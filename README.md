@@ -117,7 +117,7 @@ picoclaw agent -m "What is photosynthesis?"
 ### Or install everything in one line
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/picolm/picolm/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/RightNow-AI/picolm/main/install.sh | bash
 ```
 
 ### Performance on real hardware
@@ -201,7 +201,7 @@ The model file (638MB) stays on disk. PicoLM **memory-maps** it and streams one 
 ### One-liner install (Raspberry Pi / Linux)
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/picolm/picolm/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/RightNow-AI/picolm/main/install.sh | bash
 ```
 
 This will:
