@@ -35,7 +35,22 @@ float fp16_to_fp32_lookup(uint16_t h) {
 /* fp16-fp32 dot product: sum of fp16_to_fp32(k[i]) * x[i] for i=0..n-1 */
 float vec_dot_f16_f32(const void *src, const float *x, int n) {
     const uint16_t *k = (const uint16_t *)src;
-#ifdef PICOLM_AVX
+#ifdef PICOLM_NEON
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+        float32x4_t kf0 = fp16x4_to_fp32_inline(k + i);
+        float32x4_t xf0 = vld1q_f32(x + i);
+        acc0 = vmlaq_f32(acc0, kf0, xf0);
+        float32x4_t kf1 = fp16x4_to_fp32_inline(k + i + 4);
+        float32x4_t xf1 = vld1q_f32(x + i + 4);
+        acc1 = vmlaq_f32(acc1, kf1, xf1);
+    }
+    float sumf = vaddvq_f32(vaddq_f32(acc0, acc1));
+    for (; i < n; i++) sumf += fp16_to_fp32(k[i]) * x[i];
+    return sumf;
+#elif defined(PICOLM_AVX)
     __m256 acc = _mm256_setzero_ps();
     int i = 0;
     for (; i + 7 < n; i += 8) {
