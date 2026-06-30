@@ -157,6 +157,14 @@ typedef struct {
 } block_q4_K;            /* 144 bytes */
 #pragma pack(pop)
 
+/* Q8_K block: 256 weights, used for intermediate quantization in Q4_K/Q6_K matmul */
+/* d: float, qs: 256 int8, bsums: 16 int16 (sum of quants in groups of 16) */
+typedef struct {
+    float   d;
+    int8_t  qs[256];
+    int16_t bsums[16];
+} block_q8_K;            /* 4 + 256 + 32 = 292 bytes */
+
 /* Q3_K block: 256 weights in 110 bytes */
 #pragma pack(push, 1)
 typedef struct {
@@ -238,10 +246,16 @@ float vec_dot_q4_0_f32(const void *src, const float *x, int n);
 float vec_dot_f16_f32(const void *src, const float *x, int n);
 float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n);
 float vec_dot_q8_0_q8_0_deltas(const void *qx, const float *qx_d, const void *qw, int n);
+/* Q4_K * Q8_K dot product: Q4_K weights with pre-quantized Q8_K input */
+float vec_dot_q4_K_q8_K(const void *src_q4, const void *src_q8, int n);
 
 /* Quantize a float32 vector to Q8_0 blocks in-place or to a separate buffer.
  * dst must have space for (n / 32) * sizeof(block_q8_0) bytes. */
 void quantize_row_q8_0(const float *x, void *dst, int n);
+
+/* Quantize a float32 vector to Q8_K blocks (for Q4_K/Q6_K matmul).
+ * dst must have space for (n / 256) * sizeof(block_q8_K) bytes. */
+void quantize_row_q8_K(const float *x, void *dst, int n);
 
 /* Generic fused dot product dispatch. Returns dot(dequant(src), x) for n elements. */
 float vec_dot(const void *src, const float *x, int n, gguf_type_t type);

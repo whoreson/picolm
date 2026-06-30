@@ -63,6 +63,13 @@ matmul_worker(void *arg) {
             t->out[i] = vec_dot_q8_0_q8_0_deltas(qx, qx_d,
                                                   t->W + (size_t)i * t->row_bytes, t->n);
         }
+    } else if (t->qtype == GGUF_TYPE_Q4_K && t->x) {
+        /* Fast path: x is already quantized to Q8_K */
+        const block_q8_K *qx = (const block_q8_K *)t->x;
+        for (int i = t->start; i < t->end; i++) {
+            t->out[i] = vec_dot_q4_K_q8_K(
+                t->W + (size_t)i * t->row_bytes, qx, t->n);
+        }
     } else {
         for (int i = t->start; i < t->end; i++) {
             t->out[i] = vec_dot(t->W + (size_t)i * t->row_bytes,
@@ -160,6 +167,81 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
             return;
         }
         /* If allocation failed, fall through to generic path */
+#if defined(PICOLM_AVX2) || defined(PICOLM_AVX)
+    } else if (qtype == GGUF_TYPE_Q4_K) {
+        /* Q4_K fast path: quantize x to Q8_K once, then vec_dot_q4_K_q8_K */
+        /* Only enabled on x86 (AVX/AVX2). On NEON, use vec_dot_q4_K_f32 instead. */
+        size_t qx_size = (n / 256) * sizeof(block_q8_K);
+        block_q8_K *qx = NULL;
+        int qx_owned = 0;  /* whether we malloc'd qx */
+        if (scratch_buf != NULL && qx_size <= (size_t)scratch_size) {
+            qx = (block_q8_K *)scratch_buf;
+        } else {
+            qx = (block_q8_K *)malloc(qx_size);
+            qx_owned = 1;
+        }
+        if (qx != NULL) {
+            quantize_row_q8_K(x, qx, n);
+
+            if (n_threads <= 1 || d < 4) {
+                for (int i = 0; i < d; i++) {
+                    out[i] = vec_dot_q4_K_q8_K(wptr + (size_t)i * row_bytes, qx, n);
+                }
+                if (qx_owned) free(qx);
+                return;
+            }
+
+            int nt = n_threads;
+            if (nt > d) nt = d;
+            matmul_task_t tasks[MAX_THREADS];
+#ifdef _WIN32
+            HANDLE threads[MAX_THREADS];
+#else
+            pthread_t threads[MAX_THREADS];
+#endif
+
+            int rows_per = d / nt;
+            int extra = d % nt;
+            int row = 0;
+
+            for (int t = 0; t < nt; t++) {
+                tasks[t].out = out;
+                tasks[t].x = (const float *)qx;
+                tasks[t].W = wptr;
+                tasks[t].row_bytes = row_bytes;
+                tasks[t].n = n;
+                tasks[t].qtype = GGUF_TYPE_Q4_K;
+                tasks[t].start = row;
+                row += rows_per + (t < extra ? 1 : 0);
+                tasks[t].end = row;
+            }
+
+            for (int t = 1; t < nt; t++) {
+#ifdef _WIN32
+                threads[t] = CreateThread(NULL, 0, matmul_worker, &tasks[t], 0, NULL);
+#else
+                pthread_create(&threads[t], NULL, matmul_worker, &tasks[t]);
+#endif
+            }
+
+            for (int i = tasks[0].start; i < tasks[0].end; i++) {
+                out[i] = vec_dot_q4_K_q8_K(wptr + (size_t)i * row_bytes, qx, n);
+            }
+
+            for (int t = 1; t < nt; t++) {
+#ifdef _WIN32
+                WaitForSingleObject(threads[t], INFINITE);
+                CloseHandle(threads[t]);
+#else
+                pthread_join(threads[t], NULL);
+#endif
+            }
+
+            if (qx_owned) free(qx);
+            return;
+        }
+        /* If allocation failed, fall through to generic path */
+#endif
     }
 
     if (n_threads <= 1 || d < 4) {
