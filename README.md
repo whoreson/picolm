@@ -183,7 +183,7 @@ The model file (638MB) stays on disk. PicoLM **memory-maps** it and streams one 
 | **FP16 KV Cache** | Halves KV cache memory (44MB vs 88MB for 2048 context) |
 | **Flash Attention** | Online softmax — no O(seq_len) attention buffer needed |
 | **Pre-computed RoPE** | cos/sin lookup tables eliminate transcendentals from hot loop |
-| **SIMD Acceleration** | ARM NEON (Pi 3/4/5) and x86 SSE2 (Intel/AMD) auto-detected |
+| **SIMD Acceleration** | ARM NEON (Pi 3/4/5), x86 SSE2/SSE3/AVX/AVX2 — auto-detected at compile time |
 | **Fused Dot Products** | Dequantize + dot-product in one pass — no intermediate buffer |
 | **Multi-threaded matmul** | Parallel matrix-vector multiply across CPU cores |
 | **Grammar-Constrained JSON** | `--json` flag forces valid JSON output (for tool calling) |
@@ -234,7 +234,10 @@ make model
 
 ```cmd
 cd picolm
-build.bat
+build.bat           :: SSE2 baseline (any x86-64)
+build.bat avx2      :: AVX2 (Haswell+ / Excavator+, fastest)
+build.bat avx       :: AVX  (Sandy Bridge+ / Bulldozer+)
+build.bat scalar    :: no SIMD (portable fallback)
 picolm.exe model.gguf -p "Hello world" -n 50
 ```
 
@@ -242,6 +245,12 @@ picolm.exe model.gguf -p "Hello world" -n 50
 
 ```bash
 make native      # x86/ARM auto-detect (recommended for local machine)
+make x86         # x86-64 safe default (SSE2 only — runs on any x86-64)
+make sse2        # x86-64 SSE2 only (same as x86)
+make sse3        # x86-64 SSE2+SSE3+SSSE3 (AMD Phenom/Athlon, older Intel)
+make avx         # x86-64 AVX (Sandy Bridge+, Bulldozer+ — wider SIMD, faster)
+make avx2        # x86-64 AVX2 (Haswell+, Excavator+ — widest SIMD, fastest)
+make scalar      # No SIMD (portable scalar fallback, any architecture)
 make pi          # Raspberry Pi 3/4/5 (64-bit ARM + NEON SIMD)
 make pi-arm32    # Pi Zero / Pi 1 (32-bit ARM)
 make cross-pi    # Cross-compile for Pi from x86 (static binary)
@@ -348,7 +357,7 @@ Measured on TinyLlama 1.1B Q4_K_M (638 MB model):
  + FP16 KV cache          █████████████████░░░  (halve memory bandwidth)
  + Pre-computed RoPE      ██████████████████░░  (no sin/cos in hot loop)
  + Flash attention        ██████████████████░░  (no O(n) attention alloc)
- + NEON/SSE2 SIMD         ███████████████████░  (4-wide vector ops)
+ + NEON/SSE2/AVX SIMD     ███████████████████░  (4-wide to 8-wide vector ops)
  + KV cache persistence   ████████████████████  (skip prefill entirely)
 ```
 
@@ -477,9 +486,14 @@ PicoLM implements 9 optimizations that brought generation speed from **1.6 tok/s
 
 4-wide float vector operations for all hot paths. Example: dequantizing Q4_K nibbles with `vmovl_u8` → `vmovl_u16` → `vcvtq_f32_u32`, and RoPE with interleaved `vld2q_f32` / `vst2q_f32`.
 
-### 2. x86 SSE2 SIMD
+### 2. x86 SIMD (SSE2 / SSE3 / AVX / AVX2)
 
-Auto-detected on Intel/AMD. 4-wide `__m128` operations for dot products, RMSNorm, and vector operations.
+Four compile-time tiers for Intel/AMD:
+
+- **SSE2** (`make sse2` or `make x86`): 4-wide `__m128` operations for dot products, RMSNorm, softmax, RoPE, and element-wise ops. Safe baseline for all x86-64 CPUs.
+- **SSE3** (`make sse3`): adds `_mm_addsub_ps` for a cleaner RoPE rotation kernel (no sign-mask workaround needed).
+- **AVX** (`make avx`): 8-wide `__m256` float accumulators for all ops. Q4_K and Q6_K dot products widen the float accumulation stage while keeping integer nibble extraction at 128-bit (no AVX2 required). RoPE processes 4 complex pairs per iteration with `_mm256_addsub_ps`.
+- **AVX2** (`make avx2`): adds 256-bit integer operations. Q4_0 nibble extraction uses `_mm256_cvtepu8_epi32` (8 nibbles → 8 int32 in 2 ops vs. 4-step unpack chain). Q6_K weight extraction uses `_mm256_cvtepi8_epi32` (8 int8 → 8 int32 in 2 ops vs. 4-instruction macro chain). Targets Haswell+ Intel and Excavator+ AMD.
 
 ### 3. FP16 KV Cache
 
@@ -636,7 +650,7 @@ A: llama.cpp is excellent but requires ~200MB+ for the runtime on small models, 
 A: TinyLlama 1.1B is a small model — it handles simple tasks (Q&A, summarization, basic reasoning, JSON generation) well. It won't match GPT-4, but it runs on a $10 board with no internet. For structured output, the `--json` grammar mode guarantees valid JSON regardless of model quality.
 
 **Q: What about GPU acceleration?**
-A: PicoLM is CPU-only by design. The target hardware ($10-15 boards) doesn't have GPUs. On x86/ARM CPUs, SIMD (NEON/SSE2) provides meaningful speedup.
+A: PicoLM is CPU-only by design. The target hardware ($10-15 boards) doesn't have GPUs. On x86/ARM CPUs, SIMD (NEON/SSE2/AVX) provides meaningful speedup.
 
 **Q: Can I use a different model?**
 A: Any LLaMA-architecture GGUF model works. Download from [HuggingFace](https://huggingface.co/models?search=gguf) and point PicoLM at it. Recommended quantizations: Q4_K_M (best quality/size balance) or Q2_K (smallest, lower quality).
@@ -645,7 +659,9 @@ A: Any LLaMA-architecture GGUF model works. Download from [HuggingFace](https://
 
 ## Roadmap
 
-- [ ] AVX2/AVX-512 kernels for x86 (2-4x generation speed on modern CPUs)
+- [x] AVX kernels for x86 (`make avx` — 8-wide float ops, ~2x vs SSE2)
+- [x] AVX2 kernels for x86 (`make avx2` — 256-bit integer ops for Q4_0 and Q6_K quantized paths)
+- [ ] AVX-512 kernels for x86 (512-bit ops for server CPUs)
 - [ ] Speculative decoding with a draft model
 - [ ] Context sliding window (infinite generation beyond max_seq_len)
 - [ ] Weight pruning for further memory reduction

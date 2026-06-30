@@ -131,6 +131,21 @@ int main(int argc, char **argv) {
 
     /* Load model */
     fprintf(stderr, "Loading model: %s\n", model_path);
+    fprintf(stderr, "SIMD: %s\n",
+#if defined(PICOLM_AVX2)
+        "AVX2"
+#elif defined(PICOLM_AVX)
+        "AVX"
+#elif defined(PICOLM_SSE3)
+        "SSE3"
+#elif defined(PICOLM_SSE2)
+        "SSE2"
+#elif defined(PICOLM_NEON)
+        "NEON"
+#else
+        "scalar"
+#endif
+    );
     model_t model;
     if (model_load(&model, model_path, context_override) != 0) {
         fprintf(stderr, "Failed to load model\n");

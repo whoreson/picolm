@@ -4,29 +4,75 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* ---- SIMD detection ---- */
+/* ---- SIMD detection ----
+ *
+ * Each level explicitly implies all lower levels so that code only needs to
+ * check a single flag.  The order of checks (highest first) lets each block
+ * upgrade flags that a lower-level check would otherwise miss if the compiler
+ * only predefines the highest applicable macro.
+ *
+ * Hierarchy (x86):
+ *   PICOLM_SSE2 ⊂ PICOLM_SSE3 ⊂ PICOLM_AVX ⊂ PICOLM_AVX2
+ *
+ * ARM:
+ *   PICOLM_NEON (independent)
+ */
+
+/* --- ARM NEON --- */
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
-#define PICOLM_NEON 1
-#include <arm_neon.h>
+#  define PICOLM_NEON 1
+#  include <arm_neon.h>
 static inline float vaddvq_f32_compat(float32x4_t v) {
-#if defined(__aarch64__)
+#  if defined(__aarch64__)
     return vaddvq_f32(v);
-#else
+#  else
     float32x2_t r = vadd_f32(vget_low_f32(v), vget_high_f32(v));
     return vget_lane_f32(vpadd_f32(r, r), 0);
-#endif
+#  endif
 }
 #endif
 
-#if defined(__SSE2__) || (defined(_MSC_VER) && (defined(_M_X64) || defined(_M_AMD64)))
-#define PICOLM_SSE2 1
-#include <immintrin.h>
+/* --- x86 SIMD: detect highest level, then propagate downward --- */
+
+/* AVX2 implies AVX + SSE3 + SSE2 */
+#if defined(__AVX2__)
+#  define PICOLM_AVX2 1
+#  define PICOLM_AVX  1
+#  define PICOLM_SSE3 1
+#  define PICOLM_SSE2 1
+/* AVX implies SSE3 + SSE2 */
+#elif defined(__AVX__)
+#  define PICOLM_AVX  1
+#  define PICOLM_SSE3 1
+#  define PICOLM_SSE2 1
+/* SSE3 implies SSE2 */
+#elif defined(__SSE3__)
+#  define PICOLM_SSE3 1
+#  define PICOLM_SSE2 1
+/* SSE2 baseline (also the default for all x86-64 targets) */
+#elif defined(__SSE2__) || (defined(_MSC_VER) && (defined(_M_X64) || defined(_M_AMD64)))
+#  define PICOLM_SSE2 1
+#endif
+
+/* Include x86 SIMD header once for any x86 SIMD level.
+ * <immintrin.h> is an umbrella header that exposes all intrinsics
+ * available for the current -march target. */
+#ifdef PICOLM_SSE2
+#  include <immintrin.h>
 static inline float hsum_sse(__m128 v) {
     __m128 shuf = _mm_movehl_ps(v, v);
     __m128 sum  = _mm_add_ps(v, shuf);
     shuf = _mm_shuffle_ps(sum, sum, 1);
     sum  = _mm_add_ss(sum, shuf);
     return _mm_cvtss_f32(sum);
+}
+#endif
+
+#ifdef PICOLM_AVX
+static inline float hsum_avx(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    return hsum_sse(_mm_add_ps(lo, hi));
 }
 #endif
 
@@ -133,6 +179,14 @@ size_t gguf_type_row_size(gguf_type_t type, int n);
 float vec_dot_q4_K_f32(const void *src, const float *x, int n);
 float vec_dot_q6_K_f32(const void *src, const float *x, int n);
 float vec_dot_f32_f32(const void *src, const float *x, int n);
+float vec_dot_q8_0_f32(const void *src, const float *x, int n);
+float vec_dot_q4_0_f32(const void *src, const float *x, int n);
+float vec_dot_f16_f32(const void *src, const float *x, int n);
+float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n);
+
+/* Quantize a float32 vector to Q8_0 blocks in-place or to a separate buffer.
+ * dst must have space for (n / 32) * sizeof(block_q8_0) bytes. */
+void quantize_row_q8_0(const float *x, void *dst, int n);
 
 /* Generic fused dot product dispatch. Returns dot(dequant(src), x) for n elements. */
 float vec_dot(const void *src, const float *x, int n, gguf_type_t type);
