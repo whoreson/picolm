@@ -406,7 +406,6 @@ static int parse_gguf(model_t *m, int max_seq_len) {
     fprintf(stderr, "  n_layers=%d, vocab_size=%d, max_seq=%d\n",
             cfg->n_layers, cfg->vocab_size, cfg->max_seq_len);
     fprintf(stderr, "  head_dim=%d, rope_base=%.1f\n", cfg->head_dim, cfg->rope_freq_base);
-
     free(tinfos);
     return 0;
 }

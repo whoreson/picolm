@@ -12,7 +12,7 @@ Thanks for your interest in PicoLLM! This project is intentionally small (~2,500
 ## What We Need Help With
 
 ### High Impact
-- **SIMD kernels** — AVX2/AVX-512 for x86, optimized NEON for ARM
+- **SIMD kernels** — AVX-512 for x86 server CPUs, optimized NEON for ARM
 - **New quantization formats** — Q5_K fused dot product, IQ formats
 - **New model architectures** — Mistral, Phi, Gemma (LLaMA-compatible)
 - **Platform testing** — RISC-V boards, Pi Zero, exotic ARM SBCs
@@ -106,12 +106,20 @@ If you're adding SIMD code:
     // ARM NEON path (Pi 3/4/5)
     float32x4_t v = vld1q_f32(ptr);
     ...
+#elif defined(PICOLM_AVX2)
+    // x86 AVX2 path (Haswell+, Excavator+ — 256-bit integer + float)
+    __m256i v = _mm256_loadu_si256((const __m256i *)ptr);
+    ...
+#elif defined(PICOLM_AVX)
+    // x86 AVX path (Sandy Bridge+, Bulldozer+ — 8-wide float)
+    __m256 v = _mm256_loadu_ps(ptr);
+    ...
 #elif defined(PICOLM_SSE2)
-    // x86 SSE2 path (Intel/AMD)
+    // x86 SSE2 path (any x86-64 — 4-wide float)
     __m128 v = _mm_loadu_ps(ptr);
     ...
 #endif
-    // Scalar fallback (always works)
+    // Scalar fallback (always works — also reachable via `make scalar`)
     for (int i = 0; i < n; i++) { ... }
 ```
 

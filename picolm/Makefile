@@ -1,5 +1,5 @@
 CC      = gcc
-CFLAGS  = -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic
+CFLAGS  = -O3 -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic
 LDFLAGS = -lm -lpthread
 SRCS    = picolm.c model.c tensor.c quant.c tokenizer.c sampler.c grammar.c
 TARGET  = picolm
@@ -11,11 +11,35 @@ MODEL_DIR ?= /opt/picolm/models
 native: CFLAGS += -march=native
 native: $(TARGET)
 
+# --- x86-64 default (SSE2 only, safe for all x86-64) ---
+x86: sse2
+
+# --- No SIMD (scalar fallback, portable to any architecture) ---
+scalar: CFLAGS += -mno-sse2 -mno-avx
+scalar: $(TARGET)
+
+# --- x86-64 with SSE2 only ---
+sse2: CFLAGS += -msse2
+sse2: $(TARGET)
+
+# --- x86-64 with SSE2+SSE3+SSSE3 (covers AMD Phenom/Athlon and similar without AVX) ---
+sse3: CFLAGS += -msse2 -msse3 -mssse3 -mpopcnt
+sse3: $(TARGET)
+
+# --- x86-64 with AVX (Sandy Bridge and newer Intel; Bulldozer and newer AMD) ---
+avx: CFLAGS += -mavx -mfma -mpopcnt
+avx: $(TARGET)
+
+# --- x86-64 with AVX2 (Haswell and newer Intel; Excavator and newer AMD) ---
+avx2: CFLAGS += -mavx2 -mfma -mpopcnt
+avx2: $(TARGET)
+
 $(TARGET): $(SRCS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 # --- Static build for single-binary deployment ---
-static: CFLAGS += -march=native
+# Uses SSE2 (not -march=native) so the binary runs on any x86-64, not just the build machine.
+static: CFLAGS += -msse2
 static: LDFLAGS += -static
 static: $(TARGET)
 
@@ -70,4 +94,4 @@ model:
 clean:
 	rm -f $(TARGET) $(TARGET).exe *.obj *.o
 
-.PHONY: native static pi pi-arm32 cross-pi riscv cross-riscv debug install model clean
+.PHONY: native x86 scalar sse2 sse3 avx avx2 static pi pi-arm32 cross-pi riscv cross-riscv debug install model clean
