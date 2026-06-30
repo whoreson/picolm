@@ -37,6 +37,7 @@ int tensor_get_threads(void) {
 typedef struct {
     float       *out;
     const float *x;
+    const float *x_d;     /* pre-converted fp32 deltas for Q8_0 quantized x */
     const char  *W;
     size_t       row_bytes;
     int          n;        /* input dimension */
@@ -54,11 +55,12 @@ void *
 matmul_worker(void *arg) {
     matmul_task_t *t = (matmul_task_t *)arg;
     if (t->qtype == GGUF_TYPE_Q8_0 && t->x) {
-        /* Fast path: x is already quantized to Q8_0 */
+        /* Fast path: x is already quantized to Q8_0, with pre-converted deltas */
         const block_q8_0 *qx = (const block_q8_0 *)t->x;
+        const float *qx_d = t->x_d;
         for (int i = t->start; i < t->end; i++) {
-            t->out[i] = vec_dot_q8_0_q8_0(qx,
-                                          t->W + (size_t)i * t->row_bytes, t->n);
+            t->out[i] = vec_dot_q8_0_q8_0_deltas(qx, qx_d,
+                                                  t->W + (size_t)i * t->row_bytes, t->n);
         }
     } else {
         for (int i = t->start; i < t->end; i++) {
@@ -84,15 +86,21 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
      * maddubs_epi16 integer multiply-accumulate. */
     if (qtype == GGUF_TYPE_Q8_0 && n > 0) {
         size_t q8_row_size = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
-        float *qx_buf = scratch_buf ? (float *)scratch_buf : (float *)malloc(q8_row_size);
-        if (!qx_buf) qx_buf = (float *)malloc(q8_row_size);
+        int nb = n / 32;
+        /* Pre-allocate buffer for: quantized x + pre-converted x deltas */
+        size_t total_buf = q8_row_size + nb * sizeof(float);
+        float *qx_buf = scratch_buf ? (float *)scratch_buf : (float *)malloc(total_buf);
+        if (!qx_buf) qx_buf = (float *)malloc(total_buf);
         if (qx_buf) {
             quantize_row_q8_0(x, qx_buf, n);
             const block_q8_0 *qx = (const block_q8_0 *)qx_buf;
+            /* Pre-convert x deltas once for all rows */
+            float *qx_d = qx_buf + (q8_row_size / sizeof(float));
+            for (int bi = 0; bi < nb; bi++) qx_d[bi] = fp16_to_fp32(qx[bi].d);
 
             if (n_threads <= 1 || d < 4) {
                 for (int i = 0; i < d; i++) {
-                    out[i] = vec_dot_q8_0_q8_0(qx, wptr + (size_t)i * row_bytes, n);
+                    out[i] = vec_dot_q8_0_q8_0_deltas(qx, qx_d, wptr + (size_t)i * row_bytes, n);
                 }
                 if (qx_buf != scratch_buf) free(qx_buf);
                 return;
@@ -115,6 +123,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
             for (int t = 0; t < nt; t++) {
                 tasks[t].out = out;
                 tasks[t].x = (const float *)qx;
+                tasks[t].x_d = qx_d;
                 tasks[t].W = wptr;
                 tasks[t].row_bytes = row_bytes;
                 tasks[t].n = n;
@@ -134,7 +143,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
 
             /* Main thread does its chunk via the fast path */
             for (int i = tasks[0].start; i < tasks[0].end; i++) {
-                out[i] = vec_dot_q8_0_q8_0(qx, wptr + (size_t)i * row_bytes, n);
+                out[i] = vec_dot_q8_0_q8_0_deltas(qx, qx_d, wptr + (size_t)i * row_bytes, n);
             }
 
             for (int t = 1; t < nt; t++) {

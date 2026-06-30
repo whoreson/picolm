@@ -183,6 +183,7 @@ float vec_dot_q8_0_f32(const void *src, const float *x, int n);
 float vec_dot_q4_0_f32(const void *src, const float *x, int n);
 float vec_dot_f16_f32(const void *src, const float *x, int n);
 float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n);
+float vec_dot_q8_0_q8_0_deltas(const void *qx, const float *qx_d, const void *qw, int n);
 
 /* Quantize a float32 vector to Q8_0 blocks in-place or to a separate buffer.
  * dst must have space for (n / 32) * sizeof(block_q8_0) bytes. */
