@@ -147,6 +147,8 @@ int main(int argc, char **argv) {
 #endif
     );
     model_t model;
+    /* Initialize FP16->FP32 lookup table (64KB) for fast attention */
+    fp16_table_init();
     if (model_load(&model, model_path, context_override) != 0) {
         fprintf(stderr, "Failed to load model\n");
         return 1;

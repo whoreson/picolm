@@ -5,8 +5,64 @@
 #include <stdlib.h>
 
 /* ================================================================
+ * FP16 <-> FP32 lookup table (mirrors llama.cpp's ggml_table_f32_f16)
+ *
+ * 64KB table initialized once at startup. Each entry maps a uint16_t
+ * FP16 bit pattern to its FP32 value. This is significantly faster
+ * than computing the conversion on-the-fly, especially without F16C.
+ * ================================================================ */
+
+static float fp16_to_fp32_table[1 << 16];
+static int fp16_table_initialized = 0;
+
+void fp16_table_init(void) {
+    if (fp16_table_initialized) return;
+    for (int i = 0; i < (1 << 16); i++) {
+        fp16_to_fp32_table[i] = fp16_to_fp32((uint16_t)i);
+    }
+    fp16_table_initialized = 1;
+}
+
+/* Fast lookup-based FP16->FP32 conversion */
+float fp16_to_fp32_lookup(uint16_t h) {
+    return fp16_to_fp32_table[h];
+}
+
+/* ================================================================
  * FP16 <-> FP32 conversion (software, no hardware dependency)
  * ================================================================ */
+
+/* fp16-fp32 dot product: sum of fp16_to_fp32(k[i]) * x[i] for i=0..n-1 */
+float vec_dot_f16_f32(const void *src, const float *x, int n) {
+    const uint16_t *k = (const uint16_t *)src;
+#ifdef PICOLM_AVX
+    __m256 acc = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+        __m256 kf = fp16x8_to_fp32_inline(k + i);
+        __m256 xf = _mm256_loadu_ps(x + i);
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(kf, xf));
+    }
+    float sumf = hsum_avx(acc);
+    for (; i < n; i++) sumf += fp16_to_fp32(k[i]) * x[i];
+    return sumf;
+#elif defined(PICOLM_SSE2)
+    __m128 acc = _mm_setzero_ps();
+    int i = 0;
+    for (; i + 3 < n; i += 4) {
+        __m128 kf = fp16x4_to_fp32_inline(k + i);
+        __m128 xf = _mm_loadu_ps(x + i);
+        acc = _mm_add_ps(acc, _mm_mul_ps(kf, xf));
+    }
+    float sumf = hsum_sse(acc);
+    for (; i < n; i++) sumf += fp16_to_fp32(k[i]) * x[i];
+    return sumf;
+#else
+    float sumf = 0.0f;
+    for (int i = 0; i < n; i++) sumf += fp16_to_fp32(k[i]) * x[i];
+    return sumf;
+#endif
+}
 
 float fp16_to_fp32(uint16_t h) {
     uint32_t sign = (uint32_t)(h >> 15) << 31;
@@ -1405,20 +1461,6 @@ float vec_dot_q4_0_f32(const void *src, const float *x, int n) {
         }
         sumf *= d;
 #endif
-    }
-    return sumf;
-}
-
-/* ================================================================
- * vec_dot_f16_f32: fused dequant + dot for F16 x float32
- * ================================================================ */
-
-float vec_dot_f16_f32(const void *src, const float *x, int n) {
-    const uint16_t *w = (const uint16_t *)src;
-    float sumf = 0.0f;
-
-for (int i = 0; i < n; i++) {
-        sumf += fp16_to_fp32(w[i]) * x[i];
     }
     return sumf;
 }

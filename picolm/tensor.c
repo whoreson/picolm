@@ -442,6 +442,11 @@ void rope(float *q, float *k, int head_dim, int n_heads, int n_kv_heads,
 }
 
 void silu(float *x, int size) {
+    /* swish/silu: x / (1 + exp(-x))
+     * No hardware exp instruction in SSE/AVX, so use scalar expf.
+     * Vectorized expf exists in libsvml (Intel) or libxsmm, but we
+     * avoid those dependencies. The compiler may auto-vectorize
+     * expf with -ffast-math. */
     for (int i = 0; i < size; i++) {
         x[i] = x[i] / (1.0f + expf(-x[i]));
     }
