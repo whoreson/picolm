@@ -1043,6 +1043,7 @@ void quantize_row_q8_0(const float *x, void *dst, int n) {
  *   SSE2: 128-bit int8 MAC, scalar float accum
  * ================================================================ */
 
+#if defined(PICOLM_AVX2) || defined(PICOLM_AVX) || defined(PICOLM_SSE2)
 static inline __m128i mul_sum_i8_pairs_sse(const __m128i x, const __m128i y) {
     __m128i ax = _mm_sign_epi8(x, x);
     __m128i sy = _mm_sign_epi8(y, x);
@@ -1058,18 +1059,36 @@ static inline __m256i mul_sum_i8_pairs_avx2(const __m256i x, const __m256i y) {
     __m256i ones = _mm256_set1_epi16(1);
     return _mm256_madd_epi16(ones, dot);
 }
+#endif
 
 float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n) {
     const block_q8_0 *x = (const block_q8_0 *)qx;
     const block_q8_0 *w = (const block_q8_0 *)qw;
     int nb = n / 32;
     float sumf = 0.0f;
+    int i = 0;
 
-#ifdef PICOLM_AVX2
+#ifdef PICOLM_NEON
+    /* NEON: int8 widen multiply + accumulate for Q8_0 int8 MAC */
+    for (i = 0; i < nb; i++) {
+        float d = fp16_to_fp32(x[i].d) * fp16_to_fp32(w[i].d);
+        int32x4_t acc = vdupq_n_s32(0);
+        for (int j = 0; j < 32; j += 8) {
+            int8x8_t qx = vld1_s8(x[i].qs + j);
+            int8x8_t qw = vld1_s8(w[i].qs + j);
+            int16x8_t p = vmull_s8(qx, qw);
+            int32x4_t sl = vmovl_s16(vget_low_s16(p));
+            int32x4_t sh = vmovl_s16(vget_high_s16(p));
+            acc = vaddq_s32(acc, vaddq_s32(sl, sh));
+        }
+        float32x4_t f = vcvtq_f32_s32(acc);
+        sumf += d * vaddvq_f32_compat(f);
+    }
+
+#elif defined(PICOLM_AVX2)
     /* AVX2: load 32 int8 with _mm256_loadu_si256, 256-bit maddubs */
     __m256 acc = _mm256_setzero_ps();
-    int i = 0;
-    for (; i + 1 < nb; i += 2) {
+    for (i = 0; i + 1 < nb; i += 2) {
         __m256i qx0 = _mm256_loadu_si256((const __m256i *)x[i].qs);
         __m256i qx1 = _mm256_loadu_si256((const __m256i *)x[i + 1].qs);
         __m256i qw0 = _mm256_loadu_si256((const __m256i *)w[i].qs);
@@ -1094,8 +1113,7 @@ float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n) {
     /* AVX (no AVX2): SSE4.1 maddubs_epi16, 256-bit float accum */
     /* Process 2 blocks per iteration for instruction-level parallelism */
     __m256 acc = _mm256_setzero_ps();
-    int i = 0;
-    for (; i + 1 < nb; i += 2) {
+    for (i = 0; i + 1 < nb; i += 2) {
         __m128i qx0 = _mm_loadu_si128((const __m128i *)x[i].qs);
         __m128i qx1 = _mm_loadu_si128((const __m128i *)x[i].qs + 1);
         __m128i qw0 = _mm_loadu_si128((const __m128i *)w[i].qs);
@@ -1125,8 +1143,7 @@ float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n) {
     /* SSE2: process 2 blocks per iteration with 2 accumulators */
     __m128 acc0 = _mm_setzero_ps();
     __m128 acc1 = _mm_setzero_ps();
-    int i = 0;
-    for (; i + 1 < nb; i += 2) {
+    for (i = 0; i + 1 < nb; i += 2) {
         /* Block i */
         __m128i qx0 = _mm_loadu_si128((const __m128i *)x[i].qs);
         __m128i qx1 = _mm_loadu_si128((const __m128i *)x[i].qs + 1);
@@ -1176,11 +1193,28 @@ float vec_dot_q8_0_q8_0_deltas(const void *qx, const float *qx_d, const void *qw
     const block_q8_0 *w = (const block_q8_0 *)qw;
     int nb = n / 32;
     float sumf = 0.0f;
-
-#ifdef PICOLM_AVX2
-    __m256 acc = _mm256_setzero_ps();
     int i = 0;
-    for (; i + 1 < nb; i += 2) {
+
+#ifdef PICOLM_NEON
+    for (i = 0; i < nb; i++) {
+        float d = qx_d[i] * fp16_to_fp32(w[i].d);
+        int32x4_t acc = vdupq_n_s32(0);
+        for (int j = 0; j < 32; j += 8) {
+            int8x8_t qx = vld1_s8(x[i].qs + j);
+            int8x8_t qw = vld1_s8(w[i].qs + j);
+            int16x8_t p = vmull_s8(qx, qw);
+            int32x4_t sl = vmovl_s16(vget_low_s16(p));
+            int32x4_t sh = vmovl_s16(vget_high_s16(p));
+            acc = vaddq_s32(acc, vaddq_s32(sl, sh));
+        }
+        float32x4_t f = vcvtq_f32_s32(acc);
+        sumf += d * vaddvq_f32_compat(f);
+    }
+
+#elif defined(PICOLM_AVX2)
+    __m256 acc = _mm256_setzero_ps();
+
+    for (i = 0; i + 1 < nb; i += 2) {
         __m256i qx0 = _mm256_loadu_si256((const __m256i *)x[i].qs);
         __m256i qx1 = _mm256_loadu_si256((const __m256i *)x[i + 1].qs);
         __m256i qw0 = _mm256_loadu_si256((const __m256i *)w[i].qs);
@@ -1201,8 +1235,8 @@ float vec_dot_q8_0_q8_0_deltas(const void *qx, const float *qx_d, const void *qw
 
 #elif defined(PICOLM_AVX)
     __m256 acc = _mm256_setzero_ps();
-    int i = 0;
-    for (; i + 1 < nb; i += 2) {
+
+    for (i = 0; i + 1 < nb; i += 2) {
         __m128i qx0 = _mm_loadu_si128((const __m128i *)x[i].qs);
         __m128i qx1 = _mm_loadu_si128((const __m128i *)x[i].qs + 1);
         __m128i qw0 = _mm_loadu_si128((const __m128i *)w[i].qs);
@@ -1230,8 +1264,8 @@ float vec_dot_q8_0_q8_0_deltas(const void *qx, const float *qx_d, const void *qw
 #elif defined(PICOLM_SSE2)
     __m128 acc0 = _mm_setzero_ps();
     __m128 acc1 = _mm_setzero_ps();
-    int i = 0;
-    for (; i + 1 < nb; i += 2) {
+
+    for (i = 0; i + 1 < nb; i += 2) {
         __m128i qx0 = _mm_loadu_si128((const __m128i *)x[i].qs);
         __m128i qx1 = _mm_loadu_si128((const __m128i *)x[i].qs + 1);
         __m128i qw0 = _mm_loadu_si128((const __m128i *)w[i].qs);
@@ -1286,16 +1320,16 @@ float vec_dot_q8_0_f32(const void *src, const float *x, int n) {
 
 #ifdef PICOLM_NEON
         float32x4_t acc = vdupq_n_f32(0);
-        float32x4_t dv  = vdupq_n_f32(d);
 
         for (int j = 0; j < 32; j += 4) {
             int8x8_t q8 = vld1_s8(qs + j);
             int16x8_t q16 = vmovl_s8(q8);
-            float32x4_t qf0 = vcvtq_f32_f64(vreinterpretq_f64_u64(vmovl_u32(vget_low_u32(vmovl_u16(q16)))));
+            /* Widen int16 -> int32, then convert to float32 */
+            float32x4_t qf0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16)));
             float32x4_t xf  = vld1q_f32(xp + j);
             acc = vmlaq_f32(acc, qf0, xf);
 
-            float32x4_t qf1 = vcvtq_f32_f64(vreinterpretq_f64_u64(vmovl_u32(vget_high_u32(vmovl_u16(q16)))));
+            float32x4_t qf1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16)));
             float32x4_t xf1 = vld1q_f32(xp + j + 4);
             acc = vmlaq_f32(acc, qf1, xf1);
         }
