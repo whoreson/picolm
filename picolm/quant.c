@@ -1001,6 +1001,28 @@ void quantize_row_q8_0(const float *x, void *dst, int n) {
         _mm_storeu_si128((__m128i *)(y[i].qs + 0), ni0);
         _mm_storeu_si128((__m128i *)(y[i].qs + 16), ni4);
     }
+#elif defined(PICOLM_NEON)
+    /* NEON quantize_row_q8_0: adapted from llama.cpp ARM impl */
+    for (int i = 0; i < nb; i++) {
+        float32x4_t srcv[8], asrcv[8], amaxv[8];
+        for (int j = 0; j < 8; j++) srcv[j] = vld1q_f32(x + i*32 + 4*j);
+        for (int j = 0; j < 8; j++) asrcv[j] = vabsq_f32(srcv[j]);
+        for (int j = 0; j < 4; j++) amaxv[2*j] = vmaxq_f32(asrcv[2*j], asrcv[2*j+1]);
+        for (int j = 0; j < 2; j++) amaxv[4*j] = vmaxq_f32(amaxv[4*j], amaxv[4*j+2]);
+        for (int j = 0; j < 1; j++) amaxv[8*j] = vmaxq_f32(amaxv[8*j], amaxv[8*j+4]);
+        const float amax = vmaxvq_f32(amaxv[0]);
+        const float d = amax / 127.0f;
+        y[i].d = fp32_to_fp16(d);
+        const float id = amax > 0.0f ? 127.0f / amax : 0.0f;
+        for (int j = 0; j < 8; j++) {
+            const float32x4_t v = vmulq_n_f32(srcv[j], id);
+            const int32x4_t vi = vcvtnq_s32_f32(v);
+            y[i].qs[4*j+0] = vgetq_lane_s32(vi, 0);
+            y[i].qs[4*j+1] = vgetq_lane_s32(vi, 1);
+            y[i].qs[4*j+2] = vgetq_lane_s32(vi, 2);
+            y[i].qs[4*j+3] = vgetq_lane_s32(vi, 3);
+        }
+    }
 #elif defined(PICOLM_SSE2)
     for (int i = 0; i < nb; i++) {
         float maxAbs = 0.0f;
@@ -1069,21 +1091,40 @@ float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n) {
     int i = 0;
 
 #ifdef PICOLM_NEON
-    /* NEON: int8 widen multiply + accumulate for Q8_0 int8 MAC */
-    for (i = 0; i < nb; i++) {
-        float d = fp16_to_fp32(x[i].d) * fp16_to_fp32(w[i].d);
-        int32x4_t acc = vdupq_n_s32(0);
-        for (int j = 0; j < 32; j += 8) {
-            int8x8_t qx = vld1_s8(x[i].qs + j);
-            int8x8_t qw = vld1_s8(w[i].qs + j);
-            int16x8_t p = vmull_s8(qx, qw);
-            int32x4_t sl = vmovl_s16(vget_low_s16(p));
-            int32x4_t sh = vmovl_s16(vget_high_s16(p));
-            acc = vaddq_s32(acc, vaddq_s32(sl, sh));
+    /* NEON: optimized int8 MAC via vpaddlq_s16, 2 blocks/iter (mirrors llama.cpp) */
+    float32x4_t sumv0 = vdupq_n_f32(0.0f);
+    float32x4_t sumv1 = vdupq_n_f32(0.0f);
+    for (i = 0; i + 1 < nb; i += 2) {
+        const int8x16_t x0_0 = vld1q_s8(x[i].qs);
+        const int8x16_t x0_1 = vld1q_s8(x[i].qs + 16);
+        const int8x16_t w0_0 = vld1q_s8(w[i].qs);
+        const int8x16_t w0_1 = vld1q_s8(w[i].qs + 16);
+        {
+            const int16x8_t p0 = vmull_s8(vget_low_s8(x0_0), vget_low_s8(w0_0));
+            const int16x8_t p1 = vmull_s8(vget_high_s8(x0_0), vget_high_s8(w0_0));
+            const int16x8_t p2 = vmull_s8(vget_low_s8(x0_1), vget_low_s8(w0_1));
+            const int16x8_t p3 = vmull_s8(vget_high_s8(x0_1), vget_high_s8(w0_1));
+            const int32x4_t s = vaddq_s32(vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)),
+                                          vaddq_s32(vpaddlq_s16(p2), vpaddlq_s16(p3)));
+            const float d = fp16_to_fp32(x[i].d) * fp16_to_fp32(w[i].d);
+            sumv0 = vmlaq_n_f32(sumv0, s, d);
         }
-        float32x4_t f = vcvtq_f32_s32(acc);
-        sumf += d * vaddvq_f32_compat(f);
+        const int8x16_t x1_0 = vld1q_s8(x[i+1].qs);
+        const int8x16_t x1_1 = vld1q_s8(x[i+1].qs + 16);
+        const int8x16_t w1_0 = vld1q_s8(w[i+1].qs);
+        const int8x16_t w1_1 = vld1q_s8(w[i+1].qs + 16);
+        {
+            const int16x8_t p0 = vmull_s8(vget_low_s8(x1_0), vget_low_s8(w1_0));
+            const int16x8_t p1 = vmull_s8(vget_high_s8(x1_0), vget_high_s8(w1_0));
+            const int16x8_t p2 = vmull_s8(vget_low_s8(x1_1), vget_low_s8(w1_1));
+            const int16x8_t p3 = vmull_s8(vget_high_s8(x1_1), vget_high_s8(w1_1));
+            const int32x4_t s = vaddq_s32(vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)),
+                                          vaddq_s32(vpaddlq_s16(p2), vpaddlq_s16(p3)));
+            const float d = fp16_to_fp32(x[i+1].d) * fp16_to_fp32(w[i+1].d);
+            sumv1 = vmlaq_n_f32(sumv1, s, d);
+        }
     }
+    sumf = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
 
 #elif defined(PICOLM_AVX2)
     /* AVX2: load 32 int8 with _mm256_loadu_si256, 256-bit maddubs */
@@ -1196,20 +1237,40 @@ float vec_dot_q8_0_q8_0_deltas(const void *qx, const float *qx_d, const void *qw
     int i = 0;
 
 #ifdef PICOLM_NEON
-    for (i = 0; i < nb; i++) {
-        float d = qx_d[i] * fp16_to_fp32(w[i].d);
-        int32x4_t acc = vdupq_n_s32(0);
-        for (int j = 0; j < 32; j += 8) {
-            int8x8_t qx = vld1_s8(x[i].qs + j);
-            int8x8_t qw = vld1_s8(w[i].qs + j);
-            int16x8_t p = vmull_s8(qx, qw);
-            int32x4_t sl = vmovl_s16(vget_low_s16(p));
-            int32x4_t sh = vmovl_s16(vget_high_s16(p));
-            acc = vaddq_s32(acc, vaddq_s32(sl, sh));
+    /* NEON: optimized int8 MAC via vpaddlq_s16, 2 blocks/iter */
+    float32x4_t sumv0 = vdupq_n_f32(0.0f);
+    float32x4_t sumv1 = vdupq_n_f32(0.0f);
+    for (i = 0; i + 1 < nb; i += 2) {
+        const int8x16_t x0_0 = vld1q_s8(x[i].qs);
+        const int8x16_t x0_1 = vld1q_s8(x[i].qs + 16);
+        const int8x16_t w0_0 = vld1q_s8(w[i].qs);
+        const int8x16_t w0_1 = vld1q_s8(w[i].qs + 16);
+        {
+            const int16x8_t p0 = vmull_s8(vget_low_s8(x0_0), vget_low_s8(w0_0));
+            const int16x8_t p1 = vmull_s8(vget_high_s8(x0_0), vget_high_s8(w0_0));
+            const int16x8_t p2 = vmull_s8(vget_low_s8(x0_1), vget_low_s8(w0_1));
+            const int16x8_t p3 = vmull_s8(vget_high_s8(x0_1), vget_high_s8(w0_1));
+            const int32x4_t s = vaddq_s32(vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)),
+                                          vaddq_s32(vpaddlq_s16(p2), vpaddlq_s16(p3)));
+            const float d = qx_d[i] * fp16_to_fp32(w[i].d);
+            sumv0 = vmlaq_n_f32(sumv0, s, d);
         }
-        float32x4_t f = vcvtq_f32_s32(acc);
-        sumf += d * vaddvq_f32_compat(f);
+        const int8x16_t x1_0 = vld1q_s8(x[i+1].qs);
+        const int8x16_t x1_1 = vld1q_s8(x[i+1].qs + 16);
+        const int8x16_t w1_0 = vld1q_s8(w[i+1].qs);
+        const int8x16_t w1_1 = vld1q_s8(w[i+1].qs + 16);
+        {
+            const int16x8_t p0 = vmull_s8(vget_low_s8(x1_0), vget_low_s8(w1_0));
+            const int16x8_t p1 = vmull_s8(vget_high_s8(x1_0), vget_high_s8(w1_0));
+            const int16x8_t p2 = vmull_s8(vget_low_s8(x1_1), vget_low_s8(w1_1));
+            const int16x8_t p3 = vmull_s8(vget_high_s8(x1_1), vget_high_s8(w1_1));
+            const int32x4_t s = vaddq_s32(vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)),
+                                          vaddq_s32(vpaddlq_s16(p2), vpaddlq_s16(p3)));
+            const float d = qx_d[i+1] * fp16_to_fp32(w[i+1].d);
+            sumv1 = vmlaq_n_f32(sumv1, s, d);
+        }
     }
+    sumf = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
 
 #elif defined(PICOLM_AVX2)
     __m256 acc = _mm256_setzero_ps();

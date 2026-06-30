@@ -658,7 +658,19 @@ float *model_forward(model_t *m, int token, int pos) {
                     /* FMA: acc = acc * correction + dequant(vt) */
                     {
                         const float corr_f32 = correction;
-#ifdef PICOLM_AVX
+#ifdef PICOLM_NEON
+                        int d = 0;
+                        for (; d + 3 < head_dim; d += 4) {
+                            float32x4_t af = vld1q_f32(acc + d);
+                            float32x4_t vf = fp16x4_to_fp32_inline(vt + d);
+                            float32x4_t corr = vdupq_n_f32(corr_f32);
+                            af = vmlaq_f32(af, corr, vf);
+                            vst1q_f32(acc + d, af);
+                        }
+                        for (; d < head_dim; d++) {
+                            acc[d] = acc[d] * corr_f32 + fp16_to_fp32(vt[d]);
+                        }
+#elif defined(PICOLM_AVX)
                         int d = 0;
                         for (; d + 7 < head_dim; d += 8) {
                             __m256 af = _mm256_loadu_ps(acc + d);
@@ -696,7 +708,17 @@ float *model_forward(model_t *m, int token, int pos) {
                     sum_exp += w;
                     /* acc += w * dequant(vt) */
                     {
-#ifdef PICOLM_AVX
+#ifdef PICOLM_NEON
+                        int d = 0;
+                        float32x4_t wf = vdupq_n_f32(w);
+                        for (; d + 3 < head_dim; d += 4) {
+                            float32x4_t af = vld1q_f32(acc + d);
+                            float32x4_t vf = fp16x4_to_fp32_inline(vt + d);
+                            af = vmlaq_f32(af, wf, vf);
+                            vst1q_f32(acc + d, af);
+                        }
+                        for (; d < head_dim; d++) acc[d] += w * fp16_to_fp32(vt[d]);
+#elif defined(PICOLM_AVX)
                         int d = 0;
                         __m256 wf = _mm256_set1_ps(w);
                         for (; d + 7 < head_dim; d += 8) {
@@ -723,7 +745,17 @@ float *model_forward(model_t *m, int token, int pos) {
 
             /* Normalize */
             float inv_sum = 1.0f / sum_exp;
-#ifdef PICOLM_AVX
+#ifdef PICOLM_NEON
+            {
+                float32x4_t inv = vdupq_n_f32(inv_sum);
+                int d = 0;
+                for (; d + 3 < head_dim; d += 4) {
+                    float32x4_t af = vld1q_f32(acc + d);
+                    vst1q_f32(xbh + d, vmulq_f32(af, inv));
+                }
+                for (; d < head_dim; d++) xbh[d] = acc[d] * inv_sum;
+            }
+#elif defined(PICOLM_AVX)
             {
                 __m256 inv = _mm256_set1_ps(inv_sum);
                 int d = 0;
