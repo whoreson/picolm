@@ -1072,6 +1072,312 @@ void quantize_row_q8_0(const float *x, void *dst, int n) {
 }
 
 /* ================================================================
+ * quantize_row_q8_K: quantize float32 -> Q8_K blocks
+ * Used for intermediate quantization in Q4_K/Q6_K matmul
+ * Adapted from llama.cpp's quantize_row_q8_K_ref
+ */
+void quantize_row_q8_K(const float *x, void *dst, int n) {
+    block_q8_K *y = (block_q8_K *)dst;
+    int nb = n / 256;
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f;
+        for (int j = 0; j < 256; ++j) {
+            float ax = x[j] < 0 ? -x[j] : x[j];
+            if (ax > amax) amax = ax;
+        }
+        float id = (amax != 0.0f) ? 127.0f / amax : 0.0f;
+        y[i].d = 1.0f / id;
+
+#ifdef PICOLM_NEON
+        for (int j = 0; j < 64; j += 8) {
+            float32x4_t v0 = vld1q_f32(x + j);
+            float32x4_t v1 = vld1q_f32(x + j + 4);
+            int32x4_t vi0 = vcvtnq_s32_f32(vmulq_n_f32(v0, id));
+            int32x4_t vi1 = vcvtnq_s32_f32(vmulq_n_f32(v1, id));
+            int16x4_t s0 = vmovn_s32(vi0);
+            int16x4_t s1 = vmovn_s32(vi1);
+            int16x8_t s8 = vcombine_s16(s0, s1);
+            int8x8_t qi = vmovn_s16(s8);
+            vst1_s8(y[i].qs + j, qi);
+        }
+#elif defined(PICOLM_AVX)
+        const __m256 v_id = _mm256_set1_ps(id);
+        for (int j = 0; j < 256; j += 32) {
+            __m256 v0 = _mm256_loadu_ps(x + j + 0);
+            __m256 v1 = _mm256_loadu_ps(x + j + 8);
+            __m256 v2 = _mm256_loadu_ps(x + j + 16);
+            __m256 v3 = _mm256_loadu_ps(x + j + 24);
+            __m256i i0 = _mm256_cvtps_epi32(_mm256_round_ps(_mm256_mul_ps(v0, v_id), _MM_ROUND_NEAREST));
+            __m256i i1 = _mm256_cvtps_epi32(_mm256_round_ps(_mm256_mul_ps(v1, v_id), _MM_ROUND_NEAREST));
+            __m256i i2 = _mm256_cvtps_epi32(_mm256_round_ps(_mm256_mul_ps(v2, v_id), _MM_ROUND_NEAREST));
+            __m256i i3 = _mm256_cvtps_epi32(_mm256_round_ps(_mm256_mul_ps(v3, v_id), _MM_ROUND_NEAREST));
+            __m128i p0 = _mm256_castsi256_si128(i0);
+            __m128i p1 = _mm256_extractf128_si256(i0, 1);
+            __m128i p2 = _mm256_castsi256_si128(i1);
+            __m128i p3 = _mm256_extractf128_si256(i1, 1);
+            p0 = _mm_packs_epi32(p0, p1);
+            p2 = _mm_packs_epi32(p2, p3);
+            p0 = _mm_packs_epi16(p0, p2);
+            _mm_storeu_si128((__m128i *)(y[i].qs + j), p0);
+            /* Next 16 */
+            p0 = _mm256_castsi256_si128(i2);
+            p1 = _mm256_extractf128_si256(i2, 1);
+            p2 = _mm256_castsi256_si128(i3);
+            p3 = _mm256_extractf128_si256(i3, 1);
+            p0 = _mm_packs_epi32(p0, p1);
+            p2 = _mm_packs_epi32(p2, p3);
+            p0 = _mm_packs_epi16(p0, p2);
+            _mm_storeu_si128((__m128i *)(y[i].qs + j + 16), p0);
+        }
+#else
+        for (int j = 0; j < 256; j++) {
+            y[i].qs[j] = (int8_t)((int)(x[j] * id + (x[j] >= 0 ? 0.5f : -0.5f)));
+        }
+#endif
+
+        /* Compute bsums: sum of quants in groups of 16 */
+        for (int j = 0; j < 16; ++j) {
+            int sum = 0;
+            for (int ii = 0; ii < 16; ++ii) {
+                sum += y[i].qs[j * 16 + ii];
+            }
+            y[i].bsums[j] = sum;
+        }
+        x += 256;
+    }
+}
+
+/* ================================================================
+ * vec_dot_q4_K_q8_K: int8 MAC for Q4_K weights * Q8_K input
+ * Adapted from llama.cpp's ggml_vec_dot_q4_K_q8_K (AVX2, AVX1, NEON, scalar)
+ * The key optimization: nibble extraction to int8, int8 MAC with
+ * per-subblock scale factors, only 8 final float ops per block.
+ */
+float vec_dot_q4_K_q8_K(const void *src_q4, const void *src_q8, int n) {
+    const block_q4_K *x = (const block_q4_K *)src_q4;
+    const block_q8_K *y = (const block_q8_K *)src_q8;
+    int nb = n / 256;
+
+    static const uint32_t kmask1 = 0x3f3f3f3f;
+    static const uint32_t kmask2 = 0x0f0f0f0f;
+    static const uint32_t kmask3 = 0x03030303;
+
+    uint32_t utmp[4];
+
+#ifdef PICOLM_AVX2
+    /* AVX2 path: 256-bit SIMD nibble extraction + maddubs_epi16 */
+    const __m256i m4 = _mm256_set1_epi8(0xF);
+    __m256 acc = _mm256_setzero_ps();
+    __m128 acc_m = _mm_setzero_ps();
+
+    for (int i = 0; i < nb; ++i) {
+        const float d = y[i].d * fp16_to_fp32(x[i].d);
+        const float dmin = -y[i].d * fp16_to_fp32(x[i].dmin);
+
+        memcpy(utmp, x[i].scales, 12);
+        utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+        const uint32_t uaux = utmp[1] & kmask1;
+        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= kmask1;
+
+        const uint8_t *q4 = x[i].qs;
+        const int8_t  *q8 = y[i].qs;
+
+        const __m256i mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32(utmp[3], utmp[2], utmp[1], utmp[0]));
+
+        const __m256i q8sums = _mm256_loadu_si256((const __m256i*)y[i].bsums);
+        const __m128i q8s = _mm_hadd_epi16(_mm256_extracti128_si256(q8sums, 0), _mm256_extracti128_si256(q8sums, 1));
+        const __m128i prod = _mm_madd_epi16(_mm256_extracti128_si256(mins_and_scales, 1), q8s);
+        acc_m = _mm_fmadd_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(prod), acc_m);
+
+        const __m128i sc128 = _mm256_extracti128_si256(mins_and_scales, 0);
+        const __m256i scales256 = _mm256_insertf128_si256(_mm256_castsi128_si256(sc128), sc128, 1);
+
+        __m256i sumi = _mm256_setzero_si256();
+        for (int j = 0; j < 4; ++j) {
+            const __m256i scale_l = _mm256_shuffle_epi8(scales256,
+                _mm256_setr_epi8(0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1, 2,3,2,3,2,3,2,3,2,3,2,3,2,3,2,3));
+            const __m256i scale_h = _mm256_shuffle_epi8(scales256,
+                _mm256_setr_epi8(4,5,4,5,4,5,4,5,4,5,4,5,4,5,4,5, 6,7,6,7,6,7,6,7,6,7,6,7,6,7,6,7));
+
+            const __m256i q4bits = _mm256_loadu_si256((const __m256i*)q4); q4 += 32;
+            const __m256i q4l = _mm256_and_si256(q4bits, m4);
+            const __m256i q4h = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), m4);
+
+            const __m256i q8l = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+            __m256i p16l = _mm256_maddubs_epi16(q4l, q8l);
+            p16l = _mm256_madd_epi16(scale_l, p16l);
+
+            const __m256i q8h = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+            __m256i p16h = _mm256_maddubs_epi16(q4h, q8h);
+            p16h = _mm256_madd_epi16(scale_h, p16h);
+
+            sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p16l, p16h));
+        }
+
+        __m256 vd = _mm256_set1_ps(d);
+        acc = _mm256_fmadd_ps(vd, _mm256_cvtepi32_ps(sumi), acc);
+    }
+
+    acc_m = _mm_add_ps(acc_m, _mm_movehl_ps(acc_m, acc_m));
+    acc_m = _mm_add_ss(acc_m, _mm_movehdup_ps(acc_m));
+
+    __m128 res = _mm256_extractf128_ps(acc, 1);
+    res = _mm_add_ps(res, _mm256_castps256_ps128(acc));
+    res = _mm_add_ps(res, _mm_movehl_ps(res, res));
+    res = _mm_add_ss(res, _mm_movehdup_ps(res));
+
+    return _mm_cvtss_f32(res) + _mm_cvtss_f32(acc_m);
+
+#elif defined(PICOLM_AVX)
+    /* AVX1 path: 128-bit integer + 256-bit float accumulation */
+    const __m128i m4_128 = _mm_set1_epi8(0xF);
+    const __m128i m2 = _mm_set1_epi8(0x2);
+    __m256 acc = _mm256_setzero_ps();
+    __m128 acc_m = _mm_setzero_ps();
+
+    for (int i = 0; i < nb; ++i) {
+        const float d = y[i].d * fp16_to_fp32(x[i].d);
+        const float dmin = -y[i].d * fp16_to_fp32(x[i].dmin);
+
+        const uint8_t *q4 = x[i].qs;
+        const int8_t  *q8 = y[i].qs;
+
+        memcpy(utmp, x[i].scales, 12);
+        utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+        const uint32_t uaux = utmp[1] & kmask1;
+        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= kmask1;
+
+        const __m128i utmps = _mm_set_epi32(utmp[3], utmp[2], utmp[1], utmp[0]);
+        const __m128i scales128 = _mm_cvtepu8_epi16(utmps);
+        const __m128i mins128 = _mm_cvtepu8_epi16(_mm_unpackhi_epi64(utmps, utmps));
+
+        const __m128i q8sums_0 = _mm_loadu_si128((const __m128i*)&y[i].bsums[0]);
+        const __m128i q8sums_1 = _mm_loadu_si128((const __m128i*)&y[i].bsums[8]);
+        const __m128i q8s = _mm_hadd_epi16(q8sums_0, q8sums_1);
+        const __m128i prod = _mm_madd_epi16(mins128, q8s);
+        acc_m = _mm_add_ps(_mm_mul_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(prod)), acc_m);
+
+        __m128i sumi_0 = _mm_setzero_si128();
+        __m128i sumi_1 = _mm_setzero_si128();
+
+        __m128i shuffle = _mm_set1_epi16(0x0100);
+        for (int j = 0; j < 4; ++j) {
+            const __m128i scale_l = _mm_shuffle_epi8(scales128, shuffle);
+            shuffle = _mm_add_epi16(shuffle, m2);
+            const __m128i scale_h = _mm_shuffle_epi8(scales128, shuffle);
+            shuffle = _mm_add_epi16(shuffle, m2);
+
+            __m128i q4bits = _mm_loadu_si128((const __m128i*)q4); q4 += 16;
+            const __m128i q4l_0 = _mm_and_si128(q4bits, m4_128);
+            const __m128i q4h_0 = _mm_and_si128(_mm_srli_epi16(q4bits, 4), m4_128);
+            q4bits = _mm_loadu_si128((const __m128i*)q4); q4 += 16;
+            const __m128i q4l_1 = _mm_and_si128(q4bits, m4_128);
+            const __m128i q4h_1 = _mm_and_si128(_mm_srli_epi16(q4bits, 4), m4_128);
+
+            const __m128i q8l_0 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
+            __m128i p16l = _mm_maddubs_epi16(q4l_0, q8l_0);
+            p16l = _mm_madd_epi16(scale_l, p16l);
+            sumi_0 = _mm_add_epi32(sumi_0, p16l);
+            const __m128i q8l_1 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
+            p16l = _mm_maddubs_epi16(q4l_1, q8l_1);
+            p16l = _mm_madd_epi16(scale_l, p16l);
+            sumi_1 = _mm_add_epi32(sumi_1, p16l);
+
+            const __m128i q8h_0 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
+            __m128i p16h = _mm_maddubs_epi16(q4h_0, q8h_0);
+            p16h = _mm_madd_epi16(scale_h, p16h);
+            sumi_0 = _mm_add_epi32(sumi_0, p16h);
+            const __m128i q8h_1 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
+            p16h = _mm_maddubs_epi16(q4h_1, q8h_1);
+            p16h = _mm_madd_epi16(scale_h, p16h);
+            sumi_1 = _mm_add_epi32(sumi_1, p16h);
+        }
+
+        __m256 vd = _mm256_set1_ps(d);
+        __m256i sumi = _mm256_insertf128_si256(_mm256_castsi128_si256(sumi_0), sumi_1, 1);
+        acc = _mm256_add_ps(_mm256_mul_ps(vd, _mm256_cvtepi32_ps(sumi)), acc);
+    }
+
+    acc_m = _mm_add_ps(acc_m, _mm_movehl_ps(acc_m, acc_m));
+    acc_m = _mm_add_ss(acc_m, _mm_movehdup_ps(acc_m));
+
+    __m128 res = _mm256_extractf128_ps(acc, 1);
+    res = _mm_add_ps(res, _mm256_castps256_ps128(acc));
+    res = _mm_add_ps(res, _mm_movehl_ps(res, res));
+    res = _mm_add_ss(res, _mm_movehdup_ps(res));
+
+    return _mm_cvtss_f32(res) + _mm_cvtss_f32(acc_m);
+
+#else
+    /* Scalar fallback: nibble extraction + int8 MAC */
+    /* Used on NEON (no SIMD Q4_K_q8_K yet) and x86 without AVX */
+    const uint8_t *scales = (const uint8_t *)&utmp[0];
+    const uint8_t *mins   = (const uint8_t *)&utmp[2];
+    int8_t  aux8[256];
+    int16_t aux16[8];
+    float   sums[8] = {0};
+    int32_t aux32[8];
+
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        const uint8_t *q4 = x[i].qs;
+        const int8_t  *q8 = y[i].qs;
+
+        int8_t *a = aux8;
+        for (int j = 0; j < 4; j++) {
+            for (int l = 0; l < 32; l++) a[l] = (int8_t)(q4[l] & 0xF);
+            a += 32;
+            for (int l = 0; l < 32; l++) a[l] = (int8_t)(q4[l] >> 4);
+            a += 32;
+            q4 += 32;
+        }
+
+        memcpy(utmp, x[i].scales, 12);
+        utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+        const uint32_t uaux = utmp[1] & kmask1;
+        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= kmask1;
+
+        int sumi = 0;
+        for (int j = 0; j < 16; j++) sumi += y[i].bsums[j] * (int)mins[j / 2];
+
+        memset(aux32, 0, sizeof(aux32));
+        a = aux8;
+        int is = 0;
+        for (int j = 0; j < 8; j++) {
+            int32_t scale = (int32_t)scales[is++];
+            for (int l = 0; l < 8; l++) aux16[l] = q8[l] * a[l];
+            for (int l = 0; l < 8; l++) aux32[l] += scale * aux16[l];
+            q8 += 8; a += 8;
+            for (int l = 0; l < 8; l++) aux16[l] = q8[l] * a[l];
+            for (int l = 0; l < 8; l++) aux32[l] += scale * aux16[l];
+            q8 += 8; a += 8;
+            for (int l = 0; l < 8; l++) aux16[l] = q8[l] * a[l];
+            for (int l = 0; l < 8; l++) aux32[l] += scale * aux16[l];
+            q8 += 8; a += 8;
+            for (int l = 0; l < 8; l++) aux16[l] = q8[l] * a[l];
+            for (int l = 0; l < 8; l++) aux32[l] += scale * aux16[l];
+            q8 += 8; a += 8;
+        }
+
+        const float d = fp16_to_fp32(x[i].d) * y[i].d;
+        for (int l = 0; l < 8; l++) sums[l] += d * aux32[l];
+
+        const float dmin = fp16_to_fp32(x[i].dmin) * y[i].d;
+        sumf -= dmin * sumi;
+    }
+    for (int l = 0; l < 8; l++) sumf += sums[l];
+    return sumf;
+#endif
+}
+
+/* ================================================================
  * vec_dot_q8_0_q8_0: int8 MAC for two Q8_0 vectors
  *
  * Three tiers (mirrors llama.cpp/llamafile approach):
