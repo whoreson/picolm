@@ -18,6 +18,11 @@
  *   PICOLM_NEON (independent)
  */
 
+/* Forward declarations for use in inline helpers below */
+float fp16_to_fp32(uint16_t h);
+float fp16_to_fp32_lookup(uint16_t h);
+void fp16_table_init(void);
+
 /* --- ARM NEON --- */
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #  define PICOLM_NEON 1
@@ -73,6 +78,33 @@ static inline float hsum_avx(__m256 v) {
     __m128 lo = _mm256_castps256_ps128(v);
     __m128 hi = _mm256_extractf128_ps(v, 1);
     return hsum_sse(_mm_add_ps(lo, hi));
+}
+
+/* Convert 8 FP16 to 8 FP32 in AVX register */
+static inline __m256 fp16x8_to_fp32_inline(const uint16_t *p) {
+#ifdef __F16C__
+    __m128 lo = _mm_cvtph_ps(_mm_loadu_si128((const __m128i *)p));
+    __m128 hi = _mm_cvtph_ps(_mm_loadu_si128((const __m128i *)(p + 4)));
+    return _mm256_insertf128_ps(_mm256_castps128_ps256(lo), hi, 1);
+#else
+    /* No F16C: use lookup table for faster FP16->FP32 conversion */
+    return _mm256_set_ps(
+        fp16_to_fp32_lookup(p[7]), fp16_to_fp32_lookup(p[6]), fp16_to_fp32_lookup(p[5]), fp16_to_fp32_lookup(p[4]),
+        fp16_to_fp32_lookup(p[3]), fp16_to_fp32_lookup(p[2]), fp16_to_fp32_lookup(p[1]), fp16_to_fp32_lookup(p[0]));
+#endif
+}
+#endif
+
+#ifdef PICOLM_SSE2
+/* Convert 4 FP16 to 4 FP32 in SSE register */
+static inline __m128 fp16x4_to_fp32_inline(const uint16_t *p) {
+#ifdef __F16C__
+    return _mm_cvtph_ps(_mm_loadu_si128((const __m128i *)p));
+#else
+    /* No F16C: use lookup table */
+    return _mm_set_ps(
+        fp16_to_fp32_lookup(p[3]), fp16_to_fp32_lookup(p[2]), fp16_to_fp32_lookup(p[1]), fp16_to_fp32_lookup(p[0]));
+#endif
 }
 #endif
 
@@ -150,7 +182,6 @@ typedef struct {
 #pragma pack(pop)
 
 /* ---- FP16 conversion ---- */
-float    fp16_to_fp32(uint16_t h);
 uint16_t fp32_to_fp16(float f);
 
 /* ---- Dequantize a row of weights into float output buffer ---- */
@@ -181,6 +212,7 @@ float vec_dot_q6_K_f32(const void *src, const float *x, int n);
 float vec_dot_f32_f32(const void *src, const float *x, int n);
 float vec_dot_q8_0_f32(const void *src, const float *x, int n);
 float vec_dot_q4_0_f32(const void *src, const float *x, int n);
+/* fp16-fp32 dot product: sum of fp16_to_fp32(k[i]) * x[i] */
 float vec_dot_f16_f32(const void *src, const float *x, int n);
 float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n);
 float vec_dot_q8_0_q8_0_deltas(const void *qx, const float *qx_d, const void *qw, int n);

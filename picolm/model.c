@@ -646,10 +646,7 @@ float *model_forward(model_t *m, int token, int pos) {
             for (int t = 0; t <= pos; t++) {
                 /* Compute score: dot(Q_h, K_t) / sqrt(head_dim) */
                 const uint16_t *kt = kcache_layer + (size_t)t * kv_dim + kv_h * head_dim;
-                float score = 0.0f;
-                for (int d = 0; d < head_dim; d++) {
-                    score += qh[d] * fp16_to_fp32(kt[d]);
-                }
+                float score = vec_dot_f16_f32(kt, qh, head_dim);
                 score /= sqrtf((float)head_dim);
 
                 /* Online softmax update */
@@ -658,24 +655,97 @@ float *model_forward(model_t *m, int token, int pos) {
                 if (score > max_score) {
                     float correction = expf(max_score - score);
                     sum_exp = sum_exp * correction + 1.0f;
-                    for (int d = 0; d < head_dim; d++) {
-                        acc[d] = acc[d] * correction + fp16_to_fp32(vt[d]);
+                    /* FMA: acc = acc * correction + dequant(vt) */
+                    {
+                        const float corr_f32 = correction;
+#ifdef PICOLM_AVX
+                        int d = 0;
+                        for (; d + 7 < head_dim; d += 8) {
+                            __m256 af = _mm256_loadu_ps(acc + d);
+                            __m256 vf = fp16x8_to_fp32_inline(vt + d);
+#ifdef __FMA__
+                            af = _mm256_fmadd_ps(af, _mm256_set1_ps(corr_f32), vf);
+#else
+                            af = _mm256_add_ps(_mm256_mul_ps(af, _mm256_set1_ps(corr_f32)), vf);
+#endif
+                            _mm256_storeu_ps(acc + d, af);
+                        }
+                        for (; d < head_dim; d++) {
+                            acc[d] = acc[d] * corr_f32 + fp16_to_fp32(vt[d]);
+                        }
+#elif defined(PICOLM_SSE2)
+                        int d = 0;
+                        for (; d + 3 < head_dim; d += 4) {
+                            __m128 af = _mm_loadu_ps(acc + d);
+                            __m128 vf = fp16x4_to_fp32_inline(vt + d);
+                            af = _mm_add_ps(_mm_mul_ps(af, _mm_set1_ps(corr_f32)), vf);
+                            _mm_storeu_ps(acc + d, af);
+                        }
+                        for (; d < head_dim; d++) {
+                            acc[d] = acc[d] * corr_f32 + fp16_to_fp32(vt[d]);
+                        }
+#else
+                        for (int d = 0; d < head_dim; d++) {
+                            acc[d] = acc[d] * corr_f32 + fp16_to_fp32(vt[d]);
+                        }
+#endif
                     }
                     max_score = score;
                 } else {
                     float w = expf(score - max_score);
                     sum_exp += w;
-                    for (int d = 0; d < head_dim; d++) {
-                        acc[d] += w * fp16_to_fp32(vt[d]);
+                    /* acc += w * dequant(vt) */
+                    {
+#ifdef PICOLM_AVX
+                        int d = 0;
+                        __m256 wf = _mm256_set1_ps(w);
+                        for (; d + 7 < head_dim; d += 8) {
+                            __m256 af = _mm256_loadu_ps(acc + d);
+                            __m256 vf = fp16x8_to_fp32_inline(vt + d);
+                            _mm256_storeu_ps(acc + d, _mm256_add_ps(af, _mm256_mul_ps(wf, vf)));
+                        }
+                        for (; d < head_dim; d++) acc[d] += w * fp16_to_fp32(vt[d]);
+#elif defined(PICOLM_SSE2)
+                        int d = 0;
+                        __m128 wf = _mm_set1_ps(w);
+                        for (; d + 3 < head_dim; d += 4) {
+                            __m128 af = _mm_loadu_ps(acc + d);
+                            __m128 vf = fp16x4_to_fp32_inline(vt + d);
+                            _mm_storeu_ps(acc + d, _mm_add_ps(af, _mm_mul_ps(wf, vf)));
+                        }
+                        for (; d < head_dim; d++) acc[d] += w * fp16_to_fp32(vt[d]);
+#else
+                        for (int d = 0; d < head_dim; d++) acc[d] += w * fp16_to_fp32(vt[d]);
+#endif
                     }
                 }
             }
 
             /* Normalize */
             float inv_sum = 1.0f / sum_exp;
-            for (int d = 0; d < head_dim; d++) {
-                xbh[d] = acc[d] * inv_sum;
+#ifdef PICOLM_AVX
+            {
+                __m256 inv = _mm256_set1_ps(inv_sum);
+                int d = 0;
+                for (; d + 7 < head_dim; d += 8) {
+                    __m256 af = _mm256_loadu_ps(acc + d);
+                    _mm256_storeu_ps(xbh + d, _mm256_mul_ps(af, inv));
+                }
+                for (; d < head_dim; d++) xbh[d] = acc[d] * inv_sum;
             }
+#elif defined(PICOLM_SSE2)
+            {
+                __m128 inv = _mm_set1_ps(inv_sum);
+                int d = 0;
+                for (; d + 3 < head_dim; d += 4) {
+                    __m128 af = _mm_loadu_ps(acc + d);
+                    _mm_storeu_ps(xbh + d, _mm_mul_ps(af, inv));
+                }
+                for (; d < head_dim; d++) xbh[d] = acc[d] * inv_sum;
+            }
+#else
+            for (int d = 0; d < head_dim; d++) xbh[d] = acc[d] * inv_sum;
+#endif
         }
 
         /* Output projection */
