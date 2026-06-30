@@ -37,6 +37,11 @@ static inline float vaddvq_f32_compat(float32x4_t v) {
 }
 #endif
 
+/* --- ARM NEON detection --- */
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#  define PICOLM_NEON 1
+#endif
+
 /* --- x86 SIMD: detect highest level, then propagate downward --- */
 
 /* AVX2 implies AVX + SSE3 + SSE2 */
@@ -92,6 +97,23 @@ static inline __m256 fp16x8_to_fp32_inline(const uint16_t *p) {
         fp16_to_fp32_lookup(p[7]), fp16_to_fp32_lookup(p[6]), fp16_to_fp32_lookup(p[5]), fp16_to_fp32_lookup(p[4]),
         fp16_to_fp32_lookup(p[3]), fp16_to_fp32_lookup(p[2]), fp16_to_fp32_lookup(p[1]), fp16_to_fp32_lookup(p[0]));
 #endif
+}
+#endif
+
+/* --- ARM NEON SIMD helpers --- */
+#ifdef PICOLM_NEON
+#  include <arm_neon.h>
+static inline float hsum_neon(float32x4_t v) {
+    float32x2_t r = vpadd_f32(vget_low_f32(v), vget_high_f32(v));
+    return vget_lane_f32(vpadd_f32(r, r), 0);
+}
+
+static inline float32x4_t fp16x4_to_fp32_inline(const uint16_t *p) {
+    float32x4_t r = vdupq_n_f32(fp16_to_fp32_lookup(p[0]));
+    r = vsetq_lane_f32(fp16_to_fp32_lookup(p[1]), r, 1);
+    r = vsetq_lane_f32(fp16_to_fp32_lookup(p[2]), r, 2);
+    r = vsetq_lane_f32(fp16_to_fp32_lookup(p[3]), r, 3);
+    return r;
 }
 #endif
 
