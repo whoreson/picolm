@@ -27,7 +27,7 @@ static double get_time_ms(void) {
 #endif
 
 static void usage(const char *prog) {
-    fprintf(stderr, "PicoLLM — ultra-lightweight LLM inference engine\n\n");
+    fprintf(stderr, "PicoLLM - ultra-lightweight LLM inference engine\n\n");
     fprintf(stderr, "Usage: %s <model.gguf> [options]\n", prog);
     fprintf(stderr, "\nGeneration options:\n");
     fprintf(stderr, "  -p <prompt>    Input prompt (or pipe via stdin)\n");
