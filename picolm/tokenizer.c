@@ -263,6 +263,37 @@ const char *tokenizer_decode(const tokenizer_t *t, int prev_token, int token) {
         return space_buf;
     }
 
+    /* Handle U+00A0 NO-BREAK SPACE -> regular space */
+    if ((unsigned char)str[0] == 0xC2 && (unsigned char)str[1] == 0xA0) {
+        static char nbsp_buf[256];
+        int len = (int)strlen(str + 2);
+        if (len >= (int)sizeof(nbsp_buf)) len = (int)sizeof(nbsp_buf) - 1;
+        nbsp_buf[0] = ' ';
+        if (len > 0) {
+            memcpy(nbsp_buf + 1, str + 2, (size_t)len);
+            nbsp_buf[1 + len] = '\0';
+        } else {
+            nbsp_buf[1] = '\0';
+        }
+        return nbsp_buf;
+    }
+
+    /* Handle U+0100 (LATIN SMALL LETTER A WITH OGONEK) as space marker */
+    /* Some GGUF tokenizers use U+0100 (0xC4 0xA0) instead of U+2581 */
+    if ((unsigned char)str[0] == 0xC4 && (unsigned char)str[1] == 0xA0) {
+        static char u100_buf[256];
+        int len = (int)strlen(str + 2);
+        if (len >= (int)sizeof(u100_buf)) len = (int)sizeof(u100_buf) - 1;
+        u100_buf[0] = ' ';
+        if (len > 0) {
+            memcpy(u100_buf + 1, str + 2, (size_t)len);
+            u100_buf[1 + len] = '\0';
+        } else {
+            u100_buf[1] = '\0';
+        }
+        return u100_buf;
+    }
+
     return str;
 }
 
