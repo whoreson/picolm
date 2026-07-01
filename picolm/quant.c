@@ -1768,6 +1768,11 @@ float vec_dot_q8_0_f32(const void *src, const float *x, int n) {
 
 /* ================================================================
  * vec_dot_q4_0_f32: fused dequant + dot for Q4_0 x float32
+ *
+ * Q4_0 block: 16 bytes qs + 2 bytes d(FP16) = 18 bytes for 32 values.
+ *   vals[0..15]  = low  nibble of qs[0..15]  (qs[j] & 0xF)
+ *   vals[16..31] = high nibble of qs[0..15]  (qs[j] >> 4)
+ * Each val in [0..15], offset by -8 to get signed [-8..+7].
  * ================================================================ */
 
 float vec_dot_q4_0_f32(const void *src, const float *x, int n) {
@@ -1776,107 +1781,15 @@ float vec_dot_q4_0_f32(const void *src, const float *x, int n) {
     float sumf = 0.0f;
 
     for (int i = 0; i < nb; i++) {
-        const block_q4_0 *b = &blocks[i];
-        float d = fp16_to_fp32(b->d);
-        const uint8_t *qs = b->qs;
+        float d = fp16_to_fp32(blocks[i].d);
+        const uint8_t *qs = blocks[i].qs;
         const float *xp = x + i * 32;
-
-#ifdef PICOLM_AVX2
-        __m256 acc = _mm256_setzero_ps();
-        const __m128i mask4  = _mm_set1_epi8(0x0F);
-        const __m128i bias8  = _mm_set1_epi8(8);
-
-        for (int j = 0; j < 16; j += 8) {
-            __m128i q8 = _mm_loadl_epi64((const __m128i *)(qs + j));
-            __m128i lo = _mm_and_si128(q8, mask4);
-            __m128i hi = _mm_and_si128(_mm_srli_epi16(q8, 4), mask4);
-            __m128i lo_s = _mm_sub_epi8(lo, bias8);
-            __m128i hi_s = _mm_sub_epi8(hi, bias8);
-            __m256 qf_lo = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo_s));
-            __m256 qf_hi = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi_s));
-            __m256 xf_lo = _mm256_loadu_ps(xp + j);
-            __m256 xf_hi = _mm256_loadu_ps(xp + j + 8);
-            acc = _mm256_add_ps(acc, _mm256_mul_ps(qf_lo, xf_lo));
-            acc = _mm256_add_ps(acc, _mm256_mul_ps(qf_hi, xf_hi));
+        float block_sum = 0.0f;
+        for (int j = 0; j < 16; j++) {
+            block_sum += (float)((qs[j] & 0xF) - 8) * xp[j];
+            block_sum += (float)((qs[j] >> 4) - 8) * xp[j + 16];
         }
-        sumf += d * hsum_avx(acc);
-
-#elif defined(PICOLM_AVX)
-        __m256 acc = _mm256_setzero_ps();
-        const __m128i mask4  = _mm_set1_epi8(0x0F);
-        const __m128i bias8  = _mm_set1_epi8(8);
-        const __m128i zero_i = _mm_setzero_si128();
-
-        for (int j = 0; j < 16; j += 8) {
-            __m128i q8 = _mm_loadl_epi64((const __m128i *)(qs + j));
-            __m128i lo = _mm_and_si128(q8, mask4);
-            __m128i hi = _mm_and_si128(_mm_srli_epi16(q8, 4), mask4);
-            __m128i lo_s = _mm_sub_epi8(lo, bias8);
-            __m128i hi_s = _mm_sub_epi8(hi, bias8);
-
-            __m128i lo16 = _mm_srai_epi16(_mm_unpacklo_epi8(zero_i, lo_s), 8);
-            __m128i hi16 = _mm_srai_epi16(_mm_unpacklo_epi8(zero_i, hi_s), 8);
-            __m256 qf_lo = _mm256_cvtepi32_ps(_mm256_set_m128i(
-                _mm_srai_epi32(_mm_unpackhi_epi16(zero_i, lo16), 16),
-                _mm_srai_epi32(_mm_unpacklo_epi16(zero_i, lo16), 16)));
-            __m256 qf_hi = _mm256_cvtepi32_ps(_mm256_set_m128i(
-                _mm_srai_epi32(_mm_unpackhi_epi16(zero_i, hi16), 16),
-                _mm_srai_epi32(_mm_unpacklo_epi16(zero_i, hi16), 16)));
-
-            __m256 xf_lo = _mm256_loadu_ps(xp + j);
-            __m256 xf_hi = _mm256_loadu_ps(xp + j + 8);
-            acc = _mm256_add_ps(acc, _mm256_mul_ps(qf_lo, xf_lo));
-            acc = _mm256_add_ps(acc, _mm256_mul_ps(qf_hi, xf_hi));
-        }
-        sumf += d * hsum_avx(acc);
-
-#elif defined(PICOLM_SSE2)
-        __m128 acc0 = _mm_setzero_ps();
-        __m128 acc1 = _mm_setzero_ps();
-        const __m128i mask4  = _mm_set1_epi8(0x0F);
-        const __m128i bias8  = _mm_set1_epi8(8);
-        const __m128i zero_i = _mm_setzero_si128();
-
-        for (int j = 0; j < 16; j += 4) {
-            /* Load 4 bytes, extract 8 nibbles (lo + hi) */
-            __m128i q8 = _mm_cvtsi64_si128(*((int64_t*)(qs + j)));
-            __m128i lo = _mm_and_si128(q8, mask4);
-            __m128i hi = _mm_and_si128(_mm_srli_epi16(q8, 4), mask4);
-            __m128i lo_s = _mm_sub_epi8(lo, bias8);
-            __m128i hi_s = _mm_sub_epi8(hi, bias8);
-
-            /* sign-extend int8 -> int16 -> int32 -> float */
-            __m128i lo16 = _mm_srai_epi16(_mm_unpacklo_epi8(zero_i, lo_s), 8);
-            __m128i hi16 = _mm_srai_epi16(_mm_unpacklo_epi8(zero_i, hi_s), 8);
-            __m128 qf0 = _mm_cvtepi32_ps(_mm_srai_epi32(_mm_unpacklo_epi16(zero_i, lo16), 16));
-            __m128 qf1 = _mm_cvtepi32_ps(_mm_srai_epi32(_mm_unpackhi_epi16(zero_i, lo16), 16));
-            __m128 qf2 = _mm_cvtepi32_ps(_mm_srai_epi32(_mm_unpacklo_epi16(zero_i, hi16), 16));
-            __m128 qf3 = _mm_cvtepi32_ps(_mm_srai_epi32(_mm_unpackhi_epi16(zero_i, hi16), 16));
-
-            __m128 xf0 = _mm_loadu_ps(xp + j);
-            __m128 xf1 = _mm_loadu_ps(xp + j + 4);
-            acc0 = _mm_add_ps(acc0, _mm_mul_ps(qf0, xf0));
-            acc1 = _mm_add_ps(acc1, _mm_mul_ps(qf1, xf1));
-
-            __m128 xf2 = _mm_loadu_ps(xp + j + 8);
-            __m128 xf3 = _mm_loadu_ps(xp + j + 12);
-            acc0 = _mm_add_ps(acc0, _mm_mul_ps(qf2, xf2));
-            acc1 = _mm_add_ps(acc1, _mm_mul_ps(qf3, xf3));
-        }
-        sumf += d * hsum_sse(_mm_add_ps(acc0, acc1));
-
-#else
-        for (int j = 0; j < 32; j++) {
-            uint8_t nibble;
-            if (j < 16) {
-                nibble = qs[j] & 0xF;
-            } else {
-                nibble = qs[j - 16] >> 4;
-            }
-            sumf += (float)(nibble - 8) * xp[j];
-        }
-        sumf *= d;
-#endif
+        sumf += d * block_sum;
     }
     return sumf;
 }
