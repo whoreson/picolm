@@ -151,7 +151,10 @@ static void tp_dispatch(int nt) {
     pthread_mutex_lock(&tp_mutex);
     tp_active = 0;
     tp_tasks = nt;
-    pthread_cond_broadcast(&tp_cond);
+    /* Signal exactly nt-1 workers (not broadcast to all MAX_THREADS-1) */
+    for (int i = 0; i < nt - 1; i++) {
+        pthread_cond_signal(&tp_cond);
+    }
     while (tp_active > 0) {
         pthread_cond_wait(&tp_done, &tp_mutex);
     }
@@ -278,6 +281,11 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
                 }
                 tp_dispatch(nt);
 #endif
+            } else {
+                /* Threading disabled (too few rows or single-thread): compute remaining rows */
+                for (int i = row; i < d; i++) {
+                    out[i] = vec_dot_q8_0_q8_0_deltas(qx, qx_d, wptr + (size_t)i * row_bytes, n);
+                }
             }
 
             if (qx_buf != scratch_buf) free(qx_buf);
@@ -343,6 +351,10 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
                 }
                 tp_dispatch(nt);
 #endif
+            } else {
+                for (int i = row; i < d; i++) {
+                    out[i] = vec_dot_q4_0_q8_0(wptr + (size_t)i * row_bytes, qx, n);
+                }
             }
 
             if (qx_owned) free(qx);
@@ -408,6 +420,10 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
                 }
                 tp_dispatch(nt);
 #endif
+            } else {
+                for (int i = row; i < d; i++) {
+                    out[i] = vec_dot_q4_K_q8_K(wptr + (size_t)i * row_bytes, qx, n);
+                }
             }
 
             if (qx_owned) free(qx);
@@ -460,6 +476,10 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
         }
         tp_dispatch(nt);
 #endif
+    } else {
+        for (int i = row; i < d; i++) {
+            out[i] = vec_dot(wptr + (size_t)i * row_bytes, x, n, qtype);
+        }
     }
 }
 
