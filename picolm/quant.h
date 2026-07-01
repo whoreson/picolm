@@ -246,6 +246,8 @@ float vec_dot_q4_0_f32(const void *src, const float *x, int n);
 float vec_dot_f16_f32(const void *src, const float *x, int n);
 float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n);
 float vec_dot_q8_0_q8_0_deltas(const void *qx, const float *qx_d, const void *qw, int n);
+/* Q4_0 * Q8_0 dot product: Q4_0 weights with pre-quantized Q8_0 input */
+float vec_dot_q4_0_q8_0(const void *src_q4, const void *src_q8, int n);
 /* Q4_K * Q8_K dot product: Q4_K weights with pre-quantized Q8_K input */
 float vec_dot_q4_K_q8_K(const void *src_q4, const void *src_q8, int n);
 
