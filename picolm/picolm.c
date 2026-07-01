@@ -132,7 +132,9 @@ int main(int argc, char **argv) {
     /* Load model */
     fprintf(stderr, "Loading model: %s\n", model_path);
     fprintf(stderr, "SIMD: %s\n",
-#if defined(PICOLM_AVX2)
+#if defined(PICOLM_AVX512)
+        "AVX-512"
+#elif defined(PICOLM_AVX2)
         "AVX2"
 #elif defined(PICOLM_AVX)
         "AVX"
