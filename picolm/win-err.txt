@@ -1,0 +1,19 @@
+gcc -O3 -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic -march=native -o picolm picolm.c model.c tensor.c quant.c tokenizer.c sampler.c grammar.c -lm -lpthread
+tensor.c:238:6: error: conflicting types for 'tensor_threadpool_init'; have 'void(void)'
+  238 | void tensor_threadpool_init(void) {}
+      |      ^~~~~~~~~~~~~~~~~~~~~~
+In file included from tensor.c:1:
+tensor.h:15:6: note: previous declaration of 'tensor_threadpool_init' with type 'void(int)'
+   15 | void tensor_threadpool_init(int n_threads);
+      |      ^~~~~~~~~~~~~~~~~~~~~~
+tensor.c: In function 'matmul':
+tensor.c:301:56: error: 'matmul_worker' undeclared (first use in this function); did you mean 'matmul_worker_f'?
+  301 |                     threads[t] = CreateThread(NULL, 0, matmul_worker, &tasks[t], 0, NULL);
+      |                                                        ^~~~~~~~~~~~~
+      |                                                        matmul_worker_f
+tensor.c:301:56: note: each undeclared identifier is reported only once for each function it appears in
+tensor.c: At top level:
+tensor.c:210:13: warning: 'matmul_worker_f' defined but not used [-Wunused-function]
+  210 | static void matmul_worker_f(matmul_task_t *t) {
+      |             ^~~~~~~~~~~~~~~
+make: *** [Makefile:38: picolm] Error 1
