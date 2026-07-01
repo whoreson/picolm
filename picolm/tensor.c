@@ -254,7 +254,9 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
         int nb = n / 32;
         /* Pre-allocate buffer for: quantized x + pre-converted x deltas */
         size_t total_buf = q8_row_size + nb * sizeof(float);
-        float *qx_buf = scratch_buf ? (float *)scratch_buf : (float *)malloc(total_buf);
+        /* When threading is used, always malloc to avoid data races on scratch_buf */
+        float *qx_buf = (n_threads > 1) ? (float *)malloc(total_buf) :
+                        (scratch_buf ? (float *)scratch_buf : (float *)malloc(total_buf));
         if (!qx_buf) qx_buf = (float *)malloc(total_buf);
         if (qx_buf) {
             quantize_row_q8_0(x, qx_buf, n);
@@ -328,7 +330,8 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
         size_t qx_size = (n / 32) * sizeof(block_q8_0);
         block_q8_0 *qx = NULL;
         int qx_owned = 0;
-        if (scratch_buf != NULL && qx_size <= (size_t)scratch_size) {
+        /* When threading, always malloc to avoid data races */
+        if (n_threads <= 1 && scratch_buf != NULL && qx_size <= (size_t)scratch_size) {
             qx = (block_q8_0 *)scratch_buf;
         } else {
             qx = (block_q8_0 *)malloc(qx_size);
@@ -398,7 +401,8 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
         size_t qx_size = (n / 256) * sizeof(block_q8_K);
         block_q8_K *qx = NULL;
         int qx_owned = 0;  /* whether we malloc'd qx */
-        if (scratch_buf != NULL && qx_size <= (size_t)scratch_size) {
+        /* When threading, always malloc to avoid data races */
+        if (n_threads <= 1 && scratch_buf != NULL && qx_size <= (size_t)scratch_size) {
             qx = (block_q8_K *)scratch_buf;
         } else {
             qx = (block_q8_K *)malloc(qx_size);
