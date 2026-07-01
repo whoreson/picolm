@@ -33,7 +33,7 @@ void tensor_set_threads(int t) {
 
 /* Threshold: skip threading if output vector is smaller than this.
  * Avoids mutex overhead for tiny matmuls. */
-static int matmul_min_rows = 256;
+static int matmul_min_rows = 1024;
 
 void tensor_set_matmul_min_rows(int r) {
     if (r < 0) r = 0;
