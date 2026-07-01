@@ -136,9 +136,9 @@ static void *tp_worker(void *arg) {
     return NULL;
 }
 
-void tensor_threadpool_init(void) {
+void tensor_threadpool_init(int n_threads) {
     if (tp_nt > 0) return;
-    int nw = MAX_THREADS - 1;
+    int nw = n_threads - 1;
     if (nw <= 0) return;
     tp_stop = 0;
     tp_active = 0;
@@ -183,6 +183,9 @@ static void tp_set_task(int idx, float *out, const float *x, const float *x_d,
  * Phase 2: Reset tp_tasks so workers know they're done, wait until all complete
  */
 static void tp_dispatch(int nt) {
+    /* Safety: cap nt to available workers + 1 (main thread) */
+    if (nt > tp_nt + 1) nt = tp_nt + 1;
+    if (nt <= 1) return;  /* No workers to dispatch to */
     pthread_mutex_lock(&tp_mutex);
     tp_active = 0;
     tp_tasks = nt;

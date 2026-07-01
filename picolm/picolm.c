@@ -157,7 +157,7 @@ int main(int argc, char **argv) {
     }
 
     tensor_set_threads(num_threads);
-    tensor_threadpool_init();
+    tensor_threadpool_init(num_threads);
 
     /* Load tokenizer */
     tokenizer_t tokenizer;
