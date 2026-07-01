@@ -151,12 +151,7 @@ static void tp_dispatch(int nt) {
     pthread_mutex_lock(&tp_mutex);
     tp_active = 0;
     tp_tasks = nt;
-    /* Only signal the workers that actually have tasks (1..nt-1).
-     * broadcast wakes all MAX_THREADS-1 workers even if only a few
-     * have work, causing heavy mutex contention. */
-    for (int i = 0; i < nt - 1; i++) {
-        pthread_cond_signal(&tp_cond);
-    }
+    pthread_cond_broadcast(&tp_cond);
     while (tp_active > 0) {
         pthread_cond_wait(&tp_done, &tp_mutex);
     }
