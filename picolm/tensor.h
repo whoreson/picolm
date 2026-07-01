@@ -12,7 +12,7 @@ void tensor_init_scratch(float *buf, int size);
 /* Set number of threads for matmul (default: 1) */
 void tensor_set_threads(int t);
 int  tensor_get_threads(void);
-void tensor_threadpool_init(void);
+void tensor_threadpool_init(int n_threads);
 void tensor_threadpool_free(void);
 
 /* Matrix-vector multiply: out[d] = W[d, n] @ x[n]

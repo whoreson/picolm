@@ -1581,7 +1581,7 @@ float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n) {
             const int32x4_t s = vaddq_s32(vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)),
                                           vaddq_s32(vpaddlq_s16(p2), vpaddlq_s16(p3)));
             const float d = fp16_to_fp32(x[i].d) * fp16_to_fp32(w[i].d);
-            sumv0 = vmlaq_n_f32(sumv0, s, d);
+            sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(s), d);
         }
         const int8x16_t x1_0 = vld1q_s8(x[i+1].qs);
         const int8x16_t x1_1 = vld1q_s8(x[i+1].qs + 16);
@@ -1595,7 +1595,7 @@ float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n) {
             const int32x4_t s = vaddq_s32(vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)),
                                           vaddq_s32(vpaddlq_s16(p2), vpaddlq_s16(p3)));
             const float d = fp16_to_fp32(x[i+1].d) * fp16_to_fp32(w[i+1].d);
-            sumv1 = vmlaq_n_f32(sumv1, s, d);
+            sumv1 = vmlaq_n_f32(sumv1, vcvtq_f32_s32(s), d);
         }
     }
     sumf = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
@@ -1727,7 +1727,7 @@ float vec_dot_q8_0_q8_0_deltas(const void *qx, const float *qx_d, const void *qw
             const int32x4_t s = vaddq_s32(vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)),
                                           vaddq_s32(vpaddlq_s16(p2), vpaddlq_s16(p3)));
             const float d = qx_d[i] * fp16_to_fp32(w[i].d);
-            sumv0 = vmlaq_n_f32(sumv0, s, d);
+            sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(s), d);
         }
         const int8x16_t x1_0 = vld1q_s8(x[i+1].qs);
         const int8x16_t x1_1 = vld1q_s8(x[i+1].qs + 16);
@@ -1741,7 +1741,7 @@ float vec_dot_q8_0_q8_0_deltas(const void *qx, const float *qx_d, const void *qw
             const int32x4_t s = vaddq_s32(vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)),
                                           vaddq_s32(vpaddlq_s16(p2), vpaddlq_s16(p3)));
             const float d = qx_d[i+1] * fp16_to_fp32(w[i+1].d);
-            sumv1 = vmlaq_n_f32(sumv1, s, d);
+            sumv1 = vmlaq_n_f32(sumv1, vcvtq_f32_s32(s), d);
         }
     }
     sumf = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
