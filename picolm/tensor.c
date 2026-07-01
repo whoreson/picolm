@@ -31,6 +31,15 @@ void tensor_set_threads(int t) {
     n_threads = t;
 }
 
+/* Threshold: skip threading if output vector is smaller than this.
+ * Avoids mutex overhead for tiny matmuls. */
+static int matmul_min_rows = 256;
+
+void tensor_set_matmul_min_rows(int r) {
+    if (r < 0) r = 0;
+    matmul_min_rows = r;
+}
+
 int tensor_get_threads(void) {
     return n_threads;
 }
@@ -47,16 +56,22 @@ typedef struct {
     gguf_type_t  qtype;
 } matmul_task_t;
 
-static
-#ifdef _WIN32
-DWORD WINAPI
-#else
-void *
-#endif
-matmul_worker(void *arg) {
-    matmul_task_t *t = (matmul_task_t *)arg;
+#ifndef _WIN32
+
+/* Persistent thread pool */
+static pthread_t       tp_threads[MAX_THREADS];
+static pthread_mutex_t tp_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  tp_cond  = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t  tp_done  = PTHREAD_COND_INITIALIZER;
+static volatile int    tp_nt    = 0;
+static volatile int    tp_stop  = 0;
+static volatile int    tp_tasks = 0;
+static volatile int    tp_active= 0;
+static matmul_task_t   tp_tasks_arr[MAX_THREADS];
+
+/* Core worker logic (called by pool or directly) */
+static void matmul_worker_f(matmul_task_t *t) {
     if (t->qtype == GGUF_TYPE_Q8_0 && t->x) {
-        /* Fast path: x is already quantized to Q8_0, with pre-converted deltas */
         const block_q8_0 *qx = (const block_q8_0 *)t->x;
         const float *qx_d = t->x_d;
         for (int i = t->start; i < t->end; i++) {
@@ -64,14 +79,12 @@ matmul_worker(void *arg) {
                                                   t->W + (size_t)i * t->row_bytes, t->n);
         }
     } else if (t->qtype == GGUF_TYPE_Q4_K && t->x) {
-        /* Fast path: x is already quantized to Q8_K */
         const block_q8_K *qx = (const block_q8_K *)t->x;
         for (int i = t->start; i < t->end; i++) {
             t->out[i] = vec_dot_q4_K_q8_K(
                 t->W + (size_t)i * t->row_bytes, qx, t->n);
         }
     } else if (t->qtype == GGUF_TYPE_Q4_0 && t->x) {
-        /* Fast path: x is already quantized to Q8_0 */
         const block_q8_0 *qx = (const block_q8_0 *)t->x;
         for (int i = t->start; i < t->end; i++) {
             t->out[i] = vec_dot_q4_0_q8_0(
@@ -83,12 +96,122 @@ matmul_worker(void *arg) {
                                 t->x, t->n, t->qtype);
         }
     }
-#ifdef _WIN32
-    return 0;
-#else
-    return NULL;
-#endif
 }
+
+/* Pool worker thread: sleeps until assigned a task */
+static void *tp_worker(void *arg) {
+    int my_idx = *(int *)arg;
+    for (;;) {
+        pthread_mutex_lock(&tp_mutex);
+        while (tp_tasks < my_idx && !tp_stop) {
+            pthread_cond_wait(&tp_cond, &tp_mutex);
+        }
+        if (tp_stop) {
+            pthread_mutex_unlock(&tp_mutex);
+            break;
+        }
+        matmul_task_t task = tp_tasks_arr[my_idx];
+        tp_active++;
+        pthread_mutex_unlock(&tp_mutex);
+        matmul_worker_f(&task);
+        pthread_mutex_lock(&tp_mutex);
+        tp_active--;
+        if (tp_active == 0) {
+            pthread_cond_signal(&tp_done);
+        }
+        pthread_mutex_unlock(&tp_mutex);
+    }
+    return NULL;
+}
+
+void tensor_threadpool_init(void) {
+    if (tp_nt > 0) return;
+    int nw = MAX_THREADS - 1;
+    if (nw <= 0) return;
+    tp_stop = 0;
+    for (int i = 0; i < nw; i++) {
+        int *idx = malloc(sizeof(int));
+        *idx = i + 1;
+        pthread_create(&tp_threads[i], NULL, tp_worker, idx);
+    }
+    tp_nt = nw;
+}
+
+void tensor_threadpool_free(void) {
+    if (tp_nt <= 0) return;
+    tp_stop = 1;
+    pthread_cond_broadcast(&tp_cond);
+    for (int i = 0; i < tp_nt; i++) {
+        pthread_join(tp_threads[i], NULL);
+    }
+    tp_nt = 0;
+}
+
+static void tp_dispatch(int nt) {
+    pthread_mutex_lock(&tp_mutex);
+    tp_active = 0;
+    tp_tasks = nt;
+    /* Only signal the workers that actually have tasks (1..nt-1).
+     * broadcast wakes all MAX_THREADS-1 workers even if only a few
+     * have work, causing heavy mutex contention. */
+    for (int i = 0; i < nt - 1; i++) {
+        pthread_cond_signal(&tp_cond);
+    }
+    while (tp_active > 0) {
+        pthread_cond_wait(&tp_done, &tp_mutex);
+    }
+    tp_tasks = 0;
+    pthread_mutex_unlock(&tp_mutex);
+}
+
+static void tp_set_task(int idx, float *out, const float *x, const float *x_d,
+                        const char *W, size_t row_bytes, int n,
+                        int start, int end, gguf_type_t qtype) {
+    tp_tasks_arr[idx].out       = out;
+    tp_tasks_arr[idx].x         = x;
+    tp_tasks_arr[idx].x_d       = x_d;
+    tp_tasks_arr[idx].W         = W;
+    tp_tasks_arr[idx].row_bytes = row_bytes;
+    tp_tasks_arr[idx].n         = n;
+    tp_tasks_arr[idx].start     = start;
+    tp_tasks_arr[idx].end       = end;
+    tp_tasks_arr[idx].qtype     = qtype;
+}
+
+#else
+
+static void matmul_worker_f(matmul_task_t *t) {
+    if (t->qtype == GGUF_TYPE_Q8_0 && t->x) {
+        const block_q8_0 *qx = (const block_q8_0 *)t->x;
+        const float *qx_d = t->x_d;
+        for (int i = t->start; i < t->end; i++) {
+            t->out[i] = vec_dot_q8_0_q8_0_deltas(qx, qx_d,
+                                                  t->W + (size_t)i * t->row_bytes, t->n);
+        }
+    } else if (t->qtype == GGUF_TYPE_Q4_K && t->x) {
+        const block_q8_K *qx = (const block_q8_K *)t->x;
+        for (int i = t->start; i < t->end; i++) {
+            t->out[i] = vec_dot_q4_K_q8_K(
+                t->W + (size_t)i * t->row_bytes, qx, t->n);
+        }
+    } else if (t->qtype == GGUF_TYPE_Q4_0 && t->x) {
+        const block_q8_0 *qx = (const block_q8_0 *)t->x;
+        for (int i = t->start; i < t->end; i++) {
+            t->out[i] = vec_dot_q4_0_q8_0(
+                t->W + (size_t)i * t->row_bytes, qx, t->n);
+        }
+    } else {
+        for (int i = t->start; i < t->end; i++) {
+            t->out[i] = vec_dot(t->W + (size_t)i * t->row_bytes,
+                                t->x, t->n, t->qtype);
+        }
+    }
+}
+
+void tensor_threadpool_init(void) {}
+void tensor_threadpool_free(void) {}
+
+#endif
 
 void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t qtype) {
     size_t row_bytes = gguf_type_row_size(qtype, n);
@@ -121,52 +244,44 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
                 return;
             }
 
-            /* Threaded Q8_0 path */
+            /* Threaded Q8_0 path via persistent pool */
             int nt = n_threads;
             if (nt > d) nt = d;
-            matmul_task_t tasks[MAX_THREADS];
-#ifdef _WIN32
-            HANDLE threads[MAX_THREADS];
-#else
-            pthread_t threads[MAX_THREADS];
-#endif
 
             int rows_per = d / nt;
             int extra = d % nt;
-            int row = 0;
+            int row = rows_per + (0 < extra ? 1 : 0);
 
-            for (int t = 0; t < nt; t++) {
-                tasks[t].out = out;
-                tasks[t].x = (const float *)qx;
-                tasks[t].x_d = qx_d;
-                tasks[t].W = wptr;
-                tasks[t].row_bytes = row_bytes;
-                tasks[t].n = n;
-                tasks[t].qtype = GGUF_TYPE_Q8_0;
-                tasks[t].start = row;
-                row += rows_per + (t < extra ? 1 : 0);
-                tasks[t].end = row;
-            }
-
-            for (int t = 1; t < nt; t++) {
-#ifdef _WIN32
-                threads[t] = CreateThread(NULL, 0, matmul_worker, &tasks[t], 0, NULL);
-#else
-                pthread_create(&threads[t], NULL, matmul_worker, &tasks[t]);
-#endif
-            }
-
-            /* Main thread does its chunk via the fast path */
-            for (int i = tasks[0].start; i < tasks[0].end; i++) {
+            for (int i = 0; i < row; i++) {
                 out[i] = vec_dot_q8_0_q8_0_deltas(qx, qx_d, wptr + (size_t)i * row_bytes, n);
             }
 
-            for (int t = 1; t < nt; t++) {
+            if (nt > 1 && d >= matmul_min_rows) {
 #ifdef _WIN32
-                WaitForSingleObject(threads[t], INFINITE);
-                CloseHandle(threads[t]);
+                HANDLE threads[MAX_THREADS];
+                matmul_task_t tasks[MAX_THREADS];
+                row = rows_per + (0 < extra ? 1 : 0);
+                for (int t = 1; t < nt; t++) {
+                    int tstart = row;
+                    row += rows_per + (t < extra ? 1 : 0);
+                    tasks[t].out = out; tasks[t].x = (const float *)qx;
+                    tasks[t].x_d = qx_d; tasks[t].W = wptr;
+                    tasks[t].row_bytes = row_bytes; tasks[t].n = n;
+                    tasks[t].qtype = GGUF_TYPE_Q8_0;
+                    tasks[t].start = tstart; tasks[t].end = row;
+                    threads[t] = CreateThread(NULL, 0, matmul_worker, &tasks[t], 0, NULL);
+                }
+                for (int t = 1; t < nt; t++) {
+                    WaitForSingleObject(threads[t], INFINITE);
+                    CloseHandle(threads[t]);
+                }
 #else
-                pthread_join(threads[t], NULL);
+                for (int t = 1; t < nt; t++) {
+                    int tstart = row;
+                    row += rows_per + (t < extra ? 1 : 0);
+                    tp_set_task(t, out, (const float *)qx, qx_d, wptr, row_bytes, n, tstart, row, GGUF_TYPE_Q8_0);
+                }
+                tp_dispatch(nt);
 #endif
             }
 
@@ -199,47 +314,39 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
 
             int nt = n_threads;
             if (nt > d) nt = d;
-            matmul_task_t tasks[MAX_THREADS];
-#ifdef _WIN32
-            HANDLE threads[MAX_THREADS];
-#else
-            pthread_t threads[MAX_THREADS];
-#endif
 
             int rows_per = d / nt;
             int extra = d % nt;
-            int row = 0;
+            int row = rows_per + (0 < extra ? 1 : 0);
 
-            for (int t = 0; t < nt; t++) {
-                tasks[t].out = out;
-                tasks[t].x = (const float *)qx;
-                tasks[t].W = wptr;
-                tasks[t].row_bytes = row_bytes;
-                tasks[t].n = n;
-                tasks[t].qtype = GGUF_TYPE_Q4_0;
-                tasks[t].start = row;
-                row += rows_per + (t < extra ? 1 : 0);
-                tasks[t].end = row;
-            }
-
-            for (int t = 1; t < nt; t++) {
-#ifdef _WIN32
-                threads[t] = CreateThread(NULL, 0, matmul_worker, &tasks[t], 0, NULL);
-#else
-                pthread_create(&threads[t], NULL, matmul_worker, &tasks[t]);
-#endif
-            }
-
-            for (int i = tasks[0].start; i < tasks[0].end; i++) {
+            for (int i = 0; i < row; i++) {
                 out[i] = vec_dot_q4_0_q8_0(wptr + (size_t)i * row_bytes, qx, n);
             }
 
-            for (int t = 1; t < nt; t++) {
+            if (nt > 1 && d >= matmul_min_rows) {
 #ifdef _WIN32
-                WaitForSingleObject(threads[t], INFINITE);
-                CloseHandle(threads[t]);
+                HANDLE threads[MAX_THREADS];
+                matmul_task_t tasks[MAX_THREADS];
+                row = rows_per + (0 < extra ? 1 : 0);
+                for (int t = 1; t < nt; t++) {
+                    int tstart = row;
+                    row += rows_per + (t < extra ? 1 : 0);
+                    tasks[t].out = out; tasks[t].x = (const float *)qx; tasks[t].x_d = NULL;
+                    tasks[t].W = wptr; tasks[t].row_bytes = row_bytes; tasks[t].n = n;
+                    tasks[t].qtype = GGUF_TYPE_Q4_0; tasks[t].start = tstart; tasks[t].end = row;
+                    threads[t] = CreateThread(NULL, 0, matmul_worker, &tasks[t], 0, NULL);
+                }
+                for (int t = 1; t < nt; t++) {
+                    WaitForSingleObject(threads[t], INFINITE);
+                    CloseHandle(threads[t]);
+                }
 #else
-                pthread_join(threads[t], NULL);
+                for (int t = 1; t < nt; t++) {
+                    int tstart = row;
+                    row += rows_per + (t < extra ? 1 : 0);
+                    tp_set_task(t, out, (const float *)qx, NULL, wptr, row_bytes, n, tstart, row, GGUF_TYPE_Q4_0);
+                }
+                tp_dispatch(nt);
 #endif
             }
 
@@ -272,47 +379,39 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
 
             int nt = n_threads;
             if (nt > d) nt = d;
-            matmul_task_t tasks[MAX_THREADS];
-#ifdef _WIN32
-            HANDLE threads[MAX_THREADS];
-#else
-            pthread_t threads[MAX_THREADS];
-#endif
 
             int rows_per = d / nt;
             int extra = d % nt;
-            int row = 0;
+            int row = rows_per + (0 < extra ? 1 : 0);
 
-            for (int t = 0; t < nt; t++) {
-                tasks[t].out = out;
-                tasks[t].x = (const float *)qx;
-                tasks[t].W = wptr;
-                tasks[t].row_bytes = row_bytes;
-                tasks[t].n = n;
-                tasks[t].qtype = GGUF_TYPE_Q4_K;
-                tasks[t].start = row;
-                row += rows_per + (t < extra ? 1 : 0);
-                tasks[t].end = row;
-            }
-
-            for (int t = 1; t < nt; t++) {
-#ifdef _WIN32
-                threads[t] = CreateThread(NULL, 0, matmul_worker, &tasks[t], 0, NULL);
-#else
-                pthread_create(&threads[t], NULL, matmul_worker, &tasks[t]);
-#endif
-            }
-
-            for (int i = tasks[0].start; i < tasks[0].end; i++) {
+            for (int i = 0; i < row; i++) {
                 out[i] = vec_dot_q4_K_q8_K(wptr + (size_t)i * row_bytes, qx, n);
             }
 
-            for (int t = 1; t < nt; t++) {
+            if (nt > 1 && d >= matmul_min_rows) {
 #ifdef _WIN32
-                WaitForSingleObject(threads[t], INFINITE);
-                CloseHandle(threads[t]);
+                HANDLE threads[MAX_THREADS];
+                matmul_task_t tasks[MAX_THREADS];
+                row = rows_per + (0 < extra ? 1 : 0);
+                for (int t = 1; t < nt; t++) {
+                    int tstart = row;
+                    row += rows_per + (t < extra ? 1 : 0);
+                    tasks[t].out = out; tasks[t].x = (const float *)qx; tasks[t].x_d = NULL;
+                    tasks[t].W = wptr; tasks[t].row_bytes = row_bytes; tasks[t].n = n;
+                    tasks[t].qtype = GGUF_TYPE_Q4_K; tasks[t].start = tstart; tasks[t].end = row;
+                    threads[t] = CreateThread(NULL, 0, matmul_worker, &tasks[t], 0, NULL);
+                }
+                for (int t = 1; t < nt; t++) {
+                    WaitForSingleObject(threads[t], INFINITE);
+                    CloseHandle(threads[t]);
+                }
 #else
-                pthread_join(threads[t], NULL);
+                for (int t = 1; t < nt; t++) {
+                    int tstart = row;
+                    row += rows_per + (t < extra ? 1 : 0);
+                    tp_set_task(t, out, (const float *)qx, NULL, wptr, row_bytes, n, tstart, row, GGUF_TYPE_Q4_K);
+                }
+                tp_dispatch(nt);
 #endif
             }
 
@@ -333,45 +432,38 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
     int nt = n_threads;
     if (nt > d) nt = d;
 
-    matmul_task_t tasks[MAX_THREADS];
-#ifdef _WIN32
-    HANDLE threads[MAX_THREADS];
-#else
-    pthread_t threads[MAX_THREADS];
-#endif
-
     int rows_per = d / nt;
     int extra = d % nt;
-    int row = 0;
+    int row = rows_per + (0 < extra ? 1 : 0);
 
-    for (int t = 0; t < nt; t++) {
-        tasks[t].out = out;
-        tasks[t].x = x;
-        tasks[t].W = wptr;
-        tasks[t].row_bytes = row_bytes;
-        tasks[t].n = n;
-        tasks[t].qtype = qtype;
-        tasks[t].start = row;
-        row += rows_per + (t < extra ? 1 : 0);
-        tasks[t].end = row;
+    for (int i = 0; i < row; i++) {
+        out[i] = vec_dot(wptr + (size_t)i * row_bytes, x, n, qtype);
     }
 
-    for (int t = 1; t < nt; t++) {
+    if (nt > 1 && d >= matmul_min_rows) {
 #ifdef _WIN32
-        threads[t] = CreateThread(NULL, 0, matmul_worker, &tasks[t], 0, NULL);
+        HANDLE threads[MAX_THREADS];
+        matmul_task_t tasks[MAX_THREADS];
+        row = rows_per + (0 < extra ? 1 : 0);
+        for (int t = 1; t < nt; t++) {
+            int tstart = row;
+            row += rows_per + (t < extra ? 1 : 0);
+            tasks[t].out = out; tasks[t].x = x; tasks[t].x_d = NULL;
+            tasks[t].W = wptr; tasks[t].row_bytes = row_bytes; tasks[t].n = n;
+            tasks[t].qtype = qtype; tasks[t].start = tstart; tasks[t].end = row;
+            threads[t] = CreateThread(NULL, 0, matmul_worker, &tasks[t], 0, NULL);
+        }
+        for (int t = 1; t < nt; t++) {
+            WaitForSingleObject(threads[t], INFINITE);
+            CloseHandle(threads[t]);
+        }
 #else
-        pthread_create(&threads[t], NULL, matmul_worker, &tasks[t]);
-#endif
-    }
-
-    matmul_worker(&tasks[0]);
-
-    for (int t = 1; t < nt; t++) {
-#ifdef _WIN32
-        WaitForSingleObject(threads[t], INFINITE);
-        CloseHandle(threads[t]);
-#else
-        pthread_join(threads[t], NULL);
+        for (int t = 1; t < nt; t++) {
+            int tstart = row;
+            row += rows_per + (t < extra ? 1 : 0);
+            tp_set_task(t, out, x, NULL, wptr, row_bytes, n, tstart, row, qtype);
+        }
+        tp_dispatch(nt);
 #endif
     }
 }

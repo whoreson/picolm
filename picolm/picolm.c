@@ -155,6 +155,7 @@ int main(int argc, char **argv) {
     }
 
     tensor_set_threads(num_threads);
+    tensor_threadpool_init();
 
     /* Load tokenizer */
     tokenizer_t tokenizer;
@@ -285,6 +286,7 @@ int main(int argc, char **argv) {
     free(stdin_prompt);
     tokenizer_free(&tokenizer);
     model_free(&model);
+    tensor_threadpool_free();
 
     return 0;
 }
