@@ -44,8 +44,15 @@ static inline float vaddvq_f32_compat(float32x4_t v) {
 
 /* --- x86 SIMD: detect highest level, then propagate downward --- */
 
+/* AVX512 implies AVX2 + AVX + SSE3 + SSE2 */
+#if defined(__AVX512F__)
+#  define PICOLM_AVX512 1
+#  define PICOLM_AVX2   1
+#  define PICOLM_AVX    1
+#  define PICOLM_SSE3   1
+#  define PICOLM_SSE2   1
 /* AVX2 implies AVX + SSE3 + SSE2 */
-#if defined(__AVX2__)
+#elif defined(__AVX2__)
 #  define PICOLM_AVX2 1
 #  define PICOLM_AVX  1
 #  define PICOLM_SSE3 1
