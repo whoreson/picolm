@@ -235,7 +235,13 @@ static void matmul_worker_f(matmul_task_t *t) {
     }
 }
 
-void tensor_threadpool_init(void) {}
+/* Windows thread entry point - CreateThread requires DWORD WINAPI signature */
+static DWORD WINAPI matmul_worker(LPVOID lpParam) {
+    matmul_worker_f((matmul_task_t *)lpParam);
+    return 0;
+}
+
+void tensor_threadpool_init(int n_threads) {}
 void tensor_threadpool_free(void) {}
 
 #endif
