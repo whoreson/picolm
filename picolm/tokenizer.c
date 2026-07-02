@@ -50,6 +50,7 @@ int tokenizer_load(tokenizer_t *t, const model_t *m) {
     t->vocab_size = vs;
     t->bos_id = m->tok_bos_id;
     t->eos_id = m->tok_eos_id;
+    t->space_marker = m->tok_space_marker;
 
     /* Allocate vocab and scores arrays */
     t->vocab = (char **)calloc((size_t)vs, sizeof(char *));
@@ -113,25 +114,28 @@ int tokenizer_encode(const tokenizer_t *t, const char *text, int *tokens, int ma
 
     if (!text || !*text) return n_tokens;
 
-    /* SentencePiece convention: replace spaces with ▁ (U+2581, UTF-8: E2 96 81)
-     * and prepend ▁ at the start of the text.
-     * Build a normalized copy: " Once upon a time" → "▁Once▁upon▁a▁time" */
+    /* Replace spaces with model's space marker:
+     * - Most models: U+2581 (0xE2 0x96 0x81)
+     * - SmolLM: U+0100 (0xC4 0xA0) */
+    const unsigned char *sp;
+    int sp_len;
+    if (t->space_marker == 1) {
+        static const unsigned char sp_0100[] = {0xC4, 0xA0};
+        sp = sp_0100; sp_len = 2;
+    } else {
+        static const unsigned char sp_2581[] = {0xE2, 0x96, 0x81};
+        sp = sp_2581; sp_len = 3;
+    }
+
     int text_len = (int)strlen(text);
-    /* Worst case: every byte is a space → 3x expansion, plus leading ▁ */
-    int norm_cap = text_len * 3 + 4;
+    int norm_cap = text_len * (sp_len + 1) + sp_len + 4;
     char *norm = (char *)malloc((size_t)norm_cap);
     int norm_len = 0;
 
-    /* Add leading ▁ */
-    norm[norm_len++] = (char)0xE2;
-    norm[norm_len++] = (char)0x96;
-    norm[norm_len++] = (char)0x81;
-
+    for (int i = 0; i < sp_len; i++) norm[norm_len++] = (char)sp[i];
     for (int i = 0; i < text_len; i++) {
         if (text[i] == ' ') {
-            norm[norm_len++] = (char)0xE2;
-            norm[norm_len++] = (char)0x96;
-            norm[norm_len++] = (char)0x81;
+            for (int j = 0; j < sp_len; j++) norm[norm_len++] = (char)sp[j];
         } else {
             norm[norm_len++] = text[i];
         }
