@@ -258,6 +258,19 @@ static int parse_gguf(model_t *m, int max_seq_len) {
             int dummy; m->tok_bos_id = (uint32_t)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "tokenizer.ggml.eos_token_id")) {
             int dummy; m->tok_eos_id = (uint32_t)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "tokenizer.ggml.pre")) {
+            /* Detect space marker type for tokenization */
+            if (vtype == GGUF_META_STRING) {
+                gguf_str_t pre = read_gguf_string(&r);
+                /* SmolLM uses U+0100 (0xC4 0xA0) instead of U+2581 */
+                if (pre.len >= 6 && strncmp(pre.str, "smollm", 6) == 0) {
+                    m->tok_space_marker = 1; /* U+0100 */
+                } else {
+                    m->tok_space_marker = 0; /* U+2581 (default) */
+                }
+            } else {
+                int dummy; skip_meta_value(&r, vtype, &dummy);
+            }
         } else if (str_eq(key, "tokenizer.ggml.tokens")) {
             if (vtype != GGUF_META_ARRAY) {
                 int dummy; skip_meta_value(&r, vtype, &dummy);
@@ -612,173 +625,88 @@ float *model_forward(model_t *m, int token, int pos) {
             val_pos_fp16[d] = fp32_to_fp16(v_tmp[d]);
         }
 
-        /* ---- Flash Attention (online softmax) ----
+        /* ---- Two-Pass Attention (numerically stable softmax) ----
          *
-         * Instead of materializing the full [n_heads * seq_len] score array,
-         * compute attention in a single pass using the online softmax trick:
+         * Pass 1: compute all Q.dot.K scores, apply softmax normalization.
+         * Pass 2: accumulate weighted V values using normalized scores.
          *
-         *   max_s = -inf, sum_exp = 0, acc[d] = 0
-         *   for each cached position t:
-         *     s = dot(Q_h, K_t) / sqrt(d)
-         *     if s > max_s:
-         *       correction = exp(max_s - s)
-         *       acc *= correction, sum_exp *= correction
-         *       sum_exp += 1, acc += V_t
-         *       max_s = s
-         *     else:
-         *       w = exp(s - max_s)
-         *       sum_exp += w, acc += w * V_t
-         *   result = acc / sum_exp
+         * This avoids the compounding precision loss of the online softmax
+         * correction trick, which drifts when FP16 KV cache values are
+         * repeatedly scaled by exp(max_old - max_new) correction factors.
          *
-         * This saves memory (no att[] buffer) and is more cache-friendly.
+         * Memory: float scores[max_seq] per head = 512*4 = 2KB, fits in L1.
+         * Reused for all heads since we process heads sequentially.
          */
+        float attn_scores[512]; /* one per sequence position, reused per head */
+
         for (int h = 0; h < n_heads; h++) {
             float *qh = s->q + h * head_dim;
             int kv_h = h / kv_mul;
             float *xbh = s->xb + h * head_dim;
 
+            /* Pass 1: compute scores and softmax */
             float max_score = -1e30f;
-            float sum_exp = 0.0f;
-            /* Accumulator for weighted V values */
-            float acc[256]; /* head_dim is typically 64-128 */
-            memset(acc, 0, (size_t)head_dim * sizeof(float));
-
             for (int t = 0; t <= pos; t++) {
-                /* Compute score: dot(Q_h, K_t) / sqrt(head_dim) */
                 const uint16_t *kt = kcache_layer + (size_t)t * kv_dim + kv_h * head_dim;
                 float score = vec_dot_f16_f32(kt, qh, head_dim);
                 score /= sqrtf((float)head_dim);
-
-                /* Online softmax update */
-                const uint16_t *vt = vcache_layer + (size_t)t * kv_dim + kv_h * head_dim;
-
-                if (score > max_score) {
-                    float correction = expf(max_score - score);
-                    sum_exp = sum_exp * correction + 1.0f;
-                    /* FMA: acc = acc * correction + dequant(vt) */
-                    {
-                        const float corr_f32 = correction;
-#ifdef PICOLM_NEON
-                        int d = 0;
-                        for (; d + 3 < head_dim; d += 4) {
-                            float32x4_t af = vld1q_f32(acc + d);
-                            float32x4_t vf = fp16x4_to_fp32_inline(vt + d);
-                            float32x4_t corr = vdupq_n_f32(corr_f32);
-                            /* af * corr + vf  (not af + corr * vf) */
-                            af = vaddq_f32(vmulq_f32(af, corr), vf);
-                            vst1q_f32(acc + d, af);
-                        }
-                        for (; d < head_dim; d++) {
-                            acc[d] = acc[d] * corr_f32 + fp16_to_fp32(vt[d]);
-                        }
-#elif defined(PICOLM_AVX)
-                        int d = 0;
-                        for (; d + 7 < head_dim; d += 8) {
-                            __m256 af = _mm256_loadu_ps(acc + d);
-                            __m256 vf = fp16x8_to_fp32_inline(vt + d);
-#ifdef __FMA__
-                            af = _mm256_fmadd_ps(af, _mm256_set1_ps(corr_f32), vf);
-#else
-                            af = _mm256_add_ps(_mm256_mul_ps(af, _mm256_set1_ps(corr_f32)), vf);
-#endif
-                            _mm256_storeu_ps(acc + d, af);
-                        }
-                        for (; d < head_dim; d++) {
-                            acc[d] = acc[d] * corr_f32 + fp16_to_fp32(vt[d]);
-                        }
-#elif defined(PICOLM_SSE2)
-                        int d = 0;
-                        for (; d + 3 < head_dim; d += 4) {
-                            __m128 af = _mm_loadu_ps(acc + d);
-                            __m128 vf = fp16x4_to_fp32_inline(vt + d);
-                            af = _mm_add_ps(_mm_mul_ps(af, _mm_set1_ps(corr_f32)), vf);
-                            _mm_storeu_ps(acc + d, af);
-                        }
-                        for (; d < head_dim; d++) {
-                            acc[d] = acc[d] * corr_f32 + fp16_to_fp32(vt[d]);
-                        }
-#else
-                        for (int d = 0; d < head_dim; d++) {
-                            acc[d] = acc[d] * corr_f32 + fp16_to_fp32(vt[d]);
-                        }
-#endif
-                    }
-                    max_score = score;
-                } else {
-                    float w = expf(score - max_score);
-                    sum_exp += w;
-                    /* acc += w * dequant(vt) */
-                    {
-#ifdef PICOLM_NEON
-                        int d = 0;
-                        float32x4_t wf = vdupq_n_f32(w);
-                        for (; d + 3 < head_dim; d += 4) {
-                            float32x4_t af = vld1q_f32(acc + d);
-                            float32x4_t vf = fp16x4_to_fp32_inline(vt + d);
-                            af = vmlaq_f32(af, wf, vf);
-                            vst1q_f32(acc + d, af);
-                        }
-                        for (; d < head_dim; d++) acc[d] += w * fp16_to_fp32(vt[d]);
-#elif defined(PICOLM_AVX)
-                        int d = 0;
-                        __m256 wf = _mm256_set1_ps(w);
-                        for (; d + 7 < head_dim; d += 8) {
-                            __m256 af = _mm256_loadu_ps(acc + d);
-                            __m256 vf = fp16x8_to_fp32_inline(vt + d);
-                            _mm256_storeu_ps(acc + d, _mm256_add_ps(af, _mm256_mul_ps(wf, vf)));
-                        }
-                        for (; d < head_dim; d++) acc[d] += w * fp16_to_fp32(vt[d]);
-#elif defined(PICOLM_SSE2)
-                        int d = 0;
-                        __m128 wf = _mm_set1_ps(w);
-                        for (; d + 3 < head_dim; d += 4) {
-                            __m128 af = _mm_loadu_ps(acc + d);
-                            __m128 vf = fp16x4_to_fp32_inline(vt + d);
-                            _mm_storeu_ps(acc + d, _mm_add_ps(af, _mm_mul_ps(wf, vf)));
-                        }
-                        for (; d < head_dim; d++) acc[d] += w * fp16_to_fp32(vt[d]);
-#else
-                        for (int d = 0; d < head_dim; d++) acc[d] += w * fp16_to_fp32(vt[d]);
-#endif
-                    }
-                }
+                if (score > max_score) max_score = score;
+                attn_scores[t] = score;
             }
 
-            /* Normalize */
+            float sum_exp = 0.0f;
+            for (int t = 0; t <= pos; t++) {
+                attn_scores[t] = expf(attn_scores[t] - max_score);
+                sum_exp += attn_scores[t];
+            }
             float inv_sum = 1.0f / sum_exp;
+            for (int t = 0; t <= pos; t++) {
+                attn_scores[t] *= inv_sum;
+            }
+
+            /* Pass 2: accumulate weighted V values */
+            memset(xbh, 0, (size_t)head_dim * sizeof(float));
+            for (int t = 0; t <= pos; t++) {
+                float w = attn_scores[t];
+                const uint16_t *vt = vcache_layer + (size_t)t * kv_dim + kv_h * head_dim;
 #ifdef PICOLM_NEON
-            {
-                float32x4_t inv = vdupq_n_f32(inv_sum);
-                int d = 0;
-                for (; d + 3 < head_dim; d += 4) {
-                    float32x4_t af = vld1q_f32(acc + d);
-                    vst1q_f32(xbh + d, vmulq_f32(af, inv));
+                {
+                    int d = 0;
+                    float32x4_t wf = vdupq_n_f32(w);
+                    for (; d + 3 < head_dim; d += 4) {
+                        float32x4_t af = vld1q_f32(xbh + d);
+                        float32x4_t vf = fp16x4_to_fp32_inline(vt + d);
+                        af = vmlaq_f32(af, wf, vf);
+                        vst1q_f32(xbh + d, af);
+                    }
+                    for (; d < head_dim; d++) xbh[d] += w * fp16_to_fp32(vt[d]);
                 }
-                for (; d < head_dim; d++) xbh[d] = acc[d] * inv_sum;
-            }
 #elif defined(PICOLM_AVX)
-            {
-                __m256 inv = _mm256_set1_ps(inv_sum);
-                int d = 0;
-                for (; d + 7 < head_dim; d += 8) {
-                    __m256 af = _mm256_loadu_ps(acc + d);
-                    _mm256_storeu_ps(xbh + d, _mm256_mul_ps(af, inv));
+                {
+                    int d = 0;
+                    __m256 wf = _mm256_set1_ps(w);
+                    for (; d + 7 < head_dim; d += 8) {
+                        __m256 af = _mm256_loadu_ps(xbh + d);
+                        __m256 vf = fp16x8_to_fp32_inline(vt + d);
+                        _mm256_storeu_ps(xbh + d, _mm256_add_ps(af, _mm256_mul_ps(wf, vf)));
+                    }
+                    for (; d < head_dim; d++) xbh[d] += w * fp16_to_fp32(vt[d]);
                 }
-                for (; d < head_dim; d++) xbh[d] = acc[d] * inv_sum;
-            }
 #elif defined(PICOLM_SSE2)
-            {
-                __m128 inv = _mm_set1_ps(inv_sum);
-                int d = 0;
-                for (; d + 3 < head_dim; d += 4) {
-                    __m128 af = _mm_loadu_ps(acc + d);
-                    _mm_storeu_ps(xbh + d, _mm_mul_ps(af, inv));
+                {
+                    int d = 0;
+                    __m128 wf = _mm_set1_ps(w);
+                    for (; d + 3 < head_dim; d += 4) {
+                        __m128 af = _mm_loadu_ps(xbh + d);
+                        __m128 vf = fp16x4_to_fp32_inline(vt + d);
+                        _mm_storeu_ps(xbh + d, _mm_add_ps(af, _mm_mul_ps(wf, vf)));
+                    }
+                    for (; d < head_dim; d++) xbh[d] += w * fp16_to_fp32(vt[d]);
                 }
-                for (; d < head_dim; d++) xbh[d] = acc[d] * inv_sum;
-            }
 #else
-            for (int d = 0; d < head_dim; d++) xbh[d] = acc[d] * inv_sum;
+                for (int d = 0; d < head_dim; d++) xbh[d] += w * fp16_to_fp32(vt[d]);
 #endif
+            }
         }
 
         /* Output projection */

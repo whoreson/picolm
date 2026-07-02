@@ -122,6 +122,8 @@ typedef struct {
     uint64_t    tok_n_scores;
     uint32_t    tok_bos_id;
     uint32_t    tok_eos_id;
+    /* Pre-tokenizer type: 0=U+2581 (default), 1=U+0100 (smollm) */
+    int         tok_space_marker;
 } model_t;
 
 /* Load a GGUF model file. Returns 0 on success. */
