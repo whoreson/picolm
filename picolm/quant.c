@@ -1978,3 +1978,199 @@ float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
         }
     }
 }
+
+/* ---- quantize_row_q4_0: FP32 -> Q4_0 blocks ---- */
+void quantize_row_q4_0(const float *x, void *dst, int n) {
+    block_q4_0 *blocks = (block_q4_0 *)dst;
+    int nb = n / 32;
+
+    for (int i = 0; i < nb; i++) {
+        const float *b = x + i * 32;
+        float amax = 0.0f;
+        for (int j = 0; j < 32; j++) {
+            float v = b[j] < 0 ? -b[j] : b[j];
+            if (v > amax) amax = v;
+        }
+        float d = amax / 8.0f;
+        blocks[i].d = fp32_to_fp16(d);
+        float id = (amax != 0.0f) ? 8.0f / amax : 0.0f;
+        uint8_t *q = blocks[i].qs;
+        for (int j = 0; j < 16; j++) {
+            uint8_t v0 = (uint8_t)(b[j * 2] * id + 8.5f);
+            uint8_t v1 = (uint8_t)(b[j * 2 + 1] * id + 8.5f);
+            q[j] = v0 | (v1 << 4);
+        }
+    }
+}
+
+/* ---- scale_add_q8_0_f32: dst[i] += scale * dequant(q8_0[i]) ----
+ * dequant(q8_0[i]) = qs[i] * d (per-block)
+ * So: dst[i] += scale * qs[i] * d = (scale*d) * qs[i] */
+
+void scale_add_q8_0_f32(float *dst, float scale, const void *src, int n) {
+    const block_q8_0 *blocks = (const block_q8_0 *)src;
+    int nb = n / 32;
+
+    for (int i = 0; i < nb; i++) {
+        const block_q8_0 *b = &blocks[i];
+        float sd = fp16_to_fp32(b->d) * scale;
+        const int8_t *qs = b->qs;
+        float *dp = dst + i * 32;
+
+#ifdef PICOLM_AVX
+        __m256 sd_v = _mm256_set1_ps(sd);
+
+        for (int j = 0; j < 32; j += 8) {
+            __m128i q8 = _mm_loadl_epi64((const __m128i *)(qs + j));
+            __m128i q16 = _mm_srai_epi16(_mm_unpacklo_epi8(_mm_setzero_si128(), q8), 8);
+            __m128i q32lo = _mm_srai_epi32(_mm_unpacklo_epi16(_mm_setzero_si128(), q16), 16);
+            __m128i q32hi = _mm_srai_epi32(_mm_unpackhi_epi16(_mm_setzero_si128(), q16), 16);
+            __m256 qf = _mm256_cvtepi32_ps(_mm256_set_m128i(q32hi, q32lo));
+            __m256 scaled = _mm256_mul_ps(qf, sd_v);
+            __m256 acc = _mm256_loadu_ps(dp + j);
+            _mm256_storeu_ps(dp + j, _mm256_add_ps(acc, scaled));
+        }
+#elif defined(PICOLM_SSE2)
+        __m128 sd_v = _mm_set1_ps(sd);
+        for (int j = 0; j < 32; j += 8) {
+            __m128i q8 = _mm_loadl_epi64((const __m128i *)(qs + j));
+            __m128i q16 = _mm_srai_epi16(_mm_unpacklo_epi8(_mm_setzero_si128(), q8), 8);
+            __m128i q32lo = _mm_srai_epi32(_mm_unpacklo_epi16(_mm_setzero_si128(), q16), 16);
+            __m128i q32hi = _mm_srai_epi32(_mm_unpackhi_epi16(_mm_setzero_si128(), q16), 16);
+            __m128 qf = _mm_cvtepi32_ps(q32lo);
+            __m128 scaled = _mm_mul_ps(qf, sd_v);
+            __m128 acc = _mm_loadu_ps(dp + j);
+            _mm_storeu_ps(dp + j, _mm_add_ps(acc, scaled));
+
+            qf = _mm_cvtepi32_ps(q32hi);
+            scaled = _mm_mul_ps(qf, sd_v);
+            acc = _mm_loadu_ps(dp + j + 4);
+            _mm_storeu_ps(dp + j + 4, _mm_add_ps(acc, scaled));
+        }
+#elif defined(PICOLM_NEON)
+        float32x4_t sd_v = vdupq_n_f32(sd);
+        for (int j = 0; j < 32; j += 4) {
+            int8x8_t q8 = vld1_s8(qs + j);
+            int16x8_t q16 = vmovl_s8(q8);
+            float32x4_t qf0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16)));
+            float32x4_t acc = vld1q_f32(dp + j);
+            vst1q_f32(dp + j, vmlaq_f32(acc, qf0, sd_v));
+
+            float32x4_t qf1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16)));
+            acc = vld1q_f32(dp + j + 4);
+            vst1q_f32(dp + j + 4, vmlaq_f32(acc, qf1, sd_v));
+        }
+#else
+        for (int j = 0; j < 32; j++) {
+            dp[j] += qs[j] * sd;
+        }
+#endif
+    }
+}
+
+/* ---- scale_add_q4_0_f32: dst[i] += scale * dequant(q4_0[i]) ---- */
+void scale_add_q4_0_f32(float *dst, float scale, const void *src, int n) {
+    const block_q4_0 *blocks = (const block_q4_0 *)src;
+    int nb = n / 32;
+
+    for (int i = 0; i < nb; i++) {
+        const block_q4_0 *b = &blocks[i];
+        float sd = fp16_to_fp32(b->d) * scale;
+        const uint8_t *qs = b->qs;
+        float *dp = dst + i * 32;
+
+        for (int j = 0; j < 16; j++) {
+            dp[j]      += ((float)((qs[j] & 0xF) - 8)) * sd;
+            dp[j + 16] += ((float)((qs[j] >> 4) - 8)) * sd;
+        }
+    }
+}
+
+/* ---- fma_scale_q8_0_f32: dst[i] = dst[i] * correction + dequant(q8_0[i]) ---- */
+void fma_scale_q8_0_f32(float *dst, float correction, const void *src, int n) {
+    const block_q8_0 *blocks = (const block_q8_0 *)src;
+    int nb = n / 32;
+
+    for (int i = 0; i < nb; i++) {
+        const block_q8_0 *b = &blocks[i];
+        float d = fp16_to_fp32(b->d);
+        const int8_t *qs = b->qs;
+        float *dptr = dst + i * 32;
+
+#ifdef PICOLM_AVX
+        __m256 corr = _mm256_set1_ps(correction);
+        __m256 df = _mm256_set1_ps(d);
+
+        for (int j = 0; j < 32; j += 8) {
+            __m128i q8 = _mm_loadl_epi64((const __m128i *)(qs + j));
+            __m128i q16 = _mm_srai_epi16(_mm_unpacklo_epi8(_mm_setzero_si128(), q8), 8);
+            __m128i q32lo = _mm_srai_epi32(_mm_unpacklo_epi16(_mm_setzero_si128(), q16), 16);
+            __m128i q32hi = _mm_srai_epi32(_mm_unpackhi_epi16(_mm_setzero_si128(), q16), 16);
+            __m256 qf = _mm256_cvtepi32_ps(_mm256_set_m128i(q32hi, q32lo));
+            __m256 scaled = _mm256_mul_ps(qf, df);
+            __m256 acc = _mm256_loadu_ps(dptr + j);
+#ifdef __FMA__
+            _mm256_storeu_ps(dptr + j, _mm256_fmadd_ps(acc, corr, scaled));
+#else
+            _mm256_storeu_ps(dptr + j, _mm256_add_ps(_mm256_mul_ps(acc, corr), scaled));
+#endif
+        }
+#elif defined(PICOLM_SSE2)
+        __m128 corr = _mm_set1_ps(correction);
+        __m128 df = _mm_set1_ps(d);
+        for (int j = 0; j < 32; j += 8) {
+            __m128i q8 = _mm_loadl_epi64((const __m128i *)(qs + j));
+            __m128i q16 = _mm_srai_epi16(_mm_unpacklo_epi8(_mm_setzero_si128(), q8), 8);
+            __m128i q32lo = _mm_srai_epi32(_mm_unpacklo_epi16(_mm_setzero_si128(), q16), 16);
+            __m128i q32hi = _mm_srai_epi32(_mm_unpackhi_epi16(_mm_setzero_si128(), q16), 16);
+            __m128 qf = _mm_cvtepi32_ps(q32lo);
+            __m128 scaled = _mm_mul_ps(qf, df);
+            __m128 acc = _mm_loadu_ps(dptr + j);
+            _mm_storeu_ps(dptr + j, _mm_add_ps(_mm_mul_ps(acc, corr), scaled));
+
+            qf = _mm_cvtepi32_ps(q32hi);
+            scaled = _mm_mul_ps(qf, df);
+            acc = _mm_loadu_ps(dptr + j + 4);
+            _mm_storeu_ps(dptr + j + 4, _mm_add_ps(_mm_mul_ps(acc, corr), scaled));
+        }
+#elif defined(PICOLM_NEON)
+        float32x4_t corr = vdupq_n_f32(correction);
+        float32x4_t df = vdupq_n_f32(d);
+        for (int j = 0; j < 32; j += 4) {
+            int8x8_t q8 = vld1_s8(qs + j);
+            int16x8_t q16 = vmovl_s8(q8);
+            float32x4_t qf0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16)));
+            float32x4_t scaled = vmulq_f32(qf0, df);
+            float32x4_t acc = vld1q_f32(dptr + j);
+            vst1q_f32(dptr + j, vmlaq_f32(vmulq_f32(acc, corr), scaled));
+
+            float32x4_t qf1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16)));
+            scaled = vmulq_f32(qf1, df);
+            acc = vld1q_f32(dptr + j + 4);
+            vst1q_f32(dptr + j + 4, vmlaq_f32(vmulq_f32(acc, corr), scaled));
+        }
+#else
+        for (int j = 0; j < 32; j++) {
+            dptr[j] = dptr[j] * correction + qs[j] * d;
+        }
+#endif
+    }
+}
+
+/* ---- fma_scale_q4_0_f32: dst[i] = dst[i] * correction + dequant(q4_0[i]) ---- */
+void fma_scale_q4_0_f32(float *dst, float correction, const void *src, int n) {
+    const block_q4_0 *blocks = (const block_q4_0 *)src;
+    int nb = n / 32;
+
+    for (int i = 0; i < nb; i++) {
+        const block_q4_0 *b = &blocks[i];
+        float d = fp16_to_fp32(b->d);
+        const uint8_t *qs = b->qs;
+        float *dptr = dst + i * 32;
+
+        for (int j = 0; j < 16; j++) {
+            dptr[j]      = dptr[j] * correction + ((float)((qs[j] & 0xF) - 8)) * d;
+            dptr[j + 16] = dptr[j + 16] * correction + ((float)((qs[j] >> 4) - 8)) * d;
+        }
+    }
+}

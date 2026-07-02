@@ -61,6 +61,13 @@ typedef struct {
     layer_weights_t layers[MAX_LAYERS];
 } model_weights_t;
 
+/* KV cache quantization type */
+typedef enum {
+    KV_CACHE_F16,   /* FP16 (default, 2 bytes per element) */
+    KV_CACHE_Q8_0,  /* Q8_0 (1 byte + 2 byte scale per 32 elements) */
+    KV_CACHE_Q4_0,  /* Q4_0 (0.5 bytes + 2 byte scale per 32 elements) */
+} kv_cache_type_t;
+
 /* ---- Runtime state (pre-allocated buffers) ---- */
 
 typedef struct {
@@ -68,14 +75,20 @@ typedef struct {
     float *xb;           /* buffer after norm / attention output [n_embd] */
     float *xb2;          /* second buffer [n_embd] */
     float *q;            /* query vector [n_embd] */
-    /* att buffer REMOVED — flash attention uses online softmax */
+    /* att buffer REMOVED - flash attention uses online softmax */
     float *hb;           /* FFN hidden buffer [n_ffn] */
     float *hb2;          /* FFN hidden buffer 2 [n_ffn] */
     float *logits;       /* output logits [vocab_size] */
 
-    /* KV cache stored as FP16 to halve memory (22 MB -> 11 MB for TinyLlama) */
-    uint16_t *key_cache;    /* [n_layers * max_seq_len * n_kv_heads * head_dim] as FP16 */
-    uint16_t *val_cache;    /* [n_layers * max_seq_len * n_kv_heads * head_dim] as FP16 */
+    /* KV cache - can be FP16, Q8_0, or Q4_0 */
+    uint8_t *key_cache;    /* quantized key cache */
+    uint8_t *val_cache;    /* quantized val cache */
+
+    /* KV cache metadata */
+    kv_cache_type_t kv_type_k;
+    kv_cache_type_t kv_type_v;
+    size_t kv_row_size_k;  /* bytes per head row of K */
+    size_t kv_row_size_v;  /* bytes per head row of V */
 
     float *dequant_scratch; /* scratch for matmul dequant [max(n_embd, n_ffn)] */
 
@@ -93,7 +106,7 @@ typedef struct {
     void *mem_block;
     size_t mem_size;
 
-    /* Separate allocation for FP16 KV cache */
+    /* Separate allocation for KV cache */
     void *kv_block;
     size_t kv_size;
 } run_state_t;
@@ -127,7 +140,7 @@ typedef struct {
 } model_t;
 
 /* Load a GGUF model file. Returns 0 on success. */
-int model_load(model_t *m, const char *path, int max_seq_len);
+int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v);
 
 /* Run one forward pass. Returns pointer to logits[vocab_size]. */
 float *model_forward(model_t *m, int token, int pos);

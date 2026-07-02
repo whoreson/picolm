@@ -262,11 +262,25 @@ float vec_dot_q4_K_q8_K(const void *src_q4, const void *src_q8, int n);
  * dst must have space for (n / 32) * sizeof(block_q8_0) bytes. */
 void quantize_row_q8_0(const float *x, void *dst, int n);
 
+/* Quantize a float32 vector to Q4_0 blocks.
+ * dst must have space for (n / 32) * sizeof(block_q4_0) bytes. */
+void quantize_row_q4_0(const float *x, void *dst, int n);
+
 /* Quantize a float32 vector to Q8_K blocks (for Q4_K/Q6_K matmul).
  * dst must have space for (n / 256) * sizeof(block_q8_K) bytes. */
 void quantize_row_q8_K(const float *x, void *dst, int n);
 
 /* Generic fused dot product dispatch. Returns dot(dequant(src), x) for n elements. */
 float vec_dot(const void *src, const float *x, int n, gguf_type_t type);
+
+/* Scale-and-add: dst[i] += scale * dequant(src[i]).
+ * Used for V-cache accumulation in attention with quantized V cache. */
+void scale_add_q8_0_f32(float *dst, float scale, const void *src, int n);
+void scale_add_q4_0_f32(float *dst, float scale, const void *src, int n);
+
+/* FMA-style: dst[i] = dst[i] * correction + dequant(src[i]).
+ * Used for the online softmax "new max" path in attention. */
+void fma_scale_q8_0_f32(float *dst, float correction, const void *src, int n);
+void fma_scale_q4_0_f32(float *dst, float correction, const void *src, int n);
 
 #endif /* QUANT_H */
