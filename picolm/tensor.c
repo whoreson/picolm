@@ -97,6 +97,7 @@ static void matmul_worker_f(matmul_task_t *t) {
             t->out[i] = vec_dot_q8_0_q8_0_deltas(qx, qx_d,
                                                   t->W + (size_t)i * t->row_bytes, t->n);
         }
+#if defined(PICOLM_AVX2) || defined(PICOLM_AVX)
     } else if (t->qtype == GGUF_TYPE_Q4_K && t->x) {
         const block_q8_K *qx = (const block_q8_K *)t->x;
         for (int i = t->start; i < t->end; i++) {
@@ -109,6 +110,7 @@ static void matmul_worker_f(matmul_task_t *t) {
             t->out[i] = vec_dot_q4_0_q8_0(
                 t->W + (size_t)i * t->row_bytes, qx, t->n);
         }
+#endif
     } else {
         for (int i = t->start; i < t->end; i++) {
             t->out[i] = vec_dot(t->W + (size_t)i * t->row_bytes,
@@ -269,6 +271,7 @@ static void matmul_worker_f(matmul_task_t *t) {
             t->out[i] = vec_dot_q8_0_q8_0_deltas(qx, qx_d,
                                                   t->W + (size_t)i * t->row_bytes, t->n);
         }
+#if defined(PICOLM_AVX2) || defined(PICOLM_AVX)
     } else if (t->qtype == GGUF_TYPE_Q4_K && t->x) {
         const block_q8_K *qx = (const block_q8_K *)t->x;
         for (int i = t->start; i < t->end; i++) {
@@ -281,6 +284,7 @@ static void matmul_worker_f(matmul_task_t *t) {
             t->out[i] = vec_dot_q4_0_q8_0(
                 t->W + (size_t)i * t->row_bytes, qx, t->n);
         }
+#endif
     } else {
         for (int i = t->start; i < t->end; i++) {
             t->out[i] = vec_dot(t->W + (size_t)i * t->row_bytes,
