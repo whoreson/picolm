@@ -51,3 +51,7 @@ picoclaw/
 # Internal dev docs
 picoclaw/PICOLM_INTEGRATION.md
 .aider*
+
+# Session/debug artifacts
+.debug.txt
+geminiprompt.txt
