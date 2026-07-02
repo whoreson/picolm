@@ -25,6 +25,15 @@ void tensor_init_scratch(float *buf, int size) {
 
 static int n_threads = 1;
 
+/* Threading mode:
+ * 1 = per-matmul pthread_create/join (default, proven correct)
+ * 0 = persistent thread pool (WIP, keep code for future development)
+ * Override via compiler flag: -DPICOLM_USE_PER_MATMUL_THREAD=0
+ */
+#ifndef PICOLM_USE_PER_MATMUL_THREAD
+#define PICOLM_USE_PER_MATMUL_THREAD 1
+#endif
+
 void tensor_set_threads(int t) {
     if (t < 1) t = 1;
     if (t > MAX_THREADS) t = MAX_THREADS;
@@ -67,6 +76,7 @@ typedef struct {
  *   - The critical fix: workers must signal tp_done when ALL are done, not just
  *     the last one. Using a counter + broadcast ensures no missed signals.
  */
+#ifndef PICOLM_USE_PER_MATMUL_THREAD
 static pthread_t       tp_threads[MAX_THREADS];
 static pthread_mutex_t tp_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  tp_cond  = PTHREAD_COND_INITIALIZER;
@@ -76,6 +86,7 @@ static volatile int    tp_stop  = 0;
 static volatile int    tp_tasks = 0;
 static volatile int    tp_active = 0;
 static matmul_task_t   tp_tasks_arr[MAX_THREADS];
+#endif
 
 /* Core worker logic */
 static void matmul_worker_f(matmul_task_t *t) {
@@ -105,6 +116,8 @@ static void matmul_worker_f(matmul_task_t *t) {
         }
     }
 }
+
+#ifndef PICOLM_USE_PER_MATMUL_THREAD
 
 /* Worker thread: waits for task, executes it, signals completion */
 static void *tp_worker(void *arg) {
@@ -161,6 +174,16 @@ void tensor_threadpool_free(void) {
     tp_nt = 0;
 }
 
+#endif /* PICOLM_USE_PER_MATMUL_THREAD */
+
+/* Stubs for per-matmul path (no persistent pool to init/free) */
+#ifdef PICOLM_USE_PER_MATMUL_THREAD
+void tensor_threadpool_init(int n_threads) { (void)n_threads; }
+void tensor_threadpool_free(void) {}
+#endif
+
+#ifndef PICOLM_USE_PER_MATMUL_THREAD
+
 /* Set task for worker thread idx */
 static void tp_set_task(int idx, float *out, const float *x, const float *x_d,
                         const char *W, size_t row_bytes, int n,
@@ -204,6 +227,37 @@ static void tp_dispatch(int nt) {
     }
     pthread_mutex_unlock(&tp_mutex);
 }
+
+#endif /* PICOLM_USE_PER_MATMUL_THREAD */
+
+#ifdef PICOLM_USE_PER_MATMUL_THREAD
+/* Per-matmul worker: executes task once and returns */
+static void *per_matmul_worker(void *arg) {
+    matmul_worker_f((matmul_task_t *)arg);
+    return NULL;
+}
+
+static void per_matmul_dispatch(int nt, float *out, const float *x,
+                                const float *x_d, const char *wptr,
+                                size_t row_bytes, int n, int d,
+                                gguf_type_t qtype, int row_main) {
+    int rows_per = d / nt;
+    int extra = d % nt;
+    int row = row_main;
+    matmul_task_t tasks[MAX_THREADS];
+    pthread_t threads[MAX_THREADS];
+
+    for (int t = 1; t < nt; t++) {
+        int tstart = row;
+        row += rows_per + (t < extra ? 1 : 0);
+        tasks[t].out = out; tasks[t].x = x; tasks[t].x_d = x_d;
+        tasks[t].W = wptr; tasks[t].row_bytes = row_bytes; tasks[t].n = n;
+        tasks[t].start = tstart; tasks[t].end = row; tasks[t].qtype = qtype;
+        pthread_create(&threads[t], NULL, per_matmul_worker, &tasks[t]);
+    }
+    for (int t = 1; t < nt; t++) pthread_join(threads[t], NULL);
+}
+#endif /* PICOLM_USE_PER_MATMUL_THREAD */
 
 #else
 
@@ -311,6 +365,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
                     CloseHandle(threads[t]);
                 }
 #else
+#ifndef PICOLM_USE_PER_MATMUL_THREAD
                 for (int t = 1; t < nt; t++) {
                     int tstart = row;
                     row += rows_per + (t < extra ? 1 : 0);
@@ -318,6 +373,10 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
                                 tstart, row, GGUF_TYPE_Q8_0);
                 }
                 tp_dispatch(nt);
+#else
+                per_matmul_dispatch(nt, out, (const float *)qx, qx_d, wptr,
+                                    row_bytes, n, d, GGUF_TYPE_Q8_0, row);
+#endif
 #endif
             } else {
                 /* Threading disabled (too few rows or single-thread): compute remaining rows */
@@ -383,6 +442,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
                     CloseHandle(threads[t]);
                 }
 #else
+#ifndef PICOLM_USE_PER_MATMUL_THREAD
                 for (int t = 1; t < nt; t++) {
                     int tstart = row;
                     row += rows_per + (t < extra ? 1 : 0);
@@ -390,6 +450,10 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
                                 tstart, row, GGUF_TYPE_Q4_0);
                 }
                 tp_dispatch(nt);
+#else
+                per_matmul_dispatch(nt, out, (const float *)qx, NULL, wptr,
+                                    row_bytes, n, d, GGUF_TYPE_Q4_0, row);
+#endif
 #endif
             } else {
                 for (int i = row; i < d; i++) {
@@ -454,6 +518,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
                     CloseHandle(threads[t]);
                 }
 #else
+#ifndef PICOLM_USE_PER_MATMUL_THREAD
                 for (int t = 1; t < nt; t++) {
                     int tstart = row;
                     row += rows_per + (t < extra ? 1 : 0);
@@ -461,6 +526,10 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
                                 tstart, row, GGUF_TYPE_Q4_K);
                 }
                 tp_dispatch(nt);
+#else
+                per_matmul_dispatch(nt, out, (const float *)qx, NULL, wptr,
+                                    row_bytes, n, d, GGUF_TYPE_Q4_K, row);
+#endif
 #endif
             } else {
                 for (int i = row; i < d; i++) {
@@ -511,12 +580,16 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
             CloseHandle(threads[t]);
         }
 #else
+#ifndef PICOLM_USE_PER_MATMUL_THREAD
         for (int t = 1; t < nt; t++) {
             int tstart = row;
             row += rows_per + (t < extra ? 1 : 0);
             tp_set_task(t, out, x, NULL, wptr, row_bytes, n, tstart, row, qtype);
         }
         tp_dispatch(nt);
+#else
+        per_matmul_dispatch(nt, out, x, NULL, wptr, row_bytes, n, d, qtype, row);
+#endif
 #endif
     } else {
         for (int i = row; i < d; i++) {
