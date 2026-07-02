@@ -440,11 +440,20 @@ static void init_rope_tables(run_state_t *s, const model_config_t *c) {
 
 /* ---- Buffer allocation ---- */
 
-static int allocate_run_state(model_t *m) {
+/* Compute row size in bytes for a given KV cache type and number of elements */
+static size_t kv_row_size(kv_cache_type_t kv_type, int n) {
+    switch (kv_type) {
+        case KV_CACHE_F16:  return (size_t)n * sizeof(uint16_t);
+        case KV_CACHE_Q8_0: return ((size_t)(n / 32)) * sizeof(block_q8_0);
+        case KV_CACHE_Q4_0: return ((size_t)(n / 32)) * sizeof(block_q4_0);
+    }
+    return 0;
+}
+
+static int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v) {
     model_config_t *c = &m->config;
     run_state_t *s = &m->state;
 
-    int kv_dim = c->n_kv_heads * c->head_dim;
     int half_dim = c->head_dim / 2;
 
     /* Calculate sizes for float buffers */
@@ -472,13 +481,20 @@ static int allocate_run_state(model_t *m) {
                    sz_hb + sz_hb2 + sz_logits +
                    sz_scratch + sz_rope + sz_norm;
 
-    /* FP16 KV cache: separate allocation */
-    size_t kv_elements = (size_t)c->n_layers * c->max_seq_len * kv_dim;
-    size_t sz_kv = kv_elements * sizeof(uint16_t) * 2; /* key + val */
+    /* Quantized KV cache: separate allocation */
+    size_t sz_k_row = kv_row_size(kv_type_k, c->head_dim);
+    size_t sz_v_row = kv_row_size(kv_type_v, c->head_dim);
+    size_t sz_kv = (size_t)c->n_layers * c->max_seq_len * c->n_kv_heads * (sz_k_row + sz_v_row);
 
-    fprintf(stderr, "Allocating %.2f MB for runtime state (+ %.2f MB FP16 KV cache)\n",
+    const char *kv_name_k = "f16";
+    const char *kv_name_v = "f16";
+    if (kv_type_k == KV_CACHE_Q8_0) kv_name_k = "q8_0";
+    if (kv_type_k == KV_CACHE_Q4_0) kv_name_k = "q4_0";
+    if (kv_type_v == KV_CACHE_Q8_0) kv_name_v = "q8_0";
+    if (kv_type_v == KV_CACHE_Q4_0) kv_name_v = "q4_0";
+    fprintf(stderr, "Allocating %.2f MB for runtime state (+ %.2f MB KV cache [%s/%s])\n",
             (double)total / (1024.0 * 1024.0),
-            (double)sz_kv / (1024.0 * 1024.0));
+            (double)sz_kv / (1024.0 * 1024.0), kv_name_k, kv_name_v);
 
     s->mem_block = calloc(1, total);
     if (!s->mem_block) {
@@ -487,7 +503,7 @@ static int allocate_run_state(model_t *m) {
     }
     s->mem_size = total + sz_kv;
 
-    /* Allocate FP16 KV cache separately */
+    /* Allocate KV cache separately */
     s->kv_block = calloc(1, sz_kv);
     if (!s->kv_block) {
         fprintf(stderr, "OOM: cannot allocate %zu bytes for KV cache\n", sz_kv);
@@ -495,6 +511,11 @@ static int allocate_run_state(model_t *m) {
         return -1;
     }
     s->kv_size = sz_kv;
+
+    s->kv_type_k = kv_type_k;
+    s->kv_type_v = kv_type_v;
+    s->kv_row_size_k = sz_k_row;
+    s->kv_row_size_v = sz_v_row;
 
     /* Carve float pointers */
     float *p = (float *)s->mem_block;
@@ -514,10 +535,11 @@ static int allocate_run_state(model_t *m) {
     /* Norm weights */
     s->norm_weights = p;
 
-    /* FP16 KV cache pointers */
-    uint16_t *kp = (uint16_t *)s->kv_block;
-    s->key_cache = kp; kp += kv_elements;
-    s->val_cache = kp;
+    /* KV cache pointers: K layers first, then V layers */
+    size_t layer_stride_k = (size_t)c->max_seq_len * c->n_kv_heads * sz_k_row;
+    uint8_t *kb = (uint8_t *)s->kv_block;
+    s->key_cache = kb;
+    s->val_cache = kb + (size_t)c->n_layers * layer_stride_k;
 
     /* Pre-dequantize norm weights */
     float *nw = s->norm_weights;
@@ -547,12 +569,12 @@ static int allocate_run_state(model_t *m) {
 
 /* ---- Public API ---- */
 
-int model_load(model_t *m, const char *path, int max_seq_len) {
+int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v) {
     memset(m, 0, sizeof(*m));
 
     if (mmap_file(m, path) != 0) return -1;
     if (parse_gguf(m, max_seq_len) != 0) return -1;
-    if (allocate_run_state(m) != 0) return -1;
+    if (allocate_run_state(m, kv_type_k, kv_type_v) != 0) return -1;
 
     return 0;
 }
@@ -600,29 +622,47 @@ float *model_forward(model_t *m, int token, int pos) {
         /* QKV projections */
         matmul(s->q, s->xb, lw->attn_q, dim, dim, lw->type_attn_q);
 
-        /* K and V: project into float temp, then store as FP16 in cache */
+        /* K and V: project into float temp, then quantize and store */
         float *k_tmp = s->xb2; /* reuse xb2 as temp for K (kv_dim <= dim) */
         matmul(k_tmp, s->xb, lw->attn_k, dim, kv_dim, lw->type_attn_k);
 
-        /* Store K as FP16 */
-        uint16_t *kcache_layer = s->key_cache + (size_t)l * seq_len * kv_dim;
-        uint16_t *vcache_layer = s->val_cache + (size_t)l * seq_len * kv_dim;
-        uint16_t *key_pos_fp16 = kcache_layer + (size_t)pos * kv_dim;
+        /* KV cache layout: [layer][pos][head] with per-head quantized rows */
+        uint8_t *kcache_layer = s->key_cache + (size_t)l * seq_len * c->n_kv_heads * s->kv_row_size_k;
+        uint8_t *vcache_layer = s->val_cache + (size_t)l * seq_len * c->n_kv_heads * s->kv_row_size_v;
 
-        /* Apply RoPE to Q and K (using pre-computed tables) */
+        /* Apply RoPE to Q and K */
         rope(s->q, k_tmp, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos);
 
-        /* Convert K to FP16 and store */
-        for (int d = 0; d < kv_dim; d++) {
-            key_pos_fp16[d] = fp32_to_fp16(k_tmp[d]);
+        /* Store K per head */
+        for (int hkv = 0; hkv < n_kv_heads; hkv++) {
+            float *k_head = k_tmp + hkv * head_dim;
+            uint8_t *key_pos = kcache_layer + (size_t)pos * c->n_kv_heads * s->kv_row_size_k
+                              + hkv * s->kv_row_size_k;
+            if (s->kv_type_k == KV_CACHE_Q8_0) {
+                quantize_row_q8_0(k_head, key_pos, head_dim);
+            } else if (s->kv_type_k == KV_CACHE_Q4_0) {
+                quantize_row_q4_0(k_head, key_pos, head_dim);
+            } else {
+                uint16_t *kf = (uint16_t *)key_pos;
+                for (int d = 0; d < head_dim; d++) kf[d] = fp32_to_fp16(k_head[d]);
+            }
         }
 
-        /* V projection -> store directly as FP16 */
+        /* V projection -> store per head */
         float *v_tmp = s->xb2;
         matmul(v_tmp, s->xb, lw->attn_v, dim, kv_dim, lw->type_attn_v);
-        uint16_t *val_pos_fp16 = vcache_layer + (size_t)pos * kv_dim;
-        for (int d = 0; d < kv_dim; d++) {
-            val_pos_fp16[d] = fp32_to_fp16(v_tmp[d]);
+        for (int hkv = 0; hkv < n_kv_heads; hkv++) {
+            float *v_head = v_tmp + hkv * head_dim;
+            uint8_t *val_pos = vcache_layer + (size_t)pos * c->n_kv_heads * s->kv_row_size_v
+                              + hkv * s->kv_row_size_v;
+            if (s->kv_type_v == KV_CACHE_Q8_0) {
+                quantize_row_q8_0(v_head, val_pos, head_dim);
+            } else if (s->kv_type_v == KV_CACHE_Q4_0) {
+                quantize_row_q4_0(v_head, val_pos, head_dim);
+            } else {
+                uint16_t *vf = (uint16_t *)val_pos;
+                for (int d = 0; d < head_dim; d++) vf[d] = fp32_to_fp16(v_head[d]);
+            }
         }
 
         /* ---- Flash Attention (online softmax) ----
@@ -658,104 +698,55 @@ float *model_forward(model_t *m, int token, int pos) {
 
             for (int t = 0; t <= pos; t++) {
                 /* Compute score: dot(Q_h, K_t) / sqrt(head_dim) */
-                const uint16_t *kt = kcache_layer + (size_t)t * kv_dim + kv_h * head_dim;
-                float score = vec_dot_f16_f32(kt, qh, head_dim);
+                const uint8_t *kt = kcache_layer + (size_t)t * c->n_kv_heads * s->kv_row_size_k
+                                   + kv_h * s->kv_row_size_k;
+                float score;
+                if (s->kv_type_k == KV_CACHE_Q8_0) {
+                    score = vec_dot_q8_0_f32(kt, qh, head_dim);
+                } else if (s->kv_type_k == KV_CACHE_Q4_0) {
+                    score = vec_dot_q4_0_f32(kt, qh, head_dim);
+                } else {
+                    score = vec_dot_f16_f32(kt, qh, head_dim);
+                }
                 score /= sqrtf((float)head_dim);
 
                 /* Online softmax update */
-                const uint16_t *vt = vcache_layer + (size_t)t * kv_dim + kv_h * head_dim;
+                const uint8_t *vt = vcache_layer + (size_t)t * c->n_kv_heads * s->kv_row_size_v
+                                   + kv_h * s->kv_row_size_v;
 
                 if (score > max_score) {
                     float correction = expf(max_score - score);
                     sum_exp = sum_exp * correction + 1.0f;
                     /* FMA: acc = acc * correction + dequant(vt) */
-                    {
-                        const float corr_f32 = correction;
-#ifdef PICOLM_NEON
-                        int d = 0;
-                        for (; d + 3 < head_dim; d += 4) {
-                            float32x4_t af = vld1q_f32(acc + d);
-                            float32x4_t vf = fp16x4_to_fp32_inline(vt + d);
-                            float32x4_t corr = vdupq_n_f32(corr_f32);
-                            /* af * corr + vf  (not af + corr * vf) */
-                            af = vaddq_f32(vmulq_f32(af, corr), vf);
-                            vst1q_f32(acc + d, af);
-                        }
-                        for (; d < head_dim; d++) {
-                            acc[d] = acc[d] * corr_f32 + fp16_to_fp32(vt[d]);
-                        }
-#elif defined(PICOLM_AVX)
-                        int d = 0;
-                        for (; d + 7 < head_dim; d += 8) {
-                            __m256 af = _mm256_loadu_ps(acc + d);
-                            __m256 vf = fp16x8_to_fp32_inline(vt + d);
-#ifdef __FMA__
-                            af = _mm256_fmadd_ps(af, _mm256_set1_ps(corr_f32), vf);
-#else
-                            af = _mm256_add_ps(_mm256_mul_ps(af, _mm256_set1_ps(corr_f32)), vf);
-#endif
-                            _mm256_storeu_ps(acc + d, af);
-                        }
-                        for (; d < head_dim; d++) {
-                            acc[d] = acc[d] * corr_f32 + fp16_to_fp32(vt[d]);
-                        }
-#elif defined(PICOLM_SSE2)
-                        int d = 0;
-                        for (; d + 3 < head_dim; d += 4) {
-                            __m128 af = _mm_loadu_ps(acc + d);
-                            __m128 vf = fp16x4_to_fp32_inline(vt + d);
-                            af = _mm_add_ps(_mm_mul_ps(af, _mm_set1_ps(corr_f32)), vf);
-                            _mm_storeu_ps(acc + d, af);
-                        }
-                        for (; d < head_dim; d++) {
-                            acc[d] = acc[d] * corr_f32 + fp16_to_fp32(vt[d]);
-                        }
-#else
+                    if (s->kv_type_v == KV_CACHE_Q8_0) {
+                        fma_scale_q8_0_f32(acc, correction, vt, head_dim);
+                    } else if (s->kv_type_v == KV_CACHE_Q4_0) {
+                        fma_scale_q4_0_f32(acc, correction, vt, head_dim);
+                    } else {
+                        const uint16_t *vt16 = (const uint16_t *)vt;
                         for (int d = 0; d < head_dim; d++) {
-                            acc[d] = acc[d] * corr_f32 + fp16_to_fp32(vt[d]);
+                            acc[d] = acc[d] * correction + fp16_to_fp32(vt16[d]);
                         }
-#endif
                     }
                     max_score = score;
                 } else {
                     float w = expf(score - max_score);
                     sum_exp += w;
                     /* acc += w * dequant(vt) */
-                    {
-#ifdef PICOLM_NEON
-                        int d = 0;
-                        float32x4_t wf = vdupq_n_f32(w);
-                        for (; d + 3 < head_dim; d += 4) {
-                            float32x4_t af = vld1q_f32(acc + d);
-                            float32x4_t vf = fp16x4_to_fp32_inline(vt + d);
-                            af = vmlaq_f32(af, wf, vf);
-                            vst1q_f32(acc + d, af);
+                    if (s->kv_type_v == KV_CACHE_Q8_0) {
+                        scale_add_q8_0_f32(acc, w, vt, head_dim);
+                    } else if (s->kv_type_v == KV_CACHE_Q4_0) {
+                        scale_add_q4_0_f32(acc, w, vt, head_dim);
+                    } else {
+                        const uint16_t *vt16 = (const uint16_t *)vt;
+                        for (int d = 0; d < head_dim; d++) {
+                            acc[d] += w * fp16_to_fp32(vt16[d]);
                         }
-                        for (; d < head_dim; d++) acc[d] += w * fp16_to_fp32(vt[d]);
-#elif defined(PICOLM_AVX)
-                        int d = 0;
-                        __m256 wf = _mm256_set1_ps(w);
-                        for (; d + 7 < head_dim; d += 8) {
-                            __m256 af = _mm256_loadu_ps(acc + d);
-                            __m256 vf = fp16x8_to_fp32_inline(vt + d);
-                            _mm256_storeu_ps(acc + d, _mm256_add_ps(af, _mm256_mul_ps(wf, vf)));
-                        }
-                        for (; d < head_dim; d++) acc[d] += w * fp16_to_fp32(vt[d]);
-#elif defined(PICOLM_SSE2)
-                        int d = 0;
-                        __m128 wf = _mm_set1_ps(w);
-                        for (; d + 3 < head_dim; d += 4) {
-                            __m128 af = _mm_loadu_ps(acc + d);
-                            __m128 vf = fp16x4_to_fp32_inline(vt + d);
-                            _mm_storeu_ps(acc + d, _mm_add_ps(af, _mm_mul_ps(wf, vf)));
-                        }
-                        for (; d < head_dim; d++) acc[d] += w * fp16_to_fp32(vt[d]);
-#else
-                        for (int d = 0; d < head_dim; d++) acc[d] += w * fp16_to_fp32(vt[d]);
-#endif
                     }
                 }
             }
+
+
 
             /* Normalize */
             float inv_sum = 1.0f / sum_exp;
@@ -846,7 +837,7 @@ void model_free(model_t *m) {
 
 int kvcache_save(const model_t *m, const char *path, int n_pos) {
     const model_config_t *c = &m->config;
-    int kv_dim = c->n_kv_heads * c->head_dim;
+    const run_state_t *s = &m->state;
     int seq_len = c->max_seq_len;
 
     if (n_pos <= 0 || n_pos > seq_len) return -1;
@@ -857,26 +848,30 @@ int kvcache_save(const model_t *m, const char *path, int n_pos) {
         return -1;
     }
 
-    uint32_t header[4] = {
-        KVCACHE_MAGIC,
+    /* Version 2 header */
+    uint32_t header[7] = {
+        KVCACHE_MAGIC | 0x00000002,
         (uint32_t)n_pos,
         (uint32_t)c->n_layers,
-        (uint32_t)kv_dim
+        (uint32_t)c->n_kv_heads,
+        (uint32_t)c->head_dim,
+        (uint32_t)s->kv_type_k,
+        (uint32_t)s->kv_type_v
     };
-    fwrite(header, sizeof(uint32_t), 4, f);
+    fwrite(header, sizeof(uint32_t), 7, f);
 
-    /* Write KV cache for each layer, only the first n_pos positions */
-    size_t row_size = (size_t)kv_dim * sizeof(uint16_t);
+    size_t pos_stride_k = (size_t)c->n_kv_heads * s->kv_row_size_k;
+    size_t pos_stride_v = (size_t)c->n_kv_heads * s->kv_row_size_v;
     for (int l = 0; l < c->n_layers; l++) {
-        const uint16_t *kcache_l = m->state.key_cache + (size_t)l * seq_len * kv_dim;
+        const uint8_t *kcache_l = s->key_cache + (size_t)l * seq_len * pos_stride_k;
         for (int p = 0; p < n_pos; p++) {
-            fwrite(kcache_l + (size_t)p * kv_dim, 1, row_size, f);
+            fwrite(kcache_l + (size_t)p * pos_stride_k, 1, pos_stride_k, f);
         }
     }
     for (int l = 0; l < c->n_layers; l++) {
-        const uint16_t *vcache_l = m->state.val_cache + (size_t)l * seq_len * kv_dim;
+        const uint8_t *vcache_l = s->val_cache + (size_t)l * seq_len * pos_stride_v;
         for (int p = 0; p < n_pos; p++) {
-            fwrite(vcache_l + (size_t)p * kv_dim, 1, row_size, f);
+            fwrite(vcache_l + (size_t)p * pos_stride_v, 1, pos_stride_v, f);
         }
     }
 
@@ -887,19 +882,20 @@ int kvcache_save(const model_t *m, const char *path, int n_pos) {
 
 int kvcache_load(model_t *m, const char *path) {
     const model_config_t *c = &m->config;
-    int kv_dim = c->n_kv_heads * c->head_dim;
+    run_state_t *s = &m->state;
     int seq_len = c->max_seq_len;
 
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
 
-    uint32_t header[4];
-    if (fread(header, sizeof(uint32_t), 4, f) != 4) {
+    uint32_t header[7];
+    if (fread(header, sizeof(uint32_t), 7, f) != 7) {
         fclose(f);
         return 0;
     }
 
-    if (header[0] != KVCACHE_MAGIC) {
+    uint32_t magic_base = header[0] & ~0x00000003;
+    if (magic_base != KVCACHE_MAGIC) {
         fprintf(stderr, "kvcache_load: invalid magic\n");
         fclose(f);
         return 0;
@@ -907,11 +903,14 @@ int kvcache_load(model_t *m, const char *path) {
 
     int n_pos = (int)header[1];
     int file_layers = (int)header[2];
-    int file_kv_dim = (int)header[3];
+    int file_n_kv_heads = (int)header[3];
+    int file_head_dim = (int)header[4];
 
-    if (file_layers != c->n_layers || file_kv_dim != kv_dim) {
-        fprintf(stderr, "kvcache_load: model mismatch (layers=%d/%d, kv_dim=%d/%d)\n",
-                file_layers, c->n_layers, file_kv_dim, kv_dim);
+    if (file_layers != c->n_layers || file_n_kv_heads != c->n_kv_heads ||
+        file_head_dim != c->head_dim) {
+        fprintf(stderr, "kvcache_load: model mismatch (layers=%d/%d, kv_heads=%d/%d, head_dim=%d/%d)\n",
+                file_layers, c->n_layers, file_n_kv_heads, c->n_kv_heads,
+                file_head_dim, c->head_dim);
         fclose(f);
         return 0;
     }
@@ -922,20 +921,28 @@ int kvcache_load(model_t *m, const char *path) {
         return 0;
     }
 
-    size_t row_size = (size_t)kv_dim * sizeof(uint16_t);
+    if (header[5] != s->kv_type_k || header[6] != s->kv_type_v) {
+        fprintf(stderr, "kvcache_load: KV type mismatch (file k=%d v=%d vs current k=%d v=%d)\n",
+                header[5], header[6], s->kv_type_k, s->kv_type_v);
+        fclose(f);
+        return 0;
+    }
+
+    size_t pos_stride_k = (size_t)c->n_kv_heads * s->kv_row_size_k;
+    size_t pos_stride_v = (size_t)c->n_kv_heads * s->kv_row_size_v;
     for (int l = 0; l < c->n_layers; l++) {
-        uint16_t *kcache_l = m->state.key_cache + (size_t)l * seq_len * kv_dim;
+        uint8_t *kcache_l = s->key_cache + (size_t)l * seq_len * pos_stride_k;
         for (int p = 0; p < n_pos; p++) {
-            if (fread(kcache_l + (size_t)p * kv_dim, 1, row_size, f) != row_size) {
+            if (fread(kcache_l + (size_t)p * pos_stride_k, 1, pos_stride_k, f) != pos_stride_k) {
                 fclose(f);
                 return 0;
             }
         }
     }
     for (int l = 0; l < c->n_layers; l++) {
-        uint16_t *vcache_l = m->state.val_cache + (size_t)l * seq_len * kv_dim;
+        uint8_t *vcache_l = s->val_cache + (size_t)l * seq_len * pos_stride_v;
         for (int p = 0; p < n_pos; p++) {
-            if (fread(vcache_l + (size_t)p * kv_dim, 1, row_size, f) != row_size) {
+            if (fread(vcache_l + (size_t)p * pos_stride_v, 1, pos_stride_v, f) != pos_stride_v) {
                 fclose(f);
                 return 0;
             }

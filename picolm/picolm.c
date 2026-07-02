@@ -40,6 +40,8 @@ static void usage(const char *prog) {
     fprintf(stderr, "\nAdvanced options:\n");
     fprintf(stderr, "  --json         Grammar-constrained JSON output mode\n");
     fprintf(stderr, "  --cache <file> KV cache file (saves/loads prompt state)\n");
+    fprintf(stderr, "  -ctk <type>    Key cache type: f16, q8_0, q4_0 (default: f16)\n");
+    fprintf(stderr, "  -ctv <type>    Val cache type: f16, q8_0, q4_0 (default: f16)\n");
 }
 
 static char *read_stdin(void) {
@@ -77,6 +79,8 @@ int main(int argc, char **argv) {
     int    num_threads = 4;
     int    json_mode = 0;
     const char *cache_file = NULL;
+    kv_cache_type_t kv_type_k = KV_CACHE_F16;
+    kv_cache_type_t kv_type_v = KV_CACHE_F16;
 
     /* Parse arguments */
     for (int i = 2; i < argc; i++) {
@@ -98,6 +102,13 @@ int main(int argc, char **argv) {
             json_mode = 1;
         } else if (strcmp(argv[i], "--cache") == 0 && i + 1 < argc) {
             cache_file = argv[++i];
+        } else if ((strcmp(argv[i], "-ctk") == 0 || strcmp(argv[i], "-ctv") == 0) && i + 1 < argc) {
+            const char *typestr = argv[++i];
+            kv_cache_type_t *tgt = (strcmp(argv[i-1], "-ctk") == 0) ? &kv_type_k : &kv_type_v;
+            if (strcmp(typestr, "q8_0") == 0) *tgt = KV_CACHE_Q8_0;
+            else if (strcmp(typestr, "q4_0") == 0) *tgt = KV_CACHE_Q4_0;
+            else if (strcmp(typestr, "f16") == 0) *tgt = KV_CACHE_F16;
+            else { fprintf(stderr, "Unknown KV cache type: %s (use f16, q8_0, q4_0)\n", typestr); return 1; }
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             usage(argv[0]);
@@ -151,7 +162,7 @@ int main(int argc, char **argv) {
     model_t model;
     /* Initialize FP16->FP32 lookup table (64KB) for fast attention */
     fp16_table_init();
-    if (model_load(&model, model_path, context_override) != 0) {
+    if (model_load(&model, model_path, context_override, kv_type_k, kv_type_v) != 0) {
         fprintf(stderr, "Failed to load model\n");
         return 1;
     }
@@ -279,8 +290,16 @@ int main(int argc, char **argv) {
             total_gen, gen_time,
             gen_time > 0 ? (double)total_gen / gen_time : 0);
     fprintf(stderr, "Total: %.2fs\n", total_time);
-    fprintf(stderr, "Memory: %.2f MB runtime state (FP16 KV cache)\n",
-            (double)model.state.mem_size / (1024.0 * 1024.0));
+    {
+        const char *kname = "f16";
+        if (model.state.kv_type_k == KV_CACHE_Q8_0) kname = "q8_0";
+        if (model.state.kv_type_k == KV_CACHE_Q4_0) kname = "q4_0";
+        const char *vname = "f16";
+        if (model.state.kv_type_v == KV_CACHE_Q8_0) vname = "q8_0";
+        if (model.state.kv_type_v == KV_CACHE_Q4_0) vname = "q4_0";
+        fprintf(stderr, "Memory: %.2f MB runtime state (%s/%s KV cache)\n",
+                (double)model.state.mem_size / (1024.0 * 1024.0), kname, vname);
+    }
 
     /* Cleanup */
     grammar_free(&grammar);
