@@ -664,7 +664,8 @@ float *model_forward(model_t *m, int token, int pos) {
                             float32x4_t af = vld1q_f32(acc + d);
                             float32x4_t vf = fp16x4_to_fp32_inline(vt + d);
                             float32x4_t corr = vdupq_n_f32(corr_f32);
-                            af = vmlaq_f32(af, corr, vf);
+                            /* af * corr + vf  (not af + corr * vf) */
+                            af = vaddq_f32(vmulq_f32(af, corr), vf);
                             vst1q_f32(acc + d, af);
                         }
                         for (; d < head_dim; d++) {
