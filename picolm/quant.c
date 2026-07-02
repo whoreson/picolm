@@ -2142,12 +2142,12 @@ void fma_scale_q8_0_f32(float *dst, float correction, const void *src, int n) {
             float32x4_t qf0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16)));
             float32x4_t scaled = vmulq_f32(qf0, df);
             float32x4_t acc = vld1q_f32(dptr + j);
-            vst1q_f32(dptr + j, vmlaq_f32(vmulq_f32(acc, corr), scaled));
+            vst1q_f32(dptr + j, vaddq_f32(vmulq_f32(acc, corr), scaled));
 
             float32x4_t qf1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16)));
             scaled = vmulq_f32(qf1, df);
             acc = vld1q_f32(dptr + j + 4);
-            vst1q_f32(dptr + j + 4, vmlaq_f32(vmulq_f32(acc, corr), scaled));
+            vst1q_f32(dptr + j + 4, vaddq_f32(vmulq_f32(acc, corr), scaled));
         }
 #else
         for (int j = 0; j < 32; j++) {
