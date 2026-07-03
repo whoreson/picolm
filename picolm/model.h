@@ -35,6 +35,8 @@ typedef struct {
     const void *attn_k;
     const void *attn_v;
     const void *attn_output;
+    const void *attn_q_norm;   /* QK-norm (Qwen3): per-head RMSNorm weight [head_dim] */
+    const void *attn_k_norm;   /* QK-norm (Qwen3): per-head RMSNorm weight [head_dim] */
     const void *ffn_norm;
     const void *ffn_gate;
     const void *ffn_down;
@@ -45,6 +47,8 @@ typedef struct {
     gguf_type_t type_attn_k;
     gguf_type_t type_attn_v;
     gguf_type_t type_attn_output;
+    gguf_type_t type_attn_q_norm;
+    gguf_type_t type_attn_k_norm;
     gguf_type_t type_ffn_norm;
     gguf_type_t type_ffn_gate;
     gguf_type_t type_ffn_down;
@@ -100,6 +104,8 @@ typedef struct {
     float *norm_weights;
     float *attn_norm_w[MAX_LAYERS];
     float *ffn_norm_w[MAX_LAYERS];
+    float *attn_q_norm_w[MAX_LAYERS];  /* QK-norm (Qwen3) */
+    float *attn_k_norm_w[MAX_LAYERS];  /* QK-norm (Qwen3) */
     float *output_norm_w;
 
     /* Single allocation base */
