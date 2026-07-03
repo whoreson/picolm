@@ -1011,6 +1011,202 @@ void model_free(model_t *m) {
 }
 
 /* ================================================================
+ * Batch prefill: all prompt tokens processed at once.
+ * Projection matmuls batched (weights read once). Attention per-token.
+ * ================================================================ */
+
+float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int start_pos) {
+    model_config_t *c = &m->config;
+    model_weights_t *w = &m->weights;
+    run_state_t *s = &m->state;
+    int dim = c->n_embd, n_ffn = c->n_ffn;
+    int n_heads = c->n_heads, n_kv_heads = c->n_kv_heads, head_dim = c->head_dim;
+    int kv_dim = n_kv_heads * head_dim, kv_mul = n_heads / n_kv_heads;
+    int q_dim = n_heads * head_dim, seq_len = c->max_seq_len;
+    size_t bs = (size_t)n_tokens;
+
+    size_t sz = bs * (dim * 3 + q_dim + kv_dim * 2 + n_ffn * 2);
+    float *buf = (float *)malloc(sz * sizeof(float));
+    if (!buf) { fprintf(stderr, "OOM: prefill batch\n"); exit(1); }
+    float *p = buf;
+    float *x_batch = p;  p += bs * dim;
+    float *xb_batch = p; p += bs * dim;
+    float *xb2_batch = p; p += bs * dim;
+    float *q_batch = p;  p += bs * q_dim;
+    float *k_batch = p;  p += bs * kv_dim;
+    float *v_batch = p;  p += bs * kv_dim;
+    float *hb_batch = p; p += bs * n_ffn;
+    float *hb2_batch = p;
+
+    /* Embedding lookup */
+    {
+        size_t row_bytes = gguf_type_row_size(w->type_token_embd, dim);
+        for (int bi = 0; bi < n_tokens; bi++) {
+            const void *er = (const uint8_t *)w->token_embd + (size_t)tokens[bi] * row_bytes;
+            dequantize_row(er, x_batch + bi * dim, dim, w->type_token_embd);
+        }
+    }
+
+    for (int l = 0; l < c->n_layers; l++) {
+        layer_weights_t *lw = &w->layers[l];
+
+        /* RMSNorm */
+        for (int bi = 0; bi < n_tokens; bi++)
+            rmsnorm(xb_batch + bi * dim, x_batch + bi * dim, s->attn_norm_w[l], dim);
+
+        /* Q projection (batched) */
+        tensor_set_repacked(m->repack_used[2+l*9] ? m->repack_buffers[2+l*9] : NULL);
+        matmul_batch(q_batch, xb_batch, n_tokens, lw->attn_q, dim, q_dim, lw->type_attn_q);
+        tensor_set_repacked(NULL);
+
+        /* K+V projection (batched dual) */
+        tensor_set_repacked(m->repack_used[3+l*9] ? m->repack_buffers[3+l*9] : NULL);
+        matmul_dual_batch(k_batch, v_batch, xb_batch, n_tokens,
+                          lw->attn_k, lw->attn_v, dim, kv_dim,
+                          lw->type_attn_k, lw->type_attn_v);
+        tensor_set_repacked(NULL);
+
+        /* Per-position: RoPE, KV store, attention */
+        for (int bi = 0; bi < n_tokens; bi++) {
+            int pos = start_pos + bi;
+            float *q_pos = q_batch + bi * q_dim;
+            float *k_pos = k_batch + bi * kv_dim;
+            float *v_pos = v_batch + bi * kv_dim;
+            float *xbi = xb_batch + bi * dim;
+
+            const float *cos_pos = s->rope_cos + (size_t)pos * (head_dim / 2);
+            const float *sin_pos = s->rope_sin + (size_t)pos * (head_dim / 2);
+
+            /* QK-norm (Qwen3) */
+            if (lw->attn_q_norm) {
+                float *qnw = s->attn_q_norm_w[l];
+                float *knw = s->attn_k_norm_w[l];
+                for (int h = 0; h < n_heads; h++)
+                    rmsnorm(q_pos + h * head_dim, q_pos + h * head_dim, qnw, head_dim);
+                for (int h = 0; h < n_kv_heads; h++)
+                    rmsnorm(k_pos + h * head_dim, k_pos + h * head_dim, knw, head_dim);
+            }
+
+            rope(q_pos, k_pos, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos);
+
+            /* KV cache store */
+            uint8_t *kcl = s->key_cache + (size_t)l * seq_len * c->n_kv_heads * s->kv_row_size_k;
+            uint8_t *vcl = s->val_cache + (size_t)l * seq_len * c->n_kv_heads * s->kv_row_size_v;
+            for (int hkv = 0; hkv < n_kv_heads; hkv++) {
+                uint8_t *kp = kcl + (size_t)pos * c->n_kv_heads * s->kv_row_size_k + hkv * s->kv_row_size_k;
+                uint8_t *vp = vcl + (size_t)pos * c->n_kv_heads * s->kv_row_size_v + hkv * s->kv_row_size_v;
+                for (int d2 = 0; d2 < head_dim; d2++)
+                    ((uint16_t*)kp)[d2] = fp32_to_fp16(k_pos[hkv * head_dim + d2]);
+                for (int d2 = 0; d2 < head_dim; d2++)
+                    ((uint16_t*)vp)[d2] = fp32_to_fp16(v_pos[hkv * head_dim + d2]);
+            }
+
+            /* Attention (copied exactly from model_forward) */
+            for (int h = 0; h < n_heads; h++) {
+                float *qh = q_pos + h * head_dim;
+                int kv_h = h / kv_mul;
+                float *xbh = xbi + h * head_dim;
+                float max_score = -1e30f, sum_exp = 0.0f;
+                float acc[256];
+                memset(acc, 0, (size_t)head_dim * sizeof(float));
+
+                for (int t = 0; t <= pos; t++) {
+                    const uint8_t *kt = kcl + (size_t)t * c->n_kv_heads * s->kv_row_size_k + kv_h * s->kv_row_size_k;
+                    float score;
+                    if (s->kv_type_k == KV_CACHE_Q8_0)
+                        score = vec_dot_q8_0_f32(kt, qh, head_dim);
+                    else if (s->kv_type_k == KV_CACHE_Q4_0)
+                        score = vec_dot_q4_0_f32(kt, qh, head_dim);
+                    else
+                        score = vec_dot_f16_f32(kt, qh, head_dim);
+                    score /= sqrtf((float)head_dim);
+
+                    const uint8_t *vt = vcl + (size_t)t * c->n_kv_heads * s->kv_row_size_v + kv_h * s->kv_row_size_v;
+                    if (score > max_score) {
+                        float correction = expf(max_score - score);
+                        sum_exp = sum_exp * correction + 1.0f;
+                        if (s->kv_type_v == KV_CACHE_Q8_0)
+                            fma_scale_q8_0_f32(acc, correction, vt, head_dim);
+                        else if (s->kv_type_v == KV_CACHE_Q4_0)
+                            fma_scale_q4_0_f32(acc, correction, vt, head_dim);
+                        else {
+                            const uint16_t *vt16 = (const uint16_t*)vt;
+                            for (int d2 = 0; d2 < head_dim; d2++)
+                                acc[d2] = acc[d2] * correction + fp16_to_fp32(vt16[d2]);
+                        }
+                        max_score = score;
+                    } else {
+                        float wt = expf(score - max_score);
+                        sum_exp += wt;
+                        if (s->kv_type_v == KV_CACHE_Q8_0)
+                            scale_add_q8_0_f32(acc, wt, vt, head_dim);
+                        else if (s->kv_type_v == KV_CACHE_Q4_0)
+                            scale_add_q4_0_f32(acc, wt, vt, head_dim);
+                        else {
+                            const uint16_t *vt16 = (const uint16_t*)vt;
+                            for (int d2 = 0; d2 < head_dim; d2++)
+                                acc[d2] += wt * fp16_to_fp32(vt16[d2]);
+                        }
+                    }
+                }
+
+                float inv_sum = 1.0f / sum_exp;
+                for (int d2 = 0; d2 < head_dim; d2++) xbh[d2] = acc[d2] * inv_sum;
+            }
+        }
+
+        /* Output projection (batched) */
+        tensor_set_repacked(m->repack_used[6+l*9] ? m->repack_buffers[6+l*9] : NULL);
+        matmul_batch(xb2_batch, xb_batch, n_tokens, lw->attn_output, q_dim, dim, lw->type_attn_output);
+        tensor_set_repacked(NULL);
+
+        /* Residual: x += attn_out */
+        for (int bi = 0; bi < n_tokens; bi++) {
+            float *a = x_batch + bi * dim, *b = xb2_batch + bi * dim;
+            for (int d2 = 0; d2 < dim; d2++) a[d2] += b[d2];
+        }
+
+        /* FFN RMSNorm */
+        for (int bi = 0; bi < n_tokens; bi++)
+            rmsnorm(xb_batch + bi * dim, x_batch + bi * dim, s->ffn_norm_w[l], dim);
+
+        /* FFN gate+up (batched dual) */
+        tensor_set_repacked(m->repack_used[7+l*9] ? m->repack_buffers[7+l*9] : NULL);
+        matmul_dual_batch(hb_batch, hb2_batch, xb_batch, n_tokens,
+                          lw->ffn_gate, lw->ffn_up, dim, n_ffn,
+                          lw->type_ffn_gate, lw->type_ffn_up);
+        tensor_set_repacked(NULL);
+
+        /* SiLU + mul */
+        for (int bi = 0; bi < n_tokens; bi++) {
+            silu(hb_batch + bi * n_ffn, n_ffn);
+            elemwise_mul(hb_batch + bi * n_ffn, hb_batch + bi * n_ffn, hb2_batch + bi * n_ffn, n_ffn);
+        }
+
+        /* FFN down (batched) */
+        tensor_set_repacked(m->repack_used[8+l*9] ? m->repack_buffers[8+l*9] : NULL);
+        matmul_batch(xb2_batch, hb_batch, n_tokens, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
+        tensor_set_repacked(NULL);
+
+        /* Residual: x += ffn_out */
+        for (int bi = 0; bi < n_tokens; bi++) {
+            float *a = x_batch + bi * dim, *b = xb2_batch + bi * dim;
+            for (int d2 = 0; d2 < dim; d2++) a[d2] += b[d2];
+        }
+    }
+
+    /* Final norm + output (last token only) */
+    float *last_x = x_batch + (n_tokens - 1) * dim;
+    rmsnorm(s->x, last_x, s->output_norm_w, dim);
+    tensor_set_repacked(m->repack_used[1] ? m->repack_buffers[1] : NULL);
+    matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
+    tensor_set_repacked(NULL);
+
+    free(buf);
+    return s->logits;
+}
+
+/* ================================================================
  * KV Cache Persistence — save/load KV state to skip prompt prefill
  *
  * File format:
