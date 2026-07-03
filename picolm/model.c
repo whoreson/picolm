@@ -142,10 +142,24 @@ static uint64_t skip_meta_value(reader_t *r, uint32_t vtype, int *is_numeric) {
 
 /* ---- mmap abstraction ---- */
 
+/* Prefault the mmap so inference doesn't pay page-fault cost.
+ * Touches one byte per page to bring all pages into RAM upfront.
+ * A ~1GB model has ~250K pages; prefaulting takes a few seconds at load
+ * but prevents a page-fault storm during first inference. */
+static void prefault_mmap(const void *addr, size_t size) {
+    const volatile char *p = (const volatile char *)addr;
+    for (size_t off = 0; off < size; off += 4096)
+        (void)p[off];
+#ifdef __linux__
+    madvise((void*)addr, size, MADV_WILLNEED | MADV_SEQUENTIAL);
+#endif
+}
+
 static int mmap_file(model_t *m, const char *path) {
 #ifdef _WIN32
     HANDLE fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
-                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+                            OPEN_EXISTING,
+                            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
     if (fh == INVALID_HANDLE_VALUE) {
         fprintf(stderr, "Cannot open file: %s\n", path);
         return -1;
@@ -173,6 +187,7 @@ static int mmap_file(model_t *m, const char *path) {
     m->mmap_addr  = addr;
     m->file_handle = fh;
     m->map_handle  = mh;
+    prefault_mmap(addr, m->mmap_size);
 #else
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
@@ -190,10 +205,10 @@ static int mmap_file(model_t *m, const char *path) {
         close(fd);
         return -1;
     }
-    madvise(addr, m->mmap_size, MADV_SEQUENTIAL);
 
     m->mmap_addr = addr;
     m->fd = fd;
+    prefault_mmap(addr, m->mmap_size);
 #endif
     return 0;
 }
@@ -243,27 +258,40 @@ static int parse_gguf(model_t *m, int max_seq_len) {
         gguf_str_t key = read_gguf_string(&r);
         uint32_t vtype = read_u32(&r);
 
-        if (str_eq(key, "llama.embedding_length") || str_eq(key, "general.embedding_length")) {
+        if (str_eq(key, "llama.embedding_length") || str_eq(key, "general.embedding_length")
+            || str_eq(key, "qwen2.embedding_length") || str_eq(key, "qwen3.embedding_length")) {
             int dummy; cfg->n_embd = (int)skip_meta_value(&r, vtype, &dummy);
-        } else if (str_eq(key, "llama.feed_forward_length") || str_eq(key, "general.feed_forward_length")) {
+        } else if (str_eq(key, "llama.feed_forward_length") || str_eq(key, "general.feed_forward_length")
+            || str_eq(key, "qwen2.feed_forward_length") || str_eq(key, "qwen3.feed_forward_length")) {
             int dummy; cfg->n_ffn = (int)skip_meta_value(&r, vtype, &dummy);
-        } else if (str_eq(key, "llama.attention.head_count")) {
+        } else if (str_eq(key, "llama.attention.head_count")
+            || str_eq(key, "qwen2.attention.head_count") || str_eq(key, "qwen3.attention.head_count")) {
             int dummy; cfg->n_heads = (int)skip_meta_value(&r, vtype, &dummy);
-        } else if (str_eq(key, "llama.attention.head_count_kv")) {
+        } else if (str_eq(key, "llama.attention.head_count_kv")
+            || str_eq(key, "qwen2.attention.head_count_kv") || str_eq(key, "qwen3.attention.head_count_kv")) {
             int dummy; cfg->n_kv_heads = (int)skip_meta_value(&r, vtype, &dummy);
-        } else if (str_eq(key, "llama.block_count")) {
+        } else if (str_eq(key, "llama.block_count")
+            || str_eq(key, "qwen2.block_count") || str_eq(key, "qwen3.block_count")) {
             int dummy; cfg->n_layers = (int)skip_meta_value(&r, vtype, &dummy);
-        } else if (str_eq(key, "llama.context_length")) {
+        } else if (str_eq(key, "llama.context_length")
+            || str_eq(key, "qwen2.context_length") || str_eq(key, "qwen3.context_length")) {
             int dummy; cfg->max_seq_len = (int)skip_meta_value(&r, vtype, &dummy);
-        } else if (str_eq(key, "llama.rope.freq_base")) {
+        } else if (str_eq(key, "llama.rope.freq_base")
+            || str_eq(key, "qwen2.rope.freq_base") || str_eq(key, "qwen3.rope.freq_base")) {
             if (vtype == GGUF_META_FLOAT32) {
                 cfg->rope_freq_base = read_f32(&r);
             } else {
                 int dummy; skip_meta_value(&r, vtype, &dummy);
             }
+        } else if (str_eq(key, "llama.attention.layer_norm_rms_epsilon")
+            || str_eq(key, "qwen2.attention.layer_norm_rms_epsilon")
+            || str_eq(key, "qwen3.attention.layer_norm_rms_epsilon")) {
+            /* epsilon is hardcoded in rmsnorm (1e-5), just skip the value */
+            int dummy; skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "general.alignment")) {
             int dummy; cfg->alignment = (int)skip_meta_value(&r, vtype, &dummy);
-        } else if (str_eq(key, "llama.vocab_size")) {
+        } else if (str_eq(key, "llama.vocab_size")
+            || str_eq(key, "qwen2.vocab_size") || str_eq(key, "qwen3.vocab_size")) {
             int dummy; cfg->vocab_size = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "tokenizer.ggml.bos_token_id")) {
             int dummy; m->tok_bos_id = (uint32_t)skip_meta_value(&r, vtype, &dummy);
@@ -393,6 +421,10 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                     lw->attn_v = ptr; lw->type_attn_v = qtype;
                 } else if (strcmp(suffix, "attn_output.weight") == 0) {
                     lw->attn_output = ptr; lw->type_attn_output = qtype;
+                } else if (strcmp(suffix, "attn_q_norm.weight") == 0) {
+                    lw->attn_q_norm = ptr; lw->type_attn_q_norm = qtype;
+                } else if (strcmp(suffix, "attn_k_norm.weight") == 0) {
+                    lw->attn_k_norm = ptr; lw->type_attn_k_norm = qtype;
                 } else if (strcmp(suffix, "ffn_norm.weight") == 0) {
                     lw->ffn_norm = ptr; lw->type_ffn_norm = qtype;
                 } else if (strcmp(suffix, "ffn_gate.weight") == 0) {
@@ -489,8 +521,9 @@ static int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_ty
     /* RoPE tables: cos and sin for each (position, dim_pair) */
     size_t sz_rope = (size_t)c->max_seq_len * half_dim * sizeof(float) * 2;
 
-    /* Norm weights: (n_layers * 2 + 1) * n_embd floats */
-    size_t n_norm = (size_t)(c->n_layers * 2 + 1) * c->n_embd;
+    /* Norm weights: (n_layers * 2 + 1) * n_embd + n_layers * head_dim * 2 (QK-norm) */
+    size_t n_norm = (size_t)(c->n_layers * 2 + 1) * c->n_embd
+                  + (size_t)c->n_layers * c->head_dim * 2;
     size_t sz_norm = n_norm * sizeof(float);
 
     size_t total = sz_x + sz_xb + sz_xb2 + sz_q +
@@ -560,15 +593,32 @@ static int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_ty
     /* Pre-dequantize norm weights */
     float *nw = s->norm_weights;
     for (int l = 0; l < c->n_layers; l++) {
+        layer_weights_t *lw = &m->weights.layers[l];
         s->attn_norm_w[l] = nw;
-        dequantize_row(m->weights.layers[l].attn_norm, nw, c->n_embd,
-                       m->weights.layers[l].type_attn_norm);
+        dequantize_row(lw->attn_norm, nw, c->n_embd, lw->type_attn_norm);
         nw += c->n_embd;
 
         s->ffn_norm_w[l] = nw;
         dequantize_row(m->weights.layers[l].ffn_norm, nw, c->n_embd,
                        m->weights.layers[l].type_ffn_norm);
         nw += c->n_embd;
+
+        /* Qwen3 QK-norm weights (per-head, if present) */
+        s->attn_q_norm_w[l] = nw;
+        if (lw->attn_q_norm)
+            dequantize_row(lw->attn_q_norm, nw, c->head_dim,
+                           lw->type_attn_q_norm);
+        else
+            memset(nw, 0, (size_t)c->head_dim * sizeof(float));
+        nw += c->head_dim;
+
+        s->attn_k_norm_w[l] = nw;
+        if (lw->attn_k_norm)
+            dequantize_row(lw->attn_k_norm, nw, c->head_dim,
+                           lw->type_attn_k_norm);
+        else
+            memset(nw, 0, (size_t)c->head_dim * sizeof(float));
+        nw += c->head_dim;
     }
     s->output_norm_w = nw;
     dequantize_row(m->weights.output_norm, nw, c->n_embd,
@@ -734,6 +784,16 @@ float *model_forward(model_t *m, int token, int pos) {
         /* KV cache layout: [layer][pos][head] with per-head quantized rows */
         uint8_t *kcache_layer = s->key_cache + (size_t)l * seq_len * c->n_kv_heads * s->kv_row_size_k;
         uint8_t *vcache_layer = s->val_cache + (size_t)l * seq_len * c->n_kv_heads * s->kv_row_size_v;
+
+        /* QK-norm (Qwen3): per-head RMSNorm applied before RoPE */
+        if (lw->attn_q_norm) {
+            float *qnw = s->attn_q_norm_w[l];
+            float *knw = s->attn_k_norm_w[l];
+            for (int h = 0; h < n_heads; h++)
+                rmsnorm(s->q + h * head_dim, s->q + h * head_dim, qnw, head_dim);
+            for (int h = 0; h < n_kv_heads; h++)
+                rmsnorm(k_tmp + h * head_dim, k_tmp + h * head_dim, knw, head_dim);
+        }
 
         /* Apply RoPE to Q and K */
         rope(s->q, k_tmp, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos);
