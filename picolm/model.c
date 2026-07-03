@@ -3,6 +3,7 @@
 #include "quant.h"
 
 #include <stdio.h>
+#include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -167,9 +168,7 @@ static void prepare_mmap(const void *addr, size_t size) {
 static int mmap_file(model_t *m, const char *path) {
 #ifdef _WIN32
     HANDLE fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
-                            OPEN_EXISTING, 0, NULL,
-                            OPEN_EXISTING,
-                            FILE_ATTRIBUTE_NORMAL, NULL);
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (fh == INVALID_HANDLE_VALUE) {
         fprintf(stderr, "Cannot open file: %s\n", path);
         return -1;
@@ -395,8 +394,8 @@ static int parse_gguf(model_t *m, int max_seq_len) {
         const void *ptr = (const uint8_t *)m->mmap_addr + tensor_data_base + tinfos[i].offset;
         gguf_type_t qtype = (gguf_type_t)tinfos[i].type;
         if (i < 5) {
-            fprintf(stderr, "T%lu: %s type=%u offset=%lu abs=%zu\n",
-                    i, tinfos[i].name.str, tinfos[i].type,
+            fprintf(stderr, "T%llu: %s type=%u offset=%" PRIu64 " abs=%zu\n",
+                    (unsigned long long)i, tinfos[i].name.str, tinfos[i].type,
                     tinfos[i].offset, (size_t)((const uint8_t*)ptr - (const uint8_t*)m->mmap_addr));
         }
 
