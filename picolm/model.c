@@ -142,24 +142,34 @@ static uint64_t skip_meta_value(reader_t *r, uint32_t vtype, int *is_numeric) {
 
 /* ---- mmap abstraction ---- */
 
-/* Prefault the mmap so inference doesn't pay page-fault cost.
- * Touches one byte per page to bring all pages into RAM upfront.
- * A ~1GB model has ~250K pages; prefaulting takes a few seconds at load
- * but prevents a page-fault storm during first inference. */
-static void prefault_mmap(const void *addr, size_t size) {
+/* Two modes for mmap'd model loading:
+
+ * 1. Default (PICO mode): bare mmap, no hints. The OS pages in weights
+ *    on demand during inference. Uses minimal RAM - can run 10B models
+ *    on 256MB RAM. Prefill is slower due to page faults.
+ *
+ * 2. Prefault mode (-DPICOLM_PREFAULT): touch every page at load time
+ *    to bring the entire model into the page cache. Uses model-size RAM
+ *    but eliminates page-fault overhead during inference.
+ *
+ * The prefault loop touches one byte per 4KB page. A 1GB model has
+ * ~250K pages and takes ~2-3 seconds to fault in at load time. */
+
+static void prepare_mmap(const void *addr, size_t size) {
+#ifdef PICOLM_PREFAULT
     const volatile char *p = (const volatile char *)addr;
     for (size_t off = 0; off < size; off += 4096)
         (void)p[off];
-#ifdef __linux__
-    madvise((void*)addr, size, MADV_WILLNEED | MADV_SEQUENTIAL);
 #endif
+    (void)addr; (void)size;
 }
 
 static int mmap_file(model_t *m, const char *path) {
 #ifdef _WIN32
     HANDLE fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                            OPEN_EXISTING, 0, NULL,
                             OPEN_EXISTING,
-                            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+                            FILE_ATTRIBUTE_NORMAL, NULL);
     if (fh == INVALID_HANDLE_VALUE) {
         fprintf(stderr, "Cannot open file: %s\n", path);
         return -1;
@@ -187,7 +197,7 @@ static int mmap_file(model_t *m, const char *path) {
     m->mmap_addr  = addr;
     m->file_handle = fh;
     m->map_handle  = mh;
-    prefault_mmap(addr, m->mmap_size);
+    prepare_mmap(addr, m->mmap_size);
 #else
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
@@ -208,7 +218,7 @@ static int mmap_file(model_t *m, const char *path) {
 
     m->mmap_addr = addr;
     m->fd = fd;
-    prefault_mmap(addr, m->mmap_size);
+    prepare_mmap(addr, m->mmap_size);
 #endif
     return 0;
 }
