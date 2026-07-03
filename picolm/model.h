@@ -137,6 +137,10 @@ typedef struct {
     uint32_t    tok_eos_id;
     /* Pre-tokenizer type: 0=U+2581 (default), 1=U+0100 (smollm) */
     int         tok_space_marker;
+
+    /* Runtime repacked weight buffers (for AVX2 Q4_0_8x8 optimization) */
+    void       *repack_buffers[MAX_LAYERS + 4]; /* per-layer repacked data + output norms */
+    int         repack_used[MAX_LAYERS + 4];    /* 1 if repacked, 0 if not */
 } model_t;
 
 /* Load a GGUF model file. Returns 0 on success. */

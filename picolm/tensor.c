@@ -16,6 +16,13 @@
 static float *scratch_buf = NULL;
 static int    scratch_size = 0;
 
+/* Repacked Q4_0->Q4_0x8 weight pointer (set per-matmul by caller on AVX2) */
+static const void *wptr_repacked = NULL;
+
+void tensor_set_repacked(const void *ptr) {
+    wptr_repacked = ptr;
+}
+
 void tensor_init_scratch(float *buf, int size) {
     scratch_buf  = buf;
     scratch_size = size;
@@ -110,6 +117,34 @@ static void matmul_worker_f(matmul_task_t *t) {
             t->out[i] = vec_dot_q4_0_q8_0(
                 t->W + (size_t)i * t->row_bytes, qx, t->n);
         }
+    } else if (t->qtype == GGUF_TYPE_Q4_0_4_4 && t->x) {
+        /* Q4_0_4_4: process 4 rows at a time from interleaved layout */
+        const block_q8_0 *qx = (const block_q8_0 *)t->x;
+        int start4 = (t->start / 4) * 4;
+        int end4 = (t->end + 3) / 4 * 4;
+        for (int i = start4; i < end4; i += 4) {
+            vec_dot_q4_0x4_q8_0(
+                t->W + (size_t)i * t->row_bytes, qx, t->n,
+                t->out + i, 4);
+        }
+    } else if (t->qtype == GGUF_TYPE_Q4_0_8_8 && t->x) {
+        /* Q4_0_8_8: process 8 rows at a time from interleaved layout */
+#if defined(PICOLM_AVX2)
+        const block_q8_0 *qx = (const block_q8_0 *)t->x;
+        int start8 = (t->start / 8) * 8;
+        int end8 = (t->end + 7) / 8 * 8;
+        for (int i = start8; i < end8; i += 8) {
+            int nrows = (i + 8 < end8) ? 8 : (end8 - i);
+            vec_dot_q4_0x8_q8_0_avx2(
+                t->W + (size_t)i * t->row_bytes, qx, t->n,
+                t->out + i, nrows);
+        }
+#else
+        for (int i = t->start; i < t->end; i++) {
+            t->out[i] = vec_dot(t->W + (size_t)i * t->row_bytes,
+                                t->x, t->n, t->qtype);
+        }
+#endif
 #endif
     } else {
         for (int i = t->start; i < t->end; i++) {
@@ -284,6 +319,15 @@ static void matmul_worker_f(matmul_task_t *t) {
             t->out[i] = vec_dot_q4_0_q8_0(
                 t->W + (size_t)i * t->row_bytes, qx, t->n);
         }
+    } else if (t->qtype == GGUF_TYPE_Q4_0_4_4 && t->x) {
+        const block_q8_0 *qx = (const block_q8_0 *)t->x;
+        int start4 = (t->start / 4) * 4;
+        int end4 = (t->end + 3) / 4 * 4;
+        for (int i = start4; i < end4; i += 4) {
+            vec_dot_q4_0x4_q8_0(
+                t->W + (size_t)i * t->row_bytes, qx, t->n,
+                t->out + i, 4);
+        }
 #endif
     } else {
         for (int i = t->start; i < t->end; i++) {
@@ -395,7 +439,8 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
         /* If allocation failed, fall through to generic path */
 #if defined(PICOLM_AVX2) || defined(PICOLM_AVX)
     } else if (qtype == GGUF_TYPE_Q4_0) {
-        /* Q4_0 fast path: quantize x to Q8_0 once, then vec_dot_q4_0_q8_0 */
+        /* Q4_0 fast path: quantize x to Q8_0 once, then vec_dot_q4_0_q8_0
+         * On AVX2 with d%8==0, use repacked Q4_0_8x8 path for 8x row throughput. */
         size_t qx_size = (n / 32) * sizeof(block_q8_0);
         block_q8_0 *qx = NULL;
         int qx_owned = 0;
@@ -408,6 +453,17 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
         }
         if (qx != NULL) {
             quantize_row_q8_0(x, qx, n);
+
+#if defined(PICOLM_AVX2)
+            /* Check if we have a repacked Q4_0x8 buffer available */
+            const void *wptr8 = wptr_repacked; /* set by model_load via tensor_set_repacked() */
+            if (wptr8 && d % 8 == 0 && n % 32 == 0) {
+                /* Use AVX2 Q4_0_8x8 path: processes 8 rows per call */
+                vec_dot_q4_0x8_q8_0_avx2(wptr8, qx, n, out, d);
+                if (qx_owned) free(qx);
+                return;
+            }
+#endif
 
             if (n_threads <= 1 || d < 4) {
                 for (int i = 0; i < d; i++) {
@@ -469,6 +525,185 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
             return;
         }
         /* If allocation failed, fall through to generic path */
+    } else if (qtype == GGUF_TYPE_Q4_0_4_4) {
+        /* Q4_0_4_4 fast path: quantize x to Q8_0 once, then vec_dot_q4_0x4_q8_0
+         * processes 4 rows simultaneously from the interleaved weight layout. */
+        size_t qx_size = (n / 32) * sizeof(block_q8_0);
+        block_q8_0 *qx = NULL;
+        int qx_owned = 0;
+        if (n_threads <= 1 && scratch_buf != NULL && qx_size <= (size_t)scratch_size) {
+            qx = (block_q8_0 *)scratch_buf;
+        } else {
+            qx = (block_q8_0 *)malloc(qx_size);
+            qx_owned = 1;
+        }
+        if (qx != NULL) {
+            quantize_row_q8_0(x, qx, n);
+
+            /* Align to multiples of 4 rows */
+            int d4 = (d / 4) * 4;
+
+            if (n_threads <= 1 || d < 4) {
+                for (int i = 0; i < d4; i += 4) {
+                    vec_dot_q4_0x4_q8_0(wptr + (size_t)i * row_bytes, qx, n,
+                                         out + i, 4);
+                }
+                /* Scalar tail for remaining rows */
+                for (int i = d4; i < d; i++) {
+                    out[i] = vec_dot(wptr + (size_t)i * row_bytes, x, n, qtype);
+                }
+                if (qx_owned) free(qx);
+                return;
+            }
+
+            int nt = n_threads;
+            if (nt > d) nt = d;
+            int rows_per = d / nt;
+            int extra = d % nt;
+            int row = rows_per + (0 < extra ? 1 : 0);
+
+            /* Main thread does first group-of-4 aligned chunk */
+            int row4 = (row / 4) * 4;
+            for (int i = 0; i < row4; i += 4) {
+                vec_dot_q4_0x4_q8_0(wptr + (size_t)i * row_bytes, qx, n,
+                                     out + i, 4);
+            }
+            /* Scalar tail */
+            for (int i = row4; i < row; i++) {
+                out[i] = vec_dot(wptr + (size_t)i * row_bytes, x, n, qtype);
+            }
+
+            if (nt > 1 && d >= matmul_min_rows) {
+#ifdef _WIN32
+                HANDLE threads[MAX_THREADS];
+                matmul_task_t tasks[MAX_THREADS];
+                row = rows_per + (0 < extra ? 1 : 0);
+                for (int t = 1; t < nt; t++) {
+                    int tstart = row;
+                    row += rows_per + (t < extra ? 1 : 0);
+                    tasks[t].out = out; tasks[t].x = (const float *)qx; tasks[t].x_d = NULL;
+                    tasks[t].W = wptr; tasks[t].row_bytes = row_bytes; tasks[t].n = n;
+                    tasks[t].qtype = GGUF_TYPE_Q4_0_4_4; tasks[t].start = tstart; tasks[t].end = row;
+                    threads[t] = CreateThread(NULL, 0, matmul_worker, &tasks[t], 0, NULL);
+                }
+                for (int t = 1; t < nt; t++) {
+                    WaitForSingleObject(threads[t], INFINITE);
+                    CloseHandle(threads[t]);
+                }
+#else
+#ifndef PICOLM_USE_PER_MATMUL_THREAD
+                for (int t = 1; t < nt; t++) {
+                    int tstart = row;
+                    row += rows_per + (t < extra ? 1 : 0);
+                    tp_set_task(t, out, (const float *)qx, NULL, wptr, row_bytes, n,
+                                tstart, row, GGUF_TYPE_Q4_0_4_4);
+                }
+                tp_dispatch(nt);
+#else
+                per_matmul_dispatch(nt, out, (const float *)qx, NULL, wptr,
+                                    row_bytes, n, d, GGUF_TYPE_Q4_0_4_4, row);
+#endif
+#endif
+            } else {
+                for (int i = row; i < d4; i += 4) {
+                    vec_dot_q4_0x4_q8_0(wptr + (size_t)i * row_bytes, qx, n,
+                                         out + i, 4);
+                }
+                for (int i = d4; i < d; i++) {
+                    out[i] = vec_dot(wptr + (size_t)i * row_bytes, x, n, qtype);
+                }
+            }
+
+            if (qx_owned) free(qx);
+            return;
+        }
+    } else if (qtype == GGUF_TYPE_Q4_0_8_8) {
+        /* Q4_0_8_8 fast path: weights are already in block_q4_0x8 interleaved format.
+         * On AVX2, use vec_dot_q4_0x8_q8_0_avx2 for 8x row throughput.
+         * Otherwise fall through to generic vec_dot path. */
+#if defined(PICOLM_AVX2)
+        size_t qx_size = (n / 32) * sizeof(block_q8_0);
+        block_q8_0 *qx = NULL;
+        int qx_owned = 0;
+        if (n_threads <= 1 && scratch_buf != NULL && qx_size <= (size_t)scratch_size) {
+            qx = (block_q8_0 *)scratch_buf;
+        } else {
+            qx = (block_q8_0 *)malloc(qx_size);
+            qx_owned = 1;
+        }
+        if (qx != NULL) {
+            quantize_row_q8_0(x, qx, n);
+
+            /* Single-threaded: process all rows at once */
+            if (n_threads <= 1 || d < 8) {
+                vec_dot_q4_0x8_q8_0_avx2(wptr, qx, n, out, d);
+                if (qx_owned) free(qx);
+                return;
+            }
+
+            /* Multi-threaded: split by row groups of 8 */
+            int d8 = (d / 8) * 8;  /* aligned to 8 */
+
+            int nt = n_threads;
+            if (nt > d) nt = d;
+            int rows_per = d / nt;
+            int extra = d % nt;
+            int row = rows_per + (0 < extra ? 1 : 0);
+
+            /* Main thread: process first aligned chunk */
+            int row8 = (row / 8) * 8;
+            if (row8 > 0) {
+                vec_dot_q4_0x8_q8_0_avx2(wptr, qx, n, out, row8);
+            }
+
+            if (nt > 1 && d >= matmul_min_rows) {
+#ifdef _WIN32
+                HANDLE threads[MAX_THREADS];
+                matmul_task_t tasks[MAX_THREADS];
+                row = rows_per + (0 < extra ? 1 : 0);
+                for (int t = 1; t < nt; t++) {
+                    int tstart = row;
+                    row += rows_per + (t < extra ? 1 : 0);
+                    tasks[t].out = out; tasks[t].x = (const float *)qx; tasks[t].x_d = NULL;
+                    tasks[t].W = wptr; tasks[t].row_bytes = row_bytes; tasks[t].n = n;
+                    tasks[t].qtype = GGUF_TYPE_Q4_0_8_8; tasks[t].start = tstart; tasks[t].end = row;
+                    threads[t] = CreateThread(NULL, 0, matmul_worker, &tasks[t], 0, NULL);
+                }
+                for (int t = 1; t < nt; t++) {
+                    WaitForSingleObject(threads[t], INFINITE);
+                    CloseHandle(threads[t]);
+                }
+#else
+#ifndef PICOLM_USE_PER_MATMUL_THREAD
+                for (int t = 1; t < nt; t++) {
+                    int tstart = row;
+                    row += rows_per + (t < extra ? 1 : 0);
+                    tp_set_task(t, out, (const float *)qx, NULL, wptr, row_bytes, n,
+                                tstart, row, GGUF_TYPE_Q4_0_8_8);
+                }
+                tp_dispatch(nt);
+#else
+                per_matmul_dispatch(nt, out, (const float *)qx, NULL, wptr,
+                                    row_bytes, n, d, GGUF_TYPE_Q4_0_8_8, row);
+#endif
+#endif
+            } else {
+                /* Scalar tail for remaining rows */
+                for (int i = row8; i < d8; i += 8) {
+                    int nrows = (i + 8 < d8) ? 8 : (d8 - i);
+                    vec_dot_q4_0x8_q8_0_avx2(wptr + (size_t)i * row_bytes, qx, n,
+                                              out + i, nrows);
+                }
+                for (int i = d8; i < d; i++) {
+                    out[i] = vec_dot(wptr + (size_t)i * row_bytes, x, n, qtype);
+                }
+            }
+
+            if (qx_owned) free(qx);
+            return;
+        }
+#endif
+        /* Non-AVX2: fall through to generic vec_dot path */
     } else if (qtype == GGUF_TYPE_Q4_K) {
         /* Q4_K fast path: quantize x to Q8_K once, then vec_dot_q4_K_q8_K */
         /* Only enabled on x86 (AVX/AVX2). On NEON, use vec_dot_q4_K_f32 instead. */

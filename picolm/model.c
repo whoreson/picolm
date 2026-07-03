@@ -7,6 +7,17 @@
 #include <string.h>
 #include <math.h>
 
+/* Check if AVX2 is available at runtime (for repack decision) */
+static int cpu_has_avx2(void) {
+#ifdef PICOLM_AVX2
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+static void repack_model_weights_q4_0x8(model_t *m);
+
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -336,6 +347,11 @@ static int parse_gguf(model_t *m, int max_seq_len) {
     for (uint64_t i = 0; i < n_tensors; i++) {
         const void *ptr = (const uint8_t *)m->mmap_addr + tensor_data_base + tinfos[i].offset;
         gguf_type_t qtype = (gguf_type_t)tinfos[i].type;
+        if (i < 5) {
+            fprintf(stderr, "T%lu: %s type=%u offset=%lu abs=%zu\n",
+                    i, tinfos[i].name.str, tinfos[i].type,
+                    tinfos[i].offset, (size_t)((const uint8_t*)ptr - (const uint8_t*)m->mmap_addr));
+        }
 
         if (str_eq(tinfos[i].name, "token_embd.weight")) {
             w->token_embd = ptr; w->type_token_embd = qtype;
@@ -576,7 +592,65 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
     if (parse_gguf(m, max_seq_len) != 0) return -1;
     if (allocate_run_state(m, kv_type_k, kv_type_v) != 0) return -1;
 
+    /* Repack Q4_0 tensors to Q4_0x8 for AVX2 SIMD optimization.
+     * Only repack tensors where nrows % 8 == 0 and ncols % 32 == 0. */
+    if (0 && cpu_has_avx2()) {
+        repack_model_weights_q4_0x8(m);
+    }
+
     return 0;
+}
+
+/* Helper: repack a single Q4_0 tensor to Q4_0x8 if eligible.
+ * Returns the allocated buffer or NULL. */
+static void *try_repack_q4_0(model_t *m, const void *data, int nrows, int ncols, int buf_idx) {
+    if (nrows % 8 != 0 || ncols % 32 != 0 || !data) return NULL;
+    size_t size = gguf_type_row_size(GGUF_TYPE_Q4_0, ncols) * nrows;
+    void *buf = malloc(size);
+    if (!buf) return NULL;
+    repack_q4_0_to_q4_0x8(data, buf, nrows, ncols);
+    m->repack_buffers[buf_idx] = buf;
+    m->repack_used[buf_idx] = 1;
+    fprintf(stderr, "Repacked Q4_0 tensor (%dx%d) to Q4_0x8 for AVX2 [%zu bytes]\n",
+            nrows, ncols, size);
+    return buf;
+}
+
+/* Repack Q4_0 weight tensors to Q4_0x8 interleaved format for AVX2.
+ * Allocates buffers only for eligible tensors (nrows%8==0, ncols%32==0). */
+static void repack_model_weights_q4_0x8(model_t *m) {
+    model_weights_t *w = &m->weights;
+    model_config_t *c = &m->config;
+
+    /* Token embedding: vocab_size x n_embd */
+    try_repack_q4_0(m, w->token_embd, c->vocab_size, c->n_embd, 0);
+
+    /* Output projection: n_embd x vocab_size (transpose: vocab_size x n_embd) */
+    if (w->output && w->type_output == GGUF_TYPE_Q4_0) {
+        try_repack_q4_0(m, w->output, c->vocab_size, c->n_embd, 1);
+    }
+
+    /* Per-layer weights */
+    for (int l = 0; l < c->n_layers; l++) {
+        layer_weights_t *lw = &w->layers[l];
+        int idx = 2 + l * 9; /* base index for this layer */
+        int kv_dim = c->n_kv_heads * c->head_dim;
+
+        if (lw->type_attn_q == GGUF_TYPE_Q4_0)
+            try_repack_q4_0(m, lw->attn_q, c->n_embd, c->n_embd, idx);
+        if (lw->type_attn_k == GGUF_TYPE_Q4_0)
+            try_repack_q4_0(m, lw->attn_k, kv_dim, c->n_embd, idx + 1);
+        if (lw->type_attn_v == GGUF_TYPE_Q4_0)
+            try_repack_q4_0(m, lw->attn_v, kv_dim, c->n_embd, idx + 2);
+        if (lw->type_attn_output == GGUF_TYPE_Q4_0)
+            try_repack_q4_0(m, lw->attn_output, c->n_embd, c->n_embd, idx + 3);
+        if (lw->type_ffn_gate == GGUF_TYPE_Q4_0)
+            try_repack_q4_0(m, lw->ffn_gate, c->n_ffn, c->n_embd, idx + 4);
+        if (lw->type_ffn_down == GGUF_TYPE_Q4_0)
+            try_repack_q4_0(m, lw->ffn_down, c->n_embd, c->n_ffn, idx + 5);
+        if (lw->type_ffn_up == GGUF_TYPE_Q4_0)
+            try_repack_q4_0(m, lw->ffn_up, c->n_ffn, c->n_embd, idx + 6);
+    }
 }
 
 /* ================================================================
@@ -608,23 +682,54 @@ float *model_forward(model_t *m, int token, int pos) {
     /* 1. Embedding lookup */
     {
         size_t row_bytes = gguf_type_row_size(w->type_token_embd, dim);
-        const void *embd_row = (const uint8_t *)w->token_embd + (size_t)token * row_bytes;
-        dequantize_row(embd_row, s->x, dim, w->type_token_embd);
+        if (w->type_token_embd == GGUF_TYPE_Q4_0_8_8) {
+            int nb = dim / 32;
+            size_t group_bytes = (size_t)nb * sizeof(block_q4_0x8);
+            int group = token / 8;
+            int r = token % 8;
+            const block_q4_0x8 *blocks = (const block_q4_0x8 *)((const uint8_t *)w->token_embd + (size_t)group * group_bytes);
+
+            for (int i = 0; i < nb; i++) {
+                float d = fp16_to_fp32(blocks[i].d[r]);
+                for (int j = 0; j < 8; j++) {
+                    uint8_t byte = blocks[i].qs[r * 8 + j];
+                    int v0 = (int8_t)(byte << 4);
+                    int v1 = (int8_t)(byte & 0xF0);
+                    s->x[i * 32 + j * 2]     = d * (float)(v0 >> 4);
+                    s->x[i * 32 + j * 2 + 1] = d * (float)(v1 >> 4);
+                }
+                for (int j = 0; j < 8; j++) {
+                    uint8_t byte = blocks[i].qs[64 + r * 8 + j];
+                    int v0 = (int8_t)(byte << 4);
+                    int v1 = (int8_t)(byte & 0xF0);
+                    s->x[i * 32 + 16 + j * 2]     = d * (float)(v0 >> 4);
+                    s->x[i * 32 + 16 + j * 2 + 1] = d * (float)(v1 >> 4);
+                }
+            }
+        } else {
+            const void *embd_row = (const uint8_t *)w->token_embd + (size_t)token * row_bytes;
+            dequantize_row(embd_row, s->x, dim, w->type_token_embd);
+        }
     }
 
     /* 2. Transformer layers */
     for (int l = 0; l < c->n_layers; l++) {
         layer_weights_t *lw = &w->layers[l];
+        int ri = 2 + l * 9; /* repack buffer index base for this layer */
 
         /* ---- Attention ---- */
         rmsnorm(s->xb, s->x, s->attn_norm_w[l], dim);
 
-        /* QKV projections */
+        /* Q projection */
+        tensor_set_repacked(m->repack_used[ri] ? m->repack_buffers[ri] : NULL);
         matmul(s->q, s->xb, lw->attn_q, dim, dim, lw->type_attn_q);
+        tensor_set_repacked(NULL);
 
-        /* K and V: project into float temp, then quantize and store */
+        /* K projection */
+        tensor_set_repacked(m->repack_used[ri+1] ? m->repack_buffers[ri+1] : NULL);
         float *k_tmp = s->xb2; /* reuse xb2 as temp for K (kv_dim <= dim) */
         matmul(k_tmp, s->xb, lw->attn_k, dim, kv_dim, lw->type_attn_k);
+        tensor_set_repacked(NULL);
 
         /* KV cache layout: [layer][pos][head] with per-head quantized rows */
         uint8_t *kcache_layer = s->key_cache + (size_t)l * seq_len * c->n_kv_heads * s->kv_row_size_k;
@@ -649,8 +754,10 @@ float *model_forward(model_t *m, int token, int pos) {
         }
 
         /* V projection -> store per head */
+        tensor_set_repacked(m->repack_used[ri+2] ? m->repack_buffers[ri+2] : NULL);
         float *v_tmp = s->xb2;
         matmul(v_tmp, s->xb, lw->attn_v, dim, kv_dim, lw->type_attn_v);
+        tensor_set_repacked(NULL);
         for (int hkv = 0; hkv < n_kv_heads; hkv++) {
             float *v_head = v_tmp + hkv * head_dim;
             uint8_t *val_pos = vcache_layer + (size_t)pos * c->n_kv_heads * s->kv_row_size_v
@@ -786,19 +893,28 @@ float *model_forward(model_t *m, int token, int pos) {
         }
 
         /* Output projection */
+        tensor_set_repacked(m->repack_used[ri+3] ? m->repack_buffers[ri+3] : NULL);
         matmul(s->xb2, s->xb, lw->attn_output, dim, dim, lw->type_attn_output);
+        tensor_set_repacked(NULL);
         vec_add(s->x, s->xb2, dim);
 
         /* ---- FFN (SwiGLU) ---- */
         rmsnorm(s->xb, s->x, s->ffn_norm_w[l], dim);
 
+        tensor_set_repacked(m->repack_used[ri+4] ? m->repack_buffers[ri+4] : NULL);
         matmul(s->hb,  s->xb, lw->ffn_gate, dim, n_ffn, lw->type_ffn_gate);
+        tensor_set_repacked(NULL);
+
+        tensor_set_repacked(m->repack_used[ri+6] ? m->repack_buffers[ri+6] : NULL);
         matmul(s->hb2, s->xb, lw->ffn_up,   dim, n_ffn, lw->type_ffn_up);
+        tensor_set_repacked(NULL);
 
         silu(s->hb, n_ffn);
         elemwise_mul(s->hb, s->hb, s->hb2, n_ffn);
 
+        tensor_set_repacked(m->repack_used[ri+5] ? m->repack_buffers[ri+5] : NULL);
         matmul(s->xb, s->hb, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
+        tensor_set_repacked(NULL);
         vec_add(s->x, s->xb, dim);
     }
 
@@ -806,12 +922,23 @@ float *model_forward(model_t *m, int token, int pos) {
     rmsnorm(s->x, s->x, s->output_norm_w, dim);
 
     /* 4. Output projection -> logits */
+    tensor_set_repacked(m->repack_used[1] ? m->repack_buffers[1] : NULL);
     matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
+    tensor_set_repacked(NULL);
 
     return s->logits;
 }
 
 void model_free(model_t *m) {
+    /* Free repacked weight buffers */
+    for (int i = 0; i < MAX_LAYERS + 4; i++) {
+        if (m->repack_buffers[i]) {
+            free(m->repack_buffers[i]);
+            m->repack_buffers[i] = NULL;
+            m->repack_used[i] = 0;
+        }
+    }
+
     if (m->state.mem_block) {
         free(m->state.mem_block);
         m->state.mem_block = NULL;
