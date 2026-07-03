@@ -9,6 +9,10 @@
  * Must be called once at init with a buffer of at least max_row_size floats. */
 void tensor_init_scratch(float *buf, int size);
 
+/* Set repacked Q4_0->Q4_0x8 weight pointer for this matmul (AVX2 optimization).
+ * Pass NULL to disable repacked path. Must be called before matmul. */
+void tensor_set_repacked(const void *ptr);
+
 /* Set number of threads for matmul (default: 1) */
 void tensor_set_threads(int t);
 int  tensor_get_threads(void);

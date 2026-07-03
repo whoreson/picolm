@@ -151,7 +151,9 @@ typedef enum {
     GGUF_TYPE_Q3_K  = 11,
     GGUF_TYPE_Q4_K  = 12,
     GGUF_TYPE_Q5_K  = 13,
-    GGUF_TYPE_Q6_K  = 14,
+    GGUF_TYPE_Q6_K       = 14,
+    GGUF_TYPE_Q4_0_4_4   = 31,  /* 4-row interleaved Q4_0 (pre-repacked) */
+    GGUF_TYPE_Q4_0_8_8   = 33,  /* 8-row interleaved Q4_0 (pre-repacked, AVX2) */
 } gguf_type_t;
 
 /* Q4_K block: 256 weights in 144 bytes */
@@ -171,6 +173,46 @@ typedef struct {
     int8_t  qs[256];
     int16_t bsums[16];
 } block_q8_K;            /* 4 + 256 + 32 = 292 bytes */
+
+/* Q4_0_4_4 interleaved block: 4 rows of Q4_0 packed together for SIMD efficiency.
+ * Layout: 4 FP16 deltas, then interleaved nibble-bytes from 4 standard Q4_0 blocks.
+ * Nibbles are XOR'd with 0x88 (per byte) during repacking to convert from bias form
+ * [0..15] to sign form [-8..7], eliminating the subtract-8 during dequantization.
+ *
+ * Interleaving pattern (blocklen=4):
+ *   qs[0..3]   = row0 qs[0..3]   ^ 0x88
+ *   qs[4..7]   = row1 qs[0..3]   ^ 0x88
+ *   qs[8..11]  = row2 qs[0..3]   ^ 0x88
+ *   qs[12..15] = row3 qs[0..3]   ^ 0x88
+ *   qs[16..19] = row0 qs[4..7]   ^ 0x88
+ *   ... (continues for all 16 nibble-bytes per row)
+ *
+ * Total: 4*2 + 4*16 = 72 bytes (same as 4 standard Q4_0 blocks)
+ * Each block covers 4 rows x 32 values = 128 values. */
+#pragma pack(push, 1)
+typedef struct {
+    uint16_t d[4];      /* 4 FP16 deltas, one per row */
+    uint8_t  qs[64];    /* interleaved nibble-bytes (4 rows x 16 bytes, XOR'd with 0x88) */
+} block_q4_0x4;         /* 72 bytes */
+
+/* Q4_0_8x8 interleaved block: 8 rows of Q4_0 packed together for AVX2 SIMD.
+ * Layout: 8 FP16 deltas, then interleaved nibble-bytes from 8 standard Q4_0 blocks.
+ * Nibbles are XOR'd with 0x88 (per byte) during repacking to convert from bias form
+ * [0..15] to sign form [-8..7], eliminating the subtract-8 during dequantization.
+ *
+ * Interleaving (blocklen=8): for each chunk k=0..3:
+ *   qs[k*128 + 0..7]    = row0 qs[k*8..k*8+7] ^ 0x88
+ *   qs[k*128 + 8..15]   = row1 qs[k*8..k*8+7] ^ 0x88
+ *   ...
+ *   qs[k*128 + 56..63]  = row7 qs[k*8..k*8+7] ^ 0x88
+ *
+ * Total: 8*2 + 8*16 = 144 bytes (same as 8 standard Q4_0 blocks)
+ * Each block covers 8 rows x 32 values = 256 values.
+ * Used by AVX2 kernel that processes 8 output rows simultaneously. */
+typedef struct {
+    uint16_t d[8];      /* 8 FP16 deltas, one per row */
+    uint8_t  qs[128];   /* interleaved nibble-bytes (8 rows x 16 bytes, XOR'd with 0x88) */
+} block_q4_0x8;         /* 144 bytes */
 
 /* Q3_K block: 256 weights in 110 bytes */
 #pragma pack(push, 1)
@@ -257,6 +299,15 @@ float vec_dot_q8_0_q8_0_deltas(const void *qx, const float *qx_d, const void *qw
 float vec_dot_q4_0_q8_0(const void *src_q4, const void *src_q8, int n);
 /* Q4_K * Q8_K dot product: Q4_K weights with pre-quantized Q8_K input */
 float vec_dot_q4_K_q8_K(const void *src_q4, const void *src_q8, int n);
+/* Q4_0_4_4 interleaved weights x Q8_0 input: processes nrows (multiple of 4) simultaneously */
+void vec_dot_q4_0x4_q8_0(const void *vx, const void *wy, int n, float *out, int nrows);
+/* Q4_0_8x8 interleaved weights x Q8_0 input (AVX2): processes nrows (multiple of 8) simultaneously */
+void vec_dot_q4_0x8_q8_0_avx2(const void *vx, const void *wy, int n, float *out, int nrows);
+/* Repack standard Q4_0 weights to Q4_0_8x8 interleaved format (for AVX2).
+ * dst must have the same size as src (1:1 byte mapping, just reordered). */
+void repack_q4_0_to_q4_0x8(const void *src, void *dst, int nrows, int ncols);
+/* Repack standard Q4_0 weights to Q4_0_4x4 interleaved format (for NEON dotprod). */
+void repack_q4_0_to_q4_0x4(const void *src, void *dst, int nrows, int ncols);
 
 /* Quantize a float32 vector to Q8_0 blocks in-place or to a separate buffer.
  * dst must have space for (n / 32) * sizeof(block_q8_0) bytes. */

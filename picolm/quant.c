@@ -322,6 +322,52 @@ void dequantize_row_q4_0(const void *src, float *dst, int n) {
     }
 }
 
+/* Dequantize a single row from Q4_0_4_4 interleaved format to float32.
+ * Only the first row of each 4-row group is dequantized. */
+void dequantize_row_q4_0_4_4(const void *src, float *dst, int n) {
+    const block_q4_0x4 *blocks = (const block_q4_0x4 *)src;
+    int nb = n / 32;
+
+    for (int i = 0; i < nb; i++) {
+        float d = fp16_to_fp32(blocks[i].d[0]);
+        for (int k = 0; k < 4; k++) {
+            for (int j = 0; j < 4; j++) {
+                uint8_t byte = blocks[i].qs[k * 16 + j * 4];
+                int v0 = (int8_t)(byte << 4) >> 4;
+                int v1 = (int8_t)(byte & 0xF0) >> 4;
+                dst[i * 32 + k * 8 + j * 2] = d * (float)v0;
+                dst[i * 32 + k * 8 + j * 2 + 1] = d * (float)v1;
+            }
+        }
+    }
+}
+
+/* Dequantize a single row from Q4_0_8_8 interleaved format to float32.
+ *
+ * The GGUF stores 8 consecutive rows interleaved as block_q4_0x8 structures.
+ * src MUST point to the start of an 8-row group (i.e., aligned to nb*144 bytes).
+ * This function dequantifies row 0 of the group.
+ *
+ * For arbitrary row extraction, use the inline code in model.c's embedding lookup. */
+void dequantize_row_q4_0_8_8(const void *src, float *dst, int n) {
+    const block_q4_0x8 *blocks = (const block_q4_0x8 *)src;
+    int nb = n / 32;
+    int row_in_group = 0;
+
+    for (int i = 0; i < nb; i++) {
+        float d = fp16_to_fp32(blocks[i].d[row_in_group]);
+        for (int k = 0; k < 4; k++) {
+            for (int j = 0; j < 8; j++) {
+                uint8_t byte = blocks[i].qs[k * 128 + row_in_group * 8 + j];
+                int v0 = (int8_t)(byte << 4);
+                int v1 = (int8_t)(byte & 0xF0);
+                dst[i * 32 + k * 8 + j * 2]     = d * (float)(v0 >> 4);
+                dst[i * 32 + k * 8 + j * 2 + 1] = d * (float)(v1 >> 4);
+            }
+        }
+    }
+}
+
 void dequantize_row_f16(const void *src, float *dst, int n) {
     const uint16_t *fp16 = (const uint16_t *)src;
     for (int i = 0; i < n; i++) {
@@ -343,6 +389,8 @@ void dequantize_row(const void *src, float *dst, int n, gguf_type_t type) {
         case GGUF_TYPE_Q3_K:  dequantize_row_q3_K(src, dst, n); break;
         case GGUF_TYPE_Q4_K:  dequantize_row_q4_K(src, dst, n); break;
         case GGUF_TYPE_Q6_K:  dequantize_row_q6_K(src, dst, n); break;
+        case GGUF_TYPE_Q4_0_4_4: dequantize_row_q4_0_4_4(src, dst, n); break;
+        case GGUF_TYPE_Q4_0_8_8: dequantize_row_q4_0_8_8(src, dst, n); break;
         default:
             fprintf(stderr, "dequantize_row: unsupported type %d\n", type);
             exit(1);
@@ -366,6 +414,8 @@ int gguf_type_block_size(gguf_type_t type) {
         case GGUF_TYPE_Q4_K:  return 256;
         case GGUF_TYPE_Q5_K:  return 256;
         case GGUF_TYPE_Q6_K:  return 256;
+        case GGUF_TYPE_Q4_0_4_4: return 32;  /* each block covers 32 values per row */
+        case GGUF_TYPE_Q4_0_8_8: return 32;  /* each block covers 32 values per row */
         default: return 0;
     }
 }
@@ -385,6 +435,8 @@ int gguf_type_quant_size(gguf_type_t type) {
         case GGUF_TYPE_Q4_K:  return 144;
         case GGUF_TYPE_Q5_K:  return 176;
         case GGUF_TYPE_Q6_K:  return 210;
+        case GGUF_TYPE_Q4_0_4_4: return (int)sizeof(block_q4_0);  /* 18: GGUF stores same layout as Q4_0 */
+        case GGUF_TYPE_Q4_0_8_8: return (int)sizeof(block_q4_0);  /* 18: GGUF stores same layout as Q4_0 */
         default: return 0;
     }
 }
@@ -1706,6 +1758,53 @@ float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n) {
 }
 
 /* ================================================================
+ * vec_dot_q4_0x4_q8_0: Q4_0_4_4 interleaved weights x Q8_0 input
+ *
+ * Processes 4 rows simultaneously from the interleaved Q4_0_4_4 layout.
+ * Adapted from llama.cpp ggml_gemv_q4_0_4x4_q8_0_generic.
+ *
+ * Layout: block_q4_0x4 with d[4] (FP16) + qs[64] (interleaved nibbles)
+ * Interleaving (blocklen=4): for each k=0..3:
+ *   qs[k*16 + 0..3]   = row0 nibble-bytes at offset k*4..k*4+3
+ *   qs[k*16 + 4..7]   = row1 nibble-bytes at offset k*4..k*4+3
+ *   qs[k*16 + 8..11]  = row2 nibble-bytes at offset k*4..k*4+3
+ *   qs[k*16 + 12..15] = row3 nibble-bytes at offset k*4..k*4+3
+ *
+ * Nibbles are XOR'd with 0x88 during repacking. Extraction uses:
+ *   v0 = (int8_t)(byte << 4) >> 4  -- sign-extends low nibble
+ *   v1 = (int8_t)(byte & 0xF0) >> 4  -- extracts signed high nibble
+ *
+ * Q8_0 input (y): k*4+0..3 -> first half, k*4+0..3 + 16 -> second half.
+ * ================================================================ */
+void vec_dot_q4_0x4_q8_0(const void *vx, const void *wy, int n, float *out, int nrows) {
+    const block_q4_0x4 *xb = (const block_q4_0x4 *)vx;
+    const block_q8_0 *y = (const block_q8_0 *)wy;
+    int nb = n / 32;  /* blocks per row */
+
+/* Scalar: process each row individually from interleaved data.
+     * Adapted from llama.cpp ggml_gemv_q4_0_4x4_q8_0_generic. */
+    for (int row = 0; row < nrows; row++) {
+        float sumf = 0.0f;
+        for (int ib = 0; ib < nb; ib++) {
+            const block_q4_0x4 *b = xb + ib;
+            float dd = fp16_to_fp32(b->d[row]) * fp16_to_fp32(y[ib].d);
+            int sumi = 0;
+            for (int k = 0; k < 4; k++) {
+                for (int i = 0; i < 4; i++) {
+                    uint8_t byte = b->qs[k * 16 + row * 4 + i];
+                    int v0 = (int8_t)(byte << 4);
+                    int v1 = (int8_t)(byte & 0xF0);
+                    sumi += ((v0 * y[ib].qs[k * 4 + i]) +
+                             (v1 * y[ib].qs[k * 4 + i + 16])) >> 4;
+                }
+            }
+            sumf += (float)sumi * dd;
+        }
+        out[row] = sumf;
+    }
+}
+
+/* ================================================================
  * vec_dot_q8_0_q8_0_deltas: int8 MAC with pre-converted x deltas
  *
  * Same as vec_dot_q8_0_q8_0 but takes pre-converted float32 deltas
@@ -1957,6 +2056,54 @@ float vec_dot_q4_0_f32(const void *src, const float *x, int n) {
     return sumf;
 }
 
+/* vec_dot for Q4_0_4_4: dequantize first row of interleaved block, then dot */
+float vec_dot_q4_0_4_4_f32(const void *src, const float *x, int n) {
+    const block_q4_0x4 *blocks = (const block_q4_0x4 *)src;
+    int nb = n / 32;
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        float d = fp16_to_fp32(blocks[i].d[0]);
+        const float *xp = x + i * 32;
+        float block_sum = 0.0f;
+        for (int k = 0; k < 4; k++) {
+            for (int j = 0; j < 4; j++) {
+                uint8_t byte = blocks[i].qs[k * 16 + j * 4];
+                int v0 = (int8_t)(byte << 4) >> 4;
+                int v1 = (int8_t)(byte & 0xF0) >> 4;
+                block_sum += (float)v0 * xp[k * 8 + j * 2];
+                block_sum += (float)v1 * xp[k * 8 + j * 2 + 1];
+            }
+        }
+        sumf += d * block_sum;
+    }
+    return sumf;
+}
+
+/* vec_dot for Q4_0_8_8: dequantize row 0 of interleaved block, then dot product */
+float vec_dot_q4_0_8_8_f32(const void *src, const float *x, int n) {
+    const block_q4_0x8 *blocks = (const block_q4_0x8 *)src;
+    int nb = n / 32;
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        float d = fp16_to_fp32(blocks[i].d[0]);
+        const float *xp = x + i * 32;
+        float block_sum = 0.0f;
+        for (int k = 0; k < 4; k++) {
+            for (int j = 0; j < 8; j++) {
+                uint8_t byte = blocks[i].qs[k * 128 + j * 8];
+                int v0 = (int8_t)(byte << 4) >> 4;
+                int v1 = (int8_t)(byte & 0xF0) >> 4;
+                block_sum += (float)v0 * xp[k * 8 + j];
+                block_sum += (float)v1 * xp[k * 8 + j + 4];
+            }
+        }
+        sumf += d * block_sum;
+    }
+    return sumf;
+}
+
 /* ---- Generic dispatch ---- */
 
 float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
@@ -1966,6 +2113,8 @@ float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
         case GGUF_TYPE_F32:  return vec_dot_f32_f32(src, x, n);
         case GGUF_TYPE_Q8_0: return vec_dot_q8_0_f32(src, x, n);
         case GGUF_TYPE_Q4_0: return vec_dot_q4_0_f32(src, x, n);
+        case GGUF_TYPE_Q4_0_4_4: return vec_dot_q4_0_4_4_f32(src, x, n);
+        case GGUF_TYPE_Q4_0_8_8: return vec_dot_q4_0_8_8_f32(src, x, n);
         case GGUF_TYPE_F16:  return vec_dot_f16_f32(src, x, n);
         default: {
             /* Fallback: dequantize to temp buffer, then dot */
@@ -1977,6 +2126,257 @@ float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
             return sum;
         }
     }
+}
+
+/* ---- repack_q4_0_to_q4_0x8: Standard Q4_0 -> Q4_0_8x8 interleaved (for AVX2) ----
+ * Reorders 8 rows of standard Q4_0 into block_q4_0x8 format.
+ * The interleaving groups nibble-bytes from 8 consecutive rows together,
+ * and XORs with 0x88 to convert from bias form [0..15] to sign form [-8..7].
+ *
+ * Layout: for each chunk k=0..3 (8 bytes per chunk per row):
+ *   qs[k*128 + row*8 + 0..7] = row's qs[k*8..k*8+7] ^ 0x88...
+ *
+ * Precondition: nrows % 8 == 0, ncols % 32 == 0, src and dst have same total bytes.
+ * ================================================================ */
+void repack_q4_0_to_q4_0x8(const void *src, void *dst, int nrows, int ncols) {
+    const block_q4_0 *s = (const block_q4_0 *)src;
+    block_q4_0x8 *d = (block_q4_0x8 *)dst;
+    int nb = ncols / 32;  /* blocks per row */
+
+    for (int row8 = 0; row8 < nrows; row8 += 8) {
+        for (int b = 0; b < nb; b++) {
+            /* Copy 8 deltas */
+            for (int r = 0; r < 8; r++) {
+                d->d[r] = s[b + (row8 + r) * nb].d;
+            }
+            /* Interleave nibble bytes with XOR 0x88 */
+            for (int k = 0; k < 4; k++) {  /* 4 chunks of 8 bytes */
+                for (int r = 0; r < 8; r++) {  /* 8 rows */
+                    const uint8_t *src_qs = ((const block_q4_0 *)(s + b + (row8 + r) * nb))->qs;
+                    for (int j = 0; j < 8; j++) {
+                        d->qs[k * 128 + r * 8 + j] = src_qs[k * 8 + j] ^ 0x88;
+                    }
+                }
+            }
+            d++;
+        }
+    }
+}
+
+/* ---- repack_q4_0_to_q4_0x4: Standard Q4_0 -> Q4_0_4x4 interleaved ----
+ * Same as 8x8 but with 4 rows and blocklen=4.
+ * ================================================================ */
+void repack_q4_0_to_q4_0x4(const void *src, void *dst, int nrows, int ncols) {
+    const block_q4_0 *s = (const block_q4_0 *)src;
+    block_q4_0x4 *d = (block_q4_0x4 *)dst;
+    int nb = ncols / 32;
+
+    for (int row4 = 0; row4 < nrows; row4 += 4) {
+        for (int b = 0; b < nb; b++) {
+            for (int r = 0; r < 4; r++) {
+                d->d[r] = s[b + (row4 + r) * nb].d;
+            }
+            for (int k = 0; k < 4; k++) {
+                for (int r = 0; r < 4; r++) {
+                    const uint8_t *src_qs = ((const block_q4_0 *)(s + b + (row4 + r) * nb))->qs;
+                    for (int j = 0; j < 4; j++) {
+                        d->qs[k * 16 + r * 4 + j] = src_qs[k * 4 + j] ^ 0x88;
+                    }
+                }
+            }
+            d++;
+        }
+    }
+}
+
+/* ---- vec_dot_q4_0x8_q8_0_avx2: Q4_0_8x8 interleaved x Q8_0 (AVX2) ----
+ * Processes 8 output rows simultaneously using 256-bit AVX2 registers.
+ * Adapted from llama.cpp's gemv_q4_b32_8x8_q8_0_lut_avx.
+ *
+ * Uses a lookup table to convert 4-bit nibbles to signed 8-bit values via
+ * _mm256_shuffle_epi8 (PSHUFB), avoiding manual bit manipulation.
+ *
+ * Precondition: nrows % 8 == 0. Remaining rows handled by scalar fallback.
+ * ================================================================ */
+void vec_dot_q4_0x8_q8_0_avx2(const void *vx, const void *wy, int n, float *out, int nrows) {
+#if 0
+    const block_q4_0x8 *b_ptr_start = (const block_q4_0x8 *)vx;
+    const block_q8_0 *a_ptr = (const block_q8_0 *)wy;
+    int nb = n / 32;
+
+    /* Lookup table: maps 4-bit nibble to signed byte [-8..7] */
+    __m256i signextendlut = _mm256_castsi128_si256(
+        _mm_set_epi8(-1, -2, -3, -4, -5, -6, -7, -8, 7, 6, 5, 4, 3, 2, 1, 0));
+    signextendlut = _mm256_permute2f128_si256(signextendlut, signextendlut, 0);
+
+    /* Final permute to reorder output lanes to correct row order */
+    __m256i finalpermutemask = _mm256_set_epi32(7, 5, 3, 1, 6, 4, 2, 0);
+    const __m256i m4b = _mm256_set1_epi8(0x0F);
+
+    /* Rearrange mask for loading 8 FP16 deltas in the correct order */
+    const __m128i changemask = _mm_set_epi8(15, 14, 7, 6, 13, 12, 5, 4,
+                                             11, 10, 3, 2, 9, 8, 1, 0);
+
+    /* Process groups of 8 output rows */
+    for (int y = 0; y < nrows / 8; y++) {
+        const block_q4_0x8 *b_ptr = b_ptr_start + y * nb;
+
+        /* Accumulate all 8 rows simultaneously into one __m256 */
+        __m256 acc = _mm256_setzero_ps();
+
+        for (int b = 0; b < nb; b++) {
+            /* Load 4x256-bit chunks of interleaved qs (8 rows x 32 nibbles) */
+            const __m256i rhs0_0 = _mm256_loadu_si256((const __m256i *)b_ptr[b].qs);
+            const __m256i rhs1_0 = _mm256_loadu_si256((const __m256i *)(b_ptr[b].qs + 32));
+            const __m256i rhs0_1 = _mm256_loadu_si256((const __m256i *)(b_ptr[b].qs + 64));
+            const __m256i rhs1_1 = _mm256_loadu_si256((const __m256i *)(b_ptr[b].qs + 96));
+
+            /* Low nibbles via LUT (4-bit -> signed 8-bit) */
+            const __m256i r00 = _mm256_shuffle_epi8(signextendlut, _mm256_and_si256(rhs0_0, m4b));
+            const __m256i r10 = _mm256_shuffle_epi8(signextendlut, _mm256_and_si256(rhs1_0, m4b));
+            const __m256i r01 = _mm256_shuffle_epi8(signextendlut, _mm256_and_si256(rhs0_1, m4b));
+            const __m256i r11 = _mm256_shuffle_epi8(signextendlut, _mm256_and_si256(rhs1_1, m4b));
+
+            /* High nibbles via right-shift + LUT */
+            const __m256i r02 = _mm256_shuffle_epi8(signextendlut,
+                _mm256_and_si256(_mm256_srli_epi16(rhs0_0, 4), m4b));
+            const __m256i r12 = _mm256_shuffle_epi8(signextendlut,
+                _mm256_and_si256(_mm256_srli_epi16(rhs1_0, 4), m4b));
+            const __m256i r03 = _mm256_shuffle_epi8(signextendlut,
+                _mm256_and_si256(_mm256_srli_epi16(rhs0_1, 4), m4b));
+            const __m256i r13 = _mm256_shuffle_epi8(signextendlut,
+                _mm256_and_si256(_mm256_srli_epi16(rhs1_1, 4), m4b));
+
+            /* Load 8 column scales (FP16 -> FP32), rearranged for AVX2 lanes */
+            __m256 col_scales = _mm256_cvtph_ps(
+                _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)b_ptr[b].d), changemask));
+
+            /* Load Q8_0 input: duplicate to fill 256-bit (a0=a[0..15], a1=a[16..31]) */
+            __m256i a0 = _mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)a_ptr[b].qs));
+            __m256i a1 = _mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)(a_ptr[b].qs + 16)));
+            a0 = _mm256_permute2f128_si256(a0, a0, 0);
+            a1 = _mm256_permute2f128_si256(a1, a1, 0);
+
+            /* Row scale (Q8_0 delta) */
+            __m256 row_scale = _mm256_set1_ps(fp16_to_fp32(a_ptr[b].d));
+
+            /* Combine column and row scales */
+            __m256 sd = _mm256_mul_ps(col_scales, row_scale);
+
+            /* Int32 accumulator for 8 rows */
+            __m256i iacc = _mm256_setzero_si256();
+
+            /* Low nibbles: interleave 8 rows' nibbles with a0[0..7] and a0[8..15] */
+            {
+                __m256i bl = _mm256_blend_epi32(r00, _mm256_shuffle_epi32(r10, 177), 170);
+                __m256i bh = _mm256_blend_epi32(_mm256_shuffle_epi32(r00, 177), r10, 170);
+                __m256i al = _mm256_shuffle_epi32(a0, 0);
+                __m256i ah = _mm256_shuffle_epi32(a0, 85);
+                iacc = _mm256_add_epi32(iacc, _mm256_add_epi32(
+                    _mm256_maddubs_epi16(bl, al), _mm256_maddubs_epi16(bh, ah)));
+
+                bl = _mm256_blend_epi32(r01, _mm256_shuffle_epi32(r11, 177), 170);
+                bh = _mm256_blend_epi32(_mm256_shuffle_epi32(r01, 177), r11, 170);
+                al = _mm256_shuffle_epi32(a0, 170);
+                ah = _mm256_shuffle_epi32(a0, 255);
+                iacc = _mm256_add_epi32(iacc, _mm256_add_epi32(
+                    _mm256_maddubs_epi16(bl, al), _mm256_maddubs_epi16(bh, ah)));
+            }
+            /* High nibbles: interleave 8 rows' nibbles with a1[0..7] and a1[8..15] */
+            {
+                __m256i bl = _mm256_blend_epi32(r02, _mm256_shuffle_epi32(r12, 177), 170);
+                __m256i bh = _mm256_blend_epi32(_mm256_shuffle_epi32(r02, 177), r12, 170);
+                __m256i al = _mm256_shuffle_epi32(a1, 0);
+                __m256i ah = _mm256_shuffle_epi32(a1, 85);
+                iacc = _mm256_add_epi32(iacc, _mm256_add_epi32(
+                    _mm256_maddubs_epi16(bl, al), _mm256_maddubs_epi16(bh, ah)));
+
+                bl = _mm256_blend_epi32(r03, _mm256_shuffle_epi32(r13, 177), 170);
+                bh = _mm256_blend_epi32(_mm256_shuffle_epi32(r03, 177), r13, 170);
+                al = _mm256_shuffle_epi32(a1, 170);
+                ah = _mm256_shuffle_epi32(a1, 255);
+                iacc = _mm256_add_epi32(iacc, _mm256_add_epi32(
+                    _mm256_maddubs_epi16(bl, al), _mm256_maddubs_epi16(bh, ah)));
+            }
+
+            /* Reduce: split int16 pairs -> int32, shift right by 16 for >>4 (4 extra for sign) */
+            __m256i ihi = _mm256_srli_epi32(iacc, 16);
+            __m256i ilo = _mm256_and_si256(iacc, _mm256_set1_epi32(0xFFFF));
+            __m256i s = _mm256_add_epi32(_mm256_srai_epi32(ihi, 16), _mm256_srai_epi32(ilo, 16));
+
+            /* Scale and accumulate */
+            acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s), sd, acc);
+        }
+
+        /* Permute to correct order and store */
+        __m256 result = _mm256_permutevar8x32_ps(acc, finalpermutemask);
+        _mm256_storeu_ps(out + y * 8, result);
+    }
+
+    /* Scalar fallback for remaining rows (nrows % 8 != 0) */
+    {
+        int aligned = (nrows / 8) * 8;
+        for (int row = aligned; row < nrows; row++) {
+            int group = row / 8;
+            int r = row % 8;
+            float sumf = 0.0f;
+            for (int b = 0; b < nb; b++) {
+                const block_q4_0x8 *bp = &((const block_q4_0x8 *)vx)[b + group * nb];
+                float dd = fp16_to_fp32(bp->d[r]) * fp16_to_fp32(a_ptr[b].d);
+                int sumi = 0;
+                /* Row r's data: qs[r*8..r*8+7] (first 8 bytes = 16 nibbles) and
+                 * qs[64+r*8..64+r*8+7] (next 8 bytes = 16 nibbles)
+                 * Q8_0 input: a_ptr[b].qs[0..15] for first 16 values,
+                 *             a_ptr[b].qs[16..31] for second 16 values */
+                for (int i = 0; i < 8; i++) {
+                    uint8_t byte = bp->qs[r * 8 + i];
+                    int v0 = (int8_t)(byte << 4);
+                    int v1 = (int8_t)(byte & 0xF0);
+                    sumi += ((v0 * a_ptr[b].qs[i]) + (v1 * a_ptr[b].qs[i + 8])) >> 4;
+                }
+                for (int i = 0; i < 8; i++) {
+                    uint8_t byte = bp->qs[64 + r * 8 + i];
+                    int v0 = (int8_t)(byte << 4);
+                    int v1 = (int8_t)(byte & 0xF0);
+                    sumi += ((v0 * a_ptr[b].qs[16 + i]) + (v1 * a_ptr[b].qs[16 + i + 8])) >> 4;
+                }
+                sumf += (float)sumi * dd;
+            }
+            out[row] = sumf;
+        }
+    }
+#else
+    /* Non-AVX2: scalar fallback processing all rows from Q4_0x8 data */
+    {
+        const block_q4_0x8 *b_ptr = (const block_q4_0x8 *)vx;
+        const block_q8_0 *a_ptr = (const block_q8_0 *)wy;
+        int nb = n / 32;
+        for (int row = 0; row < nrows; row++) {
+            int group = row / 8;
+            int r = row % 8;
+            float sumf = 0.0f;
+            for (int b = 0; b < nb; b++) {
+                float dd = fp16_to_fp32(b_ptr[group * nb + b].d[r]) *
+                            fp16_to_fp32(a_ptr[b].d);
+                int sumi = 0;
+                for (int i = 0; i < 8; i++) {
+                    uint8_t byte = b_ptr[group * nb + b].qs[r * 8 + i];
+                    int v0 = (int8_t)(byte << 4);
+                    int v1 = (int8_t)(byte & 0xF0);
+                    sumi += ((v0 * a_ptr[b].qs[i]) + (v1 * a_ptr[b].qs[i + 8])) >> 4;
+                }
+                for (int i = 0; i < 8; i++) {
+                    uint8_t byte = b_ptr[group * nb + b].qs[64 + r * 8 + i];
+                    int v0 = (int8_t)(byte << 4);
+                    int v1 = (int8_t)(byte & 0xF0);
+                    sumi += ((v0 * a_ptr[b].qs[16 + i]) + (v1 * a_ptr[b].qs[16 + i + 8])) >> 4;
+                }
+                sumf += (float)sumi * dd;
+            }
+            out[row] = sumf;
+        }
+    }
+#endif
 }
 
 /* ---- quantize_row_q4_0: FP32 -> Q4_0 blocks ---- */

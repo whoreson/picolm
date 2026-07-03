@@ -170,6 +170,16 @@ int main(int argc, char **argv) {
     tensor_set_threads(num_threads);
     tensor_threadpool_init(num_threads);
 
+    /* Debug: print weight types */
+    fprintf(stderr, "Weight type: %d, Emb type: %d, Output type: %d\n",
+        model.config.weight_type, model.weights.type_token_embd, model.weights.type_output);
+    if (model.config.n_layers > 0) {
+        layer_weights_t *lw0 = &model.weights.layers[0];
+        fprintf(stderr, "Layer0: attn_q=%d k=%d v=%d gate=%d up=%d down=%d\n",
+            lw0->type_attn_q, lw0->type_attn_k, lw0->type_attn_v,
+            lw0->type_ffn_gate, lw0->type_ffn_up, lw0->type_ffn_down);
+    }
+
     /* Load tokenizer */
     tokenizer_t tokenizer;
     if (tokenizer_load(&tokenizer, &model) != 0) {
@@ -199,6 +209,9 @@ int main(int argc, char **argv) {
     int max_prompt_tokens = (int)strlen(prompt) + 3;
     int *prompt_tokens = (int *)malloc((size_t)max_prompt_tokens * sizeof(int));
     int n_prompt = tokenizer_encode(&tokenizer, prompt, prompt_tokens, max_prompt_tokens, 1);
+    fprintf(stderr, "Prompt tokens (%d):", n_prompt);
+    for (int i = 0; i < n_prompt; i++) fprintf(stderr, " %d", prompt_tokens[i]);
+    fprintf(stderr, "\n");
 
     /* If cache covers part of the prompt, skip those positions */
     int start_pos = 0;
