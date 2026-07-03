@@ -30,7 +30,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
 void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t qtype);
 
 /* RMS normalization: out[i] = x[i] / sqrt(mean(x^2) + eps) * weight[i] */
-void rmsnorm(float *out, const float *x, const float *weight, int size);
+void rmsnorm(float *out, const float *x, const float *weight, int size, float eps);
 
 /* In-place softmax over x[0..size-1] */
 void softmax(float *x, int size);
@@ -41,7 +41,7 @@ void softmax(float *x, int size);
  *   sin_pos[i] = sin(pos / freq_base^(2i/head_dim))
  * Each has head_dim/2 entries. */
 void rope(float *q, float *k, int head_dim, int n_heads, int n_kv_heads,
-          const float *cos_pos, const float *sin_pos);
+          const float *cos_pos, const float *sin_pos, int rope_type);
 
 /* In-place SiLU: x[i] = x[i] / (1 + exp(-x[i])) */
 void silu(float *x, int size);

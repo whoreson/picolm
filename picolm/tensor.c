@@ -11,6 +11,17 @@
 #include <pthread.h>
 #endif
 
+/* Thread pool (Windows-native or POSIX) */
+#ifdef _WIN32
+typedef HANDLE  win_thread_t;
+typedef CRITICAL_SECTION win_mutex_t;
+typedef HANDLE  win_cond_t;
+#else
+typedef pthread_t  win_thread_t;
+typedef pthread_mutex_t win_mutex_t;
+typedef pthread_cond_t  win_cond_t;
+#endif
+
 /* ---- Scratch buffer (kept for dequantize_row in model.c) ---- */
 
 static float *scratch_buf = NULL;
@@ -79,14 +90,37 @@ typedef struct {
  *   - Reset pool_done = 0
  */
 
-static pthread_t       pool_threads[MAX_THREADS];
-static pthread_mutex_t pool_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  pool_cond  = PTHREAD_COND_INITIALIZER;
+static win_thread_t    pool_threads[MAX_THREADS];
+static win_mutex_t     pool_mutex;
+static win_cond_t      pool_cond;
 static volatile int    pool_gen   = 0;
 static volatile int    pool_done  = 0;
 static volatile int    pool_shutdown = 0;
 static volatile int    pool_nworkers = 0;
 static matmul_task_t   pool_tasks[MAX_THREADS];
+
+/* Cross-platform mutex/cond helpers */
+#ifdef _WIN32
+static void win_mutex_init(win_mutex_t *m) { InitializeCriticalSection(m); }
+static void win_mutex_lock(win_mutex_t *m) { EnterCriticalSection(m); }
+static void win_mutex_unlock(win_mutex_t *m) { LeaveCriticalSection(m); }
+static void win_cond_init(win_cond_t *c) { *c = CreateEvent(NULL, TRUE, FALSE, NULL); }
+static void win_cond_wait(win_cond_t *c, win_mutex_t *m) { LeaveCriticalSection(m); WaitForSingleObject(*c, INFINITE); EnterCriticalSection(m); ResetEvent(*c); }
+static void win_cond_broadcast(win_cond_t *c) { SetEvent(*c); }
+static void win_cond_destroy(win_cond_t *c) { CloseHandle(*c); }
+static void win_thread_create(win_thread_t *t, DWORD (WINAPI *fn)(void*), void *arg) { *t = CreateThread(NULL, 0, fn, arg, 0, NULL); }
+static void win_thread_join(win_thread_t *t) { WaitForSingleObject(*t, INFINITE); CloseHandle(*t); }
+#else
+static void win_mutex_init(win_mutex_t *m) { pthread_mutex_init(m, NULL); }
+static void win_mutex_lock(win_mutex_t *m) { pthread_mutex_lock(m); }
+static void win_mutex_unlock(win_mutex_t *m) { pthread_mutex_unlock(m); }
+static void win_cond_init(win_cond_t *c) { pthread_cond_init(c, NULL); }
+static void win_cond_wait(win_cond_t *c, win_mutex_t *m) { pthread_cond_wait(c, m); }
+static void win_cond_broadcast(win_cond_t *c) { pthread_cond_broadcast(c); }
+static void win_cond_destroy(win_cond_t *c) { pthread_cond_destroy(c); }
+static void win_thread_create(win_thread_t *t, void *(*fn)(void*), void *arg) { pthread_create(t, NULL, fn, arg); }
+static void win_thread_join(win_thread_t *t) { pthread_join(*t, NULL); }
+#endif
 
 /* Core worker logic (same as before: handles Q8_0/Q4_K/Q4_0 fast paths) */
 static void matmul_worker_f(matmul_task_t *t) {
@@ -147,61 +181,64 @@ static void matmul_worker_f(matmul_task_t *t) {
     }
 }
 
+#ifdef _WIN32
+static DWORD WINAPI pool_worker(void *arg) {
+#else
 static void *pool_worker(void *arg) {
+#endif
     int tid = (int)(size_t)arg;
     int last_gen = 0;
-    pthread_mutex_lock(&pool_mutex);
+    win_mutex_lock(&pool_mutex);
     while (1) {
         while (pool_gen == last_gen && !pool_shutdown) {
-            pthread_cond_wait(&pool_cond, &pool_mutex);
+            win_cond_wait(&pool_cond, &pool_mutex);
         }
         if (pool_shutdown) break;
         last_gen = pool_gen;
-        pthread_mutex_unlock(&pool_mutex);
-
-        /* Execute task (mutex unlock synchronizes-with cond_wait return) */
+        win_mutex_unlock(&pool_mutex);
         matmul_worker_f(&pool_tasks[tid]);
-
-        pthread_mutex_lock(&pool_mutex);
+        win_mutex_lock(&pool_mutex);
         pool_done++;
-        pthread_cond_broadcast(&pool_cond);
+        win_cond_broadcast(&pool_cond);
     }
-    pthread_mutex_unlock(&pool_mutex);
+    win_mutex_unlock(&pool_mutex);
+#ifdef _WIN32
+    return 0;
+#else
     return NULL;
+#endif
 }
 
-/* (Re-)create pool. Lazy init: called from tensor_threadpool_init and
- * lazily from matmul when first multi-threaded call arrives. */
 static void pool_init(int nt) {
     if (pool_nworkers > 0) return;
     if (nt <= 1) return;
+    win_mutex_init(&pool_mutex);
+    win_cond_init(&pool_cond);
     pool_gen = 0;
     pool_done = 0;
     pool_shutdown = 0;
     pool_nworkers = nt - 1;
     for (int i = 1; i < nt; i++) {
-        pthread_create(&pool_threads[i], NULL, pool_worker,
-                       (void *)(size_t)i);
+        win_thread_create(&pool_threads[i], pool_worker, (void *)(size_t)i);
     }
 }
 
 static void pool_wake(int nt) {
     (void)nt;
-    pthread_mutex_lock(&pool_mutex);
+    win_mutex_lock(&pool_mutex);
     pool_gen++;
-    pthread_cond_broadcast(&pool_cond);
-    pthread_mutex_unlock(&pool_mutex);
+    win_cond_broadcast(&pool_cond);
+    win_mutex_unlock(&pool_mutex);
 }
 
 static void pool_wait(int nt) {
-    pthread_mutex_lock(&pool_mutex);
+    win_mutex_lock(&pool_mutex);
     while (pool_done < nt - 1) {
-        pthread_cond_wait(&pool_cond, &pool_mutex);
+        win_cond_wait(&pool_cond, &pool_mutex);
     }
     pool_done = 0;
-    pthread_mutex_unlock(&pool_mutex);
+    win_mutex_unlock(&pool_mutex);
 }
-
 /* ---- Public API ---- */
 
 void tensor_threadpool_init(int n_threads) {
@@ -210,14 +247,20 @@ void tensor_threadpool_init(int n_threads) {
 
 void tensor_threadpool_free(void) {
     if (pool_nworkers <= 0) return;
-    pthread_mutex_lock(&pool_mutex);
+    win_mutex_lock(&pool_mutex);
     pool_shutdown = 1;
-    pthread_cond_broadcast(&pool_cond);
-    pthread_mutex_unlock(&pool_mutex);
+    win_cond_broadcast(&pool_cond);
+    win_mutex_unlock(&pool_mutex);
     for (int i = 1; i <= pool_nworkers; i++) {
-        pthread_join(pool_threads[i], NULL);
+        win_thread_join(&pool_threads[i]);
     }
     pool_nworkers = 0;
+    win_cond_destroy(&pool_cond);
+#ifdef _WIN32
+    DeleteCriticalSection(&pool_mutex);
+#else
+    pthread_mutex_destroy(&pool_mutex);
+#endif
 }
 
 void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t qtype) {
@@ -556,7 +599,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
  * SIMD-accelerated basic operations
  * ================================================================ */
 
-void rmsnorm(float *out, const float *x, const float *weight, int size) {
+void rmsnorm(float *out, const float *x, const float *weight, int size, float eps) {
     float ss = 0.0f;
 
 #ifdef PICOLM_NEON
@@ -590,7 +633,7 @@ void rmsnorm(float *out, const float *x, const float *weight, int size) {
     for (int i = 0; i < size; i++) ss += x[i] * x[i];
 #endif
 
-    ss = 1.0f / sqrtf(ss / (float)size + 1e-5f);
+    ss = 1.0f / sqrtf(ss / (float)size + eps);
 
 #ifdef PICOLM_NEON
     float32x4_t scale = vdupq_n_f32(ss);
@@ -722,60 +765,73 @@ static void rope_sse(float *h, int half, const float *cos_pos, const float *sin_
 
 /* Rotary position encoding using pre-computed cos/sin tables */
 void rope(float *q, float *k, int head_dim, int n_heads, int n_kv_heads,
-          const float *cos_pos, const float *sin_pos) {
+          const float *cos_pos, const float *sin_pos, int rope_type) {
     int half = head_dim / 2;
 
-    /* Apply RoPE to all query heads */
-    for (int h = 0; h < n_heads; h++) {
-        float *qh = q + h * head_dim;
+    if (rope_type) {
+        /* Qwen2 interleaved style: q[i] and q[i+half] are paired */
+        for (int h = 0; h < n_heads; h++) {
+            float *qh = q + h * head_dim;
+            for (int i = 0; i < half; i++) {
+                float q0 = qh[i], q1 = qh[i + half];
+                qh[i]     = q0 * cos_pos[i] - q1 * sin_pos[i];
+                qh[i + half] = q0 * sin_pos[i] + q1 * cos_pos[i];
+            }
+        }
+        for (int h = 0; h < n_kv_heads; h++) {
+            float *kh = k + h * head_dim;
+            for (int i = 0; i < half; i++) {
+                float k0 = kh[i], k1 = kh[i + half];
+                kh[i]     = k0 * cos_pos[i] - k1 * sin_pos[i];
+                kh[i + half] = k0 * sin_pos[i] + k1 * cos_pos[i];
+            }
+        }
+    } else {
+        /* Llama pairwise style: (q[2i], q[2i+1]) paired */
+        for (int h = 0; h < n_heads; h++) {
+            float *qh = q + h * head_dim;
 #ifdef PICOLM_NEON
-        int i = 0;
-        for (; i + 3 < half; i += 4) {
-            /* Load pairs: (q0,q1), (q2,q3), ... as interleaved */
-            float32x4x2_t qv = vld2q_f32(qh + i * 2);
-            float32x4_t cv = vld1q_f32(cos_pos + i);
-            float32x4_t sv = vld1q_f32(sin_pos + i);
-            /* q_even = q0*cos - q1*sin, q_odd = q0*sin + q1*cos */
-            float32x4_t new_even = vmlsq_f32(vmulq_f32(qv.val[0], cv), qv.val[1], sv);
-            float32x4_t new_odd  = vmlaq_f32(vmulq_f32(qv.val[0], sv), qv.val[1], cv);
-            float32x4x2_t result = {{ new_even, new_odd }};
-            vst2q_f32(qh + i * 2, result);
-        }
-        for (; i < half; i++) {
-            float q0 = qh[i * 2];
-            float q1 = qh[i * 2 + 1];
-            qh[i * 2]     = q0 * cos_pos[i] - q1 * sin_pos[i];
-            qh[i * 2 + 1] = q0 * sin_pos[i] + q1 * cos_pos[i];
-        }
+            int i = 0;
+            for (; i + 3 < half; i += 4) {
+                float32x4x2_t qv = vld2q_f32(qh + i * 2);
+                float32x4_t cv = vld1q_f32(cos_pos + i);
+                float32x4_t sv = vld1q_f32(sin_pos + i);
+                float32x4_t new_even = vmlsq_f32(vmulq_f32(qv.val[0], cv), qv.val[1], sv);
+                float32x4_t new_odd  = vmlaq_f32(vmulq_f32(qv.val[0], sv), qv.val[1], cv);
+                float32x4x2_t result = {{ new_even, new_odd }};
+                vst2q_f32(qh + i * 2, result);
+            }
+            for (; i < half; i++) {
+                float q0 = qh[i * 2], q1 = qh[i * 2 + 1];
+                qh[i * 2]     = q0 * cos_pos[i] - q1 * sin_pos[i];
+                qh[i * 2 + 1] = q0 * sin_pos[i] + q1 * cos_pos[i];
+            }
 #elif defined(PICOLM_AVX)
-        rope_avx(qh, half, cos_pos, sin_pos);
+            rope_avx(qh, half, cos_pos, sin_pos);
 #elif defined(PICOLM_SSE2)
-        rope_sse(qh, half, cos_pos, sin_pos);
+            rope_sse(qh, half, cos_pos, sin_pos);
 #else
-        for (int i = 0; i < half; i++) {
-            float q0 = qh[i * 2];
-            float q1 = qh[i * 2 + 1];
-            qh[i * 2]     = q0 * cos_pos[i] - q1 * sin_pos[i];
-            qh[i * 2 + 1] = q0 * sin_pos[i] + q1 * cos_pos[i];
-        }
+            for (int i = 0; i < half; i++) {
+                float q0 = qh[i * 2], q1 = qh[i * 2 + 1];
+                qh[i * 2]     = q0 * cos_pos[i] - q1 * sin_pos[i];
+                qh[i * 2 + 1] = q0 * sin_pos[i] + q1 * cos_pos[i];
+            }
 #endif
-    }
-
-    /* Apply RoPE to all KV heads */
-    for (int h = 0; h < n_kv_heads; h++) {
-        float *kh = k + h * head_dim;
+        }
+        for (int h = 0; h < n_kv_heads; h++) {
+            float *kh = k + h * head_dim;
 #ifdef PICOLM_AVX
-        rope_avx(kh, half, cos_pos, sin_pos);
+            rope_avx(kh, half, cos_pos, sin_pos);
 #elif defined(PICOLM_SSE2)
-        rope_sse(kh, half, cos_pos, sin_pos);
+            rope_sse(kh, half, cos_pos, sin_pos);
 #else
-        for (int i = 0; i < half; i++) {
-            float k0 = kh[i * 2];
-            float k1 = kh[i * 2 + 1];
-            kh[i * 2]     = k0 * cos_pos[i] - k1 * sin_pos[i];
-            kh[i * 2 + 1] = k0 * sin_pos[i] + k1 * cos_pos[i];
-        }
+            for (int i = 0; i < half; i++) {
+                float k0 = kh[i * 2], k1 = kh[i * 2 + 1];
+                kh[i * 2]     = k0 * cos_pos[i] - k1 * sin_pos[i];
+                kh[i * 2 + 1] = k0 * sin_pos[i] + k1 * cos_pos[i];
+            }
 #endif
+        }
     }
 }
 

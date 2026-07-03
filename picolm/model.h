@@ -23,6 +23,8 @@ typedef struct {
     int max_seq_len;    /* maximum sequence length (e.g. 2048) */
     int head_dim;       /* = n_embd / n_heads */
     float rope_freq_base; /* RoPE theta base (e.g. 10000.0) */
+    float rms_norm_eps;   /* RMS norm epsilon (e.g. 1e-5) */
+    int rope_type;        /* 0=llama pairwise, 1=qwen2 interleaved */
     int alignment;      /* GGUF data alignment */
     gguf_type_t weight_type; /* default weight quantization type */
 } model_config_t;

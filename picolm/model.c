@@ -249,6 +249,8 @@ static int parse_gguf(model_t *m, int max_seq_len) {
 
     cfg->alignment = 32;
     cfg->rope_freq_base = 10000.0f;
+    cfg->rms_norm_eps = 1e-5f;
+    cfg->rope_type = 0;  /* llama pairwise */
     cfg->max_seq_len = 2048;
     cfg->weight_type = GGUF_TYPE_F16;
     m->tok_bos_id = 1;
@@ -261,6 +263,7 @@ static int parse_gguf(model_t *m, int max_seq_len) {
         if (str_eq(key, "llama.embedding_length") || str_eq(key, "general.embedding_length")
             || str_eq(key, "qwen2.embedding_length") || str_eq(key, "qwen3.embedding_length")) {
             int dummy; cfg->n_embd = (int)skip_meta_value(&r, vtype, &dummy);
+            if (key.str[0] == 'q') cfg->rope_type = 1;  /* qwen2/qwen3 interleaved */
         } else if (str_eq(key, "llama.feed_forward_length") || str_eq(key, "general.feed_forward_length")
             || str_eq(key, "qwen2.feed_forward_length") || str_eq(key, "qwen3.feed_forward_length")) {
             int dummy; cfg->n_ffn = (int)skip_meta_value(&r, vtype, &dummy);
@@ -286,8 +289,14 @@ static int parse_gguf(model_t *m, int max_seq_len) {
         } else if (str_eq(key, "llama.attention.layer_norm_rms_epsilon")
             || str_eq(key, "qwen2.attention.layer_norm_rms_epsilon")
             || str_eq(key, "qwen3.attention.layer_norm_rms_epsilon")) {
-            /* epsilon is hardcoded in rmsnorm (1e-5), just skip the value */
-            int dummy; skip_meta_value(&r, vtype, &dummy);
+            /* Read epsilon from GGUF (usually F64 type=3) */
+            if (vtype == 3) { /* F64 */
+                double val;
+                memcpy(&val, r.data + r.pos, 8); r.pos += 8;
+                cfg->rms_norm_eps = (float)val;
+            } else {
+                int dummy; skip_meta_value(&r, vtype, &dummy);
+            }
         } else if (str_eq(key, "general.alignment")) {
             int dummy; cfg->alignment = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "llama.vocab_size")
@@ -768,7 +777,7 @@ float *model_forward(model_t *m, int token, int pos) {
         int ri = 2 + l * 9; /* repack buffer index base for this layer */
 
         /* ---- Attention ---- */
-        rmsnorm(s->xb, s->x, s->attn_norm_w[l], dim);
+        rmsnorm(s->xb, s->x, s->attn_norm_w[l], dim, c->rms_norm_eps);
 
         /* Q projection */
         tensor_set_repacked(m->repack_used[ri] ? m->repack_buffers[ri] : NULL);
@@ -790,13 +799,13 @@ float *model_forward(model_t *m, int token, int pos) {
             float *qnw = s->attn_q_norm_w[l];
             float *knw = s->attn_k_norm_w[l];
             for (int h = 0; h < n_heads; h++)
-                rmsnorm(s->q + h * head_dim, s->q + h * head_dim, qnw, head_dim);
+                rmsnorm(s->q + h * head_dim, s->q + h * head_dim, qnw, head_dim, c->rms_norm_eps);
             for (int h = 0; h < n_kv_heads; h++)
-                rmsnorm(k_tmp + h * head_dim, k_tmp + h * head_dim, knw, head_dim);
+                rmsnorm(k_tmp + h * head_dim, k_tmp + h * head_dim, knw, head_dim, c->rms_norm_eps);
         }
 
         /* Apply RoPE to Q and K */
-        rope(s->q, k_tmp, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos);
+        rope(s->q, k_tmp, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos, c->rope_type);
 
         /* Store K per head */
         for (int hkv = 0; hkv < n_kv_heads; hkv++) {
@@ -959,7 +968,7 @@ float *model_forward(model_t *m, int token, int pos) {
         vec_add(s->x, s->xb2, dim);
 
         /* ---- FFN (SwiGLU) ---- */
-        rmsnorm(s->xb, s->x, s->ffn_norm_w[l], dim);
+        rmsnorm(s->xb, s->x, s->ffn_norm_w[l], dim, c->rms_norm_eps);
 
         tensor_set_repacked(m->repack_used[ri+4] ? m->repack_buffers[ri+4] : NULL);
         matmul(s->hb,  s->xb, lw->ffn_gate, dim, n_ffn, lw->type_ffn_gate);
@@ -979,7 +988,7 @@ float *model_forward(model_t *m, int token, int pos) {
     }
 
     /* 3. Final RMSNorm */
-    rmsnorm(s->x, s->x, s->output_norm_w, dim);
+    rmsnorm(s->x, s->x, s->output_norm_w, dim, c->rms_norm_eps);
 
     /* 4. Output projection -> logits */
     tensor_set_repacked(m->repack_used[1] ? m->repack_buffers[1] : NULL);
@@ -1052,7 +1061,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 
         /* RMSNorm */
         for (int bi = 0; bi < n_tokens; bi++)
-            rmsnorm(xb_batch + bi * dim, x_batch + bi * dim, s->attn_norm_w[l], dim);
+            rmsnorm(xb_batch + bi * dim, x_batch + bi * dim, s->attn_norm_w[l], dim, c->rms_norm_eps);
 
         /* Q projection (batched) */
         tensor_set_repacked(m->repack_used[2+l*9] ? m->repack_buffers[2+l*9] : NULL);
@@ -1082,12 +1091,12 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                 float *qnw = s->attn_q_norm_w[l];
                 float *knw = s->attn_k_norm_w[l];
                 for (int h = 0; h < n_heads; h++)
-                    rmsnorm(q_pos + h * head_dim, q_pos + h * head_dim, qnw, head_dim);
+                    rmsnorm(q_pos + h * head_dim, q_pos + h * head_dim, qnw, head_dim, c->rms_norm_eps);
                 for (int h = 0; h < n_kv_heads; h++)
-                    rmsnorm(k_pos + h * head_dim, k_pos + h * head_dim, knw, head_dim);
+                    rmsnorm(k_pos + h * head_dim, k_pos + h * head_dim, knw, head_dim, c->rms_norm_eps);
             }
 
-            rope(q_pos, k_pos, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos);
+            rope(q_pos, k_pos, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos, c->rope_type);
 
             /* KV cache store */
             uint8_t *kcl = s->key_cache + (size_t)l * seq_len * c->n_kv_heads * s->kv_row_size_k;
@@ -1168,7 +1177,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 
         /* FFN RMSNorm */
         for (int bi = 0; bi < n_tokens; bi++)
-            rmsnorm(xb_batch + bi * dim, x_batch + bi * dim, s->ffn_norm_w[l], dim);
+            rmsnorm(xb_batch + bi * dim, x_batch + bi * dim, s->ffn_norm_w[l], dim, c->rms_norm_eps);
 
         /* FFN gate+up (batched dual) */
         tensor_set_repacked(m->repack_used[7+l*9] ? m->repack_buffers[7+l*9] : NULL);
@@ -1197,7 +1206,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 
     /* Final norm + output (last token only) */
     float *last_x = x_batch + (n_tokens - 1) * dim;
-    rmsnorm(s->x, last_x, s->output_norm_w, dim);
+    rmsnorm(s->x, last_x, s->output_norm_w, dim, c->rms_norm_eps);
     tensor_set_repacked(m->repack_used[1] ? m->repack_buffers[1] : NULL);
     matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
     tensor_set_repacked(NULL);
