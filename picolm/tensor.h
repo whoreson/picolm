@@ -18,6 +18,11 @@ void tensor_set_threads(int t);
 int  tensor_get_threads(void);
 void tensor_threadpool_init(int n_threads);
 void tensor_threadpool_free(void);
+void matmul_batch(float *out, const float *x, int n_batch,
+                   const void *W, int n, int d, gguf_type_t qtype);
+void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
+                        const void *W1, const void *W2,
+                        int n, int d, gguf_type_t qtype1, gguf_type_t qtype2);
 
 /* Matrix-vector multiply: out[d] = W[d, n] @ x[n]
  * W is quantized in the given type, stored row-major.

@@ -228,22 +228,21 @@ int main(int argc, char **argv) {
     int total_gen = 0;
     double t_start = get_time_ms();
     double t_first_token = 0;
+    double t_end = 0;
 
-    int token = prompt_tokens[start_pos > 0 ? start_pos - 1 : 0];
-    int pos = start_pos > 0 ? start_pos - 1 : 0;
+    int pos = start_pos;
     int total_steps = n_prompt + max_tokens;
     if (total_steps > model.config.max_seq_len) {
         total_steps = model.config.max_seq_len;
     }
 
-    for (; pos < total_steps; pos++) {
-        /* Determine which token to feed */
-        if (pos < start_pos) {
-            /* This shouldn't happen given our start logic, but safety */
-            token = prompt_tokens[pos];
-            continue;
-        }
+    /* Batch prefill: disabled until matmul_batch gets proper threading.
+     * matmul_batch is single-threaded and slower than per-token matmul
+     * which uses the thread pool. When threading is added, batch prefill
+     * will be faster because weights are read once for all tokens. */
+    int token = start_pos > 0 ? prompt_tokens[start_pos - 1] : 1;
 
+    for (; pos < total_steps; pos++) {
         /* Forward pass */
         float *logits = model_forward(&model, token, pos);
 
@@ -279,16 +278,15 @@ int main(int argc, char **argv) {
     }
 
     printf("\n");
-    double t_end = get_time_ms();
+    t_end = get_time_ms();
 
-    /* Save KV cache if requested (save the full prompt state) */
+    /* Save KV cache if requested */
     if (cache_file && n_prompt > 0) {
         kvcache_save(&model, cache_file, n_prompt);
     }
 
-    /* Stats */
     double total_time = (t_end - t_start) / 1000.0;
-    if (t_first_token == 0) t_first_token = t_end; /* no generation happened */
+    if (t_first_token == 0) t_first_token = t_end;
     double gen_time = (t_end - t_first_token) / 1000.0;
     double prefill_time = (t_first_token - t_start) / 1000.0;
     int actual_prefill = n_prompt - start_pos;

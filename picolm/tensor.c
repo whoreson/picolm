@@ -519,6 +519,40 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
 }
 
 /* ================================================================
+ * Batch matmul for prefill (weights read once for all tokens)
+ * Output layout: out[batch * d + row]
+ * ================================================================ */
+
+void matmul_batch(float *out, const float *x, int n_batch,
+                   const void *W, int n, int d, gguf_type_t qtype) {
+    size_t row_bytes = gguf_type_row_size(qtype, n);
+    const char *wptr = (const char *)W;
+    for (int i = 0; i < d; i++) {
+        const char *wrow = wptr + (size_t)i * row_bytes;
+        for (int b = 0; b < n_batch; b++)
+            out[b * d + i] = vec_dot(wrow, x + b * n, n, qtype);
+    }
+}
+
+void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
+                        const void *W1, const void *W2,
+                        int n, int d, gguf_type_t qtype1, gguf_type_t qtype2) {
+    size_t row_bytes = gguf_type_row_size(qtype1, n);
+    size_t row_bytes2 = gguf_type_row_size(qtype2, n);
+    const char *w1 = (const char *)W1;
+    const char *w2 = (const char *)W2;
+    for (int i = 0; i < d; i++) {
+        const char *wr1 = w1 + (size_t)i * row_bytes;
+        const char *wr2 = w2 + (size_t)i * row_bytes2;
+        for (int b = 0; b < n_batch; b++) {
+            const float *xb = x + b * n;
+            out1[b * d + i] = vec_dot(wr1, xb, n, qtype1);
+            out2[b * d + i] = vec_dot(wr2, xb, n, qtype2);
+        }
+    }
+}
+
+/* ================================================================
  * SIMD-accelerated basic operations
  * ================================================================ */
 

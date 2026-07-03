@@ -154,6 +154,7 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
 
 /* Run one forward pass. Returns pointer to logits[vocab_size]. */
 float *model_forward(model_t *m, int token, int pos);
+float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int start_pos);
 
 /* Free all resources. */
 void model_free(model_t *m);
