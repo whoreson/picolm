@@ -13,9 +13,7 @@
 
 /* Thread pool (Windows-native or POSIX) */
 #ifdef _WIN32
-typedef HANDLE  win_thread_t;
-typedef CRITICAL_SECTION win_mutex_t;
-typedef HANDLE  win_cond_t;
+/* win_mutex_t, win_cond_t defined below in the helper functions */
 #else
 typedef pthread_t  win_thread_t;
 typedef pthread_mutex_t win_mutex_t;
@@ -101,13 +99,17 @@ static matmul_task_t   pool_tasks[MAX_THREADS];
 
 /* Cross-platform mutex/cond helpers */
 #ifdef _WIN32
-static void win_mutex_init(win_mutex_t *m) { InitializeCriticalSection(m); }
-static void win_mutex_lock(win_mutex_t *m) { EnterCriticalSection(m); }
-static void win_mutex_unlock(win_mutex_t *m) { LeaveCriticalSection(m); }
-static void win_cond_init(win_cond_t *c) { *c = CreateEvent(NULL, TRUE, FALSE, NULL); }
-static void win_cond_wait(win_cond_t *c, win_mutex_t *m) { LeaveCriticalSection(m); WaitForSingleObject(*c, INFINITE); EnterCriticalSection(m); ResetEvent(*c); }
-static void win_cond_broadcast(win_cond_t *c) { SetEvent(*c); }
-static void win_cond_destroy(win_cond_t *c) { CloseHandle(*c); }
+/* Use SRWLOCK + CONDITION_VARIABLE for correct Windows CV semantics */
+typedef SRWLOCK           win_mutex_t;
+typedef CONDITION_VARIABLE win_cond_t;
+typedef HANDLE            win_thread_t;
+static void win_mutex_init(win_mutex_t *m) { InitializeSRWLock(m); }
+static void win_mutex_lock(win_mutex_t *m) { AcquireSRWLockExclusive(m); }
+static void win_mutex_unlock(win_mutex_t *m) { ReleaseSRWLockExclusive(m); }
+static void win_cond_init(win_cond_t *c) { InitializeConditionVariable(c); }
+static void win_cond_wait(win_cond_t *c, win_mutex_t *m) { SleepConditionVariableSRW(c, m, INFINITE, 0); }
+static void win_cond_broadcast(win_cond_t *c) { WakeAllConditionVariable(c); }
+static void win_cond_destroy(win_cond_t *c) { (void)c; } /* no-op */
 static void win_thread_create(win_thread_t *t, DWORD (WINAPI *fn)(void*), void *arg) { *t = CreateThread(NULL, 0, fn, arg, 0, NULL); }
 static void win_thread_join(win_thread_t *t) { WaitForSingleObject(*t, INFINITE); CloseHandle(*t); }
 #else
@@ -257,7 +259,7 @@ void tensor_threadpool_free(void) {
     pool_nworkers = 0;
     win_cond_destroy(&pool_cond);
 #ifdef _WIN32
-    DeleteCriticalSection(&pool_mutex);
+    /* SRWLOCK has no explicit destroy */
 #else
     pthread_mutex_destroy(&pool_mutex);
 #endif
