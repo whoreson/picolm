@@ -10,7 +10,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
-static double get_time_ms(void) {
+double get_time_ms(void) {
     LARGE_INTEGER freq, count;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&count);
@@ -19,7 +19,7 @@ static double get_time_ms(void) {
 #else
 #include <sys/time.h>
 #include <unistd.h>
-static double get_time_ms(void) {
+double get_time_ms(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (double)tv.tv_sec * 1000.0 + (double)tv.tv_usec / 1000.0;
@@ -38,6 +38,10 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -c <int>       Context length override\n");
     fprintf(stderr, "  -j <int>       Number of threads (default: 4)\n");
     fprintf(stderr, "  --mem <MB>      Pin this many MB of layers in RAM (mlock)\n");
+    fprintf(stderr, "\nServer options:\n");
+    fprintf(stderr, "  --server <model> Start HTTP server (OpenAI-compatible)\n");
+    fprintf(stderr, "  --port <int>     Server port (default: 8080)\n");
+    fprintf(stderr, "  --host <addr>    Server bind address (default: 0.0.0.0)\n");
     fprintf(stderr, "\nAdvanced options:\n");
     fprintf(stderr, "  --json         Grammar-constrained JSON output mode\n");
     fprintf(stderr, "  --cache <file> KV cache file (saves/loads prompt state)\n");
@@ -83,9 +87,14 @@ int main(int argc, char **argv) {
     kv_cache_type_t kv_type_k = KV_CACHE_F16;
     kv_cache_type_t kv_type_v = KV_CACHE_F16;
     int    mem_mb = 0;  /* --mem budget in megabytes (0=disabled) */
+    int    server_mode = 0;
+    int    server_port = 8080;
+    char   server_host[256] = "0.0.0.0";
 
     /* Parse arguments */
-    for (int i = 2; i < argc; i++) {
+    for (int i = 1; i < argc; i++) {
+        /* Skip positional model path (argv[1] when it doesn't start with -) */
+        if (i == 1 && argv[1][0] != '-') continue;
         if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
             prompt = argv[++i];
         } else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
@@ -100,6 +109,14 @@ int main(int argc, char **argv) {
             context_override = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-j") == 0 && i + 1 < argc) {
             num_threads = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--server") == 0 && i + 1 < argc) {
+            server_mode = 1;
+            model_path = argv[++i];
+        } else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
+            server_port = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
+            strncpy(server_host, argv[++i], sizeof(server_host) - 1);
+            server_host[sizeof(server_host) - 1] = '\0';
         } else if (strcmp(argv[i], "--json") == 0) {
             json_mode = 1;
         } else if (strcmp(argv[i], "--cache") == 0 && i + 1 < argc) {
@@ -136,6 +153,13 @@ int main(int argc, char **argv) {
             prompt = stdin_prompt;
         }
 #endif
+    }
+
+    /* Server mode: start HTTP server (no prompt needed) */
+    if (server_mode) {
+        fp16_table_init();
+        extern int server_main(int port, const char *host, const char *model_path);
+        return server_main(server_port, server_host, model_path);
     }
 
     if (!prompt || !*prompt) {
