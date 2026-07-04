@@ -551,6 +551,363 @@ static void handle_completion(SOCKET sock, const char *request_body,
     model_free(&model);
 }
 
+/* ---- Endpoint: POST /completion (llama.cpp-style) ---- */
+
+/* Handle the non-OAI /completion endpoint.
+ * This matches the llama.cpp server format with content, tokens, stop,
+ * stop_type, generation_settings, model, timings, etc. */
+static void handle_llama_completion(SOCKET sock, const char *request_body,
+                                     const char *model_path, int *out_prompt_len) {
+    *out_prompt_len = 0;
+
+    cJSON *req = cJSON_ParseWithLength(request_body, strlen(request_body));
+    if (!req) {
+        http_send(sock, 400, "application/json", "{\"error\":\"Invalid JSON\"}");
+        return;
+    }
+
+    /* Extract prompt - supports string or array of tokens */
+    const char *prompt = NULL;
+    int *token_prompt = NULL;
+    int n_token_prompt = 0;
+    int prompt_is_tokens = 0;
+
+    cJSON *p = cJSON_GetObjectItem(req, "prompt");
+    if (!p) {
+        cJSON_Delete(req);
+        http_send(sock, 400, "application/json", "{\"error\":\"'prompt' is required\"}");
+        return;
+    }
+
+    if (cJSON_IsString(p)) {
+        prompt = cJSON_GetStringValue(p);
+    } else if (cJSON_IsArray(p)) {
+        /* Token array prompt */
+        n_token_prompt = cJSON_GetArraySize(p);
+        token_prompt = (int *)malloc((size_t)n_token_prompt * sizeof(int));
+        for (int i = 0; i < n_token_prompt; i++) {
+            cJSON *item = cJSON_GetArrayItem(p, i);
+            if (cJSON_IsNumber(item))
+                token_prompt[i] = (int)cJSON_GetNumberValue(item);
+            else if (cJSON_IsString(item)) {
+                /* Mixed array with strings - skip for now, require pure tokens */
+            }
+        }
+        prompt_is_tokens = 1;
+    } else {
+        cJSON_Delete(req);
+        http_send(sock, 400, "application/json", "{\"error\":\"'prompt' must be a string or token array\"}");
+        return;
+    }
+
+    /* Parameters (llama.cpp naming) */
+    int n_predict = -1; /* -1 = unlimited (use max_seq_len) */
+    float temperature = 0.8f;
+    float top_p = 0.95f;
+    int top_k = 40;
+    float repeat_penalty = 1.1f;
+    int repeat_last_n = 64;
+    int seed = -1; /* -1 = random */
+    int do_stream = 0;
+    int return_tokens = 0;
+    int ignore_eos = 0;
+    const char *model_name = NULL;
+
+    cJSON *item;
+    if ((item = cJSON_GetObjectItem(req, "n_predict")))
+        n_predict = (int)cJSON_GetNumberValue(item);
+    if ((item = cJSON_GetObjectItem(req, "temperature")))
+        temperature = (float)cJSON_GetNumberValue(item);
+    if ((item = cJSON_GetObjectItem(req, "top_p")))
+        top_p = (float)cJSON_GetNumberValue(item);
+    if ((item = cJSON_GetObjectItem(req, "top_k")))
+        top_k = (int)cJSON_GetNumberValue(item);
+    if ((item = cJSON_GetObjectItem(req, "repeat_penalty")))
+        repeat_penalty = (float)cJSON_GetNumberValue(item);
+    if ((item = cJSON_GetObjectItem(req, "repeat_last_n")))
+        repeat_last_n = (int)cJSON_GetNumberValue(item);
+    if ((item = cJSON_GetObjectItem(req, "seed"))) {
+        seed = (int)cJSON_GetNumberValue(item);
+    }
+    if ((item = cJSON_GetObjectItem(req, "stream")) && cJSON_IsTrue(item))
+        do_stream = 1;
+    if ((item = cJSON_GetObjectItem(req, "return_tokens")) && cJSON_IsTrue(item))
+        return_tokens = 1;
+    if ((item = cJSON_GetObjectItem(req, "ignore_eos")) && cJSON_IsTrue(item))
+        ignore_eos = 1;
+    if ((item = cJSON_GetObjectItem(req, "model")))
+        model_name = cJSON_GetStringValue(item);
+
+    /* Parse stop words */
+    char *stop_words[16];
+    int n_stop_words = 0;
+    cJSON *stop_arr = cJSON_GetObjectItem(req, "stop");
+    if (stop_arr && cJSON_IsArray(stop_arr)) {
+        int n = cJSON_GetArraySize(stop_arr);
+        if (n > 16) n = 16;
+        for (int i = 0; i < n; i++) {
+            cJSON *sw = cJSON_GetArrayItem(stop_arr, i);
+            if (cJSON_IsString(sw)) {
+                const char *s = cJSON_GetStringValue(sw);
+                if (s && strlen(s) > 0) {
+                    stop_words[n_stop_words++] = (char *)s;
+                }
+            }
+        }
+    }
+
+    cJSON_Delete(req);
+
+    /* Load model */
+    fprintf(stderr, "[server] Loading model: %s\n", model_path);
+    model_t model;
+    fp16_table_init();
+    if (model_load(&model, model_path, 0, KV_CACHE_F16, KV_CACHE_F16) != 0) {
+        free(token_prompt);
+        http_send(sock, 500, "application/json", "{\"error\":\"Failed to load model\"}");
+        return;
+    }
+
+    tensor_set_threads(4);
+    tensor_threadpool_init(4);
+
+    tokenizer_t tokenizer;
+    if (tokenizer_load(&tokenizer, &model) != 0) {
+        free(token_prompt);
+        model_free(&model);
+        http_send(sock, 500, "application/json", "{\"error\":\"Failed to load tokenizer\"}");
+        return;
+    }
+
+    /* Encode prompt */
+    int *ptokens = NULL;
+    int n_prompt = 0;
+    if (prompt_is_tokens) {
+        ptokens = token_prompt;
+        n_prompt = n_token_prompt;
+        token_prompt = NULL; /* transferred ownership */
+    } else {
+        int max_pt = (int)strlen(prompt) + 3;
+        ptokens = (int *)malloc((size_t)max_pt * sizeof(int));
+        n_prompt = tokenizer_encode(&tokenizer, prompt, ptokens, max_pt, 1);
+    }
+    *out_prompt_len = n_prompt;
+
+    if (n_predict < 0) n_predict = model.config.max_seq_len - n_prompt;
+    if (n_predict <= 0) n_predict = 32;
+
+    /* Random seed */
+    if (seed < 0) seed = (uint64_t)(time(NULL) ^ (uint64_t)((long)&seed));
+
+    sampler_t sampler;
+    sampler_init(&sampler, temperature, top_p, (uint64_t)seed);
+
+    /* Build generation_settings JSON */
+    cJSON *gen_settings = cJSON_CreateObject();
+    cJSON_AddNumberToObject(gen_settings, "n_predict", n_predict);
+    cJSON_AddNumberToObject(gen_settings, "temperature", temperature);
+    cJSON_AddNumberToObject(gen_settings, "top_p", top_p);
+    cJSON_AddNumberToObject(gen_settings, "top_k", top_k);
+    cJSON_AddNumberToObject(gen_settings, "repeat_penalty", repeat_penalty);
+    cJSON_AddNumberToObject(gen_settings, "repeat_last_n", repeat_last_n);
+    cJSON_AddNumberToObject(gen_settings, "seed", seed);
+
+    double t_start = get_time_ms();
+
+    if (do_stream) {
+        /* Streaming: SSE per token */
+        char hdr[256];
+        snprintf(hdr, sizeof(hdr),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/event-stream\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Connection: keep-alive\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "\r\n");
+        send(sock, hdr, strlen(hdr), 0);
+
+        int token = n_prompt > 0 ? ptokens[0] : (int)tokenizer.bos_id;
+        int gen_count = 0;
+        const char *stop_type = "none";
+        const char *stopping_word = "";
+
+        for (int pos = 0; pos < n_prompt + n_predict; pos++) {
+            float *logits = model_forward(&model, token, pos);
+
+            if (pos < n_prompt - 1) {
+                token = ptokens[pos + 1];
+                continue;
+            }
+
+            int next = sampler_sample(&sampler, logits, model.config.vocab_size);
+            const char *piece = tokenizer_decode(&tokenizer, token, next);
+            if (!piece) piece = "";
+
+            /* Check stop words */
+            int stopped = 0;
+            for (int i = 0; i < n_stop_words && !stopped; i++) {
+                if (strstr(piece, stop_words[i]) != NULL) {
+                    stopped = 1;
+                    stop_type = "word";
+                    stopping_word = stop_words[i];
+                }
+            }
+
+            /* Build streaming response: {content, tokens, stop} */
+            cJSON *resp = cJSON_CreateObject();
+            cJSON_AddStringToObject(resp, "content", piece);
+
+            if (return_tokens || do_stream) {
+                cJSON *tok_arr = cJSON_CreateArray();
+                cJSON_AddNumberToObject(tok_arr, "", next);
+                cJSON_AddItemToObject(resp, "tokens", tok_arr);
+            }
+
+            if (stopped || next == (int)tokenizer.eos_id) {
+                if (!stopped) stop_type = "eos";
+                cJSON_AddBoolToObject(resp, "stop", 1);
+                sse_send(sock, cJSON_PrintUnformatted(resp), NULL);
+                free(cJSON_PrintUnformatted(resp));
+                cJSON_Delete(resp);
+                gen_count++;
+                printf("%s", piece);
+                fflush(stdout);
+                break;
+            }
+
+            cJSON_AddBoolToObject(resp, "stop", 0);
+            sse_send(sock, cJSON_PrintUnformatted(resp), NULL);
+            free(cJSON_PrintUnformatted(resp));
+            cJSON_Delete(resp);
+
+            gen_count++;
+            printf("%s", piece);
+            fflush(stdout);
+
+            if (!ignore_eos && next == (int)tokenizer.eos_id) {
+                stop_type = "eos";
+                break;
+            }
+            token = next;
+        }
+
+        double t_end = get_time_ms();
+        double gen_ms = t_end - t_start;
+
+        /* Final timing SSE */
+        cJSON *final = cJSON_CreateObject();
+        cJSON_AddBoolToObject(final, "stop", 1);
+        cJSON_AddStringToObject(final, "stop_type", stop_type);
+        cJSON_AddStringToObject(final, "stopping_word", stopping_word);
+        cJSON_AddNumberToObject(final, "tokens_evaluated", n_prompt);
+        sse_send(sock, cJSON_PrintUnformatted(final), NULL);
+        free(cJSON_PrintUnformatted(final));
+        cJSON_Delete(final);
+
+        fprintf(stderr, "\n[server] /completion: %d prompt tokens, %d generated in %.0fms (%.1f tok/s)\n",
+                n_prompt, gen_count, gen_ms, gen_ms > 0 ? gen_count / (gen_ms / 1000.0) : 0);
+    } else {
+        /* Non-streaming: collect all tokens, build one big response */
+        int token = n_prompt > 0 ? ptokens[0] : (int)tokenizer.bos_id;
+        int gen_count = 0;
+        const char *stop_type = "none";
+        const char *stopping_word = "";
+        char *generated = (char *)malloc(n_predict * 100 + 1);
+        generated[0] = '\0';
+        int *gen_token_ids = (int *)malloc((size_t)n_predict * sizeof(int));
+
+        for (int pos = 0; pos < n_prompt + n_predict; pos++) {
+            float *logits = model_forward(&model, token, pos);
+
+            if (pos < n_prompt - 1) {
+                token = ptokens[pos + 1];
+                continue;
+            }
+
+            int next = sampler_sample(&sampler, logits, model.config.vocab_size);
+            const char *piece = tokenizer_decode(&tokenizer, token, next);
+            if (!piece) piece = "";
+
+            strncat(generated, piece, n_predict * 100 - strlen(generated) - 1);
+            gen_token_ids[gen_count] = next;
+            gen_count++;
+            printf("%s", piece);
+            fflush(stdout);
+
+            /* Check stop words */
+            for (int i = 0; i < n_stop_words; i++) {
+                if (strstr(generated, stop_words[i]) != NULL) {
+                    stop_type = "word";
+                    stopping_word = stop_words[i];
+                    /* Trim to before the stop word */
+                    char *found = strstr(generated, stop_words[i]);
+                    if (found) *found = '\0';
+                    gen_count--;
+                    break;
+                }
+            }
+            if (strcmp(stop_type, "word") == 0) break;
+
+            if (!ignore_eos && next == (int)tokenizer.eos_id) {
+                stop_type = "eos";
+                break;
+            }
+            if (gen_count >= n_predict) { stop_type = "limit"; break; }
+            token = next;
+        }
+
+        double t_end = get_time_ms();
+        double gen_ms = t_end - t_start;
+
+        /* Build response */
+        cJSON *resp = cJSON_CreateObject();
+        cJSON_AddStringToObject(resp, "content", generated);
+
+        if (return_tokens) {
+            cJSON *tok_arr = cJSON_CreateArray();
+            for (int i = 0; i < gen_count; i++)
+                cJSON_AddNumberToObject(tok_arr, "", gen_token_ids[i]);
+            cJSON_AddItemToObject(resp, "tokens", tok_arr);
+        }
+
+        cJSON_AddStringToObject(resp, "stop_type", stop_type);
+        cJSON_AddStringToObject(resp, "stopping_word", stopping_word);
+        cJSON_AddNumberToObject(resp, "tokens_evaluated", n_prompt);
+        cJSON_AddNumberToObject(resp, "tokens_predicted", gen_count);
+
+        if (model_name) cJSON_AddStringToObject(resp, "model", model_name);
+        else cJSON_AddStringToObject(resp, "model", "pico");
+
+        cJSON_AddItemToObject(resp, "generation_settings", gen_settings);
+
+        /* Timings */
+        cJSON *timings = cJSON_CreateObject();
+        cJSON_AddNumberToObject(timings, "predicted_per_second",
+            gen_ms > 0 ? gen_count / (gen_ms / 1000.0) : 0.0);
+        cJSON_AddNumberToObject(timings, "predicted_ms", gen_ms);
+        cJSON_AddItemToObject(resp, "timings", timings);
+
+        char *json = cJSON_PrintUnformatted(resp);
+        http_send(sock, 200, "application/json", json);
+        free(json);
+        cJSON_Delete(resp);
+
+        fprintf(stderr, "\n[server] /completion: %d prompt tokens, %d generated in %.0fms (%.1f tok/s)\n",
+                n_prompt, gen_count, gen_ms, gen_ms > 0 ? gen_count / (gen_ms / 1000.0) : 0);
+
+        free(generated);
+        free(gen_token_ids);
+    }
+
+    printf("\n");
+    fflush(stdout);
+
+    free(ptokens);
+    tokenizer_free(&tokenizer);
+    tensor_threadpool_free();
+    model_free(&model);
+}
+
 /* ---- Request Router ---- */
 
 static void handle_request(SOCKET sock) {
@@ -582,6 +939,9 @@ static void handle_request(SOCKET sock) {
         } else if (strcmp(path, "/v1/completions") == 0) {
             int prompt_len;
             handle_completion(sock, body_start, srv.model_path, 0, &prompt_len);
+        } else if (strcmp(path, "/completion") == 0) {
+            int prompt_len;
+            handle_llama_completion(sock, body_start, srv.model_path, &prompt_len);
         } else {
             http_send(sock, 404, "application/json", "{\"error\":{\"message\":\"Not found\"}}");
         }
@@ -662,6 +1022,7 @@ int server_main(int port, const char *host, const char *model_path) {
     fprintf(stderr, "[server] Endpoints:\n");
     fprintf(stderr, "  POST /v1/chat/completions\n");
     fprintf(stderr, "  POST /v1/completions\n");
+    fprintf(stderr, "  POST /completion       (llama.cpp-style)\n");
     fprintf(stderr, "  GET  /v1/models\n");
     fprintf(stderr, "[server] Press Ctrl+C to stop\n");
 
