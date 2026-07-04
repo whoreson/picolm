@@ -6,16 +6,19 @@
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
+#define WINVER 0x0600
+#define _WIN32_WINNT 0x0600
 #include <windows.h>
+#include <synchapi.h>
 #else
 #include <pthread.h>
 #endif
 
 /* Thread pool (Windows-native or POSIX) */
 #ifdef _WIN32
-typedef HANDLE    win_thread_t;
-typedef CRITICAL_SECTION win_mutex_t;
-typedef HANDLE    win_cond_t;
+typedef HANDLE            win_thread_t;
+typedef SRWLOCK           win_mutex_t;
+typedef CONDITION_VARIABLE win_cond_t;
 #else
 typedef pthread_t  win_thread_t;
 typedef pthread_mutex_t win_mutex_t;
@@ -101,17 +104,13 @@ static matmul_task_t   pool_tasks[MAX_THREADS];
 
 /* Cross-platform mutex/cond helpers */
 #ifdef _WIN32
-/* Windows CV via manual-reset Event. Key: the BROADCASTER resets, not the waiter.
- * Waiter: release lock -> wait -> re-acquire (do NOT reset)
- * Broadcaster: set event -> yield -> reset event
- * This ensures all waiters see the signal before it's reset. */
-static void win_mutex_init(win_mutex_t *m) { InitializeCriticalSection(m); }
-static void win_mutex_lock(win_mutex_t *m) { EnterCriticalSection(m); }
-static void win_mutex_unlock(win_mutex_t *m) { LeaveCriticalSection(m); }
-static void win_cond_init(win_cond_t *c) { *c = CreateEvent(NULL, TRUE, FALSE, NULL); }
-static void win_cond_wait(win_cond_t *c, win_mutex_t *m) { LeaveCriticalSection(m); WaitForSingleObject(*c, INFINITE); EnterCriticalSection(m); }
-static void win_cond_broadcast(win_cond_t *c) { SetEvent(*c); Sleep(1); ResetEvent(*c); }
-static void win_cond_destroy(win_cond_t *c) { CloseHandle(*c); }
+static void win_mutex_init(win_mutex_t *m) { InitializeSRWLock(m); }
+static void win_mutex_lock(win_mutex_t *m) { AcquireSRWLockExclusive(m); }
+static void win_mutex_unlock(win_mutex_t *m) { ReleaseSRWLockExclusive(m); }
+static void win_cond_init(win_cond_t *c) { InitializeConditionVariable(c); }
+static void win_cond_wait(win_cond_t *c, win_mutex_t *m) { SleepConditionVariableSRW(c, m, INFINITE, 0); }
+static void win_cond_broadcast(win_cond_t *c) { WakeAllConditionVariable(c); }
+static void win_cond_destroy(win_cond_t *c) { (void)c; }
 static void win_thread_create(win_thread_t *t, DWORD (WINAPI *fn)(void*), void *arg) { *t = CreateThread(NULL, 0, fn, arg, 0, NULL); }
 static void win_thread_join(win_thread_t *t) { WaitForSingleObject(*t, INFINITE); CloseHandle(*t); }
 #else
@@ -261,7 +260,7 @@ void tensor_threadpool_free(void) {
     pool_nworkers = 0;
     win_cond_destroy(&pool_cond);
 #ifdef _WIN32
-    DeleteCriticalSection(&pool_mutex);
+    /* SRWLOCK has no destroy */
 #else
     pthread_mutex_destroy(&pool_mutex);
 #endif
