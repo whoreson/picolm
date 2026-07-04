@@ -25,11 +25,14 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <errno.h>
 #pragma comment(lib, "ws2_32.lib")
 typedef int socklen_t;
 #define SHUT_RD SD_RECEIVE
 #define SHUT_WR SD_SEND
 #define SHUT_RDWR SD_BOTH
+/* On Windows, INVALID_SOCKET is the standard way to check for error */
+#define SOCKET_INVALID INVALID_SOCKET
 #else
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -645,7 +648,12 @@ int server_main(int port, const char *host, const char *model_path) {
     }
 
     if (listen(srv.listen_sock, PICO_SERVER_BACKLOG) < 0) {
-        fprintf(stderr, "[server] Failed to listen: %s\n", strerror(errno));
+        fprintf(stderr, "[server] Failed to listen");
+#ifdef _WIN32
+        fprintf(stderr, " (WSA error %lu)\n", (unsigned long)WSAGetLastError());
+#else
+        fprintf(stderr, ": %s\n", strerror(errno));
+#endif
         closesocket(srv.listen_sock);
         return -1;
     }
@@ -669,7 +677,11 @@ int server_main(int port, const char *host, const char *model_path) {
         SOCKET client = accept(srv.listen_sock, (struct sockaddr *)&client_addr, &client_len);
         if (client == SOCKET_INVALID) {
             if (srv.running) {
+#ifdef _WIN32
+                fprintf(stderr, "[server] accept failed (WSA error %lu)\n", (unsigned long)WSAGetLastError());
+#else
                 fprintf(stderr, "[server] accept failed: %s\n", strerror(errno));
+#endif
             }
             continue;
         }
@@ -679,7 +691,11 @@ int server_main(int port, const char *host, const char *model_path) {
                 ntohs(client_addr.sin_port));
 
         /* Disable Nagle's algorithm for lower latency streaming */
+#ifdef _WIN32
+        setsockopt(client, IPPROTO_TCP, TCP_NODELAY, (const char *)&opt, (int)sizeof(opt));
+#else
         setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+#endif
 
         handle_request(client);
         closesocket(client);
