@@ -149,10 +149,21 @@ typedef struct {
     /* Runtime repacked weight buffers (for AVX2 Q4_0_8x8 optimization) */
     void       *repack_buffers[MAX_LAYERS + 4]; /* per-layer repacked data + output norms */
     int         repack_used[MAX_LAYERS + 4];    /* 1 if repacked, 0 if not */
+
+    /* Weight pinning */
+    int         locked_layers;   /* number of layers pinned in RAM (0=disabled) */
 } model_t;
 
 /* Load a GGUF model file. Returns 0 on success. */
 int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v);
+
+/* Pin layer weights in RAM. Given a budget in bytes, locks the maximum
+ * number of consecutive layers (starting from 0) plus global tensors.
+ * Returns the number of layers locked, or 0 on failure. */
+int model_lock_layers(model_t *m, size_t mem_bytes);
+
+/* Unlock previously pinned weight layers. Returns 0 on success. */
+int model_unlock_layers(model_t *m);
 
 /* Run one forward pass. Returns pointer to logits[vocab_size]. */
 float *model_forward(model_t *m, int token, int pos);

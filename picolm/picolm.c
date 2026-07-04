@@ -37,6 +37,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -s <int>       RNG seed (default: 42)\n");
     fprintf(stderr, "  -c <int>       Context length override\n");
     fprintf(stderr, "  -j <int>       Number of threads (default: 4)\n");
+    fprintf(stderr, "  --mem <MB>      Pin this many MB of layers in RAM (mlock)\n");
     fprintf(stderr, "\nAdvanced options:\n");
     fprintf(stderr, "  --json         Grammar-constrained JSON output mode\n");
     fprintf(stderr, "  --cache <file> KV cache file (saves/loads prompt state)\n");
@@ -81,6 +82,7 @@ int main(int argc, char **argv) {
     const char *cache_file = NULL;
     kv_cache_type_t kv_type_k = KV_CACHE_F16;
     kv_cache_type_t kv_type_v = KV_CACHE_F16;
+    int    mem_mb = 0;  /* --mem budget in megabytes (0=disabled) */
 
     /* Parse arguments */
     for (int i = 2; i < argc; i++) {
@@ -102,6 +104,8 @@ int main(int argc, char **argv) {
             json_mode = 1;
         } else if (strcmp(argv[i], "--cache") == 0 && i + 1 < argc) {
             cache_file = argv[++i];
+        } else if (strcmp(argv[i], "--mem") == 0 && i + 1 < argc) {
+            mem_mb = atoi(argv[++i]);
         } else if ((strcmp(argv[i], "-ctk") == 0 || strcmp(argv[i], "-ctv") == 0) && i + 1 < argc) {
             const char *typestr = argv[++i];
             kv_cache_type_t *tgt = (strcmp(argv[i-1], "-ctk") == 0) ? &kv_type_k : &kv_type_v;
@@ -165,6 +169,12 @@ int main(int argc, char **argv) {
     if (model_load(&model, model_path, context_override, kv_type_k, kv_type_v) != 0) {
         fprintf(stderr, "Failed to load model\n");
         return 1;
+    }
+
+    /* Pin layers in RAM if --mem was specified */
+    if (mem_mb > 0) {
+        size_t budget = (size_t)mem_mb * 1024 * 1024;
+        model_lock_layers(&model, budget);
     }
 
     tensor_set_threads(num_threads);
@@ -313,6 +323,8 @@ int main(int argc, char **argv) {
     }
 
     /* Cleanup */
+    if (model.locked_layers > 0)
+        model_unlock_layers(&model);
     grammar_free(&grammar);
     free(prompt_tokens);
     free(stdin_prompt);
