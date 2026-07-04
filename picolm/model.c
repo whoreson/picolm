@@ -863,7 +863,15 @@ float *model_forward(model_t *m, int token, int pos) {
                 quantize_row_q4_0(k_head, key_pos, head_dim);
             } else {
                 uint16_t *kf = (uint16_t *)key_pos;
+#ifdef PICOLM_FP16_HW
+                { int d = 0;
+                  for (; d + 3 < head_dim; d += 4)
+                      f32x4_to_fp16_hw(kf + d, vld1q_f32(k_head + d));
+                  for (; d < head_dim; d++) kf[d] = fp32_to_fp16(k_head[d]);
+                }
+#else
                 for (int d = 0; d < head_dim; d++) kf[d] = fp32_to_fp16(k_head[d]);
+#endif
             }
         }
 
@@ -882,7 +890,15 @@ float *model_forward(model_t *m, int token, int pos) {
                 quantize_row_q4_0(v_head, val_pos, head_dim);
             } else {
                 uint16_t *vf = (uint16_t *)val_pos;
+#ifdef PICOLM_FP16_HW
+                { int d = 0;
+                  for (; d + 3 < head_dim; d += 4)
+                      f32x4_to_fp16_hw(vf + d, vld1q_f32(v_head + d));
+                  for (; d < head_dim; d++) vf[d] = fp32_to_fp16(v_head[d]);
+                }
+#else
                 for (int d = 0; d < head_dim; d++) vf[d] = fp32_to_fp16(v_head[d]);
+#endif
             }
         }
 
@@ -945,9 +961,20 @@ float *model_forward(model_t *m, int token, int pos) {
                         fma_scale_q4_0_f32(acc, correction, vt, head_dim);
                     } else {
                         const uint16_t *vt16 = (const uint16_t *)vt;
+#ifdef PICOLM_FP16_HW
+                        { float32x4_t cv = vdupq_n_f32(correction); int d = 0;
+                          for (; d + 3 < head_dim; d += 4) {
+                              float32x4_t a = vld1q_f32(acc + d);
+                              vst1q_f32(acc + d, vmlaq_f32(fp16x4_to_f32_hw(vt16 + d), a, cv));
+                          }
+                          for (; d < head_dim; d++)
+                              acc[d] = acc[d] * correction + fp16_to_fp32(vt16[d]);
+                        }
+#else
                         for (int d = 0; d < head_dim; d++) {
                             acc[d] = acc[d] * correction + fp16_to_fp32(vt16[d]);
                         }
+#endif
                     }
                     max_score = score;
                 } else {
@@ -960,9 +987,20 @@ float *model_forward(model_t *m, int token, int pos) {
                         scale_add_q4_0_f32(acc, w, vt, head_dim);
                     } else {
                         const uint16_t *vt16 = (const uint16_t *)vt;
+#ifdef PICOLM_FP16_HW
+                        { float32x4_t wv = vdupq_n_f32(w); int d = 0;
+                          for (; d + 3 < head_dim; d += 4) {
+                              float32x4_t a = vld1q_f32(acc + d);
+                              vst1q_f32(acc + d, vmlaq_f32(a, fp16x4_to_f32_hw(vt16 + d), wv));
+                          }
+                          for (; d < head_dim; d++)
+                              acc[d] += w * fp16_to_fp32(vt16[d]);
+                        }
+#else
                         for (int d = 0; d < head_dim; d++) {
                             acc[d] += w * fp16_to_fp32(vt16[d]);
                         }
+#endif
                     }
                 }
             }

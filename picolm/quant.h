@@ -40,6 +40,23 @@ static inline float vaddvq_f32_compat(float32x4_t v) {
 /* --- ARM NEON detection --- */
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #  define PICOLM_NEON 1
+/* Hardware FP16 vector conversion (ARMv8.2-A asimdhp).
+ * On older NEON hardware (ARMv8.0/8.1), this path is not available and
+ * the scalar fp16_to_fp32 lookup table is used instead. */
+#  if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+#    define PICOLM_FP16_HW 1
+#    include <arm_acle.h>
+#  endif
+#endif
+
+/* FP16 hardware conversion helpers (ARMv8.2-A only) */
+#if defined(PICOLM_FP16_HW)
+static inline float32x4_t fp16x4_to_f32_hw(const uint16_t *p) {
+    return vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(p)));
+}
+static inline void f32x4_to_fp16_hw(uint16_t *p, float32x4_t v) {
+    vst1_u16(p, vreinterpret_u16_f16(vcvt_f16_f32(v)));
+}
 #endif
 
 /* --- x86 SIMD: detect highest level, then propagate downward --- */
