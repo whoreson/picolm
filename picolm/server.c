@@ -173,6 +173,136 @@ static void handle_list_models(SOCKET sock, const char *model_path) {
     cJSON_Delete(root);
 }
 
+/* ---- Endpoint: GET /props ---- */
+
+static void handle_props(SOCKET sock, const char *model_path) {
+    fp16_table_init();
+    model_t model;
+    if (model_load(&model, model_path, 0, KV_CACHE_F16, KV_CACHE_F16) != 0) {
+        http_send(sock, 500, "application/json", "{\"error\":\"Failed to load model\"}");
+        return;
+    }
+
+    /* Get the base filename from the path */
+    const char *fname = model_path;
+    const char *slash = strrchr(model_path, '/');
+    if (!slash) slash = strrchr(model_path, '\\');
+    if (slash) fname = slash + 1;
+
+    cJSON *root = cJSON_CreateObject();
+
+    /* default_generation_settings */
+    cJSON *dgs = cJSON_CreateObject();
+    cJSON *params = cJSON_CreateObject();
+
+    cJSON_AddNumberToObject(params, "seed", 4294967295);
+    cJSON_AddNumberToObject(params, "temperature", 1.0);
+    cJSON_AddNumberToObject(params, "dynatemp_range", 0.0);
+    cJSON_AddNumberToObject(params, "dynatemp_exponent", 1.0);
+    cJSON_AddNumberToObject(params, "top_k", 40);
+    cJSON_AddNumberToObject(params, "top_p", 0.95);
+    cJSON_AddNumberToObject(params, "min_p", 0.05);
+    cJSON_AddNumberToObject(params, "top_n_sigma", -1.0);
+    cJSON_AddNumberToObject(params, "xtc_probability", 0.0);
+    cJSON_AddNumberToObject(params, "xtc_threshold", 0.1);
+    cJSON_AddNumberToObject(params, "typical_p", 1.0);
+    cJSON_AddNumberToObject(params, "repeat_last_n", 64);
+    cJSON_AddNumberToObject(params, "repeat_penalty", 1.1);
+    cJSON_AddNumberToObject(params, "presence_penalty", 0.0);
+    cJSON_AddNumberToObject(params, "frequency_penalty", 0.0);
+    cJSON_AddNumberToObject(params, "dry_multiplier", 0.0);
+    cJSON_AddNumberToObject(params, "dry_base", 1.75);
+    cJSON_AddNumberToObject(params, "dry_allowed_length", 2);
+    cJSON_AddNumberToObject(params, "dry_penalty_last_n", -1);
+    cJSON_AddNumberToObject(params, "mirostat", 0);
+    cJSON_AddNumberToObject(params, "mirostat_tau", 5.0);
+    cJSON_AddNumberToObject(params, "mirostat_eta", 0.1);
+    cJSON_AddNumberToObject(params, "max_tokens", -1);
+    cJSON_AddNumberToObject(params, "n_predict", -1);
+    cJSON_AddNumberToObject(params, "n_keep", 0);
+    cJSON_AddNumberToObject(params, "n_discard", 0);
+    cJSON_AddBoolToObject(params, "ignore_eos", 0);
+    cJSON_AddBoolToObject(params, "stream", 0);
+    cJSON_AddNumberToObject(params, "n_probs", 0);
+    cJSON_AddNumberToObject(params, "min_keep", 0);
+    cJSON_AddStringToObject(params, "chat_format", "Content-only");
+    cJSON_AddStringToObject(params, "reasoning_format", "none");
+    cJSON_AddBoolToObject(params, "reasoning_in_content", 0);
+    cJSON_AddStringToObject(params, "generation_prompt", "");
+    cJSON_AddNumberToObject(params, "timings_per_token", 0);
+    cJSON_AddNumberToObject(params, "post_sampling_probs", 0);
+    cJSON_AddNumberToObject(params, "backend_sampling", 0);
+    cJSON_AddNumberToObject(params, "lora", 0);
+    cJSON_AddItemToObject(dgs, "params", params);
+
+    /* n_ctx from model config */
+    cJSON_AddNumberToObject(dgs, "n_ctx", model.config.max_seq_len);
+    cJSON_AddItemToObject(root, "default_generation_settings", dgs);
+
+    /* Model metadata */
+    cJSON_AddNumberToObject(root, "total_slots", 1);
+    cJSON_AddStringToObject(root, "model_alias", fname);
+    cJSON_AddStringToObject(root, "model_path", model_path);
+
+    /* Modalities */
+    cJSON *modalities = cJSON_CreateObject();
+    cJSON_AddBoolToObject(modalities, "vision", 0);
+    cJSON_AddBoolToObject(modalities, "audio", 0);
+    cJSON_AddItemToObject(root, "modalities", modalities);
+
+    /* Media marker (placeholder) */
+    cJSON_AddStringToObject(root, "media_marker", "<__media__>");
+
+    /* Endpoints */
+    cJSON_AddBoolToObject(root, "endpoint_slots", 0);
+    cJSON_AddBoolToObject(root, "endpoint_props", 1);
+    cJSON_AddBoolToObject(root, "endpoint_metrics", 0);
+    cJSON_AddBoolToObject(root, "webui", 0);
+    cJSON_AddNumberToObject(root, "webui_settings", 0);
+
+    /* Chat template - generic template based on model's tokenizer */
+    /* We don't have a proper Jinja2 chat template, use a simple one */
+    const char *chat_tpl = "{% if messages %}{% for message in messages %}{{ '### ' + message.role + '\\n' + message.content + '\\n\\n' }}{% endfor %}{% if add_generation_prompt %}### assistant\\n{% endif %}{% endif %}";
+    cJSON_AddStringToObject(root, "chat_template", chat_tpl);
+
+    /* chat_template_caps */
+    cJSON *caps = cJSON_CreateObject();
+    cJSON_AddBoolToObject(caps, "supports_object_arguments", 0);
+    cJSON_AddBoolToObject(caps, "supports_parallel_tool_calls", 0);
+    cJSON_AddBoolToObject(caps, "supports_preserve_reasoning", 0);
+    cJSON_AddBoolToObject(caps, "supports_string_content", 1);
+    cJSON_AddBoolToObject(caps, "supports_system_role", 1);
+    cJSON_AddBoolToObject(caps, "supports_tool_calls", 0);
+    cJSON_AddBoolToObject(caps, "supports_tools", 0);
+    cJSON_AddBoolToObject(caps, "supports_typed_content", 0);
+    cJSON_AddItemToObject(root, "chat_template_caps", caps);
+
+    /* BOS/EOS tokens */
+    tokenizer_t tokenizer;
+    if (tokenizer_load(&tokenizer, &model) == 0) {
+        char bos_buf[32], eos_buf[32];
+        snprintf(bos_buf, sizeof(bos_buf), "<bos_id=%d>", tokenizer.bos_id);
+        cJSON_AddStringToObject(root, "bos_token", bos_buf);
+        snprintf(eos_buf, sizeof(eos_buf), "<eos_id=%d>", tokenizer.eos_id);
+        cJSON_AddStringToObject(root, "eos_token", eos_buf);
+        tokenizer_free(&tokenizer);
+    } else {
+        cJSON_AddStringToObject(root, "bos_token", "<unknown>");
+        cJSON_AddStringToObject(root, "eos_token", "<unknown>");
+    }
+
+    /* Build info */
+    cJSON_AddStringToObject(root, "build_info", "picolm");
+    cJSON_AddBoolToObject(root, "is_sleeping", 0);
+
+    char *json = cJSON_PrintUnformatted(root);
+    http_send(sock, 200, "application/json", json);
+    free(json);
+    cJSON_Delete(root);
+
+    model_free(&model);
+}
+
 /* ---- Build prompt from chat messages or raw text ---- */
 
 /* Convert chat messages to a prompt string.
@@ -927,6 +1057,8 @@ static void handle_request(SOCKET sock) {
     if (strcmp(method, "GET") == 0) {
         if (strcmp(path, "/v1/models") == 0) {
             handle_list_models(sock, srv.model_path);
+        } else if (strcmp(path, "/props") == 0 || strcmp(path, "/v1/props") == 0) {
+            handle_props(sock, srv.model_path);
         } else if (strcmp(path, "/") == 0 || strcmp(path, "/health") == 0) {
             http_send(sock, 200, "text/plain", "PicoLM server running\n");
         } else {
@@ -1024,6 +1156,7 @@ int server_main(int port, const char *host, const char *model_path) {
     fprintf(stderr, "  POST /v1/completions\n");
     fprintf(stderr, "  POST /completion       (llama.cpp-style)\n");
     fprintf(stderr, "  GET  /v1/models\n");
+    fprintf(stderr, "  GET  /props            (server properties)\n");
     fprintf(stderr, "[server] Press Ctrl+C to stop\n");
 
     /* Signal handler for graceful shutdown */
