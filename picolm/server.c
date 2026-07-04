@@ -117,6 +117,15 @@ static struct _server_state {
     int running;
     char recv_buf[65536];
     SOCKET sock_in_buf;
+
+    /* Persistent model state (loaded once, reused across requests) */
+    int model_loaded;
+    model_t model;
+    tokenizer_t tokenizer;
+    int kv_pos;                /* current KV cache position for prompt caching */
+    int *last_prompt_tokens;   /* cached prompt tokens for reuse */
+    int last_prompt_len;       /* number of cached prompt tokens */
+    int max_last_prompt;       /* allocated size of last_prompt_tokens */
 } srv;
 
 /* Parse HTTP request line: "METHOD /path HTTP/1.1" */
@@ -153,6 +162,48 @@ static int http_parse_request(char *buf, int len, char *method, int mlen, char *
 
 /* ---- Endpoint: GET /v1/models ---- */
 
+/* ---- Server init / free (persistent model) ---- */
+
+static int server_init(const char *model_path) {
+    fprintf(stderr, "[server] Loading model: %s\n", model_path);
+    fp16_table_init();
+
+    if (model_load(&srv.model, model_path, 0, KV_CACHE_F16, KV_CACHE_F16) != 0) {
+        fprintf(stderr, "[server] Failed to load model\n");
+        return -1;
+    }
+
+    tensor_set_threads(4);
+    tensor_threadpool_init(4);
+
+    if (tokenizer_load(&srv.tokenizer, &srv.model) != 0) {
+        fprintf(stderr, "[server] Failed to load tokenizer\n");
+        model_free(&srv.model);
+        return -1;
+    }
+
+    srv.model_loaded = 1;
+    srv.kv_pos = 0;
+    srv.last_prompt_len = 0;
+    srv.last_prompt_tokens = NULL;
+    srv.max_last_prompt = 0;
+    return 0;
+}
+
+static void server_free(void) {
+    if (srv.model_loaded) {
+        tokenizer_free(&srv.tokenizer);
+        tensor_threadpool_free();
+        model_free(&srv.model);
+        srv.model_loaded = 0;
+    }
+    free(srv.last_prompt_tokens);
+    srv.last_prompt_tokens = NULL;
+    srv.max_last_prompt = 0;
+}
+
+/* ---- Endpoints ---- */
+
 static void handle_list_models(SOCKET sock, const char *model_path) {
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "object", "list");
@@ -175,23 +226,21 @@ static void handle_list_models(SOCKET sock, const char *model_path) {
 
 /* ---- Endpoint: GET /props ---- */
 
-static void handle_props(SOCKET sock, const char *model_path) {
-    fp16_table_init();
-    model_t model;
-    if (model_load(&model, model_path, 0, KV_CACHE_F16, KV_CACHE_F16) != 0) {
-        http_send(sock, 500, "application/json", "{\"error\":\"Failed to load model\"}");
+static void handle_props(SOCKET sock) {
+    if (!srv.model_loaded) {
+        http_send(sock, 503, "application/json", "{\"error\":\"Model not loaded\"}");
         return;
     }
+    model_t *model = &srv.model;
+    tokenizer_t *tokenizer = &srv.tokenizer;
 
-    /* Get the base filename from the path */
-    const char *fname = model_path;
-    const char *slash = strrchr(model_path, '/');
-    if (!slash) slash = strrchr(model_path, '\\');
+    const char *fname = srv.model_path;
+    const char *slash = strrchr(srv.model_path, '/');
+    if (!slash) slash = strrchr(srv.model_path, '\\');
     if (slash) fname = slash + 1;
 
     cJSON *root = cJSON_CreateObject();
 
-    /* default_generation_settings */
     cJSON *dgs = cJSON_CreateObject();
     cJSON *params = cJSON_CreateObject();
 
@@ -236,13 +285,13 @@ static void handle_props(SOCKET sock, const char *model_path) {
     cJSON_AddItemToObject(dgs, "params", params);
 
     /* n_ctx from model config */
-    cJSON_AddNumberToObject(dgs, "n_ctx", model.config.max_seq_len);
+    cJSON_AddNumberToObject(dgs, "n_ctx", model->config.max_seq_len);
     cJSON_AddItemToObject(root, "default_generation_settings", dgs);
 
     /* Model metadata */
     cJSON_AddNumberToObject(root, "total_slots", 1);
     cJSON_AddStringToObject(root, "model_alias", fname);
-    cJSON_AddStringToObject(root, "model_path", model_path);
+    cJSON_AddStringToObject(root, "model_path", srv.model_path);
 
     /* Modalities */
     cJSON *modalities = cJSON_CreateObject();
@@ -278,17 +327,12 @@ static void handle_props(SOCKET sock, const char *model_path) {
     cJSON_AddItemToObject(root, "chat_template_caps", caps);
 
     /* BOS/EOS tokens */
-    tokenizer_t tokenizer;
-    if (tokenizer_load(&tokenizer, &model) == 0) {
+    {
         char bos_buf[32], eos_buf[32];
-        snprintf(bos_buf, sizeof(bos_buf), "<bos_id=%d>", tokenizer.bos_id);
+        snprintf(bos_buf, sizeof(bos_buf), "<bos_id=%d>", tokenizer->bos_id);
         cJSON_AddStringToObject(root, "bos_token", bos_buf);
-        snprintf(eos_buf, sizeof(eos_buf), "<eos_id=%d>", tokenizer.eos_id);
+        snprintf(eos_buf, sizeof(eos_buf), "<eos_id=%d>", tokenizer->eos_id);
         cJSON_AddStringToObject(root, "eos_token", eos_buf);
-        tokenizer_free(&tokenizer);
-    } else {
-        cJSON_AddStringToObject(root, "bos_token", "<unknown>");
-        cJSON_AddStringToObject(root, "eos_token", "<unknown>");
     }
 
     /* Build info */
@@ -299,8 +343,6 @@ static void handle_props(SOCKET sock, const char *model_path) {
     http_send(sock, 200, "application/json", json);
     free(json);
     cJSON_Delete(root);
-
-    model_free(&model);
 }
 
 /* ---- Build prompt from chat messages or raw text ---- */
@@ -361,10 +403,9 @@ static char *chat_to_prompt(cJSON *messages, const char *system_template) {
 
 /* ---- Endpoint: POST /v1/completions and /v1/chat/completions ---- */
 
-static void handle_completion(SOCKET sock, const char *request_body,
-                              const char *model_path, int is_chat,
-                              int *out_prompt_len) {
-    *out_prompt_len = 0;
+static void handle_completion(SOCKET sock, const char *request_body, int is_chat) {
+    model_t *model = &srv.model;
+    tokenizer_t *tokenizer = &srv.tokenizer;
 
     cJSON *req = cJSON_ParseWithLength(request_body, strlen(request_body));
     if (!req) {
@@ -372,9 +413,9 @@ static void handle_completion(SOCKET sock, const char *request_body,
         return;
     }
 
-    /* Extract parameters */
     const char *prompt = NULL;
     char *chat_prompt = NULL;
+    char *raw_prompt_copy = NULL;
     int max_tokens = 256;
     float temperature = 0.8f;
     float top_p = 0.9f;
@@ -384,109 +425,105 @@ static void handle_completion(SOCKET sock, const char *request_body,
     const char *model_name = NULL;
 
     if (is_chat) {
-        /* Chat completions */
         cJSON *messages = cJSON_GetObjectItem(req, "messages");
         if (!messages || !cJSON_IsArray(messages) || cJSON_GetArraySize(messages) == 0) {
-            char *err = "{\"error\":{\"message\":\"'messages' must be a non-empty array\"}}";
-            http_send(sock, 400, "application/json", err);
+            http_send(sock, 400, "application/json", "{\"error\":{\"message\":\"'messages' required\"}}");
             cJSON_Delete(req);
             return;
         }
-
-        /* Optional system prompt template */
         const char *sys_template = NULL;
-        cJSON *system_template_item = cJSON_GetObjectItem(req, "system_template");
-        if (system_template_item)
-            sys_template = cJSON_GetStringValue(system_template_item);
+        cJSON *sti = cJSON_GetObjectItem(req, "system_template");
+        if (sti) sys_template = cJSON_GetStringValue(sti);
 
         chat_prompt = chat_to_prompt(messages, sys_template);
         if (!chat_prompt) {
-            char *err = "{\"error\":{\"message\":\"Failed to build prompt\"}}";
-            http_send(sock, 400, "application/json", err);
+            http_send(sock, 400, "application/json", "{\"error\":{\"message\":\"Failed to build prompt\"}}");
             cJSON_Delete(req);
             return;
         }
         prompt = chat_prompt;
     } else {
-        /* Raw completions */
         cJSON *p = cJSON_GetObjectItem(req, "prompt");
         if (!p || !cJSON_IsString(p)) {
-            char *err = "{\"error\":{\"message\":\"'prompt' must be a string\"}}";
-            http_send(sock, 400, "application/json", err);
+            http_send(sock, 400, "application/json", "{\"error\":{\"message\":\"'prompt' required\"}}");
             cJSON_Delete(req);
             return;
         }
-        prompt = cJSON_GetStringValue(p);
-    }
-
-    /* Optional parameters */
-    cJSON *mt = cJSON_GetObjectItem(req, "max_tokens");
-    if (mt) max_tokens = (int)cJSON_GetNumberValue(mt);
-    if (max_tokens <= 0) max_tokens = 256;
-
-    cJSON *temp = cJSON_GetObjectItem(req, "temperature");
-    if (temp) temperature = (float)cJSON_GetNumberValue(temp);
-
-    cJSON *tp = cJSON_GetObjectItem(req, "top_p");
-    if (tp) top_p = (float)cJSON_GetNumberValue(tp);
-
-    cJSON *sd = cJSON_GetObjectItem(req, "seed");
-    if (sd) seed = (uint64_t)cJSON_GetNumberValue(sd);
-
-    cJSON *stream = cJSON_GetObjectItem(req, "stream");
-    if (stream && cJSON_IsTrue(stream)) do_stream = 1;
-
-    cJSON *n_item = cJSON_GetObjectItem(req, "n");
-    if (n_item) n_choices = (int)cJSON_GetNumberValue(n_item);
-    if (n_choices < 1) n_choices = 1;
-    if (n_choices > 4) n_choices = 4;
-
-    cJSON *model_item = cJSON_GetObjectItem(req, "model");
-    if (model_item) model_name = cJSON_GetStringValue(model_item);
-
-    /* Copy prompt for raw completions (chat_prompt is already malloc'd via chat_to_prompt) */
-    char *raw_prompt_copy = NULL;
-    if (!is_chat && prompt) {
-        raw_prompt_copy = (char *)malloc(strlen(prompt) + 1);
-        strcpy(raw_prompt_copy, prompt);
+        raw_prompt_copy = (char *)malloc(strlen(cJSON_GetStringValue(p)) + 1);
+        strcpy(raw_prompt_copy, cJSON_GetStringValue(p));
         prompt = raw_prompt_copy;
     }
+
+    cJSON *item;
+    if ((item = cJSON_GetObjectItem(req, "max_tokens"))) max_tokens = (int)cJSON_GetNumberValue(item);
+    if (max_tokens <= 0) max_tokens = 256;
+    if ((item = cJSON_GetObjectItem(req, "temperature"))) temperature = (float)cJSON_GetNumberValue(item);
+    if ((item = cJSON_GetObjectItem(req, "top_p"))) top_p = (float)cJSON_GetNumberValue(item);
+    if ((item = cJSON_GetObjectItem(req, "seed"))) seed = (uint64_t)cJSON_GetNumberValue(item);
+    if ((item = cJSON_GetObjectItem(req, "stream")) && cJSON_IsTrue(item)) do_stream = 1;
+    if ((item = cJSON_GetObjectItem(req, "n"))) n_choices = (int)cJSON_GetNumberValue(item);
+    if (n_choices < 1) n_choices = 1;
+    if (n_choices > 4) n_choices = 4;
+    if ((item = cJSON_GetObjectItem(req, "model"))) model_name = cJSON_GetStringValue(item);
     cJSON_Delete(req);
-
-    /* Load model */
-    fprintf(stderr, "[server] Loading model: %s\n", model_path);
-    model_t model;
-    fp16_table_init();
-    if (model_load(&model, model_path, 0, KV_CACHE_F16, KV_CACHE_F16) != 0) {
-        free(chat_prompt);
-        char *err = "{\"error\":{\"message\":\"Failed to load model\"}}";
-        http_send(sock, 500, "application/json", err);
-        return;
-    }
-
-    tensor_set_threads(4);
-    tensor_threadpool_init(4);
-
-    tokenizer_t tokenizer;
-    if (tokenizer_load(&tokenizer, &model) != 0) {
-        free(chat_prompt);
-        model_free(&model);
-        char *err = "{\"error\":{\"message\":\"Failed to load tokenizer\"}}";
-        http_send(sock, 500, "application/json", err);
-        return;
-    }
 
     /* Encode prompt */
     int max_pt = (int)strlen(prompt) + 3;
     int *ptokens = (int *)malloc((size_t)max_pt * sizeof(int));
-    int n_prompt = tokenizer_encode(&tokenizer, prompt, ptokens, max_pt, 1);
-    *out_prompt_len = n_prompt;
+    int n_prompt = tokenizer_encode(tokenizer, prompt, ptokens, max_pt, 1);
 
-    int total_prompt_tokens = 0;
+    /* Prompt caching: find shared prefix with last request */
+    int cache_start = 0;
+    if (srv.last_prompt_tokens) {
+        int min_len = n_prompt < srv.last_prompt_len ? n_prompt : srv.last_prompt_len;
+        for (cache_start = 0; cache_start < min_len; cache_start++) {
+            if (ptokens[cache_start] != srv.last_prompt_tokens[cache_start]) break;
+        }
+    }
+    /* If cache_start > 0, positions 0..cache_start-1 are already in the KV cache */
+    /* If cache_start == 0 or prompt diverges, we reset from scratch */
+    int start_pos = 0; // cache disabled
+    if (start_pos == 0) {
+        /* Reset KV cache for a completely new request */
+        srv.kv_pos = 0;
+    }
+
+    /* Save prompt tokens for next request */
+    if (n_prompt > srv.max_last_prompt) {
+        srv.max_last_prompt = n_prompt * 2;
+        srv.last_prompt_tokens = (int *)realloc(srv.last_prompt_tokens, (size_t)srv.max_last_prompt * sizeof(int));
+    }
+    memcpy(srv.last_prompt_tokens, ptokens, (size_t)n_prompt * sizeof(int));
+    srv.last_prompt_len = n_prompt;
+
+    /* Helper: send SSE chunk */
+    void send_chunk(SOCKET sk, const char *content, const char *role, int is_done) {
+        cJSON *chunk = cJSON_CreateObject();
+        cJSON *choice = cJSON_CreateObject();
+        cJSON *delta = cJSON_CreateObject();
+        if (role && role[0]) cJSON_AddStringToObject(delta, "role", role);
+        cJSON_AddStringToObject(delta, "content", content);
+        cJSON_AddItemToObject(choice, "delta", delta);
+        cJSON_AddNumberToObject(choice, "index", 0);
+        cJSON_AddStringToObject(choice, "finish_reason", is_done ? "stop" : "");
+        if (!is_chat) cJSON_AddStringToObject(choice, "text", content);
+        cJSON *choices = cJSON_CreateArray();
+        cJSON_AddItemToArray(choices, choice);
+        cJSON_AddItemToObject(chunk, "choices", choices);
+        cJSON_AddStringToObject(chunk, "id", is_chat ? "chatcmpl-pico" : "cmpl-pico");
+        cJSON_AddStringToObject(chunk, "object", is_chat ? "chat.completion.chunk" : "text_completion");
+        cJSON_AddNumberToObject(chunk, "created", (double)(time(NULL)));
+        if (model_name) cJSON_AddStringToObject(chunk, "model", model_name);
+        char *json = cJSON_PrintUnformatted(chunk);
+        sse_send(sk, json, NULL);
+        free(json);
+        cJSON_Delete(chunk);
+    }
+
+    int total_prompt_tokens = n_prompt;
     int total_generation_tokens = 0;
 
     if (do_stream) {
-        /* Streaming response: SSE */
         char hdr[256];
         snprintf(hdr, sizeof(hdr),
             "HTTP/1.1 200 OK\r\n"
@@ -497,146 +534,78 @@ static void handle_completion(SOCKET sock, const char *request_body,
             "\r\n");
         send(sock, hdr, strlen(hdr), 0);
 
-        /* Generate one choice */
         sampler_t sampler;
         sampler_init(&sampler, temperature, top_p, seed);
 
-        int token = ptokens[0];
+        int token = start_pos > 0 ? ptokens[start_pos - 1] : ptokens[0];
         double t_start = get_time_ms();
 
-        for (int pos = 0; pos < n_prompt + max_tokens; pos++) {
-            float *logits = model_forward(&model, token, pos);
+        for (int pos = start_pos; pos < n_prompt + max_tokens; pos++) {
+            float *logits = model_forward(model, token, pos);
 
             if (pos < n_prompt - 1) {
                 token = ptokens[pos + 1];
                 continue;
             }
 
-            int next = sampler_sample(&sampler, logits, model.config.vocab_size);
-
-            const char *piece = tokenizer_decode(&tokenizer, token, next);
+            int next = sampler_sample(&sampler, logits, model->config.vocab_size);
+            const char *piece = tokenizer_decode(tokenizer, token, next);
             if (!piece) piece = "";
 
-            /* Build SSE chunk */
-            cJSON *chunk = cJSON_CreateObject();
-            cJSON *choice = cJSON_CreateObject();
-            cJSON *delta = cJSON_CreateObject();
-
-            if (pos == n_prompt - 1) {
-                cJSON_AddStringToObject(delta, "role", is_chat ? "assistant" : "");
-                if (!is_chat)
-                    cJSON_AddStringToObject(delta, "content", "");
-            }
-            cJSON_AddStringToObject(delta, "content", is_chat ? piece : "");
-
-            if (!is_chat) {
-                cJSON_AddStringToObject(choice, "text", piece);
-            }
-
-            cJSON_AddItemToObject(choice, "delta", delta);
-            cJSON_AddNumberToObject(choice, "index", 0);
-            cJSON_AddStringToObject(choice, "finish_reason", next == (int)tokenizer.eos_id ? "stop" : "");
-            cJSON *choices = cJSON_CreateArray();
-            cJSON_AddItemToArray(choices, choice);
-            cJSON_AddItemToObject(chunk, "choices", choices);
-
-            if (is_chat) {
-                cJSON_AddStringToObject(chunk, "id", "chatcmpl-pico");
-                cJSON_AddStringToObject(chunk, "object", "chat.completion.chunk");
-                cJSON_AddNumberToObject(chunk, "created", (double)(time(NULL)));
-                cJSON_AddStringToObject(chunk, "model", model_name ? model_name : "pico");
-            } else {
-                cJSON_AddStringToObject(chunk, "id", "cmpl-pico");
-                cJSON_AddStringToObject(chunk, "object", "text_completion");
-                cJSON_AddNumberToObject(chunk, "created", (double)(time(NULL)));
-                cJSON_AddStringToObject(chunk, "model", model_name ? model_name : "pico");
-            }
-
-            char *json = cJSON_PrintUnformatted(chunk);
-            sse_send(sock, json, NULL);
-            fflush(stdout); /* flush stdout for any debug prints */
-            free(json);
-            cJSON_Delete(chunk);
-
+            send_chunk(sock, piece, pos == start_pos ? (is_chat ? "assistant" : "") : NULL, 0);
             total_generation_tokens++;
             printf("%s", piece);
             fflush(stdout);
 
-            if (next == (int)tokenizer.eos_id) break;
+            if (next == (int)tokenizer->eos_id) break;
             token = next;
         }
 
         double t_end = get_time_ms();
-        total_prompt_tokens = n_prompt;
-
-        /* Send final [DONE] chunk */
-        cJSON *done = cJSON_CreateObject();
-        cJSON *choice = cJSON_CreateObject();
-        cJSON *delta = cJSON_CreateObject();
-        cJSON_AddStringToObject(delta, "content", "");
-        cJSON_AddItemToObject(choice, "delta", delta);
-        cJSON_AddNumberToObject(choice, "index", 0);
-        cJSON_AddStringToObject(choice, "finish_reason", "stop");
-        cJSON_AddItemToObject(done, "choices", choice);
-        cJSON_AddStringToObject(done, "id", is_chat ? "chatcmpl-pico" : "cmpl-pico");
-        cJSON_AddStringToObject(done, "object", is_chat ? "chat.completion.chunk" : "text_completion");
-        cJSON_AddNumberToObject(done, "created", (double)(time(NULL)));
-        if (model_name) cJSON_AddStringToObject(done, "model", model_name);
-        /* Usage */
-        cJSON *usage = cJSON_CreateObject();
-        cJSON_AddNumberToObject(usage, "prompt_tokens", total_prompt_tokens);
-        cJSON_AddNumberToObject(usage, "completion_tokens", total_generation_tokens);
-        cJSON_AddNumberToObject(usage, "total_tokens", total_prompt_tokens + total_generation_tokens);
-        cJSON_AddItemToObject(done, "usage", usage);
-
-        char *json = cJSON_PrintUnformatted(done);
-        sse_send(sock, json, NULL);
+        send_chunk(sock, "", NULL, 1);
         send(sock, "data: [DONE]\r\n\r\n", 16, 0);
-        free(json);
-        cJSON_Delete(done);
 
-        fprintf(stderr, "\n[server] Prefill: %d tokens, "
-                        "Gen: %d tokens in %.2fs (%.1f tok/s)\n",
-                total_prompt_tokens,
-                total_generation_tokens,
-                (t_end - t_start) / 1000.0,
-                (t_end - t_start) > 0 ? (double)total_generation_tokens / ((t_end - t_start) / 1000.0) : 0.0);
+        srv.kv_pos = start_pos + (n_prompt - start_pos - 1 > 0 ? n_prompt - start_pos - 1 : 0) + total_generation_tokens;
+        fprintf(stderr, "\n[server] OAI stream: cached=%d/%d prompt, %d gen in %.0fms (%.1f tok/s)\n",
+                start_pos, n_prompt, total_generation_tokens, t_end - t_start,
+                (t_end - t_start) > 0 ? total_generation_tokens / ((t_end - t_start) / 1000.0) : 0.0);
     } else {
-        /* Non-streaming: collect all tokens, build JSON response */
+        /* Non-streaming */
         cJSON *root = cJSON_CreateObject();
         cJSON *choices = cJSON_CreateArray();
 
         for (int c = 0; c < n_choices; c++) {
-            /* Reset KV cache between choices (reload model state) */
-            /* For simplicity, we just generate sequentially with the same model */
             sampler_t sampler;
             sampler_init(&sampler, temperature, top_p, seed + (uint64_t)c);
 
-            int token = ptokens[0];
-            char *generated = (char *)malloc(max_tokens * 100); /* generous buffer */
-            if (!generated) { free(chat_prompt); free(ptokens); model_free(&model); tokenizer_free(&tokenizer);
-                http_send(sock, 500, "application/json", "{\"error\":{\"message\":\"OOM\"}}"); return; }
+            int token = start_pos > 0 ? ptokens[start_pos - 1] : ptokens[0];
+            char *generated = (char *)malloc((size_t)max_tokens * 100 + 1);
+            if (!generated) {
+                free(chat_prompt); free(raw_prompt_copy); free(ptokens);
+                http_send(sock, 500, "application/json", "{\"error\":{\"message\":\"OOM\"}}");
+                return;
+            }
             generated[0] = '\0';
             int gen_count = 0;
             const char *finish_reason = "stop";
 
-            for (int pos = 0; pos < n_prompt + max_tokens; pos++) {
-                float *logits = model_forward(&model, token, pos);
+            for (int pos = start_pos; pos < n_prompt + max_tokens; pos++) {
+                float *logits = model_forward(model, token, pos);
 
                 if (pos < n_prompt - 1) {
                     token = ptokens[pos + 1];
                     continue;
                 }
 
-                int next = sampler_sample(&sampler, logits, model.config.vocab_size);
-                const char *piece = tokenizer_decode(&tokenizer, token, next);
+                int next = sampler_sample(&sampler, logits, model->config.vocab_size);
+                const char *piece = tokenizer_decode(tokenizer, token, next);
                 if (!piece) piece = "";
                 strncat(generated, piece, max_tokens * 100 - strlen(generated) - 1);
                 gen_count++;
                 printf("%s", piece);
                 fflush(stdout);
 
-                if (next == (int)tokenizer.eos_id) { finish_reason = "stop"; break; }
+                if (next == (int)tokenizer->eos_id) { finish_reason = "stop"; break; }
                 if (gen_count >= max_tokens) { finish_reason = "length"; break; }
                 token = next;
             }
@@ -656,7 +625,6 @@ static void handle_completion(SOCKET sock, const char *request_body,
             cJSON_AddItemToArray(choices, choice);
             free(generated);
         }
-        total_prompt_tokens = n_prompt;
 
         cJSON_AddItemToObject(root, "choices", choices);
         cJSON_AddStringToObject(root, "id", is_chat ? "chatcmpl-pico" : "cmpl-pico");
@@ -665,7 +633,6 @@ static void handle_completion(SOCKET sock, const char *request_body,
         if (model_name) cJSON_AddStringToObject(root, "model", model_name);
         else cJSON_AddStringToObject(root, "model", "pico");
 
-        /* Usage */
         cJSON *usage = cJSON_CreateObject();
         cJSON_AddNumberToObject(usage, "prompt_tokens", total_prompt_tokens);
         cJSON_AddNumberToObject(usage, "completion_tokens", total_generation_tokens);
@@ -676,17 +643,15 @@ static void handle_completion(SOCKET sock, const char *request_body,
         http_send(sock, 200, "application/json", json);
         free(json);
         cJSON_Delete(root);
+
+        srv.kv_pos = start_pos + (n_prompt - start_pos - 1 > 0 ? n_prompt - start_pos - 1 : 0) + total_generation_tokens;
     }
 
     printf("\n");
     fflush(stdout);
-
     free(raw_prompt_copy);
     free(chat_prompt);
     free(ptokens);
-    tokenizer_free(&tokenizer);
-    tensor_threadpool_free();
-    model_free(&model);
 }
 
 /* ---- Endpoint: POST /completion (llama.cpp-style) ---- */
@@ -694,9 +659,7 @@ static void handle_completion(SOCKET sock, const char *request_body,
 /* Handle the non-OAI /completion endpoint.
  * This matches the llama.cpp server format with content, tokens, stop,
  * stop_type, generation_settings, model, timings, etc. */
-static void handle_llama_completion(SOCKET sock, const char *request_body,
-                                     const char *model_path, int *out_prompt_len) {
-    *out_prompt_len = 0;
+static void handle_llama_completion(SOCKET sock, const char *request_body) {
 
     cJSON *req = cJSON_ParseWithLength(request_body, strlen(request_body));
     if (!req) {
@@ -794,7 +757,6 @@ static void handle_llama_completion(SOCKET sock, const char *request_body,
         }
     }
 
-    /* Copy prompt string before freeing req (cJSON_Delete frees internal strings) */
     char *prompt_copy = NULL;
     if (prompt) {
         prompt_copy = (char *)malloc(strlen(prompt) + 1);
@@ -803,26 +765,8 @@ static void handle_llama_completion(SOCKET sock, const char *request_body,
     }
     cJSON_Delete(req);
 
-    /* Load model */
-    fprintf(stderr, "[server] Loading model: %s\n", model_path);
-    model_t model;
-    fp16_table_init();
-    if (model_load(&model, model_path, 0, KV_CACHE_F16, KV_CACHE_F16) != 0) {
-        free(token_prompt);
-        http_send(sock, 500, "application/json", "{\"error\":\"Failed to load model\"}");
-        return;
-    }
-
-    tensor_set_threads(4);
-    tensor_threadpool_init(4);
-
-    tokenizer_t tokenizer;
-    if (tokenizer_load(&tokenizer, &model) != 0) {
-        free(token_prompt);
-        model_free(&model);
-        http_send(sock, 500, "application/json", "{\"error\":\"Failed to load tokenizer\"}");
-        return;
-    }
+    model_t *model = &srv.model;
+    tokenizer_t *tokenizer = &srv.tokenizer;
 
     /* Encode prompt */
     int *ptokens = NULL;
@@ -834,11 +778,28 @@ static void handle_llama_completion(SOCKET sock, const char *request_body,
     } else {
         int max_pt = (int)strlen(prompt) + 3;
         ptokens = (int *)malloc((size_t)max_pt * sizeof(int));
-        n_prompt = tokenizer_encode(&tokenizer, prompt, ptokens, max_pt, 1);
+        n_prompt = tokenizer_encode(tokenizer, prompt, ptokens, max_pt, 1);
     }
-    *out_prompt_len = n_prompt;
 
-    if (n_predict < 0) n_predict = model.config.max_seq_len - n_prompt;
+    /* Prompt caching: find shared prefix */
+    int cache_start = 0;
+    if (srv.last_prompt_tokens) {
+        int min_len = n_prompt < srv.last_prompt_len ? n_prompt : srv.last_prompt_len;
+        for (cache_start = 0; cache_start < min_len; cache_start++) {
+            if (ptokens[cache_start] != srv.last_prompt_tokens[cache_start]) break;
+        }
+    }
+    int start_pos = 0; // cache disabled
+
+    /* Save prompt tokens for next request */
+    if (n_prompt > srv.max_last_prompt) {
+        srv.max_last_prompt = n_prompt * 2;
+        srv.last_prompt_tokens = (int *)realloc(srv.last_prompt_tokens, (size_t)srv.max_last_prompt * sizeof(int));
+    }
+    memcpy(srv.last_prompt_tokens, ptokens, (size_t)n_prompt * sizeof(int));
+    srv.last_prompt_len = n_prompt;
+
+    if (n_predict < 0) n_predict = model->config.max_seq_len - n_prompt;
     if (n_predict <= 0) n_predict = 32;
 
     /* Random seed */
@@ -871,21 +832,21 @@ static void handle_llama_completion(SOCKET sock, const char *request_body,
             "\r\n");
         send(sock, hdr, strlen(hdr), 0);
 
-        int token = n_prompt > 0 ? ptokens[0] : (int)tokenizer.bos_id;
+        int token = start_pos > 0 ? ptokens[start_pos - 1] : (n_prompt > 0 ? ptokens[0] : (int)tokenizer->bos_id);
         int gen_count = 0;
         const char *stop_type = "none";
         const char *stopping_word = "";
 
-        for (int pos = 0; pos < n_prompt + n_predict; pos++) {
-            float *logits = model_forward(&model, token, pos);
+        for (int pos = start_pos; pos < n_prompt + n_predict; pos++) {
+            float *logits = model_forward(model, token, pos);
 
             if (pos < n_prompt - 1) {
                 token = ptokens[pos + 1];
                 continue;
             }
 
-            int next = sampler_sample(&sampler, logits, model.config.vocab_size);
-            const char *piece = tokenizer_decode(&tokenizer, token, next);
+            int next = sampler_sample(&sampler, logits, model->config.vocab_size);
+            const char *piece = tokenizer_decode(tokenizer, token, next);
             if (!piece) piece = "";
 
             /* Check stop words */
@@ -908,7 +869,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body,
                 cJSON_AddItemToObject(resp, "tokens", tok_arr);
             }
 
-            if (stopped || next == (int)tokenizer.eos_id) {
+            if (stopped || next == (int)tokenizer->eos_id) {
                 if (!stopped) stop_type = "eos";
                 cJSON_AddBoolToObject(resp, "stop", 1);
                 sse_send(sock, cJSON_PrintUnformatted(resp), NULL);
@@ -929,7 +890,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body,
             printf("%s", piece);
             fflush(stdout);
 
-            if (!ignore_eos && next == (int)tokenizer.eos_id) {
+            if (!ignore_eos && next == (int)tokenizer->eos_id) {
                 stop_type = "eos";
                 break;
             }
@@ -953,7 +914,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body,
                 n_prompt, gen_count, gen_ms, gen_ms > 0 ? gen_count / (gen_ms / 1000.0) : 0);
     } else {
         /* Non-streaming: collect all tokens, build one big response */
-        int token = n_prompt > 0 ? ptokens[0] : (int)tokenizer.bos_id;
+        int token = start_pos > 0 ? ptokens[start_pos - 1] : (n_prompt > 0 ? ptokens[0] : (int)tokenizer->bos_id);
         int gen_count = 0;
         const char *stop_type = "none";
         const char *stopping_word = "";
@@ -961,16 +922,16 @@ static void handle_llama_completion(SOCKET sock, const char *request_body,
         generated[0] = '\0';
         int *gen_token_ids = (int *)malloc((size_t)n_predict * sizeof(int));
 
-        for (int pos = 0; pos < n_prompt + n_predict; pos++) {
-            float *logits = model_forward(&model, token, pos);
+        for (int pos = start_pos; pos < n_prompt + n_predict; pos++) {
+            float *logits = model_forward(model, token, pos);
 
             if (pos < n_prompt - 1) {
                 token = ptokens[pos + 1];
                 continue;
             }
 
-            int next = sampler_sample(&sampler, logits, model.config.vocab_size);
-            const char *piece = tokenizer_decode(&tokenizer, token, next);
+            int next = sampler_sample(&sampler, logits, model->config.vocab_size);
+            const char *piece = tokenizer_decode(tokenizer, token, next);
             if (!piece) piece = "";
 
             strncat(generated, piece, n_predict * 100 - strlen(generated) - 1);
@@ -993,7 +954,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body,
             }
             if (strcmp(stop_type, "word") == 0) break;
 
-            if (!ignore_eos && next == (int)tokenizer.eos_id) {
+            if (!ignore_eos && next == (int)tokenizer->eos_id) {
                 stop_type = "eos";
                 break;
             }
@@ -1048,10 +1009,8 @@ static void handle_llama_completion(SOCKET sock, const char *request_body,
     fflush(stdout);
 
     free(prompt_copy);
+    free(token_prompt);
     free(ptokens);
-    tokenizer_free(&tokenizer);
-    tensor_threadpool_free();
-    model_free(&model);
 }
 
 /* ---- Request Router ---- */
@@ -1061,11 +1020,9 @@ static void handle_request(SOCKET sock) {
     srv.sock_in_buf = sock;
     int body_len = http_parse_request(srv.recv_buf, sizeof(srv.recv_buf), method, sizeof(method), path, sizeof(path));
     if (body_len < 0) {
-        /* Connection closed or error */
         return;
     }
 
-    /* Find body after \r\n\r\n */
     char *body_start = strstr(srv.recv_buf, "\r\n\r\n");
     if (!body_start) body_start = srv.recv_buf + body_len;
     else body_start += 4;
@@ -1074,22 +1031,23 @@ static void handle_request(SOCKET sock) {
         if (strcmp(path, "/v1/models") == 0) {
             handle_list_models(sock, srv.model_path);
         } else if (strcmp(path, "/props") == 0 || strcmp(path, "/v1/props") == 0) {
-            handle_props(sock, srv.model_path);
+            handle_props(sock);
         } else if (strcmp(path, "/") == 0 || strcmp(path, "/health") == 0) {
             http_send(sock, 200, "text/plain", "PicoLM server running\n");
         } else {
             http_send(sock, 404, "application/json", "{\"error\":{\"message\":\"Not found\"}}");
         }
     } else if (strcmp(method, "POST") == 0) {
+        if (!srv.model_loaded) {
+            http_send(sock, 503, "application/json", "{\"error\":{\"message\":\"Model not loaded\"}}");
+            return;
+        }
         if (strcmp(path, "/v1/chat/completions") == 0) {
-            int prompt_len;
-            handle_completion(sock, body_start, srv.model_path, 1, &prompt_len);
+            handle_completion(sock, body_start, 1);
         } else if (strcmp(path, "/v1/completions") == 0) {
-            int prompt_len;
-            handle_completion(sock, body_start, srv.model_path, 0, &prompt_len);
+            handle_completion(sock, body_start, 0);
         } else if (strcmp(path, "/completion") == 0) {
-            int prompt_len;
-            handle_llama_completion(sock, body_start, srv.model_path, &prompt_len);
+            handle_llama_completion(sock, body_start);
         } else {
             http_send(sock, 404, "application/json", "{\"error\":{\"message\":\"Not found\"}}");
         }
@@ -1105,6 +1063,11 @@ int server_main(int port, const char *host, const char *model_path) {
     strncpy(srv.host, host, sizeof(srv.host) - 1);
     srv.model_path = model_path;
     srv.running = 1;
+
+    /* Load model once at startup */
+    if (server_init(model_path) != 0) {
+        return -1;
+    }
 
 #ifdef _WIN32
     WSADATA wsa;
@@ -1215,5 +1178,6 @@ int server_main(int port, const char *host, const char *model_path) {
 #ifdef _WIN32
     WSACleanup();
 #endif
+    server_free();
     return 0;
 }
