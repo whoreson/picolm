@@ -282,6 +282,11 @@ static int parse_gguf(model_t *m, int max_seq_len) {
         } else if (str_eq(key, "llama.attention.head_count_kv")
             || str_eq(key, "qwen2.attention.head_count_kv") || str_eq(key, "qwen3.attention.head_count_kv")) {
             int dummy; cfg->n_kv_heads = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "attention.key_length")
+            || str_eq(key, "qwen2.attention.key_length")
+            || str_eq(key, "qwen3.attention.key_length")) {
+            /* Explicit head_dim (Qwen3 may differ from n_embd/n_heads) */
+            int dummy; cfg->head_dim = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "llama.block_count")
             || str_eq(key, "qwen2.block_count") || str_eq(key, "qwen3.block_count")) {
             int dummy; cfg->n_layers = (int)skip_meta_value(&r, vtype, &dummy);
@@ -360,7 +365,10 @@ static int parse_gguf(model_t *m, int max_seq_len) {
     if (max_seq_len > 0 && max_seq_len < cfg->max_seq_len) {
         cfg->max_seq_len = max_seq_len;
     }
-    cfg->head_dim = cfg->n_embd / cfg->n_heads;
+    /* head_dim: use GGUF's attention.key_length if set (Qwen3), else derive */
+    if (cfg->head_dim <= 0) {
+        cfg->head_dim = cfg->n_embd / cfg->n_heads;
+    }
 
     /* Parse tensor info entries */
     typedef struct {
@@ -521,18 +529,21 @@ static int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_ty
     run_state_t *s = &m->state;
 
     int half_dim = c->head_dim / 2;
+    int q_dim = c->n_heads * c->head_dim;
+    int max_dim = (q_dim > c->n_embd) ? q_dim : c->n_embd;
 
     /* Calculate sizes for float buffers */
     size_t sz_x      = (size_t)c->n_embd * sizeof(float);
-    size_t sz_xb     = (size_t)c->n_embd * sizeof(float);
-    size_t sz_xb2    = (size_t)c->n_embd * sizeof(float);
-    size_t sz_q      = (size_t)c->n_embd * sizeof(float);
+    size_t sz_xb     = (size_t)q_dim * sizeof(float);
+    size_t sz_xb2    = (size_t)q_dim * sizeof(float);
+    size_t sz_q      = (size_t)q_dim * sizeof(float);
     /* att buffer removed (flash attention) */
     size_t sz_hb     = (size_t)c->n_ffn * sizeof(float);
     size_t sz_hb2    = (size_t)c->n_ffn * sizeof(float);
     size_t sz_logits = (size_t)c->vocab_size * sizeof(float);
 
-    int scratch_dim = c->n_embd > c->n_ffn ? c->n_embd : c->n_ffn;
+    int scratch_dim = max_dim;
+    if (c->n_ffn > scratch_dim) scratch_dim = c->n_ffn;
     if (c->vocab_size > scratch_dim) scratch_dim = c->vocab_size;
     size_t sz_scratch = (size_t)scratch_dim * sizeof(float);
 
@@ -738,6 +749,7 @@ float *model_forward(model_t *m, int token, int pos) {
     int n_heads = c->n_heads;
     int n_kv_heads = c->n_kv_heads;
     int head_dim = c->head_dim;
+    int q_dim = n_heads * head_dim;
     int kv_dim = n_kv_heads * head_dim;
     int kv_mul = n_heads / n_kv_heads;
     int seq_len = c->max_seq_len;
@@ -790,7 +802,7 @@ float *model_forward(model_t *m, int token, int pos) {
 
         /* Q projection */
         tensor_set_repacked(m->repack_used[ri] ? m->repack_buffers[ri] : NULL);
-        matmul(s->q, s->xb, lw->attn_q, dim, dim, lw->type_attn_q);
+        matmul(s->q, s->xb, lw->attn_q, dim, q_dim, lw->type_attn_q);
         tensor_set_repacked(NULL);
 
         /* K projection */
@@ -972,7 +984,7 @@ float *model_forward(model_t *m, int token, int pos) {
 
         /* Output projection */
         tensor_set_repacked(m->repack_used[ri+3] ? m->repack_buffers[ri+3] : NULL);
-        matmul(s->xb2, s->xb, lw->attn_output, dim, dim, lw->type_attn_output);
+        matmul(s->xb2, s->xb, lw->attn_output, q_dim, dim, lw->type_attn_output);
         tensor_set_repacked(NULL);
         vec_add(s->x, s->xb2, dim);
 
@@ -1041,14 +1053,15 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
     int n_heads = c->n_heads, n_kv_heads = c->n_kv_heads, head_dim = c->head_dim;
     int kv_dim = n_kv_heads * head_dim, kv_mul = n_heads / n_kv_heads;
     int q_dim = n_heads * head_dim, seq_len = c->max_seq_len;
+    int max_dim = (q_dim > dim) ? q_dim : dim;
     size_t bs = (size_t)n_tokens;
 
-    size_t sz = bs * (dim * 3 + q_dim + kv_dim * 2 + n_ffn * 2);
+    size_t sz = bs * (dim + 2 * max_dim + q_dim + 2 * kv_dim + 2 * n_ffn);
     float *buf = (float *)malloc(sz * sizeof(float));
     if (!buf) { fprintf(stderr, "OOM: prefill batch\n"); exit(1); }
     float *p = buf;
     float *x_batch = p;  p += bs * dim;
-    float *xb_batch = p; p += bs * dim;
+    float *xb_batch = p; p += bs * max_dim;
     float *xb2_batch = p; p += bs * dim;
     float *q_batch = p;  p += bs * q_dim;
     float *k_batch = p;  p += bs * kv_dim;
