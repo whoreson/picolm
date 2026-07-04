@@ -444,6 +444,13 @@ static void handle_completion(SOCKET sock, const char *request_body,
     cJSON *model_item = cJSON_GetObjectItem(req, "model");
     if (model_item) model_name = cJSON_GetStringValue(model_item);
 
+    /* Copy prompt for raw completions (chat_prompt is already malloc'd via chat_to_prompt) */
+    char *raw_prompt_copy = NULL;
+    if (!is_chat && prompt) {
+        raw_prompt_copy = (char *)malloc(strlen(prompt) + 1);
+        strcpy(raw_prompt_copy, prompt);
+        prompt = raw_prompt_copy;
+    }
     cJSON_Delete(req);
 
     /* Load model */
@@ -674,6 +681,7 @@ static void handle_completion(SOCKET sock, const char *request_body,
     printf("\n");
     fflush(stdout);
 
+    free(raw_prompt_copy);
     free(chat_prompt);
     free(ptokens);
     tokenizer_free(&tokenizer);
@@ -786,6 +794,13 @@ static void handle_llama_completion(SOCKET sock, const char *request_body,
         }
     }
 
+    /* Copy prompt string before freeing req (cJSON_Delete frees internal strings) */
+    char *prompt_copy = NULL;
+    if (prompt) {
+        prompt_copy = (char *)malloc(strlen(prompt) + 1);
+        strcpy(prompt_copy, prompt);
+        prompt = prompt_copy;
+    }
     cJSON_Delete(req);
 
     /* Load model */
@@ -1032,6 +1047,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body,
     printf("\n");
     fflush(stdout);
 
+    free(prompt_copy);
     free(ptokens);
     tokenizer_free(&tokenizer);
     tensor_threadpool_free();
