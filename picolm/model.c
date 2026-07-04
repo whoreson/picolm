@@ -7,6 +7,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <errno.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdint.h>
+#endif
 
 /* Check if AVX2 is available at runtime (for repack decision) */
 static int cpu_has_avx2(void) {
@@ -21,12 +31,9 @@ static void repack_model_weights_q4_0x8(model_t *m);
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
+#ifndef HAVE_WINDOWS_H
 #include <windows.h>
-#else
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#endif
 #endif
 
 /* ---- GGUF metadata value types ---- */
@@ -1055,6 +1062,292 @@ void model_free(model_t *m) {
         m->state.kv_block = NULL;
     }
     munmap_file(m);
+}
+
+/* ================================================================
+ * Weight pinning: mlock() a budget of layers so they stay in RAM.
+ * On multi-turn conversations, locked layers are never re-streamed
+ * from disk.
+ * ================================================================ */
+
+/* Compute the byte size of a weight tensor given nrows, ncols, type. */
+static size_t weight_tensor_bytes(int nrows, int ncols, gguf_type_t type) {
+    size_t row_bytes = gguf_type_row_size(type, ncols);
+    return row_bytes * (size_t)nrows;
+}
+
+/* Compute the total byte size for one layer's weight tensors. */
+static size_t layer_weight_bytes(const model_t *m, int layer) {
+    const model_config_t *c = &m->config;
+    const layer_weights_t *lw = &m->weights.layers[layer];
+    int q_dim = c->n_heads * c->head_dim;
+    int kv_dim = c->n_kv_heads * c->head_dim;
+    size_t total = 0;
+
+    if (lw->attn_norm) total += weight_tensor_bytes(c->n_embd, c->n_embd, lw->type_attn_norm);
+    if (lw->attn_q)    total += weight_tensor_bytes(q_dim, c->n_embd, lw->type_attn_q);
+    if (lw->attn_k)    total += weight_tensor_bytes(kv_dim, c->n_embd, lw->type_attn_k);
+    if (lw->attn_v)    total += weight_tensor_bytes(kv_dim, c->n_embd, lw->type_attn_v);
+    if (lw->attn_output) total += weight_tensor_bytes(c->n_embd, q_dim, lw->type_attn_output);
+    if (lw->attn_q_norm) total += weight_tensor_bytes(c->head_dim, c->head_dim, lw->type_attn_q_norm);
+    if (lw->attn_k_norm) total += weight_tensor_bytes(c->head_dim, c->head_dim, lw->type_attn_k_norm);
+    if (lw->ffn_norm)  total += weight_tensor_bytes(c->n_embd, c->n_embd, lw->type_ffn_norm);
+    if (lw->ffn_gate)  total += weight_tensor_bytes(c->n_ffn, c->n_embd, lw->type_ffn_gate);
+    if (lw->ffn_up)    total += weight_tensor_bytes(c->n_ffn, c->n_embd, lw->type_ffn_up);
+    if (lw->ffn_down)  total += weight_tensor_bytes(c->n_embd, c->n_ffn, lw->type_ffn_down);
+    return total;
+}
+
+/* Compute the total byte size for global weight tensors. */
+static size_t global_weight_bytes(const model_t *m) {
+    const model_weights_t *w = &m->weights;
+    size_t total = 0;
+    if (w->token_embd)
+        total += weight_tensor_bytes(m->config.vocab_size, m->config.n_embd, w->type_token_embd);
+    if (w->output_norm)
+        total += weight_tensor_bytes(m->config.n_embd, m->config.n_embd, w->type_output_norm);
+    if (w->output && w->output != w->token_embd)
+        total += weight_tensor_bytes(m->config.n_embd, m->config.vocab_size, w->type_output);
+    return total;
+}
+
+/* Round a pointer up to the next page boundary. */
+static const uint8_t *page_align_up(const uint8_t *p) {
+    uintptr_t addr = (uintptr_t)p;
+    return (const uint8_t *)((addr + 4095) & ~(uintptr_t)4095);
+}
+
+/* Round a pointer down to the previous page boundary. */
+static const uint8_t *page_align_down(const uint8_t *p) {
+    uintptr_t addr = (uintptr_t)p;
+    return (const uint8_t *)(addr & ~(uintptr_t)4095);
+}
+
+/* Lock layer weights in RAM using mlock().
+ *
+ * Given a budget in bytes, determines how many consecutive layers (starting
+ * from layer 0) fit, plus the global tensors, then calls mlock() on the
+ * page-aligned range covering all those tensors.
+ *
+ * Returns the number of layers locked, or 0 on failure. */
+int model_lock_layers(model_t *m, size_t mem_bytes) {
+    const model_config_t *c = &m->config;
+
+    size_t gbytes = global_weight_bytes(m);
+    if (gbytes > mem_bytes) {
+        fprintf(stderr, "Lock: budget too small for global tensors (%.1f MB)\n",
+                gbytes / (1024.0 * 1024.0));
+        return 0;
+    }
+
+    /* Compute per-layer sizes and find how many fit */
+    size_t locked_bytes = gbytes;
+    int layers_locked = 0;
+
+    for (int l = 0; l < c->n_layers; l++) {
+        size_t lbytes = layer_weight_bytes(m, l);
+        if (locked_bytes + lbytes > mem_bytes) break;
+        locked_bytes += lbytes;
+        layers_locked++;
+    }
+
+    if (layers_locked == 0) {
+        fprintf(stderr, "Lock: budget too small for any layer (%.1f MB needed, %.1f MB available)\n",
+                layer_weight_bytes(m, 0) / (1024.0 * 1024.0) + gbytes / (1024.0 * 1024.0),
+                mem_bytes / (1024.0 * 1024.0));
+        return 0;
+    }
+
+    /* Collect all tensor pointers from global + locked layers, find min/max.
+     * The GGUF may not store tensors contiguously, so we lock per-tensor
+     * ranges individually to avoid locking gaps. */
+    int n_ranges = 0;
+    const uint8_t *ranges_start[200];
+    const uint8_t *ranges_end[200];
+    size_t ranges_size[200];
+    #define NR_MAX 200
+
+    /* Helper: add a tensor range */
+    #define ADD_RANGE(ptr, sz) do { \
+        size_t _sz = (sz); \
+        if (ptr && _sz > 0 && n_ranges < NR_MAX) { \
+            ranges_start[n_ranges] = page_align_down(ptr); \
+            ranges_end[n_ranges] = page_align_up((const uint8_t *)ptr + _sz); \
+            ranges_size[n_ranges] = (const uint8_t *)ranges_end[n_ranges] - (const uint8_t *)ranges_start[n_ranges]; \
+            n_ranges++; \
+        } \
+    } while(0)
+
+    /* Global tensors */
+    ADD_RANGE(m->weights.token_embd, weight_tensor_bytes(c->vocab_size, c->n_embd, m->weights.type_token_embd));
+    ADD_RANGE(m->weights.output_norm, weight_tensor_bytes(c->n_embd, c->n_embd, m->weights.type_output_norm));
+    if (m->weights.output && m->weights.output != m->weights.token_embd)
+        ADD_RANGE(m->weights.output, weight_tensor_bytes(c->n_embd, c->vocab_size, m->weights.type_output));
+
+    /* Locked layers */
+    int q_dim = c->n_heads * c->head_dim;
+    int kv_dim = c->n_kv_heads * c->head_dim;
+    for (int l = 0; l < layers_locked; l++) {
+        const layer_weights_t *lw = &m->weights.layers[l];
+        ADD_RANGE(lw->attn_norm, lw->attn_norm ? weight_tensor_bytes(c->n_embd, c->n_embd, lw->type_attn_norm) : 0);
+        ADD_RANGE(lw->attn_q, lw->attn_q ? weight_tensor_bytes(q_dim, c->n_embd, lw->type_attn_q) : 0);
+        ADD_RANGE(lw->attn_k, lw->attn_k ? weight_tensor_bytes(kv_dim, c->n_embd, lw->type_attn_k) : 0);
+        ADD_RANGE(lw->attn_v, lw->attn_v ? weight_tensor_bytes(kv_dim, c->n_embd, lw->type_attn_v) : 0);
+        ADD_RANGE(lw->attn_output, lw->attn_output ? weight_tensor_bytes(c->n_embd, q_dim, lw->type_attn_output) : 0);
+        ADD_RANGE(lw->attn_q_norm, lw->attn_q_norm ? weight_tensor_bytes(c->head_dim, c->head_dim, lw->type_attn_q_norm) : 0);
+        ADD_RANGE(lw->attn_k_norm, lw->attn_k_norm ? weight_tensor_bytes(c->head_dim, c->head_dim, lw->type_attn_k_norm) : 0);
+        ADD_RANGE(lw->ffn_norm, lw->ffn_norm ? weight_tensor_bytes(c->n_embd, c->n_embd, lw->type_ffn_norm) : 0);
+        ADD_RANGE(lw->ffn_gate, lw->ffn_gate ? weight_tensor_bytes(c->n_ffn, c->n_embd, lw->type_ffn_gate) : 0);
+        ADD_RANGE(lw->ffn_up, lw->ffn_up ? weight_tensor_bytes(c->n_ffn, c->n_embd, lw->type_ffn_up) : 0);
+        ADD_RANGE(lw->ffn_down, lw->ffn_down ? weight_tensor_bytes(c->n_embd, c->n_ffn, lw->type_ffn_down) : 0);
+    }
+
+    /* Sort ranges by start address (simple insertion sort, N is small) */
+    for (int i = 1; i < n_ranges; i++) {
+        const uint8_t *s = ranges_start[i];
+        const uint8_t *e = ranges_end[i];
+        size_t sz = ranges_size[i];
+        int j = i - 1;
+        while (j >= 0 && ranges_start[j] > s) {
+            ranges_start[j+1] = ranges_start[j];
+            ranges_end[j+1] = ranges_end[j];
+            ranges_size[j+1] = ranges_size[j];
+            j--;
+        }
+        ranges_start[j+1] = s;
+        ranges_end[j+1] = e;
+        ranges_size[j+1] = sz;
+    }
+
+    /* Merge overlapping/adjacent ranges */
+    int merged = 1;
+    for (int i = 1; i < n_ranges; i++) {
+        if ((const uint8_t *)ranges_start[i] <= (const uint8_t *)ranges_end[merged-1]) {
+            /* Overlapping or adjacent - extend */
+            if ((const uint8_t *)ranges_end[i] > (const uint8_t *)ranges_end[merged-1])
+                ranges_end[merged-1] = ranges_end[i];
+        } else {
+            /* Gap - start new range */
+            ranges_start[merged] = ranges_start[i];
+            ranges_end[merged] = ranges_end[i];
+            merged++;
+        }
+    }
+
+    /* Call mlock on each merged range */
+    size_t total_locked = 0;
+    for (int i = 0; i < merged; i++) {
+        size_t sz = (const uint8_t *)ranges_end[i] - (const uint8_t *)ranges_start[i];
+#ifdef _WIN32
+        if (VirtualLock((void *)ranges_start[i], sz) == 0) {
+            fprintf(stderr, "Lock: VirtualLock failed (error %lu)\n", (unsigned long)GetLastError());
+            return 0;
+        }
+#else
+        if (mlock((void *)ranges_start[i], sz) != 0) {
+            int err = errno;
+            if (err == EACCES)
+                fprintf(stderr, "Lock: mlock failed - check RLIMIT_MEMLOCK (ulimit -l)\n");
+            else
+                fprintf(stderr, "Lock: mlock failed: %s\n", strerror(err));
+            return 0;
+        }
+#endif
+        total_locked += sz;
+    }
+
+    m->locked_layers = layers_locked;
+    fprintf(stderr, "Lock: pinned %.1f MB (layers 0..%d of %d)\n",
+            total_locked / (1024.0 * 1024.0),
+            layers_locked - 1, c->n_layers - 1);
+    return layers_locked;
+}
+#undef ADD_RANGE
+#undef NR_MAX
+
+/* Unlock previously pinned weight layers. */
+int model_unlock_layers(model_t *m) {
+    if (m->locked_layers == 0) return 0;
+
+    const model_config_t *c = &m->config;
+    size_t gbytes = global_weight_bytes(m);
+    size_t budget = gbytes;
+    for (int l = 0; l < m->locked_layers; l++)
+        budget += layer_weight_bytes(m, l);
+
+    /* Re-compute the ranges (same logic as lock, then munmap) */
+    int n_ranges = 0;
+    const uint8_t *ranges_start[200];
+    const uint8_t *ranges_end[200];
+    #define NR_MAX 200
+    #define ADD_RANGE(ptr, sz) do { \
+        size_t _sz = (sz); \
+        if (ptr && _sz > 0 && n_ranges < NR_MAX) { \
+            ranges_start[n_ranges] = page_align_down(ptr); \
+            ranges_end[n_ranges] = page_align_up((const uint8_t *)ptr + _sz); \
+            n_ranges++; \
+        } \
+    } while(0)
+
+    ADD_RANGE(m->weights.token_embd, weight_tensor_bytes(c->vocab_size, c->n_embd, m->weights.type_token_embd));
+    ADD_RANGE(m->weights.output_norm, weight_tensor_bytes(c->n_embd, c->n_embd, m->weights.type_output_norm));
+    if (m->weights.output && m->weights.output != m->weights.token_embd)
+        ADD_RANGE(m->weights.output, weight_tensor_bytes(c->n_embd, c->vocab_size, m->weights.type_output));
+
+    int q_dim = c->n_heads * c->head_dim;
+    int kv_dim = c->n_kv_heads * c->head_dim;
+    for (int l = 0; l < m->locked_layers; l++) {
+        const layer_weights_t *lw = &m->weights.layers[l];
+        ADD_RANGE(lw->attn_norm, lw->attn_norm ? weight_tensor_bytes(c->n_embd, c->n_embd, lw->type_attn_norm) : 0);
+        ADD_RANGE(lw->attn_q, lw->attn_q ? weight_tensor_bytes(q_dim, c->n_embd, lw->type_attn_q) : 0);
+        ADD_RANGE(lw->attn_k, lw->attn_k ? weight_tensor_bytes(kv_dim, c->n_embd, lw->type_attn_k) : 0);
+        ADD_RANGE(lw->attn_v, lw->attn_v ? weight_tensor_bytes(kv_dim, c->n_embd, lw->type_attn_v) : 0);
+        ADD_RANGE(lw->attn_output, lw->attn_output ? weight_tensor_bytes(c->n_embd, q_dim, lw->type_attn_output) : 0);
+        ADD_RANGE(lw->attn_q_norm, lw->attn_q_norm ? weight_tensor_bytes(c->head_dim, c->head_dim, lw->type_attn_q_norm) : 0);
+        ADD_RANGE(lw->attn_k_norm, lw->attn_k_norm ? weight_tensor_bytes(c->head_dim, c->head_dim, lw->type_attn_k_norm) : 0);
+        ADD_RANGE(lw->ffn_norm, lw->ffn_norm ? weight_tensor_bytes(c->n_embd, c->n_embd, lw->type_ffn_norm) : 0);
+        ADD_RANGE(lw->ffn_gate, lw->ffn_gate ? weight_tensor_bytes(c->n_ffn, c->n_embd, lw->type_ffn_gate) : 0);
+        ADD_RANGE(lw->ffn_up, lw->ffn_up ? weight_tensor_bytes(c->n_ffn, c->n_embd, lw->type_ffn_up) : 0);
+        ADD_RANGE(lw->ffn_down, lw->ffn_down ? weight_tensor_bytes(c->n_embd, c->n_ffn, lw->type_ffn_down) : 0);
+    }
+
+    /* Merge */
+    for (int i = 1; i < n_ranges; i++) {
+        const uint8_t *s = ranges_start[i], *e = ranges_end[i];
+        int j = i - 1;
+        while (j >= 0 && ranges_start[j] > s) {
+            ranges_start[j+1] = ranges_start[j];
+            ranges_end[j+1] = ranges_end[j];
+            j--;
+        }
+        ranges_start[j+1] = s; ranges_end[j+1] = e;
+    }
+    int merged = 1;
+    for (int i = 1; i < n_ranges; i++) {
+        if ((const uint8_t *)ranges_start[i] <= (const uint8_t *)ranges_end[merged-1]) {
+            if ((const uint8_t *)ranges_end[i] > (const uint8_t *)ranges_end[merged-1])
+                ranges_end[merged-1] = ranges_end[i];
+        } else {
+            ranges_start[merged] = ranges_start[i];
+            ranges_end[merged] = ranges_end[i];
+            merged++;
+        }
+    }
+
+    size_t total_unlocked = 0;
+    for (int i = 0; i < merged; i++) {
+        size_t sz = (const uint8_t *)ranges_end[i] - (const uint8_t *)ranges_start[i];
+#ifdef _WIN32
+        VirtualUnlock((void *)ranges_start[i], sz);
+#else
+        munlock((void *)ranges_start[i], sz);
+#endif
+        total_unlocked += sz;
+    }
+
+    m->locked_layers = 0;
+    fprintf(stderr, "Unlock: released %.1f MB\n", total_unlocked / (1024.0 * 1024.0));
+    return 0;
 }
 
 /* ================================================================
