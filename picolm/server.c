@@ -553,9 +553,6 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             if (ptokens[cache_start] != srv.last_prompt_tokens[cache_start]) break;
         }
     }
-    /* Use shared prefix from KV cache. The attention loop iterates
-     * from t=0 to t<=pos, so stale KV data at positions beyond n_prompt
-     * is never read (it will be overwritten during generation). */
     int start_pos = cache_start;
     if (start_pos == 0) {
         srv.kv_pos = 0;
@@ -828,7 +825,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
     if ((item = cJSON_GetObjectItem(req, "model")))
         model_name = cJSON_GetStringValue(item);
 
-    /* Parse stop words */
+    /* Parse stop words - MUST copy before cJSON_Delete */
     char *stop_words[16];
     int n_stop_words = 0;
     cJSON *stop_arr = cJSON_GetObjectItem(req, "stop");
@@ -840,7 +837,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             if (cJSON_IsString(sw)) {
                 const char *s = cJSON_GetStringValue(sw);
                 if (s && strlen(s) > 0) {
-                    stop_words[n_stop_words++] = (char *)s;
+                    stop_words[n_stop_words++] = strdup(s);
                 }
             }
         }
@@ -1156,6 +1153,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
     free(prompt_copy);
     free(token_prompt);
     free(ptokens);
+    for (int i = 0; i < n_stop_words; i++) free(stop_words[i]);
 }
 
 /* ---- Request Router ---- */
