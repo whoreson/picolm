@@ -59,6 +59,22 @@ extern double get_time_ms(void);
 /* ---- HTTP Helpers ---- */
 
 /* Send an HTTP response and close the connection. */
+/* Send data with HTTP chunked transfer encoding framing.
+ * Each call sends: chunk_length_hex\r\n data chunk\r\n */
+static void send_chunked(SOCKET sock, const char *data, size_t len) {
+    /* Send HTTP chunked encoding frame: hex-length + CRLF + data + CRLF */
+    char hdr[32];
+    int n = snprintf(hdr, sizeof(hdr), "%zx\r\n", (size_t)len);
+    send(sock, hdr, (size_t)n, 0);
+    if (len > 0) {
+        send(sock, data, len, 0);
+        send(sock, "\r\n", 2, 0);
+    } else {
+        /* Zero-length chunk: signals end of stream */
+        send(sock, "\r\n", 2, 0);
+    }
+}
+
 static void http_send(SOCKET sock, int status, const char *content_type, const char *body) {
     const char *status_text = "OK";
     switch (status) {
@@ -85,27 +101,47 @@ static void http_send(SOCKET sock, int status, const char *content_type, const c
 
 /* Send SSE data chunk. */
 static void sse_send(SOCKET sock, const char *data, const char *event) {
+    /* Build SSE message: "data: {json}\r\n\r\n" and send as one chunk */
+    /* data may contain newlines; each gets "data: " prefix */
+    int total_len = 0;
     if (event) {
-        send(sock, "event: ", 7, 0);
-        send(sock, event, strlen(event), 0);
-        send(sock, "\r\n", 2, 0);
+        total_len += (int)(7 + strlen(event) + 2); /* "event: {ev}\r\n" */
     }
-    /* SSE data lines get a "data: " prefix and double-newline terminator */
+    /* Count data lines */
     const char *p = data;
     while (*p) {
         const char *nl = strchr(p, '\n');
-        send(sock, "data: ", 6, 0);
+        total_len += 6; /* "data: " */
         if (nl) {
-            send(sock, p, (size_t)(nl - p), 0);
-            send(sock, "\r\n", 2, 0);
+            total_len += (int)(nl - p) + 2; /* line + "\r\n" */
             p = nl + 1;
         } else {
-            send(sock, p, strlen(p), 0);
-            send(sock, "\r\n", 2, 0);
+            total_len += (int)strlen(p) + 2; /* line + "\r\n" */
             break;
         }
     }
-    send(sock, "\r\n", 2, 0);
+    total_len += 2; /* final "\r\n" */
+    total_len++;     /* extra safety byte to prevent snprintf truncation */
+
+    char *buf = (char *)calloc((size_t)total_len + 1, 1);
+    int off = 0;
+    if (event) {
+        off += snprintf(buf + off, (size_t)(total_len - off), "event: %s\r\n", event);
+    }
+    p = data;
+    while (*p) {
+        const char *nl = strchr(p, '\n');
+        if (nl) {
+            off += snprintf(buf + off, (size_t)(total_len - off), "data: %.*s\r\n", (int)(nl - p), p);
+            p = nl + 1;
+        } else {
+            off += snprintf(buf + off, (size_t)(total_len - off), "data: %s\r\n", p);
+            break;
+        }
+    }
+    off += snprintf(buf + off, (size_t)(total_len - off), "\r\n");
+    send_chunked(sock, buf, (size_t)off);
+    free(buf);
 }
 
 /* Forward declaration of global server state */
@@ -530,7 +566,8 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: text/event-stream\r\n"
             "Cache-Control: no-cache\r\n"
-            "Connection: keep-alive\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            
             "Access-Control-Allow-Origin: *\r\n"
             "\r\n");
         send(sock, hdr, strlen(hdr), 0);
@@ -564,7 +601,8 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
 
         double t_end = get_time_ms();
         send_chunk(sock, "", NULL, 1);
-        send(sock, "data: [DONE]\r\n\r\n", 16, 0);
+        send_chunked(sock, "data: [DONE]\r\n", 14);
+        send_chunked(sock, "", 0);
 
         srv.kv_pos = start_pos + (n_prompt - start_pos - 1 > 0 ? n_prompt - start_pos - 1 : 0) + total_generation_tokens;
         fprintf(stderr, "\n[server] OAI stream: cached=%d/%d prompt, %d gen in %.0fms (%.1f tok/s)\n",
@@ -843,13 +881,14 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
     double t_start = get_time_ms();
 
     if (do_stream) {
-        /* Streaming: SSE per token */
+        /* Streaming: SSE per token, HTTP chunked transfer encoding */
         char hdr[256];
         snprintf(hdr, sizeof(hdr),
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: text/event-stream\r\n"
             "Cache-Control: no-cache\r\n"
-            "Connection: keep-alive\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            
             "Access-Control-Allow-Origin: *\r\n"
             "\r\n");
         send(sock, hdr, strlen(hdr), 0);
@@ -931,6 +970,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         sse_send(sock, cJSON_PrintUnformatted(final), NULL);
         free(cJSON_PrintUnformatted(final));
         cJSON_Delete(final);
+        send_chunked(sock, "", 0);
 
         fprintf(stderr, "\n[server] /completion: %d prompt tokens, %d generated in %.0fms (%.1f tok/s)\n",
                 n_prompt, gen_count, gen_ms, gen_ms > 0 ? gen_count / (gen_ms / 1000.0) : 0);
