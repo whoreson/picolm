@@ -456,7 +456,8 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
 
     cJSON *item;
     if ((item = cJSON_GetObjectItem(req, "max_tokens"))) max_tokens = (int)cJSON_GetNumberValue(item);
-    if (max_tokens <= 0) max_tokens = 256;
+    int prompt_only = (max_tokens == 0);
+    if (max_tokens <= 0 && !prompt_only) max_tokens = 256;
     if ((item = cJSON_GetObjectItem(req, "temperature"))) temperature = (float)cJSON_GetNumberValue(item);
     if ((item = cJSON_GetObjectItem(req, "top_p"))) top_p = (float)cJSON_GetNumberValue(item);
     if ((item = cJSON_GetObjectItem(req, "seed"))) seed = (uint64_t)cJSON_GetNumberValue(item);
@@ -543,7 +544,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         for (int pos = start_pos; pos < n_prompt + max_tokens; pos++) {
             float *logits = model_forward(model, token, pos);
 
-            if (pos < n_prompt - 1) {
+            if (pos < n_prompt - 1 || prompt_only) {
                 token = ptokens[pos + 1];
                 continue;
             }
@@ -592,7 +593,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             for (int pos = start_pos; pos < n_prompt + max_tokens; pos++) {
                 float *logits = model_forward(model, token, pos);
 
-                if (pos < n_prompt - 1) {
+                if (pos < n_prompt - 1 || prompt_only) {
                     token = ptokens[pos + 1];
                     continue;
                 }
@@ -789,7 +790,27 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             if (ptokens[cache_start] != srv.last_prompt_tokens[cache_start]) break;
         }
     }
-    int start_pos = 0; // cache disabled
+    /* Re-enable prompt caching. To avoid stale KV cache corruption when
+     * the previous request generated tokens beyond start_pos, we only
+     * cache the prompt (positions 0..n_prompt-1). The previous request's
+     * generated tokens at positions n_prompt onwards are harmless because
+     * the current request overwrites them as it generates.
+     *
+     * We also only cache when the ENTIRE prompt matches (not just prefix),
+     * to avoid the case where the current request's prompt is shorter than
+     * the previous one (KV cache at positions beyond current n_prompt has
+     * stale data from previous generation).
+     */
+    /* Prompt caching: always recompute the full prompt.
+     * KV cache reuse from previous requests causes corruption when
+     * the previous request's generated tokens overlap with the current
+     * request's generation positions. The attention loop reads stale
+     * KV data that was written by a different token.
+     *
+     * TODO: fix by memsetting KV cache to zero between requests,
+     * or by properly tracking which positions are valid.
+     */
+    int start_pos = 0;
 
     /* Save prompt tokens for next request */
     if (n_prompt > srv.max_last_prompt) {
@@ -799,8 +820,9 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
     memcpy(srv.last_prompt_tokens, ptokens, (size_t)n_prompt * sizeof(int));
     srv.last_prompt_len = n_prompt;
 
+    int prompt_only = (n_predict == 0);
     if (n_predict < 0) n_predict = model->config.max_seq_len - n_prompt;
-    if (n_predict <= 0) n_predict = 32;
+    if (n_predict <= 0 && !prompt_only) n_predict = 32;
 
     /* Random seed */
     if (seed < 0) seed = (uint64_t)(time(NULL) ^ (uint64_t)((long)&seed));
@@ -840,7 +862,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         for (int pos = start_pos; pos < n_prompt + n_predict; pos++) {
             float *logits = model_forward(model, token, pos);
 
-            if (pos < n_prompt - 1) {
+            if (pos < n_prompt - 1 || prompt_only) {
                 token = ptokens[pos + 1];
                 continue;
             }
@@ -925,7 +947,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         for (int pos = start_pos; pos < n_prompt + n_predict; pos++) {
             float *logits = model_forward(model, token, pos);
 
-            if (pos < n_prompt - 1) {
+            if (pos < n_prompt - 1 || prompt_only) {
                 token = ptokens[pos + 1];
                 continue;
             }
