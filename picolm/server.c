@@ -41,6 +41,7 @@ typedef int socklen_t;
 #include <unistd.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <poll.h>
 #define closesocket close
 typedef int SOCKET;
 #define SOCKET_INVALID ((SOCKET)-1)
@@ -58,21 +59,55 @@ extern double get_time_ms(void);
 
 /* ---- HTTP Helpers ---- */
 
+/* Check if the client is still connected.
+ * Returns 1 if alive, 0 if the client has disconnected.
+ * Uses a non-blocking poll + peek to avoid blocking. */
+static int client_alive(SOCKET sock) {
+#ifdef _WIN32
+    /* On Windows, use select() to check readability */
+    fd_set rfds;
+    struct timeval tv = {0, 0};
+    FD_ZERO(&rfds);
+    FD_SET(sock, &rfds);
+    if (select((int)sock + 1, &rfds, NULL, NULL, &tv) > 0) {
+        /* Socket is readable - check if it's EOF or just data */
+        char buf[1];
+        int n = recv(sock, buf, 1, MSG_PEEK);
+        if (n <= 0) return 0; /* EOF or error */
+    }
+    return 1;
+#else
+    struct pollfd pfd;
+    pfd.fd = (int)sock;
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    if (poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR))) {
+        /* Socket is readable - check if it's EOF */
+        char buf[1];
+        ssize_t n = recv(sock, buf, 1, MSG_PEEK);
+        if (n <= 0) return 0; /* EOF or error */
+    }
+    return 1;
+#endif
+}
+
 /* Send an HTTP response and close the connection. */
 /* Send data with HTTP chunked transfer encoding framing.
- * Each call sends: chunk_length_hex\r\n data chunk\r\n */
-static void send_chunked(SOCKET sock, const char *data, size_t len) {
+ * Each call sends: chunk_length_hex\r\n data chunk\r\n
+ * Returns 0 on success, -1 if the client has disconnected. */
+static int send_chunked(SOCKET sock, const char *data, size_t len) {
     /* Send HTTP chunked encoding frame: hex-length + CRLF + data + CRLF */
     char hdr[32];
     int n = snprintf(hdr, sizeof(hdr), "%zx\r\n", (size_t)len);
-    send(sock, hdr, (size_t)n, 0);
+    if (send(sock, hdr, (size_t)n, 0) < 0) return -1;
     if (len > 0) {
-        send(sock, data, len, 0);
-        send(sock, "\r\n", 2, 0);
+        if (send(sock, data, len, 0) < 0) return -1;
+        if (send(sock, "\r\n", 2, 0) < 0) return -1;
     } else {
         /* Zero-length chunk: signals end of stream */
-        send(sock, "\r\n", 2, 0);
+        if (send(sock, "\r\n", 2, 0) < 0) return -1;
     }
+    return 0;
 }
 
 static void http_send(SOCKET sock, int status, const char *content_type, const char *body) {
@@ -99,8 +134,8 @@ static void http_send(SOCKET sock, int status, const char *content_type, const c
     if (body) send(sock, body, strlen(body), 0);
 }
 
-/* Send SSE data chunk. */
-static void sse_send(SOCKET sock, const char *data, const char *event) {
+/* Send SSE data chunk. Returns 0 on success, -1 if client disconnected. */
+static int sse_send(SOCKET sock, const char *data, const char *event) {
     /* Build SSE message: "data: {json}\r\n\r\n" and send as one chunk */
     /* data may contain newlines; each gets "data: " prefix */
     int total_len = 0;
@@ -140,8 +175,9 @@ static void sse_send(SOCKET sock, const char *data, const char *event) {
         }
     }
     off += snprintf(buf + off, (size_t)(total_len - off), "\r\n");
-    send_chunked(sock, buf, (size_t)off);
+    int rc = send_chunked(sock, buf, (size_t)off);
     free(buf);
+    return rc;
 }
 
 /* Forward declaration of global server state */
@@ -534,7 +570,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
     srv.last_prompt_len = n_prompt;
 
     /* Helper: send SSE chunk */
-    void send_chunk(SOCKET sk, const char *content, const char *role, int is_done) {
+    int send_chunk(SOCKET sk, const char *content, const char *role, int is_done) {
         cJSON *chunk = cJSON_CreateObject();
         cJSON *choice = cJSON_CreateObject();
         cJSON *delta = cJSON_CreateObject();
@@ -552,9 +588,10 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         cJSON_AddNumberToObject(chunk, "created", (double)(time(NULL)));
         if (model_name) cJSON_AddStringToObject(chunk, "model", model_name);
         char *json = cJSON_PrintUnformatted(chunk);
-        sse_send(sk, json, NULL);
+        int rc = sse_send(sk, json, NULL);
         free(json);
         cJSON_Delete(chunk);
+        return rc;
     }
 
     int total_prompt_tokens = n_prompt;
@@ -581,6 +618,10 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         double t_start = get_time_ms();
 
         for (int pos = gen_start_oai; pos < n_prompt + max_tokens; pos++) {
+            if (!client_alive(sock)) {
+                fprintf(stderr, "\n[server] OAI stream: client disconnected at pos %d\n", pos);
+                break;
+            }
             float *logits = model_forward(model, token, pos);
 
             if (pos < n_prompt - 1 || prompt_only) {
@@ -592,7 +633,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             const char *piece = tokenizer_decode(tokenizer, token, next);
             if (!piece) piece = "";
 
-            send_chunk(sock, piece, pos == start_pos ? (is_chat ? "assistant" : "") : NULL, 0);
+            if (send_chunk(sock, piece, pos == start_pos ? (is_chat ? "assistant" : "") : NULL, 0) < 0) break;
             total_generation_tokens++;
             printf("%s", piece);
             fflush(stdout);
@@ -634,6 +675,9 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             const char *finish_reason = "stop";
 
             for (int pos = gen_start_oai2; pos < n_prompt + max_tokens; pos++) {
+                if (!client_alive(sock)) {
+                    free(generated); break;
+                }
                 float *logits = model_forward(model, token, pos);
 
                 if (pos < n_prompt - 1 || prompt_only) {
@@ -907,6 +951,10 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         int token = ptokens[gen_start];
 
         for (int pos = gen_start; pos < n_prompt + n_predict; pos++) {
+            if (!client_alive(sock)) {
+                fprintf(stderr, "\n[server] /completion stream: client disconnected at pos %d\n", pos);
+                break;
+            }
             float *logits = model_forward(model, token, pos);
 
             if (pos < n_prompt - 1 || prompt_only) {
@@ -963,7 +1011,12 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             }
 
             cJSON_AddBoolToObject(resp, "stop", 0);
-            sse_send(sock, cJSON_PrintUnformatted(resp), NULL);
+            if (sse_send(sock, cJSON_PrintUnformatted(resp), NULL) < 0) {
+                free(cJSON_PrintUnformatted(resp));
+                cJSON_Delete(resp);
+                fprintf(stderr, "\n[server] /completion stream: send failed\n");
+                break;
+            }
             free(cJSON_PrintUnformatted(resp));
             cJSON_Delete(resp);
 
@@ -1010,6 +1063,10 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         int *gen_token_ids = (int *)malloc((size_t)n_predict * sizeof(int));
 
         for (int pos = gen_start_ns; pos < n_prompt + n_predict; pos++) {
+            if (!client_alive(sock)) {
+                fprintf(stderr, "\n[server] /completion non-stream: client disconnected at pos %d\n", pos);
+                break;
+            }
             float *logits = model_forward(model, token, pos);
 
             if (pos < n_prompt - 1 || prompt_only) {
