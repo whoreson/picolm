@@ -59,16 +59,7 @@ int sampler_sample(sampler_t *s, float *logits, int vocab_size) {
     /* Softmax */
     softmax(logits, vocab_size);
 
-    /* If top_p >= 1.0, sample from full distribution */
-    if (s->top_p >= 1.0f) {
-        float r = rand_float(&s->rng_state);
-        float cum = 0.0f;
-        for (int i = 0; i < vocab_size; i++) {
-            cum += logits[i];
-            if (cum > r) return i;
-        }
-        return vocab_size - 1;
-    }
+    /* If top_p >= 1.0, still use sorted sampling for consistency */
 
     /* Top-p (nucleus) sampling */
     /* Sort indices by probability descending */

@@ -897,6 +897,8 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         int gen_count = 0;
         const char *stop_type = "none";
         const char *stopping_word = "";
+        char *generated_stream = (char *)calloc(1, 1024);
+        int generated_stream_cap = 1024;
 
         for (int pos = start_pos; pos < n_prompt + n_predict; pos++) {
             float *logits = model_forward(model, token, pos);
@@ -910,13 +912,25 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             const char *piece = tokenizer_decode(tokenizer, token, next);
             if (!piece) piece = "";
 
-            /* Check stop words */
+            /* Append to cumulative output for stop word matching */
+            int gen_len = (int)strlen(generated_stream);
+            int piece_len = (int)strlen(piece);
+            if (gen_len + piece_len + 1 > generated_stream_cap) {
+                generated_stream_cap = (gen_len + piece_len + 1) * 2;
+                generated_stream = (char *)realloc(generated_stream, generated_stream_cap);
+            }
+            memcpy(generated_stream + gen_len, piece, (size_t)(piece_len + 1));
+
+            /* Check stop words against cumulative output (not individual token) */
             int stopped = 0;
             for (int i = 0; i < n_stop_words && !stopped; i++) {
-                if (strstr(piece, stop_words[i]) != NULL) {
+                if (strstr(generated_stream, stop_words[i]) != NULL) {
                     stopped = 1;
                     stop_type = "word";
                     stopping_word = stop_words[i];
+                    /* Trim output to before the stop word */
+                    char *found = strstr(generated_stream, stop_words[i]);
+                    if (found) *found = '\0';
                 }
             }
 
@@ -958,6 +972,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             token = next;
         }
 
+        free(generated_stream);
         double t_end = get_time_ms();
         double gen_ms = t_end - t_start;
 
