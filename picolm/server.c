@@ -517,11 +517,11 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             if (ptokens[cache_start] != srv.last_prompt_tokens[cache_start]) break;
         }
     }
-    /* If cache_start > 0, positions 0..cache_start-1 are already in the KV cache */
-    /* If cache_start == 0 or prompt diverges, we reset from scratch */
-    int start_pos = 0; // cache disabled
+    /* Use shared prefix from KV cache. The attention loop iterates
+     * from t=0 to t<=pos, so stale KV data at positions beyond n_prompt
+     * is never read (it will be overwritten during generation). */
+    int start_pos = cache_start;
     if (start_pos == 0) {
-        /* Reset KV cache for a completely new request */
         srv.kv_pos = 0;
     }
 
@@ -575,10 +575,12 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         sampler_t sampler;
         sampler_init(&sampler, temperature, top_p, seed);
 
-        int token = start_pos > 0 ? ptokens[start_pos - 1] : ptokens[0];
+        int gen_start_oai = start_pos;
+        if (gen_start_oai >= n_prompt) gen_start_oai = n_prompt - 1;
+        int token = ptokens[gen_start_oai];
         double t_start = get_time_ms();
 
-        for (int pos = start_pos; pos < n_prompt + max_tokens; pos++) {
+        for (int pos = gen_start_oai; pos < n_prompt + max_tokens; pos++) {
             float *logits = model_forward(model, token, pos);
 
             if (pos < n_prompt - 1 || prompt_only) {
@@ -604,7 +606,8 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         send_chunked(sock, "data: [DONE]\r\n", 14);
         send_chunked(sock, "", 0);
 
-        srv.kv_pos = start_pos + (n_prompt - start_pos - 1 > 0 ? n_prompt - start_pos - 1 : 0) + total_generation_tokens;
+        srv.kv_pos = n_prompt; /* prompt tokens 0..n_prompt-1 are in KV cache */
+
         fprintf(stderr, "\n[server] OAI stream: cached=%d/%d prompt, %d gen in %.0fms (%.1f tok/s)\n",
                 start_pos, n_prompt, total_generation_tokens, t_end - t_start,
                 (t_end - t_start) > 0 ? total_generation_tokens / ((t_end - t_start) / 1000.0) : 0.0);
@@ -617,7 +620,9 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             sampler_t sampler;
             sampler_init(&sampler, temperature, top_p, seed + (uint64_t)c);
 
-            int token = start_pos > 0 ? ptokens[start_pos - 1] : ptokens[0];
+            int gen_start_oai2 = start_pos;
+            if (gen_start_oai2 >= n_prompt) gen_start_oai2 = n_prompt - 1;
+            int token = ptokens[gen_start_oai2];
             char *generated = (char *)malloc((size_t)max_tokens * 100 + 1);
             if (!generated) {
                 free(chat_prompt); free(raw_prompt_copy); free(ptokens);
@@ -628,7 +633,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             int gen_count = 0;
             const char *finish_reason = "stop";
 
-            for (int pos = start_pos; pos < n_prompt + max_tokens; pos++) {
+            for (int pos = gen_start_oai2; pos < n_prompt + max_tokens; pos++) {
                 float *logits = model_forward(model, token, pos);
 
                 if (pos < n_prompt - 1 || prompt_only) {
@@ -683,7 +688,8 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         free(json);
         cJSON_Delete(root);
 
-        srv.kv_pos = start_pos + (n_prompt - start_pos - 1 > 0 ? n_prompt - start_pos - 1 : 0) + total_generation_tokens;
+        srv.kv_pos = n_prompt; /* prompt tokens 0..n_prompt-1 are in KV cache */
+
     }
 
     printf("\n");
@@ -828,27 +834,13 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             if (ptokens[cache_start] != srv.last_prompt_tokens[cache_start]) break;
         }
     }
-    /* Re-enable prompt caching. To avoid stale KV cache corruption when
-     * the previous request generated tokens beyond start_pos, we only
-     * cache the prompt (positions 0..n_prompt-1). The previous request's
-     * generated tokens at positions n_prompt onwards are harmless because
-     * the current request overwrites them as it generates.
-     *
-     * We also only cache when the ENTIRE prompt matches (not just prefix),
-     * to avoid the case where the current request's prompt is shorter than
-     * the previous one (KV cache at positions beyond current n_prompt has
-     * stale data from previous generation).
-     */
-    /* Prompt caching: always recompute the full prompt.
-     * KV cache reuse from previous requests causes corruption when
-     * the previous request's generated tokens overlap with the current
-     * request's generation positions. The attention loop reads stale
-     * KV data that was written by a different token.
-     *
-     * TODO: fix by memsetting KV cache to zero between requests,
-     * or by properly tracking which positions are valid.
-     */
-    int start_pos = 0;
+    /* Use shared prefix from KV cache. The attention loop iterates
+     * from t=0 to t<=pos, so stale KV data at positions beyond n_prompt
+     * is never read (it will be overwritten during generation). */
+    int start_pos = cache_start;
+    if (start_pos == 0) {
+        srv.kv_pos = 0;
+    }
 
     /* Save prompt tokens for next request */
     if (n_prompt > srv.max_last_prompt) {
@@ -893,14 +885,28 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             "\r\n");
         send(sock, hdr, strlen(hdr), 0);
 
-        int token = start_pos > 0 ? ptokens[start_pos - 1] : (n_prompt > 0 ? ptokens[0] : (int)tokenizer->bos_id);
         int gen_count = 0;
         const char *stop_type = "none";
         const char *stopping_word = "";
         char *generated_stream = (char *)calloc(1, 1024);
         int generated_stream_cap = 1024;
 
-        for (int pos = start_pos; pos < n_prompt + n_predict; pos++) {
+        /* If the entire prompt is cached (start_pos >= n_prompt), step back
+         * to position n_prompt - 1 so model_forward produces correct logits
+         * for sampling the first generated token. The KV cache at that
+         * position is already valid from the previous request. */
+        int gen_start = start_pos;
+        if (gen_start >= n_prompt) {
+            gen_start = n_prompt - 1;
+        }
+        /* The token for position gen_start is ptokens[gen_start] (the token
+         * stored at that position), not ptokens[gen_start-1]. For the normal
+         * case (gen_start < n_prompt), the loop condition pos < n_prompt - 1
+         * will advance token to ptokens[pos+1]. For the step-back case,
+         * gen_start == n_prompt - 1, so we need token = ptokens[n_prompt-1]. */
+        int token = ptokens[gen_start];
+
+        for (int pos = gen_start; pos < n_prompt + n_predict; pos++) {
             float *logits = model_forward(model, token, pos);
 
             if (pos < n_prompt - 1 || prompt_only) {
@@ -991,7 +997,11 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
                 n_prompt, gen_count, gen_ms, gen_ms > 0 ? gen_count / (gen_ms / 1000.0) : 0);
     } else {
         /* Non-streaming: collect all tokens, build one big response */
-        int token = start_pos > 0 ? ptokens[start_pos - 1] : (n_prompt > 0 ? ptokens[0] : (int)tokenizer->bos_id);
+        int gen_start_ns = start_pos;
+        if (gen_start_ns >= n_prompt) {
+            gen_start_ns = n_prompt - 1;
+        }
+        int token = ptokens[gen_start_ns];
         int gen_count = 0;
         const char *stop_type = "none";
         const char *stopping_word = "";
@@ -999,7 +1009,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         generated[0] = '\0';
         int *gen_token_ids = (int *)malloc((size_t)n_predict * sizeof(int));
 
-        for (int pos = start_pos; pos < n_prompt + n_predict; pos++) {
+        for (int pos = gen_start_ns; pos < n_prompt + n_predict; pos++) {
             float *logits = model_forward(model, token, pos);
 
             if (pos < n_prompt - 1 || prompt_only) {
@@ -1075,8 +1085,9 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         free(json);
         cJSON_Delete(resp);
 
-        fprintf(stderr, "\n[server] /completion: %d prompt tokens, %d generated in %.0fms (%.1f tok/s)\n",
-                n_prompt, gen_count, gen_ms, gen_ms > 0 ? gen_count / (gen_ms / 1000.0) : 0);
+        srv.kv_pos = n_prompt; /* prompt tokens 0..n_prompt-1 are in KV cache */
+        fprintf(stderr, "\n[server] /completion: cached=%d/%d prompt, %d generated in %.0fms (%.1f tok/s)\n",
+                start_pos, n_prompt, gen_count, gen_ms, gen_ms > 0 ? gen_count / (gen_ms / 1000.0) : 0);
 
         free(generated);
         free(gen_token_ids);
