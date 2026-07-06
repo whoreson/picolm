@@ -12,6 +12,7 @@
 #include <windows.h>
 #else
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -1122,14 +1123,16 @@ static size_t layer_weight_bytes(const model_t *m, int layer) {
     int kv_dim = c->n_kv_heads * c->head_dim;
     size_t total = 0;
 
-    if (lw->attn_norm) total += weight_tensor_bytes(c->n_embd, c->n_embd, lw->type_attn_norm);
+    /* Norm tensors are 1D vectors of length n_embd (or head_dim for q/k norms).
+     * weight_tensor_bytes(1, n, type) = gguf_type_row_size(type, n). */
+    if (lw->attn_norm) total += weight_tensor_bytes(1, c->n_embd, lw->type_attn_norm);
     if (lw->attn_q)    total += weight_tensor_bytes(q_dim, c->n_embd, lw->type_attn_q);
     if (lw->attn_k)    total += weight_tensor_bytes(kv_dim, c->n_embd, lw->type_attn_k);
     if (lw->attn_v)    total += weight_tensor_bytes(kv_dim, c->n_embd, lw->type_attn_v);
     if (lw->attn_output) total += weight_tensor_bytes(c->n_embd, q_dim, lw->type_attn_output);
-    if (lw->attn_q_norm) total += weight_tensor_bytes(c->head_dim, c->head_dim, lw->type_attn_q_norm);
-    if (lw->attn_k_norm) total += weight_tensor_bytes(c->head_dim, c->head_dim, lw->type_attn_k_norm);
-    if (lw->ffn_norm)  total += weight_tensor_bytes(c->n_embd, c->n_embd, lw->type_ffn_norm);
+    if (lw->attn_q_norm) total += weight_tensor_bytes(1, c->head_dim, lw->type_attn_q_norm);
+    if (lw->attn_k_norm) total += weight_tensor_bytes(1, c->head_dim, lw->type_attn_k_norm);
+    if (lw->ffn_norm)  total += weight_tensor_bytes(1, c->n_embd, lw->type_ffn_norm);
     if (lw->ffn_gate)  total += weight_tensor_bytes(c->n_ffn, c->n_embd, lw->type_ffn_gate);
     if (lw->ffn_up)    total += weight_tensor_bytes(c->n_ffn, c->n_embd, lw->type_ffn_up);
     if (lw->ffn_down)  total += weight_tensor_bytes(c->n_embd, c->n_ffn, lw->type_ffn_down);
@@ -1143,7 +1146,7 @@ static size_t global_weight_bytes(const model_t *m) {
     if (w->token_embd)
         total += weight_tensor_bytes(m->config.vocab_size, m->config.n_embd, w->type_token_embd);
     if (w->output_norm)
-        total += weight_tensor_bytes(m->config.n_embd, m->config.n_embd, w->type_output_norm);
+        total += weight_tensor_bytes(1, m->config.n_embd, w->type_output_norm);
     if (w->output && w->output != w->token_embd)
         total += weight_tensor_bytes(m->config.n_embd, m->config.vocab_size, w->type_output);
     return total;
@@ -1171,8 +1174,21 @@ static const uint8_t *page_align_down(const uint8_t *p) {
 int model_lock_layers(model_t *m, size_t mem_bytes) {
     const model_config_t *c = &m->config;
 
+    /* Cap budget to RLIMIT_MEMLOCK minus page alignment overhead.
+     * After merging, we have ~3-4 contiguous ranges for all locked
+     * tensors, each rounded up to the next page boundary. Reserve
+     * a few extra pages to account for this overhead. */
+    size_t effective_budget = mem_bytes;
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) {
+        size_t page_overhead = (size_t)(c->n_layers + 1) * 4 * 4096;
+        size_t rlimit_budget = rl.rlim_cur - page_overhead;
+        if (rlimit_budget < effective_budget)
+            effective_budget = rlimit_budget;
+    }
+
     size_t gbytes = global_weight_bytes(m);
-    if (gbytes > mem_bytes) {
+    if (gbytes > effective_budget) {
         fprintf(stderr, "Lock: budget too small for global tensors (%.1f MB)\n",
                 gbytes / (1024.0 * 1024.0));
         return 0;
@@ -1184,7 +1200,7 @@ int model_lock_layers(model_t *m, size_t mem_bytes) {
 
     for (int l = 0; l < c->n_layers; l++) {
         size_t lbytes = layer_weight_bytes(m, l);
-        if (locked_bytes + lbytes > mem_bytes) break;
+        if (locked_bytes + lbytes > effective_budget) break;
         locked_bytes += lbytes;
         layers_locked++;
     }
@@ -1218,7 +1234,7 @@ int model_lock_layers(model_t *m, size_t mem_bytes) {
 
     /* Global tensors */
     ADD_RANGE(m->weights.token_embd, weight_tensor_bytes(c->vocab_size, c->n_embd, m->weights.type_token_embd));
-    ADD_RANGE(m->weights.output_norm, weight_tensor_bytes(c->n_embd, c->n_embd, m->weights.type_output_norm));
+    ADD_RANGE(m->weights.output_norm, weight_tensor_bytes(1, c->n_embd, m->weights.type_output_norm));
     if (m->weights.output && m->weights.output != m->weights.token_embd)
         ADD_RANGE(m->weights.output, weight_tensor_bytes(c->n_embd, c->vocab_size, m->weights.type_output));
 
@@ -1227,14 +1243,14 @@ int model_lock_layers(model_t *m, size_t mem_bytes) {
     int kv_dim = c->n_kv_heads * c->head_dim;
     for (int l = 0; l < layers_locked; l++) {
         const layer_weights_t *lw = &m->weights.layers[l];
-        ADD_RANGE(lw->attn_norm, lw->attn_norm ? weight_tensor_bytes(c->n_embd, c->n_embd, lw->type_attn_norm) : 0);
+        ADD_RANGE(lw->attn_norm, lw->attn_norm ? weight_tensor_bytes(1, c->n_embd, lw->type_attn_norm) : 0);
         ADD_RANGE(lw->attn_q, lw->attn_q ? weight_tensor_bytes(q_dim, c->n_embd, lw->type_attn_q) : 0);
         ADD_RANGE(lw->attn_k, lw->attn_k ? weight_tensor_bytes(kv_dim, c->n_embd, lw->type_attn_k) : 0);
         ADD_RANGE(lw->attn_v, lw->attn_v ? weight_tensor_bytes(kv_dim, c->n_embd, lw->type_attn_v) : 0);
         ADD_RANGE(lw->attn_output, lw->attn_output ? weight_tensor_bytes(c->n_embd, q_dim, lw->type_attn_output) : 0);
-        ADD_RANGE(lw->attn_q_norm, lw->attn_q_norm ? weight_tensor_bytes(c->head_dim, c->head_dim, lw->type_attn_q_norm) : 0);
-        ADD_RANGE(lw->attn_k_norm, lw->attn_k_norm ? weight_tensor_bytes(c->head_dim, c->head_dim, lw->type_attn_k_norm) : 0);
-        ADD_RANGE(lw->ffn_norm, lw->ffn_norm ? weight_tensor_bytes(c->n_embd, c->n_embd, lw->type_ffn_norm) : 0);
+        ADD_RANGE(lw->attn_q_norm, lw->attn_q_norm ? weight_tensor_bytes(1, c->head_dim, lw->type_attn_q_norm) : 0);
+        ADD_RANGE(lw->attn_k_norm, lw->attn_k_norm ? weight_tensor_bytes(1, c->head_dim, lw->type_attn_k_norm) : 0);
+        ADD_RANGE(lw->ffn_norm, lw->ffn_norm ? weight_tensor_bytes(1, c->n_embd, lw->type_ffn_norm) : 0);
         ADD_RANGE(lw->ffn_gate, lw->ffn_gate ? weight_tensor_bytes(c->n_ffn, c->n_embd, lw->type_ffn_gate) : 0);
         ADD_RANGE(lw->ffn_up, lw->ffn_up ? weight_tensor_bytes(c->n_ffn, c->n_embd, lw->type_ffn_up) : 0);
         ADD_RANGE(lw->ffn_down, lw->ffn_down ? weight_tensor_bytes(c->n_embd, c->n_ffn, lw->type_ffn_down) : 0);
@@ -1270,6 +1286,15 @@ int model_lock_layers(model_t *m, size_t mem_bytes) {
             ranges_end[merged] = ranges_end[i];
             merged++;
         }
+    }
+
+    /* Clamp range ends to the mmap boundary. page_align_up can push the
+     * end past the file size when the last tensor is near EOF. */
+    const uint8_t *mmap_end = (const uint8_t *)m->mmap_addr + m->mmap_size;
+    mmap_end = (const uint8_t *)(((uintptr_t)mmap_end + 4095) & ~(uintptr_t)4095);
+    for (int i = 0; i < merged; i++) {
+        if ((const uint8_t *)ranges_end[i] > mmap_end)
+            ranges_end[i] = mmap_end;
     }
 
     /* Call mlock on each merged range */
@@ -1328,7 +1353,7 @@ int model_unlock_layers(model_t *m) {
     } while(0)
 
     ADD_RANGE(m->weights.token_embd, weight_tensor_bytes(c->vocab_size, c->n_embd, m->weights.type_token_embd));
-    ADD_RANGE(m->weights.output_norm, weight_tensor_bytes(c->n_embd, c->n_embd, m->weights.type_output_norm));
+    ADD_RANGE(m->weights.output_norm, weight_tensor_bytes(1, c->n_embd, m->weights.type_output_norm));
     if (m->weights.output && m->weights.output != m->weights.token_embd)
         ADD_RANGE(m->weights.output, weight_tensor_bytes(c->n_embd, c->vocab_size, m->weights.type_output));
 
@@ -1336,14 +1361,14 @@ int model_unlock_layers(model_t *m) {
     int kv_dim = c->n_kv_heads * c->head_dim;
     for (int l = 0; l < m->locked_layers; l++) {
         const layer_weights_t *lw = &m->weights.layers[l];
-        ADD_RANGE(lw->attn_norm, lw->attn_norm ? weight_tensor_bytes(c->n_embd, c->n_embd, lw->type_attn_norm) : 0);
+        ADD_RANGE(lw->attn_norm, lw->attn_norm ? weight_tensor_bytes(1, c->n_embd, lw->type_attn_norm) : 0);
         ADD_RANGE(lw->attn_q, lw->attn_q ? weight_tensor_bytes(q_dim, c->n_embd, lw->type_attn_q) : 0);
         ADD_RANGE(lw->attn_k, lw->attn_k ? weight_tensor_bytes(kv_dim, c->n_embd, lw->type_attn_k) : 0);
         ADD_RANGE(lw->attn_v, lw->attn_v ? weight_tensor_bytes(kv_dim, c->n_embd, lw->type_attn_v) : 0);
         ADD_RANGE(lw->attn_output, lw->attn_output ? weight_tensor_bytes(c->n_embd, q_dim, lw->type_attn_output) : 0);
-        ADD_RANGE(lw->attn_q_norm, lw->attn_q_norm ? weight_tensor_bytes(c->head_dim, c->head_dim, lw->type_attn_q_norm) : 0);
-        ADD_RANGE(lw->attn_k_norm, lw->attn_k_norm ? weight_tensor_bytes(c->head_dim, c->head_dim, lw->type_attn_k_norm) : 0);
-        ADD_RANGE(lw->ffn_norm, lw->ffn_norm ? weight_tensor_bytes(c->n_embd, c->n_embd, lw->type_ffn_norm) : 0);
+        ADD_RANGE(lw->attn_q_norm, lw->attn_q_norm ? weight_tensor_bytes(1, c->head_dim, lw->type_attn_q_norm) : 0);
+        ADD_RANGE(lw->attn_k_norm, lw->attn_k_norm ? weight_tensor_bytes(1, c->head_dim, lw->type_attn_k_norm) : 0);
+        ADD_RANGE(lw->ffn_norm, lw->ffn_norm ? weight_tensor_bytes(1, c->n_embd, lw->type_ffn_norm) : 0);
         ADD_RANGE(lw->ffn_gate, lw->ffn_gate ? weight_tensor_bytes(c->n_ffn, c->n_embd, lw->type_ffn_gate) : 0);
         ADD_RANGE(lw->ffn_up, lw->ffn_up ? weight_tensor_bytes(c->n_ffn, c->n_embd, lw->type_ffn_up) : 0);
         ADD_RANGE(lw->ffn_down, lw->ffn_down ? weight_tensor_bytes(c->n_embd, c->n_ffn, lw->type_ffn_down) : 0);
@@ -1370,6 +1395,14 @@ int model_unlock_layers(model_t *m) {
             ranges_end[merged] = ranges_end[i];
             merged++;
         }
+    }
+
+    /* Clamp to mmap boundary (same as lock path) */
+    const uint8_t *munlock_mmap_end = (const uint8_t *)m->mmap_addr + m->mmap_size;
+    munlock_mmap_end = (const uint8_t *)(((uintptr_t)munlock_mmap_end + 4095) & ~(uintptr_t)4095);
+    for (int i = 0; i < merged; i++) {
+        if ((const uint8_t *)ranges_end[i] > munlock_mmap_end)
+            ranges_end[i] = munlock_mmap_end;
     }
 
     size_t total_unlocked = 0;
