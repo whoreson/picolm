@@ -4,6 +4,9 @@
   <img src="https://img.shields.io/badge/Runtime_RAM-45MB-orange?style=flat-square" alt="RAM">
   <img src="https://img.shields.io/badge/Dependencies-Zero-success?style=flat-square" alt="Zero Dependencies">
   <img src="https://img.shields.io/badge/License-MIT-yellow?style=flat-square" alt="MIT License">
+  <img src="https://img.shields.io/badge/HTTP_Server-OpenAI_API-red?style=flat-square" alt="HTTP Server">
+  <img src="https://img.shields.io/badge/SIMD-AVX2%2CNEON%2CSSE2-purple?style=flat-square" alt="SIMD">
+  <img src="https://img.shields.io/badge/Models-Qwen3%2CSmolLM%2CLlama-blue?style=flat-square" alt="Models">
 </p>
 
 <h1 align="center">PicoLM</h1>
@@ -12,6 +15,65 @@
   <strong>Run a 1-billion parameter LLM on a $10 board with 256MB RAM.</strong><br>
   Pure C. Zero dependencies. One binary. No Python. No cloud.
 </p>
+
+---
+
+# PicoLM \- But It's Actually Useful
+
+> **The upstream repo was a cute demo. We made it into a legitimate inference engine.**
+
+The original PicoLM was a clever proof-of-concept: mmap a GGUF, stream layers through 45MB of RAM, call it a day. Noble effort, but it was missing basically everything you need to actually *use* an LLM in production. So [gabucino](http://gabucino.hu) went in and **added ~59 commits of hard-won optimizations, features, and bug fixes** that transform this from a toy into a serious inference runtime.
+
+**Here's what the upstream repo was missing:**
+- Any SIMD acceleration for quantized matmul (Q8\_0/Q4\_K/Q4\_0 were scalar only)
+- An HTTP server of any kind
+- No Qwen2/Qwen3 support (broken on non-uniform head\_dim)
+- Per-matmul `pthread_create`/`pthread_join` (224 thread spawns per token)
+- No quantized KV cache
+- No memory pinning
+- No prompt caching between requests
+- No client disconnect detection
+- No Windows thread pool support
+
+**Here's what we delivered:**
+
+| Feature | Upstream | This Fork |
+|---------|----------|-----------|
+| **Q8\_0 SIMD int8 MAC** | Scalar only | AVX2/AVX/SSE4.1/NEON |
+| **Q4\_K SIMD matmul** | Scalar only | AVX2/AVX1 |
+| **Q4\_0 SIMD matmul** | Missing | AVX2/AVX/SSE2 + ARM bugfix |
+| **Q4\_0\_8\_8 experimental** | Missing | 8-row interleaved, AVX2 |
+| **64KB FP16 lookup table** | Arithmetic fp16\->fp32 | Table-indexed \- **~4x faster** on non-F16C hardware |
+| **SIMD attention loop** | Scalar K.dot.Q + V-accum | AVX/SSE2/NEON with FMA |
+| **Persistent thread pool** | pthread create/join per matmul | Generation-counter barrier, **zero thread churn** |
+| **HTTP server** | Doesn't exist | Full OpenAI API + llama.cpp-compatible endpoints |
+| **Streaming SSE** | N/A | Chunked transfer, client disconnect detection |
+| **Prompt caching** | CLI-only `--cache` file | Server-side KV cache reuse + prefix matching |
+| **Qwen2/Qwen3 support** | Broken | Interleaved RoPE, QK-norm, non-uniform head\_dim |
+| **Quantized KV cache** | FP16 only | Q8\_0/Q4\_0 KV cache (**53%/34% of FP16 memory**) |
+| **Memory pinning** | No | `--mem N` to `mlock()` layer weights in RAM |
+| **NEON SIMD RoPE** | Missing | ARM RoPE + FP16 HW conversion |
+| **mmap prefaulting** | No | `MADV_WILLNEED` + `MADV_SEQUENTIAL` + Windows scan |
+| **Cross-platform threads** | Linux pthreads only | Windows SRWLOCK+CONDITION_VARIABLE |
+| **Batch prefill** | No | Infrastructure (disabled pending threading merge) |
+| **Tokenizer fixes** | U+2581 only | Auto-detect U+0100 (SmolLM), U+2581 (Llama), U+2060 |
+| **RMS norm epsilon** | Hardcoded 1e-5 | Read from GGUF (1e-5/1e-6 per model) |
+
+### What It Takes to Add an HTTP Server + OpenAI API to a "Minimal" Inference Engine
+
+The upstream repo had zero networking. We added:
+- **`/v1/completions`** \- OpenAI-compatible completion endpoint
+- **`/v1/chat/completions`** \- OpenAI-compatible chat endpoint
+- **`/v1/models`** \- Model listing endpoint
+- **`/completion`** \- llama.cpp-compatible endpoint with stop words
+- **`/props`** \- Model properties endpoint (llama.cpp-compatible)
+- Streaming SSE responses with proper chunked transfer encoding
+- Persistent model loading (model stays loaded across requests)
+- KV cache reuse with prompt prefix matching (skip prefill on overlapping prompts)
+- Early abort on client disconnect (don't waste GPU\... er, CPU cycles)
+- All of this with a vendored MIT cJSON library, **zero additional dependencies**
+
+---
 
 <p align="center">
   <code>echo "Explain gravity" | ./picolm model.gguf -n 100 -j 4</code>
