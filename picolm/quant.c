@@ -32,7 +32,7 @@ float fp16_to_fp32_lookup(uint16_t h) {
  * FP16 <-> FP32 conversion (software, no hardware dependency)
  * ================================================================ */
 
-/* fp16-fp32 dot product: sum of fp16_to_fp32(k[i]) * x[i] for i=0..n-1 */
+/* fp16-fp32 dot product: sum of fp16_to_fp32_lookup(k[i]) * x[i] for i=0..n-1 */
 float vec_dot_f16_f32(const void *src, const float *x, int n) {
     const uint16_t *k = (const uint16_t *)src;
 #ifdef PICOLM_NEON
@@ -48,7 +48,7 @@ float vec_dot_f16_f32(const void *src, const float *x, int n) {
         acc1 = vmlaq_f32(acc1, kf1, xf1);
     }
     float sumf = vaddvq_f32(vaddq_f32(acc0, acc1));
-    for (; i < n; i++) sumf += fp16_to_fp32(k[i]) * x[i];
+    for (; i < n; i++) sumf += fp16_to_fp32_lookup(k[i]) * x[i];
     return sumf;
 #elif defined(PICOLM_AVX)
     __m256 acc = _mm256_setzero_ps();
@@ -59,7 +59,7 @@ float vec_dot_f16_f32(const void *src, const float *x, int n) {
         acc = _mm256_add_ps(acc, _mm256_mul_ps(kf, xf));
     }
     float sumf = hsum_avx(acc);
-    for (; i < n; i++) sumf += fp16_to_fp32(k[i]) * x[i];
+    for (; i < n; i++) sumf += fp16_to_fp32_lookup(k[i]) * x[i];
     return sumf;
 #elif defined(PICOLM_SSE2)
     __m128 acc = _mm_setzero_ps();
@@ -70,11 +70,11 @@ float vec_dot_f16_f32(const void *src, const float *x, int n) {
         acc = _mm_add_ps(acc, _mm_mul_ps(kf, xf));
     }
     float sumf = hsum_sse(acc);
-    for (; i < n; i++) sumf += fp16_to_fp32(k[i]) * x[i];
+    for (; i < n; i++) sumf += fp16_to_fp32_lookup(k[i]) * x[i];
     return sumf;
 #else
     float sumf = 0.0f;
-    for (int i = 0; i < n; i++) sumf += fp16_to_fp32(k[i]) * x[i];
+    for (int i = 0; i < n; i++) sumf += fp16_to_fp32_lookup(k[i]) * x[i];
     return sumf;
 #endif
 }
@@ -170,8 +170,8 @@ void dequantize_row_q4_K(const void *src, float *dst, int n) {
 
     for (int i = 0; i < nb; i++) {
         const block_q4_K *b = &blocks[i];
-        float d    = fp16_to_fp32(b->d);
-        float dmin = fp16_to_fp32(b->dmin);
+        float d    = fp16_to_fp32_lookup(b->d);
+        float dmin = fp16_to_fp32_lookup(b->dmin);
         const uint8_t *q = b->qs;
         float *y = dst + i * 256;
 
@@ -204,7 +204,7 @@ void dequantize_row_q3_K(const void *src, float *dst, int n) {
 
     for (int i = 0; i < nb; i++) {
         const block_q3_K *b = &blocks[i];
-        float d = fp16_to_fp32(b->d);
+        float d = fp16_to_fp32_lookup(b->d);
 
         int32_t scales[16];
         {
@@ -245,8 +245,8 @@ void dequantize_row_q2_K(const void *src, float *dst, int n) {
 
     for (int i = 0; i < nb; i++) {
         const block_q2_K *b = &blocks[i];
-        float d    = fp16_to_fp32(b->d);
-        float dmin = fp16_to_fp32(b->dmin);
+        float d    = fp16_to_fp32_lookup(b->d);
+        float dmin = fp16_to_fp32_lookup(b->dmin);
 
         const uint8_t *qs = b->qs;
         int out_idx = i * 256;
@@ -266,7 +266,7 @@ void dequantize_row_q6_K(const void *src, float *dst, int n) {
     int nb = n / 256;
 
     for (int i = 0; i < nb; i++) {
-        float d = fp16_to_fp32(blocks[i].d);
+        float d = fp16_to_fp32_lookup(blocks[i].d);
         const uint8_t *ql = blocks[i].ql;
         const uint8_t *qh = blocks[i].qh;
         const int8_t  *sc = blocks[i].scales;
@@ -297,7 +297,7 @@ void dequantize_row_q8_0(const void *src, float *dst, int n) {
     int nb = n / 32;
 
     for (int i = 0; i < nb; i++) {
-        float d = fp16_to_fp32(blocks[i].d);
+        float d = fp16_to_fp32_lookup(blocks[i].d);
         for (int j = 0; j < 32; j++) {
             dst[i * 32 + j] = d * (float)blocks[i].qs[j];
         }
@@ -309,7 +309,7 @@ void dequantize_row_q4_0(const void *src, float *dst, int n) {
     int nb = n / 32;
 
     for (int i = 0; i < nb; i++) {
-        float d = fp16_to_fp32(blocks[i].d);
+        float d = fp16_to_fp32_lookup(blocks[i].d);
         for (int j = 0; j < 32; j++) {
             uint8_t nibble;
             if (j < 16) {
@@ -329,7 +329,7 @@ void dequantize_row_q4_0_4_4(const void *src, float *dst, int n) {
     int nb = n / 32;
 
     for (int i = 0; i < nb; i++) {
-        float d = fp16_to_fp32(blocks[i].d[0]);
+        float d = fp16_to_fp32_lookup(blocks[i].d[0]);
         for (int k = 0; k < 4; k++) {
             for (int j = 0; j < 4; j++) {
                 uint8_t byte = blocks[i].qs[k * 16 + j * 4];
@@ -355,7 +355,7 @@ void dequantize_row_q4_0_8_8(const void *src, float *dst, int n) {
     int row_in_group = 0;
 
     for (int i = 0; i < nb; i++) {
-        float d = fp16_to_fp32(blocks[i].d[row_in_group]);
+        float d = fp16_to_fp32_lookup(blocks[i].d[row_in_group]);
         for (int k = 0; k < 4; k++) {
             for (int j = 0; j < 8; j++) {
                 uint8_t byte = blocks[i].qs[k * 128 + row_in_group * 8 + j];
@@ -371,7 +371,7 @@ void dequantize_row_q4_0_8_8(const void *src, float *dst, int n) {
 void dequantize_row_f16(const void *src, float *dst, int n) {
     const uint16_t *fp16 = (const uint16_t *)src;
     for (int i = 0; i < n; i++) {
-        dst[i] = fp16_to_fp32(fp16[i]);
+        dst[i] = fp16_to_fp32_lookup(fp16[i]);
     }
 }
 
@@ -520,8 +520,8 @@ float vec_dot_q4_K_f32(const void *src, const float *x, int n) {
 
     for (int i = 0; i < nb; i++) {
         const block_q4_K *b = &blocks[i];
-        float d    = fp16_to_fp32(b->d);
-        float dmin = fp16_to_fp32(b->dmin);
+        float d    = fp16_to_fp32_lookup(b->d);
+        float dmin = fp16_to_fp32_lookup(b->dmin);
         const uint8_t *q = b->qs;
         const float *xp = x + i * 256;
 
@@ -715,7 +715,7 @@ float vec_dot_q6_K_f32(const void *src, const float *x, int n) {
     float sumf = 0.0f;
 
     for (int i = 0; i < nb; i++) {
-        float d = fp16_to_fp32(blocks[i].d);
+        float d = fp16_to_fp32_lookup(blocks[i].d);
         const uint8_t *ql = blocks[i].ql;
         const uint8_t *qh = blocks[i].qh;
         const int8_t  *sc = blocks[i].scales;
@@ -1224,8 +1224,8 @@ float vec_dot_q4_K_q8_K(const void *src_q4, const void *src_q8, int n) {
     __m128 acc_m = _mm_setzero_ps();
 
     for (int i = 0; i < nb; ++i) {
-        const float d = y[i].d * fp16_to_fp32(x[i].d);
-        const float dmin = -y[i].d * fp16_to_fp32(x[i].dmin);
+        const float d = y[i].d * fp16_to_fp32_lookup(x[i].d);
+        const float dmin = -y[i].d * fp16_to_fp32_lookup(x[i].dmin);
 
         memcpy(utmp, x[i].scales, 12);
         utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
@@ -1301,8 +1301,8 @@ float vec_dot_q4_K_q8_K(const void *src_q4, const void *src_q8, int n) {
     __m128 acc_m = _mm_setzero_ps();
 
     for (int i = 0; i < nb; ++i) {
-        const float d = y[i].d * fp16_to_fp32(x[i].d);
-        const float dmin = -y[i].d * fp16_to_fp32(x[i].dmin);
+        const float d = y[i].d * fp16_to_fp32_lookup(x[i].d);
+        const float dmin = -y[i].d * fp16_to_fp32_lookup(x[i].dmin);
 
         const uint8_t *q4 = x[i].qs;
         const int8_t  *q8 = y[i].qs;
@@ -1428,10 +1428,10 @@ float vec_dot_q4_K_q8_K(const void *src_q4, const void *src_q8, int n) {
             q8 += 8; a += 8;
         }
 
-        const float d = fp16_to_fp32(x[i].d) * y[i].d;
+        const float d = fp16_to_fp32_lookup(x[i].d) * y[i].d;
         for (int l = 0; l < 8; l++) sums[l] += d * aux32[l];
 
-        const float dmin = fp16_to_fp32(x[i].dmin) * y[i].d;
+        const float dmin = fp16_to_fp32_lookup(x[i].dmin) * y[i].d;
         sumf -= dmin * sumi;
     }
     for (int l = 0; l < 8; l++) sumf += sums[l];
@@ -1523,7 +1523,7 @@ float vec_dot_q4_0_q8_0(const void *vx, const void *wy, int n) {
 
         for (; ib < nb; ++ib) {
             const __m256 d = _mm256_set1_ps(
-                fp16_to_fp32(x[ib].d) * fp16_to_fp32(y[ib].d));
+                fp16_to_fp32_lookup(x[ib].d) * fp16_to_fp32_lookup(y[ib].d));
             __m256i qx = _mm256_sub_epi8(bytes_from_nibbles_32(x[ib].qs), off);
             __m256i qy = _mm256_loadu_si256((const __m256i *)y[ib].qs);
             acc = _mm256_fmadd_ps(d, mul_sum_i8_pairs_float(qx, qy), acc);
@@ -1558,8 +1558,8 @@ float vec_dot_q4_0_q8_0(const void *vx, const void *wy, int n) {
             const __m128i p_2 = _mm_add_epi16(p16_2_0, p16_2_1);
 
             __m256 p = sum_i16_pairs_float(p_2, p_1);
-            float d0 = fp16_to_fp32(x[ib].d) * fp16_to_fp32(y[ib].d);
-            float d1 = fp16_to_fp32(x[ib + 1].d) * fp16_to_fp32(y[ib + 1].d);
+            float d0 = fp16_to_fp32_lookup(x[ib].d) * fp16_to_fp32_lookup(y[ib].d);
+            float d1 = fp16_to_fp32_lookup(x[ib + 1].d) * fp16_to_fp32_lookup(y[ib + 1].d);
             __m256 deltas = _mm256_set_m128(_mm_set1_ps(d1), _mm_set1_ps(d0));
             accum = _mm256_add_ps(_mm256_mul_ps(deltas, p), accum);
         }
@@ -1577,7 +1577,7 @@ float vec_dot_q4_0_q8_0(const void *vx, const void *wy, int n) {
 
         for (; ib + 1 < nb; ib += 2) {
             const __m128 d_0_1 = _mm_set1_ps(
-                fp16_to_fp32(x[ib].d) * fp16_to_fp32(y[ib].d));
+                fp16_to_fp32_lookup(x[ib].d) * fp16_to_fp32_lookup(y[ib].d));
             const __m128i tmp_0_1 = _mm_loadu_si128((const __m128i *)x[ib].qs);
             __m128i bx_0 = _mm_sub_epi8(_mm_and_si128(mask4, tmp_0_1), off);
             const __m128i i32_0 = mul_sum_i8_pairs_sse(bx_0, _mm_loadu_si128((const __m128i *)y[ib].qs));
@@ -1585,7 +1585,7 @@ float vec_dot_q4_0_q8_0(const void *vx, const void *wy, int n) {
             const __m128i i32_1 = mul_sum_i8_pairs_sse(bx_1, _mm_loadu_si128((const __m128i *)(y[ib].qs + 16)));
 
             const __m128 d_2_3 = _mm_set1_ps(
-                fp16_to_fp32(x[ib + 1].d) * fp16_to_fp32(y[ib + 1].d));
+                fp16_to_fp32_lookup(x[ib + 1].d) * fp16_to_fp32_lookup(y[ib + 1].d));
             const __m128i tmp_2_3 = _mm_loadu_si128((const __m128i *)x[ib + 1].qs);
             __m128i bx_2 = _mm_sub_epi8(_mm_and_si128(mask4, tmp_2_3), off);
             const __m128i i32_2 = mul_sum_i8_pairs_sse(bx_2, _mm_loadu_si128((const __m128i *)y[ib + 1].qs));
@@ -1613,7 +1613,7 @@ float vec_dot_q4_0_q8_0(const void *vx, const void *wy, int n) {
             sumi0 += v0 * y[ib].qs[j];
             sumi1 += v1 * y[ib].qs[j + 16];
         }
-        sumf += (float)(sumi0 + sumi1) * fp16_to_fp32(x[ib].d) * fp16_to_fp32(y[ib].d);
+        sumf += (float)(sumi0 + sumi1) * fp16_to_fp32_lookup(x[ib].d) * fp16_to_fp32_lookup(y[ib].d);
     }
 
     return sumf;
@@ -1642,7 +1642,7 @@ float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n) {
             const int16x8_t p3 = vmull_s8(vget_high_s8(x0_1), vget_high_s8(w0_1));
             const int32x4_t s = vaddq_s32(vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)),
                                           vaddq_s32(vpaddlq_s16(p2), vpaddlq_s16(p3)));
-            const float d = fp16_to_fp32(x[i].d) * fp16_to_fp32(w[i].d);
+            const float d = fp16_to_fp32_lookup(x[i].d) * fp16_to_fp32_lookup(w[i].d);
             sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(s), d);
         }
         const int8x16_t x1_0 = vld1q_s8(x[i+1].qs);
@@ -1656,7 +1656,7 @@ float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n) {
             const int16x8_t p3 = vmull_s8(vget_high_s8(x1_1), vget_high_s8(w1_1));
             const int32x4_t s = vaddq_s32(vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)),
                                           vaddq_s32(vpaddlq_s16(p2), vpaddlq_s16(p3)));
-            const float d = fp16_to_fp32(x[i+1].d) * fp16_to_fp32(w[i+1].d);
+            const float d = fp16_to_fp32_lookup(x[i+1].d) * fp16_to_fp32_lookup(w[i+1].d);
             sumv1 = vmlaq_n_f32(sumv1, vcvtq_f32_s32(s), d);
         }
     }
@@ -1677,8 +1677,8 @@ float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n) {
         __m256 f0 = _mm256_cvtepi32_ps(s0);
         __m256 f1 = _mm256_cvtepi32_ps(s1);
 
-        float d0 = fp16_to_fp32(x[i].d) * fp16_to_fp32(w[i].d);
-        float d1 = fp16_to_fp32(x[i + 1].d) * fp16_to_fp32(w[i + 1].d);
+        float d0 = fp16_to_fp32_lookup(x[i].d) * fp16_to_fp32_lookup(w[i].d);
+        float d1 = fp16_to_fp32_lookup(x[i + 1].d) * fp16_to_fp32_lookup(w[i + 1].d);
         __m256 dd0 = _mm256_set1_ps(d0);
         __m256 dd1 = _mm256_set1_ps(d1);
 
@@ -1709,8 +1709,8 @@ float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n) {
         __m128i sum1 = _mm_add_epi32(p2, p3);
         __m256 sums = _mm256_cvtepi32_ps(_mm256_set_m128i(sum1, sum0));
 
-        float d0 = fp16_to_fp32(x[i].d) * fp16_to_fp32(w[i].d);
-        float d1 = fp16_to_fp32(x[i + 1].d) * fp16_to_fp32(w[i + 1].d);
+        float d0 = fp16_to_fp32_lookup(x[i].d) * fp16_to_fp32_lookup(w[i].d);
+        float d1 = fp16_to_fp32_lookup(x[i + 1].d) * fp16_to_fp32_lookup(w[i + 1].d);
         __m256 deltas = _mm256_set_m128(_mm_set1_ps(d1), _mm_set1_ps(d0));
         acc = _mm256_add_ps(acc, _mm256_mul_ps(deltas, sums));
     }
@@ -1728,7 +1728,7 @@ float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n) {
         __m128i qw1 = _mm_loadu_si128((const __m128i *)w[i].qs + 1);
         __m128i s0 = _mm_add_epi32(mul_sum_i8_pairs_sse(qx0, qw0),
                                     mul_sum_i8_pairs_sse(qx1, qw1));
-        float d0 = fp16_to_fp32(x[i].d) * fp16_to_fp32(w[i].d);
+        float d0 = fp16_to_fp32_lookup(x[i].d) * fp16_to_fp32_lookup(w[i].d);
         __m128 dd0 = _mm_set1_ps(d0);
         acc0 = _mm_add_ps(acc0, _mm_mul_ps(_mm_cvtepi32_ps(s0), dd0));
 
@@ -1739,7 +1739,7 @@ float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n) {
         __m128i qw3 = _mm_loadu_si128((const __m128i *)w[i + 1].qs + 1);
         __m128i s1 = _mm_add_epi32(mul_sum_i8_pairs_sse(qx2, qw2),
                                     mul_sum_i8_pairs_sse(qx3, qw3));
-        float d1 = fp16_to_fp32(x[i + 1].d) * fp16_to_fp32(w[i + 1].d);
+        float d1 = fp16_to_fp32_lookup(x[i + 1].d) * fp16_to_fp32_lookup(w[i + 1].d);
         __m128 dd1 = _mm_set1_ps(d1);
         acc1 = _mm_add_ps(acc1, _mm_mul_ps(_mm_cvtepi32_ps(s1), dd1));
     }
@@ -1752,7 +1752,7 @@ float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n) {
         for (int j = 0; j < 32; j++) {
             sumi += x[i].qs[j] * w[i].qs[j];
         }
-        sumf += (float)sumi * fp16_to_fp32(x[i].d) * fp16_to_fp32(w[i].d);
+        sumf += (float)sumi * fp16_to_fp32_lookup(x[i].d) * fp16_to_fp32_lookup(w[i].d);
     }
     return sumf;
 }
@@ -1787,7 +1787,7 @@ void vec_dot_q4_0x4_q8_0(const void *vx, const void *wy, int n, float *out, int 
         float sumf = 0.0f;
         for (int ib = 0; ib < nb; ib++) {
             const block_q4_0x4 *b = xb + ib;
-            float dd = fp16_to_fp32(b->d[row]) * fp16_to_fp32(y[ib].d);
+            float dd = fp16_to_fp32_lookup(b->d[row]) * fp16_to_fp32_lookup(y[ib].d);
             int sumi = 0;
             for (int k = 0; k < 4; k++) {
                 for (int i = 0; i < 4; i++) {
@@ -1835,7 +1835,7 @@ float vec_dot_q8_0_q8_0_deltas(const void *qx, const float *qx_d, const void *qw
             const int16x8_t p3 = vmull_s8(vget_high_s8(x0_1), vget_high_s8(w0_1));
             const int32x4_t s = vaddq_s32(vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)),
                                           vaddq_s32(vpaddlq_s16(p2), vpaddlq_s16(p3)));
-            const float d = qx_d[i] * fp16_to_fp32(w[i].d);
+            const float d = qx_d[i] * fp16_to_fp32_lookup(w[i].d);
             sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(s), d);
         }
         const int8x16_t x1_0 = vld1q_s8(x[i+1].qs);
@@ -1849,7 +1849,7 @@ float vec_dot_q8_0_q8_0_deltas(const void *qx, const float *qx_d, const void *qw
             const int16x8_t p3 = vmull_s8(vget_high_s8(x1_1), vget_high_s8(w1_1));
             const int32x4_t s = vaddq_s32(vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)),
                                           vaddq_s32(vpaddlq_s16(p2), vpaddlq_s16(p3)));
-            const float d = qx_d[i+1] * fp16_to_fp32(w[i+1].d);
+            const float d = qx_d[i+1] * fp16_to_fp32_lookup(w[i+1].d);
             sumv1 = vmlaq_n_f32(sumv1, vcvtq_f32_s32(s), d);
         }
     }
@@ -1869,8 +1869,8 @@ float vec_dot_q8_0_q8_0_deltas(const void *qx, const float *qx_d, const void *qw
         __m256 f0 = _mm256_cvtepi32_ps(s0);
         __m256 f1 = _mm256_cvtepi32_ps(s1);
 
-        float d0 = qx_d[i] * fp16_to_fp32(w[i].d);
-        float d1 = qx_d[i + 1] * fp16_to_fp32(w[i + 1].d);
+        float d0 = qx_d[i] * fp16_to_fp32_lookup(w[i].d);
+        float d1 = qx_d[i + 1] * fp16_to_fp32_lookup(w[i + 1].d);
         __m256 dd0 = _mm256_set1_ps(d0);
         __m256 dd1 = _mm256_set1_ps(d1);
         acc = _mm256_add_ps(acc, _mm256_add_ps(_mm256_mul_ps(f0, dd0), _mm256_mul_ps(f1, dd1)));
@@ -1898,8 +1898,8 @@ float vec_dot_q8_0_q8_0_deltas(const void *qx, const float *qx_d, const void *qw
         __m128i sum1 = _mm_add_epi32(p2, p3);
         __m256 sums = _mm256_cvtepi32_ps(_mm256_set_m128i(sum1, sum0));
 
-        float d0 = qx_d[i] * fp16_to_fp32(w[i].d);
-        float d1 = qx_d[i + 1] * fp16_to_fp32(w[i + 1].d);
+        float d0 = qx_d[i] * fp16_to_fp32_lookup(w[i].d);
+        float d1 = qx_d[i + 1] * fp16_to_fp32_lookup(w[i + 1].d);
         __m256 deltas = _mm256_set_m128(_mm_set1_ps(d1), _mm_set1_ps(d0));
         acc = _mm256_add_ps(acc, _mm256_mul_ps(deltas, sums));
     }
@@ -1916,7 +1916,7 @@ float vec_dot_q8_0_q8_0_deltas(const void *qx, const float *qx_d, const void *qw
         __m128i qw1 = _mm_loadu_si128((const __m128i *)w[i].qs + 1);
         __m128i s0 = _mm_add_epi32(mul_sum_i8_pairs_sse(qx0, qw0),
                                     mul_sum_i8_pairs_sse(qx1, qw1));
-        float d0 = qx_d[i] * fp16_to_fp32(w[i].d);
+        float d0 = qx_d[i] * fp16_to_fp32_lookup(w[i].d);
         __m128 dd0 = _mm_set1_ps(d0);
         acc0 = _mm_add_ps(acc0, _mm_mul_ps(_mm_cvtepi32_ps(s0), dd0));
 
@@ -1926,7 +1926,7 @@ float vec_dot_q8_0_q8_0_deltas(const void *qx, const float *qx_d, const void *qw
         __m128i qw3 = _mm_loadu_si128((const __m128i *)w[i + 1].qs + 1);
         __m128i s1 = _mm_add_epi32(mul_sum_i8_pairs_sse(qx2, qw2),
                                     mul_sum_i8_pairs_sse(qx3, qw3));
-        float d1 = qx_d[i + 1] * fp16_to_fp32(w[i + 1].d);
+        float d1 = qx_d[i + 1] * fp16_to_fp32_lookup(w[i + 1].d);
         __m128 dd1 = _mm_set1_ps(d1);
         acc1 = _mm_add_ps(acc1, _mm_mul_ps(_mm_cvtepi32_ps(s1), dd1));
     }
@@ -1936,7 +1936,7 @@ float vec_dot_q8_0_q8_0_deltas(const void *qx, const float *qx_d, const void *qw
     for (; i < nb; i++) {
         int sumi = 0;
         for (int j = 0; j < 32; j++) sumi += x[i].qs[j] * w[i].qs[j];
-        sumf += (float)sumi * qx_d[i] * fp16_to_fp32(w[i].d);
+        sumf += (float)sumi * qx_d[i] * fp16_to_fp32_lookup(w[i].d);
     }
     return sumf;
 }
@@ -1958,7 +1958,7 @@ float vec_dot_q8_0_f32(const void *src, const float *x, int n) {
 
     for (int i = 0; i < nb; i++) {
         const block_q8_0 *b = &blocks[i];
-        float d = fp16_to_fp32(b->d);
+        float d = fp16_to_fp32_lookup(b->d);
         const int8_t *qs = b->qs;
         const float *xp = x + i * 32;
 
@@ -2043,7 +2043,7 @@ float vec_dot_q4_0_f32(const void *src, const float *x, int n) {
     float sumf = 0.0f;
 
     for (int i = 0; i < nb; i++) {
-        float d = fp16_to_fp32(blocks[i].d);
+        float d = fp16_to_fp32_lookup(blocks[i].d);
         const uint8_t *qs = blocks[i].qs;
         const float *xp = x + i * 32;
         float block_sum = 0.0f;
@@ -2063,7 +2063,7 @@ float vec_dot_q4_0_4_4_f32(const void *src, const float *x, int n) {
     float sumf = 0.0f;
 
     for (int i = 0; i < nb; i++) {
-        float d = fp16_to_fp32(blocks[i].d[0]);
+        float d = fp16_to_fp32_lookup(blocks[i].d[0]);
         const float *xp = x + i * 32;
         float block_sum = 0.0f;
         for (int k = 0; k < 4; k++) {
@@ -2087,7 +2087,7 @@ float vec_dot_q4_0_8_8_f32(const void *src, const float *x, int n) {
     float sumf = 0.0f;
 
     for (int i = 0; i < nb; i++) {
-        float d = fp16_to_fp32(blocks[i].d[0]);
+        float d = fp16_to_fp32_lookup(blocks[i].d[0]);
         const float *xp = x + i * 32;
         float block_sum = 0.0f;
         for (int k = 0; k < 4; k++) {
@@ -2258,7 +2258,7 @@ void vec_dot_q4_0x8_q8_0_avx2(const void *vx, const void *wy, int n, float *out,
             a1 = _mm256_permute2f128_si256(a1, a1, 0);
 
             /* Row scale (Q8_0 delta) */
-            __m256 row_scale = _mm256_set1_ps(fp16_to_fp32(a_ptr[b].d));
+            __m256 row_scale = _mm256_set1_ps(fp16_to_fp32_lookup(a_ptr[b].d));
 
             /* Combine column and row scales */
             __m256 sd = _mm256_mul_ps(col_scales, row_scale);
@@ -2322,7 +2322,7 @@ void vec_dot_q4_0x8_q8_0_avx2(const void *vx, const void *wy, int n, float *out,
             float sumf = 0.0f;
             for (int b = 0; b < nb; b++) {
                 const block_q4_0x8 *bp = &((const block_q4_0x8 *)vx)[b + group * nb];
-                float dd = fp16_to_fp32(bp->d[r]) * fp16_to_fp32(a_ptr[b].d);
+                float dd = fp16_to_fp32_lookup(bp->d[r]) * fp16_to_fp32_lookup(a_ptr[b].d);
                 int sumi = 0;
                 /* Row r's data: qs[r*8..r*8+7] (first 8 bytes = 16 nibbles) and
                  * qs[64+r*8..64+r*8+7] (next 8 bytes = 16 nibbles)
@@ -2356,8 +2356,8 @@ void vec_dot_q4_0x8_q8_0_avx2(const void *vx, const void *wy, int n, float *out,
             int r = row % 8;
             float sumf = 0.0f;
             for (int b = 0; b < nb; b++) {
-                float dd = fp16_to_fp32(b_ptr[group * nb + b].d[r]) *
-                            fp16_to_fp32(a_ptr[b].d);
+                float dd = fp16_to_fp32_lookup(b_ptr[group * nb + b].d[r]) *
+                            fp16_to_fp32_lookup(a_ptr[b].d);
                 int sumi = 0;
                 for (int i = 0; i < 8; i++) {
                     uint8_t byte = b_ptr[group * nb + b].qs[r * 8 + i];
@@ -2413,7 +2413,7 @@ void scale_add_q8_0_f32(float *dst, float scale, const void *src, int n) {
 
     for (int i = 0; i < nb; i++) {
         const block_q8_0 *b = &blocks[i];
-        float sd = fp16_to_fp32(b->d) * scale;
+        float sd = fp16_to_fp32_lookup(b->d) * scale;
         const int8_t *qs = b->qs;
         float *dp = dst + i * 32;
 
@@ -2475,7 +2475,7 @@ void scale_add_q4_0_f32(float *dst, float scale, const void *src, int n) {
 
     for (int i = 0; i < nb; i++) {
         const block_q4_0 *b = &blocks[i];
-        float sd = fp16_to_fp32(b->d) * scale;
+        float sd = fp16_to_fp32_lookup(b->d) * scale;
         const uint8_t *qs = b->qs;
         float *dp = dst + i * 32;
 
@@ -2493,7 +2493,7 @@ void fma_scale_q8_0_f32(float *dst, float correction, const void *src, int n) {
 
     for (int i = 0; i < nb; i++) {
         const block_q8_0 *b = &blocks[i];
-        float d = fp16_to_fp32(b->d);
+        float d = fp16_to_fp32_lookup(b->d);
         const int8_t *qs = b->qs;
         float *dptr = dst + i * 32;
 
@@ -2564,7 +2564,7 @@ void fma_scale_q4_0_f32(float *dst, float correction, const void *src, int n) {
 
     for (int i = 0; i < nb; i++) {
         const block_q4_0 *b = &blocks[i];
-        float d = fp16_to_fp32(b->d);
+        float d = fp16_to_fp32_lookup(b->d);
         const uint8_t *qs = b->qs;
         float *dptr = dst + i * 32;
 
