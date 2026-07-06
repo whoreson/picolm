@@ -73,6 +73,8 @@ The upstream repo had zero networking. We added:
 - Early abort on client disconnect (don't waste GPU\... er, CPU cycles)
 - All of this with a vendored MIT cJSON library, **zero additional dependencies**
 
+### All SIMD optimizations and K-quants and whatnot are copyright of Iwan Kawrakow, probably
+
 ---
 
 <p align="center">
