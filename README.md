@@ -16,11 +16,15 @@
   Pure C. Zero dependencies. One binary. No Python. No cloud.
 </p>
 
+<p align="center">
+  <strong>Up to 16% faster than llama.cpp on Q4_0 quantized models.</strong>
+</p>
+
 ---
 
 # PicoLM \- But It's Actually Useful
 
-> **The upstream repo was a cute demo. We made it into a legitimate inference engine.**
+> **The upstream repo was a cute demo. We made it into a legitimate inference engine that now outperforms llama.cpp on quantized models.**
 
 The original PicoLM was a clever proof-of-concept: mmap a GGUF, stream layers through 45MB of RAM, call it a day. Noble effort, but it was missing basically everything you need to actually *use* an LLM in production. So [gabucino](http://gabucino.hu) went in and **added ~59 commits of hard-won optimizations, features, and bug fixes** that transform this from a toy into a serious inference runtime.
 
