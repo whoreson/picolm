@@ -1175,17 +1175,19 @@ int model_lock_layers(model_t *m, size_t mem_bytes) {
     const model_config_t *c = &m->config;
 
     /* Cap budget to RLIMIT_MEMLOCK minus page alignment overhead.
-     * After merging, we have ~3-4 contiguous ranges for all locked
-     * tensors, each rounded up to the next page boundary. Reserve
-     * a few extra pages to account for this overhead. */
+     * On Windows, VirtualLock has no such limit, so skip this check. */
     size_t effective_budget = mem_bytes;
-    struct rlimit rl;
-    if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) {
-        size_t page_overhead = (size_t)(c->n_layers + 1) * 4 * 4096;
-        size_t rlimit_budget = rl.rlim_cur - page_overhead;
-        if (rlimit_budget < effective_budget)
-            effective_budget = rlimit_budget;
+#ifndef _WIN32
+    {
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) {
+            size_t page_overhead = (size_t)(c->n_layers + 1) * 4 * 4096;
+            size_t rlimit_budget = rl.rlim_cur - page_overhead;
+            if (rlimit_budget < effective_budget)
+                effective_budget = rlimit_budget;
+        }
     }
+#endif
 
     size_t gbytes = global_weight_bytes(m);
     if (gbytes > effective_budget) {
