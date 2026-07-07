@@ -12,8 +12,7 @@
 <h1 align="center">PicoLM</h1>
 
 <p align="center">
-  <strong>Run a 1-billion parameter LLM on a $10 board with 256MB RAM.</strong><br>
-  Pure C. Zero dependencies. One binary. No Python. No cloud.
+  <strong>Run a LLMs (up to 11B tested) on a $10 board with 256MB RAM.</strong><br>
 </p>
 
 <p align="center">
