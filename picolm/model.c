@@ -319,6 +319,16 @@ static int parse_gguf(model_t *m, int max_seq_len) {
             } else {
                 int dummy; skip_meta_value(&r, vtype, &dummy);
             }
+        } else if (str_eq(key, "qwen35.ssm.conv_kernel") || str_eq(key, "qwen3.ssm.conv_kernel")) {
+            int dummy; cfg->ssm_d_conv = (int)skip_meta_value(&r, vtype, &dummy); cfg->has_ssm = 1;
+        } else if (str_eq(key, "qwen35.ssm.state_size") || str_eq(key, "qwen3.ssm.state_size")) {
+            int dummy; cfg->ssm_d_state = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "qwen35.ssm.group_count") || str_eq(key, "qwen3.ssm.group_count")) {
+            int dummy; cfg->ssm_n_group = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "qwen35.ssm.time_step_rank") || str_eq(key, "qwen3.ssm.time_step_rank")) {
+            int dummy; cfg->ssm_dt_rank = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "qwen35.ssm.inner_size") || str_eq(key, "qwen3.ssm.inner_size")) {
+            int dummy; cfg->ssm_d_inner = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "general.alignment")) {
             int dummy; cfg->alignment = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "llama.vocab_size")
@@ -450,23 +460,44 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                 } else if (strcmp(suffix, "attn_q.weight") == 0) {
                     lw->attn_q = ptr; lw->type_attn_q = qtype;
                 } else if (strcmp(suffix, "attn_k.weight") == 0) {
-                    lw->attn_k = ptr; lw->type_attn_k = qtype;
+                    lw->attn_k = ptr; lw->type_attn_k = qtype; lw->is_attn_layer = 1;
                 } else if (strcmp(suffix, "attn_v.weight") == 0) {
-                    lw->attn_v = ptr; lw->type_attn_v = qtype;
+                    lw->attn_v = ptr; lw->type_attn_v = qtype; lw->is_attn_layer = 1;
                 } else if (strcmp(suffix, "attn_output.weight") == 0) {
                     lw->attn_output = ptr; lw->type_attn_output = qtype;
                 } else if (strcmp(suffix, "attn_q_norm.weight") == 0) {
                     lw->attn_q_norm = ptr; lw->type_attn_q_norm = qtype;
                 } else if (strcmp(suffix, "attn_k_norm.weight") == 0) {
                     lw->attn_k_norm = ptr; lw->type_attn_k_norm = qtype;
-                } else if (strcmp(suffix, "ffn_norm.weight") == 0) {
-                    lw->ffn_norm = ptr; lw->type_ffn_norm = qtype;
+                } else if (strcmp(suffix, "ffn_norm.weight") == 0
+                        || strcmp(suffix, "post_attention_norm.weight") == 0) {
+                    lw->post_attn_norm = ptr; lw->type_post_attn_norm = qtype;
                 } else if (strcmp(suffix, "ffn_gate.weight") == 0) {
                     lw->ffn_gate = ptr; lw->type_ffn_gate = qtype;
                 } else if (strcmp(suffix, "ffn_down.weight") == 0) {
                     lw->ffn_down = ptr; lw->type_ffn_down = qtype;
                 } else if (strcmp(suffix, "ffn_up.weight") == 0) {
                     lw->ffn_up = ptr; lw->type_ffn_up = qtype;
+                }
+                /* SSM tensors (Qwen3.5) */
+                else if (strcmp(suffix, "attn_qkv.weight") == 0) {
+                    lw->attn_qkv = ptr; lw->type_attn_qkv = qtype; lw->is_attn_layer = 0;
+                } else if (strcmp(suffix, "attn_gate.weight") == 0) {
+                    lw->attn_gate_ssm = ptr; lw->type_attn_gate_ssm = qtype;
+                } else if (strcmp(suffix, "ssm_a") == 0) {
+                    lw->ssm_a = ptr;
+                } else if (strcmp(suffix, "ssm_alpha.weight") == 0) {
+                    lw->ssm_alpha = ptr;
+                } else if (strcmp(suffix, "ssm_beta.weight") == 0) {
+                    lw->ssm_beta = ptr;
+                } else if (strcmp(suffix, "ssm_conv1d.weight") == 0) {
+                    lw->ssm_conv1d = ptr;
+                } else if (strcmp(suffix, "ssm_dt.bias") == 0) {
+                    lw->ssm_dt = ptr;
+                } else if (strcmp(suffix, "ssm_norm.weight") == 0) {
+                    lw->ssm_norm = ptr;
+                } else if (strcmp(suffix, "ssm_out.weight") == 0) {
+                    lw->ssm_out = ptr; lw->type_ssm_out = qtype;
                 }
             }
         }
@@ -493,13 +524,29 @@ static int parse_gguf(model_t *m, int max_seq_len) {
         cfg->vocab_size = (int)m->tok_n_tokens;
     }
 
-    cfg->weight_type = w->layers[0].type_attn_q;
+    // For SSM models, the first layer may not have attn_q
+    if (cfg->has_ssm && w->layers[0].type_attn_q == 0) {
+        cfg->weight_type = w->layers[0].type_attn_qkv;
+    } else {
+        cfg->weight_type = w->layers[0].type_attn_q;
+    }
 
     fprintf(stderr, "Model config:\n");
     fprintf(stderr, "  n_embd=%d, n_ffn=%d, n_heads=%d, n_kv_heads=%d\n",
             cfg->n_embd, cfg->n_ffn, cfg->n_heads, cfg->n_kv_heads);
     fprintf(stderr, "  n_layers=%d, vocab_size=%d, max_seq=%d\n",
             cfg->n_layers, cfg->vocab_size, cfg->max_seq_len);
+    if (cfg->has_ssm) {
+        int conv_dim = 2 * cfg->ssm_d_state * cfg->ssm_n_group + cfg->ssm_d_inner;
+        fprintf(stderr, "  SSM: conv=%d state=%d groups=%d dt_rank=%d inner=%d conv_dim=%d\n",
+                cfg->ssm_d_conv, cfg->ssm_d_state, cfg->ssm_n_group,
+                cfg->ssm_dt_rank, cfg->ssm_d_inner, conv_dim);
+        int attn_count = 0, ssm_count = 0;
+        for (int i = 0; i < cfg->n_layers; i++) {
+            if (w->layers[i].is_attn_layer) attn_count++; else ssm_count++;
+        }
+        fprintf(stderr, "  Layers: %d SSM + %d full attention\n", ssm_count, attn_count);
+    }
     fprintf(stderr, "  head_dim=%d, rope_base=%.1f\n", cfg->head_dim, cfg->rope_freq_base);
     free(tinfos);
     return 0;
@@ -538,13 +585,19 @@ static int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_ty
 
     int half_dim = c->head_dim / 2;
     int q_dim = c->n_heads * c->head_dim;
-    int max_dim = (q_dim > c->n_embd) ? q_dim : c->n_embd;
+    /* Qwen3.5 full attention: Q+gate joint = 2x q_dim */
+    int q_full_dim = c->has_ssm ? (q_dim * 2) : q_dim;
+    /* SSM conv_dim may be larger */
+    int ssm_conv_dim = c->has_ssm ? (2 * c->ssm_d_state * c->ssm_n_group + c->ssm_d_inner) : 0;
+    int max_proj_dim = q_full_dim;
+    if (ssm_conv_dim > max_proj_dim) max_proj_dim = ssm_conv_dim;
+    int max_dim = (max_proj_dim > c->n_embd) ? max_proj_dim : c->n_embd;
 
     /* Calculate sizes for float buffers */
     size_t sz_x      = (size_t)c->n_embd * sizeof(float);
-    size_t sz_xb     = (size_t)q_dim * sizeof(float);
-    size_t sz_xb2    = (size_t)q_dim * sizeof(float);
-    size_t sz_q      = (size_t)q_dim * sizeof(float);
+    size_t sz_xb     = (size_t)max_proj_dim * sizeof(float);
+    size_t sz_xb2    = (size_t)max_proj_dim * sizeof(float);
+    size_t sz_q      = (size_t)max_proj_dim * sizeof(float);
     /* att buffer removed (flash attention) */
     size_t sz_hb     = (size_t)c->n_ffn * sizeof(float);
     size_t sz_hb2    = (size_t)c->n_ffn * sizeof(float);
@@ -563,14 +616,37 @@ static int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_ty
                   + (size_t)c->n_layers * c->head_dim * 2;
     size_t sz_norm = n_norm * sizeof(float);
 
+    /* SSM state buffers (Qwen3.5) */
+    size_t sz_ssm_conv = 0, sz_ssm_state = 0, sz_ssm_small = 0;
+    if (c->has_ssm) {
+        int conv_dim = 2 * c->ssm_d_state * c->ssm_n_group + c->ssm_d_inner;
+        int head_v_dim = c->ssm_d_inner / c->ssm_dt_rank;
+        /* Allocate conservatively: all n_layers * (conv_state + small arrays + state)
+         * Only SSM layers actually use the buffers, but this avoids under-allocation. */
+        int ssm_per_layer = (c->ssm_d_conv - 1) * conv_dim  /* conv_state */
+                          + c->ssm_dt_rank * 2              /* a + dt */
+                          + head_v_dim                      /* norm */
+                          + c->ssm_d_conv * conv_dim        /* conv1d weights */
+                          + c->ssm_d_state * c->ssm_d_inner /* recurrent state */;
+        sz_ssm_conv = sz_ssm_state = sz_ssm_small = 0;
+        sz_ssm_small = (size_t)c->n_layers * ssm_per_layer * sizeof(float);
+    }
     size_t total = sz_x + sz_xb + sz_xb2 + sz_q +
                    sz_hb + sz_hb2 + sz_logits +
-                   sz_scratch + sz_rope + sz_norm;
+                   sz_scratch + sz_rope + sz_norm +
+                   sz_ssm_conv + sz_ssm_state + sz_ssm_small;
 
-    /* Quantized KV cache: separate allocation */
+    /* Quantized KV cache: separate allocation (only for attention layers) */
     size_t sz_k_row = kv_row_size(kv_type_k, c->head_dim);
     size_t sz_v_row = kv_row_size(kv_type_v, c->head_dim);
-    size_t sz_kv = (size_t)c->n_layers * c->max_seq_len * c->n_kv_heads * (sz_k_row + sz_v_row);
+    int attn_layer_count = 0;
+    if (c->has_ssm) {
+        for (int i = 0; i < c->n_layers; i++) {
+            if (m->weights.layers[i].is_attn_layer) attn_layer_count++;
+        }
+    }
+    int kv_layers = attn_layer_count > 0 ? attn_layer_count : c->n_layers;
+    size_t sz_kv = (size_t)kv_layers * c->max_seq_len * c->n_kv_heads * (sz_k_row + sz_v_row);
 
     const char *kv_name_k = "f16";
     const char *kv_name_v = "f16";
@@ -606,9 +682,9 @@ static int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_ty
     /* Carve float pointers */
     float *p = (float *)s->mem_block;
     s->x      = p; p += c->n_embd;
-    s->xb     = p; p += c->n_embd;
-    s->xb2    = p; p += c->n_embd;
-    s->q      = p; p += c->n_embd;
+    s->xb     = p; p += max_proj_dim;
+    s->xb2    = p; p += max_proj_dim;
+    s->q      = p; p += max_proj_dim;
     s->hb     = p; p += c->n_ffn;
     s->hb2    = p; p += c->n_ffn;
     s->logits = p; p += c->vocab_size;
@@ -620,12 +696,47 @@ static int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_ty
 
     /* Norm weights */
     s->norm_weights = p;
+    p += n_norm + c->n_embd; /* skip norm weights area (dequantized separately via nw pointer) */
 
-    /* KV cache pointers: K layers first, then V layers */
+    /* KV cache pointers: K layers first, then V layers (all layers, SSM layers just don't use their slots) */
     size_t layer_stride_k = (size_t)c->max_seq_len * c->n_kv_heads * sz_k_row;
     uint8_t *kb = (uint8_t *)s->kv_block;
     s->key_cache = kb;
     s->val_cache = kb + (size_t)c->n_layers * layer_stride_k;
+
+    /* SSM state buffers (Qwen3.5) */
+    if (c->has_ssm) {
+        int conv_dim = 2 * c->ssm_d_state * c->ssm_n_group + c->ssm_d_inner;
+        int head_v_dim = c->ssm_d_inner / c->ssm_dt_rank;
+        float *ssm_p = p;
+        for (int l = 0; l < c->n_layers; l++) {
+            if (m->weights.layers[l].is_attn_layer) {
+                s->ssm_conv_state[l] = NULL;
+                s->ssm_state[l] = NULL;
+                s->ssm_a_w[l] = NULL;
+                s->ssm_dt_w[l] = NULL;
+                s->ssm_norm_w[l] = NULL;
+                s->ssm_conv1d_w[l] = NULL;
+            } else {
+                s->ssm_conv_state[l] = ssm_p; ssm_p += (c->ssm_d_conv - 1) * conv_dim;
+                s->ssm_state[l] = NULL; /* allocated later */
+                s->ssm_a_w[l] = ssm_p; ssm_p += c->ssm_dt_rank;
+                s->ssm_dt_w[l] = ssm_p; ssm_p += c->ssm_dt_rank;
+                s->ssm_norm_w[l] = ssm_p; ssm_p += head_v_dim;
+                s->ssm_conv1d_w[l] = ssm_p; ssm_p += c->ssm_d_conv * conv_dim;
+            }
+        }
+        /* Note: allocation accounts for all layers conservatively.
+         * Only SSM layers actually use the state buffers. */
+        for (int l = 0; l < c->n_layers; l++) {
+            if (!m->weights.layers[l].is_attn_layer) {
+                s->ssm_state[l] = ssm_p;
+                memset(ssm_p, 0, c->ssm_d_state * c->ssm_d_inner * sizeof(float));
+                ssm_p += c->ssm_d_state * c->ssm_d_inner;
+            }
+        }
+        p = ssm_p;
+    }
 
     /* Pre-dequantize norm weights */
     float *nw = s->norm_weights;
@@ -638,9 +749,9 @@ static int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_ty
             memset(nw, 1, (size_t)c->n_embd);
         nw += c->n_embd;
 
-        s->ffn_norm_w[l] = nw;
-        if (lw->ffn_norm)
-            dequantize_row(lw->ffn_norm, nw, c->n_embd, lw->type_ffn_norm);
+        s->post_attn_norm_w[l] = nw;
+        if (lw->post_attn_norm)
+            dequantize_row(lw->post_attn_norm, nw, c->n_embd, lw->type_post_attn_norm);
         else
             memset(nw, 1, (size_t)c->n_embd);
         nw += c->n_embd;
@@ -666,6 +777,36 @@ static int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_ty
     dequantize_row(m->weights.output_norm, nw, c->n_embd,
                    m->weights.type_output_norm);
 
+    /* Dequantize SSM F32 weights (Qwen3.5) */
+    if (c->has_ssm) {
+        for (int l = 0; l < c->n_layers; l++) {
+            layer_weights_t *lw = &m->weights.layers[l];
+            if (lw->is_attn_layer) continue;
+            /* ssm_a: [dt_rank] F32 (negative log A) */
+            if (lw->ssm_a && s->ssm_a_w[l]) {
+                float *raw = (float *)lw->ssm_a;
+                for (int i = 0; i < c->ssm_dt_rank; i++) {
+                    s->ssm_a_w[l][i] = raw[i];
+                }
+            }
+            /* ssm_dt.bias: [dt_rank] F32 */
+            if (lw->ssm_dt && s->ssm_dt_w[l]) {
+                memcpy(s->ssm_dt_w[l], (const float *)lw->ssm_dt, c->ssm_dt_rank * sizeof(float));
+            }
+            /* ssm_norm.weight: [head_v_dim] F32 */
+            if (lw->ssm_norm && s->ssm_norm_w[l]) {
+                memcpy(s->ssm_norm_w[l], (const float *)lw->ssm_norm,
+                       (c->ssm_d_inner / c->ssm_dt_rank) * sizeof(float));
+            }
+            /* ssm_conv1d.weight: [d_conv, conv_dim] F32 */
+            if (lw->ssm_conv1d && s->ssm_conv1d_w[l]) {
+                int conv_dim = 2 * c->ssm_d_state * c->ssm_n_group + c->ssm_d_inner;
+                memcpy(s->ssm_conv1d_w[l], (const float *)lw->ssm_conv1d,
+                       c->ssm_d_conv * conv_dim * sizeof(float));
+            }
+        }
+    }
+
     /* Init tensor scratch */
     tensor_init_scratch(s->dequant_scratch, scratch_dim);
 
@@ -686,11 +827,22 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
     /* Validate that all required tensors are present */
     {
         layer_weights_t *lw = &m->weights.layers[0];
-        if (!lw->attn_q || !lw->attn_k || !lw->attn_v || !lw->attn_output ||
-            !lw->ffn_gate || !lw->ffn_up || !lw->ffn_down) {
-            fprintf(stderr, "Unsupported model architecture (missing standard transformer tensors)\n");
-            fprintf(stderr, "Qwen3.5/SSM models are not yet supported\n");
-            return -1;
+        if (m->config.has_ssm) {
+            /* SSM model: check SSM tensors */
+            if (!lw->attn_qkv || !lw->attn_gate_ssm || !lw->ssm_a ||
+                !lw->ssm_alpha || !lw->ssm_beta || !lw->ssm_conv1d ||
+                !lw->ssm_dt || !lw->ssm_norm || !lw->ssm_out ||
+                !lw->ffn_gate || !lw->ffn_up || !lw->ffn_down) {
+                fprintf(stderr, "Missing SSM tensors\n");
+                return -1;
+            }
+        } else {
+            /* Standard transformer: check attention tensors */
+            if (!lw->attn_q || !lw->attn_k || !lw->attn_v || !lw->attn_output ||
+                !lw->ffn_gate || !lw->ffn_up || !lw->ffn_down) {
+                fprintf(stderr, "Unsupported model architecture (missing standard transformer tensors)\n");
+                return -1;
+            }
         }
     }
 
@@ -764,6 +916,10 @@ static void repack_model_weights_q4_0x8(model_t *m) {
  *   - Pre-computed RoPE tables (table lookup instead of trig)
  * ================================================================ */
 
+/* Forward declarations for SSM helpers */
+static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
+                        layer_weights_t *lw, int il);
+
 float *model_forward(model_t *m, int token, int pos) {
     model_config_t *c = &m->config;
     model_weights_t *w = &m->weights;
@@ -775,6 +931,8 @@ float *model_forward(model_t *m, int token, int pos) {
     int n_kv_heads = c->n_kv_heads;
     int head_dim = c->head_dim;
     int q_dim = n_heads * head_dim;
+    /* Qwen3.5 full attention uses Q+gate joint projection: 2x q_dim */
+    int q_full_dim = c->has_ssm ? (n_heads * head_dim * 2) : q_dim;
     int kv_dim = n_kv_heads * head_dim;
     int kv_mul = n_heads / n_kv_heads;
     int seq_len = c->max_seq_len;
@@ -822,13 +980,27 @@ float *model_forward(model_t *m, int token, int pos) {
         layer_weights_t *lw = &w->layers[l];
         int ri = 2 + l * 9; /* repack buffer index base for this layer */
 
+        if (c->has_ssm && !lw->is_attn_layer) {
+            /* SSM layer (Qwen3.5) */
+            float *ssm_residual = s->xb2; /* use xb2 as residual buffer */
+            ssm_forward(m, s, s->x, ssm_residual, lw, l);
+            continue;
+        }
+
         /* ---- Attention ---- */
         rmsnorm(s->xb, s->x, s->attn_norm_w[l], dim, c->rms_norm_eps);
 
-        /* Q projection */
+        /* Q projection (Q+gate joint for Qwen3.5 full attention) */
         tensor_set_repacked(m->repack_used[ri] ? m->repack_buffers[ri] : NULL);
-        matmul(s->q, s->xb, lw->attn_q, dim, q_dim, lw->type_attn_q);
+        int this_q_dim = (c->has_ssm && lw->is_attn_layer) ? q_full_dim : q_dim;
+        matmul(s->q, s->xb, lw->attn_q, dim, this_q_dim, lw->type_attn_q);
         tensor_set_repacked(NULL);
+
+        /* For Qwen3.5: extract gate from second half of Q projection */
+        float *qwen35_attn_gate = NULL;
+        if (c->has_ssm && lw->is_attn_layer) {
+            qwen35_attn_gate = s->q + q_dim; /* second half is gate */
+        }
 
         /* K projection */
         tensor_set_repacked(m->repack_used[ri+1] ? m->repack_buffers[ri+1] : NULL);
@@ -1045,6 +1217,14 @@ float *model_forward(model_t *m, int token, int pos) {
 #endif
         }
 
+        /* Qwen3.5 full attention: apply gate sigmoid to attention output */
+        if (qwen35_attn_gate) {
+            for (int i = 0; i < q_dim; i++) {
+                float g = 1.0f / (1.0f + expf(-qwen35_attn_gate[i]));
+                s->xb[i] *= g;
+            }
+        }
+
         /* Output projection */
         tensor_set_repacked(m->repack_used[ri+3] ? m->repack_buffers[ri+3] : NULL);
         matmul(s->xb2, s->xb, lw->attn_output, q_dim, dim, lw->type_attn_output);
@@ -1052,7 +1232,7 @@ float *model_forward(model_t *m, int token, int pos) {
         vec_add(s->x, s->xb2, dim);
 
         /* ---- FFN (SwiGLU) ---- */
-        rmsnorm(s->xb, s->x, s->ffn_norm_w[l], dim, c->rms_norm_eps);
+        rmsnorm(s->xb, s->x, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
 
         tensor_set_repacked(m->repack_used[ri+4] ? m->repack_buffers[ri+4] : NULL);
         matmul(s->hb,  s->xb, lw->ffn_gate, dim, n_ffn, lw->type_ffn_gate);
@@ -1080,6 +1260,241 @@ float *model_forward(model_t *m, int token, int pos) {
     tensor_set_repacked(NULL);
 
     return s->logits;
+}
+
+/* ================================================================
+ * SSM forward pass helpers (Qwen3.5)
+ * ================================================================ */
+
+/* SSM layer forward pass (autoregressive, single token) */
+static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
+                        layer_weights_t *lw, int il) {
+    model_config_t *c = &m->config;
+    int dim = c->n_embd;
+    int d_conv = c->ssm_d_conv;
+    int d_state = c->ssm_d_state;
+    int n_k_heads = c->ssm_n_group;
+    int n_v_heads = c->ssm_dt_rank;
+    int conv_dim = 2 * d_state * n_k_heads + c->ssm_d_inner;
+    int head_v_dim = c->ssm_d_inner / n_v_heads;
+    float eps = c->rms_norm_eps;
+
+    /* Scratch space: use s->hb (n_ffn) for temporaries */
+    float *tmp = s->hb;
+
+    /* 1. RMSNorm (attn_norm) */
+    rmsnorm(s->xb, x, s->attn_norm_w[il], dim, eps);
+
+    /* 2. QKV projection: qkv_mixed = matmul(attn_qkv, xb) -> [conv_dim] */
+    matmul(s->q, s->xb, lw->attn_qkv, dim, conv_dim, lw->type_attn_qkv);
+
+    /* 3. Z gate: z = matmul(attn_gate_ssm, xb) -> [value_dim] */
+    matmul(s->xb2, s->xb, lw->attn_gate_ssm, dim, c->ssm_d_inner, lw->type_attn_gate_ssm);
+
+    /* 4. Convolution state update */
+    float *conv_state = s->ssm_conv_state[il];
+    int state_stride = conv_dim;
+    int n_state_rows = d_conv - 1;
+    /* Shift left: keep last d_conv-2 rows */
+    for (int r = 0; r < n_state_rows - 1; r++) {
+        memcpy(conv_state + r * state_stride, conv_state + (r + 1) * state_stride, state_stride * sizeof(float));
+    }
+    /* Append new token */
+    memcpy(conv_state + (n_state_rows - 1) * state_stride, s->q, state_stride * sizeof(float));
+
+    /* 5. Convolve: conv_output = silu(conv1d * conv_input) */
+    float *conv_output = tmp; /* [conv_dim] */
+    float *conv1d_w = s->ssm_conv1d_w[il];
+    for (int co = 0; co < conv_dim; co++) {
+        float sum = conv1d_w[co]; /* last row (new token) - first element */
+        /* Actually conv1d is [d_conv, conv_dim]. conv_input is [d_conv, conv_dim] = state rows */
+        /* conv_output[co] = sum(conv1d[d][co] * conv_input[d][co]) for d=0..d_conv-1 */
+        sum = 0.0f;
+        for (int d = 0; d < d_conv; d++) {
+            sum += conv1d_w[d * conv_dim + co] * conv_state[d * state_stride + co];
+        }
+        float v = sum;
+        conv_output[co] = v * (1.0f / (1.0f + expf(-v))); /* silu */
+    }
+
+    /* 6. Split into Q, K, V */
+    int qk_dim = d_state * n_k_heads;
+    float *q_conv = tmp + conv_dim; /* [qk_dim] */
+    float *k_conv = tmp + conv_dim + qk_dim; /* [qk_dim] */
+    float *v_conv = tmp + conv_dim + 2 * qk_dim; /* [c->ssm_d_inner] */
+
+    memcpy(q_conv, conv_output, qk_dim * sizeof(float));
+    memcpy(k_conv, conv_output + qk_dim, qk_dim * sizeof(float));
+    memcpy(v_conv, conv_output + 2 * qk_dim, c->ssm_d_inner * sizeof(float));
+
+    /* 7. L2 normalize Q and K per k_head */
+    for (int h = 0; h < n_k_heads; h++) {
+        float *qh = q_conv + h * d_state;
+        float nrm = 0.0f;
+        for (int d = 0; d < d_state; d++) nrm += qh[d] * qh[d];
+        nrm = 1.0f / sqrtf(nrm + 1e-12f);
+        for (int d = 0; d < d_state; d++) qh[d] *= nrm;
+    }
+    for (int h = 0; h < n_k_heads; h++) {
+        float *kh = k_conv + h * d_state;
+        float nrm = 0.0f;
+        for (int d = 0; d < d_state; d++) nrm += kh[d] * kh[d];
+        nrm = 1.0f / sqrtf(nrm + 1e-12f);
+        for (int d = 0; d < d_state; d++) kh[d] *= nrm;
+    }
+
+    /* 8. Scale Q by 1/sqrt(d_state) */
+    float q_scale = 1.0f / sqrtf((float)d_state);
+    for (int i = 0; i < qk_dim; i++) q_conv[i] *= q_scale;
+
+    /* 9. Alpha and gate computation */
+    /* alpha = matmul(ssm_alpha, x) -> [dt_rank] */
+    float *ssm_alpha_w = (float *)lw->ssm_alpha; /* [n_embd, dt_rank] F32 */
+    float *alpha_out = tmp + conv_dim + 2 * qk_dim + c->ssm_d_inner; /* [dt_rank] */
+    for (int h = 0; h < n_v_heads; h++) {
+        float sum = 0.0f;
+        for (int d = 0; d < dim; d++) sum += ssm_alpha_w[d * n_v_heads + h] * x[d];
+        alpha_out[h] = sum + s->ssm_dt_w[il][h]; /* add dt bias */
+    }
+
+    /* gate = -A_log.exp() * softplus(alpha) -> [dt_rank] */
+    float *gate = alpha_out + n_v_heads; /* [dt_rank] */
+    for (int h = 0; h < n_v_heads; h++) {
+        float a = alpha_out[h];
+        /* softplus = log(1 + exp(a)), numerically stable */
+        float sp = (a > 20.0f) ? a : (a < -20.0f) ? expf(a) : logf(1.0f + expf(a));
+        gate[h] = sp * s->ssm_a_w[il][h]; /* ssm_a_w = exp(-A_log), negative */
+    }
+
+    /* 10. Beta: sigmoid(matmul(ssm_beta, x)) -> [dt_rank] */
+    float *ssm_beta_w = (float *)lw->ssm_beta; /* [n_embd, dt_rank] F32 */
+    float *beta = gate + n_v_heads; /* [dt_rank] */
+    for (int h = 0; h < n_v_heads; h++) {
+        float sum = 0.0f;
+        for (int d = 0; d < dim; d++) sum += ssm_beta_w[d * n_v_heads + h] * x[d];
+        beta[h] = 1.0f / (1.0f + expf(-sum)); /* sigmoid */
+    }
+
+    /* 11. Gate expansion: exp(gate) -> [dt_rank] */
+    float *gate_exp = beta + n_v_heads; /* [dt_rank] */
+    for (int h = 0; h < n_v_heads; h++) {
+        float g = gate[h];
+        gate_exp[h] = (g < -50.0f) ? 0.0f : expf(g);
+    }
+
+    /* 12. State: [d_state, d_state, n_v_heads] = [128, 128, 32] */
+    float *state = s->ssm_state[il];
+
+    /* Decay state: state[h] *= gate_exp[h] for all elements */
+    for (int h = 0; h < n_v_heads; h++) {
+        float ge = gate_exp[h];
+        float *st = state + h * d_state * d_state;
+        for (int i = 0; i < d_state * d_state; i++) st[i] *= ge;
+    }
+
+    /* 13. Repeat q/k to n_v_heads */
+    int repeat = n_v_heads / n_k_heads;
+    /* q_rep and k_rep: [d_state, n_v_heads] */
+    float *q_rep = gate_exp + n_v_heads; /* [d_state * n_v_heads] */
+    float *k_rep = q_rep + d_state * n_v_heads;
+    for (int h = 0; h < n_v_heads; h++) {
+        int kh = h / repeat;
+        memcpy(q_rep + h * d_state, q_conv + kh * d_state, d_state * sizeof(float));
+        memcpy(k_rep + h * d_state, k_conv + kh * d_state, d_state * sizeof(float));
+    }
+
+    /* 14. sk = state * k_rep -> [d_state, n_v_heads]
+     * sk[d, h] = sum_d2(state[h][d][d2] * k_rep[d2, h])
+     */
+    float *sk = k_rep + d_state * n_v_heads; /* [d_state * n_v_heads] */
+    for (int h = 0; h < n_v_heads; h++) {
+        float *st_h = state + h * d_state * d_state;
+        float *kr_h = k_rep + h * d_state;
+        for (int d = 0; d < d_state; d++) {
+            float sum = 0.0f;
+            for (int d2 = 0; d2 < d_state; d2++) {
+                sum += st_h[d * d_state + d2] * kr_h[d2];
+            }
+            sk[d * n_v_heads + h] = sum;
+        }
+    }
+
+    /* 15. d = (v_conv - sk) * beta -> [d_state, n_v_heads] */
+    /* v_conv is [head_v_dim, n_v_heads] = [d_state, n_v_heads] */
+    float *d_vals = sk + d_state * n_v_heads; /* reuse sk space */
+    for (int d = 0; d < d_state; d++) {
+        for (int h = 0; h < n_v_heads; h++) {
+            d_vals[d * n_v_heads + h] = (v_conv[d * n_v_heads + h] - sk[d * n_v_heads + h]) * beta[h];
+        }
+    }
+
+    /* 16. kd = k_rep * d_vals^T -> add to state
+     * state[h][d1][d2] += k_rep[d2, h] * d_vals[d1, h]
+     */
+    for (int h = 0; h < n_v_heads; h++) {
+        float *st_h = state + h * d_state * d_state;
+        float *kr_h = k_rep + h * d_state;
+        for (int d1 = 0; d1 < d_state; d1++) {
+            float dv = d_vals[d1 * n_v_heads + h];
+            float *st_row = st_h + d1 * d_state;
+            for (int d2 = 0; d2 < d_state; d2++) {
+                st_row[d2] += kr_h[d2] * dv;
+            }
+        }
+    }
+
+    /* 17. output = state * q_rep -> [d_state, n_v_heads]
+     * output[d, h] = sum_d2(state[h][d][d2] * q_rep[d2, h])
+     */
+    float *ssm_output = d_vals + d_state * n_v_heads; /* [d_state * n_v_heads] */
+    for (int h = 0; h < n_v_heads; h++) {
+        float *st_h = state + h * d_state * d_state;
+        float *qr_h = q_rep + h * d_state;
+        for (int d = 0; d < d_state; d++) {
+            float sum = 0.0f;
+            for (int d2 = 0; d2 < d_state; d2++) {
+                sum += st_h[d * d_state + d2] * qr_h[d2];
+            }
+            ssm_output[d * n_v_heads + h] = sum;
+        }
+    }
+
+    /* 18. Gated normalization */
+    /* z is [head_v_dim, n_v_heads] in s->xb2 */
+    float *norm_w = s->ssm_norm_w[il]; /* [head_v_dim] */
+    float *final_output = ssm_output + d_state * n_v_heads; /* [head_v_dim * n_v_heads] */
+    for (int h = 0; h < n_v_heads; h++) {
+        float *out_h = ssm_output + h * head_v_dim;
+        float *z_h = s->xb2 + h * head_v_dim;
+        /* RMSNorm of out_h */
+        float nrm = 0.0f;
+        for (int d = 0; d < head_v_dim; d++) nrm += out_h[d] * out_h[d];
+        nrm = 1.0f / sqrtf(nrm / head_v_dim + eps);
+        /* Multiply by norm weights, then by silu(z_h[d]) */
+        for (int d = 0; d < head_v_dim; d++) {
+            float zv = z_h[d];
+            float silu_z = zv * (1.0f / (1.0f + expf(-zv)));
+            final_output[h * head_v_dim + d] = out_h[d] * nrm * norm_w[d] * silu_z;
+        }
+    }
+
+    /* 19. Reshape to [value_dim] and output projection */
+    /* final_output is [head_v_dim * n_v_heads] = [value_dim] = [4096] */
+    /* ssm_out: [n_embd, value_dim] */
+    matmul(residual, final_output, lw->ssm_out, c->ssm_d_inner, dim, lw->type_ssm_out);
+
+    /* 20. Residual add */
+    vec_add(x, residual, dim);
+
+    /* 21. Post-attention norm + FFN */
+    rmsnorm(s->xb, x, s->post_attn_norm_w[il], dim, eps);
+
+    matmul(s->hb, s->xb, lw->ffn_gate, dim, c->n_ffn, lw->type_ffn_gate);
+    matmul(s->hb2, s->xb, lw->ffn_up, dim, c->n_ffn, lw->type_ffn_up);
+    silu(s->hb, c->n_ffn);
+    elemwise_mul(s->hb, s->hb, s->hb2, c->n_ffn);
+    matmul(s->xb, s->hb, lw->ffn_down, c->n_ffn, dim, lw->type_ffn_down);
+    vec_add(x, s->xb, dim);
 }
 
 void model_free(model_t *m) {
@@ -1132,10 +1547,14 @@ static size_t layer_weight_bytes(const model_t *m, int layer) {
     if (lw->attn_output) total += weight_tensor_bytes(c->n_embd, q_dim, lw->type_attn_output);
     if (lw->attn_q_norm) total += weight_tensor_bytes(1, c->head_dim, lw->type_attn_q_norm);
     if (lw->attn_k_norm) total += weight_tensor_bytes(1, c->head_dim, lw->type_attn_k_norm);
-    if (lw->ffn_norm)  total += weight_tensor_bytes(1, c->n_embd, lw->type_ffn_norm);
+    if (lw->post_attn_norm) total += weight_tensor_bytes(1, c->n_embd, lw->type_post_attn_norm);
     if (lw->ffn_gate)  total += weight_tensor_bytes(c->n_ffn, c->n_embd, lw->type_ffn_gate);
     if (lw->ffn_up)    total += weight_tensor_bytes(c->n_ffn, c->n_embd, lw->type_ffn_up);
     if (lw->ffn_down)  total += weight_tensor_bytes(c->n_embd, c->n_ffn, lw->type_ffn_down);
+    /* SSM weights */
+    if (lw->attn_qkv)      total += weight_tensor_bytes(c->ssm_d_inner + 2*c->ssm_d_state*c->ssm_n_group, c->n_embd, lw->type_attn_qkv);
+    if (lw->attn_gate_ssm) total += weight_tensor_bytes(c->ssm_d_inner, c->n_embd, lw->type_attn_gate_ssm);
+    if (lw->ssm_out)       total += weight_tensor_bytes(c->n_embd, c->ssm_d_inner, lw->type_ssm_out);
     return total;
 }
 
@@ -1252,7 +1671,7 @@ int model_lock_layers(model_t *m, size_t mem_bytes) {
         ADD_RANGE(lw->attn_output, lw->attn_output ? weight_tensor_bytes(c->n_embd, q_dim, lw->type_attn_output) : 0);
         ADD_RANGE(lw->attn_q_norm, lw->attn_q_norm ? weight_tensor_bytes(1, c->head_dim, lw->type_attn_q_norm) : 0);
         ADD_RANGE(lw->attn_k_norm, lw->attn_k_norm ? weight_tensor_bytes(1, c->head_dim, lw->type_attn_k_norm) : 0);
-        ADD_RANGE(lw->ffn_norm, lw->ffn_norm ? weight_tensor_bytes(1, c->n_embd, lw->type_ffn_norm) : 0);
+        ADD_RANGE(lw->post_attn_norm, lw->post_attn_norm ? weight_tensor_bytes(1, c->n_embd, lw->type_post_attn_norm) : 0);
         ADD_RANGE(lw->ffn_gate, lw->ffn_gate ? weight_tensor_bytes(c->n_ffn, c->n_embd, lw->type_ffn_gate) : 0);
         ADD_RANGE(lw->ffn_up, lw->ffn_up ? weight_tensor_bytes(c->n_ffn, c->n_embd, lw->type_ffn_up) : 0);
         ADD_RANGE(lw->ffn_down, lw->ffn_down ? weight_tensor_bytes(c->n_embd, c->n_ffn, lw->type_ffn_down) : 0);
@@ -1370,7 +1789,7 @@ int model_unlock_layers(model_t *m) {
         ADD_RANGE(lw->attn_output, lw->attn_output ? weight_tensor_bytes(c->n_embd, q_dim, lw->type_attn_output) : 0);
         ADD_RANGE(lw->attn_q_norm, lw->attn_q_norm ? weight_tensor_bytes(1, c->head_dim, lw->type_attn_q_norm) : 0);
         ADD_RANGE(lw->attn_k_norm, lw->attn_k_norm ? weight_tensor_bytes(1, c->head_dim, lw->type_attn_k_norm) : 0);
-        ADD_RANGE(lw->ffn_norm, lw->ffn_norm ? weight_tensor_bytes(1, c->n_embd, lw->type_ffn_norm) : 0);
+        ADD_RANGE(lw->post_attn_norm, lw->post_attn_norm ? weight_tensor_bytes(1, c->n_embd, lw->type_post_attn_norm) : 0);
         ADD_RANGE(lw->ffn_gate, lw->ffn_gate ? weight_tensor_bytes(c->n_ffn, c->n_embd, lw->type_ffn_gate) : 0);
         ADD_RANGE(lw->ffn_up, lw->ffn_up ? weight_tensor_bytes(c->n_ffn, c->n_embd, lw->type_ffn_up) : 0);
         ADD_RANGE(lw->ffn_down, lw->ffn_down ? weight_tensor_bytes(c->n_embd, c->n_ffn, lw->type_ffn_down) : 0);
@@ -1582,7 +2001,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 
         /* FFN RMSNorm */
         for (int bi = 0; bi < n_tokens; bi++)
-            rmsnorm(xb_batch + bi * dim, x_batch + bi * dim, s->ffn_norm_w[l], dim, c->rms_norm_eps);
+            rmsnorm(xb_batch + bi * dim, x_batch + bi * dim, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
 
         /* FFN gate+up (batched dual) */
         tensor_set_repacked(m->repack_used[7+l*9] ? m->repack_buffers[7+l*9] : NULL);

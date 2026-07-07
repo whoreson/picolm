@@ -27,6 +27,13 @@ typedef struct {
     int rope_type;        /* 0=llama pairwise, 1=qwen2 interleaved */
     int alignment;      /* GGUF data alignment */
     gguf_type_t weight_type; /* default weight quantization type */
+    /* SSM parameters (Qwen3.5) */
+    int has_ssm;            /* 1 if model has SSM layers */
+    int ssm_d_conv;         /* convolution kernel size */
+    int ssm_d_state;        /* state size (= head_k_dim) */
+    int ssm_n_group;        /* group count (= n_k_heads) */
+    int ssm_dt_rank;        /* time step rank (= n_v_heads) */
+    int ssm_d_inner;        /* inner size (= value_dim) */
 } model_config_t;
 
 /* ---- Per-layer weight pointers (into mmap) ---- */
@@ -39,10 +46,22 @@ typedef struct {
     const void *attn_output;
     const void *attn_q_norm;   /* QK-norm (Qwen3): per-head RMSNorm weight [head_dim] */
     const void *attn_k_norm;   /* QK-norm (Qwen3): per-head RMSNorm weight [head_dim] */
-    const void *ffn_norm;
+    const void *post_attn_norm; /* post-attention norm (ffn_norm for older models) */
     const void *ffn_gate;
     const void *ffn_down;
     const void *ffn_up;
+    /* SSM layer weights (Qwen3.5) */
+    const void *attn_qkv;       /* SSM: [n_embd, conv_dim] */
+    const void *attn_gate_ssm;  /* SSM: [n_embd, value_dim] */
+    const void *ssm_a;          /* SSM: [dt_rank] F32 */
+    const void *ssm_alpha;      /* SSM: [n_embd, dt_rank] F32 */
+    const void *ssm_beta;       /* SSM: [n_embd, dt_rank] F32 */
+    const void *ssm_conv1d;     /* SSM: [d_conv, conv_dim] F32 */
+    const void *ssm_dt;         /* SSM: [dt_rank] F32 bias */
+    const void *ssm_norm;       /* SSM: [head_v_dim] F32 */
+    const void *ssm_out;        /* SSM: [value_dim, n_embd] */
+    /* Layer type */
+    int is_attn_layer;          /* 1=full attention, 0=SSM */
     /* Per-tensor quantization types */
     gguf_type_t type_attn_norm;
     gguf_type_t type_attn_q;
@@ -51,10 +70,14 @@ typedef struct {
     gguf_type_t type_attn_output;
     gguf_type_t type_attn_q_norm;
     gguf_type_t type_attn_k_norm;
-    gguf_type_t type_ffn_norm;
+    gguf_type_t type_post_attn_norm;
     gguf_type_t type_ffn_gate;
     gguf_type_t type_ffn_down;
     gguf_type_t type_ffn_up;
+    /* SSM tensor types */
+    gguf_type_t type_attn_qkv;
+    gguf_type_t type_attn_gate_ssm;
+    gguf_type_t type_ssm_out;
 } layer_weights_t;
 
 typedef struct {
@@ -105,10 +128,18 @@ typedef struct {
     /* Pre-dequantized norm weights (small, keep in RAM) */
     float *norm_weights;
     float *attn_norm_w[MAX_LAYERS];
-    float *ffn_norm_w[MAX_LAYERS];
+    float *post_attn_norm_w[MAX_LAYERS]; /* post-attention norm (was ffn_norm) */
     float *attn_q_norm_w[MAX_LAYERS];  /* QK-norm (Qwen3) */
     float *attn_k_norm_w[MAX_LAYERS];  /* QK-norm (Qwen3) */
     float *output_norm_w;
+    /* SSM runtime state (Qwen3.5) */
+    float *ssm_conv_state[MAX_LAYERS]; /* [(d_conv-1) * conv_dim] per SSM layer */
+    float *ssm_state[MAX_LAYERS];      /* [ssm_d_state * ssm_d_inner] per SSM layer */
+    /* Pre-dequantized small SSM arrays */
+    float *ssm_a_w[MAX_LAYERS];        /* [dt_rank] F32 */
+    float *ssm_dt_w[MAX_LAYERS];       /* [dt_rank] F32 */
+    float *ssm_norm_w[MAX_LAYERS];     /* [head_v_dim] F32 */
+    float *ssm_conv1d_w[MAX_LAYERS];   /* [d_conv * conv_dim] F32 */
 
     /* Single allocation base */
     void *mem_block;
