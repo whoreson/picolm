@@ -379,6 +379,29 @@ void dequantize_row_f32(const void *src, float *dst, int n) {
     memcpy(dst, src, n * sizeof(float));
 }
 
+/* Q5_K dequantize: 256 elements per block, 5-bit quants with per-subblock scale+min */
+void dequantize_row_q5_K(const void *src, float *dst, int n) {
+    const block_q5_K *x = (const block_q5_K *)src;
+    const int nb = n / 256;
+    for (int i = 0; i < nb; i++) {
+        const float d = fp16_to_fp32(x[i].d);
+        const float dm = fp16_to_fp32(x[i].dm);
+        const uint8_t *ql = x[i].qs;
+        const uint8_t *qh = x[i].qh;
+        uint8_t sc, m;
+        uint8_t u1 = 1, u2 = 2;
+        for (int j = 0; j < 256; j += 64) {
+            get_scale_min_k4(j/32 + 0, x[i].scales, &sc, &m);
+            const float d1 = d * sc, m1 = dm * m;
+            get_scale_min_k4(j/32 + 1, x[i].scales, &sc, &m);
+            const float d2 = d * sc, m2 = dm * m;
+            for (int l = 0; l < 32; ++l) *dst++ = d1 * ((ql[l] & 0xF) + (qh[l] & u1 ? 16 : 0)) - m1;
+            for (int l = 0; l < 32; ++l) *dst++ = d2 * ((ql[l] >> 4) + (qh[l] & u2 ? 16 : 0)) - m2;
+            ql += 32; u1 <<= 2; u2 <<= 2;
+        }
+    }
+}
+
 void dequantize_row(const void *src, float *dst, int n, gguf_type_t type) {
     switch (type) {
         case GGUF_TYPE_F32:   dequantize_row_f32(src, dst, n);  break;
@@ -388,6 +411,7 @@ void dequantize_row(const void *src, float *dst, int n, gguf_type_t type) {
         case GGUF_TYPE_Q2_K:  dequantize_row_q2_K(src, dst, n); break;
         case GGUF_TYPE_Q3_K:  dequantize_row_q3_K(src, dst, n); break;
         case GGUF_TYPE_Q4_K:  dequantize_row_q4_K(src, dst, n); break;
+        case GGUF_TYPE_Q5_K:  dequantize_row_q5_K(src, dst, n); break;
         case GGUF_TYPE_Q6_K:  dequantize_row_q6_K(src, dst, n); break;
         case GGUF_TYPE_Q4_0_4_4: dequantize_row_q4_0_4_4(src, dst, n); break;
         case GGUF_TYPE_Q4_0_8_8: dequantize_row_q4_0_8_8(src, dst, n); break;
@@ -2109,6 +2133,19 @@ float vec_dot_q4_0_8_8_f32(const void *src, const float *x, int n) {
 float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
     switch (type) {
         case GGUF_TYPE_Q4_K: return vec_dot_q4_K_f32(src, x, n);
+        case GGUF_TYPE_Q5_K: {
+            /* Scalar fallback: dequantize to float, then dot */
+            static float __thread q5_tmp[4096];
+            if (n > 4096) {
+                float *tmp = (float *)malloc(n * sizeof(float));
+                dequantize_row_q5_K(src, tmp, n);
+                float r = vec_dot_f32_f32(tmp, x, n);
+                free(tmp);
+                return r;
+            }
+            dequantize_row_q5_K(src, q5_tmp, n);
+            return vec_dot_f32_f32(q5_tmp, x, n);
+        }
         case GGUF_TYPE_Q6_K: return vec_dot_q6_K_f32(src, x, n);
         case GGUF_TYPE_F32:  return vec_dot_f32_f32(src, x, n);
         case GGUF_TYPE_Q8_0: return vec_dot_q8_0_f32(src, x, n);

@@ -420,7 +420,7 @@ static int parse_gguf(model_t *m, int max_seq_len) {
         const void *ptr = (const uint8_t *)m->mmap_addr + tensor_data_base + tinfos[i].offset;
         gguf_type_t qtype = (gguf_type_t)tinfos[i].type;
         if (i < 5) {
-            fprintf(stderr, "T%llu: %s type=%u offset=%" PRIu64 " abs=%zu\n",
+            fprintf(stderr, "T%llu: %-50s type=%u offset=%-20" PRIu64 " abs=%-20zu\n",
                     (unsigned long long)i, tinfos[i].name.str, tinfos[i].type,
                     tinfos[i].offset, (size_t)((const uint8_t*)ptr - (const uint8_t*)m->mmap_addr));
         }
@@ -631,10 +631,19 @@ static int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_ty
         sz_ssm_conv = sz_ssm_state = sz_ssm_small = 0;
         sz_ssm_small = (size_t)c->n_layers * ssm_per_layer * sizeof(float);
     }
+    /* SSM scratch buffer (shared across SSM layers) */
+    size_t sz_ssm_tmp = 0;
+    if (c->has_ssm) {
+        int conv_dim = 2 * c->ssm_d_state * c->ssm_n_group + c->ssm_d_inner;
+        sz_ssm_tmp = ((size_t)conv_dim * 3 +
+                      (size_t)c->ssm_d_state * c->ssm_n_group * 2 +
+                      (size_t)c->ssm_d_inner * 3 +
+                      (size_t)c->ssm_dt_rank * 4) * sizeof(float);
+    }
     size_t total = sz_x + sz_xb + sz_xb2 + sz_q +
                    sz_hb + sz_hb2 + sz_logits +
                    sz_scratch + sz_rope + sz_norm +
-                   sz_ssm_conv + sz_ssm_state + sz_ssm_small;
+                   sz_ssm_conv + sz_ssm_state + sz_ssm_small + sz_ssm_tmp;
 
     /* Quantized KV cache: separate allocation (only for attention layers) */
     size_t sz_k_row = kv_row_size(kv_type_k, c->head_dim);
@@ -736,6 +745,13 @@ static int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_ty
             }
         }
         p = ssm_p;
+    }
+    /* SSM scratch buffer (shared across all SSM layers) */
+    if (c->has_ssm) {
+        int ssm_conv_dim = 2 * c->ssm_d_state * c->ssm_n_group + c->ssm_d_inner;
+        s->ssm_tmp = p;
+        p += (ssm_conv_dim * 3 + c->ssm_d_state * c->ssm_n_group * 2 +
+              c->ssm_d_inner * 3 + c->ssm_dt_rank * 4);
     }
 
     /* Pre-dequantize norm weights */
@@ -1279,8 +1295,8 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     int head_v_dim = c->ssm_d_inner / n_v_heads;
     float eps = c->rms_norm_eps;
 
-    /* Scratch space: use s->hb (n_ffn) for temporaries */
-    float *tmp = s->hb;
+    /* Scratch space: dedicated SSM buffer */
+    float *tmp = s->ssm_tmp;
 
     /* 1. RMSNorm (attn_norm) */
     rmsnorm(s->xb, x, s->attn_norm_w[il], dim, eps);
