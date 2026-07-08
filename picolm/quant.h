@@ -164,10 +164,10 @@ typedef enum {
     GGUF_TYPE_Q5_1  = 7,
     GGUF_TYPE_Q8_0  = 8,
     GGUF_TYPE_Q8_1  = 9,
+    GGUF_TYPE_Q5_K  = 13,
     GGUF_TYPE_Q2_K  = 10,
     GGUF_TYPE_Q3_K  = 11,
     GGUF_TYPE_Q4_K  = 12,
-    GGUF_TYPE_Q5_K  = 13,
     GGUF_TYPE_Q6_K       = 14,
     GGUF_TYPE_Q4_0_4_4   = 31,  /* 4-row interleaved Q4_0 (pre-repacked) */
     GGUF_TYPE_Q4_0_8_8   = 33,  /* 8-row interleaved Q4_0 (pre-repacked, AVX2) */
@@ -259,6 +259,17 @@ typedef struct {
 } block_q8_0;            /* 34 bytes */
 #pragma pack(pop)
 
+/* Q5_K block: 256 weights in 176 bytes */
+#pragma pack(push, 1)
+typedef struct {
+    uint16_t d;          /* super-block scale (FP16) */
+    uint16_t dm;         /* super-block min   (FP16) */
+    uint8_t  scales[12]; /* packed 6-bit scales+mins (get_scale_min_k4) */
+    uint8_t  qh[32];     /* high bit (1 per quant) */
+    uint8_t  qs[128];    /* low 4 bits (2 per byte) */
+} block_q5_K;            /* 176 bytes */
+#pragma pack(pop)
+
 /* Q6_K block: 256 weights in 210 bytes */
 #pragma pack(push, 1)
 typedef struct {
@@ -286,6 +297,7 @@ void dequantize_row_q3_K(const void *src, float *dst, int n);
 void dequantize_row_q2_K(const void *src, float *dst, int n);
 void dequantize_row_q8_0(const void *src, float *dst, int n);
 void dequantize_row_q6_K(const void *src, float *dst, int n);
+void dequantize_row_q5_K(const void *src, float *dst, int n);
 void dequantize_row_q4_0(const void *src, float *dst, int n);
 void dequantize_row_f16(const void *src, float *dst, int n);
 void dequantize_row_f32(const void *src, float *dst, int n);

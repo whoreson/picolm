@@ -135,6 +135,7 @@ typedef struct {
     /* SSM runtime state (Qwen3.5) */
     float *ssm_conv_state[MAX_LAYERS]; /* [(d_conv-1) * conv_dim] per SSM layer */
     float *ssm_state[MAX_LAYERS];      /* [ssm_d_state * ssm_d_inner] per SSM layer */
+    float *ssm_tmp;                    /* scratch for ssm_forward */
     /* Pre-dequantized small SSM arrays */
     float *ssm_a_w[MAX_LAYERS];        /* [dt_rank] F32 */
     float *ssm_dt_w[MAX_LAYERS];       /* [dt_rank] F32 */
