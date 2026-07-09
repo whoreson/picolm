@@ -1318,17 +1318,15 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     /* Append new token */
     memcpy(conv_state + (n_state_rows - 1) * state_stride, s->q, state_stride * sizeof(float));
 
-    /* 5. Convolve: conv_output = silu(conv1d * conv_input) */
+    /* 5. Convolve: conv_output[co] = silu(sum over d: conv1d[d][co] * input[d][co]) */
     float *conv_output = tmp; /* [conv_dim] */
     float *conv1d_w = s->ssm_conv1d_w[il];
     for (int co = 0; co < conv_dim; co++) {
-        float sum = conv1d_w[co]; /* last row (new token) - first element */
-        /* Actually conv1d is [d_conv, conv_dim]. conv_input is [d_conv, conv_dim] = state rows */
-        /* conv_output[co] = sum(conv1d[d][co] * conv_input[d][co]) for d=0..d_conv-1 */
-        sum = 0.0f;
-        for (int d = 0; d < d_conv; d++) {
+        float sum = 0.0f;
+        for (int d = 0; d < n_state_rows; d++) {
             sum += conv1d_w[d * conv_dim + co] * conv_state[d * state_stride + co];
         }
+        sum += conv1d_w[(d_conv - 1) * conv_dim + co] * s->q[co];
         float v = sum;
         conv_output[co] = v * (1.0f / (1.0f + expf(-v))); /* silu */
     }
@@ -1363,39 +1361,42 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     float q_scale = 1.0f / sqrtf((float)d_state);
     for (int i = 0; i < qk_dim; i++) q_conv[i] *= q_scale;
 
-    /* 9. Alpha and gate computation */
-    /* alpha = matmul(ssm_alpha, x) -> [dt_rank] */
-    float *ssm_alpha_w = (float *)lw->ssm_alpha; /* [n_embd, dt_rank] F32 */
+    /* 9. Alpha: alpha = matmul(ssm_alpha, xb) + ssm_dt.bias -> [dt_rank] */
     float *alpha_out = tmp + conv_dim + 2 * qk_dim + c->ssm_d_inner; /* [dt_rank] */
-    for (int h = 0; h < n_v_heads; h++) {
-        float sum = 0.0f;
-        for (int d = 0; d < dim; d++) sum += ssm_alpha_w[d * n_v_heads + h] * x[d];
-        alpha_out[h] = sum + s->ssm_dt_w[il][h]; /* add dt bias */
+    { float avals[n_v_heads]; memset(avals, 0, n_v_heads * sizeof(float));
+      for (int d = 0; d < dim; d++) {
+          const uint8_t *row = (const uint8_t *)lw->ssm_alpha + d * (size_t)gguf_type_row_size(n_v_heads, lw->type_ssm_alpha);
+          dequantize_row(row, avals, n_v_heads, lw->type_ssm_alpha);
+          for (int h = 0; h < n_v_heads; h++) alpha_out[h] += s->xb[d] * avals[h];
+      }
+      for (int h = 0; h < n_v_heads; h++) alpha_out[h] += s->ssm_dt_w[il][h];
     }
 
-    /* gate = -A_log.exp() * softplus(alpha) -> [dt_rank] */
+    /* gate = ssm_a * softplus(alpha) -> [dt_rank] */
     float *gate = alpha_out + n_v_heads; /* [dt_rank] */
     for (int h = 0; h < n_v_heads; h++) {
         float a = alpha_out[h];
-        /* softplus = log(1 + exp(a)), numerically stable */
         float sp = (a > 20.0f) ? a : (a < -20.0f) ? expf(a) : logf(1.0f + expf(a));
-        gate[h] = sp * s->ssm_a_w[il][h]; /* ssm_a_w = exp(-A_log), negative */
+        gate[h] = sp * s->ssm_a_w[il][h];
     }
 
-    /* 10. Beta: sigmoid(matmul(ssm_beta, x)) -> [dt_rank] */
-    float *ssm_beta_w = (float *)lw->ssm_beta; /* [n_embd, dt_rank] F32 */
+    /* 10. Beta: sigmoid(matmul(ssm_beta, xb)) -> [dt_rank] */
     float *beta = gate + n_v_heads; /* [dt_rank] */
-    for (int h = 0; h < n_v_heads; h++) {
-        float sum = 0.0f;
-        for (int d = 0; d < dim; d++) sum += ssm_beta_w[d * n_v_heads + h] * x[d];
-        beta[h] = 1.0f / (1.0f + expf(-sum)); /* sigmoid */
+    { float bvals[n_v_heads]; memset(bvals, 0, n_v_heads * sizeof(float));
+      for (int d = 0; d < dim; d++) {
+          const uint8_t *row = (const uint8_t *)lw->ssm_beta + d * (size_t)gguf_type_row_size(n_v_heads, lw->type_ssm_beta);
+          dequantize_row(row, bvals, n_v_heads, lw->type_ssm_beta);
+          for (int h = 0; h < n_v_heads; h++) beta[h] += s->xb[d] * bvals[h];
+      }
+      for (int h = 0; h < n_v_heads; h++) beta[h] = 1.0f / (1.0f + expf(-beta[h]));
     }
 
     /* 11. Gate expansion: exp(gate) -> [dt_rank] */
     float *gate_exp = beta + n_v_heads; /* [dt_rank] */
     for (int h = 0; h < n_v_heads; h++) {
         float g = gate[h];
-        gate_exp[h] = (g < -50.0f) ? 0.0f : expf(g);
+        float ge = (g < -50.0f) ? 0.0f : expf(g);
+        gate_exp[h] = ge;
     }
 
     /* 12. State: [d_state, d_state, n_v_heads] = [128, 128, 32] */
@@ -1444,17 +1445,22 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
         }
     }
 
-    /* 16. kd = k_rep * d_vals^T -> add to state
-     * state[h][d1][d2] += k_rep[d2, h] * d_vals[d1, h]
+    /* 16. kd[d1,d2,h] = k[d2,h] * d[d2,h] (broadcast to all rows d1)
+     * state[h][d1][d2] += kd[d1,d2,h]
      */
     for (int h = 0; h < n_v_heads; h++) {
         float *st_h = state + h * d_state * d_state;
         float *kr_h = k_rep + h * d_state;
+        /* Compute per-element update: k[d2,h] * d[d2,h] */
+        float kd[d_state];
+        for (int d2 = 0; d2 < d_state; d2++) {
+            kd[d2] = kr_h[d2] * d_vals[d2 * n_v_heads + h];
+        }
+        /* Add to every row d1 */
         for (int d1 = 0; d1 < d_state; d1++) {
-            float dv = d_vals[d1 * n_v_heads + h];
             float *st_row = st_h + d1 * d_state;
             for (int d2 = 0; d2 < d_state; d2++) {
-                st_row[d2] += kr_h[d2] * dv;
+                st_row[d2] += kd[d2];
             }
         }
     }

@@ -181,8 +181,10 @@ typedef struct {
     int         tok_space_marker;
 
     /* Runtime repacked weight buffers (for AVX2 Q4_0_8x8 optimization) */
-    void       *repack_buffers[MAX_LAYERS + 4]; /* per-layer repacked data + output norms */
-    int         repack_used[MAX_LAYERS + 4];    /* 1 if repacked, 0 if not */
+/* ri = 2 + layer * 9, max ri+6 for 64 layers = 577, so 580 is safe */
+#define MAX_REPACK_SLOTS  580
+    void       *repack_buffers[MAX_REPACK_SLOTS]; /* per-layer repacked data + output norms */
+    int         repack_used[MAX_REPACK_SLOTS];    /* 1 if repacked, 0 if not */
 
     /* Weight pinning */
     int         locked_layers;   /* number of layers pinned in RAM (0=disabled) */
