@@ -487,9 +487,9 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                 } else if (strcmp(suffix, "ssm_a") == 0) {
                     lw->ssm_a = ptr;
                 } else if (strcmp(suffix, "ssm_alpha.weight") == 0) {
-                    lw->ssm_alpha = ptr;
+                    lw->ssm_alpha = ptr; lw->type_ssm_alpha = qtype;
                 } else if (strcmp(suffix, "ssm_beta.weight") == 0) {
-                    lw->ssm_beta = ptr;
+                    lw->ssm_beta = ptr; lw->type_ssm_beta = qtype;
                 } else if (strcmp(suffix, "ssm_conv1d.weight") == 0) {
                     lw->ssm_conv1d = ptr;
                 } else if (strcmp(suffix, "ssm_dt.bias") == 0) {
@@ -992,9 +992,10 @@ float *model_forward(model_t *m, int token, int pos) {
     }
 
     /* 2. Transformer layers */
+    int attn_ordinal = 0;
     for (int l = 0; l < c->n_layers; l++) {
         layer_weights_t *lw = &w->layers[l];
-        int ri = 2 + l * 9; /* repack buffer index base for this layer */
+        int ri = 2 + l * 9;
 
         if (c->has_ssm && !lw->is_attn_layer) {
             /* SSM layer (Qwen3.5) */
@@ -1024,9 +1025,9 @@ float *model_forward(model_t *m, int token, int pos) {
         matmul(k_tmp, s->xb, lw->attn_k, dim, kv_dim, lw->type_attn_k);
         tensor_set_repacked(NULL);
 
-        /* KV cache layout: [layer][pos][head] with per-head quantized rows */
-        uint8_t *kcache_layer = s->key_cache + (size_t)l * seq_len * c->n_kv_heads * s->kv_row_size_k;
-        uint8_t *vcache_layer = s->val_cache + (size_t)l * seq_len * c->n_kv_heads * s->kv_row_size_v;
+        int this_attn_ordinal = attn_ordinal++;
+        uint8_t *kcache_layer = s->key_cache + (size_t)this_attn_ordinal * seq_len * c->n_kv_heads * s->kv_row_size_k;
+        uint8_t *vcache_layer = s->val_cache + (size_t)this_attn_ordinal * seq_len * c->n_kv_heads * s->kv_row_size_v;
 
         /* QK-norm (Qwen3): per-head RMSNorm applied before RoPE */
         if (lw->attn_q_norm) {
