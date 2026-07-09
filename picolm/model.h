@@ -54,8 +54,10 @@ typedef struct {
     const void *attn_qkv;       /* SSM: [n_embd, conv_dim] */
     const void *attn_gate_ssm;  /* SSM: [n_embd, value_dim] */
     const void *ssm_a;          /* SSM: [dt_rank] F32 */
-    const void *ssm_alpha;      /* SSM: [n_embd, dt_rank] F32 */
-    const void *ssm_beta;       /* SSM: [n_embd, dt_rank] F32 */
+    const void *ssm_alpha;      /* SSM: [n_embd, dt_rank] F32/Q8_0 */
+    const void *ssm_beta;       /* SSM: [n_embd, dt_rank] F32/Q8_0 */
+    gguf_type_t type_ssm_alpha;
+    gguf_type_t type_ssm_beta;
     const void *ssm_conv1d;     /* SSM: [d_conv, conv_dim] F32 */
     const void *ssm_dt;         /* SSM: [dt_rank] F32 bias */
     const void *ssm_norm;       /* SSM: [head_v_dim] F32 */
