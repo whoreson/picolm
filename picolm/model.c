@@ -711,7 +711,7 @@ static int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_ty
     size_t layer_stride_k = (size_t)c->max_seq_len * c->n_kv_heads * sz_k_row;
     uint8_t *kb = (uint8_t *)s->kv_block;
     s->key_cache = kb;
-    s->val_cache = kb + (size_t)c->n_layers * layer_stride_k;
+    s->val_cache = kb + (size_t)kv_layers * layer_stride_k;
 
     /* SSM state buffers (Qwen3.5) */
     if (c->has_ssm) {
