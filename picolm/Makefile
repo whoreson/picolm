@@ -115,4 +115,8 @@ model:
 clean:
 	rm -f $(TARGET) $(TARGET).exe $(OBJS)
 
-.PHONY: native x86 scalar sse2 sse3 avx avx2 threadpool static pi pi-arm32 cross-pi riscv cross-riscv debug install model clean
+
+.PHONY: asan
+asan: CFLAGS += -fsanitize=address -g -O2 -march=native -DPICOLM_USE_PER_MATMUL_THREAD=1
+asan: LDFLAGS += -fsanitize=address
+asan: picolm
