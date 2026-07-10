@@ -383,7 +383,7 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                 if (pre.len >= 6 && strncmp(pre.str, "smollm", 6) == 0) {
                     m->tok_space_marker = 1; /* U+0100 */
                 } else if (pre.len >= 6 && strncmp(pre.str, "qwen35", 6) == 0) {
-                    m->tok_space_marker = 1; /* literal space ' ' */
+                    m->tok_space_marker = 3; /* qwen35: U+0100, no prefix on first token */
                 } else {
                     m->tok_space_marker = 0; /* U+2581 (default) */
                 }
