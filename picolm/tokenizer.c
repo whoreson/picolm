@@ -117,26 +117,34 @@ int tokenizer_encode(const tokenizer_t *t, const char *text, int *tokens, int ma
     /* Replace spaces with model's space marker:
      * - Most models: U+2581 (0xE2 0x96 0x81)
      * - SmolLM: U+0100 (0xC4 0xA0)
-     * - Qwen3.5/gpt2: literal space ' ' (0x20) */
+     * - Qwen3.5: U+0100 but NO prefix on first token (marker=3) */
     const unsigned char *sp;
     int sp_len;
+    int prepend_space = 1;
     if (t->space_marker == 1) {
         static const unsigned char sp_0100[] = {0xC4, 0xA0};
         sp = sp_0100; sp_len = 2;
     } else if (t->space_marker == 2) {
         static const unsigned char sp_literal[] = {' '};
         sp = sp_literal; sp_len = 1;
+        prepend_space = 0;
+    } else if (t->space_marker == 3) {
+        static const unsigned char sp_0100[] = {0xC4, 0xA0};
+        sp = sp_0100; sp_len = 2;
+        prepend_space = 0; /* qwen35: no space prefix on first token */
     } else {
         static const unsigned char sp_2581[] = {0xE2, 0x96, 0x81};
         sp = sp_2581; sp_len = 3;
     }
 
     int text_len = (int)strlen(text);
-    int norm_cap = text_len * (sp_len + 1) + sp_len + 4;
+    int norm_cap = text_len * (sp_len + 1) + (prepend_space ? sp_len : 0) + 4;
     char *norm = (char *)malloc((size_t)norm_cap);
     int norm_len = 0;
 
-    for (int i = 0; i < sp_len; i++) norm[norm_len++] = (char)sp[i];
+    if (prepend_space) {
+        for (int i = 0; i < sp_len; i++) norm[norm_len++] = (char)sp[i];
+    }
     for (int i = 0; i < text_len; i++) {
         if (text[i] == ' ') {
             for (int j = 0; j < sp_len; j++) norm[norm_len++] = (char)sp[j];
