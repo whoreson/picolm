@@ -11,7 +11,7 @@ typedef struct {
     int    *sorted_idx;  /* indices sorted by vocab string for binary search */
     uint32_t bos_id;
     uint32_t eos_id;
-    int space_marker; /* 0=U+2581 (default), 1=U+0100 (smollm) */
+    int space_marker; /* 0=U+2581 (default), 1=U+0100 (smollm), 2=literal space (qwen35/gpt2) */
 } tokenizer_t;
 
 /* Load tokenizer data from GGUF metadata pointers in model.

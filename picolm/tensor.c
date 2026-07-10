@@ -768,8 +768,7 @@ static void rope_sse(float *h, int half, const float *cos_pos, const float *sin_
 
 /* Rotary position encoding using pre-computed cos/sin tables */
 void rope(float *q, float *k, int head_dim, int n_heads, int n_kv_heads,
-          const float *cos_pos, const float *sin_pos, int rope_type) {
-    int half = head_dim / 2;
+          const float *cos_pos, const float *sin_pos, int rope_type, int half) {
 
     if (rope_type) {
         /* Qwen2 interleaved style: q[i] and q[i+half] are paired */

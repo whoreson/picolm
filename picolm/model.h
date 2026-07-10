@@ -25,6 +25,7 @@ typedef struct {
     float rope_freq_base; /* RoPE theta base (e.g. 10000.0) */
     float rms_norm_eps;   /* RMS norm epsilon (e.g. 1e-5) */
     int rope_type;        /* 0=llama pairwise, 1=qwen2 interleaved */
+    int rope_dim;         /* RoPE dimension (default=head_dim) */
     int alignment;      /* GGUF data alignment */
     gguf_type_t weight_type; /* default weight quantization type */
     /* SSM parameters (Qwen3.5) */

@@ -116,12 +116,16 @@ int tokenizer_encode(const tokenizer_t *t, const char *text, int *tokens, int ma
 
     /* Replace spaces with model's space marker:
      * - Most models: U+2581 (0xE2 0x96 0x81)
-     * - SmolLM: U+0100 (0xC4 0xA0) */
+     * - SmolLM: U+0100 (0xC4 0xA0)
+     * - Qwen3.5/gpt2: literal space ' ' (0x20) */
     const unsigned char *sp;
     int sp_len;
     if (t->space_marker == 1) {
         static const unsigned char sp_0100[] = {0xC4, 0xA0};
         sp = sp_0100; sp_len = 2;
+    } else if (t->space_marker == 2) {
+        static const unsigned char sp_literal[] = {' '};
+        sp = sp_literal; sp_len = 1;
     } else {
         static const unsigned char sp_2581[] = {0xE2, 0x96, 0x81};
         sp = sp_2581; sp_len = 3;
