@@ -268,6 +268,7 @@ static int parse_gguf(model_t *m, int max_seq_len) {
     cfg->rope_freq_base = 10000.0f;
     cfg->rms_norm_eps = 1e-5f;
     cfg->rope_type = 0;  /* llama pairwise */
+    cfg->rope_dim = 0;   /* 0 = use head_dim (default) */
     cfg->max_seq_len = 2048;
     cfg->weight_type = GGUF_TYPE_F16;
     m->tok_bos_id = 1;
@@ -308,6 +309,29 @@ static int parse_gguf(model_t *m, int max_seq_len) {
             } else {
                 int dummy; skip_meta_value(&r, vtype, &dummy);
             }
+        } else if (str_eq(key, "rope.dimension_sections")
+            || str_eq(key, "qwen35.rope.dimension_sections")) {
+            /* ARRAY of I32 (elem_type=5): [11, 11, 10, 0] for Qwen3.5 */
+            if (vtype == GGUF_META_ARRAY) {
+                uint32_t elem_type = read_u32(&r);
+                uint64_t elem_count = read_u64(&r);
+                cfg->rope_dim = 0;
+                for (uint64_t ei = 0; ei < elem_count; ei++) {
+                    if (elem_type == 4 || elem_type == 5) { /* U32 or I32 */
+                        int32_t v = read_i32(&r);
+                        cfg->rope_dim += v;
+                    } else {
+                        /* skip this element */
+                        if (elem_type == 0 || elem_type == 1) r.pos += 1;
+                        else if (elem_type == 2 || elem_type == 3) r.pos += 2;
+                        else if (elem_type == 6 || elem_type == 7 || elem_type == 11 || elem_type == 12) r.pos += 8;
+                        else r.pos += 4;
+                    }
+                }
+                cfg->rope_dim *= 2; /* each section is a pair */
+            } else {
+                int dummy; skip_meta_value(&r, vtype, &dummy);
+            }
         } else if (str_eq(key, "llama.attention.layer_norm_rms_epsilon")
             || str_eq(key, "qwen2.attention.layer_norm_rms_epsilon")
             || str_eq(key, "qwen3.attention.layer_norm_rms_epsilon") || str_eq(key, "qwen35.attention.layer_norm_rms_epsilon")) {
@@ -336,15 +360,30 @@ static int parse_gguf(model_t *m, int max_seq_len) {
             int dummy; cfg->vocab_size = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "tokenizer.ggml.bos_token_id")) {
             int dummy; m->tok_bos_id = (uint32_t)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "tokenizer.ggml.model")) {
+            /* Set default BOS token based on tokenizer model type */
+            if (vtype == GGUF_META_STRING) {
+                gguf_str_t model_name = read_gguf_string(&r);
+                if (model_name.len == 4 && strncmp(model_name.str, "gpt2", 4) == 0) {
+                    /* gpt2 tokenizer: BOS=11, like llama.cpp */
+                    if (m->tok_bos_id == 1) m->tok_bos_id = 11;
+                } else if (model_name.len == 5 && strncmp(model_name.str, "llama", 5) == 0) {
+                    /* llama tokenizer: BOS=1 (already default) */
+                    ;
+                }
+            } else {
+                int dummy; skip_meta_value(&r, vtype, &dummy);
+            }
         } else if (str_eq(key, "tokenizer.ggml.eos_token_id")) {
             int dummy; m->tok_eos_id = (uint32_t)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "tokenizer.ggml.pre")) {
             /* Detect space marker type for tokenization */
             if (vtype == GGUF_META_STRING) {
                 gguf_str_t pre = read_gguf_string(&r);
-                /* SmolLM uses U+0100 (0xC4 0xA0) instead of U+2581 */
                 if (pre.len >= 6 && strncmp(pre.str, "smollm", 6) == 0) {
                     m->tok_space_marker = 1; /* U+0100 */
+                } else if (pre.len >= 6 && strncmp(pre.str, "qwen35", 6) == 0) {
+                    m->tok_space_marker = 1; /* literal space ' ' */
                 } else {
                     m->tok_space_marker = 0; /* U+2581 (default) */
                 }
@@ -408,7 +447,7 @@ static int parse_gguf(model_t *m, int max_seq_len) {
         }
         tinfos[i].type   = read_u32(&r);
         tinfos[i].offset = read_u64(&r);
-    }
+            }
 
     size_t alignment = (size_t)cfg->alignment;
     size_t tensor_data_base = (r.pos + alignment - 1) & ~(alignment - 1);
@@ -547,7 +586,7 @@ static int parse_gguf(model_t *m, int max_seq_len) {
         }
         fprintf(stderr, "  Layers: %d SSM + %d full attention\n", ssm_count, attn_count);
     }
-    fprintf(stderr, "  head_dim=%d, rope_base=%.1f\n", cfg->head_dim, cfg->rope_freq_base);
+    fprintf(stderr, "  head_dim=%d, rope_dim=%d, rope_base=%.1f\n", cfg->head_dim, cfg->rope_dim, cfg->rope_freq_base);
     free(tinfos);
     return 0;
 }
@@ -555,12 +594,13 @@ static int parse_gguf(model_t *m, int max_seq_len) {
 /* ---- Pre-compute RoPE cos/sin lookup tables ---- */
 
 static void init_rope_tables(run_state_t *s, const model_config_t *c) {
-    int half_dim = c->head_dim / 2;
+    int rope_dim = (c->rope_dim > 0) ? c->rope_dim : c->head_dim;
+    int half_dim = rope_dim / 2;
     for (int pos = 0; pos < c->max_seq_len; pos++) {
         float *cos_row = s->rope_cos + (size_t)pos * half_dim;
         float *sin_row = s->rope_sin + (size_t)pos * half_dim;
         for (int i = 0; i < half_dim; i++) {
-            float theta = (float)pos / powf(c->rope_freq_base, (float)(2 * i) / (float)c->head_dim);
+            float theta = (float)pos / powf(c->rope_freq_base, (float)(2 * i) / (float)rope_dim);
             cos_row[i] = cosf(theta);
             sin_row[i] = sinf(theta);
         }
@@ -583,7 +623,8 @@ static int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_ty
     model_config_t *c = &m->config;
     run_state_t *s = &m->state;
 
-    int half_dim = c->head_dim / 2;
+    int rope_dim = (c->rope_dim > 0) ? c->rope_dim : c->head_dim;
+    int half_dim = rope_dim / 2;
     int q_dim = c->n_heads * c->head_dim;
     /* Qwen3.5 full attention: Q+gate joint = 2x q_dim */
     int q_full_dim = c->has_ssm ? (q_dim * 2) : q_dim;
@@ -1040,7 +1081,9 @@ float *model_forward(model_t *m, int token, int pos) {
         }
 
         /* Apply RoPE to Q and K */
-        rope(s->q, k_tmp, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos, c->rope_type);
+        int rope_dim = (c->rope_dim > 0) ? c->rope_dim : head_dim;
+        int rope_half = rope_dim / 2;
+        rope(s->q, k_tmp, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos, c->rope_type, rope_half);
 
         /* Store K per head */
         for (int hkv = 0; hkv < n_kv_heads; hkv++) {
@@ -1943,7 +1986,9 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                     rmsnorm(k_pos + h * head_dim, k_pos + h * head_dim, knw, head_dim, c->rms_norm_eps);
             }
 
-            rope(q_pos, k_pos, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos, c->rope_type);
+            int rope_dim_pf = (c->rope_dim > 0) ? c->rope_dim : head_dim;
+            int rope_half_pf = rope_dim_pf / 2;
+            rope(q_pos, k_pos, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos, c->rope_type, rope_half_pf);
 
             /* KV cache store */
             uint8_t *kcl = s->key_cache + (size_t)l * seq_len * c->n_kv_heads * s->kv_row_size_k;

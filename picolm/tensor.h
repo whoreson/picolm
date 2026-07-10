@@ -41,7 +41,7 @@ void softmax(float *x, int size);
  *   sin_pos[i] = sin(pos / freq_base^(2i/head_dim))
  * Each has head_dim/2 entries. */
 void rope(float *q, float *k, int head_dim, int n_heads, int n_kv_heads,
-          const float *cos_pos, const float *sin_pos, int rope_type);
+          const float *cos_pos, const float *sin_pos, int rope_type, int half);
 
 /* In-place SiLU: x[i] = x[i] / (1 + exp(-x[i])) */
 void silu(float *x, int size);
