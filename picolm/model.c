@@ -975,7 +975,7 @@ static void repack_model_weights_q4_0x8(model_t *m) {
 
 /* Forward declarations for SSM helpers */
 static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
-                        layer_weights_t *lw, int il);
+                        layer_weights_t *lw, int il, int pos);
 
 float *model_forward(model_t *m, int token, int pos) {
     model_config_t *c = &m->config;
@@ -1041,7 +1041,7 @@ float *model_forward(model_t *m, int token, int pos) {
         if (c->has_ssm && !lw->is_attn_layer) {
             /* SSM layer (Qwen3.5) */
             float *ssm_residual = s->xb2; /* use xb2 as residual buffer */
-            ssm_forward(m, s, s->x, ssm_residual, lw, l);
+            ssm_forward(m, s, s->x, ssm_residual, lw, l, pos);
             continue;
         }
 
@@ -1328,7 +1328,7 @@ float *model_forward(model_t *m, int token, int pos) {
 
 /* SSM layer forward pass (autoregressive, single token) */
 static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
-                        layer_weights_t *lw, int il) {
+                        layer_weights_t *lw, int il, int pos) {
     model_config_t *c = &m->config;
     int dim = c->n_embd;
     int d_conv = c->ssm_d_conv;
@@ -1377,7 +1377,12 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
         conv_output[co] = v * (1.0f / (1.0f + expf(-v))); /* silu */
     }
 
-    /* 6. Split into Q, K, V */
+    /* 6. Split into Q, K, V from conv_output (contiguous layout)
+     * conv_output: [conv_dim] = [q_part + k_part + v_part]
+     * Q: [head_k_dim, n_k_heads] stored head-major: [h*d_state + d]
+     * K: [head_k_dim, n_k_heads] stored head-major
+     * V: [head_v_dim, n_v_heads] stored head-major
+     */
     int qk_dim = d_state * n_k_heads;
     float *q_conv = tmp + conv_dim; /* [qk_dim] */
     float *k_conv = tmp + conv_dim + qk_dim; /* [qk_dim] */
@@ -1466,19 +1471,21 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
         memcpy(k_rep + h * d_state, k_conv + kh * d_state, d_state * sizeof(float));
     }
 
-    /* 14. sk = state * k_rep -> [d_state, n_v_heads]
-     * sk[d, h] = sum_d2(state[h][d][d2] * k_rep[d2, h])
+    /* 14. sk = sum_rows(state * k_rep) -> [d_state, n_v_heads]
+     * llama.cpp: sk[d,h] = k[d,h] * sum_d1(state[h][d1][d])
+     * = k[d,h] * column_sum of state[h] at column d (sum over first index)
      */
     float *sk = k_rep + d_state * n_v_heads; /* [d_state * n_v_heads] */
     for (int h = 0; h < n_v_heads; h++) {
         float *st_h = state + h * d_state * d_state;
         float *kr_h = k_rep + h * d_state;
         for (int d = 0; d < d_state; d++) {
-            float sum = 0.0f;
-            for (int d2 = 0; d2 < d_state; d2++) {
-                sum += st_h[d * d_state + d2] * kr_h[d2];
+            /* column sum: sum over d1, keeping column d */
+            float colsum = 0.0f;
+            for (int d1 = 0; d1 < d_state; d1++) {
+                colsum += st_h[d1 * d_state + d];
             }
-            sk[d * n_v_heads + h] = sum;
+            sk[d * n_v_heads + h] = kr_h[d] * colsum;
         }
     }
 
@@ -1487,7 +1494,7 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     float *d_vals = sk + d_state * n_v_heads; /* reuse sk space */
     for (int d = 0; d < d_state; d++) {
         for (int h = 0; h < n_v_heads; h++) {
-            d_vals[d * n_v_heads + h] = (v_conv[d * n_v_heads + h] - sk[d * n_v_heads + h]) * beta[h];
+            d_vals[d * n_v_heads + h] = (v_conv[h * head_v_dim + d] - sk[d * n_v_heads + h]) * beta[h];
         }
     }
 
@@ -1511,38 +1518,40 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
         }
     }
 
-    /* 17. output = state * q_rep -> [d_state, n_v_heads]
-     * output[d, h] = sum_d2(state[h][d][d2] * q_rep[d2, h])
+    /* 17. output = sum_rows(state * q_rep) -> [d_state, n_v_heads]
+     * llama.cpp: output[d,h] = q[d,h] * sum_d1(state[h][d1][d])
+     * = q[d,h] * column_sum of state[h] at column d (sum over first index)
      */
     float *ssm_output = d_vals + d_state * n_v_heads; /* [d_state * n_v_heads] */
     for (int h = 0; h < n_v_heads; h++) {
         float *st_h = state + h * d_state * d_state;
         float *qr_h = q_rep + h * d_state;
         for (int d = 0; d < d_state; d++) {
-            float sum = 0.0f;
-            for (int d2 = 0; d2 < d_state; d2++) {
-                sum += st_h[d * d_state + d2] * qr_h[d2];
+            /* column sum: sum over d1, keeping column d */
+            float colsum = 0.0f;
+            for (int d1 = 0; d1 < d_state; d1++) {
+                colsum += st_h[d1 * d_state + d];
             }
-            ssm_output[d * n_v_heads + h] = sum;
+            ssm_output[d * n_v_heads + h] = qr_h[d] * colsum;
         }
     }
 
     /* 18. Gated normalization */
-    /* z is [head_v_dim, n_v_heads] in s->xb2 */
+    /* ssm_output: [d * n_v_heads + h] (dim-major from delta_net output) */
     float *norm_w = s->ssm_norm_w[il]; /* [head_v_dim] */
     float *final_output = ssm_output + d_state * n_v_heads; /* [head_v_dim * n_v_heads] */
     for (int h = 0; h < n_v_heads; h++) {
-        float *out_h = ssm_output + h * head_v_dim;
-        float *z_h = s->xb2 + h * head_v_dim;
-        /* RMSNorm of out_h */
         float nrm = 0.0f;
-        for (int d = 0; d < head_v_dim; d++) nrm += out_h[d] * out_h[d];
-        nrm = 1.0f / sqrtf(nrm / head_v_dim + eps);
-        /* Multiply by norm weights, then by silu(z_h[d]) */
         for (int d = 0; d < head_v_dim; d++) {
-            float zv = z_h[d];
+            float v = ssm_output[d * n_v_heads + h];
+            nrm += v * v;
+        }
+        nrm = 1.0f / sqrtf(nrm / head_v_dim + eps);
+        for (int d = 0; d < head_v_dim; d++) {
+            float v = ssm_output[d * n_v_heads + h];
+            float zv = s->xb2[h * head_v_dim + d];
             float silu_z = zv * (1.0f / (1.0f + expf(-zv)));
-            final_output[h * head_v_dim + d] = out_h[d] * nrm * norm_w[d] * silu_z;
+            final_output[h * head_v_dim + d] = v * nrm * norm_w[d] * silu_z;
         }
     }
 
