@@ -1471,21 +1471,19 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
         memcpy(k_rep + h * d_state, k_conv + kh * d_state, d_state * sizeof(float));
     }
 
-    /* 14. sk = sum_rows(state * k_rep) -> [d_state, n_v_heads]
-     * llama.cpp: sk[d,h] = k[d,h] * sum_d1(state[h][d1][d])
-     * = k[d,h] * column_sum of state[h] at column d (sum over first index)
-     */
+    /* 14. sk[d,h] = sum_{d1}(state[h][d1][d] * k[h][d1])
+     * llama.cpp: sk = sum_rows(s * k), where s[d1][d2][h] * k[d1][h]
+     * k is indexed by d1 (the summed dimension), not d2 */
     float *sk = k_rep + d_state * n_v_heads; /* [d_state * n_v_heads] */
     for (int h = 0; h < n_v_heads; h++) {
         float *st_h = state + h * d_state * d_state;
         float *kr_h = k_rep + h * d_state;
-        for (int d = 0; d < d_state; d++) {
-            /* column sum: sum over d1, keeping column d */
-            float colsum = 0.0f;
+        for (int d2 = 0; d2 < d_state; d2++) {
+            float sum = 0.0f;
             for (int d1 = 0; d1 < d_state; d1++) {
-                colsum += st_h[d1 * d_state + d];
+                sum += st_h[d1 * d_state + d2] * kr_h[d1];
             }
-            sk[d * n_v_heads + h] = kr_h[d] * colsum;
+            sk[d2 * n_v_heads + h] = sum;
         }
     }
 
@@ -1498,41 +1496,33 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
         }
     }
 
-    /* 16. kd[d1,d2,h] = k[d2,h] * d[d2,h] (broadcast to all rows d1)
-     * state[h][d1][d2] += kd[d1,d2,h]
-     */
+    /* 16. state[h][d1][d2] += k[h][d1] * d[d2][h]
+     * llama.cpp: kd[d1][d2][h] = k[d1][h] * d[d2][h], s += kd */
     for (int h = 0; h < n_v_heads; h++) {
         float *st_h = state + h * d_state * d_state;
         float *kr_h = k_rep + h * d_state;
-        /* Compute per-element update: k[d2,h] * d[d2,h] */
-        float kd[d_state];
-        for (int d2 = 0; d2 < d_state; d2++) {
-            kd[d2] = kr_h[d2] * d_vals[d2 * n_v_heads + h];
-        }
-        /* Add to every row d1 */
         for (int d1 = 0; d1 < d_state; d1++) {
+            float kfactor = kr_h[d1];
             float *st_row = st_h + d1 * d_state;
             for (int d2 = 0; d2 < d_state; d2++) {
-                st_row[d2] += kd[d2];
+                st_row[d2] += kfactor * d_vals[d2 * n_v_heads + h];
             }
         }
     }
 
-    /* 17. output = sum_rows(state * q_rep) -> [d_state, n_v_heads]
-     * llama.cpp: output[d,h] = q[d,h] * sum_d1(state[h][d1][d])
-     * = q[d,h] * column_sum of state[h] at column d (sum over first index)
-     */
+    /* 17. output[d,h] = sum_{d1}(state[h][d1][d] * q[h][d1])
+     * llama.cpp: o = sum_rows(s * q), where s[d1][d2][h] * q[d1][h]
+     * q is indexed by d1 (the summed dimension), not d2 */
     float *ssm_output = d_vals + d_state * n_v_heads; /* [d_state * n_v_heads] */
     for (int h = 0; h < n_v_heads; h++) {
         float *st_h = state + h * d_state * d_state;
         float *qr_h = q_rep + h * d_state;
-        for (int d = 0; d < d_state; d++) {
-            /* column sum: sum over d1, keeping column d */
-            float colsum = 0.0f;
+        for (int d2 = 0; d2 < d_state; d2++) {
+            float sum = 0.0f;
             for (int d1 = 0; d1 < d_state; d1++) {
-                colsum += st_h[d1 * d_state + d];
+                sum += st_h[d1 * d_state + d2] * qr_h[d1];
             }
-            ssm_output[d * n_v_heads + h] = qr_h[d] * colsum;
+            ssm_output[d2 * n_v_heads + h] = sum;
         }
     }
 
