@@ -1362,15 +1362,17 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     /* Append new token */
     memcpy(conv_state + (n_state_rows - 1) * state_stride, s->q, state_stride * sizeof(float));
 
-    /* 5. Convolve: conv_output[co] = silu(sum over d: conv1d[d][co] * input[d][co]) */
+    /* 5. Convolve: conv_output[co] = silu(sum over d: conv1d[d][co] * input[d][co])
+     * conv1d.weight: [d_conv, conv_dim] F32, column-major (ggml: ne[0] varies fastest)
+     * conv1d[d][co] at index d + co * d_conv */
     float *conv_output = tmp; /* [conv_dim] */
     float *conv1d_w = s->ssm_conv1d_w[il];
     for (int co = 0; co < conv_dim; co++) {
         float sum = 0.0f;
         for (int d = 0; d < n_state_rows; d++) {
-            sum += conv1d_w[d * conv_dim + co] * conv_state[d * state_stride + co];
+            sum += conv1d_w[d + co * d_conv] * conv_state[d * state_stride + co];
         }
-        sum += conv1d_w[(d_conv - 1) * conv_dim + co] * s->q[co];
+        sum += conv1d_w[(d_conv - 1) + co * d_conv] * s->q[co];
         float v = sum;
         conv_output[co] = v * (1.0f / (1.0f + expf(-v))); /* silu */
     }
