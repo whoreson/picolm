@@ -1351,20 +1351,10 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     /* 3. Z gate: z = matmul(attn_gate_ssm, xb) -> [value_dim] */
     matmul(s->xb2, s->xb, lw->attn_gate_ssm, dim, c->ssm_d_inner, lw->type_attn_gate_ssm);
 
-    /* 4. Convolution state update */
+    /* 4. Convolution: compute BEFORE shifting conv_state */
     float *conv_state = s->ssm_conv_state[il];
     int state_stride = conv_dim;
     int n_state_rows = d_conv - 1;
-    /* Shift left: keep last d_conv-2 rows */
-    for (int r = 0; r < n_state_rows - 1; r++) {
-        memcpy(conv_state + r * state_stride, conv_state + (r + 1) * state_stride, state_stride * sizeof(float));
-    }
-    /* Append new token */
-    memcpy(conv_state + (n_state_rows - 1) * state_stride, s->q, state_stride * sizeof(float));
-
-    /* 5. Convolve: conv_output[co] = silu(sum over d: conv1d[d][co] * input[d][co])
-     * conv1d.weight: [d_conv, conv_dim] F32, column-major (ggml: ne[0] varies fastest)
-     * conv1d[d][co] at index d + co * d_conv */
     float *conv_output = tmp; /* [conv_dim] */
     float *conv1d_w = s->ssm_conv1d_w[il];
     for (int co = 0; co < conv_dim; co++) {
@@ -1376,6 +1366,12 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
         float v = sum;
         conv_output[co] = v * (1.0f / (1.0f + expf(-v))); /* silu */
     }
+
+    /* Shift conv_state left and append new token */
+    for (int r = 0; r < n_state_rows - 1; r++) {
+        memcpy(conv_state + r * state_stride, conv_state + (r + 1) * state_stride, state_stride * sizeof(float));
+    }
+    memcpy(conv_state + (n_state_rows - 1) * state_stride, s->q, state_stride * sizeof(float));
 
     /* 6. Split into Q, K, V from conv_output (contiguous layout)
      * conv_output: [conv_dim] = [q_part + k_part + v_part]
