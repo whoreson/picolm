@@ -803,14 +803,16 @@ static int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_ty
         if (lw->attn_norm)
             dequantize_row(lw->attn_norm, nw, c->n_embd, lw->type_attn_norm);
         else
-            memset(nw, 1, (size_t)c->n_embd);
+            for (int _ni = 0; _ni < c->n_embd; _ni++) nw[_ni] = 1.0f;
+        if (c->has_ssm) for (int _ni = 0; _ni < c->n_embd; _ni++) nw[_ni] += 1.0f;
         nw += c->n_embd;
 
         s->post_attn_norm_w[l] = nw;
         if (lw->post_attn_norm)
             dequantize_row(lw->post_attn_norm, nw, c->n_embd, lw->type_post_attn_norm);
         else
-            memset(nw, 1, (size_t)c->n_embd);
+            for (int _ni = 0; _ni < c->n_embd; _ni++) nw[_ni] = 1.0f;
+        if (c->has_ssm) for (int _ni = 0; _ni < c->n_embd; _ni++) nw[_ni] += 1.0f;
         nw += c->n_embd;
 
         /* Qwen3 QK-norm weights (per-head, if present) */
@@ -819,7 +821,8 @@ static int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_ty
             dequantize_row(lw->attn_q_norm, nw, c->head_dim,
                            lw->type_attn_q_norm);
         else
-            memset(nw, 1, (size_t)c->head_dim);
+            for (int _ni = 0; _ni < c->head_dim; _ni++) nw[_ni] = 1.0f;
+        if (c->has_ssm) for (int _ni = 0; _ni < c->head_dim; _ni++) nw[_ni] += 1.0f;
         nw += c->head_dim;
 
         s->attn_k_norm_w[l] = nw;
@@ -827,12 +830,14 @@ static int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_ty
             dequantize_row(lw->attn_k_norm, nw, c->head_dim,
                            lw->type_attn_k_norm);
         else
-            memset(nw, 1, (size_t)c->head_dim);
+            for (int _ni = 0; _ni < c->head_dim; _ni++) nw[_ni] = 1.0f;
+        if (c->has_ssm) for (int _ni = 0; _ni < c->head_dim; _ni++) nw[_ni] += 1.0f;
         nw += c->head_dim;
     }
     s->output_norm_w = nw;
     dequantize_row(m->weights.output_norm, nw, c->n_embd,
                    m->weights.type_output_norm);
+    if (c->has_ssm) for (int _ni = 0; _ni < c->n_embd; _ni++) nw[_ni] += 1.0f;
 
     /* Dequantize SSM F32 weights (Qwen3.5) */
     if (c->has_ssm) {
@@ -1412,7 +1417,7 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     float *alpha_out = tmp + conv_dim + 2 * qk_dim + c->ssm_d_inner; /* [dt_rank] */
     { float avals[n_v_heads]; memset(avals, 0, n_v_heads * sizeof(float));
       for (int d = 0; d < dim; d++) {
-          const uint8_t *row = (const uint8_t *)lw->ssm_alpha + d * (size_t)gguf_type_row_size(n_v_heads, lw->type_ssm_alpha);
+          const uint8_t *row = (const uint8_t *)lw->ssm_alpha + d * (size_t)gguf_type_row_size(lw->type_ssm_alpha, n_v_heads);
           dequantize_row(row, avals, n_v_heads, lw->type_ssm_alpha);
           for (int h = 0; h < n_v_heads; h++) alpha_out[h] += s->xb[d] * avals[h];
       }
@@ -1431,7 +1436,7 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     float *beta = gate + n_v_heads; /* [dt_rank] */
     { float bvals[n_v_heads]; memset(bvals, 0, n_v_heads * sizeof(float));
       for (int d = 0; d < dim; d++) {
-          const uint8_t *row = (const uint8_t *)lw->ssm_beta + d * (size_t)gguf_type_row_size(n_v_heads, lw->type_ssm_beta);
+          const uint8_t *row = (const uint8_t *)lw->ssm_beta + d * (size_t)gguf_type_row_size(lw->type_ssm_beta, n_v_heads);
           dequantize_row(row, bvals, n_v_heads, lw->type_ssm_beta);
           for (int h = 0; h < n_v_heads; h++) beta[h] += s->xb[d] * bvals[h];
       }
