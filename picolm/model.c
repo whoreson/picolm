@@ -1059,10 +1059,23 @@ float *model_forward(model_t *m, int token, int pos) {
         matmul(s->q, s->xb, lw->attn_q, dim, this_q_dim, lw->type_attn_q);
         tensor_set_repacked(NULL);
 
-        /* For Qwen3.5: extract gate from second half of Q projection */
+        /* For Qwen3.5: de-interleave per-head Q+gate into block layout
+         * GGUF stores [Q_0, Gate_0, Q_1, Gate_1, ...] (per-head interleaved)
+         * We need [Q_0, Q_1, ..., Q_15] in s->q, gate stored separately.
+         * Gate stored in s->hb (FFN buffer) to survive K/V projection writes.
+         */
         float *qwen35_attn_gate = NULL;
         if (c->has_ssm && lw->is_attn_layer) {
-            qwen35_attn_gate = s->q + q_dim; /* second half is gate */
+            float *qg_raw = s->q; /* [q_full_dim] = interleaved Q+gate */
+            float *q_block = s->q; /* compact Q heads here (in-place) */
+            float *gate_block = s->hb; /* gate survives K/V projection */
+            for (int h = 0; h < n_heads; h++) {
+                memcpy(q_block + h * head_dim, qg_raw + h * 2 * head_dim,
+                       head_dim * sizeof(float));
+                memcpy(gate_block + h * head_dim, qg_raw + h * 2 * head_dim + head_dim,
+                       head_dim * sizeof(float));
+            }
+            qwen35_attn_gate = gate_block;
         }
 
         /* K projection */
