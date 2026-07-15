@@ -619,7 +619,7 @@ static size_t kv_row_size(kv_cache_type_t kv_type, int n) {
     return 0;
 }
 
-static int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v) {
+int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v) {
     model_config_t *c = &m->config;
     run_state_t *s = &m->state;
 
@@ -804,7 +804,6 @@ static int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_ty
             dequantize_row(lw->attn_norm, nw, c->n_embd, lw->type_attn_norm);
         else
             for (int _ni = 0; _ni < c->n_embd; _ni++) nw[_ni] = 1.0f;
-        if (c->has_ssm) for (int _ni = 0; _ni < c->n_embd; _ni++) nw[_ni] += 1.0f;
         nw += c->n_embd;
 
         s->post_attn_norm_w[l] = nw;
@@ -812,7 +811,6 @@ static int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_ty
             dequantize_row(lw->post_attn_norm, nw, c->n_embd, lw->type_post_attn_norm);
         else
             for (int _ni = 0; _ni < c->n_embd; _ni++) nw[_ni] = 1.0f;
-        if (c->has_ssm) for (int _ni = 0; _ni < c->n_embd; _ni++) nw[_ni] += 1.0f;
         nw += c->n_embd;
 
         /* Qwen3 QK-norm weights (per-head, if present) */
@@ -822,7 +820,6 @@ static int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_ty
                            lw->type_attn_q_norm);
         else
             for (int _ni = 0; _ni < c->head_dim; _ni++) nw[_ni] = 1.0f;
-        if (c->has_ssm) for (int _ni = 0; _ni < c->head_dim; _ni++) nw[_ni] += 1.0f;
         nw += c->head_dim;
 
         s->attn_k_norm_w[l] = nw;
@@ -831,7 +828,6 @@ static int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_ty
                            lw->type_attn_k_norm);
         else
             for (int _ni = 0; _ni < c->head_dim; _ni++) nw[_ni] = 1.0f;
-        if (c->has_ssm) for (int _ni = 0; _ni < c->head_dim; _ni++) nw[_ni] += 1.0f;
         nw += c->head_dim;
     }
     s->output_norm_w = nw;
@@ -1034,6 +1030,7 @@ float *model_forward(model_t *m, int token, int pos) {
         } else {
             const void *embd_row = (const uint8_t *)w->token_embd + (size_t)token * row_bytes;
             dequantize_row(embd_row, s->x, dim, w->type_token_embd);
+
         }
     }
 
