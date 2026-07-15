@@ -190,7 +190,25 @@ int main(int argc, char **argv) {
     model_t model;
     /* Initialize FP16->FP32 lookup table (64KB) for fast attention */
     fp16_table_init();
-    if (model_load(&model, model_path, context_override, kv_type_k, kv_type_v) != 0) {
+
+    /* Auto-detect: if path is a directory with safetensors files, use safetensors loader */
+    int is_safetensors = 0;
+    {
+        char idx_path[4096];
+        snprintf(idx_path, sizeof(idx_path), "%s/model.safetensors.index.json", model_path);
+        if (access(idx_path, F_OK) == 0) is_safetensors = 1;
+        if (!is_safetensors) {
+            snprintf(idx_path, sizeof(idx_path), "%s/model.safetensors", model_path);
+            if (access(idx_path, F_OK) == 0) is_safetensors = 1;
+        }
+    }
+    int load_ok = 0;
+    if (is_safetensors) {
+        load_ok = (model_load_safetensors(&model, model_path, context_override, kv_type_k, kv_type_v) == 0);
+    } else {
+        load_ok = (model_load(&model, model_path, context_override, kv_type_k, kv_type_v) == 0);
+    }
+    if (!load_ok) {
         fprintf(stderr, "Failed to load model\n");
         return 1;
     }
@@ -274,7 +292,7 @@ int main(int argc, char **argv) {
      * matmul_batch is single-threaded and slower than per-token matmul
      * which uses the thread pool. When threading is added, batch prefill
      * will be faster because weights are read once for all tokens. */
-    int token = start_pos > 0 ? prompt_tokens[start_pos - 1] : 1;
+    int token = start_pos > 0 ? prompt_tokens[start_pos - 1] : prompt_tokens[0];
 
     for (; pos < total_steps; pos++) {
         /* Forward pass */

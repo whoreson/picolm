@@ -35,6 +35,7 @@ typedef struct {
     int ssm_n_group;        /* group count (= n_k_heads) */
     int ssm_dt_rank;        /* time step rank (= n_v_heads) */
     int ssm_d_inner;        /* inner size (= value_dim) */
+    uint8_t layer_type[MAX_LAYERS]; /* 0=attention, 1=SSM */
 } model_config_t;
 
 /* ---- Per-layer weight pointers (into mmap) ---- */
@@ -81,6 +82,10 @@ typedef struct {
     gguf_type_t type_attn_qkv;
     gguf_type_t type_attn_gate_ssm;
     gguf_type_t type_ssm_out;
+    gguf_type_t type_ssm_conv1d;
+    gguf_type_t type_ssm_dt;
+    gguf_type_t type_ssm_a;
+    gguf_type_t type_ssm_norm;
 } layer_weights_t;
 
 typedef struct {
@@ -180,6 +185,7 @@ typedef struct {
     uint32_t    tok_eos_id;
     /* Pre-tokenizer type: 0=U+2581 (default), 1=U+0100 (smollm) */
     int         tok_space_marker;
+    char        *tok_eos_str;
 
     /* Runtime repacked weight buffers (for AVX2 Q4_0_8x8 optimization) */
 /* ri = 2 + layer * 9, max ri+6 for 64 layers = 577, so 580 is safe */
@@ -193,6 +199,7 @@ typedef struct {
 
 /* Load a GGUF model file. Returns 0 on success. */
 int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v);
+int model_load_safetensors(model_t *m, const char *model_dir, int max_seq_len, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v);
 
 /* Pin layer weights in RAM. Given a budget in bytes, locks the maximum
  * number of consecutive layers (starting from 0) plus global tensors.
@@ -203,6 +210,7 @@ int model_lock_layers(model_t *m, size_t mem_bytes);
 int model_unlock_layers(model_t *m);
 
 /* Run one forward pass. Returns pointer to logits[vocab_size]. */
+int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v);
 float *model_forward(model_t *m, int token, int pos);
 float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int start_pos);
 
