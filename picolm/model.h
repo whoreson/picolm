@@ -20,6 +20,7 @@ typedef struct {
     int n_kv_heads;     /* number of KV heads for GQA (e.g. 4) */
     int n_layers;       /* number of transformer layers (e.g. 22) */
     int vocab_size;     /* vocabulary size (e.g. 32000) */
+    int is_qwen;        /* 1 if model architecture is qwen3/qwen35 */
     int max_seq_len;    /* maximum sequence length (e.g. 2048) */
     int head_dim;       /* = n_embd / n_heads */
     float rope_freq_base; /* RoPE theta base (e.g. 10000.0) */
