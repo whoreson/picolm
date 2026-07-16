@@ -195,6 +195,8 @@ typedef struct {
 
     /* Weight pinning */
     int         locked_layers;   /* number of layers pinned in RAM (0=disabled) */
+    /* Whether model was loaded from safetensors (norm weights need +1.0) */
+    int         from_safetensors;
 } model_t;
 
 /* Load a GGUF model file. Returns 0 on success. */

@@ -262,6 +262,8 @@ static int load_tokenizer_safetensors(const char *model_dir, model_t *m) {
                 if (v && cJSON_IsNumber(v)) m->tok_eos_id = (int)cJSON_GetNumberValue(v);
                 cJSON_Delete(cr);
             }
+            /* Detect model_type from raw config bytes (cJSON can corrupt strings in large configs) */
+            if (strstr(cb, "\"model_type\"") && strstr(cb, "qwen")) m->tok_bos_id = 11;
             free(cb);
         }
         fclose(cf);
@@ -277,12 +279,12 @@ static int load_tokenizer_safetensors(const char *model_dir, model_t *m) {
         if (tb) {
             fread(tb, 1, tsz, tf);
             tb[tsz] = '\0';
-            char *p = strstr(tb, "\"add_bos_token\"");
-            if (p && strstr(p, ":false")) m->tok_bos_id = 0;
-            p = strstr(tb, "\"model_type\"");
+            char *p = strstr(tb, "\"model_type\"");
             if (p) {
-                if (strstr(p, "qwen")) m->tok_space_marker = 3;
-                else if (strstr(p, "smollm")) m->tok_space_marker = 2;
+                if (strstr(p, "qwen")) {
+                    m->tok_space_marker = 3;
+                    m->tok_bos_id = 11; /* Qwen3.5 always uses BOS=11 */
+                } else if (strstr(p, "smollm")) m->tok_space_marker = 2;
             }
             free(tb);
         }
@@ -437,6 +439,7 @@ int model_load_safetensors(model_t *m, const char *model_dir, int max_seq_len, k
         }
     }
 
+    m->from_safetensors = 1;
     if (allocate_run_state(m, kv_type_k, kv_type_v) != 0) return -1;
     if (load_tokenizer_safetensors(model_dir, m) != 0) return -1;
 
