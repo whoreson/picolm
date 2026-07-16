@@ -899,20 +899,14 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
                         s->ssm_a_w[l][i] = -expf(((const float *)lw->ssm_a)[i]);
                     }
                 } else {
-                    /* GGUF: already A. GGUF may reorder v-heads from grouped
-                     * [k0v0..v7, k1v0..v7, ...] to tiled [k0v0,k0v2,...,k0v6, k1v0,...].
-                     * Apply inverse reorder to restore grouped layout. */
+                    /* GGUF: already A. Inverse _reorder_v_heads: simple transpose */
                     const float *src = (const float *)lw->ssm_a;
                     if (c->ssm_n_group > 0 && c->ssm_n_group < c->ssm_dt_rank) {
                         int n_k = c->ssm_n_group;
                         int n_vpk = c->ssm_dt_rank / n_k;
-                        int half_vpk = n_vpk / 2;
                         for (int g = 0; g < c->ssm_dt_rank; g++) {
-                            int block = g / half_vpk;
-                            int k = block % n_k;
-                            int odd_flag = block / n_k;
-                            int even_half = g % half_vpk;
-                            int v = even_half * 2 + odd_flag;
+                            int v = g / n_k;
+                            int k = g % n_k;
                             s->ssm_a_w[l][k * n_vpk + v] = src[g];
                         }
                     } else {
@@ -929,19 +923,15 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
                 } else {
                     memcpy(s->ssm_dt_w[l], (const float *)lw->ssm_dt, c->ssm_dt_rank * sizeof(float));
                 }
-                /* Inverse reorder dt_bias: GGUF tiled -> grouped */
+                /* Inverse reorder dt_bias: GGUF tiled -> grouped (simple transpose) */
                 if (!m->from_safetensors && c->ssm_n_group > 0 && c->ssm_n_group < c->ssm_dt_rank) {
                     int n_k = c->ssm_n_group;
                     int n_vpk = c->ssm_dt_rank / n_k;
-                    int half_vpk = n_vpk / 2;
                     float *tmp = alloca(c->ssm_dt_rank * sizeof(float));
                     memcpy(tmp, s->ssm_dt_w[l], c->ssm_dt_rank * sizeof(float));
                     for (int g = 0; g < c->ssm_dt_rank; g++) {
-                        int block = g / half_vpk;
-                        int k = block % n_k;
-                        int odd_flag = block / n_k;
-                        int even_half = g % half_vpk;
-                        int v = even_half * 2 + odd_flag;
+                        int v = g / n_k;
+                        int k = g % n_k;
                         s->ssm_dt_w[l][k * n_vpk + v] = tmp[g];
                     }
                                     }
@@ -1485,7 +1475,7 @@ static inline int qwen35_vhead_gguf_1d(int h, int n_vpk, int n_k, int half_vpk) 
 
 /* Pattern 2: attn_gate_ssm, attn_qkv V, conv1d V, ssm_alpha, ssm_beta, ssm_out
  * (head_dim=head_v_dim, simple transpose) */
-static inline int qwen35_vhead_gguf_2d(int h, int n_vpk, int n_k) {
+static inline int qwen35_vhead_gguf(int h, int n_vpk, int n_k) {
     int k = h / n_vpk;
     int v = h % n_vpk;
     return v * n_k + k;
@@ -1532,7 +1522,7 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
         float *xb2_tmp = alloca(c->ssm_d_inner * sizeof(float));
         memcpy(xb2_tmp, s->xb2, c->ssm_d_inner * sizeof(float));
         for (int h = 0; h < n_v_heads; h++) {
-            int gh = qwen35_vhead_gguf_2d(h, n_vpk, n_k);
+            int gh = qwen35_vhead_gguf(h, n_vpk, n_k);
             memcpy(s->xb2 + h * head_v_dim, xb2_tmp + gh * head_v_dim, head_v_dim * sizeof(float));
         }
         if (il == 0 && pos == 0) {
@@ -1584,7 +1574,7 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
         float *v_conv_tmp = alloca(c->ssm_d_inner * sizeof(float));
         memcpy(v_conv_tmp, v_conv, c->ssm_d_inner * sizeof(float));
         for (int h = 0; h < n_v_heads; h++) {
-            int gh = qwen35_vhead_gguf_2d(h, n_vpk, n_k);
+            int gh = qwen35_vhead_gguf(h, n_vpk, n_k);
             memcpy(v_conv + h * head_v_dim, v_conv_tmp + gh * head_v_dim, head_v_dim * sizeof(float));
         }
     }
@@ -1628,14 +1618,14 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
         size_t row_bytes = gguf_type_row_size(alpha_type, dim);
         if (alpha_type == GGUF_TYPE_F32) {
             for (int h = 0; h < n_v_heads; h++) {
-                int gh = do_remap ? qwen35_vhead_gguf_2d(h, n_vpk, n_k) : h;
+                int gh = do_remap ? qwen35_vhead_gguf(h, n_vpk, n_k) : h;
                 float vd = vec_dot((const uint8_t *)lw->ssm_alpha + (size_t)gh * row_bytes,
                                    s->xb, dim, alpha_type);
                 alpha_out[h] = vd + s->ssm_dt_w[il][h];
             }
         } else {
             for (int h = 0; h < n_v_heads; h++) {
-                int gh = do_remap ? qwen35_vhead_gguf_2d(h, n_vpk, n_k) : h;
+                int gh = do_remap ? qwen35_vhead_gguf(h, n_vpk, n_k) : h;
                 const uint8_t *head_data = (const uint8_t *)lw->ssm_alpha + (size_t)gh * row_bytes;
                 float sum = vec_dot(head_data, s->xb, dim, alpha_type);
                 alpha_out[h] = sum + s->ssm_dt_w[il][h];
@@ -1665,7 +1655,7 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
         size_t row_bytes = gguf_type_row_size(beta_type, dim);
         if (beta_type == GGUF_TYPE_F32) {
             for (int h = 0; h < n_v_heads; h++) {
-                int gh = do_remap ? qwen35_vhead_gguf_2d(h, n_vpk, n_k) : h;
+                int gh = do_remap ? qwen35_vhead_gguf(h, n_vpk, n_k) : h;
                 beta[h] = vec_dot((const uint8_t *)lw->ssm_beta + (size_t)gh * row_bytes,
                                   s->xb, dim, beta_type);
                 beta[h] = 1.0f / (1.0f + expf(-beta[h]));
@@ -1673,7 +1663,7 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
         } else {
             float bvals[dim];
             for (int h = 0; h < n_v_heads; h++) {
-                int gh = do_remap ? qwen35_vhead_gguf_2d(h, n_vpk, n_k) : h;
+                int gh = do_remap ? qwen35_vhead_gguf(h, n_vpk, n_k) : h;
                 dequantize_row((const uint8_t *)lw->ssm_beta + (size_t)gh * row_bytes,
                                bvals, dim, beta_type);
                 float sum = 0.0f;
@@ -1811,7 +1801,7 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
          * columns and input elements are matched. */
         float *fo_gguf = alloca(c->ssm_d_inner * sizeof(float));
         for (int h = 0; h < n_v_heads; h++) {
-            int gh = qwen35_vhead_gguf_2d(h, n_vpk, n_k);
+            int gh = qwen35_vhead_gguf(h, n_vpk, n_k);
             memcpy(fo_gguf + gh * head_v_dim, final_output + h * head_v_dim, head_v_dim * sizeof(float));
         }
         matmul(residual, fo_gguf, lw->ssm_out, c->ssm_d_inner, dim, lw->type_ssm_out);
