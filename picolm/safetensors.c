@@ -113,14 +113,9 @@ static int load_config_safetensors(const char *model_dir, model_config_t *cfg) {
                     char *colon = strchr(rt + 12, ':');
                     if (colon) cfg->rope_freq_base = (float)strtod(colon + 1, NULL);
                 }
-                char *prf = strstr(rp, "\"partial_rotary_factor\"");
-                if (prf) {
-                    char *colon = strchr(prf + 23, ':');
-                    if (colon) {
-                        float prf_val = (float)strtod(colon + 1, NULL);
-                        cfg->rope_dim = (int)((float)cfg->head_dim * prf_val + 0.5f);
-                    }
-                }
+                /* partial_rotary_factor is for MTP multi-rope, not for the main
+                 * transformer RoPE. The main transformer applies RoPE to the
+                 * full head_dim. Skip this to let rope_dim default to 0 (=head_dim). */
                 free(cbuf);
             }
             fclose(cf);

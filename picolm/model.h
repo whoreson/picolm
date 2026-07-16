@@ -36,6 +36,14 @@ typedef struct {
     int ssm_dt_rank;        /* time step rank (= n_v_heads) */
     int ssm_d_inner;        /* inner size (= value_dim) */
     uint8_t layer_type[MAX_LAYERS]; /* 0=attention, 1=SSM */
+    /* MTP (Multi-Token Prediction) - Qwen3.5 second release and later.
+     * MTP layers sit at the end of the layer list (layers n_active..n_layers-1).
+     * They have "nextn." tensors (e.g. blk.N.nextn.eh_proj, blk.N.nextn.enorm).
+     * During generation, MTP layers are skipped in model_forward().
+     * Full MTP support planned: run MTP layers on output embedding to produce
+     * N candidate tokens, verify with fast forward pass (speculative decoding). */
+    int has_mtp;              /* 1 if model has MTP layers */
+    int n_mtp_layers;         /* number of MTP layers at the end of layer list */
 } model_config_t;
 
 /* ---- Per-layer weight pointers (into mmap) ---- */
