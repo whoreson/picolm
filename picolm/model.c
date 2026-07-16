@@ -912,11 +912,10 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
     {
         layer_weights_t *lw = &m->weights.layers[0];
         if (m->config.has_ssm) {
-            /* SSM model: check SSM tensors */
+            /* SSM model: check SSM tensors (MLP weights are optional per layer) */
             if (!lw->attn_qkv || !lw->attn_gate_ssm || !lw->ssm_a ||
                 !lw->ssm_alpha || !lw->ssm_beta || !lw->ssm_conv1d ||
-                !lw->ssm_dt || !lw->ssm_norm || !lw->ssm_out ||
-                !lw->ffn_gate || !lw->ffn_up || !lw->ffn_down) {
+                !lw->ssm_dt || !lw->ssm_norm || !lw->ssm_out) {
                 fprintf(stderr, "Missing SSM tensors\n");
                 return -1;
             }
@@ -1333,24 +1332,26 @@ float *model_forward(model_t *m, int token, int pos) {
         tensor_set_repacked(NULL);
         vec_add(s->x, s->xb2, dim);
 
-        /* ---- FFN (SwiGLU) ---- */
-        rmsnorm(s->xb, s->x, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
+        /* ---- FFN (SwiGLU) - only if MLP weights exist for this layer ---- */
+        if (lw->ffn_gate && lw->ffn_up && lw->ffn_down) {
+            rmsnorm(s->xb, s->x, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
 
-        tensor_set_repacked(m->repack_used[ri+4] ? m->repack_buffers[ri+4] : NULL);
-        matmul(s->hb,  s->xb, lw->ffn_gate, dim, n_ffn, lw->type_ffn_gate);
-        tensor_set_repacked(NULL);
+            tensor_set_repacked(m->repack_used[ri+4] ? m->repack_buffers[ri+4] : NULL);
+            matmul(s->hb,  s->xb, lw->ffn_gate, dim, n_ffn, lw->type_ffn_gate);
+            tensor_set_repacked(NULL);
 
-        tensor_set_repacked(m->repack_used[ri+6] ? m->repack_buffers[ri+6] : NULL);
-        matmul(s->hb2, s->xb, lw->ffn_up,   dim, n_ffn, lw->type_ffn_up);
-        tensor_set_repacked(NULL);
+            tensor_set_repacked(m->repack_used[ri+6] ? m->repack_buffers[ri+6] : NULL);
+            matmul(s->hb2, s->xb, lw->ffn_up,   dim, n_ffn, lw->type_ffn_up);
+            tensor_set_repacked(NULL);
 
-        silu(s->hb, n_ffn);
-        elemwise_mul(s->hb, s->hb, s->hb2, n_ffn);
+            silu(s->hb, n_ffn);
+            elemwise_mul(s->hb, s->hb, s->hb2, n_ffn);
 
-        tensor_set_repacked(m->repack_used[ri+5] ? m->repack_buffers[ri+5] : NULL);
-        matmul(s->xb, s->hb, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
-        tensor_set_repacked(NULL);
-        vec_add(s->x, s->xb, dim);
+            tensor_set_repacked(m->repack_used[ri+5] ? m->repack_buffers[ri+5] : NULL);
+            matmul(s->xb, s->hb, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
+            tensor_set_repacked(NULL);
+            vec_add(s->x, s->xb, dim);
+        }
     }
 
     /* 3. Final RMSNorm */
@@ -1659,15 +1660,16 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     /* 20. Residual add */
     vec_add(x, residual, dim);
 
-    /* 21. Post-attention norm + FFN */
-    rmsnorm(s->xb, x, s->post_attn_norm_w[il], dim, eps);
-
-    matmul(s->hb, s->xb, lw->ffn_gate, dim, c->n_ffn, lw->type_ffn_gate);
-    matmul(s->hb2, s->xb, lw->ffn_up, dim, c->n_ffn, lw->type_ffn_up);
-    silu(s->hb, c->n_ffn);
-    elemwise_mul(s->hb, s->hb, s->hb2, c->n_ffn);
-    matmul(s->xb, s->hb, lw->ffn_down, c->n_ffn, dim, lw->type_ffn_down);
-    vec_add(x, s->xb, dim);
+    /* 21. Post-attention norm + FFN (only if MLP weights exist for this layer) */
+    if (lw->ffn_gate && lw->ffn_up && lw->ffn_down) {
+        rmsnorm(s->xb, x, s->post_attn_norm_w[il], dim, eps);
+        matmul(s->hb, s->xb, lw->ffn_gate, dim, c->n_ffn, lw->type_ffn_gate);
+        matmul(s->hb2, s->xb, lw->ffn_up, dim, c->n_ffn, lw->type_ffn_up);
+        silu(s->hb, c->n_ffn);
+        elemwise_mul(s->hb, s->hb, s->hb2, c->n_ffn);
+        matmul(s->xb, s->hb, lw->ffn_down, c->n_ffn, dim, lw->type_ffn_down);
+        vec_add(x, s->xb, dim);
+    }
 }
 
 void model_free(model_t *m) {

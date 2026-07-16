@@ -66,8 +66,67 @@ static int load_config_safetensors(const char *model_dir, model_config_t *cfg) {
     if (cfg->head_dim == 0) cfg->head_dim = cfg->n_embd / cfg->n_heads;
     cfg->rms_norm_eps   = (float)cJSON_GetNumberValue(cJSON_GetObjectItem(cfg_json, "rms_norm_eps"));
     if (cfg->rms_norm_eps == 0) cfg->rms_norm_eps = 1e-6f;
+    #if 0
+    /* cJSON-based rope parameter extraction (disabled: cJSON corrupts valuestring in large configs) */
+    {
+        cJSON *rt = cJSON_GetObjectItem(cfg_json, "rope_theta");
+        if (rt && cJSON_IsNumber(rt) && !cJSON_IsNull(rt)) {
+            cfg->rope_freq_base = (float)cJSON_GetNumberValue(rt);
+        } else {
+            cJSON *rp = cJSON_GetObjectItem(cfg_json, "rope_parameters");
+            if (rp && cJSON_IsObject(rp)) {
+                cJSON *rpt = cJSON_GetObjectItem(rp, "rope_theta");
+                if (rpt && cJSON_IsNumber(rpt) && !cJSON_IsNull(rpt)) {
+                    cfg->rope_freq_base = (float)cJSON_GetNumberValue(rpt);
+                }
+                cJSON *prf = cJSON_GetObjectItem(rp, "partial_rotary_factor");
+                if (prf && cJSON_IsNumber(prf) && !cJSON_IsNull(prf)) {
+                    float prf_val = (float)cJSON_GetNumberValue(prf);
+                    cfg->rope_dim = (int)((float)cfg->head_dim * prf_val + 0.5f);
+                }
+            }
+        }
+    }
+#endif
     cfg->rope_freq_base = (float)cJSON_GetNumberValue(cJSON_GetObjectItem(cfg_json, "rope_theta"));
-    if (cfg->rope_freq_base == 0) cfg->rope_freq_base = 10000.0f;
+    if (cfg->rope_freq_base <= 0.0f) cfg->rope_freq_base = 10000.0f;
+
+    /* Qwen3.5 nests rope params under rope_parameters, not at top level.
+     * Use raw strstr to avoid cJSON corruption of valuestring in large configs. */
+    {
+        char cfg_path[1024];
+        snprintf(cfg_path, sizeof(cfg_path), "%s/config.json", model_dir);
+        FILE *cf = fopen(cfg_path, "r");
+        if (cf) {
+            fseek(cf, 0, SEEK_END);
+            long csz = ftell(cf);
+            fseek(cf, 0, SEEK_SET);
+            char *cbuf = malloc(csz + 1);
+            if (cbuf) {
+                fread(cbuf, 1, csz, cf);
+                cbuf[csz] = '\0';
+                /* Try rope_parameters block first (Qwen3.5), then top-level */
+                char *rp = strstr(cbuf, "\"rope_parameters\"");
+                if (!rp) rp = cbuf;
+                char *rt = strstr(rp, "\"rope_theta\"");
+                if (rt) {
+                    char *colon = strchr(rt + 12, ':');
+                    if (colon) cfg->rope_freq_base = (float)strtod(colon + 1, NULL);
+                }
+                char *prf = strstr(rp, "\"partial_rotary_factor\"");
+                if (prf) {
+                    char *colon = strchr(prf + 23, ':');
+                    if (colon) {
+                        float prf_val = (float)strtod(colon + 1, NULL);
+                        cfg->rope_dim = (int)((float)cfg->head_dim * prf_val + 0.5f);
+                    }
+                }
+                free(cbuf);
+            }
+            fclose(cf);
+        }
+    }
+    if (cfg->rope_freq_base <= 0.0f) cfg->rope_freq_base = 10000.0f;
 
     cfg->ssm_d_conv     = json_get_int(cJSON_GetObjectItem(cfg_json, "linear_conv_kernel_dim"), 4);
     cfg->ssm_d_state    = json_get_int(cJSON_GetObjectItem(cfg_json, "linear_key_head_dim"), 128);
