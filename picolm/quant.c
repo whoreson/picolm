@@ -35,7 +35,18 @@ float fp16_to_fp32_lookup(uint16_t h) {
 /* fp16-fp32 dot product: sum of fp16_to_fp32_lookup(k[i]) * x[i] for i=0..n-1 */
 float vec_dot_f16_f32(const void *src, const float *x, int n) {
     const uint16_t *k = (const uint16_t *)src;
-#ifdef PICOLM_NEON
+#ifdef PICOLM_AVX512
+    __m512 acc = _mm512_setzero_ps();
+    int i = 0;
+    for (; i + 15 < n; i += 16) {
+        __m512 kf = fp16x16_to_fp32_inline(k + i);
+        __m512 xf = _mm512_loadu_ps(x + i);
+        acc = _mm512_fmadd_ps(kf, xf, acc);
+    }
+    float sumf = _mm512_reduce_add_ps(acc);
+    for (; i < n; i++) sumf += fp16_to_fp32_lookup(k[i]) * x[i];
+    return sumf;
+#elif defined(PICOLM_NEON)
     float32x4_t acc0 = vdupq_n_f32(0.0f);
     float32x4_t acc1 = vdupq_n_f32(0.0f);
     int i = 0;
@@ -120,9 +131,24 @@ float bf16_to_fp32(uint16_t x) {
 
 float vec_dot_bf16_f32(const void *src, const float *x, int n) {
     const uint16_t *bf16 = (const uint16_t *)src;
+#ifdef PICOLM_AVX512
+    __m512 acc = _mm512_setzero_ps();
+    int i = 0;
+    for (; i + 15 < n; i += 16) {
+        /* _mm512_cvtepu16_epi32: 16 x uint16 -> 16 x uint32 (zero-extended) */
+        __m512i bits = _mm512_cvtepu16_epi32(_mm256_loadu_si256((const __m256i *)(bf16 + i)));
+        __m512 bf = _mm512_castsi512_ps(_mm512_slli_epi32(bits, 16));
+        __m512 xf = _mm512_loadu_ps(x + i);
+        acc = _mm512_fmadd_ps(bf, xf, acc);
+    }
+    float sum = _mm512_reduce_add_ps(acc);
+    for (; i < n; i++) sum += bf16_to_fp32(bf16[i]) * x[i];
+    return sum;
+#else
     float sum = 0.0f;
     for (int i = 0; i < n; i++) sum += bf16_to_fp32(bf16[i]) * x[i];
     return sum;
+#endif
 }
 
 void dequantize_row_bf16(const void *src, float *dst, int n) {
@@ -520,6 +546,16 @@ float vec_dot_f32_f32(const void *src, const float *x, int n) {
         acc1 = vmlaq_f32(acc1, vld1q_f32(w + i + 4), vld1q_f32(x + i + 4));
     }
     float sum = vaddvq_f32_compat(vaddq_f32(acc0, acc1));
+    for (; i < n; i++) sum += w[i] * x[i];
+    return sum;
+
+#elif defined(PICOLM_AVX512)
+    __m512 acc = _mm512_setzero_ps();
+    int i = 0;
+    for (; i + 15 < n; i += 16) {
+        acc = _mm512_fmadd_ps(_mm512_loadu_ps(w + i), _mm512_loadu_ps(x + i), acc);
+    }
+    float sum = _mm512_reduce_add_ps(acc);
     for (; i < n; i++) sum += w[i] * x[i];
     return sum;
 
@@ -1010,7 +1046,57 @@ void quantize_row_q8_0(const float *x, void *dst, int n) {
     block_q8_0 *y = (block_q8_0 *)dst;
     int nb = n / 32;
 
-#ifdef PICOLM_AVX2
+#ifdef PICOLM_AVX512
+    { int i = 0;
+    /* AVX-512: cvtps_epi32 -> cvtepi32_epi8 (16 i32 -> 16 i8 each).
+     * Two calls per 32-element block, stored low+high. */
+    for (; i + 1 < nb; i += 2) {
+        __m512 v0 = _mm512_loadu_ps(x);
+        __m512 v1 = _mm512_loadu_ps(x + 16);
+        __m512 v2 = _mm512_loadu_ps(x + 32);
+        __m512 v3 = _mm512_loadu_ps(x + 48);
+        x += 64;
+
+        __m512 maxAbs = _mm512_max_ps(_mm512_abs_ps(v0), _mm512_abs_ps(v1));
+        float maxS = _mm512_reduce_max_ps(maxAbs);
+        y[i].d = fp32_to_fp16(maxS / 127.0f);
+        float id = (maxS != 0.0f) ? 127.0f / maxS : 0.0f;
+        __m512 mul = _mm512_set1_ps(id);
+        __m512i i0 = _mm512_cvtps_epi32(_mm512_mul_ps(v0, mul));
+        __m512i i1 = _mm512_cvtps_epi32(_mm512_mul_ps(v1, mul));
+        __m128i q0l = _mm512_cvtepi32_epi8(i0);  /* i32[0..15] -> i8[0..15] */
+        __m128i q0h = _mm512_cvtepi32_epi8(i1);  /* i32[16..31] -> i8[16..31] */
+        _mm_storeu_si128((__m128i *)(y[i].qs), q0l);
+        _mm_storeu_si128((__m128i *)(y[i].qs + 16), q0h);
+
+        maxAbs = _mm512_max_ps(_mm512_abs_ps(v2), _mm512_abs_ps(v3));
+        float maxS2 = _mm512_reduce_max_ps(maxAbs);
+        y[i+1].d = fp32_to_fp16(maxS2 / 127.0f);
+        float id2 = (maxS2 != 0.0f) ? 127.0f / maxS2 : 0.0f;
+        __m512 mul2 = _mm512_set1_ps(id2);
+        __m512i i2 = _mm512_cvtps_epi32(_mm512_mul_ps(v2, mul2));
+        __m512i i3 = _mm512_cvtps_epi32(_mm512_mul_ps(v3, mul2));
+        __m128i q1l = _mm512_cvtepi32_epi8(i2);
+        __m128i q1h = _mm512_cvtepi32_epi8(i3);
+        _mm_storeu_si128((__m128i *)(y[i+1].qs), q1l);
+        _mm_storeu_si128((__m128i *)(y[i+1].qs + 16), q1h);
+    }
+    for (; i < nb; i++) {
+        float asmax = 0.0f;
+        for (int j = 0; j < 32; j++) { float v = x[j]; if (v < 0) v = -v; if (v > asmax) asmax = v; }
+        float d = asmax / 127.0f;
+        y[i].d = fp32_to_fp16(d);
+        float id = (asmax != 0.0f) ? 127.0f / asmax : 0.0f;
+        for (int j = 0; j < 32; j++) {
+            int v = (int)(x[j] * id);
+            if (v > 127) v = 127;
+            if (v < -127) v = -128;
+            y[i].qs[j] = (int8_t)v;
+        }
+        x += 32;
+    }
+    } /* end AVX-512 block */
+#elif defined(PICOLM_AVX2)
     /* AVX2: same as AVX but uses _mm256_permutevar8x32_epi32 for shuffle */
     for (int i = 0; i < nb; i++) {
         const __m256 signBit = _mm256_set1_ps(-0.0f);
@@ -1674,7 +1760,39 @@ float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n) {
     float sumf = 0.0f;
     int i = 0;
 
-#ifdef PICOLM_NEON
+#ifdef PICOLM_VNNI
+    /* AVX-512 VNNI: dpbusd + sign trick for signed int8 MAC.
+     * dpbusd(zero, abs(x), sign(y,x)) = sum(x*y) for signed int8.
+     * Server CPUs have AVX512-VNNI (not client AVX-VNNI),
+     * so we use 256-bit dpbusd via __AVX512VL__. */
+    __m256 acc = _mm256_setzero_ps();
+    for (i = 0; i + 1 < nb; i += 2) {
+        __m256i qx0 = _mm256_loadu_si256((const __m256i *)x[i].qs);
+        __m256i qw0 = _mm256_loadu_si256((const __m256i *)w[i].qs);
+        __m256i qx1 = _mm256_loadu_si256((const __m256i *)x[i+1].qs);
+        __m256i qw1 = _mm256_loadu_si256((const __m256i *)w[i+1].qs);
+
+        __m256i ax0 = _mm256_sign_epi8(qx0, qx0);
+        __m256i sx0 = _mm256_sign_epi8(qw0, qx0);
+        __m256i s0 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), ax0, sx0);
+
+        __m256i ax1 = _mm256_sign_epi8(qx1, qx1);
+        __m256i sx1 = _mm256_sign_epi8(qw1, qx1);
+        __m256i s1 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), ax1, sx1);
+
+        __m256 f0 = _mm256_cvtepi32_ps(s0);
+        __m256 f1 = _mm256_cvtepi32_ps(s1);
+
+        float d0 = fp16_to_fp32_lookup(x[i].d) * fp16_to_fp32_lookup(w[i].d);
+        float d1 = fp16_to_fp32_lookup(x[i+1].d) * fp16_to_fp32_lookup(w[i+1].d);
+        __m256 dd0 = _mm256_set1_ps(d0);
+        __m256 dd1 = _mm256_set1_ps(d1);
+
+        acc = _mm256_add_ps(acc, _mm256_add_ps(_mm256_mul_ps(f0, dd0), _mm256_mul_ps(f1, dd1)));
+    }
+    sumf = hsum_avx(acc);
+
+#elif defined(PICOLM_NEON)
     /* NEON: optimized int8 MAC via vpaddlq_s16, 2 blocks/iter (mirrors llama.cpp) */
     float32x4_t sumv0 = vdupq_n_f32(0.0f);
     float32x4_t sumv1 = vdupq_n_f32(0.0f);

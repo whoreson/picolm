@@ -333,7 +333,7 @@ int main(int argc, char **argv) {
 
             grammar_apply(&grammar, logits, model.config.vocab_size);
             next = sampler_sample(&sampler, logits, model.config.vocab_size);
-
+            
             /* Update grammar state with the generated token */
             grammar_advance(&grammar, &tokenizer, next);
 
