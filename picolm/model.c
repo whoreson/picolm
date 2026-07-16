@@ -1363,6 +1363,26 @@ float *model_forward(model_t *m, int token, int pos) {
                           for (; d < head_dim; d++)
                               acc[d] = acc[d] * correction + fp16_to_fp32(vt16[d]);
                         }
+#elif defined(PICOLM_AVX512)
+                        { __m512 cv = _mm512_set1_ps(correction); int d = 0;
+                          for (; d + 15 < head_dim; d += 16) {
+                              __m512 vf = fp16x16_to_fp32_inline(vt16 + d);
+                              __m512 af = _mm512_loadu_ps(acc + d);
+                              _mm512_storeu_ps(acc + d, _mm512_fmadd_ps(vf, cv, af));
+                          }
+                          for (; d < head_dim; d++)
+                              acc[d] = acc[d] * correction + fp16_to_fp32(vt16[d]);
+                        }
+#elif defined(PICOLM_AVX)
+                        { __m256 cv = _mm256_set1_ps(correction); int d = 0;
+                          for (; d + 7 < head_dim; d += 8) {
+                              __m256 vf = fp16x8_to_fp32_inline(vt16 + d);
+                              __m256 af = _mm256_loadu_ps(acc + d);
+                              _mm256_storeu_ps(acc + d, _mm256_add_ps(_mm256_mul_ps(vf, cv), af));
+                          }
+                          for (; d < head_dim; d++)
+                              acc[d] = acc[d] * correction + fp16_to_fp32(vt16[d]);
+                        }
 #else
                         for (int d = 0; d < head_dim; d++) {
                             acc[d] = acc[d] * correction + fp16_to_fp32(vt16[d]);
@@ -1389,6 +1409,26 @@ float *model_forward(model_t *m, int token, int pos) {
                           for (; d < head_dim; d++)
                               acc[d] += w * fp16_to_fp32(vt16[d]);
                         }
+#elif defined(PICOLM_AVX512)
+                        { __m512 wv = _mm512_set1_ps(w); int d = 0;
+                          for (; d + 15 < head_dim; d += 16) {
+                              __m512 vf = fp16x16_to_fp32_inline(vt16 + d);
+                              __m512 af = _mm512_loadu_ps(acc + d);
+                              _mm512_storeu_ps(acc + d, _mm512_fmadd_ps(vf, wv, af));
+                          }
+                          for (; d < head_dim; d++)
+                              acc[d] += w * fp16_to_fp32(vt16[d]);
+                        }
+#elif defined(PICOLM_AVX)
+                        { __m256 wv = _mm256_set1_ps(w); int d = 0;
+                          for (; d + 7 < head_dim; d += 8) {
+                              __m256 vf = fp16x8_to_fp32_inline(vt16 + d);
+                              __m256 af = _mm256_loadu_ps(acc + d);
+                              _mm256_storeu_ps(acc + d, _mm256_add_ps(_mm256_mul_ps(vf, wv), af));
+                          }
+                          for (; d < head_dim; d++)
+                              acc[d] += w * fp16_to_fp32(vt16[d]);
+                        }
 #else
                         for (int d = 0; d < head_dim; d++) {
                             acc[d] += w * fp16_to_fp32(vt16[d]);
@@ -1402,7 +1442,17 @@ float *model_forward(model_t *m, int token, int pos) {
 
             /* Normalize */
             float inv_sum = 1.0f / sum_exp;
-#ifdef PICOLM_NEON
+#ifdef PICOLM_AVX512
+            {
+                __m512 inv = _mm512_set1_ps(inv_sum);
+                int d = 0;
+                for (; d + 15 < head_dim; d += 16) {
+                    __m512 af = _mm512_loadu_ps(acc + d);
+                    _mm512_storeu_ps(xbh + d, _mm512_mul_ps(af, inv));
+                }
+                for (; d < head_dim; d++) xbh[d] = acc[d] * inv_sum;
+            }
+#elif defined(PICOLM_NEON)
             {
                 float32x4_t inv = vdupq_n_f32(inv_sum);
                 int d = 0;

@@ -604,10 +604,20 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
 
 void rmsnorm(float *out, const float *x, const float *weight, int size, float eps) {
     float ss = 0.0f;
+    int i;
 
-#ifdef PICOLM_NEON
+#ifdef PICOLM_AVX512
+    __m512 acc = _mm512_setzero_ps();
+    i = 0;
+    for (; i + 15 < size; i += 16) {
+        __m512 v = _mm512_loadu_ps(x + i);
+        acc = _mm512_fmadd_ps(v, v, acc);
+    }
+    ss = _mm512_reduce_add_ps(acc);
+    for (; i < size; i++) ss += x[i] * x[i];
+#elif defined(PICOLM_NEON)
     float32x4_t acc = vdupq_n_f32(0);
-    int i = 0;
+    i = 0;
     for (; i + 3 < size; i += 4) {
         float32x4_t v = vld1q_f32(x + i);
         acc = vmlaq_f32(acc, v, v);
@@ -616,7 +626,7 @@ void rmsnorm(float *out, const float *x, const float *weight, int size, float ep
     for (; i < size; i++) ss += x[i] * x[i];
 #elif defined(PICOLM_AVX)
     __m256 acc = _mm256_setzero_ps();
-    int i = 0;
+    i = 0;
     for (; i + 7 < size; i += 8) {
         __m256 v = _mm256_loadu_ps(x + i);
         acc = _mm256_add_ps(acc, _mm256_mul_ps(v, v));
@@ -625,7 +635,7 @@ void rmsnorm(float *out, const float *x, const float *weight, int size, float ep
     for (; i < size; i++) ss += x[i] * x[i];
 #elif defined(PICOLM_SSE2)
     __m128 acc = _mm_setzero_ps();
-    int i = 0;
+    i = 0;
     for (; i + 3 < size; i += 4) {
         __m128 v = _mm_loadu_ps(x + i);
         acc = _mm_add_ps(acc, _mm_mul_ps(v, v));
@@ -638,7 +648,16 @@ void rmsnorm(float *out, const float *x, const float *weight, int size, float ep
 
     ss = 1.0f / sqrtf(ss / (float)size + eps);
 
-#ifdef PICOLM_NEON
+#ifdef PICOLM_AVX512
+    __m512 scale = _mm512_set1_ps(ss);
+    i = 0;
+    for (; i + 15 < size; i += 16) {
+        __m512 v = _mm512_loadu_ps(x + i);
+        __m512 w = _mm512_loadu_ps(weight + i);
+        _mm512_storeu_ps(out + i, _mm512_mul_ps(_mm512_mul_ps(v, scale), w));
+    }
+    for (; i < size; i++) out[i] = x[i] * ss * weight[i];
+#elif defined(PICOLM_NEON)
     float32x4_t scale = vdupq_n_f32(ss);
     i = 0;
     for (; i + 3 < size; i += 4) {
@@ -682,7 +701,14 @@ void softmax(float *x, int size) {
     }
     float inv = 1.0f / sum;
 
-#ifdef PICOLM_NEON
+#ifdef PICOLM_AVX512
+    __m512 inv_v = _mm512_set1_ps(inv);
+    int i = 0;
+    for (; i + 15 < size; i += 16) {
+        _mm512_storeu_ps(x + i, _mm512_mul_ps(_mm512_loadu_ps(x + i), inv_v));
+    }
+    for (; i < size; i++) x[i] *= inv;
+#elif defined(PICOLM_NEON)
     float32x4_t inv_v = vdupq_n_f32(inv);
     int i = 0;
     for (; i + 3 < size; i += 4) {
@@ -721,6 +747,52 @@ static void rope_avx(float *h, int half, const float *cos_pos, const float *sin_
         __m256 sw  = _mm256_permute_ps(v, 0xB1); /* swap r,i within each pair */
         _mm256_storeu_ps(h + i * 2,
             _mm256_addsub_ps(_mm256_mul_ps(v, cv), _mm256_mul_ps(sw, sv)));
+    }
+    for (; i < half; i++) {
+        float r = h[i * 2], im = h[i * 2 + 1];
+        h[i * 2]     = r * cos_pos[i] - im * sin_pos[i];
+        h[i * 2 + 1] = r * sin_pos[i] + im * cos_pos[i];
+    }
+}
+#endif
+
+/* AVX-512 RoPE: 8 complex pairs/iter */
+#ifdef PICOLM_AVX512
+static void rope_avx512(float *h, int half, const float *cos_pos, const float *sin_pos) {
+    int i = 0;
+    for (; i + 7 < half; i += 8) {
+        __m512 v = _mm512_loadu_ps(h + i * 2);
+        __m256 c8 = _mm256_loadu_ps(cos_pos + i);
+        __m256 s8 = _mm256_loadu_ps(sin_pos + i);
+        /* Broadcast each cos/sin to 2 copies: [c0,c0,c1,c1,...,c7,c7] */
+        __m128 c03 = _mm256_castps256_ps128(c8);
+        __m128 c47 = _mm256_extractf128_ps(c8, 1);
+        __m128 c00 = _mm_shuffle_ps(c03, c03, 0x44);
+        __m128 c22 = _mm_shuffle_ps(c03, c03, 0x99);
+        __m128 c44 = _mm_shuffle_ps(c47, c47, 0x44);
+        __m128 c66 = _mm_shuffle_ps(c47, c47, 0x99);
+        __m512 cv = _mm512_castps128_ps512(c00);
+        cv = _mm512_insertf32x4(cv, c22, 1);
+        cv = _mm512_insertf32x4(cv, c44, 2);
+        cv = _mm512_insertf32x4(cv, c66, 3);
+        __m128 s03 = _mm256_castps256_ps128(s8);
+        __m128 s47 = _mm256_extractf128_ps(s8, 1);
+        __m128 s00 = _mm_shuffle_ps(s03, s03, 0x44);
+        __m128 s22 = _mm_shuffle_ps(s03, s03, 0x99);
+        __m128 s44 = _mm_shuffle_ps(s47, s47, 0x44);
+        __m128 s66 = _mm_shuffle_ps(s47, s47, 0x99);
+        __m512 sv = _mm512_castps128_ps512(s00);
+        sv = _mm512_insertf32x4(sv, s22, 1);
+        sv = _mm512_insertf32x4(sv, s44, 2);
+        sv = _mm512_insertf32x4(sv, s66, 3);
+        __m512 sw = _mm512_shuffle_ps(v, v, 0xB1);
+        /* addsub replacement: a + xor(b, sign_mask) where sign_mask negates odd lanes */
+        __m512 a = _mm512_mul_ps(v, cv);
+        __m512 b = _mm512_mul_ps(sw, sv);
+        __m512i mask = _mm512_set_epi32(0,0x80000000,0,0x80000000,0,0x80000000,0,0x80000000,
+                                        0,0x80000000,0,0x80000000,0,0x80000000,0,0x80000000);
+        _mm512_storeu_ps(h + i * 2,
+            _mm512_add_ps(a, _mm512_castsi512_ps(_mm512_xor_si512(_mm512_castps_si512(b), mask))));
     }
     for (; i < half; i++) {
         float r = h[i * 2], im = h[i * 2 + 1];
@@ -808,6 +880,8 @@ void rope(float *q, float *k, int head_dim, int n_heads, int n_kv_heads,
                 qh[i * 2]     = q0 * cos_pos[i] - q1 * sin_pos[i];
                 qh[i * 2 + 1] = q0 * sin_pos[i] + q1 * cos_pos[i];
             }
+#elif defined(PICOLM_AVX512)
+            rope_avx512(qh, half, cos_pos, sin_pos);
 #elif defined(PICOLM_AVX)
             rope_avx(qh, half, cos_pos, sin_pos);
 #elif defined(PICOLM_SSE2)
@@ -838,6 +912,8 @@ void rope(float *q, float *k, int head_dim, int n_heads, int n_kv_heads,
                 kh[i * 2]     = k0 * cos_pos[i] - k1 * sin_pos[i];
                 kh[i * 2 + 1] = k0 * sin_pos[i] + k1 * cos_pos[i];
             }
+#elif defined(PICOLM_AVX512)
+            rope_avx512(kh, half, cos_pos, sin_pos);
 #elif defined(PICOLM_AVX)
             rope_avx(kh, half, cos_pos, sin_pos);
 #elif defined(PICOLM_SSE2)
@@ -865,7 +941,13 @@ void silu(float *x, int size) {
 }
 
 void elemwise_mul(float *out, const float *a, const float *b, int size) {
-#ifdef PICOLM_NEON
+#ifdef PICOLM_AVX512
+    int i = 0;
+    for (; i + 15 < size; i += 16) {
+        _mm512_storeu_ps(out + i, _mm512_mul_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i)));
+    }
+    for (; i < size; i++) out[i] = a[i] * b[i];
+#elif defined(PICOLM_NEON)
     int i = 0;
     for (; i + 3 < size; i += 4) {
         vst1q_f32(out + i, vmulq_f32(vld1q_f32(a + i), vld1q_f32(b + i)));
@@ -889,7 +971,13 @@ void elemwise_mul(float *out, const float *a, const float *b, int size) {
 }
 
 void vec_add(float *a, const float *b, int size) {
-#ifdef PICOLM_NEON
+#ifdef PICOLM_AVX512
+    int i = 0;
+    for (; i + 15 < size; i += 16) {
+        _mm512_storeu_ps(a + i, _mm512_add_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i)));
+    }
+    for (; i < size; i++) a[i] += b[i];
+#elif defined(PICOLM_NEON)
     int i = 0;
     for (; i + 3 < size; i += 4) {
         vst1q_f32(a + i, vaddq_f32(vld1q_f32(a + i), vld1q_f32(b + i)));

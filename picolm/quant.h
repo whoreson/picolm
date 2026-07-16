@@ -64,6 +64,10 @@ static inline void f32x4_to_fp16_hw(uint16_t *p, float32x4_t v) {
 /* AVX512 implies AVX2 + AVX + SSE3 + SSE2 */
 #if defined(__AVX512F__)
 #  define PICOLM_AVX512 1
+/* VNNI with 256-bit (VL) enables dpbssd/dpbusd int8 MAC instructions */
+#  if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+#    define PICOLM_VNNI 1
+#  endif
 #  define PICOLM_AVX2   1
 #  define PICOLM_AVX    1
 #  define PICOLM_SSE3   1
@@ -149,6 +153,30 @@ static inline __m128 fp16x4_to_fp32_inline(const uint16_t *p) {
 #else
     /* No F16C: use lookup table */
     return _mm_set_ps(
+        fp16_to_fp32_lookup(p[3]), fp16_to_fp32_lookup(p[2]), fp16_to_fp32_lookup(p[1]), fp16_to_fp32_lookup(p[0]));
+#endif
+}
+#endif
+
+/* AVX-512 specific helpers */
+#ifdef PICOLM_AVX512
+/* Convert 16 FP16 to 16 FP32 in AVX-512 register */
+static inline __m512 fp16x16_to_fp32_inline(const uint16_t *p) {
+#ifdef __F16C__
+    __m128 a = _mm_cvtph_ps(_mm_loadu_si128((const __m128i *)p));
+    __m128 b = _mm_cvtph_ps(_mm_loadu_si128((const __m128i *)(p + 4)));
+    __m128 c = _mm_cvtph_ps(_mm_loadu_si128((const __m128i *)(p + 8)));
+    __m128 d = _mm_cvtph_ps(_mm_loadu_si128((const __m128i *)(p + 12)));
+    __m512 r = _mm512_castps128_ps512(a);
+    r = _mm512_insertf32x4(r, b, 1);
+    r = _mm512_insertf32x4(r, c, 2);
+    r = _mm512_insertf32x4(r, d, 3);
+    return r;
+#else
+    return _mm512_set_ps(
+        fp16_to_fp32_lookup(p[15]), fp16_to_fp32_lookup(p[14]), fp16_to_fp32_lookup(p[13]), fp16_to_fp32_lookup(p[12]),
+        fp16_to_fp32_lookup(p[11]), fp16_to_fp32_lookup(p[10]), fp16_to_fp32_lookup(p[9]), fp16_to_fp32_lookup(p[8]),
+        fp16_to_fp32_lookup(p[7]), fp16_to_fp32_lookup(p[6]), fp16_to_fp32_lookup(p[5]), fp16_to_fp32_lookup(p[4]),
         fp16_to_fp32_lookup(p[3]), fp16_to_fp32_lookup(p[2]), fp16_to_fp32_lookup(p[1]), fp16_to_fp32_lookup(p[0]));
 #endif
 }
