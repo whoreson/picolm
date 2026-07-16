@@ -162,7 +162,7 @@ int main(int argc, char **argv) {
         return server_main(server_port, server_host, model_path);
     }
 
-    if (!prompt || !*prompt) {
+    if (!prompt) {
         fprintf(stderr, "No prompt provided. Use -p or pipe via stdin.\n");
         usage(argv[0]);
         return 1;
@@ -244,6 +244,10 @@ int main(int argc, char **argv) {
     sampler_t sampler;
     sampler_init(&sampler, temperature, top_p, seed);
 
+    /* Buffer for generated text (printed at the end for easy grepping) */
+    char *gen_buf = malloc(max_tokens * 16); /* avg 16 bytes per token */
+    int gen_buf_len = 0;
+
     /* Init grammar constraint */
     grammar_state_t grammar;
     grammar_init(&grammar, json_mode ? GRAMMAR_JSON : GRAMMAR_NONE, &tokenizer);
@@ -318,6 +322,12 @@ int main(int argc, char **argv) {
             const char *piece = tokenizer_decode(&tokenizer, token, next);
             printf("%s", piece);
             fflush(stdout);
+            /* Also capture in buffer */
+            int plen = (int)strlen(piece);
+            if (gen_buf_len + plen < max_tokens * 16 - 1) {
+                memcpy(gen_buf + gen_buf_len, piece, plen);
+                gen_buf_len += plen;
+            }
 
             total_gen++;
 
@@ -353,6 +363,9 @@ int main(int argc, char **argv) {
             total_gen, gen_time,
             gen_time > 0 ? (double)total_gen / gen_time : 0);
     fprintf(stderr, "Total: %.2fs\n", total_time);
+    gen_buf[gen_buf_len] = '\0';
+    fprintf(stderr, "OUTPUT: %s\n", gen_buf);
+    free(gen_buf);
     {
         const char *kname = "f16";
         if (model.state.kv_type_k == KV_CACHE_Q8_0) kname = "q8_0";
