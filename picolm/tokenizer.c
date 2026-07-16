@@ -51,6 +51,8 @@ int tokenizer_load(tokenizer_t *t, const model_t *m) {
     t->bos_id = m->tok_bos_id;
     t->eos_id = m->tok_eos_id;
     t->space_marker = m->tok_space_marker;
+    t->token_type = NULL;
+    t->n_token_type = 0;
 
     /* Allocate vocab and scores arrays */
     t->vocab = (char **)calloc((size_t)vs, sizeof(char *));
@@ -91,6 +93,13 @@ int tokenizer_load(tokenizer_t *t, const model_t *m) {
         uint64_t n = m->tok_n_scores;
         if ((int)n > vs) n = (uint64_t)vs;
         memcpy(t->scores, m->tok_scores_data, (size_t)n * sizeof(float));
+    }
+
+    /* Read token_type array (3=control, 4=user_defined) */
+    if (m->tok_token_type_data && m->tok_n_token_type > 0) {
+        t->token_type = (const int32_t *)m->tok_token_type_data;
+        t->n_token_type = (int)m->tok_n_token_type;
+        if (t->n_token_type > vs) t->n_token_type = vs;
     }
 
     /* Build sorted index */
@@ -238,6 +247,15 @@ int tokenizer_encode(const tokenizer_t *t, const char *text, int *tokens, int ma
 
 const char *tokenizer_decode(const tokenizer_t *t, int prev_token, int token) {
     if (token < 0 || token >= t->vocab_size) return "";
+
+    /* Suppress special tokens (control=3, user_defined=4) */
+    if (t->token_type) {
+        int nn = t->n_token_type;
+        if (token < nn) {
+            int32_t ty = t->token_type[token];
+            if (ty == 3 || ty == 4) return "";
+        }
+    }
 
     const char *str = t->vocab[token];
 

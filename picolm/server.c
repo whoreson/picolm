@@ -16,6 +16,7 @@
 #include "sampler.h"
 #include "grammar.h"
 #include "cJSON.h"
+#include "qwen_tokenize.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -194,6 +195,8 @@ static struct _server_state {
     int model_loaded;
     model_t model;
     tokenizer_t tokenizer;
+    int use_qwen_tok;
+    qwen_enc_t qwen_enc;
     int kv_pos;                /* current KV cache position for prompt caching */
     int *last_prompt_tokens;   /* cached prompt tokens for reuse */
     int last_prompt_len;       /* number of cached prompt tokens */
@@ -248,10 +251,23 @@ static int server_init(const char *model_path) {
     tensor_set_threads(4);
     tensor_threadpool_init(4);
 
-    if (tokenizer_load(&srv.tokenizer, &srv.model) != 0) {
-        fprintf(stderr, "[server] Failed to load tokenizer\n");
-        model_free(&srv.model);
-        return -1;
+    srv.use_qwen_tok = qwen_tokenize_should_use(&srv.model);
+    if (srv.use_qwen_tok) {
+        if (qwen_tokenize_init(&srv.qwen_enc, &srv.model) != 0) {
+            fprintf(stderr, "[server] Failed to init Qwen tokenizer\n");
+            model_free(&srv.model);
+            return -1;
+        }
+        srv.tokenizer.bos_id = srv.qwen_enc.bos_id;
+        srv.tokenizer.eos_id = srv.qwen_enc.bos_id;
+        srv.tokenizer.vocab_size = srv.qwen_enc.vocab_size;
+        fprintf(stderr, "[server] Using native Qwen GPT-2 BPE tokenizer\n");
+    } else {
+        if (tokenizer_load(&srv.tokenizer, &srv.model) != 0) {
+            fprintf(stderr, "[server] Failed to load tokenizer\n");
+            model_free(&srv.model);
+            return -1;
+        }
     }
 
     srv.model_loaded = 1;
@@ -543,7 +559,12 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
     /* Encode prompt */
     int max_pt = (int)strlen(prompt) + 3;
     int *ptokens = (int *)malloc((size_t)max_pt * sizeof(int));
-    int n_prompt = tokenizer_encode(tokenizer, prompt, ptokens, max_pt, 1);
+    int n_prompt;
+    if (srv.use_qwen_tok) {
+        n_prompt = qwen_tokenize_encode(&srv.qwen_enc, prompt, ptokens, max_pt);
+    } else {
+        n_prompt = tokenizer_encode(tokenizer, prompt, ptokens, max_pt, 1);
+    }
 
     /* Prompt caching: find shared prefix with last request */
     int cache_start = 0;
@@ -627,7 +648,15 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             }
 
             int next = sampler_sample(&sampler, logits, model->config.vocab_size);
-            const char *piece = tokenizer_decode(tokenizer, token, next);
+            /* Decode: use Qwen tokenizer if applicable */
+            static char qwen_buf[64];
+            const char *piece;
+            if (srv.use_qwen_tok) {
+                qwen_tokenize_decode(&srv.qwen_enc, next, qwen_buf, sizeof(qwen_buf));
+                piece = qwen_buf;
+            } else {
+                piece = tokenizer_decode(tokenizer, token, next);
+            }
             if (!piece) piece = "";
 
             if (send_chunk(sock, piece, pos == start_pos ? (is_chat ? "assistant" : "") : NULL, 0) < 0) break;
@@ -683,7 +712,14 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
                 }
 
                 int next = sampler_sample(&sampler, logits, model->config.vocab_size);
-                const char *piece = tokenizer_decode(tokenizer, token, next);
+                static char qwen_buf2[64];
+                const char *piece;
+                if (srv.use_qwen_tok) {
+                    qwen_tokenize_decode(&srv.qwen_enc, next, qwen_buf2, sizeof(qwen_buf2));
+                    piece = qwen_buf2;
+                } else {
+                    piece = tokenizer_decode(tokenizer, token, next);
+                }
                 if (!piece) piece = "";
                 strncat(generated, piece, max_tokens * 100 - strlen(generated) - 1);
                 gen_count++;
@@ -864,7 +900,11 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
     } else {
         int max_pt = (int)strlen(prompt) + 3;
         ptokens = (int *)malloc((size_t)max_pt * sizeof(int));
-        n_prompt = tokenizer_encode(tokenizer, prompt, ptokens, max_pt, 1);
+        if (srv.use_qwen_tok) {
+            n_prompt = qwen_tokenize_encode(&srv.qwen_enc, prompt, ptokens, max_pt);
+        } else {
+            n_prompt = tokenizer_encode(tokenizer, prompt, ptokens, max_pt, 1);
+        }
     }
 
     /* Prompt caching: find shared prefix */
@@ -960,7 +1000,14 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             }
 
             int next = sampler_sample(&sampler, logits, model->config.vocab_size);
-            const char *piece = tokenizer_decode(tokenizer, token, next);
+            static char qwen_buf3[64];
+            const char *piece;
+            if (srv.use_qwen_tok) {
+                qwen_tokenize_decode(&srv.qwen_enc, next, qwen_buf3, sizeof(qwen_buf3));
+                piece = qwen_buf3;
+            } else {
+                piece = tokenizer_decode(tokenizer, token, next);
+            }
             if (!piece) piece = "";
 
             /* Append to cumulative output for stop word matching */
@@ -1072,7 +1119,14 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             }
 
             int next = sampler_sample(&sampler, logits, model->config.vocab_size);
-            const char *piece = tokenizer_decode(tokenizer, token, next);
+            static char qwen_buf4[64];
+            const char *piece;
+            if (srv.use_qwen_tok) {
+                qwen_tokenize_decode(&srv.qwen_enc, next, qwen_buf4, sizeof(qwen_buf4));
+                piece = qwen_buf4;
+            } else {
+                piece = tokenizer_decode(tokenizer, token, next);
+            }
             if (!piece) piece = "";
 
             strncat(generated, piece, n_predict * 100 - strlen(generated) - 1);

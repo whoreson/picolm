@@ -12,6 +12,8 @@ typedef struct {
     uint32_t bos_id;
     uint32_t eos_id;
     int space_marker; /* 0=U+2581 (default), 1=U+0100 (smollm), 2=literal space (qwen35/gpt2) */
+    const int32_t *token_type;  /* token_type[i] = type of token i (3=control, 4=user_defined) */
+    int n_token_type;           /* number of entries in token_type array */
 } tokenizer_t;
 
 /* Load tokenizer data from GGUF metadata pointers in model.
