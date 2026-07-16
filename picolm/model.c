@@ -458,11 +458,6 @@ static int parse_gguf(model_t *m, int max_seq_len) {
     for (uint64_t i = 0; i < n_tensors; i++) {
         const void *ptr = (const uint8_t *)m->mmap_addr + tensor_data_base + tinfos[i].offset;
         gguf_type_t qtype = (gguf_type_t)tinfos[i].type;
-        if (i < 5) {
-            fprintf(stderr, "T%llu: %-50s type=%u offset=%-20" PRIu64 " abs=%-20zu\n",
-                    (unsigned long long)i, tinfos[i].name.str, tinfos[i].type,
-                    tinfos[i].offset, (size_t)((const uint8_t*)ptr - (const uint8_t*)m->mmap_addr));
-        }
 
         if (str_eq(tinfos[i].name, "token_embd.weight")) {
             w->token_embd = ptr; w->type_token_embd = qtype;
@@ -994,7 +989,8 @@ float *model_forward(model_t *m, int token, int pos) {
     int kv_dim = n_kv_heads * head_dim;
     int kv_mul = n_heads / n_kv_heads;
     int seq_len = c->max_seq_len;
-    int half_dim = head_dim / 2;
+    int rope_dim = (c->rope_dim > 0) ? c->rope_dim : head_dim;
+    int half_dim = rope_dim / 2;
 
     /* RoPE table pointers for this position */
     const float *cos_pos = s->rope_cos + (size_t)pos * half_dim;
@@ -1424,14 +1420,24 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     for (int i = 0; i < qk_dim; i++) q_conv[i] *= q_scale;
 
     /* 9. Alpha: alpha = matmul(ssm_alpha, xb) + ssm_dt.bias -> [dt_rank] */
+    /* GGUF stores [dim, n_v_heads] column-major: each head has dim contiguous elements */
     float *alpha_out = tmp + conv_dim + 2 * qk_dim + c->ssm_d_inner; /* [dt_rank] */
-    { float avals[n_v_heads]; memset(avals, 0, n_v_heads * sizeof(float));
-      for (int d = 0; d < dim; d++) {
-          const uint8_t *row = (const uint8_t *)lw->ssm_alpha + d * (size_t)gguf_type_row_size(lw->type_ssm_alpha, n_v_heads);
-          dequantize_row(row, avals, n_v_heads, lw->type_ssm_alpha);
-          for (int h = 0; h < n_v_heads; h++) alpha_out[h] += s->xb[d] * avals[h];
-      }
-      for (int h = 0; h < n_v_heads; h++) alpha_out[h] += s->ssm_dt_w[il][h];
+    {
+        gguf_type_t alpha_type = lw->type_ssm_alpha;
+        size_t row_bytes = gguf_type_row_size(alpha_type, dim);
+        if (alpha_type == GGUF_TYPE_F32) {
+            for (int h = 0; h < n_v_heads; h++) {
+                float vd = vec_dot((const uint8_t *)lw->ssm_alpha + (size_t)h * row_bytes,
+                                   s->xb, dim, alpha_type);
+                alpha_out[h] = vd + s->ssm_dt_w[il][h];
+            }
+        } else {
+            for (int h = 0; h < n_v_heads; h++) {
+                const uint8_t *head_data = (const uint8_t *)lw->ssm_alpha + (size_t)h * row_bytes;
+                float sum = vec_dot(head_data, s->xb, dim, alpha_type);
+                alpha_out[h] = sum + s->ssm_dt_w[il][h];
+            }
+        }
     }
 
     /* gate = ssm_a * softplus(alpha) -> [dt_rank] */
@@ -1443,14 +1449,27 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     }
 
     /* 10. Beta: sigmoid(matmul(ssm_beta, xb)) -> [dt_rank] */
+    /* GGUF stores [dim, n_v_heads] column-major: each head has dim contiguous elements */
     float *beta = gate + n_v_heads; /* [dt_rank] */
-    { float bvals[n_v_heads]; memset(bvals, 0, n_v_heads * sizeof(float));
-      for (int d = 0; d < dim; d++) {
-          const uint8_t *row = (const uint8_t *)lw->ssm_beta + d * (size_t)gguf_type_row_size(lw->type_ssm_beta, n_v_heads);
-          dequantize_row(row, bvals, n_v_heads, lw->type_ssm_beta);
-          for (int h = 0; h < n_v_heads; h++) beta[h] += s->xb[d] * bvals[h];
-      }
-      for (int h = 0; h < n_v_heads; h++) beta[h] = 1.0f / (1.0f + expf(-beta[h]));
+    {
+        gguf_type_t beta_type = lw->type_ssm_beta;
+        size_t row_bytes = gguf_type_row_size(beta_type, dim);
+        if (beta_type == GGUF_TYPE_F32) {
+            for (int h = 0; h < n_v_heads; h++) {
+                beta[h] = vec_dot((const uint8_t *)lw->ssm_beta + (size_t)h * row_bytes,
+                                  s->xb, dim, beta_type);
+                beta[h] = 1.0f / (1.0f + expf(-beta[h]));
+            }
+        } else {
+            float bvals[dim];
+            for (int h = 0; h < n_v_heads; h++) {
+                dequantize_row((const uint8_t *)lw->ssm_beta + (size_t)h * row_bytes,
+                               bvals, dim, beta_type);
+                float sum = 0.0f;
+                for (int d = 0; d < dim; d++) sum += bvals[d] * s->xb[d];
+                beta[h] = 1.0f / (1.0f + expf(-sum));
+            }
+        }
     }
 
     /* 11. Gate expansion: exp(gate) -> [dt_rank] */
