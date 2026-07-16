@@ -795,67 +795,98 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
     for (int l = 0; l < c->n_layers; l++) {
         layer_weights_t *lw = &m->weights.layers[l];
         s->attn_norm_w[l] = nw;
-        if (lw->attn_norm)
+        if (lw->attn_norm) {
             dequantize_row(lw->attn_norm, nw, c->n_embd, lw->type_attn_norm);
-        else
+            if (m->from_safetensors) for (int _ni = 0; _ni < c->n_embd; _ni++) nw[_ni] += 1.0f;
+        } else {
             for (int _ni = 0; _ni < c->n_embd; _ni++) nw[_ni] = 1.0f;
+        }
         nw += c->n_embd;
 
         s->post_attn_norm_w[l] = nw;
-        if (lw->post_attn_norm)
+        if (lw->post_attn_norm) {
             dequantize_row(lw->post_attn_norm, nw, c->n_embd, lw->type_post_attn_norm);
-        else
+            if (m->from_safetensors) for (int _ni = 0; _ni < c->n_embd; _ni++) nw[_ni] += 1.0f;
+        } else {
             for (int _ni = 0; _ni < c->n_embd; _ni++) nw[_ni] = 1.0f;
+        }
         nw += c->n_embd;
 
         /* Qwen3 QK-norm weights (per-head, if present) */
         s->attn_q_norm_w[l] = nw;
-        if (lw->attn_q_norm)
+        if (lw->attn_q_norm) {
             dequantize_row(lw->attn_q_norm, nw, c->head_dim,
                            lw->type_attn_q_norm);
-        else
+            if (m->from_safetensors) for (int _ni = 0; _ni < c->head_dim; _ni++) nw[_ni] += 1.0f;
+        } else {
             for (int _ni = 0; _ni < c->head_dim; _ni++) nw[_ni] = 1.0f;
+        }
         nw += c->head_dim;
 
         s->attn_k_norm_w[l] = nw;
-        if (lw->attn_k_norm)
+        if (lw->attn_k_norm) {
             dequantize_row(lw->attn_k_norm, nw, c->head_dim,
                            lw->type_attn_k_norm);
-        else
+            if (m->from_safetensors) for (int _ni = 0; _ni < c->head_dim; _ni++) nw[_ni] += 1.0f;
+        } else {
             for (int _ni = 0; _ni < c->head_dim; _ni++) nw[_ni] = 1.0f;
+        }
         nw += c->head_dim;
     }
     s->output_norm_w = nw;
     dequantize_row(m->weights.output_norm, nw, c->n_embd,
                    m->weights.type_output_norm);
-    if (c->has_ssm) for (int _ni = 0; _ni < c->n_embd; _ni++) nw[_ni] += 1.0f;
+    if (m->from_safetensors) {
+        for (int _ni = 0; _ni < c->n_embd; _ni++) nw[_ni] += 1.0f;
+    }
 
     /* Dequantize SSM F32 weights (Qwen3.5) */
     if (c->has_ssm) {
         for (int l = 0; l < c->n_layers; l++) {
             layer_weights_t *lw = &m->weights.layers[l];
             if (lw->is_attn_layer) continue;
-            /* ssm_a: [dt_rank] F32 (negative log A) */
+            /* ssm_a: [dt_rank]
+             * GGUF: F32, already converted to A (not A_log)
+             * safetensors: F32, stores A_log, need A = -exp(A_log)
+             */
             if (lw->ssm_a && s->ssm_a_w[l]) {
-                float *raw = (float *)lw->ssm_a;
-                for (int i = 0; i < c->ssm_dt_rank; i++) {
-                    s->ssm_a_w[l][i] = raw[i];
+                if (m->from_safetensors) {
+                    /* safetensors: A_log is F32, convert to A = -exp(A_log) */
+                    for (int i = 0; i < c->ssm_dt_rank; i++) {
+                        s->ssm_a_w[l][i] = -expf(((const float *)lw->ssm_a)[i]);
+                    }
+                } else {
+                    /* GGUF: already A */
+                    memcpy(s->ssm_a_w[l], (const float *)lw->ssm_a, c->ssm_dt_rank * sizeof(float));
                 }
             }
-            /* ssm_dt.bias: [dt_rank] F32 */
+            /* ssm_dt.bias: [dt_rank]
+             * GGUF: F32, safetensors: BF16
+             */
             if (lw->ssm_dt && s->ssm_dt_w[l]) {
-                memcpy(s->ssm_dt_w[l], (const float *)lw->ssm_dt, c->ssm_dt_rank * sizeof(float));
+                if (lw->type_ssm_dt == GGUF_TYPE_BF16 || lw->type_ssm_dt == GGUF_TYPE_F16) {
+                    dequantize_row(lw->ssm_dt, s->ssm_dt_w[l], c->ssm_dt_rank, lw->type_ssm_dt);
+                } else {
+                    memcpy(s->ssm_dt_w[l], (const float *)lw->ssm_dt, c->ssm_dt_rank * sizeof(float));
+                }
             }
             /* ssm_norm.weight: [head_v_dim] F32 */
             if (lw->ssm_norm && s->ssm_norm_w[l]) {
                 memcpy(s->ssm_norm_w[l], (const float *)lw->ssm_norm,
                        (c->ssm_d_inner / c->ssm_dt_rank) * sizeof(float));
             }
-            /* ssm_conv1d.weight: [d_conv, conv_dim] F32 */
+            /* ssm_conv1d.weight: [d_conv, conv_dim]
+             * GGUF: F32, safetensors: BF16
+             */
             if (lw->ssm_conv1d && s->ssm_conv1d_w[l]) {
                 int conv_dim = 2 * c->ssm_d_state * c->ssm_n_group + c->ssm_d_inner;
-                memcpy(s->ssm_conv1d_w[l], (const float *)lw->ssm_conv1d,
-                       c->ssm_d_conv * conv_dim * sizeof(float));
+                if (lw->type_ssm_conv1d == GGUF_TYPE_BF16 || lw->type_ssm_conv1d == GGUF_TYPE_F16) {
+                    dequantize_row(lw->ssm_conv1d, s->ssm_conv1d_w[l],
+                                   c->ssm_d_conv * conv_dim, lw->type_ssm_conv1d);
+                } else {
+                    memcpy(s->ssm_conv1d_w[l], (const float *)lw->ssm_conv1d,
+                           c->ssm_d_conv * conv_dim * sizeof(float));
+                }
             }
         }
     }
@@ -1337,6 +1368,15 @@ float *model_forward(model_t *m, int token, int pos) {
  * SSM forward pass helpers (Qwen3.5)
  * ================================================================ */
 
+#ifdef DEBUG_SSM
+static void dbg_vec(const char *tag, float *v, int n, int max_print) {
+    int p = n < max_print ? n : max_print;
+    fprintf(stderr, "DBG %s: ", tag);
+    for (int i = 0; i < p; i++) fprintf(stderr, "%.6f ", v[i]);
+    fprintf(stderr, "\n");
+}
+#endif
+
 /* SSM layer forward pass (autoregressive, single token) */
 static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
                         layer_weights_t *lw, int il, int pos) {
@@ -1355,9 +1395,15 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
 
     /* 1. RMSNorm (attn_norm) */
     rmsnorm(s->xb, x, s->attn_norm_w[il], dim, eps);
+#ifdef DEBUG_SSM
+    if (il == 0 && pos == 0) dbg_vec("xb[:8]", s->xb, 8, 8);
+#endif
 
     /* 2. QKV projection: qkv_mixed = matmul(attn_qkv, xb) -> [conv_dim] */
     matmul(s->q, s->xb, lw->attn_qkv, dim, conv_dim, lw->type_attn_qkv);
+#ifdef DEBUG_SSM
+    if (il == 0 && pos == 0) dbg_vec("qkv[:8]", s->q, 8, 8);
+#endif
 
     /* 3. Z gate: z = matmul(attn_gate_ssm, xb) -> [value_dim] */
     matmul(s->xb2, s->xb, lw->attn_gate_ssm, dim, c->ssm_d_inner, lw->type_attn_gate_ssm);
@@ -1377,6 +1423,9 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
         float v = sum;
         conv_output[co] = v * (1.0f / (1.0f + expf(-v))); /* silu */
     }
+#ifdef DEBUG_SSM
+    if (il == 0 && pos == 0) dbg_vec("conv_out[:8]", conv_output, 8, 8);
+#endif
 
     /* Shift conv_state left and append new token */
     for (int r = 0; r < n_state_rows - 1; r++) {
@@ -1418,6 +1467,12 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     /* 8. Scale Q by 1/sqrt(d_state) */
     float q_scale = 1.0f / sqrtf((float)d_state);
     for (int i = 0; i < qk_dim; i++) q_conv[i] *= q_scale;
+#ifdef DEBUG_SSM
+    if (il == 0 && pos == 0) {
+        dbg_vec("q_conv_scaled[:8]", q_conv, 8, 8);
+        dbg_vec("k_conv_scaled[:8]", k_conv, 8, 8);
+    }
+#endif
 
     /* 9. Alpha: alpha = matmul(ssm_alpha, xb) + ssm_dt.bias -> [dt_rank] */
     /* GGUF stores [dim, n_v_heads] column-major: each head has dim contiguous elements */
@@ -1439,6 +1494,9 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
             }
         }
     }
+#ifdef DEBUG_SSM
+    if (il == 0 && pos == 0) dbg_vec("alpha[:8]", alpha_out, n_v_heads, 8);
+#endif
 
     /* gate = ssm_a * softplus(alpha) -> [dt_rank] */
     float *gate = alpha_out + n_v_heads; /* [dt_rank] */
@@ -1447,6 +1505,9 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
         float sp = (a > 20.0f) ? a : (a < -20.0f) ? expf(a) : logf(1.0f + expf(a));
         gate[h] = sp * s->ssm_a_w[il][h];
     }
+#ifdef DEBUG_SSM
+    if (il == 0 && pos == 0) dbg_vec("gate[:8]", gate, n_v_heads, 8);
+#endif
 
     /* 10. Beta: sigmoid(matmul(ssm_beta, xb)) -> [dt_rank] */
     /* GGUF stores [dim, n_v_heads] column-major: each head has dim contiguous elements */
@@ -1471,6 +1532,9 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
             }
         }
     }
+#ifdef DEBUG_SSM
+    if (il == 0 && pos == 0) dbg_vec("beta[:8]", beta, n_v_heads, 8);
+#endif
 
     /* 11. Gate expansion: exp(gate) -> [dt_rank] */
     float *gate_exp = beta + n_v_heads; /* [dt_rank] */
@@ -1479,6 +1543,9 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
         float ge = (g < -50.0f) ? 0.0f : expf(g);
         gate_exp[h] = ge;
     }
+#ifdef DEBUG_SSM
+    if (il == 0 && pos == 0) dbg_vec("gate_exp[:8]", gate_exp, n_v_heads, 8);
+#endif
 
     /* 12. State: [d_state, d_state, n_v_heads] = [128, 128, 32] */
     float *state = s->ssm_state[il];
@@ -1555,6 +1622,9 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
             ssm_output[d2 * n_v_heads + h] = sum;
         }
     }
+#ifdef DEBUG_SSM
+    if (il == 0 && pos == 0) dbg_vec("ssm_out_pre[:8]", ssm_output, head_v_dim, 8);
+#endif
 
     /* 18. Gated normalization */
     /* ssm_output: [d * n_v_heads + h] (dim-major from delta_net output) */
@@ -1574,11 +1644,17 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
             final_output[h * head_v_dim + d] = v * nrm * norm_w[d] * silu_z;
         }
     }
+#ifdef DEBUG_SSM
+    if (il == 0 && pos == 0) dbg_vec("final_out[:8]", final_output, 8, 8);
+#endif
 
     /* 19. Reshape to [value_dim] and output projection */
     /* final_output is [head_v_dim * n_v_heads] = [value_dim] = [4096] */
     /* ssm_out: [n_embd, value_dim] */
     matmul(residual, final_output, lw->ssm_out, c->ssm_d_inner, dim, lw->type_ssm_out);
+#ifdef DEBUG_SSM
+    if (il == 0 && pos == 0) dbg_vec("residual[:8]", residual, 8, 8);
+#endif
 
     /* 20. Residual add */
     vec_add(x, residual, dim);
