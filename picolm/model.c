@@ -278,6 +278,19 @@ static int parse_gguf(model_t *m, int max_seq_len) {
         gguf_str_t key = read_gguf_string(&r);
         uint32_t vtype = read_u32(&r);
 
+        if (str_eq(key, "general.architecture")) {
+            int dummy; skip_meta_value(&r, vtype, &dummy);
+            /* Check if architecture contains "qwen3" */
+            if (key.len > 0) {
+                const char *s = key.str;
+                for (uint64_t k = 0; k < key.len - 4; k++) {
+                    if (s[k] == 'q' && s[k+1] == 'w' && s[k+2] == 'e' && s[k+3] == 'n' && s[k+4] == '3') {
+                        cfg->is_qwen = 1; break;
+                    }
+                }
+            }
+        } else
+
 
         if (str_eq(key, "llama.embedding_length") || str_eq(key, "general.embedding_length")
             || str_eq(key, "qwen2.embedding_length") || str_eq(key, "qwen3.embedding_length") || str_eq(key, "qwen35.embedding_length")) {

@@ -240,8 +240,11 @@ static int bpe_piece(qwen_enc_t *enc, const char *s, int n, int *out, int cap) {
 
 /* Check if a model should use the Qwen tokenizer */
 int qwen_tokenize_should_use(const model_t *m) {
-    /* Qwen models have tokenizer.ggml.token_type in GGUF metadata */
-    return m->tok_token_type_data != NULL;
+    /* Only use Qwen tokenizer for Qwen3/Qwen3.5 architectures.
+     * Llama and other architectures may also have token_type metadata
+     * but should use the old tokenizer. Safetensors Qwen models also
+     * use this tokenizer (from_safetensors path). */
+    return m->config.is_qwen || m->from_safetensors;
 }
 
 /* Initialize the Qwen tokenizer from model data */
