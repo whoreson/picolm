@@ -278,10 +278,13 @@ static int parse_gguf(model_t *m, int max_seq_len) {
         gguf_str_t key = read_gguf_string(&r);
         uint32_t vtype = read_u32(&r);
 
+
         if (str_eq(key, "llama.embedding_length") || str_eq(key, "general.embedding_length")
             || str_eq(key, "qwen2.embedding_length") || str_eq(key, "qwen3.embedding_length") || str_eq(key, "qwen35.embedding_length")) {
             int dummy; cfg->n_embd = (int)skip_meta_value(&r, vtype, &dummy);
-            if (key.str[0] == 'q') cfg->rope_type = 1;  /* qwen2/qwen3/qwen35 interleaved */
+            /* NOTE: Qwen2 uses interleaved RoPE. Qwen3 and Qwen3.5 use pairwise RoPE
+             * (same as Llama). Only set rope_type=1 for qwen2, not qwen3/qwen35. */
+            if (key.str[0] == 'q' && key.len > 6 && key.str[5] == '2') cfg->rope_type = 1;
         } else if (str_eq(key, "llama.feed_forward_length") || str_eq(key, "general.feed_forward_length")
             || str_eq(key, "qwen2.feed_forward_length") || str_eq(key, "qwen3.feed_forward_length") || str_eq(key, "qwen35.feed_forward_length")) {
             int dummy; cfg->n_ffn = (int)skip_meta_value(&r, vtype, &dummy);
@@ -329,14 +332,22 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                     }
                 }
                 cfg->rope_dim *= 2; /* each section is a pair */
+                /* NOTE: rope.dimension_sections is for MTP multi-rope, not for
+                 * the main transformer. The main transformer applies RoPE to the
+                 * full head_dim. We store rope_dim for future MTP support but
+                 * use head_dim for RoPE in model_forward(). Reset to 0 so the
+                 * (c->rope_dim > 0) ? c->rope_dim : head_dim fallback gives head_dim. */
+                cfg->rope_dim = 0;
             } else {
                 int dummy; skip_meta_value(&r, vtype, &dummy);
             }
         } else if (str_eq(key, "llama.attention.layer_norm_rms_epsilon")
             || str_eq(key, "qwen2.attention.layer_norm_rms_epsilon")
             || str_eq(key, "qwen3.attention.layer_norm_rms_epsilon") || str_eq(key, "qwen35.attention.layer_norm_rms_epsilon")) {
-            /* Read epsilon from GGUF (usually F64 type=3) */
-            if (vtype == 3) { /* F64 */
+            /* Read epsilon from GGUF (F32 type=6 or F64 type=11 in metadata) */
+            if (vtype == GGUF_META_FLOAT32) { /* F32 */
+                cfg->rms_norm_eps = read_f32(&r);
+            } else if (vtype == 11) { /* F64 */
                 double val;
                 memcpy(&val, r.data + r.pos, 8); r.pos += 8;
                 cfg->rms_norm_eps = (float)val;
@@ -449,6 +460,16 @@ static int parse_gguf(model_t *m, int max_seq_len) {
         tinfos[i].offset = read_u64(&r);
             }
 
+    /* Detect MTP (Multi-Token Prediction) layers by scanning for "nextn" tensors */
+    cfg->has_mtp = 0;
+    cfg->n_mtp_layers = 0;
+    for (uint64_t i = 0; i < n_tensors; i++) {
+        if (strstr(tinfos[i].name.str, "nextn.") && tinfos[i].name.len > 0) {
+            cfg->has_mtp = 1;
+            break;
+        }
+    }
+
     size_t alignment = (size_t)cfg->alignment;
     size_t tensor_data_base = (r.pos + alignment - 1) & ~(alignment - 1);
 
@@ -519,15 +540,15 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                 } else if (strcmp(suffix, "attn_gate.weight") == 0) {
                     lw->attn_gate_ssm = ptr; lw->type_attn_gate_ssm = qtype;
                 } else if (strcmp(suffix, "ssm_a") == 0) {
-                    lw->ssm_a = ptr;
+                    lw->ssm_a = ptr; lw->type_ssm_a = qtype;
                 } else if (strcmp(suffix, "ssm_alpha.weight") == 0) {
                     lw->ssm_alpha = ptr; lw->type_ssm_alpha = qtype;
                 } else if (strcmp(suffix, "ssm_beta.weight") == 0) {
                     lw->ssm_beta = ptr; lw->type_ssm_beta = qtype;
                 } else if (strcmp(suffix, "ssm_conv1d.weight") == 0) {
-                    lw->ssm_conv1d = ptr;
+                    lw->ssm_conv1d = ptr; lw->type_ssm_conv1d = qtype;
                 } else if (strcmp(suffix, "ssm_dt.bias") == 0) {
-                    lw->ssm_dt = ptr;
+                    lw->ssm_dt = ptr; lw->type_ssm_dt = qtype;
                 } else if (strcmp(suffix, "ssm_norm.weight") == 0) {
                     lw->ssm_norm = ptr;
                 } else if (strcmp(suffix, "ssm_out.weight") == 0) {
@@ -565,10 +586,32 @@ static int parse_gguf(model_t *m, int max_seq_len) {
         cfg->weight_type = w->layers[0].type_attn_q;
     }
 
+    /* Count MTP layers from the end: layers with "nextn" tensors */
+    if (cfg->has_mtp) {
+        for (int i = cfg->n_layers - 1; i >= 0; i--) {
+            int has_nextn = 0;
+            for (uint64_t ti = 0; ti < n_tensors; ti++) {
+                if (strstr(tinfos[ti].name.str, "blk.") == NULL) continue;
+                const char *p = tinfos[ti].name.str + 4;
+                int bl = 0;
+                while (*p >= '0' && *p <= '9') { bl = bl * 10 + (*p - '0'); p++; }
+                if (*p != '.') continue;
+                if (bl == i && strstr(tinfos[ti].name.str, "nextn.")) {
+                    has_nextn = 1; break;
+                }
+            }
+            if (has_nextn) {
+                cfg->n_mtp_layers++;
+            } else {
+                break; /* MTP layers are contiguous at the end */
+            }
+        }
+    }
+
     fprintf(stderr, "Model config:\n");
     fprintf(stderr, "  n_embd=%d, n_ffn=%d, n_heads=%d, n_kv_heads=%d\n",
             cfg->n_embd, cfg->n_ffn, cfg->n_heads, cfg->n_kv_heads);
-    fprintf(stderr, "  n_layers=%d, vocab_size=%d, max_seq=%d\n",
+        fprintf(stderr, "  n_layers=%d, vocab_size=%d, max_seq=%d\n",
             cfg->n_layers, cfg->vocab_size, cfg->max_seq_len);
     if (cfg->has_ssm) {
         int conv_dim = 2 * cfg->ssm_d_state * cfg->ssm_n_group + cfg->ssm_d_inner;
@@ -856,8 +899,25 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
                         s->ssm_a_w[l][i] = -expf(((const float *)lw->ssm_a)[i]);
                     }
                 } else {
-                    /* GGUF: already A */
-                    memcpy(s->ssm_a_w[l], (const float *)lw->ssm_a, c->ssm_dt_rank * sizeof(float));
+                    /* GGUF: already A. GGUF may reorder v-heads from grouped
+                     * [k0v0..v7, k1v0..v7, ...] to tiled [k0v0,k0v2,...,k0v6, k1v0,...].
+                     * Apply inverse reorder to restore grouped layout. */
+                    const float *src = (const float *)lw->ssm_a;
+                    if (c->ssm_n_group > 0 && c->ssm_n_group < c->ssm_dt_rank) {
+                        int n_k = c->ssm_n_group;
+                        int n_vpk = c->ssm_dt_rank / n_k;
+                        int half_vpk = n_vpk / 2;
+                        for (int g = 0; g < c->ssm_dt_rank; g++) {
+                            int block = g / half_vpk;
+                            int k = block % n_k;
+                            int odd_flag = block / n_k;
+                            int even_half = g % half_vpk;
+                            int v = even_half * 2 + odd_flag;
+                            s->ssm_a_w[l][k * n_vpk + v] = src[g];
+                        }
+                    } else {
+                        memcpy(s->ssm_a_w[l], src, c->ssm_dt_rank * sizeof(float));
+                    }
                 }
             }
             /* ssm_dt.bias: [dt_rank]
@@ -869,6 +929,22 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
                 } else {
                     memcpy(s->ssm_dt_w[l], (const float *)lw->ssm_dt, c->ssm_dt_rank * sizeof(float));
                 }
+                /* Inverse reorder dt_bias: GGUF tiled -> grouped */
+                if (!m->from_safetensors && c->ssm_n_group > 0 && c->ssm_n_group < c->ssm_dt_rank) {
+                    int n_k = c->ssm_n_group;
+                    int n_vpk = c->ssm_dt_rank / n_k;
+                    int half_vpk = n_vpk / 2;
+                    float *tmp = alloca(c->ssm_dt_rank * sizeof(float));
+                    memcpy(tmp, s->ssm_dt_w[l], c->ssm_dt_rank * sizeof(float));
+                    for (int g = 0; g < c->ssm_dt_rank; g++) {
+                        int block = g / half_vpk;
+                        int k = block % n_k;
+                        int odd_flag = block / n_k;
+                        int even_half = g % half_vpk;
+                        int v = even_half * 2 + odd_flag;
+                        s->ssm_dt_w[l][k * n_vpk + v] = tmp[g];
+                    }
+                                    }
             }
             /* ssm_norm.weight: [head_v_dim] F32 */
             if (lw->ssm_norm && s->ssm_norm_w[l]) {
@@ -1060,9 +1136,16 @@ float *model_forward(model_t *m, int token, int pos) {
         }
     }
 
-    /* 2. Transformer layers */
+    /* 2. Transformer layers
+     * Skip MTP (Multi-Token Prediction) layers at the end.
+     * MTP layers have "nextn." tensors and are used for speculative
+     * decoding. Full MTP support is planned: during generation, after
+     * the main forward pass, run MTP layers on the output embedding
+     * to produce N candidate tokens, then verify with a fast forward
+     * pass. For now, skip them entirely. */
+    int n_active_layers = c->n_layers - c->n_mtp_layers;
     int attn_ordinal = 0;
-    for (int l = 0; l < c->n_layers; l++) {
+    for (int l = 0; l < n_active_layers; l++) {
         layer_weights_t *lw = &w->layers[l];
         int ri = 2 + l * 9;
 
@@ -1378,6 +1461,36 @@ static void dbg_vec(const char *tag, float *v, int n, int max_print) {
 }
 #endif
 
+/* Qwen3.5 GGUF v-head reordering: two patterns depending on tensor type.
+ *
+ * Pattern 1 (head_dim=1, for dt_bias and ssm_a 1D tensors):
+ *   Sequential: [k0v0, k0v1, k0v2, ..., k0v7, k1v0, ..., k3v7]
+ *   GGUF:       [k0v0, k0v2, k0v4, k0v6, k1v0, k1v2, ..., k3v7,
+ *                k0v1, k0v3, k0v5, k0v7, k1v1, ..., k3v7]
+ *   Even v-indices first (stride-2), then odd v-indices.
+ *
+ * Pattern 2 (head_dim=head_v_dim, for attn_gate_ssm, attn_qkv V portion,
+ *   ssm_conv1d V channels, ssm_alpha, ssm_beta, ssm_out):
+ *   Sequential: [k0*8 blocks, k1*8 blocks, k2*8 blocks, k3*8 blocks]
+ *   GGUF:       [v0*4 blocks, v1*4 blocks, ..., v7*4 blocks]
+ *   Simple transpose: GGUF_group = v * n_k + k
+ */
+
+/* Pattern 1: dt_bias / ssm_a (head_dim=1, stride-2) */
+static inline int qwen35_vhead_gguf_1d(int h, int n_vpk, int n_k, int half_vpk) {
+    int k = h / n_vpk;
+    int v = h % n_vpk;
+    return ((v >> 1) * n_k + k) + (v & 1) * (n_k * half_vpk);
+}
+
+/* Pattern 2: attn_gate_ssm, attn_qkv V, conv1d V, ssm_alpha, ssm_beta, ssm_out
+ * (head_dim=head_v_dim, simple transpose) */
+static inline int qwen35_vhead_gguf_2d(int h, int n_vpk, int n_k) {
+    int k = h / n_vpk;
+    int v = h % n_vpk;
+    return v * n_k + k;
+}
+
 /* SSM layer forward pass (autoregressive, single token) */
 static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
                         layer_weights_t *lw, int il, int pos) {
@@ -1390,6 +1503,12 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     int conv_dim = 2 * d_state * n_k_heads + c->ssm_d_inner;
     int head_v_dim = c->ssm_d_inner / n_v_heads;
     float eps = c->rms_norm_eps;
+
+    /* Qwen3.5 GGUF v-head reorder parameters (used throughout this function) */
+    int n_k = c->ssm_n_group;
+    int n_vpk = n_v_heads / n_k;
+    int half_vpk = n_vpk / 2;
+    int do_remap = !m->from_safetensors && n_k > 0 && n_k < n_v_heads && half_vpk > 0;
 
     /* Scratch space: dedicated SSM buffer */
     float *tmp = s->ssm_tmp;
@@ -1408,6 +1527,17 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
 
     /* 3. Z gate: z = matmul(attn_gate_ssm, xb) -> [value_dim] */
     matmul(s->xb2, s->xb, lw->attn_gate_ssm, dim, c->ssm_d_inner, lw->type_attn_gate_ssm);
+    /* If GGUF reorders v-head rows, convert xb2 from GGUF order to sequential order */
+    if (do_remap) {
+        float *xb2_tmp = alloca(c->ssm_d_inner * sizeof(float));
+        memcpy(xb2_tmp, s->xb2, c->ssm_d_inner * sizeof(float));
+        for (int h = 0; h < n_v_heads; h++) {
+            int gh = qwen35_vhead_gguf_2d(h, n_vpk, n_k);
+            memcpy(s->xb2 + h * head_v_dim, xb2_tmp + gh * head_v_dim, head_v_dim * sizeof(float));
+        }
+        if (il == 0 && pos == 0) {
+            }
+    }
 
     /* 4. Convolution: compute BEFORE shifting conv_state */
     float *conv_state = s->ssm_conv_state[il];
@@ -1449,6 +1579,16 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     memcpy(k_conv, conv_output + qk_dim, qk_dim * sizeof(float));
     memcpy(v_conv, conv_output + 2 * qk_dim, c->ssm_d_inner * sizeof(float));
 
+    /* If GGUF reorders V channels, convert v_conv from GGUF order to sequential order */
+    if (do_remap) {
+        float *v_conv_tmp = alloca(c->ssm_d_inner * sizeof(float));
+        memcpy(v_conv_tmp, v_conv, c->ssm_d_inner * sizeof(float));
+        for (int h = 0; h < n_v_heads; h++) {
+            int gh = qwen35_vhead_gguf_2d(h, n_vpk, n_k);
+            memcpy(v_conv + h * head_v_dim, v_conv_tmp + gh * head_v_dim, head_v_dim * sizeof(float));
+        }
+    }
+
     /* 7. L2 normalize Q and K per k_head */
     for (int h = 0; h < n_k_heads; h++) {
         float *qh = q_conv + h * d_state;
@@ -1477,19 +1617,26 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
 
     /* 9. Alpha: alpha = matmul(ssm_alpha, xb) + ssm_dt.bias -> [dt_rank] */
     /* GGUF stores [dim, n_v_heads] column-major: each head has dim contiguous elements */
+    /* GGUF v-heads may be in tiled/interleaved order. Map sequential h -> GGUF head index. */
+    /* Mapping: sequential [k0v0, k0v1, k0v2, ..., k0v7, k1v0, ...] */
+    /*           GGUF     [k0v0, k0v2, k0v4, k0v6, k1v0, ..., k0v1, k0v3, ...] */
+    /* Helper: map sequential head h -> GGUF head index gh */
+    /* qwen35_vhead_gguf defined at file scope */
     float *alpha_out = tmp + conv_dim + 2 * qk_dim + c->ssm_d_inner; /* [dt_rank] */
     {
         gguf_type_t alpha_type = lw->type_ssm_alpha;
         size_t row_bytes = gguf_type_row_size(alpha_type, dim);
         if (alpha_type == GGUF_TYPE_F32) {
             for (int h = 0; h < n_v_heads; h++) {
-                float vd = vec_dot((const uint8_t *)lw->ssm_alpha + (size_t)h * row_bytes,
+                int gh = do_remap ? qwen35_vhead_gguf_2d(h, n_vpk, n_k) : h;
+                float vd = vec_dot((const uint8_t *)lw->ssm_alpha + (size_t)gh * row_bytes,
                                    s->xb, dim, alpha_type);
                 alpha_out[h] = vd + s->ssm_dt_w[il][h];
             }
         } else {
             for (int h = 0; h < n_v_heads; h++) {
-                const uint8_t *head_data = (const uint8_t *)lw->ssm_alpha + (size_t)h * row_bytes;
+                int gh = do_remap ? qwen35_vhead_gguf_2d(h, n_vpk, n_k) : h;
+                const uint8_t *head_data = (const uint8_t *)lw->ssm_alpha + (size_t)gh * row_bytes;
                 float sum = vec_dot(head_data, s->xb, dim, alpha_type);
                 alpha_out[h] = sum + s->ssm_dt_w[il][h];
             }
@@ -1511,21 +1658,23 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
 #endif
 
     /* 10. Beta: sigmoid(matmul(ssm_beta, xb)) -> [dt_rank] */
-    /* GGUF stores [dim, n_v_heads] column-major: each head has dim contiguous elements */
+    /* GGUF stores [dim, n_v_heads] column-major, v-heads may be tiled/interleaved */
     float *beta = gate + n_v_heads; /* [dt_rank] */
     {
         gguf_type_t beta_type = lw->type_ssm_beta;
         size_t row_bytes = gguf_type_row_size(beta_type, dim);
         if (beta_type == GGUF_TYPE_F32) {
             for (int h = 0; h < n_v_heads; h++) {
-                beta[h] = vec_dot((const uint8_t *)lw->ssm_beta + (size_t)h * row_bytes,
+                int gh = do_remap ? qwen35_vhead_gguf_2d(h, n_vpk, n_k) : h;
+                beta[h] = vec_dot((const uint8_t *)lw->ssm_beta + (size_t)gh * row_bytes,
                                   s->xb, dim, beta_type);
                 beta[h] = 1.0f / (1.0f + expf(-beta[h]));
             }
         } else {
             float bvals[dim];
             for (int h = 0; h < n_v_heads; h++) {
-                dequantize_row((const uint8_t *)lw->ssm_beta + (size_t)h * row_bytes,
+                int gh = do_remap ? qwen35_vhead_gguf_2d(h, n_vpk, n_k) : h;
+                dequantize_row((const uint8_t *)lw->ssm_beta + (size_t)gh * row_bytes,
                                bvals, dim, beta_type);
                 float sum = 0.0f;
                 for (int d = 0; d < dim; d++) sum += bvals[d] * s->xb[d];
@@ -1646,13 +1795,29 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
         }
     }
 #ifdef DEBUG_SSM
-    if (il == 0 && pos == 0) dbg_vec("final_out[:8]", final_output, 8, 8);
+    if (il == 0 && pos == 0) {
+        dbg_vec("xb2[:8]", s->xb2, 8, 8);
+        dbg_vec("final_out[:8]", final_output, 8, 8);
+    }
 #endif
 
     /* 19. Reshape to [value_dim] and output projection */
     /* final_output is [head_v_dim * n_v_heads] = [value_dim] = [4096] */
-    /* ssm_out: [n_embd, value_dim] */
-    matmul(residual, final_output, lw->ssm_out, c->ssm_d_inner, dim, lw->type_ssm_out);
+    /* ssm_out: [n_embd, value_dim] - GGUF columns may be reordered */
+    if (do_remap) {
+        /* Reorder final_output to GGUF column order before matmul, then matmul,
+         * then reorder result back. Actually easier: reorder final_output to GGUF
+         * order, matmul, and the result is already correct because the weight
+         * columns and input elements are matched. */
+        float *fo_gguf = alloca(c->ssm_d_inner * sizeof(float));
+        for (int h = 0; h < n_v_heads; h++) {
+            int gh = qwen35_vhead_gguf_2d(h, n_vpk, n_k);
+            memcpy(fo_gguf + gh * head_v_dim, final_output + h * head_v_dim, head_v_dim * sizeof(float));
+        }
+        matmul(residual, fo_gguf, lw->ssm_out, c->ssm_d_inner, dim, lw->type_ssm_out);
+    } else {
+        matmul(residual, final_output, lw->ssm_out, c->ssm_d_inner, dim, lw->type_ssm_out);
+    }
 #ifdef DEBUG_SSM
     if (il == 0 && pos == 0) dbg_vec("residual[:8]", residual, 8, 8);
 #endif
