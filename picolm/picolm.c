@@ -3,6 +3,7 @@
 #include "tokenizer.h"
 #include "sampler.h"
 #include "grammar.h"
+#include "qwen_tokenize.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -234,10 +235,21 @@ int main(int argc, char **argv) {
 
     /* Load tokenizer */
     tokenizer_t tokenizer;
-    if (tokenizer_load(&tokenizer, &model) != 0) {
-        fprintf(stderr, "Failed to load tokenizer\n");
-        model_free(&model);
-        return 1;
+    int use_qwen_tok = qwen_tokenize_should_use(&model);
+    qwen_enc_t qwen_enc = {0};
+
+    if (use_qwen_tok) {
+        if (qwen_tokenize_init(&qwen_enc, &model) != 0) {
+            fprintf(stderr, "Failed to init Qwen tokenizer\n");
+            model_free(&model);
+            return 1;
+        }
+        tokenizer.bos_id = qwen_enc.bos_id;
+        tokenizer.eos_id = qwen_enc.bos_id; /* Qwen3.5/3.6: BOS == EOS */
+        tokenizer.vocab_size = qwen_enc.vocab_size;
+        fprintf(stderr, "Using native Qwen GPT-2 BPE tokenizer\n");
+    } else {
+        tokenizer_load(&tokenizer, &model);
     }
 
     /* Init sampler */
@@ -262,9 +274,16 @@ int main(int argc, char **argv) {
     }
 
     /* Encode prompt */
-    int max_prompt_tokens = (int)strlen(prompt) + 3;
+    int max_prompt_tokens = (int)strlen(prompt) + 16;
     int *prompt_tokens = (int *)malloc((size_t)max_prompt_tokens * sizeof(int));
-    int n_prompt = tokenizer_encode(&tokenizer, prompt, prompt_tokens, max_prompt_tokens, 1);
+    int n_prompt;
+    if (use_qwen_tok) {
+        n_prompt = qwen_tokenize_encode(&qwen_enc, prompt, prompt_tokens + 1, max_prompt_tokens - 1);
+        prompt_tokens[0] = (int)tokenizer.bos_id;
+        n_prompt++;
+    } else {
+        n_prompt = tokenizer_encode(&tokenizer, prompt, prompt_tokens, max_prompt_tokens, 1);
+    }
     fprintf(stderr, "Prompt tokens (%d):", n_prompt);
     for (int i = 0; i < n_prompt; i++) fprintf(stderr, " %d", prompt_tokens[i]);
     fprintf(stderr, "\n");
@@ -319,20 +338,29 @@ int main(int argc, char **argv) {
             grammar_advance(&grammar, &tokenizer, next);
 
             /* Decode and print */
-            const char *piece = tokenizer_decode(&tokenizer, token, next);
-            printf("%s", piece);
+            static char qwen_decode_buf[64];
+            char *decode_str;
+            if (use_qwen_tok) {
+                qwen_tokenize_decode(&qwen_enc, next, qwen_decode_buf, sizeof(qwen_decode_buf));
+                decode_str = qwen_decode_buf;
+            } else {
+                decode_str = (char *)tokenizer_decode(&tokenizer, token, next);
+            }
+            printf("%s", decode_str);
             fflush(stdout);
             /* Also capture in buffer */
-            int plen = (int)strlen(piece);
-            if (gen_buf_len + plen < max_tokens * 16 - 1) {
-                memcpy(gen_buf + gen_buf_len, piece, plen);
-                gen_buf_len += plen;
+            { int plen = (int)strlen(decode_str);
+              if (gen_buf_len + plen < max_tokens * 16 - 1) {
+                  memcpy(gen_buf + gen_buf_len, decode_str, plen);
+                  gen_buf_len += plen;
+              }
             }
 
             total_gen++;
 
             /* Stop on EOS or grammar completion */
-            if (next == (int)tokenizer.eos_id) break;
+            int eos_id = use_qwen_tok ? qwen_enc.bos_id : tokenizer.eos_id;
+            if (next == eos_id) break;
             if (grammar_is_complete(&grammar)) break;
         }
 
@@ -383,7 +411,8 @@ int main(int argc, char **argv) {
     grammar_free(&grammar);
     free(prompt_tokens);
     free(stdin_prompt);
-    tokenizer_free(&tokenizer);
+    if (use_qwen_tok) qwen_tokenize_free(&qwen_enc);
+    else tokenizer_free(&tokenizer);
     model_free(&model);
     tensor_threadpool_free();
 

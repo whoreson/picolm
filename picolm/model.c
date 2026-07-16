@@ -425,6 +425,39 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                 m->tok_n_scores = arr_len;
                 r.pos += arr_len * 4;
             }
+        } else if (str_eq(key, "tokenizer.ggml.merges")) {
+            if (vtype != GGUF_META_ARRAY) {
+                int dummy; skip_meta_value(&r, vtype, &dummy);
+            } else {
+                uint32_t arr_type = read_u32(&r);
+                uint64_t arr_len  = read_u64(&r);
+                if (arr_type == GGUF_META_STRING) {
+                    m->tok_merges_data = r.data + r.pos;
+                    m->tok_n_merges = arr_len;
+                }
+                { const uint8_t *pp = r.data + r.pos;
+                  uint64_t nn = arr_len;
+                  for (uint64_t ii = 0; ii < nn; ii++) {
+                      uint64_t sl; memcpy(&sl, pp, 8); pp += 8 + sl; }
+                  r.pos = pp - r.data; }
+            }
+        } else if (str_eq(key, "tokenizer.ggml.token_type")) {
+            if (vtype != GGUF_META_ARRAY) {
+                int dummy; skip_meta_value(&r, vtype, &dummy);
+            } else {
+                uint32_t arr_type = read_u32(&r);
+                uint64_t arr_len  = read_u64(&r);
+                if (arr_type == GGUF_META_INT32 || arr_type == GGUF_META_UINT32) {
+                    m->tok_token_type_data = r.data + r.pos;
+                    m->tok_n_token_type = arr_len;
+                    r.pos += arr_len * 4;
+                } else {
+                    int dummy;
+                    for (uint64_t j = 0; j < arr_len; j++) {
+                        skip_meta_value(&r, arr_type, &dummy);
+                    }
+                }
+            }
         } else {
             int dummy; skip_meta_value(&r, vtype, &dummy);
         }
@@ -1508,7 +1541,6 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
 #ifdef DEBUG_SSM
     if (il == 0 && pos == 0) dbg_vec("xb[:8]", s->xb, 8, 8);
 #endif
-
     /* 2. QKV projection: qkv_mixed = matmul(attn_qkv, xb) -> [conv_dim] */
     matmul(s->q, s->xb, lw->attn_qkv, dim, conv_dim, lw->type_attn_qkv);
 #ifdef DEBUG_SSM
@@ -1811,7 +1843,6 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
 #ifdef DEBUG_SSM
     if (il == 0 && pos == 0) dbg_vec("residual[:8]", residual, 8, 8);
 #endif
-
     /* 20. Residual add */
     vec_add(x, residual, dim);
 

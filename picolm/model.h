@@ -189,6 +189,10 @@ typedef struct {
     uint64_t    tok_n_tokens;
     const void *tok_scores_data;
     uint64_t    tok_n_scores;
+    const void *tok_merges_data;
+    uint64_t    tok_n_merges;
+    const void *tok_token_type_data;
+    uint64_t    tok_n_token_type;
     uint32_t    tok_bos_id;
     uint32_t    tok_eos_id;
     /* Pre-tokenizer type: 0=U+2581 (default), 1=U+0100 (smollm) */

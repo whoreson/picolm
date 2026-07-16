@@ -3,7 +3,7 @@ CFLAGS  ?= -O3 -g -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic
 LDFLAGS = -lm -lpthread
 
 # Source files and corresponding .o files
-SRCS    = picolm.c model.c tensor.c quant.c tokenizer.c sampler.c grammar.c cJSON.c server.c csafetensors.c json.c safetensors.c
+SRCS    = picolm.c model.c tensor.c quant.c tokenizer.c qwen_tokenize.c sampler.c grammar.c cJSON.c server.c csafetensors.c json.c safetensors.c
 OBJS    = $(SRCS:.c=.o)
 TARGET  = picolm
 
