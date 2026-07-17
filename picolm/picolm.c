@@ -163,8 +163,8 @@ int main(int argc, char **argv) {
     /* Server mode: start HTTP server (no prompt needed) */
     if (server_mode) {
         fp16_table_init();
-        extern int server_main(int port, const char *host, const char *model_path);
-        return server_main(server_port, server_host, model_path);
+        extern int server_main(int port, const char *host, const char *model_path, int num_threads, int do_prefault);
+        return server_main(server_port, server_host, model_path, num_threads, do_prefault);
     }
 
     if (!prompt) {

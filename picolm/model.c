@@ -183,13 +183,23 @@ static uint64_t skip_meta_value(reader_t *r, uint32_t vtype, int *is_numeric) {
  * Uses volatile reads to prevent the compiler from optimizing the loop
  * away. The accesses are spread across the entire mapping so the OS
  * issues readahead for all pages, not just the first few. */
-static void prepare_mmap(const void *addr, size_t size) {
-    if (!g_do_prefault) return;
+static void _do_prefault(const void *addr, size_t size) {
     size_t pages = (size + 4095) / 4096;
     const volatile char *p = (const volatile char *)addr;
     for (size_t off = 0; off < size; off += 4096)
         (void)p[off];
     fprintf(stderr, "Prefaulted %zu pages (%.1f MB)\n", pages, (double)size / (1024.0 * 1024.0));
+}
+
+static void prepare_mmap(const void *addr, size_t size) {
+    if (!g_do_prefault) return;
+    _do_prefault(addr, size);
+}
+
+void model_prefault(model_t *m) {
+    if (m->mmap_addr) {
+        _do_prefault(m->mmap_addr, m->mmap_size);
+    }
 }
 
 static int mmap_file(model_t *m, const char *path) {

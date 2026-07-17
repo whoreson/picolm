@@ -239,7 +239,7 @@ static int http_parse_request(char *buf, int len, char *method, int mlen, char *
 
 /* ---- Server init / free (persistent model) ---- */
 
-static int server_init(const char *model_path) {
+static int server_init(const char *model_path, int num_threads, int do_prefault) {
     fprintf(stderr, "[server] Loading model: %s\n", model_path);
     fp16_table_init();
 
@@ -248,8 +248,43 @@ static int server_init(const char *model_path) {
         return -1;
     }
 
-    tensor_set_threads(4);
-    tensor_threadpool_init(4);
+    /* Print SIMD capability */
+    fprintf(stderr, "[server] SIMD: %s\n",
+#if defined(PICOLM_AVX512)
+        "AVX-512"
+#elif defined(PICOLM_AVX2)
+        "AVX2"
+#elif defined(PICOLM_AVX)
+        "AVX"
+#elif defined(PICOLM_SSE3)
+        "SSE3"
+#elif defined(PICOLM_SSE2)
+        "SSE2"
+#elif defined(PICOLM_NEON)
+        "NEON"
+#else
+        "scalar"
+#endif
+    );
+
+    /* Print weight types */
+    fprintf(stderr, "[server] Weight type: %d, Emb type: %d, Output type: %d\n",
+        srv.model.config.weight_type, srv.model.weights.type_token_embd, srv.model.weights.type_output);
+    if (srv.model.config.n_layers > 0) {
+        layer_weights_t *lw0 = &srv.model.weights.layers[0];
+        fprintf(stderr, "[server] Layer0: attn_q=%d k=%d v=%d gate=%d up=%d down=%d\n",
+            lw0->type_attn_q, lw0->type_attn_k, lw0->type_attn_v,
+            lw0->type_ffn_gate, lw0->type_ffn_up, lw0->type_ffn_down);
+    }
+
+    /* Prefault if requested */
+    if (do_prefault) {
+        extern void model_prefault(model_t *m);
+        model_prefault(&srv.model);
+    }
+
+    tensor_set_threads(num_threads);
+    tensor_threadpool_init(num_threads);
 
     srv.use_qwen_tok = qwen_tokenize_should_use(&srv.model);
     if (srv.use_qwen_tok) {
@@ -1255,14 +1290,14 @@ static void handle_request(SOCKET sock) {
 
 /* ---- Server Main Loop ---- */
 
-int server_main(int port, const char *host, const char *model_path) {
+int server_main(int port, const char *host, const char *model_path, int num_threads, int do_prefault) {
     srv.port = port;
     strncpy(srv.host, host, sizeof(srv.host) - 1);
     srv.model_path = model_path;
     srv.running = 1;
 
     /* Load model once at startup */
-    if (server_init(model_path) != 0) {
+    if (server_init(model_path, num_threads, do_prefault) != 0) {
         return -1;
     }
 

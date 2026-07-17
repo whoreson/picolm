@@ -224,6 +224,8 @@ int model_lock_layers(model_t *m, size_t mem_bytes);
 /* Enable prefaulting: touch every mmap page at load time to bring the
  * model into the page cache before inference begins. Call before model_load. */
 void model_set_prefault(int v);
+/* Unconditionally prefault model pages (for server mode, bypasses g_do_prefault). */
+void model_prefault(model_t *m);
 
 /* Unlock previously pinned weight layers. Returns 0 on success. */
 int model_unlock_layers(model_t *m);
