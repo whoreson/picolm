@@ -2281,54 +2281,6 @@ static void prefill_attn_task(int flat_idx, void *ctx_ptr) {
               ctx->kv_row_size_k, ctx->kv_row_size_v, ctx->head_dim);
 }
 
-/* Prefill RoPE + QK-norm + KV cache store task: one per token.
- * Each token's RoPE rotation, normalization, and KV store are fully
- * independent from all others, so they can be parallelized. */
-typedef struct {
-    int start_pos, q_dim, kv_dim, head_dim, n_heads, n_kv_heads;
-    int rope_dim, rope_type;
-    int has_qk_norm;
-    size_t kv_row_size_k, kv_row_size_v;
-    const float *q_batch, *k_batch, *v_batch;
-    const float *rope_cos, *rope_sin;
-    const float *qk_norm_w, *kn_norm_w;
-    float rms_norm_eps;
-    uint8_t *kcl, *vcl;
-} prefill_rope_kv_ctx_t;
-
-static void prefill_rope_kv_task(int bi, void *ctx_ptr) {
-    prefill_rope_kv_ctx_t *ctx = (prefill_rope_kv_ctx_t *)ctx_ptr;
-    int pos = ctx->start_pos + bi;
-    float *q_pos = ctx->q_batch + bi * ctx->q_dim;
-    float *k_pos = ctx->k_batch + bi * ctx->kv_dim;
-    float *v_pos = ctx->v_batch + bi * ctx->kv_dim;
-
-    const float *cos_pos = ctx->rope_cos + (size_t)pos * (ctx->head_dim / 2);
-    const float *sin_pos = ctx->rope_sin + (size_t)pos * (ctx->head_dim / 2);
-
-    if (ctx->has_qk_norm) {
-        for (int h = 0; h < ctx->n_heads; h++)
-            rmsnorm(q_pos + h * ctx->head_dim, q_pos + h * ctx->head_dim,
-                    ctx->qk_norm_w, ctx->head_dim, ctx->rms_norm_eps);
-        for (int h = 0; h < ctx->n_kv_heads; h++)
-            rmsnorm(k_pos + h * ctx->head_dim, k_pos + h * ctx->head_dim,
-                    ctx->kn_norm_w, ctx->head_dim, ctx->rms_norm_eps);
-    }
-
-    int rope_half_pf = ctx->rope_dim / 2;
-    rope(q_pos, k_pos, ctx->head_dim, ctx->n_heads, ctx->n_kv_heads,
-         cos_pos, sin_pos, ctx->rope_type, rope_half_pf);
-
-    for (int hkv = 0; hkv < ctx->n_kv_heads; hkv++) {
-        uint8_t *kp = ctx->kcl + (size_t)pos * ctx->n_kv_heads * ctx->kv_row_size_k + hkv * ctx->kv_row_size_k;
-        uint8_t *vp = ctx->vcl + (size_t)pos * ctx->n_kv_heads * ctx->kv_row_size_v + hkv * ctx->kv_row_size_v;
-        for (int d2 = 0; d2 < ctx->head_dim; d2++)
-            ((uint16_t*)kp)[d2] = fp32_to_fp16(k_pos[hkv * ctx->head_dim + d2]);
-        for (int d2 = 0; d2 < ctx->head_dim; d2++)
-            ((uint16_t*)vp)[d2] = fp32_to_fp16(v_pos[hkv * ctx->head_dim + d2]);
-    }
-}
-
 static void batch_attention_layer(
         float *xb_batch, const float *q_batch,
         const uint8_t *kcache, const uint8_t *vcache,
@@ -2409,21 +2361,43 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                           lw->type_attn_k, lw->type_attn_v);
         tensor_set_repacked(NULL);
 
-        /* Per-position: RoPE, QK-norm, KV store -- threaded via tensor_parallel_for */
+        /* Per-position: RoPE, KV store */
         {
             uint8_t *kcl = s->key_cache + (size_t)l * seq_len * c->n_kv_heads * s->kv_row_size_k;
             uint8_t *vcl = s->val_cache + (size_t)l * seq_len * c->n_kv_heads * s->kv_row_size_v;
-            prefill_rope_kv_ctx_t rctx;
-            rctx.start_pos = start_pos; rctx.q_dim = q_dim; rctx.kv_dim = kv_dim;
-            rctx.head_dim = head_dim; rctx.n_heads = n_heads; rctx.n_kv_heads = c->n_kv_heads;
-            rctx.rope_dim = (c->rope_dim > 0) ? c->rope_dim : head_dim;
-            rctx.rope_type = c->rope_type; rctx.has_qk_norm = lw->attn_q_norm ? 1 : 0;
-            rctx.kv_row_size_k = s->kv_row_size_k; rctx.kv_row_size_v = s->kv_row_size_v;
-            rctx.q_batch = q_batch; rctx.k_batch = k_batch; rctx.v_batch = v_batch;
-            rctx.rope_cos = s->rope_cos; rctx.rope_sin = s->rope_sin;
-            rctx.qk_norm_w = s->attn_q_norm_w[l]; rctx.kn_norm_w = s->attn_k_norm_w[l];
-            rctx.rms_norm_eps = c->rms_norm_eps; rctx.kcl = kcl; rctx.vcl = vcl;
-            tensor_parallel_for(n_tokens, prefill_rope_kv_task, &rctx);
+            for (int bi = 0; bi < n_tokens; bi++) {
+                int pos = start_pos + bi;
+                float *q_pos = q_batch + bi * q_dim;
+                float *k_pos = k_batch + bi * kv_dim;
+                float *v_pos = v_batch + bi * kv_dim;
+
+                const float *cos_pos = s->rope_cos + (size_t)pos * (head_dim / 2);
+                const float *sin_pos = s->rope_sin + (size_t)pos * (head_dim / 2);
+
+                /* QK-norm (Qwen3) */
+                if (lw->attn_q_norm) {
+                    float *qnw = s->attn_q_norm_w[l];
+                    float *knw = s->attn_k_norm_w[l];
+                    for (int h = 0; h < n_heads; h++)
+                        rmsnorm(q_pos + h * head_dim, q_pos + h * head_dim, qnw, head_dim, c->rms_norm_eps);
+                    for (int h = 0; h < n_kv_heads; h++)
+                        rmsnorm(k_pos + h * head_dim, k_pos + h * head_dim, knw, head_dim, c->rms_norm_eps);
+                }
+
+                int rope_dim_pf = (c->rope_dim > 0) ? c->rope_dim : head_dim;
+                int rope_half_pf = rope_dim_pf / 2;
+                rope(q_pos, k_pos, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos, c->rope_type, rope_half_pf);
+
+                /* KV cache store */
+                for (int hkv = 0; hkv < n_kv_heads; hkv++) {
+                    uint8_t *kp = kcl + (size_t)pos * c->n_kv_heads * s->kv_row_size_k + hkv * s->kv_row_size_k;
+                    uint8_t *vp = vcl + (size_t)pos * c->n_kv_heads * s->kv_row_size_v + hkv * s->kv_row_size_v;
+                    for (int d2 = 0; d2 < head_dim; d2++)
+                        ((uint16_t*)kp)[d2] = fp32_to_fp16(k_pos[hkv * head_dim + d2]);
+                    for (int d2 = 0; d2 < head_dim; d2++)
+                        ((uint16_t*)vp)[d2] = fp32_to_fp16(v_pos[hkv * head_dim + d2]);
+                }
+            }
 
             /* Zero init xb_batch for attention accumulation */
             memset(xb_batch, 0, (size_t)n_tokens * max_dim * sizeof(float));
