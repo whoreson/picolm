@@ -1230,6 +1230,167 @@ static __attribute__((always_inline)) void attn_core(
 #endif
 }
 
+/* ================================================================
+ * GQA-grouped attention: process all kv_mul Q heads sharing a KV
+ * head in a single pass over the KV cache. This reduces KV cache
+ * memory bandwidth by kv_mul x (4x for Fimbulvetr2-11B).
+ *
+ * For each position t in the KV cache, we load K[t] once and compute
+ * kv_mul dot products against the kv_mul Q heads. Similarly V[t] is
+ * loaded once and accumulated into kv_mul output vectors.
+ * ================================================================ */
+typedef struct {
+    int kv_h, kv_mul, n_kv_heads, head_dim, pos;
+    gguf_type_t kv_type_k, kv_type_v;
+    size_t kv_row_size_k, kv_row_size_v;
+    const uint8_t *kcache, *vcache;
+    const float *q;   /* [n_heads][head_dim] */
+    float *xb;        /* [n_heads][head_dim] */
+} attn_group_ctx_t;
+
+static __attribute__((always_inline)) void attention_group(int kv_head_idx, void *ctx_ptr) {
+    attn_group_ctx_t *ctx = (attn_group_ctx_t *)ctx_ptr;
+    int kv_h = kv_head_idx;
+    int kv_mul = ctx->kv_mul;
+    int head_dim = ctx->head_dim;
+    int pos = ctx->pos;
+    int first_qh = kv_h * kv_mul;
+    size_t k_stride = ctx->n_kv_heads * ctx->kv_row_size_k;
+    size_t v_stride = ctx->n_kv_heads * ctx->kv_row_size_v;
+
+    /* Per-Q-head softmax state */
+    float max_score[4], sum_exp[4];
+    for (int g = 0; g < kv_mul; g++) {
+        max_score[g] = -1e30f;
+        sum_exp[g] = 0.0f;
+    }
+    float acc[4][256];
+    for (int g = 0; g < kv_mul; g++)
+        memset(acc[g], 0, (size_t)head_dim * sizeof(float));
+
+    for (int t = 0; t <= pos; t++) {
+        const uint8_t *kt = ctx->kcache + (size_t)t * ctx->n_kv_heads * ctx->kv_row_size_k + kv_h * ctx->kv_row_size_k;
+        const uint8_t *vt = ctx->vcache + (size_t)t * ctx->n_kv_heads * ctx->kv_row_size_v + kv_h * ctx->kv_row_size_v;
+
+#ifdef PICOLM_AVX512
+        /* Load K once, convert to F32 */
+        __m512 k_vec[8]; /* 128 / 16 = 8 vectors for head_dim=128 */
+        {
+            const uint16_t *k16 = (const uint16_t *)kt;
+            int d = 0;
+            for (; d + 16 <= head_dim; d += 16) {
+                __m256i k_half = _mm256_loadu_si256((__m256i *)(k16 + d));
+                k_vec[d/16] = _mm512_cvtph_ps(k_half);
+            }
+        }
+
+        /* Load V once, convert to F32 */
+        __m512 v_vec[8];
+        {
+            const uint16_t *v16 = (const uint16_t *)vt;
+            int d = 0;
+            for (; d + 16 <= head_dim; d += 16) {
+                __m256i v_half = _mm256_loadu_si256((__m256i *)(v16 + d));
+                v_vec[d/16] = _mm512_cvtph_ps(v_half);
+            }
+        }
+
+        for (int g = 0; g < kv_mul; g++) {
+            const float *qg = ctx->q + (first_qh + g) * head_dim;
+            float score = 0.0f;
+
+            /* K.dot.Q */
+            {
+                __m512 s = _mm512_setzero_ps();
+                int d = 0;
+                for (; d + 16 <= head_dim; d += 16) {
+                    __m512 qf = _mm512_loadu_ps(qg + d);
+                    s = _mm512_fmadd_ps(k_vec[d/16], qf, s);
+                }
+                score = _mm512_reduce_add_ps(s);
+                for (; d < head_dim; d++)
+                    score += fp16_to_fp32(((uint16_t*)kt)[d]) * qg[d];
+            }
+            score /= sqrtf((float)head_dim);
+
+            float *accg = acc[g];
+            float *xbhg = ctx->xb + (first_qh + g) * head_dim;
+
+            if (score > max_score[g]) {
+                float correction = expf(max_score[g] - score);
+                sum_exp[g] = sum_exp[g] * correction + 1.0f;
+                __m512 cv = _mm512_set1_ps(correction);
+                int d = 0;
+                for (; d + 16 <= head_dim; d += 16) {
+                    __m512 af = _mm512_loadu_ps(accg + d);
+                    _mm512_storeu_ps(accg + d, _mm512_fmadd_ps(af, cv, v_vec[d/16]));
+                }
+                for (; d < head_dim; d++)
+                    accg[d] = accg[d] * correction + fp16_to_fp32(((uint16_t*)vt)[d]);
+                max_score[g] = score;
+            } else {
+                float w = expf(score - max_score[g]);
+                sum_exp[g] += w;
+                __m512 wv = _mm512_set1_ps(w);
+                int d = 0;
+                for (; d + 16 <= head_dim; d += 16) {
+                    __m512 af = _mm512_loadu_ps(accg + d);
+                    _mm512_storeu_ps(accg + d, _mm512_fmadd_ps(v_vec[d/16], wv, af));
+                }
+                for (; d < head_dim; d++)
+                    accg[d] += w * fp16_to_fp32(((uint16_t*)vt)[d]);
+            }
+        }
+#else
+        /* Fallback: per-Q-head processing (same as attn_core, no grouping benefit) */
+        for (int g = 0; g < kv_mul; g++) {
+            const float *qg = ctx->q + (first_qh + g) * head_dim;
+            float score;
+            if (ctx->kv_type_k == KV_CACHE_Q8_0) score = vec_dot_q8_0_f32(kt, qg, head_dim);
+            else if (ctx->kv_type_k == KV_CACHE_Q4_0) score = vec_dot_q4_0_f32(kt, qg, head_dim);
+            else score = vec_dot_f16_f32(kt, qg, head_dim);
+            score /= sqrtf((float)head_dim);
+
+            float *accg = acc[g];
+            if (score > max_score[g]) {
+                float correction = expf(max_score[g] - score);
+                sum_exp[g] = sum_exp[g] * correction + 1.0f;
+                if (ctx->kv_type_v == KV_CACHE_Q8_0) fma_scale_q8_0_f32(accg, correction, vt, head_dim);
+                else if (ctx->kv_type_v == KV_CACHE_Q4_0) fma_scale_q4_0_f32(accg, correction, vt, head_dim);
+                else {
+                    const uint16_t *vt16 = (const uint16_t *)vt;
+                    for (int d = 0; d < head_dim; d++) accg[d] = accg[d] * correction + fp16_to_fp32(vt16[d]);
+                }
+                max_score[g] = score;
+            } else {
+                float w = expf(score - max_score[g]);
+                sum_exp[g] += w;
+                if (ctx->kv_type_v == KV_CACHE_Q8_0) scale_add_q8_0_f32(accg, w, vt, head_dim);
+                else if (ctx->kv_type_v == KV_CACHE_Q4_0) scale_add_q4_0_f32(accg, w, vt, head_dim);
+                else {
+                    const uint16_t *vt16 = (const uint16_t *)vt;
+                    for (int d = 0; d < head_dim; d++) accg[d] += w * fp16_to_fp32(vt16[d]);
+                }
+            }
+        }
+#endif
+    }
+
+    /* Normalize and write output */
+    for (int g = 0; g < kv_mul; g++) {
+        float inv_sum = 1.0f / sum_exp[g];
+        float *accg = acc[g];
+        float *xbhg = ctx->xb + (first_qh + g) * head_dim;
+#ifdef PICOLM_AVX512
+        { __m512 inv = _mm512_set1_ps(inv_sum); int d = 0;
+          for (; d + 16 <= head_dim; d += 16) { __m512 af = _mm512_loadu_ps(accg + d); _mm512_storeu_ps(xbhg + d, _mm512_mul_ps(af, inv)); }
+          for (; d < head_dim; d++) xbhg[d] = accg[d] * inv_sum; }
+#else
+        for (int d = 0; d < head_dim; d++) xbhg[d] = accg[d] * inv_sum;
+#endif
+    }
+}
+
 typedef struct {
     int n_heads, n_kv_heads, kv_mul, head_dim, pos;
     gguf_type_t kv_type_k, kv_type_v;
@@ -1451,13 +1612,14 @@ float *model_forward(model_t *m, int token, int pos) {
          *
          * This saves memory (no att[] buffer) and is more cache-friendly.
          */
-        attn_head_ctx_t ctx;
-        ctx.n_heads = n_heads; ctx.n_kv_heads = c->n_kv_heads; ctx.kv_mul = kv_mul; ctx.head_dim = head_dim; ctx.pos = pos;
-        ctx.kv_type_k = s->kv_type_k; ctx.kv_type_v = s->kv_type_v;
-        ctx.kv_row_size_k = s->kv_row_size_k; ctx.kv_row_size_v = s->kv_row_size_v;
-        ctx.kcache = kcache_layer; ctx.vcache = vcache_layer;
-        ctx.q = s->q; ctx.xb = s->xb;
-        tensor_parallel_for(n_heads, attention_head, &ctx);
+        attn_group_ctx_t gctx;
+        gctx.kv_mul = kv_mul; gctx.head_dim = head_dim; gctx.pos = pos;
+        gctx.kv_type_k = s->kv_type_k; gctx.kv_type_v = s->kv_type_v;
+        gctx.kv_row_size_k = s->kv_row_size_k; gctx.kv_row_size_v = s->kv_row_size_v;
+        gctx.kcache = kcache_layer; gctx.vcache = vcache_layer;
+        gctx.q = s->q; gctx.xb = s->xb;
+        gctx.n_kv_heads = c->n_kv_heads;
+        tensor_parallel_for(c->n_kv_heads, attention_group, &gctx);
 
         /* Qwen3.5 full attention: apply gate sigmoid to attention output */
         if (qwen35_attn_gate) {
