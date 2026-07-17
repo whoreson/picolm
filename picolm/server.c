@@ -275,11 +275,11 @@ static int http_read_body(char *buf, int buf_len, int header_len) {
 
 /* ---- Server init / free (persistent model) ---- */
 
-static int server_init(const char *model_path, int num_threads, int do_prefault) {
+static int server_init(const char *model_path, int num_threads, int do_prefault, int context_override) {
     fprintf(stderr, "[server] Loading model: %s\n", model_path);
     fp16_table_init();
 
-    if (model_load(&srv.model, model_path, 0, KV_CACHE_F16, KV_CACHE_F16) != 0) {
+    if (model_load(&srv.model, model_path, context_override, KV_CACHE_F16, KV_CACHE_F16) != 0) {
         fprintf(stderr, "[server] Failed to load model\n");
         return -1;
     }
@@ -642,6 +642,23 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
     if (n_prompt == 0) {
         ptokens[0] = (srv.use_qwen_tok) ? srv.qwen_enc.bos_id : (int)tokenizer->bos_id;
         n_prompt = 1;
+    }
+
+    /* Reject if prompt exceeds context size */
+    if (n_prompt > model->config.max_seq_len) {
+        char errmsg[512];
+        snprintf(errmsg, sizeof(errmsg),
+            "{\"error\":{\"message\":\"Prompt too large: %d tokens exceeds model context size %d\"}}",
+            n_prompt, model->config.max_seq_len);
+        http_send(sock, 413, "application/json", errmsg);
+        free(ptokens);
+        free(prompt);
+        return;
+    }
+
+    /* Cap max_tokens so total context doesn't exceed model limit */
+    if (n_prompt + max_tokens > model->config.max_seq_len) {
+        max_tokens = model->config.max_seq_len - n_prompt;
     }
 
     /* Prompt caching: find shared prefix with last request */
@@ -1117,6 +1134,18 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         }
     }
 
+    /* Reject if prompt exceeds context size */
+    if (n_prompt > model->config.max_seq_len) {
+        char errmsg[512];
+        snprintf(errmsg, sizeof(errmsg),
+            "{\"error\":{\"message\":\"Prompt too large: %d tokens exceeds model context size %d\"}}",
+            n_prompt, model->config.max_seq_len);
+        http_send(sock, 413, "application/json", errmsg);
+        free(ptokens);
+        free(prompt);
+        return;
+    }
+
     /* Prompt caching: find shared prefix */
     int cache_start = 0;
     if (srv.last_prompt_tokens) {
@@ -1142,7 +1171,10 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
     srv.last_prompt_len = n_prompt;
 
     int prompt_only = (n_predict == 0);
-    if (n_predict < 0) n_predict = model->config.max_seq_len - n_prompt;
+    /* Cap n_predict so total context doesn't exceed model limit */
+    if (n_predict < 0 || n_prompt + n_predict > model->config.max_seq_len) {
+        n_predict = model->config.max_seq_len - n_prompt;
+    }
     if (n_prompt == 0) n_prompt = 1; /* force at least 1 token for empty prompt (BOS) */
     if (n_predict <= 0 && !prompt_only) n_predict = 32;
 
@@ -1522,14 +1554,14 @@ static void handle_request(SOCKET sock) {
 
 /* ---- Server Main Loop ---- */
 
-int server_main(int port, const char *host, const char *model_path, int num_threads, int do_prefault) {
+int server_main(int port, const char *host, const char *model_path, int num_threads, int do_prefault, int context_override) {
     srv.port = port;
     strncpy(srv.host, host, sizeof(srv.host) - 1);
     srv.model_path = model_path;
     srv.running = 1;
 
     /* Load model once at startup */
-    if (server_init(model_path, num_threads, do_prefault) != 0) {
+    if (server_init(model_path, num_threads, do_prefault, context_override) != 0) {
         return -1;
     }
 

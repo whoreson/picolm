@@ -131,6 +131,8 @@ int main(int argc, char **argv) {
             mem_mb = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--prefault") == 0) {
             do_prefault = 1;
+        } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
+            context_override = atoi(argv[++i]);
         } else if ((strcmp(argv[i], "-ctk") == 0 || strcmp(argv[i], "-ctv") == 0) && i + 1 < argc) {
             const char *typestr = argv[++i];
             kv_cache_type_t *tgt = (strcmp(argv[i-1], "-ctk") == 0) ? &kv_type_k : &kv_type_v;
@@ -184,8 +186,8 @@ int main(int argc, char **argv) {
             setsid(); /* create new session */
         }
         fp16_table_init();
-        extern int server_main(int port, const char *host, const char *model_path, int num_threads, int do_prefault);
-        return server_main(server_port, server_host, model_path, num_threads, do_prefault);
+        extern int server_main(int port, const char *host, const char *model_path, int num_threads, int do_prefault, int context_override);
+        return server_main(server_port, server_host, model_path, num_threads, do_prefault, context_override);
     }
 
     if (!prompt) {
