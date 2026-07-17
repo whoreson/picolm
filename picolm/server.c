@@ -545,6 +545,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
     uint64_t seed = 42;
     int n_choices = 1;
     int do_stream = 0;
+    int timings_per_token = 0;
     const char *model_name = NULL;
 
     if (is_chat) {
@@ -585,6 +586,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
     if ((item = cJSON_GetObjectItem(req, "top_p"))) top_p = (float)cJSON_GetNumberValue(item);
     if ((item = cJSON_GetObjectItem(req, "seed"))) seed = (uint64_t)cJSON_GetNumberValue(item);
     if ((item = cJSON_GetObjectItem(req, "stream")) && cJSON_IsTrue(item)) do_stream = 1;
+    if ((item = cJSON_GetObjectItem(req, "timings_per_token")) && cJSON_IsTrue(item)) timings_per_token = 1;
     if ((item = cJSON_GetObjectItem(req, "n"))) n_choices = (int)cJSON_GetNumberValue(item);
     if (n_choices < 1) n_choices = 1;
     if (n_choices > 4) n_choices = 4;
@@ -669,6 +671,8 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         if (gen_start_oai >= n_prompt) gen_start_oai = n_prompt - 1;
         int token = ptokens[gen_start_oai];
         double t_start = get_time_ms();
+        double t_prefill_end = 0;
+        int gen_count = 0;
 
         for (int pos = gen_start_oai; pos < n_prompt + max_tokens; pos++) {
             if (!client_alive(sock)) {
@@ -682,8 +686,12 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
                 continue;
             }
 
+            /* First generated token: mark prefill end */
+            if (gen_count == 0) {
+                t_prefill_end = get_time_ms();
+            }
+
             int next = sampler_sample(&sampler, logits, model->config.vocab_size);
-            /* Decode: use Qwen tokenizer if applicable */
             static char qwen_buf[64];
             const char *piece;
             if (srv.use_qwen_tok) {
@@ -694,8 +702,44 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             }
             if (!piece) piece = "";
 
-            if (send_chunk(sock, piece, pos == start_pos ? (is_chat ? "assistant" : "") : NULL, 0) < 0) break;
+            /* Build chunk with optional timing */
+            cJSON *chunk = cJSON_CreateObject();
+            cJSON *choice = cJSON_CreateObject();
+            cJSON *delta = cJSON_CreateObject();
+            if (gen_count == 0) cJSON_AddStringToObject(delta, "role", is_chat ? "assistant" : "");
+            cJSON_AddStringToObject(delta, "content", piece);
+            cJSON_AddItemToObject(choice, "delta", delta);
+            cJSON_AddNumberToObject(choice, "index", 0);
+            cJSON_AddStringToObject(choice, "finish_reason", "");
+            if (!is_chat) cJSON_AddStringToObject(choice, "text", piece);
+            cJSON *choices = cJSON_CreateArray();
+            cJSON_AddItemToArray(choices, choice);
+            cJSON_AddItemToObject(chunk, "choices", choices);
+            cJSON_AddStringToObject(chunk, "id", is_chat ? "chatcmpl-pico" : "cmpl-pico");
+            cJSON_AddStringToObject(chunk, "object", is_chat ? "chat.completion.chunk" : "text_completion");
+            cJSON_AddNumberToObject(chunk, "created", (double)(time(NULL)));
+            if (model_name) cJSON_AddStringToObject(chunk, "model", model_name);
+
+            /* Per-token timing */
+            if (timings_per_token && gen_count > 0) {
+                double t_now = get_time_ms();
+                double tok_ms = t_now - (gen_count == 1 ? t_prefill_end : t_now);
+                /* Actually track per-token delta */
+                cJSON *tt = cJSON_CreateObject();
+                cJSON_AddNumberToObject(tt, "token_ms", tok_ms);
+                cJSON_AddItemToObject(chunk, "timings", tt);
+            }
+            double t_tok_start = gen_count > 0 ? t_prefill_end : get_time_ms();
+            (void)t_tok_start; /* used for per-token tracking below */
+
+            char *cj = cJSON_PrintUnformatted(chunk);
+            if (sse_send(sock, cj, NULL) < 0) {
+                free(cj); cJSON_Delete(chunk); break;
+            }
+            free(cj);
+            cJSON_Delete(chunk);
             total_generation_tokens++;
+            gen_count++;
             printf("%s", piece);
             fflush(stdout);
 
@@ -704,19 +748,59 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         }
 
         double t_end = get_time_ms();
-        send_chunk(sock, "", NULL, 1);
+        double t_prefill_ms = t_prefill_end > 0 ? t_prefill_end - t_start : t_end - t_start;
+        double t_gen_ms = t_prefill_end > 0 ? t_end - t_prefill_end : 0;
+        int prompt_evaluated = n_prompt - start_pos;
+
+        /* Send final chunk with timings */
+        cJSON *done_chunk = cJSON_CreateObject();
+        cJSON *done_choice = cJSON_CreateObject();
+        cJSON *done_delta = cJSON_CreateObject();
+        cJSON_AddStringToObject(done_delta, "content", "");
+        cJSON_AddItemToObject(done_choice, "delta", done_delta);
+        cJSON_AddNumberToObject(done_choice, "index", 0);
+        cJSON_AddStringToObject(done_choice, "finish_reason", "stop");
+        cJSON *done_choices = cJSON_CreateArray();
+        cJSON_AddItemToArray(done_choices, done_choice);
+        cJSON_AddItemToObject(done_chunk, "choices", done_choices);
+        cJSON_AddStringToObject(done_chunk, "id", is_chat ? "chatcmpl-pico" : "cmpl-pico");
+        cJSON_AddStringToObject(done_chunk, "object", is_chat ? "chat.completion.chunk" : "text_completion");
+        cJSON_AddNumberToObject(done_chunk, "created", (double)(time(NULL)));
+
+        /* Timings object */
+        cJSON *timings = cJSON_CreateObject();
+        cJSON_AddNumberToObject(timings, "cache_n", start_pos);
+        cJSON_AddNumberToObject(timings, "prompt_n", prompt_evaluated);
+        cJSON_AddNumberToObject(timings, "prompt_ms", t_prefill_ms);
+        cJSON_AddNumberToObject(timings, "prompt_per_token_ms", prompt_evaluated > 0 ? t_prefill_ms / prompt_evaluated : 0);
+        cJSON_AddNumberToObject(timings, "prompt_per_second", prompt_evaluated > 0 ? prompt_evaluated / (t_prefill_ms / 1000.0) : 0);
+        cJSON_AddNumberToObject(timings, "predicted_n", total_generation_tokens);
+        cJSON_AddNumberToObject(timings, "predicted_ms", t_gen_ms);
+        cJSON_AddNumberToObject(timings, "predicted_per_token_ms", total_generation_tokens > 0 ? t_gen_ms / total_generation_tokens : 0);
+        cJSON_AddNumberToObject(timings, "predicted_per_second", total_generation_tokens > 0 ? total_generation_tokens / (t_gen_ms / 1000.0) : 0);
+        cJSON_AddItemToObject(done_chunk, "timings", timings);
+
+        char *dcj = cJSON_PrintUnformatted(done_chunk);
+        sse_send(sock, dcj, NULL);
+        free(dcj);
+        cJSON_Delete(done_chunk);
         send_chunked(sock, "data: [DONE]\r\n", 14);
         send_chunked(sock, "", 0);
 
-        srv.kv_pos = n_prompt; /* prompt tokens 0..n_prompt-1 are in KV cache */
+        srv.kv_pos = n_prompt;
 
-        fprintf(stderr, "\n[server] OAI stream: cached=%d/%d prompt, %d gen in %.0fms (%.1f tok/s)\n",
-                start_pos, n_prompt, total_generation_tokens, t_end - t_start,
-                (t_end - t_start) > 0 ? total_generation_tokens / ((t_end - t_start) / 1000.0) : 0.0);
+        fprintf(stderr, "\n[server] OAI stream: prompt %d new+%d cached in %.0fms (%.1f tok/s), gen %d in %.0fms (%.1f tok/s)\n",
+                prompt_evaluated, start_pos, t_prefill_ms,
+                prompt_evaluated > 0 ? prompt_evaluated / (t_prefill_ms / 1000.0) : 0,
+                total_generation_tokens, t_gen_ms,
+                total_generation_tokens > 0 ? total_generation_tokens / (t_gen_ms / 1000.0) : 0);
     } else {
         /* Non-streaming */
         cJSON *root = cJSON_CreateObject();
         cJSON *choices = cJSON_CreateArray();
+        double t_start_ns = get_time_ms();
+        double t_prefill_end_ns = 0;
+        int gen_count_ns = 0;
 
         for (int c = 0; c < n_choices; c++) {
             sampler_t sampler;
@@ -745,6 +829,8 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
                     token = ptokens[pos + 1];
                     continue;
                 }
+                if (gen_count_ns == 0) t_prefill_end_ns = get_time_ms();
+                gen_count_ns++;
 
                 int next = sampler_sample(&sampler, logits, model->config.vocab_size);
                 static char qwen_buf2[64];
@@ -795,12 +881,35 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         cJSON_AddNumberToObject(usage, "total_tokens", total_prompt_tokens + total_generation_tokens);
         cJSON_AddItemToObject(root, "usage", usage);
 
+        /* Timings */
+        double t_end_ns = get_time_ms();
+        double t_prefill_ms_ns = t_prefill_end_ns > 0 ? t_prefill_end_ns - t_start_ns : t_end_ns - t_start_ns;
+        double t_gen_ms_ns = t_prefill_end_ns > 0 ? t_end_ns - t_prefill_end_ns : 0;
+        int prompt_evaluated_ns = n_prompt - start_pos;
+        cJSON *timings_ns = cJSON_CreateObject();
+        cJSON_AddNumberToObject(timings_ns, "cache_n", start_pos);
+        cJSON_AddNumberToObject(timings_ns, "prompt_n", prompt_evaluated_ns);
+        cJSON_AddNumberToObject(timings_ns, "prompt_ms", t_prefill_ms_ns);
+        cJSON_AddNumberToObject(timings_ns, "prompt_per_token_ms", prompt_evaluated_ns > 0 ? t_prefill_ms_ns / prompt_evaluated_ns : 0);
+        cJSON_AddNumberToObject(timings_ns, "prompt_per_second", prompt_evaluated_ns > 0 ? prompt_evaluated_ns / (t_prefill_ms_ns / 1000.0) : 0);
+        cJSON_AddNumberToObject(timings_ns, "predicted_n", total_generation_tokens);
+        cJSON_AddNumberToObject(timings_ns, "predicted_ms", t_gen_ms_ns);
+        cJSON_AddNumberToObject(timings_ns, "predicted_per_token_ms", total_generation_tokens > 0 ? t_gen_ms_ns / total_generation_tokens : 0);
+        cJSON_AddNumberToObject(timings_ns, "predicted_per_second", total_generation_tokens > 0 ? total_generation_tokens / (t_gen_ms_ns / 1000.0) : 0);
+        cJSON_AddItemToObject(root, "timings", timings_ns);
+
         char *json = cJSON_PrintUnformatted(root);
         http_send(sock, 200, "application/json", json);
         free(json);
         cJSON_Delete(root);
 
-        srv.kv_pos = n_prompt; /* prompt tokens 0..n_prompt-1 are in KV cache */
+        srv.kv_pos = n_prompt;
+
+        fprintf(stderr, "\n[server] OAI: prompt %d new+%d cached in %.0fms (%.1f tok/s), gen %d in %.0fms (%.1f tok/s)\n",
+                prompt_evaluated_ns, start_pos, t_prefill_ms_ns,
+                prompt_evaluated_ns > 0 ? prompt_evaluated_ns / (t_prefill_ms_ns / 1000.0) : 0,
+                total_generation_tokens, t_gen_ms_ns,
+                total_generation_tokens > 0 ? total_generation_tokens / (t_gen_ms_ns / 1000.0) : 0);
 
     }
 
@@ -1112,6 +1221,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
 
         free(generated_stream);
         double t_end = get_time_ms();
+        double t_prefill_ms = t_end - t_start; /* includes everything for streaming */
         double gen_ms = t_end - t_start;
 
         /* Final timing SSE */
@@ -1120,13 +1230,25 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         cJSON_AddStringToObject(final, "stop_type", stop_type);
         cJSON_AddStringToObject(final, "stopping_word", stopping_word);
         cJSON_AddNumberToObject(final, "tokens_evaluated", n_prompt);
+        cJSON *timings_c = cJSON_CreateObject();
+        cJSON_AddNumberToObject(timings_c, "cache_n", start_pos);
+        cJSON_AddNumberToObject(timings_c, "prompt_n", n_prompt - start_pos);
+        cJSON_AddNumberToObject(timings_c, "prompt_ms", t_prefill_ms);
+        cJSON_AddNumberToObject(timings_c, "prompt_per_token_ms", (n_prompt - start_pos) > 0 ? t_prefill_ms / (n_prompt - start_pos) : 0);
+        cJSON_AddNumberToObject(timings_c, "prompt_per_second", (n_prompt - start_pos) > 0 ? (n_prompt - start_pos) / (t_prefill_ms / 1000.0) : 0);
+        cJSON_AddNumberToObject(timings_c, "predicted_n", gen_count);
+        cJSON_AddNumberToObject(timings_c, "predicted_ms", gen_ms);
+        cJSON_AddNumberToObject(timings_c, "predicted_per_token_ms", gen_count > 0 ? gen_ms / gen_count : 0);
+        cJSON_AddNumberToObject(timings_c, "predicted_per_second", gen_count > 0 ? gen_count / (gen_ms / 1000.0) : 0);
+        cJSON_AddItemToObject(final, "timings", timings_c);
         sse_send(sock, cJSON_PrintUnformatted(final), NULL);
         free(cJSON_PrintUnformatted(final));
         cJSON_Delete(final);
         send_chunked(sock, "", 0);
 
-        fprintf(stderr, "\n[server] /completion: %d prompt tokens, %d generated in %.0fms (%.1f tok/s)\n",
-                n_prompt, gen_count, gen_ms, gen_ms > 0 ? gen_count / (gen_ms / 1000.0) : 0);
+        fprintf(stderr, "\n[server] /completion: prompt %d new+%d cached in %.0fms, gen %d in %.0fms (%.1f tok/s)\n",
+                n_prompt - start_pos, start_pos, t_prefill_ms,
+                gen_count, gen_ms, gen_count > 0 ? gen_count / (gen_ms / 1000.0) : 0);
     } else {
         /* Non-streaming: collect all tokens, build one big response */
         int gen_start_ns = start_pos;
@@ -1218,9 +1340,15 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
 
         /* Timings */
         cJSON *timings = cJSON_CreateObject();
-        cJSON_AddNumberToObject(timings, "predicted_per_second",
-            gen_ms > 0 ? gen_count / (gen_ms / 1000.0) : 0.0);
+        cJSON_AddNumberToObject(timings, "cache_n", start_pos);
+        cJSON_AddNumberToObject(timings, "prompt_n", n_prompt - start_pos);
+        cJSON_AddNumberToObject(timings, "prompt_ms", gen_ms);
+        cJSON_AddNumberToObject(timings, "prompt_per_token_ms", (n_prompt - start_pos) > 0 ? gen_ms / (n_prompt - start_pos) : 0);
+        cJSON_AddNumberToObject(timings, "prompt_per_second", (n_prompt - start_pos) > 0 ? (n_prompt - start_pos) / (gen_ms / 1000.0) : 0);
+        cJSON_AddNumberToObject(timings, "predicted_n", gen_count);
         cJSON_AddNumberToObject(timings, "predicted_ms", gen_ms);
+        cJSON_AddNumberToObject(timings, "predicted_per_token_ms", gen_count > 0 ? gen_ms / gen_count : 0);
+        cJSON_AddNumberToObject(timings, "predicted_per_second", gen_count > 0 ? gen_count / (gen_ms / 1000.0) : 0);
         cJSON_AddItemToObject(resp, "timings", timings);
 
         char *json = cJSON_PrintUnformatted(resp);
@@ -1228,9 +1356,10 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         free(json);
         cJSON_Delete(resp);
 
-        srv.kv_pos = n_prompt; /* prompt tokens 0..n_prompt-1 are in KV cache */
-        fprintf(stderr, "\n[server] /completion: cached=%d/%d prompt, %d generated in %.0fms (%.1f tok/s)\n",
-                start_pos, n_prompt, gen_count, gen_ms, gen_ms > 0 ? gen_count / (gen_ms / 1000.0) : 0);
+        srv.kv_pos = n_prompt;
+        fprintf(stderr, "\n[server] /completion: prompt %d new+%d cached in %.0fms, gen %d in %.0fms (%.1f tok/s)\n",
+                n_prompt - start_pos, start_pos, gen_ms,
+                gen_count, gen_ms, gen_count > 0 ? gen_count / (gen_ms / 1000.0) : 0);
 
         free(generated);
         free(gen_token_ids);
