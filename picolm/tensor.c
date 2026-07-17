@@ -306,6 +306,38 @@ void tensor_threadpool_free(void) {
 #endif
 }
 
+/* Shared safe dispatch helpers (see tensor_parallel_for's comment for the
+ * full explanation of why partial-slot dispatch is unsafe): every call
+ * that wakes the pool must refresh every slot in [0, n_threads), because
+ * pool_wake() broadcasts to every worker thread that was ever spawned,
+ * not just the ones a given call needs.
+ *
+ * pool_assign_rows() splits `d` output rows across `count` task slots
+ * starting at `base`, writing only .start/.end -- callers fill the other
+ * fields (out/x/W/qtype/...) for slots [base, base+active) afterwards.
+ * pool_clear_unused() gives the remaining slots an empty range so they
+ * safely no-op instead of running a stale task from a previous call. */
+static int pool_assign_rows(int base, int count, int d) {
+    if (count <= 0) return 0;
+    int active = count > d ? d : count;
+    if (active < 1) active = 1;
+    int rows_per = d / active, extra = d % active, tstart = 0;
+    for (int t = 0; t < active; t++) {
+        int tend = tstart + rows_per + (t < extra ? 1 : 0);
+        pool_tasks[base + t].start = tstart;
+        pool_tasks[base + t].end = tend;
+        tstart = tend;
+    }
+    return active;
+}
+
+static void pool_clear_unused(int from, int to) {
+    for (int t = from; t < to; t++) {
+        pool_tasks[t].start = 0;
+        pool_tasks[t].end = 0;
+    }
+}
+
 void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t qtype) {
     size_t row_bytes = gguf_type_row_size(qtype, n);
     const char *wptr = (const char *)W;
@@ -342,17 +374,15 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
             /* Threaded dispatch: main thread does task 0, workers do tasks 1..nt-1 */
             {
                 int nt = n_threads;
-                if (nt > d) nt = d;
-                int rows_per = d / nt, extra = d % nt, tstart = 0;
-                for (int t = 0; t < nt; t++) {
-                    int tend = tstart + rows_per + (t < extra ? 1 : 0);
+                int active = pool_assign_rows(0, nt, d);
+                for (int t = 0; t < active; t++) {
                     pool_tasks[t].out = out; pool_tasks[t].x = (const float *)qx;
                     pool_tasks[t].x_d = qx_d; pool_tasks[t].W = wptr;
                     pool_tasks[t].row_bytes = row_bytes; pool_tasks[t].n = n;
                     pool_tasks[t].qtype = GGUF_TYPE_Q8_0;
-                    pool_tasks[t].n_batch = 0; pool_tasks[t].start = tstart; pool_tasks[t].end = tend;
-                    tstart = tend;
+                    pool_tasks[t].n_batch = 0;
                 }
+                pool_clear_unused(active, nt);
                 pool_init(nt);
                 pool_wake(nt);
                 matmul_worker_f(&pool_tasks[0]);
@@ -400,19 +430,17 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
             }
 
             int nt = n_threads;
-            if (nt > d) nt = d;
 
             {
-                int rows_per = d / nt, extra = d % nt, tstart = 0;
-                for (int t = 0; t < nt; t++) {
-                    int tend = tstart + rows_per + (t < extra ? 1 : 0);
+                int active = pool_assign_rows(0, nt, d);
+                for (int t = 0; t < active; t++) {
                     pool_tasks[t].out = out; pool_tasks[t].x = (const float *)qx;
                     pool_tasks[t].x_d = NULL; pool_tasks[t].W = wptr;
                     pool_tasks[t].row_bytes = row_bytes; pool_tasks[t].n = n;
                     pool_tasks[t].qtype = GGUF_TYPE_Q4_0;
-                    pool_tasks[t].n_batch = 0; pool_tasks[t].start = tstart; pool_tasks[t].end = tend;
-                    tstart = tend;
+                    pool_tasks[t].n_batch = 0;
                 }
+                pool_clear_unused(active, nt);
                 pool_init(nt);
                 pool_wake(nt);
                 matmul_worker_f(&pool_tasks[0]);
@@ -455,18 +483,16 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
             }
 
             int nt = n_threads;
-            if (nt > d) nt = d;
             {
-                int rows_per = d / nt, extra = d % nt, tstart = 0;
-                for (int t = 0; t < nt; t++) {
-                    int tend = tstart + rows_per + (t < extra ? 1 : 0);
+                int active = pool_assign_rows(0, nt, d);
+                for (int t = 0; t < active; t++) {
                     pool_tasks[t].out = out; pool_tasks[t].x = (const float *)qx;
                     pool_tasks[t].x_d = NULL; pool_tasks[t].W = wptr;
                     pool_tasks[t].row_bytes = row_bytes; pool_tasks[t].n = n;
                     pool_tasks[t].qtype = GGUF_TYPE_Q4_0_4_4;
-                    pool_tasks[t].n_batch = 0; pool_tasks[t].start = tstart; pool_tasks[t].end = tend;
-                    tstart = tend;
+                    pool_tasks[t].n_batch = 0;
                 }
+                pool_clear_unused(active, nt);
                 pool_init(nt);
                 pool_wake(nt);
                 matmul_worker_f(&pool_tasks[0]);
@@ -501,19 +527,17 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
             }
 
             int nt = n_threads;
-            if (nt > d) nt = d;
 
             {
-                int rows_per = d / nt, extra = d % nt, tstart = 0;
-                for (int t = 0; t < nt; t++) {
-                    int tend = tstart + rows_per + (t < extra ? 1 : 0);
+                int active = pool_assign_rows(0, nt, d);
+                for (int t = 0; t < active; t++) {
                     pool_tasks[t].out = out; pool_tasks[t].x = (const float *)qx;
                     pool_tasks[t].x_d = NULL; pool_tasks[t].W = wptr;
                     pool_tasks[t].row_bytes = row_bytes; pool_tasks[t].n = n;
                     pool_tasks[t].qtype = GGUF_TYPE_Q4_0_8_8;
-                    pool_tasks[t].n_batch = 0; pool_tasks[t].start = tstart; pool_tasks[t].end = tend;
-                    tstart = tend;
+                    pool_tasks[t].n_batch = 0;
                 }
+                pool_clear_unused(active, nt);
                 pool_init(nt);
                 pool_wake(nt);
                 matmul_worker_f(&pool_tasks[0]);
@@ -550,19 +574,17 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
             }
 
             int nt = n_threads;
-            if (nt > d) nt = d;
 
             {
-                int rows_per = d / nt, extra = d % nt, tstart = 0;
-                for (int t = 0; t < nt; t++) {
-                    int tend = tstart + rows_per + (t < extra ? 1 : 0);
+                int active = pool_assign_rows(0, nt, d);
+                for (int t = 0; t < active; t++) {
                     pool_tasks[t].out = out; pool_tasks[t].x = (const float *)qx;
                     pool_tasks[t].x_d = NULL; pool_tasks[t].W = wptr;
                     pool_tasks[t].row_bytes = row_bytes; pool_tasks[t].n = n;
                     pool_tasks[t].qtype = GGUF_TYPE_Q4_K;
-                    pool_tasks[t].n_batch = 0; pool_tasks[t].start = tstart; pool_tasks[t].end = tend;
-                    tstart = tend;
+                    pool_tasks[t].n_batch = 0;
                 }
+                pool_clear_unused(active, nt);
                 pool_init(nt);
                 pool_wake(nt);
                 matmul_worker_f(&pool_tasks[0]);
@@ -584,19 +606,17 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
     }
 
     int nt = n_threads;
-    if (nt > d) nt = d;
 
     {
-        int rows_per = d / nt, extra = d % nt, tstart = 0;
-        for (int t = 0; t < nt; t++) {
-            int tend = tstart + rows_per + (t < extra ? 1 : 0);
+        int active = pool_assign_rows(0, nt, d);
+        for (int t = 0; t < active; t++) {
             pool_tasks[t].out = out; pool_tasks[t].x = x;
             pool_tasks[t].x_d = NULL; pool_tasks[t].W = wptr;
             pool_tasks[t].row_bytes = row_bytes; pool_tasks[t].n = n;
             pool_tasks[t].qtype = qtype;
-            pool_tasks[t].n_batch = 0; pool_tasks[t].start = tstart; pool_tasks[t].end = tend;
-            tstart = tend;
+            pool_tasks[t].n_batch = 0;
         }
+        pool_clear_unused(active, nt);
         pool_init(nt);
         pool_wake(nt);
         matmul_worker_f(&pool_tasks[0]);
@@ -632,22 +652,18 @@ void matmul_batch(float *out, const float *x, int n_batch,
 
     /* Threaded: dispatch over output rows d using shared pool */
     int nt = n_threads;
-    if (nt > d) nt = d;
-    int rows_per = d / nt, extra = d % nt, tstart = 0;
-    for (int t = 0; t < nt; t++) {
-        int tend = tstart + rows_per + (t < extra ? 1 : 0);
+    int active = pool_assign_rows(0, nt, d);
+    for (int t = 0; t < active; t++) {
         pool_tasks[t].out = out;
         pool_tasks[t].x = x;
         pool_tasks[t].W = wptr;
         pool_tasks[t].row_bytes = row_bytes;
         pool_tasks[t].n = n;
         pool_tasks[t].d = d;
-        pool_tasks[t].start = tstart;
-        pool_tasks[t].end = tend;
         pool_tasks[t].qtype = qtype;
         pool_tasks[t].n_batch = n_batch;
-        tstart = tend;
     }
+    pool_clear_unused(active, nt);
     pool_init(nt);
     pool_wake(nt);
     matmul_worker_f(&pool_tasks[0]);
@@ -684,42 +700,35 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
 
     /* Threaded: run both matmuls with half threads each */
     int nt = n_threads;
-    if (nt > d) nt = d;
-    int nt1 = (nt + 1) / 2, nt2 = nt - nt1;
+    int active_total = nt > d ? d : nt;
+    int nt1 = (active_total + 1) / 2, nt2 = active_total - nt1;
 
     /* Set up tasks for W1 -> out1 */
-    int rows_per = d / nt1, extra = d % nt1, tstart = 0;
-    for (int t = 0; t < nt1; t++) {
-        int tend = tstart + rows_per + (t < extra ? 1 : 0);
+    int a1 = pool_assign_rows(0, nt1, d);
+    for (int t = 0; t < a1; t++) {
         pool_tasks[t].out = out1;
         pool_tasks[t].x = x;
         pool_tasks[t].W = (const char *)W1;
         pool_tasks[t].row_bytes = gguf_type_row_size(qtype1, n);
         pool_tasks[t].n = n;
         pool_tasks[t].d = d;
-        pool_tasks[t].start = tstart;
-        pool_tasks[t].end = tend;
         pool_tasks[t].qtype = qtype1;
         pool_tasks[t].n_batch = n_batch;
-        tstart = tend;
     }
 
     /* Set up tasks for W2 -> out2 */
-    rows_per = d / nt2, extra = d % nt2, tstart = 0;
-    for (int t = 0; t < nt2; t++) {
-        int tend = tstart + rows_per + (t < extra ? 1 : 0);
+    int a2 = pool_assign_rows(nt1, nt2, d);
+    for (int t = 0; t < a2; t++) {
         pool_tasks[nt1 + t].out = out2;
         pool_tasks[nt1 + t].x = x;
         pool_tasks[nt1 + t].W = (const char *)W2;
         pool_tasks[nt1 + t].row_bytes = gguf_type_row_size(qtype2, n);
         pool_tasks[nt1 + t].n = n;
         pool_tasks[nt1 + t].d = d;
-        pool_tasks[nt1 + t].start = tstart;
-        pool_tasks[nt1 + t].end = tend;
         pool_tasks[nt1 + t].qtype = qtype2;
         pool_tasks[nt1 + t].n_batch = n_batch;
-        tstart = tend;
     }
+    pool_clear_unused(nt1 + a2, nt);
 
     pool_init(nt);
     pool_wake(nt);
@@ -1128,26 +1137,53 @@ void vec_add(float *a, const float *b, int size) {
     for (int i = 0; i < size; i++) a[i] += b[i];
 #endif
 }
-/* tensor_parallel_for: dispatches [0, count) across the thread pool */
+/* tensor_parallel_for: dispatches [0, count) across the thread pool.
+ *
+ * IMPORTANT: pool_wake() broadcasts unconditionally to every worker thread
+ * that was ever spawned (pool_nworkers, fixed at startup by
+ * tensor_threadpool_init()), not just the first `nt` of them. If this
+ * function only filled generic_tasks[0..nt-1] and nt < pool_nworkers+1
+ * (which happens any time count < n_threads -- e.g. attention with
+ * n_heads=24 on a 32-thread build), the remaining worker threads still
+ * wake up and execute whatever *stale* generic_tasks[] entry is sitting
+ * in their slot from a previous, unrelated call -- often a dangling
+ * pointer to a stack frame that has already returned. Worse, pool_wait()
+ * only waits for `nt-1` completions total, counted across *all* workers
+ * that happen to finish first; if a stale-slot worker finishes its
+ * garbage task quickly, it can satisfy that count before a real worker
+ * on a valid slot has finished writing its output -- a silent data race,
+ * not just wasted CPU. This is the same hazard the matmul dispatchers in
+ * this file have (they also only fill [0, nt)); it matters more here
+ * because n_heads is usually smaller than n_threads on multi-core boxes,
+ * so this path hits the stale case on every single token, whereas most
+ * matmuls have output dims larger than the thread count and rarely do.
+ *
+ * Fix: always refresh every slot in [0, n_threads), giving unused slots
+ * an empty (start == end) range so they safely no-op instead of running
+ * leftover data. */
 void tensor_parallel_for(int count, void (*fn)(int idx, void *ctx), void *ctx) {
-    int nt = n_threads;
-    if (nt <= 1 || count < nt * 4) {
+    if (n_threads <= 1 || count < 2) {
         for (int i = 0; i < count; i++) fn(i, ctx);
         return;
     }
-    int nthreads = nt > count ? count : nt;
-    int chunk = (count + nthreads - 1) / nthreads;
-    for (int t = 0; t < nthreads; t++) {
+    int nt = n_threads;
+    pool_init(nt);
+    int active = nt > count ? count : nt;
+    int chunk = (count + active - 1) / active;
+    for (int t = 0; t < nt; t++) {
+        int tstart = t * chunk;
+        int tend = tstart + chunk;
+        if (tstart > count) tstart = count;
+        if (tend > count) tend = count;
         generic_tasks[t].fn = fn;
         generic_tasks[t].ctx = ctx;
-        generic_tasks[t].start = t * chunk;
-        generic_tasks[t].end = (t + 1) * chunk;
-        if (generic_tasks[t].end > count) generic_tasks[t].end = count;
+        generic_tasks[t].start = tstart;
+        generic_tasks[t].end = tend;
     }
     pool_mode = 1;
-    pool_wake(nthreads);
+    pool_wake(nt);
     /* main thread does task 0 */
     generic_worker_f(&generic_tasks[0]);
-    pool_wait(nthreads);
+    pool_wait(nt);
     pool_mode = 0;
 }

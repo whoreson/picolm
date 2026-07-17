@@ -1145,7 +1145,91 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
                         layer_weights_t *lw, int il, int pos);
 
 /* Threaded attention: per-head online softmax K.dot.Q + weighted V.
- * Each head is fully independent -> parallelized via tensor_parallel_for. */
+ * Each head is fully independent -> parallelized via tensor_parallel_for.
+ *
+ * attn_core() is the shared math: given one query vector, one KV head,
+ * and a causal limit `pos`, it scans t=0..pos in the KV cache and writes
+ * the attention output for that (token, head) into xbh. Both the decode
+ * path (model_forward, one token at a time) and the prefill path
+ * (model_forward_prefill, many tokens at once) call this same core, so
+ * there is exactly one implementation of the quant-aware SIMD attention
+ * math to maintain and both paths get the same optimizations for free. */
+static __attribute__((always_inline)) void attn_core(
+        float *xbh, const float *qh, int kv_h, int pos,
+        const uint8_t *kcache, const uint8_t *vcache,
+        int n_kv_heads, gguf_type_t kv_type_k, gguf_type_t kv_type_v,
+        size_t kv_row_size_k, size_t kv_row_size_v, int head_dim) {
+    float max_score = -1e30f, sum_exp = 0.0f;
+    float acc[256];
+    memset(acc, 0, (size_t)head_dim * sizeof(float));
+
+    for (int t = 0; t <= pos; t++) {
+        const uint8_t *kt = kcache + (size_t)t * n_kv_heads * kv_row_size_k + kv_h * kv_row_size_k;
+        float score;
+        if (kv_type_k == KV_CACHE_Q8_0) score = vec_dot_q8_0_f32(kt, qh, head_dim);
+        else if (kv_type_k == KV_CACHE_Q4_0) score = vec_dot_q4_0_f32(kt, qh, head_dim);
+        else score = vec_dot_f16_f32(kt, qh, head_dim);
+        score /= sqrtf((float)head_dim);
+        const uint8_t *vt = vcache + (size_t)t * n_kv_heads * kv_row_size_v + kv_h * kv_row_size_v;
+        if (score > max_score) {
+            float correction = expf(max_score - score);
+            sum_exp = sum_exp * correction + 1.0f;
+            if (kv_type_v == KV_CACHE_Q8_0) fma_scale_q8_0_f32(acc, correction, vt, head_dim);
+            else if (kv_type_v == KV_CACHE_Q4_0) fma_scale_q4_0_f32(acc, correction, vt, head_dim);
+            else {
+                const uint16_t *vt16 = (const uint16_t *)vt;
+#ifdef PICOLM_AVX512
+                { __m512 cv = _mm512_set1_ps(correction); int d = 0;
+                  for (; d + 15 < head_dim; d += 16) { __m512 vf = fp16x16_to_fp32_inline(vt16 + d); __m512 af = _mm512_loadu_ps(acc + d); _mm512_storeu_ps(acc + d, _mm512_fmadd_ps(af, cv, vf)); }
+                  for (; d < head_dim; d++) acc[d] = acc[d] * correction + fp16_to_fp32(vt16[d]); }
+#elif defined(PICOLM_AVX)
+                { __m256 cv = _mm256_set1_ps(correction); int d = 0;
+                  for (; d + 7 < head_dim; d += 8) { __m256 vf = fp16x8_to_fp32_inline(vt16 + d); __m256 af = _mm256_loadu_ps(acc + d); _mm256_storeu_ps(acc + d, _mm256_add_ps(_mm256_mul_ps(af, cv), vf)); }
+                  for (; d < head_dim; d++) acc[d] = acc[d] * correction + fp16_to_fp32(vt16[d]); }
+#else
+                for (int d = 0; d < head_dim; d++) acc[d] = acc[d] * correction + fp16_to_fp32(vt16[d]);
+#endif
+            }
+            max_score = score;
+        } else {
+            float w = expf(score - max_score);
+            sum_exp += w;
+            if (kv_type_v == KV_CACHE_Q8_0) scale_add_q8_0_f32(acc, w, vt, head_dim);
+            else if (kv_type_v == KV_CACHE_Q4_0) scale_add_q4_0_f32(acc, w, vt, head_dim);
+            else {
+                const uint16_t *vt16 = (const uint16_t *)vt;
+#ifdef PICOLM_AVX512
+                { __m512 wv = _mm512_set1_ps(w); int d = 0;
+                  for (; d + 15 < head_dim; d += 16) { __m512 vf = fp16x16_to_fp32_inline(vt16 + d); __m512 af = _mm512_loadu_ps(acc + d); _mm512_storeu_ps(acc + d, _mm512_fmadd_ps(vf, wv, af)); }
+                  for (; d < head_dim; d++) acc[d] += w * fp16_to_fp32(vt16[d]); }
+#elif defined(PICOLM_AVX)
+                { __m256 wv = _mm256_set1_ps(w); int d = 0;
+                  for (; d + 7 < head_dim; d += 8) { __m256 vf = fp16x8_to_fp32_inline(vt16 + d); __m256 af = _mm256_loadu_ps(acc + d); _mm256_storeu_ps(acc + d, _mm256_add_ps(_mm256_mul_ps(vf, wv), af)); }
+                  for (; d < head_dim; d++) acc[d] += w * fp16_to_fp32(vt16[d]); }
+#else
+                for (int d = 0; d < head_dim; d++) acc[d] += w * fp16_to_fp32(vt16[d]);
+#endif
+            }
+        }
+    }
+    float inv_sum = 1.0f / sum_exp;
+#ifdef PICOLM_AVX512
+    { __m512 inv = _mm512_set1_ps(inv_sum); int d = 0;
+      for (; d + 15 < head_dim; d += 16) { __m512 af = _mm512_loadu_ps(acc + d); _mm512_storeu_ps(xbh + d, _mm512_mul_ps(af, inv)); }
+      for (; d < head_dim; d++) xbh[d] = acc[d] * inv_sum; }
+#elif defined(PICOLM_AVX)
+    { __m256 inv = _mm256_set1_ps(inv_sum); int d = 0;
+      for (; d + 7 < head_dim; d += 8) { __m256 af = _mm256_loadu_ps(acc + d); _mm256_storeu_ps(xbh + d, _mm256_mul_ps(af, inv)); }
+      for (; d < head_dim; d++) xbh[d] = acc[d] * inv_sum; }
+#elif defined(PICOLM_SSE2)
+    { __m128 inv = _mm_set1_ps(inv_sum); int d = 0;
+      for (; d + 3 < head_dim; d += 4) { __m128 af = _mm_loadu_ps(acc + d); _mm_storeu_ps(xbh + d, _mm_mul_ps(af, inv)); }
+      for (; d < head_dim; d++) xbh[d] = acc[d] * inv_sum; }
+#else
+    for (int d = 0; d < head_dim; d++) xbh[d] = acc[d] * inv_sum;
+#endif
+}
+
 typedef struct {
     int n_heads, n_kv_heads, kv_mul, head_dim, pos;
     gguf_type_t kv_type_k, kv_type_v;
@@ -1162,75 +1246,9 @@ static __attribute__((always_inline)) void attention_head(int head_idx, void *ct
     float *qh = ctx->q + h * ctx->head_dim;
     int kv_h = h / ctx->kv_mul;
     float *xbh = ctx->xb + h * ctx->head_dim;
-    float max_score = -1e30f, sum_exp = 0.0f;
-    float acc[256];
-    memset(acc, 0, (size_t)ctx->head_dim * sizeof(float));
-
-    for (int t = 0; t <= ctx->pos; t++) {
-        const uint8_t *kt = ctx->kcache + (size_t)t * ctx->n_kv_heads * ctx->kv_row_size_k + kv_h * ctx->kv_row_size_k;
-        float score;
-        if (ctx->kv_type_k == KV_CACHE_Q8_0) score = vec_dot_q8_0_f32(kt, qh, ctx->head_dim);
-        else if (ctx->kv_type_k == KV_CACHE_Q4_0) score = vec_dot_q4_0_f32(kt, qh, ctx->head_dim);
-        else score = vec_dot_f16_f32(kt, qh, ctx->head_dim);
-        score /= sqrtf((float)ctx->head_dim);
-        const uint8_t *vt = ctx->vcache + (size_t)t * ctx->n_kv_heads * ctx->kv_row_size_v + kv_h * ctx->kv_row_size_v;
-        if (score > max_score) {
-            float correction = expf(max_score - score);
-            sum_exp = sum_exp * correction + 1.0f;
-            if (ctx->kv_type_v == KV_CACHE_Q8_0) fma_scale_q8_0_f32(acc, correction, vt, ctx->head_dim);
-            else if (ctx->kv_type_v == KV_CACHE_Q4_0) fma_scale_q4_0_f32(acc, correction, vt, ctx->head_dim);
-            else {
-                const uint16_t *vt16 = (const uint16_t *)vt;
-#ifdef PICOLM_AVX512
-                { __m512 cv = _mm512_set1_ps(correction); int d = 0;
-                  for (; d + 15 < ctx->head_dim; d += 16) { __m512 vf = fp16x16_to_fp32_inline(vt16 + d); __m512 af = _mm512_loadu_ps(acc + d); _mm512_storeu_ps(acc + d, _mm512_fmadd_ps(af, cv, vf)); }
-                  for (; d < ctx->head_dim; d++) acc[d] = acc[d] * correction + fp16_to_fp32(vt16[d]); }
-#elif defined(PICOLM_AVX)
-                { __m256 cv = _mm256_set1_ps(correction); int d = 0;
-                  for (; d + 7 < ctx->head_dim; d += 8) { __m256 vf = fp16x8_to_fp32_inline(vt16 + d); __m256 af = _mm256_loadu_ps(acc + d); _mm256_storeu_ps(acc + d, _mm256_add_ps(_mm256_mul_ps(af, cv), vf)); }
-                  for (; d < ctx->head_dim; d++) acc[d] = acc[d] * correction + fp16_to_fp32(vt16[d]); }
-#else
-                for (int d = 0; d < ctx->head_dim; d++) acc[d] = acc[d] * correction + fp16_to_fp32(vt16[d]);
-#endif
-            }
-            max_score = score;
-        } else {
-            float w = expf(score - max_score);
-            sum_exp += w;
-            if (ctx->kv_type_v == KV_CACHE_Q8_0) scale_add_q8_0_f32(acc, w, vt, ctx->head_dim);
-            else if (ctx->kv_type_v == KV_CACHE_Q4_0) scale_add_q4_0_f32(acc, w, vt, ctx->head_dim);
-            else {
-                const uint16_t *vt16 = (const uint16_t *)vt;
-#ifdef PICOLM_AVX512
-                { __m512 wv = _mm512_set1_ps(w); int d = 0;
-                  for (; d + 15 < ctx->head_dim; d += 16) { __m512 vf = fp16x16_to_fp32_inline(vt16 + d); __m512 af = _mm512_loadu_ps(acc + d); _mm512_storeu_ps(acc + d, _mm512_fmadd_ps(vf, wv, af)); }
-                  for (; d < ctx->head_dim; d++) acc[d] += w * fp16_to_fp32(vt16[d]); }
-#elif defined(PICOLM_AVX)
-                { __m256 wv = _mm256_set1_ps(w); int d = 0;
-                  for (; d + 7 < ctx->head_dim; d += 8) { __m256 vf = fp16x8_to_fp32_inline(vt16 + d); __m256 af = _mm256_loadu_ps(acc + d); _mm256_storeu_ps(acc + d, _mm256_add_ps(_mm256_mul_ps(vf, wv), af)); }
-                  for (; d < ctx->head_dim; d++) acc[d] += w * fp16_to_fp32(vt16[d]); }
-#else
-                for (int d = 0; d < ctx->head_dim; d++) acc[d] += w * fp16_to_fp32(vt16[d]);
-#endif
-            }
-        }
-    }
-    float inv_sum = 1.0f / sum_exp;
-#ifdef PICOLM_AVX512
-    { __m512 inv = _mm512_set1_ps(inv_sum); int d = 0;
-      for (; d + 15 < ctx->head_dim; d += 16) { __m512 af = _mm512_loadu_ps(acc + d); _mm512_storeu_ps(xbh + d, _mm512_mul_ps(af, inv)); }
-      for (; d < ctx->head_dim; d++) xbh[d] = acc[d] * inv_sum; }
-#elif defined(PICOLM_AVX)
-    { __m256 inv = _mm256_set1_ps(inv_sum); int d = 0;
-      for (; d + 7 < ctx->head_dim; d += 8) { __m256 af = _mm256_loadu_ps(acc + d); _mm256_storeu_ps(xbh + d, _mm256_mul_ps(af, inv)); }
-      for (; d < ctx->head_dim; d++) xbh[d] = acc[d] * inv_sum; }
-#elif defined(PICOLM_SSE2)
-    { __m128 inv = _mm_set1_ps(inv_sum); int d = 0;
-      for (; d + 3 < ctx->head_dim; d += 4) { __m128 af = _mm_loadu_ps(acc + d); _mm_storeu_ps(xbh + d, _mm_mul_ps(af, inv)); }
-      for (; d < ctx->head_dim; d++) xbh[d] = acc[d] * inv_sum; }
-#else
-    for (int d = 0; d < ctx->head_dim; d++) xbh[d] = acc[d] * inv_sum;
-#endif
+    attn_core(xbh, qh, kv_h, ctx->pos, ctx->kcache, ctx->vcache,
+              ctx->n_kv_heads, ctx->kv_type_k, ctx->kv_type_v,
+              ctx->kv_row_size_k, ctx->kv_row_size_v, ctx->head_dim);
 }
 
 float *model_forward(model_t *m, int token, int pos) {
@@ -2233,151 +2251,56 @@ int model_unlock_layers(model_t *m) {
  * KV cache is in F16 format, interleaved by [pos][kv_head][head_dim].
  * ================================================================ */
 
+/* Prefill attention: same math as decode's attn_core, applied to every
+ * (token, head) pair in the batch. Flattened into one index space so a
+ * single tensor_parallel_for() call threads the whole layer's attention
+ * at once (previously this was a fresh, unthreaded, F32-dequanting
+ * reimplementation that also scored the full [0, n_kv) range before
+ * masking -- wasting ~2x the dot products vs. a causal-limited loop, and
+ * allocating/freeing O(n_kv * n_kv_heads * head_dim) scratch per layer). */
+typedef struct {
+    int n_heads, n_kv_heads, kv_mul, head_dim, start_pos;
+    gguf_type_t kv_type_k, kv_type_v;
+    size_t kv_row_size_k, kv_row_size_v;
+    const uint8_t *kcache, *vcache;
+    const float *q_batch;   /* [n_tokens][n_heads * head_dim] */
+    float *xb_batch;        /* [n_tokens][xb_stride] */
+    int xb_stride;
+} prefill_attn_ctx_t;
+
+static void prefill_attn_task(int flat_idx, void *ctx_ptr) {
+    prefill_attn_ctx_t *ctx = (prefill_attn_ctx_t *)ctx_ptr;
+    int bi = flat_idx / ctx->n_heads;
+    int h  = flat_idx % ctx->n_heads;
+    int pos = ctx->start_pos + bi;
+    int kv_h = h / ctx->kv_mul;
+    const float *qh = ctx->q_batch + (size_t)bi * ctx->n_heads * ctx->head_dim + h * ctx->head_dim;
+    float *xbh = ctx->xb_batch + (size_t)bi * ctx->xb_stride + h * ctx->head_dim;
+    attn_core(xbh, qh, kv_h, pos, ctx->kcache, ctx->vcache,
+              ctx->n_kv_heads, ctx->kv_type_k, ctx->kv_type_v,
+              ctx->kv_row_size_k, ctx->kv_row_size_v, ctx->head_dim);
+}
+
 static void batch_attention_layer(
-        float *xb_batch,       /* [n_tokens][max_dim] - attention output accumulated here (F32) */
-        const float *q_batch,  /* [n_tokens][n_heads * head_dim] - queries (F32) */
-        const uint8_t *kcache, /* KV cache keys (layer-level base pointer) */
-        const uint8_t *vcache, /* KV cache values (layer-level base pointer) */
+        float *xb_batch, const float *q_batch,
+        const uint8_t *kcache, const uint8_t *vcache,
         int n_tokens, int start_pos,
         int n_heads, int n_kv_heads, int head_dim,
-        int xb_stride,         /* stride of xb_batch in floats (= max_dim) */
-        gguf_type_t kv_type,
-        size_t kv_row_size)
+        int xb_stride,
+        gguf_type_t kv_type_k, gguf_type_t kv_type_v,
+        size_t kv_row_size_k, size_t kv_row_size_v)
 {
-    int n_kv = start_pos + n_tokens; /* total cached positions (including new ones) */
-    int kv_mul = n_heads / n_kv_heads;
-    float inv_sqrt_hd = 1.0f / sqrtf((float)head_dim);
-
-    /* Workspace: contiguous F32 copies of K and V cache [n_kv][n_kv_heads][head_dim] */
-    size_t kv_f32_sz = (size_t)n_kv * n_kv_heads * head_dim * sizeof(float);
-    float *k_f32 = (float *)malloc(kv_f32_sz);
-    float *v_f32 = (float *)malloc(kv_f32_sz);
-    if (!k_f32 || !v_f32) { free(k_f32); free(v_f32); fprintf(stderr, "OOM: batch attn KV\n"); exit(1); }
-
-    /* Convert KV cache from F16 to F32, contiguous layout [n_kv_heads][n_kv][head_dim] */
-    for (int hkv = 0; hkv < n_kv_heads; hkv++) {
-        for (int t = 0; t < n_kv; t++) {
-            const uint8_t *kt = kcache + (size_t)t * n_kv_heads * kv_row_size + hkv * kv_row_size;
-            float *kf = k_f32 + (size_t)hkv * n_kv * head_dim + t * head_dim;
-            const uint8_t *vt = vcache + (size_t)t * n_kv_heads * kv_row_size + hkv * kv_row_size;
-            float *vf = v_f32 + (size_t)hkv * n_kv * head_dim + t * head_dim;
-            if (kv_type == KV_CACHE_Q8_0) {
-                const uint8_t *qb = kt;
-                float s = 1.0f / (127.0f / (float)*qb); qb++;
-                for (int d2 = 0; d2 < head_dim; d2++) kf[d2] = (float)qb[d2] * s;
-                qb = vt;
-                s = 1.0f / (127.0f / (float)*qb); qb++;
-                for (int d2 = 0; d2 < head_dim; d2++) vf[d2] = (float)qb[d2] * s;
-            } else if (kv_type == KV_CACHE_Q4_0) {
-                const uint8_t *qb = kt;
-                float m = fp16_to_fp32(*(const uint16_t *)qb); qb += 2;
-                for (int d2 = 0; d2 < head_dim; d2 += 2) {
-                    kf[d2] = (float)(qb[0] & 0x0F) * m;
-                    kf[d2+1] = (float)(qb[0] >> 4) * m; qb++;
-                }
-                qb = vt;
-                m = fp16_to_fp32(*(const uint16_t *)qb); qb += 2;
-                for (int d2 = 0; d2 < head_dim; d2 += 2) {
-                    vf[d2] = (float)(qb[0] & 0x0F) * m;
-                    vf[d2+1] = (float)(qb[0] >> 4) * m; qb++;
-                }
-            } else { /* F16 */
-                const uint16_t *fp16k = (const uint16_t *)kt;
-                const uint16_t *fp16v = (const uint16_t *)vt;
-                for (int d2 = 0; d2 < head_dim; d2++) {
-                    kf[d2] = fp16_to_fp32(fp16k[d2]);
-                    vf[d2] = fp16_to_fp32(fp16v[d2]);
-                }
-                            }
-        }
-    }
-
-    /* Score buffer: [n_heads][n_tokens][n_kv] */
-    size_t score_sz = (size_t)n_heads * n_tokens * n_kv * sizeof(float);
-    float *scores = (float *)malloc(score_sz);
-    if (!scores) { free(k_f32); free(v_f32); fprintf(stderr, "OOM: scores\n"); exit(1); }
-
-    /* Per-head attention */
-    for (int h = 0; h < n_heads; h++) {
-        int kv_h = h / kv_mul;
-        float *scores_h = scores + (size_t)h * n_tokens * n_kv;
-        const float *k_h = k_f32 + kv_h * n_kv * head_dim; /* [n_kv][head_dim] */
-        const float *v_h = v_f32 + kv_h * n_kv * head_dim; /* [n_kv][head_dim] */
-
-        /* Step 1: scores[bi][t] = Q_h[bi] @ K_h[t] for all bi, t */
-        for (int bi = 0; bi < n_tokens; bi++) {
-            const float *q_h_bi = q_batch + (size_t)bi * n_heads * head_dim + h * head_dim;
-            float *score_row = scores_h + bi * n_kv;
-            for (int t = 0; t < n_kv; t++) {
-                const float *k_row = k_h + t * head_dim;
-                float dot = 0;
-#ifdef PICOLM_AVX512
-                { __m512 sd = _mm512_setzero_ps(); int d = 0;
-                  for (; d + 15 < head_dim; d += 16) {
-                      sd = _mm512_fmadd_ps(_mm512_loadu_ps(q_h_bi + d), _mm512_loadu_ps(k_row + d), sd);
-                  }
-                  dot = _mm512_reduce_add_ps(sd);
-                  for (; d < head_dim; d++) dot += q_h_bi[d] * k_row[d];
-                }
-#else
-                for (int d2 = 0; d2 < head_dim; d2++) dot += q_h_bi[d2] * k_row[d2];
-#endif
-                score_row[t] = dot * inv_sqrt_hd;
-            }
-            if (h == 0 && bi == n_tokens - 1) { fprintf(stderr, "BT scores[0..6]=%.3f %.3f %.3f %.3f %.3f %.3f %.3f\n",
-                    score_row[0],score_row[1],score_row[2],score_row[3],score_row[4],score_row[5],score_row[6]); }
-        }
-
-        /* Step 2: Causal mask + softmax per row */
-        for (int bi = 0; bi < n_tokens; bi++) {
-            int pos = start_pos + bi;
-            float *score_row = scores_h + bi * n_kv;
-
-            /* Causal mask */
-            for (int t = pos + 1; t < n_kv; t++) score_row[t] = -1e30f;
-
-            /* Softmax: max pass */
-            float max_s = -1e30f;
-            for (int t = 0; t < n_kv; t++) {
-                if (score_row[t] > max_s) max_s = score_row[t];
-            }
-            /* exp + sum pass */
-            float sum_exp = 0;
-            for (int t = 0; t < n_kv; t++) {
-                score_row[t] = expf(score_row[t] - max_s);
-                sum_exp += score_row[t];
-            }
-            /* normalize */
-            float inv_sum = 1.0f / sum_exp;
-            for (int t = 0; t < n_kv; t++) score_row[t] *= inv_sum;
-        }
-
-        /* Step 3: output[bi] += scores[bi] @ V_h^T */
-        for (int bi = 0; bi < n_tokens; bi++) {
-            float *score_row = scores_h + bi * n_kv;
-            float *xb_bi = xb_batch + (size_t)bi * xb_stride + h * head_dim;
-            for (int t = 0; t < n_kv; t++) {
-                float w = score_row[t];
-                const float *v_row = v_h + t * head_dim;
-#ifdef PICOLM_AVX512
-                { int d = 0; __m512 wv = _mm512_set1_ps(w);
-                  for (; d + 15 < head_dim; d += 16) {
-                      __m512 af = _mm512_loadu_ps(xb_bi + d);
-                      __m512 vf = _mm512_loadu_ps(v_row + d);
-                      _mm512_storeu_ps(xb_bi + d, _mm512_fmadd_ps(vf, wv, af));
-                  }
-                  for (; d < head_dim; d++) xb_bi[d] += w * v_row[d];
-                }
-#else
-                for (int d2 = 0; d2 < head_dim; d2++) xb_bi[d2] += w * v_row[d2];
-#endif
-            }
-        }
-    }
-
-    free(scores);
-    free(k_f32);
-    free(v_f32);
+    prefill_attn_ctx_t ctx;
+    ctx.n_heads = n_heads; ctx.n_kv_heads = n_kv_heads; ctx.kv_mul = n_heads / n_kv_heads;
+    ctx.head_dim = head_dim; ctx.start_pos = start_pos;
+    ctx.kv_type_k = kv_type_k; ctx.kv_type_v = kv_type_v;
+    ctx.kv_row_size_k = kv_row_size_k; ctx.kv_row_size_v = kv_row_size_v;
+    ctx.kcache = kcache; ctx.vcache = vcache;
+    ctx.q_batch = q_batch; ctx.xb_batch = xb_batch; ctx.xb_stride = xb_stride;
+    /* One dispatch per layer for the whole batch: n_tokens * n_heads
+     * independent (token, head) tasks, each O(head_dim) memory, each
+     * scanning only its own causal range t=0..pos. */
+    tensor_parallel_for(n_tokens * n_heads, prefill_attn_task, &ctx);
 }
 
 /* ================================================================
@@ -2478,11 +2401,12 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 
             /* Zero init xb_batch for attention accumulation */
             memset(xb_batch, 0, (size_t)n_tokens * max_dim * sizeof(float));
-            /* Batched attention: all tokens, all heads at once */
+            /* Batched attention: all tokens, all heads, one thread dispatch */
             batch_attention_layer(xb_batch, q_batch, kcl, vcl,
                                   n_tokens, start_pos,
                                   n_heads, c->n_kv_heads, head_dim,
-                                  max_dim, s->kv_type_k, s->kv_row_size_k);
+                                  max_dim, s->kv_type_k, s->kv_type_v,
+                                  s->kv_row_size_k, s->kv_row_size_v);
         }
 
         /* Output projection (batched) */
