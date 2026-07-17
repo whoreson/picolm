@@ -602,6 +602,11 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
     } else {
         n_prompt = tokenizer_encode(tokenizer, prompt, ptokens, max_pt, 1);
     }
+    /* If the encoder produced 0 tokens (empty prompt), insert BOS */
+    if (n_prompt == 0) {
+        ptokens[0] = (srv.use_qwen_tok) ? srv.qwen_enc.bos_id : (int)tokenizer->bos_id;
+        n_prompt = 1;
+    }
 
     /* Prompt caching: find shared prefix with last request */
     int cache_start = 0;
@@ -1062,12 +1067,17 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         n_prompt = n_token_prompt;
         token_prompt = NULL; /* transferred ownership */
     } else {
-        int max_pt = (int)strlen(prompt) + 3;
+        int max_pt = (int)strlen(prompt) + 3 + 1;
         ptokens = (int *)malloc((size_t)max_pt * sizeof(int));
         if (srv.use_qwen_tok) {
             n_prompt = qwen_tokenize_encode(&srv.qwen_enc, prompt, ptokens, max_pt);
         } else {
             n_prompt = tokenizer_encode(tokenizer, prompt, ptokens, max_pt, 1);
+        }
+        /* If the encoder produced 0 tokens (empty prompt), insert BOS */
+        if (n_prompt == 0) {
+            ptokens[0] = (srv.use_qwen_tok) ? srv.qwen_enc.bos_id : (int)tokenizer->bos_id;
+            n_prompt = 1;
         }
     }
 
@@ -1097,6 +1107,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
 
     int prompt_only = (n_predict == 0);
     if (n_predict < 0) n_predict = model->config.max_seq_len - n_prompt;
+    if (n_prompt == 0) n_prompt = 1; /* force at least 1 token for empty prompt (BOS) */
     if (n_predict <= 0 && !prompt_only) n_predict = 32;
 
     /* Random seed */
