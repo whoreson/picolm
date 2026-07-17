@@ -104,6 +104,22 @@ static volatile int    pool_shutdown = 0;
 static volatile int    pool_nworkers = 0;
 static matmul_task_t   pool_tasks[MAX_THREADS];
 
+/* Generic task type: lets the same worker threads run an arbitrary
+ * per-index function (e.g. per-attention-head work), not just matmul rows.
+ * pool_mode selects which task array/dispatcher a woken worker should use. */
+typedef struct {
+    void (*fn)(int idx, void *ctx);
+    void *ctx;
+    int   start, end;
+} generic_task_t;
+
+static generic_task_t  generic_tasks[MAX_THREADS];
+static volatile int    pool_mode = 0; /* 0 = matmul_task_t, 1 = generic_task_t */
+
+static void generic_worker_f(generic_task_t *t) {
+    for (int i = t->start; i < t->end; i++) t->fn(i, t->ctx);
+}
+
 /* Cross-platform mutex/cond helpers */
 #ifdef _WIN32
 static void win_mutex_init(win_mutex_t *m) { InitializeSRWLock(m); }
@@ -221,7 +237,8 @@ static void *pool_worker(void *arg) {
         if (pool_shutdown) break;
         last_gen = pool_gen;
         win_mutex_unlock(&pool_mutex);
-        matmul_worker_f(&pool_tasks[tid]);
+        if (pool_mode) generic_worker_f(&generic_tasks[tid]);
+        else matmul_worker_f(&pool_tasks[tid]);
         win_mutex_lock(&pool_mutex);
         pool_done++;
         win_cond_broadcast(&pool_cond);
@@ -1110,4 +1127,27 @@ void vec_add(float *a, const float *b, int size) {
 #else
     for (int i = 0; i < size; i++) a[i] += b[i];
 #endif
+}
+/* tensor_parallel_for: dispatches [0, count) across the thread pool */
+void tensor_parallel_for(int count, void (*fn)(int idx, void *ctx), void *ctx) {
+    int nt = n_threads;
+    if (nt <= 1 || count < nt * 4) {
+        for (int i = 0; i < count; i++) fn(i, ctx);
+        return;
+    }
+    int nthreads = nt > count ? count : nt;
+    int chunk = (count + nthreads - 1) / nthreads;
+    for (int t = 0; t < nthreads; t++) {
+        generic_tasks[t].fn = fn;
+        generic_tasks[t].ctx = ctx;
+        generic_tasks[t].start = t * chunk;
+        generic_tasks[t].end = (t + 1) * chunk;
+        if (generic_tasks[t].end > count) generic_tasks[t].end = count;
+    }
+    pool_mode = 1;
+    pool_wake(nthreads);
+    /* main thread does task 0 */
+    generic_worker_f(&generic_tasks[0]);
+    pool_wait(nthreads);
+    pool_mode = 0;
 }

@@ -1144,6 +1144,95 @@ static void repack_model_weights_q4_0x8(model_t *m) {
 static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
                         layer_weights_t *lw, int il, int pos);
 
+/* Threaded attention: per-head online softmax K.dot.Q + weighted V.
+ * Each head is fully independent -> parallelized via tensor_parallel_for. */
+typedef struct {
+    int n_heads, n_kv_heads, kv_mul, head_dim, pos;
+    gguf_type_t kv_type_k, kv_type_v;
+    size_t kv_row_size_k, kv_row_size_v;
+    const uint8_t *kcache;
+    const uint8_t *vcache;
+    float *q;
+    float *xb;
+} attn_head_ctx_t;
+
+static __attribute__((always_inline)) void attention_head(int head_idx, void *ctx_ptr) {
+    attn_head_ctx_t *ctx = (attn_head_ctx_t *)ctx_ptr;
+    int h = head_idx;
+    float *qh = ctx->q + h * ctx->head_dim;
+    int kv_h = h / ctx->kv_mul;
+    float *xbh = ctx->xb + h * ctx->head_dim;
+    float max_score = -1e30f, sum_exp = 0.0f;
+    float acc[256];
+    memset(acc, 0, (size_t)ctx->head_dim * sizeof(float));
+
+    for (int t = 0; t <= ctx->pos; t++) {
+        const uint8_t *kt = ctx->kcache + (size_t)t * ctx->n_kv_heads * ctx->kv_row_size_k + kv_h * ctx->kv_row_size_k;
+        float score;
+        if (ctx->kv_type_k == KV_CACHE_Q8_0) score = vec_dot_q8_0_f32(kt, qh, ctx->head_dim);
+        else if (ctx->kv_type_k == KV_CACHE_Q4_0) score = vec_dot_q4_0_f32(kt, qh, ctx->head_dim);
+        else score = vec_dot_f16_f32(kt, qh, ctx->head_dim);
+        score /= sqrtf((float)ctx->head_dim);
+        const uint8_t *vt = ctx->vcache + (size_t)t * ctx->n_kv_heads * ctx->kv_row_size_v + kv_h * ctx->kv_row_size_v;
+        if (score > max_score) {
+            float correction = expf(max_score - score);
+            sum_exp = sum_exp * correction + 1.0f;
+            if (ctx->kv_type_v == KV_CACHE_Q8_0) fma_scale_q8_0_f32(acc, correction, vt, ctx->head_dim);
+            else if (ctx->kv_type_v == KV_CACHE_Q4_0) fma_scale_q4_0_f32(acc, correction, vt, ctx->head_dim);
+            else {
+                const uint16_t *vt16 = (const uint16_t *)vt;
+#ifdef PICOLM_AVX512
+                { __m512 cv = _mm512_set1_ps(correction); int d = 0;
+                  for (; d + 15 < ctx->head_dim; d += 16) { __m512 vf = fp16x16_to_fp32_inline(vt16 + d); __m512 af = _mm512_loadu_ps(acc + d); _mm512_storeu_ps(acc + d, _mm512_fmadd_ps(af, cv, vf)); }
+                  for (; d < ctx->head_dim; d++) acc[d] = acc[d] * correction + fp16_to_fp32(vt16[d]); }
+#elif defined(PICOLM_AVX)
+                { __m256 cv = _mm256_set1_ps(correction); int d = 0;
+                  for (; d + 7 < ctx->head_dim; d += 8) { __m256 vf = fp16x8_to_fp32_inline(vt16 + d); __m256 af = _mm256_loadu_ps(acc + d); _mm256_storeu_ps(acc + d, _mm256_add_ps(_mm256_mul_ps(af, cv), vf)); }
+                  for (; d < ctx->head_dim; d++) acc[d] = acc[d] * correction + fp16_to_fp32(vt16[d]); }
+#else
+                for (int d = 0; d < ctx->head_dim; d++) acc[d] = acc[d] * correction + fp16_to_fp32(vt16[d]);
+#endif
+            }
+            max_score = score;
+        } else {
+            float w = expf(score - max_score);
+            sum_exp += w;
+            if (ctx->kv_type_v == KV_CACHE_Q8_0) scale_add_q8_0_f32(acc, w, vt, ctx->head_dim);
+            else if (ctx->kv_type_v == KV_CACHE_Q4_0) scale_add_q4_0_f32(acc, w, vt, ctx->head_dim);
+            else {
+                const uint16_t *vt16 = (const uint16_t *)vt;
+#ifdef PICOLM_AVX512
+                { __m512 wv = _mm512_set1_ps(w); int d = 0;
+                  for (; d + 15 < ctx->head_dim; d += 16) { __m512 vf = fp16x16_to_fp32_inline(vt16 + d); __m512 af = _mm512_loadu_ps(acc + d); _mm512_storeu_ps(acc + d, _mm512_fmadd_ps(vf, wv, af)); }
+                  for (; d < ctx->head_dim; d++) acc[d] += w * fp16_to_fp32(vt16[d]); }
+#elif defined(PICOLM_AVX)
+                { __m256 wv = _mm256_set1_ps(w); int d = 0;
+                  for (; d + 7 < ctx->head_dim; d += 8) { __m256 vf = fp16x8_to_fp32_inline(vt16 + d); __m256 af = _mm256_loadu_ps(acc + d); _mm256_storeu_ps(acc + d, _mm256_add_ps(_mm256_mul_ps(vf, wv), af)); }
+                  for (; d < ctx->head_dim; d++) acc[d] += w * fp16_to_fp32(vt16[d]); }
+#else
+                for (int d = 0; d < ctx->head_dim; d++) acc[d] += w * fp16_to_fp32(vt16[d]);
+#endif
+            }
+        }
+    }
+    float inv_sum = 1.0f / sum_exp;
+#ifdef PICOLM_AVX512
+    { __m512 inv = _mm512_set1_ps(inv_sum); int d = 0;
+      for (; d + 15 < ctx->head_dim; d += 16) { __m512 af = _mm512_loadu_ps(acc + d); _mm512_storeu_ps(xbh + d, _mm512_mul_ps(af, inv)); }
+      for (; d < ctx->head_dim; d++) xbh[d] = acc[d] * inv_sum; }
+#elif defined(PICOLM_AVX)
+    { __m256 inv = _mm256_set1_ps(inv_sum); int d = 0;
+      for (; d + 7 < ctx->head_dim; d += 8) { __m256 af = _mm256_loadu_ps(acc + d); _mm256_storeu_ps(xbh + d, _mm256_mul_ps(af, inv)); }
+      for (; d < ctx->head_dim; d++) xbh[d] = acc[d] * inv_sum; }
+#elif defined(PICOLM_SSE2)
+    { __m128 inv = _mm_set1_ps(inv_sum); int d = 0;
+      for (; d + 3 < ctx->head_dim; d += 4) { __m128 af = _mm_loadu_ps(acc + d); _mm_storeu_ps(xbh + d, _mm_mul_ps(af, inv)); }
+      for (; d < ctx->head_dim; d++) xbh[d] = acc[d] * inv_sum; }
+#else
+    for (int d = 0; d < ctx->head_dim; d++) xbh[d] = acc[d] * inv_sum;
+#endif
+}
+
 float *model_forward(model_t *m, int token, int pos) {
     model_config_t *c = &m->config;
     model_weights_t *w = &m->weights;
@@ -1344,177 +1433,13 @@ float *model_forward(model_t *m, int token, int pos) {
          *
          * This saves memory (no att[] buffer) and is more cache-friendly.
          */
-        for (int h = 0; h < n_heads; h++) {
-            float *qh = s->q + h * head_dim;
-            int kv_h = h / kv_mul;
-            float *xbh = s->xb + h * head_dim;
-
-            float max_score = -1e30f;
-            float sum_exp = 0.0f;
-            /* Accumulator for weighted V values */
-            float acc[256]; /* head_dim is typically 64-128 */
-            memset(acc, 0, (size_t)head_dim * sizeof(float));
-
-            for (int t = 0; t <= pos; t++) {
-                /* Compute score: dot(Q_h, K_t) / sqrt(head_dim) */
-                const uint8_t *kt = kcache_layer + (size_t)t * c->n_kv_heads * s->kv_row_size_k
-                                   + kv_h * s->kv_row_size_k;
-                float score;
-                if (s->kv_type_k == KV_CACHE_Q8_0) {
-                    score = vec_dot_q8_0_f32(kt, qh, head_dim);
-                } else if (s->kv_type_k == KV_CACHE_Q4_0) {
-                    score = vec_dot_q4_0_f32(kt, qh, head_dim);
-                } else {
-                    score = vec_dot_f16_f32(kt, qh, head_dim);
-                }
-                score /= sqrtf((float)head_dim);
-
-                /* Online softmax update */
-                const uint8_t *vt = vcache_layer + (size_t)t * c->n_kv_heads * s->kv_row_size_v
-                                   + kv_h * s->kv_row_size_v;
-
-                if (score > max_score) {
-                    float correction = expf(max_score - score);
-                    sum_exp = sum_exp * correction + 1.0f;
-                    /* FMA: acc = acc * correction + dequant(vt) */
-                    if (s->kv_type_v == KV_CACHE_Q8_0) {
-                        fma_scale_q8_0_f32(acc, correction, vt, head_dim);
-                    } else if (s->kv_type_v == KV_CACHE_Q4_0) {
-                        fma_scale_q4_0_f32(acc, correction, vt, head_dim);
-                    } else {
-                        const uint16_t *vt16 = (const uint16_t *)vt;
-#ifdef PICOLM_FP16_HW
-                        { float32x4_t cv = vdupq_n_f32(correction); int d = 0;
-                          for (; d + 3 < head_dim; d += 4) {
-                              float32x4_t a = vld1q_f32(acc + d);
-                              vst1q_f32(acc + d, vmlaq_f32(fp16x4_to_f32_hw(vt16 + d), a, cv));
-                          }
-                          for (; d < head_dim; d++)
-                              acc[d] = acc[d] * correction + fp16_to_fp32(vt16[d]);
-                        }
-#elif defined(PICOLM_AVX512)
-                        { __m512 cv = _mm512_set1_ps(correction); int d = 0;
-                          for (; d + 15 < head_dim; d += 16) {
-                              __m512 vf = fp16x16_to_fp32_inline(vt16 + d);
-                              __m512 af = _mm512_loadu_ps(acc + d);
-                              _mm512_storeu_ps(acc + d, _mm512_fmadd_ps(af, cv, vf));
-                          }
-                          for (; d < head_dim; d++)
-                              acc[d] = acc[d] * correction + fp16_to_fp32(vt16[d]);
-                        }
-#elif defined(PICOLM_AVX)
-                        { __m256 cv = _mm256_set1_ps(correction); int d = 0;
-                          for (; d + 7 < head_dim; d += 8) {
-                              __m256 vf = fp16x8_to_fp32_inline(vt16 + d);
-                              __m256 af = _mm256_loadu_ps(acc + d);
-                              _mm256_storeu_ps(acc + d, _mm256_add_ps(_mm256_mul_ps(af, cv), vf));
-                          }
-                          for (; d < head_dim; d++)
-                              acc[d] = acc[d] * correction + fp16_to_fp32(vt16[d]);
-                        }
-#else
-                        for (int d = 0; d < head_dim; d++) {
-                            acc[d] = acc[d] * correction + fp16_to_fp32(vt16[d]);
-                        }
-#endif
-                    }
-                    max_score = score;
-                } else {
-                    float w = expf(score - max_score);
-                    sum_exp += w;
-                    /* acc += w * dequant(vt) */
-                    if (s->kv_type_v == KV_CACHE_Q8_0) {
-                        scale_add_q8_0_f32(acc, w, vt, head_dim);
-                    } else if (s->kv_type_v == KV_CACHE_Q4_0) {
-                        scale_add_q4_0_f32(acc, w, vt, head_dim);
-                    } else {
-                        const uint16_t *vt16 = (const uint16_t *)vt;
-#ifdef PICOLM_FP16_HW
-                        { float32x4_t wv = vdupq_n_f32(w); int d = 0;
-                          for (; d + 3 < head_dim; d += 4) {
-                              float32x4_t a = vld1q_f32(acc + d);
-                              vst1q_f32(acc + d, vmlaq_f32(a, fp16x4_to_f32_hw(vt16 + d), wv));
-                          }
-                          for (; d < head_dim; d++)
-                              acc[d] += w * fp16_to_fp32(vt16[d]);
-                        }
-#elif defined(PICOLM_AVX512)
-                        { __m512 wv = _mm512_set1_ps(w); int d = 0;
-                          for (; d + 15 < head_dim; d += 16) {
-                              __m512 vf = fp16x16_to_fp32_inline(vt16 + d);
-                              __m512 af = _mm512_loadu_ps(acc + d);
-                              _mm512_storeu_ps(acc + d, _mm512_fmadd_ps(vf, wv, af));
-                          }
-                          for (; d < head_dim; d++)
-                              acc[d] += w * fp16_to_fp32(vt16[d]);
-                        }
-#elif defined(PICOLM_AVX)
-                        { __m256 wv = _mm256_set1_ps(w); int d = 0;
-                          for (; d + 7 < head_dim; d += 8) {
-                              __m256 vf = fp16x8_to_fp32_inline(vt16 + d);
-                              __m256 af = _mm256_loadu_ps(acc + d);
-                              _mm256_storeu_ps(acc + d, _mm256_add_ps(_mm256_mul_ps(vf, wv), af));
-                          }
-                          for (; d < head_dim; d++)
-                              acc[d] += w * fp16_to_fp32(vt16[d]);
-                        }
-#else
-                        for (int d = 0; d < head_dim; d++) {
-                            acc[d] += w * fp16_to_fp32(vt16[d]);
-                        }
-#endif
-                    }
-                }
-            }
-
-
-
-            /* Normalize */
-            float inv_sum = 1.0f / sum_exp;
-#ifdef PICOLM_AVX512
-            {
-                __m512 inv = _mm512_set1_ps(inv_sum);
-                int d = 0;
-                for (; d + 15 < head_dim; d += 16) {
-                    __m512 af = _mm512_loadu_ps(acc + d);
-                    _mm512_storeu_ps(xbh + d, _mm512_mul_ps(af, inv));
-                }
-                for (; d < head_dim; d++) xbh[d] = acc[d] * inv_sum;
-            }
-#elif defined(PICOLM_NEON)
-            {
-                float32x4_t inv = vdupq_n_f32(inv_sum);
-                int d = 0;
-                for (; d + 3 < head_dim; d += 4) {
-                    float32x4_t af = vld1q_f32(acc + d);
-                    vst1q_f32(xbh + d, vmulq_f32(af, inv));
-                }
-                for (; d < head_dim; d++) xbh[d] = acc[d] * inv_sum;
-            }
-#elif defined(PICOLM_AVX)
-            {
-                __m256 inv = _mm256_set1_ps(inv_sum);
-                int d = 0;
-                for (; d + 7 < head_dim; d += 8) {
-                    __m256 af = _mm256_loadu_ps(acc + d);
-                    _mm256_storeu_ps(xbh + d, _mm256_mul_ps(af, inv));
-                }
-                for (; d < head_dim; d++) xbh[d] = acc[d] * inv_sum;
-            }
-#elif defined(PICOLM_SSE2)
-            {
-                __m128 inv = _mm_set1_ps(inv_sum);
-                int d = 0;
-                for (; d + 3 < head_dim; d += 4) {
-                    __m128 af = _mm_loadu_ps(acc + d);
-                    _mm_storeu_ps(xbh + d, _mm_mul_ps(af, inv));
-                }
-                for (; d < head_dim; d++) xbh[d] = acc[d] * inv_sum;
-            }
-#else
-            for (int d = 0; d < head_dim; d++) xbh[d] = acc[d] * inv_sum;
-#endif
-        }
+        attn_head_ctx_t ctx;
+        ctx.n_heads = n_heads; ctx.n_kv_heads = c->n_kv_heads; ctx.kv_mul = kv_mul; ctx.head_dim = head_dim; ctx.pos = pos;
+        ctx.kv_type_k = s->kv_type_k; ctx.kv_type_v = s->kv_type_v;
+        ctx.kv_row_size_k = s->kv_row_size_k; ctx.kv_row_size_v = s->kv_row_size_v;
+        ctx.kcache = kcache_layer; ctx.vcache = vcache_layer;
+        ctx.q = s->q; ctx.xb = s->xb;
+        tensor_parallel_for(n_heads, attention_head, &ctx);
 
         /* Qwen3.5 full attention: apply gate sigmoid to attention output */
         if (qwen35_attn_gate) {
@@ -2390,58 +2315,14 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                     ((uint16_t*)vp)[d2] = fp32_to_fp16(v_pos[hkv * head_dim + d2]);
             }
 
-            /* Attention (copied exactly from model_forward) */
-            for (int h = 0; h < n_heads; h++) {
-                float *qh = q_pos + h * head_dim;
-                int kv_h = h / kv_mul;
-                float *xbh = xbi + h * head_dim;
-                float max_score = -1e30f, sum_exp = 0.0f;
-                float acc[256];
-                memset(acc, 0, (size_t)head_dim * sizeof(float));
-
-                for (int t = 0; t <= pos; t++) {
-                    const uint8_t *kt = kcl + (size_t)t * c->n_kv_heads * s->kv_row_size_k + kv_h * s->kv_row_size_k;
-                    float score;
-                    if (s->kv_type_k == KV_CACHE_Q8_0)
-                        score = vec_dot_q8_0_f32(kt, qh, head_dim);
-                    else if (s->kv_type_k == KV_CACHE_Q4_0)
-                        score = vec_dot_q4_0_f32(kt, qh, head_dim);
-                    else
-                        score = vec_dot_f16_f32(kt, qh, head_dim);
-                    score /= sqrtf((float)head_dim);
-
-                    const uint8_t *vt = vcl + (size_t)t * c->n_kv_heads * s->kv_row_size_v + kv_h * s->kv_row_size_v;
-                    if (score > max_score) {
-                        float correction = expf(max_score - score);
-                        sum_exp = sum_exp * correction + 1.0f;
-                        if (s->kv_type_v == KV_CACHE_Q8_0)
-                            fma_scale_q8_0_f32(acc, correction, vt, head_dim);
-                        else if (s->kv_type_v == KV_CACHE_Q4_0)
-                            fma_scale_q4_0_f32(acc, correction, vt, head_dim);
-                        else {
-                            const uint16_t *vt16 = (const uint16_t*)vt;
-                            for (int d2 = 0; d2 < head_dim; d2++)
-                                acc[d2] = acc[d2] * correction + fp16_to_fp32(vt16[d2]);
-                        }
-                        max_score = score;
-                    } else {
-                        float wt = expf(score - max_score);
-                        sum_exp += wt;
-                        if (s->kv_type_v == KV_CACHE_Q8_0)
-                            scale_add_q8_0_f32(acc, wt, vt, head_dim);
-                        else if (s->kv_type_v == KV_CACHE_Q4_0)
-                            scale_add_q4_0_f32(acc, wt, vt, head_dim);
-                        else {
-                            const uint16_t *vt16 = (const uint16_t*)vt;
-                            for (int d2 = 0; d2 < head_dim; d2++)
-                                acc[d2] += wt * fp16_to_fp32(vt16[d2]);
-                        }
-                    }
-                }
-
-                float inv_sum = 1.0f / sum_exp;
-                for (int d2 = 0; d2 < head_dim; d2++) xbh[d2] = acc[d2] * inv_sum;
-            }
+            /* Attention: parallelized across heads via tensor_parallel_for */
+            attn_head_ctx_t ctx;
+            ctx.n_heads = n_heads; ctx.n_kv_heads = c->n_kv_heads; ctx.kv_mul = kv_mul; ctx.head_dim = head_dim; ctx.pos = pos;
+            ctx.kv_type_k = s->kv_type_k; ctx.kv_type_v = s->kv_type_v;
+            ctx.kv_row_size_k = s->kv_row_size_k; ctx.kv_row_size_v = s->kv_row_size_v;
+            ctx.kcache = kcl; ctx.vcache = vcl;
+            ctx.q = q_pos; ctx.xb = xbi;
+            tensor_parallel_for(n_heads, attention_head, &ctx);
         }
 
         /* Output projection (batched) */

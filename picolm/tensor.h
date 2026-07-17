@@ -20,6 +20,13 @@ void tensor_threadpool_init(int n_threads);
 void tensor_threadpool_free(void);
 void matmul_batch(float *out, const float *x, int n_batch,
                    const void *W, int n, int d, gguf_type_t qtype);
+
+/* Generic parallel-for: splits [0, count) across the existing matmul thread
+ * pool, calling fn(idx, ctx) for each index. Falls back to a plain serial
+ * loop when threading is disabled or count is too small to bother.
+ * Used to parallelize per-head attention (independent across heads) the
+ * same way matmul_batch parallelizes per-row projections. */
+void tensor_parallel_for(int count, void (*fn)(int idx, void *ctx), void *ctx);
 void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                         const void *W1, const void *W2,
                         int n, int d, gguf_type_t qtype1, gguf_type_t qtype2);
