@@ -3,7 +3,7 @@
 
 #include "quant.h"
 
-#define MAX_THREADS 16
+#define MAX_THREADS 64
 
 /* Set the scratch buffer used for row dequantization (embedding lookup, etc).
  * Must be called once at init with a buffer of at least max_row_size floats. */
