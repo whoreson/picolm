@@ -1387,7 +1387,7 @@ float *model_forward(model_t *m, int token, int pos) {
                           for (; d + 15 < head_dim; d += 16) {
                               __m512 vf = fp16x16_to_fp32_inline(vt16 + d);
                               __m512 af = _mm512_loadu_ps(acc + d);
-                              _mm512_storeu_ps(acc + d, _mm512_fmadd_ps(vf, cv, af));
+                              _mm512_storeu_ps(acc + d, _mm512_fmadd_ps(af, cv, vf));
                           }
                           for (; d < head_dim; d++)
                               acc[d] = acc[d] * correction + fp16_to_fp32(vt16[d]);
@@ -1397,7 +1397,7 @@ float *model_forward(model_t *m, int token, int pos) {
                           for (; d + 7 < head_dim; d += 8) {
                               __m256 vf = fp16x8_to_fp32_inline(vt16 + d);
                               __m256 af = _mm256_loadu_ps(acc + d);
-                              _mm256_storeu_ps(acc + d, _mm256_add_ps(_mm256_mul_ps(vf, cv), af));
+                              _mm256_storeu_ps(acc + d, _mm256_add_ps(_mm256_mul_ps(af, cv), vf));
                           }
                           for (; d < head_dim; d++)
                               acc[d] = acc[d] * correction + fp16_to_fp32(vt16[d]);
