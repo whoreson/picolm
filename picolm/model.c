@@ -8,6 +8,7 @@
 #include <string.h>
 #include <math.h>
 #include <errno.h>
+#include <time.h>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -2322,6 +2323,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         }
     }
 
+    /* Profiling counters */
     for (int l = 0; l < c->n_layers; l++) {
         layer_weights_t *lw = &w->layers[l];
 
@@ -2470,7 +2472,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
             float *a = x_batch + bi * dim, *b = xb2_batch + bi * dim;
             for (int d2 = 0; d2 < dim; d2++) a[d2] += b[d2];
         }
-    }
+        }
 
     /* Final norm + output (last token only) */
     float *last_x = x_batch + (n_tokens - 1) * dim;
