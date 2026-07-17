@@ -733,7 +733,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
 
         if (n_prefill > 0 && !model->config.has_ssm) {
             /* Batched prefill for non-SSM models */
-            logits = model_forward_prefill(model, ptokens, n_prompt, start_pos);
+            logits = model_forward_prefill(model, ptokens + start_pos, n_prefill, start_pos);
         } else if (n_prefill > 0) {
             /* Per-token prefill for SSM models or single-token prefill */
             int token_p = start_pos > 0 ? ptokens[start_pos - 1] : ptokens[0];
@@ -902,7 +902,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             int n_prefill_ns = n_prompt - start_pos;
 
             if (n_prefill_ns > 0 && !model->config.has_ssm) {
-                logits_ns = model_forward_prefill(model, ptokens, n_prompt, start_pos);
+                logits_ns = model_forward_prefill(model, ptokens + start_pos, n_prefill_ns, start_pos);
             } else if (n_prefill_ns > 0) {
                 int token_p = start_pos > 0 ? ptokens[start_pos - 1] : ptokens[0];
                 for (int pos = start_pos; pos < n_prompt; pos++) {
@@ -1266,7 +1266,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         int n_prefill = n_prompt - start_pos;
 
         if (n_prefill > 0 && !model->config.has_ssm) {
-            logits = model_forward_prefill(model, ptokens, n_prompt, start_pos);
+            logits = model_forward_prefill(model, ptokens + start_pos, n_prefill, start_pos);
         } else if (n_prefill > 0) {
             int token_p = start_pos > 0 ? ptokens[start_pos - 1] : ptokens[0];
             for (int pos = start_pos; pos < n_prompt; pos++) {
@@ -1434,7 +1434,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         int n_prefill_ns2 = n_prompt - start_pos;
 
         if (n_prefill_ns2 > 0 && !model->config.has_ssm) {
-            logits_ns2 = model_forward_prefill(model, ptokens, n_prompt, start_pos);
+            logits_ns2 = model_forward_prefill(model, ptokens + start_pos, n_prefill_ns2, start_pos);
         } else if (n_prefill_ns2 > 0) {
             int token_p = start_pos > 0 ? ptokens[start_pos - 1] : ptokens[0];
             for (int pos = start_pos; pos < n_prompt; pos++) {
