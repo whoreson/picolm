@@ -725,29 +725,40 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         sampler_t sampler;
         sampler_init(&sampler, temperature, top_p, seed);
 
-        int gen_start_oai = start_pos;
-        if (gen_start_oai >= n_prompt) gen_start_oai = n_prompt - 1;
-        int token = ptokens[gen_start_oai];
         double t_start = get_time_ms();
-        double t_prefill_end = 0;
+
+        /* ---- Prefill phase ---- */
+        float *logits = NULL;
+        int n_prefill = n_prompt - start_pos;
+
+        if (n_prefill > 0 && !model->config.has_ssm) {
+            /* Batched prefill for non-SSM models */
+            logits = model_forward_prefill(model, ptokens, n_prompt, start_pos);
+        } else if (n_prefill > 0) {
+            /* Per-token prefill for SSM models or single-token prefill */
+            int token_p = start_pos > 0 ? ptokens[start_pos - 1] : ptokens[0];
+            for (int pos = start_pos; pos < n_prompt; pos++) {
+                logits = model_forward(model, token_p, pos);
+                token_p = ptokens[pos + 1];
+            }
+        }
+        /* else: fully cached (n_prefill <= 0), no prefill needed */
+
+        double t_prefill_end = get_time_ms();
+
+        /* ---- Generation phase ---- */
         int gen_count = 0;
 
-        for (int pos = gen_start_oai; pos < n_prompt + max_tokens; pos++) {
-            if (!client_alive(sock)) {
-                fprintf(stderr, "\n[server] OAI stream: client disconnected at pos %d\n", pos);
-                break;
-            }
-            float *logits = model_forward(model, token, pos);
+        if (n_prefill <= 0) {
+            /* Fully cached: need logits for first gen token */
+            int token = ptokens[n_prompt - 1];
+            logits = model_forward(model, token, n_prompt);
+        }
+        /* else: logits already computed by prefill for last prompt token */
 
-            if (pos < n_prompt - 1 || prompt_only) {
-                token = ptokens[pos + 1];
-                continue;
-            }
-
-            /* First generated token: mark prefill end */
-            if (gen_count == 0) {
-                t_prefill_end = get_time_ms();
-            }
+        int token = ptokens[n_prompt - 1];
+        for (int pos = n_prompt; pos < n_prompt + max_tokens && logits; pos++) {
+            if (!client_alive(sock)) break;
 
             int next = sampler_sample(&sampler, logits, model->config.vocab_size);
             static char qwen_buf[64];
@@ -806,6 +817,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
 
             if (next == (int)tokenizer->eos_id) break;
             token = next;
+            logits = model_forward(model, token, pos + 1);
         }
 
         double t_end = get_time_ms();
@@ -875,9 +887,6 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             sampler_t sampler;
             sampler_init(&sampler, temperature, top_p, seed + (uint64_t)c);
 
-            int gen_start_oai2 = start_pos;
-            if (gen_start_oai2 >= n_prompt) gen_start_oai2 = n_prompt - 1;
-            int token = ptokens[gen_start_oai2];
             char *generated = (char *)malloc((size_t)max_tokens * 100 + 1);
             if (!generated) {
                 free(chat_prompt); free(raw_prompt_copy); free(ptokens);
@@ -888,20 +897,35 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             int gen_count = 0;
             const char *finish_reason = "stop";
 
-            for (int pos = gen_start_oai2; pos < n_prompt + max_tokens; pos++) {
+            /* Prefill phase */
+            float *logits_ns = NULL;
+            int n_prefill_ns = n_prompt - start_pos;
+
+            if (n_prefill_ns > 0 && !model->config.has_ssm) {
+                logits_ns = model_forward_prefill(model, ptokens, n_prompt, start_pos);
+            } else if (n_prefill_ns > 0) {
+                int token_p = start_pos > 0 ? ptokens[start_pos - 1] : ptokens[0];
+                for (int pos = start_pos; pos < n_prompt; pos++) {
+                    logits_ns = model_forward(model, token_p, pos);
+                    token_p = ptokens[pos + 1];
+                }
+            }
+
+            if (gen_count_ns == 0) t_prefill_end_ns = get_time_ms();
+
+            /* Generation phase */
+            if (n_prefill_ns <= 0) {
+                int token = ptokens[n_prompt - 1];
+                logits_ns = model_forward(model, token, n_prompt);
+            }
+
+            int token = ptokens[n_prompt - 1];
+            for (int pos = n_prompt; pos < n_prompt + max_tokens && logits_ns; pos++) {
                 if (!client_alive(sock)) {
                     free(generated); break;
                 }
-                float *logits = model_forward(model, token, pos);
 
-                if (pos < n_prompt - 1 || prompt_only) {
-                    token = ptokens[pos + 1];
-                    continue;
-                }
-                if (gen_count_ns == 0) t_prefill_end_ns = get_time_ms();
-                gen_count_ns++;
-
-                int next = sampler_sample(&sampler, logits, model->config.vocab_size);
+                int next = sampler_sample(&sampler, logits_ns, model->config.vocab_size);
                 if (gen_count < max_pt - n_prompt) ptokens[n_prompt + gen_count] = next;
                 static char qwen_buf2[64];
                 const char *piece;
@@ -920,6 +944,8 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
                 if (next == (int)tokenizer->eos_id) { finish_reason = "stop"; break; }
                 if (gen_count >= max_tokens) { finish_reason = "length"; break; }
                 token = next;
+                gen_count_ns++;
+                logits_ns = model_forward(model, token, pos + 1);
             }
             total_generation_tokens += gen_count;
 
@@ -1214,7 +1240,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             "\r\n");
         send(sock, hdr, strlen(hdr), 0);
 
-        int gen_count = 0;
+        /* gen_count declared below after prefill section */
         const char *stop_type = "none";
         const char *stopping_word = "";
         char *generated_stream = (char *)calloc(1, 1024);
@@ -1235,20 +1261,36 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
          * gen_start == n_prompt - 1, so we need token = ptokens[n_prompt-1]. */
         int token = ptokens[gen_start];
 
-        for (int pos = gen_start; pos < n_prompt + n_predict; pos++) {
+        /* ---- Prefill phase ---- */
+        float *logits = NULL;
+        int n_prefill = n_prompt - start_pos;
+
+        if (n_prefill > 0 && !model->config.has_ssm) {
+            logits = model_forward_prefill(model, ptokens, n_prompt, start_pos);
+        } else if (n_prefill > 0) {
+            int token_p = start_pos > 0 ? ptokens[start_pos - 1] : ptokens[0];
+            for (int pos = start_pos; pos < n_prompt; pos++) {
+                logits = model_forward(model, token_p, pos);
+                token_p = ptokens[pos + 1];
+            }
+        }
+        /* else: fully cached */
+
+        t_prefill_end = get_time_ms();
+
+        /* ---- Generation phase ---- */
+        if (n_prefill <= 0) {
+            int token = ptokens[n_prompt - 1];
+            logits = model_forward(model, token, n_prompt);
+        }
+
+        int gen_count = 0;
+        token = ptokens[n_prompt - 1];
+        for (int pos = n_prompt; pos < n_prompt + n_predict && logits; pos++) {
             if (!client_alive(sock)) {
                 fprintf(stderr, "\n[server] /completion stream: client disconnected at pos %d\n", pos);
                 break;
             }
-            float *logits = model_forward(model, token, pos);
-
-            if (pos < n_prompt - 1 || prompt_only) {
-                token = ptokens[pos + 1];
-                continue;
-            }
-
-            /* Mark prefill end on first generated token */
-            if (gen_count == 0) t_prefill_end = get_time_ms();
 
             int next = sampler_sample(&sampler, logits, model->config.vocab_size);
             if (gen_tok_count < n_predict + 1) gen_tok_buf[gen_tok_count++] = next;
@@ -1325,6 +1367,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
                 break;
             }
             token = next;
+            logits = model_forward(model, token, pos + 1);
         }
 
         free(generated_stream);
@@ -1386,22 +1429,36 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         generated[0] = '\0';
         int *gen_token_ids = (int *)malloc((size_t)n_predict * sizeof(int));
 
-        for (int pos = gen_start_ns; pos < n_prompt + n_predict; pos++) {
+        /* ---- Prefill phase ---- */
+        float *logits_ns2 = NULL;
+        int n_prefill_ns2 = n_prompt - start_pos;
+
+        if (n_prefill_ns2 > 0 && !model->config.has_ssm) {
+            logits_ns2 = model_forward_prefill(model, ptokens, n_prompt, start_pos);
+        } else if (n_prefill_ns2 > 0) {
+            int token_p = start_pos > 0 ? ptokens[start_pos - 1] : ptokens[0];
+            for (int pos = start_pos; pos < n_prompt; pos++) {
+                logits_ns2 = model_forward(model, token_p, pos);
+                token_p = ptokens[pos + 1];
+            }
+        }
+
+        t_prefill_end_ns = get_time_ms();
+
+        /* ---- Generation phase ---- */
+        if (n_prefill_ns2 <= 0) {
+            int token = ptokens[n_prompt - 1];
+            logits_ns2 = model_forward(model, token, n_prompt);
+        }
+
+        token = ptokens[n_prompt - 1];
+        for (int pos = n_prompt; pos < n_prompt + n_predict && logits_ns2; pos++) {
             if (!client_alive(sock)) {
                 fprintf(stderr, "\n[server] /completion non-stream: client disconnected at pos %d\n", pos);
                 break;
             }
-            float *logits = model_forward(model, token, pos);
 
-            if (pos < n_prompt - 1 || prompt_only) {
-                token = ptokens[pos + 1];
-                continue;
-            }
-
-            /* Mark prefill end on first generated token */
-            if (gen_count == 0) t_prefill_end_ns = get_time_ms();
-
-            int next = sampler_sample(&sampler, logits, model->config.vocab_size);
+            int next = sampler_sample(&sampler, logits_ns2, model->config.vocab_size);
             static char qwen_buf4[64];
             const char *piece;
             if (srv.use_qwen_tok) {
@@ -1438,6 +1495,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             }
             if (gen_count >= n_predict) { stop_type = "limit"; break; }
             token = next;
+            logits_ns2 = model_forward(model, token, pos + 1);
         }
 
         double t_end = get_time_ms();
