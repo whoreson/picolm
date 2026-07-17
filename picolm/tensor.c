@@ -245,6 +245,7 @@ static void pool_wait(int nt) {
 /* ---- Public API ---- */
 
 void tensor_threadpool_init(int n_threads) {
+    if (n_threads > MAX_THREADS) n_threads = MAX_THREADS;
     if (n_threads > 1) pool_init(n_threads);
 }
 
