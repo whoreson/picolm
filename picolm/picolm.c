@@ -90,6 +90,7 @@ int main(int argc, char **argv) {
     kv_cache_type_t kv_type_v = KV_CACHE_F16;
     int    mem_mb = 0;      /* --mem budget in megabytes (0=disabled) */
     int    do_prefault = 0; /* --prefault (touch all mmap pages at load time) */
+    int    server_daemon = 0;
     int    server_mode = 0;
     int    server_port = 8080;
     char   server_host[256] = "0.0.0.0";
@@ -112,6 +113,8 @@ int main(int argc, char **argv) {
             context_override = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-j") == 0 && i + 1 < argc) {
             num_threads = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--daemon") == 0) {
+            server_daemon = 1;
         } else if (strcmp(argv[i], "--server") == 0 && i + 1 < argc) {
             server_mode = 1;
             model_path = argv[++i];
@@ -162,6 +165,24 @@ int main(int argc, char **argv) {
 
     /* Server mode: start HTTP server (no prompt needed) */
     if (server_mode) {
+        /* Daemonize if requested */
+        if (server_daemon) {
+            pid_t pid = fork();
+            if (pid < 0) { perror("fork"); return 1; }
+            if (pid > 0) {
+                fprintf(stderr, "[server] Daemonized with PID %d\n", pid);
+                return 0;
+            }
+            /* Child: redirect stdio to /dev/null */
+            FILE *null = fopen("/dev/null", "r");
+            if (null) { dup2(fileno(null), STDIN_FILENO); fclose(null); }
+            null = fopen("/dev/null", "w");
+            if (null) dup2(fileno(null), STDOUT_FILENO);
+            null = fopen("/tmp/picolm_stderr.log", "a");
+            if (null) dup2(fileno(null), STDERR_FILENO);
+            setsid(); /* create new session */
+            setsid(); /* create new session */
+        }
         fp16_table_init();
         extern int server_main(int port, const char *host, const char *model_path, int num_threads, int do_prefault);
         return server_main(server_port, server_host, model_path, num_threads, do_prefault);
