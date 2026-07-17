@@ -1195,6 +1195,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
     cJSON_AddNumberToObject(gen_settings, "seed", seed);
 
     double t_start = get_time_ms();
+    double t_prefill_end = 0;
 
     if (do_stream) {
         /* Buffer for generated tokens (for KV cache persistence) */
@@ -1245,6 +1246,9 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
                 token = ptokens[pos + 1];
                 continue;
             }
+
+            /* Mark prefill end on first generated token */
+            if (gen_count == 0) t_prefill_end = get_time_ms();
 
             int next = sampler_sample(&sampler, logits, model->config.vocab_size);
             if (gen_tok_count < n_predict + 1) gen_tok_buf[gen_tok_count++] = next;
@@ -1325,8 +1329,8 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
 
         free(generated_stream);
         double t_end = get_time_ms();
-        double t_prefill_ms = t_end - t_start; /* includes everything for streaming */
-        double gen_ms = t_end - t_start;
+        double t_prefill_ms = t_prefill_end > 0 ? t_prefill_end - t_start : t_end - t_start;
+        double gen_ms = t_prefill_end > 0 ? t_end - t_prefill_end : t_end - t_start;
 
         /* Final timing SSE */
         cJSON *final = cJSON_CreateObject();
@@ -1363,11 +1367,13 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         srv.kv_pos = total_ctx_c;
         free(gen_tok_buf);
 
-        fprintf(stderr, "\n[server] /completion: prompt %d new+%d cached in %.0fms, gen %d in %.0fms (%.1f tok/s)\n",
+        fprintf(stderr, "\n[server] /completion: prompt %d new+%d cached in %.0fms (%.1f tok/s), gen %d in %.0fms (%.1f tok/s)\n",
                 n_prompt - start_pos, start_pos, t_prefill_ms,
+                (n_prompt - start_pos) > 0 ? (n_prompt - start_pos) / (t_prefill_ms / 1000.0) : 0,
                 gen_count, gen_ms, gen_count > 0 ? gen_count / (gen_ms / 1000.0) : 0);
     } else {
         /* Non-streaming: collect all tokens, build one big response */
+        double t_prefill_end_ns = 0;
         int gen_start_ns = start_pos;
         if (gen_start_ns >= n_prompt) {
             gen_start_ns = n_prompt - 1;
@@ -1391,6 +1397,9 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
                 token = ptokens[pos + 1];
                 continue;
             }
+
+            /* Mark prefill end on first generated token */
+            if (gen_count == 0) t_prefill_end_ns = get_time_ms();
 
             int next = sampler_sample(&sampler, logits, model->config.vocab_size);
             static char qwen_buf4[64];
@@ -1432,7 +1441,8 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         }
 
         double t_end = get_time_ms();
-        double gen_ms = t_end - t_start;
+        double t_prefill_ms_ns = t_prefill_end_ns > 0 ? t_prefill_end_ns - t_start : t_end - t_start;
+        double gen_ms = t_prefill_end_ns > 0 ? t_end - t_prefill_end_ns : t_end - t_start;
 
         /* Build response */
         cJSON *resp = cJSON_CreateObject();
@@ -1460,9 +1470,9 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         cJSON *timings = cJSON_CreateObject();
         cJSON_AddNumberToObject(timings, "cache_n", start_pos);
         cJSON_AddNumberToObject(timings, "prompt_n", n_prompt - start_pos);
-        cJSON_AddNumberToObject(timings, "prompt_ms", gen_ms);
-        cJSON_AddNumberToObject(timings, "prompt_per_token_ms", (n_prompt - start_pos) > 0 ? gen_ms / (n_prompt - start_pos) : 0);
-        cJSON_AddNumberToObject(timings, "prompt_per_second", (n_prompt - start_pos) > 0 ? (n_prompt - start_pos) / (gen_ms / 1000.0) : 0);
+        cJSON_AddNumberToObject(timings, "prompt_ms", t_prefill_ms_ns);
+        cJSON_AddNumberToObject(timings, "prompt_per_token_ms", (n_prompt - start_pos) > 0 ? t_prefill_ms_ns / (n_prompt - start_pos) : 0);
+        cJSON_AddNumberToObject(timings, "prompt_per_second", (n_prompt - start_pos) > 0 ? (n_prompt - start_pos) / (t_prefill_ms_ns / 1000.0) : 0);
         cJSON_AddNumberToObject(timings, "predicted_n", gen_count);
         cJSON_AddNumberToObject(timings, "predicted_ms", gen_ms);
         cJSON_AddNumberToObject(timings, "predicted_per_token_ms", gen_count > 0 ? gen_ms / gen_count : 0);
@@ -1487,8 +1497,9 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         srv.last_prompt_len = total_ctx_cn;
         srv.kv_pos = total_ctx_cn;
 
-        fprintf(stderr, "\n[server] /completion: prompt %d new+%d cached in %.0fms, gen %d in %.0fms (%.1f tok/s)\n",
-                n_prompt - start_pos, start_pos, gen_ms,
+        fprintf(stderr, "\n[server] /completion: prompt %d new+%d cached in %.0fms (%.1f tok/s), gen %d in %.0fms (%.1f tok/s)\n",
+                n_prompt - start_pos, start_pos, t_prefill_ms_ns,
+                (n_prompt - start_pos) > 0 ? (n_prompt - start_pos) / (t_prefill_ms_ns / 1000.0) : 0,
                 gen_count, gen_ms, gen_count > 0 ? gen_count / (gen_ms / 1000.0) : 0);
 
         free(generated);
