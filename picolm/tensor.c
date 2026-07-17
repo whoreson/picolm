@@ -1162,11 +1162,7 @@ void vec_add(float *a, const float *b, int size) {
  * an empty (start == end) range so they safely no-op instead of running
  * leftover data. */
 void tensor_parallel_for(int count, void (*fn)(int idx, void *ctx), void *ctx) {
-    /* Only thread when there's enough work per thread to amortize the
-     * mutex/condvar overhead. For decode attention (n_heads ~24-32), the
-     * per-head scan is light when pos is small, so we skip threading.
-     * For prefill attention (n_tokens * n_heads ~200+), threading helps. */
-    if (n_threads <= 1 || count < n_threads * 4) {
+    if (n_threads <= 1 || count < 2) {
         for (int i = 0; i < count; i++) fn(i, ctx);
         return;
     }
