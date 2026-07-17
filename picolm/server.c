@@ -593,8 +593,8 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
     if ((item = cJSON_GetObjectItem(req, "model"))) model_name = cJSON_GetStringValue(item);
     cJSON_Delete(req);
 
-    /* Encode prompt */
-    int max_pt = (int)strlen(prompt) + 3;
+    /* Encode prompt + reserve space for generated tokens */
+    int max_pt = (int)strlen(prompt) + 3 + max_tokens + 1;
     int *ptokens = (int *)malloc((size_t)max_pt * sizeof(int));
     int n_prompt;
     if (srv.use_qwen_tok) {
@@ -732,6 +732,9 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             double t_tok_start = gen_count > 0 ? t_prefill_end : get_time_ms();
             (void)t_tok_start; /* used for per-token tracking below */
 
+            /* Store generated token for KV cache persistence */
+            if (total_generation_tokens + 1 < max_pt) ptokens[n_prompt + total_generation_tokens] = next;
+
             char *cj = cJSON_PrintUnformatted(chunk);
             if (sse_send(sock, cj, NULL) < 0) {
                 free(cj); cJSON_Delete(chunk); break;
@@ -787,7 +790,15 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         send_chunked(sock, "data: [DONE]\r\n", 14);
         send_chunked(sock, "", 0);
 
-        srv.kv_pos = n_prompt;
+        /* Save prompt + generated tokens for next request */
+        int total_ctx = n_prompt + total_generation_tokens;
+        if (total_ctx > srv.max_last_prompt) {
+            srv.max_last_prompt = total_ctx * 2;
+            srv.last_prompt_tokens = (int *)realloc(srv.last_prompt_tokens, (size_t)srv.max_last_prompt * sizeof(int));
+        }
+        memcpy(srv.last_prompt_tokens, ptokens, (size_t)total_ctx * sizeof(int));
+        srv.last_prompt_len = total_ctx;
+        srv.kv_pos = total_ctx;
 
         fprintf(stderr, "\n[server] OAI stream: prompt %d new+%d cached in %.0fms (%.1f tok/s), gen %d in %.0fms (%.1f tok/s)\n",
                 prompt_evaluated, start_pos, t_prefill_ms,
@@ -833,6 +844,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
                 gen_count_ns++;
 
                 int next = sampler_sample(&sampler, logits, model->config.vocab_size);
+                if (gen_count < max_pt - n_prompt) ptokens[n_prompt + gen_count] = next;
                 static char qwen_buf2[64];
                 const char *piece;
                 if (srv.use_qwen_tok) {
@@ -903,7 +915,15 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         free(json);
         cJSON_Delete(root);
 
-        srv.kv_pos = n_prompt;
+        /* Save prompt + generated tokens for next request */
+        int total_ctx_ns = n_prompt + total_generation_tokens;
+        if (total_ctx_ns > srv.max_last_prompt) {
+            srv.max_last_prompt = total_ctx_ns * 2;
+            srv.last_prompt_tokens = (int *)realloc(srv.last_prompt_tokens, (size_t)srv.max_last_prompt * sizeof(int));
+        }
+        memcpy(srv.last_prompt_tokens, ptokens, (size_t)total_ctx_ns * sizeof(int));
+        srv.last_prompt_len = total_ctx_ns;
+        srv.kv_pos = total_ctx_ns;
 
         fprintf(stderr, "\n[server] OAI: prompt %d new+%d cached in %.0fms (%.1f tok/s), gen %d in %.0fms (%.1f tok/s)\n",
                 prompt_evaluated_ns, start_pos, t_prefill_ms_ns,
@@ -1098,6 +1118,10 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
     double t_start = get_time_ms();
 
     if (do_stream) {
+        /* Buffer for generated tokens (for KV cache persistence) */
+        int *gen_tok_buf = (int *)malloc((size_t)(n_predict + 1) * sizeof(int));
+        int gen_tok_count = 0;
+
         /* Streaming: SSE per token, HTTP chunked transfer encoding */
         char hdr[256];
         snprintf(hdr, sizeof(hdr),
@@ -1144,6 +1168,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             }
 
             int next = sampler_sample(&sampler, logits, model->config.vocab_size);
+            if (gen_tok_count < n_predict + 1) gen_tok_buf[gen_tok_count++] = next;
             static char qwen_buf3[64];
             const char *piece;
             if (srv.use_qwen_tok) {
@@ -1245,6 +1270,18 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         free(cJSON_PrintUnformatted(final));
         cJSON_Delete(final);
         send_chunked(sock, "", 0);
+
+        /* Save prompt + generated tokens for next request */
+        int total_ctx_c = n_prompt + gen_count;
+        if (total_ctx_c > srv.max_last_prompt) {
+            srv.max_last_prompt = total_ctx_c * 2;
+            srv.last_prompt_tokens = (int *)realloc(srv.last_prompt_tokens, (size_t)srv.max_last_prompt * sizeof(int));
+        }
+        memcpy(srv.last_prompt_tokens, ptokens, (size_t)n_prompt * sizeof(int));
+        memcpy(srv.last_prompt_tokens + n_prompt, gen_tok_buf, (size_t)gen_count * sizeof(int));
+        srv.last_prompt_len = total_ctx_c;
+        srv.kv_pos = total_ctx_c;
+        free(gen_tok_buf);
 
         fprintf(stderr, "\n[server] /completion: prompt %d new+%d cached in %.0fms, gen %d in %.0fms (%.1f tok/s)\n",
                 n_prompt - start_pos, start_pos, t_prefill_ms,
@@ -1357,6 +1394,18 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         cJSON_Delete(resp);
 
         srv.kv_pos = n_prompt;
+
+        /* Save prompt + generated tokens for next request */
+        int total_ctx_cn = n_prompt + gen_count;
+        if (total_ctx_cn > srv.max_last_prompt) {
+            srv.max_last_prompt = total_ctx_cn * 2;
+            srv.last_prompt_tokens = (int *)realloc(srv.last_prompt_tokens, (size_t)srv.max_last_prompt * sizeof(int));
+        }
+        memcpy(srv.last_prompt_tokens, ptokens, (size_t)n_prompt * sizeof(int));
+        memcpy(srv.last_prompt_tokens + n_prompt, gen_token_ids, (size_t)gen_count * sizeof(int));
+        srv.last_prompt_len = total_ctx_cn;
+        srv.kv_pos = total_ctx_cn;
+
         fprintf(stderr, "\n[server] /completion: prompt %d new+%d cached in %.0fms, gen %d in %.0fms (%.1f tok/s)\n",
                 n_prompt - start_pos, start_pos, gen_ms,
                 gen_count, gen_ms, gen_count > 0 ? gen_count / (gen_ms / 1000.0) : 0);
