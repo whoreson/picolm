@@ -1273,15 +1273,13 @@ static __attribute__((always_inline)) void attention_group(int kv_head_idx, void
         const uint8_t *vt = ctx->vcache + (size_t)t * ctx->n_kv_heads * ctx->kv_row_size_v + kv_h * ctx->kv_row_size_v;
 
 #ifdef PICOLM_AVX512
-        /* Load K once, convert to F32 */
-        __m512 k_vec[8]; /* 128 / 16 = 8 vectors for head_dim=128 */
+        /* Load K once, convert to F32 (16 F16 per chunk via fp16x16_to_fp32_inline) */
+        __m512 k_vec[8];
         {
             const uint16_t *k16 = (const uint16_t *)kt;
             int d = 0;
-            for (; d + 16 <= head_dim; d += 16) {
-                __m256i k_half = _mm256_loadu_si256((__m256i *)(k16 + d));
-                k_vec[d/16] = _mm512_cvtph_ps(k_half);
-            }
+            for (; d + 16 <= head_dim; d += 16)
+                k_vec[d/16] = fp16x16_to_fp32_inline(k16 + d);
         }
 
         /* Load V once, convert to F32 */
@@ -1289,10 +1287,8 @@ static __attribute__((always_inline)) void attention_group(int kv_head_idx, void
         {
             const uint16_t *v16 = (const uint16_t *)vt;
             int d = 0;
-            for (; d + 16 <= head_dim; d += 16) {
-                __m256i v_half = _mm256_loadu_si256((__m256i *)(v16 + d));
-                v_vec[d/16] = _mm512_cvtph_ps(v_half);
-            }
+            for (; d + 16 <= head_dim; d += 16)
+                v_vec[d/16] = fp16x16_to_fp32_inline(v16 + d);
         }
 
         for (int g = 0; g < kv_mul; g++) {
