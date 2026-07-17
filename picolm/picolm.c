@@ -318,60 +318,67 @@ int main(int argc, char **argv) {
         total_steps = model.config.max_seq_len;
     }
 
-    /* Batch prefill: disabled until matmul_batch gets proper threading.
-     * matmul_batch is single-threaded and slower than per-token matmul
-     * which uses the thread pool. When threading is added, batch prefill
-     * will be faster because weights are read once for all tokens. */
-    int token = start_pos > 0 ? prompt_tokens[start_pos - 1] : prompt_tokens[0];
+    /* Batch prefill: process all prompt tokens at once (attention/FFN models only) */
+    float *logits = NULL;
+    if (n_prompt > 0 && !model.config.has_ssm) {
+        /* Use batched prefill for all prompt tokens (standard attention/FFN models) */
+        logits = model_forward_prefill(&model, prompt_tokens, n_prompt, start_pos);
+        pos = start_pos + n_prompt - 1;
+    } else if (n_prompt > 0) {
+        /* SSM models (Qwen3.5/3.6): use per-token prefill */
+        int token = start_pos > 0 ? prompt_tokens[start_pos - 1] : prompt_tokens[0];
+        for (int p = start_pos; p < start_pos + n_prompt; p++) {
+            logits = model_forward(&model, token, p);
+            token = prompt_tokens[p + 1 - start_pos];
+        }
+        pos = start_pos + n_prompt;
+    } else {
+        /* No prompt: just generate from BOS */
+        logits = model_forward(&model, tokenizer.bos_id, pos);
+    }
 
+    int token = 0;
+    int next = 0;
     for (; pos < total_steps; pos++) {
-        /* Forward pass */
-        float *logits = model_forward(&model, token, pos);
-
-        int next;
-        if (pos < n_prompt - 1) {
-            /* Prefill: use next prompt token */
-            next = prompt_tokens[pos + 1];
-        } else {
-            /* Generation: apply grammar constraints, then sample */
-            if (pos == n_prompt - 1) {
-                t_first_token = get_time_ms();
-            }
-
-            grammar_apply(&grammar, logits, model.config.vocab_size);
-            next = sampler_sample(&sampler, logits, model.config.vocab_size);
-            
-            /* Update grammar state with the generated token */
-            grammar_advance(&grammar, &tokenizer, next);
-
-            /* Decode and print */
-            static char qwen_decode_buf[64];
-            char *decode_str;
-            if (use_qwen_tok) {
-                qwen_tokenize_decode(&qwen_enc, next, qwen_decode_buf, sizeof(qwen_decode_buf));
-                decode_str = qwen_decode_buf;
-            } else {
-                decode_str = (char *)tokenizer_decode(&tokenizer, token, next);
-            }
-            printf("%s", decode_str);
-            fflush(stdout);
-            /* Also capture in buffer */
-            { int plen = (int)strlen(decode_str);
-              if (gen_buf_len + plen < max_tokens * 16 - 1) {
-                  memcpy(gen_buf + gen_buf_len, decode_str, plen);
-                  gen_buf_len += plen;
-              }
-            }
-
-            total_gen++;
-
-            /* Stop on EOS or grammar completion */
-            int eos_id = use_qwen_tok ? qwen_enc.bos_id : tokenizer.eos_id;
-            if (next == eos_id) break;
-            if (grammar_is_complete(&grammar)) break;
+        /* Generation: apply grammar constraints, then sample */
+        if (pos == n_prompt - 1) {
+            t_first_token = get_time_ms();
         }
 
+        grammar_apply(&grammar, logits, model.config.vocab_size);
+        next = sampler_sample(&sampler, logits, model.config.vocab_size);
+
+        /* Update grammar state with the generated token */
+        grammar_advance(&grammar, &tokenizer, next);
+
+        /* Decode and print */
+        static char qwen_decode_buf[64];
+        char *decode_str;
+        if (use_qwen_tok) {
+            qwen_tokenize_decode(&qwen_enc, next, qwen_decode_buf, sizeof(qwen_decode_buf));
+            decode_str = qwen_decode_buf;
+        } else {
+            decode_str = (char *)tokenizer_decode(&tokenizer, token, next);
+        }
+        printf("%s", decode_str);
+        fflush(stdout);
+        /* Also capture in buffer */
+        { int plen = (int)strlen(decode_str);
+          if (gen_buf_len + plen < max_tokens * 16 - 1) {
+              memcpy(gen_buf + gen_buf_len, decode_str, plen);
+              gen_buf_len += plen;
+          }
+        }
+
+        total_gen++;
+
+        /* Stop on EOS or grammar completion */
+        int eos_id = use_qwen_tok ? qwen_enc.bos_id : tokenizer.eos_id;
+        if (next == eos_id) break;
+        if (grammar_is_complete(&grammar)) break;
+
         token = next;
+        logits = model_forward(&model, token, pos + 1);
     }
 
     printf("\n");
