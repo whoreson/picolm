@@ -1302,6 +1302,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         cJSON_AddStringToObject(final, "stop_type", stop_type);
         cJSON_AddStringToObject(final, "stopping_word", stopping_word);
         cJSON_AddNumberToObject(final, "tokens_evaluated", n_prompt);
+        cJSON_AddNumberToObject(final, "tokens_cached", start_pos);
         cJSON *timings_c = cJSON_CreateObject();
         cJSON_AddNumberToObject(timings_c, "cache_n", start_pos);
         cJSON_AddNumberToObject(timings_c, "prompt_n", n_prompt - start_pos);
@@ -1415,6 +1416,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         cJSON_AddStringToObject(resp, "stop_type", stop_type);
         cJSON_AddStringToObject(resp, "stopping_word", stopping_word);
         cJSON_AddNumberToObject(resp, "tokens_evaluated", n_prompt);
+        cJSON_AddNumberToObject(resp, "tokens_cached", start_pos);
         cJSON_AddNumberToObject(resp, "tokens_predicted", gen_count);
 
         if (model_name) cJSON_AddStringToObject(resp, "model", model_name);
