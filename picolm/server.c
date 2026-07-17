@@ -233,6 +233,42 @@ static int http_parse_request(char *buf, int len, char *method, int mlen, char *
     return have;
 }
 
+/* Read the full request body after headers. The body starts right after \r\n\r\n
+ * in buf. Returns the body length (bytes available after \r\n\r\n). */
+static int http_read_body(char *buf, int buf_len, int header_len) {
+    /* Find Content-Length header */
+    char *cl = strstr(buf, "Content-Length:");
+    int content_length = -1;
+    if (cl) {
+        content_length = atoi(cl + 15);
+    }
+
+    /* Find end of headers (\r\n\r\n) */
+    char *hdr_end = strstr(buf, "\r\n\r\n");
+    if (!hdr_end) return 0;
+    int body_off = (int)(hdr_end - buf) + 4; /* offset where body starts */
+    int have = header_len - body_off;         /* body bytes already in buffer */
+
+    if (content_length > 0) {
+        if (have >= content_length) {
+            /* Body fully in buffer already - common case (curl, small POSTs) */
+            return content_length;
+        }
+        /* Need to read more body bytes */
+        int remaining = content_length - have;
+        while (remaining > 0 && body_off + content_length < buf_len) {
+            int n = recv(srv.sock_in_buf, buf + body_off + have, remaining, 0);
+            if (n <= 0) return -1;
+            have += n;
+            remaining -= n;
+        }
+        buf[body_off + have] = '\0';
+        return have;
+    }
+    /* No Content-Length: whatever is already in buffer */
+    return have;
+}
+
 /* ---- Global server state ---- */
 
 /* ---- Endpoint: GET /v1/models ---- */
@@ -1439,15 +1475,20 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
 static void handle_request(SOCKET sock) {
     char method[16], path[512];
     srv.sock_in_buf = sock;
-    int body_len = http_parse_request(srv.recv_buf, sizeof(srv.recv_buf), method, sizeof(method), path, sizeof(path));
-    if (body_len < 0) {
+    int header_len = http_parse_request(srv.recv_buf, sizeof(srv.recv_buf), method, sizeof(method), path, sizeof(path));
+    if (header_len < 0) {
         return;
     }
 
-    char *body_start = strstr(srv.recv_buf, "\r\n\r\n");
-    if (!body_start) body_start = srv.recv_buf + body_len;
-    else body_start += 4;
+    /* Read body if this is a POST */
+    if (strcmp(method, "POST") == 0) {
+        http_read_body(srv.recv_buf, sizeof(srv.recv_buf), header_len);
+    }
 
+    char *body_start = strstr(srv.recv_buf, "\r\n\r\n");
+    if (!body_start) body_start = srv.recv_buf + header_len;
+    else body_start += 4;
+    
     if (strcmp(method, "GET") == 0) {
         if (strcmp(path, "/v1/models") == 0) {
             handle_list_models(sock, srv.model_path);
