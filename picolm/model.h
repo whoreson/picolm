@@ -221,6 +221,10 @@ int model_load_safetensors(model_t *m, const char *model_dir, int max_seq_len, k
  * Returns the number of layers locked, or 0 on failure. */
 int model_lock_layers(model_t *m, size_t mem_bytes);
 
+/* Enable prefaulting: touch every mmap page at load time to bring the
+ * model into the page cache before inference begins. Call before model_load. */
+void model_set_prefault(int v);
+
 /* Unlock previously pinned weight layers. Returns 0 on success. */
 int model_unlock_layers(model_t *m);
 

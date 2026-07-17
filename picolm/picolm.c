@@ -39,6 +39,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -c <int>       Context length override\n");
     fprintf(stderr, "  -j <int>       Number of threads (default: 4)\n");
     fprintf(stderr, "  --mem <MB>      Pin this many MB of layers in RAM (mlock)\n");
+    fprintf(stderr, "  --prefault      Prefault all model pages into RAM at load time\n");
     fprintf(stderr, "\nServer options:\n");
     fprintf(stderr, "  --server <model> Start HTTP server (OpenAI-compatible)\n");
     fprintf(stderr, "  --port <int>     Server port (default: 8080)\n");
@@ -87,7 +88,8 @@ int main(int argc, char **argv) {
     const char *cache_file = NULL;
     kv_cache_type_t kv_type_k = KV_CACHE_F16;
     kv_cache_type_t kv_type_v = KV_CACHE_F16;
-    int    mem_mb = 0;  /* --mem budget in megabytes (0=disabled) */
+    int    mem_mb = 0;      /* --mem budget in megabytes (0=disabled) */
+    int    do_prefault = 0; /* --prefault (touch all mmap pages at load time) */
     int    server_mode = 0;
     int    server_port = 8080;
     char   server_host[256] = "0.0.0.0";
@@ -124,6 +126,8 @@ int main(int argc, char **argv) {
             cache_file = argv[++i];
         } else if (strcmp(argv[i], "--mem") == 0 && i + 1 < argc) {
             mem_mb = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--prefault") == 0) {
+            do_prefault = 1;
         } else if ((strcmp(argv[i], "-ctk") == 0 || strcmp(argv[i], "-ctv") == 0) && i + 1 < argc) {
             const char *typestr = argv[++i];
             kv_cache_type_t *tgt = (strcmp(argv[i-1], "-ctk") == 0) ? &kv_type_k : &kv_type_v;
@@ -193,6 +197,9 @@ int main(int argc, char **argv) {
     fp16_table_init();
 
     /* Auto-detect: if path is a directory with safetensors files, use safetensors loader */
+    /* Enable prefaulting before model load (affects mmap_file in model_load) */
+    model_set_prefault(do_prefault);
+
     int is_safetensors = 0;
     {
         char idx_path[4096];
