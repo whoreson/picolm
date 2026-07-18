@@ -1584,6 +1584,36 @@ float vec_dot_q4_K_q8_K(const void *src_q4, const void *src_q8, int n) {
  *   SSE2: 128-bit int8 MAC, scalar float accum
  * ================================================================ */
 
+#if defined(PICOLM_AVX512)
+/* AVX-512 signed int8 x int8 dot product, 64 pairs per call (2 q8_0
+ * blocks' worth). Note _mm512_sign_epi8 does not exist in AVX-512 (Intel
+ * didn't extend the SSSE3 "sign" instructions to 512-bit) -- the usual
+ * abs(x)/sign(y,x) trick needs a mask-based substitute: extract the sign
+ * bit of each byte of x with _mm512_movepi8_mask, then blend y against
+ * -y using that mask. When x's byte is 0 the "sign" is arbitrary, but
+ * ax=abs(x) is also 0 there so the product is 0 regardless -- matches
+ * _mm256_sign_epi8's behavior for that case.
+ * With AVX512-VNNI, _mm512_dpbusd_epi32 does the unsigned x signed
+ * multiply-and-reduce to int32 in one instruction (also sidesteps the
+ * int16 intermediate _mm512_maddubs_epi16 produces, though for q8_0's
+ * +-127 range that intermediate never overflows int16 anyway -- the
+ * win here is purely fewer instructions). Falls back to
+ * maddubs+madd (still 512-bit, still 2 blocks/call) without VNNI. */
+static inline __m512i mul_sum_i8_pairs_avx512(const __m512i x, const __m512i y) {
+    __m512i ax = _mm512_abs_epi8(x);
+    __mmask64 neg_mask = _mm512_movepi8_mask(x);
+    __m512i neg_y = _mm512_sub_epi8(_mm512_setzero_si512(), y);
+    __m512i sy = _mm512_mask_blend_epi8(neg_mask, y, neg_y);
+#if defined(__AVX512VNNI__)
+    return _mm512_dpbusd_epi32(_mm512_setzero_si512(), ax, sy);
+#else
+    __m512i dot = _mm512_maddubs_epi16(ax, sy);
+    __m512i ones = _mm512_set1_epi16(1);
+    return _mm512_madd_epi16(ones, dot);
+#endif
+}
+#endif
+
 #if defined(PICOLM_AVX2) || defined(PICOLM_AVX) || defined(PICOLM_SSE2)
 static inline __m128i mul_sum_i8_pairs_sse(const __m128i x, const __m128i y) {
     __m128i ax = _mm_sign_epi8(x, x);
@@ -2022,6 +2052,38 @@ float vec_dot_q8_0_q8_0_deltas(const void *qx, const float *qx_d, const void *qw
         }
     }
     sumf = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
+
+#elif defined(PICOLM_AVX512)
+    /* 512-bit wide: 2 q8_0 blocks (64 int8 elements) per iteration,
+     * instead of AVX2's 1 block (32 elements) per iteration -- see
+     * mul_sum_i8_pairs_avx512's comment for the VNNI vs. maddubs+madd
+     * choice. Each 512-bit dot-product result holds 16 int32 lanes:
+     * lanes 0-7 are block i's partial sums, lanes 8-15 are block i+1's,
+     * so the two blocks' (different) per-block deltas are packed into
+     * a matching low-8/high-8 float vector and applied with one fmadd
+     * instead of extracting and horizontally summing each half
+     * separately -- only the running accumulator needs a final
+     * reduce, same as the AVX2 path's single hsum_avx after the loop. */
+    __m512 acc = _mm512_setzero_ps();
+
+    for (i = 0; i + 1 < nb; i += 2) {
+        __m256i qx0 = _mm256_loadu_si256((const __m256i *)x[i].qs);
+        __m256i qx1 = _mm256_loadu_si256((const __m256i *)x[i + 1].qs);
+        __m256i qw0 = _mm256_loadu_si256((const __m256i *)w[i].qs);
+        __m256i qw1 = _mm256_loadu_si256((const __m256i *)w[i + 1].qs);
+        __m512i xx = _mm512_inserti64x4(_mm512_castsi256_si512(qx0), qx1, 1);
+        __m512i ww = _mm512_inserti64x4(_mm512_castsi256_si512(qw0), qw1, 1);
+
+        __m512i dot = mul_sum_i8_pairs_avx512(xx, ww);
+        __m512 f = _mm512_cvtepi32_ps(dot);
+
+        float d0 = qx_d[i] * fp16_to_fp32_lookup(w[i].d);
+        float d1 = qx_d[i + 1] * fp16_to_fp32_lookup(w[i + 1].d);
+        __m512 dvec = _mm512_insertf32x8(_mm512_castps256_ps512(_mm256_set1_ps(d0)),
+                                          _mm256_set1_ps(d1), 1);
+        acc = _mm512_fmadd_ps(f, dvec, acc);
+    }
+    sumf = _mm512_reduce_add_ps(acc);
 
 #elif defined(PICOLM_AVX2)
     __m256 acc = _mm256_setzero_ps();
