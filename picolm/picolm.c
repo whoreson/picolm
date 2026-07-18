@@ -22,6 +22,7 @@ double get_time_ms(void) {
 }
 #else
 #include <sys/time.h>
+#include <sys/types.h>
 #include <unistd.h>
 double get_time_ms(void) {
     struct timeval tv;
@@ -170,12 +171,13 @@ int main(int argc, char **argv) {
 
     /* Server mode: start HTTP server (no prompt needed) */
     if (server_mode) {
-        /* Daemonize if requested */
+        /* Daemonize if requested (Unix-only) */
+#ifndef _WIN32
         if (server_daemon) {
             pid_t pid = fork();
             if (pid < 0) { perror("fork"); return 1; }
             if (pid > 0) {
-                fprintf(stderr, "[server] Daemonized with PID %d\n", pid);
+                fprintf(stderr, "[server] Daemonized with PID %d\n", (int)pid);
                 return 0;
             }
             /* Child: redirect stdio to /dev/null */
@@ -188,6 +190,7 @@ int main(int argc, char **argv) {
             setsid(); /* create new session */
             setsid(); /* create new session */
         }
+#endif
         fp16_table_init();
         extern int server_main(int port, const char *host, const char *model_path, int num_threads, int do_prefault, int context_override);
         return server_main(server_port, server_host, model_path, num_threads, do_prefault, context_override);
@@ -227,6 +230,7 @@ int main(int argc, char **argv) {
     model_set_prefault(do_prefault);
 
     int is_safetensors = 0;
+#ifndef _WIN32
     {
         char idx_path[4096];
         snprintf(idx_path, sizeof(idx_path), "%s/model.safetensors.index.json", model_path);
@@ -236,6 +240,17 @@ int main(int argc, char **argv) {
             if (access(idx_path, F_OK) == 0) is_safetensors = 1;
         }
     }
+#else
+    {
+        char idx_path[4096];
+        snprintf(idx_path, sizeof(idx_path), "%s/model.safetensors.index.json", model_path);
+        if (GetFileAttributesA(idx_path) != INVALID_FILE_ATTRIBUTES) is_safetensors = 1;
+        if (!is_safetensors) {
+            snprintf(idx_path, sizeof(idx_path), "%s/model.safetensors", model_path);
+            if (GetFileAttributesA(idx_path) != INVALID_FILE_ATTRIBUTES) is_safetensors = 1;
+        }
+    }
+#endif
     int load_ok = 0;
     if (is_safetensors) {
         load_ok = (model_load_safetensors(&model, model_path, context_override, kv_type_k, kv_type_v) == 0);
@@ -403,7 +418,7 @@ int main(int argc, char **argv) {
         total_gen++;
 
         /* Stop on EOS or grammar completion */
-        if (next == tokenizer.eos_id) break;
+        if (next == (int)tokenizer.eos_id) break;
         if (grammar_is_complete(&grammar)) break;
 
         token = next;
