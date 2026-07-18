@@ -192,8 +192,8 @@ int main(int argc, char **argv) {
         }
 #endif
         fp16_table_init();
-        extern int server_main(int port, const char *host, const char *model_path, int num_threads, int do_prefault, int context_override);
-        return server_main(server_port, server_host, model_path, num_threads, do_prefault, context_override);
+        extern int server_main(int port, const char *host, const char *model_path, int num_threads, int do_prefault, int context_override, int mem_mb);
+        return server_main(server_port, server_host, model_path, num_threads, do_prefault, context_override, mem_mb);
     }
 
     if (!prompt) {
