@@ -358,6 +358,9 @@ static int parse_gguf(model_t *m, int max_seq_len) {
             } else {
                 int dummy; skip_meta_value(&r, vtype, &dummy);
             }
+        } else if (str_eq(key, "qwen35.rope.dimension_count")
+            || str_eq(key, "llama.rope.dimension_count")) {
+            int dummy; cfg->rope_dim = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "rope.dimension_sections")
             || str_eq(key, "qwen35.rope.dimension_sections")) {
             /* ARRAY of I32 (elem_type=5): [11, 11, 10, 0] for Qwen3.5 */
@@ -1681,30 +1684,19 @@ static void dbg_vec(const char *tag, float *v, int n, int max_print) {
 }
 #endif
 
-/* Qwen3.5 GGUF v-head reordering: two patterns depending on tensor type.
+/* Qwen3.5 GGUF v-head reordering (all v-head-indexed tensors).
  *
- * Pattern 1 (head_dim=1, for dt_bias and ssm_a 1D tensors):
- *   Sequential: [k0v0, k0v1, k0v2, ..., k0v7, k1v0, ..., k3v7]
- *   GGUF:       [k0v0, k0v2, k0v4, k0v6, k1v0, k1v2, ..., k3v7,
- *                k0v1, k0v3, k0v5, k0v7, k1v1, ..., k3v7]
- *   Even v-indices first (stride-2), then odd v-indices.
+ * The GGUF converter reorders via _reorder_v_heads: a simple transpose.
+ *   Sequential: [k0v0, k0v1, k0v2, ..., k1v0, ...]
+ *   GGUF:       [v0*k, v1*k, ..., vn_vpk-1*k] for each k group
+ *   GGUF_index = v * n_k + k  where  k = h / n_vpk,  v = h % n_vpk
  *
- * Pattern 2 (head_dim=head_v_dim, for attn_gate_ssm, attn_qkv V portion,
- *   ssm_conv1d V channels, ssm_alpha, ssm_beta, ssm_out):
- *   Sequential: [k0*8 blocks, k1*8 blocks, k2*8 blocks, k3*8 blocks]
- *   GGUF:       [v0*4 blocks, v1*4 blocks, ..., v7*4 blocks]
- *   Simple transpose: GGUF_group = v * n_k + k
+ * This applies uniformly to ALL v-head-indexed tensors:
+ *   attn_gate_ssm, attn_qkv V portion, ssm_conv1d V channels,
+ *   ssm_alpha, ssm_beta, ssm_out columns, dt_bias, ssm_a.
  */
 
-/* Pattern 1: dt_bias / ssm_a (head_dim=1, stride-2) */
-static inline int qwen35_vhead_gguf_1d(int h, int n_vpk, int n_k, int half_vpk) {
-    int k = h / n_vpk;
-    int v = h % n_vpk;
-    return ((v >> 1) * n_k + k) + (v & 1) * (n_k * half_vpk);
-}
-
-/* Pattern 2: attn_gate_ssm, attn_qkv V, conv1d V, ssm_alpha, ssm_beta, ssm_out
- * (head_dim=head_v_dim, simple transpose) */
+/* Simple transpose: sequential head h -> GGUF index */
 static inline int qwen35_vhead_gguf(int h, int n_vpk, int n_k) {
     int k = h / n_vpk;
     int v = h % n_vpk;

@@ -16,6 +16,7 @@ typedef struct {
     int *vocab_len;
     int vocab_size;
     int bos_id;
+    int eos_id;
 } qwen_enc_t;
 
 /* Check if a model should use the Qwen tokenizer */

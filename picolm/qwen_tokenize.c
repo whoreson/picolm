@@ -268,6 +268,7 @@ int qwen_tokenize_init(qwen_enc_t *enc, const model_t *m) {
         }
     }
     enc->bos_id = (int)m->tok_bos_id;
+    enc->eos_id = m->tok_eos_id; /* fallback: same as bos if GGUF missing it */
 
     /* Build token lookup hash table */
     {
