@@ -22,6 +22,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -321,6 +324,9 @@ static int server_init(const char *model_path, int num_threads, int do_prefault,
 
     tensor_set_threads(num_threads);
     tensor_threadpool_init(num_threads);
+#ifdef _OPENMP
+    omp_set_num_threads(num_threads); /* match OpenMP to custom pool */
+#endif
 
     srv.use_qwen_tok = qwen_tokenize_should_use(&srv.model);
     if (srv.use_qwen_tok) {

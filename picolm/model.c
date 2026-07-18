@@ -10,6 +10,9 @@
 #include <math.h>
 #include <errno.h>
 #include <time.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -2491,6 +2494,9 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
     /* Embedding lookup */
     {
         size_t row_bytes = gguf_type_row_size(w->type_token_embd, dim);
+        #ifdef _OPENMP
+#pragma omp parallel for
+#endif
         for (int bi = 0; bi < n_tokens; bi++) {
             const void *er = (const uint8_t *)w->token_embd + (size_t)tokens[bi] * row_bytes;
             dequantize_row(er, x_batch + bi * dim, dim, w->type_token_embd);
@@ -2502,6 +2508,9 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         layer_weights_t *lw = &w->layers[l];
 
         /* RMSNorm */
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
         for (int bi = 0; bi < n_tokens; bi++)
             rmsnorm(xb_batch + bi * dim, x_batch + bi * dim, s->attn_norm_w[l], dim, c->rms_norm_eps);
 
@@ -2521,6 +2530,9 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         {
             uint8_t *kcl = s->key_cache + (size_t)l * seq_len * c->n_kv_heads * s->kv_row_size_k;
             uint8_t *vcl = s->val_cache + (size_t)l * seq_len * c->n_kv_heads * s->kv_row_size_v;
+            #ifdef _OPENMP
+#pragma omp parallel for
+#endif
             for (int bi = 0; bi < n_tokens; bi++) {
                 int pos = start_pos + bi;
                 float *q_pos = q_batch + bi * q_dim;
@@ -2571,12 +2583,18 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         tensor_set_repacked(NULL);
 
         /* Residual: x += attn_out */
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
         for (int bi = 0; bi < n_tokens; bi++) {
             float *a = x_batch + bi * dim, *b = xb2_batch + bi * dim;
             for (int d2 = 0; d2 < dim; d2++) a[d2] += b[d2];
         }
 
         /* FFN RMSNorm */
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
         for (int bi = 0; bi < n_tokens; bi++)
             rmsnorm(xb_batch + bi * dim, x_batch + bi * dim, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
 
@@ -2588,6 +2606,9 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         tensor_set_repacked(NULL);
 
         /* SiLU + mul */
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
         for (int bi = 0; bi < n_tokens; bi++) {
             silu(hb_batch + bi * n_ffn, n_ffn);
             elemwise_mul(hb_batch + bi * n_ffn, hb_batch + bi * n_ffn, hb2_batch + bi * n_ffn, n_ffn);
@@ -2599,6 +2620,9 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         tensor_set_repacked(NULL);
 
         /* Residual: x += ffn_out */
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
         for (int bi = 0; bi < n_tokens; bi++) {
             float *a = x_batch + bi * dim, *b = xb2_batch + bi * dim;
             for (int d2 = 0; d2 < dim; d2++) a[d2] += b[d2];

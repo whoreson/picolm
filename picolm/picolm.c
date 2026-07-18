@@ -8,6 +8,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -252,6 +255,9 @@ int main(int argc, char **argv) {
 
     tensor_set_threads(num_threads);
     tensor_threadpool_init(num_threads);
+#ifdef _OPENMP
+    omp_set_num_threads(num_threads); /* match OpenMP to custom pool */
+#endif
 
     /* Debug: print weight types */
     fprintf(stderr, "Weight type: %d, Emb type: %d, Output type: %d\n",
