@@ -6,7 +6,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/mman.h>
+#ifndef __WIN32
+#  include <sys/mman.h>
+#endif
 
 #include "model.h"
 #include "quant.h"
