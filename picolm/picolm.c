@@ -354,20 +354,14 @@ int main(int argc, char **argv) {
         total_steps = model.config.max_seq_len;
     }
 
-    /* Batch prefill: process all prompt tokens at once (attention/FFN models only) */
+    /* Batch prefill: process all prompt tokens at once */
     float *logits = NULL;
-    if (n_prompt > 0 && !model.config.has_ssm) {
-        /* Use batched prefill for all prompt tokens (standard attention/FFN models) */
+    if (n_prompt > 0) {
+        /* All models: use batched prefill.
+         * Attention models: full batching across tokens.
+         * SSM models: attention layers batched, SSM layers sequential per-token. */
         logits = model_forward_prefill(&model, prompt_tokens, n_prompt, start_pos);
         pos = start_pos + n_prompt - 1;
-    } else if (n_prompt > 0) {
-        /* SSM models (Qwen3.5/3.6): use per-token prefill */
-        int token = start_pos > 0 ? prompt_tokens[start_pos - 1] : prompt_tokens[0];
-        for (int p = start_pos; p < start_pos + n_prompt; p++) {
-            logits = model_forward(&model, token, p);
-            token = prompt_tokens[p + 1 - start_pos];
-        }
-        pos = start_pos + n_prompt;
     } else {
         /* No prompt: just generate from BOS */
         logits = model_forward(&model, tokenizer.bos_id, pos);

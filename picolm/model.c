@@ -914,9 +914,24 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
     /* SSM scratch buffer (shared across all SSM layers) */
     if (c->has_ssm) {
         int ssm_conv_dim = 2 * c->ssm_d_state * c->ssm_n_group + c->ssm_d_inner;
+        int ssm_d_state = c->ssm_d_state;
+        int ssm_n_group = c->ssm_n_group;
+        int ssm_d_inner = c->ssm_d_inner;
+        int ssm_dt_rank = c->ssm_dt_rank;
+        int n_v_heads_ssm = c->ssm_dt_rank;
+        /* ssm_tmp layout:
+         * conv_output[conv_dim] + q_conv[qk] + k_conv[qk] + v_conv[d_inner]
+         * + alpha[dt_rank] + gate[dt_rank] + beta[dt_rank] + gate_exp[dt_rank]
+         * + q_rep[d_state*n_v] + k_rep[d_state*n_v]
+         * + sk[d_state*n_v] + d_vals[d_state*n_v]
+         * + ssm_output[d_state*n_v] + final_output[d_state*n_v (= d_inner)]
+         */
+        int ssm_tmp_size = ssm_conv_dim + ssm_d_state*ssm_n_group*2 + ssm_d_inner
+            + ssm_dt_rank*4
+            + ssm_d_state*n_v_heads_ssm*2  /* q_rep + k_rep */
+            + ssm_d_state*n_v_heads_ssm*4  /* sk + d_vals + ssm_output + final_output */;
         s->ssm_tmp = p;
-        p += (ssm_conv_dim * 3 + c->ssm_d_state * c->ssm_n_group * 2 +
-              c->ssm_d_inner * 3 + c->ssm_dt_rank * 4);
+        p += ssm_tmp_size;
     }
 
     /* Pre-dequantize norm weights */
@@ -1725,7 +1740,7 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     int conv_dim = 2 * d_state * n_k_heads + c->ssm_d_inner;
     int head_v_dim = c->ssm_d_inner / n_v_heads;
     float eps = c->rms_norm_eps;
-
+    
     /* Qwen3.5 GGUF v-head reorder parameters (used throughout this function) */
     int n_k = c->ssm_n_group;
     int n_vpk = n_v_heads / n_k;
@@ -2509,8 +2524,22 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
     }
 
     /* Profiling counters */
+    int attn_ordinal = 0; /* KV cache ordinal for attention layers (SSM models) */
     for (int l = 0; l < c->n_layers; l++) {
         layer_weights_t *lw = &w->layers[l];
+
+        if (c->has_ssm && !lw->is_attn_layer) {
+            /* SSM layer: process tokens sequentially (stateful: conv_state + ssm_state) */
+            for (int bi = 0; bi < n_tokens; bi++) {
+                /* Copy batch token into s->x, call ssm_forward which does residual add */
+                memcpy(s->x, x_batch + bi * dim, dim * sizeof(float));
+                float *ssm_residual = s->xb2;
+                ssm_forward(m, s, s->x, ssm_residual, lw, l, start_pos + bi);
+                /* Copy result back to batch buffer */
+                memcpy(x_batch + bi * dim, s->x, dim * sizeof(float));
+            }
+            continue;
+        }
 
         /* RMSNorm */
 #ifdef _OPENMP
@@ -2533,8 +2562,9 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 
         /* Per-position: RoPE, KV store */
         {
-            uint8_t *kcl = s->key_cache + (size_t)l * seq_len * c->n_kv_heads * s->kv_row_size_k;
-            uint8_t *vcl = s->val_cache + (size_t)l * seq_len * c->n_kv_heads * s->kv_row_size_v;
+            int this_attn_ord = c->has_ssm ? attn_ordinal++ : l;
+            uint8_t *kcl = s->key_cache + (size_t)this_attn_ord * seq_len * c->n_kv_heads * s->kv_row_size_k;
+            uint8_t *vcl = s->val_cache + (size_t)this_attn_ord * seq_len * c->n_kv_heads * s->kv_row_size_v;
             #ifdef _OPENMP
 #pragma omp parallel for
 #endif
