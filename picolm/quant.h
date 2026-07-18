@@ -257,6 +257,7 @@ typedef struct {
  * Total: 8*2 + 8*16 = 144 bytes (same as 8 standard Q4_0 blocks)
  * Each block covers 8 rows x 32 values = 256 values.
  * Used by AVX2 kernel that processes 8 output rows simultaneously. */
+#pragma pack(push, 1)
 typedef struct {
     uint16_t d[8];      /* 8 FP16 deltas, one per row */
     uint8_t  qs[128];   /* interleaved nibble-bytes (8 rows x 16 bytes, XOR'd with 0x88) */
