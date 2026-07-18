@@ -6,7 +6,7 @@
 #include <stddef.h>
 
 #define GGUF_MAGIC 0x46554747
-#define MAX_LAYERS 64
+#define MAX_LAYERS 128
 
 /* Magic for KV cache files */
 #define KVCACHE_MAGIC 0x4B564350  /* "KVCP" */
