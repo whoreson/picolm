@@ -275,7 +275,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         tokenizer.bos_id = qwen_enc.bos_id;
-        tokenizer.eos_id = qwen_enc.bos_id; /* Qwen3.5/3.6: BOS == EOS */
+        tokenizer.eos_id = qwen_enc.eos_id;
         tokenizer.vocab_size = qwen_enc.vocab_size;
         fprintf(stderr, "Using native Qwen GPT-2 BPE tokenizer\n");
     } else {
@@ -308,9 +308,16 @@ int main(int argc, char **argv) {
     int *prompt_tokens = (int *)malloc((size_t)max_prompt_tokens * sizeof(int));
     int n_prompt;
     if (use_qwen_tok) {
-        n_prompt = qwen_tokenize_encode(&qwen_enc, prompt, prompt_tokens + 1, max_prompt_tokens - 1);
-        prompt_tokens[0] = (int)tokenizer.bos_id;
-        n_prompt++;
+        /* Qwen3.5 GGUF has no bos_token_id, so tok_bos_id=11 is just the gpt2 fallback.
+           Don't prepend it - llama.cpp doesn't either (add_bos=false for qwen35 pretype).
+           Qwen3.6 has bos_token_id=248044 from GGUF, so prepend that. */
+        if (tokenizer.bos_id != 11) {
+            n_prompt = qwen_tokenize_encode(&qwen_enc, prompt, prompt_tokens + 1, max_prompt_tokens - 1);
+            prompt_tokens[0] = (int)tokenizer.bos_id;
+            n_prompt++;
+        } else {
+            n_prompt = qwen_tokenize_encode(&qwen_enc, prompt, prompt_tokens, max_prompt_tokens);
+        }
     } else {
         n_prompt = tokenizer_encode(&tokenizer, prompt, prompt_tokens, max_prompt_tokens, 1);
     }
@@ -396,8 +403,7 @@ int main(int argc, char **argv) {
         total_gen++;
 
         /* Stop on EOS or grammar completion */
-        int eos_id = use_qwen_tok ? qwen_enc.bos_id : tokenizer.eos_id;
-        if (next == eos_id) break;
+        if (next == tokenizer.eos_id) break;
         if (grammar_is_complete(&grammar)) break;
 
         token = next;
