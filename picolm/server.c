@@ -278,7 +278,7 @@ static int http_read_body(char *buf, int buf_len, int header_len) {
 
 /* ---- Server init / free (persistent model) ---- */
 
-static int server_init(const char *model_path, int num_threads, int do_prefault, int context_override) {
+static int server_init(const char *model_path, int num_threads, int do_prefault, int context_override, int mem_mb) {
     fprintf(stderr, "[server] Loading model: %s\n", model_path);
     fp16_table_init();
 
@@ -320,6 +320,13 @@ static int server_init(const char *model_path, int num_threads, int do_prefault,
     if (do_prefault) {
         extern void model_prefault(model_t *m);
         model_prefault(&srv.model);
+    }
+
+    /* Pin layers in RAM if --mem was specified */
+    if (mem_mb > 0) {
+        size_t budget = (size_t)mem_mb * 1024 * 1024;
+        extern int model_lock_layers(model_t *m, size_t budget);
+        model_lock_layers(&srv.model, budget);
     }
 
     tensor_set_threads(num_threads);
@@ -711,19 +718,26 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         /* ---- Prefill phase ---- */
         float *logits = NULL;
         int n_prefill = n_prompt - start_pos;
+        int client_dropped = 0;
 
         if (n_prefill > 0 && !model->config.has_ssm) {
-            /* Batched prefill for non-SSM models */
+            /* Batched prefill for non-SSM models (fast, runs to completion) */
             logits = model_forward_prefill(model, ptokens + start_pos, n_prefill, start_pos);
         } else if (n_prefill > 0) {
-            /* Per-token prefill for SSM models or single-token prefill */
+            /* Per-token prefill for SSM models: check client between tokens */
             int token_p = start_pos > 0 ? ptokens[start_pos - 1] : ptokens[0];
             for (int pos = start_pos; pos < n_prompt; pos++) {
+                if (!client_alive(sock)) { client_dropped = 1; break; }
                 logits = model_forward(model, token_p, pos);
                 token_p = ptokens[pos + 1];
             }
         }
         /* else: fully cached (n_prefill <= 0), no prefill needed */
+
+        if (client_dropped) {
+            free(chat_prompt); free(raw_prompt_copy); free(ptokens);
+            return;
+        }
 
         double t_prefill_end = get_time_ms();
 
@@ -881,15 +895,22 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             /* Prefill phase */
             float *logits_ns = NULL;
             int n_prefill_ns = n_prompt - start_pos;
+            int client_dropped_ns = 0;
 
             if (n_prefill_ns > 0 && !model->config.has_ssm) {
                 logits_ns = model_forward_prefill(model, ptokens + start_pos, n_prefill_ns, start_pos);
             } else if (n_prefill_ns > 0) {
                 int token_p = start_pos > 0 ? ptokens[start_pos - 1] : ptokens[0];
                 for (int pos = start_pos; pos < n_prompt; pos++) {
+                    if (!client_alive(sock)) { client_dropped_ns = 1; break; }
                     logits_ns = model_forward(model, token_p, pos);
                     token_p = ptokens[pos + 1];
                 }
+            }
+
+            if (client_dropped_ns) {
+                free(chat_prompt); free(raw_prompt_copy); free(ptokens);
+                return;
             }
 
             if (gen_count_ns == 0) t_prefill_end_ns = get_time_ms();
@@ -1604,14 +1625,14 @@ static void handle_request(SOCKET sock) {
 
 /* ---- Server Main Loop ---- */
 
-int server_main(int port, const char *host, const char *model_path, int num_threads, int do_prefault, int context_override) {
+int server_main(int port, const char *host, const char *model_path, int num_threads, int do_prefault, int context_override, int mem_mb) {
     srv.port = port;
     strncpy(srv.host, host, sizeof(srv.host) - 1);
     srv.model_path = model_path;
     srv.running = 1;
 
     /* Load model once at startup */
-    if (server_init(model_path, num_threads, do_prefault, context_override) != 0) {
+    if (server_init(model_path, num_threads, do_prefault, context_override, mem_mb) != 0) {
         return -1;
     }
 
