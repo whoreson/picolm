@@ -579,6 +579,9 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
     model_t *model = &srv.model;
     tokenizer_t *tokenizer = &srv.tokenizer;
 
+    double t0 = get_time_ms();
+    fprintf(stderr, "\n[server] === request start (%s) ===\n", is_chat ? "chat" : "completion");
+
     cJSON *req = cJSON_ParseWithLength(request_body, strlen(request_body));
     if (!req) {
         http_send(sock, 400, "application/json", "{\"error\":{\"message\":\"Invalid JSON\"}}");
@@ -609,6 +612,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         if (sti) sys_template = cJSON_GetStringValue(sti);
 
         chat_prompt = chat_to_prompt(messages, sys_template);
+        fprintf(stderr, "[server] %.1fms: chat template built (%d chars)\n", get_time_ms() - t0, (int)strlen(chat_prompt));
         if (!chat_prompt) {
             http_send(sock, 400, "application/json", "{\"error\":{\"message\":\"Failed to build prompt\"}}");
             cJSON_Delete(req);
@@ -641,16 +645,19 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
     if (n_choices > 4) n_choices = 4;
     if ((item = cJSON_GetObjectItem(req, "model"))) model_name = cJSON_GetStringValue(item);
     cJSON_Delete(req);
+    fprintf(stderr, "[server] %.1fms: params parsed (stream=%d, max_tok=%d, n=%d)\n", get_time_ms() - t0, do_stream, max_tokens, n_choices);
 
     /* Encode prompt + reserve space for generated tokens */
     int max_pt = (int)strlen(prompt) + 3 + max_tokens + 1;
     int *ptokens = (int *)malloc((size_t)max_pt * sizeof(int));
     int n_prompt;
+    double t_tok = get_time_ms();
     if (srv.use_qwen_tok) {
         n_prompt = qwen_tokenize_encode(&srv.qwen_enc, prompt, ptokens, max_pt);
     } else {
         n_prompt = tokenizer_encode(tokenizer, prompt, ptokens, max_pt, 1);
     }
+    fprintf(stderr, "[server] %.1fms: tokenized %d tokens (%.1fms)\n", get_time_ms() - t0, n_prompt, get_time_ms() - t_tok);
     /* If the encoder produced 0 tokens (empty prompt), insert BOS */
     if (n_prompt == 0) {
         ptokens[0] = (srv.use_qwen_tok) ? srv.qwen_enc.bos_id : (int)tokenizer->bos_id;
@@ -683,6 +690,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         }
     }
     int start_pos = cache_start;
+    fprintf(stderr, "[server] %.1fms: KV cache match %d/%d tokens (%d new)\n", get_time_ms() - t0, start_pos, n_prompt, n_prompt - start_pos);
     if (start_pos == 0) {
         srv.kv_pos = 0;
     }
@@ -699,6 +707,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
     int total_generation_tokens = 0;
 
     if (do_stream) {
+        fprintf(stderr, "[server] %.1fms: sending HTTP headers (streaming)\n", get_time_ms() - t0);
         char hdr[256];
         snprintf(hdr, sizeof(hdr),
             "HTTP/1.1 200 OK\r\n"
@@ -718,28 +727,45 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         /* ---- Prefill phase ---- */
         float *logits = NULL;
         int n_prefill = n_prompt - start_pos;
-        int client_dropped = 0;
+        fprintf(stderr, "[server] %.1fms: starting prefill (%d tokens, %s)\n", get_time_ms() - t0, n_prefill, model->config.has_ssm ? "SSM per-token" : "batched");
 
+        /* Track how many prompt tokens were actually processed */
+        int n_processed = start_pos;
         if (n_prefill > 0 && !model->config.has_ssm) {
             /* Batched prefill for non-SSM models (fast, runs to completion) */
             logits = model_forward_prefill(model, ptokens + start_pos, n_prefill, start_pos);
+            n_processed = n_prompt;
         } else if (n_prefill > 0) {
             /* Per-token prefill for SSM models: check client between tokens */
             int token_p = start_pos > 0 ? ptokens[start_pos - 1] : ptokens[0];
             for (int pos = start_pos; pos < n_prompt; pos++) {
-                if (!client_alive(sock)) { client_dropped = 1; break; }
+                if (!client_alive(sock)) break;
                 logits = model_forward(model, token_p, pos);
                 token_p = ptokens[pos + 1];
+                n_processed = pos + 1;
             }
         }
         /* else: fully cached (n_prefill <= 0), no prefill needed */
 
-        if (client_dropped) {
+        /* Save cache: only the tokens actually processed */
+        if (n_processed > srv.max_last_prompt) {
+            srv.max_last_prompt = n_processed * 2;
+            srv.last_prompt_tokens = (int *)realloc(srv.last_prompt_tokens, (size_t)srv.max_last_prompt * sizeof(int));
+        }
+        memcpy(srv.last_prompt_tokens, ptokens, (size_t)n_processed * sizeof(int));
+        srv.last_prompt_len = n_processed;
+        srv.kv_pos = n_processed;
+
+        if (n_processed < n_prompt) {
+            /* Client disconnected during prefill */
+            fprintf(stderr, "[server] prefill cancelled at token %d/%d\n", n_processed, n_prompt);
             free(chat_prompt); free(raw_prompt_copy); free(ptokens);
             return;
         }
 
         double t_prefill_end = get_time_ms();
+        fprintf(stderr, "[server] %.1fms: prefill done (%.1fms)\n", get_time_ms() - t0, t_prefill_end - t_start);
+        fprintf(stderr, "[server] %.1fms: starting generation\n", get_time_ms() - t0);
 
         /* ---- Generation phase ---- */
         int gen_count = 0;
@@ -807,8 +833,6 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             cJSON_Delete(chunk);
             total_generation_tokens++;
             gen_count++;
-            printf("%s", piece);
-            fflush(stdout);
 
             if (next == (int)tokenizer->eos_id) break;
             token = next;
@@ -872,6 +896,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
                 total_generation_tokens > 0 ? total_generation_tokens / (t_gen_ms / 1000.0) : 0);
     } else {
         /* Non-streaming */
+        fprintf(stderr, "[server] %.1fms: sending HTTP headers (non-streaming, n=%d)\n", get_time_ms() - t0, n_choices);
         cJSON *root = cJSON_CreateObject();
         cJSON *choices = cJSON_CreateArray();
         double t_start_ns = get_time_ms();
@@ -895,25 +920,43 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             /* Prefill phase */
             float *logits_ns = NULL;
             int n_prefill_ns = n_prompt - start_pos;
-            int client_dropped_ns = 0;
+            fprintf(stderr, "[server] %.1fms: starting prefill (choice %d/%d, %d tokens)\n", get_time_ms() - t0, c, n_choices, n_prefill_ns);
 
+            /* Track how many prompt tokens were actually processed */
+            int n_processed_ns = start_pos;
             if (n_prefill_ns > 0 && !model->config.has_ssm) {
                 logits_ns = model_forward_prefill(model, ptokens + start_pos, n_prefill_ns, start_pos);
+                n_processed_ns = n_prompt;
             } else if (n_prefill_ns > 0) {
                 int token_p = start_pos > 0 ? ptokens[start_pos - 1] : ptokens[0];
                 for (int pos = start_pos; pos < n_prompt; pos++) {
-                    if (!client_alive(sock)) { client_dropped_ns = 1; break; }
+                    if (!client_alive(sock)) break;
                     logits_ns = model_forward(model, token_p, pos);
                     token_p = ptokens[pos + 1];
+                    n_processed_ns = pos + 1;
                 }
             }
 
-            if (client_dropped_ns) {
+            /* Save cache: only the tokens actually processed */
+            if (n_processed_ns > srv.max_last_prompt) {
+                srv.max_last_prompt = n_processed_ns * 2;
+                srv.last_prompt_tokens = (int *)realloc(srv.last_prompt_tokens, (size_t)srv.max_last_prompt * sizeof(int));
+            }
+            memcpy(srv.last_prompt_tokens, ptokens, (size_t)n_processed_ns * sizeof(int));
+            srv.last_prompt_len = n_processed_ns;
+            srv.kv_pos = n_processed_ns;
+
+            if (n_processed_ns < n_prompt) {
+                fprintf(stderr, "[server] prefill cancelled at token %d/%d\n", n_processed_ns, n_prompt);
                 free(chat_prompt); free(raw_prompt_copy); free(ptokens);
                 return;
             }
 
             if (gen_count_ns == 0) t_prefill_end_ns = get_time_ms();
+            if (gen_count_ns == 0) {
+                fprintf(stderr, "[server] %.1fms: prefill done (%.1fms)\n", get_time_ms() - t0, t_prefill_end_ns - t_start_ns);
+                fprintf(stderr, "[server] %.1fms: starting generation\n", get_time_ms() - t0);
+            }
 
             /* Generation phase */
             if (n_prefill_ns <= 0) {
@@ -940,8 +983,6 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
                 if (!piece) piece = "";
                 strncat(generated, piece, max_tokens * 100 - strlen(generated) - 1);
                 gen_count++;
-                printf("%s", piece);
-                fflush(stdout);
 
                 if (next == (int)tokenizer->eos_id) { finish_reason = "stop"; break; }
                 if (gen_count >= max_tokens) { finish_reason = "length"; break; }
@@ -1019,8 +1060,6 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
 
     }
 
-    printf("\n");
-    fflush(stdout);
     free(raw_prompt_copy);
     free(chat_prompt);
     free(ptokens);
@@ -1032,6 +1071,8 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
  * This matches the llama.cpp server format with content, tokens, stop,
  * stop_type, generation_settings, model, timings, etc. */
 static void handle_llama_completion(SOCKET sock, const char *request_body) {
+    double t0 = get_time_ms();
+    fprintf(stderr, "\n[server] === /completion request start ===\n");
 
     cJSON *req = cJSON_ParseWithLength(request_body, strlen(request_body));
     if (!req) {
@@ -1136,6 +1177,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         prompt = prompt_copy;
     }
     cJSON_Delete(req);
+    fprintf(stderr, "[server] %.1fms: params parsed (stream=%d, n_predict=%d)\n", get_time_ms() - t0, do_stream, n_predict);
 
     model_t *model = &srv.model;
     tokenizer_t *tokenizer = &srv.tokenizer;
@@ -1143,6 +1185,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
     /* Encode prompt */
     int *ptokens = NULL;
     int n_prompt = 0;
+    double t_tok = get_time_ms();
     if (prompt_is_tokens) {
         ptokens = token_prompt;
         n_prompt = n_token_prompt;
@@ -1161,6 +1204,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             n_prompt = 1;
         }
     }
+    fprintf(stderr, "[server] %.1fms: tokenized %d tokens (%.1fms)\n", get_time_ms() - t0, n_prompt, get_time_ms() - t_tok);
 
     /* Reject if prompt exceeds context size */
     if (n_prompt > model->config.max_seq_len) {
@@ -1186,6 +1230,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
      * from t=0 to t<=pos, so stale KV data at positions beyond n_prompt
      * is never read (it will be overwritten during generation). */
     int start_pos = cache_start;
+    fprintf(stderr, "[server] %.1fms: KV cache match %d/%d tokens (%d new)\n", get_time_ms() - t0, start_pos, n_prompt, n_prompt - start_pos);
     if (start_pos == 0) {
         srv.kv_pos = 0;
     }
@@ -1241,6 +1286,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             "Access-Control-Allow-Origin: *\r\n"
             "\r\n");
         send(sock, hdr, strlen(hdr), 0);
+        fprintf(stderr, "[server] %.1fms: HTTP headers sent (streaming)\n", get_time_ms() - t0);
 
         /* gen_count declared below after prefill section */
         const char *stop_type = "none";
@@ -1266,19 +1312,44 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         /* ---- Prefill phase ---- */
         float *logits = NULL;
         int n_prefill = n_prompt - start_pos;
+        fprintf(stderr, "[server] %.1fms: starting prefill (%d tokens, %s)\n", get_time_ms() - t0, n_prefill, model->config.has_ssm ? "SSM per-token" : "batched");
 
+        /* Track how many prompt tokens were actually processed */
+        int n_processed = start_pos;
         if (n_prefill > 0 && !model->config.has_ssm) {
             logits = model_forward_prefill(model, ptokens + start_pos, n_prefill, start_pos);
+            n_processed = n_prompt; /* batched: all tokens processed */
         } else if (n_prefill > 0) {
             int token_p = start_pos > 0 ? ptokens[start_pos - 1] : ptokens[0];
             for (int pos = start_pos; pos < n_prompt; pos++) {
+                if (!client_alive(sock)) break;
                 logits = model_forward(model, token_p, pos);
                 token_p = ptokens[pos + 1];
+                n_processed = pos + 1;
             }
         }
         /* else: fully cached */
 
         t_prefill_end = get_time_ms();
+        fprintf(stderr, "[server] %.1fms: prefill done (%.1fms, %d/%d tokens)\n", get_time_ms() - t0, t_prefill_end - t_start, n_processed, n_prompt);
+
+        /* Save cache: only the tokens actually processed */
+        if (n_processed > srv.max_last_prompt) {
+            srv.max_last_prompt = n_processed * 2;
+            srv.last_prompt_tokens = (int *)realloc(srv.last_prompt_tokens, (size_t)srv.max_last_prompt * sizeof(int));
+        }
+        memcpy(srv.last_prompt_tokens, ptokens, (size_t)n_processed * sizeof(int));
+        srv.last_prompt_len = n_processed;
+        srv.kv_pos = n_processed;
+
+        if (n_processed < n_prompt) {
+            /* Client disconnected during prefill */
+            fprintf(stderr, "[server] prefill cancelled at token %d/%d\n", n_processed, n_prompt);
+            free(prompt); free(ptokens);
+            return;
+        }
+
+        fprintf(stderr, "[server] %.1fms: starting generation\n", get_time_ms() - t0);
 
         /* ---- Generation phase ---- */
         if (n_prefill <= 0) {
@@ -1345,8 +1416,6 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
                 free(cJSON_PrintUnformatted(resp));
                 cJSON_Delete(resp);
                 gen_count++;
-                printf("%s", piece);
-                fflush(stdout);
                 break;
             }
 
@@ -1361,8 +1430,6 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             cJSON_Delete(resp);
 
             gen_count++;
-            printf("%s", piece);
-            fflush(stdout);
 
             if (!ignore_eos && next == (int)tokenizer->eos_id) {
                 stop_type = "eos";
@@ -1418,6 +1485,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
                 gen_count, gen_ms, gen_count > 0 ? gen_count / (gen_ms / 1000.0) : 0);
     } else {
         /* Non-streaming: collect all tokens, build one big response */
+        fprintf(stderr, "[server] %.1fms: non-streaming path\n", get_time_ms() - t0);
         double t_prefill_end_ns = 0;
         int gen_start_ns = start_pos;
         if (gen_start_ns >= n_prompt) {
@@ -1434,18 +1502,45 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         /* ---- Prefill phase ---- */
         float *logits_ns2 = NULL;
         int n_prefill_ns2 = n_prompt - start_pos;
+        fprintf(stderr, "[server] %.1fms: starting prefill (%d tokens, %s)\n", get_time_ms() - t0, n_prefill_ns2, model->config.has_ssm ? "SSM per-token" : "batched");
 
+        /* Track how many prompt tokens were actually processed */
+        int n_processed_ns2 = start_pos;
         if (n_prefill_ns2 > 0 && !model->config.has_ssm) {
             logits_ns2 = model_forward_prefill(model, ptokens + start_pos, n_prefill_ns2, start_pos);
+            n_processed_ns2 = n_prompt;
         } else if (n_prefill_ns2 > 0) {
             int token_p = start_pos > 0 ? ptokens[start_pos - 1] : ptokens[0];
             for (int pos = start_pos; pos < n_prompt; pos++) {
+                if (!client_alive(sock)) break;
                 logits_ns2 = model_forward(model, token_p, pos);
                 token_p = ptokens[pos + 1];
+                n_processed_ns2 = pos + 1;
             }
         }
 
         t_prefill_end_ns = get_time_ms();
+        fprintf(stderr, "[server] %.1fms: prefill done (%.1fms, %d/%d tokens)\n", get_time_ms() - t0, t_prefill_end_ns - t_start, n_processed_ns2, n_prompt);
+
+        /* Save cache: only the tokens actually processed */
+        if (n_processed_ns2 > srv.max_last_prompt) {
+            srv.max_last_prompt = n_processed_ns2 * 2;
+            srv.last_prompt_tokens = (int *)realloc(srv.last_prompt_tokens, (size_t)srv.max_last_prompt * sizeof(int));
+        }
+        memcpy(srv.last_prompt_tokens, ptokens, (size_t)n_processed_ns2 * sizeof(int));
+        srv.last_prompt_len = n_processed_ns2;
+        srv.kv_pos = n_processed_ns2;
+
+        if (n_processed_ns2 < n_prompt) {
+            /* Client disconnected during prefill */
+            fprintf(stderr, "[server] prefill cancelled at token %d/%d\n", n_processed_ns2, n_prompt);
+            free(generated); free(gen_token_ids);
+            free(prompt); free(token_prompt); free(ptokens);
+            for (int i = 0; i < n_stop_words; i++) free(stop_words[i]);
+            return;
+        }
+
+        fprintf(stderr, "[server] %.1fms: starting generation\n", get_time_ms() - t0);
 
         /* ---- Generation phase ---- */
         if (n_prefill_ns2 <= 0) {
@@ -1474,8 +1569,6 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             strncat(generated, piece, n_predict * 100 - strlen(generated) - 1);
             gen_token_ids[gen_count] = next;
             gen_count++;
-            printf("%s", piece);
-            fflush(stdout);
 
             /* Check stop words */
             for (int i = 0; i < n_stop_words; i++) {
@@ -1565,9 +1658,6 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         free(generated);
         free(gen_token_ids);
     }
-
-    printf("\n");
-    fflush(stdout);
 
     free(prompt_copy);
     free(token_prompt);
