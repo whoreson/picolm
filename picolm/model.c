@@ -1060,6 +1060,11 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
     if (mmap_file(m, path) != 0) return -1;
     if (parse_gguf(m, max_seq_len) != 0) return -1;
 
+    if (m->config.n_layers > MAX_LAYERS) {
+        fprintf(stderr, "ERROR: model has %d layers but MAX_LAYERS=%d\n", m->config.n_layers, MAX_LAYERS);
+        return -1;
+    }
+
     /* Validate that all required tensors are present */
     {
         layer_weights_t *lw = &m->weights.layers[0];
