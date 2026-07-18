@@ -241,6 +241,7 @@ typedef struct {
     uint16_t d[4];      /* 4 FP16 deltas, one per row */
     uint8_t  qs[64];    /* interleaved nibble-bytes (4 rows x 16 bytes, XOR'd with 0x88) */
 } block_q4_0x4;         /* 72 bytes */
+#pragma pack(pop)
 
 /* Q4_0_8x8 interleaved block: 8 rows of Q4_0 packed together for AVX2 SIMD.
  * Layout: 8 FP16 deltas, then interleaved nibble-bytes from 8 standard Q4_0 blocks.
@@ -260,6 +261,7 @@ typedef struct {
     uint16_t d[8];      /* 8 FP16 deltas, one per row */
     uint8_t  qs[128];   /* interleaved nibble-bytes (8 rows x 16 bytes, XOR'd with 0x88) */
 } block_q4_0x8;         /* 144 bytes */
+#pragma pack(pop)
 
 /* Q3_K block: 256 weights in 110 bytes */
 #pragma pack(push, 1)
