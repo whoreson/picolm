@@ -486,6 +486,7 @@ int gguf_type_block_size(gguf_type_t type) {
         case GGUF_TYPE_Q4_K:  return 256;
         case GGUF_TYPE_Q5_K:  return 256;
         case GGUF_TYPE_Q6_K:  return 256;
+        case GGUF_TYPE_Q8_K:  return 256;
         case GGUF_TYPE_Q4_0_4_4: return 32;  /* each block covers 32 values per row */
         case GGUF_TYPE_Q4_0_8_8: return 32;
         case GGUF_TYPE_BF16:     return 1;  /* BF16: 1 element per block, 2 bytes each */
@@ -508,6 +509,7 @@ int gguf_type_quant_size(gguf_type_t type) {
         case GGUF_TYPE_Q4_K:  return 144;
         case GGUF_TYPE_Q5_K:  return 176;
         case GGUF_TYPE_Q6_K:  return 210;
+        case GGUF_TYPE_Q8_K:  return (int)sizeof(block_q8_K);
         case GGUF_TYPE_Q4_0_4_4: return (int)sizeof(block_q4_0);  /* 18: GGUF stores same layout as Q4_0 */
         case GGUF_TYPE_Q4_0_8_8: return (int)sizeof(block_q4_0);  /* 18: GGUF stores same layout as Q4_0 */
         case GGUF_TYPE_BF16:     return 2;  /* BF16: 2 bytes per element */
