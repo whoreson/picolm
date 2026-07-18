@@ -308,15 +308,19 @@ static int parse_gguf(model_t *m, int max_seq_len) {
         uint32_t vtype = read_u32(&r);
 
         if (str_eq(key, "general.architecture")) {
-            int dummy; skip_meta_value(&r, vtype, &dummy);
-            /* Check if architecture contains "qwen3" */
-            if (key.len > 0) {
-                const char *s = key.str;
-                for (uint64_t k = 0; k < key.len - 4; k++) {
-                    if (s[k] == 'q' && s[k+1] == 'w' && s[k+2] == 'e' && s[k+3] == 'n' && s[k+4] == '3') {
+            int dummy;
+            gguf_str_t arch;
+            if (vtype == GGUF_META_STRING) {
+                arch = read_gguf_string(&r);
+                /* Check if architecture value contains "qwen3" (qwen3 or qwen35) */
+                for (uint64_t k = 0; k + 5 <= arch.len; k++) {
+                    if (arch.str[k] == 'q' && arch.str[k+1] == 'w' && arch.str[k+2] == 'e' &&
+                        arch.str[k+3] == 'n' && arch.str[k+4] == '3') {
                         cfg->is_qwen = 1; break;
                     }
                 }
+            } else {
+                skip_meta_value(&r, vtype, &dummy);
             }
         } else
 
@@ -1274,7 +1278,7 @@ static __attribute__((always_inline)) void attention_group(int kv_head_idx, void
 
 #ifdef PICOLM_AVX512
         /* Load K once, convert to F32 (16 F16 per chunk via fp16x16_to_fp32_inline) */
-        __m512 k_vec[8];
+        __m512 k_vec[16]; /* head_dim up to 256 = 16x __m512 */
         {
             const uint16_t *k16 = (const uint16_t *)kt;
             int d = 0;
@@ -1283,7 +1287,7 @@ static __attribute__((always_inline)) void attention_group(int kv_head_idx, void
         }
 
         /* Load V once, convert to F32 */
-        __m512 v_vec[8];
+        __m512 v_vec[16]; /* head_dim up to 256 = 16x __m512 */
         {
             const uint16_t *v16 = (const uint16_t *)vt;
             int d = 0;
