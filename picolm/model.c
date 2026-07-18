@@ -15,6 +15,7 @@
 #endif
 #ifdef _WIN32
 #include <windows.h>
+#define SECURITY_WIN32
 #include <security.h>
 #include <accctrl.h>
 #include <aclapi.h>
@@ -2316,7 +2317,7 @@ int model_lock_layers(model_t *m, size_t mem_bytes) {
         }
         /* If we got the privilege, VirtualLock will work. Otherwise, increase
          * the working set quota as a fallback so VirtualLock doesn't fail with
-         * ERROR_WORKING_SET_QUOTA. SetProcessWorkingSetSize with MAXIMUM_INTEGER32
+         * ERROR_WORKING_SET_QUOTA. SetProcessWorkingSetSize with 0x7FFFFFFF
          * means "no limit from Windows" - the OS still respects physical memory. */
         if (!got_lock_priv) {
             /* MAXIMUM_INTEGER32 (0x7FFFFFFF) is the sentinel meaning "no
@@ -2325,7 +2326,7 @@ int model_lock_layers(model_t *m, size_t mem_bytes) {
              * ERROR_WORKING_SET_QUOTA (1453) because the default quota is
              * very small on non-admin accounts. */
             SetProcessWorkingSetSize(GetCurrentProcess(),
-                                     MAXIMUM_INTEGER32, MAXIMUM_INTEGER32);
+                                     (SIZE_T)0x7FFFFFFF, (SIZE_T)0x7FFFFFFF);
         }
     }
 #endif
