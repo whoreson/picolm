@@ -688,31 +688,6 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
     memcpy(srv.last_prompt_tokens, ptokens, (size_t)n_prompt * sizeof(int));
     srv.last_prompt_len = n_prompt;
 
-    /* Helper: send SSE chunk */
-    int send_chunk(SOCKET sk, const char *content, const char *role, int is_done) {
-        cJSON *chunk = cJSON_CreateObject();
-        cJSON *choice = cJSON_CreateObject();
-        cJSON *delta = cJSON_CreateObject();
-        if (role && role[0]) cJSON_AddStringToObject(delta, "role", role);
-        cJSON_AddStringToObject(delta, "content", content);
-        cJSON_AddItemToObject(choice, "delta", delta);
-        cJSON_AddNumberToObject(choice, "index", 0);
-        cJSON_AddStringToObject(choice, "finish_reason", is_done ? "stop" : "");
-        if (!is_chat) cJSON_AddStringToObject(choice, "text", content);
-        cJSON *choices = cJSON_CreateArray();
-        cJSON_AddItemToArray(choices, choice);
-        cJSON_AddItemToObject(chunk, "choices", choices);
-        cJSON_AddStringToObject(chunk, "id", is_chat ? "chatcmpl-pico" : "cmpl-pico");
-        cJSON_AddStringToObject(chunk, "object", is_chat ? "chat.completion.chunk" : "text_completion");
-        cJSON_AddNumberToObject(chunk, "created", (double)(time(NULL)));
-        if (model_name) cJSON_AddStringToObject(chunk, "model", model_name);
-        char *json = cJSON_PrintUnformatted(chunk);
-        int rc = sse_send(sk, json, NULL);
-        free(json);
-        cJSON_Delete(chunk);
-        return rc;
-    }
-
     int total_prompt_tokens = n_prompt;
     int total_generation_tokens = 0;
 
