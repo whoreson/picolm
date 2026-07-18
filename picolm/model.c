@@ -3,6 +3,7 @@
 #include "quant.h"
 
 #include <stdio.h>
+#include <assert.h>
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1266,6 +1267,7 @@ static __attribute__((always_inline)) void attention_group(int kv_head_idx, void
     size_t v_stride = ctx->n_kv_heads * ctx->kv_row_size_v;
 
     /* Per-Q-head softmax state (kv_mul up to 8) */
+    assert(kv_mul <= 8 && head_dim <= 256 && "attention_group: stack arrays too small for this model");
     float max_score[8], sum_exp[8];
     for (int g = 0; g < kv_mul; g++) {
         max_score[g] = -1e30f;
