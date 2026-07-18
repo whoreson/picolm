@@ -1262,15 +1262,15 @@ static __attribute__((always_inline)) void attention_group(int kv_head_idx, void
     size_t k_stride = ctx->n_kv_heads * ctx->kv_row_size_k;
     size_t v_stride = ctx->n_kv_heads * ctx->kv_row_size_v;
 
-    /* Per-Q-head softmax state */
-    float max_score[4], sum_exp[4];
+    /* Per-Q-head softmax state (kv_mul up to 8) */
+    float max_score[8], sum_exp[8];
     for (int g = 0; g < kv_mul; g++) {
         max_score[g] = -1e30f;
         sum_exp[g] = 0.0f;
     }
-    float acc[4][256];
+    float acc[8][256];
     for (int g = 0; g < kv_mul; g++)
-        memset(acc[g], 0, (size_t)head_dim * sizeof(float));
+        for (int d = 0; d < head_dim; d++) acc[g][d] = 0.0f;
 
     for (int t = 0; t <= pos; t++) {
         const uint8_t *kt = ctx->kcache + (size_t)t * ctx->n_kv_heads * ctx->kv_row_size_k + kv_h * ctx->kv_row_size_k;
