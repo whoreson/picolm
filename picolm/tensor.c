@@ -149,7 +149,20 @@ static void matmul_worker_f(matmul_task_t *t) {
     int out_stride = nb > 0 ? t->d : t->end - t->start;
     /* Batched mode: output[b*d+i] for each batch b */
     if (nb > 0) {
-        if (t->qtype == GGUF_TYPE_Q8_0) {
+        if (t->qtype == GGUF_TYPE_Q8_0 && t->x_d) {
+            /* Pre-quantized activations: use int8xint8 MAC instead of F32 dequantize + FMA */
+            size_t q8_row_bytes = gguf_type_row_size(GGUF_TYPE_Q8_0, t->n);
+            int nblk = t->n / 32;
+            const char *qx_base = (const char *)t->x;
+            for (int i = t->start; i < t->end; i++) {
+                const block_q8_0 *wrow = (const block_q8_0 *)(t->W + (size_t)i * t->row_bytes);
+                for (int b = 0; b < nb; b++) {
+                    const block_q8_0 *xq = (const block_q8_0 *)(qx_base + (size_t)b * q8_row_bytes);
+                    const float *xqd = t->x_d + (size_t)b * nblk;
+                    t->out[b * out_stride + i] = vec_dot_q8_0_q8_0_deltas(xq, xqd, wrow, t->n);
+                }
+            }
+        } else if (t->qtype == GGUF_TYPE_Q8_0) {
             for (int i = t->start; i < t->end; i++) {
                 const block_q8_0 *wrow = (const block_q8_0 *)(t->W + (size_t)i * t->row_bytes);
                 for (int b = 0; b < nb; b++)
@@ -338,6 +351,18 @@ static void pool_clear_unused(int from, int to) {
     }
 }
 
+/* Returns the pool's actual physical thread count (workers + main thread),
+ * creating the pool on first use sized to `requested`.
+ *
+ * This is deliberately NOT the same as the mutable `n_threads` global.
+ * Once created the pool's physical size is fixed forever. pool_wake()
+ * broadcasts to every physical worker, so the count passed to
+ * pool_wake()/pool_wait() must equal the pool's true physical size. */
+static int pool_total_threads(int requested) {
+    pool_init(requested);
+    return (pool_nworkers > 0) ? (pool_nworkers + 1) : 1;
+}
+
 void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t qtype) {
     size_t row_bytes = gguf_type_row_size(qtype, n);
     const char *wptr = (const char *)W;
@@ -373,8 +398,9 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
 
             /* Threaded dispatch: main thread does task 0, workers do tasks 1..nt-1 */
             {
-                int nt = n_threads;
-                int active = pool_assign_rows(0, nt, d);
+                int nt = pool_total_threads(n_threads);
+                int want = n_threads < nt ? n_threads : nt;
+                int active = pool_assign_rows(0, want, d);
                 for (int t = 0; t < active; t++) {
                     pool_tasks[t].out = out; pool_tasks[t].x = (const float *)qx;
                     pool_tasks[t].x_d = qx_d; pool_tasks[t].W = wptr;
@@ -429,10 +455,11 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
                 return;
             }
 
-            int nt = n_threads;
+            int nt = pool_total_threads(n_threads);
+            int want = n_threads < nt ? n_threads : nt;
 
             {
-                int active = pool_assign_rows(0, nt, d);
+                int active = pool_assign_rows(0, want, d);
                 for (int t = 0; t < active; t++) {
                     pool_tasks[t].out = out; pool_tasks[t].x = (const float *)qx;
                     pool_tasks[t].x_d = NULL; pool_tasks[t].W = wptr;
@@ -482,9 +509,10 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
                 return;
             }
 
-            int nt = n_threads;
+            int nt = pool_total_threads(n_threads);
+            int want = n_threads < nt ? n_threads : nt;
             {
-                int active = pool_assign_rows(0, nt, d);
+                int active = pool_assign_rows(0, want, d);
                 for (int t = 0; t < active; t++) {
                     pool_tasks[t].out = out; pool_tasks[t].x = (const float *)qx;
                     pool_tasks[t].x_d = NULL; pool_tasks[t].W = wptr;
@@ -526,10 +554,11 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
                 return;
             }
 
-            int nt = n_threads;
+            int nt = pool_total_threads(n_threads);
 
+            int want = n_threads < nt ? n_threads : nt;
             {
-                int active = pool_assign_rows(0, nt, d);
+                int active = pool_assign_rows(0, want, d);
                 for (int t = 0; t < active; t++) {
                     pool_tasks[t].out = out; pool_tasks[t].x = (const float *)qx;
                     pool_tasks[t].x_d = NULL; pool_tasks[t].W = wptr;
@@ -573,10 +602,11 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
                 return;
             }
 
-            int nt = n_threads;
+            int nt = pool_total_threads(n_threads);
 
+            int want = n_threads < nt ? n_threads : nt;
             {
-                int active = pool_assign_rows(0, nt, d);
+                int active = pool_assign_rows(0, want, d);
                 for (int t = 0; t < active; t++) {
                     pool_tasks[t].out = out; pool_tasks[t].x = (const float *)qx;
                     pool_tasks[t].x_d = NULL; pool_tasks[t].W = wptr;
@@ -605,10 +635,11 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
         return;
     }
 
-    int nt = n_threads;
+    int nt = pool_total_threads(n_threads);
 
+    int want = n_threads < nt ? n_threads : nt;
     {
-        int active = pool_assign_rows(0, nt, d);
+        int active = pool_assign_rows(0, want, d);
         for (int t = 0; t < active; t++) {
             pool_tasks[t].out = out; pool_tasks[t].x = x;
             pool_tasks[t].x_d = NULL; pool_tasks[t].W = wptr;
@@ -634,10 +665,37 @@ void matmul_batch(float *out, const float *x, int n_batch,
     size_t row_bytes = gguf_type_row_size(qtype, n);
     const char *wptr = (const char *)W;
 
+    /* Pre-quantize the whole activation batch to Q8_0 once */
+    void *qx_buf = NULL; float *qx_d_buf = NULL;
+    size_t q8_row_bytes = 0; int nblk = 0;
+    int have_q8x = 0;
+    if (qtype == GGUF_TYPE_Q8_0 && n_batch > 0 && n > 0) {
+        size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
+        int nb = n / 32;
+        void *qbuf = malloc((size_t)n_batch * q8_rb);
+        float *dbuf = (float *)malloc((size_t)n_batch * nb * sizeof(float));
+        if (qbuf && dbuf) {
+            for (int b = 0; b < n_batch; b++) {
+                quantize_row_q8_0(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
+                const block_q8_0 *blk = (const block_q8_0 *)((char *)qbuf + (size_t)b * q8_rb);
+                for (int k = 0; k < nb; k++) dbuf[(size_t)b * nb + k] = fp16_to_fp32(blk[k].d);
+            }
+            qx_buf = qbuf; qx_d_buf = dbuf;
+            q8_row_bytes = q8_rb; nblk = nb; have_q8x = 1;
+        }
+    }
+
     if (n_threads <= 1 || d < 4) {
         /* Scalar path */
         for (int i = 0; i < d; i++) {
-            if (qtype == GGUF_TYPE_Q8_0) {
+            if (have_q8x) {
+                const block_q8_0 *wrow = (const block_q8_0 *)(wptr + (size_t)i * row_bytes);
+                for (int b = 0; b < n_batch; b++) {
+                    const block_q8_0 *xq = (const block_q8_0 *)((const char *)qx_buf + (size_t)b * q8_row_bytes);
+                    const float *xqd = qx_d_buf + (size_t)b * nblk;
+                    out[b * d + i] = vec_dot_q8_0_q8_0_deltas(xq, xqd, wrow, n);
+                }
+            } else if (qtype == GGUF_TYPE_Q8_0) {
                 const block_q8_0 *wrow = (const block_q8_0 *)(wptr + (size_t)i * row_bytes);
                 for (int b = 0; b < n_batch; b++)
                     out[b * d + i] = vec_dot_q8_0_f32(wrow, x + b * n, n);
@@ -647,15 +705,18 @@ void matmul_batch(float *out, const float *x, int n_batch,
                     out[b * d + i] = vec_dot(wrow, x + b * n, n, qtype);
             }
         }
+        if (have_q8x) { free(qx_buf); free(qx_d_buf); }
         return;
     }
 
     /* Threaded: dispatch over output rows d using shared pool */
-    int nt = n_threads;
-    int active = pool_assign_rows(0, nt, d);
+    int nt = pool_total_threads(n_threads);
+    int want = n_threads < nt ? n_threads : nt;
+    int active = pool_assign_rows(0, want, d);
     for (int t = 0; t < active; t++) {
         pool_tasks[t].out = out;
-        pool_tasks[t].x = x;
+        pool_tasks[t].x = have_q8x ? (const float *)qx_buf : x;
+        pool_tasks[t].x_d = have_q8x ? qx_d_buf : NULL;
         pool_tasks[t].W = wptr;
         pool_tasks[t].row_bytes = row_bytes;
         pool_tasks[t].n = n;
@@ -668,11 +729,32 @@ void matmul_batch(float *out, const float *x, int n_batch,
     pool_wake(nt);
     matmul_worker_f(&pool_tasks[0]);
     pool_wait(nt);
+    if (have_q8x) { free(qx_buf); free(qx_d_buf); }
 }
 
 void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                         const void *W1, const void *W2,
                         int n, int d, gguf_type_t qtype1, gguf_type_t qtype2) {
+    /* Quantize x once (shared input to both matmuls) if either weight is Q8_0 */
+    void *qx_buf = NULL; float *qx_d_buf = NULL;
+    size_t q8_row_bytes = 0; int nblk = 0;
+    int have_q8x = 0;
+    if ((qtype1 == GGUF_TYPE_Q8_0 || qtype2 == GGUF_TYPE_Q8_0) && n_batch > 0 && n > 0) {
+        size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
+        int nb = n / 32;
+        void *qbuf = malloc((size_t)n_batch * q8_rb);
+        float *dbuf = (float *)malloc((size_t)n_batch * nb * sizeof(float));
+        if (qbuf && dbuf) {
+            for (int b = 0; b < n_batch; b++) {
+                quantize_row_q8_0(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
+                const block_q8_0 *blk = (const block_q8_0 *)((char *)qbuf + (size_t)b * q8_rb);
+                for (int k = 0; k < nb; k++) dbuf[(size_t)b * nb + k] = fp16_to_fp32(blk[k].d);
+            }
+            qx_buf = qbuf; qx_d_buf = dbuf;
+            q8_row_bytes = q8_rb; nblk = nb; have_q8x = 1;
+        }
+    }
+
     /* Dual batch: two independent matmul_batch calls, each threaded.
      * The two matmuls share the same input x but write to different outputs. */
     if (n_threads <= 1) {
@@ -685,21 +767,31 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
             const char *wr2 = w2 + (size_t)i * row_bytes2;
             for (int b = 0; b < n_batch; b++) {
                 const float *xb = x + b * n;
-                if (qtype1 == GGUF_TYPE_Q8_0)
+                if (qtype1 == GGUF_TYPE_Q8_0 && have_q8x) {
+                    const block_q8_0 *xq = (const block_q8_0 *)((const char *)qx_buf + (size_t)b * q8_row_bytes);
+                    const float *xqd = qx_d_buf + (size_t)b * nblk;
+                    out1[b * d + i] = vec_dot_q8_0_q8_0_deltas(xq, xqd, (const block_q8_0*)wr1, n);
+                } else if (qtype1 == GGUF_TYPE_Q8_0)
                     out1[b * d + i] = vec_dot_q8_0_f32((const block_q8_0*)wr1, xb, n);
                 else
                     out1[b * d + i] = vec_dot(wr1, xb, n, qtype1);
-                if (qtype2 == GGUF_TYPE_Q8_0)
+                if (qtype2 == GGUF_TYPE_Q8_0 && have_q8x) {
+                    const block_q8_0 *xq = (const block_q8_0 *)((const char *)qx_buf + (size_t)b * q8_row_bytes);
+                    const float *xqd = qx_d_buf + (size_t)b * nblk;
+                    out2[b * d + i] = vec_dot_q8_0_q8_0_deltas(xq, xqd, (const block_q8_0*)wr2, n);
+                } else if (qtype2 == GGUF_TYPE_Q8_0)
                     out2[b * d + i] = vec_dot_q8_0_f32((const block_q8_0*)wr2, xb, n);
                 else
                     out2[b * d + i] = vec_dot(wr2, xb, n, qtype2);
             }
         }
+        if (have_q8x) { free(qx_buf); free(qx_d_buf); }
         return;
     }
 
     /* Threaded: run both matmuls with half threads each */
-    int nt = n_threads;
+    int nt = pool_total_threads(n_threads);
+    int want = n_threads < nt ? n_threads : nt;
     int active_total = nt > d ? d : nt;
     int nt1 = (active_total + 1) / 2, nt2 = active_total - nt1;
 
@@ -707,7 +799,8 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
     int a1 = pool_assign_rows(0, nt1, d);
     for (int t = 0; t < a1; t++) {
         pool_tasks[t].out = out1;
-        pool_tasks[t].x = x;
+        pool_tasks[t].x = (qtype1 == GGUF_TYPE_Q8_0 && have_q8x) ? (const float *)qx_buf : x;
+        pool_tasks[t].x_d = (qtype1 == GGUF_TYPE_Q8_0 && have_q8x) ? qx_d_buf : NULL;
         pool_tasks[t].W = (const char *)W1;
         pool_tasks[t].row_bytes = gguf_type_row_size(qtype1, n);
         pool_tasks[t].n = n;
@@ -720,7 +813,8 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
     int a2 = pool_assign_rows(nt1, nt2, d);
     for (int t = 0; t < a2; t++) {
         pool_tasks[nt1 + t].out = out2;
-        pool_tasks[nt1 + t].x = x;
+        pool_tasks[nt1 + t].x = (qtype2 == GGUF_TYPE_Q8_0 && have_q8x) ? (const float *)qx_buf : x;
+        pool_tasks[nt1 + t].x_d = (qtype2 == GGUF_TYPE_Q8_0 && have_q8x) ? qx_d_buf : NULL;
         pool_tasks[nt1 + t].W = (const char *)W2;
         pool_tasks[nt1 + t].row_bytes = gguf_type_row_size(qtype2, n);
         pool_tasks[nt1 + t].n = n;
@@ -734,6 +828,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
     pool_wake(nt);
     matmul_worker_f(&pool_tasks[0]);
     pool_wait(nt);
+    if (have_q8x) { free(qx_buf); free(qx_d_buf); }
 }
 
 /* ================================================================
@@ -1166,19 +1261,20 @@ void tensor_parallel_for(int count, void (*fn)(int idx, void *ctx), void *ctx) {
         for (int i = 0; i < count; i++) fn(i, ctx);
         return;
     }
-    int nt = n_threads;
-    pool_init(nt);
-    int active = nt > count ? count : nt;
+    int nt = pool_total_threads(n_threads);
+    int want = n_threads < nt ? n_threads : nt;
+    int active = want > count ? count : want;
     int chunk = (count + active - 1) / active;
-    for (int t = 0; t < nt; t++) {
-        int tstart = t * chunk;
-        int tend = tstart + chunk;
-        if (tstart > count) tstart = count;
-        if (tend > count) tend = count;
+    for (int t = 0; t < active; t++) {
         generic_tasks[t].fn = fn;
         generic_tasks[t].ctx = ctx;
-        generic_tasks[t].start = tstart;
-        generic_tasks[t].end = tend;
+        generic_tasks[t].start = t * chunk;
+        generic_tasks[t].end = (t + 1) * chunk;
+        if (generic_tasks[t].end > count) generic_tasks[t].end = count;
+    }
+    for (int t = active; t < nt; t++) {
+        generic_tasks[t].start = 0;
+        generic_tasks[t].end = 0;
     }
     pool_mode = 1;
     pool_wake(nt);
