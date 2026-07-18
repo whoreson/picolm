@@ -196,6 +196,7 @@ typedef enum {
     GGUF_TYPE_Q2_K  = 10,
     GGUF_TYPE_Q3_K  = 11,
     GGUF_TYPE_Q4_K  = 12,
+    GGUF_TYPE_Q8_K = 29,  /* internal: Q8_K intermediate quantization */
     GGUF_TYPE_Q6_K       = 14,
     GGUF_TYPE_Q4_0_4_4   = 31,  /* 4-row interleaved Q4_0 (pre-repacked) */
     GGUF_TYPE_Q4_0_8_8   = 33,  /* 8-row interleaved Q4_0 (pre-repacked, AVX2) */
