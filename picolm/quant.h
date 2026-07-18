@@ -379,6 +379,17 @@ void quantize_row_q8_0(const float *x, void *dst, int n);
  * dst must have space for (n / 32) * sizeof(block_q4_0) bytes. */
 void quantize_row_q4_0(const float *x, void *dst, int n);
 
+/* Converts one Q4_0 weight row to a "shadow" Q8_0 representation: same
+ * per-block delta, values unpacked to (nibble - 8) directly as int8.
+ * Q4_0's dequant formula is exactly (nibble-8)*d, which is exactly what
+ * Q8_0 stores natively -- so this is a lossless format conversion, not
+ * an approximation. Lets batched/prefill matmul decode a weight row's
+ * nibbles ONCE and reuse the fast vec_dot_q8_0_q8_0_deltas kernel across
+ * every token in the batch, instead of re-unpacking the same row from
+ * scratch for every single token. dst must be sized
+ * gguf_type_row_size(GGUF_TYPE_Q8_0, n) bytes. */
+void q4_0_row_to_q8_0_shadow(const void *q4_row, void *q8_row_out, int n);
+
 /* Quantize a float32 vector to Q8_K blocks (for Q4_K/Q6_K matmul).
  * dst must have space for (n / 256) * sizeof(block_q8_K) bytes. */
 void quantize_row_q8_K(const float *x, void *dst, int n);

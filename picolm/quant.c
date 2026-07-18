@@ -1785,6 +1785,20 @@ float vec_dot_q4_0_q8_0(const void *vx, const void *wy, int n) {
     return sumf;
 }
 
+void q4_0_row_to_q8_0_shadow(const void *q4_row, void *q8_row_out, int n) {
+    const block_q4_0 *q4 = (const block_q4_0 *)q4_row;
+    block_q8_0 *q8 = (block_q8_0 *)q8_row_out;
+    int nb = n / 32;
+    for (int b = 0; b < nb; b++) {
+        q8[b].d = q4[b].d; /* same fp16 scale bits -- no conversion needed */
+        for (int j = 0; j < 16; j++) {
+            uint8_t byte = q4[b].qs[j];
+            q8[b].qs[j]      = (int8_t)(byte & 0x0F) - 8;
+            q8[b].qs[j + 16] = (int8_t)(byte >> 4)    - 8;
+        }
+    }
+}
+
 float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n) {
     const block_q8_0 *x = (const block_q8_0 *)qx;
     const block_q8_0 *w = (const block_q8_0 *)qw;
