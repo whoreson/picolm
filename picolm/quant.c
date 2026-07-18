@@ -2387,34 +2387,38 @@ float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
 }
 
 /* ---- repack_q4_0_to_q4_0x8: Standard Q4_0 -> Q4_0_8x8 interleaved (for AVX2) ----
- * Reorders 8 rows of standard Q4_0 into block_q4_0x8 format.
- * The interleaving groups nibble-bytes from 8 consecutive rows together,
- * and XORs with 0x88 to convert from bias form [0..15] to sign form [-8..7].
+ * Ported from ggml's make_block_q4_0x8() (ggml/src/ggml-cpu/repack.cpp), verified
+ * against the real algorithm rather than reconstructed from memory: for chunk
+ * index i in 0..15, src_id = i%8 selects which of the 8 source rows, src_offset
+ * = (i/8)*8 selects the first or second half of that row's 16-byte qs, and the
+ * resulting 8 bytes are copied to out.qs[i*8 .. i*8+8), XOR'd with 0x88.
  *
- * Layout: for each chunk k=0..3 (8 bytes per chunk per row):
- *   qs[k*128 + row*8 + 0..7] = row's qs[k*8..k*8+7] ^ 0x88...
+ * XOR 0x88 flips bit 3 of each nibble (v -> v^8), which combined with the
+ * signextendlut used by the dot-product kernel (LUT[v] = v for v<8, v-16 for
+ * v>=8) reproduces Q4_0's (nibble-8) dequant exactly: LUT[v^8] = v-8 for all
+ * v in 0..15. Confirmed algebraically before use, not just copied.
  *
- * Precondition: nrows % 8 == 0, ncols % 32 == 0, src and dst have same total bytes.
+ * Precondition: nrows % 8 == 0, ncols % 32 == 0.
  * ================================================================ */
 void repack_q4_0_to_q4_0x8(const void *src, void *dst, int nrows, int ncols) {
     const block_q4_0 *s = (const block_q4_0 *)src;
     block_q4_0x8 *d = (block_q4_0x8 *)dst;
     int nb = ncols / 32;  /* blocks per row */
+    const uint64_t xor_mask = 0x8888888888888888ULL;
 
     for (int row8 = 0; row8 < nrows; row8 += 8) {
         for (int b = 0; b < nb; b++) {
-            /* Copy 8 deltas */
+            const block_q4_0 *in = s + row8 * nb + b; /* in[r] = row (row8+r)'s block b, stride nb */
             for (int r = 0; r < 8; r++) {
-                d->d[r] = s[b + (row8 + r) * nb].d;
+                d->d[r] = in[r * nb].d;
             }
-            /* Interleave nibble bytes with XOR 0x88 */
-            for (int k = 0; k < 4; k++) {  /* 4 chunks of 8 bytes */
-                for (int r = 0; r < 8; r++) {  /* 8 rows */
-                    const uint8_t *src_qs = ((const block_q4_0 *)(s + b + (row8 + r) * nb))->qs;
-                    for (int j = 0; j < 8; j++) {
-                        d->qs[k * 128 + r * 8 + j] = src_qs[k * 8 + j] ^ 0x88;
-                    }
-                }
+            for (int i = 0; i < 16; i++) {
+                int src_id = i % 8;
+                int src_offset = (i / 8) * 8;
+                uint64_t elems;
+                memcpy(&elems, &in[src_id * nb].qs[src_offset], sizeof(uint64_t));
+                elems ^= xor_mask;
+                memcpy(&d->qs[i * 8], &elems, sizeof(uint64_t));
             }
             d++;
         }
