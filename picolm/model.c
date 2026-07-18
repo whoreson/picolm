@@ -15,6 +15,9 @@
 #endif
 #ifdef _WIN32
 #include <windows.h>
+#include <security.h>
+#include <accctrl.h>
+#include <aclapi.h>
 #else
 #include <sys/mman.h>
 #include <sys/resource.h>
@@ -2292,6 +2295,40 @@ int model_lock_layers(model_t *m, size_t mem_bytes) {
         if ((const uint8_t *)ranges_end[i] > mmap_end)
             ranges_end[i] = mmap_end;
     }
+
+    /* On Windows, try to acquire SE_LOCK_MEMORY_NAME privilege.
+     * Without it, VirtualLock fails with ERROR_WORKING_SET_QUOTA (1453)
+     * because the default working set quota is far too small. */
+#ifdef _WIN32
+    {
+        BOOL got_lock_priv = FALSE;
+        HANDLE hToken;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+            TOKEN_PRIVILEGES tp;
+            tp.PrivilegeCount = 1;
+            if (LookupPrivilegeValueA(NULL, SE_LOCK_MEMORY_NAME, &tp.Privileges[0].Luid)) {
+                tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+                AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), NULL, NULL);
+                if (GetLastError() == ERROR_SUCCESS)
+                    got_lock_priv = TRUE;
+            }
+            CloseHandle(hToken);
+        }
+        /* If we got the privilege, VirtualLock will work. Otherwise, increase
+         * the working set quota as a fallback so VirtualLock doesn't fail with
+         * ERROR_WORKING_SET_QUOTA. SetProcessWorkingSetSize with MAXIMUM_INTEGER32
+         * means "no limit from Windows" - the OS still respects physical memory. */
+        if (!got_lock_priv) {
+            /* MAXIMUM_INTEGER32 (0x7FFFFFFF) is the sentinel meaning "no
+             * upper limit" for the working set. This does NOT require
+             * SE_INCREASE_QUOTA_NAME. Without it, VirtualLock fails with
+             * ERROR_WORKING_SET_QUOTA (1453) because the default quota is
+             * very small on non-admin accounts. */
+            SetProcessWorkingSetSize(GetCurrentProcess(),
+                                     MAXIMUM_INTEGER32, MAXIMUM_INTEGER32);
+        }
+    }
+#endif
 
     /* Call mlock on each merged range */
     size_t total_locked = 0;
