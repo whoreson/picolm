@@ -23,6 +23,16 @@ float fp16_to_fp32(uint16_t h);
 float fp16_to_fp32_lookup(uint16_t h);
 void fp16_table_init(void);
 
+/* ARMv8.2 SDOT/UDOT (vdotq_laneq_s32 etc). Distinct from PICOLM_NEON since
+ * plain NEON hardware (no dotprod) can't run this path -- per llama.cpp's
+ * own findings (and this project's own AVX1-machine test), running an
+ * interleaved Q4_0x4/x8 layout through a kernel that *doesn't* have the
+ * matching accelerated instruction is actively worse than the plain,
+ * non-interleaved path, not just "not faster". */
+#if defined(__ARM_FEATURE_DOTPROD)
+#  define PICOLM_DOTPROD 1
+#endif
+
 /* --- ARM NEON --- */
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #  define PICOLM_NEON 1

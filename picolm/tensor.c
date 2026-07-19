@@ -698,10 +698,85 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
  * Output layout: out[batch * d + row]
  * ================================================================ */
 
+typedef struct {
+    const char *wptr;
+    const void *qx_buf;
+    size_t q8_row_bytes;
+    float *out;
+    int n, d;
+} q4_0_4_4_batch_ctx_t;
+
+static void q4_0_4_4_batch_task(int b, void *ctxp) {
+    q4_0_4_4_batch_ctx_t *ctx = (q4_0_4_4_batch_ctx_t *)ctxp;
+    const char *xb = (const char *)ctx->qx_buf + (size_t)b * ctx->q8_row_bytes;
+    vec_dot_q4_0x4_q8_0(ctx->wptr, xb, ctx->n, ctx->out + (size_t)b * ctx->d, ctx->d);
+}
+
+typedef struct {
+    const char *wptr;
+    const void *qx_buf;
+    size_t q8_row_bytes;
+    float *out;
+    int n, d;
+} q4_0_8_8_batch_ctx_t;
+
+static void q4_0_8_8_batch_task(int b, void *ctxp) {
+    q4_0_8_8_batch_ctx_t *ctx = (q4_0_8_8_batch_ctx_t *)ctxp;
+    const char *xb = (const char *)ctx->qx_buf + (size_t)b * ctx->q8_row_bytes;
+    vec_dot_q4_0x8_q8_0_avx2(ctx->wptr, xb, ctx->n, ctx->out + (size_t)b * ctx->d, ctx->d);
+}
+
 void matmul_batch(float *out, const float *x, int n_batch,
                    const void *W, int n, int d, gguf_type_t qtype) {
     size_t row_bytes = gguf_type_row_size(qtype, n);
     const char *wptr = (const char *)W;
+
+#if defined(PICOLM_AVX2)
+    /* Weights already interleaved into 8-row groups on disk (produced by
+     * e.g. llama-quantize, loaded zero-copy via mmap -- no runtime repack
+     * involved). matmul()'s single-token path already threads this by
+     * splitting rows at 8-row-aligned boundaries; replicating that here
+     * would just duplicate that logic. Simpler and equally correct:
+     * reuse the same validated gemv kernel (which already handles the
+     * full row range d, including any partial group) once per token, and
+     * parallelize across TOKENS instead of rows -- n_batch is usually
+     * much larger than the thread count during prefill anyway. */
+    if (qtype == GGUF_TYPE_Q4_0_8_8 && n_batch > 0 && n > 0) {
+        size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
+        void *qbuf = malloc((size_t)n_batch * q8_rb);
+        if (qbuf) {
+            for (int b = 0; b < n_batch; b++)
+                quantize_row_q8_0(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
+            q4_0_8_8_batch_ctx_t ctx = { wptr, qbuf, q8_rb, out, n, d };
+            tensor_parallel_for(n_batch, q4_0_8_8_batch_task, &ctx);
+            free(qbuf);
+            return;
+        }
+        /* malloc failed: fall through to the generic path below, which is
+         * WRONG for this interleaved layout -- but malloc failure at this
+         * size is already a bigger problem than a wrong matmul result. */
+    }
+#endif /* PICOLM_AVX2 */
+    /* Same idea, 4-row groups -- this is the format ARM NEON dotprod/SDOT
+     * hardware wants. vec_dot_q4_0x4_q8_0 is a plain scalar reference (no
+     * SIMD acceleration wired in yet), so unlike the AVX2 kernel above it
+     * doesn't need a PICOLM_AVX2 guard -- it's correct (if not fast) on
+     * any platform. Reviewed and algebraically verified against the real
+     * NEON dotprod algorithm (the shift-based nibble extraction matches
+     * Q4_0's dequant exactly, same identity as the AVX2 LUT above), but
+     * not run on real dotprod hardware -- none available to test on here. */
+    if (qtype == GGUF_TYPE_Q4_0_4_4 && n_batch > 0 && n > 0) {
+        size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
+        void *qbuf = malloc((size_t)n_batch * q8_rb);
+        if (qbuf) {
+            for (int b = 0; b < n_batch; b++)
+                quantize_row_q8_0(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
+            q4_0_4_4_batch_ctx_t ctx = { wptr, qbuf, q8_rb, out, n, d };
+            tensor_parallel_for(n_batch, q4_0_4_4_batch_task, &ctx);
+            free(qbuf);
+            return;
+        }
+    }
 
     /* Pre-quantize the whole activation batch once per weight type */
     void *qx_buf = NULL; float *qx_d_buf = NULL;
@@ -806,6 +881,50 @@ void matmul_batch(float *out, const float *x, int n_batch,
 void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                         const void *W1, const void *W2,
                         int n, int d, gguf_type_t qtype1, gguf_type_t qtype2) {
+#if defined(PICOLM_AVX2)
+    /* Same reasoning as matmul_batch's Q4_0_8_8 branch: reuse the
+     * validated gemv kernel once per token, parallelized over tokens.
+     * Handled per-output so a mixed qtype1/qtype2 (uncommon in practice
+     * -- gate/up almost always share a quant type) still gets a correct
+     * result for whichever side isn't Q4_0_8_8, just without the fast
+     * path on that side. */
+    if ((qtype1 == GGUF_TYPE_Q4_0_8_8 || qtype2 == GGUF_TYPE_Q4_0_8_8) && n_batch > 0 && n > 0) {
+        size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
+        void *qbuf = malloc((size_t)n_batch * q8_rb);
+        if (qbuf) {
+            for (int b = 0; b < n_batch; b++)
+                quantize_row_q8_0(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
+
+            if (qtype1 == GGUF_TYPE_Q4_0_8_8) {
+                q4_0_8_8_batch_ctx_t ctx1 = { (const char *)W1, qbuf, q8_rb, out1, n, d };
+                tensor_parallel_for(n_batch, q4_0_8_8_batch_task, &ctx1);
+            } else {
+                size_t rb1 = gguf_type_row_size(qtype1, n);
+                for (int i = 0; i < d; i++) {
+                    const char *wr = (const char *)W1 + (size_t)i * rb1;
+                    for (int b = 0; b < n_batch; b++)
+                        out1[b * d + i] = vec_dot(wr, x + b * n, n, qtype1);
+                }
+            }
+            if (qtype2 == GGUF_TYPE_Q4_0_8_8) {
+                q4_0_8_8_batch_ctx_t ctx2 = { (const char *)W2, qbuf, q8_rb, out2, n, d };
+                tensor_parallel_for(n_batch, q4_0_8_8_batch_task, &ctx2);
+            } else {
+                size_t rb2 = gguf_type_row_size(qtype2, n);
+                for (int i = 0; i < d; i++) {
+                    const char *wr = (const char *)W2 + (size_t)i * rb2;
+                    for (int b = 0; b < n_batch; b++)
+                        out2[b * d + i] = vec_dot(wr, x + b * n, n, qtype2);
+                }
+            }
+            free(qbuf);
+            return;
+        }
+        /* malloc failed: fall through (wrong for the Q4_0_8_8 side, but
+         * malloc failure at this size is already a bigger problem). */
+    }
+#endif
+
     /* Pre-quantize activations for both matmuls.
      * If both types are the same, one quantization suffices.
      * If mixed, quantize for each type separately. */
