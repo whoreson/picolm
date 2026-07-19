@@ -1541,10 +1541,10 @@ float *model_forward(model_t *m, int token, int pos) {
             float *q_block = s->q; /* compact Q heads here (in-place) */
             float *gate_block = s->hb; /* gate survives K/V projection */
             for (int h = 0; h < n_heads; h++) {
-                memcpy(q_block + h * head_dim, qg_raw + h * 2 * head_dim,
-                       head_dim * sizeof(float));
-                memcpy(gate_block + h * head_dim, qg_raw + h * 2 * head_dim + head_dim,
-                       head_dim * sizeof(float));
+                memmove(q_block + h * head_dim, qg_raw + h * 2 * head_dim,
+                        head_dim * sizeof(float));
+                memmove(gate_block + h * head_dim, qg_raw + h * 2 * head_dim + head_dim,
+                        head_dim * sizeof(float));
             }
             qwen35_attn_gate = gate_block;
         }
@@ -2538,7 +2538,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
     int max_dim = (q_full_dim > dim) ? q_full_dim : dim;
     size_t bs = (size_t)n_tokens;
 
-    size_t sz = bs * (dim + 2 * max_dim + q_full_dim + 2 * kv_dim + 2 * n_ffn);
+    size_t sz = bs * (2 * dim + max_dim + q_full_dim + 2 * kv_dim + 2 * n_ffn);
     float *buf = (float *)malloc(sz * sizeof(float));
     if (!buf) { fprintf(stderr, "OOM: prefill batch\n"); exit(1); }
     float *p = buf;
@@ -2609,10 +2609,10 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                   float *q_block = q_batch + bi * q_dim;
                   float *gate_block = qwen35_gate_batch + bi * q_dim;
                   for (int h = 0; h < n_heads; h++) {
-                      memcpy(q_block + h * head_dim, qg_raw + h * 2 * head_dim,
-                             head_dim * sizeof(float));
-                      memcpy(gate_block + h * head_dim, qg_raw + h * 2 * head_dim + head_dim,
-                             head_dim * sizeof(float));
+                      memmove(q_block + h * head_dim, qg_raw + h * 2 * head_dim,
+                              head_dim * sizeof(float));
+                      memmove(gate_block + h * head_dim, qg_raw + h * 2 * head_dim + head_dim,
+                              head_dim * sizeof(float));
                   }
               }
           }
