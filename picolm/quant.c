@@ -1993,21 +1993,77 @@ void vec_dot_q4_0x4_q8_0(const void *vx, const void *wy, int n, float *out, int 
     const block_q8_0 *y = (const block_q8_0 *)wy;
     int nb = n / 32;  /* blocks per row */
 
+#if defined(PICOLM_DOTPROD)
+    /* Ported from ggml's ggml_gemv_q4_0_4x4_q8_0 (ggml-cpu/arch/arm/repack.cpp).
+     * vdotq_laneq_s32 computes a 4-way signed dot-product-accumulate in one
+     * instruction -- no shuffle/blend choreography needed, unlike the AVX2
+     * LUT approach above. The `<<4` / `&0xf0U` trick isolates each nibble
+     * into the top of its byte; interpreted as signed int8 that's exactly
+     * 16*sign_extend_4bit(nibble), and since the repack step already XORs
+     * every nibble with 8, sign_extend_4bit(nibble^8) == nibble-8 for all
+     * 16 values (same identity verified for the AVX2 LUT, just via shift
+     * instead of table lookup) -- confirmed both algebraically and by
+     * running this exact kernel under QEMU's cortex-a76 dotprod emulation
+     * against the scalar reference before shipping it, since there's no
+     * real dotprod hardware available to test on directly. */
+    for (int row_group = 0; row_group < nrows; row_group += 4) {
+        const block_q4_0x4 *b_ptr = xb + (size_t)(row_group / 4) * nb;
+        const block_q8_0 *a_ptr = y;
+        float32x4_t acc = vdupq_n_f32(0);
+        for (int b = 0; b < nb; b++) {
+            int8x16_t b0 = vld1q_s8((const int8_t *)b_ptr->qs);
+            int8x16_t b1 = vld1q_s8((const int8_t *)b_ptr->qs + 16);
+            int8x16_t b2 = vld1q_s8((const int8_t *)b_ptr->qs + 32);
+            int8x16_t b3 = vld1q_s8((const int8_t *)b_ptr->qs + 48);
+            float16x4_t bd = vld1_f16((const __fp16 *)b_ptr->d);
+
+            int8x16_t a0 = vld1q_s8(a_ptr->qs);
+            int8x16_t a1 = vld1q_s8(a_ptr->qs + 16);
+            float16x4_t ad = vld1_dup_f16((const __fp16 *)&a_ptr->d);
+
+            int32x4_t ret = vdupq_n_s32(0);
+            ret = vdotq_laneq_s32(ret, vshlq_n_s8(b0, 4), a0, 0);
+            ret = vdotq_laneq_s32(ret, vshlq_n_s8(b1, 4), a0, 1);
+            ret = vdotq_laneq_s32(ret, vshlq_n_s8(b2, 4), a0, 2);
+            ret = vdotq_laneq_s32(ret, vshlq_n_s8(b3, 4), a0, 3);
+            ret = vdotq_laneq_s32(ret, vandq_s8(b0, vdupq_n_s8((int8_t)0xf0U)), a1, 0);
+            ret = vdotq_laneq_s32(ret, vandq_s8(b1, vdupq_n_s8((int8_t)0xf0U)), a1, 1);
+            ret = vdotq_laneq_s32(ret, vandq_s8(b2, vdupq_n_s8((int8_t)0xf0U)), a1, 2);
+            ret = vdotq_laneq_s32(ret, vandq_s8(b3, vdupq_n_s8((int8_t)0xf0U)), a1, 3);
+
+            acc = vfmaq_f32(acc, vcvtq_n_f32_s32(ret, 4),
+                             vmulq_f32(vcvt_f32_f16(ad), vcvt_f32_f16(bd)));
+            a_ptr++;
+            b_ptr++;
+        }
+        vst1q_f32(out + row_group, acc);
+    }
+    return;
+#endif
+
 /* Scalar: process each row individually from interleaved data.
-     * Adapted from llama.cpp ggml_gemv_q4_0_4x4_q8_0_generic. */
+     * Adapted from llama.cpp ggml_gemv_q4_0_4x4_q8_0_generic.
+     * Groups of 4 rows are stored consecutively (each group = nb
+     * consecutive block_q4_0x4 structs), so a row beyond the first group
+     * needs both its group offset (group * nb) and its local index
+     * within that group (row % 4) -- using `row` directly as the local
+     * index only worked by accident for the first 4 rows. */
     for (int row = 0; row < nrows; row++) {
+        int group = row / 4;
+        int local_row = row % 4;
+        const block_q4_0x4 *group_base = xb + (size_t)group * nb;
         float sumf = 0.0f;
         for (int ib = 0; ib < nb; ib++) {
-            const block_q4_0x4 *b = xb + ib;
-            float dd = fp16_to_fp32_lookup(b->d[row]) * fp16_to_fp32_lookup(y[ib].d);
+            const block_q4_0x4 *b = group_base + ib;
+            float dd = fp16_to_fp32_lookup(b->d[local_row]) * fp16_to_fp32_lookup(y[ib].d);
             int sumi = 0;
             for (int k = 0; k < 4; k++) {
                 for (int i = 0; i < 4; i++) {
-                    uint8_t byte = b->qs[k * 16 + row * 4 + i];
-                    int v0 = (int8_t)(byte << 4);
-                    int v1 = (int8_t)(byte & 0xF0);
+                    uint8_t byte = b->qs[k * 16 + local_row * 4 + i];
+                    int v0 = (int8_t)(byte << 4) >> 4;
+                    int v1 = (int8_t)(byte & 0xF0) >> 4;
                     sumi += ((v0 * y[ib].qs[k * 4 + i]) +
-                             (v1 * y[ib].qs[k * 4 + i + 16])) >> 4;
+                             (v1 * y[ib].qs[k * 4 + i + 16]));
                 }
             }
             sumf += (float)sumi * dd;
@@ -2461,7 +2517,7 @@ void repack_q4_0_to_q4_0x4(const void *src, void *dst, int nrows, int ncols) {
  * Precondition: nrows % 8 == 0. Remaining rows handled by scalar fallback.
  * ================================================================ */
 void vec_dot_q4_0x8_q8_0_avx2(const void *vx, const void *wy, int n, float *out, int nrows) {
-#if 0
+#ifdef PICOLM_AVX2
     const block_q4_0x8 *b_ptr_start = (const block_q4_0x8 *)vx;
     const block_q8_0 *a_ptr = (const block_q8_0 *)wy;
     int nb = n / 32;
@@ -2528,46 +2584,49 @@ void vec_dot_q4_0x8_q8_0_avx2(const void *vx, const void *wy, int n, float *out,
             /* Int32 accumulator for 8 rows */
             __m256i iacc = _mm256_setzero_si256();
 
+            /* Signed x signed int8 dot-product-and-widen, matching ggml's
+             * mul_sum_i8_pairs_acc_int32x8: maddubs needs an unsigned first
+             * operand, so take abs(weight-nibble) and copy weight's sign
+             * onto the activation byte first, then reduce 16-bit pairs to
+             * int32 via madd_epi16 with a vector of ones. (The previous
+             * version of this kernel skipped the abs/sign step entirely --
+             * passing signed nibbles straight into maddubs, which requires
+             * an unsigned first operand -- and then tried to recover
+             * correct int32 sums via an ad hoc hi/lo 16-bit shift-and-add
+             * that doesn't correspond to any real reduction of maddubs'
+             * actual output width. That's what produced all-zero results.) */
+            #define Q4_0X8_MULSUM(bvec, avec) \
+                _mm256_add_epi32(iacc, _mm256_madd_epi16(_mm256_set1_epi16(1), \
+                    _mm256_maddubs_epi16(_mm256_sign_epi8(bvec, bvec), _mm256_sign_epi8(avec, bvec))))
+
             /* Low nibbles: interleave 8 rows' nibbles with a0[0..7] and a0[8..15] */
             {
                 __m256i bl = _mm256_blend_epi32(r00, _mm256_shuffle_epi32(r10, 177), 170);
                 __m256i bh = _mm256_blend_epi32(_mm256_shuffle_epi32(r00, 177), r10, 170);
-                __m256i al = _mm256_shuffle_epi32(a0, 0);
-                __m256i ah = _mm256_shuffle_epi32(a0, 85);
-                iacc = _mm256_add_epi32(iacc, _mm256_add_epi32(
-                    _mm256_maddubs_epi16(bl, al), _mm256_maddubs_epi16(bh, ah)));
+                iacc = Q4_0X8_MULSUM(bl, _mm256_shuffle_epi32(a0, 0));
+                iacc = Q4_0X8_MULSUM(bh, _mm256_shuffle_epi32(a0, 85));
 
                 bl = _mm256_blend_epi32(r01, _mm256_shuffle_epi32(r11, 177), 170);
                 bh = _mm256_blend_epi32(_mm256_shuffle_epi32(r01, 177), r11, 170);
-                al = _mm256_shuffle_epi32(a0, 170);
-                ah = _mm256_shuffle_epi32(a0, 255);
-                iacc = _mm256_add_epi32(iacc, _mm256_add_epi32(
-                    _mm256_maddubs_epi16(bl, al), _mm256_maddubs_epi16(bh, ah)));
+                iacc = Q4_0X8_MULSUM(bl, _mm256_shuffle_epi32(a0, 170));
+                iacc = Q4_0X8_MULSUM(bh, _mm256_shuffle_epi32(a0, 255));
             }
             /* High nibbles: interleave 8 rows' nibbles with a1[0..7] and a1[8..15] */
             {
                 __m256i bl = _mm256_blend_epi32(r02, _mm256_shuffle_epi32(r12, 177), 170);
                 __m256i bh = _mm256_blend_epi32(_mm256_shuffle_epi32(r02, 177), r12, 170);
-                __m256i al = _mm256_shuffle_epi32(a1, 0);
-                __m256i ah = _mm256_shuffle_epi32(a1, 85);
-                iacc = _mm256_add_epi32(iacc, _mm256_add_epi32(
-                    _mm256_maddubs_epi16(bl, al), _mm256_maddubs_epi16(bh, ah)));
+                iacc = Q4_0X8_MULSUM(bl, _mm256_shuffle_epi32(a1, 0));
+                iacc = Q4_0X8_MULSUM(bh, _mm256_shuffle_epi32(a1, 85));
 
                 bl = _mm256_blend_epi32(r03, _mm256_shuffle_epi32(r13, 177), 170);
                 bh = _mm256_blend_epi32(_mm256_shuffle_epi32(r03, 177), r13, 170);
-                al = _mm256_shuffle_epi32(a1, 170);
-                ah = _mm256_shuffle_epi32(a1, 255);
-                iacc = _mm256_add_epi32(iacc, _mm256_add_epi32(
-                    _mm256_maddubs_epi16(bl, al), _mm256_maddubs_epi16(bh, ah)));
+                iacc = Q4_0X8_MULSUM(bl, _mm256_shuffle_epi32(a1, 170));
+                iacc = Q4_0X8_MULSUM(bh, _mm256_shuffle_epi32(a1, 255));
             }
-
-            /* Reduce: split int16 pairs -> int32, shift right by 16 for >>4 (4 extra for sign) */
-            __m256i ihi = _mm256_srli_epi32(iacc, 16);
-            __m256i ilo = _mm256_and_si256(iacc, _mm256_set1_epi32(0xFFFF));
-            __m256i s = _mm256_add_epi32(_mm256_srai_epi32(ihi, 16), _mm256_srai_epi32(ilo, 16));
+            #undef Q4_0X8_MULSUM
 
             /* Scale and accumulate */
-            acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s), sd, acc);
+            acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(iacc), sd, acc);
         }
 
         /* Permute to correct order and store */
@@ -2586,21 +2645,25 @@ void vec_dot_q4_0x8_q8_0_avx2(const void *vx, const void *wy, int n, float *out,
                 const block_q4_0x8 *bp = &((const block_q4_0x8 *)vx)[b + group * nb];
                 float dd = fp16_to_fp32_lookup(bp->d[r]) * fp16_to_fp32_lookup(a_ptr[b].d);
                 int sumi = 0;
-                /* Row r's data: qs[r*8..r*8+7] (first 8 bytes = 16 nibbles) and
-                 * qs[64+r*8..64+r*8+7] (next 8 bytes = 16 nibbles)
-                 * Q8_0 input: a_ptr[b].qs[0..15] for first 16 values,
-                 *             a_ptr[b].qs[16..31] for second 16 values */
+                /* Row r's original 16-byte qs is split across this block's
+                 * qs[r*8 .. r*8+8) (original bytes 0-7) and
+                 * qs[64+r*8 .. 64+r*8+8) (original bytes 8-15) -- see
+                 * repack_q4_0_to_q4_0x8. Standard Q4_0 packing: byte j's low
+                 * nibble is value[j], high nibble is value[j+16]. So the
+                 * first half's low/high nibbles are value[0..7]/value[16..23],
+                 * and the second half's are value[8..15]/value[24..31] --
+                 * NOT value[i]/value[i+8] as a naive reading might suggest. */
                 for (int i = 0; i < 8; i++) {
                     uint8_t byte = bp->qs[r * 8 + i];
-                    int v0 = (int8_t)(byte << 4);
-                    int v1 = (int8_t)(byte & 0xF0);
-                    sumi += ((v0 * a_ptr[b].qs[i]) + (v1 * a_ptr[b].qs[i + 8])) >> 4;
+                    int v0 = (int8_t)(byte << 4) >> 4; /* low nibble, sign-extended: value[i] */
+                    int v1 = (int8_t)(byte & 0xF0) >> 4; /* high nibble, sign-extended: value[i+16] */
+                    sumi += v0 * a_ptr[b].qs[i] + v1 * a_ptr[b].qs[i + 16];
                 }
                 for (int i = 0; i < 8; i++) {
                     uint8_t byte = bp->qs[64 + r * 8 + i];
-                    int v0 = (int8_t)(byte << 4);
-                    int v1 = (int8_t)(byte & 0xF0);
-                    sumi += ((v0 * a_ptr[b].qs[16 + i]) + (v1 * a_ptr[b].qs[16 + i + 8])) >> 4;
+                    int v0 = (int8_t)(byte << 4) >> 4; /* value[8+i] */
+                    int v1 = (int8_t)(byte & 0xF0) >> 4; /* value[24+i] */
+                    sumi += v0 * a_ptr[b].qs[8 + i] + v1 * a_ptr[b].qs[24 + i];
                 }
                 sumf += (float)sumi * dd;
             }
@@ -2608,7 +2671,10 @@ void vec_dot_q4_0x8_q8_0_avx2(const void *vx, const void *wy, int n, float *out,
         }
     }
 #else
-    /* Non-AVX2: scalar fallback processing all rows from Q4_0x8 data */
+    /* Non-AVX2: scalar fallback processing all rows from Q4_0x8 data.
+     * See the AVX2 branch's remainder-tail comment for the nibble/activation
+     * index pairing derivation (row's first-half byte -> value[i]/value[i+16],
+     * second-half byte -> value[8+i]/value[24+i]). */
     {
         const block_q4_0x8 *b_ptr = (const block_q4_0x8 *)vx;
         const block_q8_0 *a_ptr = (const block_q8_0 *)wy;
@@ -2623,15 +2689,15 @@ void vec_dot_q4_0x8_q8_0_avx2(const void *vx, const void *wy, int n, float *out,
                 int sumi = 0;
                 for (int i = 0; i < 8; i++) {
                     uint8_t byte = b_ptr[group * nb + b].qs[r * 8 + i];
-                    int v0 = (int8_t)(byte << 4);
-                    int v1 = (int8_t)(byte & 0xF0);
-                    sumi += ((v0 * a_ptr[b].qs[i]) + (v1 * a_ptr[b].qs[i + 8])) >> 4;
+                    int v0 = (int8_t)(byte << 4) >> 4;   /* value[i] */
+                    int v1 = (int8_t)(byte & 0xF0) >> 4; /* value[i+16] */
+                    sumi += v0 * a_ptr[b].qs[i] + v1 * a_ptr[b].qs[i + 16];
                 }
                 for (int i = 0; i < 8; i++) {
                     uint8_t byte = b_ptr[group * nb + b].qs[64 + r * 8 + i];
-                    int v0 = (int8_t)(byte << 4);
-                    int v1 = (int8_t)(byte & 0xF0);
-                    sumi += ((v0 * a_ptr[b].qs[16 + i]) + (v1 * a_ptr[b].qs[16 + i + 8])) >> 4;
+                    int v0 = (int8_t)(byte << 4) >> 4;   /* value[8+i] */
+                    int v1 = (int8_t)(byte & 0xF0) >> 4; /* value[24+i] */
+                    sumi += v0 * a_ptr[b].qs[8 + i] + v1 * a_ptr[b].qs[24 + i];
                 }
                 sumf += (float)sumi * dd;
             }
