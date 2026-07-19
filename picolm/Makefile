@@ -11,30 +11,30 @@ PREFIX  ?= /usr/local
 MODEL_DIR ?= /opt/picolm/models
 
 # --- Default: native build with per-matmul threading ---
-native: CFLAGS += -march=native -DPICOLM_USE_PER_MATMUL_THREAD=1
+native: CFLAGS += -march=native
 native: $(TARGET)
 
 # --- x86-64 default (SSE2 only, safe for all x86-64) ---
 x86: sse2
 
 # --- No SIMD (scalar fallback, portable to any architecture) ---
-scalar: CFLAGS += -mno-sse2 -mno-avx -DPICOLM_USE_PER_MATMUL_THREAD=1
+scalar: CFLAGS += -mno-sse2 -mno-avx
 scalar: $(TARGET)
 
 # --- x86-64 with SSE2 only ---
-sse2: CFLAGS += -msse2 -DPICOLM_USE_PER_MATMUL_THREAD=1
+sse2: CFLAGS += -msse2
 sse2: $(TARGET)
 
 # --- x86-64 with SSE2+SSE3+SSSE3 (covers AMD Phenom/Athlon and similar without AVX) ---
-sse3: CFLAGS += -msse2 -msse3 -mssse3 -mpopcnt -DPICOLM_USE_PER_MATMUL_THREAD=1
+sse3: CFLAGS += -msse2 -msse3 -mssse3 -mpopcnt
 sse3: $(TARGET)
 
 # --- x86-64 with AVX (Sandy Bridge and newer Intel; Bulldozer and newer AMD) ---
-avx: CFLAGS += -mavx -mfma -mpopcnt -DPICOLM_USE_PER_MATMUL_THREAD=1
+avx: CFLAGS += -mavx -mfma -mpopcnt
 avx: $(TARGET)
 
 # --- x86-64 with AVX2 (Haswell and newer Intel; Excavator and newer AMD) ---
-avx2: CFLAGS += -mavx2 -mfma -mpopcnt -DPICOLM_USE_PER_MATMUL_THREAD=1
+avx2: CFLAGS += -mavx2 -mfma -mpopcnt
 avx2: $(TARGET)
 
 # --- Persistent thread pool (WIP, for development) ---
@@ -60,38 +60,38 @@ grammar.o: grammar.c grammar.h
 
 # --- Static build for single-binary deployment ---
 # Uses SSE2 (not -march=native) so the binary runs on any x86-64, not just the build machine.
-static: CFLAGS += -msse2 -DPICOLM_USE_PER_MATMUL_THREAD=1
+static: CFLAGS += -msse2
 static: LDFLAGS += -static
 static: $(TARGET)
 
 # --- Pi 3/4/5 (64-bit ARM with NEON SIMD) ---
-pi: CFLAGS += -march=armv8-a+simd -DPICOLM_USE_PER_MATMUL_THREAD=1
+pi: CFLAGS += -march=armv8-a+simd
 pi: $(TARGET)
 
 # --- Pi Zero / Pi 1 (32-bit ARM) ---
 pi-arm32: CC = arm-linux-gnueabihf-gcc
-pi-arm32: CFLAGS += -march=armv6 -mfpu=vfp -DPICOLM_USE_PER_MATMUL_THREAD=1
+pi-arm32: CFLAGS += -march=armv6 -mfpu=vfp
 pi-arm32: $(TARGET)
 
 # --- Cross-compile for Pi64 from platforms (e.g. x86) ---
 cross-pi: CC = aarch64-linux-gnu-gcc
-cross-pi: CFLAGS += -march=armv8-a+simd -DPICOLM_USE_PER_MATMUL_THREAD=1
+cross-pi: CFLAGS += -march=armv8-a+simd
 cross-pi: LDFLAGS += -static
 cross-pi: $(TARGET)
 
 # --- RISC-V (Sipeed LicheeRV, etc.) ---
 riscv: CC = riscv64-linux-gnu-gcc
-riscv: CFLAGS += -march=rv64gc -mabi=lp64d -DPICOLM_USE_PER_MATMUL_THREAD=1
+riscv: CFLAGS += -march=rv64gc -mabi=lp64d
 riscv: $(TARGET)
 
 # --- Cross-compile for RISC-V from platforms (e.g. x86) ---
 cross-riscv: CC = riscv64-linux-gnu-gcc
-cross-riscv: CFLAGS += -march=rv64gc -mabi=lp64d -DPICOLM_USE_PER_MATMUL_THREAD=1
+cross-riscv: CFLAGS += -march=rv64gc -mabi=lp64d
 cross-riscv: LDFLAGS += -static
 cross-riscv: $(TARGET)
 
 # --- Debug build ---
-debug: CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -g -O0 -DPICOLM_USE_PER_MATMUL_THREAD=1
+debug: CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -g -O0
 debug: $(TARGET)
 
 # --- Install ---
@@ -117,6 +117,6 @@ clean:
 
 
 .PHONY: asan
-asan: CFLAGS += -fsanitize=address -g -O2 -march=native -DPICOLM_USE_PER_MATMUL_THREAD=1
+asan: CFLAGS += -fsanitize=address -g -O2 -march=native
 asan: LDFLAGS += -fsanitize=address
 asan: picolm
