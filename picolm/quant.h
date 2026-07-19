@@ -329,6 +329,16 @@ typedef struct {
     uint16_t d;          /* scale (FP16) */
     uint8_t  qs[16];     /* 4-bit quantized values */
 } block_q4_0;            /* 18 bytes */
+
+/* Q4_1 block: 32 weights (old GGML format, used by some GGUF models)
+ * Layout: half d (scale), half m (min), uchar qs[16] (nibbles)
+ * Dequant: val = qs[j] * d + m  (unsigned nibble, no sign extension) */
+typedef struct {
+    uint16_t d;          /* scale (FP16) */
+    uint16_t m;          /* min (FP16) */
+    uint8_t  qs[16];     /* 4-bit quantized values */
+} block_q4_1;            /* 20 bytes */
+
 #pragma pack(pop)
 
 /* ---- FP16 conversion ---- */
@@ -363,6 +373,7 @@ float vec_dot_q6_K_f32(const void *src, const float *x, int n);
 float vec_dot_f32_f32(const void *src, const float *x, int n);
 float vec_dot_q8_0_f32(const void *src, const float *x, int n);
 float vec_dot_q4_0_f32(const void *src, const float *x, int n);
+float vec_dot_q4_1_f32(const void *src, const float *x, int n);
 /* fp16-fp32 dot product: sum of fp16_to_fp32(k[i]) * x[i] */
 float vec_dot_f16_f32(const void *src, const float *x, int n);
 float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n);
