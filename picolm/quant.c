@@ -369,6 +369,22 @@ void dequantize_row_q4_0(const void *src, float *dst, int n) {
     }
 }
 
+/* Dequantize Q4_1: val = qs[j] * d + m (unsigned nibble) */
+void dequantize_row_q4_1(const void *src, float *dst, int n) {
+    const block_q4_1 *blocks = (const block_q4_1 *)src;
+    int nb = n / 32;
+
+    for (int i = 0; i < nb; i++) {
+        float d = fp16_to_fp32_lookup(blocks[i].d);
+        float m = fp16_to_fp32_lookup(blocks[i].m);
+        for (int j = 0; j < 16; j++) {
+            uint8_t byte = blocks[i].qs[j];
+            dst[i * 32 + j]        = (float)(byte & 0x0F) * d + m;
+            dst[i * 32 + j + 16]   = (float)(byte >> 4)   * d + m;
+        }
+    }
+}
+
 /* Dequantize a single row from Q4_0_4_4 interleaved format to float32.
  * Only the first row of each 4-row group is dequantized. */
 void dequantize_row_q4_0_4_4(const void *src, float *dst, int n) {
@@ -455,6 +471,7 @@ void dequantize_row(const void *src, float *dst, int n, gguf_type_t type) {
         case GGUF_TYPE_F16:   dequantize_row_f16(src, dst, n);  break;
         case GGUF_TYPE_BF16:  dequantize_row_bf16(src, dst, n); break;
         case GGUF_TYPE_Q4_0:  dequantize_row_q4_0(src, dst, n); break;
+        case GGUF_TYPE_Q4_1:  dequantize_row_q4_1(src, dst, n); break;
         case GGUF_TYPE_Q8_0:  dequantize_row_q8_0(src, dst, n); break;
         case GGUF_TYPE_Q2_K:  dequantize_row_q2_K(src, dst, n); break;
         case GGUF_TYPE_Q3_K:  dequantize_row_q3_K(src, dst, n); break;
@@ -2356,6 +2373,36 @@ float vec_dot_q4_0_f32(const void *src, const float *x, int n) {
     return sumf;
 }
 
+/* vec_dot_q4_1_f32: fused dequant + dot for Q4_1 x float32
+ * Q4_1 block: 16 bytes qs + 2 bytes d(FP16) + 2 bytes m(FP16) = 20 bytes for 32 values.
+ *   vals[0..15]  = low  nibble of qs[0..15]  (unsigned, 0..15)
+ *   vals[16..31] = high nibble of qs[0..15]  (unsigned, 0..15)
+ * Dequant: val = qs[j] * d + m */
+float vec_dot_q4_1_f32(const void *src, const float *x, int n) {
+    const block_q4_1 *blocks = (const block_q4_1 *)src;
+    int nb = n / 32;
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        float d = fp16_to_fp32_lookup(blocks[i].d);
+        float m = fp16_to_fp32_lookup(blocks[i].m);
+        const uint8_t *qs = blocks[i].qs;
+        const float *xp = x + i * 32;
+        float block_sum = 0.0f;
+        float m_sum = 0.0f;
+        for (int j = 0; j < 16; j++) {
+            uint8_t lo = qs[j] & 0xF;
+            uint8_t hi = qs[j] >> 4;
+            block_sum += (float)lo * xp[j];
+            block_sum += (float)hi * xp[j + 16];
+            m_sum += xp[j];
+            m_sum += xp[j + 16];
+        }
+        sumf += d * block_sum + m * m_sum;
+    }
+    return sumf;
+}
+
 /* vec_dot for Q4_0_4_4: dequantize first row of interleaved block, then dot */
 float vec_dot_q4_0_4_4_f32(const void *src, const float *x, int n) {
     const block_q4_0x4 *blocks = (const block_q4_0x4 *)src;
@@ -2426,6 +2473,7 @@ float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
         case GGUF_TYPE_F32:  return vec_dot_f32_f32(src, x, n);
         case GGUF_TYPE_Q8_0: return vec_dot_q8_0_f32(src, x, n);
         case GGUF_TYPE_Q4_0: return vec_dot_q4_0_f32(src, x, n);
+        case GGUF_TYPE_Q4_1: return vec_dot_q4_1_f32(src, x, n);
         case GGUF_TYPE_Q4_0_4_4: return vec_dot_q4_0_4_4_f32(src, x, n);
         case GGUF_TYPE_Q4_0_8_8: return vec_dot_q4_0_8_8_f32(src, x, n);
         case GGUF_TYPE_F16:  return vec_dot_f16_f32(src, x, n);
