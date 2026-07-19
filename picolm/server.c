@@ -1666,6 +1666,151 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
     for (int i = 0; i < n_stop_words; i++) free(stop_words[i]);
 }
 
+/* ---- Endpoint: POST /tokenize ---- */
+static void handle_tokenize(SOCKET sock, const char *request_body) {
+    cJSON *root = cJSON_Parse(request_body);
+    if (!root) {
+        http_send(sock, 400, "application/json", "{\"error\":{\"message\":\"Invalid JSON\"}}");
+        return;
+    }
+
+    cJSON *content_obj = cJSON_GetObjectItem(root, "content");
+    if (!content_obj || !cJSON_IsString(content_obj)) {
+        cJSON_Delete(root);
+        http_send(sock, 400, "application/json", "{\"error\":{\"message\":\"'content' required (string)\"}}");
+        return;
+    }
+    const char *content = content_obj->valuestring;
+
+    int add_special = 0;
+    cJSON *add_special_obj = cJSON_GetObjectItem(root, "add_special");
+    if (add_special_obj && cJSON_IsBool(add_special_obj))
+        add_special = cJSON_IsTrue(add_special_obj);
+
+    int parse_special = 1;
+    cJSON *parse_special_obj = cJSON_GetObjectItem(root, "parse_special");
+    if (parse_special_obj && cJSON_IsBool(parse_special_obj))
+        parse_special = cJSON_IsTrue(parse_special_obj);
+
+    int with_pieces = 0;
+    cJSON *with_pieces_obj = cJSON_GetObjectItem(root, "with_pieces");
+    if (with_pieces_obj && cJSON_IsBool(with_pieces_obj))
+        with_pieces = cJSON_IsTrue(with_pieces_obj);
+
+    (void)parse_special; /* BPE tokenizer doesn't need special token parsing */
+
+    int max_tokens = 4096;
+    int *tokens = (int *)malloc((size_t)max_tokens * sizeof(int));
+    int n_tokens = 0;
+
+    if (srv.use_qwen_tok) {
+        n_tokens = qwen_tokenize_encode(&srv.qwen_enc, content, tokens, max_tokens);
+        if (add_special && n_tokens < max_tokens) {
+            /* Shift tokens right and prepend BOS */
+            for (int i = n_tokens; i > 0; i--) tokens[i] = tokens[i - 1];
+            tokens[0] = (int) srv.qwen_enc.bos_id;
+            n_tokens++;
+        }
+    } else {
+        n_tokens = tokenizer_encode(&srv.tokenizer, content, tokens, max_tokens, add_special);
+    }
+
+    cJSON *result = cJSON_CreateObject();
+    cJSON *tokens_arr = cJSON_CreateArray();
+
+    if (with_pieces) {
+        for (int i = 0; i < n_tokens; i++) {
+            cJSON *tok_obj = cJSON_CreateObject();
+            cJSON_AddNumberToObject(tok_obj, "id", tokens[i]);
+
+            const char *piece = NULL;
+            char piece_buf[64] = {0};
+            if (srv.use_qwen_tok) {
+                qwen_tokenize_decode(&srv.qwen_enc, tokens[i], piece_buf, sizeof(piece_buf));
+                piece = piece_buf;
+            } else {
+                piece = tokenizer_decode(&srv.tokenizer, i > 0 ? tokens[i - 1] : -1, tokens[i]);
+            }
+            if (piece && piece[0]) {
+                cJSON_AddStringToObject(tok_obj, "piece", piece);
+            } else {
+                cJSON_AddStringToObject(tok_obj, "piece", "");
+            }
+            cJSON_AddItemToArray(tokens_arr, tok_obj);
+        }
+    } else {
+        for (int i = 0; i < n_tokens; i++) {
+            cJSON_AddItemToArray(tokens_arr, cJSON_CreateNumber(tokens[i]));
+        }
+    }
+    cJSON_AddItemToObject(result, "tokens", tokens_arr);
+
+    char *json = cJSON_PrintUnformatted(result);
+    cJSON_Delete(result);
+    cJSON_Delete(root);
+    free(tokens);
+
+    http_send(sock, 200, "application/json", json);
+    free(json);
+}
+
+/* ---- Endpoint: POST /detokenize ---- */
+static void handle_detokenize(SOCKET sock, const char *request_body) {
+    cJSON *root = cJSON_Parse(request_body);
+    if (!root) {
+        http_send(sock, 400, "application/json", "{\"error\":{\"message\":\"Invalid JSON\"}}");
+        return;
+    }
+
+    cJSON *tokens_obj = cJSON_GetObjectItem(root, "tokens");
+    if (!tokens_obj || !cJSON_IsArray(tokens_obj)) {
+        cJSON_Delete(root);
+        http_send(sock, 400, "application/json", "{\"error\":{\"message\":\"'tokens' required (array of ints)\"}}");
+        return;
+    }
+
+    int n = cJSON_GetArraySize(tokens_obj);
+    size_t text_cap = (size_t)n * 16 + 1;
+    char *text = (char *)malloc(text_cap);
+    text[0] = '\0';
+    int text_len = 0;
+
+    for (int i = 0; i < n; i++) {
+        cJSON *tok = cJSON_GetArrayItem(tokens_obj, i);
+        if (!cJSON_IsNumber(tok)) continue;
+        int tid = (int)tok->valueint;
+
+        const char *piece = NULL;
+        char piece_buf[64] = {0};
+        if (srv.use_qwen_tok) {
+            qwen_tokenize_decode(&srv.qwen_enc, tid, piece_buf, sizeof(piece_buf));
+            piece = piece_buf;
+        } else {
+            piece = tokenizer_decode(&srv.tokenizer, i > 0 ? (int)cJSON_GetArrayItem(tokens_obj, i - 1)->valueint : -1, tid);
+        }
+        if (piece && piece[0]) {
+            int plen = (int)strlen(piece);
+            if ((size_t)(text_len + plen + 1) <= text_cap) {
+                memcpy(text + text_len, piece, (size_t)plen);
+                text_len += plen;
+                text[text_len] = '\0';
+            }
+        }
+    }
+
+    cJSON *result = cJSON_CreateObject();
+    cJSON *content = cJSON_CreateString(text);
+    cJSON_AddItemToObject(result, "content", content);
+
+    char *json = cJSON_PrintUnformatted(result);
+    cJSON_Delete(result);
+    cJSON_Delete(root);
+    free(text);
+
+    http_send(sock, 200, "application/json", json);
+    free(json);
+}
+
 /* ---- Request Router ---- */
 
 static void handle_request(SOCKET sock) {
@@ -1713,6 +1858,10 @@ static void handle_request(SOCKET sock) {
             handle_completion(sock, body_start, 0);
         } else if (strcmp(path, "/completion") == 0) {
             handle_llama_completion(sock, body_start);
+        } else if (strcmp(path, "/tokenize") == 0) {
+            handle_tokenize(sock, body_start);
+        } else if (strcmp(path, "/detokenize") == 0) {
+            handle_detokenize(sock, body_start);
         } else {
             http_send(sock, 404, "application/json", "{\"error\":{\"message\":\"Not found\"}}");
         }
@@ -1799,6 +1948,8 @@ int server_main(int port, const char *host, const char *model_path, int num_thre
     fprintf(stderr, "  POST /v1/chat/completions\n");
     fprintf(stderr, "  POST /v1/completions\n");
     fprintf(stderr, "  POST /completion       (llama.cpp-style)\n");
+    fprintf(stderr, "  POST /tokenize         (llama.cpp-style)\n");
+    fprintf(stderr, "  POST /detokenize       (llama.cpp-style)\n");
     fprintf(stderr, "  GET  /v1/models\n");
     fprintf(stderr, "  GET  /health           (health check)\n");
     fprintf(stderr, "  GET  /props            (server properties)\n");
