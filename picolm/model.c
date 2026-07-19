@@ -2533,17 +2533,19 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
     int n_heads = c->n_heads, n_kv_heads = c->n_kv_heads, head_dim = c->head_dim;
     int kv_dim = n_kv_heads * head_dim, kv_mul = n_heads / n_kv_heads;
     int q_dim = n_heads * head_dim, seq_len = c->max_seq_len;
-    int max_dim = (q_dim > dim) ? q_dim : dim;
+    /* Qwen3.5 full attention layers have interleaved Q+gate */
+    int q_full_dim = (c->has_ssm) ? (q_dim * 2) : q_dim;
+    int max_dim = (q_full_dim > dim) ? q_full_dim : dim;
     size_t bs = (size_t)n_tokens;
 
-    size_t sz = bs * (dim + 2 * max_dim + q_dim + 2 * kv_dim + 2 * n_ffn);
+    size_t sz = bs * (dim + 2 * max_dim + q_full_dim + 2 * kv_dim + 2 * n_ffn);
     float *buf = (float *)malloc(sz * sizeof(float));
     if (!buf) { fprintf(stderr, "OOM: prefill batch\n"); exit(1); }
     float *p = buf;
     float *x_batch = p;  p += bs * dim;
     float *xb_batch = p; p += bs * max_dim;
     float *xb2_batch = p; p += bs * dim;
-    float *q_batch = p;  p += bs * q_dim;
+    float *q_batch = p;  p += bs * q_full_dim;
     float *k_batch = p;  p += bs * kv_dim;
     float *v_batch = p;  p += bs * kv_dim;
     float *hb_batch = p; p += bs * n_ffn;
@@ -2588,8 +2590,33 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 
         /* Q projection (batched) */
         tensor_set_repacked(m->repack_used[2+l*9] ? m->repack_buffers[2+l*9] : NULL);
-        matmul_batch(q_batch, xb_batch, n_tokens, lw->attn_q, dim, q_dim, lw->type_attn_q);
+        { int this_q_dim = (c->has_ssm && lw->is_attn_layer) ? q_full_dim : q_dim;
+          matmul_batch(q_batch, xb_batch, n_tokens, lw->attn_q, dim, this_q_dim, lw->type_attn_q);
+        }
         tensor_set_repacked(NULL);
+
+        /* For Qwen3.5: de-interleave per-head Q+gate into block layout.
+         * GGUF stores [Q_0, Gate_0, Q_1, Gate_1, ...] (per-head interleaved).
+         * Gate stored in hb2_batch to survive K/V projection writes. */
+        { float *qwen35_gate_batch = NULL;
+          if (c->has_ssm && lw->is_attn_layer) {
+              qwen35_gate_batch = hb2_batch; /* reuse as gate storage */
+              #ifdef _OPENMP
+#pragma omp parallel for
+#endif
+              for (int bi = 0; bi < n_tokens; bi++) {
+                  float *qg_raw = q_batch + bi * q_full_dim;
+                  float *q_block = q_batch + bi * q_dim;
+                  float *gate_block = qwen35_gate_batch + bi * q_dim;
+                  for (int h = 0; h < n_heads; h++) {
+                      memcpy(q_block + h * head_dim, qg_raw + h * 2 * head_dim,
+                             head_dim * sizeof(float));
+                      memcpy(gate_block + h * head_dim, qg_raw + h * 2 * head_dim + head_dim,
+                             head_dim * sizeof(float));
+                  }
+              }
+          }
+        }
 
         /* K+V projection (batched dual) */
         tensor_set_repacked(m->repack_used[3+l*9] ? m->repack_buffers[3+l*9] : NULL);
@@ -2648,6 +2675,21 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                                   n_heads, c->n_kv_heads, head_dim,
                                   max_dim, s->kv_type_k, s->kv_type_v,
                                   s->kv_row_size_k, s->kv_row_size_v);
+        }
+
+        /* Apply Qwen3.5 attention gate (sigmoid, element-wise multiply on attention output before proj) */
+        if (c->has_ssm && lw->is_attn_layer) {
+            #ifdef _OPENMP
+#pragma omp parallel for
+#endif
+            for (int bi = 0; bi < n_tokens; bi++) {
+                float *xb = xb_batch + bi * max_dim;
+                float *gate = hb2_batch + bi * q_dim;
+                for (int i = 0; i < q_dim; i++) {
+                    float g = 1.0f / (1.0f + expf(-gate[i]));
+                    xb[i] *= g;
+                }
+            }
         }
 
         /* Output projection (batched) */
