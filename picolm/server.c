@@ -5,6 +5,7 @@
  *   POST /v1/chat/completions  - Chat completions (with streaming)
  *   POST /v1/completions        - Raw completions (with streaming)
  *   GET  /v1/models             - List available models
+ *   GET  /health                - Health check (OAI-compatible)
  *
  * Build: compile with -DPICOLM_SERVER
  * Usage: ./picolm --server <model.gguf> [--port PORT] [--host HOST]
@@ -1689,8 +1690,15 @@ static void handle_request(SOCKET sock) {
             handle_list_models(sock, srv.model_path);
         } else if (strcmp(path, "/props") == 0 || strcmp(path, "/v1/props") == 0) {
             handle_props(sock);
-        } else if (strcmp(path, "/") == 0 || strcmp(path, "/health") == 0) {
+        } else if (strcmp(path, "/") == 0) {
             http_send(sock, 200, "text/plain", "PicoLM server running\n");
+        } else if (strcmp(path, "/health") == 0 || strcmp(path, "/v1/health") == 0) {
+            if (!srv.model_loaded) {
+                http_send(sock, 503, "application/json",
+                    "{\"error\":{\"code\":503,\"message\":\"Loading model\",\"type\":\"unavailable_error\"}}");
+            } else {
+                http_send(sock, 200, "application/json", "{\"status\":\"ok\"}");
+            }
         } else {
             http_send(sock, 404, "application/json", "{\"error\":{\"message\":\"Not found\"}}");
         }
@@ -1792,6 +1800,7 @@ int server_main(int port, const char *host, const char *model_path, int num_thre
     fprintf(stderr, "  POST /v1/completions\n");
     fprintf(stderr, "  POST /completion       (llama.cpp-style)\n");
     fprintf(stderr, "  GET  /v1/models\n");
+    fprintf(stderr, "  GET  /health           (health check)\n");
     fprintf(stderr, "  GET  /props            (server properties)\n");
     fprintf(stderr, "[server] Press Ctrl+C to stop\n");
 
