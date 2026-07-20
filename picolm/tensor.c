@@ -380,6 +380,18 @@ static void matmul_worker_f(matmul_task_t *t) {
         }
 #endif
 #endif
+    } else if (t->qtype == GGUF_TYPE_Q1_0 && t->x) {
+        const block_q8_0 *qx = (const block_q8_0 *)t->x;
+        for (int i = t->start; i < t->end; i++) {
+            t->out[i] = vec_dot_q1_0_q8_0(
+                t->W + (size_t)i * t->row_bytes, qx, t->n);
+        }
+    } else if (t->qtype == GGUF_TYPE_Q2_0 && t->x) {
+        const block_q8_0 *qx = (const block_q8_0 *)t->x;
+        for (int i = t->start; i < t->end; i++) {
+            t->out[i] = vec_dot_q2_0_q8_0(
+                t->W + (size_t)i * t->row_bytes, qx, t->n);
+        }
     } else {
         for (int i = t->start; i < t->end; i++) {
             t->out[i] = vec_dot(t->W + (size_t)i * t->row_bytes,
@@ -792,6 +804,59 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
         }
         /* If allocation failed, fall through to generic path */
 #endif
+    } else if (qtype == GGUF_TYPE_Q1_0 || qtype == GGUF_TYPE_Q2_0) {
+        /* Q1_0/Q2_0 fast path: quantize x to Q8_0 once, then use int8 MAC
+         * for all rows. Same approach as Q4_0/Q8_0 above.
+         * Q1_0 has AVX2 SIMD path in vec_dot_q1_0_q8_0.
+         * Q2_0 has scalar fallback (AVX-512-VNNI path only in llama.cpp). */
+        size_t qx_size = (n / 32) * sizeof(block_q8_0);
+        block_q8_0 *qx = NULL;
+        int qx_owned = 0;
+        if (n_threads <= 1 && scratch_buf != NULL && qx_size <= (size_t)scratch_size) {
+            qx = (block_q8_0 *)scratch_buf;
+        } else {
+            qx = (block_q8_0 *)malloc(qx_size);
+            qx_owned = 1;
+        }
+        if (qx != NULL) {
+            quantize_row_q8_0(x, qx, n);
+
+            if (n_threads <= 1 || d < 4) {
+                if (qtype == GGUF_TYPE_Q1_0) {
+                    for (int i = 0; i < d; i++) {
+                        out[i] = vec_dot_q1_0_q8_0(wptr + (size_t)i * row_bytes, qx, n);
+                    }
+                } else {
+                    for (int i = 0; i < d; i++) {
+                        out[i] = vec_dot_q2_0_q8_0(wptr + (size_t)i * row_bytes, qx, n);
+                    }
+                }
+                if (qx_owned) free(qx);
+                return;
+            }
+
+            int nt = pool_total_threads(n_threads);
+            int want = n_threads < nt ? n_threads : nt;
+            {
+                int active = pool_assign_rows(0, want, d);
+                for (int t = 0; t < active; t++) {
+                    pool_tasks[t].out = out; pool_tasks[t].x = (const float *)qx;
+                    pool_tasks[t].x_d = NULL; pool_tasks[t].W = wptr;
+                    pool_tasks[t].row_bytes = row_bytes; pool_tasks[t].n = n;
+                    pool_tasks[t].qtype = qtype;
+                    pool_tasks[t].n_batch = 0;
+                }
+                pool_clear_unused(active, nt);
+                pool_init(nt);
+                pool_wake(nt);
+                matmul_worker_f(&pool_tasks[0]);
+                pool_wait(nt);
+            }
+
+            if (qx_owned) free(qx);
+            return;
+        }
+        /* If allocation failed, fall through to generic path */
     }
 
     if (n_threads <= 1 || d < 4) {

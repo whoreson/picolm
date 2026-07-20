@@ -338,16 +338,6 @@ int main(int argc, char **argv) {
     omp_set_num_threads(num_threads); /* match OpenMP to custom pool */
 #endif
 
-    /* Debug: print weight types */
-    fprintf(stderr, "Weight type: %d, Emb type: %d, Output type: %d\n",
-        model.config.weight_type, model.weights.type_token_embd, model.weights.type_output);
-    if (model.config.n_layers > 0) {
-        layer_weights_t *lw0 = &model.weights.layers[0];
-        fprintf(stderr, "Layer0: attn_q=%d k=%d v=%d gate=%d up=%d down=%d\n",
-            lw0->type_attn_q, lw0->type_attn_k, lw0->type_attn_v,
-            lw0->type_ffn_gate, lw0->type_ffn_up, lw0->type_ffn_down);
-    }
-
     /* Load tokenizer */
     tokenizer_t tokenizer;
     int use_qwen_tok = qwen_tokenize_should_use(&model);
