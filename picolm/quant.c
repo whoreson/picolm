@@ -5,42 +5,6 @@
 #include <stdlib.h>
 
 /* ================================================================
- * NEON lookup tables for Q1_0/Q2_0 bit expansion (mirrors llama.cpp)
- * ================================================================ */
-#if defined(PICOLM_NEON) && !defined(__ARM_FEATURE_DOTPROD)
-/* B-macro chain: expand 8 bits into 8 bytes of 0x00/0xFF */
-#define Q1_B1(c,n) B8_##c##_##n
-#define Q1_B2(c,n) Q1_B1(c,n ## c), Q1_B1(c,n ## n)
-#define Q1_B3(c,n) Q1_B2(c,n ## c), Q1_B2(c,n ## n)
-#define Q1_B4(c,n) Q1_B3(c,n ## c), Q1_B3(c,n ## n)
-#define Q1_B5(c,n) Q1_B4(c,n ## c), Q1_B4(c,n ## n)
-#define Q1_B6(c,n) Q1_B5(c,n ## c), Q1_B5(c,n ## n)
-#define Q1_B7(c,n) Q1_B6(c,n ## c), Q1_B6(c,n ## n)
-#define Q1_B8(c  ) Q1_B7(c,c),     Q1_B7(c,n)
-/* Not feasible to inline 256 entries. Use runtime generation instead. */
-#undef Q1_B1; #undef Q1_B2; #undef Q1_B3; #undef Q1_B4; #undef Q1_B5
-#undef Q1_B6; #undef Q1_B7; #undef Q1_B8
-
-static uint64_t neon_q1_mask_table[256];
-static int neon_q1_table_init = 0;
-static void neon_q1_table_init_fn(void) {
-    if (neon_q1_table_init) return;
-    /* table_q1_mask: for each bit b in byte, output 0xFF if b==1, 0x00 if b==0 */
-    for (int i = 0; i < 256; i++) {
-        uint64_t val = 0;
-        for (int b = 0; b < 8; b++) {
-            val |= (uint64_t)((i >> b) & 1 ? 0xFF : 0x00) << (b * 8);
-        }
-        neon_q1_mask_table[i] = val;
-    }
-    neon_q1_table_init = 1;
-}
-
-/* 2-bit expansion lookup tables for Q2_0: map each 2-bit code {0,1,2,3} to {0xFF,0x00,0x01,0x02} */
-/* Actually we don't need a lookup table for Q2_0; we use shift-and-mask */
-#endif
-
-/* ================================================================
  * FP16 <-> FP32 lookup table (mirrors llama.cpp's ggml_table_f32_f16)
  *
  * 64KB table initialized once at startup. Each entry maps a uint16_t
@@ -2646,6 +2610,61 @@ float vec_dot_q1_0_q8_0(const void *vx, const void *wy, int n) {
         sumf = hsum_avx(acc);
         return sumf;
     }
+#elif defined(PICOLM_AVX)
+    /* AVX path: broadcast 32-bit sign value via AVX, split into two
+     * 128-bit halves for pshufb expansion + maddubs (SSE4.1).
+     * Uses a correct 256-bit bit expansion via _mm256_set1_epi32
+     * (AVX, not AVX2) + two 128-bit _mm_shuffle_epi8 calls. */
+    {
+        const __m128i ones_8  = _mm_set1_epi8(1);
+        const __m128i ones_16 = _mm_set1_epi16(1);
+        const __m128i zero = _mm_setzero_si128();
+        /* pshufb index: replicate each of the 4 bytes 8 times */
+        const __m128i byte_shuf = _mm_setr_epi8(
+            0,0,0,0,0,0,0,0,
+            1,1,1,1,1,1,1,1);
+        const __m128i bit_masks = _mm_setr_epi8(
+            1,2,4,8,16,32,64,(char)-128,
+            1,2,4,8,16,32,64,(char)-128);
+        float sumf;
+        __m256 acc = _mm256_setzero_ps();
+
+        for (int ib = 0; ib < nb; ib++) {
+            float d0 = fp16_to_fp32_lookup(x[ib].d);
+            const uint32_t *qs32 = (const uint32_t *)x[ib].qs;
+            const block_q8_0 *yp = &y[ib * 4];
+            __m256 acc_block = _mm256_setzero_ps();
+
+            for (int K = 0; K < 4; K++) {
+                /* Expand 32 bits into 32 bytes of 0x00/0xFF sign mask.
+                 * Split the 32-bit value into two 16-bit halves (low=bytes 0,1,
+                 * high=bytes 2,3), replicate each to all 16-bit slots, then
+                 * use pshufb to replicate each byte 8x for bit testing. */
+                __m128i qs16 = _mm_cvtsi32_si128((int)qs32[K]);
+                __m128i rep_lo = _mm_shufflelo_epi16(qs16, 0);
+                __m128i sm_lo = _mm_cmpeq_epi8(
+                    _mm_and_si128(_mm_shuffle_epi8(rep_lo, byte_shuf), bit_masks), zero);
+                __m128i rep_hi = _mm_shufflelo_epi16(qs16, 0x11);
+                __m128i sm_hi = _mm_cmpeq_epi8(
+                    _mm_and_si128(_mm_shuffle_epi8(rep_hi, byte_shuf), bit_masks), zero);
+                /* Load Q8_0 in two 128-bit chunks */
+                __m128i qy0 = _mm_loadu_si128((const __m128i *)yp[K].qs);
+                __m128i qy1 = _mm_loadu_si128((const __m128i *)(yp[K].qs + 16));
+                __m128i sy0 = _mm_sub_epi8(_mm_xor_si128(qy0, sm_lo), sm_lo);
+                __m128i sy1 = _mm_sub_epi8(_mm_xor_si128(qy1, sm_hi), sm_hi);
+                __m128i s16_0 = _mm_maddubs_epi16(ones_8, sy0);
+                __m128i s16_1 = _mm_maddubs_epi16(ones_8, sy1);
+                __m128i s32_0 = _mm_madd_epi16(s16_0, ones_16);
+                __m128i s32_1 = _mm_madd_epi16(s16_1, ones_16);
+                __m256 q = _mm256_cvtepi32_ps(_mm256_set_m128i(s32_1, s32_0));
+                float d1 = fp16_to_fp32_lookup(yp[K].d);
+                acc_block = _mm256_add_ps(acc_block, _mm256_mul_ps(_mm256_set1_ps(d1), q));
+            }
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_set1_ps(d0), acc_block));
+        }
+        sumf = hsum_avx(acc);
+        return sumf;
+    }
 #elif defined(PICOLM_SSE3)
     /* SSSE3 path: 128-bit bit expansion + 128-bit maddubs (SSE4.1).
      * Uses 4 independent __m128 accumulators for the 4 Q8_0 sub-blocks.
@@ -2663,7 +2682,6 @@ float vec_dot_q1_0_q8_0(const void *vx, const void *wy, int n) {
         __m128 acc_1 = _mm_setzero_ps();
         __m128 acc_2 = _mm_setzero_ps();
         __m128 acc_3 = _mm_setzero_ps();
-        float sumf;
 
         for (int ib = 0; ib < nb; ib++) {
             __m128 d0 = _mm_set1_ps(fp16_to_fp32_lookup(x[ib].d));
@@ -2672,13 +2690,15 @@ float vec_dot_q1_0_q8_0(const void *vx, const void *wy, int n) {
 
 #define Q1_SSSE3_BLOCK(QS_OFF, Y_IDX, ACC) \
             { \
-                uint32_t v = qs32[QS_OFF / 4]; \
-                __m128i qs_vec = _mm_cvtsi32_si128(v); \
+                __m128i qs16 = _mm_cvtsi32_si128((int)qs32[QS_OFF / 4]); \
+                /* Expand low 16 bits (bytes 0,1) into 16 sign mask bytes */ \
+                __m128i rep_lo = _mm_shufflelo_epi16(qs16, 0); \
                 __m128i sm0 = _mm_cmpeq_epi8( \
-                    _mm_and_si128(_mm_shuffle_epi8(qs_vec, byte_shuf), bit_masks), zero); \
-                qs_vec = _mm_shufflelo_epi16(qs_vec, 0x3C); \
+                    _mm_and_si128(_mm_shuffle_epi8(rep_lo, byte_shuf), bit_masks), zero); \
+                /* Expand high 16 bits (bytes 2,3) into 16 sign mask bytes */ \
+                __m128i rep_hi = _mm_shufflelo_epi16(qs16, 0x11); \
                 __m128i sm1 = _mm_cmpeq_epi8( \
-                    _mm_and_si128(_mm_shuffle_epi8(qs_vec, byte_shuf), bit_masks), zero); \
+                    _mm_and_si128(_mm_shuffle_epi8(rep_hi, byte_shuf), bit_masks), zero); \
                 __m128i qy0 = _mm_loadu_si128((const __m128i *)yp[Y_IDX].qs); \
                 __m128i qy1 = _mm_loadu_si128((const __m128i *)(yp[Y_IDX].qs + 16)); \
                 __m128i sy0 = _mm_sub_epi8(_mm_xor_si128(qy0, sm0), sm0); \
@@ -2696,52 +2716,6 @@ float vec_dot_q1_0_q8_0(const void *vx, const void *wy, int n) {
 #undef Q1_SSSE3_BLOCK
         }
         sumf = hsum_sse(_mm_add_ps(_mm_add_ps(acc_0, acc_1), _mm_add_ps(acc_2, acc_3)));
-        return sumf;
-    }
-#elif defined(PICOLM_NEON)
-    /* NEON path for Q1_0 x Q8_0 (plain NEON, no DOTPROD).
-     * Uses table-based sign mask expansion + vpaddlq_s8 reduction.
-     * Ported from llama.cpp ggml_vec_dot_q1_0_q8_0 NEON path. */
-    {
-        neon_q1_table_init_fn();
-        float sumf = 0.0f;
-        float32x4_t sumv = vdupq_n_f32(0.0f);
-
-        for (int ib = 0; ib < nb; ib++) {
-            const float d0 = fp16_to_fp32_lookup(x[ib].d);
-            float32x4_t accv = vdupq_n_f32(0.0f);
-            const uint8_t *bits = x[ib].qs;
-
-            for (int K = 0; K < 4; K++) {
-                const block_q8_0 *yb = &y[ib * 4 + K];
-                const float d1 = fp16_to_fp32_lookup(yb->d);
-                const uint8_t *b = bits + K * 4;
-
-                const int8x16_t y0 = vld1q_s8(yb->qs);
-                const int8x16_t y1 = vld1q_s8(yb->qs + 16);
-
-                /* Expand 4 bytes of sign bits into 16 sign masks each */
-                const int8x16_t sm0 = vreinterpretq_s8_u8(
-                    vcombine_u8(vcreate_u8(neon_q1_mask_table[b[0]]),
-                                vcreate_u8(neon_q1_mask_table[b[1]])));
-                const int8x16_t sm1 = vreinterpretq_s8_u8(
-                    vcombine_u8(vcreate_u8(neon_q1_mask_table[b[2]]),
-                                vcreate_u8(neon_q1_mask_table[b[3]])));
-
-                /* Conditional negate: sy = (y ^ sm) - sm */
-                const int8x16_t sy0 = vsubq_s8(veorq_s8(y0, sm0), sm0);
-                const int8x16_t sy1 = vsubq_s8(veorq_s8(y1, sm1), sm1);
-
-                /* Reduce via widening add */
-                int32x4_t p = vdupq_n_s32(0);
-                p = vpadalq_s16(p, vpaddlq_s8(sy0));
-                p = vpadalq_s16(p, vpaddlq_s8(sy1));
-
-                accv = vmlaq_n_f32(accv, vcvtq_f32_s32(p), d1);
-            }
-            sumv = vmlaq_n_f32(sumv, accv, d0);
-        }
-        sumf = vaddvq_f32(sumv);
         return sumf;
     }
 #else
@@ -2820,63 +2794,6 @@ float vec_dot_q2_0_q8_0(const void *vx, const void *wy, int n) {
             }
             sumf += d0 * sumi;
         }
-    }
-#elif defined(PICOLM_NEON)
-    /* NEON path for Q2_0 x Q8_0 (plain NEON, no DOTPROD).
-     * Uses shift-and-mask 2-bit unpack + vmull_s8 wide multiply + vpaddlq_s16.
-     * Ported from llama.cpp ggml_vec_dot_q2_0_q8_0 NEON path. */
-    {
-        static const uint8_t tbl_idx_lo[16] = {0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3};
-        static const uint8_t tbl_idx_hi[16] = {4,4,4,4,5,5,5,5,6,6,6,6,7,7,7,7};
-        static const int8_t shift_vals[16] = {0,-2,-4,-6,0,-2,-4,-6,0,-2,-4,-6,0,-2,-4,-6};
-
-        const uint8x16_t idx_lo  = vld1q_u8(tbl_idx_lo);
-        const uint8x16_t idx_hi  = vld1q_u8(tbl_idx_hi);
-        const int8x16_t  shifts  = vld1q_s8(shift_vals);
-        const uint8x16_t mask2   = vdupq_n_u8(0x03);
-        const int8x16_t  one     = vdupq_n_s8(1);
-        float32x4_t sumv = vdupq_n_f32(0.0f);
-
-        for (int ib = 0; ib < nb; ib++) {
-            const float d0 = fp16_to_fp32_lookup(x[ib].d);
-
-            for (int K = 0; K < 4; K++) {
-                const block_q8_0 *yb = &y[ib * 4 + K];
-                const float d1 = fp16_to_fp32_lookup(yb->d);
-
-                /* Load 8 bytes of packed 2-bit values */
-                const uint8x8_t raw = vld1_u8(&x[ib].qs[K * 8]);
-                const uint8x16_t raw16 = vcombine_u8(raw, raw);
-
-                /* First 16 elements: replicate bytes 0-3, shift, mask, subtract 1 */
-                uint8x16_t bytes0 = vqtbl1q_u8(raw16, idx_lo);
-                int8x16_t qv0 = vsubq_s8(
-                    vreinterpretq_s8_u8(vandq_u8(vshlq_u8(bytes0, shifts), mask2)),
-                    one);
-
-                /* Second 16 elements: replicate bytes 4-7, shift, mask, subtract 1 */
-                uint8x16_t bytes1 = vqtbl1q_u8(raw16, idx_hi);
-                int8x16_t qv1 = vsubq_s8(
-                    vreinterpretq_s8_u8(vandq_u8(vshlq_u8(bytes1, shifts), mask2)),
-                    one);
-
-                /* Load Q8_0 values and dot product */
-                const int8x16_t y0 = vld1q_s8(yb->qs);
-                const int8x16_t y1 = vld1q_s8(yb->qs + 16);
-
-                /* Wide multiply + reduce (NEON fallback for vdot) */
-                int32x4_t p0 = vdupq_n_s32(0);
-                p0 = vaddq_s32(p0, vaddq_s32(
-                    vpaddlq_s16(vmull_s8(vget_low_s8(qv0), vget_low_s8(y0))),
-                    vpaddlq_s16(vmull_s8(vget_high_s8(qv0), vget_high_s8(y0)))));
-                p0 = vaddq_s32(p0, vaddq_s32(
-                    vpaddlq_s16(vmull_s8(vget_low_s8(qv1), vget_low_s8(y1))),
-                    vpaddlq_s16(vmull_s8(vget_high_s8(qv1), vget_high_s8(y1)))));
-
-                sumv = vmlaq_n_f32(sumv, vcvtq_f32_s32(p0), d0 * d1);
-            }
-        }
-        sumf = vaddvq_f32(sumv);
     }
 #else
     for (int ib = 0; ib < nb; ib++) {
