@@ -31,6 +31,60 @@ double get_time_ms(void) {
 }
 #endif
 
+/* Unescape common C-style escape sequences in a prompt string.
+ * Modifies the string in-place and returns it.
+ * Handles: \n, \r, \t, \\, \", and \uXXXX (Unicode escapes via UTF-8). */
+static char *unescape_prompt(char *s) {
+    char *dst = s;
+    const char *src = s;
+    while (*src) {
+        if (*src == '\\' && *(src + 1)) {
+            src++;
+            switch (*src) {
+                case 'n':  *dst++ = '\n'; break;
+                case 'r':  *dst++ = '\r'; break;
+                case 't':  *dst++ = '\t'; break;
+                case '\\': *dst++ = '\\'; break;
+                case '"':  *dst++ = '"'; break;
+                case '\'': *dst++ = '\''; break;
+                case 'a':  *dst++ = '\a'; break;
+                case 'b':  *dst++ = '\b'; break;
+                case 'f':  *dst++ = '\f'; break;
+                case 'v':  *dst++ = '\v'; break;
+                case 'u': {
+                    /* \uXXXX -> UTF-8 */
+                    unsigned int cp = 0;
+                    char hex[7];
+                    strncpy(hex, src + 1, 4);
+                    hex[4] = '\0';
+                    sscanf(hex, "%4x", &cp);
+                    src += 4;
+                    if (cp < 0x80) {
+                        *dst++ = (char)cp;
+                    } else if (cp < 0x800) {
+                        *dst++ = (char)(0xC0 | (cp >> 6));
+                        *dst++ = (char)(0x80 | (cp & 0x3F));
+                    } else {
+                        *dst++ = (char)(0xE0 | (cp >> 12));
+                        *dst++ = (char)(0x80 | ((cp >> 6) & 0x3F));
+                        *dst++ = (char)(0x80 | (cp & 0x3F));
+                    }
+                    break;
+                }
+                default:
+                    *dst++ = '\\';
+                    *dst++ = *src;
+                    break;
+            }
+        } else {
+            *dst++ = *src;
+        }
+        src++;
+    }
+    *dst = '\0';
+    return s;
+}
+
 static void usage(const char *prog) {
     fprintf(stderr, "PicoLLM - ultra-lightweight LLM inference engine\n\n");
     fprintf(stderr, "Usage: %s <model.gguf> [options]\n", prog);
@@ -81,6 +135,7 @@ int main(int argc, char **argv) {
     }
 
     const char *model_path = argv[1];
+    char *prompt_buf = NULL;   /* malloc'd buffer for -p prompt (may be modified by unescape) */
     const char *prompt = NULL;
     int    max_tokens = 256;
     float  temperature = 0.8f;
@@ -104,7 +159,10 @@ int main(int argc, char **argv) {
         /* Skip positional model path (argv[1] when it doesn't start with -) */
         if (i == 1 && argv[1][0] != '-') continue;
         if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
-            prompt = argv[++i];
+            prompt_buf = strdup(argv[++i]);
+            if (!prompt_buf) { fprintf(stderr, "strdup failed\n"); return 1; }
+            unescape_prompt(prompt_buf);
+            prompt = prompt_buf;
         } else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
             max_tokens = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
@@ -474,6 +532,7 @@ int main(int argc, char **argv) {
         model_unlock_layers(&model);
     grammar_free(&grammar);
     free(prompt_tokens);
+    free(prompt_buf);
     free(stdin_prompt);
     if (use_qwen_tok) qwen_tokenize_free(&qwen_enc);
     else tokenizer_free(&tokenizer);
