@@ -471,8 +471,39 @@ void dequantize_row_f16(const void *src, float *dst, int n) {
 }
 
 void dequantize_row_f32(const void *src, float *dst, int n) {
-#if defined(__APPLE__) && defined(__ppc__)
-    /* GGUF stores F32 as little-endian; swap on big-endian */
+#if defined(__APPLE__) && defined(__ppc__) && defined(__ALTIVEC__)
+    /* GGUF stores F32 as little-endian; swap on big-endian using Altivec vec_perm */
+    static char __f32swap_data[256];
+    static int __f32swap_init = 0;
+    unsigned long ba = (unsigned long)__f32swap_data + 63;
+    ba = ba / 64 * 64;
+    char *buf = (char*)ba + 16;
+    int i;
+    if (!__f32swap_init) {
+        ((unsigned char*)(void*)ba)[0] = 3; ((unsigned char*)(void*)ba)[1] = 2;
+        ((unsigned char*)(void*)ba)[2] = 1; ((unsigned char*)(void*)ba)[3] = 0;
+        ((unsigned char*)(void*)ba)[4] = 7; ((unsigned char*)(void*)ba)[5] = 6;
+        ((unsigned char*)(void*)ba)[6] = 5; ((unsigned char*)(void*)ba)[7] = 4;
+        ((unsigned char*)(void*)ba)[8] = 11; ((unsigned char*)(void*)ba)[9] = 10;
+        ((unsigned char*)(void*)ba)[10] = 9; ((unsigned char*)(void*)ba)[11] = 8;
+        ((unsigned char*)(void*)ba)[12] = 15; ((unsigned char*)(void*)ba)[13] = 14;
+        ((unsigned char*)(void*)ba)[14] = 13; ((unsigned char*)(void*)ba)[15] = 12;
+        __f32swap_init = 1;
+    }
+    vector unsigned char vmask = (vector unsigned char)vec_ld(0, (unsigned char*)ba);
+    for (i = 0; i + 3 < n; i += 4) {
+        memcpy(buf, (const char*)src + i * 4, 16);
+        vector unsigned char v = (vector unsigned char)vec_ld(0, (unsigned char*)buf);
+        vector unsigned char s = vec_perm(v, v, vmask);
+        vec_st(s, 0, (unsigned char*)buf);
+        memcpy(dst + i, buf, 16);
+    }
+    for (; i < n; i++) {
+        uint32_t val = *(const uint32_t*)((const char*)src + i * 4);
+        ((uint32_t*)dst)[i] = (val >> 24) | ((val >> 8) & 0xff00) | ((val << 8) & 0xff0000) | (val << 24);
+    }
+#elif defined(__APPLE__) && defined(__ppc__)
+    /* Scalar fallback for PPC without Altivec */
     const uint32_t *src32 = (const uint32_t *)src;
     uint32_t *dst32 = (uint32_t *)dst;
     for (int i = 0; i < n; i++) {

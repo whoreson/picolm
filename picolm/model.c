@@ -2,6 +2,13 @@
 #include "tensor.h"
 #include "quant.h"
 
+#if defined(__APPLE__) && defined(__ppc__) && defined(__ALTIVEC__)
+#include <altivec.h>
+#undef bool
+#undef pixel
+#undef vec_add
+#endif
+
 #include <stdio.h>
 #include <assert.h>
 #include <inttypes.h>
@@ -30,6 +37,38 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdint.h>
+#endif
+
+#if defined(__APPLE__) && defined(__ppc__) && defined(__ALTIVEC__)
+/* Swap uint16 values in-place using Altivec vec_perm.
+ * Uses static 64-byte aligned buffer to avoid alignment issues. */
+static char _f16swap_buf[64] __attribute__((aligned(64)));
+static unsigned char _f16swap_mask[16] __attribute__((aligned(64))) =
+    {1,0,3,2,5,4,7,6,9,8,11,10,13,12,15,14};
+static vector unsigned char _f16swap_vmask;
+
+static void init_f16swap(void) {
+    _f16swap_vmask = (vector unsigned char)vec_ld(0, _f16swap_mask);
+}
+
+static void swap_f16_block(uint16_t *dst, size_t n) {
+    vector unsigned char vm = _f16swap_vmask;
+    size_t i;
+    for (i = 0; i + 8 <= n; i += 8) {
+        memcpy(_f16swap_buf, dst + i, 16);
+        vector unsigned char v = (vector unsigned char)vec_ld(0, (const unsigned char*)_f16swap_buf);
+        vector unsigned char s = vec_perm(v, v, vm);
+        vec_st(s, 0, (unsigned char*)_f16swap_buf);
+        memcpy(dst + i, _f16swap_buf, 16);
+    }
+    for (; i < n; i++) dst[i] = GGUF_LE16(dst[i]);
+}
+#else
+static void swap_f16_block(uint16_t *dst, size_t n) {
+    size_t i;
+    for (i = 0; i < n; i++) dst[i] = GGUF_LE16(dst[i]);
+}
+static void init_f16swap(void) { }
 #endif
 
 /* Runtime prefault: when set, prepare_mmap() touches every 4KB page of the
@@ -735,9 +774,9 @@ static int parse_gguf(model_t *m, int max_seq_len) {
         size_t nrows = tinfos[i].dims[0];
         for (uint64_t d = 1; d < tinfos[i].n_dims; d++) nrows *= tinfos[i].dims[d];
 
-        if (qt == GGUF_TYPE_F16) {
+        if (qt == GGUF_TYPE_F16 || qt == GGUF_TYPE_BF16) {
             uint16_t *f16p = (uint16_t *)ptr;
-            for (size_t j = 0; j < nrows; j++) f16p[j] = GGUF_LE16(f16p[j]);
+            swap_f16_block(f16p, nrows);
         } else if (qt == GGUF_TYPE_Q8_0) {
             size_t nblocks = nrows / 32;
             for (size_t b = 0; b < nblocks; b++) {
@@ -780,9 +819,6 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                 block_q6_K *blk = (block_q6_K *)((uint8_t *)ptr + b * sizeof(block_q6_K));
                 blk->d = GGUF_LE16(blk->d);
             }
-        } else if (qt == GGUF_TYPE_BF16) {
-            uint16_t *bf16p = (uint16_t *)ptr;
-            for (size_t j = 0; j < nrows; j++) bf16p[j] = GGUF_LE16(bf16p[j]);
         }
     }
     fprintf(stderr, "Big-endian: swap done (%.0fms)\n", (clock() - be_start) / (double)CLOCKS_PER_SEC * 1000);
