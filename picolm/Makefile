@@ -7,6 +7,12 @@ SRCS    = picolm.c model.c tensor.c quant.c tokenizer.c qwen_tokenize.c sampler.
 OBJS    = $(SRCS:.c=.o)
 TARGET  = picolm
 
+# GPU backend
+HIPCC   ?= hipcc
+HIPFLAGS ?= -O3 -std=c++11 -fPIC -fPIE
+HIP_LIBS = -lamdhip64
+GPU_OBJS =
+
 PREFIX  ?= /usr/local
 MODEL_DIR ?= /opt/picolm/models
 
@@ -42,8 +48,8 @@ threadpool: CFLAGS += -march=native -DPICOLM_USE_PER_MATMUL_THREAD=0
 threadpool: $(TARGET)
 
 # --- Link ---
-$(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+$(TARGET): $(OBJS) $(GPU_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(GPU_LIBS) -lstdc++
 
 # --- Compile each .c to .o independently ---
 %.o: %.c
@@ -113,10 +119,32 @@ model:
 	fi
 
 clean:
-	rm -f $(TARGET) $(TARGET).exe $(OBJS)
+	rm -f $(TARGET) $(TARGET).exe $(OBJS) backend_gpu.o backend_gpu.hip.o
 
 
 .PHONY: asan
 asan: CFLAGS += -fsanitize=address -g -O2 -march=native
 asan: LDFLAGS += -fsanitize=address
 asan: picolm
+
+# --- ROCm/HIP GPU backend ---
+ROCM_LIB ?= /opt/rocm-6.3.3/lib
+.PHONY: hip
+hip: backend_gpu.hip.o
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -DPICOLM_GPU=1 -msse2 -mssse3" GPU_OBJS="backend_gpu.hip.o" GPU_LIBS="-L$(ROCM_LIB) -lamdhip64 -lstdc++ -Wl,-rpath,$(ROCM_LIB)"
+
+backend_gpu.hip.o: backend_gpu.hip backend_gpu.h quant.h
+	$(HIPCC) $(HIPFLAGS) -DPICOLM_GPU=1 -c -o $@ $< -I.
+
+# --- CUDA (NVIDIA) GPU backend ---
+NVCC ?= nvcc
+CUDA_LIB ?= /usr/local/cuda/lib64
+CUDAFLAGS ?= -O3 -std=c++11 -Xcompiler="-fPIC"
+.PHONY: cuda
+cuda: backend_gpu_cu.o
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -DPICOLM_GPU=1 -msse2 -mssse3" GPU_OBJS="backend_gpu_cu.o" GPU_LIBS="-L$(CUDA_LIB) -lcudart -lstdc++ -Wl,-rpath,$(CUDA_LIB)"
+
+backend_gpu_cu.o: backend_gpu.hip backend_gpu.h quant.h
+	$(NVCC) $(CUDAFLAGS) -DPICOLM_GPU=1 -c -o $@ backend_gpu.hip -I.
+
+.PHONY: hip cuda

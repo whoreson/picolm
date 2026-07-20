@@ -8,6 +8,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+
+#ifdef PICOLM_GPU
+#include "backend_gpu.h"
+#endif
 #include <errno.h>
 #include <time.h>
 #ifdef _OPENMP
@@ -1068,6 +1072,23 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
     /* Pre-compute RoPE tables (eliminates powf/cosf/sinf from hot path) */
     init_rope_tables(s, c);
 
+#ifdef PICOLM_GPU
+    /* Initialize GPU backend if requested via environment variable */
+    {
+        const char *gpu_env = getenv("PICOLM_GPU");
+        if (gpu_env && atoi(gpu_env)) {
+            const char *dev_env = getenv("PICOLM_GPU_DEVICE");
+            int device = dev_env ? atoi(dev_env) : 0;
+            fprintf(stderr, "INFO: initializing GPU device %d\n", device);
+            if (!picolm_gpu_init(&device, 1)) {
+                fprintf(stderr, "WARN: GPU init failed, falling back to CPU\n");
+            } else {
+                fprintf(stderr, "INFO: GPU initialized\n");
+            }
+        }
+    }
+#endif
+
     return 0;
 }
 
@@ -1112,6 +1133,77 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
     if (0 && cpu_has_avx2()) {
         repack_model_weights_q4_0x8(m);
     }
+
+    /* Upload weight tensors to GPU */
+#ifdef PICOLM_GPU
+    {
+        const char *gpu_env = getenv("PICOLM_GPU");
+        if (gpu_env && atoi(gpu_env) && picolm_gpu_device_count() > 0) {
+            int device = picolm_gpu_device_at(0);
+            fprintf(stderr, "INFO: uploading model weights to GPU device %d\n", device);
+
+            int ok = 1;
+            model_config_t *c = &m->config;
+            int q_dim = c->n_heads * c->head_dim;
+            int kv_dim = c->n_kv_heads * c->head_dim;
+            int uploaded = 0, attempted = 0;
+
+            /* Output projection: [vocab_size, n_embd] */
+            attempted++;
+            if (picolm_gpu_tensor_upload(&m->gpu.output,
+                    m->weights.output, m->weights.type_output,
+                    c->n_embd, c->vocab_size, device)) uploaded++;
+
+            for (int l = 0; l < c->n_layers; l++) {
+                layer_weights_t *lw = &m->weights.layers[l];
+                gpu_layer_weights_t *gl = &m->gpu.layers[l];
+
+#define GPU_UPLOAD(name, I, O, type) do { attempted++; \
+    if (picolm_gpu_tensor_upload(&gl->name, lw->name, lw->type ## _ ## name, (I), (O), device)) uploaded++; \
+} while(0)
+
+                /* Attention Q: [q_dim, n_embd] */
+                attempted++;
+                if (picolm_gpu_tensor_upload(&gl->attn_q,
+                        lw->attn_q, lw->type_attn_q, c->n_embd, q_dim, device)) uploaded++;
+                /* Attention K: [kv_dim, n_embd] */
+                attempted++;
+                if (picolm_gpu_tensor_upload(&gl->attn_k,
+                        lw->attn_k, lw->type_attn_k, c->n_embd, kv_dim, device)) uploaded++;
+                /* Attention V: [kv_dim, n_embd] */
+                attempted++;
+                if (picolm_gpu_tensor_upload(&gl->attn_v,
+                        lw->attn_v, lw->type_attn_v, c->n_embd, kv_dim, device)) uploaded++;
+                /* Attention O: [n_embd, q_dim] */
+                attempted++;
+                if (picolm_gpu_tensor_upload(&gl->attn_output,
+                        lw->attn_output, lw->type_attn_output, q_dim, c->n_embd, device)) uploaded++;
+                /* FFN gate: [n_ffn, n_embd] */
+                attempted++;
+                if (picolm_gpu_tensor_upload(&gl->ffn_gate,
+                        lw->ffn_gate, lw->type_ffn_gate, c->n_embd, c->n_ffn, device)) uploaded++;
+                /* FFN up: [n_ffn, n_embd] */
+                attempted++;
+                if (picolm_gpu_tensor_upload(&gl->ffn_up,
+                        lw->ffn_up, lw->type_ffn_up, c->n_embd, c->n_ffn, device)) uploaded++;
+                /* FFN down: [n_embd, n_ffn] */
+                attempted++;
+                if (picolm_gpu_tensor_upload(&gl->ffn_down,
+                        lw->ffn_down, lw->type_ffn_down, c->n_ffn, c->n_embd, device)) uploaded++;
+
+#undef GPU_UPLOAD
+            }
+            if (uploaded) {
+                m->gpu.device = device;
+                m->gpu.active = 1;
+                fprintf(stderr, "INFO: GPU upload complete: %d/%d tensors on device %d\n",
+                        uploaded, attempted, device);
+            } else {
+                fprintf(stderr, "WARN: GPU upload failed, using CPU\n");
+            }
+        }
+    }
+#endif
 
     return 0;
 }
@@ -1450,6 +1542,11 @@ float *model_forward(model_t *m, int token, int pos) {
     run_state_t *s = &m->state;
 
     int dim    = c->n_embd;
+
+#ifdef PICOLM_GPU
+    int gpu_ok = m->gpu.active;
+    int gpu_dev = m->gpu.device;
+#endif
     int n_ffn  = c->n_ffn;
     int n_heads = c->n_heads;
     int n_kv_heads = c->n_kv_heads;
@@ -1512,6 +1609,9 @@ float *model_forward(model_t *m, int token, int pos) {
     int attn_ordinal = 0;
     for (int l = 0; l < n_active_layers; l++) {
         layer_weights_t *lw = &w->layers[l];
+#ifdef PICOLM_GPU
+        gpu_layer_weights_t *gl = &m->gpu.layers[l];
+#endif
         int ri = 2 + l * 9;
 
         if (c->has_ssm && !lw->is_attn_layer) {
@@ -1525,6 +1625,9 @@ float *model_forward(model_t *m, int token, int pos) {
         rmsnorm(s->xb, s->x, s->attn_norm_w[l], dim, c->rms_norm_eps);
 
         /* Q projection (Q+gate joint for Qwen3.5 full attention) */
+#ifdef PICOLM_GPU
+        if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->attn_q, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
+#endif
         tensor_set_repacked(m->repack_used[ri] ? m->repack_buffers[ri] : NULL);
         int this_q_dim = (c->has_ssm && lw->is_attn_layer) ? q_full_dim : q_dim;
         matmul(s->q, s->xb, lw->attn_q, dim, this_q_dim, lw->type_attn_q);
@@ -1550,6 +1653,9 @@ float *model_forward(model_t *m, int token, int pos) {
         }
 
         /* K projection */
+#ifdef PICOLM_GPU
+        if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->attn_k, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
+#endif
         tensor_set_repacked(m->repack_used[ri+1] ? m->repack_buffers[ri+1] : NULL);
         float *k_tmp = s->xb2; /* reuse xb2 as temp for K (kv_dim <= dim) */
         matmul(k_tmp, s->xb, lw->attn_k, dim, kv_dim, lw->type_attn_k);
@@ -1598,6 +1704,9 @@ float *model_forward(model_t *m, int token, int pos) {
         }
 
         /* V projection -> store per head */
+#ifdef PICOLM_GPU
+        if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->attn_v, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
+#endif
         tensor_set_repacked(m->repack_used[ri+2] ? m->repack_buffers[ri+2] : NULL);
         float *v_tmp = s->xb2;
         matmul(v_tmp, s->xb, lw->attn_v, dim, kv_dim, lw->type_attn_v);
@@ -1662,6 +1771,9 @@ float *model_forward(model_t *m, int token, int pos) {
         }
 
         /* Output projection */
+        #ifdef PICOLM_GPU
+        if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->attn_output, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
+#endif
         tensor_set_repacked(m->repack_used[ri+3] ? m->repack_buffers[ri+3] : NULL);
         matmul(s->xb2, s->xb, lw->attn_output, q_dim, dim, lw->type_attn_output);
         tensor_set_repacked(NULL);
@@ -1671,10 +1783,16 @@ float *model_forward(model_t *m, int token, int pos) {
         if (lw->ffn_gate && lw->ffn_up && lw->ffn_down) {
             rmsnorm(s->xb, s->x, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
 
+            #ifdef PICOLM_GPU
+            if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->ffn_gate, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
+#endif
             tensor_set_repacked(m->repack_used[ri+4] ? m->repack_buffers[ri+4] : NULL);
             matmul(s->hb,  s->xb, lw->ffn_gate, dim, n_ffn, lw->type_ffn_gate);
             tensor_set_repacked(NULL);
 
+#ifdef PICOLM_GPU
+            if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->ffn_up, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
+#endif
             tensor_set_repacked(m->repack_used[ri+6] ? m->repack_buffers[ri+6] : NULL);
             matmul(s->hb2, s->xb, lw->ffn_up,   dim, n_ffn, lw->type_ffn_up);
             tensor_set_repacked(NULL);
@@ -1682,6 +1800,9 @@ float *model_forward(model_t *m, int token, int pos) {
             silu(s->hb, n_ffn);
             elemwise_mul(s->hb, s->hb, s->hb2, n_ffn);
 
+#ifdef PICOLM_GPU
+            if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->ffn_down, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
+#endif
             tensor_set_repacked(m->repack_used[ri+5] ? m->repack_buffers[ri+5] : NULL);
             matmul(s->xb, s->hb, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
             tensor_set_repacked(NULL);
@@ -1693,6 +1814,9 @@ float *model_forward(model_t *m, int token, int pos) {
     rmsnorm(s->x, s->x, s->output_norm_w, dim, c->rms_norm_eps);
 
     /* 4. Output projection -> logits */
+#ifdef PICOLM_GPU
+    if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)m->gpu.output, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
+#endif
     tensor_set_repacked(m->repack_used[1] ? m->repack_buffers[1] : NULL);
     matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
     tensor_set_repacked(NULL);
@@ -2077,6 +2201,23 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
 }
 
 void model_free(model_t *m) {
+    /* Free GPU weight tensors */
+#ifdef PICOLM_GPU
+    if (m->gpu.active) {
+        if (m->gpu.output) { picolm_gpu_tensor_free(m->gpu.output); m->gpu.output = NULL; }
+        for (int l = 0; l < m->config.n_layers; l++) {
+            gpu_layer_weights_t *gl = &m->gpu.layers[l];
+            if (gl->attn_q) { picolm_gpu_tensor_free(gl->attn_q); gl->attn_q = NULL; }
+            if (gl->attn_k) { picolm_gpu_tensor_free(gl->attn_k); gl->attn_k = NULL; }
+            if (gl->attn_v) { picolm_gpu_tensor_free(gl->attn_v); gl->attn_v = NULL; }
+            if (gl->attn_output) { picolm_gpu_tensor_free(gl->attn_output); gl->attn_output = NULL; }
+            if (gl->ffn_gate) { picolm_gpu_tensor_free(gl->ffn_gate); gl->ffn_gate = NULL; }
+            if (gl->ffn_up) { picolm_gpu_tensor_free(gl->ffn_up); gl->ffn_up = NULL; }
+            if (gl->ffn_down) { picolm_gpu_tensor_free(gl->ffn_down); gl->ffn_down = NULL; }
+        }
+        picolm_gpu_shutdown();
+    }
+#endif
     /* Free repacked weight buffers */
     for (int i = 0; i < MAX_LAYERS + 4; i++) {
         if (m->repack_buffers[i]) {
@@ -2538,6 +2679,11 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
     int max_dim = (q_full_dim > dim) ? q_full_dim : dim;
     size_t bs = (size_t)n_tokens;
 
+#ifdef PICOLM_GPU
+    int gpu_ok = m->gpu.active;
+    int gpu_dev = m->gpu.device;
+#endif
+
     size_t sz = bs * (2 * dim + max_dim + q_full_dim + 2 * kv_dim + 2 * n_ffn);
     float *buf = (float *)malloc(sz * sizeof(float));
     if (!buf) { fprintf(stderr, "OOM: prefill batch\n"); exit(1); }
@@ -2567,6 +2713,9 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
     int attn_ordinal = 0; /* KV cache ordinal for attention layers (SSM models) */
     for (int l = 0; l < c->n_layers; l++) {
         layer_weights_t *lw = &w->layers[l];
+#ifdef PICOLM_GPU
+        gpu_layer_weights_t *gl = &m->gpu.layers[l];
+#endif
 
         if (c->has_ssm && !lw->is_attn_layer) {
             /* SSM layer: process tokens sequentially (stateful: conv_state + ssm_state) */
@@ -2589,6 +2738,9 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
             rmsnorm(xb_batch + bi * dim, x_batch + bi * dim, s->attn_norm_w[l], dim, c->rms_norm_eps);
 
         /* Q projection (batched) */
+#ifdef PICOLM_GPU
+        if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->attn_q, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
+#endif
         tensor_set_repacked(m->repack_used[2+l*9] ? m->repack_buffers[2+l*9] : NULL);
         { int this_q_dim = (c->has_ssm && lw->is_attn_layer) ? q_full_dim : q_dim;
           matmul_batch(q_batch, xb_batch, n_tokens, lw->attn_q, dim, this_q_dim, lw->type_attn_q);
@@ -2693,6 +2845,9 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         }
 
         /* Output projection (batched) */
+#ifdef PICOLM_GPU
+        if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->attn_output, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
+#endif
         tensor_set_repacked(m->repack_used[6+l*9] ? m->repack_buffers[6+l*9] : NULL);
         matmul_batch(xb2_batch, xb_batch, n_tokens, lw->attn_output, q_dim, dim, lw->type_attn_output);
         tensor_set_repacked(NULL);
@@ -2730,6 +2885,9 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         }
 
         /* FFN down (batched) */
+#ifdef PICOLM_GPU
+        if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->ffn_down, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
+#endif
         tensor_set_repacked(m->repack_used[8+l*9] ? m->repack_buffers[8+l*9] : NULL);
         matmul_batch(xb2_batch, hb_batch, n_tokens, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
         tensor_set_repacked(NULL);
@@ -2747,6 +2905,9 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
     /* Final norm + output (last token only) */
     float *last_x = x_batch + (n_tokens - 1) * dim;
     rmsnorm(s->x, last_x, s->output_norm_w, dim, c->rms_norm_eps);
+#ifdef PICOLM_GPU
+    if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)m->gpu.output, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
+#endif
     tensor_set_repacked(m->repack_used[1] ? m->repack_buffers[1] : NULL);
     matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
     tensor_set_repacked(NULL);
