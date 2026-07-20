@@ -450,7 +450,7 @@ int main(int argc, char **argv) {
     int next = 0;
     for (; pos < total_steps; pos++) {
         /* Generation: apply grammar constraints, then sample */
-        if (pos == n_prompt - 1) {
+        if (t_first_token == 0) {
             t_first_token = get_time_ms();
         }
 
