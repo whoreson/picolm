@@ -2,6 +2,11 @@ CC      = gcc
 CFLAGS  ?= -O3 -g -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic -fopenmp
 LDFLAGS = -lm -lpthread -fopenmp
 
+# Windows needs ws2_32 for server mode
+ifeq ($(OS),Windows_NT)
+LDFLAGS += -lws2_32
+endif
+
 # Source files and corresponding .o files
 SRCS    = picolm.c model.c tensor.c quant.c tokenizer.c qwen_tokenize.c sampler.c grammar.c cJSON.c server.c csafetensors.c json.c safetensors.c
 OBJS    = $(SRCS:.c=.o)

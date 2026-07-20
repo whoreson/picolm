@@ -14,6 +14,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <time.h>
 double get_time_ms(void) {
     LARGE_INTEGER freq, count;
     QueryPerformanceFrequency(&freq);
