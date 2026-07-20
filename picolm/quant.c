@@ -2503,7 +2503,7 @@ float vec_dot_q1_0_f32(const void *src, const float *x, int n) {
     /* Pre-quantize x to Q8_0 and delegate to vec_dot_q1_0_q8_0.
      * This allows the AVX2/VNNI path to be used even with F32 activations. */
     if (n >= 128 && n % 128 == 0) {
-        int nq8 = (n / 32) * sizeof(block_q8_0);
+        size_t nq8 = (n / 32) * sizeof(block_q8_0);
         block_q8_0 qx_buf[4]; /* stack buffer for typical sizes */
         block_q8_0 *qx;
         int qx_owned = 0;
@@ -2552,8 +2552,7 @@ float vec_dot_q2_0_f32(const void *src, const float *x, int n) {
      * For small n (<128), the quantization overhead dominates; fall back
      * to scalar. */
     if (n >= 128 && n % 128 == 0) {
-        int nb = n / 128;
-        int nq8 = (n / 32) * sizeof(block_q8_0);
+        size_t nq8 = (n / 32) * sizeof(block_q8_0);
         block_q8_0 qx_buf[4]; /* stack buffer for typical sizes */
         block_q8_0 *qx;
         int qx_owned = 0;
@@ -2918,7 +2917,7 @@ float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
             /* __thread not supported on old Mac OS X; use static buffer */
             static float q5_tmp[4096];
 #else
-            static float __thread q5_tmp[4096];
+            static __thread float q5_tmp[4096];
 #endif
             if (n > 4096) {
                 float *tmp = (float *)malloc(n * sizeof(float));

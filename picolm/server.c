@@ -677,7 +677,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             n_prompt, model->config.max_seq_len);
         http_send(sock, 413, "application/json", errmsg);
         free(ptokens);
-        free(prompt);
+        free((void*)prompt);
         return;
     }
 
@@ -1219,7 +1219,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             n_prompt, model->config.max_seq_len);
         http_send(sock, 413, "application/json", errmsg);
         free(ptokens);
-        free(prompt);
+        free((void*)prompt);
         return;
     }
 
@@ -1350,7 +1350,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         if (n_processed < n_prompt) {
             /* Client disconnected during prefill */
             fprintf(stderr, "[server] prefill cancelled at token %d/%d\n", n_processed, n_prompt);
-            free(prompt); free(ptokens);
+            free((void*)prompt); free(ptokens);
             return;
         }
 
@@ -1540,7 +1540,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             /* Client disconnected during prefill */
             fprintf(stderr, "[server] prefill cancelled at token %d/%d\n", n_processed_ns2, n_prompt);
             free(generated); free(gen_token_ids);
-            free(prompt); free(token_prompt); free(ptokens);
+            free((void*)prompt); free(token_prompt); free(ptokens);
             for (int i = 0; i < n_stop_words; i++) free(stop_words[i]);
             return;
         }
