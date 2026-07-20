@@ -1561,7 +1561,7 @@ void softmax(float *x, int size) {
 }
 
 /* AVX RoPE: 4 complex pairs/iter; addsub handles r*cos-i*sin / r*sin+i*cos in one op */
-#ifdef PICOLM_AVX
+#if defined(PICOLM_AVX) && !defined(PICOLM_AVX512)
 static void rope_avx(float *h, int half, const float *cos_pos, const float *sin_pos) {
     int i = 0;
     for (; i + 3 < half; i += 4) {
