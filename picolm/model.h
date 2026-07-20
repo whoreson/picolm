@@ -8,6 +8,24 @@
 #define GGUF_MAGIC 0x46554747
 #define MAX_LAYERS 128
 
+/* GGUF format is always little-endian. On big-endian platforms, swap. */
+#if defined(__APPLE__) && defined(__ppc__)
+/* Mac OS X PPC: use libkern byte-order functions */
+#include <libkern/OSByteOrder.h>
+#define GGUF_LE32(v) OSSwapInt32(v)
+#define GGUF_LE64(v) OSSwapInt64(v)
+#define GGUF_LE16(v) OSSwapInt16(v)
+#elif defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#include <byteswap.h>
+#define GGUF_LE32(v) __builtin_bswap32(v)
+#define GGUF_LE64(v) __builtin_bswap64(v)
+#define GGUF_LE16(v) __builtin_bswap16(v)
+#else
+#define GGUF_LE32(v) (v)
+#define GGUF_LE64(v) (v)
+#define GGUF_LE16(v) (v)
+#endif
+
 /* Magic for KV cache files */
 #define KVCACHE_MAGIC 0x4B564350  /* "KVCP" */
 

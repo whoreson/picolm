@@ -29,6 +29,22 @@ void tensor_set_gpu_tensor(picolm_gpu_tensor_t *t, int device) {
 #include <unistd.h>
 #endif
 
+/* Mac OS X < 10.5 compat: _SC_NPROCESSORS_ONLN may not be defined */
+#if defined(__APPLE__) && !defined(_SC_NPROCESSORS_ONLN)
+#include <sys/types.h>
+#include <sys/sysctl.h>
+#define _SC_NPROCESSORS_ONLN 99
+static int sysconf_compat(int name) {
+    if (name == _SC_NPROCESSORS_ONLN) {
+        int mib[2] = { CTL_HW, HW_NCPU };
+        int ncpu; size_t len = sizeof(ncpu);
+        if (sysctl(mib, 2, &ncpu, &len, NULL, 0) == 0) return ncpu;
+    }
+    return 1;
+}
+#define sysconf(n) sysconf_compat(n)
+#endif
+
 /* Thread pool (Windows-native or POSIX) */
 #ifdef _WIN32
 typedef HANDLE            win_thread_t;

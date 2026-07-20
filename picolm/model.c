@@ -100,27 +100,30 @@ static uint32_t read_u32(reader_t *r) {
     uint32_t v;
     memcpy(&v, r->data + r->pos, 4);
     r->pos += 4;
-    return v;
+    return GGUF_LE32(v);
 }
 
 static int32_t read_i32(reader_t *r) {
     int32_t v;
     memcpy(&v, r->data + r->pos, 4);
     r->pos += 4;
-    return v;
+    return (int32_t)GGUF_LE32((uint32_t)v);
 }
 
 static uint64_t read_u64(reader_t *r) {
     uint64_t v;
     memcpy(&v, r->data + r->pos, 8);
     r->pos += 8;
-    return v;
+    return GGUF_LE64(v);
 }
 
 static float read_f32(reader_t *r) {
-    float v;
-    memcpy(&v, r->data + r->pos, 4);
+    uint32_t vi;
+    memcpy(&vi, r->data + r->pos, 4);
     r->pos += 4;
+    vi = GGUF_LE32(vi);
+    float v;
+    memcpy(&v, &vi, 4);
     return v;
 }
 
@@ -257,7 +260,7 @@ static int mmap_file(model_t *m, const char *path) {
     fstat(fd, &st);
     m->mmap_size = (size_t)st.st_size;
 
-    void *addr = mmap(NULL, m->mmap_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    void *addr = mmap(NULL, m->mmap_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
     if (addr == MAP_FAILED) {
         fprintf(stderr, "mmap failed\n");
         close(fd);
@@ -409,8 +412,10 @@ static int parse_gguf(model_t *m, int max_seq_len) {
             if (vtype == GGUF_META_FLOAT32) { /* F32 */
                 cfg->rms_norm_eps = read_f32(&r);
             } else if (vtype == 11) { /* F64 */
-                double val;
-                memcpy(&val, r.data + r.pos, 8); r.pos += 8;
+                uint64_t vi;
+                memcpy(&vi, r.data + r.pos, 8); r.pos += 8;
+                vi = GGUF_LE64(vi);
+                double val; memcpy(&val, &vi, 8);
                 cfg->rms_norm_eps = (float)val;
             } else {
                 int dummy; skip_meta_value(&r, vtype, &dummy);
@@ -499,7 +504,7 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                 { const uint8_t *pp = r.data + r.pos;
                   uint64_t nn = arr_len;
                   for (uint64_t ii = 0; ii < nn; ii++) {
-                      uint64_t sl; memcpy(&sl, pp, 8); pp += 8 + sl; }
+                      uint64_t sl; memcpy(&sl, pp, 8); sl = GGUF_LE64(sl); pp += 8 + sl; }
                   r.pos = pp - r.data; }
             }
         } else if (str_eq(key, "tokenizer.ggml.token_type")) {
@@ -719,6 +724,71 @@ static int parse_gguf(model_t *m, int max_seq_len) {
         fprintf(stderr, "  Layers: %d SSM + %d full attention\n", ssm_count, attn_count);
     }
     fprintf(stderr, "  head_dim=%d, rope_dim=%d, rope_base=%.1f\n", cfg->head_dim, cfg->rope_dim, cfg->rope_freq_base);
+    /* On big-endian, GGUF stores all multi-byte values as little-endian.
+     * Swap F16 values in-place for all quantized block types that contain FP16 scales. */
+#if defined(__APPLE__) && defined(__ppc__)
+    { int be_start = clock();
+    fprintf(stderr, "Big-endian: swapping F16 values...\n");
+    for (uint64_t i = 0; i < n_tensors; i++) {
+        gguf_type_t qt = (gguf_type_t)tinfos[i].type;
+        void *ptr = (void *)((uint8_t *)m->mmap_addr + tensor_data_base + tinfos[i].offset);
+        size_t nrows = tinfos[i].dims[0];
+        for (uint64_t d = 1; d < tinfos[i].n_dims; d++) nrows *= tinfos[i].dims[d];
+
+        if (qt == GGUF_TYPE_F16) {
+            uint16_t *f16p = (uint16_t *)ptr;
+            for (size_t j = 0; j < nrows; j++) f16p[j] = GGUF_LE16(f16p[j]);
+        } else if (qt == GGUF_TYPE_Q8_0) {
+            size_t nblocks = nrows / 32;
+            for (size_t b = 0; b < nblocks; b++) {
+                block_q8_0 *blk = (block_q8_0 *)((uint8_t *)ptr + b * sizeof(block_q8_0));
+                blk->d = GGUF_LE16(blk->d);
+            }
+        } else if (qt == GGUF_TYPE_Q4_0 || qt == GGUF_TYPE_Q4_1 ||
+                   qt == GGUF_TYPE_Q4_0_4_4 || qt == GGUF_TYPE_Q4_0_8_8) {
+            size_t bs = (qt == GGUF_TYPE_Q4_0_4_4) ? sizeof(block_q4_0x4)
+                       : (qt == GGUF_TYPE_Q4_0_8_8) ? sizeof(block_q4_0x8)
+                       : (qt == GGUF_TYPE_Q4_1) ? sizeof(block_q4_1)
+                       : sizeof(block_q4_0);
+            size_t nblocks = nrows / 32;
+            for (size_t b = 0; b < nblocks; b++) {
+                block_q4_0 *blk = (block_q4_0 *)((uint8_t *)ptr + b * bs);
+                blk->d = GGUF_LE16(blk->d);
+            }
+        } else if (qt == GGUF_TYPE_Q2_0) {
+            size_t nblocks = nrows / 128;
+            for (size_t b = 0; b < nblocks; b++) {
+                block_q2_0 *blk = (block_q2_0 *)((uint8_t *)ptr + b * sizeof(block_q2_0));
+                blk->d = GGUF_LE16(blk->d);
+            }
+        } else if (qt == GGUF_TYPE_Q1_0) {
+            size_t nblocks = nrows / 128;
+            for (size_t b = 0; b < nblocks; b++) {
+                block_q1_0 *blk = (block_q1_0 *)((uint8_t *)ptr + b * sizeof(block_q1_0));
+                blk->d = GGUF_LE16(blk->d);
+            }
+        } else if (qt == GGUF_TYPE_Q5_K) {
+            size_t nblocks = nrows / 256;
+            for (size_t b = 0; b < nblocks; b++) {
+                block_q5_K *blk = (block_q5_K *)((uint8_t *)ptr + b * sizeof(block_q5_K));
+                blk->d = GGUF_LE16(blk->d);
+                blk->dm = GGUF_LE16(blk->dm);
+            }
+        } else if (qt == GGUF_TYPE_Q6_K) {
+            size_t nblocks = nrows / 256;
+            for (size_t b = 0; b < nblocks; b++) {
+                block_q6_K *blk = (block_q6_K *)((uint8_t *)ptr + b * sizeof(block_q6_K));
+                blk->d = GGUF_LE16(blk->d);
+            }
+        } else if (qt == GGUF_TYPE_BF16) {
+            uint16_t *bf16p = (uint16_t *)ptr;
+            for (size_t j = 0; j < nrows; j++) bf16p[j] = GGUF_LE16(bf16p[j]);
+        }
+    }
+    fprintf(stderr, "Big-endian: swap done (%.0fms)\n", (clock() - be_start) / (double)CLOCKS_PER_SEC * 1000);
+}
+#endif
+
     free(tinfos);
     return 0;
 }

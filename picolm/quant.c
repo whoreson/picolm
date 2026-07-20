@@ -471,7 +471,16 @@ void dequantize_row_f16(const void *src, float *dst, int n) {
 }
 
 void dequantize_row_f32(const void *src, float *dst, int n) {
+#if defined(__APPLE__) && defined(__ppc__)
+    /* GGUF stores F32 as little-endian; swap on big-endian */
+    const uint32_t *src32 = (const uint32_t *)src;
+    uint32_t *dst32 = (uint32_t *)dst;
+    for (int i = 0; i < n; i++) {
+        dst32[i] = (src32[i] >> 24) | ((src32[i] >> 8) & 0xff00) | ((src32[i] << 8) & 0xff0000) | (src32[i] << 24);
+    }
+#else
     memcpy(dst, src, n * sizeof(float));
+#endif
 }
 
 /* Q5_K dequantize: 256 elements per block, 5-bit quants with per-subblock scale+min */
@@ -2874,7 +2883,12 @@ float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
         case GGUF_TYPE_Q4_K: return vec_dot_q4_K_f32(src, x, n);
         case GGUF_TYPE_Q5_K: {
             /* Scalar fallback: dequantize to float, then dot */
+#if defined(__APPLE__) && defined(__ppc__)
+            /* __thread not supported on Mac OS X PPC; use static buffer (not thread-safe but fine without OpenMP) */
+            static float q5_tmp[4096];
+#else
             static float __thread q5_tmp[4096];
+#endif
             if (n > 4096) {
                 float *tmp = (float *)malloc(n * sizeof(float));
                 dequantize_row_q5_K(src, tmp, n);

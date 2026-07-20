@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "model.h"
 
 /* ---- GGUF string reader (reused from model.c logic) ---- */
 
@@ -9,7 +10,7 @@ static uint64_t read_u64_at(const uint8_t **p) {
     uint64_t v;
     memcpy(&v, *p, 8);
     *p += 8;
-    return v;
+    return GGUF_LE64(v);
 }
 
 /* ---- Sorted index for binary search ---- */
@@ -92,7 +93,17 @@ int tokenizer_load(tokenizer_t *t, const model_t *m) {
     if (m->tok_scores_data && m->tok_n_scores > 0) {
         uint64_t n = m->tok_n_scores;
         if ((int)n > vs) n = (uint64_t)vs;
+#if defined(__APPLE__) && defined(__ppc__)
+        /* GGUF stores F32 as little-endian; swap on big-endian */
+        { const uint32_t *src32 = (const uint32_t *)m->tok_scores_data;
+          for (uint64_t i = 0; i < n; i++) {
+              uint32_t vi = GGUF_LE32(src32[i]);
+              memcpy(&t->scores[i], &vi, 4);
+          }
+        }
+#else
         memcpy(t->scores, m->tok_scores_data, (size_t)n * sizeof(float));
+#endif
     }
 
     /* Read token_type array (3=control, 4=user_defined) */
@@ -252,7 +263,7 @@ const char *tokenizer_decode(const tokenizer_t *t, int prev_token, int token) {
     if (t->token_type) {
         int nn = t->n_token_type;
         if (token < nn) {
-            int32_t ty = t->token_type[token];
+            int32_t ty = GGUF_LE32((uint32_t)t->token_type[token]);
             if (ty == 3 || ty == 4) return "";
         }
     }
