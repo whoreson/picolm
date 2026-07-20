@@ -2460,6 +2460,30 @@ float vec_dot_q4_1_f32(const void *src, const float *x, int n) {
  * Q1_0 block: 16 bytes qs (128 bits) + 2 bytes d(FP16) = 18 bytes per 128 values.
  * Dequant: val[j] = (bit[j] ? +d : -d) */
 float vec_dot_q1_0_f32(const void *src, const float *x, int n) {
+    /* Pre-quantize x to Q8_0 and delegate to vec_dot_q1_0_q8_0.
+     * This allows the AVX2/VNNI path to be used even with F32 activations. */
+    if (n >= 128 && n % 128 == 0) {
+        int nq8 = (n / 32) * sizeof(block_q8_0);
+        block_q8_0 qx_buf[4]; /* stack buffer for typical sizes */
+        block_q8_0 *qx;
+        int qx_owned = 0;
+
+        if (nq8 <= sizeof(qx_buf)) {
+            qx = qx_buf;
+        } else {
+            qx = (block_q8_0 *)malloc(nq8);
+            if (!qx) goto scalar_path;
+            qx_owned = 1;
+        }
+        quantize_row_q8_0(x, qx, n);
+        float result = vec_dot_q1_0_q8_0(src, qx, n);
+        if (qx_owned) free(qx);
+        return result;
+
+    scalar_path:
+        ;
+    }
+
     const block_q1_0 *blocks = (const block_q1_0 *)src;
     int nb = n / 128;
     float sumf = 0.0f;
@@ -2483,6 +2507,33 @@ float vec_dot_q1_0_f32(const void *src, const float *x, int n) {
  * Q2_0 block: 32 bytes qs + 2 bytes d(FP16) = 34 bytes per 128 values.
  * Dequant: val[j] = ((qs[j] & 3) - 1) * d */
 float vec_dot_q2_0_f32(const void *src, const float *x, int n) {
+    /* Pre-quantize x to Q8_0 and delegate to vec_dot_q2_0_q8_0.
+     * This allows the VNNI path to be used even with F32 activations.
+     * For small n (<128), the quantization overhead dominates; fall back
+     * to scalar. */
+    if (n >= 128 && n % 128 == 0) {
+        int nb = n / 128;
+        int nq8 = (n / 32) * sizeof(block_q8_0);
+        block_q8_0 qx_buf[4]; /* stack buffer for typical sizes */
+        block_q8_0 *qx;
+        int qx_owned = 0;
+
+        if (nq8 <= sizeof(qx_buf)) {
+            qx = qx_buf;
+        } else {
+            qx = (block_q8_0 *)malloc(nq8);
+            if (!qx) goto scalar_path;
+            qx_owned = 1;
+        }
+        quantize_row_q8_0(x, qx, n);
+        float result = vec_dot_q2_0_q8_0(src, qx, n);
+        if (qx_owned) free(qx);
+        return result;
+
+    scalar_path:
+        ;
+    }
+
     const block_q2_0 *blocks = (const block_q2_0 *)src;
     int nb = n / 128;
     float sumf = 0.0f;
