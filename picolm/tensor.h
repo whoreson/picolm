@@ -13,6 +13,13 @@ void tensor_init_scratch(float *buf, int size);
  * Pass NULL to disable repacked path. Must be called before matmul. */
 void tensor_set_repacked(const void *ptr);
 
+/* Set GPU tensor handle for offloading matmul to GPU (PICOLM_GPU builds only).
+ * Pass NULL to disable GPU offloading. Must be called before each matmul. */
+#ifdef PICOLM_GPU
+typedef struct picolm_gpu_tensor picolm_gpu_tensor_t;
+void tensor_set_gpu_tensor(picolm_gpu_tensor_t *t, int device);
+#endif
+
 /* Set number of threads for matmul (default: 1) */
 void tensor_set_threads(int t);
 int  tensor_get_threads(void);

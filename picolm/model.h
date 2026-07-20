@@ -47,6 +47,31 @@ typedef struct {
     int n_mtp_layers;         /* number of MTP layers at the end of layer list */
 } model_config_t;
 
+/* ---- GPU-resident weight handles (compiled in only with PICOLM_GPU) ---- */
+#ifdef PICOLM_GPU
+/* Per-layer GPU tensor handles, parallel to layer_weights_t.
+ * Each handle is an opaque picolm_gpu_tensor_t* cast to void*. */
+typedef struct {
+    void *attn_q;
+    void *attn_k;
+    void *attn_v;
+    void *attn_output;
+    void *ffn_gate;
+    void *ffn_down;
+    void *ffn_up;
+    void *attn_qkv;            /* SSM */
+    void *attn_gate_ssm;       /* SSM */
+    void *ssm_out;             /* SSM */
+} gpu_layer_weights_t;
+
+typedef struct {
+    void *output;
+    gpu_layer_weights_t layers[MAX_LAYERS];
+    int device;
+    int active;    /* 1 if GPU backend is active and at least some tensors uploaded */
+} gpu_weights_t;
+#endif /* PICOLM_GPU */
+
 /* ---- Per-layer weight pointers (into mmap) ---- */
 
 typedef struct {
@@ -210,6 +235,10 @@ typedef struct {
     int         locked_layers;   /* number of layers pinned in RAM (0=disabled) */
     /* Whether model was loaded from safetensors (norm weights need +1.0) */
     int         from_safetensors;
+#ifdef PICOLM_GPU
+    /* GPU-resident weight tensors */
+    gpu_weights_t gpu;
+#endif
 } model_t;
 
 /* Load a GGUF model file. Returns 0 on success. */

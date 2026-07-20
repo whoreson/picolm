@@ -4,6 +4,20 @@
 #include <string.h>
 #include <stdio.h>
 
+#ifdef PICOLM_GPU
+#include "backend_gpu.h"
+/* GPU dispatch: if a GPU tensor handle is registered for this weight matrix,
+ * offload to GPU. The handle is stored per-tensor via tensor_set_gpu_tensor().
+ * This is checked at the very start of matmul/matmul_batch before any CPU path. */
+static picolm_gpu_tensor_t *gpu_tensor = NULL;
+static int gpu_device = 0;
+
+void tensor_set_gpu_tensor(picolm_gpu_tensor_t *t, int device) {
+    gpu_tensor = t;
+    gpu_device = device;
+}
+#endif /* PICOLM_GPU */
+
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define WINVER 0x0600
@@ -402,6 +416,19 @@ static int pool_total_threads(int requested) {
 }
 
 void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t qtype) {
+#ifdef PICOLM_GPU
+    if (gpu_tensor && d > 0 && n > 0) {
+        /* GPU path: single-token GEMV (S=1) */
+        static int gpu_matmul_count = 0;
+        if (picolm_gpu_matmul(gpu_tensor, out, x, 1, gpu_device)) {
+            if (gpu_matmul_count++ == 0) {
+                fprintf(stderr, "INFO: GPU matmul active\n");
+            }
+            return;
+        }
+        /* GPU returned 0: fall through to CPU path */
+    }
+#endif
     size_t row_bytes = gguf_type_row_size(qtype, n);
     const char *wptr = (const char *)W;
 
@@ -728,6 +755,11 @@ static void q4_0_8_8_batch_task(int b, void *ctxp) {
 
 void matmul_batch(float *out, const float *x, int n_batch,
                    const void *W, int n, int d, gguf_type_t qtype) {
+#ifdef PICOLM_GPU
+    if (gpu_tensor && n_batch > 0 && d > 0 && n > 0) {
+        if (picolm_gpu_matmul(gpu_tensor, out, x, n_batch, gpu_device)) return;
+    }
+#endif
     size_t row_bytes = gguf_type_row_size(qtype, n);
     const char *wptr = (const char *)W;
 
