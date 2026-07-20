@@ -2646,55 +2646,6 @@ float vec_dot_q1_0_q8_0(const void *vx, const void *wy, int n) {
         sumf = hsum_avx(acc);
         return sumf;
     }
-#elif defined(PICOLM_AVX)
-    /* AVX path: 128-bit bit expansion (SSSE3 pshufb) + 128-bit maddubs (SSE4.1)
-     * accumulation into __m256. Ported from llama.cpp. */
-    {
-        const __m128i ones_8  = _mm_set1_epi8(1);
-        const __m128i ones_16 = _mm_set1_epi16(1);
-        const __m128i byte_shuf = _mm_setr_epi8(
-            0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1);
-        const __m128i bit_masks = _mm_setr_epi8(
-            1,2,4,8,16,32,64,(char)-128,
-            1,2,4,8,16,32,64,(char)-128);
-        const __m128i zero = _mm_setzero_si128();
-        float sumf;
-        __m256 acc = _mm256_setzero_ps();
-
-        for (int ib = 0; ib < nb; ib++) {
-            float d0 = fp16_to_fp32_lookup(x[ib].d);
-            const uint32_t *qs32 = (const uint32_t *)x[ib].qs;
-            const block_q8_0 *yp = &y[ib * 4];
-            __m256 acc_block = _mm256_setzero_ps();
-
-            for (int K = 0; K < 4; K++) {
-                /* Expand 32 bits into two 128-bit sign masks */
-                uint32_t v = qs32[K];
-                __m128i qs_lo = _mm_cvtsi32_si128(v);
-                __m128i qs_vec = _mm_shufflelo_epi16(qs_lo, 0);
-                __m128i sm0 = _mm_cmpeq_epi8(
-                    _mm_and_si128(_mm_shuffle_epi8(qs_vec, byte_shuf), bit_masks), zero);
-                qs_vec = _mm_shufflelo_epi16(qs_lo, 0x3C);
-                __m128i sm1 = _mm_cmpeq_epi8(
-                    _mm_and_si128(_mm_shuffle_epi8(qs_vec, byte_shuf), bit_masks), zero);
-                /* Load Q8_0 in two 128-bit chunks */
-                __m128i qy0 = _mm_loadu_si128((const __m128i *)yp[K].qs);
-                __m128i qy1 = _mm_loadu_si128((const __m128i *)(yp[K].qs + 16));
-                __m128i sy0 = _mm_sub_epi8(_mm_xor_si128(qy0, sm0), sm0);
-                __m128i sy1 = _mm_sub_epi8(_mm_xor_si128(qy1, sm1), sm1);
-                __m128i s16_0 = _mm_maddubs_epi16(ones_8, sy0);
-                __m128i s16_1 = _mm_maddubs_epi16(ones_8, sy1);
-                __m128i s32_0 = _mm_madd_epi16(s16_0, ones_16);
-                __m128i s32_1 = _mm_madd_epi16(s16_1, ones_16);
-                __m256 q = _mm256_cvtepi32_ps(_mm256_set_m128i(s32_1, s32_0));
-                float d1 = fp16_to_fp32_lookup(yp[K].d);
-                acc_block = _mm256_add_ps(acc_block, _mm256_mul_ps(_mm256_set1_ps(d1), q));
-            }
-            acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_set1_ps(d0), acc_block));
-        }
-        sumf = hsum_avx(acc);
-        return sumf;
-    }
 #elif defined(PICOLM_SSE3)
     /* SSSE3 path: 128-bit bit expansion + 128-bit maddubs (SSE4.1).
      * Uses 4 independent __m128 accumulators for the 4 Q8_0 sub-blocks.
@@ -2712,6 +2663,7 @@ float vec_dot_q1_0_q8_0(const void *vx, const void *wy, int n) {
         __m128 acc_1 = _mm_setzero_ps();
         __m128 acc_2 = _mm_setzero_ps();
         __m128 acc_3 = _mm_setzero_ps();
+        float sumf;
 
         for (int ib = 0; ib < nb; ib++) {
             __m128 d0 = _mm_set1_ps(fp16_to_fp32_lookup(x[ib].d));
