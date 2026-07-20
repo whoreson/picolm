@@ -921,6 +921,7 @@ static void q4_0_4_4_batch_task(int b, void *ctxp) {
     vec_dot_q4_0x4_q8_0(ctx->wptr, xb, ctx->n, ctx->out + (size_t)b * ctx->d, ctx->d);
 }
 
+#ifdef PICOLM_AVX2
 typedef struct {
     const char *wptr;
     const void *qx_buf;
@@ -934,6 +935,7 @@ static void q4_0_8_8_batch_task(int b, void *ctxp) {
     const char *xb = (const char *)ctx->qx_buf + (size_t)b * ctx->q8_row_bytes;
     vec_dot_q4_0x8_q8_0_avx2(ctx->wptr, xb, ctx->n, ctx->out + (size_t)b * ctx->d, ctx->d);
 }
+#endif
 
 void matmul_batch(float *out, const float *x, int n_batch,
                    const void *W, int n, int d, gguf_type_t qtype) {

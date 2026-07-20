@@ -365,7 +365,7 @@ static int load_tokenizer_safetensors(const char *model_dir, model_t *m) {
 
     m->tok_scores_data = malloc(m->tok_n_tokens * sizeof(float));
     if (!m->tok_scores_data) { free(vbuf); return -1; }
-    memset(m->tok_scores_data, 0, m->tok_n_tokens * sizeof(float));
+    memset((void*)m->tok_scores_data, 0, m->tok_n_tokens * sizeof(float));
 
     struct { uint64_t len; char *str; } *tok_arr = calloc(m->tok_n_tokens, sizeof(*tok_arr));
     if (!tok_arr) { free(vbuf); return -1; }
@@ -447,14 +447,14 @@ static int load_tokenizer_safetensors(const char *model_dir, model_t *m) {
     free(vbuf);
 
     size_t total_size = 0;
-    for (int i = 0; i < m->tok_n_tokens; i++) {
+    for (uint64_t i = 0; i < m->tok_n_tokens; i++) {
         total_size += tok_arr[i].str ? 8 + tok_arr[i].len : 8;
     }
     char *tok_buf = malloc(total_size + 1);
     if (!tok_buf) { free(tok_arr); return -1; }
 
     char *wp = tok_buf;
-    for (int i = 0; i < m->tok_n_tokens; i++) {
+    for (uint64_t i = 0; i < m->tok_n_tokens; i++) {
         uint64_t slen = tok_arr[i].len;
         memcpy(wp, &slen, 8);
         wp += 8;

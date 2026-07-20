@@ -47,10 +47,6 @@ static unsigned char _f16swap_mask[16] __attribute__((aligned(64))) =
     {1,0,3,2,5,4,7,6,9,8,11,10,13,12,15,14};
 static vector unsigned char _f16swap_vmask;
 
-static void init_f16swap(void) {
-    _f16swap_vmask = (vector unsigned char)vec_ld(0, _f16swap_mask);
-}
-
 static void swap_f16_block(uint16_t *dst, size_t n) {
     vector unsigned char vm = _f16swap_vmask;
     size_t i;
@@ -64,11 +60,7 @@ static void swap_f16_block(uint16_t *dst, size_t n) {
     for (; i < n; i++) dst[i] = GGUF_LE16(dst[i]);
 }
 #else
-static void swap_f16_block(uint16_t *dst, size_t n) {
-    size_t i;
-    for (i = 0; i < n; i++) dst[i] = GGUF_LE16(dst[i]);
-}
-static void init_f16swap(void) { }
+/* swap_f16_block not needed on LE; parse_gguf swap loop is PPC-only */
 #endif
 
 /* Runtime prefault: when set, prepare_mmap() touches every 4KB page of the
@@ -1385,10 +1377,10 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
  * (model_forward_prefill, many tokens at once) call this same core, so
  * there is exactly one implementation of the quant-aware SIMD attention
  * math to maintain and both paths get the same optimizations for free. */
-static __attribute__((always_inline)) void attn_core(
+static void attn_core(
         float *xbh, const float *qh, int kv_h, int pos,
         const uint8_t *kcache, const uint8_t *vcache,
-        int n_kv_heads, gguf_type_t kv_type_k, gguf_type_t kv_type_v,
+        int n_kv_heads, int kv_type_k, int kv_type_v,
         size_t kv_row_size_k, size_t kv_row_size_v, int head_dim) {
     float max_score = -1e30f, sum_exp = 0.0f;
     float acc[256];
@@ -1472,23 +1464,21 @@ static __attribute__((always_inline)) void attn_core(
  * ================================================================ */
 typedef struct {
     int kv_h, kv_mul, n_kv_heads, head_dim, pos;
-    gguf_type_t kv_type_k, kv_type_v;
+    int kv_type_k, kv_type_v;  /* kv_cache_type_t values: 0=F16, 1=Q8_0, 2=Q4_0 */
     size_t kv_row_size_k, kv_row_size_v;
     const uint8_t *kcache, *vcache;
     const float *q;   /* [n_heads][head_dim] */
     float *xb;        /* [n_heads][head_dim] */
 } attn_group_ctx_t;
 
-static __attribute__((always_inline)) void attention_group(int kv_head_idx, void *ctx_ptr) {
+static void attention_group(int kv_head_idx, void *ctx_ptr) {
     attn_group_ctx_t *ctx = (attn_group_ctx_t *)ctx_ptr;
     int kv_h = kv_head_idx;
     int kv_mul = ctx->kv_mul;
     int head_dim = ctx->head_dim;
     int pos = ctx->pos;
     int first_qh = kv_h * kv_mul;
-    size_t k_stride = ctx->n_kv_heads * ctx->kv_row_size_k;
-    size_t v_stride = ctx->n_kv_heads * ctx->kv_row_size_v;
-
+    
     /* Per-Q-head softmax state (kv_mul up to 8) */
     assert(kv_mul <= 8 && head_dim <= 256 && "attention_group: stack arrays too small for this model");
     float max_score[8], sum_exp[8];
@@ -1542,7 +1532,6 @@ static __attribute__((always_inline)) void attention_group(int kv_head_idx, void
             score /= sqrtf((float)head_dim);
 
             float *accg = acc[g];
-            float *xbhg = ctx->xb + (first_qh + g) * head_dim;
 
             if (score > max_score[g]) {
                 float correction = expf(max_score[g] - score);
@@ -1617,27 +1606,6 @@ static __attribute__((always_inline)) void attention_group(int kv_head_idx, void
         for (int d = 0; d < head_dim; d++) xbhg[d] = accg[d] * inv_sum;
 #endif
     }
-}
-
-typedef struct {
-    int n_heads, n_kv_heads, kv_mul, head_dim, pos;
-    gguf_type_t kv_type_k, kv_type_v;
-    size_t kv_row_size_k, kv_row_size_v;
-    const uint8_t *kcache;
-    const uint8_t *vcache;
-    float *q;
-    float *xb;
-} attn_head_ctx_t;
-
-static __attribute__((always_inline)) void attention_head(int head_idx, void *ctx_ptr) {
-    attn_head_ctx_t *ctx = (attn_head_ctx_t *)ctx_ptr;
-    int h = head_idx;
-    float *qh = ctx->q + h * ctx->head_dim;
-    int kv_h = h / ctx->kv_mul;
-    float *xbh = ctx->xb + h * ctx->head_dim;
-    attn_core(xbh, qh, kv_h, ctx->pos, ctx->kcache, ctx->vcache,
-              ctx->n_kv_heads, ctx->kv_type_k, ctx->kv_type_v,
-              ctx->kv_row_size_k, ctx->kv_row_size_v, ctx->head_dim);
 }
 
 float *model_forward(model_t *m, int token, int pos) {
@@ -2718,7 +2686,7 @@ int model_unlock_layers(model_t *m) {
  * allocating/freeing O(n_kv * n_kv_heads * head_dim) scratch per layer). */
 typedef struct {
     int n_heads, n_kv_heads, kv_mul, head_dim, start_pos;
-    gguf_type_t kv_type_k, kv_type_v;
+    int kv_type_k, kv_type_v;
     size_t kv_row_size_k, kv_row_size_v;
     const uint8_t *kcache, *vcache;
     const float *q_batch;   /* [n_tokens][n_heads * head_dim] */
@@ -2758,7 +2726,7 @@ static void batch_attention_layer(
         int n_tokens, int start_pos,
         int n_heads, int n_kv_heads, int head_dim,
         int xb_stride,
-        gguf_type_t kv_type_k, gguf_type_t kv_type_v,
+        int kv_type_k, int kv_type_v,
         size_t kv_row_size_k, size_t kv_row_size_v)
 {
     /* Build the prefill_attn_ctx for both the original path and the test */
@@ -3021,8 +2989,8 @@ static void batch_attention_tiled(
      *   tile*head_dim*3 = 64*128*3 = 24576 floats = 98KB
      *   ~491KB per task, manageable with malloc. */
 
-    gguf_type_t gguf_k = kv_cache_to_gguf_type(kv_type_k);
-    gguf_type_t gguf_v = kv_cache_to_gguf_type(kv_type_v);
+    gguf_type_t gguf_k = kv_cache_to_gguf_type((kv_cache_type_t)kv_type_k);
+    gguf_type_t gguf_v = kv_cache_to_gguf_type((kv_cache_type_t)kv_type_v);
     size_t k_rb_gguf = gguf_type_row_size(gguf_k, head_dim);
 
     if (n_kv_heads < 1 || n_token_groups < 1) return;
@@ -3181,7 +3149,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
     run_state_t *s = &m->state;
     int dim = c->n_embd, n_ffn = c->n_ffn;
     int n_heads = c->n_heads, n_kv_heads = c->n_kv_heads, head_dim = c->head_dim;
-    int kv_dim = n_kv_heads * head_dim, kv_mul = n_heads / n_kv_heads;
+    int kv_dim = n_kv_heads * head_dim;
     int q_dim = n_heads * head_dim, seq_len = c->max_seq_len;
     /* Qwen3.5 full attention layers have interleaved Q+gate */
     int q_full_dim = (c->has_ssm) ? (q_dim * 2) : q_dim;
@@ -3330,7 +3298,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
             batch_attention_layer(xb_batch, q_batch, kcl, vcl,
                                   n_tokens, start_pos,
                                   n_heads, c->n_kv_heads, head_dim,
-                                  max_dim, s->kv_type_k, s->kv_type_v,
+                                  max_dim, (int)s->kv_type_k, (int)s->kv_type_v,
                                   s->kv_row_size_k, s->kv_row_size_v);
         }
 

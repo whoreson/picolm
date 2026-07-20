@@ -96,6 +96,7 @@ enum { QWEN_TOKHASH_BITS = 19, QWEN_MRGHASH_BITS = 20 };
 
 static int tok_lookup(const char **vocab, int *vocab_len, int *tok_tab, int vs,
                       const char *s, int n) {
+    (void)vs;
     uint32_t m = (1u << QWEN_TOKHASH_BITS) - 1;
     uint32_t h = fnv(s, n, 0) & m;
     for (;;) {
@@ -113,7 +114,7 @@ static int merge_rank(const qwen_merge_t *merges, int *mrg_tab,
     for (;;) {
         int idx = mrg_tab[h];
         if (idx < 0) return -1;
-        qwen_merge_t *mg = &merges[idx];
+        const qwen_merge_t *mg = &merges[idx];
         if (mg->ll == ll && mg->rl == rl &&
             memcmp(mg->lp, l, ll) == 0 && memcmp(mg->rp, r, rl) == 0)
             return idx;
@@ -123,7 +124,7 @@ static int merge_rank(const qwen_merge_t *merges, int *mrg_tab,
 
 /* ---- Preetokenizer ---- */
 static int pretok_next(const char *s, int n) {
-    int cp, adv, i = 0;
+    int cp, adv;
 
     /* 1: contractions (case-insensitive) */
     if (s[0] == '\'' && n >= 2) {
@@ -161,13 +162,15 @@ static int pretok_next(const char *s, int n) {
     {
         int j = 0;
         if (cp == ' ' && adv < n) {
-            int c2, a2 = utf8_next(s + adv, n - adv, &c2);
+            int c2;
+            (void)utf8_next(s + adv, n - adv, &c2);
             if (!is_WS(c2) && !is_L(c2) && !is_N(c2)) j = adv;
-        }
-        if (j > 0 || (!is_WS(cp) && !is_L(cp) && !is_N(cp))) {
             int k = j;
-            while (k < n) { int c3, a3 = utf8_next(s + k, n - k, &c3);
-                if (is_WS(c3) || is_L(c3) || is_N(c3)) break; k += a3; }
+            while (k < n) {
+                int c3, a3 = utf8_next(s + k, n - k, &c3);
+                if (is_WS(c3) || is_L(c3) || is_N(c3)) break;
+                k += a3;
+            }
             if (k > j || j > 0) {
                 while (k < n && (s[k] == '\r' || s[k] == '\n')) k++;
                 if (k > 0) return k;
