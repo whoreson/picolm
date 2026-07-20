@@ -1190,16 +1190,14 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                 attempted++;
                 if (picolm_gpu_tensor_upload(&gl->ffn_down,
                         lw->ffn_down, lw->type_ffn_down, c->n_ffn, c->n_embd, device)) uploaded++;
-
-#undef GPU_UPLOAD
             }
-            if (uploaded) {
-                m->gpu.device = device;
+
+            m->gpu.device = device;
+            if (uploaded > 0) {
                 m->gpu.active = 1;
-                fprintf(stderr, "INFO: GPU upload complete: %d/%d tensors on device %d\n",
-                        uploaded, attempted, device);
+                fprintf(stderr, "INFO: GPU weights uploaded (%d/%d tensors)\n", uploaded, attempted);
             } else {
-                fprintf(stderr, "WARN: GPU upload failed, using CPU\n");
+                fprintf(stderr, "WARN: GPU upload failed for all tensors, using CPU\n");
             }
         }
     }
@@ -1542,17 +1540,16 @@ float *model_forward(model_t *m, int token, int pos) {
     run_state_t *s = &m->state;
 
     int dim    = c->n_embd;
-
-#ifdef PICOLM_GPU
-    int gpu_ok = m->gpu.active;
-    int gpu_dev = m->gpu.device;
-#endif
     int n_ffn  = c->n_ffn;
     int n_heads = c->n_heads;
     int n_kv_heads = c->n_kv_heads;
     int head_dim = c->head_dim;
     int q_dim = n_heads * head_dim;
     /* Qwen3.5 full attention uses Q+gate joint projection: 2x q_dim */
+#ifdef PICOLM_GPU
+    int gpu_ok = m->gpu.active;
+    int gpu_dev = m->gpu.device;
+#endif
     int q_full_dim = c->has_ssm ? (n_heads * head_dim * 2) : q_dim;
     int kv_dim = n_kv_heads * head_dim;
     int kv_mul = n_heads / n_kv_heads;
@@ -1625,10 +1622,10 @@ float *model_forward(model_t *m, int token, int pos) {
         rmsnorm(s->xb, s->x, s->attn_norm_w[l], dim, c->rms_norm_eps);
 
         /* Q projection (Q+gate joint for Qwen3.5 full attention) */
+        tensor_set_repacked(m->repack_used[ri] ? m->repack_buffers[ri] : NULL);
 #ifdef PICOLM_GPU
         if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->attn_q, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
 #endif
-        tensor_set_repacked(m->repack_used[ri] ? m->repack_buffers[ri] : NULL);
         int this_q_dim = (c->has_ssm && lw->is_attn_layer) ? q_full_dim : q_dim;
         matmul(s->q, s->xb, lw->attn_q, dim, this_q_dim, lw->type_attn_q);
         tensor_set_repacked(NULL);
@@ -1653,10 +1650,10 @@ float *model_forward(model_t *m, int token, int pos) {
         }
 
         /* K projection */
+        tensor_set_repacked(m->repack_used[ri+1] ? m->repack_buffers[ri+1] : NULL);
 #ifdef PICOLM_GPU
         if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->attn_k, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
 #endif
-        tensor_set_repacked(m->repack_used[ri+1] ? m->repack_buffers[ri+1] : NULL);
         float *k_tmp = s->xb2; /* reuse xb2 as temp for K (kv_dim <= dim) */
         matmul(k_tmp, s->xb, lw->attn_k, dim, kv_dim, lw->type_attn_k);
         tensor_set_repacked(NULL);
@@ -1704,10 +1701,10 @@ float *model_forward(model_t *m, int token, int pos) {
         }
 
         /* V projection -> store per head */
+        tensor_set_repacked(m->repack_used[ri+2] ? m->repack_buffers[ri+2] : NULL);
 #ifdef PICOLM_GPU
         if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->attn_v, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
 #endif
-        tensor_set_repacked(m->repack_used[ri+2] ? m->repack_buffers[ri+2] : NULL);
         float *v_tmp = s->xb2;
         matmul(v_tmp, s->xb, lw->attn_v, dim, kv_dim, lw->type_attn_v);
         tensor_set_repacked(NULL);
@@ -1771,10 +1768,10 @@ float *model_forward(model_t *m, int token, int pos) {
         }
 
         /* Output projection */
-        #ifdef PICOLM_GPU
+        tensor_set_repacked(m->repack_used[ri+3] ? m->repack_buffers[ri+3] : NULL);
+#ifdef PICOLM_GPU
         if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->attn_output, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
 #endif
-        tensor_set_repacked(m->repack_used[ri+3] ? m->repack_buffers[ri+3] : NULL);
         matmul(s->xb2, s->xb, lw->attn_output, q_dim, dim, lw->type_attn_output);
         tensor_set_repacked(NULL);
         vec_add(s->x, s->xb2, dim);
@@ -1783,27 +1780,27 @@ float *model_forward(model_t *m, int token, int pos) {
         if (lw->ffn_gate && lw->ffn_up && lw->ffn_down) {
             rmsnorm(s->xb, s->x, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
 
-            #ifdef PICOLM_GPU
+            tensor_set_repacked(m->repack_used[ri+4] ? m->repack_buffers[ri+4] : NULL);
+#ifdef PICOLM_GPU
             if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->ffn_gate, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
 #endif
-            tensor_set_repacked(m->repack_used[ri+4] ? m->repack_buffers[ri+4] : NULL);
             matmul(s->hb,  s->xb, lw->ffn_gate, dim, n_ffn, lw->type_ffn_gate);
             tensor_set_repacked(NULL);
 
+            tensor_set_repacked(m->repack_used[ri+6] ? m->repack_buffers[ri+6] : NULL);
 #ifdef PICOLM_GPU
             if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->ffn_up, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
 #endif
-            tensor_set_repacked(m->repack_used[ri+6] ? m->repack_buffers[ri+6] : NULL);
             matmul(s->hb2, s->xb, lw->ffn_up,   dim, n_ffn, lw->type_ffn_up);
             tensor_set_repacked(NULL);
 
             silu(s->hb, n_ffn);
             elemwise_mul(s->hb, s->hb, s->hb2, n_ffn);
 
+            tensor_set_repacked(m->repack_used[ri+5] ? m->repack_buffers[ri+5] : NULL);
 #ifdef PICOLM_GPU
             if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->ffn_down, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
 #endif
-            tensor_set_repacked(m->repack_used[ri+5] ? m->repack_buffers[ri+5] : NULL);
             matmul(s->xb, s->hb, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
             tensor_set_repacked(NULL);
             vec_add(s->x, s->xb, dim);
@@ -1814,10 +1811,10 @@ float *model_forward(model_t *m, int token, int pos) {
     rmsnorm(s->x, s->x, s->output_norm_w, dim, c->rms_norm_eps);
 
     /* 4. Output projection -> logits */
+    tensor_set_repacked(m->repack_used[1] ? m->repack_buffers[1] : NULL);
 #ifdef PICOLM_GPU
     if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)m->gpu.output, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
 #endif
-    tensor_set_repacked(m->repack_used[1] ? m->repack_buffers[1] : NULL);
     matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
     tensor_set_repacked(NULL);
 
@@ -2201,22 +2198,20 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
 }
 
 void model_free(model_t *m) {
-    /* Free GPU weight tensors */
 #ifdef PICOLM_GPU
-    if (m->gpu.active) {
-        if (m->gpu.output) { picolm_gpu_tensor_free(m->gpu.output); m->gpu.output = NULL; }
-        for (int l = 0; l < m->config.n_layers; l++) {
-            gpu_layer_weights_t *gl = &m->gpu.layers[l];
-            if (gl->attn_q) { picolm_gpu_tensor_free(gl->attn_q); gl->attn_q = NULL; }
-            if (gl->attn_k) { picolm_gpu_tensor_free(gl->attn_k); gl->attn_k = NULL; }
-            if (gl->attn_v) { picolm_gpu_tensor_free(gl->attn_v); gl->attn_v = NULL; }
-            if (gl->attn_output) { picolm_gpu_tensor_free(gl->attn_output); gl->attn_output = NULL; }
-            if (gl->ffn_gate) { picolm_gpu_tensor_free(gl->ffn_gate); gl->ffn_gate = NULL; }
-            if (gl->ffn_up) { picolm_gpu_tensor_free(gl->ffn_up); gl->ffn_up = NULL; }
-            if (gl->ffn_down) { picolm_gpu_tensor_free(gl->ffn_down); gl->ffn_down = NULL; }
-        }
-        picolm_gpu_shutdown();
+    /* Free GPU weight tensors */
+    if (m->gpu.output) { picolm_gpu_tensor_free(m->gpu.output); m->gpu.output = NULL; }
+    for (int l = 0; l < m->config.n_layers; l++) {
+        gpu_layer_weights_t *gl = &m->gpu.layers[l];
+        if (gl->attn_q) { picolm_gpu_tensor_free(gl->attn_q); gl->attn_q = NULL; }
+        if (gl->attn_k) { picolm_gpu_tensor_free(gl->attn_k); gl->attn_k = NULL; }
+        if (gl->attn_v) { picolm_gpu_tensor_free(gl->attn_v); gl->attn_v = NULL; }
+        if (gl->attn_output) { picolm_gpu_tensor_free(gl->attn_output); gl->attn_output = NULL; }
+        if (gl->ffn_gate) { picolm_gpu_tensor_free(gl->ffn_gate); gl->ffn_gate = NULL; }
+        if (gl->ffn_up) { picolm_gpu_tensor_free(gl->ffn_up); gl->ffn_up = NULL; }
+        if (gl->ffn_down) { picolm_gpu_tensor_free(gl->ffn_down); gl->ffn_down = NULL; }
     }
+    picolm_gpu_shutdown();
 #endif
     /* Free repacked weight buffers */
     for (int i = 0; i < MAX_LAYERS + 4; i++) {
@@ -2639,6 +2634,19 @@ static void prefill_attn_task(int flat_idx, void *ctx_ptr) {
               ctx->kv_row_size_k, ctx->kv_row_size_v, ctx->head_dim);
 }
 
+/* Tiled attention: tile size in KV positions */
+#define ATTN_TILE 64
+
+/* Forward declaration for batch_attention_layer gating */
+static void batch_attention_tiled(
+        float *xb_batch, const float *q_batch,
+        const uint8_t *kcache, const uint8_t *vcache,
+        int n_tokens, int start_pos,
+        int n_heads, int n_kv_heads, int head_dim,
+        int xb_stride,
+        kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v,
+        size_t kv_row_size_k, size_t kv_row_size_v);
+
 static void batch_attention_layer(
         float *xb_batch, const float *q_batch,
         const uint8_t *kcache, const uint8_t *vcache,
@@ -2648,6 +2656,7 @@ static void batch_attention_layer(
         gguf_type_t kv_type_k, gguf_type_t kv_type_v,
         size_t kv_row_size_k, size_t kv_row_size_v)
 {
+    /* Build the prefill_attn_ctx for both the original path and the test */
     prefill_attn_ctx_t ctx;
     ctx.n_heads = n_heads; ctx.n_kv_heads = n_kv_heads; ctx.kv_mul = n_heads / n_kv_heads;
     ctx.head_dim = head_dim; ctx.start_pos = start_pos;
@@ -2655,10 +2664,405 @@ static void batch_attention_layer(
     ctx.kv_row_size_k = kv_row_size_k; ctx.kv_row_size_v = kv_row_size_v;
     ctx.kcache = kcache; ctx.vcache = vcache;
     ctx.q_batch = q_batch; ctx.xb_batch = xb_batch; ctx.xb_stride = xb_stride;
+
+    /* For large enough batches, use the tiled/batched attention path which
+     * amortizes KV cache load/dequant across multiple query tokens via the
+     * existing matmul_batch infrastructure. For small batches, the original
+     * per-(token,head) path is simpler and avoids malloc overhead.
+     *
+     * The tiled path currently only supports F16 KV cache (which is what
+     * the store loop always writes). Q8_0/Q4_0 cache types are a planned
+     * enhancement. */
+    if (n_tokens >= 2 * ATTN_TILE && (int)kv_type_k == (int)KV_CACHE_F16 && (int)kv_type_v == (int)KV_CACHE_F16) {
+        batch_attention_tiled(xb_batch, q_batch, kcache, vcache,
+                              n_tokens, start_pos,
+                              n_heads, n_kv_heads, head_dim,
+                              xb_stride,
+                              (kv_cache_type_t)kv_type_k, (kv_cache_type_t)kv_type_v,
+                              kv_row_size_k, kv_row_size_v);
+        return;
+    }
+
     /* One dispatch per layer for the whole batch: n_tokens * n_heads
      * independent (token, head) tasks, each O(head_dim) memory, each
      * scanning only its own causal range t=0..pos. */
     tensor_parallel_for(n_tokens * n_heads, prefill_attn_task, &ctx);
+}
+
+/* ================================================================
+ * Tiled/blocked attention for prefill.
+ *
+ * Reframes attention as a sequence of small matmul_batch calls,
+ * tiling over KV positions. K/V tiles are extracted from the
+ * interleaved KV cache into contiguous scratch buffers, then
+ * processed through the existing weight-stationary batched matmul
+ * infrastructure (same Q8_0 activation-quantization fast paths).
+ *
+ * Key insight: for GQA models, all kv_mul query heads sharing a KV
+ * head see the same K/V tile. So the activation batch for the QK^T
+ * matmul is kv_mul * GROUP_SIZE rows, amortizing the K/V tile load
+ * across all grouped heads.
+ *
+ * Online-softmax merge across tiles: standard flash-attention
+ * recurrence with per-query running (M, S, acc) state.
+ *
+ * Causal masking via block-diagonal scheme: GROUP_SIZE == TILE.
+ * Tokens are partitioned into groups aligned with KV tile boundaries.
+ * For each group, KV tiles before the group's own block are fully
+ * visible (dense matmul), the diagonal tile needs row-wise masking,
+ * and tiles after are skipped.
+ * ================================================================ */
+
+/* Map kv_cache_type_t (0/1/2) to gguf_type_t (1/8/2) for matmul_batch */
+static gguf_type_t kv_cache_to_gguf_type(kv_cache_type_t kv_type) {
+    switch (kv_type) {
+        case KV_CACHE_F16:  return GGUF_TYPE_F16;
+        case KV_CACHE_Q8_0: return GGUF_TYPE_Q8_0;
+        case KV_CACHE_Q4_0: return GGUF_TYPE_Q4_0;
+    }
+    return GGUF_TYPE_F16;
+}
+
+/* Tiled attention task: process one (kv_head, token_group) pair.
+ * tile_k: contiguous K-tile [tile_size x head_dim] in kv_type_k format
+ * tile_v_f32: contiguous V-tile [tile_size x head_dim] in F32
+ * scores: scores for this tile [n_q_rows x tile_size] in F32
+ * q_rows: query rows [n_q_rows x head_dim] in F32 (kv_mul * GROUP_SIZE)
+ * n_q_rows: number of query rows in this group (kv_mul * tokens_in_group)
+ * tile_size: actual KV positions in this tile (may be < ATTN_TILE for tail)
+ * M, S, acc: running softmax state to update in-place
+ * out: final output to write [n_q_rows x head_dim] (only after last tile) */
+typedef struct {
+    int kv_h;
+    int kv_mul;
+    int n_kv_heads;
+    int head_dim;
+    int tile_size;
+    int n_q_rows;
+    int group_token_start;  /* first token index in this group */
+    int kv_tile_start;      /* first KV position in this tile */
+    int kv_tile_end;        /* one past last KV position */
+    int is_diagonal;        /* 1 if this tile needs causal masking */
+
+    gguf_type_t kv_gguf_k;  /* gguf_type for this kv cache type */
+    size_t kv_row_size_k;   /* bytes per KV head row in cache */
+    const uint8_t *kcache;  /* layer K cache base */
+    const float *q_rows;    /* [n_q_rows x head_dim] query vectors */
+    float *scores;          /* [n_q_rows x tile_size] score buffer */
+    uint8_t *tile_k;        /* contiguous K-tile scratch [tile_size x head_dim] in kv format */
+    float *tile_v_f32;      /* contiguous V-tile in F32 [tile_size x head_dim] */
+    float *M;               /* [n_q_rows] running max */
+    float *S;               /* [n_q_rows] running sum_exp */
+    float *acc;             /* [n_q_rows x head_dim] running accumulator */
+    float *out;             /* [n_q_rows x head_dim] final output (written only after all tiles) */
+    int last_tile;          /* 1 if this is the last tile to process */
+} attn_tile_task_t;
+
+/* Process one tile within a (kv_head, token_group) task.
+ * Called inline from the task loop. */
+static void attn_process_tile(attn_tile_task_t *t) {
+    int n_q = t->n_q_rows;
+    int ts = t->tile_size;
+    int hd = t->head_dim;
+    int is_diag = t->is_diagonal;
+    int kv_tile_start = t->kv_tile_start;
+    int group_token_start = t->group_token_start;
+
+    /* Extract K-tile from interleaved KV cache into contiguous scratch.
+     * KV cache layout: [pos][n_kv_heads][kv_row_size_k]
+     * For positions [kv_tile_start, kv_tile_start+ts), head kv_h: */
+    {
+        size_t rb = t->kv_row_size_k;
+        int gguf_k = t->kv_gguf_k;
+        size_t k_rb_gguf = gguf_type_row_size(gguf_k, hd);
+        /* K tile: ts positions, each rb bytes from cache, copied to
+         * contiguous buffer with stride k_rb_gguf. For F16 this is
+         * the same size and just a memcpy; for Q8_0/Q4_0 also same. */
+        for (int p = 0; p < ts; p++) {
+            const uint8_t *src = t->kcache + (size_t)(kv_tile_start + p) * t->n_kv_heads * rb
+                               + t->kv_h * rb;
+            uint8_t *dst = (uint8_t *)t->tile_k + (size_t)p * k_rb_gguf;
+            memcpy(dst, src, rb);
+        }
+    }
+
+    /* QK^T: matmul_batch(scores, q_rows, n_q, tile_k, hd, ts, kv_gguf_k)
+     * out layout: [n_q][ts], scores[b*ts + i] = row b, col i */
+    matmul_batch(t->scores, t->q_rows, n_q, t->tile_k, hd, ts, t->kv_gguf_k);
+
+    /* Scale scores by 1/sqrt(head_dim) */
+    float inv_sqrt_hd = 1.0f / sqrtf((float)hd);
+    for (int i = 0; i < n_q * ts; i++)
+        t->scores[i] *= inv_sqrt_hd;
+
+    /* Causal masking for diagonal tile: for each query row i,
+     * only positions [0, i_within_group] are valid.
+     * Within the diagonal tile, query row i (0..n_q-1) corresponds to
+     * token (group_token_start + i/kv_mul), and the valid KV positions
+     * within this tile are [0, row_offset_within_tile].
+     * The diagonal tile starts at kv_tile_start. The query's causal limit
+     * is pos = start_pos + group_token_start + i/kv_mul.
+     * Within this tile, valid columns are [0, pos - kv_tile_start]. */
+
+    if (is_diag) {
+        for (int i = 0; i < n_q; i++) {
+            int token_idx = i / t->kv_mul;
+            int pos = group_token_start + token_idx;
+            int valid_cols = pos - kv_tile_start + 1;
+            if (valid_cols < 0) valid_cols = 0;
+            if (valid_cols > ts) valid_cols = ts;
+            float *row = t->scores + i * ts;
+            for (int j = valid_cols; j < ts; j++)
+                row[j] = -1e30f;
+        }
+    }
+
+    /* Online softmax merge:
+     * For each query row i:
+     *   tile_max[i] = max(scores[i*ts .. (i+1)*ts - 1])
+     *   new_M[i] = max(old_M[i], tile_max[i])
+     *   corr[i] = exp(old_M[i] - new_M[i])
+     *   tile_exp[i*j] = exp(scores[i*j] - new_M[i])
+     *   tile_sum[i] = sum(tile_exp[i*0..ts-1])
+     *   old_S[i] *= corr[i]
+     *   old_acc[i*] *= corr[i]
+     *   S[i] = old_S[i] + tile_sum[i]
+     *   acc[i*] += tile_exp[i*] @ V_tile (row-major: tile_sum_i = sum_j tile_exp[i*j] * V[j*])
+     *
+     * For the acc update: tile_exp[n_q x ts] @ V_tile[ts x hd]
+     * = matmul_batch(acc_add, tile_exp, n_q, V_tile_T, ts, hd, F32)
+     * But V_tile_T would need to be quantized... Instead do it manually.
+     *
+     * Actually: we can do acc_add = tile_exp @ V_tile as a matmul_batch
+     * where V_tile is in F32 format stored [ts][hd].
+     * matmul_batch wants weight [d rows][n cols] = [hd rows][ts cols]
+     * which is the TRANSPOSE of V_tile. So we need V_t[hd x ts].
+     */
+
+    /* Per-row tile_exp buffer (tile_size wide, tile_size <= ATTN_TILE = 64) */
+    float tile_exp_buf[ATTN_TILE];
+
+    /* Process each query row independently: compute max, exp, sum, and acc update */
+    for (int i = 0; i < n_q; i++) {
+        float *srow = t->scores + i * ts;
+
+        /* Row max */
+        float rmax = srow[0];
+        for (int j = 1; j < ts; j++) {
+            if (srow[j] > rmax) rmax = srow[j];
+        }
+
+        /* Update running M and compute correction */
+        float old_M = t->M[i];
+        float new_M = (rmax > old_M) ? rmax : old_M;
+        t->M[i] = new_M;
+        float corr = expf(old_M - new_M);
+
+        /* Scale old S and acc by correction */
+        t->S[i] *= corr;
+        float *acc_row = t->acc + i * hd;
+        for (int d = 0; d < hd; d++)
+            acc_row[d] *= corr;
+
+        /* Compute exp(s[j] - new_M) for this row and accumulate */
+        float rsum = 0.0f;
+        for (int j = 0; j < ts; j++) {
+            tile_exp_buf[j] = expf(srow[j] - new_M);
+            rsum += tile_exp_buf[j];
+        }
+        t->S[i] += rsum;
+
+        /* acc_row += sum_j tile_exp[j] * V[j, d] */
+        for (int d = 0; d < hd; d++) {
+            float add = 0.0f;
+            for (int j = 0; j < ts; j++) {
+                add += tile_exp_buf[j] * t->tile_v_f32[j * hd + d];
+            }
+            acc_row[d] += add;
+        }
+    }
+}
+
+static void batch_attention_tiled(
+        float *xb_batch, const float *q_batch,
+        const uint8_t *kcache, const uint8_t *vcache,
+        int n_tokens, int start_pos,
+        int n_heads, int n_kv_heads, int head_dim,
+        int xb_stride,
+        kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v,
+        size_t kv_row_size_k, size_t kv_row_size_v)
+{
+    int kv_mul = n_heads / n_kv_heads;
+    int tile = ATTN_TILE;
+
+    /* Clamp tile to n_tokens for small batches */
+    if (tile > n_tokens) tile = n_tokens;
+    if (tile < 1) tile = 1;
+
+    int n_token_groups = (n_tokens + tile - 1) / tile;
+    int n_kv_tiles = (start_pos + n_tokens + tile - 1) / tile;
+
+    /* For each (kv_head, token_group), we need:
+     * - scores: [kv_mul * tile x tile] floats
+     * - M, S: [kv_mul * tile] floats each
+     * - acc: [kv_mul * tile x head_dim] floats
+     * - tile_k: tile x head_dim in kv format (reuse k_rb * tile)
+     * - tile_v_f32: tile x head_dim floats
+     * - tile_exp_buf: already in stack in attn_process_tile
+     *
+     * Total per task: ~kv_mul * tile * (tile + head_dim) + tile * head_dim * 3
+     * For kv_mul=8, tile=64, head_dim=128:
+     *   8*64*(64+128) = 8*64*192 = 98304 floats = 393KB
+     *   tile*head_dim*3 = 64*128*3 = 24576 floats = 98KB
+     *   ~491KB per task, manageable with malloc. */
+
+    gguf_type_t gguf_k = kv_cache_to_gguf_type(kv_type_k);
+    gguf_type_t gguf_v = kv_cache_to_gguf_type(kv_type_v);
+    size_t k_rb_gguf = gguf_type_row_size(gguf_k, head_dim);
+
+    if (n_kv_heads < 1 || n_token_groups < 1) return;
+
+    /* Run all (kv_head, token_group) tasks serially. The inner matmul_batch
+     * calls are already threaded via the global thread pool, so adding an
+     * outer parallel_for would deadlock from nested pool_wake/pool_wait. */
+        for (int kv_h = 0; kv_h < n_kv_heads; kv_h++) {
+            for (int tg = 0; tg < n_token_groups; tg++) {
+                int q_group_start = tg * tile;
+                int q_group_end = q_group_start + tile;
+                if (q_group_end > n_tokens) q_group_end = n_tokens;
+                int n_q = q_group_end - q_group_start;
+                int n_q_padded = n_q * kv_mul;
+
+                /* Scratch allocation */
+                size_t scores_sz = (size_t)(n_q_padded * tile) * sizeof(float);
+                size_t ms_sz = (size_t)n_q_padded * sizeof(float);
+                size_t acc_sz = (size_t)n_q_padded * head_dim * sizeof(float);
+                size_t tk_sz = (size_t)tile * k_rb_gguf;
+                size_t tv_sz = (size_t)tile * head_dim * sizeof(float);
+
+                float *scores = malloc(scores_sz);
+                float *M = malloc(ms_sz);
+                float *S = malloc(ms_sz);
+                float *acc = malloc(acc_sz);
+                uint8_t *tile_k_buf = malloc(tk_sz);
+                float *tile_v_f32 = malloc(tv_sz);
+                if (!scores || !M || !S || !acc || !tile_k_buf || !tile_v_f32) {
+                    free(scores); free(M); free(S); free(acc); free(tile_k_buf); free(tile_v_f32);
+                    /* Fallback to original path on OOM */
+                    return;
+                }
+
+                /* Gather query rows for this (kv_head, token_group).
+                 * q_batch layout: [n_tokens][n_heads * head_dim]
+                 * For kv_head kv_h, the query heads are [kv_h*kv_mul .. kv_h*kv_mul+kv_mul).
+                 * For token_group tg, tokens are [q_group_start .. q_group_end).
+                 * We interleave: q_rows[i*head_dim] where i = token_offset * kv_mul + qh_offset.
+                 * Actually: q_rows[row_idx] = q for token (q_group_start + row_idx/kv_mul),
+                 * head (kv_h * kv_mul + row_idx % kv_mul). */
+                float *q_rows = malloc((size_t)n_q_padded * head_dim * sizeof(float));
+                if (!q_rows) {
+                    free(scores); free(M); free(S); free(acc); free(tile_k_buf); free(tile_v_f32);
+                    return;
+                }
+                for (int ti = 0; ti < n_q; ti++) {
+                    const float *q_tok = q_batch + (size_t)(q_group_start + ti) * n_heads * head_dim;
+                    for (int g = 0; g < kv_mul; g++) {
+                        const float *qh = q_tok + (kv_h * kv_mul + g) * head_dim;
+                        float *qr = q_rows + ((size_t)ti * kv_mul + g) * head_dim;
+                        memcpy(qr, qh, head_dim * sizeof(float));
+                    }
+                }
+
+                /* Initialize M, S, acc */
+                for (int i = 0; i < n_q_padded; i++) {
+                    M[i] = -1e30f;
+                    S[i] = 0.0f;
+                }
+                memset(acc, 0, acc_sz);
+
+                /* Tile loop over KV positions */
+                for (int tk = 0; tk < n_kv_tiles; tk++) {
+                    int kv_t0 = tk * tile;
+                    int kv_t1 = kv_t0 + tile;
+                    if (kv_t1 > start_pos + n_tokens) kv_t1 = start_pos + n_tokens;
+                    if (kv_t1 > q_group_start + start_pos + 1) {
+                        /* This tile and all future tiles are fully in the future
+                         * for ALL query rows in this group. Stop. */
+                        /* Actually need per-row check: the last query row's pos is
+                         * start_pos + q_group_end - 1. If kv_t0 >= that, skip. */
+                        /* But we need to be more careful: some rows may have
+                         * earlier causal limits. Let's just check if kv_t0 is
+                         * past the causal limit of the FIRST query row. */
+                        int first_pos = start_pos + q_group_start;
+                        if (kv_t0 > first_pos) continue;
+                        if (kv_t0 >= start_pos + q_group_end) break;
+                    }
+                    /* Skip tiles entirely in the future */
+                    int first_pos = start_pos + q_group_start;
+                    if (kv_t0 > first_pos) continue;
+
+                    int this_tile_size = kv_t1 - kv_t0;
+                    if (this_tile_size <= 0) continue;
+
+                    /* Is this the diagonal tile? */
+                    int is_diag = (kv_t0 <= q_group_start) && (kv_t1 > q_group_start);
+
+                    /* Extract V-tile and dequantize to F32 */
+                    {
+                        size_t rb = kv_row_size_v;
+                        for (int p = 0; p < this_tile_size; p++) {
+                            const uint8_t *src = vcache + (size_t)(kv_t0 + p) * n_kv_heads * rb
+                                               + kv_h * rb;
+                            dequantize_row(src, tile_v_f32 + (size_t)p * head_dim,
+                                          head_dim, gguf_v);
+                        }
+                    }
+
+                    /* Build task context and process */
+                    attn_tile_task_t task;
+                    memset(&task, 0, sizeof(task));
+                    task.kv_h = kv_h;
+                    task.kv_mul = kv_mul;
+                    task.n_kv_heads = n_kv_heads;
+                    task.head_dim = head_dim;
+                    task.tile_size = this_tile_size;
+                    task.n_q_rows = n_q_padded;
+                    task.group_token_start = q_group_start;
+                    task.kv_tile_start = kv_t0;
+                    task.kv_tile_end = kv_t1;
+                    task.is_diagonal = is_diag;
+                    task.kv_gguf_k = gguf_k;
+                    task.kv_row_size_k = kv_row_size_k;
+                    task.kcache = kcache;
+                    task.q_rows = q_rows;
+                    task.scores = scores;
+                    task.tile_k = tile_k_buf;
+                    task.tile_v_f32 = tile_v_f32;
+                    task.M = M;
+                    task.S = S;
+                    task.acc = acc;
+
+                    attn_process_tile(&task);
+                }
+
+                /* Normalize and write output */
+                for (int ti = 0; ti < n_q; ti++) {
+                    for (int g = 0; g < kv_mul; g++) {
+                        int ri = ti * kv_mul + g;
+                        float inv_sum = 1.0f / S[ri];
+                        float *acc_row = acc + ri * head_dim;
+                        /* Write to xb_batch: token (q_group_start+ti), head (kv_h*kv_mul+g) */
+                        float *out = xb_batch + (size_t)(q_group_start + ti) * xb_stride
+                                   + (kv_h * kv_mul + g) * head_dim;
+                        for (int d = 0; d < head_dim; d++)
+                            out[d] = acc_row[d] * inv_sum;
+                    }
+                }
+
+                free(scores); free(M); free(S); free(acc);
+                free(tile_k_buf); free(tile_v_f32); free(q_rows);
+            }
+        }
 }
 
 /* ================================================================
@@ -2678,11 +3082,6 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
     int q_full_dim = (c->has_ssm) ? (q_dim * 2) : q_dim;
     int max_dim = (q_full_dim > dim) ? q_full_dim : dim;
     size_t bs = (size_t)n_tokens;
-
-#ifdef PICOLM_GPU
-    int gpu_ok = m->gpu.active;
-    int gpu_dev = m->gpu.device;
-#endif
 
     size_t sz = bs * (2 * dim + max_dim + q_full_dim + 2 * kv_dim + 2 * n_ffn);
     float *buf = (float *)malloc(sz * sizeof(float));
@@ -2711,11 +3110,12 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 
     /* Profiling counters */
     int attn_ordinal = 0; /* KV cache ordinal for attention layers (SSM models) */
+#ifdef PICOLM_GPU
+    int gpu_ok = m->gpu.active;
+    int gpu_dev = m->gpu.device;
+#endif
     for (int l = 0; l < c->n_layers; l++) {
         layer_weights_t *lw = &w->layers[l];
-#ifdef PICOLM_GPU
-        gpu_layer_weights_t *gl = &m->gpu.layers[l];
-#endif
 
         if (c->has_ssm && !lw->is_attn_layer) {
             /* SSM layer: process tokens sequentially (stateful: conv_state + ssm_state) */
@@ -2738,10 +3138,10 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
             rmsnorm(xb_batch + bi * dim, x_batch + bi * dim, s->attn_norm_w[l], dim, c->rms_norm_eps);
 
         /* Q projection (batched) */
-#ifdef PICOLM_GPU
-        if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->attn_q, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
-#endif
         tensor_set_repacked(m->repack_used[2+l*9] ? m->repack_buffers[2+l*9] : NULL);
+#ifdef PICOLM_GPU
+        if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)m->gpu.layers[l].attn_q, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
+#endif
         { int this_q_dim = (c->has_ssm && lw->is_attn_layer) ? q_full_dim : q_dim;
           matmul_batch(q_batch, xb_batch, n_tokens, lw->attn_q, dim, this_q_dim, lw->type_attn_q);
         }
@@ -2845,10 +3245,10 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         }
 
         /* Output projection (batched) */
-#ifdef PICOLM_GPU
-        if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->attn_output, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
-#endif
         tensor_set_repacked(m->repack_used[6+l*9] ? m->repack_buffers[6+l*9] : NULL);
+#ifdef PICOLM_GPU
+        if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)m->gpu.layers[l].attn_output, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
+#endif
         matmul_batch(xb2_batch, xb_batch, n_tokens, lw->attn_output, q_dim, dim, lw->type_attn_output);
         tensor_set_repacked(NULL);
 
@@ -2885,10 +3285,10 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         }
 
         /* FFN down (batched) */
-#ifdef PICOLM_GPU
-        if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->ffn_down, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
-#endif
         tensor_set_repacked(m->repack_used[8+l*9] ? m->repack_buffers[8+l*9] : NULL);
+#ifdef PICOLM_GPU
+        if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)m->gpu.layers[l].ffn_down, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
+#endif
         matmul_batch(xb2_batch, hb_batch, n_tokens, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
         tensor_set_repacked(NULL);
 
@@ -2905,10 +3305,10 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
     /* Final norm + output (last token only) */
     float *last_x = x_batch + (n_tokens - 1) * dim;
     rmsnorm(s->x, last_x, s->output_norm_w, dim, c->rms_norm_eps);
+    tensor_set_repacked(m->repack_used[1] ? m->repack_buffers[1] : NULL);
 #ifdef PICOLM_GPU
     if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)m->gpu.output, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
 #endif
-    tensor_set_repacked(m->repack_used[1] ? m->repack_buffers[1] : NULL);
     matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
     tensor_set_repacked(NULL);
 
