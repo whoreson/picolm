@@ -214,6 +214,26 @@ static void matmul_worker_f(matmul_task_t *t) {
                 }
             }
             if (shadow != shadow_stack) free(shadow);
+        } else if (t->qtype == GGUF_TYPE_Q1_0 && t->x) {
+            size_t q8_row_bytes = gguf_type_row_size(GGUF_TYPE_Q8_0, t->n);
+            const char *qx_base = (const char *)t->x;
+            for (int i = t->start; i < t->end; i++) {
+                const char *wrow = t->W + (size_t)i * t->row_bytes;
+                for (int b = 0; b < nb; b++) {
+                    const char *xb = qx_base + (size_t)b * q8_row_bytes;
+                    t->out[b * out_stride + i] = vec_dot_q1_0_q8_0(wrow, xb, t->n);
+                }
+            }
+        } else if (t->qtype == GGUF_TYPE_Q2_0 && t->x) {
+            size_t q8_row_bytes = gguf_type_row_size(GGUF_TYPE_Q8_0, t->n);
+            const char *qx_base = (const char *)t->x;
+            for (int i = t->start; i < t->end; i++) {
+                const char *wrow = t->W + (size_t)i * t->row_bytes;
+                for (int b = 0; b < nb; b++) {
+                    const char *xb = qx_base + (size_t)b * q8_row_bytes;
+                    t->out[b * out_stride + i] = vec_dot_q2_0_q8_0(wrow, xb, t->n);
+                }
+            }
         } else if (t->qtype == GGUF_TYPE_Q8_0) {
             for (int i = t->start; i < t->end; i++) {
                 const block_q8_0 *wrow = (const block_q8_0 *)(t->W + (size_t)i * t->row_bytes);
@@ -853,6 +873,34 @@ void matmul_batch(float *out, const float *x, int n_batch,
         } else {
             free(qbuf); free(dbuf);
         }
+    } else if (qtype == GGUF_TYPE_Q1_0 && n_batch > 0 && n > 0) {
+        size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
+        int nb = n / 32;
+        void *qbuf = malloc((size_t)n_batch * q8_rb);
+        float *dbuf = (float *)malloc((size_t)n_batch * nb * sizeof(float));
+        if (qbuf && dbuf) {
+            for (int b = 0; b < n_batch; b++) {
+                quantize_row_q8_0(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
+                const block_q8_0 *blk = (const block_q8_0 *)((char *)qbuf + (size_t)b * q8_rb);
+                for (int k = 0; k < nb; k++) dbuf[(size_t)b * nb + k] = fp16_to_fp32(blk[k].d);
+            }
+            qx_buf = qbuf; qx_d_buf = dbuf;
+            qx_stride = q8_rb; have_qx = 1;
+        } else { free(qbuf); free(dbuf); }
+    } else if (qtype == GGUF_TYPE_Q2_0 && n_batch > 0 && n > 0) {
+        size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
+        int nb = n / 32;
+        void *qbuf = malloc((size_t)n_batch * q8_rb);
+        float *dbuf = (float *)malloc((size_t)n_batch * nb * sizeof(float));
+        if (qbuf && dbuf) {
+            for (int b = 0; b < n_batch; b++) {
+                quantize_row_q8_0(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
+                const block_q8_0 *blk = (const block_q8_0 *)((char *)qbuf + (size_t)b * q8_rb);
+                for (int k = 0; k < nb; k++) dbuf[(size_t)b * nb + k] = fp16_to_fp32(blk[k].d);
+            }
+            qx_buf = qbuf; qx_d_buf = dbuf;
+            qx_stride = q8_rb; have_qx = 1;
+        } else { free(qbuf); free(dbuf); }
     }
 
     if (n_threads <= 1 || d < 4) {
@@ -869,6 +917,10 @@ void matmul_batch(float *out, const float *x, int n_batch,
                             (const block_q8_0 *)wrow, n);
                     } else if (qtype == GGUF_TYPE_Q4_K) {
                         out[b * d + i] = vec_dot_q4_K_q8_K(wrow, xb, n);
+                    } else if (qtype == GGUF_TYPE_Q1_0) {
+                        out[b * d + i] = vec_dot_q1_0_q8_0(wrow, xb, n);
+                    } else if (qtype == GGUF_TYPE_Q2_0) {
+                        out[b * d + i] = vec_dot_q2_0_q8_0(wrow, xb, n);
                     } else {
                         out[b * d + i] = vec_dot_q4_0_q8_0(wrow, xb, n);
                     }

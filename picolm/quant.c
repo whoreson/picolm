@@ -385,6 +385,38 @@ void dequantize_row_q4_1(const void *src, float *dst, int n) {
     }
 }
 
+/* Dequantize Q1_0: val[j] = (bit[j] ? +d : -d) */
+void dequantize_row_q1_0(const void *src, float *dst, int n) {
+    const block_q1_0 *blocks = (const block_q1_0 *)src;
+    int nb = n / 128;
+
+    for (int i = 0; i < nb; i++) {
+        float d = fp16_to_fp32_lookup(blocks[i].d);
+        float neg_d = -d;
+        for (int j = 0; j < 128; j++) {
+            int byte_idx = j / 8;
+            int bit_off  = j % 8;
+            dst[i * 128 + j] = ((blocks[i].qs[byte_idx] >> bit_off) & 1) ? d : neg_d;
+        }
+    }
+}
+
+/* Dequantize Q2_0: val[j] = ((qs[j] & 3) - 1) * d */
+void dequantize_row_q2_0(const void *src, float *dst, int n) {
+    const block_q2_0 *blocks = (const block_q2_0 *)src;
+    int nb = n / 128;
+
+    for (int i = 0; i < nb; i++) {
+        float d = fp16_to_fp32_lookup(blocks[i].d);
+        for (int j = 0; j < 128; j++) {
+            int byte_idx = j / 4;
+            int bit_off  = (j % 4) * 2;
+            int q = (blocks[i].qs[byte_idx] >> bit_off) & 0x03;
+            dst[i * 128 + j] = (float)(q - 1) * d;
+        }
+    }
+}
+
 /* Dequantize a single row from Q4_0_4_4 interleaved format to float32.
  * Only the first row of each 4-row group is dequantized. */
 void dequantize_row_q4_0_4_4(const void *src, float *dst, int n) {
@@ -480,6 +512,8 @@ void dequantize_row(const void *src, float *dst, int n, gguf_type_t type) {
         case GGUF_TYPE_Q6_K:  dequantize_row_q6_K(src, dst, n); break;
         case GGUF_TYPE_Q4_0_4_4: dequantize_row_q4_0_4_4(src, dst, n); break;
         case GGUF_TYPE_Q4_0_8_8: dequantize_row_q4_0_8_8(src, dst, n); break;
+        case GGUF_TYPE_Q1_0:     dequantize_row_q1_0(src, dst, n); break;
+        case GGUF_TYPE_Q2_0:     dequantize_row_q2_0(src, dst, n); break;
         default:
             fprintf(stderr, "dequantize_row: unsupported type %d\n", type);
             exit(1);
@@ -507,6 +541,8 @@ int gguf_type_block_size(gguf_type_t type) {
         case GGUF_TYPE_Q4_0_4_4: return 32;  /* each block covers 32 values per row */
         case GGUF_TYPE_Q4_0_8_8: return 32;
         case GGUF_TYPE_BF16:     return 1;  /* BF16: 1 element per block, 2 bytes each */
+        case GGUF_TYPE_Q1_0:     return 128;
+        case GGUF_TYPE_Q2_0:     return 128;
         default: return 0;
     }
 }
@@ -530,6 +566,8 @@ int gguf_type_quant_size(gguf_type_t type) {
         case GGUF_TYPE_Q4_0_4_4: return (int)sizeof(block_q4_0);  /* 18: GGUF stores same layout as Q4_0 */
         case GGUF_TYPE_Q4_0_8_8: return (int)sizeof(block_q4_0);  /* 18: GGUF stores same layout as Q4_0 */
         case GGUF_TYPE_BF16:     return 2;  /* BF16: 2 bytes per element */
+        case GGUF_TYPE_Q1_0:     return 18;
+        case GGUF_TYPE_Q2_0:     return 34;
         default: return 0;
     }
 }
@@ -1662,6 +1700,21 @@ static inline __m256i bytes_from_nibbles_32(const uint8_t *qs) {
     return _mm256_and_si256(bytes, _mm256_set1_epi8(0xF));
 }
 
+/* Expand 32 bits into a 256-bit vector of 0x00 or 0xFF per byte.
+ * Each input byte contains 8 sign bits; output has 32 bytes (4 lanes of 8).
+ * Adapted from llama.cpp bytes_from_bits_32. */
+static inline __m256i bytes_from_bits_32(const uint8_t *x) {
+    uint32_t x32;
+    memcpy(&x32, x, sizeof(uint32_t));
+    const __m256i shuf_mask = _mm256_set_epi64x(
+            0x0303030303030303ULL, 0x0202020202020202ULL,
+            0x0101010101010101ULL, 0x0000000000000000ULL);
+    __m256i bytes = _mm256_shuffle_epi8(_mm256_set1_epi32((int)x32), shuf_mask);
+    const __m256i bit_mask = _mm256_set1_epi64x(0x7fbfdfeff7fbfdfeULL);
+    bytes = _mm256_or_si256(bytes, bit_mask);
+    return _mm256_cmpeq_epi8(bytes, _mm256_set1_epi64x(-1));
+}
+
 static inline __m256 mul_sum_i8_pairs_float(const __m256i x, const __m256i y) {
     const __m256i ax = _mm256_sign_epi8(x, x);
     const __m256i sy = _mm256_sign_epi8(y, x);
@@ -2403,6 +2456,174 @@ float vec_dot_q4_1_f32(const void *src, const float *x, int n) {
     return sumf;
 }
 
+/* vec_dot_q1_0_f32: fused dequant + dot for Q1_0 x float32
+ * Q1_0 block: 16 bytes qs (128 bits) + 2 bytes d(FP16) = 18 bytes per 128 values.
+ * Dequant: val[j] = (bit[j] ? +d : -d) */
+float vec_dot_q1_0_f32(const void *src, const float *x, int n) {
+    const block_q1_0 *blocks = (const block_q1_0 *)src;
+    int nb = n / 128;
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        float d = fp16_to_fp32_lookup(blocks[i].d);
+        const uint8_t *qs = blocks[i].qs;
+        const float *xp = x + i * 128;
+        float block_sum = 0.0f;
+        for (int j = 0; j < 128; j++) {
+            int byte_idx = j / 8;
+            int bit_off  = j % 8;
+            int bit = (qs[byte_idx] >> bit_off) & 1;
+            block_sum += bit ? xp[j] : -xp[j];
+        }
+        sumf += d * block_sum;
+    }
+    return sumf;
+}
+
+/* vec_dot_q2_0_f32: fused dequant + dot for Q2_0 x float32
+ * Q2_0 block: 32 bytes qs + 2 bytes d(FP16) = 34 bytes per 128 values.
+ * Dequant: val[j] = ((qs[j] & 3) - 1) * d */
+float vec_dot_q2_0_f32(const void *src, const float *x, int n) {
+    const block_q2_0 *blocks = (const block_q2_0 *)src;
+    int nb = n / 128;
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        float d = fp16_to_fp32_lookup(blocks[i].d);
+        const uint8_t *qs = blocks[i].qs;
+        const float *xp = x + i * 128;
+        float block_sum = 0.0f;
+        for (int j = 0; j < 128; j++) {
+            int byte_idx = j / 4;
+            int bit_off  = (j % 4) * 2;
+            int q = (qs[byte_idx] >> bit_off) & 0x03;
+            block_sum += (float)(q - 1) * xp[j];
+        }
+        sumf += d * block_sum;
+    }
+    return sumf;
+}
+
+/* vec_dot_q1_0_q8_0: Q1_0 weights x Q8_0 input (int8 MAC)
+ * Ported from llama.cpp ggml_vec_dot_q1_0_q8_0.
+ * Q1_0: 16 bytes qs (128 bits) + 2 bytes d per 128 values.
+ * Q8_0: 32 bytes qs + 2 bytes d per 32 values.
+ * Each Q1_0 block (128 vals) matches 4 Q8_0 blocks (4*32 = 128 vals).
+ *
+ * Algorithm: For each Q1_0 block, expand the 128 sign bits into sign masks,
+ * then for each of the 4 Q8_0 sub-blocks, use sign masks to conditionally
+ * negate Q8_0 values, then sum with maddubs_epi16 + madd_epi16.
+ * The result is sum of signed Q8_0 values, scaled by d0*d1. */
+float vec_dot_q1_0_q8_0(const void *vx, const void *wy, int n) {
+    const block_q1_0 *x = (const block_q1_0 *)vx;
+    const block_q8_0 *y = (const block_q8_0 *)wy;
+    int nb = n / 128;
+
+#if defined(PICOLM_AVX2)
+    {
+        const __m256i ones_8  = _mm256_set1_epi8(1);
+        const __m256i ones_16 = _mm256_set1_epi16(1);
+        const __m256i byte_shuf = _mm256_setr_epi8(
+            0, 0, 0, 0, 0, 0, 0, 0,
+            1, 1, 1, 1, 1, 1, 1, 1,
+            2, 2, 2, 2, 2, 2, 2, 2,
+            3, 3, 3, 3, 3, 3, 3, 3);
+        const __m256i bit_masks = _mm256_setr_epi8(
+            1, 2, 4, 8, 16, 32, 64, (char)-128,
+            1, 2, 4, 8, 16, 32, 64, (char)-128,
+            1, 2, 4, 8, 16, 32, 64, (char)-128,
+            1, 2, 4, 8, 16, 32, 64, (char)-128);
+        const __m256i zero = _mm256_setzero_si256();
+        float sumf = 0.0f;
+        __m256 acc = _mm256_setzero_ps();
+
+        for (int ib = 0; ib < nb; ib++) {
+            float d0 = fp16_to_fp32_lookup(x[ib].d);
+            const uint32_t *qs32 = (const uint32_t *)x[ib].qs;
+            const block_q8_0 *yp = &y[ib * 4];
+            __m256 acc_block = _mm256_setzero_ps();
+
+            for (int K = 0; K < 4; K++) {
+                __m256i qy = _mm256_loadu_si256((const __m256i *)yp[K].qs);
+                /* Expand 32 bits: each 32-bit chunk of qs covers one Q8_0 block */
+                __m256i qs_vec = _mm256_set1_epi32(qs32[K]);
+                __m256i sm = _mm256_cmpeq_epi8(
+                    _mm256_and_si256(
+                        _mm256_shuffle_epi8(qs_vec, byte_shuf),
+                        bit_masks), zero);
+                /* sy[j] = qy[j] if bit==1, -qy[j] if bit==0 */
+                __m256i sy = _mm256_sub_epi8(_mm256_xor_si256(qy, sm), sm);
+                __m256i s32 = _mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, sy), ones_16);
+                float d1 = fp16_to_fp32_lookup(yp[K].d);
+                acc_block = _mm256_fmadd_ps(
+                    _mm256_set1_ps(d1), _mm256_cvtepi32_ps(s32), acc_block);
+            }
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(d0), acc_block, acc);
+        }
+        sumf = hsum_avx(acc);
+        return sumf;
+    }
+#else
+    /* Scalar fallback */
+    float sumf = 0.0f;
+    for (int ib = 0; ib < nb; ib++) {
+        float d0 = fp16_to_fp32_lookup(x[ib].d);
+        float sumi = 0.0f;
+        for (int K = 0; K < 4; K++) {
+            float d1 = fp16_to_fp32_lookup(y[ib * 4 + K].d);
+            int sumi_block = 0;
+            const uint8_t *bits = &x[ib].qs[K * 4];
+            const int8_t *qy = y[ib * 4 + K].qs;
+            for (int b = 0; b < 4; b++, qy += 8) {
+                unsigned mask = bits[b];
+                sumi_block += ((mask & 0x01) ? qy[0] : -qy[0])
+                            + ((mask & 0x02) ? qy[1] : -qy[1])
+                            + ((mask & 0x04) ? qy[2] : -qy[2])
+                            + ((mask & 0x08) ? qy[3] : -qy[3])
+                            + ((mask & 0x10) ? qy[4] : -qy[4])
+                            + ((mask & 0x20) ? qy[5] : -qy[5])
+                            + ((mask & 0x40) ? qy[6] : -qy[6])
+                            + ((mask & 0x80) ? qy[7] : -qy[7]);
+            }
+            sumi += d1 * sumi_block;
+        }
+        sumf += d0 * sumi;
+    }
+    return sumf;
+#endif
+}
+
+/* vec_dot_q2_0_q8_0: Q2_0 weights x Q8_0 input
+ * No dedicated SIMD path (only VNNI in llama.cpp). Use scalar.
+ * Q2_0: 32 bytes qs + 2 bytes d per 128 values.
+ * Q8_0: 32 bytes qs + 2 bytes d per 32 values.
+ * Each Q2_0 block (128 vals) matches 4 Q8_0 blocks. */
+float vec_dot_q2_0_q8_0(const void *vx, const void *wy, int n) {
+    const block_q2_0 *x = (const block_q2_0 *)vx;
+    const block_q8_0 *y = (const block_q8_0 *)wy;
+    int nb = n / 128;
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ib++) {
+        float d0 = fp16_to_fp32_lookup(x[ib].d);
+        float sumi = 0.0f;
+        for (int K = 0; K < 4; K++) {
+            float d1 = fp16_to_fp32_lookup(y[ib * 4 + K].d);
+            int sumi_block = 0;
+            const uint8_t *qs = &x[ib].qs[K * 8];
+            const int8_t *qy = y[ib * 4 + K].qs;
+            for (int b = 0; b < 8; b++) {
+                uint8_t byte = qs[b];
+                sumi_block += ((int)((byte >> 0) & 3) - 1) * qy[b*4 + 0];
+                sumi_block += ((int)((byte >> 2) & 3) - 1) * qy[b*4 + 1];
+                sumi_block += ((int)((byte >> 4) & 3) - 1) * qy[b*4 + 2];
+                sumi_block += ((int)((byte >> 6) & 3) - 1) * qy[b*4 + 3];
+            }
+            sumi += d1 * sumi_block;
+        }
+        sumf += d0 * sumi;
+    }
+    return sumf;
+}
+
 /* vec_dot for Q4_0_4_4: dequantize first row of interleaved block, then dot */
 float vec_dot_q4_0_4_4_f32(const void *src, const float *x, int n) {
     const block_q4_0x4 *blocks = (const block_q4_0x4 *)src;
@@ -2474,6 +2695,8 @@ float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
         case GGUF_TYPE_Q8_0: return vec_dot_q8_0_f32(src, x, n);
         case GGUF_TYPE_Q4_0: return vec_dot_q4_0_f32(src, x, n);
         case GGUF_TYPE_Q4_1: return vec_dot_q4_1_f32(src, x, n);
+        case GGUF_TYPE_Q1_0: return vec_dot_q1_0_f32(src, x, n);
+        case GGUF_TYPE_Q2_0: return vec_dot_q2_0_f32(src, x, n);
         case GGUF_TYPE_Q4_0_4_4: return vec_dot_q4_0_4_4_f32(src, x, n);
         case GGUF_TYPE_Q4_0_8_8: return vec_dot_q4_0_8_8_f32(src, x, n);
         case GGUF_TYPE_F16:  return vec_dot_f16_f32(src, x, n);

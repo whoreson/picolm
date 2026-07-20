@@ -211,6 +211,8 @@ typedef enum {
     GGUF_TYPE_Q4_0_4_4   = 31,  /* 4-row interleaved Q4_0 (pre-repacked) */
     GGUF_TYPE_Q4_0_8_8   = 33,  /* 8-row interleaved Q4_0 (pre-repacked, AVX2) */
     GGUF_TYPE_BF16      = 30,  /* Brain Float 16 (GGUF type 30) */
+    GGUF_TYPE_Q1_0       = 41,  /* 1-bit sign + scale, 128 values/block */
+    GGUF_TYPE_Q2_0       = 42,  /* 2-bit values + scale, 128 values/block */
 } gguf_type_t;
 
 /* Q4_K block: 256 weights in 144 bytes */
@@ -339,6 +341,20 @@ typedef struct {
     uint8_t  qs[16];     /* 4-bit quantized values */
 } block_q4_1;            /* 20 bytes */
 
+/* Q1_0 block: 128 weights (1-bit sign + FP16 scale, 18 bytes)
+ * Dequant: val[j] = (bit[j] ? +d : -d) */
+typedef struct {
+    uint16_t d;          /* scale (FP16) = mean(|values|) */
+    uint8_t  qs[16];     /* 128 sign bits (1 bit per value) */
+} block_q1_0;            /* 18 bytes */
+
+/* Q2_0 block: 128 weights (2-bit values + FP16 scale, 34 bytes)
+ * Dequant: val[j] = ((qs[j] - 1) * d), {0,1,2,3} -> {-d, 0, +d, +2d} */
+typedef struct {
+    uint16_t d;          /* scale (FP16) = max(|values|) */
+    uint8_t  qs[32];     /* 128 values * 2 bits each */
+} block_q2_0;            /* 34 bytes */
+
 #pragma pack(pop)
 
 /* ---- FP16 conversion ---- */
@@ -378,6 +394,10 @@ float vec_dot_q4_1_f32(const void *src, const float *x, int n);
 float vec_dot_f16_f32(const void *src, const float *x, int n);
 float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n);
 float vec_dot_q8_0_q8_0_deltas(const void *qx, const float *qx_d, const void *qw, int n);
+/* Q1_0 * Q8_0 dot product: 1-bit weights with pre-quantized Q8_0 input */
+float vec_dot_q1_0_q8_0(const void *src_q1, const void *src_q8, int n);
+/* Q2_0 * Q8_0 dot product: 2-bit weights with pre-quantized Q8_0 input */
+float vec_dot_q2_0_q8_0(const void *src_q2, const void *src_q8, int n);
 /* Q4_0 * Q8_0 dot product: Q4_0 weights with pre-quantized Q8_0 input */
 float vec_dot_q4_0_q8_0(const void *src_q4, const void *src_q8, int n);
 /* Q4_K * Q8_K dot product: Q4_K weights with pre-quantized Q8_K input */

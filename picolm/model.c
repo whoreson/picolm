@@ -1591,7 +1591,6 @@ float *model_forward(model_t *m, int token, int pos) {
         } else {
             const void *embd_row = (const uint8_t *)w->token_embd + (size_t)token * row_bytes;
             dequantize_row(embd_row, s->x, dim, w->type_token_embd);
-
         }
     }
 
