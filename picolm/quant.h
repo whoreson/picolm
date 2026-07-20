@@ -102,6 +102,15 @@ static inline void f32x4_to_fp16_hw(uint16_t *p, float32x4_t v) {
 #  define PICOLM_SSE2 1
 #endif
 
+/* PPC Altivec (VMX) - separate from x86 chain */
+#if defined(__ALTIVEC__)
+#  define PICOLM_ALTIVEC 1
+#  include <altivec.h>
+#  undef bool
+#  undef pixel
+#  undef vec_add
+#endif
+
 /* Include x86 SIMD header once for any x86 SIMD level.
  * <immintrin.h> is an umbrella header that exposes all intrinsics
  * available for the current -march target. */
@@ -144,6 +153,24 @@ static inline __m256 fp16x8_to_fp32_inline(const uint16_t *p) {
         fp16_to_fp32_lookup(p[7]), fp16_to_fp32_lookup(p[6]), fp16_to_fp32_lookup(p[5]), fp16_to_fp32_lookup(p[4]),
         fp16_to_fp32_lookup(p[3]), fp16_to_fp32_lookup(p[2]), fp16_to_fp32_lookup(p[1]), fp16_to_fp32_lookup(p[0]));
 #endif
+}
+#endif
+
+/* --- PPC Altivec SIMD helpers --- */
+#ifdef PICOLM_ALTIVEC
+static inline float hsum_altivec(vector float v) {
+    static char __hsbuf[128];
+    unsigned long hba = (unsigned long)__hsbuf + 63;
+    hba = hba / 64 * 64;
+    ((float*)(void*)hba)[0] = 1.0f;
+    vector float one = vec_splat(vec_ld(0, (float*)hba), 0);
+    vector float h1 = vec_sld(v, v, 8);
+    vector float h2 = vec_madd(h1, one, v);
+    vector float h3 = vec_sld(h2, h2, 12);
+    vector float h4 = vec_madd(h3, one, h2);
+    float result;
+    vec_st(h4, 0, &result);
+    return result;
 }
 #endif
 

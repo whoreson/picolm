@@ -1429,6 +1429,21 @@ void rmsnorm(float *out, const float *x, const float *weight, int size, float ep
     }
     ss = hsum_sse(acc);
     for (; i < size; i++) ss += x[i] * x[i];
+#elif defined(PICOLM_ALTIVEC)
+    {        static char __rnbuf[192];
+        unsigned long ba = (unsigned long)__rnbuf + 63;
+        ba = ba / 64 * 64;
+        vector float zero = (vector float)vec_splat_u32(0);
+        vector float acc = zero;
+        i = 0;
+        for (; i + 3 < size; i += 4) {
+            memcpy((void*)ba, x + i, 16);
+            vector float v = vec_ld(0, (float*)ba);
+            acc = vec_madd(v, v, acc);
+        }
+        ss = hsum_altivec(acc);
+        for (; i < size; i++) ss += x[i] * x[i];
+    }
 #else
     for (int i = 0; i < size; i++) ss += x[i] * x[i];
 #endif
@@ -1471,6 +1486,28 @@ void rmsnorm(float *out, const float *x, const float *weight, int size, float ep
         _mm_storeu_ps(out + i, _mm_mul_ps(_mm_mul_ps(v, scale), w));
     }
     for (; i < size; i++) out[i] = x[i] * ss * weight[i];
+#elif defined(PICOLM_ALTIVEC)
+    {
+        static char __rnbuf2[192];
+        unsigned long ba = (unsigned long)__rnbuf2 + 63;
+        ba = ba / 64 * 64;
+        unsigned long bs = ba;
+        ((float*)(void*)bs)[0] = ss;
+        vector float sc = vec_splat(vec_ld(0, (float*)bs), 0);
+        vector float zero = (vector float)vec_splat_u32(0);
+        i = 0;
+        for (; i + 3 < size; i += 4) {
+            memcpy((void*)(ba + 16), x + i, 16);
+            memcpy((void*)(ba + 32), weight + i, 16);
+            vector float vx2 = vec_ld(0, (float*)(ba + 16));
+            vector float wx = vec_ld(0, (float*)(ba + 32));
+            vector float result = vec_madd(vx2, sc, zero);
+            result = vec_madd(result, wx, zero);
+            vec_st(result, 0, (float*)(ba + 48));
+            memcpy(out + i, (void*)(ba + 48), 16);
+        }
+        for (; i < size; i++) out[i] = x[i] * ss * weight[i];
+    }
 #else
     for (int i = 0; i < size; i++) out[i] = x[i] * ss * weight[i];
 #endif

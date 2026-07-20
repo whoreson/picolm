@@ -101,6 +101,13 @@ cross-riscv: CFLAGS += -march=rv64gc -mabi=lp64d
 cross-riscv: LDFLAGS += -static
 cross-riscv: $(TARGET)
 
+# --- Mac OS X 10.4 Tiger (PowerPC G4, GCC 4.0.1, Altivec) ---
+# Requires: gcc -maltivec, OSSwapInt* from libkern/OSByteOrder.h
+# No OpenMP, no C11, no static linking, no libstdc++
+ppc: CFLAGS = -O2 -g -std=c99 -D_DARWIN_C_SOURCE -D_GNU_SOURCE -Wall -maltivec
+ppc: LDFLAGS = -lm
+ppc: $(TARGET)
+
 # --- Debug build ---
 debug: CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -g -O0
 debug: $(TARGET)

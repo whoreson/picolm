@@ -283,6 +283,8 @@ int main(int argc, char **argv) {
         "SSE2"
 #elif defined(PICOLM_NEON)
         "NEON"
+#elif defined(PICOLM_ALTIVEC)
+        "Altivec"
 #else
         "scalar"
 #endif
