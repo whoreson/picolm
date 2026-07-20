@@ -108,6 +108,14 @@ ppc: CFLAGS = -O2 -g -std=c99 -D_DARWIN_C_SOURCE -D_GNU_SOURCE -Wall -maltivec
 ppc: LDFLAGS = -lm
 ppc: $(TARGET)
 
+# --- Mac OS X 10.6 Snow Leopard (Core 2 Duo, GCC 4.2.1, SSE4.1) ---
+# GCC 4.2: no -march=native, no -std=c11, no -Wpedantic, no <immintrin.h>
+# SSE3 intrinsics are broken in GCC 4.2's <emmintrin.h>; SSSE3+SSE4.1 work
+# via individual headers. __thread not supported.
+mac106: CFLAGS = -O2 -g -std=c99 -D_GNU_SOURCE -Wall -msse4.1 -mssse3 -msse2
+mac106: LDFLAGS = -lm -lpthread -fopenmp
+mac106: $(TARGET)
+
 # --- Debug build ---
 debug: CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -g -O0
 debug: $(TARGET)
