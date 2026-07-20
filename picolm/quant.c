@@ -2594,13 +2594,11 @@ float vec_dot_q1_0_q8_0(const void *vx, const void *wy, int n) {
 
             for (int K = 0; K < 4; K++) {
                 __m256i qy = _mm256_loadu_si256((const __m256i *)yp[K].qs);
-                /* Expand 32 bits: each 32-bit chunk of qs covers one Q8_0 block */
                 __m256i qs_vec = _mm256_set1_epi32(qs32[K]);
                 __m256i sm = _mm256_cmpeq_epi8(
                     _mm256_and_si256(
                         _mm256_shuffle_epi8(qs_vec, byte_shuf),
                         bit_masks), zero);
-                /* sy[j] = qy[j] if bit==1, -qy[j] if bit==0 */
                 __m256i sy = _mm256_sub_epi8(_mm256_xor_si256(qy, sm), sm);
                 __m256i s32 = _mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, sy), ones_16);
                 float d1 = fp16_to_fp32_lookup(yp[K].d);
@@ -2610,6 +2608,106 @@ float vec_dot_q1_0_q8_0(const void *vx, const void *wy, int n) {
             acc = _mm256_fmadd_ps(_mm256_set1_ps(d0), acc_block, acc);
         }
         sumf = hsum_avx(acc);
+        return sumf;
+    }
+#elif defined(PICOLM_AVX)
+    /* AVX path: 128-bit bit expansion (SSSE3 pshufb) + 128-bit maddubs (SSE4.1)
+     * accumulation into __m256. Ported from llama.cpp. */
+    {
+        const __m128i ones_8  = _mm_set1_epi8(1);
+        const __m128i ones_16 = _mm_set1_epi16(1);
+        const __m128i byte_shuf = _mm_setr_epi8(
+            0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1);
+        const __m128i bit_masks = _mm_setr_epi8(
+            1,2,4,8,16,32,64,(char)-128,
+            1,2,4,8,16,32,64,(char)-128);
+        const __m128i zero = _mm_setzero_si128();
+        float sumf;
+        __m256 acc = _mm256_setzero_ps();
+
+        for (int ib = 0; ib < nb; ib++) {
+            float d0 = fp16_to_fp32_lookup(x[ib].d);
+            const uint32_t *qs32 = (const uint32_t *)x[ib].qs;
+            const block_q8_0 *yp = &y[ib * 4];
+            __m256 acc_block = _mm256_setzero_ps();
+
+            for (int K = 0; K < 4; K++) {
+                /* Expand 32 bits into two 128-bit sign masks */
+                uint32_t v = qs32[K];
+                __m128i qs_lo = _mm_cvtsi32_si128(v);
+                __m128i qs_vec = _mm_shufflelo_epi16(qs_lo, 0);
+                __m128i sm0 = _mm_cmpeq_epi8(
+                    _mm_and_si128(_mm_shuffle_epi8(qs_vec, byte_shuf), bit_masks), zero);
+                qs_vec = _mm_shufflelo_epi16(qs_lo, 0x3C);
+                __m128i sm1 = _mm_cmpeq_epi8(
+                    _mm_and_si128(_mm_shuffle_epi8(qs_vec, byte_shuf), bit_masks), zero);
+                /* Load Q8_0 in two 128-bit chunks */
+                __m128i qy0 = _mm_loadu_si128((const __m128i *)yp[K].qs);
+                __m128i qy1 = _mm_loadu_si128((const __m128i *)(yp[K].qs + 16));
+                __m128i sy0 = _mm_sub_epi8(_mm_xor_si128(qy0, sm0), sm0);
+                __m128i sy1 = _mm_sub_epi8(_mm_xor_si128(qy1, sm1), sm1);
+                __m128i s16_0 = _mm_maddubs_epi16(ones_8, sy0);
+                __m128i s16_1 = _mm_maddubs_epi16(ones_8, sy1);
+                __m128i s32_0 = _mm_madd_epi16(s16_0, ones_16);
+                __m128i s32_1 = _mm_madd_epi16(s16_1, ones_16);
+                __m256 q = _mm256_cvtepi32_ps(_mm256_set_m128i(s32_1, s32_0));
+                float d1 = fp16_to_fp32_lookup(yp[K].d);
+                acc_block = _mm256_add_ps(acc_block, _mm256_mul_ps(_mm256_set1_ps(d1), q));
+            }
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(_mm256_set1_ps(d0), acc_block));
+        }
+        sumf = hsum_avx(acc);
+        return sumf;
+    }
+#elif defined(PICOLM_SSE3)
+    /* SSSE3 path: 128-bit bit expansion + 128-bit maddubs (SSE4.1).
+     * Uses 4 independent __m128 accumulators for the 4 Q8_0 sub-blocks.
+     * Ported from llama.cpp. */
+    {
+        const __m128i ones_8  = _mm_set1_epi8(1);
+        const __m128i ones_16 = _mm_set1_epi16(1);
+        const __m128i byte_shuf = _mm_setr_epi8(
+            0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1);
+        const __m128i bit_masks = _mm_setr_epi8(
+            1,2,4,8,16,32,64,(char)-128,
+            1,2,4,8,16,32,64,(char)-128);
+        const __m128i zero = _mm_setzero_si128();
+        __m128 acc_0 = _mm_setzero_ps();
+        __m128 acc_1 = _mm_setzero_ps();
+        __m128 acc_2 = _mm_setzero_ps();
+        __m128 acc_3 = _mm_setzero_ps();
+
+        for (int ib = 0; ib < nb; ib++) {
+            __m128 d0 = _mm_set1_ps(fp16_to_fp32_lookup(x[ib].d));
+            const uint32_t *qs32 = (const uint32_t *)x[ib].qs;
+            const block_q8_0 *yp = &y[ib * 4];
+
+#define Q1_SSSE3_BLOCK(QS_OFF, Y_IDX, ACC) \
+            { \
+                uint32_t v = qs32[QS_OFF / 4]; \
+                __m128i qs_vec = _mm_cvtsi32_si128(v); \
+                __m128i sm0 = _mm_cmpeq_epi8( \
+                    _mm_and_si128(_mm_shuffle_epi8(qs_vec, byte_shuf), bit_masks), zero); \
+                qs_vec = _mm_shufflelo_epi16(qs_vec, 0x3C); \
+                __m128i sm1 = _mm_cmpeq_epi8( \
+                    _mm_and_si128(_mm_shuffle_epi8(qs_vec, byte_shuf), bit_masks), zero); \
+                __m128i qy0 = _mm_loadu_si128((const __m128i *)yp[Y_IDX].qs); \
+                __m128i qy1 = _mm_loadu_si128((const __m128i *)(yp[Y_IDX].qs + 16)); \
+                __m128i sy0 = _mm_sub_epi8(_mm_xor_si128(qy0, sm0), sm0); \
+                __m128i sy1 = _mm_sub_epi8(_mm_xor_si128(qy1, sm1), sm1); \
+                __m128i sum_0 = _mm_madd_epi16(_mm_maddubs_epi16(ones_8, sy0), ones_16); \
+                __m128i sum_1 = _mm_madd_epi16(_mm_maddubs_epi16(ones_8, sy1), ones_16); \
+                __m128 q = _mm_cvtepi32_ps(_mm_add_epi32(sum_0, sum_1)); \
+                (ACC) = _mm_add_ps((ACC), _mm_mul_ps(_mm_mul_ps(d0, \
+                    _mm_set1_ps(fp16_to_fp32_lookup(yp[Y_IDX].d))), q)); \
+            }
+            Q1_SSSE3_BLOCK(0, 0, acc_0)
+            Q1_SSSE3_BLOCK(4, 1, acc_1)
+            Q1_SSSE3_BLOCK(8, 2, acc_2)
+            Q1_SSSE3_BLOCK(12, 3, acc_3)
+#undef Q1_SSSE3_BLOCK
+        }
+        sumf = hsum_sse(_mm_add_ps(_mm_add_ps(acc_0, acc_1), _mm_add_ps(acc_2, acc_3)));
         return sumf;
     }
 #else
