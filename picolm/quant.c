@@ -1709,7 +1709,7 @@ static inline __m512i mul_sum_i8_pairs_avx512(const __m512i x, const __m512i y) 
 }
 #endif
 
-#if defined(PICOLM_AVX2) || defined(PICOLM_AVX) || defined(PICOLM_SSE2)
+#if defined(PICOLM_AVX2) || defined(PICOLM_AVX) || defined(PICOLM_SSSE3)
 static inline __m128i mul_sum_i8_pairs_sse(const __m128i x, const __m128i y) {
     __m128i ax = _mm_sign_epi8(x, x);
     __m128i sy = _mm_sign_epi8(y, x);
@@ -1842,7 +1842,7 @@ float vec_dot_q4_0_q8_0(const void *vx, const void *wy, int n) {
         sumf = hsum_avx(accum);
     }
 
-#elif defined(PICOLM_SSE2)
+#elif defined(PICOLM_SSSE3)
     {
         const __m128i mask4 = _mm_set1_epi8(15);
         const __m128i off = _mm_set1_epi8(8);
@@ -2038,8 +2038,8 @@ float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n) {
     }
     sumf = hsum_avx(acc);
 
-#elif defined(PICOLM_SSE2)
-    /* SSE2: process 2 blocks per iteration with 2 accumulators */
+#elif defined(PICOLM_SSSE3)
+    /* SSSE3: process 2 blocks per iteration with 2 accumulators */
     __m128 acc0 = _mm_setzero_ps();
     __m128 acc1 = _mm_setzero_ps();
     for (i = 0; i + 1 < nb; i += 2) {
@@ -2315,7 +2315,7 @@ float vec_dot_q8_0_q8_0_deltas(const void *qx, const float *qx_d, const void *qw
     }
     sumf = hsum_avx(acc);
 
-#elif defined(PICOLM_SSE2)
+#elif defined(PICOLM_SSSE3)
     __m128 acc0 = _mm_setzero_ps();
     __m128 acc1 = _mm_setzero_ps();
 
@@ -2914,8 +2914,8 @@ float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
         case GGUF_TYPE_Q4_K: return vec_dot_q4_K_f32(src, x, n);
         case GGUF_TYPE_Q5_K: {
             /* Scalar fallback: dequantize to float, then dot */
-#if defined(__APPLE__) && defined(__ppc__)
-            /* __thread not supported on Mac OS X PPC; use static buffer (not thread-safe but fine without OpenMP) */
+#if defined(__APPLE__)
+            /* __thread not supported on old Mac OS X; use static buffer */
             static float q5_tmp[4096];
 #else
             static float __thread q5_tmp[4096];

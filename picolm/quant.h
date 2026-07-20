@@ -95,7 +95,12 @@ static inline void f32x4_to_fp16_hw(uint16_t *p, float32x4_t v) {
 #  define PICOLM_SSE2 1
 /* SSE3 implies SSE2 */
 #elif defined(__SSE3__)
-#  define PICOLM_SSE3 1
+#  if __GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ > 2)
+#    define PICOLM_SSE3 1
+#  endif
+#  ifdef __SSSE3__
+#    define PICOLM_SSSE3 1
+#  endif
 #  define PICOLM_SSE2 1
 /* SSE2 baseline (also the default for all x86-64 targets) */
 #elif defined(__SSE2__) || (defined(_MSC_VER) && (defined(_M_X64) || defined(_M_AMD64)))
@@ -112,10 +117,21 @@ static inline void f32x4_to_fp16_hw(uint16_t *p, float32x4_t v) {
 #endif
 
 /* Include x86 SIMD header once for any x86 SIMD level.
- * <immintrin.h> is an umbrella header that exposes all intrinsics
- * available for the current -march target. */
+ * <immintrin.h> is the modern umbrella header (GCC 4.7+).
+ * Older compilers (e.g. GCC 4.2 on Mac OS X 10.6) need individual headers. */
 #ifdef PICOLM_SSE2
-#  include <immintrin.h>
+#  if __GNUC__ < 4 || (__GNUC__ == 4 && __GNUC_MINOR__ < 7)
+#    include <xmmintrin.h>  /* SSE/SSE2 */
+#    include <emmintrin.h>  /* SSE3 */
+#    ifdef __SSSE3__
+#      include <tmmintrin.h>  /* SSSE3: _mm_maddubs_epi16, _mm_sign_epi8 */
+#    endif
+#    ifdef __SSE4_1__
+#      include <smmintrin.h>  /* SSE4.1: _mm_blendv_epi8, _mm_blendv_ps */
+#    endif
+#  else
+#    include <immintrin.h>
+#  endif
 static inline float hsum_sse(__m128 v) {
     __m128 shuf = _mm_movehl_ps(v, v);
     __m128 sum  = _mm_add_ps(v, shuf);
