@@ -2592,7 +2592,6 @@ float vec_dot_q1_0_q8_0(const void *vx, const void *wy, int n) {
 }
 
 /* vec_dot_q2_0_q8_0: Q2_0 weights x Q8_0 input
- * No dedicated SIMD path (only VNNI in llama.cpp). Use scalar.
  * Q2_0: 32 bytes qs + 2 bytes d per 128 values.
  * Q8_0: 32 bytes qs + 2 bytes d per 32 values.
  * Each Q2_0 block (128 vals) matches 4 Q8_0 blocks. */
@@ -2602,6 +2601,44 @@ float vec_dot_q2_0_q8_0(const void *vx, const void *wy, int n) {
     int nb = n / 128;
     float sumf = 0.0f;
 
+#ifdef PICOLM_VNNI
+    /* AVX-512-VNNI path: unpack 2-bit codes c in {0,1,2,3} (value = c-1),
+     * then dot((c-1), qy) = dpbusd(c, qy) - dpbusd(1, qy).
+     * Ported from llama.cpp ggml_vec_dot_q2_0_q8_0. */
+    {
+        const __m256i ones   = _mm256_set1_epi8(1);
+        const __m128i idxlo  = _mm_setr_epi8(0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3);
+        const __m128i idxhi  = _mm_setr_epi8(4,4,4,4,5,5,5,5,6,6,6,6,7,7,7,7);
+        const __m256i mul    = _mm256_setr_epi16(64,16,4,1, 64,16,4,1, 64,16,4,1, 64,16,4,1);
+        const __m256i three  = _mm256_set1_epi16(3);
+
+        for (int i = 0; i < nb; i++) {
+            const float d0 = fp16_to_fp32_lookup(x[i].d);
+            float sumi = 0.0f;
+            for (int k = 0; k < 4; k++) {
+                const block_q8_0 *yb = &y[i * 4 + k];
+                const float d1 = fp16_to_fp32_lookup(yb->d);
+                const __m256i qy = _mm256_loadu_si256((const __m256i *)yb->qs);
+                /* Load 8 bytes of qs (covers 32 2-bit values for this Q8_0 block) */
+                const __m128i src = _mm_loadl_epi64((const __m128i *)&x[i].qs[k * 8]);
+                /* Replicate each byte 4x -> 32 bytes in low+high 128-bit lanes */
+                const __m256i rep = _mm256_set_m128i(
+                    _mm_shuffle_epi8(src, idxhi), _mm_shuffle_epi8(src, idxlo));
+                /* Expand bytes to 16-bit, extract 2-bit fields via multiply+shift */
+                __m256i r0 = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(rep));
+                __m256i r1 = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(rep, 1));
+                r0 = _mm256_and_si256(_mm256_srli_epi16(_mm256_mullo_epi16(r0, mul), 6), three);
+                r1 = _mm256_and_si256(_mm256_srli_epi16(_mm256_mullo_epi16(r1, mul), 6), three);
+                /* Pack back to 32 ordered codes */
+                __m256i codes = _mm256_permute4x64_epi64(_mm256_packus_epi16(r0, r1), 0xD8);
+                const int dp = hsum_i32_8(_mm256_dpbusd_epi32(_mm256_setzero_si256(), codes, qy));
+                const int sy = hsum_i32_8(_mm256_dpbusd_epi32(_mm256_setzero_si256(), ones,  qy));
+                sumi += d1 * (float)(dp - sy);
+            }
+            sumf += d0 * sumi;
+        }
+    }
+#else
     for (int ib = 0; ib < nb; ib++) {
         float d0 = fp16_to_fp32_lookup(x[ib].d);
         float sumi = 0.0f;
@@ -2621,6 +2658,7 @@ float vec_dot_q2_0_q8_0(const void *vx, const void *wy, int n) {
         }
         sumf += d0 * sumi;
     }
+#endif
     return sumf;
 }
 

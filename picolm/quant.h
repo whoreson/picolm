@@ -123,6 +123,15 @@ static inline float hsum_avx(__m256 v) {
     return hsum_sse(_mm_add_ps(lo, hi));
 }
 
+/* Horizontal sum of 8 int32_t in a 256-bit register */
+static inline int hsum_i32_8(__m256i a) {
+    __m128i sum128 = _mm_add_epi32(_mm256_castsi256_si128(a), _mm256_extractf128_si256(a, 1));
+    __m128i hi64 = _mm_unpackhi_epi64(sum128, sum128);
+    __m128i sum64 = _mm_add_epi32(hi64, sum128);
+    __m128i hi32 = _mm_shuffle_epi32(sum64, _MM_SHUFFLE(2, 3, 0, 1));
+    return _mm_cvtsi128_si32(_mm_add_epi32(sum64, hi32));
+}
+
 /* Convert 8 FP16 to 8 FP32 in AVX register */
 static inline __m256 fp16x8_to_fp32_inline(const uint16_t *p) {
 #ifdef __F16C__
