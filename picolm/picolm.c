@@ -22,6 +22,7 @@ double get_time_ms(void) {
 }
 #else
 #include <sys/time.h>
+#include <time.h>
 #include <sys/types.h>
 #include <unistd.h>
 double get_time_ms(void) {
@@ -339,6 +340,7 @@ int main(int argc, char **argv) {
 #endif
 
     /* Load tokenizer */
+    clock_t t_tok_start = clock();
     tokenizer_t tokenizer;
     int use_qwen_tok = qwen_tokenize_should_use(&model);
     qwen_enc_t qwen_enc = {0};
@@ -356,6 +358,7 @@ int main(int argc, char **argv) {
     } else {
         tokenizer_load(&tokenizer, &model);
     }
+    fprintf(stderr, "%0.1fms: tokenizer loaded\n", (double)(clock() - t_tok_start) / CLOCKS_PER_SEC * 1000.0);
 
     /* Init sampler */
     sampler_t sampler;
@@ -379,6 +382,7 @@ int main(int argc, char **argv) {
     }
 
     /* Encode prompt */
+    clock_t t_start_token = clock();
     int max_prompt_tokens = (int)strlen(prompt) + 16;
     int *prompt_tokens = (int *)malloc((size_t)max_prompt_tokens * sizeof(int));
     int n_prompt;
@@ -396,9 +400,21 @@ int main(int argc, char **argv) {
     } else {
         n_prompt = tokenizer_encode(&tokenizer, prompt, prompt_tokens, max_prompt_tokens, 1);
     }
+    fprintf(stderr, "%0.1fms: tokenized %d tokens\n", (double)(clock() - t_start_token) / CLOCKS_PER_SEC * 1000.0, n_prompt);
     fprintf(stderr, "Prompt tokens (%d):", n_prompt);
     for (int i = 0; i < n_prompt; i++) fprintf(stderr, " %d", prompt_tokens[i]);
     fprintf(stderr, "\n");
+    fflush(stderr);
+
+    /* Exit here for tokenization benchmarking */
+    if (getenv("PICOLM_EXIT_AFTER_TOKENIZE")) {
+        model_free(&model);
+        free(prompt_tokens);
+        free(gen_buf);
+        if (!use_qwen_tok) tokenizer_free(&tokenizer);
+        qwen_tokenize_free(&qwen_enc);
+        exit(0);
+    }
 
     /* If cache covers part of the prompt, skip those positions */
     int start_pos = 0;
