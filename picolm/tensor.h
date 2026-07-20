@@ -23,6 +23,10 @@ void tensor_set_gpu_tensor(picolm_gpu_tensor_t *t, int device);
 /* Set number of threads for matmul (default: 1) */
 void tensor_set_threads(int t);
 int  tensor_get_threads(void);
+
+/* Return a good default thread count based on physical core enumeration.
+ * Excludes HT siblings; falls back to 4 if detection fails. */
+int tensor_default_threads(void);
 void tensor_threadpool_init(int n_threads);
 void tensor_threadpool_free(void);
 void matmul_batch(float *out, const float *x, int n_batch,

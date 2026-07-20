@@ -26,6 +26,7 @@ void tensor_set_gpu_tensor(picolm_gpu_tensor_t *t, int device) {
 #include <synchapi.h>
 #else
 #include <pthread.h>
+#include <unistd.h>
 #endif
 
 /* Thread pool (Windows-native or POSIX) */
@@ -60,10 +61,90 @@ void tensor_init_scratch(float *buf, int size) {
 
 static int n_threads = 1;
 
+/* ---- Physical core enumeration ---- */
+
+/* Count physical CPU cores (excluding hyperthread siblings).
+ * Linux: parses /sys/devices/system/cpu/ topology files.
+ * Windows: uses GetLogicalProcessorInformation with RelationProcessorCore.
+ * Fallback: sysconf(_SC_NPROCESSORS_ONLN) on POSIX, GetProcessorCount() on Win. */
+static int count_physical_cores(void) {
+#ifdef _WIN32
+    {
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION *buf = NULL;
+        DWORD len = 0;
+        GetLogicalProcessorInformation(NULL, &len);
+        buf = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION *)malloc(len);
+        if (buf && GetLogicalProcessorInformation(buf, &len)) {
+            int cores = 0;
+            for (DWORD i = 0; i < len / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION); i++) {
+                if (buf[i].Relationship == RelationProcessorCore) {
+                    cores++;
+                }
+            }
+            free(buf);
+            if (cores > 0) return cores;
+        } else if (buf) {
+            free(buf);
+        }
+        /* Fallback: total logical processors (works on Win7+) */
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        return (int)si.dwNumberOfProcessors;
+    }
+#else /* Linux / POSIX */
+    {
+        /* Count physical cores from /sys topology files.
+         * Each /sys/devices/system/cpu/cpuN/topology/core_id gives the core
+         * number for that logical CPU. Unique count = physical cores. */
+        {
+            int max_cpus = 256;
+            int *core_ids = (int *)calloc(max_cpus, sizeof(int));
+            if (!core_ids) return (int)sysconf(_SC_NPROCESSORS_ONLN);
+            int n_cpus = 0;
+            for (int i = 0; i < max_cpus; i++) {
+                char path[128];
+                snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/core_id", i);
+                FILE *cf = fopen(path, "r");
+                if (!cf) break;
+                int cid;
+                if (fscanf(cf, "%d", &cid) == 1) {
+                    core_ids[n_cpus++] = cid;
+                }
+                fclose(cf);
+            }
+            /* Count unique core_ids */
+            int unique = 0;
+            for (int i = 0; i < n_cpus; i++) {
+                int found = 0;
+                for (int j = 0; j < unique; j++) {
+                    if (core_ids[i] == core_ids[j]) { found = 1; break; }
+                }
+                if (!found) {
+                    core_ids[unique++] = core_ids[i];
+                }
+            }
+            free(core_ids);
+            if (unique > 0) return unique;
+        }
+        /* Fallback */
+        return (int)sysconf(_SC_NPROCESSORS_ONLN);
+    }
+#endif
+}
+
 void tensor_set_threads(int t) {
     if (t < 1) t = 1;
     if (t > MAX_THREADS) t = MAX_THREADS;
     n_threads = t;
+}
+
+/* Return the default thread count based on physical core enumeration.
+ * Uses only physical cores (no HT siblings) for generation performance. */
+int tensor_default_threads(void) {
+    int cores = count_physical_cores();
+    if (cores < 1) cores = 4; /* fallback */
+    if (cores > MAX_THREADS) cores = MAX_THREADS;
+    return cores;
 }
 
 /* Threshold: skip threading if output vector is smaller than this.

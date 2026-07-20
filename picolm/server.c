@@ -330,6 +330,10 @@ static int server_init(const char *model_path, int num_threads, int do_prefault,
         model_lock_layers(&srv.model, budget);
     }
 
+    /* Resolve thread count: if not specified, auto-detect physical cores */
+    if (num_threads <= 0) {
+        num_threads = tensor_default_threads();
+    }
     tensor_set_threads(num_threads);
     tensor_threadpool_init(num_threads);
 #ifdef _OPENMP

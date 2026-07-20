@@ -95,7 +95,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -k <float>     Top-p / nucleus sampling (default: 0.9)\n");
     fprintf(stderr, "  -s <int>       RNG seed (default: 42)\n");
     fprintf(stderr, "  -c <int>       Context length override\n");
-    fprintf(stderr, "  -j <int>       Number of threads (default: 4)\n");
+    fprintf(stderr, "  -j <int>       Number of threads (default: auto-detect physical cores)\n");
     fprintf(stderr, "  --mem <MB>      Pin this many MB of layers in RAM (mlock)\n");
     fprintf(stderr, "  --prefault      Prefault all model pages into RAM at load time\n");
     fprintf(stderr, "\nServer options:\n");
@@ -142,7 +142,7 @@ int main(int argc, char **argv) {
     float  top_p = 0.9f;
     uint64_t seed = 42;
     int    context_override = 0;
-    int    num_threads = 4;
+    int    num_threads = 0; /* 0 = auto-detect from physical cores */
     int    json_mode = 0;
     const char *cache_file = NULL;
     kv_cache_type_t kv_type_k = KV_CACHE_F16;
@@ -225,6 +225,11 @@ int main(int argc, char **argv) {
             prompt = stdin_prompt;
         }
 #endif
+    }
+
+    /* Resolve thread count: if not specified, auto-detect physical cores */
+    if (num_threads <= 0) {
+        num_threads = tensor_default_threads();
     }
 
     /* Server mode: start HTTP server (no prompt needed) */
