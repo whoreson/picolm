@@ -105,7 +105,7 @@ static int load_config_safetensors(const char *model_dir, model_config_t *cfg) {
             fseek(cf, 0, SEEK_SET);
             char *cbuf = malloc(csz + 1);
             if (cbuf) {
-                fread(cbuf, 1, csz, cf);
+                (void)fread(cbuf, 1, csz, cf);
                 cbuf[csz] = '\0';
                 /* Try rope_parameters block first (Qwen3.5), then top-level */
                 char *rp = strstr(cbuf, "\"rope_parameters\"");
@@ -308,7 +308,7 @@ static int load_tokenizer_safetensors(const char *model_dir, model_t *m) {
         fseek(cf, 0, SEEK_SET);
         char *cb = malloc(csz + 1);
         if (cb) {
-            fread(cb, 1, csz, cf);
+            (void)fread(cb, 1, csz, cf);
             cb[csz] = '\0';
             cJSON *cr = cJSON_ParseWithLength(cb, (size_t)csz);
             if (cr) {
@@ -333,7 +333,7 @@ static int load_tokenizer_safetensors(const char *model_dir, model_t *m) {
         fseek(tf, 0, SEEK_SET);
         char *tb = malloc(tsz + 1);
         if (tb) {
-            fread(tb, 1, tsz, tf);
+            (void)fread(tb, 1, tsz, tf);
             tb[tsz] = '\0';
             char *p = strstr(tb, "\"model_type\"");
             if (p) {
@@ -359,7 +359,7 @@ static int load_tokenizer_safetensors(const char *model_dir, model_t *m) {
     fseek(f, 0, SEEK_SET);
     char *vbuf = malloc(vsz + 1);
     if (!vbuf) { fclose(f); return -1; }
-    fread(vbuf, 1, vsz, f);
+    (void)fread(vbuf, 1, vsz, f);
     vbuf[vsz] = '\0';
     fclose(f);
 
