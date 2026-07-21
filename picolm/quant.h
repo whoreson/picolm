@@ -34,7 +34,8 @@ void fp16_table_init(void);
 #endif
 
 /* --- ARM NEON --- */
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+/* Guard against CUDA device compilation: nvcc cannot handle arm_neon.h */
+#if (defined(__ARM_NEON) || defined(__ARM_NEON__)) && !defined(__CUDACC__)
 #  define PICOLM_NEON 1
 #  include <arm_neon.h>
 static inline float vaddvq_f32_compat(float32x4_t v) {
@@ -48,7 +49,7 @@ static inline float vaddvq_f32_compat(float32x4_t v) {
 #endif
 
 /* --- ARM NEON detection --- */
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#if (defined(__ARM_NEON) || defined(__ARM_NEON__)) && !defined(__CUDACC__)
 #  define PICOLM_NEON 1
 /* Hardware FP16 vector conversion (ARMv8.2-A asimdhp).
  * On older NEON hardware (ARMv8.0/8.1), this path is not available and
@@ -192,7 +193,7 @@ static inline float hsum_altivec(vector float v) {
 
 /* --- ARM NEON SIMD helpers --- */
 #ifdef PICOLM_NEON
-#  include <arm_neon.h>
+/* arm_neon.h already included above */
 static inline float hsum_neon(float32x4_t v) {
     float32x2_t r = vpadd_f32(vget_low_f32(v), vget_high_f32(v));
     return vget_lane_f32(vpadd_f32(r, r), 0);
