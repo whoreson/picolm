@@ -159,14 +159,12 @@ __host__ __device__ static inline unsigned short gpu_fp32_to_fp16(float f) {
  *
  * These mirror PicoLM's block layouts in quant.h.
  * All blocks have FP16 scales (uint16_t d field).
- *
- * Struct definitions needed for sizeof() in kernel code.
  */
-#pragma pack(push, 1)
-typedef struct { uint16_t d; uint8_t qs[16]; } block_q4_0;  /* 18 bytes */
-typedef struct { uint16_t d; int8_t qs[32]; } block_q8_0;   /* 34 bytes */
-typedef struct { int8_t ql[32]; uint8_t qh[32]; int8_t scales[12]; uint16_t d; uint8_t ql2[128]; } block_q4_K; /* 144 bytes */
-#pragma pack(pop)
+
+/* Block sizes in bytes (from quant.h structs) */
+#define GPU_BLOCK_Q4_0_SIZE  18  /* uint16_t d + uint8_t qs[16] */
+#define GPU_BLOCK_Q8_0_SIZE  34  /* uint16_t d + int8_t qs[32] */
+#define GPU_BLOCK_Q4_K_SIZE 144  /* block_q4_K from quant.h */
 
 /* block_q4_0: 18 bytes = 2B scale(FP16) + 16B qs (32 values)
  * dequant(i) = (qs[i] & 0xF - 8) * d  for i in [0,32) */
@@ -218,9 +216,9 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
     int bytes_per_block;
     switch (qtype) {
         case GGUF_TYPE_F32:  bytes_per_block = 4; break;      /* 1 float */
-        case GGUF_TYPE_Q4_0: bytes_per_block = sizeof(block_q4_0); break;  /* 18 */
-        case GGUF_TYPE_Q8_0: bytes_per_block = sizeof(block_q8_0); break;  /* 34 */
-        case GGUF_TYPE_Q4_K: bytes_per_block = sizeof(block_q4_K); break;  /* 144 */
+        case GGUF_TYPE_Q4_0: bytes_per_block = GPU_BLOCK_Q4_0_SIZE; break;  /* 18 */
+        case GGUF_TYPE_Q8_0: bytes_per_block = GPU_BLOCK_Q8_0_SIZE; break;  /* 34 */
+        case GGUF_TYPE_Q4_K: bytes_per_block = GPU_BLOCK_Q4_K_SIZE; break;  /* 144 */
         default: bytes_per_block = 18; break;
     }
     int o = gpuBlockIdx_x;
