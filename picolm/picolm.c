@@ -109,6 +109,11 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --cache <file> KV cache file (saves/loads prompt state)\n");
     fprintf(stderr, "  -ctk <type>    Key cache type: f16, q8_0, q4_0 (default: f16)\n");
     fprintf(stderr, "  -ctv <type>    Val cache type: f16, q8_0, q4_0 (default: f16)\n");
+    fprintf(stderr, "\nSSM checkpoint options (Qwen3.5/3.6 only, no-op for other models):\n");
+    fprintf(stderr, "  --checkpoint-max <N>        Max checkpoints to keep (default: 0=disabled)\n");
+    fprintf(stderr, "  --checkpoint-every-nt <N>   Checkpoint every N tokens during prefill (default: 256)\n");
+    fprintf(stderr, "  --checkpoint-every-nt-gen <N> Checkpoint every N tokens during generation (default: 64)\n");
+    fprintf(stderr, "  --checkpoint-tail-offset <N> Checkpoint N tokens before end of prompt (default: 5)\n");
 }
 
 static char *read_stdin(void) {
@@ -155,6 +160,11 @@ int main(int argc, char **argv) {
     int    server_mode = 0;
     int    server_port = 8080;
     char   server_host[256] = "0.0.0.0";
+    /* SSM checkpoint options */
+    int    checkpoint_max = 0;          /* 0=disabled */
+    int    checkpoint_interval = 256;
+    int    checkpoint_interval_gen = 64;
+    int    checkpoint_tail_offset = 5;
 
     /* Parse arguments */
     for (int i = 1; i < argc; i++) {
@@ -204,6 +214,14 @@ int main(int argc, char **argv) {
             else if (strcmp(typestr, "q4_0") == 0) *tgt = KV_CACHE_Q4_0;
             else if (strcmp(typestr, "f16") == 0) *tgt = KV_CACHE_F16;
             else { fprintf(stderr, "Unknown KV cache type: %s (use f16, q8_0, q4_0)\n", typestr); return 1; }
+        } else if (strcmp(argv[i], "--checkpoint-max") == 0 && i + 1 < argc) {
+            checkpoint_max = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--checkpoint-every-nt") == 0 && i + 1 < argc) {
+            checkpoint_interval = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--checkpoint-every-nt-gen") == 0 && i + 1 < argc) {
+            checkpoint_interval_gen = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--checkpoint-tail-offset") == 0 && i + 1 < argc) {
+            checkpoint_tail_offset = atoi(argv[++i]);
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             usage(argv[0]);
@@ -257,8 +275,10 @@ int main(int argc, char **argv) {
         }
 #endif
         fp16_table_init();
-        extern int server_main(int port, const char *host, const char *model_path, int num_threads, int do_prefault, int context_override, int mem_mb);
-        return server_main(server_port, server_host, model_path, num_threads, do_prefault, context_override, mem_mb);
+        extern int server_main(int port, const char *host, const char *model_path, int num_threads, int do_prefault, int context_override, int mem_mb,
+                               int checkpoint_max, int checkpoint_interval, int checkpoint_interval_gen, int checkpoint_tail_offset);
+        return server_main(server_port, server_host, model_path, num_threads, do_prefault, context_override, mem_mb,
+                           checkpoint_max, checkpoint_interval, checkpoint_interval_gen, checkpoint_tail_offset);
     }
 
     if (!prompt) {

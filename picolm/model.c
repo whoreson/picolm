@@ -1926,6 +1926,79 @@ static inline int qwen35_vhead_gguf(int h, int n_vpk, int n_k) {
     return v * n_k + k;
 }
 
+/* ---- SSM per-head task (threaded state recurrence) ----
+ * Each of the n_v_heads has its own independent [d_state x d_state]
+ * state block.  tensor_parallel_for dispatches one head per task.
+ *
+ * Layout note: ssm_state is stored [n_v_heads][d_state][d_state]
+ * (row = contracted dim, col = output dim) with the row index being
+ * the dimension summed over in sk/output.  This means sk and output
+ * scan column-wise against row-major storage (stride d_state per
+ * element).  The expert03 insight was that flipping the loop order
+ * to row-outer makes all four steps (decay/sk/update/output)
+ * contiguous.  However, the state matrix is shared with the
+ * batched prefill path which assumes the original layout, so we
+ * keep the existing layout here and instead compute the recurrence
+ * with row-major access: d1-outer loop, d2-inner, which is still
+ * reasonably cache-friendly for d_state=128. */
+typedef struct {
+    float *state;               /* [n_v_heads][d_state][d_state] */
+    const float *q_conv, *k_conv; /* [n_k_heads][d_state], head-major */
+    const float *v_conv;         /* [n_v_heads][head_v_dim], head-major */
+    const float *gate_exp, *beta; /* [n_v_heads] */
+    float *ssm_output;           /* [d_state][n_v_heads], dim-major */
+    int d_state, head_v_dim, n_v_heads, repeat;
+} ssm_head_ctx_t;
+
+static void ssm_head_task(int h, void *ctxp) {
+    ssm_head_ctx_t *ctx = (ssm_head_ctx_t *)ctxp;
+    int d_state = ctx->d_state;
+    int n_v_heads = ctx->n_v_heads;
+    assert(d_state <= 256 && "ssm_head_task: stack scratch too large");
+    assert(ctx->head_v_dim == d_state &&
+           "ssm_head_task assumes head_v_dim == d_state");
+
+    float *st = ctx->state + (size_t)h * d_state * d_state;
+    float ge = ctx->gate_exp[h];
+
+    /* Decay: elementwise */
+    for (int i = 0; i < d_state * d_state; i++) st[i] *= ge;
+
+    int kh = h / ctx->repeat;
+    const float *qh = ctx->q_conv + (size_t)kh * d_state;
+    const float *khv = ctx->k_conv + (size_t)kh * d_state;
+    const float *vh = ctx->v_conv + (size_t)h * ctx->head_v_dim;
+    float bh = ctx->beta[h];
+
+    float sk_local[256];
+    float d_local[256];
+
+    /* sk[row] = sum_col state[row][col] * k[col] -- row-major contiguous */
+    for (int row = 0; row < d_state; row++) {
+        const float *st_row = st + (size_t)row * d_state;
+        float sum = 0.0f;
+        for (int col = 0; col < d_state; col++) sum += st_row[col] * khv[col];
+        sk_local[row] = sum;
+    }
+    for (int row = 0; row < d_state; row++)
+        d_local[row] = (vh[row] - sk_local[row]) * bh;
+
+    /* state[row][col] += k[col] * d[row] -- row-major contiguous */
+    for (int row = 0; row < d_state; row++) {
+        float dv = d_local[row];
+        float *st_row = st + (size_t)row * d_state;
+        for (int col = 0; col < d_state; col++) st_row[col] += khv[col] * dv;
+    }
+
+    /* output[row] = sum_col state[row][col] * q[col] -- row-major contiguous */
+    for (int row = 0; row < d_state; row++) {
+        const float *st_row = st + (size_t)row * d_state;
+        float sum = 0.0f;
+        for (int col = 0; col < d_state; col++) sum += st_row[col] * qh[col];
+        ctx->ssm_output[(size_t)row * n_v_heads + h] = sum;
+    }
+}
+
 /* SSM layer forward pass (autoregressive, single token) */
 static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
                         layer_weights_t *lw, int il, int pos) {
@@ -2049,6 +2122,25 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     }
 #endif
 
+    /* Alpha/beta per-head projections share the same activation vector
+     * (s->xb) across every one of the (up to dozens of) v-heads -- quantize
+     * it to Q8_0 once here and reuse the fast int8 x int8 kernels
+     * (vec_dot_q8_0_q8_0_deltas / vec_dot_q4_0_q8_0) for whichever of
+     * alpha/beta uses a Q8_0 or Q4_0 weight, instead of the mixed
+     * int8-weight x float32-activation kernel vec_dot()'s generic
+     * dispatch falls back to for those types -- same fix already applied
+     * to attn_core's K-dot product and to the FFN/projection matmuls. */
+    uint8_t xb_q8_stack[8192 / 32 * 34];
+    void *xb_q8 = (size_t)(dim / 32) * 34 <= sizeof(xb_q8_stack) ? (void *)xb_q8_stack : malloc((size_t)(dim / 32) * 34);
+    float xb_q8_d_stack[8192 / 32];
+    float *xb_q8_d = (dim / 32) <= (int)(sizeof(xb_q8_d_stack) / sizeof(float)) ? xb_q8_d_stack : (float *)malloc(sizeof(float) * (dim / 32));
+    {
+        int nb_xb = dim / 32;
+        quantize_row_q8_0(s->xb, xb_q8, dim);
+        const block_q8_0 *xqb = (const block_q8_0 *)xb_q8;
+        for (int k = 0; k < nb_xb; k++) xb_q8_d[k] = fp16_to_fp32_lookup(xqb[k].d);
+    }
+
     /* 9. Alpha: alpha = matmul(ssm_alpha, xb) + ssm_dt.bias -> [dt_rank] */
     /* GGUF stores [dim, n_v_heads] column-major: each head has dim contiguous elements */
     /* GGUF v-heads may be in tiled/interleaved order. Map sequential h -> GGUF head index. */
@@ -2060,20 +2152,14 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     {
         gguf_type_t alpha_type = lw->type_ssm_alpha;
         size_t row_bytes = gguf_type_row_size(alpha_type, dim);
-        if (alpha_type == GGUF_TYPE_F32) {
-            for (int h = 0; h < n_v_heads; h++) {
-                int gh = do_remap ? qwen35_vhead_gguf(h, n_vpk, n_k) : h;
-                float vd = vec_dot((const uint8_t *)lw->ssm_alpha + (size_t)gh * row_bytes,
-                                   s->xb, dim, alpha_type);
-                alpha_out[h] = vd + s->ssm_dt_w[il][h];
-            }
-        } else {
-            for (int h = 0; h < n_v_heads; h++) {
-                int gh = do_remap ? qwen35_vhead_gguf(h, n_vpk, n_k) : h;
-                const uint8_t *head_data = (const uint8_t *)lw->ssm_alpha + (size_t)gh * row_bytes;
-                float sum = vec_dot(head_data, s->xb, dim, alpha_type);
-                alpha_out[h] = sum + s->ssm_dt_w[il][h];
-            }
+        for (int h = 0; h < n_v_heads; h++) {
+            int gh = do_remap ? qwen35_vhead_gguf(h, n_vpk, n_k) : h;
+            const uint8_t *head_data = (const uint8_t *)lw->ssm_alpha + (size_t)gh * row_bytes;
+            float sum;
+            if (alpha_type == GGUF_TYPE_Q8_0) sum = vec_dot_q8_0_q8_0_deltas(xb_q8, xb_q8_d, head_data, dim);
+            else if (alpha_type == GGUF_TYPE_Q4_0) sum = vec_dot_q4_0_q8_0(head_data, xb_q8, dim);
+            else sum = vec_dot(head_data, s->xb, dim, alpha_type);
+            alpha_out[h] = sum + s->ssm_dt_w[il][h];
         }
     }
 #ifdef DEBUG_SSM
@@ -2097,25 +2183,18 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     {
         gguf_type_t beta_type = lw->type_ssm_beta;
         size_t row_bytes = gguf_type_row_size(beta_type, dim);
-        if (beta_type == GGUF_TYPE_F32) {
-            for (int h = 0; h < n_v_heads; h++) {
-                int gh = do_remap ? qwen35_vhead_gguf(h, n_vpk, n_k) : h;
-                beta[h] = vec_dot((const uint8_t *)lw->ssm_beta + (size_t)gh * row_bytes,
-                                  s->xb, dim, beta_type);
-                beta[h] = 1.0f / (1.0f + expf(-beta[h]));
-            }
-        } else {
-            float bvals[dim];
-            for (int h = 0; h < n_v_heads; h++) {
-                int gh = do_remap ? qwen35_vhead_gguf(h, n_vpk, n_k) : h;
-                dequantize_row((const uint8_t *)lw->ssm_beta + (size_t)gh * row_bytes,
-                               bvals, dim, beta_type);
-                float sum = 0.0f;
-                for (int d = 0; d < dim; d++) sum += bvals[d] * s->xb[d];
-                beta[h] = 1.0f / (1.0f + expf(-sum));
-            }
+        for (int h = 0; h < n_v_heads; h++) {
+            int gh = do_remap ? qwen35_vhead_gguf(h, n_vpk, n_k) : h;
+            const uint8_t *head_data = (const uint8_t *)lw->ssm_beta + (size_t)gh * row_bytes;
+            float sum;
+            if (beta_type == GGUF_TYPE_Q8_0) sum = vec_dot_q8_0_q8_0_deltas(xb_q8, xb_q8_d, head_data, dim);
+            else if (beta_type == GGUF_TYPE_Q4_0) sum = vec_dot_q4_0_q8_0(head_data, xb_q8, dim);
+            else sum = vec_dot(head_data, s->xb, dim, beta_type);
+            beta[h] = 1.0f / (1.0f + expf(-sum));
         }
     }
+    if (xb_q8 != (void *)xb_q8_stack) free(xb_q8);
+    if (xb_q8_d != xb_q8_d_stack) free(xb_q8_d);
 #ifdef DEBUG_SSM
     if (il == 0 && pos == 0) dbg_vec("beta[:8]", beta, n_v_heads, 8);
 #endif
@@ -2131,81 +2210,24 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     if (il == 0 && pos == 0) dbg_vec("gate_exp[:8]", gate_exp, n_v_heads, 8);
 #endif
 
-    /* 12. State: [d_state, d_state, n_v_heads] = [128, 128, 32] */
+    /* 12-17. State recurrence, threaded across n_v_heads (each head's
+     * [d_state x d_state] state block is fully independent -- no
+     * cross-head data dependency within a single token, only token-to-
+     * token via `state` persisting across calls). Previously this was
+     * four separate fully-serial for-h loops (decay/sk/update/output)
+     * with zero threading on what is the dominant per-token FLOP cost
+     * for SSM layers (O(n_v_heads * d_state^2) each for sk/update/output). */
     float *state = s->ssm_state[il];
-
-    /* Decay state: state[h] *= gate_exp[h] for all elements */
-    for (int h = 0; h < n_v_heads; h++) {
-        float ge = gate_exp[h];
-        float *st = state + h * d_state * d_state;
-        for (int i = 0; i < d_state * d_state; i++) st[i] *= ge;
-    }
-
-    /* 13. Repeat q/k to n_v_heads */
     int repeat = n_v_heads / n_k_heads;
-    /* q_rep and k_rep: [d_state, n_v_heads] */
-    float *q_rep = gate_exp + n_v_heads; /* [d_state * n_v_heads] */
-    float *k_rep = q_rep + d_state * n_v_heads;
-    for (int h = 0; h < n_v_heads; h++) {
-        int kh = h / repeat;
-        memcpy(q_rep + h * d_state, q_conv + kh * d_state, d_state * sizeof(float));
-        memcpy(k_rep + h * d_state, k_conv + kh * d_state, d_state * sizeof(float));
-    }
+    float *ssm_output = gate_exp + n_v_heads; /* [d_state * n_v_heads], dim-major */
 
-    /* 14. sk[d,h] = sum_{d1}(state[h][d1][d] * k[h][d1])
-     * llama.cpp: sk = sum_rows(s * k), where s[d1][d2][h] * k[d1][h]
-     * k is indexed by d1 (the summed dimension), not d2 */
-    float *sk = k_rep + d_state * n_v_heads; /* [d_state * n_v_heads] */
-    for (int h = 0; h < n_v_heads; h++) {
-        float *st_h = state + h * d_state * d_state;
-        float *kr_h = k_rep + h * d_state;
-        for (int d2 = 0; d2 < d_state; d2++) {
-            float sum = 0.0f;
-            for (int d1 = 0; d1 < d_state; d1++) {
-                sum += st_h[d1 * d_state + d2] * kr_h[d1];
-            }
-            sk[d2 * n_v_heads + h] = sum;
-        }
-    }
-
-    /* 15. d = (v_conv - sk) * beta -> [d_state, n_v_heads] */
-    /* v_conv is [head_v_dim, n_v_heads] = [d_state, n_v_heads] */
-    float *d_vals = sk + d_state * n_v_heads; /* reuse sk space */
-    for (int d = 0; d < d_state; d++) {
-        for (int h = 0; h < n_v_heads; h++) {
-            d_vals[d * n_v_heads + h] = (v_conv[h * head_v_dim + d] - sk[d * n_v_heads + h]) * beta[h];
-        }
-    }
-
-    /* 16. state[h][d1][d2] += k[h][d1] * d[d2][h]
-     * llama.cpp: kd[d1][d2][h] = k[d1][h] * d[d2][h], s += kd */
-    for (int h = 0; h < n_v_heads; h++) {
-        float *st_h = state + h * d_state * d_state;
-        float *kr_h = k_rep + h * d_state;
-        for (int d1 = 0; d1 < d_state; d1++) {
-            float kfactor = kr_h[d1];
-            float *st_row = st_h + d1 * d_state;
-            for (int d2 = 0; d2 < d_state; d2++) {
-                st_row[d2] += kfactor * d_vals[d2 * n_v_heads + h];
-            }
-        }
-    }
-
-    /* 17. output[d,h] = sum_{d1}(state[h][d1][d] * q[h][d1])
-     * llama.cpp: o = sum_rows(s * q), where s[d1][d2][h] * q[d1][h]
-     * q is indexed by d1 (the summed dimension), not d2 */
-    float *ssm_output = d_vals + d_state * n_v_heads; /* [d_state * n_v_heads] */
-    for (int h = 0; h < n_v_heads; h++) {
-        float *st_h = state + h * d_state * d_state;
-        float *qr_h = q_rep + h * d_state;
-        for (int d2 = 0; d2 < d_state; d2++) {
-            float sum = 0.0f;
-            for (int d1 = 0; d1 < d_state; d1++) {
-                sum += st_h[d1 * d_state + d2] * qr_h[d1];
-            }
-            ssm_output[d2 * n_v_heads + h] = sum;
-        }
-    }
+    ssm_head_ctx_t ssm_ctx;
+    ssm_ctx.state = state; ssm_ctx.d_state = d_state; ssm_ctx.head_v_dim = head_v_dim;
+    ssm_ctx.n_v_heads = n_v_heads; ssm_ctx.repeat = repeat;
+    ssm_ctx.q_conv = q_conv; ssm_ctx.k_conv = k_conv; ssm_ctx.v_conv = v_conv;
+    ssm_ctx.gate_exp = gate_exp; ssm_ctx.beta = beta;
+    ssm_ctx.ssm_output = ssm_output; /* shared, dim-major [d*n_v_heads+h] */
+    tensor_parallel_for(n_v_heads, ssm_head_task, &ssm_ctx);
 #ifdef DEBUG_SSM
     if (il == 0 && pos == 0) dbg_vec("ssm_out_pre[:8]", ssm_output, head_v_dim, 8);
 #endif
@@ -3518,4 +3540,109 @@ int kvcache_load(model_t *m, const char *path) {
     fclose(f);
     fprintf(stderr, "KV cache loaded: %d positions from %s\n", n_pos, path);
     return n_pos;
+}
+
+/* ---- SSM State Checkpointing (Qwen3.5/3.6) ---- */
+
+/* Compute total bytes needed to snapshot all SSM layer states.
+ * Each SSM layer has:
+ *   ssm_conv_state[l]: (d_conv-1) * conv_dim floats
+ *   ssm_state[l]:      d_state * d_inner floats
+ * Returns 0 if model has no SSM layers. */
+size_t model_ssm_snapshot_size(const model_t *m) {
+    const model_config_t *c = &m->config;
+    if (!c->has_ssm) return 0;
+
+    int conv_dim = 2 * c->ssm_d_state * c->ssm_n_group + c->ssm_d_inner;
+    size_t total = 0;
+    for (int l = 0; l < c->n_layers; l++) {
+        if (m->weights.layers[l].is_attn_layer) continue;
+        total += (size_t)(c->ssm_d_conv - 1) * conv_dim * sizeof(float);
+        total += (size_t)c->ssm_d_state * c->ssm_d_inner * sizeof(float);
+    }
+    return total;
+}
+
+/* Save current SSM state into pre-allocated buffer.
+ * Layout: [conv_state_l0][conv_state_l1]...[state_l0][state_l1]...
+ * Returns bytes written (= model_ssm_snapshot_size on success). */
+size_t model_ssm_state_save(const model_t *m, uint8_t *buf, size_t buf_size) {
+    const model_config_t *c = &m->config;
+    if (!c->has_ssm) return 0;
+
+    size_t needed = model_ssm_snapshot_size(m);
+    if (buf_size < needed) {
+        fprintf(stderr, "SSM state save: buffer too small (%zu < %zu)\n", buf_size, needed);
+        return 0;
+    }
+
+    int conv_dim = 2 * c->ssm_d_state * c->ssm_n_group + c->ssm_d_inner;
+    size_t off = 0;
+    /* First pass: save all conv_states */
+    for (int l = 0; l < c->n_layers; l++) {
+        if (m->weights.layers[l].is_attn_layer) continue;
+        if (!m->state.ssm_conv_state[l]) continue;
+        size_t sz = (size_t)(c->ssm_d_conv - 1) * conv_dim * sizeof(float);
+        memcpy(buf + off, m->state.ssm_conv_state[l], sz);
+        off += sz;
+    }
+    /* Second pass: save all ssm_states */
+    for (int l = 0; l < c->n_layers; l++) {
+        if (m->weights.layers[l].is_attn_layer) continue;
+        if (!m->state.ssm_state[l]) continue;
+        size_t sz = (size_t)c->ssm_d_state * c->ssm_d_inner * sizeof(float);
+        memcpy(buf + off, m->state.ssm_state[l], sz);
+        off += sz;
+    }
+    return off;
+}
+
+/* Restore SSM state from buffer.
+ * Returns bytes read (= model_ssm_snapshot_size on success). */
+size_t model_ssm_state_restore(model_t *m, const uint8_t *buf, size_t buf_size) {
+    const model_config_t *c = &m->config;
+    if (!c->has_ssm) return 0;
+
+    size_t needed = model_ssm_snapshot_size(m);
+    if (buf_size < needed) {
+        fprintf(stderr, "SSM state restore: buffer too small (%zu < %zu)\n", buf_size, needed);
+        return 0;
+    }
+
+    int conv_dim = 2 * c->ssm_d_state * c->ssm_n_group + c->ssm_d_inner;
+    size_t off = 0;
+    /* First pass: restore all conv_states */
+    for (int l = 0; l < c->n_layers; l++) {
+        if (m->weights.layers[l].is_attn_layer) continue;
+        if (!m->state.ssm_conv_state[l]) continue;
+        size_t sz = (size_t)(c->ssm_d_conv - 1) * conv_dim * sizeof(float);
+        memcpy(m->state.ssm_conv_state[l], buf + off, sz);
+        off += sz;
+    }
+    /* Second pass: restore all ssm_states */
+    for (int l = 0; l < c->n_layers; l++) {
+        if (m->weights.layers[l].is_attn_layer) continue;
+        if (!m->state.ssm_state[l]) continue;
+        size_t sz = (size_t)c->ssm_d_state * c->ssm_d_inner * sizeof(float);
+        memcpy(m->state.ssm_state[l], buf + off, sz);
+        off += sz;
+    }
+    return off;
+}
+
+/* Reset all SSM state to zero (fresh start). */
+void model_ssm_state_reset(model_t *m) {
+    const model_config_t *c = &m->config;
+    if (!c->has_ssm) return;
+
+    int conv_dim = 2 * c->ssm_d_state * c->ssm_n_group + c->ssm_d_inner;
+    for (int l = 0; l < c->n_layers; l++) {
+        if (m->weights.layers[l].is_attn_layer) continue;
+        if (m->state.ssm_conv_state[l])
+            memset(m->state.ssm_conv_state[l], 0,
+                   (size_t)(c->ssm_d_conv - 1) * conv_dim * sizeof(float));
+        if (m->state.ssm_state[l])
+            memset(m->state.ssm_state[l], 0,
+                   (size_t)c->ssm_d_state * c->ssm_d_inner * sizeof(float));
+    }
 }
