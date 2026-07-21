@@ -383,24 +383,35 @@ int qwen_tokenize_encode(qwen_enc_t *enc, const char *text, int *out, int cap) {
     return m2;
 }
 
-/* Decode one token ID to UTF-8 text. Returns bytes written. */
-int qwen_tokenize_decode(const qwen_enc_t *enc, int id, char *buf, int cap) {
+/* Decode one token ID to UTF-8 text. Returns bytes written.
+ * By default, BOS and EOS are hidden (return 0).
+ * Other special tokens (tool_call tags, etc.) are printed as their raw vocab bytes.
+ * If add_special is 1, BOS/EOS are also printed. */
+int qwen_tokenize_decode2(const qwen_enc_t *enc, int id, char *buf, int cap, int add_special) {
     if (id < 0 || id >= enc->vocab_size) return 0;
-    /* Special tokens (control/user_defined) produce no visible output */
+
+    /* Check if this is a special token */
+    int is_special = 0;
     for (int si = 0; si < enc->n_spec; si++) {
-        if (enc->spec[si] == id) { buf[0] = '\0'; return 0; }
+        if (enc->spec[si] == id) { is_special = 1; break; }
     }
+
     const char *s = enc->vocab[id];
     int sl = enc->vocab_len[id];
-    int w = 0;
 
+    /* For BOS/EOS: hide unless add_special is set */
+    if (is_special && id == enc->bos_id && !add_special) { buf[0] = '\0'; return 0; }
+    if (is_special && id == enc->eos_id && !add_special) { buf[0] = '\0'; return 0; }
+
+    /* For all other special tokens (tool_call, etc.), emit the raw vocab bytes */
+    int w = 0;
     for (int i = 0; i < sl && w < cap - 4; ) {
         int cp;
         i += utf8_next(s + i, sl - i, &cp);
         if (cp < 512 && g_rev[cp] >= 0) {
             buf[w++] = (char)g_rev[cp];
         } else {
-            /* Special token: emit raw UTF-8 */
+            /* Control bytes and special codepoints: emit raw UTF-8 */
             if (cp < 0x80) buf[w++] = (char)cp;
             else if (cp < 0x800) {
                 buf[w++] = (char)(0xC0 | (cp >> 6));
@@ -414,5 +425,10 @@ int qwen_tokenize_decode(const qwen_enc_t *enc, int id, char *buf, int cap) {
     }
     buf[w] = '\0';
     return w;
+}
+
+/* Compatibility wrapper: add_special=0 */
+int qwen_tokenize_decode(const qwen_enc_t *enc, int id, char *buf, int cap) {
+    return qwen_tokenize_decode2(enc, id, buf, cap, 0);
 }
 
