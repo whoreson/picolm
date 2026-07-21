@@ -352,11 +352,22 @@ picolm_silu_mul(float *gate, const float *up, size_t n) {
 #endif
 #endif
 
-/* CUDA WMMA: sm_70+ (Volta and newer) */
-#ifdef __CUDA_ARCH__
-#if __CUDA_ARCH__ >= 700
+/* CUDA WMMA: sm_70+ (Volta and newer)
+ * Guard must exclude host compilation phase to avoid CUDAFE stub generation
+ * failures (wmma types are device-only). Host gets a forward declaration. */
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
 #define PICOLM_GPU_WMMA_AVAILABLE 1
 #endif
+
+/* Forward declarations for host compilation (extern "C" stubs only, no body) */
+#ifndef PICOLM_GPU_WMMA_AVAILABLE
+extern "C" {
+__global__ void picolm_w4a16_matmul(float *y, const float *x, const void *weights,
+                                     int M, int K, int N, int block_size);
+__global__ void picolm_w4a16_gate_up(float *gate, float *up, const float *x,
+                                      const void *gate_weights, const void *up_weights,
+                                      int M, int K, int N, int block_size);
+}
 #endif
 
 #ifdef PICOLM_GPU_WMMA_AVAILABLE
