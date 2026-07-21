@@ -370,8 +370,9 @@ __device__ static inline half dequant_q4_0_elem_fp16(const void *blk, int j) {
     half val; val.__x = gpu_fp32_to_fp16((float)(((b[2 + (j >> 1)] >> ((j & 1) * 4)) & 0xF) - 8));
     return d * val;
 #else
-    half d; d.__x = d_raw;
-    half val; val.__x = __float2half((float)(((b[2 + (j >> 1)] >> ((j & 1) * 4)) & 0xF) - 8));
+    /* CUDA: __half::__x is private since CUDA 12+. Use proper constructors. */
+    half d = __ushort_as_half(d_raw);
+    half val = __float2half((float)(((b[2 + (j >> 1)] >> ((j & 1) * 4)) & 0xF) - 8));
     return d * val;
 #endif
 }
