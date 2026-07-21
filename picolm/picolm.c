@@ -444,10 +444,18 @@ int main(int argc, char **argv) {
 
     /* Batch prefill: process all prompt tokens at once */
     float *logits = NULL;
-    if (n_prompt > 0) {
-        /* Batch prefill: all models (attention + SSM) use batched prefill */
+    if (n_prompt > 0 && !model.config.has_ssm) {
+        /* Attention-only models: full batched prefill */
         logits = model_forward_prefill(&model, prompt_tokens, n_prompt, start_pos);
         pos = start_pos + n_prompt - 1;
+    } else if (n_prompt > 0) {
+        /* SSM models (Qwen3.5/3.6): per-token prefill (SSM is stateful) */
+        int token = start_pos > 0 ? prompt_tokens[start_pos - 1] : prompt_tokens[0];
+        for (int p = start_pos; p < start_pos + n_prompt; p++) {
+            logits = model_forward(&model, token, p);
+            token = prompt_tokens[p + 1 - start_pos];
+        }
+        pos = start_pos + n_prompt;
     } else {
         /* No prompt: just generate from BOS */
         logits = model_forward(&model, tokenizer.bos_id, pos);
