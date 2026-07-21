@@ -308,8 +308,21 @@ static int checkpoint_exists(int n_tokens) {
     return 0;
 }
 
+/* Print current checkpoint list to stderr */
+static void checkpoint_print_list(const char *label) {
+    fprintf(stderr, "  [ssm checkpoint] %s checkpoints: ", label);
+    int idx = 0;
+    for (picolm_checkpoint_t *cp = srv.checkpoints; cp; cp = cp->next) {
+        if (idx > 0) fprintf(stderr, ", ");
+        fprintf(stderr, "%d", cp->n_tokens);
+        idx++;
+    }
+    fprintf(stderr, "\n");
+}
+
 /* Variance-based eviction: remove the checkpoint whose removal produces
- * the lowest variance of gaps between remaining checkpoints. */
+ * the lowest variance of gaps between remaining checkpoints.
+ * Prints detailed information about each candidate and the removal. */
 static void checkpoint_evict_one(void) {
     int n = checkpoint_count();
     if (n <= 2) return; /* Never remove if 2 or fewer */
@@ -320,6 +333,16 @@ static void checkpoint_evict_one(void) {
     for (picolm_checkpoint_t *cp = srv.checkpoints; cp; cp = cp->next) {
         tokens[i++] = cp->n_tokens;
     }
+
+    /* Log current state */
+    fprintf(stderr, "  [ssm checkpoint] at capacity (%d/%d), evaluating eviction candidates:\n",
+            n, srv.max_checkpoints);
+    fprintf(stderr, "  [ssm checkpoint]   positions: ");
+    for (int k = 0; k < n; k++) {
+        if (k > 0) fprintf(stderr, ", ");
+        fprintf(stderr, "%d", tokens[k]);
+    }
+    fprintf(stderr, "\n");
 
     /* Never remove first (index 0) or last (index n-1) */
     double best_var = 1e30;
@@ -342,11 +365,19 @@ static void checkpoint_evict_one(void) {
         }
         double mean = (double)(tokens[n - 1] - tokens[0]) / gap_count;
         double var = sum_sq / gap_count - mean * mean;
+        fprintf(stderr, "  [ssm checkpoint]   candidate idx=%d (n_tokens=%d): variance=%.1f\n",
+                remove, tokens[remove], var);
         if (var < best_var) {
             best_var = var;
             best_idx = remove;
         }
     }
+
+    if (best_idx < 0) return;
+
+    fprintf(stderr, "  [ssm checkpoint] erasing checkpoint at index %d (n_tokens=%d), "
+            "variance after removal = %.1f\n",
+            best_idx, tokens[best_idx], best_var);
 
     /* Remove the checkpoint at best_idx */
     picolm_checkpoint_t *prev = NULL;
@@ -366,9 +397,6 @@ static void checkpoint_evict_one(void) {
  * Auto-evicts old checkpoints if max_checkpoints exceeded. */
 static void checkpoint_save(int n_tokens) {
     if (srv.max_checkpoints <= 0) return;
-    if (!srv.checkpoints || srv.checkpoints->data) {
-        /* Ensure we have snapshot capability */
-    }
     if (srv.checkpoint_snapshot_size == 0) return;
     if (checkpoint_exists(n_tokens)) return; /* skip duplicates */
 
@@ -402,6 +430,13 @@ static void checkpoint_save(int n_tokens) {
     if (prev) prev->next = cp;
     else srv.checkpoints = cp;
     cp->next = cur;
+
+    /* Print creation info */
+    int n_now = checkpoint_count();
+    float size_mb = (float)srv.checkpoint_snapshot_size / (1024.0 * 1024.0);
+    fprintf(stderr, "  [ssm checkpoint] created checkpoint %d of %d (n_tokens=%d, size=%.3f MiB)\n",
+            n_now, srv.max_checkpoints, n_tokens, size_mb);
+    checkpoint_print_list("after creation");
 }
 
 /* Restore checkpoint at or before the given n_tokens.
@@ -431,8 +466,24 @@ static int checkpoint_restore(int n_tokens, int *actual_n_tokens) {
     return 0;
 }
 
+/* Print checkpoint restore info (called from handle functions with context) */
+static void checkpoint_restore_log(int target, int actual, int kv_match, int success) {
+    float size_mb = (float)srv.checkpoint_snapshot_size / (1024.0 * 1024.0);
+    if (success) {
+        fprintf(stderr, "  [ssm checkpoint] restored checkpoint (n_tokens=%d, size=%.3f MiB), kv_match=%d, reprocess from %d\n",
+                actual, size_mb, kv_match, actual);
+    } else {
+        fprintf(stderr, "  [ssm checkpoint] no checkpoint available for target=%d, resetting SSM state\n", target);
+    }
+}
+
 /* Clear all checkpoints and free their memory */
 static void checkpoint_clear(void) {
+    int n = checkpoint_count();
+    if (n == 0) return;
+    fprintf(stderr, "  [ssm checkpoint] clearing %d checkpoints\n", n);
+    checkpoint_print_list("before clear");
+
     picolm_checkpoint_t *cp = srv.checkpoints;
     while (cp) {
         picolm_checkpoint_t *next = cp->next;
@@ -901,13 +952,12 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             if (actual < srv.last_prompt_len) {
                 srv.last_prompt_len = actual;
             }
-            fprintf(stderr, "[server] %.1fms: SSM checkpoint restored at pos %d (KV match was %d)\n",
-                    get_time_ms() - t0, actual, cache_start);
+            checkpoint_restore_log(cache_start, actual, cache_start, 1);
         } else {
             /* No suitable checkpoint found. Must reprocess everything from scratch. */
             start_pos = 0;
             model_ssm_state_reset(model);
-            fprintf(stderr, "[server] %.1fms: No SSM checkpoint available, resetting state\n", get_time_ms() - t0);
+            checkpoint_restore_log(cache_start, 0, cache_start, 0);
         }
     }
 
@@ -1504,12 +1554,11 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             if (actual < srv.last_prompt_len) {
                 srv.last_prompt_len = actual;
             }
-            fprintf(stderr, "[server] %.1fms: SSM checkpoint restored at pos %d (KV match was %d)\n",
-                    get_time_ms() - t0, actual, cache_start);
+            checkpoint_restore_log(cache_start, actual, cache_start, 1);
         } else {
             start_pos = 0;
             model_ssm_state_reset(model);
-            fprintf(stderr, "[server] %.1fms: No SSM checkpoint available, resetting state\n", get_time_ms() - t0);
+            checkpoint_restore_log(cache_start, 0, cache_start, 0);
         }
     }
 
