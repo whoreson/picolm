@@ -317,6 +317,8 @@ static int checkpoint_exists(int n_tokens) {
 
 /* Print current checkpoint list to stderr */
 static void checkpoint_print_list(const char *label) {
+    /* Commented out: too verbose for production use */
+    /*
     fprintf(stderr, "  [ssm checkpoint] %s checkpoints: ", label);
     int idx = 0;
     for (picolm_checkpoint_t *cp = srv.checkpoints; cp; cp = cp->next) {
@@ -325,6 +327,8 @@ static void checkpoint_print_list(const char *label) {
         idx++;
     }
     fprintf(stderr, "\n");
+    */
+    (void)label;
 }
 
 /* Variance-based eviction: remove the checkpoint whose removal produces
@@ -341,7 +345,8 @@ static void checkpoint_evict_one(void) {
         tokens[i++] = cp->n_tokens;
     }
 
-    /* Log current state */
+    /* Log current state - commented out: too verbose */
+    /*
     fprintf(stderr, "  [ssm checkpoint] at capacity (%d/%d), evaluating eviction candidates:\n",
             n, srv.max_checkpoints);
     fprintf(stderr, "  [ssm checkpoint]   positions: ");
@@ -350,6 +355,7 @@ static void checkpoint_evict_one(void) {
         fprintf(stderr, "%d", tokens[k]);
     }
     fprintf(stderr, "\n");
+    */
 
     /* Never remove first (index 0) or last (index n-1) */
     double best_var = 1e30;
@@ -372,8 +378,11 @@ static void checkpoint_evict_one(void) {
         }
         double mean = (double)(tokens[n - 1] - tokens[0]) / gap_count;
         double var = sum_sq / gap_count - mean * mean;
+        /* Commented out: candidate-level detail too verbose */
+        /*
         fprintf(stderr, "  [ssm checkpoint]   candidate idx=%d (n_tokens=%d): variance=%.1f\n",
                 remove, tokens[remove], var);
+        */
         if (var < best_var) {
             best_var = var;
             best_idx = remove;
@@ -412,6 +421,8 @@ static void checkpoint_save(int n_tokens) {
         checkpoint_evict_one();
     }
 
+    double t_create_start = get_time_ms();
+
     /* Allocate new checkpoint */
     picolm_checkpoint_t *cp = (picolm_checkpoint_t *)calloc(1, sizeof(*cp));
     if (!cp) return;
@@ -438,11 +449,12 @@ static void checkpoint_save(int n_tokens) {
     else srv.checkpoints = cp;
     cp->next = cur;
 
-    /* Print creation info */
+    /* Print creation info with timing */
     int n_now = checkpoint_count();
     float size_mb = (float)srv.checkpoint_snapshot_size / (1024.0 * 1024.0);
-    fprintf(stderr, "  [ssm checkpoint] created checkpoint %d of %d (n_tokens=%d, size=%.3f MiB)\n",
-            n_now, srv.max_checkpoints, n_tokens, size_mb);
+    double creation_ms = get_time_ms() - t_create_start;
+    fprintf(stderr, "  [ssm checkpoint] created checkpoint %d of %d (n_tokens=%d, size=%.3f MiB, %.1f ms)\n",
+            n_now, srv.max_checkpoints, n_tokens, size_mb, creation_ms);
     checkpoint_print_list("after creation");
 }
 
@@ -488,8 +500,11 @@ static void checkpoint_restore_log(int target, int actual, int kv_match, int suc
 static void checkpoint_clear(void) {
     int n = checkpoint_count();
     if (n == 0) return;
+    /* Commented out: too verbose */
+    /*
     fprintf(stderr, "  [ssm checkpoint] clearing %d checkpoints\n", n);
     checkpoint_print_list("before clear");
+    */
 
     picolm_checkpoint_t *cp = srv.checkpoints;
     while (cp) {
@@ -634,6 +649,26 @@ static void server_free(void) {
     free(srv.last_prompt_tokens);
     srv.last_prompt_tokens = NULL;
     srv.max_last_prompt = 0;
+}
+
+/* ---- Debug: print token ID + text (env var gated) ---- */
+
+static void debug_print_token(int token_id) {
+    const char *dbg = getenv("PICOLM_DBG_TOKEN");
+    if (!dbg || dbg[0] == '0') return;
+
+    static char dbg_buf[256];
+    const char *text;
+    if (srv.use_qwen_tok) {
+        /* Show all special tokens in debug mode */
+        qwen_tokenize_decode2(&srv.qwen_enc, token_id, dbg_buf, sizeof(dbg_buf), 1);
+        text = dbg_buf[0] ? dbg_buf : "(control)";
+    } else {
+        /* For non-Qwen, use tokenizer_decode with no prev token */
+        text = tokenizer_decode(&srv.tokenizer, -1, token_id);
+        if (!text || text[0] == '\0') text = "(empty)";
+    }
+    fprintf(stderr, "[dbg-token] id=%d text=%s\n", token_id, text);
 }
 
 /* ---- Endpoints ---- */
@@ -1168,6 +1203,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             if (!client_alive(sock)) break;
 
             int next = sampler_sample(&sampler, logits, model->config.vocab_size);
+            debug_print_token(next);
             static char qwen_buf[64];
             const char *piece;
             if (srv.use_qwen_tok) {
@@ -1378,6 +1414,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
                 }
 
                 int next = sampler_sample(&sampler, logits_ns, model->config.vocab_size);
+                debug_print_token(next);
                 if (gen_count < max_pt - n_prompt) ptokens[n_prompt + gen_count] = next;
                 static char qwen_buf2[64];
                 const char *piece;
@@ -1813,6 +1850,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             }
 
             int next = sampler_sample(&sampler, logits, model->config.vocab_size);
+            debug_print_token(next);
             if (gen_tok_count < n_predict + 1) gen_tok_buf[gen_tok_count++] = next;
             static char qwen_buf3[64];
             const char *piece;
@@ -1848,7 +1886,12 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
 
             /* Build streaming response: {content, tokens, stop} */
             cJSON *resp = cJSON_CreateObject();
-            cJSON_AddStringToObject(resp, "content", piece);
+            /* If stopped by stop word, suppress the piece that triggered it */
+            if (stopped) {
+                cJSON_AddStringToObject(resp, "content", "");
+            } else {
+                cJSON_AddStringToObject(resp, "content", piece);
+            }
 
             if (return_tokens || do_stream) {
                 cJSON *tok_arr = cJSON_CreateArray();
@@ -2024,6 +2067,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             }
 
             int next = sampler_sample(&sampler, logits_ns2, model->config.vocab_size);
+            debug_print_token(next);
             static char qwen_buf4[64];
             const char *piece;
             if (srv.use_qwen_tok) {

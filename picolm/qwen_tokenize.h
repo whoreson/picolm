@@ -29,7 +29,11 @@ void qwen_tokenize_free(qwen_enc_t *enc);
 /* Encode text to token IDs. Returns number of tokens produced. */
 int qwen_tokenize_encode(qwen_enc_t *enc, const char *text, int *out, int cap);
 
-/* Decode one token ID to UTF-8 text. Returns bytes written. */
+/* Decode one token ID to UTF-8 text. Returns bytes written.
+ * add_special=0: hide BOS/EOS (default behavior).
+ * add_special=1: print BOS/EOS too.
+ * All other special tokens (tool_call tags, etc.) are always printed. */
+int qwen_tokenize_decode2(const qwen_enc_t *enc, int id, char *buf, int cap, int add_special);
 int qwen_tokenize_decode(const qwen_enc_t *enc, int id, char *buf, int cap);
 
 #endif /* QWEN_TOKENIZE_H */
