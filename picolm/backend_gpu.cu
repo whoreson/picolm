@@ -370,8 +370,9 @@ __device__ static inline half dequant_q4_0_elem_fp16(const void *blk, int j) {
     half val; val.__x = gpu_fp32_to_fp16((float)(((b[2 + (j >> 1)] >> ((j & 1) * 4)) & 0xF) - 8));
     return d * val;
 #else
-    half d = __short2half_raw(d_raw);
-    return d * __float2half((float)(((b[2 + (j >> 1)] >> ((j & 1) * 4)) & 0xF) - 8));
+    half d; d.__x = d_raw;
+    half val; val.__x = __float2half((float)(((b[2 + (j >> 1)] >> ((j & 1) * 4)) & 0xF) - 8));
+    return d * val;
 #endif
 }
 
