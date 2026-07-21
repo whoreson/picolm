@@ -1,6 +1,8 @@
-/* backend_gpu.hip
+/* backend_gpu.cu
  *
- * CUDA/HIP backend for PicoLM. Compiled with hipcc (ROCm) or nvcc (CUDA).
+ * CUDA/HIP backend for PicoLM. Single source compiled with hipcc (ROCm) or
+ * nvcc (CUDA). The .cu extension is standard for both - hipcc accepts .cu
+ * natively, and nvcc of course requires it.
  *
  * Quantization format: uses PicoLM's GGUF block layouts (block_q4_0, block_q8_0,
  * block_q4_K) rather than Colibri's raw-packed nibbles. Each block has its own
@@ -13,9 +15,9 @@
  * for int4 weights + FP16 activations. Only enabled on sm_70+/gfx9+.
  *
  * Platform detection:
- *   __HIP_PLATFORM_AMD__  -> ROCm/HIP
- *   __CUDA_ARCH__         -> CUDA device code
- *   __HIP_DEVICE_COMPILE__ -> HIP device code
+ *   __HIP__             -> HIP device code (both AMD and NVIDIA HIPC)
+ *   __HIP_PLATFORM_AMD__ -> ROCm/AMD specifically
+ *   __CUDA_ARCH__        -> CUDA device code
  */
 
 #include "backend_gpu.h"
@@ -117,6 +119,11 @@ typedef hipEvent_t gpuEvent_t;
 #define gpuBlockDim_x blockDim.x
 #define gpuGridDim_x gridDim.x
 #define gpuGridDim_y gridDim.y
+#define gpuDeviceSynchronize cudaDeviceSynchronize
+#define gpuShflSync __shfl_sync
+#define gpuShflUpSync __shfl_up_sync
+#define gpuLaunchBlockPerMultiprocessor cudaDevAttrMaxThreadsPerMultiProcessor
+#define gpuDevice cudaDevice
 #endif
 
 /* ---- Device-side FP16 helpers ---- */
@@ -140,10 +147,10 @@ __host__ __device__ static inline uint16_t gpu_fp32_to_fp16(float f) {
 #endif
 #else
 /* CUDA: __half is a native type */
-__host__ __device__ static inline float gpu_fp16_to_fp32(uint16_t h) {
-    return (float).__half_raw(h);
+__host__ __device__ static inline float gpu_fp16_to_fp32(unsigned short h) {
+    return __half2float(__ushort_as_half(h));
 }
-__host__ __device__ static inline uint16_t gpu_fp32_to_fp16(float f) {
+__host__ __device__ static inline unsigned short gpu_fp32_to_fp16(float f) {
     return __half_as_ushort(__float2half(f));
 }
 #endif
