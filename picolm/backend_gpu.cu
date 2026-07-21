@@ -159,7 +159,14 @@ __host__ __device__ static inline unsigned short gpu_fp32_to_fp16(float f) {
  *
  * These mirror PicoLM's block layouts in quant.h.
  * All blocks have FP16 scales (uint16_t d field).
+ *
+ * Struct definitions needed for sizeof() in kernel code.
  */
+#pragma pack(push, 1)
+typedef struct { uint16_t d; uint8_t qs[16]; } block_q4_0;  /* 18 bytes */
+typedef struct { uint16_t d; int8_t qs[32]; } block_q8_0;   /* 34 bytes */
+typedef struct { int8_t ql[32]; uint8_t qh[32]; int8_t scales[12]; uint16_t d; uint8_t ql2[128]; } block_q4_K; /* 144 bytes */
+#pragma pack(pop)
 
 /* block_q4_0: 18 bytes = 2B scale(FP16) + 16B qs (32 values)
  * dequant(i) = (qs[i] & 0xF - 8) * d  for i in [0,32) */
@@ -207,14 +214,14 @@ __device__ static inline float dequant_q8_0(const void *blk, int i) {
 extern "C" __global__ void
 picolm_quant_matmul(float *y, const float *x, const void *weights,
                     gguf_type_t qtype, int S, int I, int O, int row_bytes) {
-    /* block_size derived from qtype: 32 for Q4_0/Q8_0, 256 for Q4_K, 0 for F32 */
-    int block_size;
+    /* bytes_per_block: stride between consecutive blocks in memory */
+    int bytes_per_block;
     switch (qtype) {
-        case GGUF_TYPE_F32:  block_size = 1; break;
-        case GGUF_TYPE_Q4_0: block_size = 32; break;
-        case GGUF_TYPE_Q8_0: block_size = 32; break;
-        case GGUF_TYPE_Q4_K: block_size = 256; break;
-        default: block_size = 32; break;
+        case GGUF_TYPE_F32:  bytes_per_block = 4; break;      /* 1 float */
+        case GGUF_TYPE_Q4_0: bytes_per_block = sizeof(block_q4_0); break;  /* 18 */
+        case GGUF_TYPE_Q8_0: bytes_per_block = sizeof(block_q8_0); break;  /* 34 */
+        case GGUF_TYPE_Q4_K: bytes_per_block = sizeof(block_q4_K); break;  /* 144 */
+        default: bytes_per_block = 18; break;
     }
     int o = gpuBlockIdx_x;
     int s = gpuBlockIdx_y;
@@ -231,11 +238,11 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
         break;
 
     case 2: /* GGUF_TYPE_Q4_0 */
-        /* I values in block_size-byte blocks, each block has 32 values */
+        /* I values in 32-value blocks (18 bytes each) */
         {
             int n_blocks = I / 32;
             for (int bi = gpuThreadIdx_x; bi < n_blocks; bi += gpuBlockDim_x) {
-                const void *blk = wrow + (size_t)bi * block_size;
+                const void *blk = wrow + (size_t)bi * bytes_per_block;
                 for (int j = 0; j < 32; j++) {
                     int i = bi * 32 + j;
                     sum += x[(size_t)s * I + i] * dequant_q4_0(blk, j);
@@ -245,11 +252,11 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
         break;
 
     case 8: /* GGUF_TYPE_Q8_0 */
-        /* I values in block_size-byte blocks, each block has 32 values */
+        /* I values in 32-value blocks (34 bytes each) */
         {
             int n_blocks = I / 32;
             for (int bi = gpuThreadIdx_x; bi < n_blocks; bi += gpuBlockDim_x) {
-                const void *blk = wrow + (size_t)bi * block_size;
+                const void *blk = wrow + (size_t)bi * bytes_per_block;
                 for (int j = 0; j < 32; j++) {
                     int i = bi * 32 + j;
                     sum += x[(size_t)s * I + i] * dequant_q8_0(blk, j);
@@ -268,7 +275,7 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
             for (int i = gpuThreadIdx_x; i < I; i += gpuBlockDim_x) {
                 int bi = i / 256;  /* which block_q4_K */
                 int ji = i % 256;  /* index within block */
-                const uint8_t *blk = b + (size_t)bi * 144;
+                const uint8_t *blk = b + (size_t)bi * bytes_per_block;
                 /* block_q4_K layout (from quant.h):
                  * int8_t ql[32];     offset 0
                  * uint8_t qh[32];    offset 32
