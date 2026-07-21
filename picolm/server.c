@@ -213,6 +213,13 @@ static struct _server_state {
     int last_prompt_len;       /* number of cached prompt tokens */
     int max_last_prompt;       /* allocated size of last_prompt_tokens */
 
+    /* Slot state (PicoLM supports exactly 1 slot) */
+    int is_processing;         /* 1 if currently handling a request */
+    int slot_n_decoded;        /* total tokens decoded in current request */
+    int slot_n_remain;         /* remaining tokens to generate (-1 = unlimited) */
+    int slot_has_next_token;   /* 1 if there is a next token pending */
+    int slot_has_new_line;     /* 1 if next token starts a new line */
+
     /* SSM checkpoint management */
     picolm_checkpoint_t *checkpoints;     /* linked list head (sorted by n_tokens) */
     int max_checkpoints;                  /* --checkpoint-max (default: 0=disabled) */
@@ -590,6 +597,13 @@ static int server_init(const char *model_path, int num_threads, int do_prefault,
     srv.last_prompt_tokens = NULL;
     srv.max_last_prompt = 0;
 
+    /* Initialize slot state */
+    srv.is_processing = 0;
+    srv.slot_n_decoded = 0;
+    srv.slot_n_remain = -1;
+    srv.slot_has_next_token = 0;
+    srv.slot_has_new_line = 0;
+
     /* Initialize SSM checkpoint system */
     srv.checkpoint_snapshot_size = model_ssm_snapshot_size(&srv.model);
     srv.checkpoints = NULL;
@@ -758,6 +772,90 @@ static void handle_props(SOCKET sock) {
     /* Build info */
     cJSON_AddStringToObject(root, "build_info", "picolm");
     cJSON_AddBoolToObject(root, "is_sleeping", 0);
+
+    char *json = cJSON_PrintUnformatted(root);
+    http_send(sock, 200, "application/json", json);
+    free(json);
+    cJSON_Delete(root);
+}
+
+/* ---- Endpoint: GET /slots ---- */
+
+static void handle_slots(SOCKET sock) {
+    if (!srv.model_loaded) {
+        http_send(sock, 503, "application/json", "{\"error\":\"Model not loaded\"}");
+        return;
+    }
+
+    /* Check for ?fail_on_no_slot=1 query parameter */
+    /* We only have 1 slot; if it's currently processing, it's "busy" but not "no slot" */
+    /* Since PicoLM always has exactly 1 slot and it's always available (single-threaded),
+     * we don't fail. The slot is either idle or processing. */
+
+    /* PicoLM has exactly 1 slot (id=0).
+     * Report values matching llama.cpp's /slots response format.
+     * Unsupported features are reported with empty/zero/default values. */
+
+    cJSON *root = cJSON_CreateArray();
+
+    cJSON *slot = cJSON_CreateObject();
+    cJSON_AddNumberToObject(slot, "id", 0);
+    cJSON_AddNumberToObject(slot, "id_task", 0);
+    cJSON_AddNumberToObject(slot, "n_ctx", srv.model.config.max_seq_len);
+    cJSON_AddBoolToObject(slot, "speculative", 0);
+    cJSON_AddBoolToObject(slot, "is_processing", srv.is_processing != 0);
+
+    /* Generation params - defaults for PicoLM */
+    cJSON *params = cJSON_CreateObject();
+    cJSON_AddNumberToObject(params, "n_predict", -1);
+    cJSON_AddNumberToObject(params, "seed", 4294967295);
+    cJSON_AddNumberToObject(params, "temperature", 0.8);
+    cJSON_AddNumberToObject(params, "dynatemp_range", 0.0);
+    cJSON_AddNumberToObject(params, "dynatemp_exponent", 1.0);
+    cJSON_AddNumberToObject(params, "top_k", 40);
+    cJSON_AddNumberToObject(params, "top_p", 0.95);
+    cJSON_AddNumberToObject(params, "min_p", 0.05);
+    cJSON_AddNumberToObject(params, "top_n_sigma", -1.0);
+    cJSON_AddNumberToObject(params, "xtc_probability", 0.0);
+    cJSON_AddNumberToObject(params, "xtc_threshold", 0.1);
+    cJSON_AddNumberToObject(params, "typical_p", 1.0);
+    cJSON_AddNumberToObject(params, "repeat_last_n", 64);
+    cJSON_AddNumberToObject(params, "repeat_penalty", 1.1);
+    cJSON_AddNumberToObject(params, "presence_penalty", 0.0);
+    cJSON_AddNumberToObject(params, "frequency_penalty", 0.0);
+    cJSON_AddNumberToObject(params, "dry_multiplier", 0.0);
+    cJSON_AddNumberToObject(params, "dry_base", 1.75);
+    cJSON_AddNumberToObject(params, "dry_allowed_length", 2);
+    cJSON_AddNumberToObject(params, "dry_penalty_last_n", -1);
+    cJSON_AddNumberToObject(params, "mirostat", 0);
+    cJSON_AddNumberToObject(params, "mirostat_tau", 5.0);
+    cJSON_AddNumberToObject(params, "mirostat_eta", 0.1);
+    cJSON_AddNumberToObject(params, "max_tokens", -1);
+    cJSON_AddNumberToObject(params, "n_keep", 0);
+    cJSON_AddNumberToObject(params, "n_discard", 0);
+    cJSON_AddBoolToObject(params, "ignore_eos", 0);
+    cJSON_AddBoolToObject(params, "stream", 0);
+    cJSON_AddNumberToObject(params, "n_probs", 0);
+    cJSON_AddNumberToObject(params, "min_keep", 0);
+    cJSON_AddStringToObject(params, "chat_format", "Content-only");
+    cJSON_AddStringToObject(params, "reasoning_format", "none");
+    cJSON_AddBoolToObject(params, "reasoning_in_content", 0);
+    cJSON_AddStringToObject(params, "generation_prompt", "");
+    cJSON_AddBoolToObject(params, "timings_per_token", 0);
+    cJSON_AddBoolToObject(params, "post_sampling_probs", 0);
+    cJSON_AddNumberToObject(params, "backend_sampling", 0);
+    cJSON_AddNumberToObject(params, "lora", 0);
+    cJSON_AddItemToObject(slot, "params", params);
+
+    /* next_token info */
+    cJSON *next_token = cJSON_CreateObject();
+    cJSON_AddBoolToObject(next_token, "has_next_token", srv.slot_has_next_token != 0);
+    cJSON_AddBoolToObject(next_token, "has_new_line", srv.slot_has_new_line != 0);
+    cJSON_AddNumberToObject(next_token, "n_remain", srv.slot_n_remain);
+    cJSON_AddNumberToObject(next_token, "n_decoded", srv.slot_n_decoded);
+    cJSON_AddItemToObject(slot, "next_token", next_token);
+
+    cJSON_AddItemToArray(root, slot);
 
     char *json = cJSON_PrintUnformatted(root);
     http_send(sock, 200, "application/json", json);
@@ -2209,6 +2307,8 @@ static void handle_request(SOCKET sock) {
             handle_list_models(sock, srv.model_path);
         } else if (strcmp(path, "/props") == 0 || strcmp(path, "/v1/props") == 0) {
             handle_props(sock);
+        } else if (strcmp(path, "/slots") == 0 || strcmp(path, "/v1/slots") == 0) {
+            handle_slots(sock);
         } else if (strcmp(path, "/") == 0) {
             http_send(sock, 200, "text/plain", "PicoLM server running\n");
         } else if (strcmp(path, "/health") == 0 || strcmp(path, "/v1/health") == 0) {
@@ -2226,6 +2326,7 @@ static void handle_request(SOCKET sock) {
             http_send(sock, 503, "application/json", "{\"error\":{\"message\":\"Model not loaded\"}}");
             return;
         }
+        srv.is_processing = 1;
         if (strcmp(path, "/v1/chat/completions") == 0) {
             handle_completion(sock, body_start, 1);
         } else if (strcmp(path, "/v1/completions") == 0) {
@@ -2239,6 +2340,7 @@ static void handle_request(SOCKET sock) {
         } else {
             http_send(sock, 404, "application/json", "{\"error\":{\"message\":\"Not found\"}}");
         }
+        srv.is_processing = 0;
     } else {
         http_send(sock, 405, "application/json", "{\"error\":{\"message\":\"Method not allowed\"}}");
     }
@@ -2329,6 +2431,7 @@ int server_main(int port, const char *host, const char *model_path, int num_thre
     fprintf(stderr, "  GET  /v1/models\n");
     fprintf(stderr, "  GET  /health           (health check)\n");
     fprintf(stderr, "  GET  /props            (server properties)\n");
+    fprintf(stderr, "  GET  /slots            (slot state)\n");
     fprintf(stderr, "[server] Press Ctrl+C to stop\n");
 
     /* Signal handler for graceful shutdown */
