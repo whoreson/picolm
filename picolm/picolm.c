@@ -288,7 +288,7 @@ int main(int argc, char **argv) {
     }
 
     /* Load model */
-    fprintf(stderr, "PicoLM v1.0-alpha1\n");
+    fprintf(stderr, "PicoLM v1.0-beta1\n");
     fprintf(stderr, "Loading model: %s\n", model_path);
     fprintf(stderr, "SIMD: %s\n",
 #if defined(PICOLM_AVX512)
