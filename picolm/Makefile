@@ -151,7 +151,7 @@ asan: picolm
 ROCM_LIB ?= /opt/rocm-6.3.3/lib
 .PHONY: hip
 hip: backend_gpu.o
-	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -DPICOLM_GPU=1 -msse2 -mssse3" GPU_OBJS="backend_gpu.o" GPU_LIBS="-L$(ROCM_LIB) -lamdhip64 -lstdc++ -Wl,-rpath,$(ROCM_LIB)"
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -DPICOLM_GPU=1" GPU_OBJS="backend_gpu.o" GPU_LIBS="-L$(ROCM_LIB) -lamdhip64 -lstdc++ -Wl,-rpath,$(ROCM_LIB)"
 
 backend_gpu.o: backend_gpu.cu backend_gpu.h quant.h
 	$(HIPCC) $(HIPFLAGS) -DPICOLM_GPU=1 -c -o $@ $< -I.
@@ -162,7 +162,7 @@ CUDA_LIB ?= /usr/local/cuda/lib64
 CUDAFLAGS ?= -O3 -std=c++11 -Xcompiler="-fPIC"
 .PHONY: cuda
 cuda: backend_gpu.o
-	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -DPICOLM_GPU=1 -msse2 -mssse3" GPU_OBJS="backend_gpu.o" GPU_LIBS="-L$(CUDA_LIB) -lcudart -lstdc++ -Wl,-rpath,$(CUDA_LIB)"
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -DPICOLM_GPU=1" GPU_OBJS="backend_gpu.o" GPU_LIBS="-L$(CUDA_LIB) -lcudart -lstdc++ -Wl,-rpath,$(CUDA_LIB)"
 
 backend_gpu.o: backend_gpu.cu backend_gpu.h quant.h
 	$(NVCC) $(CUDAFLAGS) -DPICOLM_GPU=1 -c -o $@ $< -I.
