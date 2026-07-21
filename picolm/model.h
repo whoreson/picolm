@@ -295,4 +295,21 @@ int kvcache_save(const model_t *m, const char *path, int n_pos);
  * loaded (0 on failure). Caller should start generation from this position. */
 int kvcache_load(model_t *m, const char *path);
 
+/* ---- SSM state checkpointing (Qwen3.5/3.6) ---- */
+
+/* Returns total bytes needed for a full SSM state snapshot (all SSM layers).
+ * Returns 0 if model has no SSM layers. */
+size_t model_ssm_snapshot_size(const model_t *m);
+
+/* Save current SSM state into pre-allocated buffer. Returns bytes written.
+ * buf must be >= model_ssm_snapshot_size(m). */
+size_t model_ssm_state_save(const model_t *m, uint8_t *buf, size_t buf_size);
+
+/* Restore SSM state from buffer. Returns bytes read.
+ * buf must contain a valid snapshot (matching model config). */
+size_t model_ssm_state_restore(model_t *m, const uint8_t *buf, size_t buf_size);
+
+/* Reset all SSM state to zero (fresh start). No-op for non-SSM models. */
+void model_ssm_state_reset(model_t *m);
+
 #endif /* MODEL_H */

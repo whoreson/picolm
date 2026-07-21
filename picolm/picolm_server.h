@@ -10,7 +10,8 @@
 
 /* Start the HTTP server. Blocks until interrupted.
  * Returns 0 on success, -1 on failure. */
-int server_main(int port, const char *host, const char *model_path, int num_threads, int do_prefault, int context_override, int mem_mb);
+int server_main(int port, const char *host, const char *model_path, int num_threads, int do_prefault, int context_override, int mem_mb,
+                int checkpoint_max, int checkpoint_interval, int checkpoint_interval_gen, int checkpoint_tail_offset);
 
 /* Get current time in milliseconds (declared in picolm.c) */
 double get_time_ms(void);

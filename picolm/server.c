@@ -185,6 +185,13 @@ static int sse_send(SOCKET sock, const char *data, const char *event) {
     return rc;
 }
 
+/* SSM state checkpoint (for Qwen3.5/3.6 models) */
+typedef struct picolm_checkpoint {
+    int n_tokens;             /* total tokens processed at checkpoint time */
+    uint8_t *data;            /* heap-allocated SSM state snapshot */
+    struct picolm_checkpoint *next; /* linked list, ordered by n_tokens ascending */
+} picolm_checkpoint_t;
+
 /* Forward declaration of global server state */
 static struct _server_state {
     SOCKET listen_sock;
@@ -205,6 +212,15 @@ static struct _server_state {
     int *last_prompt_tokens;   /* cached prompt tokens for reuse */
     int last_prompt_len;       /* number of cached prompt tokens */
     int max_last_prompt;       /* allocated size of last_prompt_tokens */
+
+    /* SSM checkpoint management */
+    picolm_checkpoint_t *checkpoints;     /* linked list head (sorted by n_tokens) */
+    int max_checkpoints;                  /* --checkpoint-max (default: 0=disabled) */
+    int checkpoint_interval;              /* --checkpoint-every-nt (default: 256) */
+    int checkpoint_interval_gen;          /* --checkpoint-every-nt-gen (default: 64) */
+    int checkpoint_tail_offset;           /* --checkpoint-tail-offset (default: 5) */
+    size_t checkpoint_snapshot_size;      /* cached snapshot size from model */
+    uint8_t *checkpoint_scratch;          /* pre-allocated buffer for save/restore */
 } srv;
 
 /* Parse HTTP request line: "METHOD /path HTTP/1.1" */
@@ -275,11 +291,169 @@ static int http_read_body(char *buf, int buf_len, int header_len) {
 
 /* ---- Global server state ---- */
 
+/* ---- SSM Checkpoint Management ---- */
+
+/* Count checkpoints in linked list */
+static int checkpoint_count(void) {
+    int n = 0;
+    for (picolm_checkpoint_t *cp = srv.checkpoints; cp; cp = cp->next) n++;
+    return n;
+}
+
+/* Check if a checkpoint at position n_tokens already exists */
+static int checkpoint_exists(int n_tokens) {
+    for (picolm_checkpoint_t *cp = srv.checkpoints; cp; cp = cp->next) {
+        if (cp->n_tokens == n_tokens) return 1;
+    }
+    return 0;
+}
+
+/* Variance-based eviction: remove the checkpoint whose removal produces
+ * the lowest variance of gaps between remaining checkpoints. */
+static void checkpoint_evict_one(void) {
+    int n = checkpoint_count();
+    if (n <= 2) return; /* Never remove if 2 or fewer */
+
+    /* Collect checkpoint positions */
+    int *tokens = alloca((size_t)n * sizeof(int));
+    int i = 0;
+    for (picolm_checkpoint_t *cp = srv.checkpoints; cp; cp = cp->next) {
+        tokens[i++] = cp->n_tokens;
+    }
+
+    /* Never remove first (index 0) or last (index n-1) */
+    double best_var = 1e30;
+    int best_idx = -1;
+
+    for (int remove = 1; remove < n - 1; remove++) {
+        double sum_sq = 0;
+        int gap_count = 0;
+        for (int j = 0; j < n - 1; j++) {
+            int gap;
+            if (j == remove - 1) {
+                gap = tokens[remove + 1] - tokens[remove - 1]; /* merged gap */
+            } else if (j == remove) {
+                continue; /* skip - merged into previous */
+            } else {
+                gap = tokens[j + 1] - tokens[j];
+            }
+            sum_sq += (double)gap * gap;
+            gap_count++;
+        }
+        double mean = (double)(tokens[n - 1] - tokens[0]) / gap_count;
+        double var = sum_sq / gap_count - mean * mean;
+        if (var < best_var) {
+            best_var = var;
+            best_idx = remove;
+        }
+    }
+
+    /* Remove the checkpoint at best_idx */
+    picolm_checkpoint_t *prev = NULL;
+    picolm_checkpoint_t *cur = srv.checkpoints;
+    for (int idx = 0; idx < best_idx; idx++) {
+        prev = cur;
+        cur = cur->next;
+    }
+    if (prev) prev->next = cur->next;
+    else srv.checkpoints = cur->next;
+
+    free(cur->data);
+    free(cur);
+}
+
+/* Create a checkpoint at current SSM state position.
+ * Auto-evicts old checkpoints if max_checkpoints exceeded. */
+static void checkpoint_save(int n_tokens) {
+    if (srv.max_checkpoints <= 0) return;
+    if (!srv.checkpoints || srv.checkpoints->data) {
+        /* Ensure we have snapshot capability */
+    }
+    if (srv.checkpoint_snapshot_size == 0) return;
+    if (checkpoint_exists(n_tokens)) return; /* skip duplicates */
+
+    /* Evict if at capacity */
+    while (checkpoint_count() >= srv.max_checkpoints) {
+        checkpoint_evict_one();
+    }
+
+    /* Allocate new checkpoint */
+    picolm_checkpoint_t *cp = (picolm_checkpoint_t *)calloc(1, sizeof(*cp));
+    if (!cp) return;
+    cp->n_tokens = n_tokens;
+    cp->data = (uint8_t *)malloc(srv.checkpoint_snapshot_size);
+    if (!cp->data) { free(cp); return; }
+
+    /* Save SSM state */
+    size_t written = model_ssm_state_save(&srv.model, cp->data, srv.checkpoint_snapshot_size);
+    if (written == 0) {
+        free(cp->data);
+        free(cp);
+        return;
+    }
+
+    /* Insert in sorted order by n_tokens */
+    picolm_checkpoint_t *prev = NULL;
+    picolm_checkpoint_t *cur = srv.checkpoints;
+    while (cur && cur->n_tokens < n_tokens) {
+        prev = cur;
+        cur = cur->next;
+    }
+    if (prev) prev->next = cp;
+    else srv.checkpoints = cp;
+    cp->next = cur;
+}
+
+/* Restore checkpoint at or before the given n_tokens.
+ * Returns 0 on success (checkpoint restored), -1 if no suitable checkpoint found.
+ * On success, *actual_n_tokens is set to the checkpoint's n_tokens. */
+static int checkpoint_restore(int n_tokens, int *actual_n_tokens) {
+    if (srv.max_checkpoints <= 0) return -1;
+    if (srv.checkpoint_snapshot_size == 0) return -1;
+
+    /* Find the latest checkpoint with n_tokens <= target */
+    picolm_checkpoint_t *best = NULL;
+    for (picolm_checkpoint_t *cp = srv.checkpoints; cp; cp = cp->next) {
+        if (cp->n_tokens <= n_tokens) {
+            best = cp;
+        } else {
+            break; /* list is sorted, no need to continue */
+        }
+    }
+
+    if (!best) return -1;
+
+    /* Restore SSM state from checkpoint */
+    size_t read = model_ssm_state_restore(&srv.model, best->data, srv.checkpoint_snapshot_size);
+    if (read == 0) return -1;
+
+    *actual_n_tokens = best->n_tokens;
+    return 0;
+}
+
+/* Clear all checkpoints and free their memory */
+static void checkpoint_clear(void) {
+    picolm_checkpoint_t *cp = srv.checkpoints;
+    while (cp) {
+        picolm_checkpoint_t *next = cp->next;
+        free(cp->data);
+        free(cp);
+        cp = next;
+    }
+    srv.checkpoints = NULL;
+}
+
 /* ---- Endpoint: GET /v1/models ---- */
 
 /* ---- Server init / free (persistent model) ---- */
 
-static int server_init(const char *model_path, int num_threads, int do_prefault, int context_override, int mem_mb) {
+static int server_init(const char *model_path, int num_threads, int do_prefault, int context_override, int mem_mb,
+                       int checkpoint_max, int checkpoint_interval, int checkpoint_interval_gen, int checkpoint_tail_offset) {
+    /* Set checkpoint parameters */
+    srv.max_checkpoints = checkpoint_max;
+    srv.checkpoint_interval = checkpoint_interval;
+    srv.checkpoint_interval_gen = checkpoint_interval_gen;
+    srv.checkpoint_tail_offset = checkpoint_tail_offset;
     fprintf(stderr, "[server] Loading model: %s\n", model_path);
     fp16_table_init();
 
@@ -364,10 +538,28 @@ static int server_init(const char *model_path, int num_threads, int do_prefault,
     srv.last_prompt_len = 0;
     srv.last_prompt_tokens = NULL;
     srv.max_last_prompt = 0;
+
+    /* Initialize SSM checkpoint system */
+    srv.checkpoint_snapshot_size = model_ssm_snapshot_size(&srv.model);
+    srv.checkpoints = NULL;
+    srv.checkpoint_scratch = NULL;
+    if (srv.max_checkpoints > 0 && srv.checkpoint_snapshot_size > 0) {
+        srv.checkpoint_scratch = (uint8_t *)malloc(srv.checkpoint_snapshot_size);
+        fprintf(stderr, "[server] SSM checkpointing enabled: max=%d, interval=%d, gen_interval=%d, tail=%d, snapshot_size=%.1fMB\n",
+                srv.max_checkpoints, srv.checkpoint_interval, srv.checkpoint_interval_gen,
+                srv.checkpoint_tail_offset, (double)srv.checkpoint_snapshot_size / (1024.0 * 1024.0));
+    } else if (srv.checkpoint_snapshot_size > 0) {
+        fprintf(stderr, "[server] Model has SSM layers but checkpointing is disabled (checkpoint-max=0)\n");
+    }
+
     return 0;
 }
 
 static void server_free(void) {
+    checkpoint_clear();
+    free(srv.checkpoint_scratch);
+    srv.checkpoint_scratch = NULL;
+
     if (srv.model_loaded) {
         tokenizer_free(&srv.tokenizer);
         tensor_threadpool_free();
@@ -696,8 +888,33 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
     }
     int start_pos = cache_start;
     fprintf(stderr, "[server] %.1fms: KV cache match %d/%d tokens (%d new)\n", get_time_ms() - t0, start_pos, n_prompt, n_prompt - start_pos);
+
+    /* SSM checkpoint restore: if we have SSM layers and cache_start > 0,
+     * try to find and restore a checkpoint at or before cache_start. */
+    if (model->config.has_ssm && cache_start > 0) {
+        int actual = 0;
+        if (checkpoint_restore(cache_start, &actual) == 0) {
+            /* Restored SSM state to checkpoint at position 'actual'.
+             * Reprocess tokens from 'actual' to 'n_prompt' (not from cache_start). */
+            start_pos = actual;
+            /* Truncate last_prompt_tokens to checkpoint position */
+            if (actual < srv.last_prompt_len) {
+                srv.last_prompt_len = actual;
+            }
+            fprintf(stderr, "[server] %.1fms: SSM checkpoint restored at pos %d (KV match was %d)\n",
+                    get_time_ms() - t0, actual, cache_start);
+        } else {
+            /* No suitable checkpoint found. Must reprocess everything from scratch. */
+            start_pos = 0;
+            model_ssm_state_reset(model);
+            fprintf(stderr, "[server] %.1fms: No SSM checkpoint available, resetting state\n", get_time_ms() - t0);
+        }
+    }
+
     if (start_pos == 0) {
         srv.kv_pos = 0;
+        /* Clear checkpoints on full reprocess - conversation has reset */
+        checkpoint_clear();
     }
 
     /* Save prompt tokens for next request */
@@ -743,11 +960,22 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         } else if (n_prefill > 0) {
             /* Per-token prefill for SSM models: check client between tokens */
             int token_p = start_pos > 0 ? ptokens[start_pos - 1] : ptokens[0];
+            int tail_pos = n_prompt - srv.checkpoint_tail_offset;
+            if (tail_pos < start_pos) tail_pos = n_prompt; /* short prompt */
             for (int pos = start_pos; pos < n_prompt; pos++) {
                 if (!client_alive(sock)) break;
                 logits = model_forward(model, token_p, pos);
                 token_p = ptokens[pos + 1];
                 n_processed = pos + 1;
+
+                /* Checkpoint: interval-based */
+                if (srv.max_checkpoints > 0 && (n_processed - start_pos) % srv.checkpoint_interval == 0) {
+                    checkpoint_save(n_processed);
+                }
+                /* Checkpoint: tail checkpoint (N tokens before end) */
+                if (srv.max_checkpoints > 0 && n_processed == tail_pos) {
+                    checkpoint_save(n_processed);
+                }
             }
         }
         /* else: fully cached (n_prefill <= 0), no prefill needed */
@@ -766,6 +994,11 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             fprintf(stderr, "[server] prefill cancelled at token %d/%d\n", n_processed, n_prompt);
             free(chat_prompt); free(raw_prompt_copy); free(ptokens);
             return;
+        }
+
+        /* End-of-prompt checkpoint (always, for SSM models) */
+        if (srv.max_checkpoints > 0 && model->config.has_ssm) {
+            checkpoint_save(n_processed);
         }
 
         double t_prefill_end = get_time_ms();
@@ -838,6 +1071,11 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             cJSON_Delete(chunk);
             total_generation_tokens++;
             gen_count++;
+
+            /* Generation checkpoint: every checkpoint_interval_gen tokens */
+            if (srv.max_checkpoints > 0 && model->config.has_ssm && gen_count % srv.checkpoint_interval_gen == 0) {
+                checkpoint_save(n_prompt + gen_count);
+            }
 
             if (next == (int)tokenizer->eos_id) break;
             token = next;
@@ -934,11 +1172,22 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
                 n_processed_ns = n_prompt;
             } else if (n_prefill_ns > 0) {
                 int token_p = start_pos > 0 ? ptokens[start_pos - 1] : ptokens[0];
+                int tail_pos_ns = n_prompt - srv.checkpoint_tail_offset;
+                if (tail_pos_ns < start_pos) tail_pos_ns = n_prompt;
                 for (int pos = start_pos; pos < n_prompt; pos++) {
                     if (!client_alive(sock)) break;
                     logits_ns = model_forward(model, token_p, pos);
                     token_p = ptokens[pos + 1];
                     n_processed_ns = pos + 1;
+
+                    /* Checkpoint: interval-based */
+                    if (srv.max_checkpoints > 0 && (n_processed_ns - start_pos) % srv.checkpoint_interval == 0) {
+                        checkpoint_save(n_processed_ns);
+                    }
+                    /* Checkpoint: tail checkpoint */
+                    if (srv.max_checkpoints > 0 && n_processed_ns == tail_pos_ns) {
+                        checkpoint_save(n_processed_ns);
+                    }
                 }
             }
 
@@ -955,6 +1204,11 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
                 fprintf(stderr, "[server] prefill cancelled at token %d/%d\n", n_processed_ns, n_prompt);
                 free(chat_prompt); free(raw_prompt_copy); free(ptokens);
                 return;
+            }
+
+            /* End-of-prompt checkpoint */
+            if (srv.max_checkpoints > 0 && model->config.has_ssm) {
+                checkpoint_save(n_processed_ns);
             }
 
             if (gen_count_ns == 0) t_prefill_end_ns = get_time_ms();
@@ -988,6 +1242,11 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
                 if (!piece) piece = "";
                 strncat(generated, piece, max_tokens * 100 - strlen(generated) - 1);
                 gen_count++;
+
+                /* Generation checkpoint */
+                if (srv.max_checkpoints > 0 && model->config.has_ssm && gen_count % srv.checkpoint_interval_gen == 0) {
+                    checkpoint_save(n_prompt + gen_count);
+                }
 
                 if (next == (int)tokenizer->eos_id) { finish_reason = "stop"; break; }
                 if (gen_count >= max_tokens) { finish_reason = "length"; break; }
@@ -1236,8 +1495,28 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
      * is never read (it will be overwritten during generation). */
     int start_pos = cache_start;
     fprintf(stderr, "[server] %.1fms: KV cache match %d/%d tokens (%d new)\n", get_time_ms() - t0, start_pos, n_prompt, n_prompt - start_pos);
+
+    /* SSM checkpoint restore */
+    if (model->config.has_ssm && cache_start > 0) {
+        int actual = 0;
+        if (checkpoint_restore(cache_start, &actual) == 0) {
+            start_pos = actual;
+            if (actual < srv.last_prompt_len) {
+                srv.last_prompt_len = actual;
+            }
+            fprintf(stderr, "[server] %.1fms: SSM checkpoint restored at pos %d (KV match was %d)\n",
+                    get_time_ms() - t0, actual, cache_start);
+        } else {
+            start_pos = 0;
+            model_ssm_state_reset(model);
+            fprintf(stderr, "[server] %.1fms: No SSM checkpoint available, resetting state\n", get_time_ms() - t0);
+        }
+    }
+
     if (start_pos == 0) {
         srv.kv_pos = 0;
+        /* Clear checkpoints on full reprocess */
+        checkpoint_clear();
     }
 
     /* Save prompt tokens for next request */
@@ -1326,17 +1605,33 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             n_processed = n_prompt; /* batched: all tokens processed */
         } else if (n_prefill > 0) {
             int token_p = start_pos > 0 ? ptokens[start_pos - 1] : ptokens[0];
+            int tail_pos_cs = n_prompt - srv.checkpoint_tail_offset;
+            if (tail_pos_cs < start_pos) tail_pos_cs = n_prompt;
             for (int pos = start_pos; pos < n_prompt; pos++) {
                 if (!client_alive(sock)) break;
                 logits = model_forward(model, token_p, pos);
                 token_p = ptokens[pos + 1];
                 n_processed = pos + 1;
+
+                /* Checkpoint: interval-based */
+                if (srv.max_checkpoints > 0 && (n_processed - start_pos) % srv.checkpoint_interval == 0) {
+                    checkpoint_save(n_processed);
+                }
+                /* Checkpoint: tail checkpoint */
+                if (srv.max_checkpoints > 0 && n_processed == tail_pos_cs) {
+                    checkpoint_save(n_processed);
+                }
             }
         }
         /* else: fully cached */
 
         t_prefill_end = get_time_ms();
         fprintf(stderr, "[server] %.1fms: prefill done (%.1fms, %d/%d tokens)\n", get_time_ms() - t0, t_prefill_end - t_start, n_processed, n_prompt);
+
+        /* End-of-prompt checkpoint */
+        if (srv.max_checkpoints > 0 && model->config.has_ssm) {
+            checkpoint_save(n_processed);
+        }
 
         /* Save cache: only the tokens actually processed */
         if (n_processed > srv.max_last_prompt) {
@@ -1436,6 +1731,11 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
 
             gen_count++;
 
+            /* Generation checkpoint */
+            if (srv.max_checkpoints > 0 && model->config.has_ssm && gen_count % srv.checkpoint_interval_gen == 0) {
+                checkpoint_save(n_prompt + gen_count);
+            }
+
             if (!ignore_eos && next == (int)tokenizer->eos_id) {
                 stop_type = "eos";
                 break;
@@ -1516,16 +1816,32 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             n_processed_ns2 = n_prompt;
         } else if (n_prefill_ns2 > 0) {
             int token_p = start_pos > 0 ? ptokens[start_pos - 1] : ptokens[0];
+            int tail_pos2 = n_prompt - srv.checkpoint_tail_offset;
+            if (tail_pos2 < start_pos) tail_pos2 = n_prompt;
             for (int pos = start_pos; pos < n_prompt; pos++) {
                 if (!client_alive(sock)) break;
                 logits_ns2 = model_forward(model, token_p, pos);
                 token_p = ptokens[pos + 1];
                 n_processed_ns2 = pos + 1;
+
+                /* Checkpoint: interval-based */
+                if (srv.max_checkpoints > 0 && (n_processed_ns2 - start_pos) % srv.checkpoint_interval == 0) {
+                    checkpoint_save(n_processed_ns2);
+                }
+                /* Checkpoint: tail checkpoint */
+                if (srv.max_checkpoints > 0 && n_processed_ns2 == tail_pos2) {
+                    checkpoint_save(n_processed_ns2);
+                }
             }
         }
 
         t_prefill_end_ns = get_time_ms();
         fprintf(stderr, "[server] %.1fms: prefill done (%.1fms, %d/%d tokens)\n", get_time_ms() - t0, t_prefill_end_ns - t_start, n_processed_ns2, n_prompt);
+
+        /* End-of-prompt checkpoint */
+        if (srv.max_checkpoints > 0 && model->config.has_ssm) {
+            checkpoint_save(n_processed_ns2);
+        }
 
         /* Save cache: only the tokens actually processed */
         if (n_processed_ns2 > srv.max_last_prompt) {
@@ -1574,6 +1890,11 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             strncat(generated, piece, n_predict * 100 - strlen(generated) - 1);
             gen_token_ids[gen_count] = next;
             gen_count++;
+
+            /* Generation checkpoint */
+            if (srv.max_checkpoints > 0 && model->config.has_ssm && gen_count % srv.checkpoint_interval_gen == 0) {
+                checkpoint_save(n_prompt + gen_count);
+            }
 
             /* Check stop words */
             for (int i = 0; i < n_stop_words; i++) {
@@ -1876,14 +2197,16 @@ static void handle_request(SOCKET sock) {
 
 /* ---- Server Main Loop ---- */
 
-int server_main(int port, const char *host, const char *model_path, int num_threads, int do_prefault, int context_override, int mem_mb) {
+int server_main(int port, const char *host, const char *model_path, int num_threads, int do_prefault, int context_override, int mem_mb,
+                int checkpoint_max, int checkpoint_interval, int checkpoint_interval_gen, int checkpoint_tail_offset) {
     srv.port = port;
     strncpy(srv.host, host, sizeof(srv.host) - 1);
     srv.model_path = model_path;
     srv.running = 1;
 
     /* Load model once at startup */
-    if (server_init(model_path, num_threads, do_prefault, context_override, mem_mb) != 0) {
+    if (server_init(model_path, num_threads, do_prefault, context_override, mem_mb,
+                    checkpoint_max, checkpoint_interval, checkpoint_interval_gen, checkpoint_tail_offset) != 0) {
         return -1;
     }
 
