@@ -1293,7 +1293,27 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
             m->gpu.device = device;
             if (uploaded > 0) {
                 m->gpu.active = 1;
+                /* Log per-type upload stats */
+                int tcounts[20] = {0};
+                for (int l = 0; l < c->n_layers; l++) {
+                    gpu_layer_weights_t *gl = &m->gpu.layers[l];
+                    layer_weights_t *lw = &m->weights.layers[l];
+                    const void *ptrs[] = {gl->attn_q, gl->attn_k, gl->attn_v,
+                                          gl->attn_output, gl->ffn_gate, gl->ffn_up, gl->ffn_down};
+                    int types[] = {lw->type_attn_q, lw->type_attn_k, lw->type_attn_v,
+                                   lw->type_attn_output, lw->type_ffn_gate, lw->type_ffn_up, lw->type_ffn_down};
+                    for (int j = 0; j < 7; j++) {
+                        int t = types[j];
+                        if (t >= 0 && t < 20) tcounts[t]++;
+                    }
+                }
+                /* Count output tensor */
+                int ot = m->weights.type_output;
+                if (ot >= 0 && ot < 20) tcounts[ot]++;
                 fprintf(stderr, "INFO: GPU weights uploaded (%d/%d tensors)\n", uploaded, attempted);
+                for (int t = 0; t < 20; t++) {
+                    if (tcounts[t]) fprintf(stderr, "  type %d: %d tensors\n", t, tcounts[t]);
+                }
             } else {
                 fprintf(stderr, "WARN: GPU upload failed for all tensors, using CPU\n");
             }
