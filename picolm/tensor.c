@@ -550,6 +550,28 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
         /* GPU path: single-token GEMV (S=1) */
         static int gpu_matmul_count = 0;
         if (picolm_gpu_matmul(gpu_tensor, out, x, 1, gpu_device)) {
+            /* Debug: compare GPU vs CPU output */
+            if (getenv("PICOLM_DBG_MATMUL")) {
+                float *cpu_out = (float *)malloc(d * sizeof(float));
+                const char *wrow_base = (const char *)W;
+                switch (qtype) {
+                    case GGUF_TYPE_Q8_0: {
+                        for (int i = 0; i < d; i++) {
+                            const block_q8_0 *wrow = (const block_q8_0 *)(wrow_base + (size_t)i * gguf_type_row_size(qtype, n));
+                            cpu_out[i] = vec_dot_q8_0_f32(wrow, x, n);
+                        }
+                        break;
+                    }
+                    default: return; /* only debug Q8_0 for now */
+                }
+                float max_err = 0;
+                for (int i = 0; i < d; i++) {
+                    float err = fabsf(out[i] - cpu_out[i]);
+                    if (err > max_err) max_err = err;
+                }
+                fprintf(stderr, "[GPU dbg] matmul #000003d d=%d n=%d max_err=%.6f\n", gpu_matmul_count, d, n, max_err);
+                free(cpu_out);
+            }
             if (gpu_matmul_count++ == 0) {
                 fprintf(stderr, "INFO: GPU matmul active\n");
             }
