@@ -572,6 +572,14 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
 #ifdef PICOLM_GPU
     if (gpu_tensor && d > 0 && n > 0) {
         gpu_assert_orchestrator("matmul GPU dispatch");
+        /* Try WMMA Tensor Core for aligned Q4_0 matrices */
+        if (picolm_gpu_w4a16_matmul(gpu_tensor, out, x, 1, gpu_device)) {
+            static int gpu_matmul_count = 0;
+            if (gpu_matmul_count++ == 0) {
+                fprintf(stderr, "INFO: GPU WMMA matmul active\n");
+            }
+            return;
+        }
         /* GPU path: single-token GEMV (S=1) */
         if (picolm_gpu_matmul(gpu_tensor, out, x, 1, gpu_device)) {
             static int gpu_matmul_count = 0;
@@ -967,7 +975,21 @@ void matmul_batch(float *out, const float *x, int n_batch,
 #ifdef PICOLM_GPU
     if (gpu_tensor && n_batch > 0 && d > 0 && n > 0) {
         gpu_assert_orchestrator("matmul_batch GPU dispatch");
-        if (picolm_gpu_matmul(gpu_tensor, out, x, n_batch, gpu_device)) return;
+        /* Try WMMA Tensor Core for aligned Q4_0 batched matmul */
+        if (picolm_gpu_w4a16_matmul(gpu_tensor, out, x, n_batch, gpu_device)) {
+            static int gpu_batch_count = 0;
+            if (gpu_batch_count++ == 0) {
+                fprintf(stderr, "INFO: GPU WMMA batch matmul active\n");
+            }
+            return;
+        }
+        if (picolm_gpu_matmul(gpu_tensor, out, x, n_batch, gpu_device)) {
+            static int gpu_batch_count = 0;
+            if (gpu_batch_count++ == 0) {
+                fprintf(stderr, "INFO: GPU batch matmul active\n");
+            }
+            return;
+        }
     }
 #endif
     size_t row_bytes = gguf_type_row_size(qtype, n);

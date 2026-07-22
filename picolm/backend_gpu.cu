@@ -455,18 +455,22 @@ __global__ void picolm_w4a16_gate_up(float *gate, float *up, const float *x,
 
 #ifdef PICOLM_GPU_WMMA_AVAILABLE
 
-/* Dequant one nibble from block_q4_0 to FP16, given the block base and value index */
+/* Dequant one nibble from block_q4_0 to FP16.
+ * GGUF Q4_0: values 0..15 = low nibble of qs[0..15], values 16..31 = high nibble.
+ * NOT interleaved (that was the Q4_0 precision bug from earlier). */
 __device__ static inline half dequant_q4_0_elem_fp16(const void *blk, int j) {
     const uint8_t *b = (const uint8_t *)blk;
     uint16_t d_raw = b[0] | ((uint16_t)b[1] << 8);
+    int v;
+    if (j < 16) v = b[2 + j] & 0xF;
+    else v = b[2 + j - 16] >> 4;
 #ifdef __HIP__
     half d; d.__x = d_raw;
-    half val; val.__x = gpu_fp32_to_fp16((float)(((b[2 + (j >> 1)] >> ((j & 1) * 4)) & 0xF) - 8));
+    half val; val.__x = gpu_fp32_to_fp16((float)(v - 8));
     return d * val;
 #else
-    /* CUDA: __half::__x is private since CUDA 12+. Use proper constructors. */
     half d = __ushort_as_half(d_raw);
-    half val = __float2half((float)(((b[2 + (j >> 1)] >> ((j & 1) * 4)) & 0xF) - 8));
+    half val = __float2half((float)(v - 8));
     return d * val;
 #endif
 }
@@ -923,6 +927,9 @@ int picolm_gpu_tensor_device(const picolm_gpu_tensor_t *t) {
 
 int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, int device) {
     if (!t || !y || !x || S < 1) return 0;
+    /* Minimum I for GPU to be worthwhile vs CPU kernel launch overhead.
+     * Smaller tensors: kernel launch (~200us) dominates compute. */
+    if (t->I < 512 || t->O < 256) return 0;
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!select_ctx(ctx)) return 0;
 
@@ -1055,6 +1062,51 @@ int picolm_gpu_w4a16_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
 #else
     (void)gate; (void)up; (void)down; (void)y; (void)x; (void)S;
     return 0; /* WMMA not available on this arch */
+#endif
+}
+
+/* General-purpose WMMA matmul for Q4_0 weights.
+ * Handles any tensor, not just expert MLP.
+ * M = rows (S in our convention), K = columns (I), N = output (O)
+ * Returns 1 on success, 0 to fall back to quant_matmul.
+ * Constraints: qtype must be Q4_0, N%64==0, M%16==0, K%32==0. */
+int picolm_gpu_w4a16_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, int device) {
+#ifdef PICOLM_GPU_WMMA_AVAILABLE
+    if (!t || !y || !x || S < 1 || t->qtype != 2) return 0; /* Q4_0 only */
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!select_ctx(ctx)) return 0;
+
+    int M = S, K = t->I, N = t->O;
+    /* WMMA is only worthwhile for large batch sizes.
+     * Small M wastes SM resources (16x64 tile for a 1-row output).
+     * N must be at least 64 (one grid-x tile). */
+    if (M < 16 || N < 64 || K < 64) return 0;
+
+    size_t xb = (size_t)M * K * sizeof(float);
+    size_t yb = (size_t)M * N * sizeof(float);
+    if (!reserve(&ctx->x, &ctx->x_cap, xb) ||
+        !reserve(&ctx->y, &ctx->y_cap, yb)) return 0;
+
+#ifdef __HIP__
+    if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "w4a16 input")) return 0;
+#else
+    memcpy(ctx->x, x, xb);
+#endif
+
+    dim3 grid((unsigned)((N + 63) / 64), (unsigned)((M + 15) / 16));
+    picolm_w4a16_matmul<<<grid, 256>>>(ctx->y, ctx->x, t->weights, M, K, N, t->block_size);
+    if (!gpu_ok(gpuGetLastError(), "w4a16 matmul") ||
+        !gpu_ok(gpuDeviceSynchronize(), "w4a16 sync")) return 0;
+
+#ifdef __HIP__
+    if (!gpu_ok(gpuMemcpy(y, ctx->y, yb, gpuMemcpyDeviceToHost), "w4a16 output")) return 0;
+#else
+    memcpy(y, ctx->y, yb);
+#endif
+    return 1;
+#else
+    (void)t; (void)y; (void)x; (void)S; (void)device;
+    return 0;
 #endif
 }
 

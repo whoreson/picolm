@@ -70,6 +70,12 @@ int picolm_gpu_w4a16_mlp(picolm_gpu_tensor_t *gate,
                           picolm_gpu_tensor_t *down,
                           float *y, const float *x, int S);
 
+/* General-purpose WMMA matmul: any Q4_0 tensor, batched over S rows.
+ * Requirements: qtype==Q4_0, O%64==0, S%16==0, I%32==0.
+ * Returns 1 on success, 0 if unsupported (fall back to quant_matmul). */
+int picolm_gpu_w4a16_matmul(picolm_gpu_tensor_t *t,
+                             float *y, const float *x, int S, int device);
+
 /* Free a GPU tensor (device memory + host handle). */
 void picolm_gpu_tensor_free(picolm_gpu_tensor_t *tensor);
 
