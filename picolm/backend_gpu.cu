@@ -726,7 +726,7 @@ int picolm_gpu_tensor_upload(picolm_gpu_tensor_t **tensor,
     t->row_bytes = row_bytes; t->block_size = bs;
 
     /* Try zero-copy first: register CPU memory with GPU (unified memory SoC) */
-    gpuError_t zc_err = gpuHostRegister(weights, total, 0);
+    gpuError_t zc_err = gpuHostRegister((void *)weights, total, 0);
     if (gpu_ok(zc_err, "zero-copy register")) {
         /* Success: GPU can read directly from CPU memory */
         t->weights = (void *)weights;
