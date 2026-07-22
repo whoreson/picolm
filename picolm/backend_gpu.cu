@@ -87,6 +87,8 @@ typedef hipEvent_t gpuEvent_t;
 #define gpuGridDim_y hipGridDim_y
 #define gpuHostRegister hipHostRegister
 #define gpuHostUnregister hipHostUnregister
+#define gpuMallocManaged hipMallocManaged
+/* HIP: no hipMemAdvise equivalent; unified memory is automatic on HIP */
 #else
 /* NVIDIA CUDA */
 #define gpuSuccess cudaSuccess
@@ -130,6 +132,13 @@ typedef hipEvent_t gpuEvent_t;
 #define gpuDevice cudaDevice
 #define gpuHostRegister cudaHostRegister
 #define gpuHostUnregister cudaHostUnregister
+#define gpuMallocManaged cudaMallocManaged
+#define gpuMemAdvise cudaMemAdvise
+#define gpuMemLocation cudaMemLocation
+#define gpuMemLocationType cudaMemLocationType
+#define gpuCudaMemLocationTypeDevice cudaMemLocationTypeDevice
+#define gpuCudaMemLocationTypecpu cudaMemLocationTypecpu
+#define gpuCudaMemAdviseSetReadMostly cudaMemAdviseSetReadMostly
 #endif
 
 /* ---- Device-side FP16 helpers ---- */
@@ -672,7 +681,27 @@ static int reserve(float **ptr, size_t *cap, size_t bytes) {
     if (*cap >= bytes) { pthread_mutex_unlock(&g_resize_mutex); return 1; }
     if (*ptr) gpuFree(*ptr);
     *ptr = NULL; *cap = 0;
-    if (!gpu_ok(gpuMalloc(ptr, bytes), "scratch allocation")) {
+    /* Use managed memory on CUDA for unified memory systems (Grace-Blackwell SoC).
+     * On discrete GPUs, the page fault overhead is tolerable for the small scratch
+     * buffers (typically < 10 MB). On SoC, this eliminates the H2D/D2H copies
+     * entirely since CPU and GPU share coherent memory.
+     * HIP uses regular malloc since hipMallocManaged has different semantics. */
+    gpuError_t err;
+#ifdef __HIP__
+    err = gpuMalloc(ptr, bytes);
+#else
+    err = gpuMallocManaged(ptr, bytes);
+    if (err == gpuSuccess && *ptr) {
+        /* Advise: prefer GPU placement for these scratch buffers.
+         * They are written by CPU (H2D equivalent), read by GPU kernel, then
+         * read by CPU (D2H equivalent). GPU placement minimizes NVLink traffic. */
+        gpuMemLocation loc;
+        loc.type = gpuCudaMemLocationTypeDevice;
+        loc.id = -1; /* any device */
+        (void)gpuMemAdvise(*ptr, bytes, gpuCudaMemAdviseSetReadMostly, loc);
+    }
+#endif
+    if (!gpu_ok(err, "scratch allocation")) {
         pthread_mutex_unlock(&g_resize_mutex);
         return 0;
     }
@@ -759,6 +788,20 @@ void picolm_gpu_shutdown(void) {
     g_nctx = 0;
 }
 
+/* Detect if we're on a unified memory SoC (Grace-Blackwell, Apple Silicon, etc.) */
+static int is_unified_memory(void) {
+#ifdef __HIP__
+    return 0; /* HIP: treat as discrete GPU (conservative) */
+#else
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, 0);
+    /* On Grace-Blackwell, unifiedAddressing is true and the device has no
+     * separate PCIe link width (it's chip-to-chip). Check for integrated
+     * memory by looking at the bus type. */
+    return prop.unifiedAddressing && prop.l2CacheSize > 0;
+#endif
+}
+
 int picolm_gpu_device_count(void) { return g_nctx; }
 
 int picolm_gpu_device_at(int index) {
@@ -778,7 +821,7 @@ static int gguf_block_size(gguf_type_t qtype) {
     case 0:  return 0;    /* F32: no blocks */
     case 2:  return 18;   /* Q4_0: 18 bytes per 32 values */
     case 8:  return 34;   /* Q8_0: 34 bytes per 32 values */
-    case 12: return 144;  /* Q4_K: 144 bytes per 256 values */
+    case 12: return 0;    /* Q4_K: unsupported on GPU, skip upload */
     case 41: return 18;   /* Q1_0: 18 bytes per 128 values */
     case 42: return 34;   /* Q2_0: 34 bytes per 128 values */
     default: return 0;
@@ -889,39 +932,30 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
     if (!reserve(&ctx->x, &ctx->x_cap, xb) ||
         !reserve(&ctx->y, &ctx->y_cap, yb)) return 0;
 
+    /* On unified memory (CUDA managed), x and ctx->x are the same address space.
+     * We can write directly into ctx->x from CPU, then the GPU kernel reads it.
+     * On discrete GPUs (HIP or fallback), we still need explicit copies. */
+#ifdef __HIP__
     if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
+#else
+    /* Managed memory: CPU writes directly, GPU reads directly.
+     * memcpy is fast on unified memory (same physical RAM via C2C interconnect). */
+    memcpy(ctx->x, x, xb);
+#endif
 
     dim3 grid((unsigned)O, (unsigned)S);
     picolm_quant_matmul<<<grid, 256>>>(ctx->y, ctx->x, t->weights,
                                         t->qtype, S, I, O,
                                         (int)t->row_bytes);
     if (!gpu_ok(gpuGetLastError(), "matmul launch") ||
-        !gpu_ok(gpuDeviceSynchronize(), "matmul sync") ||
-        !gpu_ok(gpuMemcpy(y, ctx->y, yb, gpuMemcpyDeviceToHost), "output download")) return 0;
+        !gpu_ok(gpuDeviceSynchronize(), "matmul sync")) return 0;
 
-    /* DEBUG: print GPU vs CPU comparison for first Q4_0 matmul */
-    static int debug_dumped = 0;
-    if (t->qtype == GGUF_TYPE_Q4_0 && !debug_dumped) {
-        debug_dumped = 1;
-        fprintf(stderr, "[GPU] Q4_0 debug: I=%d O=%d S=%d row_bytes=%d\n",
-                I, O, S, (int)t->row_bytes);
-
-        /* Upload first row of weights back to host for verification */
-        size_t rb = t->row_bytes;
-        uint8_t *hw = (uint8_t*)malloc(rb);
-        gpuMemcpy(hw, t->weights, rb, gpuMemcpyDeviceToHost);
-        fprintf(stderr, "[GPU] weight row[0]: first 18 bytes: ");
-        for (int i = 0; i < 18; i++) fprintf(stderr, "%02x ", hw[i]);
-        fprintf(stderr, "\n");
-        free(hw);
-
-        fprintf(stderr, "[GPU] x[:5] = ");
-        for (int i = 0; i < 5 && i < I; i++) fprintf(stderr, "%.4f ", x[i]);
-        fprintf(stderr, "\n");
-        fprintf(stderr, "[GPU] y[:5] = ");
-        for (int i = 0; i < 5 && i < O; i++) fprintf(stderr, "%.4f ", y[i]);
-        fprintf(stderr, "\n");
-    }
+    /* Managed memory: GPU writes directly to ctx->y, CPU reads directly. */
+#ifdef __HIP__
+    if (!gpu_ok(gpuMemcpy(y, ctx->y, yb, gpuMemcpyDeviceToHost), "output download")) return 0;
+#else
+    memcpy(y, ctx->y, yb);
+#endif
     return 1;
 }
 
@@ -943,7 +977,11 @@ int picolm_gpu_expert_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
         !reserve(&ctx->gate, &ctx->gate_cap, ib) ||
         !reserve(&ctx->up, &ctx->up_cap, ib)) return 0;
 
+#ifdef __HIP__
     if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "expert input")) return 0;
+#else
+    memcpy(ctx->x, x, xb);
+#endif
 
     /* gate projection */
     dim3 hidden_grid((unsigned)I, (unsigned)S);
@@ -960,8 +998,12 @@ int picolm_gpu_expert_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
     picolm_quant_matmul<<<output_grid, 256>>>(ctx->y, ctx->gate, down->weights,
         down->qtype, S, I, D, (int)down->row_bytes);
 
-    if (!gpu_ok(gpuGetLastError(), "expert MLP") ||
-        !gpu_ok(gpuMemcpy(y, ctx->y, xb, gpuMemcpyDeviceToHost), "expert output")) return 0;
+    if (!gpu_ok(gpuGetLastError(), "expert MLP")) return 0;
+#ifdef __HIP__
+    if (!gpu_ok(gpuMemcpy(y, ctx->y, xb, gpuMemcpyDeviceToHost), "expert output")) return 0;
+#else
+    memcpy(y, ctx->y, xb);
+#endif
     return 1;
 }
 
@@ -986,7 +1028,11 @@ int picolm_gpu_w4a16_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
         !reserve(&ctx->up, &ctx->up_cap, ib) ||
         !reserve(&ctx->y, &ctx->y_cap, xb)) return 0;
 
+    #ifdef __HIP__
     if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "w4a16 input")) return 0;
+#else
+    memcpy(ctx->x, x, xb);
+#endif
 
     /* fused gate+up via WMMA */
     dim3 hidden((unsigned)((I + 63) / 64), (unsigned)((S + 15) / 16));
@@ -999,8 +1045,12 @@ int picolm_gpu_w4a16_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
     dim3 output((unsigned)((D + 63) / 64), (unsigned)((S + 15) / 16));
     picolm_w4a16_matmul<<<output, 256>>>(ctx->y, ctx->gate, down->weights, S, I, D, down->block_size);
 
-    if (!gpu_ok(gpuGetLastError(), "w4a16 launch") ||
-        !gpu_ok(gpuMemcpy(y, ctx->y, xb, gpuMemcpyDeviceToHost), "w4a16 output")) return 0;
+    if (!gpu_ok(gpuGetLastError(), "w4a16 launch")) return 0;
+#ifdef __HIP__
+    if (!gpu_ok(gpuMemcpy(y, ctx->y, xb, gpuMemcpyDeviceToHost), "w4a16 output")) return 0;
+#else
+    memcpy(y, ctx->y, xb);
+#endif
     return 1;
 #else
     (void)gate; (void)up; (void)down; (void)y; (void)x; (void)S;

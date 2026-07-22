@@ -578,23 +578,6 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
             if (gpu_matmul_count++ == 0) {
                 fprintf(stderr, "INFO: GPU matmul active\n");
             }
-            /* DEBUG: verify first Q4_0 matmul against CPU */
-            if (qtype == GGUF_TYPE_Q4_0 && gpu_matmul_count == 1) {
-                /* Compute CPU reference for first 5 outputs */
-                size_t cpu_row_bytes = gguf_type_row_size(qtype, n);
-                float ref[5];
-                for (int i = 0; i < 5 && i < d; i++) {
-                    ref[i] = vec_dot((const char *)W + (size_t)i * cpu_row_bytes, x, n, qtype);
-                }
-                float max_err = 0;
-                for (int i = 0; i < 5 && i < d; i++) {
-                    float err = fabsf(out[i] - ref[i]);
-                    float rel = fabsf(ref[i]) > 1e-8f ? err / fabsf(ref[i]) : err;
-                    if (rel > max_err) max_err = rel;
-                    fprintf(stderr, "[VERIFY] out[%d]: GPU=%.6f CPU=%.6f rel_err=%.2e %s\n",
-                            i, out[i], ref[i], rel, rel < 1e-3f ? "OK" : "FAIL");
-                }
-            }
             return;
         }
         /* GPU returned 0: fall through to CPU path */
