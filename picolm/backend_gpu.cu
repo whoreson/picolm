@@ -733,21 +733,21 @@ int picolm_gpu_tensor_upload(picolm_gpu_tensor_t **tensor,
     /* Diagnostic: verify upload by downloading first 64 bytes and comparing */
     {
         static int verify_count = 0;
-        if (verify_count++ == 0 && total > 64) {
-            uint8_t *h_verify = (uint8_t *)malloc(64);
-            gpuMemcpy(h_verify, t->weights, 64, gpuMemcpyDeviceToHost);
-            int match = 1;
-            for (int i = 0; i < 64; i++) {
-                if (h_verify[i] != ((const uint8_t *)weights)[i]) {
-                    match = 0;
-                    fprintf(stderr, "[GPU] VERIFY FAIL at byte %d: gpu=%02x cpu=%02x\n",
-                            i, h_verify[i], ((const uint8_t *)weights)[i]);
-                    break;
-                }
+        size_t check_bytes = total > 64 ? 64 : total;
+        uint8_t *h_verify = (uint8_t *)malloc(check_bytes);
+        gpuMemcpy(h_verify, t->weights, check_bytes, gpuMemcpyDeviceToHost);
+        int match = 1;
+        for (size_t i = 0; i < check_bytes; i++) {
+            if (h_verify[i] != ((const uint8_t *)weights)[i]) {
+                match = 0;
+                fprintf(stderr, "[GPU] VERIFY FAIL tensor #%d at byte %zu: gpu=%02x cpu=%02x\n",
+                        verify_count, i, h_verify[i], ((const uint8_t *)weights)[i]);
+                break;
             }
-            if (match) fprintf(stderr, "[GPU] Upload verify OK (first 64 bytes match)\n");
-            free(h_verify);
         }
+        verify_count++;
+        free(h_verify);
+        (void)match; /* silence warning */
     }
     *tensor = t;
     return 1;
