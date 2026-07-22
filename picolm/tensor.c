@@ -378,7 +378,6 @@ static void matmul_worker_f(matmul_task_t *t) {
             t->out[i] = vec_dot_q8_0_q8_0_deltas(qx, qx_d,
                                                   t->W + (size_t)i * t->row_bytes, t->n);
         }
-#if defined(PICOLM_AVX2) || defined(PICOLM_AVX)
     } else if (t->qtype == GGUF_TYPE_Q4_K && t->x) {
         const block_q8_K *qx = (const block_q8_K *)t->x;
         for (int i = t->start; i < t->end; i++) {
@@ -418,7 +417,6 @@ static void matmul_worker_f(matmul_task_t *t) {
             t->out[i] = vec_dot(t->W + (size_t)i * t->row_bytes,
                                 t->x, t->n, t->qtype);
         }
-#endif
 #endif
     } else if (t->qtype == GGUF_TYPE_Q1_0 && t->x) {
         const block_q8_0 *qx = (const block_q8_0 *)t->x;
@@ -646,10 +644,10 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
             return;
         }
         /* If allocation failed, fall through to generic path */
-#if defined(PICOLM_AVX2) || defined(PICOLM_AVX)
     } else if (qtype == GGUF_TYPE_Q4_0) {
         /* Q4_0 fast path: quantize x to Q8_0 once, then vec_dot_q4_0_q8_0
-         * On AVX2 with d%8==0, use repacked Q4_0_8x8 path for 8x row throughput. */
+         * On AVX2 with d%8==0, use repacked Q4_0_8x8 path for 8x row throughput.
+         * vec_dot_q4_0_q8_0 has scalar/I8MM fallback for NEON/non-AVX platforms */
         size_t qx_size = (n / 32) * sizeof(block_q8_0);
         block_q8_0 *qx = NULL;
         int qx_owned = 0;
@@ -805,10 +803,9 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
         }
 #endif
         /* Non-AVX2: fall through to generic vec_dot path */
-#endif
     } else if (qtype == GGUF_TYPE_Q4_K) {
         /* Q4_K fast path: quantize x to Q8_K once, then vec_dot_q4_K_q8_K */
-        /* Only enabled on x86 (AVX/AVX2). On NEON, use vec_dot_q4_K_f32 instead. */
+        /* vec_dot_q4_K_q8_K has scalar fallback for NEON/non-AVX platforms */
         size_t qx_size = (n / 256) * sizeof(block_q8_K);
         block_q8_K *qx = NULL;
         int qx_owned = 0;  /* whether we malloc'd qx */
