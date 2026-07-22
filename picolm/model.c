@@ -2204,14 +2204,25 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     {
         gguf_type_t alpha_type = lw->type_ssm_alpha;
         size_t row_bytes = gguf_type_row_size(alpha_type, dim);
-        for (int h = 0; h < n_v_heads; h++) {
-            int gh = do_remap ? qwen35_vhead_gguf(h, n_vpk, n_k) : h;
-            const uint8_t *head_data = (const uint8_t *)lw->ssm_alpha + (size_t)gh * row_bytes;
-            float sum;
-            if (alpha_type == GGUF_TYPE_Q8_0) sum = vec_dot_q8_0_q8_0_deltas(xb_q8, xb_q8_d, head_data, dim);
-            else if (alpha_type == GGUF_TYPE_Q4_0) sum = vec_dot_q4_0_q8_0(head_data, xb_q8, dim);
-            else sum = vec_dot(head_data, s->xb, dim, alpha_type);
-            alpha_out[h] = sum + s->ssm_dt_w[il][h];
+        int alpha_map[n_v_heads];
+        for (int h = 0; h < n_v_heads; h++) alpha_map[h] = do_remap ? qwen35_vhead_gguf(h, n_vpk, n_k) : h;
+#ifdef PICOLM_GPU
+        if (gpu_lw && (alpha_type == GGUF_TYPE_Q4_0 || alpha_type == GGUF_TYPE_Q8_0) &&
+            picolm_gpu_ssm_vecdot(alpha_out, s->xb, lw->ssm_alpha, alpha_type, dim,
+                                  n_v_heads, (int)row_bytes, alpha_map, m->gpu.device)) {
+            for (int h = 0; h < n_v_heads; h++) alpha_out[h] += s->ssm_dt_w[il][h];
+        } else
+#endif
+        {
+            for (int h = 0; h < n_v_heads; h++) {
+                int gh = alpha_map[h];
+                const uint8_t *head_data = (const uint8_t *)lw->ssm_alpha + (size_t)gh * row_bytes;
+                float sum;
+                if (alpha_type == GGUF_TYPE_Q8_0) sum = vec_dot_q8_0_q8_0_deltas(xb_q8, xb_q8_d, head_data, dim);
+                else if (alpha_type == GGUF_TYPE_Q4_0) sum = vec_dot_q4_0_q8_0(head_data, xb_q8, dim);
+                else sum = vec_dot(head_data, s->xb, dim, alpha_type);
+                alpha_out[h] = sum + s->ssm_dt_w[il][h];
+            }
         }
     }
 #ifdef DEBUG_SSM
@@ -2235,14 +2246,25 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     {
         gguf_type_t beta_type = lw->type_ssm_beta;
         size_t row_bytes = gguf_type_row_size(beta_type, dim);
-        for (int h = 0; h < n_v_heads; h++) {
-            int gh = do_remap ? qwen35_vhead_gguf(h, n_vpk, n_k) : h;
-            const uint8_t *head_data = (const uint8_t *)lw->ssm_beta + (size_t)gh * row_bytes;
-            float sum;
-            if (beta_type == GGUF_TYPE_Q8_0) sum = vec_dot_q8_0_q8_0_deltas(xb_q8, xb_q8_d, head_data, dim);
-            else if (beta_type == GGUF_TYPE_Q4_0) sum = vec_dot_q4_0_q8_0(head_data, xb_q8, dim);
-            else sum = vec_dot(head_data, s->xb, dim, beta_type);
-            beta[h] = 1.0f / (1.0f + expf(-sum));
+        int beta_map[n_v_heads];
+        for (int h = 0; h < n_v_heads; h++) beta_map[h] = do_remap ? qwen35_vhead_gguf(h, n_vpk, n_k) : h;
+#ifdef PICOLM_GPU
+        if (gpu_lw && (beta_type == GGUF_TYPE_Q4_0 || beta_type == GGUF_TYPE_Q8_0) &&
+            picolm_gpu_ssm_vecdot(beta, s->xb, lw->ssm_beta, beta_type, dim,
+                                  n_v_heads, (int)row_bytes, beta_map, m->gpu.device)) {
+            for (int h = 0; h < n_v_heads; h++) beta[h] = 1.0f / (1.0f + expf(-beta[h]));
+        } else
+#endif
+        {
+            for (int h = 0; h < n_v_heads; h++) {
+                int gh = beta_map[h];
+                const uint8_t *head_data = (const uint8_t *)lw->ssm_beta + (size_t)gh * row_bytes;
+                float sum;
+                if (beta_type == GGUF_TYPE_Q8_0) sum = vec_dot_q8_0_q8_0_deltas(xb_q8, xb_q8_d, head_data, dim);
+                else if (beta_type == GGUF_TYPE_Q4_0) sum = vec_dot_q4_0_q8_0(head_data, xb_q8, dim);
+                else sum = vec_dot(head_data, s->xb, dim, beta_type);
+                beta[h] = 1.0f / (1.0f + expf(-sum));
+            }
         }
     }
     if (xb_q8 != (void *)xb_q8_stack) free(xb_q8);

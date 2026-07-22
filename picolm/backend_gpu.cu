@@ -417,6 +417,67 @@ picolm_silu_mul(float *gate, const float *up, size_t n) {
     }
 }
 
+/* ---- SSM alpha/beta batched vec_dot kernel ----
+ * Each thread block handles one head, 256 threads process dim elements.
+ * Weights: column-major [dim, n_heads], each column is a quantized row. */
+extern "C" __global__ void
+picolm_ssm_vecdot_kernel(float *out,
+                          const float *x,
+                          const void *weights,
+                          gguf_type_t qtype,
+                          int dim, int n_v_heads,
+                          int row_bytes,
+                          const int *head_map) {
+    int h = gpuBlockIdx_x;
+    if (h >= n_v_heads) return;
+    int tid = gpuThreadIdx_x;
+    int gh = head_map ? head_map[h] : h;
+    const char *wrow = (const char *)weights + (size_t)gh * row_bytes;
+    double sum = 0.0;
+
+    switch (qtype) {
+    case 2: { /* Q4_0 */
+        int n_blocks = dim / 32;
+        for (int bi = tid; bi < n_blocks; bi += gpuBlockDim_x) {
+            const uint8_t *blk = (const uint8_t *)wrow + (size_t)bi * 18;
+            uint16_t d_raw = blk[0] | ((uint16_t)blk[1] << 8);
+            float d = gpu_fp16_to_fp32(d_raw);
+            const uint8_t *qs = blk + 2;
+            for (int j = 0; j < 32; j++) {
+                int i = bi * 32 + j;
+                int v = (j < 16) ? (qs[j] & 0xF) : (qs[j - 16] >> 4);
+                sum += x[i] * (float)(v - 8) * d;
+            }
+        }
+        break;
+    }
+    case 8: { /* Q8_0 */
+        int n_blocks = dim / 32;
+        for (int bi = tid; bi < n_blocks; bi += gpuBlockDim_x) {
+            const uint8_t *blk = (const uint8_t *)wrow + (size_t)bi * 34;
+            uint16_t d_raw = blk[0] | ((uint16_t)blk[1] << 8);
+            float d = gpu_fp16_to_fp32(d_raw);
+            const int8_t *qs = (const int8_t *)(blk + 2);
+            for (int j = 0; j < 32; j++) {
+                int i = bi * 32 + j;
+                sum += x[i] * (float)qs[j] * d;
+            }
+        }
+        break;
+    }
+    }
+    /* Tree reduce */
+    float local = (float)sum;
+    __shared__ float sdata[256];
+    sdata[tid] = local;
+    gpuSyncthreads();
+    for (int s = 128; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        gpuSyncthreads();
+    }
+    if (tid == 0) out[h] = sdata[0];
+}
+
 /* ---- SSM recurrence kernel ----
  *
  * One thread block per head, 256 threads per block.
@@ -922,14 +983,16 @@ static int gguf_block_size(gguf_type_t qtype) {
     }
 }
 
-int picolm_gpu_tensor_upload(picolm_gpu_tensor_t **tensor,
+int picolm_gpu_tensor_upload(void **tensor,
                               const void *weights,
                               gguf_type_t qtype, int I, int O, int device) {
+    if (!tensor || !weights || I < 1 || O < 1) return 0;
+    picolm_gpu_tensor_t **tp = (picolm_gpu_tensor_t **)tensor;
     gpu_device_ctx_t *ctx = find_ctx(device);
-    if (!tensor || !weights || I < 1 || O < 1 || !select_ctx(ctx)) return 0;
+    if (!select_ctx(ctx)) return 0;
     int bs = gguf_block_size(qtype);
     if (!bs && qtype != 0) return 0;
-    if (*tensor) return 1; /* idempotent */
+    if (*tp) return 1; /* idempotent */
 
     /* Compute row bytes */
     size_t row_bytes;
@@ -983,7 +1046,7 @@ int picolm_gpu_tensor_upload(picolm_gpu_tensor_t **tensor,
             first_print = 0;
         }
     }
-    *tensor = t;
+    *tp = t;
     return 1;
 }
 
@@ -1230,6 +1293,51 @@ picolm_gpu_ssm_recurrence(float *state,
 
     if (!gpu_ok(gpuGetLastError(), "ssm recurrence") ||
         !gpu_ok(gpuDeviceSynchronize(), "ssm sync")) return 0;
+    return 1;
+}
+
+/* ---- SSM batched vec_dot API ---- */
+extern "C" int
+picolm_gpu_ssm_vecdot(float *out_host,
+                       const float *x_host,
+                       const void *weights_host,
+                       gguf_type_t qtype,
+                       int dim, int n_v_heads,
+                       int row_bytes,
+                       const int *head_map,
+                       int device) {
+    if (n_v_heads <= 0 || dim <= 0) return 0;
+    if (qtype != 2 && qtype != 8) return 0;
+
+    if (!gpu_ok(gpuSetDevice(device), "ssm vecdot device")) return 0;
+    gpu_device_ctx_t *ctx = NULL;
+    for (int i = 0; i < g_nctx; i++) {
+        if (g_gpu_ctx[i].device == device) { ctx = &g_gpu_ctx[i]; break; }
+    }
+    if (!ctx) return 0;
+
+    size_t x_bytes = (size_t)dim * sizeof(float);
+    size_t w_bytes = (size_t)n_v_heads * row_bytes;
+    size_t out_bytes = (size_t)n_v_heads * sizeof(float);
+
+    if (!reserve(&ctx->x, &ctx->x_cap, x_bytes) ||
+        !reserve(&ctx->y, &ctx->y_cap, out_bytes)) return 0;
+    void *w_dev = NULL;
+    if (!gpu_ok(gpuMalloc(&w_dev, w_bytes), "ssm vecdot w malloc")) return 0;
+
+    if (!gpu_ok(gpuMemcpy(ctx->x, x_host, x_bytes, gpuMemcpyHostToDevice), "ssm x h2d") ||
+        !gpu_ok(gpuMemcpy(w_dev, weights_host, w_bytes, gpuMemcpyHostToDevice), "ssm w h2d")) {
+        gpuFree(w_dev);
+        return 0;
+    }
+
+    dim3 grid((unsigned)n_v_heads, 1, 1);
+    picolm_ssm_vecdot_kernel<<<grid, 256, 256 * sizeof(float), ctx->stream>>>(
+        ctx->y, ctx->x, w_dev, qtype, dim, n_v_heads, row_bytes, head_map);
+    gpuFree(w_dev);
+
+    if (!gpu_ok(gpuDeviceSynchronize(), "ssm vecdot sync") ||
+        !gpu_ok(gpuMemcpy(out_host, ctx->y, out_bytes, gpuMemcpyDeviceToHost), "ssm out d2h")) return 0;
     return 1;
 }
 

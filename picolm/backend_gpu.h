@@ -41,7 +41,7 @@ int picolm_gpu_mem_info(int device, size_t *free_bytes, size_t *total_bytes);
  * On first call for a given slot, allocates device memory and uploads.
  * Subsequent calls with same params are no-ops (idempotent).
  * Returns 1 on success. */
-int picolm_gpu_tensor_upload(picolm_gpu_tensor_t **tensor,
+int picolm_gpu_tensor_upload(void **tensor,
                               const void *weights,
                               gguf_type_t qtype, int I, int O, int device);
 
@@ -88,6 +88,18 @@ int picolm_gpu_w4a16_matmul(picolm_gpu_tensor_t *t,
  *   beta: [n_v_heads] (float per-head beta)
  *   ssm_output: [d_state][n_v_heads] (dim-major)
  * Returns 1 on success. */
+/* SSM batched vec_dot: n_v_heads independent vec_dot calls on GPU.
+ * All pointers are host-side. head_map maps sequential h -> GGUF head index
+ * (NULL for identity). Returns 1 on success. */
+int picolm_gpu_ssm_vecdot(float *out,
+                           const float *x,
+                           const void *weights,
+                           gguf_type_t qtype,
+                           int dim, int n_v_heads,
+                           int row_bytes,
+                           const int *head_map,
+                           int device);
+
 int picolm_gpu_ssm_recurrence(float *state,
                                const float *q_conv,
                                const float *k_conv,

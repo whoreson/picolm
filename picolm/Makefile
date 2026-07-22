@@ -1,4 +1,4 @@
-CC      = gcc
+CC      ?= gcc
 CFLAGS  ?= -O3 -g -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic -fopenmp
 LDFLAGS = -lm -lpthread -fopenmp
 

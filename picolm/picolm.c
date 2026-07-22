@@ -290,25 +290,41 @@ int main(int argc, char **argv) {
     /* Load model */
     fprintf(stderr, "PicoLM v1.0-beta1\n");
     fprintf(stderr, "Loading model: %s\n", model_path);
-    fprintf(stderr, "SIMD: %s\n",
-#if defined(PICOLM_AVX512)
-        "AVX-512"
+    #if defined(PICOLM_AVX512)
+    fprintf(stderr, "SIMD: AVX-512\n");
 #elif defined(PICOLM_AVX2)
-        "AVX2"
+    fprintf(stderr, "SIMD: AVX2\n");
 #elif defined(PICOLM_AVX)
-        "AVX"
+    fprintf(stderr, "SIMD: AVX\n");
 #elif defined(PICOLM_SSE3)
-        "SSE3"
+    fprintf(stderr, "SIMD: SSE3\n");
 #elif defined(PICOLM_SSE2)
-        "SSE2"
+    fprintf(stderr, "SIMD: SSE2\n");
 #elif defined(PICOLM_NEON)
-        "NEON"
-#elif defined(PICOLM_ALTIVEC)
-        "Altivec"
+#if defined(PICOLM_I8MM)
+    fprintf(stderr, "SIMD: NEON +I8MM\n");
 #else
-        "scalar"
+    fprintf(stderr, "SIMD: NEON\n");
 #endif
-    );
+#elif defined(PICOLM_ALTIVEC)
+    fprintf(stderr, "SIMD: Altivec\n");
+#else
+    fprintf(stderr, "SIMD: scalar\n");
+#endif
+
+    /* Runtime check: warn if CPU supports I8MM but compiler didn't enable it */
+#if defined(__aarch64__) && !defined(PICOLM_I8MM) && !defined(_WIN32)
+    {
+        #include <sys/auxv.h>
+        #include <elf.h>
+        unsigned long hwcap2 = getauxval(AT_HWCAP2);
+        if (hwcap2 & (1UL << 13)) { /* HWCAP2_I8MM */
+            fprintf(stderr, "NOTE: CPU supports I8MM integer dot product but it was not compiled in.\n");
+            fprintf(stderr, "      Rebuild with GCC 15+ (-march=native) for ~2-3x faster Q4_K and Q8_0 inference.\n");
+        }
+    }
+#endif
+
     model_t model;
     /* Initialize FP16->FP32 lookup table (64KB) for fast attention */
     fp16_table_init();
