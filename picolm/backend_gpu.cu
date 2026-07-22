@@ -138,7 +138,7 @@ typedef hipEvent_t gpuEvent_t;
 #define gpuMemLocationType cudaMemLocationType
 #define gpuCudaMemLocationTypeDevice cudaMemLocationTypeDevice
 #define gpuCudaMemLocationTypecpu cudaMemLocationTypecpu
-#define gpuCudaMemAdviseSetReadMostly cudaMemAdviseSetReadMostly
+#define gpuCudaMemAdviseSetPreferredLocation cudaMemAdviseSetPreferredLocation
 #endif
 
 /* ---- Device-side FP16 helpers ---- */
@@ -849,11 +849,15 @@ static int reserve(float **ptr, size_t *cap, size_t bytes) {
     if (err == gpuSuccess && *ptr) {
         /* Advise: prefer GPU placement for these scratch buffers.
          * They are written by CPU (H2D equivalent), read by GPU kernel, then
-         * read by CPU (D2H equivalent). GPU placement minimizes NVLink traffic. */
+         * read by CPU (D2H equivalent). GPU placement minimizes NVLink traffic.
+         * Use SetPreferredLocation (not SetReadMostly) because these buffers
+         * are actively written by both CPU and GPU - SetReadMostly would force
+         * the driver to maintain and invalidate read-only replicas on every
+         * write, adding overhead rather than reducing it. */
         gpuMemLocation loc;
         loc.type = gpuCudaMemLocationTypeDevice;
         loc.id = -1; /* any device */
-        (void)gpuMemAdvise(*ptr, bytes, gpuCudaMemAdviseSetReadMostly, loc);
+        (void)gpuMemAdvise(*ptr, bytes, gpuCudaMemAdviseSetPreferredLocation, loc);
     }
 #endif
     if (!gpu_ok(err, "scratch allocation")) {

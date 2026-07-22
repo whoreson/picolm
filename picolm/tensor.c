@@ -15,9 +15,9 @@
  * orchestrator thread (the same thread that calls model_forward/model_forward_prefill).
  * All task functions passed to tensor_parallel_for must NOT call matmul/matmul_batch.
  *
- * In DEBUG mode we record the orchestrator thread ID and abort if any GPU dispatch
+ * We record the orchestrator thread ID and abort if any GPU dispatch
  * or tensor_set_gpu_tensor call originates from a different thread. This catches
- * silent corruption (wrong weight matrix used) rather than just crashes. */
+ * silent corruption (wrong weight matrix used) by converting it into a loud crash. */
 static picolm_gpu_tensor_t *gpu_tensor = NULL;
 static int gpu_device = 0;
 static pthread_t gpu_orchestrator_thread = 0;
@@ -570,15 +570,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
 #ifdef PICOLM_GPU
     if (gpu_tensor && d > 0 && n > 0) {
         gpu_assert_orchestrator("matmul GPU dispatch");
-        /* Try WMMA Tensor Core for aligned Q4_0 matrices */
-        if (picolm_gpu_w4a16_matmul(gpu_tensor, out, x, 1, gpu_device)) {
-            static int gpu_matmul_count = 0;
-            if (gpu_matmul_count++ == 0) {
-                fprintf(stderr, "INFO: GPU WMMA matmul active\n");
-            }
-            return;
-        }
-        /* GPU path: single-token GEMV (S=1) */
+        /* GPU path: single-token GEMV (S=1). WMMA requires S>=16 so skip it here. */
         if (picolm_gpu_matmul(gpu_tensor, out, x, 1, gpu_device)) {
             static int gpu_matmul_count = 0;
             if (gpu_matmul_count++ == 0) {

@@ -149,22 +149,43 @@ asan: picolm
 
 # --- ROCm/HIP GPU backend ---
 ROCM_LIB ?= /opt/rocm-6.3.3/lib
+
+# HIP target architecture.
+#   Default: gfx940 (CDNA2, first generation with hipWMMA)
+#   Options: gfx906/908 (RDNA2/3, no WMMA), gfx940/941/942 (CDNA2+, WMMA)
+HIP_ARCH ?= gfx940
+
 .PHONY: hip
 hip: backend_gpu.o.hip
 	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -DPICOLM_GPU=1" GPU_OBJS="backend_gpu.o.hip" GPU_LIBS="-L$(ROCM_LIB) -lamdhip64 -lstdc++ -Wl,-rpath,$(ROCM_LIB)"
 
 backend_gpu.o.hip: backend_gpu.cu backend_gpu.h quant.h
-	$(HIPCC) $(HIPFLAGS) -DPICOLM_GPU=1 -c -o $@ $< -I.
+	$(HIPCC) $(HIPFLAGS) --amdgpu-target=$(HIP_ARCH) -DPICOLM_GPU=1 -c -o $@ $< -I.
 
 # --- CUDA (NVIDIA) GPU backend ---
-NVCC ?= nvcc
-CUDA_LIB ?= /usr/local/cuda/lib64
-CUDAFLAGS ?= -O3 -std=c++11 -Xcompiler="-fPIC"
+NVCC      ?= nvcc
+CUDA_LIB  ?= /usr/local/cuda/lib64
+
+# CUDA target architecture(s).
+#   Single arch (thin binary):   CUDA_ARCH=sm_121
+#   Multiple archs (fat binary): CUDA_ARCHS="sm_70 sm_80 sm_121"
+#   Default: sm_70 (Volta+; sufficient for WMMA Tensor Cores)
+#   GPU compute capabilities:
+#     sm_70 Volta, sm_75 Turing, sm_80 Ampere, sm_86/89 Ampere/Ada,
+#     sm_90 Hopper, sm_121 Blackwell (GB10)
+CUDA_ARCH ?= sm_70
+CUDA_ARCHS = $(CUDA_ARCH)
+
+# Build -gencode flags from CUDA_ARCHS
+CUDA_GENCODE := $(foreach arch,$(CUDA_ARCHS),-gencode arch=compute_$(subst sm_,,$(arch)),code=$(arch))
+
+CUDAFLAGS   ?= -O3 -std=c++11 -Xcompiler="-fPIC"
+
 .PHONY: cuda
 cuda: backend_gpu.o.cuda
 	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -DPICOLM_GPU=1" GPU_OBJS="backend_gpu.o.cuda" GPU_LIBS="-L$(CUDA_LIB) -lcudart -lstdc++ -Wl,-rpath,$(CUDA_LIB)"
 
 backend_gpu.o.cuda: backend_gpu.cu backend_gpu.h quant.h
-	$(NVCC) $(CUDAFLAGS) -DPICOLM_GPU=1 -c -o $@ $< -I.
+	$(NVCC) $(CUDAFLAGS) $(CUDA_GENCODE) -DPICOLM_GPU=1 -c -o $@ $< -I.
 
 .PHONY: hip cuda
