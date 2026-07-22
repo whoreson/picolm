@@ -548,41 +548,8 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
 #ifdef PICOLM_GPU
     if (gpu_tensor && d > 0 && n > 0) {
         /* GPU path: single-token GEMV (S=1) */
-        static int gpu_matmul_count = 0;
         if (picolm_gpu_matmul(gpu_tensor, out, x, 1, gpu_device)) {
-            /* Debug: compare GPU vs CPU output */
-            if (getenv("PICOLM_DBG_MATMUL")) {
-                float *cpu_out = (float *)malloc(d * sizeof(float));
-                const char *wrow_base = (const char *)W;
-                switch (qtype) {
-                    case GGUF_TYPE_Q8_0: {
-                        for (int i = 0; i < d; i++) {
-                            const block_q8_0 *wrow = (const block_q8_0 *)(wrow_base + (size_t)i * gguf_type_row_size(qtype, n));
-                            cpu_out[i] = vec_dot_q8_0_f32(wrow, x, n);
-                        }
-                        break;
-                    }
-                    default: return; /* only debug Q8_0 for now */
-                }
-                float max_err = 0; int max_idx = -1;
-                int n_zero_gpu = 0, n_mismatch = 0;
-                int first_zero = -1, last_zero = -1;
-                for (int i = 0; i < d; i++) {
-                    float err = fabsf(out[i] - cpu_out[i]);
-                    if (err > max_err) { max_err = err; max_idx = i; }
-                    if (out[i] == 0.0f) {
-                        n_zero_gpu++;
-                        if (first_zero < 0) first_zero = i;
-                        last_zero = i;
-                    }
-                    if (err > 0.01f) n_mismatch++;
-                }
-                fprintf(stderr, "[GPU dbg] matmul %03d d=%d n=%d max_err=%.6f@%d (gpu=%.4f cpu=%.4f) zeros=%d range=[%d,%d] mismatches=%d\n",
-                        gpu_matmul_count, d, n, max_err, max_idx,
-                        max_idx >= 0 ? out[max_idx] : 0, max_idx >= 0 ? cpu_out[max_idx] : 0,
-                        n_zero_gpu, first_zero, last_zero, n_mismatch);
-                free(cpu_out);
-            }
+            static int gpu_matmul_count = 0;
             if (gpu_matmul_count++ == 0) {
                 fprintf(stderr, "INFO: GPU matmul active\n");
             }
