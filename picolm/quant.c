@@ -1373,7 +1373,7 @@ void quantize_row_q8_K(const float *x, void *dst, int n) {
         y[i].d = 1.0f / id;
 
 #ifdef PICOLM_NEON
-        for (int j = 0; j < 64; j += 8) {
+        for (int j = 0; j < 256; j += 8) {
             float32x4_t v0 = vld1q_f32(x + j);
             float32x4_t v1 = vld1q_f32(x + j + 4);
             int32x4_t vi0 = vcvtnq_s32_f32(vmulq_n_f32(v0, id));
