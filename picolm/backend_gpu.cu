@@ -554,6 +554,7 @@ struct picolm_gpu_tensor {
     size_t row_bytes;
     int block_size;  /* bytes per quant block (18 for q4_0, 34 for q8_0, etc.) */
     int tracked;
+    int zero_copy;   /* 1 if using cudaHostRegister (unified memory), 0 if copied */
 };
 
 typedef struct {
@@ -719,47 +720,39 @@ int picolm_gpu_tensor_upload(picolm_gpu_tensor_t **tensor,
     t->qtype = qtype; t->I = I; t->O = O; t->device = device;
     t->row_bytes = row_bytes; t->block_size = bs;
 
-    if (!gpu_ok(gpuMalloc(&t->weights, total), "tensor allocation")) {
-        fprintf(stderr, "[GPU] OOM: I=%d O=%d qtype=%d total=%zu MB (gpu_used=%.1f MB)\n",
-                I, O, qtype, total/(1024*1024), ctx->tensor_bytes/(1024.0*1024));
-        free(t); return 0;
+    /* Try zero-copy first: register CPU memory with GPU (unified memory SoC) */
+    gpuError_t zc_err = gpuHostRegister(weights, total, 0);
+    if (gpu_ok(zc_err, "zero-copy register")) {
+        /* Success: GPU can read directly from CPU memory */
+        t->weights = (void *)weights;
+        t->zero_copy = 1;
+        t->tracked = 1;
+        ctx->tensor_count++;
+        /* Don't count zero-copy tensors in tensor_bytes (shared memory) */
+    } else {
+        /* Fallback: allocate GPU memory and copy */
+        if (!gpu_ok(gpuMalloc(&t->weights, total), "tensor allocation")) {
+            fprintf(stderr, "[GPU] OOM: I=%d O=%d qtype=%d total=%zu MB (gpu_used=%.1f MB)\n",
+                    I, O, qtype, total/(1024*1024), ctx->tensor_bytes/(1024.0*1024));
+            free(t); return 0;
+        }
+        if (!gpu_ok(gpuMemcpy(t->weights, weights, total, gpuMemcpyHostToDevice),
+                    "tensor upload")) {
+            gpuFree(t->weights); free(t); return 0;
+        }
+        t->zero_copy = 0;
+        t->tracked = 1;
+        ctx->tensor_count++;
+        ctx->tensor_bytes += total;
     }
-    if (!gpu_ok(gpuMemcpy(t->weights, weights, total, gpuMemcpyHostToDevice),
-                "tensor upload")) {
-        gpuFree(t->weights); free(t); return 0;
-    }
-    t->tracked = 1;
-    ctx->tensor_count++;
-    ctx->tensor_bytes += total;
     
-    /* Diagnostic: verify upload by downloading first/last/middle bytes */
+    /* Print upload summary for first tensor */
     {
-        static int verify_count = 0;
-        const uint8_t *cpu = (const uint8_t *)weights;
-        size_t check_bytes = total > 64 ? 64 : total;
-        uint8_t *h_verify = (uint8_t *)malloc(check_bytes);
-        gpuMemcpy(h_verify, t->weights, check_bytes, gpuMemcpyDeviceToHost);
-        for (size_t i = 0; i < check_bytes; i++) {
-            if (h_verify[i] != cpu[i]) {
-                fprintf(stderr, "[GPU] VERIFY FAIL tensor #%d byte %zu: gpu=%02x cpu=%02x\n",
-                        verify_count, i, h_verify[i], cpu[i]);
-                break;
-            }
+        static int first_print = 1;
+        if (first_print) {
+            fprintf(stderr, "[GPU] upload mode: %s\n", t->zero_copy ? "zero-copy (unified)" : "copied");
+            first_print = 0;
         }
-        /* Check last 64 bytes */
-        if (total > 128) {
-            size_t off = total - check_bytes;
-            gpuMemcpy(h_verify, (const char *)t->weights + off, check_bytes, gpuMemcpyDeviceToHost);
-            for (size_t i = 0; i < check_bytes; i++) {
-                if (h_verify[i] != cpu[off + i]) {
-                    fprintf(stderr, "[GPU] VERIFY FAIL tensor #%d byte %zu: gpu=%02x cpu=%02x\n",
-                            verify_count, off+i, h_verify[i], cpu[off+i]);
-                    break;
-                }
-            }
-        }
-        verify_count++;
-        free(h_verify);
     }
     *tensor = t;
     return 1;
@@ -775,7 +768,11 @@ void picolm_gpu_tensor_free(picolm_gpu_tensor_t *t) {
         }
     }
     if (t->weights) {
-        gpuFree(t->weights);
+        if (t->zero_copy) {
+            gpuHostUnregister(t->weights);
+        } else {
+            gpuFree(t->weights);
+        }
         t->weights = NULL;
     }
     free(t);
