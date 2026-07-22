@@ -33,6 +33,14 @@ void fp16_table_init(void);
 #  define PICOLM_DOTPROD 1
 #endif
 
+/* ARMv8.2 I8MM (vmmlaq_s32 / vmmlaq_u32). 16 int8 x int8 -> 4 int32 lanes.
+ * Each lane is an 8-element dot product. vmmlaq_s32 computes a 2x2 block
+ * matmul: lanes 0,1,2,3 = a_lo.b_lo, a_lo.b_hi, a_hi.b_lo, a_hi.b_hi.
+ * Requires __ARM_FEATURE_SVE_MATMUL_INT8 or explicit -march=armv8.2-a+i8mm. */
+#if defined(__ARM_FEATURE_SVE_MATMUL_INT8)
+#  define PICOLM_I8MM 1
+#endif
+
 /* --- ARM NEON --- */
 /* Guard against CUDA device compilation: nvcc cannot handle arm_neon.h */
 #if (defined(__ARM_NEON) || defined(__ARM_NEON__)) && !defined(__CUDACC__)

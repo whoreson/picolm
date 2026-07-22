@@ -1842,6 +1842,57 @@ float vec_dot_q4_0_q8_0(const void *vx, const void *wy, int n) {
         sumf = hsum_avx(accum);
     }
 
+#elif defined(PICOLM_I8MM)
+    /* I8MM: vmmlaq_s32 for int8 x int8 -> int32 MAC.
+     * Q4_0: 16 bytes qs (nibbles), 32 values. Extract low/high nibbles to int8,
+     * subtract 8 for signed offset. Each vmmlaq processes 16 int8 elements.
+     * For a Q4_0 block: low nibbles (16 values) vmmlaq with q8[0..15],
+     * high nibbles (16 values) vmmlaq with q8[16..31]. */
+    {
+        const uint8x16_t mask4 = vdupq_n_u8(0x0F);
+        const int8x16_t offset8 = vdupq_n_s8(8);
+        float32x4_t sumv = vdupq_n_f32(0.0f);
+
+        for (; ib + 1 < nb; ib += 2) {
+            /* Block ib */
+            const uint8x16_t qx4 = vld1q_u8(x[ib].qs);
+            const int8x16_t qy0 = vld1q_s8(y[ib].qs);
+            const int8x16_t qy1 = vld1q_s8(y[ib].qs + 16);
+            {
+                /* Low nibbles: qs & 0xF, subtract 8 */
+                int8x16_t qx_lo = vreinterpretq_s8_u8(vandq_u8(qx4, mask4));
+                qx_lo = vsubq_s8(qx_lo, offset8);
+                /* High nibbles: qs >> 4, subtract 8 */
+                int8x16_t qx_hi = vreinterpretq_s8_u8(vshrq_n_u8(qx4, 4));
+                qx_hi = vsubq_s8(qx_hi, offset8);
+                /* vmmlaq: each does 4 8-element dot products -> sum all 8 lanes */
+                int32x4_t s_lo = vmmlaq_s32(vdupq_n_s32(0), qx_lo, qy0);
+                int32x4_t s_hi = vmmlaq_s32(vdupq_n_s32(0), qx_hi, qy1);
+                int32x4_t s = vaddq_s32(s_lo, s_hi);
+                int32_t dot_i = vaddvq_s32(s);
+                float di = fp16_to_fp32_lookup(x[ib].d) * fp16_to_fp32_lookup(y[ib].d);
+                sumv = vmlaq_n_f32(sumv, vcvtq_n_f32_s32(dot_i), di);
+            }
+            /* Block ib+1 */
+            const uint8x16_t qx4b = vld1q_u8(x[ib+1].qs);
+            const int8x16_t qyb0 = vld1q_s8(y[ib+1].qs);
+            const int8x16_t qyb1 = vld1q_s8(y[ib+1].qs + 16);
+            {
+                int8x16_t qx_lo = vreinterpretq_s8_u8(vandq_u8(qx4b, mask4));
+                qx_lo = vsubq_s8(qx_lo, offset8);
+                int8x16_t qx_hi = vreinterpretq_s8_u8(vshrq_n_u8(qx4b, 4));
+                qx_hi = vsubq_s8(qx_hi, offset8);
+                int32x4_t s_lo = vmmlaq_s32(vdupq_n_s32(0), qx_lo, qyb0);
+                int32x4_t s_hi = vmmlaq_s32(vdupq_n_s32(0), qx_hi, qyb1);
+                int32x4_t s = vaddq_s32(s_lo, s_hi);
+                int32_t dot_j = vaddvq_s32(s);
+                float dj = fp16_to_fp32_lookup(x[ib+1].d) * fp16_to_fp32_lookup(y[ib+1].d);
+                sumv = vmlaq_n_f32(sumv, vcvtq_n_f32_s32(dot_j), dj);
+            }
+        }
+        sumf = vaddvq_f32(sumv);
+    }
+
 #elif defined(PICOLM_SSSE3)
     {
         const __m128i mask4 = _mm_set1_epi8(15);
@@ -1947,6 +1998,33 @@ float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n) {
         acc = _mm256_add_ps(acc, _mm256_add_ps(_mm256_mul_ps(f0, dd0), _mm256_mul_ps(f1, dd1)));
     }
     sumf = hsum_avx(acc);
+
+#elif defined(PICOLM_I8MM)
+    /* I8MM: vmmlaq_s32 for int8 x int8 -> int32 MAC, 2 blocks/iter */
+    float32x4_t sumv0 = vdupq_n_f32(0.0f);
+    float32x4_t sumv1 = vdupq_n_f32(0.0f);
+    for (i = 0; i + 1 < nb; i += 2) {
+        const int8x16_t xi_0 = vld1q_s8(x[i].qs);
+        const int8x16_t xi_1 = vld1q_s8(x[i].qs + 16);
+        const int8x16_t wi_0 = vld1q_s8(w[i].qs);
+        const int8x16_t wi_1 = vld1q_s8(w[i].qs + 16);
+        int32x4_t si = vaddq_s32(vmmlaq_s32(vdupq_n_s32(0), xi_0, wi_0),
+                                  vmmlaq_s32(vdupq_n_s32(0), xi_1, wi_1));
+        int32_t dot_i = vaddvq_s32(si);
+        const float d = fp16_to_fp32_lookup(x[i].d) * fp16_to_fp32_lookup(w[i].d);
+        sumv0 = vmlaq_n_f32(sumv0, vcvtq_n_f32_s32(dot_i), d);
+
+        const int8x16_t xj_0 = vld1q_s8(x[i+1].qs);
+        const int8x16_t xj_1 = vld1q_s8(x[i+1].qs + 16);
+        const int8x16_t wj_0 = vld1q_s8(w[i+1].qs);
+        const int8x16_t wj_1 = vld1q_s8(w[i+1].qs + 16);
+        int32x4_t sj = vaddq_s32(vmmlaq_s32(vdupq_n_s32(0), xj_0, wj_0),
+                                  vmmlaq_s32(vdupq_n_s32(0), xj_1, wj_1));
+        int32_t dot_j = vaddvq_s32(sj);
+        const float dj = fp16_to_fp32_lookup(x[i+1].d) * fp16_to_fp32_lookup(w[i+1].d);
+        sumv1 = vmlaq_n_f32(sumv1, vcvtq_n_f32_s32(dot_j), dj);
+    }
+    sumf = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
 
 #elif defined(PICOLM_NEON)
     /* NEON: optimized int8 MAC via vpaddlq_s16, 2 blocks/iter (mirrors llama.cpp) */
@@ -2197,7 +2275,56 @@ float vec_dot_q8_0_q8_0_deltas(const void *qx, const float *qx_d, const void *qw
     float sumf = 0.0f;
     int i = 0;
 
-#ifdef PICOLM_NEON
+#ifdef PICOLM_I8MM
+    /* I8MM: vmmlaq_s32 processes 16 int8 elements -> 4 int32 lanes.
+     * Each lane is an 8-element dot product. For a Q8_0 block (32 elements),
+     * 2 vmmlaq calls handle all 32 elements -> 8 int32 lanes.
+     * Layout per vmmlaq: lanes 0,1,2,3 = a_lo.b_lo, a_lo.b_hi, a_hi.b_lo, a_hi.b_hi
+     * where lo=qs[0..7], hi=qs[8..15]. So for 32 elements we need:
+     * vmmlaq(x[0..15], w[0..15]) -> 4 lanes covering x[0..7].w[0..7], x[0..7].w[8..15], x[8..15].w[0..7], x[8..15].w[8..15]
+     * vmmlaq(x[16..31], w[16..31]) -> 4 lanes covering x[16..23].w[16..23], etc.
+     * Total: 8 lanes, each a partial sum. Sum all 8 lanes = full dot product.
+     * 
+     * We process 2 blocks per iteration, accumulating 8+8 = 16 int32 lanes.
+     * Then horizontally sum into 2 float4 accumulators. */
+    float32x4_t sumv0 = vdupq_n_f32(0.0f);
+    float32x4_t sumv1 = vdupq_n_f32(0.0f);
+    
+    for (i = 0; i + 1 < nb; i += 2) {
+        /* Block i */
+        const int8x16_t xi_0 = vld1q_s8(x[i].qs);     /* qs[0..15] */
+        const int8x16_t xi_1 = vld1q_s8(x[i].qs + 16); /* qs[16..31] */
+        const int8x16_t wi_0 = vld1q_s8(w[i].qs);
+        const int8x16_t wi_1 = vld1q_s8(w[i].qs + 16);
+        
+        int32x4_t s0 = vmmlaq_s32(vdupq_n_s32(0), xi_0, wi_0); /* 4 lanes: x[0..7].w[0..7], x[0..7].w[8..15], x[8..15].w[0..7], x[8..15].w[8..15] */
+        int32x4_t s1 = vmmlaq_s32(vdupq_n_s32(0), xi_1, wi_1); /* 4 lanes: x[16..23].w[16..23], ... */
+        int32x4_t si = vaddq_s32(s0, s1); /* 8 partial sums -> 4 lanes, each = sum of 16 elements */
+        /* Now si has 4 lanes, each is a partial dot product of 16 elements.
+         * Actually no: s0[0] = x[0..7].w[0..7], s1[0] = x[16..23].w[16..23]
+         * So si[0] = x[0..7].w[0..7] + x[16..23].w[16..23]
+         * We still need si[1] + si[2] + si[3] too.
+         * Total = sum of all 4 lanes of si = full dot product of 32 elements. */
+        int32_t dot_i = vaddvq_s32(si);
+        float d = qx_d[i] * fp16_to_fp32_lookup(w[i].d);
+        sumv0 = vmlaq_n_f32(sumv0, vcvtq_n_f32_s32(dot_i), d);
+        
+        /* Block i+1 */
+        const int8x16_t xj_0 = vld1q_s8(x[i+1].qs);
+        const int8x16_t xj_1 = vld1q_s8(x[i+1].qs + 16);
+        const int8x16_t wj_0 = vld1q_s8(w[i+1].qs);
+        const int8x16_t wj_1 = vld1q_s8(w[i+1].qs + 16);
+        
+        int32x4_t sj0 = vmmlaq_s32(vdupq_n_s32(0), xj_0, wj_0);
+        int32x4_t sj1 = vmmlaq_s32(vdupq_n_s32(0), xj_1, wj_1);
+        int32x4_t sj = vaddq_s32(sj0, sj1);
+        int32_t dot_j = vaddvq_s32(sj);
+        float dj = qx_d[i+1] * fp16_to_fp32_lookup(w[i+1].d);
+        sumv1 = vmlaq_n_f32(sumv1, vcvtq_n_f32_s32(dot_j), dj);
+    }
+    sumf = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
+
+#elif defined(PICOLM_NEON)
     /* NEON: optimized int8 MAC via vpaddlq_s16, 2 blocks/iter */
     float32x4_t sumv0 = vdupq_n_f32(0.0f);
     float32x4_t sumv1 = vdupq_n_f32(0.0f);
