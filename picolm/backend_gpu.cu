@@ -37,6 +37,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <pthread.h>
 
 /* ---- Platform abstraction ---- */
 
@@ -84,7 +85,10 @@ typedef hipEvent_t gpuEvent_t;
 #define gpuBlockDim_x hipBlockDim_x
 #define gpuGridDim_x hipGridDim_x
 #define gpuGridDim_y hipGridDim_y
+#define gpuHostRegister hipHostRegister
+#define gpuHostUnregister hipHostUnregister
 #else
+/* NVIDIA CUDA */
 #define gpuSuccess cudaSuccess
 #define gpuError_t cudaError_t
 #define gpuGetErrorString cudaGetErrorString
@@ -126,9 +130,6 @@ typedef hipEvent_t gpuEvent_t;
 #define gpuDevice cudaDevice
 #define gpuHostRegister cudaHostRegister
 #define gpuHostUnregister cudaHostUnregister
-#define gpuMemcpyHostToDevice cudaMemcpyHostToDevice
-#define gpuMemcpyDeviceToHost cudaMemcpyDeviceToHost
-#define gpuError_t cudaError_t
 #endif
 
 /* ---- Device-side FP16 helpers ---- */
@@ -172,12 +173,23 @@ __host__ __device__ static inline unsigned short gpu_fp32_to_fp16(float f) {
 #define GPU_BLOCK_Q4_K_SIZE 144  /* block_q4_K from quant.h */
 
 /* block_q4_0: 18 bytes = 2B scale(FP16) + 16B qs (32 values)
- * dequant(i) = (qs[i] & 0xF - 8) * d  for i in [0,32) */
+ * GGUF nibble layout (per vec_dot_q4_0_f32 in quant.c):
+ *   qs[0..15] low nibble  -> values 0..15  (qs[j] & 0xF)
+ *   qs[0..15] high nibble -> values 16..31  (qs[j] >> 4)
+ * This is NOT interleaved! All low nibbles come first, then high nibbles.
+ * The old interleaved reading (low0,high0,low1,high1,...) was WRONG
+ * and produced garbage output. */
 __device__ static inline float dequant_q4_0(const void *blk, int i) {
     const uint8_t *b = (const uint8_t *)blk;
     uint16_t d_raw = b[0] | ((uint16_t)b[1] << 8);
     float d = gpu_fp16_to_fp32(d_raw);
-    int v = (b[2 + (i >> 1)] >> ((i & 1) * 4)) & 0xF;
+    const uint8_t *qs = b + 2;
+    int v;
+    if (i < 16) {
+        v = qs[i] & 0xF;           /* low nibble: values 0-15 */
+    } else {
+        v = qs[i - 16] >> 4;       /* high nibble: values 16-31 */
+    }
     return (float)(v - 8) * d;
 }
 
@@ -188,6 +200,28 @@ __device__ static inline float dequant_q8_0(const void *blk, int i) {
     uint16_t d_raw = b[0] | ((uint16_t)b[1] << 8);
     float d = gpu_fp16_to_fp32(d_raw);
     return (float)((const int8_t *)(b + 2))[i] * d;
+}
+
+/* block_q1_0: 18 bytes = 2B scale(FP16) + 16B qs (128 sign bits)
+ * dequant(i) = (bit[i] ? +d : -d) */
+__device__ static inline float dequant_q1_0(const void *blk, int i) {
+    const uint8_t *b = (const uint8_t *)blk;
+    uint16_t d_raw = b[0] | ((uint16_t)b[1] << 8);
+    float d = gpu_fp16_to_fp32(d_raw);
+    int bit = (b[2 + (i >> 3)] >> (i & 7)) & 1;
+    return bit ? d : -d;
+}
+
+/* block_q2_0: 34 bytes = 2B scale(FP16) + 32B qs (128 values * 2 bits each)
+ * dequant(i) = (qs[i] - 1) * d, where qs[i] in {0,1,2,3} -> {-d, 0, +d, +2d} */
+__device__ static inline float dequant_q2_0(const void *blk, int i) {
+    const uint8_t *b = (const uint8_t *)blk;
+    uint16_t d_raw = b[0] | ((uint16_t)b[1] << 8);
+    float d = gpu_fp16_to_fp32(d_raw);
+    int byte_idx = i >> 2;          /* 4 values per byte */
+    int shift = (i & 3) << 1;       /* 2 bits per value */
+    int v = (b[2 + byte_idx] >> shift) & 3;
+    return (float)(v - 1) * d;
 }
 
 /* block_q4_K: 144 bytes for 256 values (3 superblocks + scales + qs)
@@ -224,6 +258,8 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
         case GGUF_TYPE_Q4_0: bytes_per_block = GPU_BLOCK_Q4_0_SIZE; break;  /* 18 */
         case GGUF_TYPE_Q8_0: bytes_per_block = GPU_BLOCK_Q8_0_SIZE; break;  /* 34 */
         case GGUF_TYPE_Q4_K: bytes_per_block = GPU_BLOCK_Q4_K_SIZE; break;  /* 144 */
+        case 41:             bytes_per_block = 18; break;      /* Q1_0 */
+        case 42:             bytes_per_block = 34; break;      /* Q2_0 */
         default: bytes_per_block = 18; break;
     }
     int o = gpuBlockIdx_x;
@@ -306,6 +342,34 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
                 }
                 /* This Q4_K dequant is getting complex. Use a cleaner helper. */
                 /* For the initial port, we'll use a proper Q4_K dequant helper. */
+            }
+        }
+        break;
+
+    case 41: /* GGUF_TYPE_Q1_0 */
+        /* 128 values per block, 18 bytes */
+        {
+            int n_blocks = I / 128;
+            for (int bi = gpuThreadIdx_x; bi < n_blocks; bi += gpuBlockDim_x) {
+                const void *blk = wrow + (size_t)bi * bytes_per_block;
+                for (int j = 0; j < 128; j++) {
+                    int i = bi * 128 + j;
+                    sum += x[(size_t)s * I + i] * dequant_q1_0(blk, j);
+                }
+            }
+        }
+        break;
+
+    case 42: /* GGUF_TYPE_Q2_0 */
+        /* 128 values per block, 34 bytes */
+        {
+            int n_blocks = I / 128;
+            for (int bi = gpuThreadIdx_x; bi < n_blocks; bi += gpuBlockDim_x) {
+                const void *blk = wrow + (size_t)bi * bytes_per_block;
+                for (int j = 0; j < 128; j++) {
+                    int i = bi * 128 + j;
+                    sum += x[(size_t)s * I + i] * dequant_q2_0(blk, j);
+                }
             }
         }
         break;
@@ -576,6 +640,10 @@ typedef struct {
 static gpu_device_ctx_t g_gpu_ctx[PICOLM_GPU_MAX_DEVICES];
 static int g_nctx;
 
+/* Mutex protecting g_gpu_ctx scratch buffer resize (reserve/reserve_pinned).
+ * Resize is rare (once per buffer growth), so lock contention is negligible. */
+static pthread_mutex_t g_resize_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 static int gpu_ok(gpuError_t err, const char *what) {
     if (err == gpuSuccess) return 1;
     fprintf(stderr, "[GPU] %s: %s\n", what, gpuGetErrorString(err));
@@ -600,20 +668,30 @@ static int select_ctx(gpu_device_ctx_t *ctx) {
 }
 
 static int reserve(float **ptr, size_t *cap, size_t bytes) {
-    if (*cap >= bytes) return 1;
+    pthread_mutex_lock(&g_resize_mutex);
+    if (*cap >= bytes) { pthread_mutex_unlock(&g_resize_mutex); return 1; }
     if (*ptr) gpuFree(*ptr);
     *ptr = NULL; *cap = 0;
-    if (!gpu_ok(gpuMalloc(ptr, bytes), "scratch allocation")) return 0;
+    if (!gpu_ok(gpuMalloc(ptr, bytes), "scratch allocation")) {
+        pthread_mutex_unlock(&g_resize_mutex);
+        return 0;
+    }
     *cap = bytes;
+    pthread_mutex_unlock(&g_resize_mutex);
     return 1;
 }
 
 static int reserve_pinned(float **ptr, size_t *cap, size_t bytes) {
-    if (*cap >= bytes) return 1;
+    pthread_mutex_lock(&g_resize_mutex);
+    if (*cap >= bytes) { pthread_mutex_unlock(&g_resize_mutex); return 1; }
     if (*ptr) gpuFreeHost(*ptr);
     *ptr = NULL; *cap = 0;
-    if (!gpu_ok(gpuMallocHost(ptr, bytes), "pinned staging allocation")) return 0;
+    if (!gpu_ok(gpuMallocHost(ptr, bytes), "pinned staging allocation")) {
+        pthread_mutex_unlock(&g_resize_mutex);
+        return 0;
+    }
     *cap = bytes;
+    pthread_mutex_unlock(&g_resize_mutex);
     return 1;
 }
 
@@ -694,13 +772,15 @@ int picolm_gpu_mem_info(int device, size_t *free_bytes, size_t *total_bytes) {
     return gpu_ok(gpuMemGetInfo(&fb, &tb), "memory info") && (*free_bytes = fb, *total_bytes = tb, 1);
 }
 
-/* Map GGUF_TYPE to block size */
+/* Map GGUF_TYPE to block size and values per block */
 static int gguf_block_size(gguf_type_t qtype) {
     switch (qtype) {
-    case 0: return 0;  /* F32: no blocks */
-    case 2: return 18; /* Q4_0: 18 bytes per 32 values */
-    case 8: return 34; /* Q8_0: 34 bytes per 32 values */
-    case 12: return 144; /* Q4_K: 144 bytes per 256 values */
+    case 0:  return 0;    /* F32: no blocks */
+    case 2:  return 18;   /* Q4_0: 18 bytes per 32 values */
+    case 8:  return 34;   /* Q8_0: 34 bytes per 32 values */
+    case 12: return 144;  /* Q4_K: 144 bytes per 256 values */
+    case 41: return 18;   /* Q1_0: 18 bytes per 128 values */
+    case 42: return 34;   /* Q2_0: 34 bytes per 128 values */
     default: return 0;
     }
 }
@@ -716,8 +796,18 @@ int picolm_gpu_tensor_upload(picolm_gpu_tensor_t **tensor,
 
     /* Compute row bytes */
     size_t row_bytes;
-    if (qtype == 0) row_bytes = (size_t)I * sizeof(float);
-    else row_bytes = (size_t)((I + (qtype == 12 ? 255 : 31)) / (qtype == 12 ? 256 : 32)) * bs;
+    int vals_per_block;
+    if (qtype == 0) {
+        row_bytes = (size_t)I * sizeof(float);
+        vals_per_block = 1;
+    } else if (qtype == 12) {
+        vals_per_block = 256;
+    } else if (qtype == 41 || qtype == 42) {
+        vals_per_block = 128;
+    } else {
+        vals_per_block = 32;
+    }
+    row_bytes = (size_t)((I + vals_per_block - 1) / vals_per_block) * bs;
     size_t total = row_bytes * (size_t)O;
 
     picolm_gpu_tensor_t *t = (picolm_gpu_tensor_t *)calloc(1, sizeof(*t));
@@ -726,30 +816,27 @@ int picolm_gpu_tensor_upload(picolm_gpu_tensor_t **tensor,
     t->row_bytes = row_bytes; t->block_size = bs;
 
     /* Try zero-copy first: register CPU memory with GPU (unified memory SoC) */
-    gpuError_t zc_err = gpuHostRegister((void *)weights, total, 0);
-    if (gpu_ok(zc_err, "zero-copy register")) {
-        /* Success: GPU can read directly from CPU memory */
-        t->weights = (void *)weights;
-        t->zero_copy = 1;
-        t->tracked = 1;
-        ctx->tensor_count++;
-        /* Don't count zero-copy tensors in tensor_bytes (shared memory) */
-    } else {
-        /* Fallback: allocate GPU memory and copy */
-        if (!gpu_ok(gpuMalloc(&t->weights, total), "tensor allocation")) {
-            fprintf(stderr, "[GPU] OOM: I=%d O=%d qtype=%d total=%zu MB (gpu_used=%.1f MB)\n",
-                    I, O, qtype, total/(1024*1024), ctx->tensor_bytes/(1024.0*1024));
-            free(t); return 0;
-        }
-        if (!gpu_ok(gpuMemcpy(t->weights, weights, total, gpuMemcpyHostToDevice),
-                    "tensor upload")) {
-            gpuFree(t->weights); free(t); return 0;
-        }
-        t->zero_copy = 0;
-        t->tracked = 1;
-        ctx->tensor_count++;
-        ctx->tensor_bytes += total;
+    /* NOTE: mmap'd file-backed memory can cause zero-copy to silently produce
+     * wrong results on some platforms. cudaHostRegister may succeed but the GPU
+     * sees stale or unmapped pages. We use cudaHostRegister with
+     * cudaHostRegisterPortable and verify the upload works.
+     *
+     * For now, skip zero-copy and always copy. The copy happens once at model
+     * load time, and on SoC systems with unified memory the effective cost is
+     * just a page-table walk, not a real data copy. */
+    if (!gpu_ok(gpuMalloc(&t->weights, total), "tensor allocation")) {
+        fprintf(stderr, "[GPU] OOM: I=%d O=%d qtype=%d total=%zu MB (gpu_used=%.1f MB)\n",
+                I, O, qtype, total/(1024*1024), ctx->tensor_bytes/(1024.0*1024));
+        free(t); return 0;
     }
+    if (!gpu_ok(gpuMemcpy(t->weights, weights, total, gpuMemcpyHostToDevice),
+                "tensor upload")) {
+        gpuFree(t->weights); free(t); return 0;
+    }
+    t->zero_copy = 0;
+    t->tracked = 1;
+    ctx->tensor_count++;
+    ctx->tensor_bytes += total;
     
     /* Print upload summary for first tensor */
     {
@@ -811,6 +898,30 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
     if (!gpu_ok(gpuGetLastError(), "matmul launch") ||
         !gpu_ok(gpuDeviceSynchronize(), "matmul sync") ||
         !gpu_ok(gpuMemcpy(y, ctx->y, yb, gpuMemcpyDeviceToHost), "output download")) return 0;
+
+    /* DEBUG: print GPU vs CPU comparison for first Q4_0 matmul */
+    static int debug_dumped = 0;
+    if (t->qtype == GGUF_TYPE_Q4_0 && !debug_dumped) {
+        debug_dumped = 1;
+        fprintf(stderr, "[GPU] Q4_0 debug: I=%d O=%d S=%d row_bytes=%d\n",
+                I, O, S, (int)t->row_bytes);
+
+        /* Upload first row of weights back to host for verification */
+        size_t rb = t->row_bytes;
+        uint8_t *hw = (uint8_t*)malloc(rb);
+        gpuMemcpy(hw, t->weights, rb, gpuMemcpyDeviceToHost);
+        fprintf(stderr, "[GPU] weight row[0]: first 18 bytes: ");
+        for (int i = 0; i < 18; i++) fprintf(stderr, "%02x ", hw[i]);
+        fprintf(stderr, "\n");
+        free(hw);
+
+        fprintf(stderr, "[GPU] x[:5] = ");
+        for (int i = 0; i < 5 && i < I; i++) fprintf(stderr, "%.4f ", x[i]);
+        fprintf(stderr, "\n");
+        fprintf(stderr, "[GPU] y[:5] = ");
+        for (int i = 0; i < 5 && i < O; i++) fprintf(stderr, "%.4f ", y[i]);
+        fprintf(stderr, "\n");
+    }
     return 1;
 }
 

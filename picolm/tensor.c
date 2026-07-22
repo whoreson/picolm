@@ -6,13 +6,37 @@
 
 #ifdef PICOLM_GPU
 #include "backend_gpu.h"
+#include <pthread.h>
 /* GPU dispatch: if a GPU tensor handle is registered for this weight matrix,
  * offload to GPU. The handle is stored per-tensor via tensor_set_gpu_tensor().
- * This is checked at the very start of matmul/matmul_batch before any CPU path. */
+ * This is checked at the very start of matmul/matmul_batch before any CPU path.
+ *
+ * Load-bearing invariant: gpu_tensor/gpu_device are accessed ONLY from the
+ * orchestrator thread (the same thread that calls model_forward/model_forward_prefill).
+ * All task functions passed to tensor_parallel_for must NOT call matmul/matmul_batch.
+ *
+ * In DEBUG mode we record the orchestrator thread ID and abort if any GPU dispatch
+ * or tensor_set_gpu_tensor call originates from a different thread. This catches
+ * silent corruption (wrong weight matrix used) rather than just crashes. */
 static picolm_gpu_tensor_t *gpu_tensor = NULL;
 static int gpu_device = 0;
+static pthread_t gpu_orchestrator_thread = 0;
+static int gpu_orchestrator_set = 0;
+
+static void gpu_assert_orchestrator(const char *fn) {
+    if (!gpu_orchestrator_set) return;
+    if (pthread_self() != gpu_orchestrator_thread) {
+        fprintf(stderr, "FATAL: GPU %s called from non-orchestrator thread (corruption risk)\n", fn);
+        abort();
+    }
+}
 
 void tensor_set_gpu_tensor(picolm_gpu_tensor_t *t, int device) {
+    if (!gpu_orchestrator_set) {
+        gpu_orchestrator_thread = pthread_self();
+        gpu_orchestrator_set = 1;
+    }
+    gpu_assert_orchestrator("tensor_set_gpu_tensor");
     gpu_tensor = t;
     gpu_device = device;
 }
@@ -547,11 +571,29 @@ static int pool_total_threads(int requested) {
 void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t qtype) {
 #ifdef PICOLM_GPU
     if (gpu_tensor && d > 0 && n > 0) {
+        gpu_assert_orchestrator("matmul GPU dispatch");
         /* GPU path: single-token GEMV (S=1) */
         if (picolm_gpu_matmul(gpu_tensor, out, x, 1, gpu_device)) {
             static int gpu_matmul_count = 0;
             if (gpu_matmul_count++ == 0) {
                 fprintf(stderr, "INFO: GPU matmul active\n");
+            }
+            /* DEBUG: verify first Q4_0 matmul against CPU */
+            if (qtype == GGUF_TYPE_Q4_0 && gpu_matmul_count == 1) {
+                /* Compute CPU reference for first 5 outputs */
+                size_t cpu_row_bytes = gguf_type_row_size(qtype, n);
+                float ref[5];
+                for (int i = 0; i < 5 && i < d; i++) {
+                    ref[i] = vec_dot((const char *)W + (size_t)i * cpu_row_bytes, x, n, qtype);
+                }
+                float max_err = 0;
+                for (int i = 0; i < 5 && i < d; i++) {
+                    float err = fabsf(out[i] - ref[i]);
+                    float rel = fabsf(ref[i]) > 1e-8f ? err / fabsf(ref[i]) : err;
+                    if (rel > max_err) max_err = rel;
+                    fprintf(stderr, "[VERIFY] out[%d]: GPU=%.6f CPU=%.6f rel_err=%.2e %s\n",
+                            i, out[i], ref[i], rel, rel < 1e-3f ? "OK" : "FAIL");
+                }
             }
             return;
         }
@@ -941,6 +983,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
                    const void *W, int n, int d, gguf_type_t qtype) {
 #ifdef PICOLM_GPU
     if (gpu_tensor && n_batch > 0 && d > 0 && n > 0) {
+        gpu_assert_orchestrator("matmul_batch GPU dispatch");
         if (picolm_gpu_matmul(gpu_tensor, out, x, n_batch, gpu_device)) return;
     }
 #endif
