@@ -772,6 +772,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
         }
 #endif
         /* Non-AVX2: fall through to generic vec_dot path */
+#endif
     } else if (qtype == GGUF_TYPE_Q4_K) {
         /* Q4_K fast path: quantize x to Q8_K once, then vec_dot_q4_K_q8_K */
         /* Only enabled on x86 (AVX/AVX2). On NEON, use vec_dot_q4_K_f32 instead. */
@@ -819,7 +820,6 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
             return;
         }
         /* If allocation failed, fall through to generic path */
-#endif
     } else if (qtype == GGUF_TYPE_Q1_0 || qtype == GGUF_TYPE_Q2_0) {
         /* Q1_0/Q2_0 fast path: quantize x to Q8_0 once, then use int8 MAC
          * for all rows. Same approach as Q4_0/Q8_0 above.
