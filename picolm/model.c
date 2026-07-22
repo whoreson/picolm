@@ -1396,7 +1396,7 @@ static void repack_model_weights_q4_0x8(model_t *m) {
 
 /* Forward declarations for SSM helpers */
 static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
-                        layer_weights_t *lw, int il, int pos);
+                        layer_weights_t *lw, int il, int pos, void *gpu_lw);
 
 /* Threaded attention: per-head online softmax K.dot.Q + weighted V.
  * Each head is fully independent -> parallelized via tensor_parallel_for.
@@ -1719,9 +1719,12 @@ float *model_forward(model_t *m, int token, int pos) {
             /* SSM layer (Qwen3.5) */
 #ifdef PICOLM_GPU
             tensor_set_gpu_tensor(NULL, 0); /* clear stale handle from previous layer */
-#endif
             float *ssm_residual = s->xb2;
-            ssm_forward(m, s, s->x, ssm_residual, lw, l, pos);
+            ssm_forward(m, s, s->x, ssm_residual, lw, l, pos, &m->gpu.layers[l]);
+#else
+            float *ssm_residual = s->xb2;
+            ssm_forward(m, s, s->x, ssm_residual, lw, l, pos, NULL);
+#endif
             continue;
         }
 
@@ -2035,7 +2038,7 @@ static void ssm_head_task(int h, void *ctxp) {
 
 /* SSM layer forward pass (autoregressive, single token) */
 static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
-                        layer_weights_t *lw, int il, int pos) {
+                        layer_weights_t *lw, int il, int pos, void *gpu_lw) {
     model_config_t *c = &m->config;
     int dim = c->n_embd;
     int d_conv = c->ssm_d_conv;
@@ -2061,13 +2064,28 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     if (il == 0 && pos == 0) dbg_vec("xb[:8]", s->xb, 8, 8);
 #endif
     /* 2. QKV projection: qkv_mixed = matmul(attn_qkv, xb) -> [conv_dim] */
+#ifdef PICOLM_GPU
+    if (gpu_lw) {
+        gpu_layer_weights_t *gl = (gpu_layer_weights_t *)gpu_lw;
+        tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->attn_qkv, m->gpu.device);
+    }
+#endif
     matmul(s->q, s->xb, lw->attn_qkv, dim, conv_dim, lw->type_attn_qkv);
+#ifdef PICOLM_GPU
+    if (gpu_lw) {
+        gpu_layer_weights_t *gl = (gpu_layer_weights_t *)gpu_lw;
+        tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->attn_gate_ssm, m->gpu.device);
+    }
+#endif
 #ifdef DEBUG_SSM
     if (il == 0 && pos == 0) dbg_vec("qkv[:8]", s->q, 8, 8);
 #endif
 
     /* 3. Z gate: z = matmul(attn_gate_ssm, xb) -> [value_dim] */
     matmul(s->xb2, s->xb, lw->attn_gate_ssm, dim, c->ssm_d_inner, lw->type_attn_gate_ssm);
+#ifdef PICOLM_GPU
+    if (gpu_lw) tensor_set_gpu_tensor(NULL, 0); /* clear before next layer */
+#endif
     /* If GGUF reorders v-head rows, convert xb2 from GGUF order to sequential order */
     if (do_remap) {
         float *xb2_tmp = alloca(c->ssm_d_inner * sizeof(float));
@@ -3252,7 +3270,11 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                 /* Copy batch token into s->x, call ssm_forward which does residual add */
                 memcpy(s->x, x_batch + bi * dim, dim * sizeof(float));
                 float *ssm_residual = s->xb2;
-                ssm_forward(m, s, s->x, ssm_residual, lw, l, start_pos + bi);
+#ifdef PICOLM_GPU
+                ssm_forward(m, s, s->x, ssm_residual, lw, l, start_pos + bi, &m->gpu.layers[l]);
+#else
+                ssm_forward(m, s, s->x, ssm_residual, lw, l, start_pos + bi, NULL);
+#endif
                 /* Copy result back to batch buffer */
                 memcpy(x_batch + bi * dim, s->x, dim * sizeof(float));
             }
