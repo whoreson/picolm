@@ -1869,7 +1869,7 @@ float vec_dot_q4_0_q8_0(const void *vx, const void *wy, int n) {
                 int32x4_t s_lo = vmmlaq_s32(vdupq_n_s32(0), qx_lo, qy0);
                 int32x4_t s_hi = vmmlaq_s32(vdupq_n_s32(0), qx_hi, qy1);
                 int32x4_t s = vaddq_s32(s_lo, s_hi);
-                int32_t dot_i = vaddvq_s32(s);
+                int32_t dot_i = vgetq_lane_s32(s, 0) + vgetq_lane_s32(s, 3);
                 float di = fp16_to_fp32_lookup(x[ib].d) * fp16_to_fp32_lookup(y[ib].d);
                 sumv = vmlaq_n_f32(sumv, vcvtq_f32_s32(vdupq_n_s32(dot_i)), di);
             }
@@ -1885,7 +1885,7 @@ float vec_dot_q4_0_q8_0(const void *vx, const void *wy, int n) {
                 int32x4_t s_lo = vmmlaq_s32(vdupq_n_s32(0), qx_lo, qyb0);
                 int32x4_t s_hi = vmmlaq_s32(vdupq_n_s32(0), qx_hi, qyb1);
                 int32x4_t s = vaddq_s32(s_lo, s_hi);
-                int32_t dot_j = vaddvq_s32(s);
+                int32_t dot_j = vgetq_lane_s32(s, 0) + vgetq_lane_s32(s, 3);
                 float dj = fp16_to_fp32_lookup(x[ib+1].d) * fp16_to_fp32_lookup(y[ib+1].d);
                 sumv = vmlaq_n_f32(sumv, vcvtq_f32_s32(vdupq_n_s32(dot_j)), dj);
             }
@@ -2010,7 +2010,7 @@ float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n) {
         const int8x16_t wi_1 = vld1q_s8(w[i].qs + 16);
         int32x4_t si = vaddq_s32(vmmlaq_s32(vdupq_n_s32(0), xi_0, wi_0),
                                   vmmlaq_s32(vdupq_n_s32(0), xi_1, wi_1));
-        int32_t dot_i = vaddvq_s32(si);
+        int32_t dot_i = vgetq_lane_s32(si, 0) + vgetq_lane_s32(si, 3);
         const float d = fp16_to_fp32_lookup(x[i].d) * fp16_to_fp32_lookup(w[i].d);
         sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(vdupq_n_s32(dot_i)), d);
 
@@ -2020,7 +2020,7 @@ float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n) {
         const int8x16_t wj_1 = vld1q_s8(w[i+1].qs + 16);
         int32x4_t sj = vaddq_s32(vmmlaq_s32(vdupq_n_s32(0), xj_0, wj_0),
                                   vmmlaq_s32(vdupq_n_s32(0), xj_1, wj_1));
-        int32_t dot_j = vaddvq_s32(sj);
+        int32_t dot_j = vgetq_lane_s32(sj, 0) + vgetq_lane_s32(sj, 3);
         const float dj = fp16_to_fp32_lookup(x[i+1].d) * fp16_to_fp32_lookup(w[i+1].d);
         sumv1 = vmlaq_n_f32(sumv1, vcvtq_f32_s32(vdupq_n_s32(dot_j)), dj);
     }
@@ -2305,7 +2305,7 @@ float vec_dot_q8_0_q8_0_deltas(const void *qx, const float *qx_d, const void *qw
          * So si[0] = x[0..7].w[0..7] + x[16..23].w[16..23]
          * We still need si[1] + si[2] + si[3] too.
          * Total = sum of all 4 lanes of si = full dot product of 32 elements. */
-        int32_t dot_i = vaddvq_s32(si);
+        int32_t dot_i = vgetq_lane_s32(si, 0) + vgetq_lane_s32(si, 3);
         float d = qx_d[i] * fp16_to_fp32_lookup(w[i].d);
         sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(vdupq_n_s32(dot_i)), d);
         
@@ -2318,7 +2318,7 @@ float vec_dot_q8_0_q8_0_deltas(const void *qx, const float *qx_d, const void *qw
         int32x4_t sj0 = vmmlaq_s32(vdupq_n_s32(0), xj_0, wj_0);
         int32x4_t sj1 = vmmlaq_s32(vdupq_n_s32(0), xj_1, wj_1);
         int32x4_t sj = vaddq_s32(sj0, sj1);
-        int32_t dot_j = vaddvq_s32(sj);
+        int32_t dot_j = vgetq_lane_s32(sj, 0) + vgetq_lane_s32(sj, 3);
         float dj = qx_d[i+1] * fp16_to_fp32_lookup(w[i+1].d);
         sumv1 = vmlaq_n_f32(sumv1, vcvtq_f32_s32(vdupq_n_s32(dot_j)), dj);
     }
