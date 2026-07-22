@@ -489,6 +489,22 @@ int main(int argc, char **argv) {
             t_first_token = get_time_ms();
         }
 
+        /* Debug: print top-3 logits on first generation step */
+        static int dbg_printed = 0;
+        if (!dbg_printed++ && getenv("PICOLM_DBG_LOGITS")) {
+            int top3[3] = {0,0,0}; float topv[3] = {-1e30f,-1e30f,-1e30f};
+            for (int i = 0; i < model.config.vocab_size; i++) {
+                for (int j = 0; j < 3; j++) {
+                    if (logits[i] > topv[j]) {
+                        for (int k = 2; k > j; k--) { topv[k]=topv[k-1]; top3[k]=top3[k-1]; }
+                        topv[j]=logits[i]; top3[j]=i; break;
+                    }
+                }
+            }
+            fprintf(stderr, "[LOGITS] top3: ");
+            for (int j = 0; j < 3; j++) fprintf(stderr, "(%d:%.2f) ", top3[j], topv[j]);
+            fprintf(stderr, "\n");
+        }
         grammar_apply(&grammar, logits, model.config.vocab_size);
         next = sampler_sample(&sampler, logits, model.config.vocab_size);
 
