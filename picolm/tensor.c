@@ -594,6 +594,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
             {
                 int nt = pool_total_threads(n_threads);
                 int want = n_threads < nt ? n_threads : nt;
+            if (want > 1 && d < want * 512) want = (d + 511) / 512;
                 int active = pool_assign_rows(0, want, d);
                 for (int t = 0; t < active; t++) {
                     pool_tasks[t].out = out; pool_tasks[t].x = (const float *)qx;
@@ -651,6 +652,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
 
             int nt = pool_total_threads(n_threads);
             int want = n_threads < nt ? n_threads : nt;
+            if (want > 1 && d < want * 512) want = (d + 511) / 512;
 
             {
                 int active = pool_assign_rows(0, want, d);
@@ -705,6 +707,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
 
             int nt = pool_total_threads(n_threads);
             int want = n_threads < nt ? n_threads : nt;
+            if (want > 1 && d < want * 512) want = (d + 511) / 512;
             {
                 int active = pool_assign_rows(0, want, d);
                 for (int t = 0; t < active; t++) {
@@ -751,6 +754,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
             int nt = pool_total_threads(n_threads);
 
             int want = n_threads < nt ? n_threads : nt;
+            if (want > 1 && d < want * 512) want = (d + 511) / 512;
             {
                 int active = pool_assign_rows(0, want, d);
                 for (int t = 0; t < active; t++) {
@@ -799,6 +803,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
             int nt = pool_total_threads(n_threads);
 
             int want = n_threads < nt ? n_threads : nt;
+            if (want > 1 && d < want * 512) want = (d + 511) / 512;
             {
                 int active = pool_assign_rows(0, want, d);
                 for (int t = 0; t < active; t++) {
@@ -853,6 +858,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
 
             int nt = pool_total_threads(n_threads);
             int want = n_threads < nt ? n_threads : nt;
+            if (want > 1 && d < want * 512) want = (d + 511) / 512;
             {
                 int active = pool_assign_rows(0, want, d);
                 for (int t = 0; t < active; t++) {
@@ -885,6 +891,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
     int nt = pool_total_threads(n_threads);
 
     int want = n_threads < nt ? n_threads : nt;
+            if (want > 1 && d < want * 512) want = (d + 511) / 512;
     {
         int active = pool_assign_rows(0, want, d);
         for (int t = 0; t < active; t++) {
@@ -1106,6 +1113,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
     /* Threaded: dispatch over output rows d using shared pool */
     int nt = pool_total_threads(n_threads);
     int want = n_threads < nt ? n_threads : nt;
+            if (want > 1 && d < want * 512) want = (d + 511) / 512;
     int active = pool_assign_rows(0, want, d);
     for (int t = 0; t < active; t++) {
         pool_tasks[t].out = out;
@@ -1347,6 +1355,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
     /* Threaded: run both matmuls with half threads each */
     int nt = pool_total_threads(n_threads);
     int want = n_threads < nt ? n_threads : nt;
+            if (want > 1 && d < want * 512) want = (d + 511) / 512;
     int active_total = want > d ? d : want;
     int nt1 = (active_total + 1) / 2, nt2 = active_total - nt1;
 
@@ -1856,6 +1865,7 @@ void tensor_parallel_for(int count, void (*fn)(int idx, void *ctx), void *ctx) {
     }
     int nt = pool_total_threads(n_threads);
     int want = n_threads < nt ? n_threads : nt;
+            if (want > 1 && count < want * 256) want = (count + 255) / 256;
     int active = want > count ? count : want;
     int chunk = (count + active - 1) / active;
     for (int t = 0; t < active; t++) {
