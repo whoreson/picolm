@@ -720,7 +720,8 @@ int picolm_gpu_tensor_upload(picolm_gpu_tensor_t **tensor,
     t->row_bytes = row_bytes; t->block_size = bs;
 
     if (!gpu_ok(gpuMalloc(&t->weights, total), "tensor allocation")) {
-        fprintf(stderr, "[GPU] OOM: I=%d O=%d qtype=%d total=%zu MB\n", I, O, qtype, total/(1024*1024));
+        fprintf(stderr, "[GPU] OOM: I=%d O=%d qtype=%d total=%zu MB (gpu_used=%.1f MB)\n",
+                I, O, qtype, total/(1024*1024), ctx->tensor_bytes/(1024.0*1024));
         free(t); return 0;
     }
     if (!gpu_ok(gpuMemcpy(t->weights, weights, total, gpuMemcpyHostToDevice),
