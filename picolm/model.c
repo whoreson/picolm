@@ -1260,14 +1260,11 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
     if (picolm_gpu_tensor_upload(&gl->name, lw->name, lw->type ## _ ## name, (I), (O), device)) uploaded++; \
 } while(0)
 
-                /* Attention Q: [q_dim, n_embd] (q_full_dim for SSM) */
+                /* Attention Q: [q_dim, n_embd] for dense, [q_full_dim, n_embd] for SSM attn */
                 attempted++;
-                { int qo = q_dim;
-                  if (c->has_ssm && lw->is_attn_layer) qo = q_dim * 2;
+                { int qo = (c->has_ssm && lw->is_attn_layer) ? q_dim * 2 : q_dim;
                   if (picolm_gpu_tensor_upload(&gl->attn_q,
-                          lw->attn_q, lw->type_attn_q, c->n_embd, qo, device)) uploaded++;
-                  if (l == 0) fprintf(stderr, "GPU attn_q: I=%d O=%d (q_dim=%d q_full=%d has_ssm=%d is_attn=%d)\n",
-                                      c->n_embd, qo, q_dim, q_dim*2, c->has_ssm, lw->is_attn_layer); }
+                          lw->attn_q, lw->type_attn_q, c->n_embd, qo, device)) uploaded++; }
                 /* Attention K: [kv_dim, n_embd] */
                 attempted++;
                 if (picolm_gpu_tensor_upload(&gl->attn_k,
@@ -1292,6 +1289,16 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                 attempted++;
                 if (picolm_gpu_tensor_upload(&gl->ffn_down,
                         lw->ffn_down, lw->type_ffn_down, c->n_ffn, c->n_embd, device)) uploaded++;
+                /* SSM layer tensors (Qwen3.5) */
+                if (!lw->is_attn_layer && c->has_ssm) {
+                    int conv_dim = 2 * c->ssm_d_state * c->ssm_n_group + c->ssm_d_inner;
+                    attempted++;
+                    if (picolm_gpu_tensor_upload(&gl->attn_qkv,
+                            lw->attn_qkv, lw->type_attn_qkv, c->n_embd, conv_dim, device)) uploaded++;
+                    attempted++;
+                    if (picolm_gpu_tensor_upload(&gl->attn_gate_ssm,
+                            lw->attn_gate_ssm, lw->type_attn_gate_ssm, c->n_embd, c->ssm_d_inner, device)) uploaded++;
+                }
             }
 
             m->gpu.device = device;
@@ -1710,7 +1717,10 @@ float *model_forward(model_t *m, int token, int pos) {
 
         if (c->has_ssm && !lw->is_attn_layer) {
             /* SSM layer (Qwen3.5) */
-            float *ssm_residual = s->xb2; /* use xb2 as residual buffer */
+#ifdef PICOLM_GPU
+            tensor_set_gpu_tensor(NULL, 0); /* clear stale handle from previous layer */
+#endif
+            float *ssm_residual = s->xb2;
             ssm_forward(m, s, s->x, ssm_residual, lw, l, pos);
             continue;
         }
@@ -3431,6 +3441,10 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
     matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
     tensor_set_repacked(NULL);
 
+    /* Clear GPU tensor handle so generation path doesn't inherit stale handle */
+#ifdef PICOLM_GPU
+    tensor_set_gpu_tensor(NULL, 0);
+#endif
     free(buf);
     return s->logits;
 }
