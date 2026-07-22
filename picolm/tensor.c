@@ -211,6 +211,7 @@ static win_mutex_t     pool_mutex;
 static win_cond_t      pool_cond;
 static volatile int    pool_gen   = 0;
 static volatile int    pool_done  = 0;
+static volatile int    pool_target = 0;   /* workers that must signal */
 static volatile int    pool_shutdown = 0;
 static volatile int    pool_nworkers = 0;
 static matmul_task_t   pool_tasks[MAX_THREADS];
@@ -430,6 +431,17 @@ static void *pool_worker(void *arg) {
         }
         if (pool_shutdown) break;
         last_gen = pool_gen;
+        /* Skip workers whose task has no real work (start >= end).
+         * They loop back to sleep without incrementing pool_done,
+         * so pool_wait only blocks for workers that actually ran. */
+        if (!pool_mode && pool_tasks[tid].start >= pool_tasks[tid].end) {
+            /* No-op task: loop back to wait */
+            continue;
+        }
+        if (pool_mode && generic_tasks[tid].start >= generic_tasks[tid].end) {
+            /* No-op generic task: loop back to wait */
+            continue;
+        }
         win_mutex_unlock(&pool_mutex);
         if (pool_mode) generic_worker_f(&generic_tasks[tid]);
         else matmul_worker_f(&pool_tasks[tid]);
@@ -459,20 +471,35 @@ static void pool_init(int nt) {
     }
 }
 
-static void pool_wake(int nt) {
+static void pool_wake_unused(int nt) __attribute__((unused));
+static void pool_wake_unused(int nt) {
     (void)nt;
     win_mutex_lock(&pool_mutex);
     pool_gen++;
+    pool_target = 0;  /* 0 = wait for all workers */
+    win_cond_broadcast(&pool_cond);
+    win_mutex_unlock(&pool_mutex);
+}
+
+static void pool_wake_active(int active) {
+    /* Wake all workers but only wait for `active` of them (task 0 = main
+     * thread, so workers 1..active must signal). Workers with empty tasks
+     * loop back to sleep without incrementing pool_done. */
+    win_mutex_lock(&pool_mutex);
+    pool_gen++;
+    pool_target = active > 1 ? (active - 1) : 0;
     win_cond_broadcast(&pool_cond);
     win_mutex_unlock(&pool_mutex);
 }
 
 static void pool_wait(int nt) {
     win_mutex_lock(&pool_mutex);
-    while (pool_done < nt - 1) {
+    int target = pool_target > 0 ? pool_target : (nt - 1);
+    while (pool_done < target) {
         win_cond_wait(&pool_cond, &pool_mutex);
     }
     pool_done = 0;
+    pool_target = 0;
     win_mutex_unlock(&pool_mutex);
 }
 /* ---- Public API ---- */
@@ -582,7 +609,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
             float *qx_d = qx_buf + (q8_row_size / sizeof(float));
             for (int bi = 0; bi < nb; bi++) qx_d[bi] = fp16_to_fp32(qx[bi].d);
 
-            if (n_threads <= 1 || d < 4) {
+            if (n_threads <= 1 || d < 4 || d < matmul_min_rows) {
                 for (int i = 0; i < d; i++) {
                     out[i] = vec_dot_q8_0_q8_0_deltas(qx, qx_d, wptr + (size_t)i * row_bytes, n);
                 }
@@ -604,7 +631,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
                 }
                 pool_clear_unused(active, nt);
                 pool_init(nt);
-                pool_wake(nt);
+                pool_wake_active(active);
                 matmul_worker_f(&pool_tasks[0]);
                 pool_wait(nt);
             }
@@ -641,7 +668,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
             }
 #endif
 
-            if (n_threads <= 1 || d < 4) {
+            if (n_threads <= 1 || d < 4 || d < matmul_min_rows) {
                 for (int i = 0; i < d; i++) {
                     out[i] = vec_dot_q4_0_q8_0(wptr + (size_t)i * row_bytes, qx, n);
                 }
@@ -663,7 +690,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
                 }
                 pool_clear_unused(active, nt);
                 pool_init(nt);
-                pool_wake(nt);
+                pool_wake_active(active);
                 matmul_worker_f(&pool_tasks[0]);
                 pool_wait(nt);
             }
@@ -690,7 +717,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
             /* Align to multiples of 4 rows */
             int d4 = (d / 4) * 4;
 
-            if (n_threads <= 1 || d < 4) {
+            if (n_threads <= 1 || d < 4 || d < matmul_min_rows) {
                 for (int i = 0; i < d4; i += 4) {
                     vec_dot_q4_0x4_q8_0(wptr + (size_t)i * row_bytes, qx, n,
                                          out + i, 4);
@@ -716,7 +743,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
                 }
                 pool_clear_unused(active, nt);
                 pool_init(nt);
-                pool_wake(nt);
+                pool_wake_active(active);
                 matmul_worker_f(&pool_tasks[0]);
                 pool_wait(nt);
             }
@@ -762,7 +789,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
                 }
                 pool_clear_unused(active, nt);
                 pool_init(nt);
-                pool_wake(nt);
+                pool_wake_active(active);
                 matmul_worker_f(&pool_tasks[0]);
                 pool_wait(nt);
             }
@@ -788,7 +815,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
         if (qx != NULL) {
             quantize_row_q8_K(x, qx, n);
 
-            if (n_threads <= 1 || d < 4) {
+            if (n_threads <= 1 || d < 4 || d < matmul_min_rows) {
                 for (int i = 0; i < d; i++) {
                     out[i] = vec_dot_q4_K_q8_K(wptr + (size_t)i * row_bytes, qx, n);
                 }
@@ -810,7 +837,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
                 }
                 pool_clear_unused(active, nt);
                 pool_init(nt);
-                pool_wake(nt);
+                pool_wake_active(active);
                 matmul_worker_f(&pool_tasks[0]);
                 pool_wait(nt);
             }
@@ -837,7 +864,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
         if (qx != NULL) {
             quantize_row_q8_0(x, qx, n);
 
-            if (n_threads <= 1 || d < 4) {
+            if (n_threads <= 1 || d < 4 || d < matmul_min_rows) {
                 if (qtype == GGUF_TYPE_Q1_0) {
                     for (int i = 0; i < d; i++) {
                         out[i] = vec_dot_q1_0_q8_0(wptr + (size_t)i * row_bytes, qx, n);
@@ -864,7 +891,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
                 }
                 pool_clear_unused(active, nt);
                 pool_init(nt);
-                pool_wake(nt);
+                pool_wake_active(active);
                 matmul_worker_f(&pool_tasks[0]);
                 pool_wait(nt);
             }
@@ -875,7 +902,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
         /* If allocation failed, fall through to generic path */
     }
 
-    if (n_threads <= 1 || d < 4) {
+    if (n_threads <= 1 || d < 4 || d < matmul_min_rows) {
         for (int i = 0; i < d; i++) {
             out[i] = vec_dot(wptr + (size_t)i * row_bytes, x, n, qtype);
         }
@@ -896,7 +923,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
         }
         pool_clear_unused(active, nt);
         pool_init(nt);
-        pool_wake(nt);
+        pool_wake_active(active);
         matmul_worker_f(&pool_tasks[0]);
         pool_wait(nt);
     }
@@ -1067,7 +1094,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
         } else { free(qbuf); free(dbuf); }
     }
 
-    if (n_threads <= 1 || d < 4) {
+    if (n_threads <= 1 || d < 4 || d < matmul_min_rows) {
         /* Scalar path */
         for (int i = 0; i < d; i++) {
             if (have_qx) {
@@ -1120,7 +1147,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
     }
     pool_clear_unused(active, nt);
     pool_init(nt);
-    pool_wake(nt);
+    pool_wake_active(active);
     matmul_worker_f(&pool_tasks[0]);
     pool_wait(nt);
     if (qx_buf) { free(qx_buf); if (qx_d_buf) free(qx_d_buf); }
@@ -1380,7 +1407,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
     pool_clear_unused(nt1 + a2, nt);
 
     pool_init(nt);
-    pool_wake(nt);
+    pool_wake_active(a1 + a2);
     matmul_worker_f(&pool_tasks[0]);
     pool_wait(nt);
     if (qx1_buf) { free(qx1_buf); if (qx1_d_buf) free(qx1_d_buf); }
@@ -1870,7 +1897,7 @@ void tensor_parallel_for(int count, void (*fn)(int idx, void *ctx), void *ctx) {
         generic_tasks[t].end = 0;
     }
     pool_mode = 1;
-    pool_wake(nt);
+    pool_wake_active(active);
     /* main thread does task 0 */
     generic_worker_f(&generic_tasks[0]);
     pool_wait(nt);
