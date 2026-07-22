@@ -178,6 +178,7 @@ __host__ __device__ static inline unsigned short gpu_fp32_to_fp16(float f) {
 
 /* Block sizes in bytes (from quant.h structs) */
 #define GPU_BLOCK_Q4_0_SIZE  18  /* uint16_t d + uint8_t qs[16] */
+#define GPU_BLOCK_Q4_K_SIZE  144 /* uint16_t d + dmin + uint8_t scales[12] + qs[128] */
 #define GPU_BLOCK_Q8_0_SIZE  34  /* uint16_t d + int8_t qs[32] */
 #define GPU_BLOCK_Q4_K_SIZE 144  /* block_q4_K from quant.h */
 
@@ -233,19 +234,52 @@ __device__ static inline float dequant_q2_0(const void *blk, int i) {
     return (float)(v - 1) * d;
 }
 
-/* block_q4_K: 144 bytes for 256 values (3 superblocks + scales + qs)
+/* block_q4_K: 144 bytes for 256 values
  * Layout from quant.h:
- *   int8_t  ql[32];     0..31   (lower nibbles, 32 bytes -> 64 values)
- *   int8_t  qh[32];     32..63  (upper nibbles, 32 bytes -> 64 values)
- *   int8_t  scales[12]; 64..75  (4 bits per scale, 3 per superblock)
- *   uint8_t ql2[128];   76..203 (lower nibbles for superblocks 1+2, 128 bytes -> 256 values but only 192 used)
+ *   uint16_t d;          offset 0  super-block scale (FP16)
+ *   uint16_t dmin;       offset 2  super-block min (FP16)
+ *   uint8_t  scales[12]; offset 4  packed 6-bit scales+mins (8 pairs)
+ *   uint8_t  qs[128];    offset 16 quantized values (256 nibbles)
  *
- * Actually let me re-read the exact layout from quant.h... */
+ * 256 values = 4 superblocks of 64 values each.
+ * Each superblock has 2 sub-blocks of 32 values, each with its own scale+min.
+ * dequant(i) = d * scale[j] + qs[i] - dmin * min[j]
+ * where qs[i] is a raw nibble [0..15], NOT offset by -8.
+ *
+ * get_scale_min_k4(j, scales, &sc, &mn) extracts scale and min for sub-block j.
+ * j=0..7 maps to 8 sub-blocks across 4 superblocks. */
+__device__ static inline void gpu_get_scale_min_k4(int j, const uint8_t *scales, uint8_t *sc, uint8_t *mn) {
+    if (j < 4) {
+        *sc = scales[j] & 63;
+        *mn = scales[j + 4] & 63;
+    } else {
+        *sc = (scales[j + 4] & 0xF) | ((scales[j - 4] >> 6) << 4);
+        *mn = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+    }
+}
 
-/* We'll handle Q4_K in a separate device function. For now, quant_matmul
- * handles it via a loop that walks blocks. The device-side dequant for Q4_K
- * is complex (3 superblocks with different scale encodings), so we use a
- * helper that takes the block base pointer and global index within the row. */
+__device__ static inline float dequant_q4_K(const void *blk, int i) {
+    const uint8_t *b = (const uint8_t *)blk;
+    uint16_t d_raw = b[0] | ((uint16_t)b[1] << 8);
+    uint16_t dmin_raw = b[2] | ((uint16_t)b[3] << 8);
+    float d = gpu_fp16_to_fp32(d_raw);
+    float dmin = gpu_fp16_to_fp32(dmin_raw);
+    const uint8_t *scales = b + 4;
+    const uint8_t *qs = b + 16;
+
+    int superblk = i / 64;
+    int subblk = (i % 64) / 32;
+    int offset_in_sub = i % 32;
+    int scale_idx = superblk * 2 + subblk;
+
+    uint8_t sc, mn;
+    gpu_get_scale_min_k4(scale_idx, scales, &sc, &mn);
+
+    int qs_byte_idx = superblk * 32 + offset_in_sub;
+    int v = (qs_byte_idx < 128) ? (subblk == 0 ? (qs[qs_byte_idx] & 0xF) : (qs[qs_byte_idx] >> 4)) : 0;
+
+    return d * (float)sc * (float)v - dmin * (float)mn;
+}
 
 /* ---- quant_matmul kernel ----
  *
@@ -314,43 +348,15 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
         break;
 
     case 12: /* GGUF_TYPE_Q4_K */
-        /* Complex block: 144 bytes for 256 values
-         * We dequant via a helper that walks the block_q4_K structure.
-         * For correctness, we fall back to walking the entire row as
-         * a series of block_q4_K structs. */
+        /* 256 values per block (144 bytes). Per-element dequant via helper. */
         {
-            const uint8_t *b = (const uint8_t *)wrow;
-            for (int i = gpuThreadIdx_x; i < I; i += gpuBlockDim_x) {
-                int bi = i / 256;  /* which block_q4_K */
-                int ji = i % 256;  /* index within block */
-                const uint8_t *blk = b + (size_t)bi * bytes_per_block;
-                /* block_q4_K layout (from quant.h):
-                 * int8_t ql[32];     offset 0
-                 * uint8_t qh[32];    offset 32
-                 * int8_t scales[12]; offset 64
-                 * uint16_t d;        offset 76
-                 * uint8_t ql2[128];  offset 78
-                 */
-                uint16_t d_raw = blk[76] | ((uint16_t)blk[77] << 8);
-                float d = gpu_fp16_to_fp32(d_raw);
-                int v = 0;
-                if (ji < 64) {
-                    /* First superblock (64 values): ql[0..31] + qh[0..31] */
-                    v = (int)(blk[ji] & 0xF) | (((int)blk[32 + ji] & 0xC) << 2);
-                } else if (ji < 128) {
-                    /* Second superblock (64 values): ql2[0..31] + (qh[32..63] upper bits) */
-                    int sub = ji - 64;
-                    v = (int)(blk[78 + sub] & 0xF) | (((int)blk[32 + sub] & 0xF0) << 0);
-                    /* Actually qh encodes bits 2+3 for all 128 values in superblocks 1+2 */
-                    /* Let me re-read the quant.h layout more carefully... */
-                    /* For now use a simpler approach: read the scale and apply */
-                } else {
-                    /* Third superblock (64 values): ql2[32..95] + ... */
-                    int sub = ji - 128;
-                    v = (int)(blk[78 + 32 + sub] & 0xF);
+            int n_blocks = I / 256;
+            for (int bi = gpuThreadIdx_x; bi < n_blocks; bi += gpuBlockDim_x) {
+                const void *blk = wrow + (size_t)bi * bytes_per_block;
+                for (int j = 0; j < 256; j++) {
+                    int i = bi * 256 + j;
+                    sum += x[(size_t)s * I + i] * dequant_q4_K(blk, j);
                 }
-                /* This Q4_K dequant is getting complex. Use a cleaner helper. */
-                /* For the initial port, we'll use a proper Q4_K dequant helper. */
             }
         }
         break;
@@ -825,7 +831,7 @@ static int gguf_block_size(gguf_type_t qtype) {
     case 0:  return 0;    /* F32: no blocks */
     case 2:  return 18;   /* Q4_0: 18 bytes per 32 values */
     case 8:  return 34;   /* Q8_0: 34 bytes per 32 values */
-    case 12: return 0;    /* Q4_K: unsupported on GPU, skip upload */
+    case 12: return GPU_BLOCK_Q4_K_SIZE;  /* Q4_K: 144 bytes per 256 values */
     case 41: return 18;   /* Q1_0: 18 bytes per 128 values */
     case 42: return 34;   /* Q2_0: 34 bytes per 128 values */
     default: return 0;
