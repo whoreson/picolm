@@ -564,12 +564,14 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
                     }
                     default: return; /* only debug Q8_0 for now */
                 }
-                float max_err = 0;
+                float max_err = 0; int max_idx = -1;
                 for (int i = 0; i < d; i++) {
                     float err = fabsf(out[i] - cpu_out[i]);
-                    if (err > max_err) max_err = err;
+                    if (err > max_err) { max_err = err; max_idx = i; }
                 }
-                fprintf(stderr, "[GPU dbg] matmul %03d d=%d n=%d max_err=%.6f\n", gpu_matmul_count, d, n, max_err);
+                fprintf(stderr, "[GPU dbg] matmul %03d d=%d n=%d max_err=%.6f@%d (gpu=%.4f cpu=%.4f)\n",
+                        gpu_matmul_count, d, n, max_err, max_idx,
+                        max_idx >= 0 ? out[max_idx] : 0, max_idx >= 0 ? cpu_out[max_idx] : 0);
                 free(cpu_out);
             }
             if (gpu_matmul_count++ == 0) {
