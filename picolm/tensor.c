@@ -565,18 +565,22 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
                     default: return; /* only debug Q8_0 for now */
                 }
                 float max_err = 0; int max_idx = -1;
-                int n_zero_gpu = 0, n_zero_cpu = 0, n_mismatch = 0;
+                int n_zero_gpu = 0, n_mismatch = 0;
+                int first_zero = -1, last_zero = -1;
                 for (int i = 0; i < d; i++) {
                     float err = fabsf(out[i] - cpu_out[i]);
                     if (err > max_err) { max_err = err; max_idx = i; }
-                    if (out[i] == 0.0f) n_zero_gpu++;
-                    if (cpu_out[i] == 0.0f) n_zero_cpu++;
+                    if (out[i] == 0.0f) {
+                        n_zero_gpu++;
+                        if (first_zero < 0) first_zero = i;
+                        last_zero = i;
+                    }
                     if (err > 0.01f) n_mismatch++;
                 }
-                fprintf(stderr, "[GPU dbg] matmul %03d d=%d n=%d max_err=%.6f@%d (gpu=%.4f cpu=%.4f) zeros_gpu=%d/%d mismatches=%d\n",
+                fprintf(stderr, "[GPU dbg] matmul %03d d=%d n=%d max_err=%.6f@%d (gpu=%.4f cpu=%.4f) zeros=%d range=[%d,%d] mismatches=%d\n",
                         gpu_matmul_count, d, n, max_err, max_idx,
                         max_idx >= 0 ? out[max_idx] : 0, max_idx >= 0 ? cpu_out[max_idx] : 0,
-                        n_zero_gpu, d, n_mismatch);
+                        n_zero_gpu, first_zero, last_zero, n_mismatch);
                 free(cpu_out);
             }
             if (gpu_matmul_count++ == 0) {
