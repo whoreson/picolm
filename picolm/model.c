@@ -1260,10 +1260,14 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
     if (picolm_gpu_tensor_upload(&gl->name, lw->name, lw->type ## _ ## name, (I), (O), device)) uploaded++; \
 } while(0)
 
-                /* Attention Q: [q_dim, n_embd] */
+                /* Attention Q: [q_dim, n_embd] (q_full_dim for SSM) */
                 attempted++;
-                if (picolm_gpu_tensor_upload(&gl->attn_q,
-                        lw->attn_q, lw->type_attn_q, c->n_embd, q_dim, device)) uploaded++;
+                { int qo = q_dim;
+                  if (c->has_ssm && lw->is_attn_layer) qo = q_dim * 2;
+                  if (picolm_gpu_tensor_upload(&gl->attn_q,
+                          lw->attn_q, lw->type_attn_q, c->n_embd, qo, device)) uploaded++;
+                  if (l == 0) fprintf(stderr, "GPU attn_q: I=%d O=%d (q_dim=%d q_full=%d has_ssm=%d is_attn=%d)\n",
+                                      c->n_embd, qo, q_dim, q_dim*2, c->has_ssm, lw->is_attn_layer); }
                 /* Attention K: [kv_dim, n_embd] */
                 attempted++;
                 if (picolm_gpu_tensor_upload(&gl->attn_k,
