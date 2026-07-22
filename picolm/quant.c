@@ -1620,74 +1620,73 @@ float vec_dot_q4_K_q8_K(const void *src_q4, const void *src_q8, int n) {
      * vmmlaq_s32 processes 16 int8 x int8 -> 4 int32 lanes.
      * Lanes 0 and 3 each accumulate an 8-element dot product.
      * For 32 values, need 2 vmmlaq calls (16+16). */
-    {
-        const uint8x16_t m4 = vdupq_n_u8(0x0F);
+    const uint8x16_t m4 = vdupq_n_u8(0x0F);
 
-        float sumf = 0.0f;
-        for (int i = 0; i < nb; i++) {
-            const uint8_t *q4 = x[i].qs;
-            const int8_t  *q8 = y[i].qs;
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        const uint8_t *q4 = x[i].qs;
+        const int8_t  *q8 = y[i].qs;
 
-            /* Decode 6-bit scales and mins from packed 12 bytes */
-            memcpy(utmp, x[i].scales, 12);
-            utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
-            const uint32_t uaux = utmp[1] & kmask1;
-            utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
-            utmp[2] = uaux;
-            utmp[0] &= kmask1;
+        /* Decode 6-bit scales and mins from packed 12 bytes */
+        memcpy(utmp, x[i].scales, 12);
+        utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+        const uint32_t uaux = utmp[1] & kmask1;
+        utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= kmask1;
 
-            const uint8_t *scales8 = (const uint8_t *)&utmp[0];
-            const uint8_t *mins8   = (const uint8_t *)&utmp[2];
+        const uint8_t *scales8 = (const uint8_t *)&utmp[0];
+        const uint8_t *mins8   = (const uint8_t *)&utmp[2];
 
-            /* Compute dmin * sum(bsums * mins) for bias correction */
-            int sumi = 0;
-            for (int j = 0; j < 16; j++) sumi += y[i].bsums[j] * (int)mins8[j / 2];
+        /* Compute dmin * sum(bsums * mins) for bias correction */
+        int sumi = 0;
+        for (int j = 0; j < 16; j++) sumi += y[i].bsums[j] * (int)mins8[j / 2];
 
-            const float d    = fp16_to_fp32_lookup(x[i].d) * y[i].d;
-            const float dmin = fp16_to_fp32_lookup(x[i].dmin) * y[i].d;
+        const float d    = fp16_to_fp32_lookup(x[i].d) * y[i].d;
+        const float dmin = fp16_to_fp32_lookup(x[i].dmin) * y[i].d;
 
-            int32_t sub_sums[8] = {0};
+        int32_t sub_sums[8] = {0};
 
-            /* Process 4 groups of 32 bytes (64 nibbles = 32 low + 32 high) */
-            for (int j = 0; j < 4; j++) {
-                /* Load first 16 Q4_K bytes of this group -> 32 low nibbles for sub-block j*2 */
-                const uint8x16_t q4a = vld1q_u8(q4);
-                const uint8x16_t q4b = vld1q_u8(q4 + 16);
-                q4 += 32;
+        /* Process 4 groups of 32 bytes (64 nibbles = 32 low + 32 high) */
+        for (int j = 0; j < 4; j++) {
+            /* Load 32 Q4_K bytes -> 64 nibbles: 32 low + 32 high */
+            const uint8x16_t q4a = vld1q_u8(q4);
+            const uint8x16_t q4b = vld1q_u8(q4 + 16);
+            q4 += 32;
 
-                const int8x16_t q4lo_a = vreinterpretq_s8_u8(vandq_u8(q4a, m4));
-                const int8x16_t q4lo_b = vreinterpretq_s8_u8(vandq_u8(q4b, m4));
-                const int8x16_t q4hi_a = vreinterpretq_s8_u8(vshrq_n_u8(q4a, 4));
-                const int8x16_t q4hi_b = vreinterpretq_s8_u8(vshrq_n_u8(q4b, 4));
+            const int8x16_t q4lo_a = vreinterpretq_s8_u8(vandq_u8(q4a, m4));
+            const int8x16_t q4lo_b = vreinterpretq_s8_u8(vandq_u8(q4b, m4));
+            const int8x16_t q4hi_a = vreinterpretq_s8_u8(vshrq_n_u8(q4a, 4));
+            const int8x16_t q4hi_b = vreinterpretq_s8_u8(vshrq_n_u8(q4b, 4));
 
-                /* Sub-block j*2: low nibbles (32 values) vs q8[32*j*2 .. 32*j*2+31] */
-                int sb_lo = j * 2;
-                const int8x16_t q8a = vld1q_s8(q8); q8 += 16;
-                const int8x16_t q8b = vld1q_s8(q8); q8 += 16;
-                int32x4_t s0 = vmmlaq_s32(vdupq_n_s32(0), q4lo_a, q8a);
-                int32x4_t s1 = vmmlaq_s32(vdupq_n_s32(0), q4lo_b, q8b);
-                sub_sums[sb_lo] += (vgetq_lane_s32(s0, 0) + vgetq_lane_s32(s0, 3) +
-                                     vgetq_lane_s32(s1, 0) + vgetq_lane_s32(s1, 3)) *
-                                   scales8[sb_lo];
+            /* Sub-block j*2: low nibbles (32 values) vs q8[32*j*2 .. 32*j*2+31] */
+            int sb_lo = j * 2;
+            const int8x16_t q8a = vld1q_s8(q8); q8 += 16;
+            const int8x16_t q8b = vld1q_s8(q8); q8 += 16;
+            int32x4_t s0 = vmmlaq_s32(vdupq_n_s32(0), q4lo_a, q8a);
+            int32x4_t s1 = vmmlaq_s32(vdupq_n_s32(0), q4lo_b, q8b);
+            sub_sums[sb_lo] += (vgetq_lane_s32(s0, 0) + vgetq_lane_s32(s0, 3) +
+                                 vgetq_lane_s32(s1, 0) + vgetq_lane_s32(s1, 3)) *
+                               scales8[sb_lo];
 
-                /* Sub-block j*2+1: high nibbles (32 values) vs q8[32*(j*2+1) .. 32*(j*2+1)+31] */
-                int sb_hi = j * 2 + 1;
-                const int8x16_t q8c = vld1q_s8(q8); q8 += 16;
-                const int8x16_t q8d = vld1q_s8(q8); q8 += 16;
-                int32x4_t s2 = vmmlaq_s32(vdupq_n_s32(0), q4hi_a, q8c);
-                int32x4_t s3 = vmmlaq_s32(vdupq_n_s32(0), q4hi_b, q8d);
-                sub_sums[sb_hi] += (vgetq_lane_s32(s2, 0) + vgetq_lane_s32(s2, 3) +
-                                     vgetq_lane_s32(s3, 0) + vgetq_lane_s32(s3, 3)) *
-                                    scales8[sb_hi];
-            }
-
-            /* Sum all 8 sub-block contributions */
-            int32_t total = 0;
-            for (int j = 0; j < 8; j++) total += sub_sums[j];
-
-            sumf += d * (float)total - dmin * (float)sumi;
+            /* Sub-block j*2+1: high nibbles (32 values) vs q8[32*(j*2+1) .. 32*(j*2+1)+31] */
+            int sb_hi = j * 2 + 1;
+            const int8x16_t q8c = vld1q_s8(q8); q8 += 16;
+            const int8x16_t q8d = vld1q_s8(q8); q8 += 16;
+            int32x4_t s2 = vmmlaq_s32(vdupq_n_s32(0), q4hi_a, q8c);
+            int32x4_t s3 = vmmlaq_s32(vdupq_n_s32(0), q4hi_b, q8d);
+            sub_sums[sb_hi] += (vgetq_lane_s32(s2, 0) + vgetq_lane_s32(s2, 3) +
+                                 vgetq_lane_s32(s3, 0) + vgetq_lane_s32(s3, 3)) *
+                                scales8[sb_hi];
         }
+
+        /* Sum all 8 sub-block contributions */
+        int32_t total = 0;
+        for (int j = 0; j < 8; j++) total += sub_sums[j];
+
+        sumf += d * (float)total - dmin * (float)sumi;
     }
+    return sumf;
 
 #else
     /* Scalar fallback: nibble extraction + int8 MAC */
