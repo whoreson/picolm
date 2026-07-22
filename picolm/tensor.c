@@ -495,8 +495,11 @@ static void pool_wake_active(int active) {
 static void pool_wait(int nt) {
     win_mutex_lock(&pool_mutex);
     int target = pool_target > 0 ? pool_target : (nt - 1);
+    if (target < 0) target = 0;
+    if (target > 0) fprintf(stderr, "\n[pool_wait] target=%d done=%d nt=%d gen=%d\n", target, pool_done, nt, pool_gen);
     while (pool_done < target) {
         win_cond_wait(&pool_cond, &pool_mutex);
+        if (target > 0) fprintf(stderr, "[pool_wait] WAKE done=%d gen=%d\n", pool_done, pool_gen);
     }
     pool_done = 0;
     pool_target = 0;
