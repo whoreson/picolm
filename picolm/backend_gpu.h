@@ -76,6 +76,28 @@ int picolm_gpu_w4a16_mlp(picolm_gpu_tensor_t *gate,
 int picolm_gpu_w4a16_matmul(picolm_gpu_tensor_t *t,
                              float *y, const float *x, int S, int device);
 
+/* SSM recurrence kernel: processes n_v_heads independently on GPU.
+ * Each head does: decay state, compute sk=state*k, d=(v-sk)*beta,
+ * state += k*d (outer product), output = state*q.
+ * Layouts:
+ *   state: [n_v_heads][d_state][d_state], row-major (float)
+ *   q_conv: [n_k_heads][d_state] (k_head = h/repeat)
+ *   k_conv: [n_k_heads][d_state]
+ *   v_conv: [n_v_heads][head_v_dim] where head_v_dim == d_state
+ *   gate_exp: [n_v_heads] (float decay factors)
+ *   beta: [n_v_heads] (float per-head beta)
+ *   ssm_output: [d_state][n_v_heads] (dim-major)
+ * Returns 1 on success. */
+int picolm_gpu_ssm_recurrence(float *state,
+                               const float *q_conv,
+                               const float *k_conv,
+                               const float *v_conv,
+                               const float *gate_exp,
+                               const float *beta,
+                               float *ssm_output,
+                               int n_v_heads, int d_state,
+                               int repeat, int device);
+
 /* Free a GPU tensor (device memory + host handle). */
 void picolm_gpu_tensor_free(picolm_gpu_tensor_t *tensor);
 

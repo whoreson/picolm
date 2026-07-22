@@ -2279,7 +2279,20 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     ssm_ctx.q_conv = q_conv; ssm_ctx.k_conv = k_conv; ssm_ctx.v_conv = v_conv;
     ssm_ctx.gate_exp = gate_exp; ssm_ctx.beta = beta;
     ssm_ctx.ssm_output = ssm_output; /* shared, dim-major [d*n_v_heads+h] */
-    tensor_parallel_for(n_v_heads, ssm_head_task, &ssm_ctx);
+#ifdef PICOLM_GPU
+    if (gpu_lw) {
+        /* GPU SSM recurrence kernel */
+        if (!picolm_gpu_ssm_recurrence(state, q_conv, k_conv, v_conv,
+                                        gate_exp, beta, ssm_output,
+                                        n_v_heads, d_state, repeat, m->gpu.device)) {
+            /* Fall back to CPU */
+            tensor_parallel_for(n_v_heads, ssm_head_task, &ssm_ctx);
+        }
+    } else
+#endif
+    {
+        tensor_parallel_for(n_v_heads, ssm_head_task, &ssm_ctx);
+    }
 #ifdef DEBUG_SSM
     if (il == 0 && pos == 0) dbg_vec("ssm_out_pre[:8]", ssm_output, head_v_dim, 8);
 #endif

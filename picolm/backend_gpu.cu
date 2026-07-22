@@ -417,6 +417,90 @@ picolm_silu_mul(float *gate, const float *up, size_t n) {
     }
 }
 
+/* ---- SSM recurrence kernel ----
+ *
+ * One thread block per head, 256 threads per block.
+ * Each head independently processes its d_state x d_state state block.
+ * d_state can be up to 256 -> d_state^2 = 65536 elements.
+ *
+ * Steps per head:
+ * 1. Decay: state *= gate_exp
+ * 2. sk = state @ k (matrix-vector)
+ * 3. d = (v - sk) * beta
+ * 4. state += k * d^T (outer product)
+ * 5. output = state @ q (matrix-vector), written dim-major
+ */
+extern "C" __global__ void
+picolm_ssm_recurrence_kernel(float *state,
+                              const float *q_conv,
+                              const float *k_conv,
+                              const float *v_conv,
+                              const float *gate_exp,
+                              const float *beta,
+                              float *ssm_output,
+                              int n_v_heads, int d_state,
+                              int repeat) {
+    int h = gpuBlockIdx_x;
+    if (h >= n_v_heads) return;
+    int tid = gpuThreadIdx_x;
+
+    /* Shared memory for intermediate results: sk[d_state] + d_local[d_state] */
+    extern __shared__ float sdata[];
+    float *sk = sdata;
+    float *d_local = sdata + d_state;
+
+    /* Per-head pointers */
+    int kh = h / repeat;
+    const float *qh = q_conv + (size_t)kh * d_state;
+    const float *khv = k_conv + (size_t)kh * d_state;
+    const float *vh = v_conv + (size_t)h * d_state;
+    float ge = gate_exp[h];
+    float bh = beta[h];
+    float *st = state + (size_t)h * d_state * d_state;
+    float *out_base = ssm_output + h; /* stride n_v_heads in dim-major */
+
+    /* Step 1: Decay state elementwise */
+    for (int i = tid; i < d_state * d_state; i += gpuBlockDim_x) {
+        st[i] *= ge;
+    }
+    gpuSyncthreads();
+
+    /* Step 2: sk[row] = state[row] @ k */
+    for (int row = tid; row < d_state; row += gpuBlockDim_x) {
+        float sum = 0.0f;
+        const float *st_row = st + (size_t)row * d_state;
+        for (int col = 0; col < d_state; col++) {
+            sum += st_row[col] * khv[col];
+        }
+        sk[row] = sum;
+    }
+    gpuSyncthreads();
+
+    /* Step 3: d[row] = (v[row] - sk[row]) * beta */
+    for (int row = tid; row < d_state; row += gpuBlockDim_x) {
+        d_local[row] = (vh[row] - sk[row]) * bh;
+    }
+    gpuSyncthreads();
+
+    /* Step 4: state[row][col] += k[col] * d[row] */
+    for (int i = tid; i < d_state * d_state; i += gpuBlockDim_x) {
+        int row = i / d_state;
+        int col = i % d_state;
+        st[i] += khv[col] * d_local[row];
+    }
+    gpuSyncthreads();
+
+    /* Step 5: output[row] = state[row] @ q, written dim-major [row*n_v_heads + h] */
+    for (int row = tid; row < d_state; row += gpuBlockDim_x) {
+        float sum = 0.0f;
+        const float *st_row = st + (size_t)row * d_state;
+        for (int col = 0; col < d_state; col++) {
+            sum += st_row[col] * qh[col];
+        }
+        out_base[(size_t)row * n_v_heads] = sum;
+    }
+}
+
 /* ---- w4a16_matmul kernel (Tensor Core path) ----
  *
  * NVIDIA: WMMA via nvcuda::wmma namespace (sm_70+, CUDA 10+)
@@ -1114,5 +1198,38 @@ int picolm_gpu_w4a16_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, in
     (void)t; (void)y; (void)x; (void)S; (void)device;
     return 0;
 #endif
+}
+
+/* ---- SSM recurrence API ---- */
+extern "C" int
+picolm_gpu_ssm_recurrence(float *state,
+                           const float *q_conv,
+                           const float *k_conv,
+                           const float *v_conv,
+                           const float *gate_exp,
+                           const float *beta,
+                           float *ssm_output,
+                           int n_v_heads, int d_state,
+                           int repeat, int device) {
+    if (n_v_heads <= 0 || d_state <= 0) return 0;
+    if (d_state > 256) return 0;
+
+    if (!gpu_ok(gpuSetDevice(device), "ssm device")) return 0;
+    gpu_device_ctx_t *ctx = NULL;
+    for (int i = 0; i < g_nctx; i++) {
+        if (g_gpu_ctx[i].device == device) { ctx = &g_gpu_ctx[i]; break; }
+    }
+    if (!ctx) return 0;
+
+    size_t shared_mem = 2 * d_state * sizeof(float);
+
+    dim3 grid((unsigned)n_v_heads, 1, 1);
+    picolm_ssm_recurrence_kernel<<<grid, 256, (unsigned)shared_mem, ctx->stream>>>(
+        state, q_conv, k_conv, v_conv, gate_exp, beta, ssm_output,
+        n_v_heads, d_state, repeat);
+
+    if (!gpu_ok(gpuGetLastError(), "ssm recurrence") ||
+        !gpu_ok(gpuDeviceSynchronize(), "ssm sync")) return 0;
+    return 1;
 }
 
