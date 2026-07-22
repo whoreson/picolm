@@ -124,6 +124,11 @@ typedef hipEvent_t gpuEvent_t;
 #define gpuShflUpSync __shfl_up_sync
 #define gpuLaunchBlockPerMultiprocessor cudaDevAttrMaxThreadsPerMultiProcessor
 #define gpuDevice cudaDevice
+#define gpuHostRegister cudaHostRegister
+#define gpuHostUnregister cudaHostUnregister
+#define gpuMemcpyHostToDevice cudaMemcpyHostToDevice
+#define gpuMemcpyDeviceToHost cudaMemcpyDeviceToHost
+#define gpuError_t cudaError_t
 #endif
 
 /* ---- Device-side FP16 helpers ---- */
