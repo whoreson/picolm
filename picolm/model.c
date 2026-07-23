@@ -1760,6 +1760,13 @@ float *model_forward(model_t *m, int token, int pos) {
 #endif
         int this_q_dim = (c->has_ssm && lw->is_attn_layer) ? q_full_dim : q_dim;
         matmul(s->q, s->xb, lw->attn_q, dim, this_q_dim, lw->type_attn_q);
+        if (l == 0 && pos == 0) {
+            float qsum = 0, qmax = 0;
+            for (int qi = 0; qi < this_q_dim; qi++) {
+                qsum += s->q[qi];
+                if (fabsf(s->q[qi]) > qmax) qmax = fabsf(s->q[qi]);
+            }
+                    }
         tensor_set_repacked(NULL);
 
         /* For Qwen3.5: de-interleave per-head Q+gate into block layout
@@ -1948,6 +1955,15 @@ float *model_forward(model_t *m, int token, int pos) {
     if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)m->gpu.output, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
 #endif
     matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
+    static int dbg_logits = 0;
+    if (!dbg_logits++) {
+        float lmax = s->logits[0], lmin = s->logits[0], lsum = 0;
+        for (int li = 0; li < c->vocab_size; li++) {
+            lsum += s->logits[li];
+            if (s->logits[li] > lmax) lmax = s->logits[li];
+            if (s->logits[li] < lmin) lmin = s->logits[li];
+        }
+            }
     tensor_set_repacked(NULL);
 
     return s->logits;
@@ -3379,6 +3395,14 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #endif
         { int this_q_dim = (c->has_ssm && lw->is_attn_layer) ? q_full_dim : q_dim;
           matmul_batch(q_batch, xb_batch, n_tokens, lw->attn_q, dim, this_q_dim, lw->type_attn_q);
+          if (l == 0) {
+              float qsum = 0, qmax = 0;
+              for (int qi = 0; qi < this_q_dim; qi++) {
+                  qsum += q_batch[qi];
+                  float av = fabsf(q_batch[qi]);
+                  if (av > qmax) qmax = av;
+              }
+                        }
         }
         tensor_set_repacked(NULL);
 
@@ -3485,6 +3509,14 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)m->gpu.layers[l].attn_output, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
 #endif
         matmul_batch(xb2_batch, xb_batch, n_tokens, lw->attn_output, q_dim, dim, lw->type_attn_output);
+        if (l == 0) {
+            float asum = 0, amax = 0;
+            for (int ai = 0; ai < dim; ai++) {
+                asum += xb2_batch[ai];
+                float av = fabsf(xb2_batch[ai]);
+                if (av > amax) amax = av;
+            }
+                    }
         tensor_set_repacked(NULL);
 
         /* Residual: x += attn_out */
@@ -3535,11 +3567,20 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
             float *a = x_batch + bi * dim, *b = xb2_batch + bi * dim;
             for (int d2 = 0; d2 < dim; d2++) a[d2] += b[d2];
         }
+        if (l == 0 || l == 1 || l == 2) {
+            float xsum = 0, xmax = 0;
+            float *rx = x_batch + dim; /* token 1 */
+            for (int d2 = 0; d2 < dim; d2++) {
+                xsum += rx[d2];
+                float av = fabsf(rx[d2]);
+                if (av > xmax) xmax = av;
+            }
+                    }
         }
 
     /* Final norm + output (last token only) */
     float *last_x = x_batch + (n_tokens - 1) * dim;
-    rmsnorm(s->x, last_x, s->output_norm_w, dim, c->rms_norm_eps);
+        rmsnorm(s->x, last_x, s->output_norm_w, dim, c->rms_norm_eps);
     tensor_set_repacked(m->repack_used[1] ? m->repack_buffers[1] : NULL);
 #ifdef PICOLM_GPU
     if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)m->gpu.output, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);

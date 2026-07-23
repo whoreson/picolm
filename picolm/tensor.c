@@ -1104,6 +1104,30 @@ void matmul_batch(float *out, const float *x, int n_batch,
         } else { free(qbuf); free(dbuf); }
     }
 
+    /* Q4_0_4_4 fast path for batched matmul */
+    if (qtype == GGUF_TYPE_Q4_0_4_4 && n_batch > 0 && n > 0) {
+        size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
+        void *qx_buf = malloc((size_t)n_batch * q8_rb);
+        if (qx_buf) {
+            for (int b = 0; b < n_batch; b++)
+                quantize_row_q8_0(x + (size_t)b * n, (char *)qx_buf + (size_t)b * q8_rb, n);
+            int d4 = (d / 4) * 4;
+            size_t group_bytes = (size_t)(n / 32) * sizeof(block_q4_0x4);
+            for (int b = 0; b < n_batch; b++) {
+                const block_q8_0 *qx = (const block_q8_0 *)((char *)qx_buf + (size_t)b * q8_rb);
+                for (int g = 0; g < d4; g += 4) {
+                    const char *wg = (const char *)W + (g / 4) * group_bytes;
+                    vec_dot_q4_0x4_q8_0(wg, qx, n, out + b * d + g, 4);
+                }
+                /* Tail rows */
+                for (int i = d4; i < d; i++)
+                    out[b * d + i] = vec_dot((const char *)W + (size_t)i * gguf_type_row_size(qtype, n), x + b * n, n, qtype);
+            }
+            free(qx_buf);
+            return;
+        }
+    }
+
     if (n_threads <= 1 || d < 4 || d < matmul_min_rows) {
         /* Scalar path */
         for (int i = 0; i < d; i++) {
@@ -1323,11 +1347,48 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                 }
             }
         }
-    }
 
-    /* Dual batch: two independent matmul_batch calls, each threaded.
-     * The two matmuls share the same input x but write to different outputs. */
-    if (n_threads <= 1) {
+    /* Q4_0_4_4 requires group-of-4 row processing; handle before threading check */
+    int is_q4x4_1 = (qtype1 == GGUF_TYPE_Q4_0_4_4);
+    int is_q4x4_2 = (qtype2 == GGUF_TYPE_Q4_0_4_4);
+    if (is_q4x4_1 || is_q4x4_2) {
+        /* Quantize input to Q8_0 once per batch token */
+        size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
+        void *qx_buf = malloc((size_t)n_batch * q8_rb);
+        if (qx_buf) {
+            for (int b = 0; b < n_batch; b++)
+                quantize_row_q8_0(x + (size_t)b * n, (char *)qx_buf + (size_t)b * q8_rb, n);
+            int d4_1 = (is_q4x4_1) ? (d / 4) * 4 : 0;
+            int d4_2 = (is_q4x4_2) ? (d / 4) * 4 : 0;
+                size_t group_bytes1 = (is_q4x4_1) ? (size_t)(n / 32) * sizeof(block_q4_0x4) : 0;
+                size_t group_bytes2 = (is_q4x4_2) ? (size_t)(n / 32) * sizeof(block_q4_0x4) : 0;
+                size_t rb1 = gguf_type_row_size(qtype1, n);
+                size_t rb2 = gguf_type_row_size(qtype2, n);
+                for (int b = 0; b < n_batch; b++) {
+                    const block_q8_0 *qx = (const block_q8_0 *)((char *)qx_buf + (size_t)b * q8_rb);
+                    if (is_q4x4_1) {
+                        for (int g = 0; g < d4_1; g += 4) {
+                            const char *wg = (const char *)W1 + (g / 4) * group_bytes1;
+                            vec_dot_q4_0x4_q8_0(wg, qx, n, out1 + b * d + g, 4);
+                        }
+                    } else {
+                        for (int i = 0; i < d; i++)
+                            out1[b * d + i] = vec_dot((const char *)W1 + i * rb1, x + b * n, n, qtype1);
+                    }
+                    if (is_q4x4_2) {
+                        for (int g = 0; g < d4_2; g += 4) {
+                            const char *wg = (const char *)W2 + (g / 4) * group_bytes2;
+                            vec_dot_q4_0x4_q8_0(wg, qx, n, out2 + b * d + g, 4);
+                        }
+                    } else {
+                        for (int i = 0; i < d; i++)
+                            out2[b * d + i] = vec_dot((const char *)W2 + i * rb2, x + b * n, n, qtype2);
+                    }
+                }
+                free(qx_buf);
+                return;
+            }
+        }
         size_t row_bytes = gguf_type_row_size(qtype1, n);
         size_t row_bytes2 = gguf_type_row_size(qtype2, n);
         const char *w1 = (const char *)W1;

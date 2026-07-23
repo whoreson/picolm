@@ -2247,6 +2247,7 @@ void vec_dot_q4_0x4_q8_0(const void *vx, const void *wy, int n, float *out, int 
     const block_q8_0 *y = (const block_q8_0 *)wy;
     int nb = n / 32;  /* blocks per row */
 
+#if 0 /* disabled: DOTPROD laneq pattern incompatible with standard Q8_0 input */
 #if defined(PICOLM_DOTPROD)
     /* Ported from ggml's ggml_gemv_q4_0_4x4_q8_0 (ggml-cpu/arch/arm/repack.cpp).
      * vdotq_laneq_s32 computes a 4-way signed dot-product-accumulate in one
@@ -2293,6 +2294,7 @@ void vec_dot_q4_0x4_q8_0(const void *vx, const void *wy, int n, float *out, int 
         vst1q_f32(out + row_group, acc);
     }
     return;
+#endif
 #endif
 
 /* Scalar: process each row individually from interleaved data.
