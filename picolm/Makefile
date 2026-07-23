@@ -230,4 +230,14 @@ probes/metal_matmul_bench: probes/metal_matmul_bench.mm
 metal-bench-run: metal-bench
 	./probes/metal_matmul_bench
 
+# --- End-to-end model timing (needs `make metal` first + GGUF files) ---
+# Runs ./picolm on real models, parses prefill/generation tok/s.
+#   make metal-model-bench            # GPU
+#   make metal-model-bench CPU=1      # also CPU baseline
+#   LABEL=after make metal-model-bench # tag the run
+# Override models with MODELS="a.gguf b.gguf" or pass them as script args.
+.PHONY: metal-model-bench
+metal-model-bench:
+	./probes/metal_model_bench.sh
+
 .PHONY: hip cuda metal

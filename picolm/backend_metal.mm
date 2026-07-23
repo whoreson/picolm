@@ -64,8 +64,9 @@
 //     derived from quant.c dequantize_row_q4_K and hand-verified.
 //   - Q8_0: 1 block (34B, 32 values) per simdgroup; each lane reads 1 int8.
 //   - F32/F16: float4 / half4 vector loads, lanes stride by TPB*4.
-// Q4_0/Q5_K/Q6_K keep a per-element structure (their layouts are awkward to
-// coalesce) but cache block metadata once and use simd_sum.
+// Q4_0/Q5_K keep a per-element structure (their layouts are awkward to
+// coalesce) but cache block metadata once and use simd_sum. Q6_K is ALSO
+// coalesced (1 block/simdgroup, 8 values/lane) — see mm_q6_K below.
 //
 // IMPORTANT: dequant layouts match PicoLM's CPU dequantize_row_* in quant.c
 // (the GGUF/llama.cpp convention). For Q4_0: value j -> byte (j&15), low nibble
@@ -296,8 +297,12 @@ kernel void mm_q5_K(device const uint8_t* w [[buffer(0)]],\n\
     if (tid == 0) y[(unsigned long)s * O + o] = total;\n\
 }\n\
 \n\
-/* ---------------- Q6_K (210B/256v) — metadata cached + simd_sum -----------\n\
- * block_q6_K: ql[128], qh[64], scales[16 int8], uint16 d (offset 208). */\n\
+/* ---------------- Q6_K (210B/256v) — COALESCED, 1 block/simdgroup ---------\n\
+ * One simdgroup (32 lanes) processes one 256-value block; each lane owns 8\n\
+ * values. ql[128] read in 4 coalesced 32B passes (lane t owns bytes t,32+t,\n\
+ * 64+t,96+t); qh[64] in 2 coalesced passes; scales read direct (cached).\n\
+ * Indexing derived from quant.c dequantize_row_q6_K; validated vs the CPU\n\
+ * reference by probes/metal_matmul_bench (4-11x faster than per-element). */\n\
 kernel void mm_q6_K(device const uint8_t* w [[buffer(0)]],\n\
                     device const float*   x [[buffer(1)]],\n\
                     device float*         y [[buffer(2)]],\n\
@@ -309,26 +314,30 @@ kernel void mm_q6_K(device const uint8_t* w [[buffer(0)]],\n\
     int o = (int)gp.x, s = (int)gp.y;\n\
     int nblocks = I / 256;\n\
     device const uint8_t* row = w + (unsigned long)o * (unsigned long)(nblocks * 210);\n\
+    uint warp = tid >> 5, lane = tid & 31;\n\
     float acc = 0.0f;\n\
-    for (int bi = (int)tid; bi < nblocks; bi += TPB) {\n\
+    for (int bi = (int)warp; bi < nblocks; bi += NW) {\n\
         device const uint8_t* blk = row + (unsigned long)(bi * 210);\n\
         float d = f16tof32((uint16_t)blk[208] | ((uint16_t)blk[209] << 8));\n\
         device const uint8_t* ql = blk;\n\
         device const uint8_t* qh = blk + 128;\n\
         device const int8_t*  sc = (device const int8_t*)(blk + 192);\n\
-        float ds[16];\n\
-        for (int i = 0; i < 16; i++) ds[i] = d * (float)sc[i];\n\
-        for (int j = 0; j < 256; j++) {\n\
-            int chunk = j / 128, within = j % 128;\n\
-            int sub = within / 32, l = within % 32;\n\
-            int ql_idx = (sub == 1 || sub == 3) ? (l + 32) : l;\n\
-            uint8_t qlb = ql[chunk * 64 + ql_idx];\n\
-            uint8_t qhb = qh[chunk * 32 + l];\n\
-            int qh_shift = (sub == 0) ? 0 : (sub == 1) ? 2 : (sub == 2) ? 4 : 6;\n\
-            int qraw = ((sub < 2) ? (int)(qlb & 0xF) : (int)(qlb >> 4))\n\
-                     | (int)(((qhb >> qh_shift) & 3) << 4);\n\
-            int sc_idx = chunk * 8 + l / 16 + 2 * sub;\n\
-            acc += x[(unsigned long)s * I + bi * 256 + j] * (ds[sc_idx] * (float)(qraw - 32));\n\
+        #pragma unroll\n\
+        for (int k = 0; k < 4; k++) {            /* 4 coalesced 32B ql reads */\n\
+            uint b   = (uint)(k * 32) + lane;     /* ql byte this lane owns   */\n\
+            uint chk = b >> 6;                     /* chunk = b/64            */\n\
+            uint grp = (b & 63) >> 5;             /* (b%64)/32               */\n\
+            uint l   = b & 31;                     /* b%32                    */\n\
+            uint qlb = ql[b];                      /* coalesced               */\n\
+            uint qhb = qh[chk * 32 + l];\n\
+            int qraw0 = (int)(qlb & 0xF) | (int)(((qhb >> (2u * grp)) & 3u) << 4);\n\
+            int si0   = (int)(chk * 8 + l / 16 + 2u * grp);\n\
+            uint j0   = chk * 128 + grp * 32 + l;\n\
+            acc += x[(unsigned long)s * I + (unsigned long)bi * 256 + j0] * (d * (float)sc[si0] * (float)(qraw0 - 32));\n\
+            int qraw1 = (int)(qlb >> 4) | (int)(((qhb >> (2u * (grp + 2u))) & 3u) << 4);\n\
+            int si1   = (int)(chk * 8 + l / 16 + 2u * (grp + 2u));\n\
+            uint j1   = chk * 128 + (grp + 2u) * 32 + l;\n\
+            acc += x[(unsigned long)s * I + (unsigned long)bi * 256 + j1] * (d * (float)sc[si1] * (float)(qraw1 - 32));\n\
         }\n\
     }\n\
     threadgroup float wb[NW];\n\
