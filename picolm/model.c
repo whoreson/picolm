@@ -2408,10 +2408,6 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     /* final_output is [head_v_dim * n_v_heads] = [value_dim] = [4096] */
     /* ssm_out: [n_embd, value_dim] - GGUF columns may be reordered */
     if (do_remap) {
-        /* Reorder final_output to GGUF column order before matmul, then matmul,
-         * then reorder result back. Actually easier: reorder final_output to GGUF
-         * order, matmul, and the result is already correct because the weight
-         * columns and input elements are matched. */
         float *fo_gguf = alloca(c->ssm_d_inner * sizeof(float));
         for (int h = 0; h < n_v_heads; h++) {
             int gh = qwen35_vhead_gguf(h, n_vpk, n_k);
@@ -2421,7 +2417,7 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     } else {
         matmul(residual, final_output, lw->ssm_out, c->ssm_d_inner, dim, lw->type_ssm_out);
     }
-#ifdef DEBUG_SSM
+    #ifdef DEBUG_SSM
     if (il == 0 && pos == 0) dbg_vec("residual[:8]", residual, 8, 8);
 #endif
     /* 20. Residual add */
@@ -3320,9 +3316,10 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
                               float *hb_batch, float *hb2_batch,
                               layer_weights_t *lw, int l,
                               int n_tokens, int start_pos, int xb2_stride,
-                              int xb_stride, void **gpu_lw) {
+                              void **gpu_lw) {
     (void)start_pos;
     (void)gpu_lw;
+    (void)xb_batch; /* not used: SSM layer uses local ssm_xb buffer */
     model_config_t *c = &m->config;
     int dim = c->n_embd;
     int d_state = c->ssm_d_state;
@@ -3347,22 +3344,23 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
     int state_stride = conv_dim;
     int ri = 2 + l * 9;
 
-    /* Allocate per-token scratch: qkv + z + conv_out */
-    size_t per_tok = (size_t)(conv_dim + value_dim + conv_dim);
+    /* Allocate per-token scratch: xb (RMSNorm'd input) + qkv + z + conv_out */
+    size_t per_tok = (size_t)(dim + conv_dim + value_dim + conv_dim);
     float *ssm_buf = (float *)malloc((size_t)n_tokens * per_tok * sizeof(float));
     if (!ssm_buf) { fprintf(stderr, "OOM: SSM prefill scratch\n"); exit(1); }
-    float *qkv_batch = ssm_buf;
+    float *ssm_xb = ssm_buf;              /* [n_tokens][dim] - RMSNorm'd input */
+    float *qkv_batch = ssm_xb + (size_t)n_tokens * dim;
     float *z_batch = qkv_batch + (size_t)n_tokens * conv_dim;
     float *conv_batch = z_batch + (size_t)n_tokens * value_dim;
 
-    /* 1. Batched RMSNorm */
+    /* 1. Batched RMSNorm (write to local ssm_xb with stride dim) */
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
     for (int bi = 0; bi < n_tokens; bi++)
-        rmsnorm(xb_batch + bi * xb_stride, x_batch + bi * dim, s->attn_norm_w[l], dim, eps);
+        rmsnorm(ssm_xb + bi * dim, x_batch + bi * dim, s->attn_norm_w[l], dim, eps);
 
-    /* 2. Batched QKV projection */
+    /* 2. Batched QKV projection (read from ssm_xb with stride dim) */
     tensor_set_repacked(m->repack_used[ri] ? m->repack_buffers[ri] : NULL);
 #ifdef PICOLM_GPU
     if (gpu_lw[l]) {
@@ -3370,7 +3368,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
         tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->attn_qkv, m->gpu.device);
     }
 #endif
-    matmul_batch(qkv_batch, xb_batch, n_tokens, lw->attn_qkv, dim, conv_dim, lw->type_attn_qkv);
+    matmul_batch(qkv_batch, ssm_xb, n_tokens, lw->attn_qkv, dim, conv_dim, lw->type_attn_qkv);
     tensor_set_repacked(NULL);
 #ifdef PICOLM_GPU
     if (gpu_lw[l]) {
@@ -3381,7 +3379,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
 
     /* 3. Batched Z gate projection */
     tensor_set_repacked(m->repack_used[ri+1] ? m->repack_buffers[ri+1] : NULL);
-    matmul_batch(z_batch, xb_batch, n_tokens, lw->attn_gate_ssm, dim, value_dim, lw->type_attn_gate_ssm);
+    matmul_batch(z_batch, ssm_xb, n_tokens, lw->attn_gate_ssm, dim, value_dim, lw->type_attn_gate_ssm);
     tensor_set_repacked(NULL);
 #ifdef PICOLM_GPU
     if (gpu_lw[l]) tensor_set_gpu_tensor(NULL, 0);
@@ -3485,7 +3483,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
 #pragma omp parallel for
 #endif
         for (int bi = 0; bi < n_tokens; bi++) {
-            quantize_row_q8_0(xb_batch + bi * xb_stride, xb_q8_batch + bi * nb_xb * 34, dim);
+            quantize_row_q8_0(ssm_xb + bi * dim, xb_q8_batch + bi * nb_xb * 34, dim);
             const block_q8_0 *xqb = (const block_q8_0 *)(xb_q8_batch + bi * nb_xb * 34);
             for (int k = 0; k < nb_xb; k++) {
                 xb_q8_d_batch[bi * nb_xb + k] = fp16_to_fp32_lookup(xqb[k].d);
@@ -3507,7 +3505,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
                 float sum;
                 if (alpha_type == GGUF_TYPE_Q8_0) sum = vec_dot_q8_0_q8_0_deltas(xb_q8, xb_q8_d, head_data, dim);
                 else if (alpha_type == GGUF_TYPE_Q4_0) sum = vec_dot_q4_0_q8_0(head_data, xb_q8, dim);
-                else sum = vec_dot(head_data, xb_batch + bi * xb_stride, dim, alpha_type);
+                else sum = vec_dot(head_data, ssm_xb + bi * dim, dim, alpha_type);
                 al[h] = sum + s->ssm_dt_w[l][h];
             }
             /* Beta */
@@ -3519,7 +3517,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
                 float sum;
                 if (beta_type == GGUF_TYPE_Q8_0) sum = vec_dot_q8_0_q8_0_deltas(xb_q8, xb_q8_d, head_data, dim);
                 else if (beta_type == GGUF_TYPE_Q4_0) sum = vec_dot_q4_0_q8_0(head_data, xb_q8, dim);
-                else sum = vec_dot(head_data, xb_batch + bi * xb_stride, dim, beta_type);
+                else sum = vec_dot(head_data, ssm_xb + bi * dim, dim, beta_type);
                 bt[h] = sum;
             }
         }
@@ -3672,10 +3670,10 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
 #pragma omp parallel for
 #endif
         for (int bi = 0; bi < n_tokens; bi++)
-            rmsnorm(xb_batch + bi * xb_stride, x_batch + bi * dim, s->post_attn_norm_w[l], dim, eps);
+            rmsnorm(ssm_xb + bi * dim, x_batch + bi * dim, s->post_attn_norm_w[l], dim, eps);
 
         tensor_set_repacked(m->repack_used[ri+7] ? m->repack_buffers[ri+7] : NULL);
-        matmul_dual_batch(hb_batch, hb2_batch, xb_batch, n_tokens,
+        matmul_dual_batch(hb_batch, hb2_batch, ssm_xb, n_tokens,
                           lw->ffn_gate, lw->ffn_up, dim, c->n_ffn,
                           lw->type_ffn_gate, lw->type_ffn_up);
         tensor_set_repacked(NULL);
@@ -3730,7 +3728,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
     if (!buf) { fprintf(stderr, "OOM: prefill batch\n"); exit(1); }
     float *p = buf;
     float *x_batch = p;  p += bs * dim;
-    float *xb_batch = p; p += bs * dim; /* stride = dim, used by both SSM and attention paths */
+    float *xb_batch = p; p += bs * max_dim; /* stride = max_dim (attention needs q_full_dim) */
     float *xb2_batch = p; p += bs * xb2_stride;
     float *q_batch = p;  p += bs * q_full_dim;
     float *k_batch = p;  p += bs * kv_dim;
@@ -3812,24 +3810,12 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         layer_weights_t *lw = &w->layers[l];
 
         if (c->has_ssm && !lw->is_attn_layer) {
-            /* SSM layer: batched prefill with batched projections + threaded recurrence */
-#ifdef PICOLM_GPU
-            if (!gpu_ok) {
-#endif
-            ssm_prefill_layer(m, s, x_batch, xb_batch, xb2_batch,
-                              hb_batch, hb2_batch,
-                              lw, l, n_tokens, start_pos, xb2_stride,
-                              max_dim, NULL);
-#ifdef PICOLM_GPU
-            } else {
-                /* GPU path: per-token with GPU kernel */
-                for (int bi = 0; bi < n_tokens; bi++) {
-                    memcpy(s->x, x_batch + bi * dim, dim * sizeof(float));
-                    ssm_forward(m, s, s->x, s->xb2, lw, l, start_pos + bi, &m->gpu.layers[l]);
-                    memcpy(x_batch + bi * dim, s->x, dim * sizeof(float));
-                }
+            /* SSM layer: fall back to per-token for now until batched path is verified */
+            for (int bi = 0; bi < n_tokens; bi++) {
+                memcpy(s->x, x_batch + bi * dim, dim * sizeof(float));
+                ssm_forward(m, s, s->x, s->xb2, lw, l, start_pos + bi, NULL);
+                memcpy(x_batch + bi * dim, s->x, dim * sizeof(float));
             }
-#endif
             continue;
         }
 
@@ -3956,11 +3942,24 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         }
 
         /* Output projection (batched) */
-        tensor_set_repacked(m->repack_used[6+l*9] ? m->repack_buffers[6+l*9] : NULL);
-#ifdef PICOLM_GPU
-        if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)m->gpu.layers[l].attn_output, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
+        /* Note: xb_batch has stride max_dim, but attention output is q_dim wide.
+         * matmul_batch requires stride == n, so we copy to compact buffer. */
+        { float *attn_out_batch = NULL;
+          if (max_dim > q_dim) {
+              attn_out_batch = (float *)malloc((size_t)n_tokens * q_dim * sizeof(float));
+#ifdef _OPENMP
+#pragma omp parallel for
 #endif
-        matmul_batch(xb2_batch, xb_batch, n_tokens, lw->attn_output, q_dim, dim, lw->type_attn_output);
+              for (int bi = 0; bi < n_tokens; bi++)
+                  memcpy(attn_out_batch + bi * q_dim, xb_batch + bi * max_dim, q_dim * sizeof(float));
+          }
+          tensor_set_repacked(m->repack_used[6+l*9] ? m->repack_buffers[6+l*9] : NULL);
+#ifdef PICOLM_GPU
+          if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)m->gpu.layers[l].attn_output, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
+#endif
+          matmul_batch(xb2_batch, attn_out_batch ? attn_out_batch : xb_batch, n_tokens, lw->attn_output, q_dim, dim, lw->type_attn_output);
+          if (attn_out_batch) free(attn_out_batch);
+        }
         if (l == 0) {
             float asum = 0, amax = 0;
             for (int ai = 0; ai < dim; ai++) {
