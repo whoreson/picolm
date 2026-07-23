@@ -2439,26 +2439,25 @@ void vec_dot_q4_0x4_4x8_q8_0(const void *vx, const void *wy, int n, float *out, 
 
 /* ---- gemm_q4_0_4x8_q8_0: batched matmul for Q4_0_4x8 ----
  * Processes d output rows x n_batch activation tokens.
+ * Delegates to vec_dot_q4_0x4_4x8_q8_0 (DOTPROD gemv) per token.
  *
- * Weights: Q4_0_4x8 interleaved, [d/4 groups][nb blocks][d[4]+qs[64]]
- * Activations: Q8_0, [n_batch rows][nb blocks][d[1]+qs[32]]
- * Output: float32, [n_batch x d], row-major.
- *
- * NOTE: The I8MM inline assembly port from llama.cpp is kept as a commented-out
- * reference. It requires careful adaptation of the activation loading pattern
- * (PicoLM uses contiguous Q8_0 rows, llama.cpp uses repacked block_q8_0x4).
- * For now, uses the DOTPROD gemv path via vec_dot_q4_0x4_4x8_q8_0. */
+ * TODO: I8MM intrinsic path using vmmlaq_s32.
+ * The nibble expansion and packing for smmla requires careful rearrangement
+ * of Q4_0_4x8 data. See I8MM_PLAN.md for analysis. */
 void gemm_q4_0_4x8_q8_0(const void *W, const void *X, int n,
                          float *out, int d, int n_batch) {
-    /* Delegate to per-token gemv calls.
-     * The vec_dot_q4_0x4_4x8_q8_0 uses DOTPROD for correct results.
-     * TODO: rewrite with I8MM intrinsics (vmmlaq_s32) for better throughput. */
     size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
     for (int b = 0; b < n_batch; b++) {
         const void *xb = (const int8_t *)X + (size_t)b * q8_rb;
         vec_dot_q4_0x4_4x8_q8_0(W, xb, n, out + (size_t)b * d, d);
     }
 }
+
+/* ================================================================
+ * vec_dot_q8_0_q8_0_deltas: int8 MAC with pre-converted x deltas
 
 /* ================================================================
  * vec_dot_q8_0_q8_0_deltas: int8 MAC with pre-converted x deltas
