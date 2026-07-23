@@ -3308,6 +3308,404 @@ static void batch_attention_tiled(
 }
 
 /* ================================================================
+ * Batched SSM prefill layer.
+ *
+ * All projection matmuls batched across tokens (weights read once).
+ * Convolution, alpha/beta projections also batched.
+ * State recurrence remains sequential per token but uses threaded
+ * ssm_head_task across v-heads within each token.
+ * ================================================================ */
+static void ssm_prefill_layer(model_t *m, run_state_t *s,
+                              float *x_batch, float *xb_batch, float *xb2_batch,
+                              float *hb_batch, float *hb2_batch,
+                              layer_weights_t *lw, int l,
+                              int n_tokens, int start_pos, int xb2_stride,
+                              int xb_stride, void **gpu_lw) {
+    (void)start_pos;
+    (void)gpu_lw;
+    model_config_t *c = &m->config;
+    int dim = c->n_embd;
+    int d_state = c->ssm_d_state;
+    int n_k_heads = c->ssm_n_group;
+    int n_v_heads = c->ssm_dt_rank;
+    int conv_dim = 2 * d_state * n_k_heads + c->ssm_d_inner;
+    int head_v_dim = c->ssm_d_inner / n_v_heads;
+    float eps = c->rms_norm_eps;
+
+    int n_k = c->ssm_n_group;
+    int n_vpk = n_v_heads / n_k;
+    int half_vpk = n_vpk / 2;
+    int do_remap = !m->from_safetensors && n_k > 0 && n_k < n_v_heads && half_vpk > 0;
+    int value_dim = c->ssm_d_inner;
+    int qk_dim = d_state * n_k_heads;
+    int repeat = n_v_heads / n_k_heads;
+
+    float *conv_state = s->ssm_conv_state[l];
+    float *state = s->ssm_state[l];
+    float *conv1d_w = s->ssm_conv1d_w[l];
+    int n_state_rows = c->ssm_d_conv - 1;
+    int state_stride = conv_dim;
+    int ri = 2 + l * 9;
+
+    /* Allocate per-token scratch: qkv + z + conv_out */
+    size_t per_tok = (size_t)(conv_dim + value_dim + conv_dim);
+    float *ssm_buf = (float *)malloc((size_t)n_tokens * per_tok * sizeof(float));
+    if (!ssm_buf) { fprintf(stderr, "OOM: SSM prefill scratch\n"); exit(1); }
+    float *qkv_batch = ssm_buf;
+    float *z_batch = qkv_batch + (size_t)n_tokens * conv_dim;
+    float *conv_batch = z_batch + (size_t)n_tokens * value_dim;
+
+    /* 1. Batched RMSNorm */
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+    for (int bi = 0; bi < n_tokens; bi++)
+        rmsnorm(xb_batch + bi * xb_stride, x_batch + bi * dim, s->attn_norm_w[l], dim, eps);
+
+    /* 2. Batched QKV projection */
+    tensor_set_repacked(m->repack_used[ri] ? m->repack_buffers[ri] : NULL);
+#ifdef PICOLM_GPU
+    if (gpu_lw[l]) {
+        gpu_layer_weights_t *gl = (gpu_layer_weights_t *)gpu_lw[l];
+        tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->attn_qkv, m->gpu.device);
+    }
+#endif
+    matmul_batch(qkv_batch, xb_batch, n_tokens, lw->attn_qkv, dim, conv_dim, lw->type_attn_qkv);
+    tensor_set_repacked(NULL);
+#ifdef PICOLM_GPU
+    if (gpu_lw[l]) {
+        gpu_layer_weights_t *gl = (gpu_layer_weights_t *)gpu_lw[l];
+        tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->attn_gate_ssm, m->gpu.device);
+    }
+#endif
+
+    /* 3. Batched Z gate projection */
+    tensor_set_repacked(m->repack_used[ri+1] ? m->repack_buffers[ri+1] : NULL);
+    matmul_batch(z_batch, xb_batch, n_tokens, lw->attn_gate_ssm, dim, value_dim, lw->type_attn_gate_ssm);
+    tensor_set_repacked(NULL);
+#ifdef PICOLM_GPU
+    if (gpu_lw[l]) tensor_set_gpu_tensor(NULL, 0);
+#endif
+    if (do_remap) {
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+        for (int bi = 0; bi < n_tokens; bi++) {
+            float *zb = z_batch + bi * value_dim;
+            float *zt = alloca(value_dim * sizeof(float));
+            memcpy(zt, zb, value_dim * sizeof(float));
+            for (int h = 0; h < n_v_heads; h++) {
+                int gh = qwen35_vhead_gguf(h, n_vpk, n_k);
+                memcpy(zb + h * head_v_dim, zt + gh * head_v_dim, head_v_dim * sizeof(float));
+            }
+        }
+    }
+
+    /* 4. Convolution + silu (sequential per token: conv_state is stateful) */
+    for (int bi = 0; bi < n_tokens; bi++) {
+        float *qkv = qkv_batch + bi * conv_dim;
+        float *conv_out = conv_batch + bi * conv_dim;
+        for (int co = 0; co < conv_dim; co++) {
+            float sum = 0.0f;
+            for (int d = 0; d < n_state_rows; d++)
+                sum += conv1d_w[d + co * c->ssm_d_conv] * conv_state[d * state_stride + co];
+            sum += conv1d_w[(c->ssm_d_conv - 1) + co * c->ssm_d_conv] * qkv[co];
+            float v = sum;
+            conv_out[co] = v * (1.0f / (1.0f + expf(-v)));
+        }
+        /* Shift conv_state and append new token */
+        for (int r = 0; r < n_state_rows - 1; r++)
+            memcpy(conv_state + r * state_stride, conv_state + (r + 1) * state_stride, state_stride * sizeof(float));
+        memcpy(conv_state + (n_state_rows - 1) * state_stride, qkv, state_stride * sizeof(float));
+    }
+
+    /* 5. Split Q/K/V + L2 norm + Q scale (batched across tokens) */
+    if (do_remap) {
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+        for (int bi = 0; bi < n_tokens; bi++) {
+            float *conv = conv_batch + bi * conv_dim;
+            float *vt = alloca(value_dim * sizeof(float));
+            memcpy(vt, conv + 2*qk_dim, value_dim * sizeof(float));
+            for (int h = 0; h < n_v_heads; h++) {
+                int gh = qwen35_vhead_gguf(h, n_vpk, n_k);
+                memcpy(conv + 2*qk_dim + h * head_v_dim, vt + gh * head_v_dim, head_v_dim * sizeof(float));
+            }
+        }
+    }
+    float q_scale = 1.0f / sqrtf((float)d_state);
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+    for (int bi = 0; bi < n_tokens; bi++) {
+        float *conv = conv_batch + bi * conv_dim;
+        float *q = conv;
+        float *k = conv + qk_dim;
+        for (int h = 0; h < n_k_heads; h++) {
+            float *qh = q + h * d_state;
+            float nrm = 0.0f;
+            for (int d = 0; d < d_state; d++) nrm += qh[d] * qh[d];
+            nrm = 1.0f / sqrtf(nrm + 1e-12f) * q_scale;
+            for (int d = 0; d < d_state; d++) qh[d] *= nrm;
+        }
+        for (int h = 0; h < n_k_heads; h++) {
+            float *kh = k + h * d_state;
+            float nrm = 0.0f;
+            for (int d = 0; d < d_state; d++) nrm += kh[d] * kh[d];
+            nrm = 1.0f / sqrtf(nrm + 1e-12f);
+            for (int d = 0; d < d_state; d++) kh[d] *= nrm;
+        }
+    }
+
+    /* 6. Batched alpha + gate_exp + beta projections.
+     * GGUF stores [dim, n_v_heads] column-major per head, with possible
+     * v-head reordering. Each head is a vec_dot of dim elements.
+     * We process all tokens and all heads in batched fashion. */
+    float *alpha_batch = (float *)malloc((size_t)n_tokens * n_v_heads * sizeof(float));
+    float *beta_batch = (float *)malloc((size_t)n_tokens * n_v_heads * sizeof(float));
+    {
+        gguf_type_t alpha_type = lw->type_ssm_alpha;
+        gguf_type_t beta_type = lw->type_ssm_beta;
+        size_t row_bytes_alpha = gguf_type_row_size(alpha_type, dim);
+        size_t row_bytes_beta = gguf_type_row_size(beta_type, dim);
+
+        /* Precompute head maps */
+        int alpha_map[n_v_heads], beta_map[n_v_heads];
+        for (int h = 0; h < n_v_heads; h++) {
+            alpha_map[h] = do_remap ? qwen35_vhead_gguf(h, n_vpk, n_k) : h;
+            beta_map[h] = do_remap ? qwen35_vhead_gguf(h, n_vpk, n_k) : h;
+        }
+
+        /* Quantize all xb tokens to Q8_0 once for fast vec_dot */
+        int nb_xb = dim / 32;
+        uint8_t *xb_q8_batch = (uint8_t *)malloc((size_t)n_tokens * nb_xb * 34);
+        float *xb_q8_d_batch = (float *)malloc((size_t)n_tokens * nb_xb * sizeof(float));
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+        for (int bi = 0; bi < n_tokens; bi++) {
+            quantize_row_q8_0(xb_batch + bi * xb_stride, xb_q8_batch + bi * nb_xb * 34, dim);
+            const block_q8_0 *xqb = (const block_q8_0 *)(xb_q8_batch + bi * nb_xb * 34);
+            for (int k = 0; k < nb_xb; k++) {
+                xb_q8_d_batch[bi * nb_xb + k] = fp16_to_fp32_lookup(xqb[k].d);
+            }
+        }
+
+        /* Alpha: per-token, per-head vec_dot with proper GGUF head indexing */
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+        for (int bi = 0; bi < n_tokens; bi++) {
+            const void *xb_q8 = (const void *)(xb_q8_batch + bi * nb_xb * 34);
+            const float *xb_q8_d = xb_q8_d_batch + bi * nb_xb;
+            float *al = alpha_batch + bi * n_v_heads;
+            const uint8_t *alpha_w = (const uint8_t *)lw->ssm_alpha;
+            for (int h = 0; h < n_v_heads; h++) {
+                int gh = alpha_map[h];
+                const uint8_t *head_data = alpha_w + (size_t)gh * row_bytes_alpha;
+                float sum;
+                if (alpha_type == GGUF_TYPE_Q8_0) sum = vec_dot_q8_0_q8_0_deltas(xb_q8, xb_q8_d, head_data, dim);
+                else if (alpha_type == GGUF_TYPE_Q4_0) sum = vec_dot_q4_0_q8_0(head_data, xb_q8, dim);
+                else sum = vec_dot(head_data, xb_batch + bi * xb_stride, dim, alpha_type);
+                al[h] = sum + s->ssm_dt_w[l][h];
+            }
+            /* Beta */
+            const uint8_t *beta_w = (const uint8_t *)lw->ssm_beta;
+            float *bt = beta_batch + bi * n_v_heads;
+            for (int h = 0; h < n_v_heads; h++) {
+                int gh = beta_map[h];
+                const uint8_t *head_data = beta_w + (size_t)gh * row_bytes_beta;
+                float sum;
+                if (beta_type == GGUF_TYPE_Q8_0) sum = vec_dot_q8_0_q8_0_deltas(xb_q8, xb_q8_d, head_data, dim);
+                else if (beta_type == GGUF_TYPE_Q4_0) sum = vec_dot_q4_0_q8_0(head_data, xb_q8, dim);
+                else sum = vec_dot(head_data, xb_batch + bi * xb_stride, dim, beta_type);
+                bt[h] = sum;
+            }
+        }
+        free(xb_q8_batch);
+        free(xb_q8_d_batch);
+
+        /* Post-process: alpha -> softplus -> gate -> exp; beta -> sigmoid */
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+        for (int bi = 0; bi < n_tokens; bi++) {
+            float *al = alpha_batch + bi * n_v_heads;
+            float *bt = beta_batch + bi * n_v_heads;
+            for (int h = 0; h < n_v_heads; h++) {
+                float a = al[h];
+                float sp = (a > 20.0f) ? a : (a < -20.0f) ? expf(a) : logf(1.0f + expf(a));
+                float gate = sp * s->ssm_a_w[l][h];
+                al[h] = (gate < -50.0f) ? 0.0f : expf(gate);
+                bt[h] = 1.0f / (1.0f + expf(-bt[h]));
+            }
+        }
+    }
+
+    /* 7. Sequential state update per token (THE HOT PATH).
+     * Each token's recurrence is sequential (state depends on previous),
+     * but within each token, the n_v_heads are fully independent and
+     * threaded via ssm_head_task. */
+    /* Pre-allocate scratch outside token loop to avoid repeated alloca */
+    float *q_rep = (float *)malloc((size_t)d_state * n_v_heads * sizeof(float));
+    float *k_rep = (float *)malloc((size_t)d_state * n_v_heads * sizeof(float));
+    float *ssm_output = (float *)malloc((size_t)d_state * n_v_heads * sizeof(float));
+    ssm_head_ctx_t ssm_ctx;
+    ssm_ctx.state = state;
+    ssm_ctx.d_state = d_state;
+    ssm_ctx.head_v_dim = head_v_dim;
+    ssm_ctx.n_v_heads = n_v_heads;
+    ssm_ctx.repeat = repeat;
+    ssm_ctx.ssm_output = ssm_output;
+    for (int bi = 0; bi < n_tokens; bi++) {
+        float *conv = conv_batch + bi * conv_dim;
+        float *q = conv;
+        float *k = conv + qk_dim;
+        float *v = conv + 2 * qk_dim;
+        float *ge = alpha_batch + bi * n_v_heads; /* gate_exp stored in-place */
+        float *bet = beta_batch + bi * n_v_heads;
+
+        /* Repeat Q/K from n_k_heads to n_v_heads (GQA-style: h/repeat) */
+        for (int h = 0; h < n_v_heads; h++) {
+            int kh = h / repeat;
+            memcpy(q_rep + h * d_state, q + kh * d_state, d_state * sizeof(float));
+            memcpy(k_rep + h * d_state, k + kh * d_state, d_state * sizeof(float));
+        }
+
+        /* Threaded state recurrence across v-heads */
+        ssm_ctx.q_conv = q_rep;
+        ssm_ctx.k_conv = k_rep;
+        ssm_ctx.v_conv = v;
+        ssm_ctx.gate_exp = ge;
+        ssm_ctx.beta = bet;
+
+        tensor_parallel_for(n_v_heads, ssm_head_task, &ssm_ctx);
+
+        /* Write output to xb2_batch in head-major layout */
+        float *out = xb2_batch + bi * value_dim;
+        for (int d = 0; d < d_state; d++)
+            for (int h = 0; h < n_v_heads; h++)
+                out[h * head_v_dim + d] = ssm_output[d * n_v_heads + h];
+    }
+
+    free(alpha_batch);
+    free(beta_batch);
+    free(q_rep);
+    free(k_rep);
+    free(ssm_output);
+
+    /* 8. Gated normalization (batched across tokens) */
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+    for (int bi = 0; bi < n_tokens; bi++) {
+        float *ssm_out = xb2_batch + bi * value_dim;
+        float *z = z_batch + bi * value_dim;
+        float *norm_w = s->ssm_norm_w[l];
+        for (int h = 0; h < n_v_heads; h++) {
+            float nrm = 0.0f;
+            for (int d = 0; d < head_v_dim; d++) {
+                float v = ssm_out[h * head_v_dim + d];
+                nrm += v * v;
+            }
+            nrm = 1.0f / sqrtf(nrm / head_v_dim + eps);
+            for (int d = 0; d < head_v_dim; d++) {
+                float v = ssm_out[h * head_v_dim + d];
+                float zv = z[h * head_v_dim + d];
+                ssm_out[h * head_v_dim + d] = v * nrm * norm_w[d] *
+                    zv * (1.0f / (1.0f + expf(-zv)));
+            }
+        }
+    }
+
+    /* 9. Output projection (batched) */
+    if (do_remap) {
+        /* Reorder to GGUF column order, then matmul per token.
+         * Allocate temp buffer once outside the loop. */
+        float *fo_gguf = (float *)malloc(value_dim * sizeof(float));
+        for (int bi = 0; bi < n_tokens; bi++) {
+            float *fo = xb2_batch + bi * value_dim;
+            for (int h = 0; h < n_v_heads; h++) {
+                int gh = qwen35_vhead_gguf(h, n_vpk, n_k);
+                memcpy(fo_gguf + gh * head_v_dim, fo + h * head_v_dim, head_v_dim * sizeof(float));
+            }
+            matmul(xb2_batch + bi * xb2_stride, fo_gguf, lw->ssm_out, value_dim, dim, lw->type_ssm_out);
+        }
+        free(fo_gguf);
+    } else {
+        tensor_set_repacked(m->repack_used[ri+5] ? m->repack_buffers[ri+5] : NULL);
+#ifdef PICOLM_GPU
+        if (gpu_lw[l]) {
+            gpu_layer_weights_t *gl = (gpu_layer_weights_t *)gpu_lw[l];
+            tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->ssm_out, m->gpu.device);
+        }
+#endif
+        /* Cannot alias in/out when value_dim != dim (strides differ, cross-token corruption) */
+        float *ssm_out_buf = (float *)malloc((size_t)n_tokens * dim * sizeof(float));
+        matmul_batch(ssm_out_buf, xb2_batch, n_tokens, lw->ssm_out, value_dim, dim, lw->type_ssm_out);
+        /* Copy result back to xb2_batch with correct stride */
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+        for (int bi = 0; bi < n_tokens; bi++)
+            memcpy(xb2_batch + bi * xb2_stride, ssm_out_buf + bi * dim, dim * sizeof(float));
+        free(ssm_out_buf);
+        tensor_set_repacked(NULL);
+#ifdef PICOLM_GPU
+        if (gpu_lw[l]) tensor_set_gpu_tensor(NULL, 0);
+#endif
+    }
+
+    /* 10. Residual add (batched) */
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+    for (int bi = 0; bi < n_tokens; bi++) {
+        float *a = x_batch + bi * dim, *b = xb2_batch + bi * xb2_stride;
+        for (int d = 0; d < dim; d++) a[d] += b[d];
+    }
+
+    /* 11. Batched FFN (if present) */
+    if (lw->ffn_gate && lw->ffn_up && lw->ffn_down) {
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+        for (int bi = 0; bi < n_tokens; bi++)
+            rmsnorm(xb_batch + bi * xb_stride, x_batch + bi * dim, s->post_attn_norm_w[l], dim, eps);
+
+        tensor_set_repacked(m->repack_used[ri+7] ? m->repack_buffers[ri+7] : NULL);
+        matmul_dual_batch(hb_batch, hb2_batch, xb_batch, n_tokens,
+                          lw->ffn_gate, lw->ffn_up, dim, c->n_ffn,
+                          lw->type_ffn_gate, lw->type_ffn_up);
+        tensor_set_repacked(NULL);
+
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+        for (int bi = 0; bi < n_tokens; bi++) {
+            silu(hb_batch + bi * c->n_ffn, c->n_ffn);
+            elemwise_mul(hb_batch + bi * c->n_ffn, hb_batch + bi * c->n_ffn,
+                         hb2_batch + bi * c->n_ffn, c->n_ffn);
+        }
+
+        tensor_set_repacked(m->repack_used[ri+8] ? m->repack_buffers[ri+8] : NULL);
+        matmul_batch(xb2_batch, hb_batch, n_tokens, lw->ffn_down, c->n_ffn, dim, lw->type_ffn_down);
+        tensor_set_repacked(NULL);
+
+#ifdef _OPENMP
+#pragma omp parallel for
+#endif
+        for (int bi = 0; bi < n_tokens; bi++) {
+            float *a = x_batch + bi * dim, *b = xb2_batch + bi * dim;
+            for (int d = 0; d < dim; d++) a[d] += b[d];
+        }
+    }
+
+    free(ssm_buf);
+}
+
+/* ================================================================
  * Batch prefill: all prompt tokens processed at once.
  * Projection matmuls batched (weights read once). Attention batched.
  * ================================================================ */
@@ -3325,13 +3723,15 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
     int max_dim = (q_full_dim > dim) ? q_full_dim : dim;
     size_t bs = (size_t)n_tokens;
 
-    size_t sz = bs * (2 * dim + max_dim + q_full_dim + 2 * kv_dim + 2 * n_ffn);
+    /* For SSM models, xb2 needs to be wide enough for ssm_d_inner (value_dim) */
+    int xb2_stride = (c->has_ssm && c->ssm_d_inner > dim) ? c->ssm_d_inner : dim;
+    size_t sz = bs * (dim + max_dim + xb2_stride + q_full_dim + 2 * kv_dim + 2 * n_ffn);
     float *buf = (float *)malloc(sz * sizeof(float));
     if (!buf) { fprintf(stderr, "OOM: prefill batch\n"); exit(1); }
     float *p = buf;
     float *x_batch = p;  p += bs * dim;
-    float *xb_batch = p; p += bs * max_dim;
-    float *xb2_batch = p; p += bs * dim;
+    float *xb_batch = p; p += bs * dim; /* stride = dim, used by both SSM and attention paths */
+    float *xb2_batch = p; p += bs * xb2_stride;
     float *q_batch = p;  p += bs * q_full_dim;
     float *k_batch = p;  p += bs * kv_dim;
     float *v_batch = p;  p += bs * kv_dim;
@@ -3412,19 +3812,24 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         layer_weights_t *lw = &w->layers[l];
 
         if (c->has_ssm && !lw->is_attn_layer) {
-            /* SSM layer: process tokens sequentially (stateful: conv_state + ssm_state) */
-            for (int bi = 0; bi < n_tokens; bi++) {
-                /* Copy batch token into s->x, call ssm_forward which does residual add */
-                memcpy(s->x, x_batch + bi * dim, dim * sizeof(float));
-                float *ssm_residual = s->xb2;
+            /* SSM layer: batched prefill with batched projections + threaded recurrence */
 #ifdef PICOLM_GPU
-                ssm_forward(m, s, s->x, ssm_residual, lw, l, start_pos + bi, &m->gpu.layers[l]);
-#else
-                ssm_forward(m, s, s->x, ssm_residual, lw, l, start_pos + bi, NULL);
+            if (!gpu_ok) {
 #endif
-                /* Copy result back to batch buffer */
-                memcpy(x_batch + bi * dim, s->x, dim * sizeof(float));
+            ssm_prefill_layer(m, s, x_batch, xb_batch, xb2_batch,
+                              hb_batch, hb2_batch,
+                              lw, l, n_tokens, start_pos, xb2_stride,
+                              max_dim, NULL);
+#ifdef PICOLM_GPU
+            } else {
+                /* GPU path: per-token with GPU kernel */
+                for (int bi = 0; bi < n_tokens; bi++) {
+                    memcpy(s->x, x_batch + bi * dim, dim * sizeof(float));
+                    ssm_forward(m, s, s->x, s->xb2, lw, l, start_pos + bi, &m->gpu.layers[l]);
+                    memcpy(x_batch + bi * dim, s->x, dim * sizeof(float));
+                }
             }
+#endif
             continue;
         }
 

@@ -2446,6 +2446,7 @@ void vec_dot_q4_0x4_4x8_q8_0(const void *vx, const void *wy, int n, float *out, 
  * After repack, smmla(A=[weight_lo, weight_hi], B=[repacked_0..7, repacked_8..15])
  * gives [dot(lo,lo), dot(lo,hi), dot(hi,lo), dot(hi,hi)]
  * where [0]+[3] = the correct dot product for one row block. */
+#if defined(PICOLM_I8MM)
 void repack_q8_0_for_i8mm(const void *src, int8_t *dst, float *dst_d, int n, int n_batch) {
     int nb = n / 32;
     for (int b = 0; b < n_batch; b++) {
@@ -2478,6 +2479,7 @@ void repack_q8_0_for_i8mm(const void *src, int8_t *dst, float *dst_d, int n, int
         }
     }
 }
+#endif /* PICOLM_I8MM */
 
 /* ---- gemm_q4_0_4x8_i8mm: I8MM batched matmul with repacked activations ----
  *
@@ -2492,6 +2494,7 @@ void repack_q8_0_for_i8mm(const void *src, int8_t *dst, float *dst_d, int n, int
  *   -> [0]+[3] = correct dot product for this block
  *
  * Process 4 rows at a time, accumulating int32 sums across nb blocks. */
+#if defined(PICOLM_I8MM)
 void gemm_q4_0_4x8_i8mm(const void *W, const int8_t *X_repacked, const float *ad,
                          int n, float *out, int d, int n_batch) {
     int nb = n / 32;
@@ -2547,6 +2550,7 @@ void gemm_q4_0_4x8_i8mm(const void *W, const int8_t *X_repacked, const float *ad
         }
     }
 }
+#endif /* PICOLM_I8MM */
 
 /* ---- gemm_q4_0_4x8_q8_0: dispatch with optional I8MM path ----
  *
