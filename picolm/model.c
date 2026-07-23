@@ -1693,6 +1693,28 @@ float *model_forward(model_t *m, int token, int pos) {
                     s->x[i * 32 + 16 + j * 2 + 1] = d * (float)(v1 >> 4);
                 }
             }
+        } else if (w->type_token_embd == GGUF_TYPE_Q4_0_4_4) {
+            /* Q4_0_4_4: 4 rows interleaved in block_q4_0x4 structs.
+             * qs[k*16 + r*4 + j] = row_r.qs[k*4 + j] ^ 0x88
+             * Each block_q4_0x4 covers 4 rows x 32 columns. */
+            int nb = dim / 32;
+            size_t group_bytes = (size_t)nb * sizeof(block_q4_0x4);
+            int group = token / 4;
+            int r = token % 4;
+            const block_q4_0x4 *blocks = (const block_q4_0x4 *)((const uint8_t *)w->token_embd + (size_t)group * group_bytes);
+
+            for (int i = 0; i < nb; i++) {
+                float d = fp16_to_fp32_lookup(blocks[i].d[r]);
+                for (int k = 0; k < 4; k++) {
+                    for (int j = 0; j < 4; j++) {
+                        uint8_t byte = blocks[i].qs[k * 16 + r * 4 + j];
+                        int v0 = (int8_t)(byte << 4) >> 4;
+                        int v1 = (int8_t)(byte & 0xF0) >> 4;
+                        s->x[i * 32 + k * 8 + j * 2]     = d * (float)v0;
+                        s->x[i * 32 + k * 8 + j * 2 + 1] = d * (float)v1;
+                    }
+                }
+            }
         } else {
             const void *embd_row = (const uint8_t *)w->token_embd + (size_t)token * row_bytes;
             dequantize_row(embd_row, s->x, dim, w->type_token_embd);
@@ -3280,13 +3302,40 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 
     /* Embedding lookup */
     {
-        size_t row_bytes = gguf_type_row_size(w->type_token_embd, dim);
-        #ifdef _OPENMP
+        if (w->type_token_embd == GGUF_TYPE_Q4_0_4_4) {
+            /* Q4_0_4_4: rows are interleaved in groups of 4 */
+            int nb = dim / 32;
+            size_t group_bytes = (size_t)nb * sizeof(block_q4_0x4);
+            #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-        for (int bi = 0; bi < n_tokens; bi++) {
-            const void *er = (const uint8_t *)w->token_embd + (size_t)tokens[bi] * row_bytes;
-            dequantize_row(er, x_batch + bi * dim, dim, w->type_token_embd);
+            for (int bi = 0; bi < n_tokens; bi++) {
+                int group = tokens[bi] / 4;
+                int r = tokens[bi] % 4;
+                const block_q4_0x4 *blocks = (const block_q4_0x4 *)((const uint8_t *)w->token_embd + (size_t)group * group_bytes);
+                float *dst = x_batch + bi * dim;
+                for (int i = 0; i < nb; i++) {
+                    float d = fp16_to_fp32_lookup(blocks[i].d[r]);
+                    for (int k = 0; k < 4; k++) {
+                        for (int j = 0; j < 4; j++) {
+                            uint8_t byte = blocks[i].qs[k * 16 + r * 4 + j];
+                            int v0 = (int8_t)(byte << 4) >> 4;
+                            int v1 = (int8_t)(byte & 0xF0) >> 4;
+                            dst[i * 32 + k * 8 + j * 2]     = d * (float)v0;
+                            dst[i * 32 + k * 8 + j * 2 + 1] = d * (float)v1;
+                        }
+                    }
+                }
+            }
+        } else {
+            size_t row_bytes = gguf_type_row_size(w->type_token_embd, dim);
+            #ifdef _OPENMP
+#pragma omp parallel for
+#endif
+            for (int bi = 0; bi < n_tokens; bi++) {
+                const void *er = (const uint8_t *)w->token_embd + (size_t)tokens[bi] * row_bytes;
+                dequantize_row(er, x_batch + bi * dim, dim, w->type_token_embd);
+            }
         }
     }
 
