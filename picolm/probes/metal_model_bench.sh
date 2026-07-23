@@ -32,11 +32,13 @@ else
     MODELS="${MODELS:-}"
     if [ -z "$MODELS" ]; then
         discovered=""
-        for pat in "*tinyllama*Q4_K*" "*ThinkingCap-Qwen3.6-27B-Q4_K_M*" "*Qwen3*-27B*Q4_K*"; do
+        shopt -s nocaseglob
+        for pat in "*tinyllama*q4*" "*thinkingcap*qwen*27b*q4*" "*qwen3*27b*q4*" "*qwen*-27b*q4*"; do
             for f in "$MODELS_DIR"/$pat; do
                 [ -f "$f" ] && discovered="$discovered $f"
             done
         done
+        shopt -u nocaseglob
         MODELS="$(echo $discovered | tr ' ' '\n' | awk '!seen[$0]++' | tr '\n' ' ')"
     fi
 fi

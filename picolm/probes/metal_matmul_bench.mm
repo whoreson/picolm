@@ -184,8 +184,48 @@ kernel void mm_q6_K_c(device const uint8_t* w [[buffer(0)]],device const float* 
     }\n\
     threadgroup float wb[NW]; float total=reduce_all(acc,wb,tid); if(tid==0) y[(unsigned long)s*O+o]=total;\n\
 }\n\
-/* trivial kernel for dispatch-overhead probe */\n\
-kernel void noop_k(device float* y [[buffer(0)]],uint gid [[thread_position_in_threadgroup]]){ if(gid==0u) y[0]=0.0f; }\n\
+/* ---- MULTI-OUTPUT decode GEMV (1 warp per output; no cross-warp reduce) ----
+ * grid=(O/8,S,1), TG=256 (8 warps). warp w computes output o=gp.x*8+w over ALL
+ * blocks; simd_sum within the warp only (no threadgroup barrier / shared mem).
+ * Cuts the per-output reduction and packs 8 outputs per threadgroup -> better
+ * effective bandwidth, esp. on small-I rows (lm_head). */
+kernel void mm_q4_K_mo(device const uint8_t* w [[buffer(0)]],device const float* x [[buffer(1)]],device float* y [[buffer(2)]],
+   constant int& I [[buffer(3)]],constant int& S [[buffer(4)]],constant int& O [[buffer(5)]],
+   uint tid [[thread_index_in_threadgroup]],uint2 gp [[threadgroup_position_in_grid]]){
+    int s=(int)gp.y; int o=(int)gp.x*8+(int)(tid>>5); if(o>=O) return;
+    int nblocks=I/256; device const uint8_t* row=w+(unsigned long)o*(unsigned long)(nblocks*144);
+    uint lane=tid&31,g=lane/8,within=(lane&7)*4; float acc=0.0f;
+    for(int bi=0;bi<nblocks;bi++){ device const uint8_t* blk=row+(unsigned long)(bi*144);
+        float d=f16tof32((uint16_t)blk[0]|((uint16_t)blk[1]<<8)); float dmin=f16tof32((uint16_t)blk[2]|((uint16_t)blk[3]<<8));
+        device const uint8_t* scales=blk+4; device const uint8_t* qs=blk+16;
+        float d_lo,m_lo,d_hi,m_hi; k4_unpack(scales,2*(int)g,d_lo,m_lo,d,dmin); k4_unpack(scales,2*(int)g+1,d_hi,m_hi,d,dmin);
+        uint qw=*(device const uint*)(qs+lane*4); uint base=(uint)(bi*256)+g*64+within;
+        for(int k=0;k<4;k++){ uint bv=(qw>>(k*8))&0xFF; float lo=(float)(bv&0xF),hi=(float)(bv>>4);
+            acc+=x[(unsigned long)s*I+base+k]*(d_lo*lo-m_lo); acc+=x[(unsigned long)s*I+base+k+32]*(d_hi*hi-m_hi); }
+    }
+    float total=simd_sum(acc); if(lane==0) y[(unsigned long)s*O+o]=total;
+}
+kernel void mm_q6_K_mo(device const uint8_t* w [[buffer(0)]],device const float* x [[buffer(1)]],device float* y [[buffer(2)]],
+   constant int& I [[buffer(3)]],constant int& S [[buffer(4)]],constant int& O [[buffer(5)]],
+   uint tid [[thread_index_in_threadgroup]],uint2 gp [[threadgroup_position_in_grid]]){
+    int s=(int)gp.y; int o=(int)gp.x*8+(int)(tid>>5); if(o>=O) return;
+    int nblocks=I/256; device const uint8_t* row=w+(unsigned long)o*(unsigned long)(nblocks*210);
+    uint lane=tid&31; float acc=0.0f;
+    for(int bi=0;bi<nblocks;bi++){ device const uint8_t* blk=row+(unsigned long)(bi*210);
+        float d=f16tof32((uint16_t)blk[208]|((uint16_t)blk[209]<<8));
+        device const uint8_t* ql=blk; device const uint8_t* qh=blk+128; device const int8_t* sc=(device const int8_t*)(blk+192);
+        for(int k=0;k<4;k++){ uint b=(uint)(k*32)+lane; uint chk=b>>6,grp=(b&63)>>5,l=b&31;
+            uint qlb=ql[b]; uint qhb=qh[chk*32+l];
+            int qr0=(int)(qlb&0xF)|(int)(((qhb>>(2u*grp))&3u)<<4); int si0=(int)(chk*8+l/16+2u*grp); uint j0=chk*128+grp*32+l;
+            acc+=x[(unsigned long)s*I+(unsigned long)bi*256+j0]*(d*(float)sc[si0]*(float)(qr0-32));
+            int qr1=(int)(qlb>>4)|(int)(((qhb>>(2u*(grp+2u)))&3u)<<4); int si1=(int)(chk*8+l/16+2u*(grp+2u)); uint j1=chk*128+(grp+2u)*32+l;
+            acc+=x[(unsigned long)s*I+(unsigned long)bi*256+j1]*(d*(float)sc[si1]*(float)(qr1-32));
+        }
+    }
+    float total=simd_sum(acc); if(lane==0) y[(unsigned long)s*O+o]=total;
+}
+/* trivial kernel for dispatch-overhead probe */
+kernel void noop_k(device float* y [[buffer(0)]],uint gid [[thread_position_in_threadgroup]]){ if(gid==0u) y[0]=0.0f; }
 ";
 
 // ---------------- timing ----------------
@@ -193,20 +233,21 @@ static double g_tick2ns=0;
 static double now_s(void){ if(!g_tick2ns){ mach_timebase_info_data_t tb; mach_timebase_info(&tb); g_tick2ns=(double)tb.numer/(double)tb.denom; } return (double)mach_absolute_time()*g_tick2ns/1e9; }
 
 static id<MTLCommandBuffer> enc_matmul(id<MTLCommandQueue> q, id<MTLComputePipelineState> ps,
-        id<MTLBuffer> w, id<MTLBuffer> x, id<MTLBuffer> y, int I,int S,int O){
+        id<MTLBuffer> w, id<MTLBuffer> x, id<MTLBuffer> y, int I,int S,int O,int mo){
+    NSUInteger gx = (mo>1) ? (NSUInteger)((O+mo-1)/mo) : (NSUInteger)O;
     id<MTLCommandBuffer> cb=[q commandBuffer];
     id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
     [e setComputePipelineState:ps];
     [e setBuffer:w offset:0 atIndex:0]; [e setBuffer:x offset:0 atIndex:1]; [e setBuffer:y offset:0 atIndex:2];
     int32_t cI=I,cS=S,cO=O; [e setBytes:&cI length:4 atIndex:3]; [e setBytes:&cS length:4 atIndex:4]; [e setBytes:&cO length:4 atIndex:5];
-    [e dispatchThreadgroups:MTLSizeMake((NSUInteger)O,(NSUInteger)S,1) threadsPerThreadgroup:MTLSizeMake(TPB,1,1)];
+    [e dispatchThreadgroups:MTLSizeMake(gx,(NSUInteger)S,1) threadsPerThreadgroup:MTLSizeMake(TPB,1,1)];
     [e endEncoding]; return cb;
 }
 static double bench(id<MTLCommandQueue> q, id<MTLComputePipelineState> ps,
-        id<MTLBuffer> w,id<MTLBuffer> x,id<MTLBuffer> y,int I,int S,int O,int iters){
-    for(int i=0;i<5;i++){ @autoreleasepool{ id<MTLCommandBuffer> cb=enc_matmul(q,ps,w,x,y,I,S,O); [cb commit]; [cb waitUntilCompleted]; } }
+        id<MTLBuffer> w,id<MTLBuffer> x,id<MTLBuffer> y,int I,int S,int O,int mo,int iters){
+    for(int i=0;i<5;i++){ @autoreleasepool{ id<MTLCommandBuffer> cb=enc_matmul(q,ps,w,x,y,I,S,O,mo); [cb commit]; [cb waitUntilCompleted]; } }
     double t0=now_s();
-    for(int i=0;i<iters;i++){ @autoreleasepool{ id<MTLCommandBuffer> cb=enc_matmul(q,ps,w,x,y,I,S,O); [cb commit]; [cb waitUntilCompleted]; } }
+    for(int i=0;i<iters;i++){ @autoreleasepool{ id<MTLCommandBuffer> cb=enc_matmul(q,ps,w,x,y,I,S,O,mo); [cb commit]; [cb waitUntilCompleted]; } }
     return (now_s()-t0)/(double)iters;
 }
 static double bench_noop(id<MTLCommandQueue> q, id<MTLComputePipelineState> ps, id<MTLBuffer> y, int iters){
@@ -234,19 +275,22 @@ int main(void){
         NSError* err=nil;
         id<MTLLibrary> lib=[dev newLibraryWithSource:KS options:nil error:&err];
         if(!lib){ fprintf(stderr,"FAIL compile: %s\n",[[err localizedDescription] UTF8String]); return 1; }
-        id<MTLComputePipelineState> ps_q4K =[dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mm_q4_K"]  error:&err];
-        id<MTLComputePipelineState> ps_q6K =[dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mm_q6_K"]  error:nil];
-        id<MTLComputePipelineState> ps_q6Kc=[dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mm_q6_K_c"] error:nil];
-        id<MTLComputePipelineState> ps_noop=[dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"noop_k"]   error:nil];
-        if(!ps_q4K||!ps_q6K||!ps_q6Kc||!ps_noop){ fprintf(stderr,"FAIL: pipeline state\n"); return 1; }
+        id<MTLComputePipelineState> ps_q4K  =[dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mm_q4_K"]    error:&err];
+        id<MTLComputePipelineState> ps_q6K  =[dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mm_q6_K"]    error:nil];
+        id<MTLComputePipelineState> ps_q6Kc =[dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mm_q6_K_c"]  error:nil];
+        id<MTLComputePipelineState> ps_q4Kmo=[dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mm_q4_K_mo"] error:nil];
+        id<MTLComputePipelineState> ps_q6Kmo=[dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mm_q6_K_mo"] error:nil];
+        id<MTLComputePipelineState> ps_noop =[dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"noop_k"]     error:nil];
+        if(!ps_q4K||!ps_q6K||!ps_q6Kc||!ps_q4Kmo||!ps_q6Kmo||!ps_noop){ fprintf(stderr,"FAIL: pipeline state\n"); return 1; }
 
         NSLog(@"[bench] device: %@", dev.name);
 
         // ---------- 1. correctness (small dims) ----------
         printf("\n=== CORRECTNESS (GPU vs CPU; max abs diff) ===\n");
         printf("%-12s type  I    O    S   maxdiff   verdict\n","kernel");
-        struct { const char* name; id<MTLComputePipelineState> ps; int qtype; } cks[]={
-            {"mm_q4_K",   ps_q4K,  T_Q4K}, {"mm_q6_K",   ps_q6K,  T_Q6K}, {"mm_q6_K_c", ps_q6Kc, T_Q6K},
+        struct { const char* name; id<MTLComputePipelineState> ps; int qtype; int mo; } cks[]={
+            {"mm_q4_K",   ps_q4K,   T_Q4K, 1}, {"mm_q6_K",   ps_q6K,   T_Q6K, 1}, {"mm_q6_K_c", ps_q6Kc,  T_Q6K, 1},
+            {"mm_q4_K_mo",ps_q4Kmo, T_Q4K, 8}, {"mm_q6_K_mo",ps_q6Kmo, T_Q6K, 8},
         };
         int cdims[][3]={{256,32,1},{512,48,4}}; // (I,O,S)
         float* tmp=(float*)malloc(4096*sizeof(float));
@@ -262,7 +306,7 @@ int main(void){
                 id<MTLBuffer> wbuf=[dev newBufferWithBytes:wh length:wb options:MTLResourceStorageModeShared];
                 id<MTLBuffer> xbuf=[dev newBufferWithBytes:xh length:xb options:MTLResourceStorageModeShared];
                 id<MTLBuffer> ybuf=[dev newBufferWithLength:yb options:MTLResourceStorageModeShared];
-                @autoreleasepool{ id<MTLCommandBuffer> cb=enc_matmul(q,cks[c].ps,wbuf,xbuf,ybuf,I,S,O); [cb commit]; [cb waitUntilCompleted]; }
+                @autoreleasepool{ id<MTLCommandBuffer> cb=enc_matmul(q,cks[c].ps,wbuf,xbuf,ybuf,I,S,O,cks[c].mo); [cb commit]; [cb waitUntilCompleted]; }
                 const float* yg=(const float*)[ybuf contents]; float mx=0;
                 for(size_t i=0;i<yb/4;i++){ float df=fabsf(yg[i]-yref[i]); if(df>mx)mx=df; }
                 printf("%-12s Q%d_K  %-4d %-4d %-3d %.3e  %s\n", cks[c].name, qt==T_Q4K?4:6, I,O,S, mx, mx<1e-3f?"OK":"MISMATCH");
@@ -281,8 +325,11 @@ int main(void){
         // ---------- 3. throughput ----------
         printf("\n=== THROUGHPUT (ms/iter and effective weight bandwidth) ===\n");
         printf("%-10s type  I     O      S    wMB    ms/iter   GB/s\n","kernel");
-        struct { const char* name; id<MTLComputePipelineState> ps; int qtype; } tks[]={
-            {"mm_q4_K",ps_q4K,T_Q4K},{"mm_q6_K",ps_q6K,T_Q6K},{"mm_q6_K_c",ps_q6Kc,T_Q6K},
+        struct { const char* name; id<MTLComputePipelineState> ps; int qtype; int mo; } tks[]={
+            {"mm_q4_K",   ps_q4K,   T_Q4K, 1},
+            {"mm_q6_K_c", ps_q6Kc,  T_Q6K, 1},
+            {"mm_q4_K_mo",ps_q4Kmo, T_Q4K, 8},
+            {"mm_q6_K_mo",ps_q6Kmo, T_Q6K, 8},
         };
         int tdims[][3]={{2048,2048,1},{2048,5632,1},{5632,2048,1},{2048,32000,1},
                         {2048,2048,32},{2048,5632,32},{2048,2048,128}};
@@ -299,7 +346,7 @@ int main(void){
                 id<MTLBuffer> xbuf=[dev newBufferWithBytes:xh length:xb options:MTLResourceStorageModeShared];
                 id<MTLBuffer> ybuf=[dev newBufferWithLength:yb options:MTLResourceStorageModeShared];
                 int iters = (S>=128)?30 : (S>=32?100:300);
-                double sec=bench(q,tks[t].ps,wbuf,xbuf,ybuf,I,S,O,iters);
+                double sec=bench(q,tks[t].ps,wbuf,xbuf,ybuf,I,S,O,tks[t].mo,iters);
                 double wmb=(double)wb/1e6, gbs=(double)wb/sec/1e9;
                 printf("%-10s Q%d_K  %-5d %-6d %-3d  %5.1f  %.4f   %6.1f\n", tks[t].name, qt==T_Q4K?4:6, I,O,S, wmb, sec*1e3, gbs);
                 free(wh); free(xh);
