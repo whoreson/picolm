@@ -998,12 +998,6 @@ static void q4_0_4_4_batch_task(int b, void *ctxp) {
     vec_dot_q4_0x4_q8_0(ctx->wptr, xb, ctx->n, ctx->out + (size_t)b * ctx->d, ctx->d);
 }
 
-static void q4_0_4_8_batch_task(int b, void *ctxp) {
-    q4_0_4_4_batch_ctx_t *ctx = (q4_0_4_4_batch_ctx_t *)ctxp;
-    const char *xb = (const char *)ctx->qx_buf + (size_t)b * ctx->q8_row_bytes;
-    vec_dot_q4_0x4_4x8_q8_0(ctx->wptr, xb, ctx->n, ctx->out + (size_t)b * ctx->d, ctx->d);
-}
-
 #ifdef PICOLM_AVX2
 typedef struct {
     const char *wptr;
@@ -1091,15 +1085,14 @@ void matmul_batch(float *out, const float *x, int n_batch,
             return;
         }
     }
-    /* Q4_0_4_8 batch path (blocklen=8) */
+    /* Q4_0_4_8 batch path: use I8MM gemm (delegates to DOTPROD gemv) */
     if (qtype == GGUF_TYPE_Q4_0_4_8 && n_batch > 0 && n > 0) {
         size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
         void *qbuf = malloc((size_t)n_batch * q8_rb);
         if (qbuf) {
             for (int b = 0; b < n_batch; b++)
                 quantize_row_q8_0(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
-            q4_0_4_4_batch_ctx_t ctx = { wptr, qbuf, q8_rb, out, n, d };
-            tensor_parallel_for(n_batch, q4_0_4_8_batch_task, &ctx);
+            gemm_q4_0_4x8_q8_0(wptr, qbuf, n, out, d, n_batch);
             free(qbuf);
             return;
         }

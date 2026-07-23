@@ -468,6 +468,8 @@ float vec_dot_q4_K_q8_K(const void *src_q4, const void *src_q8, int n);
 void vec_dot_q4_0x4_q8_0(const void *vx, const void *wy, int n, float *out, int nrows);
 /* Q4_0_4_8 interleaved weights x Q8_0 input (blocklen=8): processes nrows (multiple of 4) */
 void vec_dot_q4_0x4_4x8_q8_0(const void *vx, const void *wy, int n, float *out, int nrows);
+/* Q4_0_4_8 I8MM batched gemm: processes d output rows x n_batch activations */
+void gemm_q4_0_4x8_q8_0(const void *W, const void *X, int n, float *out, int d, int n_batch);
 /* Q4_0_8x8 interleaved weights x Q8_0 input (AVX2): processes nrows (multiple of 8) simultaneously */
 void vec_dot_q4_0x8_q8_0_avx2(const void *vx, const void *wy, int n, float *out, int nrows);
 /* Repack standard Q4_0 weights to Q4_0_8x8 interleaved format (for AVX2).
