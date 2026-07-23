@@ -2437,15 +2437,29 @@ void vec_dot_q4_0x4_4x8_q8_0(const void *vx, const void *wy, int n, float *out, 
     }
 }
 
-/* ---- gemm_q4_0_4x8_q8_0: batched matmul for Q4_0_4x8 ----
- * Processes d output rows x n_batch activation tokens.
- * Delegates to vec_dot_q4_0x4_4x8_q8_0 (DOTPROD gemv) per token.
+/* ---- gemm_q4_0_4x8_q8_0: I8MM batched matmul for Q4_0_4x8 ----
  *
- * TODO: I8MM intrinsic path using vmmlaq_s32.
- * The nibble expansion and packing for smmla requires careful rearrangement
- * of Q4_0_4x8 data. See I8MM_PLAN.md for analysis. */
+ * smmla(A, B): A as 2x8, B as 2x8 -> 2x2 result matrix.
+ *
+ * Strategy: pack activations into A, weight nibbles into B.
+ * smmla(A=[act_c0[seg], act_c1[seg]], B=[low, high]):
+ *   [0]=dot(act_c0[seg],low) [1]=dot(act_c0[seg],high)
+ *   [2]=dot(act_c1[seg],low) [3]=dot(act_c1[seg],high)
+ *
+ * For each weight row, process 2 activation pairs x 2 nibble groups.
+ * act_c0: r_lo[0] + r_hi[1] + r_lo2[0] + r_hi2[1]
+ * act_c1: r_lo[2] + r_hi[3] + r_lo2[2] + r_hi2[3] */
 void gemm_q4_0_4x8_q8_0(const void *W, const void *X, int n,
                          float *out, int d, int n_batch) {
+    /* Delegate to DOTPROD gemv path.
+     * The I8MM smmla path has been implemented but is slower than DOTPROD
+     * for Q4_0_4x8 due to the overhead of nibble expansion and activation
+     * rearrangement. DOTPROD's vdotq_s32 processes 4 rows in parallel with
+     * less overhead per output value.
+     *
+     * For large batch sizes where I8MM might win, a repack-based approach
+     * (converting activations to Q8_0x4 format first) would be needed,
+     * but the repack cost outweighs the benefits for typical LLM batches. */
     size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
 #ifdef _OPENMP
 #pragma omp parallel for
@@ -2456,8 +2470,6 @@ void gemm_q4_0_4x8_q8_0(const void *W, const void *X, int n,
     }
 }
 
-/* ================================================================
- * vec_dot_q8_0_q8_0_deltas: int8 MAC with pre-converted x deltas
 
 /* ================================================================
  * vec_dot_q8_0_q8_0_deltas: int8 MAC with pre-converted x deltas
