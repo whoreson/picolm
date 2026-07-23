@@ -294,7 +294,7 @@ int main(void){
         };
         int cdims[][3]={{256,32,1},{512,48,4}}; // (I,O,S)
         float* tmp=(float*)malloc(4096*sizeof(float));
-        for(int c=0;c<3;c++){
+        for(int c=0;c<(int)(sizeof(cks)/sizeof(cks[0]));c++){
             for(int d=0;d<2;d++){
                 int I=cdims[d][0],O=cdims[d][1],S=cdims[d][2]; int qt=cks[c].qtype;
                 size_t rb=row_bytes_for(qt,I); size_t wb=O*rb, xb=(size_t)S*I*4, yb=(size_t)S*O*4;
@@ -324,7 +324,7 @@ int main(void){
 
         // ---------- 3. throughput ----------
         printf("\n=== THROUGHPUT (ms/iter and effective weight bandwidth) ===\n");
-        printf("%-10s type  I     O      S    wMB    ms/iter   GB/s\n","kernel");
+        printf("%-10s type  I     O      S    wMB   ms/iter    GB/s   kGB/s\n","kernel");
         struct { const char* name; id<MTLComputePipelineState> ps; int qtype; int mo; } tks[]={
             {"mm_q4_K",   ps_q4K,   T_Q4K, 1},
             {"mm_q6_K_c", ps_q6Kc,  T_Q6K, 1},
@@ -333,7 +333,7 @@ int main(void){
         };
         int tdims[][3]={{2048,2048,1},{2048,5632,1},{5632,2048,1},{2048,32000,1},
                         {2048,2048,32},{2048,5632,32},{2048,2048,128}};
-        for(int t=0;t<3;t++){
+        for(int t=0;t<(int)(sizeof(tks)/sizeof(tks[0]));t++){
             int qt=tks[t].qtype;
             for(int d=0;d<7;d++){
                 int I=tdims[d][0],O=tdims[d][1],S=tdims[d][2];
@@ -348,7 +348,9 @@ int main(void){
                 int iters = (S>=128)?30 : (S>=32?100:300);
                 double sec=bench(q,tks[t].ps,wbuf,xbuf,ybuf,I,S,O,tks[t].mo,iters);
                 double wmb=(double)wb/1e6, gbs=(double)wb/sec/1e9;
-                printf("%-10s Q%d_K  %-5d %-6d %-3d  %5.1f  %.4f   %6.1f\n", tks[t].name, qt==T_Q4K?4:6, I,O,S, wmb, sec*1e3, gbs);
+                double ksec=sec-us*1e-6; if(ksec<1e-9) ksec=1e-9;     /* subtract dispatch overhead */
+                double kgbs=(double)wb/ksec/1e9;                       /* true kernel bandwidth   */
+                printf("%-10s Q%d_K  %-5d %-6d %-3d  %5.1f  %.4f   %6.1f %6.1f\n", tks[t].name, qt==T_Q4K?4:6, I,O,S, wmb, sec*1e3, gbs, kgbs);
                 free(wh); free(xh);
             }
         }
