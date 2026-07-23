@@ -2437,29 +2437,150 @@ void vec_dot_q4_0x4_4x8_q8_0(const void *vx, const void *wy, int n, float *out, 
     }
 }
 
-/* ---- gemm_q4_0_4x8_q8_0: I8MM batched matmul for Q4_0_4x8 ----
+/* ---- repack_q8_0_for_i8mm: rearrange Q8_0 activations for smmla ----
  *
- * smmla(A, B): A as 2x8, B as 2x8 -> 2x2 result matrix.
+ * Standard Q8_0 block: d[2] + qs[0..31]
+ * Repacked: qs[0..7] + qs[16..23] + qs[8..15] + qs[24..31]
+ * Stored as int8_t[32] per block (no delta, deltas stored separately).
  *
- * Strategy: pack activations into A, weight nibbles into B.
- * smmla(A=[act_c0[seg], act_c1[seg]], B=[low, high]):
- *   [0]=dot(act_c0[seg],low) [1]=dot(act_c0[seg],high)
- *   [2]=dot(act_c1[seg],low) [3]=dot(act_c1[seg],high)
+ * After repack, smmla(A=[weight_lo, weight_hi], B=[repacked_0..7, repacked_8..15])
+ * gives [dot(lo,lo), dot(lo,hi), dot(hi,lo), dot(hi,hi)]
+ * where [0]+[3] = the correct dot product for one row block. */
+void repack_q8_0_for_i8mm(const void *src, int8_t *dst, float *dst_d, int n, int n_batch) {
+    int nb = n / 32;
+    for (int b = 0; b < n_batch; b++) {
+        const block_q8_0 *x = (const block_q8_0 *)((const int8_t *)src + (size_t)b * gguf_type_row_size(GGUF_TYPE_Q8_0, n));
+        /* Store per-block activation deltas */
+        for (int ib = 0; ib < nb; ib++)
+            dst_d[(size_t)b * nb + ib] = fp16_to_fp32_lookup(x[ib].d);
+        for (int ib = 0; ib < nb; ib++) {
+            int8_t *out = dst + (size_t)b * nb * 32 + ib * 32;
+#if defined(PICOLM_I8MM)
+            /* Repack: [qs[0..7], qs[16..23], qs[8..15], qs[24..31]]
+             * This lets smmla extract dot(lo, qs[0..7]) + dot(hi, qs[16..23]) as diagonal. */
+            int8x8_t a0 = vld1_s8(x[ib].qs);      /* qs[0..7] */
+            int8x8_t a1 = vld1_s8(x[ib].qs + 16); /* qs[16..23] */
+            int8x8_t a2 = vld1_s8(x[ib].qs + 8);  /* qs[8..15] */
+            int8x8_t a3 = vld1_s8(x[ib].qs + 24); /* qs[24..31] */
+            vst1_s8(out + 0, a0);
+            vst1_s8(out + 8, a1);
+            vst1_s8(out + 16, a2);
+            vst1_s8(out + 24, a3);
+#else
+            /* Scalar repack: simple copy */
+            for (int i = 0; i < 8; i++) {
+                out[i] = x[ib].qs[i];
+                out[i + 8] = x[ib].qs[i + 16];
+                out[i + 16] = x[ib].qs[i + 8];
+                out[i + 24] = x[ib].qs[i + 24];
+            }
+#endif
+        }
+    }
+}
+
+/* ---- gemm_q4_0_4x8_i8mm: I8MM batched matmul with repacked activations ----
  *
- * For each weight row, process 2 activation pairs x 2 nibble groups.
- * act_c0: r_lo[0] + r_hi[1] + r_lo2[0] + r_hi2[1]
- * act_c1: r_lo[2] + r_hi[3] + r_lo2[2] + r_hi2[3] */
+ * Weights: Q4_0_4x8 interleaved (standard GGUF layout)
+ * Activations: repacked via repack_q8_0_for_i8mm
+ * Output: float32, [n_batch x d], row-major
+ *
+ * For each weight row:
+ *   Expand 8 nibble bytes to low[8]+high[8] int8.
+ *   smmla(A=[low, high], B=[repacked[0..7], repacked[8..15]])
+ *   -> [0]=dot(low, repacked[0..7]), [3]=dot(high, repacked[8..15])
+ *   -> [0]+[3] = correct dot product for this block
+ *
+ * Process 4 rows at a time, accumulating int32 sums across nb blocks. */
+void gemm_q4_0_4x8_i8mm(const void *W, const int8_t *X_repacked, const float *ad,
+                         int n, float *out, int d, int n_batch) {
+    int nb = n / 32;
+    int d4 = (d / 4) * 4;
+
+    for (int br = 0; br < d4; br += 4) {
+        const block_q4_0x4 *wb = (const block_q4_0x4 *)W + (size_t)(br / 4) * nb;
+
+        for (int bc = 0; bc < n_batch; bc++) {
+            float acc[4] = {0};
+            const int8_t *xrep = X_repacked + (size_t)bc * nb * 32;
+            const float *ad_bc = ad + (size_t)bc * nb;
+
+            for (int ib = 0; ib < nb; ib++) {
+                const block_q4_0x4 *b = wb + ib;
+                const uint8_t *wqs = (const uint8_t *)b->qs;
+                const int8_t *aq = xrep + ib * 32;
+                float adelta = ad_bc[ib];
+
+                int8x16_t B0 = vld1q_s8(aq);
+                int8x16_t B1 = vld1q_s8(aq + 16);
+
+                float wd[4];
+                wd[0] = fp16_to_fp32_lookup(b->d[0]);
+                wd[1] = fp16_to_fp32_lookup(b->d[1]);
+                wd[2] = fp16_to_fp32_lookup(b->d[2]);
+                wd[3] = fp16_to_fp32_lookup(b->d[3]);
+
+                for (int r = 0; r < 4; r++) {
+                    uint8x8_t wb0 = vld1_u8(wqs + r * 8);
+                    int8x8_t lo0 = vshl_n_s8(vreinterpret_s8_u8(wb0), 4);
+                    lo0 = vshr_n_s8(lo0, 4);
+                    int8x8_t hi0 = vshr_n_s8(vreinterpret_s8_u8(wb0), 4);
+
+                    uint8x8_t wb1 = vld1_u8(wqs + 32 + r * 8);
+                    int8x8_t lo1 = vshl_n_s8(vreinterpret_s8_u8(wb1), 4);
+                    lo1 = vshr_n_s8(lo1, 4);
+                    int8x8_t hi1 = vshr_n_s8(vreinterpret_s8_u8(wb1), 4);
+
+                    int8x16_t A0 = vcombine_s8(lo0, hi0);
+                    int8x16_t A1 = vcombine_s8(lo1, hi1);
+
+                    int32x4_t r0 = vmmlaq_s32(vdupq_n_s32(0), A0, B0);
+                    int32x4_t r1 = vmmlaq_s32(vdupq_n_s32(0), A1, B1);
+
+                    int32_t ra[4]; vst1q_s32(ra, r0);
+                    int32_t rb[4]; vst1q_s32(rb, r1);
+                    acc[r] += (float)(ra[0] + ra[3] + rb[0] + rb[3]) * wd[r] * adelta;
+                }
+            }
+            for (int r = 0; r < 4; r++)
+                out[(size_t)bc * d + br + r] = acc[r];
+        }
+    }
+}
+
+/* ---- gemm_q4_0_4x8_q8_0: dispatch with optional I8MM path ----
+ *
+ * When n_batch is large enough, repack activations and use I8MM smmla.
+ * Otherwise fall back to DOTPROD gemv per token. */
 void gemm_q4_0_4x8_q8_0(const void *W, const void *X, int n,
                          float *out, int d, int n_batch) {
-    /* Delegate to DOTPROD gemv path.
-     * The I8MM smmla path has been implemented but is slower than DOTPROD
-     * for Q4_0_4x8 due to the overhead of nibble expansion and activation
-     * rearrangement. DOTPROD's vdotq_s32 processes 4 rows in parallel with
-     * less overhead per output value.
-     *
-     * For large batch sizes where I8MM might win, a repack-based approach
-     * (converting activations to Q8_0x4 format first) would be needed,
-     * but the repack cost outweighs the benefits for typical LLM batches. */
+#if defined(PICOLM_I8MM)
+    /* Use I8MM for batched prefill (n_batch >= 8) */
+    if (n_batch >= 8) {
+        int nb = n / 32;
+        int8_t *xrep = malloc((size_t)n_batch * nb * 32);
+        float *ad = malloc((size_t)n_batch * nb * sizeof(float));
+        if (xrep && ad) {
+            int d4 = (d / 4) * 4;
+            repack_q8_0_for_i8mm(X, xrep, ad, n, n_batch);
+
+            gemm_q4_0_4x8_i8mm(W, xrep, ad, n, out, d4, n_batch);
+
+            /* Tail rows via DOTPROD */
+            if (d4 < d) {
+                size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
+                for (int b = 0; b < n_batch; b++) {
+                    const void *xb = (const int8_t *)X + (size_t)b * q8_rb;
+                    vec_dot_q4_0x4_4x8_q8_0(W, xb, n, out + (size_t)b * d + d4, d - d4);
+                }
+            }
+            free(xrep);
+            free(ad);
+            return;
+        }
+    }
+#endif
+    /* DOTPROD gemv fallback */
     size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
 #ifdef _OPENMP
 #pragma omp parallel for

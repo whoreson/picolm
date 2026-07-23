@@ -366,6 +366,16 @@ typedef struct {
 } block_q8_0;            /* 34 bytes */
 #pragma pack(pop)
 
+/* I8MM repacked activation for Q4_0_4x8 gemm
+ * Each Q8_0 block (32 int8 values) is repacked into two int8x16 vectors:
+ *   B0 = [act[0..7], act[16..23]]   -- low segments zipped with high segments
+ *   B1 = [act[8..15], act[24..31]]
+ * This layout matches smmla's 2x8 input format:
+ *   smmla(A=[row_lo, row_hi], B=B0) gives [dot(lo,lo), dot(lo,hi), dot(hi,lo), dot(hi,hi)]
+ *   where [0]+[3] = dot product of expanded nibbles with full activation.
+ *
+ * Storage: int8_t[32] per block (same as Q8_0 qs, but rearranged). */
+
 /* Q5_K block: 256 weights in 176 bytes */
 #pragma pack(push, 1)
 typedef struct {
