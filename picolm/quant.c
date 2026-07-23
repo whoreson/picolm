@@ -418,7 +418,9 @@ void dequantize_row_q2_0(const void *src, float *dst, int n) {
 }
 
 /* Dequantize a single row from Q4_0_4_4 interleaved format to float32.
- * Only the first row of each 4-row group is dequantized. */
+ * Dequantizes row 0 from a group of 4 interleaved rows.
+ * Interleaving: qs[k*16 + r*4 + j] = row_r.qs[k*4 + j] ^ 0x88
+ * For row 0: qs[k*16 + j] for k=0..3, j=0..3 */
 void dequantize_row_q4_0_4_4(const void *src, float *dst, int n) {
     const block_q4_0x4 *blocks = (const block_q4_0x4 *)src;
     int nb = n / 32;
@@ -427,7 +429,7 @@ void dequantize_row_q4_0_4_4(const void *src, float *dst, int n) {
         float d = fp16_to_fp32_lookup(blocks[i].d[0]);
         for (int k = 0; k < 4; k++) {
             for (int j = 0; j < 4; j++) {
-                uint8_t byte = blocks[i].qs[k * 16 + j * 4];
+                uint8_t byte = blocks[i].qs[k * 16 + j];
                 int v0 = (int8_t)(byte << 4) >> 4;
                 int v1 = (int8_t)(byte & 0xF0) >> 4;
                 dst[i * 32 + k * 8 + j * 2] = d * (float)v0;
@@ -3027,7 +3029,9 @@ float vec_dot_q2_0_q8_0(const void *vx, const void *wy, int n) {
     return sumf;
 }
 
-/* vec_dot for Q4_0_4_4: dequantize first row of interleaved block, then dot */
+/* vec_dot for Q4_0_4_4: dequantize row 0 of interleaved block, then dot
+ * Interleaving: qs[k*16 + r*4 + j] = row_r.qs[k*4 + j] ^ 0x88
+ * For row 0: qs[k*16 + j] for k=0..3, j=0..3 */
 float vec_dot_q4_0_4_4_f32(const void *src, const float *x, int n) {
     const block_q4_0x4 *blocks = (const block_q4_0x4 *)src;
     int nb = n / 32;
@@ -3039,7 +3043,7 @@ float vec_dot_q4_0_4_4_f32(const void *src, const float *x, int n) {
         float block_sum = 0.0f;
         for (int k = 0; k < 4; k++) {
             for (int j = 0; j < 4; j++) {
-                uint8_t byte = blocks[i].qs[k * 16 + j * 4];
+                uint8_t byte = blocks[i].qs[k * 16 + j];
                 int v0 = (int8_t)(byte << 4) >> 4;
                 int v1 = (int8_t)(byte & 0xF0) >> 4;
                 block_sum += (float)v0 * xp[k * 8 + j * 2];
