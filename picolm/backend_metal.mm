@@ -345,6 +345,90 @@ kernel void mm_q6_K(device const uint8_t* w [[buffer(0)]],\n\
     if (tid == 0) y[(unsigned long)s * O + o] = total;\n\
 }\n\
 \n\
+/* ---------------- Q4_K MULTI-OUTPUT GEMV (1 warp/output) --------------\n\
+ * grid=(O/8,S,1), TG=256 (8 warps). warp w computes output o=gp.x*8+w over\n\
+ * ALL blocks; simd_sum within the warp only (no cross-warp barrier/shared).\n\
+ * Validated vs CPU by probes/metal_matmul_bench; faster on medium/large O.\n\
+ * Host dispatches grid_x=(O+7)/8 for Q4_K/Q6_K (see launch_matmul). */\n\
+kernel void mm_q4_K_mo(device const uint8_t* w [[buffer(0)]],\n\
+                    device const float*   x [[buffer(1)]],\n\
+                    device float*         y [[buffer(2)]],\n\
+                    constant int& I [[buffer(3)]],\n\
+                    constant int& S [[buffer(4)]],\n\
+                    constant int& O [[buffer(5)]],\n\
+                    uint tid [[thread_index_in_threadgroup]],\n\
+                    uint2 gp [[threadgroup_position_in_grid]]) {\n\
+    int o = (int)gp.x * 8 + (int)(tid >> 5), s = (int)gp.y;\n\
+    if (o >= O) return;\n\
+    int nblocks = I / 256;\n\
+    device const uint8_t* row = w + (unsigned long)o * (unsigned long)(nblocks * 144);\n\
+    uint lane = tid & 31, g = lane / 8, within = (lane & 7) * 4;\n\
+    float acc = 0.0f;\n\
+    for (int bi = 0; bi < nblocks; bi++) {\n\
+        device const uint8_t* blk = row + (unsigned long)(bi * 144);\n\
+        float d    = f16tof32((uint16_t)blk[0] | ((uint16_t)blk[1] << 8));\n\
+        float dmin = f16tof32((uint16_t)blk[2] | ((uint16_t)blk[3] << 8));\n\
+        device const uint8_t* scales = blk + 4;\n\
+        device const uint8_t* qs     = blk + 16;\n\
+        float d_lo, m_lo, d_hi, m_hi;\n\
+        k4_unpack(scales, 2 * (int)g,     d_lo, m_lo, d, dmin);\n\
+        k4_unpack(scales, 2 * (int)g + 1, d_hi, m_hi, d, dmin);\n\
+        uint qw = *(device const uint*)(qs + lane * 4);\n\
+        uint base = (uint)(bi * 256) + g * 64 + within;\n\
+        for (int k = 0; k < 4; k++) {\n\
+            uint bv = (qw >> (k * 8)) & 0xFF;\n\
+            float lo = (float)(bv & 0xF);\n\
+            float hi = (float)(bv >> 4);\n\
+            acc += x[(unsigned long)s * I + base + k]      * (d_lo * lo - m_lo);\n\
+            acc += x[(unsigned long)s * I + base + k + 32] * (d_hi * hi - m_hi);\n\
+        }\n\
+    }\n\
+    float total = simd_sum(acc);\n\
+    if (lane == 0) y[(unsigned long)s * O + o] = total;\n\
+}\n\
+/* ---------------- Q6_K MULTI-OUTPUT GEMV (1 warp/output) --------------\n\
+ * grid=(O/8,S,1). warp w -> output o=gp.x*8+w over ALL blocks; simd_sum only.\n\
+ * Coalesced ql/qh reads as in mm_q6_K. Validated vs CPU; faster on large O. */\n\
+kernel void mm_q6_K_mo(device const uint8_t* w [[buffer(0)]],\n\
+                    device const float*   x [[buffer(1)]],\n\
+                    device float*         y [[buffer(2)]],\n\
+                    constant int& I [[buffer(3)]],\n\
+                    constant int& S [[buffer(4)]],\n\
+                    constant int& O [[buffer(5)]],\n\
+                    uint tid [[thread_index_in_threadgroup]],\n\
+                    uint2 gp [[threadgroup_position_in_grid]]) {\n\
+    int o = (int)gp.x * 8 + (int)(tid >> 5), s = (int)gp.y;\n\
+    if (o >= O) return;\n\
+    int nblocks = I / 256;\n\
+    device const uint8_t* row = w + (unsigned long)o * (unsigned long)(nblocks * 210);\n\
+    uint lane = tid & 31;\n\
+    float acc = 0.0f;\n\
+    for (int bi = 0; bi < nblocks; bi++) {\n\
+        device const uint8_t* blk = row + (unsigned long)(bi * 210);\n\
+        float d = f16tof32((uint16_t)blk[208] | ((uint16_t)blk[209] << 8));\n\
+        device const uint8_t* ql = blk;\n\
+        device const uint8_t* qh = blk + 128;\n\
+        device const int8_t*  sc = (device const int8_t*)(blk + 192);\n\
+        for (int k = 0; k < 4; k++) {\n\
+            uint b   = (uint)(k * 32) + lane;\n\
+            uint chk = b >> 6;\n\
+            uint grp = (b & 63) >> 5;\n\
+            uint l   = b & 31;\n\
+            uint qlb = ql[b];\n\
+            uint qhb = qh[chk * 32 + l];\n\
+            int qraw0 = (int)(qlb & 0xF) | (int)(((qhb >> (2u * grp)) & 3u) << 4);\n\
+            int si0   = (int)(chk * 8 + l / 16 + 2u * grp);\n\
+            uint j0   = chk * 128 + grp * 32 + l;\n\
+            acc += x[(unsigned long)s * I + (unsigned long)bi * 256 + j0] * (d * (float)sc[si0] * (float)(qraw0 - 32));\n\
+            int qraw1 = (int)(qlb >> 4) | (int)(((qhb >> (2u * (grp + 2u))) & 3u) << 4);\n\
+            int si1   = (int)(chk * 8 + l / 16 + 2u * (grp + 2u));\n\
+            uint j1   = chk * 128 + (grp + 2u) * 32 + l;\n\
+            acc += x[(unsigned long)s * I + (unsigned long)bi * 256 + j1] * (d * (float)sc[si1] * (float)(qraw1 - 32));\n\
+        }\n\
+    }\n\
+    float total = simd_sum(acc);\n\
+    if (lane == 0) y[(unsigned long)s * O + o] = total;\n\
+}\n\
 /* ---------------- silu_mul elementwise: gate[i] = silu(gate[i]) * up[i] --- */\n\
 kernel void silu_mul(device float*       gate [[buffer(0)]],\n\
                      device const float* up   [[buffer(1)]],\n\
@@ -366,7 +450,8 @@ static id<MTLDevice>            g_device  = nil;
 static id<MTLCommandQueue>       g_queue   = nil;
 static id<MTLLibrary>            g_library = nil;
 static id<MTLComputePipelineState> g_ps_f32, g_ps_f16, g_ps_q4_0, g_ps_q8_0,
-                                  g_ps_q4_K, g_ps_q5_K, g_ps_q6_K, g_ps_silu;
+                                  g_ps_q4_K, g_ps_q5_K, g_ps_q6_K, g_ps_silu,
+                                  g_ps_q4_K_mo, g_ps_q6_K_mo;
 static int g_ndev = 0;
 
 // Grow-only scratch buffers (mirror CUDA's reserve()). Shared storage mode =
@@ -380,9 +465,9 @@ static id<MTLComputePipelineState> ps_for_qtype(gguf_type_t q) {
         case GGUF_TYPE_F16:  return g_ps_f16;
         case GGUF_TYPE_Q4_0: return g_ps_q4_0;
         case GGUF_TYPE_Q8_0: return g_ps_q8_0;
-        case GGUF_TYPE_Q4_K: return g_ps_q4_K;
+        case GGUF_TYPE_Q4_K: return g_ps_q4_K_mo;
         case GGUF_TYPE_Q5_K: return g_ps_q5_K;
-        case GGUF_TYPE_Q6_K: return g_ps_q6_K;
+        case GGUF_TYPE_Q6_K: return g_ps_q6_K_mo;
         default:             return nil;   /* unsupported -> caller falls back to CPU */
     }
 }
@@ -447,8 +532,10 @@ int picolm_gpu_init(const int *devices, int count) {
     g_ps_q4_K = [g_device newComputePipelineStateWithFunction:[g_library newFunctionWithName:@"mm_q4_K"] error:nil];
     g_ps_q5_K = [g_device newComputePipelineStateWithFunction:[g_library newFunctionWithName:@"mm_q5_K"] error:nil];
     g_ps_q6_K = [g_device newComputePipelineStateWithFunction:[g_library newFunctionWithName:@"mm_q6_K"] error:nil];
+    g_ps_q4_K_mo = [g_device newComputePipelineStateWithFunction:[g_library newFunctionWithName:@"mm_q4_K_mo"] error:nil];
+    g_ps_q6_K_mo = [g_device newComputePipelineStateWithFunction:[g_library newFunctionWithName:@"mm_q6_K_mo"] error:nil];
     g_ps_silu = [g_device newComputePipelineStateWithFunction:[g_library newFunctionWithName:@"silu_mul"] error:nil];
-    if (!g_ps_f32 || !g_ps_f16 || !g_ps_q4_0 || !g_ps_q8_0 || !g_ps_q4_K || !g_ps_q5_K || !g_ps_q6_K || !g_ps_silu) {
+    if (!g_ps_f32 || !g_ps_f16 || !g_ps_q4_0 || !g_ps_q8_0 || !g_ps_q4_K || !g_ps_q5_K || !g_ps_q6_K || !g_ps_q4_K_mo || !g_ps_q6_K_mo || !g_ps_silu) {
         fprintf(stderr, "[Metal] pipeline state creation failed\n");
         g_device = nil; g_queue = nil; g_library = nil; return 0;
     }
@@ -594,7 +681,9 @@ static int launch_matmul(picolm_gpu_tensor_t *t, id<MTLBuffer> xbuf, id<MTLBuffe
     [enc setBytes:&cI length:sizeof(cI) atIndex:3];
     [enc setBytes:&cS length:sizeof(cS) atIndex:4];
     [enc setBytes:&cO length:sizeof(cO) atIndex:5];
-    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)O, (NSUInteger)S, 1)
+    NSUInteger gx = (t->qtype == GGUF_TYPE_Q4_K || t->qtype == GGUF_TYPE_Q6_K)
+                      ? (NSUInteger)((O + 7) / 8) : (NSUInteger)O;
+    [enc dispatchThreadgroups:MTLSizeMake(gx, (NSUInteger)S, 1)
         threadsPerThreadgroup:MTLSizeMake(TPB, 1, 1)];
     [enc endEncoding];
     return 1;
