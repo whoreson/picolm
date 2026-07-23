@@ -38,7 +38,7 @@ The original PicoLM was a clever proof-of-concept: mmap a GGUF, stream layers th
 | **KV cache** | F16, Q8_0 (53% memory), Q4_0 (34% memory), persistent with prefix matching |
 | **Misc** | 64KB FP16 lookup table, `--mem` mlock, `--prefault`, `--daemon`, `--json` grammar, grammar-constrained JSON |
 
-**Not yet:** GPU backend (HIP/CUDA infrastructure exists but untested), SSM KV rewinding (checkpointing planned).
+**GPU:** Metal backend for Apple Silicon (`make metal`, zero external deps — raw Metal framework). CUDA/HIP infrastructure also exists. **Not yet:** SSM KV rewinding (checkpointing planned).
 
 ---
 
@@ -286,7 +286,26 @@ make cross-pi    # Cross-compile for Pi from x86 (static binary)
 make riscv       # RISC-V (Sipeed LicheeRV, etc.)
 make static      # Static binary for single-file deployment
 make debug       # Debug build with symbols, no optimization
+make metal       # Apple Silicon GPU backend (Metal; macOS only, no deps)
 ```
+
+### Metal backend (Apple Silicon)
+
+PicoLM ships a Metal backend implemented directly against the Metal framework
+(no MLX-C, no CMake, no Homebrew — just `clang++` + the macOS SDK). It compiles
+the matmul kernels from Metal Shading Language source at runtime and maps model
+weights **zero-copy** into the GPU's unified memory, so large models don't
+double their resident RAM.
+
+```bash
+make metal                          # builds picolm with -DPICOLM_GPU=1
+PICOLM_GPU=1 ./picolm model.gguf -p "Hello" -n 50    # run on the GPU
+```
+
+Supported quantizations: F32, F16, Q4_0, Q8_0, Q4_K, Q5_K, Q6_K. The dequant
+kernels are faithful ports of PicoLM's CPU `dequantize_row_*` (the GGUF/
+llama.cpp block layouts). A self-contained kernel smoke-test lives in
+`probes/metal_reduction_probe.mm` (`make metal-probe-run`).
 
 ---
 
@@ -679,7 +698,11 @@ A: llama.cpp is excellent but requires ~200MB+ for the runtime on small models, 
 A: TinyLlama 1.1B is a small model — it handles simple tasks (Q&A, summarization, basic reasoning, JSON generation) well. It won't match GPT-4, but it runs on a $10 board with no internet. For structured output, the `--json` grammar mode guarantees valid JSON regardless of model quality.
 
 **Q: What about GPU acceleration?**
-A: PicoLM is CPU-only by design. The target hardware ($10-15 boards) doesn't have GPUs. On x86/ARM CPUs, SIMD (NEON/SSE2/AVX) provides meaningful speedup.
+A: On Apple Silicon, PicoLM has a native Metal backend — `make metal` then run
+with `PICOLM_GPU=1`. It's zero-dependency (raw Metal framework) and maps weights
+zero-copy into unified memory. The original $10-15 target boards have no GPU, so
+the CPU path (NEON/SSE2/AVX SIMD) remains the focus there; CUDA/HIP
+infrastructure also exists for discrete GPUs.
 
 **Q: Can I use a different model?**
 A: Any LLaMA-architecture GGUF model works. Download from [HuggingFace](https://huggingface.co/models?search=gguf) and point PicoLM at it. Recommended quantizations: Q4_K_M (best quality/size balance) or Q2_K (smallest, lower quality).
@@ -690,6 +713,7 @@ A: Any LLaMA-architecture GGUF model works. Download from [HuggingFace](https://
 
 - [x] AVX kernels for x86 (`make avx` — 8-wide float ops, ~2x vs SSE2)
 - [x] AVX2 kernels for x86 (`make avx2` — 256-bit integer ops for Q4_0 and Q6_K quantized paths)
+- [x] Metal backend for Apple Silicon (`make metal` — zero-copy, raw Metal framework, no deps)
 - [ ] AVX-512 kernels for x86 (512-bit ops for server CPUs)
 - [ ] Speculative decoding with a draft model
 - [ ] Context sliding window (infinite generation beyond max_seq_len)
