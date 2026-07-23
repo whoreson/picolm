@@ -184,48 +184,48 @@ kernel void mm_q6_K_c(device const uint8_t* w [[buffer(0)]],device const float* 
     }\n\
     threadgroup float wb[NW]; float total=reduce_all(acc,wb,tid); if(tid==0) y[(unsigned long)s*O+o]=total;\n\
 }\n\
-/* ---- MULTI-OUTPUT decode GEMV (1 warp per output; no cross-warp reduce) ----
- * grid=(O/8,S,1), TG=256 (8 warps). warp w computes output o=gp.x*8+w over ALL
- * blocks; simd_sum within the warp only (no threadgroup barrier / shared mem).
- * Cuts the per-output reduction and packs 8 outputs per threadgroup -> better
- * effective bandwidth, esp. on small-I rows (lm_head). */
-kernel void mm_q4_K_mo(device const uint8_t* w [[buffer(0)]],device const float* x [[buffer(1)]],device float* y [[buffer(2)]],
-   constant int& I [[buffer(3)]],constant int& S [[buffer(4)]],constant int& O [[buffer(5)]],
-   uint tid [[thread_index_in_threadgroup]],uint2 gp [[threadgroup_position_in_grid]]){
-    int s=(int)gp.y; int o=(int)gp.x*8+(int)(tid>>5); if(o>=O) return;
-    int nblocks=I/256; device const uint8_t* row=w+(unsigned long)o*(unsigned long)(nblocks*144);
-    uint lane=tid&31,g=lane/8,within=(lane&7)*4; float acc=0.0f;
-    for(int bi=0;bi<nblocks;bi++){ device const uint8_t* blk=row+(unsigned long)(bi*144);
-        float d=f16tof32((uint16_t)blk[0]|((uint16_t)blk[1]<<8)); float dmin=f16tof32((uint16_t)blk[2]|((uint16_t)blk[3]<<8));
-        device const uint8_t* scales=blk+4; device const uint8_t* qs=blk+16;
-        float d_lo,m_lo,d_hi,m_hi; k4_unpack(scales,2*(int)g,d_lo,m_lo,d,dmin); k4_unpack(scales,2*(int)g+1,d_hi,m_hi,d,dmin);
-        uint qw=*(device const uint*)(qs+lane*4); uint base=(uint)(bi*256)+g*64+within;
-        for(int k=0;k<4;k++){ uint bv=(qw>>(k*8))&0xFF; float lo=(float)(bv&0xF),hi=(float)(bv>>4);
-            acc+=x[(unsigned long)s*I+base+k]*(d_lo*lo-m_lo); acc+=x[(unsigned long)s*I+base+k+32]*(d_hi*hi-m_hi); }
-    }
-    float total=simd_sum(acc); if(lane==0) y[(unsigned long)s*O+o]=total;
-}
-kernel void mm_q6_K_mo(device const uint8_t* w [[buffer(0)]],device const float* x [[buffer(1)]],device float* y [[buffer(2)]],
-   constant int& I [[buffer(3)]],constant int& S [[buffer(4)]],constant int& O [[buffer(5)]],
-   uint tid [[thread_index_in_threadgroup]],uint2 gp [[threadgroup_position_in_grid]]){
-    int s=(int)gp.y; int o=(int)gp.x*8+(int)(tid>>5); if(o>=O) return;
-    int nblocks=I/256; device const uint8_t* row=w+(unsigned long)o*(unsigned long)(nblocks*210);
-    uint lane=tid&31; float acc=0.0f;
-    for(int bi=0;bi<nblocks;bi++){ device const uint8_t* blk=row+(unsigned long)(bi*210);
-        float d=f16tof32((uint16_t)blk[208]|((uint16_t)blk[209]<<8));
-        device const uint8_t* ql=blk; device const uint8_t* qh=blk+128; device const int8_t* sc=(device const int8_t*)(blk+192);
-        for(int k=0;k<4;k++){ uint b=(uint)(k*32)+lane; uint chk=b>>6,grp=(b&63)>>5,l=b&31;
-            uint qlb=ql[b]; uint qhb=qh[chk*32+l];
-            int qr0=(int)(qlb&0xF)|(int)(((qhb>>(2u*grp))&3u)<<4); int si0=(int)(chk*8+l/16+2u*grp); uint j0=chk*128+grp*32+l;
-            acc+=x[(unsigned long)s*I+(unsigned long)bi*256+j0]*(d*(float)sc[si0]*(float)(qr0-32));
-            int qr1=(int)(qlb>>4)|(int)(((qhb>>(2u*(grp+2u)))&3u)<<4); int si1=(int)(chk*8+l/16+2u*(grp+2u)); uint j1=chk*128+(grp+2u)*32+l;
-            acc+=x[(unsigned long)s*I+(unsigned long)bi*256+j1]*(d*(float)sc[si1]*(float)(qr1-32));
-        }
-    }
-    float total=simd_sum(acc); if(lane==0) y[(unsigned long)s*O+o]=total;
-}
-/* trivial kernel for dispatch-overhead probe */
-kernel void noop_k(device float* y [[buffer(0)]],uint gid [[thread_position_in_threadgroup]]){ if(gid==0u) y[0]=0.0f; }
+/* ---- MULTI-OUTPUT decode GEMV (1 warp per output; no cross-warp reduce) ----\n\
+ * grid=(O/8,S,1), TG=256 (8 warps). warp w computes output o=gp.x*8+w over ALL\n\
+ * blocks; simd_sum within the warp only (no threadgroup barrier / shared mem).\n\
+ * Cuts the per-output reduction and packs 8 outputs per threadgroup -> better\n\
+ * effective bandwidth, esp. on small-I rows (lm_head). */\n\
+kernel void mm_q4_K_mo(device const uint8_t* w [[buffer(0)]],device const float* x [[buffer(1)]],device float* y [[buffer(2)]],\n\
+   constant int& I [[buffer(3)]],constant int& S [[buffer(4)]],constant int& O [[buffer(5)]],\n\
+   uint tid [[thread_index_in_threadgroup]],uint2 gp [[threadgroup_position_in_grid]]){\n\
+    int s=(int)gp.y; int o=(int)gp.x*8+(int)(tid>>5); if(o>=O) return;\n\
+    int nblocks=I/256; device const uint8_t* row=w+(unsigned long)o*(unsigned long)(nblocks*144);\n\
+    uint lane=tid&31,g=lane/8,within=(lane&7)*4; float acc=0.0f;\n\
+    for(int bi=0;bi<nblocks;bi++){ device const uint8_t* blk=row+(unsigned long)(bi*144);\n\
+        float d=f16tof32((uint16_t)blk[0]|((uint16_t)blk[1]<<8)); float dmin=f16tof32((uint16_t)blk[2]|((uint16_t)blk[3]<<8));\n\
+        device const uint8_t* scales=blk+4; device const uint8_t* qs=blk+16;\n\
+        float d_lo,m_lo,d_hi,m_hi; k4_unpack(scales,2*(int)g,d_lo,m_lo,d,dmin); k4_unpack(scales,2*(int)g+1,d_hi,m_hi,d,dmin);\n\
+        uint qw=*(device const uint*)(qs+lane*4); uint base=(uint)(bi*256)+g*64+within;\n\
+        for(int k=0;k<4;k++){ uint bv=(qw>>(k*8))&0xFF; float lo=(float)(bv&0xF),hi=(float)(bv>>4);\n\
+            acc+=x[(unsigned long)s*I+base+k]*(d_lo*lo-m_lo); acc+=x[(unsigned long)s*I+base+k+32]*(d_hi*hi-m_hi); }\n\
+    }\n\
+    float total=simd_sum(acc); if(lane==0) y[(unsigned long)s*O+o]=total;\n\
+}\n\
+kernel void mm_q6_K_mo(device const uint8_t* w [[buffer(0)]],device const float* x [[buffer(1)]],device float* y [[buffer(2)]],\n\
+   constant int& I [[buffer(3)]],constant int& S [[buffer(4)]],constant int& O [[buffer(5)]],\n\
+   uint tid [[thread_index_in_threadgroup]],uint2 gp [[threadgroup_position_in_grid]]){\n\
+    int s=(int)gp.y; int o=(int)gp.x*8+(int)(tid>>5); if(o>=O) return;\n\
+    int nblocks=I/256; device const uint8_t* row=w+(unsigned long)o*(unsigned long)(nblocks*210);\n\
+    uint lane=tid&31; float acc=0.0f;\n\
+    for(int bi=0;bi<nblocks;bi++){ device const uint8_t* blk=row+(unsigned long)(bi*210);\n\
+        float d=f16tof32((uint16_t)blk[208]|((uint16_t)blk[209]<<8));\n\
+        device const uint8_t* ql=blk; device const uint8_t* qh=blk+128; device const int8_t* sc=(device const int8_t*)(blk+192);\n\
+        for(int k=0;k<4;k++){ uint b=(uint)(k*32)+lane; uint chk=b>>6,grp=(b&63)>>5,l=b&31;\n\
+            uint qlb=ql[b]; uint qhb=qh[chk*32+l];\n\
+            int qr0=(int)(qlb&0xF)|(int)(((qhb>>(2u*grp))&3u)<<4); int si0=(int)(chk*8+l/16+2u*grp); uint j0=chk*128+grp*32+l;\n\
+            acc+=x[(unsigned long)s*I+(unsigned long)bi*256+j0]*(d*(float)sc[si0]*(float)(qr0-32));\n\
+            int qr1=(int)(qlb>>4)|(int)(((qhb>>(2u*(grp+2u)))&3u)<<4); int si1=(int)(chk*8+l/16+2u*(grp+2u)); uint j1=chk*128+(grp+2u)*32+l;\n\
+            acc+=x[(unsigned long)s*I+(unsigned long)bi*256+j1]*(d*(float)sc[si1]*(float)(qr1-32));\n\
+        }\n\
+    }\n\
+    float total=simd_sum(acc); if(lane==0) y[(unsigned long)s*O+o]=total;\n\
+}\n\
+/* trivial kernel for dispatch-overhead probe */\n\
+kernel void noop_k(device float* y [[buffer(0)]],uint gid [[thread_position_in_threadgroup]]){ if(gid==0u) y[0]=0.0f; }\n\
 ";
 
 // ---------------- timing ----------------
