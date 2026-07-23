@@ -269,7 +269,8 @@ typedef enum {
     GGUF_TYPE_Q4_K  = 12,
     GGUF_TYPE_Q8_K = 29,  /* internal: Q8_K intermediate quantization */
     GGUF_TYPE_Q6_K       = 14,
-    GGUF_TYPE_Q4_0_4_4   = 31,  /* 4-row interleaved Q4_0 (pre-repacked) */
+    GGUF_TYPE_Q4_0_4_4   = 31,  /* 4-row interleaved Q4_0, blocklen=4 (pre-repacked) */
+    GGUF_TYPE_Q4_0_4_8   = 32,  /* 4-row interleaved Q4_0, blocklen=8 (pre-repacked, I8MM target) */
     GGUF_TYPE_Q4_0_8_8   = 33,  /* 8-row interleaved Q4_0 (pre-repacked, AVX2) */
     GGUF_TYPE_BF16      = 30,  /* Brain Float 16 (GGUF type 30) */
     GGUF_TYPE_Q1_0       = 41,  /* 1-bit sign + scale, 128 values/block */
@@ -463,8 +464,10 @@ float vec_dot_q2_0_q8_0(const void *src_q2, const void *src_q8, int n);
 float vec_dot_q4_0_q8_0(const void *src_q4, const void *src_q8, int n);
 /* Q4_K * Q8_K dot product: Q4_K weights with pre-quantized Q8_K input */
 float vec_dot_q4_K_q8_K(const void *src_q4, const void *src_q8, int n);
-/* Q4_0_4_4 interleaved weights x Q8_0 input: processes nrows (multiple of 4) simultaneously */
+/* Q4_0_4_4 interleaved weights x Q8_0 input (blocklen=4): processes nrows (multiple of 4) */
 void vec_dot_q4_0x4_q8_0(const void *vx, const void *wy, int n, float *out, int nrows);
+/* Q4_0_4_8 interleaved weights x Q8_0 input (blocklen=8): processes nrows (multiple of 4) */
+void vec_dot_q4_0x4_4x8_q8_0(const void *vx, const void *wy, int n, float *out, int nrows);
 /* Q4_0_8x8 interleaved weights x Q8_0 input (AVX2): processes nrows (multiple of 8) simultaneously */
 void vec_dot_q4_0x8_q8_0_avx2(const void *vx, const void *wy, int n, float *out, int nrows);
 /* Repack standard Q4_0 weights to Q4_0_8x8 interleaved format (for AVX2).

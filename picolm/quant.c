@@ -439,6 +439,26 @@ void dequantize_row_q4_0_4_4(const void *src, float *dst, int n) {
     }
 }
 
+/* Dequantize row 0 from Q4_0_4_8 interleaved format (blocklen=8).
+ * Same block_q4_0x4 struct but different interleaving: 8 bytes per row per group. */
+void dequantize_row_q4_0_4_8(const void *src, float *dst, int n) {
+    const block_q4_0x4 *blocks = (const block_q4_0x4 *)src;
+    int nb = n / 32;
+
+    for (int i = 0; i < nb; i++) {
+        float d = fp16_to_fp32_lookup(blocks[i].d[0]);
+        for (int k = 0; k < 2; k++) {
+            for (int j = 0; j < 8; j++) {
+                uint8_t byte = blocks[i].qs[k * 32 + j];
+                int v0 = (int8_t)(byte << 4) >> 4;
+                int v1 = (int8_t)(byte & 0xF0) >> 4;
+                dst[i * 32 + k * 16 + j * 2] = d * (float)v0;
+                dst[i * 32 + k * 16 + j * 2 + 1] = d * (float)v1;
+            }
+        }
+    }
+}
+
 /* Dequantize a single row from Q4_0_8_8 interleaved format to float32.
  *
  * The GGUF stores 8 consecutive rows interleaved as block_q4_0x8 structures.
@@ -553,6 +573,7 @@ void dequantize_row(const void *src, float *dst, int n, gguf_type_t type) {
         case GGUF_TYPE_Q5_K:  dequantize_row_q5_K(src, dst, n); break;
         case GGUF_TYPE_Q6_K:  dequantize_row_q6_K(src, dst, n); break;
         case GGUF_TYPE_Q4_0_4_4: dequantize_row_q4_0_4_4(src, dst, n); break;
+        case GGUF_TYPE_Q4_0_4_8: dequantize_row_q4_0_4_8(src, dst, n); break;
         case GGUF_TYPE_Q4_0_8_8: dequantize_row_q4_0_8_8(src, dst, n); break;
         case GGUF_TYPE_Q1_0:     dequantize_row_q1_0(src, dst, n); break;
         case GGUF_TYPE_Q2_0:     dequantize_row_q2_0(src, dst, n); break;
@@ -581,6 +602,7 @@ int gguf_type_block_size(gguf_type_t type) {
         case GGUF_TYPE_Q6_K:  return 256;
         case GGUF_TYPE_Q8_K:  return 256;
         case GGUF_TYPE_Q4_0_4_4: return 32;  /* each block covers 32 values per row */
+        case GGUF_TYPE_Q4_0_4_8: return 32;
         case GGUF_TYPE_Q4_0_8_8: return 32;
         case GGUF_TYPE_BF16:     return 1;  /* BF16: 1 element per block, 2 bytes each */
         case GGUF_TYPE_Q1_0:     return 128;
@@ -606,6 +628,7 @@ int gguf_type_quant_size(gguf_type_t type) {
         case GGUF_TYPE_Q6_K:  return 210;
         case GGUF_TYPE_Q8_K:  return (int)sizeof(block_q8_K);
         case GGUF_TYPE_Q4_0_4_4: return (int)sizeof(block_q4_0);  /* 18: GGUF stores same layout as Q4_0 */
+        case GGUF_TYPE_Q4_0_4_8: return (int)sizeof(block_q4_0);  /* 18: same per-row stride as Q4_0 */
         case GGUF_TYPE_Q4_0_8_8: return (int)sizeof(block_q4_0);  /* 18: GGUF stores same layout as Q4_0 */
         case GGUF_TYPE_BF16:     return 2;  /* BF16: 2 bytes per element */
         case GGUF_TYPE_Q1_0:     return 18;
@@ -2326,6 +2349,94 @@ void vec_dot_q4_0x4_q8_0(const void *vx, const void *wy, int n, float *out, int 
     }
 }
 
+/* ---- vec_dot_q4_0x4_4x8_q8_0: Q4_0_4x8 interleaved x Q8_0 (DOTPROD) ----
+ * Processes 4 output rows simultaneously.
+ * Adapted from llama.cpp's ggml_gemv_q4_0_4x8_q8_0.
+ *
+ * Q4_0_4_8 layout (blocklen=8): 4 rows interleaved in blocks of 8 bytes.
+ * qs[k*32 + r*8 + j] for k=0..1, r=0..3, j=0..7.
+ * Each block has 2 groups of 32 bytes, each group has 4 rows x 8 bytes.
+ *
+ * The DOTPROD kernel uses vdotq_s32 (not vdotq_laneq_s32) because blocklen=8.
+ * Each vdotq_s32 computes 4 dot products of 4-byte segments.
+ * The Q8_0 input (32 bytes = 2x16) is loaded as 4x8-byte duplicated chunks. */
+void vec_dot_q4_0x4_4x8_q8_0(const void *vx, const void *wy, int n, float *out, int nrows) {
+    const block_q4_0x4 *xb = (const block_q4_0x4 *)vx;
+    const block_q8_0 *y = (const block_q8_0 *)wy;
+    int nb = n / 32;
+
+#if defined(PICOLM_DOTPROD)
+    for (int row_group = 0; row_group < nrows; row_group += 4) {
+        const block_q4_0x4 *b_ptr = xb + (size_t)(row_group / 4) * nb;
+        const block_q8_0 *a_ptr = y;
+        float32x4_t acc = vdupq_n_f32(0);
+        for (int b = 0; b < nb; b++) {
+            int8x16_t b0 = vld1q_s8((const int8_t *)b_ptr->qs);
+            int8x16_t b1 = vld1q_s8((const int8_t *)b_ptr->qs + 16);
+            int8x16_t b2 = vld1q_s8((const int8_t *)b_ptr->qs + 32);
+            int8x16_t b3 = vld1q_s8((const int8_t *)b_ptr->qs + 48);
+            float16x4_t bd = vld1_f16((const __fp16 *)b_ptr->d);
+
+            /* Q8_0 input: duplicate each 8-byte chunk to fill 16-byte register */
+            int8x16_t a0 = (int8x16_t)vld1q_dup_s64((const int64_t *)a_ptr->qs);
+            int8x16_t a1 = (int8x16_t)vld1q_dup_s64((const int64_t *)a_ptr->qs + 1);
+            int8x16_t a2 = (int8x16_t)vld1q_dup_s64((const int64_t *)a_ptr->qs + 2);
+            int8x16_t a3 = (int8x16_t)vld1q_dup_s64((const int64_t *)a_ptr->qs + 3);
+            float16x4_t ad = vld1_dup_f16((const __fp16 *)&a_ptr->d);
+
+            int32x4_t ret0 = vdupq_n_s32(0);
+            int32x4_t ret1 = vdupq_n_s32(0);
+
+            /* Low nibbles: b0/b1 with a0, b2/b3 with a1 */
+            ret0 = vdotq_s32(ret0, vshlq_n_s8(b0, 4), a0);
+            ret1 = vdotq_s32(ret1, vshlq_n_s8(b1, 4), a0);
+            ret0 = vdotq_s32(ret0, vshlq_n_s8(b2, 4), a1);
+            ret1 = vdotq_s32(ret1, vshlq_n_s8(b3, 4), a1);
+
+            /* High nibbles: b0/b1 with a2, b2/b3 with a3 */
+            ret0 = vdotq_s32(ret0, vandq_s8(b0, vdupq_n_s8((int8_t)0xf0U)), a2);
+            ret1 = vdotq_s32(ret1, vandq_s8(b1, vdupq_n_s8((int8_t)0xf0U)), a2);
+            ret0 = vdotq_s32(ret0, vandq_s8(b2, vdupq_n_s8((int8_t)0xf0U)), a3);
+            ret1 = vdotq_s32(ret1, vandq_s8(b3, vdupq_n_s8((int8_t)0xf0U)), a3);
+
+            /* Horizontal pair-add to combine ret0+ret1 */
+            int32x4_t ret = vpaddq_s32(ret0, ret1);
+
+            acc = vfmaq_f32(acc, vcvtq_n_f32_s32(ret, 4),
+                             vmulq_f32(vcvt_f32_f16(ad), vcvt_f32_f16(bd)));
+            a_ptr++;
+            b_ptr++;
+        }
+        vst1q_f32(out + row_group, acc);
+    }
+    return;
+#endif
+
+    /* Scalar fallback for Q4_0_4_8 (blocklen=8) */
+    for (int row = 0; row < nrows; row++) {
+        int group = row / 4;
+        int local_row = row % 4;
+        const block_q4_0x4 *group_base = xb + (size_t)group * nb;
+        float sumf = 0.0f;
+        for (int ib = 0; ib < nb; ib++) {
+            const block_q4_0x4 *b = group_base + ib;
+            float dd = fp16_to_fp32_lookup(b->d[local_row]) * fp16_to_fp32_lookup(y[ib].d);
+            int sumi = 0;
+            for (int k = 0; k < 2; k++) {
+                for (int i = 0; i < 8; i++) {
+                    uint8_t byte = b->qs[k * 32 + local_row * 8 + i];
+                    int v0 = (int8_t)(byte << 4) >> 4;
+                    int v1 = (int8_t)(byte & 0xF0) >> 4;
+                    sumi += ((v0 * y[ib].qs[k * 8 + i]) +
+                             (v1 * y[ib].qs[k * 8 + i + 16]));
+                }
+            }
+            sumf += (float)sumi * dd;
+        }
+        out[row] = sumf;
+    }
+}
+
 /* ================================================================
  * vec_dot_q8_0_q8_0_deltas: int8 MAC with pre-converted x deltas
  *
@@ -3055,6 +3166,32 @@ float vec_dot_q4_0_4_4_f32(const void *src, const float *x, int n) {
     return sumf;
 }
 
+/* vec_dot for Q4_0_4_8: dequantize row 0 of interleaved block (blocklen=8), then dot
+ * Interleaving: qs[k*32 + r*8 + j] = row_r.qs[k*8 + j] ^ 0x88
+ * For row 0: qs[k*32 + j] for k=0..1, j=0..7 */
+float vec_dot_q4_0_4_8_f32(const void *src, const float *x, int n) {
+    const block_q4_0x4 *blocks = (const block_q4_0x4 *)src;
+    int nb = n / 32;
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        float d = fp16_to_fp32_lookup(blocks[i].d[0]);
+        const float *xp = x + i * 32;
+        float block_sum = 0.0f;
+        for (int k = 0; k < 2; k++) {
+            for (int j = 0; j < 8; j++) {
+                uint8_t byte = blocks[i].qs[k * 32 + j];
+                int v0 = (int8_t)(byte << 4) >> 4;
+                int v1 = (int8_t)(byte & 0xF0) >> 4;
+                block_sum += (float)v0 * xp[k * 16 + j * 2];
+                block_sum += (float)v1 * xp[k * 16 + j * 2 + 1];
+            }
+        }
+        sumf += d * block_sum;
+    }
+    return sumf;
+}
+
 /* vec_dot for Q4_0_8_8: dequantize row 0 of interleaved block, then dot product */
 float vec_dot_q4_0_8_8_f32(const void *src, const float *x, int n) {
     const block_q4_0x8 *blocks = (const block_q4_0x8 *)src;
@@ -3110,6 +3247,7 @@ float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
         case GGUF_TYPE_Q1_0: return vec_dot_q1_0_f32(src, x, n);
         case GGUF_TYPE_Q2_0: return vec_dot_q2_0_f32(src, x, n);
         case GGUF_TYPE_Q4_0_4_4: return vec_dot_q4_0_4_4_f32(src, x, n);
+        case GGUF_TYPE_Q4_0_4_8: return vec_dot_q4_0_4_8_f32(src, x, n);
         case GGUF_TYPE_Q4_0_8_8: return vec_dot_q4_0_8_8_f32(src, x, n);
         case GGUF_TYPE_F16:  return vec_dot_f16_f32(src, x, n);
         case GGUF_TYPE_BF16: return vec_dot_bf16_f32(src, x, n);
