@@ -51,6 +51,17 @@ jobs:
           name: picolm-macos-arm64
           path: picolm/picolm
 
+  build-macos-metal:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (Metal backend)
+        run: cd picolm && make metal
+      - name: Check binary
+        run: ls -la picolm/picolm && file picolm/picolm
+      - name: Kernel smoke-test
+        run: cd picolm && make metal-probe-run
+
   build-windows:
     runs-on: windows-latest
     steps:

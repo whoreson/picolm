@@ -312,8 +312,12 @@ int main(int argc, char **argv) {
     fprintf(stderr, "SIMD: scalar\n");
 #endif
 
-    /* Runtime check: warn if CPU supports I8MM but compiler didn't enable it */
-#if defined(__aarch64__) && !defined(PICOLM_I8MM) && !defined(_WIN32)
+    /* Runtime check: warn if CPU supports I8MM but compiler didn't enable it.
+     * Linux-only: it reads the ELF auxiliary vector (getauxval/AT_HWCAP2),
+     * which does not exist on macOS. Apple Silicon is __aarch64__ too, so it
+     * must be excluded explicitly (this also broke the macOS/`make metal` and
+     * `make native` builds with "sys/auxv.h not found"). */
+#if defined(__aarch64__) && !defined(PICOLM_I8MM) && !defined(_WIN32) && !defined(__APPLE__)
     {
         #include <sys/auxv.h>
         #include <elf.h>

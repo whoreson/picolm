@@ -3,3 +3,11 @@
 *.fixed
 leaks.txt
 qwen35_ref.c
+# build artifacts
+picolm/*.o
+picolm/picolm
+picolm/picolm.exe
+picolm/backend_gpu.o.hip
+picolm/backend_gpu.o.cuda
+picolm/backend_metal.o
+picolm/probes/metal_reduction_probe

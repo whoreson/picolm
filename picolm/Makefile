@@ -139,7 +139,7 @@ model:
 	fi
 
 clean:
-	rm -f $(TARGET) $(TARGET).exe $(OBJS) backend_gpu.o backend_gpu.o.hip backend_gpu.o.cuda
+	rm -f $(TARGET) $(TARGET).exe $(OBJS) backend_gpu.o backend_gpu.o.hip backend_gpu.o.cuda backend_metal.o probes/metal_reduction_probe
 
 
 .PHONY: asan
@@ -188,4 +188,35 @@ cuda: backend_gpu.o.cuda
 backend_gpu.o.cuda: backend_gpu.cu backend_gpu.h quant.h
 	$(NVCC) $(CUDAFLAGS) $(CUDA_GENCODE) -DPICOLM_GPU=1 -c -o $@ $< -I.
 
-.PHONY: hip cuda
+# --- Metal (Apple Silicon) backend — RAW Metal framework, no MLX-C ---
+# macOS only. No external dependencies beyond the Metal framework that ships
+# with macOS + the Command Line Tools (clang). Compile the whole backend with:
+#     make metal
+# Then run with: PICOLM_GPU=1 ./picolm model.gguf ...
+METAL_CXX      ?= clang++
+METAL_CXXFLAGS ?= -std=c++20 -O3 -fobjc-arc -fPIC
+METAL_FRAMEWORKS = -framework Metal -framework Foundation
+METAL_LIBS       = $(METAL_FRAMEWORKS)
+# (the link rule appends -lstdc++ for the ObjC++ runtime)
+.PHONY: metal
+metal: backend_metal.o
+	$(MAKE) $(TARGET) \
+	  CFLAGS="$(filter-out -fopenmp,$(CFLAGS)) -DPICOLM_GPU=1" \
+	  LDFLAGS="$(filter-out -fopenmp,$(LDFLAGS))" \
+	  GPU_OBJS="backend_metal.o" GPU_LIBS="$(METAL_LIBS)"
+
+# .mm = Objective-C++ so we can use <metal/Metal.h> directly.
+backend_metal.o: backend_metal.mm backend_gpu.h quant.h
+	$(METAL_CXX) $(METAL_CXXFLAGS) -DPICOLM_GPU=1 -c -o $@ $< -I.
+
+# --- Metal kernel probe (smoke test for the raw-Metal kernel mechanism) ---
+# Builds and runs probes/metal_reduction_probe.mm against the Metal framework.
+# Needs only clang++ + the macOS SDK (no CMake, no MLX-C).
+.PHONY: metal-probe metal-probe-run
+metal-probe: probes/metal_reduction_probe
+probes/metal_reduction_probe: probes/metal_reduction_probe.mm
+	$(METAL_CXX) $(METAL_CXXFLAGS) $< $(METAL_FRAMEWORKS) -o $@
+metal-probe-run: metal-probe
+	./probes/metal_reduction_probe
+
+.PHONY: hip cuda metal
