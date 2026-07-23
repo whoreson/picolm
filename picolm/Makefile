@@ -139,7 +139,7 @@ model:
 	fi
 
 clean:
-	rm -f $(TARGET) $(TARGET).exe $(OBJS) backend_gpu.o backend_gpu.o.hip backend_gpu.o.cuda backend_metal.o probes/metal_reduction_probe
+	rm -f $(TARGET) $(TARGET).exe $(OBJS) backend_gpu.o backend_gpu.o.hip backend_gpu.o.cuda backend_metal.o probes/metal_reduction_probe probes/metal_matmul_bench
 
 
 .PHONY: asan
@@ -218,5 +218,16 @@ probes/metal_reduction_probe: probes/metal_reduction_probe.mm
 	$(METAL_CXX) $(METAL_CXXFLAGS) $< $(METAL_FRAMEWORKS) -o $@
 metal-probe-run: metal-probe
 	./probes/metal_reduction_probe
+
+# --- Metal matmul benchmark + correctness harness (no model file needed) ---
+# Measures each kernel at decode/prefill dims, diffs vs a CPU reference, and
+# reports effective weight bandwidth + per-dispatch overhead. Use it to tell
+# whether to optimize the kernels or the host launch/sync path.
+.PHONY: metal-bench metal-bench-run
+metal-bench: probes/metal_matmul_bench
+probes/metal_matmul_bench: probes/metal_matmul_bench.mm
+	$(METAL_CXX) $(METAL_CXXFLAGS) $< $(METAL_FRAMEWORKS) -o $@
+metal-bench-run: metal-bench
+	./probes/metal_matmul_bench
 
 .PHONY: hip cuda metal

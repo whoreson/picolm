@@ -11,3 +11,4 @@ picolm/backend_gpu.o.hip
 picolm/backend_gpu.o.cuda
 picolm/backend_metal.o
 picolm/probes/metal_reduction_probe
+picolm/probes/metal_matmul_bench
