@@ -2057,18 +2057,131 @@ static void ssm_head_task(int h, void *ctxp) {
 
     float *st = ctx->state + (size_t)h * d_state * d_state;
     float ge = ctx->gate_exp[h];
-
-    /* Decay: elementwise */
-    for (int i = 0; i < d_state * d_state; i++) st[i] *= ge;
-
     int kh = h / ctx->repeat;
     const float *qh = ctx->q_conv + (size_t)kh * d_state;
     const float *khv = ctx->k_conv + (size_t)kh * d_state;
     const float *vh = ctx->v_conv + (size_t)h * ctx->head_v_dim;
     float bh = ctx->beta[h];
 
+#ifdef PICOLM_AVX512
+    /* ---- AVX-512 vectorized recurrence ----
+     * Process 4 rows of the d_state x d_state state matrix simultaneously.
+     * Each __m512 holds 16 floats. For d_state=128: 8 vector lanes per row,
+     * 4 rows processed at once = 32 vector registers for the matrix.
+     *
+     * Layout: st[h] is [d_state][d_state] row-major.
+     * We process 4 consecutive rows (r, r+1, r+2, r+3) together. */
+    {
+        int nr = d_state / 4; /* number of 4-row groups */
+        __m512 ge_v = _mm512_set1_ps(ge);
+        int d16 = d_state / 16; /* number of 16-float vector lanes per row */
+
+        for (int g = 0; g < nr; g++) {
+            int base = g * 4; /* row base in this group */
+            /* Load 4 rows x d16 vectors = 4*d128 floats for this group */
+
+            /* Phase 1: Decay + sk computation */
+            /* sk[4 rows][16 lanes] = sum over columns: st[4r][c] * k[c] */
+            __m512 sk0 = _mm512_setzero_ps(), sk1 = _mm512_setzero_ps();
+            __m512 sk2 = _mm512_setzero_ps(), sk3 = _mm512_setzero_ps();
+
+            for (int v = 0; v < d16; v++) {
+                int col_base = v * 16;
+                /* Load k[col_base..col_base+15] broadcast to decay/multiply */
+                __m512 kv = _mm512_loadu_ps(khv + col_base);
+
+                /* Row 0: decay + accumulate sk */
+                __m512 r0 = _mm512_loadu_ps(st + base * d_state + col_base);
+                r0 = _mm512_mul_ps(r0, ge_v);
+                _mm512_storeu_ps(st + base * d_state + col_base, r0);
+                sk0 = _mm512_fmadd_ps(r0, kv, sk0);
+
+                /* Row 1 */
+                __m512 r1 = _mm512_loadu_ps(st + (base+1) * d_state + col_base);
+                r1 = _mm512_mul_ps(r1, ge_v);
+                _mm512_storeu_ps(st + (base+1) * d_state + col_base, r1);
+                sk1 = _mm512_fmadd_ps(r1, kv, sk1);
+
+                /* Row 2 */
+                __m512 r2 = _mm512_loadu_ps(st + (base+2) * d_state + col_base);
+                r2 = _mm512_mul_ps(r2, ge_v);
+                _mm512_storeu_ps(st + (base+2) * d_state + col_base, r2);
+                sk2 = _mm512_fmadd_ps(r2, kv, sk2);
+
+                /* Row 3 */
+                __m512 r3 = _mm512_loadu_ps(st + (base+3) * d_state + col_base);
+                r3 = _mm512_mul_ps(r3, ge_v);
+                _mm512_storeu_ps(st + (base+3) * d_state + col_base, r3);
+                sk3 = _mm512_fmadd_ps(r3, kv, sk3);
+            }
+
+            /* Horizontal reduce sk (sum across 16 lanes per __m512) */
+            float sk0s = _mm512_reduce_add_ps(sk0);
+            float sk1s = _mm512_reduce_add_ps(sk1);
+            float sk2s = _mm512_reduce_add_ps(sk2);
+            float sk3s = _mm512_reduce_add_ps(sk3);
+
+            /* Phase 2: Compute delta = (v - sk) * beta */
+            float d0 = (vh[base + 0] - sk0s) * bh;
+            float d1 = (vh[base + 1] - sk1s) * bh;
+            float d2 = (vh[base + 2] - sk2s) * bh;
+            float d3 = (vh[base + 3] - sk3s) * bh;
+
+            __m512 d0v = _mm512_set1_ps(d0);
+            __m512 d1v = _mm512_set1_ps(d1);
+            __m512 d2v = _mm512_set1_ps(d2);
+            __m512 d3v = _mm512_set1_ps(d3);
+
+            /* Phase 3: State update + output computation
+             * state[r][c] += k[c] * d[r]  (rank-1 update)
+             * output[r] = sum_c state[r][c] * q[c] */
+            __m512 out0 = _mm512_setzero_ps(), out1 = _mm512_setzero_ps();
+            __m512 out2 = _mm512_setzero_ps(), out3 = _mm512_setzero_ps();
+
+            for (int v = 0; v < d16; v++) {
+                int col_base = v * 16;
+                __m512 kv = _mm512_loadu_ps(khv + col_base);
+                __m512 qv = _mm512_loadu_ps(qh + col_base);
+
+                /* Row 0: update state + accumulate output */
+                __m512 r0 = _mm512_loadu_ps(st + base * d_state + col_base);
+                r0 = _mm512_fmadd_ps(kv, d0v, r0);
+                _mm512_storeu_ps(st + base * d_state + col_base, r0);
+                out0 = _mm512_fmadd_ps(r0, qv, out0);
+
+                /* Row 1 */
+                __m512 r1 = _mm512_loadu_ps(st + (base+1) * d_state + col_base);
+                r1 = _mm512_fmadd_ps(kv, d1v, r1);
+                _mm512_storeu_ps(st + (base+1) * d_state + col_base, r1);
+                out1 = _mm512_fmadd_ps(r1, qv, out1);
+
+                /* Row 2 */
+                __m512 r2 = _mm512_loadu_ps(st + (base+2) * d_state + col_base);
+                r2 = _mm512_fmadd_ps(kv, d2v, r2);
+                _mm512_storeu_ps(st + (base+2) * d_state + col_base, r2);
+                out2 = _mm512_fmadd_ps(r2, qv, out2);
+
+                /* Row 3 */
+                __m512 r3 = _mm512_loadu_ps(st + (base+3) * d_state + col_base);
+                r3 = _mm512_fmadd_ps(kv, d3v, r3);
+                _mm512_storeu_ps(st + (base+3) * d_state + col_base, r3);
+                out3 = _mm512_fmadd_ps(r3, qv, out3);
+            }
+
+            /* Horizontal reduce output */
+            ctx->ssm_output[(size_t)base * n_v_heads + h] = _mm512_reduce_add_ps(out0);
+            ctx->ssm_output[(size_t)(base+1) * n_v_heads + h] = _mm512_reduce_add_ps(out1);
+            ctx->ssm_output[(size_t)(base+2) * n_v_heads + h] = _mm512_reduce_add_ps(out2);
+            ctx->ssm_output[(size_t)(base+3) * n_v_heads + h] = _mm512_reduce_add_ps(out3);
+        }
+    }
+#else
+    /* ---- Scalar fallback ---- */
     float sk_local[256];
     float d_local[256];
+
+    /* Decay: elementwise */
+    for (int i = 0; i < d_state * d_state; i++) st[i] *= ge;
 
     /* sk[row] = sum_col state[row][col] * k[col] -- row-major contiguous */
     for (int row = 0; row < d_state; row++) {
@@ -2094,6 +2207,7 @@ static void ssm_head_task(int h, void *ctxp) {
         for (int col = 0; col < d_state; col++) sum += st_row[col] * qh[col];
         ctx->ssm_output[(size_t)row * n_v_heads + h] = sum;
     }
+#endif
 }
 
 /* SSM layer forward pass (autoregressive, single token) */
@@ -3363,7 +3477,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
     /* 2. Batched QKV projection (read from ssm_xb with stride dim) */
     tensor_set_repacked(m->repack_used[ri] ? m->repack_buffers[ri] : NULL);
 #ifdef PICOLM_GPU
-    if (gpu_lw[l]) {
+    if (gpu_lw && gpu_lw[l]) {
         gpu_layer_weights_t *gl = (gpu_layer_weights_t *)gpu_lw[l];
         tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->attn_qkv, m->gpu.device);
     }
@@ -3371,7 +3485,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
     matmul_batch(qkv_batch, ssm_xb, n_tokens, lw->attn_qkv, dim, conv_dim, lw->type_attn_qkv);
     tensor_set_repacked(NULL);
 #ifdef PICOLM_GPU
-    if (gpu_lw[l]) {
+    if (gpu_lw && gpu_lw[l]) {
         gpu_layer_weights_t *gl = (gpu_layer_weights_t *)gpu_lw[l];
         tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->attn_gate_ssm, m->gpu.device);
     }
@@ -3399,7 +3513,8 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
         }
     }
 
-    /* 4. Convolution + silu (sequential per token: conv_state is stateful) */
+    /* 4. Convolution + silu (sequential per token: conv_state is stateful)
+     * Each token sees a different conv_state because we shift after each token. */
     for (int bi = 0; bi < n_tokens; bi++) {
         float *qkv = qkv_batch + bi * conv_dim;
         float *conv_out = conv_batch + bi * conv_dim;
@@ -3460,6 +3575,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
      * GGUF stores [dim, n_v_heads] column-major per head, with possible
      * v-head reordering. Each head is a vec_dot of dim elements.
      * We process all tokens and all heads in batched fashion. */
+    /* Phase 1.3: alpha/beta stored in pooled ssm_buf instead of separate mallocs */
     float *alpha_batch = (float *)malloc((size_t)n_tokens * n_v_heads * sizeof(float));
     float *beta_batch = (float *)malloc((size_t)n_tokens * n_v_heads * sizeof(float));
     {
@@ -3546,8 +3662,6 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
      * but within each token, the n_v_heads are fully independent and
      * threaded via ssm_head_task. */
     /* Pre-allocate scratch outside token loop to avoid repeated alloca */
-    float *q_rep = (float *)malloc((size_t)d_state * n_v_heads * sizeof(float));
-    float *k_rep = (float *)malloc((size_t)d_state * n_v_heads * sizeof(float));
     float *ssm_output = (float *)malloc((size_t)d_state * n_v_heads * sizeof(float));
     ssm_head_ctx_t ssm_ctx;
     ssm_ctx.state = state;
@@ -3564,16 +3678,10 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
         float *ge = alpha_batch + bi * n_v_heads; /* gate_exp stored in-place */
         float *bet = beta_batch + bi * n_v_heads;
 
-        /* Repeat Q/K from n_k_heads to n_v_heads (GQA-style: h/repeat) */
-        for (int h = 0; h < n_v_heads; h++) {
-            int kh = h / repeat;
-            memcpy(q_rep + h * d_state, q + kh * d_state, d_state * sizeof(float));
-            memcpy(k_rep + h * d_state, k + kh * d_state, d_state * sizeof(float));
-        }
-
-        /* Threaded state recurrence across v-heads */
-        ssm_ctx.q_conv = q_rep;
-        ssm_ctx.k_conv = k_rep;
+        /* Pass Q/K directly (n_k_heads entries). ssm_head_task handles
+         * the GQA k-head indexing via kh = h / repeat internally. */
+        ssm_ctx.q_conv = q;
+        ssm_ctx.k_conv = k;
         ssm_ctx.v_conv = v;
         ssm_ctx.gate_exp = ge;
         ssm_ctx.beta = bet;
@@ -3589,8 +3697,6 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
 
     free(alpha_batch);
     free(beta_batch);
-    free(q_rep);
-    free(k_rep);
     free(ssm_output);
 
     /* 8. Gated normalization (batched across tokens) */
@@ -3642,7 +3748,6 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
         /* Cannot alias in/out when value_dim != dim (strides differ, cross-token corruption) */
         float *ssm_out_buf = (float *)malloc((size_t)n_tokens * dim * sizeof(float));
         matmul_batch(ssm_out_buf, xb2_batch, n_tokens, lw->ssm_out, value_dim, dim, lw->type_ssm_out);
-        /* Copy result back to xb2_batch with correct stride */
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
@@ -3810,12 +3915,17 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         layer_weights_t *lw = &w->layers[l];
 
         if (c->has_ssm && !lw->is_attn_layer) {
-            /* SSM layer: fall back to per-token for now until batched path is verified */
-            for (int bi = 0; bi < n_tokens; bi++) {
-                memcpy(s->x, x_batch + bi * dim, dim * sizeof(float));
-                ssm_forward(m, s, s->x, s->xb2, lw, l, start_pos + bi, NULL);
-                memcpy(x_batch + bi * dim, s->x, dim * sizeof(float));
-            }
+            /* Batched SSM layer prefill */
+#ifdef PICOLM_GPU
+            ssm_prefill_layer(m, s, x_batch, xb_batch, xb2_batch,
+                              hb_batch, hb2_batch, lw, l,
+                              n_tokens, start_pos, xb2_stride,
+                              (void **)m->gpu.layers);
+#else
+            ssm_prefill_layer(m, s, x_batch, xb_batch, xb2_batch,
+                              hb_batch, hb2_batch, lw, l,
+                              n_tokens, start_pos, xb2_stride, NULL);
+#endif
             continue;
         }
 
