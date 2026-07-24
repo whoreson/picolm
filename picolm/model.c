@@ -1240,7 +1240,6 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
             int device = picolm_gpu_device_at(0);
             fprintf(stderr, "INFO: uploading model weights to GPU device %d\n", device);
 
-            int ok = 1;
             model_config_t *c = &m->config;
             int q_dim = c->n_heads * c->head_dim;
             int kv_dim = c->n_kv_heads * c->head_dim;
@@ -1307,10 +1306,7 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                 /* Log per-type upload stats */
                 int tcounts[20] = {0};
                 for (int l = 0; l < c->n_layers; l++) {
-                    gpu_layer_weights_t *gl = &m->gpu.layers[l];
                     layer_weights_t *lw = &m->weights.layers[l];
-                    const void *ptrs[] = {gl->attn_q, gl->attn_k, gl->attn_v,
-                                          gl->attn_output, gl->ffn_gate, gl->ffn_up, gl->ffn_down};
                     int types[] = {lw->type_attn_q, lw->type_attn_k, lw->type_attn_v,
                                    lw->type_attn_output, lw->type_ffn_gate, lw->type_ffn_up, lw->type_ffn_down};
                     for (int j = 0; j < 7; j++) {
@@ -2569,6 +2565,9 @@ static void ssm_chunked_recurrence(
 /* SSM layer forward pass (autoregressive, single token) */
 static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
                         layer_weights_t *lw, int il, int pos, void *gpu_lw) {
+#ifndef PICOLM_GPU
+    (void)gpu_lw;
+#endif
     model_config_t *c = &m->config;
     int dim = c->n_embd;
     int d_conv = c->ssm_d_conv;

@@ -165,7 +165,7 @@ __host__ __device__ static inline uint16_t gpu_fp32_to_fp16(float f) {
 __host__ __device__ static inline float gpu_fp16_to_fp32(unsigned short h) {
     return __half2float(__ushort_as_half(h));
 }
-__host__ __device__ static inline unsigned short gpu_fp32_to_fp16(float f) {
+__host__ __device__ __attribute__((unused)) static inline unsigned short gpu_fp32_to_fp16(float f) {
     return __half_as_ushort(__float2half(f));
 }
 #endif
@@ -869,7 +869,7 @@ static int reserve(float **ptr, size_t *cap, size_t bytes) {
     return 1;
 }
 
-static int reserve_pinned(float **ptr, size_t *cap, size_t bytes) {
+static __attribute__((unused)) int reserve_pinned(float **ptr, size_t *cap, size_t bytes) {
     pthread_mutex_lock(&g_resize_mutex);
     if (*cap >= bytes) { pthread_mutex_unlock(&g_resize_mutex); return 1; }
     if (*ptr) gpuFreeHost(*ptr);
@@ -948,7 +948,7 @@ void picolm_gpu_shutdown(void) {
 }
 
 /* Detect if we're on a unified memory SoC (Grace-Blackwell, Apple Silicon, etc.) */
-static int is_unified_memory(void) {
+static __attribute__((unused)) int is_unified_memory(void) {
 #ifdef __HIP__
     return 0; /* HIP: treat as discrete GPU (conservative) */
 #else

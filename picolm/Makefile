@@ -139,13 +139,22 @@ model:
 	fi
 
 clean:
-	rm -f $(TARGET) $(TARGET).exe $(OBJS) backend_gpu.o backend_gpu.o.hip backend_gpu.o.cuda backend_metal.o probes/metal_reduction_probe
+	rm -f $(TARGET) $(TARGET).exe $(OBJS) backend_gpu.o backend_gpu.o.hip backend_gpu.o.cuda backend_metal.o probes/metal_reduction_probe probes/metal_matmul_bench
 
 
 .PHONY: asan
 asan: CFLAGS += -fsanitize=address -g -O2 -march=native
 asan: LDFLAGS += -fsanitize=address
 asan: picolm
+
+# --- Force recompile of GPU-dependent C objects ---
+# These objects contain #ifdef PICOLM_GPU code; when building GPU targets
+# alongside a prior native build, Make won't recompile them because
+# CFLAGS is a variable, not a prerequisite. Remove them so the sub-make
+# with -DPICOLM_GPU=1 rebuilds them from scratch.
+.PHONY: gpu-clean-objs
+gpu-clean-objs:
+	rm -f model.o tensor.o quant.o
 
 # --- ROCm/HIP GPU backend ---
 ROCM_LIB ?= /opt/rocm-6.3.3/lib
@@ -156,7 +165,7 @@ ROCM_LIB ?= /opt/rocm-6.3.3/lib
 HIP_ARCH ?= gfx940
 
 .PHONY: hip
-hip: backend_gpu.o.hip
+hip: backend_gpu.o.hip gpu-clean-objs
 	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -DPICOLM_GPU=1" GPU_OBJS="backend_gpu.o.hip" GPU_LIBS="-L$(ROCM_LIB) -lamdhip64 -lstdc++ -Wl,-rpath,$(ROCM_LIB)"
 
 backend_gpu.o.hip: backend_gpu.cu backend_gpu.h quant.h
@@ -182,13 +191,11 @@ CUDA_GENCODE := $(foreach arch,$(CUDA_ARCHS),-gencode arch=compute_$(subst sm_,,
 CUDAFLAGS   ?= -O3 -std=c++11 -Xcompiler="-fPIC"
 
 .PHONY: cuda
-cuda: backend_gpu.o.cuda
+cuda: backend_gpu.o.cuda gpu-clean-objs
 	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -DPICOLM_GPU=1" GPU_OBJS="backend_gpu.o.cuda" GPU_LIBS="-L$(CUDA_LIB) -lcudart -lstdc++ -Wl,-rpath,$(CUDA_LIB)"
 
 backend_gpu.o.cuda: backend_gpu.cu backend_gpu.h quant.h
 	$(NVCC) $(CUDAFLAGS) $(CUDA_GENCODE) -DPICOLM_GPU=1 -c -o $@ $< -I.
-
-.PHONY: hip cuda
 
 # --- Metal (Apple Silicon) backend -- RAW Metal framework, no MLX-C ---
 # macOS only. No external dependencies beyond the Metal framework that ships
@@ -201,7 +208,7 @@ METAL_FRAMEWORKS = -framework Metal -framework Foundation
 METAL_LIBS       = $(METAL_FRAMEWORKS)
 # (the link rule appends -lstdc++ for the ObjC++ runtime)
 .PHONY: metal
-metal: backend_metal.o
+metal: backend_metal.o gpu-clean-objs
 	$(MAKE) $(TARGET) \
 	  CFLAGS="$(filter-out -fopenmp,$(CFLAGS)) -DPICOLM_GPU=1" \
 	  LDFLAGS="$(filter-out -fopenmp,$(LDFLAGS))" \
@@ -221,4 +228,24 @@ probes/metal_reduction_probe: probes/metal_reduction_probe.mm
 metal-probe-run: metal-probe
 	./probes/metal_reduction_probe
 
+# --- Metal matmul benchmark + correctness harness (no model file needed) ---
+# Measures each kernel at decode/prefill dims, diffs vs a CPU reference, and
+# reports effective weight bandwidth + per-dispatch overhead. Use it to tell
+# whether to optimize the kernels or the host launch/sync path.
+.PHONY: metal-bench metal-bench-run
+metal-bench: probes/metal_matmul_bench
+probes/metal_matmul_bench: probes/metal_matmul_bench.mm
+	$(METAL_CXX) $(METAL_CXXFLAGS) $< $(METAL_FRAMEWORKS) -o $@
+metal-bench-run: metal-bench
+	./probes/metal_matmul_bench
+
+# --- End-to-end model timing (needs `make metal` first + GGUF files) ---
+# Runs ./picolm on real models, parses prefill/generation tok/s.
+#   make metal-model-bench            # GPU
+#   make metal-model-bench CPU=1      # also CPU baseline
+#   LABEL=after make metal-model-bench # tag the run
+# Override models with MODELS="a.gguf b.gguf" or pass them as script args.
+.PHONY: metal-model-bench
+metal-model-bench:
+	./probes/metal_model_bench.sh
 .PHONY: hip cuda metal

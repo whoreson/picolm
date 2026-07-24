@@ -1,6 +1,6 @@
 // backend_metal.mm
 //
-// Apple Metal backend for PicoLM — implements the backend_gpu.h C ABI using the
+// Apple Metal backend for PicoLM  implements the backend_gpu.h C ABI using the
 // Metal framework directly (no MLX-C, no CMake, no external dependencies beyond
 // what ships with macOS + the Command Line Tools).
 //
@@ -9,17 +9,17 @@
 // Design mirrors backend_gpu.cu (CUDA/HIP): one device context, grow-only
 // scratch buffers, idempotent tensor upload, per-tensor MTLBuffer handles.
 // The host side implements backend_gpu.h unchanged; model.c / tensor.c /
-// model.h are NOT modified — they were already written generically behind
+// model.h are NOT modified  they were already written generically behind
 // #ifdef PICOLM_GPU.
 //
 // The matmul kernels are hand-written Metal Shading Language (compiled from a
 // source string at init), NOT direct ports of the CUDA device kernels. The
 // device-side dequant is taken from PicoLM's CPU reference in quant.c (the
-// source of truth for GGUF block layouts — the CUDA file's Q4_K path is
+// source of truth for GGUF block layouts  the CUDA file's Q4_K path is
 // unfinished and its Q4_0 nibble order is wrong). The high-traffic types use
 // coalesced warp-cooperative loads + simd_sum reduction.
 //
-// Activation: same as CUDA — set PICOLM_GPU=1 in the environment. The whole
+// Activation: same as CUDA  set PICOLM_GPU=1 in the environment. The whole
 // GPU path is gated by -DPICOLM_GPU=1, added by the `metal` Makefile target.
 //
 // Supported quants: F32, F16, Q4_0, Q8_0, Q4_K, Q5_K, Q6_K. Weights are mapped
@@ -64,8 +64,9 @@
 //     derived from quant.c dequantize_row_q4_K and hand-verified.
 //   - Q8_0: 1 block (34B, 32 values) per simdgroup; each lane reads 1 int8.
 //   - F32/F16: float4 / half4 vector loads, lanes stride by TPB*4.
-// Q4_0/Q5_K/Q6_K keep a per-element structure (their layouts are awkward to
-// coalesce) but cache block metadata once and use simd_sum.
+// Q4_0/Q5_K keep a per-element structure (their layouts are awkward to
+// coalesce) but cache block metadata once and use simd_sum. Q6_K is ALSO
+// coalesced (1 block/simdgroup, 8 values/lane)  see mm_q6_K below.
 //
 // IMPORTANT: dequant layouts match PicoLM's CPU dequantize_row_* in quant.c
 // (the GGUF/llama.cpp convention). For Q4_0: value j -> byte (j&15), low nibble
@@ -185,7 +186,7 @@ kernel void mm_q4_0(device const uint8_t* w [[buffer(0)]],\n\
     if (tid == 0) y[(unsigned long)s * O + o] = total;\n\
 }\n\
 \n\
-/* ---------------- Q8_0 (34B/32v) — COALESCED, 1 block/simdgroup -----------\n\
+/* ---------------- Q8_0 (34B/32v)  COALESCED, 1 block/simdgroup -----------\n\
  * 32 lanes read 32 consecutive int8 qs bytes (one coalesced 32B load); each\n\
  * lane owns value `lane` of the block. d broadcast from L1. */\n\
 kernel void mm_q8_0(device const uint8_t* w [[buffer(0)]],\n\
@@ -212,7 +213,7 @@ kernel void mm_q8_0(device const uint8_t* w [[buffer(0)]],\n\
     if (tid == 0) y[(unsigned long)s * O + o] = total;\n\
 }\n\
 \n\
-/* ---------------- Q4_K (144B/256v) — COALESCED, 1 block/simdgroup ---------\n\
+/* ---------------- Q4_K (144B/256v)  COALESCED, 1 block/simdgroup ---------\n\
  * The dominant, hot type. One simdgroup (32 lanes) processes one block.\n\
  * Each lane reads qs[lane*4 .. lane*4+4) -> 4 bytes -> 8 nibbles -> 8 values,\n\
  * a single coalesced 128-byte read across the simdgroup for the whole qs[128].\n\
@@ -258,7 +259,7 @@ kernel void mm_q4_K(device const uint8_t* w [[buffer(0)]],\n\
     if (tid == 0) y[(unsigned long)s * O + o] = total;\n\
 }\n\
 \n\
-/* ---------------- Q5_K (176B/256v) — metadata cached + simd_sum -----------\n\
+/* ---------------- Q5_K (176B/256v)  metadata cached + simd_sum -----------\n\
  * block_q5_K: uint16 d, dm, scales[12], qh[32], qs[128]. 5th bit per value in qh. */\n\
 kernel void mm_q5_K(device const uint8_t* w [[buffer(0)]],\n\
                     device const float*   x [[buffer(1)]],\n\
@@ -296,8 +297,12 @@ kernel void mm_q5_K(device const uint8_t* w [[buffer(0)]],\n\
     if (tid == 0) y[(unsigned long)s * O + o] = total;\n\
 }\n\
 \n\
-/* ---------------- Q6_K (210B/256v) — metadata cached + simd_sum -----------\n\
- * block_q6_K: ql[128], qh[64], scales[16 int8], uint16 d (offset 208). */\n\
+/* ---------------- Q6_K (210B/256v)  COALESCED, 1 block/simdgroup ---------\n\
+ * One simdgroup (32 lanes) processes one 256-value block; each lane owns 8\n\
+ * values. ql[128] read in 4 coalesced 32B passes (lane t owns bytes t,32+t,\n\
+ * 64+t,96+t); qh[64] in 2 coalesced passes; scales read direct (cached).\n\
+ * Indexing derived from quant.c dequantize_row_q6_K; validated vs the CPU\n\
+ * reference by probes/metal_matmul_bench (4-11x faster than per-element). */\n\
 kernel void mm_q6_K(device const uint8_t* w [[buffer(0)]],\n\
                     device const float*   x [[buffer(1)]],\n\
                     device float*         y [[buffer(2)]],\n\
@@ -309,26 +314,30 @@ kernel void mm_q6_K(device const uint8_t* w [[buffer(0)]],\n\
     int o = (int)gp.x, s = (int)gp.y;\n\
     int nblocks = I / 256;\n\
     device const uint8_t* row = w + (unsigned long)o * (unsigned long)(nblocks * 210);\n\
+    uint warp = tid >> 5, lane = tid & 31;\n\
     float acc = 0.0f;\n\
-    for (int bi = (int)tid; bi < nblocks; bi += TPB) {\n\
+    for (int bi = (int)warp; bi < nblocks; bi += NW) {\n\
         device const uint8_t* blk = row + (unsigned long)(bi * 210);\n\
         float d = f16tof32((uint16_t)blk[208] | ((uint16_t)blk[209] << 8));\n\
         device const uint8_t* ql = blk;\n\
         device const uint8_t* qh = blk + 128;\n\
         device const int8_t*  sc = (device const int8_t*)(blk + 192);\n\
-        float ds[16];\n\
-        for (int i = 0; i < 16; i++) ds[i] = d * (float)sc[i];\n\
-        for (int j = 0; j < 256; j++) {\n\
-            int chunk = j / 128, within = j % 128;\n\
-            int sub = within / 32, l = within % 32;\n\
-            int ql_idx = (sub == 1 || sub == 3) ? (l + 32) : l;\n\
-            uint8_t qlb = ql[chunk * 64 + ql_idx];\n\
-            uint8_t qhb = qh[chunk * 32 + l];\n\
-            int qh_shift = (sub == 0) ? 0 : (sub == 1) ? 2 : (sub == 2) ? 4 : 6;\n\
-            int qraw = ((sub < 2) ? (int)(qlb & 0xF) : (int)(qlb >> 4))\n\
-                     | (int)(((qhb >> qh_shift) & 3) << 4);\n\
-            int sc_idx = chunk * 8 + l / 16 + 2 * sub;\n\
-            acc += x[(unsigned long)s * I + bi * 256 + j] * (ds[sc_idx] * (float)(qraw - 32));\n\
+        #pragma unroll\n\
+        for (int k = 0; k < 4; k++) {            /* 4 coalesced 32B ql reads */\n\
+            uint b   = (uint)(k * 32) + lane;     /* ql byte this lane owns   */\n\
+            uint chk = b >> 6;                     /* chunk = b/64            */\n\
+            uint grp = (b & 63) >> 5;             /* (b%64)/32               */\n\
+            uint l   = b & 31;                     /* b%32                    */\n\
+            uint qlb = ql[b];                      /* coalesced               */\n\
+            uint qhb = qh[chk * 32 + l];\n\
+            int qraw0 = (int)(qlb & 0xF) | (int)(((qhb >> (2u * grp)) & 3u) << 4);\n\
+            int si0   = (int)(chk * 8 + l / 16 + 2u * grp);\n\
+            uint j0   = chk * 128 + grp * 32 + l;\n\
+            acc += x[(unsigned long)s * I + (unsigned long)bi * 256 + j0] * (d * (float)sc[si0] * (float)(qraw0 - 32));\n\
+            int qraw1 = (int)(qlb >> 4) | (int)(((qhb >> (2u * (grp + 2u))) & 3u) << 4);\n\
+            int si1   = (int)(chk * 8 + l / 16 + 2u * (grp + 2u));\n\
+            uint j1   = chk * 128 + (grp + 2u) * 32 + l;\n\
+            acc += x[(unsigned long)s * I + (unsigned long)bi * 256 + j1] * (d * (float)sc[si1] * (float)(qraw1 - 32));\n\
         }\n\
     }\n\
     threadgroup float wb[NW];\n\
@@ -336,6 +345,90 @@ kernel void mm_q6_K(device const uint8_t* w [[buffer(0)]],\n\
     if (tid == 0) y[(unsigned long)s * O + o] = total;\n\
 }\n\
 \n\
+/* ---------------- Q4_K MULTI-OUTPUT GEMV (1 warp/output) --------------\n\
+ * grid=(O/8,S,1), TG=256 (8 warps). warp w computes output o=gp.x*8+w over\n\
+ * ALL blocks; simd_sum within the warp only (no cross-warp barrier/shared).\n\
+ * Validated vs CPU by probes/metal_matmul_bench; faster on medium/large O.\n\
+ * Host dispatches grid_x=(O+7)/8 for Q4_K/Q6_K (see launch_matmul). */\n\
+kernel void mm_q4_K_mo(device const uint8_t* w [[buffer(0)]],\n\
+                    device const float*   x [[buffer(1)]],\n\
+                    device float*         y [[buffer(2)]],\n\
+                    constant int& I [[buffer(3)]],\n\
+                    constant int& S [[buffer(4)]],\n\
+                    constant int& O [[buffer(5)]],\n\
+                    uint tid [[thread_index_in_threadgroup]],\n\
+                    uint2 gp [[threadgroup_position_in_grid]]) {\n\
+    int o = (int)gp.x * 8 + (int)(tid >> 5), s = (int)gp.y;\n\
+    if (o >= O) return;\n\
+    int nblocks = I / 256;\n\
+    device const uint8_t* row = w + (unsigned long)o * (unsigned long)(nblocks * 144);\n\
+    uint lane = tid & 31, g = lane / 8, within = (lane & 7) * 4;\n\
+    float acc = 0.0f;\n\
+    for (int bi = 0; bi < nblocks; bi++) {\n\
+        device const uint8_t* blk = row + (unsigned long)(bi * 144);\n\
+        float d    = f16tof32((uint16_t)blk[0] | ((uint16_t)blk[1] << 8));\n\
+        float dmin = f16tof32((uint16_t)blk[2] | ((uint16_t)blk[3] << 8));\n\
+        device const uint8_t* scales = blk + 4;\n\
+        device const uint8_t* qs     = blk + 16;\n\
+        float d_lo, m_lo, d_hi, m_hi;\n\
+        k4_unpack(scales, 2 * (int)g,     d_lo, m_lo, d, dmin);\n\
+        k4_unpack(scales, 2 * (int)g + 1, d_hi, m_hi, d, dmin);\n\
+        uint qw = *(device const uint*)(qs + lane * 4);\n\
+        uint base = (uint)(bi * 256) + g * 64 + within;\n\
+        for (int k = 0; k < 4; k++) {\n\
+            uint bv = (qw >> (k * 8)) & 0xFF;\n\
+            float lo = (float)(bv & 0xF);\n\
+            float hi = (float)(bv >> 4);\n\
+            acc += x[(unsigned long)s * I + base + k]      * (d_lo * lo - m_lo);\n\
+            acc += x[(unsigned long)s * I + base + k + 32] * (d_hi * hi - m_hi);\n\
+        }\n\
+    }\n\
+    float total = simd_sum(acc);\n\
+    if (lane == 0) y[(unsigned long)s * O + o] = total;\n\
+}\n\
+/* ---------------- Q6_K MULTI-OUTPUT GEMV (1 warp/output) --------------\n\
+ * grid=(O/8,S,1). warp w -> output o=gp.x*8+w over ALL blocks; simd_sum only.\n\
+ * Coalesced ql/qh reads as in mm_q6_K. Validated vs CPU; faster on large O. */\n\
+kernel void mm_q6_K_mo(device const uint8_t* w [[buffer(0)]],\n\
+                    device const float*   x [[buffer(1)]],\n\
+                    device float*         y [[buffer(2)]],\n\
+                    constant int& I [[buffer(3)]],\n\
+                    constant int& S [[buffer(4)]],\n\
+                    constant int& O [[buffer(5)]],\n\
+                    uint tid [[thread_index_in_threadgroup]],\n\
+                    uint2 gp [[threadgroup_position_in_grid]]) {\n\
+    int o = (int)gp.x * 8 + (int)(tid >> 5), s = (int)gp.y;\n\
+    if (o >= O) return;\n\
+    int nblocks = I / 256;\n\
+    device const uint8_t* row = w + (unsigned long)o * (unsigned long)(nblocks * 210);\n\
+    uint lane = tid & 31;\n\
+    float acc = 0.0f;\n\
+    for (int bi = 0; bi < nblocks; bi++) {\n\
+        device const uint8_t* blk = row + (unsigned long)(bi * 210);\n\
+        float d = f16tof32((uint16_t)blk[208] | ((uint16_t)blk[209] << 8));\n\
+        device const uint8_t* ql = blk;\n\
+        device const uint8_t* qh = blk + 128;\n\
+        device const int8_t*  sc = (device const int8_t*)(blk + 192);\n\
+        for (int k = 0; k < 4; k++) {\n\
+            uint b   = (uint)(k * 32) + lane;\n\
+            uint chk = b >> 6;\n\
+            uint grp = (b & 63) >> 5;\n\
+            uint l   = b & 31;\n\
+            uint qlb = ql[b];\n\
+            uint qhb = qh[chk * 32 + l];\n\
+            int qraw0 = (int)(qlb & 0xF) | (int)(((qhb >> (2u * grp)) & 3u) << 4);\n\
+            int si0   = (int)(chk * 8 + l / 16 + 2u * grp);\n\
+            uint j0   = chk * 128 + grp * 32 + l;\n\
+            acc += x[(unsigned long)s * I + (unsigned long)bi * 256 + j0] * (d * (float)sc[si0] * (float)(qraw0 - 32));\n\
+            int qraw1 = (int)(qlb >> 4) | (int)(((qhb >> (2u * (grp + 2u))) & 3u) << 4);\n\
+            int si1   = (int)(chk * 8 + l / 16 + 2u * (grp + 2u));\n\
+            uint j1   = chk * 128 + (grp + 2u) * 32 + l;\n\
+            acc += x[(unsigned long)s * I + (unsigned long)bi * 256 + j1] * (d * (float)sc[si1] * (float)(qraw1 - 32));\n\
+        }\n\
+    }\n\
+    float total = simd_sum(acc);\n\
+    if (lane == 0) y[(unsigned long)s * O + o] = total;\n\
+}\n\
 /* ---------------- silu_mul elementwise: gate[i] = silu(gate[i]) * up[i] --- */\n\
 kernel void silu_mul(device float*       gate [[buffer(0)]],\n\
                      device const float* up   [[buffer(1)]],\n\
@@ -357,7 +450,8 @@ static id<MTLDevice>            g_device  = nil;
 static id<MTLCommandQueue>       g_queue   = nil;
 static id<MTLLibrary>            g_library = nil;
 static id<MTLComputePipelineState> g_ps_f32, g_ps_f16, g_ps_q4_0, g_ps_q8_0,
-                                  g_ps_q4_K, g_ps_q5_K, g_ps_q6_K, g_ps_silu;
+                                  g_ps_q4_K, g_ps_q5_K, g_ps_q6_K, g_ps_silu,
+                                  g_ps_q4_K_mo, g_ps_q6_K_mo;
 static int g_ndev = 0;
 
 // Grow-only scratch buffers (mirror CUDA's reserve()). Shared storage mode =
@@ -371,9 +465,9 @@ static id<MTLComputePipelineState> ps_for_qtype(gguf_type_t q) {
         case GGUF_TYPE_F16:  return g_ps_f16;
         case GGUF_TYPE_Q4_0: return g_ps_q4_0;
         case GGUF_TYPE_Q8_0: return g_ps_q8_0;
-        case GGUF_TYPE_Q4_K: return g_ps_q4_K;
+        case GGUF_TYPE_Q4_K: return g_ps_q4_K_mo;
         case GGUF_TYPE_Q5_K: return g_ps_q5_K;
-        case GGUF_TYPE_Q6_K: return g_ps_q6_K;
+        case GGUF_TYPE_Q6_K: return g_ps_q6_K_mo;
         default:             return nil;   /* unsupported -> caller falls back to CPU */
     }
 }
@@ -438,8 +532,10 @@ int picolm_gpu_init(const int *devices, int count) {
     g_ps_q4_K = [g_device newComputePipelineStateWithFunction:[g_library newFunctionWithName:@"mm_q4_K"] error:nil];
     g_ps_q5_K = [g_device newComputePipelineStateWithFunction:[g_library newFunctionWithName:@"mm_q5_K"] error:nil];
     g_ps_q6_K = [g_device newComputePipelineStateWithFunction:[g_library newFunctionWithName:@"mm_q6_K"] error:nil];
+    g_ps_q4_K_mo = [g_device newComputePipelineStateWithFunction:[g_library newFunctionWithName:@"mm_q4_K_mo"] error:nil];
+    g_ps_q6_K_mo = [g_device newComputePipelineStateWithFunction:[g_library newFunctionWithName:@"mm_q6_K_mo"] error:nil];
     g_ps_silu = [g_device newComputePipelineStateWithFunction:[g_library newFunctionWithName:@"silu_mul"] error:nil];
-    if (!g_ps_f32 || !g_ps_f16 || !g_ps_q4_0 || !g_ps_q8_0 || !g_ps_q4_K || !g_ps_q5_K || !g_ps_q6_K || !g_ps_silu) {
+    if (!g_ps_f32 || !g_ps_f16 || !g_ps_q4_0 || !g_ps_q8_0 || !g_ps_q4_K || !g_ps_q5_K || !g_ps_q6_K || !g_ps_q4_K_mo || !g_ps_q6_K_mo || !g_ps_silu) {
         fprintf(stderr, "[Metal] pipeline state creation failed\n");
         g_device = nil; g_queue = nil; g_library = nil; return 0;
     }
@@ -479,7 +575,11 @@ struct picolm_gpu_tensor {
     int zero_copy;
 };
 
-int picolm_gpu_tensor_upload(picolm_gpu_tensor_t **tensor,
+// NOTE: param is `void**` (not picolm_gpu_tensor_t**) to match the extern "C"
+// declaration in backend_gpu.h. A T** definition against a void** decl does
+// NOT match in C++ -> it would emit a mangled symbol and fail to link against
+// model.o (compiled as C, which references the unmangled name). Verified.
+int picolm_gpu_tensor_upload(void **tensor,
                               const void *weights,
                               gguf_type_t qtype, int I, int O, int device) {
     if (!tensor || !weights || I < 1 || O < 1 || device != 0 || !g_device) return 0;
@@ -502,7 +602,7 @@ int picolm_gpu_tensor_upload(picolm_gpu_tensor_t **tensor,
      * DOWN the pointer and UP the length, register the aligned region, and
      * bind the tensor at its offset within that region. This makes almost every
      * tensor zero-copy with no per-tensor copy and no extra RAM. (If Metal
-     * rejects the region — e.g. some overlap cases — we fall back to copy.) */
+     * rejects the region  e.g. some overlap cases  we fall back to copy.) */
     size_t page = (size_t)getpagesize();
     uintptr_t addr = (uintptr_t)weights;
     uintptr_t base_addr = addr & ~(uintptr_t)(page - 1);   /* round down to page */
@@ -581,7 +681,9 @@ static int launch_matmul(picolm_gpu_tensor_t *t, id<MTLBuffer> xbuf, id<MTLBuffe
     [enc setBytes:&cI length:sizeof(cI) atIndex:3];
     [enc setBytes:&cS length:sizeof(cS) atIndex:4];
     [enc setBytes:&cO length:sizeof(cO) atIndex:5];
-    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)O, (NSUInteger)S, 1)
+    NSUInteger gx = (t->qtype == GGUF_TYPE_Q4_K || t->qtype == GGUF_TYPE_Q6_K)
+                      ? (NSUInteger)((O + 7) / 8) : (NSUInteger)O;
+    [enc dispatchThreadgroups:MTLSizeMake(gx, (NSUInteger)S, 1)
         threadsPerThreadgroup:MTLSizeMake(TPB, 1, 1)];
     [enc endEncoding];
     return 1;
@@ -656,6 +758,47 @@ int picolm_gpu_w4a16_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
                           picolm_gpu_tensor_t *down, float *y, const float *x, int S) {
     (void)gate; (void)up; (void)down; (void)y; (void)x; (void)S;
     return 0;
+}
+
+// The three entry points below are referenced by the host under -DPICOLM_GPU=1
+// (tensor.c picolm_gpu_w4a16_matmul; model.c ssm_vecdot/ssm_recurrence) but are
+// not implemented for Metal in v1. Returning 0 makes the caller fall back to
+// the CPU (quant_matmul / SSM) path, which is correct. These stubs are required
+// for `make metal` to link against the current host code (which gained these
+// GPU hooks after the Metal backend was first written). Verified needed via:
+//   cc -DPICOLM_GPU=1 -c model.c tensor.c && nm -u *.o | grep picolm_gpu
+int picolm_gpu_w4a16_matmul(picolm_gpu_tensor_t *t,
+                             float *y, const float *x, int S, int device) {
+    (void)t; (void)y; (void)x; (void)S; (void)device;
+    return 0;   /* CPU fallback (WMMA Tensor Core path not exposed on Apple GPUs yet) */
+}
+
+int picolm_gpu_ssm_vecdot(float *out,
+                           const float *x,
+                           const void *weights,
+                           gguf_type_t qtype,
+                           int dim, int n_v_heads,
+                           int row_bytes,
+                           const int *head_map,
+                           int device) {
+    (void)out; (void)x; (void)weights; (void)qtype; (void)dim;
+    (void)n_v_heads; (void)row_bytes; (void)head_map; (void)device;
+    return 0;   /* CPU fallback (SSM alpha/beta vec_dot) */
+}
+
+int picolm_gpu_ssm_recurrence(float *state,
+                               const float *q_conv,
+                               const float *k_conv,
+                               const float *v_conv,
+                               const float *gate_exp,
+                               const float *beta,
+                               float *ssm_output,
+                               int n_v_heads, int d_state,
+                               int repeat, int device) {
+    (void)state; (void)q_conv; (void)k_conv; (void)v_conv; (void)gate_exp;
+    (void)beta; (void)ssm_output; (void)n_v_heads; (void)d_state;
+    (void)repeat; (void)device;
+    return 0;   /* CPU fallback (per-head SSM recurrence) */
 }
 
 }  // extern "C"
