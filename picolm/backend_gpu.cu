@@ -481,6 +481,8 @@ picolm_ssm_vecdot_kernel(float *out,
         }
         break;
     }
+    default:
+        break;
     }
     /* Tree reduce */
     float local = (float)sum;

@@ -169,7 +169,7 @@ hip: backend_gpu.o.hip gpu-clean-objs
 	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -DPICOLM_GPU=1" GPU_OBJS="backend_gpu.o.hip" GPU_LIBS="-L$(ROCM_LIB) -lamdhip64 -lstdc++ -Wl,-rpath,$(ROCM_LIB)"
 
 backend_gpu.o.hip: backend_gpu.cu backend_gpu.h quant.h
-	$(HIPCC) $(HIPFLAGS) --amdgpu-target=$(HIP_ARCH) -DPICOLM_GPU=1 -c -o $@ $< -I.
+	$(HIPCC) $(HIPFLAGS) --offload-arch=$(HIP_ARCH) -DPICOLM_GPU=1 -c -o $@ $< -I.
 
 # --- CUDA (NVIDIA) GPU backend ---
 NVCC      ?= nvcc
