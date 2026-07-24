@@ -5,9 +5,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
 #include <unistd.h>
-#ifndef __WIN32
-#  include <sys/mman.h>
+#include <sys/mman.h>
+#else
+#include <io.h>
+#define F_OK 0
+#define access _access
 #endif
 
 #include "model.h"
@@ -105,7 +109,7 @@ static int load_config_safetensors(const char *model_dir, model_config_t *cfg) {
             fseek(cf, 0, SEEK_SET);
             char *cbuf = malloc(csz + 1);
             if (cbuf) {
-                { __attribute__((unused)) size_t _r = fread(cbuf, 1, csz, cf); }
+                { size_t _r = fread(cbuf, 1, csz, cf); (void)_r; }
                 cbuf[csz] = '\0';
                 /* Try rope_parameters block first (Qwen3.5), then top-level */
                 char *rp = strstr(cbuf, "\"rope_parameters\"");
@@ -308,7 +312,7 @@ static int load_tokenizer_safetensors(const char *model_dir, model_t *m) {
         fseek(cf, 0, SEEK_SET);
         char *cb = malloc(csz + 1);
         if (cb) {
-            { __attribute__((unused)) size_t _r = fread(cb, 1, csz, cf); }
+            { size_t _r = fread(cb, 1, csz, cf); (void)_r; }
             cb[csz] = '\0';
             cJSON *cr = cJSON_ParseWithLength(cb, (size_t)csz);
             if (cr) {
@@ -333,7 +337,7 @@ static int load_tokenizer_safetensors(const char *model_dir, model_t *m) {
         fseek(tf, 0, SEEK_SET);
         char *tb = malloc(tsz + 1);
         if (tb) {
-            { __attribute__((unused)) size_t _r = fread(tb, 1, tsz, tf); }
+            { size_t _r = fread(tb, 1, tsz, tf); (void)_r; }
             tb[tsz] = '\0';
             char *p = strstr(tb, "\"model_type\"");
             if (p) {
@@ -359,7 +363,7 @@ static int load_tokenizer_safetensors(const char *model_dir, model_t *m) {
     fseek(f, 0, SEEK_SET);
     char *vbuf = malloc(vsz + 1);
     if (!vbuf) { fclose(f); return -1; }
-    { __attribute__((unused)) size_t _r = fread(vbuf, 1, vsz, f); }
+    { size_t _r = fread(vbuf, 1, vsz, f); (void)_r; }
     vbuf[vsz] = '\0';
     fclose(f);
 

@@ -9,6 +9,10 @@ picolm
 picolm.exe
 backend_gpu.o.hip
 backend_gpu.o.cuda
+backend_gpu_cuda_win.obj
 backend_metal.o
+picolm.exp
+picolm.lib
+.hunger_build.bat
 probes/metal_reduction_probe
 probes/metal_matmul_bench

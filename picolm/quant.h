@@ -79,9 +79,10 @@ static inline void f32x4_to_fp16_hw(uint16_t *p, float32x4_t v) {
 #endif
 
 /* --- x86 SIMD: detect highest level, then propagate downward --- */
-
-/* AVX512 implies AVX2 + AVX + SSE3 + SSE2 */
-#if defined(__AVX512F__)
+/* Never enable x86 SIMD intrinsics in CUDA/HIP device code */
+#if !defined(__CUDACC__) && !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_VERSION__)
+/* MSVC: /arch:AVX512 defines __AVX512F__ on VS2019+ but also __AVX512__ on some versions */
+#if defined(__AVX512F__) || (defined(_MSC_VER) && defined(__AVX512__))
 #  define PICOLM_AVX512 1
 /* VNNI with 256-bit (VL) enables dpbssd/dpbusd int8 MAC instructions */
 #  if defined(__AVX512VNNI__) && defined(__AVX512VL__)
@@ -91,7 +92,7 @@ static inline void f32x4_to_fp16_hw(uint16_t *p, float32x4_t v) {
 #  define PICOLM_AVX    1
 #  define PICOLM_SSE3   1
 #  define PICOLM_SSE2   1
-/* AVX2 implies AVX + SSE3 + SSE2 */
+/* MSVC: /arch:AVX2 defines __AVX2__ */
 #elif defined(__AVX2__)
 #  define PICOLM_AVX2 1
 #  define PICOLM_AVX  1
@@ -115,6 +116,7 @@ static inline void f32x4_to_fp16_hw(uint16_t *p, float32x4_t v) {
 #elif defined(__SSE2__) || (defined(_MSC_VER) && (defined(_M_X64) || defined(_M_AMD64)))
 #  define PICOLM_SSE2 1
 #endif
+#endif /* !__CUDA__ && !__HIP__ */
 
 /* PPC Altivec (VMX) - separate from x86 chain */
 #if defined(__ALTIVEC__)
@@ -129,7 +131,10 @@ static inline void f32x4_to_fp16_hw(uint16_t *p, float32x4_t v) {
  * <immintrin.h> is the modern umbrella header (GCC 4.7+).
  * Older compilers (e.g. GCC 4.2 on Mac OS X 10.6) need individual headers. */
 #ifdef PICOLM_SSE2
-#  if __GNUC__ < 4 || (__GNUC__ == 4 && __GNUC_MINOR__ < 7)
+#  ifdef _MSC_VER
+#    include <intrin.h>  /* MSVC: provides __m128, __m256, __m512 built-in types + intrinsics */
+#    include <immintrin.h>
+#  elif __GNUC__ < 4 || (__GNUC__ == 4 && __GNUC_MINOR__ < 7)
 #    include <xmmintrin.h>  /* SSE/SSE2 */
 #    include <emmintrin.h>  /* SSE3 */
 #    ifdef __SSSE3__

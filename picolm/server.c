@@ -31,7 +31,9 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <errno.h>
+#ifdef _MSC_VER
 #pragma comment(lib, "ws2_32.lib")
+#endif
 typedef int socklen_t;
 #define SHUT_RD SD_RECEIVE
 #define SHUT_WR SD_SEND
@@ -1698,7 +1700,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
     if (n_predict <= 0 && !prompt_only) n_predict = 32;
 
     /* Random seed */
-    if (seed < 0) seed = (uint64_t)(time(NULL) ^ (uint64_t)((long)&seed));
+    if (seed < 0) seed = (uint64_t)(time(NULL) ^ (uint64_t)(uintptr_t)&seed);
 
     sampler_t sampler;
     sampler_init(&sampler, temperature, top_p, (uint64_t)seed);

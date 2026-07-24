@@ -248,4 +248,66 @@ metal-bench-run: metal-bench
 .PHONY: metal-model-bench
 metal-model-bench:
 	./probes/metal_model_bench.sh
-.PHONY: hip cuda metal
+.PHONY: hip cuda metal hunger
+
+# --- hunger: CUDA build for Windows 11 (MSYS2 + MSVC + CUDA 12.4) ---
+# Target box: Windows 11, MSYS2 make, VS2022 Community on D:, CUDA on C:
+# Paths gleaned from /data4/build-lcpp (VCP environment from that box).
+#
+#   make hunger
+#
+# Produces: picolm.exe with CUDA GPU support.
+# Run with: set PICOLM_GPU=1 & picolm.exe <model.gguf> -p "hello"
+
+HUNGER_CUDA_ROOT  ?= C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4
+HUNGER_CUDA_ARCH  ?= sm_89
+HUNGER_VS_ROOT    ?= D:/Program Files/Microsoft Visual Studio/2022/Community
+HUNGER_MSVC_VER   ?= 14.44.35207
+
+# Compile as C. The /c flag is implicit when no /Fe or /LD is given.
+# All .obj files go to the linker, never to cl.exe.
+HUNGER_CL_DIR = $(HUNGER_VS_ROOT)/VC/Tools/MSVC/$(HUNGER_MSVC_VER)/bin/Hostx64/x64
+HUNGER_CL = "$(HUNGER_CL_DIR)/cl.exe"
+HUNGER_LNK = "$(HUNGER_CL_DIR)/link.exe"
+HUNGER_CFILES = picolm.c model.c tensor.c quant.c tokenizer.c qwen_tokenize.c sampler.c grammar.c cJSON.c server.c csafetensors.c json.c safetensors.c
+HUNGER_COBJS = $(HUNGER_CFILES:.c=.obj)
+# cl.exe flags - all Make vars, NO batch %VAR% references
+HUNGER_CF = /O2 /W3 /wd4996 /arch:AVX512 /D PICOLM_GPU=1 /D _CRT_SECURE_NO_WARNINGS /I. /openmp /c
+
+hunger:
+	echo @echo off > .hunger_build.bat
+	echo del /q picolm.exe backend_gpu_cuda_win.obj $(HUNGER_COBJS) 2^>nul >> .hunger_build.bat
+	echo call "$(HUNGER_VS_ROOT)/VC/Auxiliary/Build/vcvars64.bat" >> .hunger_build.bat
+	echo "$(HUNGER_CUDA_ROOT)/bin/nvcc.exe" -O3 -std=c++14 -DPICOLM_GPU=1 -ccbin $(HUNGER_CL) -Xcompiler "/EHsc /O2 /W3 /std:c++14 /arch:AVX512" -gencode arch=compute_89,code=$(HUNGER_CUDA_ARCH) -c -o backend_gpu_cuda_win.obj backend_gpu.cu -I. >> .hunger_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF) picolm.c >> .hunger_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF) model.c >> .hunger_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF) tensor.c >> .hunger_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF) quant.c >> .hunger_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF) tokenizer.c >> .hunger_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF) qwen_tokenize.c >> .hunger_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF) sampler.c >> .hunger_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF) grammar.c >> .hunger_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF) cJSON.c >> .hunger_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF) server.c >> .hunger_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF) csafetensors.c >> .hunger_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF) json.c >> .hunger_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF) safetensors.c >> .hunger_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
+	echo $(HUNGER_LNK) /OUT:picolm.exe $(HUNGER_COBJS) backend_gpu_cuda_win.obj "$(HUNGER_CUDA_ROOT)/lib/x64/cudart.lib" ws2_32.lib advapi32.lib >> .hunger_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
+	echo del /q backend_gpu_cuda_win.obj 2^>nul >> .hunger_build.bat
+	echo del .hunger_build.bat >> .hunger_build.bat
+	cmd /c .hunger_build.bat

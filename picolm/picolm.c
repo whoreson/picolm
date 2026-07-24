@@ -15,6 +15,9 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <time.h>
+#ifndef strdup
+#define strdup _strdup
+#endif
 double get_time_ms(void) {
     LARGE_INTEGER freq, count;
     QueryPerformanceFrequency(&freq);
@@ -157,7 +160,9 @@ int main(int argc, char **argv) {
     kv_cache_type_t kv_type_v = KV_CACHE_F16;
     int    mem_mb = 0;      /* --mem budget in megabytes (0=disabled) */
     int    do_prefault = 0; /* --prefault (touch all mmap pages at load time) */
+    #ifndef _WIN32
     int    server_daemon = 0;
+#endif
     int    server_mode = 0;
     int    server_port = 8080;
     char   server_host[256] = "0.0.0.0";
@@ -190,8 +195,10 @@ int main(int argc, char **argv) {
             context_override = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-j") == 0 && i + 1 < argc) {
             num_threads = atoi(argv[++i]);
+        #ifndef _WIN32
         } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--daemon") == 0) {
             server_daemon = 1;
+#endif
         } else if (strcmp(argv[i], "--server") == 0 && i + 1 < argc) {
             server_mode = 1;
             model_path = argv[++i];

@@ -37,7 +37,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <synchapi.h>
+#else
 #include <pthread.h>
+#endif
 
 /* ---- Platform abstraction ---- */
 
@@ -141,6 +148,13 @@ typedef hipEvent_t gpuEvent_t;
 #define gpuCudaMemAdviseSetPreferredLocation cudaMemAdviseSetPreferredLocation
 #endif
 
+/* Cross-platform unused attribute */
+#ifdef _WIN32
+#define PICOLM_UNUSED
+#else
+#define PICOLM_UNUSED __attribute__((unused))
+#endif
+
 /* ---- Device-side FP16 helpers ---- */
 
 #ifdef __HIP_PLATFORM_AMD__
@@ -165,7 +179,7 @@ __host__ __device__ static inline uint16_t gpu_fp32_to_fp16(float f) {
 __host__ __device__ static inline float gpu_fp16_to_fp32(unsigned short h) {
     return __half2float(__ushort_as_half(h));
 }
-__host__ __device__ __attribute__((unused)) static inline unsigned short gpu_fp32_to_fp16(float f) {
+__host__ __device__ PICOLM_UNUSED static inline unsigned short gpu_fp32_to_fp16(float f) {
     return __half_as_ushort(__float2half(f));
 }
 #endif
@@ -298,7 +312,7 @@ __device__ static inline float dequant_q4_K(const void *blk, int i) {
  * Each thread computes y[s*O + o] = sum_i x[s*I + i] * W[o][i]
  */
 
-extern "C" __global__ void
+__global__ void
 picolm_quant_matmul(float *y, const float *x, const void *weights,
                     gguf_type_t qtype, int S, int I, int O, int row_bytes) {
     /* bytes_per_block: stride between consecutive blocks in memory */
@@ -424,7 +438,7 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
 
 /* ---- silu_mul kernel ----
  * Element-wise: gate[i] = gate[i] / (1 + exp(-gate[i])) * up[i] */
-extern "C" __global__ void
+__global__ void
 picolm_silu_mul(float *gate, const float *up, size_t n) {
     size_t i = (size_t)gpuBlockIdx_x * gpuBlockDim_x + gpuThreadIdx_x;
     if (i < n) {
@@ -436,7 +450,7 @@ picolm_silu_mul(float *gate, const float *up, size_t n) {
 /* ---- SSM alpha/beta batched vec_dot kernel ----
  * Each thread block handles one head, 256 threads process dim elements.
  * Weights: column-major [dim, n_heads], each column is a quantized row. */
-extern "C" __global__ void
+__global__ void
 picolm_ssm_vecdot_kernel(float *out,
                           const float *x,
                           const void *weights,
@@ -509,7 +523,7 @@ picolm_ssm_vecdot_kernel(float *out,
  * 4. state += k * d^T (outer product)
  * 5. output = state @ q (matrix-vector), written dim-major
  */
-extern "C" __global__ void
+__global__ void
 picolm_ssm_recurrence_kernel(float *state,
                               const float *q_conv,
                               const float *k_conv,
@@ -611,15 +625,13 @@ picolm_ssm_recurrence_kernel(float *state,
 #define PICOLM_GPU_WMMA_AVAILABLE 1
 #endif
 
-/* Forward declarations for host compilation (extern "C" stubs only, no body) */
+/* Forward declarations for host compilation (stubs only, no body) */
 #ifndef PICOLM_GPU_WMMA_AVAILABLE
-extern "C" {
 __global__ void picolm_w4a16_matmul(float *y, const float *x, const void *weights,
                                      int M, int K, int N, int block_size);
 __global__ void picolm_w4a16_gate_up(float *gate, float *up, const float *x,
                                       const void *gate_weights, const void *up_weights,
                                       int M, int K, int N, int block_size);
-}
 #endif
 
 #ifdef PICOLM_GPU_WMMA_AVAILABLE
@@ -644,7 +656,7 @@ __device__ static inline half dequant_q4_0_elem_fp16(const void *blk, int j) {
 #endif
 }
 
-extern "C" __global__ void
+__global__ void
 picolm_w4a16_matmul(float *y, const float *x, const void *weights,
                      int M, int K, int N, int block_size) {
     int warp = gpuThreadIdx_x >> 5;
@@ -719,7 +731,7 @@ picolm_w4a16_matmul(float *y, const float *x, const void *weights,
 
 /* ---- w4a16_gate_up kernel (fused gate+up) ---- */
 
-extern "C" __global__ void
+__global__ void
 picolm_w4a16_gate_up(float *gate, float *up, const float *x,
                       const void *gw, const void *uw,
                       int M, int K, int N, int block_size) {
@@ -824,7 +836,11 @@ static int g_nctx;
 
 /* Mutex protecting g_gpu_ctx scratch buffer resize (reserve/reserve_pinned).
  * Resize is rare (once per buffer growth), so lock contention is negligible. */
+#ifdef _WIN32
+static SRWLOCK g_resize_mutex = SRWLOCK_INIT;
+#else
 static pthread_mutex_t g_resize_mutex = PTHREAD_MUTEX_INITIALIZER;
+#endif
 
 static int gpu_ok(gpuError_t err, const char *what) {
     if (err == gpuSuccess) return 1;
@@ -839,7 +855,11 @@ static gpu_device_ctx_t *find_ctx(int device) {
 }
 
 /* Thread-local device cache: avoid redundant cudaSetDevice/hipSetDevice calls */
+#ifdef _WIN32
+static __declspec(thread) int g_current_device = -1;
+#else
 static __thread int g_current_device = -1;
+#endif
 
 static int select_ctx(gpu_device_ctx_t *ctx) {
     if (!ctx) return 0;
@@ -849,9 +869,24 @@ static int select_ctx(gpu_device_ctx_t *ctx) {
     return 1;
 }
 
-static int reserve(float **ptr, size_t *cap, size_t bytes) {
+static __host__ void gpu_mutex_lock(void) {
+#ifdef _WIN32
+    AcquireSRWLockExclusive(&g_resize_mutex);
+#else
     pthread_mutex_lock(&g_resize_mutex);
-    if (*cap >= bytes) { pthread_mutex_unlock(&g_resize_mutex); return 1; }
+#endif
+}
+static __host__ void gpu_mutex_unlock(void) {
+#ifdef _WIN32
+    ReleaseSRWLockExclusive(&g_resize_mutex);
+#else
+    pthread_mutex_unlock(&g_resize_mutex);
+#endif
+}
+
+static int reserve(float **ptr, size_t *cap, size_t bytes) {
+    gpu_mutex_lock();
+    if (*cap >= bytes) { gpu_mutex_unlock(); return 1; }
     if (*ptr) gpuFree(*ptr);
     *ptr = NULL; *cap = 0;
     /* Use device memory for scratch buffers.
@@ -863,25 +898,25 @@ static int reserve(float **ptr, size_t *cap, size_t bytes) {
      * kernel launches. */
     gpuError_t err = gpuMalloc(ptr, bytes);
     if (!gpu_ok(err, "scratch allocation")) {
-        pthread_mutex_unlock(&g_resize_mutex);
+        gpu_mutex_unlock();
         return 0;
     }
     *cap = bytes;
-    pthread_mutex_unlock(&g_resize_mutex);
+    gpu_mutex_unlock();
     return 1;
 }
 
-static __attribute__((unused)) int reserve_pinned(float **ptr, size_t *cap, size_t bytes) {
-    pthread_mutex_lock(&g_resize_mutex);
-    if (*cap >= bytes) { pthread_mutex_unlock(&g_resize_mutex); return 1; }
+static PICOLM_UNUSED int reserve_pinned(float **ptr, size_t *cap, size_t bytes) {
+    gpu_mutex_lock();
+    if (*cap >= bytes) { gpu_mutex_unlock(); return 1; }
     if (*ptr) gpuFreeHost(*ptr);
     *ptr = NULL; *cap = 0;
     if (!gpu_ok(gpuMallocHost(ptr, bytes), "pinned staging allocation")) {
-        pthread_mutex_unlock(&g_resize_mutex);
+        gpu_mutex_unlock();
         return 0;
     }
     *cap = bytes;
-    pthread_mutex_unlock(&g_resize_mutex);
+    gpu_mutex_unlock();
     return 1;
 }
 
@@ -950,7 +985,7 @@ void picolm_gpu_shutdown(void) {
 }
 
 /* Detect if we're on a unified memory SoC (Grace-Blackwell, Apple Silicon, etc.) */
-static __attribute__((unused)) int is_unified_memory(void) {
+static PICOLM_UNUSED int is_unified_memory(void) {
 #ifdef __HIP__
     return 0; /* HIP: treat as discrete GPU (conservative) */
 #else

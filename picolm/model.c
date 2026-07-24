@@ -2733,7 +2733,7 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     {
         gguf_type_t alpha_type = lw->type_ssm_alpha;
         size_t row_bytes = gguf_type_row_size(alpha_type, dim);
-        int alpha_map[n_v_heads];
+        int *alpha_map = (int *)malloc((size_t)n_v_heads * sizeof(int));
         for (int h = 0; h < n_v_heads; h++) alpha_map[h] = do_remap ? qwen35_vhead_gguf(h, n_vpk, n_k) : h;
 #ifdef PICOLM_GPU
         if (gpu_lw && (alpha_type == GGUF_TYPE_Q4_0 || alpha_type == GGUF_TYPE_Q8_0) &&
@@ -2753,6 +2753,7 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
                 alpha_out[h] = sum + s->ssm_dt_w[il][h];
             }
         }
+        free(alpha_map);
     }
 #ifdef DEBUG_SSM
     if (il == 0 && pos == 0) dbg_vec("alpha[:8]", alpha_out, n_v_heads, 8);
@@ -2775,7 +2776,7 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     {
         gguf_type_t beta_type = lw->type_ssm_beta;
         size_t row_bytes = gguf_type_row_size(beta_type, dim);
-        int beta_map[n_v_heads];
+        int *beta_map = (int *)malloc((size_t)n_v_heads * sizeof(int));
         for (int h = 0; h < n_v_heads; h++) beta_map[h] = do_remap ? qwen35_vhead_gguf(h, n_vpk, n_k) : h;
 #ifdef PICOLM_GPU
         if (gpu_lw && (beta_type == GGUF_TYPE_Q4_0 || beta_type == GGUF_TYPE_Q8_0) &&
@@ -2795,6 +2796,7 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
                 beta[h] = 1.0f / (1.0f + expf(-sum));
             }
         }
+        free(beta_map);
     }
     if (xb_q8 != (void *)xb_q8_stack) free(xb_q8);
     if (xb_q8_d != xb_q8_d_stack) free(xb_q8_d);
@@ -3786,6 +3788,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
                               layer_weights_t *lw, int l,
                               int n_tokens, int start_pos, int xb2_stride,
                               void **gpu_lw) {
+    int bi;
     (void)start_pos;
     (void)gpu_lw;
     (void)xb_batch; /* not used: SSM layer uses local ssm_xb buffer */
@@ -3826,7 +3829,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-    for (int bi = 0; bi < n_tokens; bi++)
+    for (bi = 0; bi < n_tokens; bi++)
         rmsnorm(ssm_xb + bi * dim, x_batch + bi * dim, s->attn_norm_w[l], dim, eps);
 
     /* 2. Batched QKV projection (read from ssm_xb with stride dim) */
@@ -3857,7 +3860,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-        for (int bi = 0; bi < n_tokens; bi++) {
+        for (bi = 0; bi < n_tokens; bi++) {
             float *zb = z_batch + bi * value_dim;
             float *zt = alloca(value_dim * sizeof(float));
             memcpy(zt, zb, value_dim * sizeof(float));
@@ -3892,7 +3895,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-        for (int bi = 0; bi < n_tokens; bi++) {
+        for (bi = 0; bi < n_tokens; bi++) {
             float *conv = conv_batch + bi * conv_dim;
             float *vt = alloca(value_dim * sizeof(float));
             memcpy(vt, conv + 2*qk_dim, value_dim * sizeof(float));
@@ -3906,7 +3909,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-    for (int bi = 0; bi < n_tokens; bi++) {
+    for (bi = 0; bi < n_tokens; bi++) {
         float *conv = conv_batch + bi * conv_dim;
         float *q = conv;
         float *k = conv + qk_dim;
@@ -3940,7 +3943,8 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
         size_t row_bytes_beta = gguf_type_row_size(beta_type, dim);
 
         /* Precompute head maps */
-        int alpha_map[n_v_heads], beta_map[n_v_heads];
+        int *alpha_map = (int *)malloc((size_t)n_v_heads * sizeof(int));
+        int *beta_map = (int *)malloc((size_t)n_v_heads * sizeof(int));
         for (int h = 0; h < n_v_heads; h++) {
             alpha_map[h] = do_remap ? qwen35_vhead_gguf(h, n_vpk, n_k) : h;
             beta_map[h] = do_remap ? qwen35_vhead_gguf(h, n_vpk, n_k) : h;
@@ -3953,7 +3957,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-        for (int bi = 0; bi < n_tokens; bi++) {
+        for (bi = 0; bi < n_tokens; bi++) {
             quantize_row_q8_0(ssm_xb + bi * dim, xb_q8_batch + bi * nb_xb * 34, dim);
             const block_q8_0 *xqb = (const block_q8_0 *)(xb_q8_batch + bi * nb_xb * 34);
             for (int k = 0; k < nb_xb; k++) {
@@ -3965,7 +3969,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-        for (int bi = 0; bi < n_tokens; bi++) {
+        for (bi = 0; bi < n_tokens; bi++) {
             const void *xb_q8 = (const void *)(xb_q8_batch + bi * nb_xb * 34);
             const float *xb_q8_d = xb_q8_d_batch + bi * nb_xb;
             float *al = alpha_batch + bi * n_v_heads;
@@ -3994,12 +3998,14 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
         }
         free(xb_q8_batch);
         free(xb_q8_d_batch);
+        free(alpha_map);
+        free(beta_map);
 
         /* Post-process: alpha -> softplus -> gate -> exp; beta -> sigmoid */
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-        for (int bi = 0; bi < n_tokens; bi++) {
+        for (bi = 0; bi < n_tokens; bi++) {
             float *al = alpha_batch + bi * n_v_heads;
             float *bt = beta_batch + bi * n_v_heads;
             for (int h = 0; h < n_v_heads; h++) {
@@ -4056,7 +4062,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-    for (int bi = 0; bi < n_tokens; bi++) {
+    for (bi = 0; bi < n_tokens; bi++) {
         float *ssm_out = xb2_batch + bi * value_dim;
         float *z = z_batch + bi * value_dim;
         float *norm_w = s->ssm_norm_w[l];
@@ -4104,7 +4110,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-        for (int bi = 0; bi < n_tokens; bi++)
+        for (bi = 0; bi < n_tokens; bi++)
             memcpy(xb2_batch + bi * xb2_stride, ssm_out_buf + bi * dim, dim * sizeof(float));
         free(ssm_out_buf);
         tensor_set_repacked(NULL);
@@ -4117,7 +4123,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-    for (int bi = 0; bi < n_tokens; bi++) {
+    for (bi = 0; bi < n_tokens; bi++) {
         float *a = x_batch + bi * dim, *b = xb2_batch + bi * xb2_stride;
         for (int d = 0; d < dim; d++) a[d] += b[d];
     }
@@ -4127,7 +4133,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-        for (int bi = 0; bi < n_tokens; bi++)
+        for (bi = 0; bi < n_tokens; bi++)
             rmsnorm(ssm_xb + bi * dim, x_batch + bi * dim, s->post_attn_norm_w[l], dim, eps);
 
         tensor_set_repacked(m->repack_used[ri+7] ? m->repack_buffers[ri+7] : NULL);
@@ -4139,7 +4145,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-        for (int bi = 0; bi < n_tokens; bi++) {
+        for (bi = 0; bi < n_tokens; bi++) {
             silu(hb_batch + bi * c->n_ffn, c->n_ffn);
             elemwise_mul(hb_batch + bi * c->n_ffn, hb_batch + bi * c->n_ffn,
                          hb2_batch + bi * c->n_ffn, c->n_ffn);
@@ -4152,7 +4158,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-        for (int bi = 0; bi < n_tokens; bi++) {
+        for (bi = 0; bi < n_tokens; bi++) {
             float *a = x_batch + bi * dim, *b = xb2_batch + bi * dim;
             for (int d = 0; d < dim; d++) a[d] += b[d];
         }
@@ -4167,6 +4173,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
  * ================================================================ */
 
 float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int start_pos) {
+    int bi;
     model_config_t *c = &m->config;
     model_weights_t *w = &m->weights;
     run_state_t *s = &m->state;
@@ -4203,7 +4210,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
             #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-            for (int bi = 0; bi < n_tokens; bi++) {
+            for (bi = 0; bi < n_tokens; bi++) {
                 int group = tokens[bi] / 4;
                 int r = tokens[bi] % 4;
                 const block_q4_0x4 *blocks = (const block_q4_0x4 *)((const uint8_t *)w->token_embd + (size_t)group * group_bytes);
@@ -4228,7 +4235,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
             #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-            for (int bi = 0; bi < n_tokens; bi++) {
+            for (bi = 0; bi < n_tokens; bi++) {
                 int group = tokens[bi] / 4;
                 int r = tokens[bi] % 4;
                 const block_q4_0x4 *blocks = (const block_q4_0x4 *)((const uint8_t *)w->token_embd + (size_t)group * group_bytes);
@@ -4251,7 +4258,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
             #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-            for (int bi = 0; bi < n_tokens; bi++) {
+            for (bi = 0; bi < n_tokens; bi++) {
                 const void *er = (const uint8_t *)w->token_embd + (size_t)tokens[bi] * row_bytes;
                 dequantize_row(er, x_batch + bi * dim, dim, w->type_token_embd);
             }
@@ -4299,7 +4306,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-        for (int bi = 0; bi < n_tokens; bi++)
+        for (bi = 0; bi < n_tokens; bi++)
             rmsnorm(xb_batch + bi * dim, x_batch + bi * dim, s->attn_norm_w[l], dim, c->rms_norm_eps);
 
         /* Q projection (batched) */
@@ -4329,7 +4336,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
               #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-              for (int bi = 0; bi < n_tokens; bi++) {
+              for (bi = 0; bi < n_tokens; bi++) {
                   float *qg_raw = q_batch + bi * q_full_dim;
                   float *q_block = q_batch + bi * q_dim;
                   float *gate_block = qwen35_gate_batch + bi * q_dim;
@@ -4358,7 +4365,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
             #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-            for (int bi = 0; bi < n_tokens; bi++) {
+            for (bi = 0; bi < n_tokens; bi++) {
                 int pos = start_pos + bi;
                 float *q_pos = q_batch + bi * q_dim;
                 float *k_pos = k_batch + bi * kv_dim;
@@ -4407,7 +4414,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
             #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-            for (int bi = 0; bi < n_tokens; bi++) {
+            for (bi = 0; bi < n_tokens; bi++) {
                 float *xb = xb_batch + bi * max_dim;
                 float *gate = hb2_batch + bi * q_dim;
                 for (int i = 0; i < q_dim; i++) {
@@ -4426,7 +4433,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-              for (int bi = 0; bi < n_tokens; bi++)
+              for (bi = 0; bi < n_tokens; bi++)
                   memcpy(attn_out_batch + bi * q_dim, xb_batch + bi * max_dim, q_dim * sizeof(float));
           }
           tensor_set_repacked(m->repack_used[6+l*9] ? m->repack_buffers[6+l*9] : NULL);
@@ -4450,7 +4457,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-        for (int bi = 0; bi < n_tokens; bi++) {
+        for (bi = 0; bi < n_tokens; bi++) {
             float *a = x_batch + bi * dim, *b = xb2_batch + bi * dim;
             for (int d2 = 0; d2 < dim; d2++) a[d2] += b[d2];
         }
@@ -4459,7 +4466,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-        for (int bi = 0; bi < n_tokens; bi++)
+        for (bi = 0; bi < n_tokens; bi++)
             rmsnorm(xb_batch + bi * dim, x_batch + bi * dim, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
 
         /* FFN gate+up (batched dual) */
@@ -4473,7 +4480,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-        for (int bi = 0; bi < n_tokens; bi++) {
+        for (bi = 0; bi < n_tokens; bi++) {
             silu(hb_batch + bi * n_ffn, n_ffn);
             elemwise_mul(hb_batch + bi * n_ffn, hb_batch + bi * n_ffn, hb2_batch + bi * n_ffn, n_ffn);
         }
@@ -4490,7 +4497,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-        for (int bi = 0; bi < n_tokens; bi++) {
+        for (bi = 0; bi < n_tokens; bi++) {
             float *a = x_batch + bi * dim, *b = xb2_batch + bi * dim;
             for (int d2 = 0; d2 < dim; d2++) a[d2] += b[d2];
         }

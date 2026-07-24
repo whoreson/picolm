@@ -2558,6 +2558,7 @@ void gemm_q4_0_4x8_i8mm(const void *W, const int8_t *X_repacked, const float *ad
  * Otherwise fall back to DOTPROD gemv per token. */
 void gemm_q4_0_4x8_q8_0(const void *W, const void *X, int n,
                          float *out, int d, int n_batch) {
+    int b;
 #if defined(PICOLM_I8MM)
     /* Use I8MM for batched prefill (n_batch >= 8) */
     if (n_batch >= 8) {
@@ -2589,7 +2590,7 @@ void gemm_q4_0_4x8_q8_0(const void *W, const void *X, int n,
 #ifdef _OPENMP
 #pragma omp parallel for
 #endif
-    for (int b = 0; b < n_batch; b++) {
+    for (b = 0; b < n_batch; b++) {
         const void *xb = (const int8_t *)X + (size_t)b * q8_rb;
         vec_dot_q4_0x4_4x8_q8_0(W, xb, n, out + (size_t)b * d, d);
     }
@@ -3382,7 +3383,10 @@ float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
         case GGUF_TYPE_Q4_K: return vec_dot_q4_K_f32(src, x, n);
         case GGUF_TYPE_Q5_K: {
             /* Scalar fallback: dequantize to float, then dot */
-#if defined(__APPLE__)
+#if defined(_WIN32)
+            /* MSVC has no __thread; use plain static */
+            static float q5_tmp[4096];
+#elif defined(__APPLE__)
             /* __thread not supported on old Mac OS X; use static buffer */
             static float q5_tmp[4096];
 #else
@@ -3390,8 +3394,9 @@ float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
 #endif
             if (n > 4096) {
                 float *tmp = (float *)malloc(n * sizeof(float));
+                float r;
                 dequantize_row_q5_K(src, tmp, n);
-                float r = vec_dot_f32_f32(tmp, x, n);
+                r = vec_dot_f32_f32(tmp, x, n);
                 free(tmp);
                 return r;
             }

@@ -4,9 +4,23 @@
 #include <string.h>
 #include <stdio.h>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#ifndef WINVER
+#define WINVER 0x0600
+#endif
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
+#include <windows.h>
+#include <synchapi.h>
+#else
+#include <pthread.h>
+#include <unistd.h>
+#endif
+
 #ifdef PICOLM_GPU
 #include "backend_gpu.h"
-#include <pthread.h>
 /* GPU dispatch: if a GPU tensor handle is registered for this weight matrix,
  * offload to GPU. The handle is stored per-tensor via tensor_set_gpu_tensor().
  * This is checked at the very start of matmul/matmul_batch before any CPU path.
@@ -20,12 +34,20 @@
  * silent corruption (wrong weight matrix used) by converting it into a loud crash. */
 static picolm_gpu_tensor_t *gpu_tensor = NULL;
 static int gpu_device = 0;
+#ifdef _WIN32
+static DWORD gpu_orchestrator_thread = 0;
+#else
 static pthread_t gpu_orchestrator_thread = 0;
+#endif
 static int gpu_orchestrator_set = 0;
 
 static void gpu_assert_orchestrator(const char *fn) {
     if (!gpu_orchestrator_set) return;
+#ifdef _WIN32
+    if (GetCurrentThreadId() != gpu_orchestrator_thread) {
+#else
     if (pthread_self() != gpu_orchestrator_thread) {
+#endif
         fprintf(stderr, "FATAL: GPU %s called from non-orchestrator thread (corruption risk)\n", fn);
         abort();
     }
@@ -33,7 +55,11 @@ static void gpu_assert_orchestrator(const char *fn) {
 
 void tensor_set_gpu_tensor(picolm_gpu_tensor_t *t, int device) {
     if (!gpu_orchestrator_set) {
+#ifdef _WIN32
+        gpu_orchestrator_thread = GetCurrentThreadId();
+#else
         gpu_orchestrator_thread = pthread_self();
+#endif
         gpu_orchestrator_set = 1;
     }
     gpu_assert_orchestrator("tensor_set_gpu_tensor");
@@ -41,17 +67,6 @@ void tensor_set_gpu_tensor(picolm_gpu_tensor_t *t, int device) {
     gpu_device = device;
 }
 #endif /* PICOLM_GPU */
-
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#define WINVER 0x0600
-#define _WIN32_WINNT 0x0600
-#include <windows.h>
-#include <synchapi.h>
-#else
-#include <pthread.h>
-#include <unistd.h>
-#endif
 
 /* Mac OS X < 10.5 compat: _SC_NPROCESSORS_ONLN may not be defined */
 #if defined(__APPLE__) && !defined(_SC_NPROCESSORS_ONLN)
