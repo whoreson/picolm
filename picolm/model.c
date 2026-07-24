@@ -2210,6 +2210,362 @@ static void ssm_head_task(int h, void *ctxp) {
 #endif
 }
 
+/* ================================================================
+ * Chunked DeltaNet recurrence.
+ *
+ * Replaces the sequential per-token recurrence with a chunked
+ * algorithm that processes CS tokens at a time using triangular
+ * matrix operations. This converts O(n_tokens * d_state^2)
+ * sequential work into O(n_tokens * d_state^2) parallel work.
+ *
+ * Per v-head, the recurrence is:
+ *   S *= ge[t]          (scalar decay)
+ *   sk = S @ k[t]       (d_state vector)
+ *   d = (v[t] - sk) * beta[t]  (d_state vector)
+ *   S += outer(k[t], d) (rank-1 update)
+ *   out = S @ q[t]      (d_state vector)
+ *
+ * Within a chunk, we unroll this into:
+ *   1. Compute cumulative decay D[t] = prod(ge[0..t])
+ *   2. Build CS x CS decay mask: decay[i][j] = D[i]/D[j]
+ *   3. Compute interaction matrix kb[i][j] = k[i].k[j]*beta[j] * decay
+ *   4. Forward-substitute to get V_hat (solved V values)
+ *   5. Compute output from initial state + intra-chunk attention
+ *   6. Update state for next chunk
+ *
+ * Each v-head is independent; parallelized via tensor_parallel_for.
+ * ================================================================ */
+
+typedef struct {
+    int idx;               /* v-head index */
+    int d_state;
+    int cs;                /* actual chunk size (last chunk may be smaller) */
+    int repeat;            /* n_v_heads / n_k_heads */
+
+    /* Input data: Q, K are [CS][d_state] per k-head, V is [CS][d_state] per v-head */
+    const float *q;        /* [cs][d_state] for this k-head */
+    const float *k;        /* [cs][d_state] for this k-head */
+    const float *v;        /* [cs][d_state] for this v-head */
+    const float *gate_log; /* [cs] log(gate_exp) for this v-head */
+    const float *beta;     /* [cs] beta for this v-head */
+
+    /* State: [d_state][d_state] for this v-head (in/out) */
+    float *state;
+
+    /* Output: [cs][d_state] for this v-head */
+    float *out;
+
+    /* Scratch buffer pointer (allocated externally) */
+    float *scratch;
+} ssm_chunk_head_task_t;
+
+/* Process one v-head's chunked recurrence.
+ * Corrected formulation following the DeltaNet chunking derivation:
+ *
+ * Per-token recurrence:
+ *   S *= ge              (scalar decay)
+ *   sk[r] = S[r] . k     (d_state vector, one per row)
+ *   delta[r] = beta * (v[r] - sk[r])
+ *   S += outer(k, delta) (rank-1 update)
+ *   out[r] = S[r] . q    (d_state vector output)
+ *
+ * Chunked formulation (per v-head):
+ *   cum_g[t] = sum_{j=0}^{t} log(ge[j])
+ *   decay[i][j] = exp(cum_g[i] - cum_g[j]) for i >= j
+ *
+ *   V_eff[i] = beta[i] * (v[i] - decay[i] * S_init . k[i])
+ *   M[i][j] = (k[i] . k[j]) * decay[i][j]   (no beta on k[j])
+ *   V_hat[i] = V_eff[i] - beta[i] * sum_{j<i} M[i][j] * V_hat[j]
+ *
+ *   out[i] = decay[i] * S_init . q[i]
+ *          + sum_{j<=i} (k[j] . q[i]) * decay[i][j] * V_hat[j]
+ *
+ *   S_new = decay[last] * S_init
+ *         + sum_j decay[last][j] * outer(V_hat[j], k[j])
+ */
+static void ssm_chunk_head_task(int h, void *ctxp) {
+    ssm_chunk_head_task_t *tasks = (ssm_chunk_head_task_t *)ctxp;
+    ssm_chunk_head_task_t *ctx = &tasks[h];
+    int d = ctx->d_state;
+    int cs = ctx->cs;
+    int kh = h / ctx->repeat;
+
+    /* Point to this head's data within the chunk */
+    const float *q = ctx->q + (size_t)kh * cs * d;
+    const float *k = ctx->k + (size_t)kh * cs * d;
+    const float *v = ctx->v + (size_t)h * cs * d;
+    const float *gate_log = ctx->gate_log + h * cs;
+    const float *beta = ctx->beta + h * cs;
+
+    float *state = ctx->state + (size_t)h * d * d;
+    /* ctx->out already offset by h*cs*d_state; no additional offset needed */
+    float *out = ctx->out;
+
+    /* Allocate scratch from the pre-allocated buffer.
+     * We need:
+     *   cum_g[cs], q_decay[cs]
+     *   decay_mask[cs*cs], M[cs*cs]  (interaction matrix, no beta)
+     *   v_eff[cs*d], v_hat[cs*d]
+     * Total: 2*cs + 2*cs*cs + 2*cs*d floats */
+    float *sp = ctx->scratch;
+
+    float *cum_g = sp; sp += cs;
+    float *q_decay = sp; sp += cs;
+    float *decay_mask = sp; sp += cs * cs;
+    float *M_mat = sp; sp += cs * cs;
+    float *v_eff = sp; sp += cs * d;
+    float *v_hat = sp; sp += cs * d;
+
+    
+    /* Step 1: Compute cumulative log-decay and decay from start */
+    {
+        float cum = 0.0f;
+        for (int t = 0; t < cs; t++) {
+            cum += gate_log[t];
+            cum_g[t] = cum;
+            float ex = cum;
+            if (ex > 50.0f) ex = 50.0f;
+            if (ex < -50.0f) ex = -50.0f;
+            q_decay[t] = expf(ex);
+        }
+    }
+
+    /* Step 2: Build decay mask and interaction matrix M[i][j] = k_i . k_j * decay
+     * M is strictly lower triangular (j < i), no beta factor. */
+    for (int i = 0; i < cs; i++) {
+        const float *ki = k + i * d;
+        for (int j = 0; j <= i; j++) {
+            float dm;
+            if (i == j) {
+                dm = 1.0f;
+            } else {
+                float diff = cum_g[i] - cum_g[j];
+                if (diff > 50.0f) diff = 50.0f;
+                if (diff < -50.0f) diff = -50.0f;
+                dm = expf(diff);
+            }
+            decay_mask[i * cs + j] = dm;
+
+            /* k[i] . k[j] */
+            float dot = 0.0f;
+            const float *kj = k + j * d;
+            for (int di = 0; di < d; di++) dot += ki[di] * kj[di];
+            M_mat[i * cs + j] = dot * dm;
+        }
+        for (int j = i + 1; j < cs; j++) {
+            decay_mask[i * cs + j] = 0.0f;
+            M_mat[i * cs + j] = 0.0f;
+        }
+    }
+
+    /* Step 3: Compute V_eff[i] = beta[i] * (v[i] - decay[i] * S_init . k[i]) */
+    for (int i = 0; i < cs; i++) {
+        float decay_i = q_decay[i];
+        float bt = beta[i];
+        const float *ki = k + i * d;
+        for (int r = 0; r < d; r++) {
+            float s_dot_k = 0.0f;
+            const float *st_row = state + r * d;
+            for (int c = 0; c < d; c++) s_dot_k += st_row[c] * ki[c];
+            v_eff[i * d + r] = bt * (v[i * d + r] - decay_i * s_dot_k);
+        }
+    }
+
+    /* Step 4: Forward substitution.
+     * V_hat[i] = V_eff[i] - beta[i] * sum_{j<i} M[i][j] * V_hat[j]
+     * Note: beta[i] multiplies the ENTIRE subtraction term. */
+    for (int i = 0; i < cs; i++) {
+        float bt = beta[i];
+        for (int r = 0; r < d; r++) {
+            float sum_mv = 0.0f;
+            for (int j = 0; j < i; j++) {
+                sum_mv += M_mat[i * cs + j] * v_hat[j * d + r];
+            }
+            v_hat[i * d + r] = v_eff[i * d + r] - bt * sum_mv;
+        }
+    }
+
+    /* Step 5: Compute output.
+     * out[i][r] = decay[i] * S_init[r] . q[i]
+     *           + sum_{j<=i} (k[j] . q[i]) * decay[i][j] * V_hat[j][r] */
+    for (int i = 0; i < cs; i++) {
+        float decay_i = q_decay[i];
+        const float *qi = q + i * d;
+
+        /* Initial state contribution */
+        for (int r = 0; r < d; r++) {
+            float s_dot_q = 0.0f;
+            const float *st_row = state + r * d;
+            for (int c = 0; c < d; c++) s_dot_q += st_row[c] * qi[c];
+            out[i * d + r] = s_dot_q * decay_i;
+        }
+
+        /* Intra-chunk contribution (includes j == i) */
+        for (int j = 0; j <= i; j++) {
+            float dm = decay_mask[i * cs + j];
+            /* k[j] . q[i] */
+            float k_dot_q = 0.0f;
+            const float *kj = k + j * d;
+            for (int di = 0; di < d; di++) k_dot_q += kj[di] * qi[di];
+            float attn = k_dot_q * dm;
+            const float *vht = v_hat + j * d;
+            float *outi = out + i * d;
+            for (int r = 0; r < d; r++) outi[r] += attn * vht[r];
+        }
+    }
+
+    
+    /* Step 6: Update state for next chunk.
+     * S_new[r][c] = decay[last] * S_init[r][c]
+     *             + sum_j decay[last][j] * V_hat[j][r] * k[j][c] */
+    {
+        float total_decay;
+        {
+            float cum = cum_g[cs - 1];
+            if (cum > 50.0f) cum = 50.0f;
+            if (cum < -50.0f) cum = -50.0f;
+            total_decay = expf(cum);
+        }
+
+        for (int r = 0; r < d; r++) {
+            for (int c = 0; c < d; c++) {
+                float update = 0.0f;
+                for (int j = 0; j < cs; j++) {
+                    float diff = cum_g[cs - 1] - cum_g[j];
+                    float decay_to_end;
+                    if (diff > 50.0f) diff = 50.0f;
+                    if (diff < -50.0f) diff = -50.0f;
+                    decay_to_end = expf(diff);
+                    update += v_hat[j * d + r] * k[j * d + c] * decay_to_end;
+                }
+                state[r * d + c] = state[r * d + c] * total_decay + update;
+            }
+        }
+    }
+}
+
+/* Chunked SSM recurrence: replaces the sequential per-token loop.
+ * Processes all n_tokens in chunks of CS, parallelized across v-heads.
+ *
+ * conv_batch layout: [n_tokens][conv_dim] where conv_dim = 2*qk_dim + value_dim
+ *   Within each token: [Q[n_k_heads][d_state] | K[n_k_heads][d_state] | V[n_v_heads][head_v_dim]]
+ * alpha_batch: [n_tokens][n_v_heads] gate_exp values
+ * beta_batch:  [n_tokens][n_v_heads] sigmoid(beta) values
+ * state:       [n_v_heads][d_state][d_state] recurrent state (updated in-place)
+ * xb2_batch:   [n_tokens][value_dim] head-major output [h*head_v_dim + d]
+ */
+static void ssm_chunked_recurrence(
+        const float *conv_batch,
+        const float *alpha_batch,
+        const float *beta_batch,
+        float *state,
+        float *xb2_batch,
+        int n_tokens, int value_dim,
+        int d_state, int n_k_heads, int n_v_heads, int head_v_dim, int repeat,
+        int conv_dim)
+{
+    const int CS = 64; /* chunk size for non-KDA (scalar decay) */
+    int n_chunks = (n_tokens + CS - 1) / CS;
+    if (n_chunks < 1) n_chunks = 1;
+
+    int qk_dim = d_state * n_k_heads;
+
+    /* Compute scratch size per thread for ssm_chunk_head_task.
+     * cs + 2*cs*cs + 2*cs*d floats.
+     * For CS=64, d=128: 64 + 8192 + 16384 = ~25KB per thread */
+    size_t scratch_per_head = (size_t)CS + 2UL * CS + 2UL * CS * CS + 2UL * CS * (size_t)d_state;
+    scratch_per_head = (scratch_per_head + 15) & ~15UL;
+
+    /* Allocate task contexts and per-head scratch separately to avoid stride issues */
+    ssm_chunk_head_task_t *tasks = (ssm_chunk_head_task_t *)calloc(n_v_heads, sizeof(ssm_chunk_head_task_t));
+    float *scratch_pool = (float *)calloc(n_v_heads * scratch_per_head, sizeof(float));
+    if (!tasks || !scratch_pool) { fprintf(stderr, "OOM: chunk tasks\n"); exit(1); }
+    for (int h = 0; h < n_v_heads; h++) {
+        tasks[h].scratch = scratch_pool + (size_t)h * scratch_per_head;
+    }
+
+    /* Allocate gather buffers for contiguous chunk data.
+     * Layout: [n_heads][CS][d] for Q/K/V, [n_v_heads][CS] for scalars.
+     * This matches the access pattern in ssm_chunk_head_task:
+     *   q[kh*cs*d + t*d + di], k[kh*cs*d + t*d + di], v[h*cs*d + t*d + di]
+     *   gate_log[h*cs + t], beta[h*cs + t] */
+    size_t cs_alloc = CS; /* max possible */
+    float *chunk_q = (float *)malloc(cs_alloc * (size_t)n_k_heads * (size_t)d_state * sizeof(float));
+    float *chunk_k = (float *)malloc(cs_alloc * (size_t)n_k_heads * (size_t)d_state * sizeof(float));
+    float *chunk_v = (float *)malloc(cs_alloc * (size_t)n_v_heads * (size_t)head_v_dim * sizeof(float));
+    float *chunk_beta = (float *)malloc(cs_alloc * (size_t)n_v_heads * sizeof(float));
+    float *gate_log = (float *)malloc(cs_alloc * (size_t)n_v_heads * sizeof(float));
+    float *chunk_out = (float *)malloc(cs_alloc * (size_t)n_v_heads * (size_t)d_state * sizeof(float));
+    if (!chunk_q || !chunk_k || !chunk_v || !chunk_beta || !gate_log || !chunk_out) {
+        fprintf(stderr, "OOM: chunk gather buffers\n"); exit(1);
+    }
+
+    /* Process chunk by chunk */
+    for (int ci = 0; ci < n_chunks; ci++) {
+        int cs = (ci == n_chunks - 1) ? (n_tokens - ci * CS) : CS;
+        if (cs <= 0) break;
+        int chunk_start = ci * CS;
+
+        /* Gather Q, K, V, beta, gate_log for this chunk.
+         * Layout: [n_heads][cs][d] for Q/K/V, [n_v_heads][cs] for scalars. */
+        for (int h = 0; h < n_k_heads; h++) {
+            for (int t = 0; t < cs; t++) {
+                const float *tok = conv_batch + (chunk_start + t) * conv_dim;
+                memcpy(chunk_q + (size_t)h * cs * d_state + t * d_state,
+                       tok + h * d_state, d_state * sizeof(float));
+                memcpy(chunk_k + (size_t)h * cs * d_state + t * d_state,
+                       tok + qk_dim + h * d_state, d_state * sizeof(float));
+            }
+        }
+        for (int h = 0; h < n_v_heads; h++) {
+            for (int t = 0; t < cs; t++) {
+                const float *tok = conv_batch + (chunk_start + t) * conv_dim;
+                memcpy(chunk_v + (size_t)h * cs * head_v_dim + t * head_v_dim,
+                       tok + 2 * qk_dim + h * head_v_dim, head_v_dim * sizeof(float));
+                chunk_beta[h * cs + t] = beta_batch[(chunk_start + t) * n_v_heads + h];
+                float ge = alpha_batch[(chunk_start + t) * n_v_heads + h];
+                gate_log[h * cs + t] = (ge <= 0.0f) ? -50.0f : logf(ge);
+            }
+        }
+
+        /* Initialize each task */
+        for (int h = 0; h < n_v_heads; h++) {
+            tasks[h].idx = h;
+            tasks[h].d_state = d_state;
+            tasks[h].cs = cs;
+            tasks[h].repeat = repeat;
+            /* Now Q/K/V are contiguous [cs][n_heads][d], so we can slice by head */
+            tasks[h].q = chunk_q;
+            tasks[h].k = chunk_k;
+            tasks[h].v = chunk_v;
+            tasks[h].gate_log = gate_log;
+            tasks[h].beta = chunk_beta;
+            tasks[h].state = state;
+            /* Output: [cs][d_state] per v-head */
+            tasks[h].out = chunk_out + (size_t)h * cs * d_state;
+        }
+
+        /* Process all v-heads in parallel */
+        tensor_parallel_for(n_v_heads, ssm_chunk_head_task, tasks);
+
+        /* Reshape output from [n_v_heads][cs][d_state] to [cs][value_dim] head-major.
+         * chunk_out[h * cs * d_state + t * d_state + r] -> xb2_batch[(chunk_start+t)*value_dim + h*head_v_dim + r] */
+        for (int t = 0; t < cs; t++) {
+            float *out_tok = xb2_batch + (chunk_start + t) * value_dim;
+            for (int h = 0; h < n_v_heads; h++) {
+                const float *oh = chunk_out + (size_t)h * cs * d_state + t * d_state;
+                float *od = out_tok + h * head_v_dim;
+                memcpy(od, oh, d_state * sizeof(float));
+            }
+        }
+
+            }
+
+    free(tasks); free(scratch_pool);
+    free(chunk_q); free(chunk_k); free(chunk_v);
+    free(chunk_beta); free(gate_log); free(chunk_out);
+}
+
 /* SSM layer forward pass (autoregressive, single token) */
 static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
                         layer_weights_t *lw, int il, int pos, void *gpu_lw) {
@@ -3657,47 +4013,45 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
         }
     }
 
-    /* 7. Sequential state update per token (THE HOT PATH).
-     * Each token's recurrence is sequential (state depends on previous),
-     * but within each token, the n_v_heads are fully independent and
-     * threaded via ssm_head_task. */
-    /* Pre-allocate scratch outside token loop to avoid repeated alloca */
-    float *ssm_output = (float *)malloc((size_t)d_state * n_v_heads * sizeof(float));
-    ssm_head_ctx_t ssm_ctx;
-    ssm_ctx.state = state;
-    ssm_ctx.d_state = d_state;
-    ssm_ctx.head_v_dim = head_v_dim;
-    ssm_ctx.n_v_heads = n_v_heads;
-    ssm_ctx.repeat = repeat;
-    ssm_ctx.ssm_output = ssm_output;
-    for (int bi = 0; bi < n_tokens; bi++) {
-        float *conv = conv_batch + bi * conv_dim;
-        float *q = conv;
-        float *k = conv + qk_dim;
-        float *v = conv + 2 * qk_dim;
-        float *ge = alpha_batch + bi * n_v_heads; /* gate_exp stored in-place */
-        float *bet = beta_batch + bi * n_v_heads;
-
-        /* Pass Q/K directly (n_k_heads entries). ssm_head_task handles
-         * the GQA k-head indexing via kh = h / repeat internally. */
-        ssm_ctx.q_conv = q;
-        ssm_ctx.k_conv = k;
-        ssm_ctx.v_conv = v;
-        ssm_ctx.gate_exp = ge;
-        ssm_ctx.beta = bet;
-
-        tensor_parallel_for(n_v_heads, ssm_head_task, &ssm_ctx);
-
-        /* Write output to xb2_batch in head-major layout */
-        float *out = xb2_batch + bi * value_dim;
-        for (int d = 0; d < d_state; d++)
-            for (int h = 0; h < n_v_heads; h++)
-                out[h * head_v_dim + d] = ssm_output[d * n_v_heads + h];
+    /* 7. Chunked state recurrence (Phase 2).
+     * Replaces sequential per-token recurrence with chunked DeltaNet.
+     * Processes tokens in chunks of CS=64, using triangular matrix
+    * operations within each chunk. Each v-head is fully independent
+    * and parallelized via tensor_parallel_for.
+    * For single-token inputs, falls back to the standard per-token path. */
+    {
+        if (n_tokens > 1) {
+            ssm_chunked_recurrence(
+                conv_batch, alpha_batch, beta_batch,
+                state, xb2_batch,
+                n_tokens, value_dim,
+                d_state, n_k_heads, n_v_heads, head_v_dim, repeat,
+                conv_dim);
+        } else {
+            /* Single token: use the standard per-token path */
+            float *ssm_output = (float *)malloc((size_t)d_state * n_v_heads * sizeof(float));
+            ssm_head_ctx_t ssm_ctx;
+            ssm_ctx.state = state;
+            ssm_ctx.d_state = d_state;
+            ssm_ctx.head_v_dim = head_v_dim;
+            ssm_ctx.n_v_heads = n_v_heads;
+            ssm_ctx.repeat = repeat;
+            ssm_ctx.ssm_output = ssm_output;
+            ssm_ctx.q_conv = conv_batch;
+            ssm_ctx.k_conv = conv_batch + qk_dim;
+            ssm_ctx.v_conv = conv_batch + 2 * qk_dim;
+            ssm_ctx.gate_exp = alpha_batch;
+            ssm_ctx.beta = beta_batch;
+            tensor_parallel_for(n_v_heads, ssm_head_task, &ssm_ctx);
+            for (int d = 0; d < d_state; d++)
+                for (int h = 0; h < n_v_heads; h++)
+                    xb2_batch[h * head_v_dim + d] = ssm_output[d * n_v_heads + h];
+            free(ssm_output);
+        }
     }
 
     free(alpha_batch);
     free(beta_batch);
-    free(ssm_output);
 
     /* 8. Gated normalization (batched across tokens) */
 #ifdef _OPENMP
