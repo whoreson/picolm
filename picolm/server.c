@@ -1132,7 +1132,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         /* ---- Prefill phase ---- */
         float *logits = NULL;
         int n_prefill = n_prompt - start_pos;
-        fprintf(stderr, "[server] %.1fms: starting prefill (%d tokens, %s)\n", get_time_ms() - t0, n_prefill, model->config.has_ssm ? "SSM batched" : "batched");
+        fprintf(stderr, "[server] %.1fms: starting prefill (%d tokens, %s)\n", get_time_ms() - t0, n_prefill, model->config.has_ssm ? (model->ssm_batched_prefill ? "SSM batched" : "SSM per-token") : "batched");
 
         /* Track how many prompt tokens were actually processed */
         int n_processed = start_pos;
@@ -1758,7 +1758,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         /* ---- Prefill phase ---- */
         float *logits = NULL;
         int n_prefill = n_prompt - start_pos;
-        fprintf(stderr, "[server] %.1fms: starting prefill (%d tokens, %s)\n", get_time_ms() - t0, n_prefill, model->config.has_ssm ? "SSM batched" : "batched");
+        fprintf(stderr, "[server] %.1fms: starting prefill (%d tokens, %s)\n", get_time_ms() - t0, n_prefill, model->config.has_ssm ? (model->ssm_batched_prefill ? "SSM batched" : "SSM per-token") : "batched");
 
         /* Track how many prompt tokens were actually processed */
         int n_processed = start_pos;
@@ -1964,7 +1964,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         /* ---- Prefill phase ---- */
         float *logits_ns2 = NULL;
         int n_prefill_ns2 = n_prompt - start_pos;
-        fprintf(stderr, "[server] %.1fms: starting prefill (%d tokens, %s)\n", get_time_ms() - t0, n_prefill_ns2, model->config.has_ssm ? "SSM batched" : "batched");
+        fprintf(stderr, "[server] %.1fms: starting prefill (%d tokens, %s)\n", get_time_ms() - t0, n_prefill_ns2, model->config.has_ssm ? (model->ssm_batched_prefill ? "SSM batched" : "SSM per-token") : "batched");
 
         /* Track how many prompt tokens were actually processed */
         int n_processed_ns2 = start_pos;

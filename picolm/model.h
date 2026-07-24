@@ -218,6 +218,9 @@ typedef struct {
     model_weights_t weights;
     run_state_t     state;
 
+    /* SSM batching: 0=per-token (default), 1=batched */
+    int             ssm_batched_prefill;
+
     /* mmap bookkeeping */
     void  *mmap_addr;
     size_t mmap_size;

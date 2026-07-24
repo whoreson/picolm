@@ -4269,17 +4269,30 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         layer_weights_t *lw = &w->layers[l];
 
         if (c->has_ssm && !lw->is_attn_layer) {
-            /* Batched SSM layer prefill */
+            if (m->ssm_batched_prefill) {
+                /* Batched SSM layer prefill (--ssm-batched) */
 #ifdef PICOLM_GPU
-            ssm_prefill_layer(m, s, x_batch, xb_batch, xb2_batch,
-                              hb_batch, hb2_batch, lw, l,
-                              n_tokens, start_pos, xb2_stride,
-                              (void **)m->gpu.layers);
+                ssm_prefill_layer(m, s, x_batch, xb_batch, xb2_batch,
+                                  hb_batch, hb2_batch, lw, l,
+                                  n_tokens, start_pos, xb2_stride,
+                                  (void **)m->gpu.layers);
 #else
-            ssm_prefill_layer(m, s, x_batch, xb_batch, xb2_batch,
-                              hb_batch, hb2_batch, lw, l,
-                              n_tokens, start_pos, xb2_stride, NULL);
+                ssm_prefill_layer(m, s, x_batch, xb_batch, xb2_batch,
+                                  hb_batch, hb2_batch, lw, l,
+                                  n_tokens, start_pos, xb2_stride, NULL);
 #endif
+            } else {
+                /* Per-token SSM fallback (default) */
+                for (int bi = 0; bi < n_tokens; bi++) {
+                    float *x = x_batch + bi * dim;
+                    float *out = xb2_batch + bi * xb2_stride;
+#ifdef PICOLM_GPU
+                    ssm_forward(m, s, x, out, lw, l, start_pos + bi, (void **)m->gpu.layers);
+#else
+                    ssm_forward(m, s, x, out, lw, l, start_pos + bi, NULL);
+#endif
+                }
+            }
             continue;
         }
 

@@ -114,6 +114,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --checkpoint-every-nt <N>   Checkpoint every N tokens during prefill (default: 256)\n");
     fprintf(stderr, "  --checkpoint-every-nt-gen <N> Checkpoint every N tokens during generation (default: 64)\n");
     fprintf(stderr, "  --checkpoint-tail-offset <N> Checkpoint N tokens before end of prompt (default: 5)\n");
+    fprintf(stderr, "  --ssm-batched     Use batched SSM prefill (SLOW, scalar implementation)\n");
 }
 
 static char *read_stdin(void) {
@@ -160,6 +161,8 @@ int main(int argc, char **argv) {
     int    server_mode = 0;
     int    server_port = 8080;
     char   server_host[256] = "0.0.0.0";
+    /* SSM options */
+    int    ssm_batched_prefill = 0;     /* 0=per-token (default), 1=batched */
     /* SSM checkpoint options */
     int    checkpoint_max = 0;          /* 0=disabled */
     int    checkpoint_interval = 256;
@@ -222,6 +225,8 @@ int main(int argc, char **argv) {
             checkpoint_interval_gen = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--checkpoint-tail-offset") == 0 && i + 1 < argc) {
             checkpoint_tail_offset = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--ssm-batched") == 0) {
+            ssm_batched_prefill = 1;
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             usage(argv[0]);
@@ -366,6 +371,8 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    model.ssm_batched_prefill = ssm_batched_prefill;
+
     /* Pin layers in RAM if --mem was specified */
     if (mem_mb > 0) {
         size_t budget = (size_t)mem_mb * 1024 * 1024;
@@ -481,9 +488,8 @@ int main(int argc, char **argv) {
     /* Batch prefill: process all prompt tokens at once */
     float *logits = NULL;
     if (n_prompt > 0) {
-        /* All models (attention + SSM) use batched prefill.
-         * SSM models have their own batched ssm_prefill_layer path
-         * inside model_forward_prefill. */
+        /* All models use model_forward_prefill.
+         * SSM models: per-token by default, use --ssm-batched for batched path. */
         logits = model_forward_prefill(&model, prompt_tokens, n_prompt, start_pos);
         pos = start_pos + n_prompt - 1;
     } else {
