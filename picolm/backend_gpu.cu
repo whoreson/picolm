@@ -234,6 +234,13 @@ __device__ static inline float dequant_q2_0(const void *blk, int i) {
     return (float)(v - 1) * d;
 }
 
+/* F16: raw array of uint16_t, each value is an individual FP16 element.
+ * No block structure: dequant(i) = gpu_fp16_to_fp32(weights[i]) */
+__device__ static inline float dequant_f16(const void *weights, int i) {
+    const uint16_t *w = (const uint16_t *)weights;
+    return gpu_fp16_to_fp32(w[i]);
+}
+
 /* block_q4_K: 144 bytes for 256 values
  * Layout from quant.h:
  *   uint16_t d;          offset 0  super-block scale (FP16)
@@ -298,6 +305,8 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
     int bytes_per_block;
     switch (qtype) {
         case GGUF_TYPE_F32:  bytes_per_block = 4; break;      /* 1 float */
+        case GGUF_TYPE_F16:  bytes_per_block = 2; break;      /* 1 uint16_t */
+        case 30:             bytes_per_block = 2; break;      /* BF16 */
         case GGUF_TYPE_Q4_0: bytes_per_block = GPU_BLOCK_Q4_0_SIZE; break;  /* 18 */
         case GGUF_TYPE_Q8_0: bytes_per_block = GPU_BLOCK_Q8_0_SIZE; break;  /* 34 */
         case GGUF_TYPE_Q4_K: bytes_per_block = GPU_BLOCK_Q4_K_SIZE; break;  /* 144 */
@@ -316,6 +325,13 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
     case 0: /* GGUF_TYPE_F32 */
         for (int i = gpuThreadIdx_x; i < I; i += gpuBlockDim_x) {
             sum += x[(size_t)s * I + i] * ((const float *)(wrow))[i];
+        }
+        break;
+
+    case 1: /* GGUF_TYPE_F16 */
+        /* Raw FP16 array, no block structure. Dequant on-the-fly. */
+        for (int i = gpuThreadIdx_x; i < I; i += gpuBlockDim_x) {
+            sum += x[(size_t)s * I + i] * dequant_f16(wrow, i);
         }
         break;
 
@@ -836,30 +852,14 @@ static int reserve(float **ptr, size_t *cap, size_t bytes) {
     if (*cap >= bytes) { pthread_mutex_unlock(&g_resize_mutex); return 1; }
     if (*ptr) gpuFree(*ptr);
     *ptr = NULL; *cap = 0;
-    /* Use managed memory on CUDA for unified memory systems (Grace-Blackwell SoC).
-     * On discrete GPUs, the page fault overhead is tolerable for the small scratch
-     * buffers (typically < 10 MB). On SoC, this eliminates the H2D/D2H copies
-     * entirely since CPU and GPU share coherent memory.
-     * HIP uses regular malloc since hipMallocManaged has different semantics. */
-    gpuError_t err;
-#ifdef __HIP__
-    err = gpuMalloc(ptr, bytes);
-#else
-    err = gpuMallocManaged(ptr, bytes);
-    if (err == gpuSuccess && *ptr) {
-        /* Advise: prefer GPU placement for these scratch buffers.
-         * They are written by CPU (H2D equivalent), read by GPU kernel, then
-         * read by CPU (D2H equivalent). GPU placement minimizes NVLink traffic.
-         * Use SetPreferredLocation (not SetReadMostly) because these buffers
-         * are actively written by both CPU and GPU - SetReadMostly would force
-         * the driver to maintain and invalidate read-only replicas on every
-         * write, adding overhead rather than reducing it. */
-        gpuMemLocation loc;
-        loc.type = gpuCudaMemLocationTypeDevice;
-        loc.id = -1; /* any device */
-        (void)gpuMemAdvise(*ptr, bytes, gpuCudaMemAdviseSetPreferredLocation, loc);
-    }
-#endif
+    /* Use device memory for scratch buffers.
+     * cpu writes via explicit cudaMemcpyAsync H2D, gpu reads from device mem,
+     * gpu writes to device mem, then cpu reads via explicit cudaMemcpyAsync D2H.
+     * This avoids cudaMallocManaged page-fault overhead and err=1 issues
+     * seen on GB10 (sm_121) with CUDA 13.0 where managed memory mixed with
+     * device memory in kernel arguments causes cudaErrorInvalidValue on first
+     * kernel launches. */
+    gpuError_t err = gpuMalloc(ptr, bytes);
     if (!gpu_ok(err, "scratch allocation")) {
         pthread_mutex_unlock(&g_resize_mutex);
         return 0;
@@ -974,10 +974,13 @@ int picolm_gpu_mem_info(int device, size_t *free_bytes, size_t *total_bytes) {
     return gpu_ok(gpuMemGetInfo(&fb, &tb), "memory info") && (*free_bytes = fb, *total_bytes = tb, 1);
 }
 
-/* Map GGUF_TYPE to block size and values per block */
+/* Map GGUF_TYPE to block size and values per block.
+ * F32 (0), F16 (1), BF16 (30): no blocks, each is an individual element. */
 static int gguf_block_size(gguf_type_t qtype) {
     switch (qtype) {
     case 0:  return 0;    /* F32: no blocks */
+    case 1:  return 0;    /* F16: no blocks */
+    case 30: return 0;    /* BF16: no blocks */
     case 2:  return 18;   /* Q4_0: 18 bytes per 32 values */
     case 8:  return 34;   /* Q8_0: 34 bytes per 32 values */
     case 12: return GPU_BLOCK_Q4_K_SIZE;  /* Q4_K: 144 bytes per 256 values */
@@ -995,7 +998,7 @@ int picolm_gpu_tensor_upload(void **tensor,
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!select_ctx(ctx)) return 0;
     int bs = gguf_block_size(qtype);
-    if (!bs && qtype != 0) return 0;
+    if (!bs && qtype != 0 && qtype != 1 && qtype != 30) return 0;
     if (*tp) return 1; /* idempotent */
 
     /* Compute row bytes */
@@ -1004,14 +1007,19 @@ int picolm_gpu_tensor_upload(void **tensor,
     if (qtype == 0) {
         row_bytes = (size_t)I * sizeof(float);
         vals_per_block = 1;
+    } else if (qtype == 1 || qtype == 30) {
+        row_bytes = (size_t)I * sizeof(uint16_t);
+        vals_per_block = 1;
     } else if (qtype == 12) {
         vals_per_block = 256;
+        row_bytes = (size_t)((I + vals_per_block - 1) / vals_per_block) * bs;
     } else if (qtype == 41 || qtype == 42) {
         vals_per_block = 128;
+        row_bytes = (size_t)((I + vals_per_block - 1) / vals_per_block) * bs;
     } else {
         vals_per_block = 32;
+        row_bytes = (size_t)((I + vals_per_block - 1) / vals_per_block) * bs;
     }
-    row_bytes = (size_t)((I + vals_per_block - 1) / vals_per_block) * bs;
     size_t total = row_bytes * (size_t)O;
 
     picolm_gpu_tensor_t *t = (picolm_gpu_tensor_t *)calloc(1, sizeof(*t));
@@ -1096,30 +1104,18 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
     if (!reserve(&ctx->x, &ctx->x_cap, xb) ||
         !reserve(&ctx->y, &ctx->y_cap, yb)) return 0;
 
-    /* On unified memory (CUDA managed), x and ctx->x are the same address space.
-     * We can write directly into ctx->x from CPU, then the GPU kernel reads it.
-     * On discrete GPUs (HIP or fallback), we still need explicit copies. */
-#ifdef __HIP__
+    /* Scratch buffers are in device memory. Explicit H2D copy needed. */
     if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
-#else
-    /* Managed memory: CPU writes directly, GPU reads directly.
-     * memcpy is fast on unified memory (same physical RAM via C2C interconnect). */
-    memcpy(ctx->x, x, xb);
-#endif
 
     dim3 grid((unsigned)O, (unsigned)S);
-    picolm_quant_matmul<<<grid, 256>>>(ctx->y, ctx->x, t->weights,
+    picolm_quant_matmul<<<grid, 256, 0, ctx->stream>>>(ctx->y, ctx->x, t->weights,
                                         t->qtype, S, I, O,
                                         (int)t->row_bytes);
     if (!gpu_ok(gpuGetLastError(), "matmul launch") ||
         !gpu_ok(gpuDeviceSynchronize(), "matmul sync")) return 0;
 
-    /* Managed memory: GPU writes directly to ctx->y, CPU reads directly. */
-#ifdef __HIP__
+    /* Scratch buffers are in device memory. Explicit D2H copy needed. */
     if (!gpu_ok(gpuMemcpy(y, ctx->y, yb, gpuMemcpyDeviceToHost), "output download")) return 0;
-#else
-    memcpy(y, ctx->y, yb);
-#endif
     return 1;
 }
 
@@ -1141,11 +1137,7 @@ int picolm_gpu_expert_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
         !reserve(&ctx->gate, &ctx->gate_cap, ib) ||
         !reserve(&ctx->up, &ctx->up_cap, ib)) return 0;
 
-#ifdef __HIP__
     if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "expert input")) return 0;
-#else
-    memcpy(ctx->x, x, xb);
-#endif
 
     /* gate projection */
     dim3 hidden_grid((unsigned)I, (unsigned)S);
@@ -1163,11 +1155,7 @@ int picolm_gpu_expert_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
         down->qtype, S, I, D, (int)down->row_bytes);
 
     if (!gpu_ok(gpuGetLastError(), "expert MLP")) return 0;
-#ifdef __HIP__
     if (!gpu_ok(gpuMemcpy(y, ctx->y, xb, gpuMemcpyDeviceToHost), "expert output")) return 0;
-#else
-    memcpy(y, ctx->y, xb);
-#endif
     return 1;
 }
 
@@ -1192,11 +1180,7 @@ int picolm_gpu_w4a16_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
         !reserve(&ctx->up, &ctx->up_cap, ib) ||
         !reserve(&ctx->y, &ctx->y_cap, xb)) return 0;
 
-    #ifdef __HIP__
     if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "w4a16 input")) return 0;
-#else
-    memcpy(ctx->x, x, xb);
-#endif
 
     /* fused gate+up via WMMA */
     dim3 hidden((unsigned)((I + 63) / 64), (unsigned)((S + 15) / 16));
@@ -1244,22 +1228,14 @@ int picolm_gpu_w4a16_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, in
     if (!reserve(&ctx->x, &ctx->x_cap, xb) ||
         !reserve(&ctx->y, &ctx->y_cap, yb)) return 0;
 
-#ifdef __HIP__
     if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "w4a16 input")) return 0;
-#else
-    memcpy(ctx->x, x, xb);
-#endif
 
     dim3 grid((unsigned)((N + 63) / 64), (unsigned)((M + 15) / 16));
     picolm_w4a16_matmul<<<grid, 256>>>(ctx->y, ctx->x, t->weights, M, K, N, t->block_size);
     if (!gpu_ok(gpuGetLastError(), "w4a16 matmul") ||
         !gpu_ok(gpuDeviceSynchronize(), "w4a16 sync")) return 0;
 
-#ifdef __HIP__
     if (!gpu_ok(gpuMemcpy(y, ctx->y, yb, gpuMemcpyDeviceToHost), "w4a16 output")) return 0;
-#else
-    memcpy(y, ctx->y, yb);
-#endif
     return 1;
 #else
     (void)t; (void)y; (void)x; (void)S; (void)device;
