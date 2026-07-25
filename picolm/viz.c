@@ -832,7 +832,7 @@ static void viz_render_heatmap(void) {
         viz_draw_string(fb, fb_w, fb_h, bar_x + 1, heatmap_y + bar_h - VIZ_FONT_H, num_buf, dim);
     }
 
-    /* Layer labels + skip indicators on the left. */
+    /* Layer labels on the left (only if enough room). */
     if (layer_h >= 10 && n_layers <= 64) {
         char lbl[16];
         for (int l = 0; l < n_layers; l++) {
@@ -842,28 +842,35 @@ static void viz_render_heatmap(void) {
             if (l >= 9) {
                 viz_draw_char(fb, fb_w, fb_h, 7, cy, lbl[1], dim);
             }
-            /* Draw "S" indicator if layer is skipped */
-            if (atomic_load_explicit(&viz_skip_layer[l], memory_order_relaxed)) {
-                /* Bright red "S" at right edge before color bar */
-                unsigned int red = 0xFFFFFF00; /* BGRA: bright red */
-                int skip_lbl_x = fb_w - 30;
-                if (skip_lbl_x < 20) skip_lbl_x = fb_w / 2;
-                viz_draw_char(fb, fb_w, fb_h, skip_lbl_x, cy, 'S', red);
-                /* Dim the entire row by drawing semi-transparent overlay */
-                int row_start = heatmap_y + l * layer_h;
-                int row_h = layer_h;
-                for (int py = row_start; py < row_start + row_h && py < fb_h; py++) {
-                    size_t row_off = (size_t)py * fb_w * 4;
-                    for (int px = 0; px < fb_w; px++) {
-                        size_t idx = row_off + px * 4;
-                        /* Reduce all channels to 30% */
-                        fb[idx]     = (unsigned char)(fb[idx] * 3 / 10);
-                        fb[idx + 1] = (unsigned char)(fb[idx + 1] * 3 / 10);
-                        fb[idx + 2] = (unsigned char)(fb[idx + 2] * 3 / 10);
-                        /* Alpha stays 255 */
-                    }
+        }
+    }
+
+    /* Post-process: dim skipped layer rows and draw "S" indicators.
+     * Done after all heatmap + label drawing so indicators stay bright. */
+    {
+        int color_bar_x = fb_w - 16; /* matches bar_x below */
+        for (int l = 0; l < n_layers; l++) {
+            if (!atomic_load_explicit(&viz_skip_layer[l], memory_order_relaxed))
+                continue;
+
+            int row_start = heatmap_y + l * layer_h;
+            int row_h = layer_h;
+            /* Dim only the heatmap area (skip labels on left, color bar on right) */
+            for (int py = row_start; py < row_start + row_h && py < fb_h; py++) {
+                size_t row_off = (size_t)py * fb_w * 4;
+                for (int px = 12; px < color_bar_x && px < fb_w; px++) {
+                    size_t idx = row_off + px * 4;
+                    fb[idx]     = (unsigned char)(fb[idx] * 3 / 10);
+                    fb[idx + 1] = (unsigned char)(fb[idx + 1] * 3 / 10);
+                    fb[idx + 2] = (unsigned char)(fb[idx + 2] * 3 / 10);
                 }
             }
+            /* Draw bright red "S" at center of the row */
+            unsigned int red = 0xFFFFFF00; /* BGRA: bright red */
+            int s_x = heatmap_w / 2 + 2;
+            int s_y = row_start + (row_h - 8) / 2;
+            if (s_y < heatmap_y) s_y = row_start + 1;
+            viz_draw_string(fb, fb_w, fb_h, s_x, s_y, "SKIP", red);
         }
     }
 
