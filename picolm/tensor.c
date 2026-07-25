@@ -1714,7 +1714,7 @@ void rmsnorm(float *out, const float *x, const float *weight, int size, float ep
         for (; i < size; i++) ss += x[i] * x[i];
     }
 #else
-    for (int i = 0; i < size; i++) ss += x[i] * x[i];
+    for (i = 0; i < size; i++) ss += x[i] * x[i];
 #endif
 
     ss = 1.0f / sqrtf(ss / (float)size + eps);

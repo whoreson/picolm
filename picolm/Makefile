@@ -45,7 +45,7 @@ avx: CFLAGS += -mavx -mfma -mpopcnt
 avx: $(TARGET)
 
 # --- x86-64 with AVX2 (Haswell and newer Intel; Excavator and newer AMD) ---
-avx2: CFLAGS += -mavx2 -mfma -mpopcnt
+avx2: CFLAGS += -mavx2 -mfma -mpopcnt -mf16c
 avx2: $(TARGET)
 
 # --- Persistent thread pool (WIP, for development) ---

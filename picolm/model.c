@@ -81,6 +81,18 @@ static int cpu_has_avx2(void) {
 #endif
 }
 
+/* AVX2 horizontal sum: reduce 8 FP32 lanes to one float */
+#ifdef PICOLM_AVX2
+static inline float hreduce256_ps(__m256 a) {
+    __m256 t1 = _mm256_permute2f128_ps(a, a, 1);
+    __m256 t2 = _mm256_add_ps(a, t1);
+    __m128 t3 = _mm256_castps256_ps128(t2);
+    t3 = _mm_add_ss(t3, _mm_movehl_ps(t3, t3));
+    t3 = _mm_add_ss(t3, _mm_shuffle_ps(t3, t3, 0x1));
+    return _mm_cvtss_f32(t3);
+}
+#endif
+
 static void repack_model_weights_q4_0x8(model_t *m);
 
 #ifdef _WIN32
@@ -2289,6 +2301,114 @@ static void ssm_head_task(int h, void *ctxp) {
             ctx->ssm_output[(size_t)(base+3) * n_v_heads + h] = _mm512_reduce_add_ps(out3);
         }
     }
+#elif defined(PICOLM_AVX2)
+    /* ---- AVX2 vectorized recurrence ----
+     * Process 4 rows of the d_state x d_state state matrix simultaneously.
+     * Each __m256 holds 8 floats. For d_state=128: 16 vector lanes per row,
+     * 4 rows processed at once = 64 vector registers for the matrix.
+     *
+     * Layout: st[h] is [d_state][d_state] row-major.
+     * We process 4 consecutive rows (r, r+1, r+2, r+3) together.
+     *
+     * Horizontal reduction of 8-lane vectors requires manual shuffles. */
+    {
+        int nr = d_state / 4; /* number of 4-row groups */
+        __m256 ge_v = _mm256_set1_ps(ge);
+        int d8 = d_state / 8; /* number of 8-float vector lanes per row */
+
+        for (int g = 0; g < nr; g++) {
+            int base = g * 4; /* row base in this group */
+
+            /* Phase 1: Decay + sk computation */
+            __m256 sk0 = _mm256_setzero_ps(), sk1 = _mm256_setzero_ps();
+            __m256 sk2 = _mm256_setzero_ps(), sk3 = _mm256_setzero_ps();
+
+            for (int v = 0; v < d8; v++) {
+                int col_base = v * 8;
+                __m256 kv = _mm256_loadu_ps(khv + col_base);
+
+                /* Row 0 */
+                __m256 r0 = _mm256_loadu_ps(st + base * d_state + col_base);
+                r0 = _mm256_mul_ps(r0, ge_v);
+                _mm256_storeu_ps(st + base * d_state + col_base, r0);
+                sk0 = _mm256_fmadd_ps(r0, kv, sk0);
+
+                /* Row 1 */
+                __m256 r1 = _mm256_loadu_ps(st + (base+1) * d_state + col_base);
+                r1 = _mm256_mul_ps(r1, ge_v);
+                _mm256_storeu_ps(st + (base+1) * d_state + col_base, r1);
+                sk1 = _mm256_fmadd_ps(r1, kv, sk1);
+
+                /* Row 2 */
+                __m256 r2 = _mm256_loadu_ps(st + (base+2) * d_state + col_base);
+                r2 = _mm256_mul_ps(r2, ge_v);
+                _mm256_storeu_ps(st + (base+2) * d_state + col_base, r2);
+                sk2 = _mm256_fmadd_ps(r2, kv, sk2);
+
+                /* Row 3 */
+                __m256 r3 = _mm256_loadu_ps(st + (base+3) * d_state + col_base);
+                r3 = _mm256_mul_ps(r3, ge_v);
+                _mm256_storeu_ps(st + (base+3) * d_state + col_base, r3);
+                sk3 = _mm256_fmadd_ps(r3, kv, sk3);
+            }
+
+            float sk0s = hreduce256_ps(sk0);
+            float sk1s = hreduce256_ps(sk1);
+            float sk2s = hreduce256_ps(sk2);
+            float sk3s = hreduce256_ps(sk3);
+
+            /* Phase 2: Compute delta = (v - sk) * beta */
+            float d0 = (vh[base + 0] - sk0s) * bh;
+            float d1 = (vh[base + 1] - sk1s) * bh;
+            float d2 = (vh[base + 2] - sk2s) * bh;
+            float d3 = (vh[base + 3] - sk3s) * bh;
+
+            __m256 d0v = _mm256_set1_ps(d0);
+            __m256 d1v = _mm256_set1_ps(d1);
+            __m256 d2v = _mm256_set1_ps(d2);
+            __m256 d3v = _mm256_set1_ps(d3);
+
+            /* Phase 3: State update + output computation */
+            __m256 out0 = _mm256_setzero_ps(), out1 = _mm256_setzero_ps();
+            __m256 out2 = _mm256_setzero_ps(), out3 = _mm256_setzero_ps();
+
+            for (int v = 0; v < d8; v++) {
+                int col_base = v * 8;
+                __m256 kv = _mm256_loadu_ps(khv + col_base);
+                __m256 qv = _mm256_loadu_ps(qh + col_base);
+
+                /* Row 0 */
+                __m256 r0 = _mm256_loadu_ps(st + base * d_state + col_base);
+                r0 = _mm256_fmadd_ps(kv, d0v, r0);
+                _mm256_storeu_ps(st + base * d_state + col_base, r0);
+                out0 = _mm256_fmadd_ps(r0, qv, out0);
+
+                /* Row 1 */
+                __m256 r1 = _mm256_loadu_ps(st + (base+1) * d_state + col_base);
+                r1 = _mm256_fmadd_ps(kv, d1v, r1);
+                _mm256_storeu_ps(st + (base+1) * d_state + col_base, r1);
+                out1 = _mm256_fmadd_ps(r1, qv, out1);
+
+                /* Row 2 */
+                __m256 r2 = _mm256_loadu_ps(st + (base+2) * d_state + col_base);
+                r2 = _mm256_fmadd_ps(kv, d2v, r2);
+                _mm256_storeu_ps(st + (base+2) * d_state + col_base, r2);
+                out2 = _mm256_fmadd_ps(r2, qv, out2);
+
+                /* Row 3 */
+                __m256 r3 = _mm256_loadu_ps(st + (base+3) * d_state + col_base);
+                r3 = _mm256_fmadd_ps(kv, d3v, r3);
+                _mm256_storeu_ps(st + (base+3) * d_state + col_base, r3);
+                out3 = _mm256_fmadd_ps(r3, qv, out3);
+            }
+
+            /* Horizontal reduce output */
+            ctx->ssm_output[(size_t)base * n_v_heads + h] = hreduce256_ps(out0);
+            ctx->ssm_output[(size_t)(base+1) * n_v_heads + h] = hreduce256_ps(out1);
+            ctx->ssm_output[(size_t)(base+2) * n_v_heads + h] = hreduce256_ps(out2);
+            ctx->ssm_output[(size_t)(base+3) * n_v_heads + h] = hreduce256_ps(out3);
+        }
+    }
 #else
     /* ---- Scalar fallback ---- */
     float sk_local[256];
@@ -2616,7 +2736,250 @@ static void ssm_kernel_sq(
         }
     }
 }
-#endif /* PICOLM_AVX512 */
+#elif defined(PICOLM_AVX2)
+
+/* Kernel 1: V_eff -- compute S_init @ K^T -> sk[cs][d] */
+static void ssm_kernel_veff(
+        float *sk,        /* [cs][d] output */
+        const float *state, /* [d][d] state */
+        const float *k,   /* [cs][d] */
+        int d, int cs)
+{
+    int d8 = d / 8; /* d=128 -> d8=16 */
+
+    for (int i = 0; i < cs; i++) {
+        const float *ki = k + i * d;
+        float *ski = sk + i * d;
+
+        /* Initialize d/8 accumulators to zero */
+        __m256 acc[16];
+        int v;
+        for (v = 0; v < d8; v++) acc[v] = _mm256_setzero_ps();
+
+        /* Accumulate over d rows of state */
+        for (int r = 0; r < d; r++) {
+            const float *sr = state + r * d;
+            float kir = ki[r];
+            if (kir == 0.0f) continue;
+            __m256 kv = _mm256_set1_ps(kir);
+            for (v = 0; v < d8; v++) {
+                __m256 sv = _mm256_loadu_ps(sr + v * 8);
+                acc[v] = _mm256_fmadd_ps(sv, kv, acc[v]);
+            }
+        }
+
+        /* Store results */
+        for (v = 0; v < d8; v++) {
+            _mm256_storeu_ps(ski + v * 8, acc[v]);
+        }
+    }
+}
+
+/* Kernel 2: Interaction matrix -- K @ K^T -> M[cs][cs] */
+static void ssm_kernel_interaction(
+        float *M,          /* [cs][cs] output */
+        const float *k,    /* [cs][d] */
+        const float *decay, /* [cs][cs] decay mask */
+        int d, int cs)
+{
+    int d8 = d / 8;
+
+    for (int i = 0; i < cs; i++) {
+        const float *ki = k + i * d;
+        float *Mi = M + i * cs;
+        const float *decay_i = decay + i * cs;
+
+        for (int j = 0; j <= i; j++) {
+            const float *kj = k + j * d;
+
+            /* Dot product ki . kj using AVX2 */
+            __m256 acc0 = _mm256_setzero_ps();
+            __m256 acc1 = _mm256_setzero_ps();
+            __m256 acc2 = _mm256_setzero_ps();
+            __m256 acc3 = _mm256_setzero_ps();
+
+            int v;
+            for (v = 0; v + 3 < d8; v += 4) {
+                acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(ki + v * 8),
+                                        _mm256_loadu_ps(kj + v * 8), acc0);
+                acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(ki + (v+1) * 8),
+                                        _mm256_loadu_ps(kj + (v+1) * 8), acc1);
+                acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(ki + (v+2) * 8),
+                                        _mm256_loadu_ps(kj + (v+2) * 8), acc2);
+                acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(ki + (v+3) * 8),
+                                        _mm256_loadu_ps(kj + (v+3) * 8), acc3);
+            }
+
+            float dot = hreduce256_ps(acc0) + hreduce256_ps(acc1)
+                      + hreduce256_ps(acc2) + hreduce256_ps(acc3);
+
+            for (; v < d8; v++) {
+                acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(ki + v * 8),
+                                        _mm256_loadu_ps(kj + v * 8), acc0);
+            }
+            dot += hreduce256_ps(acc0);
+
+            Mi[j] = dot * decay_i[j];
+        }
+
+        /* Zero upper triangle */
+        for (int j = i + 1; j < cs; j++) {
+            Mi[j] = 0.0f;
+        }
+    }
+}
+
+/* Kernel 3: Output cross-products -- K @ Q^T -> kq[cs][cs] */
+static void ssm_kernel_output_cross(
+        float *kq,         /* [cs][cs] output */
+        const float *k,    /* [cs][d] */
+        const float *q,    /* [cs][d] */
+        const float *decay, /* [cs][cs] */
+        int d, int cs)
+{
+    int d8 = d / 8;
+
+    for (int i = 0; i < cs; i++) {
+        const float *qi = q + i * d;
+        float *kqi = kq + i * cs;
+        const float *decay_i = decay + i * cs;
+
+        for (int j = 0; j <= i; j++) {
+            const float *kj = k + j * d;
+
+            /* Dot product kj . qi using AVX2 */
+            __m256 acc0 = _mm256_setzero_ps();
+            __m256 acc1 = _mm256_setzero_ps();
+            __m256 acc2 = _mm256_setzero_ps();
+            __m256 acc3 = _mm256_setzero_ps();
+
+            int v;
+            for (v = 0; v + 3 < d8; v += 4) {
+                acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(kj + v * 8),
+                                        _mm256_loadu_ps(qi + v * 8), acc0);
+                acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(kj + (v+1) * 8),
+                                        _mm256_loadu_ps(qi + (v+1) * 8), acc1);
+                acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(kj + (v+2) * 8),
+                                        _mm256_loadu_ps(qi + (v+2) * 8), acc2);
+                acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(kj + (v+3) * 8),
+                                        _mm256_loadu_ps(qi + (v+3) * 8), acc3);
+            }
+
+            float dot = hreduce256_ps(acc0) + hreduce256_ps(acc1)
+                      + hreduce256_ps(acc2) + hreduce256_ps(acc3);
+
+            for (; v < d8; v++) {
+                acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(kj + v * 8),
+                                        _mm256_loadu_ps(qi + v * 8), acc0);
+            }
+            dot += hreduce256_ps(acc0);
+
+            kqi[j] = dot * decay_i[j];
+        }
+
+        /* Zero upper triangle */
+        for (int j = i + 1; j < cs; j++) {
+            kqi[j] = 0.0f;
+        }
+    }
+}
+
+/* Kernel 4: State update -- accumulate weighted outer products */
+static void ssm_kernel_state_update(
+        float *state,           /* [d][d] in-place */
+        const float *v_hat,     /* [cs][d] */
+        const float *k,         /* [cs][d] */
+        const float *decay_to_end, /* [cs] */
+        float total_decay,
+        int d, int cs)
+{
+    int d8 = d / 8;
+
+    /* First: decay the existing state by total_decay */
+    __m256 td = _mm256_set1_ps(total_decay);
+    for (int r = 0; r < d; r++) {
+        float *sr = state + r * d;
+        for (int v = 0; v < d8; v++) {
+            __m256 sv = _mm256_loadu_ps(sr + v * 8);
+            _mm256_storeu_ps(sr + v * 8, _mm256_mul_ps(sv, td));
+        }
+    }
+
+    /* Second: accumulate weighted outer products.
+     * Process 4 rows at a time for better register utilization. */
+    int nr = d / 4;
+
+    for (int j = 0; j < cs; j++) {
+        const float *vj = v_hat + j * d;
+        const float *kj = k + j * d;
+        float dj = decay_to_end[j];
+
+        if (dj == 0.0f) continue;
+
+        for (int g = 0; g < nr; g++) {
+            int base = g * 4;
+            float vj0 = vj[base];
+            float vj1 = vj[base + 1];
+            float vj2 = vj[base + 2];
+            float vj3 = vj[base + 3];
+
+            __m256 s0 = _mm256_set1_ps(vj0 * dj);
+            __m256 s1 = _mm256_set1_ps(vj1 * dj);
+            __m256 s2 = _mm256_set1_ps(vj2 * dj);
+            __m256 s3 = _mm256_set1_ps(vj3 * dj);
+
+            for (int v = 0; v < d8; v++) {
+                int col_base = v * 8;
+                __m256 kv = _mm256_loadu_ps(kj + col_base);
+
+                __m256 r0 = _mm256_loadu_ps(state + base * d + col_base);
+                __m256 r1 = _mm256_loadu_ps(state + (base+1) * d + col_base);
+                __m256 r2 = _mm256_loadu_ps(state + (base+2) * d + col_base);
+                __m256 r3 = _mm256_loadu_ps(state + (base+3) * d + col_base);
+
+                _mm256_storeu_ps(state + base * d + col_base, _mm256_fmadd_ps(kv, s0, r0));
+                _mm256_storeu_ps(state + (base+1) * d + col_base, _mm256_fmadd_ps(kv, s1, r1));
+                _mm256_storeu_ps(state + (base+2) * d + col_base, _mm256_fmadd_ps(kv, s2, r2));
+                _mm256_storeu_ps(state + (base+3) * d + col_base, _mm256_fmadd_ps(kv, s3, r3));
+            }
+        }
+    }
+}
+
+/* Kernel 1b: S_init @ Q^T -> sq[cs][d] */
+static void ssm_kernel_sq(
+        float *sq,        /* [cs][d] output */
+        const float *state, /* [d][d] state */
+        const float *q,   /* [cs][d] */
+        int d, int cs)
+{
+    int d8 = d / 8;
+
+    for (int i = 0; i < cs; i++) {
+        const float *qi = q + i * d;
+        float *sqi = sq + i * d;
+
+        __m256 acc[16];
+        int v;
+        for (v = 0; v < d8; v++) acc[v] = _mm256_setzero_ps();
+
+        for (int r = 0; r < d; r++) {
+            const float *sr = state + r * d;
+            float qir = qi[r];
+            if (qir == 0.0f) continue;
+            __m256 kv = _mm256_set1_ps(qir);
+            for (v = 0; v < d8; v++) {
+                __m256 sv = _mm256_loadu_ps(sr + v * 8);
+                acc[v] = _mm256_fmadd_ps(sv, kv, acc[v]);
+            }
+        }
+
+        for (v = 0; v < d8; v++) {
+            _mm256_storeu_ps(sqi + v * 8, acc[v]);
+        }
+    }
+}
+#endif /* PICOLM_AVX512 || PICOLM_AVX2 */
 
 /* ================================================================
  * Chunked DeltaNet recurrence.
@@ -2734,6 +3097,11 @@ static void ssm_chunk_head_task(int h, void *ctxp) {
     float *sq = sp; sp += cs * d;        /* S_init @ Q^T */
     float *kq = sp; sp += cs * cs;       /* K @ Q^T */
     float *decay_to_end = sp; sp += cs;  /* decay from each j to end */
+#elif defined(PICOLM_AVX2)
+    float *sk = sp; sp += cs * d;        /* S_init @ K^T */
+    float *sq = sp; sp += cs * d;        /* S_init @ Q^T */
+    float *kq = sp; sp += cs * cs;       /* K @ Q^T */
+    float *decay_to_end = sp; sp += cs;  /* decay from each j to end */
 #else
     (void)sp; /* silence unused warning */
 #endif
@@ -2752,7 +3120,7 @@ static void ssm_chunk_head_task(int h, void *ctxp) {
     }
 
     /* Pre-compute decay from each position to end of chunk (for state update) */
-#ifdef PICOLM_AVX512
+#if defined(PICOLM_AVX512) || defined(PICOLM_AVX2)
     {
         float cum_last = cum_g[cs - 1];
         for (int j = 0; j < cs; j++) {
@@ -2783,8 +3151,8 @@ static void ssm_chunk_head_task(int h, void *ctxp) {
         }
     }
 
-#ifdef PICOLM_AVX512
-    /* === AVX-512 micro-kernel path === */
+#if defined(PICOLM_AVX512) || defined(PICOLM_AVX2)
+    /* === AVX-512 / AVX2 micro-kernel path === */
 
     /* Kernel 2: Interaction matrix M = K @ K^T with decay mask */
     ssm_kernel_interaction(M_mat, k, decay_mask, d, cs);
