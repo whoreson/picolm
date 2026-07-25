@@ -1269,6 +1269,65 @@ void matmul_batch(float *out, const float *x, int n_batch,
     if (qx_buf) { free(qx_buf); if (qx_d_buf) free(qx_d_buf); }
 }
 
+/* Dual-batch Q8_0 row task: one task per output row, processes all tokens */
+typedef struct {
+    float *out1, *out2;
+    const void *W1, *W2;
+    const void *qx1_buf, *qx2_buf;
+    const float *qx1_d, *qx2_d;
+    size_t row_bytes1, row_bytes2, qx_stride1, qx_stride2;
+    int n, d, n_batch;
+    gguf_type_t qtype1, qtype2;
+} dual_q8_row_ctx_t;
+
+static void dual_q8_row_task(int i, void *ctxp) {
+    dual_q8_row_ctx_t *c = (dual_q8_row_ctx_t *)ctxp;
+    const char *wr1 = (const char *)c->W1 + (size_t)i * c->row_bytes1;
+    const char *wr2 = (const char *)c->W2 + (size_t)i * c->row_bytes2;
+    for (int b = 0; b < c->n_batch; b++) {
+        if (c->qtype1 == GGUF_TYPE_Q8_0) {
+            const block_q8_0 *xq = (const block_q8_0 *)((const char *)c->qx1_buf + (size_t)b * c->qx_stride1);
+            const float *xqd = c->qx1_d + (size_t)b * (c->n / 32);
+            c->out1[b * c->d + i] = vec_dot_q8_0_q8_0_deltas(xq, xqd, (const block_q8_0*)wr1, c->n);
+        } else if (c->qtype1 == GGUF_TYPE_Q4_0) {
+            const char *xb1 = (const char *)c->qx1_buf + (size_t)b * c->qx_stride1;
+            c->out1[b * c->d + i] = vec_dot_q4_0_q8_0(wr1, xb1, c->n);
+        } else if (c->qtype1 == GGUF_TYPE_Q4_K) {
+            const char *xb1 = (const char *)c->qx1_buf + (size_t)b * c->qx_stride1;
+            c->out1[b * c->d + i] = vec_dot_q4_K_q8_K(wr1, xb1, c->n);
+        } else if (c->qtype1 == GGUF_TYPE_Q1_0) {
+            const char *xb1 = (const char *)c->qx1_buf + (size_t)b * c->qx_stride1;
+            c->out1[b * c->d + i] = vec_dot_q1_0_q8_0(wr1, xb1, c->n);
+        } else if (c->qtype1 == GGUF_TYPE_Q2_0) {
+            const char *xb1 = (const char *)c->qx1_buf + (size_t)b * c->qx_stride1;
+            c->out1[b * c->d + i] = vec_dot_q2_0_q8_0(wr1, xb1, c->n);
+        } else {
+            const char *xb1 = (const char *)c->qx1_buf + (size_t)b * c->qx_stride1;
+            c->out1[b * c->d + i] = vec_dot_q8_0_q8_0(wr1, xb1, c->n);
+        }
+        if (c->qtype2 == GGUF_TYPE_Q8_0) {
+            const block_q8_0 *xq = (const block_q8_0 *)((const char *)c->qx2_buf + (size_t)b * c->qx_stride2);
+            const float *xqd = c->qx2_d + (size_t)b * (c->n / 32);
+            c->out2[b * c->d + i] = vec_dot_q8_0_q8_0_deltas(xq, xqd, (const block_q8_0*)wr2, c->n);
+        } else if (c->qtype2 == GGUF_TYPE_Q4_0) {
+            const char *xb2 = (const char *)c->qx2_buf + (size_t)b * c->qx_stride2;
+            c->out2[b * c->d + i] = vec_dot_q4_0_q8_0(wr2, xb2, c->n);
+        } else if (c->qtype2 == GGUF_TYPE_Q4_K) {
+            const char *xb2 = (const char *)c->qx2_buf + (size_t)b * c->qx_stride2;
+            c->out2[b * c->d + i] = vec_dot_q4_K_q8_K(wr2, xb2, c->n);
+        } else if (c->qtype2 == GGUF_TYPE_Q1_0) {
+            const char *xb2 = (const char *)c->qx2_buf + (size_t)b * c->qx_stride2;
+            c->out2[b * c->d + i] = vec_dot_q1_0_q8_0(wr2, xb2, c->n);
+        } else if (c->qtype2 == GGUF_TYPE_Q2_0) {
+            const char *xb2 = (const char *)c->qx2_buf + (size_t)b * c->qx_stride2;
+            c->out2[b * c->d + i] = vec_dot_q2_0_q8_0(wr2, xb2, c->n);
+        } else {
+            const char *xb2 = (const char *)c->qx2_buf + (size_t)b * c->qx_stride2;
+            c->out2[b * c->d + i] = vec_dot_q8_0_q8_0(wr2, xb2, c->n);
+        }
+    }
+}
+
 void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                         const void *W1, const void *W2,
                         int n, int d, gguf_type_t qtype1, gguf_type_t qtype2) {
@@ -1481,47 +1540,69 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
         size_t row_bytes2 = gguf_type_row_size(qtype2, n);
         const char *w1 = (const char *)W1;
         const char *w2 = (const char *)W2;
-        for (int i = 0; i < d; i++) {
-            const char *wr1 = w1 + (size_t)i * row_bytes;
-            const char *wr2 = w2 + (size_t)i * row_bytes2;
-            for (int b = 0; b < n_batch; b++) {
-                if (have_qx1) {
-                    const char *xb1 = (const char *)qx1_buf + (size_t)b * qx1_stride;
-                    if (qtype1 == GGUF_TYPE_Q8_0) {
-                        const block_q8_0 *xq = (const block_q8_0 *)xb1;
-                        const float *xqd = qx1_d_buf + (size_t)b * (n / 32);
-                        out1[b * d + i] = vec_dot_q8_0_q8_0_deltas(xq, xqd,
-                            (const block_q8_0*)wr1, n);
-                    } else if (qtype1 == GGUF_TYPE_Q4_K) {
-                        out1[b * d + i] = vec_dot_q4_K_q8_K(wr1, xb1, n);
-                    } else if (qtype1 == GGUF_TYPE_Q1_0) {
-                        out1[b * d + i] = vec_dot_q1_0_q8_0(wr1, xb1, n);
-                    } else if (qtype1 == GGUF_TYPE_Q2_0) {
-                        out1[b * d + i] = vec_dot_q2_0_q8_0(wr1, xb1, n);
-                    } else /* Q4_0 */ {
-                        out1[b * d + i] = vec_dot_q4_0_q8_0(wr1, xb1, n);
+
+        /* Threaded dispatch across output rows using tensor_parallel_for.
+         * Each row is independent, so parallelize across d rows. */
+        if (n_threads > 1 && d > matmul_min_rows) {
+            { static int noted = 0; if (!noted) { noted = 1;
+              fprintf(stderr, "NOTE: matmul_dual_batch threaded path (%dx%d, %d tok, qtype1=%d qtype2=%d)\n",
+                      n, d, n_batch, qtype1, qtype2); }}
+            dual_q8_row_ctx_t ctx;
+            ctx.out1 = out1; ctx.out2 = out2;
+            ctx.W1 = w1; ctx.W2 = w2;
+            ctx.qx1_buf = qx1_buf; ctx.qx2_buf = qx2_buf;
+            ctx.qx1_d = qx1_d_buf; ctx.qx2_d = qx2_d_buf;
+            ctx.row_bytes1 = row_bytes; ctx.row_bytes2 = row_bytes2;
+            ctx.qx_stride1 = qx1_stride; ctx.qx_stride2 = qx2_stride;
+            ctx.n = n; ctx.d = d; ctx.n_batch = n_batch;
+            ctx.qtype1 = qtype1; ctx.qtype2 = qtype2;
+            tensor_parallel_for(d, dual_q8_row_task, &ctx);
+        } else {
+            /* Serial fallback for small d or single-threaded */
+            { static int warned = 0;
+              if (!warned && d > 100) { warned = 1;
+                fprintf(stderr, "WARN: matmul_dual_batch serial path (%dx%d, %d tok, qtype1=%d qtype2=%d, threads=%d min_rows=%d)\n",
+                        n, d, n_batch, qtype1, qtype2, n_threads, matmul_min_rows); }}
+            for (int i = 0; i < d; i++) {
+                const char *wr1 = w1 + (size_t)i * row_bytes;
+                const char *wr2 = w2 + (size_t)i * row_bytes2;
+                for (int b = 0; b < n_batch; b++) {
+                    if (have_qx1) {
+                        const char *xb1 = (const char *)qx1_buf + (size_t)b * qx1_stride;
+                        if (qtype1 == GGUF_TYPE_Q8_0) {
+                            const block_q8_0 *xq = (const block_q8_0 *)xb1;
+                            const float *xqd = qx1_d_buf + (size_t)b * (n / 32);
+                            out1[b * d + i] = vec_dot_q8_0_q8_0_deltas(xq, xqd, (const block_q8_0*)wr1, n);
+                        } else if (qtype1 == GGUF_TYPE_Q4_K) {
+                            out1[b * d + i] = vec_dot_q4_K_q8_K(wr1, xb1, n);
+                        } else if (qtype1 == GGUF_TYPE_Q1_0) {
+                            out1[b * d + i] = vec_dot_q1_0_q8_0(wr1, xb1, n);
+                        } else if (qtype1 == GGUF_TYPE_Q2_0) {
+                            out1[b * d + i] = vec_dot_q2_0_q8_0(wr1, xb1, n);
+                        } else {
+                            out1[b * d + i] = vec_dot_q4_0_q8_0(wr1, xb1, n);
+                        }
+                    } else {
+                        out1[b * d + i] = vec_dot(wr1, x + b * n, n, qtype1);
                     }
-                } else {
-                    out1[b * d + i] = vec_dot(wr1, x + b * n, n, qtype1);
-                }
-                if (have_qx2) {
-                    const char *xb2 = (const char *)qx2_buf + (size_t)b * qx2_stride;
-                    if (qtype2 == GGUF_TYPE_Q8_0) {
-                        const block_q8_0 *xq = (const block_q8_0 *)xb2;
-                        const float *xqd = qx2_d_buf + (size_t)b * (n / 32);
-                        out2[b * d + i] = vec_dot_q8_0_q8_0_deltas(xq, xqd,
-                            (const block_q8_0*)wr2, n);
-                    } else if (qtype2 == GGUF_TYPE_Q4_K) {
-                        out2[b * d + i] = vec_dot_q4_K_q8_K(wr2, xb2, n);
-                    } else if (qtype2 == GGUF_TYPE_Q1_0) {
-                        out2[b * d + i] = vec_dot_q1_0_q8_0(wr2, xb2, n);
-                    } else if (qtype2 == GGUF_TYPE_Q2_0) {
-                        out2[b * d + i] = vec_dot_q2_0_q8_0(wr2, xb2, n);
-                    } else /* Q4_0 */ {
-                        out2[b * d + i] = vec_dot_q4_0_q8_0(wr2, xb2, n);
+                    if (have_qx2) {
+                        const char *xb2 = (const char *)qx2_buf + (size_t)b * qx2_stride;
+                        if (qtype2 == GGUF_TYPE_Q8_0) {
+                            const block_q8_0 *xq = (const block_q8_0 *)xb2;
+                            const float *xqd = qx2_d_buf + (size_t)b * (n / 32);
+                            out2[b * d + i] = vec_dot_q8_0_q8_0_deltas(xq, xqd, (const block_q8_0*)wr2, n);
+                        } else if (qtype2 == GGUF_TYPE_Q4_K) {
+                            out2[b * d + i] = vec_dot_q4_K_q8_K(wr2, xb2, n);
+                        } else if (qtype2 == GGUF_TYPE_Q1_0) {
+                            out2[b * d + i] = vec_dot_q1_0_q8_0(wr2, xb2, n);
+                        } else if (qtype2 == GGUF_TYPE_Q2_0) {
+                            out2[b * d + i] = vec_dot_q2_0_q8_0(wr2, xb2, n);
+                        } else {
+                            out2[b * d + i] = vec_dot_q4_0_q8_0(wr2, xb2, n);
+                        }
+                    } else {
+                        out2[b * d + i] = vec_dot(wr2, x + b * n, n, qtype2);
                     }
-                } else {
-                    out2[b * d + i] = vec_dot(wr2, x + b * n, n, qtype2);
                 }
             }
         }
