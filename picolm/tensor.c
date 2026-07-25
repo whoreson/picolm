@@ -1543,7 +1543,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
 
         /* Threaded dispatch across output rows using tensor_parallel_for.
          * Each row is independent, so parallelize across d rows. */
-        if (n_threads > 1 && d > matmul_min_rows) {
+        if (n_threads > 1 && d >= matmul_min_rows) {
             { static int noted = 0; if (!noted) { noted = 1;
               fprintf(stderr, "NOTE: matmul_dual_batch threaded path (%dx%d, %d tok, qtype1=%d qtype2=%d)\n",
                       n, d, n_batch, qtype1, qtype2); }}
