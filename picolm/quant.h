@@ -118,6 +118,13 @@ static inline void f32x4_to_fp16_hw(uint16_t *p, float32x4_t v) {
 #endif
 #endif /* !__CUDA__ && !__HIP__ */
 
+/* FMA3 (FMA) detection -- independent of AVX level.
+ * AMD Piledriver (FX-8350 etc.) has AVX+FMA but no AVX2.
+ * Intel Haswell+ has AVX2+FMA.  Sandy/Ivy Bridge have AVX but no FMA. */
+#if defined(__FMA__)
+#  define PICOLM_FMA 1
+#endif
+
 /* PPC Altivec (VMX) - separate from x86 chain */
 #if defined(__ALTIVEC__)
 #  define PICOLM_ALTIVEC 1

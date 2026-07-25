@@ -81,8 +81,8 @@ static int cpu_has_avx2(void) {
 #endif
 }
 
-/* AVX2 horizontal sum: reduce 8 FP32 lanes to one float */
-#ifdef PICOLM_AVX2
+/* AVX2/AVX horizontal sum: reduce 8 FP32 lanes to one float */
+#if defined(PICOLM_AVX2) || defined(PICOLM_AVX)
 static inline float hreduce256_ps(__m256 a) {
     __m256 t1 = _mm256_permute2f128_ps(a, a, 1);
     __m256 t2 = _mm256_add_ps(a, t1);
@@ -91,7 +91,7 @@ static inline float hreduce256_ps(__m256 a) {
     t3 = _mm_add_ss(t3, _mm_shuffle_ps(t3, t3, 0x1));
     return _mm_cvtss_f32(t3);
 }
-#endif
+#endif /* PICOLM_AVX2 || PICOLM_AVX */
 
 static void repack_model_weights_q4_0x8(model_t *m);
 
@@ -2301,8 +2301,8 @@ static void ssm_head_task(int h, void *ctxp) {
             ctx->ssm_output[(size_t)(base+3) * n_v_heads + h] = _mm512_reduce_add_ps(out3);
         }
     }
-#elif defined(PICOLM_AVX2)
-    /* ---- AVX2 vectorized recurrence ----
+#elif defined(PICOLM_AVX2) || defined(PICOLM_AVX)
+    /* ---- AVX2/AVX vectorized recurrence ----
      * Process 4 rows of the d_state x d_state state matrix simultaneously.
      * Each __m256 holds 8 floats. For d_state=128: 16 vector lanes per row,
      * 4 rows processed at once = 64 vector registers for the matrix.
@@ -2310,7 +2310,14 @@ static void ssm_head_task(int h, void *ctxp) {
      * Layout: st[h] is [d_state][d_state] row-major.
      * We process 4 consecutive rows (r, r+1, r+2, r+3) together.
      *
-     * Horizontal reduction of 8-lane vectors requires manual shuffles. */
+     * FMA256 macro: uses _mm256_fmadd_ps when FMA3 is available,
+     * falls back to mul+add for AVX-only CPUs without FMA (e.g. Sandy Bridge). */
+#ifdef PICOLM_FMA
+    #define FMA256(a,b,c) _mm256_fmadd_ps((a),(b),(c))
+#else
+    #define FMA256(a,b,c) _mm256_add_ps(_mm256_mul_ps((a),(b)),(c))
+#endif
+
     {
         int nr = d_state / 4; /* number of 4-row groups */
         __m256 ge_v = _mm256_set1_ps(ge);
@@ -2331,25 +2338,25 @@ static void ssm_head_task(int h, void *ctxp) {
                 __m256 r0 = _mm256_loadu_ps(st + base * d_state + col_base);
                 r0 = _mm256_mul_ps(r0, ge_v);
                 _mm256_storeu_ps(st + base * d_state + col_base, r0);
-                sk0 = _mm256_fmadd_ps(r0, kv, sk0);
+                sk0 = FMA256(r0, kv, sk0);
 
                 /* Row 1 */
                 __m256 r1 = _mm256_loadu_ps(st + (base+1) * d_state + col_base);
                 r1 = _mm256_mul_ps(r1, ge_v);
                 _mm256_storeu_ps(st + (base+1) * d_state + col_base, r1);
-                sk1 = _mm256_fmadd_ps(r1, kv, sk1);
+                sk1 = FMA256(r1, kv, sk1);
 
                 /* Row 2 */
                 __m256 r2 = _mm256_loadu_ps(st + (base+2) * d_state + col_base);
                 r2 = _mm256_mul_ps(r2, ge_v);
                 _mm256_storeu_ps(st + (base+2) * d_state + col_base, r2);
-                sk2 = _mm256_fmadd_ps(r2, kv, sk2);
+                sk2 = FMA256(r2, kv, sk2);
 
                 /* Row 3 */
                 __m256 r3 = _mm256_loadu_ps(st + (base+3) * d_state + col_base);
                 r3 = _mm256_mul_ps(r3, ge_v);
                 _mm256_storeu_ps(st + (base+3) * d_state + col_base, r3);
-                sk3 = _mm256_fmadd_ps(r3, kv, sk3);
+                sk3 = FMA256(r3, kv, sk3);
             }
 
             float sk0s = hreduce256_ps(sk0);
@@ -2379,27 +2386,27 @@ static void ssm_head_task(int h, void *ctxp) {
 
                 /* Row 0 */
                 __m256 r0 = _mm256_loadu_ps(st + base * d_state + col_base);
-                r0 = _mm256_fmadd_ps(kv, d0v, r0);
+                r0 = FMA256(kv, d0v, r0);
                 _mm256_storeu_ps(st + base * d_state + col_base, r0);
-                out0 = _mm256_fmadd_ps(r0, qv, out0);
+                out0 = FMA256(r0, qv, out0);
 
                 /* Row 1 */
                 __m256 r1 = _mm256_loadu_ps(st + (base+1) * d_state + col_base);
-                r1 = _mm256_fmadd_ps(kv, d1v, r1);
+                r1 = FMA256(kv, d1v, r1);
                 _mm256_storeu_ps(st + (base+1) * d_state + col_base, r1);
-                out1 = _mm256_fmadd_ps(r1, qv, out1);
+                out1 = FMA256(r1, qv, out1);
 
                 /* Row 2 */
                 __m256 r2 = _mm256_loadu_ps(st + (base+2) * d_state + col_base);
-                r2 = _mm256_fmadd_ps(kv, d2v, r2);
+                r2 = FMA256(kv, d2v, r2);
                 _mm256_storeu_ps(st + (base+2) * d_state + col_base, r2);
-                out2 = _mm256_fmadd_ps(r2, qv, out2);
+                out2 = FMA256(r2, qv, out2);
 
                 /* Row 3 */
                 __m256 r3 = _mm256_loadu_ps(st + (base+3) * d_state + col_base);
-                r3 = _mm256_fmadd_ps(kv, d3v, r3);
+                r3 = FMA256(kv, d3v, r3);
                 _mm256_storeu_ps(st + (base+3) * d_state + col_base, r3);
-                out3 = _mm256_fmadd_ps(r3, qv, out3);
+                out3 = FMA256(r3, qv, out3);
             }
 
             /* Horizontal reduce output */
@@ -2736,7 +2743,12 @@ static void ssm_kernel_sq(
         }
     }
 }
-#elif defined(PICOLM_AVX2)
+#elif defined(PICOLM_AVX2) || defined(PICOLM_AVX)
+#ifdef PICOLM_FMA
+    #define FMA256(a,b,c) _mm256_fmadd_ps((a),(b),(c))
+#else
+    #define FMA256(a,b,c) _mm256_add_ps(_mm256_mul_ps((a),(b)),(c))
+#endif
 
 /* Kernel 1: V_eff -- compute S_init @ K^T -> sk[cs][d] */
 static void ssm_kernel_veff(
@@ -2764,7 +2776,7 @@ static void ssm_kernel_veff(
             __m256 kv = _mm256_set1_ps(kir);
             for (v = 0; v < d8; v++) {
                 __m256 sv = _mm256_loadu_ps(sr + v * 8);
-                acc[v] = _mm256_fmadd_ps(sv, kv, acc[v]);
+                acc[v] = FMA256(sv, kv, acc[v]);
             }
         }
 
@@ -2800,13 +2812,13 @@ static void ssm_kernel_interaction(
 
             int v;
             for (v = 0; v + 3 < d8; v += 4) {
-                acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(ki + v * 8),
+                acc0 = FMA256(_mm256_loadu_ps(ki + v * 8),
                                         _mm256_loadu_ps(kj + v * 8), acc0);
-                acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(ki + (v+1) * 8),
+                acc1 = FMA256(_mm256_loadu_ps(ki + (v+1) * 8),
                                         _mm256_loadu_ps(kj + (v+1) * 8), acc1);
-                acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(ki + (v+2) * 8),
+                acc2 = FMA256(_mm256_loadu_ps(ki + (v+2) * 8),
                                         _mm256_loadu_ps(kj + (v+2) * 8), acc2);
-                acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(ki + (v+3) * 8),
+                acc3 = FMA256(_mm256_loadu_ps(ki + (v+3) * 8),
                                         _mm256_loadu_ps(kj + (v+3) * 8), acc3);
             }
 
@@ -2814,7 +2826,7 @@ static void ssm_kernel_interaction(
                       + hreduce256_ps(acc2) + hreduce256_ps(acc3);
 
             for (; v < d8; v++) {
-                acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(ki + v * 8),
+                acc0 = FMA256(_mm256_loadu_ps(ki + v * 8),
                                         _mm256_loadu_ps(kj + v * 8), acc0);
             }
             dot += hreduce256_ps(acc0);
@@ -2855,13 +2867,13 @@ static void ssm_kernel_output_cross(
 
             int v;
             for (v = 0; v + 3 < d8; v += 4) {
-                acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(kj + v * 8),
+                acc0 = FMA256(_mm256_loadu_ps(kj + v * 8),
                                         _mm256_loadu_ps(qi + v * 8), acc0);
-                acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(kj + (v+1) * 8),
+                acc1 = FMA256(_mm256_loadu_ps(kj + (v+1) * 8),
                                         _mm256_loadu_ps(qi + (v+1) * 8), acc1);
-                acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(kj + (v+2) * 8),
+                acc2 = FMA256(_mm256_loadu_ps(kj + (v+2) * 8),
                                         _mm256_loadu_ps(qi + (v+2) * 8), acc2);
-                acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(kj + (v+3) * 8),
+                acc3 = FMA256(_mm256_loadu_ps(kj + (v+3) * 8),
                                         _mm256_loadu_ps(qi + (v+3) * 8), acc3);
             }
 
@@ -2869,7 +2881,7 @@ static void ssm_kernel_output_cross(
                       + hreduce256_ps(acc2) + hreduce256_ps(acc3);
 
             for (; v < d8; v++) {
-                acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(kj + v * 8),
+                acc0 = FMA256(_mm256_loadu_ps(kj + v * 8),
                                         _mm256_loadu_ps(qi + v * 8), acc0);
             }
             dot += hreduce256_ps(acc0);
@@ -2937,10 +2949,10 @@ static void ssm_kernel_state_update(
                 __m256 r2 = _mm256_loadu_ps(state + (base+2) * d + col_base);
                 __m256 r3 = _mm256_loadu_ps(state + (base+3) * d + col_base);
 
-                _mm256_storeu_ps(state + base * d + col_base, _mm256_fmadd_ps(kv, s0, r0));
-                _mm256_storeu_ps(state + (base+1) * d + col_base, _mm256_fmadd_ps(kv, s1, r1));
-                _mm256_storeu_ps(state + (base+2) * d + col_base, _mm256_fmadd_ps(kv, s2, r2));
-                _mm256_storeu_ps(state + (base+3) * d + col_base, _mm256_fmadd_ps(kv, s3, r3));
+                _mm256_storeu_ps(state + base * d + col_base, FMA256(kv, s0, r0));
+                _mm256_storeu_ps(state + (base+1) * d + col_base, FMA256(kv, s1, r1));
+                _mm256_storeu_ps(state + (base+2) * d + col_base, FMA256(kv, s2, r2));
+                _mm256_storeu_ps(state + (base+3) * d + col_base, FMA256(kv, s3, r3));
             }
         }
     }
@@ -2970,7 +2982,7 @@ static void ssm_kernel_sq(
             __m256 kv = _mm256_set1_ps(qir);
             for (v = 0; v < d8; v++) {
                 __m256 sv = _mm256_loadu_ps(sr + v * 8);
-                acc[v] = _mm256_fmadd_ps(sv, kv, acc[v]);
+                acc[v] = FMA256(sv, kv, acc[v]);
             }
         }
 
@@ -2979,7 +2991,8 @@ static void ssm_kernel_sq(
         }
     }
 }
-#endif /* PICOLM_AVX512 || PICOLM_AVX2 */
+#undef FMA256
+#endif /* PICOLM_AVX512 || PICOLM_AVX2 || PICOLM_AVX */
 
 /* ================================================================
  * Chunked DeltaNet recurrence.
@@ -3097,7 +3110,7 @@ static void ssm_chunk_head_task(int h, void *ctxp) {
     float *sq = sp; sp += cs * d;        /* S_init @ Q^T */
     float *kq = sp; sp += cs * cs;       /* K @ Q^T */
     float *decay_to_end = sp; sp += cs;  /* decay from each j to end */
-#elif defined(PICOLM_AVX2)
+#elif defined(PICOLM_AVX2) || defined(PICOLM_AVX)
     float *sk = sp; sp += cs * d;        /* S_init @ K^T */
     float *sq = sp; sp += cs * d;        /* S_init @ Q^T */
     float *kq = sp; sp += cs * cs;       /* K @ Q^T */
@@ -3120,7 +3133,7 @@ static void ssm_chunk_head_task(int h, void *ctxp) {
     }
 
     /* Pre-compute decay from each position to end of chunk (for state update) */
-#if defined(PICOLM_AVX512) || defined(PICOLM_AVX2)
+#if defined(PICOLM_AVX512) || defined(PICOLM_AVX2) || defined(PICOLM_AVX)
     {
         float cum_last = cum_g[cs - 1];
         for (int j = 0; j < cs; j++) {
@@ -3151,7 +3164,7 @@ static void ssm_chunk_head_task(int h, void *ctxp) {
         }
     }
 
-#if defined(PICOLM_AVX512) || defined(PICOLM_AVX2)
+#if defined(PICOLM_AVX512) || defined(PICOLM_AVX2) || defined(PICOLM_AVX)
     /* === AVX-512 / AVX2 micro-kernel path === */
 
     /* Kernel 2: Interaction matrix M = K @ K^T with decay mask */
