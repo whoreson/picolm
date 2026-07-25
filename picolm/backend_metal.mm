@@ -456,8 +456,19 @@ static int g_ndev = 0;
 
 // Grow-only scratch buffers (mirror CUDA's reserve()). Shared storage mode =
 // unified memory: CPU writes x, GPU reads x & writes y, CPU reads y.
+//
+// These stay hazard-TRACKED (the default): picolm_gpu_expert_mlp issues 4
+// separate compute encoders in ONE command buffer with cross-encoder
+// read-after-write deps on g_gate/g_up (gate matmul -> silu_mul -> down
+// matmul). Default tracking is what serializes those across encoders; making
+// them Untracked would race. The per-call waitUntilCompleted below does not
+// help with intra-command-buffer ordering.
 static id<MTLBuffer> g_x = nil, g_y = nil, g_gate = nil, g_up = nil;
 static size_t g_xcap = 0, g_ycap = 0, g_gatecap = 0, g_upcap = 0;
+// Cached CPU mappings of the scratch buffers (stable for a buffer's lifetime;
+// refreshed only on reallocation inside reserve_buf). Saves a
+// -[MTLBuffer contents] message send on every dispatch.
+static void *g_xptr = NULL, *g_yptr = NULL, *g_gateptr = NULL, *g_upptr = NULL;
 
 static id<MTLComputePipelineState> ps_for_qtype(gguf_type_t q) {
     switch (q) {
@@ -475,11 +486,22 @@ static id<MTLComputePipelineState> ps_for_qtype(gguf_type_t q) {
 // Grow-only: only (re)allocates when current capacity is too small.
 // Parameter qualified __strong so we can pass &g_x (a strong global); the
 // default (__autoreleasing*) would reject address-of-strong-global under ARC.
-static id<MTLBuffer> reserve_buf(__strong id<MTLBuffer> *buf, size_t *cap, size_t bytes) {
+//
+// `options` tunes the CPU cache policy for shared storage:
+//   - WriteCombined for CPU->GPU upload buffers (g_x): the CPU write streams
+//     straight to unified memory without evicting hot host data, and is never
+//     read back on the CPU. This is the hot path (every matmul memcpy()s x in).
+//   - DefaultCache  for GPU->CPU download buffers (g_y): CPU reads them back.
+// `ptr_out` (may be NULL) receives the stable -contents pointer, so callers
+// skip the message send per dispatch.
+static id<MTLBuffer> reserve_buf(__strong id<MTLBuffer> *buf, size_t *cap,
+                                 void **ptr_out, size_t bytes,
+                                 MTLResourceOptions options) {
     if (*buf && *cap >= bytes) return *buf;
-    *buf = [g_device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-    if (!*buf) { *cap = 0; return nil; }
+    *buf = [g_device newBufferWithLength:bytes options:options];
+    if (!*buf) { *cap = 0; if (ptr_out) *ptr_out = NULL; return nil; }
     *cap = bytes;
+    if (ptr_out) *ptr_out = [*buf contents];
     return *buf;
 }
 
@@ -550,6 +572,7 @@ int picolm_gpu_init(const int *devices, int count) {
 void picolm_gpu_shutdown(void) {
     g_x = g_y = g_gate = g_up = nil;
     g_xcap = g_ycap = g_gatecap = g_upcap = 0;
+    g_xptr = g_yptr = g_gateptr = g_upptr = NULL;
     g_ps_f32 = g_ps_f16 = g_ps_q4_0 = g_ps_q8_0 = g_ps_q4_K = g_ps_q5_K = g_ps_q6_K = g_ps_silu = nil;
     g_library = nil; g_queue = nil; g_device = nil;
     g_ndev = 0;
@@ -608,10 +631,16 @@ int picolm_gpu_tensor_upload(void **tensor,
     uintptr_t base_addr = addr & ~(uintptr_t)(page - 1);   /* round down to page */
     size_t pad_lo = (size_t)(addr - base_addr);
     size_t aligned_len = (total + pad_lo + page - 1) & ~(page - 1);  /* round up */
+    /* Untracked: weights are read-only on the GPU and never written by host or
+     * device after upload, so there is no read-after-write hazard to track.
+     * Removing per-resource hazard tracking lowers dispatch-encoding overhead
+     * for every matmul that binds a weight buffer (the common case). Ordering
+     * vs the CPU is provided by the per-call waitUntilCompleted full barrier. */
     buf = [g_device newBufferWithBytesNoCopy:(void *)base_addr
                                       length:aligned_len
                                       options:MTLResourceStorageModeShared |
-                                               MTLResourceCPUCacheModeDefaultCache
+                                               MTLResourceCPUCacheModeDefaultCache |
+                                               MTLResourceHazardTrackingModeUntracked
                                       deallocator:^(void *ptr, NSUInteger len) {
                                           /* mmap'd memory is owned by the model; nothing to free. */
                                           (void)ptr; (void)len;
@@ -620,8 +649,11 @@ int picolm_gpu_tensor_upload(void **tensor,
         zero_copy = 1;
         buf_offset = pad_lo;
     } else {
-        /* Fallback: one-time copy into a shared-storage buffer (offset 0). */
-        buf = [g_device newBufferWithBytes:weights length:total options:MTLResourceStorageModeShared];
+        /* Fallback: one-time copy into a shared-storage buffer (offset 0).
+         * Untracked here too (see above): read-only on the GPU. */
+        buf = [g_device newBufferWithBytes:weights length:total
+                                   options:MTLResourceStorageModeShared |
+                                            MTLResourceHazardTrackingModeUntracked];
         buf_offset = 0;
     }
     if (!buf) {
@@ -694,17 +726,26 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
     int I = t->I, O = t->O;
     size_t xb = (size_t)S * I * sizeof(float);
     size_t yb = (size_t)S * O * sizeof(float);
-    if (!reserve_buf(&g_x, &g_xcap, xb)) return 0;
-    if (!reserve_buf(&g_y, &g_ycap, yb)) return 0;
+    /* g_x is CPU-written/GPU-read -> WriteCombined (streaming write, no cache
+     * pollution). g_y is GPU-written/CPU-read -> DefaultCache. */
+    if (!reserve_buf(&g_x, &g_xcap, &g_xptr, xb,
+                     MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined)) return 0;
+    if (!reserve_buf(&g_y, &g_ycap, &g_yptr, yb,
+                     MTLResourceStorageModeShared | MTLResourceCPUCacheModeDefaultCache)) return 0;
 
-    memcpy([g_x contents], x, xb);
+    memcpy(g_xptr, x, xb);
 
-    id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+    /* Unretained command buffer: skips per-resource retain/release bookkeeping
+     * for every bound buffer + pipeline state. Safe because every resource
+     * bound here is a static global (scratch buffers, pipeline states) or a
+     * model-resident weight tensor that outlives this command buffer. The
+     * function holds the command buffer until waitUntilCompleted anyway. */
+    id<MTLCommandBuffer> cmd = [g_queue commandBufferWithUnretainedReferences];
     if (!launch_matmul(t, g_x, g_y, S, cmd)) { return 0; }
     [cmd commit];
     [cmd waitUntilCompleted];
 
-    memcpy(y, [g_y contents], yb);
+    memcpy(y, g_yptr, yb);
     return 1;
 }
 
@@ -718,14 +759,23 @@ int picolm_gpu_expert_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
     int D = gate->I, I = gate->O;
     size_t xb = (size_t)S * D * sizeof(float);
     size_t ib = (size_t)S * I * sizeof(float);
-    if (!reserve_buf(&g_x,    &g_xcap,    xb)) return 0;
-    if (!reserve_buf(&g_y,    &g_ycap,    xb)) return 0;
-    if (!reserve_buf(&g_gate, &g_gatecap, ib)) return 0;
-    if (!reserve_buf(&g_up,   &g_upcap,   ib)) return 0;
+    /* g_x is the only CPU->GPU upload here (WriteCombined). g_y is read back on
+     * the CPU. g_gate/g_up are pure GPU scratch (written and re-read inside the
+     * command buffer), so their CPU cache mode is irrelevant; DefaultCache. */
+    if (!reserve_buf(&g_x,    &g_xcap,    &g_xptr,    xb,
+                     MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined)) return 0;
+    if (!reserve_buf(&g_y,    &g_ycap,    &g_yptr,    xb,
+                     MTLResourceStorageModeShared | MTLResourceCPUCacheModeDefaultCache)) return 0;
+    if (!reserve_buf(&g_gate, &g_gatecap, &g_gateptr, ib,
+                     MTLResourceStorageModeShared | MTLResourceCPUCacheModeDefaultCache)) return 0;
+    if (!reserve_buf(&g_up,   &g_upcap,   &g_upptr,   ib,
+                     MTLResourceStorageModeShared | MTLResourceCPUCacheModeDefaultCache)) return 0;
 
-    memcpy([g_x contents], x, xb);
+    memcpy(g_xptr, x, xb);
 
-    id<MTLCommandBuffer> cmd = [g_queue commandBuffer];
+    /* Unretained command buffer: see picolm_gpu_matmul (every bound buffer
+     * outlives this command buffer). */
+    id<MTLCommandBuffer> cmd = [g_queue commandBufferWithUnretainedReferences];
     /* gate = W_gate @ x ; up = W_up @ x */
     if (!launch_matmul(gate, g_x, g_gate, S, cmd)) return 0;
     if (!launch_matmul(up,   g_x, g_up,   S, cmd)) return 0;
@@ -747,7 +797,7 @@ int picolm_gpu_expert_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
     [cmd commit];
     [cmd waitUntilCompleted];
 
-    memcpy(y, [g_y contents], xb);
+    memcpy(y, g_yptr, xb);
     return 1;
 }
 
