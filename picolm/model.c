@@ -4167,11 +4167,28 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     /* 21. Post-attention norm + FFN (only if MLP weights exist for this layer) */
     if (lw->ffn_gate && lw->ffn_up && lw->ffn_down) {
         rmsnorm(s->xb, x, s->post_attn_norm_w[il], dim, eps);
+#ifdef PICOLM_GPU
+        /* Fused FFN on GPU: y = down(silu(gate(x)) * up(x)) in one command
+         * buffer (3 dispatches -> 1); s->xb aliases in/out safely. On miss
+         * fall through to the per-matmul CPU path. Matches model_forward. */
+        if (gpu_lw) {
+            gpu_layer_weights_t *gl = (gpu_layer_weights_t *)gpu_lw;
+            if (gl->ffn_gate && gl->ffn_up && gl->ffn_down &&
+                picolm_gpu_expert_mlp((picolm_gpu_tensor_t *)gl->ffn_gate,
+                                      (picolm_gpu_tensor_t *)gl->ffn_up,
+                                      (picolm_gpu_tensor_t *)gl->ffn_down,
+                                      s->xb, s->xb, 1))
+                goto ssm_ffn_done;
+        }
+#endif
         matmul(s->hb, s->xb, lw->ffn_gate, dim, c->n_ffn, lw->type_ffn_gate);
         matmul(s->hb2, s->xb, lw->ffn_up, dim, c->n_ffn, lw->type_ffn_up);
         silu(s->hb, c->n_ffn);
         elemwise_mul(s->hb, s->hb, s->hb2, c->n_ffn);
         matmul(s->xb, s->hb, lw->ffn_down, c->n_ffn, dim, lw->type_ffn_down);
+#ifdef PICOLM_GPU
+ssm_ffn_done:
+#endif
         vec_add(x, s->xb, dim);
     }
 }
