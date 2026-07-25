@@ -365,13 +365,22 @@ int main(int argc, char **argv) {
     int    viz_height = 480;
 #endif
 
-    /* Parse arguments */
+    /* First pass: find positional model path */
     for (int i = 1; i < argc; i++) {
-        /* Positional model path: first non-dash arg */
         if (argv[i][0] != '-') {
             if (!model_path) model_path = argv[i];
-            continue;
+            else {
+                fprintf(stderr, "Unexpected argument: %s\n", argv[i]);
+                usage(argv[0]);
+                return 1;
+            }
         }
+    }
+
+    /* Second pass: parse options (model_path now known regardless of order) */
+    for (int i = 1; i < argc; i++) {
+        /* Skip positional args (already captured) */
+        if (argv[i][0] != '-') continue;
         if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
             prompt_buf = strdup(argv[++i]);
             if (!prompt_buf) { fprintf(stderr, "strdup failed\n"); return 1; }

@@ -466,8 +466,9 @@ static const char *gguf_type_name(uint32_t type) {
         case 37: return "q8_4";
         case 38: return "q3_0";
         case 39: return "q4_3";
-        case 40: return "q1_0";
-        case 41: return "q4_2";
+        case 40: return "nvfp4";
+        case 41: return "q1_0";
+        case 42: return "q2_0";
         default: return "unknown";
     }
 }
