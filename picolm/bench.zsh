@@ -134,7 +134,7 @@ resolve_model() {
     *)                                  pat="(#i)*${name}*" ;;
   esac
   local m
-  for m in "$LLMS_DIR"/$~pat(N); do print -- "${m:A}"; return 0; done
+  for m in "$LLMS_DIR"/$~pat(N.); do print -- "${m:A}"; return 0; done
   return 1
 }
 
