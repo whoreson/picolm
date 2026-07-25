@@ -70,6 +70,11 @@ void viz_free(void);
 /* Check if any viewer is currently connected (optional, for debugging).*/
 int  viz_has_viewers(void);
 
+/* Check if a layer should be skipped (toggled by VNC mouse click).
+ * Returns 1 if layer `layer` should be skipped, 0 otherwise.
+ * Safe to call from inference thread (atomic load).                   */
+int  viz_layer_skip(int layer);
+
 #ifdef __cplusplus
 }
 #endif

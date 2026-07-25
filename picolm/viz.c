@@ -204,6 +204,20 @@ typedef struct {
 static viz_state_t viz;
 
 /* ------------------------------------------------------------------ */
+/*  Layer skip array (toggled by VNC mouse click)                      */
+/*  Shared between VNC thread (writer) and inference thread (reader).  */
+/* ------------------------------------------------------------------ */
+static _Atomic int viz_skip_layer[VIZ_MAX_LAYERS];
+
+/* Check if a layer should be skipped.
+ * Called from the inference thread. Atomic load, no blocking. */
+int viz_layer_skip(int layer) {
+    if (layer >= 0 && layer < VIZ_MAX_LAYERS)
+        return atomic_load_explicit(&viz_skip_layer[layer], memory_order_relaxed);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /*  VNC Protocol Helpers (big-endian network byte order)               */
 /* ------------------------------------------------------------------ */
 
@@ -818,7 +832,7 @@ static void viz_render_heatmap(void) {
         viz_draw_string(fb, fb_w, fb_h, bar_x + 1, heatmap_y + bar_h - VIZ_FONT_H, num_buf, dim);
     }
 
-    /* Layer labels on the left (only if enough room). */
+    /* Layer labels + skip indicators on the left. */
     if (layer_h >= 10 && n_layers <= 64) {
         char lbl[16];
         for (int l = 0; l < n_layers; l++) {
@@ -827,6 +841,28 @@ static void viz_render_heatmap(void) {
             viz_draw_char(fb, fb_w, fb_h, 1, cy, lbl[0], dim);
             if (l >= 9) {
                 viz_draw_char(fb, fb_w, fb_h, 7, cy, lbl[1], dim);
+            }
+            /* Draw "S" indicator if layer is skipped */
+            if (atomic_load_explicit(&viz_skip_layer[l], memory_order_relaxed)) {
+                /* Bright red "S" at right edge before color bar */
+                unsigned int red = 0xFFFFFF00; /* BGRA: bright red */
+                int skip_lbl_x = fb_w - 30;
+                if (skip_lbl_x < 20) skip_lbl_x = fb_w / 2;
+                viz_draw_char(fb, fb_w, fb_h, skip_lbl_x, cy, 'S', red);
+                /* Dim the entire row by drawing semi-transparent overlay */
+                int row_start = heatmap_y + l * layer_h;
+                int row_h = layer_h;
+                for (int py = row_start; py < row_start + row_h && py < fb_h; py++) {
+                    size_t row_off = (size_t)py * fb_w * 4;
+                    for (int px = 0; px < fb_w; px++) {
+                        size_t idx = row_off + px * 4;
+                        /* Reduce all channels to 30% */
+                        fb[idx]     = (unsigned char)(fb[idx] * 3 / 10);
+                        fb[idx + 1] = (unsigned char)(fb[idx + 1] * 3 / 10);
+                        fb[idx + 2] = (unsigned char)(fb[idx + 2] * 3 / 10);
+                        /* Alpha stays 255 */
+                    }
+                }
             }
         }
     }
@@ -987,9 +1023,40 @@ static void viz_vnc_process_messages(void) {
             }
             break;
 
-        case 5: /* PointerEvent - we ignore but consume */
+        case 5: /* PointerEvent - mouse click toggles layer skip */
             if (viz_recv_full(viz.client_fd, buf, 5) < 0) {
                 viz_vnc_disconnect();
+            }
+            {
+                uint8_t button_mask = buf[0];
+                (void)vnc_read_u16_be(buf + 1); /* mouse_x, not used for layer skip */
+                uint16_t mouse_y = vnc_read_u16_be(buf + 3);
+
+                /* Left button (mask & 0x01) click on heatmap toggles layer skip */
+                if (button_mask & 0x01) {
+                    /* Layout: top bar = 20px, then 2px gap, then heatmap rows.
+                     * Each layer gets (height - 22) / n_layers pixels. */
+                    int top_bar_h = 20;
+                    int heatmap_y = top_bar_h + 2;
+                    int heatmap_h = viz.height - heatmap_y - 2;
+                    int n_layers = viz.n_layers;
+                    if (n_layers > 0 && mouse_y >= heatmap_y && mouse_y < (uint16_t)(heatmap_y + heatmap_h)) {
+                        int layer_h = heatmap_h / n_layers;
+                        if (layer_h > 0) {
+                            int clicked_layer = (mouse_y - heatmap_y) / layer_h;
+                            if (clicked_layer >= 0 && clicked_layer < n_layers) {
+                                int old = atomic_load_explicit(&viz_skip_layer[clicked_layer],
+                                                                memory_order_relaxed);
+                                atomic_store_explicit(&viz_skip_layer[clicked_layer], !old,
+                                                       memory_order_release);
+                                fprintf(stderr, "[VIZ] Layer %d: %s\n",
+                                        clicked_layer, !old ? "SKIPPED" : "ACTIVE");
+                                atomic_store_explicit(&viz.update_requested, 1,
+                                                       memory_order_release);
+                            }
+                        }
+                    }
+                }
             }
             break;
 

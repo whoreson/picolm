@@ -2020,6 +2020,18 @@ float *model_forward(model_t *m, int token, int pos) {
 #endif
         int ri = 2 + l * 9;
 
+#ifdef PICOLM_VIZ
+        /* Layer skip: toggled by VNC mouse click, zero overhead when unused */
+        if (viz_layer_skip(l)) {
+            /* Pass through: residual stays unchanged, no computation */
+#ifdef PICOLM_VIZ
+            viz_push_layer(l, s->x, dim);
+#endif
+            BENCH_LAYER_END(l, 0);
+            continue;
+        }
+#endif
+
         if (c->has_ssm && !lw->is_attn_layer) {
             /* SSM layer (Qwen3.5) */
 #ifdef PICOLM_GPU
@@ -5619,6 +5631,18 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
     for (int l = 0; l < c->n_layers; l++) {
         layer_weights_t *lw = &w->layers[l];
         BENCH_LAYER_START();
+
+#ifdef PICOLM_VIZ
+        /* Layer skip: toggled by VNC mouse click, zero overhead when unused */
+        if (viz_layer_skip(l)) {
+            /* Pass through: batch stays unchanged, no computation */
+#ifdef PICOLM_VIZ
+            viz_push_layer(l, x_batch + (n_tokens - 1) * dim, dim);
+#endif
+            BENCH_LAYER_END(l, 1);
+            continue;
+        }
+#endif
 
         if (c->has_ssm && !lw->is_attn_layer) {
             if (m->ssm_batched_prefill) {
