@@ -264,6 +264,8 @@ typedef struct {
 
 /* Load a GGUF model file. Returns 0 on success. */
 int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v);
+/* List all tensors in a GGUF file (name, dims, type) and exit. Returns 0 on success. */
+int model_list_tensors(const char *path);
 int model_load_safetensors(model_t *m, const char *model_dir, int max_seq_len, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v);
 
 /* Pin layer weights in RAM. Given a budget in bytes, locks the maximum

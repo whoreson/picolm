@@ -1,6 +1,7 @@
 #include "model.h"
 #include "tensor.h"
 #include "quant.h"
+#include <inttypes.h>
 
 #if defined(__APPLE__) && defined(__ppc__) && defined(__ALTIVEC__)
 #include <altivec.h>
@@ -316,6 +317,123 @@ static void munmap_file(model_t *m) {
     close(m->fd);
 #endif
     m->mmap_addr = NULL;
+}
+
+/* ---- Tensor listing ---- */
+
+static const char *gguf_type_name(uint32_t type) {
+    switch (type) {
+        case 0:  return "f32";
+        case 1:  return "f16";
+        case 2:  return "q4_0";
+        case 3:  return "q4_1";
+        case 6:  return "q5_0";
+        case 7:  return "q5_1";
+        case 8:  return "q8_0";
+        case 9:  return "q8_1";
+        case 10: return "q2_k";
+        case 11: return "q3_k";
+        case 12: return "q4_k";
+        case 13: return "q5_k";
+        case 14: return "q6_k";
+        case 15: return "q8_k";
+        case 16: return "iq2_xxs";
+        case 17: return "iq2_xs";
+        case 18: return "iq3_xxs";
+        case 19: return "iq1_s";
+        case 20: return "iq4_xxs";
+        case 21: return "iq3_s";
+        case 22: return "iq2_s";
+        case 23: return "iq4_xs";
+        case 24: return "iq1_m";
+        case 25: return "iq6_xxs";
+        case 26: return "iq4_nl";
+        case 27: return "i8";
+        case 28: return "u8";
+        case 29: return "i4";
+        case 30: return "bf16";
+        case 31: return "q4_0_4_4";
+        case 32: return "q4_0_4_8";
+        case 33: return "q4_0_8_8";
+        case 34: return "tq1_0";
+        case 35: return "tq2_0";
+        case 36: return "mxfp4";
+        case 37: return "q8_4";
+        case 38: return "q3_0";
+        case 39: return "q4_3";
+        case 40: return "q1_0";
+        case 41: return "q4_2";
+        default: return "unknown";
+    }
+}
+
+int model_list_tensors(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { perror("open"); return -1; }
+
+    struct stat st;
+    if (fstat(fd, &st) < 0) { close(fd); return -1; }
+
+    uint8_t *addr = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (addr == MAP_FAILED) { close(fd); return -1; }
+
+    reader_t r = { .data = addr, .pos = 0, .size = (uint64_t)st.st_size };
+
+    uint32_t magic = read_u32(&r);
+    if (magic != GGUF_MAGIC) {
+        fprintf(stderr, "Invalid GGUF magic: 0x%08X\n", magic);
+        munmap(addr, st.st_size); close(fd);
+        return -1;
+    }
+
+    uint32_t version = read_u32(&r);
+    uint64_t n_tensors = read_u64(&r);
+    uint64_t n_metadata = read_u64(&r);
+
+    fprintf(stderr, "GGUF v%u: %" PRIu64 " metadata entries, %" PRIu64 " tensors\n\n",
+            version, n_metadata, n_tensors);
+
+    /* Skip metadata */
+    for (uint64_t i = 0; i < n_metadata; i++) {
+        gguf_str_t key = read_gguf_string(&r); (void)key;
+        uint32_t vtype = read_u32(&r);
+        int dummy;
+        skip_meta_value(&r, vtype, &dummy);
+    }
+
+    /* Print tensor list */
+    fprintf(stderr, "%-52s %14s %-12s %s\n", "Name", "Shape", "Type", "Type ID");
+    fprintf(stderr, "%-52s %14s %-12s %s\n", "----", "----", "----", "-------");
+
+    for (uint64_t i = 0; i < n_tensors; i++) {
+        gguf_str_t name = read_gguf_string(&r);
+        uint32_t n_dims = read_u32(&r);
+        uint64_t dims[4] = {0};
+        for (uint32_t d = 0; d < n_dims; d++) dims[d] = read_u64(&r);
+        uint32_t type = read_u32(&r);
+        uint64_t offset = read_u64(&r); (void)offset;
+
+        char nbuf[56];
+        size_t nlen = name.len < sizeof(nbuf) ? name.len : sizeof(nbuf);
+        memcpy(nbuf, name.str, nlen);
+        nbuf[nlen] = '\0';
+        if (name.len >= sizeof(nbuf)) { nbuf[nlen-4] = '.'; nbuf[nlen-3] = '.'; nbuf[nlen-2] = '.'; }
+
+        char dstr[16];
+        snprintf(dstr, sizeof(dstr), "[%" PRIu64, dims[0]);
+        for (uint32_t d = 1; d < n_dims; d++) {
+            char tmp[12];
+            snprintf(tmp, sizeof(tmp), ",%" PRIu64, dims[d]);
+            strncat(dstr, tmp, sizeof(dstr) - strlen(dstr) - 1);
+        }
+        strncat(dstr, "]", sizeof(dstr) - strlen(dstr) - 1);
+
+        fprintf(stderr, "%-52s %14s %-12s %u\n", nbuf, dstr, gguf_type_name(type), type);
+    }
+
+    munmap(addr, st.st_size);
+    close(fd);
+    return 0;
 }
 
 /* ---- GGUF Parser ---- */

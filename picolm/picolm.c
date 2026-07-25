@@ -118,6 +118,8 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --checkpoint-every-nt-gen <N> Checkpoint every N tokens during generation (default: 64)\n");
     fprintf(stderr, "  --checkpoint-tail-offset <N> Checkpoint N tokens before end of prompt (default: 5)\n");
     fprintf(stderr, "  --ssm-batched     Use batched SSM prefill (SLOW, scalar implementation)\n");
+    fprintf(stderr, "\nInfo options:\n");
+    fprintf(stderr, "  --list-tensors   List all tensors (name, shape, type) and exit\n");
 }
 
 static char *read_stdin(void) {
@@ -234,6 +236,9 @@ int main(int argc, char **argv) {
             checkpoint_tail_offset = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--ssm-batched") == 0) {
             ssm_batched_prefill = 1;
+        } else if (strcmp(argv[i], "--list-tensors") == 0) {
+            model_list_tensors(model_path);
+            return 0;
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             usage(argv[0]);
