@@ -5821,14 +5821,16 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
           if (attn_out_batch) free(attn_out_batch);
         }
         if (l == 0) {
-            float asum = 0, amax = 0;
-            for (int ai = 0; ai < dim; ai++) {
-                asum += xb2_batch[ai];
-                float av = fabsf(xb2_batch[ai]);
-                if (av > amax) amax = av;
+            float dsum = 0, dmax = 0;
+            for (int di = 0; di < dim && di < 4; di++) {
+                float dv = xb2_batch[di]; dsum += dv;
+                float dav = fabsf(dv); if (dav > dmax) dmax = dav;
             }
-                    }
-        tensor_set_repacked(NULL);
+            fprintf(stderr, "DEBUG attn_out[0]: sum=%.6f max=%.6f first4=", dsum, dmax);
+            for (int di = 0; di < dim && di < 4; di++) fprintf(stderr, "%.4f ", xb2_batch[di]);
+            fprintf(stderr, "\n");
+        }
+                tensor_set_repacked(NULL);
 
         /* Residual: x += attn_out */
         for (bi = 0; bi < n_tokens; bi++) {

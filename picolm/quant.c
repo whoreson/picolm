@@ -287,6 +287,13 @@ void dequantize_row_q3_K(const void *src, float *dst, int n) {
 }
 
 void dequantize_row_q2_K(const void *src, float *dst, int n) {
+    /* Q2_K: 256 values per block, 84 bytes
+     * Dequant: val = d * scale * q - dmin * min
+     * q is 2-bit, scale and min are 4-bit each, packed in scales[16]
+     * Quant layout: for each 128-value chunk, 4 bit-shifts (0,2,4,6)
+     * across 32 qs bytes (2 groups of 16), giving 128 values per chunk.
+     * Two chunks per block = 256 values total.
+     * Ported from llama.cpp ggml-quants.c dequantize_row_q2_K */
     const block_q2_K *blocks = (const block_q2_K *)src;
     int nb = n / 256;
 
@@ -295,15 +302,25 @@ void dequantize_row_q2_K(const void *src, float *dst, int n) {
         float d    = fp16_to_fp32_lookup(b->d);
         float dmin = fp16_to_fp32_lookup(b->dmin);
 
-        const uint8_t *qs = b->qs;
-        int out_idx = i * 256;
+        const uint8_t *q = b->qs;
+        float *y = dst + i * 256;
 
-        for (int j = 0; j < 256; j++) {
-            int q2 = (qs[j / 4] >> (2 * (j % 4))) & 3;
-            int sb = j / 16;
-            uint8_t sc = b->scales[sb] & 0xF;
-            uint8_t mn = b->scales[sb] >> 4;
-            dst[out_idx + j] = d * (float)sc * (float)q2 - dmin * (float)mn;
+        int is = 0;
+        float dl, ml;
+        for (int chunk = 0; chunk < 256; chunk += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; ++j) {
+                uint8_t sc = b->scales[is++];
+                dl = d * (sc & 0xF); ml = dmin * (sc >> 4);
+                for (int l = 0; l < 16; ++l) *y++ = dl * (int8_t)((q[l] >> shift) & 3) - ml;
+
+                sc = b->scales[is++];
+                dl = d * (sc & 0xF); ml = dmin * (sc >> 4);
+                for (int l = 0; l < 16; ++l) *y++ = dl * (int8_t)((q[l+16] >> shift) & 3) - ml;
+
+                shift += 2;
+            }
+            q += 32;
         }
     }
 }
@@ -1156,6 +1173,200 @@ float vec_dot_q6_K_f32(const void *src, const float *x, int n) {
         }
     }
     return sumf;
+}
+
+/* ================================================================
+ * vec_dot_q6_K_q8_K: int8 MAC for Q6_K weights * Q8_K input
+ *
+ * Q6_K stores 6-bit values per weight, biased by 32: stored [0..63], actual [-32..31].
+ * 256 weights per block, 16 per-subblock scales, 16 bsums precomputed for Q8_K input.
+ *
+ * The key optimization from llama.cpp:
+ *   sum((q6_stored[j] - 32) * q8[j] * scale[sub])
+ * = sum(q6_stored[j] * q8[j] * scale[sub]) - 32 * bsums[sub] * scale[sub]
+ *
+ * We do unsigned int8 MAC with stored [0..63] values, then subtract
+ * the bias correction: 32 * bsums[j] * scales[j], precomputed per block.
+ *
+ * AVX-512 VNNI: _mm256_dpbusd_epi32 for 32-wide dot per sub-block
+ * AVX2:         _mm256_maddubs_epi16 for 32-wide multiply-accumulate
+ * AVX:          _mm_maddubs_epi16 for 16-wide (two lanes)
+ * ================================================================ */
+
+/* Scale shuffle for Q6_K: 16 scales, each repeated 8 times per 32-byte lane.
+ * Q6_K has one scale per 16-element sub-block. For AVX2 32-wide ops, each
+ * scale needs to be duplicated across the lanes it applies to.
+ * Each scale index is repeated 8 times (covering 8 values per 32-lane register).
+ * Two consecutive scales cover 16 values each = 32 values per chunk of the shuffle. */
+static const uint8_t get_scale_shuffle_k6[144] = {
+     0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+     2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
+     4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5,
+     6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7,
+     8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9,
+    10,10,10,10,10,10,10,10,11,11,11,11,11,11,11,11,
+    12,12,12,12,12,12,12,12,13,13,13,13,13,13,13,13,
+    14,14,14,14,14,14,14,14,15,15,15,15,15,15,15,15,
+};
+
+float vec_dot_q6_K_q8_K(const void *src_q6, const void *src_q8, int n) {
+    const block_q6_K *x = (const block_q6_K *)src_q6;
+    const block_q8_K *y = (const block_q8_K *)src_q8;
+    int nb = n / 256;
+
+/* AVX-512 and AVX2 share the same algorithm: maddubs_epi16 + scale application.
+ * VNNI doesn't cleanly help here because per-subblock scales (16 per block)
+ * require int16->int32 scaling anyway. The AVX-512 advantage comes from
+ * wider float accumulation via _mm512 (not used here since maddubs is 256-bit).
+ * Both paths use __m256 for the integer ops. */
+#if defined(PICOLM_AVX2) || defined(PICOLM_AVX)
+    /* AVX2 and AVX path: 128-bit integer, 256-bit float accumulation */
+    const __m128i m3_128  = _mm_set1_epi8(3);
+    const __m128i m15_128 = _mm_set1_epi8(15);
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb; i++) {
+        const float d = y[i].d * fp16_to_fp32_lookup(x[i].d);
+
+        const uint8_t *ql = x[i].ql;
+        const uint8_t *qh = x[i].qh;
+        const int8_t  *q8 = y[i].qs;
+
+        /* Bias correction using bsums */
+        const __m128i q8sums_0 = _mm_loadu_si128((const __m128i*)y[i].bsums);
+        const __m128i q8sums_1 = _mm_loadu_si128((const __m128i*)y[i].bsums + 1);
+        const __m128i scales = _mm_loadu_si128((const __m128i*)x[i].scales);
+        const __m128i scales_16_0 = _mm_cvtepi8_epi16(scales);
+        const __m128i scales_16_1 = _mm_cvtepi8_epi16(_mm_bsrli_si128(scales, 8));
+        const __m128i q8sclsub_0 = _mm_slli_epi32(_mm_madd_epi16(q8sums_0, scales_16_0), 5);
+        const __m128i q8sclsub_1 = _mm_slli_epi32(_mm_madd_epi16(q8sums_1, scales_16_1), 5);
+
+        __m128i sumi_0 = _mm_setzero_si128();
+        __m128i sumi_1 = _mm_setzero_si128();
+        int is = 0;
+
+        for (int j = 0; j < 2; j++) {  /* 2 chunks of 128 */
+            const __m128i q4bitsH_0 = _mm_loadu_si128((const __m128i*)qh); qh += 16;
+            const __m128i q4bitsH_1 = _mm_loadu_si128((const __m128i*)qh); qh += 16;
+
+            const __m128i q4h_0 = _mm_slli_epi16(_mm_and_si128(q4bitsH_0, m3_128), 4);
+            const __m128i q4h_1 = _mm_slli_epi16(_mm_and_si128(q4bitsH_1, m3_128), 4);
+            const __m128i q4h_2 = _mm_slli_epi16(_mm_and_si128(q4bitsH_0, _mm_set1_epi8(12)), 2);
+            const __m128i q4h_3 = _mm_slli_epi16(_mm_and_si128(q4bitsH_1, _mm_set1_epi8(12)), 2);
+            const __m128i q4h_4 = _mm_and_si128(q4bitsH_0, _mm_set1_epi8(48));
+            const __m128i q4h_5 = _mm_and_si128(q4bitsH_1, _mm_set1_epi8(48));
+            const __m128i q4h_6 = _mm_srli_epi16(_mm_and_si128(q4bitsH_0, _mm_set1_epi8(-64)), 2);
+            const __m128i q4h_7 = _mm_srli_epi16(_mm_and_si128(q4bitsH_1, _mm_set1_epi8(-64)), 2);
+
+            const __m128i q4bits1_0 = _mm_loadu_si128((const __m128i*)ql); ql += 16;
+            const __m128i q4bits1_1 = _mm_loadu_si128((const __m128i*)ql); ql += 16;
+            const __m128i q4bits2_0 = _mm_loadu_si128((const __m128i*)ql); ql += 16;
+            const __m128i q4bits2_1 = _mm_loadu_si128((const __m128i*)ql); ql += 16;
+
+            const __m128i q4_0 = _mm_or_si128(_mm_and_si128(q4bits1_0, m15_128), q4h_0);
+            const __m128i q4_1 = _mm_or_si128(_mm_and_si128(q4bits1_1, m15_128), q4h_1);
+            const __m128i q4_2 = _mm_or_si128(_mm_and_si128(q4bits2_0, m15_128), q4h_2);
+            const __m128i q4_3 = _mm_or_si128(_mm_and_si128(q4bits2_1, m15_128), q4h_3);
+            const __m128i q4_4 = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(q4bits1_0, 4), m15_128), q4h_4);
+            const __m128i q4_5 = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(q4bits1_1, 4), m15_128), q4h_5);
+            const __m128i q4_6 = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(q4bits2_0, 4), m15_128), q4h_6);
+            const __m128i q4_7 = _mm_or_si128(_mm_and_si128(_mm_srli_epi16(q4bits2_1, 4), m15_128), q4h_7);
+
+            const __m128i q8_0 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
+            const __m128i q8_1 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
+            const __m128i q8_2 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
+            const __m128i q8_3 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
+            const __m128i q8_4 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
+            const __m128i q8_5 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
+            const __m128i q8_6 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
+            const __m128i q8_7 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
+
+            __m128i p16_0 = _mm_maddubs_epi16(q4_0, q8_0);
+            __m128i p16_1 = _mm_maddubs_epi16(q4_1, q8_1);
+            __m128i p16_2 = _mm_maddubs_epi16(q4_2, q8_2);
+            __m128i p16_3 = _mm_maddubs_epi16(q4_3, q8_3);
+            __m128i p16_4 = _mm_maddubs_epi16(q4_4, q8_4);
+            __m128i p16_5 = _mm_maddubs_epi16(q4_5, q8_5);
+            __m128i p16_6 = _mm_maddubs_epi16(q4_6, q8_6);
+            __m128i p16_7 = _mm_maddubs_epi16(q4_7, q8_7);
+
+            const __m128i scale_0 = _mm_shuffle_epi8(scales, _mm_loadu_si128((const __m128i*)(get_scale_shuffle_k6 + 16*(is+0))));
+            const __m128i scale_1 = _mm_shuffle_epi8(scales, _mm_loadu_si128((const __m128i*)(get_scale_shuffle_k6 + 16*(is+1))));
+            const __m128i scale_2 = _mm_shuffle_epi8(scales, _mm_loadu_si128((const __m128i*)(get_scale_shuffle_k6 + 16*(is+2))));
+            const __m128i scale_3 = _mm_shuffle_epi8(scales, _mm_loadu_si128((const __m128i*)(get_scale_shuffle_k6 + 16*(is+3))));
+            is += 4;
+
+            p16_0 = _mm_madd_epi16(_mm_cvtepi8_epi16(scale_0), p16_0);
+            p16_1 = _mm_madd_epi16(_mm_cvtepi8_epi16(_mm_bsrli_si128(scale_0, 8)), p16_1);
+            p16_2 = _mm_madd_epi16(_mm_cvtepi8_epi16(scale_1), p16_2);
+            p16_3 = _mm_madd_epi16(_mm_cvtepi8_epi16(_mm_bsrli_si128(scale_1, 8)), p16_3);
+            p16_4 = _mm_madd_epi16(_mm_cvtepi8_epi16(scale_2), p16_4);
+            p16_5 = _mm_madd_epi16(_mm_cvtepi8_epi16(_mm_bsrli_si128(scale_2, 8)), p16_5);
+            p16_6 = _mm_madd_epi16(_mm_cvtepi8_epi16(scale_3), p16_6);
+            p16_7 = _mm_madd_epi16(_mm_cvtepi8_epi16(_mm_bsrli_si128(scale_3, 8)), p16_7);
+
+            sumi_0 = _mm_add_epi32(sumi_0, _mm_add_epi32(p16_0, p16_2));
+            sumi_1 = _mm_add_epi32(sumi_1, _mm_add_epi32(p16_1, p16_3));
+            sumi_0 = _mm_add_epi32(sumi_0, _mm_add_epi32(p16_4, p16_6));
+            sumi_1 = _mm_add_epi32(sumi_1, _mm_add_epi32(p16_5, p16_7));
+        }
+
+        sumi_0 = _mm_sub_epi32(sumi_0, q8sclsub_0);
+        sumi_1 = _mm_sub_epi32(sumi_1, q8sclsub_1);
+        const __m256i sumi = _mm256_insertf128_si256(_mm256_castsi128_si256(sumi_0), sumi_1, 1);
+        acc = _mm256_add_ps(_mm256_mul_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi)), acc);
+    }
+    float result = hsum_avx(acc);
+    return result;
+
+#else
+    /* Scalar fallback */
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        const float d = y[i].d * fp16_to_fp32_lookup(x[i].d);
+        const uint8_t *ql = x[i].ql;
+        const uint8_t *qh = x[i].qh;
+        const int8_t  *q8 = y[i].qs;
+        const int8_t  *sc = x[i].scales;
+
+        int block_sum = 0;
+        {
+            int sums[16] = {0};
+            for (int chunk = 0; chunk < 2; chunk++) {
+                int is = chunk * 8;
+                const uint8_t *ql_c = ql + chunk * 64;
+                const uint8_t *qh_c = qh + chunk * 32;
+                const int8_t  *q8_c = q8 + chunk * 128;
+
+                for (int l = 0; l < 16; l++) {
+                    int q1 = (ql_c[l]      & 0xF) | (((qh_c[l] >> 0) & 3) << 4);
+                    int q2 = (ql_c[l + 32] & 0xF) | (((qh_c[l] >> 2) & 3) << 4);
+                    int q3 = (ql_c[l]      >> 4)  | (((qh_c[l] >> 4) & 3) << 4);
+                    int q4 = (ql_c[l + 32] >> 4)  | (((qh_c[l] >> 6) & 3) << 4);
+                    sums[is + 0] += q1 * q8_c[l];
+                    sums[is + 2] += q2 * q8_c[l + 32];
+                    sums[is + 4] += q3 * q8_c[l + 64];
+                    sums[is + 6] += q4 * q8_c[l + 96];
+                }
+                for (int l = 16; l < 32; l++) {
+                    int q1 = (ql_c[l]      & 0xF) | (((qh_c[l] >> 0) & 3) << 4);
+                    int q2 = (ql_c[l + 32] & 0xF) | (((qh_c[l] >> 2) & 3) << 4);
+                    int q3 = (ql_c[l]      >> 4)  | (((qh_c[l] >> 4) & 3) << 4);
+                    int q4 = (ql_c[l + 32] >> 4)  | (((qh_c[l] >> 6) & 3) << 4);
+                    sums[is + 1] += q1 * q8_c[l];
+                    sums[is + 3] += q2 * q8_c[l + 32];
+                    sums[is + 5] += q3 * q8_c[l + 64];
+                    sums[is + 7] += q4 * q8_c[l + 96];
+                }
+            }
+            for (int j = 0; j < 16; j++) {
+                block_sum += sc[j] * sums[j] - 32 * y[i].bsums[j] * sc[j];
+            }
+        }
+        sumf += d * block_sum;
+    }
+    return sumf;
+#endif
 }
 
 /* ================================================================

@@ -365,22 +365,14 @@ int main(int argc, char **argv) {
     int    viz_height = 480;
 #endif
 
-    /* First pass: find positional model path */
+    /* Parse arguments */
+    int list_tensors = 0;
     for (int i = 1; i < argc; i++) {
+        /* Positional model path: first non-dash arg */
         if (argv[i][0] != '-') {
             if (!model_path) model_path = argv[i];
-            else {
-                fprintf(stderr, "Unexpected argument: %s\n", argv[i]);
-                usage(argv[0]);
-                return 1;
-            }
+            continue;
         }
-    }
-
-    /* Second pass: parse options (model_path now known regardless of order) */
-    for (int i = 1; i < argc; i++) {
-        /* Skip positional args (already captured) */
-        if (argv[i][0] != '-') continue;
         if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
             prompt_buf = strdup(argv[++i]);
             if (!prompt_buf) { fprintf(stderr, "strdup failed\n"); return 1; }
@@ -453,13 +445,23 @@ int main(int argc, char **argv) {
             }
 #endif
         } else if (strcmp(argv[i], "--list-tensors") == 0) {
-            model_list_tensors(model_path);
-            return 0;
+            list_tensors = 1;
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             usage(argv[0]);
             return 1;
         }
+    }
+
+    /* --list-tensors: now that model_path is known regardless of arg order */
+    if (list_tensors) {
+        if (!model_path) {
+            fprintf(stderr, "No model file specified for --list-tensors\n");
+            usage(argv[0]);
+            return 1;
+        }
+        model_list_tensors(model_path);
+        return 0;
     }
 
     /* Read prompt from stdin if not provided via -p */

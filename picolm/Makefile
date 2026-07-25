@@ -163,7 +163,7 @@ asan: picolm
 # with -DPICOLM_GPU=1 rebuilds them from scratch.
 .PHONY: gpu-clean-objs
 gpu-clean-objs:
-	rm -f model.o tensor.o quant.o
+	rm -f model.o tensor.o quant.o picolm.o
 
 # --- ROCm/HIP GPU backend ---
 ROCM_LIB ?= /opt/rocm-6.3.3/lib
