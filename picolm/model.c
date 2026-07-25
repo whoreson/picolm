@@ -2067,6 +2067,22 @@ float *model_forward(model_t *m, int token, int pos) {
         if (lw->ffn_gate && lw->ffn_up && lw->ffn_down) {
             rmsnorm(s->xb, s->x, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
 
+#ifdef PICOLM_GPU
+            /* Fused FFN on GPU: y = down(silu(gate(x)) * up(x)) in ONE command
+             * buffer -> 3 dispatches collapse to 1 (each layer saves ~2x the
+             * per-dispatch sync floor) and silu*mul runs on the GPU. x and y
+             * alias s->xb safely: expert_mlp memcpy()s x into device scratch
+             * first. On miss (GPU off / a tensor not uploaded / OOM) fall
+             * through to the per-matmul path below. */
+            if (gpu_ok && gl->ffn_gate && gl->ffn_up && gl->ffn_down &&
+                picolm_gpu_expert_mlp((picolm_gpu_tensor_t *)gl->ffn_gate,
+                                      (picolm_gpu_tensor_t *)gl->ffn_up,
+                                      (picolm_gpu_tensor_t *)gl->ffn_down,
+                                      s->xb, s->xb, 1)) {
+                tensor_set_gpu_tensor(NULL, 0);
+                goto ffn_done;
+            }
+#endif
             tensor_set_repacked(m->repack_used[ri+4] ? m->repack_buffers[ri+4] : NULL);
 #ifdef PICOLM_GPU
             if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->ffn_gate, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
@@ -2090,6 +2106,9 @@ float *model_forward(model_t *m, int token, int pos) {
 #endif
             matmul(s->xb, s->hb, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
             tensor_set_repacked(NULL);
+#ifdef PICOLM_GPU
+ffn_done:
+#endif
             vec_add(s->x, s->xb, dim);
         }
     }
