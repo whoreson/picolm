@@ -304,9 +304,9 @@ static int mmap_file(model_t *m, const char *path) {
     fstat(fd, &st);
     m->mmap_size = (size_t)st.st_size;
 
-    void *addr = mmap(NULL, m->mmap_size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    void *addr = mmap(NULL, m->mmap_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (addr == MAP_FAILED) {
-        fprintf(stderr, "mmap failed\n");
+        fprintf(stderr, "mmap failed: %s\n", strerror(errno));
         close(fd);
         return -1;
     }

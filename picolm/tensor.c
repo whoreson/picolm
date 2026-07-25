@@ -1273,10 +1273,12 @@ void matmul_batch(float *out, const float *x, int n_batch,
 typedef struct {
     float *out1, *out2;
     const void *W1, *W2;
+    const float *x;              /* original float activations (for fallback) */
     const void *qx1_buf, *qx2_buf;
     const float *qx1_d, *qx2_d;
     size_t row_bytes1, row_bytes2, qx_stride1, qx_stride2;
     int n, d, n_batch;
+    int have_qx1, have_qx2;     /* 1 if pre-quantized buffer valid */
     gguf_type_t qtype1, qtype2;
 } dual_q8_row_ctx_t;
 
@@ -1285,45 +1287,53 @@ static void dual_q8_row_task(int i, void *ctxp) {
     const char *wr1 = (const char *)c->W1 + (size_t)i * c->row_bytes1;
     const char *wr2 = (const char *)c->W2 + (size_t)i * c->row_bytes2;
     for (int b = 0; b < c->n_batch; b++) {
-        if (c->qtype1 == GGUF_TYPE_Q8_0) {
-            const block_q8_0 *xq = (const block_q8_0 *)((const char *)c->qx1_buf + (size_t)b * c->qx_stride1);
-            const float *xqd = c->qx1_d + (size_t)b * (c->n / 32);
-            c->out1[b * c->d + i] = vec_dot_q8_0_q8_0_deltas(xq, xqd, (const block_q8_0*)wr1, c->n);
-        } else if (c->qtype1 == GGUF_TYPE_Q4_0) {
-            const char *xb1 = (const char *)c->qx1_buf + (size_t)b * c->qx_stride1;
-            c->out1[b * c->d + i] = vec_dot_q4_0_q8_0(wr1, xb1, c->n);
-        } else if (c->qtype1 == GGUF_TYPE_Q4_K) {
-            const char *xb1 = (const char *)c->qx1_buf + (size_t)b * c->qx_stride1;
-            c->out1[b * c->d + i] = vec_dot_q4_K_q8_K(wr1, xb1, c->n);
-        } else if (c->qtype1 == GGUF_TYPE_Q1_0) {
-            const char *xb1 = (const char *)c->qx1_buf + (size_t)b * c->qx_stride1;
-            c->out1[b * c->d + i] = vec_dot_q1_0_q8_0(wr1, xb1, c->n);
-        } else if (c->qtype1 == GGUF_TYPE_Q2_0) {
-            const char *xb1 = (const char *)c->qx1_buf + (size_t)b * c->qx_stride1;
-            c->out1[b * c->d + i] = vec_dot_q2_0_q8_0(wr1, xb1, c->n);
+        if (c->have_qx1) {
+            if (c->qtype1 == GGUF_TYPE_Q8_0) {
+                const block_q8_0 *xq = (const block_q8_0 *)((const char *)c->qx1_buf + (size_t)b * c->qx_stride1);
+                const float *xqd = c->qx1_d + (size_t)b * (c->n / 32);
+                c->out1[b * c->d + i] = vec_dot_q8_0_q8_0_deltas(xq, xqd, (const block_q8_0*)wr1, c->n);
+            } else if (c->qtype1 == GGUF_TYPE_Q4_0) {
+                const char *xb1 = (const char *)c->qx1_buf + (size_t)b * c->qx_stride1;
+                c->out1[b * c->d + i] = vec_dot_q4_0_q8_0(wr1, xb1, c->n);
+            } else if (c->qtype1 == GGUF_TYPE_Q4_K) {
+                const char *xb1 = (const char *)c->qx1_buf + (size_t)b * c->qx_stride1;
+                c->out1[b * c->d + i] = vec_dot_q4_K_q8_K(wr1, xb1, c->n);
+            } else if (c->qtype1 == GGUF_TYPE_Q1_0) {
+                const char *xb1 = (const char *)c->qx1_buf + (size_t)b * c->qx_stride1;
+                c->out1[b * c->d + i] = vec_dot_q1_0_q8_0(wr1, xb1, c->n);
+            } else if (c->qtype1 == GGUF_TYPE_Q2_0) {
+                const char *xb1 = (const char *)c->qx1_buf + (size_t)b * c->qx_stride1;
+                c->out1[b * c->d + i] = vec_dot_q2_0_q8_0(wr1, xb1, c->n);
+            } else {
+                const char *xb1 = (const char *)c->qx1_buf + (size_t)b * c->qx_stride1;
+                c->out1[b * c->d + i] = vec_dot_q8_0_q8_0(wr1, xb1, c->n);
+            }
         } else {
-            const char *xb1 = (const char *)c->qx1_buf + (size_t)b * c->qx_stride1;
-            c->out1[b * c->d + i] = vec_dot_q8_0_q8_0(wr1, xb1, c->n);
+            c->out1[b * c->d + i] = vec_dot(wr1, c->x + b * c->n, c->n, c->qtype1);
         }
-        if (c->qtype2 == GGUF_TYPE_Q8_0) {
-            const block_q8_0 *xq = (const block_q8_0 *)((const char *)c->qx2_buf + (size_t)b * c->qx_stride2);
-            const float *xqd = c->qx2_d + (size_t)b * (c->n / 32);
-            c->out2[b * c->d + i] = vec_dot_q8_0_q8_0_deltas(xq, xqd, (const block_q8_0*)wr2, c->n);
-        } else if (c->qtype2 == GGUF_TYPE_Q4_0) {
-            const char *xb2 = (const char *)c->qx2_buf + (size_t)b * c->qx_stride2;
-            c->out2[b * c->d + i] = vec_dot_q4_0_q8_0(wr2, xb2, c->n);
-        } else if (c->qtype2 == GGUF_TYPE_Q4_K) {
-            const char *xb2 = (const char *)c->qx2_buf + (size_t)b * c->qx_stride2;
-            c->out2[b * c->d + i] = vec_dot_q4_K_q8_K(wr2, xb2, c->n);
-        } else if (c->qtype2 == GGUF_TYPE_Q1_0) {
-            const char *xb2 = (const char *)c->qx2_buf + (size_t)b * c->qx_stride2;
-            c->out2[b * c->d + i] = vec_dot_q1_0_q8_0(wr2, xb2, c->n);
-        } else if (c->qtype2 == GGUF_TYPE_Q2_0) {
-            const char *xb2 = (const char *)c->qx2_buf + (size_t)b * c->qx_stride2;
-            c->out2[b * c->d + i] = vec_dot_q2_0_q8_0(wr2, xb2, c->n);
+        if (c->have_qx2) {
+            if (c->qtype2 == GGUF_TYPE_Q8_0) {
+                const block_q8_0 *xq = (const block_q8_0 *)((const char *)c->qx2_buf + (size_t)b * c->qx_stride2);
+                const float *xqd = c->qx2_d + (size_t)b * (c->n / 32);
+                c->out2[b * c->d + i] = vec_dot_q8_0_q8_0_deltas(xq, xqd, (const block_q8_0*)wr2, c->n);
+            } else if (c->qtype2 == GGUF_TYPE_Q4_0) {
+                const char *xb2 = (const char *)c->qx2_buf + (size_t)b * c->qx_stride2;
+                c->out2[b * c->d + i] = vec_dot_q4_0_q8_0(wr2, xb2, c->n);
+            } else if (c->qtype2 == GGUF_TYPE_Q4_K) {
+                const char *xb2 = (const char *)c->qx2_buf + (size_t)b * c->qx_stride2;
+                c->out2[b * c->d + i] = vec_dot_q4_K_q8_K(wr2, xb2, c->n);
+            } else if (c->qtype2 == GGUF_TYPE_Q1_0) {
+                const char *xb2 = (const char *)c->qx2_buf + (size_t)b * c->qx_stride2;
+                c->out2[b * c->d + i] = vec_dot_q1_0_q8_0(wr2, xb2, c->n);
+            } else if (c->qtype2 == GGUF_TYPE_Q2_0) {
+                const char *xb2 = (const char *)c->qx2_buf + (size_t)b * c->qx_stride2;
+                c->out2[b * c->d + i] = vec_dot_q2_0_q8_0(wr2, xb2, c->n);
+            } else {
+                const char *xb2 = (const char *)c->qx2_buf + (size_t)b * c->qx_stride2;
+                c->out2[b * c->d + i] = vec_dot_q8_0_q8_0(wr2, xb2, c->n);
+            }
         } else {
-            const char *xb2 = (const char *)c->qx2_buf + (size_t)b * c->qx_stride2;
-            c->out2[b * c->d + i] = vec_dot_q8_0_q8_0(wr2, xb2, c->n);
+            c->out2[b * c->d + i] = vec_dot(wr2, c->x + b * c->n, c->n, c->qtype2);
         }
     }
 }
@@ -1550,11 +1560,13 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
             dual_q8_row_ctx_t ctx;
             ctx.out1 = out1; ctx.out2 = out2;
             ctx.W1 = w1; ctx.W2 = w2;
+            ctx.x = x;
             ctx.qx1_buf = qx1_buf; ctx.qx2_buf = qx2_buf;
             ctx.qx1_d = qx1_d_buf; ctx.qx2_d = qx2_d_buf;
             ctx.row_bytes1 = row_bytes; ctx.row_bytes2 = row_bytes2;
             ctx.qx_stride1 = qx1_stride; ctx.qx_stride2 = qx2_stride;
             ctx.n = n; ctx.d = d; ctx.n_batch = n_batch;
+            ctx.have_qx1 = have_qx1; ctx.have_qx2 = have_qx2;
             ctx.qtype1 = qtype1; ctx.qtype2 = qtype2;
             tensor_parallel_for(d, dual_q8_row_task, &ctx);
         } else {
