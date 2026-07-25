@@ -15,6 +15,10 @@
 
 #include "viz.h"
 
+/* POSIX dependencies: sockets, pthreads, fcntl, nanosleep.
+ * Works on Linux, macOS, FreeBSD, MSYS2/MinGW-w64.
+ * Native MSVC is not supported (no POSIX runtime). */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

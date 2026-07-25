@@ -16,6 +16,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#ifndef _WIN32
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#endif
 
 #ifdef PICOLM_GPU
 #include "backend_gpu.h"
@@ -468,21 +473,56 @@ static const char *gguf_type_name(uint32_t type) {
 }
 
 int model_list_tensors(const char *path) {
+    uint8_t *addr;
+    size_t fsize;
+#ifdef _WIN32
+    HANDLE fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (fh == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "Cannot open file: %s\n", path);
+        return -1;
+    }
+
+    LARGE_INTEGER ls;
+    GetFileSizeEx(fh, &ls);
+    fsize = (size_t)ls.QuadPart;
+
+    HANDLE mh = CreateFileMappingA(fh, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!mh) {
+        fprintf(stderr, "CreateFileMapping failed\n");
+        CloseHandle(fh);
+        return -1;
+    }
+
+    addr = MapViewOfFile(mh, FILE_MAP_READ, 0, 0, 0);
+    if (!addr) {
+        fprintf(stderr, "MapViewOfFile failed\n");
+        CloseHandle(mh);
+        CloseHandle(fh);
+        return -1;
+    }
+#else
     int fd = open(path, O_RDONLY);
     if (fd < 0) { perror("open"); return -1; }
 
     struct stat st;
     if (fstat(fd, &st) < 0) { close(fd); return -1; }
 
-    uint8_t *addr = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    addr = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (addr == MAP_FAILED) { close(fd); return -1; }
+    fsize = (size_t)st.st_size;
+#endif
 
-    reader_t r = { .data = addr, .pos = 0, .size = (uint64_t)st.st_size };
+    reader_t r = { .data = addr, .pos = 0, .size = fsize };
 
     uint32_t magic = read_u32(&r);
     if (magic != GGUF_MAGIC) {
         fprintf(stderr, "Invalid GGUF magic: 0x%08X\n", magic);
-        munmap(addr, st.st_size); close(fd);
+#ifdef _WIN32
+        UnmapViewOfFile(addr); CloseHandle(mh); CloseHandle(fh);
+#else
+        munmap(addr, fsize); close(fd);
+#endif
         return -1;
     }
 
@@ -531,8 +571,14 @@ int model_list_tensors(const char *path) {
         fprintf(stderr, "%-52s %14s %-12s %u\n", nbuf, dstr, gguf_type_name(type), type);
     }
 
-    munmap(addr, st.st_size);
+    #ifdef _WIN32
+    UnmapViewOfFile(addr);
+    CloseHandle(mh);
+    CloseHandle(fh);
+#else
+    munmap(addr, fsize);
     close(fd);
+#endif
     return 0;
 }
 
