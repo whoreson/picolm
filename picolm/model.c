@@ -68,6 +68,91 @@ static void swap_f16_block(uint16_t *dst, size_t n) {
  * mmap region to bring the model into the page cache before inference. */
 static int g_do_prefault = 0;
 
+/* Benchmark layer callback */
+static bench_layer_cb_t g_bench_cb = NULL;
+static void *g_bench_user_data = NULL;
+
+void model_set_bench_callback(bench_layer_cb_t cb, void *user_data) {
+    g_bench_cb = cb;
+    g_bench_user_data = user_data;
+}
+
+/* Get per-layer weight size in bytes for bandwidth calculation */
+size_t layer_weight_size(model_t *m, int l) {
+    model_weights_t *w = &m->weights;
+    layer_weights_t *lw = &w->layers[l];
+    size_t sz = 0;
+    int dim = m->config.n_embd;
+    int n_ffn = m->config.n_ffn;
+    int head_dim = m->config.head_dim;
+    int n_heads = m->config.n_heads;
+    int n_kv_heads = m->config.n_kv_heads;
+    int q_dim = n_heads * head_dim;
+    int kv_dim = n_kv_heads * head_dim;
+
+    /* Attention or SSM attention path */
+    if (lw->attn_qkv) {
+        /* SSM layer: attn_qkv [dim, conv_dim], attn_gate_ssm [dim, ssm_d_inner],
+         * ssm_out [ssm_d_inner, dim], ssm_conv1d [d_conv, conv_dim],
+         * ssm_alpha [dim, dt_rank], ssm_beta [dim, dt_rank],
+         * ssm_a [dt_rank], ssm_dt [dt_rank], ssm_norm [head_v_dim] */
+        int conv_dim = 2 * m->config.ssm_d_state * m->config.ssm_n_group + m->config.ssm_d_inner;
+        int ssm_d_inner = m->config.ssm_d_inner;
+        int dt_rank = m->config.ssm_dt_rank;
+        int head_v_dim = ssm_d_inner / dt_rank;
+
+        sz += gguf_type_row_size(lw->type_attn_qkv, conv_dim) * dim;
+        sz += gguf_type_row_size(lw->type_attn_gate_ssm, ssm_d_inner) * dim;
+        sz += gguf_type_row_size(lw->type_ssm_out, dim) * ssm_d_inner;
+        sz += gguf_type_row_size(lw->type_ssm_conv1d, conv_dim) * m->config.ssm_d_conv;
+        sz += gguf_type_row_size(lw->type_ssm_alpha, dt_rank) * dim;
+        sz += gguf_type_row_size(lw->type_ssm_beta, dt_rank) * dim;
+        sz += gguf_type_row_size(lw->type_ssm_a, 1) * dt_rank;
+        sz += gguf_type_row_size(lw->type_ssm_dt, 1) * dt_rank;
+        sz += gguf_type_row_size(GGUF_TYPE_F32, 1) * head_v_dim; /* ssm_norm is always F32 */
+    } else if (lw->attn_q) {
+        /* Standard attention: attn_q [dim, q_full_dim], attn_k [dim, kv_dim],
+         * attn_v [dim, kv_dim], attn_output [q_dim, dim] */
+        int q_full_dim = (m->config.has_ssm && lw->is_attn_layer) ? (q_dim * 2) : q_dim;
+        sz += gguf_type_row_size(lw->type_attn_q, q_full_dim) * dim;
+        sz += gguf_type_row_size(lw->type_attn_k, kv_dim) * dim;
+        sz += gguf_type_row_size(lw->type_attn_v, kv_dim) * dim;
+        sz += gguf_type_row_size(lw->type_attn_output, dim) * q_dim;
+    }
+
+    /* FFN (shared by both SSM and attention layers) */
+    if (lw->ffn_gate) {
+        sz += gguf_type_row_size(lw->type_ffn_gate, n_ffn) * dim;
+    }
+    if (lw->ffn_up) {
+        sz += gguf_type_row_size(lw->type_ffn_up, n_ffn) * dim;
+    }
+    if (lw->ffn_down) {
+        sz += gguf_type_row_size(lw->type_ffn_down, dim) * n_ffn;
+    }
+    return sz;
+}
+
+/* Invoke the benchmark callback for a completed layer */
+static void bench_emit(int l, int is_prefill, double elapsed_ms, long minflt, long majflt) {
+    if (!g_bench_cb) return;
+    g_bench_cb(l, is_prefill, elapsed_ms, minflt, majflt, g_bench_user_data);
+}
+
+/* Inline-like macro for benchmarking a layer: captures rusage before, time before,
+ * caller does work, then bench_emit_after does the rest. */
+double get_time_ms(void);
+#ifdef _WIN32
+#define BENCH_LAYER_START() double _bench_t0 = get_time_ms()
+#define BENCH_LAYER_END(_l, _pref) bench_emit(_l, _pref, get_time_ms() - (_bench_t0), 0, 0)
+#else
+#define BENCH_LAYER_START() double _bench_t0 = get_time_ms(); struct rusage _bench_ru0; getrusage(RUSAGE_SELF, &_bench_ru0)
+#define BENCH_LAYER_END(_l, _pref) do { struct rusage _bench_ru1; getrusage(RUSAGE_SELF, &_bench_ru1); \
+    bench_emit(_l, _pref, get_time_ms() - (_bench_t0), \
+        (long)_bench_ru1.ru_minflt - (long)_bench_ru0.ru_minflt, \
+        (long)_bench_ru1.ru_majflt - (long)_bench_ru0.ru_majflt); } while(0)
+#endif
+
 void model_set_prefault(int v) {
     g_do_prefault = v;
 }
@@ -1880,6 +1965,7 @@ float *model_forward(model_t *m, int token, int pos) {
     int attn_ordinal = 0;
     for (int l = 0; l < n_active_layers; l++) {
         layer_weights_t *lw = &w->layers[l];
+        BENCH_LAYER_START();
 #ifdef PICOLM_GPU
         gpu_layer_weights_t *gl = &m->gpu.layers[l];
 #endif
@@ -1895,6 +1981,7 @@ float *model_forward(model_t *m, int token, int pos) {
             float *ssm_residual = s->xb2;
             ssm_forward(m, s, s->x, ssm_residual, lw, l, pos, NULL);
 #endif
+            BENCH_LAYER_END(l, 0);
             continue;
         }
 
@@ -2092,6 +2179,7 @@ float *model_forward(model_t *m, int token, int pos) {
             tensor_set_repacked(NULL);
             vec_add(s->x, s->xb, dim);
         }
+        BENCH_LAYER_END(l, 0);
     }
 
     /* 3. Final RMSNorm */
@@ -5475,6 +5563,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #endif
     for (int l = 0; l < c->n_layers; l++) {
         layer_weights_t *lw = &w->layers[l];
+        BENCH_LAYER_START();
 
         if (c->has_ssm && !lw->is_attn_layer) {
             if (m->ssm_batched_prefill) {
@@ -5502,6 +5591,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                     memcpy(x_batch + bi * dim, s->x, dim * sizeof(float));
                 }
             }
+            BENCH_LAYER_END(l, 1);
             continue;
         }
 
@@ -5686,7 +5776,8 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                 if (av > xmax) xmax = av;
             }
                     }
-        }
+        BENCH_LAYER_END(l, 1);
+    }
 
     /* Final norm + output (last token only) */
     float *last_x = x_batch + (n_tokens - 1) * dim;

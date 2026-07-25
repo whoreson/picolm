@@ -8,6 +8,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
+#include <errno.h>
+#include <math.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -120,6 +123,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --ssm-serial      Use serial per-token SSM prefill (default is batched)\n");
     fprintf(stderr, "\nInfo options:\n");
     fprintf(stderr, "  --list-tensors   List all tensors (name, shape, type) and exit\n");
+    fprintf(stderr, "  --benchmark      Continuous benchmark loop (Ctrl-C to stop)\n");
 }
 
 static char *read_stdin(void) {
@@ -141,13 +145,181 @@ static char *read_stdin(void) {
     return buf;
 }
 
+/* ---- Benchmark mode ---- */
+
+/* Per-iteration stats */
+typedef struct {
+    /* Accumulators */
+    double prefill_total_ms;       /* total prefill time */
+    double gen_total_ms;           /* total generation time */
+    int    prefill_layer_count;    /* total layers processed in prefill */
+    int    gen_layer_count;        /* total layers processed in gen */
+    /* Per-layer ring buffer (last N layers) for ETA */
+#define BENCH_LAYER_HISTORY 32
+    double layer_times[BENCH_LAYER_HISTORY];  /* recent layer times in ms */
+    int    layer_hist_idx;
+    int    layer_hist_count;
+    /* Running stats */
+    double layer_avg_ms;
+    double layer_sum_ms;
+    int    layer_total_count;
+    /* Model info (set once) */
+    int    n_layers;
+    size_t layer_weight_sizes[128];  /* per-layer weight size in bytes */
+    int    n_active_layers;
+    /* Current phase */
+    int    is_prefill;
+    int    n_prompt_tokens;
+    /* Page fault counts */
+    long total_minflt;
+    long total_majflt;
+    /* Iteration counter */
+    int iteration;
+    /* Tokens generated in this iteration */
+    int gen_tokens;
+} bench_ctx_t;
+
+static void bench_callback(int layer, int is_prefill, double elapsed_ms, long minflt, long majflt, void *user_data) {
+    bench_ctx_t *bc = (bench_ctx_t *)user_data;
+    bc->total_minflt += minflt;
+    bc->total_majflt += majflt;
+
+    /* Add to ring buffer */
+    int idx = bc->layer_hist_idx % BENCH_LAYER_HISTORY;
+    bc->layer_times[idx] = elapsed_ms;
+    bc->layer_hist_idx++;
+    if (bc->layer_hist_count < BENCH_LAYER_HISTORY) bc->layer_hist_count++;
+
+    /* Running average */
+    bc->layer_sum_ms += elapsed_ms;
+    bc->layer_total_count++;
+    bc->layer_avg_ms = bc->layer_sum_ms / bc->layer_total_count;
+
+    if (is_prefill) {
+        bc->prefill_total_ms += elapsed_ms;
+        bc->prefill_layer_count++;
+    } else {
+        bc->gen_total_ms += elapsed_ms;
+        bc->gen_layer_count++;
+    }
+
+    /* layers_done is the count *after* this layer, used for ETA */
+    int layers_done = is_prefill ? bc->prefill_layer_count : bc->gen_layer_count;
+
+    /* Compute ETA using recent average (ring buffer), not the all-time average.
+     * The all-time average can be skewed by slow prefill layers from earlier
+     * in the iteration. The ring buffer of the last 32 layers gives a more
+     * accurate picture of current performance. */
+    double recent_avg_ms = 0;
+    {
+        double ring_sum = 0;
+        int ring_count = 0;
+        for (int i = 0; i < bc->layer_hist_count; i++) {
+            ring_sum += bc->layer_times[i];
+            ring_count++;
+        }
+        recent_avg_ms = ring_count > 0 ? ring_sum / ring_count : bc->layer_avg_ms;
+    }
+
+    int layers_remaining;
+    if (is_prefill) {
+        /* Prefill: ETA to complete the prefill phase */
+        layers_remaining = bc->n_active_layers - layers_done;
+    } else {
+        /* Generation: ETA to the NEXT token (end of current forward pass).
+         * layers_done wraps every n_active_layers. When layers_done is a
+         * multiple of n_active_layers, the current token just completed. */
+        int layers_in_token = layers_done % bc->n_active_layers;
+        layers_remaining = (layers_in_token == 0) ? 0 : (bc->n_active_layers - layers_in_token);
+    }
+    double eta_ms = layers_remaining * recent_avg_ms;
+    double eta_sec = eta_ms / 1000.0;
+
+    /* Effective weight throughput: weight_bytes / elapsed_ms.
+     * This captures the combined I/O + compute bottleneck - how fast the layer
+     * "consumes" its own weights end-to-end. */
+    size_t wsize = 0;
+    if (layer >= 0 && layer < bc->n_layers) {
+        wsize = bc->layer_weight_sizes[layer];
+    }
+        double wt_mbs = 0; /* MB/s effective weight throughput */
+    if (elapsed_ms > 0 && wsize > 0) {
+        wt_mbs = (double)wsize / (elapsed_ms / 1000.0) / (1024.0 * 1024.0);
+    }
+
+    /* Format ETA */
+    char eta_str[32];
+    if (eta_sec < 1.0) snprintf(eta_str, sizeof(eta_str), "%.0fms", eta_sec * 1000.0);
+    else if (eta_sec < 60.0) snprintf(eta_str, sizeof(eta_str), "%.1fs", eta_sec);
+    else snprintf(eta_str, sizeof(eta_str), "%.0fm%.0fs", eta_sec / 60.0, fmod(eta_sec, 60.0));
+
+    /* Format I/O column: weight throughput + I/O fraction */
+    char bw_str[64];
+    if (wsize > 0 && wt_mbs > 0) {
+        /* Compute I/O fraction: what % of the effective throughput is actual I/O */
+        double io_bytes = (double)majflt * 4096;
+        double io_mbs = elapsed_ms > 0 ? io_bytes / (elapsed_ms / 1000.0) / (1024.0 * 1024.0) : 0;
+        double io_pct = (wt_mbs > 0) ? (io_mbs / wt_mbs) * 100.0 : 0;
+        /* Also compute "cache I/O" fraction from minor faults */
+        double cache_bytes = (double)minflt * 4096;
+        double cache_mbs = elapsed_ms > 0 ? cache_bytes / (elapsed_ms / 1000.0) / (1024.0 * 1024.0) : 0;
+        double cache_pct = (wt_mbs > 0) ? (cache_mbs / wt_mbs) * 100.0 : 0;
+
+        if (wt_mbs >= 100.0)
+            snprintf(bw_str, sizeof(bw_str), "%.0fMB/s io=%.0f%% cache=%.0f%%", wt_mbs, io_pct, cache_pct);
+        else if (wt_mbs >= 1.0)
+            snprintf(bw_str, sizeof(bw_str), "%.1fMB/s io=%.0f%% cache=%.0f%%", wt_mbs, io_pct, cache_pct);
+        else
+            snprintf(bw_str, sizeof(bw_str), "%.0fKB/s io=%.0f%% cache=%.0f%%", wt_mbs*1024.0, io_pct, cache_pct);
+    } else {
+        snprintf(bw_str, sizeof(bw_str), "?MB/s");
+    }
+
+    /* Format page faults */
+    /* Print per-layer line */
+    const char *phase = is_prefill ? "Prefill" : "Gen";
+    fprintf(stderr, "%s [layer %d/%d]: %6.1fms  %-8s  %-14s",
+            phase, layer, bc->n_active_layers, elapsed_ms, eta_str, bw_str);
+    if (minflt > 0 || majflt > 0) {
+        fprintf(stderr, " [pf=%lu+%lu]", (unsigned long)minflt, (unsigned long)majflt);
+    }
+    fprintf(stderr, "\n");
+}
+
+/* Print benchmark summary */
+static void bench_summary(const bench_ctx_t *bc, int iteration, double wall_sec) {
+    fprintf(stderr, "\n--- Iteration %d (%.2fs wall) ---\n", iteration, wall_sec);
+    if (bc->prefill_layer_count > 0) {
+        double prefill_tok_s = (bc->prefill_total_ms > 0) ?
+            (double)bc->n_prompt_tokens / (bc->prefill_total_ms / 1000.0) : 0;
+        fprintf(stderr, "  Prefill: %d tokens, %d layers, %.1fms (%.1f tok/s, %.1fms/layer)\n",
+                bc->n_prompt_tokens, bc->prefill_layer_count,
+                bc->prefill_total_ms, prefill_tok_s,
+                bc->prefill_total_ms / bc->prefill_layer_count);
+    }
+    if (bc->gen_layer_count > 0) {
+        double gen_tok_s = (bc->gen_total_ms > 0) ?
+            (double)bc->gen_tokens / (bc->gen_total_ms / 1000.0) : 0;
+        fprintf(stderr, "  Generation: %d tokens, %d layers, %.1fms (%.1f tok/s, %.1fms/token)\n",
+                bc->gen_tokens, bc->gen_layer_count,
+                bc->gen_total_ms, gen_tok_s,
+                bc->gen_total_ms / bc->gen_tokens);
+    }
+    if (bc->total_minflt > 0 || bc->total_majflt > 0) {
+        fprintf(stderr, "  Page faults: %lu minor, %lu major\n",
+                (unsigned long)bc->total_minflt, (unsigned long)bc->total_majflt);
+    }
+    fprintf(stderr, "  Total wall time: %.2fs\n", wall_sec);
+    fprintf(stderr, "----------------------------------\n\n");
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         usage(argv[0]);
         return 1;
     }
 
-    const char *model_path = argv[1];
+    const char *model_path = NULL;
     char *prompt_buf = NULL;   /* malloc'd buffer for -p prompt (may be modified by unescape) */
     const char *prompt = NULL;
     int    max_tokens = 256;
@@ -157,6 +329,7 @@ int main(int argc, char **argv) {
     int    context_override = 0;
     int    num_threads = 0; /* 0 = auto-detect from physical cores */
     int    json_mode = 0;
+    int    benchmark_mode = 0;
     const char *cache_file = NULL;
     kv_cache_type_t kv_type_k = KV_CACHE_F16;
     kv_cache_type_t kv_type_v = KV_CACHE_F16;
@@ -178,8 +351,11 @@ int main(int argc, char **argv) {
 
     /* Parse arguments */
     for (int i = 1; i < argc; i++) {
-        /* Skip positional model path (argv[1] when it doesn't start with -) */
-        if (i == 1 && argv[1][0] != '-') continue;
+        /* Positional model path: first non-dash arg */
+        if (argv[i][0] != '-') {
+            if (!model_path) model_path = argv[i];
+            continue;
+        }
         if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
             prompt_buf = strdup(argv[++i]);
             if (!prompt_buf) { fprintf(stderr, "strdup failed\n"); return 1; }
@@ -238,6 +414,8 @@ int main(int argc, char **argv) {
             /* no-op: batched is now the default */
         } else if (strcmp(argv[i], "--ssm-serial") == 0) {
             ssm_batched_prefill = 0;
+        } else if (strcmp(argv[i], "--benchmark") == 0) {
+            benchmark_mode = 1;
         } else if (strcmp(argv[i], "--list-tensors") == 0) {
             model_list_tensors(model_path);
             return 0;
@@ -490,6 +668,128 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Prompt: %d tokens, generating up to %d (temp=%.2f, top_p=%.2f, threads=%d)\n",
             n_prompt, max_tokens, temperature, top_p, num_threads);
     fprintf(stderr, "---\n");
+
+    /* ---- Benchmark mode ---- */
+    if (benchmark_mode) {
+        fprintf(stderr, "\nBenchmark mode (Ctrl-C to stop)\n");
+        fprintf(stderr, "  Model: %.1f GB | SIMD: ", (double)model.mmap_size / (1024.0*1024.0*1024.0));
+#if defined(PICOLM_AVX512)
+        fprintf(stderr, "AVX-512");
+#elif defined(PICOLM_AVX2)
+        fprintf(stderr, "AVX2");
+#elif defined(PICOLM_AVX)
+        fprintf(stderr, "AVX");
+#elif defined(PICOLM_SSE3)
+        fprintf(stderr, "SSE3");
+#elif defined(PICOLM_SSE2)
+        fprintf(stderr, "SSE2");
+#elif defined(PICOLM_NEON)
+        fprintf(stderr, "NEON");
+#elif defined(PICOLM_ALTIVEC)
+        fprintf(stderr, "Altivec");
+#else
+        fprintf(stderr, "scalar");
+#endif
+        fprintf(stderr, " | Threads: %d\n", num_threads);
+        fprintf(stderr, "  Context: %d | KV cache: %.0f MB\n",
+                model.config.max_seq_len, (double)model.state.kv_size / (1024.0*1024.0));
+        fprintf(stderr, "  Prompt: %d tokens | Generate: %d tokens\n\n", n_prompt, max_tokens);
+
+        /* Set up benchmark context */
+        bench_ctx_t bench;
+        memset(&bench, 0, sizeof(bench));
+        bench.n_layers = model.config.n_layers;
+        bench.n_active_layers = model.config.n_layers - model.config.n_mtp_layers;
+        bench.n_prompt_tokens = n_prompt;
+
+        /* Pre-compute per-layer weight sizes */
+        for (int l = 0; l < bench.n_layers; l++) {
+            bench.layer_weight_sizes[l] = layer_weight_size(&model, l);
+        }
+
+        model_set_bench_callback(bench_callback, &bench);
+
+        /* Benchmark runs until SIGINT/SIGTERM terminates the process.
+         * On Linux, 'timeout' sends SIGTERM. Ctrl-C sends SIGINT. */
+
+        int iteration = 0;
+        int do_prefill = (n_prompt > 0);
+        int do_generate = (max_tokens > 0);
+        if (!do_prefill && !do_generate) {
+            /* No prompt and no -n: just do prefill with BOS token */
+            do_prefill = 1;
+            n_prompt = 1;
+            prompt_tokens[0] = (int)tokenizer.bos_id;
+        }
+
+        while (1) {
+            iteration++;
+            bench.iteration = iteration;
+            bench.prefill_total_ms = 0;
+            bench.gen_total_ms = 0;
+            bench.prefill_layer_count = 0;
+            bench.gen_layer_count = 0;
+            bench.gen_tokens = 0;
+            bench.layer_sum_ms = 0;
+            bench.layer_total_count = 0;
+            bench.layer_avg_ms = 0;
+            bench.layer_hist_idx = 0;
+            bench.layer_hist_count = 0;
+            bench.total_minflt = 0;
+            bench.total_majflt = 0;
+
+            double t_iter_start = get_time_ms();
+
+            /* Reset model state for fresh iteration */
+            model_ssm_state_reset(&model);
+            /* Zero KV cache */
+            if (model.state.kv_block)
+                memset(model.state.kv_block, 0, model.state.kv_size);
+
+            int pos = 0;
+            float *logits = NULL;
+
+            /* Prefill phase */
+            if (do_prefill) {
+                bench.is_prefill = 1;
+                logits = model_forward_prefill(&model, prompt_tokens, n_prompt, 0);
+                pos = n_prompt - 1;
+            } else {
+                bench.is_prefill = 0;
+                logits = model_forward(&model, tokenizer.bos_id, pos);
+            }
+
+            /* Generation phase */
+            if (do_generate) {
+                bench.is_prefill = 0;
+                int token = 0, next = 0;
+                for (int g = 0; g < max_tokens; g++) {
+                    grammar_apply(&grammar, logits, model.config.vocab_size);
+                    next = sampler_sample(&sampler, logits, model.config.vocab_size);
+                    grammar_advance(&grammar, &tokenizer, next);
+                    token = next;
+                    bench.gen_tokens++;
+                    logits = model_forward(&model, token, pos + 1);
+                }
+            }
+
+            double t_iter_end = get_time_ms();
+            double wall_sec = (t_iter_end - t_iter_start) / 1000.0;
+            bench_summary(&bench, iteration, wall_sec);
+        }
+
+        /* Unreachable, but for compiler */
+        model_set_bench_callback(NULL, NULL);
+        free(prompt_tokens);
+        free(gen_buf);
+        free(prompt_buf);
+        free(stdin_prompt);
+        if (use_qwen_tok) qwen_tokenize_free(&qwen_enc);
+        else tokenizer_free(&tokenizer);
+        model_free(&model);
+        tensor_threadpool_free();
+        return 0;
+    }
 
     /* Generation loop */
     int total_gen = 0;

@@ -282,6 +282,13 @@ void model_prefault(model_t *m);
 /* Unlock previously pinned weight layers. Returns 0 on success. */
 int model_unlock_layers(model_t *m);
 
+/* Benchmark layer callback: called at end of each layer during forward/prefill.
+ * Set via model_set_bench_callback(). Parameters: layer index, 1=prefill 0=gen,
+ * wall-clock ms elapsed in this layer, page fault counts (minflt + majflt). */
+typedef void (*bench_layer_cb_t)(int layer, int is_prefill, double elapsed_ms, long minflt, long majflt, void *user_data);
+void model_set_bench_callback(bench_layer_cb_t cb, void *user_data);
+size_t layer_weight_size(model_t *m, int l);
+
 /* Run one forward pass. Returns pointer to logits[vocab_size]. */
 int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v);
 float *model_forward(model_t *m, int token, int pos);
