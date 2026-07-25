@@ -2416,6 +2416,118 @@ static void ssm_head_task(int h, void *ctxp) {
             ctx->ssm_output[(size_t)(base+3) * n_v_heads + h] = hreduce256_ps(out3);
         }
     }
+#elif defined(PICOLM_NEON)
+    /* ---- NEON vectorized recurrence ----
+     * Process 4 rows of the d_state x d_state state matrix simultaneously.
+     * Each float32x4_t holds 4 floats. For d_state=128: 32 vector lanes per row,
+     * 4 rows processed at once = 128 vector registers for the matrix.
+     *
+     * Layout: st[h] is [d_state][d_state] row-major.
+     * We process 4 consecutive rows (r, r+1, r+2, r+3) together.
+     *
+     * NEON always has FP32 FMA via vmlaq_f32. */
+    {
+        int nr = d_state / 4; /* number of 4-row groups */
+        float32x4_t ge_v = vdupq_n_f32(ge);
+        int d4 = d_state / 4; /* number of 4-float vector lanes per row */
+
+        for (int g = 0; g < nr; g++) {
+            int base = g * 4; /* row base in this group */
+
+            /* Phase 1: Decay + sk computation */
+            float32x4_t sk0 = vdupq_n_f32(0);
+            float32x4_t sk1 = vdupq_n_f32(0);
+            float32x4_t sk2 = vdupq_n_f32(0);
+            float32x4_t sk3 = vdupq_n_f32(0);
+
+            for (int v = 0; v < d4; v++) {
+                int col_base = v * 4;
+                float32x4_t kv = vld1q_f32(khv + col_base);
+
+                /* Row 0 */
+                float32x4_t r0 = vld1q_f32(st + base * d_state + col_base);
+                r0 = vmulq_f32(r0, ge_v);
+                vst1q_f32(st + base * d_state + col_base, r0);
+                sk0 = vmlaq_f32(sk0, r0, kv);
+
+                /* Row 1 */
+                float32x4_t r1 = vld1q_f32(st + (base+1) * d_state + col_base);
+                r1 = vmulq_f32(r1, ge_v);
+                vst1q_f32(st + (base+1) * d_state + col_base, r1);
+                sk1 = vmlaq_f32(sk1, r1, kv);
+
+                /* Row 2 */
+                float32x4_t r2 = vld1q_f32(st + (base+2) * d_state + col_base);
+                r2 = vmulq_f32(r2, ge_v);
+                vst1q_f32(st + (base+2) * d_state + col_base, r2);
+                sk2 = vmlaq_f32(sk2, r2, kv);
+
+                /* Row 3 */
+                float32x4_t r3 = vld1q_f32(st + (base+3) * d_state + col_base);
+                r3 = vmulq_f32(r3, ge_v);
+                vst1q_f32(st + (base+3) * d_state + col_base, r3);
+                sk3 = vmlaq_f32(sk3, r3, kv);
+            }
+
+            float sk0s = vaddvq_f32_compat(sk0);
+            float sk1s = vaddvq_f32_compat(sk1);
+            float sk2s = vaddvq_f32_compat(sk2);
+            float sk3s = vaddvq_f32_compat(sk3);
+
+            /* Phase 2: Compute delta = (v - sk) * beta */
+            float d0 = (vh[base + 0] - sk0s) * bh;
+            float d1 = (vh[base + 1] - sk1s) * bh;
+            float d2 = (vh[base + 2] - sk2s) * bh;
+            float d3 = (vh[base + 3] - sk3s) * bh;
+
+            float32x4_t d0v = vdupq_n_f32(d0);
+            float32x4_t d1v = vdupq_n_f32(d1);
+            float32x4_t d2v = vdupq_n_f32(d2);
+            float32x4_t d3v = vdupq_n_f32(d3);
+
+            /* Phase 3: State update + output computation */
+            float32x4_t out0 = vdupq_n_f32(0);
+            float32x4_t out1 = vdupq_n_f32(0);
+            float32x4_t out2 = vdupq_n_f32(0);
+            float32x4_t out3 = vdupq_n_f32(0);
+
+            for (int v = 0; v < d4; v++) {
+                int col_base = v * 4;
+                float32x4_t kv = vld1q_f32(khv + col_base);
+                float32x4_t qv = vld1q_f32(qh + col_base);
+
+                /* Row 0 */
+                float32x4_t r0 = vld1q_f32(st + base * d_state + col_base);
+                r0 = vmlaq_f32(r0, kv, d0v);
+                vst1q_f32(st + base * d_state + col_base, r0);
+                out0 = vmlaq_f32(out0, r0, qv);
+
+                /* Row 1 */
+                float32x4_t r1 = vld1q_f32(st + (base+1) * d_state + col_base);
+                r1 = vmlaq_f32(r1, kv, d1v);
+                vst1q_f32(st + (base+1) * d_state + col_base, r1);
+                out1 = vmlaq_f32(out1, r1, qv);
+
+                /* Row 2 */
+                float32x4_t r2 = vld1q_f32(st + (base+2) * d_state + col_base);
+                r2 = vmlaq_f32(r2, kv, d2v);
+                vst1q_f32(st + (base+2) * d_state + col_base, r2);
+                out2 = vmlaq_f32(out2, r2, qv);
+
+                /* Row 3 */
+                float32x4_t r3 = vld1q_f32(st + (base+3) * d_state + col_base);
+                r3 = vmlaq_f32(r3, kv, d3v);
+                vst1q_f32(st + (base+3) * d_state + col_base, r3);
+                out3 = vmlaq_f32(out3, r3, qv);
+            }
+
+            /* Horizontal reduce output */
+            ctx->ssm_output[(size_t)base * n_v_heads + h] = vaddvq_f32_compat(out0);
+            ctx->ssm_output[(size_t)(base+1) * n_v_heads + h] = vaddvq_f32_compat(out1);
+            ctx->ssm_output[(size_t)(base+2) * n_v_heads + h] = vaddvq_f32_compat(out2);
+            ctx->ssm_output[(size_t)(base+3) * n_v_heads + h] = vaddvq_f32_compat(out3);
+        }
+    }
 #else
     /* ---- Scalar fallback ---- */
     float sk_local[256];
@@ -2995,6 +3107,246 @@ static void ssm_kernel_sq(
 #endif /* PICOLM_AVX512 || PICOLM_AVX2 || PICOLM_AVX */
 
 /* ================================================================
+ * NEON micro-kernels for chunked DeltaNet recurrence.
+ *
+ * d=128 = 32 x float32x4_t (each holds 4 floats).
+ * cs=64 max = 16 x float32x4_t.
+ *
+ * NEON always has FP32 FMA via vmlaq_f32.
+ * ================================================================ */
+#ifdef PICOLM_NEON
+
+/* Kernel 1: V_eff -- compute S_init @ K^T -> sk[cs][d] */
+static void ssm_kernel_veff(
+        float *sk,        /* [cs][d] output */
+        const float *state, /* [d][d] state */
+        const float *k,   /* [cs][d] */
+        int d, int cs)
+{
+    int d4 = d / 4; /* d=128 -> d4=32 */
+
+    for (int i = 0; i < cs; i++) {
+        const float *ki = k + i * d;
+        float *ski = sk + i * d;
+
+        float32x4_t acc[32];
+        int v;
+        for (v = 0; v < d4; v++) acc[v] = vdupq_n_f32(0);
+
+        for (int r = 0; r < d; r++) {
+            const float *sr = state + r * d;
+            float kir = ki[r];
+            if (kir == 0.0f) continue;
+            float32x4_t kv = vdupq_n_f32(kir);
+            for (v = 0; v < d4; v++) {
+                float32x4_t sv = vld1q_f32(sr + v * 4);
+                acc[v] = vmlaq_f32(acc[v], sv, kv);
+            }
+        }
+
+        for (v = 0; v < d4; v++) {
+            vst1q_f32(ski + v * 4, acc[v]);
+        }
+    }
+}
+
+/* Kernel 2: Interaction matrix -- K @ K^T -> M[cs][cs] */
+static void ssm_kernel_interaction(
+        float *M,          /* [cs][cs] output */
+        const float *k,    /* [cs][d] */
+        const float *decay, /* [cs][cs] decay mask */
+        int d, int cs)
+{
+    int d4 = d / 4;
+
+    for (int i = 0; i < cs; i++) {
+        const float *ki = k + i * d;
+        float *Mi = M + i * cs;
+        const float *decay_i = decay + i * cs;
+
+        for (int j = 0; j <= i; j++) {
+            const float *kj = k + j * d;
+
+            /* Dot product ki . kj using NEON - 4 accumulators */
+            float32x4_t acc0 = vdupq_n_f32(0);
+            float32x4_t acc1 = vdupq_n_f32(0);
+            float32x4_t acc2 = vdupq_n_f32(0);
+            float32x4_t acc3 = vdupq_n_f32(0);
+
+            int v;
+            for (v = 0; v + 3 < d4; v += 4) {
+                acc0 = vmlaq_f32(acc0, vld1q_f32(ki + v * 4), vld1q_f32(kj + v * 4));
+                acc1 = vmlaq_f32(acc1, vld1q_f32(ki + (v+1) * 4), vld1q_f32(kj + (v+1) * 4));
+                acc2 = vmlaq_f32(acc2, vld1q_f32(ki + (v+2) * 4), vld1q_f32(kj + (v+2) * 4));
+                acc3 = vmlaq_f32(acc3, vld1q_f32(ki + (v+3) * 4), vld1q_f32(kj + (v+3) * 4));
+            }
+
+            /* Reduce 4 accumulators to one float */
+            float32x4_t sum = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+            float dot = vaddvq_f32_compat(sum);
+
+            for (; v < d4; v++) {
+                acc0 = vmlaq_f32(acc0, vld1q_f32(ki + v * 4), vld1q_f32(kj + v * 4));
+            }
+            dot += vaddvq_f32_compat(acc0);
+
+            Mi[j] = dot * decay_i[j];
+        }
+
+        /* Zero upper triangle */
+        for (int j = i + 1; j < cs; j++) {
+            Mi[j] = 0.0f;
+        }
+    }
+}
+
+/* Kernel 3: Output cross-products -- K @ Q^T -> kq[cs][cs] */
+static void ssm_kernel_output_cross(
+        float *kq,         /* [cs][cs] output */
+        const float *k,    /* [cs][d] */
+        const float *q,    /* [cs][d] */
+        const float *decay, /* [cs][cs] */
+        int d, int cs)
+{
+    int d4 = d / 4;
+
+    for (int i = 0; i < cs; i++) {
+        const float *qi = q + i * d;
+        float *kqi = kq + i * cs;
+        const float *decay_i = decay + i * cs;
+
+        for (int j = 0; j <= i; j++) {
+            const float *kj = k + j * d;
+
+            float32x4_t acc0 = vdupq_n_f32(0);
+            float32x4_t acc1 = vdupq_n_f32(0);
+            float32x4_t acc2 = vdupq_n_f32(0);
+            float32x4_t acc3 = vdupq_n_f32(0);
+
+            int v;
+            for (v = 0; v + 3 < d4; v += 4) {
+                acc0 = vmlaq_f32(acc0, vld1q_f32(kj + v * 4), vld1q_f32(qi + v * 4));
+                acc1 = vmlaq_f32(acc1, vld1q_f32(kj + (v+1) * 4), vld1q_f32(qi + (v+1) * 4));
+                acc2 = vmlaq_f32(acc2, vld1q_f32(kj + (v+2) * 4), vld1q_f32(qi + (v+2) * 4));
+                acc3 = vmlaq_f32(acc3, vld1q_f32(kj + (v+3) * 4), vld1q_f32(qi + (v+3) * 4));
+            }
+
+            float32x4_t sum = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+            float dot = vaddvq_f32_compat(sum);
+
+            for (; v < d4; v++) {
+                acc0 = vmlaq_f32(acc0, vld1q_f32(kj + v * 4), vld1q_f32(qi + v * 4));
+            }
+            dot += vaddvq_f32_compat(acc0);
+
+            kqi[j] = dot * decay_i[j];
+        }
+
+        /* Zero upper triangle */
+        for (int j = i + 1; j < cs; j++) {
+            kqi[j] = 0.0f;
+        }
+    }
+}
+
+/* Kernel 4: State update -- accumulate weighted outer products */
+static void ssm_kernel_state_update(
+        float *state,           /* [d][d] in-place */
+        const float *v_hat,     /* [cs][d] */
+        const float *k,         /* [cs][d] */
+        const float *decay_to_end, /* [cs] */
+        float total_decay,
+        int d, int cs)
+{
+    int d4 = d / 4;
+
+    /* First: decay the existing state by total_decay */
+    float32x4_t td = vdupq_n_f32(total_decay);
+    for (int r = 0; r < d; r++) {
+        float *sr = state + r * d;
+        for (int v = 0; v < d4; v++) {
+            float32x4_t sv = vld1q_f32(sr + v * 4);
+            vst1q_f32(sr + v * 4, vmulq_f32(sv, td));
+        }
+    }
+
+    /* Second: accumulate weighted outer products.
+     * Process 4 rows at a time for better register utilization. */
+    int nr = d / 4;
+
+    for (int j = 0; j < cs; j++) {
+        const float *vj = v_hat + j * d;
+        const float *kj = k + j * d;
+        float dj = decay_to_end[j];
+
+        if (dj == 0.0f) continue;
+
+        for (int g = 0; g < nr; g++) {
+            int base = g * 4;
+            float vj0 = vj[base];
+            float vj1 = vj[base + 1];
+            float vj2 = vj[base + 2];
+            float vj3 = vj[base + 3];
+
+            float32x4_t s0 = vdupq_n_f32(vj0 * dj);
+            float32x4_t s1 = vdupq_n_f32(vj1 * dj);
+            float32x4_t s2 = vdupq_n_f32(vj2 * dj);
+            float32x4_t s3 = vdupq_n_f32(vj3 * dj);
+
+            for (int v = 0; v < d4; v++) {
+                int col_base = v * 4;
+                float32x4_t kv = vld1q_f32(kj + col_base);
+
+                float32x4_t r0 = vld1q_f32(state + base * d + col_base);
+                float32x4_t r1 = vld1q_f32(state + (base+1) * d + col_base);
+                float32x4_t r2 = vld1q_f32(state + (base+2) * d + col_base);
+                float32x4_t r3 = vld1q_f32(state + (base+3) * d + col_base);
+
+                vst1q_f32(state + base * d + col_base, vmlaq_f32(r0, kv, s0));
+                vst1q_f32(state + (base+1) * d + col_base, vmlaq_f32(r1, kv, s1));
+                vst1q_f32(state + (base+2) * d + col_base, vmlaq_f32(r2, kv, s2));
+                vst1q_f32(state + (base+3) * d + col_base, vmlaq_f32(r3, kv, s3));
+            }
+        }
+    }
+}
+
+/* Kernel 1b: S_init @ Q^T -> sq[cs][d] */
+static void ssm_kernel_sq(
+        float *sq,        /* [cs][d] output */
+        const float *state, /* [d][d] state */
+        const float *q,   /* [cs][d] */
+        int d, int cs)
+{
+    int d4 = d / 4;
+
+    for (int i = 0; i < cs; i++) {
+        const float *qi = q + i * d;
+        float *sqi = sq + i * d;
+
+        float32x4_t acc[32];
+        int v;
+        for (v = 0; v < d4; v++) acc[v] = vdupq_n_f32(0);
+
+        for (int r = 0; r < d; r++) {
+            const float *sr = state + r * d;
+            float qir = qi[r];
+            if (qir == 0.0f) continue;
+            float32x4_t kv = vdupq_n_f32(qir);
+            for (v = 0; v < d4; v++) {
+                float32x4_t sv = vld1q_f32(sr + v * 4);
+                acc[v] = vmlaq_f32(acc[v], sv, kv);
+            }
+        }
+
+        for (v = 0; v < d4; v++) {
+            vst1q_f32(sqi + v * 4, acc[v]);
+        }
+    }
+}
+#endif /* PICOLM_NEON */
+
+/* ================================================================
  * Chunked DeltaNet recurrence.
  *
  * Replaces the sequential per-token recurrence with a chunked
@@ -3110,7 +3462,7 @@ static void ssm_chunk_head_task(int h, void *ctxp) {
     float *sq = sp; sp += cs * d;        /* S_init @ Q^T */
     float *kq = sp; sp += cs * cs;       /* K @ Q^T */
     float *decay_to_end = sp; sp += cs;  /* decay from each j to end */
-#elif defined(PICOLM_AVX2) || defined(PICOLM_AVX)
+#elif defined(PICOLM_AVX2) || defined(PICOLM_AVX) || defined(PICOLM_NEON)
     float *sk = sp; sp += cs * d;        /* S_init @ K^T */
     float *sq = sp; sp += cs * d;        /* S_init @ Q^T */
     float *kq = sp; sp += cs * cs;       /* K @ Q^T */
@@ -3133,7 +3485,7 @@ static void ssm_chunk_head_task(int h, void *ctxp) {
     }
 
     /* Pre-compute decay from each position to end of chunk (for state update) */
-#if defined(PICOLM_AVX512) || defined(PICOLM_AVX2) || defined(PICOLM_AVX)
+#if defined(PICOLM_AVX512) || defined(PICOLM_AVX2) || defined(PICOLM_AVX) || defined(PICOLM_NEON)
     {
         float cum_last = cum_g[cs - 1];
         for (int j = 0; j < cs; j++) {
@@ -3164,8 +3516,8 @@ static void ssm_chunk_head_task(int h, void *ctxp) {
         }
     }
 
-#if defined(PICOLM_AVX512) || defined(PICOLM_AVX2) || defined(PICOLM_AVX)
-    /* === AVX-512 / AVX2 micro-kernel path === */
+#if defined(PICOLM_AVX512) || defined(PICOLM_AVX2) || defined(PICOLM_AVX) || defined(PICOLM_NEON)
+    /* === AVX-512 / AVX2 / NEON micro-kernel path === */
 
     /* Kernel 2: Interaction matrix M = K @ K^T with decay mask */
     ssm_kernel_interaction(M_mat, k, decay_mask, d, cs);

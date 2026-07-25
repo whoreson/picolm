@@ -37,7 +37,7 @@ void fp16_table_init(void);
  * Each lane is an 8-element dot product. vmmlaq_s32 computes a 2x2 block
  * matmul: lanes 0,1,2,3 = a_lo.b_lo, a_lo.b_hi, a_hi.b_lo, a_hi.b_hi.
  * Requires __ARM_FEATURE_SVE_MATMUL_INT8 or explicit -march=armv8.2-a+i8mm. */
-#if defined(__ARM_FEATURE_SVE_MATMUL_INT8)
+#if defined(__ARM_FEATURE_MATMUL_INT8) || defined(__ARM_FEATURE_SVE_MATMUL_INT8)
 #  define PICOLM_I8MM 1
 #endif
 
