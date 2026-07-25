@@ -2207,6 +2207,300 @@ static void ssm_head_task(int h, void *ctxp) {
 }
 
 /* ================================================================
+ * AVX-512 micro-kernels for chunked DeltaNet recurrence.
+ *
+ * These replace the scalar C loops in ssm_chunk_head_task with
+ * AVX-512 vectorized GEMM kernels. Each kernel is single-threaded,
+ * fixed-shape (d=128, cs<=64), and operates entirely in registers/L1.
+ *
+ * d=128 = 8 x __m512 (each holds 16 floats).
+ * cs=64 max = 4 x __m512.
+ *
+ * The parallelism comes from the outer tensor_parallel_for across
+ * (head, chunk) -- each kernel is called once per v-head per chunk.
+ * ================================================================ */
+
+#ifdef PICOLM_AVX512
+#include <immintrin.h>
+
+/* Kernel 1: V_eff -- compute S_init @ K^T -> sk[cs][d]
+ *
+ * sk[i][r] = sum_{c=0}^{d-1} state[r][c] * k[i][c]
+ *
+ * This is a GEMM: sk = state @ K^T   [d x d] @ [d x cs] -> [d x cs]
+ * Transposed view: sk[cs][d] where sk[i] is the i-th row.
+ */
+static void ssm_kernel_veff(
+        float *sk,        /* [cs][d] output */
+        const float *state, /* [d][d] state */
+        const float *k,   /* [cs][d] */
+        int d, int cs)
+{
+    int d16 = d / 16; /* d=128 -> d16=8 */
+
+    /* Process each of the cs rows independently */
+    for (int i = 0; i < cs; i++) {
+        const float *ki = k + i * d;
+        float *ski = sk + i * d;
+
+        /* Initialize d/16 accumulators to zero */
+        __m512 acc[8];
+        int v;
+        for (v = 0; v < d16; v++) acc[v] = _mm512_setzero_ps();
+
+        /* Accumulate over d rows of state */
+        for (int r = 0; r < d; r++) {
+            const float *sr = state + r * d;
+            float kir = ki[r];
+            if (kir == 0.0f) continue;
+            __m512 kv = _mm512_set1_ps(kir);
+            for (v = 0; v < d16; v++) {
+                __m512 sv = _mm512_loadu_ps(sr + v * 16);
+                acc[v] = _mm512_fmadd_ps(sv, kv, acc[v]);
+            }
+        }
+
+        /* Store results */
+        for (v = 0; v < d16; v++) {
+            _mm512_storeu_ps(ski + v * 16, acc[v]);
+        }
+    }
+}
+
+/* Kernel 2: Interaction matrix -- K @ K^T -> M[cs][cs]
+ *
+ * M[i][j] = (k[i] . k[j]) * decay[i][j]
+ *
+ * Only lower triangle (j <= i) is computed; upper triangle is zeroed.
+ * The decay mask is applied elementwise.
+ */
+static void ssm_kernel_interaction(
+        float *M,          /* [cs][cs] output */
+        const float *k,    /* [cs][d] */
+        const float *decay, /* [cs][cs] decay mask */
+        int d, int cs)
+{
+    int d16 = d / 16;
+
+    for (int i = 0; i < cs; i++) {
+        const float *ki = k + i * d;
+        float *Mi = M + i * cs;
+        const float *decay_i = decay + i * cs;
+
+        for (int j = 0; j <= i; j++) {
+            const float *kj = k + j * d;
+
+            /* Dot product ki . kj using AVX-512 */
+            __m512 acc0 = _mm512_setzero_ps();
+            __m512 acc1 = _mm512_setzero_ps();
+            __m512 acc2 = _mm512_setzero_ps();
+            __m512 acc3 = _mm512_setzero_ps();
+
+            /* Unroll 4 vectors at a time = 64 floats per iteration */
+            int v;
+            for (v = 0; v + 3 < d16; v += 4) {
+                acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(ki + v * 16),
+                                        _mm512_loadu_ps(kj + v * 16), acc0);
+                acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(ki + (v+1) * 16),
+                                        _mm512_loadu_ps(kj + (v+1) * 16), acc1);
+                acc2 = _mm512_fmadd_ps(_mm512_loadu_ps(ki + (v+2) * 16),
+                                        _mm512_loadu_ps(kj + (v+2) * 16), acc2);
+                acc3 = _mm512_fmadd_ps(_mm512_loadu_ps(ki + (v+3) * 16),
+                                        _mm512_loadu_ps(kj + (v+3) * 16), acc3);
+            }
+
+            /* Horizontal reduce */
+            float dot = _mm512_reduce_add_ps(acc0) + _mm512_reduce_add_ps(acc1)
+                      + _mm512_reduce_add_ps(acc2) + _mm512_reduce_add_ps(acc3);
+
+            /* Handle remaining lanes (d16=8, 4+4=8, so no remainder) */
+            for (; v < d16; v++) {
+                acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(ki + v * 16),
+                                        _mm512_loadu_ps(kj + v * 16), acc0);
+            }
+            dot += _mm512_reduce_add_ps(acc0);
+
+            Mi[j] = dot * decay_i[j];
+        }
+
+        /* Zero upper triangle */
+        for (int j = i + 1; j < cs; j++) {
+            Mi[j] = 0.0f;
+        }
+    }
+}
+
+/* Kernel 3: Output cross-products -- K @ Q^T -> kq[cs][cs]
+ *
+ * kq[i][j] = (k[j] . q[i]) * decay[i][j]
+ *
+ * Note: k is indexed by j, q by i. This is effectively K^T @ Q but
+ * with indices swapped compared to a standard GEMM.
+ */
+static void ssm_kernel_output_cross(
+        float *kq,         /* [cs][cs] output */
+        const float *k,    /* [cs][d] */
+        const float *q,    /* [cs][d] */
+        const float *decay, /* [cs][cs] */
+        int d, int cs)
+{
+    int d16 = d / 16;
+
+    for (int i = 0; i < cs; i++) {
+        const float *qi = q + i * d;
+        float *kqi = kq + i * cs;
+        const float *decay_i = decay + i * cs;
+
+        for (int j = 0; j <= i; j++) {
+            const float *kj = k + j * d;
+
+            /* Dot product kj . qi using AVX-512 */
+            __m512 acc0 = _mm512_setzero_ps();
+            __m512 acc1 = _mm512_setzero_ps();
+            __m512 acc2 = _mm512_setzero_ps();
+            __m512 acc3 = _mm512_setzero_ps();
+
+            int v;
+            for (v = 0; v + 3 < d16; v += 4) {
+                acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(kj + v * 16),
+                                        _mm512_loadu_ps(qi + v * 16), acc0);
+                acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(kj + (v+1) * 16),
+                                        _mm512_loadu_ps(qi + (v+1) * 16), acc1);
+                acc2 = _mm512_fmadd_ps(_mm512_loadu_ps(kj + (v+2) * 16),
+                                        _mm512_loadu_ps(qi + (v+2) * 16), acc2);
+                acc3 = _mm512_fmadd_ps(_mm512_loadu_ps(kj + (v+3) * 16),
+                                        _mm512_loadu_ps(qi + (v+3) * 16), acc3);
+            }
+
+            float dot = _mm512_reduce_add_ps(acc0) + _mm512_reduce_add_ps(acc1)
+                      + _mm512_reduce_add_ps(acc2) + _mm512_reduce_add_ps(acc3);
+
+            for (; v < d16; v++) {
+                acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(kj + v * 16),
+                                        _mm512_loadu_ps(qi + v * 16), acc0);
+            }
+            dot += _mm512_reduce_add_ps(acc0);
+
+            kqi[j] = dot * decay_i[j];
+        }
+
+        /* Zero upper triangle */
+        for (int j = i + 1; j < cs; j++) {
+            kqi[j] = 0.0f;
+        }
+    }
+}
+
+/* Kernel 4: State update -- accumulate decay[j] * outer(V_hat[j], k[j]) -> S_update[d][d]
+ *
+ * S_update[r][c] = sum_{j=0}^{cs-1} decay_to_end[j] * v_hat[j][r] * k[j][c]
+ *
+ * This is a weighted sum of rank-1 outer products.
+ * Process d x d output tiled in AVX-512 friendly blocks.
+ */
+static void ssm_kernel_state_update(
+        float *state,           /* [d][d] in-place: state *= total_decay, then += update */
+        const float *v_hat,     /* [cs][d] */
+        const float *k,         /* [cs][d] */
+        const float *decay_to_end, /* [cs] decay from each position to end of chunk */
+        float total_decay,
+        int d, int cs)
+{
+    int d16 = d / 16;
+
+    /* First: decay the existing state by total_decay */
+    __m512 td = _mm512_set1_ps(total_decay);
+    for (int r = 0; r < d; r++) {
+        float *sr = state + r * d;
+        for (int v = 0; v < d16; v++) {
+            __m512 sv = _mm512_loadu_ps(sr + v * 16);
+            _mm512_storeu_ps(sr + v * 16, _mm512_mul_ps(sv, td));
+        }
+    }
+
+    /* Second: accumulate weighted outer products.
+     * For each j: decay_to_end[j] * outer(V_hat[j], k[j])
+     * Process 4 rows at a time for better register utilization. */
+    int nr = d / 4; /* number of 4-row groups */
+
+    for (int j = 0; j < cs; j++) {
+        const float *vj = v_hat + j * d;
+        const float *kj = k + j * d;
+        float dj = decay_to_end[j];
+
+        if (dj == 0.0f) continue;
+
+                for (int g = 0; g < nr; g++) {
+            int base = g * 4;
+            float vj0 = vj[base];
+            float vj1 = vj[base + 1];
+            float vj2 = vj[base + 2];
+            float vj3 = vj[base + 3];
+
+            __m512 s0 = _mm512_set1_ps(vj0 * dj);
+            __m512 s1 = _mm512_set1_ps(vj1 * dj);
+            __m512 s2 = _mm512_set1_ps(vj2 * dj);
+            __m512 s3 = _mm512_set1_ps(vj3 * dj);
+
+            for (int v = 0; v < d16; v++) {
+                int col_base = v * 16;
+                __m512 kv = _mm512_loadu_ps(kj + col_base);
+
+                __m512 r0 = _mm512_loadu_ps(state + base * d + col_base);
+                __m512 r1 = _mm512_loadu_ps(state + (base+1) * d + col_base);
+                __m512 r2 = _mm512_loadu_ps(state + (base+2) * d + col_base);
+                __m512 r3 = _mm512_loadu_ps(state + (base+3) * d + col_base);
+
+                _mm512_storeu_ps(state + base * d + col_base, _mm512_fmadd_ps(kv, s0, r0));
+                _mm512_storeu_ps(state + (base+1) * d + col_base, _mm512_fmadd_ps(kv, s1, r1));
+                _mm512_storeu_ps(state + (base+2) * d + col_base, _mm512_fmadd_ps(kv, s2, r2));
+                _mm512_storeu_ps(state + (base+3) * d + col_base, _mm512_fmadd_ps(kv, s3, r3));
+            }
+        }
+    }
+}
+
+/* Kernel 1b: S_init @ q[i] for each of cs positions -> sq[cs][d]
+ *
+ * sq[i][r] = sum_{c=0}^{d-1} state[r][c] * q[i][c]
+ *
+ * Same structure as Kernel 1 but with q instead of k.
+ */
+static void ssm_kernel_sq(
+        float *sq,        /* [cs][d] output */
+        const float *state, /* [d][d] state */
+        const float *q,   /* [cs][d] */
+        int d, int cs)
+{
+    int d16 = d / 16;
+
+    for (int i = 0; i < cs; i++) {
+        const float *qi = q + i * d;
+        float *sqi = sq + i * d;
+
+        __m512 acc[8];
+        int v;
+        for (v = 0; v < d16; v++) acc[v] = _mm512_setzero_ps();
+
+        for (int r = 0; r < d; r++) {
+            const float *sr = state + r * d;
+            float qir = qi[r];
+            if (qir == 0.0f) continue;
+            __m512 kv = _mm512_set1_ps(qir);
+            for (v = 0; v < d16; v++) {
+                __m512 sv = _mm512_loadu_ps(sr + v * 16);
+                acc[v] = _mm512_fmadd_ps(sv, kv, acc[v]);
+            }
+        }
+
+        for (v = 0; v < d16; v++) {
+            _mm512_storeu_ps(sqi + v * 16, acc[v]);
+        }
+    }
+}
+#endif /* PICOLM_AVX512 */
+
+/* ================================================================
  * Chunked DeltaNet recurrence.
  *
  * Replaces the sequential per-token recurrence with a chunked
@@ -2302,7 +2596,12 @@ static void ssm_chunk_head_task(int h, void *ctxp) {
      *   cum_g[cs], q_decay[cs]
      *   decay_mask[cs*cs], M[cs*cs]  (interaction matrix, no beta)
      *   v_eff[cs*d], v_hat[cs*d]
-     * Total: 2*cs + 2*cs*cs + 2*cs*d floats */
+     *   sk[cs*d] (for AVX-512 kernel 1: S_init @ K^T)
+     *   sq[cs*d] (for AVX-512 kernel 1b: S_init @ Q^T)
+     *   kq[cs*cs] (for AVX-512 kernel 3: K @ Q^T)
+     *   decay_to_end[cs] (for kernel 4: state update)
+     * Total: 2*cs + 2*cs*cs + 3*cs*d + cs*d + cs*cs + cs floats
+     * For CS=64, d=128: ~38KB per head */
     float *sp = ctx->scratch;
 
     float *cum_g = sp; sp += cs;
@@ -2312,7 +2611,15 @@ static void ssm_chunk_head_task(int h, void *ctxp) {
     float *v_eff = sp; sp += cs * d;
     float *v_hat = sp; sp += cs * d;
 
-    
+#ifdef PICOLM_AVX512
+    float *sk = sp; sp += cs * d;        /* S_init @ K^T */
+    float *sq = sp; sp += cs * d;        /* S_init @ Q^T */
+    float *kq = sp; sp += cs * cs;       /* K @ Q^T */
+    float *decay_to_end = sp; sp += cs;  /* decay from each j to end */
+#else
+    (void)sp; /* silence unused warning */
+#endif
+
     /* Step 1: Compute cumulative log-decay and decay from start */
     {
         float cum = 0.0f;
@@ -2326,10 +2633,21 @@ static void ssm_chunk_head_task(int h, void *ctxp) {
         }
     }
 
-    /* Step 2: Build decay mask and interaction matrix M[i][j] = k_i . k_j * decay
-     * M is strictly lower triangular (j < i), no beta factor. */
+    /* Pre-compute decay from each position to end of chunk (for state update) */
+#ifdef PICOLM_AVX512
+    {
+        float cum_last = cum_g[cs - 1];
+        for (int j = 0; j < cs; j++) {
+            float diff = cum_last - cum_g[j];
+            if (diff > 50.0f) diff = 50.0f;
+            if (diff < -50.0f) diff = -50.0f;
+            decay_to_end[j] = expf(diff);
+        }
+    }
+#endif
+
+    /* Build decay mask: decay_mask[i][j] = exp(cum_g[i] - cum_g[j]) for j <= i */
     for (int i = 0; i < cs; i++) {
-        const float *ki = k + i * d;
         for (int j = 0; j <= i; j++) {
             float dm;
             if (i == j) {
@@ -2341,15 +2659,99 @@ static void ssm_chunk_head_task(int h, void *ctxp) {
                 dm = expf(diff);
             }
             decay_mask[i * cs + j] = dm;
-
-            /* k[i] . k[j] */
-            float dot = 0.0f;
-            const float *kj = k + j * d;
-            for (int di = 0; di < d; di++) dot += ki[di] * kj[di];
-            M_mat[i * cs + j] = dot * dm;
         }
         for (int j = i + 1; j < cs; j++) {
             decay_mask[i * cs + j] = 0.0f;
+        }
+    }
+
+#ifdef PICOLM_AVX512
+    /* === AVX-512 micro-kernel path === */
+
+    /* Kernel 2: Interaction matrix M = K @ K^T with decay mask */
+    ssm_kernel_interaction(M_mat, k, decay_mask, d, cs);
+
+    /* Kernel 1: sk = S_init @ K^T (for V_eff computation) */
+    ssm_kernel_veff(sk, state, k, d, cs);
+
+    /* Step 3 (scalar post-processing): V_eff[i] = beta[i] * (v[i] - decay[i] * sk[i]) */
+    for (int i = 0; i < cs; i++) {
+        float decay_i = q_decay[i];
+        float bt = beta[i];
+        const float *vi = v + i * d;
+        const float *ski = sk + i * d;
+        float *veffi = v_eff + i * d;
+        for (int r = 0; r < d; r++) {
+            veffi[r] = bt * (vi[r] - decay_i * ski[r]);
+        }
+    }
+
+    /* Step 4: Forward substitution (sequential, scalar, cheap) */
+    for (int i = 0; i < cs; i++) {
+        float bt = beta[i];
+        for (int r = 0; r < d; r++) {
+            float sum_mv = 0.0f;
+            for (int j = 0; j < i; j++) {
+                sum_mv += M_mat[i * cs + j] * v_hat[j * d + r];
+            }
+            v_hat[i * d + r] = v_eff[i * d + r] - bt * sum_mv;
+        }
+    }
+
+    /* Kernel 1b: sq = S_init @ Q^T (for initial state contribution to output) */
+    ssm_kernel_sq(sq, state, q, d, cs);
+
+    /* Kernel 3: kq = K @ Q^T with decay mask */
+    ssm_kernel_output_cross(kq, k, q, decay_mask, d, cs);
+
+    /* Step 5 (scalar assembly): out[i][r] = sq[i][r] * decay[i] + sum_{j<=i} kq[i][j] * v_hat[j][r] */
+    for (int i = 0; i < cs; i++) {
+        float decay_i = q_decay[i];
+        const float *sqi = sq + i * d;
+        float *outi = out + i * d;
+        const float *kqi = kq + i * cs;
+
+        /* Initial state contribution (scaled by decay) */
+        for (int r = 0; r < d; r++) {
+            outi[r] = sqi[r] * decay_i;
+        }
+
+        /* Intra-chunk contribution */
+        for (int j = 0; j <= i; j++) {
+            float attn = kqi[j];
+            if (attn == 0.0f) continue;
+            const float *vht = v_hat + j * d;
+            for (int r = 0; r < d; r++) {
+                outi[r] += attn * vht[r];
+            }
+        }
+    }
+
+    /* Kernel 4: State update (in-place: decay + accumulate weighted outer products) */
+    {
+        float cum_last = cum_g[cs - 1];
+        float total_decay;
+        {
+            float ex = cum_last;
+            if (ex > 50.0f) ex = 50.0f;
+            if (ex < -50.0f) ex = -50.0f;
+            total_decay = expf(ex);
+        }
+        ssm_kernel_state_update(state, v_hat, k, decay_to_end, total_decay, d, cs);
+    }
+#else
+    /* === Scalar path (reference) === */
+
+    /* Step 2: Compute interaction matrix M[i][j] = k_i . k_j * decay (scalar) */
+    for (int i = 0; i < cs; i++) {
+        const float *ki = k + i * d;
+        for (int j = 0; j <= i; j++) {
+            float dot = 0.0f;
+            const float *kj = k + j * d;
+            for (int di = 0; di < d; di++) dot += ki[di] * kj[di];
+            M_mat[i * cs + j] = dot * decay_mask[i * cs + j];
+        }
+        for (int j = i + 1; j < cs; j++) {
             M_mat[i * cs + j] = 0.0f;
         }
     }
@@ -2367,9 +2769,7 @@ static void ssm_chunk_head_task(int h, void *ctxp) {
         }
     }
 
-    /* Step 4: Forward substitution.
-     * V_hat[i] = V_eff[i] - beta[i] * sum_{j<i} M[i][j] * V_hat[j]
-     * Note: beta[i] multiplies the ENTIRE subtraction term. */
+    /* Step 4: Forward substitution. */
     for (int i = 0; i < cs; i++) {
         float bt = beta[i];
         for (int r = 0; r < d; r++) {
@@ -2381,9 +2781,7 @@ static void ssm_chunk_head_task(int h, void *ctxp) {
         }
     }
 
-    /* Step 5: Compute output.
-     * out[i][r] = decay[i] * S_init[r] . q[i]
-     *           + sum_{j<=i} (k[j] . q[i]) * decay[i][j] * V_hat[j][r] */
+    /* Step 5: Compute output. */
     for (int i = 0; i < cs; i++) {
         float decay_i = q_decay[i];
         const float *qi = q + i * d;
@@ -2399,7 +2797,6 @@ static void ssm_chunk_head_task(int h, void *ctxp) {
         /* Intra-chunk contribution (includes j == i) */
         for (int j = 0; j <= i; j++) {
             float dm = decay_mask[i * cs + j];
-            /* k[j] . q[i] */
             float k_dot_q = 0.0f;
             const float *kj = k + j * d;
             for (int di = 0; di < d; di++) k_dot_q += kj[di] * qi[di];
@@ -2410,10 +2807,7 @@ static void ssm_chunk_head_task(int h, void *ctxp) {
         }
     }
 
-    
-    /* Step 6: Update state for next chunk.
-     * S_new[r][c] = decay[last] * S_init[r][c]
-     *             + sum_j decay[last][j] * V_hat[j][r] * k[j][c] */
+    /* Step 6: Update state for next chunk. */
     {
         float total_decay;
         {
@@ -2438,6 +2832,7 @@ static void ssm_chunk_head_task(int h, void *ctxp) {
             }
         }
     }
+#endif
 }
 
 /* Chunked SSM recurrence: replaces the sequential per-token loop.
@@ -2466,10 +2861,15 @@ static void ssm_chunked_recurrence(
 
     int qk_dim = d_state * n_k_heads;
 
-    /* Compute scratch size per thread for ssm_chunk_head_task.
-     * cs + 2*cs*cs + 2*cs*d floats.
-     * For CS=64, d=128: 64 + 8192 + 16384 = ~25KB per thread */
-    size_t scratch_per_head = (size_t)CS + 2UL * CS + 2UL * CS * CS + 2UL * CS * (size_t)d_state;
+    /* Compute scratch size per head for ssm_chunk_head_task.
+     * Base: cum_g[cs] + q_decay[cs] + decay_mask[cs*cs] + M_mat[cs*cs]
+     *       + v_eff[cs*d] + v_hat[cs*d]
+     * AVX-512 extras: sk[cs*d] + sq[cs*d] + kq[cs*cs] + decay_to_end[cs]
+     * Total base: 2*cs + 2*cs*cs + 2*cs*d
+     * Total AVX:  + 2*cs*d + cs*cs + cs = 3*cs + 3*cs*cs + 4*cs*d
+     * For CS=64, d=128: ~38KB per head */
+    size_t scratch_per_head = (size_t)CS + 2UL * CS + 2UL * CS * CS + 2UL * CS * (size_t)d_state
+                            + 2UL * CS * (size_t)d_state + CS * CS + CS;
     scratch_per_head = (scratch_per_head + 15) & ~15UL;
 
     /* Allocate task contexts and per-head scratch separately to avoid stride issues */
