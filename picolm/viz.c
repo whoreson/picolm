@@ -15,24 +15,40 @@
 
 #include "viz.h"
 
-/* POSIX dependencies: sockets, pthreads, fcntl, nanosleep.
- * Works on Linux, macOS, FreeBSD, MSYS2/MinGW-w64.
- * Native MSVC is not supported (no POSIX runtime). */
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <fcntl.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <errno.h>
-#include <math.h>
-#include <pthread.h>
-#include <stdatomic.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "ws2_32.lib")
+#endif
+#ifndef socklen_t
+typedef int socklen_t;
+#endif
+#else
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#endif
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <time.h>
+
+/* viz socket close: closesocket on Windows, close on POSIX */
+#ifdef _WIN32
+#define _viz_close closesocket
+#else
+#define _viz_close close
+#endif
 
 /* ------------------------------------------------------------------ */
 /*  Constants                                                          */
@@ -223,23 +239,34 @@ static uint32_t vnc_read_u32_be(const unsigned char *buf) {
 /* ------------------------------------------------------------------ */
 
 static int viz_set_nonblocking(int fd) {
+#ifdef _WIN32
+    u_long mode = 1;
+    return ioctlsocket(fd, FIONBIO, &mode);
+#else
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags == -1) return -1;
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+#endif
 }
 
 static int viz_recv_full(int fd, void *buf, size_t len) {
     size_t received = 0;
     unsigned char *ptr = (unsigned char *)buf;
     while (received < len) {
-        int r = recv(fd, (char *)(ptr + received), len - received, 0);
+        int r = recv(fd, (char *)(ptr + received), (int)(len - received), 0);
         if (r > 0) {
             received += (size_t)r;
         } else if (r == 0) {
             return -1;
         } else {
+#ifdef _WIN32
+            int err = WSAGetLastError();
+            if (err != WSAEWOULDBLOCK) return -1;
+            Sleep(1);
+#else
             if (errno != EAGAIN && errno != EWOULDBLOCK) return -1;
             usleep(1000); /* 1ms */
+#endif
         }
     }
     return 0;
@@ -249,14 +276,20 @@ static int viz_send_full(int fd, const void *buf, size_t len) {
     size_t sent = 0;
     const unsigned char *ptr = (const unsigned char *)buf;
     while (sent < len) {
-        int s = send(fd, (const char *)(ptr + sent), len - sent, 0);
+        int s = send(fd, (const char *)(ptr + sent), (int)(len - sent), 0);
         if (s > 0) {
             sent += (size_t)s;
         } else if (s == 0) {
             return -1;
         } else {
+#ifdef _WIN32
+            int err = WSAGetLastError();
+            if (err != WSAEWOULDBLOCK) return -1;
+            Sleep(1);
+#else
             if (errno != EAGAIN && errno != EWOULDBLOCK) return -1;
             usleep(1000);
+#endif
         }
     }
     return 0;
@@ -268,11 +301,43 @@ static int viz_send_full(int fd, const void *buf, size_t len) {
 
 static void viz_sleep(double seconds) {
     if (seconds > 0) {
+#ifdef _WIN32
+        Sleep((DWORD)(seconds * 1000.0));
+#else
         struct timespec ts;
         ts.tv_sec = (time_t)floor(seconds);
         ts.tv_nsec = (long)round((seconds - (double)ts.tv_sec) * 1000000000.0);
         nanosleep(&ts, NULL);
+#endif
     }
+}
+
+/* Portable error string for socket operations (only used on Windows) */
+#ifdef _WIN32
+static const char *viz_socket_strerror(int err) {
+    /* WSAGetLastError codes: WSAEINVAL=10022, WSAEMFILE=10024, etc. */
+    switch (err) {
+        case WSAENOTSOCK: return "socket operation on non-socket";
+        case WSAEADDRINUSE: return "address already in use";
+        case WSAEACCES: return "permission denied";
+        case WSAEINVAL: return "invalid argument";
+        default: return "socket error";
+    }
+}
+#endif
+
+/* Monotonic time in seconds */
+static double viz_mono_time(void) {
+#ifdef _WIN32
+    LARGE_INTEGER freq, count;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&count);
+    return (double)count.QuadPart / (double)freq.QuadPart;
+#else
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (double)now.tv_sec + (double)now.tv_nsec / 1e9;
+#endif
 }
 
 /* ------------------------------------------------------------------ */
@@ -777,7 +842,7 @@ static void viz_render_heatmap(void) {
 static void viz_vnc_disconnect(void) {
     if (viz.client_fd > 0) {
         fprintf(stderr, "[VIZ] VNC: Client disconnected\n");
-        close(viz.client_fd);
+        _viz_close(viz.client_fd);
     }
     viz.client_fd = -1;
     viz.state = 0;
@@ -859,13 +924,23 @@ static void viz_vnc_process_messages(void) {
     unsigned char buf[64];
     int r;
 
-    r = recv(viz.client_fd, (char *)&msg_type, 1, MSG_DONTWAIT);
+    r = recv(viz.client_fd, (char *)&msg_type, 1,
+#ifdef _WIN32
+             0
+#else
+             MSG_DONTWAIT
+#endif
+    );
     if (r == 0) {
         viz_vnc_disconnect();
         return;
     }
     if (r < 0) {
+#ifdef _WIN32
+        if (WSAGetLastError() == WSAEWOULDBLOCK) return;
+#else
         if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+#endif
         viz_vnc_disconnect();
         return;
     }
@@ -1029,10 +1104,7 @@ static void *viz_vnc_thread_func(void *arg) {
     double last_update = 0.0;
     const double update_interval = 0.2; /* 5 Hz max update rate */
 
-    /* Simple monotonic time using clock_gettime */
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    last_update = (double)now.tv_sec + (double)now.tv_nsec / 1e9;
+    last_update = viz_mono_time();
 
     while (atomic_load_explicit(&viz.running, memory_order_relaxed)) {
         /* Accept new connections */
@@ -1041,11 +1113,15 @@ static void *viz_vnc_thread_func(void *arg) {
             socklen_t addr_len = sizeof(client_addr);
             int new_fd = accept(viz.listen_fd, (struct sockaddr *)&client_addr, &addr_len);
 
+#ifdef _WIN32
+            if (new_fd != (int)INVALID_SOCKET) {
+#else
             if (new_fd > 0) {
+#endif
                 fprintf(stderr, "[VIZ] VNC: Connection from %s\n",
                         inet_ntoa(client_addr.sin_addr));
                 int flag = 1;
-                setsockopt(new_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+                setsockopt(new_fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&flag, sizeof(flag));
                 viz_set_nonblocking(new_fd);
                 viz.client_fd = new_fd;
                 viz.state = 0;
@@ -1064,8 +1140,7 @@ static void *viz_vnc_thread_func(void *arg) {
         }
 
         /* Render and send frame at controlled rate */
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        double current = (double)now.tv_sec + (double)now.tv_nsec / 1e9;
+        double current = viz_mono_time();
 
         if (current - last_update >= update_interval) {
             last_update = current;
@@ -1091,11 +1166,11 @@ static void *viz_vnc_thread_func(void *arg) {
 
     /* Cleanup */
     if (viz.client_fd > 0) {
-        close(viz.client_fd);
+        _viz_close(viz.client_fd);
         viz.client_fd = -1;
     }
     if (viz.listen_fd >= 0) {
-        close(viz.listen_fd);
+        _viz_close(viz.listen_fd);
         viz.listen_fd = -1;
     }
 
@@ -1116,6 +1191,16 @@ int viz_init(int width, int height, int port) {
     /* Zero out state */
     memset(&viz, 0, sizeof(viz));
     memset(&viz_ring, 0, sizeof(viz_ring));
+
+#ifdef _WIN32
+    {
+        WSADATA wsa;
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+            fprintf(stderr, "[VIZ] WSAStartup failed\n");
+            return -1;
+        }
+    }
+#endif
 
     viz.width = width;
     viz.height = height;
@@ -1147,15 +1232,21 @@ int viz_init(int width, int height, int port) {
 
     /* Create listening socket */
     viz.listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+#ifdef _WIN32
+    if (viz.listen_fd == (int)INVALID_SOCKET) {
+        fprintf(stderr, "[VIZ] Failed to create socket: %s\n",
+                viz_socket_strerror(WSAGetLastError()));
+#else
     if (viz.listen_fd < 0) {
         fprintf(stderr, "[VIZ] Failed to create socket: %s\n", strerror(errno));
+#endif
         free(viz.framebuffer);
         viz.framebuffer = NULL;
         return -1;
     }
 
     int opt = 1;
-    setsockopt(viz.listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(viz.listen_fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -1163,17 +1254,29 @@ int viz_init(int width, int height, int port) {
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons((uint16_t)port);
 
+#ifdef _WIN32
+    if (bind(viz.listen_fd, (struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR) {
+        fprintf(stderr, "[VIZ] Failed to bind to port %d: %s\n", port,
+                viz_socket_strerror(WSAGetLastError()));
+#else
     if (bind(viz.listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         fprintf(stderr, "[VIZ] Failed to bind to port %d: %s\n", port, strerror(errno));
-        close(viz.listen_fd);
+#endif
+        _viz_close(viz.listen_fd);
         free(viz.framebuffer);
         viz.framebuffer = NULL;
         return -1;
     }
 
+#ifdef _WIN32
+    if (listen(viz.listen_fd, VIZ_MAX_CLIENTS) == SOCKET_ERROR) {
+        fprintf(stderr, "[VIZ] Failed to listen: %s\n",
+                viz_socket_strerror(WSAGetLastError()));
+#else
     if (listen(viz.listen_fd, VIZ_MAX_CLIENTS) < 0) {
         fprintf(stderr, "[VIZ] Failed to listen: %s\n", strerror(errno));
-        close(viz.listen_fd);
+#endif
+        _viz_close(viz.listen_fd);
         free(viz.framebuffer);
         viz.framebuffer = NULL;
         return -1;
@@ -1190,7 +1293,7 @@ int viz_init(int width, int height, int port) {
     /* Start VNC thread */
     if (pthread_create(&viz.thread, NULL, viz_vnc_thread_func, NULL) != 0) {
         fprintf(stderr, "[VIZ] Failed to create VNC thread: %s\n", strerror(errno));
-        close(viz.listen_fd);
+        _viz_close(viz.listen_fd);
         free(viz.framebuffer);
         viz.framebuffer = NULL;
         return -1;
@@ -1241,11 +1344,15 @@ void viz_free(void) {
     pthread_mutex_destroy(&viz.fb_mutex);
 
     if (viz.listen_fd >= 0) {
-        close(viz.listen_fd);
+        _viz_close(viz.listen_fd);
         viz.listen_fd = -1;
     }
 
     fprintf(stderr, "[VIZ] Freed.\n");
+
+#ifdef _WIN32
+    WSACleanup();
+#endif
 }
 
 int viz_has_viewers(void) {
