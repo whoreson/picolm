@@ -162,13 +162,17 @@ static int pretok_next(const char *s, int n) {
     {
         int j = 0;
         if (cp == ' ' && adv < n) {
-            int c2, a2 = utf8_next(s + adv, n - adv, &c2);
+            int c2;
+            (void)utf8_next(s + adv, n - adv, &c2);
             if (!is_WS(c2) && !is_L(c2) && !is_N(c2)) j = adv;
         }
         if (j > 0 || (!is_WS(cp) && !is_L(cp) && !is_N(cp))) {
             int k = j;
-            while (k < n) { int c3, a3 = utf8_next(s + k, n - k, &c3);
-                if (is_WS(c3) || is_L(c3) || is_N(c3)) break; k += a3; }
+            while (k < n) {
+                int c3, a3 = utf8_next(s + k, n - k, &c3);
+                if (is_WS(c3) || is_L(c3) || is_N(c3)) break;
+                k += a3;
+            }
             if (k > j || j > 0) {
                 while (k < n && (s[k] == '\r' || s[k] == '\n')) k++;
                 if (k > 0) return k;
