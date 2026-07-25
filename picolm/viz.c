@@ -209,12 +209,44 @@ static viz_state_t viz;
 /* ------------------------------------------------------------------ */
 static _Atomic int viz_skip_layer[VIZ_MAX_LAYERS];
 
+/* Layer permutation: viz_layer_permute(slot) returns which logical layer
+ * should execute at position `slot` in the forward pass. Identity by
+ * default. Modified by VNC drag-and-drop. */
+static _Atomic int viz_layer_perm[VIZ_MAX_LAYERS];
+
+/* Build an inverse map: perm_inv[layer] = slot where layer executes.
+ * Used for rendering (knowing which row to draw which layer's data). */
+static int viz_perm_inv[VIZ_MAX_LAYERS];
+
+static void viz_perm_rebuild_inv(void) {
+    for (int i = 0; i < VIZ_MAX_LAYERS; i++) {
+        int layer = atomic_load_explicit(&viz_layer_perm[i], memory_order_relaxed);
+        if (layer >= 0 && layer < VIZ_MAX_LAYERS)
+            viz_perm_inv[layer] = i;
+    }
+}
+
 /* Check if a layer should be skipped.
  * Called from the inference thread. Atomic load, no blocking. */
 int viz_layer_skip(int layer) {
     if (layer >= 0 && layer < VIZ_MAX_LAYERS)
         return atomic_load_explicit(&viz_skip_layer[layer], memory_order_relaxed);
     return 0;
+}
+
+/* Get the execution order permutation for layers.
+ * Returns the logical layer index that should execute at position `slot`. */
+int viz_layer_permute(int slot) {
+    if (slot >= 0 && slot < VIZ_MAX_LAYERS)
+        return atomic_load_explicit(&viz_layer_perm[slot], memory_order_relaxed);
+    return slot;
+}
+
+/* Reset layer permutation to identity. */
+void viz_layer_permute_reset(void) {
+    for (int i = 0; i < VIZ_MAX_LAYERS; i++)
+        atomic_store_explicit(&viz_layer_perm[i], i, memory_order_relaxed);
+    viz_perm_rebuild_inv();
 }
 
 /* ------------------------------------------------------------------ */
@@ -832,7 +864,7 @@ static void viz_render_heatmap(void) {
         viz_draw_string(fb, fb_w, fb_h, bar_x + 1, heatmap_y + bar_h - VIZ_FONT_H, num_buf, dim);
     }
 
-    /* Layer labels on the left (only if enough room). */
+    /* Layer labels on the left (only if enough room for small labels). */
     if (layer_h >= 10 && n_layers <= 64) {
         char lbl[16];
         for (int l = 0; l < n_layers; l++) {
@@ -845,6 +877,20 @@ static void viz_render_heatmap(void) {
         }
     }
 
+    /* Permutation indicators: show "L@S" on the right side for
+     * layers that are not in their natural execution position. */
+    {
+        int label_x = fb_w - 32; /* right side, before color bar */
+        if (label_x < 20) label_x = fb_w / 2;
+        char lbl[16];
+        for (int l = 0; l < n_layers; l++) {
+            int exec_slot = viz_perm_inv[l];
+            if (exec_slot == l) continue; /* natural position, no indicator */
+            int cy = heatmap_y + l * layer_h + 1;
+            snprintf(lbl, sizeof(lbl), "%d@%d", l, exec_slot);
+            viz_draw_string(fb, fb_w, fb_h, label_x, cy, lbl, 0xFFFFFFAA);
+        }
+    }
     /* Post-process: dim skipped layer rows and draw "S" indicators.
      * Done after all heatmap + label drawing so indicators stay bright. */
     {
@@ -962,6 +1008,26 @@ static int viz_vnc_handle_handshake(void) {
     }
 }
 
+/* Drag state for layer permutation (persisted across calls) */
+static int viz_drag_slot = -1;    /* slot where button was pressed */
+static int viz_drag_prev_y = -1;  /* y of last event, for debouncing */
+
+/* Map a y-coordinate to a layer slot, or -1 if outside heatmap */
+static int viz_y_to_slot(uint16_t y) {
+    int top_bar_h = 20;
+    int heatmap_y = top_bar_h + 2;
+    int heatmap_h = viz.height - heatmap_y - 2;
+    int n_layers = viz.n_layers;
+    if (n_layers > 0 && y >= (uint16_t)heatmap_y && y < (uint16_t)(heatmap_y + heatmap_h)) {
+        int layer_h = heatmap_h / n_layers;
+        if (layer_h > 0) {
+            int s = (y - heatmap_y) / layer_h;
+            if (s >= 0 && s < n_layers) return s;
+        }
+    }
+    return -1;
+}
+
 static void viz_vnc_process_messages(void) {
     unsigned char msg_type;
     unsigned char buf[64];
@@ -1030,38 +1096,56 @@ static void viz_vnc_process_messages(void) {
             }
             break;
 
-        case 5: /* PointerEvent - mouse click toggles layer skip */
+        case 5: /* PointerEvent - click toggles skip, drag permutes layers */
             if (viz_recv_full(viz.client_fd, buf, 5) < 0) {
                 viz_vnc_disconnect();
             }
             {
                 uint8_t button_mask = buf[0];
-                (void)vnc_read_u16_be(buf + 1); /* mouse_x, not used for layer skip */
+                (void)vnc_read_u16_be(buf + 1); /* mouse_x */
                 uint16_t mouse_y = vnc_read_u16_be(buf + 3);
 
-                /* Left button (mask & 0x01) click on heatmap toggles layer skip */
+                int slot = viz_y_to_slot(mouse_y);
+
                 if (button_mask & 0x01) {
-                    /* Layout: top bar = 20px, then 2px gap, then heatmap rows.
-                     * Each layer gets (height - 22) / n_layers pixels. */
-                    int top_bar_h = 20;
-                    int heatmap_y = top_bar_h + 2;
-                    int heatmap_h = viz.height - heatmap_y - 2;
-                    int n_layers = viz.n_layers;
-                    if (n_layers > 0 && mouse_y >= heatmap_y && mouse_y < (uint16_t)(heatmap_y + heatmap_h)) {
-                        int layer_h = heatmap_h / n_layers;
-                        if (layer_h > 0) {
-                            int clicked_layer = (mouse_y - heatmap_y) / layer_h;
-                            if (clicked_layer >= 0 && clicked_layer < n_layers) {
-                                int old = atomic_load_explicit(&viz_skip_layer[clicked_layer],
-                                                                memory_order_relaxed);
-                                atomic_store_explicit(&viz_skip_layer[clicked_layer], !old,
-                                                       memory_order_release);
-                                fprintf(stderr, "[VIZ] Layer %d: %s\n",
-                                        clicked_layer, !old ? "SKIPPED" : "ACTIVE");
-                                atomic_store_explicit(&viz.update_requested, 1,
-                                                       memory_order_release);
-                            }
+                    /* Button held: track start slot */
+                    if (viz_drag_slot < 0 && slot >= 0) {
+                        viz_drag_slot = slot;
+                        viz_drag_prev_y = mouse_y;
+                    }
+                } else {
+                    /* Button released: decide click vs drag */
+                    if (viz_drag_slot >= 0) {
+                        int release_slot = viz_y_to_slot(mouse_y);
+                        if (release_slot >= 0 && release_slot != viz_drag_slot) {
+                            /* Drag: swap original press slot with release slot */
+                            int a = viz_drag_slot, b = release_slot;
+                            int tmp = atomic_load_explicit(&viz_layer_perm[a], memory_order_relaxed);
+                            atomic_store_explicit(&viz_layer_perm[a],
+                                atomic_load_explicit(&viz_layer_perm[b], memory_order_relaxed),
+                                memory_order_release);
+                            atomic_store_explicit(&viz_layer_perm[b], tmp, memory_order_release);
+                            viz_perm_rebuild_inv();
+                            fprintf(stderr, "[VIZ] Swapped exec slots %d<->%d (layers %d<->%d)\n",
+                                    a, b,
+                                    atomic_load_explicit(&viz_layer_perm[a], memory_order_relaxed),
+                                    atomic_load_explicit(&viz_layer_perm[b], memory_order_relaxed));
+                            atomic_store_explicit(&viz.update_requested, 1, memory_order_release);
+                        } else if (release_slot == viz_drag_slot) {
+                            /* Click: released on same slot -> toggle skip */
+                            int old = atomic_load_explicit(&viz_skip_layer[viz_drag_slot],
+                                                            memory_order_relaxed);
+                            atomic_store_explicit(&viz_skip_layer[viz_drag_slot], !old,
+                                                   memory_order_release);
+                            fprintf(stderr, "[VIZ] Slot %d (layer %d): %s\n",
+                                    viz_drag_slot,
+                                    atomic_load_explicit(&viz_layer_perm[viz_drag_slot], memory_order_relaxed),
+                                    !old ? "SKIPPED" : "ACTIVE");
+                            atomic_store_explicit(&viz.update_requested, 1,
+                                                   memory_order_release);
                         }
+                        viz_drag_slot = -1;
+                        viz_drag_prev_y = -1;
                     }
                 }
             }
@@ -1285,6 +1369,13 @@ int viz_init(int width, int height, int port) {
     viz.global_max = 1.0f;
     viz.display_mode = 0;
     viz.scroll_offset = 0;
+
+    /* Initialize skip flags to 0 (not skipped) */
+    for (int i = 0; i < VIZ_MAX_LAYERS; i++)
+        atomic_store_explicit(&viz_skip_layer[i], 0, memory_order_relaxed);
+
+    /* Initialize layer permutation to identity */
+    viz_layer_permute_reset();
 
     /* Allocate framebuffer */
     viz.framebuffer = (unsigned char *)malloc((size_t)width * height * 4);

@@ -75,6 +75,15 @@ int  viz_has_viewers(void);
  * Safe to call from inference thread (atomic load).                   */
 int  viz_layer_skip(int layer);
 
+/* Get the execution order permutation for layers.
+ * Returns the logical layer index that should execute at position `slot`.
+ * When no permutation is active, returns `slot` (identity).
+ * Safe to call from inference thread (atomic load).                   */
+int  viz_layer_permute(int slot);
+
+/* Reset layer permutation to identity. */
+void viz_layer_permute_reset(void);
+
 #ifdef __cplusplus
 }
 #endif

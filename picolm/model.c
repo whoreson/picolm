@@ -2012,7 +2012,12 @@ float *model_forward(model_t *m, int token, int pos) {
      * pass. For now, skip them entirely. */
     int n_active_layers = c->n_layers - c->n_mtp_layers;
     int attn_ordinal = 0;
-    for (int l = 0; l < n_active_layers; l++) {
+    for (int slot = 0; slot < n_active_layers; slot++) {
+#ifdef PICOLM_VIZ
+        int l = viz_layer_permute(slot);
+#else
+        int l = slot;
+#endif
         layer_weights_t *lw = &w->layers[l];
         BENCH_LAYER_START();
 #ifdef PICOLM_GPU
@@ -5628,7 +5633,12 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
     int gpu_ok = m->gpu.active;
     int gpu_dev = m->gpu.device;
 #endif
-    for (int l = 0; l < c->n_layers; l++) {
+    for (int slot = 0; slot < c->n_layers; slot++) {
+#ifdef PICOLM_VIZ
+        int l = viz_layer_permute(slot);
+#else
+        int l = slot;
+#endif
         layer_weights_t *lw = &w->layers[l];
         BENCH_LAYER_START();
 
