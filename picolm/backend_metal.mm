@@ -439,6 +439,120 @@ kernel void silu_mul(device float*       gate [[buffer(0)]],\n\
         gate[gid] = (v / (1.0f + exp(-v))) * up[gid];\n\
     }\n\
 }\n\
+\n\
+/* =============== SSM batched quantized vec_dot (1 head / threadgroup) =========\n\
+ * Ported from backend_gpu.cu picolm_ssm_vecdot_kernel. One threadgroup per\n\
+ * v-head: out[h] = x . dequant(weights[head_map[h]]) over `dim` elements,\n\
+ * reduced with reduce_all. Only Q4_0 / Q8_0 reach here (model.c host gate);\n\
+ * other types -> CPU fallback. Dequant matches quant.c / mm_q4_0 / mm_q8_0.\n\
+ * head_map is non-NULL on the host path (NULL identity is handled by uploading\n\
+ * an identity map in the host wrapper). */\n\
+kernel void ssm_vecdot(device float*         out      [[buffer(0)]],\n\
+                       device const float*   x        [[buffer(1)]],\n\
+                       device const uint8_t* weights  [[buffer(2)]],\n\
+                       constant int& qtype    [[buffer(3)]],\n\
+                       constant int& dim      [[buffer(4)]],\n\
+                       constant int& n_v_heads[[buffer(5)]],\n\
+                       constant int& row_bytes[[buffer(6)]],\n\
+                       device const int*   head_map [[buffer(7)]],\n\
+                       uint tid [[thread_index_in_threadgroup]],\n\
+                       uint  h  [[threadgroup_position_in_grid]]) {\n\
+    if ((int)h >= n_v_heads) return;\n\
+    int gh = head_map[h];\n\
+    device const uint8_t* wrow = weights + (unsigned long)gh * (unsigned long)row_bytes;\n\
+    float acc = 0.0f;\n\
+    if (qtype == 2) {                       /* Q4_0: 18B/32v, separated nibbles */\n\
+        int nb = dim / 32;\n\
+        for (int bi = (int)tid; bi < nb; bi += TPB) {\n\
+            device const uint8_t* blk = wrow + (unsigned long)(bi * 18);\n\
+            float d = f16tof32((uint16_t)blk[0] | ((uint16_t)blk[1] << 8));\n\
+            device const uint8_t* qs = blk + 2;\n\
+            for (int j = 0; j < 32; j++) {\n\
+                int byte_idx = j & 15;\n\
+                int shift = (j < 16) ? 0 : 4;\n\
+                int nib = (qs[byte_idx] >> shift) & 0xF;\n\
+                acc += x[bi * 32 + j] * (float)(nib - 8) * d;\n\
+            }\n\
+        }\n\
+    } else if (qtype == 8) {                /* Q8_0: 34B/32v */\n\
+        int nb = dim / 32;\n\
+        for (int bi = (int)tid; bi < nb; bi += TPB) {\n\
+            device const uint8_t* blk = wrow + (unsigned long)(bi * 34);\n\
+            float d = f16tof32((uint16_t)blk[0] | ((uint16_t)blk[1] << 8));\n\
+            device const int8_t* qs = (device const int8_t*)(blk + 2);\n\
+            for (int j = 0; j < 32; j++)\n\
+                acc += x[bi * 32 + j] * (float)qs[j] * d;\n\
+        }\n\
+    }\n\
+    threadgroup float wb[NW];\n\
+    float total = reduce_all(acc, wb, tid);\n\
+    if (tid == 0) out[h] = total;\n\
+}\n\
+\n\
+/* =============== SSM DeltaNet recurrence (1 head / threadgroup) ==============\n\
+ * Ported from backend_gpu.cu picolm_ssm_recurrence_kernel; matches the CPU\n\
+ * scalar reference in model.c ssm_head_task (same op order). One threadgroup of\n\
+ * TPB lanes owns one v-head's [d_state x d_state] state. d_state <= 256 (host\n\
+ * returns 0 -> CPU fallback otherwise). Fixed threadgroup scratch\n\
+ * sk[256] + d_local[256] = 2 KB covers the max d_state.\n\
+ * Per head h (k_head = h/repeat shares q_conv/k_conv):\n\
+ *   1. decay state *= gate_exp   2. sk[row]=state[row].k   3. d=(v-sk)*beta\n\
+ *   4. state += k^T d (rank-1)   5. out[row*n_v_heads+h] = state[row].q\n\
+ * Barriers separate phases; within a phase threads touch disjoint elements. */\n\
+kernel void ssm_recurrence(device float*       state    [[buffer(0)]],\n\
+                           device const float* q_conv   [[buffer(1)]],\n\
+                           device const float* k_conv   [[buffer(2)]],\n\
+                           device const float* v_conv   [[buffer(3)]],\n\
+                           device const float* gate_exp [[buffer(4)]],\n\
+                           device const float* beta     [[buffer(5)]],\n\
+                           device float*       ssm_out  [[buffer(6)]],\n\
+                           constant int* dims          [[buffer(7)]],\n\
+                           uint tid [[thread_index_in_threadgroup]],\n\
+                           uint  h  [[threadgroup_position_in_grid]]) {\n\
+    int n_v_heads = dims[0];\n\
+    int d_state   = dims[1];\n\
+    int repeat    = dims[2];\n\
+    if ((int)h >= n_v_heads) return;\n\
+    threadgroup float sk[256];\n\
+    threadgroup float d_local[256];\n\
+    int kh = (int)h / repeat;\n\
+    device const float* qh  = q_conv + (unsigned long)kh * (unsigned long)d_state;\n\
+    device const float* khv = k_conv + (unsigned long)kh * (unsigned long)d_state;\n\
+    device const float* vh  = v_conv + (unsigned long)h  * (unsigned long)d_state;\n\
+    float ge = gate_exp[h];\n\
+    float bh = beta[h];\n\
+    device float* st       = state   + (unsigned long)h * (unsigned long)d_state * (unsigned long)d_state;\n\
+    device float* out_base = ssm_out + (unsigned long)h;       /* dim-major */\n\
+    int N = d_state * d_state;\n\
+    /* 1. decay */\n\
+    for (int i = (int)tid; i < N; i += TPB) st[i] *= ge;\n\
+    threadgroup_barrier(mem_flags::mem_threadgroup);\n\
+    /* 2. sk[row] = state[row] . k */\n\
+    for (int row = (int)tid; row < d_state; row += TPB) {\n\
+        device const float* st_row = st + (unsigned long)row * (unsigned long)d_state;\n\
+        float sum = 0.0f;\n\
+        for (int col = 0; col < d_state; col++) sum += st_row[col] * khv[col];\n\
+        sk[row] = sum;\n\
+    }\n\
+    threadgroup_barrier(mem_flags::mem_threadgroup);\n\
+    /* 3. d[row] = (v[row] - sk[row]) * beta */\n\
+    for (int row = (int)tid; row < d_state; row += TPB)\n\
+        d_local[row] = (vh[row] - sk[row]) * bh;\n\
+    threadgroup_barrier(mem_flags::mem_threadgroup);\n\
+    /* 4. state[row][col] += k[col] * d[row]  (rank-1 update) */\n\
+    for (int i = (int)tid; i < N; i += TPB) {\n\
+        int row = i / d_state, col = i % d_state;\n\
+        st[i] += khv[col] * d_local[row];\n\
+    }\n\
+    threadgroup_barrier(mem_flags::mem_threadgroup);\n\
+    /* 5. out[row*n_v_heads+h] = state[row] . q */\n\
+    for (int row = (int)tid; row < d_state; row += TPB) {\n\
+        device const float* st_row = st + (unsigned long)row * (unsigned long)d_state;\n\
+        float sum = 0.0f;\n\
+        for (int col = 0; col < d_state; col++) sum += st_row[col] * qh[col];\n\
+        out_base[(unsigned long)row * (unsigned long)n_v_heads] = sum;\n\
+    }\n\
+}\n\
 ";
 
 #pragma mark - Device context (single global; Apple Silicon has one GPU)
@@ -451,7 +565,8 @@ static id<MTLCommandQueue>       g_queue   = nil;
 static id<MTLLibrary>            g_library = nil;
 static id<MTLComputePipelineState> g_ps_f32, g_ps_f16, g_ps_q4_0, g_ps_q8_0,
                                   g_ps_q4_K, g_ps_q5_K, g_ps_q6_K, g_ps_silu,
-                                  g_ps_q4_K_mo, g_ps_q6_K_mo;
+                                  g_ps_q4_K_mo, g_ps_q6_K_mo,
+                                  g_ps_ssm_vecdot, g_ps_ssm_recurrence;
 static int g_ndev = 0;
 
 // Grow-only scratch buffers (mirror CUDA's reserve()). Shared storage mode =
@@ -463,12 +578,16 @@ static int g_ndev = 0;
 // matmul). Default tracking is what serializes those across encoders; making
 // them Untracked would race. The per-call waitUntilCompleted below does not
 // help with intra-command-buffer ordering.
-static id<MTLBuffer> g_x = nil, g_y = nil, g_gate = nil, g_up = nil;
-static size_t g_xcap = 0, g_ycap = 0, g_gatecap = 0, g_upcap = 0;
+// g_ssm holds the per-layer SSM recurrence state during a kernel run: it is
+// CPU-uploaded (state H2D), read AND written by the recurrence kernel, then
+// CPU-read back (state D2H). DefaultCache like g_y (GPU-write/CPU-read).
+static id<MTLBuffer> g_x = nil, g_y = nil, g_gate = nil, g_up = nil, g_ssm = nil;
+static size_t g_xcap = 0, g_ycap = 0, g_gatecap = 0, g_upcap = 0, g_ssmcap = 0;
 // Cached CPU mappings of the scratch buffers (stable for a buffer's lifetime;
 // refreshed only on reallocation inside reserve_buf). Saves a
 // -[MTLBuffer contents] message send on every dispatch.
-static void *g_xptr = NULL, *g_yptr = NULL, *g_gateptr = NULL, *g_upptr = NULL;
+static void *g_xptr = NULL, *g_yptr = NULL, *g_gateptr = NULL, *g_upptr = NULL,
+           *g_ssmptr = NULL;
 
 static id<MTLComputePipelineState> ps_for_qtype(gguf_type_t q) {
     switch (q) {
@@ -557,10 +676,17 @@ int picolm_gpu_init(const int *devices, int count) {
     g_ps_q4_K_mo = [g_device newComputePipelineStateWithFunction:[g_library newFunctionWithName:@"mm_q4_K_mo"] error:nil];
     g_ps_q6_K_mo = [g_device newComputePipelineStateWithFunction:[g_library newFunctionWithName:@"mm_q6_K_mo"] error:nil];
     g_ps_silu = [g_device newComputePipelineStateWithFunction:[g_library newFunctionWithName:@"silu_mul"] error:nil];
+    g_ps_ssm_vecdot     = [g_device newComputePipelineStateWithFunction:[g_library newFunctionWithName:@"ssm_vecdot"]     error:nil];
+    g_ps_ssm_recurrence = [g_device newComputePipelineStateWithFunction:[g_library newFunctionWithName:@"ssm_recurrence"] error:nil];
     if (!g_ps_f32 || !g_ps_f16 || !g_ps_q4_0 || !g_ps_q8_0 || !g_ps_q4_K || !g_ps_q5_K || !g_ps_q6_K || !g_ps_q4_K_mo || !g_ps_q6_K_mo || !g_ps_silu) {
         fprintf(stderr, "[Metal] pipeline state creation failed\n");
         g_device = nil; g_queue = nil; g_library = nil; return 0;
     }
+    /* The SSM kernels are new and not exercised by non-SSM models; if either
+     * fails to compile we keep GPU matmul/FFN working and just fall the SSM
+     * path back to CPU (the wrappers check for nil pipeline and return 0). */
+    if (!g_ps_ssm_vecdot || !g_ps_ssm_recurrence)
+        fprintf(stderr, "[Metal] warning: SSM kernel compile failed; SSM will run on CPU\n");
 
     g_ndev = 1;
     fprintf(stderr, "[Metal] device: %s, working set %.1f GB\n",
@@ -570,10 +696,11 @@ int picolm_gpu_init(const int *devices, int count) {
 }
 
 void picolm_gpu_shutdown(void) {
-    g_x = g_y = g_gate = g_up = nil;
-    g_xcap = g_ycap = g_gatecap = g_upcap = 0;
-    g_xptr = g_yptr = g_gateptr = g_upptr = NULL;
+    g_x = g_y = g_gate = g_up = g_ssm = nil;
+    g_xcap = g_ycap = g_gatecap = g_upcap = g_ssmcap = 0;
+    g_xptr = g_yptr = g_gateptr = g_upptr = g_ssmptr = NULL;
     g_ps_f32 = g_ps_f16 = g_ps_q4_0 = g_ps_q8_0 = g_ps_q4_K = g_ps_q5_K = g_ps_q6_K = g_ps_silu = nil;
+    g_ps_ssm_vecdot = g_ps_ssm_recurrence = nil;
     g_library = nil; g_queue = nil; g_device = nil;
     g_ndev = 0;
 }
@@ -823,6 +950,11 @@ int picolm_gpu_w4a16_matmul(picolm_gpu_tensor_t *t,
     return 0;   /* CPU fallback (WMMA Tensor Core path not exposed on Apple GPUs yet) */
 }
 
+/* ---- SSM batched quantized vec_dot (ported from backend_gpu.cu) ----
+ * out[h] = x . dequant(weights[head_map[h]]) for each of n_v_heads heads.
+ * Inputs packed into g_x as [x | weights | head_map]; out in g_y. Only Q4_0 /
+ * Q8_0 are supported (matches the host gate in model.c); anything else returns 0
+ * -> CPU fallback. head_map==NULL means identity (we upload an identity map). */
 int picolm_gpu_ssm_vecdot(float *out,
                            const float *x,
                            const void *weights,
@@ -831,11 +963,63 @@ int picolm_gpu_ssm_vecdot(float *out,
                            int row_bytes,
                            const int *head_map,
                            int device) {
-    (void)out; (void)x; (void)weights; (void)qtype; (void)dim;
-    (void)n_v_heads; (void)row_bytes; (void)head_map; (void)device;
-    return 0;   /* CPU fallback (SSM alpha/beta vec_dot) */
+    if (!out || !x || !weights || n_v_heads <= 0 || dim <= 0 || row_bytes <= 0)
+        return 0;
+    if (device != 0 || !g_device || !g_ps_ssm_vecdot) return 0;
+    if (qtype != GGUF_TYPE_Q4_0 && qtype != GGUF_TYPE_Q8_0) return 0;  /* CPU fallback */
+
+    /* head_map: identity on stack when NULL (cap guards tiny stack array). */
+    int idmap[256];
+    const int *hmap = head_map;
+    if (!hmap) {
+        if (n_v_heads > (int)(sizeof(idmap) / sizeof(int))) return 0;
+        for (int i = 0; i < n_v_heads; i++) idmap[i] = i;
+        hmap = idmap;
+    }
+
+    size_t x_bytes    = (size_t)dim * sizeof(float);
+    size_t w_bytes    = (size_t)n_v_heads * (size_t)row_bytes;
+    size_t map_off    = (x_bytes + w_bytes + 15) & ~(size_t)15;  /* 16-align int head_map */
+    size_t map_bytes  = (size_t)n_v_heads * sizeof(int);
+    size_t total_in   = map_off + map_bytes;
+    size_t out_bytes  = (size_t)n_v_heads * sizeof(float);
+
+    if (!reserve_buf(&g_x, &g_xcap, &g_xptr, total_in,
+                     MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined)) return 0;
+    if (!reserve_buf(&g_y, &g_ycap, &g_yptr, out_bytes,
+                     MTLResourceStorageModeShared | MTLResourceCPUCacheModeDefaultCache)) return 0;
+
+    memcpy(g_xptr, x, x_bytes);
+    memcpy((uint8_t *)g_xptr + x_bytes, weights, w_bytes);
+    memcpy((uint8_t *)g_xptr + map_off, hmap, map_bytes);
+
+    id<MTLCommandBuffer> cmd = [g_queue commandBufferWithUnretainedReferences];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    [enc setComputePipelineState:g_ps_ssm_vecdot];
+    [enc setBuffer:g_y offset:0                    atIndex:0];   /* out      */
+    [enc setBuffer:g_x offset:0                    atIndex:1];   /* x        */
+    [enc setBuffer:g_x offset:x_bytes              atIndex:2];   /* weights  */
+    int32_t cq = (int32_t)qtype, cd = dim, cn = n_v_heads, cr = row_bytes;
+    [enc setBytes:&cq length:sizeof(cq) atIndex:3];
+    [enc setBytes:&cd length:sizeof(cd) atIndex:4];
+    [enc setBytes:&cn length:sizeof(cn) atIndex:5];
+    [enc setBytes:&cr length:sizeof(cr) atIndex:6];
+    [enc setBuffer:g_x offset:map_off               atIndex:7];   /* head_map */
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_v_heads, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(TPB, 1, 1)];
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+
+    memcpy(out, g_yptr, out_bytes);
+    return 1;
 }
 
+/* ---- SSM DeltaNet recurrence (ported from backend_gpu.cu) ----
+ * One threadgroup per v-head. State is copied H2D into g_ssm, mutated by the
+ * kernel, then copied D2H back (the state is persistent host memory owned by
+ * the model). Small per-head inputs (q/k/v/gate_exp/beta) are packed into g_x;
+ * ssm_output lands in g_y. d_state<=256 (else CPU fallback). */
 int picolm_gpu_ssm_recurrence(float *state,
                                const float *q_conv,
                                const float *k_conv,
@@ -845,10 +1029,64 @@ int picolm_gpu_ssm_recurrence(float *state,
                                float *ssm_output,
                                int n_v_heads, int d_state,
                                int repeat, int device) {
-    (void)state; (void)q_conv; (void)k_conv; (void)v_conv; (void)gate_exp;
-    (void)beta; (void)ssm_output; (void)n_v_heads; (void)d_state;
-    (void)repeat; (void)device;
-    return 0;   /* CPU fallback (per-head SSM recurrence) */
+    if (!state || !q_conv || !k_conv || !v_conv || !gate_exp || !beta || !ssm_output)
+        return 0;
+    if (n_v_heads <= 0 || d_state <= 0 || d_state > 256 || repeat < 1)
+        return 0;
+    if (device != 0 || !g_device || !g_ps_ssm_recurrence) return 0;
+
+    int n_k_heads = n_v_heads / repeat;          /* k_head = h/repeat shares q/k */
+
+    /* Pack [q_conv | k_conv | v_conv | gate_exp | beta] into g_x. */
+    size_t q_bytes = (size_t)n_k_heads * (size_t)d_state * sizeof(float);
+    size_t k_bytes = q_bytes;
+    size_t v_bytes = (size_t)n_v_heads * (size_t)d_state * sizeof(float);
+    size_t gb_bytes = (size_t)n_v_heads * sizeof(float);
+    size_t q_off = 0;
+    size_t k_off = q_off + q_bytes;
+    size_t v_off = k_off + k_bytes;
+    size_t g_off = v_off + v_bytes;
+    size_t b_off = g_off + gb_bytes;
+    size_t total_in = b_off + gb_bytes;
+
+    size_t state_bytes = (size_t)n_v_heads * (size_t)d_state * (size_t)d_state * sizeof(float);
+    size_t out_bytes   = (size_t)d_state * (size_t)n_v_heads * sizeof(float);
+
+    if (!reserve_buf(&g_ssm, &g_ssmcap, &g_ssmptr, state_bytes,
+                     MTLResourceStorageModeShared | MTLResourceCPUCacheModeDefaultCache)) return 0;
+    if (!reserve_buf(&g_x, &g_xcap, &g_xptr, total_in,
+                     MTLResourceStorageModeShared | MTLResourceCPUCacheModeWriteCombined)) return 0;
+    if (!reserve_buf(&g_y, &g_ycap, &g_yptr, out_bytes,
+                     MTLResourceStorageModeShared | MTLResourceCPUCacheModeDefaultCache)) return 0;
+
+    memcpy(g_ssmptr, state, state_bytes);                 /* H2D state */
+    memcpy((uint8_t *)g_xptr + q_off, q_conv,   q_bytes);
+    memcpy((uint8_t *)g_xptr + k_off, k_conv,   k_bytes);
+    memcpy((uint8_t *)g_xptr + v_off, v_conv,   v_bytes);
+    memcpy((uint8_t *)g_xptr + g_off, gate_exp, gb_bytes);
+    memcpy((uint8_t *)g_xptr + b_off, beta,     gb_bytes);
+
+    id<MTLCommandBuffer> cmd = [g_queue commandBufferWithUnretainedReferences];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    [enc setComputePipelineState:g_ps_ssm_recurrence];
+    [enc setBuffer:g_ssm offset:0 atIndex:0];              /* state (rw) */
+    [enc setBuffer:g_x   offset:q_off atIndex:1];          /* q_conv     */
+    [enc setBuffer:g_x   offset:k_off atIndex:2];          /* k_conv     */
+    [enc setBuffer:g_x   offset:v_off atIndex:3];          /* v_conv     */
+    [enc setBuffer:g_x   offset:g_off atIndex:4];          /* gate_exp   */
+    [enc setBuffer:g_x   offset:b_off atIndex:5];          /* beta       */
+    [enc setBuffer:g_y   offset:0   atIndex:6];            /* ssm_output */
+    int32_t dims[3] = { n_v_heads, d_state, repeat };
+    [enc setBytes:dims length:sizeof(dims) atIndex:7];
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_v_heads, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(TPB, 1, 1)];
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+
+    memcpy(state, g_ssmptr, state_bytes);                  /* D2H state */
+    memcpy(ssm_output, g_yptr, out_bytes);
+    return 1;
 }
 
 }  // extern "C"
