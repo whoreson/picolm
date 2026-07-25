@@ -5678,7 +5678,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                     memcpy(s->x, x_batch + bi * dim, dim * sizeof(float));
                     float *ssm_residual = s->xb2;
 #ifdef PICOLM_GPU
-                    ssm_forward(m, s, s->x, ssm_residual, lw, l, start_pos + bi, (void **)m->gpu.layers);
+                    ssm_forward(m, s, s->x, ssm_residual, lw, l, start_pos + bi, &m->gpu.layers[l]);
 #else
                     ssm_forward(m, s, s->x, ssm_residual, lw, l, start_pos + bi, NULL);
 #endif
