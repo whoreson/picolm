@@ -26,6 +26,15 @@
 #   3. ./bench.zsh --out logs/after
 #   4. ./bench.zsh --compare logs/before/summary.tsv logs/after/summary.tsv
 
+# Force the C locale for all numeric text processing. The harness parses
+# picolm's period-decimal output ("Prefill/Generation ... tok/s") and computes
+# medians/min/max with sort/awk/printf. Under a comma-decimal locale (de_DE,
+# hu_HU, ...) BSD `sort -n` and float `printf` mis-handle the period and
+# collapse "59.3" -> "59", silently corrupting median/min/max. picolm is a C
+# program that never calls setlocale(), so it always emits period decimals
+# regardless of this setting.
+export LC_ALL=C
+
 emulate -L zsh
 setopt extended_glob
 
