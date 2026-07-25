@@ -12,6 +12,10 @@ SRCS    = picolm.c model.c tensor.c quant.c tokenizer.c qwen_tokenize.c sampler.
 OBJS    = $(SRCS:.c=.o)
 TARGET  = picolm
 
+# VIZ support (adds viz.c when PICOLM_VIZ is defined)
+VIZ_SRCS = viz.c
+VIZ_OBJS = $(VIZ_SRCS:.c=.o)
+
 # GPU backend
 HIPCC   ?= hipcc
 HIPFLAGS ?= -O3 -std=c++11 -fPIC -fPIE
@@ -24,6 +28,10 @@ MODEL_DIR ?= /opt/picolm/models
 # --- Default: native build with per-matmul threading ---
 native: CFLAGS += -march=native
 native: $(TARGET)
+
+# --- VIZ build: native with embedded VNC visualization server ---
+viz:
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native -DPICOLM_VIZ=1" OBJS="$(OBJS) viz.o"
 
 # --- x86-64 default (SSE2 only, safe for all x86-64) ---
 x86: sse2
@@ -62,6 +70,7 @@ $(TARGET): $(OBJS) $(GPU_OBJS)
 
 # Header dependencies
 picolm.o: picolm.c quant.h tensor.h model.h tokenizer.h sampler.h grammar.h
+viz.o:  viz.c  viz.h
 model.o:  model.c  model.h quant.h tensor.h
 tensor.o: tensor.c tensor.h quant.h model.h
 quant.o:  quant.c  quant.h
@@ -139,7 +148,7 @@ model:
 	fi
 
 clean:
-	rm -f $(TARGET) $(TARGET).exe $(OBJS) backend_gpu.o backend_gpu.o.hip backend_gpu.o.cuda backend_metal.o probes/metal_reduction_probe probes/metal_matmul_bench
+	rm -f $(TARGET) $(TARGET).exe $(OBJS) $(VIZ_OBJS) backend_gpu.o backend_gpu.o.hip backend_gpu.o.cuda backend_metal.o probes/metal_reduction_probe probes/metal_matmul_bench
 
 
 .PHONY: asan

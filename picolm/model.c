@@ -20,6 +20,9 @@
 #ifdef PICOLM_GPU
 #include "backend_gpu.h"
 #endif
+#ifdef PICOLM_VIZ
+#include "viz.h"
+#endif
 #include <errno.h>
 #include <time.h>
 #ifdef _OPENMP
@@ -1981,6 +1984,9 @@ float *model_forward(model_t *m, int token, int pos) {
             float *ssm_residual = s->xb2;
             ssm_forward(m, s, s->x, ssm_residual, lw, l, pos, NULL);
 #endif
+#ifdef PICOLM_VIZ
+            viz_push_layer(l, s->x, dim);
+#endif
             BENCH_LAYER_END(l, 0);
             continue;
         }
@@ -2179,6 +2185,9 @@ float *model_forward(model_t *m, int token, int pos) {
             tensor_set_repacked(NULL);
             vec_add(s->x, s->xb, dim);
         }
+#ifdef PICOLM_VIZ
+        viz_push_layer(l, s->x, dim);
+#endif
         BENCH_LAYER_END(l, 0);
     }
 
@@ -5591,6 +5600,10 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                     memcpy(x_batch + bi * dim, s->x, dim * sizeof(float));
                 }
             }
+#ifdef PICOLM_VIZ
+            /* Push the last token in the batch for visualization */
+            viz_push_layer(l, x_batch + (n_tokens - 1) * dim, dim);
+#endif
             BENCH_LAYER_END(l, 1);
             continue;
         }
@@ -5776,6 +5789,9 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                 if (av > xmax) xmax = av;
             }
                     }
+#ifdef PICOLM_VIZ
+        viz_push_layer(l, x_batch + (n_tokens - 1) * dim, dim);
+#endif
         BENCH_LAYER_END(l, 1);
     }
 

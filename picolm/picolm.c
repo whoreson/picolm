@@ -4,6 +4,9 @@
 #include "sampler.h"
 #include "grammar.h"
 #include "qwen_tokenize.h"
+#ifdef PICOLM_VIZ
+#include "viz.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -124,6 +127,12 @@ static void usage(const char *prog) {
     fprintf(stderr, "\nInfo options:\n");
     fprintf(stderr, "  --list-tensors   List all tensors (name, shape, type) and exit\n");
     fprintf(stderr, "  --benchmark      Continuous benchmark loop (Ctrl-C to stop)\n");
+#ifdef PICOLM_VIZ
+    fprintf(stderr, "\nVisualization options:\n");
+    fprintf(stderr, "  --viz             Start VNC visualization server (requires PICOLM_VIZ)\n");
+    fprintf(stderr, "  --viz-port <int>  VNC port (default: 5900)\n");
+    fprintf(stderr, "  --viz-res WxH     VNC resolution (default: 800x480)\n");
+#endif
 }
 
 static char *read_stdin(void) {
@@ -348,6 +357,13 @@ int main(int argc, char **argv) {
     int    checkpoint_interval = 256;
     int    checkpoint_interval_gen = 64;
     int    checkpoint_tail_offset = 5;
+#ifdef PICOLM_VIZ
+    /* Visualization options */
+    int    viz_mode = 0;
+    int    viz_port = 5900;
+    int    viz_width = 800;
+    int    viz_height = 480;
+#endif
 
     /* Parse arguments */
     for (int i = 1; i < argc; i++) {
@@ -416,6 +432,17 @@ int main(int argc, char **argv) {
             ssm_batched_prefill = 0;
         } else if (strcmp(argv[i], "--benchmark") == 0) {
             benchmark_mode = 1;
+#ifdef PICOLM_VIZ
+        } else if (strcmp(argv[i], "--viz") == 0) {
+            viz_mode = 1;
+        } else if (strcmp(argv[i], "--viz-port") == 0 && i + 1 < argc) {
+            viz_port = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--viz-res") == 0 && i + 1 < argc) {
+            if (sscanf(argv[++i], "%dx%d", &viz_width, &viz_height) < 2) {
+                fprintf(stderr, "Invalid resolution: %s (use WxH, e.g. 800x480)\n", argv[i]);
+                return 1;
+            }
+#endif
         } else if (strcmp(argv[i], "--list-tensors") == 0) {
             model_list_tensors(model_path);
             return 0;
@@ -568,6 +595,29 @@ int main(int argc, char **argv) {
     }
 
     model.ssm_batched_prefill = ssm_batched_prefill;
+
+#ifdef PICOLM_VIZ
+    /* Start visualization server if requested */
+    if (viz_mode) {
+        /* Build a short model name for the VNC title */
+        char model_short[256];
+        const char *base = model_path;
+        const char *slash = strrchr(model_path, '/');
+        if (slash) base = slash + 1;
+        /* Strip extension */
+        strncpy(model_short, base, sizeof(model_short) - 1);
+        model_short[sizeof(model_short) - 1] = '\0';
+        char *dot = strrchr(model_short, '.');
+        if (dot) *dot = '\0';
+
+        if (viz_init(viz_width, viz_height, viz_port) != 0) {
+            fprintf(stderr, "Failed to start visualization server\n");
+            /* Non-fatal: continue without viz */
+        } else {
+            viz_set_model_info(model.config.n_layers, model.config.n_embd, model_short);
+        }
+    }
+#endif
 
     /* Pin layers in RAM if --mem was specified */
     if (mem_mb > 0) {
@@ -921,6 +971,9 @@ int main(int argc, char **argv) {
     free(stdin_prompt);
     if (use_qwen_tok) qwen_tokenize_free(&qwen_enc);
     else tokenizer_free(&tokenizer);
+#ifdef PICOLM_VIZ
+    if (viz_mode) viz_free();
+#endif
     model_free(&model);
     tensor_threadpool_free();
 
