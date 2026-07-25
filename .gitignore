@@ -52,6 +52,9 @@ picoclaw/
 picoclaw/PICOLM_INTEGRATION.md
 .aider*
 
+# Benchmark harness output (bench.zsh --out, default bench_logs/)
+bench_logs/
+
 # Session/debug artifacts
 .debug.txt
 geminiprompt.txt
