@@ -5083,16 +5083,21 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
     /* 2. Batched QKV projection (read from ssm_xb with stride dim) */
     tensor_set_repacked(m->repack_used[ri] ? m->repack_buffers[ri] : NULL);
 #ifdef PICOLM_GPU
-    if (gpu_lw && gpu_lw[l]) {
-        gpu_layer_weights_t *gl = (gpu_layer_weights_t *)gpu_lw[l];
+    /* gpu_lw is gpu_layer_weights_t[] (an array of STRUCTS, ~80B each), passed
+     * as void**. Index with struct stride, NOT pointer stride -- the old
+     * `gpu_lw[l]` read a field value (a heap handle) as a struct pointer and
+     * crashed on gl->attn_qkv. m->gpu is zeroed in model_load, so any tensor
+     * not uploaded for this layer is NULL and matmul_batch falls back to CPU. */
+    if (gpu_lw) {
+        gpu_layer_weights_t *gl = &((gpu_layer_weights_t *)gpu_lw)[l];
         tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->attn_qkv, m->gpu.device);
     }
 #endif
     matmul_batch(qkv_batch, ssm_xb, n_tokens, lw->attn_qkv, dim, conv_dim, lw->type_attn_qkv);
     tensor_set_repacked(NULL);
 #ifdef PICOLM_GPU
-    if (gpu_lw && gpu_lw[l]) {
-        gpu_layer_weights_t *gl = (gpu_layer_weights_t *)gpu_lw[l];
+    if (gpu_lw) {
+        gpu_layer_weights_t *gl = &((gpu_layer_weights_t *)gpu_lw)[l];
         tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->attn_gate_ssm, m->gpu.device);
     }
 #endif
@@ -5102,7 +5107,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
     matmul_batch(z_batch, ssm_xb, n_tokens, lw->attn_gate_ssm, dim, value_dim, lw->type_attn_gate_ssm);
     tensor_set_repacked(NULL);
 #ifdef PICOLM_GPU
-    if (gpu_lw[l]) tensor_set_gpu_tensor(NULL, 0);
+    if (gpu_lw) tensor_set_gpu_tensor(NULL, 0);
 #endif
     if (do_remap) {
         for (bi = 0; bi < n_tokens; bi++) {
@@ -5326,8 +5331,8 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
     } else {
         tensor_set_repacked(m->repack_used[ri+5] ? m->repack_buffers[ri+5] : NULL);
 #ifdef PICOLM_GPU
-        if (gpu_lw[l]) {
-            gpu_layer_weights_t *gl = (gpu_layer_weights_t *)gpu_lw[l];
+        if (gpu_lw) {
+            gpu_layer_weights_t *gl = &((gpu_layer_weights_t *)gpu_lw)[l];
             tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->ssm_out, m->gpu.device);
         }
 #endif
@@ -5339,7 +5344,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
         free(ssm_out_buf);
         tensor_set_repacked(NULL);
 #ifdef PICOLM_GPU
-        if (gpu_lw[l]) tensor_set_gpu_tensor(NULL, 0);
+        if (gpu_lw) tensor_set_gpu_tensor(NULL, 0);
 #endif
     }
 
