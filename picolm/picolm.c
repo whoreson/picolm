@@ -117,7 +117,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --checkpoint-every-nt <N>   Checkpoint every N tokens during prefill (default: 256)\n");
     fprintf(stderr, "  --checkpoint-every-nt-gen <N> Checkpoint every N tokens during generation (default: 64)\n");
     fprintf(stderr, "  --checkpoint-tail-offset <N> Checkpoint N tokens before end of prompt (default: 5)\n");
-    fprintf(stderr, "  --ssm-batched     Use batched SSM prefill (SLOW, scalar implementation)\n");
+    fprintf(stderr, "  --ssm-serial      Use serial per-token SSM prefill (default is batched)\n");
     fprintf(stderr, "\nInfo options:\n");
     fprintf(stderr, "  --list-tensors   List all tensors (name, shape, type) and exit\n");
 }
@@ -169,7 +169,7 @@ int main(int argc, char **argv) {
     int    server_port = 8080;
     char   server_host[256] = "0.0.0.0";
     /* SSM options */
-    int    ssm_batched_prefill = 0;     /* 0=per-token (default), 1=batched */
+    int    ssm_batched_prefill = 1;     /* 1=batched (default), 0=per-token */
     /* SSM checkpoint options */
     int    checkpoint_max = 0;          /* 0=disabled */
     int    checkpoint_interval = 256;
@@ -235,7 +235,9 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--checkpoint-tail-offset") == 0 && i + 1 < argc) {
             checkpoint_tail_offset = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--ssm-batched") == 0) {
-            ssm_batched_prefill = 1;
+            /* no-op: batched is now the default */
+        } else if (strcmp(argv[i], "--ssm-serial") == 0) {
+            ssm_batched_prefill = 0;
         } else if (strcmp(argv[i], "--list-tensors") == 0) {
             model_list_tensors(model_path);
             return 0;
@@ -505,7 +507,7 @@ int main(int argc, char **argv) {
     float *logits = NULL;
     if (n_prompt > 0) {
         /* All models use model_forward_prefill.
-         * SSM models: per-token by default, use --ssm-batched for batched path. */
+         * SSM models: batched by default, use --ssm-serial for per-token path. */
         logits = model_forward_prefill(&model, prompt_tokens, n_prompt, start_pos);
         pos = start_pos + n_prompt - 1;
     } else {

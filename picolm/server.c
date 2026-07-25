@@ -536,6 +536,7 @@ static int server_init(const char *model_path, int num_threads, int do_prefault,
         fprintf(stderr, "[server] Failed to load model\n");
         return -1;
     }
+    srv.model.ssm_batched_prefill = 1; /* batched SSM prefill is default */
 
     /* Print SIMD capability */
     fprintf(stderr, "[server] SIMD: %s\n",
@@ -1134,7 +1135,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         /* ---- Prefill phase ---- */
         float *logits = NULL;
         int n_prefill = n_prompt - start_pos;
-        fprintf(stderr, "[server] %.1fms: starting prefill (%d tokens, %s)\n", get_time_ms() - t0, n_prefill, model->config.has_ssm ? (model->ssm_batched_prefill ? "SSM batched" : "SSM per-token") : "batched");
+        fprintf(stderr, "[server] %.1fms: starting prefill (%d tokens, %s, %d threads)\n", get_time_ms() - t0, n_prefill, model->config.has_ssm ? (model->ssm_batched_prefill ? "SSM batched" : "SSM per-token") : "batched", tensor_get_threads());
 
         /* Track how many prompt tokens were actually processed */
         int n_processed = start_pos;
@@ -1177,7 +1178,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
 
         double t_prefill_end = get_time_ms();
         fprintf(stderr, "[server] %.1fms: prefill done (%.1fms)\n", get_time_ms() - t0, t_prefill_end - t_start);
-        fprintf(stderr, "[server] %.1fms: starting generation\n", get_time_ms() - t0);
+        fprintf(stderr, "[server] %.1fms: starting generation (%d threads)\n", get_time_ms() - t0, tensor_get_threads());
 
         /* ---- Generation phase ---- */
         int gen_count = 0;
@@ -1378,7 +1379,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             if (gen_count_ns == 0) t_prefill_end_ns = get_time_ms();
             if (gen_count_ns == 0) {
                 fprintf(stderr, "[server] %.1fms: prefill done (%.1fms)\n", get_time_ms() - t0, t_prefill_end_ns - t_start_ns);
-                fprintf(stderr, "[server] %.1fms: starting generation\n", get_time_ms() - t0);
+                fprintf(stderr, "[server] %.1fms: starting generation (%d threads)\n", get_time_ms() - t0, tensor_get_threads());
             }
 
             /* Generation phase */
@@ -1760,7 +1761,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         /* ---- Prefill phase ---- */
         float *logits = NULL;
         int n_prefill = n_prompt - start_pos;
-        fprintf(stderr, "[server] %.1fms: starting prefill (%d tokens, %s)\n", get_time_ms() - t0, n_prefill, model->config.has_ssm ? (model->ssm_batched_prefill ? "SSM batched" : "SSM per-token") : "batched");
+        fprintf(stderr, "[server] %.1fms: starting prefill (%d tokens, %s, %d threads)\n", get_time_ms() - t0, n_prefill, model->config.has_ssm ? (model->ssm_batched_prefill ? "SSM batched" : "SSM per-token") : "batched", tensor_get_threads());
 
         /* Track how many prompt tokens were actually processed */
         int n_processed = start_pos;
@@ -1802,7 +1803,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             return;
         }
 
-        fprintf(stderr, "[server] %.1fms: starting generation\n", get_time_ms() - t0);
+        fprintf(stderr, "[server] %.1fms: starting generation (%d threads)\n", get_time_ms() - t0, tensor_get_threads());
 
         /* ---- Generation phase ---- */
         if (n_prefill <= 0) {
@@ -1966,7 +1967,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         /* ---- Prefill phase ---- */
         float *logits_ns2 = NULL;
         int n_prefill_ns2 = n_prompt - start_pos;
-        fprintf(stderr, "[server] %.1fms: starting prefill (%d tokens, %s)\n", get_time_ms() - t0, n_prefill_ns2, model->config.has_ssm ? (model->ssm_batched_prefill ? "SSM batched" : "SSM per-token") : "batched");
+        fprintf(stderr, "[server] %.1fms: starting prefill (%d tokens, %s, %d threads)\n", get_time_ms() - t0, n_prefill_ns2, model->config.has_ssm ? (model->ssm_batched_prefill ? "SSM batched" : "SSM per-token") : "batched", tensor_get_threads());
 
         /* Track how many prompt tokens were actually processed */
         int n_processed_ns2 = start_pos;
@@ -2009,7 +2010,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             return;
         }
 
-        fprintf(stderr, "[server] %.1fms: starting generation\n", get_time_ms() - t0);
+        fprintf(stderr, "[server] %.1fms: starting generation (%d threads)\n", get_time_ms() - t0, tensor_get_threads());
 
         /* ---- Generation phase ---- */
         if (n_prefill_ns2 <= 0) {
