@@ -2846,16 +2846,15 @@ static void ssm_kernel_interaction(
                                         _mm512_loadu_ps(kj + (v+3) * 16), acc3);
             }
 
-            /* Horizontal reduce */
-            float dot = _mm512_reduce_add_ps(acc0) + _mm512_reduce_add_ps(acc1)
-                      + _mm512_reduce_add_ps(acc2) + _mm512_reduce_add_ps(acc3);
-
-            /* Handle remaining lanes (d16=8, 4+4=8, so no remainder) */
+            /* Handle remaining lanes */
             for (; v < d16; v++) {
                 acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(ki + v * 16),
                                         _mm512_loadu_ps(kj + v * 16), acc0);
             }
-            dot += _mm512_reduce_add_ps(acc0);
+
+            /* Horizontal reduce all accumulators */
+            float dot = _mm512_reduce_add_ps(acc0) + _mm512_reduce_add_ps(acc1)
+                      + _mm512_reduce_add_ps(acc2) + _mm512_reduce_add_ps(acc3);
 
             Mi[j] = dot * decay_i[j];
         }
@@ -2909,14 +2908,13 @@ static void ssm_kernel_output_cross(
                                         _mm512_loadu_ps(qi + (v+3) * 16), acc3);
             }
 
-            float dot = _mm512_reduce_add_ps(acc0) + _mm512_reduce_add_ps(acc1)
-                      + _mm512_reduce_add_ps(acc2) + _mm512_reduce_add_ps(acc3);
-
             for (; v < d16; v++) {
                 acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(kj + v * 16),
                                         _mm512_loadu_ps(qi + v * 16), acc0);
             }
-            dot += _mm512_reduce_add_ps(acc0);
+
+            float dot = _mm512_reduce_add_ps(acc0) + _mm512_reduce_add_ps(acc1)
+                      + _mm512_reduce_add_ps(acc2) + _mm512_reduce_add_ps(acc3);
 
             kqi[j] = dot * decay_i[j];
         }
@@ -3114,14 +3112,13 @@ static void ssm_kernel_interaction(
                                         _mm256_loadu_ps(kj + (v+3) * 8), acc3);
             }
 
-            float dot = hreduce256_ps(acc0) + hreduce256_ps(acc1)
-                      + hreduce256_ps(acc2) + hreduce256_ps(acc3);
-
             for (; v < d8; v++) {
                 acc0 = FMA256(_mm256_loadu_ps(ki + v * 8),
                                         _mm256_loadu_ps(kj + v * 8), acc0);
             }
-            dot += hreduce256_ps(acc0);
+
+            float dot = hreduce256_ps(acc0) + hreduce256_ps(acc1)
+                      + hreduce256_ps(acc2) + hreduce256_ps(acc3);
 
             Mi[j] = dot * decay_i[j];
         }
@@ -3169,14 +3166,13 @@ static void ssm_kernel_output_cross(
                                         _mm256_loadu_ps(qi + (v+3) * 8), acc3);
             }
 
-            float dot = hreduce256_ps(acc0) + hreduce256_ps(acc1)
-                      + hreduce256_ps(acc2) + hreduce256_ps(acc3);
-
             for (; v < d8; v++) {
                 acc0 = FMA256(_mm256_loadu_ps(kj + v * 8),
                                         _mm256_loadu_ps(qi + v * 8), acc0);
             }
-            dot += hreduce256_ps(acc0);
+
+            float dot = hreduce256_ps(acc0) + hreduce256_ps(acc1)
+                      + hreduce256_ps(acc2) + hreduce256_ps(acc3);
 
             kqi[j] = dot * decay_i[j];
         }
@@ -3361,14 +3357,13 @@ static void ssm_kernel_interaction(
                 acc3 = vmlaq_f32(acc3, vld1q_f32(ki + (v+3) * 4), vld1q_f32(kj + (v+3) * 4));
             }
 
-            /* Reduce 4 accumulators to one float */
-            float32x4_t sum = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
-            float dot = vaddvq_f32_compat(sum);
-
             for (; v < d4; v++) {
                 acc0 = vmlaq_f32(acc0, vld1q_f32(ki + v * 4), vld1q_f32(kj + v * 4));
             }
-            dot += vaddvq_f32_compat(acc0);
+
+            /* Reduce 4 accumulators to one float */
+            float32x4_t sum = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+            float dot = vaddvq_f32_compat(sum);
 
             Mi[j] = dot * decay_i[j];
         }
@@ -3411,13 +3406,12 @@ static void ssm_kernel_output_cross(
                 acc3 = vmlaq_f32(acc3, vld1q_f32(kj + (v+3) * 4), vld1q_f32(qi + (v+3) * 4));
             }
 
-            float32x4_t sum = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
-            float dot = vaddvq_f32_compat(sum);
-
             for (; v < d4; v++) {
                 acc0 = vmlaq_f32(acc0, vld1q_f32(kj + v * 4), vld1q_f32(qi + v * 4));
             }
-            dot += vaddvq_f32_compat(acc0);
+
+            float32x4_t sum = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+            float dot = vaddvq_f32_compat(sum);
 
             kqi[j] = dot * decay_i[j];
         }

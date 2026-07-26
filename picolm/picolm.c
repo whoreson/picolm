@@ -915,6 +915,7 @@ int main(int argc, char **argv) {
         } else {
             decode_str = (char *)tokenizer_decode(&tokenizer, token, next);
         }
+        fprintf(stderr, "[gen] id=%d text='%s'\n", next, decode_str);
         printf("%s", decode_str);
         fflush(stdout);
         /* Also capture in buffer */
