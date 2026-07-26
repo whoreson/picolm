@@ -2224,6 +2224,22 @@ float *model_forward(model_t *m, int token, int pos) {
         if (lw->ffn_gate && lw->ffn_up && lw->ffn_down) {
             rmsnorm(s->xb, s->x, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
 
+#ifdef PICOLM_GPU
+            /* Fused FFN on GPU: y = down(silu(gate(x)) * up(x)) in ONE command
+             * buffer -> 3 dispatches collapse to 1 (each layer saves ~2x the
+             * per-dispatch sync floor) and silu*mul runs on the GPU. x and y
+             * alias s->xb safely: expert_mlp memcpy()s x into device scratch
+             * first. On miss (GPU off / a tensor not uploaded / OOM) fall
+             * through to the per-matmul path below. */
+            if (gpu_ok && gl->ffn_gate && gl->ffn_up && gl->ffn_down &&
+                picolm_gpu_expert_mlp((picolm_gpu_tensor_t *)gl->ffn_gate,
+                                      (picolm_gpu_tensor_t *)gl->ffn_up,
+                                      (picolm_gpu_tensor_t *)gl->ffn_down,
+                                      s->xb, s->xb, 1)) {
+                tensor_set_gpu_tensor(NULL, 0);
+                goto ffn_done;
+            }
+#endif
             tensor_set_repacked(m->repack_used[ri+4] ? m->repack_buffers[ri+4] : NULL);
 #ifdef PICOLM_GPU
             if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->ffn_gate, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
@@ -2247,6 +2263,9 @@ float *model_forward(model_t *m, int token, int pos) {
 #endif
             matmul(s->xb, s->hb, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
             tensor_set_repacked(NULL);
+#ifdef PICOLM_GPU
+ffn_done:
+#endif
             vec_add(s->x, s->xb, dim);
         }
 #ifdef PICOLM_VIZ
@@ -4309,11 +4328,28 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     /* 21. Post-attention norm + FFN (only if MLP weights exist for this layer) */
     if (lw->ffn_gate && lw->ffn_up && lw->ffn_down) {
         rmsnorm(s->xb, x, s->post_attn_norm_w[il], dim, eps);
+#ifdef PICOLM_GPU
+        /* Fused FFN on GPU: y = down(silu(gate(x)) * up(x)) in one command
+         * buffer (3 dispatches -> 1); s->xb aliases in/out safely. On miss
+         * fall through to the per-matmul CPU path. Matches model_forward. */
+        if (gpu_lw) {
+            gpu_layer_weights_t *gl = (gpu_layer_weights_t *)gpu_lw;
+            if (gl->ffn_gate && gl->ffn_up && gl->ffn_down &&
+                picolm_gpu_expert_mlp((picolm_gpu_tensor_t *)gl->ffn_gate,
+                                      (picolm_gpu_tensor_t *)gl->ffn_up,
+                                      (picolm_gpu_tensor_t *)gl->ffn_down,
+                                      s->xb, s->xb, 1))
+                goto ssm_ffn_done;
+        }
+#endif
         matmul(s->hb, s->xb, lw->ffn_gate, dim, c->n_ffn, lw->type_ffn_gate);
         matmul(s->hb2, s->xb, lw->ffn_up, dim, c->n_ffn, lw->type_ffn_up);
         silu(s->hb, c->n_ffn);
         elemwise_mul(s->hb, s->hb, s->hb2, c->n_ffn);
         matmul(s->xb, s->hb, lw->ffn_down, c->n_ffn, dim, lw->type_ffn_down);
+#ifdef PICOLM_GPU
+ssm_ffn_done:
+#endif
         vec_add(x, s->xb, dim);
     }
 }
