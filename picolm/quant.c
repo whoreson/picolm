@@ -246,6 +246,7 @@ void dequantize_row_q4_K(const void *src, float *dst, int n) {
 }
 
 void dequantize_row_q3_K(const void *src, float *dst, int n) {
+    /* Ported from llama.cpp ggml-quants.c dequantize_row_q3_K */
     const block_q3_K *blocks = (const block_q3_K *)src;
     int nb = n / 256;
 
@@ -253,35 +254,38 @@ void dequantize_row_q3_K(const void *src, float *dst, int n) {
         const block_q3_K *b = &blocks[i];
         float d = fp16_to_fp32_lookup(b->d);
 
-        int32_t scales[16];
-        {
-            for (int j = 0; j < 8; j++) {
-                scales[j] = (int32_t)(b->scales[j] & 0xF);
-            }
-            for (int j = 0; j < 8; j++) {
-                scales[8 + j] = (int32_t)(b->scales[j] >> 4);
-            }
-            for (int j = 0; j < 4; j++) {
-                scales[2*j]     |= ((b->scales[8 + j]     ) & 3) << 4;
-                scales[2*j + 1] |= ((b->scales[8 + j] >> 2) & 3) << 4;
-                scales[2*j + 8] |= ((b->scales[8 + j] >> 4) & 3) << 4;
-                scales[2*j + 9] |= ((b->scales[8 + j] >> 6) & 3) << 4;
-            }
-            for (int j = 0; j < 16; j++) {
-                scales[j] -= 32;
-            }
-        }
+        /* Unpack 16 scales from 12 bytes using llama.cpp's bit-interleaving */
+        uint32_t aux[4];
+        memcpy(aux, b->scales, 12);
+        uint32_t tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & 0x0F0F0F0F) | (((tmp >> 4) & 0x03030303) << 4);
+        aux[3] = ((aux[1] >> 4) & 0x0F0F0F0F) | (((tmp >> 6) & 0x03030303) << 4);
+        aux[0] = (aux[0] & 0x0F0F0F0F) | (((tmp >> 0) & 0x03030303) << 4);
+        aux[1] = (aux[1] & 0x0F0F0F0F) | (((tmp >> 2) & 0x03030303) << 4);
+        const int8_t *scales = (const int8_t *)aux;
 
-        const uint8_t *qs    = b->qs;
-        const uint8_t *hmask = b->hmask;
-        int out_idx = i * 256;
+        const uint8_t *q = b->qs;
+        const uint8_t *hm = b->hmask;
+        uint8_t m = 1;
 
-        for (int j = 0; j < 256; j++) {
-            int q2 = (qs[j / 4] >> (2 * (j % 4))) & 3;
-            int hbit = (hmask[j / 8] >> (j % 8)) & 1;
-            int q3 = q2 | (hbit << 2);
-            int sb = j / 16;
-            dst[out_idx + j] = d * (float)scales[sb] * ((float)q3 - 4.0f);
+        float *y = dst + i * 256;
+        int is = 0;
+        float dl;
+        for (int chunk = 0; chunk < 256; chunk += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; ++j) {
+                dl = d * (scales[is++] - 32);
+                for (int l = 0; l < 16; ++l) {
+                    *y++ = dl * ((int8_t)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4));
+                }
+                dl = d * (scales[is++] - 32);
+                for (int l = 0; l < 16; ++l) {
+                    *y++ = dl * ((int8_t)((q[l+16] >> shift) & 3) - ((hm[l+16] & m) ? 0 : 4));
+                }
+                shift += 2;
+                m <<= 1;
+            }
+            q += 32;
         }
     }
 }
