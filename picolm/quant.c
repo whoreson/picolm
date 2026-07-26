@@ -1379,7 +1379,7 @@ float vec_dot_q6_K_q8_K(const void *src_q6, const void *src_q8, int n) {
         sumi_0 = _mm_sub_epi32(sumi_0, q8sclsub_0);
         sumi_1 = _mm_sub_epi32(sumi_1, q8sclsub_1);
         const __m256i sumi = _mm256_insertf128_si256(_mm256_castsi128_si256(sumi_0), sumi_1, 1);
-        acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), acc);
+        acc = _mm256_add_ps(_mm256_mul_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi)), acc);
     }
     float result = hsum_avx(acc);
     return result;
@@ -1926,7 +1926,7 @@ float vec_dot_q4_K_q8_K(const void *src_q4, const void *src_q8, int n) {
 
         __m256 vd = _mm256_set1_ps(d);
         __m256i sumi = _mm256_insertf128_si256(_mm256_castsi128_si256(sumi_0), sumi_1, 1);
-        acc = _mm256_fmadd_ps(vd, _mm256_cvtepi32_ps(sumi), acc);
+        acc = _mm256_add_ps(_mm256_mul_ps(vd, _mm256_cvtepi32_ps(sumi)), acc);
     }
 
     acc_m = _mm_add_ps(acc_m, _mm_movehl_ps(acc_m, acc_m));
@@ -2252,7 +2252,7 @@ float vec_dot_q4_0_q8_0(const void *vx, const void *wy, int n) {
             float d0 = fp16_to_fp32_lookup(x[ib].d) * fp16_to_fp32_lookup(y[ib].d);
             float d1 = fp16_to_fp32_lookup(x[ib + 1].d) * fp16_to_fp32_lookup(y[ib + 1].d);
             __m256 deltas = _mm256_set_m128(_mm_set1_ps(d1), _mm_set1_ps(d0));
-            accum = _mm256_fmadd_ps(deltas, p, accum);
+            accum = _mm256_add_ps(_mm256_mul_ps(deltas, p), accum);
         }
         sumf = hsum_avx(accum);
     }
@@ -2395,7 +2395,7 @@ float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n) {
         __m256 dd0 = _mm256_set1_ps(d0);
         __m256 dd1 = _mm256_set1_ps(d1);
 
-        acc = _mm256_fmadd_ps(f0, dd0, _mm256_fmadd_ps(f1, dd1, acc));
+        acc = _mm256_add_ps(_mm256_mul_ps(f0, dd0), _mm256_add_ps(_mm256_mul_ps(f1, dd1), acc));
     }
     sumf = hsum_avx(acc);
 
@@ -2509,7 +2509,7 @@ float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n) {
         float d0 = fp16_to_fp32_lookup(x[i].d) * fp16_to_fp32_lookup(w[i].d);
         float d1 = fp16_to_fp32_lookup(x[i + 1].d) * fp16_to_fp32_lookup(w[i + 1].d);
         __m256 deltas = _mm256_set_m128(_mm_set1_ps(d1), _mm_set1_ps(d0));
-        acc = _mm256_fmadd_ps(deltas, sums, acc);
+        acc = _mm256_add_ps(_mm256_mul_ps(deltas, sums), acc);
     }
     sumf = hsum_avx(acc);
 
@@ -3061,7 +3061,7 @@ float vec_dot_q8_0_q8_0_deltas(const void *qx, const float *qx_d, const void *qw
         float d0 = qx_d[i] * fp16_to_fp32_lookup(w[i].d);
         float d1 = qx_d[i + 1] * fp16_to_fp32_lookup(w[i + 1].d);
         __m256 deltas = _mm256_set_m128(_mm_set1_ps(d1), _mm_set1_ps(d0));
-        acc = _mm256_fmadd_ps(deltas, sums, acc);
+        acc = _mm256_add_ps(_mm256_mul_ps(deltas, sums), acc);
     }
     sumf = hsum_avx(acc);
 
