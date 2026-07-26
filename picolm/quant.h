@@ -350,13 +350,15 @@ typedef struct {
 } block_q4_0x8;         /* 144 bytes */
 #pragma pack(pop)
 
-/* Q3_K block: 256 weights in 110 bytes */
+/* Q3_K block: 256 weights in 110 bytes
+ * Layout matches llama.cpp GGUF binary format:
+ * hmask[32] + qs[64] + scales[12] + d[2] */
 #pragma pack(push, 1)
 typedef struct {
-    uint16_t d;          /* super-block scale (FP16) */
-    uint8_t  qs[64];     /* 2-bit low quants */
     uint8_t  hmask[32];  /* high bit mask */
+    uint8_t  qs[64];     /* 2-bit low quants */
     uint8_t  scales[12]; /* packed 6-bit scales */
+    uint16_t d;          /* super-block scale (FP16) */
 } block_q3_K;            /* 110 bytes */
 #pragma pack(pop)
 
