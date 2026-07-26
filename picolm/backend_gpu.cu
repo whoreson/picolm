@@ -610,11 +610,17 @@ picolm_ssm_recurrence_kernel(float *state,
  * Dequant on-the-fly to FP16 for the WMMA B tile.
  */
 
-/* HIP WMMA: only on CDNA2+ (gfx940, gfx941, gfx942). gfx906/908 have no WMMA. */
+/* HIP WMMA: only on CDNA2+ (gfx940, gfx941, gfx942). gfx906/908 have no WMMA.
+ * The hip/wmma/wmma.h header is only available in ROCm >= 6.4. On older
+ * ROCm releases WMMA is silently disabled so the non-WMA path is used. */
 #ifdef __HIP_DEVICE_COMPILE__
 #if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
+#ifdef __has_include
+#if __has_include(<hip/wmma/wmma.h>)
 #define PICOLM_GPU_WMMA_AVAILABLE 1
 #include <hip/wmma/wmma.h>
+#endif
+#endif
 #endif
 #endif
 
