@@ -436,6 +436,105 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
         y[(size_t)s * O + o] = (float)partial[0];
 }
 
+/* ---- GPU-side Q8_0 quantization kernel ----
+ *
+ * Mirrors CPU quantize_row_q8_0 in quant.c exactly.
+ * Per 32-element block: d = max(|x|) / 127, qs[i] = round(x[i] / d).
+ * Output: int8_t qs[32] + uint16_t d (FP16) per block = 34 bytes.
+ *
+ * Grid: [S, n_blocks_per_row], Block: 32 threads.
+ * Each block quantizes one 32-element chunk of one input row. */
+__global__ void
+picolm_quantize_q8_0(int8_t *qs_out, float *d_out,
+                      const float *x, int I, int S) {
+    int s = gpuBlockIdx_y;           /* row index */
+    int block = gpuBlockIdx_x;       /* 32-value block within row */
+    int tid = gpuThreadIdx_x;        /* 0..31 */
+    int n_blocks = (I + 31) / 32;
+    if (block >= n_blocks || s >= S) return;
+
+    const float *xb = x + (size_t)s * I + (size_t)block * 32;
+
+    __shared__ float amax_shared[32];
+    float v = (tid < I - block * 32) ? xb[tid] : 0.0f;
+    amax_shared[tid] = fabsf(v);
+    gpuSyncthreads();
+
+    /* Reduce max across 32 threads */
+    for (int stride = 16; stride; stride >>= 1) {
+        if (tid < stride)
+            amax_shared[tid] = fmaxf(amax_shared[tid], amax_shared[tid + stride]);
+        gpuSyncthreads();
+    }
+
+    float amax = amax_shared[0];
+    float d = amax / 127.0f;
+    float id = (d > 0.0f) ? 1.0f / d : 0.0f;
+    int q = (int)lrintf(v * id);
+    /* Clamp to [-128, 127] */
+    if (q > 127) q = 127;
+    if (q < -128) q = -128;
+
+    qs_out[(size_t)s * (size_t)n_blocks * 32 + (size_t)block * 32 + tid] = (int8_t)q;
+    if (tid == 0)
+        d_out[(size_t)s * (size_t)n_blocks + block] = d;
+}
+
+/* ---- Q8_0 x Q8_0 integer-MAC matmul kernel ----
+ *
+ * Matches CPU vec_dot_q8_0_q8_0_deltas exactly:
+ *   For each 32-element block: dot(int8_x, int8_w) * d_x * d_w
+ * where d_x and d_w are pre-converted to FP32.
+ *
+ * Grid: [O, S], Block: 256 threads.
+ * Each thread block computes one output element y[s*O + o].
+ *
+ * xq: quantized input, shape [S, n_blocks, 32] of int8_t
+ * xd: x deltas as FP32, shape [S, n_blocks] (pre-converted from FP16)
+ * weights: Q8_0 weight blocks, shape [O, n_blocks] * 34 bytes each */
+__global__ void
+picolm_q8_q8_matmul(float *y,
+                     const int8_t *xq, const float *xd,
+                     const void *weights,
+                     int S, int I, int O, int row_bytes) {
+    int o = gpuBlockIdx_x;
+    int s = gpuBlockIdx_y;
+    if (o >= O || s >= S) return;
+
+    int n_blocks = I / 32;
+    const char *wrow = (const char *)weights + (size_t)o * row_bytes;
+    const int8_t *xrow = xq + (size_t)s * I;
+    const float *xdrow = xd + (size_t)s * n_blocks;
+
+    double sum = 0.0;
+    for (int bi = gpuThreadIdx_x; bi < n_blocks; bi += gpuBlockDim_x) {
+        const uint8_t *b = (const uint8_t *)wrow + (size_t)bi * GPU_BLOCK_Q8_0_SIZE;
+        uint16_t wd_raw = b[0] | ((uint16_t)b[1] << 8);
+        float wd = gpu_fp16_to_fp32(wd_raw);
+        float xdv = xdrow[bi];
+
+        const int8_t *wq = (const int8_t *)(b + 2);
+        const int8_t *xqp = xrow + bi * 32;
+
+        int32_t acc = 0;
+        for (int j = 0; j < 32; j++)
+            acc += (int32_t)wq[j] * (int32_t)xqp[j];
+
+        sum += (double)acc * (double)wd * (double)xdv;
+    }
+
+    __shared__ double partial[256];
+    partial[gpuThreadIdx_x] = sum;
+    gpuSyncthreads();
+    for (int n = gpuBlockDim_x >> 1; n; n >>= 1) {
+        if (gpuThreadIdx_x < n)
+            partial[gpuThreadIdx_x] += partial[gpuThreadIdx_x + n];
+        gpuSyncthreads();
+    }
+    if (!gpuThreadIdx_x)
+        y[(size_t)s * O + o] = (float)partial[0];
+}
+
 /* ---- silu_mul kernel ----
  * Element-wise: gate[i] = gate[i] / (1 + exp(-gate[i])) * up[i] */
 __global__ void
@@ -833,6 +932,11 @@ typedef struct {
     size_t x_cap, y_cap, gate_cap, up_cap;
     float *host_x, *host_y;
     size_t host_x_cap, host_y_cap;
+    /* Q8_0 GPU matmul scratch buffers */
+    int8_t *q8_xq;      /* quantized input activations (int8) */
+    float *q8_xd;       /* pre-converted x deltas (fp32) */
+    size_t q8_xq_cap;   /* capacity in bytes for q8_xq */
+    size_t q8_xd_cap;   /* capacity in bytes for q8_xd */
     gpuStream_t stream;
     size_t tensor_count, tensor_bytes;
 } gpu_device_ctx_t;
@@ -926,6 +1030,22 @@ static PICOLM_UNUSED int reserve_pinned(float **ptr, size_t *cap, size_t bytes) 
     return 1;
 }
 
+/* Reserve int8_t device buffer (for Q8_0 quantized activations) */
+static int reserve_i8(int8_t **ptr, size_t *cap, size_t bytes) {
+    gpu_mutex_lock();
+    if (*cap >= bytes) { gpu_mutex_unlock(); return 1; }
+    if (*ptr) gpuFree(*ptr);
+    *ptr = NULL; *cap = 0;
+    gpuError_t err = gpuMalloc(ptr, bytes);
+    if (!gpu_ok(err, "int8 scratch allocation")) {
+        gpu_mutex_unlock();
+        return 0;
+    }
+    *cap = bytes;
+    gpu_mutex_unlock();
+    return 1;
+}
+
 /* ---- Public API ---- */
 
 int picolm_gpu_init(const int *devices, int count) {
@@ -978,12 +1098,17 @@ void picolm_gpu_shutdown(void) {
         if (ctx->y) gpuFree(ctx->y);
         if (ctx->gate) gpuFree(ctx->gate);
         if (ctx->up) gpuFree(ctx->up);
+        if (ctx->q8_xq) gpuFree(ctx->q8_xq);
+        if (ctx->q8_xd) gpuFree(ctx->q8_xd);
         if (ctx->host_x) gpuFreeHost(ctx->host_x);
         if (ctx->host_y) gpuFreeHost(ctx->host_y);
         if (ctx->stream) gpuStreamDestroy(ctx->stream);
         ctx->x = ctx->y = ctx->gate = ctx->up = NULL;
+        ctx->q8_xq = NULL;
+        ctx->q8_xd = NULL;
         ctx->host_x = ctx->host_y = NULL;
         ctx->x_cap = ctx->y_cap = ctx->gate_cap = ctx->up_cap = 0;
+        ctx->q8_xq_cap = ctx->q8_xd_cap = 0;
         ctx->host_x_cap = ctx->host_y_cap = 0;
         ctx->stream = NULL;
     }
@@ -1025,7 +1150,7 @@ static int gguf_block_size(gguf_type_t qtype) {
     case 1:  return 0;    /* F16: no blocks */
     case 30: return 0;    /* BF16: no blocks */
     case 2:  return 18;   /* Q4_0: 18 bytes per 32 values */
-    case 8:  return 34;   /* Q8_0: 34 bytes per 32 values */
+    case 8:  return GPU_BLOCK_Q8_0_SIZE; /* Q8_0: 34 bytes per 32 values */
     case 12: return GPU_BLOCK_Q4_K_SIZE;  /* Q4_K: 144 bytes per 256 values */
     case 41: return 18;   /* Q1_0: 18 bytes per 128 values */
     case 42: return 34;   /* Q2_0: 34 bytes per 128 values */
@@ -1147,6 +1272,45 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
     if (!reserve(&ctx->x, &ctx->x_cap, xb) ||
         !reserve(&ctx->y, &ctx->y_cap, yb)) return 0;
 
+    /* ---- Q8_0 special path: quantize x to Q8_0 on GPU, then int8 MAC ----
+     * This matches the CPU path in tensor.c exactly:
+     *   1. quantize_row_q8_0(x) -> int8 qs + float d per 32-block
+     *   2. vec_dot_q8_0_q8_0_deltas(int8_x, float_xd, int8_w, fp16_wd)
+     * GPU quantize kernel outputs d as FP32 directly (matching CPU's
+     * pre-converted qx_d array), avoiding an extra FP16->FP32 conversion
+     * step. The matmul kernel then does pure int8 MAC with fp32 scales. */
+    if (t->qtype == GGUF_TYPE_Q8_0) {
+        int n_blocks = I / 32;
+        if (n_blocks < 1 || I % 32 != 0) return 0; /* must be aligned */
+
+        /* Upload fp32 input */
+        if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
+
+        /* Allocate quantized input buffers: qs (int8_t[S*I]) + d (float[S*n_blocks]) */
+        size_t xq_bytes = (size_t)S * I;
+        size_t xd_bytes = (size_t)S * n_blocks * sizeof(float);
+        if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, xq_bytes) ||
+            !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
+
+        /* Step 1: Quantize x to Q8_0 on GPU */
+        dim3 q_grid((unsigned)n_blocks, (unsigned)S);
+        picolm_quantize_q8_0<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
+            ctx->q8_xq, ctx->q8_xd, ctx->x, I, S);
+        if (!gpu_ok(gpuGetLastError(), "q8 quantize") ||
+            !gpu_ok(gpuDeviceSynchronize(), "q8 quantize sync")) return 0;
+
+        /* Step 2: Q8_0 x Q8_0 integer MAC matmul */
+        dim3 grid((unsigned)O, (unsigned)S);
+        picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
+            ctx->y, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes);
+        if (!gpu_ok(gpuGetLastError(), "q8 matmul") ||
+            !gpu_ok(gpuDeviceSynchronize(), "q8 matmul sync")) return 0;
+
+        if (!gpu_ok(gpuMemcpy(y, ctx->y, yb, gpuMemcpyDeviceToHost), "output download")) return 0;
+        return 1;
+    }
+
+    /* Generic path for all other quant types */
     /* Scratch buffers are in device memory. Explicit H2D copy needed. */
     if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
 
@@ -1307,15 +1471,50 @@ picolm_gpu_ssm_recurrence(float *state,
     }
     if (!ctx) return 0;
 
-    size_t shared_mem = 2 * d_state * sizeof(float);
+    /* Upload all CPU data to device memory.
+     * On AMD iGPU, CPU malloc'd memory is NOT directly GPU-accessible. */
+    size_t state_bytes = (size_t)n_v_heads * d_state * d_state * sizeof(float);
+    size_t q_bytes = (size_t)(n_v_heads / repeat) * d_state * sizeof(float);
+    size_t k_bytes = q_bytes;
+    size_t v_bytes = (size_t)n_v_heads * d_state * sizeof(float);
+    size_t scalar_bytes = (size_t)n_v_heads * sizeof(float);
+    size_t out_bytes = (size_t)d_state * n_v_heads * sizeof(float);
 
+    void *ds, *dq, *dk, *dv, *dg, *db, *do_;
+    if (!gpu_ok(gpuMalloc(&ds, state_bytes), "ssm st") ||
+        !gpu_ok(gpuMalloc(&dq, q_bytes), "ssm q") ||
+        !gpu_ok(gpuMalloc(&dk, k_bytes), "ssm k") ||
+        !gpu_ok(gpuMalloc(&dv, v_bytes), "ssm v") ||
+        !gpu_ok(gpuMalloc(&dg, scalar_bytes), "ssm g") ||
+        !gpu_ok(gpuMalloc(&db, scalar_bytes), "ssm b") ||
+        !gpu_ok(gpuMalloc(&do_, out_bytes), "ssm o")) return 0;
+
+    if (!gpu_ok(gpuMemcpy(ds, state, state_bytes, gpuMemcpyHostToDevice), "ssm st h2d") ||
+        !gpu_ok(gpuMemcpy(dq, q_conv, q_bytes, gpuMemcpyHostToDevice), "ssm q h2d") ||
+        !gpu_ok(gpuMemcpy(dk, k_conv, k_bytes, gpuMemcpyHostToDevice), "ssm k h2d") ||
+        !gpu_ok(gpuMemcpy(dv, v_conv, v_bytes, gpuMemcpyHostToDevice), "ssm v h2d") ||
+        !gpu_ok(gpuMemcpy(dg, gate_exp, scalar_bytes, gpuMemcpyHostToDevice), "ssm g h2d") ||
+        !gpu_ok(gpuMemcpy(db, beta, scalar_bytes, gpuMemcpyHostToDevice), "ssm b h2d")) {
+        gpuFree(ds); gpuFree(dq); gpuFree(dk); gpuFree(dv);
+        gpuFree(dg); gpuFree(db); gpuFree(do_); return 0;
+    }
+
+    size_t shared_mem = 2 * d_state * sizeof(float);
     dim3 grid((unsigned)n_v_heads, 1, 1);
     picolm_ssm_recurrence_kernel<<<grid, 256, (unsigned)shared_mem, ctx->stream>>>(
-        state, q_conv, k_conv, v_conv, gate_exp, beta, ssm_output,
-        n_v_heads, d_state, repeat);
+        (float *)ds, (const float *)dq, (const float *)dk,
+        (const float *)dv, (const float *)dg, (const float *)db,
+        (float *)do_, n_v_heads, d_state, repeat);
 
     if (!gpu_ok(gpuGetLastError(), "ssm recurrence") ||
-        !gpu_ok(gpuDeviceSynchronize(), "ssm sync")) return 0;
+        !gpu_ok(gpuDeviceSynchronize(), "ssm sync")) {
+        gpuFree(ds); gpuFree(dq); gpuFree(dk); gpuFree(dv);
+        gpuFree(dg); gpuFree(db); gpuFree(do_); return 0;
+    }
+    gpuMemcpy(ssm_output, do_, out_bytes, gpuMemcpyDeviceToHost);
+    gpuMemcpy(state, ds, state_bytes, gpuMemcpyDeviceToHost);
+    gpuFree(ds); gpuFree(dq); gpuFree(dk); gpuFree(dv);
+    gpuFree(dg); gpuFree(db); gpuFree(do_);
     return 1;
 }
 
@@ -1355,9 +1554,16 @@ picolm_gpu_ssm_vecdot(float *out_host,
     }
 
     dim3 grid((unsigned)n_v_heads, 1, 1);
+    void *hm_dev = NULL;
+    if (head_map) {
+        gpuMalloc(&hm_dev, (size_t)n_v_heads * sizeof(int));
+        gpuMemcpy(hm_dev, head_map, (size_t)n_v_heads * sizeof(int), gpuMemcpyHostToDevice);
+    }
     picolm_ssm_vecdot_kernel<<<grid, 256, 256 * sizeof(float), ctx->stream>>>(
-        ctx->y, ctx->x, w_dev, qtype, dim, n_v_heads, row_bytes, head_map);
+        ctx->y, ctx->x, w_dev, qtype, dim, n_v_heads, row_bytes,
+        hm_dev ? (const int *)hm_dev : NULL);
     gpuFree(w_dev);
+    if (hm_dev) gpuFree(hm_dev);
 
     if (!gpu_ok(gpuDeviceSynchronize(), "ssm vecdot sync") ||
         !gpu_ok(gpuMemcpy(out_host, ctx->y, out_bytes, gpuMemcpyDeviceToHost), "ssm out d2h")) return 0;
