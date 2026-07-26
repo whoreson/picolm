@@ -34,6 +34,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>       // getpagesize()
+#include <time.h>        // clock_gettime (optional profiling)
 
 #define TPB 256             // threads per threadgroup for all matmul kernels
 
@@ -589,6 +590,37 @@ static size_t g_xcap = 0, g_ycap = 0, g_gatecap = 0, g_upcap = 0, g_ssmcap = 0;
 static void *g_xptr = NULL, *g_yptr = NULL, *g_gateptr = NULL, *g_upptr = NULL,
            *g_ssmptr = NULL;
 
+// Optional profiling (enable with PICOLM_GPU_PROFILE=1). Accumulates wall time
+// of the GPU entry points so a decode run shows where per-token time goes
+// (SSM recurrence copy vs GPU, and total GPU-active time vs decode budget).
+static int    g_prof = 0;
+static long   g_prof_calls = 0;
+static double g_prof_gpu_ms = 0;     // total GPU-active time (dispatch+wait)
+static double g_prof_rec_copy_ms = 0;// SSM recurrence H2D+D2H memcpy time
+static double g_prof_rec_gpu_ms = 0; // SSM recurrence dispatch+wait time
+static long   g_prof_rec_calls = 0;
+static inline double prof_now_ms(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
+}
+static inline void prof_maybe_init(void) {
+    static int inited = 0;
+    if (!inited) { g_prof = getenv("PICOLM_GPU_PROFILE") != NULL; inited = 1; }
+}
+static inline void prof_report(void) {
+    if (!g_prof || (g_prof_calls % 256) != 0) return;
+    static double p_gpu = 0, p_rc = 0, p_rg = 0;
+    static long   p_calls = 0, p_rcalls = 0;
+    double d_gpu = g_prof_gpu_ms - p_gpu, d_rc = g_prof_rec_copy_ms - p_rc, d_rg = g_prof_rec_gpu_ms - p_rg;
+    long   d_calls = g_prof_calls - p_calls, d_rcalls = g_prof_rec_calls - p_rcalls;
+    /* ~256 GPU calls ~= one decode token (matmuls + 48 SSM recurrences). */
+    fprintf(stderr, "[prof] last %ld GPU calls (~1 tok): gpu_active=%.1f ms | "
+                    "ssm_rec %ld layers: copy=%.1f ms gpu=%.1f ms\n",
+            d_calls, d_gpu, d_rcalls, d_rc, d_rg);
+    p_gpu = g_prof_gpu_ms; p_rc = g_prof_rec_copy_ms; p_rg = g_prof_rec_gpu_ms;
+    p_calls = g_prof_calls; p_rcalls = g_prof_rec_calls;
+}
+
 static id<MTLComputePipelineState> ps_for_qtype(gguf_type_t q) {
     switch (q) {
         case GGUF_TYPE_F32:  return g_ps_f32;
@@ -643,6 +675,7 @@ static size_t gguf_row_bytes(gguf_type_t q, int I) {
 extern "C" {
 
 int picolm_gpu_init(const int *devices, int count) {
+    prof_maybe_init();
     if (g_ndev > 0) return 1;                 /* idempotent */
     if (!devices || count < 1 || count > PICOLM_GPU_MAX_DEVICES) return 0;
 
@@ -869,8 +902,10 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
      * function holds the command buffer until waitUntilCompleted anyway. */
     id<MTLCommandBuffer> cmd = [g_queue commandBufferWithUnretainedReferences];
     if (!launch_matmul(t, g_x, g_y, S, cmd)) { return 0; }
+    double _pt0 = g_prof ? prof_now_ms() : 0;
     [cmd commit];
     [cmd waitUntilCompleted];
+    if (g_prof) { g_prof_gpu_ms += prof_now_ms() - _pt0; g_prof_calls++; prof_report(); }
 
     memcpy(y, g_yptr, yb);
     return 1;
@@ -921,8 +956,10 @@ int picolm_gpu_expert_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
     }
     /* y = W_down @ gate */
     if (!launch_matmul(down, g_gate, g_y, S, cmd)) return 0;
+    double _pt0 = g_prof ? prof_now_ms() : 0;
     [cmd commit];
     [cmd waitUntilCompleted];
+    if (g_prof) { g_prof_gpu_ms += prof_now_ms() - _pt0; g_prof_calls++; prof_report(); }
 
     memcpy(y, g_yptr, xb);
     return 1;
@@ -1008,8 +1045,10 @@ int picolm_gpu_ssm_vecdot(float *out,
     [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_v_heads, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(TPB, 1, 1)];
     [enc endEncoding];
+    double _pt0 = g_prof ? prof_now_ms() : 0;
     [cmd commit];
     [cmd waitUntilCompleted];
+    if (g_prof) { g_prof_gpu_ms += prof_now_ms() - _pt0; g_prof_calls++; prof_report(); }
 
     memcpy(out, g_yptr, out_bytes);
     return 1;
@@ -1059,6 +1098,7 @@ int picolm_gpu_ssm_recurrence(float *state,
     if (!reserve_buf(&g_y, &g_ycap, &g_yptr, out_bytes,
                      MTLResourceStorageModeShared | MTLResourceCPUCacheModeDefaultCache)) return 0;
 
+    double _pc0 = g_prof ? prof_now_ms() : 0;
     memcpy(g_ssmptr, state, state_bytes);                 /* H2D state */
     memcpy((uint8_t *)g_xptr + q_off, q_conv,   q_bytes);
     memcpy((uint8_t *)g_xptr + k_off, k_conv,   k_bytes);
@@ -1081,11 +1121,20 @@ int picolm_gpu_ssm_recurrence(float *state,
     [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_v_heads, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(TPB, 1, 1)];
     [enc endEncoding];
+    double _pt0 = g_prof ? prof_now_ms() : 0;
     [cmd commit];
     [cmd waitUntilCompleted];
+    if (g_prof) {
+        double _dt = prof_now_ms() - _pt0;
+        g_prof_gpu_ms += _dt; g_prof_calls++; g_prof_rec_gpu_ms += _dt; g_prof_rec_calls++;
+        g_prof_rec_copy_ms += _pt0 - _pc0;     /* copy-in time */
+        prof_report();
+    }
 
+    double _pc1 = g_prof ? prof_now_ms() : 0;
     memcpy(state, g_ssmptr, state_bytes);                  /* D2H state */
     memcpy(ssm_output, g_yptr, out_bytes);
+    if (g_prof) g_prof_rec_copy_ms += prof_now_ms() - _pc1; /* copy-out time */
     return 1;
 }
 
