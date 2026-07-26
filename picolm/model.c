@@ -5861,9 +5861,6 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                 float dv = xb2_batch[di]; dsum += dv;
                 float dav = fabsf(dv); if (dav > dmax) dmax = dav;
             }
-            fprintf(stderr, "DEBUG attn_out[0]: sum=%.6f max=%.6f first4=", dsum, dmax);
-            for (int di = 0; di < dim && di < 4; di++) fprintf(stderr, "%.4f ", xb2_batch[di]);
-            fprintf(stderr, "\n");
         }
                 tensor_set_repacked(NULL);
 
