@@ -24,15 +24,44 @@ GPU_OBJS =
 PREFIX  ?= /usr/local
 MODEL_DIR ?= /opt/picolm/models
 
-# --- Default: native build with per-matmul threading ---
-native: CFLAGS += -march=native
-native: $(TARGET)
+# ---- Auto-detect SIMD level from compiler flags ----
+# These define PICOLM_* macros that gate the optimized code paths.
+# Detection cascades: AVX-512 > AVX2 > AVX > SSE3 > SSE2 (first match wins).
+# When -march=native is used, the compiler defines __AVX512F__, __AVX2__, etc.
+
+_have_avx512 = $(shell echo | $(CC) -E -dM $(1) - 2>/dev/null | grep -c '__AVX512F__')
+_have_avx2   = $(shell echo | $(CC) -E -dM $(1) - 2>/dev/null | grep -c '__AVX2__')
+_have_avx    = $(shell echo | $(CC) -E -dM $(1) - 2>/dev/null | grep -c '__AVX__')
+_have_sse3   = $(shell echo | $(CC) -E -dM $(1) - 2>/dev/null | grep -c '__SSSE3__')
+_have_sse2   = $(shell echo | $(CC) -E -dM $(1) - 2>/dev/null | grep -c '__SSE2__')
+_have_fma    = $(shell echo | $(CC) -E -dM $(1) - 2>/dev/null | grep -c '__FMA__')
+
+# Pick the highest SIMD level and emit the right -DPICOLM_* defines
+simd_defines_for = $(strip \
+  $(if $(filter 0,$(call _have_avx512,$(1))),,\
+    -DPICOLM_AVX512 $(if $(filter 0,$(call _have_fma,$(1))),,-DPICOLM_FMA)) \
+  $(if $(and $(filter 0,$(call _have_avx512,$(1))),$(filter 0,$(call _have_avx2,$(1)))),,\
+    -DPICOLM_AVX2 $(if $(filter 0,$(call _have_fma,$(1))),,-DPICOLM_FMA)) \
+  $(if $(and $(filter 0,$(call _have_avx512,$(1))),$(filter 0,$(call _have_avx2,$(1))),$(filter 0,$(call _have_avx,$(1)))),,\
+    -DPICOLM_AVX) \
+  $(if $(and $(filter 0,$(call _have_avx512,$(1))),$(filter 0,$(call _have_avx2,$(1))),$(filter 0,$(call _have_avx,$(1))),$(filter 0,$(call _have_sse3,$(1)))),,\
+    -DPICOLM_SSE3) \
+  $(if $(and $(filter 0,$(call _have_avx512,$(1))),$(filter 0,$(call _have_avx2,$(1))),$(filter 0,$(call _have_avx,$(1))),$(filter 0,$(call _have_sse3,$(1))),$(filter 0,$(call _have_sse2,$(1)))),,\
+    -DPICOLM_SSE2))
+
+# --- Default target: build with -march=native + auto-detected SIMD ---
+.PHONY: all
+all: $(TARGET)
+
+# --- Native build: -march=native with auto-detected SIMD defines ---
+native:
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_defines_for,-march=native)"
 
 # --- VIZ build: native with embedded VNC visualization server ---
 viz:
-	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native -DPICOLM_VIZ=1" OBJS="$(OBJS) viz.o"
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_defines_for,-march=native) -DPICOLM_VIZ=1" OBJS="$(OBJS) viz.o"
 
-# --- x86-64 default (SSE2 only, safe for all x86-64) ---
+# --- x86-64 default: -march=native + GPU disabled, safe fallback ---
 x86: sse2
 
 # --- No SIMD (scalar fallback, portable to any architecture) ---
@@ -40,24 +69,24 @@ scalar: CFLAGS += -mno-sse2 -mno-avx
 scalar: $(TARGET)
 
 # --- x86-64 with SSE2 only ---
-sse2: CFLAGS += -msse2
-sse2: $(TARGET)
+sse2:
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -msse2 -DPICOLM_SSE2"
 
 # --- x86-64 with SSE2+SSE3+SSSE3 (covers AMD Phenom/Athlon and similar without AVX) ---
-sse3: CFLAGS += -msse2 -msse3 -mssse3 -mpopcnt
-sse3: $(TARGET)
+sse3:
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -msse2 -msse3 -mssse3 -mpopcnt -DPICOLM_SSE3 -DPICOLM_SSE2"
 
 # --- x86-64 with AVX (Sandy Bridge and newer Intel; Bulldozer and newer AMD) ---
-avx: CFLAGS += -mavx -mf16c -mpopcnt
-avx: $(TARGET)
+avx:
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -mavx -mf16c -mpopcnt -DPICOLM_AVX -DPICOLM_SSE2"
 
 # --- x86-64 with AVX2 (Haswell and newer Intel; Excavator and newer AMD) ---
-avx2: CFLAGS += -mavx2 -mfma -mpopcnt -mf16c
-avx2: $(TARGET)
+avx2:
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -mavx2 -mfma -mpopcnt -mf16c -DPICOLM_AVX2 -DPICOLM_FMA -DPICOLM_SSE2"
 
 # --- Persistent thread pool (WIP, for development) ---
-threadpool: CFLAGS += -march=native -DPICOLM_USE_PER_MATMUL_THREAD=0
-threadpool: $(TARGET)
+threadpool:
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_defines_for,-march=native) -DPICOLM_USE_PER_MATMUL_THREAD=0"
 
 # --- Link ---
 $(TARGET): $(OBJS) $(GPU_OBJS)
@@ -79,54 +108,47 @@ grammar.o: grammar.c grammar.h
 
 # --- Static build for single-binary deployment ---
 # Uses SSE2 (not -march=native) so the binary runs on any x86-64, not just the build machine.
-static: CFLAGS += -msse2
-static: LDFLAGS += -static
-static: $(TARGET)
+static:
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -msse2 -DPICOLM_SSE2" LDFLAGS="$(LDFLAGS) -static"
 
 # --- Pi 3/4/5 (64-bit ARM with NEON SIMD) ---
-pi: CFLAGS += -march=armv8-a+simd
-pi: $(TARGET)
+pi:
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=armv8-a+simd -DPICOLM_NEON"
 
 # --- Pi Zero / Pi 1 (32-bit ARM) ---
 pi-arm32: CC = arm-linux-gnueabihf-gcc
-pi-arm32: CFLAGS += -march=armv6 -mfpu=vfp
-pi-arm32: $(TARGET)
+pi-arm32:
+	$(MAKE) $(TARGET) CC=arm-linux-gnueabihf-gcc CFLAGS="$(CFLAGS) -march=armv6 -mfpu=vfp"
 
 # --- Cross-compile for Pi64 from platforms (e.g. x86) ---
 cross-pi: CC = aarch64-linux-gnu-gcc
-cross-pi: CFLAGS += -march=armv8-a+simd
-cross-pi: LDFLAGS += -static
-cross-pi: $(TARGET)
+cross-pi:
+	$(MAKE) $(TARGET) CC=aarch64-linux-gnu-gcc CFLAGS="$(CFLAGS) -march=armv8-a+simd -DPICOLM_NEON" LDFLAGS="$(LDFLAGS) -static"
 
 # --- RISC-V (Sipeed LicheeRV, etc.) ---
 riscv: CC = riscv64-linux-gnu-gcc
-riscv: CFLAGS += -march=rv64gc -mabi=lp64d
 riscv: $(TARGET)
 
 # --- Cross-compile for RISC-V from platforms (e.g. x86) ---
 cross-riscv: CC = riscv64-linux-gnu-gcc
-cross-riscv: CFLAGS += -march=rv64gc -mabi=lp64d
-cross-riscv: LDFLAGS += -static
 cross-riscv: $(TARGET)
 
 # --- Mac OS X 10.4 Tiger (PowerPC G4, GCC 4.0.1, Altivec) ---
 # Requires: gcc -maltivec, OSSwapInt* from libkern/OSByteOrder.h
 # No OpenMP, no C11, no static linking, no libstdc++
-ppc: CFLAGS = -O2 -g -std=c99 -D_DARWIN_C_SOURCE -D_GNU_SOURCE -Wall -maltivec
-ppc: LDFLAGS = -lm
-ppc: $(TARGET)
+ppc:
+	$(MAKE) $(TARGET) CFLAGS="-O2 -g -std=c99 -D_DARWIN_C_SOURCE -D_GNU_SOURCE -Wall -maltivec -DPICOLM_ALTIVEC" LDFLAGS="-lm"
 
 # --- Mac OS X 10.6 Snow Leopard (Core 2 Duo, GCC 4.2.1, SSE4.1) ---
 # GCC 4.2: no -march=native, no -std=c11, no -Wpedantic, no <immintrin.h>
 # SSE3 intrinsics are broken in GCC 4.2's <emmintrin.h>; SSSE3+SSE4.1 work
 # via individual headers. __thread not supported.
-mac106: CFLAGS = -O2 -g -std=c99 -D_GNU_SOURCE -Wall -msse4.1 -mssse3 -msse2
-mac106: LDFLAGS = -lm -lpthread -fopenmp
-mac106: $(TARGET)
+mac106:
+	$(MAKE) $(TARGET) CFLAGS="-O2 -g -std=c99 -D_GNU_SOURCE -Wall -msse4.1 -mssse3 -msse2 -DPICOLM_SSE3 -DPICOLM_SSE2" LDFLAGS="-lm -lpthread -fopenmp"
 
 # --- Debug build ---
-debug: CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -g -O0
-debug: $(TARGET)
+debug:
+	$(MAKE) $(TARGET) CFLAGS="-std=c11 -Wall -Wextra -Wpedantic -g -O0"
 
 # --- Install ---
 install: $(TARGET)
@@ -151,9 +173,8 @@ clean:
 
 
 .PHONY: asan
-asan: CFLAGS += -fsanitize=address -g -O2 -march=native
-asan: LDFLAGS += -fsanitize=address
-asan: picolm
+asan:
+	$(MAKE) $(TARGET) CFLAGS="-fsanitize=address -g -O2 -march=native $(call simd_defines_for,-march=native) -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic -fopenmp" LDFLAGS="-lm -lpthread -fopenmp -fsanitize=address"
 
 # --- Force recompile of GPU-dependent C objects ---
 # These objects contain #ifdef PICOLM_GPU code; when building GPU targets
@@ -198,7 +219,7 @@ endif
 
 .PHONY: hip
 hip: backend_gpu.o.hip gpu-clean-objs
-	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -DPICOLM_GPU=1" GPU_OBJS="backend_gpu.o.hip" GPU_LIBS="-L$(ROCM_LIB) -lamdhip64 -lstdc++ -Wl,-rpath,$(ROCM_LIB)"
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_defines_for,-march=native) -DPICOLM_GPU=1" GPU_OBJS="backend_gpu.o.hip" GPU_LIBS="-L$(ROCM_LIB) -lamdhip64 -lstdc++ -Wl,-rpath,$(ROCM_LIB)"
 
 backend_gpu.o.hip: backend_gpu.cu backend_gpu.h quant.h
 	$(HIPCC) $(HIPFLAGS) --offload-arch=$(HIP_ARCH) -DPICOLM_GPU=1 -c -o $@ $< -I.
@@ -224,7 +245,7 @@ CUDAFLAGS   ?= -O3 -std=c++11 -Xcompiler="-fPIC"
 
 .PHONY: cuda
 cuda: backend_gpu.o.cuda gpu-clean-objs
-	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -DPICOLM_GPU=1" GPU_OBJS="backend_gpu.o.cuda" GPU_LIBS="-L$(CUDA_LIB) -lcudart -lstdc++ -Wl,-rpath,$(CUDA_LIB)"
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_defines_for,-march=native) -DPICOLM_GPU=1" GPU_OBJS="backend_gpu.o.cuda" GPU_LIBS="-L$(CUDA_LIB) -lcudart -lstdc++ -Wl,-rpath,$(CUDA_LIB)"
 
 backend_gpu.o.cuda: backend_gpu.cu backend_gpu.h quant.h
 	$(NVCC) $(CUDAFLAGS) $(CUDA_GENCODE) -DPICOLM_GPU=1 -c -o $@ $< -I.
