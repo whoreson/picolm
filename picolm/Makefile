@@ -17,7 +17,6 @@ VIZ_SRCS = viz.c
 VIZ_OBJS = $(VIZ_SRCS:.c=.o)
 
 # GPU backend
-HIPCC   ?= hipcc
 HIPFLAGS ?= -O3 -std=c++11 -fPIC -fPIE
 HIP_LIBS = -lamdhip64
 GPU_OBJS =
@@ -166,12 +165,36 @@ gpu-clean-objs:
 	rm -f model.o tensor.o quant.o picolm.o
 
 # --- ROCm/HIP GPU backend ---
-ROCM_LIB ?= /opt/rocm-6.3.3/lib
+
+# Auto-detect ROCm root. Strategy:
+#   1. If rocminfo is in PATH, derive its parent/../ (e.g. /usr/bin/rocminfo -> /usr, /opt/rocm/bin/rocminfo -> /opt/rocm).
+#   2. Scan well-known locations for a working rocminfo.
+# Override with ROCM_ROOT=/path/to/rocm if needed.
+ROCM_ROOT := $(shell \
+  r=$$(command -v rocminfo 2>/dev/null); \
+  if [ -n "$$r" ]; then dirname "$$(dirname "$$r")"; \
+  else \
+    for d in /opt/rocm /opt/rocm-6.3.3 /opt/rocm-6.2.4 /opt/rocm-6.2 /opt/rocm-6.1 /opt/rocm-5.7 /usr/lib/rocm /usr; do \
+      if [ -x "$$d/bin/rocminfo" ]; then echo "$$d"; break; fi; \
+    done; \
+  fi)
+ifeq ($(ROCM_ROOT),)
+ROCM_ROOT := /opt/rocm
+endif
+
+ROCM_LIB ?= $(ROCM_ROOT)/lib
+HIPCC    ?= $(ROCM_ROOT)/bin/hipcc
+
+# Auto-detect GPU architecture via rocminfo, fall back to gfx906.
+# rocminfo outputs lines like "Name:                    gfx906" for each GPU.
+HIP_ARCH := $(shell $(ROCM_ROOT)/bin/rocminfo 2>/dev/null | grep 'Name:' | grep 'gfx' | head -1 | awk '{print $$2}')
+ifeq ($(HIP_ARCH),)
+HIP_ARCH := gfx906
+endif
 
 # HIP target architecture.
-#   Default: gfx940 (CDNA2, first generation with hipWMMA)
+#   Auto-detected via rocminfo when possible. Override with HIP_ARCH=gfx940 etc.
 #   Options: gfx906/908 (RDNA2/3, no WMMA), gfx940/941/942 (CDNA2+, WMMA)
-HIP_ARCH ?= gfx940
 
 .PHONY: hip
 hip: backend_gpu.o.hip gpu-clean-objs
