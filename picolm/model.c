@@ -4145,7 +4145,7 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     {
         gguf_type_t alpha_type = lw->type_ssm_alpha;
         size_t row_bytes = gguf_type_row_size(alpha_type, dim);
-        int *alpha_map = (int *)malloc((size_t)n_v_heads * sizeof(int));
+        int alpha_map[256];
         for (int h = 0; h < n_v_heads; h++) alpha_map[h] = do_remap ? qwen35_vhead_gguf(h, n_vpk, n_k) : h;
 #ifdef PICOLM_GPU
         if (gpu_lw && (alpha_type == GGUF_TYPE_Q4_0 || alpha_type == GGUF_TYPE_Q8_0) &&
@@ -4165,7 +4165,7 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
                 alpha_out[h] = sum + s->ssm_dt_w[il][h];
             }
         }
-        free(alpha_map);
+        /* alpha_map is stack-allocated */
     }
 #ifdef DEBUG_SSM
     if (il == 0 && pos == 0) dbg_vec("alpha[:8]", alpha_out, n_v_heads, 8);
@@ -4188,7 +4188,7 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     {
         gguf_type_t beta_type = lw->type_ssm_beta;
         size_t row_bytes = gguf_type_row_size(beta_type, dim);
-        int *beta_map = (int *)malloc((size_t)n_v_heads * sizeof(int));
+        int beta_map[256];
         for (int h = 0; h < n_v_heads; h++) beta_map[h] = do_remap ? qwen35_vhead_gguf(h, n_vpk, n_k) : h;
 #ifdef PICOLM_GPU
         if (gpu_lw && (beta_type == GGUF_TYPE_Q4_0 || beta_type == GGUF_TYPE_Q8_0) &&
@@ -4208,7 +4208,7 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
                 beta[h] = 1.0f / (1.0f + expf(-sum));
             }
         }
-        free(beta_map);
+        /* beta_map is stack-allocated */
     }
     if (xb_q8 != (void *)xb_q8_stack) free(xb_q8);
     if (xb_q8_d != xb_q8_d_stack) free(xb_q8_d);
@@ -5348,8 +5348,8 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
         size_t row_bytes_beta = gguf_type_row_size(beta_type, dim);
 
         /* Precompute head maps */
-        int *alpha_map = (int *)malloc((size_t)n_v_heads * sizeof(int));
-        int *beta_map = (int *)malloc((size_t)n_v_heads * sizeof(int));
+        int alpha_map[256];
+        int beta_map[256];
         for (int h = 0; h < n_v_heads; h++) {
             alpha_map[h] = do_remap ? qwen35_vhead_gguf(h, n_vpk, n_k) : h;
             beta_map[h] = do_remap ? qwen35_vhead_gguf(h, n_vpk, n_k) : h;
@@ -5397,8 +5397,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
         }
         free(xb_q8_batch);
         free(xb_q8_d_batch);
-        free(alpha_map);
-        free(beta_map);
+        /* alpha_map and beta_map are stack-allocated */
 
         /* Post-process: alpha -> softplus -> gate -> exp; beta -> sigmoid */
         for (bi = 0; bi < n_tokens; bi++) {
