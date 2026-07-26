@@ -5827,6 +5827,13 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 
             /* Zero init xb_batch for attention accumulation */
             memset(xb_batch, 0, (size_t)n_tokens * max_dim * sizeof(float));
+            /* Clear GPU tensor: batch_attention_layer's internal matmul_batch
+             * calls use KV cache tiles (F16 on CPU), NOT GPU weight tensors.
+             * Stale gpu_tensor from attn_q projection would cause the GPU
+             * dispatch to use the wrong tensor dimensions and crash. */
+#ifdef PICOLM_GPU
+            tensor_set_gpu_tensor(NULL, 0);
+#endif
             /* Batched attention: all tokens, all heads, one thread dispatch */
             batch_attention_layer(xb_batch, q_batch, kcl, vcl,
                                   n_tokens, start_pos,
