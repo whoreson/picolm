@@ -5307,15 +5307,20 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
     if (gpu_lw) tensor_set_gpu_tensor(NULL, 0);
 #endif
     if (do_remap) {
+        /* Single temp buffer for reordering v-heads (reused each iteration).
+         * Cannot use alloca inside the loop: that grows stack without shrinking,
+         * causing stack overflow for large n_tokens (e.g. 613 * 24KB > 8MB). */
+        float *zt = malloc(value_dim * sizeof(float));
+        if (!zt) { fprintf(stderr, "OOM: zt remap buffer\n"); exit(1); }
         for (bi = 0; bi < n_tokens; bi++) {
             float *zb = z_batch + bi * value_dim;
-            float *zt = alloca(value_dim * sizeof(float));
             memcpy(zt, zb, value_dim * sizeof(float));
             for (int h = 0; h < n_v_heads; h++) {
                 int gh = qwen35_vhead_gguf(h, n_vpk, n_k);
                 memcpy(zb + h * head_v_dim, zt + gh * head_v_dim, head_v_dim * sizeof(float));
             }
         }
+        free(zt);
     }
 
     /* 4. Convolution + silu (sequential per token: conv_state is stateful)
@@ -5339,15 +5344,18 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
 
     /* 5. Split Q/K/V + L2 norm + Q scale (batched across tokens) */
     if (do_remap) {
+        /* Single temp buffer for V reordering (reused each iteration). */
+        float *vt = malloc(value_dim * sizeof(float));
+        if (!vt) { fprintf(stderr, "OOM: vt remap buffer\n"); exit(1); }
         for (bi = 0; bi < n_tokens; bi++) {
             float *conv = conv_batch + bi * conv_dim;
-            float *vt = alloca(value_dim * sizeof(float));
             memcpy(vt, conv + 2*qk_dim, value_dim * sizeof(float));
             for (int h = 0; h < n_v_heads; h++) {
                 int gh = qwen35_vhead_gguf(h, n_vpk, n_k);
                 memcpy(conv + 2*qk_dim + h * head_v_dim, vt + gh * head_v_dim, head_v_dim * sizeof(float));
             }
         }
+        free(vt);
     }
     float q_scale = 1.0f / sqrtf((float)d_state);
     for (bi = 0; bi < n_tokens; bi++) {
