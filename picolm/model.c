@@ -1625,6 +1625,28 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
     }
 #endif
 
+    /* Log tensor type distribution */
+    {
+        int tcounts[60] = {0};
+        for (int l = 0; l < m->config.n_layers; l++) {
+            layer_weights_t *lw = &m->weights.layers[l];
+            int types[] = {lw->type_attn_q, lw->type_attn_k, lw->type_attn_v,
+                           lw->type_attn_output, lw->type_ffn_gate, lw->type_ffn_up, lw->type_ffn_down,
+                           lw->type_ssm_out, lw->type_ssm_conv1d, lw->type_ssm_alpha, lw->type_ssm_beta,
+                           lw->type_ssm_a, lw->type_ssm_dt, lw->type_attn_norm, lw->type_post_attn_norm};
+            for (int j = 0; j < 15; j++) {
+                if (types[j] >= 0 && types[j] < 60) tcounts[types[j]]++;
+            }
+        }
+        if (m->weights.type_token_embd >= 0 && m->weights.type_token_embd < 60) tcounts[m->weights.type_token_embd]++;
+        if (m->weights.type_output >= 0 && m->weights.type_output < 60) tcounts[m->weights.type_output]++;
+        fprintf(stderr, "Tensor types:");
+        for (int t = 0; t < 60; t++) {
+            if (tcounts[t]) fprintf(stderr, " %d(%d)", t, tcounts[t]);
+        }
+        fprintf(stderr, "\n");
+    }
+
     return 0;
 }
 
