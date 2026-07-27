@@ -382,6 +382,10 @@ int main(int argc, char **argv) {
             max_tokens = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
             temperature = (float)atof(argv[++i]);
+            if (temperature >= 2.0f) {
+                fprintf(stderr, "ERROR: -t is for temperature, not number of threads (-j)\n");
+                exit(1);
+            }
         } else if (strcmp(argv[i], "-k") == 0 && i + 1 < argc) {
             top_p = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
