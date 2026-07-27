@@ -1137,11 +1137,27 @@ static void init_rope_tables(run_state_t *s, const model_config_t *c) {
 /* ---- Buffer allocation ---- */
 
 /* Compute row size in bytes for a given KV cache type and number of elements */
-static size_t kv_row_size(kv_cache_type_t kv_type, int n) {
+/* kv_row_size: bytes for a GQA row (n_kv_heads * head_dim elements)
+ * For FP16: n * sizeof(uint16_t)
+ * For quantized types: quantized block layout for the full GQA row */
+static size_t kv_row_size_gqa(kv_cache_type_t kv_type, int n_elements) {
     switch (kv_type) {
-        case KV_CACHE_F16:  return (size_t)n * sizeof(uint16_t);
-        case KV_CACHE_Q8_0: return ((size_t)(n / 32)) * sizeof(block_q8_0);
-        case KV_CACHE_Q4_0: return ((size_t)(n / 32)) * sizeof(block_q4_0);
+        case KV_CACHE_F16:  return (size_t)n_elements * sizeof(uint16_t);
+        case KV_CACHE_Q8_0: return ((size_t)(n_elements / 32)) * sizeof(block_q8_0);
+        case KV_CACHE_Q4_0: return ((size_t)(n_elements / 32)) * sizeof(block_q4_0);
+    }
+    return 0;
+}
+
+/* kv_head_stride: byte offset between consecutive heads within a GQA row
+ * For FP16: head_dim * sizeof(uint16_t)
+ * For quantized: the quantized size of head_dim elements
+ * (for head_dim=64: Q8_0=68, Q4_0=44) */
+static size_t kv_head_stride(kv_cache_type_t kv_type, int head_dim) {
+    switch (kv_type) {
+        case KV_CACHE_F16:  return (size_t)head_dim * sizeof(uint16_t);
+        case KV_CACHE_Q8_0: return ((size_t)(head_dim / 32)) * sizeof(block_q8_0);
+        case KV_CACHE_Q4_0: return ((size_t)(head_dim / 32)) * sizeof(block_q4_0);
     }
     return 0;
 }
@@ -1213,9 +1229,12 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
                    sz_scratch + sz_rope + sz_norm +
                    sz_ssm_conv + sz_ssm_state + sz_ssm_small + sz_ssm_tmp;
 
-    /* Quantized KV cache: separate allocation (only for attention layers) */
-    size_t sz_k_row = kv_row_size(kv_type_k, c->head_dim);
-    size_t sz_v_row = kv_row_size(kv_type_v, c->head_dim);
+    /* Quantized KV cache: separate allocation (only for attention layers)
+     * Full-row GQA layout: [layer][pos] -> GQA row of n_kv_heads*head_dim */
+    size_t sz_k_row = kv_row_size_gqa(kv_type_k, c->n_kv_heads * c->head_dim);
+    size_t sz_v_row = kv_row_size_gqa(kv_type_v, c->n_kv_heads * c->head_dim);
+    size_t sz_k_head = kv_head_stride(kv_type_k, c->head_dim);
+    size_t sz_v_head = kv_head_stride(kv_type_v, c->head_dim);
     int attn_layer_count = 0;
     if (c->has_ssm) {
         for (int i = 0; i < c->n_layers; i++) {
@@ -1223,7 +1242,8 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         }
     }
     int kv_layers = attn_layer_count > 0 ? attn_layer_count : c->n_layers;
-    size_t sz_kv = (size_t)kv_layers * c->max_seq_len * c->n_kv_heads * (sz_k_row + sz_v_row);
+    /* GQA layout: each position stores one GQA row, not n_kv_heads rows */
+    size_t sz_kv = (size_t)kv_layers * c->max_seq_len * (sz_k_row + sz_v_row);
 
     const char *kv_name_k = "f16";
     const char *kv_name_v = "f16";
@@ -1255,6 +1275,8 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
     s->kv_type_v = kv_type_v;
     s->kv_row_size_k = sz_k_row;
     s->kv_row_size_v = sz_v_row;
+    s->kv_head_stride_k = sz_k_head;
+    s->kv_head_stride_v = sz_v_head;
 
     /* Carve float pointers */
     float *p = (float *)s->mem_block;
@@ -1275,8 +1297,9 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
     s->norm_weights = p;
     p += n_norm + c->n_embd; /* skip norm weights area (dequantized separately via nw pointer) */
 
-    /* KV cache pointers: K layers first, then V layers (all layers, SSM layers just don't use their slots) */
-    size_t layer_stride_k = (size_t)c->max_seq_len * c->n_kv_heads * sz_k_row;
+    /* KV cache pointers: K layers first, then V layers (all layers, SSM layers just don't use their slots)
+     * GQA layout: [layer][pos] * kv_row_size, with head offset = h * kv_head_stride */
+    size_t layer_stride_k = (size_t)c->max_seq_len * sz_k_row;
     uint8_t *kb = (uint8_t *)s->kv_block;
     s->key_cache = kb;
     s->val_cache = kb + (size_t)kv_layers * layer_stride_k;
@@ -1726,20 +1749,23 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
 static void attn_core(
         float *xbh, const float *qh, int kv_h, int pos,
         const uint8_t *kcache, const uint8_t *vcache,
-        int n_kv_heads, int kv_type_k, int kv_type_v,
-        size_t kv_row_size_k, size_t kv_row_size_v, int head_dim) {
+        int kv_type_k, int kv_type_v,
+        size_t kv_row_size_k, size_t kv_row_size_v,
+        size_t kv_head_stride_k, size_t kv_head_stride_v,
+        int head_dim) {
     float max_score = -1e30f, sum_exp = 0.0f;
     float acc[256];
     memset(acc, 0, (size_t)head_dim * sizeof(float));
 
     for (int t = 0; t <= pos; t++) {
-        const uint8_t *kt = kcache + (size_t)t * n_kv_heads * kv_row_size_k + kv_h * kv_row_size_k;
+        /* GQA layout: [pos] * kv_row_size + head * kv_head_stride */
+        const uint8_t *kt = kcache + (size_t)t * kv_row_size_k + kv_h * kv_head_stride_k;
         float score;
         if (kv_type_k == KV_CACHE_Q8_0) score = vec_dot_q8_0_f32(kt, qh, head_dim);
         else if (kv_type_k == KV_CACHE_Q4_0) score = vec_dot_q4_0_f32(kt, qh, head_dim);
         else score = vec_dot_f16_f32(kt, qh, head_dim);
         score /= sqrtf((float)head_dim);
-        const uint8_t *vt = vcache + (size_t)t * n_kv_heads * kv_row_size_v + kv_h * kv_row_size_v;
+        const uint8_t *vt = vcache + (size_t)t * kv_row_size_v + kv_h * kv_head_stride_v;
         if (score > max_score) {
             float correction = expf(max_score - score);
             sum_exp = sum_exp * correction + 1.0f;
@@ -1812,6 +1838,7 @@ typedef struct {
     int kv_h, kv_mul, n_kv_heads, head_dim, pos;
     int kv_type_k, kv_type_v;  /* kv_cache_type_t values: 0=F16, 1=Q8_0, 2=Q4_0 */
     size_t kv_row_size_k, kv_row_size_v;
+    size_t kv_head_stride_k, kv_head_stride_v;
     const uint8_t *kcache, *vcache;
     const float *q;   /* [n_heads][head_dim] */
     float *xb;        /* [n_heads][head_dim] */
@@ -1824,6 +1851,8 @@ static void attention_group(int kv_head_idx, void *ctx_ptr) {
     int head_dim = ctx->head_dim;
     int pos = ctx->pos;
     int first_qh = kv_h * kv_mul;
+    size_t kv_head_stride_k = ctx->kv_head_stride_k;
+    size_t kv_head_stride_v = ctx->kv_head_stride_v;
     
     /* Per-Q-head softmax state (kv_mul up to 8) */
     assert(kv_mul <= 8 && head_dim <= 256 && "attention_group: stack arrays too small for this model");
@@ -1837,8 +1866,9 @@ static void attention_group(int kv_head_idx, void *ctx_ptr) {
         for (int d = 0; d < head_dim; d++) acc[g][d] = 0.0f;
 
     for (int t = 0; t <= pos; t++) {
-        const uint8_t *kt = ctx->kcache + (size_t)t * ctx->n_kv_heads * ctx->kv_row_size_k + kv_h * ctx->kv_row_size_k;
-        const uint8_t *vt = ctx->vcache + (size_t)t * ctx->n_kv_heads * ctx->kv_row_size_v + kv_h * ctx->kv_row_size_v;
+        /* GQA layout: [pos] * kv_row_size_k + head * kv_head_stride_k */
+        const uint8_t *kt = ctx->kcache + (size_t)t * ctx->kv_row_size_k + kv_h * kv_head_stride_k;
+        const uint8_t *vt = ctx->vcache + (size_t)t * ctx->kv_row_size_v + kv_h * kv_head_stride_v;
 
 #ifdef PICOLM_AVX512
         /* AVX-512 fast path: dequantize K and V to F32 vectors,
@@ -2177,8 +2207,9 @@ float *model_forward(model_t *m, int token, int pos) {
         tensor_set_repacked(NULL);
 
         int this_attn_ordinal = attn_ordinal++;
-        uint8_t *kcache_layer = s->key_cache + (size_t)this_attn_ordinal * seq_len * c->n_kv_heads * s->kv_row_size_k;
-        uint8_t *vcache_layer = s->val_cache + (size_t)this_attn_ordinal * seq_len * c->n_kv_heads * s->kv_row_size_v;
+        /* GQA layout: kcache_layer points to this layer's K cache [seq_len][kv_row_size_gqa] */
+        uint8_t *kcache_layer = s->key_cache + (size_t)this_attn_ordinal * seq_len * s->kv_row_size_k;
+        uint8_t *vcache_layer = s->val_cache + (size_t)this_attn_ordinal * seq_len * s->kv_row_size_v;
 
         /* QK-norm (Qwen3): per-head RMSNorm applied before RoPE */
         if (lw->attn_q_norm) {
@@ -2195,30 +2226,36 @@ float *model_forward(model_t *m, int token, int pos) {
         int rope_half = rope_dim / 2;
         rope(s->q, k_tmp, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos, c->rope_type, rope_half);
 
-        /* Store K per head */
-        for (int hkv = 0; hkv < n_kv_heads; hkv++) {
-            float *k_head = k_tmp + hkv * head_dim;
-            uint8_t *key_pos = kcache_layer + (size_t)pos * c->n_kv_heads * s->kv_row_size_k
-                              + hkv * s->kv_row_size_k;
+        /* Store K: GQA row quantization
+         * For quantized types, quantize the full GQA row (n_kv_heads*head_dim) at once.
+         * For FP16, store each head's FP16 data at its offset within the row. */
+        {
+            uint8_t *key_pos = kcache_layer + (size_t)pos * s->kv_row_size_k;
             if (s->kv_type_k == KV_CACHE_Q8_0) {
-                quantize_row_q8_0(k_head, key_pos, head_dim);
+                /* Quantize full GQA row at once */
+                quantize_row_q8_0(k_tmp, key_pos, kv_dim);
             } else if (s->kv_type_k == KV_CACHE_Q4_0) {
-                quantize_row_q4_0(k_head, key_pos, head_dim);
+                /* Quantize full GQA row at once */
+                quantize_row_q4_0(k_tmp, key_pos, kv_dim);
             } else {
-                uint16_t *kf = (uint16_t *)key_pos;
+                /* FP16: store each head at its offset within the GQA row */
+                for (int hkv = 0; hkv < n_kv_heads; hkv++) {
+                    float *k_head = k_tmp + hkv * head_dim;
+                    uint16_t *kf = (uint16_t *)(key_pos + hkv * s->kv_head_stride_k);
 #ifdef PICOLM_FP16_HW
-                { int d = 0;
-                  for (; d + 3 < head_dim; d += 4)
-                      f32x4_to_fp16_hw(kf + d, vld1q_f32(k_head + d));
-                  for (; d < head_dim; d++) kf[d] = fp32_to_fp16(k_head[d]);
-                }
+                    { int d = 0;
+                      for (; d + 3 < head_dim; d += 4)
+                          f32x4_to_fp16_hw(kf + d, vld1q_f32(k_head + d));
+                      for (; d < head_dim; d++) kf[d] = fp32_to_fp16(k_head[d]);
+                    }
 #else
-                for (int d = 0; d < head_dim; d++) kf[d] = fp32_to_fp16(k_head[d]);
+                    for (int d = 0; d < head_dim; d++) kf[d] = fp32_to_fp16(k_head[d]);
 #endif
+                }
             }
         }
 
-        /* V projection -> store per head */
+        /* V projection -> store */
         tensor_set_repacked(m->repack_used[ri+2] ? m->repack_buffers[ri+2] : NULL);
 #ifdef PICOLM_GPU
         if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->attn_v, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
@@ -2226,25 +2263,27 @@ float *model_forward(model_t *m, int token, int pos) {
         float *v_tmp = s->xb2;
         matmul(v_tmp, s->xb, lw->attn_v, dim, kv_dim, lw->type_attn_v);
         tensor_set_repacked(NULL);
-        for (int hkv = 0; hkv < n_kv_heads; hkv++) {
-            float *v_head = v_tmp + hkv * head_dim;
-            uint8_t *val_pos = vcache_layer + (size_t)pos * c->n_kv_heads * s->kv_row_size_v
-                              + hkv * s->kv_row_size_v;
+        /* Store V: GQA row quantization */
+        {
+            uint8_t *val_pos = vcache_layer + (size_t)pos * s->kv_row_size_v;
             if (s->kv_type_v == KV_CACHE_Q8_0) {
-                quantize_row_q8_0(v_head, val_pos, head_dim);
+                quantize_row_q8_0(v_tmp, val_pos, kv_dim);
             } else if (s->kv_type_v == KV_CACHE_Q4_0) {
-                quantize_row_q4_0(v_head, val_pos, head_dim);
+                quantize_row_q4_0(v_tmp, val_pos, kv_dim);
             } else {
-                uint16_t *vf = (uint16_t *)val_pos;
+                for (int hkv = 0; hkv < n_kv_heads; hkv++) {
+                    float *v_head = v_tmp + hkv * head_dim;
+                    uint16_t *vf = (uint16_t *)(val_pos + hkv * s->kv_head_stride_v);
 #ifdef PICOLM_FP16_HW
-                { int d = 0;
-                  for (; d + 3 < head_dim; d += 4)
-                      f32x4_to_fp16_hw(vf + d, vld1q_f32(v_head + d));
-                  for (; d < head_dim; d++) vf[d] = fp32_to_fp16(v_head[d]);
-                }
+                    { int d = 0;
+                      for (; d + 3 < head_dim; d += 4)
+                          f32x4_to_fp16_hw(vf + d, vld1q_f32(v_head + d));
+                      for (; d < head_dim; d++) vf[d] = fp32_to_fp16(v_head[d]);
+                    }
 #else
-                for (int d = 0; d < head_dim; d++) vf[d] = fp32_to_fp16(v_head[d]);
+                    for (int d = 0; d < head_dim; d++) vf[d] = fp32_to_fp16(v_head[d]);
 #endif
+                }
             }
         }
 
@@ -2272,6 +2311,7 @@ float *model_forward(model_t *m, int token, int pos) {
         gctx.kv_mul = kv_mul; gctx.head_dim = head_dim; gctx.pos = pos;
         gctx.kv_type_k = s->kv_type_k; gctx.kv_type_v = s->kv_type_v;
         gctx.kv_row_size_k = s->kv_row_size_k; gctx.kv_row_size_v = s->kv_row_size_v;
+        gctx.kv_head_stride_k = s->kv_head_stride_k; gctx.kv_head_stride_v = s->kv_head_stride_v;
         gctx.kcache = kcache_layer; gctx.vcache = vcache_layer;
         gctx.q = s->q; gctx.xb = s->xb;
         gctx.n_kv_heads = c->n_kv_heads;
@@ -4881,6 +4921,7 @@ typedef struct {
     int n_heads, n_kv_heads, kv_mul, head_dim, start_pos;
     int kv_type_k, kv_type_v;
     size_t kv_row_size_k, kv_row_size_v;
+    size_t kv_head_stride_k, kv_head_stride_v;
     const uint8_t *kcache, *vcache;
     const float *q_batch;   /* [n_tokens][n_heads * head_dim] */
     float *xb_batch;        /* [n_tokens][xb_stride] */
@@ -4896,8 +4937,10 @@ static void prefill_attn_task(int flat_idx, void *ctx_ptr) {
     const float *qh = ctx->q_batch + (size_t)bi * ctx->n_heads * ctx->head_dim + h * ctx->head_dim;
     float *xbh = ctx->xb_batch + (size_t)bi * ctx->xb_stride + h * ctx->head_dim;
     attn_core(xbh, qh, kv_h, pos, ctx->kcache, ctx->vcache,
-              ctx->n_kv_heads, ctx->kv_type_k, ctx->kv_type_v,
-              ctx->kv_row_size_k, ctx->kv_row_size_v, ctx->head_dim);
+              ctx->kv_type_k, ctx->kv_type_v,
+              ctx->kv_row_size_k, ctx->kv_row_size_v,
+              ctx->kv_head_stride_k, ctx->kv_head_stride_v,
+              ctx->head_dim);
 }
 
 /* Tiled attention: tile size in KV positions */
@@ -4911,7 +4954,8 @@ static void batch_attention_tiled(
         int n_heads, int n_kv_heads, int head_dim,
         int xb_stride,
         kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v,
-        size_t kv_row_size_k, size_t kv_row_size_v);
+        size_t kv_row_size_k, size_t kv_row_size_v,
+        size_t kv_head_stride_k, size_t kv_head_stride_v);
 
 static void batch_attention_layer(
         float *xb_batch, const float *q_batch,
@@ -4920,7 +4964,8 @@ static void batch_attention_layer(
         int n_heads, int n_kv_heads, int head_dim,
         int xb_stride,
         int kv_type_k, int kv_type_v,
-        size_t kv_row_size_k, size_t kv_row_size_v)
+        size_t kv_row_size_k, size_t kv_row_size_v,
+        size_t kv_head_stride_k, size_t kv_head_stride_v)
 {
     /* Build the prefill_attn_ctx for both the original path and the test */
     prefill_attn_ctx_t ctx;
@@ -4928,6 +4973,7 @@ static void batch_attention_layer(
     ctx.head_dim = head_dim; ctx.start_pos = start_pos;
     ctx.kv_type_k = kv_type_k; ctx.kv_type_v = kv_type_v;
     ctx.kv_row_size_k = kv_row_size_k; ctx.kv_row_size_v = kv_row_size_v;
+    ctx.kv_head_stride_k = kv_head_stride_k; ctx.kv_head_stride_v = kv_head_stride_v;
     ctx.kcache = kcache; ctx.vcache = vcache;
     ctx.q_batch = q_batch; ctx.xb_batch = xb_batch; ctx.xb_stride = xb_stride;
 
@@ -4945,7 +4991,8 @@ static void batch_attention_layer(
                               n_heads, n_kv_heads, head_dim,
                               xb_stride,
                               (kv_cache_type_t)kv_type_k, (kv_cache_type_t)kv_type_v,
-                              kv_row_size_k, kv_row_size_v);
+                              kv_row_size_k, kv_row_size_v,
+                              kv_head_stride_k, kv_head_stride_v);
         return;
     }
 
@@ -5011,7 +5058,8 @@ typedef struct {
     int is_diagonal;        /* 1 if this tile needs causal masking */
 
     gguf_type_t kv_gguf_k;  /* gguf_type for this kv cache type */
-    size_t kv_row_size_k;   /* bytes per KV head row in cache */
+    size_t kv_row_size_k;   /* bytes per GQA row in cache */
+    size_t kv_head_stride_k;/* bytes per head within GQA row */
     const uint8_t *kcache;  /* layer K cache base */
     const float *q_rows;    /* [n_q_rows x head_dim] query vectors */
     float *scores;          /* [n_q_rows x tile_size] score buffer */
@@ -5034,18 +5082,19 @@ static void attn_process_tile(attn_tile_task_t *t) {
     int kv_tile_start = t->kv_tile_start;
     int group_token_start = t->group_token_start;
 
-    /* Extract K-tile from interleaved KV cache into contiguous scratch.
-     * KV cache layout: [pos][n_kv_heads][kv_row_size_k]
+    /* Extract K-tile from GQA KV cache into contiguous scratch.
+     * KV cache layout: [pos][kv_row_size_gqa] with head offset = kv_h * kv_head_stride_k
      * For positions [kv_tile_start, kv_tile_start+ts), head kv_h: */
     {
-        size_t rb = t->kv_row_size_k;
+        size_t rb = t->kv_head_stride_k;
+        size_t row_stride = t->kv_row_size_k;
         int gguf_k = t->kv_gguf_k;
         size_t k_rb_gguf = gguf_type_row_size(gguf_k, hd);
         /* K tile: ts positions, each rb bytes from cache, copied to
          * contiguous buffer with stride k_rb_gguf. For F16 this is
          * the same size and just a memcpy; for Q8_0/Q4_0 also same. */
         for (int p = 0; p < ts; p++) {
-            const uint8_t *src = t->kcache + (size_t)(kv_tile_start + p) * t->n_kv_heads * rb
+            const uint8_t *src = t->kcache + (size_t)(kv_tile_start + p) * row_stride
                                + t->kv_h * rb;
             uint8_t *dst = (uint8_t *)t->tile_k + (size_t)p * k_rb_gguf;
             memcpy(dst, src, rb);
@@ -5156,8 +5205,10 @@ static void batch_attention_tiled(
         int n_heads, int n_kv_heads, int head_dim,
         int xb_stride,
         kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v,
-        size_t kv_row_size_k, size_t kv_row_size_v)
+        size_t kv_row_size_k, size_t kv_row_size_v,
+        size_t kv_head_stride_k, size_t kv_head_stride_v)
 {
+    (void)kv_head_stride_v;  /* V tile uses F32 dequant, no head stride needed */
     int kv_mul = n_heads / n_kv_heads;
     int tile = ATTN_TILE;
 
@@ -5299,6 +5350,7 @@ static void batch_attention_tiled(
                     task.is_diagonal = is_diag;
                     task.kv_gguf_k = gguf_k;
                     task.kv_row_size_k = kv_row_size_k;
+                    task.kv_head_stride_k = kv_head_stride_k;
                     task.kcache = kcache;
                     task.q_rows = q_rows;
                     task.scores = scores;
@@ -5898,8 +5950,9 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         /* Per-position: RoPE, KV store */
         {
             int this_attn_ord = c->has_ssm ? attn_ordinal++ : l;
-            uint8_t *kcl = s->key_cache + (size_t)this_attn_ord * seq_len * c->n_kv_heads * s->kv_row_size_k;
-            uint8_t *vcl = s->val_cache + (size_t)this_attn_ord * seq_len * c->n_kv_heads * s->kv_row_size_v;
+            /* GQA layout: [layer][pos] * kv_row_size_gqa */
+            uint8_t *kcl = s->key_cache + (size_t)this_attn_ord * seq_len * s->kv_row_size_k;
+            uint8_t *vcl = s->val_cache + (size_t)this_attn_ord * seq_len * s->kv_row_size_v;
                         for (bi = 0; bi < n_tokens; bi++) {
                 int pos = start_pos + bi;
                 float *q_pos = q_batch + bi * q_dim;
@@ -5923,27 +5976,34 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                 int rope_half_pf = rope_dim_pf / 2;
                 rope(q_pos, k_pos, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos, c->rope_type, rope_half_pf);
 
-                /* KV cache store (respect kv_type_k/v) */
-                for (int hkv = 0; hkv < n_kv_heads; hkv++) {
-                    float *k_head = k_pos + hkv * head_dim;
-                    float *v_head = v_pos + hkv * head_dim;
-                    uint8_t *kp = kcl + (size_t)pos * c->n_kv_heads * s->kv_row_size_k + hkv * s->kv_row_size_k;
-                    uint8_t *vp = vcl + (size_t)pos * c->n_kv_heads * s->kv_row_size_v + hkv * s->kv_row_size_v;
+                /* KV cache store: GQA row quantization */
+                {
+                    uint8_t *kp = kcl + (size_t)pos * s->kv_row_size_k;
+                    uint8_t *vp = vcl + (size_t)pos * s->kv_row_size_v;
                     if (s->kv_type_k == KV_CACHE_Q8_0) {
-                        quantize_row_q8_0(k_head, kp, head_dim);
+                        quantize_row_q8_0(k_pos, kp, kv_dim);
                     } else if (s->kv_type_k == KV_CACHE_Q4_0) {
-                        quantize_row_q4_0(k_head, kp, head_dim);
+                        quantize_row_q4_0(k_pos, kp, kv_dim);
                     } else {
-                        for (int d2 = 0; d2 < head_dim; d2++)
-                            ((uint16_t*)kp)[d2] = fp32_to_fp16(k_head[d2]);
+                        /* FP16: store each head at its offset within the GQA row */
+                        for (int hkv = 0; hkv < n_kv_heads; hkv++) {
+                            float *k_head = k_pos + hkv * head_dim;
+                            uint16_t *kf = (uint16_t *)(kp + hkv * s->kv_head_stride_k);
+                            for (int d2 = 0; d2 < head_dim; d2++)
+                                kf[d2] = fp32_to_fp16(k_head[d2]);
+                        }
                     }
                     if (s->kv_type_v == KV_CACHE_Q8_0) {
-                        quantize_row_q8_0(v_head, vp, head_dim);
+                        quantize_row_q8_0(v_pos, vp, kv_dim);
                     } else if (s->kv_type_v == KV_CACHE_Q4_0) {
-                        quantize_row_q4_0(v_head, vp, head_dim);
+                        quantize_row_q4_0(v_pos, vp, kv_dim);
                     } else {
-                        for (int d2 = 0; d2 < head_dim; d2++)
-                            ((uint16_t*)vp)[d2] = fp32_to_fp16(v_head[d2]);
+                        for (int hkv = 0; hkv < n_kv_heads; hkv++) {
+                            float *v_head = v_pos + hkv * head_dim;
+                            uint16_t *vf = (uint16_t *)(vp + hkv * s->kv_head_stride_v);
+                            for (int d2 = 0; d2 < head_dim; d2++)
+                                vf[d2] = fp32_to_fp16(v_head[d2]);
+                        }
                     }
                 }
             }
@@ -5962,7 +6022,8 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                                   n_tokens, start_pos,
                                   n_heads, c->n_kv_heads, head_dim,
                                   max_dim, (int)s->kv_type_k, (int)s->kv_type_v,
-                                  s->kv_row_size_k, s->kv_row_size_v);
+                                  s->kv_row_size_k, s->kv_row_size_v,
+                                  s->kv_head_stride_k, s->kv_head_stride_v);
         }
 
         /* Apply Qwen3.5 attention gate (sigmoid, element-wise multiply on attention output before proj) */
@@ -6096,9 +6157,9 @@ int kvcache_save(const model_t *m, const char *path, int n_pos) {
         return -1;
     }
 
-    /* Version 2 header */
+    /* Version 3 header: GQA full-row layout */
     uint32_t header[7] = {
-        KVCACHE_MAGIC | 0x00000002,
+        KVCACHE_MAGIC | 0x00000003,
         (uint32_t)n_pos,
         (uint32_t)c->n_layers,
         (uint32_t)c->n_kv_heads,
@@ -6108,8 +6169,9 @@ int kvcache_save(const model_t *m, const char *path, int n_pos) {
     };
     fwrite(header, sizeof(uint32_t), 7, f);
 
-    size_t pos_stride_k = (size_t)c->n_kv_heads * s->kv_row_size_k;
-    size_t pos_stride_v = (size_t)c->n_kv_heads * s->kv_row_size_v;
+    /* GQA layout: pos_stride = kv_row_size_gqa (all KV heads in one row) */
+    size_t pos_stride_k = s->kv_row_size_k;
+    size_t pos_stride_v = s->kv_row_size_v;
     for (int l = 0; l < c->n_layers; l++) {
         const uint8_t *kcache_l = s->key_cache + (size_t)l * seq_len * pos_stride_k;
         for (int p = 0; p < n_pos; p++) {
@@ -6176,8 +6238,9 @@ int kvcache_load(model_t *m, const char *path) {
         return 0;
     }
 
-    size_t pos_stride_k = (size_t)c->n_kv_heads * s->kv_row_size_k;
-    size_t pos_stride_v = (size_t)c->n_kv_heads * s->kv_row_size_v;
+    /* GQA layout: pos_stride = kv_row_size_gqa */
+    size_t pos_stride_k = s->kv_row_size_k;
+    size_t pos_stride_v = s->kv_row_size_v;
     for (int l = 0; l < c->n_layers; l++) {
         uint8_t *kcache_l = s->key_cache + (size_t)l * seq_len * pos_stride_k;
         for (int p = 0; p < n_pos; p++) {

@@ -176,8 +176,10 @@ typedef struct {
     /* KV cache metadata */
     kv_cache_type_t kv_type_k;
     kv_cache_type_t kv_type_v;
-    size_t kv_row_size_k;  /* bytes per head row of K */
-    size_t kv_row_size_v;  /* bytes per head row of V */
+    size_t kv_row_size_k;   /* bytes per GQA row of K (all KV heads concatenated) */
+    size_t kv_row_size_v;   /* bytes per GQA row of V (all KV heads concatenated) */
+    size_t kv_head_stride_k;/* bytes per head within a GQA row (for attention reads) */
+    size_t kv_head_stride_v;/* bytes per head within a GQA row (for attention reads) */
 
     float *dequant_scratch; /* scratch for matmul dequant [max(n_embd, n_ffn)] */
 
