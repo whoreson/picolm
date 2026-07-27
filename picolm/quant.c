@@ -3463,6 +3463,7 @@ float vec_dot_q1_0_q8_0(const void *vx, const void *wy, int n) {
      * Uses 4 independent __m128 accumulators for the 4 Q8_0 sub-blocks.
      * Ported from llama.cpp. */
     {
+        float sumf;
         const __m128i ones_8  = _mm_set1_epi8(1);
         const __m128i ones_16 = _mm_set1_epi16(1);
         const __m128i byte_shuf = _mm_setr_epi8(
