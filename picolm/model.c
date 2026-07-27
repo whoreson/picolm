@@ -3966,7 +3966,7 @@ static void ssm_chunked_recurrence(
     for (int ci = 0; ci < n_chunks; ci++) {
         int cs_actual = (ci == n_chunks - 1) ? (n_tokens - ci * cs) : cs;
         if (cs_actual <= 0) break;
-        int chunk_start = ci * cs_actual;
+        int chunk_start = ci * cs;
 
         /* Gather Q, K, V, beta, gate_log for this chunk.
          * Layout: [n_heads][cs_actual][d] for Q/K/V, [n_v_heads][cs_actual] for scalars. */
