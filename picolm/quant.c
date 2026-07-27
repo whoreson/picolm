@@ -2237,7 +2237,7 @@ float vec_dot_q5_K_q8_K(const void *src_q5, const void *src_q8, int n) {
     for (int i = 0; i < nb; ++i) {
         const uint8_t *q5 = x[i].qs;
         const int8_t  *q8 = y[i].qs;
-        const float d = y[i].d * fp16_to_fp32_lookup(x[i].dm);
+        const float d = y[i].d * fp16_to_fp32_lookup(x[i].d);
         const float dmin = -y[i].d * fp16_to_fp32_lookup(x[i].dm);
 
         memcpy(utmp, x[i].scales, 12);
@@ -2303,7 +2303,7 @@ float vec_dot_q5_K_q8_K(const void *src_q5, const void *src_q8, int n) {
     float summs = 0.0f;
 
     for (int i = 0; i < nb; ++i) {
-        const float d = y[i].d * fp16_to_fp32_lookup(x[i].dm);
+        const float d = y[i].d * fp16_to_fp32_lookup(x[i].d);
         const float dmin = -y[i].d * fp16_to_fp32_lookup(x[i].dm);
         const uint8_t *q5 = x[i].qs;
         const int8_t  *q8 = y[i].qs;
@@ -2386,7 +2386,7 @@ float vec_dot_q5_K_q8_K(const void *src_q5, const void *src_q8, int n) {
 #else
     float sumf = 0.0f;
     for (int i = 0; i < nb; i++) {
-        float dl = fp16_to_fp32_lookup(x[i].dm);
+        float dl = fp16_to_fp32_lookup(x[i].d);
         float dml = fp16_to_fp32_lookup(x[i].dm);
         const uint8_t *q5 = x[i].qs;
         const uint8_t *qh = x[i].qh;
