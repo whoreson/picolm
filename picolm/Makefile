@@ -35,6 +35,7 @@ _have_avx    = $(shell echo | $(CC) -E -dM $(1) - 2>/dev/null | grep -c '__AVX__
 _have_sse3   = $(shell echo | $(CC) -E -dM $(1) - 2>/dev/null | grep -c '__SSSE3__')
 _have_sse2   = $(shell echo | $(CC) -E -dM $(1) - 2>/dev/null | grep -c '__SSE2__')
 _have_fma    = $(shell echo | $(CC) -E -dM $(1) - 2>/dev/null | grep -c '__FMA__')
+_have_f16c   = $(shell echo | $(CC) -E -dM $(1) - 2>/dev/null | grep -c '__F16C__')
 
 # Pick the highest SIMD level and emit the right -DPICOLM_* preprocessor defines.
 # Cascading if/elif/else: only the first (highest) matching level is emitted.
@@ -54,13 +55,17 @@ simd_defines_for = $(strip \
 # Emit the right -m* compiler flags for the detected SIMD level.
 # Used alongside -march=native to ensure inline intrinsics compile correctly
 # (mingw sometimes needs explicit feature flags).
+# Note: F16C is NOT implied by AVX. Bulldozer/Piledriver have AVX without F16C.
+# We detect F16C separately and only add -mf16c when the CPU actually supports it.
+# The $(1) argument is -march=native, so _have_f16c checks the actual CPU.
+f16c_flag = $(if $(filter 1,$(call _have_f16c,$(1))),-mf16c,)
 simd_flags_for = $(strip \
   $(if $(filter 1,$(call _have_avx512,$(1))),\
-    -mavx512f -mavx512vl -mf16c -mbmi2 -mfma,\
+    -mavx512f -mavx512vl $(call f16c_flag,$(1)) -mbmi2 -mfma,\
     $(if $(filter 1,$(call _have_avx2,$(1))),\
-      -mavx2 -mfma -mf16c -mbmi2,\
+      -mavx2 -mfma $(call f16c_flag,$(1)) -mbmi2,\
       $(if $(filter 1,$(call _have_avx,$(1))),\
-        -mavx -mf16c,\
+        -mavx $(call f16c_flag,$(1)),\
         $(if $(filter 1,$(call _have_sse3,$(1))),\
           -mssse3 -mpopcnt,\
           )))))
