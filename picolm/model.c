@@ -474,113 +474,145 @@ static const char *gguf_type_name(uint32_t type) {
 }
 
 int model_list_tensors(const char *path) {
-    uint8_t *addr;
-    size_t fsize;
+    uint8_t *addr = NULL;
+    size_t fsize = 0;
+    char *buf = NULL;
+    int rc = -1;
 #ifdef _WIN32
-    HANDLE fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
-                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE fh = INVALID_HANDLE_VALUE;
+    HANDLE mh = NULL;
+#else
+    int fd = -1;
+#endif
+
+#ifdef _WIN32
+    fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                     OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (fh == INVALID_HANDLE_VALUE) {
         fprintf(stderr, "Cannot open file: %s\n", path);
         return -1;
     }
 
-    LARGE_INTEGER ls;
-    GetFileSizeEx(fh, &ls);
-    fsize = (size_t)ls.QuadPart;
+    { LARGE_INTEGER ls;
+      GetFileSizeEx(fh, &ls);
+      fsize = (size_t)ls.QuadPart; }
 
-    HANDLE mh = CreateFileMappingA(fh, NULL, PAGE_READONLY, 0, 0, NULL);
+    mh = CreateFileMappingA(fh, NULL, PAGE_READONLY, 0, 0, NULL);
     if (!mh) {
         fprintf(stderr, "CreateFileMapping failed\n");
-        CloseHandle(fh);
-        return -1;
+        goto out;
     }
 
     addr = MapViewOfFile(mh, FILE_MAP_READ, 0, 0, 0);
     if (!addr) {
         fprintf(stderr, "MapViewOfFile failed\n");
-        CloseHandle(mh);
-        CloseHandle(fh);
-        return -1;
+        goto out;
     }
 #else
-    int fd = open(path, O_RDONLY);
+    fd = open(path, O_RDONLY);
     if (fd < 0) { perror("open"); return -1; }
 
-    struct stat st;
-    if (fstat(fd, &st) < 0) { close(fd); return -1; }
-
-    addr = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (addr == MAP_FAILED) { close(fd); return -1; }
-    fsize = (size_t)st.st_size;
+    { struct stat st;
+      if (fstat(fd, &st) < 0) goto out;
+      addr = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+      if (addr == MAP_FAILED) { addr = NULL; goto out; }
+      fsize = (size_t)st.st_size; }
 #endif
 
     reader_t r = { .data = addr, .pos = 0, .size = fsize };
 
-    uint32_t magic = read_u32(&r);
-    if (magic != GGUF_MAGIC) {
-        fprintf(stderr, "Invalid GGUF magic: 0x%08X\n", magic);
-#ifdef _WIN32
-        UnmapViewOfFile(addr); CloseHandle(mh); CloseHandle(fh);
-#else
-        munmap(addr, fsize); close(fd);
-#endif
-        return -1;
-    }
+    { uint32_t magic = read_u32(&r);
+      if (magic != GGUF_MAGIC) {
+          fprintf(stderr, "Invalid GGUF magic: 0x%08X\n", magic);
+          goto out;
+      } }
 
     uint32_t version = read_u32(&r);
     uint64_t n_tensors = read_u64(&r);
     uint64_t n_metadata = read_u64(&r);
 
-    fprintf(stderr, "GGUF v%u: %" PRIu64 " metadata entries, %" PRIu64 " tensors\n\n",
-            version, n_metadata, n_tensors);
-
     /* Skip metadata */
     for (uint64_t i = 0; i < n_metadata; i++) {
-        gguf_str_t key = read_gguf_string(&r); (void)key;
+        (void)read_gguf_string(&r);
         uint32_t vtype = read_u32(&r);
         int dummy;
         skip_meta_value(&r, vtype, &dummy);
     }
 
-    /* Print tensor list */
-    fprintf(stderr, "%-52s %14s %-12s %s\n", "Name", "Shape", "Type", "Type ID");
-    fprintf(stderr, "%-52s %14s %-12s %s\n", "----", "----", "----", "-------");
+    /*
+     * Build the entire output (GGUF header + tensor table) into a buffer,
+     * then write it in a single fwrite() to avoid the "bit-bang"
+     * one-write-per-line problem when stdout is redirected to a slow
+     * destination (e.g. network share).
+     */
+    { size_t buf_size = 128 + (n_tensors + 2) * 96;
+      buf = malloc(buf_size);
+      if (!buf) {
+          fprintf(stderr, "error: out of memory\n");
+          goto out;
+      }
 
-    for (uint64_t i = 0; i < n_tensors; i++) {
-        gguf_str_t name = read_gguf_string(&r);
-        uint32_t n_dims = read_u32(&r);
-        uint64_t dims[4] = {0};
-        for (uint32_t d = 0; d < n_dims; d++) dims[d] = read_u64(&r);
-        uint32_t type = read_u32(&r);
-        uint64_t offset = read_u64(&r); (void)offset;
+      size_t pos = 0;
+      /* Safe append macro: clamps on truncation */
+      #define APPEND(fmt, ...) do {                                          \
+          int _r = snprintf(buf + pos, buf_size - pos, fmt, __VA_ARGS__);    \
+          if (_r > 0) pos += (size_t)_r < (buf_size - pos) ? (size_t)_r : 0; \
+      } while (0)
 
-        char nbuf[56];
-        size_t nlen = name.len < sizeof(nbuf) ? name.len : sizeof(nbuf);
-        memcpy(nbuf, name.str, nlen);
-        nbuf[nlen] = '\0';
-        if (name.len >= sizeof(nbuf)) { nbuf[nlen-4] = '.'; nbuf[nlen-3] = '.'; nbuf[nlen-2] = '.'; }
+      APPEND("GGUF v%u: %" PRIu64 " metadata entries, %" PRIu64 " tensors\n\n",
+             version, n_metadata, n_tensors);
+      APPEND("%-52s %14s %-12s %s\n", "Name", "Shape", "Type", "Type ID");
+      APPEND("%-52s %14s %-12s %s\n", "----", "----", "----", "-------");
 
-        char dstr[16];
-        snprintf(dstr, sizeof(dstr), "[%" PRIu64, dims[0]);
-        for (uint32_t d = 1; d < n_dims; d++) {
-            char tmp[12];
-            snprintf(tmp, sizeof(tmp), ",%" PRIu64, dims[d]);
-            strncat(dstr, tmp, sizeof(dstr) - strlen(dstr) - 1);
-        }
-        strncat(dstr, "]", sizeof(dstr) - strlen(dstr) - 1);
+      for (uint64_t i = 0; i < n_tensors; i++) {
+          gguf_str_t name = read_gguf_string(&r);
+          uint32_t n_dims = read_u32(&r);
+          uint64_t dims[4] = {0};
+          for (uint32_t d = 0; d < n_dims; d++) dims[d] = read_u64(&r);
+          uint32_t type = read_u32(&r);
+          (void)read_u64(&r); /* offset */
 
-        fprintf(stderr, "%-52s %14s %-12s %u\n", nbuf, dstr, gguf_type_name(type), type);
+          char nbuf[56];
+          size_t nlen = name.len < sizeof(nbuf) ? name.len : sizeof(nbuf);
+          memcpy(nbuf, name.str, nlen);
+          nbuf[nlen] = '\0';
+          if (name.len >= sizeof(nbuf)) {
+              nbuf[nlen-4] = '.'; nbuf[nlen-3] = '.'; nbuf[nlen-2] = '.';
+          }
+
+          /* Build shape string with pointer arithmetic instead of strncat */
+          char dstr[16];
+          char *dp = dstr;
+          int drem = (int)(sizeof(dstr) - 1);
+          int n = snprintf(dp, drem + 1, "[%" PRIu64, dims[0]);
+          if (n > 0 && n < drem) { dp += n; drem -= n; }
+          for (uint32_t d = 1; d < n_dims && drem > 1; d++) {
+              n = snprintf(dp, drem + 1, ",%" PRIu64, dims[d]);
+              if (n > 0 && n < drem) { dp += n; drem -= n; } else break;
+          }
+          if (drem > 0) { *dp = ']'; dp++; }
+          *dp = '\0';
+
+          APPEND("%-52s %14s %-12s %u\n", nbuf, dstr, gguf_type_name(type), type);
+      }
+      #undef APPEND
+
+      fwrite(buf, 1, pos, stdout);
+      fflush(stdout);
     }
 
-    #ifdef _WIN32
-    UnmapViewOfFile(addr);
-    CloseHandle(mh);
-    CloseHandle(fh);
+    rc = 0;
+out:
+    free(buf);
+#ifdef _WIN32
+    if (addr) UnmapViewOfFile(addr);
+    if (mh) CloseHandle(mh);
+    if (fh != INVALID_HANDLE_VALUE) CloseHandle(fh);
 #else
-    munmap(addr, fsize);
-    close(fd);
+    if (addr) munmap(addr, fsize);
+    if (fd >= 0) close(fd);
 #endif
-    return 0;
+    return rc;
 }
 
 /* ---- GGUF Parser ---- */
