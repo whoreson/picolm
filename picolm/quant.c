@@ -1490,7 +1490,7 @@ void quantize_row_q8_0(const float *x, void *dst, int n) {
         y[i].d = fp32_to_fp16(d);
         float id = (asmax != 0.0f) ? 127.0f / asmax : 0.0f;
         for (int j = 0; j < 32; j++) {
-            int v = (int)(x[j] * id);
+            int v = (int)lroundf(x[j] * id);
             if (v > 127) v = 127;
             if (v < -127) v = -128;
             y[i].qs[j] = (int8_t)v;
