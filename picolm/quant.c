@@ -4487,7 +4487,9 @@ void vec_dot_q4_0x8_q8_0_avx2(const void *vx, const void *wy, int n, float *out,
 #endif
 }
 
-/* ---- quantize_row_q4_0: FP32 -> Q4_0 blocks ---- */
+/* ---- quantize_row_q4_0: FP32 -> Q4_0 blocks ----
+ * Clamps each quantized value to [0, 15] to prevent 4-bit overflow.
+ * Matches llama.cpp's MIN(15, ...) clamping in quantize_row_q4_0_ref. */
 void quantize_row_q4_0(const float *x, void *dst, int n) {
     block_q4_0 *blocks = (block_q4_0 *)dst;
     int nb = n / 32;
@@ -4506,6 +4508,8 @@ void quantize_row_q4_0(const float *x, void *dst, int n) {
         for (int j = 0; j < 16; j++) {
             uint8_t v0 = (uint8_t)(b[j * 2] * id + 8.5f);
             uint8_t v1 = (uint8_t)(b[j * 2 + 1] * id + 8.5f);
+            if (v0 > 15) v0 = 15;
+            if (v1 > 15) v1 = 15;
             q[j] = v0 | (v1 << 4);
         }
     }

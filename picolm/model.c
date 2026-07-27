@@ -1841,22 +1841,39 @@ static void attention_group(int kv_head_idx, void *ctx_ptr) {
         const uint8_t *vt = ctx->vcache + (size_t)t * ctx->n_kv_heads * ctx->kv_row_size_v + kv_h * ctx->kv_row_size_v;
 
 #ifdef PICOLM_AVX512
-        /* Load K once, convert to F32 (16 F16 per chunk via fp16x16_to_fp32_inline) */
-        __m512 k_vec[16]; /* head_dim up to 256 = 16x __m512 */
-        {
+        /* AVX-512 fast path: dequantize K and V to F32 vectors,
+         * then use FMA-based attention math. Supports FP16, Q8_0, Q4_0.
+         * FP16 uses SIMD fp16x16_to_fp32_inline for speed;
+         * Q8_0/Q4_0 use scalar dequant (head_dim is small, overhead is OK). */
+        float k_f32[256], v_f32[256];
+        if (ctx->kv_type_k == KV_CACHE_Q8_0) {
+            dequantize_row_q8_0(kt, k_f32, head_dim);
+        } else if (ctx->kv_type_k == KV_CACHE_Q4_0) {
+            dequantize_row_q4_0(kt, k_f32, head_dim);
+        } else {
+            /* FP16: SIMD-accelerated conversion */
             const uint16_t *k16 = (const uint16_t *)kt;
             int d = 0;
-            for (; d + 16 <= head_dim; d += 16)
-                k_vec[d/16] = fp16x16_to_fp32_inline(k16 + d);
+            for (; d + 16 <= head_dim; d += 16) {
+                __m512 kf = fp16x16_to_fp32_inline(k16 + d);
+                _mm512_storeu_ps(k_f32 + d, kf);
+            }
+            for (; d < head_dim; d++) k_f32[d] = fp16_to_fp32(k16[d]);
         }
 
-        /* Load V once, convert to F32 */
-        __m512 v_vec[16]; /* head_dim up to 256 = 16x __m512 */
-        {
+        if (ctx->kv_type_v == KV_CACHE_Q8_0) {
+            dequantize_row_q8_0(vt, v_f32, head_dim);
+        } else if (ctx->kv_type_v == KV_CACHE_Q4_0) {
+            dequantize_row_q4_0(vt, v_f32, head_dim);
+        } else {
+            /* FP16: SIMD-accelerated conversion */
             const uint16_t *v16 = (const uint16_t *)vt;
             int d = 0;
-            for (; d + 16 <= head_dim; d += 16)
-                v_vec[d/16] = fp16x16_to_fp32_inline(v16 + d);
+            for (; d + 16 <= head_dim; d += 16) {
+                __m512 vf = fp16x16_to_fp32_inline(v16 + d);
+                _mm512_storeu_ps(v_f32 + d, vf);
+            }
+            for (; d < head_dim; d++) v_f32[d] = fp16_to_fp32(v16[d]);
         }
 
         for (int g = 0; g < kv_mul; g++) {
@@ -1868,12 +1885,13 @@ static void attention_group(int kv_head_idx, void *ctx_ptr) {
                 __m512 s = _mm512_setzero_ps();
                 int d = 0;
                 for (; d + 16 <= head_dim; d += 16) {
+                    __m512 kf = _mm512_loadu_ps(k_f32 + d);
                     __m512 qf = _mm512_loadu_ps(qg + d);
-                    s = _mm512_fmadd_ps(k_vec[d/16], qf, s);
+                    s = _mm512_fmadd_ps(kf, qf, s);
                 }
                 score = _mm512_reduce_add_ps(s);
                 for (; d < head_dim; d++)
-                    score += fp16_to_fp32(((uint16_t*)kt)[d]) * qg[d];
+                    score += k_f32[d] * qg[d];
             }
             score /= sqrtf((float)head_dim);
 
@@ -1886,10 +1904,11 @@ static void attention_group(int kv_head_idx, void *ctx_ptr) {
                 int d = 0;
                 for (; d + 16 <= head_dim; d += 16) {
                     __m512 af = _mm512_loadu_ps(accg + d);
-                    _mm512_storeu_ps(accg + d, _mm512_fmadd_ps(af, cv, v_vec[d/16]));
+                    __m512 vf = _mm512_loadu_ps(v_f32 + d);
+                    _mm512_storeu_ps(accg + d, _mm512_fmadd_ps(af, cv, vf));
                 }
                 for (; d < head_dim; d++)
-                    accg[d] = accg[d] * correction + fp16_to_fp32(((uint16_t*)vt)[d]);
+                    accg[d] = accg[d] * correction + v_f32[d];
                 max_score[g] = score;
             } else {
                 float w = expf(score - max_score[g]);
@@ -1898,10 +1917,11 @@ static void attention_group(int kv_head_idx, void *ctx_ptr) {
                 int d = 0;
                 for (; d + 16 <= head_dim; d += 16) {
                     __m512 af = _mm512_loadu_ps(accg + d);
-                    _mm512_storeu_ps(accg + d, _mm512_fmadd_ps(v_vec[d/16], wv, af));
+                    __m512 vf = _mm512_loadu_ps(v_f32 + d);
+                    _mm512_storeu_ps(accg + d, _mm512_fmadd_ps(vf, wv, af));
                 }
                 for (; d < head_dim; d++)
-                    accg[d] += w * fp16_to_fp32(((uint16_t*)vt)[d]);
+                    accg[d] += w * v_f32[d];
             }
         }
 #else
@@ -5903,14 +5923,28 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                 int rope_half_pf = rope_dim_pf / 2;
                 rope(q_pos, k_pos, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos, c->rope_type, rope_half_pf);
 
-                /* KV cache store */
+                /* KV cache store (respect kv_type_k/v) */
                 for (int hkv = 0; hkv < n_kv_heads; hkv++) {
+                    float *k_head = k_pos + hkv * head_dim;
+                    float *v_head = v_pos + hkv * head_dim;
                     uint8_t *kp = kcl + (size_t)pos * c->n_kv_heads * s->kv_row_size_k + hkv * s->kv_row_size_k;
                     uint8_t *vp = vcl + (size_t)pos * c->n_kv_heads * s->kv_row_size_v + hkv * s->kv_row_size_v;
-                    for (int d2 = 0; d2 < head_dim; d2++)
-                        ((uint16_t*)kp)[d2] = fp32_to_fp16(k_pos[hkv * head_dim + d2]);
-                    for (int d2 = 0; d2 < head_dim; d2++)
-                        ((uint16_t*)vp)[d2] = fp32_to_fp16(v_pos[hkv * head_dim + d2]);
+                    if (s->kv_type_k == KV_CACHE_Q8_0) {
+                        quantize_row_q8_0(k_head, kp, head_dim);
+                    } else if (s->kv_type_k == KV_CACHE_Q4_0) {
+                        quantize_row_q4_0(k_head, kp, head_dim);
+                    } else {
+                        for (int d2 = 0; d2 < head_dim; d2++)
+                            ((uint16_t*)kp)[d2] = fp32_to_fp16(k_head[d2]);
+                    }
+                    if (s->kv_type_v == KV_CACHE_Q8_0) {
+                        quantize_row_q8_0(v_head, vp, head_dim);
+                    } else if (s->kv_type_v == KV_CACHE_Q4_0) {
+                        quantize_row_q4_0(v_head, vp, head_dim);
+                    } else {
+                        for (int d2 = 0; d2 < head_dim; d2++)
+                            ((uint16_t*)vp)[d2] = fp32_to_fp16(v_head[d2]);
+                    }
                 }
             }
 
