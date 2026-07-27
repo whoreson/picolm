@@ -3919,10 +3919,12 @@ static void ssm_chunked_recurrence(
         float *xb2_batch,
         int n_tokens, int value_dim,
         int d_state, int n_k_heads, int n_v_heads, int head_v_dim, int repeat,
-        int conv_dim)
+        int conv_dim, int cs)
 {
-    const int CS = 64; /* chunk size for non-KDA (scalar decay) */
-    int n_chunks = (n_tokens + CS - 1) / CS;
+    /* cs: chunk size (from model->ssm_chunk_size, default 64, 0=auto) */
+    if (cs <= 0) cs = 64; /* default */
+    if (cs > n_tokens) cs = n_tokens;
+    int n_chunks = (n_tokens + cs - 1) / cs;
     if (n_chunks < 1) n_chunks = 1;
 
     int qk_dim = d_state * n_k_heads;
@@ -3931,11 +3933,9 @@ static void ssm_chunked_recurrence(
      * Base: cum_g[cs] + q_decay[cs] + decay_mask[cs*cs] + M_mat[cs*cs]
      *       + v_eff[cs*d] + v_hat[cs*d]
      * AVX-512 extras: sk[cs*d] + sq[cs*d] + kq[cs*cs] + decay_to_end[cs]
-     * Total base: 2*cs + 2*cs*cs + 2*cs*d
-     * Total AVX:  + 2*cs*d + cs*cs + cs = 3*cs + 3*cs*cs + 4*cs*d
-     * For CS=64, d=128: ~38KB per head */
-    size_t scratch_per_head = (size_t)CS + 2UL * CS + 2UL * CS * CS + 2UL * CS * (size_t)d_state
-                            + 2UL * CS * (size_t)d_state + CS * CS + CS;
+     * Total: 3*cs + 3*cs*cs + 4*cs*d (for AVX-512)
+     * For cs=64, d=128: ~38KB per head */
+    size_t scratch_per_head = 3UL * cs + 3UL * cs * cs + 4UL * cs * (size_t)d_state;
     scratch_per_head = (scratch_per_head + 15) & ~15UL;
 
     /* Allocate task contexts and per-head scratch separately to avoid stride issues */
@@ -3947,11 +3947,11 @@ static void ssm_chunked_recurrence(
     }
 
     /* Allocate gather buffers for contiguous chunk data.
-     * Layout: [n_heads][CS][d] for Q/K/V, [n_v_heads][CS] for scalars.
+     * Layout: [n_heads][cs][d] for Q/K/V, [n_v_heads][cs] for scalars.
      * This matches the access pattern in ssm_chunk_head_task:
      *   q[kh*cs*d + t*d + di], k[kh*cs*d + t*d + di], v[h*cs*d + t*d + di]
      *   gate_log[h*cs + t], beta[h*cs + t] */
-    size_t cs_alloc = CS; /* max possible */
+    size_t cs_alloc = cs; /* runtime chunk size */
     float *chunk_q = (float *)malloc(cs_alloc * (size_t)n_k_heads * (size_t)d_state * sizeof(float));
     float *chunk_k = (float *)malloc(cs_alloc * (size_t)n_k_heads * (size_t)d_state * sizeof(float));
     float *chunk_v = (float *)malloc(cs_alloc * (size_t)n_v_heads * (size_t)head_v_dim * sizeof(float));
@@ -3964,29 +3964,29 @@ static void ssm_chunked_recurrence(
 
     /* Process chunk by chunk */
     for (int ci = 0; ci < n_chunks; ci++) {
-        int cs = (ci == n_chunks - 1) ? (n_tokens - ci * CS) : CS;
-        if (cs <= 0) break;
-        int chunk_start = ci * CS;
+        int cs_actual = (ci == n_chunks - 1) ? (n_tokens - ci * cs) : cs;
+        if (cs_actual <= 0) break;
+        int chunk_start = ci * cs_actual;
 
         /* Gather Q, K, V, beta, gate_log for this chunk.
-         * Layout: [n_heads][cs][d] for Q/K/V, [n_v_heads][cs] for scalars. */
+         * Layout: [n_heads][cs_actual][d] for Q/K/V, [n_v_heads][cs_actual] for scalars. */
         for (int h = 0; h < n_k_heads; h++) {
-            for (int t = 0; t < cs; t++) {
+            for (int t = 0; t < cs_actual; t++) {
                 const float *tok = conv_batch + (chunk_start + t) * conv_dim;
-                memcpy(chunk_q + (size_t)h * cs * d_state + t * d_state,
+                memcpy(chunk_q + (size_t)h * cs_actual * d_state + t * d_state,
                        tok + h * d_state, d_state * sizeof(float));
-                memcpy(chunk_k + (size_t)h * cs * d_state + t * d_state,
+                memcpy(chunk_k + (size_t)h * cs_actual * d_state + t * d_state,
                        tok + qk_dim + h * d_state, d_state * sizeof(float));
             }
         }
         for (int h = 0; h < n_v_heads; h++) {
-            for (int t = 0; t < cs; t++) {
+            for (int t = 0; t < cs_actual; t++) {
                 const float *tok = conv_batch + (chunk_start + t) * conv_dim;
-                memcpy(chunk_v + (size_t)h * cs * head_v_dim + t * head_v_dim,
+                memcpy(chunk_v + (size_t)h * cs_actual * head_v_dim + t * head_v_dim,
                        tok + 2 * qk_dim + h * head_v_dim, head_v_dim * sizeof(float));
-                chunk_beta[h * cs + t] = beta_batch[(chunk_start + t) * n_v_heads + h];
+                chunk_beta[h * cs_actual + t] = beta_batch[(chunk_start + t) * n_v_heads + h];
                 float ge = alpha_batch[(chunk_start + t) * n_v_heads + h];
-                gate_log[h * cs + t] = (ge <= 0.0f) ? -50.0f : logf(ge);
+                gate_log[h * cs_actual + t] = (ge <= 0.0f) ? -50.0f : logf(ge);
             }
         }
 
@@ -3994,28 +3994,28 @@ static void ssm_chunked_recurrence(
         for (int h = 0; h < n_v_heads; h++) {
             tasks[h].idx = h;
             tasks[h].d_state = d_state;
-            tasks[h].cs = cs;
+            tasks[h].cs = cs_actual;
             tasks[h].repeat = repeat;
-            /* Now Q/K/V are contiguous [cs][n_heads][d], so we can slice by head */
+            /* Now Q/K/V are contiguous [cs_actual][n_heads][d], so we can slice by head */
             tasks[h].q = chunk_q;
             tasks[h].k = chunk_k;
             tasks[h].v = chunk_v;
             tasks[h].gate_log = gate_log;
             tasks[h].beta = chunk_beta;
             tasks[h].state = state;
-            /* Output: [cs][d_state] per v-head */
-            tasks[h].out = chunk_out + (size_t)h * cs * d_state;
+            /* Output: [cs_actual][d_state] per v-head */
+            tasks[h].out = chunk_out + (size_t)h * cs_actual * d_state;
         }
 
         /* Process all v-heads in parallel */
         tensor_parallel_for(n_v_heads, ssm_chunk_head_task, tasks);
 
-        /* Reshape output from [n_v_heads][cs][d_state] to [cs][value_dim] head-major.
-         * chunk_out[h * cs * d_state + t * d_state + r] -> xb2_batch[(chunk_start+t)*value_dim + h*head_v_dim + r] */
-        for (int t = 0; t < cs; t++) {
+        /* Reshape output from [n_v_heads][cs_actual][d_state] to [cs_actual][value_dim] head-major.
+         * chunk_out[h * cs_actual * d_state + t * d_state + r] -> xb2_batch[(chunk_start+t)*value_dim + h*head_v_dim + r] */
+        for (int t = 0; t < cs_actual; t++) {
             float *out_tok = xb2_batch + (chunk_start + t) * value_dim;
             for (int h = 0; h < n_v_heads; h++) {
-                const float *oh = chunk_out + (size_t)h * cs * d_state + t * d_state;
+                const float *oh = chunk_out + (size_t)h * cs_actual * d_state + t * d_state;
                 float *od = out_tok + h * head_v_dim;
                 memcpy(od, oh, d_state * sizeof(float));
             }
@@ -5505,7 +5505,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
                 state, xb2_batch,
                 n_tokens, value_dim,
                 d_state, n_k_heads, n_v_heads, head_v_dim, repeat,
-                conv_dim);
+                conv_dim, m->ssm_chunk_size);
         } else {
             /* Single token: use the standard per-token path */
             float *ssm_output = (float *)malloc((size_t)d_state * n_v_heads * sizeof(float));
