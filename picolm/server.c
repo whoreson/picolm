@@ -518,6 +518,90 @@ static void checkpoint_clear(void) {
     srv.checkpoints = NULL;
 }
 
+/* Checkpoint-aware prefill: processes tokens in chunks so that interval-based
+ * and tail checkpoints can be created during SSM prefill.
+ * For non-SSM models or when checkpointing is disabled, does a single batched call.
+ *
+ * Returns pointer to logits, or NULL on client disconnect.
+ * Sets *out_n_processed to the number of tokens processed.
+ *
+ * sock: client socket (checked for disconnect in per-token paths)
+ * model: model pointer
+ * tokens: token array starting at start_pos
+ * n_prefill: number of new tokens to process
+ * start_pos: KV cache position of the first token in 'tokens'
+ * out_n_processed: output: total tokens processed (including cached prefix)
+ *
+ * The 'client_check' parameter is 1 to check client_alive between tokens,
+ * 0 to skip (e.g. non-streaming paths that don't need per-token checks).
+ */
+static float *prefill_with_checkpoints(SOCKET sock, model_t *model,
+                                       const int *tokens, int n_prefill, int start_pos,
+                                       int *out_n_processed, int client_check) {
+    float *logits = NULL;
+    int n_processed = start_pos;
+
+    /* Non-SSM model, or checkpointing disabled: single batched call */
+    if (!model->config.has_ssm || srv.max_checkpoints <= 0) {
+        if (n_prefill > 0) {
+            logits = model_forward_prefill(model, tokens, n_prefill, start_pos);
+            n_processed = start_pos + n_prefill;
+        }
+        *out_n_processed = n_processed;
+        return logits;
+    }
+
+    /* SSM model with checkpointing enabled: split into chunks */
+    int tail_pos = start_pos + n_prefill - srv.checkpoint_tail_offset;
+    if (tail_pos < start_pos) tail_pos = start_pos + n_prefill; /* short prompt */
+    if (tail_pos < start_pos + srv.checkpoint_interval) {
+        /* Prompt too short for both tail and interval: single batch */
+        logits = model_forward_prefill(model, tokens, n_prefill, start_pos);
+        n_processed = start_pos + n_prefill;
+        *out_n_processed = n_processed;
+        return logits;
+    }
+
+    int offset = 0;
+    while (offset < n_prefill) {
+        int cur_pos = start_pos + offset;
+        int remaining = n_prefill - offset;
+
+        /* Distance to next interval boundary from cur_pos */
+        int mod = cur_pos % srv.checkpoint_interval;
+        int interval_dist = (mod == 0) ? srv.checkpoint_interval : (srv.checkpoint_interval - mod);
+
+        /* Distance to tail position from cur_pos */
+        int tail_dist = tail_pos - cur_pos;
+
+        /* Chunk size: whichever boundary (interval, tail, or end) comes first */
+        int chunk_size = interval_dist;
+        if (tail_dist > 0 && tail_dist < chunk_size) {
+            chunk_size = tail_dist;
+        }
+        if (chunk_size > remaining) {
+            chunk_size = remaining;
+        }
+        if (chunk_size <= 0) chunk_size = 1; /* safety */
+
+        /* Checkpoint at the current position if we've already processed some tokens */
+        if (offset > 0) {
+            checkpoint_save(cur_pos);
+        }
+
+        logits = model_forward_prefill(model, tokens + offset, chunk_size, cur_pos);
+        n_processed = cur_pos + chunk_size;
+        offset += chunk_size;
+
+        if (client_check && !client_alive(sock)) {
+            break;
+        }
+    }
+
+    *out_n_processed = n_processed;
+    return logits;
+}
+
 /* ---- Endpoint: GET /v1/models ---- */
 
 /* ---- Server init / free (persistent model) ---- */
@@ -1140,18 +1224,8 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         /* Track how many prompt tokens were actually processed */
         int n_processed = start_pos;
         if (n_prefill > 0) {
-            /* Batched prefill for all models (SSM has its own batched path inside) */
-            logits = model_forward_prefill(model, ptokens + start_pos, n_prefill, start_pos);
-            n_processed = n_prompt;
-        } else if (n_prefill > 0) {
-            /* Per-token prefill fallback (should not be reached) */
-            int token_p = start_pos > 0 ? ptokens[start_pos - 1] : ptokens[0];
-            for (int pos = start_pos; pos < n_prompt; pos++) {
-                if (!client_alive(sock)) break;
-                logits = model_forward(model, token_p, pos);
-                token_p = ptokens[pos + 1];
-                n_processed = pos + 1;
-            }
+            /* Checkpoint-aware prefill: creates interval + tail checkpoints for SSM models */
+            logits = prefill_with_checkpoints(sock, model, ptokens + start_pos, n_prefill, start_pos, &n_processed, 1);
         }
         /* else: fully cached (n_prefill <= 0), no prefill needed */
 
@@ -1344,16 +1418,8 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             /* Track how many prompt tokens were actually processed */
             int n_processed_ns = start_pos;
             if (n_prefill_ns > 0) {
-                logits_ns = model_forward_prefill(model, ptokens + start_pos, n_prefill_ns, start_pos);
-                n_processed_ns = n_prompt;
-            } else if (n_prefill_ns > 0) {
-                int token_p = start_pos > 0 ? ptokens[start_pos - 1] : ptokens[0];
-                for (int pos = start_pos; pos < n_prompt; pos++) {
-                    if (!client_alive(sock)) break;
-                    logits_ns = model_forward(model, token_p, pos);
-                    token_p = ptokens[pos + 1];
-                    n_processed_ns = pos + 1;
-                }
+                /* Checkpoint-aware prefill */
+                logits_ns = prefill_with_checkpoints(sock, model, ptokens + start_pos, n_prefill_ns, start_pos, &n_processed_ns, 1);
             }
 
             /* Save cache: only the tokens actually processed */
@@ -1766,16 +1832,8 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         /* Track how many prompt tokens were actually processed */
         int n_processed = start_pos;
         if (n_prefill > 0) {
-            logits = model_forward_prefill(model, ptokens + start_pos, n_prefill, start_pos);
-            n_processed = n_prompt; /* batched: all tokens processed */
-        } else if (n_prefill > 0) {
-            int token_p = start_pos > 0 ? ptokens[start_pos - 1] : ptokens[0];
-            for (int pos = start_pos; pos < n_prompt; pos++) {
-                if (!client_alive(sock)) break;
-                logits = model_forward(model, token_p, pos);
-                token_p = ptokens[pos + 1];
-                n_processed = pos + 1;
-            }
+            /* Checkpoint-aware prefill */
+            logits = prefill_with_checkpoints(sock, model, ptokens + start_pos, n_prefill, start_pos, &n_processed, 1);
         }
         /* else: fully cached */
 
@@ -1972,16 +2030,8 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         /* Track how many prompt tokens were actually processed */
         int n_processed_ns2 = start_pos;
         if (n_prefill_ns2 > 0) {
-            logits_ns2 = model_forward_prefill(model, ptokens + start_pos, n_prefill_ns2, start_pos);
-            n_processed_ns2 = n_prompt;
-        } else if (n_prefill_ns2 > 0) {
-            int token_p = start_pos > 0 ? ptokens[start_pos - 1] : ptokens[0];
-            for (int pos = start_pos; pos < n_prompt; pos++) {
-                if (!client_alive(sock)) break;
-                logits_ns2 = model_forward(model, token_p, pos);
-                token_p = ptokens[pos + 1];
-                n_processed_ns2 = pos + 1;
-            }
+            /* Checkpoint-aware prefill */
+            logits_ns2 = prefill_with_checkpoints(sock, model, ptokens + start_pos, n_prefill_ns2, start_pos, &n_processed_ns2, 0);
         }
 
         t_prefill_end_ns = get_time_ms();
