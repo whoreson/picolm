@@ -36,30 +36,47 @@ _have_sse3   = $(shell echo | $(CC) -E -dM $(1) - 2>/dev/null | grep -c '__SSSE3
 _have_sse2   = $(shell echo | $(CC) -E -dM $(1) - 2>/dev/null | grep -c '__SSE2__')
 _have_fma    = $(shell echo | $(CC) -E -dM $(1) - 2>/dev/null | grep -c '__FMA__')
 
-# Pick the highest SIMD level and emit the right -DPICOLM_* defines
+# Pick the highest SIMD level and emit the right -DPICOLM_* preprocessor defines.
+# Cascading if/elif/else: only the first (highest) matching level is emitted.
 simd_defines_for = $(strip \
-  $(if $(filter 0,$(call _have_avx512,$(1))),,\
-    -DPICOLM_AVX512 $(if $(filter 0,$(call _have_fma,$(1))),,-DPICOLM_FMA)) \
-  $(if $(and $(filter 0,$(call _have_avx512,$(1))),$(filter 0,$(call _have_avx2,$(1)))),,\
-    -DPICOLM_AVX2 $(if $(filter 0,$(call _have_fma,$(1))),,-DPICOLM_FMA)) \
-  $(if $(and $(filter 0,$(call _have_avx512,$(1))),$(filter 0,$(call _have_avx2,$(1))),$(filter 0,$(call _have_avx,$(1)))),,\
-    -DPICOLM_AVX) \
-  $(if $(and $(filter 0,$(call _have_avx512,$(1))),$(filter 0,$(call _have_avx2,$(1))),$(filter 0,$(call _have_avx,$(1))),$(filter 0,$(call _have_sse3,$(1)))),,\
-    -DPICOLM_SSE3) \
-  $(if $(and $(filter 0,$(call _have_avx512,$(1))),$(filter 0,$(call _have_avx2,$(1))),$(filter 0,$(call _have_avx,$(1))),$(filter 0,$(call _have_sse3,$(1))),$(filter 0,$(call _have_sse2,$(1)))),,\
-    -DPICOLM_SSE2))
+  $(if $(filter 1,$(call _have_avx512,$(1))),\
+    -DPICOLM_AVX512 -DPICOLM_AVX2 -DPICOLM_AVX -DPICOLM_SSE3 -DPICOLM_SSE2 -DPICOLM_FMA,\
+    $(if $(filter 1,$(call _have_avx2,$(1))),\
+      -DPICOLM_AVX2 -DPICOLM_AVX -DPICOLM_SSE3 -DPICOLM_SSE2 -DPICOLM_FMA,\
+      $(if $(filter 1,$(call _have_avx,$(1))),\
+        -DPICOLM_AVX -DPICOLM_SSE3 -DPICOLM_SSE2,\
+        $(if $(filter 1,$(call _have_sse3,$(1))),\
+          -DPICOLM_SSE3 -DPICOLM_SSE2,\
+          $(if $(filter 1,$(call _have_sse2,$(1))),\
+            -DPICOLM_SSE2,\
+            ))))))
+
+# Emit the right -m* compiler flags for the detected SIMD level.
+# Used alongside -march=native to ensure inline intrinsics compile correctly
+# (mingw sometimes needs explicit feature flags).
+simd_flags_for = $(strip \
+  $(if $(filter 1,$(call _have_avx512,$(1))),\
+    -mavx512f -mavx512vl -mf16c -mbmi2 -mfma,\
+    $(if $(filter 1,$(call _have_avx2,$(1))),\
+      -mavx2 -mfma -mf16c -mbmi2,\
+      $(if $(filter 1,$(call _have_avx,$(1))),\
+        -mavx -mf16c,\
+        $(if $(filter 1,$(call _have_sse3,$(1))),\
+          -mssse3 -mpopcnt,\
+          )))))
 
 # --- Default target: build with -march=native + auto-detected SIMD ---
 .PHONY: all
-all: $(TARGET)
+all:
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_flags_for,-march=native) $(call simd_defines_for,-march=native)"
 
 # --- Native build: -march=native with auto-detected SIMD defines ---
 native:
-	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_defines_for,-march=native)"
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_flags_for,-march=native) $(call simd_defines_for,-march=native)"
 
 # --- VIZ build: native with embedded VNC visualization server ---
 viz:
-	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_defines_for,-march=native) -DPICOLM_VIZ=1" OBJS="$(OBJS) viz.o"
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_flags_for,-march=native) $(call simd_defines_for,-march=native) -DPICOLM_VIZ=1" OBJS="$(OBJS) viz.o"
 
 # --- x86-64 default: -march=native + GPU disabled, safe fallback ---
 x86: sse2

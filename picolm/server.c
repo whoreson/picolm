@@ -1066,7 +1066,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
     int n_choices = 1;
     int do_stream = 0;
     int timings_per_token = 0;
-    const char *model_name = NULL;
+    char *model_name = NULL;
 
     if (is_chat) {
         cJSON *messages = cJSON_GetObjectItem(req, "messages");
@@ -1111,7 +1111,8 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
     if ((item = cJSON_GetObjectItem(req, "n"))) n_choices = (int)cJSON_GetNumberValue(item);
     if (n_choices < 1) n_choices = 1;
     if (n_choices > 4) n_choices = 4;
-    if ((item = cJSON_GetObjectItem(req, "model"))) model_name = cJSON_GetStringValue(item);
+    if ((item = cJSON_GetObjectItem(req, "model")) && cJSON_IsString(item))
+        model_name = strdup(item->valuestring);
     cJSON_Delete(req);
     fprintf(stderr, "[server] %.1fms: params parsed (stream=%d, max_tok=%d, n=%d)\n", get_time_ms() - t0, do_stream, max_tokens, n_choices);
 
@@ -1139,8 +1140,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             "{\"error\":{\"message\":\"Prompt too large: %d tokens exceeds model context size %d\"}}",
             n_prompt, model->config.max_seq_len);
         http_send(sock, 413, "application/json", errmsg);
-        free(ptokens);
-        free((void*)prompt);
+        free(ptokens); free(model_name); free((void*)prompt);
         return;
     }
 
@@ -1241,7 +1241,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         if (n_processed < n_prompt) {
             /* Client disconnected during prefill */
             fprintf(stderr, "[server] prefill cancelled at token %d/%d\n", n_processed, n_prompt);
-            free(chat_prompt); free(raw_prompt_copy); free(ptokens);
+            free(chat_prompt); free(raw_prompt_copy); free(model_name); free(ptokens);
             return;
         }
 
@@ -1369,7 +1369,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         sse_send(sock, dcj, NULL);
         free(dcj);
         cJSON_Delete(done_chunk);
-        send_chunked(sock, "data: [DONE]\r\n", 14);
+        send_chunked(sock, "data: [DONE]\r\n\r\n", 16);
         send_chunked(sock, "", 0);
 
         /* Save prompt + generated tokens for next request */
@@ -1402,7 +1402,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
 
             char *generated = (char *)malloc((size_t)max_tokens * 100 + 1);
             if (!generated) {
-                free(chat_prompt); free(raw_prompt_copy); free(ptokens);
+                free(chat_prompt); free(raw_prompt_copy); free(model_name); free(ptokens);
                 http_send(sock, 500, "application/json", "{\"error\":{\"message\":\"OOM\"}}");
                 return;
             }
@@ -1433,7 +1433,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
 
             if (n_processed_ns < n_prompt) {
                 fprintf(stderr, "[server] prefill cancelled at token %d/%d\n", n_processed_ns, n_prompt);
-                free(chat_prompt); free(raw_prompt_copy); free(ptokens);
+                free(chat_prompt); free(raw_prompt_copy); free(model_name); free(ptokens);
                 return;
             }
 
@@ -1558,6 +1558,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
 
     free(raw_prompt_copy);
     free(chat_prompt);
+    free(model_name);
     free(ptokens);
 }
 
@@ -1621,7 +1622,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
     int do_stream = 0;
     int return_tokens = 0;
     int ignore_eos = 0;
-    const char *model_name = NULL;
+    char *model_name = NULL;
 
     cJSON *item;
     if ((item = cJSON_GetObjectItem(req, "n_predict")))
@@ -1645,8 +1646,8 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         return_tokens = 1;
     if ((item = cJSON_GetObjectItem(req, "ignore_eos")) && cJSON_IsTrue(item))
         ignore_eos = 1;
-    if ((item = cJSON_GetObjectItem(req, "model")))
-        model_name = cJSON_GetStringValue(item);
+    if ((item = cJSON_GetObjectItem(req, "model")) && cJSON_IsString(item))
+        model_name = strdup(item->valuestring);
 
     /* Parse stop words - MUST copy before cJSON_Delete */
     char *stop_words[16];
@@ -1709,8 +1710,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             "{\"error\":{\"message\":\"Prompt too large: %d tokens exceeds model context size %d\"}}",
             n_prompt, model->config.max_seq_len);
         http_send(sock, 413, "application/json", errmsg);
-        free(ptokens);
-        free((void*)prompt);
+        free(ptokens); free(model_name); free((void*)prompt);
         return;
     }
 
@@ -1857,7 +1857,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         if (n_processed < n_prompt) {
             /* Client disconnected during prefill */
             fprintf(stderr, "[server] prefill cancelled at token %d/%d\n", n_processed, n_prompt);
-            free((void*)prompt); free(ptokens);
+            free(model_name); free((void*)prompt); free(ptokens);
             return;
         }
 
@@ -1969,6 +1969,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
 
         /* Final timing SSE */
         cJSON *final = cJSON_CreateObject();
+        cJSON_AddStringToObject(final, "content", "");
         cJSON_AddBoolToObject(final, "stop", 1);
         cJSON_AddStringToObject(final, "stop_type", stop_type);
         cJSON_AddStringToObject(final, "stopping_word", stopping_word);
@@ -2055,7 +2056,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             /* Client disconnected during prefill */
             fprintf(stderr, "[server] prefill cancelled at token %d/%d\n", n_processed_ns2, n_prompt);
             free(generated); free(gen_token_ids);
-            free((void*)prompt); free(token_prompt); free(ptokens);
+            free(model_name); free((void*)prompt); free(token_prompt); free(ptokens);
             for (int i = 0; i < n_stop_words; i++) free(stop_words[i]);
             return;
         }
@@ -2187,6 +2188,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
 
     free(prompt_copy);
     free(token_prompt);
+    free(model_name);
     free(ptokens);
     for (int i = 0; i < n_stop_words; i++) free(stop_words[i]);
 }
