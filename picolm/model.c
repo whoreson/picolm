@@ -2773,33 +2773,37 @@ static void ssm_kernel_veff(
         const float *k,   /* [cs][d] */
         int d, int cs)
 {
-    int d16 = d / 16; /* d=128 -> d16=8 */
+    int d16 = d / 16;
+    int nr = d / 4;
 
-    /* Process each of the cs rows independently */
     for (int i = 0; i < cs; i++) {
         const float *ki = k + i * d;
         float *ski = sk + i * d;
 
-        /* Initialize d/16 accumulators to zero */
-        __m512 acc[8];
-        int v;
-        for (v = 0; v < d16; v++) acc[v] = _mm512_setzero_ps();
+        for (int g = 0; g < nr; g++) {
+            int base = g * 4;
+            __m512 acc0 = _mm512_setzero_ps();
+            __m512 acc1 = _mm512_setzero_ps();
+            __m512 acc2 = _mm512_setzero_ps();
+            __m512 acc3 = _mm512_setzero_ps();
 
-        /* Accumulate over d rows of state */
-        for (int r = 0; r < d; r++) {
-            const float *sr = state + r * d;
-            float kir = ki[r];
-            if (kir == 0.0f) continue;
-            __m512 kv = _mm512_set1_ps(kir);
-            for (v = 0; v < d16; v++) {
-                __m512 sv = _mm512_loadu_ps(sr + v * 16);
-                acc[v] = _mm512_fmadd_ps(sv, kv, acc[v]);
+            for (int v = 0; v < d16; v++) {
+                int col = v * 16;
+                __m512 kv = _mm512_loadu_ps(ki + col);
+                __m512 s0 = _mm512_loadu_ps(state + base * d + col);
+                __m512 s1 = _mm512_loadu_ps(state + (base+1) * d + col);
+                __m512 s2 = _mm512_loadu_ps(state + (base+2) * d + col);
+                __m512 s3 = _mm512_loadu_ps(state + (base+3) * d + col);
+                acc0 = _mm512_fmadd_ps(s0, kv, acc0);
+                acc1 = _mm512_fmadd_ps(s1, kv, acc1);
+                acc2 = _mm512_fmadd_ps(s2, kv, acc2);
+                acc3 = _mm512_fmadd_ps(s3, kv, acc3);
             }
-        }
 
-        /* Store results */
-        for (v = 0; v < d16; v++) {
-            _mm512_storeu_ps(ski + v * 16, acc[v]);
+            ski[base] = _mm512_reduce_add_ps(acc0);
+            ski[base+1] = _mm512_reduce_add_ps(acc1);
+            ski[base+2] = _mm512_reduce_add_ps(acc2);
+            ski[base+3] = _mm512_reduce_add_ps(acc3);
         }
     }
 }
@@ -3008,28 +3012,36 @@ static void ssm_kernel_sq(
         int d, int cs)
 {
     int d16 = d / 16;
+    int nr = d / 4;
 
     for (int i = 0; i < cs; i++) {
         const float *qi = q + i * d;
         float *sqi = sq + i * d;
 
-        __m512 acc[8];
-        int v;
-        for (v = 0; v < d16; v++) acc[v] = _mm512_setzero_ps();
+        for (int g = 0; g < nr; g++) {
+            int base = g * 4;
+            __m512 acc0 = _mm512_setzero_ps();
+            __m512 acc1 = _mm512_setzero_ps();
+            __m512 acc2 = _mm512_setzero_ps();
+            __m512 acc3 = _mm512_setzero_ps();
 
-        for (int r = 0; r < d; r++) {
-            const float *sr = state + r * d;
-            float qir = qi[r];
-            if (qir == 0.0f) continue;
-            __m512 kv = _mm512_set1_ps(qir);
-            for (v = 0; v < d16; v++) {
-                __m512 sv = _mm512_loadu_ps(sr + v * 16);
-                acc[v] = _mm512_fmadd_ps(sv, kv, acc[v]);
+            for (int v = 0; v < d16; v++) {
+                int col = v * 16;
+                __m512 qv = _mm512_loadu_ps(qi + col);
+                __m512 s0 = _mm512_loadu_ps(state + base * d + col);
+                __m512 s1 = _mm512_loadu_ps(state + (base+1) * d + col);
+                __m512 s2 = _mm512_loadu_ps(state + (base+2) * d + col);
+                __m512 s3 = _mm512_loadu_ps(state + (base+3) * d + col);
+                acc0 = _mm512_fmadd_ps(s0, qv, acc0);
+                acc1 = _mm512_fmadd_ps(s1, qv, acc1);
+                acc2 = _mm512_fmadd_ps(s2, qv, acc2);
+                acc3 = _mm512_fmadd_ps(s3, qv, acc3);
             }
-        }
 
-        for (v = 0; v < d16; v++) {
-            _mm512_storeu_ps(sqi + v * 16, acc[v]);
+            sqi[base] = _mm512_reduce_add_ps(acc0);
+            sqi[base+1] = _mm512_reduce_add_ps(acc1);
+            sqi[base+2] = _mm512_reduce_add_ps(acc2);
+            sqi[base+3] = _mm512_reduce_add_ps(acc3);
         }
     }
 }
@@ -3047,32 +3059,37 @@ static void ssm_kernel_veff(
         const float *k,   /* [cs][d] */
         int d, int cs)
 {
-    int d8 = d / 8; /* d=128 -> d8=16 */
+    int d8 = d / 8;
+    int nr = d / 4;
 
     for (int i = 0; i < cs; i++) {
         const float *ki = k + i * d;
         float *ski = sk + i * d;
 
-        /* Initialize d/8 accumulators to zero */
-        __m256 acc[16];
-        int v;
-        for (v = 0; v < d8; v++) acc[v] = _mm256_setzero_ps();
+        for (int g = 0; g < nr; g++) {
+            int base = g * 4;
+            __m256 acc0 = _mm256_setzero_ps();
+            __m256 acc1 = _mm256_setzero_ps();
+            __m256 acc2 = _mm256_setzero_ps();
+            __m256 acc3 = _mm256_setzero_ps();
 
-        /* Accumulate over d rows of state */
-        for (int r = 0; r < d; r++) {
-            const float *sr = state + r * d;
-            float kir = ki[r];
-            if (kir == 0.0f) continue;
-            __m256 kv = _mm256_set1_ps(kir);
-            for (v = 0; v < d8; v++) {
-                __m256 sv = _mm256_loadu_ps(sr + v * 8);
-                acc[v] = FMA256(sv, kv, acc[v]);
+            for (int v = 0; v < d8; v++) {
+                int col = v * 8;
+                __m256 kv = _mm256_loadu_ps(ki + col);
+                __m256 s0 = _mm256_loadu_ps(state + base * d + col);
+                __m256 s1 = _mm256_loadu_ps(state + (base+1) * d + col);
+                __m256 s2 = _mm256_loadu_ps(state + (base+2) * d + col);
+                __m256 s3 = _mm256_loadu_ps(state + (base+3) * d + col);
+                acc0 = FMA256(s0, kv, acc0);
+                acc1 = FMA256(s1, kv, acc1);
+                acc2 = FMA256(s2, kv, acc2);
+                acc3 = FMA256(s3, kv, acc3);
             }
-        }
 
-        /* Store results */
-        for (v = 0; v < d8; v++) {
-            _mm256_storeu_ps(ski + v * 8, acc[v]);
+            ski[base] = hreduce256_ps(acc0);
+            ski[base+1] = hreduce256_ps(acc1);
+            ski[base+2] = hreduce256_ps(acc2);
+            ski[base+3] = hreduce256_ps(acc3);
         }
     }
 }
@@ -3254,28 +3271,36 @@ static void ssm_kernel_sq(
         int d, int cs)
 {
     int d8 = d / 8;
+    int nr = d / 4;
 
     for (int i = 0; i < cs; i++) {
         const float *qi = q + i * d;
         float *sqi = sq + i * d;
 
-        __m256 acc[16];
-        int v;
-        for (v = 0; v < d8; v++) acc[v] = _mm256_setzero_ps();
+        for (int g = 0; g < nr; g++) {
+            int base = g * 4;
+            __m256 acc0 = _mm256_setzero_ps();
+            __m256 acc1 = _mm256_setzero_ps();
+            __m256 acc2 = _mm256_setzero_ps();
+            __m256 acc3 = _mm256_setzero_ps();
 
-        for (int r = 0; r < d; r++) {
-            const float *sr = state + r * d;
-            float qir = qi[r];
-            if (qir == 0.0f) continue;
-            __m256 kv = _mm256_set1_ps(qir);
-            for (v = 0; v < d8; v++) {
-                __m256 sv = _mm256_loadu_ps(sr + v * 8);
-                acc[v] = FMA256(sv, kv, acc[v]);
+            for (int v = 0; v < d8; v++) {
+                int col = v * 8;
+                __m256 qv = _mm256_loadu_ps(qi + col);
+                __m256 s0 = _mm256_loadu_ps(state + base * d + col);
+                __m256 s1 = _mm256_loadu_ps(state + (base+1) * d + col);
+                __m256 s2 = _mm256_loadu_ps(state + (base+2) * d + col);
+                __m256 s3 = _mm256_loadu_ps(state + (base+3) * d + col);
+                acc0 = FMA256(s0, qv, acc0);
+                acc1 = FMA256(s1, qv, acc1);
+                acc2 = FMA256(s2, qv, acc2);
+                acc3 = FMA256(s3, qv, acc3);
             }
-        }
 
-        for (v = 0; v < d8; v++) {
-            _mm256_storeu_ps(sqi + v * 8, acc[v]);
+            sqi[base] = hreduce256_ps(acc0);
+            sqi[base+1] = hreduce256_ps(acc1);
+            sqi[base+2] = hreduce256_ps(acc2);
+            sqi[base+3] = hreduce256_ps(acc3);
         }
     }
 }
@@ -3299,29 +3324,37 @@ static void ssm_kernel_veff(
         const float *k,   /* [cs][d] */
         int d, int cs)
 {
-    int d4 = d / 4; /* d=128 -> d4=32 */
+    int d4 = d / 4;
+    int nr = d / 4;
 
     for (int i = 0; i < cs; i++) {
         const float *ki = k + i * d;
         float *ski = sk + i * d;
 
-        float32x4_t acc[32];
-        int v;
-        for (v = 0; v < d4; v++) acc[v] = vdupq_n_f32(0);
+        for (int g = 0; g < nr; g++) {
+            int base = g * 4;
+            float32x4_t acc0 = vdupq_n_f32(0);
+            float32x4_t acc1 = vdupq_n_f32(0);
+            float32x4_t acc2 = vdupq_n_f32(0);
+            float32x4_t acc3 = vdupq_n_f32(0);
 
-        for (int r = 0; r < d; r++) {
-            const float *sr = state + r * d;
-            float kir = ki[r];
-            if (kir == 0.0f) continue;
-            float32x4_t kv = vdupq_n_f32(kir);
-            for (v = 0; v < d4; v++) {
-                float32x4_t sv = vld1q_f32(sr + v * 4);
-                acc[v] = vmlaq_f32(acc[v], sv, kv);
+            for (int v = 0; v < d4; v++) {
+                int col = v * 4;
+                float32x4_t kv = vld1q_f32(ki + col);
+                float32x4_t s0 = vld1q_f32(state + base * d + col);
+                float32x4_t s1 = vld1q_f32(state + (base+1) * d + col);
+                float32x4_t s2 = vld1q_f32(state + (base+2) * d + col);
+                float32x4_t s3 = vld1q_f32(state + (base+3) * d + col);
+                acc0 = vmlaq_f32(acc0, s0, kv);
+                acc1 = vmlaq_f32(acc1, s1, kv);
+                acc2 = vmlaq_f32(acc2, s2, kv);
+                acc3 = vmlaq_f32(acc3, s3, kv);
             }
-        }
 
-        for (v = 0; v < d4; v++) {
-            vst1q_f32(ski + v * 4, acc[v]);
+            ski[base] = vaddvq_f32_compat(acc0);
+            ski[base+1] = vaddvq_f32_compat(acc1);
+            ski[base+2] = vaddvq_f32_compat(acc2);
+            ski[base+3] = vaddvq_f32_compat(acc3);
         }
     }
 }
@@ -3493,28 +3526,36 @@ static void ssm_kernel_sq(
         int d, int cs)
 {
     int d4 = d / 4;
+    int nr = d / 4;
 
     for (int i = 0; i < cs; i++) {
         const float *qi = q + i * d;
         float *sqi = sq + i * d;
 
-        float32x4_t acc[32];
-        int v;
-        for (v = 0; v < d4; v++) acc[v] = vdupq_n_f32(0);
+        for (int g = 0; g < nr; g++) {
+            int base = g * 4;
+            float32x4_t acc0 = vdupq_n_f32(0);
+            float32x4_t acc1 = vdupq_n_f32(0);
+            float32x4_t acc2 = vdupq_n_f32(0);
+            float32x4_t acc3 = vdupq_n_f32(0);
 
-        for (int r = 0; r < d; r++) {
-            const float *sr = state + r * d;
-            float qir = qi[r];
-            if (qir == 0.0f) continue;
-            float32x4_t kv = vdupq_n_f32(qir);
-            for (v = 0; v < d4; v++) {
-                float32x4_t sv = vld1q_f32(sr + v * 4);
-                acc[v] = vmlaq_f32(acc[v], sv, kv);
+            for (int v = 0; v < d4; v++) {
+                int col = v * 4;
+                float32x4_t qv = vld1q_f32(qi + col);
+                float32x4_t s0 = vld1q_f32(state + base * d + col);
+                float32x4_t s1 = vld1q_f32(state + (base+1) * d + col);
+                float32x4_t s2 = vld1q_f32(state + (base+2) * d + col);
+                float32x4_t s3 = vld1q_f32(state + (base+3) * d + col);
+                acc0 = vmlaq_f32(acc0, s0, qv);
+                acc1 = vmlaq_f32(acc1, s1, qv);
+                acc2 = vmlaq_f32(acc2, s2, qv);
+                acc3 = vmlaq_f32(acc3, s3, qv);
             }
-        }
 
-        for (v = 0; v < d4; v++) {
-            vst1q_f32(sqi + v * 4, acc[v]);
+            sqi[base] = vaddvq_f32_compat(acc0);
+            sqi[base+1] = vaddvq_f32_compat(acc1);
+            sqi[base+2] = vaddvq_f32_compat(acc2);
+            sqi[base+3] = vaddvq_f32_compat(acc3);
         }
     }
 }
