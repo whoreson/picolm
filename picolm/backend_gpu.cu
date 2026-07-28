@@ -552,50 +552,22 @@ picolm_silu_mul(float *gate, const float *up, size_t n) {
  * Phase 1: GPU-resident KV cache + attention kernels
  * ================================================================ */
 
-/* ---- KV cache store kernel ----
- * Simple memcpy-style kernel: 1 thread per FP16 element.
- * Writes into kv_k/kv_v at the precomputed offset.
- * Layout: [layer_ordinal][pos][kv_head][head_dim] in FP16.
- * kv_head_stride: bytes per head within a GQA row. */
-__global__ void
-picolm_gpu_kv_store_kernel(uint16_t *dst,
-                            const uint16_t *src,
-                            size_t dst_head_offset,
-                            int head_dim) {
-    int d = gpuThreadIdx_x + (int)gpuBlockIdx_x * gpuBlockDim_x;
-    if (d < head_dim) {
-        dst[dst_head_offset + d] = src[d];
-    }
-}
-
-/* ---- KV cache batch store kernel ----
- * Stores n_tokens x head_dim elements for one KV head.
- * Each thread handles one FP16 element across all tokens. */
-__global__ void
-picolm_gpu_kv_store_batch_kernel(uint16_t *dst,
-                                  const uint16_t *src,
-                                  size_t base_dst_offset,
-                                  int head_dim,
-                                  size_t pos_stride_bytes,
-                                  int n_tokens,
-                                  int start_pos) {
-    int d = gpuThreadIdx_x + (int)gpuBlockIdx_x * gpuBlockDim_x;
-    if (d < head_dim) {
-        for (int t = 0; t < n_tokens; t++) {
-            size_t dst_off = base_dst_offset + (size_t)(start_pos + t) * pos_stride_bytes / 2 + d;
-            dst[dst_off] = src[(size_t)t * head_dim + d];
-        }
-    }
-}
-
-/* ---- Decode attention kernel ----
+/* Phase 1.5: no store kernel needed. The CPU-side KV cache row layout
+ * ([kv_head][head_dim] contiguous FP16) is byte-identical to the device
+ * layout, so storing is a single gpuMemcpyAsync -- see
+ * picolm_gpu_kv_store_rows() in the host API section below. This replaces
+ * the old picolm_gpu_kv_store_kernel / picolm_gpu_kv_store_batch_kernel,
+ * which cost one launch per (position, kv_head) and dominated prefill
+ * time (O(n_tokens * n_kv_heads) launches for a handful of FP16 elements
+ * each).
+ *
+ * ---- Decode attention kernel ----
  * One thread block per KV head. Within each block, kv_mul warps (or thread
  * groups) process the kv_mul query heads that share this KV head.
  *
  * Shared memory: holds one KV position's K and V (head_dim FP16 each).
  * Each query-head group maintains its own online-softmax state in registers.
  *
- * For kv_mul up to 8, we assign threads contiguously: threads 0..(head_dim-1)
  /* ---- Decode attention kernel (one thread block per KV head,
  * processes all kv_mul Q heads, loop over positions, shared mem K/V) ----
  *
@@ -1920,52 +1892,31 @@ picolm_gpu_kv_free(void) {
 }
 
 extern "C" int
-picolm_gpu_kv_store(int is_k, int layer_ordinal, int pos, int kv_head,
-                     const uint16_t *vec_f16, int head_dim,
-                     int n_kv_heads, int max_seq_len,
-                     size_t kv_head_stride, int device) {
+picolm_gpu_kv_store_rows(int is_k, int layer_ordinal, int start_pos, int n_positions,
+                          const void *host_rows, size_t row_bytes,
+                          int n_kv_heads, int head_dim, int max_seq_len, int device) {
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
     if (!g_kv_k_dev[device] || !g_kv_v_dev[device]) return 0;
 
-    uint16_t *dst = is_k ? g_kv_k_dev[device] : g_kv_v_dev[device];
-    /* Layout: [layer_ordinal][pos][kv_head][head_dim]
-     * stride: layer -> pos: max_seq_len * n_kv_heads * kv_head_stride
-     *         pos -> kv_head: n_kv_heads * kv_head_stride
-     *         kv_head -> next: kv_head_stride
-     * All in bytes. Convert to uint16_t indices by /2. */
-    size_t base_off = (size_t)layer_ordinal * max_seq_len * n_kv_heads * kv_head_stride / 2
-                    + (size_t)pos * n_kv_heads * kv_head_stride / 2
-                    + (size_t)kv_head * kv_head_stride / 2;
+    /* Sanity: row_bytes must match the F16 GQA row size this cache was
+     * sized for. If a caller passes a quantized row_bytes here, refuse
+     * rather than silently corrupting the cache. */
+    size_t expect_row_bytes = (size_t)n_kv_heads * head_dim * sizeof(uint16_t);
+    if (row_bytes != expect_row_bytes) return 0;
 
-    int n_threads = min(head_dim, 256);
-    int n_blocks = (head_dim + n_threads - 1) / n_threads;
-    picolm_gpu_kv_store_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
-        dst, vec_f16, base_off, head_dim);
-    return 1;
-}
+    uint16_t *dst_base = is_k ? g_kv_k_dev[device] : g_kv_v_dev[device];
+    /* Layout: [layer_ordinal][pos][kv_head][head_dim], contiguous rows.
+     * n_positions contiguous rows starting at start_pos == one memcpy. */
+    size_t layer_off_bytes = (size_t)layer_ordinal * max_seq_len * row_bytes;
+    size_t pos_off_bytes = (size_t)start_pos * row_bytes;
+    uint8_t *dst = (uint8_t *)dst_base + layer_off_bytes + pos_off_bytes;
 
-extern "C" int
-picolm_gpu_kv_store_batch(int is_k, int layer_ordinal, int start_pos, int n_tokens,
-                           const uint16_t *vecs_f16,
-                           int head_dim, int kv_head,
-                           int n_kv_heads, int max_seq_len,
-                           size_t kv_head_stride, int device) {
-    gpu_device_ctx_t *ctx = find_ctx(device);
-    if (!ctx || !select_ctx(ctx)) return 0;
-    if (!g_kv_k_dev[device] || !g_kv_v_dev[device]) return 0;
-
-    uint16_t *dst = is_k ? g_kv_k_dev[device] : g_kv_v_dev[device];
-    size_t base_off = (size_t)layer_ordinal * max_seq_len * n_kv_heads * kv_head_stride / 2
-                    + (size_t)kv_head * kv_head_stride / 2;
-    /* pos_stride_bytes within this layer for one position (all kv_heads) */
-    size_t pos_stride_bytes = (size_t)n_kv_heads * kv_head_stride;
-
-    int n_threads = min(head_dim, 256);
-    int n_blocks = (head_dim + n_threads - 1) / n_threads;
-    picolm_gpu_kv_store_batch_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
-        dst, vecs_f16, base_off, head_dim,
-        pos_stride_bytes, n_tokens, start_pos);
+    size_t copy_bytes = (size_t)n_positions * row_bytes;
+    if (!gpu_ok(gpuMemcpyAsync(dst, host_rows, copy_bytes,
+                               gpuMemcpyHostToDevice, ctx->stream),
+                "kv_store_rows async copy"))
+        return 0;
     return 1;
 }
 

@@ -2327,12 +2327,14 @@ float *model_forward(model_t *m, int token, int pos) {
 #else
                     for (int d = 0; d < head_dim; d++) kf[d] = fp32_to_fp16(k_head[d]);
 #endif
-                    /* Phase 1: Also store to GPU KV cache */
-                    if (gpu_ok && m->gpu.kv_active) {
-                        picolm_gpu_kv_store(1, this_attn_ordinal, pos, hkv,
-                                            kf, head_dim, n_kv_heads, seq_len,
-                                            s->kv_head_stride_k, gpu_dev);
-                    }
+                }
+                /* Phase 1.5: key_pos now holds the full contiguous GQA row
+                 * (all kv_heads) -- one bulk async copy instead of one
+                 * kernel launch per head. */
+                if (gpu_ok && m->gpu.kv_active) {
+                    picolm_gpu_kv_store_rows(1, this_attn_ordinal, pos, 1,
+                                             key_pos, s->kv_row_size_k,
+                                             n_kv_heads, head_dim, seq_len, gpu_dev);
                 }
             }
         }
@@ -2371,12 +2373,11 @@ float *model_forward(model_t *m, int token, int pos) {
 #else
                     for (int d = 0; d < head_dim; d++) vf[d] = fp32_to_fp16(v_head[d]);
 #endif
-                    /* Phase 1: Also store to GPU KV cache */
-                    if (gpu_ok && m->gpu.kv_active) {
-                        picolm_gpu_kv_store(0, this_attn_ordinal, pos, hkv,
-                                            vf, head_dim, n_kv_heads, seq_len,
-                                            s->kv_head_stride_v, gpu_dev);
-                    }
+                }
+                if (gpu_ok && m->gpu.kv_active) {
+                    picolm_gpu_kv_store_rows(0, this_attn_ordinal, pos, 1,
+                                             val_pos, s->kv_row_size_v,
+                                             n_kv_heads, head_dim, seq_len, gpu_dev);
                 }
             }
         }
@@ -6148,15 +6149,9 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                                 kf[d2] = fp32_to_fp16(k_head[d2]);
                         }
                     }
-                    /* Phase 1: GPU KV cache store for K (prefill, per position) */
-                    if (gpu_ok && m->gpu.kv_active && s->kv_type_k == KV_CACHE_F16) {
-                        for (int hkv = 0; hkv < n_kv_heads; hkv++) {
-                            uint16_t *kf = (uint16_t *)(kp + hkv * s->kv_head_stride_k);
-                            picolm_gpu_kv_store(1, this_attn_ord, pos, hkv,
-                                                kf, head_dim, n_kv_heads, seq_len,
-                                                s->kv_head_stride_k, gpu_dev);
-                        }
-                    }
+                    /* Phase 1.5: GPU KV store for this chunk is done once,
+                     * after the bi loop below, as a single bulk copy -
+                     * see "GPU KV cache: bulk store" below. */
                     /* Hadamard rotation of V before quantization (prefill) */
                     if (s->kv_hadamard_v && s->kv_type_v != KV_CACHE_F16) {
                         for (int hkv = 0; hkv < n_kv_heads; hkv++) {
@@ -6175,16 +6170,23 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                                 vf[d2] = fp32_to_fp16(v_head[d2]);
                         }
                     }
-                    /* Phase 1: GPU KV cache store for V (prefill, per position) */
-                    if (gpu_ok && m->gpu.kv_active && s->kv_type_v == KV_CACHE_F16) {
-                        for (int hkv = 0; hkv < n_kv_heads; hkv++) {
-                            uint16_t *vf = (uint16_t *)(vp + hkv * s->kv_head_stride_v);
-                            picolm_gpu_kv_store(0, this_attn_ord, pos, hkv,
-                                                vf, head_dim, n_kv_heads, seq_len,
-                                                s->kv_head_stride_v, gpu_dev);
-                        }
                     }
-                }
+            }
+
+            /* Phase 1.5: GPU KV cache bulk store. kcl/vcl already hold
+             * n_tokens contiguous F16 GQA rows starting at start_pos
+             * (identical layout to the device cache) -- one async copy
+             * per K/V per chunk, replacing n_tokens*n_kv_heads launches. */
+            if (gpu_ok && m->gpu.kv_active &&
+                s->kv_type_k == KV_CACHE_F16 && s->kv_type_v == KV_CACHE_F16) {
+                picolm_gpu_kv_store_rows(1, this_attn_ord, start_pos, n_tokens,
+                                         kcl + (size_t)start_pos * s->kv_row_size_k,
+                                         s->kv_row_size_k, n_kv_heads, head_dim,
+                                         seq_len, gpu_dev);
+                picolm_gpu_kv_store_rows(0, this_attn_ord, start_pos, n_tokens,
+                                         vcl + (size_t)start_pos * s->kv_row_size_v,
+                                         s->kv_row_size_v, n_kv_heads, head_dim,
+                                         seq_len, gpu_dev);
             }
 
             /* Zero init xb_batch for attention accumulation */

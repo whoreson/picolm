@@ -120,27 +120,27 @@ int picolm_gpu_ssm_recurrence(float *state,
  * Returns 1 on success, 0 -> caller falls back to CPU KV cache. */
 int picolm_gpu_kv_alloc(size_t kv_k_bytes, size_t kv_v_bytes, int device);
 
-/* Store one K or V vector (F16) at [layer_ordinal][pos][kv_head].
- * vec_f16 is an array of head_dim uint16_t values.
- * head_dim: number of FP16 elements per head.
- * n_kv_heads: total KV heads per layer.
- * max_seq_len: maximum sequence length (for stride computation).
- * kv_head_stride: bytes per head within a GQA row (== head_dim * sizeof(uint16_t)).
- * Returns 1 on success. */
-int picolm_gpu_kv_store(int is_k, int layer_ordinal, int pos, int kv_head,
-                         const uint16_t *vec_f16, int head_dim,
-                         int n_kv_heads, int max_seq_len,
-                         size_t kv_head_stride, int device);
-
-/* Store a batch of K or V vectors (F16) for prefill.
- * vecs_f16 is [n_tokens][head_dim] in FP16.
- * start_pos: KV position of vecs_f16[0].
- * Returns 1 on success. */
-int picolm_gpu_kv_store_batch(int is_k, int layer_ordinal, int start_pos, int n_tokens,
-                               const uint16_t *vecs_f16,
-                               int head_dim, int kv_head,
-                               int n_kv_heads, int max_seq_len,
-                               size_t kv_head_stride, int device);
+/* Store one or more full GQA rows (F16) into the device KV cache.
+ *
+ * Phase 1.5: the CPU-side KV cache (s->key_cache / s->val_cache) already
+ * stores each row as [kv_head][head_dim] contiguous FP16 -- byte-identical
+ * to the device layout [layer][pos][kv_head][head_dim]. There is therefore
+ * no per-head or per-element work to do on the device side at all; this is
+ * a single async H2D copy of `n_positions` contiguous rows starting at
+ * `start_pos`. This replaces both the old per-head decode kernel launch
+ * and the old per-token/per-head prefill loop (which cost O(n_tokens *
+ * n_kv_heads) launches and was the source of the prefill regression).
+ *
+ * host_rows: pointer to `n_positions` contiguous rows, i.e.
+ *            s->key_cache/val_cache + this_attn_ordinal*seq_len*row_bytes
+ *                                   + start_pos*row_bytes
+ * row_bytes: n_kv_heads * head_dim * sizeof(uint16_t) (== kv_row_size_k/v
+ *            for KV_CACHE_F16 -- caller must only call this for F16 KV).
+ * Returns 1 on success, 0 -> caller must fall back (row_bytes mismatch,
+ * alloc missing, etc). */
+int picolm_gpu_kv_store_rows(int is_k, int layer_ordinal, int start_pos, int n_positions,
+                              const void *host_rows, size_t row_bytes,
+                              int n_kv_heads, int head_dim, int max_seq_len, int device);
 
 /* Decode-path attention: S=1, one query per head, online softmax over pos+1
  * cached positions. q is host pointer [n_heads][head_dim] in F32.
