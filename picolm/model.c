@@ -6600,3 +6600,15 @@ void model_ssm_state_reset(model_t *m) {
                    (size_t)c->ssm_d_state * c->ssm_d_inner * sizeof(float));
     }
 }
+
+/* Phase 2: GPU-pipelined decode (skeleton)
+ * Keeps activations on-device across all layers.
+ * Falls back to model_forward until fully implemented.
+ * The elementwise kernels (gpu_rmsnorm, gpu_rope_apply,
+ * gpu_residual_add) are implemented in backend_gpu.cu. */
+float *model_forward_gpu(model_t *m, int token, int pos) {
+    /* Phase 2: TODO - wire elementwise kernels into layer loop.
+     * For now, fall back to CPU path. */
+    return model_forward(m, token, pos);
+}
+

@@ -312,6 +312,12 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
 float *model_forward(model_t *m, int token, int pos);
 float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int start_pos);
 
+/* GPU-pipelined forward pass (Phase 2).
+ * Keeps activations on-device across layers, eliminating per-layer H2D/D2H
+ * for the residual stream. Falls back to model_forward on unsupported models.
+ * Returns pointer to logits[vocab_size] on host. */
+float *model_forward_gpu(model_t *m, int token, int pos);
+
 /* Free all resources. */
 void model_free(model_t *m);
 
