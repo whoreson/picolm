@@ -536,10 +536,15 @@ int main(int argc, char **argv) {
                                int viz_port, int viz_width, int viz_height);
         /* When --viz is specified in server mode, pass the viz parameters through.
          * When --viz is not specified, viz_port=0 so server_init skips viz. */
-        int srv_viz_port = viz_mode ? viz_port : 0;
+        int srv_viz_port = 0, srv_viz_width = 800, srv_viz_height = 480;
+#ifdef PICOLM_VIZ
+        srv_viz_port = viz_mode ? viz_port : 0;
+        srv_viz_width = viz_width;
+        srv_viz_height = viz_height;
+#endif
         return server_main(server_port, server_host, model_path, num_threads, do_prefault, context_override, mem_mb,
                            checkpoint_max, checkpoint_interval, checkpoint_interval_gen, checkpoint_tail_offset,
-                           srv_viz_port, viz_width, viz_height);
+                           srv_viz_port, srv_viz_width, srv_viz_height);
     }
 
     if (!prompt) {
