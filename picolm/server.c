@@ -1695,6 +1695,9 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
     cJSON *item;
     if ((item = cJSON_GetObjectItem(req, "n_predict")))
         n_predict = (int)cJSON_GetNumberValue(item);
+    /* Also accept OpenAI-style 'max_tokens' as alias for n_predict */
+    if ((item = cJSON_GetObjectItem(req, "max_tokens")) && n_predict < 0)
+        n_predict = (int)cJSON_GetNumberValue(item);
     if ((item = cJSON_GetObjectItem(req, "temperature")))
         temperature = (float)cJSON_GetNumberValue(item);
     if ((item = cJSON_GetObjectItem(req, "top_p")))
