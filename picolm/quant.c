@@ -4234,64 +4234,49 @@ float vec_dot_q2_K_q8_K(const void *src_q2, const void *src_q8, int n) {
         const int summs = vgetq_lane_s32(msum, 0) + vgetq_lane_s32(msum, 1) +
                           vgetq_lane_s32(msum, 2) + vgetq_lane_s32(msum, 3);
 
-        /* Main dot product: iterate over 2 chunks of 128 values */
+        /* Main dot product: iterate over 2 chunks of 128 values.
+         * Each chunk has 32 qs bytes. Within each chunk, 4 shifts
+         * (0,2,4,6) extract 2-bit values from those 32 bytes.
+         * Per shift: 16 values from q2[0..15] (sub-block 0) and
+         * 16 values from q2[16..31] (sub-block 1), each paired
+         * with 16 q8 values = 32 q8 consumed per shift.
+         * Total: 2 chunks * 4 shifts * 32 q8 = 256 q8 per block. */
         int isum = 0;
         int is = 0;
         for (int chunk = 0; chunk < 2; ++chunk) {
-            /* Load 32 qs bytes (2 groups of 16 bytes, each covering 16*4=64 values) */
-            const uint8x16_t q2a = vld1q_u8(q2);
-            const uint8x16_t q2b = vld1q_u8(q2 + 16);
+            /* Load 32 qs bytes, process 4 shifts in-place */
+            uint8x16_t q2a = vld1q_u8(q2);
+            uint8x16_t q2b = vld1q_u8(q2 + 16);
             q2 += 32;
 
             for (int shift_i = 0; shift_i < 4; ++shift_i) {
-                /* Extract 2-bit values at current shift */
-                const int8x16_t qa_lo = vreinterpretq_s8_u8(vandq_u8(q2a, m3));
-                const int8x16_t qb_lo = vreinterpretq_s8_u8(vandq_u8(q2b, m3));
+                /* Extract one 2-bit field from each byte */
+                const int8x16_t qa = vreinterpretq_s8_u8(vandq_u8(q2a, m3));
+                const int8x16_t qb = vreinterpretq_s8_u8(vandq_u8(q2b, m3));
+                q2a = vshrq_n_u8(q2a, 2);
+                q2b = vshrq_n_u8(q2b, 2);
 
-                /* Multiply with corresponding Q8_K values (32 per group) */
+                /* 16 q8 values for qa, 16 for qb */
                 const int8x16_t q8a = vld1q_s8(q8);
                 const int8x16_t q8b = vld1q_s8(q8 + 16);
                 q8 += 32;
 
-                /* int8 x int8 -> int16 -> int32 reduce */
-                const int16x8_t p0a = vmull_s8(vget_low_s8(qa_lo), vget_low_s8(q8a));
-                const int16x8_t p1a = vmull_s8(vget_high_s8(qa_lo), vget_high_s8(q8a));
+                /* qa dot q8a */
+                const int16x8_t p0a = vmull_s8(vget_low_s8(qa), vget_low_s8(q8a));
+                const int16x8_t p1a = vmull_s8(vget_high_s8(qa), vget_high_s8(q8a));
                 const int32x4_t s0a = vaddq_s32(vpaddlq_s16(p0a), vpaddlq_s16(p1a));
-
-                const int16x8_t p0b = vmull_s8(vget_low_s8(qb_lo), vget_low_s8(q8b));
-                const int16x8_t p1b = vmull_s8(vget_high_s8(qb_lo), vget_high_s8(q8b));
-                const int32x4_t s0b = vaddq_s32(vpaddlq_s16(p0b), vpaddlq_s16(p1b));
-
                 int dot_a = vgetq_lane_s32(s0a, 0) + vgetq_lane_s32(s0a, 1) +
                             vgetq_lane_s32(s0a, 2) + vgetq_lane_s32(s0a, 3);
+
+                /* qb dot q8b */
+                const int16x8_t p0b = vmull_s8(vget_low_s8(qb), vget_low_s8(q8b));
+                const int16x8_t p1b = vmull_s8(vget_high_s8(qb), vget_high_s8(q8b));
+                const int32x4_t s0b = vaddq_s32(vpaddlq_s16(p0b), vpaddlq_s16(p1b));
                 int dot_b = vgetq_lane_s32(s0b, 0) + vgetq_lane_s32(s0b, 1) +
                             vgetq_lane_s32(s0b, 2) + vgetq_lane_s32(s0b, 3);
 
                 isum += dot_a * aux[is] + dot_b * aux[is + 1];
-
-                /* Shift for next 2-bit field */
-                const int8x16_t qa_hi = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q2a, 2), m3));
-                const int8x16_t qb_hi = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(q2b, 2), m3));
-
-                const int8x16_t q8c = vld1q_s8(q8);
-                const int8x16_t q8d = vld1q_s8(q8 + 16);
-                q8 += 32;
-
-                const int16x8_t p2a = vmull_s8(vget_low_s8(qa_hi), vget_low_s8(q8c));
-                const int16x8_t p3a = vmull_s8(vget_high_s8(qa_hi), vget_high_s8(q8c));
-                const int32x4_t s2a = vaddq_s32(vpaddlq_s16(p2a), vpaddlq_s16(p3a));
-
-                const int16x8_t p2b = vmull_s8(vget_low_s8(qb_hi), vget_low_s8(q8d));
-                const int16x8_t p3b = vmull_s8(vget_high_s8(qb_hi), vget_high_s8(q8d));
-                const int32x4_t s2b = vaddq_s32(vpaddlq_s16(p2b), vpaddlq_s16(p3b));
-
-                dot_a = vgetq_lane_s32(s2a, 0) + vgetq_lane_s32(s2a, 1) +
-                        vgetq_lane_s32(s2a, 2) + vgetq_lane_s32(s2a, 3);
-                dot_b = vgetq_lane_s32(s2b, 0) + vgetq_lane_s32(s2b, 1) +
-                        vgetq_lane_s32(s2b, 2) + vgetq_lane_s32(s2b, 3);
-
-                isum += dot_a * aux[is + 2] + dot_b * aux[is + 3];
-                is += 4;
+                is += 2;
             }
         }
 
