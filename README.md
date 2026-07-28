@@ -17,28 +17,28 @@
 
 ---
 
-# PicoLM - But It's Actually Useful (v1.0-alpha1)
+# PicoLM - But It's Actually Useful (v1.0-beta2)
 
-> **143 commits. Zero new dependencies. Up to 70B models.**
+> **143 commits (alpha1) + 132 commits (beta1-beta2). Zero new dependencies. Up to 70B models.**
 
-The original PicoLM was a clever proof-of-concept: mmap a GGUF, stream layers through 45MB of RAM, call it a day. Noble effort, but it was missing basically everything you need to actually use an LLM. So [gabucino](http://gabucino.hu) went in and added 143 commits across quantization acceleration, model support, HTTP server, and cross-platform fixes.
+The original PicoLM was a clever proof-of-concept: mmap a GGUF, stream layers through 45MB of RAM, call it a day. Noble effort, but it was missing basically everything you need to actually use an LLM. So [gabucino](http://gabucino.hu) went in and added hundreds of commits across quantization acceleration, model support, HTTP server, GPU backends, and cross-platform fixes.
 
 **What was added since the upstream baseline:**
 
 | Category | Details |
 |----------|---------|
 | **Quantization** | Q8_0, Q4_K, Q4_0, Q4_1, Q2_K, Q3_K, Q5_K, Q6_K, Q8_K, Q4_0_8_8, Q4_0_4_4, Q1_0, Q2_0, F16, BF16, F32 |
-| **SIMD: x86** | AVX-512 (VNNI, fp16x16, vec_dot, rmsnorm, RoPE, attention), AVX2 (full int8 MAC), AVX/SSE2 (Q8_0, Q4_K, attention FMA) |
-| **SIMD: ARM** | NEON (RoPE, FP16 HW convert, Q8_0 int8 MAC, attention), DotProd (Q4_0_4_4, ARMv8.2+ SDOT) |
+| **SIMD: x86** | AVX-512 (VNNI, fp16x16, vec_dot, rmsnorm, RoPE, attention, Q6_K, Q3_K, SSM), AVX2 (full int8 MAC, Q6_K, Q3_K, SSM), AVX/SSE2 (Q8_0, Q4_K, attention FMA, SSM) |
+| **SIMD: ARM** | NEON (RoPE, FP16 HW convert, Q8_0 int8 MAC, attention, SSM kernels), DotProd (Q4_0_4_4, ARMv8.2+ SDOT) |
 | **Models** | Llama 1/2/3, Qwen2, Qwen3 (non-uniform head_dim), Qwen3.5/3.6 (SSM/Mamba hybrid) |
 | **Scale** | Tested up to 70B parameters (miq-70b), 128 layers max |
 | **HTTP server** | OpenAI API (`/v1/completions`, `/v1/chat/completions`, `/v1/models`), llama.cpp-compatible (`/completion`, `/props`), `/tokenize`, `/detokenize`, `/health`, streaming, persistent model/KV cache |
 | **Threading** | Persistent thread pool (gen-counter barrier), physical core auto-detect, GQA grouped attention, tiled/blocked attention for prefill, batched GEMV |
 | **Platform** | Linux (AVX-512/VNNI, ARM NEON, RISC-V), Windows (SRWLOCK, MinGW, VirtualLock, `--mem`) |
-| **KV cache** | F16, Q8_0 (53% memory), Q4_0 (34% memory), persistent with prefix matching |
-| **Misc** | 64KB FP16 lookup table, `--mem` mlock, `--prefault`, `--daemon`, `--json` grammar, grammar-constrained JSON |
+| **KV cache** | F16, Q8_0 (53% memory), Q4_0 (34% memory), Walsh-Hadamard rotation (`-khad`/`-vhad`), persistent with prefix matching |
+| **Misc** | 64KB FP16 lookup table, `--mem` mlock, `--prefault`, `--daemon`, `--json` grammar, VNC visualization server, `bench.zsh` benchmark harness |
 
-**GPU:** Metal backend for Apple Silicon (`make metal`, zero external deps — raw Metal framework). CUDA/HIP infrastructure also exists. **Not yet:** SSM KV rewinding (checkpointing planned).
+**GPU:** Metal backend for Apple Silicon (`make metal`, SSM kernels, multi-output GEMV, FFN fusion). CUDA (Q4_0/Q4_K/Q8_0, WMMA Tensor Core, SSM) and HIP/ROCm also supported.
 
 ---
 
@@ -207,12 +207,12 @@ The model file (638MB) stays on disk. PicoLM **memory-maps** it and streams one 
 | Feature | Description |
 |---------|-------------|
 | **GGUF Native** | Reads GGUF v2/v3 files directly — no conversion needed |
-| **K-Quant Support** | Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, F16, F32 |
+| **K-Quant Support** | Q1_0, Q2_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, Q4_1, F16, BF16, F32 |
 | **mmap Layer Streaming** | Model weights stay on disk; OS pages in one layer at a time |
 | **FP16 KV Cache** | Halves KV cache memory (44MB vs 88MB for 2048 context) |
 | **Flash Attention** | Online softmax — no O(seq_len) attention buffer needed |
 | **Pre-computed RoPE** | cos/sin lookup tables eliminate transcendentals from hot loop |
-| **SIMD Acceleration** | ARM NEON (Pi 3/4/5), x86 SSE2/SSE3/AVX/AVX2 — auto-detected at compile time |
+| **SIMD Acceleration** | ARM NEON (Pi 3/4/5), x86 SSE2/SSE3/AVX/AVX2/AVX-512 (VNNI) - auto-detected at compile time |
 | **Fused Dot Products** | Dequantize + dot-product in one pass — no intermediate buffer |
 | **Multi-threaded matmul** | Parallel matrix-vector multiply across CPU cores |
 | **Grammar-Constrained JSON** | `--json` flag forces valid JSON output (for tool calling) |
@@ -302,8 +302,8 @@ make metal                          # builds picolm with -DPICOLM_GPU=1
 PICOLM_GPU=1 ./picolm model.gguf -p "Hello" -n 50    # run on the GPU
 ```
 
-Supported quantizations: F32, F16, Q4_0, Q8_0, Q4_K, Q5_K, Q6_K. The dequant
-kernels are faithful ports of PicoLM's CPU `dequantize_row_*` (the GGUF/
+Supported quantizations: F32, F16, Q4_0, Q8_0, Q4_K, Q5_K, Q6_K.
+The dequant kernels are faithful ports of PicoLM's CPU `dequantize_row_*` (the GGUF/
 llama.cpp block layouts). A self-contained kernel smoke-test lives in
 `probes/metal_reduction_probe.mm` (`make metal-probe-run`).
 
