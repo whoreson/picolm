@@ -505,6 +505,33 @@ static void checkpoint_restore_log(int target, int actual, int kv_match, int suc
     }
 }
 
+/* When the prompt is fully cached, adjust start_pos so that at least one
+ * token is re-evaluated. Prevents the n_prefill<=0 path from writing a
+ * duplicate KV entry for the last prompt token at the wrong position.
+ * Matches llama.cpp: if (n_past == task.n_tokens() && n_past > 0) n_past--;
+ */
+static void cache_adjust_stepback(model_t *model, int n_prompt, int *start_pos) {
+    if (*start_pos < n_prompt || *start_pos <= 0) return;
+
+    if (model->config.has_ssm && srv.max_checkpoints > 0) {
+        int target = n_prompt - 1;
+        int actual = 0;
+        if (checkpoint_restore(target, &actual) == 0) {
+            *start_pos = actual;
+            if (actual < srv.last_prompt_len) {
+                srv.last_prompt_len = actual;
+            }
+            checkpoint_restore_log(target, actual, 0, 1);
+        } else {
+            *start_pos = 0;
+            model_ssm_state_reset(model);
+            checkpoint_restore_log(target, 0, 0, 0);
+        }
+    } else {
+        (*start_pos)--;
+    }
+}
+
 /* Clear all checkpoints and free their memory */
 static void checkpoint_clear(void) {
     int n = checkpoint_count();
@@ -1216,6 +1243,9 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         }
     }
 
+    /* Step back when fully cached to avoid duplicate KV entry (see cache_adjust_stepback) */
+    cache_adjust_stepback(model, n_prompt, &start_pos);
+
     if (start_pos == 0) {
         srv.kv_pos = 0;
         /* Clear checkpoints on full reprocess - conversation has reset */
@@ -1757,9 +1787,10 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             if (ptokens[cache_start] != srv.last_prompt_tokens[cache_start]) break;
         }
     }
-    /* Use shared prefix from KV cache. The attention loop iterates
-     * from t=0 to t<=pos, so stale KV data at positions beyond n_prompt
-     * is never read (it will be overwritten during generation). */
+    /* Use shared prefix from KV cache. Stale KV data at positions beyond
+     * the prompt is harmless during generation (it gets overwritten).
+     * When the prompt is fully cached, we step back 1 token below so that
+     * at least one token is re-evaluated, preventing a duplicate KV entry. */
     int start_pos = cache_start;
     fprintf(stderr, "[server] %.1fms: KV cache match %d/%d tokens (%d new)\n", get_time_ms() - t0, start_pos, n_prompt, n_prompt - start_pos);
 
@@ -1778,6 +1809,9 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             checkpoint_restore_log(cache_start, 0, cache_start, 0);
         }
     }
+
+    /* Step back when fully cached to avoid duplicate KV entry (see cache_adjust_stepback) */
+    cache_adjust_stepback(model, n_prompt, &start_pos);
 
     if (start_pos == 0) {
         srv.kv_pos = 0;

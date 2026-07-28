@@ -2435,9 +2435,9 @@ float vec_dot_q3_K_q8_K(const void *src_q3, const void *src_q8, int n) {
 
     const uint32_t kmask1 = 0x03030303;
     const uint32_t kmask2 = 0x0f0f0f0f;
-    uint32_t aux[3];
 
 #if defined(PICOLM_AVX2)
+    uint32_t aux[3];
     static const uint8_t k_shuffle[128] = {
          0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,     2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3,
          4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5,     6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7,
