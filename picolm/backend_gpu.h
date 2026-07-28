@@ -52,6 +52,15 @@ int picolm_gpu_tensor_upload(void **tensor,
 int picolm_gpu_matmul(picolm_gpu_tensor_t *t,
                        float *y, const float *x, int S, int device);
 
+/* Device-native variant: x/y are already device pointers (Phase 2
+ * pipeline buffers), no H2D/D2H, no internal sync. Caller must call
+ * gpuDeviceSynchronize() once at the end of the whole forward pass
+ * before reading anything back via D2H. Must not alias the scratch
+ * buffers picolm_gpu_matmul() itself uses internally. Returns 1 on
+ * success. */
+int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t,
+                           float *y_dev, const float *x_dev, int S, int device);
+
 /* Fused expert-style MLP: y = down(silu(gate(x)) * up(x))
  * All three tensors must be resident on the same device.
  * Activations cross PCIe once in each direction.
@@ -153,6 +162,16 @@ int picolm_gpu_attention_decode(float *xb_out, const float *q,
                                  int n_heads, int n_kv_heads, int head_dim,
                                  int max_seq_len, int device);
 
+/* Device-native variant: q_dev/xb_out_dev are already device pointers,
+ * no H2D/D2H, no internal sync. Caller must have already issued the KV
+ * store for `pos` on the same stream (ctx->stream) before calling this,
+ * so in-stream ordering guarantees the write lands before this kernel's
+ * read. Must not alias ctx->x/ctx->y. Returns 1 on success. */
+int picolm_gpu_attention_decode_dev(float *xb_out_dev, const float *q_dev,
+                                     int layer_ordinal, int pos,
+                                     int n_heads, int n_kv_heads, int head_dim,
+                                     int max_seq_len, int device);
+
 /* Prefill-path attention: S queries, causal mask, tiled online-softmax merge.
  * q: host [n_tokens][n_heads][head_dim] in F32.
  * xb_out: host [n_tokens][n_heads][head_dim] in F32 (pre-zeroed by caller).
@@ -188,6 +207,13 @@ int picolm_gpu_rope_apply(float *x, int n_heads, int head_dim,
  * All device pointers. Returns 1 on success. */
 int picolm_gpu_residual_add(float *out, const float *a, const float *b,
                              int n, int device);
+
+/* SiLU-mul on device, in place: gate[i] = silu(gate[i]) * up[i].
+ * All device pointers, on ctx->stream (required for pipeline ordering --
+ * unlike the internal use inside picolm_gpu_expert_mlp(), which is safe
+ * without this because that function still syncs at the end). */
+int picolm_gpu_silu_mul_dev(float *gate_dev, const float *up_dev,
+                             size_t n, int device);
 
 /* Free a GPU tensor (device memory + host handle). */
 void picolm_gpu_tensor_free(picolm_gpu_tensor_t *tensor);

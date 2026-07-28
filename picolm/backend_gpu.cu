@@ -1614,6 +1614,64 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
     return 1;
 }
 
+/* Device-native matmul: x_dev and y_dev are already device-resident
+ * pointers owned by the caller (Phase 2 pipeline buffers) -- no H2D, no
+ * D2H, no gpuDeviceSynchronize(). Mirrors picolm_gpu_matmul() exactly
+ * (same eligibility checks, same kernels, same Q8_0 special-case path)
+ * except for the copies and the per-step sync.
+ *
+ * Safe to omit the sync here: all kernels below are launched on
+ * ctx->stream, and CUDA guarantees in-order execution of work queued to
+ * the same stream, so the q8 quantize kernel is guaranteed complete
+ * before the q8_q8 matmul kernel reads its output, with no explicit sync
+ * needed in between. The caller (model_forward_gpu) must call
+ * gpuDeviceSynchronize() exactly once, after the very last op of the
+ * whole forward pass and before reading any result back via D2H -- not
+ * after each layer or each matmul. That single sync is what actually
+ * eliminates the ~14-syncs/layer overhead Phase 2 exists to remove.
+ *
+ * x_dev/y_dev must NOT alias ctx->x/ctx->y/ctx->q8_xq/ctx->q8_xd (those
+ * are still used internally here as Q8_0 quantize scratch) -- pass
+ * dedicated pipeline buffers. */
+extern "C" int
+picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
+                       int S, int device) {
+    if (!t || !y_dev || !x_dev || S < 1) return 0;
+    if (t->I < 512 || t->O < 256) return 0;
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!select_ctx(ctx)) return 0;
+
+    int I = t->I, O = t->O;
+
+    if (t->qtype == GGUF_TYPE_Q8_0) {
+        int n_blocks = I / 32;
+        if (n_blocks < 1 || I % 32 != 0) return 0; /* must be aligned */
+
+        size_t xq_bytes = (size_t)S * I;
+        size_t xd_bytes = (size_t)S * n_blocks * sizeof(float);
+        if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, xq_bytes) ||
+            !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
+
+        dim3 q_grid((unsigned)n_blocks, (unsigned)S);
+        picolm_quantize_q8_0<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
+            ctx->q8_xq, ctx->q8_xd, x_dev, I, S);
+        if (!gpu_ok(gpuGetLastError(), "q8 quantize (dev)")) return 0;
+
+        dim3 grid((unsigned)O, (unsigned)S);
+        picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
+            y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes);
+        if (!gpu_ok(gpuGetLastError(), "q8 matmul (dev)")) return 0;
+        return 1;
+    }
+
+    dim3 grid((unsigned)O, (unsigned)S);
+    picolm_quant_matmul<<<grid, 256, 0, ctx->stream>>>(y_dev, x_dev, t->weights,
+                                        t->qtype, S, I, O,
+                                        (int)t->row_bytes);
+    if (!gpu_ok(gpuGetLastError(), "matmul launch (dev)")) return 0;
+    return 1;
+}
+
 int picolm_gpu_expert_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
                            picolm_gpu_tensor_t *down, float *y, const float *x, int S) {
     if (!gate || !up || !down || !x || !y || S < 1 ||
@@ -1979,6 +2037,45 @@ picolm_gpu_attention_decode(float *xb_out, const float *q_host,
     return 1;
 }
 
+/* Device-native decode attention: q_dev and xb_out_dev are already
+ * device-resident (Phase 2 pipeline buffers, e.g. the output of the Q
+ * projection matmul_dev and rope_apply, both in place on the same
+ * buffer). No H2D, no D2H, no gpuDeviceSynchronize() -- same ordering
+ * argument as picolm_gpu_matmul_dev: this kernel and picolm_gpu_kv_store_rows
+ * (the KV write for this position) are both launched on ctx->stream, so
+ * in-stream ordering guarantees the K/V write for `pos` is visible before
+ * this kernel reads it, PROVIDED the K/V store call for `pos` happens
+ * first in program order on the same device/stream -- caller must store
+ * K/V before calling this. q_dev/xb_out_dev must not alias ctx->x/ctx->y. */
+extern "C" int
+picolm_gpu_attention_decode_dev(float *xb_out_dev, const float *q_dev,
+                                 int layer_ordinal, int pos,
+                                 int n_heads, int n_kv_heads, int head_dim,
+                                 int max_seq_len, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    if (!g_kv_k_dev[device] || !g_kv_v_dev[device]) return 0;
+    if (head_dim > 256) return 0; /* stack array limit */
+
+    int kv_mul = n_heads / n_kv_heads;
+    if (kv_mul < 1 || kv_mul > 8) return 0;
+
+    size_t kv_pos_stride_bytes = (size_t)n_kv_heads * head_dim * sizeof(uint16_t);
+    size_t kv_head_stride_bytes = head_dim * sizeof(uint16_t);
+    size_t shared_bytes = 2 * head_dim * sizeof(uint16_t) + 256 * sizeof(float);
+    int block_threads = 256;
+
+    dim3 grid((unsigned)n_kv_heads, 1, 1);
+    picolm_gpu_attention_decode_kernel<<<grid, block_threads, (unsigned)shared_bytes, ctx->stream>>>(
+        xb_out_dev, q_dev,
+        g_kv_k_dev[device], g_kv_v_dev[device],
+        layer_ordinal, pos, n_heads, n_kv_heads, head_dim, max_seq_len,
+        kv_pos_stride_bytes, kv_head_stride_bytes);
+
+    if (!gpu_ok(gpuGetLastError(), "attn decode kernel (dev)")) return 0;
+    return 1;
+}
+
 extern "C" int
 picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
                               int layer_ordinal, int start_pos, int n_tokens,
@@ -2024,19 +2121,18 @@ picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
  * Phase 2: Device-resident elementwise kernels (stubs)
  * ================================================================ */
 
-/* RMSNorm kernel: out[d] = x[d] * rsqrt(mean(x^2) + eps) * weight[d] */
+/* RMSNorm kernel: out[d] = x[d] * rsqrt(mean(x^2) + eps) * weight[d].
+ * Single block, grid-stride loop -- correct for any dim (an earlier
+ * version returned early before __syncthreads() for threads with
+ * d >= dim, which deadlocks/UB whenever dim isn't an exact multiple of
+ * blockDim). Launched with grid=1 by the host wrapper below. */
 __global__ void
 picolm_gpu_rmsnorm_kernel(float *out, const float *x, const float *weight,
                            int dim, float eps) {
-    int d = gpuThreadIdx_x + (int)gpuBlockIdx_x * gpuBlockDim_x;
-    if (d >= dim) return;
-
-    /* Thread 0 computes the norm */
     float sum_sq = 0.0f;
     for (int i = gpuThreadIdx_x; i < dim; i += gpuBlockDim_x) {
         sum_sq += x[i] * x[i];
     }
-    /* Block reduce */
     __shared__ float ssum[256];
     ssum[gpuThreadIdx_x] = sum_sq;
     gpuSyncthreads();
@@ -2045,8 +2141,11 @@ picolm_gpu_rmsnorm_kernel(float *out, const float *x, const float *weight,
         gpuSyncthreads();
     }
     float rms = sqrtf(ssum[0] / dim + eps);
+    float inv_rms = 1.0f / rms;
 
-    out[d] = x[d] * (1.0f / rms) * weight[d];
+    for (int d = gpuThreadIdx_x; d < dim; d += gpuBlockDim_x) {
+        out[d] = x[d] * inv_rms * weight[d];
+    }
 }
 
 /* RoPE kernel: applies pairwise rotary position embedding */
@@ -2085,7 +2184,7 @@ picolm_gpu_residual_add_kernel(float *out, const float *a, const float *b, int n
     }
 }
 
-/* Phase 2 host API stubs */
+/* Phase 2 host API */
 extern "C" int
 picolm_gpu_rmsnorm(float *out, const float *x, const float *weight,
                     int dim, float eps, int device) {
@@ -2093,8 +2192,7 @@ picolm_gpu_rmsnorm(float *out, const float *x, const float *weight,
     if (!ctx || !select_ctx(ctx)) return 0;
 
     int n_threads = min(dim, 256);
-    int n_blocks = (dim + n_threads - 1) / n_threads;
-    picolm_gpu_rmsnorm_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
+    picolm_gpu_rmsnorm_kernel<<<1, n_threads, 0, ctx->stream>>>(
         out, x, weight, dim, eps);
     if (!gpu_ok(gpuGetLastError(), "rmsnorm kernel")) return 0;
     return 1;
@@ -2127,6 +2225,23 @@ picolm_gpu_residual_add(float *out, const float *a, const float *b,
     picolm_gpu_residual_add_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
         out, a, b, n);
     if (!gpu_ok(gpuGetLastError(), "residual_add kernel")) return 0;
+    return 1;
+}
+
+/* Standalone device-native host wrapper. picolm_silu_mul itself was
+ * previously only ever launched inline inside picolm_gpu_expert_mlp()
+ * (which does its own H2D/D2H); the Phase 2 pipeline needs to call it
+ * on already-device-resident gate/up buffers between matmul_dev calls,
+ * with no transfer and no per-call sync (same stream-ordering argument
+ * as picolm_gpu_matmul_dev / picolm_gpu_attention_decode_dev). Result is
+ * written in place into gate_dev. */
+extern "C" int
+picolm_gpu_silu_mul_dev(float *gate_dev, const float *up_dev, size_t n, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    picolm_silu_mul<<<(unsigned)((n + 255) / 256), 256, 0, ctx->stream>>>(
+        gate_dev, up_dev, n);
+    if (!gpu_ok(gpuGetLastError(), "silu_mul (dev)")) return 0;
     return 1;
 }
 
