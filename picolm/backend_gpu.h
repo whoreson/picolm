@@ -110,6 +110,62 @@ int picolm_gpu_ssm_recurrence(float *state,
                                int n_v_heads, int d_state,
                                int repeat, int device);
 
+/* ================================================================
+ * Phase 1: GPU-resident KV cache + attention kernels
+ * ================================================================ */
+
+/* Allocate device KV cache. Called once at model_load.
+ * kv_k_bytes / kv_v_bytes are the total bytes needed for each cache,
+ * matching the CPU allocation: kv_layers * max_seq_len * n_kv_heads * kv_head_stride.
+ * Returns 1 on success, 0 -> caller falls back to CPU KV cache. */
+int picolm_gpu_kv_alloc(size_t kv_k_bytes, size_t kv_v_bytes, int device);
+
+/* Store one K or V vector (F16) at [layer_ordinal][pos][kv_head].
+ * vec_f16 is an array of head_dim uint16_t values.
+ * head_dim: number of FP16 elements per head.
+ * n_kv_heads: total KV heads per layer.
+ * max_seq_len: maximum sequence length (for stride computation).
+ * kv_head_stride: bytes per head within a GQA row (== head_dim * sizeof(uint16_t)).
+ * Returns 1 on success. */
+int picolm_gpu_kv_store(int is_k, int layer_ordinal, int pos, int kv_head,
+                         const uint16_t *vec_f16, int head_dim,
+                         int n_kv_heads, int max_seq_len,
+                         size_t kv_head_stride, int device);
+
+/* Store a batch of K or V vectors (F16) for prefill.
+ * vecs_f16 is [n_tokens][head_dim] in FP16.
+ * start_pos: KV position of vecs_f16[0].
+ * Returns 1 on success. */
+int picolm_gpu_kv_store_batch(int is_k, int layer_ordinal, int start_pos, int n_tokens,
+                               const uint16_t *vecs_f16,
+                               int head_dim, int kv_head,
+                               int n_kv_heads, int max_seq_len,
+                               size_t kv_head_stride, int device);
+
+/* Decode-path attention: S=1, one query per head, online softmax over pos+1
+ * cached positions. q is host pointer [n_heads][head_dim] in F32.
+ * Output xb_out [n_heads][head_dim] in F32.
+ * layer_ordinal: which KV cache layer (0..kv_layers-1).
+ * pos: current position (0-indexed), attention attends to positions 0..pos.
+ * Returns 1 on success, 0 -> caller falls back to attention_group(). */
+int picolm_gpu_attention_decode(float *xb_out, const float *q,
+                                 int layer_ordinal, int pos,
+                                 int n_heads, int n_kv_heads, int head_dim,
+                                 int max_seq_len, int device);
+
+/* Prefill-path attention: S queries, causal mask, tiled online-softmax merge.
+ * q: host [n_tokens][n_heads][head_dim] in F32.
+ * xb_out: host [n_tokens][n_heads][head_dim] in F32 (pre-zeroed by caller).
+ * start_pos: KV position of q[0] (for context continuation).
+ * Returns 1 on success, 0 -> caller falls back to batch_attention_layer(). */
+int picolm_gpu_attention_prefill(float *xb_out, const float *q,
+                                  int layer_ordinal, int start_pos, int n_tokens,
+                                  int n_heads, int n_kv_heads, int head_dim,
+                                  int max_seq_len, int device);
+
+/* Free GPU KV cache allocations. */
+void picolm_gpu_kv_free(void);
+
 /* Free a GPU tensor (device memory + host handle). */
 void picolm_gpu_tensor_free(picolm_gpu_tensor_t *tensor);
 

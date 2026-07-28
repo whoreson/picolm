@@ -87,6 +87,12 @@ typedef struct {
     gpu_layer_weights_t layers[MAX_LAYERS];
     int device;
     int active;    /* 1 if GPU backend is active and at least some tensors uploaded */
+    /* Phase 1: GPU-resident KV cache */
+    void *kv_k_dev;   /* device pointer to K cache, owned by backend_gpu */
+    void *kv_v_dev;   /* device pointer to V cache */
+    size_t kv_k_cap;  /* allocated bytes for K cache */
+    size_t kv_v_cap;  /* allocated bytes for V cache */
+    int kv_active;    /* 1 if GPU KV cache path is usable (MHA, F16 KV, no SSM/QK-norm) */
 } gpu_weights_t;
 #endif /* PICOLM_GPU */
 

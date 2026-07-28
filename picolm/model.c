@@ -1646,6 +1646,51 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
             m->gpu.device = device;
             if (uploaded > 0) {
                 m->gpu.active = 1;
+
+                /* Phase 1: Allocate GPU KV cache for eligible models
+                 * Eligibility: standard MHA (no SSM), rope_type==0 (llama pairwise),
+                 * no QK-norm layers, F16 KV cache only. */
+                {
+                    int eligible = 1;
+                    if (c->has_ssm) eligible = 0;
+                    if (c->rope_type != 0) eligible = 0;
+                    /* Check for QK-norm layers */
+                    for (int l = 0; l < c->n_layers && eligible; l++) {
+                        if (m->weights.layers[l].attn_q_norm) eligible = 0;
+                    }
+                    /* F16 KV cache only for Phase 1 */
+                    if (kv_type_k != KV_CACHE_F16 || kv_type_v != KV_CACHE_F16) eligible = 0;
+
+                    if (eligible) {
+                        /* Compute KV cache sizes matching CPU allocation */
+                        int kv_layers = 0;
+                        for (int l = 0; l < c->n_layers; l++) {
+                            if (m->weights.layers[l].is_attn_layer) kv_layers++;
+                        }
+                        if (kv_layers == 0) kv_layers = c->n_layers;
+
+                        size_t kv_head_stride = c->n_kv_heads * c->head_dim * sizeof(uint16_t);
+                        /* Per-layer: max_seq_len * n_kv_heads * head_dim * sizeof(uint16_t) */
+                        size_t layer_bytes = (size_t)c->max_seq_len * kv_head_stride;
+                        size_t total_k = (size_t)kv_layers * layer_bytes;
+                        size_t total_v = (size_t)kv_layers * layer_bytes;
+
+                        if (picolm_gpu_kv_alloc(total_k, total_v, device)) {
+                            m->gpu.kv_k_dev = (void *)1; /* opaque marker: allocated */
+                            m->gpu.kv_v_dev = (void *)1;
+                            m->gpu.kv_k_cap = total_k;
+                            m->gpu.kv_v_cap = total_v;
+                            m->gpu.kv_active = 1;
+                            fprintf(stderr, "INFO: GPU KV cache allocated (%zu MB K + %zu MB V)\n",
+                                    total_k / (1024*1024), total_v / (1024*1024));
+                        } else {
+                            fprintf(stderr, "WARN: GPU KV cache allocation failed, falling back to CPU\n");
+                        }
+                    } else {
+                        fprintf(stderr, "INFO: GPU KV cache disabled (model not eligible: SSM=%d rope=%d)\n",
+                                c->has_ssm, c->rope_type);
+                    }
+                }
                 /* Log per-type upload stats */
                 int tcounts[20] = {0};
                 for (int l = 0; l < c->n_layers; l++) {
@@ -2282,6 +2327,12 @@ float *model_forward(model_t *m, int token, int pos) {
 #else
                     for (int d = 0; d < head_dim; d++) kf[d] = fp32_to_fp16(k_head[d]);
 #endif
+                    /* Phase 1: Also store to GPU KV cache */
+                    if (gpu_ok && m->gpu.kv_active) {
+                        picolm_gpu_kv_store(1, this_attn_ordinal, pos, hkv,
+                                            kf, head_dim, n_kv_heads, seq_len,
+                                            s->kv_head_stride_k, gpu_dev);
+                    }
                 }
             }
         }
@@ -2320,6 +2371,12 @@ float *model_forward(model_t *m, int token, int pos) {
 #else
                     for (int d = 0; d < head_dim; d++) vf[d] = fp32_to_fp16(v_head[d]);
 #endif
+                    /* Phase 1: Also store to GPU KV cache */
+                    if (gpu_ok && m->gpu.kv_active) {
+                        picolm_gpu_kv_store(0, this_attn_ordinal, pos, hkv,
+                                            vf, head_dim, n_kv_heads, seq_len,
+                                            s->kv_head_stride_v, gpu_dev);
+                    }
                 }
             }
         }
@@ -2362,7 +2419,42 @@ float *model_forward(model_t *m, int token, int pos) {
         gctx.kv_hadamard_k = s->kv_hadamard_k;
         gctx.kv_hadamard_v = s->kv_hadamard_v;
         gctx.kv_hadamard_size = s->kv_hadamard_size;
-        tensor_parallel_for(c->n_kv_heads, attention_group, &gctx);
+
+        /* Phase 1: GPU attention decode path */
+        if (gpu_ok && m->gpu.kv_active && s->kv_type_k == KV_CACHE_F16 && s->kv_type_v == KV_CACHE_F16) {
+            /* Clear GPU tensor before calling attention (no weight tensors involved) */
+            tensor_set_gpu_tensor(NULL, 0);
+            if (picolm_gpu_attention_decode(s->xb, s->q,
+                                             this_attn_ordinal, pos,
+                                             n_heads, n_kv_heads, head_dim,
+                                             seq_len, gpu_dev)) {
+                /* GPU attention succeeded */
+            } else {
+                tensor_parallel_for(c->n_kv_heads, attention_group, &gctx);
+            }
+        } else {
+            tensor_parallel_for(c->n_kv_heads, attention_group, &gctx);
+        }
+
+        /* PICOLM_DBG_ATTN: compare GPU vs CPU attention output */
+        {
+            const char *dbg_attn = getenv("PICOLM_DBG_ATTN");
+            if (dbg_attn && atoi(dbg_attn) && gpu_ok && m->gpu.kv_active && s->kv_type_k == KV_CACHE_F16) {
+                float xb_cpu[n_heads * 256];
+                memcpy(xb_cpu, s->xb, n_heads * head_dim * sizeof(float));
+                tensor_parallel_for(c->n_kv_heads, attention_group, &gctx);
+                float max_diff = 0.0f;
+                for (int i = 0; i < n_heads * head_dim; i++) {
+                    float d = xb_cpu[i] - s->xb[i];
+                    if (d < 0) d = -d;
+                    if (d > max_diff) max_diff = d;
+                }
+                if (max_diff > 1e-3f || (pos < 5 && l == 0)) {
+                    fprintf(stderr, "[ATTN_DBG decode] layer=%d pos=%d max_diff=%.6f\n", l, pos, max_diff);
+                }
+                memcpy(s->xb, xb_cpu, n_heads * head_dim * sizeof(float));
+            }
+        }
 
         /* Hadamard rotation of attention output back to original space (Point D) */
         if (s->kv_hadamard_v) {
@@ -6056,6 +6148,15 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                                 kf[d2] = fp32_to_fp16(k_head[d2]);
                         }
                     }
+                    /* Phase 1: GPU KV cache store for K (prefill, per position) */
+                    if (gpu_ok && m->gpu.kv_active && s->kv_type_k == KV_CACHE_F16) {
+                        for (int hkv = 0; hkv < n_kv_heads; hkv++) {
+                            uint16_t *kf = (uint16_t *)(kp + hkv * s->kv_head_stride_k);
+                            picolm_gpu_kv_store(1, this_attn_ord, pos, hkv,
+                                                kf, head_dim, n_kv_heads, seq_len,
+                                                s->kv_head_stride_k, gpu_dev);
+                        }
+                    }
                     /* Hadamard rotation of V before quantization (prefill) */
                     if (s->kv_hadamard_v && s->kv_type_v != KV_CACHE_F16) {
                         for (int hkv = 0; hkv < n_kv_heads; hkv++) {
@@ -6072,6 +6173,15 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                             uint16_t *vf = (uint16_t *)(vp + hkv * s->kv_head_stride_v);
                             for (int d2 = 0; d2 < head_dim; d2++)
                                 vf[d2] = fp32_to_fp16(v_head[d2]);
+                        }
+                    }
+                    /* Phase 1: GPU KV cache store for V (prefill, per position) */
+                    if (gpu_ok && m->gpu.kv_active && s->kv_type_v == KV_CACHE_F16) {
+                        for (int hkv = 0; hkv < n_kv_heads; hkv++) {
+                            uint16_t *vf = (uint16_t *)(vp + hkv * s->kv_head_stride_v);
+                            picolm_gpu_kv_store(0, this_attn_ord, pos, hkv,
+                                                vf, head_dim, n_kv_heads, seq_len,
+                                                s->kv_head_stride_v, gpu_dev);
                         }
                     }
                 }
@@ -6097,13 +6207,32 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #ifdef PICOLM_GPU
             tensor_set_gpu_tensor(NULL, 0);
 #endif
-            /* Batched attention: all tokens, all heads, one thread dispatch */
-            batch_attention_layer(xb_batch, q_batch, kcl, vcl,
-                                  n_tokens, start_pos,
-                                  n_heads, c->n_kv_heads, head_dim,
-                                  max_dim, (int)s->kv_type_k, (int)s->kv_type_v,
-                                  s->kv_row_size_k, s->kv_row_size_v,
-                                  s->kv_head_stride_k, s->kv_head_stride_v);
+
+            /* Phase 1: GPU attention prefill path */
+            if (gpu_ok && m->gpu.kv_active && s->kv_type_k == KV_CACHE_F16 && s->kv_type_v == KV_CACHE_F16 &&
+                s->kv_head_stride_k == s->kv_head_stride_v) {
+                if (picolm_gpu_attention_prefill(xb_batch, q_batch,
+                                                  this_attn_ord, start_pos, n_tokens,
+                                                  n_heads, c->n_kv_heads, head_dim,
+                                                  seq_len, gpu_dev)) {
+                    /* GPU attention succeeded */
+                } else {
+                    batch_attention_layer(xb_batch, q_batch, kcl, vcl,
+                                          n_tokens, start_pos,
+                                          n_heads, c->n_kv_heads, head_dim,
+                                          max_dim, (int)s->kv_type_k, (int)s->kv_type_v,
+                                          s->kv_row_size_k, s->kv_row_size_v,
+                                          s->kv_head_stride_k, s->kv_head_stride_v);
+                }
+            } else {
+                /* Batched attention: all tokens, all heads, one thread dispatch */
+                batch_attention_layer(xb_batch, q_batch, kcl, vcl,
+                                      n_tokens, start_pos,
+                                      n_heads, c->n_kv_heads, head_dim,
+                                      max_dim, (int)s->kv_type_k, (int)s->kv_type_v,
+                                      s->kv_row_size_k, s->kv_row_size_v,
+                                      s->kv_head_stride_k, s->kv_head_stride_v);
+            }
         }
 
         /* Hadamard rotation of attention output back to original space (prefill) */
