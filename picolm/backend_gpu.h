@@ -166,6 +166,29 @@ int picolm_gpu_attention_prefill(float *xb_out, const float *q,
 /* Free GPU KV cache allocations. */
 void picolm_gpu_kv_free(void);
 
+/* ================================================================
+ * Phase 2: Device-resident elementwise kernels (residual pipeline)
+ * ================================================================ */
+
+/* RMSNorm on device: out[d] = x[d] * rsqrt(mean(x^2) + eps) * weight[d].
+ * x and out are device pointers, weight is device pointer.
+ * Returns 1 on success. */
+int picolm_gpu_rmsnorm(float *out, const float *x, const float *weight,
+                        int dim, float eps, int device);
+
+/* RoPE (rotary position embedding) on device.
+ * Applies pairwise sin/cos rotation to x in-place.
+ * cos_tbl, sin_tbl are device pointers [half_dim].
+ * Returns 1 on success. */
+int picolm_gpu_rope_apply(float *x, int n_heads, int head_dim,
+                           const float *cos_tbl, const float *sin_tbl,
+                           int half_dim, int device);
+
+/* Residual add on device: out[i] = a[i] + b[i] for i = 0..n-1.
+ * All device pointers. Returns 1 on success. */
+int picolm_gpu_residual_add(float *out, const float *a, const float *b,
+                             int n, int device);
+
 /* Free a GPU tensor (device memory + host handle). */
 void picolm_gpu_tensor_free(picolm_gpu_tensor_t *tensor);
 

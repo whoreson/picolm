@@ -2009,3 +2009,113 @@ picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
     return 1;
 }
 
+/* ================================================================
+ * Phase 2: Device-resident elementwise kernels (stubs)
+ * ================================================================ */
+
+/* RMSNorm kernel: out[d] = x[d] * rsqrt(mean(x^2) + eps) * weight[d] */
+__global__ void
+picolm_gpu_rmsnorm_kernel(float *out, const float *x, const float *weight,
+                           int dim, float eps) {
+    int d = gpuThreadIdx_x + (int)gpuBlockIdx_x * gpuBlockDim_x;
+    if (d >= dim) return;
+
+    /* Thread 0 computes the norm */
+    float sum_sq = 0.0f;
+    for (int i = gpuThreadIdx_x; i < dim; i += gpuBlockDim_x) {
+        sum_sq += x[i] * x[i];
+    }
+    /* Block reduce */
+    __shared__ float ssum[256];
+    ssum[gpuThreadIdx_x] = sum_sq;
+    gpuSyncthreads();
+    for (int s = gpuBlockDim_x / 2; s > 0; s >>= 1) {
+        if (gpuThreadIdx_x < s) ssum[gpuThreadIdx_x] += ssum[gpuThreadIdx_x + s];
+        gpuSyncthreads();
+    }
+    float rms = sqrtf(ssum[0] / dim + eps);
+
+    out[d] = x[d] * (1.0f / rms) * weight[d];
+}
+
+/* RoPE kernel: applies pairwise rotary position embedding */
+__global__ void
+picolm_gpu_rope_kernel(float *x, int n_heads, int head_dim,
+                        const float *cos_tbl, const float *sin_tbl,
+                        int half_dim) {
+    int idx = gpuThreadIdx_x + (int)gpuBlockIdx_x * gpuBlockDim_x;
+    int total = n_heads * head_dim;
+    for (int i = idx; i < total; i += (int)gridDim.x * gpuBlockDim_x) {
+        int h = i / head_dim;
+        int d = i % head_dim;
+        if (d >= half_dim * 2) {
+            /* Beyond rope_dim, copy as-is */
+            /* Already in place */
+        } else if (d < half_dim) {
+            int h1 = d;
+            int h2 = d + half_dim;
+            float x1 = x[i];
+            float x2 = x[h * head_dim + h2];
+            float c = cos_tbl[h1];
+            float s = sin_tbl[h1];
+            x[h * head_dim + h1] = x1 * c - x2 * s;
+            x[h * head_dim + h2] = x1 * s + x2 * c;
+        }
+        /* d >= half_dim: already updated by the paired thread */
+    }
+}
+
+/* Residual add kernel: out[i] = a[i] + b[i] */
+__global__ void
+picolm_gpu_residual_add_kernel(float *out, const float *a, const float *b, int n) {
+    int i = gpuThreadIdx_x + (int)gpuBlockIdx_x * gpuBlockDim_x;
+    for (; i < n; i += (int)gridDim.x * gpuBlockDim_x) {
+        out[i] = a[i] + b[i];
+    }
+}
+
+/* Phase 2 host API stubs */
+extern "C" int
+picolm_gpu_rmsnorm(float *out, const float *x, const float *weight,
+                    int dim, float eps, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+
+    int n_threads = min(dim, 256);
+    int n_blocks = (dim + n_threads - 1) / n_threads;
+    picolm_gpu_rmsnorm_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
+        out, x, weight, dim, eps);
+    if (!gpu_ok(gpuGetLastError(), "rmsnorm kernel")) return 0;
+    return 1;
+}
+
+extern "C" int
+picolm_gpu_rope_apply(float *x, int n_heads, int head_dim,
+                       const float *cos_tbl, const float *sin_tbl,
+                       int half_dim, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+
+    int total = n_heads * head_dim;
+    int n_threads = 128;
+    int n_blocks = min((total + n_threads - 1) / n_threads, 128);
+    picolm_gpu_rope_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
+        x, n_heads, head_dim, cos_tbl, sin_tbl, half_dim);
+    if (!gpu_ok(gpuGetLastError(), "rope kernel")) return 0;
+    return 1;
+}
+
+extern "C" int
+picolm_gpu_residual_add(float *out, const float *a, const float *b,
+                         int n, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+
+    int n_threads = 256;
+    int n_blocks = min((n + n_threads - 1) / n_threads, 256);
+    picolm_gpu_residual_add_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
+        out, a, b, n);
+    if (!gpu_ok(gpuGetLastError(), "residual_add kernel")) return 0;
+    return 1;
+}
+
