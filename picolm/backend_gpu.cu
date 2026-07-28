@@ -21,6 +21,7 @@
  */
 
 #include "backend_gpu.h"
+#include <stdlib.h> /* setenv() */
 
 #ifdef __HIP__
 #include <hip/hip_runtime.h>
@@ -1326,6 +1327,16 @@ static int reserve_i8(int8_t **ptr, size_t *cap, size_t bytes) {
 int picolm_gpu_init(const int *devices, int count) {
     int available = 0;
     if (!devices || count < 1 || count > PICOLM_GPU_MAX_DEVICES) return 0;
+#ifndef __HIP__
+    /* CUDA 13 / GB10 (sm_121): multi-engine scheduling can reorder/overlap
+     * H2D, kernel, and D2H work even though our code issues everything
+     * synchronously per-call, causing run-to-run nondeterminism at temp=0
+     * (see gpu_nondeterminism.md -- isolated empirically, fixes it 8/8 with
+     * no measured perf cost since we already sync per call). Must be set
+     * before the first CUDA driver call, so this has to be the very first
+     * thing in init. overwrite=0: respect an explicit user-set value. */
+    setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1", 0);
+#endif
     if (!gpu_ok(gpuGetDeviceCount(&available), "device discovery")) return 0;
     g_nctx = 0;
     for (int i = 0; i < count; i++) {
