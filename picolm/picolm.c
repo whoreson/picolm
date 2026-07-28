@@ -532,9 +532,14 @@ int main(int argc, char **argv) {
 #endif
         fp16_table_init();
         extern int server_main(int port, const char *host, const char *model_path, int num_threads, int do_prefault, int context_override, int mem_mb,
-                               int checkpoint_max, int checkpoint_interval, int checkpoint_interval_gen, int checkpoint_tail_offset);
+                               int checkpoint_max, int checkpoint_interval, int checkpoint_interval_gen, int checkpoint_tail_offset,
+                               int viz_port, int viz_width, int viz_height);
+        /* When --viz is specified in server mode, pass the viz parameters through.
+         * When --viz is not specified, viz_port=0 so server_init skips viz. */
+        int srv_viz_port = viz_mode ? viz_port : 0;
         return server_main(server_port, server_host, model_path, num_threads, do_prefault, context_override, mem_mb,
-                           checkpoint_max, checkpoint_interval, checkpoint_interval_gen, checkpoint_tail_offset);
+                           checkpoint_max, checkpoint_interval, checkpoint_interval_gen, checkpoint_tail_offset,
+                           srv_viz_port, viz_width, viz_height);
     }
 
     if (!prompt) {

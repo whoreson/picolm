@@ -18,6 +18,9 @@
 #include "grammar.h"
 #include "cJSON.h"
 #include "qwen_tokenize.h"
+#ifdef PICOLM_VIZ
+#include "viz.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -230,6 +233,10 @@ static struct _server_state {
     int checkpoint_tail_offset;           /* --checkpoint-tail-offset (default: 5) */
     size_t checkpoint_snapshot_size;      /* cached snapshot size from model */
     uint8_t *checkpoint_scratch;          /* pre-allocated buffer for save/restore */
+
+#ifdef PICOLM_VIZ
+    int viz_initialized;                  /* 1 if viz_init succeeded */
+#endif
 } srv;
 
 /* Parse HTTP request line: "METHOD /path HTTP/1.1" */
@@ -607,7 +614,8 @@ static float *prefill_with_checkpoints(SOCKET sock, model_t *model,
 /* ---- Server init / free (persistent model) ---- */
 
 static int server_init(const char *model_path, int num_threads, int do_prefault, int context_override, int mem_mb,
-                       int checkpoint_max, int checkpoint_interval, int checkpoint_interval_gen, int checkpoint_tail_offset) {
+                       int checkpoint_max, int checkpoint_interval, int checkpoint_interval_gen, int checkpoint_tail_offset,
+                       int viz_port, int viz_width, int viz_height) {
     /* Set checkpoint parameters */
     srv.max_checkpoints = checkpoint_max;
     srv.checkpoint_interval = checkpoint_interval;
@@ -694,6 +702,30 @@ static int server_init(const char *model_path, int num_threads, int do_prefault,
     }
 
     srv.model_loaded = 1;
+
+#ifdef PICOLM_VIZ
+    /* Start visualization server if requested */
+    srv.viz_initialized = 0;
+    if (viz_port > 0) {
+        char model_short[256];
+        const char *base = model_path;
+        const char *slash = strrchr(model_path, '/');
+        if (slash) base = slash + 1;
+        strncpy(model_short, base, sizeof(model_short) - 1);
+        model_short[sizeof(model_short) - 1] = '\0';
+        char *dot = strrchr(model_short, '.');
+        if (dot && dot != model_short) *dot = '\0';
+
+        if (viz_init(viz_width, viz_height, viz_port) != 0) {
+            fprintf(stderr, "[server] Failed to start visualization server on port %d\n", viz_port);
+        } else {
+            fprintf(stderr, "[server] Visualization server started on port %d (%dx%d)\n", viz_port, viz_width, viz_height);
+            viz_set_model_info(srv.model.config.n_layers, srv.model.config.n_embd, model_short);
+            srv.viz_initialized = 1;
+        }
+    }
+#endif
+
     srv.kv_pos = 0;
     srv.last_prompt_len = 0;
     srv.last_prompt_tokens = NULL;
@@ -728,6 +760,9 @@ static void server_free(void) {
     srv.checkpoint_scratch = NULL;
 
     if (srv.model_loaded) {
+#ifdef PICOLM_VIZ
+        if (srv.viz_initialized) viz_free();
+#endif
         tokenizer_free(&srv.tokenizer);
         tensor_threadpool_free();
         model_free(&srv.model);
@@ -2404,7 +2439,8 @@ static void handle_request(SOCKET sock) {
 /* ---- Server Main Loop ---- */
 
 int server_main(int port, const char *host, const char *model_path, int num_threads, int do_prefault, int context_override, int mem_mb,
-                int checkpoint_max, int checkpoint_interval, int checkpoint_interval_gen, int checkpoint_tail_offset) {
+                int checkpoint_max, int checkpoint_interval, int checkpoint_interval_gen, int checkpoint_tail_offset,
+                int viz_port, int viz_width, int viz_height) {
     srv.port = port;
     strncpy(srv.host, host, sizeof(srv.host) - 1);
     srv.model_path = model_path;
@@ -2412,7 +2448,8 @@ int server_main(int port, const char *host, const char *model_path, int num_thre
 
     /* Load model once at startup */
     if (server_init(model_path, num_threads, do_prefault, context_override, mem_mb,
-                    checkpoint_max, checkpoint_interval, checkpoint_interval_gen, checkpoint_tail_offset) != 0) {
+                    checkpoint_max, checkpoint_interval, checkpoint_interval_gen, checkpoint_tail_offset,
+                    viz_port, viz_width, viz_height) != 0) {
         return -1;
     }
 

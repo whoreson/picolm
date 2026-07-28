@@ -81,7 +81,8 @@ native:
 
 # --- VIZ build: native with embedded VNC visualization server ---
 viz:
-	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_flags_for,-march=native) $(call simd_defines_for,-march=native) -DPICOLM_VIZ=1" OBJS="$(OBJS) viz.o"
+	@touch model.c picolm.c server.c
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_flags_for,-march=native) $(call simd_defines_for,-march=native) -DPICOLM_VIZ=1 -DPICOLM_SERVER" OBJS="$(OBJS) viz.o"
 
 # --- x86-64 default: -march=native + GPU disabled, safe fallback ---
 x86: sse2
