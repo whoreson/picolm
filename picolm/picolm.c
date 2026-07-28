@@ -118,6 +118,8 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --cache <file> KV cache file (saves/loads prompt state)\n");
     fprintf(stderr, "  -ctk <type>    Key cache type: f16, q8_0, q4_0 (default: f16)\n");
     fprintf(stderr, "  -ctv <type>    Val cache type: f16, q8_0, q4_0 (default: f16)\n");
+    fprintf(stderr, "  -khad          Apply Walsh-Hadamard rotation to K cache before quantization\n");
+    fprintf(stderr, "  -vhad          Apply Walsh-Hadamard rotation to V cache before quantization\n");
     fprintf(stderr, "\nSSM checkpoint options (Qwen3.5/3.6 only, no-op for other models):\n");
     fprintf(stderr, "  --checkpoint-max <N>        Max checkpoints to keep (default: 0=disabled)\n");
     fprintf(stderr, "  --checkpoint-every-nt <N>   Checkpoint every N tokens during prefill (default: 256)\n");
@@ -344,6 +346,8 @@ int main(int argc, char **argv) {
     const char *cache_file = NULL;
     kv_cache_type_t kv_type_k = KV_CACHE_F16;
     kv_cache_type_t kv_type_v = KV_CACHE_F16;
+    int    k_cache_hadamard = 0;  /* -khad: Walsh-Hadamard rotation for K cache */
+    int    v_cache_hadamard = 0;  /* -vhad: Walsh-Hadamard rotation for V cache */
     int    mem_mb = 0;      /* --mem budget in megabytes (0=disabled) */
     int    do_prefault = 0; /* --prefault (touch all mmap pages at load time) */
     #ifndef _WIN32
@@ -426,6 +430,10 @@ int main(int argc, char **argv) {
             else if (strcmp(typestr, "q4_0") == 0) *tgt = KV_CACHE_Q4_0;
             else if (strcmp(typestr, "f16") == 0) *tgt = KV_CACHE_F16;
             else { fprintf(stderr, "Unknown KV cache type: %s (use f16, q8_0, q4_0)\n", typestr); return 1; }
+        } else if (strcmp(argv[i], "-khad") == 0) {
+            k_cache_hadamard = 1;
+        } else if (strcmp(argv[i], "-vhad") == 0) {
+            v_cache_hadamard = 1;
         } else if (strcmp(argv[i], "--checkpoint-max") == 0 && i + 1 < argc) {
             checkpoint_max = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--checkpoint-every-nt") == 0 && i + 1 < argc) {
@@ -609,9 +617,9 @@ int main(int argc, char **argv) {
 #endif
     int load_ok = 0;
     if (is_safetensors) {
-        load_ok = (model_load_safetensors(&model, model_path, context_override, kv_type_k, kv_type_v) == 0);
+        load_ok = (model_load_safetensors(&model, model_path, context_override, kv_type_k, kv_type_v, k_cache_hadamard, v_cache_hadamard) == 0);
     } else {
-        load_ok = (model_load(&model, model_path, context_override, kv_type_k, kv_type_v) == 0);
+        load_ok = (model_load(&model, model_path, context_override, kv_type_k, kv_type_v, k_cache_hadamard, v_cache_hadamard) == 0);
     }
     if (!load_ok) {
         fprintf(stderr, "Failed to load model\n");

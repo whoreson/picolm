@@ -541,4 +541,13 @@ void scale_add_q4_0_f32(float *dst, float scale, const void *src, int n);
 void fma_scale_q8_0_f32(float *dst, float correction, const void *src, int n);
 void fma_scale_q4_0_f32(float *dst, float correction, const void *src, int n);
 
+/* ---- Walsh-Hadamard Transform (for KV cache rotation) ---- */
+/* In-place Walsh-Hadamard transform of n elements.
+ * n must be a power of 2. Self-inverting: applying twice restores the input. */
+void picolm_fast_ht(float *x, int n);
+
+/* Apply fast_ht(nrot) to each nrot-element block in x.
+ * x has head_dim elements. head_dim % nrot == 0. */
+void picolm_hadamard_transform(float *x, int head_dim, int nrot);
+
 #endif /* QUANT_H */

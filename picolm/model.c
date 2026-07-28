@@ -1162,7 +1162,8 @@ static size_t kv_head_stride(kv_cache_type_t kv_type, int head_dim) {
     return 0;
 }
 
-int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v) {
+int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v,
+                       int k_cache_hadamard, int v_cache_hadamard) {
     model_config_t *c = &m->config;
     run_state_t *s = &m->state;
 
@@ -1277,6 +1278,27 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
     s->kv_row_size_v = sz_v_row;
     s->kv_head_stride_k = sz_k_head;
     s->kv_head_stride_v = sz_v_head;
+
+    /* Hadamard rotation for KV cache (disabled by default) */
+    s->kv_hadamard_k = 0;
+    s->kv_hadamard_v = 0;
+    s->kv_hadamard_size = 0;
+    if (k_cache_hadamard && kv_type_k != KV_CACHE_F16) {
+        s->kv_hadamard_k = 1;
+    }
+    if (v_cache_hadamard && kv_type_v != KV_CACHE_F16) {
+        s->kv_hadamard_v = 1;
+    }
+    if (s->kv_hadamard_k || s->kv_hadamard_v) {
+        /* Determine block size: largest power of 2 that divides head_dim, at least 64 */
+        int nrot = 64;
+        if (c->head_dim >= 128 && c->head_dim % 128 == 0) nrot = 128;
+        if (c->head_dim >= 256 && c->head_dim % 256 == 0) nrot = 256;
+        assert(c->head_dim % nrot == 0 && "Hadamard requires head_dim multiple of nrot");
+        s->kv_hadamard_size = nrot;
+        fprintf(stderr, "KV Hadamard rotation enabled: K=%d V=%d (nrot=%d)\n",
+                s->kv_hadamard_k, s->kv_hadamard_v, nrot);
+    }
 
     /* Carve float pointers */
     float *p = (float *)s->mem_block;
@@ -1512,7 +1534,8 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
 
 /* ---- Public API ---- */
 
-int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v) {
+int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v,
+               int k_cache_hadamard, int v_cache_hadamard) {
     memset(m, 0, sizeof(*m));
 
     if (mmap_file(m, path) != 0) return -1;
@@ -1544,7 +1567,7 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
         }
     }
 
-    if (allocate_run_state(m, kv_type_k, kv_type_v) != 0) return -1;
+    if (allocate_run_state(m, kv_type_k, kv_type_v, k_cache_hadamard, v_cache_hadamard) != 0) return -1;
 
     /* Repack Q4_0 tensors to Q4_0x8 for AVX2 SIMD optimization.
      * Only repack tensors where nrows % 8 == 0 and ncols % 32 == 0. */
@@ -1842,6 +1865,8 @@ typedef struct {
     const uint8_t *kcache, *vcache;
     const float *q;   /* [n_heads][head_dim] */
     float *xb;        /* [n_heads][head_dim] */
+    int kv_hadamard_k, kv_hadamard_v;
+    int kv_hadamard_size;
 } attn_group_ctx_t;
 
 static void attention_group(int kv_head_idx, void *ctx_ptr) {
@@ -2231,6 +2256,12 @@ float *model_forward(model_t *m, int token, int pos) {
          * For FP16, store each head's FP16 data at its offset within the row. */
         {
             uint8_t *key_pos = kcache_layer + (size_t)pos * s->kv_row_size_k;
+            /* Hadamard rotation of K before quantization */
+            if (s->kv_hadamard_k && s->kv_type_k != KV_CACHE_F16) {
+                for (int hkv = 0; hkv < n_kv_heads; hkv++) {
+                    picolm_hadamard_transform(k_tmp + hkv * head_dim, head_dim, s->kv_hadamard_size);
+                }
+            }
             if (s->kv_type_k == KV_CACHE_Q8_0) {
                 /* Quantize full GQA row at once */
                 quantize_row_q8_0(k_tmp, key_pos, kv_dim);
@@ -2266,6 +2297,12 @@ float *model_forward(model_t *m, int token, int pos) {
         /* Store V: GQA row quantization */
         {
             uint8_t *val_pos = vcache_layer + (size_t)pos * s->kv_row_size_v;
+            /* Hadamard rotation of V before quantization */
+            if (s->kv_hadamard_v && s->kv_type_v != KV_CACHE_F16) {
+                for (int hkv = 0; hkv < n_kv_heads; hkv++) {
+                    picolm_hadamard_transform(v_tmp + hkv * head_dim, head_dim, s->kv_hadamard_size);
+                }
+            }
             if (s->kv_type_v == KV_CACHE_Q8_0) {
                 quantize_row_q8_0(v_tmp, val_pos, kv_dim);
             } else if (s->kv_type_v == KV_CACHE_Q4_0) {
@@ -2307,6 +2344,13 @@ float *model_forward(model_t *m, int token, int pos) {
          *
          * This saves memory (no att[] buffer) and is more cache-friendly.
          */
+        /* Hadamard rotation of Q before attention (Point B) */
+        if (s->kv_hadamard_k) {
+            for (int h = 0; h < n_heads; h++) {
+                picolm_hadamard_transform(s->q + h * head_dim, head_dim, s->kv_hadamard_size);
+            }
+        }
+
         attn_group_ctx_t gctx;
         gctx.kv_mul = kv_mul; gctx.head_dim = head_dim; gctx.pos = pos;
         gctx.kv_type_k = s->kv_type_k; gctx.kv_type_v = s->kv_type_v;
@@ -2315,7 +2359,17 @@ float *model_forward(model_t *m, int token, int pos) {
         gctx.kcache = kcache_layer; gctx.vcache = vcache_layer;
         gctx.q = s->q; gctx.xb = s->xb;
         gctx.n_kv_heads = c->n_kv_heads;
+        gctx.kv_hadamard_k = s->kv_hadamard_k;
+        gctx.kv_hadamard_v = s->kv_hadamard_v;
+        gctx.kv_hadamard_size = s->kv_hadamard_size;
         tensor_parallel_for(c->n_kv_heads, attention_group, &gctx);
+
+        /* Hadamard rotation of attention output back to original space (Point D) */
+        if (s->kv_hadamard_v) {
+            for (int h = 0; h < n_heads; h++) {
+                picolm_hadamard_transform(s->xb + h * head_dim, head_dim, s->kv_hadamard_size);
+            }
+        }
 
         /* Qwen3.5 full attention: apply gate sigmoid to attention output */
         if (qwen35_attn_gate) {
@@ -4926,6 +4980,8 @@ typedef struct {
     const float *q_batch;   /* [n_tokens][n_heads * head_dim] */
     float *xb_batch;        /* [n_tokens][xb_stride] */
     int xb_stride;
+    int kv_hadamard_k, kv_hadamard_v;
+    int kv_hadamard_size;
 } prefill_attn_ctx_t;
 
 static void prefill_attn_task(int flat_idx, void *ctx_ptr) {
@@ -4969,6 +5025,7 @@ static void batch_attention_layer(
 {
     /* Build the prefill_attn_ctx for both the original path and the test */
     prefill_attn_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
     ctx.n_heads = n_heads; ctx.n_kv_heads = n_kv_heads; ctx.kv_mul = n_heads / n_kv_heads;
     ctx.head_dim = head_dim; ctx.start_pos = start_pos;
     ctx.kv_type_k = kv_type_k; ctx.kv_type_v = kv_type_v;
@@ -5980,6 +6037,12 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                 {
                     uint8_t *kp = kcl + (size_t)pos * s->kv_row_size_k;
                     uint8_t *vp = vcl + (size_t)pos * s->kv_row_size_v;
+                    /* Hadamard rotation of K before quantization (prefill) */
+                    if (s->kv_hadamard_k && s->kv_type_k != KV_CACHE_F16) {
+                        for (int hkv = 0; hkv < n_kv_heads; hkv++) {
+                            picolm_hadamard_transform(k_pos + hkv * head_dim, head_dim, s->kv_hadamard_size);
+                        }
+                    }
                     if (s->kv_type_k == KV_CACHE_Q8_0) {
                         quantize_row_q8_0(k_pos, kp, kv_dim);
                     } else if (s->kv_type_k == KV_CACHE_Q4_0) {
@@ -5991,6 +6054,12 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                             uint16_t *kf = (uint16_t *)(kp + hkv * s->kv_head_stride_k);
                             for (int d2 = 0; d2 < head_dim; d2++)
                                 kf[d2] = fp32_to_fp16(k_head[d2]);
+                        }
+                    }
+                    /* Hadamard rotation of V before quantization (prefill) */
+                    if (s->kv_hadamard_v && s->kv_type_v != KV_CACHE_F16) {
+                        for (int hkv = 0; hkv < n_kv_heads; hkv++) {
+                            picolm_hadamard_transform(v_pos + hkv * head_dim, head_dim, s->kv_hadamard_size);
                         }
                     }
                     if (s->kv_type_v == KV_CACHE_Q8_0) {
@@ -6010,6 +6079,17 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 
             /* Zero init xb_batch for attention accumulation */
             memset(xb_batch, 0, (size_t)n_tokens * max_dim * sizeof(float));
+
+            /* Hadamard rotation of Q before attention (prefill) */
+            if (s->kv_hadamard_k) {
+                for (bi = 0; bi < n_tokens; bi++) {
+                    float *q_pos = q_batch + bi * q_dim;
+                    for (int h = 0; h < n_heads; h++) {
+                        picolm_hadamard_transform(q_pos + h * head_dim, head_dim, s->kv_hadamard_size);
+                    }
+                }
+            }
+
             /* Clear GPU tensor: batch_attention_layer's internal matmul_batch
              * calls use KV cache tiles (F16 on CPU), NOT GPU weight tensors.
              * Stale gpu_tensor from attn_q projection would cause the GPU
@@ -6024,6 +6104,16 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                                   max_dim, (int)s->kv_type_k, (int)s->kv_type_v,
                                   s->kv_row_size_k, s->kv_row_size_v,
                                   s->kv_head_stride_k, s->kv_head_stride_v);
+        }
+
+        /* Hadamard rotation of attention output back to original space (prefill) */
+        if (s->kv_hadamard_v) {
+            for (bi = 0; bi < n_tokens; bi++) {
+                float *xb_pos = xb_batch + bi * max_dim;
+                for (int h = 0; h < n_heads; h++) {
+                    picolm_hadamard_transform(xb_pos + h * head_dim, head_dim, s->kv_hadamard_size);
+                }
+            }
         }
 
         /* Apply Qwen3.5 attention gate (sigmoid, element-wise multiply on attention output before proj) */
@@ -6157,17 +6247,19 @@ int kvcache_save(const model_t *m, const char *path, int n_pos) {
         return -1;
     }
 
-    /* Version 3 header: GQA full-row layout */
-    uint32_t header[7] = {
+    /* Version 3 header: GQA full-row layout + Hadamard flags */
+    uint32_t header[9] = {
         KVCACHE_MAGIC | 0x00000003,
         (uint32_t)n_pos,
         (uint32_t)c->n_layers,
         (uint32_t)c->n_kv_heads,
         (uint32_t)c->head_dim,
         (uint32_t)s->kv_type_k,
-        (uint32_t)s->kv_type_v
+        (uint32_t)s->kv_type_v,
+        (uint32_t)s->kv_hadamard_k,
+        (uint32_t)s->kv_hadamard_v
     };
-    fwrite(header, sizeof(uint32_t), 7, f);
+    fwrite(header, sizeof(uint32_t), 9, f);
 
     /* GQA layout: pos_stride = kv_row_size_gqa (all KV heads in one row) */
     size_t pos_stride_k = s->kv_row_size_k;
@@ -6198,10 +6290,12 @@ int kvcache_load(model_t *m, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
 
-    uint32_t header[7];
-    if (fread(header, sizeof(uint32_t), 7, f) != 7) {
-        fclose(f);
-        return 0;
+    uint32_t header[9];
+    if (fread(header, sizeof(uint32_t), 9, f) != 9) {
+        /* Legacy header without Hadamard flags: try 7-entry header */
+        if (fseek(f, (long)(sizeof(uint32_t) * 4), SEEK_SET) != 0) { fclose(f); return 0; }
+        if (fread(header, sizeof(uint32_t), 7, f) != 7) { fclose(f); return 0; }
+        header[7] = 0; header[8] = 0; /* assume no Hadamard */
     }
 
     uint32_t magic_base = header[0] & ~0x00000003;
@@ -6234,6 +6328,12 @@ int kvcache_load(model_t *m, const char *path) {
     if (header[5] != s->kv_type_k || header[6] != s->kv_type_v) {
         fprintf(stderr, "kvcache_load: KV type mismatch (file k=%d v=%d vs current k=%d v=%d)\n",
                 header[5], header[6], s->kv_type_k, s->kv_type_v);
+        fclose(f);
+        return 0;
+    }
+    if (header[7] != (uint32_t)s->kv_hadamard_k || header[8] != (uint32_t)s->kv_hadamard_v) {
+        fprintf(stderr, "kvcache_load: Hadamard mismatch (file K=%d V=%d vs current K=%d V=%d)\n",
+                header[7], header[8], s->kv_hadamard_k, s->kv_hadamard_v);
         fclose(f);
         return 0;
     }

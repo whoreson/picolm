@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <assert.h>
 
 /* ================================================================
  * FP16 <-> FP32 lookup table (mirrors llama.cpp's ggml_table_f32_f16)
@@ -378,14 +379,12 @@ void dequantize_row_q4_0(const void *src, float *dst, int n) {
 
     for (int i = 0; i < nb; i++) {
         float d = fp16_to_fp32_lookup(blocks[i].d);
-        for (int j = 0; j < 32; j++) {
-            uint8_t nibble;
-            if (j < 16) {
-                nibble = blocks[i].qs[j] & 0xF;
-            } else {
-                nibble = blocks[i].qs[j - 16] >> 4;
-            }
-            dst[i * 32 + j] = d * ((float)nibble - 8.0f);
+        const uint8_t *qs = blocks[i].qs;
+        float *dp = dst + i * 32;
+        /* GGUF Q4_0: qs[j] = {b[j] low nibble, b[j+16] high nibble} */
+        for (int j = 0; j < 16; j++) {
+            dp[j]      = d * ((float)(qs[j] & 0xF) - 8.0f);
+            dp[j + 16] = d * ((float)(qs[j] >> 4) - 8.0f);
         }
     }
 }
@@ -4505,9 +4504,10 @@ void quantize_row_q4_0(const float *x, void *dst, int n) {
         blocks[i].d = fp32_to_fp16(d);
         float id = (amax != 0.0f) ? 8.0f / amax : 0.0f;
         uint8_t *q = blocks[i].qs;
+        /* GGUF Q4_0: qs[j] = {b[j] low nibble, b[j+16] high nibble} */
         for (int j = 0; j < 16; j++) {
-            uint8_t v0 = (uint8_t)(b[j * 2] * id + 8.5f);
-            uint8_t v1 = (uint8_t)(b[j * 2 + 1] * id + 8.5f);
+            uint8_t v0 = (uint8_t)(b[j] * id + 8.5f);
+            uint8_t v1 = (uint8_t)(b[j + 16] * id + 8.5f);
             if (v0 > 15) v0 = 15;
             if (v1 > 15) v1 = 15;
             q[j] = v0 | (v1 << 4);
@@ -4684,5 +4684,45 @@ void fma_scale_q4_0_f32(float *dst, float correction, const void *src, int n) {
             dptr[j]      = dptr[j] * correction + ((float)((qs[j] & 0xF) - 8)) * d;
             dptr[j + 16] = dptr[j + 16] * correction + ((float)((qs[j] >> 4) - 8)) * d;
         }
+    }
+}
+
+/* ==================================================================
+ * Walsh-Hadamard Transform (for KV cache rotation)
+ *
+ * Applies an in-place orthonormal Walsh-Hadamard transform.
+ * Self-inverting: fast_ht(x, n) applied twice returns x to its original
+ * values (up to float precision). This property (H * H = I) enables
+ * dot-product preservation: (H*q) . (H*k) = q . k.
+ *
+ * From ik_llama's fast_ht() reference implementation.
+ * ================================================================== */
+void picolm_fast_ht(float *x, int n) {
+    /* n must be a power of 2 */
+    assert((n > 0) && ((n & (n - 1)) == 0));
+
+    const float ksqrt2 = 0.707106781f;
+    float scale = 1.0f;
+
+    for (int h = 1; h < n; h <<= 1) {
+        for (int i = 0; i < n; i += 2 * h) {
+            for (int j = i; j < i + h; ++j) {
+                float a = x[j];
+                float b = x[j + h];
+                x[j + 0] = a + b;
+                x[j + h] = a - b;
+            }
+        }
+        scale *= ksqrt2;
+    }
+    for (int i = 0; i < n; ++i) x[i] *= scale;
+}
+
+void picolm_hadamard_transform(float *x, int head_dim, int nrot) {
+    /* Apply fast_ht to each nrot-sized block within head_dim */
+    assert(head_dim > 0 && head_dim % nrot == 0);
+    int nblocks = head_dim / nrot;
+    for (int b = 0; b < nblocks; b++) {
+        picolm_fast_ht(x + b * nrot, nrot);
     }
 }

@@ -474,7 +474,8 @@ static int load_tokenizer_safetensors(const char *model_dir, model_t *m) {
     return 0;
 }
 
-int model_load_safetensors(model_t *m, const char *model_dir, int max_seq_len, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v) {
+int model_load_safetensors(model_t *m, const char *model_dir, int max_seq_len, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v,
+                           int k_cache_hadamard, int v_cache_hadamard) {
     memset(m, 0, sizeof(*m));
     st_state_t st;
 
@@ -500,7 +501,7 @@ int model_load_safetensors(model_t *m, const char *model_dir, int max_seq_len, k
     }
 
     m->from_safetensors = 1;
-    if (allocate_run_state(m, kv_type_k, kv_type_v) != 0) return -1;
+    if (allocate_run_state(m, kv_type_k, kv_type_v, k_cache_hadamard, v_cache_hadamard) != 0) return -1;
     if (load_tokenizer_safetensors(model_dir, m) != 0) return -1;
 
     m->mmap_addr = malloc(sizeof(st_state_t));

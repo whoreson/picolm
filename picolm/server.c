@@ -616,7 +616,7 @@ static int server_init(const char *model_path, int num_threads, int do_prefault,
     fprintf(stderr, "[server] Loading model: %s\n", model_path);
     fp16_table_init();
 
-    if (model_load(&srv.model, model_path, context_override, KV_CACHE_F16, KV_CACHE_F16) != 0) {
+    if (model_load(&srv.model, model_path, context_override, KV_CACHE_F16, KV_CACHE_F16, 0, 0) != 0) {
         fprintf(stderr, "[server] Failed to load model\n");
         return -1;
     }
