@@ -1264,13 +1264,26 @@ typedef struct {
     const void *qx_buf;
     size_t q8_row_bytes;
     float *out;
-    int n, d;
+    int n, d, n_batch;
 } q4_0_8_8_batch_ctx_t;
 
-static void q4_0_8_8_batch_task(int b, void *ctxp) {
+/* Process one (token, 8-row-group) pair. The AVX2 kernel handles partial
+ * groups at the tail. This enables row-level parallelism within each
+ * token, matching the matmul() single-token threaded path and closing
+ * the perf gap vs Q8_0's row-parallel matmul_batch. */
+static void q4_0_8_8_batch_task(int idx, void *ctxp) {
     q4_0_8_8_batch_ctx_t *ctx = (q4_0_8_8_batch_ctx_t *)ctxp;
+    int total_groups = (ctx->d + 7) / 8;
+    int b = idx / total_groups;
+    int g = idx % total_groups;
+    int row_start = g * 8;
+    int nrows = (row_start + 8 < ctx->d) ? 8 : (ctx->d - row_start);
+    if (row_start >= ctx->d) return;
+
     const char *xb = (const char *)ctx->qx_buf + (size_t)b * ctx->q8_row_bytes;
-    vec_dot_q4_0x8_q8_0_avx2(ctx->wptr, xb, ctx->n, ctx->out + (size_t)b * ctx->d, ctx->d);
+    const void *wp = (const char *)ctx->wptr + (size_t)row_start * ctx->q8_row_bytes;
+    float *op = ctx->out + (size_t)b * ctx->d + row_start;
+    vec_dot_q4_0x8_q8_0_avx2(wp, xb, ctx->n, op, nrows);
 }
 #endif
 
@@ -1300,23 +1313,20 @@ void matmul_batch(float *out, const float *x, int n_batch,
     const char *wptr = (const char *)W;
 
 #if defined(PICOLM_AVX2)
-    /* Weights already interleaved into 8-row groups on disk (produced by
-     * e.g. llama-quantize, loaded zero-copy via mmap -- no runtime repack
-     * involved). matmul()'s single-token path already threads this by
-     * splitting rows at 8-row-aligned boundaries; replicating that here
-     * would just duplicate that logic. Simpler and equally correct:
-     * reuse the same validated gemv kernel (which already handles the
-     * full row range d, including any partial group) once per token, and
-     * parallelize across TOKENS instead of rows -- n_batch is usually
-     * much larger than the thread count during prefill anyway. */
+    /* Parallelize across (token, 8-row-group) pairs. Each group is processed
+     * by vec_dot_q4_0x8_q8_0_avx2 which handles 8 rows per call. This matches
+     * the row-parallel strategy of the Q8_0 batch path and provides enough
+     * work units even for small n_batch (e.g. 51 tokens x ~1280 groups =
+     * 65K work units on a 27B model). */
     if (qtype == GGUF_TYPE_Q4_0_8_8 && n_batch > 0 && n > 0) {
         size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
         void *qbuf = malloc((size_t)n_batch * q8_rb);
         if (qbuf) {
             for (int b = 0; b < n_batch; b++)
                 quantize_row_q8_0(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
-            q4_0_8_8_batch_ctx_t ctx = { wptr, qbuf, q8_rb, out, n, d };
-            tensor_parallel_for(n_batch, q4_0_8_8_batch_task, &ctx);
+            int total_groups = (d + 7) / 8;
+            q4_0_8_8_batch_ctx_t ctx = { wptr, qbuf, q8_rb, out, n, d, n_batch };
+            tensor_parallel_for(n_batch * total_groups, q4_0_8_8_batch_task, &ctx);
             free(qbuf);
             return;
         }
@@ -1663,9 +1673,10 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
             for (int b = 0; b < n_batch; b++)
                 quantize_row_q8_0(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
 
+            int total_groups = (d + 7) / 8;
             if (qtype1 == GGUF_TYPE_Q4_0_8_8) {
-                q4_0_8_8_batch_ctx_t ctx1 = { (const char *)W1, qbuf, q8_rb, out1, n, d };
-                tensor_parallel_for(n_batch, q4_0_8_8_batch_task, &ctx1);
+                q4_0_8_8_batch_ctx_t ctx1 = { (const char *)W1, qbuf, q8_rb, out1, n, d, n_batch };
+                tensor_parallel_for(n_batch * total_groups, q4_0_8_8_batch_task, &ctx1);
             } else {
                 size_t rb1 = gguf_type_row_size(qtype1, n);
                 for (int i = 0; i < d; i++) {
@@ -1675,8 +1686,8 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                 }
             }
             if (qtype2 == GGUF_TYPE_Q4_0_8_8) {
-                q4_0_8_8_batch_ctx_t ctx2 = { (const char *)W2, qbuf, q8_rb, out2, n, d };
-                tensor_parallel_for(n_batch, q4_0_8_8_batch_task, &ctx2);
+                q4_0_8_8_batch_ctx_t ctx2 = { (const char *)W2, qbuf, q8_rb, out2, n, d, n_batch };
+                tensor_parallel_for(n_batch * total_groups, q4_0_8_8_batch_task, &ctx2);
             } else {
                 size_t rb2 = gguf_type_row_size(qtype2, n);
                 for (int i = 0; i < d; i++) {
