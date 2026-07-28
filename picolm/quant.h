@@ -491,6 +491,10 @@ float vec_dot_q4_K_q8_K(const void *src_q4, const void *src_q8, int n);
 float vec_dot_q5_K_q8_K(const void *src_q5, const void *src_q8, int n);
 /* Q3_K * Q8_K dot product: Q3_K weights with pre-quantized Q8_K input */
 float vec_dot_q3_K_q8_K(const void *src_q3, const void *src_q8, int n);
+/* Q2_K * Q8_K dot product: Q2_K weights with pre-quantized Q8_K input */
+float vec_dot_q2_K_q8_K(const void *src_q2, const void *src_q8, int n);
+/* Q2_K * F32 dot product: Q2_K weights with float activations */
+float vec_dot_q2_K_f32(const void *src, const float *x, int n);
 /* Q4_0_4_4 interleaved weights x Q8_0 input (blocklen=4): processes nrows (multiple of 4) */
 void vec_dot_q4_0x4_q8_0(const void *vx, const void *wy, int n, float *out, int nrows);
 /* Q4_0_4_8 interleaved weights x Q8_0 input (blocklen=8): processes nrows (multiple of 4) */
