@@ -5,6 +5,13 @@ LDFLAGS = -lm -lpthread -fopenmp
 # Windows needs ws2_32 for server mode
 ifeq ($(OS),Windows_NT)
 LDFLAGS += -lws2_32
+# Force cmd.exe as shell for consistency across Windows 7 through 11.
+SHELL := cmd.exe
+# Wrap del in cmd /c for compatibility with GNU Make on Windows 7 where
+# CreateProcess(NULL, "del ...", ...) fails for internal commands.
+RM = cmd /c del /f /q
+else
+RM = rm -f
 endif
 
 # Source files and corresponding .o files
@@ -80,8 +87,13 @@ native:
 	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_flags_for,-march=native) $(call simd_defines_for,-march=native)"
 
 # --- VIZ build: native with embedded VNC visualization server ---
-viz:
-	@touch model.c picolm.c server.c
+# Remove affected .o files so the sub-make recompiles with -DPICOLM_VIZ.
+# Uses $(RM) (Make built-in, defaults to `rm -f`) for cross-platform safety.
+.PHONY: viz-clean-objs
+viz-clean-objs:
+	-$(RM) model.o picolm.o server.o
+
+viz: viz-clean-objs
 	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_flags_for,-march=native) $(call simd_defines_for,-march=native) -DPICOLM_VIZ=1 -DPICOLM_SERVER" OBJS="$(OBJS) viz.o"
 
 # --- x86-64 default: -march=native + GPU disabled, safe fallback ---
@@ -192,7 +204,7 @@ model:
 	fi
 
 clean:
-	rm -f $(TARGET) $(TARGET).exe $(OBJS) $(VIZ_OBJS) backend_gpu.o backend_gpu.o.hip backend_gpu.o.cuda backend_metal.o probes/metal_reduction_probe probes/metal_matmul_bench
+	-$(RM) $(TARGET) $(TARGET).exe $(OBJS) $(VIZ_OBJS) backend_gpu.o backend_gpu.o.hip backend_gpu.o.cuda backend_metal.o
 
 
 .PHONY: asan
@@ -206,7 +218,7 @@ asan:
 # with -DPICOLM_GPU=1 rebuilds them from scratch.
 .PHONY: gpu-clean-objs
 gpu-clean-objs:
-	rm -f model.o tensor.o quant.o picolm.o
+	-$(RM) model.o tensor.o quant.o picolm.o
 
 # --- ROCm/HIP GPU backend ---
 

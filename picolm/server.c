@@ -643,6 +643,9 @@ static float *prefill_with_checkpoints(SOCKET sock, model_t *model,
 static int server_init(const char *model_path, int num_threads, int do_prefault, int context_override, int mem_mb,
                        int checkpoint_max, int checkpoint_interval, int checkpoint_interval_gen, int checkpoint_tail_offset,
                        int viz_port, int viz_width, int viz_height) {
+#ifndef PICOLM_VIZ
+    (void)viz_port; (void)viz_width; (void)viz_height;
+#endif
     /* Set checkpoint parameters */
     srv.max_checkpoints = checkpoint_max;
     srv.checkpoint_interval = checkpoint_interval;
