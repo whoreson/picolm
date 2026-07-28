@@ -271,72 +271,72 @@ const char *tokenizer_decode(const tokenizer_t *t, int prev_token, int token) {
     const char *str = t->vocab[token];
 
     /* Handle byte tokens: <0xHH> -> single byte */
-    if (str[0] == '<' && str[1] == '0' && str[2] == 'x' && str[5] == '>') {
-        /* Decode hex byte */
-        static char byte_buf[2];
-        unsigned int val = 0;
-        for (int i = 3; i < 5; i++) {
-            val <<= 4;
-            char c = str[i];
-            if (c >= '0' && c <= '9') val += (unsigned)(c - '0');
-            else if (c >= 'A' && c <= 'F') val += (unsigned)(c - 'A' + 10);
-            else if (c >= 'a' && c <= 'f') val += (unsigned)(c - 'a' + 10);
+    /* Must check length first to avoid OOB read on short strings */
+    {
+        int slen = (int)strlen(str);
+        if (slen == 6 && str[0] == '<' && str[1] == '0' && str[2] == 'x' && str[5] == '>') {
+            static char byte_buf[2];
+            unsigned int val = 0;
+            for (int i = 3; i < 5; i++) {
+                val <<= 4;
+                char c = str[i];
+                if (c >= '0' && c <= '9') val += (unsigned)(c - '0');
+                else if (c >= 'A' && c <= 'F') val += (unsigned)(c - 'A' + 10);
+                else if (c >= 'a' && c <= 'f') val += (unsigned)(c - 'a' + 10);
+            }
+            byte_buf[0] = (char)val;
+            byte_buf[1] = '\0';
+            return byte_buf;
         }
-        byte_buf[0] = (char)val;
-        byte_buf[1] = '\0';
-        return byte_buf;
     }
 
-    /* Handle SentencePiece leading space marker "▁" -> " " */
-    /* The "▁" character is U+2581, encoded as 0xE2 0x96 0x81 in UTF-8 */
-    if ((unsigned char)str[0] == 0xE2 && (unsigned char)str[1] == 0x96 && (unsigned char)str[2] == 0x81) {
-        /* Replace leading ▁ with space, but not after BOS */
-        static char space_buf[256];
-        if (prev_token == (int)t->bos_id) {
-            /* After BOS, strip the leading space */
-            int len = (int)strlen(str + 3);
-            if (len >= (int)sizeof(space_buf)) len = (int)sizeof(space_buf) - 1;
-            memcpy(space_buf, str + 3, (size_t)len);
-            space_buf[len] = '\0';
-            return space_buf;
+    /* Unescape whitespace markers in the token string.
+     * llama.cpp: replace_all(word, "\xe2\x96\x81", " ");
+     * Must handle ALL occurrences, not just the leading one,
+     * because tokens like "  " (4-space indent) are stored as
+     * multiple U+2581 markers, each representing one space.
+     *
+     * After BOS, ALL leading space markers are stripped (not just the
+     * first one), matching SentencePiece spec where the first
+     * non-control token after BOS should have all leading spaces removed.
+     *
+     * Only U+2581 (SentencePiece) and U+0100 (SmolLM/Qwen) are treated
+     * as space markers. U+00A0 is a literal non-breaking space and is
+     * NOT converted. */
+    static char space_buf[256];
+    int out = 0;
+    const char *s = str;
+    int skip_leading = (prev_token == (int)t->bos_id);
+    int changed = 0;
+
+    while (*s && out < (int)sizeof(space_buf) - 1) {
+        if ((unsigned char)s[0] == 0xE2 && (unsigned char)s[1] == 0x96 && (unsigned char)s[2] == 0x81) {
+            /* U+2581 SentencePiece space marker */
+            if (!skip_leading) {
+                space_buf[out++] = ' ';
+            } else {
+                /* Skip all leading space markers after BOS */
+            }
+            s += 3;
+            changed = 1;
+        } else if ((unsigned char)s[0] == 0xC4 && (unsigned char)s[1] == 0xA0) {
+            /* U+0100 (SmolLM/Qwen-style space marker) */
+            if (!skip_leading) {
+                space_buf[out++] = ' ';
+            } else {
+                /* Skip all leading space markers after BOS */
+            }
+            s += 2;
+            changed = 1;
+        } else {
+            /* First non-space character: stop skipping */
+            skip_leading = 0;
+            space_buf[out++] = *s++;
         }
-        space_buf[0] = ' ';
-        int len = (int)strlen(str + 3);
-        if (len >= (int)sizeof(space_buf) - 1) len = (int)sizeof(space_buf) - 2;
-        memcpy(space_buf + 1, str + 3, (size_t)len);
-        space_buf[1 + len] = '\0';
+    }
+    if (changed) {
+        space_buf[out] = '\0';
         return space_buf;
-    }
-
-    /* Handle U+00A0 NO-BREAK SPACE -> regular space */
-    if ((unsigned char)str[0] == 0xC2 && (unsigned char)str[1] == 0xA0) {
-        static char nbsp_buf[256];
-        int len = (int)strlen(str + 2);
-        if (len >= (int)sizeof(nbsp_buf)) len = (int)sizeof(nbsp_buf) - 1;
-        nbsp_buf[0] = ' ';
-        if (len > 0) {
-            memcpy(nbsp_buf + 1, str + 2, (size_t)len);
-            nbsp_buf[1 + len] = '\0';
-        } else {
-            nbsp_buf[1] = '\0';
-        }
-        return nbsp_buf;
-    }
-
-    /* Handle U+0100 (LATIN SMALL LETTER A WITH OGONEK) as space marker */
-    /* Some GGUF tokenizers use U+0100 (0xC4 0xA0) instead of U+2581 */
-    if ((unsigned char)str[0] == 0xC4 && (unsigned char)str[1] == 0xA0) {
-        static char u100_buf[256];
-        int len = (int)strlen(str + 2);
-        if (len >= (int)sizeof(u100_buf)) len = (int)sizeof(u100_buf) - 1;
-        u100_buf[0] = ' ';
-        if (len > 0) {
-            memcpy(u100_buf + 1, str + 2, (size_t)len);
-            u100_buf[1 + len] = '\0';
-        } else {
-            u100_buf[1] = '\0';
-        }
-        return u100_buf;
     }
 
     return str;
