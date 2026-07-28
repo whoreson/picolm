@@ -1261,8 +1261,9 @@ static void q4_0_4_4_batch_task(int b, void *ctxp) {
 #ifdef PICOLM_AVX2
 typedef struct {
     const char *wptr;
+    size_t w_row_bytes;      /* Q4_0_8_8 row_bytes for weight offset calc */
     const void *qx_buf;
-    size_t q8_row_bytes;
+    size_t q8_row_bytes;     /* Q8_0 row_bytes for activation offset calc */
     float *out;
     int n, d, n_batch;
 } q4_0_8_8_batch_ctx_t;
@@ -1281,7 +1282,7 @@ static void q4_0_8_8_batch_task(int idx, void *ctxp) {
     if (row_start >= ctx->d) return;
 
     const char *xb = (const char *)ctx->qx_buf + (size_t)b * ctx->q8_row_bytes;
-    const void *wp = (const char *)ctx->wptr + (size_t)row_start * ctx->q8_row_bytes;
+    const void *wp = (const char *)ctx->wptr + (size_t)row_start * ctx->w_row_bytes;
     float *op = ctx->out + (size_t)b * ctx->d + row_start;
     vec_dot_q4_0x8_q8_0_avx2(wp, xb, ctx->n, op, nrows);
 }
@@ -1325,7 +1326,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
             for (int b = 0; b < n_batch; b++)
                 quantize_row_q8_0(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
             int total_groups = (d + 7) / 8;
-            q4_0_8_8_batch_ctx_t ctx = { wptr, qbuf, q8_rb, out, n, d, n_batch };
+            q4_0_8_8_batch_ctx_t ctx = { wptr, row_bytes, qbuf, q8_rb, out, n, d, n_batch };
             tensor_parallel_for(n_batch * total_groups, q4_0_8_8_batch_task, &ctx);
             free(qbuf);
             return;
@@ -1675,7 +1676,8 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
 
             int total_groups = (d + 7) / 8;
             if (qtype1 == GGUF_TYPE_Q4_0_8_8) {
-                q4_0_8_8_batch_ctx_t ctx1 = { (const char *)W1, qbuf, q8_rb, out1, n, d, n_batch };
+                size_t rb1 = gguf_type_row_size(GGUF_TYPE_Q4_0_8_8, n);
+                q4_0_8_8_batch_ctx_t ctx1 = { (const char *)W1, rb1, qbuf, q8_rb, out1, n, d, n_batch };
                 tensor_parallel_for(n_batch * total_groups, q4_0_8_8_batch_task, &ctx1);
             } else {
                 size_t rb1 = gguf_type_row_size(qtype1, n);
@@ -1686,7 +1688,8 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                 }
             }
             if (qtype2 == GGUF_TYPE_Q4_0_8_8) {
-                q4_0_8_8_batch_ctx_t ctx2 = { (const char *)W2, qbuf, q8_rb, out2, n, d, n_batch };
+                size_t rb2 = gguf_type_row_size(GGUF_TYPE_Q4_0_8_8, n);
+                q4_0_8_8_batch_ctx_t ctx2 = { (const char *)W2, rb2, qbuf, q8_rb, out2, n, d, n_batch };
                 tensor_parallel_for(n_batch * total_groups, q4_0_8_8_batch_task, &ctx2);
             } else {
                 size_t rb2 = gguf_type_row_size(qtype2, n);
