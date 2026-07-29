@@ -2061,6 +2061,82 @@ extern "C" float *picolm_gpu_pipe_ffn_norm(int device)   { gpu_device_ctx_t *c =
 extern "C" float *picolm_gpu_pipe_gate(int device)       { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_gate : NULL; }
 extern "C" float *picolm_gpu_pipe_up(int device)         { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_up : NULL; }
 
+/* Bit-exact device port of the host fp32_to_fp16() in quant.c -- NOT
+ * CUDA's __float2half (different rounding/tie behavior in edge cases),
+ * so that PICOLM_DBG_PIPELINE logit comparisons against the CPU path
+ * stay meaningful all the way through the KV cache, not just up to
+ * whatever tolerance a different rounding rule would introduce. */
+__device__ __forceinline__ uint16_t
+picolm_gpu_fp32_to_fp16(float f) {
+    uint32_t bits;
+    memcpy(&bits, &f, sizeof(float));
+    uint32_t sign = (bits >> 16) & 0x8000;
+    int exp = (int)((bits >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = bits & 0x7FFFFF;
+
+    if (((bits >> 23) & 0xFF) == 0) return (uint16_t)sign;
+    if (((bits >> 23) & 0xFF) == 0xFF)
+        return (uint16_t)(sign | 0x7C00 | (mant ? 0x0200 : 0));
+    if (exp >= 31) return (uint16_t)(sign | 0x7C00);
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;
+        mant |= 0x800000;
+        uint32_t shift = (uint32_t)(14 - exp);
+        uint32_t round_bit = 1U << (shift - 1);
+        mant = (mant + round_bit) >> shift;
+        return (uint16_t)(sign | mant);
+    }
+    mant += 0x00001000;
+    if (mant & 0x00800000) {
+        mant = 0;
+        exp++;
+        if (exp >= 31) return (uint16_t)(sign | 0x7C00);
+    }
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | (mant >> 13));
+}
+
+/* Pack a device-resident F32 [n_kv_heads*head_dim] vector to F16 and
+ * write it directly into the device KV cache row for (layer_ordinal,
+ * pos). One thread per element, grid-stride, no shared memory. This
+ * replaces the D2H -> CPU convert -> H2D round trip that
+ * model_forward_gpu() otherwise needs every layer of every token: with
+ * this kernel the KV store never touches the host on the hot path. */
+__global__ void
+picolm_gpu_kv_pack_store_kernel(uint16_t *dst_row, const float *src, int n) {
+    for (int i = gpuThreadIdx_x + (int)gpuBlockIdx_x * gpuBlockDim_x; i < n;
+         i += (int)gridDim.x * gpuBlockDim_x) {
+        dst_row[i] = picolm_gpu_fp32_to_fp16(src[i]);
+    }
+}
+
+/* Device-native KV store: src_dev is pipe_k/pipe_v (F32, already on
+ * device, kv_dim = n_kv_heads*head_dim elements). No transfer, no sync --
+ * same ctx->stream ordering argument as the other _dev primitives.
+ * Caller must call this (K then V) before picolm_gpu_attention_decode_dev
+ * for the same (layer_ordinal, pos), same as picolm_gpu_kv_store_rows. */
+extern "C" int
+picolm_gpu_kv_store_dev(int is_k, int layer_ordinal, int pos,
+                         const float *src_dev, int n_kv_heads, int head_dim,
+                         int max_seq_len, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    if (!g_kv_k_dev[device] || !g_kv_v_dev[device]) return 0;
+
+    int kv_dim = n_kv_heads * head_dim;
+    size_t row_bytes = (size_t)kv_dim * sizeof(uint16_t);
+    uint16_t *dst_base = is_k ? g_kv_k_dev[device] : g_kv_v_dev[device];
+    uint16_t *dst_row = dst_base
+        + ((size_t)layer_ordinal * max_seq_len * row_bytes
+           + (size_t)pos * row_bytes) / sizeof(uint16_t);
+
+    int n_threads = min(kv_dim, 256);
+    int n_blocks = (kv_dim + n_threads - 1) / n_threads;
+    picolm_gpu_kv_pack_store_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
+        dst_row, src_dev, kv_dim);
+    if (!gpu_ok(gpuGetLastError(), "kv pack+store (dev)")) return 0;
+    return 1;
+}
+
 extern "C" int
 picolm_gpu_kv_store_rows(int is_k, int layer_ordinal, int start_pos, int n_positions,
                           const void *host_rows, size_t row_bytes,

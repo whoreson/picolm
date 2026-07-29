@@ -6648,7 +6648,6 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
     int n_heads = c->n_heads;
     int n_kv_heads = c->n_kv_heads;
     int head_dim = c->head_dim;
-    int kv_dim = n_kv_heads * head_dim;
     int seq_len = c->max_seq_len;
     int rope_half = head_dim / 2;
 
@@ -6688,8 +6687,8 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
         picolm_gpu_memcpy(pipe_x, s->x, dim * sizeof(float), 1, gpu_dev);
     }
 
-    /* Host scratch for KV F16 conversion (small: 2KB each) */
-    float kv_tmp[2048]; /* max: n_kv_heads * head_dim = 8*128 = 1024 floats */
+    /* KV cache store is now fully device-native (picolm_gpu_kv_store_dev),
+     * no host scratch buffer needed. */
 
     int this_attn_ordinal = 0;
 
@@ -6732,40 +6731,40 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
         picolm_gpu_rope_apply(pipe_k, n_kv_heads, head_dim,
                                rope_cos_pos, rope_sin_pos, rope_half, gpu_dev);
 
-        /* G. KV cache store: download K/V F32, convert to F16, bulk store */
-        /* Download K from device to host */
-        picolm_gpu_memcpy(kv_tmp, pipe_k, kv_dim * sizeof(float), -1, gpu_dev);
-        {
-            uint8_t *key_pos = s->key_cache + (size_t)this_attn_ordinal * seq_len * s->kv_row_size_k + (size_t)pos * s->kv_row_size_k;
-            /* Convert F32 to F16 per KV head */
-            for (int hkv = 0; hkv < n_kv_heads; hkv++) {
-                float *k_head = kv_tmp + hkv * head_dim;
-                uint16_t *kf = (uint16_t *)(key_pos + hkv * s->kv_head_stride_k);
-                for (int d = 0; d < head_dim; d++) kf[d] = fp32_to_fp16(k_head[d]);
-            }
-            picolm_gpu_kv_store_rows(1, this_attn_ordinal, pos, 1,
-                                      key_pos, s->kv_row_size_k,
-                                      n_kv_heads, head_dim, seq_len, gpu_dev);
-        }
-
-        /* Download V from device to host */
-        picolm_gpu_memcpy(kv_tmp, pipe_v, kv_dim * sizeof(float), -1, gpu_dev);
-        {
-            uint8_t *val_pos = s->val_cache + (size_t)this_attn_ordinal * seq_len * s->kv_row_size_v + (size_t)pos * s->kv_row_size_v;
-            for (int hkv = 0; hkv < n_kv_heads; hkv++) {
-                float *v_head = kv_tmp + hkv * head_dim;
-                uint16_t *vf = (uint16_t *)(val_pos + hkv * s->kv_head_stride_v);
-                for (int d = 0; d < head_dim; d++) vf[d] = fp32_to_fp16(v_head[d]);
-            }
-            picolm_gpu_kv_store_rows(0, this_attn_ordinal, pos, 1,
-                                      val_pos, s->kv_row_size_v,
-                                      n_kv_heads, head_dim, seq_len, gpu_dev);
-        }
+        /* G. KV cache store: pack F32 -> F16 and write directly into the
+         * device KV cache, entirely device-to-device. The previous
+         * version of this step did a synchronous D2H of pipe_k/pipe_v,
+         * a CPU F16 conversion, then an H2D via picolm_gpu_kv_store_rows
+         * -- each layer, twice (K and V). picolm_gpu_memcpy is a
+         * blocking gpuMemcpy, so that was also forcing a full device
+         * sync twice per layer (64x per token for a 32-layer model),
+         * which defeated most of the point of this pipeline. This
+         * version never touches the host, so it costs nothing beyond
+         * two tiny kernel launches on ctx->stream.
+         *
+         * Trade-off: s->key_cache/val_cache (the host-side KV mirror)
+         * is NOT updated here anymore. That's fine for the current
+         * eligibility gate (kv_active requires no SSM, decided once at
+         * model load, never changes mid-generation), but if a mid-stream
+         * CPU fallback is ever introduced, it needs a one-time bulk
+         * device->host flush of the whole KV cache first -- not
+         * per-token reconstruction. Not needed today; flagged here so
+         * it isn't a silent trap later. */
+        picolm_gpu_kv_store_dev(1, this_attn_ordinal, pos, pipe_k,
+                                 n_kv_heads, head_dim, seq_len, gpu_dev);
+        picolm_gpu_kv_store_dev(0, this_attn_ordinal, pos, pipe_v,
+                                 n_kv_heads, head_dim, seq_len, gpu_dev);
         this_attn_ordinal++;
 
-        /* H. Attention decode: pipe_attn_out = attn(pipe_q) */
+        /* H. Attention decode: pipe_attn_out = attn(pipe_q)
+         * Uses this_attn_ordinal - 1 (already incremented above), the
+         * same compacted index the KV cache was just written at.
+         * Currently always equal to `l` since kv_active requires
+         * has_ssm == 0, but using the raw loop index here would be a
+         * silent landmine if that eligibility gate is ever relaxed to
+         * allow SSM-interleaved models. */
         picolm_gpu_attention_decode_dev(pipe_attn_out, pipe_q,
-                                         l, pos,
+                                         this_attn_ordinal - 1, pos,
                                          n_heads, n_kv_heads, head_dim,
                                          seq_len, gpu_dev);
 

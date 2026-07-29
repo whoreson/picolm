@@ -151,6 +151,17 @@ int picolm_gpu_kv_store_rows(int is_k, int layer_ordinal, int start_pos, int n_p
                               const void *host_rows, size_t row_bytes,
                               int n_kv_heads, int head_dim, int max_seq_len, int device);
 
+/* Device-native KV store for model_forward_gpu(): src_dev (pipe_k/pipe_v,
+ * F32, kv_dim = n_kv_heads*head_dim elements) is packed to F16 and
+ * written directly into the device KV cache -- no D2H, no CPU convert,
+ * no H2D, no sync. This is the version to use in the pipeline; use
+ * picolm_gpu_kv_store_rows() only for the host-driven decode/prefill
+ * paths (model_forward/model_forward_prefill) where K/V only ever exist
+ * on the host. Returns 1 on success. */
+int picolm_gpu_kv_store_dev(int is_k, int layer_ordinal, int pos,
+                             const float *src_dev, int n_kv_heads, int head_dim,
+                             int max_seq_len, int device);
+
 /* Decode-path attention: S=1, one query per head, online softmax over pos+1
  * cached positions. q is host pointer [n_heads][head_dim] in F32.
  * Output xb_out [n_heads][head_dim] in F32.
