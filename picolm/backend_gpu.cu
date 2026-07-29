@@ -580,6 +580,24 @@ picolm_silu_mul(float *gate, const float *up, size_t n) {
  * Shared memory: [K:head_dim u16][V:head_dim u16][reduce:256 float]
  * The reduce area is oversized (256 floats = 1KB) to handle the tree reduce.
  * For head_dim=128, kv_mul=8: 256+256+1024 = 1536 bytes. */
+/* Rewritten: the previous version had every thread declare and
+ * zero-init a private acc[8][256] float array (8KB/thread) -- far
+ * beyond the register file, so it spills to local memory, and it's
+ * done redundantly by all n_threads threads even though only thread 0
+ * ever used its own copy for the actual accumulation (which then ran
+ * serially on thread 0 alone, 255 threads idling at the barrier every
+ * position). Measured at 894.6us avg vs a ~3us KV-bytes-read bandwidth
+ * floor at pos=200 -- ~300x off, consistent with this being the actual
+ * cost driver rather than genuine attention compute.
+ *
+ * Fix: one shared-memory accumulator [kv_mul][head_dim], written once
+ * (cooperative zero-init), and the per-position update parallelized
+ * across all threads (grid-stride over head_dim) instead of a thread-0
+ * serial loop. The online-softmax branch decision is still a scalar
+ * computed by thread 0 (cheap), broadcast via two shared scalars
+ * (rescale, weight) so the unified update
+ *   acc[d] = acc[d]*rescale + weight*v[d]
+ * covers both softmax-update branches without duplicating the loop. */
 __global__ void
 picolm_gpu_attention_decode_kernel(
         float *xb_out,
@@ -600,35 +618,33 @@ picolm_gpu_attention_decode_kernel(
     int tid = gpuThreadIdx_x;
     int n_threads = gpuBlockDim_x;
 
-    /* Layer base offset in uint16_t */
     size_t layer_base = (size_t)layer_ordinal * max_seq_len * n_kv_heads * head_dim;
 
-    /* Shared memory: K + V in uint16, then float reduce area */
+    /* Shared memory: K + V (u16), reduce area (256 float), then the
+     * accumulator [kv_mul][head_dim] float, then max_score[kv_mul] and
+     * sum_exp[kv_mul] float. Sized by the host wrapper. */
     extern __shared__ uint8_t smem[];
     uint16_t *k_sh = (uint16_t *)smem;
     uint16_t *v_sh = k_sh + head_dim;
     float *reduce_sh = (float *)((uint8_t *)v_sh + head_dim * sizeof(uint16_t));
+    float *acc_sh = reduce_sh + 256;
+    float *max_score_sh = acc_sh + (size_t)kv_mul * head_dim;
+    float *sum_exp_sh = max_score_sh + kv_mul;
 
-    /* Per-Q-head online softmax state (thread-local, kv_mul <= 8) */
-    float max_score[8];
-    float sum_exp[8];
-    float acc[8][256]; /* kv_mul <= 8, head_dim <= 256 */
+    __shared__ float rescale_sh, weight_sh;
 
-    for (int g = 0; g < kv_mul; g++) {
-        max_score[g] = -1e30f;
-        sum_exp[g] = 0.0f;
-        for (int d = 0; d < head_dim; d++) acc[g][d] = 0.0f;
+    for (int i = tid; i < kv_mul * head_dim; i += n_threads) acc_sh[i] = 0.0f;
+    for (int g = tid; g < kv_mul; g += n_threads) {
+        max_score_sh[g] = -1e30f;
+        sum_exp_sh[g] = 0.0f;
     }
+    gpuSyncthreads();
 
     float sqrt_hd = sqrtf((float)head_dim);
 
     for (int t = 0; t <= pos; t++) {
-        /* Load K and V for this KV head at position t */
-        /* kv_pos_stride_bytes = n_kv_heads * head_dim * sizeof(uint16_t)
-         * kv_head_stride_bytes = head_dim * sizeof(uint16_t)
-         * Offsets are in uint16_t indices (bytes / 2) */
         size_t k_off = layer_base + (size_t)t * kv_pos_stride_bytes / 2 + kv_h * kv_head_stride_bytes / 2;
-        size_t v_off = layer_base + (size_t)t * kv_pos_stride_bytes / 2 + kv_h * kv_head_stride_bytes / 2;
+        size_t v_off = k_off;
         for (int d = tid; d < head_dim; d += n_threads) {
             k_sh[d] = kv_k[k_off + d];
             v_sh[d] = kv_v[v_off + d];
@@ -637,12 +653,10 @@ picolm_gpu_attention_decode_kernel(
 
         for (int g = 0; g < kv_mul; g++) {
             const float *qg = q_dev + (size_t)(first_qh + g) * head_dim;
-            /* Compute partial dot product */
             float score = 0.0f;
             for (int d = tid; d < head_dim; d += n_threads) {
                 score += qg[d] * gpu_fp16_to_fp32(k_sh[d]);
             }
-            /* Tree reduce across threads */
             reduce_sh[tid] = score;
             gpuSyncthreads();
             for (int s = n_threads / 2; s > 0; s >>= 1) {
@@ -651,36 +665,35 @@ picolm_gpu_attention_decode_kernel(
             }
             score = reduce_sh[0] / sqrt_hd;
 
-            /* Online softmax update (thread 0 only) */
             if (tid == 0) {
-                float *accg = acc[g];
-                if (score > max_score[g]) {
-                    float correction = expf(max_score[g] - score);
-                    sum_exp[g] = sum_exp[g] * correction + 1.0f;
-                    for (int d = 0; d < head_dim; d++) {
-                        accg[d] = accg[d] * correction + gpu_fp16_to_fp32(v_sh[d]);
-                    }
-                    max_score[g] = score;
+                if (score > max_score_sh[g]) {
+                    rescale_sh = expf(max_score_sh[g] - score);
+                    weight_sh = 1.0f;
+                    sum_exp_sh[g] = sum_exp_sh[g] * rescale_sh + 1.0f;
+                    max_score_sh[g] = score;
                 } else {
-                    float w = expf(score - max_score[g]);
-                    sum_exp[g] += w;
-                    for (int d = 0; d < head_dim; d++) {
-                        accg[d] += w * gpu_fp16_to_fp32(v_sh[d]);
-                    }
+                    rescale_sh = 1.0f;
+                    weight_sh = expf(score - max_score_sh[g]);
+                    sum_exp_sh[g] += weight_sh;
                 }
             }
             gpuSyncthreads();
+
+            float *accg = acc_sh + (size_t)g * head_dim;
+            for (int d = tid; d < head_dim; d += n_threads) {
+                accg[d] = accg[d] * rescale_sh + weight_sh * gpu_fp16_to_fp32(v_sh[d]);
+            }
+            gpuSyncthreads(); /* reduce_sh/rescale_sh/weight_sh reused next g/t iter */
         }
     }
 
-    /* Normalize and write output */
-    if (tid == 0) {
-        for (int g = 0; g < kv_mul; g++) {
-            float inv_sum = 1.0f / sum_exp[g];
-            float *xbhg = xb_out + (size_t)(first_qh + g) * head_dim;
-            for (int d = 0; d < head_dim; d++) {
-                xbhg[d] = acc[g][d] * inv_sum;
-            }
+    /* Normalize and write output, parallelized across threads */
+    for (int g = 0; g < kv_mul; g++) {
+        float inv_sum = 1.0f / sum_exp_sh[g];
+        float *xbhg = xb_out + (size_t)(first_qh + g) * head_dim;
+        float *accg = acc_sh + (size_t)g * head_dim;
+        for (int d = tid; d < head_dim; d += n_threads) {
+            xbhg[d] = accg[d] * inv_sum;
         }
     }
 }
@@ -2195,8 +2208,12 @@ picolm_gpu_attention_decode(float *xb_out, const float *q_host,
     /* kv_head stride: bytes from kv_head H to H+1 at same pos */
     size_t kv_head_stride_bytes = head_dim * sizeof(uint16_t);
 
-    /* Shared memory: K(head_dim u16) + V(head_dim u16) + reduce(256 float) */
-    size_t shared_bytes = 2 * head_dim * sizeof(uint16_t) + 256 * sizeof(float);
+    /* Shared memory: K(head_dim u16) + V(head_dim u16) + reduce(256 float)
+     * + acc[kv_mul][head_dim] float + max_score[kv_mul] + sum_exp[kv_mul] */
+    size_t shared_bytes = 2 * head_dim * sizeof(uint16_t) + 256 * sizeof(float)
+                         + (size_t)kv_mul * head_dim * sizeof(float)
+                         + (size_t)kv_mul * sizeof(float)
+                         + (size_t)kv_mul * sizeof(float);
     int block_threads = 256;
 
     dim3 grid((unsigned)n_kv_heads, 1, 1);
@@ -2239,7 +2256,10 @@ picolm_gpu_attention_decode_dev(float *xb_out_dev, const float *q_dev,
 
     size_t kv_pos_stride_bytes = (size_t)n_kv_heads * head_dim * sizeof(uint16_t);
     size_t kv_head_stride_bytes = head_dim * sizeof(uint16_t);
-    size_t shared_bytes = 2 * head_dim * sizeof(uint16_t) + 256 * sizeof(float);
+    size_t shared_bytes = 2 * head_dim * sizeof(uint16_t) + 256 * sizeof(float)
+                         + (size_t)kv_mul * head_dim * sizeof(float)
+                         + (size_t)kv_mul * sizeof(float)
+                         + (size_t)kv_mul * sizeof(float);
     int block_threads = 256;
 
     dim3 grid((unsigned)n_kv_heads, 1, 1);
