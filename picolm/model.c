@@ -469,6 +469,12 @@ static const char *gguf_type_name(uint32_t type) {
         case 40: return "nvfp4";
         case 41: return "q1_0";
         case 42: return "q2_0";
+        /* ik_llama repacked types */
+        case 202: return "q4_0_r8";
+        case 208: return "q8_0_r8";
+        case 212: return "q4_k_r4";
+        case 213: return "q5_k_r4";
+        case 214: return "q6_k_r4";
         default: return "unknown";
     }
 }
@@ -1662,22 +1668,22 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
             if (uploaded > 0) {
                 m->gpu.active = 1;
                 /* Log per-type upload stats */
-                int tcounts[20] = {0};
+                int tcounts[512] = {0};
                 for (int l = 0; l < c->n_layers; l++) {
                     layer_weights_t *lw = &m->weights.layers[l];
                     int types[] = {lw->type_attn_q, lw->type_attn_k, lw->type_attn_v,
                                    lw->type_attn_output, lw->type_ffn_gate, lw->type_ffn_up, lw->type_ffn_down};
                     for (int j = 0; j < 7; j++) {
                         int t = types[j];
-                        if (t >= 0 && t < 20) tcounts[t]++;
+                        if (t >= 0 && t < 512) tcounts[t]++;
                     }
                 }
                 /* Count output tensor */
                 int ot = m->weights.type_output;
-                if (ot >= 0 && ot < 20) tcounts[ot]++;
+                if (ot >= 0 && ot < 512) tcounts[ot]++;
                 fprintf(stderr, "INFO: GPU weights uploaded (%d/%d tensors)\n", uploaded, attempted);
                 for (int t = 0; t < 20; t++) {
-                    if (tcounts[t]) fprintf(stderr, "  type %d: %d tensors\n", t, tcounts[t]);
+                    if (tcounts[t]) fprintf(stderr, "  type %d (%s): %d tensors\n", t, gguf_type_name(t), tcounts[t]);
                 }
             } else {
                 fprintf(stderr, "WARN: GPU upload failed for all tensors, using CPU\n");
@@ -1688,7 +1694,7 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
 
     /* Log tensor type distribution */
     {
-        int tcounts[60] = {0};
+        int tcounts[512] = {0};
         for (int l = 0; l < m->config.n_layers; l++) {
             layer_weights_t *lw = &m->weights.layers[l];
             int types[] = {lw->type_attn_q, lw->type_attn_k, lw->type_attn_v,
@@ -1696,14 +1702,14 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                            lw->type_ssm_out, lw->type_ssm_conv1d, lw->type_ssm_alpha, lw->type_ssm_beta,
                            lw->type_ssm_a, lw->type_ssm_dt, lw->type_attn_norm, lw->type_post_attn_norm};
             for (int j = 0; j < 15; j++) {
-                if (types[j] >= 0 && types[j] < 60) tcounts[types[j]]++;
+                if (types[j] >= 0 && types[j] < 512) tcounts[types[j]]++;
             }
         }
-        if (m->weights.type_token_embd >= 0 && m->weights.type_token_embd < 60) tcounts[m->weights.type_token_embd]++;
-        if (m->weights.type_output >= 0 && m->weights.type_output < 60) tcounts[m->weights.type_output]++;
+        if (m->weights.type_token_embd >= 0 && m->weights.type_token_embd < 512) tcounts[m->weights.type_token_embd]++;
+        if (m->weights.type_output >= 0 && m->weights.type_output < 512) tcounts[m->weights.type_output]++;
         fprintf(stderr, "Tensor types:");
-        for (int t = 0; t < 60; t++) {
-            if (tcounts[t]) fprintf(stderr, " %d(%d)", t, tcounts[t]);
+        for (int t = 0; t < 512; t++) {
+            if (tcounts[t]) fprintf(stderr, " %s(%d)", gguf_type_name(t), tcounts[t]);
         }
         fprintf(stderr, "\n");
     }
