@@ -189,6 +189,35 @@ void picolm_gpu_kv_free(void);
  * Phase 2: Device-resident elementwise kernels (residual pipeline)
  * ================================================================ */
 
+/* Allocate the fixed-size device-resident pipeline buffers used by
+ * model_forward_gpu() (decode, S=1 only). Call once at model load, right
+ * after picolm_gpu_kv_alloc() succeeds, with sizes from model config:
+ *   dim        = hidden size (residual stream width)
+ *   q_dim      = n_heads * head_dim
+ *   kv_dim     = n_kv_heads * head_dim
+ *   ffn_hidden = FFN intermediate size
+ * Idempotent (safe to call again; no-op once allocated for this
+ * device -- these buffers never grow). Returns 1 on success, 0 ->
+ * caller must not use model_forward_gpu() for this model/device. */
+int picolm_gpu_pipeline_alloc(int dim, int q_dim, int kv_dim, int ffn_hidden, int device);
+
+/* Free all pipeline buffers on all devices. */
+void picolm_gpu_pipeline_free(void);
+
+/* Accessors for the pipeline buffers -- gpu_device_ctx_t is file-static
+ * to backend_gpu.cu, so model.c reaches the buffers through these rather
+ * than a struct it can't see. Each returns NULL if picolm_gpu_pipeline_alloc()
+ * hasn't been called successfully for `device` yet. */
+float *picolm_gpu_pipe_x(int device);
+float *picolm_gpu_pipe_xb(int device);
+float *picolm_gpu_pipe_q(int device);
+float *picolm_gpu_pipe_k(int device);
+float *picolm_gpu_pipe_v(int device);
+float *picolm_gpu_pipe_attn_out(int device);
+float *picolm_gpu_pipe_ffn_norm(int device);
+float *picolm_gpu_pipe_gate(int device);
+float *picolm_gpu_pipe_up(int device);
+
 /* RMSNorm on device: out[d] = x[d] * rsqrt(mean(x^2) + eps) * weight[d].
  * x and out are device pointers, weight is device pointer.
  * Returns 1 on success. */
@@ -215,6 +244,11 @@ int picolm_gpu_residual_add(float *out, const float *a, const float *b,
 int picolm_gpu_silu_mul_dev(float *gate_dev, const float *up_dev,
                              size_t n, int device);
 
+/* The single sync point for a whole model_forward_gpu() pass -- see the
+ * comment on the implementation for why every _dev primitive omits its
+ * own sync. */
+int picolm_gpu_sync(int device);
+
 /* Free a GPU tensor (device memory + host handle). */
 void picolm_gpu_tensor_free(picolm_gpu_tensor_t *tensor);
 
@@ -223,6 +257,10 @@ size_t picolm_gpu_tensor_bytes(const picolm_gpu_tensor_t *tensor);
 
 /* Get device ordinal for a tensor. */
 int picolm_gpu_tensor_device(const picolm_gpu_tensor_t *tensor);
+
+/* Upload a plain host F32 vector (norm weights, RoPE cos/sin tables) to
+ * a new device buffer. Returns device pointer, or NULL on failure. */
+float *picolm_gpu_upload_f32(const float *host, size_t n, int device);
 
 #ifdef __cplusplus
 }

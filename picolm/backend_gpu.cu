@@ -1215,6 +1215,17 @@ typedef struct {
     size_t q8_xd_cap;   /* capacity in bytes for q8_xd */
     gpuStream_t stream;
     size_t tensor_count, tensor_bytes;
+    /* Phase 2: fixed-size device-resident pipeline buffers for
+     * model_forward_gpu() decode (S=1 only). Allocated once at model
+     * load via picolm_gpu_pipeline_alloc(), sized from model config, no
+     * grow-on-demand -- deliberately NOT reserve()-based, so the
+     * per-token layer chain never risks a mid-pass cudaFree/cudaMalloc
+     * racing a still-queued kernel that reads the old pointer. Must not
+     * alias x/y/q8_xq/q8_xd above (those stay used internally by
+     * picolm_gpu_matmul_dev's Q8_0 path). */
+    float *pipe_x, *pipe_xb, *pipe_q, *pipe_k, *pipe_v,
+          *pipe_attn_out, *pipe_ffn_norm, *pipe_gate, *pipe_up;
+    int pipe_ready; /* 1 once the above are allocated for this device */
 } gpu_device_ctx_t;
 
 static gpu_device_ctx_t g_gpu_ctx[PICOLM_GPU_MAX_DEVICES];
@@ -1379,6 +1390,8 @@ int picolm_gpu_init(const int *devices, int count) {
 void picolm_gpu_shutdown(void) {
     /* Free KV cache allocations */
     picolm_gpu_kv_free();
+    /* Free pipeline buffers */
+    picolm_gpu_pipeline_free();
     for (int i = 0; i < g_nctx; i++) {
         gpu_device_ctx_t *ctx = &g_gpu_ctx[i];
         if (!select_ctx(ctx)) continue;
@@ -1544,6 +1557,28 @@ size_t picolm_gpu_tensor_bytes(const picolm_gpu_tensor_t *t) {
 
 int picolm_gpu_tensor_device(const picolm_gpu_tensor_t *t) {
     return t ? t->device : -1;
+}
+
+/* Upload a plain host F32 vector (norm weights, RoPE cos/sin tables --
+ * anything that isn't a quantized matmul weight matrix, so
+ * picolm_gpu_tensor_upload doesn't apply) to a freshly allocated device
+ * buffer. Caller owns the returned pointer and must gpuFree() it (or
+ * just leak it for the lifetime of the process, same as other one-time
+ * per-model uploads here). Returns NULL on failure. */
+extern "C" float *
+picolm_gpu_upload_f32(const float *host, size_t n, int device) {
+    if (!host || n < 1) return NULL;
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return NULL;
+
+    float *dev = NULL;
+    size_t bytes = n * sizeof(float);
+    if (!gpu_ok(gpuMalloc(&dev, bytes), "f32 vector allocation")) return NULL;
+    if (!gpu_ok(gpuMemcpy(dev, host, bytes, gpuMemcpyHostToDevice), "f32 vector upload")) {
+        gpuFree(dev);
+        return NULL;
+    }
+    return dev;
 }
 
 int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, int device) {
@@ -1960,6 +1995,72 @@ picolm_gpu_kv_free(void) {
     }
 }
 
+/* Phase 2: allocate the fixed-size device-resident pipeline buffers for
+ * model_forward_gpu() decode (S=1 only). Called once at model load,
+ * right after picolm_gpu_kv_alloc(), with sizes derived from model
+ * config. Idempotent: safe to call again with the same sizes (no-op if
+ * ctx->pipe_ready already set for this device -- these buffers never
+ * need to grow, unlike reserve()-based scratch, since decode is always
+ * S=1). Returns 1 on success. */
+extern "C" int
+picolm_gpu_pipeline_alloc(int dim, int q_dim, int kv_dim, int ffn_hidden, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    if (ctx->pipe_ready) return 1;
+
+    size_t db = (size_t)dim * sizeof(float);
+    size_t qb = (size_t)q_dim * sizeof(float);
+    size_t kvb = (size_t)kv_dim * sizeof(float);
+    size_t fb = (size_t)ffn_hidden * sizeof(float);
+
+    int ok = 1;
+    ok &= gpu_ok(gpuMalloc(&ctx->pipe_x, db), "pipe_x alloc");
+    ok &= gpu_ok(gpuMalloc(&ctx->pipe_xb, db), "pipe_xb alloc");
+    ok &= gpu_ok(gpuMalloc(&ctx->pipe_q, qb), "pipe_q alloc");
+    ok &= gpu_ok(gpuMalloc(&ctx->pipe_k, kvb), "pipe_k alloc");
+    ok &= gpu_ok(gpuMalloc(&ctx->pipe_v, kvb), "pipe_v alloc");
+    ok &= gpu_ok(gpuMalloc(&ctx->pipe_attn_out, qb), "pipe_attn_out alloc");
+    ok &= gpu_ok(gpuMalloc(&ctx->pipe_ffn_norm, db), "pipe_ffn_norm alloc");
+    ok &= gpu_ok(gpuMalloc(&ctx->pipe_gate, fb), "pipe_gate alloc");
+    ok &= gpu_ok(gpuMalloc(&ctx->pipe_up, fb), "pipe_up alloc");
+    if (!ok) return 0;
+
+    ctx->pipe_ready = 1;
+    return 1;
+}
+
+extern "C" void
+picolm_gpu_pipeline_free(void) {
+    for (int i = 0; i < PICOLM_GPU_MAX_DEVICES; i++) {
+        gpu_device_ctx_t *ctx = &g_gpu_ctx[i];
+        if (!ctx->pipe_ready) continue;
+        if (ctx->pipe_x) gpuFree(ctx->pipe_x);
+        if (ctx->pipe_xb) gpuFree(ctx->pipe_xb);
+        if (ctx->pipe_q) gpuFree(ctx->pipe_q);
+        if (ctx->pipe_k) gpuFree(ctx->pipe_k);
+        if (ctx->pipe_v) gpuFree(ctx->pipe_v);
+        if (ctx->pipe_attn_out) gpuFree(ctx->pipe_attn_out);
+        if (ctx->pipe_ffn_norm) gpuFree(ctx->pipe_ffn_norm);
+        if (ctx->pipe_gate) gpuFree(ctx->pipe_gate);
+        if (ctx->pipe_up) gpuFree(ctx->pipe_up);
+        ctx->pipe_x = ctx->pipe_xb = ctx->pipe_q = ctx->pipe_k = ctx->pipe_v =
+            ctx->pipe_attn_out = ctx->pipe_ffn_norm = ctx->pipe_gate = ctx->pipe_up = NULL;
+        ctx->pipe_ready = 0;
+    }
+}
+
+/* Device pointer accessors, so model.c doesn't need gpu_device_ctx_t's
+ * internal layout (it's file-static to backend_gpu.cu). */
+extern "C" float *picolm_gpu_pipe_x(int device)         { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_x : NULL; }
+extern "C" float *picolm_gpu_pipe_xb(int device)         { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_xb : NULL; }
+extern "C" float *picolm_gpu_pipe_q(int device)          { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_q : NULL; }
+extern "C" float *picolm_gpu_pipe_k(int device)          { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_k : NULL; }
+extern "C" float *picolm_gpu_pipe_v(int device)          { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_v : NULL; }
+extern "C" float *picolm_gpu_pipe_attn_out(int device)   { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_attn_out : NULL; }
+extern "C" float *picolm_gpu_pipe_ffn_norm(int device)   { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_ffn_norm : NULL; }
+extern "C" float *picolm_gpu_pipe_gate(int device)       { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_gate : NULL; }
+extern "C" float *picolm_gpu_pipe_up(int device)         { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_up : NULL; }
+
 extern "C" int
 picolm_gpu_kv_store_rows(int is_k, int layer_ordinal, int start_pos, int n_positions,
                           const void *host_rows, size_t row_bytes,
@@ -2243,5 +2344,17 @@ picolm_gpu_silu_mul_dev(float *gate_dev, const float *up_dev, size_t n, int devi
         gate_dev, up_dev, n);
     if (!gpu_ok(gpuGetLastError(), "silu_mul (dev)")) return 0;
     return 1;
+}
+
+/* The single sync point for the whole model_forward_gpu() pass: call
+ * this exactly once, after the last device-native op (typically the
+ * final rmsnorm), before reading anything back via D2H. Every _dev
+ * primitive above is launched on ctx->stream with no internal sync, so
+ * this is what actually guarantees all of it has completed. */
+extern "C" int
+picolm_gpu_sync(int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    return gpu_ok(gpuDeviceSynchronize(), "pipeline sync");
 }
 
