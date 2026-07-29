@@ -869,14 +869,16 @@ int main(int argc, char **argv) {
 
                         /* PICOLM_DBG_PIPELINE: compare GPU pipeline vs CPU per token */
                         {
+                            static int dbg_pipeline_active = 0;
                             static int dbg_pipeline_init = 0;
                             if (!dbg_pipeline_init++) {
                                 const char *dbg = getenv("PICOLM_DBG_PIPELINE");
                                 if (dbg && atoi(dbg)) {
+                                    dbg_pipeline_active = 1;
                                     fprintf(stderr, "INFO: PICOLM_DBG_PIPELINE active\n");
                                 }
                             }
-                            if (dbg_pipeline_init > 1) {
+                            if (dbg_pipeline_active) {
                                 /* Run CPU path for comparison (reuses same KV cache positions) */
                                 float *logits_cpu = model_forward(&model, token, pos + 1);
                                 if (logits_cpu) {
@@ -999,7 +1001,15 @@ int main(int argc, char **argv) {
         if (grammar_is_complete(&grammar)) break;
 
         token = next;
-        logits = model_forward(&model, token, pos + 1);
+#ifdef PICOLM_GPU
+        if (model.gpu.kv_active) {
+            logits = model_forward_gpu(&model, token, pos + 1);
+            if (!logits) logits = model_forward(&model, token, pos + 1);
+        } else
+#endif
+        {
+            logits = model_forward(&model, token, pos + 1);
+        }
     }
 
     printf("\n");
