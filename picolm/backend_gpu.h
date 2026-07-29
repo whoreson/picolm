@@ -162,6 +162,12 @@ int picolm_gpu_kv_store_dev(int is_k, int layer_ordinal, int pos,
                              const float *src_dev, int n_kv_heads, int head_dim,
                              int max_seq_len, int device);
 
+/* Batched KV store: src_dev is [S][kv_dim] contiguous, positions
+ * start_pos..start_pos+S-1. One launch for the whole prefill chunk. */
+int picolm_gpu_kv_store_dev_batched(int is_k, int layer_ordinal, int start_pos, int n_positions,
+                                     const float *src_dev, int n_kv_heads, int head_dim,
+                                     int max_seq_len, int device);
+
 /* Decode-path attention: S=1, one query per head, online softmax over pos+1
  * cached positions. q is host pointer [n_heads][head_dim] in F32.
  * Output xb_out [n_heads][head_dim] in F32.
@@ -259,6 +265,11 @@ float *picolm_gpu_pipe_up_b(int device);
 int picolm_gpu_rmsnorm(float *out, const float *x, const float *weight,
                         int dim, float eps, int device);
 
+/* Batched rmsnorm: x/out are [S][dim] contiguous, one block per row.
+ * weight is shared across all rows. For prefill pipeline. */
+int picolm_gpu_rmsnorm_batched(float *out, const float *x, const float *weight,
+                                int dim, float eps, int S, int device);
+
 /* RoPE (rotary position embedding) on device.
  * Applies pairwise sin/cos rotation to x in-place.
  * cos_tbl, sin_tbl are device pointers [half_dim].
@@ -266,6 +277,13 @@ int picolm_gpu_rmsnorm(float *out, const float *x, const float *weight,
 int picolm_gpu_rope_apply(float *x, int n_heads, int head_dim,
                            const float *cos_tbl, const float *sin_tbl,
                            int half_dim, int device);
+
+/* Batched RoPE: x is [S][n_heads][head_dim] contiguous, positions
+ * start_pos..start_pos+S-1. cos_tbl_base/sin_tbl_base are the UNOFFSET
+ * [max_seq_len][half_dim] base pointers. One launch for the whole chunk. */
+int picolm_gpu_rope_apply_batched(float *x, int n_heads, int head_dim,
+                                   const float *cos_tbl_base, const float *sin_tbl_base,
+                                   int half_dim, int start_pos, int S, int device);
 
 /* Residual add on device: out[i] = a[i] + b[i] for i = 0..n-1.
  * All device pointers. Returns 1 on success. */

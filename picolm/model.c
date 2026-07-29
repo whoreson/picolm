@@ -6839,8 +6839,6 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
     int n_heads = c->n_heads;
     int n_kv_heads = c->n_kv_heads;
     int head_dim = c->head_dim;
-    int q_dim = n_heads * head_dim;
-    int kv_dim = n_kv_heads * head_dim;
     int seq_len = c->max_seq_len;
     int rope_half = head_dim / 2;
 
@@ -6897,14 +6895,10 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
             return model_forward_prefill(m, tokens, n_tokens, start_pos);
         }
 
-        /* A. RMSNorm per token */
-        for (int bi = 0; bi < n_tokens; bi++) {
-            float *x_ptr = bx + (size_t)bi * dim;
-            float *out_ptr = bxb + (size_t)bi * dim;
-            picolm_gpu_rmsnorm(out_ptr, x_ptr,
-                                (float *)gw->attn_norm_dev[l],
-                                dim, c->rms_norm_eps, gpu_dev);
-        }
+        /* A. RMSNorm batched: one launch for all n_tokens */
+        picolm_gpu_rmsnorm_batched(bxb, bx,
+                                    (float *)gw->attn_norm_dev[l],
+                                    dim, c->rms_norm_eps, n_tokens, gpu_dev);
 
         /* B. Q projection: bq = attn_q @ bxb (S=n_tokens) */
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
@@ -6918,36 +6912,23 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_v,
                                bv, bxb, n_tokens, gpu_dev);
 
-        /* E. RoPE on Q (in-place, per token) */
-        for (int bi = 0; bi < n_tokens; bi++) {
-            int pos = start_pos + bi;
-            float *q_ptr = bq + (size_t)bi * q_dim;
-            float *rope_cos_pos = (float *)gw->rope_cos_dev + (size_t)pos * rope_half;
-            float *rope_sin_pos = (float *)gw->rope_sin_dev + (size_t)pos * rope_half;
-            picolm_gpu_rope_apply(q_ptr, n_heads, head_dim,
-                                   rope_cos_pos, rope_sin_pos, rope_half, gpu_dev);
-        }
+        /* E. RoPE on Q (batched, one launch for whole chunk) */
+        picolm_gpu_rope_apply_batched(bq, n_heads, head_dim,
+                                       (float *)gw->rope_cos_dev,
+                                       (float *)gw->rope_sin_dev,
+                                       rope_half, start_pos, n_tokens, gpu_dev);
 
-        /* F. RoPE on K (in-place, per token) */
-        for (int bi = 0; bi < n_tokens; bi++) {
-            int pos = start_pos + bi;
-            float *k_ptr = bk + (size_t)bi * kv_dim;
-            float *rope_cos_pos = (float *)gw->rope_cos_dev + (size_t)pos * rope_half;
-            float *rope_sin_pos = (float *)gw->rope_sin_dev + (size_t)pos * rope_half;
-            picolm_gpu_rope_apply(k_ptr, n_kv_heads, head_dim,
-                                   rope_cos_pos, rope_sin_pos, rope_half, gpu_dev);
-        }
+        /* F. RoPE on K (batched) */
+        picolm_gpu_rope_apply_batched(bk, n_kv_heads, head_dim,
+                                       (float *)gw->rope_cos_dev,
+                                       (float *)gw->rope_sin_dev,
+                                       rope_half, start_pos, n_tokens, gpu_dev);
 
-        /* G. KV cache store: device-native F32->F16 pack+store, batched */
-        for (int bi = 0; bi < n_tokens; bi++) {
-            int pos = start_pos + bi;
-            float *k_ptr = bk + (size_t)bi * kv_dim;
-            float *v_ptr = bv + (size_t)bi * kv_dim;
-            picolm_gpu_kv_store_dev(1, this_attn_ordinal, pos, k_ptr,
-                                     n_kv_heads, head_dim, seq_len, gpu_dev);
-            picolm_gpu_kv_store_dev(0, this_attn_ordinal, pos, v_ptr,
-                                     n_kv_heads, head_dim, seq_len, gpu_dev);
-        }
+        /* G. KV cache store: batched F32->F16 pack+store, 2 launches per layer */
+        picolm_gpu_kv_store_dev_batched(1, this_attn_ordinal, start_pos, n_tokens,
+                                         bk, n_kv_heads, head_dim, seq_len, gpu_dev);
+        picolm_gpu_kv_store_dev_batched(0, this_attn_ordinal, start_pos, n_tokens,
+                                         bv, n_kv_heads, head_dim, seq_len, gpu_dev);
         this_attn_ordinal++;
 
         /* H. Attention prefill: battn_out = attn_prefill(bq) */
@@ -6960,21 +6941,13 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_output,
                                bxb, battn_out, n_tokens, gpu_dev);
 
-        /* J. Residual add: bx += bxb (per token) */
-        for (int bi = 0; bi < n_tokens; bi++) {
-            float *x_ptr = bx + (size_t)bi * dim;
-            float *xb_ptr = bxb + (size_t)bi * dim;
-            picolm_gpu_residual_add(x_ptr, x_ptr, xb_ptr, dim, gpu_dev);
-        }
+        /* J. Residual add: bx += bxb (batched, single launch) */
+        picolm_gpu_residual_add(bx, bx, bxb, n_tokens * dim, gpu_dev);
 
-        /* K. FFN: rmsnorm + gate/silu + up + down + residual */
-        for (int bi = 0; bi < n_tokens; bi++) {
-            float *x_ptr = bx + (size_t)bi * dim;
-            float *out_ptr = bffn_norm + (size_t)bi * dim;
-            picolm_gpu_rmsnorm(out_ptr, x_ptr,
-                                (float *)gw->post_attn_norm_dev[l],
-                                dim, c->rms_norm_eps, gpu_dev);
-        }
+        /* K. FFN: rmsnorm (batched) */
+        picolm_gpu_rmsnorm_batched(bffn_norm, bx,
+                                    (float *)gw->post_attn_norm_dev[l],
+                                    dim, c->rms_norm_eps, n_tokens, gpu_dev);
 
         /* FFN gate */
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_gate,
@@ -6984,23 +6957,15 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_up,
                                bup, bffn_norm, n_tokens, gpu_dev);
 
-        /* FFN silu_mul: bgate = silu(bgate) * bup (per token) */
-        for (int bi = 0; bi < n_tokens; bi++) {
-            float *g_ptr = bgate + (size_t)bi * n_ffn;
-            float *u_ptr = bup + (size_t)bi * n_ffn;
-            picolm_gpu_silu_mul_dev(g_ptr, u_ptr, n_ffn, gpu_dev);
-        }
+        /* FFN silu_mul: bgate = silu(bgate) * bup (batched, single launch) */
+        picolm_gpu_silu_mul_dev(bgate, bup, n_tokens * n_ffn, gpu_dev);
 
         /* FFN down: bxb = down_proj @ bgate */
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_down,
                                bxb, bgate, n_tokens, gpu_dev);
 
-        /* FFN residual: bx += bxb (per token) */
-        for (int bi = 0; bi < n_tokens; bi++) {
-            float *x_ptr = bx + (size_t)bi * dim;
-            float *xb_ptr = bxb + (size_t)bi * dim;
-            picolm_gpu_residual_add(x_ptr, x_ptr, xb_ptr, dim, gpu_dev);
-        }
+        /* FFN residual: bx += bxb (batched, single launch) */
+        picolm_gpu_residual_add(bx, bx, bxb, n_tokens * dim, gpu_dev);
     }
 
     /* 3. Final rmsnorm + sync + D2H + host lm_head matmul */

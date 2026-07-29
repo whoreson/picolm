@@ -2211,6 +2211,35 @@ picolm_gpu_kv_store_dev(int is_k, int layer_ordinal, int pos,
     return 1;
 }
 
+/* Batched variant: src_dev is [S][kv_dim] contiguous F32, positions
+ * start_pos..start_pos+S-1. Reuses picolm_gpu_kv_pack_store_kernel --
+ * since the device KV cache has no per-row padding, S contiguous source
+ * rows map to S contiguous destination rows. One launch for the whole
+ * prefill chunk. */
+extern "C" int
+picolm_gpu_kv_store_dev_batched(int is_k, int layer_ordinal, int start_pos, int n_positions,
+                                 const float *src_dev, int n_kv_heads, int head_dim,
+                                 int max_seq_len, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    if (!g_kv_k_dev[device] || !g_kv_v_dev[device]) return 0;
+
+    int kv_dim = n_kv_heads * head_dim;
+    size_t row_bytes = (size_t)kv_dim * sizeof(uint16_t);
+    uint16_t *dst_base = is_k ? g_kv_k_dev[device] : g_kv_v_dev[device];
+    uint16_t *dst_row = dst_base
+        + ((size_t)layer_ordinal * max_seq_len * row_bytes
+           + (size_t)start_pos * row_bytes) / sizeof(uint16_t);
+
+    int total = n_positions * kv_dim;
+    int n_threads = 256;
+    int n_blocks = min((total + n_threads - 1) / n_threads, 4096);
+    picolm_gpu_kv_pack_store_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
+        dst_row, src_dev, total);
+    if (!gpu_ok(gpuGetLastError(), "kv pack+store batched (dev)")) return 0;
+    return 1;
+}
+
 extern "C" int
 picolm_gpu_kv_store_rows(int is_k, int layer_ordinal, int start_pos, int n_positions,
                           const void *host_rows, size_t row_bytes,
@@ -2435,6 +2464,62 @@ picolm_gpu_rmsnorm_kernel(float *out, const float *x, const float *weight,
     }
 }
 
+/* Batched rmsnorm: one block per row (S rows), same reduction per block.
+ * weight is shared across all rows. Mirrors how matmul_dev batches over S. */
+__global__ void
+picolm_gpu_rmsnorm_batched_kernel(float *out, const float *x, const float *weight,
+                                   int dim, float eps) {
+    int row = (int)gpuBlockIdx_x;
+    const float *xr = x + (size_t)row * dim;
+    float *outr = out + (size_t)row * dim;
+
+    float sum_sq = 0.0f;
+    for (int i = gpuThreadIdx_x; i < dim; i += gpuBlockDim_x) {
+        sum_sq += xr[i] * xr[i];
+    }
+    __shared__ float ssum[256];
+    ssum[gpuThreadIdx_x] = sum_sq;
+    gpuSyncthreads();
+    for (int s = gpuBlockDim_x / 2; s > 0; s >>= 1) {
+        if (gpuThreadIdx_x < s) ssum[gpuThreadIdx_x] += ssum[gpuThreadIdx_x + s];
+        gpuSyncthreads();
+    }
+    float inv_rms = 1.0f / sqrtf(ssum[0] / dim + eps);
+
+    for (int d = gpuThreadIdx_x; d < dim; d += gpuBlockDim_x) {
+        outr[d] = xr[d] * inv_rms * weight[d];
+    }
+}
+
+/* Batched RoPE: each element computes its own absolute position's table
+ * row. x is [S][n_heads][head_dim] contiguous, positions start_pos..start_pos+S-1.
+ * One launch for the whole prefill chunk. */
+__global__ void
+picolm_gpu_rope_batched_kernel(float *x, int n_heads, int head_dim,
+                                const float *cos_tbl, const float *sin_tbl,
+                                int half_dim, int start_pos, int S) {
+    int idx = gpuThreadIdx_x + (int)gpuBlockIdx_x * gpuBlockDim_x;
+    int per_row = n_heads * head_dim;
+    int total = S * per_row;
+    for (int i = idx; i < total; i += (int)gridDim.x * gpuBlockDim_x) {
+        int row = i / per_row;
+        int rem = i % per_row;
+        int d = rem % head_dim;
+        if (d >= half_dim) continue; /* second half handled by paired thread */
+
+        int pos = start_pos + row;
+        int h = rem / head_dim;
+        float *xr = x + (size_t)row * per_row;
+        int h1 = d, h2 = d + half_dim;
+        float x1 = xr[h * head_dim + h1];
+        float x2 = xr[h * head_dim + h2];
+        float c = cos_tbl[(size_t)pos * half_dim + h1];
+        float s = sin_tbl[(size_t)pos * half_dim + h1];
+        xr[h * head_dim + h1] = x1 * c - x2 * s;
+        xr[h * head_dim + h2] = x1 * s + x2 * c;
+    }
+}
+
 /* RoPE kernel: applies pairwise rotary position embedding */
 __global__ void
 picolm_gpu_rope_kernel(float *x, int n_heads, int head_dim,
@@ -2485,6 +2570,21 @@ picolm_gpu_rmsnorm(float *out, const float *x, const float *weight,
     return 1;
 }
 
+/* Batched rmsnorm: one launch for S rows. */
+extern "C" int
+picolm_gpu_rmsnorm_batched(float *out, const float *x, const float *weight,
+                            int dim, float eps, int S, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    if (S < 1) return 0;
+
+    int n_threads = min(dim, 256);
+    picolm_gpu_rmsnorm_batched_kernel<<<S, n_threads, 0, ctx->stream>>>(
+        out, x, weight, dim, eps);
+    if (!gpu_ok(gpuGetLastError(), "rmsnorm batched kernel")) return 0;
+    return 1;
+}
+
 extern "C" int
 picolm_gpu_rope_apply(float *x, int n_heads, int head_dim,
                        const float *cos_tbl, const float *sin_tbl,
@@ -2498,6 +2598,25 @@ picolm_gpu_rope_apply(float *x, int n_heads, int head_dim,
     picolm_gpu_rope_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
         x, n_heads, head_dim, cos_tbl, sin_tbl, half_dim);
     if (!gpu_ok(gpuGetLastError(), "rope kernel")) return 0;
+    return 1;
+}
+
+/* Batched RoPE: cos_tbl_base/sin_tbl_base are the UNOFFSET [max_seq_len][half_dim]
+ * base pointers. Each row computes its own position as start_pos + row. */
+extern "C" int
+picolm_gpu_rope_apply_batched(float *x, int n_heads, int head_dim,
+                               const float *cos_tbl_base, const float *sin_tbl_base,
+                               int half_dim, int start_pos, int S, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    if (S < 1) return 0;
+
+    int total = S * n_heads * head_dim;
+    int n_threads = 256;
+    int n_blocks = min((total + n_threads - 1) / n_threads, 4096);
+    picolm_gpu_rope_batched_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
+        x, n_heads, head_dim, cos_tbl_base, sin_tbl_base, half_dim, start_pos, S);
+    if (!gpu_ok(gpuGetLastError(), "rope batched kernel")) return 0;
     return 1;
 }
 
