@@ -2399,7 +2399,6 @@ float vec_dot_q5_K_q8_K(const void *src_q5, const void *src_q8, int n) {
         }
         utmp[0] &= kmask1;
         const uint16_t *uscales = (const uint16_t *)utmp;
-        int bit = 0;
         uint16_t hmv = 1;
         float smin = 0.0f;
         for (int j = 0; j < 256; j += 64) {
@@ -2433,11 +2432,10 @@ float vec_dot_q3_K_q8_K(const void *src_q3, const void *src_q8, int n) {
     const block_q8_K *y = (const block_q8_K *)src_q8;
     const int nb = n / 256;
 
+#if defined(PICOLM_AVX2)
     const uint32_t kmask1 = 0x03030303;
     const uint32_t kmask2 = 0x0f0f0f0f;
     uint32_t aux[3];
-
-#if defined(PICOLM_AVX2)
     static const uint8_t k_shuffle[128] = {
          0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,     2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3,
          4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5,     6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7,
@@ -2530,6 +2528,8 @@ float vec_dot_q3_K_q8_K(const void *src_q3, const void *src_q8, int n) {
     const __m128i mone = _mm_set1_epi8(1);
     const __m128i m32  = _mm_set1_epi8(32);
     const __m128i m2   = _mm_set1_epi8(2);
+    const uint32_t kmask1 = 0x03030303;
+    const uint32_t kmask2 = 0x0f0f0f0f;
     __m256 acc = _mm256_setzero_ps();
     uint32_t auxv[3];
 
@@ -4170,6 +4170,325 @@ float vec_dot_q4_0_8_8_f32(const void *src, const float *x, int n) {
     return sumf;
 }
 
+/* ================================================================
+ * vec_dot_q2_K_q8_K: int8 MAC for Q2_K weights * Q8_K input
+ * Adapted from llama.cpp ggml_vec_dot_q2_K_q8_K (arm NEON path + generic).
+ *
+ * Q2_K block: 256 values, 84 bytes
+ *   scales[16] - packed 4-bit scales+mins (lower 4 = scale, upper 4 = min)
+ *   qs[64]     - 2-bit quantized values (2 bits * 64 * 2 chunks = 256)
+ *   d          - super-block scale (FP16)
+ *   dmin       - super-block min   (FP16)
+ *
+ * Dequant formula: val = d * scale * q - dmin * min
+ * where q in {0,1,2,3} and scale/min are 4-bit each.
+ *
+ * Dot product: sum(d * scale * q * q8 - dmin * min * q8)
+ *            = d * sum(scale * (q*q8)) - dmin * sum(min * sum(q8_per_group))
+ *
+ * The second term uses bsums (precomputed sum of q8 in groups of 16).
+ * ================================================================ */
+float vec_dot_q2_K_q8_K(const void *src_q2, const void *src_q8, int n) {
+    const block_q2_K *x = (const block_q2_K *)src_q2;
+    const block_q8_K *y = (const block_q8_K *)src_q8;
+    const int nb = n / 256;
+    float sumf = 0.0f;
+
+#ifdef PICOLM_I8MM
+    /* I8MM: vmmlaq_s32 for 16x int8 MAC -> 4x int32 lanes per call.
+     * Each Q2_K block = 256 values in 2 chunks of 128.
+     * Per chunk: 4 shifts x 2 halves (16 values each) = 8 sub-blocks of 16.
+     * vmmlaq_s32: 16 int8 x int8 -> 4 int32 lanes.
+     * Lanes 0+3 = full 16-element dot product.
+     * One vmmlaq call per 16-element group. */
+    const uint8x16_t m3 = vdupq_n_u8(0x3);
+    const uint8x16_t m4 = vdupq_n_u8(0xF);
+
+    for (int i = 0; i < nb; ++i) {
+        const float d    = fp16_to_fp32_lookup(x[i].d)    * y[i].d;
+        const float dmin = fp16_to_fp32_lookup(x[i].dmin) * y[i].d;
+
+        const uint8_t *q2 = x[i].qs;
+        const int8_t  *q8 = y[i].qs;
+        const uint8_t *sc = x[i].scales;
+
+        /* Extract scales (lower 4 bits) */
+        const uint8x16_t mins_and_scales = vld1q_u8(sc);
+        const uint8x16_t scales_v = vandq_u8(mins_and_scales, m4);
+        const int8x16_t  scales_s8 = vreinterpretq_s8_u8(scales_v);
+
+        /* Min correction: dmin * sum(bsums[j] * min[j]) */
+        const uint8x16_t mins_v = vshrq_n_u8(mins_and_scales, 4);
+        const int16x4_t b0 = vld1_s16(y[i].bsums);
+        const int16x4_t b1 = vld1_s16(y[i].bsums + 4);
+        const int16x4_t b2 = vld1_s16(y[i].bsums + 8);
+        const int16x4_t b3 = vld1_s16(y[i].bsums + 12);
+        const int32x4_t mm0 = vmull_s16(vget_low_s16(vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(mins_v)))), b0);
+        const int32x4_t mm1 = vmull_s16(vget_high_s16(vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(mins_v)))), b1);
+        const int32x4_t mm2 = vmull_s16(vget_low_s16(vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(mins_v)))), b2);
+        const int32x4_t mm3 = vmull_s16(vget_high_s16(vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(mins_v)))), b3);
+        const int32x4_t msum = vaddq_s32(vaddq_s32(mm0, mm1), vaddq_s32(mm2, mm3));
+        const int summs = vaddvq_s32(msum);
+
+        int isum = 0;
+        int is = 0;
+        for (int chunk = 0; chunk < 2; ++chunk) {
+            uint8x16_t q2a = vld1q_u8(q2);
+            uint8x16_t q2b = vld1q_u8(q2 + 16);
+            q2 += 32;
+
+            for (int shift_i = 0; shift_i < 4; ++shift_i) {
+                const int8x16_t qa = vreinterpretq_s8_u8(vandq_u8(q2a, m3));
+                const int8x16_t qb = vreinterpretq_s8_u8(vandq_u8(q2b, m3));
+                q2a = vshrq_n_u8(q2a, 2);
+                q2b = vshrq_n_u8(q2b, 2);
+
+                const int8x16_t q8a = vld1q_s8(q8);
+                const int8x16_t q8b = vld1q_s8(q8 + 16);
+                q8 += 32;
+
+                int32x4_t s0 = vmmlaq_s32(vdupq_n_s32(0), qa, q8a);
+                int32x4_t s1 = vmmlaq_s32(vdupq_n_s32(0), qb, q8b);
+                int dot_a = vgetq_lane_s32(s0, 0) + vgetq_lane_s32(s0, 3);
+                int dot_b = vgetq_lane_s32(s1, 0) + vgetq_lane_s32(s1, 3);
+
+                isum += dot_a * (int)scales_s8[is] + dot_b * (int)scales_s8[is + 1];
+                is += 2;
+            }
+        }
+
+        sumf += d * (float)isum - dmin * (float)summs;
+    }
+
+#elif defined(PICOLM_DOTPROD)
+    /* ARMv8.2 dotprod: vdotq_s32 for 16x int8 MAC -> 1 int32 accumulation.
+     * Each 16-element group uses one vdotq_s32 call.
+     * Pattern mirrors llama.cpp's NEON dotprod Q2_K path. */
+    const uint8x16_t m3 = vdupq_n_u8(0x3);
+    const uint8x16_t m4 = vdupq_n_u8(0xF);
+
+    for (int i = 0; i < nb; ++i) {
+        const float d    = fp16_to_fp32_lookup(x[i].d)    * y[i].d;
+        const float dmin = fp16_to_fp32_lookup(x[i].dmin) * y[i].d;
+
+        const uint8_t *q2 = x[i].qs;
+        const int8_t  *q8 = y[i].qs;
+        const uint8_t *sc = x[i].scales;
+
+        const uint8x16_t mins_and_scales = vld1q_u8(sc);
+        const uint8x16_t scales_v = vandq_u8(mins_and_scales, m4);
+        const int8x16_t  scales_s8 = vreinterpretq_s8_u8(scales_v);
+
+        const uint8x16_t mins_v = vshrq_n_u8(mins_and_scales, 4);
+        const int16x4_t b0 = vld1_s16(y[i].bsums);
+        const int16x4_t b1 = vld1_s16(y[i].bsums + 4);
+        const int16x4_t b2 = vld1_s16(y[i].bsums + 8);
+        const int16x4_t b3 = vld1_s16(y[i].bsums + 12);
+        const int32x4_t mm0 = vmull_s16(vget_low_s16(vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(mins_v)))), b0);
+        const int32x4_t mm1 = vmull_s16(vget_high_s16(vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(mins_v)))), b1);
+        const int32x4_t mm2 = vmull_s16(vget_low_s16(vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(mins_v)))), b2);
+        const int32x4_t mm3 = vmull_s16(vget_high_s16(vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(mins_v)))), b3);
+        const int32x4_t msum = vaddq_s32(vaddq_s32(mm0, mm1), vaddq_s32(mm2, mm3));
+        const int summs = vaddvq_s32(msum);
+
+        int isum = 0;
+        int is = 0;
+        const int32x4_t vzero = vdupq_n_s32(0);
+
+        for (int chunk = 0; chunk < 2; ++chunk) {
+            uint8x16_t q2a = vld1q_u8(q2);
+            uint8x16_t q2b = vld1q_u8(q2 + 16);
+            q2 += 32;
+
+            for (int shift_i = 0; shift_i < 4; ++shift_i) {
+                const int8x16_t qa = vreinterpretq_s8_u8(vandq_u8(q2a, m3));
+                const int8x16_t qb = vreinterpretq_s8_u8(vandq_u8(q2b, m3));
+                q2a = vshrq_n_u8(q2a, 2);
+                q2b = vshrq_n_u8(q2b, 2);
+
+                const int8x16_t q8a = vld1q_s8(q8);
+                const int8x16_t q8b = vld1q_s8(q8 + 16);
+                q8 += 32;
+
+                int dot_a = vaddvq_s32(vdotq_s32(vzero, qa, q8a));
+                int dot_b = vaddvq_s32(vdotq_s32(vzero, qb, q8b));
+
+                isum += dot_a * (int)scales_s8[is] + dot_b * (int)scales_s8[is + 1];
+                is += 2;
+            }
+        }
+
+        sumf += d * (float)isum - dmin * (float)summs;
+    }
+
+#elif defined(PICOLM_NEON)
+    /* Plain NEON (no dotprod, no I8MM): vmull_s8 + vpaddlq_s16.
+     * Same algorithm as above but without dotprod or I8MM instructions. */
+    const uint8x16_t m3  = vdupq_n_u8(0x3);
+    const uint8x16_t m4  = vdupq_n_u8(0xF);
+
+    for (int i = 0; i < nb; ++i) {
+        const float d    = fp16_to_fp32_lookup(x[i].d)    * y[i].d;
+        const float dmin = fp16_to_fp32_lookup(x[i].dmin) * y[i].d;
+
+        const uint8_t *q2 = x[i].qs;
+        const int8_t  *q8 = y[i].qs;
+        const uint8_t *sc = x[i].scales;
+
+        const uint8x16_t mins_and_scales = vld1q_u8(sc);
+        const uint8x16_t scales_v = vandq_u8(mins_and_scales, m4);
+        const int8x16_t  scales_s8 = vreinterpretq_s8_u8(scales_v);
+
+        const uint8x16_t mins_v = vshrq_n_u8(mins_and_scales, 4);
+        const int16x4_t b0 = vld1_s16(y[i].bsums);
+        const int16x4_t b1 = vld1_s16(y[i].bsums + 4);
+        const int16x4_t b2 = vld1_s16(y[i].bsums + 8);
+        const int16x4_t b3 = vld1_s16(y[i].bsums + 12);
+        const int32x4_t mm0 = vmull_s16(vget_low_s16(vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(mins_v)))), b0);
+        const int32x4_t mm1 = vmull_s16(vget_high_s16(vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(mins_v)))), b1);
+        const int32x4_t mm2 = vmull_s16(vget_low_s16(vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(mins_v)))), b2);
+        const int32x4_t mm3 = vmull_s16(vget_high_s16(vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(mins_v)))), b3);
+        const int32x4_t msum = vaddq_s32(vaddq_s32(mm0, mm1), vaddq_s32(mm2, mm3));
+        const int summs = vaddvq_s32(msum);
+
+        int isum = 0;
+        int is = 0;
+        for (int chunk = 0; chunk < 2; ++chunk) {
+            uint8x16_t q2a = vld1q_u8(q2);
+            uint8x16_t q2b = vld1q_u8(q2 + 16);
+            q2 += 32;
+
+            for (int shift_i = 0; shift_i < 4; ++shift_i) {
+                const int8x16_t qa = vreinterpretq_s8_u8(vandq_u8(q2a, m3));
+                const int8x16_t qb = vreinterpretq_s8_u8(vandq_u8(q2b, m3));
+                q2a = vshrq_n_u8(q2a, 2);
+                q2b = vshrq_n_u8(q2b, 2);
+
+                const int8x16_t q8a = vld1q_s8(q8);
+                const int8x16_t q8b = vld1q_s8(q8 + 16);
+                q8 += 32;
+
+                const int16x8_t p0a = vmull_s8(vget_low_s8(qa), vget_low_s8(q8a));
+                const int16x8_t p1a = vmull_s8(vget_high_s8(qa), vget_high_s8(q8a));
+                const int32x4_t s0a = vaddq_s32(vpaddlq_s16(p0a), vpaddlq_s16(p1a));
+                int dot_a = vaddvq_s32(s0a);
+
+                const int16x8_t p0b = vmull_s8(vget_low_s8(qb), vget_low_s8(q8b));
+                const int16x8_t p1b = vmull_s8(vget_high_s8(qb), vget_high_s8(q8b));
+                const int32x4_t s0b = vaddq_s32(vpaddlq_s16(p0b), vpaddlq_s16(p1b));
+                int dot_b = vaddvq_s32(s0b);
+
+                isum += dot_a * (int)scales_s8[is] + dot_b * (int)scales_s8[is + 1];
+                is += 2;
+            }
+        }
+
+        sumf += d * (float)isum - dmin * (float)summs;
+    }
+
+#else
+    /* Scalar fallback (mirrors llama.cpp generic path) */
+    for (int i = 0; i < nb; ++i) {
+        const uint8_t *q2 = x[i].qs;
+        const int8_t  *q8 = y[i].qs;
+        const uint8_t *sc = x[i].scales;
+
+        int summs = 0;
+        for (int j = 0; j < 16; ++j) {
+            summs += y[i].bsums[j] * (int)(sc[j] >> 4);
+        }
+
+        const float d    = fp16_to_fp32_lookup(x[i].d)    * y[i].d;
+        const float dmin = fp16_to_fp32_lookup(x[i].dmin) * y[i].d;
+
+        int isum = 0;
+        int is = 0;
+        for (int chunk = 0; chunk < 2; ++chunk) {
+            int shift = 0;
+            for (int j = 0; j < 4; ++j) {
+                int s = sc[is++] & 0xF;
+                int isuml = 0;
+                for (int l = 0; l < 16; ++l) isuml += q8[l] * ((q2[l] >> shift) & 3);
+                isum += s * isuml;
+
+                s = sc[is++] & 0xF;
+                isuml = 0;
+                for (int l = 0; l < 16; ++l) isuml += q8[l + 16] * ((q2[l] >> shift) & 3);
+                isum += s * isuml;
+
+                shift += 2;
+                q8 += 32;
+            }
+            q2 += 32;
+        }
+
+        sumf += d * (float)isum - dmin * (float)summs;
+    }
+#endif
+    return sumf;
+}
+
+/* ================================================================
+ * vec_dot_q2_K_f32: Q2_K weights x float32 activations
+ * Pre-quantizes activations to Q8_K and delegates to vec_dot_q2_K_q8_K.
+ * ================================================================ */
+float vec_dot_q2_K_f32(const void *src, const float *x, int n) {
+    /* Pre-quantize x to Q8_K and delegate to vec_dot_q2_K_q8_K.
+     * For small n, quantization overhead dominates; fall back to scalar. */
+    if (n >= 256 && n % 256 == 0) {
+        size_t nq8 = (n / 256) * sizeof(block_q8_K);
+        /* Use stack buffer for small sizes to avoid malloc overhead */
+        block_q8_K qx_buf[2];
+        block_q8_K *qx;
+        int qx_owned = 0;
+
+        if (nq8 <= sizeof(qx_buf)) {
+            qx = qx_buf;
+        } else {
+            qx = (block_q8_K *)malloc(nq8);
+            if (!qx) goto scalar_path;
+            qx_owned = 1;
+        }
+        quantize_row_q8_K(x, qx, n);
+        float result = vec_dot_q2_K_q8_K(src, qx, n);
+        if (qx_owned) free(qx);
+        return result;
+
+    scalar_path:
+        ;
+    }
+
+    /* Scalar fallback: dequantize Q2_K to float, then dot */
+    const block_q2_K *blocks = (const block_q2_K *)src;
+    int nb = n / 256;
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        float d    = fp16_to_fp32_lookup(blocks[i].d);
+        float dmin = fp16_to_fp32_lookup(blocks[i].dmin);
+        const uint8_t *q = blocks[i].qs;
+        const float *xp = x + i * 256;
+        float block_sum = 0.0f;
+        int is = 0;
+        float dl, ml;
+        for (int chunk = 0; chunk < 256; chunk += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; ++j) {
+                uint8_t sc = blocks[i].scales[is++];
+                dl = d * (sc & 0xF); ml = dmin * (sc >> 4);
+                for (int l = 0; l < 16; ++l) block_sum += (dl * (int8_t)((q[l] >> shift) & 3) - ml) * xp[l];
+                sc = blocks[i].scales[is++];
+                dl = d * (sc & 0xF); ml = dmin * (sc >> 4);
+                for (int l = 0; l < 16; ++l) block_sum += (dl * (int8_t)((q[l+16] >> shift) & 3) - ml) * xp[l + 16];
+                shift += 2;
+                xp += 32;
+            }
+            q += 32;
+        }
+        sumf += block_sum;
+    }
+    return sumf;
+}
+
 /* ---- Generic dispatch ---- */
 
 float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
@@ -4204,6 +4523,7 @@ float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
         case GGUF_TYPE_Q4_1: return vec_dot_q4_1_f32(src, x, n);
         case GGUF_TYPE_Q1_0: return vec_dot_q1_0_f32(src, x, n);
         case GGUF_TYPE_Q2_0: return vec_dot_q2_0_f32(src, x, n);
+        case GGUF_TYPE_Q2_K:  return vec_dot_q2_K_f32(src, x, n);
         case GGUF_TYPE_Q4_0_4_4: return vec_dot_q4_0_4_4_f32(src, x, n);
         case GGUF_TYPE_Q4_0_4_8: return vec_dot_q4_0_4_8_f32(src, x, n);
         case GGUF_TYPE_Q4_0_8_8: return vec_dot_q4_0_8_8_f32(src, x, n);

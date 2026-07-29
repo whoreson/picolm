@@ -18,6 +18,9 @@
 #include "grammar.h"
 #include "cJSON.h"
 #include "qwen_tokenize.h"
+#ifdef PICOLM_VIZ
+#include "viz.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -230,6 +233,10 @@ static struct _server_state {
     int checkpoint_tail_offset;           /* --checkpoint-tail-offset (default: 5) */
     size_t checkpoint_snapshot_size;      /* cached snapshot size from model */
     uint8_t *checkpoint_scratch;          /* pre-allocated buffer for save/restore */
+
+#ifdef PICOLM_VIZ
+    int viz_initialized;                  /* 1 if viz_init succeeded */
+#endif
 } srv;
 
 /* Parse HTTP request line: "METHOD /path HTTP/1.1" */
@@ -498,6 +505,33 @@ static void checkpoint_restore_log(int target, int actual, int kv_match, int suc
     }
 }
 
+/* When the prompt is fully cached, adjust start_pos so that at least one
+ * token is re-evaluated. Prevents the n_prefill<=0 path from writing a
+ * duplicate KV entry for the last prompt token at the wrong position.
+ * Matches llama.cpp: if (n_past == task.n_tokens() && n_past > 0) n_past--;
+ */
+static void cache_adjust_stepback(model_t *model, int n_prompt, int *start_pos) {
+    if (*start_pos < n_prompt || *start_pos <= 0) return;
+
+    if (model->config.has_ssm && srv.max_checkpoints > 0) {
+        int target = n_prompt - 1;
+        int actual = 0;
+        if (checkpoint_restore(target, &actual) == 0) {
+            *start_pos = actual;
+            if (actual < srv.last_prompt_len) {
+                srv.last_prompt_len = actual;
+            }
+            checkpoint_restore_log(target, actual, 0, 1);
+        } else {
+            *start_pos = 0;
+            model_ssm_state_reset(model);
+            checkpoint_restore_log(target, 0, 0, 0);
+        }
+    } else {
+        (*start_pos)--;
+    }
+}
+
 /* Clear all checkpoints and free their memory */
 static void checkpoint_clear(void) {
     int n = checkpoint_count();
@@ -607,7 +641,11 @@ static float *prefill_with_checkpoints(SOCKET sock, model_t *model,
 /* ---- Server init / free (persistent model) ---- */
 
 static int server_init(const char *model_path, int num_threads, int do_prefault, int context_override, int mem_mb,
-                       int checkpoint_max, int checkpoint_interval, int checkpoint_interval_gen, int checkpoint_tail_offset) {
+                       int checkpoint_max, int checkpoint_interval, int checkpoint_interval_gen, int checkpoint_tail_offset,
+                       int viz_port, int viz_width, int viz_height) {
+#ifndef PICOLM_VIZ
+    (void)viz_port; (void)viz_width; (void)viz_height;
+#endif
     /* Set checkpoint parameters */
     srv.max_checkpoints = checkpoint_max;
     srv.checkpoint_interval = checkpoint_interval;
@@ -694,6 +732,30 @@ static int server_init(const char *model_path, int num_threads, int do_prefault,
     }
 
     srv.model_loaded = 1;
+
+#ifdef PICOLM_VIZ
+    /* Start visualization server if requested */
+    srv.viz_initialized = 0;
+    if (viz_port > 0) {
+        char model_short[256];
+        const char *base = model_path;
+        const char *slash = strrchr(model_path, '/');
+        if (slash) base = slash + 1;
+        strncpy(model_short, base, sizeof(model_short) - 1);
+        model_short[sizeof(model_short) - 1] = '\0';
+        char *dot = strrchr(model_short, '.');
+        if (dot && dot != model_short) *dot = '\0';
+
+        if (viz_init(viz_width, viz_height, viz_port) != 0) {
+            fprintf(stderr, "[server] Failed to start visualization server on port %d\n", viz_port);
+        } else {
+            fprintf(stderr, "[server] Visualization server started on port %d (%dx%d)\n", viz_port, viz_width, viz_height);
+            viz_set_model_info(srv.model.config.n_layers, srv.model.config.n_embd, model_short);
+            srv.viz_initialized = 1;
+        }
+    }
+#endif
+
     srv.kv_pos = 0;
     srv.last_prompt_len = 0;
     srv.last_prompt_tokens = NULL;
@@ -728,6 +790,9 @@ static void server_free(void) {
     srv.checkpoint_scratch = NULL;
 
     if (srv.model_loaded) {
+#ifdef PICOLM_VIZ
+        if (srv.viz_initialized) viz_free();
+#endif
         tokenizer_free(&srv.tokenizer);
         tensor_threadpool_free();
         model_free(&srv.model);
@@ -1181,6 +1246,9 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         }
     }
 
+    /* Step back when fully cached to avoid duplicate KV entry (see cache_adjust_stepback) */
+    cache_adjust_stepback(model, n_prompt, &start_pos);
+
     if (start_pos == 0) {
         srv.kv_pos = 0;
         /* Clear checkpoints on full reprocess - conversation has reset */
@@ -1627,6 +1695,9 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
     cJSON *item;
     if ((item = cJSON_GetObjectItem(req, "n_predict")))
         n_predict = (int)cJSON_GetNumberValue(item);
+    /* Also accept OpenAI-style 'max_tokens' as alias for n_predict */
+    if ((item = cJSON_GetObjectItem(req, "max_tokens")) && n_predict < 0)
+        n_predict = (int)cJSON_GetNumberValue(item);
     if ((item = cJSON_GetObjectItem(req, "temperature")))
         temperature = (float)cJSON_GetNumberValue(item);
     if ((item = cJSON_GetObjectItem(req, "top_p")))
@@ -1722,9 +1793,10 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             if (ptokens[cache_start] != srv.last_prompt_tokens[cache_start]) break;
         }
     }
-    /* Use shared prefix from KV cache. The attention loop iterates
-     * from t=0 to t<=pos, so stale KV data at positions beyond n_prompt
-     * is never read (it will be overwritten during generation). */
+    /* Use shared prefix from KV cache. Stale KV data at positions beyond
+     * the prompt is harmless during generation (it gets overwritten).
+     * When the prompt is fully cached, we step back 1 token below so that
+     * at least one token is re-evaluated, preventing a duplicate KV entry. */
     int start_pos = cache_start;
     fprintf(stderr, "[server] %.1fms: KV cache match %d/%d tokens (%d new)\n", get_time_ms() - t0, start_pos, n_prompt, n_prompt - start_pos);
 
@@ -1743,6 +1815,9 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             checkpoint_restore_log(cache_start, 0, cache_start, 0);
         }
     }
+
+    /* Step back when fully cached to avoid duplicate KV entry (see cache_adjust_stepback) */
+    cache_adjust_stepback(model, n_prompt, &start_pos);
 
     if (start_pos == 0) {
         srv.kv_pos = 0;
@@ -2404,7 +2479,8 @@ static void handle_request(SOCKET sock) {
 /* ---- Server Main Loop ---- */
 
 int server_main(int port, const char *host, const char *model_path, int num_threads, int do_prefault, int context_override, int mem_mb,
-                int checkpoint_max, int checkpoint_interval, int checkpoint_interval_gen, int checkpoint_tail_offset) {
+                int checkpoint_max, int checkpoint_interval, int checkpoint_interval_gen, int checkpoint_tail_offset,
+                int viz_port, int viz_width, int viz_height) {
     srv.port = port;
     strncpy(srv.host, host, sizeof(srv.host) - 1);
     srv.model_path = model_path;
@@ -2412,7 +2488,8 @@ int server_main(int port, const char *host, const char *model_path, int num_thre
 
     /* Load model once at startup */
     if (server_init(model_path, num_threads, do_prefault, context_override, mem_mb,
-                    checkpoint_max, checkpoint_interval, checkpoint_interval_gen, checkpoint_tail_offset) != 0) {
+                    checkpoint_max, checkpoint_interval, checkpoint_interval_gen, checkpoint_tail_offset,
+                    viz_port, viz_width, viz_height) != 0) {
         return -1;
     }
 

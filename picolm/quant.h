@@ -182,7 +182,7 @@ static inline int hsum_i32_8(__m256i a) {
 static inline __m256 fp16x8_to_fp32_inline(const uint16_t *p) {
 #ifdef __F16C__
     __m128 lo = _mm_cvtph_ps(_mm_loadu_si128((const __m128i *)p));
-    __m128 hi = _mm_cvtph_ps(_mm_loadu_si128((const __m128i *)(p + 4)));
+    __m128 hi = _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *)(p + 4)));
     return _mm256_insertf128_ps(_mm256_castps128_ps256(lo), hi, 1);
 #else
     /* No F16C: use lookup table for faster FP16->FP32 conversion */
@@ -232,7 +232,7 @@ static inline float32x4_t fp16x4_to_fp32_inline(const uint16_t *p) {
 /* Convert 4 FP16 to 4 FP32 in SSE register */
 static inline __m128 fp16x4_to_fp32_inline(const uint16_t *p) {
 #ifdef __F16C__
-    return _mm_cvtph_ps(_mm_loadu_si128((const __m128i *)p));
+    return _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *)p));
 #else
     /* No F16C: use lookup table */
     return _mm_set_ps(
@@ -249,7 +249,7 @@ static inline __m512 fp16x16_to_fp32_inline(const uint16_t *p) {
     __m128 a = _mm_cvtph_ps(_mm_loadu_si128((const __m128i *)p));
     __m128 b = _mm_cvtph_ps(_mm_loadu_si128((const __m128i *)(p + 4)));
     __m128 c = _mm_cvtph_ps(_mm_loadu_si128((const __m128i *)(p + 8)));
-    __m128 d = _mm_cvtph_ps(_mm_loadu_si128((const __m128i *)(p + 12)));
+    __m128 d = _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *)(p + 12)));
     __m512 r = _mm512_castps128_ps512(a);
     r = _mm512_insertf32x4(r, b, 1);
     r = _mm512_insertf32x4(r, c, 2);
@@ -491,6 +491,10 @@ float vec_dot_q4_K_q8_K(const void *src_q4, const void *src_q8, int n);
 float vec_dot_q5_K_q8_K(const void *src_q5, const void *src_q8, int n);
 /* Q3_K * Q8_K dot product: Q3_K weights with pre-quantized Q8_K input */
 float vec_dot_q3_K_q8_K(const void *src_q3, const void *src_q8, int n);
+/* Q2_K * Q8_K dot product: Q2_K weights with pre-quantized Q8_K input */
+float vec_dot_q2_K_q8_K(const void *src_q2, const void *src_q8, int n);
+/* Q2_K * F32 dot product: Q2_K weights with float activations */
+float vec_dot_q2_K_f32(const void *src, const float *x, int n);
 /* Q4_0_4_4 interleaved weights x Q8_0 input (blocklen=4): processes nrows (multiple of 4) */
 void vec_dot_q4_0x4_q8_0(const void *vx, const void *wy, int n, float *out, int nrows);
 /* Q4_0_4_8 interleaved weights x Q8_0 input (blocklen=8): processes nrows (multiple of 4) */

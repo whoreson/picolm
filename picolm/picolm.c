@@ -532,9 +532,19 @@ int main(int argc, char **argv) {
 #endif
         fp16_table_init();
         extern int server_main(int port, const char *host, const char *model_path, int num_threads, int do_prefault, int context_override, int mem_mb,
-                               int checkpoint_max, int checkpoint_interval, int checkpoint_interval_gen, int checkpoint_tail_offset);
+                               int checkpoint_max, int checkpoint_interval, int checkpoint_interval_gen, int checkpoint_tail_offset,
+                               int viz_port, int viz_width, int viz_height);
+        /* When --viz is specified in server mode, pass the viz parameters through.
+         * When --viz is not specified, viz_port=0 so server_init skips viz. */
+        int srv_viz_port = 0, srv_viz_width = 800, srv_viz_height = 480;
+#ifdef PICOLM_VIZ
+        srv_viz_port = viz_mode ? viz_port : 0;
+        srv_viz_width = viz_width;
+        srv_viz_height = viz_height;
+#endif
         return server_main(server_port, server_host, model_path, num_threads, do_prefault, context_override, mem_mb,
-                           checkpoint_max, checkpoint_interval, checkpoint_interval_gen, checkpoint_tail_offset);
+                           checkpoint_max, checkpoint_interval, checkpoint_interval_gen, checkpoint_tail_offset,
+                           srv_viz_port, srv_viz_width, srv_viz_height);
     }
 
     if (!prompt) {
@@ -544,7 +554,7 @@ int main(int argc, char **argv) {
     }
 
     /* Load model */
-    fprintf(stderr, "PicoLM v1.0-beta1\n");
+    fprintf(stderr, "PicoLM v1.0-beta2\n");
     fprintf(stderr, "Loading model: %s\n", model_path);
     #if defined(PICOLM_AVX512)
     fprintf(stderr, "SIMD: AVX-512\n");

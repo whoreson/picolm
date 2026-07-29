@@ -5384,7 +5384,7 @@ static void batch_attention_tiled(
         size_t kv_row_size_k, size_t kv_row_size_v,
         size_t kv_head_stride_k, size_t kv_head_stride_v)
 {
-    (void)kv_head_stride_v;  /* V tile uses F32 dequant, no head stride needed */
+    /* kv_head_stride_v is used below in V-tile extraction */
     int kv_mul = n_heads / n_kv_heads;
     int tile = ATTN_TILE;
 
@@ -5503,9 +5503,10 @@ static void batch_attention_tiled(
                     /* Extract V-tile and dequantize to F32 */
                     {
                         size_t rb = kv_row_size_v;
+                        size_t v_head_stride = kv_head_stride_v;
                         for (int p = 0; p < this_tile_size; p++) {
-                            const uint8_t *src = vcache + (size_t)(kv_t0 + p) * n_kv_heads * rb
-                                               + kv_h * rb;
+                            const uint8_t *src = vcache + (size_t)(kv_t0 + p) * rb
+                                               + kv_h * v_head_stride;
                             dequantize_row(src, tile_v_f32 + (size_t)p * head_dim,
                                           head_dim, gguf_v);
                         }

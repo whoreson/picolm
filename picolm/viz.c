@@ -249,6 +249,24 @@ void viz_layer_permute_reset(void) {
     viz_perm_rebuild_inv();
 }
 
+/* Ensure identity permutation at program startup, before main() runs.
+ * This is critical: when PICOLM_VIZ is defined but --viz is not passed,
+ * viz_init() is never called, leaving viz_layer_perm[] zero-initialized
+ * (every slot maps to layer 0). The constructor guarantees correct identity
+ * mapping regardless of whether the viz server is started. */
+#ifdef _MSC_VER
+#pragma section(".CRT$XCU", read)
+static void viz_permute_startup_init(void);
+__declspec(allocate(".CRT$XCU")) void (*viz_permute_startup_init_ptr)(void) = viz_permute_startup_init;
+static void viz_permute_startup_init(void)
+#else
+__attribute__((constructor))
+static void viz_permute_startup_init(void)
+#endif
+{
+    viz_layer_permute_reset();
+}
+
 /* ------------------------------------------------------------------ */
 /*  VNC Protocol Helpers (big-endian network byte order)               */
 /* ------------------------------------------------------------------ */
