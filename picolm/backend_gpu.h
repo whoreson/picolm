@@ -193,6 +193,14 @@ int picolm_gpu_attention_prefill(float *xb_out, const float *q,
                                   int n_heads, int n_kv_heads, int head_dim,
                                   int max_seq_len, int device);
 
+/* Device-native prefill attention: q_dev and xb_out_dev are device pointers.
+ * No H2D, no D2H, no sync. S=n_tokens queries, causal mask, tiled over KV
+ * positions. Same tiling as picolm_gpu_attention_prefill but no transfers. */
+int picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
+                                      int layer_ordinal, int start_pos, int n_tokens,
+                                      int n_heads, int n_kv_heads, int head_dim,
+                                      int max_seq_len, int device);
+
 /* Free GPU KV cache allocations. */
 void picolm_gpu_kv_free(void);
 
@@ -212,6 +220,11 @@ void picolm_gpu_kv_free(void);
  * caller must not use model_forward_gpu() for this model/device. */
 int picolm_gpu_pipeline_alloc(int dim, int q_dim, int kv_dim, int ffn_hidden, int device);
 
+/* Allocate prefill batch pipeline buffers: [max_seq_len][dim] for S>1.
+ * Same shape as pipeline_alloc but sized for batched prefill. */
+int picolm_gpu_pipeline_batch_alloc(int dim, int q_dim, int kv_dim, int ffn_hidden,
+                                     int max_seq_len, int device);
+
 /* Free all pipeline buffers on all devices. */
 void picolm_gpu_pipeline_free(void);
 
@@ -228,6 +241,17 @@ float *picolm_gpu_pipe_attn_out(int device);
 float *picolm_gpu_pipe_ffn_norm(int device);
 float *picolm_gpu_pipe_gate(int device);
 float *picolm_gpu_pipe_up(int device);
+
+/* Prefill batch buffer accessors (S>1, [max_seq_len][dim] layout). */
+float *picolm_gpu_pipe_x_b(int device);
+float *picolm_gpu_pipe_xb_b(int device);
+float *picolm_gpu_pipe_q_b(int device);
+float *picolm_gpu_pipe_k_b(int device);
+float *picolm_gpu_pipe_v_b(int device);
+float *picolm_gpu_pipe_attn_out_b(int device);
+float *picolm_gpu_pipe_ffn_norm_b(int device);
+float *picolm_gpu_pipe_gate_b(int device);
+float *picolm_gpu_pipe_up_b(int device);
 
 /* RMSNorm on device: out[d] = x[d] * rsqrt(mean(x^2) + eps) * weight[d].
  * x and out are device pointers, weight is device pointer.

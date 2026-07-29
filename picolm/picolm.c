@@ -845,7 +845,7 @@ int main(int argc, char **argv) {
             /* Prefill phase */
             if (do_prefill) {
                 bench.is_prefill = 1;
-                logits = model_forward_prefill(&model, prompt_tokens, n_prompt, 0);
+                logits = model_forward_prefill_gpu(&model, prompt_tokens, n_prompt, 0);
                 pos = n_prompt - 1;
             } else {
                 bench.is_prefill = 0;
@@ -938,7 +938,7 @@ int main(int argc, char **argv) {
     if (n_prompt > 0) {
         /* All models use model_forward_prefill.
          * SSM models: batched by default, use --ssm-serial for per-token path. */
-        logits = model_forward_prefill(&model, prompt_tokens, n_prompt, start_pos);
+        logits = model_forward_prefill_gpu(&model, prompt_tokens, n_prompt, start_pos);
         pos = start_pos + n_prompt - 1;
     } else {
         /* No prompt: just generate from BOS */

@@ -323,6 +323,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
  * for the residual stream. Falls back to model_forward on unsupported models.
  * Returns pointer to logits[vocab_size] on host. */
 float *model_forward_gpu(model_t *m, int token, int pos);
+float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, int start_pos);
 
 /* Free all resources. */
 void model_free(model_t *m);

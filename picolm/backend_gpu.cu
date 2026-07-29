@@ -1239,6 +1239,11 @@ typedef struct {
     float *pipe_x, *pipe_xb, *pipe_q, *pipe_k, *pipe_v,
           *pipe_attn_out, *pipe_ffn_norm, *pipe_gate, *pipe_up;
     int pipe_ready; /* 1 once the above are allocated for this device */
+    /* Prefill batch buffers: [max_seq_len][dim] for S>1 prefill pipeline.
+     * Same set of buffers as decode but sized for n_tokens rows. */
+    float *pipe_x_b, *pipe_xb_b, *pipe_q_b, *pipe_k_b, *pipe_v_b,
+          *pipe_attn_out_b, *pipe_ffn_norm_b, *pipe_gate_b, *pipe_up_b;
+    int pipe_b_ready;
 } gpu_device_ctx_t;
 
 static gpu_device_ctx_t g_gpu_ctx[PICOLM_GPU_MAX_DEVICES];
@@ -2042,6 +2047,36 @@ picolm_gpu_pipeline_alloc(int dim, int q_dim, int kv_dim, int ffn_hidden, int de
     return 1;
 }
 
+/* Allocate prefill batch buffers: [max_seq_len][dim] for S>1 pipeline */
+extern "C" int
+picolm_gpu_pipeline_batch_alloc(int dim, int q_dim, int kv_dim, int ffn_hidden,
+                                 int max_seq_len, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    if (ctx->pipe_b_ready) return 1;
+
+    size_t bsz = (size_t)max_seq_len;
+    size_t db = bsz * dim * sizeof(float);
+    size_t qb = bsz * q_dim * sizeof(float);
+    size_t kvb = bsz * kv_dim * sizeof(float);
+    size_t fb = bsz * ffn_hidden * sizeof(float);
+
+    int ok = 1;
+    ok &= gpu_ok(gpuMalloc(&ctx->pipe_x_b, db), "pipe_x_b alloc");
+    ok &= gpu_ok(gpuMalloc(&ctx->pipe_xb_b, db), "pipe_xb_b alloc");
+    ok &= gpu_ok(gpuMalloc(&ctx->pipe_q_b, qb), "pipe_q_b alloc");
+    ok &= gpu_ok(gpuMalloc(&ctx->pipe_k_b, kvb), "pipe_k_b alloc");
+    ok &= gpu_ok(gpuMalloc(&ctx->pipe_v_b, kvb), "pipe_v_b alloc");
+    ok &= gpu_ok(gpuMalloc(&ctx->pipe_attn_out_b, qb), "pipe_attn_out_b alloc");
+    ok &= gpu_ok(gpuMalloc(&ctx->pipe_ffn_norm_b, db), "pipe_ffn_norm_b alloc");
+    ok &= gpu_ok(gpuMalloc(&ctx->pipe_gate_b, fb), "pipe_gate_b alloc");
+    ok &= gpu_ok(gpuMalloc(&ctx->pipe_up_b, fb), "pipe_up_b alloc");
+    if (!ok) return 0;
+
+    ctx->pipe_b_ready = 1;
+    return 1;
+}
+
 extern "C" void
 picolm_gpu_pipeline_free(void) {
     for (int i = 0; i < PICOLM_GPU_MAX_DEVICES; i++) {
@@ -2060,6 +2095,22 @@ picolm_gpu_pipeline_free(void) {
             ctx->pipe_attn_out = ctx->pipe_ffn_norm = ctx->pipe_gate = ctx->pipe_up = NULL;
         ctx->pipe_ready = 0;
     }
+    for (int i = 0; i < PICOLM_GPU_MAX_DEVICES; i++) {
+        gpu_device_ctx_t *ctx = &g_gpu_ctx[i];
+        if (!ctx->pipe_b_ready) continue;
+        if (ctx->pipe_x_b) gpuFree(ctx->pipe_x_b);
+        if (ctx->pipe_xb_b) gpuFree(ctx->pipe_xb_b);
+        if (ctx->pipe_q_b) gpuFree(ctx->pipe_q_b);
+        if (ctx->pipe_k_b) gpuFree(ctx->pipe_k_b);
+        if (ctx->pipe_v_b) gpuFree(ctx->pipe_v_b);
+        if (ctx->pipe_attn_out_b) gpuFree(ctx->pipe_attn_out_b);
+        if (ctx->pipe_ffn_norm_b) gpuFree(ctx->pipe_ffn_norm_b);
+        if (ctx->pipe_gate_b) gpuFree(ctx->pipe_gate_b);
+        if (ctx->pipe_up_b) gpuFree(ctx->pipe_up_b);
+        ctx->pipe_x_b = ctx->pipe_xb_b = ctx->pipe_q_b = ctx->pipe_k_b = ctx->pipe_v_b =
+            ctx->pipe_attn_out_b = ctx->pipe_ffn_norm_b = ctx->pipe_gate_b = ctx->pipe_up_b = NULL;
+        ctx->pipe_b_ready = 0;
+    }
 }
 
 /* Device pointer accessors, so model.c doesn't need gpu_device_ctx_t's
@@ -2073,6 +2124,16 @@ extern "C" float *picolm_gpu_pipe_attn_out(int device)   { gpu_device_ctx_t *c =
 extern "C" float *picolm_gpu_pipe_ffn_norm(int device)   { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_ffn_norm : NULL; }
 extern "C" float *picolm_gpu_pipe_gate(int device)       { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_gate : NULL; }
 extern "C" float *picolm_gpu_pipe_up(int device)         { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_up : NULL; }
+
+extern "C" float *picolm_gpu_pipe_x_b(int device)         { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_x_b : NULL; }
+extern "C" float *picolm_gpu_pipe_xb_b(int device)         { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_xb_b : NULL; }
+extern "C" float *picolm_gpu_pipe_q_b(int device)          { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_q_b : NULL; }
+extern "C" float *picolm_gpu_pipe_k_b(int device)          { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_k_b : NULL; }
+extern "C" float *picolm_gpu_pipe_v_b(int device)          { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_v_b : NULL; }
+extern "C" float *picolm_gpu_pipe_attn_out_b(int device)   { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_attn_out_b : NULL; }
+extern "C" float *picolm_gpu_pipe_ffn_norm_b(int device)   { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_ffn_norm_b : NULL; }
+extern "C" float *picolm_gpu_pipe_gate_b(int device)       { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_gate_b : NULL; }
+extern "C" float *picolm_gpu_pipe_up_b(int device)         { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_up_b : NULL; }
 
 /* Bit-exact device port of the host fp32_to_fp16() in quant.c -- NOT
  * CUDA's __float2half (different rounding/tie behavior in edge cases),
@@ -2311,6 +2372,35 @@ picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
 
     if (!gpu_ok(gpuMemcpy(xb_out, ctx->y, y_bytes, gpuMemcpyDeviceToHost),
                 "attn prefill output download")) return 0;
+    return 1;
+}
+
+/* Device-native prefill attention: xb_out_dev and q_dev are already
+ * device-resident. No H2D, no D2H, no gpuDeviceSynchronize(). */
+extern "C" int
+picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
+                                  int layer_ordinal, int start_pos, int n_tokens,
+                                  int n_heads, int n_kv_heads, int head_dim,
+                                  int max_seq_len, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    if (!g_kv_k_dev[device] || !g_kv_v_dev[device]) return 0;
+    if (head_dim > 256) return 0;
+
+    size_t kv_pos_stride_bytes = (size_t)n_kv_heads * head_dim * sizeof(uint16_t);
+    size_t kv_head_stride_bytes = head_dim * sizeof(uint16_t);
+
+    int n_tiles_q = (n_tokens + ATTN_TILE_Q - 1) / ATTN_TILE_Q;
+    size_t shared_bytes = 2 * ATTN_TILE_K * head_dim * sizeof(uint16_t) + 256 * sizeof(float);
+    int block_threads = 128;
+
+    dim3 grid((unsigned)n_heads, (unsigned)n_tiles_q, 1);
+    picolm_gpu_attention_prefill_kernel<<<grid, block_threads, (unsigned)shared_bytes, ctx->stream>>>(
+        xb_out_dev, q_dev,
+        g_kv_k_dev[device], g_kv_v_dev[device],
+        layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim, max_seq_len,
+        kv_pos_stride_bytes, kv_head_stride_bytes);
+    if (!gpu_ok(gpuGetLastError(), "attn prefill (dev)")) return 0;
     return 1;
 }
 

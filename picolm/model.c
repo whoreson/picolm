@@ -1690,6 +1690,11 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                             if (!picolm_gpu_pipeline_alloc(c->n_embd, q_dim, kv_dim, c->n_ffn, device)) {
                                 fprintf(stderr, "WARN: GPU pipeline buffer alloc failed\n");
                             }
+                            /* Prefill batch buffers */
+                            if (!picolm_gpu_pipeline_batch_alloc(c->n_embd, q_dim, kv_dim,
+                                                                 c->n_ffn, c->max_seq_len, device)) {
+                                fprintf(stderr, "WARN: GPU prefill batch buffer alloc failed\n");
+                            }
 
                             /* Upload norm weights and RoPE tables to device */
                             run_state_t *s = &m->state;
@@ -6812,6 +6817,201 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
 
     /* 5. Output projection -> logits (host-facing, needs D2H anyway for sampling) */
     tensor_set_repacked(m->repack_used[1] ? m->repack_buffers[1] : NULL);
+    tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gw->output, gpu_dev);
+    matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
+    tensor_set_repacked(NULL);
+    tensor_set_gpu_tensor(NULL, 0);
+
+    return s->logits;
+}
+/* Phase 2: GPU-pipelined prefill forward pass.
+ * Keeps activations on-device across all layers with S=n_tokens batching.
+ * Falls back to model_forward_prefill() if pipeline not ready. */
+float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, int start_pos) {
+    model_config_t *c = &m->config;
+    model_weights_t *w = &m->weights;
+    gpu_weights_t *gw = &m->gpu;
+    run_state_t *s = &m->state;
+
+    int gpu_dev = gw->device;
+    int dim = c->n_embd;
+    int n_ffn = c->n_ffn;
+    int n_heads = c->n_heads;
+    int n_kv_heads = c->n_kv_heads;
+    int head_dim = c->head_dim;
+    int q_dim = n_heads * head_dim;
+    int kv_dim = n_kv_heads * head_dim;
+    int seq_len = c->max_seq_len;
+    int rope_half = head_dim / 2;
+
+    /* Verify pipeline and batch buffers are ready */
+    if (!gw->kv_active) return model_forward_prefill(m, tokens, n_tokens, start_pos);
+    if (!picolm_gpu_pipe_x(gpu_dev)) return model_forward_prefill(m, tokens, n_tokens, start_pos);
+    if (!picolm_gpu_pipe_x_b(gpu_dev)) return model_forward_prefill(m, tokens, n_tokens, start_pos);
+    if (!gw->rope_cos_dev || !gw->rope_sin_dev) return model_forward_prefill(m, tokens, n_tokens, start_pos);
+
+    /* Batch buffer pointers */
+    float *bx = picolm_gpu_pipe_x_b(gpu_dev);
+    float *bxb = picolm_gpu_pipe_xb_b(gpu_dev);
+    float *bq = picolm_gpu_pipe_q_b(gpu_dev);
+    float *bk = picolm_gpu_pipe_k_b(gpu_dev);
+    float *bv = picolm_gpu_pipe_v_b(gpu_dev);
+    float *battn_out = picolm_gpu_pipe_attn_out_b(gpu_dev);
+    float *bffn_norm = picolm_gpu_pipe_ffn_norm_b(gpu_dev);
+    float *bgate = picolm_gpu_pipe_gate_b(gpu_dev);
+    float *bup = picolm_gpu_pipe_up_b(gpu_dev);
+
+    gpu_layer_weights_t *gl;
+
+    /* 1. Embedding lookup (CPU) into host buffer, then single H2D */
+    {
+        size_t row_bytes = gguf_type_row_size(w->type_token_embd, dim);
+        if (w->type_token_embd == GGUF_TYPE_Q4_0_8_8 ||
+            w->type_token_embd == GGUF_TYPE_Q4_0_4_4 ||
+            w->type_token_embd == GGUF_TYPE_Q4_0_4_8) {
+            return model_forward_prefill(m, tokens, n_tokens, start_pos);
+        }
+        size_t embd_bytes = (size_t)n_tokens * dim * sizeof(float);
+        float *host_embd = (float *)malloc(embd_bytes);
+        if (!host_embd) {
+            return model_forward_prefill(m, tokens, n_tokens, start_pos);
+        }
+        for (int bi = 0; bi < n_tokens; bi++) {
+            const void *embd_row = (const uint8_t *)w->token_embd + (size_t)tokens[bi] * row_bytes;
+            float *dst = host_embd + (size_t)bi * dim;
+            dequantize_row(embd_row, dst, dim, w->type_token_embd);
+        }
+        /* Single H2D for entire batch */
+        picolm_gpu_memcpy(bx, host_embd, embd_bytes, 1, gpu_dev);
+        free(host_embd);
+    }
+
+    int this_attn_ordinal = 0;
+
+    /* 2. Per-layer pipeline (S=n_tokens batched) */
+    for (int l = 0; l < c->n_layers; l++) {
+        layer_weights_t *lw = &w->layers[l];
+        gl = &gw->layers[l];
+
+        if (c->has_ssm && !lw->is_attn_layer) {
+            return model_forward_prefill(m, tokens, n_tokens, start_pos);
+        }
+
+        /* A. RMSNorm per token */
+        for (int bi = 0; bi < n_tokens; bi++) {
+            float *x_ptr = bx + (size_t)bi * dim;
+            float *out_ptr = bxb + (size_t)bi * dim;
+            picolm_gpu_rmsnorm(out_ptr, x_ptr,
+                                (float *)gw->attn_norm_dev[l],
+                                dim, c->rms_norm_eps, gpu_dev);
+        }
+
+        /* B. Q projection: bq = attn_q @ bxb (S=n_tokens) */
+        picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
+                               bq, bxb, n_tokens, gpu_dev);
+
+        /* C. K projection: bk = attn_k @ bxb */
+        picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_k,
+                               bk, bxb, n_tokens, gpu_dev);
+
+        /* D. V projection: bv = attn_v @ bxb */
+        picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_v,
+                               bv, bxb, n_tokens, gpu_dev);
+
+        /* E. RoPE on Q (in-place, per token) */
+        for (int bi = 0; bi < n_tokens; bi++) {
+            int pos = start_pos + bi;
+            float *q_ptr = bq + (size_t)bi * q_dim;
+            float *rope_cos_pos = (float *)gw->rope_cos_dev + (size_t)pos * rope_half;
+            float *rope_sin_pos = (float *)gw->rope_sin_dev + (size_t)pos * rope_half;
+            picolm_gpu_rope_apply(q_ptr, n_heads, head_dim,
+                                   rope_cos_pos, rope_sin_pos, rope_half, gpu_dev);
+        }
+
+        /* F. RoPE on K (in-place, per token) */
+        for (int bi = 0; bi < n_tokens; bi++) {
+            int pos = start_pos + bi;
+            float *k_ptr = bk + (size_t)bi * kv_dim;
+            float *rope_cos_pos = (float *)gw->rope_cos_dev + (size_t)pos * rope_half;
+            float *rope_sin_pos = (float *)gw->rope_sin_dev + (size_t)pos * rope_half;
+            picolm_gpu_rope_apply(k_ptr, n_kv_heads, head_dim,
+                                   rope_cos_pos, rope_sin_pos, rope_half, gpu_dev);
+        }
+
+        /* G. KV cache store: device-native F32->F16 pack+store, batched */
+        for (int bi = 0; bi < n_tokens; bi++) {
+            int pos = start_pos + bi;
+            float *k_ptr = bk + (size_t)bi * kv_dim;
+            float *v_ptr = bv + (size_t)bi * kv_dim;
+            picolm_gpu_kv_store_dev(1, this_attn_ordinal, pos, k_ptr,
+                                     n_kv_heads, head_dim, seq_len, gpu_dev);
+            picolm_gpu_kv_store_dev(0, this_attn_ordinal, pos, v_ptr,
+                                     n_kv_heads, head_dim, seq_len, gpu_dev);
+        }
+        this_attn_ordinal++;
+
+        /* H. Attention prefill: battn_out = attn_prefill(bq) */
+        picolm_gpu_attention_prefill_dev(battn_out, bq,
+                                          this_attn_ordinal - 1, start_pos, n_tokens,
+                                          n_heads, n_kv_heads, head_dim,
+                                          seq_len, gpu_dev);
+
+        /* I. Output projection: bxb = attn_output @ battn_out */
+        picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_output,
+                               bxb, battn_out, n_tokens, gpu_dev);
+
+        /* J. Residual add: bx += bxb (per token) */
+        for (int bi = 0; bi < n_tokens; bi++) {
+            float *x_ptr = bx + (size_t)bi * dim;
+            float *xb_ptr = bxb + (size_t)bi * dim;
+            picolm_gpu_residual_add(x_ptr, x_ptr, xb_ptr, dim, gpu_dev);
+        }
+
+        /* K. FFN: rmsnorm + gate/silu + up + down + residual */
+        for (int bi = 0; bi < n_tokens; bi++) {
+            float *x_ptr = bx + (size_t)bi * dim;
+            float *out_ptr = bffn_norm + (size_t)bi * dim;
+            picolm_gpu_rmsnorm(out_ptr, x_ptr,
+                                (float *)gw->post_attn_norm_dev[l],
+                                dim, c->rms_norm_eps, gpu_dev);
+        }
+
+        /* FFN gate */
+        picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_gate,
+                               bgate, bffn_norm, n_tokens, gpu_dev);
+
+        /* FFN up */
+        picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_up,
+                               bup, bffn_norm, n_tokens, gpu_dev);
+
+        /* FFN silu_mul: bgate = silu(bgate) * bup (per token) */
+        for (int bi = 0; bi < n_tokens; bi++) {
+            float *g_ptr = bgate + (size_t)bi * n_ffn;
+            float *u_ptr = bup + (size_t)bi * n_ffn;
+            picolm_gpu_silu_mul_dev(g_ptr, u_ptr, n_ffn, gpu_dev);
+        }
+
+        /* FFN down: bxb = down_proj @ bgate */
+        picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_down,
+                               bxb, bgate, n_tokens, gpu_dev);
+
+        /* FFN residual: bx += bxb (per token) */
+        for (int bi = 0; bi < n_tokens; bi++) {
+            float *x_ptr = bx + (size_t)bi * dim;
+            float *xb_ptr = bxb + (size_t)bi * dim;
+            picolm_gpu_residual_add(x_ptr, x_ptr, xb_ptr, dim, gpu_dev);
+        }
+    }
+
+    /* 3. Final rmsnorm + sync + D2H + host lm_head matmul */
+    {
+        float *last_x = bx + (size_t)(n_tokens - 1) * dim;
+        picolm_gpu_sync(gpu_dev);
+        picolm_gpu_memcpy(s->x, last_x, dim * sizeof(float), 0, gpu_dev);
+    }
+
+    rmsnorm(s->x, s->x, s->output_norm_w, dim, c->rms_norm_eps);
+
     tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gw->output, gpu_dev);
     matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
     tensor_set_repacked(NULL);
