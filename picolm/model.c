@@ -1683,6 +1683,32 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                             m->gpu.kv_active = 1;
                             fprintf(stderr, "INFO: GPU KV cache allocated (%zu MB K + %zu MB V)\n",
                                     total_k / (1024*1024), total_v / (1024*1024));
+
+                            /* Phase 2: allocate pipeline buffers and upload norm/RoPE weights */
+                            int q_dim = c->n_heads * c->head_dim;
+                            int kv_dim = c->n_kv_heads * c->head_dim;
+                            if (!picolm_gpu_pipeline_alloc(c->n_embd, q_dim, kv_dim, c->n_ffn, device)) {
+                                fprintf(stderr, "WARN: GPU pipeline buffer alloc failed\n");
+                            }
+
+                            /* Upload norm weights and RoPE tables to device */
+                            run_state_t *s = &m->state;
+                            /* RoPE cos/sin: [max_seq_len * half_dim] */
+                            {
+                                int half_dim = c->head_dim / 2;
+                                size_t rope_n = (size_t)c->max_seq_len * half_dim;
+                                m->gpu.rope_cos_dev = picolm_gpu_upload_f32(s->rope_cos, rope_n, device);
+                                m->gpu.rope_sin_dev = picolm_gpu_upload_f32(s->rope_sin, rope_n, device);
+                            }
+                            /* Output norm */
+                            m->gpu.output_norm_dev = picolm_gpu_upload_f32(s->output_norm_w, c->n_embd, device);
+                            /* Per-layer norm weights */
+                            for (int l = 0; l < c->n_layers; l++) {
+                                m->gpu.attn_norm_dev[l] =
+                                    picolm_gpu_upload_f32(s->attn_norm_w[l], c->n_embd, device);
+                                m->gpu.post_attn_norm_dev[l] =
+                                    picolm_gpu_upload_f32(s->post_attn_norm_w[l], c->n_embd, device);
+                            }
                         } else {
                             fprintf(stderr, "WARN: GPU KV cache allocation failed, falling back to CPU\n");
                         }
@@ -6607,8 +6633,190 @@ void model_ssm_state_reset(model_t *m) {
  * The elementwise kernels (gpu_rmsnorm, gpu_rope_apply,
  * gpu_residual_add) are implemented in backend_gpu.cu. */
 float *model_forward_gpu(model_t *m, int token, int pos) {
-    /* Phase 2: TODO - wire elementwise kernels into layer loop.
-     * For now, fall back to CPU path. */
-    return model_forward(m, token, pos);
+    /* Phase 2: GPU-pipelined forward pass.
+     * Keeps activations on-device across all layers.
+     * Falls back to model_forward() if pipeline not ready. */
+    model_config_t *c = &m->config;
+    model_weights_t *w = &m->weights;
+    gpu_weights_t *gw = &m->gpu;
+    run_state_t *s = &m->state;
+
+    int gpu_dev = gw->device;
+    int dim = c->n_embd;
+    int n_ffn = c->n_ffn;
+    int n_heads = c->n_heads;
+    int n_kv_heads = c->n_kv_heads;
+    int head_dim = c->head_dim;
+    int kv_dim = n_kv_heads * head_dim;
+    int seq_len = c->max_seq_len;
+    int rope_half = head_dim / 2;
+
+    /* Verify pipeline is ready */
+    if (!gw->kv_active) return model_forward(m, token, pos);
+    if (!picolm_gpu_pipe_x(gpu_dev)) return model_forward(m, token, pos);
+    if (!gw->rope_cos_dev || !gw->rope_sin_dev) return model_forward(m, token, pos);
+
+    /* Pipeline buffer pointers */
+    float *pipe_x = picolm_gpu_pipe_x(gpu_dev);
+    float *pipe_xb = picolm_gpu_pipe_xb(gpu_dev);
+    float *pipe_q = picolm_gpu_pipe_q(gpu_dev);
+    float *pipe_k = picolm_gpu_pipe_k(gpu_dev);
+    float *pipe_v = picolm_gpu_pipe_v(gpu_dev);
+    float *pipe_attn_out = picolm_gpu_pipe_attn_out(gpu_dev);
+    float *pipe_ffn_norm = picolm_gpu_pipe_ffn_norm(gpu_dev);
+    float *pipe_gate = picolm_gpu_pipe_gate(gpu_dev);
+    float *pipe_up = picolm_gpu_pipe_up(gpu_dev);
+
+    /* GPU layer weight handles */
+    gpu_layer_weights_t *gl;
+
+    /* 1. Embedding lookup on CPU (same path as model_forward), then H2D */
+    /* For Fimbulvetr (type=1 F16 embd), the generic dequantize_row works.
+     * For interleaved Q4_0 formats, fall back to CPU path. */
+    if (w->type_token_embd == GGUF_TYPE_Q4_0_8_8 ||
+        w->type_token_embd == GGUF_TYPE_Q4_0_4_4 ||
+        w->type_token_embd == GGUF_TYPE_Q4_0_4_8) {
+        /* Interleaved token embedding formats need the full model_forward
+         * dequant path. Fall back to CPU. */
+        return model_forward(m, token, pos);
+    }
+    {
+        size_t row_bytes = gguf_type_row_size(w->type_token_embd, dim);
+        const void *embd_row = (const uint8_t *)w->token_embd + (size_t)token * row_bytes;
+        dequantize_row(embd_row, s->x, dim, w->type_token_embd);
+        picolm_gpu_memcpy(pipe_x, s->x, dim * sizeof(float), 1, gpu_dev);
+    }
+
+    /* Host scratch for KV F16 conversion (small: 2KB each) */
+    float kv_tmp[2048]; /* max: n_kv_heads * head_dim = 8*128 = 1024 floats */
+
+    int this_attn_ordinal = 0;
+
+    /* 2. Per-layer pipeline */
+    for (int l = 0; l < c->n_layers; l++) {
+        layer_weights_t *lw = &w->layers[l];
+        gl = &gw->layers[l];
+
+        /* Skip non-attention layers (SSM) - not supported yet */
+        if (c->has_ssm && !lw->is_attn_layer) {
+            /* Fall back to CPU for models with SSM */
+            return model_forward(m, token, pos);
+        }
+
+        /* A. RMSNorm: pipe_xb = rmsnorm(pipe_x, attn_norm_w[l]) */
+        picolm_gpu_rmsnorm(pipe_xb, pipe_x,
+                            (float *)gw->attn_norm_dev[l],
+                            dim, c->rms_norm_eps, gpu_dev);
+
+        /* B. Q projection: pipe_q = attn_q @ pipe_xb */
+        picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
+                               pipe_q, pipe_xb, 1, gpu_dev);
+
+        /* C. K projection: pipe_k = attn_k @ pipe_xb */
+        picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_k,
+                               pipe_k, pipe_xb, 1, gpu_dev);
+
+        /* D. V projection: pipe_v = attn_v @ pipe_xb */
+        picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_v,
+                               pipe_v, pipe_xb, 1, gpu_dev);
+
+        /* E. RoPE on Q (in-place): rope(pipe_q, n_heads) */
+        /* RoPE tables for this position on device */
+        float *rope_cos_pos = (float *)gw->rope_cos_dev + (size_t)pos * rope_half;
+        float *rope_sin_pos = (float *)gw->rope_sin_dev + (size_t)pos * rope_half;
+        picolm_gpu_rope_apply(pipe_q, n_heads, head_dim,
+                               rope_cos_pos, rope_sin_pos, rope_half, gpu_dev);
+
+        /* F. RoPE on K (in-place): rope(pipe_k, n_kv_heads) */
+        picolm_gpu_rope_apply(pipe_k, n_kv_heads, head_dim,
+                               rope_cos_pos, rope_sin_pos, rope_half, gpu_dev);
+
+        /* G. KV cache store: download K/V F32, convert to F16, bulk store */
+        /* Download K from device to host */
+        picolm_gpu_memcpy(kv_tmp, pipe_k, kv_dim * sizeof(float), -1, gpu_dev);
+        {
+            uint8_t *key_pos = s->key_cache + (size_t)this_attn_ordinal * seq_len * s->kv_row_size_k + (size_t)pos * s->kv_row_size_k;
+            /* Convert F32 to F16 per KV head */
+            for (int hkv = 0; hkv < n_kv_heads; hkv++) {
+                float *k_head = kv_tmp + hkv * head_dim;
+                uint16_t *kf = (uint16_t *)(key_pos + hkv * s->kv_head_stride_k);
+                for (int d = 0; d < head_dim; d++) kf[d] = fp32_to_fp16(k_head[d]);
+            }
+            picolm_gpu_kv_store_rows(1, this_attn_ordinal, pos, 1,
+                                      key_pos, s->kv_row_size_k,
+                                      n_kv_heads, head_dim, seq_len, gpu_dev);
+        }
+
+        /* Download V from device to host */
+        picolm_gpu_memcpy(kv_tmp, pipe_v, kv_dim * sizeof(float), -1, gpu_dev);
+        {
+            uint8_t *val_pos = s->val_cache + (size_t)this_attn_ordinal * seq_len * s->kv_row_size_v + (size_t)pos * s->kv_row_size_v;
+            for (int hkv = 0; hkv < n_kv_heads; hkv++) {
+                float *v_head = kv_tmp + hkv * head_dim;
+                uint16_t *vf = (uint16_t *)(val_pos + hkv * s->kv_head_stride_v);
+                for (int d = 0; d < head_dim; d++) vf[d] = fp32_to_fp16(v_head[d]);
+            }
+            picolm_gpu_kv_store_rows(0, this_attn_ordinal, pos, 1,
+                                      val_pos, s->kv_row_size_v,
+                                      n_kv_heads, head_dim, seq_len, gpu_dev);
+        }
+        this_attn_ordinal++;
+
+        /* H. Attention decode: pipe_attn_out = attn(pipe_q) */
+        picolm_gpu_attention_decode_dev(pipe_attn_out, pipe_q,
+                                         l, pos,
+                                         n_heads, n_kv_heads, head_dim,
+                                         seq_len, gpu_dev);
+
+        /* I. Output projection: pipe_xb = attn_output @ pipe_attn_out */
+        picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_output,
+                               pipe_xb, pipe_attn_out, 1, gpu_dev);
+
+        /* J. Residual add: pipe_x += pipe_xb */
+        picolm_gpu_residual_add(pipe_x, pipe_x, pipe_xb, dim, gpu_dev);
+
+        /* K. FFN: pipe_xb = rmsnorm(pipe_x, post_attn_norm_w[l]) */
+        picolm_gpu_rmsnorm(pipe_ffn_norm, pipe_x,
+                            (float *)gw->post_attn_norm_dev[l],
+                            dim, c->rms_norm_eps, gpu_dev);
+
+        /* L. Gate: pipe_gate = ffn_gate @ pipe_ffn_norm */
+        picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_gate,
+                               pipe_gate, pipe_ffn_norm, 1, gpu_dev);
+
+        /* M. Up: pipe_up = ffn_up @ pipe_ffn_norm */
+        picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_up,
+                               pipe_up, pipe_ffn_norm, 1, gpu_dev);
+
+        /* N. SiLU-mul: pipe_gate = silu(pipe_gate) * pipe_up (in-place on gate) */
+        picolm_gpu_silu_mul_dev(pipe_gate, pipe_up, n_ffn, gpu_dev);
+
+        /* O. Down: pipe_xb = ffn_down @ pipe_gate */
+        picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_down,
+                               pipe_xb, pipe_gate, 1, gpu_dev);
+
+        /* P. Residual add: pipe_x += pipe_xb */
+        picolm_gpu_residual_add(pipe_x, pipe_x, pipe_xb, dim, gpu_dev);
+    }
+
+    /* 3. Final RMSNorm: pipe_x = rmsnorm(pipe_x, output_norm_w) */
+    picolm_gpu_rmsnorm(pipe_x, pipe_x,
+                        (float *)gw->output_norm_dev,
+                        dim, c->rms_norm_eps, gpu_dev);
+
+    /* 4. Sync once, then lm_head on host */
+    picolm_gpu_sync(gpu_dev);
+
+    /* Download pipe_x to host */
+    picolm_gpu_memcpy(s->x, pipe_x, dim * sizeof(float), -1, gpu_dev);
+
+    /* 5. Output projection -> logits (host-facing, needs D2H anyway for sampling) */
+    tensor_set_repacked(m->repack_used[1] ? m->repack_buffers[1] : NULL);
+    tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gw->output, gpu_dev);
+    matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
+    tensor_set_repacked(NULL);
+    tensor_set_gpu_tensor(NULL, 0);
+
+    return s->logits;
 }
 

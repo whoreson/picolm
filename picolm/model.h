@@ -93,6 +93,12 @@ typedef struct {
     size_t kv_k_cap;  /* allocated bytes for K cache */
     size_t kv_v_cap;  /* allocated bytes for V cache */
     int kv_active;    /* 1 if GPU KV cache path is usable (MHA, F16 KV, no SSM/QK-norm) */
+    /* Phase 2: device-resident norm weights and RoPE tables */
+    void *rope_cos_dev;      /* device copy of rope_cos [max_seq_len * half_dim] */
+    void *rope_sin_dev;      /* device copy of rope_sin [max_seq_len * half_dim] */
+    void *output_norm_dev;   /* device copy of output_norm_w [dim] */
+    void *attn_norm_dev[MAX_LAYERS];      /* device copy of attn_norm_w[l] [dim] */
+    void *post_attn_norm_dev[MAX_LAYERS]; /* device copy of post_attn_norm_w[l] [dim] */
 } gpu_weights_t;
 #endif /* PICOLM_GPU */
 

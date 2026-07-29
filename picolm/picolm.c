@@ -852,7 +852,15 @@ int main(int argc, char **argv) {
                     grammar_advance(&grammar, &tokenizer, next);
                     token = next;
                     bench.gen_tokens++;
-                    logits = model_forward(&model, token, pos + 1);
+#ifdef PICOLM_GPU
+                    if (model.gpu.kv_active) {
+                        logits = model_forward_gpu(&model, token, pos + 1);
+                        if (!logits) logits = model_forward(&model, token, pos + 1);
+                    } else
+#endif
+                    {
+                        logits = model_forward(&model, token, pos + 1);
+                    }
                 }
             }
 

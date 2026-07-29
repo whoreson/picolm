@@ -262,6 +262,10 @@ int picolm_gpu_tensor_device(const picolm_gpu_tensor_t *tensor);
  * a new device buffer. Returns device pointer, or NULL on failure. */
 float *picolm_gpu_upload_f32(const float *host, size_t n, int device);
 
+/* Synchronous memcpy wrapper for model.c (which is C, not CUDA).
+ * dir: 1 = H2D, -1 = D2H. Returns 1 on success. */
+int picolm_gpu_memcpy(void *dst, const void *src, size_t bytes, int dir, int device);
+
 #ifdef __cplusplus
 }
 #endif

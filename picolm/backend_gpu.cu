@@ -2358,3 +2358,15 @@ picolm_gpu_sync(int device) {
     return gpu_ok(gpuDeviceSynchronize(), "pipeline sync");
 }
 
+/* Synchronous memcpy wrapper for model.c (C file, no CUDA types).
+ * dir: 1 = H2D, -1 = D2H. Returns 1 on success. */
+extern "C" int
+picolm_gpu_memcpy(void *dst, const void *src, size_t bytes, int dir, int device) {
+    if (!dst || !src || bytes < 1) return 0;
+    (void)device; /* device already selected by caller */
+    gpuError_t err = (dir > 0) ?
+        gpuMemcpy(dst, src, bytes, gpuMemcpyHostToDevice) :
+        gpuMemcpy(dst, src, bytes, gpuMemcpyDeviceToHost);
+    return gpu_ok(err, "pipeline memcpy");
+}
+
