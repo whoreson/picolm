@@ -120,6 +120,8 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -ctv <type>    Val cache type: f16, q8_0, q4_0 (default: f16)\n");
     fprintf(stderr, "  -khad          Apply Walsh-Hadamard rotation to K cache before quantization\n");
     fprintf(stderr, "  -vhad          Apply Walsh-Hadamard rotation to V cache before quantization\n");
+    fprintf(stderr, "\nServer slot options:\n");
+    fprintf(stderr, "  --slot-save-path <dir>  Directory for /slots save/restore files\n");
     fprintf(stderr, "\nSSM checkpoint options (Qwen3.5/3.6 only, no-op for other models):\n");
     fprintf(stderr, "  --checkpoint-max <N>        Max checkpoints to keep (default: 0=disabled)\n");
     fprintf(stderr, "  --checkpoint-every-nt <N>   Checkpoint every N tokens during prefill (default: 256)\n");
@@ -364,6 +366,7 @@ int main(int argc, char **argv) {
     int    checkpoint_interval = 256;
     int    checkpoint_interval_gen = 64;
     int    checkpoint_tail_offset = 5;
+    char  *slot_save_path = NULL;  /* --slot-save-path */
 #ifdef PICOLM_VIZ
     /* Visualization options */
     int    viz_mode = 0;
@@ -442,6 +445,8 @@ int main(int argc, char **argv) {
             checkpoint_interval_gen = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--checkpoint-tail-offset") == 0 && i + 1 < argc) {
             checkpoint_tail_offset = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--slot-save-path") == 0 && i + 1 < argc) {
+            slot_save_path = argv[++i];
         } else if (strcmp(argv[i], "--ssm-batched") == 0) {
             /* no-op: batched is now the default */
         } else if (strcmp(argv[i], "--ssm-serial") == 0) {
@@ -533,6 +538,7 @@ int main(int argc, char **argv) {
         fp16_table_init();
         extern int server_main(int port, const char *host, const char *model_path, int num_threads, int do_prefault, int context_override, int mem_mb,
                                int checkpoint_max, int checkpoint_interval, int checkpoint_interval_gen, int checkpoint_tail_offset,
+                               const char *slot_save_path,
                                int viz_port, int viz_width, int viz_height);
         /* When --viz is specified in server mode, pass the viz parameters through.
          * When --viz is not specified, viz_port=0 so server_init skips viz. */
@@ -544,6 +550,7 @@ int main(int argc, char **argv) {
 #endif
         return server_main(server_port, server_host, model_path, num_threads, do_prefault, context_override, mem_mb,
                            checkpoint_max, checkpoint_interval, checkpoint_interval_gen, checkpoint_tail_offset,
+                           slot_save_path,
                            srv_viz_port, srv_viz_width, srv_viz_height);
     }
 
@@ -712,8 +719,9 @@ int main(int argc, char **argv) {
 
     /* Try to load KV cache (skip prefill for cached prompt) */
     int cache_pos = 0;
+    int *cache_tokens = NULL;
     if (cache_file) {
-        cache_pos = kvcache_load(&model, cache_file);
+        cache_pos = kvcache_load(&model, cache_file, &cache_tokens);
     }
 
     /* Encode prompt */
@@ -972,8 +980,9 @@ int main(int argc, char **argv) {
 
     /* Save KV cache if requested */
     if (cache_file && n_prompt > 0) {
-        kvcache_save(&model, cache_file, n_prompt);
+        kvcache_save(&model, cache_file, n_prompt, prompt_tokens);
     }
+    free(cache_tokens);
 
     double total_time = (t_end - t_start) / 1000.0;
     if (t_first_token == 0) t_first_token = t_end;

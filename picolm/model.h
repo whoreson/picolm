@@ -216,6 +216,14 @@ typedef struct {
     /* Separate allocation for KV cache */
     void *kv_block;
     size_t kv_size;
+
+    /* KV cache layer mapping (for SSM/mixed models).
+     * kv_layer_map[l] = 1 if layer l has KV cache (attention layer), 0 if SSM layer.
+     * kv_layer_ordinal[l] = ordinal within KV layers (0..kv_layer_count-1), or -1 if SSM.
+     * kv_layer_count = number of layers with KV cache data. */
+    int kv_layer_count;
+    uint8_t kv_layer_map[MAX_LAYERS];
+    int kv_layer_ordinal[MAX_LAYERS];
 } run_state_t;
 
 /* ---- Model ---- */
@@ -312,12 +320,14 @@ void model_free(model_t *m);
 /* ---- KV cache persistence ---- */
 
 /* Save KV cache state for positions [0, n_pos) to a file.
+ * tokens: pointer to token array (optional, NULL if not saving tokens).
  * Returns 0 on success. */
-int kvcache_save(const model_t *m, const char *path, int n_pos);
+int kvcache_save(const model_t *m, const char *path, int n_pos, const int *tokens);
 
 /* Load KV cache state from a file. Returns the number of positions
- * loaded (0 on failure). Caller should start generation from this position. */
-int kvcache_load(model_t *m, const char *path);
+ * loaded (0 on failure). *tokens_out is set to a malloc'd token array
+ * (free by caller), or NULL if no tokens were saved. */
+int kvcache_load(model_t *m, const char *path, int **tokens_out);
 
 /* ---- SSM state checkpointing (Qwen3.5/3.6) ---- */
 

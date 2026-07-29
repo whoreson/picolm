@@ -269,6 +269,7 @@ static struct _server_state {
     const char *model_path;
     int running;
     char recv_buf[65536];
+    char recv_path[2048];         /* last request path, for query param parsing */
     SOCKET sock_in_buf;
 
     /* Persistent model state (loaded once, reused across requests) */
@@ -288,6 +289,9 @@ static struct _server_state {
     int slot_n_remain;         /* remaining tokens to generate (-1 = unlimited) */
     int slot_has_next_token;   /* 1 if there is a next token pending */
     int slot_has_new_line;     /* 1 if next token starts a new line */
+
+    /* Slot save/restore path (--slot-save-path) */
+    char slot_save_path[512];
 
     /* SSM checkpoint management */
     picolm_checkpoint_t *checkpoints;     /* linked list head (sorted by n_tokens) */
@@ -480,6 +484,14 @@ static void checkpoint_evict_one(void) {
 
     free(cur->data);
     free(cur);
+}
+
+/* Reconstruct KV row stride from kv_cache_type enum value */
+static size_t kv_stride_from_type(int kv_type, int n_elements) {
+    if (kv_type == 0) return (size_t)n_elements * sizeof(uint16_t);  /* KV_CACHE_F16 */
+    if (kv_type == 1) return ((size_t)(n_elements / 32)) * 40;        /* KV_CACHE_Q8_0 */
+    if (kv_type == 2) return ((size_t)(n_elements / 32)) * 20;        /* KV_CACHE_Q4_0 */
+    return (size_t)n_elements * sizeof(float); /* fallback F32 */
 }
 
 /* Create a checkpoint at current SSM state position.
@@ -1049,6 +1061,383 @@ static void handle_props(SOCKET sock) {
     http_send(sock, 200, "application/json", json);
     free(json);
     cJSON_Delete(root);
+}
+
+/* ---- Helper: extract query parameter from path ---- */
+static const char *query_param(const char *path, const char *key) {
+    const char *qs = strstr(path, "?");
+    if (!qs) return NULL;
+    const char *kp = qs + 1;
+    while (1) {
+        const char *amp = strchr(kp, '&');
+        const char *eq = memchr(kp, '=', amp ? (size_t)(amp - kp) : strlen(kp));
+        if (eq) {
+            size_t klen = (size_t)(eq - kp);
+            if (klen == strlen(key) && memcmp(kp, key, klen) == 0) {
+                return eq + 1;
+            }
+        }
+        if (!amp) break;
+        kp = amp + 1;
+    }
+    return NULL;
+}
+
+/* ---- Helper: build full path for slot file ---- */
+static void build_slot_path(char *out, int out_len, const char *filename) {
+    snprintf(out, out_len, "%s/%s", srv.slot_save_path, filename);
+}
+
+/* ---- Endpoint: POST /slots?action=save|restore|erase ---- */
+
+static void handle_slots_post(SOCKET sock, const char *body) {
+    const char *action = query_param(srv.recv_path, "action");
+    if (!action) {
+        http_send(sock, 400, "application/json",
+            "{\"error\":{\"message\":\"Missing ?action=save|restore|erase\"}}");
+        return;
+    }
+
+    /* Parse request body for filename */
+    char filename[1024];
+    filename[0] = '\0';
+    if (body && strlen(body) > 0) {
+        cJSON *req = cJSON_ParseWithLength(body, strlen(body));
+        if (req) {
+            cJSON *fn = cJSON_GetObjectItem(req, "filename");
+            if (fn && cJSON_IsString(fn)) {
+                strncpy(filename, fn->valuestring, sizeof(filename) - 1);
+                filename[sizeof(filename) - 1] = '\0';
+            }
+            cJSON_Delete(req);
+        }
+    }
+
+    if (strcmp(action, "save") == 0) {
+        if (!*srv.slot_save_path) {
+            http_send(sock, 501, "application/json",
+                "{\"error\":{\"message\":\"Slot save not configured. Use --slot-save-path\"}}");
+            return;
+        }
+        if (!*filename) {
+            snprintf(filename, sizeof(filename), "slot_0.bin");
+        }
+        char full_path[2048];
+        build_slot_path(full_path, sizeof(full_path), filename);
+
+        double t0 = get_time_ms();
+        int rc = kvcache_save(&srv.model, full_path, srv.kv_pos, srv.last_prompt_tokens);
+        double t_ms = get_time_ms() - t0;
+
+        if (rc != 0) {
+            http_send(sock, 500, "application/json",
+                "{\"error\":{\"message\":\"Failed to save slot\"}}");
+            return;
+        }
+
+        /* Append checkpoints to the file (after main KV+SSM data) */
+        int n_cps = checkpoint_count();
+        if (n_cps > 0 && srv.checkpoint_snapshot_size > 0) {
+            /* Open file for appending */
+#ifdef _WIN32
+            int fd = _open(full_path, _O_WRONLY | _O_APPEND | _O_BINARY);
+#else
+            int fd = open(full_path, O_WRONLY | O_APPEND);
+#endif
+            if (fd >= 0) {
+                /* Checkpoint header: 2 uint32_t = [CHECKPOINT_MAGIC, count] */
+                uint32_t cp_magic = 0x43505350; /* "CSPS" backwards */
+                uint32_t cp_count = (uint32_t)n_cps;
+#ifdef _WIN32
+                _write(fd, (char *)&cp_magic, sizeof(cp_magic));
+                _write(fd, (char *)&cp_count, sizeof(cp_count));
+#else
+                write(fd, &cp_magic, sizeof(cp_magic));
+                write(fd, &cp_count, sizeof(cp_count));
+#endif
+                /* Write each checkpoint: [n_tokens (uint32_t), data (bytes)] */
+                picolm_checkpoint_t *cp = srv.checkpoints;
+                while (cp) {
+                    uint32_t cp_n = (uint32_t)cp->n_tokens;
+#ifdef _WIN32
+                    _write(fd, (char *)&cp_n, sizeof(cp_n));
+                    _write(fd, (char *)cp->data, (unsigned)srv.checkpoint_snapshot_size);
+#else
+                    write(fd, &cp_n, sizeof(cp_n));
+                    write(fd, cp->data, srv.checkpoint_snapshot_size);
+#endif
+                    cp = cp->next;
+                }
+#ifdef _WIN32
+                _close(fd);
+#else
+                close(fd);
+#endif
+                fprintf(stderr, "\n[server] Saved %d SSM checkpoints (%.1f MB total)\n",
+                        n_cps, (double)n_cps * srv.checkpoint_snapshot_size / (1024*1024));
+            }
+        }
+
+        /* Build response */
+        cJSON *root = cJSON_CreateObject();
+        cJSON_AddNumberToObject(root, "id_slot", 0);
+        cJSON_AddStringToObject(root, "filename", filename);
+        cJSON_AddNumberToObject(root, "n_saved", srv.kv_pos);
+        cJSON_AddNumberToObject(root, "n_written", srv.kv_pos);
+        cJSON *timings = cJSON_CreateObject();
+        cJSON_AddNumberToObject(timings, "save_ms", t_ms);
+        cJSON_AddItemToObject(root, "timings", timings);
+
+        char *json = cJSON_PrintUnformatted(root);
+        http_send(sock, 200, "application/json", json);
+        free(json);
+        cJSON_Delete(root);
+
+    } else if (strcmp(action, "restore") == 0) {
+        if (!*srv.slot_save_path) {
+            http_send(sock, 501, "application/json",
+                "{\"error\":{\"message\":\"Slot save not configured. Use --slot-save-path\"}}");
+            return;
+        }
+        if (!*filename) {
+            snprintf(filename, sizeof(filename), "slot_0.bin");
+        }
+        char full_path[2048];
+        build_slot_path(full_path, sizeof(full_path), filename);
+
+        double t0 = get_time_ms();
+        int *restored_tokens = NULL;
+        int n_restored = kvcache_load(&srv.model, full_path, &restored_tokens);
+        double t_ms = get_time_ms() - t0;
+
+        if (n_restored <= 0) {
+            free(restored_tokens);
+            http_send(sock, 500, "application/json",
+                "{\"error\":{\"message\":\"Failed to restore slot\"}}");
+            return;
+        }
+
+        srv.kv_pos = n_restored;
+        /* Clear checkpoints on restore (conversation state is from file) */
+        checkpoint_clear();
+        /* Restore last_prompt_tokens from saved token sequence */
+        if (restored_tokens) {
+            if (n_restored > srv.max_last_prompt) {
+                srv.max_last_prompt = n_restored * 2;
+                srv.last_prompt_tokens = (int *)realloc(srv.last_prompt_tokens,
+                    (size_t)srv.max_last_prompt * sizeof(int));
+            }
+            memcpy(srv.last_prompt_tokens, restored_tokens, (size_t)n_restored * sizeof(int));
+            srv.last_prompt_len = n_restored;
+            free(restored_tokens);
+        } else {
+            srv.last_prompt_len = 0;
+        }
+
+        /* Restore checkpoints from the file (appended after main KV+SSM data) */
+        if (srv.checkpoint_snapshot_size > 0) {
+            /* Seek to end of file and look for checkpoint data */
+#ifdef _WIN32
+            int fd = _open(full_path, _O_RDONLY | _O_BINARY);
+#else
+            int fd = open(full_path, O_RDONLY);
+#endif
+            if (fd >= 0) {
+                /* Read the main header to determine file size of KV data */
+                uint32_t header[13];
+#ifdef _WIN32
+                ssize_t hdr_read = (ssize_t)_read(fd, (char *)header, sizeof(header));
+#else
+                ssize_t hdr_read = read(fd, header, sizeof(header));
+#endif
+                if (hdr_read == (ssize_t)sizeof(header)) {
+                    uint32_t ver = header[0] & 0xF;
+                    int file_n_pos = (int)header[1];
+                    int file_layers = (int)header[2];
+                    int file_n_kv_heads = (int)header[3];
+                    int file_head_dim = (int)header[4];
+                    int kv_type_k = (int)header[5];
+                    int kv_type_v = (int)header[6];
+
+                    /* Calculate where KV data ends */
+                    off_t kv_end = (off_t)sizeof(header);
+                    if (ver >= 4) {
+                        /* Token sequence */
+                        if (file_n_pos > 0) {
+                            kv_end += (off_t)file_n_pos * sizeof(uint32_t);
+                        }
+                        /* Layer bitmap */
+                        kv_end += (off_t)file_layers;
+                    }
+
+                    /* KV data: only attention layers */
+                    int n_gqa_elements = file_n_kv_heads * file_head_dim;
+                    size_t pos_stride_k = kv_stride_from_type(kv_type_k, n_gqa_elements);
+                    size_t pos_stride_v = kv_stride_from_type(kv_type_v, n_gqa_elements);
+                    int attn_layers;
+                    if (ver >= 4) {
+                        /* Read layer bitmap to count attention layers */
+                        uint8_t *layer_map = (uint8_t *)alloca(file_layers);
+                        lseek(fd, (off_t)sizeof(header) + (file_n_pos > 0 ? (off_t)file_n_pos * sizeof(uint32_t) : 0), SEEK_SET);
+                        read(fd, layer_map, file_layers);
+                        attn_layers = 0;
+                        for (int l = 0; l < file_layers; l++) {
+                            if (layer_map[l]) attn_layers++;
+                        }
+                    } else {
+                        /* v2/v3: all layers are attention */
+                        attn_layers = file_layers;
+                    }
+                    /* Reset file position to beginning (we lseek'd for bitmap read) */
+                    lseek(fd, 0, SEEK_SET);
+                    kv_end += (off_t)attn_layers * file_n_pos * (pos_stride_k + pos_stride_v);
+
+                    /* SSM state (v4 only) */
+                    if (ver >= 4) {
+                        int has_ssm = (int)header[9];
+                        uint32_t ssm_sz = header[10];
+                        if (has_ssm && ssm_sz > 0) {
+                            kv_end += (off_t)ssm_sz;
+                        }
+                    }
+
+                    /* Seek to end of KV data and try to read checkpoint magic */
+                    lseek(fd, kv_end, SEEK_SET);
+#ifdef _WIN32
+                    _lseeki64(fd, kv_end, SEEK_SET);
+#else
+                    lseek(fd, kv_end, SEEK_SET);
+#endif
+                    uint32_t cp_magic;
+                    ssize_t mr = read(fd, &cp_magic, sizeof(cp_magic));
+                    if (mr == (ssize_t)sizeof(cp_magic) && cp_magic == 0x43505350) {
+                        uint32_t cp_count;
+#ifdef _WIN32
+                        _read(fd, (char *)&cp_count, sizeof(cp_count));
+#else
+                        read(fd, &cp_count, sizeof(cp_count));
+#endif
+                        if (cp_count > 0 && cp_count <= 128) {
+                            /* Load checkpoints into linked list */
+                            for (uint32_t i = 0; i < cp_count; i++) {
+                                uint32_t cp_n;
+#ifdef _WIN32
+                                _read(fd, (char *)&cp_n, sizeof(cp_n));
+#else
+                                read(fd, &cp_n, sizeof(cp_n));
+#endif
+                                if (cp_n > 0) {
+                                    picolm_checkpoint_t *cp = (picolm_checkpoint_t *)calloc(1, sizeof(*cp));
+                                    if (cp) {
+                                        cp->n_tokens = (int)cp_n;
+                                        cp->data = (uint8_t *)malloc(srv.checkpoint_snapshot_size);
+                                        if (cp->data) {
+#ifdef _WIN32
+                                            _read(fd, (char *)cp->data, (unsigned)srv.checkpoint_snapshot_size);
+#else
+                                            read(fd, cp->data, srv.checkpoint_snapshot_size);
+#endif
+                                            /* Insert in sorted order */
+                                            picolm_checkpoint_t *prev = NULL;
+                                            picolm_checkpoint_t *cur = srv.checkpoints;
+                                            while (cur && cur->n_tokens < cp->n_tokens) {
+                                                prev = cur;
+                                                cur = cur->next;
+                                            }
+                                            if (prev) prev->next = cp;
+                                            else srv.checkpoints = cp;
+                                            cp->next = cur;
+                                        } else {
+                                            free(cp);
+                                        }
+                                    }
+                                } else {
+                                    /* Skip data for invalid checkpoint */
+#ifdef _WIN32
+                                    uint8_t *skip_buf = (uint8_t *)alloca(srv.checkpoint_snapshot_size > 4096 ? 4096 : srv.checkpoint_snapshot_size);
+                                    size_t skip = srv.checkpoint_snapshot_size;
+                                    while (skip > 0) {
+                                        size_t chunk = skip < 4096 ? skip : 4096;
+                                        _read(fd, (char *)skip_buf, (unsigned)chunk);
+                                        skip -= chunk;
+                                    }
+#else
+                                    uint8_t *skip_buf = (uint8_t *)alloca(srv.checkpoint_snapshot_size > 4096 ? 4096 : srv.checkpoint_snapshot_size);
+                                    size_t skip = srv.checkpoint_snapshot_size;
+                                    while (skip > 0) {
+                                        size_t chunk = skip < 4096 ? skip : 4096;
+                                        read(fd, skip_buf, chunk);
+                                        skip -= chunk;
+                                    }
+#endif
+                                }
+                            }
+                            fprintf(stderr, "\n[server] Restored %d SSM checkpoints: ", cp_count);
+                            picolm_checkpoint_t *ecp = srv.checkpoints;
+                            while (ecp) {
+                                fprintf(stderr, "%d ", ecp->n_tokens);
+                                ecp = ecp->next;
+                            }
+                            fprintf(stderr, "\n");
+                        } else {
+                            /* Skip checkpoint data */
+#ifdef _WIN32
+                            uint8_t *skip_buf = (uint8_t *)alloca(4096);
+                            for (uint32_t i = 0; i < cp_count && cp_count <= 1024; i++) {
+                                _read(fd, (char *)skip_buf, 4096); /* skip 4 bytes */
+                            }
+#else
+                            uint8_t *skip_buf = (uint8_t *)alloca(4096);
+                            for (uint32_t i = 0; i < cp_count && cp_count <= 1024; i++) {
+                                read(fd, skip_buf, 4096); /* skip 4 bytes */
+                            }
+#endif
+                        }
+                    }
+                }
+#ifdef _WIN32
+                _close(fd);
+#else
+                close(fd);
+#endif
+            }
+        }
+
+        cJSON *root = cJSON_CreateObject();
+        cJSON_AddNumberToObject(root, "id_slot", 0);
+        cJSON_AddStringToObject(root, "filename", filename);
+        cJSON_AddNumberToObject(root, "n_restored", n_restored);
+        cJSON *timings = cJSON_CreateObject();
+        cJSON_AddNumberToObject(timings, "restore_ms", t_ms);
+        cJSON_AddItemToObject(root, "timings", timings);
+
+        char *json = cJSON_PrintUnformatted(root);
+        http_send(sock, 200, "application/json", json);
+        free(json);
+        cJSON_Delete(root);
+
+    } else if (strcmp(action, "erase") == 0) {
+        int n_erased = srv.kv_pos;
+        srv.kv_pos = 0;
+        srv.last_prompt_len = 0;
+        checkpoint_clear();
+
+        /* Zero the KV cache */
+        memset(srv.model.state.key_cache, 0, srv.model.state.kv_size);
+
+        cJSON *root = cJSON_CreateObject();
+        cJSON_AddNumberToObject(root, "id_slot", 0);
+        cJSON_AddNumberToObject(root, "n_erased", n_erased);
+
+        char *json = cJSON_PrintUnformatted(root);
+        http_send(sock, 200, "application/json", json);
+        free(json);
+        cJSON_Delete(root);
+
+    } else {
+        http_send(sock, 400, "application/json",
+            "{\"error\":{\"message\":\"Unknown action. Use save, restore, or erase\"}}");
+    }
 }
 
 /* ---- Endpoint: GET /slots ---- */
@@ -2577,9 +2966,17 @@ static void handle_request(SOCKET sock) {
     char method[16], path[512];
     srv.sock_in_buf = sock;
     int header_len = http_parse_request(srv.recv_buf, sizeof(srv.recv_buf), method, sizeof(method), path, sizeof(path));
+    if (header_len >= 0) {
+        strncpy(srv.recv_path, path, sizeof(srv.recv_path) - 1);
+        srv.recv_path[sizeof(srv.recv_path) - 1] = '\0';
+    }
     if (header_len < 0) {
         return;
     }
+
+    /* Strip query string from path for routing */
+    char *qmark = strchr(path, '?');
+    if (qmark) *qmark = '\0';
 
     /* Read body if this is a POST */
     if (strcmp(method, "POST") == 0) {
@@ -2625,6 +3022,8 @@ static void handle_request(SOCKET sock) {
             handle_tokenize(sock, body_start);
         } else if (strcmp(path, "/detokenize") == 0) {
             handle_detokenize(sock, body_start);
+        } else if (strcmp(path, "/slots") == 0 || strcmp(path, "/v1/slots") == 0) {
+            handle_slots_post(sock, body_start);
         } else {
             http_send(sock, 404, "application/json", "{\"error\":{\"message\":\"Not found\"}}");
         }
@@ -2638,11 +3037,19 @@ static void handle_request(SOCKET sock) {
 
 int server_main(int port, const char *host, const char *model_path, int num_threads, int do_prefault, int context_override, int mem_mb,
                 int checkpoint_max, int checkpoint_interval, int checkpoint_interval_gen, int checkpoint_tail_offset,
+                const char *slot_save_path,
                 int viz_port, int viz_width, int viz_height) {
     srv.port = port;
     strncpy(srv.host, host, sizeof(srv.host) - 1);
     srv.model_path = model_path;
     srv.running = 1;
+
+    /* Slot save path */
+    if (slot_save_path && strlen(slot_save_path) > 0) {
+        strncpy(srv.slot_save_path, slot_save_path, sizeof(srv.slot_save_path) - 1);
+    } else {
+        srv.slot_save_path[0] = '\0';
+    }
 
     /* Load model once at startup */
     if (server_init(model_path, num_threads, do_prefault, context_override, mem_mb,

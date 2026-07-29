@@ -16,3 +16,5 @@ picolm.lib
 .hunger_build.bat
 probes/metal_reduction_probe
 probes/metal_matmul_bench
+.nfs*
+real
