@@ -304,7 +304,7 @@ size_t layer_weight_size(model_t *m, int l);
 int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v,
                        int k_cache_hadamard, int v_cache_hadamard);
 float *model_forward(model_t *m, int token, int pos);
-float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int start_pos);
+float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt);
 
 /* Free all resources. */
 void model_free(model_t *m);

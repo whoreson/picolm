@@ -5812,7 +5812,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
  * Projection matmuls batched (weights read once). Attention batched.
  * ================================================================ */
 
-float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int start_pos) {
+float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt) {
     int bi;
     model_config_t *c = &m->config;
     model_weights_t *w = &m->weights;
@@ -5902,6 +5902,11 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
     int gpu_dev = m->gpu.device;
 #endif
     for (int slot = 0; slot < c->n_layers; slot++) {
+        /* Check for client disconnect interrupt */
+        if (interrupt && *interrupt) {
+            free(buf);
+            return NULL;
+        }
 #ifdef PICOLM_VIZ
         int l = viz_layer_permute(slot);
 #else

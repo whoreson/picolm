@@ -639,10 +639,19 @@ static float *prefill_with_checkpoints(SOCKET sock, model_t *model,
     float *logits = NULL;
     int n_processed = start_pos;
 
+    /* Interrupt flag: set by client_alive check, polled inside model_forward_prefill */
+    volatile int interrupt = 0;
+
     /* Non-SSM model, or checkpointing disabled: single batched call */
     if (!model->config.has_ssm || srv.max_checkpoints <= 0) {
         if (n_prefill > 0) {
-            logits = model_forward_prefill(model, tokens, n_prefill, start_pos);
+            logits = model_forward_prefill(model, tokens, n_prefill, start_pos,
+                                           client_check ? &interrupt : NULL);
+            if (!logits) {
+                /* Interrupted during prefill */
+                *out_n_processed = n_processed;
+                return NULL;
+            }
             n_processed = start_pos + n_prefill;
         }
         *out_n_processed = n_processed;
@@ -654,7 +663,12 @@ static float *prefill_with_checkpoints(SOCKET sock, model_t *model,
     if (tail_pos < start_pos) tail_pos = start_pos + n_prefill; /* short prompt */
     if (tail_pos < start_pos + srv.checkpoint_interval) {
         /* Prompt too short for both tail and interval: single batch */
-        logits = model_forward_prefill(model, tokens, n_prefill, start_pos);
+        logits = model_forward_prefill(model, tokens, n_prefill, start_pos,
+                                       client_check ? &interrupt : NULL);
+        if (!logits) {
+            *out_n_processed = n_processed;
+            return NULL;
+        }
         n_processed = start_pos + n_prefill;
         *out_n_processed = n_processed;
         return logits;
@@ -687,11 +701,18 @@ static float *prefill_with_checkpoints(SOCKET sock, model_t *model,
             checkpoint_save(cur_pos);
         }
 
-        logits = model_forward_prefill(model, tokens + offset, chunk_size, cur_pos);
+        logits = model_forward_prefill(model, tokens + offset, chunk_size, cur_pos,
+                                       client_check ? &interrupt : NULL);
+        if (!logits) {
+            /* Interrupted inside model_forward_prefill */
+            *out_n_processed = n_processed;
+            return NULL;
+        }
         n_processed = cur_pos + chunk_size;
         offset += chunk_size;
 
         if (client_check && !client_alive(sock)) {
+            interrupt = 1;
             break;
         }
     }
@@ -2243,7 +2264,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         int n_processed_ns2 = start_pos;
         if (n_prefill_ns2 > 0) {
             /* Checkpoint-aware prefill */
-            logits_ns2 = prefill_with_checkpoints(sock, model, ptokens + start_pos, n_prefill_ns2, start_pos, &n_processed_ns2, 0);
+            logits_ns2 = prefill_with_checkpoints(sock, model, ptokens + start_pos, n_prefill_ns2, start_pos, &n_processed_ns2, 1);
         }
 
         t_prefill_end_ns = get_time_ms();
