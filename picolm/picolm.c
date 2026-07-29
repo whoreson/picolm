@@ -866,6 +866,33 @@ int main(int argc, char **argv) {
                     if (model.gpu.kv_active) {
                         logits = model_forward_gpu(&model, token, pos + 1);
                         if (!logits) logits = model_forward(&model, token, pos + 1);
+
+                        /* PICOLM_DBG_PIPELINE: compare GPU pipeline vs CPU per token */
+                        {
+                            static int dbg_pipeline_init = 0;
+                            if (!dbg_pipeline_init++) {
+                                const char *dbg = getenv("PICOLM_DBG_PIPELINE");
+                                if (dbg && atoi(dbg)) {
+                                    fprintf(stderr, "INFO: PICOLM_DBG_PIPELINE active\n");
+                                }
+                            }
+                            if (dbg_pipeline_init > 1) {
+                                /* Run CPU path for comparison (reuses same KV cache positions) */
+                                float *logits_cpu = model_forward(&model, token, pos + 1);
+                                if (logits_cpu) {
+                                    float max_diff = 0.0f;
+                                    for (int v = 0; v < model.config.vocab_size; v++) {
+                                        float d = logits[v] - logits_cpu[v];
+                                        if (d < 0) d = -d;
+                                        if (d > max_diff) max_diff = d;
+                                    }
+                                    if (max_diff > 1e-2f) {
+                                        fprintf(stderr, "[DBG_PIPELINE] pos=%d max_logit_diff=%.6f\n",
+                                                pos + 1, max_diff);
+                                    }
+                                }
+                            }
+                        }
                     } else
 #endif
                     {
