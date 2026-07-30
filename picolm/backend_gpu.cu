@@ -97,6 +97,8 @@ typedef hipEvent_t gpuEvent_t;
 #define gpuHostUnregister hipHostUnregister
 #define gpuMallocManaged hipMallocManaged
 #define gpuMemset hipMemset
+#define gpuFuncSetAttribute hipFuncSetAttribute
+#define gpuFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
 /* HIP: no hipMemAdvise equivalent; unified memory is automatic on HIP */
 #else
 /* NVIDIA CUDA */
@@ -118,6 +120,8 @@ typedef hipEvent_t gpuEvent_t;
 #define gpuStreamDestroy cudaStreamDestroy
 #define gpuStreamSynchronize cudaStreamSynchronize
 #define gpuMemGetInfo cudaMemGetInfo
+#define gpuFuncSetAttribute cudaFuncSetAttribute
+#define gpuFuncAttributeMaxDynamicSharedMemorySize cudaFuncAttributeMaxDynamicSharedMemorySize
 #define gpuMallocHost cudaMallocHost
 #define gpuFreeHost cudaFreeHost
 #define gpuEvent_t cudaEvent_t
@@ -808,27 +812,34 @@ picolm_gpu_attention_prefill_kernel(
     int q_end = min(q_start + ATTN_TILE_Q, n_tokens);
     int n_q = q_end - q_start;
 
-    /* Shared memory: [K tile:ATTN_TILE_K*head_dim u16][V tile:ATTN_TILE_K*head_dim u16][reduce:256 float] */
+    /* Shared memory: K tile + V tile (u16) + reduce (256 float) +
+     * acc[ATTN_TILE_Q][head_dim] (float) + max_score[ATTN_TILE_Q] +
+     * sum_exp[ATTN_TILE_Q] (float). Sized by the host wrapper, which
+     * also opts into extended dynamic shared memory since this total
+     * exceeds the default 48KB for typical head_dim/tile sizes.
+     *
+     * Previously acc/max_score/sum_exp were per-thread local arrays
+     * (acc[32][256] = 32KB/thread) -- spilled to local memory, declared
+     * and zero-initialized redundantly by every one of n_threads
+     * threads, and only ever read/written by thread 0 in the update
+     * loop below while every other thread idled at the barrier. Same
+     * bug class as the decode attention kernel, fixed the same way:
+     * one shared copy, update parallelized across threads. */
     extern __shared__ uint8_t smem[];
     uint16_t *k_tile = (uint16_t *)smem;
     uint16_t *v_tile = k_tile + ATTN_TILE_K * head_dim;
     float *reduce_sh = (float *)((uint8_t *)v_tile + ATTN_TILE_K * head_dim * sizeof(uint16_t));
+    float *acc_sh = reduce_sh + 256;               /* [ATTN_TILE_Q][head_dim] */
+    float *max_score_sh = acc_sh + (size_t)ATTN_TILE_Q * head_dim;  /* [ATTN_TILE_Q] */
+    float *sum_exp_sh = max_score_sh + ATTN_TILE_Q; /* [ATTN_TILE_Q] */
+    __shared__ float rescale_sh, weight_sh;
 
-    /* Per-query-token online softmax state */
-    float max_score[ATTN_TILE_Q];
-    float sum_exp[ATTN_TILE_Q];
-    float acc[ATTN_TILE_Q][256];
-
-    for (int qi = 0; qi < n_q; qi++) {
-        max_score[qi] = -1e30f;
-        sum_exp[qi] = 0.0f;
-        for (int d = 0; d < head_dim; d++) acc[qi][d] = 0.0f;
+    for (int i = tid; i < ATTN_TILE_Q * head_dim; i += n_threads) acc_sh[i] = 0.0f;
+    for (int qi = tid; qi < ATTN_TILE_Q; qi += n_threads) {
+        max_score_sh[qi] = -1e30f;
+        sum_exp_sh[qi] = 0.0f;
     }
-    /* Zero-init for unused slots in the tile */
-    for (int qi = n_q; qi < ATTN_TILE_Q; qi++) {
-        max_score[qi] = -1e30f;
-        sum_exp[qi] = 0.0f;
-    }
+    gpuSyncthreads();
 
     /* Total KV positions visible: start_pos + n_tokens */
     int total_kv = start_pos + n_tokens;
@@ -854,6 +865,7 @@ picolm_gpu_attention_prefill_kernel(
             int global_pos = start_pos + global_q;
 
             const float *qg = q_dev + (size_t)(global_q * n_heads + h) * head_dim;
+            float *accqi = acc_sh + (size_t)qi * head_dim;
 
             for (int ti = 0; ti < tile_k_size; ti++) {
                 int global_kv = t0 + ti;
@@ -873,36 +885,39 @@ picolm_gpu_attention_prefill_kernel(
                 }
                 score = reduce_sh[0] / sqrt_hd;
 
-                /* Online softmax update (thread 0 only) */
+                /* Online softmax branch decision on thread 0, broadcast
+                 * via shared scalars; accumulator update parallelized
+                 * across all threads below. */
                 if (tid == 0) {
-                    if (score > max_score[qi]) {
-                        float correction = expf(max_score[qi] - score);
-                        sum_exp[qi] = sum_exp[qi] * correction + 1.0f;
-                        for (int d = 0; d < head_dim; d++) {
-                            acc[qi][d] = acc[qi][d] * correction + gpu_fp16_to_fp32(v_tile[ti * head_dim + d]);
-                        }
-                        max_score[qi] = score;
+                    if (score > max_score_sh[qi]) {
+                        rescale_sh = expf(max_score_sh[qi] - score);
+                        weight_sh = 1.0f;
+                        sum_exp_sh[qi] = sum_exp_sh[qi] * rescale_sh + 1.0f;
+                        max_score_sh[qi] = score;
                     } else {
-                        float w = expf(score - max_score[qi]);
-                        sum_exp[qi] += w;
-                        for (int d = 0; d < head_dim; d++) {
-                            acc[qi][d] += w * gpu_fp16_to_fp32(v_tile[ti * head_dim + d]);
-                        }
+                        rescale_sh = 1.0f;
+                        weight_sh = expf(score - max_score_sh[qi]);
+                        sum_exp_sh[qi] += weight_sh;
                     }
                 }
                 gpuSyncthreads();
+
+                for (int d = tid; d < head_dim; d += n_threads) {
+                    accqi[d] = accqi[d] * rescale_sh + weight_sh * gpu_fp16_to_fp32(v_tile[ti * head_dim + d]);
+                }
+                gpuSyncthreads(); /* reduce_sh/rescale_sh/weight_sh reused next ti/qi */
             }
         }
     }
 
-    /* Normalize and write output */
-    if (tid == 0) {
-        for (int qi = 0; qi < n_q; qi++) {
-            float inv_sum = 1.0f / sum_exp[qi];
-            float *xbhg = xb_out + (size_t)(q_start + qi) * n_heads * head_dim + h * head_dim;
-            for (int d = 0; d < head_dim; d++) {
-                xbhg[d] = acc[qi][d] * inv_sum;
-            }
+    /* Normalize and write output, parallelized across threads */
+    for (int qi = 0; qi < n_q; qi++) {
+        int global_q = q_start + qi;
+        float inv_sum = 1.0f / sum_exp_sh[qi];
+        float *xbhg = xb_out + (size_t)(global_q * n_heads + h) * head_dim;
+        float *accqi = acc_sh + (size_t)qi * head_dim;
+        for (int d = tid; d < head_dim; d += n_threads) {
+            xbhg[d] = accqi[d] * inv_sum;
         }
     }
 }
@@ -2387,11 +2402,13 @@ picolm_gpu_attention_decode(float *xb_out, const float *q_host,
     size_t kv_head_stride_bytes = head_dim * sizeof(uint16_t);
 
     /* Shared memory: K(head_dim u16) + V(head_dim u16) + reduce(256 float)
-     * + acc[kv_mul][head_dim] float + max_score[kv_mul] + sum_exp[kv_mul] */
+     * + acc[kv_mul][head_dim] float + max_score[kv_mul] + sum_exp[kv_mul]
+     * + rescale_sh + weight_sh (static __shared__, 8 bytes) */
     size_t shared_bytes = 2 * head_dim * sizeof(uint16_t) + 256 * sizeof(float)
                          + (size_t)kv_mul * head_dim * sizeof(float)
                          + (size_t)kv_mul * sizeof(float)
-                         + (size_t)kv_mul * sizeof(float);
+                         + (size_t)kv_mul * sizeof(float)
+                         + 2 * sizeof(float); /* rescale_sh + weight_sh */
     int block_threads = 256;
 
     dim3 grid((unsigned)n_kv_heads, 1, 1);
@@ -2451,6 +2468,43 @@ picolm_gpu_attention_decode_dev(float *xb_out_dev, const float *q_dev,
     return 1;
 }
 
+/* Total dynamic shared memory picolm_gpu_attention_prefill_kernel needs:
+ * K tile + V tile (u16) + reduce (256 float) + acc[ATTN_TILE_Q][head_dim]
+ * (float) + max_score[ATTN_TILE_Q] + sum_exp[ATTN_TILE_Q] (float).
+ * For head_dim=128 this is ~50KB -- over the default 48KB/block limit,
+ * so the caller must opt in via gpuFuncSetAttribute before launching
+ * with this size (see ensure_attn_prefill_shared_mem below). */
+static size_t
+attn_prefill_shared_bytes(int head_dim) {
+    /* Dynamic shared memory (extern __shared__): K tile + V tile + reduce +
+     * acc + max_score + sum_exp. Plus 8 bytes of static __shared__ for
+     * rescale_sh/weight_sh. Total must be set via gpuFuncSetAttribute. */
+    return 2 * (size_t)ATTN_TILE_K * head_dim * sizeof(uint16_t)
+         + 256 * sizeof(float)
+         + (size_t)ATTN_TILE_Q * head_dim * sizeof(float)
+         + (size_t)ATTN_TILE_Q * sizeof(float)
+         + (size_t)ATTN_TILE_Q * sizeof(float)
+         + 2 * sizeof(float); /* rescale_sh + weight_sh (static __shared__) */
+}
+
+/* Opts the kernel into a larger dynamic shared memory limit if needed.
+ * Idempotent: tracks the largest size already configured so repeated
+ * calls (every prefill call, every layer) are a cheap no-op after the
+ * first. Returns 1 if `bytes` is safe to launch with, 0 if the opt-in
+ * itself failed (e.g. device doesn't support this much shared memory --
+ * would need a fallback path, not expected on GB10/Blackwell). */
+static int
+ensure_attn_prefill_shared_mem(size_t bytes) {
+    static size_t configured = 49152; /* default limit, no opt-in needed under this */
+    if (bytes <= configured) return 1;
+    if (!gpu_ok(gpuFuncSetAttribute((const void *)picolm_gpu_attention_prefill_kernel,
+                                     gpuFuncAttributeMaxDynamicSharedMemorySize, (int)bytes),
+                "attn prefill shared mem opt-in"))
+        return 0;
+    configured = bytes;
+    return 1;
+}
+
 extern "C" int
 picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
                               int layer_ordinal, int start_pos, int n_tokens,
@@ -2473,8 +2527,8 @@ picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
     size_t kv_head_stride_bytes = head_dim * sizeof(uint16_t);
 
     int n_tiles_q = (n_tokens + ATTN_TILE_Q - 1) / ATTN_TILE_Q;
-    /* Shared memory: K tile [ATTN_TILE_K][head_dim] + V tile [ATTN_TILE_K][head_dim] in half */
-    size_t shared_bytes = 2 * ATTN_TILE_K * head_dim * sizeof(uint16_t) + 256 * sizeof(float);
+    size_t shared_bytes = attn_prefill_shared_bytes(head_dim);
+    if (!ensure_attn_prefill_shared_mem(shared_bytes)) return 0;
     int block_threads = 128; /* enough for head_dim up to 256 */
 
     dim3 grid((unsigned)n_heads, (unsigned)n_tiles_q, 1);
@@ -2508,7 +2562,8 @@ picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
     size_t kv_head_stride_bytes = head_dim * sizeof(uint16_t);
 
     int n_tiles_q = (n_tokens + ATTN_TILE_Q - 1) / ATTN_TILE_Q;
-    size_t shared_bytes = 2 * ATTN_TILE_K * head_dim * sizeof(uint16_t) + 256 * sizeof(float);
+    size_t shared_bytes = attn_prefill_shared_bytes(head_dim);
+    if (!ensure_attn_prefill_shared_mem(shared_bytes)) return 0;
     int block_threads = 128;
 
     dim3 grid((unsigned)n_heads, (unsigned)n_tiles_q, 1);
