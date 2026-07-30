@@ -33,6 +33,7 @@
 /* NVIDIA CUDA */
 #include <cuda_runtime.h>
 #include <mma.h>
+#include <sm_61_intrinsics.h> /* __dp4a: 4-way int8 MAC, sm_61+ */
 #endif
 
 #include <stdlib.h>
@@ -524,8 +525,28 @@ picolm_q8_q8_matmul(float *y,
         const int8_t *xqp = xrow + bi * 32;
 
         int32_t acc = 0;
+#if 0 /* __dp4a: 4-way int8 MAC (sm_61+). Verified bit-exact but on GB10 (sm_121)
+       * ptxas lowers __dp4a to scalar IMAD -- no hardware DP4A on Blackwell.
+       * Kept in #if 0 for architectures that have it (e.g. Turing/Ampere
+       * where __dp4a maps to real DP4A instructions). Guarded to avoid
+       * the memcpy overhead on platforms where it doesn't help. */
+#ifndef __HIP__
+        {
+            int32_t wq4[8], xq4[8];
+            memcpy(wq4, wq, 32);
+            memcpy(xq4, xqp, 32);
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+                acc = __dp4a(wq4[j], xq4[j], acc);
+        }
+#else
         for (int j = 0; j < 32; j++)
             acc += (int32_t)wq[j] * (int32_t)xqp[j];
+#endif
+#else
+        for (int j = 0; j < 32; j++)
+            acc += (int32_t)wq[j] * (int32_t)xqp[j];
+#endif
 
         sum += (double)acc * (double)wd * (double)xdv;
     }
@@ -595,8 +616,24 @@ picolm_q8_q8_matmul_tiled(float *y,
             const int8_t *xqp = xrow + bi * 32;
 
             int32_t acc = 0;
+#if 0 /* __dp4a: see picolm_q8_q8_matmul comment above */
+#ifndef __HIP__
+            {
+                int32_t wq4[8], xq4[8];
+                memcpy(wq4, wq, 32);
+                memcpy(xq4, xqp, 32);
+#pragma unroll
+                for (int j = 0; j < 8; j++)
+                    acc = __dp4a(wq4[j], xq4[j], acc);
+            }
+#else
             for (int j = 0; j < 32; j++)
                 acc += (int32_t)wq[j] * (int32_t)xqp[j];
+#endif
+#else
+            for (int j = 0; j < 32; j++)
+                acc += (int32_t)wq[j] * (int32_t)xqp[j];
+#endif
 
             sum += (double)acc * (double)wd * (double)xdv;
         }
