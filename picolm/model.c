@@ -473,29 +473,32 @@ static void munmap_file(model_t *m) {
 #define MAX_SPLIT_FILES 64
 
 /* Extract the prefix from a split file path.
- * Given "/path/model-Q4_0-split-00001-of-00003.gguf" -> "/path/model-Q4_0-split"
+ * Pattern: <prefix>-DDDDD-of-DDDDD.gguf (e.g. "/path/model-Q4_0-split-00001-of-00003.gguf")
+ * Returns the prefix part (everything before "-DDDDD-of-").
  * Returns 1 on success, 0 on failure (path doesn't match split convention). */
 static int split_path_prefix(char *prefix, size_t maxlen, const char *split_path) {
-    /* Find the last "-NNNNN-of-NNNNN.gguf" suffix */
-    const char *dash = strrchr(split_path, '-');
-    if (!dash) return 0;
+    size_t plen = strlen(split_path);
+    /* Suffix is: -DDDDD-of-DDDDD.gguf = 20 chars. Minimum total path: 24 chars. */
+    if (plen < 24) return 0;
 
-    /* Check the suffix matches the split pattern: -DDDDD-of-DDDDD.gguf */
-    /* Format: -00001-of-00003.gguf = 21 chars after the dash */
-    /* We need at least: -XXXXX-of-XXXXX.gguf */
-    size_t dashlen = strlen(dash);
-    if (dashlen < 21) return 0; /* "-00001-of-00001.gguf" is exactly 21 chars */
+    const char *suf = split_path + plen - 20;
+    /* Must end with .gguf */
+    if (strcmp(suf + 15, ".gguf") != 0) return 0;
+    /* First char must be dash */
+    if (suf[0] != '-') return 0;
+    /* DDDDD-of-DDDDD: positions 1-5 are digits, 6-9 are "-of-", 10-14 are digits */
+    for (int i = 1; i <= 5; i++) {
+        if (suf[i] < '0' || suf[i] > '9') return 0;
+    }
+    if (suf[6] != '-' || suf[7] != 'o' || suf[8] != 'f' || suf[9] != '-') return 0;
+    for (int i = 10; i <= 14; i++) {
+        if (suf[i] < '0' || suf[i] > '9') return 0;
+    }
 
-    /* Verify the pattern: -DDDDD-of-DDDDD.gguf */
-    if (dash[1] < '0' || dash[1] > '9') return 0;
-    if (dash[5] != '-' || dash[6] != 'o' || dash[7] != 'f' || dash[8] != '-') return 0;
-    if (dash[9] < '0' || dash[9] > '9') return 0;
-    if (dash[14] != '.' || strcmp(dash + 14, ".gguf") != 0) return 0;
-
-    size_t plen = (size_t)(dash - split_path);
-    if (plen >= maxlen) return 0;
-    memcpy(prefix, split_path, plen);
-    prefix[plen] = '\0';
+    size_t plen2 = (size_t)(suf - split_path);
+    if (plen2 >= maxlen) return 0;
+    memcpy(prefix, split_path, plen2);
+    prefix[plen2] = '\0';
     return 1;
 }
 
@@ -1160,14 +1163,56 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                     }
                 }
             }
+        /* Split GGUF metadata */
+        } else if (str_eq(key, "split.count")) {
+            int dummy; m->split_count = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "split.no")) {
+            int dummy; m->split_no = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "split.tensors.count")) {
+            int dummy; m->split_tensors_count = (int)skip_meta_value(&r, vtype, &dummy);
         } else {
             int dummy; skip_meta_value(&r, vtype, &dummy);
         }
     }
 
-    if (max_seq_len > 0 && max_seq_len < cfg->max_seq_len) {
-        cfg->max_seq_len = max_seq_len;
+    /* ---- Split GGUF: detect and prepare ---- */
+    {
+        int total_splits = m->split_count > 1 ? m->split_count : 1;
+        m->n_splits = total_splits;
+
+        if (total_splits > 1) {
+            /* Derive prefix from first split path */
+            char prefix[512];
+            if (!split_path_prefix(prefix, sizeof(prefix), m->first_split_path)) {
+                fprintf(stderr, "Split model: could not derive prefix from path '%s'\n", m->first_split_path);
+                return -1;
+            }
+
+            fprintf(stderr, "Split model: %d splits, total tensors=%d\n",
+                    total_splits, m->split_tensors_count);
+
+            /* Mmap remaining splits */
+            for (int si = 1; si < total_splits; si++) {
+                char split_path[512];
+                split_path_build(split_path, sizeof(split_path), prefix, si, total_splits);
+
+                if (mmap_one_file(&m->splits[si], split_path) != 0) {
+                    /* Clean up already-mapped splits */
+                    for (int sj = 1; sj <= si; sj++) munmap_one_file(&m->splits[sj]);
+                    return -1;
+                }
+                prepare_mmap(m->splits[si].mmap_addr, m->splits[si].mmap_size);
+            }
+        }
     }
+
+    /* Validate required config fields before using them */
+    if (cfg->n_embd <= 0 || cfg->n_heads <= 0 || cfg->n_layers <= 0) {
+        fprintf(stderr, "Model architecture not recognized (n_embd=%d n_heads=%d n_layers=%d)\n",
+                cfg->n_embd, cfg->n_heads, cfg->n_layers);
+        return -1;
+    }
+
     /* head_dim: use GGUF's attention.key_length if set (Qwen3), else derive */
     if (cfg->head_dim <= 0) {
         cfg->head_dim = cfg->n_embd / cfg->n_heads;
@@ -1182,46 +1227,111 @@ static int parse_gguf(model_t *m, int max_seq_len) {
         if (cfg->f_final_logit_softcapping <= 0) cfg->f_final_logit_softcapping = 30.0f;
     }
 
-    /* Parse tensor info entries */
+    /* ---- Parse tensor info entries (split-aware) ---- */
+    /* tensor_info_t with split_idx */
     typedef struct {
         gguf_str_t name;
         uint32_t   n_dims;
         uint64_t   dims[4];
         uint32_t   type;
         uint64_t   offset;
+        int        split_idx;
     } tensor_info_t;
 
-    tensor_info_t *tinfos = (tensor_info_t *)malloc(n_tensors * sizeof(tensor_info_t));
+    /* Total tensor count: use split.tensors.count if split, else header n_tensors */
+    uint64_t total_tensor_count = (m->split_tensors_count > 0) ? (uint64_t)m->split_tensors_count : n_tensors;
+
+    tensor_info_t *tinfos = (tensor_info_t *)malloc(total_tensor_count * sizeof(tensor_info_t));
     if (!tinfos) { fprintf(stderr, "OOM allocating tensor info\n"); return -1; }
 
-    for (uint64_t i = 0; i < n_tensors; i++) {
-        tinfos[i].name   = read_gguf_string(&r);
-        tinfos[i].n_dims = read_u32(&r);
-        for (uint32_t d = 0; d < tinfos[i].n_dims; d++) {
-            tinfos[i].dims[d] = read_u64(&r);
-        }
-        tinfos[i].type   = read_u32(&r);
-        tinfos[i].offset = read_u64(&r);
+    /* Parse tensor tables from each split */
+    {
+        uint64_t tidx = 0;
+        for (int si = 0; si < m->n_splits; si++) {
+            reader_t sr;
+            uint64_t s_n_tensors;
+
+            if (si == 0) {
+                /* Split 0: we already parsed metadata, reader 'r' is positioned after it.
+                 * We need the per-file n_tensors. Re-read header to get it, then reuse
+                 * the existing reader position (after metadata) for tensor entries. */
+                {
+                    reader_t hr = (reader_t){ .data = (const uint8_t *)m->splits[0].mmap_addr,
+                                              .pos = 0, .size = m->splits[0].mmap_size };
+                    (void)read_u32(&hr); /* magic */
+                    (void)read_u32(&hr); /* version */
+                    s_n_tensors = read_u64(&hr);
+                }
+                /* Continue reading tensor entries from 'r' (positioned after metadata) */
+                for (uint64_t ti = 0; ti < s_n_tensors; ti++) {
+                    tinfos[tidx].name     = read_gguf_string(&r);
+                    tinfos[tidx].n_dims   = read_u32(&r);
+                    for (uint32_t d = 0; d < tinfos[tidx].n_dims; d++) {
+                        tinfos[tidx].dims[d] = read_u64(&r);
+                    }
+                    tinfos[tidx].type     = read_u32(&r);
+                    tinfos[tidx].offset   = read_u64(&r);
+                    tinfos[tidx].split_idx = 0;
+                    tidx++;
+                }
+                /* tensor_data_base for split 0: after all tensor entries in split 0 */
+                m->tensor_data_base[0] = (r.pos + cfg->alignment - 1) & ~((size_t)cfg->alignment - 1);
+            } else {
+                /* Other splits: parse from scratch */
+                sr = (reader_t){ .data = (const uint8_t *)m->splits[si].mmap_addr,
+                                .pos = 0, .size = m->splits[si].mmap_size };
+                (void)read_u32(&sr); /* magic */
+                (void)read_u32(&sr); /* version */
+                s_n_tensors = read_u64(&sr);
+                uint64_t s_n_metadata = read_u64(&sr);
+                for (uint64_t mi = 0; mi < s_n_metadata; mi++) {
+                    (void)read_gguf_string(&sr);
+                    uint32_t svtype = read_u32(&sr);
+                    int dummy;
+                    skip_meta_value(&sr, svtype, &dummy);
+                }
+
+                for (uint64_t ti = 0; ti < s_n_tensors; ti++) {
+                    tinfos[tidx].name     = read_gguf_string(&sr);
+                    tinfos[tidx].n_dims   = read_u32(&sr);
+                    for (uint32_t d = 0; d < tinfos[tidx].n_dims; d++) {
+                        tinfos[tidx].dims[d] = read_u64(&sr);
+                    }
+                    tinfos[tidx].type     = read_u32(&sr);
+                    tinfos[tidx].offset   = read_u64(&sr);
+                    tinfos[tidx].split_idx = si;
+                    tidx++;
+                }
+                /* tensor_data_base: after tensor entries */
+                m->tensor_data_base[si] = (sr.pos + cfg->alignment - 1) & ~((size_t)cfg->alignment - 1);
             }
+        }
+        /* Verify tensor count matches */
+        if (tidx != total_tensor_count) {
+            fprintf(stderr, "Split model: expected %lu tensors but got %lu\n",
+                    (unsigned long)total_tensor_count, (unsigned long)tidx);
+            free(tinfos);
+            return -1;
+        }
+    }
 
     /* Detect MTP (Multi-Token Prediction) layers by scanning for "nextn" tensors */
     cfg->has_mtp = 0;
     cfg->n_mtp_layers = 0;
-    for (uint64_t i = 0; i < n_tensors; i++) {
+    for (uint64_t i = 0; i < total_tensor_count; i++) {
         if (strstr(tinfos[i].name.str, "nextn.") && tinfos[i].name.len > 0) {
             cfg->has_mtp = 1;
             break;
         }
     }
 
-    size_t alignment = (size_t)cfg->alignment;
-    size_t tensor_data_base = (r.pos + alignment - 1) & ~(alignment - 1);
-
     model_weights_t *w = &m->weights;
     memset(w, 0, sizeof(*w));
 
-    for (uint64_t i = 0; i < n_tensors; i++) {
-        const void *ptr = (const uint8_t *)m->mmap_addr + tensor_data_base + tinfos[i].offset;
+    for (uint64_t i = 0; i < total_tensor_count; i++) {
+        /* Resolve tensor pointer from the correct split's mmap region */
+        int si = tinfos[i].split_idx;
+        const void *ptr = (const uint8_t *)m->splits[si].mmap_addr + m->tensor_data_base[si] + tinfos[i].offset;
         gguf_type_t qtype = (gguf_type_t)tinfos[i].type;
 
         if (str_eq(tinfos[i].name, "token_embd.weight")) {
@@ -1333,7 +1443,7 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                 } else if (strcmp(suffix, "laurel_l.weight") == 0) {
                     lw->laurel_l = ptr; lw->type_laurel_l = qtype;
                     /* Derive laurel_rank from tensor shape [n_embd, laurel_rank] */
-                    for (uint64_t ti = 0; ti < n_tensors; ti++) {
+                    for (uint64_t ti = 0; ti < total_tensor_count; ti++) {
                         if (tinfos[ti].name.len > 4 && memcmp(tinfos[ti].name.str, "blk.", 4) == 0) {
                             const char *p = tinfos[ti].name.str + 4;
                             int bl = 0;
@@ -1374,7 +1484,7 @@ static int parse_gguf(model_t *m, int max_seq_len) {
     }
 
     if (cfg->vocab_size == 0) {
-        for (uint64_t i = 0; i < n_tensors; i++) {
+        for (uint64_t i = 0; i < total_tensor_count; i++) {
             if (str_eq(tinfos[i].name, "token_embd.weight")) {
                 if (tinfos[i].n_dims >= 2) {
                     int d0 = (int)tinfos[i].dims[0];
@@ -1400,7 +1510,7 @@ static int parse_gguf(model_t *m, int max_seq_len) {
     if (cfg->has_mtp) {
         for (int i = cfg->n_layers - 1; i >= 0; i--) {
             int has_nextn = 0;
-            for (uint64_t ti = 0; ti < n_tensors; ti++) {
+            for (uint64_t ti = 0; ti < total_tensor_count; ti++) {
                 if (strstr(tinfos[ti].name.str, "blk.") == NULL) continue;
                 const char *p = tinfos[ti].name.str + 4;
                 int bl = 0;
@@ -1445,9 +1555,10 @@ static int parse_gguf(model_t *m, int max_seq_len) {
 #if defined(__APPLE__) && defined(__ppc__)
     { int be_start = clock();
     fprintf(stderr, "Big-endian: swapping F16 values...\n");
-    for (uint64_t i = 0; i < n_tensors; i++) {
+    for (uint64_t i = 0; i < total_tensor_count; i++) {
         gguf_type_t qt = (gguf_type_t)tinfos[i].type;
-        void *ptr = (void *)((uint8_t *)m->mmap_addr + tensor_data_base + tinfos[i].offset);
+        int _si = tinfos[i].split_idx;
+        void *ptr = (void *)((uint8_t *)m->splits[_si].mmap_addr + m->tensor_data_base[_si] + tinfos[i].offset);
         size_t nrows = tinfos[i].dims[0];
         for (uint64_t d = 1; d < tinfos[i].n_dims; d++) nrows *= tinfos[i].dims[d];
 
@@ -5789,13 +5900,21 @@ int model_lock_layers(model_t *m, size_t mem_bytes) {
         }
     }
 
-    /* Clamp range ends to the mmap boundary. page_align_up can push the
-     * end past the file size when the last tensor is near EOF. */
-    const uint8_t *mmap_end = (const uint8_t *)m->mmap_addr + m->mmap_size;
-    mmap_end = (const uint8_t *)(((uintptr_t)mmap_end + 4095) & ~(uintptr_t)4095);
+    /* Clamp range ends to the mmap boundary of the corresponding split.
+     * page_align_up can push the end past the file size when the last
+     * tensor in a split is near EOF. */
     for (int i = 0; i < merged; i++) {
-        if ((const uint8_t *)ranges_end[i] > mmap_end)
-            ranges_end[i] = mmap_end;
+        /* Find which split this range belongs to */
+        for (int si = 0; si < m->n_splits; si++) {
+            const uint8_t *s_start = (const uint8_t *)m->splits[si].mmap_addr;
+            const uint8_t *s_end = s_start + m->splits[si].mmap_size;
+            const uint8_t *s_end_aligned = (const uint8_t *)(((uintptr_t)s_end + 4095) & ~(uintptr_t)4095);
+            if (ranges_start[i] >= s_start && ranges_start[i] < s_end) {
+                if ((const uint8_t *)ranges_end[i] > s_end_aligned)
+                    ranges_end[i] = s_end_aligned;
+                break;
+            }
+        }
     }
 
     /* On Windows, try to acquire SE_LOCK_MEMORY_NAME privilege.
