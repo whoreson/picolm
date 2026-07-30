@@ -39,6 +39,7 @@ typedef struct {
     int n_layers;       /* number of transformer layers (e.g. 22) */
     int vocab_size;     /* vocabulary size (e.g. 32000) */
     int is_qwen;        /* 1 if model architecture is qwen3/qwen35 */
+    int is_gemma3n;     /* 1 if model architecture is gemma3n */
     int max_seq_len;    /* maximum sequence length (e.g. 2048) */
     int head_dim;       /* = n_embd / n_heads */
     float rope_freq_base; /* RoPE theta base (e.g. 10000.0) */
@@ -63,6 +64,13 @@ typedef struct {
      * N candidate tokens, verify with fast forward pass (speculative decoding). */
     int has_mtp;              /* 1 if model has MTP layers */
     int n_mtp_layers;         /* number of MTP layers at the end of layer list */
+    /* Gemma-3n specific */
+    int n_altup;              /* number of altup copies (default 4) */
+    int i_altup_act;          /* active altup index (default 0) */
+    int laurel_rank;          /* LAUREL low-rank bottleneck dimension */
+    int n_embd_altup;         /* per-layer input dimension (n_embd_altup = 256) */
+    int n_layer_kv_from_start;/* number of layers with KV cache from start */
+    float f_final_logit_softcapping; /* final logit soft-capping (0=disabled) */
 } model_config_t;
 
 /* ---- GPU-resident weight handles (compiled in only with PICOLM_GPU) ---- */
@@ -138,6 +146,28 @@ typedef struct {
     gguf_type_t type_ssm_dt;
     gguf_type_t type_ssm_a;
     gguf_type_t type_ssm_norm;
+    /* Gemma-3n specific weights */
+    const void *attn_post_norm;     /* post-attention norm [n_embd] */
+    gguf_type_t type_attn_post_norm;
+    const void *post_ffw_norm;      /* post-FFW norm [n_embd] */
+    gguf_type_t type_post_ffw_norm;
+    const void *per_layer_inp_gate;  /* [n_embd, n_embd_altup] */
+    gguf_type_t type_per_layer_inp_gate;
+    const void *per_layer_proj;      /* [n_embd_altup, n_embd] */
+    gguf_type_t type_per_layer_proj;
+    const void *per_layer_post_norm; /* [n_embd] */
+    gguf_type_t type_per_layer_post_norm;
+    const void *altup_correct_coef;  /* [n_altup, n_altup] F32 */
+    const void *altup_correct_scale; /* [n_embd] F32 */
+    const void *altup_predict_coef;  /* [n_altup, n_altup*n_altup] F32 */
+    const void *altup_router;        /* [n_embd, n_altup] */
+    gguf_type_t type_altup_router;
+    const void *altup_router_norm;   /* [n_embd] F32 */
+    const void *laurel_l;            /* [n_embd, laurel_rank] */
+    gguf_type_t type_laurel_l;
+    const void *laurel_r;            /* [laurel_rank, n_embd] */
+    gguf_type_t type_laurel_r;
+    const void *laurel_post_norm;    /* [n_embd] F32 */
 } layer_weights_t;
 
 typedef struct {
@@ -147,6 +177,16 @@ typedef struct {
     gguf_type_t type_output_norm;
     const void *output;        /* final output projection (may alias token_embd) */
     gguf_type_t type_output;
+    /* Gemma-3n global tensors */
+    const void *altup_proj;            /* [n_embd, n_embd, n_altup-1] */
+    gguf_type_t type_altup_proj;
+    const void *altup_unembd_proj;     /* [n_embd, n_embd, n_altup-1] */
+    gguf_type_t type_altup_unembd_proj;
+    const void *per_layer_tok_embd;    /* [n_embd_altup * n_layer, n_vocab] */
+    gguf_type_t type_per_layer_tok_embd;
+    const void *per_layer_model_proj;  /* [n_embd, n_embd_altup * n_layer] */
+    gguf_type_t type_per_layer_model_proj;
+    const void *per_layer_proj_norm;   /* [n_embd_altup] */
     layer_weights_t layers[MAX_LAYERS];
 } model_weights_t;
 
@@ -208,6 +248,26 @@ typedef struct {
     float *ssm_dt_w[MAX_LAYERS];       /* [dt_rank] F32 */
     float *ssm_norm_w[MAX_LAYERS];     /* [head_v_dim] F32 */
     float *ssm_conv1d_w[MAX_LAYERS];   /* [d_conv * conv_dim] F32 */
+
+    /* Gemma-3n runtime state */
+    float *gemma3n_altup_state;        /* [n_altup * n_tokens * n_embd] for prefill, [n_altup * n_embd] for gen */
+    float *gemma3n_per_layer_inp;      /* [n_embd_altup * n_layer] projected per-layer input */
+    float *gemma3n_inp_gate_out;       /* [n_embd_altup] gated per-layer output */
+    float *gemma3n_laurel_out;         /* [n_embd] laurel output */
+    float *gemma3n_router_cache;       /* [n_altup] router modalities cache */
+    float *gemma3n_router_out;         /* [n_altup] router output */
+    float *gemma3n_norm_w[MAX_LAYERS]; /* extra norm weights for gemma3n */
+    float *attn_post_norm_w[MAX_LAYERS];
+    float *post_ffw_norm_w[MAX_LAYERS];
+    float *per_layer_post_norm_w[MAX_LAYERS];
+    float *laurel_post_norm_w[MAX_LAYERS];
+    float *altup_router_norm_w[MAX_LAYERS];
+    float *altup_correct_scale_w[MAX_LAYERS];
+    /* Pre-dequantized small Gemma-3n arrays */
+    float *altup_correct_coef_w[MAX_LAYERS];  /* [n_altup * n_altup] */
+    float *altup_predict_coef_w[MAX_LAYERS];  /* [n_altup * n_altup * n_altup] */
+    float *laurel_l_w[MAX_LAYERS];
+    float *laurel_r_w[MAX_LAYERS];
 
     /* Single allocation base */
     void *mem_block;
