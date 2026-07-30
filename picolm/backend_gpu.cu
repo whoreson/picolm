@@ -811,6 +811,182 @@ picolm_gpu_attention_decode_kernel(
     }
 }
 
+/* ---- Split-K decode attention ----
+ * The shared-memory rewrite above fixed the accumulator bug, but grid =
+ * n_kv_heads (likely ~8 blocks total) still massively underutilizes the
+ * GPU's SM count, especially as context grows and each block serially
+ * walks more positions. This splits the KV range across multiple blocks
+ * per KV head (grid.y = n_splits), each producing a partial online-
+ * softmax state, merged by a second small kernel -- standard
+ * "flash-decoding" pattern for GQA decode with few KV heads.
+ *
+ * NOTE: unlike every other attention kernel change this session, this
+ * is NOT expected to be bit-exact with the single-pass kernel. Merging
+ * partials involves re-scaling by exp(local_max - global_max) in a
+ * different summation order than the single serial pass -- floating
+ * point addition isn't associative, so tiny (sub-ULP-accumulation-scale)
+ * differences are expected and fine. Validate against the existing
+ * PICOLM_DBG_ATTN/PICOLM_DBG_PIPELINE tolerance (1e-2/1e-3), not for
+ * exact equality -- a nonzero-but-below-threshold diff here is correct
+ * behavior, not a regression. */
+#define ATTN_DECODE_MAX_SPLITS 8
+#define ATTN_DECODE_MIN_CHUNK  64
+
+/* Partial state layout (flat float buffer, sized by the host wrapper):
+ *   partial_max: [n_heads][n_splits]
+ *   partial_sum: [n_heads][n_splits]
+ *   partial_acc: [n_heads][n_splits][head_dim]
+ * index(kv_h, split, g) = (kv_h * n_splits + split) * kv_mul + g */
+__global__ void
+picolm_gpu_attention_decode_split_kernel(
+        float *partial_max, float *partial_sum, float *partial_acc,
+        const float *q_dev,
+        const uint16_t *kv_k, const uint16_t *kv_v,
+        int layer_ordinal, int pos,
+        int n_heads, int n_kv_heads, int head_dim, int max_seq_len,
+        size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes,
+        int n_splits, int chunk_size)
+{
+    int kv_h = (int)gpuBlockIdx_x;
+    int split = (int)gpuBlockIdx_y;
+    if (kv_h >= n_kv_heads || split >= n_splits) return;
+
+    int kv_mul = n_heads / n_kv_heads;
+    int first_qh = kv_h * kv_mul;
+    int tid = gpuThreadIdx_x;
+    int n_threads = gpuBlockDim_x;
+    int idx_base = (kv_h * n_splits + split) * kv_mul;
+
+    int t0 = split * chunk_size;
+    int t1 = min(t0 + chunk_size, pos + 1);
+
+    extern __shared__ uint8_t smem[];
+    uint16_t *k_sh = (uint16_t *)smem;
+    uint16_t *v_sh = k_sh + head_dim;
+    float *reduce_sh = (float *)((uint8_t *)v_sh + head_dim * sizeof(uint16_t));
+    float *acc_sh = reduce_sh + 256;
+    float *max_score_sh = acc_sh + (size_t)kv_mul * head_dim;
+    float *sum_exp_sh = max_score_sh + kv_mul;
+    __shared__ float rescale_sh, weight_sh;
+
+    for (int i = tid; i < kv_mul * head_dim; i += n_threads) acc_sh[i] = 0.0f;
+    for (int g = tid; g < kv_mul; g += n_threads) {
+        max_score_sh[g] = -1e30f;
+        sum_exp_sh[g] = 0.0f;
+    }
+    gpuSyncthreads();
+
+    if (t0 < t1) {
+        size_t layer_base = (size_t)layer_ordinal * max_seq_len * n_kv_heads * head_dim;
+        float sqrt_hd = sqrtf((float)head_dim);
+
+        for (int t = t0; t < t1; t++) {
+            size_t k_off = layer_base + (size_t)t * kv_pos_stride_bytes / 2 + kv_h * kv_head_stride_bytes / 2;
+            for (int d = tid; d < head_dim; d += n_threads) {
+                k_sh[d] = kv_k[k_off + d];
+                v_sh[d] = kv_v[k_off + d];
+            }
+            gpuSyncthreads();
+
+            for (int g = 0; g < kv_mul; g++) {
+                const float *qg = q_dev + (size_t)(first_qh + g) * head_dim;
+                float score = 0.0f;
+                for (int d = tid; d < head_dim; d += n_threads)
+                    score += qg[d] * gpu_fp16_to_fp32(k_sh[d]);
+                reduce_sh[tid] = score;
+                gpuSyncthreads();
+                for (int s = n_threads / 2; s > 0; s >>= 1) {
+                    if (tid < s) reduce_sh[tid] += reduce_sh[tid + s];
+                    gpuSyncthreads();
+                }
+                score = reduce_sh[0] / sqrt_hd;
+
+                if (tid == 0) {
+                    if (score > max_score_sh[g]) {
+                        rescale_sh = expf(max_score_sh[g] - score);
+                        weight_sh = 1.0f;
+                        sum_exp_sh[g] = sum_exp_sh[g] * rescale_sh + 1.0f;
+                        max_score_sh[g] = score;
+                    } else {
+                        rescale_sh = 1.0f;
+                        weight_sh = expf(score - max_score_sh[g]);
+                        sum_exp_sh[g] += weight_sh;
+                    }
+                }
+                gpuSyncthreads();
+
+                float *accg = acc_sh + (size_t)g * head_dim;
+                for (int d = tid; d < head_dim; d += n_threads)
+                    accg[d] = accg[d] * rescale_sh + weight_sh * gpu_fp16_to_fp32(v_sh[d]);
+                gpuSyncthreads();
+            }
+        }
+    }
+
+    for (int g = tid; g < kv_mul; g += n_threads) {
+        partial_max[idx_base + g] = max_score_sh[g];
+        partial_sum[idx_base + g] = sum_exp_sh[g];
+    }
+    for (int i = tid; i < kv_mul * head_dim; i += n_threads)
+        partial_acc[(size_t)idx_base * head_dim + i] = acc_sh[i];
+}
+
+/* Merges n_splits partial states per KV head via the standard online-
+ * softmax merge rule, writes final normalized output. Grid = n_kv_heads. */
+__global__ void
+picolm_gpu_attention_decode_merge_kernel(
+        float *xb_out,
+        const float *partial_max, const float *partial_sum, const float *partial_acc,
+        int n_heads, int n_kv_heads, int head_dim, int n_splits)
+{
+    int kv_h = (int)gpuBlockIdx_x;
+    int kv_mul = n_heads / n_kv_heads;
+    int first_qh = kv_h * kv_mul;
+    int tid = gpuThreadIdx_x;
+    int n_threads = gpuBlockDim_x;
+
+    extern __shared__ float smem_f[];
+    float *global_max_sh = smem_f;         /* [kv_mul] */
+    float *global_sum_sh = global_max_sh + kv_mul; /* [kv_mul] */
+
+    for (int g = tid; g < kv_mul; g += n_threads) {
+        float m = -1e30f;
+        for (int sp = 0; sp < n_splits; sp++) {
+            int idx = (kv_h * n_splits + sp) * kv_mul + g;
+            float v = partial_max[idx];
+            if (v > m) m = v;
+        }
+        global_max_sh[g] = m;
+    }
+    gpuSyncthreads();
+
+    for (int g = tid; g < kv_mul; g += n_threads) {
+        float m = global_max_sh[g];
+        float s = 0.0f;
+        for (int sp = 0; sp < n_splits; sp++) {
+            int idx = (kv_h * n_splits + sp) * kv_mul + g;
+            s += partial_sum[idx] * expf(partial_max[idx] - m);
+        }
+        global_sum_sh[g] = s;
+    }
+    gpuSyncthreads();
+
+    for (int g = 0; g < kv_mul; g++) {
+        float m = global_max_sh[g];
+        float inv_sum = 1.0f / global_sum_sh[g];
+        float *xbhg = xb_out + (size_t)(first_qh + g) * head_dim;
+        for (int d = tid; d < head_dim; d += n_threads) {
+            float acc_d = 0.0f;
+            for (int sp = 0; sp < n_splits; sp++) {
+                int idx = (kv_h * n_splits + sp) * kv_mul + g;
+                float w = expf(partial_max[idx] - m);
+                acc_d += w * partial_acc[(size_t)idx * head_dim + d];
+            }
+            xbhg[d] = acc_d * inv_sum;
+        }
+    }
+}
+
 /* ---- Prefill tiled attention kernel ----
  * Processes one (query_head, token_tile) pair.
  * Tiled over KV positions with online-softmax merge.
@@ -1363,6 +1539,12 @@ typedef struct {
     float *pipe_x, *pipe_xb, *pipe_q, *pipe_k, *pipe_v,
           *pipe_attn_out, *pipe_ffn_norm, *pipe_gate, *pipe_up;
     int pipe_ready; /* 1 once the above are allocated for this device */
+    /* Split-K decode attention scratch: [n_heads*n_splits] max + sum
+     * floats, then [n_heads*n_splits*head_dim] acc floats, grown via
+     * reserve() on first use (size depends on n_splits, which varies
+     * with context length, capped at ATTN_DECODE_MAX_SPLITS). */
+    float *attn_partial;
+    size_t attn_partial_cap;
     /* Prefill batch buffers: [max_seq_len][dim] for S>1 prefill pipeline.
      * Same set of buffers as decode but sized for n_tokens rows. */
     float *pipe_x_b, *pipe_xb_b, *pipe_q_b, *pipe_k_b, *pipe_v_b,
@@ -2409,6 +2591,65 @@ picolm_gpu_kv_store_rows(int is_k, int layer_ordinal, int start_pos, int n_posit
     return 1;
 }
 
+/* Shared dispatch for both picolm_gpu_attention_decode and _dev: chooses
+ * single-pass (grid=n_kv_heads, matching the pre-split-K behavior
+ * exactly -- no regression risk for short contexts) vs split-K (grid=
+ * n_kv_heads*n_splits + a merge pass) based on how many KV positions
+ * there are to walk. xb_dev/q_dev must already be device pointers. */
+static int
+attn_decode_dispatch(float *xb_dev, const float *q_dev,
+                      int layer_ordinal, int pos,
+                      int n_heads, int n_kv_heads, int head_dim, int max_seq_len,
+                      gpu_device_ctx_t *ctx, int device) {
+    int kv_mul = n_heads / n_kv_heads;
+    size_t kv_pos_stride_bytes = (size_t)n_kv_heads * head_dim * sizeof(uint16_t);
+    size_t kv_head_stride_bytes = head_dim * sizeof(uint16_t);
+
+    int total_kv = pos + 1;
+    int n_splits = (total_kv + ATTN_DECODE_MIN_CHUNK - 1) / ATTN_DECODE_MIN_CHUNK;
+    if (n_splits > ATTN_DECODE_MAX_SPLITS) n_splits = ATTN_DECODE_MAX_SPLITS;
+    if (n_splits < 1) n_splits = 1;
+
+    size_t shared_bytes = 2 * head_dim * sizeof(uint16_t) + 256 * sizeof(float)
+                         + (size_t)kv_mul * head_dim * sizeof(float)
+                         + (size_t)kv_mul * sizeof(float)
+                         + (size_t)kv_mul * sizeof(float)
+                         + 2 * sizeof(float); /* rescale_sh + weight_sh */
+
+    if (n_splits <= 1) {
+        dim3 grid((unsigned)n_kv_heads, 1, 1);
+        picolm_gpu_attention_decode_kernel<<<grid, 256, (unsigned)shared_bytes, ctx->stream>>>(
+            xb_dev, q_dev, g_kv_k_dev[device], g_kv_v_dev[device],
+            layer_ordinal, pos, n_heads, n_kv_heads, head_dim, max_seq_len,
+            kv_pos_stride_bytes, kv_head_stride_bytes);
+        if (!gpu_ok(gpuGetLastError(), "attn decode kernel")) return 0;
+        return 1;
+    }
+
+    int chunk_size = (total_kv + n_splits - 1) / n_splits;
+    size_t need = (size_t)n_heads * n_splits * (head_dim + 2) * sizeof(float);
+    if (!reserve(&ctx->attn_partial, &ctx->attn_partial_cap, need)) return 0;
+    float *partial_max = ctx->attn_partial;
+    float *partial_sum = partial_max + (size_t)n_heads * n_splits;
+    float *partial_acc = partial_sum + (size_t)n_heads * n_splits;
+
+    dim3 grid_split((unsigned)n_kv_heads, (unsigned)n_splits, 1);
+    picolm_gpu_attention_decode_split_kernel<<<grid_split, 256, (unsigned)shared_bytes, ctx->stream>>>(
+        partial_max, partial_sum, partial_acc,
+        q_dev, g_kv_k_dev[device], g_kv_v_dev[device],
+        layer_ordinal, pos, n_heads, n_kv_heads, head_dim, max_seq_len,
+        kv_pos_stride_bytes, kv_head_stride_bytes, n_splits, chunk_size);
+    if (!gpu_ok(gpuGetLastError(), "attn decode split kernel")) return 0;
+
+    size_t merge_shared = (size_t)kv_mul * 2 * sizeof(float);
+    dim3 grid_merge((unsigned)n_kv_heads, 1, 1);
+    picolm_gpu_attention_decode_merge_kernel<<<grid_merge, 128, (unsigned)merge_shared, ctx->stream>>>(
+        xb_dev, partial_max, partial_sum, partial_acc,
+        n_heads, n_kv_heads, head_dim, n_splits);
+    if (!gpu_ok(gpuGetLastError(), "attn decode merge kernel")) return 0;
+    return 1;
+}
+
 extern "C" int
 picolm_gpu_attention_decode(float *xb_out, const float *q_host,
                              int layer_ordinal, int pos,
@@ -2417,7 +2658,7 @@ picolm_gpu_attention_decode(float *xb_out, const float *q_host,
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
     if (!g_kv_k_dev[device] || !g_kv_v_dev[device]) return 0;
-    if (head_dim > 256) return 0; /* stack array limit */
+    if (head_dim > 256) return 0;
 
     int kv_mul = n_heads / n_kv_heads;
     if (kv_mul < 1 || kv_mul > 8) return 0;
@@ -2427,36 +2668,14 @@ picolm_gpu_attention_decode(float *xb_out, const float *q_host,
     if (!reserve(&ctx->x, &ctx->x_cap, x_bytes) ||
         !reserve(&ctx->y, &ctx->y_cap, y_bytes)) return 0;
 
-    /* Upload Q */
     if (!gpu_ok(gpuMemcpy(ctx->x, q_host, x_bytes, gpuMemcpyHostToDevice),
                 "attn decode Q upload")) return 0;
 
-    /* Compute strides for kernel */
-    /* Within a layer: [pos][kv_head][head_dim] in uint16_t */
-    /* pos stride: bytes from pos P to P+1 for any kv_head */
-    size_t kv_pos_stride_bytes = (size_t)n_kv_heads * head_dim * sizeof(uint16_t);
-    /* kv_head stride: bytes from kv_head H to H+1 at same pos */
-    size_t kv_head_stride_bytes = head_dim * sizeof(uint16_t);
+    if (!attn_decode_dispatch(ctx->y, ctx->x, layer_ordinal, pos,
+                              n_heads, n_kv_heads, head_dim, max_seq_len,
+                              ctx, device)) return 0;
 
-    /* Shared memory: K(head_dim u16) + V(head_dim u16) + reduce(256 float)
-     * + acc[kv_mul][head_dim] float + max_score[kv_mul] + sum_exp[kv_mul]
-     * + rescale_sh + weight_sh (static __shared__, 8 bytes) */
-    size_t shared_bytes = 2 * head_dim * sizeof(uint16_t) + 256 * sizeof(float)
-                         + (size_t)kv_mul * head_dim * sizeof(float)
-                         + (size_t)kv_mul * sizeof(float)
-                         + (size_t)kv_mul * sizeof(float)
-                         + 2 * sizeof(float); /* rescale_sh + weight_sh */
-    int block_threads = 256;
-
-    dim3 grid((unsigned)n_kv_heads, 1, 1);
-    picolm_gpu_attention_decode_kernel<<<grid, block_threads, (unsigned)shared_bytes, ctx->stream>>>(
-        ctx->y, ctx->x,
-        g_kv_k_dev[device], g_kv_v_dev[device],
-        layer_ordinal, pos, n_heads, n_kv_heads, head_dim, max_seq_len,
-        kv_pos_stride_bytes, kv_head_stride_bytes);
-
-    if (!gpu_ok(gpuGetLastError(), "attn decode kernel") ||
-        !gpu_ok(gpuDeviceSynchronize(), "attn decode sync")) return 0;
+    if (!gpu_ok(gpuDeviceSynchronize(), "attn decode sync")) return 0;
 
     if (!gpu_ok(gpuMemcpy(xb_out, ctx->y, y_bytes, gpuMemcpyDeviceToHost),
                 "attn decode output download")) return 0;
@@ -2486,23 +2705,9 @@ picolm_gpu_attention_decode_dev(float *xb_out_dev, const float *q_dev,
     int kv_mul = n_heads / n_kv_heads;
     if (kv_mul < 1 || kv_mul > 8) return 0;
 
-    size_t kv_pos_stride_bytes = (size_t)n_kv_heads * head_dim * sizeof(uint16_t);
-    size_t kv_head_stride_bytes = head_dim * sizeof(uint16_t);
-    size_t shared_bytes = 2 * head_dim * sizeof(uint16_t) + 256 * sizeof(float)
-                         + (size_t)kv_mul * head_dim * sizeof(float)
-                         + (size_t)kv_mul * sizeof(float)
-                         + (size_t)kv_mul * sizeof(float);
-    int block_threads = 256;
-
-    dim3 grid((unsigned)n_kv_heads, 1, 1);
-    picolm_gpu_attention_decode_kernel<<<grid, block_threads, (unsigned)shared_bytes, ctx->stream>>>(
-        xb_out_dev, q_dev,
-        g_kv_k_dev[device], g_kv_v_dev[device],
-        layer_ordinal, pos, n_heads, n_kv_heads, head_dim, max_seq_len,
-        kv_pos_stride_bytes, kv_head_stride_bytes);
-
-    if (!gpu_ok(gpuGetLastError(), "attn decode kernel (dev)")) return 0;
-    return 1;
+    return attn_decode_dispatch(xb_out_dev, q_dev, layer_ordinal, pos,
+                                 n_heads, n_kv_heads, head_dim, max_seq_len,
+                                 ctx, device);
 }
 
 /* Total dynamic shared memory picolm_gpu_attention_prefill_kernel needs:
