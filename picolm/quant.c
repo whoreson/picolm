@@ -5016,10 +5016,22 @@ void fma_scale_q4_0_f32(float *dst, float correction, const void *src, int n) {
  * dot-product preservation: (H*q) . (H*k) = q . k.
  *
  * From ik_llama's fast_ht() reference implementation.
+ *
+ * 'signs' parameter: if non-NULL, apply deterministic sign flips before the
+ * butterfly stages. This breaks positional correlation in structured outliers,
+ * improving KV cache quantization accuracy. See MNN TurboQuant tq3_wht_forward_32.
+ * If signs is NULL and 'signs' is true, generate golden-ratio signs inline.
  * ================================================================== */
-void picolm_fast_ht(float *x, int n) {
+void picolm_fast_ht(float *x, int n, const float *signs) {
     /* n must be a power of 2 */
     assert((n > 0) && ((n & (n - 1)) == 0));
+
+    /* Step 0: Apply deterministic sign flips before butterfly stages.
+     * This randomizes structured outliers so the Hadamard transform
+     * distributes energy more uniformly. */
+    if (signs) {
+        for (int i = 0; i < n; i++) x[i] *= signs[i];
+    }
 
     const float ksqrt2 = 0.707106781f;
     float scale = 1.0f;
@@ -5038,11 +5050,22 @@ void picolm_fast_ht(float *x, int n) {
     for (int i = 0; i < n; ++i) x[i] *= scale;
 }
 
+/* Deterministic sign pattern for WHT randomization (golden ratio hash).
+ * signs[i] = ((i * 0x9E3779B9) >> 31) ? -1.0f : 1.0f
+ * From MNN TurboQuant: breaks positional correlation before Hadamard rotation. */
+static const float picolm_wht_signs_32[32] = {
+    1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f,
+   -1.0f,-1.0f, 1.0f,-1.0f, 1.0f, 1.0f,-1.0f, 1.0f,
+   -1.0f,-1.0f, 1.0f,-1.0f, 1.0f,-1.0f,-1.0f, 1.0f,
+   -1.0f, 1.0f, 1.0f,-1.0f, 1.0f,-1.0f,-1.0f, 1.0f,
+};
+
 void picolm_hadamard_transform(float *x, int head_dim, int nrot) {
     /* Apply fast_ht to each nrot-sized block within head_dim */
     assert(head_dim > 0 && head_dim % nrot == 0);
     int nblocks = head_dim / nrot;
     for (int b = 0; b < nblocks; b++) {
-        picolm_fast_ht(x + b * nrot, nrot);
+        const float *signs = (nrot == 32) ? picolm_wht_signs_32 : NULL;
+        picolm_fast_ht(x + b * nrot, nrot, signs);
     }
 }
