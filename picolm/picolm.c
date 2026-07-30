@@ -342,6 +342,7 @@ int main(int argc, char **argv) {
     int    max_tokens = 256;
     float  temperature = 0.8f;
     float  top_p = 0.9f;
+    int    top_k = 40;
     uint64_t seed = 42;
     int    context_override = 0;
     int    num_threads = 0; /* 0 = auto-detect from physical cores */
@@ -395,12 +396,10 @@ int main(int argc, char **argv) {
             max_tokens = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
             temperature = (float)atof(argv[++i]);
-            if (temperature >= 2.0f) {
-                fprintf(stderr, "ERROR: -t is for temperature, not number of threads (-j)\n");
-                exit(1);
-            }
-        } else if (strcmp(argv[i], "-k") == 0 && i + 1 < argc) {
+        } else if (strcmp(argv[i], "--top-p") == 0 && i + 1 < argc) {
             top_p = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "-k") == 0 && i + 1 < argc) {
+            top_k = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
             seed = (uint64_t)atoll(argv[++i]);
         } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
@@ -721,7 +720,7 @@ int main(int argc, char **argv) {
 
     /* Init sampler */
     sampler_t sampler;
-    sampler_init(&sampler, temperature, top_p, seed);
+    sampler_init(&sampler, temperature, top_p, top_k, 0.05f, seed);
 
     /* Buffer for generated text (printed at the end for easy grepping) */
     char *gen_buf = malloc(max_tokens * 16); /* avg 16 bytes per token */

@@ -1613,6 +1613,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
     int max_tokens = 256;
     float temperature = 0.8f;
     float top_p = 0.9f;
+    int top_k = 40;
     uint64_t seed = 42;
     int n_choices = 1;
     int do_stream = 0;
@@ -1656,6 +1657,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
     if (max_tokens <= 0 && !prompt_only) max_tokens = 256;
     if ((item = cJSON_GetObjectItem(req, "temperature"))) temperature = (float)cJSON_GetNumberValue(item);
     if ((item = cJSON_GetObjectItem(req, "top_p"))) top_p = (float)cJSON_GetNumberValue(item);
+    if ((item = cJSON_GetObjectItem(req, "top_k"))) top_k = (int)cJSON_GetNumberValue(item);
     if ((item = cJSON_GetObjectItem(req, "seed"))) seed = (uint64_t)cJSON_GetNumberValue(item);
     if ((item = cJSON_GetObjectItem(req, "stream")) && cJSON_IsTrue(item)) do_stream = 1;
     if ((item = cJSON_GetObjectItem(req, "timings_per_token")) && cJSON_IsTrue(item)) timings_per_token = 1;
@@ -1784,7 +1786,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         send(sock, hdr, strlen(hdr), 0);
 
         sampler_t sampler;
-        sampler_init(&sampler, temperature, top_p, seed);
+        sampler_init(&sampler, temperature, top_p, top_k, 0.05f, seed);
 
         double t_start = get_time_ms();
 
@@ -2004,7 +2006,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
 
         for (int c = 0; c < n_choices; c++) {
             sampler_t sampler;
-            sampler_init(&sampler, temperature, top_p, seed + (uint64_t)c);
+            sampler_init(&sampler, temperature, top_p, top_k, 0.05f, seed + (uint64_t)c);
 
             char *generated = (char *)malloc((size_t)max_tokens * 100 + 1);
             if (!generated) {
@@ -2400,7 +2402,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
     if (seed < 0) seed = (uint64_t)(time(NULL) ^ (uint64_t)(uintptr_t)&seed);
 
     sampler_t sampler;
-    sampler_init(&sampler, temperature, top_p, (uint64_t)seed);
+    sampler_init(&sampler, temperature, top_p, top_k, 0.05f, (uint64_t)seed);
 
     /* Build generation_settings JSON */
     cJSON *gen_settings = cJSON_CreateObject();
