@@ -34,6 +34,9 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <errno.h>
+#include <io.h>
+#include <fcntl.h>
+#include <unistd.h>
 #ifdef _MSC_VER
 #pragma comment(lib, "ws2_32.lib")
 #endif
@@ -1279,7 +1282,11 @@ static void handle_slots_post(SOCKET sock, const char *body) {
                         /* Read layer bitmap to count attention layers */
                         uint8_t *layer_map = (uint8_t *)alloca(file_layers);
                         lseek(fd, (off_t)sizeof(header) + (file_n_pos > 0 ? (off_t)file_n_pos * sizeof(uint32_t) : 0), SEEK_SET);
+#ifdef _WIN32
+                        _read(fd, (char *)layer_map, (unsigned)file_layers);
+#else
                         read(fd, layer_map, file_layers);
+#endif
                         attn_layers = 0;
                         for (int l = 0; l < file_layers; l++) {
                             if (layer_map[l]) attn_layers++;
@@ -1302,14 +1309,17 @@ static void handle_slots_post(SOCKET sock, const char *body) {
                     }
 
                     /* Seek to end of KV data and try to read checkpoint magic */
-                    lseek(fd, kv_end, SEEK_SET);
 #ifdef _WIN32
                     _lseeki64(fd, kv_end, SEEK_SET);
 #else
                     lseek(fd, kv_end, SEEK_SET);
 #endif
                     uint32_t cp_magic;
+#ifdef _WIN32
+                    ssize_t mr = (ssize_t)_read(fd, (char *)&cp_magic, sizeof(cp_magic));
+#else
                     ssize_t mr = read(fd, &cp_magic, sizeof(cp_magic));
+#endif
                     if (mr == (ssize_t)sizeof(cp_magic) && cp_magic == 0x43505350) {
                         uint32_t cp_count;
 #ifdef _WIN32
