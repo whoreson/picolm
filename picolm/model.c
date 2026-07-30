@@ -409,65 +409,40 @@ static void prepare_mmap(const void *addr, size_t size) {
 }
 
 void model_prefault(model_t *m) {
-    if (m->mmap_addr) {
-        _do_prefault(m->mmap_addr, m->mmap_size);
+    int n = m->n_splits > 0 ? m->n_splits : 1;
+    for (int i = 0; i < n; i++) {
+        if (m->splits[i].mmap_addr) {
+            _do_prefault(m->splits[i].mmap_addr, m->splits[i].mmap_size);
+        }
     }
 }
 
+/* Forward declarations for split mmap helpers */
+static int mmap_one_file(split_mmap_t *s, const char *path);
+static void munmap_one_file(split_mmap_t *s);
+static int split_path_prefix(char *prefix, size_t maxlen, const char *split_path);
+static void split_path_build(char *path, size_t maxlen, const char *prefix, int split_no, int split_count);
+
 static int mmap_file(model_t *m, const char *path) {
+    /* Store path for split derivation later */
+    strncpy(m->first_split_path, path, sizeof(m->first_split_path) - 1);
+    m->first_split_path[sizeof(m->first_split_path) - 1] = '\0';
+
+    /* Mmap as split 0 */
+    if (mmap_one_file(&m->splits[0], path) != 0) return -1;
+
+    /* Backward compat: legacy fields point to split 0 */
+    m->mmap_addr = m->splits[0].mmap_addr;
+    m->mmap_size = m->splits[0].mmap_size;
 #ifdef _WIN32
-    HANDLE fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
-                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (fh == INVALID_HANDLE_VALUE) {
-        fprintf(stderr, "Cannot open file: %s\n", path);
-        return -1;
-    }
-
-    LARGE_INTEGER fsize;
-    GetFileSizeEx(fh, &fsize);
-    m->mmap_size = (size_t)fsize.QuadPart;
-
-    HANDLE mh = CreateFileMappingA(fh, NULL, PAGE_READONLY, 0, 0, NULL);
-    if (!mh) {
-        fprintf(stderr, "CreateFileMapping failed\n");
-        CloseHandle(fh);
-        return -1;
-    }
-
-    void *addr = MapViewOfFile(mh, FILE_MAP_READ, 0, 0, 0);
-    if (!addr) {
-        fprintf(stderr, "MapViewOfFile failed\n");
-        CloseHandle(mh);
-        CloseHandle(fh);
-        return -1;
-    }
-
-    m->mmap_addr  = addr;
-    m->file_handle = fh;
-    m->map_handle  = mh;
-    prepare_mmap(addr, m->mmap_size);
+    m->file_handle = m->splits[0].file_handle;
+    m->map_handle  = m->splits[0].map_handle;
 #else
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        fprintf(stderr, "Cannot open file: %s\n", path);
-        return -1;
-    }
-
-    struct stat st;
-    fstat(fd, &st);
-    m->mmap_size = (size_t)st.st_size;
-
-    void *addr = mmap(NULL, m->mmap_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (addr == MAP_FAILED) {
-        fprintf(stderr, "mmap failed: %s\n", strerror(errno));
-        close(fd);
-        return -1;
-    }
-
-    m->mmap_addr = addr;
-    m->fd = fd;
-    prepare_mmap(addr, m->mmap_size);
+    m->fd = m->splits[0].fd;
 #endif
+    m->n_splits = 1;
+
+    prepare_mmap(m->mmap_addr, m->mmap_size);
     return 0;
 }
 
