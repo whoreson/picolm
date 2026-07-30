@@ -1932,7 +1932,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
 
             if (stopped || next == (int)tokenizer->eos_id) break;
             token = next;
-            logits = model_forward(model, token, pos + 1);
+            logits = model_forward(model, token, pos);
         }
 
         free(generated_stream);
@@ -2106,7 +2106,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
                 if (gen_count >= max_tokens) { finish_reason = "length"; break; }
                 token = next;
                 gen_count_ns++;
-                logits_ns = model_forward(model, token, pos + 1);
+                logits_ns = model_forward(model, token, pos);
             }
             total_generation_tokens += gen_count;
 
@@ -2592,7 +2592,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
                 break;
             }
             token = next;
-            logits = model_forward(model, token, pos + 1);
+            logits = model_forward(model, token, pos);
         }
 
         free(generated_stream);
@@ -2751,7 +2751,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             }
             if (gen_count >= n_predict) { stop_type = "limit"; break; }
             token = next;
-            logits_ns2 = model_forward(model, token, pos + 1);
+            logits_ns2 = model_forward(model, token, pos);
         }
 
         double t_end = get_time_ms();
