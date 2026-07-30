@@ -1188,10 +1188,14 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                 } else if (strcmp(suffix, "ffn_norm.weight") == 0) {
                     lw->post_attn_norm = ptr; lw->type_post_attn_norm = qtype;
                 } else if (strcmp(suffix, "post_attention_norm.weight") == 0) {
-                    /* In most models: post_attention_norm = ffn_norm alias.
-                     * In Gemma-3n: post_attention_norm = attn post-norm.
-                     * We set both fields and resolve in forward pass. */
-                    lw->attn_post_norm = ptr; lw->type_attn_post_norm = qtype;
+                    /* Standard models (Llama, Qwen2/3/3.5/3.6): this is the
+                     * FFN pre-norm (alias for ffn_norm).
+                     * Gemma-3n: separate attention post-norm (ffn_norm exists too). */
+                    if (cfg->is_gemma3n) {
+                        lw->attn_post_norm = ptr; lw->type_attn_post_norm = qtype;
+                    } else {
+                        lw->post_attn_norm = ptr; lw->type_post_attn_norm = qtype;
+                    }
                 } else if (strcmp(suffix, "ffn_gate.weight") == 0) {
                     lw->ffn_gate = ptr; lw->type_ffn_gate = qtype;
                 } else if (strcmp(suffix, "ffn_down.weight") == 0) {
