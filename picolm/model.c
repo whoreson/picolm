@@ -1561,6 +1561,44 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
 
     /* Quantized KV cache: separate allocation (only for attention layers)
      * Full-row GQA layout: [layer][pos] -> GQA row of n_kv_heads*head_dim */
+
+    /* Quantized KV cache requires head_dim to be a multiple of the quantization
+     * block size (32 for Q8_0/Q4_0). This is because:
+     *
+     * 1. The K/V cache stores quantized blocks per-GQA-row, but attention reads
+     *    access individual heads at head-stride offsets within that row.
+     * 2. Each quantization block (32 elements) carries its own scale factor.
+     *    If head_dim is not a multiple of 32, block boundaries fall in the
+     *    middle of a head, so a single block's scale covers elements from two
+     *    different heads. The per-head read stride cannot split blocks, so it
+     *    either truncates the head (reading fewer than head_dim elements) or
+     *    reads into the next head's data.
+     *
+     * Example: head_dim=48, Q8_0. Block 0 covers elements 0-31, Block 1 covers
+     * elements 32-63. Head 0 owns elements 0-47, but Block 0 only provides
+     * elements 0-31 with one scale, and Block 1 mixes elements 32-47 (head 0)
+     * with 48-63 (head 1) under a shared scale. Reading head 0 at stride=34
+     * bytes (1 block) yields only 32 of the 48 elements.
+     *
+     * llama.cpp enforces the same constraint in its flash attention path:
+     *   "K cache type q8_0 with block size 32 does not divide n_embd_head_k=48"
+     *
+     * We check here and fall back to FP16 for any incompatible cache type.
+     * This affects head_dim values like 48, 80, 112, ... (anything % 32 != 0). */
+    {
+        int blck_size = 32; /* Q8_0 and Q4_0 block size */
+        if (kv_type_k != KV_CACHE_F16 && c->head_dim % blck_size != 0) {
+            fprintf(stderr, "KV cache: head_dim=%d is not divisible by Q8_0/Q4_0 block size %d; "
+                    "falling back K cache to f16\n", c->head_dim, blck_size);
+            kv_type_k = KV_CACHE_F16;
+        }
+        if (kv_type_v != KV_CACHE_F16 && c->head_dim % blck_size != 0) {
+            fprintf(stderr, "KV cache: head_dim=%d is not divisible by Q8_0/Q4_0 block size %d; "
+                    "falling back V cache to f16\n", c->head_dim, blck_size);
+            kv_type_v = KV_CACHE_F16;
+        }
+    }
+
     size_t sz_k_row = kv_row_size_gqa(kv_type_k, c->n_kv_heads * c->head_dim);
     size_t sz_v_row = kv_row_size_gqa(kv_type_v, c->n_kv_heads * c->head_dim);
     size_t sz_k_head = kv_head_stride(kv_type_k, c->head_dim);
