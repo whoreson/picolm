@@ -282,6 +282,63 @@ static int str_eq(gguf_str_t s, const char *lit) {
     return s.len == n && memcmp(s.str, lit, n) == 0;
 }
 
+/* Forward declarations */
+static uint64_t skip_meta_value(reader_t *r, uint32_t vtype, int *is_numeric);
+static int gguf_format_value(char *buf, int buflen, reader_t *r, uint32_t vtype);
+
+/* Format a single scalar GGUF metadata value into buf (up to buflen-1 chars).
+ * Returns number of chars written (not counting null terminator). */
+static int gguf_format_value(char *buf, int buflen, reader_t *r, uint32_t vtype) {
+    switch (vtype) {
+        case GGUF_META_UINT8:   return snprintf(buf, buflen, "%u", read_u8(r));
+        case GGUF_META_INT8:    return snprintf(buf, buflen, "%d", (int8_t)read_u8(r));
+        case GGUF_META_UINT16:  return snprintf(buf, buflen, "%u", read_u16(r));
+        case GGUF_META_INT16:   return snprintf(buf, buflen, "%d", (int16_t)read_u16(r));
+        case GGUF_META_UINT32:  return snprintf(buf, buflen, "%u", read_u32(r));
+        case GGUF_META_INT32:   return snprintf(buf, buflen, "%d", read_i32(r));
+        case GGUF_META_UINT64:  return snprintf(buf, buflen, "%" PRIu64, read_u64(r));
+        case GGUF_META_INT64:   return snprintf(buf, buflen, "%" PRId64, (int64_t)read_u64(r));
+        case GGUF_META_FLOAT32: return snprintf(buf, buflen, "%g", read_f32(r));
+        case GGUF_META_FLOAT64: { uint64_t raw = read_u64(r); double d; memcpy(&d, &raw, 8);
+#if defined(__APPLE__) && defined(__ppc__)
+            /* Big-endian: GGUF stores LE */
+            { uint64_t sw; memcpy(&sw, &raw, 8); sw = GGUF_LE64(sw); memcpy(&d, &sw, 8); }
+#endif
+            return snprintf(buf, buflen, "%g", d); }
+        case GGUF_META_BOOL:    return snprintf(buf, buflen, "%s", read_u8(r) ? "true" : "false");
+        case GGUF_META_STRING: {
+            gguf_str_t s = read_gguf_string(r);
+            int n = (int)s.len < buflen - 1 ? (int)s.len : buflen - 1;
+            memcpy(buf, s.str, (size_t)n);
+            buf[n] = '\0';
+            return n;
+        }
+        case GGUF_META_ARRAY: {
+            uint32_t arr_type = read_u32(r);
+            uint64_t arr_len  = read_u64(r);
+            if (arr_len == 0) { buf[0] = '['; buf[1] = ']'; buf[2] = '\0'; return 2; }
+            /* Sample first few elements, skip the rest */
+            int written = snprintf(buf, buflen, "[");
+            uint64_t show = arr_len < 4 ? arr_len : 3;
+            for (uint64_t i = 0; i < show; i++) {
+                char valbuf[64];
+                gguf_format_value(valbuf, (int)sizeof(valbuf), r, arr_type);
+                written += snprintf(buf + written, buflen - written, "%s%s",
+                    i > 0 ? ", " : "", valbuf);
+            }
+            /* Skip remaining elements */
+            { int dummy;
+              for (uint64_t i = show; i < arr_len; i++) {
+                  skip_meta_value(r, arr_type, &dummy);
+              } }
+            written += snprintf(buf + written, buflen - written,
+                arr_len > 4 ? ", ..%lu..]" : "]", (unsigned long)(arr_len - show));
+            return written;
+        }
+        default: return snprintf(buf, buflen, "<type %u>", vtype);
+    }
+}
+
 static uint64_t skip_meta_value(reader_t *r, uint32_t vtype, int *is_numeric) {
     *is_numeric = 1;
     switch (vtype) {
@@ -537,6 +594,10 @@ int model_list_tensors(const char *path) {
       } }
 
     uint32_t version = read_u32(&r);
+    if (version < 2 || version > 3) {
+        fprintf(stderr, "Unsupported GGUF version: %u (only v2/v3 supported)\n", version);
+        goto out;
+    }
     uint64_t n_tensors = read_u64(&r);
     uint64_t n_metadata = read_u64(&r);
 
@@ -603,6 +664,116 @@ int model_list_tensors(const char *path) {
           *dp = '\0';
 
           APPEND("%-52s %14s %-12s %u\n", nbuf, dstr, gguf_type_name(type), type);
+      }
+      #undef APPEND
+
+      fwrite(buf, 1, pos, stdout);
+      fflush(stdout);
+    }
+
+    rc = 0;
+out:
+    free(buf);
+#ifdef _WIN32
+    if (addr) UnmapViewOfFile(addr);
+    if (mh) CloseHandle(mh);
+    if (fh != INVALID_HANDLE_VALUE) CloseHandle(fh);
+#else
+    if (addr) munmap(addr, fsize);
+    if (fd >= 0) close(fd);
+#endif
+    return rc;
+}
+
+/* ---- GGUF KV List ---- */
+
+int model_list_kv(const char *path) {
+    uint8_t *addr = NULL;
+    size_t fsize = 0;
+    char *buf = NULL;
+    int rc = -1;
+#ifdef _WIN32
+    HANDLE fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                            FILE_ATTRIBUTE_NORMAL, NULL);
+    if (fh == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "Cannot open '%s'\n", path);
+        return -1;
+    }
+    { LARGE_INTEGER sz;
+      GetFileSizeEx(fh, &sz);
+      fsize = (size_t)sz.QuadPart; }
+    HANDLE mh = CreateFileMappingA(fh, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (mh) {
+        addr = (uint8_t *)MapViewOfFile(mh, FILE_MAP_READ, 0, 0, fsize);
+    }
+#else
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { perror("open"); return -1; }
+    { struct stat st;
+      if (fstat(fd, &st) < 0) goto out;
+      addr = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+      if (addr == MAP_FAILED) { addr = NULL; goto out; }
+      fsize = (size_t)st.st_size; }
+#endif
+
+    if (!addr) {
+        fprintf(stderr, "Failed to map '%s'\n", path);
+        goto out;
+    }
+
+    reader_t r = { .data = addr, .pos = 0, .size = fsize };
+
+    { uint32_t magic = read_u32(&r);
+      if (magic != GGUF_MAGIC) {
+          fprintf(stderr, "Invalid GGUF magic: 0x%08X\n", magic);
+          goto out;
+      } }
+
+    uint32_t version = read_u32(&r);
+    if (version < 2 || version > 3) {
+        fprintf(stderr, "Unsupported GGUF version: %u (only v2/v3 supported)\n", version);
+        goto out;
+    }
+    uint64_t n_tensors = read_u64(&r);
+    uint64_t n_metadata = read_u64(&r);
+
+    /* Buffer: key + value per entry, plus header */
+    { size_t buf_size = 1024 + n_metadata * 128;
+      buf = malloc(buf_size);
+      if (!buf) {
+          fprintf(stderr, "error: out of memory\n");
+          goto out;
+      }
+
+      size_t pos = 0;
+      #define APPEND(fmt, ...) do {                                          \
+          int _r = snprintf(buf + pos, buf_size - pos, fmt, __VA_ARGS__);    \
+          if (_r > 0) pos += (size_t)_r < (buf_size - pos) ? (size_t)_r : 0; \
+      } while (0)
+
+      APPEND("GGUF v%u: %" PRIu64 " metadata entries, %" PRIu64 " tensors\n\n",
+             version, n_metadata, n_tensors);
+      APPEND("%-50s %s\n", "Key", "Value");
+      APPEND("%-50s %s\n", "---", "-----");
+
+      for (uint64_t i = 0; i < n_metadata; i++) {
+          gguf_str_t key = read_gguf_string(&r);
+          uint32_t vtype = read_u32(&r);
+
+          /* Truncate key for display */
+          char keybuf[54];
+          size_t klen = key.len < sizeof(keybuf) - 1 ? key.len : sizeof(keybuf) - 4;
+          memcpy(keybuf, key.str, klen);
+          keybuf[klen] = '\0';
+          if (key.len >= sizeof(keybuf) - 1) {
+              keybuf[klen-3] = '.'; keybuf[klen-2] = '.'; keybuf[klen-1] = '.';
+          }
+
+          /* Format the value */
+          char valbuf[80];
+          gguf_format_value(valbuf, (int)sizeof(valbuf), &r, vtype);
+
+          APPEND("%-50s %s\n", keybuf, valbuf);
       }
       #undef APPEND
 

@@ -132,6 +132,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "                       produce slightly different outputs due to float rounding order)\n");
     fprintf(stderr, "\nInfo options:\n");
     fprintf(stderr, "  --list-tensors   List all tensors (name, shape, type) and exit\n");
+    fprintf(stderr, "  --list-kv        List all KV metadata entries and exit\n");
     fprintf(stderr, "  --benchmark      Continuous benchmark loop (Ctrl-C to stop)\n");
 #ifdef PICOLM_VIZ
     fprintf(stderr, "\nVisualization options:\n");
@@ -377,6 +378,7 @@ int main(int argc, char **argv) {
 
     /* Parse arguments */
     int list_tensors = 0;
+    int list_kv = 0;
     for (int i = 1; i < argc; i++) {
         /* Positional model path: first non-dash arg */
         if (argv[i][0] != '-') {
@@ -472,6 +474,8 @@ int main(int argc, char **argv) {
 #endif
         } else if (strcmp(argv[i], "--list-tensors") == 0) {
             list_tensors = 1;
+        } else if (strcmp(argv[i], "--list-kv") == 0) {
+            list_kv = 1;
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             usage(argv[0]);
@@ -479,14 +483,15 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* --list-tensors: now that model_path is known regardless of arg order */
-    if (list_tensors) {
+    /* --list-tensors / --list-kv: now that model_path is known regardless of arg order */
+    if (list_tensors || list_kv) {
         if (!model_path) {
-            fprintf(stderr, "No model file specified for --list-tensors\n");
+            fprintf(stderr, "No model file specified\n");
             usage(argv[0]);
             return 1;
         }
-        model_list_tensors(model_path);
+        if (list_tensors) model_list_tensors(model_path);
+        else model_list_kv(model_path);
         return 0;
     }
 

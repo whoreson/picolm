@@ -284,6 +284,8 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                int k_cache_hadamard, int v_cache_hadamard);
 /* List all tensors in a GGUF file (name, dims, type) and exit. Returns 0 on success. */
 int model_list_tensors(const char *path);
+/* List all KV metadata entries in a GGUF file and exit. Returns 0 on success. */
+int model_list_kv(const char *path);
 int model_load_safetensors(model_t *m, const char *model_dir, int max_seq_len, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v,
                            int k_cache_hadamard, int v_cache_hadamard);
 
