@@ -1634,14 +1634,18 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         s->kv_hadamard_v = 1;
     }
     if (s->kv_hadamard_k || s->kv_hadamard_v) {
-        /* Determine block size: largest power of 2 that divides head_dim, at least 64 */
-        int nrot = 64;
-        if (c->head_dim >= 128 && c->head_dim % 128 == 0) nrot = 128;
-        if (c->head_dim >= 256 && c->head_dim % 256 == 0) nrot = 256;
-        assert(c->head_dim % nrot == 0 && "Hadamard requires head_dim multiple of nrot");
-        s->kv_hadamard_size = nrot;
-        fprintf(stderr, "KV Hadamard rotation enabled: K=%d V=%d (nrot=%d)\n",
-                s->kv_hadamard_k, s->kv_hadamard_v, nrot);
+        /* Determine block size: largest power of 2 that divides head_dim */
+        int nrot = c->head_dim & ~(c->head_dim - 1); /* largest power-of-2 factor */
+        if (nrot < 2) {
+            fprintf(stderr, "KV Hadamard: head_dim=%d has no power-of-2 divisor >= 2, "
+                    "disabling Hadamard rotation\n", c->head_dim);
+            s->kv_hadamard_k = 0;
+            s->kv_hadamard_v = 0;
+        } else {
+            s->kv_hadamard_size = nrot;
+            fprintf(stderr, "KV Hadamard rotation enabled: K=%d V=%d (nrot=%d)\n",
+                    s->kv_hadamard_k, s->kv_hadamard_v, nrot);
+        }
     }
 
     /* Carve float pointers */
