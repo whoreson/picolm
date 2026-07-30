@@ -1691,7 +1691,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
     if (srv.use_qwen_tok) {
         n_prompt = qwen_tokenize_encode(&srv.qwen_enc, prompt, ptokens, max_pt);
     } else {
-        n_prompt = tokenizer_encode(tokenizer, prompt, ptokens, max_pt, 1);
+        n_prompt = tokenizer_encode(tokenizer, prompt, ptokens, max_pt, srv.model.tok_add_bos);
     }
     fprintf(stderr, "[server] %.1fms: tokenized %d tokens (%.1fms)\n", get_time_ms() - t0, n_prompt, get_time_ms() - t_tok);
     /* If the encoder produced 0 tokens (empty prompt), insert BOS */
@@ -2317,7 +2317,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         if (srv.use_qwen_tok) {
             n_prompt = qwen_tokenize_encode(&srv.qwen_enc, prompt, ptokens, max_pt);
         } else {
-            n_prompt = tokenizer_encode(tokenizer, prompt, ptokens, max_pt, 1);
+            n_prompt = tokenizer_encode(tokenizer, prompt, ptokens, max_pt, srv.model.tok_add_bos);
         }
         /* If the encoder produced 0 tokens (empty prompt), insert BOS */
         if (n_prompt == 0) {

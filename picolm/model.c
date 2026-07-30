@@ -825,6 +825,8 @@ static int parse_gguf(model_t *m, int max_seq_len) {
     cfg->weight_type = GGUF_TYPE_F16;
     m->tok_bos_id = 1;
     m->tok_eos_id = 2;
+    m->tok_add_bos = 1;
+    m->tok_add_space_prefix = 1;
 
     for (uint64_t i = 0; i < n_metadata; i++) {
         gguf_str_t key = read_gguf_string(&r);
@@ -998,19 +1000,26 @@ static int parse_gguf(model_t *m, int max_seq_len) {
         } else if (str_eq(key, "tokenizer.ggml.eos_token_id")) {
             int dummy; m->tok_eos_id = (uint32_t)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "tokenizer.ggml.pre")) {
-            /* Detect space marker type for tokenization */
+            /* Detect space marker type for tokenization.
+             * GPT-2 BPE tokenizers use literal spaces, not U+2581. */
             if (vtype == GGUF_META_STRING) {
                 gguf_str_t pre = read_gguf_string(&r);
                 if (pre.len >= 6 && strncmp(pre.str, "smollm", 6) == 0) {
                     m->tok_space_marker = 1; /* U+0100 */
                 } else if (pre.len >= 6 && strncmp(pre.str, "qwen35", 6) == 0) {
                     m->tok_space_marker = 3; /* qwen35: U+0100, no prefix on first token */
+                } else if (pre.len >= 5 && strncmp(pre.str, "gpt-2", 5) == 0) {
+                    m->tok_space_marker = 1; /* GPT-2 BPE: U+0100 space marker */
                 } else {
-                    m->tok_space_marker = 0; /* U+2581 (default) */
+                    m->tok_space_marker = 0; /* U+2581 (default, SPM models) */
                 }
             } else {
                 int dummy; skip_meta_value(&r, vtype, &dummy);
             }
+        } else if (str_eq(key, "tokenizer.ggml.add_bos_token")) {
+            int dummy; m->tok_add_bos = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "tokenizer.ggml.add_space_prefix")) {
+            int dummy; m->tok_add_space_prefix = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "tokenizer.ggml.tokens")) {
             if (vtype != GGUF_META_ARRAY) {
                 int dummy; skip_meta_value(&r, vtype, &dummy);

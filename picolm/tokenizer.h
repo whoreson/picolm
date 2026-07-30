@@ -11,9 +11,10 @@ typedef struct {
     int    *sorted_idx;  /* indices sorted by vocab string for binary search */
     uint32_t bos_id;
     uint32_t eos_id;
-    int space_marker; /* 0=U+2581 (default), 1=U+0100 (smollm), 2=literal space (qwen35/gpt2) */
+    int space_marker; /* 0=U+2581 (default), 1=U+0100 (smollm), 2=literal space (qwen35/gpt2), 3=qwen35 */
     const int32_t *token_type;  /* token_type[i] = type of token i (3=control, 4=user_defined) */
     int n_token_type;           /* number of entries in token_type array */
+    int add_space_prefix;       /* prepend space marker to input (from GGUF add_space_prefix) */
 } tokenizer_t;
 
 /* Load tokenizer data from GGUF metadata pointers in model.

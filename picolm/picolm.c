@@ -746,7 +746,7 @@ int main(int argc, char **argv) {
             n_prompt = qwen_tokenize_encode(&qwen_enc, prompt, prompt_tokens, max_prompt_tokens);
         }
     } else {
-        n_prompt = tokenizer_encode(&tokenizer, prompt, prompt_tokens, max_prompt_tokens, 1);
+        n_prompt = tokenizer_encode(&tokenizer, prompt, prompt_tokens, max_prompt_tokens, model.tok_add_bos);
     }
     fprintf(stderr, "%0.1fms: tokenized %d tokens\n", (double)(clock() - t_start_token) / CLOCKS_PER_SEC * 1000.0, n_prompt);
     fprintf(stderr, "Prompt tokens (%d):", n_prompt);

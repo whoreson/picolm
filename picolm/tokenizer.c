@@ -52,6 +52,7 @@ int tokenizer_load(tokenizer_t *t, const model_t *m) {
     t->bos_id = m->tok_bos_id;
     t->eos_id = m->tok_eos_id;
     t->space_marker = m->tok_space_marker;
+    t->add_space_prefix = m->tok_add_space_prefix;
     t->token_type = NULL;
     t->n_token_type = 0;
 
@@ -140,22 +141,26 @@ int tokenizer_encode(const tokenizer_t *t, const char *text, int *tokens, int ma
      * - Qwen3.5: U+0100 but NO prefix on first token (marker=3) */
     const unsigned char *sp;
     int sp_len;
-    int prepend_space = 1;
     if (t->space_marker == 1) {
         static const unsigned char sp_0100[] = {0xC4, 0xA0};
         sp = sp_0100; sp_len = 2;
     } else if (t->space_marker == 2) {
         static const unsigned char sp_literal[] = {' '};
         sp = sp_literal; sp_len = 1;
-        prepend_space = 0;
     } else if (t->space_marker == 3) {
         static const unsigned char sp_0100[] = {0xC4, 0xA0};
         sp = sp_0100; sp_len = 2;
-        prepend_space = 0; /* qwen35: no space prefix on first token */
     } else {
         static const unsigned char sp_2581[] = {0xE2, 0x96, 0x81};
         sp = sp_2581; sp_len = 3;
     }
+
+    /* Determine whether to prepend a space marker.
+     * Controlled by the GGUF key tokenizer.ggml.add_space_prefix.
+     * - SentencePiece (llama) models: typically true (implicit)
+     * - GPT-2 BPE models: typically false
+     * - Qwen3.5 (marker=3): never prepend */
+    int prepend_space = (t->space_marker != 3) && t->add_space_prefix;
 
     int text_len = (int)strlen(text);
     int norm_cap = text_len * (sp_len + 1) + (prepend_space ? sp_len : 0) + 4;
