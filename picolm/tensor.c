@@ -17,6 +17,7 @@
 #else
 #include <pthread.h>
 #include <unistd.h>
+#include <dirent.h>
 #endif
 
 #ifdef PICOLM_GPU
@@ -118,6 +119,104 @@ static int n_threads = 1;
 
 /* ---- Physical core enumeration ---- */
 
+/* ---- big.LITTLE CPU group detection (Linux only) ---- */
+
+#ifndef _WIN32
+
+typedef struct {
+    int ids[32];        /* CPU logical IDs in this group */
+    int nids;           /* number of IDs */
+    uint32_t min_freq;  /* kHz (cpufreq units) */
+    uint32_t max_freq;  /* kHz */
+} cpu_group_t;
+
+/* Detect CPU core groups from cpufreq topology.
+ * Returns number of groups found (0 = fallback to single group).
+ * Groups are sorted by max_freq ascending (little first, big last). */
+static int detect_cpu_groups(cpu_group_t groups[], int max_groups) {
+    DIR *root = opendir("/sys/devices/system/cpu/cpufreq");
+    if (!root) return 0;
+
+    int ng = 0;
+    struct dirent *ent;
+    while ((ent = readdir(root)) != NULL && ng < max_groups) {
+        /* Match policy0, policy1, etc. */
+        if (ent->d_name[0] != 'p') continue;
+        if (strlen(ent->d_name) > 120) continue; /* sanity limit */
+        char dir[256];
+        snprintf(dir, sizeof(dir), "/sys/devices/system/cpu/cpufreq/%s", ent->d_name);
+
+        cpu_group_t *g = &groups[ng];
+        g->nids = 0;
+        g->min_freq = 0;
+        g->max_freq = 0;
+
+        /* Read affected_cpus */
+        {
+            char path[384];
+            snprintf(path, sizeof(path), "%s/affected_cpus", dir);
+            FILE *f = fopen(path, "r");
+            if (f) {
+                char buf[256] = {0};
+                if (fgets(buf, sizeof(buf), f)) {
+                    char *tok = strtok(buf, ", \t\n");
+                    while (tok && g->nids < 32) {
+                        g->ids[g->nids++] = atoi(tok);
+                        tok = strtok(NULL, ", \t\n");
+                    }
+                }
+                fclose(f);
+            }
+        }
+
+        /* Read cpuinfo_min_freq and cpuinfo_max_freq (in kHz) */
+        {
+            char path[384];
+            FILE *f;
+            snprintf(path, sizeof(path), "%s/cpuinfo_min_freq", dir);
+            f = fopen(path, "r");
+            if (f) { fscanf(f, "%u", &g->min_freq); fclose(f); }
+            snprintf(path, sizeof(path), "%s/cpuinfo_max_freq", dir);
+            f = fopen(path, "r");
+            if (f) { fscanf(f, "%u", &g->max_freq); fclose(f); }
+        }
+
+        if (g->nids > 0) ng++;
+    }
+    closedir(root);
+
+    /* Sort groups by max_freq ascending (bubble sort, small N) */
+    for (int i = 0; i < ng - 1; i++) {
+        for (int j = i + 1; j < ng; j++) {
+            if (groups[j].max_freq < groups[i].max_freq) {
+                cpu_group_t tmp = groups[i];
+                groups[i] = groups[j];
+                groups[j] = tmp;
+            }
+        }
+    }
+
+    /* Merge groups with same max_freq */
+    int merged = 0;
+    for (int i = 0; i < ng; i++) {
+        if (merged > 0 && groups[merged-1].max_freq == groups[i].max_freq) {
+            cpu_group_t *prev = &groups[merged-1];
+            for (int k = 0; k < groups[i].nids; k++) {
+                if (prev->nids < 32) prev->ids[prev->nids++] = groups[i].ids[k];
+            }
+            if (groups[i].min_freq < prev->min_freq) prev->min_freq = groups[i].min_freq;
+        } else {
+            if (merged > 0 && merged != i) {
+                groups[merged] = groups[i];
+            }
+            merged++;
+        }
+    }
+    return merged;
+}
+
+#endif /* _WIN32 */
+
 /* Count physical CPU cores (excluding hyperthread siblings).
  * Linux: parses /sys/devices/system/cpu/ topology files.
  * Windows: uses GetLogicalProcessorInformation with RelationProcessorCore.
@@ -194,12 +293,44 @@ void tensor_set_threads(int t) {
 }
 
 /* Return the default thread count based on physical core enumeration.
- * Uses only physical cores (no HT siblings) for generation performance. */
+ * Uses only physical cores (no HT siblings) for generation performance.
+ * On big.LITTLE systems, prefers big cores only. */
 int tensor_default_threads(void) {
     int cores = count_physical_cores();
     if (cores < 1) cores = 4; /* fallback */
+
+#ifndef _WIN32
+    /* Try to detect big.LITTLE groups. If found, prefer big cores only. */
+    cpu_group_t groups[8];
+    int ng = detect_cpu_groups(groups, 8);
+    if (ng >= 2) {
+        /* Multiple groups detected: use only the fastest (last group = big cores) */
+        int big_cores = groups[ng - 1].nids;
+        fprintf(stderr, "CPU: detected %d groups, using %d big cores (skipping %d little)\n",
+                ng, big_cores, cores - big_cores);
+        cores = big_cores;
+    }
+#endif
+
     if (cores > MAX_THREADS) cores = MAX_THREADS;
     return cores;
+}
+
+/* Return the number of big cores on a big.LITTLE system, or total physical
+ * cores if no big.LITTLE detected. Returns 0 if detection fails. */
+int tensor_get_big_cores(void) {
+#ifdef _WIN32
+    int cores = count_physical_cores();
+    return (cores > 0) ? cores : 0;
+#else
+    cpu_group_t groups[8];
+    int ng = detect_cpu_groups(groups, 8);
+    if (ng >= 2) {
+        return groups[ng - 1].nids;
+    }
+    int cores = count_physical_cores();
+    return (cores > 0) ? cores : 0;
+#endif
 }
 
 /* Threshold: skip threading if output vector is smaller than this.
