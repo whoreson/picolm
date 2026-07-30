@@ -35,6 +35,9 @@
 #endif
 #ifdef _WIN32
 #include <windows.h>
+#include <io.h>
+#include <fcntl.h>
+#include <unistd.h>
 #define SECURITY_WIN32
 #include <security.h>
 #include <accctrl.h>
