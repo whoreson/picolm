@@ -1175,6 +1175,11 @@ static int parse_gguf(model_t *m, int max_seq_len) {
         }
     }
 
+    /* Apply user-specified context length override (-c option) */
+    if (max_seq_len > 0) {
+        cfg->max_seq_len = max_seq_len;
+    }
+
     /* ---- Split GGUF: detect and prepare ---- */
     {
         int total_splits = m->split_count > 1 ? m->split_count : 1;

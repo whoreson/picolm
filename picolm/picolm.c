@@ -427,8 +427,6 @@ int main(int argc, char **argv) {
             mem_mb = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--prefault") == 0) {
             do_prefault = 1;
-        } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
-            context_override = atoi(argv[++i]);
         } else if ((strcmp(argv[i], "-ctk") == 0 || strcmp(argv[i], "-ctv") == 0) && i + 1 < argc) {
             const char *typestr = argv[++i];
             kv_cache_type_t *tgt = (strcmp(argv[i-1], "-ctk") == 0) ? &kv_type_k : &kv_type_v;
