@@ -742,6 +742,8 @@ static float *prefill_with_checkpoints(SOCKET sock, model_t *model,
 
 static int server_init(const char *model_path, int num_threads, int do_prefault, int context_override, int mem_mb,
                        int checkpoint_max, int checkpoint_interval, int checkpoint_interval_gen, int checkpoint_tail_offset,
+                       kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v,
+                       int k_cache_hadamard, int v_cache_hadamard,
                        int viz_port, int viz_width, int viz_height) {
 #ifndef PICOLM_VIZ
     (void)viz_port; (void)viz_width; (void)viz_height;
@@ -754,7 +756,7 @@ static int server_init(const char *model_path, int num_threads, int do_prefault,
     fprintf(stderr, "[server] Loading model: %s\n", model_path);
     fp16_table_init();
 
-    if (model_load(&srv.model, model_path, context_override, KV_CACHE_F16, KV_CACHE_F16, 0, 0) != 0) {
+    if (model_load(&srv.model, model_path, context_override, kv_type_k, kv_type_v, k_cache_hadamard, v_cache_hadamard) != 0) {
         fprintf(stderr, "[server] Failed to load model\n");
         return -1;
     }
@@ -3045,26 +3047,24 @@ static void handle_request(SOCKET sock) {
 
 /* ---- Server Main Loop ---- */
 
-int server_main(int port, const char *host, const char *model_path, int num_threads, int do_prefault, int context_override, int mem_mb,
-                int checkpoint_max, int checkpoint_interval, int checkpoint_interval_gen, int checkpoint_tail_offset,
-                const char *slot_save_path,
-                int viz_port, int viz_width, int viz_height) {
-    srv.port = port;
-    strncpy(srv.host, host, sizeof(srv.host) - 1);
-    srv.model_path = model_path;
+int server_main(server_config_t *sc) {
+    srv.port = sc->port;
+    strncpy(srv.host, sc->host, sizeof(srv.host) - 1); srv.host[sizeof(srv.host) - 1] = '\0';
+    srv.model_path = sc->model_path;
     srv.running = 1;
 
     /* Slot save path */
-    if (slot_save_path && strlen(slot_save_path) > 0) {
-        strncpy(srv.slot_save_path, slot_save_path, sizeof(srv.slot_save_path) - 1);
+    if (sc->slot_save_path && strlen(sc->slot_save_path) > 0) {
+        strncpy(srv.slot_save_path, sc->slot_save_path, sizeof(srv.slot_save_path) - 1);
     } else {
         srv.slot_save_path[0] = '\0';
     }
 
     /* Load model once at startup */
-    if (server_init(model_path, num_threads, do_prefault, context_override, mem_mb,
-                    checkpoint_max, checkpoint_interval, checkpoint_interval_gen, checkpoint_tail_offset,
-                    viz_port, viz_width, viz_height) != 0) {
+    if (server_init(sc->model_path, sc->num_threads, sc->do_prefault, sc->context_override, sc->mem_mb,
+                    sc->checkpoint_max, sc->checkpoint_interval, sc->checkpoint_interval_gen, sc->checkpoint_tail_offset,
+                    sc->kv_type_k, sc->kv_type_v, sc->k_cache_hadamard, sc->v_cache_hadamard,
+                    sc->viz_port, sc->viz_width, sc->viz_height) != 0) {
         return -1;
     }
 
@@ -3098,15 +3098,15 @@ int server_main(int port, const char *host, const char *model_path, int num_thre
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_port = htons((uint16_t)port);
-    if (strcmp(host, "0.0.0.0") == 0 || strcmp(host, "::") == 0)
+    addr.sin_port = htons((uint16_t)sc->port);
+    if (strcmp(sc->host, "0.0.0.0") == 0 || strcmp(sc->host, "::") == 0)
         addr.sin_addr.s_addr = INADDR_ANY;
     else
-        addr.sin_addr.s_addr = inet_addr(host);
+        addr.sin_addr.s_addr = inet_addr(sc->host);
 
     if (bind(srv.listen_sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         fprintf(stderr, "[server] Failed to bind to %s:%d: %s\n",
-                host, port,
+                sc->host, sc->port,
 #ifdef _WIN32
                 "WSAGetLastError()"
 #else
@@ -3128,7 +3128,7 @@ int server_main(int port, const char *host, const char *model_path, int num_thre
         return -1;
     }
 
-    fprintf(stderr, "[server] Listening on %s:%d (model: %s)\n", host, port, model_path);
+    fprintf(stderr, "[server] Listening on %s:%d (model: %s)\n", sc->host, sc->port, sc->model_path);
     fprintf(stderr, "[server] Endpoints:\n");
     fprintf(stderr, "  POST /v1/chat/completions\n");
     fprintf(stderr, "  POST /v1/completions\n");

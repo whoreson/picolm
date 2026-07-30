@@ -4,6 +4,7 @@
 #include "sampler.h"
 #include "grammar.h"
 #include "qwen_tokenize.h"
+#include "picolm_server.h"
 #ifdef PICOLM_VIZ
 #include "viz.h"
 #endif
@@ -541,10 +542,6 @@ int main(int argc, char **argv) {
         }
 #endif
         fp16_table_init();
-        extern int server_main(int port, const char *host, const char *model_path, int num_threads, int do_prefault, int context_override, int mem_mb,
-                               int checkpoint_max, int checkpoint_interval, int checkpoint_interval_gen, int checkpoint_tail_offset,
-                               const char *slot_save_path,
-                               int viz_port, int viz_width, int viz_height);
         /* When --viz is specified in server mode, pass the viz parameters through.
          * When --viz is not specified, viz_port=0 so server_init skips viz. */
         int srv_viz_port = 0, srv_viz_width = 800, srv_viz_height = 480;
@@ -553,10 +550,27 @@ int main(int argc, char **argv) {
         srv_viz_width = viz_width;
         srv_viz_height = viz_height;
 #endif
-        return server_main(server_port, server_host, model_path, num_threads, do_prefault, context_override, mem_mb,
-                           checkpoint_max, checkpoint_interval, checkpoint_interval_gen, checkpoint_tail_offset,
-                           slot_save_path,
-                           srv_viz_port, srv_viz_width, srv_viz_height);
+        server_config_t sc = {0};
+        sc.port = server_port;
+        memcpy(sc.host, server_host, sizeof(server_host)); sc.host[sizeof(sc.host) - 1] = '\0';
+        sc.model_path = model_path;
+        sc.num_threads = num_threads;
+        sc.do_prefault = do_prefault;
+        sc.context_override = context_override;
+        sc.mem_mb = mem_mb;
+        sc.checkpoint_max = checkpoint_max;
+        sc.checkpoint_interval = checkpoint_interval;
+        sc.checkpoint_interval_gen = checkpoint_interval_gen;
+        sc.checkpoint_tail_offset = checkpoint_tail_offset;
+        sc.slot_save_path = slot_save_path;
+        sc.kv_type_k = kv_type_k;
+        sc.kv_type_v = kv_type_v;
+        sc.k_cache_hadamard = k_cache_hadamard;
+        sc.v_cache_hadamard = v_cache_hadamard;
+        sc.viz_port = srv_viz_port;
+        sc.viz_width = srv_viz_width;
+        sc.viz_height = srv_viz_height;
+        return server_main(&sc);
     }
 
     if (!prompt) {
