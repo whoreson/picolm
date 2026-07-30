@@ -484,6 +484,114 @@ static void munmap_file(model_t *m) {
     m->mmap_addr = NULL;
 }
 
+/* ================================================================
+ * Split GGUF support
+ * ================================================================
+ *
+ * GGUF split files use the naming convention:
+ *   <prefix>-NNNNN-of-NNNNN.gguf  (1-based, zero-padded to 5 digits)
+ *
+ * Each split is a complete, valid GGUF file. Only the first split
+ * (index 0) contains full metadata. Tensor offsets are per-file.
+ */
+
+#define MAX_SPLIT_FILES 64
+
+/* Extract the prefix from a split file path.
+ * Given "/path/model-Q4_0-split-00001-of-00003.gguf" -> "/path/model-Q4_0-split"
+ * Returns 1 on success, 0 on failure (path doesn't match split convention). */
+static int split_path_prefix(char *prefix, size_t maxlen, const char *split_path) {
+    /* Find the last "-NNNNN-of-NNNNN.gguf" suffix */
+    const char *dash = strrchr(split_path, '-');
+    if (!dash) return 0;
+
+    /* Check the suffix matches the split pattern: -DDDDD-of-DDDDD.gguf */
+    /* Format: -00001-of-00003.gguf = 21 chars after the dash */
+    /* We need at least: -XXXXX-of-XXXXX.gguf */
+    size_t dashlen = strlen(dash);
+    if (dashlen < 21) return 0; /* "-00001-of-00001.gguf" is exactly 21 chars */
+
+    /* Verify the pattern: -DDDDD-of-DDDDD.gguf */
+    if (dash[1] < '0' || dash[1] > '9') return 0;
+    if (dash[5] != '-' || dash[6] != 'o' || dash[7] != 'f' || dash[8] != '-') return 0;
+    if (dash[9] < '0' || dash[9] > '9') return 0;
+    if (dash[14] != '.' || strcmp(dash + 14, ".gguf") != 0) return 0;
+
+    size_t plen = (size_t)(dash - split_path);
+    if (plen >= maxlen) return 0;
+    memcpy(prefix, split_path, plen);
+    prefix[plen] = '\0';
+    return 1;
+}
+
+/* Construct a split file path from prefix, split_no (0-based), and split_count. */
+static void split_path_build(char *path, size_t maxlen, const char *prefix, int split_no, int split_count) {
+    snprintf(path, maxlen, "%s-%05d-of-%05d.gguf", prefix, split_no + 1, split_count);
+}
+
+/* Mmap a single split file into a split_mmap_t struct. */
+static int mmap_one_file(split_mmap_t *s, const char *path) {
+#ifdef _WIN32
+    HANDLE fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (fh == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "Cannot open split file: %s\n", path);
+        return -1;
+    }
+    LARGE_INTEGER fsize;
+    GetFileSizeEx(fh, &fsize);
+    s->mmap_size = (size_t)fsize.QuadPart;
+    HANDLE mh = CreateFileMappingA(fh, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!mh) {
+        fprintf(stderr, "CreateFileMapping failed for: %s\n", path);
+        CloseHandle(fh);
+        return -1;
+    }
+    void *addr = MapViewOfFile(mh, FILE_MAP_READ, 0, 0, 0);
+    if (!addr) {
+        fprintf(stderr, "MapViewOfFile failed for: %s\n", path);
+        CloseHandle(mh);
+        CloseHandle(fh);
+        return -1;
+    }
+    s->mmap_addr  = addr;
+    s->file_handle = fh;
+    s->map_handle  = mh;
+#else
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "Cannot open split file: %s\n", path);
+        return -1;
+    }
+    struct stat st;
+    fstat(fd, &st);
+    s->mmap_size = (size_t)st.st_size;
+    void *addr = mmap(NULL, s->mmap_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (addr == MAP_FAILED) {
+        fprintf(stderr, "mmap failed for split file %s: %s\n", path, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    s->mmap_addr = addr;
+    s->fd = fd;
+#endif
+    return 0;
+}
+
+/* Unmap a single split file. */
+static void munmap_one_file(split_mmap_t *s) {
+    if (!s->mmap_addr) return;
+#ifdef _WIN32
+    UnmapViewOfFile(s->mmap_addr);
+    CloseHandle(s->map_handle);
+    CloseHandle(s->file_handle);
+#else
+    munmap(s->mmap_addr, s->mmap_size);
+    close(s->fd);
+#endif
+    s->mmap_addr = NULL;
+}
+
 /* ---- Tensor listing ---- */
 
 static const char *gguf_type_name(uint32_t type) {
@@ -5508,7 +5616,11 @@ void model_free(model_t *m) {
         free(m->state.kv_block);
         m->state.kv_block = NULL;
     }
-    munmap_file(m);
+    /* Unmap all split files */
+    for (int i = 0; i < m->n_splits; i++) {
+        munmap_one_file(&m->splits[i]);
+    }
+    m->mmap_addr = NULL;
 }
 
 /* ================================================================

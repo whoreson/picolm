@@ -286,6 +286,21 @@ typedef struct {
     int kv_layer_ordinal[MAX_LAYERS];
 } run_state_t;
 
+/* ---- Split GGUF mmap entries ---- */
+
+#define MAX_SPLIT_FILES 64
+
+typedef struct {
+    void  *mmap_addr;
+    size_t mmap_size;
+#ifdef _WIN32
+    void  *file_handle;
+    void  *map_handle;
+#else
+    int    fd;
+#endif
+} split_mmap_t;
+
 /* ---- Model ---- */
 
 typedef struct {
@@ -298,15 +313,22 @@ typedef struct {
     /* SSM chunk size for batched prefill (default 64, 0=auto) */
     int             ssm_chunk_size;
 
-    /* mmap bookkeeping */
-    void  *mmap_addr;
-    size_t mmap_size;
+    /* mmap bookkeeping - array for split files, legacy fields for compat */
+    void     *mmap_addr;      /* kept for backward compat, points to splits[0].mmap_addr */
+    size_t    mmap_size;
 #ifdef _WIN32
-    void  *file_handle;
-    void  *map_handle;
+    void     *file_handle;
+    void     *map_handle;
 #else
-    int    fd;
+    int       fd;
 #endif
+    split_mmap_t splits[MAX_SPLIT_FILES]; /* one per split file */
+    int        n_splits;                   /* number of split files (1 = non-split) */
+    int        split_count;                /* split.count from metadata (0 if not split) */
+    int        split_no;                   /* split.no of first split (0 if not split) */
+    int        split_tensors_count;        /* split.tensors.count total (0 if not split) */
+    size_t     tensor_data_base[MAX_SPLIT_FILES]; /* tensor data base per split */
+    char       first_split_path[512];      /* path to first split file */
 
     /* Tokenizer data offsets (filled by GGUF parser, used by tokenizer_load) */
     const void *tok_tokens_data;
