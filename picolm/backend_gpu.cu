@@ -538,6 +538,78 @@ picolm_q8_q8_matmul(float *y,
         y[(size_t)s * O + o] = (float)partial[0];
 }
 
+/* Number of sequence positions per tile in the tiled Q8_0 matmul.
+ * Shared memory usage (row_bytes, up to ~15KB for a 14336-wide FFN row)
+ * doesn't depend on this constant -- positions are handled in an inner
+ * loop, not concurrently. Stays well under the default 48KB/block. */
+#define Q8_TILE_S 32
+
+/* Tiled Q8_0 matmul: loads each weight row into shared memory once per
+ * tile of Q8_TILE_S query positions, then reuses it in the inner loop.
+ * Original reads the same weight row from global memory independently
+ * for every (output_row, s) pair -- for S=291 prefill, that's 291
+ * redundant global reads of the same row.
+ * Same arithmetic, same accumulation order per (o,s) as original --
+ * bit-exact. For S=1 (decode) reduces to one tile of size 1. */
+__global__ void
+picolm_q8_q8_matmul_tiled(float *y,
+                           const int8_t *xq, const float *xd,
+                           const void *weights,
+                           int S, int I, int O, int row_bytes) {
+    int o = gpuBlockIdx_x;
+    int tile = gpuBlockIdx_y;
+    if (o >= O) return;
+    int s0 = tile * Q8_TILE_S;
+    if (s0 >= S) return;
+    int s_count = min(Q8_TILE_S, S - s0);
+
+    int n_blocks = I / 32;
+    const uint8_t *wrow = (const uint8_t *)weights + (size_t)o * row_bytes;
+
+    /* Load weight row into shared memory (dynamic portion) */
+    extern __shared__ uint8_t wrow_sh[];
+    for (int b = gpuThreadIdx_x; b < row_bytes; b += gpuBlockDim_x) {
+        wrow_sh[b] = wrow[b];
+    }
+    gpuSyncthreads();
+
+    __shared__ double partial[256];
+
+    for (int ls = 0; ls < s_count; ls++) {
+        int s = s0 + ls;
+        const int8_t *xrow = xq + (size_t)s * I;
+        const float *xdrow = xd + (size_t)s * n_blocks;
+
+        double sum = 0.0;
+        for (int bi = gpuThreadIdx_x; bi < n_blocks; bi += gpuBlockDim_x) {
+            const uint8_t *b = wrow_sh + (size_t)bi * GPU_BLOCK_Q8_0_SIZE;
+            uint16_t wd_raw = b[0] | ((uint16_t)b[1] << 8);
+            float wd = gpu_fp16_to_fp32(wd_raw);
+            float xdv = xdrow[bi];
+
+            const int8_t *wq = (const int8_t *)(b + 2);
+            const int8_t *xqp = xrow + bi * 32;
+
+            int32_t acc = 0;
+            for (int j = 0; j < 32; j++)
+                acc += (int32_t)wq[j] * (int32_t)xqp[j];
+
+            sum += (double)acc * (double)wd * (double)xdv;
+        }
+
+        partial[gpuThreadIdx_x] = sum;
+        gpuSyncthreads();
+        for (int n = gpuBlockDim_x >> 1; n; n >>= 1) {
+            if (gpuThreadIdx_x < n)
+                partial[gpuThreadIdx_x] += partial[gpuThreadIdx_x + n];
+            gpuSyncthreads();
+        }
+        if (!gpuThreadIdx_x)
+            y[(size_t)s * O + o] = (float)partial[0];
+        gpuSyncthreads(); /* clean up before next ls iteration */
+    }
+}
+
 /* ---- silu_mul kernel ----
  * Element-wise: gate[i] = gate[i] / (1 + exp(-gate[i])) * up[i] */
 __global__ void
@@ -1640,10 +1712,20 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
         if (!gpu_ok(gpuGetLastError(), "q8 quantize") ||
             !gpu_ok(gpuDeviceSynchronize(), "q8 quantize sync")) return 0;
 
-        /* Step 2: Q8_0 x Q8_0 integer MAC matmul */
-        dim3 grid((unsigned)O, (unsigned)S);
-        picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
-            ctx->y, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes);
+        /* Step 2: Q8_0 x Q8_0 integer MAC matmul, tiled over S to reuse
+         * each weight row from shared memory across Q8_TILE_S positions.
+         * For S=1 (decode), the tiled kernel's shared memory load+sync
+         * overhead dominates -- fall back to the original per-block kernel.
+         * Also falls back if row too large for shared memory. */
+        if (S > 1 && t->row_bytes + 2048 <= 49152) {
+            dim3 grid((unsigned)O, (unsigned)((S + Q8_TILE_S - 1) / Q8_TILE_S));
+            picolm_q8_q8_matmul_tiled<<<grid, 256, (unsigned)t->row_bytes, ctx->stream>>>(
+                ctx->y, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes);
+        } else {
+            dim3 grid((unsigned)O, (unsigned)S);
+            picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
+                ctx->y, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes);
+        }
         if (!gpu_ok(gpuGetLastError(), "q8 matmul") ||
             !gpu_ok(gpuDeviceSynchronize(), "q8 matmul sync")) return 0;
 
@@ -1710,9 +1792,15 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
             ctx->q8_xq, ctx->q8_xd, x_dev, I, S);
         if (!gpu_ok(gpuGetLastError(), "q8 quantize (dev)")) return 0;
 
-        dim3 grid((unsigned)O, (unsigned)S);
-        picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
-            y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes);
+        if (S > 1 && t->row_bytes + 2048 <= 49152) {
+            dim3 grid((unsigned)O, (unsigned)((S + Q8_TILE_S - 1) / Q8_TILE_S));
+            picolm_q8_q8_matmul_tiled<<<grid, 256, (unsigned)t->row_bytes, ctx->stream>>>(
+                y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes);
+        } else {
+            dim3 grid((unsigned)O, (unsigned)S);
+            picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
+                y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes);
+        }
         if (!gpu_ok(gpuGetLastError(), "q8 matmul (dev)")) return 0;
         return 1;
     }
