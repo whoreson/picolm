@@ -5344,13 +5344,14 @@ float vec_dot_tq3_f32(const void *src, const float *q_rotated, int n) {
     for (int bi = 0; bi < nb; bi++) {
         float scale = fp16_to_fp32(blocks[bi].d);
         const uint8_t *packed = blocks[bi].qs;
+        const float *qr = q_rotated + bi * TQ3_BLOCK_SIZE;
         float dot = 0.0f;
 
         for (int g = 0; g < 4; g++) {
             uint8_t indices[8];
             tq3_unpack_3bit_8(indices, packed + g * 3);
             for (int k = 0; k < 8; k++) {
-                dot += q_rotated[g * 8 + k] * tq3_codebook[indices[k]];
+                dot += qr[g * 8 + k] * tq3_codebook[indices[k]];
             }
         }
         sumf += dot * scale;

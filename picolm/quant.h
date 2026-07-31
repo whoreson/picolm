@@ -417,7 +417,7 @@ static inline void tq3_unpack_3bit_8(uint8_t *dst, const uint8_t *src) {
     dst[3] = (src[1] >> 1) & 7;
     dst[4] = (src[1] >> 4) & 7;
     dst[5] = ((src[1] >> 7) | (src[2] << 1)) & 7;
-    dst[6] = src[2] >> 2;
+    dst[6] = (src[2] >> 2) & 7;
     dst[7] = (src[2] >> 5) & 7;
 }
 

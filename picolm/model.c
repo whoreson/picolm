@@ -1821,9 +1821,11 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
     const char *kv_name_k = "f16";
     const char *kv_name_v = "f16";
     if (kv_type_k == KV_CACHE_Q8_0) kv_name_k = "q8_0";
-    if (kv_type_k == KV_CACHE_Q4_0) kv_name_k = "q4_0";
+    else if (kv_type_k == KV_CACHE_Q4_0) kv_name_k = "q4_0";
+    else if (kv_type_k == KV_CACHE_TQ3) kv_name_k = "tq3";
     if (kv_type_v == KV_CACHE_Q8_0) kv_name_v = "q8_0";
-    if (kv_type_v == KV_CACHE_Q4_0) kv_name_v = "q4_0";
+    else if (kv_type_v == KV_CACHE_Q4_0) kv_name_v = "q4_0";
+    else if (kv_type_v == KV_CACHE_TQ3) kv_name_v = "tq3";
     fprintf(stderr, "Allocating %.2f MB for runtime state (+ %.2f MB KV cache [%s/%s])\n",
             (double)total / (1024.0 * 1024.0),
             (double)sz_kv / (1024.0 * 1024.0), kv_name_k, kv_name_v);
@@ -2480,6 +2482,16 @@ static void attn_core(
         float score;
         if (kv_type_k == KV_CACHE_Q8_0) score = vec_dot_q8_0_f32(kt, qh, head_dim);
         else if (kv_type_k == KV_CACHE_Q4_0) score = vec_dot_q4_0_f32(kt, qh, head_dim);
+        else if (kv_type_k == KV_CACHE_TQ3) {
+            /* TQ3 K: dequant to F32 then dot. The vec_dot_tq3_f32 codebook
+             * approach loses too much accuracy for attention scoring when
+             * used alone (TQ3 K + non-TQ3 V). Full dequant is needed. */
+            float k_f32_local[256];
+            memset(k_f32_local, 0, (size_t)head_dim * sizeof(float));
+            scale_add_tq3_f32(k_f32_local, 1.0f, kt, head_dim);
+            score = 0;
+            for (int d = 0; d < head_dim; d++) score += qh[d] * k_f32_local[d];
+        }
         else score = vec_dot_f16_f32(kt, qh, head_dim);
         score /= sqrtf((float)head_dim);
         const uint8_t *vt = vcache + (size_t)t * kv_row_size_v + kv_h * kv_head_stride_v;
@@ -2488,6 +2500,7 @@ static void attn_core(
             sum_exp = sum_exp * correction + 1.0f;
             if (kv_type_v == KV_CACHE_Q8_0) fma_scale_q8_0_f32(acc, correction, vt, head_dim);
             else if (kv_type_v == KV_CACHE_Q4_0) fma_scale_q4_0_f32(acc, correction, vt, head_dim);
+            else if (kv_type_v == KV_CACHE_TQ3) fma_scale_tq3_f32(acc, correction, vt, head_dim);
             else {
                 const uint16_t *vt16 = (const uint16_t *)vt;
 #ifdef PICOLM_AVX512
@@ -2508,6 +2521,7 @@ static void attn_core(
             sum_exp += w;
             if (kv_type_v == KV_CACHE_Q8_0) scale_add_q8_0_f32(acc, w, vt, head_dim);
             else if (kv_type_v == KV_CACHE_Q4_0) scale_add_q4_0_f32(acc, w, vt, head_dim);
+            else if (kv_type_v == KV_CACHE_TQ3) scale_add_tq3_f32(acc, w, vt, head_dim);
             else {
                 const uint16_t *vt16 = (const uint16_t *)vt;
 #ifdef PICOLM_AVX512
@@ -2738,7 +2752,13 @@ static void attention_group(int kv_head_idx, void *ctx_ptr) {
             float score;
             if (ctx->kv_type_k == KV_CACHE_Q8_0) score = vec_dot_q8_0_f32(kt, qg, head_dim);
             else if (ctx->kv_type_k == KV_CACHE_Q4_0) score = vec_dot_q4_0_f32(kt, qg, head_dim);
-            else if (ctx->kv_type_k == KV_CACHE_TQ3) score = vec_dot_tq3_f32(kt, qg, head_dim);
+            else if (ctx->kv_type_k == KV_CACHE_TQ3) {
+                float k_f32_local[256];
+                memset(k_f32_local, 0, (size_t)head_dim * sizeof(float));
+                scale_add_tq3_f32(k_f32_local, 1.0f, kt, head_dim);
+                score = 0;
+                for (int d = 0; d < head_dim; d++) score += qg[d] * k_f32_local[d];
+            }
             else score = vec_dot_f16_f32(kt, qg, head_dim);
             score /= sqrtf((float)head_dim);
 
@@ -3129,11 +3149,8 @@ float *model_forward(model_t *m, int token, int pos) {
                 picolm_hadamard_transform(s->q + h * head_dim, head_dim, s->kv_hadamard_size);
             }
         } else if (s->kv_type_k == KV_CACHE_TQ3) {
-            /* TQ3: rotate Q with WHT block=32 (same as picolm_hadamard_transform
-             * with nrot=32, which uses the TQ3 sign pattern). */
-            for (int h = 0; h < n_heads; h++) {
-                picolm_hadamard_transform(s->q + h * head_dim, head_dim, TQ3_BLOCK_SIZE);
-            }
+            /* TQ3 K: Q is NOT rotated. We dequant TQ3 to F32 in the
+             * attention path, so Q stays in the original domain. */
         }
 
         attn_group_ctx_t gctx;
@@ -7322,6 +7339,8 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                         picolm_hadamard_transform(q_pos + h * head_dim, head_dim, s->kv_hadamard_size);
                     }
                 }
+            } else if (s->kv_type_k == KV_CACHE_TQ3) {
+                /* TQ3 K: Q is NOT rotated (we dequant to F32 in attention path) */
             }
 
             /* Clear GPU tensor: batch_attention_layer's internal matmul_batch
@@ -7348,6 +7367,8 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                     picolm_hadamard_transform(xb_pos + h * head_dim, head_dim, s->kv_hadamard_size);
                 }
             }
+        } else if (s->kv_type_v == KV_CACHE_TQ3) {
+            /* TQ3 V-path: scale_add_tq3_f32 already applies inverse WHT internally */
         }
 
         /* Apply Qwen3.5 attention gate (sigmoid, element-wise multiply on attention output before proj) */
