@@ -1532,6 +1532,10 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
     return 0;
 }
 
+/* Forward declaration for SSM v-head remap function (used during GPU weight upload,
+ * defined later in the file) */
+static inline int qwen35_vhead_gguf(int h, int n_vpk, int n_k);
+
 /* ---- Public API ---- */
 
 int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v,
@@ -1640,6 +1644,20 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                     attempted++;
                     if (picolm_gpu_tensor_upload(&gl->attn_gate_ssm,
                             lw->attn_gate_ssm, lw->type_attn_gate_ssm, c->n_embd, c->ssm_d_inner, device)) uploaded++;
+                    /* SSM F32 weights: conv1d [d_conv x conv_dim], ssm_a [dt_rank], ssm_dt [dt_rank],
+                     * ssm_norm [head_v_dim], ssm_alpha [dim x dt_rank], ssm_beta [dim x dt_rank] */
+                    {
+                        int head_v_dim = c->ssm_d_inner / c->ssm_dt_rank;
+                        attempted++;
+                        if (picolm_gpu_tensor_upload(&gl->ssm_conv1d,
+                                lw->ssm_conv1d, lw->type_ssm_conv1d, c->ssm_d_conv, conv_dim, device)) uploaded++;
+                        attempted++;
+                        if (picolm_gpu_tensor_upload(&gl->ssm_alpha,
+                                lw->ssm_alpha, lw->type_ssm_alpha, c->n_embd, c->ssm_dt_rank, device)) uploaded++;
+                        attempted++;
+                        if (picolm_gpu_tensor_upload(&gl->ssm_beta,
+                                lw->ssm_beta, lw->type_ssm_beta, c->n_embd, c->ssm_dt_rank, device)) uploaded++;
+                    }
                 }
             }
 
@@ -1720,6 +1738,51 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                     } else {
                         fprintf(stderr, "INFO: GPU KV cache disabled (model not eligible: SSM=%d rope=%d)\n",
                                 c->has_ssm, c->rope_type);
+                        /* SSM model: upload small SSM F32 weights to device for the GPU kernels
+                         * that are already called from ssm_forward().
+                         * These are: ssm_a [dt_rank], ssm_dt [dt_rank], ssm_norm [head_v_dim] per layer.
+                         * The larger SSM weights (conv1d, alpha, beta) were already uploaded above
+                         * as GPU tensor handles during the per-layer upload loop. */
+                        if (c->has_ssm) {
+                            run_state_t *s = &m->state;
+                            int head_v_dim = c->ssm_d_inner / c->ssm_dt_rank;
+                            for (int l = 0; l < c->n_layers; l++) {
+                                layer_weights_t *lw = &m->weights.layers[l];
+                                if (lw->is_attn_layer) continue;
+                                m->gpu.ssm_a_dev[l] = picolm_gpu_upload_f32(s->ssm_a_w[l], c->ssm_dt_rank, device);
+                                m->gpu.ssm_dt_dev[l] = picolm_gpu_upload_f32(s->ssm_dt_w[l], c->ssm_dt_rank, device);
+                                m->gpu.ssm_norm_dev[l] = picolm_gpu_upload_f32(s->ssm_norm_w[l], head_v_dim, device);
+                                /* Allocate device-resident SSM state */
+                                if (s->ssm_state[l]) {
+                                    size_t st_bytes = (size_t)c->ssm_dt_rank * c->ssm_d_state * c->ssm_d_state * sizeof(float);
+                                    m->gpu.ssm_state_dev[l] = picolm_gpu_alloc_device(st_bytes, device);
+                                    /* Initialize to zero (fresh start) */
+                                    if (m->gpu.ssm_state_dev[l])
+                                        picolm_gpu_device_memset(m->gpu.ssm_state_dev[l], 0, st_bytes, device);
+                                }
+                                /* Allocate device-resident conv state: [(d_conv-1) x conv_dim] */
+                                if (s->ssm_conv_state[l]) {
+                                    int conv_dim = 2 * c->ssm_d_state * c->ssm_n_group + c->ssm_d_inner;
+                                    size_t cs_bytes = (size_t)(c->ssm_d_conv - 1) * conv_dim * sizeof(float);
+                                    m->gpu.ssm_conv_state_dev[l] = picolm_gpu_alloc_device(cs_bytes, device);
+                                    if (m->gpu.ssm_conv_state_dev[l])
+                                        picolm_gpu_device_memset(m->gpu.ssm_conv_state_dev[l], 0, cs_bytes, device);
+                                }
+                            }
+                            /* Upload head_map for v-head remapping (if needed) */
+                            {
+                                int do_remap = (c->ssm_n_group > 0 && c->ssm_n_group < c->ssm_dt_rank);
+                                if (do_remap) {
+                                    int n_v_heads = c->ssm_dt_rank;
+                                    int n_k_heads = c->ssm_n_group;
+                                    int n_vpk = c->ssm_dt_rank / n_k_heads;
+                                    int *hmap = alloca(n_v_heads * sizeof(int));
+                                    for (int h = 0; h < n_v_heads; h++)
+                                        hmap[h] = qwen35_vhead_gguf(h, n_vpk, n_k_heads);
+                                    m->gpu.ssm_head_map_dev = picolm_gpu_upload_int(hmap, n_v_heads, device);
+                                }
+                            }
+                        }
                     }
                 }
                 /* Log per-type upload stats */
@@ -4494,7 +4557,7 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
         int alpha_map[256];
         for (int h = 0; h < n_v_heads; h++) alpha_map[h] = do_remap ? qwen35_vhead_gguf(h, n_vpk, n_k) : h;
 #ifdef PICOLM_GPU
-        if (gpu_lw && (alpha_type == GGUF_TYPE_Q4_0 || alpha_type == GGUF_TYPE_Q8_0) &&
+        if (gpu_lw && (alpha_type == GGUF_TYPE_F32 || alpha_type == GGUF_TYPE_Q4_0 || alpha_type == GGUF_TYPE_Q8_0) &&
             picolm_gpu_ssm_vecdot(alpha_out, s->xb, lw->ssm_alpha, alpha_type, dim,
                                   n_v_heads, (int)row_bytes, alpha_map, m->gpu.device)) {
             for (int h = 0; h < n_v_heads; h++) alpha_out[h] += s->ssm_dt_w[il][h];
@@ -4537,7 +4600,7 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
         int beta_map[256];
         for (int h = 0; h < n_v_heads; h++) beta_map[h] = do_remap ? qwen35_vhead_gguf(h, n_vpk, n_k) : h;
 #ifdef PICOLM_GPU
-        if (gpu_lw && (beta_type == GGUF_TYPE_Q4_0 || beta_type == GGUF_TYPE_Q8_0) &&
+        if (gpu_lw && (beta_type == GGUF_TYPE_F32 || beta_type == GGUF_TYPE_Q4_0 || beta_type == GGUF_TYPE_Q8_0) &&
             picolm_gpu_ssm_vecdot(beta, s->xb, lw->ssm_beta, beta_type, dim,
                                   n_v_heads, (int)row_bytes, beta_map, m->gpu.device)) {
             for (int h = 0; h < n_v_heads; h++) beta[h] = 1.0f / (1.0f + expf(-beta[h]));
@@ -4612,18 +4675,36 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     /* ssm_output: [d * n_v_heads + h] (dim-major from delta_net output) */
     float *norm_w = s->ssm_norm_w[il]; /* [head_v_dim] */
     float *final_output = ssm_output + d_state * n_v_heads; /* [head_v_dim * n_v_heads] */
-    for (int h = 0; h < n_v_heads; h++) {
-        float nrm = 0.0f;
-        for (int d = 0; d < head_v_dim; d++) {
-            float v = ssm_output[d * n_v_heads + h];
-            nrm += v * v;
+    {
+        int gn_done = 0;
+#ifdef PICOLM_GPU
+        /* Try GPU gated norm if GPU is active.
+         * Note: we pass head_map=NULL so the kernel writes in sequential order.
+         * The GGUF v-head remap (do_remap) is handled separately in step 19. */
+        if (gpu_lw && m->gpu.active) {
+            if (picolm_gpu_ssm_gated_norm(final_output, ssm_output, s->xb2,
+                                           norm_w, NULL, head_v_dim, n_v_heads, eps,
+                                           m->gpu.device)) {
+                gn_done = 1;
+            }
         }
-        nrm = 1.0f / sqrtf(nrm / head_v_dim + eps);
-        for (int d = 0; d < head_v_dim; d++) {
-            float v = ssm_output[d * n_v_heads + h];
-            float zv = s->xb2[h * head_v_dim + d];
-            float silu_z = zv * (1.0f / (1.0f + expf(-zv)));
-            final_output[h * head_v_dim + d] = v * nrm * norm_w[d] * silu_z;
+#endif
+        if (!gn_done) {
+            /* CPU fallback */
+            for (int h = 0; h < n_v_heads; h++) {
+                float nrm = 0.0f;
+                for (int d = 0; d < head_v_dim; d++) {
+                    float v = ssm_output[d * n_v_heads + h];
+                    nrm += v * v;
+                }
+                nrm = 1.0f / sqrtf(nrm / head_v_dim + eps);
+                for (int d = 0; d < head_v_dim; d++) {
+                    float v = ssm_output[d * n_v_heads + h];
+                    float zv = s->xb2[h * head_v_dim + d];
+                    float silu_z = zv * (1.0f / (1.0f + expf(-zv)));
+                    final_output[h * head_v_dim + d] = v * nrm * norm_w[d] * silu_z;
+                }
+            }
         }
     }
 #ifdef DEBUG_SSM

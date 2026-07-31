@@ -1154,6 +1154,18 @@ picolm_ssm_vecdot_kernel(float *out,
     double sum = 0.0;
 
     switch (qtype) {
+    case 0: { /* F32 -- ssm_alpha/ssm_beta stay unquantized on some models
+               * (Qwen3.6): these are small, precision-sensitive gating
+               * projections. Simpler than the quantized cases -- no
+               * dequant, just a strided dot product. */
+        const float *wrow_f = (const float *)wrow;
+        int per_thread = (dim + gpuBlockDim_x - 1) / gpuBlockDim_x;
+        int start = tid * per_thread;
+        int end = min(start + per_thread, dim);
+        for (int i = start; i < end; i++)
+            sum += (double)x[i] * (double)wrow_f[i];
+        break;
+    }
     case 2: { /* Q4_0 */
         int n_blocks = dim / 32;
         for (int bi = tid; bi < n_blocks; bi += gpuBlockDim_x) {
@@ -1197,6 +1209,43 @@ picolm_ssm_vecdot_kernel(float *out,
     }
     if (tid == 0) out[h] = sdata[0];
 }
+
+/* ---- SSM causal conv1d + state shift (fused) ----
+ * Direct port of the CPU reference (ssm_forward, conv1d section): for
+ * each channel co, sum d_conv taps (d_conv-1 from history in
+ * conv_state, the newest tap from new_input), SiLU-activate, then
+ * shift conv_state left and append new_input as the newest row.
+ *
+ * Embarrassingly parallel across conv_dim channels -- each thread
+ * owns one channel end-to-end (read old state, compute, write output,
+ * shift its own channel's history), no shared memory, no
+ * synchronization needed at all. Genuinely new: no GPU conv1d existed
+ * before this (CPU always did this step). */
+__global__ void
+picolm_gpu_ssm_conv1d_kernel(float *conv_output, float *conv_state,
+                              const float *new_input, const float *conv1d_w,
+                              int conv_dim, int d_conv) {
+    int co = (int)gpuBlockIdx_x * gpuBlockDim_x + gpuThreadIdx_x;
+    if (co >= conv_dim) return;
+
+    int n_state_rows = d_conv - 1;
+    float sum = 0.0f;
+    for (int d = 0; d < n_state_rows; d++)
+        sum += conv1d_w[d + co * d_conv] * conv_state[d * conv_dim + co];
+    sum += conv1d_w[(d_conv - 1) + co * d_conv] * new_input[co];
+    conv_output[co] = sum / (1.0f + expf(-sum)); /* silu */
+
+    /* Shift history left, append newest -- safe to do after computing
+     * the output above since each thread only ever touches its own
+     * channel's column, no cross-thread dependency. */
+    for (int r = 0; r < n_state_rows - 1; r++)
+        conv_state[r * conv_dim + co] = conv_state[(r + 1) * conv_dim + co];
+    if (n_state_rows > 0)
+        conv_state[(n_state_rows - 1) * conv_dim + co] = new_input[co];
+}
+
+/* Host wrapper is below, after helper functions (find_ctx, gpu_ok, select_ctx).
+ * See picolm_gpu_ssm_conv1d_dev definition further down. */
 
 /* ---- SSM recurrence kernel ----
  *
@@ -1905,6 +1954,39 @@ picolm_gpu_upload_f32(const float *host, size_t n, int device) {
     return dev;
 }
 
+/* Generic device memory allocation. Returns NULL on failure. */
+void *picolm_gpu_alloc_device(size_t bytes, int device) {
+    if (bytes < 1) return NULL;
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return NULL;
+    void *ptr = NULL;
+    if (!gpu_ok(gpuMalloc(&ptr, bytes), "device alloc")) return NULL;
+    return ptr;
+}
+
+/* Device memory set to value. Uses gpuMemset (zero-fill). */
+int picolm_gpu_device_memset(void *dev_ptr, int value, size_t bytes, int device) {
+    if (!dev_ptr || bytes < 1) return 0;
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    return gpu_ok(gpuMemset(dev_ptr, value, bytes), "device memset");
+}
+
+/* Upload a host int32 array to device. Returns device pointer or NULL. */
+void *picolm_gpu_upload_int(const int *host, size_t n, int device) {
+    if (!host || n < 1) return NULL;
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return NULL;
+    void *dev = NULL;
+    size_t bytes = n * sizeof(int);
+    if (!gpu_ok(gpuMalloc(&dev, bytes), "int vector allocation")) return NULL;
+    if (!gpu_ok(gpuMemcpy(dev, host, bytes, gpuMemcpyHostToDevice), "int vector upload")) {
+        gpuFree(dev);
+        return NULL;
+    }
+    return dev;
+}
+
 int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, int device) {
     if (!t || !y || !x || S < 1) return 0;
     /* Minimum I for GPU to be worthwhile vs CPU kernel launch overhead.
@@ -2239,6 +2321,165 @@ picolm_gpu_ssm_recurrence(float *state,
     return 1;
 }
 
+/* ---- SSM gated normalization ----
+ * Direct port of the CPU reference ("18. Gated normalization" in
+ * ssm_forward): per-head RMSNorm of the SSM output, scaled by a
+ * learned per-dim weight (shared across heads) and gated by
+ * silu(xb2) (the z-gate computed earlier in the layer).
+ *
+ * Two different layouts meet here, exactly as in the CPU code -- get
+ * this wrong and every hybrid layer's output is silently corrupted:
+ *   ssm_output: dim-major  [head_v_dim][n_v_heads], index d*n_v_heads+h
+ *   xb2 (gate): head-major [n_v_heads][head_v_dim], index h*head_v_dim+d
+ *   output:     head-major [n_v_heads][head_v_dim], index h*head_v_dim+d
+ *     (or, if head_map is non-NULL, written at head_map[h] instead of h
+ *      -- this fuses the GGUF v-head remap into the output write,
+ *      avoiding the CPU reference's separate fo_gguf permute-copy pass)
+ *
+ * Grid = n_v_heads blocks; each block does one head's RMS reduction
+ * then writes its head_v_dim outputs, both parallelized across all
+ * threads (no per-thread-array/serial-thread-0 pattern -- learned that
+ * lesson three times already this session). */
+__global__ void
+picolm_gpu_ssm_gated_norm_kernel(float *final_output,
+                                  const float *ssm_output,
+                                  const float *xb2,
+                                  const float *norm_w,
+                                  const int *head_map,
+                                  int head_v_dim, int n_v_heads, float eps) {
+    int h = (int)gpuBlockIdx_x;
+    if (h >= n_v_heads) return;
+    int tid = gpuThreadIdx_x;
+    int n_threads = gpuBlockDim_x;
+
+    __shared__ float ssum[256];
+    float local = 0.0f;
+    for (int d = tid; d < head_v_dim; d += n_threads) {
+        float v = ssm_output[(size_t)d * n_v_heads + h];
+        local += v * v;
+    }
+    ssum[tid] = local;
+    gpuSyncthreads();
+    for (int s = n_threads / 2; s > 0; s >>= 1) {
+        if (tid < s) ssum[tid] += ssum[tid + s];
+        gpuSyncthreads();
+    }
+    float nrm = 1.0f / sqrtf(ssum[0] / head_v_dim + eps);
+
+    int gh = head_map ? head_map[h] : h;
+    float *out_h = final_output + (size_t)gh * head_v_dim;
+    const float *xb2_h = xb2 + (size_t)h * head_v_dim;
+
+    for (int d = tid; d < head_v_dim; d += n_threads) {
+        float v = ssm_output[(size_t)d * n_v_heads + h];
+        float zv = xb2_h[d];
+        float silu_z = zv / (1.0f + expf(-zv));
+        out_h[d] = v * nrm * norm_w[d] * silu_z;
+    }
+}
+
+/* Device-native: all pointers device-resident, no H2D/D2H, no sync.
+ * head_map_dev may be NULL (identity, no remap). eps matches the CPU
+ * reference's default (typically 1e-6 / 1e-5 -- confirm against
+ * s->ssm_norm_w's actual eps at the call site, don't hardcode here). */
+extern "C" int
+picolm_gpu_ssm_gated_norm_dev(float *final_output_dev,
+                               const float *ssm_output_dev,
+                               const float *xb2_dev,
+                               const float *norm_w_dev,
+                               const int *head_map_dev,
+                               int head_v_dim, int n_v_heads, float eps,
+                               int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    if (head_v_dim < 1 || n_v_heads < 1 || head_v_dim > 256) return 0;
+
+    int n_threads = min(head_v_dim, 256);
+    dim3 grid((unsigned)n_v_heads, 1, 1);
+    picolm_gpu_ssm_gated_norm_kernel<<<grid, n_threads, 0, ctx->stream>>>(
+        final_output_dev, ssm_output_dev, xb2_dev, norm_w_dev, head_map_dev,
+        head_v_dim, n_v_heads, eps);
+    if (!gpu_ok(gpuGetLastError(), "ssm gated norm (dev)")) return 0;
+    return 1;
+}
+
+/* Host wrapper for ssm_conv1d (moved here to be after helper functions) */
+extern "C" int
+picolm_gpu_ssm_conv1d_dev(float *conv_output_dev, float *conv_state_dev,
+                           const float *new_input_dev, const float *conv1d_w_dev,
+                           int conv_dim, int d_conv, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    if (conv_dim < 1 || d_conv < 1) return 0;
+
+    int n_threads = 256;
+    int n_blocks = (conv_dim + n_threads - 1) / n_threads;
+    picolm_gpu_ssm_conv1d_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
+        conv_output_dev, conv_state_dev, new_input_dev, conv1d_w_dev, conv_dim, d_conv);
+    if (!gpu_ok(gpuGetLastError(), "ssm conv1d (dev)")) return 0;
+    return 1;
+}
+
+/* Host-side gated norm wrapper: takes CPU pointers, does its own H2D/D2H/sync.
+ * For use from ssm_forward() when the pipeline is not active. */
+extern "C" int
+picolm_gpu_ssm_gated_norm(float *final_output,  /* out, host [head_v_dim * n_v_heads] */
+                           const float *ssm_output, /* in, host [d_state * n_v_heads] */
+                           const float *xb2,    /* in, host [head_v_dim * n_v_heads] */
+                           const float *norm_w, /* in, host [head_v_dim] */
+                           const int *head_map, /* in, host [n_v_heads] or NULL */
+                           int head_v_dim, int n_v_heads, float eps,
+                           int device) {
+    if (head_v_dim < 1 || n_v_heads < 1) return 0;
+    if (!gpu_ok(gpuSetDevice(device), "ssm gn")) return 0;
+    gpu_device_ctx_t *ctx = NULL;
+    for (int i = 0; i < g_nctx; i++) {
+        if (g_gpu_ctx[i].device == device) { ctx = &g_gpu_ctx[i]; break; }
+    }
+    if (!ctx) return 0;
+
+    size_t out_bytes = (size_t)n_v_heads * head_v_dim * sizeof(float);
+    size_t so_bytes = (size_t)n_v_heads * head_v_dim * sizeof(float); /* ssm_output: d_state==head_v_dim */
+    size_t xb2_bytes = (size_t)n_v_heads * head_v_dim * sizeof(float);
+    size_t nw_bytes = head_v_dim * sizeof(float);
+    size_t hm_bytes = n_v_heads * sizeof(int);
+
+    void *d_final, *d_so, *d_xb2, *d_nw, *d_hm;
+    if (!gpu_ok(gpuMalloc(&d_final, out_bytes), "ssm gn final") ||
+        !gpu_ok(gpuMalloc(&d_so, so_bytes), "ssm gn so") ||
+        !gpu_ok(gpuMalloc(&d_xb2, xb2_bytes), "ssm gn xb2") ||
+        !gpu_ok(gpuMalloc(&d_nw, nw_bytes), "ssm gn nw")) return 0;
+    d_hm = NULL;
+    if (head_map) {
+        if (!gpu_ok(gpuMalloc(&d_hm, hm_bytes), "ssm gn hmap")) {
+            gpuFree(d_final); gpuFree(d_so); gpuFree(d_xb2); gpuFree(d_nw); return 0;
+        }
+    }
+    if (!gpu_ok(gpuMemcpy(d_so, ssm_output, so_bytes, gpuMemcpyHostToDevice), "ssm gn so h2d") ||
+        !gpu_ok(gpuMemcpy(d_xb2, xb2, xb2_bytes, gpuMemcpyHostToDevice), "ssm gn xb2 h2d") ||
+        !gpu_ok(gpuMemcpy(d_nw, norm_w, nw_bytes, gpuMemcpyHostToDevice), "ssm gn nw h2d")) {
+        gpuFree(d_final); gpuFree(d_so); gpuFree(d_xb2); gpuFree(d_nw);
+        if (d_hm) gpuFree(d_hm); return 0;
+    }
+    if (d_hm && !gpu_ok(gpuMemcpy(d_hm, head_map, hm_bytes, gpuMemcpyHostToDevice), "ssm gn hm h2d")) {
+        gpuFree(d_final); gpuFree(d_so); gpuFree(d_xb2); gpuFree(d_nw); gpuFree(d_hm); return 0;
+    }
+
+    picolm_gpu_ssm_gated_norm_kernel<<<(unsigned)n_v_heads, min(head_v_dim, 256), 0, ctx->stream>>>(
+        (float *)d_final, (const float *)d_so, (const float *)d_xb2,
+        (const float *)d_nw, (const int *)d_hm, head_v_dim, n_v_heads, eps);
+
+    if (!gpu_ok(gpuGetLastError(), "ssm gated norm") ||
+        !gpu_ok(gpuDeviceSynchronize(), "ssm gn sync")) {
+        gpuFree(d_final); gpuFree(d_so); gpuFree(d_xb2); gpuFree(d_nw);
+        if (d_hm) gpuFree(d_hm); return 0;
+    }
+    gpuMemcpy(final_output, d_final, out_bytes, gpuMemcpyDeviceToHost);
+    gpuFree(d_final); gpuFree(d_so); gpuFree(d_xb2); gpuFree(d_nw);
+    if (d_hm) gpuFree(d_hm);
+    return 1;
+}
+
 /* ---- SSM batched vec_dot API ---- */
 extern "C" int
 picolm_gpu_ssm_vecdot(float *out_host,
@@ -2250,7 +2491,7 @@ picolm_gpu_ssm_vecdot(float *out_host,
                        const int *head_map,
                        int device) {
     if (n_v_heads <= 0 || dim <= 0) return 0;
-    if (qtype != 2 && qtype != 8) return 0;
+    if (qtype != 0 && qtype != 2 && qtype != 8) return 0;
 
     if (!gpu_ok(gpuSetDevice(device), "ssm vecdot device")) return 0;
     gpu_device_ctx_t *ctx = NULL;

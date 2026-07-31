@@ -119,6 +119,45 @@ int picolm_gpu_ssm_recurrence(float *state,
                                int n_v_heads, int d_state,
                                int repeat, int device);
 
+/* SSM causal conv1d + state shift, fused, device-native (all pointers
+ * device-resident, no H2D/D2H, no internal sync). conv_state is
+ * persistent per-layer device state, updated in place. Genuinely new --
+ * no GPU conv1d existed before this session. Returns 1 on success. */
+int picolm_gpu_ssm_conv1d_dev(float *conv_output_dev, float *conv_state_dev,
+                               const float *new_input_dev, const float *conv1d_w_dev,
+                               int conv_dim, int d_conv, int device);
+
+/* SSM gated normalization, device-native (Finding 5): per-head RMSNorm
+ * of dim-major ssm_output, gated by silu(head-major xb2), with the
+ * GGUF v-head remap optionally fused into the output write (pass
+ * head_map_dev = NULL for identity / no remap). All pointers device-
+ * resident, no H2D/D2H, no sync. Returns 1 on success. */
+int picolm_gpu_ssm_gated_norm_dev(float *final_output_dev,
+                                   const float *ssm_output_dev,
+                                   const float *xb2_dev,
+                                   const float *norm_w_dev,
+                                   const int *head_map_dev,
+                                   int head_v_dim, int n_v_heads, float eps,
+                                   int device);
+
+/* SSM gated normalization, host-side wrapper (non-pipelined).
+ * Takes CPU pointers, does its own H2D/D2H/sync. For use from
+ * ssm_forward() when the pipeline is not active. */
+int picolm_gpu_ssm_gated_norm(float *final_output,
+                               const float *ssm_output,
+                               const float *xb2,
+                               const float *norm_w,
+                               const int *head_map,
+                               int head_v_dim, int n_v_heads, float eps,
+                               int device);
+
+/* Generic device memory allocation. Returns NULL on failure. */
+void *picolm_gpu_alloc_device(size_t bytes, int device);
+/* Device memory set to value (zero-fill). Returns 1 on success. */
+int picolm_gpu_device_memset(void *dev_ptr, int value, size_t bytes, int device);
+/* Upload a host int32 array to device. Returns device pointer or NULL. */
+void *picolm_gpu_upload_int(const int *host, size_t n, int device);
+
 /* ================================================================
  * Phase 1: GPU-resident KV cache + attention kernels
  * ================================================================ */

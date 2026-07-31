@@ -80,6 +80,9 @@ typedef struct {
     void *attn_qkv;            /* SSM */
     void *attn_gate_ssm;       /* SSM */
     void *ssm_out;             /* SSM */
+    void *ssm_conv1d;          /* SSM: [d_conv x conv_dim] f32 */
+    void *ssm_alpha;           /* SSM: [dim x dt_rank] f32 or quantized */
+    void *ssm_beta;            /* SSM: [dim x dt_rank] f32 or quantized */
 } gpu_layer_weights_t;
 
 typedef struct {
@@ -99,6 +102,16 @@ typedef struct {
     void *output_norm_dev;   /* device copy of output_norm_w [dim] */
     void *attn_norm_dev[MAX_LAYERS];      /* device copy of attn_norm_w[l] [dim] */
     void *post_attn_norm_dev[MAX_LAYERS]; /* device copy of post_attn_norm_w[l] [dim] */
+    /* SSM GPU pipeline: device-resident weights and state */
+    void *ssm_alpha_dev[MAX_LAYERS];      /* device copy of ssm_alpha weights [dim x dt_rank] */
+    void *ssm_beta_dev[MAX_LAYERS];       /* device copy of ssm_beta weights [dim x dt_rank] */
+    void *ssm_conv1d_dev[MAX_LAYERS];     /* device copy of ssm_conv1d weights [d_conv x conv_dim] */
+    void *ssm_a_dev[MAX_LAYERS];          /* device copy of ssm_a [dt_rank] */
+    void *ssm_dt_dev[MAX_LAYERS];         /* device copy of ssm_dt [dt_rank] */
+    void *ssm_norm_dev[MAX_LAYERS];       /* device copy of ssm_norm [head_v_dim] */
+    void *ssm_conv_state_dev[MAX_LAYERS]; /* device state: [(d_conv-1) x conv_dim] */
+    void *ssm_state_dev[MAX_LAYERS];      /* device state: [n_v_heads x d_state x d_state] */
+    void *ssm_head_map_dev;               /* device copy of head_map [n_v_heads] */
 } gpu_weights_t;
 #endif /* PICOLM_GPU */
 
