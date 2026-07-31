@@ -119,6 +119,19 @@ int picolm_gpu_ssm_recurrence(float *state,
                                int n_v_heads, int d_state,
                                int repeat, int device);
 
+/* Device-native SSM recurrence: persistent state on device, no per-call
+ * state H2D/D2H. q/k/v/gate_exp/beta still host-side per call.
+ * ssm_state_dev must be allocated by picolm_gpu_alloc_device. */
+int picolm_gpu_ssm_recurrence_dev(void *ssm_state_dev,
+                                   const float *q_conv,
+                                   const float *k_conv,
+                                   const float *v_conv,
+                               const float *gate_exp,
+                               const float *beta,
+                               float *ssm_output,
+                               int n_v_heads, int d_state,
+                               int repeat, int device);
+
 /* SSM causal conv1d + state shift, fused, device-native (all pointers
  * device-resident, no H2D/D2H, no internal sync). conv_state is
  * persistent per-layer device state, updated in place. Genuinely new --
@@ -298,14 +311,17 @@ float *picolm_gpu_pipe_ffn_norm_b(int device);
 float *picolm_gpu_pipe_gate_b(int device);
 float *picolm_gpu_pipe_up_b(int device);
 
-/* RMSNorm on device: out[d] = x[d] * rsqrt(mean(x^2) + eps) * weight[d].
- * x and out are device pointers, weight is device pointer.
- * Returns 1 on success. */
+/* Device-native rmsnorm: x/out/weight are device pointers, no H2D/D2H, no sync. */
+int picolm_gpu_rmsnorm_dev(float *out, const float *x, const float *weight,
+                            int dim, float eps, int device);
+/* Host-side rmsnorm: takes host pointers, does H2D/D2H/sync. */
 int picolm_gpu_rmsnorm(float *out, const float *x, const float *weight,
                         int dim, float eps, int device);
 
-/* Batched rmsnorm: x/out are [S][dim] contiguous, one block per row.
- * weight is shared across all rows. For prefill pipeline. */
+/* Device-native batched rmsnorm: all device pointers, no H2D/D2H/sync. */
+int picolm_gpu_rmsnorm_batched_dev(float *out, const float *x, const float *weight,
+                                    int dim, float eps, int S, int device);
+/* Host-side batched rmsnorm: takes host pointers, does H2D/D2H/sync. */
 int picolm_gpu_rmsnorm_batched(float *out, const float *x, const float *weight,
                                 int dim, float eps, int S, int device);
 

@@ -1665,19 +1665,29 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
             if (uploaded > 0) {
                 m->gpu.active = 1;
 
-                /* Phase 1: Allocate GPU KV cache for eligible models
-                 * Eligibility: standard MHA (no SSM), rope_type==0 (llama pairwise),
-                 * no QK-norm layers, F16 KV cache only. */
+                /* Phase 1+2: Allocate GPU KV cache and pipeline buffers for eligible models.
+                 * Eligibility (non-SSM): standard MHA (no SSM), rope_type==0, no QK-norm, F16 KV.
+                 * Eligibility (SSM models): Qwen3.6 DeltaNet shape accepted.
+                 *   - attention-only layers: standard MHA/GQA
+                 *   - hybrid layers: must have ssm_d_state > 0, ssm_dt_rank > 0, etc.
+                 *   - rope_type==0 required
+                 *   - F16 KV cache required
+                 * QK-norm layers in attention-only layers are handled by GPU RMSNorm (no veto). */
                 {
                     int eligible = 1;
-                    if (c->has_ssm) eligible = 0;
                     if (c->rope_type != 0) eligible = 0;
-                    /* Check for QK-norm layers */
-                    for (int l = 0; l < c->n_layers && eligible; l++) {
-                        if (m->weights.layers[l].attn_q_norm) eligible = 0;
-                    }
-                    /* F16 KV cache only for Phase 1 */
+                    /* F16 KV cache only */
                     if (kv_type_k != KV_CACHE_F16 || kv_type_v != KV_CACHE_F16) eligible = 0;
+                    /* SSM models: check DeltaNet shape sanity */
+                    if (c->has_ssm) {
+                        /* SSM models: the full GPU pipeline (model_forward_gpu) doesn't
+                         * handle hybrid SSM+attention layers yet. So kv_active stays 0
+                         * and we fall back to the per-matmul H2D/D2H path.
+                         * However, ssm_forward() already dispatches GPU kernels for
+                         * vecdot, recurrence, and gated_norm - those still work via
+                         * the old path. */
+                        eligible = 0;
+                    }
 
                     if (eligible) {
                         /* Compute KV cache sizes matching CPU allocation */
@@ -2379,10 +2389,23 @@ float *model_forward(model_t *m, int token, int pos) {
         if (lw->attn_q_norm) {
             float *qnw = s->attn_q_norm_w[l];
             float *knw = s->attn_k_norm_w[l];
-            for (int h = 0; h < n_heads; h++)
-                rmsnorm(s->q + h * head_dim, s->q + h * head_dim, qnw, head_dim, c->rms_norm_eps);
-            for (int h = 0; h < n_kv_heads; h++)
-                rmsnorm(k_tmp + h * head_dim, k_tmp + h * head_dim, knw, head_dim, c->rms_norm_eps);
+#ifdef PICOLM_GPU
+            /* Try GPU QK-norm if GPU is active */
+            int qk_done = 0;
+            if (gpu_ok && m->gpu.active) {
+                if (picolm_gpu_rmsnorm_batched(s->q, s->q, qnw, head_dim, c->rms_norm_eps, n_heads, m->gpu.device) &&
+                    picolm_gpu_rmsnorm_batched(k_tmp, k_tmp, knw, head_dim, c->rms_norm_eps, n_kv_heads, m->gpu.device)) {
+                    qk_done = 1;
+                }
+            }
+            if (!qk_done)
+#endif
+            {
+                for (int h = 0; h < n_heads; h++)
+                    rmsnorm(s->q + h * head_dim, s->q + h * head_dim, qnw, head_dim, c->rms_norm_eps);
+                for (int h = 0; h < n_kv_heads; h++)
+                    rmsnorm(k_tmp + h * head_dim, k_tmp + h * head_dim, knw, head_dim, c->rms_norm_eps);
+            }
         }
 
         /* Apply RoPE to Q and K */
@@ -4655,10 +4678,26 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     ssm_ctx.ssm_output = ssm_output; /* shared, dim-major [d*n_v_heads+h] */
 #ifdef PICOLM_GPU
     if (gpu_lw) {
-        /* GPU SSM recurrence kernel */
-        if (!picolm_gpu_ssm_recurrence(state, q_conv, k_conv, v_conv,
+        /* GPU SSM recurrence kernel.
+         * Try the device-native variant first (uses persistent state buffer,
+         * eliminates per-call state H2D/D2H), then fall back to the old
+         * host-wrapper variant, then CPU. */
+        int rec_done = 0;
+        if (m->gpu.ssm_state_dev[il]) {
+            /* Device-native: state stays on GPU between calls */
+            if (picolm_gpu_ssm_recurrence_dev(m->gpu.ssm_state_dev[il],
+                                               q_conv, k_conv, v_conv,
+                                               gate_exp, beta, ssm_output,
+                                               n_v_heads, d_state, repeat, m->gpu.device)) {
+                rec_done = 1;
+            }
+        }
+        if (!rec_done && picolm_gpu_ssm_recurrence(state, q_conv, k_conv, v_conv,
                                         gate_exp, beta, ssm_output,
                                         n_v_heads, d_state, repeat, m->gpu.device)) {
+            rec_done = 1;
+        }
+        if (!rec_done) {
             /* Fall back to CPU */
             tensor_parallel_for(n_v_heads, ssm_head_task, &ssm_ctx);
         }
@@ -6229,10 +6268,24 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                 if (lw->attn_q_norm) {
                     float *qnw = s->attn_q_norm_w[l];
                     float *knw = s->attn_k_norm_w[l];
-                    for (int h = 0; h < n_heads; h++)
-                        rmsnorm(q_pos + h * head_dim, q_pos + h * head_dim, qnw, head_dim, c->rms_norm_eps);
-                    for (int h = 0; h < n_kv_heads; h++)
-                        rmsnorm(k_pos + h * head_dim, k_pos + h * head_dim, knw, head_dim, c->rms_norm_eps);
+#ifdef PICOLM_GPU
+                    {
+                        int qk_done = 0;
+                        if (gpu_ok && m->gpu.active) {
+                            if (picolm_gpu_rmsnorm_batched(q_pos, q_pos, qnw, head_dim, c->rms_norm_eps, n_heads, m->gpu.device) &&
+                                picolm_gpu_rmsnorm_batched(k_pos, k_pos, knw, head_dim, c->rms_norm_eps, n_kv_heads, m->gpu.device)) {
+                                qk_done = 1;
+                            }
+                        }
+                        if (!qk_done)
+#endif
+                        {
+                            for (int h = 0; h < n_heads; h++)
+                                rmsnorm(q_pos + h * head_dim, q_pos + h * head_dim, qnw, head_dim, c->rms_norm_eps);
+                            for (int h = 0; h < n_kv_heads; h++)
+                                rmsnorm(k_pos + h * head_dim, k_pos + h * head_dim, knw, head_dim, c->rms_norm_eps);
+                        }
+                    }
                 }
 
                 int rope_dim_pf = (c->rope_dim > 0) ? c->rope_dim : head_dim;
@@ -6790,9 +6843,9 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
         }
 
         /* A. RMSNorm: pipe_xb = rmsnorm(pipe_x, attn_norm_w[l]) */
-        picolm_gpu_rmsnorm(pipe_xb, pipe_x,
-                            (float *)gw->attn_norm_dev[l],
-                            dim, c->rms_norm_eps, gpu_dev);
+        picolm_gpu_rmsnorm_dev(pipe_xb, pipe_x,
+                                (float *)gw->attn_norm_dev[l],
+                                dim, c->rms_norm_eps, gpu_dev);
 
         /* B. Q projection: pipe_q = attn_q @ pipe_xb */
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
@@ -6862,9 +6915,9 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
         picolm_gpu_residual_add(pipe_x, pipe_x, pipe_xb, dim, gpu_dev);
 
         /* K. FFN: pipe_xb = rmsnorm(pipe_x, post_attn_norm_w[l]) */
-        picolm_gpu_rmsnorm(pipe_ffn_norm, pipe_x,
-                            (float *)gw->post_attn_norm_dev[l],
-                            dim, c->rms_norm_eps, gpu_dev);
+        picolm_gpu_rmsnorm_dev(pipe_ffn_norm, pipe_x,
+                                (float *)gw->post_attn_norm_dev[l],
+                                dim, c->rms_norm_eps, gpu_dev);
 
         /* L. Gate: pipe_gate = ffn_gate @ pipe_ffn_norm */
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_gate,
@@ -6886,9 +6939,9 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
     }
 
     /* 3. Final RMSNorm: pipe_x = rmsnorm(pipe_x, output_norm_w) */
-    picolm_gpu_rmsnorm(pipe_x, pipe_x,
-                        (float *)gw->output_norm_dev,
-                        dim, c->rms_norm_eps, gpu_dev);
+    picolm_gpu_rmsnorm_dev(pipe_x, pipe_x,
+                            (float *)gw->output_norm_dev,
+                            dim, c->rms_norm_eps, gpu_dev);
 
     /* 4. Sync once, then lm_head on host */
     picolm_gpu_sync(gpu_dev);
@@ -6977,9 +7030,9 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
         }
 
         /* A. RMSNorm batched: one launch for all n_tokens */
-        picolm_gpu_rmsnorm_batched(bxb, bx,
-                                    (float *)gw->attn_norm_dev[l],
-                                    dim, c->rms_norm_eps, n_tokens, gpu_dev);
+        picolm_gpu_rmsnorm_batched_dev(bxb, bx,
+                                        (float *)gw->attn_norm_dev[l],
+                                        dim, c->rms_norm_eps, n_tokens, gpu_dev);
 
         /* B. Q projection: bq = attn_q @ bxb (S=n_tokens) */
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
@@ -7026,9 +7079,9 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
         picolm_gpu_residual_add(bx, bx, bxb, n_tokens * dim, gpu_dev);
 
         /* K. FFN: rmsnorm (batched) */
-        picolm_gpu_rmsnorm_batched(bffn_norm, bx,
-                                    (float *)gw->post_attn_norm_dev[l],
-                                    dim, c->rms_norm_eps, n_tokens, gpu_dev);
+        picolm_gpu_rmsnorm_batched_dev(bffn_norm, bx,
+                                        (float *)gw->post_attn_norm_dev[l],
+                                        dim, c->rms_norm_eps, n_tokens, gpu_dev);
 
         /* FFN gate */
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_gate,

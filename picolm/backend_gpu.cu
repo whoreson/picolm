@@ -2321,6 +2321,73 @@ picolm_gpu_ssm_recurrence(float *state,
     return 1;
 }
 
+/* Device-native SSM recurrence: takes device-resident state, no per-call
+ * malloc/H2D/D2H for state. q/k/v/gate_exp/beta/ssm_output still CPU-side,
+ * uploaded/downloaded per call. The key saving is eliminating the persistent
+ * state H2D/D2H round-trip per token. */
+extern "C" int
+picolm_gpu_ssm_recurrence_dev(void *ssm_state_dev,  /* in/out, device [n_v_heads][d_state][d_state] */
+                               const float *q_conv,  /* host [n_k_heads][d_state] */
+                               const float *k_conv,  /* host [n_k_heads][d_state] */
+                               const float *v_conv,  /* host [n_v_heads][head_v_dim==d_state] */
+                               const float *gate_exp, /* host [n_v_heads] */
+                               const float *beta,    /* host [n_v_heads] */
+                               float *ssm_output,    /* out, host [d_state * n_v_heads] */
+                               int n_v_heads, int d_state,
+                               int repeat, int device) {
+    if (n_v_heads <= 0 || d_state <= 0) return 0;
+    if (d_state > 256) return 0;
+    if (!ssm_state_dev) return 0;
+
+    if (!gpu_ok(gpuSetDevice(device), "ssm device")) return 0;
+    gpu_device_ctx_t *ctx = NULL;
+    for (int i = 0; i < g_nctx; i++) {
+        if (g_gpu_ctx[i].device == device) { ctx = &g_gpu_ctx[i]; break; }
+    }
+    if (!ctx) return 0;
+
+    size_t q_bytes = (size_t)(n_v_heads / repeat) * d_state * sizeof(float);
+    size_t k_bytes = q_bytes;
+    size_t v_bytes = (size_t)n_v_heads * d_state * sizeof(float);
+    size_t scalar_bytes = (size_t)n_v_heads * sizeof(float);
+    size_t out_bytes = (size_t)d_state * n_v_heads * sizeof(float);
+
+    void *dq, *dk, *dv, *dg, *db, *do_;
+    if (!gpu_ok(gpuMalloc(&dq, q_bytes), "ssm q") ||
+        !gpu_ok(gpuMalloc(&dk, k_bytes), "ssm k") ||
+        !gpu_ok(gpuMalloc(&dv, v_bytes), "ssm v") ||
+        !gpu_ok(gpuMalloc(&dg, scalar_bytes), "ssm g") ||
+        !gpu_ok(gpuMalloc(&db, scalar_bytes), "ssm b") ||
+        !gpu_ok(gpuMalloc(&do_, out_bytes), "ssm o")) return 0;
+
+    if (!gpu_ok(gpuMemcpy(dq, q_conv, q_bytes, gpuMemcpyHostToDevice), "ssm q h2d") ||
+        !gpu_ok(gpuMemcpy(dk, k_conv, k_bytes, gpuMemcpyHostToDevice), "ssm k h2d") ||
+        !gpu_ok(gpuMemcpy(dv, v_conv, v_bytes, gpuMemcpyHostToDevice), "ssm v h2d") ||
+        !gpu_ok(gpuMemcpy(dg, gate_exp, scalar_bytes, gpuMemcpyHostToDevice), "ssm g h2d") ||
+        !gpu_ok(gpuMemcpy(db, beta, scalar_bytes, gpuMemcpyHostToDevice), "ssm b h2d")) {
+        gpuFree(dq); gpuFree(dk); gpuFree(dv);
+        gpuFree(dg); gpuFree(db); gpuFree(do_); return 0;
+    }
+
+    size_t shared_mem = 2 * d_state * sizeof(float);
+    dim3 grid((unsigned)n_v_heads, 1, 1);
+    picolm_ssm_recurrence_kernel<<<grid, 256, (unsigned)shared_mem, ctx->stream>>>(
+        (float *)ssm_state_dev, (const float *)dq, (const float *)dk,
+        (const float *)dv, (const float *)dg, (const float *)db,
+        (float *)do_, n_v_heads, d_state, repeat);
+
+    if (!gpu_ok(gpuGetLastError(), "ssm recurrence") ||
+        !gpu_ok(gpuDeviceSynchronize(), "ssm sync")) {
+        gpuFree(dq); gpuFree(dk); gpuFree(dv);
+        gpuFree(dg); gpuFree(db); gpuFree(do_); return 0;
+    }
+    gpuMemcpy(ssm_output, do_, out_bytes, gpuMemcpyDeviceToHost);
+    /* State remains on device - no D2H needed */
+    gpuFree(dq); gpuFree(dk); gpuFree(dv);
+    gpuFree(dg); gpuFree(db); gpuFree(do_);
+    return 1;
+}
+
 /* ---- SSM gated normalization ----
  * Direct port of the CPU reference ("18. Gated normalization" in
  * ssm_forward): per-head RMSNorm of the SSM output, scaled by a
@@ -3183,31 +3250,91 @@ picolm_gpu_residual_add_kernel(float *out, const float *a, const float *b, int n
 }
 
 /* Phase 2 host API */
+/* Device-native rmsnorm: all pointers are device-resident, no H2D/D2H, no sync.
+ * Used from model_forward_gpu() pipeline path. */
+extern "C" int
+picolm_gpu_rmsnorm_dev(float *out, const float *x, const float *weight,
+                        int dim, float eps, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    int n_threads = min(dim, 256);
+    picolm_gpu_rmsnorm_kernel<<<1, n_threads, 0, ctx->stream>>>(
+        out, x, weight, dim, eps);
+    if (!gpu_ok(gpuGetLastError(), "rmsnorm dev kernel")) return 0;
+    return 1;
+}
+
+/* Host-side rmsnorm: takes host pointers, does H2D/D2H/sync.
+ * Used from ssm_forward() QK-norm path and other host-side callers. */
 extern "C" int
 picolm_gpu_rmsnorm(float *out, const float *x, const float *weight,
                     int dim, float eps, int device) {
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
-
+    size_t xb = dim * sizeof(float);
+    size_t wb = dim * sizeof(float);
+    void *dx, *dw, *do_;
+    if (!gpu_ok(gpuMalloc(&dx, xb), "rmsnorm x") ||
+        !gpu_ok(gpuMalloc(&dw, wb), "rmsnorm w") ||
+        !gpu_ok(gpuMalloc(&do_, xb), "rmsnorm o")) return 0;
+    if (!gpu_ok(gpuMemcpy(dx, x, xb, gpuMemcpyHostToDevice), "rmsnorm x h2d") ||
+        !gpu_ok(gpuMemcpy(dw, weight, wb, gpuMemcpyHostToDevice), "rmsnorm w h2d")) {
+        gpuFree(dx); gpuFree(dw); gpuFree(do_); return 0;
+    }
     int n_threads = min(dim, 256);
     picolm_gpu_rmsnorm_kernel<<<1, n_threads, 0, ctx->stream>>>(
-        out, x, weight, dim, eps);
-    if (!gpu_ok(gpuGetLastError(), "rmsnorm kernel")) return 0;
+        (float *)do_, (const float *)dx, (const float *)dw, dim, eps);
+    if (!gpu_ok(gpuGetLastError(), "rmsnorm kernel") ||
+        !gpu_ok(gpuDeviceSynchronize(), "rmsnorm sync")) {
+        gpuFree(dx); gpuFree(dw); gpuFree(do_); return 0;
+    }
+    gpuMemcpy(out, do_, xb, gpuMemcpyDeviceToHost);
+    gpuFree(dx); gpuFree(dw); gpuFree(do_);
     return 1;
 }
 
-/* Batched rmsnorm: one launch for S rows. */
+/* Device-native batched rmsnorm: all pointers device-resident, no H2D/D2H/sync.
+ * Used from model_forward_gpu() / model_forward_prefill_gpu() pipeline paths. */
+extern "C" int
+picolm_gpu_rmsnorm_batched_dev(float *out, const float *x, const float *weight,
+                                int dim, float eps, int S, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    if (S < 1) return 0;
+    int n_threads = min(dim, 256);
+    picolm_gpu_rmsnorm_batched_kernel<<<S, n_threads, 0, ctx->stream>>>(
+        out, x, weight, dim, eps);
+    if (!gpu_ok(gpuGetLastError(), "rmsnorm batched dev kernel")) return 0;
+    return 1;
+}
+
+/* Host-side batched rmsnorm: takes host pointers, does H2D/D2H/sync.
+ * Used from ssm_forward() QK-norm path. */
 extern "C" int
 picolm_gpu_rmsnorm_batched(float *out, const float *x, const float *weight,
                             int dim, float eps, int S, int device) {
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
     if (S < 1) return 0;
-
+    size_t xb = (size_t)S * dim * sizeof(float);
+    size_t wb = dim * sizeof(float);
+    void *dx, *dw, *do_;
+    if (!gpu_ok(gpuMalloc(&dx, xb), "rmsnorm_b x") ||
+        !gpu_ok(gpuMalloc(&dw, wb), "rmsnorm_b w") ||
+        !gpu_ok(gpuMalloc(&do_, xb), "rmsnorm_b o")) return 0;
+    if (!gpu_ok(gpuMemcpy(dx, x, xb, gpuMemcpyHostToDevice), "rmsnorm_b x h2d") ||
+        !gpu_ok(gpuMemcpy(dw, weight, wb, gpuMemcpyHostToDevice), "rmsnorm_b w h2d")) {
+        gpuFree(dx); gpuFree(dw); gpuFree(do_); return 0;
+    }
     int n_threads = min(dim, 256);
     picolm_gpu_rmsnorm_batched_kernel<<<S, n_threads, 0, ctx->stream>>>(
-        out, x, weight, dim, eps);
-    if (!gpu_ok(gpuGetLastError(), "rmsnorm batched kernel")) return 0;
+        (float *)do_, (const float *)dx, (const float *)dw, dim, eps);
+    if (!gpu_ok(gpuGetLastError(), "rmsnorm batched kernel") ||
+        !gpu_ok(gpuDeviceSynchronize(), "rmsnorm batched sync")) {
+        gpuFree(dx); gpuFree(dw); gpuFree(do_); return 0;
+    }
+    gpuMemcpy(out, do_, xb, gpuMemcpyDeviceToHost);
+    gpuFree(dx); gpuFree(dw); gpuFree(do_);
     return 1;
 }
 
