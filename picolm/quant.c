@@ -2001,9 +2001,7 @@ float vec_dot_q4_K_q8_K(const void *src_q4, const void *src_q8, int n) {
             const int8x16_t q8b = vld1q_s8(q8); q8 += 16;
             int32x4_t s0 = vmmlaq_s32(vdupq_n_s32(0), q4lo_a, q8a);
             int32x4_t s1 = vmmlaq_s32(vdupq_n_s32(0), q4lo_b, q8b);
-            sub_sums[sb_lo] += (vgetq_lane_s32(s0, 0) + vgetq_lane_s32(s0, 3) +
-                                 vgetq_lane_s32(s1, 0) + vgetq_lane_s32(s1, 3)) *
-                               scales8[sb_lo];
+            sub_sums[sb_lo] += vaddvq_s32(vaddq_s32(s0, s1)) * scales8[sb_lo];
 
             /* Sub-block j*2+1: high nibbles (32 values) vs q8[32*(j*2+1) .. 32*(j*2+1)+31] */
             int sb_hi = j * 2 + 1;
@@ -2011,9 +2009,7 @@ float vec_dot_q4_K_q8_K(const void *src_q4, const void *src_q8, int n) {
             const int8x16_t q8d = vld1q_s8(q8); q8 += 16;
             int32x4_t s2 = vmmlaq_s32(vdupq_n_s32(0), q4hi_a, q8c);
             int32x4_t s3 = vmmlaq_s32(vdupq_n_s32(0), q4hi_b, q8d);
-            sub_sums[sb_hi] += (vgetq_lane_s32(s2, 0) + vgetq_lane_s32(s2, 3) +
-                                 vgetq_lane_s32(s3, 0) + vgetq_lane_s32(s3, 3)) *
-                                scales8[sb_hi];
+            sub_sums[sb_hi] += vaddvq_s32(vaddq_s32(s2, s3)) * scales8[sb_hi];
         }
 
         /* Sum all 8 sub-block contributions */
@@ -2743,16 +2739,53 @@ float vec_dot_q4_0_q8_0(const void *vx, const void *wy, int n) {
     }
 
 #elif defined(PICOLM_I8MM)
-    /* I8MM: vmmlaq_s32 for int8 x int8 -> int32 MAC.
-     * Q4_0: low nibbles (16 values) vmmlaq with q8[0..15],
-     * high nibbles (16 values) vmmlaq with q8[16..31].
-     * Use lanes 0+3 from each vmmlaq for the dot product. */
+    /* Fused I8MM: vmmlaq_s32 for int8 x int8 -> int32 MAC,
+     * with post-processing (scvtf + scale multiply) fused in NEON.
+     *
+     * Strategy: accumulate int32 dot products in float32x4 accumulators
+     * per block, using vmlaq_n_f32 to fuse the scale multiply.
+     * This mirrors MNN's fused epilogue: int32 -> scvtf -> fmul(scale)
+     * stays entirely in SIMD registers.
+     *
+     * vmmlaq_s32 on 16 int8 x 16 int8 produces 4 int32 lanes:
+     *   lane 0 = dot of first 8 pairs, lane 3 = dot of last 8 pairs.
+     * After low+high vmmlaq vadd: lane 0 + lane 3 = 32-element dot.
+     * We use vaddvq_s32 for the horizontal sum (all 4 lanes) since
+     * lanes 1+2 are zero after our two-vaddq pattern. */
     {
         const uint8x16_t mask4 = vdupq_n_u8(0x0F);
         const int8x16_t offset8 = vdupq_n_s8(8);
+        float32x4_t acc = vdupq_n_f32(0.0f);
 
+        for (; ib + 3 < nb; ib += 4) {
+            /* Process 4 blocks per iteration */
+            float scales[4];
+            int32x4_t sums[4];
+            for (int k = 0; k < 4; k++) {
+                int ki = ib + k;
+                const uint8x16_t qx4k = vld1q_u8(x[ki].qs);
+                const int8x16_t qy0k = vld1q_s8(y[ki].qs);
+                const int8x16_t qy1k = vld1q_s8(y[ki].qs + 16);
+                int8x16_t qx_lo_k = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(qx4k, mask4)), offset8);
+                int8x16_t qx_hi_k = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(qx4k, 4)), offset8);
+                sums[k] = vaddq_s32(vmmlaq_s32(vdupq_n_s32(0), qx_lo_k, qy0k),
+                                     vmmlaq_s32(vdupq_n_s32(0), qx_hi_k, qy1k));
+                scales[k] = fp16_to_fp32_lookup(x[ki].d) * fp16_to_fp32_lookup(y[ki].d);
+            }
+            /* Fused post-processing: scvtf + fmul(scale) per block, accumulate in float32x4 */
+            float di = scales[0];
+            float dj = scales[1];
+            float dk = scales[2];
+            float dl = scales[3];
+            acc = vmlaq_n_f32(acc, vcvtq_f32_s32(sums[0]), di);
+            acc = vmlaq_n_f32(acc, vcvtq_f32_s32(sums[1]), dj);
+            acc = vmlaq_n_f32(acc, vcvtq_f32_s32(sums[2]), dk);
+            acc = vmlaq_n_f32(acc, vcvtq_f32_s32(sums[3]), dl);
+        }
+        sumf = vaddvq_f32(acc);
+
+        /* Tail: 1-3 blocks */
         for (; ib + 1 < nb; ib += 2) {
-            /* Block ib */
             const uint8x16_t qx4 = vld1q_u8(x[ib].qs);
             const int8x16_t qy0 = vld1q_s8(y[ib].qs);
             const int8x16_t qy1 = vld1q_s8(y[ib].qs + 16);
@@ -2760,11 +2793,9 @@ float vec_dot_q4_0_q8_0(const void *vx, const void *wy, int n) {
             int8x16_t qx_hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(qx4, 4)), offset8);
             int32x4_t s = vaddq_s32(vmmlaq_s32(vdupq_n_s32(0), qx_lo, qy0),
                                      vmmlaq_s32(vdupq_n_s32(0), qx_hi, qy1));
-            int32_t dot_i = vgetq_lane_s32(s, 0) + vgetq_lane_s32(s, 3);
             float di = fp16_to_fp32_lookup(x[ib].d) * fp16_to_fp32_lookup(y[ib].d);
-            sumf += (float)dot_i * di;
+            acc = vmlaq_n_f32(acc, vcvtq_f32_s32(s), di);
 
-            /* Block ib+1 */
             const uint8x16_t qx4b = vld1q_u8(x[ib+1].qs);
             const int8x16_t qyb0 = vld1q_s8(y[ib+1].qs);
             const int8x16_t qyb1 = vld1q_s8(y[ib+1].qs + 16);
@@ -2772,9 +2803,23 @@ float vec_dot_q4_0_q8_0(const void *vx, const void *wy, int n) {
             int8x16_t qx_hi_b = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(qx4b, 4)), offset8);
             int32x4_t sb = vaddq_s32(vmmlaq_s32(vdupq_n_s32(0), qx_lo_b, qyb0),
                                       vmmlaq_s32(vdupq_n_s32(0), qx_hi_b, qyb1));
-            int32_t dot_j = vgetq_lane_s32(sb, 0) + vgetq_lane_s32(sb, 3);
             float dj = fp16_to_fp32_lookup(x[ib+1].d) * fp16_to_fp32_lookup(y[ib+1].d);
-            sumf += (float)dot_j * dj;
+            acc = vmlaq_n_f32(acc, vcvtq_f32_s32(sb), dj);
+        }
+        sumf += vaddvq_f32(acc);
+
+        /* Final single block */
+        for (; ib < nb; ib++) {
+            const uint8x16_t qx4 = vld1q_u8(x[ib].qs);
+            const int8x16_t qy0 = vld1q_s8(y[ib].qs);
+            const int8x16_t qy1 = vld1q_s8(y[ib].qs + 16);
+            int8x16_t qx_lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(qx4, mask4)), offset8);
+            int8x16_t qx_hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(qx4, 4)), offset8);
+            int32x4_t s = vaddq_s32(vmmlaq_s32(vdupq_n_s32(0), qx_lo, qy0),
+                                     vmmlaq_s32(vdupq_n_s32(0), qx_hi, qy1));
+            float di = fp16_to_fp32_lookup(x[ib].d) * fp16_to_fp32_lookup(y[ib].d);
+            int32_t dot_i = vgetq_lane_s32(s, 0) + vgetq_lane_s32(s, 3);
+            sumf += (float)dot_i * di;
         }
     }
 
@@ -2885,27 +2930,68 @@ float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n) {
     sumf = hsum_avx(acc);
 
 #elif defined(PICOLM_I8MM)
-    /* I8MM: vmmlaq_s32 for int8 x int8 -> int32 MAC, 2 blocks/iter */
-    for (i = 0; i + 1 < nb; i += 2) {
-        const int8x16_t xi_0 = vld1q_s8(x[i].qs);
-        const int8x16_t xi_1 = vld1q_s8(x[i].qs + 16);
-        const int8x16_t wi_0 = vld1q_s8(w[i].qs);
-        const int8x16_t wi_1 = vld1q_s8(w[i].qs + 16);
-        int32x4_t si = vaddq_s32(vmmlaq_s32(vdupq_n_s32(0), xi_0, wi_0),
-                                  vmmlaq_s32(vdupq_n_s32(0), xi_1, wi_1));
-        int32_t dot_i = vgetq_lane_s32(si, 0) + vgetq_lane_s32(si, 3);
-        const float d = fp16_to_fp32_lookup(x[i].d) * fp16_to_fp32_lookup(w[i].d);
-        sumf += (float)dot_i * d;
+    /* Fused I8MM: vmmlaq_s32 for int8 x int8 -> int32 MAC,
+     * with scvtf + scale multiply fused in NEON (MNN-style epilogue).
+     *
+     * vmmlaq_s32 on 32 int8 x int8 (split as 16+16) produces:
+     *   lane 0 = dot(8 pairs), lane 3 = dot(8 pairs) for each half.
+     * After vaddq of two vmmlaq: lane 0 = dot(16), lane 3 = dot(16).
+     * Total dot = lane 0 + lane 3.
+     *
+     * We accumulate in float32x4 using vmlaq_n_f32 to fuse scvtf+fmul,
+     * processing 4 blocks per iteration for register efficiency. */
+    {
+        float32x4_t acc = vdupq_n_f32(0.0f);
+        for (i = 0; i + 3 < nb; i += 4) {
+            int32x4_t sums[4];
+            float scales[4];
+            for (int k = 0; k < 4; k++) {
+                int ki = i + k;
+                const int8x16_t xi0 = vld1q_s8(x[ki].qs);
+                const int8x16_t xi1 = vld1q_s8(x[ki].qs + 16);
+                const int8x16_t wi0 = vld1q_s8(w[ki].qs);
+                const int8x16_t wi1 = vld1q_s8(w[ki].qs + 16);
+                sums[k] = vaddq_s32(vmmlaq_s32(vdupq_n_s32(0), xi0, wi0),
+                                     vmmlaq_s32(vdupq_n_s32(0), xi1, wi1));
+                scales[k] = fp16_to_fp32_lookup(x[ki].d) * fp16_to_fp32_lookup(w[ki].d);
+            }
+            acc = vmlaq_n_f32(acc, vcvtq_f32_s32(sums[0]), scales[0]);
+            acc = vmlaq_n_f32(acc, vcvtq_f32_s32(sums[1]), scales[1]);
+            acc = vmlaq_n_f32(acc, vcvtq_f32_s32(sums[2]), scales[2]);
+            acc = vmlaq_n_f32(acc, vcvtq_f32_s32(sums[3]), scales[3]);
+        }
+        sumf = vaddvq_f32(acc);
 
-        const int8x16_t xj_0 = vld1q_s8(x[i+1].qs);
-        const int8x16_t xj_1 = vld1q_s8(x[i+1].qs + 16);
-        const int8x16_t wj_0 = vld1q_s8(w[i+1].qs);
-        const int8x16_t wj_1 = vld1q_s8(w[i+1].qs + 16);
-        int32x4_t sj = vaddq_s32(vmmlaq_s32(vdupq_n_s32(0), xj_0, wj_0),
-                                  vmmlaq_s32(vdupq_n_s32(0), xj_1, wj_1));
-        int32_t dot_j = vgetq_lane_s32(sj, 0) + vgetq_lane_s32(sj, 3);
-        const float dj = fp16_to_fp32_lookup(x[i+1].d) * fp16_to_fp32_lookup(w[i+1].d);
-        sumf += (float)dot_j * dj;
+        /* Tail: 1-3 blocks via scalar extraction */
+        for (; i + 1 < nb; i += 2) {
+            const int8x16_t xi_0 = vld1q_s8(x[i].qs);
+            const int8x16_t xi_1 = vld1q_s8(x[i].qs + 16);
+            const int8x16_t wi_0 = vld1q_s8(w[i].qs);
+            const int8x16_t wi_1 = vld1q_s8(w[i].qs + 16);
+            int32x4_t si = vaddq_s32(vmmlaq_s32(vdupq_n_s32(0), xi_0, wi_0),
+                                      vmmlaq_s32(vdupq_n_s32(0), xi_1, wi_1));
+            int32_t dot_i = vgetq_lane_s32(si, 0) + vgetq_lane_s32(si, 3);
+            sumf += (float)dot_i * fp16_to_fp32_lookup(x[i].d) * fp16_to_fp32_lookup(w[i].d);
+
+            const int8x16_t xj_0 = vld1q_s8(x[i+1].qs);
+            const int8x16_t xj_1 = vld1q_s8(x[i+1].qs + 16);
+            const int8x16_t wj_0 = vld1q_s8(w[i+1].qs);
+            const int8x16_t wj_1 = vld1q_s8(w[i+1].qs + 16);
+            int32x4_t sj = vaddq_s32(vmmlaq_s32(vdupq_n_s32(0), xj_0, wj_0),
+                                      vmmlaq_s32(vdupq_n_s32(0), xj_1, wj_1));
+            int32_t dot_j = vgetq_lane_s32(sj, 0) + vgetq_lane_s32(sj, 3);
+            sumf += (float)dot_j * fp16_to_fp32_lookup(x[i+1].d) * fp16_to_fp32_lookup(w[i+1].d);
+        }
+        for (; i < nb; i++) {
+            const int8x16_t xi_0 = vld1q_s8(x[i].qs);
+            const int8x16_t xi_1 = vld1q_s8(x[i].qs + 16);
+            const int8x16_t wi_0 = vld1q_s8(w[i].qs);
+            const int8x16_t wi_1 = vld1q_s8(w[i].qs + 16);
+            int32x4_t si = vaddq_s32(vmmlaq_s32(vdupq_n_s32(0), xi_0, wi_0),
+                                      vmmlaq_s32(vdupq_n_s32(0), xi_1, wi_1));
+            int32_t dot_i = vgetq_lane_s32(si, 0) + vgetq_lane_s32(si, 3);
+            sumf += (float)dot_i * fp16_to_fp32_lookup(x[i].d) * fp16_to_fp32_lookup(w[i].d);
+        }
     }
 
 #elif defined(PICOLM_NEON)
@@ -3297,11 +3383,67 @@ void gemm_q4_0_4x8_i8mm(const void *W, const int8_t *X_repacked, const float *ad
         const block_q4_0x4 *wb = (const block_q4_0x4 *)W + (size_t)(br / 4) * nb;
 
         for (int bc = 0; bc < n_batch; bc++) {
-            float acc[4] = {0};
+            /* Fused I8MM: process 4 blocks per group, accumulating int32
+             * in NEON registers, then doing scvtf + fmul(scale) in float32x4.
+             *
+             * Each block has different wd[r] and adelta, so we cannot
+             * accumulate raw int32 across all blocks and multiply once.
+             * Instead, we group 4 blocks: accumulate int32 per block in
+             * 4 int32x4 registers, then convert to float32 and multiply
+             * by the combined scale (wd[r]*adelta), adding into a running
+             * float32 accumulator. This mirrors MNN's approach where
+             * scale multiply happens inside the SIMD kernel. */
+            float row_sum[4] = {0};
             const int8_t *xrep = X_repacked + (size_t)bc * nb * 32;
             const float *ad_bc = ad + (size_t)bc * nb;
 
-            for (int ib = 0; ib < nb; ib++) {
+            /* Process 4 blocks per group */
+            for (int ib = 0; ib + 3 < nb; ib += 4) {
+                float32x4_t f_acc[4];
+                f_acc[0] = vdupq_n_f32(0.0f);
+                f_acc[1] = vdupq_n_f32(0.0f);
+                f_acc[2] = vdupq_n_f32(0.0f);
+                f_acc[3] = vdupq_n_f32(0.0f);
+
+                for (int k = 0; k < 4; k++) {
+                    int ki = ib + k;
+                    const block_q4_0x4 *b = wb + ki;
+                    const uint8_t *wqs = (const uint8_t *)b->qs;
+                    const int8_t *aq = xrep + ki * 32;
+                    float adelta = ad_bc[ki];
+
+                    int8x16_t B0 = vld1q_s8(aq);
+                    int8x16_t B1 = vld1q_s8(aq + 16);
+
+                    for (int r = 0; r < 4; r++) {
+                        uint8x8_t wb0 = vld1_u8(wqs + r * 8);
+                        int8x8_t lo0 = vshl_n_s8(vreinterpret_s8_u8(wb0), 4);
+                        lo0 = vshr_n_s8(lo0, 4);
+                        int8x8_t hi0 = vshr_n_s8(vreinterpret_s8_u8(wb0), 4);
+
+                        uint8x8_t wb1 = vld1_u8(wqs + 32 + r * 8);
+                        int8x8_t lo1 = vshl_n_s8(vreinterpret_s8_u8(wb1), 4);
+                        lo1 = vshr_n_s8(lo1, 4);
+                        int8x8_t hi1 = vshr_n_s8(vreinterpret_s8_u8(wb1), 4);
+
+                        int8x16_t A0 = vcombine_s8(lo0, hi0);
+                        int8x16_t A1 = vcombine_s8(lo1, hi1);
+
+                        int32x4_t r0 = vmmlaq_s32(vdupq_n_s32(0), A0, B0);
+                        int32x4_t r1 = vmmlaq_s32(vdupq_n_s32(0), A1, B1);
+                        int32x4_t sum = vaddq_s32(r0, r1);
+
+                        float scale = fp16_to_fp32_lookup(b->d[r]) * adelta;
+                        f_acc[r] = vmlaq_n_f32(f_acc[r], vcvtq_f32_s32(sum), scale);
+                    }
+                }
+
+                for (int r = 0; r < 4; r++)
+                    row_sum[r] += vaddvq_f32(f_acc[r]);
+            }
+
+            /* Tail: 1-3 blocks */
+            for (; ib < nb; ib++) {
                 const block_q4_0x4 *b = wb + ib;
                 const uint8_t *wqs = (const uint8_t *)b->qs;
                 const int8_t *aq = xrep + ib * 32;
@@ -3309,12 +3451,6 @@ void gemm_q4_0_4x8_i8mm(const void *W, const int8_t *X_repacked, const float *ad
 
                 int8x16_t B0 = vld1q_s8(aq);
                 int8x16_t B1 = vld1q_s8(aq + 16);
-
-                float wd[4];
-                wd[0] = fp16_to_fp32_lookup(b->d[0]);
-                wd[1] = fp16_to_fp32_lookup(b->d[1]);
-                wd[2] = fp16_to_fp32_lookup(b->d[2]);
-                wd[3] = fp16_to_fp32_lookup(b->d[3]);
 
                 for (int r = 0; r < 4; r++) {
                     uint8x8_t wb0 = vld1_u8(wqs + r * 8);
@@ -3332,14 +3468,15 @@ void gemm_q4_0_4x8_i8mm(const void *W, const int8_t *X_repacked, const float *ad
 
                     int32x4_t r0 = vmmlaq_s32(vdupq_n_s32(0), A0, B0);
                     int32x4_t r1 = vmmlaq_s32(vdupq_n_s32(0), A1, B1);
-
-                    int32_t ra[4]; vst1q_s32(ra, r0);
-                    int32_t rb[4]; vst1q_s32(rb, r1);
-                    acc[r] += (float)(ra[0] + ra[3] + rb[0] + rb[3]) * wd[r] * adelta;
+                    int32x4_t sum = vaddq_s32(r0, r1);
+                    int32_t ra[4]; vst1q_s32(ra, sum);
+                    row_sum[r] += (float)(ra[0] + ra[3]) *
+                        fp16_to_fp32_lookup(b->d[r]) * adelta;
                 }
             }
+
             for (int r = 0; r < 4; r++)
-                out[(size_t)bc * d + br + r] = acc[r];
+                out[(size_t)bc * d + br + r] = row_sum[r];
         }
     }
 }
@@ -5067,5 +5204,220 @@ void picolm_hadamard_transform(float *x, int head_dim, int nrot) {
     for (int b = 0; b < nblocks; b++) {
         const float *signs = (nrot == 32) ? picolm_wht_signs_32 : NULL;
         picolm_fast_ht(x + b * nrot, nrot, signs);
+    }
+}
+
+/* ================================================================
+ * TurboQuant TQ3: 3-bit Lloyd-Max codebook KV cache quantization
+ *
+ * Based on MNN's TurboQuant.hpp (Alibaba, 2024)
+ * Algorithm: RMS normalize -> WHT forward (sign-randomized) ->
+ *            Lloyd-Max 3-bit scalar quantization -> 14 bytes/block
+ *
+ * Block layout: [2 bytes fp16 RMS scale] [12 bytes packed 3-bit indices]
+ * 32 values -> 14 bytes = 3.5 bits/value (vs Q4_0: 4.25 bits/value)
+ *
+ * The WHT used here is block_size=32 with deterministic sign flips
+ * (golden ratio hash). This is the same transform as picolm_fast_ht
+ * with signs=picolm_wht_signs_32, but TQ3 hardcodes block=32.
+ * ================================================================ */
+
+const float tq3_codebook[8] = TQ3_CODEBOOK_8;
+const float tq3_boundaries[7] = TQ3_BOUNDARIES_7;
+const float tq3_signs[32] = TQ3_SIGNS_32;
+
+/* Pack 8 3-bit indices into 3 bytes */
+static inline void tq3_pack_3bit_8(uint8_t *dst, const uint8_t *idx) {
+    dst[0] = (uint8_t)(idx[0] | (idx[1] << 3) | (idx[2] << 6));
+    dst[1] = (uint8_t)((idx[2] >> 2) | (idx[3] << 1) | (idx[4] << 4) | (idx[5] << 7));
+    dst[2] = (uint8_t)((idx[5] >> 1) | (idx[6] << 2) | (idx[7] << 5));
+}
+/* tq3_unpack_3bit_8 is declared in quant.h as static inline for use in model.c */
+
+/* Find nearest TQ3 codebook index (scalar) */
+static inline uint8_t tq3_find_nearest(float val) {
+    uint8_t idx = 0;
+    for (int b = 0; b < 7; b++) {
+        if (val > tq3_boundaries[b]) idx = (uint8_t)(b + 1);
+    }
+    return idx;
+}
+
+/* WHT forward for TQ3 block (32 elements, in-place)
+ * Uses the same butterfly as picolm_fast_ht but with TQ3 signs hardcoded. */
+static void tq3_wht_forward_32(float *out, const float *in) {
+    /* Step 1: Apply sign flips */
+    for (int i = 0; i < 32; i++) out[i] = in[i] * tq3_signs[i];
+
+    /* Step 2: Butterfly stages (log2(32) = 5) */
+    for (int step = 1; step < 32; step <<= 1) {
+        for (int i = 0; i < 32; i += step << 1) {
+            for (int j = i; j < i + step; j++) {
+                float a = out[j];
+                float b = out[j + step];
+                out[j] = a + b;
+                out[j + step] = a - b;
+            }
+        }
+    }
+
+    /* Step 3: Normalize by 1/sqrt(32) */
+    const float norm = 1.0f / sqrtf(32.0f);
+    for (int i = 0; i < 32; i++) out[i] *= norm;
+}
+
+/* WHT inverse for TQ3 block (32 elements, out-of-place)
+ * Applies butterfly + normalize + undo sign flips. */
+static void tq3_wht_inverse_32(float *out, const float *in) {
+    /* Step 1: Copy input */
+    for (int i = 0; i < 32; i++) out[i] = in[i];
+
+    /* Step 2: Butterfly stages (self-inverse up to scaling) */
+    for (int step = 1; step < 32; step <<= 1) {
+        for (int i = 0; i < 32; i += step << 1) {
+            for (int j = i; j < i + step; j++) {
+                float a = out[j];
+                float b = out[j + step];
+                out[j] = a + b;
+                out[j + step] = a - b;
+            }
+        }
+    }
+
+    /* Step 3: Normalize and undo sign flips */
+    const float norm = 1.0f / sqrtf(32.0f);
+    for (int i = 0; i < 32; i++) out[i] *= norm * tq3_signs[i];
+}
+
+/* ---- quantize_row_tq3: float32 -> TQ3 blocks ---- */
+void quantize_row_tq3(const float *x, void *dst, int n) {
+    assert(n > 0 && (n % TQ3_BLOCK_SIZE) == 0);
+    block_tq3 *blocks = (block_tq3 *)dst;
+    int nb = n / TQ3_BLOCK_SIZE;
+
+    for (int bi = 0; bi < nb; bi++) {
+        const float *src = x + bi * TQ3_BLOCK_SIZE;
+
+        /* Step 1: Compute RMS scale */
+        float sumSq = 0.0f;
+        for (int i = 0; i < TQ3_BLOCK_SIZE; i++)
+            sumSq += src[i] * src[i];
+        float rms = sqrtf(sumSq / TQ3_BLOCK_SIZE);
+        if (rms < 1e-10f) rms = 1e-10f;
+
+        blocks[bi].d = fp32_to_fp16(rms);
+
+        /* Step 2: Normalize by RMS */
+        float normalized[TQ3_BLOCK_SIZE];
+        float invRms = 1.0f / rms;
+        for (int i = 0; i < TQ3_BLOCK_SIZE; i++)
+            normalized[i] = src[i] * invRms;
+
+        /* Step 3: WHT forward with sign pattern */
+        float rotated[TQ3_BLOCK_SIZE];
+        tq3_wht_forward_32(rotated, normalized);
+
+        /* Step 4: Find nearest codebook index per element */
+        uint8_t indices[TQ3_BLOCK_SIZE];
+        for (int i = 0; i < TQ3_BLOCK_SIZE; i++)
+            indices[i] = tq3_find_nearest(rotated[i]);
+
+        /* Step 5: Pack 3-bit indices (4 groups of 8 -> 12 bytes) */
+        for (int g = 0; g < 4; g++)
+            tq3_pack_3bit_8(blocks[bi].qs + g * 3, indices + g * 8);
+    }
+}
+
+/* ---- vec_dot_tq3_f32: TQ3-encoded K dot float32 pre-rotated Q ----
+ *
+ * The Q input must already be WHT-forward rotated (block=32) with
+ * the TQ3 sign pattern. This is the same rotation applied during
+ * quantization, so the dot product simplifies to:
+ *   dot = scale * sum(q_rotated[i] * codebook[idx[i]])
+ * No inverse WHT needed. */
+float vec_dot_tq3_f32(const void *src, const float *q_rotated, int n) {
+    assert(n > 0 && (n % TQ3_BLOCK_SIZE) == 0);
+    const block_tq3 *blocks = (const block_tq3 *)src;
+    int nb = n / TQ3_BLOCK_SIZE;
+    float sumf = 0.0f;
+
+    for (int bi = 0; bi < nb; bi++) {
+        float scale = fp16_to_fp32(blocks[bi].d);
+        const uint8_t *packed = blocks[bi].qs;
+        float dot = 0.0f;
+
+        for (int g = 0; g < 4; g++) {
+            uint8_t indices[8];
+            tq3_unpack_3bit_8(indices, packed + g * 3);
+            for (int k = 0; k < 8; k++) {
+                dot += q_rotated[g * 8 + k] * tq3_codebook[indices[k]];
+            }
+        }
+        sumf += dot * scale;
+    }
+    return sumf;
+}
+
+/* ---- scale_add_tq3_f32: dst[i] += scale * tq3_dequant(src[i]) ----
+ *
+ * Full dequantization path: unpack -> codebook lookup -> WHT inverse ->
+ * scale multiply -> add to destination. The inverse WHT is applied per
+ * TQ3 block (32 elements) before writing to dst. */
+void scale_add_tq3_f32(float *dst, float scale, const void *src, int n) {
+    assert(n > 0 && (n % TQ3_BLOCK_SIZE) == 0);
+    const block_tq3 *blocks = (const block_tq3 *)src;
+    int nb = n / TQ3_BLOCK_SIZE;
+
+    for (int bi = 0; bi < nb; bi++) {
+        float block_scale = scale * fp16_to_fp32(blocks[bi].d);
+        const uint8_t *packed = blocks[bi].qs;
+
+        /* Unpack indices and look up codebook values -> rotated domain */
+        float rotated[TQ3_BLOCK_SIZE];
+        for (int g = 0; g < 4; g++) {
+            uint8_t indices[8];
+            tq3_unpack_3bit_8(indices, packed + g * 3);
+            for (int k = 0; k < 8; k++)
+                rotated[g * 8 + k] = tq3_codebook[indices[k]];
+        }
+
+        /* WHT inverse -> original domain, then scale + add */
+        float reconstructed[TQ3_BLOCK_SIZE];
+        tq3_wht_inverse_32(reconstructed, rotated);
+        for (int i = 0; i < TQ3_BLOCK_SIZE; i++)
+            dst[bi * TQ3_BLOCK_SIZE + i] += reconstructed[i] * block_scale;
+    }
+}
+
+/* ---- fma_scale_tq3_f32: dst[i] = dst[i] * correction + tq3_dequant(src[i]) ----
+ *
+ * Used for the online softmax "new max" path in attention.
+ * correction = exp(old_max - new_max), dst *= correction, then add dequant. */
+void fma_scale_tq3_f32(float *dst, float correction, const void *src, int n) {
+    assert(n > 0 && (n % TQ3_BLOCK_SIZE) == 0);
+    const block_tq3 *blocks = (const block_tq3 *)src;
+    int nb = n / TQ3_BLOCK_SIZE;
+
+    for (int bi = 0; bi < nb; bi++) {
+        float block_scale = fp16_to_fp32(blocks[bi].d);
+        const uint8_t *packed = blocks[bi].qs;
+        float *dptr = dst + bi * TQ3_BLOCK_SIZE;
+
+        /* Unpack indices and look up codebook values */
+        float rotated[TQ3_BLOCK_SIZE];
+        for (int g = 0; g < 4; g++) {
+            uint8_t indices[8];
+            tq3_unpack_3bit_8(indices, packed + g * 3);
+            for (int k = 0; k < 8; k++)
+                rotated[g * 8 + k] = tq3_codebook[indices[k]];
+        }
+
+        /* WHT inverse -> original domain */
+        float reconstructed[TQ3_BLOCK_SIZE];
+        tq3_wht_inverse_32(reconstructed, rotated);
+
+        /* FMA: dst[i] = dst[i] * correction + reconstructed[i] * scale */
+        for (int i = 0; i < TQ3_BLOCK_SIZE; i++)
+            dptr[i] = dptr[i] * correction + reconstructed[i] * block_scale;
     }
 }

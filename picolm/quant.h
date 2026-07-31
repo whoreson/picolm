@@ -376,6 +376,51 @@ typedef struct {
     uint16_t d;          /* scale (FP16) */
     int8_t   qs[32];     /* 8-bit quantized values */
 } block_q8_0;            /* 34 bytes */
+
+/* TurboQuant TQ3 block: 32 values in 14 bytes (3.5 bits/value)
+ * Pipeline: RMS normalize -> WHT forward (sign-randomized) -> Lloyd-Max 3-bit
+ * Dequant: unpack indices -> codebook lookup -> WHT inverse -> scale restore
+ *
+ * Layout: 2 bytes fp16 RMS scale + 12 bytes packed 3-bit indices.
+ * 8-element Lloyd-Max codebook for N(0,1): {-2.15, -1.34, -0.76, -0.25, 0.25, 0.76, 1.34, 2.15} */
+typedef struct {
+    uint16_t d;          /* RMS scale (FP16) */
+    uint8_t  qs[12];     /* 32 values x 3-bit packed = 12 bytes */
+} block_tq3;             /* 14 bytes */
+
+/* TQ3 Lloyd-Max codebook centroids for N(0,1) */
+#define TQ3_CODEBOOK_8 { -2.1519f, -1.3439f, -0.7560f, -0.2451f, \
+                          0.2451f,  0.7560f,  1.3439f,  2.1519f }
+
+/* TQ3 decision boundaries (midpoints between consecutive centroids) */
+#define TQ3_BOUNDARIES_7 { -1.7479f, -1.0500f, -0.5005f, 0.0f, 0.5005f, 1.0500f, 1.7479f }
+
+/* TQ3 deterministic sign pattern (golden ratio hash) */
+#define TQ3_SIGNS_32 { \
+    1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, \
+   -1.0f,-1.0f, 1.0f,-1.0f, 1.0f, 1.0f,-1.0f, 1.0f, \
+   -1.0f,-1.0f, 1.0f,-1.0f, 1.0f,-1.0f,-1.0f, 1.0f, \
+   -1.0f, 1.0f, 1.0f,-1.0f, 1.0f,-1.0f,-1.0f, 1.0f }
+
+/* TQ3 block size */
+#define TQ3_BLOCK_SIZE 32
+
+/* TQ3 data exposed for use in model.c attention path */
+extern const float tq3_codebook[8];
+extern const float tq3_boundaries[7];
+extern const float tq3_signs[32];
+
+static inline void tq3_unpack_3bit_8(uint8_t *dst, const uint8_t *src) {
+    dst[0] = src[0] & 7;
+    dst[1] = (src[0] >> 3) & 7;
+    dst[2] = ((src[0] >> 6) | (src[1] << 2)) & 7;
+    dst[3] = (src[1] >> 1) & 7;
+    dst[4] = (src[1] >> 4) & 7;
+    dst[5] = ((src[1] >> 7) | (src[2] << 1)) & 7;
+    dst[6] = src[2] >> 2;
+    dst[7] = (src[2] >> 5) & 7;
+}
+
 #pragma pack(pop)
 
 /* I8MM repacked activation for Q4_0_4x8 gemm
@@ -517,6 +562,11 @@ void quantize_row_q8_0(const float *x, void *dst, int n);
  * dst must have space for (n / 32) * sizeof(block_q4_0) bytes. */
 void quantize_row_q4_0(const float *x, void *dst, int n);
 
+/* Quantize a float32 vector to TQ3 blocks (TurboQuant 3-bit codebook).
+ * dst must have space for (n / 32) * sizeof(block_tq3) bytes.
+ * n must be a multiple of 32. */
+void quantize_row_tq3(const float *x, void *dst, int n);
+
 /* Converts one Q4_0 weight row to a "shadow" Q8_0 representation: same
  * per-block delta, values unpacked to (nibble - 8) directly as int8.
  * Q4_0's dequant formula is exactly (nibble-8)*d, which is exactly what
@@ -544,6 +594,20 @@ void scale_add_q4_0_f32(float *dst, float scale, const void *src, int n);
  * Used for the online softmax "new max" path in attention. */
 void fma_scale_q8_0_f32(float *dst, float correction, const void *src, int n);
 void fma_scale_q4_0_f32(float *dst, float correction, const void *src, int n);
+
+/* ---- TQ3 KV cache helpers ---- */
+/* vec_dot_tq3_f32: dot product of TQ3-encoded K with float32 Q.
+ * Q must be pre-rotated with WHT forward (block=32) before calling.
+ * Returns: scale * sum(q_rotated[i] * codebook[idx[i]]). */
+float vec_dot_tq3_f32(const void *src, const float *q_rotated, int n);
+
+/* scale_add_tq3_f32: dst[i] += scale * tq3_dequant(src[i]).
+ * Result is in the ORIGINAL domain (inverse WHT applied). */
+void scale_add_tq3_f32(float *dst, float scale, const void *src, int n);
+
+/* fma_scale_tq3_f32: dst[i] = dst[i] * correction + tq3_dequant(src[i]).
+ * Result is in the ORIGINAL domain (inverse WHT applied). */
+void fma_scale_tq3_f32(float *dst, float correction, const void *src, int n);
 
 /* ---- Walsh-Hadamard Transform (for KV cache rotation) ---- */
 /* In-place Walsh-Hadamard transform of n elements.

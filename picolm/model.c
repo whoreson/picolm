@@ -1649,6 +1649,7 @@ static size_t kv_row_size_gqa(kv_cache_type_t kv_type, int n_elements) {
         case KV_CACHE_F16:  return (size_t)n_elements * sizeof(uint16_t);
         case KV_CACHE_Q8_0: return ((size_t)(n_elements / 32)) * sizeof(block_q8_0);
         case KV_CACHE_Q4_0: return ((size_t)(n_elements / 32)) * sizeof(block_q4_0);
+        case KV_CACHE_TQ3:  return ((size_t)(n_elements / TQ3_BLOCK_SIZE)) * sizeof(block_tq3);
     }
     return 0;
 }
@@ -1656,12 +1657,13 @@ static size_t kv_row_size_gqa(kv_cache_type_t kv_type, int n_elements) {
 /* kv_head_stride: byte offset between consecutive heads within a GQA row
  * For FP16: head_dim * sizeof(uint16_t)
  * For quantized: the quantized size of head_dim elements
- * (for head_dim=64: Q8_0=68, Q4_0=44) */
+ * (for head_dim=64: Q8_0=68, Q4_0=44, TQ3=28) */
 static size_t kv_head_stride(kv_cache_type_t kv_type, int head_dim) {
     switch (kv_type) {
         case KV_CACHE_F16:  return (size_t)head_dim * sizeof(uint16_t);
         case KV_CACHE_Q8_0: return ((size_t)(head_dim / 32)) * sizeof(block_q8_0);
         case KV_CACHE_Q4_0: return ((size_t)(head_dim / 32)) * sizeof(block_q4_0);
+        case KV_CACHE_TQ3:  return ((size_t)(head_dim / TQ3_BLOCK_SIZE)) * sizeof(block_tq3);
     }
     return 0;
 }
@@ -2597,6 +2599,38 @@ static void attention_group(int kv_head_idx, void *ctx_ptr) {
             dequantize_row_q8_0(kt, k_f32, head_dim);
         } else if (ctx->kv_type_k == KV_CACHE_Q4_0) {
             dequantize_row_q4_0(kt, k_f32, head_dim);
+        } else if (ctx->kv_type_k == KV_CACHE_TQ3) {
+            /* TQ3 K: use vec_dot_tq3_f32 directly (Q is pre-rotated) */
+            /* For AVX512 path, dequant to f32 for uniform dot product */
+            float k_f32_tq3[256];
+            for (int hkv_block = 0; hkv_block < head_dim; hkv_block += TQ3_BLOCK_SIZE) {
+                float tmp[32];
+                const block_tq3 *tb = (const block_tq3 *)kt;
+                /* Inline TQ3 dequant per block */
+                const block_tq3 *blk = &tb[hkv_block / TQ3_BLOCK_SIZE];
+                float sc = fp16_to_fp32(blk->d);
+                float rot[32];
+                for (int gg = 0; gg < 4; gg++) {
+                    uint8_t idx8[8];
+                    tq3_unpack_3bit_8(idx8, blk->qs + gg * 3);
+                    for (int kk = 0; kk < 8; kk++)
+                        rot[gg * 8 + kk] = tq3_codebook[idx8[kk]];
+                }
+                /* WHT inverse */
+                {
+                    float tmp2[32]; memcpy(tmp2, rot, sizeof(tmp2));
+                    for (int step = 1; step < 32; step <<= 1)
+                        for (int ii = 0; ii < 32; ii += step << 1)
+                            for (int jj = ii; jj < ii + step; jj++) {
+                                float aa = tmp2[jj], bb = tmp2[jj + step];
+                                tmp2[jj] = aa + bb; tmp2[jj + step] = aa - bb;
+                            }
+                    const float norm = 1.0f / 5.656854f; /* 1/sqrt(32) */
+                    for (int ii = 0; ii < 32; ii++)
+                        k_f32_tq3[hkv_block + ii] = tmp2[ii] * norm * tq3_signs[ii] * sc;
+                }
+            }
+            memcpy(k_f32, k_f32_tq3, head_dim * sizeof(float));
         } else {
             /* FP16: SIMD-accelerated conversion */
             const uint16_t *k16 = (const uint16_t *)kt;
@@ -2612,6 +2646,32 @@ static void attention_group(int kv_head_idx, void *ctx_ptr) {
             dequantize_row_q8_0(vt, v_f32, head_dim);
         } else if (ctx->kv_type_v == KV_CACHE_Q4_0) {
             dequantize_row_q4_0(vt, v_f32, head_dim);
+        } else if (ctx->kv_type_v == KV_CACHE_TQ3) {
+            /* TQ3 V: dequant to f32 for uniform path */
+            for (int hkv_block = 0; hkv_block < head_dim; hkv_block += TQ3_BLOCK_SIZE) {
+                float rot[32];
+                const block_tq3 *blk = (const block_tq3 *)((const uint8_t *)vt +
+                    (hkv_block / TQ3_BLOCK_SIZE) * sizeof(block_tq3));
+                float sc = fp16_to_fp32(blk->d);
+                for (int gg = 0; gg < 4; gg++) {
+                    uint8_t idx8[8];
+                    tq3_unpack_3bit_8(idx8, blk->qs + gg * 3);
+                    for (int kk = 0; kk < 8; kk++)
+                        rot[gg * 8 + kk] = tq3_codebook[idx8[kk]];
+                }
+                {
+                    float tmp2[32]; memcpy(tmp2, rot, sizeof(tmp2));
+                    for (int step = 1; step < 32; step <<= 1)
+                        for (int ii = 0; ii < 32; ii += step << 1)
+                            for (int jj = ii; jj < ii + step; jj++) {
+                                float aa = tmp2[jj], bb = tmp2[jj + step];
+                                tmp2[jj] = aa + bb; tmp2[jj + step] = aa - bb;
+                            }
+                    const float norm = 1.0f / 5.656854f;
+                    for (int ii = 0; ii < 32; ii++)
+                        v_f32[hkv_block + ii] = tmp2[ii] * norm * tq3_signs[ii] * sc;
+                }
+            }
         } else {
             /* FP16: SIMD-accelerated conversion */
             const uint16_t *v16 = (const uint16_t *)vt;
@@ -2678,6 +2738,7 @@ static void attention_group(int kv_head_idx, void *ctx_ptr) {
             float score;
             if (ctx->kv_type_k == KV_CACHE_Q8_0) score = vec_dot_q8_0_f32(kt, qg, head_dim);
             else if (ctx->kv_type_k == KV_CACHE_Q4_0) score = vec_dot_q4_0_f32(kt, qg, head_dim);
+            else if (ctx->kv_type_k == KV_CACHE_TQ3) score = vec_dot_tq3_f32(kt, qg, head_dim);
             else score = vec_dot_f16_f32(kt, qg, head_dim);
             score /= sqrtf((float)head_dim);
 
@@ -2687,6 +2748,7 @@ static void attention_group(int kv_head_idx, void *ctx_ptr) {
                 sum_exp[g] = sum_exp[g] * correction + 1.0f;
                 if (ctx->kv_type_v == KV_CACHE_Q8_0) fma_scale_q8_0_f32(accg, correction, vt, head_dim);
                 else if (ctx->kv_type_v == KV_CACHE_Q4_0) fma_scale_q4_0_f32(accg, correction, vt, head_dim);
+                else if (ctx->kv_type_v == KV_CACHE_TQ3) fma_scale_tq3_f32(accg, correction, vt, head_dim);
                 else {
                     const uint16_t *vt16 = (const uint16_t *)vt;
                     for (int d = 0; d < head_dim; d++) accg[d] = accg[d] * correction + fp16_to_fp32(vt16[d]);
@@ -2697,6 +2759,7 @@ static void attention_group(int kv_head_idx, void *ctx_ptr) {
                 sum_exp[g] += w;
                 if (ctx->kv_type_v == KV_CACHE_Q8_0) scale_add_q8_0_f32(accg, w, vt, head_dim);
                 else if (ctx->kv_type_v == KV_CACHE_Q4_0) scale_add_q4_0_f32(accg, w, vt, head_dim);
+                else if (ctx->kv_type_v == KV_CACHE_TQ3) scale_add_tq3_f32(accg, w, vt, head_dim);
                 else {
                     const uint16_t *vt16 = (const uint16_t *)vt;
                     for (int d = 0; d < head_dim; d++) accg[d] += w * fp16_to_fp32(vt16[d]);
@@ -2967,6 +3030,14 @@ float *model_forward(model_t *m, int token, int pos) {
             } else if (s->kv_type_k == KV_CACHE_Q4_0) {
                 /* Quantize full GQA row at once */
                 quantize_row_q4_0(k_tmp, key_pos, kv_dim);
+            } else if (s->kv_type_k == KV_CACHE_TQ3) {
+                /* TQ3: quantize per head (not full GQA row) since
+                 * quantize_row_tq3 operates on contiguous float32.
+                 * TQ3 handles WHT internally so skip Hadamard rotation. */
+                for (int hkv = 0; hkv < n_kv_heads; hkv++) {
+                    quantize_row_tq3(k_tmp + hkv * head_dim,
+                        key_pos + hkv * s->kv_head_stride_k, head_dim);
+                }
             } else {
                 /* FP16: store each head at its offset within the GQA row */
                 for (int hkv = 0; hkv < n_kv_heads; hkv++) {
@@ -3006,6 +3077,12 @@ float *model_forward(model_t *m, int token, int pos) {
                 quantize_row_q8_0(v_tmp, val_pos, kv_dim);
             } else if (s->kv_type_v == KV_CACHE_Q4_0) {
                 quantize_row_q4_0(v_tmp, val_pos, kv_dim);
+            } else if (s->kv_type_v == KV_CACHE_TQ3) {
+                /* TQ3: quantize per head */
+                for (int hkv = 0; hkv < n_kv_heads; hkv++) {
+                    quantize_row_tq3(v_tmp + hkv * head_dim,
+                        val_pos + hkv * s->kv_head_stride_v, head_dim);
+                }
             } else {
                 for (int hkv = 0; hkv < n_kv_heads; hkv++) {
                     float *v_head = v_tmp + hkv * head_dim;
@@ -3044,9 +3121,18 @@ float *model_forward(model_t *m, int token, int pos) {
          * This saves memory (no att[] buffer) and is more cache-friendly.
          */
         /* Hadamard rotation of Q before attention (Point B) */
+        /* For TQ3: Q must be WHT-forward rotated (block=32) to match K encoding.
+         * This is done via the standard Hadamard path with nrot=32, which
+         * uses the same sign pattern as TQ3's internal WHT. */
         if (s->kv_hadamard_k) {
             for (int h = 0; h < n_heads; h++) {
                 picolm_hadamard_transform(s->q + h * head_dim, head_dim, s->kv_hadamard_size);
+            }
+        } else if (s->kv_type_k == KV_CACHE_TQ3) {
+            /* TQ3: rotate Q with WHT block=32 (same as picolm_hadamard_transform
+             * with nrot=32, which uses the TQ3 sign pattern). */
+            for (int h = 0; h < n_heads; h++) {
+                picolm_hadamard_transform(s->q + h * head_dim, head_dim, TQ3_BLOCK_SIZE);
             }
         }
 
@@ -3068,6 +3154,9 @@ float *model_forward(model_t *m, int token, int pos) {
             for (int h = 0; h < n_heads; h++) {
                 picolm_hadamard_transform(s->xb + h * head_dim, head_dim, s->kv_hadamard_size);
             }
+        } else if (s->kv_type_v == KV_CACHE_TQ3) {
+            /* TQ3 V-path: the scale_add_tq3_f32 already applies inverse WHT
+             * internally, so no post-rotation needed. */
         }
 
         /* Qwen3.5 full attention: apply gate sigmoid to attention output */
@@ -6212,12 +6301,13 @@ static void batch_attention_layer(
  * and tiles after are skipped.
  * ================================================================ */
 
-/* Map kv_cache_type_t (0/1/2) to gguf_type_t (1/8/2) for matmul_batch */
+/* Map kv_cache_type_t to gguf_type_t for matmul_batch */
 static gguf_type_t kv_cache_to_gguf_type(kv_cache_type_t kv_type) {
     switch (kv_type) {
         case KV_CACHE_F16:  return GGUF_TYPE_F16;
         case KV_CACHE_Q8_0: return GGUF_TYPE_Q8_0;
         case KV_CACHE_Q4_0: return GGUF_TYPE_Q4_0;
+        case KV_CACHE_TQ3:  return GGUF_TYPE_F16; /* TQ3 doesn't have a GGUF equivalent */
     }
     return GGUF_TYPE_F16;
 }
