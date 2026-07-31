@@ -1,5 +1,6 @@
 #include "sampler.h"
 #include "tensor.h"  /* for softmax */
+#include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>

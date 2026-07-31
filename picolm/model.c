@@ -2658,29 +2658,18 @@ static void attention_group(int kv_head_idx, void *ctx_ptr) {
             }
             memcpy(k_f32, k_f32_tq3, head_dim * sizeof(float));
         } else if (ctx->kv_type_k == KV_CACHE_TQ4) {
-            /* TQ4 K: dequant to f32 for AVX512 path */
+            /* TQ4 K: Q is pre-rotated with WHT forward (block=32).
+             * Keep K in the rotated domain for the dot product:
+             * just scale the codebook values (no inverse WHT). */
             for (int hkv_block = 0; hkv_block < head_dim; hkv_block += TQ4_BLOCK_SIZE) {
                 const block_tq4 *blk = (const block_tq4 *)((const uint8_t *)kt +
                     (hkv_block / TQ4_BLOCK_SIZE) * sizeof(block_tq4));
                 float sc = fp16_to_fp32(blk->d);
-                float rot[32];
                 for (int gg = 0; gg < 4; gg++) {
                     uint8_t idx8[8];
                     tq4_unpack_4bit_8(idx8, blk->qs + gg * 4);
                     for (int kk = 0; kk < 8; kk++)
-                        rot[gg * 8 + kk] = tq4_codebook[idx8[kk]];
-                }
-                {
-                    float tmp2[32]; memcpy(tmp2, rot, sizeof(tmp2));
-                    for (int step = 1; step < 32; step <<= 1)
-                        for (int ii = 0; ii < 32; ii += step << 1)
-                            for (int jj = ii; jj < ii + step; jj++) {
-                                float aa = tmp2[jj], bb = tmp2[jj + step];
-                                tmp2[jj] = aa + bb; tmp2[jj + step] = aa - bb;
-                            }
-                    const float norm = 1.0f / 5.656854f;
-                    for (int ii = 0; ii < 32; ii++)
-                        k_f32[hkv_block + ii] = tmp2[ii] * norm * tq3_signs[ii] * sc;
+                        k_f32[hkv_block + gg * 8 + kk] = tq4_codebook[idx8[kk]] * sc;
                 }
             }
         } else {
