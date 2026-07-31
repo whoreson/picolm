@@ -91,7 +91,7 @@ const char *csafetensors_get_metadata(const csafetensors_t *st, const char *key)
 size_t csafetensors_dtype_size(csafetensors_dtype_t dtype);
 const char *csafetensors_dtype_name(csafetensors_dtype_t dtype);
 size_t csafetensors_shape_size(const csafetensors_tensor_t *tensor);
-bool csafetensors_validate(const csafetensors_t *st);
+bool csafetensors_validate(csafetensors_t *st);
 float csafetensors_bf16_to_f32(uint16_t x);
 uint16_t csafetensors_f32_to_bf16(float x);
 float csafetensors_f16_to_f32(uint16_t x);

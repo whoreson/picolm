@@ -277,11 +277,11 @@ void dequantize_row_q3_K(const void *src, float *dst, int n) {
             for (int j = 0; j < 4; ++j) {
                 dl = d * (scales[is++] - 32);
                 for (int l = 0; l < 16; ++l) {
-                    *y++ = dl * ((int8_t)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4));
+                    *y++ = dl * (float)((int8_t)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4));
                 }
                 dl = d * (scales[is++] - 32);
                 for (int l = 0; l < 16; ++l) {
-                    *y++ = dl * ((int8_t)((q[l+16] >> shift) & 3) - ((hm[l+16] & m) ? 0 : 4));
+                    *y++ = dl * (float)((int8_t)((q[l+16] >> shift) & 3) - ((hm[l+16] & m) ? 0 : 4));
                 }
                 shift += 2;
                 m <<= 1;
@@ -572,8 +572,8 @@ void dequantize_row_q5_K(const void *src, float *dst, int n) {
             const float d1 = d * sc, m1 = dm * m;
             get_scale_min_k4(j/32 + 1, x[i].scales, &sc, &m);
             const float d2 = d * sc, m2 = dm * m;
-            for (int l = 0; l < 32; ++l) *dst++ = d1 * ((ql[l] & 0xF) + (qh[l] & u1 ? 16 : 0)) - m1;
-            for (int l = 0; l < 32; ++l) *dst++ = d2 * ((ql[l] >> 4) + (qh[l] & u2 ? 16 : 0)) - m2;
+            for (int l = 0; l < 32; ++l) *dst++ = d1 * (float)((ql[l] & 0xF) + (qh[l] & u1 ? 16 : 0)) - m1;
+            for (int l = 0; l < 32; ++l) *dst++ = d2 * (float)((ql[l] >> 4) + (qh[l] & u2 ? 16 : 0)) - m2;
             ql += 32; u1 <<= 2; u2 <<= 2;
         }
     }
@@ -1735,7 +1735,7 @@ void quantize_row_q8_K(const float *x, void *dst, int n) {
                 __m128i s128 = _mm_add_epi32(_mm256_castsi256_si128(s0), _mm256_extractf128_si256(s0, 1));
                 s128 = _mm_add_epi32(s128, _mm_shuffle_epi32(s128, 0x1B));
                 s128 = _mm_add_epi32(s128, _mm_shuffle_epi32(s128, 0x4E));
-                y[i].bsums[j] = _mm_cvtsi128_si32(s128);
+                y[i].bsums[j] = (int16_t)_mm_cvtsi128_si32(s128);
             }
         }
 #elif defined(PICOLM_AVX)
@@ -1751,7 +1751,7 @@ void quantize_row_q8_K(const float *x, void *dst, int n) {
                 s0 = _mm_add_epi32(s0, s1);
                 s0 = _mm_add_epi32(s0, _mm_shuffle_epi32(s0, 0x1B));
                 s0 = _mm_add_epi32(s0, _mm_shuffle_epi32(s0, 0x4E));
-                y[i].bsums[j] = _mm_cvtsi128_si32(s0);
+                y[i].bsums[j] = (int16_t)_mm_cvtsi128_si32(s0);
             }
         }
 #else
@@ -4223,7 +4223,7 @@ float vec_dot_q2_0_q8_0(const void *vx, const void *wy, int n) {
                 sumi_block += ((int)((byte >> 4) & 3) - 1) * qy[b*4 + 2];
                 sumi_block += ((int)((byte >> 6) & 3) - 1) * qy[b*4 + 3];
             }
-            sumi += d1 * sumi_block;
+            sumi += d1 * (float)sumi_block;
         }
         sumf += d0 * sumi;
     }

@@ -369,7 +369,7 @@ static int load_tokenizer_safetensors(const char *model_dir, model_t *m) {
 
     m->tok_scores_data = malloc(m->tok_n_tokens * sizeof(float));
     if (!m->tok_scores_data) { free(vbuf); return -1; }
-    memset((void*)m->tok_scores_data, 0, m->tok_n_tokens * sizeof(float));
+    memset((void *)(uintptr_t)m->tok_scores_data, 0, m->tok_n_tokens * sizeof(float));
 
     struct { uint64_t len; char *str; } *tok_arr = calloc(m->tok_n_tokens, sizeof(*tok_arr));
     if (!tok_arr) { free(vbuf); return -1; }
@@ -383,7 +383,7 @@ static int load_tokenizer_safetensors(const char *model_dir, model_t *m) {
         p++;
 
         /* Read key string into buffer */
-        char key[256];
+        unsigned char key[256];
         int ki = 0;
         while (*p && *p != '"' && ki < 254) {
             if (*p == '\\' && *(p+1)) {
@@ -404,9 +404,9 @@ static int load_tokenizer_safetensors(const char *model_dir, model_t *m) {
                                           c >= 'a' && c <= 'f' ? c - 'a' + 10 :
                                           c >= 'A' && c <= 'F' ? c - 'A' + 10 : 0);
                             }
-                            if (hex < 0x80) key[ki++] = hex;
-                            else if (hex < 0x800) { key[ki++] = 0xC0 | (hex >> 6); key[ki++] = 0x80 | (hex & 0x3F); }
-                            else { key[ki++] = 0xE0 | (hex >> 12); key[ki++] = 0x80 | ((hex >> 6) & 0x3F); key[ki++] = 0x80 | (hex & 0x3F); }
+                            if (hex < 0x80) key[ki++] = (unsigned char)hex;
+                            else if (hex < 0x800) { key[ki++] = (unsigned char)(0xC0 | (hex >> 6)); key[ki++] = (unsigned char)(0x80 | (hex & 0x3F)); }
+                            else { key[ki++] = (unsigned char)(0xE0 | (hex >> 12)); key[ki++] = (unsigned char)(0x80 | ((hex >> 6) & 0x3F)); key[ki++] = (unsigned char)(0x80 | (hex & 0x3F)); }
                             p += 4;
                         }
                         break;

@@ -298,7 +298,7 @@ static int gguf_format_value(char *buf, int buflen, reader_t *r, uint32_t vtype)
         case GGUF_META_INT32:   return snprintf(buf, buflen, "%d", read_i32(r));
         case GGUF_META_UINT64:  return snprintf(buf, buflen, "%" PRIu64, read_u64(r));
         case GGUF_META_INT64:   return snprintf(buf, buflen, "%" PRId64, (int64_t)read_u64(r));
-        case GGUF_META_FLOAT32: return snprintf(buf, buflen, "%g", read_f32(r));
+        case GGUF_META_FLOAT32: return snprintf(buf, buflen, "%g", (double)read_f32(r));
         case GGUF_META_FLOAT64: { uint64_t raw = read_u64(r); double d; memcpy(&d, &raw, 8);
 #if defined(__APPLE__) && defined(__ppc__)
             /* Big-endian: GGUF stores LE */
@@ -446,18 +446,6 @@ static int mmap_file(model_t *m, const char *path) {
     return 0;
 }
 
-static void munmap_file(model_t *m) {
-    if (!m->mmap_addr) return;
-#ifdef _WIN32
-    UnmapViewOfFile(m->mmap_addr);
-    CloseHandle(m->map_handle);
-    CloseHandle(m->file_handle);
-#else
-    munmap(m->mmap_addr, m->mmap_size);
-    close(m->fd);
-#endif
-    m->mmap_addr = NULL;
-}
 
 /* ================================================================
  * Split GGUF support
@@ -504,7 +492,10 @@ static int split_path_prefix(char *prefix, size_t maxlen, const char *split_path
 
 /* Construct a split file path from prefix, split_no (0-based), and split_count. */
 static void split_path_build(char *path, size_t maxlen, const char *prefix, int split_no, int split_count) {
-    snprintf(path, maxlen, "%s-%05d-of-%05d.gguf", prefix, split_no + 1, split_count);
+    /* Suffix "-NNNNN-of-NNNNN.gguf" is exactly 18 chars */
+    if (maxlen < 19) { path[0] = '\0'; return; }
+    int plen = snprintf(path, maxlen, "%s", prefix);
+    snprintf(path + plen, maxlen - (size_t)plen, "-%05d-of-%05d.gguf", split_no + 1, split_count);
 }
 
 /* Mmap a single split file into a split_mmap_t struct. */
@@ -1549,11 +1540,11 @@ static int parse_gguf(model_t *m, int max_seq_len) {
         }
         fprintf(stderr, "  Layers: %d SSM + %d full attention\n", ssm_count, attn_count);
     }
-    fprintf(stderr, "  head_dim=%d, rope_dim=%d, rope_base=%.1f\n", cfg->head_dim, cfg->rope_dim, cfg->rope_freq_base);
+    fprintf(stderr, "  head_dim=%d, rope_dim=%d, rope_base=%.1f\n", cfg->head_dim, cfg->rope_dim, (double)cfg->rope_freq_base);
     if (cfg->is_gemma3n) {
         fprintf(stderr, "  Gemma-3n: altup=%d active=%d laurel_rank=%d embd_altup=%d kv_layers=%d softcap=%.1f\n",
                 cfg->n_altup, cfg->i_altup_act, cfg->laurel_rank, cfg->n_embd_altup,
-                cfg->n_layer_kv_from_start, cfg->f_final_logit_softcapping);
+                cfg->n_layer_kv_from_start, (double)cfg->f_final_logit_softcapping);
     }
     /* On big-endian, GGUF stores all multi-byte values as little-endian.
      * Swap F16 values in-place for all quantized block types that contain FP16 scales. */
@@ -1736,7 +1727,6 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
     }
     /* Gemma-3n buffers */
     size_t sz_gemma3n = 0;
-    size_t sz_gemma3n_carved = 0;
     if (c->is_gemma3n) {
         int n_altup = c->n_altup;
         int n_embd = c->n_embd;
@@ -1958,7 +1948,6 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
     }
     /* SSM scratch buffer (shared across all SSM layers) */
     if (c->has_ssm) {
-        int ssm_conv_dim = 2 * c->ssm_d_state * c->ssm_n_group + c->ssm_d_inner;
         int ssm_d_state = c->ssm_d_state;
         int ssm_n_group = c->ssm_n_group;
         int ssm_d_inner = c->ssm_d_inner;
@@ -3088,7 +3077,6 @@ float *model_forward(model_t *m, int token, int pos) {
         }
 
         /* Apply RoPE to Q and K */
-        int rope_dim = (c->rope_dim > 0) ? c->rope_dim : head_dim;
         int rope_half = rope_dim / 2;
         rope(s->q, k_tmp, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos, c->rope_type, rope_half);
 
@@ -3373,7 +3361,7 @@ static void gemma3n_router(float *out, float *inp, int n_embd, int n_altup,
                            const float *norm_w, const void *router_raw, gguf_type_t router_type,
                            float rms_norm_eps, float *tmp_buf) {
     /* RMSNorm */
-    rmsnorm(tmp_buf, inp, (float*)norm_w, n_embd, rms_norm_eps);
+    rmsnorm(tmp_buf, inp, norm_w, n_embd, rms_norm_eps);
     /* Scale by 1/n_embd */
     float sc = 1.0f / (float)n_embd;
     for (int i = 0; i < n_embd; i++) tmp_buf[i] *= sc;
@@ -3449,7 +3437,7 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
         const float *proj_norm_raw = (const float *)w->per_layer_proj_norm;
         for (int l = 0; l < c->n_layers; l++) {
             float *layer_inp = s->xb + l * n_embd_altup;
-            rmsnorm(s->hb, layer_inp, (float*)proj_norm_raw, n_embd_altup, rms_norm_eps);
+            rmsnorm(s->hb, layer_inp, proj_norm_raw, n_embd_altup, rms_norm_eps);
             memcpy(layer_inp, s->hb, n_embd_altup * sizeof(float));
         }
 
@@ -5798,7 +5786,7 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
             float v = ssm_output[d * n_v_heads + h];
             nrm += v * v;
         }
-        nrm = 1.0f / sqrtf(nrm / head_v_dim + eps);
+        nrm = 1.0f / sqrtf(nrm / (float)head_v_dim + eps);
         for (int d = 0; d < head_v_dim; d++) {
             float v = ssm_output[d * n_v_heads + h];
             float zv = s->xb2[h * head_v_dim + d];
@@ -5994,7 +5982,7 @@ int model_lock_layers(model_t *m, size_t mem_bytes) {
     size_t gbytes = global_weight_bytes(m);
     if (gbytes > effective_budget) {
         fprintf(stderr, "Lock: budget too small for global tensors (%.1f MB)\n",
-                gbytes / (1024.0 * 1024.0));
+                (double)gbytes / (1024.0 * 1024.0));
         return 0;
     }
 
@@ -6011,8 +5999,8 @@ int model_lock_layers(model_t *m, size_t mem_bytes) {
 
     if (layers_locked == 0) {
         fprintf(stderr, "Lock: budget too small for any layer (%.1f MB needed, %.1f MB available)\n",
-                layer_weight_bytes(m, 0) / (1024.0 * 1024.0) + gbytes / (1024.0 * 1024.0),
-                mem_bytes / (1024.0 * 1024.0));
+                (double)layer_weight_bytes(m, 0) / (1024.0 * 1024.0) + (double)gbytes / (1024.0 * 1024.0),
+                (double)mem_bytes / (1024.0 * 1024.0));
         return 0;
     }
 
@@ -6148,12 +6136,12 @@ int model_lock_layers(model_t *m, size_t mem_bytes) {
     for (int i = 0; i < merged; i++) {
         size_t sz = (const uint8_t *)ranges_end[i] - (const uint8_t *)ranges_start[i];
 #ifdef _WIN32
-        if (VirtualLock((void *)ranges_start[i], sz) == 0) {
+        if (VirtualLock((void *)(const void *)ranges_start[i], sz) == 0) {
             fprintf(stderr, "Lock: VirtualLock failed (error %lu)\n", (unsigned long)GetLastError());
             return 0;
         }
 #else
-        if (mlock((void *)ranges_start[i], sz) != 0) {
+        if (mlock(ranges_start[i], sz) != 0) {
             int err = errno;
             if (err == EACCES)
                 fprintf(stderr, "Lock: mlock failed - check RLIMIT_MEMLOCK (ulimit -l)\n");
@@ -6167,7 +6155,7 @@ int model_lock_layers(model_t *m, size_t mem_bytes) {
 
     m->locked_layers = layers_locked;
     fprintf(stderr, "Lock: pinned %.1f MB (layers 0..%d of %d)\n",
-            total_locked / (1024.0 * 1024.0),
+            (double)total_locked / (1024.0 * 1024.0),
             layers_locked - 1, c->n_layers - 1);
     return layers_locked;
 }
@@ -6255,15 +6243,15 @@ int model_unlock_layers(model_t *m) {
     for (int i = 0; i < merged; i++) {
         size_t sz = (const uint8_t *)ranges_end[i] - (const uint8_t *)ranges_start[i];
 #ifdef _WIN32
-        VirtualUnlock((void *)ranges_start[i], sz);
+        VirtualUnlock((void *)(const void *)ranges_start[i], sz);
 #else
-        munlock((void *)ranges_start[i], sz);
+        munlock(ranges_start[i], sz);
 #endif
         total_unlocked += sz;
     }
 
     m->locked_layers = 0;
-    fprintf(stderr, "Unlock: released %.1f MB\n", total_unlocked / (1024.0 * 1024.0));
+    fprintf(stderr, "Unlock: released %.1f MB\n", (double)total_unlocked / (1024.0 * 1024.0));
     return 0;
 }
 
@@ -6862,7 +6850,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
 
     /* 4. Convolution + silu (sequential per token: conv_state is stateful)
      * Each token sees a different conv_state because we shift after each token. */
-    for (int bi = 0; bi < n_tokens; bi++) {
+    for (bi = 0; bi < n_tokens; bi++) {
         float *qkv = qkv_batch + bi * conv_dim;
         float *conv_out = conv_batch + bi * conv_dim;
         for (int co = 0; co < conv_dim; co++) {
@@ -7045,7 +7033,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
                 float v = ssm_out[h * head_v_dim + d];
                 nrm += v * v;
             }
-            nrm = 1.0f / sqrtf(nrm / head_v_dim + eps);
+            nrm = 1.0f / sqrtf(nrm / (float)head_v_dim + eps);
             for (int d = 0; d < head_v_dim; d++) {
                 float v = ssm_out[h * head_v_dim + d];
                 float zv = z[h * head_v_dim + d];
@@ -7060,7 +7048,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
         /* Reorder to GGUF column order, then matmul per token.
          * Allocate temp buffer once outside the loop. */
         float *fo_gguf = (float *)malloc(value_dim * sizeof(float));
-        for (int bi = 0; bi < n_tokens; bi++) {
+        for (bi = 0; bi < n_tokens; bi++) {
             float *fo = xb2_batch + bi * value_dim;
             for (int h = 0; h < n_v_heads; h++) {
                 int gh = qwen35_vhead_gguf(h, n_vpk, n_k);
@@ -7140,11 +7128,11 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         return m->state.logits;
     }
 
-    int bi;
     model_config_t *c = &m->config;
     model_weights_t *w = &m->weights;
     run_state_t *s = &m->state;
     int dim = c->n_embd, n_ffn = c->n_ffn;
+    int bi;
     int n_heads = c->n_heads, n_kv_heads = c->n_kv_heads, head_dim = c->head_dim;
     int kv_dim = n_kv_heads * head_dim;
     int q_dim = n_heads * head_dim, seq_len = c->max_seq_len;
@@ -7269,7 +7257,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #endif
             } else {
                 /* Per-token SSM fallback (default) - uses s->x/s->xb2 like original */
-                for (int bi = 0; bi < n_tokens; bi++) {
+                for (bi = 0; bi < n_tokens; bi++) {
                     memcpy(s->x, x_batch + bi * dim, dim * sizeof(float));
                     float *ssm_residual = s->xb2;
 #ifdef PICOLM_GPU

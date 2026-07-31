@@ -793,7 +793,7 @@ int main(int argc, char **argv) {
     }
 
     fprintf(stderr, "Prompt: %d tokens, generating up to %d (temp=%.2f, top_p=%.2f, threads=%d)\n",
-            n_prompt, max_tokens, temperature, top_p, num_threads);
+            n_prompt, max_tokens, (double)temperature, (double)top_p, num_threads);
     fprintf(stderr, "---\n");
 
     /* ---- Benchmark mode ---- */
@@ -963,7 +963,7 @@ int main(int argc, char **argv) {
                 }
             }
             fprintf(stderr, "[LOGITS] top3: ");
-            for (int j = 0; j < 3; j++) fprintf(stderr, "(%d:%.2f) ", top3[j], topv[j]);
+            for (int j = 0; j < 3; j++) fprintf(stderr, "(%d:%.2f) ", top3[j], (double)topv[j]);
             fprintf(stderr, "\n");
         }
         grammar_apply(&grammar, logits, model.config.vocab_size);
@@ -974,12 +974,12 @@ int main(int argc, char **argv) {
 
         /* Decode and print */
         static char qwen_decode_buf[64];
-        char *decode_str;
+        const char *decode_str;
         if (use_qwen_tok) {
             qwen_tokenize_decode(&qwen_enc, next, qwen_decode_buf, sizeof(qwen_decode_buf));
             decode_str = qwen_decode_buf;
         } else {
-            decode_str = (char *)tokenizer_decode(&tokenizer, token, next);
+            decode_str = tokenizer_decode(&tokenizer, token, next);
         }
         printf("%s", decode_str);
         fflush(stdout);

@@ -1,5 +1,5 @@
 CC      ?= gcc
-CFLAGS  ?= -O3 -g -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic -fopenmp
+CFLAGS  ?= -O3 -g -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic -Wshadow -Wdouble-promotion -Wimplicit-fallthrough -Wconversion -Wmisleading-indentation -Wduplicated-cond -Wduplicated-branches -Wfloat-conversion -Wsign-conversion -Wcast-qual -Wformat-nonliteral -Wformat-truncation -fno-common -fopenmp
 LDFLAGS = -lm -lpthread -fopenmp
 
 # Windows needs ws2_32 for server mode

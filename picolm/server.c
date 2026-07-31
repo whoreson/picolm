@@ -316,7 +316,7 @@ static int http_parse_request(char *buf, int len, char *method, int mlen, char *
     /* Read until \r\n\r\n (end of headers) */
     int have = 0;
     while (have < len - 1) {
-        int n = recv(srv.sock_in_buf, buf + have, len - have - 1, 0);
+        int n = (int)recv(srv.sock_in_buf, buf + have, len - have - 1, 0);
         if (n <= 0) return -1;
         have += n;
         buf[have] = '\0';
@@ -364,7 +364,7 @@ static int http_read_body(char *buf, int buf_len, int header_len) {
         /* Need to read more body bytes */
         int remaining = content_length - have;
         while (remaining > 0 && body_off + content_length < buf_len) {
-            int n = recv(srv.sock_in_buf, buf + body_off + have, remaining, 0);
+            int n = (int)recv(srv.sock_in_buf, buf + body_off + have, remaining, 0);
             if (n <= 0) return -1;
             have += n;
             remaining -= n;
@@ -539,10 +539,10 @@ static void checkpoint_save(int n_tokens) {
 
     /* Print creation info with timing */
     int n_now = checkpoint_count();
-    float size_mb = (float)srv.checkpoint_snapshot_size / (1024.0 * 1024.0);
+    float size_mb = (float)srv.checkpoint_snapshot_size / (1024.0f * 1024.0f);
     double creation_ms = get_time_ms() - t_create_start;
     fprintf(stderr, "  [ssm checkpoint] created checkpoint %d of %d (n_tokens=%d, size=%.3f MiB, %.1f ms)\n",
-            n_now, srv.max_checkpoints, n_tokens, size_mb, creation_ms);
+            n_now, srv.max_checkpoints, n_tokens, (double)size_mb, creation_ms);
     checkpoint_print_list("after creation");
 }
 
@@ -575,10 +575,10 @@ static int checkpoint_restore(int n_tokens, int *actual_n_tokens) {
 
 /* Print checkpoint restore info (called from handle functions with context) */
 static void checkpoint_restore_log(int target, int actual, int kv_match, int success) {
-    float size_mb = (float)srv.checkpoint_snapshot_size / (1024.0 * 1024.0);
+    float size_mb = (float)srv.checkpoint_snapshot_size / (1024.0f * 1024.0f);
     if (success) {
         fprintf(stderr, "  [ssm checkpoint] restored checkpoint (n_tokens=%d, size=%.3f MiB), kv_match=%d, reprocess from %d\n",
-                actual, size_mb, kv_match, actual);
+                actual, (double)size_mb, kv_match, actual);
     } else {
         fprintf(stderr, "  [ssm checkpoint] no checkpoint available for target=%d, resetting SSM state\n", target);
     }
@@ -1179,7 +1179,7 @@ static void handle_slots_post(SOCKET sock, const char *body) {
                 close(fd);
 #endif
                 fprintf(stderr, "\n[server] Saved %d SSM checkpoints (%.1f MB total)\n",
-                        n_cps, (double)n_cps * srv.checkpoint_snapshot_size / (1024*1024));
+                        n_cps, (double)n_cps * (double)srv.checkpoint_snapshot_size / (1024*1024));
             }
         }
 
@@ -1542,7 +1542,7 @@ static void handle_slots(SOCKET sock) {
  * Simple template: each message becomes "### {role}\n{text}\n\n".
  * Returns a malloc'd string. */
 static char *chat_to_prompt(cJSON *messages, const char *system_template) {
-    int total_len = 0;
+    size_t total_len = 0;
     int n_msgs = cJSON_GetArraySize(messages);
 
     /* First pass: calculate total length */
@@ -1573,8 +1573,20 @@ static char *chat_to_prompt(cJSON *messages, const char *system_template) {
 
         if (strcmp(rs, "system") == 0) {
             if (system_template && strlen(system_template) > 0) {
-                snprintf(prompt + strlen(prompt), total_len - strlen(prompt),
-                         system_template, cs);
+                /* Safely substitute first %s in template with content */
+                const char *pct = strstr(system_template, "%s");
+                if (pct) {
+                    /* Write prefix before %s, then content, then suffix after %s */
+                    int pre = (int)(pct - system_template);
+                    size_t used = strlen(prompt);
+                    if ((size_t)pre < total_len - used)
+                        memcpy(prompt + used, system_template, (size_t)pre);
+                    strcat(prompt + used + (size_t)pre, cs);
+                    strcat(prompt, pct + 2);
+                } else {
+                    strcat(prompt, system_template);
+                    strcat(prompt, cs);
+                }
             } else {
                 strcat(prompt, "### system\n");
                 strcat(prompt, cs);
@@ -1711,7 +1723,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             "{\"error\":{\"message\":\"Prompt too large: %d tokens exceeds model context size %d\"}}",
             n_prompt, model->config.max_seq_len);
         http_send(sock, 413, "application/json", errmsg);
-        free(ptokens); free(model_name); free((void*)prompt);
+        free(ptokens); free(model_name); free((void *)(uintptr_t)prompt);
         return;
     }
 
@@ -2338,7 +2350,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             "{\"error\":{\"message\":\"Prompt too large: %d tokens exceeds model context size %d\"}}",
             n_prompt, model->config.max_seq_len);
         http_send(sock, 413, "application/json", errmsg);
-        free(ptokens); free(model_name); free((void*)prompt);
+        free(ptokens); free(model_name); free((void *)(uintptr_t)prompt);
         return;
     }
 
@@ -2399,7 +2411,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
     if (n_predict <= 0 && !prompt_only) n_predict = 32;
 
     /* Random seed */
-    if (seed < 0) seed = (uint64_t)(time(NULL) ^ (uint64_t)(uintptr_t)&seed);
+    if (seed < 0) seed = (int)((unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)&seed);
 
     sampler_t sampler;
     sampler_init(&sampler, temperature, top_p, top_k, 0.05f, (uint64_t)seed);
@@ -2489,7 +2501,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         if (n_processed < n_prompt) {
             /* Client disconnected during prefill */
             fprintf(stderr, "[server] prefill cancelled at token %d/%d\n", n_processed, n_prompt);
-            free(model_name); free((void*)prompt); free(ptokens);
+            free(model_name); free((void *)(uintptr_t)prompt); free(ptokens);
             return;
         }
 
@@ -2497,7 +2509,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
 
         /* ---- Generation phase ---- */
         if (n_prefill <= 0) {
-            int token = ptokens[n_prompt - 1];
+            token = ptokens[n_prompt - 1];
             logits = model_forward(model, token, n_prompt);
         }
 
@@ -2691,7 +2703,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             /* Client disconnected during prefill */
             fprintf(stderr, "[server] prefill cancelled at token %d/%d\n", n_processed_ns2, n_prompt);
             free(generated); free(gen_token_ids);
-            free(model_name); free((void*)prompt); free(token_prompt); free(ptokens);
+            free(model_name); free((void *)(uintptr_t)prompt); free(token_prompt); free(ptokens);
             for (int i = 0; i < n_stop_words; i++) free(stop_words[i]);
             return;
         }
@@ -2700,7 +2712,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
 
         /* ---- Generation phase ---- */
         if (n_prefill_ns2 <= 0) {
-            int token = ptokens[n_prompt - 1];
+            token = ptokens[n_prompt - 1];
             logits_ns2 = model_forward(model, token, n_prompt);
         }
 

@@ -1236,7 +1236,7 @@ size_t csafetensors_shape_size(const csafetensors_tensor_t *tensor) {
     return size;
 }
 
-bool csafetensors_validate(const csafetensors_t *st) {
+bool csafetensors_validate(csafetensors_t *st) {
     if (!st) return false;
 
     size_t data_size;
@@ -1250,7 +1250,7 @@ bool csafetensors_validate(const csafetensors_t *st) {
         const csafetensors_tensor_t *t = &st->tensors[i];
 
         if (t->data_offset_begin > t->data_offset_end) {
-            snprintf((char *)st->error_msg, sizeof(st->error_msg),
+            snprintf(st->error_msg, sizeof(st->error_msg),
                      "Tensor '%.128s': begin offset > end offset", t->name);
             return false;
         }
@@ -1259,14 +1259,14 @@ bool csafetensors_validate(const csafetensors_t *st) {
         if (tensor_size == 0) continue;
 
         if (t->data_offset_end > data_size) {
-            snprintf((char *)st->error_msg, sizeof(st->error_msg),
+            snprintf(st->error_msg, sizeof(st->error_msg),
                      "Tensor '%.128s': data offset exceeds buffer size", t->name);
             return false;
         }
 
         size_t stored_size = t->data_offset_end - t->data_offset_begin;
         if (tensor_size != stored_size) {
-            snprintf((char *)st->error_msg, sizeof(st->error_msg),
+            snprintf(st->error_msg, sizeof(st->error_msg),
                      "Tensor '%.128s': size mismatch (expected %zu, got %zu)", t->name, tensor_size, stored_size);
             return false;
         }
