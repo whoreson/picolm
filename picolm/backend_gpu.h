@@ -331,14 +331,15 @@ int picolm_gpu_rmsnorm_batched(float *out, const float *x, const float *weight,
  * Returns 1 on success. */
 int picolm_gpu_rope_apply(float *x, int n_heads, int head_dim,
                            const float *cos_tbl, const float *sin_tbl,
-                           int half_dim, int device);
+                           int half_dim, int rope_type, int device);
 
 /* Batched RoPE: x is [S][n_heads][head_dim] contiguous, positions
  * start_pos..start_pos+S-1. cos_tbl_base/sin_tbl_base are the UNOFFSET
  * [max_seq_len][half_dim] base pointers. One launch for the whole chunk. */
 int picolm_gpu_rope_apply_batched(float *x, int n_heads, int head_dim,
                                    const float *cos_tbl_base, const float *sin_tbl_base,
-                                   int half_dim, int start_pos, int S, int device);
+                                   int half_dim, int start_pos, int S,
+                                   int rope_type, int device);
 
 /* Residual add on device: out[i] = a[i] + b[i] for i = 0..n-1.
  * All device pointers. Returns 1 on success. */

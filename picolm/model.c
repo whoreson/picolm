@@ -6864,11 +6864,11 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
         float *rope_cos_pos = (float *)gw->rope_cos_dev + (size_t)pos * rope_half;
         float *rope_sin_pos = (float *)gw->rope_sin_dev + (size_t)pos * rope_half;
         picolm_gpu_rope_apply(pipe_q, n_heads, head_dim,
-                               rope_cos_pos, rope_sin_pos, rope_half, gpu_dev);
+                               rope_cos_pos, rope_sin_pos, rope_half, c->rope_type, gpu_dev);
 
         /* F. RoPE on K (in-place): rope(pipe_k, n_kv_heads) */
         picolm_gpu_rope_apply(pipe_k, n_kv_heads, head_dim,
-                               rope_cos_pos, rope_sin_pos, rope_half, gpu_dev);
+                               rope_cos_pos, rope_sin_pos, rope_half, c->rope_type, gpu_dev);
 
         /* G. KV cache store: pack F32 -> F16 and write directly into the
          * device KV cache, entirely device-to-device. The previous
@@ -7050,13 +7050,13 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
         picolm_gpu_rope_apply_batched(bq, n_heads, head_dim,
                                        (float *)gw->rope_cos_dev,
                                        (float *)gw->rope_sin_dev,
-                                       rope_half, start_pos, n_tokens, gpu_dev);
+                                       rope_half, start_pos, n_tokens, c->rope_type, gpu_dev);
 
         /* F. RoPE on K (batched) */
         picolm_gpu_rope_apply_batched(bk, n_kv_heads, head_dim,
                                        (float *)gw->rope_cos_dev,
                                        (float *)gw->rope_sin_dev,
-                                       rope_half, start_pos, n_tokens, gpu_dev);
+                                       rope_half, start_pos, n_tokens, c->rope_type, gpu_dev);
 
         /* G. KV cache store: batched F32->F16 pack+store, 2 launches per layer */
         picolm_gpu_kv_store_dev_batched(1, this_attn_ordinal, start_pos, n_tokens,

@@ -3190,26 +3190,42 @@ picolm_gpu_rmsnorm_batched_kernel(float *out, const float *x, const float *weigh
 __global__ void
 picolm_gpu_rope_batched_kernel(float *x, int n_heads, int head_dim,
                                 const float *cos_tbl, const float *sin_tbl,
-                                int half_dim, int start_pos, int S) {
+                                int half_dim, int start_pos, int S,
+                                int rope_type) {
     int idx = gpuThreadIdx_x + (int)gpuBlockIdx_x * gpuBlockDim_x;
     int per_row = n_heads * head_dim;
     int total = S * per_row;
     for (int i = idx; i < total; i += (int)gridDim.x * gpuBlockDim_x) {
         int row = i / per_row;
         int rem = i % per_row;
-        int d = rem % head_dim;
-        if (d >= half_dim) continue; /* second half handled by paired thread */
-
-        int pos = start_pos + row;
         int h = rem / head_dim;
+        int d = rem % head_dim;
         float *xr = x + (size_t)row * per_row;
-        int h1 = d, h2 = d + half_dim;
-        float x1 = xr[h * head_dim + h1];
-        float x2 = xr[h * head_dim + h2];
-        float c = cos_tbl[(size_t)pos * half_dim + h1];
-        float s = sin_tbl[(size_t)pos * half_dim + h1];
-        xr[h * head_dim + h1] = x1 * c - x2 * s;
-        xr[h * head_dim + h2] = x1 * s + x2 * c;
+        int pos = start_pos + row;
+
+        if (rope_type) {
+            /* Qwen2 interleaved: (x[d], x[d+half_dim]) rotated */
+            if (d >= half_dim) continue;
+            int h1 = d, h2 = d + half_dim;
+            float x1 = xr[h * head_dim + h1];
+            float x2 = xr[h * head_dim + h2];
+            float c = cos_tbl[(size_t)pos * half_dim + h1];
+            float s = sin_tbl[(size_t)pos * half_dim + h1];
+            xr[h * head_dim + h1] = x1 * c - x2 * s;
+            xr[h * head_dim + h2] = x1 * s + x2 * c;
+        } else {
+            /* Llama pairwise: (x[2i], x[2i+1]) rotated by cos[i], sin[i] */
+            if (d & 1) continue; /* odd index: handled by even partner */
+            if (d + 1 >= head_dim) continue; /* safety: beyond head */
+            int idx_pair = d >> 1; /* 0,1 -> pair 0; 2,3 -> pair 1; etc. */
+            if (idx_pair >= half_dim) continue; /* beyond rope range */
+            float x0 = xr[h * head_dim + d];
+            float x1v = xr[h * head_dim + d + 1];
+            float c = cos_tbl[(size_t)pos * half_dim + idx_pair];
+            float s = sin_tbl[(size_t)pos * half_dim + idx_pair];
+            xr[h * head_dim + d]     = x0 * c - x1v * s;
+            xr[h * head_dim + d + 1] = x0 * s + x1v * c;
+        }
     }
 }
 
@@ -3217,26 +3233,36 @@ picolm_gpu_rope_batched_kernel(float *x, int n_heads, int head_dim,
 __global__ void
 picolm_gpu_rope_kernel(float *x, int n_heads, int head_dim,
                         const float *cos_tbl, const float *sin_tbl,
-                        int half_dim) {
+                        int half_dim, int rope_type) {
     int idx = gpuThreadIdx_x + (int)gpuBlockIdx_x * gpuBlockDim_x;
     int total = n_heads * head_dim;
     for (int i = idx; i < total; i += (int)gridDim.x * gpuBlockDim_x) {
         int h = i / head_dim;
         int d = i % head_dim;
-        if (d >= half_dim * 2) {
-            /* Beyond rope_dim, copy as-is */
-            /* Already in place */
-        } else if (d < half_dim) {
-            int h1 = d;
-            int h2 = d + half_dim;
-            float x1 = x[i];
+
+        if (rope_type) {
+            /* Qwen2 interleaved: (x[d], x[d+half_dim]) rotated */
+            if (d >= half_dim) continue;
+            int h1 = d, h2 = d + half_dim;
+            float x1 = x[h * head_dim + h1];
             float x2 = x[h * head_dim + h2];
             float c = cos_tbl[h1];
             float s = sin_tbl[h1];
             x[h * head_dim + h1] = x1 * c - x2 * s;
             x[h * head_dim + h2] = x1 * s + x2 * c;
+        } else {
+            /* Llama pairwise: (x[2i], x[2i+1]) rotated by cos[i], sin[i] */
+            if (d & 1) continue; /* odd: handled by even partner */
+            if (d + 1 >= head_dim) continue;
+            int idx_pair = d >> 1;
+            if (idx_pair >= half_dim) continue;
+            float x0 = x[h * head_dim + d];
+            float x1v = x[h * head_dim + d + 1];
+            float c = cos_tbl[idx_pair];
+            float s = sin_tbl[idx_pair];
+            x[h * head_dim + d]     = x0 * c - x1v * s;
+            x[h * head_dim + d + 1] = x0 * s + x1v * c;
         }
-        /* d >= half_dim: already updated by the paired thread */
     }
 }
 
@@ -3341,7 +3367,7 @@ picolm_gpu_rmsnorm_batched(float *out, const float *x, const float *weight,
 extern "C" int
 picolm_gpu_rope_apply(float *x, int n_heads, int head_dim,
                        const float *cos_tbl, const float *sin_tbl,
-                       int half_dim, int device) {
+                       int half_dim, int rope_type, int device) {
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
 
@@ -3349,7 +3375,7 @@ picolm_gpu_rope_apply(float *x, int n_heads, int head_dim,
     int n_threads = 128;
     int n_blocks = min((total + n_threads - 1) / n_threads, 128);
     picolm_gpu_rope_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
-        x, n_heads, head_dim, cos_tbl, sin_tbl, half_dim);
+        x, n_heads, head_dim, cos_tbl, sin_tbl, half_dim, rope_type);
     if (!gpu_ok(gpuGetLastError(), "rope kernel")) return 0;
     return 1;
 }
@@ -3359,7 +3385,8 @@ picolm_gpu_rope_apply(float *x, int n_heads, int head_dim,
 extern "C" int
 picolm_gpu_rope_apply_batched(float *x, int n_heads, int head_dim,
                                const float *cos_tbl_base, const float *sin_tbl_base,
-                               int half_dim, int start_pos, int S, int device) {
+                               int half_dim, int start_pos, int S,
+                               int rope_type, int device) {
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
     if (S < 1) return 0;
@@ -3368,7 +3395,7 @@ picolm_gpu_rope_apply_batched(float *x, int n_heads, int head_dim,
     int n_threads = 256;
     int n_blocks = min((total + n_threads - 1) / n_threads, 4096);
     picolm_gpu_rope_batched_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
-        x, n_heads, head_dim, cos_tbl_base, sin_tbl_base, half_dim, start_pos, S);
+        x, n_heads, head_dim, cos_tbl_base, sin_tbl_base, half_dim, start_pos, S, rope_type);
     if (!gpu_ok(gpuGetLastError(), "rope batched kernel")) return 0;
     return 1;
 }
