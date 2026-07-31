@@ -7860,7 +7860,7 @@ int kvcache_load(model_t *m, const char *path, int **tokens_out) {
         }
     }
 
-    if ((header[0] & ~0xF) != KVCACHE_MAGIC) {
+    if ((header[0] & (uint32_t)~0xF) != KVCACHE_MAGIC) {
         fprintf(stderr, "kvcache_load: invalid magic\n");
         _kv_close(fd); return 0;
     }
