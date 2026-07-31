@@ -5422,3 +5422,156 @@ void fma_scale_tq3_f32(float *dst, float correction, const void *src, int n) {
             dptr[i] = dptr[i] * correction + reconstructed[i] * block_scale;
     }
 }
+
+/* ================================================================
+ * TQ4: 4-bit TurboQuant (4.5 bits/value)
+ *
+ * Same WHT rotation as TQ3, but 16-entry Lloyd-Max codebook with
+ * nibble (4-bit) packing. D_mse ~0.0095 (vs TQ3 ~0.032).
+ * Block layout: 2 bytes fp16 RMS scale + 16 bytes packed indices = 18 bytes.
+ * ================================================================ */
+
+const float tq4_codebook[16] = {
+    -2.7326f, -2.0690f, -1.6180f, -1.2562f, -0.9423f, -0.6568f, -0.3880f, -0.1284f,
+     0.1284f,  0.3880f,  0.6568f,  0.9423f,  1.2562f,  1.6180f,  2.0690f,  2.7326f,
+};
+
+const float tq4_boundaries[15] = {
+    -2.4008f, -1.8435f, -1.4371f, -1.0993f, -0.7995f, -0.5224f, -0.2582f, 0.0000f,
+     0.2582f,  0.5224f,  0.7995f,  1.0993f,  1.4371f,  1.8435f,  2.4008f,
+};
+
+/* Find nearest TQ4 codebook index for a value */
+static uint8_t tq4_find_nearest(float val) {
+    uint8_t idx = 0;
+    for (int b = 0; b < 15; b++) {
+        if (val > tq4_boundaries[b]) idx = (uint8_t)(b + 1);
+    }
+    return idx;
+}
+
+/* Pack 8 4-bit indices into 4 bytes (nibble packing) */
+static void tq4_pack_4bit_8(uint8_t *dst, const uint8_t *idx) {
+    dst[0] = idx[0] | (idx[1] << 4);
+    dst[1] = idx[2] | (idx[3] << 4);
+    dst[2] = idx[4] | (idx[5] << 4);
+    dst[3] = idx[6] | (idx[7] << 4);
+}
+
+/* ---- quantize_row_tq4: float32 -> TQ4 blocks ---- */
+void quantize_row_tq4(const float *x, void *dst, int n) {
+    assert(n > 0 && (n % TQ4_BLOCK_SIZE) == 0);
+    block_tq4 *blocks = (block_tq4 *)dst;
+
+    for (int bi = 0; bi < n / TQ4_BLOCK_SIZE; bi++) {
+        const float *src = x + bi * TQ4_BLOCK_SIZE;
+
+        /* Step 1: RMS normalization */
+        float rms = 0.0f;
+        for (int i = 0; i < TQ4_BLOCK_SIZE; i++) rms += src[i] * src[i];
+        rms = sqrtf(rms / TQ4_BLOCK_SIZE);
+        if (rms < 1e-10f) rms = 1e-10f;
+        blocks[bi].d = fp32_to_fp16(rms);
+
+        /* Step 2: Normalize by RMS */
+        float normalized[TQ4_BLOCK_SIZE];
+        float invRms = 1.0f / rms;
+        for (int i = 0; i < TQ4_BLOCK_SIZE; i++)
+            normalized[i] = src[i] * invRms;
+
+        /* Step 3: WHT forward with sign pattern (reuses TQ3's WHT) */
+        float rotated[TQ4_BLOCK_SIZE];
+        tq3_wht_forward_32(rotated, normalized);
+
+        /* Step 4: Find nearest codebook index per element */
+        uint8_t indices[TQ4_BLOCK_SIZE];
+        for (int i = 0; i < TQ4_BLOCK_SIZE; i++)
+            indices[i] = tq4_find_nearest(rotated[i]);
+
+        /* Step 5: Pack 4-bit indices (4 groups of 8 -> 16 bytes) */
+        for (int g = 0; g < 4; g++)
+            tq4_pack_4bit_8(blocks[bi].qs + g * 4, indices + g * 8);
+    }
+}
+
+/* ---- vec_dot_tq4_f32: TQ4-encoded K dot float32 pre-rotated Q ---- */
+float vec_dot_tq4_f32(const void *src, const float *q_rotated, int n) {
+    assert(n > 0 && (n % TQ4_BLOCK_SIZE) == 0);
+    const block_tq4 *blocks = (const block_tq4 *)src;
+    int nb = n / TQ4_BLOCK_SIZE;
+    float sumf = 0.0f;
+
+    for (int bi = 0; bi < nb; bi++) {
+        float scale = fp16_to_fp32(blocks[bi].d);
+        const uint8_t *packed = blocks[bi].qs;
+        const float *qr = q_rotated + bi * TQ4_BLOCK_SIZE;
+        float dot = 0.0f;
+
+        for (int g = 0; g < 4; g++) {
+            uint8_t indices[8];
+            tq4_unpack_4bit_8(indices, packed + g * 4);
+            for (int k = 0; k < 8; k++) {
+                dot += qr[g * 8 + k] * tq4_codebook[indices[k]];
+            }
+        }
+        sumf += dot * scale;
+    }
+    return sumf;
+}
+
+/* ---- scale_add_tq4_f32: dst[i] += scale * tq4_dequant(src[i]) ---- */
+void scale_add_tq4_f32(float *dst, float scale, const void *src, int n) {
+    assert(n > 0 && (n % TQ4_BLOCK_SIZE) == 0);
+    const block_tq4 *blocks = (const block_tq4 *)src;
+    int nb = n / TQ4_BLOCK_SIZE;
+
+    for (int bi = 0; bi < nb; bi++) {
+        float block_scale = scale * fp16_to_fp32(blocks[bi].d);
+        const uint8_t *packed = blocks[bi].qs;
+
+        /* Unpack indices and look up codebook values -> rotated domain */
+        float rotated[TQ4_BLOCK_SIZE];
+        for (int g = 0; g < 4; g++) {
+            uint8_t indices[8];
+            tq4_unpack_4bit_8(indices, packed + g * 4);
+            for (int k = 0; k < 8; k++)
+                rotated[g * 8 + k] = tq4_codebook[indices[k]];
+        }
+
+        /* WHT inverse -> original domain, then scale + add */
+        float reconstructed[TQ4_BLOCK_SIZE];
+        tq3_wht_inverse_32(reconstructed, rotated);
+        for (int i = 0; i < TQ4_BLOCK_SIZE; i++)
+            dst[bi * TQ4_BLOCK_SIZE + i] += reconstructed[i] * block_scale;
+    }
+}
+
+/* ---- fma_scale_tq4_f32: dst[i] = dst[i] * correction + tq4_dequant(src[i]) ---- */
+void fma_scale_tq4_f32(float *dst, float correction, const void *src, int n) {
+    assert(n > 0 && (n % TQ4_BLOCK_SIZE) == 0);
+    const block_tq4 *blocks = (const block_tq4 *)src;
+    int nb = n / TQ4_BLOCK_SIZE;
+
+    for (int bi = 0; bi < nb; bi++) {
+        float block_scale = fp16_to_fp32(blocks[bi].d);
+        const uint8_t *packed = blocks[bi].qs;
+        float *dptr = dst + bi * TQ4_BLOCK_SIZE;
+
+        /* Unpack indices and look up codebook values */
+        float rotated[TQ4_BLOCK_SIZE];
+        for (int g = 0; g < 4; g++) {
+            uint8_t indices[8];
+            tq4_unpack_4bit_8(indices, packed + g * 4);
+            for (int k = 0; k < 8; k++)
+                rotated[g * 8 + k] = tq4_codebook[indices[k]];
+        }
+
+        /* WHT inverse -> original domain */
+        float reconstructed[TQ4_BLOCK_SIZE];
+        tq3_wht_inverse_32(reconstructed, rotated);
+
+        /* FMA: dst[i] = dst[i] * correction + reconstructed[i] * scale */
+        for (int i = 0; i < TQ4_BLOCK_SIZE; i++)
+            dptr[i] = dptr[i] * correction + reconstructed[i] * block_scale;
+    }
+}

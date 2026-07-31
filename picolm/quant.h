@@ -388,6 +388,15 @@ typedef struct {
     uint8_t  qs[12];     /* 32 values x 3-bit packed = 12 bytes */
 } block_tq3;             /* 14 bytes */
 
+/* TurboQuant TQ4 block: 32 values in 18 bytes (4.5 bits/value)
+ * Same WHT rotation as TQ3, but 16-entry Lloyd-Max codebook + nibble packing.
+ * D_mse ~0.0095 (vs TQ3 D_mse ~0.032) -- 3.4x better accuracy.
+ * Layout: 2 bytes fp16 RMS scale + 16 bytes packed 4-bit indices. */
+typedef struct {
+    uint16_t d;          /* RMS scale (FP16) */
+    uint8_t  qs[16];     /* 32 values x 4-bit packed = 16 bytes */
+} block_tq4;             /* 18 bytes */
+
 /* TQ3 Lloyd-Max codebook centroids for N(0,1) */
 #define TQ3_CODEBOOK_8 { -2.1519f, -1.3439f, -0.7560f, -0.2451f, \
                           0.2451f,  0.7560f,  1.3439f,  2.1519f }
@@ -409,6 +418,25 @@ typedef struct {
 extern const float tq3_codebook[8];
 extern const float tq3_boundaries[7];
 extern const float tq3_signs[32];
+
+/* TQ4 block size (same as TQ3) */
+#define TQ4_BLOCK_SIZE 32
+
+/* TQ4 Lloyd-Max 16-entry codebook centroids for N(0,1) */
+/* D_mse ~0.0095 vs TQ3 ~0.032 */
+extern const float tq4_codebook[16];
+extern const float tq4_boundaries[15];
+
+static inline void tq4_unpack_4bit_8(uint8_t *dst, const uint8_t *src) {
+    dst[0] = src[0] & 0xF;
+    dst[1] = src[0] >> 4;
+    dst[2] = src[1] & 0xF;
+    dst[3] = src[1] >> 4;
+    dst[4] = src[2] & 0xF;
+    dst[5] = src[2] >> 4;
+    dst[6] = src[3] & 0xF;
+    dst[7] = src[3] >> 4;
+}
 
 static inline void tq3_unpack_3bit_8(uint8_t *dst, const uint8_t *src) {
     dst[0] = src[0] & 7;
@@ -567,6 +595,11 @@ void quantize_row_q4_0(const float *x, void *dst, int n);
  * n must be a multiple of 32. */
 void quantize_row_tq3(const float *x, void *dst, int n);
 
+/* Quantize a float32 vector to TQ4 blocks (TurboQuant 4-bit codebook).
+ * dst must have space for (n / 32) * sizeof(block_tq4) bytes.
+ * n must be a multiple of 32. */
+void quantize_row_tq4(const float *x, void *dst, int n);
+
 /* Converts one Q4_0 weight row to a "shadow" Q8_0 representation: same
  * per-block delta, values unpacked to (nibble - 8) directly as int8.
  * Q4_0's dequant formula is exactly (nibble-8)*d, which is exactly what
@@ -608,6 +641,21 @@ void scale_add_tq3_f32(float *dst, float scale, const void *src, int n);
 /* fma_scale_tq3_f32: dst[i] = dst[i] * correction + tq3_dequant(src[i]).
  * Result is in the ORIGINAL domain (inverse WHT applied). */
 void fma_scale_tq3_f32(float *dst, float correction, const void *src, int n);
+
+/* ---- TQ4 KV cache helpers ---- */
+/* TQ4: same WHT as TQ3 but 16-entry Lloyd-Max codebook (4 bits/value).
+ * Dot product uses the codebook-lookup approach in the rotated domain
+ * (no inverse WHT needed, via Parseval's theorem for orthogonal transforms).
+ * Q must be pre-rotated with WHT forward (block=32) before calling vec_dot. */
+float vec_dot_tq4_f32(const void *src, const float *q_rotated, int n);
+
+/* scale_add_tq4_f32: dst[i] += scale * tq4_dequant(src[i]).
+ * Result is in the ORIGINAL domain (inverse WHT applied). */
+void scale_add_tq4_f32(float *dst, float scale, const void *src, int n);
+
+/* fma_scale_tq4_f32: dst[i] = dst[i] * correction + tq4_dequant(src[i]).
+ * Result is in the ORIGINAL domain (inverse WHT applied). */
+void fma_scale_tq4_f32(float *dst, float correction, const void *src, int n);
 
 /* ---- Walsh-Hadamard Transform (for KV cache rotation) ---- */
 /* In-place Walsh-Hadamard transform of n elements.

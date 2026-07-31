@@ -196,6 +196,7 @@ typedef enum {
     KV_CACHE_Q8_0,  /* Q8_0 (1 byte + 2 byte scale per 32 elements) */
     KV_CACHE_Q4_0,  /* Q4_0 (0.5 bytes + 2 byte scale per 32 elements) */
     KV_CACHE_TQ3,   /* TurboQuant 3-bit: 3.5 bits/element (WHT + Lloyd-Max) */
+    KV_CACHE_TQ4,   /* TurboQuant 4-bit: 4.5 bits/element (WHT + Lloyd-Max) */
 } kv_cache_type_t;
 
 /* ---- Runtime state (pre-allocated buffers) ---- */

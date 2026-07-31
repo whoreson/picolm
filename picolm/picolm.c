@@ -117,8 +117,8 @@ static void usage(const char *prog) {
     fprintf(stderr, "\nAdvanced options:\n");
     fprintf(stderr, "  --json         Grammar-constrained JSON output mode\n");
     fprintf(stderr, "  --cache <file> KV cache file (saves/loads prompt state)\n");
-    fprintf(stderr, "  -ctk <type>    Key cache type: f16, q8_0, q4_0, tq3 (default: f16)\n");
-    fprintf(stderr, "  -ctv <type>    Val cache type: f16, q8_0, q4_0, tq3 (default: f16)\n");
+    fprintf(stderr, "  -ctk <type>    Key cache type: f16, q8_0, q4_0, tq3, tq4 (default: f16)\n");
+    fprintf(stderr, "  -ctv <type>    Val cache type: f16, q8_0, q4_0, tq3, tq4 (default: f16)\n");
     fprintf(stderr, "  -khad          Apply Walsh-Hadamard rotation to K cache before quantization\n");
     fprintf(stderr, "  -vhad          Apply Walsh-Hadamard rotation to V cache before quantization\n");
     fprintf(stderr, "\nServer slot options:\n");
@@ -432,8 +432,9 @@ int main(int argc, char **argv) {
             if (strcmp(typestr, "q8_0") == 0) *tgt = KV_CACHE_Q8_0;
             else if (strcmp(typestr, "q4_0") == 0) *tgt = KV_CACHE_Q4_0;
             else if (strcmp(typestr, "tq3") == 0) *tgt = KV_CACHE_TQ3;
+            else if (strcmp(typestr, "tq4") == 0) *tgt = KV_CACHE_TQ4;
             else if (strcmp(typestr, "f16") == 0) *tgt = KV_CACHE_F16;
-            else { fprintf(stderr, "Unknown KV cache type: %s (use f16, q8_0, q4_0, tq3)\n", typestr); return 1; }
+            else { fprintf(stderr, "Unknown KV cache type: %s (use f16, q8_0, q4_0, tq3, tq4)\n", typestr); return 1; }
         } else if (strcmp(argv[i], "-khad") == 0) {
             k_cache_hadamard = 1;
         } else if (strcmp(argv[i], "-vhad") == 0) {
@@ -649,6 +650,14 @@ int main(int argc, char **argv) {
         }
     }
 #endif
+    /* Guard: TQ3 is too lossy for mixed-mode. Require TQ3/TQ3 pairing. */
+    if ((kv_type_k == KV_CACHE_TQ3 && kv_type_v != KV_CACHE_TQ3) ||
+        (kv_type_v == KV_CACHE_TQ3 && kv_type_k != KV_CACHE_TQ3)) {
+        fprintf(stderr, "ERROR: TQ3 KV cache must be used for both K and V (-ctk tq3 -ctv tq3).\n");
+        fprintf(stderr, "       Mixed-mode (TQ3 K + non-TQ3 V or vice versa) produces corrupted output\n");
+        fprintf(stderr, "       because 3-bit quantization error in attention scores is too large.\n");
+        return 1;
+    }
     int load_ok = 0;
     if (is_safetensors) {
         load_ok = (model_load_safetensors(&model, model_path, context_override, kv_type_k, kv_type_v, k_cache_hadamard, v_cache_hadamard) == 0);
@@ -1023,12 +1032,14 @@ int main(int argc, char **argv) {
     {
         const char *kname = "f16";
         if (model.state.kv_type_k == KV_CACHE_Q8_0) kname = "q8_0";
-        if (model.state.kv_type_k == KV_CACHE_Q4_0) kname = "q4_0";
-        if (model.state.kv_type_k == KV_CACHE_TQ3) kname = "tq3";
+        else if (model.state.kv_type_k == KV_CACHE_Q4_0) kname = "q4_0";
+        else if (model.state.kv_type_k == KV_CACHE_TQ3) kname = "tq3";
+        else if (model.state.kv_type_k == KV_CACHE_TQ4) kname = "tq4";
         const char *vname = "f16";
         if (model.state.kv_type_v == KV_CACHE_Q8_0) vname = "q8_0";
-        if (model.state.kv_type_v == KV_CACHE_Q4_0) vname = "q4_0";
-        if (model.state.kv_type_v == KV_CACHE_TQ3) vname = "tq3";
+        else if (model.state.kv_type_v == KV_CACHE_Q4_0) vname = "q4_0";
+        else if (model.state.kv_type_v == KV_CACHE_TQ3) vname = "tq3";
+        else if (model.state.kv_type_v == KV_CACHE_TQ4) vname = "tq4";
         fprintf(stderr, "Memory: %.2f MB runtime state (%s/%s KV cache)\n",
                 (double)model.state.mem_size / (1024.0 * 1024.0), kname, vname);
     }
