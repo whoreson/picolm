@@ -3064,12 +3064,12 @@ static void moe_forward(model_t *m, run_state_t *s, const float *x, float *resid
         silu(hb_exp, n_ff);
         elemwise_mul(hb_exp, hb_exp, hb2_exp, n_ff);
 
-        /* Down projection: out = hb_exp @ down_w */
-        matmul(s->xb, hb_exp, down_w, n_ff, dim, type_down);
+        /* Down projection: out = hb_exp @ down_w (use xb2 as scratch, not s->xb which is input) */
+        matmul(s->xb2, hb_exp, down_w, n_ff, dim, type_down);
 
         /* Weighted accumulate */
         for (int d = 0; d < dim; d++) {
-            moe_out[d] += w_i * s->xb[d];
+            moe_out[d] += w_i * s->xb2[d];
         }
     }
 
@@ -3078,19 +3078,20 @@ static void moe_forward(model_t *m, run_state_t *s, const float *x, float *resid
     matmul(s->hb2, (float *)x, lw->ffn_up_shexp, dim, c->n_ff_shexp, lw->type_ffn_up_shexp);
     silu(s->hb, c->n_ff_shexp);
     elemwise_mul(s->hb, s->hb, s->hb2, c->n_ff_shexp);
-    matmul(s->xb, s->hb, lw->ffn_down_shexp, c->n_ff_shexp, dim, lw->type_ffn_down_shexp);
+    /* Use xb2 for down projection (xb may alias input x) */
+    matmul(s->xb2, s->hb, lw->ffn_down_shexp, c->n_ff_shexp, dim, lw->type_ffn_down_shexp);
 
     /* Shared expert sigmoid gate: sigmoid(x @ ffn_gate_inp_shexp) */
     {
         float gate_val;
         matmul(&gate_val, (float *)x, lw->ffn_gate_inp_shexp, dim, 1, GGUF_TYPE_F32);
         gate_val = 1.0f / (1.0f + expf(-gate_val));
-        for (int d = 0; d < dim; d++) s->xb[d] *= gate_val;
+        for (int d = 0; d < dim; d++) s->xb2[d] *= gate_val;
     }
 
     /* 7. Combine: moe_out + shared */
     for (int d = 0; d < dim; d++) {
-        residual[d] = moe_out[d] + s->xb[d];
+        residual[d] = moe_out[d] + s->xb2[d];
     }
 }
 
