@@ -141,6 +141,44 @@ size_t layer_weight_size(model_t *m, int l) {
     if (lw->ffn_down) {
         sz += gguf_type_row_size(lw->type_ffn_down, dim) * n_ffn;
     }
+    /* MoE tensors: 3D [dim0, dim1, n_expert], stored row-major (dim0 fastest) */
+    if (lw->ffn_gate_exps) {
+        int n_ff_exp = m->config.n_ff_exp;
+        int n_expert = m->config.n_expert;
+        /* [dim, n_ff_exp, n_expert]: n_expert * n_ff_exp rows of dim elements */
+        sz += (size_t)n_expert * n_ff_exp * gguf_type_row_size(lw->type_ffn_gate_exps, dim);
+    }
+    if (lw->ffn_up_exps) {
+        int n_ff_exp = m->config.n_ff_exp;
+        int n_expert = m->config.n_expert;
+        sz += (size_t)n_expert * n_ff_exp * gguf_type_row_size(lw->type_ffn_up_exps, dim);
+    }
+    if (lw->ffn_down_exps) {
+        int n_ff_exp = m->config.n_ff_exp;
+        int n_expert = m->config.n_expert;
+        /* [n_ff_exp, dim, n_expert]: n_expert * dim rows of n_ff_exp elements */
+        sz += (size_t)n_expert * dim * gguf_type_row_size(lw->type_ffn_down_exps, n_ff_exp);
+    }
+    if (lw->ffn_gate_inp) {
+        int n_expert = m->config.n_expert;
+        sz += gguf_type_row_size(lw->type_ffn_gate_inp, n_expert) * dim;
+    }
+    if (lw->ffn_gate_inp_shexp) {
+        /* [dim] F32 */
+        sz += dim * sizeof(float);
+    }
+    if (lw->ffn_gate_shexp) {
+        int n_ff_shexp = m->config.n_ff_shexp;
+        sz += gguf_type_row_size(lw->type_ffn_gate_shexp, n_ff_shexp) * dim;
+    }
+    if (lw->ffn_up_shexp) {
+        int n_ff_shexp = m->config.n_ff_shexp;
+        sz += gguf_type_row_size(lw->type_ffn_up_shexp, n_ff_shexp) * dim;
+    }
+    if (lw->ffn_down_shexp) {
+        int n_ff_shexp = m->config.n_ff_shexp;
+        sz += gguf_type_row_size(lw->type_ffn_down_shexp, dim) * n_ff_shexp;
+    }
     return sz;
 }
 
@@ -936,7 +974,7 @@ static int parse_gguf(model_t *m, int max_seq_len) {
 
 
         if (str_eq(key, "llama.embedding_length") || str_eq(key, "general.embedding_length")
-            || str_eq(key, "qwen2.embedding_length") || str_eq(key, "qwen3.embedding_length") || str_eq(key, "qwen35.embedding_length")
+            || str_eq(key, "qwen2.embedding_length") || str_eq(key, "qwen3.embedding_length") || str_eq(key, "qwen35.embedding_length") || str_eq(key, "qwen35moe.embedding_length")
             || str_eq(key, "gemma3n.embedding_length")) {
             int dummy; cfg->n_embd = (int)skip_meta_value(&r, vtype, &dummy);
             /* NOTE: Qwen2 uses interleaved RoPE. Qwen3 and Qwen3.5 use pairwise RoPE
@@ -948,29 +986,30 @@ static int parse_gguf(model_t *m, int max_seq_len) {
             || str_eq(key, "gemma3n.feed_forward_length")) {
             int dummy; cfg->n_ffn = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "llama.attention.head_count")
-            || str_eq(key, "qwen2.attention.head_count") || str_eq(key, "qwen3.attention.head_count") || str_eq(key, "qwen35.attention.head_count")
+            || str_eq(key, "qwen2.attention.head_count") || str_eq(key, "qwen3.attention.head_count") || str_eq(key, "qwen35.attention.head_count") || str_eq(key, "qwen35moe.attention.head_count")
             || str_eq(key, "gemma3n.attention.head_count")) {
             int dummy; cfg->n_heads = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "llama.attention.head_count_kv")
-            || str_eq(key, "qwen2.attention.head_count_kv") || str_eq(key, "qwen3.attention.head_count_kv") || str_eq(key, "qwen35.attention.head_count_kv")
+            || str_eq(key, "qwen2.attention.head_count_kv") || str_eq(key, "qwen3.attention.head_count_kv") || str_eq(key, "qwen35.attention.head_count_kv") || str_eq(key, "qwen35moe.attention.head_count_kv")
             || str_eq(key, "gemma3n.attention.head_count_kv")) {
             int dummy; cfg->n_kv_heads = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "attention.key_length")
             || str_eq(key, "qwen2.attention.key_length")
             || str_eq(key, "qwen3.attention.key_length") || str_eq(key, "qwen35.attention.key_length")
+            || str_eq(key, "qwen35moe.attention.key_length")
             || str_eq(key, "gemma3n.attention.key_length")) {
             /* Explicit head_dim (Qwen3/3.5/Gemma-3n may differ from n_embd/n_heads) */
             int dummy; cfg->head_dim = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "llama.block_count")
-            || str_eq(key, "qwen2.block_count") || str_eq(key, "qwen3.block_count") || str_eq(key, "qwen35.block_count")
+            || str_eq(key, "qwen2.block_count") || str_eq(key, "qwen3.block_count") || str_eq(key, "qwen35.block_count") || str_eq(key, "qwen35moe.block_count")
             || str_eq(key, "gemma3n.block_count")) {
             int dummy; cfg->n_layers = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "llama.context_length")
-            || str_eq(key, "qwen2.context_length") || str_eq(key, "qwen3.context_length") || str_eq(key, "qwen35.context_length")
+            || str_eq(key, "qwen2.context_length") || str_eq(key, "qwen3.context_length") || str_eq(key, "qwen35.context_length") || str_eq(key, "qwen35moe.context_length")
             || str_eq(key, "gemma3n.context_length")) {
             int dummy; cfg->max_seq_len = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "llama.rope.freq_base")
-            || str_eq(key, "qwen2.rope.freq_base") || str_eq(key, "qwen3.rope.freq_base") || str_eq(key, "qwen35.rope.freq_base")
+            || str_eq(key, "qwen2.rope.freq_base") || str_eq(key, "qwen3.rope.freq_base") || str_eq(key, "qwen35.rope.freq_base") || str_eq(key, "qwen35moe.rope.freq_base")
             || str_eq(key, "gemma3n.rope.freq_base")) {
             if (vtype == GGUF_META_FLOAT32) {
                 cfg->rope_freq_base = read_f32(&r);
@@ -978,10 +1017,12 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                 int dummy; skip_meta_value(&r, vtype, &dummy);
             }
         } else if (str_eq(key, "qwen35.rope.dimension_count")
+            || str_eq(key, "qwen35moe.rope.dimension_count")
             || str_eq(key, "llama.rope.dimension_count")) {
             int dummy; cfg->rope_dim = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "rope.dimension_sections")
-            || str_eq(key, "qwen35.rope.dimension_sections")) {
+            || str_eq(key, "qwen35.rope.dimension_sections")
+            || str_eq(key, "qwen35moe.rope.dimension_sections")) {
             /* ARRAY of I32 (elem_type=5): [11, 11, 10, 0] for Qwen3.5 */
             if (vtype == GGUF_META_ARRAY) {
                 uint32_t elem_type = read_u32(&r);
@@ -1011,7 +1052,7 @@ static int parse_gguf(model_t *m, int max_seq_len) {
             }
         } else if (str_eq(key, "llama.attention.layer_norm_rms_epsilon")
             || str_eq(key, "qwen2.attention.layer_norm_rms_epsilon")
-            || str_eq(key, "qwen3.attention.layer_norm_rms_epsilon") || str_eq(key, "qwen35.attention.layer_norm_rms_epsilon")
+            || str_eq(key, "qwen3.attention.layer_norm_rms_epsilon") || str_eq(key, "qwen35.attention.layer_norm_rms_epsilon") || str_eq(key, "qwen35moe.attention.layer_norm_rms_epsilon")
             || str_eq(key, "gemma3n.attention.layer_norm_rms_epsilon")) {
             /* Read epsilon from GGUF (F32 type=6 or F64 type=11 in metadata) */
             if (vtype == GGUF_META_FLOAT32) { /* F32 */
@@ -1025,15 +1066,15 @@ static int parse_gguf(model_t *m, int max_seq_len) {
             } else {
                 int dummy; skip_meta_value(&r, vtype, &dummy);
             }
-        } else if (str_eq(key, "qwen35.ssm.conv_kernel") || str_eq(key, "qwen3.ssm.conv_kernel")) {
+        } else if (str_eq(key, "qwen35.ssm.conv_kernel") || str_eq(key, "qwen35moe.ssm.conv_kernel") || str_eq(key, "qwen3.ssm.conv_kernel")) {
             int dummy; cfg->ssm_d_conv = (int)skip_meta_value(&r, vtype, &dummy); cfg->has_ssm = 1;
-        } else if (str_eq(key, "qwen35.ssm.state_size") || str_eq(key, "qwen3.ssm.state_size")) {
+        } else if (str_eq(key, "qwen35.ssm.state_size") || str_eq(key, "qwen35moe.ssm.state_size") || str_eq(key, "qwen3.ssm.state_size")) {
             int dummy; cfg->ssm_d_state = (int)skip_meta_value(&r, vtype, &dummy);
-        } else if (str_eq(key, "qwen35.ssm.group_count") || str_eq(key, "qwen3.ssm.group_count")) {
+        } else if (str_eq(key, "qwen35.ssm.group_count") || str_eq(key, "qwen35moe.ssm.group_count") || str_eq(key, "qwen3.ssm.group_count")) {
             int dummy; cfg->ssm_n_group = (int)skip_meta_value(&r, vtype, &dummy);
-        } else if (str_eq(key, "qwen35.ssm.time_step_rank") || str_eq(key, "qwen3.ssm.time_step_rank")) {
+        } else if (str_eq(key, "qwen35.ssm.time_step_rank") || str_eq(key, "qwen35moe.ssm.time_step_rank") || str_eq(key, "qwen3.ssm.time_step_rank")) {
             int dummy; cfg->ssm_dt_rank = (int)skip_meta_value(&r, vtype, &dummy);
-        } else if (str_eq(key, "qwen35.ssm.inner_size") || str_eq(key, "qwen3.ssm.inner_size")) {
+        } else if (str_eq(key, "qwen35.ssm.inner_size") || str_eq(key, "qwen35moe.ssm.inner_size") || str_eq(key, "qwen3.ssm.inner_size")) {
             int dummy; cfg->ssm_d_inner = (int)skip_meta_value(&r, vtype, &dummy);
         /* Gemma-3n specific config */
         } else if (str_eq(key, "gemma3n.altup.num_inputs")) {
@@ -1050,12 +1091,23 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                 int dummy; skip_meta_value(&r, vtype, &dummy);
             }
         }
+        /* MoE specific config (qwen35moe) */
+        else if (str_eq(key, "qwen35moe.expert_count")) {
+            int dummy; cfg->n_expert = (int)skip_meta_value(&r, vtype, &dummy); cfg->has_moe = 1;
+        } else if (str_eq(key, "qwen35moe.expert_used_count")) {
+            int dummy; cfg->n_expert_used = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "qwen35moe.expert_feed_forward_length")) {
+            int dummy; cfg->n_ff_exp = (int)skip_meta_value(&r, vtype, &dummy);
+            cfg->n_ffn = cfg->n_ff_exp; /* reuse n_ffn for buffer sizing */
+        } else if (str_eq(key, "qwen35moe.expert_shared_feed_forward_length")) {
+            int dummy; cfg->n_ff_shexp = (int)skip_meta_value(&r, vtype, &dummy);
+        }
         /* Gemma-3n: laurel_rank is derived from tensor shapes, not from KV */
         /* Gemma-3n: final_logit_softcapping default */
         else if (str_eq(key, "general.alignment")) {
             int dummy; cfg->alignment = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "llama.vocab_size")
-            || str_eq(key, "qwen2.vocab_size") || str_eq(key, "qwen3.vocab_size") || str_eq(key, "qwen35.vocab_size")
+            || str_eq(key, "qwen2.vocab_size") || str_eq(key, "qwen3.vocab_size") || str_eq(key, "qwen35.vocab_size") || str_eq(key, "qwen35moe.vocab_size")
             || str_eq(key, "gemma3n.vocab_size")) {
             int dummy; cfg->vocab_size = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "tokenizer.ggml.bos_token_id")) {
@@ -1392,6 +1444,24 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                 } else if (strcmp(suffix, "ffn_up.weight") == 0) {
                     lw->ffn_up = ptr; lw->type_ffn_up = qtype;
                 }
+                /* MoE tensors (qwen35moe) */
+                else if (strcmp(suffix, "ffn_gate_exps.weight") == 0) {
+                    lw->ffn_gate_exps = ptr; lw->type_ffn_gate_exps = qtype;
+                } else if (strcmp(suffix, "ffn_up_exps.weight") == 0) {
+                    lw->ffn_up_exps = ptr; lw->type_ffn_up_exps = qtype;
+                } else if (strcmp(suffix, "ffn_down_exps.weight") == 0) {
+                    lw->ffn_down_exps = ptr; lw->type_ffn_down_exps = qtype;
+                } else if (strcmp(suffix, "ffn_gate_inp.weight") == 0) {
+                    lw->ffn_gate_inp = ptr; lw->type_ffn_gate_inp = qtype;
+                } else if (strcmp(suffix, "ffn_gate_inp_shexp.weight") == 0) {
+                    lw->ffn_gate_inp_shexp = ptr;
+                } else if (strcmp(suffix, "ffn_gate_shexp.weight") == 0) {
+                    lw->ffn_gate_shexp = ptr; lw->type_ffn_gate_shexp = qtype;
+                } else if (strcmp(suffix, "ffn_up_shexp.weight") == 0) {
+                    lw->ffn_up_shexp = ptr; lw->type_ffn_up_shexp = qtype;
+                } else if (strcmp(suffix, "ffn_down_shexp.weight") == 0) {
+                    lw->ffn_down_shexp = ptr; lw->type_ffn_down_shexp = qtype;
+                }
                 /* SSM tensors (Qwen3.5) */
                 else if (strcmp(suffix, "attn_qkv.weight") == 0) {
                     lw->attn_qkv = ptr; lw->type_attn_qkv = qtype; lw->is_attn_layer = 0;
@@ -1541,6 +1611,10 @@ static int parse_gguf(model_t *m, int max_seq_len) {
         fprintf(stderr, "  Layers: %d SSM + %d full attention\n", ssm_count, attn_count);
     }
     fprintf(stderr, "  head_dim=%d, rope_dim=%d, rope_base=%.1f\n", cfg->head_dim, cfg->rope_dim, (double)cfg->rope_freq_base);
+    if (cfg->has_moe) {
+        fprintf(stderr, "  MoE: experts=%d used=%d ff_exp=%d ff_shexp=%d\n",
+                cfg->n_expert, cfg->n_expert_used, cfg->n_ff_exp, cfg->n_ff_shexp);
+    }
     if (cfg->is_gemma3n) {
         fprintf(stderr, "  Gemma-3n: altup=%d active=%d laurel_rank=%d embd_altup=%d kv_layers=%d softcap=%.1f\n",
                 cfg->n_altup, cfg->i_altup_act, cfg->laurel_rank, cfg->n_embd_altup,
@@ -1746,11 +1820,21 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         sz_gemma3n += (size_t)c->n_layers * (n_embd * laurel_rank + laurel_rank * n_embd) * sizeof(float); /* laurel_l + laurel_r */
     }
 
+    /* MoE buffers */
+    size_t sz_moe = 0;
+    if (c->has_moe) {
+        sz_moe += (size_t)c->n_expert * sizeof(float);       /* expert_logits */
+        sz_moe += (size_t)c->n_expert_used * sizeof(int);    /* expert_ids */
+        sz_moe += (size_t)c->n_expert_used * sizeof(float);  /* expert_weights */
+        sz_moe += (size_t)c->n_embd * sizeof(float);         /* moe_out */
+        sz_moe += (size_t)c->n_ff_exp * sizeof(float) * 2;   /* hb_exp, hb2_exp */
+    }
+
     size_t total = sz_x + sz_xb + sz_xb2 + sz_q +
                    sz_hb + sz_hb2 + sz_logits +
                    sz_scratch + sz_rope + sz_norm +
                    sz_ssm_conv + sz_ssm_state + sz_ssm_small + sz_ssm_tmp +
-                   sz_gemma3n;
+                   sz_gemma3n + sz_moe;
 
     /* Quantized KV cache: separate allocation (only for attention layers)
      * Full-row GQA layout: [layer][pos] -> GQA row of n_kv_heads*head_dim */
@@ -2011,6 +2095,18 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         }
     }
 
+    /* MoE buffer carving */
+    if (c->has_moe) {
+        s->expert_logits = p; p += c->n_expert;
+        /* Align int pointer to float boundary */
+        s->expert_ids = (int *)((uint8_t *)p);
+        p += (c->n_expert_used * sizeof(int) + sizeof(float) - 1) / sizeof(float);
+        s->expert_weights = p; p += c->n_expert_used;
+        s->moe_out = p; p += c->n_embd;
+        s->hb_exp = p; p += c->n_ff_exp;
+        s->hb2_exp = p; p += c->n_ff_exp;
+    }
+
     /* Pre-dequantize norm weights */
     float *nw = s->norm_weights;
     for (int l = 0; l < c->n_layers; l++) {
@@ -2238,7 +2334,24 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
     /* Validate that all required tensors are present */
     {
         layer_weights_t *lw = &m->weights.layers[0];
-        if (m->config.has_ssm) {
+        if (m->config.has_moe) {
+            /* MoE model: check MoE tensors */
+            if (!lw->ffn_gate_exps || !lw->ffn_up_exps || !lw->ffn_down_exps ||
+                !lw->ffn_gate_inp || !lw->ffn_gate_inp_shexp ||
+                !lw->ffn_gate_shexp || !lw->ffn_up_shexp || !lw->ffn_down_shexp) {
+                fprintf(stderr, "Missing MoE tensors\n");
+                return -1;
+            }
+            /* MoE models also have SSM tensors (like qwen35) */
+            if (m->config.has_ssm) {
+                if (!lw->attn_qkv || !lw->attn_gate_ssm || !lw->ssm_a ||
+                    !lw->ssm_alpha || !lw->ssm_beta || !lw->ssm_conv1d ||
+                    !lw->ssm_dt || !lw->ssm_norm || !lw->ssm_out) {
+                    fprintf(stderr, "Missing SSM tensors in MoE model\n");
+                    return -1;
+                }
+            }
+        } else if (m->config.has_ssm) {
             /* SSM model: check SSM tensors (MLP weights are optional per layer) */
             if (!lw->attn_qkv || !lw->attn_gate_ssm || !lw->ssm_a ||
                 !lw->ssm_alpha || !lw->ssm_beta || !lw->ssm_conv1d ||
@@ -2852,6 +2965,135 @@ static void attention_group(int kv_head_idx, void *ctx_ptr) {
     }
 }
 
+/* ---- MoE Forward Pass ---- */
+
+/* Get pointer to expert e's sub-tensor within a 3D expert tensor.
+ * For gate_exps [n_embd, n_ff_exp, n_expert]: each expert is [n_embd, n_ff_exp].
+ * For down_exps [n_ff_exp, n_embd, n_expert]: each expert is [n_ff_exp, n_embd].
+ * GGUF stores dims row-major: dims[0] varies fastest.
+ * Expert e starts at: e * dim1 * gguf_type_row_size(type, dim0)
+ * (each row has dim0 elements, and there are dim1 rows per expert) */
+static const void *get_expert_slice(const void *base, int expert,
+                                    int dim0, int dim1, gguf_type_t type) {
+    size_t expert_stride = (size_t)dim1 * gguf_type_row_size(type, dim0);
+    return (const void *)((const uint8_t *)base + expert * expert_stride);
+}
+
+/* MoE forward pass: router + top-K expert selection + SwiGLU per expert + shared expert.
+ * Input: x[n_embd], Output: residual[n_embd] (additive to input) */
+static void moe_forward(model_t *m, run_state_t *s, const float *x, float *residual,
+                        const layer_weights_t *lw) {
+    model_config_t *c = &m->config;
+    int dim = c->n_embd;
+    int n_ff = c->n_ff_exp;
+    int n_expert = c->n_expert;
+    int n_used = c->n_expert_used;
+    float *logits = s->expert_logits;
+    int *ids = s->expert_ids;
+    float *weights = s->expert_weights;
+    float *moe_out = s->moe_out;
+    float *hb_exp = s->hb_exp;
+    float *hb2_exp = s->hb2_exp;
+
+    /* 1. Router: logits = x @ ffn_gate_inp  [n_embd, n_expert] -> [n_expert] */
+    matmul(logits, (float *)x, lw->ffn_gate_inp, dim, n_expert, lw->type_ffn_gate_inp);
+
+    /* 2. Softmax over logits */
+    {
+        float max_l = logits[0];
+        for (int i = 1; i < n_expert; i++) {
+            if (logits[i] > max_l) max_l = logits[i];
+        }
+        float sum = 0.0f;
+        for (int i = 0; i < n_expert; i++) {
+            logits[i] = expf(logits[i] - max_l);
+            sum += logits[i];
+        }
+        float inv_sum = 1.0f / sum;
+        for (int i = 0; i < n_expert; i++) {
+            logits[i] *= inv_sum;
+        }
+    }
+
+    /* 3. Find top-K experts (simple selection sort for small K) */
+    {
+        /* Create index array sorted by descending logit value */
+        int idx[256]; /* max n_expert = 256 for qwen35moe */
+        for (int i = 0; i < n_expert; i++) idx[i] = i;
+
+        /* Partial selection sort: only sort top-K */
+        for (int i = 0; i < n_used; i++) {
+            int best = i;
+            for (int j = i + 1; j < n_expert; j++) {
+                if (logits[idx[j]] > logits[idx[best]]) best = j;
+            }
+            /* Swap */
+            { int t = idx[i]; idx[i] = idx[best]; idx[best] = t; }
+            ids[i] = idx[i];
+            weights[i] = logits[idx[i]];
+        }
+    }
+
+    /* 3b. Normalize top-K weights by their sum (norm_w=true for qwen35moe) */
+    {
+        float wsum = 0.0f;
+        for (int i = 0; i < n_used; i++) wsum += weights[i];
+        float inv_wsum = (wsum > 0.0f) ? 1.0f / wsum : 0.0f;
+        for (int i = 0; i < n_used; i++) weights[i] *= inv_wsum;
+    }
+
+    /* 4. Zero accumulator */
+    memset(moe_out, 0, dim * sizeof(float));
+
+    /* 5. For each selected expert, compute SwiGLU and weighted add */
+    gguf_type_t type_gate = lw->type_ffn_gate_exps;
+    gguf_type_t type_up = lw->type_ffn_up_exps;
+    gguf_type_t type_down = lw->type_ffn_down_exps;
+
+    for (int i = 0; i < n_used; i++) {
+        int eid = ids[i];
+        float w_i = weights[i];
+
+        const void *gate_w = get_expert_slice(lw->ffn_gate_exps, eid, dim, n_ff, type_gate);
+        const void *up_w = get_expert_slice(lw->ffn_up_exps, eid, dim, n_ff, type_up);
+        const void *down_w = get_expert_slice(lw->ffn_down_exps, eid, n_ff, dim, type_down);
+
+        /* SwiGLU: gate = silu(x @ gate_w), up = x @ up_w */
+        matmul(hb_exp, (float *)x, gate_w, dim, n_ff, type_gate);
+        matmul(hb2_exp, (float *)x, up_w, dim, n_ff, type_up);
+        silu(hb_exp, n_ff);
+        elemwise_mul(hb_exp, hb_exp, hb2_exp, n_ff);
+
+        /* Down projection: out = hb_exp @ down_w */
+        matmul(s->xb, hb_exp, down_w, n_ff, dim, type_down);
+
+        /* Weighted accumulate */
+        for (int d = 0; d < dim; d++) {
+            moe_out[d] += w_i * s->xb[d];
+        }
+    }
+
+    /* 6. Shared expert (always computed) */
+    matmul(s->hb, (float *)x, lw->ffn_gate_shexp, dim, c->n_ff_shexp, lw->type_ffn_gate_shexp);
+    matmul(s->hb2, (float *)x, lw->ffn_up_shexp, dim, c->n_ff_shexp, lw->type_ffn_up_shexp);
+    silu(s->hb, c->n_ff_shexp);
+    elemwise_mul(s->hb, s->hb, s->hb2, c->n_ff_shexp);
+    matmul(s->xb, s->hb, lw->ffn_down_shexp, c->n_ff_shexp, dim, lw->type_ffn_down_shexp);
+
+    /* Shared expert sigmoid gate: sigmoid(x @ ffn_gate_inp_shexp) */
+    {
+        float gate_val;
+        matmul(&gate_val, (float *)x, lw->ffn_gate_inp_shexp, dim, 1, GGUF_TYPE_F32);
+        gate_val = 1.0f / (1.0f + expf(-gate_val));
+        for (int d = 0; d < dim; d++) s->xb[d] *= gate_val;
+    }
+
+    /* 7. Combine: moe_out + shared */
+    for (int d = 0; d < dim; d++) {
+        residual[d] = moe_out[d] + s->xb[d];
+    }
+}
+
 float *model_forward_gemma3n(model_t *m, int token, int pos);
 
 float *model_forward(model_t *m, int token, int pos) {
@@ -3262,8 +3504,13 @@ float *model_forward(model_t *m, int token, int pos) {
         tensor_set_repacked(NULL);
         vec_add(s->x, s->xb2, dim);
 
-        /* ---- FFN (SwiGLU) - only if MLP weights exist for this layer ---- */
-        if (lw->ffn_gate && lw->ffn_up && lw->ffn_down) {
+        /* ---- FFN (SwiGLU or MoE) - only if MLP weights exist for this layer ---- */
+        if (c->has_moe) {
+            /* MoE forward pass */
+            rmsnorm(s->xb, s->x, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
+            moe_forward(m, s, s->xb, s->xb, lw);
+            vec_add(s->x, s->xb, dim);
+        } else if (lw->ffn_gate && lw->ffn_up && lw->ffn_down) {
             rmsnorm(s->xb, s->x, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
 
 #ifdef PICOLM_GPU
@@ -5821,7 +6068,12 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     vec_add(x, residual, dim);
 
     /* 21. Post-attention norm + FFN (only if MLP weights exist for this layer) */
-    if (lw->ffn_gate && lw->ffn_up && lw->ffn_down) {
+    if (c->has_moe) {
+        /* MoE forward pass */
+        rmsnorm(s->xb, x, s->post_attn_norm_w[il], dim, eps);
+        moe_forward(m, s, s->xb, s->xb, lw);
+        vec_add(x, s->xb, dim);
+    } else if (lw->ffn_gate && lw->ffn_up && lw->ffn_down) {
         rmsnorm(s->xb, x, s->post_attn_norm_w[il], dim, eps);
 #ifdef PICOLM_GPU
         /* Fused FFN on GPU: y = down(silu(gate(x)) * up(x)) in one command
@@ -7084,7 +7336,15 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
     }
 
     /* 11. Batched FFN (if present) */
-    if (lw->ffn_gate && lw->ffn_up && lw->ffn_down) {
+    if (c->has_moe) {
+        /* MoE: per-token for now (batched MoE optimization deferred) */
+        for (bi = 0; bi < n_tokens; bi++) {
+            rmsnorm(ssm_xb + bi * dim, x_batch + bi * dim, s->post_attn_norm_w[l], dim, eps);
+            moe_forward(m, s, ssm_xb + bi * dim, s->xb, lw);
+            float *a = x_batch + bi * dim, *b = s->xb;
+            for (int d = 0; d < dim; d++) a[d] += b[d];
+        }
+    } else if (lw->ffn_gate && lw->ffn_up && lw->ffn_down) {
         for (bi = 0; bi < n_tokens; bi++)
             rmsnorm(ssm_xb + bi * dim, x_batch + bi * dim, s->post_attn_norm_w[l], dim, eps);
 
@@ -7142,7 +7402,10 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
     size_t bs = (size_t)n_tokens;
 
     int xb2_stride = dim;
-    size_t sz = bs * (dim + max_dim + dim + q_full_dim + 2 * kv_dim + 2 * n_ffn);
+    /* hb/hb2 buffers need to be large enough for FFN (n_ffn) OR gate storage (q_dim) on SSM+attn layers */
+    int ffn_buf_size = n_ffn;
+    if (q_dim > ffn_buf_size) ffn_buf_size = q_dim;
+    size_t sz = bs * (dim + max_dim + dim + q_full_dim + 2 * kv_dim + 2 * ffn_buf_size);
     float *buf = (float *)malloc(sz * sizeof(float));
     if (!buf) { fprintf(stderr, "OOM: prefill batch\n"); exit(1); }
     float *p = buf;
@@ -7152,8 +7415,8 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
     float *q_batch = p;  p += bs * q_full_dim;
     float *k_batch = p;  p += bs * kv_dim;
     float *v_batch = p;  p += bs * kv_dim;
-    float *hb_batch = p; p += bs * n_ffn;
-    float *hb2_batch = p;
+    float *hb_batch = p; p += bs * ffn_buf_size;
+    float *hb2_batch = p; p += bs * ffn_buf_size;
 
     /* Embedding lookup */
     {
@@ -7515,35 +7778,46 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
             for (int d2 = 0; d2 < dim; d2++) a[d2] += b[d2];
         }
 
-        /* FFN RMSNorm */
-        for (bi = 0; bi < n_tokens; bi++)
-            rmsnorm(xb_batch + bi * dim, x_batch + bi * dim, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
+        /* FFN (MoE or dense) */
+        if (c->has_moe) {
+            /* MoE: per-token for now */
+            for (bi = 0; bi < n_tokens; bi++) {
+                rmsnorm(xb_batch + bi * dim, x_batch + bi * dim, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
+                moe_forward(m, s, xb_batch + bi * dim, s->xb, lw);
+                float *a = x_batch + bi * dim, *b = s->xb;
+                for (int d2 = 0; d2 < dim; d2++) a[d2] += b[d2];
+            }
+        } else {
+            /* FFN RMSNorm */
+            for (bi = 0; bi < n_tokens; bi++)
+                rmsnorm(xb_batch + bi * dim, x_batch + bi * dim, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
 
-        /* FFN gate+up (batched dual) */
-        tensor_set_repacked(m->repack_used[7+l*9] ? m->repack_buffers[7+l*9] : NULL);
-        matmul_dual_batch(hb_batch, hb2_batch, xb_batch, n_tokens,
-                          lw->ffn_gate, lw->ffn_up, dim, n_ffn,
-                          lw->type_ffn_gate, lw->type_ffn_up);
-        tensor_set_repacked(NULL);
+            /* FFN gate+up (batched dual) */
+            tensor_set_repacked(m->repack_used[7+l*9] ? m->repack_buffers[7+l*9] : NULL);
+            matmul_dual_batch(hb_batch, hb2_batch, xb_batch, n_tokens,
+                              lw->ffn_gate, lw->ffn_up, dim, n_ffn,
+                              lw->type_ffn_gate, lw->type_ffn_up);
+            tensor_set_repacked(NULL);
 
-        /* SiLU + mul */
-        for (bi = 0; bi < n_tokens; bi++) {
-            silu(hb_batch + bi * n_ffn, n_ffn);
-            elemwise_mul(hb_batch + bi * n_ffn, hb_batch + bi * n_ffn, hb2_batch + bi * n_ffn, n_ffn);
-        }
+            /* SiLU + mul */
+            for (bi = 0; bi < n_tokens; bi++) {
+                silu(hb_batch + bi * n_ffn, n_ffn);
+                elemwise_mul(hb_batch + bi * n_ffn, hb_batch + bi * n_ffn, hb2_batch + bi * n_ffn, n_ffn);
+            }
 
-        /* FFN down (batched) */
-        tensor_set_repacked(m->repack_used[8+l*9] ? m->repack_buffers[8+l*9] : NULL);
+            /* FFN down (batched) */
+            tensor_set_repacked(m->repack_used[8+l*9] ? m->repack_buffers[8+l*9] : NULL);
 #ifdef PICOLM_GPU
-        if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)m->gpu.layers[l].ffn_down, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
+            if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)m->gpu.layers[l].ffn_down, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
 #endif
-        matmul_batch(xb2_batch, hb_batch, n_tokens, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
-        tensor_set_repacked(NULL);
+            matmul_batch(xb2_batch, hb_batch, n_tokens, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
+            tensor_set_repacked(NULL);
 
-        /* Residual: x += ffn_out */
-        for (bi = 0; bi < n_tokens; bi++) {
-            float *a = x_batch + bi * dim, *b = xb2_batch + bi * dim;
-            for (int d2 = 0; d2 < dim; d2++) a[d2] += b[d2];
+            /* Residual: x += ffn_out */
+            for (bi = 0; bi < n_tokens; bi++) {
+                float *a = x_batch + bi * dim, *b = xb2_batch + bi * dim;
+                for (int d2 = 0; d2 < dim; d2++) a[d2] += b[d2];
+            }
         }
         if (l == 0 || l == 1 || l == 2) {
             float xsum = 0, xmax = 0;

@@ -64,6 +64,12 @@ typedef struct {
      * N candidate tokens, verify with fast forward pass (speculative decoding). */
     int has_mtp;              /* 1 if model has MTP layers */
     int n_mtp_layers;         /* number of MTP layers at the end of layer list */
+    /* MoE parameters (Qwen3.6-35B-A3B = qwen35moe architecture) */
+    int has_moe;              /* 1 if model is MoE */
+    int n_expert;             /* total number of experts (256) */
+    int n_expert_used;        /* top-K experts per token (8) */
+    int n_ff_exp;             /* per-expert FFN hidden dim (512) */
+    int n_ff_shexp;           /* shared expert FFN hidden dim (512) */
     /* Gemma-3n specific */
     int n_altup;              /* number of altup copies (default 4) */
     int i_altup_act;          /* active altup index (default 0) */
@@ -112,6 +118,23 @@ typedef struct {
     const void *ffn_gate;
     const void *ffn_down;
     const void *ffn_up;
+    /* MoE tensors (3D expert weights) */
+    const void *ffn_gate_exps;      /* [n_embd, n_ff_exp, n_expert] */
+    const void *ffn_up_exps;        /* [n_embd, n_ff_exp, n_expert] */
+    const void *ffn_down_exps;      /* [n_ff_exp, n_embd, n_expert] */
+    const void *ffn_gate_inp;       /* [n_embd, n_expert] router */
+    gguf_type_t type_ffn_gate_exps;
+    gguf_type_t type_ffn_up_exps;
+    gguf_type_t type_ffn_down_exps;
+    gguf_type_t type_ffn_gate_inp;
+    /* Shared expert tensors */
+    const void *ffn_gate_inp_shexp; /* [n_embd, 1] */
+    const void *ffn_gate_shexp;     /* [n_embd, n_ff_shexp] */
+    const void *ffn_up_shexp;       /* [n_embd, n_ff_shexp] */
+    const void *ffn_down_shexp;     /* [n_ff_shexp, n_embd] */
+    gguf_type_t type_ffn_gate_shexp;
+    gguf_type_t type_ffn_up_shexp;
+    gguf_type_t type_ffn_down_shexp;
     /* SSM layer weights (Qwen3.5) */
     const void *attn_qkv;       /* SSM: [n_embd, conv_dim] */
     const void *attn_gate_ssm;  /* SSM: [n_embd, value_dim] */
@@ -270,6 +293,13 @@ typedef struct {
     float *altup_predict_coef_w[MAX_LAYERS];  /* [n_altup * n_altup * n_altup] */
     float *laurel_l_w[MAX_LAYERS];
     float *laurel_r_w[MAX_LAYERS];
+    /* MoE runtime state */
+    float *expert_logits;     /* router logits [n_expert] */
+    int *expert_ids;          /* selected expert indices [n_expert_used] */
+    float *expert_weights;    /* routing weights [n_expert_used] */
+    float *moe_out;           /* MoE output accumulator [n_embd] */
+    float *hb_exp;            /* per-expert hidden buffer [n_ff_exp] */
+    float *hb2_exp;           /* second per-expert hidden buffer [n_ff_exp] */
 
     /* Single allocation base */
     void *mem_block;
