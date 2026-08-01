@@ -200,6 +200,7 @@ __host__ __device__ PICOLM_UNUSED static inline unsigned short gpu_fp32_to_fp16(
 
 /* Block sizes in bytes (from quant.h structs) */
 #define GPU_BLOCK_Q4_0_SIZE  18  /* uint16_t d + uint8_t qs[16] */
+#define GPU_BLOCK_Q2_K_SIZE  84  /* block_q2_K: scales[16]+qs[64]+d+dm */
 #define GPU_BLOCK_Q4_K_SIZE  144 /* block_q4_K from quant.h */
 #define GPU_BLOCK_Q5_K_SIZE  176 /* block_q5_K: d+dm+scales[12]+qh[32]+qs[128] */
 #define GPU_BLOCK_Q6_K_SIZE  210 /* block_q6_K: ql[128]+qh[64]+scales[16]+d[2] */
@@ -286,6 +287,50 @@ __device__ static inline void gpu_get_scale_min_k4(int j, const uint8_t *scales,
         *sc = (scales[j + 4] & 0xF) | ((scales[j - 4] >> 6) << 4);
         *mn = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
     }
+}
+
+/* Q2_K dequant: 256 values in 84 bytes.
+ * Layout: scales[16] (4-bit sc+mn each), qs[64] (2-bit quants), d (fp16), dmin (fp16).
+ * Structure: 2 chunks of 128 values each.
+ * Each chunk: 4 groups of 16 values. Each group uses a bit-shift (0,2,4,6) over 32 qs bytes.
+ *   Group 0: (qs[0..15] >> 0) & 3, scale[0]
+ *   Group 1: (qs[16..31] >> 0) & 3, scale[1]
+ *   Group 2: (qs[0..15] >> 2) & 3, scale[2]
+ *   Group 3: (qs[16..31] >> 2) & 3, scale[3]
+ *   Group 4: (qs[0..15] >> 4) & 3, scale[4]
+ *   Group 5: (qs[16..31] >> 4) & 3, scale[5]
+ *   Group 6: (qs[0..15] >> 6) & 3, scale[6]
+ *   Group 7: (qs[16..31] >> 6) & 3, scale[7]
+ * Then same pattern for second chunk (qs[32..63], scales[8..15]).
+ * Each scale byte: low nibble = scale, high nibble = min.
+ * Result = d * sc * q - dmin * mn. */
+__device__ static inline float dequant_q2_K(const void *blk, int i) {
+    const uint8_t *b = (const uint8_t *)blk;
+    const uint8_t *scales = b;
+    const uint8_t *qs = b + 16;
+    uint16_t d_raw = b[80] | ((uint16_t)b[81] << 8);
+    uint16_t dm_raw = b[82] | ((uint16_t)b[83] << 8);
+    float d = gpu_fp16_to_fp32(d_raw);
+    float dmin = gpu_fp16_to_fp32(dm_raw);
+
+    /* i in 0..255 */
+    int chunk = i / 128;              /* 0 or 1 */
+    int i_in_chunk = i % 128;         /* 0..127 */
+    int group = i_in_chunk / 16;      /* 0..7 */
+    int l = i_in_chunk % 16;          /* 0..15 */
+
+    int shift = (group % 4) * 2;      /* 0, 2, 4, 6 */
+    int half = group / 4;             /* 0 or 1 (first or second half of qs bytes) */
+    int scale_idx = chunk * 8 + group; /* 0..15 */
+
+    uint8_t sc_byte = scales[scale_idx];
+    uint8_t sc = sc_byte & 0xF;
+    uint8_t mn = sc_byte >> 4;
+
+    int qs_base = chunk * 32 + half * 16;
+    int v = (qs[qs_base + l] >> shift) & 3;
+
+    return d * (float)sc * (float)v - dmin * (float)mn;
 }
 
 __device__ static inline float dequant_q4_K(const void *blk, int i) {
@@ -422,6 +467,8 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
         case 30:             bytes_per_block = 2; break;      /* BF16 */
         case GGUF_TYPE_Q4_0: bytes_per_block = GPU_BLOCK_Q4_0_SIZE; break;  /* 18 */
         case GGUF_TYPE_Q8_0: bytes_per_block = GPU_BLOCK_Q8_0_SIZE; break;  /* 34 */
+        case 10:             bytes_per_block = GPU_BLOCK_Q2_K_SIZE; break;  /* Q2_K: 84 */
+        case 11:             bytes_per_block = 110; break;                   /* Q3_K: 110 */
         case GGUF_TYPE_Q4_K: bytes_per_block = GPU_BLOCK_Q4_K_SIZE; break;  /* 144 */
         case 13:             bytes_per_block = GPU_BLOCK_Q5_K_SIZE; break;  /* Q5_K: 176 */
         case 14:             bytes_per_block = GPU_BLOCK_Q6_K_SIZE; break;  /* Q6_K: 210 */
@@ -473,6 +520,20 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
                 for (int j = 0; j < 32; j++) {
                     int i = bi * 32 + j;
                     sum += x[(size_t)s * I + i] * dequant_q8_0(blk, j);
+                }
+            }
+        }
+        break;
+
+    case 10: /* GGUF_TYPE_Q2_K */
+        /* 256 values per block (84 bytes). Per-element dequant via helper. */
+        {
+            int n_blocks = I / 256;
+            for (int bi = gpuThreadIdx_x; bi < n_blocks; bi += gpuBlockDim_x) {
+                const void *blk = wrow + (size_t)bi * bytes_per_block;
+                for (int j = 0; j < 256; j++) {
+                    int i = bi * 256 + j;
+                    sum += x[(size_t)s * I + i] * dequant_q2_K(blk, j);
                 }
             }
         }
@@ -1962,6 +2023,8 @@ static int gguf_block_size(gguf_type_t qtype) {
     case 30: return 0;    /* BF16: no blocks */
     case 2:  return 18;   /* Q4_0: 18 bytes per 32 values */
     case 8:  return GPU_BLOCK_Q8_0_SIZE; /* Q8_0: 34 bytes per 32 values */
+    case 10: return 84;    /* Q2_K: 84 bytes per 256 values */
+    case 11: return 110;   /* Q3_K: 110 bytes per 256 values */
     case 12: return GPU_BLOCK_Q4_K_SIZE;  /* Q4_K: 144 bytes per 256 values */
     case 13: return GPU_BLOCK_Q5_K_SIZE;  /* Q5_K: 176 bytes per 256 values */
     case 14: return GPU_BLOCK_Q6_K_SIZE;  /* Q6_K: 210 bytes per 256 values */
@@ -1991,7 +2054,7 @@ int picolm_gpu_tensor_upload(void **tensor,
     } else if (qtype == 1 || qtype == 30) {
         row_bytes = (size_t)I * sizeof(uint16_t);
         vals_per_block = 1;
-    } else if (qtype == 12) {
+    } else if (qtype == 10 || qtype == 11 || qtype == 12 || qtype == 13 || qtype == 14) {
         vals_per_block = 256;
         row_bytes = (size_t)((I + vals_per_block - 1) / vals_per_block) * bs;
     } else if (qtype == 41 || qtype == 42) {
@@ -2008,23 +2071,32 @@ int picolm_gpu_tensor_upload(void **tensor,
     t->qtype = qtype; t->I = I; t->O = O; t->device = device;
     t->row_bytes = row_bytes; t->block_size = bs;
 
-    /* Q4_K/Q5_K/Q6_K fast path: convert to Q8_0 at upload time for the int8-MAC kernel.
+    /* Q2_K/Q3_K/Q4_K/Q5_K/Q6_K fast path: convert to Q8_0 at upload time for the int8-MAC kernel.
      * These have per-sub-block scales that the Q8_0 kernel can't handle,
      * but requantizing to Q8_0 (1 scale per 32 elements) is accurate enough
      * and enables the highly-optimized picolm_q8_q8_matmul path. */
-    if (qtype == 12 || qtype == 13 || qtype == 14) {
-        /* Dequant Q4_K/Q5_K/Q6_K to F32, then requant to Q8_0 */
+    if (qtype == 10 || qtype == 11 || qtype == 12 || qtype == 13 || qtype == 14) {
+        /* Dequant Q2_K/Q3_K/Q4_K/Q5_K/Q6_K to F32, then requant to Q8_0 */
         size_t f32_bytes = (size_t)I * (size_t)O * sizeof(float);
         float *f32_buf = (float *)calloc(I * O, sizeof(float));
         if (!f32_buf) { gpuFree(t->weights); free(t); return 0; }
 
         /* Dequant each row */
         int nb = I / 256;
-        int blk_bytes = (qtype == 12) ? 144 : ((qtype == 13) ? 176 : 210);
+        int blk_bytes;
+        if (qtype == 10) blk_bytes = 84;
+        else if (qtype == 11) blk_bytes = 110;
+        else if (qtype == 12) blk_bytes = 144;
+        else if (qtype == 13) blk_bytes = 176;
+        else blk_bytes = 210; /* qtype == 14 */
         for (int row = 0; row < O; row++) {
             float *dst = f32_buf + row * I;
             const uint8_t *row_start = (const uint8_t *)weights + row * nb * blk_bytes;
-            if (qtype == 12)
+            if (qtype == 10)
+                dequantize_row_q2_K(row_start, dst, I);
+            else if (qtype == 11)
+                dequantize_row_q3_K(row_start, dst, I);
+            else if (qtype == 12)
                 dequantize_row_q4_K(row_start, dst, I);
             else if (qtype == 13)
                 dequantize_row_q5_K(row_start, dst, I);
@@ -2063,7 +2135,7 @@ int picolm_gpu_tensor_upload(void **tensor,
         {
             static int first_print = 1;
             if (first_print) {
-                fprintf(stderr, "[GPU] upload mode: q4/q5/q6->q8 (int8-MAC fast path)\n");
+                fprintf(stderr, "[GPU] upload mode: q2/q3/q4/q5/q6->q8 (int8-MAC fast path)\n");
                 first_print = 0;
             }
         }
