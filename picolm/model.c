@@ -1647,7 +1647,6 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                     /* SSM F32 weights: conv1d [d_conv x conv_dim], ssm_a [dt_rank], ssm_dt [dt_rank],
                      * ssm_norm [head_v_dim], ssm_alpha [dim x dt_rank], ssm_beta [dim x dt_rank] */
                     {
-                        int head_v_dim = c->ssm_d_inner / c->ssm_dt_rank;
                         attempted++;
                         if (picolm_gpu_tensor_upload(&gl->ssm_conv1d,
                                 lw->ssm_conv1d, lw->type_ssm_conv1d, c->ssm_d_conv, conv_dim, device)) uploaded++;
@@ -1675,17 +1674,26 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                  * QK-norm layers in attention-only layers are handled by GPU RMSNorm (no veto). */
                 {
                     int eligible = 1;
-                    if (c->rope_type != 0) eligible = 0;
+                    /* rope_type 0 (Llama pairwise) and 1 (Qwen2 interleaved)
+                     * are both supported now (b67b1df) -- this used to be
+                     * a hard veto on anything but 0, stale since that fix. */
+                    if (c->rope_type != 0 && c->rope_type != 1) eligible = 0;
                     /* F16 KV cache only */
                     if (kv_type_k != KV_CACHE_F16 || kv_type_v != KV_CACHE_F16) eligible = 0;
-                    /* SSM models: check DeltaNet shape sanity */
+                    /* SSM models: shape validation passes but the hybrid
+                     * layer branch isn't wired yet (model_forward_gpu and
+                     * model_forward_prefill_gpu both bail out on SSM layers,
+                     * which corrupts KV cache state). Veto until the branch
+                     * is implemented. The shape checks below are kept as
+                     * documentation of what the branch will need. */
                     if (c->has_ssm) {
-                        /* SSM models: the full GPU pipeline (model_forward_gpu) doesn't
-                         * handle hybrid SSM+attention layers yet. So kv_active stays 0
-                         * and we fall back to the per-matmul H2D/D2H path.
-                         * However, ssm_forward() already dispatches GPU kernels for
-                         * vecdot, recurrence, and gated_norm - those still work via
-                         * the old path. */
+                        if (c->ssm_d_state <= 0 || c->ssm_d_state > 256) eligible = 0;
+                        if (c->ssm_dt_rank <= 0) eligible = 0;        /* n_v_heads */
+                        if (c->ssm_n_group <= 0) eligible = 0;        /* n_k_heads */
+                        if (c->ssm_d_inner <= 0) eligible = 0;        /* value_dim */
+                        if (c->ssm_d_conv <= 1) eligible = 0;         /* need >=2 taps */
+                        if (eligible && c->ssm_d_inner % c->ssm_dt_rank != 0) eligible = 0;
+                        /* Veto SSM models until hybrid layer branch is wired */
                         eligible = 0;
                     }
 
@@ -1754,6 +1762,14 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                          * The larger SSM weights (conv1d, alpha, beta) were already uploaded above
                          * as GPU tensor handles during the per-layer upload loop. */
                         if (c->has_ssm) {
+                            /* SSM pipeline buffers (needed for the future hybrid layer branch) */
+                            {
+                                int conv_dim = 2 * c->ssm_d_state * c->ssm_n_group + c->ssm_d_inner;
+                                if (!picolm_gpu_ssm_pipeline_alloc(conv_dim, c->ssm_d_inner,
+                                                                    c->ssm_dt_rank, device)) {
+                                    fprintf(stderr, "WARN: GPU SSM pipeline buffer alloc failed\n");
+                                }
+                            }
                             run_state_t *s = &m->state;
                             int head_v_dim = c->ssm_d_inner / c->ssm_dt_rank;
                             for (int l = 0; l < c->n_layers; l++) {

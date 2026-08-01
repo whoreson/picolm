@@ -130,6 +130,21 @@ int picolm_gpu_ssm_gate_beta_dev(float *gate_exp_out_dev, float *beta_out_dev,
                                   const float *alpha_in_dev, const float *beta_raw_in_dev,
                                   const float *ssm_a_w_dev, int n_v_heads, int device);
 
+/* SSM L2 normalization (Q/K per k_head), device-native, in-place.
+ * eps must match the CPU reference (1e-12). extra_scale: pass
+ * 1/sqrtf(d_state) for Q, 1.0f for K -- fuses the CPU reference's
+ * separate Q-scale pass into the norm itself. Returns 1 on success. */
+int picolm_gpu_ssm_l2norm_dev(float *x_dev, int head_dim, int n_heads,
+                               float eps, float extra_scale, int device);
+
+/* Generic per-head gather for the GGUF v-head remap: dst[h] =
+ * src[head_map[h]]. Used for both the xb2 (z-gate) remap and the
+ * v_conv remap (same head_map, head_dim=head_v_dim, n_heads=n_v_heads
+ * in both cases). dst and src must not alias. Returns 1 on success. */
+int picolm_gpu_ssm_head_permute_dev(float *dst_dev, const float *src_dev,
+                                     const int *head_map_dev,
+                                     int head_dim, int n_heads, int device);
+
 int picolm_gpu_ssm_recurrence(float *state,
                                const float *q_conv,
                                const float *k_conv,
@@ -321,6 +336,12 @@ int picolm_gpu_pipeline_alloc(int dim, int q_dim, int kv_dim, int ffn_hidden, in
 int picolm_gpu_pipeline_batch_alloc(int dim, int q_dim, int kv_dim, int ffn_hidden,
                                      int max_seq_len, int device);
 
+/* Allocate SSM-specific pipeline buffers for hybrid SSM+attention layers.
+ * Called after picolm_gpu_pipeline_alloc succeeds for SSM-eligible models.
+ * conv_dim = 2*d_state*n_group + d_inner, ssm_d_inner = value_dim,
+ * n_v_heads = dt_rank. Returns 1 on success. */
+int picolm_gpu_ssm_pipeline_alloc(int conv_dim, int ssm_d_inner, int n_v_heads, int device);
+
 /* Free all pipeline buffers on all devices. */
 void picolm_gpu_pipeline_free(void);
 
@@ -348,6 +369,19 @@ float *picolm_gpu_pipe_attn_out_b(int device);
 float *picolm_gpu_pipe_ffn_norm_b(int device);
 float *picolm_gpu_pipe_gate_b(int device);
 float *picolm_gpu_pipe_up_b(int device);
+
+/* SSM pipeline buffer accessors. Returns NULL if not yet allocated. */
+float *picolm_gpu_ssm_qkv_raw(int device);
+float *picolm_gpu_ssm_conv_out(int device);
+float *picolm_gpu_ssm_xb2(int device);
+float *picolm_gpu_ssm_xb2_remap(int device);
+float *picolm_gpu_ssm_v_remap(int device);
+float *picolm_gpu_ssm_alpha_raw(int device);
+float *picolm_gpu_ssm_beta_raw(int device);
+float *picolm_gpu_ssm_gate_exp(int device);
+float *picolm_gpu_ssm_beta(int device);
+float *picolm_gpu_ssm_output(int device);
+float *picolm_gpu_ssm_final_output(int device);
 
 /* Device-native rmsnorm: x/out/weight are device pointers, no H2D/D2H, no sync. */
 int picolm_gpu_rmsnorm_dev(float *out, const float *x, const float *weight,

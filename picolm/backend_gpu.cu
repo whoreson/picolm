@@ -1599,6 +1599,22 @@ typedef struct {
     float *pipe_x_b, *pipe_xb_b, *pipe_q_b, *pipe_k_b, *pipe_v_b,
           *pipe_attn_out_b, *pipe_ffn_norm_b, *pipe_gate_b, *pipe_up_b;
     int pipe_b_ready;
+    /* SSM pipeline buffers (decode, S=1). Allocated once per model if
+     * model has SSM layers. Sized from model's SSM config (conv_dim,
+     * ssm_d_inner, dt_rank). These are the working buffers used by the
+     * hybrid SSM+attention branch in model_forward_gpu(). */
+    float *ssm_qkv_raw;      /* [conv_dim] attn_qkv output, conv1d input */
+    float *ssm_conv_out;     /* [conv_dim] conv1d output, split into q/k/v */
+    float *ssm_xb2;          /* [ssm_d_inner] attn_gate_ssm output (z-gate) */
+    float *ssm_xb2_remap;    /* [ssm_d_inner] remapped xb2 (if do_remap) */
+    float *ssm_v_remap;      /* [ssm_d_inner] remapped v_conv (if do_remap) */
+    float *ssm_alpha_raw;    /* [n_v_heads] alpha vecdot output */
+    float *ssm_beta_raw;     /* [n_v_heads] beta vecdot output */
+    float *ssm_gate_exp;     /* [n_v_heads] gate exp output */
+    float *ssm_beta;         /* [n_v_heads] beta sigmoid output */
+    float *ssm_output;       /* [ssm_d_inner] recurrence output */
+    float *ssm_final_output; /* [ssm_d_inner] gated_norm output */
+    int ssm_ready;           /* 1 once SSM buffers are allocated */
 } gpu_device_ctx_t;
 
 static gpu_device_ctx_t g_gpu_ctx[PICOLM_GPU_MAX_DEVICES];
@@ -2464,6 +2480,91 @@ picolm_gpu_ssm_gate_beta_dev(float *gate_exp_out_dev, float *beta_out_dev,
     return 1;
 }
 
+/* ---- SSM L2 normalization (Q/K, per k_head) ----
+ * Direct port of the CPU reference (ssm_forward, step 7-8): per-head L2
+ * norm (NOT RMS -- no division by head_dim, no learned weight), with an
+ * optional fused extra_scale applied after normalizing. The CPU
+ * reference does Q's 1/sqrt(d_state) scale as a separate pass (decode
+ * path) or fused into the norm (prefill path) -- this kernel always
+ * fuses it (extra_scale=q_scale for Q, extra_scale=1.0 for K), matching
+ * the prefill reference exactly and reducing to the same result as the
+ * decode reference's two-pass version (multiplication is associative
+ * here, single scalar factor either way).
+ * In-place: x is normalized in place. Grid = n_heads. */
+__global__ void
+picolm_gpu_ssm_l2norm_kernel(float *x, int head_dim, int n_heads,
+                              float eps, float extra_scale) {
+    int h = (int)gpuBlockIdx_x;
+    if (h >= n_heads) return;
+    float *xh = x + (size_t)h * head_dim;
+    int tid = gpuThreadIdx_x, nt = gpuBlockDim_x;
+
+    __shared__ float ssum[256];
+    float local = 0.0f;
+    for (int d = tid; d < head_dim; d += nt) local += xh[d] * xh[d];
+    ssum[tid] = local;
+    gpuSyncthreads();
+    for (int s = nt / 2; s > 0; s >>= 1) {
+        if (tid < s) ssum[tid] += ssum[tid + s];
+        gpuSyncthreads();
+    }
+    float nrm = (1.0f / sqrtf(ssum[0] + eps)) * extra_scale;
+    for (int d = tid; d < head_dim; d += nt) xh[d] *= nrm;
+}
+
+/* Device-native, in-place. eps must match the CPU reference (1e-12).
+ * extra_scale: pass 1/sqrtf(d_state) for Q, 1.0f for K. */
+extern "C" int
+picolm_gpu_ssm_l2norm_dev(float *x_dev, int head_dim, int n_heads,
+                           float eps, float extra_scale, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    if (head_dim < 1 || n_heads < 1 || head_dim > 256) return 0;
+
+    int n_threads = min(head_dim, 256);
+    dim3 grid((unsigned)n_heads, 1, 1);
+    picolm_gpu_ssm_l2norm_kernel<<<grid, n_threads, 0, ctx->stream>>>(
+        x_dev, head_dim, n_heads, eps, extra_scale);
+    if (!gpu_ok(gpuGetLastError(), "ssm l2norm (dev)")) return 0;
+    return 1;
+}
+
+/* ---- SSM head permute (GGUF v-head remap) ----
+ * Generic per-head gather: dst[h] = src[head_map[h]], head_dim elements
+ * each. Used for BOTH the xb2 (z-gate) remap and the v_conv remap --
+ * same head_map (qwen35_vhead_gguf), same head_dim (head_v_dim), same
+ * n_heads (n_v_heads) in both cases. dst and src must NOT alias (the
+ * CPU reference uses a temp buffer for exactly this reason -- a
+ * permutation isn't safe to do purely in place). */
+__global__ void
+picolm_gpu_ssm_head_permute_kernel(float *dst, const float *src,
+                                    const int *head_map,
+                                    int head_dim, int n_heads) {
+    int h = (int)gpuBlockIdx_x;
+    if (h >= n_heads) return;
+    int gh = head_map[h];
+    int tid = gpuThreadIdx_x, nt = gpuBlockDim_x;
+    const float *srch = src + (size_t)gh * head_dim;
+    float *dsth = dst + (size_t)h * head_dim;
+    for (int d = tid; d < head_dim; d += nt) dsth[d] = srch[d];
+}
+
+extern "C" int
+picolm_gpu_ssm_head_permute_dev(float *dst_dev, const float *src_dev,
+                                 const int *head_map_dev,
+                                 int head_dim, int n_heads, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    if (head_dim < 1 || n_heads < 1) return 0;
+
+    int n_threads = min(head_dim, 256);
+    dim3 grid((unsigned)n_heads, 1, 1);
+    picolm_gpu_ssm_head_permute_kernel<<<grid, n_threads, 0, ctx->stream>>>(
+        dst_dev, src_dev, head_map_dev, head_dim, n_heads);
+    if (!gpu_ok(gpuGetLastError(), "ssm head permute (dev)")) return 0;
+    return 1;
+}
+
 /* ---- SSM gated normalization ----
  * Direct port of the CPU reference ("18. Gated normalization" in
  * ssm_forward): per-head RMSNorm of the SSM output, scaled by a
@@ -2783,6 +2884,36 @@ picolm_gpu_pipeline_alloc(int dim, int q_dim, int kv_dim, int ffn_hidden, int de
     return 1;
 }
 
+/* Allocate SSM pipeline buffers for hybrid SSM+attention layers.
+ * Called from model_load after SSM eligibility passes. */
+extern "C" int
+picolm_gpu_ssm_pipeline_alloc(int conv_dim, int ssm_d_inner, int n_v_heads, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    if (ctx->ssm_ready) return 1;
+
+    size_t conv_b = (size_t)conv_dim * sizeof(float);
+    size_t inner_b = (size_t)ssm_d_inner * sizeof(float);
+    size_t heads_b = (size_t)n_v_heads * sizeof(float);
+
+    int ok = 1;
+    ok &= gpu_ok(gpuMalloc(&ctx->ssm_qkv_raw, conv_b), "ssm_qkv_raw alloc");
+    ok &= gpu_ok(gpuMalloc(&ctx->ssm_conv_out, conv_b), "ssm_conv_out alloc");
+    ok &= gpu_ok(gpuMalloc(&ctx->ssm_xb2, inner_b), "ssm_xb2 alloc");
+    ok &= gpu_ok(gpuMalloc(&ctx->ssm_xb2_remap, inner_b), "ssm_xb2_remap alloc");
+    ok &= gpu_ok(gpuMalloc(&ctx->ssm_v_remap, inner_b), "ssm_v_remap alloc");
+    ok &= gpu_ok(gpuMalloc(&ctx->ssm_alpha_raw, heads_b), "ssm_alpha_raw alloc");
+    ok &= gpu_ok(gpuMalloc(&ctx->ssm_beta_raw, heads_b), "ssm_beta_raw alloc");
+    ok &= gpu_ok(gpuMalloc(&ctx->ssm_gate_exp, heads_b), "ssm_gate_exp alloc");
+    ok &= gpu_ok(gpuMalloc(&ctx->ssm_beta, heads_b), "ssm_beta alloc");
+    ok &= gpu_ok(gpuMalloc(&ctx->ssm_output, inner_b), "ssm_output alloc");
+    ok &= gpu_ok(gpuMalloc(&ctx->ssm_final_output, inner_b), "ssm_final_output alloc");
+    if (!ok) return 0;
+
+    ctx->ssm_ready = 1;
+    return 1;
+}
+
 /* Allocate prefill batch buffers: [max_seq_len][dim] for S>1 pipeline */
 extern "C" int
 picolm_gpu_pipeline_batch_alloc(int dim, int q_dim, int kv_dim, int ffn_hidden,
@@ -2847,6 +2978,26 @@ picolm_gpu_pipeline_free(void) {
             ctx->pipe_attn_out_b = ctx->pipe_ffn_norm_b = ctx->pipe_gate_b = ctx->pipe_up_b = NULL;
         ctx->pipe_b_ready = 0;
     }
+    /* SSM pipeline buffers */
+    for (int i = 0; i < PICOLM_GPU_MAX_DEVICES; i++) {
+        gpu_device_ctx_t *ctx = &g_gpu_ctx[i];
+        if (!ctx->ssm_ready) continue;
+        if (ctx->ssm_qkv_raw) gpuFree(ctx->ssm_qkv_raw);
+        if (ctx->ssm_conv_out) gpuFree(ctx->ssm_conv_out);
+        if (ctx->ssm_xb2) gpuFree(ctx->ssm_xb2);
+        if (ctx->ssm_xb2_remap) gpuFree(ctx->ssm_xb2_remap);
+        if (ctx->ssm_v_remap) gpuFree(ctx->ssm_v_remap);
+        if (ctx->ssm_alpha_raw) gpuFree(ctx->ssm_alpha_raw);
+        if (ctx->ssm_beta_raw) gpuFree(ctx->ssm_beta_raw);
+        if (ctx->ssm_gate_exp) gpuFree(ctx->ssm_gate_exp);
+        if (ctx->ssm_beta) gpuFree(ctx->ssm_beta);
+        if (ctx->ssm_output) gpuFree(ctx->ssm_output);
+        if (ctx->ssm_final_output) gpuFree(ctx->ssm_final_output);
+        ctx->ssm_qkv_raw = ctx->ssm_conv_out = ctx->ssm_xb2 = ctx->ssm_xb2_remap =
+            ctx->ssm_v_remap = ctx->ssm_alpha_raw = ctx->ssm_beta_raw = ctx->ssm_gate_exp =
+            ctx->ssm_beta = ctx->ssm_output = ctx->ssm_final_output = NULL;
+        ctx->ssm_ready = 0;
+    }
 }
 
 /* Device pointer accessors, so model.c doesn't need gpu_device_ctx_t's
@@ -2870,6 +3021,19 @@ extern "C" float *picolm_gpu_pipe_attn_out_b(int device)   { gpu_device_ctx_t *c
 extern "C" float *picolm_gpu_pipe_ffn_norm_b(int device)   { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_ffn_norm_b : NULL; }
 extern "C" float *picolm_gpu_pipe_gate_b(int device)       { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_gate_b : NULL; }
 extern "C" float *picolm_gpu_pipe_up_b(int device)         { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_up_b : NULL; }
+
+/* SSM pipeline buffer accessors */
+extern "C" float *picolm_gpu_ssm_qkv_raw(int device)       { gpu_device_ctx_t *c = find_ctx(device); return c ? c->ssm_qkv_raw : NULL; }
+extern "C" float *picolm_gpu_ssm_conv_out(int device)      { gpu_device_ctx_t *c = find_ctx(device); return c ? c->ssm_conv_out : NULL; }
+extern "C" float *picolm_gpu_ssm_xb2(int device)           { gpu_device_ctx_t *c = find_ctx(device); return c ? c->ssm_xb2 : NULL; }
+extern "C" float *picolm_gpu_ssm_xb2_remap(int device)     { gpu_device_ctx_t *c = find_ctx(device); return c ? c->ssm_xb2_remap : NULL; }
+extern "C" float *picolm_gpu_ssm_v_remap(int device)       { gpu_device_ctx_t *c = find_ctx(device); return c ? c->ssm_v_remap : NULL; }
+extern "C" float *picolm_gpu_ssm_alpha_raw(int device)     { gpu_device_ctx_t *c = find_ctx(device); return c ? c->ssm_alpha_raw : NULL; }
+extern "C" float *picolm_gpu_ssm_beta_raw(int device)      { gpu_device_ctx_t *c = find_ctx(device); return c ? c->ssm_beta_raw : NULL; }
+extern "C" float *picolm_gpu_ssm_gate_exp(int device)      { gpu_device_ctx_t *c = find_ctx(device); return c ? c->ssm_gate_exp : NULL; }
+extern "C" float *picolm_gpu_ssm_beta(int device)          { gpu_device_ctx_t *c = find_ctx(device); return c ? c->ssm_beta : NULL; }
+extern "C" float *picolm_gpu_ssm_output(int device)        { gpu_device_ctx_t *c = find_ctx(device); return c ? c->ssm_output : NULL; }
+extern "C" float *picolm_gpu_ssm_final_output(int device)  { gpu_device_ctx_t *c = find_ctx(device); return c ? c->ssm_final_output : NULL; }
 
 /* Bit-exact device port of the host fp32_to_fp16() in quant.c -- NOT
  * CUDA's __float2half (different rounding/tie behavior in edge cases),
