@@ -1,5 +1,19 @@
 CC      ?= gcc
-CFLAGS  ?= -O3 -g -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic -Wshadow -Wdouble-promotion -Wimplicit-fallthrough -Wconversion -Wmisleading-indentation -Wduplicated-cond -Wduplicated-branches -Wfloat-conversion -Wsign-conversion -Wcast-qual -Wformat-nonliteral -Wformat-truncation -fno-common -fopenmp
+
+# ---- Compiler detection ----
+# -Wduplicated-cond, -Wduplicated-branches and -Wformat-truncation are
+# GCC-only. Clang (incl. Apple Clang, and the `gcc` shim on macOS which is
+# really clang) doesn't recognize them and emits a -Wunknown-warning-option
+# note per file per flag -- 39 spurious lines across the 13 C TUs. Gate them so
+# the warning stream stays trustworthy under both compilers.
+_is_clang = $(shell echo | $(CC) -E -dM - 2>/dev/null | grep -c '__clang__')
+ifeq ($(call _is_clang),1)
+WARN_GCC_ONLY =
+else
+WARN_GCC_ONLY = -Wduplicated-cond -Wduplicated-branches -Wformat-truncation
+endif
+
+CFLAGS  ?= -O3 -g -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic -Wshadow -Wdouble-promotion -Wimplicit-fallthrough -Wconversion -Wmisleading-indentation $(WARN_GCC_ONLY) -Wfloat-conversion -Wsign-conversion -Wcast-qual -Wformat-nonliteral -fno-common -fopenmp
 LDFLAGS = -lm -lpthread -fopenmp
 
 # Windows needs ws2_32 for server mode
@@ -291,7 +305,11 @@ backend_gpu.o.cuda: backend_gpu.cu backend_gpu.h quant.h
 #     make metal
 # Then run with: PICOLM_GPU=1 ./picolm model.gguf ...
 METAL_CXX      ?= clang++
-METAL_CXXFLAGS ?= -std=c++20 -O3 -fobjc-arc -fPIC
+# Strict warning set mirroring the C CFLAGS (clang-compatible subset; the
+# GCC-only flags are intentionally absent since METAL_CXX is clang++).
+# backend_metal.mm is the one TU the metal build is supposed to validate --
+# previously it compiled with no warning flags at all.
+METAL_CXXFLAGS ?= -std=c++20 -O3 -fobjc-arc -fPIC -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Wsign-conversion -Wdouble-promotion -Wfloat-conversion -Wcast-qual -Wmisleading-indentation -Wimplicit-fallthrough -Wformat-nonliteral
 METAL_FRAMEWORKS = -framework Metal -framework Foundation
 METAL_LIBS       = $(METAL_FRAMEWORKS)
 # (the link rule appends -lstdc++ for the ObjC++ runtime)
