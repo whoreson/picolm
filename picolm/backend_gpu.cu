@@ -2388,6 +2388,82 @@ picolm_gpu_ssm_recurrence_dev(void *ssm_state_dev,  /* in/out, device [n_v_heads
     return 1;
 }
 
+/* Fully device-native: ALL of q_conv/k_conv/v_conv/gate_exp/beta/
+ * ssm_output are already device-resident pipeline buffers -- no malloc,
+ * no H2D/D2H, no sync at all, unlike picolm_gpu_ssm_recurrence_dev above
+ * (which still round-trips q/k/v/gate/beta/output through host memory
+ * every call, only state is persistent there). This is the one to use
+ * from model_forward_gpu's SSM layer branch. */
+extern "C" int
+picolm_gpu_ssm_recurrence_pipeline_dev(void *ssm_state_dev,
+                                        const float *q_conv_dev,
+                                        const float *k_conv_dev,
+                                        const float *v_conv_dev,
+                                        const float *gate_exp_dev,
+                                        const float *beta_dev,
+                                        float *ssm_output_dev,
+                                        int n_v_heads, int d_state,
+                                        int repeat, int device) {
+    if (n_v_heads <= 0 || d_state <= 0) return 0;
+    if (d_state > 256) return 0;
+    if (!ssm_state_dev) return 0;
+
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+
+    size_t shared_mem = 2 * d_state * sizeof(float);
+    dim3 grid((unsigned)n_v_heads, 1, 1);
+    picolm_ssm_recurrence_kernel<<<grid, 256, (unsigned)shared_mem, ctx->stream>>>(
+        (float *)ssm_state_dev, q_conv_dev, k_conv_dev,
+        v_conv_dev, gate_exp_dev, beta_dev,
+        ssm_output_dev, n_v_heads, d_state, repeat);
+    if (!gpu_ok(gpuGetLastError(), "ssm recurrence (pipeline dev)")) return 0;
+    return 1;
+}
+
+/* ---- SSM gate/beta activation (Finding 6) ----
+ * Direct port of the CPU reference (ssm_forward, steps 9-11):
+ *   gate[h]     = softplus(alpha[h]) * ssm_a_w[h]
+ *   gate_exp[h] = (gate[h] < -50) ? 0 : exp(gate[h])
+ *   beta_out[h] = sigmoid(beta_raw[h])
+ * Tiny (n_v_heads elements, e.g. 48) and embarrassingly parallel -- one
+ * thread per head, no shared memory or sync needed. Small enough that
+ * leaving it host-side costs little, but this closes the loop for a
+ * fully device-resident hybrid layer with zero host touches. */
+__global__ void
+picolm_gpu_ssm_gate_beta_kernel(float *gate_exp_out, float *beta_out,
+                                 const float *alpha_in, const float *beta_raw_in,
+                                 const float *ssm_a_w, int n_v_heads) {
+    int h = (int)gpuBlockIdx_x * gpuBlockDim_x + gpuThreadIdx_x;
+    if (h >= n_v_heads) return;
+
+    float a = alpha_in[h];
+    float sp = (a > 20.0f) ? a : (a < -20.0f) ? expf(a) : logf(1.0f + expf(a));
+    float gate = sp * ssm_a_w[h];
+    gate_exp_out[h] = (gate < -50.0f) ? 0.0f : expf(gate);
+
+    float braw = beta_raw_in[h];
+    beta_out[h] = 1.0f / (1.0f + expf(-braw));
+}
+
+/* Device-native: all pointers device-resident, no H2D/D2H, no sync. */
+extern "C" int
+picolm_gpu_ssm_gate_beta_dev(float *gate_exp_out_dev, float *beta_out_dev,
+                              const float *alpha_in_dev, const float *beta_raw_in_dev,
+                              const float *ssm_a_w_dev, int n_v_heads, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    if (n_v_heads < 1) return 0;
+
+    int n_threads = min(n_v_heads, 256);
+    int n_blocks = (n_v_heads + n_threads - 1) / n_threads;
+    picolm_gpu_ssm_gate_beta_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
+        gate_exp_out_dev, beta_out_dev, alpha_in_dev, beta_raw_in_dev,
+        ssm_a_w_dev, n_v_heads);
+    if (!gpu_ok(gpuGetLastError(), "ssm gate/beta (dev)")) return 0;
+    return 1;
+}
+
 /* ---- SSM gated normalization ----
  * Direct port of the CPU reference ("18. Gated normalization" in
  * ssm_forward): per-head RMSNorm of the SSM output, scaled by a
@@ -2596,6 +2672,36 @@ picolm_gpu_ssm_vecdot(float *out_host,
 
     if (!gpu_ok(gpuDeviceSynchronize(), "ssm vecdot sync") ||
         !gpu_ok(gpuMemcpy(out_host, ctx->y, out_bytes, gpuMemcpyDeviceToHost), "ssm out d2h")) return 0;
+    return 1;
+}
+
+/* Fully device-native SSM vecdot: weights_dev and head_map_dev must
+ * already be device-resident, uploaded ONCE at model load (via
+ * picolm_gpu_tensor_upload for quantized weights or picolm_gpu_upload_f32
+ * for F32 ssm_alpha/ssm_beta, and a one-time int array upload for the
+ * head_map) -- NOT re-uploaded every call like picolm_gpu_ssm_vecdot()
+ * above does. x_dev/out_dev are pipeline buffers. No malloc, no H2D/D2H,
+ * no internal sync -- same ctx->stream ordering argument as every other
+ * _dev primitive this session. head_map_dev may be NULL (identity). */
+extern "C" int
+picolm_gpu_ssm_vecdot_dev(float *out_dev,
+                           const float *x_dev,
+                           const void *weights_dev,
+                           gguf_type_t qtype,
+                           int dim, int n_v_heads,
+                           int row_bytes,
+                           const int *head_map_dev,
+                           int device) {
+    if (n_v_heads <= 0 || dim <= 0) return 0;
+    if (qtype != 0 && qtype != 2 && qtype != 8) return 0;
+
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+
+    dim3 grid((unsigned)n_v_heads, 1, 1);
+    picolm_ssm_vecdot_kernel<<<grid, 256, 256 * sizeof(float), ctx->stream>>>(
+        out_dev, x_dev, weights_dev, qtype, dim, n_v_heads, row_bytes, head_map_dev);
+    if (!gpu_ok(gpuGetLastError(), "ssm vecdot (dev)")) return 0;
     return 1;
 }
 

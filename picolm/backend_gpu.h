@@ -109,6 +109,27 @@ int picolm_gpu_ssm_vecdot(float *out,
                            const int *head_map,
                            int device);
 
+/* Fully device-native: weights_dev/head_map_dev uploaded once at model
+ * load (not re-uploaded per call like picolm_gpu_ssm_vecdot() above).
+ * x_dev/out_dev are pipeline buffers. No malloc, no H2D/D2H, no sync. */
+int picolm_gpu_ssm_vecdot_dev(float *out_dev,
+                               const float *x_dev,
+                               const void *weights_dev,
+                               gguf_type_t qtype,
+                               int dim, int n_v_heads,
+                               int row_bytes,
+                               const int *head_map_dev,
+                               int device);
+
+/* SSM gate/beta activation (Finding 6), device-native: gate_exp[h] =
+ * exp(softplus(alpha[h]) * ssm_a_w[h]) (0 if underflow), beta_out[h] =
+ * sigmoid(beta_raw[h]). All pointers device-resident, no H2D/D2H, no
+ * sync. Tiny (n_v_heads elements) but closes the loop for a fully
+ * device-resident hybrid layer. */
+int picolm_gpu_ssm_gate_beta_dev(float *gate_exp_out_dev, float *beta_out_dev,
+                                  const float *alpha_in_dev, const float *beta_raw_in_dev,
+                                  const float *ssm_a_w_dev, int n_v_heads, int device);
+
 int picolm_gpu_ssm_recurrence(float *state,
                                const float *q_conv,
                                const float *k_conv,
@@ -131,6 +152,23 @@ int picolm_gpu_ssm_recurrence_dev(void *ssm_state_dev,
                                float *ssm_output,
                                int n_v_heads, int d_state,
                                int repeat, int device);
+
+/* Fully device-native SSM recurrence: q_conv/k_conv/v_conv/gate_exp/beta/
+ * ssm_output are ALL device-resident pipeline buffers (unlike
+ * picolm_gpu_ssm_recurrence_dev above, which still uploads/downloads
+ * those per call -- only state is device-resident there). No malloc, no
+ * H2D/D2H, no sync at all. Use this one in model_forward_gpu's SSM
+ * layer branch; use the _dev variant above only from the CPU-orchestrated
+ * ssm_forward() path where q/k/v are computed on the host. */
+int picolm_gpu_ssm_recurrence_pipeline_dev(void *ssm_state_dev,
+                                            const float *q_conv_dev,
+                                            const float *k_conv_dev,
+                                            const float *v_conv_dev,
+                                            const float *gate_exp_dev,
+                                            const float *beta_dev,
+                                            float *ssm_output_dev,
+                                            int n_v_heads, int d_state,
+                                            int repeat, int device);
 
 /* SSM causal conv1d + state shift, fused, device-native (all pointers
  * device-resident, no H2D/D2H, no internal sync). conv_state is

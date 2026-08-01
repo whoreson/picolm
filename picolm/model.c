@@ -2389,18 +2389,16 @@ float *model_forward(model_t *m, int token, int pos) {
         if (lw->attn_q_norm) {
             float *qnw = s->attn_q_norm_w[l];
             float *knw = s->attn_k_norm_w[l];
-#ifdef PICOLM_GPU
-            /* Try GPU QK-norm if GPU is active */
             int qk_done = 0;
+#ifdef PICOLM_GPU
             if (gpu_ok && m->gpu.active) {
                 if (picolm_gpu_rmsnorm_batched(s->q, s->q, qnw, head_dim, c->rms_norm_eps, n_heads, m->gpu.device) &&
                     picolm_gpu_rmsnorm_batched(k_tmp, k_tmp, knw, head_dim, c->rms_norm_eps, n_kv_heads, m->gpu.device)) {
                     qk_done = 1;
                 }
             }
-            if (!qk_done)
 #endif
-            {
+            if (!qk_done) {
                 for (int h = 0; h < n_heads; h++)
                     rmsnorm(s->q + h * head_dim, s->q + h * head_dim, qnw, head_dim, c->rms_norm_eps);
                 for (int h = 0; h < n_kv_heads; h++)
@@ -2448,11 +2446,13 @@ float *model_forward(model_t *m, int token, int pos) {
                 /* Phase 1.5: key_pos now holds the full contiguous GQA row
                  * (all kv_heads) -- one bulk async copy instead of one
                  * kernel launch per head. */
+#ifdef PICOLM_GPU
                 if (gpu_ok && m->gpu.kv_active) {
                     picolm_gpu_kv_store_rows(1, this_attn_ordinal, pos, 1,
                                              key_pos, s->kv_row_size_k,
                                              n_kv_heads, head_dim, seq_len, gpu_dev);
                 }
+#endif
             }
         }
 
@@ -2491,15 +2491,17 @@ float *model_forward(model_t *m, int token, int pos) {
                     for (int d = 0; d < head_dim; d++) vf[d] = fp32_to_fp16(v_head[d]);
 #endif
                 }
+                #ifdef PICOLM_GPU
                 if (gpu_ok && m->gpu.kv_active) {
                     picolm_gpu_kv_store_rows(0, this_attn_ordinal, pos, 1,
                                              val_pos, s->kv_row_size_v,
                                              n_kv_heads, head_dim, seq_len, gpu_dev);
                 }
+#endif
             }
         }
 
-        /* ---- Flash Attention (online softmax) ----
+/* ---- Flash Attention (online softmax) ----
          *
          * Instead of materializing the full [n_heads * seq_len] score array,
          * compute attention in a single pass using the online softmax trick:
@@ -2538,6 +2540,7 @@ float *model_forward(model_t *m, int token, int pos) {
         gctx.kv_hadamard_v = s->kv_hadamard_v;
         gctx.kv_hadamard_size = s->kv_hadamard_size;
 
+        #ifdef PICOLM_GPU
         /* Phase 1: GPU attention decode path */
         if (gpu_ok && m->gpu.kv_active && s->kv_type_k == KV_CACHE_F16 && s->kv_type_v == KV_CACHE_F16) {
             /* Clear GPU tensor before calling attention (no weight tensors involved) */
@@ -2550,10 +2553,13 @@ float *model_forward(model_t *m, int token, int pos) {
             } else {
                 tensor_parallel_for(c->n_kv_heads, attention_group, &gctx);
             }
-        } else {
+        } else
+#endif
+        {
             tensor_parallel_for(c->n_kv_heads, attention_group, &gctx);
         }
 
+#ifdef PICOLM_GPU
         /* PICOLM_DBG_ATTN: compare GPU vs CPU attention output */
         {
             const char *dbg_attn = getenv("PICOLM_DBG_ATTN");
@@ -2573,6 +2579,7 @@ float *model_forward(model_t *m, int token, int pos) {
                 memcpy(s->xb, xb_cpu, n_heads * head_dim * sizeof(float));
             }
         }
+#endif
 
         /* Hadamard rotation of attention output back to original space (Point D) */
         if (s->kv_hadamard_v) {
@@ -6268,23 +6275,20 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                 if (lw->attn_q_norm) {
                     float *qnw = s->attn_q_norm_w[l];
                     float *knw = s->attn_k_norm_w[l];
+                    int qk_done = 0;
 #ifdef PICOLM_GPU
-                    {
-                        int qk_done = 0;
-                        if (gpu_ok && m->gpu.active) {
-                            if (picolm_gpu_rmsnorm_batched(q_pos, q_pos, qnw, head_dim, c->rms_norm_eps, n_heads, m->gpu.device) &&
-                                picolm_gpu_rmsnorm_batched(k_pos, k_pos, knw, head_dim, c->rms_norm_eps, n_kv_heads, m->gpu.device)) {
-                                qk_done = 1;
-                            }
+                    if (gpu_ok && m->gpu.active) {
+                        if (picolm_gpu_rmsnorm_batched(q_pos, q_pos, qnw, head_dim, c->rms_norm_eps, n_heads, m->gpu.device) &&
+                            picolm_gpu_rmsnorm_batched(k_pos, k_pos, knw, head_dim, c->rms_norm_eps, n_kv_heads, m->gpu.device)) {
+                            qk_done = 1;
                         }
-                        if (!qk_done)
+                    }
 #endif
-                        {
-                            for (int h = 0; h < n_heads; h++)
-                                rmsnorm(q_pos + h * head_dim, q_pos + h * head_dim, qnw, head_dim, c->rms_norm_eps);
-                            for (int h = 0; h < n_kv_heads; h++)
-                                rmsnorm(k_pos + h * head_dim, k_pos + h * head_dim, knw, head_dim, c->rms_norm_eps);
-                        }
+                    if (!qk_done) {
+                        for (int h = 0; h < n_heads; h++)
+                            rmsnorm(q_pos + h * head_dim, q_pos + h * head_dim, qnw, head_dim, c->rms_norm_eps);
+                        for (int h = 0; h < n_kv_heads; h++)
+                            rmsnorm(k_pos + h * head_dim, k_pos + h * head_dim, knw, head_dim, c->rms_norm_eps);
                     }
                 }
 
@@ -6343,6 +6347,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
              * n_tokens contiguous F16 GQA rows starting at start_pos
              * (identical layout to the device cache) -- one async copy
              * per K/V per chunk, replacing n_tokens*n_kv_heads launches. */
+            #ifdef PICOLM_GPU
             if (gpu_ok && m->gpu.kv_active &&
                 s->kv_type_k == KV_CACHE_F16 && s->kv_type_v == KV_CACHE_F16) {
                 picolm_gpu_kv_store_rows(1, this_attn_ord, start_pos, n_tokens,
@@ -6354,6 +6359,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                                          s->kv_row_size_v, n_kv_heads, head_dim,
                                          seq_len, gpu_dev);
             }
+#endif
 
             /* Zero init xb_batch for attention accumulation */
             memset(xb_batch, 0, (size_t)n_tokens * max_dim * sizeof(float));
@@ -6376,6 +6382,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
             tensor_set_gpu_tensor(NULL, 0);
 #endif
 
+            #ifdef PICOLM_GPU
             /* Phase 1: GPU attention prefill path */
             if (gpu_ok && m->gpu.kv_active && s->kv_type_k == KV_CACHE_F16 && s->kv_type_v == KV_CACHE_F16 &&
                 s->kv_head_stride_k == s->kv_head_stride_v) {
@@ -6392,7 +6399,9 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                                           s->kv_row_size_k, s->kv_row_size_v,
                                           s->kv_head_stride_k, s->kv_head_stride_v);
                 }
-            } else {
+            } else
+#endif
+            {
                 /* Batched attention: all tokens, all heads, one thread dispatch */
                 batch_attention_layer(xb_batch, q_batch, kcl, vcl,
                                       n_tokens, start_pos,
@@ -6767,6 +6776,7 @@ void model_ssm_state_reset(model_t *m) {
     }
 }
 
+#ifdef PICOLM_GPU
 /* Phase 2: GPU-pipelined decode (skeleton)
  * Keeps activations on-device across all layers.
  * Falls back to model_forward until fully implemented.
@@ -6958,6 +6968,7 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
 
     return s->logits;
 }
+
 /* Phase 2: GPU-pipelined prefill forward pass.
  * Keeps activations on-device across all layers with S=n_tokens batching.
  * Falls back to model_forward_prefill() if pipeline not ready. */
@@ -7119,3 +7130,4 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
     return s->logits;
 }
 
+#endif /* PICOLM_GPU */
