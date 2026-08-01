@@ -2419,10 +2419,10 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
     /* Build generation_settings JSON */
     cJSON *gen_settings = cJSON_CreateObject();
     cJSON_AddNumberToObject(gen_settings, "n_predict", n_predict);
-    cJSON_AddNumberToObject(gen_settings, "temperature", temperature);
-    cJSON_AddNumberToObject(gen_settings, "top_p", top_p);
+    cJSON_AddNumberToObject(gen_settings, "temperature", (double)temperature);
+    cJSON_AddNumberToObject(gen_settings, "top_p", (double)top_p);
     cJSON_AddNumberToObject(gen_settings, "top_k", top_k);
-    cJSON_AddNumberToObject(gen_settings, "repeat_penalty", repeat_penalty);
+    cJSON_AddNumberToObject(gen_settings, "repeat_penalty", (double)repeat_penalty);
     cJSON_AddNumberToObject(gen_settings, "repeat_last_n", repeat_last_n);
     cJSON_AddNumberToObject(gen_settings, "seed", seed);
 

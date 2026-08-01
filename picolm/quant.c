@@ -203,8 +203,8 @@ static inline void get_scale_min_k4(int j, const uint8_t *q, uint8_t *sc, uint8_
         *sc = q[j] & 63;
         *mn = q[j + 4] & 63;
     } else {
-        *sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
-        *mn = (q[j + 4] >>  4) | ((q[j    ] >> 6) << 4);
+        *sc = (uint8_t)((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4));
+        *mn = (uint8_t)((q[j + 4] >>  4) | ((q[j    ] >> 6) << 4));
     }
 }
 
@@ -1196,6 +1196,7 @@ float vec_dot_q6_K_f32(const void *src, const float *x, int n) {
  * AVX:          _mm_maddubs_epi16 for 16-wide (two lanes)
  * ================================================================ */
 
+#if defined(PICOLM_AVX2)
 /* Scale shuffle for Q6_K: 16 scales, each repeated 8 times per 32-byte lane.
  * Q6_K has one scale per 16-element sub-block. For AVX2 32-wide ops, each
  * scale needs to be duplicated across the lanes it applies to.
@@ -1211,6 +1212,7 @@ static const uint8_t get_scale_shuffle_k6[144] = {
     12,12,12,12,12,12,12,12,13,13,13,13,13,13,13,13,
     14,14,14,14,14,14,14,14,15,15,15,15,15,15,15,15,
 };
+#endif
 
 float vec_dot_q6_K_q8_K(const void *src_q6, const void *src_q8, int n) {
     const block_q6_K *x = (const block_q6_K *)src_q6;
@@ -1431,7 +1433,7 @@ float vec_dot_q6_K_q8_K(const void *src_q6, const void *src_q8, int n) {
                 block_sum += sc[j] * sums[j] - 32 * y[i].bsums[j] * sc[j];
             }
         }
-        sumf += d * block_sum;
+        sumf += d * (float)block_sum;
     }
     return sumf;
 #endif
@@ -1619,10 +1621,10 @@ void quantize_row_q8_0(const float *x, void *dst, int n) {
         for (int j = 0; j < 8; j++) {
             const float32x4_t v = vmulq_n_f32(srcv[j], id);
             const int32x4_t vi = vcvtnq_s32_f32(v);
-            y[i].qs[4*j+0] = vgetq_lane_s32(vi, 0);
-            y[i].qs[4*j+1] = vgetq_lane_s32(vi, 1);
-            y[i].qs[4*j+2] = vgetq_lane_s32(vi, 2);
-            y[i].qs[4*j+3] = vgetq_lane_s32(vi, 3);
+            y[i].qs[4*j+0] = (int8_t)vgetq_lane_s32(vi, 0);
+            y[i].qs[4*j+1] = (int8_t)vgetq_lane_s32(vi, 1);
+            y[i].qs[4*j+2] = (int8_t)vgetq_lane_s32(vi, 2);
+            y[i].qs[4*j+3] = (int8_t)vgetq_lane_s32(vi, 3);
         }
     }
 #elif defined(PICOLM_SSE2)
@@ -1760,7 +1762,7 @@ void quantize_row_q8_K(const float *x, void *dst, int n) {
             for (int ii = 0; ii < 16; ++ii) {
                 sum += y[i].qs[j * 16 + ii];
             }
-            y[i].bsums[j] = sum;
+            y[i].bsums[j] = (int16_t)sum;
         }
 #endif
         x += 256;
@@ -2074,10 +2076,10 @@ float vec_dot_q4_K_q8_K(const void *src_q4, const void *src_q8, int n) {
         }
 
         const float d = fp16_to_fp32_lookup(x[i].d) * y[i].d;
-        for (int l = 0; l < 8; l++) sums[l] += d * aux32[l];
+        for (int l = 0; l < 8; l++) sums[l] += d * (float)aux32[l];
 
         const float dmin = fp16_to_fp32_lookup(x[i].dmin) * y[i].d;
-        sumf -= dmin * sumi;
+        sumf -= dmin * (float)sumi;
     }
     for (int l = 0; l < 8; l++) sumf += sums[l];
     return sumf;
@@ -2650,12 +2652,12 @@ float vec_dot_q3_K_q8_K(const void *src_q3, const void *src_q8, int n) {
             for (int j = 0; j < 4; j++) {
                 float dl = d * (scales[is++] - 32);
                 for (int l = 0; l < 16; l++) {
-                    int8_t v = (int8_t)((q3[l] >> shift) & 3) - ((hm[l] & hmv) ? 0 : 4);
+                    int8_t v = (int8_t)(((q3[l] >> shift) & 3) - ((hm[l] & hmv) ? 0 : 4));
                     sumf += dl * (float)v * q8[l];
                 }
                 float dl2 = d * (scales[is++] - 32);
                 for (int l = 0; l < 16; l++) {
-                    int8_t v = (int8_t)((q3[l+16] >> shift) & 3) - ((hm[l+16] & hmv) ? 0 : 4);
+                    int8_t v = (int8_t)(((q3[l+16] >> shift) & 3) - ((hm[l+16] & hmv) ? 0 : 4));
                     sumf += dl2 * (float)v * q8[16+l];
                 }
                 shift += 2;
@@ -4152,7 +4154,7 @@ float vec_dot_q1_0_q8_0(const void *vx, const void *wy, int n) {
                             + ((mask & 0x40) ? qy[6] : -qy[6])
                             + ((mask & 0x80) ? qy[7] : -qy[7]);
             }
-            sumi += d1 * sumi_block;
+            sumi += d1 * (float)sumi_block;
         }
         sumf += d0 * sumi;
     }
@@ -4967,7 +4969,7 @@ void quantize_row_q4_0(const float *x, void *dst, int n) {
             uint8_t v1 = (uint8_t)(b[j + 16] * id + 8.5f);
             if (v0 > 15) v0 = 15;
             if (v1 > 15) v1 = 15;
-            q[j] = v0 | (v1 << 4);
+            q[j] = (uint8_t)(v0 | (v1 << 4));
         }
     }
 }
@@ -5452,10 +5454,10 @@ static uint8_t tq4_find_nearest(float val) {
 
 /* Pack 8 4-bit indices into 4 bytes (nibble packing) */
 static void tq4_pack_4bit_8(uint8_t *dst, const uint8_t *idx) {
-    dst[0] = idx[0] | (idx[1] << 4);
-    dst[1] = idx[2] | (idx[3] << 4);
-    dst[2] = idx[4] | (idx[5] << 4);
-    dst[3] = idx[6] | (idx[7] << 4);
+    dst[0] = (uint8_t)(idx[0] | (idx[1] << 4));
+    dst[1] = (uint8_t)(idx[2] | (idx[3] << 4));
+    dst[2] = (uint8_t)(idx[4] | (idx[5] << 4));
+    dst[3] = (uint8_t)(idx[6] | (idx[7] << 4));
 }
 
 /* ---- quantize_row_tq4: float32 -> TQ4 blocks ---- */

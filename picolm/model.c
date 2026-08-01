@@ -2184,11 +2184,11 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
             }
             /* laurel_l: [n_embd, laurel_rank] */
             if (lw->laurel_l) {
-                dequantize_row(lw->laurel_l, s->laurel_l_w[l], (size_t)n_embd * laurel_rank, lw->type_laurel_l);
+                dequantize_row(lw->laurel_l, s->laurel_l_w[l], (int)((size_t)n_embd * laurel_rank), lw->type_laurel_l);
             }
             /* laurel_r: [laurel_rank, n_embd] */
             if (lw->laurel_r) {
-                dequantize_row(lw->laurel_r, s->laurel_r_w[l], (size_t)laurel_rank * n_embd, lw->type_laurel_r);
+                dequantize_row(lw->laurel_r, s->laurel_r_w[l], (int)((size_t)laurel_rank * n_embd), lw->type_laurel_r);
             }
         }
     }
@@ -3024,13 +3024,6 @@ float *model_forward(model_t *m, int token, int pos) {
 #endif
         int this_q_dim = (c->has_ssm && lw->is_attn_layer) ? q_full_dim : q_dim;
         matmul(s->q, s->xb, lw->attn_q, dim, this_q_dim, lw->type_attn_q);
-        if (l == 0 && pos == 0) {
-            float qsum = 0, qmax = 0;
-            for (int qi = 0; qi < this_q_dim; qi++) {
-                qsum += s->q[qi];
-                if (fabsf(s->q[qi]) > qmax) qmax = fabsf(s->q[qi]);
-            }
-                    }
         tensor_set_repacked(NULL);
 
         /* For Qwen3.5: de-interleave per-head Q+gate into block layout
@@ -3325,15 +3318,6 @@ ffn_done:
     if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)m->gpu.output, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
 #endif
     matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
-    static int dbg_logits = 0;
-    if (!dbg_logits++) {
-        float lmax = s->logits[0], lmin = s->logits[0], lsum = 0;
-        for (int li = 0; li < c->vocab_size; li++) {
-            lsum += s->logits[li];
-            if (s->logits[li] > lmax) lmax = s->logits[li];
-            if (s->logits[li] < lmin) lmin = s->logits[li];
-        }
-            }
     tensor_set_repacked(NULL);
 
     return s->logits;
@@ -3367,7 +3351,7 @@ static void gemma3n_router(float *out, float *inp, int n_embd, int n_altup,
     for (int i = 0; i < n_embd; i++) tmp_buf[i] *= sc;
     /* Dequantize router weights [n_embd, n_altup] */
     float *router_w = tmp_buf + n_embd; /* use tmp_buf space after n_embd */
-    dequantize_row(router_raw, router_w, (size_t)n_embd * n_altup, router_type);
+    dequantize_row(router_raw, router_w, (int)((size_t)n_embd * n_altup), router_type);
     /* Matmul: [n_embd, n_altup] -> [n_altup] */
     for (int a = 0; a < n_altup; a++) {
         float sum = 0;
@@ -6167,10 +6151,6 @@ int model_unlock_layers(model_t *m) {
     if (m->locked_layers == 0) return 0;
 
     const model_config_t *c = &m->config;
-    size_t gbytes = global_weight_bytes(m);
-    size_t budget = gbytes;
-    for (int l = 0; l < m->locked_layers; l++)
-        budget += layer_weight_bytes(m, l);
 
     /* Re-compute the ranges (same logic as lock, then munmap) */
     int n_ranges = 0;
@@ -7287,14 +7267,6 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #endif
         { int this_q_dim = (c->has_ssm && lw->is_attn_layer) ? q_full_dim : q_dim;
           matmul_batch(q_batch, xb_batch, n_tokens, lw->attn_q, dim, this_q_dim, lw->type_attn_q);
-          if (l == 0) {
-              float qsum = 0, qmax = 0;
-              for (int qi = 0; qi < this_q_dim; qi++) {
-                  qsum += q_batch[qi];
-                  float av = fabsf(q_batch[qi]);
-                  if (av > qmax) qmax = av;
-              }
-                        }
         }
         tensor_set_repacked(NULL);
 
@@ -7500,13 +7472,6 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
           matmul_batch(xb2_batch, attn_out_batch ? attn_out_batch : xb_batch, n_tokens, lw->attn_output, q_dim, dim, lw->type_attn_output);
           if (attn_out_batch) free(attn_out_batch);
         }
-        if (l == 0) {
-            float dsum = 0, dmax = 0;
-            for (int di = 0; di < dim && di < 4; di++) {
-                float dv = xb2_batch[di]; dsum += dv;
-                float dav = fabsf(dv); if (dav > dmax) dmax = dav;
-            }
-        }
                 tensor_set_repacked(NULL);
 
         /* Residual: x += attn_out */
@@ -7545,15 +7510,6 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
             float *a = x_batch + bi * dim, *b = xb2_batch + bi * dim;
             for (int d2 = 0; d2 < dim; d2++) a[d2] += b[d2];
         }
-        if (l == 0 || l == 1 || l == 2) {
-            float xsum = 0, xmax = 0;
-            float *rx = x_batch + dim; /* token 1 */
-            for (int d2 = 0; d2 < dim; d2++) {
-                xsum += rx[d2];
-                float av = fabsf(rx[d2]);
-                if (av > xmax) xmax = av;
-            }
-                    }
 #ifdef PICOLM_VIZ
         viz_push_layer(l, x_batch + (n_tokens - 1) * dim, dim);
 #endif
