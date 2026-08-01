@@ -657,7 +657,7 @@ int model_list_tensors(const char *path) {
 
     { struct stat st;
       if (fstat(fd, &st) < 0) goto out;
-      addr = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+      addr = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
       if (addr == MAP_FAILED) { addr = NULL; goto out; }
       fsize = (size_t)st.st_size; }
 #endif
@@ -788,7 +788,7 @@ int model_list_kv(const char *path) {
     if (fd < 0) { perror("open"); return -1; }
     { struct stat st;
       if (fstat(fd, &st) < 0) goto out;
-      addr = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+      addr = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
       if (addr == MAP_FAILED) { addr = NULL; goto out; }
       fsize = (size_t)st.st_size; }
 #endif
@@ -1135,7 +1135,7 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                   uint64_t nn = arr_len;
                   for (uint64_t ii = 0; ii < nn; ii++) {
                       uint64_t sl; memcpy(&sl, pp, 8); sl = GGUF_LE64(sl); pp += 8 + sl; }
-                  r.pos = pp - r.data; }
+                  r.pos = (size_t)(pp - r.data); }
             }
         } else if (str_eq(key, "tokenizer.ggml.token_type")) {
             if (vtype != GGUF_META_ARRAY) {
@@ -6003,7 +6003,7 @@ int model_lock_layers(model_t *m, size_t mem_bytes) {
         if (ptr && _sz > 0 && n_ranges < NR_MAX) { \
             ranges_start[n_ranges] = page_align_down(ptr); \
             ranges_end[n_ranges] = page_align_up((const uint8_t *)ptr + _sz); \
-            ranges_size[n_ranges] = (const uint8_t *)ranges_end[n_ranges] - (const uint8_t *)ranges_start[n_ranges]; \
+            ranges_size[n_ranges] = (size_t)((const uint8_t *)ranges_end[n_ranges] - (const uint8_t *)ranges_start[n_ranges]); \
             n_ranges++; \
         } \
     } while(0)
@@ -6118,7 +6118,7 @@ int model_lock_layers(model_t *m, size_t mem_bytes) {
     /* Call mlock on each merged range */
     size_t total_locked = 0;
     for (int i = 0; i < merged; i++) {
-        size_t sz = (const uint8_t *)ranges_end[i] - (const uint8_t *)ranges_start[i];
+        size_t sz = (size_t)((const uint8_t *)ranges_end[i] - (const uint8_t *)ranges_start[i]);
 #ifdef _WIN32
         if (VirtualLock((void *)(const void *)ranges_start[i], sz) == 0) {
             fprintf(stderr, "Lock: VirtualLock failed (error %lu)\n", (unsigned long)GetLastError());
@@ -6221,7 +6221,7 @@ int model_unlock_layers(model_t *m) {
 
     size_t total_unlocked = 0;
     for (int i = 0; i < merged; i++) {
-        size_t sz = (const uint8_t *)ranges_end[i] - (const uint8_t *)ranges_start[i];
+        size_t sz = (size_t)((const uint8_t *)ranges_end[i] - (const uint8_t *)ranges_start[i]);
 #ifdef _WIN32
         VirtualUnlock((void *)(const void *)ranges_start[i], sz);
 #else

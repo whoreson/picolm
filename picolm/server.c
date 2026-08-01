@@ -1269,7 +1269,7 @@ static void handle_slots_post(SOCKET sock, const char *body) {
                     if (ver >= 4) {
                         /* Token sequence */
                         if (file_n_pos > 0) {
-                            kv_end += (off_t)file_n_pos * sizeof(uint32_t);
+                            kv_end += (off_t)file_n_pos * (off_t)sizeof(uint32_t);
                         }
                         /* Layer bitmap */
                         kv_end += (off_t)file_layers;
@@ -1283,7 +1283,7 @@ static void handle_slots_post(SOCKET sock, const char *body) {
                     if (ver >= 4) {
                         /* Read layer bitmap to count attention layers */
                         uint8_t *layer_map = (uint8_t *)alloca(file_layers);
-                        lseek(fd, (off_t)sizeof(header) + (file_n_pos > 0 ? (off_t)file_n_pos * sizeof(uint32_t) : 0), SEEK_SET);
+                        lseek(fd, (off_t)sizeof(header) + (file_n_pos > 0 ? (off_t)file_n_pos * (off_t)sizeof(uint32_t) : 0), SEEK_SET);
 #ifdef _WIN32
                         _read(fd, (char *)layer_map, (unsigned)file_layers);
 #else
@@ -1299,7 +1299,7 @@ static void handle_slots_post(SOCKET sock, const char *body) {
                     }
                     /* Reset file position to beginning (we lseek'd for bitmap read) */
                     lseek(fd, 0, SEEK_SET);
-                    kv_end += (off_t)attn_layers * file_n_pos * (pos_stride_k + pos_stride_v);
+                    kv_end += (off_t)attn_layers * file_n_pos * (off_t)(pos_stride_k + pos_stride_v);
 
                     /* SSM state (v4 only) */
                     if (ver >= 4) {
