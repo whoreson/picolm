@@ -3400,7 +3400,8 @@ void gemm_q4_0_4x8_i8mm(const void *W, const int8_t *X_repacked, const float *ad
             const float *ad_bc = ad + (size_t)bc * nb;
 
             /* Process 4 blocks per group */
-            for (int ib = 0; ib + 3 < nb; ib += 4) {
+            int ib;
+            for (ib = 0; ib + 3 < nb; ib += 4) {
                 float32x4_t f_acc[4];
                 f_acc[0] = vdupq_n_f32(0.0f);
                 f_acc[1] = vdupq_n_f32(0.0f);
