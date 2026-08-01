@@ -1660,6 +1660,23 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                 }
             }
 
+            /* Bridge per-layer GPU tensor pointers to the global SSM arrays.
+             * The SSM branch in model_forward_gpu uses gw->ssm_alpha_dev[l] etc.,
+             * but the per-layer tensor upload stores them in gl->ssm_alpha (a
+             * picolm_gpu_tensor_t*). Extract the .weights device pointer. */
+            {
+                gpu_weights_t *gw = &m->gpu;
+                for (int l = 0; l < c->n_layers; l++) {
+                    gpu_layer_weights_t *gl = &m->gpu.layers[l];
+                    if (gl->ssm_conv1d)
+                        gw->ssm_conv1d_dev[l] = (void *)picolm_gpu_tensor_weights((picolm_gpu_tensor_t *)gl->ssm_conv1d);
+                    if (gl->ssm_alpha)
+                        gw->ssm_alpha_dev[l] = (void *)picolm_gpu_tensor_weights((picolm_gpu_tensor_t *)gl->ssm_alpha);
+                    if (gl->ssm_beta)
+                        gw->ssm_beta_dev[l] = (void *)picolm_gpu_tensor_weights((picolm_gpu_tensor_t *)gl->ssm_beta);
+                }
+            }
+
             m->gpu.device = device;
             if (uploaded > 0) {
                 m->gpu.active = 1;
@@ -1693,8 +1710,6 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                         if (c->ssm_d_inner <= 0) eligible = 0;        /* value_dim */
                         if (c->ssm_d_conv <= 1) eligible = 0;         /* need >=2 taps */
                         if (eligible && c->ssm_d_inner % c->ssm_dt_rank != 0) eligible = 0;
-                        /* Veto SSM models until hybrid layer branch is wired */
-                        eligible = 0;
                     }
 
                     if (eligible) {
@@ -1749,6 +1764,43 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                                     picolm_gpu_upload_f32(s->attn_norm_w[l], c->n_embd, device);
                                 m->gpu.post_attn_norm_dev[l] =
                                     picolm_gpu_upload_f32(s->post_attn_norm_w[l], c->n_embd, device);
+                            }
+
+                            /* SSM pipeline buffers and weight uploads (for hybrid layers) */
+                            if (c->has_ssm) {
+                                int conv_dim = 2 * c->ssm_d_state * c->ssm_n_group + c->ssm_d_inner;
+                                if (!picolm_gpu_ssm_pipeline_alloc(conv_dim, c->ssm_d_inner,
+                                                                    c->ssm_dt_rank, device)) {
+                                    fprintf(stderr, "WARN: GPU SSM pipeline buffer alloc failed\n");
+                                }
+                                run_state_t *ss = &m->state;
+                                int head_v_dim = c->ssm_d_inner / c->ssm_dt_rank;
+                                for (int l = 0; l < c->n_layers; l++) {
+                                    layer_weights_t *lw = &m->weights.layers[l];
+                                    if (lw->is_attn_layer) continue;
+                                    m->gpu.ssm_a_dev[l] = picolm_gpu_upload_f32(ss->ssm_a_w[l], c->ssm_dt_rank, device);
+                                    m->gpu.ssm_dt_dev[l] = picolm_gpu_upload_f32(ss->ssm_dt_w[l], c->ssm_dt_rank, device);
+                                    m->gpu.ssm_norm_dev[l] = picolm_gpu_upload_f32(ss->ssm_norm_w[l], head_v_dim, device);
+                                    /* Allocate device-resident SSM state */
+                                    if (ss->ssm_state[l]) {
+                                        size_t ssm_st_bytes = (size_t)c->ssm_d_state *
+                                             (size_t)c->ssm_d_state *
+                                             (size_t)c->ssm_dt_rank * sizeof(float);
+                                        m->gpu.ssm_state_dev[l] = picolm_gpu_alloc_device(ssm_st_bytes, device);
+                                        if (m->gpu.ssm_state_dev[l]) {
+                                            picolm_gpu_device_memset(m->gpu.ssm_state_dev[l], 0,
+                                                ssm_st_bytes, device);
+                                        }
+                                    }
+                                    /* Conv state: (d_conv-1) * conv_dim floats */
+                                    size_t conv_st_bytes = (size_t)(c->ssm_d_conv - 1) *
+                                        (size_t)conv_dim * sizeof(float);
+                                    m->gpu.ssm_conv_state_dev[l] = picolm_gpu_alloc_device(conv_st_bytes, device);
+                                    if (m->gpu.ssm_conv_state_dev[l]) {
+                                        picolm_gpu_device_memset(m->gpu.ssm_conv_state_dev[l], 0,
+                                            conv_st_bytes, device);
+                                    }
+                                }
                             }
                         } else {
                             fprintf(stderr, "WARN: GPU KV cache allocation failed, falling back to CPU\n");
@@ -6862,82 +6914,190 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
         layer_weights_t *lw = &w->layers[l];
         gl = &gw->layers[l];
 
-        /* Skip non-attention layers (SSM) - not supported yet */
-        if (c->has_ssm && !lw->is_attn_layer) {
-            /* Fall back to CPU for models with SSM */
-            return model_forward(m, token, pos);
+        if (!c->has_ssm || lw->is_attn_layer) {
+            /* A. RMSNorm: pipe_xb = rmsnorm(pipe_x, attn_norm_w[l]) */
+            picolm_gpu_rmsnorm_dev(pipe_xb, pipe_x,
+                                    (float *)gw->attn_norm_dev[l],
+                                    dim, c->rms_norm_eps, gpu_dev);
+
+            /* B. Q projection: pipe_q = attn_q @ pipe_xb */
+            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
+                                   pipe_q, pipe_xb, 1, gpu_dev);
+
+            /* C. K projection: pipe_k = attn_k @ pipe_xb */
+            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_k,
+                                   pipe_k, pipe_xb, 1, gpu_dev);
+
+            /* D. V projection: pipe_v = attn_v @ pipe_xb */
+            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_v,
+                                   pipe_v, pipe_xb, 1, gpu_dev);
+
+            /* E. RoPE on Q (in-place): rope(pipe_q, n_heads) */
+            /* RoPE tables for this position on device */
+            float *rope_cos_pos = (float *)gw->rope_cos_dev + (size_t)pos * rope_half;
+            float *rope_sin_pos = (float *)gw->rope_sin_dev + (size_t)pos * rope_half;
+            picolm_gpu_rope_apply(pipe_q, n_heads, head_dim,
+                                   rope_cos_pos, rope_sin_pos, rope_half, c->rope_type, gpu_dev);
+
+            /* F. RoPE on K (in-place): rope(pipe_k, n_kv_heads) */
+            picolm_gpu_rope_apply(pipe_k, n_kv_heads, head_dim,
+                                   rope_cos_pos, rope_sin_pos, rope_half, c->rope_type, gpu_dev);
+
+            /* G. KV cache store: pack F32 -> F16 and write directly into the
+             * device KV cache, entirely device-to-device. The previous
+             * version of this step did a synchronous D2H of pipe_k/pipe_v,
+             * a CPU F16 conversion, then an H2D via picolm_gpu_kv_store_rows
+             * -- each layer, twice (K and V). picolm_gpu_memcpy is a
+             * blocking gpuMemcpy, so that was also forcing a full device
+             * sync twice per layer (64x per token for a 32-layer model),
+             * which defeated most of the point of this pipeline. This
+             * version never touches the host, so that costs nothing beyond
+             * two tiny kernel launches on ctx->stream.
+             *
+             * Trade-off: s->key_cache/val_cache (the host-side KV mirror)
+             * is NOT updated here anymore. That's fine for the current
+             * eligibility gate (kv_active requires no SSM, decided once at
+             * model load, never changes mid-generation), but if a mid-stream
+             * CPU fallback is ever introduced, it needs a one-time bulk
+             * device->host flush of the whole KV cache first -- not
+             * per-token reconstruction. Not needed today; flagged here so
+             * it isn't a silent trap later. */
+            picolm_gpu_kv_store_dev(1, this_attn_ordinal, pos, pipe_k,
+                                     n_kv_heads, head_dim, seq_len, gpu_dev);
+            picolm_gpu_kv_store_dev(0, this_attn_ordinal, pos, pipe_v,
+                                     n_kv_heads, head_dim, seq_len, gpu_dev);
+            this_attn_ordinal++;
+
+            /* H. Attention decode: pipe_attn_out = attn(pipe_q)
+             * Uses this_attn_ordinal - 1 (already incremented above), the
+             * same compacted index the KV cache was just written at. This
+             * ordinal only advances for actual attention layers (above) --
+             * SSM/hybrid layers below have no KV cache entry at all, they
+             * index ssm_state_dev/ssm_conv_state_dev by the raw layer index
+             * `l` instead. */
+            picolm_gpu_attention_decode_dev(pipe_attn_out, pipe_q,
+                                             this_attn_ordinal - 1, pos,
+                                             n_heads, n_kv_heads, head_dim,
+                                             seq_len, gpu_dev);
+
+            /* I. Output projection: pipe_xb = attn_output @ pipe_attn_out */
+            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_output,
+                                   pipe_xb, pipe_attn_out, 1, gpu_dev);
+
+            /* J. Residual add: pipe_x += pipe_xb */
+            picolm_gpu_residual_add(pipe_x, pipe_x, pipe_xb, dim, gpu_dev);
+        } else {
+            /* SSM/hybrid layer block. Mirrors ssm_forward()'s CPU
+             * reference exactly, steps re-lettered to match this
+             * function's convention. No KV cache, no RoPE, no softmax
+             * attention -- despite the "attn_" prefix on some of these
+             * tensor names (GGUF naming carried over), hybrid layers do
+             * no standard multi-head attention at all. */
+            int ssm_n_k = c->ssm_n_group;
+            int ssm_n_v = c->ssm_dt_rank;
+            int ssm_d_state = c->ssm_d_state;
+            int ssm_head_v_dim = c->ssm_d_inner / ssm_n_v;
+            int ssm_repeat = ssm_n_v / ssm_n_k;
+            int ssm_qk_dim = ssm_d_state * ssm_n_k;
+            int ssm_conv_dim = 2 * ssm_qk_dim + c->ssm_d_inner;
+            int ssm_do_remap = !m->from_safetensors && ssm_n_k > 0 &&
+                                ssm_n_k < ssm_n_v && gw->ssm_head_map_dev;
+
+            float *ssm_qkv_raw = picolm_gpu_ssm_qkv_raw(gpu_dev);
+            float *ssm_conv_out = picolm_gpu_ssm_conv_out(gpu_dev);
+            float *ssm_xb2 = picolm_gpu_ssm_xb2(gpu_dev);
+            float *ssm_xb2_remap = picolm_gpu_ssm_xb2_remap(gpu_dev);
+            float *ssm_v_remap = picolm_gpu_ssm_v_remap(gpu_dev);
+            float *ssm_alpha_raw = picolm_gpu_ssm_alpha_raw(gpu_dev);
+            float *ssm_beta_raw = picolm_gpu_ssm_beta_raw(gpu_dev);
+            float *ssm_gate_exp = picolm_gpu_ssm_gate_exp(gpu_dev);
+            float *ssm_beta = picolm_gpu_ssm_beta(gpu_dev);
+            float *ssm_output = picolm_gpu_ssm_output(gpu_dev);
+            float *ssm_final_output = picolm_gpu_ssm_final_output(gpu_dev);
+
+            /* A. RMSNorm (same attn_norm as attention layers) */
+            picolm_gpu_rmsnorm_dev(pipe_xb, pipe_x,
+                                    (float *)gw->attn_norm_dev[l],
+                                    dim, c->rms_norm_eps, gpu_dev);
+
+            /* B. attn_qkv projection -> conv1d input */
+            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_qkv,
+                                   ssm_qkv_raw, pipe_xb, 1, gpu_dev);
+
+            /* C. attn_gate_ssm projection -> z-gate */
+            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_gate_ssm,
+                                   ssm_xb2, pipe_xb, 1, gpu_dev);
+
+            float *xb2_use = ssm_xb2;
+            if (ssm_do_remap) {
+                picolm_gpu_ssm_head_permute_dev(ssm_xb2_remap, ssm_xb2,
+                                                 (int *)gw->ssm_head_map_dev,
+                                                 ssm_head_v_dim, ssm_n_v, gpu_dev);
+                xb2_use = ssm_xb2_remap;
+            }
+
+            /* D. Conv1d + state shift */
+            picolm_gpu_ssm_conv1d_dev(ssm_conv_out, (float *)gw->ssm_conv_state_dev[l],
+                                       ssm_qkv_raw, (float *)gw->ssm_conv1d_dev[l],
+                                       ssm_conv_dim, c->ssm_d_conv, gpu_dev);
+
+            /* E. Split into q_conv/k_conv/v_conv */
+            float *q_conv = ssm_conv_out;
+            float *k_conv = ssm_conv_out + ssm_qk_dim;
+            float *v_conv_src = ssm_conv_out + 2 * ssm_qk_dim;
+
+            float *v_conv_use = v_conv_src;
+            if (ssm_do_remap) {
+                picolm_gpu_ssm_head_permute_dev(ssm_v_remap, v_conv_src,
+                                                 (int *)gw->ssm_head_map_dev,
+                                                 ssm_head_v_dim, ssm_n_v, gpu_dev);
+                v_conv_use = ssm_v_remap;
+            }
+
+            /* F. L2 norm of Q/K (per k_head) */
+            picolm_gpu_ssm_l2norm_dev(q_conv, ssm_d_state, ssm_n_k,
+                                       1e-12f, 1.0f / sqrtf((float)ssm_d_state), gpu_dev);
+            picolm_gpu_ssm_l2norm_dev(k_conv, ssm_d_state, ssm_n_k,
+                                       1e-12f, 1.0f, gpu_dev);
+
+            /* G. Alpha/beta vecdot */
+            picolm_gpu_ssm_vecdot_dev(ssm_alpha_raw, pipe_xb,
+                                       gw->ssm_alpha_dev[l], lw->type_ssm_alpha,
+                                       dim, ssm_n_v,
+                                       (int)gguf_type_row_size(lw->type_ssm_alpha, dim),
+                                       (const int *)gw->ssm_head_map_dev, gpu_dev);
+            picolm_gpu_ssm_vecdot_dev(ssm_beta_raw, pipe_xb,
+                                       gw->ssm_beta_dev[l], lw->type_ssm_beta,
+                                       dim, ssm_n_v,
+                                       (int)gguf_type_row_size(lw->type_ssm_beta, dim),
+                                       (const int *)gw->ssm_head_map_dev, gpu_dev);
+
+            /* H. Gate/beta activation */
+            picolm_gpu_ssm_gate_beta_dev(ssm_gate_exp, ssm_beta,
+                                          ssm_alpha_raw, ssm_beta_raw,
+                                          (float *)gw->ssm_a_dev[l],
+                                          (float *)gw->ssm_dt_dev[l], ssm_n_v, gpu_dev);
+
+            /* I. Recurrence */
+            picolm_gpu_ssm_recurrence_pipeline_dev(gw->ssm_state_dev[l],
+                                                    q_conv, k_conv, v_conv_use,
+                                                    ssm_gate_exp, ssm_beta,
+                                                    ssm_output, ssm_n_v, ssm_d_state,
+                                                    ssm_repeat, gpu_dev);
+
+            /* J. Gated normalization */
+            picolm_gpu_ssm_gated_norm_dev(ssm_final_output, ssm_output, xb2_use,
+                                           (float *)gw->ssm_norm_dev[l],
+                                           ssm_do_remap ? (const int *)gw->ssm_head_map_dev : NULL,
+                                           ssm_head_v_dim, ssm_n_v, 1e-12f, gpu_dev);
+
+            /* K. ssm_out projection */
+            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ssm_out,
+                                   pipe_xb, ssm_final_output, 1, gpu_dev);
+
+            /* L. Residual add */
+            picolm_gpu_residual_add(pipe_x, pipe_x, pipe_xb, dim, gpu_dev);
         }
-
-        /* A. RMSNorm: pipe_xb = rmsnorm(pipe_x, attn_norm_w[l]) */
-        picolm_gpu_rmsnorm_dev(pipe_xb, pipe_x,
-                                (float *)gw->attn_norm_dev[l],
-                                dim, c->rms_norm_eps, gpu_dev);
-
-        /* B. Q projection: pipe_q = attn_q @ pipe_xb */
-        picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
-                               pipe_q, pipe_xb, 1, gpu_dev);
-
-        /* C. K projection: pipe_k = attn_k @ pipe_xb */
-        picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_k,
-                               pipe_k, pipe_xb, 1, gpu_dev);
-
-        /* D. V projection: pipe_v = attn_v @ pipe_xb */
-        picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_v,
-                               pipe_v, pipe_xb, 1, gpu_dev);
-
-        /* E. RoPE on Q (in-place): rope(pipe_q, n_heads) */
-        /* RoPE tables for this position on device */
-        float *rope_cos_pos = (float *)gw->rope_cos_dev + (size_t)pos * rope_half;
-        float *rope_sin_pos = (float *)gw->rope_sin_dev + (size_t)pos * rope_half;
-        picolm_gpu_rope_apply(pipe_q, n_heads, head_dim,
-                               rope_cos_pos, rope_sin_pos, rope_half, c->rope_type, gpu_dev);
-
-        /* F. RoPE on K (in-place): rope(pipe_k, n_kv_heads) */
-        picolm_gpu_rope_apply(pipe_k, n_kv_heads, head_dim,
-                               rope_cos_pos, rope_sin_pos, rope_half, c->rope_type, gpu_dev);
-
-        /* G. KV cache store: pack F32 -> F16 and write directly into the
-         * device KV cache, entirely device-to-device. The previous
-         * version of this step did a synchronous D2H of pipe_k/pipe_v,
-         * a CPU F16 conversion, then an H2D via picolm_gpu_kv_store_rows
-         * -- each layer, twice (K and V). picolm_gpu_memcpy is a
-         * blocking gpuMemcpy, so that was also forcing a full device
-         * sync twice per layer (64x per token for a 32-layer model),
-         * which defeated most of the point of this pipeline. This
-         * version never touches the host, so it costs nothing beyond
-         * two tiny kernel launches on ctx->stream.
-         *
-         * Trade-off: s->key_cache/val_cache (the host-side KV mirror)
-         * is NOT updated here anymore. That's fine for the current
-         * eligibility gate (kv_active requires no SSM, decided once at
-         * model load, never changes mid-generation), but if a mid-stream
-         * CPU fallback is ever introduced, it needs a one-time bulk
-         * device->host flush of the whole KV cache first -- not
-         * per-token reconstruction. Not needed today; flagged here so
-         * it isn't a silent trap later. */
-        picolm_gpu_kv_store_dev(1, this_attn_ordinal, pos, pipe_k,
-                                 n_kv_heads, head_dim, seq_len, gpu_dev);
-        picolm_gpu_kv_store_dev(0, this_attn_ordinal, pos, pipe_v,
-                                 n_kv_heads, head_dim, seq_len, gpu_dev);
-        this_attn_ordinal++;
-
-        /* H. Attention decode: pipe_attn_out = attn(pipe_q)
-         * Uses this_attn_ordinal - 1 (already incremented above), the
-         * same compacted index the KV cache was just written at.
-         * Currently always equal to `l` since kv_active requires
-         * has_ssm == 0, but using the raw loop index here would be a
-         * silent landmine if that eligibility gate is ever relaxed to
-         * allow SSM-interleaved models. */
-        picolm_gpu_attention_decode_dev(pipe_attn_out, pipe_q,
-                                         this_attn_ordinal - 1, pos,
-                                         n_heads, n_kv_heads, head_dim,
-                                         seq_len, gpu_dev);
-
-        /* I. Output projection: pipe_xb = attn_output @ pipe_attn_out */
-        picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_output,
-                               pipe_xb, pipe_attn_out, 1, gpu_dev);
-
-        /* J. Residual add: pipe_x += pipe_xb */
         picolm_gpu_residual_add(pipe_x, pipe_x, pipe_xb, dim, gpu_dev);
 
         /* K. FFN: pipe_xb = rmsnorm(pipe_x, post_attn_norm_w[l]) */

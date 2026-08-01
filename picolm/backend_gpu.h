@@ -121,14 +121,15 @@ int picolm_gpu_ssm_vecdot_dev(float *out_dev,
                                const int *head_map_dev,
                                int device);
 
-/* SSM gate/beta activation (Finding 6), device-native: gate_exp[h] =
+/* SSM gate/beta activation (Finding 6), device-native: alpha[h] =
+ * alpha_raw[h] + ssm_dt_w[h] (bias), gate_exp[h] =
  * exp(softplus(alpha[h]) * ssm_a_w[h]) (0 if underflow), beta_out[h] =
- * sigmoid(beta_raw[h]). All pointers device-resident, no H2D/D2H, no
- * sync. Tiny (n_v_heads elements) but closes the loop for a fully
- * device-resident hybrid layer. */
+ * sigmoid(beta_raw[h]) (no bias). All pointers device-resident, no
+ * H2D/D2H, no sync. */
 int picolm_gpu_ssm_gate_beta_dev(float *gate_exp_out_dev, float *beta_out_dev,
                                   const float *alpha_in_dev, const float *beta_raw_in_dev,
-                                  const float *ssm_a_w_dev, int n_v_heads, int device);
+                                  const float *ssm_a_w_dev, const float *ssm_dt_w_dev,
+                                  int n_v_heads, int device);
 
 /* SSM L2 normalization (Q/K per k_head), device-native, in-place.
  * eps must match the CPU reference (1e-12). extra_scale: pass
@@ -438,6 +439,7 @@ size_t picolm_gpu_tensor_bytes(const picolm_gpu_tensor_t *tensor);
 
 /* Get device ordinal for a tensor. */
 int picolm_gpu_tensor_device(const picolm_gpu_tensor_t *tensor);
+const void *picolm_gpu_tensor_weights(const picolm_gpu_tensor_t *tensor); /* device weights ptr */
 
 /* Upload a plain host F32 vector (norm weights, RoPE cos/sin tables) to
  * a new device buffer. Returns device pointer, or NULL on failure. */

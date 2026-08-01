@@ -2205,6 +2205,9 @@ size_t picolm_gpu_tensor_bytes(const picolm_gpu_tensor_t *t) {
 int picolm_gpu_tensor_device(const picolm_gpu_tensor_t *t) {
     return t ? t->device : -1;
 }
+const void *picolm_gpu_tensor_weights(const picolm_gpu_tensor_t *t) {
+    return t ? t->weights : NULL;
+}
 
 /* Upload a plain host F32 vector (norm weights, RoPE cos/sin tables --
  * anything that isn't a quantized matmul weight matrix, so
@@ -2697,21 +2700,25 @@ picolm_gpu_ssm_recurrence_pipeline_dev(void *ssm_state_dev,
 
 /* ---- SSM gate/beta activation (Finding 6) ----
  * Direct port of the CPU reference (ssm_forward, steps 9-11):
+ *   alpha[h]    = alpha_raw[h] + ssm_dt_w[h]   (bias add, easy to miss --
+ *                 caught on a second read-through of the CPU reference;
+ *                 the vecdot output alone is NOT what softplus takes)
  *   gate[h]     = softplus(alpha[h]) * ssm_a_w[h]
  *   gate_exp[h] = (gate[h] < -50) ? 0 : exp(gate[h])
- *   beta_out[h] = sigmoid(beta_raw[h])
+ *   beta_out[h] = sigmoid(beta_raw[h])  (no bias -- confirmed against
+ *                 the CPU reference, beta's vecdot output goes straight
+ *                 into sigmoid)
  * Tiny (n_v_heads elements, e.g. 48) and embarrassingly parallel -- one
- * thread per head, no shared memory or sync needed. Small enough that
- * leaving it host-side costs little, but this closes the loop for a
- * fully device-resident hybrid layer with zero host touches. */
+ * thread per head, no shared memory or sync needed. */
 __global__ void
 picolm_gpu_ssm_gate_beta_kernel(float *gate_exp_out, float *beta_out,
                                  const float *alpha_in, const float *beta_raw_in,
-                                 const float *ssm_a_w, int n_v_heads) {
+                                 const float *ssm_a_w, const float *ssm_dt_w,
+                                 int n_v_heads) {
     int h = (int)gpuBlockIdx_x * gpuBlockDim_x + gpuThreadIdx_x;
     if (h >= n_v_heads) return;
 
-    float a = alpha_in[h];
+    float a = alpha_in[h] + ssm_dt_w[h];
     float sp = (a > 20.0f) ? a : (a < -20.0f) ? expf(a) : logf(1.0f + expf(a));
     float gate = sp * ssm_a_w[h];
     gate_exp_out[h] = (gate < -50.0f) ? 0.0f : expf(gate);
@@ -2724,7 +2731,8 @@ picolm_gpu_ssm_gate_beta_kernel(float *gate_exp_out, float *beta_out,
 extern "C" int
 picolm_gpu_ssm_gate_beta_dev(float *gate_exp_out_dev, float *beta_out_dev,
                               const float *alpha_in_dev, const float *beta_raw_in_dev,
-                              const float *ssm_a_w_dev, int n_v_heads, int device) {
+                              const float *ssm_a_w_dev, const float *ssm_dt_w_dev,
+                              int n_v_heads, int device) {
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
     if (n_v_heads < 1) return 0;
@@ -2733,7 +2741,7 @@ picolm_gpu_ssm_gate_beta_dev(float *gate_exp_out_dev, float *beta_out_dev,
     int n_blocks = (n_v_heads + n_threads - 1) / n_threads;
     picolm_gpu_ssm_gate_beta_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
         gate_exp_out_dev, beta_out_dev, alpha_in_dev, beta_raw_in_dev,
-        ssm_a_w_dev, n_v_heads);
+        ssm_a_w_dev, ssm_dt_w_dev, n_v_heads);
     if (!gpu_ok(gpuGetLastError(), "ssm gate/beta (dev)")) return 0;
     return 1;
 }
