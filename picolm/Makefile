@@ -68,7 +68,7 @@ simd_defines_for = $(strip \
 f16c_flag = $(if $(filter 1,$(call _have_f16c,$(1))),-mf16c,)
 simd_flags_for = $(strip \
   $(if $(filter 1,$(call _have_avx512,$(1))),\
-    -mavx512f -mavx512vl $(call f16c_flag,$(1)) -mbmi2 -mfma,\
+    -mavx512f -mavx512vl -mavx512vnni $(call f16c_flag,$(1)) -mbmi2 -mfma,\
     $(if $(filter 1,$(call _have_avx2,$(1))),\
       -mavx2 -mfma $(call f16c_flag,$(1)) -mbmi2,\
       $(if $(filter 1,$(call _have_avx,$(1))),\

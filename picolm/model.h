@@ -349,9 +349,16 @@ typedef struct {
     float *mm_up_out;
     float *mm_down_out;
 
-    /* Scratch Q8_0 buffer for mm_id down projection */
+    /* Scratch Q8_0 buffer for mm_id down projection (single-token) */
     block_q8_0 *mm_scratch_qx;
     float *mm_scratch_qx_d;
+
+    /* Per-expert down quantization buffers for mm_id batching.
+     * Each expert can have up to n_expert_used tokens assigned.
+     * mm_down_qx_all: [n_expert_used × q8_buf_per_token] — pre-allocated Q8_0 scratch
+     * mm_down_qx_d_all: corresponding deltas */
+    block_q8_0 *mm_down_qx_all;
+    float *mm_down_qx_d_all;
 
     /* Single allocation base */
     void *mem_block;

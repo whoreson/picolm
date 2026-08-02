@@ -1895,6 +1895,14 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
             size_t dnb = c->n_ff_exp / 32;
             sz_moe += gguf_type_row_size(GGUF_TYPE_Q8_0, c->n_ff_exp) + dnb * sizeof(float);
         }
+
+        /* Per-expert down quantization buffers for batched mm_id.
+         * Size: n_expert_used tokens × q8_buf_per_token floats per entry */
+        {
+            size_t q8_per_token = gguf_type_row_size(GGUF_TYPE_Q8_0, c->n_ff_exp) / sizeof(float)
+                                + c->n_ff_exp / 32; /* blocks + deltas */
+            sz_moe += c->n_expert_used * q8_per_token * sizeof(float) * 2; /* qx + qx_d, 2 = aligned padding */
+        }
     }
 
     size_t total = sz_x + sz_xb + sz_xb2 + sz_q +
@@ -2240,6 +2248,16 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
                 s->mm_scratch_qx = (block_q8_0 *)p;
                 p = (float *)((char *)p + gguf_type_row_size(GGUF_TYPE_Q8_0, c->n_ff_exp));
                 s->mm_scratch_qx_d = p; p += dnb;
+            }
+
+            /* Per-expert down quantization buffers for batched mm_id.
+             * Layout: per-expert, per-token Q8_0 buffer with embedded deltas.
+             * Each entry: [q8_data_off floats] + [dnb deltas] — same layout as moe_qx_all.
+             * Total: n_expert_used × q8_buf_per_token floats. */
+            {
+                s->mm_down_qx_all = (block_q8_0 *)p;
+                p += c->n_expert_used * s->moe_q8_buf_per_token;
+                s->mm_down_qx_d_all = NULL; /* not needed, deltas are embedded */
             }
         }
     }
@@ -3517,7 +3535,8 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
             lw->ffn_down_exps,
             (const int *)all_ids, n_experts_per_token,
             n_tokens, n_used, dim, n_ff, n_expert, type,
-            s->mm_scratch_qx, s->mm_scratch_qx_d);
+            s->mm_scratch_qx, s->mm_scratch_qx_d,
+            s->mm_down_qx_all, s->mm_down_qx_d_all, s->moe_q8_buf_per_token);
     }
 
     /* ---- Phase 6: Weighted accumulation in Top-K order ---- */
