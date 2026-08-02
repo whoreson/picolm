@@ -117,6 +117,9 @@ void tensor_init_scratch(float *buf, int size) {
 
 static int n_threads = 1;
 
+int tensor_get_n_threads(void) { return n_threads; }
+void tensor_set_n_threads(int n) { n_threads = n; }
+
 /* ---- Physical core enumeration ---- */
 
 /* ---- big.LITTLE CPU group detection (Linux only) ---- */
@@ -1419,6 +1422,55 @@ static void q4_0_8_8_batch_task(int idx, void *ctxp) {
     vec_dot_q4_0x8_q8_0_avx2(wp, xb, ctx->n, op, nrows);
 }
 #endif
+
+/* matmul_q8: matmul with pre-quantized Q8_0 activation.
+ * qx: pre-quantized input as block_q8_0[], same layout as quantize_row_q8_0 output.
+ * qx_d: pre-converted delta values (fp32) for each Q8_0 block of x.
+ * This avoids re-quantizing x for every call, critical for MoE where x
+ * is projected against 16+ expert weight matrices per layer.
+ * n = input dimension (must be multiple of 32)
+ * d = number of output rows (weight matrix columns) */
+void matmul_q8(float *out, const void *qx, const float *qx_d,
+               const void *W, int n, int d, gguf_type_t qtype) {
+    size_t row_bytes = gguf_type_row_size(qtype, n);
+    const char *wptr = (const char *)W;
+
+    if (qtype == GGUF_TYPE_Q8_0 && n > 0) {
+        /* Use Q8xQ8 dot products with pre-converted deltas */
+        if (n_threads <= 1 || d < 4 || d < matmul_min_rows) {
+            for (int i = 0; i < d; i++) {
+                out[i] = vec_dot_q8_0_q8_0_deltas(qx, qx_d, wptr + (size_t)i * row_bytes, n);
+            }
+            return;
+        }
+
+        /* Threaded dispatch: main thread does task 0, workers do tasks 1..nt-1 */
+        {
+            int nt = pool_total_threads(n_threads);
+            int want = n_threads < nt ? n_threads : nt;
+            int active = pool_assign_rows(0, want, d);
+            for (int t = 0; t < active; t++) {
+                pool_tasks[t].out = out; pool_tasks[t].x = (const float *)qx;
+                pool_tasks[t].x_d = (float *)qx_d; pool_tasks[t].W = wptr;
+                pool_tasks[t].row_bytes = row_bytes; pool_tasks[t].n = n;
+                pool_tasks[t].qtype = GGUF_TYPE_Q8_0;
+                pool_tasks[t].n_batch = 0;
+            }
+            pool_clear_unused(active, nt);
+            pool_init(nt);
+            pool_wake(nt);
+            matmul_worker_f(&pool_tasks[0]);
+            pool_wait(nt);
+        }
+        return;
+    }
+    /* For non-Q8_0 types, fall through to generic vec_dot */
+    if (n_threads <= 1 || d < 4 || d < matmul_min_rows) {
+        for (int i = 0; i < d; i++) {
+            out[i] = vec_dot(wptr + (size_t)i * row_bytes, NULL, n, qtype);
+        }
+    }
+}
 
 void matmul_batch(float *out, const float *x, int n_batch,
                    const void *W, int n, int d, gguf_type_t qtype) {

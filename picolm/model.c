@@ -49,6 +49,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <pthread.h>
 #endif
 
 #if defined(__APPLE__) && defined(__ppc__) && defined(__ALTIVEC__)
@@ -2981,6 +2982,9 @@ static const void *get_expert_slice(const void *base, int expert,
 
 /* MoE forward pass: router + top-K expert selection + SwiGLU per expert + shared expert.
  * Input: x[n_embd], Output: residual[n_embd] (additive to input) */
+/* Optimized MoE forward: pre-quantize x, Q8xQ8 dot products for gate+up,
+ * AVX-512 vectorized accumulation. Sequential expert loop (parallelism
+ * deferred until prefill batching is implemented). */
 static void moe_forward(model_t *m, run_state_t *s, const float *x, float *residual,
                         const layer_weights_t *lw) {
     model_config_t *c = &m->config;
@@ -2992,8 +2996,6 @@ static void moe_forward(model_t *m, run_state_t *s, const float *x, float *resid
     int *ids = s->expert_ids;
     float *weights = s->expert_weights;
     float *moe_out = s->moe_out;
-    float *hb_exp = s->hb_exp;
-    float *hb2_exp = s->hb2_exp;
 
     /* 1. Router: logits = x @ ffn_gate_inp  [n_embd, n_expert] -> [n_expert] */
     matmul(logits, (float *)x, lw->ffn_gate_inp, dim, n_expert, lw->type_ffn_gate_inp);
@@ -3017,24 +3019,20 @@ static void moe_forward(model_t *m, run_state_t *s, const float *x, float *resid
 
     /* 3. Find top-K experts (simple selection sort for small K) */
     {
-        /* Create index array sorted by descending logit value */
-        int idx[256]; /* max n_expert = 256 for qwen35moe */
+        int idx[256];
         for (int i = 0; i < n_expert; i++) idx[i] = i;
-
-        /* Partial selection sort: only sort top-K */
         for (int i = 0; i < n_used; i++) {
             int best = i;
             for (int j = i + 1; j < n_expert; j++) {
                 if (logits[idx[j]] > logits[idx[best]]) best = j;
             }
-            /* Swap */
             { int t = idx[i]; idx[i] = idx[best]; idx[best] = t; }
             ids[i] = idx[i];
             weights[i] = logits[idx[i]];
         }
     }
 
-    /* 3b. Normalize top-K weights by their sum (norm_w=true for qwen35moe) */
+    /* 3b. Normalize top-K weights by their sum */
     {
         float wsum = 0.0f;
         for (int i = 0; i < n_used; i++) wsum += weights[i];
@@ -3045,32 +3043,69 @@ static void moe_forward(model_t *m, run_state_t *s, const float *x, float *resid
     /* 4. Zero accumulator */
     memset(moe_out, 0, dim * sizeof(float));
 
-    /* 5. For each selected expert, compute SwiGLU and weighted add */
-    gguf_type_t type_gate = lw->type_ffn_gate_exps;
-    gguf_type_t type_up = lw->type_ffn_up_exps;
-    gguf_type_t type_down = lw->type_ffn_down_exps;
+    /* 5. Pre-quantize input x to Q8_0 ONCE (Phase A + D).
+     * All expert gate+up projections reuse this quantized buffer via matmul_q8,
+     * saving 16 redundant quantizations per MoE layer. */
+    {
+        size_t q8_row_size = gguf_type_row_size(GGUF_TYPE_Q8_0, dim);
+        size_t nb = dim / 32;
+        size_t buf_size = q8_row_size + nb * sizeof(float);
+        float *qx_buf = (float *)malloc(buf_size);
+        if (!qx_buf) return;
 
-    for (int i = 0; i < n_used; i++) {
-        int eid = ids[i];
-        float w_i = weights[i];
+        block_q8_0 *qx = (block_q8_0 *)qx_buf;
+        quantize_row_q8_0(x, qx, dim);
 
-        const void *gate_w = get_expert_slice(lw->ffn_gate_exps, eid, dim, n_ff, type_gate);
-        const void *up_w = get_expert_slice(lw->ffn_up_exps, eid, dim, n_ff, type_up);
-        const void *down_w = get_expert_slice(lw->ffn_down_exps, eid, n_ff, dim, type_down);
-
-        /* SwiGLU: gate = silu(x @ gate_w), up = x @ up_w */
-        matmul(hb_exp, (float *)x, gate_w, dim, n_ff, type_gate);
-        matmul(hb2_exp, (float *)x, up_w, dim, n_ff, type_up);
-        silu(hb_exp, n_ff);
-        elemwise_mul(hb_exp, hb_exp, hb2_exp, n_ff);
-
-        /* Down projection: out = hb_exp @ down_w (use xb2 as scratch, not s->xb which is input) */
-        matmul(s->xb2, hb_exp, down_w, n_ff, dim, type_down);
-
-        /* Weighted accumulate */
-        for (int d = 0; d < dim; d++) {
-            moe_out[d] += w_i * s->xb2[d];
+        float *qx_d = qx_buf + (q8_row_size / sizeof(float));
+        for (size_t bi = 0; bi < nb; bi++) {
+            qx_d[bi] = fp16_to_fp32(qx[bi].d);
         }
+
+        gguf_type_t type_gate = lw->type_ffn_gate_exps;
+        gguf_type_t type_up = lw->type_ffn_up_exps;
+        gguf_type_t type_down = lw->type_ffn_down_exps;
+
+        float *hb_exp = s->hb_exp;
+        float *hb2_exp = s->hb2_exp;
+        float *xb2_exp = s->xb2;
+
+        /* Sequential expert computation with pre-quantized x (Phase A + D).
+         * Each expert's gate+up reuse the Q8_0 quantized activation via matmul_q8. */
+        for (int i = 0; i < n_used; i++) {
+            int eid = ids[i];
+            float w_i = weights[i];
+
+            const void *gate_w = get_expert_slice(lw->ffn_gate_exps, eid, dim, n_ff, type_gate);
+            const void *up_w = get_expert_slice(lw->ffn_up_exps, eid, dim, n_ff, type_up);
+            const void *down_w = get_expert_slice(lw->ffn_down_exps, eid, n_ff, dim, type_down);
+
+            matmul_q8(hb_exp, qx, qx_d, gate_w, dim, n_ff, type_gate);
+            matmul_q8(hb2_exp, qx, qx_d, up_w, dim, n_ff, type_up);
+
+            silu(hb_exp, n_ff);
+            elemwise_mul(hb_exp, hb_exp, hb2_exp, n_ff);
+            matmul(xb2_exp, hb_exp, down_w, n_ff, dim, type_down);
+
+#ifdef PICOLM_AVX512
+            {
+                __m512 bw = _mm512_set1_ps(w_i);
+                int di = 0;
+                for (; di + 15 < dim; di += 16) {
+                    __m512 v0 = _mm512_loadu_ps(moe_out + di);
+                    __m512 v1 = _mm512_loadu_ps(xb2_exp + di);
+                    __m512 v2 = _mm512_loadu_ps(moe_out + di + 8);
+                    __m512 v3 = _mm512_loadu_ps(xb2_exp + di + 8);
+                    _mm512_storeu_ps(moe_out + di, _mm512_add_ps(v0, _mm512_mul_ps(bw, v1)));
+                    _mm512_storeu_ps(moe_out + di + 8, _mm512_add_ps(v2, _mm512_mul_ps(bw, v3)));
+                }
+                for (; di < dim; di++) moe_out[di] += w_i * xb2_exp[di];
+            }
+#else
+            for (int d = 0; d < dim; d++) moe_out[d] += w_i * xb2_exp[d];
+#endif
+        }
+
+        free(qx_buf);
     }
 
     /* 6. Shared expert (always computed) */
@@ -3078,7 +3113,6 @@ static void moe_forward(model_t *m, run_state_t *s, const float *x, float *resid
     matmul(s->hb2, (float *)x, lw->ffn_up_shexp, dim, c->n_ff_shexp, lw->type_ffn_up_shexp);
     silu(s->hb, c->n_ff_shexp);
     elemwise_mul(s->hb, s->hb, s->hb2, c->n_ff_shexp);
-    /* Use xb2 for down projection (xb may alias input x) */
     matmul(s->xb2, s->hb, lw->ffn_down_shexp, c->n_ff_shexp, dim, lw->type_ffn_down_shexp);
 
     /* Shared expert sigmoid gate: sigmoid(x @ ffn_gate_inp_shexp) */

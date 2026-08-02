@@ -30,6 +30,8 @@ int  tensor_get_threads(void);
 int tensor_default_threads(void);
 int tensor_get_big_cores(void);
 void tensor_threadpool_init(int n_threads);
+int tensor_get_n_threads(void);
+void tensor_set_n_threads(int n);
 void tensor_threadpool_free(void);
 void matmul_batch(float *out, const float *x, int n_batch,
                    const void *W, int n, int d, gguf_type_t qtype);
@@ -48,6 +50,11 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
  * W is quantized in the given type, stored row-major.
  * Uses fused dequant+dot (no scratch buffer) and optional threading. */
 void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t qtype);
+
+/* matmul_q8: matmul with pre-quantized Q8_0 activation.
+ * qx = pre-quantized input (block_q8_0 array), qx_d = pre-converted deltas. */
+extern void matmul_q8(float *out, const void *qx, const float *qx_d,
+                      const void *W, int n, int d, gguf_type_t qtype);
 
 /* RMS normalization: out[i] = x[i] / sqrt(mean(x^2) + eps) * weight[i] */
 void rmsnorm(float *out, const float *x, const float *weight, int size, float eps);
