@@ -3176,6 +3176,174 @@ static void moe_forward(model_t *m, run_state_t *s, const float *x, float *resid
     }
 }
 
+/* moe_forward_batch: process multiple tokens through MoE simultaneously.
+ * x_batch: input [n_tokens * dim] with stride dim
+ * residual_batch: output [n_tokens * dim] with stride dim
+ * All tokens share the same expert assignments (simplification for prefill).
+ * In practice, each token may select different experts, but for prefill we
+ * process each token's routing + experts independently, just sharing the
+ * quantized buffer across tokens. */
+static void moe_forward_batch(model_t *m, run_state_t *s,
+                              const float *x_batch, float *residual_batch,
+                              int n_tokens, const layer_weights_t *lw) {
+    model_config_t *c = &m->config;
+    int dim = c->n_embd;
+    int n_ff = c->n_ff_exp;
+    int n_expert = c->n_expert;
+    int n_used = c->n_expert_used;
+    float *moe_out = s->moe_out;
+    float *hb_exp = s->hb_exp;
+    float *hb2_exp = s->hb2_exp;
+    float *xb2_exp = s->xb2;
+
+    int saved_threads = tensor_get_n_threads();
+    tensor_set_n_threads(1);
+
+    gguf_type_t type_gate = lw->type_ffn_gate_exps;
+    gguf_type_t type_up = lw->type_ffn_up_exps;
+    gguf_type_t type_down = lw->type_ffn_down_exps;
+
+    for (int t = 0; t < n_tokens; t++) {
+        const float *x = x_batch + t * dim;
+        float *residual = residual_batch + t * dim;
+
+        /* 1. Router: x @ ffn_gate_inp → logits */
+        matmul(s->expert_logits, x, lw->ffn_gate_inp, dim, n_expert, lw->type_ffn_gate_inp);
+
+        /* 2. Softmax + shared expert gate */
+        {
+            float *logits = s->expert_logits;
+            float max_l = logits[0];
+            for (int i = 1; i < n_expert; i++) {
+                if (logits[i] > max_l) max_l = logits[i];
+            }
+            float sum = 0.0f;
+            for (int i = 0; i < n_expert; i++) {
+                logits[i] = expf(logits[i] - max_l);
+                sum += logits[i];
+            }
+            float inv_sum = (sum > 0.0f) ? 1.0f / sum : 0.0f;
+            for (int i = 0; i < n_expert; i++) logits[i] *= inv_sum;
+        }
+
+        /* 3. Top-K selection */
+        {
+            int *ids = s->expert_ids;
+            float *weights = s->expert_weights;
+            float *logits = s->expert_logits;
+            int idx[256];
+            for (int i = 0; i < n_expert; i++) idx[i] = i;
+            for (int i = 0; i < n_used; i++) {
+                int best = i;
+                for (int j = i + 1; j < n_expert; j++) {
+                    if (logits[idx[j]] > logits[idx[best]]) best = j;
+                }
+                { int tmp = idx[i]; idx[i] = idx[best]; idx[best] = tmp; }
+                ids[i] = idx[i];
+                weights[i] = logits[idx[i]];
+            }
+            float wsum = 0.0f;
+            for (int i = 0; i < n_used; i++) wsum += weights[i];
+            float inv_wsum = (wsum > 0.0f) ? 1.0f / wsum : 0.0f;
+            for (int i = 0; i < n_used; i++) weights[i] *= inv_wsum;
+        }
+
+        /* 4. Zero accumulator */
+        memset(moe_out, 0, dim * sizeof(float));
+
+        /* 5. Experts: gate+up (Q8×Q8) + SwiGLU + down (Q8×Q8) */
+        {
+            size_t nb = dim / 32;
+            block_q8_0 *qx = s->shared_qx;
+            float *qx_d = s->shared_qx_d;
+            quantize_row_q8_0(x, qx, dim);
+            for (size_t bi = 0; bi < nb; bi++) {
+                qx_d[bi] = fp16_to_fp32(qx[bi].d);
+            }
+
+            int *ids = s->expert_ids;
+            float *weights = s->expert_weights;
+
+            for (int i = 0; i < n_used; i++) {
+                int eid = ids[i];
+                float w_i = weights[i];
+
+                const void *gate_w = get_expert_slice(lw->ffn_gate_exps, eid, dim, n_ff, type_gate);
+                const void *up_w = get_expert_slice(lw->ffn_up_exps, eid, dim, n_ff, type_up);
+                const void *down_w = get_expert_slice(lw->ffn_down_exps, eid, n_ff, dim, type_down);
+
+                matmul_q8(hb_exp, qx, qx_d, gate_w, dim, n_ff, type_gate);
+                matmul_q8(hb2_exp, qx, qx_d, up_w, dim, n_ff, type_up);
+
+                silu(hb_exp, n_ff);
+                elemwise_mul(hb_exp, hb_exp, hb2_exp, n_ff);
+
+                /* Q8×Q8 down */
+                {
+                    size_t dnb = n_ff / 32;
+                    quantize_row_q8_0(hb_exp, s->down_qx, n_ff);
+                    for (size_t bi = 0; bi < dnb; bi++) {
+                        s->down_qx_d[bi] = fp16_to_fp32(s->down_qx[bi].d);
+                    }
+                    matmul_q8(xb2_exp, s->down_qx, s->down_qx_d, down_w, n_ff, dim, type_down);
+                }
+
+#ifdef PICOLM_AVX512
+                {
+                    __m512 bw = _mm512_set1_ps(w_i);
+                    int di = 0;
+                    for (; di + 15 < dim; di += 16) {
+                        __m512 v0 = _mm512_loadu_ps(moe_out + di);
+                        __m512 v1 = _mm512_loadu_ps(xb2_exp + di);
+                        __m512 v2 = _mm512_loadu_ps(moe_out + di + 8);
+                        __m512 v3 = _mm512_loadu_ps(xb2_exp + di + 8);
+                        _mm512_storeu_ps(moe_out + di, _mm512_add_ps(v0, _mm512_mul_ps(bw, v1)));
+                        _mm512_storeu_ps(moe_out + di + 8, _mm512_add_ps(v2, _mm512_mul_ps(bw, v3)));
+                    }
+                    for (; di < dim; di++) moe_out[di] += w_i * xb2_exp[di];
+                }
+#else
+                for (int d = 0; d < dim; d++) moe_out[d] += w_i * xb2_exp[d];
+#endif
+            }
+        }
+
+        /* 6. Shared expert — Q8×Q8 */
+        {
+            size_t nb = dim / 32;
+            quantize_row_q8_0(x, s->shared_qx, dim);
+            for (size_t bi = 0; bi < nb; bi++) {
+                s->shared_qx_d[bi] = fp16_to_fp32(s->shared_qx[bi].d);
+            }
+            matmul_q8(s->hb, s->shared_qx, s->shared_qx_d, lw->ffn_gate_shexp, dim, c->n_ff_shexp, lw->type_ffn_gate_shexp);
+            matmul_q8(s->hb2, s->shared_qx, s->shared_qx_d, lw->ffn_up_shexp, dim, c->n_ff_shexp, lw->type_ffn_up_shexp);
+            silu(s->hb, c->n_ff_shexp);
+            elemwise_mul(s->hb, s->hb, s->hb2, c->n_ff_shexp);
+            {
+                size_t dnb = c->n_ff_shexp / 32;
+                quantize_row_q8_0(s->hb, s->shared_down_qx, c->n_ff_shexp);
+                for (size_t bi = 0; bi < dnb; bi++) {
+                    s->shared_down_qx_d[bi] = fp16_to_fp32(s->shared_down_qx[bi].d);
+                }
+                matmul_q8(s->xb2, s->shared_down_qx, s->shared_down_qx_d, lw->ffn_down_shexp, c->n_ff_shexp, dim, lw->type_ffn_down_shexp);
+            }
+        }
+
+        /* Shared expert sigmoid gate */
+        {
+            float gate_val;
+            matmul(&gate_val, x, lw->ffn_gate_inp_shexp, dim, 1, GGUF_TYPE_F32);
+            gate_val = 1.0f / (1.0f + expf(-gate_val));
+            for (int d = 0; d < dim; d++) s->xb2[d] *= gate_val;
+        }
+
+        /* 7. Combine */
+        for (int d = 0; d < dim; d++) residual[d] = moe_out[d] + s->xb2[d];
+    }
+
+    tensor_set_n_threads(saved_threads);
+}
+
 float *model_forward_gemma3n(model_t *m, int token, int pos);
 
 float *model_forward(model_t *m, int token, int pos) {
@@ -7419,11 +7587,12 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
 
     /* 11. Batched FFN (if present) */
     if (c->has_moe) {
-        /* MoE: per-token for now (batched MoE optimization deferred) */
         for (bi = 0; bi < n_tokens; bi++) {
             rmsnorm(ssm_xb + bi * dim, x_batch + bi * dim, s->post_attn_norm_w[l], dim, eps);
-            moe_forward(m, s, ssm_xb + bi * dim, s->xb, lw);
-            float *a = x_batch + bi * dim, *b = s->xb;
+        }
+        moe_forward_batch(m, s, ssm_xb, xb2_batch, n_tokens, lw);
+        for (bi = 0; bi < n_tokens; bi++) {
+            float *a = x_batch + bi * dim, *b = xb2_batch + bi * dim;
             for (int d = 0; d < dim; d++) a[d] += b[d];
         }
     } else if (lw->ffn_gate && lw->ffn_up && lw->ffn_down) {
@@ -7862,11 +8031,12 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 
         /* FFN (MoE or dense) */
         if (c->has_moe) {
-            /* MoE: per-token for now */
             for (bi = 0; bi < n_tokens; bi++) {
                 rmsnorm(xb_batch + bi * dim, x_batch + bi * dim, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
-                moe_forward(m, s, xb_batch + bi * dim, s->xb, lw);
-                float *a = x_batch + bi * dim, *b = s->xb;
+            }
+            moe_forward_batch(m, s, xb_batch, xb2_batch, n_tokens, lw);
+            for (bi = 0; bi < n_tokens; bi++) {
+                float *a = x_batch + bi * dim, *b = xb2_batch + bi * dim;
                 for (int d2 = 0; d2 < dim; d2++) a[d2] += b[d2];
             }
         } else {
