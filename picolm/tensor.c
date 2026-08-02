@@ -127,7 +127,7 @@ void tensor_set_n_threads(int n) { n_threads = n; }
 #ifndef _WIN32
 
 typedef struct {
-    int ids[32];        /* CPU logical IDs in this group */
+    int ids[256];        /* CPU logical IDs in this group */
     int nids;           /* number of IDs */
     uint32_t min_freq;  /* kHz (cpufreq units) */
     uint32_t max_freq;  /* kHz */
@@ -164,7 +164,7 @@ static int detect_cpu_groups(cpu_group_t groups[], int max_groups) {
                 char buf[256] = {0};
                 if (fgets(buf, sizeof(buf), f)) {
                     char *tok = strtok(buf, ", \t\n");
-                    while (tok && g->nids < 32) {
+                    while (tok && g->nids < 256) {
                         g->ids[g->nids++] = atoi(tok);
                         tok = strtok(NULL, ", \t\n");
                     }
@@ -206,7 +206,7 @@ static int detect_cpu_groups(cpu_group_t groups[], int max_groups) {
         if (merged > 0 && groups[merged-1].max_freq == groups[i].max_freq) {
             cpu_group_t *prev = &groups[merged-1];
             for (int k = 0; k < groups[i].nids; k++) {
-                if (prev->nids < 32) prev->ids[prev->nids++] = groups[i].ids[k];
+                if (prev->nids < 256) prev->ids[prev->nids++] = groups[i].ids[k];
             }
             if (groups[i].min_freq < prev->min_freq) prev->min_freq = groups[i].min_freq;
         } else {
@@ -305,14 +305,20 @@ int tensor_default_threads(void) {
 
 #ifndef _WIN32
     /* Try to detect big.LITTLE groups. If found, prefer big cores only. */
-    cpu_group_t groups[8];
-    int ng = detect_cpu_groups(groups, 8);
+    cpu_group_t groups[256];
+    int ng = detect_cpu_groups(groups, 256);
     if (ng >= 2) {
         /* Multiple groups detected: use only the fastest (last group = big cores) */
         int big_cores = groups[ng - 1].nids;
         fprintf(stderr, "CPU: detected %d groups, using %d big cores (skipping %d little)\n",
                 ng, big_cores, cores - big_cores);
         cores = big_cores;
+        /* Cap default threads on big.LITTLE to avoid over-subscription on decode
+         * workloads. The thread pool's broadcast-wait model has O(n_threads)
+         * overhead per matmul. For decode (S=1), each layer has ~8 matmuls
+         * with 4096-14336 output rows. Empirical sweet spot: 4-8 threads.
+         * Users who need more threads for prefill can use -j explicitly. */
+        if (cores > 6) cores = 6;
     }
 #endif
 
@@ -327,8 +333,8 @@ int tensor_get_big_cores(void) {
     int cores = count_physical_cores();
     return (cores > 0) ? cores : 0;
 #else
-    cpu_group_t groups[8];
-    int ng = detect_cpu_groups(groups, 8);
+    cpu_group_t groups[256];
+    int ng = detect_cpu_groups(groups, 256);
     if (ng >= 2) {
         return groups[ng - 1].nids;
     }
