@@ -354,11 +354,16 @@ typedef struct {
     float *mm_scratch_qx_d;
 
     /* Per-expert down quantization buffers for mm_id batching.
-     * Each expert can have up to n_expert_used tokens assigned.
-     * mm_down_qx_all: [n_expert_used × q8_buf_per_token] — pre-allocated Q8_0 scratch
-     * mm_down_qx_d_all: corresponding deltas */
+     * mm_down_qx_all: per-thread × per-token Q8_0 scratch for parallel expert dispatch
+     * mm_down_qx_d_all: NULL (deltas embedded in Q8_0 buffer) */
     block_q8_0 *mm_down_qx_all;
     float *mm_down_qx_d_all;
+
+    /* Precomputed routing map for mm_id dispatch.
+     * expert_assignments: [n_expert × max_tokens] packed (token << 8 | slot)
+     * expert_counts: [n_expert] number of assigned tokens per expert */
+    int *expert_assignments;
+    int *expert_counts;
 
     /* Single allocation base */
     void *mem_block;

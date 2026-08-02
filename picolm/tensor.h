@@ -66,23 +66,22 @@ extern void matmul_q8_batch(float *out, const float *qx_all, int qx_d_off,
                             int n, int d, int n_batch, gguf_type_t qtype);
 
 /* matmul_mm_id_gate_up: MoE gate+up projections via mm_id pattern.
- * Processes all expert×token combinations in a single expert-centric sweep.
+ * Uses precomputed routing map to avoid O(experts × tokens) scanning.
  * gate_out, up_out: [n_tokens * n_used * n_ff] output buffers */
 extern void matmul_mm_id_gate_up(float *gate_out, float *up_out,
     const float *qx_all, int qx_d_off, int q8_buf_per_token,
     const void *gate_w_base, const void *up_w_base,
-    const int *ids, const int *n_experts_per_token,
+    const int *expert_assignments, const int *expert_counts,
     int n_tokens, int n_used, int dim, int n_ff, int n_expert,
     gguf_type_t type);
 
 /* matmul_mm_id_down: MoE down projection via mm_id pattern.
- * expert_out: [n_tokens * n_used * n_ff] SwiGLU inputs per token per slot
- * down_out: [n_tokens * n_used * dim] down projection results
- * exp_down_qx_all/d_all: per-expert batched Q8_0 quantization buffers
- * q8_per_token: size of each Q8_0 buffer in floats */
+ * Uses precomputed routing map.
+ * exp_down_qx_all: per-thread × per-token Q8_0 quantization buffer
+ * q8_per_token: size of each Q8_0 entry in floats */
 extern void matmul_mm_id_down(float *down_out,
     const float *expert_out, const void *down_w_base,
-    const int *ids, const int *n_experts_per_token,
+    const int *expert_assignments, const int *expert_counts,
     int n_tokens, int n_used, int dim, int n_ff, int n_expert,
     gguf_type_t type, block_q8_0 *scratch_qx, float *scratch_qx_d,
     block_q8_0 *exp_down_qx_all, float *exp_down_qx_d_all, int q8_per_token);

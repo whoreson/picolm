@@ -1824,7 +1824,7 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
     /* MoE buffers */
     size_t sz_moe = 0;
     if (c->has_moe) {
-        sz_moe += (size_t)c->n_expert * sizeof(float);       /* expert_logits */
+        sz_moe += (size_t)c->n_expert * c->max_seq_len * sizeof(float);       /* expert_logits (batched) */
         sz_moe += (size_t)c->n_expert_used * sizeof(int);    /* expert_ids */
         sz_moe += (size_t)c->n_expert_used * sizeof(float);  /* expert_weights */
         sz_moe += (size_t)c->n_embd * sizeof(float);         /* moe_out */
@@ -1902,6 +1902,18 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
             size_t q8_per_token = gguf_type_row_size(GGUF_TYPE_Q8_0, c->n_ff_exp) / sizeof(float)
                                 + c->n_ff_exp / 32; /* blocks + deltas */
             sz_moe += c->n_expert_used * q8_per_token * sizeof(float) * 2; /* qx + qx_d, 2 = aligned padding */
+        }
+
+        /* Precomputed routing map: expert_assignments + expert_counts */
+        sz_moe += (size_t)c->n_expert * c->max_seq_len * sizeof(int);
+        sz_moe += (size_t)c->n_expert * sizeof(int);
+
+        /* Per-thread mm_down_qx_all: MAX_THREADS × 256 × down_q8_per_token */
+        {
+            size_t down_q8_rb = c->n_ff_exp / 32;
+            size_t down_q8_data_off = (down_q8_rb * sizeof(block_q8_0) + sizeof(float) - 1) / sizeof(float);
+            size_t down_q8_per_token = down_q8_data_off + down_q8_rb;
+            sz_moe += (size_t)16 * 256 * down_q8_per_token; /* MAX_THREADS × 256 max tokens per expert */
         }
     }
 
@@ -2172,7 +2184,7 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
 
     /* MoE buffer carving */
     if (c->has_moe) {
-        s->expert_logits = p; p += c->n_expert;
+        s->expert_logits = p; p += (size_t)c->n_expert * c->max_seq_len;
         /* Align int pointer to float boundary */
         s->expert_ids = (int *)((uint8_t *)p);
         p += (c->n_expert_used * sizeof(int) + sizeof(float) - 1) / sizeof(float);
@@ -2251,13 +2263,27 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
             }
 
             /* Per-expert down quantization buffers for batched mm_id.
-             * Layout: per-expert, per-token Q8_0 buffer with embedded deltas.
-             * Each entry: [q8_data_off floats] + [dnb deltas] — same layout as moe_qx_all.
-             * Total: n_expert_used × q8_buf_per_token floats. */
+             * Layout: per-thread × per-token Q8_0 buffer with embedded deltas.
+             * Each entry is for n_ff_exp (not n_embd) since we quantize SwiGLU output.
+             * Total: MAX_THREADS × 256 (max tokens per expert) × down_q8_per_token floats. */
             {
+                int n_threads_max = MAX_THREADS;
+                size_t down_q8_rb = c->n_ff_exp / 32;
+                size_t down_q8_data_off = (down_q8_rb * sizeof(block_q8_0) + sizeof(float) - 1) / sizeof(float);
+                size_t down_q8_per_token = down_q8_data_off + down_q8_rb;
+                size_t per_thread_buf = (size_t)n_threads_max * 256 * down_q8_per_token;
                 s->mm_down_qx_all = (block_q8_0 *)p;
-                p += c->n_expert_used * s->moe_q8_buf_per_token;
+                p += per_thread_buf;
                 s->mm_down_qx_d_all = NULL; /* not needed, deltas are embedded */
+            }
+
+            /* Precomputed routing map: expert_assignments[eid * n_tokens + a] = packed (t << 8 | slot)
+             * expert_counts[eid] = number of assigned tokens. */
+            {
+                s->expert_assignments = (int *)p;
+                p += (size_t)c->n_expert * c->max_seq_len * sizeof(int);
+                s->expert_counts = (int *)p;
+                p += (size_t)c->n_expert * sizeof(int);
             }
         }
     }
@@ -3424,6 +3450,12 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
     int n_expert = c->n_expert;
     int n_used = c->n_expert_used;
 
+    /* Single-token fast path: use moe_forward directly */
+    if (n_tokens == 1) {
+        moe_forward(m, s, (const float *)x_batch, residual_batch, lw);
+        return;
+    }
+
     int saved_threads = tensor_get_n_threads();
     tensor_set_n_threads(1);
 
@@ -3509,13 +3541,28 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
         }
     }
 
+    /* ---- Phase 2b: Precompute routing map for mm_id dispatch ---- */
+    /* expert_assignments[eid * n_tokens + a] = packed (token << 8 | slot) */
+    {
+        memset(s->expert_counts, 0, n_expert * sizeof(int));
+        for (int t = 0; t < n_tokens; t++) {
+            int n_tok_experts = n_experts_per_token[t];
+            for (int sl = 0; sl < n_tok_experts; sl++) {
+                int eid = all_ids[t][sl];
+                int idx = s->expert_counts[eid];
+                s->expert_assignments[eid * n_tokens + idx] = (t << 8) | sl;
+                s->expert_counts[eid]++;
+            }
+        }
+    }
+
     /* ---- Phase 3: mm_id gate+up projections ---- */
     {
         gguf_type_t type = lw->type_ffn_gate_exps;
         matmul_mm_id_gate_up(mm_gate_out, mm_up_out,
             qx_all, qx_d_off, q8_buf_per_token,
             lw->ffn_gate_exps, lw->ffn_up_exps,
-            (const int *)all_ids, n_experts_per_token,
+            s->expert_assignments, s->expert_counts,
             n_tokens, n_used, dim, n_ff, n_expert, type);
     }
 
@@ -3536,7 +3583,7 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
         gguf_type_t type = lw->type_ffn_down_exps;
         matmul_mm_id_down(mm_down_out, mm_gate_out,
             lw->ffn_down_exps,
-            (const int *)all_ids, n_experts_per_token,
+            s->expert_assignments, s->expert_counts,
             n_tokens, n_used, dim, n_ff, n_expert, type,
             s->mm_scratch_qx, s->mm_scratch_qx_d,
             s->mm_down_qx_all, s->mm_down_qx_d_all, s->moe_q8_buf_per_token);

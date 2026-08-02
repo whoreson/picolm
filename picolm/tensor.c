@@ -1550,11 +1550,18 @@ void matmul_q8_batch(float *out, const float *qx_all, int qx_d_off,
  * Worker functions are declared at file scope for C compliance.
  * ================================================================ */
 
+/* Precomputed routing map: for each expert, list of (token_id << 8 | slot) entries.
+ * Using packed token+slot to save space. expert_counts[e] tells how many entries. */
+#define MOE_ROUTE_PACK(t, s)  ((t) << 8 | (s))
+#define MOE_ROUTE_TOKEN(v)    ((v) >> 8)
+#define MOE_ROUTE_SLOT(v)     ((v) & 0xff)
+
 typedef struct {
     float *gate_out; float *up_out;
     const float *qx_all; int qx_d_off; int q8_buf_per_token;
     const void *gate_w_base; const void *up_w_base;
-    const int *ids; const int *n_experts_per_token;
+    const int *expert_assignments; /* [n_expert][n_tokens] packed token+slot */
+    const int *expert_counts;      /* [n_expert] number of assigned tokens */
     int n_tokens; int n_used; int dim; int n_ff; int n_expert;
     gguf_type_t type;
     size_t row_bytes;
@@ -1564,7 +1571,8 @@ typedef struct {
     float *down_out;
     const float *expert_out;
     const void *down_w_base;
-    const int *ids; const int *n_experts_per_token;
+    const int *expert_assignments;
+    const int *expert_counts;
     int n_tokens; int n_used; int dim; int n_ff; int n_expert;
     gguf_type_t type;
     size_t row_bytes; size_t dnb; size_t qx_d_off;
@@ -1594,7 +1602,7 @@ static void mm_id_down_expert_task(int idx, void *ctxp);
 void matmul_mm_id_gate_up(float *gate_out, float *up_out,
     const float *qx_all, int qx_d_off, int q8_buf_per_token,
     const void *gate_w_base, const void *up_w_base,
-    const int *ids, const int *n_experts_per_token,
+    const int *expert_assignments, const int *expert_counts,
     int n_tokens, int n_used, int dim, int n_ff, int n_expert,
     gguf_type_t type) {
 
@@ -1602,8 +1610,26 @@ void matmul_mm_id_gate_up(float *gate_out, float *up_out,
 
     size_t row_bytes = gguf_type_row_size(type, dim);
 
+    /* Count active experts — only dispatch those with >0 assigned tokens */
+    int active_eids[256];
+    int n_active = 0;
+    for (int eid = 0; eid < n_expert; eid++) {
+        if (expert_counts[eid] > 0) active_eids[n_active++] = eid;
+    }
+
+    /* Use sequential path for small batches (dispatch overhead > benefit) */
+    if (n_active < 8 || n_tokens <= 2) {
+        for (int i = 0; i < n_active; i++) {
+            mm_id_gate_expert_task(active_eids[i],
+                (void *)&(mm_id_gate_ctx_t){ gate_out, up_out, qx_all, qx_d_off, q8_buf_per_token,
+                    gate_w_base, up_w_base, expert_assignments, expert_counts,
+                    n_tokens, n_used, dim, n_ff, n_expert, type, row_bytes });
+        }
+        return;
+    }
+
     mm_id_gate_ctx_t ctx = { gate_out, up_out, qx_all, qx_d_off, q8_buf_per_token,
-        gate_w_base, up_w_base, ids, n_experts_per_token,
+        gate_w_base, up_w_base, expert_assignments, expert_counts,
         n_tokens, n_used, dim, n_ff, n_expert, type, row_bytes };
 
     tensor_parallel_for(n_expert, mm_id_gate_expert_task, &ctx);
@@ -1623,7 +1649,7 @@ void matmul_mm_id_gate_up(float *gate_out, float *up_out,
 void matmul_mm_id_down(float *down_out,
     const float *expert_out, /* [n_tokens * n_used * n_ff] */
     const void *down_w_base,
-    const int *ids, const int *n_experts_per_token,
+    const int *expert_assignments, const int *expert_counts,
     int n_tokens, int n_used, int dim, int n_ff, int n_expert,
     gguf_type_t type,
     /* Scratch buffers */
@@ -1644,7 +1670,7 @@ void matmul_mm_id_down(float *down_out,
     size_t qx_d_off = (q8_rb * sizeof(block_q8_0) + sizeof(float) - 1) / sizeof(float);
 
     mm_id_down_ctx_t ctx = { down_out, expert_out, down_w_base,
-        ids, n_experts_per_token, n_tokens, n_used, dim, n_ff, n_expert,
+        expert_assignments, expert_counts, n_tokens, n_used, dim, n_ff, n_expert,
         type, row_bytes, dnb, qx_d_off,
         scratch_qx, scratch_qx_d, exp_down_qx_all, q8_per_token, MAX_THREADS };
 
@@ -1659,33 +1685,23 @@ static void mm_id_gate_expert_task(int idx, void *ctxp) {
     mm_id_gate_ctx_t *c = (mm_id_gate_ctx_t *)ctxp;
     int eid = idx;
 
-    int assigned[64];
-    int n_assigned = 0;
-    int slots[64];
-
-    for (int t = 0; t < c->n_tokens; t++) {
-        int n_tok_experts = c->n_experts_per_token[t];
-        for (int s = 0; s < n_tok_experts; s++) {
-            if (c->ids[t * c->n_used + s] == eid) {
-                assigned[n_assigned++] = t;
-                break;
-            }
-        }
-        if (n_assigned >= 64) break;
-    }
+    /* Use precomputed routing map — no scanning needed */
+    int n_assigned = c->expert_counts[eid];
     if (n_assigned == 0) return;
+
+    const int *assignments = c->expert_assignments + eid * c->n_tokens;
+
+    int assigned[256]; /* max tokens that can select one expert */
+    int slots[256];
+    int n_useful = n_assigned < 256 ? n_assigned : 256;
+    for (int a = 0; a < n_useful; a++) {
+        assigned[a] = MOE_ROUTE_TOKEN(assignments[a]);
+        slots[a] = MOE_ROUTE_SLOT(assignments[a]);
+    }
+    n_assigned = n_useful;
 
     const char *gate_exp = (const char *)c->gate_w_base + (size_t)eid * c->n_ff * c->row_bytes;
     const char *up_exp = (const char *)c->up_w_base + (size_t)eid * c->n_ff * c->row_bytes;
-
-    for (int a = 0; a < n_assigned; a++) {
-        int t = assigned[a];
-        int slot = 0;
-        for (int s = 0; s < c->n_used; s++) {
-            if (c->ids[t * c->n_used + s] == eid) { slot = s; break; }
-        }
-        slots[a] = slot;
-    }
 
 #ifdef PICOLM_AVX512
     int n_batch4 = (n_assigned / 4) * 4;
@@ -1751,37 +1767,32 @@ static void mm_id_down_expert_task(int idx, void *ctxp) {
     mm_id_down_ctx_t *c = (mm_id_down_ctx_t *)ctxp;
     int eid = idx;
 
-    int assigned[64];
-    int n_assigned = 0;
-
-    for (int t = 0; t < c->n_tokens; t++) {
-        int n_tok_experts = c->n_experts_per_token[t];
-        for (int s = 0; s < n_tok_experts; s++) {
-            if (c->ids[t * c->n_used + s] == eid) {
-                assigned[n_assigned++] = t;
-                break;
-            }
-        }
-        if (n_assigned >= 64) break;
-    }
+    /* Use precomputed routing map — no scanning needed */
+    int n_assigned = c->expert_counts[eid];
     if (n_assigned == 0) return;
+
+    const int *assignments = c->expert_assignments + eid * c->n_tokens;
+
+    int assigned[256];
+    int slots[256];
+    int n_useful = n_assigned < 256 ? n_assigned : 256;
+    for (int a = 0; a < n_useful; a++) {
+        assigned[a] = MOE_ROUTE_TOKEN(assignments[a]);
+        slots[a] = MOE_ROUTE_SLOT(assignments[a]);
+    }
+    n_assigned = n_useful;
 
     const char *dw = (const char *)c->down_w_base + (size_t)eid * c->dim * c->row_bytes;
 
     int tid = tensor_get_thread_id();
-    float *my_qx_base = (float *)c->exp_down_qx_all + tid * 64 * c->q8_per_token;
+    float *my_qx_base = (float *)c->exp_down_qx_all + tid * 256 * c->q8_per_token;
 
-    const void *qx_bufs[64];
-    const float *qx_d_arr[64];
-    int slots[64];
+    const void *qx_bufs[256];
+    const float *qx_d_arr[256];
 
     for (int a = 0; a < n_assigned; a++) {
         int t = assigned[a];
-        int slot = 0;
-        for (int s = 0; s < c->n_used; s++) {
-            if (c->ids[t * c->n_used + s] == eid) { slot = s; break; }
-        }
-        slots[a] = slot;
+        int slot = slots[a];
 
         const float *swiglu = c->expert_out + (size_t)t * c->n_used * c->n_ff + (size_t)slot * c->n_ff;
         float *entry = my_qx_base + a * c->q8_per_token;
