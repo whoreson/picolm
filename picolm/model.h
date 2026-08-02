@@ -316,6 +316,26 @@ typedef struct {
     void *moe_thread_scratch;  /* base pointer to per-thread scratch area */
     size_t moe_thread_stride;  /* bytes per thread */
 
+    /* Pre-allocated batch buffers for weight-centric MoE path:
+     * gate_batch_exp[n_ff_exp] — gate output for one expert (single token or batched)
+     * up_batch_exp[n_ff_exp] — up output for one expert
+     * down_qx_exp — Q8_0 quantized SwiGLU for down projection
+     * down_qx_d_exp — deltas for down_qx_exp */
+    float *gate_batch_exp;    /* [n_ff_exp] gate output buffer */
+    float *up_batch_exp;      /* [n_ff_exp] up output buffer */
+    block_q8_0 *down_qx_exp;  /* quantized SwiGLU for down projection */
+    float *down_qx_d_exp;     /* deltas */
+
+    /* Pre-allocated qx_all buffer: quantized Q8_0 inputs for all tokens.
+     * Size: n_ctx × (q8_row_blocks + nb_deltas) floats. */
+    float *moe_qx_all;
+    int moe_qx_d_off;
+    int moe_q8_buf_per_token;
+
+    /* Shared expert batch buffers (gate+up for all tokens) */
+    float *sh_gate;   /* [n_ff_shexp × n_ctx] */
+    float *sh_up;     /* [n_ff_shexp × n_ctx] */
+
     /* Single allocation base */
     void *mem_block;
     size_t mem_size;

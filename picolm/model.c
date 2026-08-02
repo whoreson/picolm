@@ -1851,6 +1851,34 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
             per_thread = (per_thread + 31) / 32 * 32;                /* align to 32 bytes */
             sz_moe += per_thread * MAX_THREADS;
         }
+
+        /* Per-expert scratch: gate_buf, up_buf, down_qx, down_qx_d.
+         * gate_batch_exp and up_batch_exp are [n_ff_exp * n_ctx] where
+         * n_ctx is the actual context size used for this batch.
+         * We use a moderate size: n_ff_exp * 128 (covers typical batches). */
+        {
+            size_t batch_max = c->max_seq_len;
+            if (batch_max > 256) batch_max = 256;
+            sz_moe += (size_t)c->n_ff_exp * batch_max * sizeof(float) * 2; /* gate_batch_exp + up_batch_exp */
+        }
+        sz_moe += gguf_type_row_size(GGUF_TYPE_Q8_0, c->n_ff_exp);   /* down_qx_exp */
+        sz_moe += (c->n_ff_exp / 32) * sizeof(float);                /* down_qx_d_exp */
+
+        /* Pre-allocated qx_all buffer for batched MoE.
+         * Size: max_seq_len * (q8_row_blocks + nb_deltas) floats. */
+        {
+            size_t q8_rb = c->n_embd / 32;
+            size_t q8_data_off = (q8_rb * sizeof(block_q8_0) + sizeof(float) - 1) / sizeof(float);
+            size_t q8_buf_per_token = q8_data_off + q8_rb;
+            sz_moe += (size_t)c->max_seq_len * q8_buf_per_token;
+        }
+
+        /* Shared expert batch buffers (gate+up for all tokens) */
+        {
+            size_t batch_max = c->max_seq_len;
+            if (batch_max > 256) batch_max = 256;
+            sz_moe += (size_t)c->n_ff_shexp * batch_max * sizeof(float) * 2; /* sh_gate + sh_up */
+        }
     }
 
     size_t total = sz_x + sz_xb + sz_xb2 + sz_q +
@@ -2156,6 +2184,38 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
                 s->moe_thread_scratch = (void *)p;
                 s->moe_thread_stride = per_thread;
                 p += (per_thread / sizeof(float) + 1) * MAX_THREADS;
+            }
+
+            /* Per-expert scratch: gate_buf, up_buf, down_qx, down_qx_d */
+            {
+                size_t batch_max = c->max_seq_len;
+                if (batch_max > 256) batch_max = 256;
+                s->gate_batch_exp = p; p += (size_t)c->n_ff_exp * batch_max;
+                s->up_batch_exp = p; p += (size_t)c->n_ff_exp * batch_max;
+            }
+            {
+                size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, c->n_ff_exp);
+                s->down_qx_exp = (block_q8_0 *)p; p += (q8_rb + sizeof(float) - 1) / sizeof(float);
+                s->down_qx_d_exp = p; p += c->n_ff_exp / 32;
+            }
+
+            /* Pre-allocated qx_all buffer for batched MoE */
+            {
+                size_t q8_rb = c->n_embd / 32;
+                size_t q8_data_off = (q8_rb * sizeof(block_q8_0) + sizeof(float) - 1) / sizeof(float);
+                size_t q8_buf_per_token = q8_data_off + q8_rb;
+                s->moe_qx_d_off = (int)q8_data_off;
+                s->moe_q8_buf_per_token = (int)q8_buf_per_token;
+                s->moe_qx_all = p;
+                p += (size_t)c->max_seq_len * q8_buf_per_token;
+            }
+
+            /* Shared expert batch buffers (gate+up for all tokens) */
+            {
+                size_t batch_max = c->max_seq_len;
+                if (batch_max > 256) batch_max = 256;
+                s->sh_gate = p; p += (size_t)c->n_ff_shexp * batch_max;
+                s->sh_up = p; p += (size_t)c->n_ff_shexp * batch_max;
             }
         }
     }
@@ -3298,15 +3358,13 @@ static void moe_token_worker(int t, void *vctx) {
     tensor_set_n_threads(saved_t);
 }
 
-/* moe_forward_batch: expert-centric batched MoE forward pass.
+/* moe_forward_batch: weight-centric batched MoE forward pass.
  *
- * Strategy (following llama.cpp's mm_id pattern):
- * Phase 1: Route all tokens → per-token expert_ids + weights
- * Phase 2: Quantize all token inputs to Q8_0
- * Phase 3: For each selected expert E, collect assigned tokens, do
- *          batched matmul_q8 per projection (gate, up, down)
- * Phase 4: Weighted accumulation per token
- * Phase 5: Shared expert batched across all tokens
+ * Strategy: sweep experts linearly (0..n_expert-1). For each expert,
+ * identify which tokens selected it. Process those tokens through
+ * gate/up/down using matmul_q8_batch (activating batch4 kernel).
+ * This guarantees each expert's weights are streamed from RAM exactly
+ * once per layer, regardless of how many tokens use it.
  *
  * x_batch:        input [n_tokens * dim], stride = dim
  * residual_batch: output [n_tokens * dim], stride = dim
@@ -3319,12 +3377,10 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
     int n_ff = c->n_ff_exp;
     int n_expert = c->n_expert;
     int n_used = c->n_expert_used;
-    float *moe_out = s->moe_out;
 
     int saved_threads = tensor_get_n_threads();
     tensor_set_n_threads(1);
 
-    
     /* Per-token expert routing tables: [n_tokens][n_used] */
     int all_ids[n_tokens][8];       /* 8 = max n_expert_used */
     float all_weights[n_tokens][8];
@@ -3374,91 +3430,141 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
             for (int i = 0; i < n_used; i++) weights[i] *= inv_wsum;
         }
     }
-    
-    /* ---- Phase 2: Quantize all token inputs to Q8_0 ----
-     * We use a contiguous scratch area for quantized activations.
-     * Layout: [n_tokens * (q8_row_blocks + nb_deltas)] as float array. */
+
+    /* ---- Phase 2: Quantize all token inputs to Q8_0 (pre-allocated) ---- */
     {
+        int q8_buf_per_token = s->moe_q8_buf_per_token;
+        int qx_d_off = s->moe_qx_d_off;
+        float *qx_all = s->moe_qx_all;
         size_t q8_row_blocks = dim / 32;
-        size_t q8_row_size = q8_row_blocks * sizeof(block_q8_0);
-        size_t q8_data_off = (q8_row_size + sizeof(float) - 1) / sizeof(float);
-        size_t q8_buf_per_token = q8_data_off + q8_row_blocks;
-        int qx_d_off = (int)q8_data_off;
-        float *qx_all = (float *)malloc(n_tokens * q8_buf_per_token * sizeof(float));
-        if (!qx_all) { tensor_set_n_threads(saved_threads); return; }
 
         for (int t = 0; t < n_tokens; t++) {
             float *tbuf = qx_all + t * q8_buf_per_token;
             block_q8_0 *qx = (block_q8_0 *)tbuf;
-            float *qx_d = tbuf + q8_data_off;
+            float *qx_d = tbuf + qx_d_off;
             quantize_row_q8_0(x_batch + t * dim, qx, dim);
             for (size_t bi = 0; bi < q8_row_blocks; bi++) {
                 qx_d[bi] = fp16_to_fp32(qx[bi].d);
             }
         }
 
-        /* ---- Phase 3+4: Token-parallel expert processing ----
-         * Each thread processes a disjoint set of tokens through all their
-         * experts. Uses per-thread scratch buffers (no malloc, no races).
-         * Each thread writes only to its own residual_batch[t], no races. */
+        /* ---- Phase 3+4: Weight-centric expert processing ----
+         * Sweep all 256 experts linearly. For each expert, find assigned
+         * tokens and process them via matmul_q8_batch (batch4 kernel).
+         * Accumulate into residual_batch. */
         gguf_type_t type_gate = lw->type_ffn_gate_exps;
         gguf_type_t type_up = lw->type_ffn_up_exps;
         gguf_type_t type_down = lw->type_ffn_down_exps;
 
-        /* Zero all MoE output accumulators */
+        /* Zero only the active portion of residual_batch */
         memset(residual_batch, 0, (size_t)n_tokens * dim * sizeof(float));
 
-        /* Context for parallel token worker */
-        struct moe_tok_ctx {
-            float *residual_batch;
-            float *qx_all;
-            int qx_d_off, q8_buf_per_token, dim, n_ff;
-            int *all_ids;
-            float *all_weights;
-            int n_used;
-            gguf_type_t type_gate, type_up, type_down;
-            const void *gate_exps, *up_exps, *down_exps;
-            run_state_t *s;
-        } moe_ctx = {
-            .residual_batch = residual_batch,
-            .qx_all = qx_all,
-            .qx_d_off = qx_d_off,
-            .q8_buf_per_token = q8_buf_per_token,
-            .dim = dim, .n_ff = n_ff,
-            .all_ids = (int *)all_ids,
-            .all_weights = (float *)all_weights,
-            .n_used = n_used,
-            .type_gate = type_gate, .type_up = type_up, .type_down = type_down,
-            .gate_exps = lw->ffn_gate_exps,
-            .up_exps = lw->ffn_up_exps,
-            .down_exps = lw->ffn_down_exps,
-            .s = s
-        };
+        /* Per-expert scratch buffers */
+        float *gate_buf = s->gate_batch_exp;
+        float *up_buf = s->up_batch_exp;
+        block_q8_0 *down_qx = s->down_qx_exp;
+        float *down_qx_d = s->down_qx_d_exp;
+        size_t dnb = n_ff / 32;
 
-        /* Note: tensor_parallel_for uses the global n_threads for dispatch.
-         * We DON'T set n_threads=1 here because that would force sequential mode.
-         * Instead, the worker calls tensor_set_n_threads(1) locally before each matmul. */
-        tensor_parallel_for(n_tokens, (void (*)(int, void *))moe_token_worker, &moe_ctx);
+        /* Build per-expert token list by sweeping routing tables.
+         * Worst case: all n_tokens select the same expert. */
+        int expert_tokens[n_tokens];
+        float expert_weights[n_tokens];
 
-        /* ---- Phase 5: Shared expert (batched via matmul_q8_batch) ----
-         * All tokens go through the same shared expert weights.
-         * Use matmul_q8_batch with batch-4 kernel for gate+up. */
-        {
-            int sh_ff = c->n_ff_shexp;
-            size_t sh_batch_sz = (size_t)n_tokens * sh_ff * sizeof(float);
-            float *sh_gate = (float *)malloc(sh_batch_sz);
-            float *sh_up = (float *)malloc(sh_batch_sz);
-            if (!sh_gate || !sh_up) {
-                free(sh_gate); free(sh_up);
-                free(qx_all);
-                tensor_set_n_threads(saved_threads); return;
+        for (int eid = 0; eid < n_expert; eid++) {
+            /* Find which tokens selected this expert */
+            int n_tok = 0;
+            for (int t = 0; t < n_tokens; t++) {
+                for (int ei = 0; ei < n_used; ei++) {
+                    if (all_ids[t][ei] == eid) {
+                        expert_tokens[n_tok] = t;
+                        expert_weights[n_tok] = all_weights[t][ei];
+                        n_tok++;
+                        break;
+                    }
+                }
             }
 
-            /* Batched gate: all n_tokens through shared gate weights (activates batch4!) */
-            matmul_q8_batch(sh_gate, qx_all, (int)q8_data_off, (int)q8_buf_per_token,
+            if (n_tok == 0) continue; /* Expert not used by any token */
+
+            /* Get expert weight pointers */
+            const void *gate_w = get_expert_slice(lw->ffn_gate_exps, eid, dim, n_ff, type_gate);
+            const void *up_w = get_expert_slice(lw->ffn_up_exps, eid, dim, n_ff, type_up);
+            const void *down_w = get_expert_slice(lw->ffn_down_exps, eid, n_ff, dim, type_down);
+
+            /* Build per-expert qx buffer: gather the n_tok token activations
+             * into a contiguous qx array for matmul_q8_batch.
+             * Layout: [token0 qx + deltas] [token1 qx + deltas] ... */
+            float *exp_qx_all = (float *)malloc(n_tok * s->moe_q8_buf_per_token * sizeof(float));
+            if (!exp_qx_all) continue;
+
+            for (int k = 0; k < n_tok; k++) {
+                const float *src = qx_all + expert_tokens[k] * q8_buf_per_token;
+                float *dst = exp_qx_all + k * q8_buf_per_token;
+                memcpy(dst, src, q8_buf_per_token * sizeof(float));
+            }
+
+            /* Gate projection: batched via matmul_q8_batch (activates batch4) */
+            matmul_q8_batch(gate_buf, exp_qx_all, qx_d_off, q8_buf_per_token,
+                            gate_w, dim, n_ff, n_tok, type_gate);
+
+            /* Up projection: batched via matmul_q8_batch */
+            matmul_q8_batch(up_buf, exp_qx_all, qx_d_off, q8_buf_per_token,
+                            up_w, dim, n_ff, n_tok, type_up);
+
+            free(exp_qx_all);
+
+            /* Per-token SwiGLU → down → accumulate */
+            for (int k = 0; k < n_tok; k++) {
+                int t = expert_tokens[k];
+                float w_i = expert_weights[k];
+
+                /* SwiGLU on token k's slice */
+                float *gk = gate_buf + k * n_ff;
+                float *uk = up_buf + k * n_ff;
+                silu(gk, n_ff);
+                elemwise_mul(gk, gk, uk, n_ff);
+
+                /* Q8×Q8 down */
+                quantize_row_q8_0(gk, down_qx, n_ff);
+                for (size_t bi = 0; bi < dnb; bi++) {
+                    down_qx_d[bi] = fp16_to_fp32(down_qx[bi].d);
+                }
+                matmul_q8(s->xb2, down_qx, down_qx_d, down_w, n_ff, dim, type_down);
+
+                /* Weighted accumulation into residual_batch[t] */
+                float *out = residual_batch + t * dim;
+#ifdef PICOLM_AVX512
+                {
+                    __m512 bw = _mm512_set1_ps(w_i);
+                    int di = 0;
+                    for (; di + 15 < dim; di += 16) {
+                        __m512 v0 = _mm512_loadu_ps(out + di);
+                        __m512 v1 = _mm512_loadu_ps(s->xb2 + di);
+                        __m512 v2 = _mm512_loadu_ps(out + di + 8);
+                        __m512 v3 = _mm512_loadu_ps(s->xb2 + di + 8);
+                        _mm512_storeu_ps(out + di, _mm512_add_ps(v0, _mm512_mul_ps(bw, v1)));
+                        _mm512_storeu_ps(out + di + 8, _mm512_add_ps(v2, _mm512_mul_ps(bw, v3)));
+                    }
+                    for (; di < dim; di++) out[di] += w_i * s->xb2[di];
+                }
+#else
+                for (int d = 0; d < dim; d++) out[d] += w_i * s->xb2[d];
+#endif
+            }
+        }
+
+        /* ---- Phase 5: Shared expert (batched via matmul_q8_batch) ---- */
+        {
+            int sh_ff = c->n_ff_shexp;
+            float *sh_gate = s->sh_gate;
+            float *sh_up = s->sh_up;
+
+            /* Batched gate: all n_tokens through shared gate weights */
+            matmul_q8_batch(sh_gate, s->moe_qx_all, s->moe_qx_d_off, s->moe_q8_buf_per_token,
                             lw->ffn_gate_shexp, dim, sh_ff, n_tokens, lw->type_ffn_gate_shexp);
             /* Batched up: all n_tokens through shared up weights */
-            matmul_q8_batch(sh_up, qx_all, (int)q8_data_off, (int)q8_buf_per_token,
+            matmul_q8_batch(sh_up, s->moe_qx_all, s->moe_qx_d_off, s->moe_q8_buf_per_token,
                             lw->ffn_up_shexp, dim, sh_ff, n_tokens, lw->type_ffn_up_shexp);
 
             /* Per-token SwiGLU + down + sigmoid gate + combine */
@@ -3472,9 +3578,9 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
 
                 /* Q8×Q8 down */
                 {
-                    size_t dnb = sh_ff / 32;
+                    size_t dnb_sh = sh_ff / 32;
                     quantize_row_q8_0(g, s->shared_down_qx, sh_ff);
-                    for (size_t bi = 0; bi < dnb; bi++) {
+                    for (size_t bi = 0; bi < dnb_sh; bi++) {
                         s->shared_down_qx_d[bi] = fp16_to_fp32(s->shared_down_qx[bi].d);
                     }
                     matmul_q8(s->xb2, s->shared_down_qx, s->shared_down_qx_d, lw->ffn_down_shexp, sh_ff, dim, lw->type_ffn_down_shexp);
@@ -3491,11 +3597,7 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
                 /* Add shared to MoE output */
                 for (int d = 0; d < dim; d++) out[d] += s->xb2[d];
             }
-            free(sh_gate);
-            free(sh_up);
         }
-
-        free(qx_all);
     }
 
     tensor_set_n_threads(saved_threads);
