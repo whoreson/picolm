@@ -46,8 +46,10 @@ static int load_config_safetensors(const char *model_dir, model_config_t *cfg) {
     if (!f) return -1;
 
     fseek(f, 0, SEEK_END);
-    long size = ftell(f);
+    long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
+    if (fsize < 0) { fclose(f); return -1; }
+    size_t size = (size_t)fsize;
     char *json_str = (char *)malloc(size + 1);
     if (!json_str) { fclose(f); return -1; }
     if (fread(json_str, 1, size, f) != (size_t)size) { free(json_str); fclose(f); return -1; }
@@ -105,8 +107,10 @@ static int load_config_safetensors(const char *model_dir, model_config_t *cfg) {
         FILE *cf = fopen(cfg_path, "r");
         if (cf) {
             fseek(cf, 0, SEEK_END);
-            long csz = ftell(cf);
+            long csz_l = ftell(cf);
             fseek(cf, 0, SEEK_SET);
+            if (csz_l < 0) csz_l = 0;
+            size_t csz = (size_t)csz_l;
             char *cbuf = malloc(csz + 1);
             if (cbuf) {
                 { size_t _r = fread(cbuf, 1, csz, cf); (void)_r; }
@@ -308,8 +312,10 @@ static int load_tokenizer_safetensors(const char *model_dir, model_t *m) {
     FILE *cf = fopen(path, "r");
     if (cf) {
         fseek(cf, 0, SEEK_END);
-        long csz = ftell(cf);
+        long csz_l = ftell(cf);
         fseek(cf, 0, SEEK_SET);
+        if (csz_l < 0) csz_l = 0;
+        size_t csz = (size_t)csz_l;
         char *cb = malloc(csz + 1);
         if (cb) {
             { size_t _r = fread(cb, 1, csz, cf); (void)_r; }
@@ -333,8 +339,10 @@ static int load_tokenizer_safetensors(const char *model_dir, model_t *m) {
     FILE *tf = fopen(path, "r");
     if (tf) {
         fseek(tf, 0, SEEK_END);
-        long tsz = ftell(tf);
+        long tsz_l = ftell(tf);
         fseek(tf, 0, SEEK_SET);
+        if (tsz_l < 0) tsz_l = 0;
+        size_t tsz = (size_t)tsz_l;
         char *tb = malloc(tsz + 1);
         if (tb) {
             { size_t _r = fread(tb, 1, tsz, tf); (void)_r; }
@@ -359,8 +367,10 @@ static int load_tokenizer_safetensors(const char *model_dir, model_t *m) {
     if (!f) return -1;
 
     fseek(f, 0, SEEK_END);
-    long vsz = ftell(f);
+    long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
+    if (fsize < 0) { fclose(f); return -1; }
+    size_t vsz = (size_t)fsize;
     char *vbuf = malloc(vsz + 1);
     if (!vbuf) { fclose(f); return -1; }
     { size_t _r = fread(vbuf, 1, vsz, f); (void)_r; }

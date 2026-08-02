@@ -1269,7 +1269,7 @@ static void handle_slots_post(SOCKET sock, const char *body) {
                     if (ver >= 4) {
                         /* Token sequence */
                         if (file_n_pos > 0) {
-                            kv_end += (off_t)file_n_pos * sizeof(uint32_t);
+                            kv_end += (off_t)file_n_pos * (off_t)sizeof(uint32_t);
                         }
                         /* Layer bitmap */
                         kv_end += (off_t)file_layers;
@@ -1283,7 +1283,7 @@ static void handle_slots_post(SOCKET sock, const char *body) {
                     if (ver >= 4) {
                         /* Read layer bitmap to count attention layers */
                         uint8_t *layer_map = (uint8_t *)alloca(file_layers);
-                        lseek(fd, (off_t)sizeof(header) + (file_n_pos > 0 ? (off_t)file_n_pos * sizeof(uint32_t) : 0), SEEK_SET);
+                        lseek(fd, (off_t)sizeof(header) + (file_n_pos > 0 ? (off_t)file_n_pos * (off_t)sizeof(uint32_t) : 0), SEEK_SET);
 #ifdef _WIN32
                         _read(fd, (char *)layer_map, (unsigned)file_layers);
 #else
@@ -1299,7 +1299,7 @@ static void handle_slots_post(SOCKET sock, const char *body) {
                     }
                     /* Reset file position to beginning (we lseek'd for bitmap read) */
                     lseek(fd, 0, SEEK_SET);
-                    kv_end += (off_t)attn_layers * file_n_pos * (pos_stride_k + pos_stride_v);
+                    kv_end += (off_t)attn_layers * file_n_pos * (off_t)(pos_stride_k + pos_stride_v);
 
                     /* SSM state (v4 only) */
                     if (ver >= 4) {
@@ -2419,10 +2419,10 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
     /* Build generation_settings JSON */
     cJSON *gen_settings = cJSON_CreateObject();
     cJSON_AddNumberToObject(gen_settings, "n_predict", n_predict);
-    cJSON_AddNumberToObject(gen_settings, "temperature", temperature);
-    cJSON_AddNumberToObject(gen_settings, "top_p", top_p);
+    cJSON_AddNumberToObject(gen_settings, "temperature", (double)temperature);
+    cJSON_AddNumberToObject(gen_settings, "top_p", (double)top_p);
     cJSON_AddNumberToObject(gen_settings, "top_k", top_k);
-    cJSON_AddNumberToObject(gen_settings, "repeat_penalty", repeat_penalty);
+    cJSON_AddNumberToObject(gen_settings, "repeat_penalty", (double)repeat_penalty);
     cJSON_AddNumberToObject(gen_settings, "repeat_last_n", repeat_last_n);
     cJSON_AddNumberToObject(gen_settings, "seed", seed);
 
