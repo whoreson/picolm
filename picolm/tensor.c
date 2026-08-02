@@ -1543,6 +1543,39 @@ void matmul_q8_batch(float *out, const float *qx_all, int qx_d_off,
     }
 }
 
+/* ================================================================
+ * Parallel mm_id expert dispatch
+ *
+ * Context struct shared between main thread and worker threads.
+ * Worker functions are declared at file scope for C compliance.
+ * ================================================================ */
+
+typedef struct {
+    float *gate_out; float *up_out;
+    const float *qx_all; int qx_d_off; int q8_buf_per_token;
+    const void *gate_w_base; const void *up_w_base;
+    const int *ids; const int *n_experts_per_token;
+    int n_tokens; int n_used; int dim; int n_ff; int n_expert;
+    gguf_type_t type;
+    size_t row_bytes;
+} mm_id_gate_ctx_t;
+
+typedef struct {
+    float *down_out;
+    const float *expert_out;
+    const void *down_w_base;
+    const int *ids; const int *n_experts_per_token;
+    int n_tokens; int n_used; int dim; int n_ff; int n_expert;
+    gguf_type_t type;
+    size_t row_bytes; size_t dnb; size_t qx_d_off;
+    block_q8_0 *scratch_qx; float *scratch_qx_d;
+    block_q8_0 *exp_down_qx_all;
+    int q8_per_token; int max_threads;
+} mm_id_down_ctx_t;
+
+static void mm_id_gate_expert_task(int idx, void *ctxp);
+static void mm_id_down_expert_task(int idx, void *ctxp);
+
 /* matmul_mm_id: llama.cpp-style MoE batched GEMM.
  *
  * Input layout (PicoLM native, no repacking needed):
@@ -1569,137 +1602,11 @@ void matmul_mm_id_gate_up(float *gate_out, float *up_out,
 
     size_t row_bytes = gguf_type_row_size(type, dim);
 
-#ifdef PICOLM_AVX512
-    /* AVX-512 path: for each expert, process all assigned tokens */
-    for (int eid = 0; eid < n_expert; eid++) {
-        /* Gather tokens assigned to this expert */
-        int assigned[64]; /* max 64 tokens per expert */
-        int n_assigned = 0;
+    mm_id_gate_ctx_t ctx = { gate_out, up_out, qx_all, qx_d_off, q8_buf_per_token,
+        gate_w_base, up_w_base, ids, n_experts_per_token,
+        n_tokens, n_used, dim, n_ff, n_expert, type, row_bytes };
 
-        for (int t = 0; t < n_tokens; t++) {
-            int n_tok_experts = n_experts_per_token[t];
-            for (int s = 0; s < n_tok_experts; s++) {
-                if (ids[t * n_used + s] == eid) {
-                    assigned[n_assigned++] = t;
-                    break; /* each token selects each expert at most once */
-                }
-            }
-            if (n_assigned >= 64) break;
-        }
-
-        if (n_assigned == 0) continue;
-
-        /* Expert weight pointers */
-        const char *gate_exp = (const char *)gate_w_base + (size_t)eid * n_ff * row_bytes;
-        const char *up_exp = (const char *)up_w_base + (size_t)eid * n_ff * row_bytes;
-
-        /* Precompute slot indices for each assigned token */
-        int slots[64];
-        for (int a = 0; a < n_assigned; a++) {
-            int t = assigned[a];
-            int slot = 0;
-            for (int s = 0; s < n_used; s++) {
-                if (ids[t * n_used + s] == eid) { slot = s; break; }
-            }
-            slots[a] = slot;
-        }
-
-        /* For each weight row, process all assigned tokens using batch4 when possible */
-        int n_batch4 = (n_assigned / 4) * 4;
-
-        for (int row = 0; row < n_ff; row++) {
-            const char *gw = gate_exp + row * row_bytes;
-            const char *uw = up_exp + row * row_bytes;
-
-            /* Batch-4 path: process 4 tokens simultaneously per weight row */
-            for (int a = 0; a < n_batch4; a += 4) {
-                const void *qx[4];
-                const float *qx_d_arr[4];
-                float fout[4];
-
-                for (int k = 0; k < 4; k++) {
-                    int t = assigned[a + k];
-                    const float *tbuf = qx_all + t * q8_buf_per_token;
-                    qx[k] = (const void *)tbuf;
-                    qx_d_arr[k] = tbuf + qx_d_off;
-                }
-
-                /* Gate: 4 tokens through same gate weight row */
-                vec_dot_q8_0_q8_0_deltas_batch4(qx[0], qx_d_arr[0], qx[1], qx_d_arr[1],
-                    qx[2], qx_d_arr[2], qx[3], qx_d_arr[3], gw, dim,
-                    &fout[0], &fout[1], &fout[2], &fout[3]);
-                for (int k = 0; k < 4; k++) {
-                    int t = assigned[a + k];
-                    size_t idx = (size_t)t * n_used * n_ff + (size_t)slots[a + k] * n_ff + row;
-                    gate_out[idx] = fout[k];
-                }
-
-                /* Up: 4 tokens through same up weight row */
-                vec_dot_q8_0_q8_0_deltas_batch4(qx[0], qx_d_arr[0], qx[1], qx_d_arr[1],
-                    qx[2], qx_d_arr[2], qx[3], qx_d_arr[3], uw, dim,
-                    &fout[0], &fout[1], &fout[2], &fout[3]);
-                for (int k = 0; k < 4; k++) {
-                    int t = assigned[a + k];
-                    size_t idx = (size_t)t * n_used * n_ff + (size_t)slots[a + k] * n_ff + row;
-                    up_out[idx] = fout[k];
-                }
-            }
-
-            /* Remainder: single-token fallback */
-            for (int a = n_batch4; a < n_assigned; a++) {
-                int t = assigned[a];
-                const float *tbuf = qx_all + t * q8_buf_per_token;
-                const void *qx = (const void *)tbuf;
-                const float *qx_d = tbuf + qx_d_off;
-                size_t idx = (size_t)t * n_used * n_ff + (size_t)slots[a] * n_ff + row;
-                gate_out[idx] = vec_dot_q8_0_q8_0_deltas(qx, qx_d, gw, dim);
-                up_out[idx] = vec_dot_q8_0_q8_0_deltas(qx, qx_d, uw, dim);
-            }
-        }
-    }
-#else
-    /* Scalar fallback: same algorithm, no SIMD */
-    for (int eid = 0; eid < n_expert; eid++) {
-        int assigned[64];
-        int n_assigned = 0;
-
-        for (int t = 0; t < n_tokens; t++) {
-            int n_tok_experts = n_experts_per_token[t];
-            for (int s = 0; s < n_tok_experts; s++) {
-                if (ids[t * n_used + s] == eid) {
-                    assigned[n_assigned++] = t;
-                    break;
-                }
-            }
-            if (n_assigned >= 64) break;
-        }
-
-        if (n_assigned == 0) continue;
-
-        const char *gate_exp = (const char *)gate_w_base + (size_t)eid * n_ff * row_bytes;
-        const char *up_exp = (const char *)up_w_base + (size_t)eid * n_ff * row_bytes;
-
-        for (int row = 0; row < n_ff; row++) {
-            for (int a = 0; a < n_assigned; a++) {
-                int t = assigned[a];
-                const float *tbuf = qx_all + t * q8_buf_per_token;
-                const void *qx = (const void *)tbuf;
-                const float *qx_d = tbuf + qx_d_off;
-
-                int slot = 0;
-                for (int s = 0; s < n_used; s++) {
-                    if (ids[t * n_used + s] == eid) { slot = s; break; }
-                }
-
-                size_t idx = (size_t)t * n_used * n_ff + (size_t)slot * n_ff + row;
-                gate_out[idx] = vec_dot_q8_0_q8_0_deltas(qx, qx_d,
-                    gate_exp + row * row_bytes, dim);
-                up_out[idx] = vec_dot_q8_0_q8_0_deltas(qx, qx_d,
-                    up_exp + row * row_bytes, dim);
-            }
-        }
-    }
-#endif
+    tensor_parallel_for(n_expert, mm_id_gate_expert_task, &ctx);
 }
 
 /* matmul_mm_id_down: down projection with mm_id pattern.
@@ -1736,91 +1643,183 @@ void matmul_mm_id_down(float *down_out,
     size_t q8_rb = n_ff / 32;
     size_t qx_d_off = (q8_rb * sizeof(block_q8_0) + sizeof(float) - 1) / sizeof(float);
 
-    /* For each expert, gather assigned tokens and process down projection */
-    for (int eid = 0; eid < n_expert; eid++) {
-        int assigned[64];
-        int n_assigned = 0;
+    mm_id_down_ctx_t ctx = { down_out, expert_out, down_w_base,
+        ids, n_experts_per_token, n_tokens, n_used, dim, n_ff, n_expert,
+        type, row_bytes, dnb, qx_d_off,
+        scratch_qx, scratch_qx_d, exp_down_qx_all, q8_per_token, MAX_THREADS };
 
-        for (int t = 0; t < n_tokens; t++) {
-            int n_tok_experts = n_experts_per_token[t];
-            for (int s = 0; s < n_tok_experts; s++) {
-                if (ids[t * n_used + s] == eid) {
-                    assigned[n_assigned++] = t;
-                    break;
-                }
+    tensor_parallel_for(n_expert, mm_id_down_expert_task, &ctx);
+}
+
+
+/* ================================================================
+ * mm_id parallel expert tasks (file-scope static functions)
+ * ================================================================ */
+static void mm_id_gate_expert_task(int idx, void *ctxp) {
+    mm_id_gate_ctx_t *c = (mm_id_gate_ctx_t *)ctxp;
+    int eid = idx;
+
+    int assigned[64];
+    int n_assigned = 0;
+    int slots[64];
+
+    for (int t = 0; t < c->n_tokens; t++) {
+        int n_tok_experts = c->n_experts_per_token[t];
+        for (int s = 0; s < n_tok_experts; s++) {
+            if (c->ids[t * c->n_used + s] == eid) {
+                assigned[n_assigned++] = t;
+                break;
             }
-            if (n_assigned >= 64) break;
+        }
+        if (n_assigned >= 64) break;
+    }
+    if (n_assigned == 0) return;
+
+    const char *gate_exp = (const char *)c->gate_w_base + (size_t)eid * c->n_ff * c->row_bytes;
+    const char *up_exp = (const char *)c->up_w_base + (size_t)eid * c->n_ff * c->row_bytes;
+
+    for (int a = 0; a < n_assigned; a++) {
+        int t = assigned[a];
+        int slot = 0;
+        for (int s = 0; s < c->n_used; s++) {
+            if (c->ids[t * c->n_used + s] == eid) { slot = s; break; }
+        }
+        slots[a] = slot;
+    }
+
+#ifdef PICOLM_AVX512
+    int n_batch4 = (n_assigned / 4) * 4;
+
+    for (int row = 0; row < c->n_ff; row++) {
+        const char *gw = gate_exp + row * c->row_bytes;
+        const char *uw = up_exp + row * c->row_bytes;
+
+        for (int a = 0; a < n_batch4; a += 4) {
+            const void *qx[4];
+            const float *qx_d_arr[4];
+            float fout[4];
+            for (int k = 0; k < 4; k++) {
+                int t = assigned[a + k];
+                const float *tbuf = c->qx_all + t * c->q8_buf_per_token;
+                qx[k] = (const void *)tbuf;
+                qx_d_arr[k] = tbuf + c->qx_d_off;
+            }
+            vec_dot_q8_0_q8_0_deltas_batch4(qx[0], qx_d_arr[0], qx[1], qx_d_arr[1],
+                qx[2], qx_d_arr[2], qx[3], qx_d_arr[3], gw, c->dim,
+                &fout[0], &fout[1], &fout[2], &fout[3]);
+            for (int k = 0; k < 4; k++) {
+                int t = assigned[a + k];
+                size_t idx = (size_t)t * c->n_used * c->n_ff + (size_t)slots[a + k] * c->n_ff + row;
+                c->gate_out[idx] = fout[k];
+            }
+            vec_dot_q8_0_q8_0_deltas_batch4(qx[0], qx_d_arr[0], qx[1], qx_d_arr[1],
+                qx[2], qx_d_arr[2], qx[3], qx_d_arr[3], uw, c->dim,
+                &fout[0], &fout[1], &fout[2], &fout[3]);
+            for (int k = 0; k < 4; k++) {
+                int t = assigned[a + k];
+                size_t idx = (size_t)t * c->n_used * c->n_ff + (size_t)slots[a + k] * c->n_ff + row;
+                c->up_out[idx] = fout[k];
+            }
         }
 
-        if (n_assigned == 0) continue;
-
-        /* Expert down weights: [n_ff, dim] */
-        const char *dw = (const char *)down_w_base + (size_t)eid * dim * row_bytes;
-
-        /* Phase 1: Quantize all assigned tokens' SwiGLU outputs */
-        const void *qx_bufs[64];
-        const float *qx_d_arr[64];
-        int slots[64];
-
+        for (int a = n_batch4; a < n_assigned; a++) {
+            int t = assigned[a];
+            const float *tbuf = c->qx_all + t * c->q8_buf_per_token;
+            const void *qx = (const void *)tbuf;
+            const float *qx_d = tbuf + c->qx_d_off;
+            size_t idx = (size_t)t * c->n_used * c->n_ff + (size_t)slots[a] * c->n_ff + row;
+            c->gate_out[idx] = vec_dot_q8_0_q8_0_deltas(qx, qx_d, gw, c->dim);
+            c->up_out[idx] = vec_dot_q8_0_q8_0_deltas(qx, qx_d, uw, c->dim);
+        }
+    }
+#else
+    for (int row = 0; row < c->n_ff; row++) {
         for (int a = 0; a < n_assigned; a++) {
             int t = assigned[a];
-            int slot = 0;
-            for (int s = 0; s < n_used; s++) {
-                if (ids[t * n_used + s] == eid) { slot = s; break; }
-            }
-            slots[a] = slot;
-
-            /* Get SwiGLU output for this token+slot */
-            const float *swiglu = expert_out + (size_t)t * n_used * n_ff + (size_t)slot * n_ff;
-
-            /* Quantize into per-expert buffer (same layout as moe_qx_all) */
-            float *entry = (float *)exp_down_qx_all + a * q8_per_token;
-            block_q8_0 *exp_qx = (block_q8_0 *)entry;
-            float *exp_qx_d = entry + qx_d_off;
-            quantize_row_q8_0(swiglu, exp_qx, n_ff);
-            for (size_t bi = 0; bi < dnb; bi++)
-                exp_qx_d[bi] = fp16_to_fp32(exp_qx[bi].d);
-
-            qx_bufs[a] = (const void *)exp_qx;
-            qx_d_arr[a] = exp_qx_d;
+            const float *tbuf = c->qx_all + t * c->q8_buf_per_token;
+            size_t idx = (size_t)t * c->n_used * c->n_ff + (size_t)slots[a] * c->n_ff + row;
+            c->gate_out[idx] = vec_dot_q8_0_q8_0_deltas((const void *)tbuf,
+                tbuf + c->qx_d_off, gate_exp + row * c->row_bytes, c->dim);
+            c->up_out[idx] = vec_dot_q8_0_q8_0_deltas((const void *)tbuf,
+                tbuf + c->qx_d_off, up_exp + row * c->row_bytes, c->dim);
         }
+    }
+#endif
+}
 
-        /* Phase 2: Batched down projection using matmul_q8_batch_expert */
-        /* Output layout: [n_assigned * dim] row-major */
-        {
-            float batch_out[64 * 2048]; /* worst case: 64 tokens × 2048 dim — too big for stack */
-            /* Use per-expert output buffer from down_out layout instead */
-            /* For each assigned token, write to the right place in down_out */
+static void mm_id_down_expert_task(int idx, void *ctxp) {
+    mm_id_down_ctx_t *c = (mm_id_down_ctx_t *)ctxp;
+    int eid = idx;
 
-            if (n_assigned == 1) {
-                /* Single-token fast path */
-                float *dout = down_out + (size_t)assigned[0] * n_used * dim + (size_t)slots[0] * dim;
-                matmul_q8(dout, qx_bufs[0], qx_d_arr[0], dw, n_ff, dim, type);
-            } else {
-                /* Multi-token batched down: row-major with batch4, scatter to down_out */
-                int n_batch4 = (n_assigned / 4) * 4;
-                for (int row = 0; row < dim; row++) {
-                    const char *wi = dw + row * row_bytes;
-                    for (int a = 0; a < n_batch4; a += 4) {
-                        float fout[4];
-                        vec_dot_q8_0_q8_0_deltas_batch4(qx_bufs[a], qx_d_arr[a],
-                            qx_bufs[a+1], qx_d_arr[a+1],
-                            qx_bufs[a+2], qx_d_arr[a+2],
-                            qx_bufs[a+3], qx_d_arr[a+3],
-                            wi, n_ff,
-                            &fout[0], &fout[1], &fout[2], &fout[3]);
-                        for (int k = 0; k < 4; k++) {
-                            int t = assigned[a + k];
-                            size_t idx = (size_t)t * n_used * dim + (size_t)slots[a + k] * dim + row;
-                            down_out[idx] = fout[k];
-                        }
-                    }
-                    for (int a = n_batch4; a < n_assigned; a++) {
-                        int t = assigned[a];
-                        size_t idx = (size_t)t * n_used * dim + (size_t)slots[a] * dim + row;
-                        down_out[idx] = vec_dot_q8_0_q8_0_deltas(qx_bufs[a], qx_d_arr[a], wi, n_ff);
-                    }
+    int assigned[64];
+    int n_assigned = 0;
+
+    for (int t = 0; t < c->n_tokens; t++) {
+        int n_tok_experts = c->n_experts_per_token[t];
+        for (int s = 0; s < n_tok_experts; s++) {
+            if (c->ids[t * c->n_used + s] == eid) {
+                assigned[n_assigned++] = t;
+                break;
+            }
+        }
+        if (n_assigned >= 64) break;
+    }
+    if (n_assigned == 0) return;
+
+    const char *dw = (const char *)c->down_w_base + (size_t)eid * c->dim * c->row_bytes;
+
+    int tid = tensor_get_thread_id();
+    float *my_qx_base = (float *)c->exp_down_qx_all + tid * 64 * c->q8_per_token;
+
+    const void *qx_bufs[64];
+    const float *qx_d_arr[64];
+    int slots[64];
+
+    for (int a = 0; a < n_assigned; a++) {
+        int t = assigned[a];
+        int slot = 0;
+        for (int s = 0; s < c->n_used; s++) {
+            if (c->ids[t * c->n_used + s] == eid) { slot = s; break; }
+        }
+        slots[a] = slot;
+
+        const float *swiglu = c->expert_out + (size_t)t * c->n_used * c->n_ff + (size_t)slot * c->n_ff;
+        float *entry = my_qx_base + a * c->q8_per_token;
+        block_q8_0 *exp_qx = (block_q8_0 *)entry;
+        float *exp_qx_d = entry + c->qx_d_off;
+        quantize_row_q8_0(swiglu, exp_qx, c->n_ff);
+        for (size_t bi = 0; bi < c->dnb; bi++)
+            exp_qx_d[bi] = fp16_to_fp32(exp_qx[bi].d);
+
+        qx_bufs[a] = (const void *)exp_qx;
+        qx_d_arr[a] = exp_qx_d;
+    }
+
+    if (n_assigned == 1) {
+        float *dout = c->down_out + (size_t)assigned[0] * c->n_used * c->dim + (size_t)slots[0] * c->dim;
+        matmul_q8(dout, qx_bufs[0], qx_d_arr[0], dw, c->n_ff, c->dim, c->type);
+    } else {
+        int n_batch4 = (n_assigned / 4) * 4;
+        for (int row = 0; row < c->dim; row++) {
+            const char *wi = dw + row * c->row_bytes;
+            for (int a = 0; a < n_batch4; a += 4) {
+                float fout[4];
+                vec_dot_q8_0_q8_0_deltas_batch4(qx_bufs[a], qx_d_arr[a],
+                    qx_bufs[a+1], qx_d_arr[a+1],
+                    qx_bufs[a+2], qx_d_arr[a+2],
+                    qx_bufs[a+3], qx_d_arr[a+3],
+                    wi, c->n_ff,
+                    &fout[0], &fout[1], &fout[2], &fout[3]);
+                for (int k = 0; k < 4; k++) {
+                    int t = assigned[a + k];
+                    size_t idx = (size_t)t * c->n_used * c->dim + (size_t)slots[a + k] * c->dim + row;
+                    c->down_out[idx] = fout[k];
                 }
+            }
+            for (int a = n_batch4; a < n_assigned; a++) {
+                int t = assigned[a];
+                size_t idx = (size_t)t * c->n_used * c->dim + (size_t)slots[a] * c->dim + row;
+                c->down_out[idx] = vec_dot_q8_0_q8_0_deltas(qx_bufs[a], qx_d_arr[a], wi, c->n_ff);
             }
         }
     }
