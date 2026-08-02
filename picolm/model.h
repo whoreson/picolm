@@ -336,6 +336,11 @@ typedef struct {
     float *sh_gate;   /* [n_ff_shexp × n_ctx] */
     float *sh_up;     /* [n_ff_shexp × n_ctx] */
 
+    /* Per-token accumulator for MoE: [n_embd × n_ctx].
+     * Used by weight-centric path to accumulate expert outputs
+     * in Top-K order (matching single-token moe_forward). */
+    float *moe_acc_batch;
+
     /* Single allocation base */
     void *mem_block;
     size_t mem_size;

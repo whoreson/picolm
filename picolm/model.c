@@ -1879,6 +1879,13 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
             if (batch_max > 256) batch_max = 256;
             sz_moe += (size_t)c->n_ff_shexp * batch_max * sizeof(float) * 2; /* sh_gate + sh_up */
         }
+
+        /* Per-token accumulator for MoE: [n_embd × n_expert_used × batch_max] */
+        {
+            size_t batch_max = c->max_seq_len;
+            if (batch_max > 256) batch_max = 256;
+            sz_moe += (size_t)c->n_embd * c->n_expert_used * batch_max * sizeof(float); /* moe_acc_batch */
+        }
     }
 
     size_t total = sz_x + sz_xb + sz_xb2 + sz_q +
@@ -2216,6 +2223,13 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
                 if (batch_max > 256) batch_max = 256;
                 s->sh_gate = p; p += (size_t)c->n_ff_shexp * batch_max;
                 s->sh_up = p; p += (size_t)c->n_ff_shexp * batch_max;
+            }
+
+            /* Per-token accumulator for MoE */
+            {
+                size_t batch_max = c->max_seq_len;
+                if (batch_max > 256) batch_max = 256;
+                s->moe_acc_batch = p; p += (size_t)c->n_embd * c->n_expert_used * batch_max;
             }
         }
     }
@@ -3381,6 +3395,11 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
     int saved_threads = tensor_get_n_threads();
     tensor_set_n_threads(1);
 
+    /* Pre-allocated quantization buffer variables */
+    int q8_buf_per_token = s->moe_q8_buf_per_token;
+    int qx_d_off = s->moe_qx_d_off;
+    float *qx_all = s->moe_qx_all;
+
     /* Per-token expert routing tables: [n_tokens][n_used] */
     int all_ids[n_tokens][8];       /* 8 = max n_expert_used */
     float all_weights[n_tokens][8];
@@ -3433,11 +3452,7 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
 
     /* ---- Phase 2: Quantize all token inputs to Q8_0 (pre-allocated) ---- */
     {
-        int q8_buf_per_token = s->moe_q8_buf_per_token;
-        int qx_d_off = s->moe_qx_d_off;
-        float *qx_all = s->moe_qx_all;
         size_t q8_row_blocks = dim / 32;
-
         for (int t = 0; t < n_tokens; t++) {
             float *tbuf = qx_all + t * q8_buf_per_token;
             block_q8_0 *qx = (block_q8_0 *)tbuf;
@@ -3447,8 +3462,9 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
                 qx_d[bi] = fp16_to_fp32(qx[bi].d);
             }
         }
+    }
 
-        /* ---- Phase 3+4: Token-parallel expert processing ----
+    /* ---- Phase 3+4: Token-parallel expert processing ----
          * Each thread processes a disjoint set of tokens through all their
          * experts. Uses per-thread scratch buffers (no malloc, no races).
          * Each thread writes only to its own residual_batch[t], no races. */
@@ -3486,10 +3502,10 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
             .s = s
         };
 
-        /* Note: tensor_parallel_for uses the global n_threads for dispatch.
-         * We DON'T set n_threads=1 here because that would force sequential mode.
-         * Instead, the worker calls tensor_set_n_threads(1) locally before each matmul. */
-        tensor_parallel_for(n_tokens, (void (*)(int, void *))moe_token_worker, &moe_ctx);
+        /* Sequential token processing for correctness */
+        for (int t = 0; t < n_tokens; t++) {
+            moe_token_worker(t, &moe_ctx);
+        }
 
         /* ---- Phase 5: Shared expert (batched via matmul_q8_batch) ----
          * All tokens go through the same shared expert weights.
@@ -3537,11 +3553,11 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
                 for (int d = 0; d < dim; d++) out[d] += s->xb2[d];
             }
         }
-    }
 
     tensor_set_n_threads(saved_threads);
 }
 
+/* ---- Gemma-3n forward pass (specialized) ---- */
 float *model_forward_gemma3n(model_t *m, int token, int pos);
 
 float *model_forward(model_t *m, int token, int pos) {
