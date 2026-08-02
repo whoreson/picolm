@@ -309,17 +309,16 @@ int tensor_default_threads(void) {
         fprintf(stderr, "CPU: detected %d groups, using %d big cores (skipping %d little)\n",
                 ng, big_cores, cores - big_cores);
         cores = big_cores;
+        /* Cap default threads on big.LITTLE to avoid over-subscription on decode
+         * workloads. The thread pool's broadcast-wait model has O(n_threads)
+         * overhead per matmul. For decode (S=1), each layer has ~8 matmuls
+         * with 4096-14336 output rows. Empirical sweet spot: 4-8 threads.
+         * Users who need more threads for prefill can use -j explicitly. */
+        if (cores > 6) cores = 6;
     }
 #endif
 
     if (cores > MAX_THREADS) cores = MAX_THREADS;
-    /* Cap default threads to avoid over-subscription on decode workloads.
-     * The thread pool's broadcast-wait model has O(n_threads) overhead
-     * per matmul. For decode (S=1), each layer has ~8 matmuls, and each
-     * matmul output dimension is 4096-14336. Empirical sweet spot:
-     * 4-8 threads for Q8_0 models. llama.cpp shows similar behavior.
-     * Users who need more threads for prefill can use -j explicitly. */
-    if (cores > 6) cores = 6;
     return cores;
 }
 
