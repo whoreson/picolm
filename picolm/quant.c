@@ -3724,6 +3724,119 @@ float vec_dot_q8_0_q8_0_deltas(const void *qx, const float *qx_d, const void *qw
 }
 
 /* ================================================================
+ * vec_dot_q8_0_q8_0_deltas_batch4: compute 4 dot products
+ *
+ * Takes 4 pre-quantized token activations (x0..x3) against a single
+ * weight row (w), returning 4 dot products. The weight is loaded once
+ * per block and reused across all 4 activations, multiplying memory
+ * bandwidth efficiency by 4x for the weight portion.
+ *
+ * Each activation has its own per-block delta (qx_d0..qx_d3), while
+ * the weight has a shared per-block delta (w[i].d).
+ * ================================================================ */
+void vec_dot_q8_0_q8_0_deltas_batch4(
+        const void *qx0, const float *qx_d0,
+        const void *qx1, const float *qx_d1,
+        const void *qx2, const float *qx_d2,
+        const void *qx3, const float *qx_d3,
+        const void *qw, int n,
+        float *out0, float *out1, float *out2, float *out3) {
+    const block_q8_0 *x[4] = {
+        (const block_q8_0 *)qx0, (const block_q8_0 *)qx1,
+        (const block_q8_0 *)qx2, (const block_q8_0 *)qx3
+    };
+    const float *qx_d[4] = { qx_d0, qx_d1, qx_d2, qx_d3 };
+    float *out[4] = { out0, out1, out2, out3 };
+    const block_q8_0 *w = (const block_q8_0 *)qw;
+    int nb = n / 32;
+    int i = 0;
+
+#ifdef PICOLM_AVX512
+    __m512 acc[4] = {
+        _mm512_setzero_ps(), _mm512_setzero_ps(),
+        _mm512_setzero_ps(), _mm512_setzero_ps()
+    };
+
+    for (i = 0; i + 1 < nb; i += 2) {
+        __m256i qw0 = _mm256_loadu_si256((const __m256i *)w[i].qs);
+        __m256i qw1 = _mm256_loadu_si256((const __m256i *)w[i + 1].qs);
+        __m512i ww = _mm512_inserti64x4(_mm512_castsi256_si512(qw0), qw1, 1);
+
+        float wd0 = fp16_to_fp32_lookup(w[i].d);
+        float wd1 = fp16_to_fp32_lookup(w[i + 1].d);
+
+        for (int b = 0; b < 4; b++) {
+            __m256i qx0v = _mm256_loadu_si256((const __m256i *)x[b][i].qs);
+            __m256i qx1v = _mm256_loadu_si256((const __m256i *)x[b][i + 1].qs);
+            __m512i xx = _mm512_inserti64x4(_mm512_castsi256_si512(qx0v), qx1v, 1);
+
+            __m512i dot = mul_sum_i8_pairs_avx512(xx, ww);
+            __m512 f = _mm512_cvtepi32_ps(dot);
+
+            float d0 = qx_d[b][i] * wd0;
+            float d1 = qx_d[b][i + 1] * wd1;
+            __m512 dvec = _mm512_insertf32x8(_mm512_castps256_ps512(_mm256_set1_ps(d0)),
+                                              _mm256_set1_ps(d1), 1);
+            acc[b] = _mm512_fmadd_ps(f, dvec, acc[b]);
+        }
+    }
+    for (int b = 0; b < 4; b++) *out[b] = _mm512_reduce_add_ps(acc[b]);
+
+#elif defined(PICOLM_AVX2)
+    __m256 acc[4] = {
+        _mm256_setzero_ps(), _mm256_setzero_ps(),
+        _mm256_setzero_ps(), _mm256_setzero_ps()
+    };
+
+    for (i = 0; i + 1 < nb; i += 2) {
+        __m256i qw0 = _mm256_loadu_si256((const __m256i *)w[i].qs);
+        __m256i qw1 = _mm256_loadu_si256((const __m256i *)w[i + 1].qs);
+
+        float wd0 = fp16_to_fp32_lookup(w[i].d);
+        float wd1 = fp16_to_fp32_lookup(w[i + 1].d);
+
+        for (int b = 0; b < 4; b++) {
+            __m256i qx0v = _mm256_loadu_si256((const __m256i *)x[b][i].qs);
+            __m256i qx1v = _mm256_loadu_si256((const __m256i *)x[b][i + 1].qs);
+
+            __m256i s0 = mul_sum_i8_pairs_avx2(qx0v, qw0);
+            __m256i s1 = mul_sum_i8_pairs_avx2(qx1v, qw1);
+            __m256 f0 = _mm256_cvtepi32_ps(s0);
+            __m256 f1 = _mm256_cvtepi32_ps(s1);
+
+            acc[b] = _mm256_fmadd_ps(f0, _mm256_set1_ps(qx_d[b][i] * wd0),
+                       _mm256_fmadd_ps(f1, _mm256_set1_ps(qx_d[b][i + 1] * wd1), acc[b]));
+        }
+    }
+    for (int b = 0; b < 4; b++) *out[b] = hsum_avx(acc[b]);
+
+#else
+    /* Fallback: 4 separate scalar dot products */
+    for (int b = 0; b < 4; b++) {
+        float s = 0.0f;
+        for (i = 0; i < nb; i++) {
+            int sumi = 0;
+            for (int j = 0; j < 32; j++) sumi += x[b][i].qs[j] * w[i].qs[j];
+            s += (float)sumi * qx_d[b][i] * fp16_to_fp32_lookup(w[i].d);
+        }
+        *out[b] = s;
+    }
+    return;
+#endif
+
+    /* Scalar remainder (same for all 4 outputs) */
+    for (int b = 0; b < 4; b++) {
+        float s = 0.0f;
+        for (; i < nb; i++) {
+            int sumi = 0;
+            for (int j = 0; j < 32; j++) sumi += x[b][i].qs[j] * w[i].qs[j];
+            s += (float)sumi * qx_d[b][i] * fp16_to_fp32_lookup(w[i].d);
+        }
+        *out[b] += s;
+    }
+}
+
+/* ================================================================
  * vec_dot_q8_0_f32: fused dequant + dot for Q8_0 x float32
  *
  * Strategy: load int8 quantized values, widen to int32, multiply

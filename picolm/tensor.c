@@ -1473,34 +1473,59 @@ void matmul_q8(float *out, const void *qx, const float *qx_d,
 }
 
 /* matmul_q8_batch: batched Q8×Q8 matmul with pre-quantized activations.
- * qx_all: array of n_batch pre-quantized Q8_0 inputs, each of size q8_buf_per_token floats.
- *         Layout: qx_all[b * q8_buf_per_token] = block_q8_0 data + deltas
- * qx_d_off: offset (in floats) from start of each token's buffer to the delta array.
- * out: output [n_batch * d], row-major: out[b * d + i] = token b, row i.
- * W: weight matrix [d rows × n cols] in quantized format.
- * n: input dimension (must be multiple of 32).
- * d: number of output rows.
- * n_batch: number of tokens to process.
- * qtype: weight quantization type (typically GGUF_TYPE_Q8_0).
  *
- * Token-major traversal: for each token, process all rows. This keeps qx in
- * L1 cache across all d rows (qx is ~8KB for dim=2048, fitting in L1). */
+ * Strategy: for each weight row, process 4 tokens at a time using
+ * vec_dot_q8_0_q8_0_deltas_batch4, which loads the weight block once
+ * and reuses it across 4 different activations. This reduces weight
+ * memory traffic by ~4x compared to sequential single-token calls.
+ *
+ * qx_all: array of n_batch pre-quantized Q8_0 inputs, each of size
+ *         q8_buf_per_token floats.
+ * qx_d_off: offset in floats from token buffer start to delta array.
+ * out: output [n_batch * d], row-major: out[b*d + i] = token b, row i.
+ * W: weight matrix [d rows × n cols] in Q8_0 format. */
 void matmul_q8_batch(float *out, const float *qx_all, int qx_d_off,
                      int q8_buf_per_token, const void *W,
                      int n, int d, int n_batch, gguf_type_t qtype) {
+    if (qtype != GGUF_TYPE_Q8_0 || n <= 0 || d <= 0 || n_batch <= 0) return;
+
     size_t row_bytes = gguf_type_row_size(qtype, n);
     const char *wptr = (const char *)W;
 
-    if (qtype != GGUF_TYPE_Q8_0 || n <= 0 || d <= 0 || n_batch <= 0) return;
+    /* Process 4 tokens at a time per weight row */
+    int n_batch4 = (n_batch / 4) * 4;
 
-    for (int b = 0; b < n_batch; b++) {
-        const float *tbuf = qx_all + b * q8_buf_per_token;
-        const void *qx = (const void *)tbuf;
-        const float *qx_d = tbuf + qx_d_off;
-        float *bout = out + b * d;
+    for (int i = 0; i < d; i++) {
+        const char *wi = wptr + (size_t)i * row_bytes;
 
-        for (int i = 0; i < d; i++) {
-            bout[i] = vec_dot_q8_0_q8_0_deltas(qx, qx_d, wptr + (size_t)i * row_bytes, n);
+        /* Batch-4 kernel: weight loaded once per block, reused across 4 tokens */
+        for (int b = 0; b < n_batch4; b += 4) {
+            const float *tb[4];
+            const void *qx[4];
+            const float *qx_d[4];
+            float fout[4];
+
+            for (int k = 0; k < 4; k++) {
+                tb[k] = qx_all + (b + k) * q8_buf_per_token;
+                qx[k] = (const void *)tb[k];
+                qx_d[k] = tb[k] + qx_d_off;
+            }
+
+            vec_dot_q8_0_q8_0_deltas_batch4(qx[0], qx_d[0], qx[1], qx_d[1],
+                                             qx[2], qx_d[2], qx[3], qx_d[3],
+                                             wi, n,
+                                             &fout[0], &fout[1], &fout[2], &fout[3]);
+
+            for (int k = 0; k < 4; k++) {
+                out[(b + k) * d + i] = fout[k];
+            }
+        }
+
+        /* Remainder: single-token vec_dot */
+        for (int b = n_batch4; b < n_batch; b++) {
+            const float *tbuf = qx_all + b * q8_buf_per_token;
+            out[b * d + i] = vec_dot_q8_0_q8_0_deltas((const void *)tbuf,
+                tbuf + qx_d_off, wi, n);
         }
     }
 }

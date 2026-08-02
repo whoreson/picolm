@@ -552,6 +552,14 @@ float vec_dot_q4_1_f32(const void *src, const float *x, int n);
 float vec_dot_f16_f32(const void *src, const float *x, int n);
 float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n);
 float vec_dot_q8_0_q8_0_deltas(const void *qx, const float *qx_d, const void *qw, int n);
+/* Batch-4: compute 4 dot products with 1 shared weight row */
+void vec_dot_q8_0_q8_0_deltas_batch4(
+        const void *qx0, const float *qx_d0,
+        const void *qx1, const float *qx_d1,
+        const void *qx2, const float *qx_d2,
+        const void *qx3, const float *qx_d3,
+        const void *qw, int n,
+        float *out0, float *out1, float *out2, float *out3);
 /* Q1_0 * Q8_0 dot product: 1-bit weights with pre-quantized Q8_0 input */
 float vec_dot_q1_0_q8_0(const void *src_q1, const void *src_q8, int n);
 /* Q2_0 * Q8_0 dot product: 2-bit weights with pre-quantized Q8_0 input */
