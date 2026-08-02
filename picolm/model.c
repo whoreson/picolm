@@ -3176,13 +3176,19 @@ static void moe_forward(model_t *m, run_state_t *s, const float *x, float *resid
     }
 }
 
-/* moe_forward_batch: process multiple tokens through MoE simultaneously.
- * x_batch: input [n_tokens * dim] with stride dim
- * residual_batch: output [n_tokens * dim] with stride dim
- * All tokens share the same expert assignments (simplification for prefill).
- * In practice, each token may select different experts, but for prefill we
- * process each token's routing + experts independently, just sharing the
- * quantized buffer across tokens. */
+/* moe_forward_batch: expert-centric batched MoE forward pass.
+ *
+ * Strategy (following llama.cpp's mm_id pattern):
+ * Phase 1: Route all tokens → per-token expert_ids + weights
+ * Phase 2: Quantize all token inputs to Q8_0
+ * Phase 3: For each selected expert E, collect assigned tokens, do
+ *          batched matmul_q8 per projection (gate, up, down)
+ * Phase 4: Weighted accumulation per token
+ * Phase 5: Shared expert batched across all tokens
+ *
+ * x_batch:        input [n_tokens * dim], stride = dim
+ * residual_batch: output [n_tokens * dim], stride = dim
+ */
 static void moe_forward_batch(model_t *m, run_state_t *s,
                               const float *x_batch, float *residual_batch,
                               int n_tokens, const layer_weights_t *lw) {
@@ -3192,25 +3198,23 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
     int n_expert = c->n_expert;
     int n_used = c->n_expert_used;
     float *moe_out = s->moe_out;
-    float *hb_exp = s->hb_exp;
-    float *hb2_exp = s->hb2_exp;
-    float *xb2_exp = s->xb2;
 
     int saved_threads = tensor_get_n_threads();
     tensor_set_n_threads(1);
 
-    gguf_type_t type_gate = lw->type_ffn_gate_exps;
-    gguf_type_t type_up = lw->type_ffn_up_exps;
-    gguf_type_t type_down = lw->type_ffn_down_exps;
+    
+    /* Per-token expert routing tables: [n_tokens][n_used] */
+    int all_ids[n_tokens][8];       /* 8 = max n_expert_used */
+    float all_weights[n_tokens][8];
 
+    /* ---- Phase 1: Route all tokens ---- */
     for (int t = 0; t < n_tokens; t++) {
         const float *x = x_batch + t * dim;
-        float *residual = residual_batch + t * dim;
 
-        /* 1. Router: x @ ffn_gate_inp → logits */
+        /* Router: x @ ffn_gate_inp → logits [n_expert] */
         matmul(s->expert_logits, x, lw->ffn_gate_inp, dim, n_expert, lw->type_ffn_gate_inp);
 
-        /* 2. Softmax + shared expert gate */
+        /* Softmax */
         {
             float *logits = s->expert_logits;
             float max_l = logits[0];
@@ -3226,10 +3230,10 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
             for (int i = 0; i < n_expert; i++) logits[i] *= inv_sum;
         }
 
-        /* 3. Top-K selection */
+        /* Top-K selection */
         {
-            int *ids = s->expert_ids;
-            float *weights = s->expert_weights;
+            int *ids = all_ids[t];
+            float *weights = all_weights[t];
             float *logits = s->expert_logits;
             int idx[256];
             for (int i = 0; i < n_expert; i++) idx[i] = i;
@@ -3247,98 +3251,180 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
             float inv_wsum = (wsum > 0.0f) ? 1.0f / wsum : 0.0f;
             for (int i = 0; i < n_used; i++) weights[i] *= inv_wsum;
         }
+    }
+    
+    /* ---- Phase 2: Quantize all token inputs to Q8_0 ----
+     * We use a contiguous scratch area for quantized activations.
+     * Layout: [n_tokens * (q8_row_blocks + nb_deltas)] as float array. */
+    {
+        size_t q8_row_blocks = dim / 32;
+        size_t q8_row_size = q8_row_blocks * sizeof(block_q8_0);
+        size_t q8_buf_per_token = (q8_row_size + sizeof(float) - 1) / sizeof(float) + q8_row_blocks;
+        float *qx_all = (float *)malloc(n_tokens * q8_buf_per_token * sizeof(float));
+        if (!qx_all) { tensor_set_n_threads(saved_threads); return; }
 
-        /* 4. Zero accumulator */
-        memset(moe_out, 0, dim * sizeof(float));
-
-        /* 5. Experts: gate+up (Q8×Q8) + SwiGLU + down (Q8×Q8) */
-        {
-            size_t nb = dim / 32;
-            block_q8_0 *qx = s->shared_qx;
-            float *qx_d = s->shared_qx_d;
-            quantize_row_q8_0(x, qx, dim);
-            for (size_t bi = 0; bi < nb; bi++) {
+        for (int t = 0; t < n_tokens; t++) {
+            float *tbuf = qx_all + t * q8_buf_per_token;
+            block_q8_0 *qx = (block_q8_0 *)tbuf;
+            float *qx_d = tbuf + (q8_row_size + sizeof(float) - 1) / sizeof(float);
+            quantize_row_q8_0(x_batch + t * dim, qx, dim);
+            for (size_t bi = 0; bi < q8_row_blocks; bi++) {
                 qx_d[bi] = fp16_to_fp32(qx[bi].d);
             }
-
-            int *ids = s->expert_ids;
-            float *weights = s->expert_weights;
-
-            for (int i = 0; i < n_used; i++) {
-                int eid = ids[i];
-                float w_i = weights[i];
-
-                const void *gate_w = get_expert_slice(lw->ffn_gate_exps, eid, dim, n_ff, type_gate);
-                const void *up_w = get_expert_slice(lw->ffn_up_exps, eid, dim, n_ff, type_up);
-                const void *down_w = get_expert_slice(lw->ffn_down_exps, eid, n_ff, dim, type_down);
-
-                matmul_q8(hb_exp, qx, qx_d, gate_w, dim, n_ff, type_gate);
-                matmul_q8(hb2_exp, qx, qx_d, up_w, dim, n_ff, type_up);
-
-                silu(hb_exp, n_ff);
-                elemwise_mul(hb_exp, hb_exp, hb2_exp, n_ff);
-
-                /* Q8×Q8 down */
-                {
-                    size_t dnb = n_ff / 32;
-                    quantize_row_q8_0(hb_exp, s->down_qx, n_ff);
-                    for (size_t bi = 0; bi < dnb; bi++) {
-                        s->down_qx_d[bi] = fp16_to_fp32(s->down_qx[bi].d);
-                    }
-                    matmul_q8(xb2_exp, s->down_qx, s->down_qx_d, down_w, n_ff, dim, type_down);
-                }
-
-#ifdef PICOLM_AVX512
-                {
-                    __m512 bw = _mm512_set1_ps(w_i);
-                    int di = 0;
-                    for (; di + 15 < dim; di += 16) {
-                        __m512 v0 = _mm512_loadu_ps(moe_out + di);
-                        __m512 v1 = _mm512_loadu_ps(xb2_exp + di);
-                        __m512 v2 = _mm512_loadu_ps(moe_out + di + 8);
-                        __m512 v3 = _mm512_loadu_ps(xb2_exp + di + 8);
-                        _mm512_storeu_ps(moe_out + di, _mm512_add_ps(v0, _mm512_mul_ps(bw, v1)));
-                        _mm512_storeu_ps(moe_out + di + 8, _mm512_add_ps(v2, _mm512_mul_ps(bw, v3)));
-                    }
-                    for (; di < dim; di++) moe_out[di] += w_i * xb2_exp[di];
-                }
-#else
-                for (int d = 0; d < dim; d++) moe_out[d] += w_i * xb2_exp[d];
-#endif
-            }
         }
 
-        /* 6. Shared expert — Q8×Q8 */
+        /* ---- Phase 3+4: Expert-centric gate+up+down + accumulation ----
+         * For each token, for each of its n_used experts:
+         *   gate = matmul_q8(qx[t], gate_w[e])
+         *   up   = matmul_q8(qx[t], up_w[e])
+         *   SwiGLU(down) = matmul_q8(quantize(silu(gate)*up), down_w[e])
+         *   moe_out[t] += weight * down_out
+         *
+         * To maximize cache reuse, we group by expert: for each expert E,
+         * find all tokens that selected it, and batch their gate/up/down
+         * projections. However, since matmul_q8 currently only supports
+         * single-row output, we loop token-first within each expert. */
+
+        gguf_type_t type_gate = lw->type_ffn_gate_exps;
+        gguf_type_t type_up = lw->type_ffn_up_exps;
+        gguf_type_t type_down = lw->type_ffn_down_exps;
+
+        float *hb_exp = s->hb_exp;
+        float *hb2_exp = s->hb2_exp;
+        float *xb2_exp = s->xb2;
+
+        /* Zero all MoE output accumulators */
+        memset(residual_batch, 0, (size_t)n_tokens * dim * sizeof(float));
+
+        /* Expert-centric loop: for each expert, process all assigned tokens */
+        for (int ei = 0; ei < n_used; ei++) {
+            /* Collect unique experts and their token lists for this expert slot */
+            int expert_tokens[n_tokens];
+            int n_expert_tokens = 0;
+
+            for (int t = 0; t < n_tokens; t++) {
+                expert_tokens[n_expert_tokens++] = t;
+            }
+
+            /* Group by expert ID — use a simple bucket approach */
+            int expert_bucket[256]; /* expert_id → list start in expert_tokens */
+            int expert_count[256];
+            memset(expert_count, 0, sizeof(int) * 256);
+
+            /* Count tokens per expert for this slot */
+            for (int t = 0; t < n_tokens; t++) {
+                expert_count[all_ids[t][ei]]++;
+            }
+
+            /* Build prefix sums for bucket starts */
+            expert_bucket[0] = 0;
+            for (int e = 1; e < n_expert; e++) {
+                expert_bucket[e] = expert_bucket[e - 1] + expert_count[e - 1];
+            }
+
+            /* Place tokens into buckets */
+            int current_pos[256];
+            for (int e = 0; e < n_expert; e++) current_pos[e] = expert_bucket[e];
+            int bucket_tokens[n_tokens];
+            for (int t = 0; t < n_tokens; t++) {
+                int eid = all_ids[t][ei];
+                bucket_tokens[current_pos[eid]++] = t;
+            }
+
+            /* Process each expert that has tokens */
+            for (int e = 0; e < n_expert; e++) {
+                if (expert_count[e] == 0) continue;
+
+                const void *gate_w = get_expert_slice(lw->ffn_gate_exps, e, dim, n_ff, type_gate);
+                const void *up_w = get_expert_slice(lw->ffn_up_exps, e, dim, n_ff, type_up);
+                const void *down_w = get_expert_slice(lw->ffn_down_exps, e, n_ff, dim, type_down);
+
+                /* For each token assigned to this expert */
+                for (int bi = expert_bucket[e]; bi < expert_bucket[e] + expert_count[e]; bi++) {
+                    int t = bucket_tokens[bi];
+                    float *tbuf = qx_all + t * q8_buf_per_token;
+                    block_q8_0 *qx = (block_q8_0 *)tbuf;
+                    float *qx_d = tbuf + (q8_row_size + sizeof(float) - 1) / sizeof(float);
+
+                    float *out = residual_batch + t * dim;
+
+                    matmul_q8(hb_exp, qx, qx_d, gate_w, dim, n_ff, type_gate);
+                    matmul_q8(hb2_exp, qx, qx_d, up_w, dim, n_ff, type_up);
+
+                    silu(hb_exp, n_ff);
+                    elemwise_mul(hb_exp, hb_exp, hb2_exp, n_ff);
+
+                    /* Q8×Q8 down */
+                    {
+                        size_t dnb = n_ff / 32;
+                        quantize_row_q8_0(hb_exp, s->down_qx, n_ff);
+                        for (size_t b = 0; b < dnb; b++) {
+                            s->down_qx_d[b] = fp16_to_fp32(s->down_qx[b].d);
+                        }
+                        matmul_q8(xb2_exp, s->down_qx, s->down_qx_d, down_w, n_ff, dim, type_down);
+                    }
+
+                    /* Weighted accumulation */
+                    float w_i = all_weights[t][ei];
+#ifdef PICOLM_AVX512
+                    {
+                        __m512 bw = _mm512_set1_ps(w_i);
+                        int di = 0;
+                        for (; di + 15 < dim; di += 16) {
+                            __m512 v0 = _mm512_loadu_ps(out + di);
+                            __m512 v1 = _mm512_loadu_ps(xb2_exp + di);
+                            __m512 v2 = _mm512_loadu_ps(out + di + 8);
+                            __m512 v3 = _mm512_loadu_ps(xb2_exp + di + 8);
+                            _mm512_storeu_ps(out + di, _mm512_add_ps(v0, _mm512_mul_ps(bw, v1)));
+                            _mm512_storeu_ps(out + di + 8, _mm512_add_ps(v2, _mm512_mul_ps(bw, v3)));
+                        }
+                        for (; di < dim; di++) out[di] += w_i * xb2_exp[di];
+                    }
+#else
+                    for (int d = 0; d < dim; d++) out[d] += w_i * xb2_exp[d];
+#endif
+                }
+            }
+        }
+        
+        /* ---- Phase 5: Shared expert (batched across all tokens) ---- */
         {
             size_t nb = dim / 32;
-            quantize_row_q8_0(x, s->shared_qx, dim);
-            for (size_t bi = 0; bi < nb; bi++) {
-                s->shared_qx_d[bi] = fp16_to_fp32(s->shared_qx[bi].d);
-            }
-            matmul_q8(s->hb, s->shared_qx, s->shared_qx_d, lw->ffn_gate_shexp, dim, c->n_ff_shexp, lw->type_ffn_gate_shexp);
-            matmul_q8(s->hb2, s->shared_qx, s->shared_qx_d, lw->ffn_up_shexp, dim, c->n_ff_shexp, lw->type_ffn_up_shexp);
-            silu(s->hb, c->n_ff_shexp);
-            elemwise_mul(s->hb, s->hb, s->hb2, c->n_ff_shexp);
-            {
-                size_t dnb = c->n_ff_shexp / 32;
-                quantize_row_q8_0(s->hb, s->shared_down_qx, c->n_ff_shexp);
-                for (size_t bi = 0; bi < dnb; bi++) {
-                    s->shared_down_qx_d[bi] = fp16_to_fp32(s->shared_down_qx[bi].d);
+            for (int t = 0; t < n_tokens; t++) {
+                const float *x = x_batch + t * dim;
+                float *out = residual_batch + t * dim;
+
+                quantize_row_q8_0(x, s->shared_qx, dim);
+                for (size_t bi = 0; bi < nb; bi++) {
+                    s->shared_qx_d[bi] = fp16_to_fp32(s->shared_qx[bi].d);
                 }
-                matmul_q8(s->xb2, s->shared_down_qx, s->shared_down_qx_d, lw->ffn_down_shexp, c->n_ff_shexp, dim, lw->type_ffn_down_shexp);
+                matmul_q8(s->hb, s->shared_qx, s->shared_qx_d, lw->ffn_gate_shexp, dim, c->n_ff_shexp, lw->type_ffn_gate_shexp);
+                matmul_q8(s->hb2, s->shared_qx, s->shared_qx_d, lw->ffn_up_shexp, dim, c->n_ff_shexp, lw->type_ffn_up_shexp);
+                silu(s->hb, c->n_ff_shexp);
+                elemwise_mul(s->hb, s->hb, s->hb2, c->n_ff_shexp);
+                {
+                    size_t dnb = c->n_ff_shexp / 32;
+                    quantize_row_q8_0(s->hb, s->shared_down_qx, c->n_ff_shexp);
+                    for (size_t bi = 0; bi < dnb; bi++) {
+                        s->shared_down_qx_d[bi] = fp16_to_fp32(s->shared_down_qx[bi].d);
+                    }
+                    matmul_q8(s->xb2, s->shared_down_qx, s->shared_down_qx_d, lw->ffn_down_shexp, c->n_ff_shexp, dim, lw->type_ffn_down_shexp);
+                }
+
+                /* Shared expert sigmoid gate */
+                {
+                    float gate_val;
+                    matmul(&gate_val, x, lw->ffn_gate_inp_shexp, dim, 1, GGUF_TYPE_F32);
+                    gate_val = 1.0f / (1.0f + expf(-gate_val));
+                    for (int d = 0; d < dim; d++) s->xb2[d] *= gate_val;
+                }
+
+                /* Add shared to MoE output */
+                for (int d = 0; d < dim; d++) out[d] += s->xb2[d];
             }
         }
 
-        /* Shared expert sigmoid gate */
-        {
-            float gate_val;
-            matmul(&gate_val, x, lw->ffn_gate_inp_shexp, dim, 1, GGUF_TYPE_F32);
-            gate_val = 1.0f / (1.0f + expf(-gate_val));
-            for (int d = 0; d < dim; d++) s->xb2[d] *= gate_val;
-        }
-
-        /* 7. Combine */
-        for (int d = 0; d < dim; d++) residual[d] = moe_out[d] + s->xb2[d];
+        free(qx_all);
     }
 
     tensor_set_n_threads(saved_threads);
