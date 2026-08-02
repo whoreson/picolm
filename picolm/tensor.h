@@ -32,6 +32,7 @@ int tensor_get_big_cores(void);
 void tensor_threadpool_init(int n_threads);
 int tensor_get_n_threads(void);
 void tensor_set_n_threads(int n);
+int tensor_get_thread_id(void);  /* returns 0 for main, 1..n-1 for pool workers */
 void tensor_threadpool_free(void);
 void matmul_batch(float *out, const float *x, int n_batch,
                    const void *W, int n, int d, gguf_type_t qtype);

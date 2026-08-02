@@ -309,6 +309,13 @@ typedef struct {
     block_q8_0 *shared_down_qx; /* quantized SwiGLU for shared down */
     float *shared_down_qx_d;  /* deltas */
 
+    /* Per-thread MoE scratch buffers for parallel dispatch (no malloc in workers).
+     * Each thread gets: gate_buf[n_ff_exp], up_buf[n_ff_exp], xb2_buf[n_embd],
+     * down_qx (Q8_0 row), down_qx_d (deltas), acc_buf[n_embd].
+     * Allocated as [n_threads × per_thread_size] contiguous block. */
+    void *moe_thread_scratch;  /* base pointer to per-thread scratch area */
+    size_t moe_thread_stride;  /* bytes per thread */
+
     /* Single allocation base */
     void *mem_block;
     size_t mem_size;

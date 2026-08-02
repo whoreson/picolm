@@ -406,6 +406,12 @@ typedef struct {
 
 static generic_task_t  generic_tasks[MAX_THREADS];
 static volatile int    pool_mode = 0; /* 0 = matmul_task_t, 1 = generic_task_t */
+static __thread int    pool_my_tid = 0; /* TLS: current thread's pool index (0 for main) */
+
+/* Return current thread's pool index (0 for main thread, 1..n-1 for workers) */
+int tensor_get_thread_id(void) {
+    return pool_my_tid;
+}
 
 static void generic_worker_f(generic_task_t *t) {
     for (int i = t->start; i < t->end; i++) t->fn(i, t->ctx);
@@ -676,6 +682,7 @@ static DWORD WINAPI pool_worker(void *arg) {
 static void *pool_worker(void *arg) {
 #endif
     int tid = (int)(size_t)arg;
+    pool_my_tid = tid;
     int last_gen = 0;
     win_mutex_lock(&pool_mutex);
     while (1) {
