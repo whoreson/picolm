@@ -56,6 +56,14 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
 extern void matmul_q8(float *out, const void *qx, const float *qx_d,
                       const void *W, int n, int d, gguf_type_t qtype);
 
+/* matmul_q8_batch: batched Q8×Q8 with pre-quantized activations.
+ * qx_all: [n_batch * q8_buf_per_token] float array with Q8_0 blocks + deltas.
+ * qx_d_off: offset in floats from token buffer start to delta array.
+ * out: [n_batch * d] row-major output. */
+extern void matmul_q8_batch(float *out, const float *qx_all, int qx_d_off,
+                            int q8_buf_per_token, const void *W,
+                            int n, int d, int n_batch, gguf_type_t qtype);
+
 /* RMS normalization: out[i] = x[i] / sqrt(mean(x^2) + eps) * weight[i] */
 void rmsnorm(float *out, const float *x, const float *weight, int size, float eps);
 

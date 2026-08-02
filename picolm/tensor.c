@@ -1472,6 +1472,39 @@ void matmul_q8(float *out, const void *qx, const float *qx_d,
     }
 }
 
+/* matmul_q8_batch: batched Q8×Q8 matmul with pre-quantized activations.
+ * qx_all: array of n_batch pre-quantized Q8_0 inputs, each of size q8_buf_per_token floats.
+ *         Layout: qx_all[b * q8_buf_per_token] = block_q8_0 data + deltas
+ * qx_d_off: offset (in floats) from start of each token's buffer to the delta array.
+ * out: output [n_batch * d], row-major: out[b * d + i] = token b, row i.
+ * W: weight matrix [d rows × n cols] in quantized format.
+ * n: input dimension (must be multiple of 32).
+ * d: number of output rows.
+ * n_batch: number of tokens to process.
+ * qtype: weight quantization type (typically GGUF_TYPE_Q8_0).
+ *
+ * Token-major traversal: for each token, process all rows. This keeps qx in
+ * L1 cache across all d rows (qx is ~8KB for dim=2048, fitting in L1). */
+void matmul_q8_batch(float *out, const float *qx_all, int qx_d_off,
+                     int q8_buf_per_token, const void *W,
+                     int n, int d, int n_batch, gguf_type_t qtype) {
+    size_t row_bytes = gguf_type_row_size(qtype, n);
+    const char *wptr = (const char *)W;
+
+    if (qtype != GGUF_TYPE_Q8_0 || n <= 0 || d <= 0 || n_batch <= 0) return;
+
+    for (int b = 0; b < n_batch; b++) {
+        const float *tbuf = qx_all + b * q8_buf_per_token;
+        const void *qx = (const void *)tbuf;
+        const float *qx_d = tbuf + qx_d_off;
+        float *bout = out + b * d;
+
+        for (int i = 0; i < d; i++) {
+            bout[i] = vec_dot_q8_0_q8_0_deltas(qx, qx_d, wptr + (size_t)i * row_bytes, n);
+        }
+    }
+}
+
 void matmul_batch(float *out, const float *x, int n_batch,
                    const void *W, int n, int d, gguf_type_t qtype) {
 #ifdef PICOLM_GPU
