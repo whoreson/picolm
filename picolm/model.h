@@ -300,6 +300,14 @@ typedef struct {
     float *moe_out;           /* MoE output accumulator [n_embd] */
     float *hb_exp;            /* per-expert hidden buffer [n_ff_exp] */
     float *hb2_exp;           /* second per-expert hidden buffer [n_ff_exp] */
+    float *gate_batch;        /* batched gate outputs [n_ff_exp][n_expert_used] */
+    float *up_batch;          /* batched up outputs [n_ff_exp][n_expert_used] */
+    block_q8_0 *down_qx;      /* quantized SwiGLU for down projection */
+    float *down_qx_d;         /* deltas */
+    block_q8_0 *shared_qx;    /* quantized input for shared expert */
+    float *shared_qx_d;       /* deltas */
+    block_q8_0 *shared_down_qx; /* quantized SwiGLU for shared down */
+    float *shared_down_qx_d;  /* deltas */
 
     /* Single allocation base */
     void *mem_block;

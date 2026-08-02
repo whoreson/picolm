@@ -1829,6 +1829,15 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         sz_moe += (size_t)c->n_expert_used * sizeof(float);  /* expert_weights */
         sz_moe += (size_t)c->n_embd * sizeof(float);         /* moe_out */
         sz_moe += (size_t)c->n_ff_exp * sizeof(float) * 2;   /* hb_exp, hb2_exp */
+        /* Pre-allocated quantization buffers — avoid per-expert malloc */
+        sz_moe += (size_t)c->n_ff_exp * (size_t)c->n_expert_used * sizeof(float); /* gate_batch */
+        sz_moe += (size_t)c->n_ff_exp * (size_t)c->n_expert_used * sizeof(float); /* up_batch */
+        sz_moe += gguf_type_row_size(GGUF_TYPE_Q8_0, c->n_ff_exp); /* down_qx */
+        sz_moe += (c->n_ff_exp / 32) * sizeof(float);         /* down_qx_d */
+        sz_moe += gguf_type_row_size(GGUF_TYPE_Q8_0, c->n_embd); /* shared_qx */
+        sz_moe += (c->n_embd / 32) * sizeof(float);           /* shared_qx_d */
+        sz_moe += gguf_type_row_size(GGUF_TYPE_Q8_0, c->n_ff_shexp); /* shared_down_qx */
+        sz_moe += (c->n_ff_shexp / 32) * sizeof(float);       /* shared_down_qx_d */
     }
 
     size_t total = sz_x + sz_xb + sz_xb2 + sz_q +
@@ -2106,6 +2115,23 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         s->moe_out = p; p += c->n_embd;
         s->hb_exp = p; p += c->n_ff_exp;
         s->hb2_exp = p; p += c->n_ff_exp;
+        s->gate_batch = p; p += (size_t)c->n_ff_exp * c->n_expert_used;
+        s->up_batch = p; p += (size_t)c->n_ff_exp * c->n_expert_used;
+        {
+            size_t q8_rb, q8_nb;
+            q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, c->n_ff_exp);
+            q8_nb = c->n_ff_exp / 32;
+            s->down_qx = (block_q8_0 *)p; p += (q8_rb + sizeof(float) - 1) / sizeof(float);
+            s->down_qx_d = p; p += q8_nb;
+            q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, c->n_embd);
+            q8_nb = c->n_embd / 32;
+            s->shared_qx = (block_q8_0 *)p; p += (q8_rb + sizeof(float) - 1) / sizeof(float);
+            s->shared_qx_d = p; p += q8_nb;
+            q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, c->n_ff_shexp);
+            q8_nb = c->n_ff_shexp / 32;
+            s->shared_down_qx = (block_q8_0 *)p; p += (q8_rb + sizeof(float) - 1) / sizeof(float);
+            s->shared_down_qx_d = p; p += q8_nb;
+        }
     }
 
     /* Pre-dequantize norm weights */
@@ -3047,16 +3073,14 @@ static void moe_forward(model_t *m, run_state_t *s, const float *x, float *resid
      * All expert gate+up projections reuse this quantized buffer via matmul_q8,
      * saving 16 redundant quantizations per MoE layer. */
     {
-        size_t q8_row_size = gguf_type_row_size(GGUF_TYPE_Q8_0, dim);
+        /* Disable threading for small MoE matmuls — thread pool overhead dominates */
+        int saved_threads = tensor_get_n_threads();
+        tensor_set_n_threads(1);
+
         size_t nb = dim / 32;
-        size_t buf_size = q8_row_size + nb * sizeof(float);
-        float *qx_buf = (float *)malloc(buf_size);
-        if (!qx_buf) return;
-
-        block_q8_0 *qx = (block_q8_0 *)qx_buf;
+        block_q8_0 *qx = s->shared_qx; /* pre-allocated, reused each layer */
+        float *qx_d = s->shared_qx_d;
         quantize_row_q8_0(x, qx, dim);
-
-        float *qx_d = qx_buf + (q8_row_size / sizeof(float));
         for (size_t bi = 0; bi < nb; bi++) {
             qx_d[bi] = fp16_to_fp32(qx[bi].d);
         }
@@ -3069,8 +3093,6 @@ static void moe_forward(model_t *m, run_state_t *s, const float *x, float *resid
         float *hb2_exp = s->hb2_exp;
         float *xb2_exp = s->xb2;
 
-        /* Sequential expert computation with pre-quantized x (Phase A + D).
-         * Each expert's gate+up reuse the Q8_0 quantized activation via matmul_q8. */
         for (int i = 0; i < n_used; i++) {
             int eid = ids[i];
             float w_i = weights[i];
@@ -3084,7 +3106,16 @@ static void moe_forward(model_t *m, run_state_t *s, const float *x, float *resid
 
             silu(hb_exp, n_ff);
             elemwise_mul(hb_exp, hb_exp, hb2_exp, n_ff);
-            matmul(xb2_exp, hb_exp, down_w, n_ff, dim, type_down);
+
+            /* Q8×Q8 down projection with pre-allocated quantization buffer */
+            {
+                size_t down_nb = n_ff / 32;
+                quantize_row_q8_0(hb_exp, s->down_qx, n_ff);
+                for (size_t bi = 0; bi < down_nb; bi++) {
+                    s->down_qx_d[bi] = fp16_to_fp32(s->down_qx[bi].d);
+                }
+                matmul_q8(xb2_exp, s->down_qx, s->down_qx_d, down_w, n_ff, dim, type_down);
+            }
 
 #ifdef PICOLM_AVX512
             {
@@ -3104,16 +3135,32 @@ static void moe_forward(model_t *m, run_state_t *s, const float *x, float *resid
             for (int d = 0; d < dim; d++) moe_out[d] += w_i * xb2_exp[d];
 #endif
         }
-
-        free(qx_buf);
+        tensor_set_n_threads(saved_threads);
     }
 
-    /* 6. Shared expert (always computed) */
-    matmul(s->hb, (float *)x, lw->ffn_gate_shexp, dim, c->n_ff_shexp, lw->type_ffn_gate_shexp);
-    matmul(s->hb2, (float *)x, lw->ffn_up_shexp, dim, c->n_ff_shexp, lw->type_ffn_up_shexp);
-    silu(s->hb, c->n_ff_shexp);
-    elemwise_mul(s->hb, s->hb, s->hb2, c->n_ff_shexp);
-    matmul(s->xb2, s->hb, lw->ffn_down_shexp, c->n_ff_shexp, dim, lw->type_ffn_down_shexp);
+    /* 6. Shared expert — Q8×Q8 with pre-allocated buffers */
+    {
+        int saved_threads = tensor_get_n_threads();
+        tensor_set_n_threads(1);
+        size_t nb = dim / 32;
+        quantize_row_q8_0(x, s->shared_qx, dim);
+        for (size_t bi = 0; bi < nb; bi++) {
+            s->shared_qx_d[bi] = fp16_to_fp32(s->shared_qx[bi].d);
+        }
+        matmul_q8(s->hb, s->shared_qx, s->shared_qx_d, lw->ffn_gate_shexp, dim, c->n_ff_shexp, lw->type_ffn_gate_shexp);
+        matmul_q8(s->hb2, s->shared_qx, s->shared_qx_d, lw->ffn_up_shexp, dim, c->n_ff_shexp, lw->type_ffn_up_shexp);
+        silu(s->hb, c->n_ff_shexp);
+        elemwise_mul(s->hb, s->hb, s->hb2, c->n_ff_shexp);
+        {
+            size_t dnb = c->n_ff_shexp / 32;
+            quantize_row_q8_0(s->hb, s->shared_down_qx, c->n_ff_shexp);
+            for (size_t bi = 0; bi < dnb; bi++) {
+                s->shared_down_qx_d[bi] = fp16_to_fp32(s->shared_down_qx[bi].d);
+            }
+            matmul_q8(s->xb2, s->shared_down_qx, s->shared_down_qx_d, lw->ffn_down_shexp, c->n_ff_shexp, dim, lw->type_ffn_down_shexp);
+        }
+        tensor_set_n_threads(saved_threads);
+    }
 
     /* Shared expert sigmoid gate: sigmoid(x @ ffn_gate_inp_shexp) */
     {
