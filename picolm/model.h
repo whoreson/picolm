@@ -341,6 +341,18 @@ typedef struct {
      * in Top-K order (matching single-token moe_forward). */
     float *moe_acc_batch;
 
+    /* mm_id buffers: per-token, per-slot expert outputs
+     * mm_gate_out: [n_tokens * n_used * n_ff] — gate projections
+     * mm_up_out:   [n_tokens * n_used * n_ff] — up projections
+     * mm_down_out: [n_tokens * n_used * n_embd] — down projections (post-SwiGLU) */
+    float *mm_gate_out;
+    float *mm_up_out;
+    float *mm_down_out;
+
+    /* Scratch Q8_0 buffer for mm_id down projection */
+    block_q8_0 *mm_scratch_qx;
+    float *mm_scratch_qx_d;
+
     /* Single allocation base */
     void *mem_block;
     size_t mem_size;
