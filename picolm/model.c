@@ -3456,19 +3456,21 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
     /* ---- Phase 1: Route all tokens ---- */
     {
         int *idx = alloca(n_expert * sizeof(int));
-        for (int t = 0; t < n_tokens; t++) {
-            /* Router: logits = x @ ffn_gate_inp */
-            matmul(s->expert_logits, (float *)(x_batch + t * dim), lw->ffn_gate_inp,
-                   dim, n_expert, lw->type_ffn_gate_inp);
 
-            /* Softmax */
-            softmax(s->expert_logits, n_expert);
+        /* Batched router: all tokens through ffn_gate_inp in one matmul_batch */
+        {
+            float *logits_batch = s->expert_logits;
+            matmul_batch(logits_batch, (float *)x_batch, n_tokens,
+                lw->ffn_gate_inp, dim, n_expert, lw->type_ffn_gate_inp);
 
-            /* Top-K selection */
-            {
-                int *ids = all_ids[t];
-                float *weights = all_weights[t];
-                float *logits = s->expert_logits;
+            for (int t = 0; t < n_tokens; t++) {
+                float *logits = logits_batch + t * n_expert;
+                softmax(logits, n_expert);
+
+                /* Top-K selection */
+                {
+                    int *ids = all_ids[t];
+                    float *weights = all_weights[t];
                 for (int i = 0; i < n_expert; i++) idx[i] = i;
                 for (int i = 0; i < n_used; i++) {
                     int best = i;
@@ -3487,8 +3489,9 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
                     float inv_wsum = (wsum > 0.0f) ? 1.0f / wsum : 0.0f;
                     for (int i = 0; i < n_used; i++) weights[i] *= inv_wsum;
                 }
-            }
+                }
             n_experts_per_token[t] = n_used;
+            }
         }
     }
 
