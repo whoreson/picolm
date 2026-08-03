@@ -243,6 +243,22 @@ static inline __m128 fp16x4_to_fp32_inline(const uint16_t *p) {
 
 /* AVX-512 specific helpers */
 #ifdef PICOLM_AVX512
+/* AVX-512 signed int8 x int8 dot product, 64 pairs per call (2 q8_0 blocks).
+ * Used by vec_dot_q8_0_q8_0_deltas, vec_dot_q8_0_q8_0_deltas_batch4, and
+ * the block-interleaved MoE GEMM kernels in tensor.c. */
+static inline __m512i mul_sum_i8_pairs_avx512(const __m512i x, const __m512i y) {
+    __m512i ax = _mm512_abs_epi8(x);
+    __mmask64 neg_mask = _mm512_movepi8_mask(x);
+    __m512i neg_y = _mm512_sub_epi8(_mm512_setzero_si512(), y);
+    __m512i sy = _mm512_mask_blend_epi8(neg_mask, y, neg_y);
+#if defined(__AVX512VNNI__)
+    return _mm512_dpbusd_epi32(_mm512_setzero_si512(), ax, sy);
+#else
+    __m512i dot = _mm512_maddubs_epi16(ax, sy);
+    __m512i ones = _mm512_set1_epi16(1);
+    return _mm512_madd_epi16(ones, dot);
+#endif
+}
 /* Convert 16 FP16 to 16 FP32 in AVX-512 register */
 static inline __m512 fp16x16_to_fp32_inline(const uint16_t *p) {
 #ifdef __F16C__

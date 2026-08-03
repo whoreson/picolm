@@ -2095,35 +2095,7 @@ float vec_dot_q4_K_q8_K(const void *src_q4, const void *src_q8, int n) {
  *   SSE2: 128-bit int8 MAC, scalar float accum
  * ================================================================ */
 
-#if defined(PICOLM_AVX512)
-/* AVX-512 signed int8 x int8 dot product, 64 pairs per call (2 q8_0
- * blocks' worth). Note _mm512_sign_epi8 does not exist in AVX-512 (Intel
- * didn't extend the SSSE3 "sign" instructions to 512-bit) -- the usual
- * abs(x)/sign(y,x) trick needs a mask-based substitute: extract the sign
- * bit of each byte of x with _mm512_movepi8_mask, then blend y against
- * -y using that mask. When x's byte is 0 the "sign" is arbitrary, but
- * ax=abs(x) is also 0 there so the product is 0 regardless -- matches
- * _mm256_sign_epi8's behavior for that case.
- * With AVX512-VNNI, _mm512_dpbusd_epi32 does the unsigned x signed
- * multiply-and-reduce to int32 in one instruction (also sidesteps the
- * int16 intermediate _mm512_maddubs_epi16 produces, though for q8_0's
- * +-127 range that intermediate never overflows int16 anyway -- the
- * win here is purely fewer instructions). Falls back to
- * maddubs+madd (still 512-bit, still 2 blocks/call) without VNNI. */
-static inline __m512i mul_sum_i8_pairs_avx512(const __m512i x, const __m512i y) {
-    __m512i ax = _mm512_abs_epi8(x);
-    __mmask64 neg_mask = _mm512_movepi8_mask(x);
-    __m512i neg_y = _mm512_sub_epi8(_mm512_setzero_si512(), y);
-    __m512i sy = _mm512_mask_blend_epi8(neg_mask, y, neg_y);
-#if defined(__AVX512VNNI__)
-    return _mm512_dpbusd_epi32(_mm512_setzero_si512(), ax, sy);
-#else
-    __m512i dot = _mm512_maddubs_epi16(ax, sy);
-    __m512i ones = _mm512_set1_epi16(1);
-    return _mm512_madd_epi16(ones, dot);
-#endif
-}
-#endif
+/* mul_sum_i8_pairs_avx512 is now defined in quant.h (shared with tensor.c) */
 
 #if defined(PICOLM_AVX2) || defined(PICOLM_AVX) || defined(PICOLM_SSSE3)
 static inline __m128i mul_sum_i8_pairs_sse(const __m128i x, const __m128i y) {

@@ -1685,7 +1685,7 @@ static void mm_id_gate_expert_task(int idx, void *ctxp) {
     mm_id_gate_ctx_t *c = (mm_id_gate_ctx_t *)ctxp;
     int eid = idx;
 
-    /* Use precomputed routing map — no scanning needed */
+    /* Use precomputed routing map */
     int n_assigned = c->expert_counts[eid];
     if (n_assigned == 0) return;
 
@@ -1704,48 +1704,136 @@ static void mm_id_gate_expert_task(int idx, void *ctxp) {
     const char *up_exp = (const char *)c->up_w_base + (size_t)eid * c->n_ff * c->row_bytes;
 
 #ifdef PICOLM_AVX512
-    int n_batch4 = (n_assigned / 4) * 4;
+    int nblk = c->dim / 32;  /* 64 blocks per row for dim=2048 */
 
-    for (int row = 0; row < c->n_ff; row++) {
-        const char *gw = gate_exp + row * c->row_bytes;
-        const char *uw = up_exp + row * c->row_bytes;
+    /* Precompute token buffer pointers */
+    const float *tbufs[256];
+    const float *qx_d_ptrs[256];
+    for (int a = 0; a < n_assigned; a++) {
+        tbufs[a] = c->qx_all + assigned[a] * c->q8_buf_per_token;
+        qx_d_ptrs[a] = tbufs[a] + c->qx_d_off;
+    }
 
-        for (int a = 0; a < n_batch4; a += 4) {
-            const void *qx[4];
-            const float *qx_d_arr[4];
-            float fout[4];
-            for (int k = 0; k < 4; k++) {
-                int t = assigned[a + k];
-                const float *tbuf = c->qx_all + t * c->q8_buf_per_token;
-                qx[k] = (const void *)tbuf;
-                qx_d_arr[k] = tbuf + c->qx_d_off;
+    /* Block-interleaved kernel: for each weight row, process all blocks
+     * in the outer loop and all assigned tokens in the inner loop.
+     * This keeps weight blocks in L1 cache across all tokens.
+     * Per-token accumulators are __m512 registers (max 8 inline). */
+    if (n_assigned <= 8) {
+        for (int row = 0; row < c->n_ff; row++) {
+            const block_q8_0 *gw = (const block_q8_0 *)(gate_exp + (size_t)row * c->row_bytes);
+            const block_q8_0 *uw = (const block_q8_0 *)(up_exp + (size_t)row * c->row_bytes);
+
+            __m512 g_acc[8], u_acc[8];
+            for (int a = 0; a < n_assigned; a++) {
+                g_acc[a] = _mm512_setzero_ps();
+                u_acc[a] = _mm512_setzero_ps();
             }
-            vec_dot_q8_0_q8_0_deltas_batch4(qx[0], qx_d_arr[0], qx[1], qx_d_arr[1],
-                qx[2], qx_d_arr[2], qx[3], qx_d_arr[3], gw, c->dim,
-                &fout[0], &fout[1], &fout[2], &fout[3]);
-            for (int k = 0; k < 4; k++) {
-                int t = assigned[a + k];
-                size_t idx = (size_t)t * c->n_used * c->n_ff + (size_t)slots[a + k] * c->n_ff + row;
-                c->gate_out[idx] = fout[k];
+
+            int bi;
+            for (bi = 0; bi + 1 < nblk; bi += 2) {
+                /* Load gate weight blocks (once, shared across tokens) */
+                __m256i wg0 = _mm256_loadu_si256((const __m256i *)gw[bi].qs);
+                __m256i wg1 = _mm256_loadu_si256((const __m256i *)gw[bi + 1].qs);
+                __m512i ww_g = _mm512_inserti64x4(_mm512_castsi256_si512(wg0), wg1, 1);
+                float wd_g0 = fp16_to_fp32_lookup(gw[bi].d);
+                float wd_g1 = fp16_to_fp32_lookup(gw[bi + 1].d);
+
+                /* Load up weight blocks (once, shared across tokens) */
+                __m256i wu0 = _mm256_loadu_si256((const __m256i *)uw[bi].qs);
+                __m256i wu1 = _mm256_loadu_si256((const __m256i *)uw[bi + 1].qs);
+                __m512i ww_u = _mm512_inserti64x4(_mm512_castsi256_si512(wu0), wu1, 1);
+                float wd_u0 = fp16_to_fp32_lookup(uw[bi].d);
+                float wd_u1 = fp16_to_fp32_lookup(uw[bi + 1].d);
+
+                for (int a = 0; a < n_assigned; a++) {
+                    const block_q8_0 *xq = (const block_q8_0 *)tbufs[a];
+                    const float *qx_d = qx_d_ptrs[a];
+
+                    __m256i x0 = _mm256_loadu_si256((const __m256i *)xq[bi].qs);
+                    __m256i x1 = _mm256_loadu_si256((const __m256i *)xq[bi + 1].qs);
+                    __m512i xx = _mm512_inserti64x4(_mm512_castsi256_si512(x0), x1, 1);
+
+                    /* Gate dot product */
+                    __m512i dot_g = mul_sum_i8_pairs_avx512(xx, ww_g);
+                    __m512 f_g = _mm512_cvtepi32_ps(dot_g);
+                    float dg0 = qx_d[bi] * wd_g0;
+                    float dg1 = qx_d[bi + 1] * wd_g1;
+                    __m512 dvec_g = _mm512_insertf32x8(
+                        _mm512_castps256_ps512(_mm256_set1_ps(dg0)),
+                        _mm256_set1_ps(dg1), 1);
+                    g_acc[a] = _mm512_fmadd_ps(f_g, dvec_g, g_acc[a]);
+
+                    /* Up dot product (same activation, different weights) */
+                    __m512i dot_u = mul_sum_i8_pairs_avx512(xx, ww_u);
+                    __m512 f_u = _mm512_cvtepi32_ps(dot_u);
+                    float du0 = qx_d[bi] * wd_u0;
+                    float du1 = qx_d[bi + 1] * wd_u1;
+                    __m512 dvec_u = _mm512_insertf32x8(
+                        _mm512_castps256_ps512(_mm256_set1_ps(du0)),
+                        _mm256_set1_ps(du1), 1);
+                    u_acc[a] = _mm512_fmadd_ps(f_u, dvec_u, u_acc[a]);
+                }
             }
-            vec_dot_q8_0_q8_0_deltas_batch4(qx[0], qx_d_arr[0], qx[1], qx_d_arr[1],
-                qx[2], qx_d_arr[2], qx[3], qx_d_arr[3], uw, c->dim,
-                &fout[0], &fout[1], &fout[2], &fout[3]);
-            for (int k = 0; k < 4; k++) {
-                int t = assigned[a + k];
-                size_t idx = (size_t)t * c->n_used * c->n_ff + (size_t)slots[a + k] * c->n_ff + row;
-                c->up_out[idx] = fout[k];
+
+            /* Reduce and scatter */
+            for (int a = 0; a < n_assigned; a++) {
+                const block_q8_0 *xq = (const block_q8_0 *)tbufs[a];
+                const float *qx_d = qx_d_ptrs[a];
+                float gs = _mm512_reduce_add_ps(g_acc[a]);
+                float us = _mm512_reduce_add_ps(u_acc[a]);
+                /* Scalar remainder for odd nblk */
+                for (; bi < nblk; bi++) {
+                    int si_g = 0, si_u = 0;
+                    for (int j = 0; j < 32; j++) {
+                        si_g += xq[bi].qs[j] * gw[bi].qs[j];
+                        si_u += xq[bi].qs[j] * uw[bi].qs[j];
+                    }
+                    gs += (float)si_g * qx_d[bi] * fp16_to_fp32_lookup(gw[bi].d);
+                    us += (float)si_u * qx_d[bi] * fp16_to_fp32_lookup(uw[bi].d);
+                }
+                int t = assigned[a];
+                size_t idx = (size_t)t * c->n_used * c->n_ff + (size_t)slots[a] * c->n_ff + row;
+                c->gate_out[idx] = gs;
+                c->up_out[idx] = us;
             }
         }
-
-        for (int a = n_batch4; a < n_assigned; a++) {
-            int t = assigned[a];
-            const float *tbuf = c->qx_all + t * c->q8_buf_per_token;
-            const void *qx = (const void *)tbuf;
-            const float *qx_d = tbuf + c->qx_d_off;
-            size_t idx = (size_t)t * c->n_used * c->n_ff + (size_t)slots[a] * c->n_ff + row;
-            c->gate_out[idx] = vec_dot_q8_0_q8_0_deltas(qx, qx_d, gw, c->dim);
-            c->up_out[idx] = vec_dot_q8_0_q8_0_deltas(qx, qx_d, uw, c->dim);
+    } else {
+        /* >8 tokens per expert: use batch4 + scalar fallback */
+        int n_batch4 = (n_assigned / 4) * 4;
+        for (int row = 0; row < c->n_ff; row++) {
+            const char *gw = gate_exp + row * c->row_bytes;
+            const char *uw = up_exp + row * c->row_bytes;
+            for (int a = 0; a < n_batch4; a += 4) {
+                const void *qx[4];
+                const float *qx_d_arr[4];
+                float fout[4];
+                for (int k = 0; k < 4; k++) {
+                    qx[k] = (const void *)tbufs[a + k];
+                    qx_d_arr[k] = qx_d_ptrs[a + k];
+                }
+                vec_dot_q8_0_q8_0_deltas_batch4(qx[0], qx_d_arr[0], qx[1], qx_d_arr[1],
+                    qx[2], qx_d_arr[2], qx[3], qx_d_arr[3], gw, c->dim,
+                    &fout[0], &fout[1], &fout[2], &fout[3]);
+                for (int k = 0; k < 4; k++) {
+                    size_t idx = (size_t)assigned[a + k] * c->n_used * c->n_ff
+                               + (size_t)slots[a + k] * c->n_ff + row;
+                    c->gate_out[idx] = fout[k];
+                }
+                vec_dot_q8_0_q8_0_deltas_batch4(qx[0], qx_d_arr[0], qx[1], qx_d_arr[1],
+                    qx[2], qx_d_arr[2], qx[3], qx_d_arr[3], uw, c->dim,
+                    &fout[0], &fout[1], &fout[2], &fout[3]);
+                for (int k = 0; k < 4; k++) {
+                    size_t idx = (size_t)assigned[a + k] * c->n_used * c->n_ff
+                               + (size_t)slots[a + k] * c->n_ff + row;
+                    c->up_out[idx] = fout[k];
+                }
+            }
+            for (int a = n_batch4; a < n_assigned; a++) {
+                size_t idx = (size_t)assigned[a] * c->n_used * c->n_ff
+                           + (size_t)slots[a] * c->n_ff + row;
+                c->gate_out[idx] = vec_dot_q8_0_q8_0_deltas(tbufs[a], qx_d_ptrs[a], gw, c->dim);
+                c->up_out[idx] = vec_dot_q8_0_q8_0_deltas(tbufs[a], qx_d_ptrs[a], uw, c->dim);
+            }
         }
     }
 #else
@@ -1767,7 +1855,7 @@ static void mm_id_down_expert_task(int idx, void *ctxp) {
     mm_id_down_ctx_t *c = (mm_id_down_ctx_t *)ctxp;
     int eid = idx;
 
-    /* Use precomputed routing map — no scanning needed */
+    /* Use precomputed routing map */
     int n_assigned = c->expert_counts[eid];
     if (n_assigned == 0) return;
 
@@ -1787,6 +1875,7 @@ static void mm_id_down_expert_task(int idx, void *ctxp) {
     int tid = tensor_get_thread_id();
     float *my_qx_base = (float *)c->exp_down_qx_all + tid * 256 * c->q8_per_token;
 
+    /* Quantize all assigned tokens' SwiGLU outputs to Q8_0 */
     const void *qx_bufs[256];
     const float *qx_d_arr[256];
 
@@ -1806,10 +1895,70 @@ static void mm_id_down_expert_task(int idx, void *ctxp) {
         qx_d_arr[a] = exp_qx_d;
     }
 
-    if (n_assigned == 1) {
+#ifdef PICOLM_AVX512
+    int nblk = c->n_ff / 32;  /* 16 blocks per row for n_ff=512 */
+
+    /* Block-interleaved kernel: same strategy as gate+up.
+     * For each weight row, process blocks in the outer loop,
+     * tokens in the inner loop, keeping weight blocks in L1. */
+    if (n_assigned <= 8) {
+        for (int row = 0; row < c->dim; row++) {
+            const block_q8_0 *dw_blocks = (const block_q8_0 *)(dw + (size_t)row * c->row_bytes);
+
+            __m512 acc[8];
+            for (int a = 0; a < n_assigned; a++)
+                acc[a] = _mm512_setzero_ps();
+
+            int bi;
+            for (bi = 0; bi + 1 < nblk; bi += 2) {
+                /* Load down weight blocks (once, shared across tokens) */
+                __m256i wd0 = _mm256_loadu_si256((const __m256i *)dw_blocks[bi].qs);
+                __m256i wd1 = _mm256_loadu_si256((const __m256i *)dw_blocks[bi + 1].qs);
+                __m512i ww = _mm512_inserti64x4(_mm512_castsi256_si512(wd0), wd1, 1);
+                float wd_d0 = fp16_to_fp32_lookup(dw_blocks[bi].d);
+                float wd_d1 = fp16_to_fp32_lookup(dw_blocks[bi + 1].d);
+
+                for (int a = 0; a < n_assigned; a++) {
+                    const block_q8_0 *xq = (const block_q8_0 *)qx_bufs[a];
+                    const float *qx_d = qx_d_arr[a];
+
+                    __m256i x0 = _mm256_loadu_si256((const __m256i *)xq[bi].qs);
+                    __m256i x1 = _mm256_loadu_si256((const __m256i *)xq[bi + 1].qs);
+                    __m512i xx = _mm512_inserti64x4(_mm512_castsi256_si512(x0), x1, 1);
+
+                    __m512i dot = mul_sum_i8_pairs_avx512(xx, ww);
+                    __m512 f = _mm512_cvtepi32_ps(dot);
+                    float d0 = qx_d[bi] * wd_d0;
+                    float d1 = qx_d[bi + 1] * wd_d1;
+                    __m512 dvec = _mm512_insertf32x8(
+                        _mm512_castps256_ps512(_mm256_set1_ps(d0)),
+                        _mm256_set1_ps(d1), 1);
+                    acc[a] = _mm512_fmadd_ps(f, dvec, acc[a]);
+                }
+            }
+
+            /* Reduce and scatter */
+            for (int a = 0; a < n_assigned; a++) {
+                const block_q8_0 *xq = (const block_q8_0 *)qx_bufs[a];
+                const float *qx_d = qx_d_arr[a];
+                float result = _mm512_reduce_add_ps(acc[a]);
+                /* Scalar remainder for odd nblk */
+                for (; bi < nblk; bi++) {
+                    int si = 0;
+                    for (int j = 0; j < 32; j++)
+                        si += xq[bi].qs[j] * dw_blocks[bi].qs[j];
+                    result += (float)si * qx_d[bi] * fp16_to_fp32_lookup(dw_blocks[bi].d);
+                }
+                int t = assigned[a];
+                size_t idx = (size_t)t * c->n_used * c->dim + (size_t)slots[a] * c->dim + row;
+                c->down_out[idx] = result;
+            }
+        }
+    } else if (n_assigned == 1) {
         float *dout = c->down_out + (size_t)assigned[0] * c->n_used * c->dim + (size_t)slots[0] * c->dim;
         matmul_q8(dout, qx_bufs[0], qx_d_arr[0], dw, c->n_ff, c->dim, c->type);
     } else {
+        /* >8 tokens per expert: batch4 + scalar fallback */
         int n_batch4 = (n_assigned / 4) * 4;
         for (int row = 0; row < c->dim; row++) {
             const char *wi = dw + row * c->row_bytes;
@@ -1834,6 +1983,21 @@ static void mm_id_down_expert_task(int idx, void *ctxp) {
             }
         }
     }
+#else
+    if (n_assigned == 1) {
+        float *dout = c->down_out + (size_t)assigned[0] * c->n_used * c->dim + (size_t)slots[0] * c->dim;
+        matmul_q8(dout, qx_bufs[0], qx_d_arr[0], dw, c->n_ff, c->dim, c->type);
+    } else {
+        for (int row = 0; row < c->dim; row++) {
+            const char *wi = dw + row * c->row_bytes;
+            for (int a = 0; a < n_assigned; a++) {
+                int t = assigned[a];
+                size_t idx = (size_t)t * c->n_used * c->dim + (size_t)slots[a] * c->dim + row;
+                c->down_out[idx] = vec_dot_q8_0_q8_0_deltas(qx_bufs[a], qx_d_arr[a], wi, c->n_ff);
+            }
+        }
+    }
+#endif
 }
 
 void matmul_batch(float *out, const float *x, int n_batch,
