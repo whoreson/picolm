@@ -884,8 +884,8 @@ static int launch_matmul(picolm_gpu_tensor_t *t, id<MTLBuffer> xbuf, id<MTLBuffe
 int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, int device) {
     if (!t || !y || !x || S < 1 || device != 0 || !g_device) return 0;
     int I = t->I, O = t->O;
-    size_t xb = (size_t)S * I * sizeof(float);
-    size_t yb = (size_t)S * O * sizeof(float);
+    size_t xb = (size_t)S * (size_t)I * sizeof(float);
+    size_t yb = (size_t)S * (size_t)O * sizeof(float);
     /* g_x is CPU-written/GPU-read -> WriteCombined (streaming write, no cache
      * pollution). g_y is GPU-written/CPU-read -> DefaultCache. */
     if (!reserve_buf(&g_x, &g_xcap, &g_xptr, xb,
@@ -919,8 +919,8 @@ int picolm_gpu_expert_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
         down->I != gate->O || down->O != gate->I) return 0;
 
     int D = gate->I, I = gate->O;
-    size_t xb = (size_t)S * D * sizeof(float);
-    size_t ib = (size_t)S * I * sizeof(float);
+    size_t xb = (size_t)S * (size_t)D * sizeof(float);
+    size_t ib = (size_t)S * (size_t)I * sizeof(float);
     /* g_x is the only CPU->GPU upload here (WriteCombined). g_y is read back on
      * the CPU. g_gate/g_up are pure GPU scratch (written and re-read inside the
      * command buffer), so their CPU cache mode is irrelevant; DefaultCache. */

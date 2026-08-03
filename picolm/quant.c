@@ -203,8 +203,8 @@ static inline void get_scale_min_k4(int j, const uint8_t *q, uint8_t *sc, uint8_
         *sc = q[j] & 63;
         *mn = q[j + 4] & 63;
     } else {
-        *sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
-        *mn = (q[j + 4] >>  4) | ((q[j    ] >> 6) << 4);
+        *sc = (uint8_t)((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4));
+        *mn = (uint8_t)((q[j + 4] >>  4) | ((q[j    ] >> 6) << 4));
     }
 }
 
@@ -552,7 +552,7 @@ void dequantize_row_f32(const void *src, float *dst, int n) {
         dst32[i] = (src32[i] >> 24) | ((src32[i] >> 8) & 0xff00) | ((src32[i] << 8) & 0xff0000) | (src32[i] << 24);
     }
 #else
-    memcpy(dst, src, n * sizeof(float));
+    memcpy(dst, src, (size_t)n * sizeof(float));
 #endif
 }
 
@@ -661,7 +661,7 @@ size_t gguf_type_row_size(gguf_type_t type, int n) {
     int bs = gguf_type_block_size(type);
     int qs = gguf_type_quant_size(type);
     if (bs == 0 || qs == 0) return 0;
-    return (size_t)(n / bs) * qs;
+    return (size_t)(n / bs) * (size_t)qs;
 }
 
 /* ================================================================
@@ -1196,6 +1196,7 @@ float vec_dot_q6_K_f32(const void *src, const float *x, int n) {
  * AVX:          _mm_maddubs_epi16 for 16-wide (two lanes)
  * ================================================================ */
 
+#if defined(PICOLM_AVX2)
 /* Scale shuffle for Q6_K: 16 scales, each repeated 8 times per 32-byte lane.
  * Q6_K has one scale per 16-element sub-block. For AVX2 32-wide ops, each
  * scale needs to be duplicated across the lanes it applies to.
@@ -1211,6 +1212,7 @@ static const uint8_t get_scale_shuffle_k6[144] = {
     12,12,12,12,12,12,12,12,13,13,13,13,13,13,13,13,
     14,14,14,14,14,14,14,14,15,15,15,15,15,15,15,15,
 };
+#endif
 
 float vec_dot_q6_K_q8_K(const void *src_q6, const void *src_q8, int n) {
     const block_q6_K *x = (const block_q6_K *)src_q6;
@@ -1431,7 +1433,7 @@ float vec_dot_q6_K_q8_K(const void *src_q6, const void *src_q8, int n) {
                 block_sum += sc[j] * sums[j] - 32 * y[i].bsums[j] * sc[j];
             }
         }
-        sumf += d * block_sum;
+        sumf += d * (float)block_sum;
     }
     return sumf;
 #endif
@@ -1619,10 +1621,10 @@ void quantize_row_q8_0(const float *x, void *dst, int n) {
         for (int j = 0; j < 8; j++) {
             const float32x4_t v = vmulq_n_f32(srcv[j], id);
             const int32x4_t vi = vcvtnq_s32_f32(v);
-            y[i].qs[4*j+0] = vgetq_lane_s32(vi, 0);
-            y[i].qs[4*j+1] = vgetq_lane_s32(vi, 1);
-            y[i].qs[4*j+2] = vgetq_lane_s32(vi, 2);
-            y[i].qs[4*j+3] = vgetq_lane_s32(vi, 3);
+            y[i].qs[4*j+0] = (int8_t)vgetq_lane_s32(vi, 0);
+            y[i].qs[4*j+1] = (int8_t)vgetq_lane_s32(vi, 1);
+            y[i].qs[4*j+2] = (int8_t)vgetq_lane_s32(vi, 2);
+            y[i].qs[4*j+3] = (int8_t)vgetq_lane_s32(vi, 3);
         }
     }
 #elif defined(PICOLM_SSE2)
@@ -1760,7 +1762,7 @@ void quantize_row_q8_K(const float *x, void *dst, int n) {
             for (int ii = 0; ii < 16; ++ii) {
                 sum += y[i].qs[j * 16 + ii];
             }
-            y[i].bsums[j] = sum;
+            y[i].bsums[j] = (int16_t)sum;
         }
 #endif
         x += 256;
@@ -2074,10 +2076,10 @@ float vec_dot_q4_K_q8_K(const void *src_q4, const void *src_q8, int n) {
         }
 
         const float d = fp16_to_fp32_lookup(x[i].d) * y[i].d;
-        for (int l = 0; l < 8; l++) sums[l] += d * aux32[l];
+        for (int l = 0; l < 8; l++) sums[l] += d * (float)aux32[l];
 
         const float dmin = fp16_to_fp32_lookup(x[i].dmin) * y[i].d;
-        sumf -= dmin * sumi;
+        sumf -= dmin * (float)sumi;
     }
     for (int l = 0; l < 8; l++) sumf += sums[l];
     return sumf;
@@ -2650,12 +2652,12 @@ float vec_dot_q3_K_q8_K(const void *src_q3, const void *src_q8, int n) {
             for (int j = 0; j < 4; j++) {
                 float dl = d * (scales[is++] - 32);
                 for (int l = 0; l < 16; l++) {
-                    int8_t v = (int8_t)((q3[l] >> shift) & 3) - ((hm[l] & hmv) ? 0 : 4);
+                    int8_t v = (int8_t)(((q3[l] >> shift) & 3) - ((hm[l] & hmv) ? 0 : 4));
                     sumf += dl * (float)v * q8[l];
                 }
                 float dl2 = d * (scales[is++] - 32);
                 for (int l = 0; l < 16; l++) {
-                    int8_t v = (int8_t)((q3[l+16] >> shift) & 3) - ((hm[l+16] & hmv) ? 0 : 4);
+                    int8_t v = (int8_t)(((q3[l+16] >> shift) & 3) - ((hm[l+16] & hmv) ? 0 : 4));
                     sumf += dl2 * (float)v * q8[16+l];
                 }
                 shift += 2;
@@ -3163,7 +3165,7 @@ void vec_dot_q4_0x4_q8_0(const void *vx, const void *wy, int n, float *out, int 
      * against the scalar reference before shipping it, since there's no
      * real dotprod hardware available to test on directly. */
     for (int row_group = 0; row_group < nrows; row_group += 4) {
-        const block_q4_0x4 *b_ptr = xb + (size_t)(row_group / 4) * nb;
+        const block_q4_0x4 *b_ptr = xb + (size_t)(row_group / 4) * (size_t)nb;
         const block_q8_0 *a_ptr = y;
         float32x4_t acc = vdupq_n_f32(0);
         for (int b = 0; b < nb; b++) {
@@ -3207,7 +3209,7 @@ void vec_dot_q4_0x4_q8_0(const void *vx, const void *wy, int n, float *out, int 
     for (int row = 0; row < nrows; row++) {
         int group = row / 4;
         int local_row = row % 4;
-        const block_q4_0x4 *group_base = xb + (size_t)group * nb;
+        const block_q4_0x4 *group_base = xb + (size_t)group * (size_t)nb;
         float sumf = 0.0f;
         for (int ib = 0; ib < nb; ib++) {
             const block_q4_0x4 *b = group_base + ib;
@@ -3246,7 +3248,7 @@ void vec_dot_q4_0x4_4x8_q8_0(const void *vx, const void *wy, int n, float *out, 
 
 #if defined(PICOLM_DOTPROD)
     for (int row_group = 0; row_group < nrows; row_group += 4) {
-        const block_q4_0x4 *b_ptr = xb + (size_t)(row_group / 4) * nb;
+        const block_q4_0x4 *b_ptr = xb + (size_t)(row_group / 4) * (size_t)nb;
         const block_q8_0 *a_ptr = y;
         float32x4_t acc = vdupq_n_f32(0);
         for (int b = 0; b < nb; b++) {
@@ -3295,7 +3297,7 @@ void vec_dot_q4_0x4_4x8_q8_0(const void *vx, const void *wy, int n, float *out, 
     for (int row = 0; row < nrows; row++) {
         int group = row / 4;
         int local_row = row % 4;
-        const block_q4_0x4 *group_base = xb + (size_t)group * nb;
+        const block_q4_0x4 *group_base = xb + (size_t)group * (size_t)nb;
         float sumf = 0.0f;
         for (int ib = 0; ib < nb; ib++) {
             const block_q4_0x4 *b = group_base + ib;
@@ -3332,9 +3334,9 @@ void repack_q8_0_for_i8mm(const void *src, int8_t *dst, float *dst_d, int n, int
         const block_q8_0 *x = (const block_q8_0 *)((const int8_t *)src + (size_t)b * gguf_type_row_size(GGUF_TYPE_Q8_0, n));
         /* Store per-block activation deltas */
         for (int ib = 0; ib < nb; ib++)
-            dst_d[(size_t)b * nb + ib] = fp16_to_fp32_lookup(x[ib].d);
+            dst_d[(size_t)b * (size_t)nb + (size_t)ib] = fp16_to_fp32_lookup(x[ib].d);
         for (int ib = 0; ib < nb; ib++) {
-            int8_t *out = dst + (size_t)b * nb * 32 + ib * 32;
+            int8_t *out = dst + (size_t)b * (size_t)nb * 32 + (size_t)ib * 32;
 #if defined(PICOLM_I8MM)
             /* Repack: [qs[0..7], qs[16..23], qs[8..15], qs[24..31]]
              * This lets smmla extract dot(lo, qs[0..7]) + dot(hi, qs[16..23]) as diagonal. */
@@ -3380,7 +3382,7 @@ void gemm_q4_0_4x8_i8mm(const void *W, const int8_t *X_repacked, const float *ad
     int d4 = (d / 4) * 4;
 
     for (int br = 0; br < d4; br += 4) {
-        const block_q4_0x4 *wb = (const block_q4_0x4 *)W + (size_t)(br / 4) * nb;
+        const block_q4_0x4 *wb = (const block_q4_0x4 *)W + (size_t)(br / 4) * (size_t)nb;
 
         for (int bc = 0; bc < n_batch; bc++) {
             /* Fused I8MM: process 4 blocks per group, accumulating int32
@@ -3394,11 +3396,12 @@ void gemm_q4_0_4x8_i8mm(const void *W, const int8_t *X_repacked, const float *ad
              * float32 accumulator. This mirrors MNN's approach where
              * scale multiply happens inside the SIMD kernel. */
             float row_sum[4] = {0};
-            const int8_t *xrep = X_repacked + (size_t)bc * nb * 32;
-            const float *ad_bc = ad + (size_t)bc * nb;
+            const int8_t *xrep = X_repacked + (size_t)bc * (size_t)nb * 32;
+            const float *ad_bc = ad + (size_t)bc * (size_t)nb;
 
             /* Process 4 blocks per group */
-            for (int ib = 0; ib + 3 < nb; ib += 4) {
+            int ib;
+            for (ib = 0; ib + 3 < nb; ib += 4) {
                 float32x4_t f_acc[4];
                 f_acc[0] = vdupq_n_f32(0.0f);
                 f_acc[1] = vdupq_n_f32(0.0f);
@@ -3476,7 +3479,7 @@ void gemm_q4_0_4x8_i8mm(const void *W, const int8_t *X_repacked, const float *ad
             }
 
             for (int r = 0; r < 4; r++)
-                out[(size_t)bc * d + br + r] = row_sum[r];
+                out[(size_t)bc * (size_t)d + (size_t)br + (size_t)r] = row_sum[r];
         }
     }
 }
@@ -3493,8 +3496,8 @@ void gemm_q4_0_4x8_q8_0(const void *W, const void *X, int n,
     /* Use I8MM for batched prefill (n_batch >= 8) */
     if (n_batch >= 8) {
         int nb = n / 32;
-        int8_t *xrep = malloc((size_t)n_batch * nb * 32);
-        float *ad = malloc((size_t)n_batch * nb * sizeof(float));
+        int8_t *xrep = malloc((size_t)n_batch * (size_t)nb * 32);
+        float *ad = malloc((size_t)n_batch * (size_t)nb * sizeof(float));
         if (xrep && ad) {
             int d4 = (d / 4) * 4;
             repack_q8_0_for_i8mm(X, xrep, ad, n, n_batch);
@@ -3504,9 +3507,9 @@ void gemm_q4_0_4x8_q8_0(const void *W, const void *X, int n,
             /* Tail rows via DOTPROD */
             if (d4 < d) {
                 size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
-                for (int b = 0; b < n_batch; b++) {
-                    const void *xb = (const int8_t *)X + (size_t)b * q8_rb;
-                    vec_dot_q4_0x4_4x8_q8_0(W, xb, n, out + (size_t)b * d + d4, d - d4);
+                for (int bi = 0; bi < n_batch; bi++) {
+                    const void *xb = (const int8_t *)X + (size_t)bi * q8_rb;
+                    vec_dot_q4_0x4_4x8_q8_0(W, xb, n, out + (size_t)bi * (size_t)d + (size_t)d4, d - d4);
                 }
             }
             free(xrep);
@@ -3522,7 +3525,7 @@ void gemm_q4_0_4x8_q8_0(const void *W, const void *X, int n,
 #endif
     for (b = 0; b < n_batch; b++) {
         const void *xb = (const int8_t *)X + (size_t)b * q8_rb;
-        vec_dot_q4_0x4_4x8_q8_0(W, xb, n, out + (size_t)b * d, d);
+        vec_dot_q4_0x4_4x8_q8_0(W, xb, n, out + (size_t)b * (size_t)d, d);
     }
 }
 
@@ -3988,7 +3991,7 @@ float vec_dot_q1_0_f32(const void *src, const float *x, int n) {
     /* Pre-quantize x to Q8_0 and delegate to vec_dot_q1_0_q8_0.
      * This allows the AVX2/VNNI path to be used even with F32 activations. */
     if (n >= 128 && n % 128 == 0) {
-        size_t nq8 = (n / 32) * sizeof(block_q8_0);
+        size_t nq8 = (size_t)(n / 32) * sizeof(block_q8_0);
         block_q8_0 qx_buf[4]; /* stack buffer for typical sizes */
         block_q8_0 *qx;
         int qx_owned = 0;
@@ -4037,7 +4040,7 @@ float vec_dot_q2_0_f32(const void *src, const float *x, int n) {
      * For small n (<128), the quantization overhead dominates; fall back
      * to scalar. */
     if (n >= 128 && n % 128 == 0) {
-        size_t nq8 = (n / 32) * sizeof(block_q8_0);
+        size_t nq8 = (size_t)(n / 32) * sizeof(block_q8_0);
         block_q8_0 qx_buf[4]; /* stack buffer for typical sizes */
         block_q8_0 *qx;
         int qx_owned = 0;
@@ -4265,7 +4268,7 @@ float vec_dot_q1_0_q8_0(const void *vx, const void *wy, int n) {
                             + ((mask & 0x40) ? qy[6] : -qy[6])
                             + ((mask & 0x80) ? qy[7] : -qy[7]);
             }
-            sumi += d1 * sumi_block;
+            sumi += d1 * (float)sumi_block;
         }
         sumf += d0 * sumi;
     }
@@ -4686,7 +4689,7 @@ float vec_dot_q2_K_f32(const void *src, const float *x, int n) {
     /* Pre-quantize x to Q8_K and delegate to vec_dot_q2_K_q8_K.
      * For small n, quantization overhead dominates; fall back to scalar. */
     if (n >= 256 && n % 256 == 0) {
-        size_t nq8 = (n / 256) * sizeof(block_q8_K);
+        size_t nq8 = (size_t)(n / 256) * sizeof(block_q8_K);
         /* Use stack buffer for small sizes to avoid malloc overhead */
         block_q8_K qx_buf[2];
         block_q8_K *qx;
@@ -4756,7 +4759,7 @@ float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
             static __thread float q5_tmp[4096];
 #endif
             if (n > 4096) {
-                float *tmp = (float *)malloc(n * sizeof(float));
+                float *tmp = (float *)malloc((size_t)n * sizeof(float));
                 float r;
                 dequantize_row_q5_K(src, tmp, n);
                 r = vec_dot_f32_f32(tmp, x, n);
@@ -5080,7 +5083,7 @@ void quantize_row_q4_0(const float *x, void *dst, int n) {
             uint8_t v1 = (uint8_t)(b[j + 16] * id + 8.5f);
             if (v0 > 15) v0 = 15;
             if (v1 > 15) v1 = 15;
-            q[j] = v0 | (v1 << 4);
+            q[j] = (uint8_t)(v0 | (v1 << 4));
         }
     }
 }
@@ -5565,10 +5568,10 @@ static uint8_t tq4_find_nearest(float val) {
 
 /* Pack 8 4-bit indices into 4 bytes (nibble packing) */
 static void tq4_pack_4bit_8(uint8_t *dst, const uint8_t *idx) {
-    dst[0] = idx[0] | (idx[1] << 4);
-    dst[1] = idx[2] | (idx[3] << 4);
-    dst[2] = idx[4] | (idx[5] << 4);
-    dst[3] = idx[6] | (idx[7] << 4);
+    dst[0] = (uint8_t)(idx[0] | (idx[1] << 4));
+    dst[1] = (uint8_t)(idx[2] | (idx[3] << 4));
+    dst[2] = (uint8_t)(idx[4] | (idx[5] << 4));
+    dst[3] = (uint8_t)(idx[6] | (idx[7] << 4));
 }
 
 /* ---- quantize_row_tq4: float32 -> TQ4 blocks ---- */
