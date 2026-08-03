@@ -3457,6 +3457,7 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
     }
 
     int saved_threads = tensor_get_n_threads();
+    /* Phase 1-2: routing and quantization are lightweight, keep single-threaded */
     tensor_set_n_threads(1);
 
     /* Pre-allocated quantization buffer variables */
@@ -3557,13 +3558,18 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
     }
 
     /* ---- Phase 3: mm_id gate+up projections ---- */
+    /* Enable multi-threading for expert dispatch: each expert task is
+     * self-contained (no nested matmul calls), so tensor_parallel_for
+     * across 256 experts benefits from parallelism. */
     {
+        tensor_set_n_threads(saved_threads);
         gguf_type_t type = lw->type_ffn_gate_exps;
         matmul_mm_id_gate_up(mm_gate_out, mm_up_out,
             qx_all, qx_d_off, q8_buf_per_token,
             lw->ffn_gate_exps, lw->ffn_up_exps,
             s->expert_assignments, s->expert_counts,
             n_tokens, n_used, dim, n_ff, n_expert, type);
+        tensor_set_n_threads(1);
     }
 
     /* ---- Phase 4: SwiGLU per (token, slot) ---- */
@@ -3580,6 +3586,7 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
 
     /* ---- Phase 5: mm_id down projections ---- */
     {
+        tensor_set_n_threads(saved_threads);
         gguf_type_t type = lw->type_ffn_down_exps;
         matmul_mm_id_down(mm_down_out, mm_gate_out,
             lw->ffn_down_exps,
@@ -3587,6 +3594,7 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
             n_tokens, n_used, dim, n_ff, n_expert, type,
             s->mm_scratch_qx, s->mm_scratch_qx_d,
             s->mm_down_qx_all, s->mm_down_qx_d_all, s->moe_q8_buf_per_token);
+        tensor_set_n_threads(1);
     }
 
     /* ---- Phase 6: Weighted accumulation in Top-K order ---- */
