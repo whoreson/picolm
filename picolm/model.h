@@ -348,6 +348,8 @@ typedef struct {
     float *mm_gate_out;
     float *mm_up_out;
     float *mm_down_out;
+    size_t mm_gateup_alloc;  /* allocated size of mm_gate_out/mm_up_out in bytes */
+    size_t mm_down_alloc;    /* allocated size of mm_down_out in bytes */
 
     /* Scratch Q8_0 buffer for mm_id down projection (single-token) */
     block_q8_0 *mm_scratch_qx;

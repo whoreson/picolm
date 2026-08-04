@@ -1913,7 +1913,7 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
             size_t down_q8_rb = c->n_ff_exp / 32;
             size_t down_q8_data_off = (down_q8_rb * sizeof(block_q8_0) + sizeof(float) - 1) / sizeof(float);
             size_t down_q8_per_token = down_q8_data_off + down_q8_rb;
-            sz_moe += (size_t)16 * 256 * down_q8_per_token; /* MAX_THREADS × 256 max tokens per expert */
+            sz_moe += (size_t)MAX_THREADS * 256 * down_q8_per_token; /* MAX_THREADS × 256 max tokens per expert */
         }
     }
 
@@ -3450,7 +3450,9 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
     int n_expert = c->n_expert;
     int n_used = c->n_expert_used;
 
-    /* Single-token fast path: use moe_forward directly */
+    /* Single-token fast path: use moe_forward directly.
+     * The batched path has overhead from routing map setup and tensor_parallel_for
+     * dispatch across 256 experts that outweighs the benefit for a single token. */
     if (n_tokens == 1) {
         moe_forward(m, s, (const float *)x_batch, residual_batch, lw);
         return;
@@ -3465,18 +3467,33 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
     int qx_d_off = s->moe_qx_d_off;
     float *qx_all = s->moe_qx_all;
 
-    /* On-demand mm_id buffers (sized to actual batch size) */
+    /* Down projection Q8_0 per-token buffer size (for n_ff, not n_embd) */
+    size_t down_q8_rb = n_ff / 32;
+    size_t down_q8_data_off = (down_q8_rb * sizeof(block_q8_0) + sizeof(float) - 1) / sizeof(float);
+    int down_q8_per_token = (int)(down_q8_data_off + down_q8_rb);
+
+    /* On-demand mm_id buffers (sized to actual batch size).
+     * Reallocate if batch size has grown since last call. */
     size_t gateup_sz = (size_t)n_tokens * n_used * n_ff * sizeof(float);
     size_t down_sz = (size_t)n_tokens * n_used * dim * sizeof(float);
     float *mm_gate_out = s->mm_gate_out;
     float *mm_up_out = s->mm_up_out;
     float *mm_down_out = s->mm_down_out;
 
-    /* Allocate on first use if not pre-allocated */
-    if (!mm_gate_out) {
+    /* Allocate or grow if needed */
+    if (!mm_gate_out || s->mm_gateup_alloc < gateup_sz) {
+        free(mm_gate_out);
+        free(mm_up_out);
+        free(mm_down_out);
         s->mm_gate_out = mm_gate_out = (float *)aligned_alloc(64, gateup_sz + 4095);
         s->mm_up_out = mm_up_out = (float *)aligned_alloc(64, gateup_sz + 4095);
         s->mm_down_out = mm_down_out = (float *)aligned_alloc(64, down_sz + 4095);
+        s->mm_gateup_alloc = gateup_sz;
+        s->mm_down_alloc = down_sz;
+    } else if (s->mm_down_alloc < down_sz) {
+        free(mm_down_out);
+        s->mm_down_out = mm_down_out = (float *)aligned_alloc(64, down_sz + 4095);
+        s->mm_down_alloc = down_sz;
     }
 
     /* Per-token expert routing tables: [n_tokens][n_used] */
@@ -3593,7 +3610,7 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
             s->expert_assignments, s->expert_counts,
             n_tokens, n_used, dim, n_ff, n_expert, type,
             s->mm_scratch_qx, s->mm_scratch_qx_d,
-            s->mm_down_qx_all, s->mm_down_qx_d_all, s->moe_q8_buf_per_token);
+            s->mm_down_qx_all, s->mm_down_qx_d_all, down_q8_per_token);
         tensor_set_n_threads(1);
     }
 
@@ -6691,6 +6708,13 @@ void model_free(model_t *m) {
             m->repack_used[i] = 0;
         }
     }
+
+    /* Free on-demand mm_id buffers */
+    if (m->state.mm_gate_out) { free(m->state.mm_gate_out); m->state.mm_gate_out = NULL; }
+    if (m->state.mm_up_out)   { free(m->state.mm_up_out);   m->state.mm_up_out = NULL; }
+    if (m->state.mm_down_out) { free(m->state.mm_down_out); m->state.mm_down_out = NULL; }
+    m->state.mm_gateup_alloc = 0;
+    m->state.mm_down_alloc = 0;
 
     if (m->state.mem_block) {
         free(m->state.mem_block);
