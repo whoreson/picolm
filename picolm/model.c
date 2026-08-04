@@ -7098,7 +7098,6 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
             /* L. Residual add */
             picolm_gpu_residual_add(pipe_x, pipe_x, pipe_xb, dim, gpu_dev);
         }
-        picolm_gpu_residual_add(pipe_x, pipe_x, pipe_xb, dim, gpu_dev);
 
         /* K. FFN: pipe_xb = rmsnorm(pipe_x, post_attn_norm_w[l]) */
         picolm_gpu_rmsnorm_dev(pipe_ffn_norm, pipe_x,
