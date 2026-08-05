@@ -4357,8 +4357,28 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
 
             /* LAUREL: norm(laurel_r @ (laurel_l @ x)) + x */
             {
-                matmul(s->hb, active_pred, lw->laurel_l, dim, laurel_rank, lw->type_laurel_l);
-                matmul(s->gemma3n_laurel_out, s->hb, lw->laurel_r, laurel_rank, dim, lw->type_laurel_r);
+                /* laurel_l: [n_embd, laurel_rank] F16, laurel_r: [laurel_rank, n_embd] F16 */
+                int laurel_t = getenv("PICOLM_LAUREL_T") ? 1 : 0;
+                if (laurel_t) {
+                    /* Transposed access: out[i] = sum_n W[n,i] * x[n] */
+                    const uint16_t *wl = (const uint16_t *)lw->laurel_l;
+                    for (int i = 0; i < laurel_rank; i++) {
+                        float sum = 0.0f;
+                        for (int n = 0; n < dim; n++)
+                            sum += fp16_to_fp32(wl[n * laurel_rank + i]) * active_pred[n];
+                        s->hb[i] = sum;
+                    }
+                    const uint16_t *wr = (const uint16_t *)lw->laurel_r;
+                    for (int i = 0; i < dim; i++) {
+                        float sum = 0.0f;
+                        for (int n = 0; n < laurel_rank; n++)
+                            sum += fp16_to_fp32(wr[n * dim + i]) * s->hb[n];
+                        s->gemma3n_laurel_out[i] = sum;
+                    }
+                } else {
+                    matmul(s->hb, active_pred, lw->laurel_l, dim, laurel_rank, lw->type_laurel_l);
+                    matmul(s->gemma3n_laurel_out, s->hb, lw->laurel_r, laurel_rank, dim, lw->type_laurel_r);
+                }
                 rmsnorm(s->gemma3n_laurel_out, s->gemma3n_laurel_out, s->laurel_post_norm_w[l], dim, rms_norm_eps);
                 for (int i = 0; i < dim; i++) s->gemma3n_laurel_out[i] += active_pred[i];
             }
