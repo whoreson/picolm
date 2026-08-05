@@ -4381,10 +4381,14 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
 
         /* V projection + RMSNorm (unweighted in Gemma-3n) */
         matmul(s->hb, s->xb, lw->attn_v, dim, kv_dim, lw->type_attn_v);
-        { float ss = 0.0f;
-          for (int i = 0; i < kv_dim; i++) ss += s->hb[i] * s->hb[i];
-          ss = 1.0f / sqrtf(ss / (float)kv_dim + rms_norm_eps);
-          for (int i = 0; i < kv_dim; i++) s->hb[i] *= ss;
+        { /* V-norm: per-KV-head RMSNorm without learned weight (Gemma-3n) */
+          for (int h = 0; h < n_kv_heads; h++) {
+              float ss = 0.0f;
+              float *v_head = s->hb + h * head_dim;
+              for (int i = 0; i < head_dim; i++) ss += v_head[i] * v_head[i];
+              ss = 1.0f / sqrtf(ss / (float)head_dim + rms_norm_eps);
+              for (int i = 0; i < head_dim; i++) v_head[i] *= ss;
+          }
         }
 
         /* RoPE */
