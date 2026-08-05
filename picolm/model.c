@@ -4249,6 +4249,10 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
         dequantize_row(embd_row, s->x, dim, w->type_token_embd);
         for (int i = 0; i < dim; i++) s->x[i] *= sqrt_dim;
     }
+    if (pos == 0 && getenv("PICOLM_DBG")) {
+        double em = 0; for(int i=0;i<dim;i++){double v=s->x[i]; em+=v*v;}
+        fprintf(stderr, "DBG embd_rms=%.4f (expected %.2f)\n", sqrt(em/dim), sqrtf((float)dim));
+    }
 
     /* 2. Build per-layer inputs: [n_embd_altup, n_layer]
      * From per_layer_tok_embd[token] * sqrt(n_embd_altup)
@@ -4310,6 +4314,14 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
             /* Scale to target magnitude (new_mag is now ~1.0) */
             for (int i = 0; i < dim; i++) dst[i] *= target_mag;
         }
+        if (pos == 0 && getenv("PICOLM_DBG")) {
+            fprintf(stderr, "DBG altup_mags={");
+            for(int a=0;a<n_altup;a++){
+                double m=0; for(int i=0;i<dim;i++){double v=s->gemma3n_altup_state[a*dim+i]; m+=v*v;}
+                fprintf(stderr,"%.1f%s",sqrt(m/dim),a<n_altup-1?",":"");
+            }
+            fprintf(stderr, "}\n");
+        }
     }
 
     /* 4. Transformer layers */
@@ -4333,17 +4345,16 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
                 for (int r = 0; r < n_altup; r++) sum += s->gemma3n_router_out[r] * ((const float *)lw->altup_predict_coef)[r * n_altup * n_altup + a];
                 all_coefs[a] = sum;
             }
-            /* predictions[a] = sum_a' coefs[a,a'] * cur[a'] + cur[a] */
+            /* GGML: ggml_mul_mat(cur_permuted, all_coefs) -> result[a,d] = sum_a' all_coefs[a',a] * cur[a',d]
+             * So the coefficient for cur[a'] contributing to predictions[a] is all_coefs[a' * n_altup + a] */
             predictions = s->gemma3n_predictions;
             for (int a = 0; a < n_altup; a++) {
                 float *pred = predictions + a * dim;
-                float coef = all_coefs[a * n_altup];
                 float *cur_a = s->gemma3n_altup_state;
-                for (int d = 0; d < dim; d++) pred[d] = coef * cur_a[d];
+                for (int d = 0; d < dim; d++) pred[d] = all_coefs[0 * n_altup + a] * cur_a[d];
                 for (int a2 = 1; a2 < n_altup; a2++) {
-                    coef = all_coefs[a * n_altup + a2];
                     cur_a = s->gemma3n_altup_state + a2 * dim;
-                    for (int d = 0; d < dim; d++) pred[d] += coef * cur_a[d];
+                    for (int d = 0; d < dim; d++) pred[d] += all_coefs[a2 * n_altup + a] * cur_a[d];
                 }
             }
 
@@ -4467,6 +4478,12 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
         /* Output projection: attn_output @ attn_result */
         matmul(s->xb2, s->xb, lw->attn_output, q_dim, dim, lw->type_attn_output);
 
+        if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
+            double am = 0; for(int i=0;i<dim;i++){double v=s->xb2[i]; am+=v*v;}
+            fprintf(stderr, "DBG attn_proj_rms=%.3f [0:5]={", sqrt(am/dim));
+            for(int i=0;i<5;i++) fprintf(stderr,"%.4f%s",s->xb2[i],i<4?",":"");
+            fprintf(stderr, "}\n");
+        }
         /* attn_post_norm(attn_result) */
         rmsnorm(s->xb, s->xb2, s->attn_post_norm_w[l], dim, rms_norm_eps);
 
@@ -4604,6 +4621,12 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
     /* 6. Final RMSNorm */
     rmsnorm(s->x, s->x, s->output_norm_w, dim, rms_norm_eps);
 
+    if (pos == 0 && getenv("PICOLM_DBG")) {
+        double om = 0; for(int i=0;i<dim;i++){double v=s->x[i]; om+=v*v;}
+        fprintf(stderr, "DBG hidden_rms=%.4f [0:5]={", sqrt(om/dim));
+        for(int i=0;i<5;i++) fprintf(stderr,"%.4f%s",s->x[i],i<4?",":"");
+        fprintf(stderr, "}\n");
+    }
     /* 7. Output projection -> logits */
     matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
 
