@@ -4454,8 +4454,11 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
         for (int i = 0; i < dim; i++) s->xb[i] += predictions[i_altup_act * dim + i];
 
         /* Add laurel, scale by 1/sqrt(2) */
-        for (int i = 0; i < dim; i++) {
-            s->x[i] = (s->xb[i] + s->gemma3n_laurel_out[i]) / sqrt_2;
+        {
+            int skip_laurel = getenv("PICOLM_SKIP_LAUREL") ? 1 : 0;
+            for (int i = 0; i < dim; i++) {
+                s->x[i] = (s->xb[i] + (skip_laurel ? 0.0f : s->gemma3n_laurel_out[i])) / sqrt_2;
+            }
         }
 
         /* FFN */
@@ -4525,10 +4528,7 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
 
             /* inp_gate: [n_embd, n_embd_altup] */
             matmul(s->gemma3n_inp_gate_out, first_pred, lw->per_layer_inp_gate, dim, n_embd_altup, lw->type_per_layer_inp_gate);
-            for (int i = 0; i < n_embd_altup; i++) {
-                float v = s->gemma3n_inp_gate_out[i];
-                s->gemma3n_inp_gate_out[i] = v * (1.0f / (1.0f + expf(-v))); /* GELU approx */
-            }
+            gelu(s->gemma3n_inp_gate_out, n_embd_altup);  /* Gemma-3n uses GELU */
 
             /* Multiply by per-layer input for this layer */
             float *layer_inp = s->gemma3n_per_layer_inp + l * n_embd_altup;
