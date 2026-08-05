@@ -4463,7 +4463,7 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
             rmsnorm(s->xb, s->x, s->post_attn_norm_w[l], dim, rms_norm_eps);
             matmul(s->hb, s->xb, lw->ffn_gate, dim, n_ffn, lw->type_ffn_gate);
             matmul(s->hb2, s->xb, lw->ffn_up, dim, n_ffn, lw->type_ffn_up);
-            silu(s->hb, n_ffn);
+            gelu(s->hb, n_ffn);  /* Gemma-3n uses GELU, not SiLU */
             elemwise_mul(s->hb, s->hb, s->hb2, n_ffn);
             matmul(s->xb, s->hb, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
             /* post_ffw_norm */

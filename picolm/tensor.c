@@ -3141,6 +3141,14 @@ void silu(float *x, int size) {
     }
 }
 
+void gelu(float *x, int size) {
+    /* GELU: x * Phi(x) ≈ 0.5*x*(1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3))) */
+    for (int i = 0; i < size; i++) {
+        float xi = x[i];
+        x[i] = 0.5f * xi * (1.0f + tanhf(0.79788456f * (xi + 0.044715f * xi * xi * xi)));
+    }
+}
+
 void elemwise_mul(float *out, const float *a, const float *b, int size) {
 #ifdef PICOLM_AVX512
     int i = 0;
