@@ -275,11 +275,11 @@ typedef struct {
     float *ssm_conv1d_w[MAX_LAYERS];   /* [d_conv * conv_dim] F32 */
 
     /* Gemma-3n runtime state */
-    float *gemma3n_altup_state;        /* [n_altup * n_tokens * n_embd] for prefill, [n_altup * n_embd] for gen */
+    float *gemma3n_altup_state;        /* [n_altup * n_embd] for gen */
     float *gemma3n_per_layer_inp;      /* [n_embd_altup * n_layer] projected per-layer input */
     float *gemma3n_inp_gate_out;       /* [n_embd_altup] gated per-layer output */
     float *gemma3n_laurel_out;         /* [n_embd] laurel output */
-    float *gemma3n_router_cache;       /* [n_altup] router modalities cache */
+    float *gemma3n_predictions;        /* [n_altup * n_embd] saved predictions for correct step */
     float *gemma3n_router_out;         /* [n_altup] router output */
     float *gemma3n_norm_w[MAX_LAYERS]; /* extra norm weights for gemma3n */
     float *attn_post_norm_w[MAX_LAYERS];
@@ -293,6 +293,7 @@ typedef struct {
     float *altup_predict_coef_w[MAX_LAYERS];  /* [n_altup * n_altup * n_altup] */
     float *laurel_l_w[MAX_LAYERS];
     float *laurel_r_w[MAX_LAYERS];
+    float *altup_router_w[MAX_LAYERS];     /* [n_embd * n_altup] dequantized router weights */
     /* MoE runtime state */
     float *expert_logits;     /* router logits [n_expert] */
     int *expert_ids;          /* selected expert indices [n_expert_used] */

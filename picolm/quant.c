@@ -1196,12 +1196,13 @@ float vec_dot_q6_K_f32(const void *src, const float *x, int n) {
  * AVX:          _mm_maddubs_epi16 for 16-wide (two lanes)
  * ================================================================ */
 
-#if defined(PICOLM_AVX2)
+#if defined(PICOLM_AVX2) || defined(PICOLM_AVX)
 /* Scale shuffle for Q6_K: 16 scales, each repeated 8 times per 32-byte lane.
  * Q6_K has one scale per 16-element sub-block. For AVX2 32-wide ops, each
  * scale needs to be duplicated across the lanes it applies to.
  * Each scale index is repeated 8 times (covering 8 values per 32-lane register).
- * Two consecutive scales cover 16 values each = 32 values per chunk of the shuffle. */
+ * Two consecutive scales cover 16 values each = 32 values per chunk of the shuffle.
+ * Used by both AVX2 (32-wide) and AVX (16-wide) code paths. */
 static const uint8_t get_scale_shuffle_k6[144] = {
      0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
      2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,

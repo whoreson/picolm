@@ -1808,10 +1808,11 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         int n_embd_altup = c->n_embd_altup;
         int laurel_rank = c->laurel_rank;
         sz_gemma3n += (size_t)n_altup * n_embd * sizeof(float);         /* altup_state (single-token) */
+        sz_gemma3n += (size_t)n_altup * n_embd * sizeof(float);         /* predictions buffer */
         sz_gemma3n += (size_t)n_embd_altup * c->n_layers * sizeof(float); /* per_layer_inp */
         sz_gemma3n += (size_t)n_embd_altup * sizeof(float);              /* inp_gate_out */
         sz_gemma3n += (size_t)n_embd * sizeof(float);                    /* laurel_out */
-        sz_gemma3n += (size_t)n_altup * 2 * sizeof(float);              /* router buffers */
+        sz_gemma3n += (size_t)n_altup * sizeof(float);                  /* router_out */
         /* Extra norm weights per layer */
         sz_gemma3n += (size_t)c->n_layers * n_embd * 5 * sizeof(float); /* attn_post, post_ffw, per_layer_post, laurel_post, router_norm */
         sz_gemma3n += (size_t)c->n_layers * n_embd * sizeof(float);     /* altup_correct_scale */
@@ -1819,6 +1820,7 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         sz_gemma3n += (size_t)c->n_layers * n_altup * n_altup * sizeof(float);        /* correct_coef [n_altup x n_altup] */
         sz_gemma3n += (size_t)c->n_layers * n_altup * n_altup * n_altup * sizeof(float); /* predict_coef [n_altup x n_altup*n_altup] */
         sz_gemma3n += (size_t)c->n_layers * (n_embd * laurel_rank + laurel_rank * n_embd) * sizeof(float); /* laurel_l + laurel_r */
+        sz_gemma3n += (size_t)c->n_layers * n_embd * n_altup * sizeof(float); /* altup_router dequantized */
     }
 
     /* MoE buffers */
@@ -2148,10 +2150,10 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         float *gp = p;
 
         s->gemma3n_altup_state = gp; gp += (size_t)n_altup * n_embd;
+        s->gemma3n_predictions = gp; gp += (size_t)n_altup * n_embd;
         s->gemma3n_per_layer_inp = gp; gp += (size_t)n_embd_altup * c->n_layers;
         s->gemma3n_inp_gate_out = gp; gp += (size_t)n_embd_altup;
         s->gemma3n_laurel_out = gp; gp += (size_t)n_embd;
-        s->gemma3n_router_cache = gp; gp += (size_t)n_altup;
         s->gemma3n_router_out = gp; gp += (size_t)n_altup;
 
         /* Extra norm weights per layer */
@@ -2174,6 +2176,7 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         for (int l = 0; l < c->n_layers; l++) {
             s->laurel_l_w[l] = gp; gp += (size_t)n_embd * laurel_rank;
             s->laurel_r_w[l] = gp; gp += (size_t)laurel_rank * n_embd;
+            s->altup_router_w[l] = gp; gp += (size_t)n_embd * n_altup;
         }
         p = gp;
         /* Verify we didn't exceed the allocation */
@@ -2466,6 +2469,11 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
             /* laurel_r: [laurel_rank, n_embd] */
             if (lw->laurel_r) {
                 dequantize_row(lw->laurel_r, s->laurel_r_w[l], (int)((size_t)laurel_rank * n_embd), lw->type_laurel_r);
+            }
+            /* altup_router: [n_embd, n_altup] F16 -> F32 */
+            if (lw->altup_router) {
+                dequantize_row(lw->altup_router, s->altup_router_w[l],
+                               (int)((size_t)n_embd * n_altup), lw->type_altup_router);
             }
         }
     }
@@ -4188,20 +4196,17 @@ static void gemma3n_normalize(float *x, int n, float mag) {
 
 /* Router: norm -> matmul -> tanh -> [n_altup] */
 static void gemma3n_router(float *out, float *inp, int n_embd, int n_altup,
-                           const float *norm_w, const void *router_raw, gguf_type_t router_type,
+                           const float *norm_w, const float *router_w_f32,
                            float rms_norm_eps, float *tmp_buf) {
     /* RMSNorm */
     rmsnorm(tmp_buf, inp, norm_w, n_embd, rms_norm_eps);
     /* Scale by 1/n_embd */
-    float sc = 1.0f / (float)n_embd;
-    for (int i = 0; i < n_embd; i++) tmp_buf[i] *= sc;
-    /* Dequantize router weights [n_embd, n_altup] */
-    float *router_w = tmp_buf + n_embd; /* use tmp_buf space after n_embd */
-    dequantize_row(router_raw, router_w, (int)((size_t)n_embd * n_altup), router_type);
-    /* Matmul: [n_embd, n_altup] -> [n_altup] */
+    { float sc = 1.0f / (float)n_embd;
+      for (int i = 0; i < n_embd; i++) tmp_buf[i] *= sc; }
+    /* Matmul: router_w_f32 [n_embd, n_altup] -> [n_altup] */
     for (int a = 0; a < n_altup; a++) {
         float sum = 0;
-        const float *col = router_w + a * n_embd;
+        const float *col = router_w_f32 + a * n_embd;
         for (int i = 0; i < n_embd; i++) sum += tmp_buf[i] * col[i];
         out[a] = tanhf(sum);
     }
@@ -4310,6 +4315,8 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
     /* 4. Transformer layers */
     for (int l = 0; l < c->n_layers; l++) {
         layer_weights_t *lw = &w->layers[l];
+        float *predictions;
+        float *active_pred;
 
         /* ALTUP predict: router -> predict_coef -> linear combine altups */
         {
@@ -4317,7 +4324,7 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
             float *active = s->gemma3n_altup_state + i_altup_act * dim;
             /* Router: [n_embd] -> [n_altup] */
             gemma3n_router(s->gemma3n_router_out, active, dim, n_altup,
-                          s->altup_router_norm_w[l], lw->altup_router, lw->type_altup_router,
+                          s->altup_router_norm_w[l], s->altup_router_w[l],
                           rms_norm_eps, s->xb);
             /* predict_coef: [n_altup, n_altup*n_altup] -> [n_altup] -> reshape [n_altup, n_altup] */
             float *all_coefs = s->xb2;
@@ -4326,41 +4333,35 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
                 for (int r = 0; r < n_altup; r++) sum += s->gemma3n_router_out[r] * ((const float *)lw->altup_predict_coef)[r * n_altup * n_altup + a];
                 all_coefs[a] = sum;
             }
-            /* Linear combine: predictions[a] = sum_a' coefs[a,a'] * altup[a'] */
-            float *predictions = s->q; /* reuse as [n_altup * n_embd] */
+            /* predictions[a] = sum_a' coefs[a,a'] * cur[a'] + cur[a] */
+            predictions = s->gemma3n_predictions;
             for (int a = 0; a < n_altup; a++) {
                 float *pred = predictions + a * dim;
-                float *src_altup = s->gemma3n_altup_state + a * dim;
-                memcpy(pred, src_altup, dim * sizeof(float)); /* start with copy */
-                for (int a2 = 0; a2 < n_altup; a2++) {
-                    if (a2 == a) continue;
-                    float coef = all_coefs[a * n_altup + a2];
-                    float *src2 = s->gemma3n_altup_state + a2 * dim;
-                    for (int d = 0; d < dim; d++) pred[d] += coef * src2[d];
+                float coef = all_coefs[a * n_altup];
+                float *cur_a = s->gemma3n_altup_state;
+                for (int d = 0; d < dim; d++) pred[d] = coef * cur_a[d];
+                for (int a2 = 1; a2 < n_altup; a2++) {
+                    coef = all_coefs[a * n_altup + a2];
+                    cur_a = s->gemma3n_altup_state + a2 * dim;
+                    for (int d = 0; d < dim; d++) pred[d] += coef * cur_a[d];
                 }
             }
 
+            /* Residual: predictions += cur */
+            for (int d = 0; d < dim * n_altup; d++) predictions[d] += s->gemma3n_altup_state[d];
+
             /* Active prediction */
-            float *active_pred = predictions + i_altup_act * dim;
-            memcpy(s->x, active_pred, dim * sizeof(float));
-        }
+            active_pred = predictions + i_altup_act * dim;
+            /* ATTN NORM */
+            rmsnorm(s->xb, active_pred, s->attn_norm_w[l], dim, rms_norm_eps);
 
-        /* ATTN NORM */
-        rmsnorm(s->xb, s->x, s->attn_norm_w[l], dim, rms_norm_eps);
-
-        /* LAUREL: L*L^T bottleneck around identity
-         * laurel_out = norm(laurel_r * laurel_l * x) + x
-         */
-        {
-            float *cur = s->x; /* active_prediction */
-            /* laurel_l: [n_embd, laurel_rank] */
-            matmul(s->hb, cur, lw->laurel_l, dim, laurel_rank, lw->type_laurel_l);
-            /* laurel_r: [laurel_rank, n_embd] */
-            matmul(s->gemma3n_laurel_out, s->hb, lw->laurel_r, laurel_rank, dim, lw->type_laurel_r);
-            /* norm */
-            rmsnorm(s->gemma3n_laurel_out, s->gemma3n_laurel_out, s->laurel_post_norm_w[l], dim, rms_norm_eps);
-            /* residual */
-            for (int i = 0; i < dim; i++) s->gemma3n_laurel_out[i] += cur[i];
+            /* LAUREL: norm(laurel_r @ (laurel_l @ x)) + x */
+            {
+                matmul(s->hb, active_pred, lw->laurel_l, dim, laurel_rank, lw->type_laurel_l);
+                matmul(s->gemma3n_laurel_out, s->hb, lw->laurel_r, laurel_rank, dim, lw->type_laurel_r);
+                rmsnorm(s->gemma3n_laurel_out, s->gemma3n_laurel_out, s->laurel_post_norm_w[l], dim, rms_norm_eps);
+                for (int i = 0; i < dim; i++) s->gemma3n_laurel_out[i] += active_pred[i];
+            }
         }
 
         /* Q projection */
@@ -4439,16 +4440,14 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
             tensor_parallel_for(c->n_kv_heads, attention_group, &gctx);
         }
 
-        /* Output projection */
+        /* Output projection: attn_output @ attn_result */
         matmul(s->xb2, s->xb, lw->attn_output, q_dim, dim, lw->type_attn_output);
-        vec_add(s->x, s->xb2, dim);
 
-        /* attn_post_norm */
-        rmsnorm(s->xb, s->x, s->attn_post_norm_w[l], dim, rms_norm_eps);
+        /* attn_post_norm(attn_result) */
+        rmsnorm(s->xb, s->xb2, s->attn_post_norm_w[l], dim, rms_norm_eps);
 
-        /* Add active prediction */
-        float *active_pred = s->q + i_altup_act * dim; /* still there from predict step */
-        for (int i = 0; i < dim; i++) s->xb[i] += active_pred[i];
+        /* Add active prediction (residual) */
+        for (int i = 0; i < dim; i++) s->xb[i] += predictions[i_altup_act * dim + i];
 
         /* Add laurel, scale by 1/sqrt(2) */
         for (int i = 0; i < dim; i++) {
@@ -4469,48 +4468,58 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
             for (int i = 0; i < dim; i++) s->xb[i] += s->x[i];
         }
 
-        /* ALTUP correct */
+        /* ALTUP Correct
+         * activated = s->xb (output after FFN)
+         * active_prediction = predictions[i_altup_act] (from predict step)
+         * innovation = activated - active_prediction
+         * correct_coefs = altup_correct_coef @ modalities + 1.0  [n_altup]
+         * corrected = predictions + innovation * correct_coefs  [broadcast n_altup]
+         */
         {
-            /* Re-compute router on the current state (after FFN) */
+            /* Router on activated state */
             gemma3n_router(s->gemma3n_router_out, s->xb, dim, n_altup,
-                          s->altup_router_norm_w[l], lw->altup_router, lw->type_altup_router,
-                          rms_norm_eps, s->hb);
+                          s->altup_router_norm_w[l], s->altup_router_w[l],
+                          rms_norm_eps, s->xb2);
 
-            /* Get active prediction from earlier predictions buffer */
-            /* innovation = activated - active_prediction */
-            /* We need the predictions from earlier - they were in s->q */
-            /* Re-derive: active_pred was in s->q + i_altup_act * dim, but may be overwritten */
-            /* Actually we need to re-predict. Let me restructure. */
-
-            /* correct_coef: [n_altup, n_altup] -> [n_altup] via router */
-            float *all_coefs = s->xb2;
+            /* correct_coefs = altup_correct_coef @ modalities + 1.0 */
+            float *correct_coefs = s->xb2;
+            const float *correct_coef = lw->altup_correct_coef;
             for (int a = 0; a < n_altup; a++) {
                 float sum = 0;
-                for (int r = 0; r < n_altup; r++) sum += s->gemma3n_router_out[r] * ((const float *)lw->altup_correct_coef)[r * n_altup + a];
-                all_coefs[a] = sum + 1.0f; /* +1 bias */
+                for (int r = 0; r < n_altup; r++)
+                    sum += s->gemma3n_router_out[r] * correct_coef[r * n_altup + a];
+                correct_coefs[a] = sum + 1.0f;
             }
 
-            /* innovation = activated - active_prediction */
-            /* Re-do predict step to get fresh predictions */
-            /* Actually per the reference code, we use the "predictions" from the predict step */
-            /* and "activated" is the current state (after FFN + attn_laurel) */
-            /* But we've lost the predictions... Let me restructure to keep them. */
+            /* innovation = activated - predictions[i_altup_act] */
+            float *active_prediction = predictions + i_altup_act * dim;
+            for (int d = 0; d < dim; d++)
+                s->hb[d] = s->xb[d] - active_prediction[d];
 
-            /* For now, use s->gemma3n_altup_state as the predictions (they were the last predicted values) */
-            /* This is an approximation - the correct approach needs to save predictions */
+            /* corrected[a] = predictions[a] + innovation * correct_coefs[a] */
+            for (int a = 0; a < n_altup; a++) {
+                float coef = correct_coefs[a];
+                float *pred_a = predictions + a * dim;
+                float *cur_a = s->gemma3n_altup_state + a * dim;
+                for (int d = 0; d < dim; d++)
+                    cur_a[d] = pred_a[d] + s->hb[d] * coef;
+            }
         }
 
-        /* Per-layer input gate + project */
+        /* Per-layer gating
+         * first_prediction = corrected[i_altup_act] * altup_correct_scale
+         * first_prediction = GELU(inp_gate @ first_prediction) * per_layer_inp[l]
+         * first_prediction = rmsnorm(per_layer_proj @ first_prediction)
+         * corrected[1:] += first_prediction
+         */
         {
-            /* first_prediction = active altup from corrected predictions */
-            /* For simplicity, take current state as first_prediction */
             float *first_pred = s->gemma3n_inp_gate_out;
-            memcpy(first_pred, s->xb, dim * sizeof(float));
+            /* Take active corrected altup */
+            float *corrected_active = s->gemma3n_altup_state + i_altup_act * dim;
+            /* Scale by altup_correct_scale */
+            for (int i = 0; i < dim; i++) first_pred[i] = corrected_active[i] * s->altup_correct_scale_w[l][i];
 
-            /* Scale by correct_scale */
-            for (int i = 0; i < dim; i++) first_pred[i] *= s->altup_correct_scale_w[l][i];
-
-            /* inp_gate: [n_embd, n_embd_altup] -> GELU */
+            /* inp_gate: [n_embd, n_embd_altup] */
             matmul(s->gemma3n_inp_gate_out, first_pred, lw->per_layer_inp_gate, dim, n_embd_altup, lw->type_per_layer_inp_gate);
             for (int i = 0; i < n_embd_altup; i++) {
                 float v = s->gemma3n_inp_gate_out[i];
@@ -4525,15 +4534,13 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
             matmul(s->hb, s->gemma3n_inp_gate_out, lw->per_layer_proj, n_embd_altup, dim, lw->type_per_layer_proj);
             rmsnorm(s->hb, s->hb, s->per_layer_post_norm_w[l], dim, rms_norm_eps);
 
-            /* Add to altups[1:] (all except active) */
+            /* Add to all non-active altups */
             for (int a = 0; a < n_altup; a++) {
                 if (a == i_altup_act) continue;
-                float *altup = s->gemma3n_altup_state + a * dim;
-                for (int i = 0; i < dim; i++) altup[i] += s->hb[i];
+                float *a_dst = s->gemma3n_altup_state + a * dim;
+                for (int i = 0; i < dim; i++) a_dst[i] += s->hb[i];
             }
-
-            /* Set active altup to current state */
-            memcpy(s->gemma3n_altup_state + i_altup_act * dim, s->xb, dim * sizeof(float));
+            /* Active altup already set by correct step */
         }
 
         /* cur = corrected predictions (all altups) -> next layer input is the concat */
