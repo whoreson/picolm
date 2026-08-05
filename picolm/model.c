@@ -3168,11 +3168,93 @@ static const void *get_expert_slice(const void *base, int expert,
     return (const void *)((const uint8_t *)base + expert * expert_stride);
 }
 
+/* Parallel expert worker for moe_forward: processes one expert using
+ * per-thread scratch buffers. Uses matmul_q8_seq (not matmul_q8) to
+ * avoid racing on the global n_threads variable and re-entering the
+ * thread pool from inside a tensor_parallel_for worker. */
+typedef struct {
+    const block_q8_0 *qx;       /* pre-quantized input */
+    const float *qx_d;          /* input Q8_0 deltas */
+    int dim, n_ff;
+    int *ids;                   /* expert ids [n_used] */
+    float *weights;             /* expert weights [n_used] */
+    gguf_type_t type_gate, type_up, type_down;
+    const void *gate_exps, *up_exps, *down_exps;
+    float *expert_out;          /* output [n_used * dim], each expert writes to slot i*dim */
+    run_state_t *s;
+} moe_expert_ctx;
+
+static void moe_expert_worker(int i, void *vctx) {
+    moe_expert_ctx *ctx = (moe_expert_ctx *)vctx;
+    int dim = ctx->dim, n_ff = ctx->n_ff;
+
+    int eid = ctx->ids[i];
+    float w_i = ctx->weights[i];
+
+    /* Get per-thread scratch buffer */
+    unsigned tid = tensor_get_thread_id();
+    if (tid >= MAX_THREADS) tid = 0;
+    char *scratch = (char *)ctx->s->moe_thread_scratch + tid * ctx->s->moe_thread_stride;
+
+    float *gate_buf = (float *)scratch;
+    float *up_buf = gate_buf + n_ff;
+    /* xb2 + acc area follows (dim * 2 floats), then Q8 buffers */
+    char *q8_ptr = (char *)(up_buf + n_ff) + (size_t)dim * 2 * sizeof(float);
+    block_q8_0 *down_qx = (block_q8_0 *)q8_ptr;
+    float *down_qx_d = (float *)((char *)down_qx + gguf_type_row_size(GGUF_TYPE_Q8_0, n_ff));
+
+    const void *gate_w = get_expert_slice(ctx->gate_exps, eid, dim, n_ff, ctx->type_gate);
+    const void *up_w = get_expert_slice(ctx->up_exps, eid, dim, n_ff, ctx->type_up);
+    const void *down_w = get_expert_slice(ctx->down_exps, eid, n_ff, dim, ctx->type_down);
+
+    /* Use matmul_q8_seq: sequential, no thread pool, safe inside tensor_parallel_for */
+    matmul_q8_seq(gate_buf, ctx->qx, ctx->qx_d, gate_w, dim, n_ff, ctx->type_gate);
+    matmul_q8_seq(up_buf, ctx->qx, ctx->qx_d, up_w, dim, n_ff, ctx->type_up);
+
+    /* SwiGLU: silu(gate) * up */
+    silu(gate_buf, n_ff);
+    elemwise_mul(gate_buf, gate_buf, up_buf, n_ff);
+
+    /* Quantize SwiGLU output for Q8xQ8 down projection */
+    {
+        size_t dnb = n_ff / 32;
+        quantize_row_q8_0(gate_buf, down_qx, n_ff);
+        for (size_t b = 0; b < dnb; b++) {
+            down_qx_d[b] = fp16_to_fp32(down_qx[b].d);
+        }
+    }
+
+    /* Down projection */
+    float *out = ctx->expert_out + (size_t)i * dim;
+    matmul_q8_seq(out, down_qx, down_qx_d, down_w, n_ff, dim, ctx->type_down);
+
+    /* Scale by expert weight */
+#ifdef PICOLM_AVX512
+    {
+        __m512 bw = _mm512_set1_ps(w_i);
+        int di = 0;
+        for (; di + 15 < dim; di += 16) {
+            __m512 v0 = _mm512_loadu_ps(out + di);
+            __m512 v1 = _mm512_loadu_ps(out + di + 8);
+            _mm512_storeu_ps(out + di, _mm512_mul_ps(bw, v0));
+            _mm512_storeu_ps(out + di + 8, _mm512_mul_ps(bw, v1));
+        }
+        for (; di + 7 < dim; di += 8) {
+            __m512 v = _mm512_loadu_ps(out + di);
+            _mm512_storeu_ps(out + di, _mm512_mul_ps(bw, v));
+        }
+        for (; di < dim; di++) out[di] *= w_i;
+    }
+#else
+    for (int d = 0; d < dim; d++) out[d] *= w_i;
+#endif
+}
+
 /* MoE forward pass: router + top-K expert selection + SwiGLU per expert + shared expert.
  * Input: x[n_embd], Output: residual[n_embd] (additive to input) */
 /* Optimized MoE forward: pre-quantize x, Q8xQ8 dot products for gate+up,
- * AVX-512 vectorized accumulation. Sequential expert loop (parallelism
- * deferred until prefill batching is implemented). */
+ * AVX-512 vectorized accumulation. Experts processed in parallel via
+ * tensor_parallel_for for multi-threaded generation. */
 static void moe_forward(model_t *m, run_state_t *s, const float *x, float *residual,
                         const layer_weights_t *lw) {
     model_config_t *c = &m->config;
@@ -3228,19 +3310,12 @@ static void moe_forward(model_t *m, run_state_t *s, const float *x, float *resid
         for (int i = 0; i < n_used; i++) weights[i] *= inv_wsum;
     }
 
-    /* 4. Zero accumulator */
-    memset(moe_out, 0, dim * sizeof(float));
-
     /* 5. Pre-quantize input x to Q8_0 ONCE (Phase A + D).
      * All expert gate+up projections reuse this quantized buffer via matmul_q8,
      * saving 16 redundant quantizations per MoE layer. */
     {
-        /* Disable threading for small MoE matmuls — thread pool overhead dominates */
-        int saved_threads = tensor_get_n_threads();
-        tensor_set_n_threads(1);
-
         size_t nb = dim / 32;
-        block_q8_0 *qx = s->shared_qx; /* pre-allocated, reused each layer */
+        block_q8_0 *qx = s->shared_qx;
         float *qx_d = s->shared_qx_d;
         quantize_row_q8_0(x, qx, dim);
         for (size_t bi = 0; bi < nb; bi++) {
@@ -3251,53 +3326,49 @@ static void moe_forward(model_t *m, run_state_t *s, const float *x, float *resid
         gguf_type_t type_up = lw->type_ffn_up_exps;
         gguf_type_t type_down = lw->type_ffn_down_exps;
 
-        float *hb_exp = s->hb_exp;
-        float *hb2_exp = s->hb2_exp;
-        float *xb2_exp = s->xb2;
+        /* Parallel expert dispatch: each expert runs in its own thread.
+         * matmul_q8_seq is used (not matmul_q8) to avoid racing on the
+         * global n_threads and re-entering the thread pool. */
+        float *expert_out = (float *)alloca((size_t)n_used * dim * sizeof(float));
 
+        moe_expert_ctx ctx = {
+            .qx = s->shared_qx,
+            .qx_d = s->shared_qx_d,
+            .dim = dim,
+            .n_ff = n_ff,
+            .ids = ids,
+            .weights = weights,
+            .type_gate = type_gate,
+            .type_up = type_up,
+            .type_down = type_down,
+            .gate_exps = lw->ffn_gate_exps,
+            .up_exps = lw->ffn_up_exps,
+            .down_exps = lw->ffn_down_exps,
+            .expert_out = expert_out,
+            .s = s,
+        };
+
+        tensor_parallel_for(n_used, moe_expert_worker, &ctx);
+
+        /* Reduce per-expert outputs into moe_out */
+        memset(moe_out, 0, dim * sizeof(float));
         for (int i = 0; i < n_used; i++) {
-            int eid = ids[i];
-            float w_i = weights[i];
-
-            const void *gate_w = get_expert_slice(lw->ffn_gate_exps, eid, dim, n_ff, type_gate);
-            const void *up_w = get_expert_slice(lw->ffn_up_exps, eid, dim, n_ff, type_up);
-            const void *down_w = get_expert_slice(lw->ffn_down_exps, eid, n_ff, dim, type_down);
-
-            matmul_q8(hb_exp, qx, qx_d, gate_w, dim, n_ff, type_gate);
-            matmul_q8(hb2_exp, qx, qx_d, up_w, dim, n_ff, type_up);
-
-            silu(hb_exp, n_ff);
-            elemwise_mul(hb_exp, hb_exp, hb2_exp, n_ff);
-
-            /* Q8×Q8 down projection with pre-allocated quantization buffer */
-            {
-                size_t down_nb = n_ff / 32;
-                quantize_row_q8_0(hb_exp, s->down_qx, n_ff);
-                for (size_t bi = 0; bi < down_nb; bi++) {
-                    s->down_qx_d[bi] = fp16_to_fp32(s->down_qx[bi].d);
-                }
-                matmul_q8(xb2_exp, s->down_qx, s->down_qx_d, down_w, n_ff, dim, type_down);
-            }
-
+            float *eo = expert_out + (size_t)i * dim;
 #ifdef PICOLM_AVX512
-            {
-                __m512 bw = _mm512_set1_ps(w_i);
-                int di = 0;
-                for (; di + 15 < dim; di += 16) {
-                    __m512 v0 = _mm512_loadu_ps(moe_out + di);
-                    __m512 v1 = _mm512_loadu_ps(xb2_exp + di);
-                    __m512 v2 = _mm512_loadu_ps(moe_out + di + 8);
-                    __m512 v3 = _mm512_loadu_ps(xb2_exp + di + 8);
-                    _mm512_storeu_ps(moe_out + di, _mm512_add_ps(v0, _mm512_mul_ps(bw, v1)));
-                    _mm512_storeu_ps(moe_out + di + 8, _mm512_add_ps(v2, _mm512_mul_ps(bw, v3)));
-                }
-                for (; di < dim; di++) moe_out[di] += w_i * xb2_exp[di];
+            int di = 0;
+            for (; di + 15 < dim; di += 16) {
+                __m512 v0 = _mm512_loadu_ps(moe_out + di);
+                __m512 v1 = _mm512_loadu_ps(eo + di);
+                __m512 v2 = _mm512_loadu_ps(moe_out + di + 8);
+                __m512 v3 = _mm512_loadu_ps(eo + di + 8);
+                _mm512_storeu_ps(moe_out + di, _mm512_add_ps(v0, v1));
+                _mm512_storeu_ps(moe_out + di + 8, _mm512_add_ps(v2, v3));
             }
+            for (; di < dim; di++) moe_out[di] += eo[di];
 #else
-            for (int d = 0; d < dim; d++) moe_out[d] += w_i * xb2_exp[d];
+            for (int d = 0; d < dim; d++) moe_out[d] += eo[d];
 #endif
         }
-        tensor_set_n_threads(saved_threads);
     }
 
     /* 6. Shared expert — Q8×Q8 with pre-allocated buffers */

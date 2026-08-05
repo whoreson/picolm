@@ -1484,6 +1484,23 @@ void matmul_q8(float *out, const void *qx, const float *qx_d,
         }
     }
 }
+/* matmul_q8_seq: sequential Q8xQ8 matmul that ignores n_threads.
+ * Safe to call from inside tensor_parallel_for workers. */
+void matmul_q8_seq(float *out, const void *qx, const float *qx_d,
+                   const void *W, int n, int d, gguf_type_t qtype) {
+    size_t row_bytes = gguf_type_row_size(qtype, n);
+    const char *wptr = (const char *)W;
+
+    if (qtype == GGUF_TYPE_Q8_0 && n > 0) {
+        for (int i = 0; i < d; i++) {
+            out[i] = vec_dot_q8_0_q8_0_deltas(qx, qx_d, wptr + (size_t)i * row_bytes, n);
+        }
+        return;
+    }
+    for (int i = 0; i < d; i++) {
+        out[i] = vec_dot(wptr + (size_t)i * row_bytes, NULL, n, qtype);
+    }
+}
 
 /* matmul_q8_batch: batched Q8×Q8 matmul with pre-quantized activations.
  *
