@@ -1528,7 +1528,26 @@ void matmul_q8_seq(float *out, const void *qx, const float *qx_d,
 void matmul_q8_batch(float *out, const float *qx_all, int qx_d_off,
                      int q8_buf_per_token, const void *W,
                      int n, int d, int n_batch, gguf_type_t qtype) {
-    if (qtype != GGUF_TYPE_Q8_0 || n <= 0 || d <= 0 || n_batch <= 0) return;
+    if (n <= 0 || d <= 0 || n_batch <= 0) return;
+
+    if (qtype != GGUF_TYPE_Q8_0) {
+        /* Non-Q8_0 weights: dequantize Q8_0 activation to float, then use vec_dot.
+         * This is slower than Q8xQ8 but handles all weight types (Q4_K, Q6_K, etc.) */
+        {
+            size_t row_bytes = gguf_type_row_size(qtype, n);
+            const char *wptr = (const char *)W;
+            float *xf = (float *)malloc((size_t)n * sizeof(float));
+            for (int b = 0; b < n_batch; b++) {
+                const float *tbuf = qx_all + b * q8_buf_per_token;
+                dequantize_row_q8_0(tbuf, xf, n);
+                for (int i = 0; i < d; i++) {
+                    out[b * d + i] = vec_dot(wptr + (size_t)i * row_bytes, xf, n, qtype);
+                }
+            }
+            free(xf);
+        }
+        return;
+    }
 
     size_t row_bytes = gguf_type_row_size(qtype, n);
     const char *wptr = (const char *)W;
