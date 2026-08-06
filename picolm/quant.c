@@ -1678,7 +1678,7 @@ void quantize_row_q8_K(const float *x, void *dst, int n) {
         }
         float id = (amax != 0.0f) ? 127.0f / amax : 0.0f;
         y[i].d = 1.0f / id;
-
+        
 #ifdef PICOLM_NEON
         for (int j = 0; j < 256; j += 8) {
             float32x4_t v0 = vld1q_f32(x + j);
@@ -2218,7 +2218,7 @@ float vec_dot_q5_K_q8_K(const void *src_q5, const void *src_q8, int n) {
         utmp[0] &= kmask1;
 
         const __m256i mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32(utmp[3], utmp[2], utmp[1], utmp[0]));
-
+        
         const __m256i q8sums = _mm256_loadu_si256((const __m256i*)y[i].bsums);
         const __m128i q8s = _mm_hadd_epi16(_mm256_extracti128_si256(q8sums, 0), _mm256_extracti128_si256(q8sums, 1));
         const __m128i prod = _mm_madd_epi16(_mm256_extracti128_si256(mins_and_scales, 1), q8s);
@@ -2354,43 +2354,63 @@ float vec_dot_q5_K_q8_K(const void *src_q5, const void *src_q8, int n) {
     return hsum_avx(acc) + summs;
 
 #else
-    float sumf = 0.0f;
-    for (int i = 0; i < nb; i++) {
-        float dl = fp16_to_fp32_lookup(x[i].d);
-        float dml = fp16_to_fp32_lookup(x[i].dm);
-        const uint8_t *q5 = x[i].qs;
-        const uint8_t *qh = x[i].qh;
-        const int8_t  *q8 = y[i].qs;
-        memcpy(utmp, x[i].scales, 12);
-        utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
-        {
-            const uint32_t uaux = utmp[1] & kmask1;
-            utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
-            utmp[2] = uaux;
-        }
-        utmp[0] &= kmask1;
-        const uint16_t *uscales = (const uint16_t *)utmp;
-        uint16_t hmv = 1;
-        float smin = 0.0f;
-        for (int j = 0; j < 256; j += 64) {
-            for (int l = 0; l < 32; l++) {
-                uint8_t qval = (q5[l] & 0xF) | ((qh[l] & hmv) ? 16 : 0);
-                sumf += (float)qval * q8[l] * (float)uscales[(j/64)*2 + 0];
+    /* Scalar fallback: ported from llama.cpp ggml_vec_dot_q5_K_q8_K_generic */
+    {
+        int8_t aux8[256];
+        int32_t aux32[8];
+        float sums[8];
+        float sumf = 0.0f;
+
+        for (int s = 0; s < 8; s++) sums[s] = 0.0f;
+
+        for (int i = 0; i < nb; i++) {
+            const uint8_t *q4 = x[i].qs;
+            const uint8_t *hm = x[i].qh;
+            const int8_t *q8 = y[i].qs;
+
+            for (int s = 0; s < 8; s++) aux32[s] = 0;
+
+            int8_t *a = aux8;
+            uint8_t m = 1;
+            for (int j = 0; j < 4; ++j) {
+                for (int l = 0; l < 32; ++l) a[l] = (int8_t)(q4[l] & 0xF);
+                for (int l = 0; l < 32; ++l) a[l] += (hm[l] & m ? 16 : 0);
+                a += 32; m <<= 1;
+                for (int l = 0; l < 32; ++l) a[l] = (int8_t)(q4[l] >> 4);
+                for (int l = 0; l < 32; ++l) a[l] += (hm[l] & m ? 16 : 0);
+                a += 32; m <<= 1;
+                q4 += 32;
             }
-            smin += (float)uscales[(j/64)*2 + 4] * (y[i].bsums[(j/64)*4 + 0] + y[i].bsums[(j/64)*4 + 1]);
-            hmv <<= 1;
-            for (int l = 0; l < 32; l++) {
-                uint8_t qval = (q5[l] >> 4) | ((qh[l] & hmv) ? 16 : 0);
-                sumf += (float)qval * q8[32+l] * (float)uscales[(j/64)*2 + 1];
+            memcpy(utmp, x[i].scales, 12);
+            utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+            { const uint32_t uaux = utmp[1] & kmask1; utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4); utmp[2] = uaux; }
+            utmp[0] &= kmask1;
+
+            const uint8_t *scales = (const uint8_t *)&utmp[0];
+            const uint8_t *mins = (const uint8_t *)&utmp[2];
+            
+            int sumi = 0;
+            for (int j = 0; j < 16; ++j) sumi += y[i].bsums[j] * mins[j / 2];
+
+            a = aux8;
+            int is = 0;
+            for (int j = 0; j < 8; ++j) {
+                int32_t scale = scales[is++];
+                for (int g = 0; g < 4; g++) {
+                    for (int l = 0; l < 8; ++l) aux32[l] += scale * (q8[l] * a[l]);
+                    q8 += 8; a += 8;
+                }
             }
-            smin += (float)uscales[(j/64)*2 + 5] * (y[i].bsums[(j/64)*4 + 2] + y[i].bsums[(j/64)*4 + 3]);
-            hmv <<= 1;
-            q5 += 32;
+
+            float d = fp16_to_fp32_lookup(x[i].d) * y[i].d;
+            for (int l = 0; l < 8; ++l) sums[l] += d * aux32[l];
+
+            float dmin = fp16_to_fp32_lookup(x[i].dm) * y[i].d;
+            sumf -= dmin * sumi;
         }
-        sumf *= dl * y[i].d;
-        sumf += dml * y[i].d * (-smin);
+        for (int l = 0; l < 8; ++l) sumf += sums[l];
+        return sumf;
     }
-    return sumf;
 #endif
 }
 
@@ -3890,10 +3910,13 @@ float vec_dot_q8_0_f32(const void *src, const float *x, int n) {
 
 #else
         /* Scalar fallback */
-        for (int j = 0; j < 32; j++) {
-            sumf += (float)qs[j] * xp[j];
+        {
+            float block_sum = 0.0f;
+            for (int j = 0; j < 32; j++) {
+                block_sum += (float)qs[j] * xp[j];
+            }
+            sumf += d * block_sum;
         }
-        sumf *= d;
 #endif
     }
     return sumf;
