@@ -6913,6 +6913,7 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
     for (int l = 0; l < c->n_layers; l++) {
         layer_weights_t *lw = &w->layers[l];
         gl = &gw->layers[l];
+        int did_cpu_ssm = 0;
 
         if (!c->has_ssm || lw->is_attn_layer) {
             /* A. RMSNorm: pipe_xb = rmsnorm(pipe_x, attn_norm_w[l]) */
@@ -6987,140 +6988,69 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
             /* J. Residual add: pipe_x += pipe_xb */
             picolm_gpu_residual_add(pipe_x, pipe_x, pipe_xb, dim, gpu_dev);
         } else {
-            /* SSM/hybrid layer block. Mirrors ssm_forward()'s CPU
-             * reference exactly, steps re-lettered to match this
-             * function's convention. No KV cache, no RoPE, no softmax
-             * attention -- despite the "attn_" prefix on some of these
-             * tensor names (GGUF naming carried over), hybrid layers do
-             * no standard multi-head attention at all. */
-            int ssm_n_k = c->ssm_n_group;
-            int ssm_n_v = c->ssm_dt_rank;
-            int ssm_d_state = c->ssm_d_state;
-            int ssm_head_v_dim = c->ssm_d_inner / ssm_n_v;
-            int ssm_repeat = ssm_n_v / ssm_n_k;
-            int ssm_qk_dim = ssm_d_state * ssm_n_k;
-            int ssm_conv_dim = 2 * ssm_qk_dim + c->ssm_d_inner;
-            int ssm_do_remap = !m->from_safetensors && ssm_n_k > 0 &&
-                                ssm_n_k < ssm_n_v && gw->ssm_head_map_dev;
+            /* SSM/hybrid layer: fall back to CPU ssm_forward().
+             *
+             * The GPU SSM pipeline (per-kernel dispatch: rmsnorm, matmul,
+             * conv1d, l2norm, vecdot x2, gate_beta, recurrence, gated_norm,
+             * matmul, residual_add -- 11+ launches, ~20+ counting the FFN
+             * that follows) is correct but launch-overhead bound: for a
+             * 48-SSM-layer model that's 960+ tiny kernel launches per
+             * token, which dominates over the actual compute. Running the
+             * layer on CPU instead means one CPU function call per layer.
+             *
+             * Portability: this uses a plain D2H + H2D pair rather than
+             * unified memory, so it works the same on discrete GPUs
+             * (PCIe) as it does on GB10. Payload is dim floats (20KB
+             * for n_embd=5120) each way -- at PCIe Gen4 x16 (~16GB/s)
+             * that's ~1.25us per transfer, negligible next to the
+             * ~0.5-1ms the CPU spends actually computing the layer.
+             *
+             * gpu_lw=NULL is required, not optional: every GPU-kernel
+             * call inside ssm_forward is gated on `if (gpu_lw)` deriving
+             * its gpu_layer_weights_t* from that exact parameter (see the
+             * vecdot/recurrence/FFN call sites), so passing NULL is what
+             * forces the whole layer to run on CPU instead of silently
+             * reintroducing the same per-kernel-launch overhead we're
+             * trying to avoid here. */
+            picolm_gpu_sync(gpu_dev);
+            picolm_gpu_memcpy(s->x, pipe_x, (size_t)dim * sizeof(float), -1, gpu_dev);
 
-            float *ssm_qkv_raw = picolm_gpu_ssm_qkv_raw(gpu_dev);
-            float *ssm_conv_out = picolm_gpu_ssm_conv_out(gpu_dev);
-            float *ssm_xb2 = picolm_gpu_ssm_xb2(gpu_dev);
-            float *ssm_xb2_remap = picolm_gpu_ssm_xb2_remap(gpu_dev);
-            float *ssm_v_remap = picolm_gpu_ssm_v_remap(gpu_dev);
-            float *ssm_alpha_raw = picolm_gpu_ssm_alpha_raw(gpu_dev);
-            float *ssm_beta_raw = picolm_gpu_ssm_beta_raw(gpu_dev);
-            float *ssm_gate_exp = picolm_gpu_ssm_gate_exp(gpu_dev);
-            float *ssm_beta = picolm_gpu_ssm_beta(gpu_dev);
-            float *ssm_output = picolm_gpu_ssm_output(gpu_dev);
-            float *ssm_final_output = picolm_gpu_ssm_final_output(gpu_dev);
+            float *ssm_residual = s->xb2;
+            ssm_forward(m, s, s->x, ssm_residual, lw, l, pos, NULL);
 
-            /* A. RMSNorm (same attn_norm as attention layers) */
-            picolm_gpu_rmsnorm_dev(pipe_xb, pipe_x,
-                                    (float *)gw->attn_norm_dev[l],
-                                    dim, c->rms_norm_eps, gpu_dev);
-
-            /* B. attn_qkv projection -> conv1d input */
-            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_qkv,
-                                   ssm_qkv_raw, pipe_xb, 1, gpu_dev);
-
-            /* C. attn_gate_ssm projection -> z-gate */
-            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_gate_ssm,
-                                   ssm_xb2, pipe_xb, 1, gpu_dev);
-
-            float *xb2_use = ssm_xb2;
-            if (ssm_do_remap) {
-                picolm_gpu_ssm_head_permute_dev(ssm_xb2_remap, ssm_xb2,
-                                                 (int *)gw->ssm_head_map_dev,
-                                                 ssm_head_v_dim, ssm_n_v, gpu_dev);
-                xb2_use = ssm_xb2_remap;
-            }
-
-            /* D. Conv1d + state shift */
-            picolm_gpu_ssm_conv1d_dev(ssm_conv_out, (float *)gw->ssm_conv_state_dev[l],
-                                       ssm_qkv_raw, (float *)gw->ssm_conv1d_dev[l],
-                                       ssm_conv_dim, c->ssm_d_conv, gpu_dev);
-
-            /* E. Split into q_conv/k_conv/v_conv */
-            float *q_conv = ssm_conv_out;
-            float *k_conv = ssm_conv_out + ssm_qk_dim;
-            float *v_conv_src = ssm_conv_out + 2 * ssm_qk_dim;
-
-            float *v_conv_use = v_conv_src;
-            if (ssm_do_remap) {
-                picolm_gpu_ssm_head_permute_dev(ssm_v_remap, v_conv_src,
-                                                 (int *)gw->ssm_head_map_dev,
-                                                 ssm_head_v_dim, ssm_n_v, gpu_dev);
-                v_conv_use = ssm_v_remap;
-            }
-
-            /* F. L2 norm of Q/K (per k_head) */
-            picolm_gpu_ssm_l2norm_dev(q_conv, ssm_d_state, ssm_n_k,
-                                       1e-12f, 1.0f / sqrtf((float)ssm_d_state), gpu_dev);
-            picolm_gpu_ssm_l2norm_dev(k_conv, ssm_d_state, ssm_n_k,
-                                       1e-12f, 1.0f, gpu_dev);
-
-            /* G. Alpha/beta vecdot */
-            picolm_gpu_ssm_vecdot_dev(ssm_alpha_raw, pipe_xb,
-                                       gw->ssm_alpha_dev[l], lw->type_ssm_alpha,
-                                       dim, ssm_n_v,
-                                       (int)gguf_type_row_size(lw->type_ssm_alpha, dim),
-                                       (const int *)gw->ssm_head_map_dev, gpu_dev);
-            picolm_gpu_ssm_vecdot_dev(ssm_beta_raw, pipe_xb,
-                                       gw->ssm_beta_dev[l], lw->type_ssm_beta,
-                                       dim, ssm_n_v,
-                                       (int)gguf_type_row_size(lw->type_ssm_beta, dim),
-                                       (const int *)gw->ssm_head_map_dev, gpu_dev);
-
-            /* H. Gate/beta activation */
-            picolm_gpu_ssm_gate_beta_dev(ssm_gate_exp, ssm_beta,
-                                          ssm_alpha_raw, ssm_beta_raw,
-                                          (float *)gw->ssm_a_dev[l],
-                                          (float *)gw->ssm_dt_dev[l], ssm_n_v, gpu_dev);
-
-            /* I. Recurrence */
-            picolm_gpu_ssm_recurrence_pipeline_dev(gw->ssm_state_dev[l],
-                                                    q_conv, k_conv, v_conv_use,
-                                                    ssm_gate_exp, ssm_beta,
-                                                    ssm_output, ssm_n_v, ssm_d_state,
-                                                    ssm_repeat, gpu_dev);
-
-            /* J. Gated normalization */
-            picolm_gpu_ssm_gated_norm_dev(ssm_final_output, ssm_output, xb2_use,
-                                           (float *)gw->ssm_norm_dev[l],
-                                           ssm_do_remap ? (const int *)gw->ssm_head_map_dev : NULL,
-                                           ssm_head_v_dim, ssm_n_v, 1e-12f, gpu_dev);
-
-            /* K. ssm_out projection */
-            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ssm_out,
-                                   pipe_xb, ssm_final_output, 1, gpu_dev);
-
-            /* L. Residual add */
-            picolm_gpu_residual_add(pipe_x, pipe_x, pipe_xb, dim, gpu_dev);
+            picolm_gpu_memcpy(pipe_x, s->x, (size_t)dim * sizeof(float), 1, gpu_dev);
+            did_cpu_ssm = 1;
         }
 
-        /* K. FFN: pipe_xb = rmsnorm(pipe_x, post_attn_norm_w[l]) */
-        picolm_gpu_rmsnorm_dev(pipe_ffn_norm, pipe_x,
-                                (float *)gw->post_attn_norm_dev[l],
-                                dim, c->rms_norm_eps, gpu_dev);
+        /* FFN block: only for attention layers (and any GPU-side SSM
+         * layer if that path is ever re-enabled). ssm_forward() already
+         * runs its own RMSNorm+FFN+residual internally when the layer
+         * has one, so running this again for a CPU-hybrid SSM layer
+         * would apply the FFN twice. */
+        if (!did_cpu_ssm) {
+            /* K. FFN: pipe_xb = rmsnorm(pipe_x, post_attn_norm_w[l]) */
+            picolm_gpu_rmsnorm_dev(pipe_ffn_norm, pipe_x,
+                                    (float *)gw->post_attn_norm_dev[l],
+                                    dim, c->rms_norm_eps, gpu_dev);
 
-        /* L. Gate: pipe_gate = ffn_gate @ pipe_ffn_norm */
-        picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_gate,
-                               pipe_gate, pipe_ffn_norm, 1, gpu_dev);
+            /* L. Gate: pipe_gate = ffn_gate @ pipe_ffn_norm */
+            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_gate,
+                                   pipe_gate, pipe_ffn_norm, 1, gpu_dev);
 
-        /* M. Up: pipe_up = ffn_up @ pipe_ffn_norm */
-        picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_up,
-                               pipe_up, pipe_ffn_norm, 1, gpu_dev);
+            /* M. Up: pipe_up = ffn_up @ pipe_ffn_norm */
+            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_up,
+                                   pipe_up, pipe_ffn_norm, 1, gpu_dev);
 
-        /* N. SiLU-mul: pipe_gate = silu(pipe_gate) * pipe_up (in-place on gate) */
-        picolm_gpu_silu_mul_dev(pipe_gate, pipe_up, n_ffn, gpu_dev);
+            /* N. SiLU-mul: pipe_gate = silu(pipe_gate) * pipe_up (in-place on gate) */
+            picolm_gpu_silu_mul_dev(pipe_gate, pipe_up, n_ffn, gpu_dev);
 
-        /* O. Down: pipe_xb = ffn_down @ pipe_gate */
-        picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_down,
-                               pipe_xb, pipe_gate, 1, gpu_dev);
+            /* O. Down: pipe_xb = ffn_down @ pipe_gate */
+            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_down,
+                                   pipe_xb, pipe_gate, 1, gpu_dev);
 
-        /* P. Residual add: pipe_x += pipe_xb */
-        picolm_gpu_residual_add(pipe_x, pipe_x, pipe_xb, dim, gpu_dev);
+            /* P. Residual add: pipe_x += pipe_xb */
+            picolm_gpu_residual_add(pipe_x, pipe_x, pipe_xb, dim, gpu_dev);
+        } /* end if (!did_cpu_ssm) */
     }
 
     /* 3. Final RMSNorm: pipe_x = rmsnorm(pipe_x, output_norm_w) */
