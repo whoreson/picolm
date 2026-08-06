@@ -1973,7 +1973,7 @@ static void mm_id_down_expert_task(int idx, void *ctxp) {
         }
     } else if (n_assigned == 1) {
         float *dout = c->down_out + (size_t)assigned[0] * c->n_used * c->dim + (size_t)slots[0] * c->dim;
-        matmul_q8(dout, qx_bufs[0], qx_d_arr[0], dw, c->n_ff, c->dim, c->type);
+        matmul_q8_seq(dout, qx_bufs[0], qx_d_arr[0], dw, c->n_ff, c->dim, c->type);
     } else {
         /* >8 tokens per expert: batch4 + scalar fallback */
         int n_batch4 = (n_assigned / 4) * 4;
@@ -2003,7 +2003,7 @@ static void mm_id_down_expert_task(int idx, void *ctxp) {
 #else
     if (n_assigned == 1) {
         float *dout = c->down_out + (size_t)assigned[0] * c->n_used * c->dim + (size_t)slots[0] * c->dim;
-        matmul_q8(dout, qx_bufs[0], qx_d_arr[0], dw, c->n_ff, c->dim, c->type);
+        matmul_q8_seq(dout, qx_bufs[0], qx_d_arr[0], dw, c->n_ff, c->dim, c->type);
     } else {
         for (int row = 0; row < c->dim; row++) {
             const char *wi = dw + row * c->row_bytes;
