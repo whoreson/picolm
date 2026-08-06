@@ -8295,7 +8295,8 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
     int gpu_ok = m->gpu.active;
     int gpu_dev = m->gpu.device;
 #endif
-    for (int slot = 0; slot < c->n_layers; slot++) {
+    int n_active_layers = c->n_layers - c->n_mtp_layers;
+    for (int slot = 0; slot < n_active_layers; slot++) {
         /* Check for client disconnect interrupt */
         if (interrupt && *interrupt) {
             free(buf);

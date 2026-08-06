@@ -1874,9 +1874,11 @@ static void mm_id_gate_expert_task(int idx, void *ctxp) {
      * the block-interleaved Q8_0 path but handles all weight types. */
     float *wrow_f = (float *)malloc(c->dim * sizeof(float));
     if (!wrow_f) { fprintf(stderr, "OOM: scalar_gateup\n"); exit(1); }
+
     for (int row = 0; row < c->n_ff; row++) {
         const char *gw = gate_exp + row * c->row_bytes;
         const char *uw = up_exp + row * c->row_bytes;
+
         dequantize_row(gw, wrow_f, c->dim, c->type);
         for (int a = 0; a < n_assigned; a++) {
             int t = assigned[a];
