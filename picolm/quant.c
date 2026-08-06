@@ -92,35 +92,35 @@ float vec_dot_f16_f32(const void *src, const float *x, int n) {
 }
 
 float fp16_to_fp32(uint16_t h) {
-    uint32_t sign = (uint32_t)(h >> 15) << 31;
-    uint32_t exp  = (h >> 10) & 0x1F;
-    uint32_t mant = h & 0x3FF;
-    uint32_t f;
+    /* Mirrors llama.cpp's ggml_compute_fp16_to_fp32 for correct subnormal handling */
+    uint32_t w = (uint32_t)h << 16;
+    uint32_t sign = w & 0x80000000U;
+    uint32_t two_w = w + w;
 
-    if (exp == 0) {
-        if (mant == 0) {
-            f = sign; /* +/- zero */
-        } else {
-            /* subnormal: renormalize */
-            exp = 1;
-            while (!(mant & 0x400)) {
-                mant <<= 1;
-                exp--;
-            }
-            mant &= 0x3FF;
-            f = sign | ((exp + 127 - 15) << 23) | (mant << 13);
-        }
-    } else if (exp == 31) {
-        f = sign | 0x7F800000 | (mant << 13); /* inf / nan */
+    uint32_t exp_offset = 0xE0U << 23;
+    float exp_scale;
+    memcpy(&exp_scale, "\x00\x00\x80\x07", sizeof(float)); /* 0x07800000 = 2^-112 */
+    float normalized_value;
+    { uint32_t nbits = (two_w >> 4) + exp_offset; memcpy(&normalized_value, &nbits, sizeof(float)); }
+    normalized_value *= exp_scale;
+
+    uint32_t magic_mask = 126U << 23;
+    float magic_bias = 0.5f;
+    float denormalized_value;
+    { uint32_t dbits = (two_w >> 17) | magic_mask; memcpy(&denormalized_value, &dbits, sizeof(float)); }
+    denormalized_value -= magic_bias;
+
+    uint32_t denormalized_cutoff = 1U << 27;
+    uint32_t result;
+    float rv;
+    if (two_w < denormalized_cutoff) {
+        memcpy(&result, &denormalized_value, sizeof(float));
     } else {
-        f = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+        memcpy(&result, &normalized_value, sizeof(float));
     }
-
-    float result;
-    memcpy(&result, &f, sizeof(float));
-    return result;
-
-    return result;
+    result |= sign;
+    memcpy(&rv, &result, sizeof(float));
+    return rv;
 }
 
 /* BF16 -> FP32 conversion */

@@ -164,8 +164,8 @@ size_t layer_weight_size(model_t *m, int l) {
         sz += gguf_type_row_size(lw->type_ffn_gate_inp, n_expert) * dim;
     }
     if (lw->ffn_gate_inp_shexp) {
-        /* [dim] F32 */
-        sz += dim * sizeof(float);
+        /* [dim] — quantization type varies (F32, Q4_K, etc.) */
+        sz += gguf_type_row_size(lw->type_ffn_gate_inp_shexp, dim);
     }
     if (lw->ffn_gate_shexp) {
         int n_ff_shexp = m->config.n_ff_shexp;
@@ -1454,7 +1454,7 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                 } else if (strcmp(suffix, "ffn_gate_inp.weight") == 0) {
                     lw->ffn_gate_inp = ptr; lw->type_ffn_gate_inp = qtype;
                 } else if (strcmp(suffix, "ffn_gate_inp_shexp.weight") == 0) {
-                    lw->ffn_gate_inp_shexp = ptr;
+                    lw->ffn_gate_inp_shexp = ptr; lw->type_ffn_gate_inp_shexp = qtype;
                 } else if (strcmp(suffix, "ffn_gate_shexp.weight") == 0) {
                     lw->ffn_gate_shexp = ptr; lw->type_ffn_gate_shexp = qtype;
                 } else if (strcmp(suffix, "ffn_up_shexp.weight") == 0) {
@@ -3527,7 +3527,7 @@ static void moe_forward(model_t *m, run_state_t *s, const float *x, float *resid
     /* Shared expert sigmoid gate: sigmoid(x @ ffn_gate_inp_shexp) */
     {
         float gate_val;
-        matmul(&gate_val, (float *)x, lw->ffn_gate_inp_shexp, dim, 1, GGUF_TYPE_F32);
+        matmul(&gate_val, (float *)x, lw->ffn_gate_inp_shexp, dim, 1, lw->type_ffn_gate_inp_shexp);
         gate_val = 1.0f / (1.0f + expf(-gate_val));
         for (int d = 0; d < dim; d++) s->xb2[d] *= gate_val;
     }
@@ -3536,7 +3536,6 @@ static void moe_forward(model_t *m, run_state_t *s, const float *x, float *resid
     for (int d = 0; d < dim; d++) {
         residual[d] = moe_out[d] + s->xb2[d];
     }
-    fflush(stderr);
     free(expert_out);
 }
 
@@ -3711,9 +3710,6 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
     }
 
     /* ---- Phase 3: mm_id gate+up projections ---- */
-    /* Enable multi-threading for expert dispatch: each expert task is
-     * self-contained (no nested matmul calls), so tensor_parallel_for
-     * across 256 experts benefits from parallelism. */
     {
         tensor_set_n_threads(saved_threads);
         gguf_type_t type = lw->type_ffn_gate_exps;
@@ -3736,7 +3732,6 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
             }
         }
     }
-
     /* ---- Phase 5: mm_id down projections ---- */
     {
         tensor_set_n_threads(saved_threads);
@@ -3749,7 +3744,6 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
             s->mm_down_qx_all, s->mm_down_qx_d_all, down_q8_per_token);
         tensor_set_n_threads(1);
     }
-
     /* ---- Phase 6: Weighted accumulation in Top-K order ---- */
     {
         for (int t = 0; t < n_tokens; t++) {
@@ -3848,11 +3842,11 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
                     s->shared_down_qx_d[bi] = fp16_to_fp32(s->shared_down_qx[bi].d);
                 }
                 matmul_q8(s->xb2, s->shared_down_qx, s->shared_down_qx_d, lw->ffn_down_shexp, sh_ff, dim, lw->type_ffn_down_shexp);
-            }
+                }
 
             {
                 float gate_val;
-                matmul(&gate_val, x_batch + t * dim, lw->ffn_gate_inp_shexp, dim, 1, GGUF_TYPE_F32);
+                matmul(&gate_val, x_batch + t * dim, lw->ffn_gate_inp_shexp, dim, 1, lw->type_ffn_gate_inp_shexp);
                 gate_val = 1.0f / (1.0f + expf(-gate_val));
                 for (int d = 0; d < dim; d++) s->xb2[d] *= gate_val;
             }
@@ -7876,6 +7870,18 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
         tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->attn_qkv, m->gpu.device);
     }
 #endif
+    if (l <= 1 && n_tokens > 0) {
+        float vd = vec_dot(lw->attn_qkv, ssm_xb, dim, lw->type_attn_qkv);
+        /* Check activation values */
+        float amax = 0, amin = 0;
+        int isnan_cnt = 0;
+        for (int j = 0; j < dim; j++) {
+            float ax = ssm_xb[j];
+            if (isnan(ax)) { isnan_cnt++; continue; }
+            if (ax > amax) amax = ax;
+            if (ax < amin) amin = ax;
+        }
+        }
     matmul_batch(qkv_batch, ssm_xb, n_tokens, lw->attn_qkv, dim, conv_dim, lw->type_attn_qkv);
     tensor_set_repacked(NULL);
 #ifdef PICOLM_GPU

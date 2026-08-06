@@ -129,6 +129,7 @@ typedef struct {
     gguf_type_t type_ffn_gate_inp;
     /* Shared expert tensors */
     const void *ffn_gate_inp_shexp; /* [n_embd, 1] */
+    gguf_type_t type_ffn_gate_inp_shexp;
     const void *ffn_gate_shexp;     /* [n_embd, n_ff_shexp] */
     const void *ffn_up_shexp;       /* [n_embd, n_ff_shexp] */
     const void *ffn_down_shexp;     /* [n_ff_shexp, n_embd] */
