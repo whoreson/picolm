@@ -6988,35 +6988,46 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
             /* J. Residual add: pipe_x += pipe_xb */
             picolm_gpu_residual_add(pipe_x, pipe_x, pipe_xb, dim, gpu_dev);
         } else {
-            /* SSM/hybrid layer: fall back to CPU ssm_forward().
+            /* SSM/hybrid layer: CPU ssm_forward() with gpu_lw passed through
+             * so its internal per-op GPU dispatch kicks in for the expensive
+             * pieces.
              *
-             * The GPU SSM pipeline (per-kernel dispatch: rmsnorm, matmul,
-             * conv1d, l2norm, vecdot x2, gate_beta, recurrence, gated_norm,
-             * matmul, residual_add -- 11+ launches, ~20+ counting the FFN
-             * that follows) is correct but launch-overhead bound: for a
-             * 48-SSM-layer model that's 960+ tiny kernel launches per
-             * token, which dominates over the actual compute. Running the
-             * layer on CPU instead means one CPU function call per layer.
+             * This replaced the full GPU SSM pipeline (per-kernel dispatch:
+             * rmsnorm, matmul, conv1d, l2norm, vecdot x2, gate_beta,
+             * recurrence, gated_norm, matmul, residual_add -- 11+ launches,
+             * ~20+ counting the FFN that follows), which was launch-overhead
+             * bound: 48 SSM layers x that many tiny kernel launches per token
+             * dominated over actual compute.
              *
-             * Portability: this uses a plain D2H + H2D pair rather than
-             * unified memory, so it works the same on discrete GPUs
-             * (PCIe) as it does on GB10. Payload is dim floats (20KB
-             * for n_embd=5120) each way -- at PCIe Gen4 x16 (~16GB/s)
-             * that's ~1.25us per transfer, negligible next to the
-             * ~0.5-1ms the CPU spends actually computing the layer.
+             * Passing &m->gpu.layers[l] activates ssm_forward's existing
+             * internal `if (gpu_lw)` GPU paths:
+             *   - attn_qkv / attn_gate_ssm matmuls -> picolm_gpu_matmul(),
+             *     device-resident weights, only the activation vector
+             *     transfers per call. Real win, these are 2 of the
+             *     layer's biggest ops.
+             *   - recurrence -> tries picolm_gpu_ssm_recurrence_dev()
+             *     first, which keeps the 3.15MB state resident on device
+             *     across tokens (m->gpu.ssm_state_dev[il], allocated at
+             *     load time) instead of re-uploading it every call.
+             *   - FFN -> picolm_gpu_expert_mlp(), one fused GPU call for
+             *     gate+up+down instead of three.
+             * Two things this does NOT help: alpha/beta vecdot goes through
+             * picolm_gpu_ssm_vecdot(), which re-uploads the full alpha/beta
+             * weight matrix via a fresh gpuMalloc every call (no persistent
+             * device copy in this path) -- for an op that only produces
+             * n_v_heads output floats, that's likely a net loss vs. CPU.
+             * And the ssm_out projection matmul is never routed to GPU
+             * inside ssm_forward at all (no tensor_set_gpu_tensor call
+             * precedes it) -- it always runs on CPU regardless of gpu_lw.
              *
-             * gpu_lw=NULL is required, not optional: every GPU-kernel
-             * call inside ssm_forward is gated on `if (gpu_lw)` deriving
-             * its gpu_layer_weights_t* from that exact parameter (see the
-             * vecdot/recurrence/FFN call sites), so passing NULL is what
-             * forces the whole layer to run on CPU instead of silently
-             * reintroducing the same per-kernel-launch overhead we're
-             * trying to avoid here. */
+             * Portability: plain D2H + H2D pair rather than unified memory,
+             * so it works the same on discrete GPUs (PCIe) as on GB10.
+             * Payload is dim floats (20KB for n_embd=5120) each way. */
             picolm_gpu_sync(gpu_dev);
             picolm_gpu_memcpy(s->x, pipe_x, (size_t)dim * sizeof(float), -1, gpu_dev);
 
             float *ssm_residual = s->xb2;
-            ssm_forward(m, s, s->x, ssm_residual, lw, l, pos, NULL);
+            ssm_forward(m, s, s->x, ssm_residual, lw, l, pos, &m->gpu.layers[l]);
 
             picolm_gpu_memcpy(pipe_x, s->x, (size_t)dim * sizeof(float), 1, gpu_dev);
             did_cpu_ssm = 1;
