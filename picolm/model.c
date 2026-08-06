@@ -16,11 +16,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#ifndef _WIN32
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#endif
 
 #ifdef PICOLM_GPU
 #include "backend_gpu.h"
@@ -41,6 +36,7 @@
 #include <io.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <malloc.h>
 #define SECURITY_WIN32
 #include <security.h>
 #include <accctrl.h>
@@ -2000,13 +1996,29 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
             (double)total / (1024.0 * 1024.0),
             (double)sz_kv / (1024.0 * 1024.0), kv_name_k, kv_name_v);
 
-    /* Use mmap instead of calloc for large allocations to avoid
-     * address space collisions with the GGUF file mmap.
-     * Place allocations contiguously below the GGUF mmap region. */
+    /* Use mmap (or Windows equivalent) instead of calloc for large
+     * allocations to avoid address space collisions with the GGUF
+     * file mmap. Place allocations contiguously below the GGUF mmap region. */
     {
         size_t total_alloc = total + sz_kv;
         void *base = NULL;
-
+#ifdef _WIN32
+        if (m->mmap_addr) {
+            /* Try to allocate near the GGUF mmap by creating a mapping
+             * in a separate file; fall back to VirtualAlloc */
+            base = VirtualAlloc((void *)((uintptr_t)m->mmap_addr - (total_alloc + 4096)),
+                                total_alloc, MEM_COMMIT | PAGE_READWRITE, 0);
+            if (!base) {
+                base = VirtualAlloc(NULL, total_alloc, MEM_COMMIT | PAGE_READWRITE, 0);
+            }
+        } else {
+            base = VirtualAlloc(NULL, total_alloc, MEM_COMMIT | PAGE_READWRITE, 0);
+        }
+        if (!base) {
+            fprintf(stderr, "OOM: VirtualAlloc failed for %zu bytes\n", total_alloc);
+            return -1;
+        }
+#else
         if (m->mmap_addr) {
             /* Try to allocate just below the GGUF mmap */
             uintptr_t hint = (uintptr_t)m->mmap_addr - (total_alloc + 4096);
@@ -2025,6 +2037,7 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
             fprintf(stderr, "OOM: mmap failed for %zu bytes: %s\n", total_alloc, strerror(errno));
             return -1;
         }
+#endif
 
         s->mem_block = base;
         s->mem_size = total + sz_kv;
@@ -3590,17 +3603,37 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
 
     /* Allocate or grow if needed */
     if (!mm_gate_out || s->mm_gateup_alloc < gateup_sz) {
+#ifdef _WIN32
+        _aligned_free(mm_gate_out);
+        _aligned_free(mm_up_out);
+        _aligned_free(mm_down_out);
+#else
         free(mm_gate_out);
         free(mm_up_out);
         free(mm_down_out);
+#endif
+#ifdef _WIN32
+        s->mm_gate_out = mm_gate_out = (float *)_aligned_malloc(gateup_sz + 4095, 64);
+        s->mm_up_out = mm_up_out = (float *)_aligned_malloc(gateup_sz + 4095, 64);
+        s->mm_down_out = mm_down_out = (float *)_aligned_malloc(down_sz + 4095, 64);
+#else
         s->mm_gate_out = mm_gate_out = (float *)aligned_alloc(64, gateup_sz + 4095);
         s->mm_up_out = mm_up_out = (float *)aligned_alloc(64, gateup_sz + 4095);
         s->mm_down_out = mm_down_out = (float *)aligned_alloc(64, down_sz + 4095);
+#endif
         s->mm_gateup_alloc = gateup_sz;
         s->mm_down_alloc = down_sz;
     } else if (s->mm_down_alloc < down_sz) {
+#ifdef _WIN32
+        _aligned_free(mm_down_out);
+#else
         free(mm_down_out);
+#endif
+#ifdef _WIN32
+        s->mm_down_out = mm_down_out = (float *)_aligned_malloc(down_sz + 4095, 64);
+#else
         s->mm_down_out = mm_down_out = (float *)aligned_alloc(64, down_sz + 4095);
+#endif
         s->mm_down_alloc = down_sz;
     }
 
@@ -6901,15 +6934,25 @@ void model_free(model_t *m) {
     }
 
     /* Free on-demand mm_id buffers */
+#ifdef _WIN32
+    if (m->state.mm_gate_out) { _aligned_free(m->state.mm_gate_out); m->state.mm_gate_out = NULL; }
+    if (m->state.mm_up_out)   { _aligned_free(m->state.mm_up_out);   m->state.mm_up_out = NULL; }
+    if (m->state.mm_down_out) { _aligned_free(m->state.mm_down_out); m->state.mm_down_out = NULL; }
+#else
     if (m->state.mm_gate_out) { free(m->state.mm_gate_out); m->state.mm_gate_out = NULL; }
     if (m->state.mm_up_out)   { free(m->state.mm_up_out);   m->state.mm_up_out = NULL; }
     if (m->state.mm_down_out) { free(m->state.mm_down_out); m->state.mm_down_out = NULL; }
+#endif
     m->state.mm_gateup_alloc = 0;
     m->state.mm_down_alloc = 0;
 
     if (m->state.mem_block) {
-        /* mem_block and kv_block are contiguously mmap'd; unmap the combined region */
+        /* mem_block and kv_block are contiguously allocated; release */
+#ifdef _WIN32
+        VirtualFree(m->state.mem_block, 0, MEM_RELEASE);
+#else
         munmap(m->state.mem_block, m->state.mem_size);
+#endif
         m->state.mem_block = NULL;
         m->state.kv_block = NULL;
     }
