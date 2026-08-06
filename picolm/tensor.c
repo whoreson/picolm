@@ -1689,7 +1689,7 @@ void matmul_mm_id_down(float *down_out,
     mm_id_down_ctx_t ctx = { down_out, expert_out, down_w_base,
         expert_assignments, expert_counts, n_tokens, n_used, dim, n_ff, n_expert,
         type, row_bytes, dnb, qx_d_off,
-        scratch_qx, scratch_qx_d, exp_down_qx_all, q8_per_token, MAX_THREADS };
+        scratch_qx, scratch_qx_d, exp_down_qx_all, q8_per_token, tensor_get_n_threads() };
 
     tensor_parallel_for(n_expert, mm_id_down_expert_task, &ctx);
 }

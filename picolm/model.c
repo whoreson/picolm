@@ -1737,7 +1737,7 @@ static size_t kv_head_stride(kv_cache_type_t kv_type, int head_dim) {
 }
 
 int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v,
-                       int k_cache_hadamard, int v_cache_hadamard) {
+                       int k_cache_hadamard, int v_cache_hadamard, int n_threads) {
     model_config_t *c = &m->config;
     run_state_t *s = &m->state;
 
@@ -1851,7 +1851,7 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
             per_thread += gguf_type_row_size(GGUF_TYPE_Q8_0, c->n_ff_exp); /* down_qx */
             per_thread += (c->n_ff_exp / 32) * sizeof(float);        /* down_qx_d */
             per_thread = (per_thread + 31) / 32 * 32;                /* align to 32 bytes */
-            sz_moe += per_thread * MAX_THREADS;
+            sz_moe += per_thread * (size_t)n_threads;
         }
 
         /* Per-expert scratch: gate_buf, up_buf, down_qx, down_qx_d.
@@ -1910,12 +1910,12 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         sz_moe += (size_t)c->n_expert * c->max_seq_len * sizeof(int);
         sz_moe += (size_t)c->n_expert * sizeof(int);
 
-        /* Per-thread mm_down_qx_all: MAX_THREADS × 256 × down_q8_per_token */
+        /* Per-thread mm_down_qx_all: n_threads × 256 × down_q8_per_token */
         {
             size_t down_q8_rb = c->n_ff_exp / 32;
             size_t down_q8_data_off = (down_q8_rb * sizeof(block_q8_0) + sizeof(float) - 1) / sizeof(float);
             size_t down_q8_per_token = down_q8_data_off + down_q8_rb;
-            sz_moe += (size_t)MAX_THREADS * 256 * down_q8_per_token; /* MAX_THREADS × 256 max tokens per expert */
+            sz_moe += (size_t)n_threads * 256 * down_q8_per_token; /* n_threads × 256 max tokens per expert */
         }
     }
 
@@ -2222,7 +2222,7 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
                 per_thread = (per_thread + 31) / 32 * 32;                /* align to 32 bytes */
                 s->moe_thread_scratch = (void *)p;
                 s->moe_thread_stride = per_thread;
-                p += (per_thread / sizeof(float) + 1) * MAX_THREADS;
+                p += (per_thread / sizeof(float) + 1) * (size_t)n_threads;
             }
 
             /* Per-expert scratch: gate_buf, up_buf, down_qx, down_qx_d */
@@ -2268,9 +2268,9 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
             /* Per-expert down quantization buffers for batched mm_id.
              * Layout: per-thread × per-token Q8_0 buffer with embedded deltas.
              * Each entry is for n_ff_exp (not n_embd) since we quantize SwiGLU output.
-             * Total: MAX_THREADS × 256 (max tokens per expert) × down_q8_per_token floats. */
+             * Total: n_threads × 256 (max tokens per expert) × down_q8_per_token floats. */
             {
-                int n_threads_max = MAX_THREADS;
+                int n_threads_max = n_threads;
                 size_t down_q8_rb = c->n_ff_exp / 32;
                 size_t down_q8_data_off = (down_q8_rb * sizeof(block_q8_0) + sizeof(float) - 1) / sizeof(float);
                 size_t down_q8_per_token = down_q8_data_off + down_q8_rb;
@@ -2509,7 +2509,7 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
 /* ---- Public API ---- */
 
 int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v,
-               int k_cache_hadamard, int v_cache_hadamard) {
+               int k_cache_hadamard, int v_cache_hadamard, int n_threads) {
     memset(m, 0, sizeof(*m));
 
     if (mmap_file(m, path) != 0) return -1;
@@ -2558,7 +2558,7 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
         }
     }
 
-    if (allocate_run_state(m, kv_type_k, kv_type_v, k_cache_hadamard, v_cache_hadamard) != 0) return -1;
+    if (allocate_run_state(m, kv_type_k, kv_type_v, k_cache_hadamard, v_cache_hadamard, n_threads) != 0) return -1;
 
     /* Repack Q4_0 tensors to Q4_0x8 for AVX2 SIMD optimization.
      * Only repack tensors where nrows % 8 == 0 and ncols % 32 == 0. */
@@ -3193,7 +3193,8 @@ static void moe_expert_worker(int i, void *vctx) {
 
     /* Get per-thread scratch buffer */
     unsigned tid = tensor_get_thread_id();
-    if (tid >= MAX_THREADS) tid = 0;
+    int nt = tensor_get_n_threads();
+    if (tid >= (unsigned)nt) tid = 0;
     char *scratch = (char *)ctx->s->moe_thread_scratch + tid * ctx->s->moe_thread_stride;
 
     float *gate_buf = (float *)scratch;
@@ -3242,6 +3243,44 @@ static void moe_expert_worker(int i, void *vctx) {
         for (; di + 7 < dim; di += 8) {
             __m512 v = _mm512_loadu_ps(out + di);
             _mm512_storeu_ps(out + di, _mm512_mul_ps(bw, v));
+        }
+        for (; di < dim; di++) out[di] *= w_i;
+    }
+#elif defined(PICOLM_AVX2)
+    {
+        __m256 bw = _mm256_set1_ps(w_i);
+        int di = 0;
+        for (; di + 15 < dim; di += 16) {
+            __m256 v0 = _mm256_loadu_ps(out + di);
+            __m256 v1 = _mm256_loadu_ps(out + di + 4);
+            __m256 v2 = _mm256_loadu_ps(out + di + 8);
+            __m256 v3 = _mm256_loadu_ps(out + di + 12);
+            _mm256_storeu_ps(out + di, _mm256_mul_ps(bw, v0));
+            _mm256_storeu_ps(out + di + 4, _mm256_mul_ps(bw, v1));
+            _mm256_storeu_ps(out + di + 8, _mm256_mul_ps(bw, v2));
+            _mm256_storeu_ps(out + di + 12, _mm256_mul_ps(bw, v3));
+        }
+        for (; di < dim; di++) out[di] *= w_i;
+    }
+#elif defined(PICOLM_AVX)
+    {
+        __m128 bw = _mm_set1_ps(w_i);
+        int di = 0;
+        for (; di + 7 < dim; di += 8) {
+            __m128 v0 = _mm_loadu_ps(out + di);
+            __m128 v1 = _mm_loadu_ps(out + di + 4);
+            _mm_storeu_ps(out + di, _mm_mul_ps(bw, v0));
+            _mm_storeu_ps(out + di + 4, _mm_mul_ps(bw, v1));
+        }
+        for (; di < dim; di++) out[di] *= w_i;
+    }
+#elif defined(PICOLM_SSE2)
+    {
+        __m128 bw = _mm_set1_ps(w_i);
+        int di = 0;
+        for (; di + 3 < dim; di += 4) {
+            __m128 v = _mm_loadu_ps(out + di);
+            _mm_storeu_ps(out + di, _mm_mul_ps(bw, v));
         }
         for (; di < dim; di++) out[di] *= w_i;
     }
@@ -3355,16 +3394,60 @@ static void moe_forward(model_t *m, run_state_t *s, const float *x, float *resid
         for (int i = 0; i < n_used; i++) {
             float *eo = expert_out + (size_t)i * dim;
 #ifdef PICOLM_AVX512
-            int di = 0;
-            for (; di + 15 < dim; di += 16) {
-                __m512 v0 = _mm512_loadu_ps(moe_out + di);
-                __m512 v1 = _mm512_loadu_ps(eo + di);
-                __m512 v2 = _mm512_loadu_ps(moe_out + di + 8);
-                __m512 v3 = _mm512_loadu_ps(eo + di + 8);
-                _mm512_storeu_ps(moe_out + di, _mm512_add_ps(v0, v1));
-                _mm512_storeu_ps(moe_out + di + 8, _mm512_add_ps(v2, v3));
+            {
+                int di = 0;
+                for (; di + 15 < dim; di += 16) {
+                    __m512 v0 = _mm512_loadu_ps(moe_out + di);
+                    __m512 v1 = _mm512_loadu_ps(eo + di);
+                    __m512 v2 = _mm512_loadu_ps(moe_out + di + 8);
+                    __m512 v3 = _mm512_loadu_ps(eo + di + 8);
+                    _mm512_storeu_ps(moe_out + di, _mm512_add_ps(v0, v1));
+                    _mm512_storeu_ps(moe_out + di + 8, _mm512_add_ps(v2, v3));
+                }
+                for (; di < dim; di++) moe_out[di] += eo[di];
             }
-            for (; di < dim; di++) moe_out[di] += eo[di];
+#elif defined(PICOLM_AVX2)
+            {
+                int di = 0;
+                for (; di + 15 < dim; di += 16) {
+                    __m256 v0 = _mm256_loadu_ps(moe_out + di);
+                    __m256 v1 = _mm256_loadu_ps(eo + di);
+                    __m256 v2 = _mm256_loadu_ps(moe_out + di + 4);
+                    __m256 v3 = _mm256_loadu_ps(eo + di + 4);
+                    __m256 v4 = _mm256_loadu_ps(moe_out + di + 8);
+                    __m256 v5 = _mm256_loadu_ps(eo + di + 8);
+                    __m256 v6 = _mm256_loadu_ps(moe_out + di + 12);
+                    __m256 v7 = _mm256_loadu_ps(eo + di + 12);
+                    _mm256_storeu_ps(moe_out + di, _mm256_add_ps(v0, v1));
+                    _mm256_storeu_ps(moe_out + di + 4, _mm256_add_ps(v2, v3));
+                    _mm256_storeu_ps(moe_out + di + 8, _mm256_add_ps(v4, v5));
+                    _mm256_storeu_ps(moe_out + di + 12, _mm256_add_ps(v6, v7));
+                }
+                for (; di < dim; di++) moe_out[di] += eo[di];
+            }
+#elif defined(PICOLM_AVX)
+            {
+                int di = 0;
+                for (; di + 7 < dim; di += 8) {
+                    __m128 v0 = _mm_loadu_ps(moe_out + di);
+                    __m128 v1 = _mm_loadu_ps(eo + di);
+                    __m128 v2 = _mm_loadu_ps(moe_out + di + 4);
+                    __m128 v3 = _mm_loadu_ps(eo + di + 4);
+                    _mm_storeu_ps(moe_out + di, _mm_add_ps(v0, v1));
+                    _mm_storeu_ps(moe_out + di + 4, _mm_add_ps(v2, v3));
+                }
+                for (; di < dim; di++) moe_out[di] += eo[di];
+            }
+#elif defined(PICOLM_SSE2)
+            {
+                int di = 0;
+                for (; di + 3 < dim; di += 4) {
+                    __m128 v0 = _mm_loadu_ps(moe_out + di);
+                    __m128 v1 = _mm_loadu_ps(eo + di);
+                    _mm_storeu_ps(moe_out + di, _mm_add_ps(v0, v1));
+                }
+                for (; di < dim; di++) moe_out[di] += eo[di];
+            }
 #else
             for (int d = 0; d < dim; d++) moe_out[d] += eo[d];
 #endif

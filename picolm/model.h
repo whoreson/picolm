@@ -465,13 +465,13 @@ typedef struct {
 
 /* Load a GGUF model file. Returns 0 on success. */
 int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v,
-               int k_cache_hadamard, int v_cache_hadamard);
+               int k_cache_hadamard, int v_cache_hadamard, int n_threads);
 /* List all tensors in a GGUF file (name, dims, type) and exit. Returns 0 on success. */
 int model_list_tensors(const char *path);
 /* List all KV metadata entries in a GGUF file and exit. Returns 0 on success. */
 int model_list_kv(const char *path);
 int model_load_safetensors(model_t *m, const char *model_dir, int max_seq_len, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v,
-                           int k_cache_hadamard, int v_cache_hadamard);
+                           int k_cache_hadamard, int v_cache_hadamard, int n_threads);
 
 /* Pin layer weights in RAM. Given a budget in bytes, locks the maximum
  * number of consecutive layers (starting from 0) plus global tensors.
@@ -496,7 +496,7 @@ size_t layer_weight_size(model_t *m, int l);
 
 /* Run one forward pass. Returns pointer to logits[vocab_size]. */
 int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v,
-                       int k_cache_hadamard, int v_cache_hadamard);
+                       int k_cache_hadamard, int v_cache_hadamard, int n_threads);
 float *model_forward(model_t *m, int token, int pos);
 float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt);
 

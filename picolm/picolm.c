@@ -660,9 +660,9 @@ int main(int argc, char **argv) {
     }
     int load_ok = 0;
     if (is_safetensors) {
-        load_ok = (model_load_safetensors(&model, model_path, context_override, kv_type_k, kv_type_v, k_cache_hadamard, v_cache_hadamard) == 0);
+        load_ok = (model_load_safetensors(&model, model_path, context_override, kv_type_k, kv_type_v, k_cache_hadamard, v_cache_hadamard, num_threads) == 0);
     } else {
-        load_ok = (model_load(&model, model_path, context_override, kv_type_k, kv_type_v, k_cache_hadamard, v_cache_hadamard) == 0);
+        load_ok = (model_load(&model, model_path, context_override, kv_type_k, kv_type_v, k_cache_hadamard, v_cache_hadamard, num_threads) == 0);
     }
     if (!load_ok) {
         fprintf(stderr, "Failed to load model\n");
