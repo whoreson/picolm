@@ -896,7 +896,8 @@ int main(int argc, char **argv) {
                     grammar_advance(&grammar, &tokenizer, next);
                     token = next;
                     bench.gen_tokens++;
-                    logits = model_forward(&model, token, pos + 1);
+                    pos++;
+                    logits = model_forward(&model, token, pos);
                 }
             }
 

@@ -1477,11 +1477,16 @@ void matmul_q8(float *out, const void *qx, const float *qx_d,
         }
         return;
     }
-    /* For non-Q8_0 types, fall through to generic vec_dot */
-    if (n_threads <= 1 || d < 4 || d < matmul_min_rows) {
-        for (int i = 0; i < d; i++) {
-            out[i] = vec_dot(wptr + (size_t)i * row_bytes, NULL, n, qtype);
+    /* For non-Q8_0 types, dequantize Q8_0 activation to float, then use vec_dot */
+    {
+        float *xf = (float *)malloc((size_t)n * sizeof(float));
+        dequantize_row_q8_0(qx, xf, n);
+        if (n_threads <= 1 || d < 4 || d < matmul_min_rows) {
+            for (int i = 0; i < d; i++) {
+                out[i] = vec_dot(wptr + (size_t)i * row_bytes, xf, n, qtype);
+            }
         }
+        free(xf);
     }
 }
 /* matmul_q8_seq: sequential Q8xQ8 matmul that ignores n_threads.
@@ -1497,8 +1502,17 @@ void matmul_q8_seq(float *out, const void *qx, const float *qx_d,
         }
         return;
     }
-    for (int i = 0; i < d; i++) {
-        out[i] = vec_dot(wptr + (size_t)i * row_bytes, NULL, n, qtype);
+    /* Non-Q8_0 weights: dequantize Q8_0 activation to float, then use vec_dot */
+    fflush(stderr);
+    {
+        float *xf = (float *)malloc((size_t)n * sizeof(float));
+        fflush(stderr);
+        dequantize_row_q8_0(qx, xf, n);
+        fflush(stderr);
+        for (int i = 0; i < d; i++) {
+            out[i] = vec_dot(wptr + (size_t)i * row_bytes, xf, n, qtype);
+        }
+        free(xf);
     }
 }
 
