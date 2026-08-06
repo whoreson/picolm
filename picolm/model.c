@@ -2003,20 +2003,18 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         size_t total_alloc = total + sz_kv;
         void *base = NULL;
 #ifdef _WIN32
-        if (m->mmap_addr) {
-            /* Try to allocate near the GGUF mmap by creating a mapping
-             * in a separate file; fall back to VirtualAlloc */
-            base = VirtualAlloc((void *)((uintptr_t)m->mmap_addr - (total_alloc + 4096)),
-                                total_alloc, MEM_COMMIT | PAGE_READWRITE, 0);
-            if (!base) {
-                base = VirtualAlloc(NULL, total_alloc, MEM_COMMIT | PAGE_READWRITE, 0);
-            }
+        /* Try VirtualAlloc for large allocations (avoids heap fragmentation).
+         * Fall back to calloc if the OS commit limit is reached. */
+        base = VirtualAlloc(NULL, total_alloc, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (base) {
+            s->mem_block_alloc_type = 1; /* VirtualAlloc */
         } else {
-            base = VirtualAlloc(NULL, total_alloc, MEM_COMMIT | PAGE_READWRITE, 0);
-        }
-        if (!base) {
-            fprintf(stderr, "OOM: VirtualAlloc failed for %zu bytes\n", total_alloc);
-            return -1;
+            base = calloc(1, total_alloc);
+            if (!base) {
+                fprintf(stderr, "OOM: allocation failed for %zu bytes\n", total_alloc);
+                return -1;
+            }
+            s->mem_block_alloc_type = 0; /* calloc */
         }
 #else
         if (m->mmap_addr) {
@@ -2037,6 +2035,7 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
             fprintf(stderr, "OOM: mmap failed for %zu bytes: %s\n", total_alloc, strerror(errno));
             return -1;
         }
+        s->mem_block_alloc_type = 1; /* mmap */
 #endif
 
         s->mem_block = base;
@@ -6949,7 +6948,10 @@ void model_free(model_t *m) {
     if (m->state.mem_block) {
         /* mem_block and kv_block are contiguously allocated; release */
 #ifdef _WIN32
-        VirtualFree(m->state.mem_block, 0, MEM_RELEASE);
+        if (m->state.mem_block_alloc_type)
+            VirtualFree(m->state.mem_block, 0, MEM_RELEASE);
+        else
+            free(m->state.mem_block);
 #else
         munmap(m->state.mem_block, m->state.mem_size);
 #endif

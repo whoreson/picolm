@@ -371,6 +371,7 @@ typedef struct {
     /* Single allocation base */
     void *mem_block;
     size_t mem_size;
+    int mem_block_alloc_type; /* 0=calloc, 1=VirtualAlloc/mmap */
 
     /* Separate allocation for KV cache */
     void *kv_block;
