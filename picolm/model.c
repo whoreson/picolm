@@ -2000,21 +2000,39 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
             (double)total / (1024.0 * 1024.0),
             (double)sz_kv / (1024.0 * 1024.0), kv_name_k, kv_name_v);
 
-    s->mem_block = calloc(1, total);
-    if (!s->mem_block) {
-        fprintf(stderr, "OOM: cannot allocate %zu bytes\n", total);
-        return -1;
-    }
-    s->mem_size = total + sz_kv;
+    /* Use mmap instead of calloc for large allocations to avoid
+     * address space collisions with the GGUF file mmap.
+     * Place allocations contiguously below the GGUF mmap region. */
+    {
+        size_t total_alloc = total + sz_kv;
+        void *base = NULL;
 
-    /* Allocate KV cache separately */
-    s->kv_block = calloc(1, sz_kv);
-    if (!s->kv_block) {
-        fprintf(stderr, "OOM: cannot allocate %zu bytes for KV cache\n", sz_kv);
-        free(s->mem_block);
-        return -1;
+        if (m->mmap_addr) {
+            /* Try to allocate just below the GGUF mmap */
+            uintptr_t hint = (uintptr_t)m->mmap_addr - (total_alloc + 4096);
+            base = mmap((void *)hint, total_alloc, PROT_READ|PROT_WRITE,
+                        MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+            if (base == MAP_FAILED || base != (void *)hint) {
+                /* mmap at hint failed or moved us; try anywhere */
+                base = mmap(NULL, total_alloc, PROT_READ|PROT_WRITE,
+                            MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+            }
+        } else {
+            base = mmap(NULL, total_alloc, PROT_READ|PROT_WRITE,
+                        MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+        }
+        if (base == MAP_FAILED) {
+            fprintf(stderr, "OOM: mmap failed for %zu bytes: %s\n", total_alloc, strerror(errno));
+            return -1;
+        }
+
+        s->mem_block = base;
+        s->mem_size = total + sz_kv;
+
+        /* KV cache follows mem_block contiguously */
+        s->kv_block = (char *)base + total;
+        s->kv_size = sz_kv;
     }
-    s->kv_size = sz_kv;
 
     /* Populate KV layer mapping */
     {
@@ -6890,11 +6908,9 @@ void model_free(model_t *m) {
     m->state.mm_down_alloc = 0;
 
     if (m->state.mem_block) {
-        free(m->state.mem_block);
+        /* mem_block and kv_block are contiguously mmap'd; unmap the combined region */
+        munmap(m->state.mem_block, m->state.mem_size);
         m->state.mem_block = NULL;
-    }
-    if (m->state.kv_block) {
-        free(m->state.kv_block);
         m->state.kv_block = NULL;
     }
     /* Unmap all split files */
