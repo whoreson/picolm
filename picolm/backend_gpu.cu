@@ -1011,7 +1011,7 @@ picolm_gpu_attention_decode_kernel(
  * PICOLM_DBG_ATTN/PICOLM_DBG_PIPELINE tolerance (1e-2/1e-3), not for
  * exact equality -- a nonzero-but-below-threshold diff here is correct
  * behavior, not a regression. */
-#define ATTN_DECODE_MAX_SPLITS 8
+#define ATTN_DECODE_MAX_SPLITS 32
 #define ATTN_DECODE_MIN_CHUNK  64
 
 /* Partial state layout (flat float buffer, sized by the host wrapper):
