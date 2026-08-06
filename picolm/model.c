@@ -33,6 +33,9 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+#ifdef PICOLM_NEON
+#include <arm_neon.h>
+#endif
 #ifdef _WIN32
 #include <windows.h>
 #include <io.h>
@@ -3284,6 +3287,16 @@ static void moe_expert_worker(int i, void *vctx) {
         }
         for (; di < dim; di++) out[di] *= w_i;
     }
+#elif defined(PICOLM_NEON)
+    {
+        float32x4_t bw = vdupq_n_f32(w_i);
+        int di = 0;
+        for (; di + 3 < dim; di += 4) {
+            float32x4_t v = vld1q_f32(out + di);
+            vst1q_f32(out + di, vmulq_f32(bw, v));
+        }
+        for (; di < dim; di++) out[di] *= w_i;
+    }
 #else
     for (int d = 0; d < dim; d++) out[d] *= w_i;
 #endif
@@ -3445,6 +3458,16 @@ static void moe_forward(model_t *m, run_state_t *s, const float *x, float *resid
                     __m128 v0 = _mm_loadu_ps(moe_out + di);
                     __m128 v1 = _mm_loadu_ps(eo + di);
                     _mm_storeu_ps(moe_out + di, _mm_add_ps(v0, v1));
+                }
+                for (; di < dim; di++) moe_out[di] += eo[di];
+            }
+#elif defined(PICOLM_NEON)
+            {
+                int di = 0;
+                for (; di + 3 < dim; di += 4) {
+                    float32x4_t v0 = vld1q_f32(moe_out + di);
+                    float32x4_t v1 = vld1q_f32(eo + di);
+                    vst1q_f32(moe_out + di, vaddq_f32(v0, v1));
                 }
                 for (; di < dim; di++) moe_out[di] += eo[di];
             }
@@ -3704,6 +3727,43 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
                             _mm512_add_ps(v0, _mm512_mul_ps(bw, v1)));
                         _mm512_storeu_ps(out + di + 8,
                             _mm512_add_ps(v2, _mm512_mul_ps(bw, v3)));
+                    }
+                    for (; di < dim; di++)
+                        out[di] += w_i * expert_out[di];
+                }
+#elif defined(PICOLM_AVX2)
+                {
+                    __m256 bw = _mm256_set1_ps(w_i);
+                    int di = 0;
+                    for (; di + 15 < dim; di += 16) {
+                        __m256 v0 = _mm256_loadu_ps(out + di);
+                        __m256 v1 = _mm256_loadu_ps(expert_out + di);
+                        __m256 v2 = _mm256_loadu_ps(out + di + 4);
+                        __m256 v3 = _mm256_loadu_ps(expert_out + di + 4);
+                        __m256 v4 = _mm256_loadu_ps(out + di + 8);
+                        __m256 v5 = _mm256_loadu_ps(expert_out + di + 8);
+                        __m256 v6 = _mm256_loadu_ps(out + di + 12);
+                        __m256 v7 = _mm256_loadu_ps(expert_out + di + 12);
+                        _mm256_storeu_ps(out + di,
+                            _mm256_add_ps(v0, _mm256_mul_ps(bw, v1)));
+                        _mm256_storeu_ps(out + di + 4,
+                            _mm256_add_ps(v2, _mm256_mul_ps(bw, v3)));
+                        _mm256_storeu_ps(out + di + 8,
+                            _mm256_add_ps(v4, _mm256_mul_ps(bw, v5)));
+                        _mm256_storeu_ps(out + di + 12,
+                            _mm256_add_ps(v6, _mm256_mul_ps(bw, v7)));
+                    }
+                    for (; di < dim; di++)
+                        out[di] += w_i * expert_out[di];
+                }
+#elif defined(PICOLM_NEON)
+                {
+                    float32x4_t bw = vdupq_n_f32(w_i);
+                    int di = 0;
+                    for (; di + 3 < dim; di += 4) {
+                        float32x4_t v0 = vld1q_f32(out + di);
+                        float32x4_t v1 = vld1q_f32(expert_out + di);
+                        vst1q_f32(out + di, vaddq_f32(v0, vmulq_f32(bw, v1)));
                     }
                     for (; di < dim; di++)
                         out[di] += w_i * expert_out[di];
