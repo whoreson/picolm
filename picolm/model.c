@@ -1656,6 +1656,13 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                         attempted++;
                         if (picolm_gpu_tensor_upload(&gl->ssm_beta,
                                 lw->ssm_beta, lw->type_ssm_beta, c->n_embd, c->ssm_dt_rank, device)) uploaded++;
+                        /* ssm_out: [value_dim, n_embd] projects FROM ssm_d_inner (value_dim)
+                         * TO dim (n_embd), matching matmul()'s (I, O) convention.
+                         * Without this upload gl->ssm_out stays NULL and
+                         * tensor_set_gpu_tensor(gl->ssm_out, ...) is a silent no-op. */
+                        attempted++;
+                        if (picolm_gpu_tensor_upload(&gl->ssm_out,
+                                lw->ssm_out, lw->type_ssm_out, c->ssm_d_inner, c->n_embd, device)) uploaded++;
                     }
                 }
             }
@@ -4481,6 +4488,39 @@ static void ssm_chunked_recurrence(
     free(chunk_beta); free(gate_log); free(chunk_out);
 }
 
+#ifdef PICOLM_GPU
+/* Persistent device scratch buffers for ssm_forward()'s device-native
+ * vecdot calls (picolm_gpu_ssm_vecdot_dev). The _dev variant needs
+ * device-resident x/out pointers -- weights and head_map are already
+ * device-resident from model load, but the activation (s->xb) lives
+ * on the host and the small per-head output needs a device buffer
+ * before D2H back. Sized once from dim/n_v_heads and reused. */
+static void *g_ssm_vecdot_x_dev = NULL;
+static size_t g_ssm_vecdot_x_bytes = 0;
+static void *g_ssm_vecdot_out_dev = NULL;
+static size_t g_ssm_vecdot_out_bytes = 0;
+static int g_ssm_vecdot_device = -1;
+
+static int ssm_vecdot_dev_scratch_ensure(int device, size_t x_bytes, size_t out_bytes) {
+    if (g_ssm_vecdot_device != device) {
+        g_ssm_vecdot_x_dev = NULL; g_ssm_vecdot_x_bytes = 0;
+        g_ssm_vecdot_out_dev = NULL; g_ssm_vecdot_out_bytes = 0;
+        g_ssm_vecdot_device = device;
+    }
+    if (!g_ssm_vecdot_x_dev || g_ssm_vecdot_x_bytes < x_bytes) {
+        g_ssm_vecdot_x_dev = picolm_gpu_alloc_device(x_bytes, device);
+        if (!g_ssm_vecdot_x_dev) return 0;
+        g_ssm_vecdot_x_bytes = x_bytes;
+    }
+    if (!g_ssm_vecdot_out_dev || g_ssm_vecdot_out_bytes < out_bytes) {
+        g_ssm_vecdot_out_dev = picolm_gpu_alloc_device(out_bytes, device);
+        if (!g_ssm_vecdot_out_dev) return 0;
+        g_ssm_vecdot_out_bytes = out_bytes;
+    }
+    return 1;
+}
+#endif
+
 /* SSM layer forward pass (autoregressive, single token) */
 static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
                         layer_weights_t *lw, int il, int pos, void *gpu_lw) {
@@ -4648,6 +4688,22 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     /*           GGUF     [k0v0, k0v2, k0v4, k0v6, k1v0, ..., k0v1, k0v3, ...] */
     /* Helper: map sequential head h -> GGUF head index gh */
     /* qwen35_vhead_gguf defined at file scope */
+#ifdef PICOLM_GPU
+    /* Upload xb once, shared by both alpha and beta device-native vecdot.
+     * Weights (ssm_alpha_dev/ssm_beta_dev) and head_map are already
+     * device-resident from model load. Only the activation needs per-call H2D
+     * (~20KB) instead of picolm_gpu_ssm_vecdot()'s ~255KB weight re-upload. */
+    int ssm_vecdot_gpu_ready = 0;
+    if (gpu_lw && m->gpu.active) {
+        size_t vx_bytes = (size_t)dim * sizeof(float);
+        size_t vout_bytes = (size_t)n_v_heads * sizeof(float);
+        if (ssm_vecdot_dev_scratch_ensure(m->gpu.device, vx_bytes, vout_bytes) &&
+            picolm_gpu_memcpy(g_ssm_vecdot_x_dev, s->xb, vx_bytes, 1, m->gpu.device)) {
+            ssm_vecdot_gpu_ready = 1;
+        }
+    }
+    const int *ssm_vecdot_hmap_dev = do_remap ? (const int *)m->gpu.ssm_head_map_dev : NULL;
+#endif
     float *alpha_out = tmp + conv_dim + 2 * qk_dim + c->ssm_d_inner; /* [dt_rank] */
     {
         gguf_type_t alpha_type = lw->type_ssm_alpha;
@@ -4655,9 +4711,16 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
         int alpha_map[256];
         for (int h = 0; h < n_v_heads; h++) alpha_map[h] = do_remap ? qwen35_vhead_gguf(h, n_vpk, n_k) : h;
 #ifdef PICOLM_GPU
-        if (gpu_lw && (alpha_type == GGUF_TYPE_F32 || alpha_type == GGUF_TYPE_Q4_0 || alpha_type == GGUF_TYPE_Q8_0) &&
-            picolm_gpu_ssm_vecdot(alpha_out, s->xb, lw->ssm_alpha, alpha_type, dim,
-                                  n_v_heads, (int)row_bytes, alpha_map, m->gpu.device)) {
+        if (gpu_lw && ssm_vecdot_gpu_ready && m->gpu.ssm_alpha_dev[il] &&
+            (!do_remap || ssm_vecdot_hmap_dev) &&
+            (alpha_type == GGUF_TYPE_F32 || alpha_type == GGUF_TYPE_Q4_0 || alpha_type == GGUF_TYPE_Q8_0) &&
+            picolm_gpu_ssm_vecdot_dev(g_ssm_vecdot_out_dev, g_ssm_vecdot_x_dev,
+                                       m->gpu.ssm_alpha_dev[il], alpha_type, dim,
+                                       n_v_heads, (int)row_bytes, ssm_vecdot_hmap_dev,
+                                       m->gpu.device) &&
+            picolm_gpu_sync(m->gpu.device) &&
+            picolm_gpu_memcpy(alpha_out, g_ssm_vecdot_out_dev,
+                               (size_t)n_v_heads * sizeof(float), -1, m->gpu.device)) {
             for (int h = 0; h < n_v_heads; h++) alpha_out[h] += s->ssm_dt_w[il][h];
         } else
 #endif
@@ -4698,9 +4761,16 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
         int beta_map[256];
         for (int h = 0; h < n_v_heads; h++) beta_map[h] = do_remap ? qwen35_vhead_gguf(h, n_vpk, n_k) : h;
 #ifdef PICOLM_GPU
-        if (gpu_lw && (beta_type == GGUF_TYPE_F32 || beta_type == GGUF_TYPE_Q4_0 || beta_type == GGUF_TYPE_Q8_0) &&
-            picolm_gpu_ssm_vecdot(beta, s->xb, lw->ssm_beta, beta_type, dim,
-                                  n_v_heads, (int)row_bytes, beta_map, m->gpu.device)) {
+        if (gpu_lw && ssm_vecdot_gpu_ready && m->gpu.ssm_beta_dev[il] &&
+            (!do_remap || ssm_vecdot_hmap_dev) &&
+            (beta_type == GGUF_TYPE_F32 || beta_type == GGUF_TYPE_Q4_0 || beta_type == GGUF_TYPE_Q8_0) &&
+            picolm_gpu_ssm_vecdot_dev(g_ssm_vecdot_out_dev, g_ssm_vecdot_x_dev,
+                                       m->gpu.ssm_beta_dev[il], beta_type, dim,
+                                       n_v_heads, (int)row_bytes, ssm_vecdot_hmap_dev,
+                                       m->gpu.device) &&
+            picolm_gpu_sync(m->gpu.device) &&
+            picolm_gpu_memcpy(beta, g_ssm_vecdot_out_dev,
+                               (size_t)n_v_heads * sizeof(float), -1, m->gpu.device)) {
             for (int h = 0; h < n_v_heads; h++) beta[h] = 1.0f / (1.0f + expf(-beta[h]));
         } else
 #endif
@@ -4831,6 +4901,12 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     /* 19. Reshape to [value_dim] and output projection */
     /* final_output is [head_v_dim * n_v_heads] = [value_dim] = [4096] */
     /* ssm_out: [n_embd, value_dim] - GGUF columns may be reordered */
+#ifdef PICOLM_GPU
+    if (gpu_lw) {
+        gpu_layer_weights_t *gl = (gpu_layer_weights_t *)gpu_lw;
+        tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->ssm_out, m->gpu.device);
+    }
+#endif
     if (do_remap) {
         float *fo_gguf = alloca(c->ssm_d_inner * sizeof(float));
         for (int h = 0; h < n_v_heads; h++) {
@@ -4841,6 +4917,9 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     } else {
         matmul(residual, final_output, lw->ssm_out, c->ssm_d_inner, dim, lw->type_ssm_out);
     }
+#ifdef PICOLM_GPU
+    if (gpu_lw) tensor_set_gpu_tensor(NULL, 0); /* clear before FFN below */
+#endif
     #ifdef DEBUG_SSM
     if (il == 0 && pos == 0) dbg_vec("residual[:8]", residual, 8, 8);
 #endif
