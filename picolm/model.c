@@ -4519,6 +4519,57 @@ static int ssm_vecdot_dev_scratch_ensure(int device, size_t x_bytes, size_t out_
     }
     return 1;
 }
+
+/* Device scratch buffers for batched matmul via picolm_gpu_matmul_dev.
+ * Unlike the host-wrapper picolm_gpu_matmul() (called via matmul()/
+ * tensor_set_gpu_tensor), which does TWO gpuDeviceSynchronize() calls
+ * per Q8_0 matmul (one after quantize-x, one after the matmul kernel),
+ * matmul_dev has zero internal syncs. Kernels on the same stream
+ * execute in submission order, so two back-to-back matmul_dev calls
+ * need only one sync total -- when host code actually reads results.
+ * This is ~4x fewer syncs for the attn_qkv+attn_gate_ssm pair (1 vs 4). */
+static void *g_ssm_mm_xb_dev = NULL;      static size_t g_ssm_mm_xb_bytes = 0;
+static void *g_ssm_mm_qkv_dev = NULL;     static size_t g_ssm_mm_qkv_bytes = 0;
+static void *g_ssm_mm_gate_dev = NULL;    static size_t g_ssm_mm_gate_bytes = 0;
+static void *g_ssm_mm_outin_dev = NULL;   static size_t g_ssm_mm_outin_bytes = 0;
+static void *g_ssm_mm_outres_dev = NULL;  static size_t g_ssm_mm_outres_bytes = 0;
+static int g_ssm_mm_device = -1;
+
+static int ssm_mm_alloc(void **buf, size_t *cap, size_t need, int device) {
+    if (*buf && *cap >= need) return 1;
+    *buf = picolm_gpu_alloc_device(need, device);
+    if (!*buf) { *cap = 0; return 0; }
+    *cap = need;
+    return 1;
+}
+
+static int ssm_qkv_gate_dev_scratch_ensure(int device, size_t xb_bytes,
+                                            size_t qkv_bytes, size_t gate_bytes) {
+    if (g_ssm_mm_device != device) {
+        g_ssm_mm_xb_dev = NULL; g_ssm_mm_xb_bytes = 0;
+        g_ssm_mm_qkv_dev = NULL; g_ssm_mm_qkv_bytes = 0;
+        g_ssm_mm_gate_dev = NULL; g_ssm_mm_gate_bytes = 0;
+        g_ssm_mm_outin_dev = NULL; g_ssm_mm_outin_bytes = 0;
+        g_ssm_mm_outres_dev = NULL; g_ssm_mm_outres_bytes = 0;
+        g_ssm_mm_device = device;
+    }
+    return ssm_mm_alloc(&g_ssm_mm_xb_dev, &g_ssm_mm_xb_bytes, xb_bytes, device) &&
+           ssm_mm_alloc(&g_ssm_mm_qkv_dev, &g_ssm_mm_qkv_bytes, qkv_bytes, device) &&
+           ssm_mm_alloc(&g_ssm_mm_gate_dev, &g_ssm_mm_gate_bytes, gate_bytes, device);
+}
+
+static int ssm_out_dev_scratch_ensure(int device, size_t in_bytes, size_t out_bytes) {
+    if (g_ssm_mm_device != device) {
+        g_ssm_mm_xb_dev = NULL; g_ssm_mm_xb_bytes = 0;
+        g_ssm_mm_qkv_dev = NULL; g_ssm_mm_qkv_bytes = 0;
+        g_ssm_mm_gate_dev = NULL; g_ssm_mm_gate_bytes = 0;
+        g_ssm_mm_outin_dev = NULL; g_ssm_mm_outin_bytes = 0;
+        g_ssm_mm_outres_dev = NULL; g_ssm_mm_outres_bytes = 0;
+        g_ssm_mm_device = device;
+    }
+    return ssm_mm_alloc(&g_ssm_mm_outin_dev, &g_ssm_mm_outin_bytes, in_bytes, device) &&
+           ssm_mm_alloc(&g_ssm_mm_outres_dev, &g_ssm_mm_outres_bytes, out_bytes, device);
+}
 #endif
 
 /* SSM layer forward pass (autoregressive, single token) */
@@ -4552,27 +4603,38 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     if (il == 0 && pos == 0) dbg_vec("xb[:8]", s->xb, 8, 8);
 #endif
     /* 2. QKV projection: qkv_mixed = matmul(attn_qkv, xb) -> [conv_dim] */
+    /* 3. Z gate: z = matmul(attn_gate_ssm, xb) -> [value_dim] */
+    /* Batched: both read the same xb, so one H2D, two matmul_dev,
+     * one sync, two D2H. Replaces two matmul() calls each doing
+     * H2D + 2x sync + D2H (4 syncs total for Q8_0 -> 1 sync). */
 #ifdef PICOLM_GPU
+    int ssm_qkv_gate_gpu_done = 0;
     if (gpu_lw) {
         gpu_layer_weights_t *gl = (gpu_layer_weights_t *)gpu_lw;
-        tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->attn_qkv, m->gpu.device);
+        size_t xb_bytes = (size_t)dim * sizeof(float);
+        size_t qkv_bytes = (size_t)conv_dim * sizeof(float);
+        size_t gate_bytes = (size_t)c->ssm_d_inner * sizeof(float);
+        if (gl->attn_qkv && gl->attn_gate_ssm &&
+            ssm_qkv_gate_dev_scratch_ensure(m->gpu.device, xb_bytes, qkv_bytes, gate_bytes) &&
+            picolm_gpu_memcpy(g_ssm_mm_xb_dev, s->xb, xb_bytes, 1, m->gpu.device) &&
+            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_qkv,
+                                   g_ssm_mm_qkv_dev, g_ssm_mm_xb_dev, 1, m->gpu.device) &&
+            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_gate_ssm,
+                                   g_ssm_mm_gate_dev, g_ssm_mm_xb_dev, 1, m->gpu.device) &&
+            picolm_gpu_sync(m->gpu.device) &&
+            picolm_gpu_memcpy(s->q, g_ssm_mm_qkv_dev, qkv_bytes, -1, m->gpu.device) &&
+            picolm_gpu_memcpy(s->xb2, g_ssm_mm_gate_dev, gate_bytes, -1, m->gpu.device)) {
+            ssm_qkv_gate_gpu_done = 1;
+        }
     }
+    if (!ssm_qkv_gate_gpu_done)
 #endif
-    matmul(s->q, s->xb, lw->attn_qkv, dim, conv_dim, lw->type_attn_qkv);
-#ifdef PICOLM_GPU
-    if (gpu_lw) {
-        gpu_layer_weights_t *gl = (gpu_layer_weights_t *)gpu_lw;
-        tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->attn_gate_ssm, m->gpu.device);
+    {
+        matmul(s->q, s->xb, lw->attn_qkv, dim, conv_dim, lw->type_attn_qkv);
+        matmul(s->xb2, s->xb, lw->attn_gate_ssm, dim, c->ssm_d_inner, lw->type_attn_gate_ssm);
     }
-#endif
 #ifdef DEBUG_SSM
     if (il == 0 && pos == 0) dbg_vec("qkv[:8]", s->q, 8, 8);
-#endif
-
-    /* 3. Z gate: z = matmul(attn_gate_ssm, xb) -> [value_dim] */
-    matmul(s->xb2, s->xb, lw->attn_gate_ssm, dim, c->ssm_d_inner, lw->type_attn_gate_ssm);
-#ifdef PICOLM_GPU
-    if (gpu_lw) tensor_set_gpu_tensor(NULL, 0); /* clear before next layer */
 #endif
     /* If GGUF reorders v-head rows, convert xb2 from GGUF order to sequential order */
     if (do_remap) {
@@ -4901,25 +4963,36 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     /* 19. Reshape to [value_dim] and output projection */
     /* final_output is [head_v_dim * n_v_heads] = [value_dim] = [4096] */
     /* ssm_out: [n_embd, value_dim] - GGUF columns may be reordered */
-#ifdef PICOLM_GPU
-    if (gpu_lw) {
-        gpu_layer_weights_t *gl = (gpu_layer_weights_t *)gpu_lw;
-        tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->ssm_out, m->gpu.device);
-    }
-#endif
+    float *fo_gguf = NULL;
     if (do_remap) {
-        float *fo_gguf = alloca(c->ssm_d_inner * sizeof(float));
+        fo_gguf = alloca(c->ssm_d_inner * sizeof(float));
         for (int h = 0; h < n_v_heads; h++) {
             int gh = qwen35_vhead_gguf(h, n_vpk, n_k);
             memcpy(fo_gguf + gh * head_v_dim, final_output + h * head_v_dim, head_v_dim * sizeof(float));
         }
-        matmul(residual, fo_gguf, lw->ssm_out, c->ssm_d_inner, dim, lw->type_ssm_out);
-    } else {
-        matmul(residual, final_output, lw->ssm_out, c->ssm_d_inner, dim, lw->type_ssm_out);
     }
+    const float *ssm_out_src = do_remap ? fo_gguf : final_output;
 #ifdef PICOLM_GPU
-    if (gpu_lw) tensor_set_gpu_tensor(NULL, 0); /* clear before FFN below */
+    int ssm_out_gpu_done = 0;
+    if (gpu_lw) {
+        gpu_layer_weights_t *gl = (gpu_layer_weights_t *)gpu_lw;
+        size_t in_bytes = (size_t)c->ssm_d_inner * sizeof(float);
+        size_t out_bytes = (size_t)dim * sizeof(float);
+        if (gl->ssm_out &&
+            ssm_out_dev_scratch_ensure(m->gpu.device, in_bytes, out_bytes) &&
+            picolm_gpu_memcpy(g_ssm_mm_outin_dev, ssm_out_src, in_bytes, 1, m->gpu.device) &&
+            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ssm_out,
+                                   g_ssm_mm_outres_dev, g_ssm_mm_outin_dev, 1, m->gpu.device) &&
+            picolm_gpu_sync(m->gpu.device) &&
+            picolm_gpu_memcpy(residual, g_ssm_mm_outres_dev, out_bytes, -1, m->gpu.device)) {
+            ssm_out_gpu_done = 1;
+        }
+    }
+    if (!ssm_out_gpu_done)
 #endif
+    {
+        matmul(residual, ssm_out_src, lw->ssm_out, c->ssm_d_inner, dim, lw->type_ssm_out);
+    }
     #ifdef DEBUG_SSM
     if (il == 0 && pos == 0) dbg_vec("residual[:8]", residual, 8, 8);
 #endif
@@ -4942,6 +5015,11 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
                                       s->xb, s->xb, 1))
                 goto ssm_ffn_done;
         }
+        /* Defensive: the qkv/gate/ssm_out matmuls above now go through
+         * matmul_dev directly and never touch tensor_set_gpu_tensor,
+         * but clear it before the CPU-fallback matmul() calls below,
+         * which read the global gpu_tensor with no paired set/clear. */
+        if (gpu_lw) tensor_set_gpu_tensor(NULL, 0);
 #endif
         matmul(s->hb, s->xb, lw->ffn_gate, dim, c->n_ffn, lw->type_ffn_gate);
         matmul(s->hb2, s->xb, lw->ffn_up, dim, c->n_ffn, lw->type_ffn_up);
