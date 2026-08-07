@@ -1477,11 +1477,39 @@ void matmul_q8(float *out, const void *qx, const float *qx_d,
         }
         return;
     }
-    /* For non-Q8_0 types, fall through to generic vec_dot */
-    if (n_threads <= 1 || d < 4 || d < matmul_min_rows) {
-        for (int i = 0; i < d; i++) {
-            out[i] = vec_dot(wptr + (size_t)i * row_bytes, NULL, n, qtype);
+    /* For non-Q8_0 types, dequantize Q8_0 activation to float, then use vec_dot */
+    {
+        float *xf = (float *)malloc((size_t)n * sizeof(float));
+        dequantize_row_q8_0(qx, xf, n);
+        if (n_threads <= 1 || d < 4 || d < matmul_min_rows) {
+            for (int i = 0; i < d; i++) {
+                out[i] = vec_dot(wptr + (size_t)i * row_bytes, xf, n, qtype);
+            }
         }
+        free(xf);
+    }
+}
+/* matmul_q8_seq: sequential Q8xQ8 matmul that ignores n_threads.
+ * Safe to call from inside tensor_parallel_for workers. */
+void matmul_q8_seq(float *out, const void *qx, const float *qx_d,
+                   const void *W, int n, int d, gguf_type_t qtype) {
+    size_t row_bytes = gguf_type_row_size(qtype, n);
+    const char *wptr = (const char *)W;
+
+    if (qtype == GGUF_TYPE_Q8_0 && n > 0) {
+        for (int i = 0; i < d; i++) {
+            out[i] = vec_dot_q8_0_q8_0_deltas(qx, qx_d, wptr + (size_t)i * row_bytes, n);
+        }
+        return;
+    }
+    /* Non-Q8_0 weights: dequantize Q8_0 activation to float, then use vec_dot */
+    {
+        float *xf = (float *)malloc((size_t)n * sizeof(float));
+        dequantize_row_q8_0(qx, xf, n);
+        for (int i = 0; i < d; i++) {
+            out[i] = vec_dot(wptr + (size_t)i * row_bytes, xf, n, qtype);
+        }
+        free(xf);
     }
 }
 
@@ -1500,7 +1528,26 @@ void matmul_q8(float *out, const void *qx, const float *qx_d,
 void matmul_q8_batch(float *out, const float *qx_all, int qx_d_off,
                      int q8_buf_per_token, const void *W,
                      int n, int d, int n_batch, gguf_type_t qtype) {
-    if (qtype != GGUF_TYPE_Q8_0 || n <= 0 || d <= 0 || n_batch <= 0) return;
+    if (n <= 0 || d <= 0 || n_batch <= 0) return;
+
+    if (qtype != GGUF_TYPE_Q8_0) {
+        /* Non-Q8_0 weights: dequantize Q8_0 activation to float, then use vec_dot.
+         * This is slower than Q8xQ8 but handles all weight types (Q4_K, Q6_K, etc.) */
+        {
+            size_t row_bytes = gguf_type_row_size(qtype, n);
+            const char *wptr = (const char *)W;
+            float *xf = (float *)malloc((size_t)n * sizeof(float));
+            for (int b = 0; b < n_batch; b++) {
+                const float *tbuf = qx_all + b * q8_buf_per_token;
+                dequantize_row_q8_0(tbuf, xf, n);
+                for (int i = 0; i < d; i++) {
+                    out[b * d + i] = vec_dot(wptr + (size_t)i * row_bytes, xf, n, qtype);
+                }
+            }
+            free(xf);
+        }
+        return;
+    }
 
     size_t row_bytes = gguf_type_row_size(qtype, n);
     const char *wptr = (const char *)W;
@@ -1672,7 +1719,7 @@ void matmul_mm_id_down(float *down_out,
     mm_id_down_ctx_t ctx = { down_out, expert_out, down_w_base,
         expert_assignments, expert_counts, n_tokens, n_used, dim, n_ff, n_expert,
         type, row_bytes, dnb, qx_d_off,
-        scratch_qx, scratch_qx_d, exp_down_qx_all, q8_per_token, MAX_THREADS };
+        scratch_qx, scratch_qx_d, exp_down_qx_all, q8_per_token, tensor_get_n_threads() };
 
     tensor_parallel_for(n_expert, mm_id_down_expert_task, &ctx);
 }
@@ -1704,11 +1751,14 @@ static void mm_id_gate_expert_task(int idx, void *ctxp) {
     const char *up_exp = (const char *)c->up_w_base + (size_t)eid * c->n_ff * c->row_bytes;
 
 #ifdef PICOLM_AVX512
-    int nblk = c->dim / 32;  /* 64 blocks per row for dim=2048 */
+    if (c->type == GGUF_TYPE_Q8_0) {
+        /* Block-interleaved kernel: Q8_0 weights only.
+         * For other types, fall through to scalar_gateup below. */
+        int nblk = c->dim / 32;  /* 64 blocks per row for dim=2048 */
 
-    /* Precompute token buffer pointers */
-    const float *tbufs[256];
-    const float *qx_d_ptrs[256];
+        /* Precompute token buffer pointers */
+        const float *tbufs[256];
+        const float *qx_d_ptrs[256];
     for (int a = 0; a < n_assigned; a++) {
         tbufs[a] = c->qx_all + assigned[a] * c->q8_buf_per_token;
         qx_d_ptrs[a] = tbufs[a] + c->qx_d_off;
@@ -1836,17 +1886,75 @@ static void mm_id_gate_expert_task(int idx, void *ctxp) {
             }
         }
     }
-#else
+    } /* end if (c->type == GGUF_TYPE_Q8_0) */
+    scalar_gateup:
+    /* For non-Q8_0 weights, dequantize each row to float once, then
+     * compute dot products with Q8_0 activations. This is slower than
+     * the block-interleaved Q8_0 path but handles all weight types. */
+    float *wrow_f = (float *)malloc(c->dim * sizeof(float));
+    if (!wrow_f) { fprintf(stderr, "OOM: scalar_gateup\n"); exit(1); }
+
     for (int row = 0; row < c->n_ff; row++) {
+        const char *gw = gate_exp + row * c->row_bytes;
+        const char *uw = up_exp + row * c->row_bytes;
+
+        dequantize_row(gw, wrow_f, c->dim, c->type);
         for (int a = 0; a < n_assigned; a++) {
             int t = assigned[a];
             const float *tbuf = c->qx_all + t * c->q8_buf_per_token;
             size_t idx = (size_t)t * c->n_used * c->n_ff + (size_t)slots[a] * c->n_ff + row;
-            c->gate_out[idx] = vec_dot_q8_0_q8_0_deltas((const void *)tbuf,
-                tbuf + c->qx_d_off, gate_exp + row * c->row_bytes, c->dim);
-            c->up_out[idx] = vec_dot_q8_0_q8_0_deltas((const void *)tbuf,
-                tbuf + c->qx_d_off, up_exp + row * c->row_bytes, c->dim);
+            c->gate_out[idx] = vec_dot_q8_0_f32(tbuf, wrow_f, c->dim);
         }
+        dequantize_row(uw, wrow_f, c->dim, c->type);
+        for (int a = 0; a < n_assigned; a++) {
+            int t = assigned[a];
+            const float *tbuf = c->qx_all + t * c->q8_buf_per_token;
+            size_t idx = (size_t)t * c->n_used * c->n_ff + (size_t)slots[a] * c->n_ff + row;
+            c->up_out[idx] = vec_dot_q8_0_f32(tbuf, wrow_f, c->dim);
+        }
+    }
+    free(wrow_f);
+#else
+    /* Non-AVX512: scalar path for all weight types.
+     * For Q8_0 weights, use vec_dot_q8_0_q8_0_deltas directly.
+     * For non-Q8_0 weights, dequantize to float and use vec_dot_q8_0_f32. */
+    if (c->type == GGUF_TYPE_Q8_0) {
+        for (int row = 0; row < c->n_ff; row++) {
+            const char *gw = gate_exp + row * c->row_bytes;
+            const char *uw = up_exp + row * c->row_bytes;
+            for (int a = 0; a < n_assigned; a++) {
+                int t = assigned[a];
+                const float *tbuf = c->qx_all + t * c->q8_buf_per_token;
+                size_t idx = (size_t)t * c->n_used * c->n_ff + (size_t)slots[a] * c->n_ff + row;
+                c->gate_out[idx] = vec_dot_q8_0_q8_0_deltas((const void *)tbuf,
+                    tbuf + c->qx_d_off, gw, c->dim);
+                c->up_out[idx] = vec_dot_q8_0_q8_0_deltas((const void *)tbuf,
+                    tbuf + c->qx_d_off, uw, c->dim);
+            }
+        }
+    } else {
+        /* Non-Q8_0: dequantize each row to float, then dot with Q8_0 activations */
+        float *wrow_f = (float *)malloc(c->dim * sizeof(float));
+        if (!wrow_f) { fprintf(stderr, "OOM: scalar_gateup\n"); exit(1); }
+        for (int row = 0; row < c->n_ff; row++) {
+            const char *gw = gate_exp + row * c->row_bytes;
+            const char *uw = up_exp + row * c->row_bytes;
+            dequantize_row(gw, wrow_f, c->dim, c->type);
+            for (int a = 0; a < n_assigned; a++) {
+                int t = assigned[a];
+                const void *tbuf = (const void *)(c->qx_all + t * c->q8_buf_per_token);
+                size_t idx = (size_t)t * c->n_used * c->n_ff + (size_t)slots[a] * c->n_ff + row;
+                c->gate_out[idx] = vec_dot_q8_0_f32(tbuf, wrow_f, c->dim);
+            }
+            dequantize_row(uw, wrow_f, c->dim, c->type);
+            for (int a = 0; a < n_assigned; a++) {
+                int t = assigned[a];
+                const void *tbuf = (const void *)(c->qx_all + t * c->q8_buf_per_token);
+                size_t idx = (size_t)t * c->n_used * c->n_ff + (size_t)slots[a] * c->n_ff + row;
+                c->up_out[idx] = vec_dot_q8_0_f32(tbuf, wrow_f, c->dim);
+            }
+        }
+        free(wrow_f);
     }
 #endif
 }
@@ -1898,10 +2006,9 @@ static void mm_id_down_expert_task(int idx, void *ctxp) {
 #ifdef PICOLM_AVX512
     int nblk = c->n_ff / 32;  /* 16 blocks per row for n_ff=512 */
 
-    /* Block-interleaved kernel: same strategy as gate+up.
-     * For each weight row, process blocks in the outer loop,
-     * tokens in the inner loop, keeping weight blocks in L1. */
-    if (n_assigned <= 8) {
+    /* Block-interleaved kernel: Q8_0 weights only.
+     * For non-Q8_0 types, fall through to matmul_q8_seq below. */
+    if (c->type == GGUF_TYPE_Q8_0 && n_assigned <= 8) {
         for (int row = 0; row < c->dim; row++) {
             const block_q8_0 *dw_blocks = (const block_q8_0 *)(dw + (size_t)row * c->row_bytes);
 
@@ -1956,9 +2063,9 @@ static void mm_id_down_expert_task(int idx, void *ctxp) {
         }
     } else if (n_assigned == 1) {
         float *dout = c->down_out + (size_t)assigned[0] * c->n_used * c->dim + (size_t)slots[0] * c->dim;
-        matmul_q8(dout, qx_bufs[0], qx_d_arr[0], dw, c->n_ff, c->dim, c->type);
-    } else {
-        /* >8 tokens per expert: batch4 + scalar fallback */
+        matmul_q8_seq(dout, qx_bufs[0], qx_d_arr[0], dw, c->n_ff, c->dim, c->type);
+    } else if (c->type == GGUF_TYPE_Q8_0) {
+        /* >8 tokens per expert: batch4 + scalar fallback (Q8_0 only) */
         int n_batch4 = (n_assigned / 4) * 4;
         for (int row = 0; row < c->dim; row++) {
             const char *wi = dw + row * c->row_bytes;
@@ -1982,20 +2089,22 @@ static void mm_id_down_expert_task(int idx, void *ctxp) {
                 c->down_out[idx] = vec_dot_q8_0_q8_0_deltas(qx_bufs[a], qx_d_arr[a], wi, c->n_ff);
             }
         }
+    } else {
+        /* Non-Q8_0 weights: use matmul_q8_seq which handles all types */
+        for (int a = 0; a < n_assigned; a++) {
+            int t = assigned[a];
+            int slot = slots[a];
+            float *dout = c->down_out + (size_t)t * c->n_used * c->dim + (size_t)slot * c->dim;
+            matmul_q8_seq(dout, qx_bufs[a], qx_d_arr[a], dw, c->n_ff, c->dim, c->type);
+        }
     }
 #else
-    if (n_assigned == 1) {
-        float *dout = c->down_out + (size_t)assigned[0] * c->n_used * c->dim + (size_t)slots[0] * c->dim;
-        matmul_q8(dout, qx_bufs[0], qx_d_arr[0], dw, c->n_ff, c->dim, c->type);
-    } else {
-        for (int row = 0; row < c->dim; row++) {
-            const char *wi = dw + row * c->row_bytes;
-            for (int a = 0; a < n_assigned; a++) {
-                int t = assigned[a];
-                size_t idx = (size_t)t * c->n_used * c->dim + (size_t)slots[a] * c->dim + row;
-                c->down_out[idx] = vec_dot_q8_0_q8_0_deltas(qx_bufs[a], qx_d_arr[a], wi, c->n_ff);
-            }
-        }
+    /* Non-AVX512: use matmul_q8_seq for all weight types */
+    for (int a = 0; a < n_assigned; a++) {
+        int t = assigned[a];
+        int slot = slots[a];
+        float *dout = c->down_out + (size_t)t * c->n_used * c->dim + (size_t)slot * c->dim;
+        matmul_q8_seq(dout, qx_bufs[a], qx_d_arr[a], dw, c->n_ff, c->dim, c->type);
     }
 #endif
 }

@@ -16,11 +16,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#ifndef _WIN32
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#endif
 
 #ifdef PICOLM_GPU
 #include "backend_gpu.h"
@@ -33,11 +28,15 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+#ifdef PICOLM_NEON
+#include <arm_neon.h>
+#endif
 #ifdef _WIN32
 #include <windows.h>
 #include <io.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <malloc.h>
 #define SECURITY_WIN32
 #include <security.h>
 #include <accctrl.h>
@@ -165,8 +164,8 @@ size_t layer_weight_size(model_t *m, int l) {
         sz += gguf_type_row_size(lw->type_ffn_gate_inp, n_expert) * dim;
     }
     if (lw->ffn_gate_inp_shexp) {
-        /* [dim] F32 */
-        sz += dim * sizeof(float);
+        /* [dim] — quantization type varies (F32, Q4_K, etc.) */
+        sz += gguf_type_row_size(lw->type_ffn_gate_inp_shexp, dim);
     }
     if (lw->ffn_gate_shexp) {
         int n_ff_shexp = m->config.n_ff_shexp;
@@ -1489,7 +1488,7 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                 } else if (strcmp(suffix, "ffn_gate_inp.weight") == 0) {
                     lw->ffn_gate_inp = ptr; lw->type_ffn_gate_inp = qtype;
                 } else if (strcmp(suffix, "ffn_gate_inp_shexp.weight") == 0) {
-                    lw->ffn_gate_inp_shexp = ptr;
+                    lw->ffn_gate_inp_shexp = ptr; lw->type_ffn_gate_inp_shexp = qtype;
                 } else if (strcmp(suffix, "ffn_gate_shexp.weight") == 0) {
                     lw->ffn_gate_shexp = ptr; lw->type_ffn_gate_shexp = qtype;
                 } else if (strcmp(suffix, "ffn_up_shexp.weight") == 0) {
@@ -1771,7 +1770,7 @@ static size_t kv_head_stride(kv_cache_type_t kv_type, int head_dim) {
 }
 
 int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v,
-                       int k_cache_hadamard, int v_cache_hadamard) {
+                       int k_cache_hadamard, int v_cache_hadamard, int n_threads) {
     model_config_t *c = &m->config;
     run_state_t *s = &m->state;
 
@@ -1885,7 +1884,7 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
             per_thread += gguf_type_row_size(GGUF_TYPE_Q8_0, c->n_ff_exp); /* down_qx */
             per_thread += (c->n_ff_exp / 32) * sizeof(float);        /* down_qx_d */
             per_thread = (per_thread + 31) / 32 * 32;                /* align to 32 bytes */
-            sz_moe += per_thread * MAX_THREADS;
+            sz_moe += per_thread * (size_t)n_threads;
         }
 
         /* Per-expert scratch: gate_buf, up_buf, down_qx, down_qx_d.
@@ -1944,12 +1943,12 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         sz_moe += (size_t)c->n_expert * c->max_seq_len * sizeof(int);
         sz_moe += (size_t)c->n_expert * sizeof(int);
 
-        /* Per-thread mm_down_qx_all: MAX_THREADS × 256 × down_q8_per_token */
+        /* Per-thread mm_down_qx_all: n_threads × 256 × down_q8_per_token */
         {
             size_t down_q8_rb = c->n_ff_exp / 32;
             size_t down_q8_data_off = (down_q8_rb * sizeof(block_q8_0) + sizeof(float) - 1) / sizeof(float);
             size_t down_q8_per_token = down_q8_data_off + down_q8_rb;
-            sz_moe += (size_t)MAX_THREADS * 256 * down_q8_per_token; /* MAX_THREADS × 256 max tokens per expert */
+            sz_moe += (size_t)n_threads * 256 * down_q8_per_token; /* n_threads × 256 max tokens per expert */
         }
     }
 
@@ -2031,21 +2030,45 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
             (double)total / (1024.0 * 1024.0),
             (double)sz_kv / (1024.0 * 1024.0), kv_name_k, kv_name_v);
 
-    s->mem_block = calloc(1, total);
-    if (!s->mem_block) {
-        fprintf(stderr, "OOM: cannot allocate %zu bytes\n", total);
-        return -1;
-    }
-    s->mem_size = total + sz_kv;
+    /* Use mmap on POSIX for large allocations to avoid address space
+     * collisions with the GGUF file mmap. On Windows, use calloc. */
+    {
+        size_t total_alloc = total + sz_kv;
+        void *base = NULL;
+#ifdef _WIN32
+        base = calloc(1, total_alloc);
+        if (!base) {
+            fprintf(stderr, "OOM: calloc failed for %zu bytes\n", total_alloc);
+            return -1;
+        }
+#else
+        if (m->mmap_addr) {
+            /* Try to allocate just below the GGUF mmap */
+            uintptr_t hint = (uintptr_t)m->mmap_addr - (total_alloc + 4096);
+            base = mmap((void *)hint, total_alloc, PROT_READ|PROT_WRITE,
+                        MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+            if (base == MAP_FAILED || base != (void *)hint) {
+                /* mmap at hint failed or moved us; try anywhere */
+                base = mmap(NULL, total_alloc, PROT_READ|PROT_WRITE,
+                            MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+            }
+        } else {
+            base = mmap(NULL, total_alloc, PROT_READ|PROT_WRITE,
+                        MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+        }
+        if (base == MAP_FAILED) {
+            fprintf(stderr, "OOM: mmap failed for %zu bytes: %s\n", total_alloc, strerror(errno));
+            return -1;
+        }
+#endif
 
-    /* Allocate KV cache separately */
-    s->kv_block = calloc(1, sz_kv);
-    if (!s->kv_block) {
-        fprintf(stderr, "OOM: cannot allocate %zu bytes for KV cache\n", sz_kv);
-        free(s->mem_block);
-        return -1;
+        s->mem_block = base;
+        s->mem_size = total + sz_kv;
+
+        /* KV cache follows mem_block contiguously */
+        s->kv_block = (char *)base + total;
+        s->kv_size = sz_kv;
     }
-    s->kv_size = sz_kv;
 
     /* Populate KV layer mapping */
     {
@@ -2256,7 +2279,7 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
                 per_thread = (per_thread + 31) / 32 * 32;                /* align to 32 bytes */
                 s->moe_thread_scratch = (void *)p;
                 s->moe_thread_stride = per_thread;
-                p += (per_thread / sizeof(float) + 1) * MAX_THREADS;
+                p += (per_thread / sizeof(float) + 1) * (size_t)n_threads;
             }
 
             /* Per-expert scratch: gate_buf, up_buf, down_qx, down_qx_d */
@@ -2302,9 +2325,9 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
             /* Per-expert down quantization buffers for batched mm_id.
              * Layout: per-thread × per-token Q8_0 buffer with embedded deltas.
              * Each entry is for n_ff_exp (not n_embd) since we quantize SwiGLU output.
-             * Total: MAX_THREADS × 256 (max tokens per expert) × down_q8_per_token floats. */
+             * Total: n_threads × 256 (max tokens per expert) × down_q8_per_token floats. */
             {
-                int n_threads_max = MAX_THREADS;
+                int n_threads_max = n_threads;
                 size_t down_q8_rb = c->n_ff_exp / 32;
                 size_t down_q8_data_off = (down_q8_rb * sizeof(block_q8_0) + sizeof(float) - 1) / sizeof(float);
                 size_t down_q8_per_token = down_q8_data_off + down_q8_rb;
@@ -2543,7 +2566,7 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
 /* ---- Public API ---- */
 
 int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v,
-               int k_cache_hadamard, int v_cache_hadamard) {
+               int k_cache_hadamard, int v_cache_hadamard, int n_threads) {
     memset(m, 0, sizeof(*m));
 
     if (mmap_file(m, path) != 0) return -1;
@@ -2592,7 +2615,7 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
         }
     }
 
-    if (allocate_run_state(m, kv_type_k, kv_type_v, k_cache_hadamard, v_cache_hadamard) != 0) return -1;
+    if (allocate_run_state(m, kv_type_k, kv_type_v, k_cache_hadamard, v_cache_hadamard, n_threads) != 0) return -1;
 
     /* Repack Q4_0 tensors to Q4_0x8 for AVX2 SIMD optimization.
      * Only repack tensors where nrows % 8 == 0 and ncols % 32 == 0. */
@@ -3203,11 +3226,142 @@ static const void *get_expert_slice(const void *base, int expert,
     return (const void *)((const uint8_t *)base + expert * expert_stride);
 }
 
+/* Parallel expert worker for moe_forward: processes one expert using
+ * per-thread scratch buffers. Uses matmul_q8_seq (not matmul_q8) to
+ * avoid racing on the global n_threads variable and re-entering the
+ * thread pool from inside a tensor_parallel_for worker. */
+typedef struct {
+    const block_q8_0 *qx;       /* pre-quantized input */
+    const float *qx_d;          /* input Q8_0 deltas */
+    int dim, n_ff;
+    int *ids;                   /* expert ids [n_used] */
+    float *weights;             /* expert weights [n_used] */
+    gguf_type_t type_gate, type_up, type_down;
+    const void *gate_exps, *up_exps, *down_exps;
+    float *expert_out;          /* output [n_used * dim], each expert writes to slot i*dim */
+    run_state_t *s;
+} moe_expert_ctx;
+
+static void moe_expert_worker(int i, void *vctx) {
+    moe_expert_ctx *ctx = (moe_expert_ctx *)vctx;
+    int dim = ctx->dim, n_ff = ctx->n_ff;
+
+    int eid = ctx->ids[i];
+    float w_i = ctx->weights[i];
+
+    /* Get per-thread scratch buffer */
+    unsigned tid = tensor_get_thread_id();
+    int nt = tensor_get_n_threads();
+    if (tid >= (unsigned)nt) tid = 0;
+    char *scratch = (char *)ctx->s->moe_thread_scratch + tid * ctx->s->moe_thread_stride;
+
+    float *gate_buf = (float *)scratch;
+    float *up_buf = gate_buf + n_ff;
+    /* xb2 + acc area follows (dim * 2 floats), then Q8 buffers */
+    char *q8_ptr = (char *)(up_buf + n_ff) + (size_t)dim * 2 * sizeof(float);
+    block_q8_0 *down_qx = (block_q8_0 *)q8_ptr;
+    float *down_qx_d = (float *)((char *)down_qx + gguf_type_row_size(GGUF_TYPE_Q8_0, n_ff));
+
+    const void *gate_w = get_expert_slice(ctx->gate_exps, eid, dim, n_ff, ctx->type_gate);
+    const void *up_w = get_expert_slice(ctx->up_exps, eid, dim, n_ff, ctx->type_up);
+    const void *down_w = get_expert_slice(ctx->down_exps, eid, n_ff, dim, ctx->type_down);
+
+    /* Use matmul_q8_seq: sequential, no thread pool, safe inside tensor_parallel_for */
+    matmul_q8_seq(gate_buf, ctx->qx, ctx->qx_d, gate_w, dim, n_ff, ctx->type_gate);
+    matmul_q8_seq(up_buf, ctx->qx, ctx->qx_d, up_w, dim, n_ff, ctx->type_up);
+
+    /* SwiGLU: silu(gate) * up */
+    silu(gate_buf, n_ff);
+    elemwise_mul(gate_buf, gate_buf, up_buf, n_ff);
+
+    /* Quantize SwiGLU output for Q8xQ8 down projection */
+    {
+        size_t dnb = n_ff / 32;
+        quantize_row_q8_0(gate_buf, down_qx, n_ff);
+        for (size_t b = 0; b < dnb; b++) {
+            down_qx_d[b] = fp16_to_fp32(down_qx[b].d);
+        }
+    }
+
+    /* Down projection */
+    float *out = ctx->expert_out + (size_t)i * dim;
+    matmul_q8_seq(out, down_qx, down_qx_d, down_w, n_ff, dim, ctx->type_down);
+
+    /* Scale by expert weight */
+#ifdef PICOLM_AVX512
+    {
+        __m512 bw = _mm512_set1_ps(w_i);
+        int di = 0;
+        for (; di + 23 < dim; di += 16) {
+            __m512 v0 = _mm512_loadu_ps(out + di);
+            __m512 v1 = _mm512_loadu_ps(out + di + 8);
+            _mm512_storeu_ps(out + di, _mm512_mul_ps(bw, v0));
+            _mm512_storeu_ps(out + di + 8, _mm512_mul_ps(bw, v1));
+        }
+        for (; di + 15 < dim; di += 16) {
+            __m512 v = _mm512_loadu_ps(out + di);
+            _mm512_storeu_ps(out + di, _mm512_mul_ps(bw, v));
+        }
+        for (; di < dim; di++) out[di] *= w_i;
+    }
+#elif defined(PICOLM_AVX2)
+    {
+        __m256 bw = _mm256_set1_ps(w_i);
+        int di = 0;
+        for (; di + 19 < dim; di += 16) {
+            __m256 v0 = _mm256_loadu_ps(out + di);
+            __m256 v1 = _mm256_loadu_ps(out + di + 4);
+            __m256 v2 = _mm256_loadu_ps(out + di + 8);
+            __m256 v3 = _mm256_loadu_ps(out + di + 12);
+            _mm256_storeu_ps(out + di, _mm256_mul_ps(bw, v0));
+            _mm256_storeu_ps(out + di + 4, _mm256_mul_ps(bw, v1));
+            _mm256_storeu_ps(out + di + 8, _mm256_mul_ps(bw, v2));
+            _mm256_storeu_ps(out + di + 12, _mm256_mul_ps(bw, v3));
+        }
+        for (; di < dim; di++) out[di] *= w_i;
+    }
+#elif defined(PICOLM_AVX)
+    {
+        __m128 bw = _mm_set1_ps(w_i);
+        int di = 0;
+        for (; di + 7 < dim; di += 8) {
+            __m128 v0 = _mm_loadu_ps(out + di);
+            __m128 v1 = _mm_loadu_ps(out + di + 4);
+            _mm_storeu_ps(out + di, _mm_mul_ps(bw, v0));
+            _mm_storeu_ps(out + di + 4, _mm_mul_ps(bw, v1));
+        }
+        for (; di < dim; di++) out[di] *= w_i;
+    }
+#elif defined(PICOLM_SSE2)
+    {
+        __m128 bw = _mm_set1_ps(w_i);
+        int di = 0;
+        for (; di + 3 < dim; di += 4) {
+            __m128 v = _mm_loadu_ps(out + di);
+            _mm_storeu_ps(out + di, _mm_mul_ps(bw, v));
+        }
+        for (; di < dim; di++) out[di] *= w_i;
+    }
+#elif defined(PICOLM_NEON)
+    {
+        float32x4_t bw = vdupq_n_f32(w_i);
+        int di = 0;
+        for (; di + 3 < dim; di += 4) {
+            float32x4_t v = vld1q_f32(out + di);
+            vst1q_f32(out + di, vmulq_f32(bw, v));
+        }
+        for (; di < dim; di++) out[di] *= w_i;
+    }
+#else
+    for (int d = 0; d < dim; d++) out[d] *= w_i;
+#endif
+}
+
 /* MoE forward pass: router + top-K expert selection + SwiGLU per expert + shared expert.
  * Input: x[n_embd], Output: residual[n_embd] (additive to input) */
 /* Optimized MoE forward: pre-quantize x, Q8xQ8 dot products for gate+up,
- * AVX-512 vectorized accumulation. Sequential expert loop (parallelism
- * deferred until prefill batching is implemented). */
+ * AVX-512 vectorized accumulation. Experts processed in parallel via
+ * tensor_parallel_for for multi-threaded generation. */
 static void moe_forward(model_t *m, run_state_t *s, const float *x, float *residual,
                         const layer_weights_t *lw) {
     model_config_t *c = &m->config;
@@ -3219,6 +3373,7 @@ static void moe_forward(model_t *m, run_state_t *s, const float *x, float *resid
     int *ids = s->expert_ids;
     float *weights = s->expert_weights;
     float *moe_out = s->moe_out;
+    float *expert_out = NULL;
 
     /* 1. Router: logits = x @ ffn_gate_inp  [n_embd, n_expert] -> [n_expert] */
     matmul(logits, (float *)x, lw->ffn_gate_inp, dim, n_expert, lw->type_ffn_gate_inp);
@@ -3263,19 +3418,12 @@ static void moe_forward(model_t *m, run_state_t *s, const float *x, float *resid
         for (int i = 0; i < n_used; i++) weights[i] *= inv_wsum;
     }
 
-    /* 4. Zero accumulator */
-    memset(moe_out, 0, dim * sizeof(float));
-
     /* 5. Pre-quantize input x to Q8_0 ONCE (Phase A + D).
      * All expert gate+up projections reuse this quantized buffer via matmul_q8,
      * saving 16 redundant quantizations per MoE layer. */
     {
-        /* Disable threading for small MoE matmuls — thread pool overhead dominates */
-        int saved_threads = tensor_get_n_threads();
-        tensor_set_n_threads(1);
-
         size_t nb = dim / 32;
-        block_q8_0 *qx = s->shared_qx; /* pre-allocated, reused each layer */
+        block_q8_0 *qx = s->shared_qx;
         float *qx_d = s->shared_qx_d;
         quantize_row_q8_0(x, qx, dim);
         for (size_t bi = 0; bi < nb; bi++) {
@@ -3286,53 +3434,105 @@ static void moe_forward(model_t *m, run_state_t *s, const float *x, float *resid
         gguf_type_t type_up = lw->type_ffn_up_exps;
         gguf_type_t type_down = lw->type_ffn_down_exps;
 
-        float *hb_exp = s->hb_exp;
-        float *hb2_exp = s->hb2_exp;
-        float *xb2_exp = s->xb2;
+        /* Parallel expert dispatch: each expert runs in its own thread.
+         * matmul_q8_seq is used (not matmul_q8) to avoid racing on the
+         * global n_threads and re-entering the thread pool.
+         * Use calloc instead of alloca to avoid Windows stack overflow. */
+        expert_out = (float *)calloc((size_t)n_used * dim, sizeof(float));
+        if (!expert_out) { fprintf(stderr, "OOM: expert_out\n"); return; }
 
+        moe_expert_ctx ctx = {
+            .qx = s->shared_qx,
+            .qx_d = s->shared_qx_d,
+            .dim = dim,
+            .n_ff = n_ff,
+            .ids = ids,
+            .weights = weights,
+            .type_gate = type_gate,
+            .type_up = type_up,
+            .type_down = type_down,
+            .gate_exps = lw->ffn_gate_exps,
+            .up_exps = lw->ffn_up_exps,
+            .down_exps = lw->ffn_down_exps,
+            .expert_out = expert_out,
+            .s = s,
+        };
+
+        tensor_parallel_for(n_used, moe_expert_worker, &ctx);
+
+        /* Reduce per-expert outputs into moe_out */
+        memset(moe_out, 0, dim * sizeof(float));
         for (int i = 0; i < n_used; i++) {
-            int eid = ids[i];
-            float w_i = weights[i];
-
-            const void *gate_w = get_expert_slice(lw->ffn_gate_exps, eid, dim, n_ff, type_gate);
-            const void *up_w = get_expert_slice(lw->ffn_up_exps, eid, dim, n_ff, type_up);
-            const void *down_w = get_expert_slice(lw->ffn_down_exps, eid, n_ff, dim, type_down);
-
-            matmul_q8(hb_exp, qx, qx_d, gate_w, dim, n_ff, type_gate);
-            matmul_q8(hb2_exp, qx, qx_d, up_w, dim, n_ff, type_up);
-
-            silu(hb_exp, n_ff);
-            elemwise_mul(hb_exp, hb_exp, hb2_exp, n_ff);
-
-            /* Q8×Q8 down projection with pre-allocated quantization buffer */
-            {
-                size_t down_nb = n_ff / 32;
-                quantize_row_q8_0(hb_exp, s->down_qx, n_ff);
-                for (size_t bi = 0; bi < down_nb; bi++) {
-                    s->down_qx_d[bi] = fp16_to_fp32(s->down_qx[bi].d);
-                }
-                matmul_q8(xb2_exp, s->down_qx, s->down_qx_d, down_w, n_ff, dim, type_down);
-            }
-
+            float *eo = expert_out + (size_t)i * dim;
 #ifdef PICOLM_AVX512
             {
-                __m512 bw = _mm512_set1_ps(w_i);
                 int di = 0;
-                for (; di + 15 < dim; di += 16) {
+                for (; di + 23 < dim; di += 16) {
                     __m512 v0 = _mm512_loadu_ps(moe_out + di);
-                    __m512 v1 = _mm512_loadu_ps(xb2_exp + di);
+                    __m512 v1 = _mm512_loadu_ps(eo + di);
                     __m512 v2 = _mm512_loadu_ps(moe_out + di + 8);
-                    __m512 v3 = _mm512_loadu_ps(xb2_exp + di + 8);
-                    _mm512_storeu_ps(moe_out + di, _mm512_add_ps(v0, _mm512_mul_ps(bw, v1)));
-                    _mm512_storeu_ps(moe_out + di + 8, _mm512_add_ps(v2, _mm512_mul_ps(bw, v3)));
+                    __m512 v3 = _mm512_loadu_ps(eo + di + 8);
+                    _mm512_storeu_ps(moe_out + di, _mm512_add_ps(v0, v1));
+                    _mm512_storeu_ps(moe_out + di + 8, _mm512_add_ps(v2, v3));
                 }
-                for (; di < dim; di++) moe_out[di] += w_i * xb2_exp[di];
+                for (; di < dim; di++) moe_out[di] += eo[di];
+            }
+#elif defined(PICOLM_AVX2)
+            {
+                int di = 0;
+                for (; di + 20 < dim; di += 16) {
+                    __m256 v0 = _mm256_loadu_ps(moe_out + di);
+                    __m256 v1 = _mm256_loadu_ps(eo + di);
+                    __m256 v2 = _mm256_loadu_ps(moe_out + di + 4);
+                    __m256 v3 = _mm256_loadu_ps(eo + di + 4);
+                    __m256 v4 = _mm256_loadu_ps(moe_out + di + 8);
+                    __m256 v5 = _mm256_loadu_ps(eo + di + 8);
+                    __m256 v6 = _mm256_loadu_ps(moe_out + di + 12);
+                    __m256 v7 = _mm256_loadu_ps(eo + di + 12);
+                    _mm256_storeu_ps(moe_out + di, _mm256_add_ps(v0, v1));
+                    _mm256_storeu_ps(moe_out + di + 4, _mm256_add_ps(v2, v3));
+                    _mm256_storeu_ps(moe_out + di + 8, _mm256_add_ps(v4, v5));
+                    _mm256_storeu_ps(moe_out + di + 12, _mm256_add_ps(v6, v7));
+                }
+                for (; di < dim; di++) moe_out[di] += eo[di];
+            }
+#elif defined(PICOLM_AVX)
+            {
+                int di = 0;
+                for (; di + 7 < dim; di += 8) {
+                    __m128 v0 = _mm_loadu_ps(moe_out + di);
+                    __m128 v1 = _mm_loadu_ps(eo + di);
+                    __m128 v2 = _mm_loadu_ps(moe_out + di + 4);
+                    __m128 v3 = _mm_loadu_ps(eo + di + 4);
+                    _mm_storeu_ps(moe_out + di, _mm_add_ps(v0, v1));
+                    _mm_storeu_ps(moe_out + di + 4, _mm_add_ps(v2, v3));
+                }
+                for (; di < dim; di++) moe_out[di] += eo[di];
+            }
+#elif defined(PICOLM_SSE2)
+            {
+                int di = 0;
+                for (; di + 3 < dim; di += 4) {
+                    __m128 v0 = _mm_loadu_ps(moe_out + di);
+                    __m128 v1 = _mm_loadu_ps(eo + di);
+                    _mm_storeu_ps(moe_out + di, _mm_add_ps(v0, v1));
+                }
+                for (; di < dim; di++) moe_out[di] += eo[di];
+            }
+#elif defined(PICOLM_NEON)
+            {
+                int di = 0;
+                for (; di + 3 < dim; di += 4) {
+                    float32x4_t v0 = vld1q_f32(moe_out + di);
+                    float32x4_t v1 = vld1q_f32(eo + di);
+                    vst1q_f32(moe_out + di, vaddq_f32(v0, v1));
+                }
+                for (; di < dim; di++) moe_out[di] += eo[di];
             }
 #else
-            for (int d = 0; d < dim; d++) moe_out[d] += w_i * xb2_exp[d];
+            for (int d = 0; d < dim; d++) moe_out[d] += eo[d];
 #endif
         }
-        tensor_set_n_threads(saved_threads);
     }
 
     /* 6. Shared expert — Q8×Q8 with pre-allocated buffers */
@@ -3362,7 +3562,7 @@ static void moe_forward(model_t *m, run_state_t *s, const float *x, float *resid
     /* Shared expert sigmoid gate: sigmoid(x @ ffn_gate_inp_shexp) */
     {
         float gate_val;
-        matmul(&gate_val, (float *)x, lw->ffn_gate_inp_shexp, dim, 1, GGUF_TYPE_F32);
+        matmul(&gate_val, (float *)x, lw->ffn_gate_inp_shexp, dim, 1, lw->type_ffn_gate_inp_shexp);
         gate_val = 1.0f / (1.0f + expf(-gate_val));
         for (int d = 0; d < dim; d++) s->xb2[d] *= gate_val;
     }
@@ -3371,103 +3571,9 @@ static void moe_forward(model_t *m, run_state_t *s, const float *x, float *resid
     for (int d = 0; d < dim; d++) {
         residual[d] = moe_out[d] + s->xb2[d];
     }
+    free(expert_out);
 }
 
-/* moe_token_worker: parallel worker for moe_forward_batch.
- * Each worker processes one token through all its selected experts.
- * Uses per-thread scratch buffers from run_state_t — NO malloc.
- * Each thread writes only to residual_batch[t], no races. */
-typedef struct {
-    float *residual_batch;
-    float *qx_all;
-    int qx_d_off, q8_buf_per_token, dim, n_ff;
-    int *all_ids;
-    float *all_weights;
-    int n_used;
-    gguf_type_t type_gate, type_up, type_down;
-    const void *gate_exps, *up_exps, *down_exps;
-    run_state_t *s;
-} moe_tok_ctx;
-
-static void moe_token_worker(int t, void *vctx) {
-    moe_tok_ctx *ctx = (moe_tok_ctx *)vctx;
-    int dim = ctx->dim, n_ff = ctx->n_ff, n_used = ctx->n_used;
-
-    /* Get per-thread scratch buffer using thread pool index */
-    unsigned tid = tensor_get_thread_id();
-    if (tid >= MAX_THREADS) tid = 0;
-    char *scratch = (char *)ctx->s->moe_thread_scratch + tid * ctx->s->moe_thread_stride;
-
-    /* Layout within per-thread scratch:
-     * [gate_buf: n_ff floats] [up_buf: n_ff floats]
-     * [xb2_buf: dim floats] [acc_buf: dim floats]
-     * [down_qx: Q8_0 row of n_ff] [down_qx_d: n_ff/32 floats] */
-    float *gate_buf = (float *)scratch;
-    float *up_buf = gate_buf + n_ff;
-    float *xb2_buf = up_buf + n_ff;
-    float *acc = xb2_buf + dim;
-    char *q8_ptr = (char *)acc + dim * sizeof(float);
-    block_q8_0 *down_qx = (block_q8_0 *)q8_ptr;
-    float *down_qx_d = (float *)((char *)down_qx + gguf_type_row_size(GGUF_TYPE_Q8_0, n_ff));
-
-    float *tbuf = ctx->qx_all + t * ctx->q8_buf_per_token;
-    const block_q8_0 *qx = (const block_q8_0 *)tbuf;
-    const float *qx_d = tbuf + ctx->qx_d_off;
-
-    /* Zero accumulator */
-    memset(acc, 0, dim * sizeof(float));
-
-    /* Process all n_used experts for this token */
-    int saved_t = tensor_get_n_threads();
-    tensor_set_n_threads(1); /* matmul must be single-threaded inside parallel workers */
-    for (int ei = 0; ei < n_used; ei++) {
-        int eid = ctx->all_ids[t * n_used + ei];
-        float w_i = ctx->all_weights[t * n_used + ei];
-
-        const void *gate_w = get_expert_slice(ctx->gate_exps, eid, dim, n_ff, ctx->type_gate);
-        const void *up_w = get_expert_slice(ctx->up_exps, eid, dim, n_ff, ctx->type_up);
-        const void *down_w = get_expert_slice(ctx->down_exps, eid, n_ff, dim, ctx->type_down);
-
-        matmul_q8(gate_buf, qx, qx_d, gate_w, dim, n_ff, ctx->type_gate);
-        matmul_q8(up_buf, qx, qx_d, up_w, dim, n_ff, ctx->type_up);
-
-        silu(gate_buf, n_ff);
-        elemwise_mul(gate_buf, gate_buf, up_buf, n_ff);
-
-        /* Q8×Q8 down */
-        {
-            size_t dnb = n_ff / 32;
-            quantize_row_q8_0(gate_buf, down_qx, n_ff);
-            for (size_t b = 0; b < dnb; b++) {
-                down_qx_d[b] = fp16_to_fp32(down_qx[b].d);
-            }
-            matmul_q8(xb2_buf, down_qx, down_qx_d, down_w, n_ff, dim, ctx->type_down);
-        }
-
-        /* Weighted accumulation into local buffer */
-#ifdef PICOLM_AVX512
-        {
-            __m512 bw = _mm512_set1_ps(w_i);
-            int di = 0;
-            for (; di + 15 < dim; di += 16) {
-                __m512 v0 = _mm512_loadu_ps(acc + di);
-                __m512 v1 = _mm512_loadu_ps(xb2_buf + di);
-                __m512 v2 = _mm512_loadu_ps(acc + di + 8);
-                __m512 v3 = _mm512_loadu_ps(xb2_buf + di + 8);
-                _mm512_storeu_ps(acc + di, _mm512_add_ps(v0, _mm512_mul_ps(bw, v1)));
-                _mm512_storeu_ps(acc + di + 8, _mm512_add_ps(v2, _mm512_mul_ps(bw, v3)));
-            }
-            for (; di < dim; di++) acc[di] += w_i * xb2_buf[di];
-        }
-#else
-        for (int d = 0; d < dim; d++) acc[d] += w_i * xb2_buf[d];
-#endif
-    }
-
-    /* Write to residual_batch — each thread writes a unique token, no race */
-    memcpy(ctx->residual_batch + t * dim, acc, dim * sizeof(float));
-    tensor_set_n_threads(saved_t);
-}
 
 /* moe_forward_batch: mm_id-style batched MoE forward pass.
  *
@@ -3525,17 +3631,37 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
 
     /* Allocate or grow if needed */
     if (!mm_gate_out || s->mm_gateup_alloc < gateup_sz) {
+#ifdef _WIN32
+        _aligned_free(mm_gate_out);
+        _aligned_free(mm_up_out);
+        _aligned_free(mm_down_out);
+#else
         free(mm_gate_out);
         free(mm_up_out);
         free(mm_down_out);
+#endif
+#ifdef _WIN32
+        s->mm_gate_out = mm_gate_out = (float *)_aligned_malloc(gateup_sz + 4095, 64);
+        s->mm_up_out = mm_up_out = (float *)_aligned_malloc(gateup_sz + 4095, 64);
+        s->mm_down_out = mm_down_out = (float *)_aligned_malloc(down_sz + 4095, 64);
+#else
         s->mm_gate_out = mm_gate_out = (float *)aligned_alloc(64, gateup_sz + 4095);
         s->mm_up_out = mm_up_out = (float *)aligned_alloc(64, gateup_sz + 4095);
         s->mm_down_out = mm_down_out = (float *)aligned_alloc(64, down_sz + 4095);
+#endif
         s->mm_gateup_alloc = gateup_sz;
         s->mm_down_alloc = down_sz;
     } else if (s->mm_down_alloc < down_sz) {
+#ifdef _WIN32
+        _aligned_free(mm_down_out);
+#else
         free(mm_down_out);
+#endif
+#ifdef _WIN32
+        s->mm_down_out = mm_down_out = (float *)_aligned_malloc(down_sz + 4095, 64);
+#else
         s->mm_down_out = mm_down_out = (float *)aligned_alloc(64, down_sz + 4095);
+#endif
         s->mm_down_alloc = down_sz;
     }
 
@@ -3548,7 +3674,7 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
 
     /* ---- Phase 1: Route all tokens ---- */
     {
-        int *idx = alloca(n_expert * sizeof(int));
+        int *idx = (int *)malloc(n_expert * sizeof(int));
 
         /* Batched router: all tokens through ffn_gate_inp in one matmul_batch */
         {
@@ -3586,6 +3712,7 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
             n_experts_per_token[t] = n_used;
             }
         }
+        free(idx);
     }
 
     /* ---- Phase 2: Quantize all token inputs to Q8_0 (pre-allocated) ---- */
@@ -3618,9 +3745,6 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
     }
 
     /* ---- Phase 3: mm_id gate+up projections ---- */
-    /* Enable multi-threading for expert dispatch: each expert task is
-     * self-contained (no nested matmul calls), so tensor_parallel_for
-     * across 256 experts benefits from parallelism. */
     {
         tensor_set_n_threads(saved_threads);
         gguf_type_t type = lw->type_ffn_gate_exps;
@@ -3643,7 +3767,6 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
             }
         }
     }
-
     /* ---- Phase 5: mm_id down projections ---- */
     {
         tensor_set_n_threads(saved_threads);
@@ -3656,7 +3779,6 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
             s->mm_down_qx_all, s->mm_down_qx_d_all, down_q8_per_token);
         tensor_set_n_threads(1);
     }
-
     /* ---- Phase 6: Weighted accumulation in Top-K order ---- */
     {
         for (int t = 0; t < n_tokens; t++) {
@@ -3671,7 +3793,7 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
                 {
                     __m512 bw = _mm512_set1_ps(w_i);
                     int di = 0;
-                    for (; di + 15 < dim; di += 16) {
+                    for (; di + 23 < dim; di += 16) {
                         __m512 v0 = _mm512_loadu_ps(out + di);
                         __m512 v1 = _mm512_loadu_ps(expert_out + di);
                         __m512 v2 = _mm512_loadu_ps(out + di + 8);
@@ -3680,6 +3802,43 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
                             _mm512_add_ps(v0, _mm512_mul_ps(bw, v1)));
                         _mm512_storeu_ps(out + di + 8,
                             _mm512_add_ps(v2, _mm512_mul_ps(bw, v3)));
+                    }
+                    for (; di < dim; di++)
+                        out[di] += w_i * expert_out[di];
+                }
+#elif defined(PICOLM_AVX2)
+                {
+                    __m256 bw = _mm256_set1_ps(w_i);
+                    int di = 0;
+                    for (; di + 20 < dim; di += 16) {
+                        __m256 v0 = _mm256_loadu_ps(out + di);
+                        __m256 v1 = _mm256_loadu_ps(expert_out + di);
+                        __m256 v2 = _mm256_loadu_ps(out + di + 4);
+                        __m256 v3 = _mm256_loadu_ps(expert_out + di + 4);
+                        __m256 v4 = _mm256_loadu_ps(out + di + 8);
+                        __m256 v5 = _mm256_loadu_ps(expert_out + di + 8);
+                        __m256 v6 = _mm256_loadu_ps(out + di + 12);
+                        __m256 v7 = _mm256_loadu_ps(expert_out + di + 12);
+                        _mm256_storeu_ps(out + di,
+                            _mm256_add_ps(v0, _mm256_mul_ps(bw, v1)));
+                        _mm256_storeu_ps(out + di + 4,
+                            _mm256_add_ps(v2, _mm256_mul_ps(bw, v3)));
+                        _mm256_storeu_ps(out + di + 8,
+                            _mm256_add_ps(v4, _mm256_mul_ps(bw, v5)));
+                        _mm256_storeu_ps(out + di + 12,
+                            _mm256_add_ps(v6, _mm256_mul_ps(bw, v7)));
+                    }
+                    for (; di < dim; di++)
+                        out[di] += w_i * expert_out[di];
+                }
+#elif defined(PICOLM_NEON)
+                {
+                    float32x4_t bw = vdupq_n_f32(w_i);
+                    int di = 0;
+                    for (; di + 3 < dim; di += 4) {
+                        float32x4_t v0 = vld1q_f32(out + di);
+                        float32x4_t v1 = vld1q_f32(expert_out + di);
+                        vst1q_f32(out + di, vaddq_f32(v0, vmulq_f32(bw, v1)));
                     }
                     for (; di < dim; di++)
                         out[di] += w_i * expert_out[di];
@@ -3718,11 +3877,11 @@ static void moe_forward_batch(model_t *m, run_state_t *s,
                     s->shared_down_qx_d[bi] = fp16_to_fp32(s->shared_down_qx[bi].d);
                 }
                 matmul_q8(s->xb2, s->shared_down_qx, s->shared_down_qx_d, lw->ffn_down_shexp, sh_ff, dim, lw->type_ffn_down_shexp);
-            }
+                }
 
             {
                 float gate_val;
-                matmul(&gate_val, x_batch + t * dim, lw->ffn_gate_inp_shexp, dim, 1, GGUF_TYPE_F32);
+                matmul(&gate_val, x_batch + t * dim, lw->ffn_gate_inp_shexp, dim, 1, lw->type_ffn_gate_inp_shexp);
                 gate_val = 1.0f / (1.0f + expf(-gate_val));
                 for (int d = 0; d < dim; d++) s->xb2[d] *= gate_val;
             }
@@ -3743,7 +3902,6 @@ float *model_forward(model_t *m, int token, int pos) {
     if (m->config.is_gemma3n) {
         return model_forward_gemma3n(m, token, pos);
     }
-
     model_config_t *c = &m->config;
     model_weights_t *w = &m->weights;
     run_state_t *s = &m->state;
@@ -3897,7 +4055,6 @@ float *model_forward(model_t *m, int token, int pos) {
             BENCH_LAYER_END(l, 0);
             continue;
         }
-
         /* ---- Attention ---- */
         rmsnorm(s->xb, s->x, s->attn_norm_w[l], dim, c->rms_norm_eps);
 
@@ -4286,7 +4443,6 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
     }
     if (pos == 0 && getenv("PICOLM_DBG")) {
         double em = 0; for(int i=0;i<dim;i++){double v=s->x[i]; em+=v*v;}
-        fprintf(stderr, "DBG embd_rms=%.4f (expected %.2f)\n", sqrt(em/dim), sqrtf((float)dim));
     }
 
     /* 2. Build per-layer inputs: [n_embd_altup, n_layer]
@@ -4359,7 +4515,6 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
             for (int i = 0; i < dim; i++) dst[i] *= target_mag;
         }
         if (pos == 0 && getenv("PICOLM_DBG")) {
-            fprintf(stderr, "DBG altup_mags={");
             for(int a=0;a<n_altup;a++){
                 double m=0; for(int i=0;i<dim;i++){double v=s->gemma3n_altup_state[a*dim+i]; m+=v*v;}
                 fprintf(stderr,"%.1f%s",sqrt(m/dim),a<n_altup-1?",":"");
@@ -4585,7 +4740,6 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
 
         if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
             double am = 0; for(int i=0;i<dim;i++){double v=s->xb2[i]; am+=v*v;}
-            fprintf(stderr, "DBG attn_proj_rms=%.3f [0:5]={", sqrt(am/dim));
             for(int i=0;i<5;i++) fprintf(stderr,"%.4f%s",s->xb2[i],i<4?",":"");
             fprintf(stderr, "}\n");
         }
@@ -4795,7 +4949,6 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
 
     if (pos == 0 && getenv("PICOLM_DBG")) {
         double om = 0; for(int i=0;i<dim;i++){double v=s->x[i]; om+=v*v;}
-        fprintf(stderr, "DBG hidden_rms=%.4f [0:5]={", sqrt(om/dim));
         for(int i=0;i<5;i++) fprintf(stderr,"%.4f%s",s->x[i],i<4?",":"");
         fprintf(stderr, "}\n");
     }
@@ -4820,7 +4973,6 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
 #ifdef DEBUG_SSM
 static void dbg_vec(const char *tag, float *v, int n, int max_print) {
     int p = n < max_print ? n : max_print;
-    fprintf(stderr, "DBG %s: ", tag);
     for (int i = 0; i < p; i++) fprintf(stderr, "%.6f ", v[i]);
     fprintf(stderr, "\n");
 }
@@ -6599,12 +6751,13 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
 #endif
     /* If GGUF reorders v-head rows, convert xb2 from GGUF order to sequential order */
     if (do_remap) {
-        float *xb2_tmp = alloca(c->ssm_d_inner * sizeof(float));
+        float *xb2_tmp = (float *)malloc(c->ssm_d_inner * sizeof(float));
         memcpy(xb2_tmp, s->xb2, c->ssm_d_inner * sizeof(float));
         for (int h = 0; h < n_v_heads; h++) {
             int gh = qwen35_vhead_gguf(h, n_vpk, n_k);
             memcpy(s->xb2 + h * head_v_dim, xb2_tmp + gh * head_v_dim, head_v_dim * sizeof(float));
         }
+        free(xb2_tmp);
         if (il == 0 && pos == 0) {
             }
     }
@@ -6651,12 +6804,13 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
 
     /* If GGUF reorders V channels, convert v_conv from GGUF order to sequential order */
     if (do_remap) {
-        float *v_conv_tmp = alloca(c->ssm_d_inner * sizeof(float));
+        float *v_conv_tmp = (float *)malloc(c->ssm_d_inner * sizeof(float));
         memcpy(v_conv_tmp, v_conv, c->ssm_d_inner * sizeof(float));
         for (int h = 0; h < n_v_heads; h++) {
             int gh = qwen35_vhead_gguf(h, n_vpk, n_k);
             memcpy(v_conv + h * head_v_dim, v_conv_tmp + gh * head_v_dim, head_v_dim * sizeof(float));
         }
+        free(v_conv_tmp);
     }
 
     /* 7. L2 normalize Q and K per k_head */
@@ -6861,12 +7015,13 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     /* final_output is [head_v_dim * n_v_heads] = [value_dim] = [4096] */
     /* ssm_out: [n_embd, value_dim] - GGUF columns may be reordered */
     if (do_remap) {
-        float *fo_gguf = alloca(c->ssm_d_inner * sizeof(float));
+        float *fo_gguf = (float *)malloc(c->ssm_d_inner * sizeof(float));
         for (int h = 0; h < n_v_heads; h++) {
             int gh = qwen35_vhead_gguf(h, n_vpk, n_k);
             memcpy(fo_gguf + gh * head_v_dim, final_output + h * head_v_dim, head_v_dim * sizeof(float));
         }
         matmul(residual, fo_gguf, lw->ssm_out, c->ssm_d_inner, dim, lw->type_ssm_out);
+        free(fo_gguf);
     } else {
         matmul(residual, final_output, lw->ssm_out, c->ssm_d_inner, dim, lw->type_ssm_out);
     }
@@ -6936,18 +7091,26 @@ void model_free(model_t *m) {
     }
 
     /* Free on-demand mm_id buffers */
+#ifdef _WIN32
+    if (m->state.mm_gate_out) { _aligned_free(m->state.mm_gate_out); m->state.mm_gate_out = NULL; }
+    if (m->state.mm_up_out)   { _aligned_free(m->state.mm_up_out);   m->state.mm_up_out = NULL; }
+    if (m->state.mm_down_out) { _aligned_free(m->state.mm_down_out); m->state.mm_down_out = NULL; }
+#else
     if (m->state.mm_gate_out) { free(m->state.mm_gate_out); m->state.mm_gate_out = NULL; }
     if (m->state.mm_up_out)   { free(m->state.mm_up_out);   m->state.mm_up_out = NULL; }
     if (m->state.mm_down_out) { free(m->state.mm_down_out); m->state.mm_down_out = NULL; }
+#endif
     m->state.mm_gateup_alloc = 0;
     m->state.mm_down_alloc = 0;
 
     if (m->state.mem_block) {
+        /* mem_block and kv_block are contiguously allocated; release */
+#ifdef _WIN32
         free(m->state.mem_block);
+#else
+        munmap(m->state.mem_block, m->state.mem_size);
+#endif
         m->state.mem_block = NULL;
-    }
-    if (m->state.kv_block) {
-        free(m->state.kv_block);
         m->state.kv_block = NULL;
     }
     /* Unmap all split files */
@@ -7886,6 +8049,18 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
         tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->attn_qkv, m->gpu.device);
     }
 #endif
+    if (l <= 1 && n_tokens > 0) {
+        float vd = vec_dot(lw->attn_qkv, ssm_xb, dim, lw->type_attn_qkv);
+        /* Check activation values */
+        float amax = 0, amin = 0;
+        int isnan_cnt = 0;
+        for (int j = 0; j < dim; j++) {
+            float ax = ssm_xb[j];
+            if (isnan(ax)) { isnan_cnt++; continue; }
+            if (ax > amax) amax = ax;
+            if (ax < amin) amin = ax;
+        }
+        }
     matmul_batch(qkv_batch, ssm_xb, n_tokens, lw->attn_qkv, dim, conv_dim, lw->type_attn_qkv);
     tensor_set_repacked(NULL);
 #ifdef PICOLM_GPU
@@ -8299,7 +8474,8 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
     int gpu_ok = m->gpu.active;
     int gpu_dev = m->gpu.device;
 #endif
-    for (int slot = 0; slot < c->n_layers; slot++) {
+    int n_active_layers = c->n_layers - c->n_mtp_layers;
+    for (int slot = 0; slot < n_active_layers; slot++) {
         /* Check for client disconnect interrupt */
         if (interrupt && *interrupt) {
             free(buf);

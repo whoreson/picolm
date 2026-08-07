@@ -756,7 +756,7 @@ static int server_init(const char *model_path, int num_threads, int do_prefault,
     fprintf(stderr, "[server] Loading model: %s\n", model_path);
     fp16_table_init();
 
-    if (model_load(&srv.model, model_path, context_override, kv_type_k, kv_type_v, k_cache_hadamard, v_cache_hadamard) != 0) {
+    if (model_load(&srv.model, model_path, context_override, kv_type_k, kv_type_v, k_cache_hadamard, v_cache_hadamard, num_threads) != 0) {
         fprintf(stderr, "[server] Failed to load model\n");
         return -1;
     }
@@ -1769,8 +1769,9 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
 
     if (start_pos == 0) {
         srv.kv_pos = 0;
-        /* Clear checkpoints on full reprocess - conversation has reset */
+        /* Clear checkpoints and reset SSM state on full reprocess */
         checkpoint_clear();
+        model_ssm_state_reset(model);
     }
 
     /* Save prompt tokens for next request */
@@ -2390,8 +2391,9 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
 
     if (start_pos == 0) {
         srv.kv_pos = 0;
-        /* Clear checkpoints on full reprocess */
+        /* Clear checkpoints and reset SSM state on full reprocess */
         checkpoint_clear();
+        model_ssm_state_reset(model);
     }
 
     /* Save prompt tokens for next request */

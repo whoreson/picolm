@@ -660,9 +660,9 @@ int main(int argc, char **argv) {
     }
     int load_ok = 0;
     if (is_safetensors) {
-        load_ok = (model_load_safetensors(&model, model_path, context_override, kv_type_k, kv_type_v, k_cache_hadamard, v_cache_hadamard) == 0);
+        load_ok = (model_load_safetensors(&model, model_path, context_override, kv_type_k, kv_type_v, k_cache_hadamard, v_cache_hadamard, num_threads) == 0);
     } else {
-        load_ok = (model_load(&model, model_path, context_override, kv_type_k, kv_type_v, k_cache_hadamard, v_cache_hadamard) == 0);
+        load_ok = (model_load(&model, model_path, context_override, kv_type_k, kv_type_v, k_cache_hadamard, v_cache_hadamard, num_threads) == 0);
     }
     if (!load_ok) {
         fprintf(stderr, "Failed to load model\n");
@@ -896,7 +896,8 @@ int main(int argc, char **argv) {
                     grammar_advance(&grammar, &tokenizer, next);
                     token = next;
                     bench.gen_tokens++;
-                    logits = model_forward(&model, token, pos + 1);
+                    pos++;
+                    logits = model_forward(&model, token, pos);
                 }
             }
 
@@ -950,23 +951,7 @@ int main(int argc, char **argv) {
             t_first_token = get_time_ms();
         }
 
-        /* Debug: print top-3 logits on first generation step */
-        static int dbg_printed = 0;
-        if (!dbg_printed++ && getenv("PICOLM_DBG_LOGITS")) {
-            int top3[3] = {0,0,0}; float topv[3] = {-1e30f,-1e30f,-1e30f};
-            for (int i = 0; i < model.config.vocab_size; i++) {
-                for (int j = 0; j < 3; j++) {
-                    if (logits[i] > topv[j]) {
-                        for (int k = 2; k > j; k--) { topv[k]=topv[k-1]; top3[k]=top3[k-1]; }
-                        topv[j]=logits[i]; top3[j]=i; break;
-                    }
-                }
-            }
-            fprintf(stderr, "[LOGITS] top3: ");
-            for (int j = 0; j < 3; j++) fprintf(stderr, "(%d:%.2f) ", top3[j], (double)topv[j]);
-            fprintf(stderr, "\n");
-        }
-        grammar_apply(&grammar, logits, model.config.vocab_size);
+                grammar_apply(&grammar, logits, model.config.vocab_size);
         next = sampler_sample(&sampler, logits, model.config.vocab_size);
 
         /* Update grammar state with the generated token */

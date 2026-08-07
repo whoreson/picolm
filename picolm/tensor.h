@@ -56,6 +56,8 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
  * qx = pre-quantized input (block_q8_0 array), qx_d = pre-converted deltas. */
 extern void matmul_q8(float *out, const void *qx, const float *qx_d,
                       const void *W, int n, int d, gguf_type_t qtype);
+extern void matmul_q8_seq(float *out, const void *qx, const float *qx_d,
+                      const void *W, int n, int d, gguf_type_t qtype);
 
 /* matmul_q8_batch: batched Q8×Q8 with pre-quantized activations.
  * qx_all: [n_batch * q8_buf_per_token] float array with Q8_0 blocks + deltas.
