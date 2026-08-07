@@ -368,7 +368,7 @@ int main(int argc, char **argv) {
     int    checkpoint_max = 0;          /* 0=disabled */
     int    checkpoint_interval = 256;
     int    checkpoint_interval_gen = 64;
-    int    checkpoint_tail_offset = 5;
+    int    checkpoint_tail_offset = 1;  /* 1: ensures checkpoint at n_prompt-1 for stepback */
     char  *slot_save_path = NULL;  /* --slot-save-path */
 #ifdef PICOLM_VIZ
     /* Visualization options */

@@ -301,7 +301,7 @@ static struct _server_state {
     int max_checkpoints;                  /* --checkpoint-max (default: 0=disabled) */
     int checkpoint_interval;              /* --checkpoint-every-nt (default: 256) */
     int checkpoint_interval_gen;          /* --checkpoint-every-nt-gen (default: 64) */
-    int checkpoint_tail_offset;           /* --checkpoint-tail-offset (default: 5) */
+    int checkpoint_tail_offset;           /* --checkpoint-tail-offset (default: 1) */
     size_t checkpoint_snapshot_size;      /* cached snapshot size from model */
     uint8_t *checkpoint_scratch;          /* pre-allocated buffer for save/restore */
 
@@ -674,20 +674,11 @@ static float *prefill_with_checkpoints(SOCKET sock, model_t *model,
     }
 
     /* SSM model with checkpointing enabled: split into chunks */
+    /* Always use chunked path for SSM models with checkpointing, even for short
+     * prompts. This ensures a tail checkpoint is created at n_prompt-1, which
+     * cache_adjust_stepback() needs when the prompt is fully cached on retry. */
     int tail_pos = start_pos + n_prefill - srv.checkpoint_tail_offset;
-    if (tail_pos < start_pos) tail_pos = start_pos + n_prefill; /* short prompt */
-    if (tail_pos < start_pos + srv.checkpoint_interval) {
-        /* Prompt too short for both tail and interval: single batch */
-        logits = model_forward_prefill(model, tokens, n_prefill, start_pos,
-                                       client_check ? &interrupt : NULL);
-        if (!logits) {
-            *out_n_processed = n_processed;
-            return NULL;
-        }
-        n_processed = start_pos + n_prefill;
-        *out_n_processed = n_processed;
-        return logits;
-    }
+    if (tail_pos < start_pos) tail_pos = start_pos; /* clamp: tail at first token */
 
     int offset = 0;
     while (offset < n_prefill) {
@@ -1833,11 +1824,6 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             return;
         }
 
-        /* End-of-prompt checkpoint (always, for SSM models) */
-        if (srv.max_checkpoints > 0 && model->config.has_ssm) {
-            checkpoint_save(n_processed);
-        }
-
         double t_prefill_end = get_time_ms();
         fprintf(stderr, "[server] %.1fms: prefill done (%.1fms)\n", get_time_ms() - t0, t_prefill_end - t_start);
         fprintf(stderr, "[server] %.1fms: starting generation (%d threads)\n", get_time_ms() - t0, tensor_get_threads());
@@ -2058,11 +2044,6 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
                 free(chat_prompt); free(raw_prompt_copy); free(model_name); free(ptokens);
                 for (int _si = 0; _si < n_stop_words; _si++) free(stop_words[_si]);
                 return;
-            }
-
-            /* End-of-prompt checkpoint */
-            if (srv.max_checkpoints > 0 && model->config.has_ssm) {
-                checkpoint_save(n_processed_ns);
             }
 
             if (gen_count_ns == 0) t_prefill_end_ns = get_time_ms();
@@ -2486,11 +2467,6 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         t_prefill_end = get_time_ms();
         fprintf(stderr, "[server] %.1fms: prefill done (%.1fms, %d/%d tokens)\n", get_time_ms() - t0, t_prefill_end - t_start, n_processed, n_prompt);
 
-        /* End-of-prompt checkpoint */
-        if (srv.max_checkpoints > 0 && model->config.has_ssm) {
-            checkpoint_save(n_processed);
-        }
-
         /* Save cache: only the tokens actually processed */
         if (n_processed > srv.max_last_prompt) {
             srv.max_last_prompt = n_processed * 2;
@@ -2686,11 +2662,6 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
 
         t_prefill_end_ns = get_time_ms();
         fprintf(stderr, "[server] %.1fms: prefill done (%.1fms, %d/%d tokens)\n", get_time_ms() - t0, t_prefill_end_ns - t_start, n_processed_ns2, n_prompt);
-
-        /* End-of-prompt checkpoint */
-        if (srv.max_checkpoints > 0 && model->config.has_ssm) {
-            checkpoint_save(n_processed_ns2);
-        }
 
         /* Save cache: only the tokens actually processed */
         if (n_processed_ns2 > srv.max_last_prompt) {
