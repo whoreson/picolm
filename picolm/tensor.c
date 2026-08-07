@@ -1477,14 +1477,14 @@ void matmul_q8(float *out, const void *qx, const float *qx_d,
         }
         return;
     }
-    /* For non-Q8_0 types, dequantize Q8_0 activation to float, then use vec_dot */
+    /* For non-Q8_0 types, dequantize Q8_0 activation to float, then use vec_dot.
+     * Threaded dispatch is not supported for non-Q8_0 weights (matmul_worker_f
+     * has no non-batched float-activation fallback); always use single-threaded. */
     {
         float *xf = (float *)malloc((size_t)n * sizeof(float));
         dequantize_row_q8_0(qx, xf, n);
-        if (n_threads <= 1 || d < 4 || d < matmul_min_rows) {
-            for (int i = 0; i < d; i++) {
-                out[i] = vec_dot(wptr + (size_t)i * row_bytes, xf, n, qtype);
-            }
+        for (int i = 0; i < d; i++) {
+            out[i] = vec_dot(wptr + (size_t)i * row_bytes, xf, n, qtype);
         }
         free(xf);
     }
@@ -1887,6 +1887,7 @@ static void mm_id_gate_expert_task(int idx, void *ctxp) {
         }
     }
     } /* end if (c->type == GGUF_TYPE_Q8_0) */
+    if (c->type == GGUF_TYPE_Q8_0) return;
     scalar_gateup:
     /* For non-Q8_0 weights, dequantize each row to float once, then
      * compute dot products with Q8_0 activations. This is slower than
