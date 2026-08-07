@@ -1890,24 +1890,52 @@ static void mm_id_gate_expert_task(int idx, void *ctxp) {
     if (c->type == GGUF_TYPE_Q8_0) return;
     scalar_gateup:
     /* For non-Q8_0 weights, dequantize each row to float once, then
-     * compute dot products with Q8_0 activations. This is slower than
-     * the block-interleaved Q8_0 path but handles all weight types. */
+     * compute dot products with Q8_0 activations. AVX-512 batch4 path
+     * keeps the weight row resident while processing 4 tokens at a time. */
     float *wrow_f = (float *)malloc(c->dim * sizeof(float));
     if (!wrow_f) { fprintf(stderr, "OOM: scalar_gateup\n"); exit(1); }
 
+    int n_batch4 = (n_assigned / 4) * 4;
     for (int row = 0; row < c->n_ff; row++) {
         const char *gw = gate_exp + row * c->row_bytes;
         const char *uw = up_exp + row * c->row_bytes;
 
         dequantize_row(gw, wrow_f, c->dim, c->type);
-        for (int a = 0; a < n_assigned; a++) {
+        for (int a = 0; a < n_batch4; a += 4) {
+            float fout[4];
+            const float *tb[4];
+            for (int k = 0; k < 4; k++)
+                tb[k] = c->qx_all + assigned[a + k] * c->q8_buf_per_token;
+            vec_dot_q8_0_f32_batch4(tb[0], tb[1], tb[2], tb[3], wrow_f, c->dim,
+                                    &fout[0], &fout[1], &fout[2], &fout[3]);
+            for (int k = 0; k < 4; k++) {
+                size_t idx = (size_t)assigned[a + k] * c->n_used * c->n_ff
+                           + (size_t)slots[a + k] * c->n_ff + row;
+                c->gate_out[idx] = fout[k];
+            }
+        }
+        for (int a = n_batch4; a < n_assigned; a++) {
             int t = assigned[a];
             const float *tbuf = c->qx_all + t * c->q8_buf_per_token;
             size_t idx = (size_t)t * c->n_used * c->n_ff + (size_t)slots[a] * c->n_ff + row;
             c->gate_out[idx] = vec_dot_q8_0_f32(tbuf, wrow_f, c->dim);
         }
+
         dequantize_row(uw, wrow_f, c->dim, c->type);
-        for (int a = 0; a < n_assigned; a++) {
+        for (int a = 0; a < n_batch4; a += 4) {
+            float fout[4];
+            const float *tb[4];
+            for (int k = 0; k < 4; k++)
+                tb[k] = c->qx_all + assigned[a + k] * c->q8_buf_per_token;
+            vec_dot_q8_0_f32_batch4(tb[0], tb[1], tb[2], tb[3], wrow_f, c->dim,
+                                    &fout[0], &fout[1], &fout[2], &fout[3]);
+            for (int k = 0; k < 4; k++) {
+                size_t idx = (size_t)assigned[a + k] * c->n_used * c->n_ff
+                           + (size_t)slots[a + k] * c->n_ff + row;
+                c->up_out[idx] = fout[k];
+            }
+        }
+        for (int a = n_batch4; a < n_assigned; a++) {
             int t = assigned[a];
             const float *tbuf = c->qx_all + t * c->q8_buf_per_token;
             size_t idx = (size_t)t * c->n_used * c->n_ff + (size_t)slots[a] * c->n_ff + row;

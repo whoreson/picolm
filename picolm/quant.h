@@ -566,6 +566,9 @@ float vec_dot_q6_K_f32(const void *src, const float *x, int n);
 float vec_dot_q6_K_q8_K(const void *src_q6, const void *src_q8, int n);
 float vec_dot_f32_f32(const void *src, const float *x, int n);
 float vec_dot_q8_0_f32(const void *src, const float *x, int n);
+void vec_dot_q8_0_f32_batch4(const void *qx0, const void *qx1, const void *qx2, const void *qx3,
+                              const float *w, int n,
+                              float *out0, float *out1, float *out2, float *out3);
 float vec_dot_q4_0_f32(const void *src, const float *x, int n);
 float vec_dot_q4_1_f32(const void *src, const float *x, int n);
 /* fp16-fp32 dot product: sum of fp16_to_fp32(k[i]) * x[i] */
