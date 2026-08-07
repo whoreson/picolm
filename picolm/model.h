@@ -77,6 +77,12 @@ typedef struct {
     int n_embd_altup;         /* per-layer input dimension (n_embd_altup = 256) */
     int n_layer_kv_from_start;/* number of layers with KV cache from start */
     float f_final_logit_softcapping; /* final logit soft-capping (0=disabled) */
+    int n_layer_sparsity;     /* number of layers using activation sparsity (Gemma-3n) */
+    float f_sparsity_std_mul; /* sparsity std multiplier (Gemma-3n) */
+    int n_swa;                /* sliding window attention size (0=disabled) */
+    int swa_period;           /* SWA pattern period (e.g. 5 for Gemma-3n) */
+    float rope_freq_base_swa; /* RoPE freq base for SWA layers */
+    float f_attention_scale;  /* attention scale factor (1.0 for Gemma-3n, 0=default) */
 } model_config_t;
 
 /* ---- GPU-resident weight handles (compiled in only with PICOLM_GPU) ---- */

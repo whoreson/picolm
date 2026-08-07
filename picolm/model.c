@@ -939,6 +939,18 @@ static int parse_gguf(model_t *m, int max_seq_len) {
     cfg->rope_dim = 0;   /* 0 = use head_dim (default) */
     cfg->max_seq_len = 2048;
     cfg->weight_type = GGUF_TYPE_F16;
+    cfg->n_layer_sparsity = 0;
+    cfg->f_sparsity_std_mul = 0.0f;
+    cfg->n_swa = 0;
+    cfg->swa_period = 0;
+    cfg->rope_freq_base_swa = 10000.0f;
+    cfg->f_attention_scale = 0.0f;  /* 0 = use 1/sqrt(head_dim) default */
+    cfg->n_altup = 0;
+    cfg->i_altup_act = -1;
+    cfg->n_embd_altup = 0;
+    cfg->n_layer_kv_from_start = -1;
+    cfg->f_final_logit_softcapping = 0.0f;
+    cfg->laurel_rank = 0;
     m->tok_bos_id = 1;
     m->tok_eos_id = 2;
     m->tok_add_bos = 1;
@@ -1085,12 +1097,24 @@ static int parse_gguf(model_t *m, int max_seq_len) {
         } else if (str_eq(key, "gemma3n.embedding_length_per_layer_input")) {
             int dummy; cfg->n_embd_altup = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "gemma3n.attention.shared_kv_layers")) {
-            /* shared_kv_layers is f32 in GGUF but represents an integer count */
+            /* shared_kv_layers is f32 in GGUF but represents an integer count.
+             * Value is the number of layers from the END that share KV.
+             * n_layer_kv_from_start = n_layers - shared_kv_layers */
             if (vtype == GGUF_META_FLOAT32) {
-                cfg->n_layer_kv_from_start = (int)read_f32(&r);
+                cfg->n_layer_kv_from_start = cfg->n_layers - (int)read_f32(&r);
             } else {
                 int dummy; skip_meta_value(&r, vtype, &dummy);
             }
+        } else if (str_eq(key, "gemma3n.attention.sliding_window")) {
+            int dummy; cfg->n_swa = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "gemma3n.attention.sliding_window_pattern")) {
+            /* ARRAY of bool (elem_type=8): [true, true, true, true, false, ...]
+             * We read the pattern period from the array length.
+             * The pattern repeats with period = array_length / (count of true+false).
+             * Actually, the pattern is just a per-layer boolean array.
+             * We store it in a bitfield in layer_type or a separate array.
+             * For now, just skip it - we'll derive swa_pattern from swa_period. */
+            int dummy; skip_meta_value(&r, vtype, &dummy);
         }
         /* MoE specific config (qwen35moe) */
         else if (str_eq(key, "qwen35moe.expert_count")) {
@@ -1274,6 +1298,16 @@ static int parse_gguf(model_t *m, int max_seq_len) {
         if (cfg->n_embd_altup <= 0) cfg->n_embd_altup = 256;
         if (cfg->n_layer_kv_from_start < 0) cfg->n_layer_kv_from_start = cfg->n_layers;
         if (cfg->f_final_logit_softcapping <= 0) cfg->f_final_logit_softcapping = 30.0f;
+        /* Gemma-3n uses NeoX-style RoPE (split halves), not Llama pairwise */
+        cfg->rope_type = 1;
+        /* Attention scale: 1.0 (no 1/sqrt(head_dim) scaling, QK-norm handles it) */
+        cfg->f_attention_scale = 1.0f;
+        /* Activation sparsity: first 10 layers use gaussian_topk */
+        cfg->n_layer_sparsity = 10;
+        cfg->f_sparsity_std_mul = 1.6448533535003662f;
+        /* SWA: period 5, window 512. SWA layers use freq_base=10000 */
+        cfg->swa_period = 5;
+        cfg->rope_freq_base_swa = 10000.0f;
     }
 
     /* ---- Parse tensor info entries (split-aware) ---- */
@@ -2766,7 +2800,7 @@ static void attn_core(
         int kv_type_k, int kv_type_v,
         size_t kv_row_size_k, size_t kv_row_size_v,
         size_t kv_head_stride_k, size_t kv_head_stride_v,
-        int head_dim) {
+        int head_dim, float attn_scale) {
     float max_score = -1e30f, sum_exp = 0.0f;
     float acc[256];
     memset(acc, 0, (size_t)head_dim * sizeof(float));
@@ -2794,7 +2828,7 @@ static void attn_core(
             score = vec_dot_tq4_f32(kt, qh, head_dim);
         }
         else score = vec_dot_f16_f32(kt, qh, head_dim);
-        score /= sqrtf((float)head_dim);
+        score *= attn_scale;
         const uint8_t *vt = vcache + (size_t)t * kv_row_size_v + kv_h * kv_head_stride_v;
         if (score > max_score) {
             float correction = expf(max_score - score);
@@ -2878,6 +2912,7 @@ typedef struct {
     float *xb;        /* [n_heads][head_dim] */
     int kv_hadamard_k, kv_hadamard_v;
     int kv_hadamard_size;
+    float attn_scale;  /* scale factor for QK scores (default 1/sqrt(head_dim)) */
 } attn_group_ctx_t;
 
 static void attention_group(int kv_head_idx, void *ctx_ptr) {
@@ -3058,7 +3093,7 @@ static void attention_group(int kv_head_idx, void *ctx_ptr) {
                 for (; d < head_dim; d++)
                     score += k_f32[d] * qg[d];
             }
-            score /= sqrtf((float)head_dim);
+            score *= ctx->attn_scale;
 
             float *accg = acc[g];
 
@@ -3108,7 +3143,7 @@ static void attention_group(int kv_head_idx, void *ctx_ptr) {
                 score = vec_dot_tq4_f32(kt, qg, head_dim);
             }
             else score = vec_dot_f16_f32(kt, qg, head_dim);
-            score /= sqrtf((float)head_dim);
+            score *= ctx->attn_scale;
 
             float *accg = acc[g];
             if (score > max_score[g]) {
@@ -4267,7 +4302,10 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
         dequantize_row(embd_row, s->gemma3n_per_layer_inp, total_embd, w->type_per_layer_tok_embd);
         for (int i = 0; i < total_embd; i++) s->gemma3n_per_layer_inp[i] *= sqrt_altup_dim;
 
-        /* Project: per_layer_model_proj * inpL / sqrt(n_embd) */
+        /* Project: per_layer_model_proj [n_embd, total_embd] @ inpL [n_embd] -> [total_embd]
+         * GGUF tensor [dim, total_embd]: ne[0]=dim (fastest), ne[1]=total_embd
+         * matmul(out, x, W, n, d): out has d elements, each is dot(x[n], W_row[i][n])
+         * So matmul(s->xb, s->x, W, dim, total_embd) gives total_embd outputs. ✓ */
         matmul(s->xb, s->x, w->per_layer_model_proj, dim, total_embd, w->type_per_layer_model_proj);
         float proj_scale = 1.0f / sqrt_embd;
         for (int i = 0; i < total_embd; i++) s->xb[i] *= proj_scale;
@@ -4289,6 +4327,12 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
 
         /* Store in gemma3n_per_layer_inp: [n_embd_altup, n_layer] */
         memcpy(s->gemma3n_per_layer_inp, s->xb, total_embd * sizeof(float));
+    }
+    if (pos == 0 && getenv("PICOLM_DBG")) {
+        double pm = 0; for(int i=0;i<n_embd_altup;i++){double v=s->gemma3n_per_layer_inp[i]; pm+=v*v;}
+        fprintf(stderr, "DBG per_layer_inp[0]_rms=%.4f\n", sqrt(pm/n_embd_altup));
+        double pm2 = 0; for(int i=0;i<n_embd_altup;i++){double v=s->gemma3n_per_layer_inp[c->n_layers*n_embd_altup-i-1]; pm2+=v*v;}
+        fprintf(stderr, "DBG per_layer_inp[last]_rms=%.4f\n", sqrt(pm2/n_embd_altup));
     }
 
     /* 3. ALTUP expand: create n_altup copies
@@ -4325,7 +4369,23 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
     }
 
     /* 4. Transformer layers */
-    for (int l = 0; l < c->n_layers; l++) {
+    {
+        int stop_after = -1;
+        const char *stop_env = getenv("PICOLM_STOP_LAYER");
+        if (stop_env) stop_after = atoi(stop_env);
+        for (int l = 0; l < c->n_layers; l++) {
+            if (pos == 0 && getenv("PICOLM_DBG")) {
+                fprintf(stderr, "DBG layer=%d altup_state_rms={", l);
+                for(int a=0;a<n_altup;a++){
+                    double m=0; for(int i=0;i<dim;i++){double v=s->gemma3n_altup_state[a*dim+i]; m+=v*v;}
+                    fprintf(stderr,"%.2f%s",sqrt(m/dim),a<n_altup-1?",":"");
+                }
+                fprintf(stderr, "}\n");
+            }
+            if (l == stop_after + 1) {
+                /* Stop after layer l-1, skip remaining layers */
+                break;
+            }
         layer_weights_t *lw = &w->layers[l];
         float *predictions;
         float *active_pred;
@@ -4344,6 +4404,14 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
                 float sum = 0;
                 for (int r = 0; r < n_altup; r++) sum += s->gemma3n_router_out[r] * ((const float *)lw->altup_predict_coef)[r * n_altup * n_altup + a];
                 all_coefs[a] = sum;
+            }
+            if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
+                fprintf(stderr, "DBG L0 modalities={");
+                for(int r=0;r<n_altup;r++) fprintf(stderr,"%.4f%s",s->gemma3n_router_out[r],r<n_altup-1?",":"");
+                fprintf(stderr, "}\n");
+                fprintf(stderr, "DBG L0 predict_coefs={");
+                for(int a=0;a<n_altup*n_altup;a++) fprintf(stderr,"%.4f%s",all_coefs[a],a<n_altup*n_altup-1?",":"");
+                fprintf(stderr, "}\n");
             }
             /* GGML: ggml_mul_mat(cur_permuted, all_coefs) -> result[a,d] = sum_a' all_coefs[a',a] * cur[a',d]
              * So the coefficient for cur[a'] contributing to predictions[a] is all_coefs[a' * n_altup + a] */
@@ -4366,17 +4434,18 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
             /* ATTN NORM */
             rmsnorm(s->xb, active_pred, s->attn_norm_w[l], dim, rms_norm_eps);
 
-            /* LAUREL: norm(laurel_r @ (laurel_l @ x)) + x */
+            /* LAUREL: norm(laurel_r @ (laurel_l @ x_normed)) + x_normed
+             * x is the ATTN-NORMED active prediction (s->xb) */
             {
-                /* laurel_l: [n_embd, laurel_rank] F16, laurel_r: [laurel_rank, n_embd] F16 */
                 int laurel_t = getenv("PICOLM_LAUREL_T") ? 1 : 0;
+                /* s->xb holds the attn-normed active prediction */
                 if (laurel_t) {
                     /* Transposed access: out[i] = sum_n W[n,i] * x[n] */
                     const uint16_t *wl = (const uint16_t *)lw->laurel_l;
                     for (int i = 0; i < laurel_rank; i++) {
                         float sum = 0.0f;
                         for (int n = 0; n < dim; n++)
-                            sum += fp16_to_fp32(wl[n * laurel_rank + i]) * active_pred[n];
+                            sum += fp16_to_fp32(wl[n * laurel_rank + i]) * s->xb[n];
                         s->hb[i] = sum;
                     }
                     const uint16_t *wr = (const uint16_t *)lw->laurel_r;
@@ -4387,92 +4456,128 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
                         s->gemma3n_laurel_out[i] = sum;
                     }
                 } else {
-                    matmul(s->hb, active_pred, lw->laurel_l, dim, laurel_rank, lw->type_laurel_l);
+                    matmul(s->hb, s->xb, lw->laurel_l, dim, laurel_rank, lw->type_laurel_l);
                     matmul(s->gemma3n_laurel_out, s->hb, lw->laurel_r, laurel_rank, dim, lw->type_laurel_r);
                 }
                 rmsnorm(s->gemma3n_laurel_out, s->gemma3n_laurel_out, s->laurel_post_norm_w[l], dim, rms_norm_eps);
-                for (int i = 0; i < dim; i++) s->gemma3n_laurel_out[i] += active_pred[i];
+                /* Residual: laurel_out + x_normed (not active_pred!) */
+                for (int i = 0; i < dim; i++) s->gemma3n_laurel_out[i] += s->xb[i];
             }
         }
 
-        /* Q projection */
-        matmul(s->q, s->xb, lw->attn_q, dim, q_dim, lw->type_attn_q);
-        /* K projection */
-        matmul(s->xb2, s->xb, lw->attn_k, dim, kv_dim, lw->type_attn_k);
-
-        /* QK-norm */
-        if (lw->attn_q_norm) {
-            float *qnw = s->attn_q_norm_w[l];
-            float *knw = s->attn_k_norm_w[l];
-            for (int h = 0; h < n_heads; h++)
-                rmsnorm(s->q + h * head_dim, s->q + h * head_dim, qnw, head_dim, rms_norm_eps);
-            for (int h = 0; h < n_kv_heads; h++)
-                rmsnorm(s->xb2 + h * head_dim, s->xb2 + h * head_dim, knw, head_dim, rms_norm_eps);
-        }
-
-        /* V projection + RMSNorm (unweighted in Gemma-3n) */
-        matmul(s->hb, s->xb, lw->attn_v, dim, kv_dim, lw->type_attn_v);
-        { /* V-norm: per-KV-head RMSNorm without learned weight (Gemma-3n) */
-          for (int h = 0; h < n_kv_heads; h++) {
-              float ss = 0.0f;
-              float *v_head = s->hb + h * head_dim;
-              for (int i = 0; i < head_dim; i++) ss += v_head[i] * v_head[i];
-              ss = 1.0f / sqrtf(ss / (float)head_dim + rms_norm_eps);
-              for (int i = 0; i < head_dim; i++) v_head[i] *= ss;
-          }
-        }
-
-        /* RoPE */
-        rope(s->q, s->xb2, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos, c->rope_type, half_dim);
-
-        /* Store K/V (only for first n_layer_kv layers) */
         int kv_ordinal = (l < n_layer_kv) ? l : (n_layer_kv - 1);
         uint8_t *kcache_layer = s->key_cache + (size_t)kv_ordinal * seq_len * s->kv_row_size_k;
         uint8_t *vcache_layer = s->val_cache + (size_t)kv_ordinal * seq_len * s->kv_row_size_v;
 
-        {
-            uint8_t *key_pos = kcache_layer + (size_t)pos * s->kv_row_size_k;
-            if (s->kv_type_k == KV_CACHE_Q8_0) {
-                quantize_row_q8_0(s->xb2, key_pos, kv_dim);
-            } else if (s->kv_type_k == KV_CACHE_Q4_0) {
-                quantize_row_q4_0(s->xb2, key_pos, kv_dim);
-            } else {
-                for (int hkv = 0; hkv < n_kv_heads; hkv++) {
-                    float *k_head = s->xb2 + hkv * head_dim;
-                    uint16_t *kf = (uint16_t *)(key_pos + hkv * s->kv_head_stride_k);
-                    for (int d = 0; d < head_dim; d++) kf[d] = fp32_to_fp16(k_head[d]);
-                }
-            }
-        }
-        {
-            uint8_t *val_pos = vcache_layer + (size_t)pos * s->kv_row_size_v;
-            if (s->kv_type_v == KV_CACHE_Q8_0) {
-                quantize_row_q8_0(s->hb, val_pos, kv_dim);
-            } else if (s->kv_type_v == KV_CACHE_Q4_0) {
-                quantize_row_q4_0(s->hb, val_pos, kv_dim);
-            } else {
-                for (int hkv = 0; hkv < n_kv_heads; hkv++) {
-                    float *v_head = s->hb + hkv * head_dim;
-                    uint16_t *vf = (uint16_t *)(val_pos + hkv * s->kv_head_stride_v);
-                    for (int d = 0; d < head_dim; d++) vf[d] = fp32_to_fp16(v_head[d]);
-                }
-            }
-        }
+        if (l < n_layer_kv) {
+            /* KV-storing layer: compute Q, K, V, store K/V, attention */
+            /* Q projection */
+            matmul(s->q, s->xb, lw->attn_q, dim, q_dim, lw->type_attn_q);
+            /* K projection */
+            matmul(s->xb2, s->xb, lw->attn_k, dim, kv_dim, lw->type_attn_k);
 
-        /* Attention */
-        {
-            attn_group_ctx_t gctx;
-            gctx.kv_mul = kv_mul; gctx.head_dim = head_dim; gctx.pos = pos;
-            gctx.kv_type_k = s->kv_type_k; gctx.kv_type_v = s->kv_type_v;
-            gctx.kv_row_size_k = s->kv_row_size_k; gctx.kv_row_size_v = s->kv_row_size_v;
-            gctx.kv_head_stride_k = s->kv_head_stride_k; gctx.kv_head_stride_v = s->kv_head_stride_v;
-            gctx.kcache = kcache_layer; gctx.vcache = vcache_layer;
-            gctx.q = s->q; gctx.xb = s->xb;
-            gctx.n_kv_heads = c->n_kv_heads;
-            gctx.kv_hadamard_k = s->kv_hadamard_k;
-            gctx.kv_hadamard_v = s->kv_hadamard_v;
-            gctx.kv_hadamard_size = s->kv_hadamard_size;
-            tensor_parallel_for(c->n_kv_heads, attention_group, &gctx);
+            /* QK-norm */
+            if (lw->attn_q_norm) {
+                float *qnw = s->attn_q_norm_w[l];
+                float *knw = s->attn_k_norm_w[l];
+                for (int h = 0; h < n_heads; h++)
+                    rmsnorm(s->q + h * head_dim, s->q + h * head_dim, qnw, head_dim, rms_norm_eps);
+                for (int h = 0; h < n_kv_heads; h++)
+                    rmsnorm(s->xb2 + h * head_dim, s->xb2 + h * head_dim, knw, head_dim, rms_norm_eps);
+            }
+
+            /* V projection + RMSNorm (unweighted in Gemma-3n) */
+            matmul(s->hb, s->xb, lw->attn_v, dim, kv_dim, lw->type_attn_v);
+            { /* V-norm: per-KV-head RMSNorm without learned weight (Gemma-3n) */
+              for (int h = 0; h < n_kv_heads; h++) {
+                  float ss = 0.0f;
+                  float *v_head = s->hb + h * head_dim;
+                  for (int i = 0; i < head_dim; i++) ss += v_head[i] * v_head[i];
+                  ss = 1.0f / sqrtf(ss / (float)head_dim + rms_norm_eps);
+                  for (int i = 0; i < head_dim; i++) v_head[i] *= ss;
+              }
+            }
+
+            /* RoPE */
+            rope(s->q, s->xb2, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos, c->rope_type, half_dim);
+
+            /* Store K/V */
+            {
+                uint8_t *key_pos = kcache_layer + (size_t)pos * s->kv_row_size_k;
+                if (s->kv_type_k == KV_CACHE_Q8_0) {
+                    quantize_row_q8_0(s->xb2, key_pos, kv_dim);
+                } else if (s->kv_type_k == KV_CACHE_Q4_0) {
+                    quantize_row_q4_0(s->xb2, key_pos, kv_dim);
+                } else {
+                    for (int hkv = 0; hkv < n_kv_heads; hkv++) {
+                        float *k_head = s->xb2 + hkv * head_dim;
+                        uint16_t *kf = (uint16_t *)(key_pos + hkv * s->kv_head_stride_k);
+                        for (int d = 0; d < head_dim; d++) kf[d] = fp32_to_fp16(k_head[d]);
+                    }
+                }
+            }
+            {
+                uint8_t *val_pos = vcache_layer + (size_t)pos * s->kv_row_size_v;
+                if (s->kv_type_v == KV_CACHE_Q8_0) {
+                    quantize_row_q8_0(s->hb, val_pos, kv_dim);
+                } else if (s->kv_type_v == KV_CACHE_Q4_0) {
+                    quantize_row_q4_0(s->hb, val_pos, kv_dim);
+                } else {
+                    for (int hkv = 0; hkv < n_kv_heads; hkv++) {
+                        float *v_head = s->hb + hkv * head_dim;
+                        uint16_t *vf = (uint16_t *)(val_pos + hkv * s->kv_head_stride_v);
+                        for (int d = 0; d < head_dim; d++) vf[d] = fp32_to_fp16(v_head[d]);
+                    }
+                }
+            }
+
+            /* Attention */
+            {
+                attn_group_ctx_t gctx;
+                gctx.kv_mul = kv_mul; gctx.head_dim = head_dim; gctx.pos = pos;
+                gctx.kv_type_k = s->kv_type_k; gctx.kv_type_v = s->kv_type_v;
+                gctx.kv_row_size_k = s->kv_row_size_k; gctx.kv_row_size_v = s->kv_row_size_v;
+                gctx.kv_head_stride_k = s->kv_head_stride_k; gctx.kv_head_stride_v = s->kv_head_stride_v;
+                gctx.kcache = kcache_layer; gctx.vcache = vcache_layer;
+                gctx.q = s->q; gctx.xb = s->xb;
+                gctx.n_kv_heads = c->n_kv_heads;
+                gctx.kv_hadamard_k = s->kv_hadamard_k;
+                gctx.kv_hadamard_v = s->kv_hadamard_v;
+                gctx.kv_hadamard_size = s->kv_hadamard_size;
+                gctx.attn_scale = (c->f_attention_scale > 0) ? c->f_attention_scale : (1.0f / sqrtf((float)head_dim));
+                tensor_parallel_for(c->n_kv_heads, attention_group, &gctx);
+            }
+        } else {
+            /* Non-KV layer: only compute Q, reuse KV cache from last KV layer */
+            /* Q projection */
+            matmul(s->q, s->xb, lw->attn_q, dim, q_dim, lw->type_attn_q);
+
+            /* Q-norm only (no K, V) */
+            if (lw->attn_q_norm) {
+                float *qnw = s->attn_q_norm_w[l];
+                for (int h = 0; h < n_heads; h++)
+                    rmsnorm(s->q + h * head_dim, s->q + h * head_dim, qnw, head_dim, rms_norm_eps);
+            }
+
+            /* RoPE on Q only */
+            rope(s->q, s->xb2, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos, c->rope_type, half_dim);
+
+            /* Attention (reuse KV from layer n_layer_kv-1) */
+            {
+                attn_group_ctx_t gctx;
+                gctx.kv_mul = kv_mul; gctx.head_dim = head_dim; gctx.pos = pos;
+                gctx.kv_type_k = s->kv_type_k; gctx.kv_type_v = s->kv_type_v;
+                gctx.kv_row_size_k = s->kv_row_size_k; gctx.kv_row_size_v = s->kv_row_size_v;
+                gctx.kv_head_stride_k = s->kv_head_stride_k; gctx.kv_head_stride_v = s->kv_head_stride_v;
+                gctx.kcache = kcache_layer; gctx.vcache = vcache_layer;
+                gctx.q = s->q; gctx.xb = s->xb;
+                gctx.n_kv_heads = c->n_kv_heads;
+                gctx.kv_hadamard_k = s->kv_hadamard_k;
+                gctx.kv_hadamard_v = s->kv_hadamard_v;
+                gctx.kv_hadamard_size = s->kv_hadamard_size;
+                gctx.attn_scale = (c->f_attention_scale > 0) ? c->f_attention_scale : (1.0f / sqrtf((float)head_dim));
+                tensor_parallel_for(c->n_kv_heads, attention_group, &gctx);
+            }
         }
 
         /* Output projection: attn_output @ attn_result */
@@ -4485,7 +4590,15 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
             fprintf(stderr, "}\n");
         }
         /* attn_post_norm(attn_result) */
+        if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
+            double wm = 0; for(int i=0;i<dim;i++){double v=s->attn_post_norm_w[l][i]; wm+=v*v;}
+            fprintf(stderr, "DBG L0 attn_post_norm_weight_rms=%.2f\n", sqrt(wm/dim));
+        }
         rmsnorm(s->xb, s->xb2, s->attn_post_norm_w[l], dim, rms_norm_eps);
+        if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
+            double am = 0; for(int i=0;i<dim;i++){double v=s->xb[i]; am+=v*v;}
+            fprintf(stderr, "DBG L0 attn_post_norm_rms=%.2f\n", sqrt(am/dim));
+        }
 
         /* Add active prediction (residual) */
         for (int i = 0; i < dim; i++) s->xb[i] += predictions[i_altup_act * dim + i];
@@ -4496,18 +4609,66 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
             for (int i = 0; i < dim; i++) {
                 s->x[i] = (s->xb[i] + (skip_laurel ? 0.0f : s->gemma3n_laurel_out[i])) / sqrt_2;
             }
+            if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
+                double am = 0; for(int i=0;i<dim;i++){double v=s->x[i]; am+=v*v;}
+                fprintf(stderr, "DBG L0 attn_laurel_rms=%.2f\n", sqrt(am/dim));
+            }
         }
 
         /* FFN */
         {
+            if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
+                double wm = 0; for(int i=0;i<dim;i++){double v=s->post_attn_norm_w[l][i]; wm+=v*v;}
+                fprintf(stderr, "DBG L0 ffn_norm_weight_rms=%.2f [0:5]={", sqrt(wm/dim));
+                for(int i=0;i<5;i++) fprintf(stderr,"%.4f%s",s->post_attn_norm_w[l][i],i<4?",":"");
+                fprintf(stderr, "}\n");
+            }
             rmsnorm(s->xb, s->x, s->post_attn_norm_w[l], dim, rms_norm_eps);
+            if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
+                double am = 0; for(int i=0;i<dim;i++){double v=s->xb[i]; am+=v*v;}
+                fprintf(stderr, "DBG L0 ffn_norm_rms=%.2f\n", sqrt(am/dim));
+            }
             matmul(s->hb, s->xb, lw->ffn_gate, dim, n_ffn, lw->type_ffn_gate);
+            /* Activation sparsity (gaussian_topk) for first n_layer_sparsity layers */
+            if (c->is_gemma3n && l < c->n_layer_sparsity && c->n_layer_sparsity > 0) {
+                float *gp = s->hb;
+                /* mean = mean(gate_proj) */
+                float mean = 0.0f;
+                for (int i = 0; i < n_ffn; i++) mean += gp[i];
+                mean /= (float)n_ffn;
+                /* std = sqrt(sum((x - mean)^2) / (n_ffn - 1)) */
+                float var = 0.0f;
+                for (int i = 0; i < n_ffn; i++) { float d = gp[i] - mean; var += d * d; }
+                var /= (float)(n_ffn - 1);
+                float std = sqrtf(var);
+                /* cutoff = mean + std * f_sparsity_std_mul */
+                float cutoff = mean + std * c->f_sparsity_std_mul;
+                /* relu(x - cutoff): zero out values below cutoff */
+                for (int i = 0; i < n_ffn; i++) {
+                    float v = gp[i] - cutoff;
+                    gp[i] = (v > 0.0f) ? v : 0.0f;
+                }
+            }
             matmul(s->hb2, s->xb, lw->ffn_up, dim, n_ffn, lw->type_ffn_up);
             gelu(s->hb, n_ffn);  /* Gemma-3n uses GELU, not SiLU */
             elemwise_mul(s->hb, s->hb, s->hb2, n_ffn);
             matmul(s->xb, s->hb, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
+            if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
+                double am = 0; for(int i=0;i<dim;i++){double v=s->xb[i]; am+=v*v;}
+                fprintf(stderr, "DBG L0 ffn_down_rms=%.2f\n", sqrt(am/dim));
+            }
             /* post_ffw_norm */
+            if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
+                double wm = 0; for(int i=0;i<dim;i++){double v=s->post_ffw_norm_w[l][i]; wm+=v*v;}
+                fprintf(stderr, "DBG L0 post_ffw_norm_weight_rms=%.2f [0:3]={", sqrt(wm/dim));
+                for(int i=0;i<3;i++) fprintf(stderr,"%.4f%s",s->post_ffw_norm_w[l][i],i<2?",":"");
+                fprintf(stderr, "}\n");
+            }
             rmsnorm(s->xb, s->xb, s->post_ffw_norm_w[l], dim, rms_norm_eps);
+            if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
+                double am = 0; for(int i=0;i<dim;i++){double v=s->xb[i]; am+=v*v;}
+                fprintf(stderr, "DBG L0 ffn_post_norm_rms=%.2f\n", sqrt(am/dim));
+            }
             /* Add residual (attn_laurel combined) */
             for (int i = 0; i < dim; i++) s->xb[i] += s->x[i];
         }
@@ -4519,6 +4680,10 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
          * correct_coefs = altup_correct_coef @ modalities + 1.0  [n_altup]
          * corrected = predictions + innovation * correct_coefs  [broadcast n_altup]
          */
+        if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
+            double am = 0; for(int i=0;i<dim;i++){double v=s->xb[i]; am+=v*v;}
+            fprintf(stderr, "DBG L0 activated_rms=%.2f\n", sqrt(am/dim));
+        }
         {
             /* Router on activated state */
             gemma3n_router(s->gemma3n_router_out, s->xb, dim, n_altup,
@@ -4533,6 +4698,11 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
                 for (int r = 0; r < n_altup; r++)
                     sum += s->gemma3n_router_out[r] * correct_coef[r * n_altup + a];
                 correct_coefs[a] = sum + 1.0f;
+            }
+            if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
+                fprintf(stderr, "DBG L0 correct_coefs={");
+                for(int a=0;a<n_altup;a++) fprintf(stderr,"%.4f%s",correct_coefs[a],a<n_altup-1?",":"");
+                fprintf(stderr, "}\n");
             }
 
             /* innovation = activated - predictions[i_altup_act] */
@@ -4575,9 +4745,14 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
             matmul(s->hb, s->gemma3n_inp_gate_out, lw->per_layer_proj, n_embd_altup, dim, lw->type_per_layer_proj);
             rmsnorm(s->hb, s->hb, s->per_layer_post_norm_w[l], dim, rms_norm_eps);
 
-            /* Add to all non-active altups */
-            for (int a = 0; a < n_altup; a++) {
-                if (a == i_altup_act) continue;
+            if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
+                double am = 0; for(int i=0;i<dim;i++){double v=s->hb[i]; am+=v*v;}
+                fprintf(stderr, "DBG L0 gating_out_rms=%.2f\n", sqrt(am/dim));
+            }
+            /* Add to altup indices 1..n_altup-1 (reference: corrected[1:] += first_prediction)
+             * Note: this is NOT the active altup. The reference always skips index 0,
+             * regardless of which is the active altup. */
+            for (int a = 1; a < n_altup; a++) {
                 float *a_dst = s->gemma3n_altup_state + a * dim;
                 for (int i = 0; i < dim; i++) a_dst[i] += s->hb[i];
             }
@@ -4585,11 +4760,8 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
         }
 
         /* cur = corrected predictions (all altups) -> next layer input is the concat */
-        /* For single-token generation, the next layer input is the active altup */
-        /* But per the reference, the output for next layer is all altups (inpL) */
-        /* The active altup is used as the "output" of this layer for the next iteration */
-        /* Actually, inpL for next layer = all altups combined */
     }
+    } /* end of stop_layer scope */
 
     /* 5. ALTUP unembed: merge all altups back to single copy */
     {
@@ -7178,6 +7350,7 @@ typedef struct {
     int xb_stride;
     int kv_hadamard_k, kv_hadamard_v;
     int kv_hadamard_size;
+    float attn_scale;
 } prefill_attn_ctx_t;
 
 static void prefill_attn_task(int flat_idx, void *ctx_ptr) {
@@ -7192,7 +7365,7 @@ static void prefill_attn_task(int flat_idx, void *ctx_ptr) {
               ctx->kv_type_k, ctx->kv_type_v,
               ctx->kv_row_size_k, ctx->kv_row_size_v,
               ctx->kv_head_stride_k, ctx->kv_head_stride_v,
-              ctx->head_dim);
+              ctx->head_dim, ctx->attn_scale);
 }
 
 /* Tiled attention: tile size in KV positions */
@@ -7207,7 +7380,8 @@ static void batch_attention_tiled(
         int xb_stride,
         kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v,
         size_t kv_row_size_k, size_t kv_row_size_v,
-        size_t kv_head_stride_k, size_t kv_head_stride_v);
+        size_t kv_head_stride_k, size_t kv_head_stride_v,
+        float attn_scale);
 
 static void batch_attention_layer(
         float *xb_batch, const float *q_batch,
@@ -7217,7 +7391,8 @@ static void batch_attention_layer(
         int xb_stride,
         int kv_type_k, int kv_type_v,
         size_t kv_row_size_k, size_t kv_row_size_v,
-        size_t kv_head_stride_k, size_t kv_head_stride_v)
+        size_t kv_head_stride_k, size_t kv_head_stride_v,
+        float attn_scale)
 {
     /* Build the prefill_attn_ctx for both the original path and the test */
     prefill_attn_ctx_t ctx;
@@ -7229,6 +7404,7 @@ static void batch_attention_layer(
     ctx.kv_head_stride_k = kv_head_stride_k; ctx.kv_head_stride_v = kv_head_stride_v;
     ctx.kcache = kcache; ctx.vcache = vcache;
     ctx.q_batch = q_batch; ctx.xb_batch = xb_batch; ctx.xb_stride = xb_stride;
+    ctx.attn_scale = attn_scale;
 
     /* For large enough batches, use the tiled/batched attention path which
      * amortizes KV cache load/dequant across multiple query tokens via the
@@ -7245,7 +7421,8 @@ static void batch_attention_layer(
                               xb_stride,
                               (kv_cache_type_t)kv_type_k, (kv_cache_type_t)kv_type_v,
                               kv_row_size_k, kv_row_size_v,
-                              kv_head_stride_k, kv_head_stride_v);
+                              kv_head_stride_k, kv_head_stride_v,
+                              attn_scale);
         return;
     }
 
@@ -7325,6 +7502,7 @@ typedef struct {
     float *acc;             /* [n_q_rows x head_dim] running accumulator */
     float *out;             /* [n_q_rows x head_dim] final output (written only after all tiles) */
     int last_tile;          /* 1 if this is the last tile to process */
+    float attn_scale;       /* attention score scale factor */
 } attn_tile_task_t;
 
 /* Process one tile within a (kv_head, token_group) task.
@@ -7360,10 +7538,9 @@ static void attn_process_tile(attn_tile_task_t *t) {
      * out layout: [n_q][ts], scores[b*ts + i] = row b, col i */
     matmul_batch(t->scores, t->q_rows, n_q, t->tile_k, hd, ts, t->kv_gguf_k);
 
-    /* Scale scores by 1/sqrt(head_dim) */
-    float inv_sqrt_hd = 1.0f / sqrtf((float)hd);
+    /* Scale scores */
     for (int i = 0; i < n_q * ts; i++)
-        t->scores[i] *= inv_sqrt_hd;
+        t->scores[i] *= t->attn_scale;
 
     /* Causal masking for diagonal tile: for each query row i,
      * only positions [0, i_within_group] are valid.
@@ -7461,7 +7638,8 @@ static void batch_attention_tiled(
         int xb_stride,
         kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v,
         size_t kv_row_size_k, size_t kv_row_size_v,
-        size_t kv_head_stride_k, size_t kv_head_stride_v)
+        size_t kv_head_stride_k, size_t kv_head_stride_v,
+        float attn_scale)
 {
     /* kv_head_stride_v is used below in V-tile extraction */
     int kv_mul = n_heads / n_kv_heads;
@@ -7615,6 +7793,7 @@ static void batch_attention_tiled(
                     task.M = M;
                     task.S = S;
                     task.acc = acc;
+                    task.attn_scale = attn_scale;
 
                     attn_process_tile(&task);
                 }
@@ -8351,7 +8530,8 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                                   n_heads, c->n_kv_heads, head_dim,
                                   max_dim, (int)s->kv_type_k, (int)s->kv_type_v,
                                   s->kv_row_size_k, s->kv_row_size_v,
-                                  s->kv_head_stride_k, s->kv_head_stride_v);
+                                  s->kv_head_stride_k, s->kv_head_stride_v,
+                                  1.0f / sqrtf((float)head_dim));
         }
 
         /* Hadamard rotation of attention output back to original space (prefill) */
