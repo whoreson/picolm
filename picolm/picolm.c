@@ -880,7 +880,7 @@ int main(int argc, char **argv) {
             if (do_prefill) {
                 bench.is_prefill = 1;
 #ifdef PICOLM_GPU
-                if (model.gpu.kv_active) {
+                if (model.gpu.kv_active && 0) { /* TEMP: skip GPU prefill */
                     logits = model_forward_prefill_gpu(&model, prompt_tokens, n_prompt, 0, NULL);
                     if (!logits) logits = model_forward_prefill(&model, prompt_tokens, n_prompt, 0, NULL);
                 } else
@@ -889,6 +889,12 @@ int main(int argc, char **argv) {
                     logits = model_forward_prefill(&model, prompt_tokens, n_prompt, 0, NULL);
                 }
                 pos = n_prompt - 1;
+                /* Sync SSM state from host to device after CPU prefill */
+#ifdef PICOLM_GPU
+                if (model.gpu.kv_active && model.config.has_ssm) {
+                    picolm_ssm_state_sync_to_device(&model, model.gpu.device);
+                }
+#endif
             } else {
                 bench.is_prefill = 0;
                 logits = model_forward(&model, tokenizer.bos_id, pos);
@@ -906,7 +912,7 @@ int main(int argc, char **argv) {
                     bench.gen_tokens++;
                     pos++;
 #ifdef PICOLM_GPU
-                    if (model.gpu.kv_active) {
+                    if (model.gpu.kv_active && 0) { /* TEMP: skip GPU gen */
                         logits = model_forward_gpu(&model, token, pos);
                         if (!logits) logits = model_forward(&model, token, pos);
 
@@ -990,6 +996,12 @@ int main(int argc, char **argv) {
             logits = model_forward_prefill(&model, prompt_tokens, n_prompt, start_pos, NULL);
         }
         pos = start_pos + n_prompt - 1;
+        /* Sync SSM state from host to device after CPU prefill */
+#ifdef PICOLM_GPU
+        if (model.gpu.kv_active && model.config.has_ssm) {
+            picolm_ssm_state_sync_to_device(&model, model.gpu.device);
+        }
+#endif
     } else {
         /* No prompt: just generate from BOS */
         logits = model_forward(&model, tokenizer.bos_id, pos);
