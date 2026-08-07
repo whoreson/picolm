@@ -879,7 +879,8 @@ int main(int argc, char **argv) {
             /* Prefill phase */
             if (do_prefill) {
                 bench.is_prefill = 1;
-                logits = model_forward_prefill(&model, prompt_tokens, n_prompt, 0, NULL);
+                logits = model_forward_prefill_gpu(&model, prompt_tokens, n_prompt, 0, NULL);
+                if (!logits) logits = model_forward_prefill(&model, prompt_tokens, n_prompt, 0, NULL);
                 pos = n_prompt - 1;
             } else {
                 bench.is_prefill = 0;
@@ -897,7 +898,43 @@ int main(int argc, char **argv) {
                     token = next;
                     bench.gen_tokens++;
                     pos++;
-                    logits = model_forward(&model, token, pos);
+#ifdef PICOLM_GPU
+                    if (model.gpu.kv_active) {
+                        logits = model_forward_gpu(&model, token, pos);
+                        if (!logits) logits = model_forward(&model, token, pos);
+
+                        /* PICOLM_DBG_PIPELINE: compare GPU pipeline vs CPU per token */
+                        {
+                            static int dbg_pipeline_active = 0;
+                            static int dbg_pipeline_init = 0;
+                            if (!dbg_pipeline_init++) {
+                                const char *dbg = getenv("PICOLM_DBG_PIPELINE");
+                                if (dbg && atoi(dbg)) {
+                                    dbg_pipeline_active = 1;
+                                    fprintf(stderr, "INFO: PICOLM_DBG_PIPELINE active\n");
+                                }
+                            }
+                            if (dbg_pipeline_active) {
+                                float *logits_cpu = model_forward(&model, token, pos);
+                                if (logits_cpu) {
+                                    float max_diff = 0.0f;
+                                    for (int v = 0; v < model.config.vocab_size; v++) {
+                                        float d = logits[v] - logits_cpu[v];
+                                        if (d < 0) d = -d;
+                                        if (d > max_diff) max_diff = d;
+                                    }
+                                    if (max_diff > 1e-2f) {
+                                        fprintf(stderr, "[DBG_PIPELINE] pos=%d max_logit_diff=%.6f\n",
+                                                pos, max_diff);
+                                    }
+                                }
+                            }
+                        }
+                    } else
+#endif
+                    {
+                        logits = model_forward(&model, token, pos);
+                    }
                 }
             }
 
@@ -936,7 +973,13 @@ int main(int argc, char **argv) {
     if (n_prompt > 0) {
         /* All models use model_forward_prefill.
          * SSM models: batched by default, use --ssm-serial for per-token path. */
-        logits = model_forward_prefill(&model, prompt_tokens, n_prompt, start_pos, NULL);
+        if (model.gpu.kv_active) {
+            logits = model_forward_prefill_gpu(&model, prompt_tokens, n_prompt, start_pos, NULL);
+            if (!logits) logits = model_forward_prefill(&model, prompt_tokens, n_prompt, start_pos, NULL);
+        } else
+        {
+            logits = model_forward_prefill(&model, prompt_tokens, n_prompt, start_pos, NULL);
+        }
         pos = start_pos + n_prompt - 1;
     } else {
         /* No prompt: just generate from BOS */
@@ -983,7 +1026,38 @@ int main(int argc, char **argv) {
         if (grammar_is_complete(&grammar)) break;
 
         token = next;
-        logits = model_forward(&model, token, pos + 1);
+#ifdef PICOLM_GPU
+        static int dbg_pipeline_active = 0, dbg_pipeline_init = 0;
+        if (!dbg_pipeline_init++) {
+            const char *dbg = getenv("PICOLM_DBG_PIPELINE");
+            if (dbg && atoi(dbg)) {
+                dbg_pipeline_active = 1;
+                fprintf(stderr, "INFO: PICOLM_DBG_PIPELINE active (default loop)\n");
+            }
+        }
+        if (model.gpu.kv_active) {
+            logits = model_forward_gpu(&model, token, pos + 1);
+            if (!logits) logits = model_forward(&model, token, pos + 1);
+            /* PICOLM_DBG_PIPELINE: compare GPU pipeline vs CPU at first token only
+             * (running CPU path for all tokens corrupts the KV cache shared with GPU) */
+            if (dbg_pipeline_active && logits && pos == n_prompt) {
+                float *logits_cpu = model_forward(&model, token, pos + 1);
+                if (logits_cpu) {
+                    float max_diff = 0.0f;
+                    for (int v = 0; v < model.config.vocab_size; v++) {
+                        float d = logits[v] - logits_cpu[v];
+                        if (d < 0) d = -d;
+                        if (d > max_diff) max_diff = d;
+                    }
+                    fprintf(stderr, "[DBG_PIPELINE] pos=%d max_logit_diff=%.6f\n",
+                            pos + 1, max_diff);
+                }
+            }
+        } else
+#endif
+        {
+            logits = model_forward(&model, token, pos + 1);
+        }
     }
 
     printf("\n");

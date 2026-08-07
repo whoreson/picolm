@@ -100,6 +100,9 @@ typedef struct {
     void *attn_qkv;            /* SSM */
     void *attn_gate_ssm;       /* SSM */
     void *ssm_out;             /* SSM */
+    void *ssm_conv1d;          /* SSM: [d_conv x conv_dim] f32 */
+    void *ssm_alpha;           /* SSM: [dim x dt_rank] f32 or quantized */
+    void *ssm_beta;            /* SSM: [dim x dt_rank] f32 or quantized */
 } gpu_layer_weights_t;
 
 typedef struct {
@@ -107,6 +110,28 @@ typedef struct {
     gpu_layer_weights_t layers[MAX_LAYERS];
     int device;
     int active;    /* 1 if GPU backend is active and at least some tensors uploaded */
+    /* Phase 1: GPU-resident KV cache */
+    void *kv_k_dev;   /* device pointer to K cache, owned by backend_gpu */
+    void *kv_v_dev;   /* device pointer to V cache */
+    size_t kv_k_cap;  /* allocated bytes for K cache */
+    size_t kv_v_cap;  /* allocated bytes for V cache */
+    int kv_active;    /* 1 if GPU KV cache path is usable (MHA, F16 KV, no SSM/QK-norm) */
+    /* Phase 2: device-resident norm weights and RoPE tables */
+    void *rope_cos_dev;      /* device copy of rope_cos [max_seq_len * half_dim] */
+    void *rope_sin_dev;      /* device copy of rope_sin [max_seq_len * half_dim] */
+    void *output_norm_dev;   /* device copy of output_norm_w [dim] */
+    void *attn_norm_dev[MAX_LAYERS];      /* device copy of attn_norm_w[l] [dim] */
+    void *post_attn_norm_dev[MAX_LAYERS]; /* device copy of post_attn_norm_w[l] [dim] */
+    /* SSM GPU pipeline: device-resident weights and state */
+    void *ssm_alpha_dev[MAX_LAYERS];      /* device copy of ssm_alpha weights [dim x dt_rank] */
+    void *ssm_beta_dev[MAX_LAYERS];       /* device copy of ssm_beta weights [dim x dt_rank] */
+    void *ssm_conv1d_dev[MAX_LAYERS];     /* device copy of ssm_conv1d weights [d_conv x conv_dim] */
+    void *ssm_a_dev[MAX_LAYERS];          /* device copy of ssm_a [dt_rank] */
+    void *ssm_dt_dev[MAX_LAYERS];         /* device copy of ssm_dt [dt_rank] */
+    void *ssm_norm_dev[MAX_LAYERS];       /* device copy of ssm_norm [head_v_dim] */
+    void *ssm_conv_state_dev[MAX_LAYERS]; /* device state: [(d_conv-1) x conv_dim] */
+    void *ssm_state_dev[MAX_LAYERS];      /* device state: [n_v_heads x d_state x d_state] */
+    void *ssm_head_map_dev;               /* device copy of head_map [n_v_heads] */
 } gpu_weights_t;
 #endif /* PICOLM_GPU */
 
@@ -507,6 +532,13 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
                        int k_cache_hadamard, int v_cache_hadamard, int n_threads);
 float *model_forward(model_t *m, int token, int pos);
 float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt);
+
+/* GPU-pipelined forward pass (Phase 2).
+ * Keeps activations on-device across layers, eliminating per-layer H2D/D2H
+ * for the residual stream. Falls back to model_forward on unsupported models.
+ * Returns pointer to logits[vocab_size] on host. */
+float *model_forward_gpu(model_t *m, int token, int pos);
+float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt);
 
 /* Free all resources. */
 void model_free(model_t *m);

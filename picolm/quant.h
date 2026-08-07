@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* ---- SIMD detection ----
  *
  * Each level explicitly implies all lower levels so that code only needs to
@@ -690,5 +694,9 @@ void picolm_fast_ht(float *x, int n, const float *signs);
 /* Apply fast_ht(nrot) to each nrot-element block in x.
  * x has head_dim elements. head_dim % nrot == 0. */
 void picolm_hadamard_transform(float *x, int head_dim, int nrot);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* QUANT_H */
