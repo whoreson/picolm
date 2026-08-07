@@ -2752,12 +2752,10 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                     if (c->rope_type != 0 && c->rope_type != 1) eligible = 0;
                     /* F16 KV cache only */
                     if (kv_type_k != KV_CACHE_F16 || kv_type_v != KV_CACHE_F16) eligible = 0;
-                    /* SSM models: shape validation passes but the hybrid
-                     * layer branch isn't wired yet (model_forward_gpu and
-                     * model_forward_prefill_gpu both bail out on SSM layers,
-                     * which corrupts KV cache state). Veto until the branch
-                     * is implemented. The shape checks below are kept as
-                     * documentation of what the branch will need. */
+                    /* SSM models: shape validation passes but the GPU SSM pipeline
+                     * produces incorrect results (known bug in device SSM recurrence/
+                     * vecdot kernels on GB10 and potentially other architectures).
+                     * Veto from GPU pipeline; CPU ssm_forward path works correctly. */
                     if (c->has_ssm) {
                         if (c->ssm_d_state <= 0 || c->ssm_d_state > 256) eligible = 0;
                         if (c->ssm_dt_rank <= 0) eligible = 0;        /* n_v_heads */
@@ -2765,6 +2763,7 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                         if (c->ssm_d_inner <= 0) eligible = 0;        /* value_dim */
                         if (c->ssm_d_conv <= 1) eligible = 0;         /* need >=2 taps */
                         if (eligible && c->ssm_d_inner % c->ssm_dt_rank != 0) eligible = 0;
+                        eligible = 0;  /* GPU SSM pipeline not yet correct */
                     }
 
                     if (eligible) {
@@ -10288,6 +10287,23 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
     tensor_set_gpu_tensor(NULL, 0);
 
     return s->logits;
+}
+
+void picolm_ssm_state_sync_to_device(model_t *m, int device) {
+    model_config_t *c = &m->config;
+    if (!c->has_ssm) return;
+    int conv_dim = 2 * c->ssm_d_state * c->ssm_n_group + c->ssm_d_inner;
+    for (int l = 0; l < c->n_layers; l++) {
+        if (m->weights.layers[l].is_attn_layer) continue;
+        if (m->gpu.ssm_state_dev[l] && m->state.ssm_state[l]) {
+            size_t sz = (size_t)c->ssm_dt_rank * c->ssm_d_state * c->ssm_d_state * sizeof(float);
+            picolm_gpu_memcpy(m->gpu.ssm_state_dev[l], m->state.ssm_state[l], sz, 1, device);
+        }
+        if (m->gpu.ssm_conv_state_dev[l] && m->state.ssm_conv_state[l]) {
+            size_t sz = (size_t)(c->ssm_d_conv - 1) * (size_t)conv_dim * sizeof(float);
+            picolm_gpu_memcpy(m->gpu.ssm_conv_state_dev[l], m->state.ssm_conv_state[l], sz, 1, device);
+        }
+    }
 }
 
 #endif /* PICOLM_GPU */
