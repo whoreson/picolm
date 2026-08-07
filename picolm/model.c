@@ -4264,6 +4264,7 @@ float *model_forward(model_t *m, int token, int pos) {
         gctx.kv_hadamard_k = s->kv_hadamard_k;
         gctx.kv_hadamard_v = s->kv_hadamard_v;
         gctx.kv_hadamard_size = s->kv_hadamard_size;
+        gctx.attn_scale = 1.0f / sqrtf((float)head_dim);
         tensor_parallel_for(c->n_kv_heads, attention_group, &gctx);
 
         /* Hadamard rotation of attention output back to original space (Point D) */
