@@ -345,7 +345,7 @@ int tensor_get_big_cores(void) {
 
 /* Threshold: skip threading if output vector is smaller than this.
  * Avoids mutex overhead for tiny matmuls. */
-static int matmul_min_rows = 1024;
+static int matmul_min_rows = 256;  /* lowered from 1024 to cover d=512 (MoE shared expert) */
 
 void tensor_set_matmul_min_rows(int r) {
     if (r < 0) r = 0;
