@@ -3923,22 +3923,189 @@ float vec_dot_q8_0_f32(const void *src, const float *x, int n) {
 }
 
 /* vec_dot_q8_0_f32_batch4: dot product of 4 Q8_0 activations against the same
- * float32 weight vector. Each token has its own per-block quantization delta,
- * so we dispatch to vec_dot_q8_0_f32 which handles per-token deltas correctly.
+ * float32 weight vector. Keeps the weight vector w resident in cache/registers
+ * while processing 4 tokens simultaneously. Each token has its own per-block
+ * quantization delta (d0..d3), applied correctly per-token.
  *
- * The previous hand-rolled SIMD batch4 had multiple correctness bugs:
- * (1) only token 0's delta was used for all 4 tokens
- * (2) accumulators were rescaled in-place across blocks (compounding error)
- * (3) overlapping weight loads in AVX2/NEON inner loops
- * All replaced with 4 calls to the proven-correct vec_dot_q8_0_f32.
- * The batching benefit (weight reuse across tokens) is lost but correctness is guaranteed. */
+ * Correct implementation: for each Q8_0 block, load 8 qs from each of the 4
+ * tokens, sign-extend to float32, multiply by the same 8 w floats, accumulate
+ * into 4 separate per-token accumulators. After the block, scale each
+ * accumulator by its token's delta and add to the running sum. */
 void vec_dot_q8_0_f32_batch4(const void *qx0, const void *qx1, const void *qx2, const void *qx3,
                               const float *w, int n,
                               float *out0, float *out1, float *out2, float *out3) {
+#ifdef PICOLM_AVX2
+    const block_q8_0 *b0 = (const block_q8_0 *)qx0;
+    const block_q8_0 *b1 = (const block_q8_0 *)qx1;
+    const block_q8_0 *b2 = (const block_q8_0 *)qx2;
+    const block_q8_0 *b3 = (const block_q8_0 *)qx3;
+    int nb = n / 32;
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+    const __m128i zero_i = _mm_setzero_si128();
+
+    for (int i = 0; i < nb; i++) {
+        float d0 = fp16_to_fp32_lookup(b0[i].d);
+        float d1 = fp16_to_fp32_lookup(b1[i].d);
+        float d2 = fp16_to_fp32_lookup(b2[i].d);
+        float d3 = fp16_to_fp32_lookup(b3[i].d);
+        const int8_t *qs0 = b0[i].qs, *qs1 = b1[i].qs, *qs2 = b2[i].qs, *qs3 = b3[i].qs;
+        const float *wp = w + i * 32;
+        __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+        __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+
+        for (int j = 0; j < 32; j += 8) {
+            __m256 xf = _mm256_loadu_ps(wp + j);
+            __m128i q8_0 = _mm_loadl_epi64((const __m128i *)(qs0 + j));
+            __m128i q8_1 = _mm_loadl_epi64((const __m128i *)(qs1 + j));
+            __m128i q8_2 = _mm_loadl_epi64((const __m128i *)(qs2 + j));
+            __m128i q8_3 = _mm_loadl_epi64((const __m128i *)(qs3 + j));
+            __m128i q16_0 = _mm_srai_epi16(_mm_unpacklo_epi8(zero_i, q8_0), 8);
+            __m128i q16_1 = _mm_srai_epi16(_mm_unpacklo_epi8(zero_i, q8_1), 8);
+            __m128i q16_2 = _mm_srai_epi16(_mm_unpacklo_epi8(zero_i, q8_2), 8);
+            __m128i q16_3 = _mm_srai_epi16(_mm_unpacklo_epi8(zero_i, q8_3), 8);
+            __m128i q32lo_0 = _mm_srai_epi32(_mm_unpacklo_epi16(zero_i, q16_0), 16);
+            __m128i q32hi_0 = _mm_srai_epi32(_mm_unpackhi_epi16(zero_i, q16_0), 16);
+            __m128i q32lo_1 = _mm_srai_epi32(_mm_unpacklo_epi16(zero_i, q16_1), 16);
+            __m128i q32hi_1 = _mm_srai_epi32(_mm_unpackhi_epi16(zero_i, q16_1), 16);
+            __m128i q32lo_2 = _mm_srai_epi32(_mm_unpacklo_epi16(zero_i, q16_2), 16);
+            __m128i q32hi_2 = _mm_srai_epi32(_mm_unpackhi_epi16(zero_i, q16_2), 16);
+            __m128i q32lo_3 = _mm_srai_epi32(_mm_unpacklo_epi16(zero_i, q16_3), 16);
+            __m128i q32hi_3 = _mm_srai_epi32(_mm_unpackhi_epi16(zero_i, q16_3), 16);
+            __m256 qf0 = _mm256_cvtepi32_ps(_mm256_set_m128i(q32hi_0, q32lo_0));
+            __m256 qf1 = _mm256_cvtepi32_ps(_mm256_set_m128i(q32hi_1, q32lo_1));
+            __m256 qf2 = _mm256_cvtepi32_ps(_mm256_set_m128i(q32hi_2, q32lo_2));
+            __m256 qf3 = _mm256_cvtepi32_ps(_mm256_set_m128i(q32hi_3, q32lo_3));
+            acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(qf0, xf));
+            acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(qf1, xf));
+            acc2 = _mm256_add_ps(acc2, _mm256_mul_ps(qf2, xf));
+            acc3 = _mm256_add_ps(acc3, _mm256_mul_ps(qf3, xf));
+        }
+        sum0 += d0 * hsum_avx(acc0);
+        sum1 += d1 * hsum_avx(acc1);
+        sum2 += d2 * hsum_avx(acc2);
+        sum3 += d3 * hsum_avx(acc3);
+    }
+    *out0 = sum0;
+    *out1 = sum1;
+    *out2 = sum2;
+    *out3 = sum3;
+#elif defined(PICOLM_AVX)
+    const block_q8_0 *b0 = (const block_q8_0 *)qx0;
+    const block_q8_0 *b1 = (const block_q8_0 *)qx1;
+    const block_q8_0 *b2 = (const block_q8_0 *)qx2;
+    const block_q8_0 *b3 = (const block_q8_0 *)qx3;
+    int nb = n / 32;
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+    const __m128i zero_i = _mm_setzero_si128();
+
+    for (int i = 0; i < nb; i++) {
+        float d0 = fp16_to_fp32_lookup(b0[i].d);
+        float d1 = fp16_to_fp32_lookup(b1[i].d);
+        float d2 = fp16_to_fp32_lookup(b2[i].d);
+        float d3 = fp16_to_fp32_lookup(b3[i].d);
+        const int8_t *qs0 = b0[i].qs, *qs1 = b1[i].qs, *qs2 = b2[i].qs, *qs3 = b3[i].qs;
+        const float *wp = w + i * 32;
+        __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+        __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+
+        for (int j = 0; j < 32; j += 8) {
+            __m256 xf = _mm256_loadu_ps(wp + j);
+            __m128i q8_0 = _mm_loadl_epi64((const __m128i *)(qs0 + j));
+            __m128i q8_1 = _mm_loadl_epi64((const __m128i *)(qs1 + j));
+            __m128i q8_2 = _mm_loadl_epi64((const __m128i *)(qs2 + j));
+            __m128i q8_3 = _mm_loadl_epi64((const __m128i *)(qs3 + j));
+            __m128i q16_0 = _mm_srai_epi16(_mm_unpacklo_epi8(zero_i, q8_0), 8);
+            __m128i q16_1 = _mm_srai_epi16(_mm_unpacklo_epi8(zero_i, q8_1), 8);
+            __m128i q16_2 = _mm_srai_epi16(_mm_unpacklo_epi8(zero_i, q8_2), 8);
+            __m128i q16_3 = _mm_srai_epi16(_mm_unpacklo_epi8(zero_i, q8_3), 8);
+            __m128i q32lo_0 = _mm_srai_epi32(_mm_unpacklo_epi16(zero_i, q16_0), 16);
+            __m128i q32hi_0 = _mm_srai_epi32(_mm_unpackhi_epi16(zero_i, q16_0), 16);
+            __m128i q32lo_1 = _mm_srai_epi32(_mm_unpacklo_epi16(zero_i, q16_1), 16);
+            __m128i q32hi_1 = _mm_srai_epi32(_mm_unpackhi_epi16(zero_i, q16_1), 16);
+            __m128i q32lo_2 = _mm_srai_epi32(_mm_unpacklo_epi16(zero_i, q16_2), 16);
+            __m128i q32hi_2 = _mm_srai_epi32(_mm_unpackhi_epi16(zero_i, q16_2), 16);
+            __m128i q32lo_3 = _mm_srai_epi32(_mm_unpacklo_epi16(zero_i, q16_3), 16);
+            __m128i q32hi_3 = _mm_srai_epi32(_mm_unpackhi_epi16(zero_i, q16_3), 16);
+            __m256 qf0 = _mm256_cvtepi32_ps(_mm256_set_m128i(q32hi_0, q32lo_0));
+            __m256 qf1 = _mm256_cvtepi32_ps(_mm256_set_m128i(q32hi_1, q32lo_1));
+            __m256 qf2 = _mm256_cvtepi32_ps(_mm256_set_m128i(q32hi_2, q32lo_2));
+            __m256 qf3 = _mm256_cvtepi32_ps(_mm256_set_m128i(q32hi_3, q32lo_3));
+            acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(qf0, xf));
+            acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(qf1, xf));
+            acc2 = _mm256_add_ps(acc2, _mm256_mul_ps(qf2, xf));
+            acc3 = _mm256_add_ps(acc3, _mm256_mul_ps(qf3, xf));
+        }
+        sum0 += d0 * hsum_avx(acc0);
+        sum1 += d1 * hsum_avx(acc1);
+        sum2 += d2 * hsum_avx(acc2);
+        sum3 += d3 * hsum_avx(acc3);
+    }
+    *out0 = sum0;
+    *out1 = sum1;
+    *out2 = sum2;
+    *out3 = sum3;
+#elif defined(PICOLM_NEON)
+    const block_q8_0 *b0 = (const block_q8_0 *)qx0;
+    const block_q8_0 *b1 = (const block_q8_0 *)qx1;
+    const block_q8_0 *b2 = (const block_q8_0 *)qx2;
+    const block_q8_0 *b3 = (const block_q8_0 *)qx3;
+    int nb = n / 32;
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        float d0 = fp16_to_fp32_lookup(b0[i].d);
+        float d1 = fp16_to_fp32_lookup(b1[i].d);
+        float d2 = fp16_to_fp32_lookup(b2[i].d);
+        float d3 = fp16_to_fp32_lookup(b3[i].d);
+        const int8_t *qs0 = b0[i].qs, *qs1 = b1[i].qs, *qs2 = b2[i].qs, *qs3 = b3[i].qs;
+        const float *wp = w + i * 32;
+        float32x4_t acc0 = vdupq_n_f32(0), acc1 = vdupq_n_f32(0);
+        float32x4_t acc2 = vdupq_n_f32(0), acc3 = vdupq_n_f32(0);
+
+        for (int j = 0; j < 32; j += 4) {
+            float32x4_t xf = vld1q_f32(wp + j);
+            int8x8_t q8_0 = vld1_s8(qs0 + j);
+            int8x8_t q8_1 = vld1_s8(qs1 + j);
+            int8x8_t q8_2 = vld1_s8(qs2 + j);
+            int8x8_t q8_3 = vld1_s8(qs3 + j);
+            int16x8_t q16_0 = vmovl_s8(q8_0);
+            int16x8_t q16_1 = vmovl_s8(q8_1);
+            int16x8_t q16_2 = vmovl_s8(q8_2);
+            int16x8_t q16_3 = vmovl_s8(q8_3);
+            float32x4_t qf0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16_0)));
+            float32x4_t qf1 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16_1)));
+            float32x4_t qf2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16_2)));
+            float32x4_t qf3 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16_3)));
+            acc0 = vmlaq_f32(acc0, qf0, xf);
+            acc1 = vmlaq_f32(acc1, qf1, xf);
+            acc2 = vmlaq_f32(acc2, qf2, xf);
+            acc3 = vmlaq_f32(acc3, qf3, xf);
+            qf0 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16_0)));
+            qf1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16_1)));
+            qf2 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16_2)));
+            qf3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(q16_3)));
+            xf  = vld1q_f32(wp + j + 4);
+            acc0 = vmlaq_f32(acc0, qf0, xf);
+            acc1 = vmlaq_f32(acc1, qf1, xf);
+            acc2 = vmlaq_f32(acc2, qf2, xf);
+            acc3 = vmlaq_f32(acc3, qf3, xf);
+        }
+        sum0 += d0 * vaddvq_f32_compat(acc0);
+        sum1 += d1 * vaddvq_f32_compat(acc1);
+        sum2 += d2 * vaddvq_f32_compat(acc2);
+        sum3 += d3 * vaddvq_f32_compat(acc3);
+    }
+    *out0 = sum0;
+    *out1 = sum1;
+    *out2 = sum2;
+    *out3 = sum3;
+#else
+    /* Scalar fallback: 4 independent calls */
     *out0 = vec_dot_q8_0_f32(qx0, w, n);
     *out1 = vec_dot_q8_0_f32(qx1, w, n);
     *out2 = vec_dot_q8_0_f32(qx2, w, n);
     *out3 = vec_dot_q8_0_f32(qx3, w, n);
+#endif
 }
 
 /* ================================================================
