@@ -3856,7 +3856,7 @@ float vec_dot_q8_0_f32(const void *src, const float *x, int n) {
 #ifdef PICOLM_NEON
         float32x4_t acc = vdupq_n_f32(0);
 
-        for (int j = 0; j < 32; j += 4) {
+        for (int j = 0; j < 32; j += 8) {
             int8x8_t q8 = vld1_s8(qs + j);
             int16x8_t q16 = vmovl_s8(q8);
             /* Widen int16 -> int32, then convert to float32 */
@@ -4062,7 +4062,7 @@ void vec_dot_q8_0_f32_batch4(const void *qx0, const void *qx1, const void *qx2, 
         float32x4_t acc0 = vdupq_n_f32(0), acc1 = vdupq_n_f32(0);
         float32x4_t acc2 = vdupq_n_f32(0), acc3 = vdupq_n_f32(0);
 
-        for (int j = 0; j < 32; j += 4) {
+        for (int j = 0; j < 32; j += 8) {
             float32x4_t xf = vld1q_f32(wp + j);
             int8x8_t q8_0 = vld1_s8(qs0 + j);
             int8x8_t q8_1 = vld1_s8(qs1 + j);
@@ -5316,7 +5316,7 @@ void scale_add_q8_0_f32(float *dst, float scale, const void *src, int n) {
         }
 #elif defined(PICOLM_NEON)
         float32x4_t sd_v = vdupq_n_f32(sd);
-        for (int j = 0; j < 32; j += 4) {
+        for (int j = 0; j < 32; j += 8) {
             int8x8_t q8 = vld1_s8(qs + j);
             int16x8_t q16 = vmovl_s8(q8);
             float32x4_t qf0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16)));
@@ -5403,7 +5403,7 @@ void fma_scale_q8_0_f32(float *dst, float correction, const void *src, int n) {
 #elif defined(PICOLM_NEON)
         float32x4_t corr = vdupq_n_f32(correction);
         float32x4_t df = vdupq_n_f32(d);
-        for (int j = 0; j < 32; j += 4) {
+        for (int j = 0; j < 32; j += 8) {
             int8x8_t q8 = vld1_s8(qs + j);
             int16x8_t q16 = vmovl_s8(q8);
             float32x4_t qf0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(q16)));
