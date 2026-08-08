@@ -15,6 +15,9 @@ typedef struct {
     const int32_t *token_type;  /* token_type[i] = type of token i (3=control, 4=user_defined) */
     int n_token_type;           /* number of entries in token_type array */
     int add_space_prefix;       /* prepend space marker to input (from GGUF add_space_prefix) */
+    /* Special tokens cache (for SPM partitioning) */
+    int    *special_tokens;   /* token IDs of special tokens (type 3/4/5), sorted by string length desc */
+    int     n_special_tokens; /* number of special tokens */
 } tokenizer_t;
 
 /* Load tokenizer data from GGUF metadata pointers in model.
