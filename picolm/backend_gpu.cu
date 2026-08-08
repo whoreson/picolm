@@ -1581,12 +1581,10 @@ picolm_ssm_recurrence_warp_kernel(float *state,
         q[i] = (lane * cols_per_lane + i < S_v) ? qh[lane * cols_per_lane + i] : 0.0f;
     }
 
-    /* Load v for this head. */
+    /* Load v for this head. v is indexed by row (one scalar per row),
+     * not by column like k/q. Every lane reads the same v[row]. */
     const float *vh = v_conv + head * S_v;
-    float v_shard[cols_per_lane];
-    for (int i = 0; i < cols_per_lane; i++) {
-        v_shard[i] = (lane * cols_per_lane + i < S_v) ? vh[lane * cols_per_lane + i] : 0.0f;
-    }
+    const float v0 = vh[row];
 
     /* Step 1: sk = S @ k (matvec with UNDECAYED state, decay applied later) */
     float sk_shard = 0.0f;
@@ -1595,20 +1593,8 @@ picolm_ssm_recurrence_warp_kernel(float *state,
     }
     float sk_row = picolm_warp_reduce_sum<warp_size>(sk_shard);
 
-    /* Step 2: delta = (v - ge * sk) * beta */
-    float delta = (v_shard[0] - ge * sk_row) * bh;  /* v_shard[0] only valid for lane 0's v */
-
-    /* Step 3: broadcast delta from lane 0 */
-    delta = gpu_shfl_xor_sync(delta, 0, warp_size);  /* actually need lane 0, but we compute per-lane */
-    /* Actually each lane has its own v_shard[0], so delta is different per lane.
-     * Wait - delta is per-ROW, not per-lane. We need to compute it once.
-     * Lane 0 has v[row], so compute delta there and broadcast. */
-    /* Recompute: only lane with v[0] contributes */
-    /* Actually the formula is: delta = (v[row] - ge * sk_row) * beta[head]
-     * v[row] is the same for all lanes in this warp (same row).
-     * We need v_shard from whichever lane owns column 0 -- that's lane 0. */
-    float v0 = gpu_shfl_xor_sync(v_shard[0], 0, warp_size);
-    delta = (v0 - ge * sk_row) * bh;
+    /* Step 2: delta = (v[row] - ge * sk) * beta[head] */
+    float delta = (v0 - ge * sk_row) * bh;
 
     /* Step 4: S[row][col] = ge * S[row][col] + k[col] * delta (fused decay + outer product) */
     for (int i = 0; i < cols_per_lane; i++) {

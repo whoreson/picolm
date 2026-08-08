@@ -2752,19 +2752,11 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                     if (c->rope_type != 0 && c->rope_type != 1) eligible = 0;
                     /* F16 KV cache only */
                     if (kv_type_k != KV_CACHE_F16 || kv_type_v != KV_CACHE_F16) eligible = 0;
-                    /* SSM models: shape validation passes but the GPU SSM pipeline
-                     * produces incorrect results (known bug in device SSM recurrence/
-                     * vecdot kernels on GB10 and potentially other architectures).
-                     * Veto from GPU pipeline; CPU ssm_forward path works correctly. */
-                    if (c->has_ssm) {
-                        if (c->ssm_d_state <= 0 || c->ssm_d_state > 256) eligible = 0;
-                        if (c->ssm_dt_rank <= 0) eligible = 0;        /* n_v_heads */
-                        if (c->ssm_n_group <= 0) eligible = 0;        /* n_k_heads */
-                        if (c->ssm_d_inner <= 0) eligible = 0;        /* value_dim */
-                        if (c->ssm_d_conv <= 1) eligible = 0;         /* need >=2 taps */
-                        if (eligible && c->ssm_d_inner % c->ssm_dt_rank != 0) eligible = 0;
-                        /* GPU SSM pipeline: enabled */
-                    }
+                    /* GPU pipeline doesn't support SSM models yet.
+                     * The attention pipeline doesn't handle Q+gate interleaving,
+                     * and the SSM kernels (recurrence, vecdot, gated_norm) have
+                     * correctness issues. Fall back to CPU. */
+                    if (c->has_ssm) eligible = 0;
 
                     if (eligible) {
                         /* Compute KV cache sizes matching CPU allocation */
