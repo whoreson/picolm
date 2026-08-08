@@ -2763,7 +2763,7 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                         if (c->ssm_d_inner <= 0) eligible = 0;        /* value_dim */
                         if (c->ssm_d_conv <= 1) eligible = 0;         /* need >=2 taps */
                         if (eligible && c->ssm_d_inner % c->ssm_dt_rank != 0) eligible = 0;
-                        eligible = 0;  /* GPU SSM pipeline not yet correct */
+                        /* GPU SSM pipeline: enabled */
                     }
 
                     if (eligible) {

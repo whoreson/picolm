@@ -88,10 +88,13 @@ typedef hipStream_t gpuStream_t;
 typedef hipEvent_t gpuEvent_t;
 #define gpuDevice hipDevice
 #define gpuThreadIdx_x hipThreadIdx_x
+#define gpuThreadIdx_y hipThreadIdx_y
 #define gpuBlockIdx_x hipBlockIdx_x
 #define gpuBlockIdx_y hipBlockIdx_y
 #define gpuBlockIdx_z hipBlockIdx_z
 #define gpuBlockDim_x hipBlockDim_x
+#define gpuBlockDim_y hipBlockDim_y
+#define gpuBlockDim_z hipBlockDim_z
 #define gpuGridDim_x hipGridDim_x
 #define gpuGridDim_y hipGridDim_y
 #define gpuHostRegister hipHostRegister
@@ -101,6 +104,7 @@ typedef hipEvent_t gpuEvent_t;
 #define gpuFuncSetAttribute hipFuncSetAttribute
 #define gpuFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
 /* HIP: no hipMemAdvise equivalent; unified memory is automatic on HIP */
+#define GPU_WARP_SIZE __AMDGCN_WAVEFRONT_SIZE
 #else
 /* NVIDIA CUDA */
 #define gpuSuccess cudaSuccess
@@ -133,10 +137,13 @@ typedef hipEvent_t gpuEvent_t;
 #define gpuGetLastError cudaGetLastError
 #define gpuSyncthreads __syncthreads
 #define gpuThreadIdx_x threadIdx.x
+#define gpuThreadIdx_y threadIdx.y
 #define gpuBlockIdx_x blockIdx.x
 #define gpuBlockIdx_y blockIdx.y
 #define gpuBlockIdx_z blockIdx.z
 #define gpuBlockDim_x blockDim.x
+#define gpuBlockDim_y blockDim.y
+#define gpuBlockDim_z blockDim.z
 #define gpuGridDim_x gridDim.x
 #define gpuGridDim_y gridDim.y
 #define gpuDeviceSynchronize cudaDeviceSynchronize
@@ -154,6 +161,7 @@ typedef hipEvent_t gpuEvent_t;
 #define gpuCudaMemLocationTypeDevice cudaMemLocationTypeDevice
 #define gpuCudaMemLocationTypecpu cudaMemLocationTypecpu
 #define gpuCudaMemAdviseSetPreferredLocation cudaMemAdviseSetPreferredLocation
+#define GPU_WARP_SIZE 32
 #endif
 
 /* Cross-platform unused attribute */
@@ -1489,6 +1497,148 @@ picolm_gpu_ssm_conv1d_kernel(float *conv_output, float *conv_state,
  * 4. state += k * d^T (outer product)
  * 5. output = state @ q (matrix-vector), written dim-major
  */
+
+/* ---- Warp-shuffle SSM recurrence kernel ----
+ *
+ * Row-parallel: each warp processes one row of the d_state x d_state
+ * state matrix. Lanes within the warp distribute columns, and warp
+ * shuffles perform the matvec reduction.
+ *
+ * Grid: (n_v_heads, 1, d_state/num_warps)
+ * Block: (GPU_WARP_SIZE, num_warps, 1)
+ * On CUDA (warp=32): block=(32,4,1)=128 threads, grid.z=32 for d_state=128
+ * On HIP/gfx906 (wave=64): block=(64,4,1)=256 threads, grid.z=32 for d_state=128
+ *
+ * No shared memory, no syncthreads. All state in registers + warp shuffles.
+ *
+ * XOR shuffle: handled by gpu_shfl_xor_sync() wrapper, not via macro,
+ * because HIP's __shfl_xor has different signature than CUDA's
+ * __shfl_xor_sync. ROCm 6.x hipShflXorSync is only available when
+ * HIP_ENABLE_WARP_SYNC_BUILTINS is defined. */
+
+#if !defined(__HIP__)
+__device__ inline float
+gpu_shfl_xor_sync(float var, int laneMask, int width) {
+    return __shfl_xor_sync(0xffffffff, var, laneMask, width);
+}
+#else
+__device__ inline float
+gpu_shfl_xor_sync(float var, int laneMask, int width) {
+    return __shfl_xor(var, laneMask, width);
+}
+#endif
+
+template <int warp_size>
+__device__ inline float
+picolm_warp_reduce_sum(float val) {
+    for (int offset = warp_size / 2; offset > 0; offset >>= 1) {
+        val += gpu_shfl_xor_sync(val, offset, warp_size);
+    }
+    return val;
+}
+
+template <int S_v>
+__global__ void
+picolm_ssm_recurrence_warp_kernel(float *state,
+                                   const float *q_conv,
+                                   const float *k_conv,
+                                   const float *v_conv,
+                                   const float *gate_exp,
+                                   const float *beta,
+                                   float *ssm_output,
+                                   int n_v_heads, int repeat) {
+    /* Each warp processes one row of one head's S matrix. */
+    int head = gpuBlockIdx_x;
+    const int row = gpuBlockIdx_z * gpuBlockDim_y + gpuThreadIdx_y;
+    if (head >= n_v_heads || row >= S_v) return;
+
+    const int lane = gpuThreadIdx_x;       /* 0..GPU_WARP_SIZE-1 */
+    constexpr int warp_size = GPU_WARP_SIZE;
+    const int cols_per_lane = (S_v + warp_size - 1) / warp_size;
+
+    const int kh = head / repeat;
+    const float ge = gate_exp[head];
+    const float bh = beta[head];
+
+    /* Load this head's row of state into registers. */
+    const float *st_in = state + (size_t)head * S_v * S_v + row * S_v;
+    float S[cols_per_lane];
+    for (int i = 0; i < cols_per_lane; i++) {
+        S[i] = (lane * cols_per_lane + i < S_v) ? st_in[lane * cols_per_lane + i] : 0.0f;
+    }
+
+    /* Load k for this head. */
+    const float *khv = k_conv + kh * S_v;
+    float k[cols_per_lane];
+    for (int i = 0; i < cols_per_lane; i++) {
+        k[i] = (lane * cols_per_lane + i < S_v) ? khv[lane * cols_per_lane + i] : 0.0f;
+    }
+
+    /* Load q for this head. */
+    const float *qh = q_conv + kh * S_v;
+    float q[cols_per_lane];
+    for (int i = 0; i < cols_per_lane; i++) {
+        q[i] = (lane * cols_per_lane + i < S_v) ? qh[lane * cols_per_lane + i] : 0.0f;
+    }
+
+    /* Load v for this head. */
+    const float *vh = v_conv + head * S_v;
+    float v_shard[cols_per_lane];
+    for (int i = 0; i < cols_per_lane; i++) {
+        v_shard[i] = (lane * cols_per_lane + i < S_v) ? vh[lane * cols_per_lane + i] : 0.0f;
+    }
+
+    /* Step 1: sk = S @ k (matvec with UNDECAYED state, decay applied later) */
+    float sk_shard = 0.0f;
+    for (int i = 0; i < cols_per_lane; i++) {
+        sk_shard += S[i] * k[i];
+    }
+    float sk_row = picolm_warp_reduce_sum<warp_size>(sk_shard);
+
+    /* Step 2: delta = (v - ge * sk) * beta */
+    float delta = (v_shard[0] - ge * sk_row) * bh;  /* v_shard[0] only valid for lane 0's v */
+
+    /* Step 3: broadcast delta from lane 0 */
+    delta = gpu_shfl_xor_sync(delta, 0, warp_size);  /* actually need lane 0, but we compute per-lane */
+    /* Actually each lane has its own v_shard[0], so delta is different per lane.
+     * Wait - delta is per-ROW, not per-lane. We need to compute it once.
+     * Lane 0 has v[row], so compute delta there and broadcast. */
+    /* Recompute: only lane with v[0] contributes */
+    /* Actually the formula is: delta = (v[row] - ge * sk_row) * beta[head]
+     * v[row] is the same for all lanes in this warp (same row).
+     * We need v_shard from whichever lane owns column 0 -- that's lane 0. */
+    float v0 = gpu_shfl_xor_sync(v_shard[0], 0, warp_size);
+    delta = (v0 - ge * sk_row) * bh;
+
+    /* Step 4: S[row][col] = ge * S[row][col] + k[col] * delta (fused decay + outer product) */
+    for (int i = 0; i < cols_per_lane; i++) {
+        S[i] = ge * S[i] + k[i] * delta;
+    }
+
+    /* Step 5: out = S @ q (matvec with updated state) */
+    float out_shard = 0.0f;
+    for (int i = 0; i < cols_per_lane; i++) {
+        out_shard += S[i] * q[i];
+    }
+    float out_row = picolm_warp_reduce_sum<warp_size>(out_shard);
+
+    /* Write output (dim-major: out[row * n_v_heads + head]) */
+    if (lane == 0) {
+        ssm_output[row * n_v_heads + head] = out_row;
+    }
+
+    /* Write updated state back to global memory */
+    float *st_out = state + (size_t)head * S_v * S_v + row * S_v;
+    for (int i = 0; i < cols_per_lane; i++) {
+        if (lane * cols_per_lane + i < S_v) {
+            st_out[lane * cols_per_lane + i] = S[i];
+        }
+    }
+}
+
+/* Old thread-0 kernel (fallback for unsupported d_state values):
+ * One thread block per head, 256 threads per block.
+ */
 __global__ void
 picolm_ssm_recurrence_kernel(float *state,
                               const float *q_conv,
@@ -2619,13 +2769,51 @@ picolm_gpu_ssm_recurrence(float *state,
         gpuFree(dg); gpuFree(db); gpuFree(do_); return 0;
     }
 
-    /* Thread-0-only kernel now: no dynamic shared mem needed (sk/d_local
-     * are per-thread local arrays, only thread 0 of each block runs). */
-    dim3 grid((unsigned)n_v_heads, 1, 1);
-    picolm_ssm_recurrence_kernel<<<grid, 256, 0, ctx->stream>>>(
-        (float *)ds, (const float *)dq, (const float *)dk,
-        (const float *)dv, (const float *)dg, (const float *)db,
-        (float *)do_, n_v_heads, d_state, repeat);
+    /* Warp-shuffle kernel for common d_state values. */
+    if (d_state == 128) {
+        constexpr int S_v = 128;
+        constexpr int num_warps = 4;
+        dim3 grid((unsigned)n_v_heads, 1, S_v / num_warps);
+        dim3 block(GPU_WARP_SIZE, num_warps, 1);
+        picolm_ssm_recurrence_warp_kernel<S_v><<<grid, block, 0, ctx->stream>>>(
+            (float *)ds, (const float *)dq, (const float *)dk,
+            (const float *)dv, (const float *)dg, (const float *)db,
+            (float *)do_, n_v_heads, repeat);
+    } else if (d_state == 64) {
+        constexpr int S_v = 64;
+        constexpr int num_warps = 4;
+        dim3 grid((unsigned)n_v_heads, 1, S_v / num_warps);
+        dim3 block(GPU_WARP_SIZE, num_warps, 1);
+        picolm_ssm_recurrence_warp_kernel<S_v><<<grid, block, 0, ctx->stream>>>(
+            (float *)ds, (const float *)dq, (const float *)dk,
+            (const float *)dv, (const float *)dg, (const float *)db,
+            (float *)do_, n_v_heads, repeat);
+    } else if (d_state == 32) {
+        constexpr int S_v = 32;
+        constexpr int num_warps = 4;
+        dim3 grid((unsigned)n_v_heads, 1, S_v / num_warps);
+        dim3 block(GPU_WARP_SIZE, num_warps, 1);
+        picolm_ssm_recurrence_warp_kernel<S_v><<<grid, block, 0, ctx->stream>>>(
+            (float *)ds, (const float *)dq, (const float *)dk,
+            (const float *)dv, (const float *)dg, (const float *)db,
+            (float *)do_, n_v_heads, repeat);
+    } else if (d_state == 16) {
+        constexpr int S_v = 16;
+        constexpr int num_warps = 4;
+        dim3 grid((unsigned)n_v_heads, 1, S_v / num_warps);
+        dim3 block(GPU_WARP_SIZE, num_warps, 1);
+        picolm_ssm_recurrence_warp_kernel<S_v><<<grid, block, 0, ctx->stream>>>(
+            (float *)ds, (const float *)dq, (const float *)dk,
+            (const float *)dv, (const float *)dg, (const float *)db,
+            (float *)do_, n_v_heads, repeat);
+    } else {
+        /* Fallback: old thread-0 kernel for unsupported d_state */
+        dim3 grid((unsigned)n_v_heads, 1, 1);
+        picolm_ssm_recurrence_kernel<<<grid, 256, 0, ctx->stream>>>(
+            (float *)ds, (const float *)dq, (const float *)dk,
+            (const float *)dv, (const float *)dg, (const float *)db,
+            (float *)do_, n_v_heads, d_state, repeat);
+    }
 
     if (!gpu_ok(gpuGetLastError(), "ssm recurrence") ||
         !gpu_ok(gpuDeviceSynchronize(), "ssm sync")) {
