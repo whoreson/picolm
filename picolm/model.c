@@ -9776,7 +9776,11 @@ int kvcache_load(model_t *m, const char *path, int **tokens_out) {
     }
 
     _kv_close(fd);
-    fprintf(stderr, "\nKV cache loaded: %d positions from %s\n", n_pos, path);
+    fprintf(stderr, "\nKV cache loaded: %d positions from %s", n_pos, path);
+    if (has_ssm && header[10] > 0) {
+        fprintf(stderr, " + SSM state (%.1f MB)", (double)(size_t)header[10] / (1024.0 * 1024.0));
+    }
+    fprintf(stderr, "\n");
     return n_pos;
 }
 

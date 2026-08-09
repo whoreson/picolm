@@ -491,9 +491,9 @@ static void checkpoint_evict_one(void) {
 
 /* Reconstruct KV row stride from kv_cache_type enum value */
 static size_t kv_stride_from_type(int kv_type, int n_elements) {
-    if (kv_type == 0) return (size_t)n_elements * sizeof(uint16_t);  /* KV_CACHE_F16 */
-    if (kv_type == 1) return ((size_t)(n_elements / 32)) * 40;        /* KV_CACHE_Q8_0 */
-    if (kv_type == 2) return ((size_t)(n_elements / 32)) * 20;        /* KV_CACHE_Q4_0 */
+    if (kv_type == 0) return (size_t)n_elements * sizeof(uint16_t);          /* KV_CACHE_F16 */
+    if (kv_type == 1) return ((size_t)(n_elements / 32)) * sizeof(block_q8_0); /* KV_CACHE_Q8_0 */
+    if (kv_type == 2) return ((size_t)(n_elements / 32)) * sizeof(block_q4_0); /* KV_CACHE_Q4_0 */
     return (size_t)n_elements * sizeof(float); /* fallback F32 */
 }
 
@@ -1396,6 +1396,9 @@ static void handle_slots_post(SOCKET sock, const char *body) {
                             }
 #endif
                         }
+                    } else {
+                        fprintf(stderr, "\n[server] No SSM checkpoint section found at offset %lld (magic=0x%08X, expected=0x43505350)\n",
+                                (long long)kv_end, (unsigned)cp_magic);
                     }
                 }
 #ifdef _WIN32
