@@ -880,7 +880,7 @@ int main(int argc, char **argv) {
             if (do_prefill) {
                 bench.is_prefill = 1;
 #ifdef PICOLM_GPU
-                if (model.gpu.kv_active && 0) { /* TEMP: skip GPU prefill */
+                if (model.gpu.kv_active) {
                     logits = model_forward_prefill_gpu(&model, prompt_tokens, n_prompt, 0, NULL);
                     if (!logits) logits = model_forward_prefill(&model, prompt_tokens, n_prompt, 0, NULL);
                 } else
@@ -912,7 +912,7 @@ int main(int argc, char **argv) {
                     bench.gen_tokens++;
                     pos++;
 #ifdef PICOLM_GPU
-                    if (model.gpu.kv_active && 0) { /* TEMP: skip GPU gen */
+                    if (model.gpu.kv_active) {
                         logits = model_forward_gpu(&model, token, pos);
                         if (!logits) logits = model_forward(&model, token, pos);
 
@@ -1017,6 +1017,7 @@ int main(int argc, char **argv) {
 
                 grammar_apply(&grammar, logits, model.config.vocab_size);
         next = sampler_sample(&sampler, logits, model.config.vocab_size);
+        fprintf(stderr, "[GEN] pos=%d next=%d eos=%d\n", pos, next, (int)tokenizer.eos_id);
 
         /* Update grammar state with the generated token */
         grammar_advance(&grammar, &tokenizer, next);

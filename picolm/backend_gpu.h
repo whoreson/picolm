@@ -360,6 +360,20 @@ float *picolm_gpu_pipe_ffn_norm(int device);
 float *picolm_gpu_pipe_gate(int device);
 float *picolm_gpu_pipe_up(int device);
 
+/* Q+gate de-interleave for SSM attention layers. */
+int picolm_gpu_qg_deinterleave_dev(const float *raw_dev, float *out_q_dev,
+                                    float *out_g_dev, int n_heads, int head_dim,
+                                    int device);
+/* Elementwise sigmoid-multiply for SSM gated attention output. */
+int picolm_gpu_sigmoid_mul_dev(float *out_dev, const float *gate_dev,
+                                int n, int device);
+/* Batched versions for prefill (S sequences). */
+int picolm_gpu_qg_deinterleave_batched_dev(const float *raw_dev, float *out_q_dev,
+                                            float *out_g_dev, int n_heads,
+                                            int head_dim, int S, int device);
+int picolm_gpu_sigmoid_mul_batched_dev(float *out_dev, const float *gate_dev,
+                                       int n, int S, int device);
+
 /* Prefill batch buffer accessors (S>1, [max_seq_len][dim] layout). */
 float *picolm_gpu_pipe_x_b(int device);
 float *picolm_gpu_pipe_xb_b(int device);

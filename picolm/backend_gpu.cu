@@ -4021,6 +4021,73 @@ picolm_gpu_residual_add_kernel(float *out, const float *a, const float *b, int n
     }
 }
 
+/* Q+gate de-interleave kernel for SSM attention layers.
+ * GGUF stores [Q_0, Gate_0, Q_1, Gate_1, ...] per head, each head_dim floats.
+ * Reads raw[head * 2 * head_dim + ...], writes Q to out_q[head * head_dim + ...]
+ * and Gate to out_g[head * head_dim + ...].
+ * One thread per head, thread-0 of each block does the memmove-like copy. */
+__global__ void
+picolm_gpu_qg_deinterleave_kernel(const float *raw, float *out_q, float *out_g,
+                                   int n_heads, int head_dim) {
+    int h = gpuBlockIdx_x * gpuBlockDim_x + gpuThreadIdx_x;
+    if (h >= n_heads) return;
+    const float *src = raw + (size_t)h * 2 * head_dim;
+    float *dst_q = out_q + (size_t)h * head_dim;
+    float *dst_g = out_g + (size_t)h * head_dim;
+    for (int d = 0; d < head_dim; d++) {
+        dst_q[d] = src[d];           /* Q portion */
+        dst_g[d] = src[head_dim + d]; /* Gate portion */
+    }
+}
+
+/* Elementwise sigmoid-multiply kernel: out[i] = a[i] * sigmoid(g[i])
+ * For SSM attention: pipe_attn_out *= sigmoid(gate) before output projection. */
+__global__ void
+picolm_gpu_sigmoid_mul_kernel(float *out, const float *gate, int n) {
+    int i = gpuThreadIdx_x + (int)gpuBlockIdx_x * gpuBlockDim_x;
+    for (; i < n; i += (int)gridDim.x * gpuBlockDim_x) {
+        float g = gate[i];
+        float sg = (g > 20.0f) ? 1.0f : (g < -20.0f) ? 0.0f : 1.0f / (1.0f + expf(-g));
+        out[i] *= sg;
+    }
+}
+
+/* Batched Q+gate de-interleave: processes S sequences, each with n_heads heads.
+ * raw is [S][n_heads * 2 * head_dim], out_q is [S][n_heads * head_dim],
+ * out_g is [S][n_heads * head_dim]. */
+__global__ void
+picolm_gpu_qg_deinterleave_batched_kernel(const float *raw, float *out_q,
+                                           float *out_g, int n_heads,
+                                           int head_dim, int S) {
+    int idx = gpuBlockIdx_x * gpuBlockDim_x + gpuThreadIdx_x;
+    int total = n_heads * S;
+    if (idx >= total) return;
+    int s = idx / n_heads;
+    int h = idx % n_heads;
+    size_t row_stride = (size_t)n_heads * 2 * head_dim;
+    size_t q_stride = (size_t)n_heads * head_dim;
+    const float *src = raw + (size_t)s * row_stride + (size_t)h * 2 * head_dim;
+    float *dst_q = out_q + (size_t)s * q_stride + (size_t)h * head_dim;
+    float *dst_g = out_g + (size_t)s * q_stride + (size_t)h * head_dim;
+    for (int d = 0; d < head_dim; d++) {
+        dst_q[d] = src[d];
+        dst_g[d] = src[head_dim + d];
+    }
+}
+
+/* Batched sigmoid-multiply: processes S sequences, each n elements. */
+__global__ void
+picolm_gpu_sigmoid_mul_batched_kernel(float *out, const float *gate,
+                                       int n, int S) {
+    int i = gpuThreadIdx_x + (int)gpuBlockIdx_x * gpuBlockDim_x;
+    int total = n * S;
+    for (; i < total; i += (int)gridDim.x * gpuBlockDim_x) {
+        float g = gate[i];
+        float sg = (g > 20.0f) ? 1.0f : (g < -20.0f) ? 0.0f : 1.0f / (1.0f + expf(-g));
+        out[i] *= sg;
+    }
+}
+
 /* Phase 2 host API */
 /* Device-native rmsnorm: all pointers are device-resident, no H2D/D2H, no sync.
  * Used from model_forward_gpu() pipeline path. */
@@ -4157,6 +4224,62 @@ picolm_gpu_residual_add(float *out, const float *a, const float *b,
     picolm_gpu_residual_add_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
         out, a, b, n);
     if (!gpu_ok(gpuGetLastError(), "residual_add kernel")) return 0;
+    return 1;
+}
+
+extern "C" int
+picolm_gpu_qg_deinterleave_dev(const float *raw_dev, float *out_q_dev,
+                                float *out_g_dev, int n_heads, int head_dim,
+                                int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    int n_threads = 256;
+    int n_blocks = min((n_heads + n_threads - 1) / n_threads, 256);
+    picolm_gpu_qg_deinterleave_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
+        raw_dev, out_q_dev, out_g_dev, n_heads, head_dim);
+    if (!gpu_ok(gpuGetLastError(), "qg_deinterleave kernel")) return 0;
+    return 1;
+}
+
+extern "C" int
+picolm_gpu_sigmoid_mul_dev(float *out_dev, const float *gate_dev,
+                            int n, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    int n_threads = 256;
+    int n_blocks = min((n + n_threads - 1) / n_threads, 256);
+    picolm_gpu_sigmoid_mul_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
+        out_dev, gate_dev, n);
+    if (!gpu_ok(gpuGetLastError(), "sigmoid_mul kernel")) return 0;
+    return 1;
+}
+
+extern "C" int
+picolm_gpu_qg_deinterleave_batched_dev(const float *raw_dev, float *out_q_dev,
+                                        float *out_g_dev, int n_heads,
+                                        int head_dim, int S, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    int total = n_heads * S;
+    int n_threads = 256;
+    int n_blocks = min((total + n_threads - 1) / n_threads, 256);
+    picolm_gpu_qg_deinterleave_batched_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
+        raw_dev, out_q_dev, out_g_dev, n_heads, head_dim, S);
+    if (!gpu_ok(gpuGetLastError(), "qg_deinterleave_batched kernel")) return 0;
+    return 1;
+}
+
+extern "C" int
+picolm_gpu_sigmoid_mul_batched_dev(float *out_dev, const float *gate_dev,
+                                   int n, int S, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    int total = n * S;
+    int n_threads = 256;
+    int n_blocks = min((total + n_threads - 1) / n_threads, 256);
+    picolm_gpu_sigmoid_mul_batched_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
+        out_dev, gate_dev, n, S);
+    if (!gpu_ok(gpuGetLastError(), "sigmoid_mul_batched kernel")) return 0;
     return 1;
 }
 

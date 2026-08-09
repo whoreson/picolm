@@ -2753,9 +2753,9 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                     /* F16 KV cache only */
                     if (kv_type_k != KV_CACHE_F16 || kv_type_v != KV_CACHE_F16) eligible = 0;
                     /* GPU pipeline doesn't support SSM models yet.
-                     * The attention pipeline doesn't handle Q+gate interleaving,
-                     * and the SSM kernels (recurrence, vecdot, gated_norm) have
-                     * correctness issues. Fall back to CPU. */
+                     * QK-norm and Q+gate de-interleaving are fixed, but
+                     * the SSM layer fallback (D2H->CPU ssm_forward->H2D)
+                     * corrupts GPU pipeline state. Disable for now. */
                     if (c->has_ssm) eligible = 0;
 
                     if (eligible) {
@@ -2784,11 +2784,14 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                             /* Phase 2: allocate pipeline buffers and upload norm/RoPE weights */
                             int q_dim = c->n_heads * c->head_dim;
                             int kv_dim = c->n_kv_heads * c->head_dim;
-                            if (!picolm_gpu_pipeline_alloc(c->n_embd, q_dim, kv_dim, c->n_ffn, device)) {
+                            /* SSM models use q_full_dim = 2*q_dim for attention Q+gate projection.
+                             * pipe_q and pipe_attn_out must be sized for the larger output. */
+                            int q_pipeline_dim = c->has_ssm ? (q_dim * 2) : q_dim;
+                            if (!picolm_gpu_pipeline_alloc(c->n_embd, q_pipeline_dim, kv_dim, c->n_ffn, device)) {
                                 fprintf(stderr, "WARN: GPU pipeline buffer alloc failed\n");
                             }
                             /* Prefill batch buffers */
-                            if (!picolm_gpu_pipeline_batch_alloc(c->n_embd, q_dim, kv_dim,
+                            if (!picolm_gpu_pipeline_batch_alloc(c->n_embd, q_pipeline_dim, kv_dim,
                                                                  c->n_ffn, c->max_seq_len, device)) {
                                 fprintf(stderr, "WARN: GPU prefill batch buffer alloc failed\n");
                             }
@@ -2810,6 +2813,13 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                                     picolm_gpu_upload_f32(s->attn_norm_w[l], c->n_embd, device);
                                 m->gpu.post_attn_norm_dev[l] =
                                     picolm_gpu_upload_f32(s->post_attn_norm_w[l], c->n_embd, device);
+                                /* QK-norm weights (Qwen3): per-head RMSNorm [head_dim] */
+                                if (s->attn_q_norm_w[l]) {
+                                    m->gpu.attn_qk_norm_q_dev[l] =
+                                        picolm_gpu_upload_f32(s->attn_q_norm_w[l], c->head_dim, device);
+                                    m->gpu.attn_qk_norm_k_dev[l] =
+                                        picolm_gpu_upload_f32(s->attn_k_norm_w[l], c->head_dim, device);
+                                }
                             }
 
                             /* SSM pipeline buffers and weight uploads (for hybrid layers) */
@@ -4838,11 +4848,14 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
             gemma3n_router(s->gemma3n_router_out, active, dim, n_altup,
                           s->altup_router_norm_w[l], s->altup_router_w[l],
                           rms_norm_eps, s->xb);
-            /* predict_coef: [n_altup, n_altup*n_altup] -> [n_altup] -> reshape [n_altup, n_altup] */
+            /* predict_coef: GGUF shape {n_altup, n_altup*n_altup}, ne[0]=n_altup, ne[1]=n_altup*n_altup.
+             * ggml_mul_mat(predict_coef, modalities) computes:
+             *   out[c] = sum_r predict_coef[r + c * n_altup] * modalities[r]
+             * (reduction over ne[0]=n_altup, output has ne[1]=n_altup*n_altup elements) */
             float *all_coefs = s->xb2;
             for (int a = 0; a < n_altup * n_altup; a++) {
                 float sum = 0;
-                for (int r = 0; r < n_altup; r++) sum += s->gemma3n_router_out[r] * ((const float *)lw->altup_predict_coef)[r * n_altup * n_altup + a];
+                for (int r = 0; r < n_altup; r++) sum += s->gemma3n_router_out[r] * ((const float *)lw->altup_predict_coef)[r + a * n_altup];
                 all_coefs[a] = sum;
             }
             if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
@@ -5129,13 +5142,15 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
                           s->altup_router_norm_w[l], s->altup_router_w[l],
                           rms_norm_eps, s->xb2);
 
-            /* correct_coefs = altup_correct_coef @ modalities + 1.0 */
+            /* correct_coefs = altup_correct_coef @ modalities + 1.0
+             * GGUF shape {n_altup, n_altup}, ne[0]=n_altup, ne[1]=n_altup.
+             * ggml_mul_mat: out[a] = sum_r correct_coef[r + a * n_altup] * modalities[r] */
             float *correct_coefs = s->xb2;
             const float *correct_coef = lw->altup_correct_coef;
             for (int a = 0; a < n_altup; a++) {
                 float sum = 0;
                 for (int r = 0; r < n_altup; r++)
-                    sum += s->gemma3n_router_out[r] * correct_coef[r * n_altup + a];
+                    sum += s->gemma3n_router_out[r] * correct_coef[r + a * n_altup];
                 correct_coefs[a] = sum + 1.0f;
             }
             if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
@@ -7379,14 +7394,12 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     ssm_ctx.gate_exp = gate_exp; ssm_ctx.beta = beta;
     ssm_ctx.ssm_output = ssm_output; /* shared, dim-major [d*n_v_heads+h] */
 #ifdef PICOLM_GPU
-    if (gpu_lw) {
-        /* GPU SSM recurrence kernel.
-         * Try the device-native variant first (uses persistent state buffer,
-         * eliminates per-call state H2D/D2H), then fall back to the old
-         * host-wrapper variant, then CPU. */
+    /* TEMP: Force CPU SSM recurrence to isolate GPU bugs.
+     * GPU recurrence has known issues with state sync and numerical correctness. */
+    if (0) {
+        /* GPU SSM recurrence kernel - disabled for now */
         int rec_done = 0;
         if (m->gpu.ssm_state_dev[il]) {
-            /* Device-native: state stays on GPU between calls */
             if (picolm_gpu_ssm_recurrence_dev(m->gpu.ssm_state_dev[il],
                                                q_conv, k_conv, v_conv,
                                                gate_exp, beta, ssm_output,
@@ -7400,7 +7413,6 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
             rec_done = 1;
         }
         if (!rec_done) {
-            /* Fall back to CPU */
             tensor_parallel_for(n_v_heads, ssm_head_task, &ssm_ctx);
         }
     } else
@@ -9166,7 +9178,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                                          vcl + (size_t)start_pos * s->kv_row_size_v,
                                          s->kv_row_size_v, n_kv_heads, head_dim,
                                          seq_len, gpu_dev);
-            }
+                }
 #endif
 
             /* Zero init xb_batch for attention accumulation */
@@ -9904,6 +9916,8 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
     int n_heads = c->n_heads;
     int n_kv_heads = c->n_kv_heads;
     int head_dim = c->head_dim;
+    int q_dim = n_heads * head_dim;
+    int kv_dim = n_kv_heads * head_dim;
     int seq_len = c->max_seq_len;
     int rope_half = head_dim / 2;
 
@@ -9960,9 +9974,20 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
                                     (float *)gw->attn_norm_dev[l],
                                     dim, c->rms_norm_eps, gpu_dev);
 
-            /* B. Q projection: pipe_q = attn_q @ pipe_xb */
+            /* B. Q projection: pipe_q = attn_q @ pipe_xb
+             * For SSM models this writes q_full_dim = 2*q_dim
+             * (interleaved [Q0,Gate0,Q1,Gate1,...]). */
             picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
                                    pipe_q, pipe_xb, 1, gpu_dev);
+
+            /* B1. For SSM models: de-interleave Q+gate from pipe_q.
+             * After this, pipe_q holds compacted Q[q_dim], pipe_gate
+             * holds gate[q_dim]. For non-SSM models, skip. */
+            if (c->has_ssm) {
+                picolm_gpu_qg_deinterleave_dev(pipe_q, pipe_q,
+                                                pipe_gate, n_heads, head_dim,
+                                                gpu_dev);
+            }
 
             /* C. K projection: pipe_k = attn_k @ pipe_xb */
             picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_k,
@@ -9972,14 +9997,26 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
             picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_v,
                                    pipe_v, pipe_xb, 1, gpu_dev);
 
-            /* E. RoPE on Q (in-place): rope(pipe_q, n_heads) */
+            /* E. QK-norm (Qwen3): per-head RMSNorm on Q and K.
+             * pipe_q is [n_heads][head_dim], weight is [head_dim].
+             * pipe_k is [n_kv_heads][head_dim], same weight layout. */
+            if (gw->attn_qk_norm_q_dev[l]) {
+                picolm_gpu_rmsnorm_batched(pipe_q, pipe_q,
+                                           (float *)gw->attn_qk_norm_q_dev[l],
+                                           head_dim, c->rms_norm_eps, n_heads, gpu_dev);
+                picolm_gpu_rmsnorm_batched(pipe_k, pipe_k,
+                                           (float *)gw->attn_qk_norm_k_dev[l],
+                                           head_dim, c->rms_norm_eps, n_kv_heads, gpu_dev);
+            }
+
+            /* F. RoPE on Q (in-place): rope(pipe_q, n_heads) */
             /* RoPE tables for this position on device */
             float *rope_cos_pos = (float *)gw->rope_cos_dev + (size_t)pos * rope_half;
             float *rope_sin_pos = (float *)gw->rope_sin_dev + (size_t)pos * rope_half;
             picolm_gpu_rope_apply(pipe_q, n_heads, head_dim,
                                    rope_cos_pos, rope_sin_pos, rope_half, c->rope_type, gpu_dev);
 
-            /* F. RoPE on K (in-place): rope(pipe_k, n_kv_heads) */
+            /* G. RoPE on K (in-place): rope(pipe_k, n_kv_heads) */
             picolm_gpu_rope_apply(pipe_k, n_kv_heads, head_dim,
                                    rope_cos_pos, rope_sin_pos, rope_half, c->rope_type, gpu_dev);
 
@@ -10020,7 +10057,15 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
                                              n_heads, n_kv_heads, head_dim,
                                              seq_len, gpu_dev);
 
-            /* I. Output projection: pipe_xb = attn_output @ pipe_attn_out */
+            /* I1. For SSM models: apply gate sigmoid to attention output.
+             * pipe_attn_out *= sigmoid(pipe_gate)
+             * This must happen before the output projection. */
+            if (c->has_ssm) {
+                picolm_gpu_sigmoid_mul_dev(pipe_attn_out, pipe_gate,
+                                            q_dim, gpu_dev);
+            }
+
+            /* I2. Output projection: pipe_xb = attn_output @ pipe_attn_out */
             picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_output,
                                    pipe_xb, pipe_attn_out, 1, gpu_dev);
 
@@ -10200,9 +10245,20 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
                                         (float *)gw->attn_norm_dev[l],
                                         dim, c->rms_norm_eps, n_tokens, gpu_dev);
 
-        /* B. Q projection: bq = attn_q @ bxb (S=n_tokens) */
+        /* B. Q projection: bq = attn_q @ bxb (S=n_tokens)
+         * For SSM models this writes q_full_dim = 2*q_dim per token. */
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
                                bq, bxb, n_tokens, gpu_dev);
+
+        /* B1. For SSM models: de-interleave Q+gate from bq.
+         * After this, bq holds compacted Q[q_dim] per token,
+         * bgate holds gate[q_dim] per token. */
+        if (c->has_ssm) {
+            int q_dim = n_heads * head_dim;
+            picolm_gpu_qg_deinterleave_batched_dev(bq, bq, bgate,
+                                                    n_heads, head_dim,
+                                                    n_tokens, gpu_dev);
+        }
 
         /* C. K projection: bk = attn_k @ bxb */
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_k,
@@ -10211,6 +10267,19 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
         /* D. V projection: bv = attn_v @ bxb */
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_v,
                                bv, bxb, n_tokens, gpu_dev);
+
+        /* D1. QK-norm (Qwen3): per-head RMSNorm on Q and K (batched over S).
+         * bq is [S][n_heads][head_dim], weight is [head_dim].
+         * bk is [S][n_kv_heads][head_dim], same weight layout.
+         * Total heads for batched RMSNorm: S * n_heads. */
+        if (gw->attn_qk_norm_q_dev[l]) {
+            picolm_gpu_rmsnorm_batched(bq, bq,
+                                       (float *)gw->attn_qk_norm_q_dev[l],
+                                       head_dim, c->rms_norm_eps, n_heads * n_tokens, gpu_dev);
+            picolm_gpu_rmsnorm_batched(bk, bk,
+                                       (float *)gw->attn_qk_norm_k_dev[l],
+                                       head_dim, c->rms_norm_eps, n_kv_heads * n_tokens, gpu_dev);
+        }
 
         /* E. RoPE on Q (batched, one launch for whole chunk) */
         picolm_gpu_rope_apply_batched(bq, n_heads, head_dim,
@@ -10236,6 +10305,13 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
                                           this_attn_ordinal - 1, start_pos, n_tokens,
                                           n_heads, n_kv_heads, head_dim,
                                           seq_len, gpu_dev);
+
+        /* H1. For SSM models: apply gate sigmoid to attention output. */
+        if (c->has_ssm) {
+            int q_dim = n_heads * head_dim;
+            picolm_gpu_sigmoid_mul_batched_dev(battn_out, bgate,
+                                                q_dim, n_tokens, gpu_dev);
+        }
 
         /* I. Output projection: bxb = attn_output @ battn_out */
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_output,

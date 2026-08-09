@@ -122,6 +122,8 @@ typedef struct {
     void *output_norm_dev;   /* device copy of output_norm_w [dim] */
     void *attn_norm_dev[MAX_LAYERS];      /* device copy of attn_norm_w[l] [dim] */
     void *post_attn_norm_dev[MAX_LAYERS]; /* device copy of post_attn_norm_w[l] [dim] */
+    void *attn_qk_norm_q_dev[MAX_LAYERS]; /* device copy of attn_q_norm_w[l] [head_dim] */
+    void *attn_qk_norm_k_dev[MAX_LAYERS]; /* device copy of attn_k_norm_w[l] [head_dim] */
     /* SSM GPU pipeline: device-resident weights and state */
     void *ssm_alpha_dev[MAX_LAYERS];      /* device copy of ssm_alpha weights [dim x dt_rank] */
     void *ssm_beta_dev[MAX_LAYERS];       /* device copy of ssm_beta weights [dim x dt_rank] */
