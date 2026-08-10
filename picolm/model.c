@@ -2752,10 +2752,9 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                     if (c->rope_type != 0 && c->rope_type != 1) eligible = 0;
                     /* F16 KV cache only */
                     if (kv_type_k != KV_CACHE_F16 || kv_type_v != KV_CACHE_F16) eligible = 0;
-                    /* GPU pipeline doesn't support SSM models yet.
-                     * QK-norm and Q+gate de-interleaving are fixed, but
-                     * the SSM layer fallback (D2H->CPU ssm_forward->H2D)
-                     * corrupts GPU pipeline state. Disable for now. */
+                    /* GPU pipeline doesn't support SSM models.
+                     * Disable to avoid GPU prefill wasting time uploading
+                     * embeddings then falling back to CPU at first SSM layer. */
                     if (c->has_ssm) eligible = 0;
 
                     if (eligible) {
@@ -4272,7 +4271,7 @@ float *model_forward(model_t *m, int token, int pos) {
             ssm_forward(m, s, s->x, ssm_residual, lw, l, pos, &m->gpu.layers[l]);
 #else
             float *ssm_residual = s->xb2;
-            ssm_forward(m, s, s->x, ssm_residual, lw, l, pos, NULL);
+            ssm_forward(m, s, s->x, ssm_residual, lw, l, pos, &m->gpu.layers[l]);
 #endif
 #ifdef PICOLM_VIZ
             viz_push_layer(l, s->x, dim);
@@ -10111,7 +10110,7 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
             picolm_gpu_memcpy(s->x, pipe_x, (size_t)dim * sizeof(float), -1, gpu_dev);
 
             float *ssm_residual = s->xb2;
-            ssm_forward(m, s, s->x, ssm_residual, lw, l, pos, NULL);
+            ssm_forward(m, s, s->x, ssm_residual, lw, l, pos, &m->gpu.layers[l]);
 
             picolm_gpu_memcpy(pipe_x, s->x, (size_t)dim * sizeof(float), 1, gpu_dev);
             did_cpu_ssm = 1;
