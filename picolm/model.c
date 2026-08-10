@@ -4883,16 +4883,21 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
                 for(int a=0;a<4;a++) fprintf(stderr,"%.6f%s",((const float *)lw->altup_correct_coef)[a],a<3?",":"");
                 fprintf(stderr, "}\n");
             }
-            /* GGML: ggml_mul_mat(cur_permuted, all_coefs) -> result[a,d] = sum_a' all_coefs[a',a] * cur[a',d]
-             * So the coefficient for cur[a'] contributing to predictions[a] is all_coefs[a' * n_altup + a] */
+            /* GGML: ggml_mul_mat(cur_permuted, all_coefs) where
+             *   cur_permuted has ne=[n_altup, n_embd, n_tokens] (data: cur[d,t,a])
+             *   all_coefs has ne=[n_altup, n_altup, n_tokens] (from reshape_3d of flat [n_altup^2, n_tokens])
+             * Result: ne=[n_embd, n_altup, n_tokens], then permuted back to [n_embd, n_tokens, n_altup]
+             *   result[d, a1, t] = sum_a2 cur[d, t, a2] * all_coefs_3d[a2, a1, t]
+             *   all_coefs_3d[a2, a1, t] = all_coefs_flat[a2 + a1*n_altup + t*n_altup^2]
+             * So the coefficient for cur[a2] contributing to predictions[a1] is all_coefs[a2 + a1*n_altup] */
             predictions = s->gemma3n_predictions;
             for (int a = 0; a < n_altup; a++) {
                 float *pred = predictions + a * dim;
                 float *cur_a = s->gemma3n_altup_state;
-                for (int d = 0; d < dim; d++) pred[d] = all_coefs[0 * n_altup + a] * cur_a[d];
+                for (int d = 0; d < dim; d++) pred[d] = all_coefs[0 + a * n_altup] * cur_a[d];
                 for (int a2 = 1; a2 < n_altup; a2++) {
                     cur_a = s->gemma3n_altup_state + a2 * dim;
-                    for (int d = 0; d < dim; d++) pred[d] += all_coefs[a2 * n_altup + a] * cur_a[d];
+                    for (int d = 0; d < dim; d++) pred[d] += all_coefs[a2 + a * n_altup] * cur_a[d];
                 }
             }
 
@@ -4901,6 +4906,16 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
 
             /* Active prediction */
             active_pred = predictions + i_altup_act * dim;
+            if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
+                double pm = 0; for(int i=0;i<dim;i++){double v=active_pred[i]; pm+=v*v;}
+                fprintf(stderr, "DBG L0 active_pred_rms=%.4f [0:5]={", sqrt(pm/dim));
+                for(int i=0;i<5;i++) fprintf(stderr,"%.4f%s",active_pred[i],i<4?",":"");
+                fprintf(stderr, "}\n");
+                double pm2 = 0; for(int i=0;i<dim;i++){double v=predictions[dim+i]; pm2+=v*v;}
+                fprintf(stderr, "DBG L0 pred[1]_rms=%.4f [0:5]={", sqrt(pm2/dim));
+                for(int i=0;i<5;i++) fprintf(stderr,"%.4f%s",predictions[dim+i],i<4?",":"");
+                fprintf(stderr, "}\n");
+            }
             /* ATTN NORM */
             rmsnorm(s->xb, active_pred, s->attn_norm_w[l], dim, rms_norm_eps);
 
@@ -10026,13 +10041,14 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
                 /* De-interleave Q+gate. Cannot write Q in-place to pipe_q:
                  * thread h writes pipe_q[h*head_dim] which overlaps with
                  * thread h+1's read from pipe_q[(h+1)*2*head_dim].
-                 * Use pipe_ffn_norm as temp scratch for raw Q+gate data.
-                 * pipe_ffn_norm is sized for dim (>= q_full_dim) and idle here. */
-                picolm_gpu_memcpy(pipe_ffn_norm, pipe_q,
+                 * Use pipe_attn_out as temp scratch for raw Q+gate data.
+                 * pipe_attn_out is sized for q_pipeline_dim (>= q_full_dim).
+                 * pipe_ffn_norm is only dim-sized and would overflow. */
+                picolm_gpu_memcpy(pipe_attn_out, pipe_q,
                                    (size_t)n_heads * 2 * head_dim * sizeof(float),
                                    0, gpu_dev);
                 picolm_gpu_sync(gpu_dev);
-                picolm_gpu_qg_deinterleave_dev(pipe_ffn_norm, pipe_q,
+                picolm_gpu_qg_deinterleave_dev(pipe_attn_out, pipe_q,
                                                 pipe_gate, n_heads, head_dim,
                                                 gpu_dev);
             }
