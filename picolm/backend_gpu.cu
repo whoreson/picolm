@@ -2769,15 +2769,57 @@ picolm_gpu_ssm_recurrence(float *state,
         gpuFree(dg); gpuFree(db); gpuFree(do_); return 0;
     }
 
-    /* Use the NEON-order-matched thread-0 kernel for all d_state values.
-     * The warp-shuffle kernel has a different accumulation order
-     * (undecayed sk, 32-lane XOR reduction) that doesn't match CPU NEON's
-     * 4-lane strided fmaf + pairwise combine. See ssmreport.txt. */
-    dim3 grid((unsigned)n_v_heads, 1, 1);
-    picolm_ssm_recurrence_kernel<<<grid, 256, 0, ctx->stream>>>(
-        (float *)ds, (const float *)dq, (const float *)dk,
-        (const float *)dv, (const float *)dg, (const float *)db,
-        (float *)do_, n_v_heads, d_state, repeat);
+    /* Warp-shuffle kernel for common d_state values. Falls back to
+     * thread-0 kernel for unsupported sizes. */
+    int warp_launched = 0;
+    if (d_state == 128) {
+        constexpr int S_v = 128;
+        constexpr int num_warps = 4;
+        dim3 g((unsigned)n_v_heads, 1, S_v / num_warps);
+        dim3 b(GPU_WARP_SIZE, num_warps, 1);
+        picolm_ssm_recurrence_warp_kernel<S_v><<<g, b, 0, ctx->stream>>>(
+            (float *)ds, (const float *)dq, (const float *)dk,
+            (const float *)dv, (const float *)dg, (const float *)db,
+            (float *)do_, n_v_heads, repeat);
+        warp_launched = 1;
+    } else if (d_state == 64) {
+        constexpr int S_v = 64;
+        constexpr int num_warps = 4;
+        dim3 g((unsigned)n_v_heads, 1, S_v / num_warps);
+        dim3 b(GPU_WARP_SIZE, num_warps, 1);
+        picolm_ssm_recurrence_warp_kernel<S_v><<<g, b, 0, ctx->stream>>>(
+            (float *)ds, (const float *)dq, (const float *)dk,
+            (const float *)dv, (const float *)dg, (const float *)db,
+            (float *)do_, n_v_heads, repeat);
+        warp_launched = 1;
+    } else if (d_state == 32) {
+        constexpr int S_v = 32;
+        constexpr int num_warps = 4;
+        dim3 g((unsigned)n_v_heads, 1, S_v / num_warps);
+        dim3 b(GPU_WARP_SIZE, num_warps, 1);
+        picolm_ssm_recurrence_warp_kernel<S_v><<<g, b, 0, ctx->stream>>>(
+            (float *)ds, (const float *)dq, (const float *)dk,
+            (const float *)dv, (const float *)dg, (const float *)db,
+            (float *)do_, n_v_heads, repeat);
+        warp_launched = 1;
+    } else if (d_state == 16) {
+        constexpr int S_v = 16;
+        constexpr int num_warps = 4;
+        dim3 g((unsigned)n_v_heads, 1, S_v / num_warps);
+        dim3 b(GPU_WARP_SIZE, num_warps, 1);
+        picolm_ssm_recurrence_warp_kernel<S_v><<<g, b, 0, ctx->stream>>>(
+            (float *)ds, (const float *)dq, (const float *)dk,
+            (const float *)dv, (const float *)dg, (const float *)db,
+            (float *)do_, n_v_heads, repeat);
+        warp_launched = 1;
+    }
+    if (!warp_launched) {
+        dim3 grid((unsigned)n_v_heads, 1, 1);
+        picolm_ssm_recurrence_kernel<<<grid, 256, 0, ctx->stream>>>(
+            (float *)ds, (const float *)dq, (const float *)dk,
+            (const float *)dv, (const float *)dg, (const float *)db,
+            (float *)do_, n_v_heads, d_state, repeat);
+    }
 
     if (!gpu_ok(gpuGetLastError(), "ssm recurrence") ||
         !gpu_ok(gpuDeviceSynchronize(), "ssm sync")) {
@@ -2839,13 +2881,56 @@ picolm_gpu_ssm_recurrence_dev(void *ssm_state_dev,  /* in/out, device [n_v_heads
         gpuFree(dg); gpuFree(db); gpuFree(do_); return 0;
     }
 
-    /* Thread-0-only kernel now: no dynamic shared mem needed (sk/d_local
-     * are per-thread local arrays, only thread 0 of each block runs). */
-    dim3 grid((unsigned)n_v_heads, 1, 1);
-    picolm_ssm_recurrence_kernel<<<grid, 256, 0, ctx->stream>>>(
-        (float *)ssm_state_dev, (const float *)dq, (const float *)dk,
-        (const float *)dv, (const float *)dg, (const float *)db,
-        (float *)do_, n_v_heads, d_state, repeat);
+    /* Warp-shuffle kernel for common d_state values. */
+    int warp_launched = 0;
+    if (d_state == 128) {
+        constexpr int S_v = 128;
+        constexpr int num_warps = 4;
+        dim3 g((unsigned)n_v_heads, 1, S_v / num_warps);
+        dim3 b(GPU_WARP_SIZE, num_warps, 1);
+        picolm_ssm_recurrence_warp_kernel<S_v><<<g, b, 0, ctx->stream>>>(
+            (float *)ssm_state_dev, (const float *)dq, (const float *)dk,
+            (const float *)dv, (const float *)dg, (const float *)db,
+            (float *)do_, n_v_heads, repeat);
+        warp_launched = 1;
+    } else if (d_state == 64) {
+        constexpr int S_v = 64;
+        constexpr int num_warps = 4;
+        dim3 g((unsigned)n_v_heads, 1, S_v / num_warps);
+        dim3 b(GPU_WARP_SIZE, num_warps, 1);
+        picolm_ssm_recurrence_warp_kernel<S_v><<<g, b, 0, ctx->stream>>>(
+            (float *)ssm_state_dev, (const float *)dq, (const float *)dk,
+            (const float *)dv, (const float *)dg, (const float *)db,
+            (float *)do_, n_v_heads, repeat);
+        warp_launched = 1;
+    } else if (d_state == 32) {
+        constexpr int S_v = 32;
+        constexpr int num_warps = 4;
+        dim3 g((unsigned)n_v_heads, 1, S_v / num_warps);
+        dim3 b(GPU_WARP_SIZE, num_warps, 1);
+        picolm_ssm_recurrence_warp_kernel<S_v><<<g, b, 0, ctx->stream>>>(
+            (float *)ssm_state_dev, (const float *)dq, (const float *)dk,
+            (const float *)dv, (const float *)dg, (const float *)db,
+            (float *)do_, n_v_heads, repeat);
+        warp_launched = 1;
+    } else if (d_state == 16) {
+        constexpr int S_v = 16;
+        constexpr int num_warps = 4;
+        dim3 g((unsigned)n_v_heads, 1, S_v / num_warps);
+        dim3 b(GPU_WARP_SIZE, num_warps, 1);
+        picolm_ssm_recurrence_warp_kernel<S_v><<<g, b, 0, ctx->stream>>>(
+            (float *)ssm_state_dev, (const float *)dq, (const float *)dk,
+            (const float *)dv, (const float *)dg, (const float *)db,
+            (float *)do_, n_v_heads, repeat);
+        warp_launched = 1;
+    }
+    if (!warp_launched) {
+        dim3 grid((unsigned)n_v_heads, 1, 1);
+        picolm_ssm_recurrence_kernel<<<grid, 256, 0, ctx->stream>>>(
+            (float *)ssm_state_dev, (const float *)dq, (const float *)dk,
+            (const float *)dv, (const float *)dg, (const float *)db,
+            (float *)do_, n_v_heads, d_state, repeat);
+    }
 
     if (!gpu_ok(gpuGetLastError(), "ssm recurrence") ||
         !gpu_ok(gpuDeviceSynchronize(), "ssm sync")) {
@@ -2882,13 +2967,56 @@ picolm_gpu_ssm_recurrence_pipeline_dev(void *ssm_state_dev,
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
 
-    /* Thread-0-only kernel now: no dynamic shared mem needed (sk/d_local
-     * are per-thread local arrays, only thread 0 of each block runs). */
-    dim3 grid((unsigned)n_v_heads, 1, 1);
-    picolm_ssm_recurrence_kernel<<<grid, 256, 0, ctx->stream>>>(
-        (float *)ssm_state_dev, q_conv_dev, k_conv_dev,
-        v_conv_dev, gate_exp_dev, beta_dev,
-        ssm_output_dev, n_v_heads, d_state, repeat);
+    /* Warp-shuffle kernel for common d_state values. */
+    int warp_launched = 0;
+    if (d_state == 128) {
+        constexpr int S_v = 128;
+        constexpr int num_warps = 4;
+        dim3 g((unsigned)n_v_heads, 1, S_v / num_warps);
+        dim3 b(GPU_WARP_SIZE, num_warps, 1);
+        picolm_ssm_recurrence_warp_kernel<S_v><<<g, b, 0, ctx->stream>>>(
+            (float *)ssm_state_dev, q_conv_dev, k_conv_dev,
+            v_conv_dev, gate_exp_dev, beta_dev,
+            ssm_output_dev, n_v_heads, repeat);
+        warp_launched = 1;
+    } else if (d_state == 64) {
+        constexpr int S_v = 64;
+        constexpr int num_warps = 4;
+        dim3 g((unsigned)n_v_heads, 1, S_v / num_warps);
+        dim3 b(GPU_WARP_SIZE, num_warps, 1);
+        picolm_ssm_recurrence_warp_kernel<S_v><<<g, b, 0, ctx->stream>>>(
+            (float *)ssm_state_dev, q_conv_dev, k_conv_dev,
+            v_conv_dev, gate_exp_dev, beta_dev,
+            ssm_output_dev, n_v_heads, repeat);
+        warp_launched = 1;
+    } else if (d_state == 32) {
+        constexpr int S_v = 32;
+        constexpr int num_warps = 4;
+        dim3 g((unsigned)n_v_heads, 1, S_v / num_warps);
+        dim3 b(GPU_WARP_SIZE, num_warps, 1);
+        picolm_ssm_recurrence_warp_kernel<S_v><<<g, b, 0, ctx->stream>>>(
+            (float *)ssm_state_dev, q_conv_dev, k_conv_dev,
+            v_conv_dev, gate_exp_dev, beta_dev,
+            ssm_output_dev, n_v_heads, repeat);
+        warp_launched = 1;
+    } else if (d_state == 16) {
+        constexpr int S_v = 16;
+        constexpr int num_warps = 4;
+        dim3 g((unsigned)n_v_heads, 1, S_v / num_warps);
+        dim3 b(GPU_WARP_SIZE, num_warps, 1);
+        picolm_ssm_recurrence_warp_kernel<S_v><<<g, b, 0, ctx->stream>>>(
+            (float *)ssm_state_dev, q_conv_dev, k_conv_dev,
+            v_conv_dev, gate_exp_dev, beta_dev,
+            ssm_output_dev, n_v_heads, repeat);
+        warp_launched = 1;
+    }
+    if (!warp_launched) {
+        dim3 grid((unsigned)n_v_heads, 1, 1);
+        picolm_ssm_recurrence_kernel<<<grid, 256, 0, ctx->stream>>>(
+            (float *)ssm_state_dev, q_conv_dev, k_conv_dev,
+            v_conv_dev, gate_exp_dev, beta_dev,
+            ssm_output_dev, n_v_heads, d_state, repeat);
+    }
     if (!gpu_ok(gpuGetLastError(), "ssm recurrence (pipeline dev)")) return 0;
     return 1;
 }

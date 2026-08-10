@@ -4279,7 +4279,7 @@ float *model_forward(model_t *m, int token, int pos) {
 #ifdef PICOLM_GPU
             tensor_set_gpu_tensor(NULL, 0); /* clear stale handle from previous layer */
             float *ssm_residual = s->xb2;
-            ssm_forward(m, s, s->x, ssm_residual, lw, l, pos, NULL);
+            ssm_forward(m, s, s->x, ssm_residual, lw, l, pos, &m->gpu.layers[l]);
 #else
             float *ssm_residual = s->xb2;
             ssm_forward(m, s, s->x, ssm_residual, lw, l, pos, NULL);
@@ -7188,10 +7188,19 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
             picolm_gpu_memcpy(s->q, g_ssm_mm_qkv_dev, qkv_bytes, -1, m->gpu.device) &&
             picolm_gpu_memcpy(s->xb2, g_ssm_mm_gate_dev, gate_bytes, -1, m->gpu.device)) {
             ssm_qkv_gate_gpu_done = 1;
+        } else if (il == 0 || il == 8 || il == 16 || il == 32 || il == 48 || il == 60) {
+            fprintf(stderr, "DEBUG: SSM qkv/gate GPU dispatch failed (gpu_lw=%p gl->qkv=%p gl->gate=%p pos=%d)\n",
+                    gpu_lw, gl ? gl->attn_qkv : NULL, gl ? gl->attn_gate_ssm : NULL, pos);
         }
     }
     if (!ssm_qkv_gate_gpu_done)
+    {
+        if (il == 0 || il == 8 || il == 16 || il == 32 || il == 48 || il == 60) fprintf(stderr, "DEBUG: SSM qkv/gate matmul fell through to CPU (pos=%d)\n", pos);
+    } else {
+        if (il == 0 || il == 8 || il == 16 || il == 32 || il == 48 || il == 60) fprintf(stderr, "DEBUG: SSM qkv/gate GPU OK (pos=%d)\n", pos);
+    }
 #endif
+    if (!ssm_qkv_gate_gpu_done)
     {
         matmul(s->q, s->xb, lw->attn_qkv, dim, conv_dim, lw->type_attn_qkv);
         matmul(s->xb2, s->xb, lw->attn_gate_ssm, dim, c->ssm_d_inner, lw->type_attn_gate_ssm);
@@ -7208,7 +7217,7 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
             memcpy(s->xb2 + h * head_v_dim, xb2_tmp + gh * head_v_dim, head_v_dim * sizeof(float));
         }
         free(xb2_tmp);
-        if (il == 0 && pos == 0) {
+        if (il == 0 || il == 8 || il == 16 || il == 32 || il == 48 || il == 60) {
             }
     }
 
@@ -7283,7 +7292,7 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     float q_scale = 1.0f / sqrtf((float)d_state);
     for (int i = 0; i < qk_dim; i++) q_conv[i] *= q_scale;
 #ifdef DEBUG_SSM
-    if (il == 0 && pos == 0) {
+    if (il == 0 || il == 8 || il == 16 || il == 32 || il == 48 || il == 60) {
         dbg_vec("q_conv_scaled[:8]", q_conv, 8, 8);
         dbg_vec("k_conv_scaled[:8]", k_conv, 8, 8);
     }
@@ -7449,9 +7458,7 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     ssm_ctx.gate_exp = gate_exp; ssm_ctx.beta = beta;
     ssm_ctx.ssm_output = ssm_output; /* shared, dim-major [d*n_v_heads+h] */
 #ifdef PICOLM_GPU
-    /* TEMP: Force CPU SSM recurrence to isolate GPU bugs.
-     * GPU recurrence has known issues with state sync and numerical correctness. */
-    if (0) {
+    if (1) {
         int rec_done = 0;
         if (m->gpu.ssm_state_dev[il]) {
             if (picolm_gpu_ssm_recurrence_dev(m->gpu.ssm_state_dev[il],
@@ -7515,7 +7522,7 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
         }
     }
 #ifdef DEBUG_SSM
-    if (il == 0 && pos == 0) {
+    if (il == 0 || il == 8 || il == 16 || il == 32 || il == 48 || il == 60) {
         dbg_vec("xb2[:8]", s->xb2, 8, 8);
         dbg_vec("final_out[:8]", final_output, 8, 8);
     }
@@ -7550,7 +7557,16 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
         }
     }
     if (!ssm_out_gpu_done)
+    {
+        if (il == 0 || il == 8 || il == 16 || il == 32 || il == 48 || il == 60 && gpu_lw) {
+            gpu_layer_weights_t *gl2 = (gpu_layer_weights_t *)gpu_lw;
+            fprintf(stderr, "DEBUG: ssm_out GPU failed: gl->ssm_out=%p\n", gl2 ? gl2->ssm_out : NULL);
+        }
+    } else {
+        if (il == 0 || il == 8 || il == 16 || il == 32 || il == 48 || il == 60) fprintf(stderr, "DEBUG: ssm_out GPU OK\n");
+    }
 #endif
+    if (!ssm_out_gpu_done)
     {
         matmul(residual, ssm_out_src, lw->ssm_out, c->ssm_d_inner, dim, lw->type_ssm_out);
     }
@@ -7574,11 +7590,19 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
          * fall through to the per-matmul CPU path. Matches model_forward. */
         if (gpu_lw) {
             gpu_layer_weights_t *gl = (gpu_layer_weights_t *)gpu_lw;
-            if (gl->ffn_gate && gl->ffn_up && gl->ffn_down &&
-                picolm_gpu_expert_mlp((picolm_gpu_tensor_t *)gl->ffn_gate,
+            int mlp_ok = 0;
+            if (gl->ffn_gate && gl->ffn_up && gl->ffn_down) {
+                mlp_ok = picolm_gpu_expert_mlp((picolm_gpu_tensor_t *)gl->ffn_gate,
                                       (picolm_gpu_tensor_t *)gl->ffn_up,
                                       (picolm_gpu_tensor_t *)gl->ffn_down,
-                                      s->xb, s->xb, 1))
+                                      s->xb, s->xb, 1);
+            }
+            if (il == 0 || il == 8 || il == 16 || il == 32 || il == 48 || il == 60) {
+                fprintf(stderr, "DEBUG: SSM FFN GPU: gate=%p up=%p down=%p mlp_ok=%d\n",
+                        gl ? gl->ffn_gate : NULL, gl ? gl->ffn_up : NULL,
+                        gl ? gl->ffn_down : NULL, mlp_ok);
+            }
+            if (mlp_ok)
                 goto ssm_ffn_done;
         }
         /* Defensive: the qkv/gate/ssm_out matmuls above now go through
@@ -10182,7 +10206,7 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
             picolm_gpu_memcpy(s->x, pipe_x, (size_t)dim * sizeof(float), -1, gpu_dev);
 
             float *ssm_residual = s->xb2;
-            ssm_forward(m, s, s->x, ssm_residual, lw, l, pos, NULL);
+            ssm_forward(m, s, s->x, ssm_residual, lw, l, pos, &m->gpu.layers[l]);
 
             picolm_gpu_memcpy(pipe_x, s->x, (size_t)dim * sizeof(float), 1, gpu_dev);
             did_cpu_ssm = 1;
