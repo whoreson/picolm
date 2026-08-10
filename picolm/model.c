@@ -10051,7 +10051,10 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
                 picolm_gpu_memcpy(pipe_attn_out, pipe_q,
                                    (size_t)n_heads * 2 * head_dim * sizeof(float),
                                    0, gpu_dev);
-                /* D2D is synchronous, no need for sync after. */
+                /* D2D is synchronous on stream 0, but ctx->stream (cudaStreamNonBlocking)
+                 * doesn't synchronize with stream 0. Sync again to ensure the de-interleave
+                 * kernel on ctx->stream doesn't start reading pipe_attn_out before D2D writes it. */
+                picolm_gpu_sync(gpu_dev);
                 picolm_gpu_qg_deinterleave_dev(pipe_attn_out, pipe_q,
                                                 pipe_gate, n_heads, head_dim,
                                                 gpu_dev);
