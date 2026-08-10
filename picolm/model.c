@@ -10043,11 +10043,15 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
                  * thread h+1's read from pipe_q[(h+1)*2*head_dim].
                  * Use pipe_attn_out as temp scratch for raw Q+gate data.
                  * pipe_attn_out is sized for q_pipeline_dim (>= q_full_dim).
-                 * pipe_ffn_norm is only dim-sized and would overflow. */
+                 * pipe_ffn_norm is only dim-sized and would overflow.
+                 *
+                 * SYNC BEFORE D2D to ensure Q projection (on ctx->stream)
+                 * completes before the D2D copy (on stream 0) reads pipe_q. */
+                picolm_gpu_sync(gpu_dev);
                 picolm_gpu_memcpy(pipe_attn_out, pipe_q,
                                    (size_t)n_heads * 2 * head_dim * sizeof(float),
                                    0, gpu_dev);
-                picolm_gpu_sync(gpu_dev);
+                /* D2D is synchronous, no need for sync after. */
                 picolm_gpu_qg_deinterleave_dev(pipe_attn_out, pipe_q,
                                                 pipe_gate, n_heads, head_dim,
                                                 gpu_dev);
