@@ -63,6 +63,7 @@
 #define gpuMemcpy hipMemcpy
 #define gpuMemcpyHostToDevice hipMemcpyHostToDevice
 #define gpuMemcpyDeviceToHost hipMemcpyDeviceToHost
+#define gpuMemcpyDeviceToDevice hipMemcpyDeviceToDevice
 #define gpuMemcpyAsync hipMemcpyAsync
 #define gpuStream_t hipStream_t
 #define gpuStreamCreateWithFlags hipStreamCreateWithFlags
@@ -119,6 +120,7 @@ typedef hipEvent_t gpuEvent_t;
 #define gpuMemcpy cudaMemcpy
 #define gpuMemcpyHostToDevice cudaMemcpyHostToDevice
 #define gpuMemcpyDeviceToHost cudaMemcpyDeviceToHost
+#define gpuMemcpyDeviceToDevice cudaMemcpyDeviceToDevice
 #define gpuMemcpyAsync cudaMemcpyAsync
 #define gpuStream_t cudaStream_t
 #define gpuStreamCreateWithFlags cudaStreamCreateWithFlags
@@ -1639,13 +1641,17 @@ picolm_ssm_recurrence_kernel(float *state,
     if (h >= n_v_heads) return;
     if (gpuThreadIdx_x != 0) return;
 
-    /* Thread-0 sequential, matching ssm_head_task's scalar fallback
-     * (model.c) row-by-row, step-by-step -- the AVX/NEON paths there
-     * fuse decay+sk+update+output per 4-row group with different
-     * intermediate rounding, so we deliberately mirror the scalar tail
-     * instead (same reasoning as every other kernel in this file: the
-     * scalar path is the one guaranteed bit-identical to a portable
-     * reference, and errors here compound over dozens of layers). */
+    /* Thread-0 sequential, matching CPU NEON accumulation order.
+     * The DGX Spark runs ARM64 with NEON. The CPU ssm_head_task uses
+     * 4-lane strided fmaf accumulators combined by pairwise reduction
+     * (vaddvq_f32: (a0+a1)+(a2+a3)). This is a different summation
+     * tree from strict left-to-right addition, producing ~1e-7 relative
+     * difference that compounds over 48+ SSM layers.
+     *
+     * Replicate NEON's exact order: 4 independent fmaf() strided
+     * accumulators, combined with pairwise (lo+hi) reduction.
+     * Decay is applied per-element BEFORE the sk dot product,
+     * matching NEON which decays each loaded element before fma. */
     int kh = h / repeat;
     const float *qh = q_conv + (size_t)kh * d_state;
     const float *khv = k_conv + (size_t)kh * d_state;
@@ -1654,38 +1660,46 @@ picolm_ssm_recurrence_kernel(float *state,
     float bh = beta[h];
     float *st = state + (size_t)h * d_state * d_state;
 
+    int d4 = d_state / 4; /* d_state always 16/32/64/128 */
     float sk_local[256];
     float d_local[256];
 
-    /* Step 1: Decay state elementwise */
-    for (int i = 0; i < d_state * d_state; i++) st[i] *= ge;
-
-    /* Step 2: sk[row] = state[row] @ k */
+    /* Decay + sk: 4-lane strided fmaf per row, matching NEON */
     for (int row = 0; row < d_state; row++) {
-        const float *st_row = st + (size_t)row * d_state;
-        float sum = 0.0f;
-        for (int col = 0; col < d_state; col++) sum += st_row[col] * khv[col];
-        sk_local[row] = sum;
-    }
-
-    /* Step 3: d[row] = (v[row] - sk[row]) * beta */
-    for (int row = 0; row < d_state; row++) {
+        float *sr = st + (size_t)row * d_state;
+        float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+        for (int vv = 0; vv < d4; vv++) {
+            int cb = vv * 4;
+            float r0 = sr[cb+0] * ge; sr[cb+0] = r0;
+            float r1 = sr[cb+1] * ge; sr[cb+1] = r1;
+            float r2 = sr[cb+2] * ge; sr[cb+2] = r2;
+            float r3 = sr[cb+3] * ge; sr[cb+3] = r3;
+            s0 = fmaf(r0, khv[cb+0], s0);
+            s1 = fmaf(r1, khv[cb+1], s1);
+            s2 = fmaf(r2, khv[cb+2], s2);
+            s3 = fmaf(r3, khv[cb+3], s3);
+        }
+        sk_local[row] = (s0 + s1) + (s2 + s3);
         d_local[row] = (vh[row] - sk_local[row]) * bh;
     }
 
-    /* Step 4: state[row][col] += k[col] * d[row] */
+    /* Rank-1 update + output: 4-lane strided fmaf per row */
     for (int row = 0; row < d_state; row++) {
         float dv = d_local[row];
-        float *st_row = st + (size_t)row * d_state;
-        for (int col = 0; col < d_state; col++) st_row[col] += khv[col] * dv;
-    }
-
-    /* Step 5: output[row] = state[row] @ q, written dim-major [row*n_v_heads + h] */
-    for (int row = 0; row < d_state; row++) {
-        const float *st_row = st + (size_t)row * d_state;
-        float sum = 0.0f;
-        for (int col = 0; col < d_state; col++) sum += st_row[col] * qh[col];
-        ssm_output[(size_t)row * n_v_heads + h] = sum;
+        float *sr = st + (size_t)row * d_state;
+        float o0 = 0, o1 = 0, o2 = 0, o3 = 0;
+        for (int vv = 0; vv < d4; vv++) {
+            int cb = vv * 4;
+            float r0 = fmaf(khv[cb+0], dv, sr[cb+0]); sr[cb+0] = r0;
+            float r1 = fmaf(khv[cb+1], dv, sr[cb+1]); sr[cb+1] = r1;
+            float r2 = fmaf(khv[cb+2], dv, sr[cb+2]); sr[cb+2] = r2;
+            float r3 = fmaf(khv[cb+3], dv, sr[cb+3]); sr[cb+3] = r3;
+            o0 = fmaf(r0, qh[cb+0], o0);
+            o1 = fmaf(r1, qh[cb+1], o1);
+            o2 = fmaf(r2, qh[cb+2], o2);
+            o3 = fmaf(r3, qh[cb+3], o3);
+        }
+        ssm_output[(size_t)row * n_v_heads + h] = (o0 + o1) + (o2 + o3);
     }
 }
 
@@ -2755,51 +2769,15 @@ picolm_gpu_ssm_recurrence(float *state,
         gpuFree(dg); gpuFree(db); gpuFree(do_); return 0;
     }
 
-    /* Warp-shuffle kernel for common d_state values. */
-    if (d_state == 128) {
-        constexpr int S_v = 128;
-        constexpr int num_warps = 4;
-        dim3 grid((unsigned)n_v_heads, 1, S_v / num_warps);
-        dim3 block(GPU_WARP_SIZE, num_warps, 1);
-        picolm_ssm_recurrence_warp_kernel<S_v><<<grid, block, 0, ctx->stream>>>(
-            (float *)ds, (const float *)dq, (const float *)dk,
-            (const float *)dv, (const float *)dg, (const float *)db,
-            (float *)do_, n_v_heads, repeat);
-    } else if (d_state == 64) {
-        constexpr int S_v = 64;
-        constexpr int num_warps = 4;
-        dim3 grid((unsigned)n_v_heads, 1, S_v / num_warps);
-        dim3 block(GPU_WARP_SIZE, num_warps, 1);
-        picolm_ssm_recurrence_warp_kernel<S_v><<<grid, block, 0, ctx->stream>>>(
-            (float *)ds, (const float *)dq, (const float *)dk,
-            (const float *)dv, (const float *)dg, (const float *)db,
-            (float *)do_, n_v_heads, repeat);
-    } else if (d_state == 32) {
-        constexpr int S_v = 32;
-        constexpr int num_warps = 4;
-        dim3 grid((unsigned)n_v_heads, 1, S_v / num_warps);
-        dim3 block(GPU_WARP_SIZE, num_warps, 1);
-        picolm_ssm_recurrence_warp_kernel<S_v><<<grid, block, 0, ctx->stream>>>(
-            (float *)ds, (const float *)dq, (const float *)dk,
-            (const float *)dv, (const float *)dg, (const float *)db,
-            (float *)do_, n_v_heads, repeat);
-    } else if (d_state == 16) {
-        constexpr int S_v = 16;
-        constexpr int num_warps = 4;
-        dim3 grid((unsigned)n_v_heads, 1, S_v / num_warps);
-        dim3 block(GPU_WARP_SIZE, num_warps, 1);
-        picolm_ssm_recurrence_warp_kernel<S_v><<<grid, block, 0, ctx->stream>>>(
-            (float *)ds, (const float *)dq, (const float *)dk,
-            (const float *)dv, (const float *)dg, (const float *)db,
-            (float *)do_, n_v_heads, repeat);
-    } else {
-        /* Fallback: old thread-0 kernel for unsupported d_state */
-        dim3 grid((unsigned)n_v_heads, 1, 1);
-        picolm_ssm_recurrence_kernel<<<grid, 256, 0, ctx->stream>>>(
-            (float *)ds, (const float *)dq, (const float *)dk,
-            (const float *)dv, (const float *)dg, (const float *)db,
-            (float *)do_, n_v_heads, d_state, repeat);
-    }
+    /* Use the NEON-order-matched thread-0 kernel for all d_state values.
+     * The warp-shuffle kernel has a different accumulation order
+     * (undecayed sk, 32-lane XOR reduction) that doesn't match CPU NEON's
+     * 4-lane strided fmaf + pairwise combine. See ssmreport.txt. */
+    dim3 grid((unsigned)n_v_heads, 1, 1);
+    picolm_ssm_recurrence_kernel<<<grid, 256, 0, ctx->stream>>>(
+        (float *)ds, (const float *)dq, (const float *)dk,
+        (const float *)dv, (const float *)dg, (const float *)db,
+        (float *)do_, n_v_heads, d_state, repeat);
 
     if (!gpu_ok(gpuGetLastError(), "ssm recurrence") ||
         !gpu_ok(gpuDeviceSynchronize(), "ssm sync")) {
@@ -4320,7 +4298,8 @@ picolm_gpu_memcpy(void *dst, const void *src, size_t bytes, int dir, int device)
     (void)device; /* device already selected by caller */
     gpuError_t err = (dir > 0) ?
         gpuMemcpy(dst, src, bytes, gpuMemcpyHostToDevice) :
-        gpuMemcpy(dst, src, bytes, gpuMemcpyDeviceToHost);
+        (dir < 0) ? gpuMemcpy(dst, src, bytes, gpuMemcpyDeviceToHost) :
+                    gpuMemcpy(dst, src, bytes, gpuMemcpyDeviceToDevice);
     return gpu_ok(err, "pipeline memcpy");
 }
 

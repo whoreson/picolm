@@ -4737,6 +4737,7 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
         for (int i = 0; i < dim; i++) s->x[i] *= sqrt_dim;
     }
     if (pos == 0 && getenv("PICOLM_DBG")) {
+        fprintf(stderr, "DBG rms_norm_eps=%e\n", rms_norm_eps);
         double em = 0; for(int i=0;i<dim;i++){double v=s->x[i]; em+=v*v;}
     }
 
@@ -7397,7 +7398,6 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     /* TEMP: Force CPU SSM recurrence to isolate GPU bugs.
      * GPU recurrence has known issues with state sync and numerical correctness. */
     if (0) {
-        /* GPU SSM recurrence kernel - disabled for now */
         int rec_done = 0;
         if (m->gpu.ssm_state_dev[il]) {
             if (picolm_gpu_ssm_recurrence_dev(m->gpu.ssm_state_dev[il],
@@ -10111,7 +10111,7 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
             picolm_gpu_memcpy(s->x, pipe_x, (size_t)dim * sizeof(float), -1, gpu_dev);
 
             float *ssm_residual = s->xb2;
-            ssm_forward(m, s, s->x, ssm_residual, lw, l, pos, &m->gpu.layers[l]);
+            ssm_forward(m, s, s->x, ssm_residual, lw, l, pos, NULL);
 
             picolm_gpu_memcpy(pipe_x, s->x, (size_t)dim * sizeof(float), 1, gpu_dev);
             did_cpu_ssm = 1;
