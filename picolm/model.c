@@ -2867,6 +2867,21 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                                             conv_st_bytes, device);
                                     }
                                 }
+                                /* Upload head_map for v-head remapping (if GGUF reorders v-heads) */
+                                {
+                                    int n_vh = c->ssm_dt_rank;
+                                    int n_kh = c->ssm_n_group;
+                                    int n_vpk = c->ssm_dt_rank / n_kh;
+                                    int half_vpk = n_vpk / 2;
+                                    int do_rm = !m->from_safetensors && n_kh > 0 &&
+                                                n_kh < n_vh && half_vpk > 0;
+                                    if (do_rm) {
+                                        int *hmap = alloca(n_vh * sizeof(int));
+                                        for (int h = 0; h < n_vh; h++)
+                                            hmap[h] = qwen35_vhead_gguf(h, n_vpk, n_kh);
+                                        m->gpu.ssm_head_map_dev = picolm_gpu_upload_int(hmap, n_vh, device);
+                                    }
+                                }
                             }
                         } else {
                             fprintf(stderr, "WARN: GPU KV cache allocation failed, falling back to CPU\n");
