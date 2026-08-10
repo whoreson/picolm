@@ -7188,16 +7188,7 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
             picolm_gpu_memcpy(s->q, g_ssm_mm_qkv_dev, qkv_bytes, -1, m->gpu.device) &&
             picolm_gpu_memcpy(s->xb2, g_ssm_mm_gate_dev, gate_bytes, -1, m->gpu.device)) {
             ssm_qkv_gate_gpu_done = 1;
-        } else if (il == 0 || il == 8 || il == 16 || il == 32 || il == 48 || il == 60) {
-            fprintf(stderr, "DEBUG: SSM qkv/gate GPU dispatch failed (gpu_lw=%p gl->qkv=%p gl->gate=%p pos=%d)\n",
-                    gpu_lw, gl ? gl->attn_qkv : NULL, gl ? gl->attn_gate_ssm : NULL, pos);
         }
-    }
-    if (!ssm_qkv_gate_gpu_done)
-    {
-        if (il == 0 || il == 8 || il == 16 || il == 32 || il == 48 || il == 60) fprintf(stderr, "DEBUG: SSM qkv/gate matmul fell through to CPU (pos=%d)\n", pos);
-    } else {
-        if (il == 0 || il == 8 || il == 16 || il == 32 || il == 48 || il == 60) fprintf(stderr, "DEBUG: SSM qkv/gate GPU OK (pos=%d)\n", pos);
     }
 #endif
     if (!ssm_qkv_gate_gpu_done)
@@ -7556,15 +7547,6 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
             ssm_out_gpu_done = 1;
         }
     }
-    if (!ssm_out_gpu_done)
-    {
-        if (il == 0 || il == 8 || il == 16 || il == 32 || il == 48 || il == 60 && gpu_lw) {
-            gpu_layer_weights_t *gl2 = (gpu_layer_weights_t *)gpu_lw;
-            fprintf(stderr, "DEBUG: ssm_out GPU failed: gl->ssm_out=%p\n", gl2 ? gl2->ssm_out : NULL);
-        }
-    } else {
-        if (il == 0 || il == 8 || il == 16 || il == 32 || il == 48 || il == 60) fprintf(stderr, "DEBUG: ssm_out GPU OK\n");
-    }
 #endif
     if (!ssm_out_gpu_done)
     {
@@ -7596,11 +7578,6 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
                                       (picolm_gpu_tensor_t *)gl->ffn_up,
                                       (picolm_gpu_tensor_t *)gl->ffn_down,
                                       s->xb, s->xb, 1);
-            }
-            if (il == 0 || il == 8 || il == 16 || il == 32 || il == 48 || il == 60) {
-                fprintf(stderr, "DEBUG: SSM FFN GPU: gate=%p up=%p down=%p mlp_ok=%d\n",
-                        gl ? gl->ffn_gate : NULL, gl ? gl->ffn_up : NULL,
-                        gl ? gl->ffn_down : NULL, mlp_ok);
             }
             if (mlp_ok)
                 goto ssm_ffn_done;
