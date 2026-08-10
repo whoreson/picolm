@@ -2752,10 +2752,17 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                     if (c->rope_type != 0 && c->rope_type != 1) eligible = 0;
                     /* F16 KV cache only */
                     if (kv_type_k != KV_CACHE_F16 || kv_type_v != KV_CACHE_F16) eligible = 0;
-                    /* GPU pipeline doesn't support SSM models.
-                     * Disable to avoid GPU prefill wasting time uploading
-                     * embeddings then falling back to CPU at first SSM layer. */
-                    if (c->has_ssm) eligible = 0;
+                    /* SSM models: enable GPU pipeline.
+                     * Q+gate de-interleave race condition is fixed.
+                     * Recurrence kernel matches NEON order. */
+                    if (c->has_ssm) {
+                        if (c->ssm_d_state <= 0 || c->ssm_d_state > 256) eligible = 0;
+                        if (c->ssm_dt_rank <= 0) eligible = 0;
+                        if (c->ssm_n_group <= 0) eligible = 0;
+                        if (c->ssm_d_inner <= 0) eligible = 0;
+                        if (c->ssm_d_conv <= 1) eligible = 0;
+                        if (eligible && c->ssm_d_inner % c->ssm_dt_rank != 0) eligible = 0;
+                    }
 
                     if (eligible) {
                         /* Compute KV cache sizes matching CPU allocation */
@@ -2812,8 +2819,12 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                                     picolm_gpu_upload_f32(s->attn_norm_w[l], c->n_embd, device);
                                 m->gpu.post_attn_norm_dev[l] =
                                     picolm_gpu_upload_f32(s->post_attn_norm_w[l], c->n_embd, device);
-                                /* QK-norm weights (Qwen3): per-head RMSNorm [head_dim] */
-                                if (s->attn_q_norm_w[l]) {
+                                /* QK-norm weights (Qwen3): per-head RMSNorm [head_dim]
+                                 * Only upload if the model actually has QK-norm tensors
+                                 * (w->layers[l].attn_q_norm non-NULL). The host buffer
+                                 * is always allocated but initialized to 1.0 when absent.
+                                 * Must match the CPU path which checks lw->attn_q_norm. */
+                                if (m->weights.layers[l].attn_q_norm) {
                                     m->gpu.attn_qk_norm_q_dev[l] =
                                         picolm_gpu_upload_f32(s->attn_q_norm_w[l], c->head_dim, device);
                                     m->gpu.attn_qk_norm_k_dev[l] =
@@ -4268,10 +4279,10 @@ float *model_forward(model_t *m, int token, int pos) {
 #ifdef PICOLM_GPU
             tensor_set_gpu_tensor(NULL, 0); /* clear stale handle from previous layer */
             float *ssm_residual = s->xb2;
-            ssm_forward(m, s, s->x, ssm_residual, lw, l, pos, &m->gpu.layers[l]);
+            ssm_forward(m, s, s->x, ssm_residual, lw, l, pos, NULL);
 #else
             float *ssm_residual = s->xb2;
-            ssm_forward(m, s, s->x, ssm_residual, lw, l, pos, &m->gpu.layers[l]);
+            ssm_forward(m, s, s->x, ssm_residual, lw, l, pos, NULL);
 #endif
 #ifdef PICOLM_VIZ
             viz_push_layer(l, s->x, dim);
@@ -4865,6 +4876,12 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
                 fprintf(stderr, "DBG L0 predict_coefs={");
                 for(int a=0;a<n_altup*n_altup;a++) fprintf(stderr,"%.4f%s",all_coefs[a],a<n_altup*n_altup-1?",":"");
                 fprintf(stderr, "}\n");
+                fprintf(stderr, "DBG L0 raw_predict_coef[0:4]={");
+                for(int a=0;a<4;a++) fprintf(stderr,"%.6f%s",((const float *)lw->altup_predict_coef)[a],a<3?",":"");
+                fprintf(stderr, "}\n");
+                fprintf(stderr, "DBG L0 raw_correct_coef[0:4]={");
+                for(int a=0;a<4;a++) fprintf(stderr,"%.6f%s",((const float *)lw->altup_correct_coef)[a],a<3?",":"");
+                fprintf(stderr, "}\n");
             }
             /* GGML: ggml_mul_mat(cur_permuted, all_coefs) -> result[a,d] = sum_a' all_coefs[a',a] * cur[a',d]
              * So the coefficient for cur[a'] contributing to predictions[a] is all_coefs[a' * n_altup + a] */
@@ -5141,6 +5158,11 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
             gemma3n_router(s->gemma3n_router_out, s->xb, dim, n_altup,
                           s->altup_router_norm_w[l], s->altup_router_w[l],
                           rms_norm_eps, s->xb2);
+            if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
+                fprintf(stderr, "DBG L0 correct_modalities={");
+                for(int r=0;r<n_altup;r++) fprintf(stderr,"%.4f%s",s->gemma3n_router_out[r],r<n_altup-1?",":"");
+                fprintf(stderr, "}\n");
+            }
 
             /* correct_coefs = altup_correct_coef @ modalities + 1.0
              * GGUF shape {n_altup, n_altup}, ne[0]=n_altup, ne[1]=n_altup.
@@ -5164,6 +5186,11 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
             for (int d = 0; d < dim; d++)
                 s->hb[d] = s->xb[d] - active_prediction[d];
 
+            if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
+                double im = 0; for(int i=0;i<dim;i++){double v=s->hb[i]; im+=v*v;}
+                fprintf(stderr, "DBG L0 innovation_rms=%.4f\n", sqrt(im/dim));
+            }
+
             /* corrected[a] = predictions[a] + innovation * correct_coefs[a] */
             for (int a = 0; a < n_altup; a++) {
                 float coef = correct_coefs[a];
@@ -5171,6 +5198,13 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
                 float *cur_a = s->gemma3n_altup_state + a * dim;
                 for (int d = 0; d < dim; d++)
                     cur_a[d] = pred_a[d] + s->hb[d] * coef;
+            }
+
+            if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
+                for (int a = 0; a < n_altup; a++) {
+                    double am = 0; for(int i=0;i<dim;i++){double v=s->gemma3n_altup_state[a*dim+i]; am+=v*v;}
+                    fprintf(stderr, "DBG L0 corrected[%d]_rms=%.4f\n", a, sqrt(am/dim));
+                }
             }
         }
 
@@ -5185,6 +5219,12 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
             /* Take active corrected altup */
             float *corrected_active = s->gemma3n_altup_state + i_altup_act * dim;
             /* Scale by altup_correct_scale */
+            if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
+                double sc_rms = 0; for(int i=0;i<dim;i++){double v=s->altup_correct_scale_w[l][i]; sc_rms+=v*v;}
+                fprintf(stderr, "DBG L0 altup_correct_scale_rms=%.4f [0:5]={", sqrt(sc_rms/dim));
+                for(int i=0;i<5;i++) fprintf(stderr,"%.4f%s",s->altup_correct_scale_w[l][i],i<4?",":"");
+                fprintf(stderr, "}\n");
+            }
             for (int i = 0; i < dim; i++) first_pred[i] = corrected_active[i] * s->altup_correct_scale_w[l][i];
 
             /* inp_gate: [n_embd, n_embd_altup] */
@@ -9983,7 +10023,16 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
              * After this, pipe_q holds compacted Q[q_dim], pipe_gate
              * holds gate[q_dim]. For non-SSM models, skip. */
             if (c->has_ssm) {
-                picolm_gpu_qg_deinterleave_dev(pipe_q, pipe_q,
+                /* De-interleave Q+gate. Cannot write Q in-place to pipe_q:
+                 * thread h writes pipe_q[h*head_dim] which overlaps with
+                 * thread h+1's read from pipe_q[(h+1)*2*head_dim].
+                 * Use pipe_ffn_norm as temp scratch for raw Q+gate data.
+                 * pipe_ffn_norm is sized for dim (>= q_full_dim) and idle here. */
+                picolm_gpu_memcpy(pipe_ffn_norm, pipe_q,
+                                   (size_t)n_heads * 2 * head_dim * sizeof(float),
+                                   0, gpu_dev);
+                picolm_gpu_sync(gpu_dev);
+                picolm_gpu_qg_deinterleave_dev(pipe_ffn_norm, pipe_q,
                                                 pipe_gate, n_heads, head_dim,
                                                 gpu_dev);
             }
@@ -10110,7 +10159,7 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
             picolm_gpu_memcpy(s->x, pipe_x, (size_t)dim * sizeof(float), -1, gpu_dev);
 
             float *ssm_residual = s->xb2;
-            ssm_forward(m, s, s->x, ssm_residual, lw, l, pos, &m->gpu.layers[l]);
+            ssm_forward(m, s, s->x, ssm_residual, lw, l, pos, NULL);
 
             picolm_gpu_memcpy(pipe_x, s->x, (size_t)dim * sizeof(float), 1, gpu_dev);
             did_cpu_ssm = 1;
@@ -10254,7 +10303,12 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
          * bgate holds gate[q_dim] per token. */
         if (c->has_ssm) {
             int q_dim = n_heads * head_dim;
-            picolm_gpu_qg_deinterleave_batched_dev(bq, bq, bgate,
+            /* Copy raw Q+gate to battn_out (scratch) before de-interleaving.
+             * Same in-place aliasing bug as decode path. */
+            size_t qg_bytes = (size_t)n_tokens * n_heads * 2 * head_dim * sizeof(float);
+            picolm_gpu_memcpy(battn_out, bq, qg_bytes, 0, gpu_dev);
+            picolm_gpu_sync(gpu_dev); /* ensure D2D copy completes before kernel */
+            picolm_gpu_qg_deinterleave_batched_dev(battn_out, bq, bgate,
                                                     n_heads, head_dim,
                                                     n_tokens, gpu_dev);
         }

@@ -3221,11 +3221,15 @@ picolm_gpu_ssm_vecdot(float *out_host,
     picolm_ssm_vecdot_kernel<<<grid, 256, 0, ctx->stream>>>(
         ctx->y, ctx->x, w_dev, qtype, dim, n_v_heads, row_bytes,
         hm_dev ? (const int *)hm_dev : NULL);
-    gpuFree(w_dev);
-    if (hm_dev) gpuFree(hm_dev);
 
     if (!gpu_ok(gpuDeviceSynchronize(), "ssm vecdot sync") ||
-        !gpu_ok(gpuMemcpy(out_host, ctx->y, out_bytes, gpuMemcpyDeviceToHost), "ssm out d2h")) return 0;
+        !gpu_ok(gpuMemcpy(out_host, ctx->y, out_bytes, gpuMemcpyDeviceToHost), "ssm out d2h")) {
+        gpuFree(w_dev);
+        if (hm_dev) gpuFree(hm_dev);
+        return 0;
+    }
+    gpuFree(w_dev);
+    if (hm_dev) gpuFree(hm_dev);
     return 1;
 }
 
