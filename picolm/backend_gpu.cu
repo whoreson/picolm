@@ -1539,6 +1539,38 @@ picolm_warp_reduce_sum(float val) {
     return val;
 }
 
+/* NOTE (2026-08-11): This kernel was previously (32 lanes = 32 disjoint
+ * column-blocks, one row per warp, XOR-shuffle tree reduction over all
+ * 32 partials) row-parallel but used a completely different summation
+ * tree from the CPU NEON reference (picolm_ssm_recurrence_kernel below):
+ * NEON accumulates 4 *strided* partial sums (columns cb+0, cb+4, cb+8...
+ * go into s0; cb+1,cb+5,... into s1; etc.) via serial fmaf, then combines
+ * with exactly two pairwise adds: (s0+s1)+(s2+s3). A 32-wide tree over
+ * differently-grouped partials is bit-different from that, and the
+ * ~1e-7 per-row error it introduces compounds over 48 SSM layers into
+ * wrong hidden states (see ssm_recurrence_verify.c / ssmreport.txt in
+ * project notes -- gpu_fp64 vs cpu_neon was ALSO ~1.7e-7 off, proving
+ * this is an order-of-operations mismatch, not a precision one).
+ *
+ * Fixed design: instead of 32 lanes cooperating on one row, split the
+ * warp into GROUPS_PER_WARP groups of exactly 4 lanes each and give
+ * every group its own row. Within a group, sub-lane `sub` (0..3) plays
+ * the role of the CPU's s{sub} accumulator: it strides over columns
+ * `vv*4 + sub` for vv in [0, S_v/4), doing the *same sequence* of fmaf
+ * calls in the *same order* as the CPU loop. The two-step XOR-shuffle
+ * reduction below (mask 1, then mask 2, both width-4) computes exactly
+ * (s0+s1)+(s2+s3): float addition is commutative bit-for-bit (only
+ * associativity/grouping affects rounding), so pairing lane 0 with lane
+ * 1 first (mask=1) and then combining with the {2,3} pair (mask=2)
+ * reproduces the CPU's exact grouping in every one of the 4 lanes.
+ * This is bit-exact with the thread-0 kernel/CPU NEON path while still
+ * processing GROUPS_PER_WARP rows concurrently per warp (8x on a
+ * 32-wide warp) instead of thread-0's single-row-at-a-time serial loop
+ * over all S_v rows in one thread.
+ *
+ * MUST be re-validated against ssm_recurrence_verify.c (gpu_fixed_step)
+ * on real hardware before this dispatches in production -- this rewrite
+ * has not been compiled/run on a GPU in this session. */
 template <int S_v>
 __global__ void
 picolm_ssm_recurrence_warp_kernel(float *state,
@@ -1549,78 +1581,58 @@ picolm_ssm_recurrence_warp_kernel(float *state,
                                    const float *beta,
                                    float *ssm_output,
                                    int n_v_heads, int repeat) {
-    /* Each warp processes one row of one head's S matrix. */
-    int head = gpuBlockIdx_x;
-    const int row = gpuBlockIdx_z * gpuBlockDim_y + gpuThreadIdx_y;
-    if (head >= n_v_heads || row >= S_v) return;
+    constexpr int GROUP = 4;                         /* matches CPU's 4 strided accumulators */
+    constexpr int GROUPS_PER_WARP = GPU_WARP_SIZE / GROUP;
+    constexpr int d4 = S_v / GROUP;                  /* S_v always 16/32/64/128, multiple of 4 */
 
-    const int lane = gpuThreadIdx_x;       /* 0..GPU_WARP_SIZE-1 */
-    constexpr int warp_size = GPU_WARP_SIZE;
-    const int cols_per_lane = (S_v + warp_size - 1) / warp_size;
+    const int head = gpuBlockIdx_x;
+    const int lane = gpuThreadIdx_x;                 /* 0..GPU_WARP_SIZE-1 */
+    const int group_in_warp = lane / GROUP;          /* which row within this warp */
+    const int sub = lane % GROUP;                    /* 0..3, role of CPU's s0..s3 */
+    const int row = (gpuBlockIdx_z * gpuBlockDim_y + gpuThreadIdx_y) * GROUPS_PER_WARP
+                     + group_in_warp;
+    if (head >= n_v_heads || row >= S_v) return;
 
     const int kh = head / repeat;
     const float ge = gate_exp[head];
     const float bh = beta[head];
 
-    /* Load this head's row of state into registers. */
-    const float *st_in = state + (size_t)head * S_v * S_v + row * S_v;
-    float S[cols_per_lane];
-    for (int i = 0; i < cols_per_lane; i++) {
-        S[i] = (lane * cols_per_lane + i < S_v) ? st_in[lane * cols_per_lane + i] : 0.0f;
+    float *st = state + (size_t)head * S_v * S_v + (size_t)row * S_v;
+    const float *khv = k_conv + (size_t)kh * S_v;
+    const float *qh  = q_conv + (size_t)kh * S_v;
+    const float v0 = v_conv[(size_t)head * S_v + row];
+
+    /* Pass 1 (matches CPU's decay+sk loop): decay each of this sub-lane's
+     * strided columns and fmaf-accumulate the dot product with k, in
+     * ascending vv order, exactly like the CPU's s{sub} accumulator. */
+    float s_acc = 0.0f;
+    for (int vv = 0; vv < d4; vv++) {
+        int c = vv * GROUP + sub;
+        float r = st[c] * ge;
+        st[c] = r;
+        s_acc = fmaf(r, khv[c], s_acc);
     }
+    /* (s0+s1)+(s2+s3) via two width-4 XOR shuffles -- see note above. */
+    float t1 = s_acc + gpu_shfl_xor_sync(s_acc, 1, GROUP);
+    float sk_row = t1 + gpu_shfl_xor_sync(t1, 2, GROUP);
 
-    /* Load k for this head. */
-    const float *khv = k_conv + kh * S_v;
-    float k[cols_per_lane];
-    for (int i = 0; i < cols_per_lane; i++) {
-        k[i] = (lane * cols_per_lane + i < S_v) ? khv[lane * cols_per_lane + i] : 0.0f;
+    const float dv = (v0 - sk_row) * bh;
+
+    /* Pass 2 (matches CPU's rank-1 update + output loop): update this
+     * sub-lane's strided columns with the rank-1 term and fmaf-accumulate
+     * the output dot product with q, same order as the CPU loop. */
+    float o_acc = 0.0f;
+    for (int vv = 0; vv < d4; vv++) {
+        int c = vv * GROUP + sub;
+        float r = fmaf(khv[c], dv, st[c]);
+        st[c] = r;
+        o_acc = fmaf(r, qh[c], o_acc);
     }
+    float u1 = o_acc + gpu_shfl_xor_sync(o_acc, 1, GROUP);
+    float out_row = u1 + gpu_shfl_xor_sync(u1, 2, GROUP);
 
-    /* Load q for this head. */
-    const float *qh = q_conv + kh * S_v;
-    float q[cols_per_lane];
-    for (int i = 0; i < cols_per_lane; i++) {
-        q[i] = (lane * cols_per_lane + i < S_v) ? qh[lane * cols_per_lane + i] : 0.0f;
-    }
-
-    /* Load v for this head. v is indexed by row (one scalar per row),
-     * not by column like k/q. Every lane reads the same v[row]. */
-    const float *vh = v_conv + head * S_v;
-    const float v0 = vh[row];
-
-    /* Step 1: sk = S @ k (matvec with UNDECAYED state, decay applied later) */
-    float sk_shard = 0.0f;
-    for (int i = 0; i < cols_per_lane; i++) {
-        sk_shard += S[i] * k[i];
-    }
-    float sk_row = picolm_warp_reduce_sum<warp_size>(sk_shard);
-
-    /* Step 2: delta = (v[row] - ge * sk) * beta[head] */
-    float delta = (v0 - ge * sk_row) * bh;
-
-    /* Step 4: S[row][col] = ge * S[row][col] + k[col] * delta (fused decay + outer product) */
-    for (int i = 0; i < cols_per_lane; i++) {
-        S[i] = ge * S[i] + k[i] * delta;
-    }
-
-    /* Step 5: out = S @ q (matvec with updated state) */
-    float out_shard = 0.0f;
-    for (int i = 0; i < cols_per_lane; i++) {
-        out_shard += S[i] * q[i];
-    }
-    float out_row = picolm_warp_reduce_sum<warp_size>(out_shard);
-
-    /* Write output (dim-major: out[row * n_v_heads + head]) */
-    if (lane == 0) {
-        ssm_output[row * n_v_heads + head] = out_row;
-    }
-
-    /* Write updated state back to global memory */
-    float *st_out = state + (size_t)head * S_v * S_v + row * S_v;
-    for (int i = 0; i < cols_per_lane; i++) {
-        if (lane * cols_per_lane + i < S_v) {
-            st_out[lane * cols_per_lane + i] = S[i];
-        }
+    if (sub == 0) {
+        ssm_output[(size_t)row * n_v_heads + head] = out_row;
     }
 }
 
@@ -2770,12 +2782,22 @@ picolm_gpu_ssm_recurrence(float *state,
     }
 
     /* Warp-shuffle kernel for common d_state values. Falls back to
-     * thread-0 kernel for unsupported sizes. */
+     * thread-0 kernel for unsupported sizes.
+     * Gated behind PICOLM_SSM_WARP_KERNEL_VALIDATED: the rewritten
+     * order-matched warp kernel (see comment above
+     * picolm_ssm_recurrence_warp_kernel) has not been validated on
+     * real hardware against ssm_recurrence_verify.c in this session.
+     * Until that validation is done and this macro is defined by the
+     * build, always use the thread-0 kernel, which IS bit-exact with
+     * CPU NEON (previously verified -- see ssm_gpu_session_findings.md). */
     int warp_launched = 0;
+#ifdef PICOLM_SSM_WARP_KERNEL_VALIDATED
     if (d_state == 128) {
         constexpr int S_v = 128;
         constexpr int num_warps = 4;
-        dim3 g((unsigned)n_v_heads, 1, S_v / num_warps);
+        dim3 g((unsigned)n_v_heads, 1,
+               (unsigned)((S_v + num_warps * (GPU_WARP_SIZE / 4) - 1) /
+                          (num_warps * (GPU_WARP_SIZE / 4))));
         dim3 b(GPU_WARP_SIZE, num_warps, 1);
         picolm_ssm_recurrence_warp_kernel<S_v><<<g, b, 0, ctx->stream>>>(
             (float *)ds, (const float *)dq, (const float *)dk,
@@ -2785,7 +2807,9 @@ picolm_gpu_ssm_recurrence(float *state,
     } else if (d_state == 64) {
         constexpr int S_v = 64;
         constexpr int num_warps = 4;
-        dim3 g((unsigned)n_v_heads, 1, S_v / num_warps);
+        dim3 g((unsigned)n_v_heads, 1,
+               (unsigned)((S_v + num_warps * (GPU_WARP_SIZE / 4) - 1) /
+                          (num_warps * (GPU_WARP_SIZE / 4))));
         dim3 b(GPU_WARP_SIZE, num_warps, 1);
         picolm_ssm_recurrence_warp_kernel<S_v><<<g, b, 0, ctx->stream>>>(
             (float *)ds, (const float *)dq, (const float *)dk,
@@ -2795,7 +2819,9 @@ picolm_gpu_ssm_recurrence(float *state,
     } else if (d_state == 32) {
         constexpr int S_v = 32;
         constexpr int num_warps = 4;
-        dim3 g((unsigned)n_v_heads, 1, S_v / num_warps);
+        dim3 g((unsigned)n_v_heads, 1,
+               (unsigned)((S_v + num_warps * (GPU_WARP_SIZE / 4) - 1) /
+                          (num_warps * (GPU_WARP_SIZE / 4))));
         dim3 b(GPU_WARP_SIZE, num_warps, 1);
         picolm_ssm_recurrence_warp_kernel<S_v><<<g, b, 0, ctx->stream>>>(
             (float *)ds, (const float *)dq, (const float *)dk,
@@ -2805,7 +2831,9 @@ picolm_gpu_ssm_recurrence(float *state,
     } else if (d_state == 16) {
         constexpr int S_v = 16;
         constexpr int num_warps = 4;
-        dim3 g((unsigned)n_v_heads, 1, S_v / num_warps);
+        dim3 g((unsigned)n_v_heads, 1,
+               (unsigned)((S_v + num_warps * (GPU_WARP_SIZE / 4) - 1) /
+                          (num_warps * (GPU_WARP_SIZE / 4))));
         dim3 b(GPU_WARP_SIZE, num_warps, 1);
         picolm_ssm_recurrence_warp_kernel<S_v><<<g, b, 0, ctx->stream>>>(
             (float *)ds, (const float *)dq, (const float *)dk,
@@ -2813,6 +2841,7 @@ picolm_gpu_ssm_recurrence(float *state,
             (float *)do_, n_v_heads, repeat);
         warp_launched = 1;
     }
+#endif /* PICOLM_SSM_WARP_KERNEL_VALIDATED */
     if (!warp_launched) {
         dim3 grid((unsigned)n_v_heads, 1, 1);
         picolm_ssm_recurrence_kernel<<<grid, 256, 0, ctx->stream>>>(
@@ -2881,12 +2910,18 @@ picolm_gpu_ssm_recurrence_dev(void *ssm_state_dev,  /* in/out, device [n_v_heads
         gpuFree(dg); gpuFree(db); gpuFree(do_); return 0;
     }
 
-    /* Warp-shuffle kernel for common d_state values. */
+    /* Warp-shuffle kernel for common d_state values.
+     * Gated behind PICOLM_SSM_WARP_KERNEL_VALIDATED -- see the longer
+     * comment at the first dispatch site in picolm_gpu_ssm_recurrence()
+     * above. Not enabled by default: needs on-device validation. */
     int warp_launched = 0;
+#ifdef PICOLM_SSM_WARP_KERNEL_VALIDATED
     if (d_state == 128) {
         constexpr int S_v = 128;
         constexpr int num_warps = 4;
-        dim3 g((unsigned)n_v_heads, 1, S_v / num_warps);
+        dim3 g((unsigned)n_v_heads, 1,
+               (unsigned)((S_v + num_warps * (GPU_WARP_SIZE / 4) - 1) /
+                          (num_warps * (GPU_WARP_SIZE / 4))));
         dim3 b(GPU_WARP_SIZE, num_warps, 1);
         picolm_ssm_recurrence_warp_kernel<S_v><<<g, b, 0, ctx->stream>>>(
             (float *)ssm_state_dev, (const float *)dq, (const float *)dk,
@@ -2896,7 +2931,9 @@ picolm_gpu_ssm_recurrence_dev(void *ssm_state_dev,  /* in/out, device [n_v_heads
     } else if (d_state == 64) {
         constexpr int S_v = 64;
         constexpr int num_warps = 4;
-        dim3 g((unsigned)n_v_heads, 1, S_v / num_warps);
+        dim3 g((unsigned)n_v_heads, 1,
+               (unsigned)((S_v + num_warps * (GPU_WARP_SIZE / 4) - 1) /
+                          (num_warps * (GPU_WARP_SIZE / 4))));
         dim3 b(GPU_WARP_SIZE, num_warps, 1);
         picolm_ssm_recurrence_warp_kernel<S_v><<<g, b, 0, ctx->stream>>>(
             (float *)ssm_state_dev, (const float *)dq, (const float *)dk,
@@ -2906,7 +2943,9 @@ picolm_gpu_ssm_recurrence_dev(void *ssm_state_dev,  /* in/out, device [n_v_heads
     } else if (d_state == 32) {
         constexpr int S_v = 32;
         constexpr int num_warps = 4;
-        dim3 g((unsigned)n_v_heads, 1, S_v / num_warps);
+        dim3 g((unsigned)n_v_heads, 1,
+               (unsigned)((S_v + num_warps * (GPU_WARP_SIZE / 4) - 1) /
+                          (num_warps * (GPU_WARP_SIZE / 4))));
         dim3 b(GPU_WARP_SIZE, num_warps, 1);
         picolm_ssm_recurrence_warp_kernel<S_v><<<g, b, 0, ctx->stream>>>(
             (float *)ssm_state_dev, (const float *)dq, (const float *)dk,
@@ -2916,7 +2955,9 @@ picolm_gpu_ssm_recurrence_dev(void *ssm_state_dev,  /* in/out, device [n_v_heads
     } else if (d_state == 16) {
         constexpr int S_v = 16;
         constexpr int num_warps = 4;
-        dim3 g((unsigned)n_v_heads, 1, S_v / num_warps);
+        dim3 g((unsigned)n_v_heads, 1,
+               (unsigned)((S_v + num_warps * (GPU_WARP_SIZE / 4) - 1) /
+                          (num_warps * (GPU_WARP_SIZE / 4))));
         dim3 b(GPU_WARP_SIZE, num_warps, 1);
         picolm_ssm_recurrence_warp_kernel<S_v><<<g, b, 0, ctx->stream>>>(
             (float *)ssm_state_dev, (const float *)dq, (const float *)dk,
@@ -2924,6 +2965,7 @@ picolm_gpu_ssm_recurrence_dev(void *ssm_state_dev,  /* in/out, device [n_v_heads
             (float *)do_, n_v_heads, repeat);
         warp_launched = 1;
     }
+#endif /* PICOLM_SSM_WARP_KERNEL_VALIDATED */
     if (!warp_launched) {
         dim3 grid((unsigned)n_v_heads, 1, 1);
         picolm_ssm_recurrence_kernel<<<grid, 256, 0, ctx->stream>>>(
@@ -2967,12 +3009,18 @@ picolm_gpu_ssm_recurrence_pipeline_dev(void *ssm_state_dev,
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
 
-    /* Warp-shuffle kernel for common d_state values. */
+    /* Warp-shuffle kernel for common d_state values.
+     * Gated behind PICOLM_SSM_WARP_KERNEL_VALIDATED -- see the longer
+     * comment at the first dispatch site in picolm_gpu_ssm_recurrence()
+     * above. Not enabled by default: needs on-device validation. */
     int warp_launched = 0;
+#ifdef PICOLM_SSM_WARP_KERNEL_VALIDATED
     if (d_state == 128) {
         constexpr int S_v = 128;
         constexpr int num_warps = 4;
-        dim3 g((unsigned)n_v_heads, 1, S_v / num_warps);
+        dim3 g((unsigned)n_v_heads, 1,
+               (unsigned)((S_v + num_warps * (GPU_WARP_SIZE / 4) - 1) /
+                          (num_warps * (GPU_WARP_SIZE / 4))));
         dim3 b(GPU_WARP_SIZE, num_warps, 1);
         picolm_ssm_recurrence_warp_kernel<S_v><<<g, b, 0, ctx->stream>>>(
             (float *)ssm_state_dev, q_conv_dev, k_conv_dev,
@@ -2982,7 +3030,9 @@ picolm_gpu_ssm_recurrence_pipeline_dev(void *ssm_state_dev,
     } else if (d_state == 64) {
         constexpr int S_v = 64;
         constexpr int num_warps = 4;
-        dim3 g((unsigned)n_v_heads, 1, S_v / num_warps);
+        dim3 g((unsigned)n_v_heads, 1,
+               (unsigned)((S_v + num_warps * (GPU_WARP_SIZE / 4) - 1) /
+                          (num_warps * (GPU_WARP_SIZE / 4))));
         dim3 b(GPU_WARP_SIZE, num_warps, 1);
         picolm_ssm_recurrence_warp_kernel<S_v><<<g, b, 0, ctx->stream>>>(
             (float *)ssm_state_dev, q_conv_dev, k_conv_dev,
@@ -2992,7 +3042,9 @@ picolm_gpu_ssm_recurrence_pipeline_dev(void *ssm_state_dev,
     } else if (d_state == 32) {
         constexpr int S_v = 32;
         constexpr int num_warps = 4;
-        dim3 g((unsigned)n_v_heads, 1, S_v / num_warps);
+        dim3 g((unsigned)n_v_heads, 1,
+               (unsigned)((S_v + num_warps * (GPU_WARP_SIZE / 4) - 1) /
+                          (num_warps * (GPU_WARP_SIZE / 4))));
         dim3 b(GPU_WARP_SIZE, num_warps, 1);
         picolm_ssm_recurrence_warp_kernel<S_v><<<g, b, 0, ctx->stream>>>(
             (float *)ssm_state_dev, q_conv_dev, k_conv_dev,
@@ -3002,7 +3054,9 @@ picolm_gpu_ssm_recurrence_pipeline_dev(void *ssm_state_dev,
     } else if (d_state == 16) {
         constexpr int S_v = 16;
         constexpr int num_warps = 4;
-        dim3 g((unsigned)n_v_heads, 1, S_v / num_warps);
+        dim3 g((unsigned)n_v_heads, 1,
+               (unsigned)((S_v + num_warps * (GPU_WARP_SIZE / 4) - 1) /
+                          (num_warps * (GPU_WARP_SIZE / 4))));
         dim3 b(GPU_WARP_SIZE, num_warps, 1);
         picolm_ssm_recurrence_warp_kernel<S_v><<<g, b, 0, ctx->stream>>>(
             (float *)ssm_state_dev, q_conv_dev, k_conv_dev,
@@ -3010,6 +3064,7 @@ picolm_gpu_ssm_recurrence_pipeline_dev(void *ssm_state_dev,
             ssm_output_dev, n_v_heads, repeat);
         warp_launched = 1;
     }
+#endif /* PICOLM_SSM_WARP_KERNEL_VALIDATED */
     if (!warp_launched) {
         dim3 grid((unsigned)n_v_heads, 1, 1);
         picolm_ssm_recurrence_kernel<<<grid, 256, 0, ctx->stream>>>(

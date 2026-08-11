@@ -7467,20 +7467,65 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     if (1) {
         int rec_done = 0;
         if (m->gpu.ssm_state_dev[il]) {
+            /* m->gpu.ssm_state_dev[il] is the ONLY up-to-date copy of this
+             * layer's recurrence state once GPU-native decode is running:
+             * picolm_gpu_ssm_recurrence_dev() deliberately never D2H's the
+             * state back to s->ssm_state[il] (that round-trip is exactly
+             * what the persistent-state optimization exists to avoid, see
+             * "State remains on device - no D2H needed" in backend_gpu.cu).
+             * s->ssm_state[il] (== `state` below) is therefore stale/
+             * divergent from the moment the first token after prefill goes
+             * through this path, and only gets further out of date with
+             * every subsequent token.
+             *
+             * Previously, a failed recurrence_dev call here silently fell
+             * back to picolm_gpu_ssm_recurrence(state, ...) or the CPU
+             * tensor_parallel_for path -- both of which read that same
+             * stale `state`. That computes ssm_output for this token from
+             * the wrong starting state (corrupting this token's logits,
+             * which then feeds back into generation as the next input
+             * token), while leaving the real, correct device state
+             * un-updated for this token -- a silent, undetectable
+             * correctness bug. A transient failure here (e.g. gpuMalloc
+             * contention) becomes far more likely under added system load
+             * (such as running under `perf record`), which is consistent
+             * with the early-stop/garbage-output reports.
+             *
+             * Retry once (transient GPU errors are typically one-off),
+             * then fail loudly rather than silently corrupting output. */
             if (picolm_gpu_ssm_recurrence_dev(m->gpu.ssm_state_dev[il],
                                                q_conv, k_conv, v_conv,
                                                gate_exp, beta, ssm_output,
                                                n_v_heads, d_state, repeat, m->gpu.device)) {
                 rec_done = 1;
+            } else if (picolm_gpu_ssm_recurrence_dev(m->gpu.ssm_state_dev[il],
+                                               q_conv, k_conv, v_conv,
+                                               gate_exp, beta, ssm_output,
+                                               n_v_heads, d_state, repeat, m->gpu.device)) {
+                fprintf(stderr, "WARN: GPU SSM recurrence retry succeeded "
+                        "(layer %d, pos %d) after an initial failure -- "
+                        "investigate transient GPU errors.\n", il, pos);
+                rec_done = 1;
+            } else {
+                fprintf(stderr, "FATAL: GPU SSM recurrence failed twice for "
+                        "layer %d, pos %d with device-resident state present. "
+                        "Falling back to CPU/host state here would silently "
+                        "corrupt this and all subsequent tokens (device state "
+                        "is the sole up-to-date copy and is not host-synced "
+                        "per-token). Aborting instead of producing wrong "
+                        "output. Check GPU memory pressure/errors.\n", il, pos);
+                abort();
             }
         }
-        if (!rec_done && picolm_gpu_ssm_recurrence(state, q_conv, k_conv, v_conv,
-                                        gate_exp, beta, ssm_output,
-                                        n_v_heads, d_state, repeat, m->gpu.device)) {
-            rec_done = 1;
-        }
         if (!rec_done) {
-            tensor_parallel_for(n_v_heads, ssm_head_task, &ssm_ctx);
+            /* No device-resident state exists for this layer (e.g. GPU
+             * disabled, or state never allocated) -- `state` (host) is the
+             * authoritative copy in this case, so these paths are safe. */
+            if (!picolm_gpu_ssm_recurrence(state, q_conv, k_conv, v_conv,
+                                            gate_exp, beta, ssm_output,
+                                            n_v_heads, d_state, repeat, m->gpu.device)) {
+                tensor_parallel_for(n_v_heads, ssm_head_task, &ssm_ctx);
+            }
         }
     } else
 #endif
