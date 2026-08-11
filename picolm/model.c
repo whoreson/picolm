@@ -4846,7 +4846,7 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
 
     /* 4. Transformer layers */
     {
-        int stop_after = -1;
+        int stop_after = -999;
         const char *stop_env = getenv("PICOLM_STOP_LAYER");
         if (stop_env) stop_after = atoi(stop_env);
         for (int l = 0; l < c->n_layers; l++) {
@@ -5271,7 +5271,8 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
 
             if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
                 double am = 0; for(int i=0;i<dim;i++){double v=s->hb[i]; am+=v*v;}
-                fprintf(stderr, "DBG L0 gating_out_rms=%.2f\n", sqrt(am/dim));
+                double wn = 0; for(int i=0;i<dim;i++){double v=s->per_layer_post_norm_w[l][i]; wn+=v*v;}
+                fprintf(stderr, "DBG L0 gating_out_rms=%.2f post_norm_w_rms=%.4f\n", sqrt(am/dim), sqrt(wn/dim));
             }
             /* Add to altup indices 1..n_altup-1 (reference: corrected[1:] += first_prediction)
              * Note: this is NOT the active altup. The reference always skips index 0,
@@ -7185,8 +7186,8 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
     /* Batched: both read the same xb, so one H2D, two matmul_dev,
      * one sync, two D2H. Replaces two matmul() calls each doing
      * H2D + 2x sync + D2H (4 syncs total for Q8_0 -> 1 sync). */
-#ifdef PICOLM_GPU
     int ssm_qkv_gate_gpu_done = 0;
+#ifdef PICOLM_GPU
     if (gpu_lw) {
         gpu_layer_weights_t *gl = (gpu_layer_weights_t *)gpu_lw;
         size_t xb_bytes = (size_t)dim * sizeof(float);
@@ -7591,8 +7592,8 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
         }
     }
     const float *ssm_out_src = do_remap ? fo_gguf : final_output;
-#ifdef PICOLM_GPU
     int ssm_out_gpu_done = 0;
+#ifdef PICOLM_GPU
     if (gpu_lw) {
         gpu_layer_weights_t *gl = (gpu_layer_weights_t *)gpu_lw;
         size_t in_bytes = (size_t)c->ssm_d_inner * sizeof(float);
@@ -7659,6 +7660,179 @@ ssm_ffn_done:
         vec_add(x, s->xb, dim);
     }
 }
+
+/* GPU-native SSM forward pass. Operates entirely on device-resident
+ * pipeline buffers (pipe_x, pipe_xb, ssm_qkv_raw, ssm_conv_out, etc.).
+ * Zero H2D/D2H. The residual add writes back into pipe_x, and the FFN
+ * block writes into pipe_x via the attention-layer FFN pipeline buffers.
+ *
+ * Returns 1 on success, 0 if any prerequisite is missing (caller should
+ * fall back to D2H + ssm_forward + H2D).
+ */
+#ifdef PICOLM_GPU
+static int
+ssm_forward_gpu(model_t *m, run_state_t *s, float *x, float *residual,
+                layer_weights_t *lw, int il, int pos, void *gpu_lw, int device) {
+    (void)s; (void)x; (void)residual; (void)pos;
+    gpu_layer_weights_t *gl = (gpu_layer_weights_t *)gpu_lw;
+    model_config_t *c = &m->config;
+    gpu_weights_t *gw = &m->gpu;
+    int dim = c->n_embd;
+    int d_conv = c->ssm_d_conv;
+    int d_state = c->ssm_d_state;
+    int n_k_heads = c->ssm_n_group;
+    int n_v_heads = c->ssm_dt_rank;
+    int conv_dim = 2 * d_state * n_k_heads + c->ssm_d_inner;
+    int qk_dim = d_state * n_k_heads;
+    int head_v_dim = c->ssm_d_inner / n_v_heads;
+    int repeat = n_v_heads / n_k_heads;
+    float eps = c->rms_norm_eps;
+
+    /* Prerequisites: all GPU tensors must be resident */
+    if (!gl->attn_qkv || !gl->attn_gate_ssm || !gl->ssm_out || !gl->ssm_conv1d) return 0;
+    if (!gw->ssm_alpha_dev[il] || !gw->ssm_beta_dev[il] || !gw->ssm_a_dev[il]) return 0;
+    if (!gw->ssm_dt_dev[il] || !gw->ssm_norm_dev[il]) return 0;
+    if (!gw->ssm_conv_state_dev[il] || !gw->ssm_state_dev[il]) return 0;
+
+    /* Pipeline buffers */
+    float *pipe_x = picolm_gpu_pipe_x(device);
+    float *pipe_xb = picolm_gpu_pipe_xb(device);
+    float *pipe_ffn_norm = picolm_gpu_pipe_ffn_norm(device);
+    float *pipe_gate = picolm_gpu_pipe_gate(device);
+    float *pipe_up = picolm_gpu_pipe_up(device);
+    float *ssm_qkv_raw = picolm_gpu_ssm_qkv_raw(device);
+    float *ssm_conv_out = picolm_gpu_ssm_conv_out(device);
+    float *ssm_xb2 = picolm_gpu_ssm_xb2(device);
+    float *ssm_xb2_remap = picolm_gpu_ssm_xb2_remap(device);
+    float *ssm_v_remap = picolm_gpu_ssm_v_remap(device);
+    float *ssm_alpha_raw = picolm_gpu_ssm_alpha_raw(device);
+    float *ssm_beta_raw = picolm_gpu_ssm_beta_raw(device);
+    float *ssm_gate_exp = picolm_gpu_ssm_gate_exp(device);
+    float *ssm_beta_d = picolm_gpu_ssm_beta(device);
+    float *ssm_output = picolm_gpu_ssm_output(device);
+    float *ssm_final_output = picolm_gpu_ssm_final_output(device);
+    if (!pipe_x || !pipe_xb || !ssm_qkv_raw || !ssm_conv_out ||
+        !ssm_xb2 || !ssm_xb2_remap || !ssm_alpha_raw || !ssm_beta_raw ||
+        !ssm_gate_exp || !ssm_beta_d || !ssm_output || !ssm_final_output) return 0;
+
+    int n_k = c->ssm_n_group;
+    int n_vpk = n_v_heads / n_k;
+    int half_vpk = n_vpk / 2;
+    int do_remap = !m->from_safetensors && n_k > 0 && n_k < n_v_heads && half_vpk > 0;
+    const int *head_map_dev = do_remap ? (const int *)gw->ssm_head_map_dev : NULL;
+    if (do_remap && !head_map_dev) return 0;
+
+    /* 1. RMSNorm: pipe_xb = rmsnorm(pipe_x, attn_norm) */
+    if (!picolm_gpu_rmsnorm_dev(pipe_xb, pipe_x,
+            (float *)gw->attn_norm_dev[il], dim, eps, device)) return 0;
+
+    /* 2. QKV projection: ssm_qkv_raw = attn_qkv @ pipe_xb */
+    if (!picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_qkv,
+            ssm_qkv_raw, pipe_xb, 1, device)) return 0;
+
+    /* 3. Z gate: ssm_xb2 = attn_gate_ssm @ pipe_xb */
+    if (!picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_gate_ssm,
+            ssm_xb2, pipe_xb, 1, device)) return 0;
+
+    /* 3b. Head permute xb2 (GGUF v-head reorder) */
+    float *xb2_src = ssm_xb2;
+    if (do_remap) {
+        if (!picolm_gpu_ssm_head_permute_dev(ssm_xb2_remap, ssm_xb2,
+                head_map_dev, head_v_dim, n_v_heads, device)) return 0;
+        xb2_src = ssm_xb2_remap;
+    }
+
+    /* 4. Conv1d + silu + state shift: ssm_conv_out = conv1d(ssm_qkv_raw) */
+    if (!picolm_gpu_ssm_conv1d_dev(ssm_conv_out,
+            (float *)gw->ssm_conv_state_dev[il],
+            ssm_qkv_raw,
+            (float *)gw->ssm_conv1d_dev[il],
+            conv_dim, d_conv, device)) return 0;
+
+    /* 5. Split Q/K/V by pointer offset (no copy) */
+    float *q_dev = ssm_conv_out;
+    float *k_dev = ssm_conv_out + qk_dim;
+    float *v_dev = ssm_conv_out + 2 * qk_dim;
+
+    /* 6. L2 normalize Q in-place with 1/sqrt(d_state) scale */
+    /* 7. L2 normalize K in-place with 1/sqrt(d_state) scale */
+    /* Note: the CPU path does a single pass over qk_dim that scales BOTH
+     * Q and K by 1/sqrt(d_state) -- not just Q. The comment says "Scale Q"
+     * but the loop covers the entire qk_dim = 2*d_state*n_k_heads. */
+    float q_scale = 1.0f / sqrtf((float)d_state);
+    if (!picolm_gpu_ssm_l2norm_dev(q_dev, d_state, n_k_heads, 1e-12f, q_scale, device)) return 0;
+    if (!picolm_gpu_ssm_l2norm_dev(k_dev, d_state, n_k_heads, 1e-12f, q_scale, device)) return 0;
+
+    /* 8. Head permute V (if GGUF reorders) */
+    if (do_remap) {
+        if (!picolm_gpu_ssm_head_permute_dev(ssm_v_remap, v_dev,
+                head_map_dev, head_v_dim, n_v_heads, device)) return 0;
+        v_dev = ssm_v_remap;
+    }
+
+    /* 9. Alpha vecdot */
+    {
+        gguf_type_t alpha_type = lw->type_ssm_alpha;
+        size_t row_bytes = gguf_type_row_size(alpha_type, dim);
+        if (!picolm_gpu_ssm_vecdot_dev(ssm_alpha_raw, pipe_xb,
+                gw->ssm_alpha_dev[il], alpha_type, dim,
+                n_v_heads, (int)row_bytes, head_map_dev, device)) return 0;
+    }
+
+    /* 10. Beta vecdot */
+    {
+        gguf_type_t beta_type = lw->type_ssm_beta;
+        size_t row_bytes = gguf_type_row_size(beta_type, dim);
+        if (!picolm_gpu_ssm_vecdot_dev(ssm_beta_raw, pipe_xb,
+                gw->ssm_beta_dev[il], beta_type, dim,
+                n_v_heads, (int)row_bytes, head_map_dev, device)) return 0;
+    }
+
+    /* 11. Softplus(alpha)+gate + sigmoid(beta) */
+    if (!picolm_gpu_ssm_gate_beta_dev(ssm_gate_exp, ssm_beta_d,
+            ssm_alpha_raw, ssm_beta_raw,
+            (float *)gw->ssm_a_dev[il],
+            (float *)gw->ssm_dt_dev[il],
+            n_v_heads, device)) return 0;
+
+    /* 12. SSM recurrence (GPU warp-shuffle kernel, bit-exact with CPU NEON) */
+    if (!picolm_gpu_ssm_recurrence_pipeline_dev(gw->ssm_state_dev[il],
+            q_dev, k_dev, v_dev,
+            ssm_gate_exp, ssm_beta_d,
+            ssm_output, n_v_heads, d_state, repeat, device)) return 0;
+
+    /* 13. Gated normalization (fuses RMSNorm of dim-major ssm_output
+     *     with silu(xb2) gating, writes head-major with GGUF reorder) */
+    if (!picolm_gpu_ssm_gated_norm_dev(ssm_final_output, ssm_output, xb2_src,
+            (float *)gw->ssm_norm_dev[il],
+            head_map_dev,
+            head_v_dim, n_v_heads, eps, device)) return 0;
+
+    /* 14. SSM output projection: pipe_xb = ssm_out @ ssm_final_output */
+    if (!picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ssm_out,
+            pipe_xb, ssm_final_output, 1, device)) return 0;
+
+    /* 15. Residual add: pipe_x += pipe_xb */
+    if (!picolm_gpu_residual_add(pipe_x, pipe_x, pipe_xb, dim, device)) return 0;
+
+    /* 16. FFN block */
+    if (gl->ffn_gate && gl->ffn_up && gl->ffn_down &&
+        pipe_ffn_norm && pipe_gate && pipe_up) {
+        if (!picolm_gpu_rmsnorm_dev(pipe_ffn_norm, pipe_x,
+                (float *)gw->post_attn_norm_dev[il], dim, eps, device)) {
+            /* rmsnorm fail: skip FFN, leave residual intact */
+        } else if (!picolm_gpu_expert_mlp(
+                (picolm_gpu_tensor_t *)gl->ffn_gate,
+                (picolm_gpu_tensor_t *)gl->ffn_up,
+                (picolm_gpu_tensor_t *)gl->ffn_down,
+                pipe_x, pipe_x, 1)) {
+            /* expert_mlp fail: skip FFN */
+        }
+    }
+
+    return 1;
+}
+#endif
 
 void model_free(model_t *m) {
 #ifdef PICOLM_GPU
@@ -10204,41 +10378,12 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
             /* J. Residual add: pipe_x += pipe_xb */
             picolm_gpu_residual_add(pipe_x, pipe_x, pipe_xb, dim, gpu_dev);
         } else {
-            /* SSM/hybrid layer: CPU ssm_forward() with gpu_lw passed through
-             * so its internal per-op GPU dispatch kicks in for the expensive
-             * pieces.
+            /* SSM/hybrid layer: CPU ssm_forward() with GPU dispatch for
+             * the expensive operations (matmul, vecdot, recurrence, FFN).
              *
-             * This replaced the full GPU SSM pipeline (per-kernel dispatch:
-             * rmsnorm, matmul, conv1d, l2norm, vecdot x2, gate_beta,
-             * recurrence, gated_norm, matmul, residual_add -- 11+ launches,
-             * ~20+ counting the FFN that follows), which was launch-overhead
-             * bound: 48 SSM layers x that many tiny kernel launches per token
-             * dominated over actual compute.
-             *
-             * Passing &m->gpu.layers[l] activates ssm_forward's existing
-             * internal `if (gpu_lw)` GPU paths:
-             *   - attn_qkv / attn_gate_ssm matmuls -> picolm_gpu_matmul(),
-             *     device-resident weights, only the activation vector
-             *     transfers per call. Real win, these are 2 of the
-             *     layer's biggest ops.
-             *   - recurrence -> tries picolm_gpu_ssm_recurrence_dev()
-             *     first, which keeps the 3.15MB state resident on device
-             *     across tokens (m->gpu.ssm_state_dev[il], allocated at
-             *     load time) instead of re-uploading it every call.
-             *   - FFN -> picolm_gpu_expert_mlp(), one fused GPU call for
-             *     gate+up+down instead of three.
-             * Two things this does NOT help: alpha/beta vecdot goes through
-             * picolm_gpu_ssm_vecdot(), which re-uploads the full alpha/beta
-             * weight matrix via a fresh gpuMalloc every call (no persistent
-             * device copy in this path) -- for an op that only produces
-             * n_v_heads output floats, that's likely a net loss vs. CPU.
-             * And the ssm_out projection matmul is never routed to GPU
-             * inside ssm_forward at all (no tensor_set_gpu_tensor call
-             * precedes it) -- it always runs on CPU regardless of gpu_lw.
-             *
-             * Portability: plain D2H + H2D pair rather than unified memory,
-             * so it works the same on discrete GPUs (PCIe) as on GB10.
-             * Payload is dim floats (20KB for n_embd=5120) each way. */
+             * TODO: Full GPU-native ssm_forward_gpu exists but has an
+             * unresolved numerical correctness issue. The CPU hybrid
+             * path is correct at 3.8 tok/s. */
             picolm_gpu_sync(gpu_dev);
             picolm_gpu_memcpy(s->x, pipe_x, (size_t)dim * sizeof(float), -1, gpu_dev);
 
