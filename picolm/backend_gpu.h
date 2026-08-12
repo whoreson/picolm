@@ -109,6 +109,18 @@ int picolm_gpu_ssm_vecdot(float *out,
                            const int *head_map,
                            int device);
 
+/* Batched-over-tokens version of the above: one weight/head_map upload
+ * and one x upload for the whole n_tokens batch, instead of once per
+ * token. out is [n_tokens][n_v_heads], x is [n_tokens][dim]. */
+int picolm_gpu_ssm_vecdot_batch(float *out,
+                                 const float *x,
+                                 const void *weights,
+                                 gguf_type_t qtype,
+                                 int dim, int n_v_heads, int n_tokens,
+                                 int row_bytes,
+                                 const int *head_map,
+                                 int device);
+
 /* Fully device-native: weights_dev/head_map_dev uploaded once at model
  * load (not re-uploaded per call like picolm_gpu_ssm_vecdot() above).
  * x_dev/out_dev are pipeline buffers. No malloc, no H2D/D2H, no sync. */
@@ -137,6 +149,17 @@ int picolm_gpu_ssm_gate_beta_dev(float *gate_exp_out_dev, float *beta_out_dev,
  * separate Q-scale pass into the norm itself. Returns 1 on success. */
 int picolm_gpu_ssm_l2norm_dev(float *x_dev, int head_dim, int n_heads,
                                float eps, float extra_scale, int device);
+
+/* Host-facing, batched-over-tokens version of the above: one H2D/D2H
+ * round trip for the whole n_tokens batch. token_stride is the element
+ * stride between consecutive tokens' head groups in x_host -- pass
+ * n_heads*head_dim for a tightly-packed buffer, or something larger
+ * (e.g. conv_dim) if the head group operated on (Q or K) is embedded
+ * inside a bigger per-token block alongside other data. In place. */
+int picolm_gpu_ssm_l2norm_batch(float *x_host, int head_dim, int n_heads,
+                                 int n_tokens, int token_stride,
+                                 float eps, float extra_scale,
+                                 int device);
 
 /* Generic per-head gather for the GGUF v-head remap: dst[h] =
  * src[head_map[h]]. Used for both the xb2 (z-gate) remap and the
@@ -194,6 +217,20 @@ int picolm_gpu_ssm_conv1d_dev(float *conv_output_dev, float *conv_state_dev,
                                const float *new_input_dev, const float *conv1d_w_dev,
                                int conv_dim, int d_conv, int device);
 
+/* Host-facing, batched-over-tokens version of the above: one H2D/D2H
+ * round trip for the whole n_tokens batch. conv_state_host is the
+ * SAME host buffer ssm_prefill_layer/ssm_forward already use as their
+ * source of truth (s->ssm_conv_state[l]) -- this does not touch the
+ * separate persistent gw->ssm_conv_state_dev[il] device buffer that
+ * only ssm_forward_gpu() (currently disabled) reads/writes. Returns 0
+ * (safe to fall back to CPU, nothing mutated yet) if d_conv exceeds
+ * PICOLM_SSM_CONV_MAX_D_CONV (16) -- see backend_gpu.cu. */
+int picolm_gpu_ssm_conv1d_batch(float *conv_output_host,
+                                 float *conv_state_host,
+                                 const float *new_input_host,
+                                 const float *conv1d_w_host,
+                                 int conv_dim, int d_conv, int n_tokens, int device);
+
 /* SSM gated normalization, device-native (Finding 5): per-head RMSNorm
  * of dim-major ssm_output, gated by silu(head-major xb2), with the
  * GGUF v-head remap optionally fused into the output write (pass
@@ -217,6 +254,49 @@ int picolm_gpu_ssm_gated_norm(float *final_output,
                                const int *head_map,
                                int head_v_dim, int n_v_heads, float eps,
                                int device);
+
+/* Batched-over-tokens version of the above: one H2D/D2H round trip for
+ * the whole n_tokens batch. Layouts match the per-token version with
+ * an added leading token dimension. */
+int picolm_gpu_ssm_gated_norm_batch(float *final_output,
+                                     const float *ssm_output,
+                                     const float *xb2,
+                                     const float *norm_w,
+                                     const int *head_map,
+                                     int head_v_dim, int n_v_heads, int n_tokens, float eps,
+                                     int device);
+
+/* Prefill-specific gated norm: NOT the same layout as
+ * picolm_gpu_ssm_gated_norm(_batch) above -- see the long comment above
+ * picolm_gpu_ssm_prefill_gated_norm_kernel in backend_gpu.cu. ssm_out
+ * and z are both head-major [n_tokens][n_v_heads][head_v_dim], no
+ * head_map remap is applied (that happens later, only in
+ * ssm_prefill_layer's do_remap output-projection branch). In-place on
+ * ssm_out_host. */
+int picolm_gpu_ssm_prefill_gated_norm(float *ssm_out_host,
+                                       const float *z_host,
+                                       const float *norm_w_host,
+                                       int head_v_dim, int n_v_heads, int n_tokens, float eps,
+                                       int device);
+
+/* Chunked DeltaNet SSM recurrence -- GPU port of ssm_chunked_recurrence()
+ * (model.c), for prefill. NOT VALIDATED ON REAL HARDWARE -- always
+ * returns 0 (safe no-op, caller falls back to the CPU path) unless the
+ * build defines PICOLM_SSM_CHUNKED_GPU_VALIDATED. See
+ * chunked_ssm_gpu_design.md in the project notes for the validation
+ * plan before defining that macro. state_host is [n_v_heads][d_state]
+ * [d_state] in/out; xb2_batch_host is [n_tokens][value_dim] head-major
+ * out. Requires d_state == head_v_dim (checked internally; returns 0
+ * if it doesn't hold). */
+int picolm_gpu_ssm_chunked_recurrence(const float *conv_batch_host,
+                                       const float *alpha_batch_host,
+                                       const float *beta_batch_host,
+                                       float *state_host,
+                                       float *xb2_batch_host,
+                                       int n_tokens, int value_dim,
+                                       int d_state, int n_k_heads, int n_v_heads,
+                                       int head_v_dim, int repeat,
+                                       int conv_dim, int cs, int device);
 
 /* Generic device memory allocation. Returns NULL on failure. */
 void *picolm_gpu_alloc_device(size_t bytes, int device);

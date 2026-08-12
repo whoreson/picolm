@@ -1449,6 +1449,101 @@ picolm_ssm_vecdot_kernel(float *out,
     out[h] = sum;
 }
 
+/* Batched-over-tokens version of the above: identical per-(token,head)
+ * computation (including the same redundant per-block re-quantization
+ * of x into Q8_0 -- kept for simplicity/correctness parity with the
+ * per-token kernel; x is small enough that this isn't the bottleneck).
+ * x is [n_tokens][dim], out is [n_tokens][n_v_heads]. */
+__global__ void
+picolm_ssm_vecdot_batch_kernel(float *out,
+                                const float *x,
+                                const void *weights,
+                                gguf_type_t qtype,
+                                int dim, int n_v_heads, int n_tokens,
+                                int row_bytes,
+                                const int *head_map) {
+    int h = gpuBlockIdx_x;
+    int t = gpuBlockIdx_y;
+    if (h >= n_v_heads || t >= n_tokens) return;
+    int tid = gpuThreadIdx_x;
+    int gh = head_map ? head_map[h] : h;
+    const char *wrow = (const char *)weights + (size_t)gh * row_bytes;
+    const float *xt = x + (size_t)t * dim;
+
+    __shared__ int8_t xq[PICOLM_SSM_VECDOT_MAX_DIM];
+    __shared__ float xq_d[PICOLM_SSM_VECDOT_MAX_DIM / 32];
+
+    if ((qtype == 2 || qtype == 8) && tid == 0) {
+        int nb = dim / 32;
+        for (int bi = 0; bi < nb; bi++) {
+            float asmax = 0.0f;
+            for (int j = 0; j < 32; j++) {
+                float v = xt[bi * 32 + j];
+                if (v < 0.0f) v = -v;
+                if (v > asmax) asmax = v;
+            }
+            float d = asmax / 127.0f;
+            xq_d[bi] = gpu_fp16_to_fp32(gpu_fp32_to_fp16(d));
+            float id = (asmax != 0.0f) ? 127.0f / asmax : 0.0f;
+            for (int j = 0; j < 32; j++) {
+                int v = (int)lroundf(xt[bi * 32 + j] * id);
+                if (v > 127) v = 127;
+                if (v < -127) v = -128;
+                xq[bi * 32 + j] = (int8_t)v;
+            }
+        }
+    }
+    gpuSyncthreads();
+
+    if (tid != 0) return;
+
+    float sum = 0.0f;
+
+    switch (qtype) {
+    case 0: {
+        const float *wrow_f = (const float *)wrow;
+        for (int i = 0; i < dim; i++) sum += wrow_f[i] * xt[i];
+        break;
+    }
+    case 2: {
+        int n_blocks = dim / 32;
+        for (int bi = 0; bi < n_blocks; bi++) {
+            const uint8_t *blk = (const uint8_t *)wrow + (size_t)bi * 18;
+            uint16_t d_raw = blk[0] | ((uint16_t)blk[1] << 8);
+            float wd = gpu_fp16_to_fp32(d_raw);
+            const uint8_t *qs = blk + 2;
+            const int8_t *yq = xq + bi * 32;
+            int sumi0 = 0, sumi1 = 0;
+            for (int j = 0; j < 16; j++) {
+                int v0 = (qs[j] & 0x0F) - 8;
+                int v1 = (qs[j] >> 4) - 8;
+                sumi0 += v0 * yq[j];
+                sumi1 += v1 * yq[j + 16];
+            }
+            sum += (float)(sumi0 + sumi1) * wd * xq_d[bi];
+        }
+        break;
+    }
+    case 8: {
+        int n_blocks = dim / 32;
+        for (int bi = 0; bi < n_blocks; bi++) {
+            const uint8_t *blk = (const uint8_t *)wrow + (size_t)bi * 34;
+            uint16_t d_raw = blk[0] | ((uint16_t)blk[1] << 8);
+            float wd = gpu_fp16_to_fp32(d_raw);
+            const int8_t *qs = (const int8_t *)(blk + 2);
+            const int8_t *yq = xq + bi * 32;
+            int sumi = 0;
+            for (int j = 0; j < 32; j++) sumi += (int)yq[j] * (int)qs[j];
+            sum += (float)sumi * xq_d[bi] * wd;
+        }
+        break;
+    }
+    default:
+        break;
+    }
+    out[(size_t)t * n_v_heads + h] = sum;
+}
+
 /* ---- SSM causal conv1d + state shift (fused) ----
  * Direct port of the CPU reference (ssm_forward, conv1d section): for
  * each channel co, sum d_conv taps (d_conv-1 from history in
@@ -1485,6 +1580,65 @@ picolm_gpu_ssm_conv1d_kernel(float *conv_output, float *conv_state,
 
 /* Host wrapper is below, after helper functions (find_ctx, gpu_ok, select_ctx).
  * See picolm_gpu_ssm_conv1d_dev definition further down. */
+
+/* ---- SSM causal conv1d + state shift, BATCHED over tokens ----
+ * Same computation as picolm_gpu_ssm_conv1d_kernel above, called
+ * conceptually n_tokens times in sequence -- but each channel-thread
+ * keeps its own small history window in registers across all n_tokens
+ * instead of round-tripping through conv_state in global memory once
+ * per token. conv_state is read once at the start and written once at
+ * the end. d_conv is always small in practice (4 is typical for this
+ * family of models); PICOLM_SSM_CONV_MAX_D_CONV is a generous cap --
+ * the host wrapper below refuses to dispatch (returns 0, caller falls
+ * back to the CPU/per-token path) if d_conv exceeds it, rather than
+ * silently truncating history.
+ *
+ * Bit-exact with the per-token kernel run n_tokens times: hist[] is
+ * updated with the identical shift-then-append order conv_state itself
+ * would be, and the tap sum is accumulated in the identical order
+ * (d=0..n_state_rows-1 then the new-sample tap), so this produces the
+ * same float sequence, not just a mathematically equivalent one. */
+#define PICOLM_SSM_CONV_MAX_D_CONV 16
+
+__global__ void
+picolm_gpu_ssm_conv1d_batch_kernel(float *conv_output,     /* out [n_tokens][conv_dim] */
+                                    float *conv_state,      /* in/out [d_conv-1][conv_dim], persistent */
+                                    const float *new_input, /* in [n_tokens][conv_dim] */
+                                    const float *conv1d_w,  /* in [conv_dim][d_conv] */
+                                    int conv_dim, int d_conv, int n_tokens) {
+    int co = (int)gpuBlockIdx_x * gpuBlockDim_x + gpuThreadIdx_x;
+    if (co >= conv_dim) return;
+
+    int n_state_rows = d_conv - 1;
+
+    float hist[PICOLM_SSM_CONV_MAX_D_CONV];
+    for (int r = 0; r < n_state_rows; r++)
+        hist[r] = conv_state[r * conv_dim + co];
+
+    float w[PICOLM_SSM_CONV_MAX_D_CONV];
+    for (int d = 0; d < d_conv; d++)
+        w[d] = conv1d_w[d + co * d_conv];
+
+    for (int t = 0; t < n_tokens; t++) {
+        float new_sample = new_input[(size_t)t * conv_dim + co];
+        float sum = 0.0f;
+        for (int d = 0; d < n_state_rows; d++)
+            sum += w[d] * hist[d];
+        sum += w[n_state_rows] * new_sample;
+        conv_output[(size_t)t * conv_dim + co] = sum / (1.0f + expf(-sum)); /* silu */
+
+        for (int r = 0; r < n_state_rows - 1; r++)
+            hist[r] = hist[r + 1];
+        if (n_state_rows > 0)
+            hist[n_state_rows - 1] = new_sample;
+    }
+
+    for (int r = 0; r < n_state_rows; r++)
+        conv_state[r * conv_dim + co] = hist[r];
+}
+
+/* Host wrapper for the batched conv1d kernel is below, next to
+ * picolm_gpu_ssm_conv1d_dev, for the same reason (needs find_ctx/gpu_ok). */
 
 /* ---- SSM recurrence kernel ----
  *
@@ -1999,6 +2153,13 @@ typedef struct {
     float *ssm_output;       /* [ssm_d_inner] recurrence output */
     float *ssm_final_output; /* [ssm_d_inner] gated_norm output */
     int ssm_ready;           /* 1 once SSM buffers are allocated */
+    /* Prefill SSM scratch buffer: grow-only, reused across all batched
+     * kernel calls (conv1d_batch, l2norm_batch, vecdot_batch, gated_norm_batch,
+     * chunked_recurrence). Eliminates per-call cudaMalloc/cudaFree. */
+    float *ssm_prefill_scratch;
+    size_t ssm_prefill_scratch_cap;
+    int8_t *ssm_prefill_scratch_i8;
+    size_t ssm_prefill_scratch_i8_cap;
 } gpu_device_ctx_t;
 
 static gpu_device_ctx_t g_gpu_ctx[PICOLM_GPU_MAX_DEVICES];
@@ -2468,17 +2629,26 @@ void *picolm_gpu_upload_int(const int *host, size_t n, int device) {
 
 int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, int device) {
     if (!t || !y || !x || S < 1) return 0;
-    /* Minimum I for GPU to be worthwhile vs CPU kernel launch overhead.
-     * Smaller tensors: kernel launch (~200us) dominates compute. */
-    if (t->I < 512 || t->O < 256) return 0;
+    if (t->I < 512 || t->O < 256) {
+        static int small_cnt = 0;
+        if (small_cnt++ < 3) fprintf(stderr, "WARN: GPU matmul bail: I=%d O=%d (need I>=512 O>=256)\n", t->I, t->O);
+        return 0;
+    }
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!select_ctx(ctx)) return 0;
+
+    static int gpm_cnt = 0;
+    if (++gpm_cnt <= 10) fprintf(stderr, "[GPU matmul] #=%d I=%d O=%d S=%d qtype=%d\n", gpm_cnt, t->I, t->O, S, t->qtype);
 
     int I = t->I, O = t->O;
     size_t xb = (size_t)S * I * sizeof(float);
     size_t yb = (size_t)S * O * sizeof(float);
     if (!reserve(&ctx->x, &ctx->x_cap, xb) ||
-        !reserve(&ctx->y, &ctx->y_cap, yb)) return 0;
+        !reserve(&ctx->y, &ctx->y_cap, yb)) {
+        static int res_fail = 0;
+        if (res_fail++ < 3) fprintf(stderr, "WARN: GPU matmul reserve fail xb=%zu yb=%zu\n", xb, yb);
+        return 0;
+    }
 
     /* ---- Q8_0 special path: quantize x to Q8_0 on GPU, then int8 MAC ----
      * This matches the CPU path in tensor.c exactly:
@@ -2492,13 +2662,19 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
         if (n_blocks < 1 || I % 32 != 0) return 0; /* must be aligned */
 
         /* Upload fp32 input */
-        if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
+        if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) {
+            static int h2d_fail = 0; if (h2d_fail++ < 3) fprintf(stderr, "WARN: GPU Q8 H2D fail xb=%zu\n", xb);
+            return 0;
+        }
 
         /* Allocate quantized input buffers: qs (int8_t[S*I]) + d (float[S*n_blocks]) */
         size_t xq_bytes = (size_t)S * I;
         size_t xd_bytes = (size_t)S * n_blocks * sizeof(float);
         if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, xq_bytes) ||
-            !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
+            !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) {
+            static int q8_res_fail = 0; if (q8_res_fail++ < 3) fprintf(stderr, "WARN: GPU Q8 reserve fail xq=%zu xd=%zu\n", xq_bytes, xd_bytes);
+            return 0;
+        }
 
         /* Step 1: Quantize x to Q8_0 on GPU */
         dim3 q_grid((unsigned)n_blocks, (unsigned)S);
@@ -2507,11 +2683,6 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
         if (!gpu_ok(gpuGetLastError(), "q8 quantize") ||
             !gpu_ok(gpuDeviceSynchronize(), "q8 quantize sync")) return 0;
 
-        /* Step 2: Q8_0 x Q8_0 integer MAC matmul, tiled over S to reuse
-         * each weight row from shared memory across Q8_TILE_S positions.
-         * For S=1 (decode), the tiled kernel's shared memory load+sync
-         * overhead dominates -- fall back to the original per-block kernel.
-         * Also falls back if row too large for shared memory. */
         if (S > 1 && t->row_bytes + 2048 <= 49152) {
             dim3 grid((unsigned)O, (unsigned)((S + Q8_TILE_S - 1) / Q8_TILE_S));
             picolm_q8_q8_matmul_tiled<<<grid, 256, (unsigned)t->row_bytes, ctx->stream>>>(
@@ -2522,7 +2693,11 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
                 ctx->y, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes);
         }
         if (!gpu_ok(gpuGetLastError(), "q8 matmul") ||
-            !gpu_ok(gpuDeviceSynchronize(), "q8 matmul sync")) return 0;
+            !gpu_ok(gpuDeviceSynchronize(), "q8 matmul sync")) {
+            static int q8_fail = 0;
+            if (q8_fail++ < 3) fprintf(stderr, "WARN: GPU Q8 matmul kernel fail O=%d S=%d\n", O, S);
+            return 0;
+        }
 
         if (!gpu_ok(gpuMemcpy(y, ctx->y, yb, gpuMemcpyDeviceToHost), "output download")) return 0;
         return 1;
@@ -3152,6 +3327,32 @@ picolm_gpu_ssm_l2norm_kernel(float *x, int head_dim, int n_heads,
     for (int d = 0; d < head_dim; d++) xh[d] *= nrm;
 }
 
+/* Batched-over-tokens version: identical per-(token,head) computation,
+ * grid.y = n_tokens instead of a host-side loop over tokens.
+ * token_stride is the element stride between consecutive tokens' head
+ * groups in x -- pass n_heads*head_dim for a tightly-packed
+ * [n_tokens][n_heads][head_dim] buffer, or something larger (e.g.
+ * conv_dim) if the head group this call operates on (Q or K) is
+ * embedded inside a bigger per-token block alongside other data (as in
+ * ssm_prefill_layer's conv_batch, where each token's block is
+ * [Q][K][V] and Q/K individually don't sit at a tight n_heads*head_dim
+ * stride from one token to the next). In-place. */
+__global__ void
+picolm_gpu_ssm_l2norm_batch_kernel(float *x, int head_dim, int n_heads,
+                                    int n_tokens, int token_stride,
+                                    float eps, float extra_scale) {
+    int h = (int)gpuBlockIdx_x;
+    int t = (int)gpuBlockIdx_y;
+    if (h >= n_heads || t >= n_tokens) return;
+    if (gpuThreadIdx_x != 0) return;
+    float *xh = x + (size_t)t * token_stride + (size_t)h * head_dim;
+
+    float nrm = 0.0f;
+    for (int d = 0; d < head_dim; d++) nrm += xh[d] * xh[d];
+    nrm = (1.0f / sqrtf(nrm + eps)) * extra_scale;
+    for (int d = 0; d < head_dim; d++) xh[d] *= nrm;
+}
+
 /* Device-native, in-place. eps must match the CPU reference (1e-12).
  * extra_scale: pass 1/sqrtf(d_state) for Q, 1.0f for K. */
 extern "C" int
@@ -3167,6 +3368,42 @@ picolm_gpu_ssm_l2norm_dev(float *x_dev, int head_dim, int n_heads,
         x_dev, head_dim, n_heads, eps, extra_scale);
     if (!gpu_ok(gpuGetLastError(), "ssm l2norm (dev)")) return 0;
     return 1;
+}
+
+/* Host-facing, batched-over-tokens L2-norm: takes a CPU pointer to the
+ * start of the first token's head group, does one H2D/D2H round trip
+ * for the whole batch (in place). See the kernel comment above for
+ * token_stride semantics. Same eps/extra_scale contract as the
+ * per-token _dev version above. */
+extern "C" int
+picolm_gpu_ssm_l2norm_batch(float *x_host, int head_dim, int n_heads,
+                             int n_tokens, int token_stride,
+                             float eps, float extra_scale,
+                             int device) {
+    if (head_dim < 1 || n_heads < 1 || head_dim > 256 || n_tokens < 1) return 0;
+    if (token_stride < n_heads * head_dim) return 0;
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+
+    /* Copy the full strided span [0, (n_tokens-1)*token_stride + n_heads*head_dim)
+     * in one shot -- includes bytes belonging to other data (K/V) sitting
+     * between consecutive tokens' head groups when token_stride is larger
+     * than n_heads*head_dim, but that's still one H2D/D2H instead of
+     * n_tokens of them, and avoids needing a strided-memcpy helper. */
+    size_t span = (size_t)(n_tokens - 1) * token_stride + (size_t)n_heads * head_dim;
+    size_t bytes = span * sizeof(float);
+    if (!reserve(&ctx->ssm_prefill_scratch, &ctx->ssm_prefill_scratch_cap, bytes)) return 0;
+    float *d_x = ctx->ssm_prefill_scratch;
+    if (!gpu_ok(gpuMemcpy(d_x, x_host, bytes, gpuMemcpyHostToDevice), "l2norm batch h2d")) return 0;
+
+    int n_threads = min(head_dim, 256);
+    dim3 grid((unsigned)n_heads, (unsigned)n_tokens, 1);
+    picolm_gpu_ssm_l2norm_batch_kernel<<<grid, n_threads, 0, ctx->stream>>>(
+        d_x, head_dim, n_heads, n_tokens, token_stride, eps, extra_scale);
+
+    if (!gpu_ok(gpuGetLastError(), "ssm l2norm batch") ||
+        !gpu_ok(gpuDeviceSynchronize(), "ssm l2norm batch sync")) return 0;
+    return gpu_ok(gpuMemcpy(x_host, d_x, bytes, gpuMemcpyDeviceToHost), "l2norm batch d2h");
 }
 
 /* ---- SSM head permute (GGUF v-head remap) ----
@@ -3257,6 +3494,45 @@ picolm_gpu_ssm_gated_norm_kernel(float *final_output,
     }
 }
 
+/* Batched-over-tokens version: identical per-(token,head) computation.
+ * ssm_output is [n_tokens][head_v_dim][n_v_heads] (dim-major per
+ * token), xb2 and final_output are [n_tokens][n_v_heads][head_v_dim]
+ * (head-major per token, final_output's head slot remapped through
+ * head_map exactly as in the per-token kernel). */
+__global__ void
+picolm_gpu_ssm_gated_norm_batch_kernel(float *final_output,
+                                        const float *ssm_output,
+                                        const float *xb2,
+                                        const float *norm_w,
+                                        const int *head_map,
+                                        int head_v_dim, int n_v_heads,
+                                        int n_tokens, float eps) {
+    int h = (int)gpuBlockIdx_x;
+    int t = (int)gpuBlockIdx_y;
+    if (h >= n_v_heads || t >= n_tokens) return;
+    if (gpuThreadIdx_x != 0) return;
+
+    const float *so_t = ssm_output + (size_t)t * head_v_dim * n_v_heads;
+
+    float nrm = 0.0f;
+    for (int d = 0; d < head_v_dim; d++) {
+        float v = so_t[(size_t)d * n_v_heads + h];
+        nrm += v * v;
+    }
+    nrm = 1.0f / sqrtf(nrm / head_v_dim + eps);
+
+    int gh = head_map ? head_map[h] : h;
+    float *out_h = final_output + (size_t)t * n_v_heads * head_v_dim + (size_t)gh * head_v_dim;
+    const float *xb2_h = xb2 + (size_t)t * n_v_heads * head_v_dim + (size_t)h * head_v_dim;
+
+    for (int d = 0; d < head_v_dim; d++) {
+        float v = so_t[(size_t)d * n_v_heads + h];
+        float zv = xb2_h[d];
+        float silu_z = zv / (1.0f + expf(-zv));
+        out_h[d] = v * nrm * norm_w[d] * silu_z;
+    }
+}
+
 /* Device-native: all pointers device-resident, no H2D/D2H, no sync.
  * head_map_dev may be NULL (identity, no remap). eps matches the CPU
  * reference's default (typically 1e-6 / 1e-5 -- confirm against
@@ -3297,6 +3573,61 @@ picolm_gpu_ssm_conv1d_dev(float *conv_output_dev, float *conv_state_dev,
         conv_output_dev, conv_state_dev, new_input_dev, conv1d_w_dev, conv_dim, d_conv);
     if (!gpu_ok(gpuGetLastError(), "ssm conv1d (dev)")) return 0;
     return 1;
+}
+
+/* Host-facing, batched-over-tokens conv1d: takes CPU pointers, does its
+ * own H2D/D2H/sync, all in one round trip for the whole n_tokens batch
+ * (not one per token). conv_state_host is read once and overwritten
+ * with the final window once -- same host buffer ssm_prefill_layer and
+ * the CPU-hybrid ssm_forward() decode path both already use as the
+ * single source of truth (this does NOT touch the separate persistent
+ * gw->ssm_conv_state_dev[il] device buffer that only the currently-
+ * disabled ssm_forward_gpu() reads/writes).
+ * Returns 0 (caller should fall back to the CPU path -- safe, nothing
+ * has been mutated yet) if d_conv exceeds PICOLM_SSM_CONV_MAX_D_CONV. */
+extern "C" int
+picolm_gpu_ssm_conv1d_batch(float *conv_output_host,      /* out [n_tokens][conv_dim] */
+                             float *conv_state_host,       /* in/out [d_conv-1][conv_dim] */
+                             const float *new_input_host,  /* in [n_tokens][conv_dim] */
+                             const float *conv1d_w_host,   /* in [conv_dim][d_conv] */
+                             int conv_dim, int d_conv, int n_tokens, int device) {
+    if (conv_dim < 1 || d_conv < 1 || n_tokens < 1) return 0;
+    if (d_conv > PICOLM_SSM_CONV_MAX_D_CONV) return 0;
+
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+
+    size_t state_bytes = (size_t)(d_conv - 1) * conv_dim * sizeof(float);
+    size_t input_bytes = (size_t)n_tokens * conv_dim * sizeof(float);
+    size_t w_bytes = (size_t)conv_dim * d_conv * sizeof(float);
+    size_t out_bytes = input_bytes;
+    size_t total = out_bytes + state_bytes + input_bytes + w_bytes;
+    if (!reserve(&ctx->ssm_prefill_scratch, &ctx->ssm_prefill_scratch_cap, total)) return 0;
+
+    float *d_out = ctx->ssm_prefill_scratch;
+    float *d_state = d_out + n_tokens * conv_dim;
+    float *d_in = d_state + (d_conv - 1) * conv_dim;
+    float *d_w = d_in + n_tokens * conv_dim;
+
+    int ok = 1;
+    if (state_bytes > 0)
+        ok = ok && gpu_ok(gpuMemcpy(d_state, conv_state_host, state_bytes, gpuMemcpyHostToDevice), "conv1d batch state h2d");
+    ok = ok && gpu_ok(gpuMemcpy(d_in, new_input_host, input_bytes, gpuMemcpyHostToDevice), "conv1d batch in h2d");
+    ok = ok && gpu_ok(gpuMemcpy(d_w, conv1d_w_host, w_bytes, gpuMemcpyHostToDevice), "conv1d batch w h2d");
+    if (!ok) return 0;
+
+    int n_threads = 256;
+    int n_blocks = (conv_dim + n_threads - 1) / n_threads;
+    picolm_gpu_ssm_conv1d_batch_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
+        d_out, d_state, d_in, d_w,
+        conv_dim, d_conv, n_tokens);
+
+    if (!gpu_ok(gpuGetLastError(), "ssm conv1d batch") ||
+        !gpu_ok(gpuDeviceSynchronize(), "ssm conv1d batch sync")) return 0;
+    ok = gpu_ok(gpuMemcpy(conv_output_host, d_out, out_bytes, gpuMemcpyDeviceToHost), "conv1d batch out d2h");
+    if (ok && state_bytes > 0)
+        ok = gpu_ok(gpuMemcpy(conv_state_host, d_state, state_bytes, gpuMemcpyDeviceToHost), "conv1d batch state d2h");
+    return ok;
 }
 
 /* Host-side gated norm wrapper: takes CPU pointers, does its own H2D/D2H/sync.
@@ -3359,7 +3690,140 @@ picolm_gpu_ssm_gated_norm(float *final_output,  /* out, host [head_v_dim * n_v_h
     return 1;
 }
 
-/* ---- SSM batched vec_dot API ---- */
+/* Batched-over-tokens version of picolm_gpu_ssm_gated_norm above: one
+ * H2D/D2H round trip for the whole n_tokens batch instead of one per
+ * token. Layouts match the per-token version with an added leading
+ * token dimension -- see picolm_gpu_ssm_gated_norm_batch_kernel's
+ * comment for exact strides. */
+extern "C" int
+picolm_gpu_ssm_gated_norm_batch(float *final_output,  /* out, host [n_tokens][n_v_heads][head_v_dim] */
+                                 const float *ssm_output, /* in, host [n_tokens][head_v_dim][n_v_heads] */
+                                 const float *xb2,     /* in, host [n_tokens][n_v_heads][head_v_dim] */
+                                 const float *norm_w,  /* in, host [head_v_dim] */
+                                 const int *head_map,  /* in, host [n_v_heads] or NULL */
+                                 int head_v_dim, int n_v_heads, int n_tokens, float eps,
+                                 int device) {
+    if (head_v_dim < 1 || n_v_heads < 1 || n_tokens < 1) return 0;
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+
+    size_t out_bytes = (size_t)n_tokens * n_v_heads * head_v_dim * sizeof(float);
+    size_t so_bytes = out_bytes;
+    size_t xb2_bytes = out_bytes;
+    size_t nw_bytes = (size_t)head_v_dim * sizeof(float);
+    size_t hm_bytes = (size_t)n_v_heads * sizeof(int);
+
+    void *d_final, *d_so, *d_xb2, *d_nw, *d_hm = NULL;
+    if (!gpu_ok(gpuMalloc(&d_final, out_bytes), "ssm gn batch final") ||
+        !gpu_ok(gpuMalloc(&d_so, so_bytes), "ssm gn batch so") ||
+        !gpu_ok(gpuMalloc(&d_xb2, xb2_bytes), "ssm gn batch xb2") ||
+        !gpu_ok(gpuMalloc(&d_nw, nw_bytes), "ssm gn batch nw")) return 0;
+    if (head_map && !gpu_ok(gpuMalloc(&d_hm, hm_bytes), "ssm gn batch hmap")) {
+        gpuFree(d_final); gpuFree(d_so); gpuFree(d_xb2); gpuFree(d_nw); return 0;
+    }
+    if (!gpu_ok(gpuMemcpy(d_so, ssm_output, so_bytes, gpuMemcpyHostToDevice), "ssm gn batch so h2d") ||
+        !gpu_ok(gpuMemcpy(d_xb2, xb2, xb2_bytes, gpuMemcpyHostToDevice), "ssm gn batch xb2 h2d") ||
+        !gpu_ok(gpuMemcpy(d_nw, norm_w, nw_bytes, gpuMemcpyHostToDevice), "ssm gn batch nw h2d")) {
+        gpuFree(d_final); gpuFree(d_so); gpuFree(d_xb2); gpuFree(d_nw);
+        if (d_hm) gpuFree(d_hm); return 0;
+    }
+    if (d_hm && !gpu_ok(gpuMemcpy(d_hm, head_map, hm_bytes, gpuMemcpyHostToDevice), "ssm gn batch hm h2d")) {
+        gpuFree(d_final); gpuFree(d_so); gpuFree(d_xb2); gpuFree(d_nw); gpuFree(d_hm); return 0;
+    }
+
+    dim3 grid((unsigned)n_v_heads, (unsigned)n_tokens, 1);
+    picolm_gpu_ssm_gated_norm_batch_kernel<<<grid, min(head_v_dim, 256), 0, ctx->stream>>>(
+        (float *)d_final, (const float *)d_so, (const float *)d_xb2,
+        (const float *)d_nw, (const int *)d_hm, head_v_dim, n_v_heads, n_tokens, eps);
+
+    if (!gpu_ok(gpuGetLastError(), "ssm gated norm batch") ||
+        !gpu_ok(gpuDeviceSynchronize(), "ssm gn batch sync")) {
+        gpuFree(d_final); gpuFree(d_so); gpuFree(d_xb2); gpuFree(d_nw);
+        if (d_hm) gpuFree(d_hm); return 0;
+    }
+    int ok = gpu_ok(gpuMemcpy(final_output, d_final, out_bytes, gpuMemcpyDeviceToHost), "ssm gn batch out d2h");
+    gpuFree(d_final); gpuFree(d_so); gpuFree(d_xb2); gpuFree(d_nw);
+    if (d_hm) gpuFree(d_hm);
+    return ok;
+}
+
+/* ---- SSM prefill gated normalization ----
+ * Direct port of ssm_prefill_layer's "8. Gated normalization" CPU loop
+ * (model.c). Deliberately NOT shared with picolm_gpu_ssm_gated_norm(_dev)
+ * above: those are direct ports of ssm_forward()'s per-token step 18,
+ * which takes dim-major ssm_output and fuses the GGUF head_map remap
+ * into the output write. Prefill's chunked recurrence
+ * (ssm_chunked_recurrence) already writes its output head-major
+ * (matching xb2/z's layout) and applies no remap at this stage -- the
+ * remap only happens later, in ssm_prefill_layer's do_remap output-
+ * projection branch. Forcing this through the decode-path kernel would
+ * mean transposing dim-major<->head-major for no reason and getting the
+ * remap timing wrong; a second, simpler kernel matching this layout
+ * exactly is safer than reusing one built for a different layout.
+ *
+ * In-place on ssm_out. Same thread-0-per-(token,head) sequential
+ * accumulation as every other norm kernel in this file, to bit-match
+ * the CPU scalar reference's left-to-right sum. */
+__global__ void
+picolm_gpu_ssm_prefill_gated_norm_kernel(float *ssm_out,   /* in/out [n_tokens][n_v_heads][head_v_dim] */
+                                          const float *z,   /* in [n_tokens][n_v_heads][head_v_dim] */
+                                          const float *norm_w, /* in [head_v_dim] */
+                                          int head_v_dim, int n_v_heads,
+                                          int n_tokens, float eps) {
+    int h = (int)gpuBlockIdx_x;
+    int t = (int)gpuBlockIdx_y;
+    if (h >= n_v_heads || t >= n_tokens) return;
+    if (gpuThreadIdx_x != 0) return;
+
+    float *out_h = ssm_out + ((size_t)t * n_v_heads + h) * head_v_dim;
+    const float *z_h = z + ((size_t)t * n_v_heads + h) * head_v_dim;
+
+    float nrm = 0.0f;
+    for (int d = 0; d < head_v_dim; d++) {
+        float v = out_h[d];
+        nrm += v * v;
+    }
+    nrm = 1.0f / sqrtf(nrm / (float)head_v_dim + eps);
+
+    for (int d = 0; d < head_v_dim; d++) {
+        float v = out_h[d];
+        float zv = z_h[d];
+        float silu_z = zv / (1.0f + expf(-zv));
+        out_h[d] = v * nrm * norm_w[d] * silu_z;
+    }
+}
+
+extern "C" int
+picolm_gpu_ssm_prefill_gated_norm(float *ssm_out_host,   /* in/out [n_tokens][n_v_heads][head_v_dim] */
+                                   const float *z_host,   /* in [n_tokens][n_v_heads][head_v_dim] */
+                                   const float *norm_w_host, /* in [head_v_dim] */
+                                   int head_v_dim, int n_v_heads, int n_tokens, float eps,
+                                   int device) {
+    if (head_v_dim < 1 || n_v_heads < 1 || n_tokens < 1) return 0;
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+
+    size_t so_bytes = (size_t)n_tokens * n_v_heads * head_v_dim * sizeof(float);
+    size_t nw_bytes = (size_t)head_v_dim * sizeof(float);
+    size_t total = so_bytes + so_bytes + nw_bytes;
+    if (!reserve(&ctx->ssm_prefill_scratch, &ctx->ssm_prefill_scratch_cap, total)) return 0;
+
+    float *d_so = ctx->ssm_prefill_scratch;
+    float *d_z = d_so + n_tokens * n_v_heads * head_v_dim;
+    float *d_nw = d_z + n_tokens * n_v_heads * head_v_dim;
+
+    if (!gpu_ok(gpuMemcpy(d_so, ssm_out_host, so_bytes, gpuMemcpyHostToDevice), "prefill gn so h2d") ||
+        !gpu_ok(gpuMemcpy(d_z, z_host, so_bytes, gpuMemcpyHostToDevice), "prefill gn z h2d") ||
+        !gpu_ok(gpuMemcpy(d_nw, norm_w_host, nw_bytes, gpuMemcpyHostToDevice), "prefill gn nw h2d")) return 0;
+
+    dim3 grid((unsigned)n_v_heads, (unsigned)n_tokens, 1);
+    picolm_gpu_ssm_prefill_gated_norm_kernel<<<grid, min(head_v_dim, 256), 0, ctx->stream>>>(
+        d_so, d_z, d_nw, head_v_dim, n_v_heads, n_tokens, eps);
+
+    if (!gpu_ok(gpuGetLastError(), "ssm prefill gated norm") ||
+        !gpu_ok(gpuDeviceSynchronize(), "ssm prefill gn sync")) return 0;
+    return gpu_ok(gpuMemcpy(ssm_out_host, d_so, so_bytes, gpuMemcpyDeviceToHost), "prefill gn out d2h");
+}
 extern "C" int
 picolm_gpu_ssm_vecdot(float *out_host,
                        const float *x_host,
@@ -3416,6 +3880,56 @@ picolm_gpu_ssm_vecdot(float *out_host,
     return 1;
 }
 
+/* Batched-over-tokens version of picolm_gpu_ssm_vecdot above: uploads
+ * the weight matrix and head_map ONCE for the whole n_tokens batch
+ * (instead of once per token, which is what calling picolm_gpu_ssm_vecdot
+ * n_tokens times in a loop would do), and does a single H2D for all
+ * n_tokens' worth of x and a single D2H for all outputs. */
+extern "C" int
+picolm_gpu_ssm_vecdot_batch(float *out_host,       /* out [n_tokens][n_v_heads] */
+                             const float *x_host,   /* in [n_tokens][dim] */
+                             const void *weights_host,
+                             gguf_type_t qtype,
+                             int dim, int n_v_heads, int n_tokens,
+                             int row_bytes,
+                             const int *head_map,
+                             int device) {
+    if (n_v_heads <= 0 || dim <= 0 || n_tokens <= 0) return 0;
+    if (qtype != 0 && qtype != 2 && qtype != 8) return 0;
+    if (dim > PICOLM_SSM_VECDOT_MAX_DIM) return 0;
+
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+
+    size_t x_bytes = (size_t)n_tokens * dim * sizeof(float);
+    size_t w_bytes = (size_t)n_v_heads * row_bytes;
+    size_t out_bytes = (size_t)n_tokens * n_v_heads * sizeof(float);
+    size_t hm_bytes = head_map ? (size_t)n_v_heads * sizeof(int) : 0;
+
+    size_t total = x_bytes + w_bytes + out_bytes + hm_bytes;
+    if (!reserve(&ctx->ssm_prefill_scratch, &ctx->ssm_prefill_scratch_cap, total)) return 0;
+
+    float *x_dev = ctx->ssm_prefill_scratch;
+    float *w_dev = x_dev + n_tokens * dim;
+    float *out_dev = w_dev + (row_bytes + 7) / 8 * n_v_heads;
+    int *hm_dev = (int *)((float *)out_dev + n_tokens * n_v_heads);
+
+    int ok = gpu_ok(gpuMemcpy(x_dev, x_host, x_bytes, gpuMemcpyHostToDevice), "vecdot batch x h2d") &&
+             gpu_ok(gpuMemcpy(w_dev, weights_host, w_bytes, gpuMemcpyHostToDevice), "vecdot batch w h2d");
+    if (ok && head_map)
+        ok = gpu_ok(gpuMemcpy(hm_dev, head_map, hm_bytes, gpuMemcpyHostToDevice), "vecdot batch hmap h2d");
+    if (!ok) return 0;
+
+    dim3 grid((unsigned)n_v_heads, (unsigned)n_tokens, 1);
+    picolm_ssm_vecdot_batch_kernel<<<grid, 256, 0, ctx->stream>>>(
+        out_dev, x_dev, w_dev, qtype, dim, n_v_heads, n_tokens,
+        row_bytes, head_map ? hm_dev : NULL);
+
+    if (!gpu_ok(gpuGetLastError(), "ssm vecdot batch") ||
+        !gpu_ok(gpuDeviceSynchronize(), "ssm vecdot batch sync")) return 0;
+    return gpu_ok(gpuMemcpy(out_host, out_dev, out_bytes, gpuMemcpyDeviceToHost), "vecdot batch out d2h");
+}
+
 /* Fully device-native SSM vecdot: weights_dev and head_map_dev must
  * already be device-resident, uploaded ONCE at model load (via
  * picolm_gpu_tensor_upload for quantized weights or picolm_gpu_upload_f32
@@ -3445,6 +3959,508 @@ picolm_gpu_ssm_vecdot_dev(float *out_dev,
         out_dev, x_dev, weights_dev, qtype, dim, n_v_heads, row_bytes, head_map_dev);
     if (!gpu_ok(gpuGetLastError(), "ssm vecdot (dev)")) return 0;
     return 1;
+}
+
+/* ================================================================
+ * Chunked DeltaNet SSM recurrence -- GPU port (prefill).
+ *
+ * NOT VALIDATED ON REAL HARDWARE IN THIS SESSION. Gated behind
+ * PICOLM_SSM_CHUNKED_GPU_VALIDATED (undefined by default -- the host
+ * driver at the bottom of this section returns 0 unconditionally
+ * unless that macro is defined by the build, so calling it is always
+ * safe/no-op until someone has actually run it through the validation
+ * plan below and flipped the flag on purpose).
+ *
+ * Direct, deliberately unoptimized (one-thread-per-output-element, no
+ * tiling/shared-memory GEMM) port of the scalar reference path in
+ * ssm_chunk_head_task() / ssm_chunked_recurrence() (model.c) -- ported
+ * from the #else scalar branch there, not the AVX/NEON micro-kernel
+ * branches (multiple SIMD variants exist; the scalar branch is the one
+ * unambiguous reference all of them are optimizing). See
+ * chunked_ssm_gpu_design.md in the project notes for:
+ *   - why bit-exactness with the CPU path is NOT the goal (unlike the
+ *     single-token recurrence kernel, these are GEMM-shaped reductions
+ *     over d_state~128 elements -- forcing a specific summation order
+ *     there would mean giving up tiling, i.e. giving up most of the
+ *     performance point)
+ *   - the recommended validation plan (per-chunk numerical comparison
+ *     against ssm_chunk_head_task before trusting end-to-end output)
+ *   - why every kernel below batches per-v-head as one threadblock,
+ *     matching the CPU's tensor_parallel_for(n_v_heads, ...) head
+ *     parallelization, with chunks processed sequentially on the host
+ *     side (state carries chunk-to-chunk within a head)
+ *
+ * Buffer layout (matches ssm_chunk_head_task's scratch pool exactly,
+ * so this can be checked line-by-line against it):
+ *   chunk_q, chunk_k:  [n_k_heads][cs][d]   (gathered once per chunk)
+ *   chunk_v:           [n_v_heads][cs][d]
+ *   chunk_beta, gate_log, cum_g, q_decay:  [n_v_heads][cs]
+ *   decay_mask, M_mat, kq:                 [n_v_heads][cs][cs]
+ *   v_eff, v_hat, sk, sq, chunk_out:        [n_v_heads][cs][d]
+ *   state:                                  [n_v_heads][d][d]
+ *
+ * `d` below is shared between K/Q (d_state) and V/out/state
+ * (head_v_dim) -- this whole algorithm relies on d_state == head_v_dim
+ * (state is square, V/out are d_state-wide per head), which
+ * ssm_chunk_head_task() on the CPU side already relies on too (it
+ * indexes chunk_v, gathered at head_v_dim stride, using ctx->d_state).
+ * The host driver checks this invariant explicitly and refuses to
+ * dispatch (safe fallback to CPU) if it doesn't hold, rather than
+ * assume it silently.
+ * ================================================================ */
+
+/* ---- Gather: gate_log/beta/Q/K/V for one chunk, from the token-major
+ * conv_batch/alpha_batch/beta_batch buffers, into the head-major
+ * layout the rest of this pipeline uses. Direct port of the CPU gather
+ * loops in ssm_chunked_recurrence(). Two kernels (Q/K vs V+scalars)
+ * since they're indexed by different head counts (n_k_heads vs
+ * n_v_heads). ---- */
+__global__ void
+ssm_chunk_gather_qk_kernel(float *chunk_q, float *chunk_k,
+                            const float *conv_batch,
+                            int chunk_start, int cs_actual, int conv_dim,
+                            int qk_dim, int d_state, int n_k_heads) {
+    int h = blockIdx.x;
+    if (h >= n_k_heads) return;
+    float *cq_h = chunk_q + (size_t)h * cs_actual * d_state;
+    float *ck_h = chunk_k + (size_t)h * cs_actual * d_state;
+    int n_elem = cs_actual * d_state;
+    for (int idx = threadIdx.x; idx < n_elem; idx += blockDim.x) {
+        int t = idx / d_state, di = idx % d_state;
+        const float *tok = conv_batch + (size_t)(chunk_start + t) * conv_dim;
+        cq_h[idx] = tok[h * d_state + di];
+        ck_h[idx] = tok[qk_dim + h * d_state + di];
+    }
+}
+
+__global__ void
+ssm_chunk_gather_v_kernel(float *chunk_v, float *chunk_beta, float *gate_log,
+                           const float *conv_batch, const float *alpha_batch,
+                           const float *beta_batch,
+                           int chunk_start, int cs_actual, int conv_dim,
+                           int qk_dim, int head_v_dim, int n_v_heads) {
+    int h = blockIdx.x;
+    if (h >= n_v_heads) return;
+    float *cv_h = chunk_v + (size_t)h * cs_actual * head_v_dim;
+    float *cb_h = chunk_beta + (size_t)h * cs_actual;
+    float *gl_h = gate_log + (size_t)h * cs_actual;
+
+    int n_elem = cs_actual * head_v_dim;
+    for (int idx = threadIdx.x; idx < n_elem; idx += blockDim.x) {
+        int t = idx / head_v_dim, di = idx % head_v_dim;
+        const float *tok = conv_batch + (size_t)(chunk_start + t) * conv_dim;
+        cv_h[idx] = tok[2 * qk_dim + h * head_v_dim + di];
+    }
+    for (int t = threadIdx.x; t < cs_actual; t += blockDim.x) {
+        cb_h[t] = beta_batch[(size_t)(chunk_start + t) * n_v_heads + h];
+        float ge = alpha_batch[(size_t)(chunk_start + t) * n_v_heads + h];
+        gl_h[t] = (ge <= 0.0f) ? -50.0f : logf(ge);
+    }
+}
+
+/* ---- Step 1: cumulative log-decay + decay mask. Direct port of the
+ * CPU's "Step 1" + "Build decay mask" blocks. Thread 0 does the
+ * inherently-sequential prefix sum (matches CPU's ascending-t loop
+ * exactly, same clamping, same expf calls); all threads then fill the
+ * cs x cs mask in parallel once cum_g is visible via __syncthreads(). ---- */
+__global__ void
+ssm_chunk_decay_kernel(float *cum_g, float *q_decay, float *decay_mask,
+                        const float *gate_log, int n_v_heads, int cs) {
+    int h = blockIdx.x;
+    if (h >= n_v_heads) return;
+    const float *gl = gate_log + (size_t)h * cs;
+    float *cg = cum_g + (size_t)h * cs;
+    float *qd = q_decay + (size_t)h * cs;
+    float *dm = decay_mask + (size_t)h * cs * cs;
+
+    if (threadIdx.x == 0) {
+        float cum = 0.0f;
+        for (int t = 0; t < cs; t++) {
+            cum += gl[t];
+            cg[t] = cum;
+            float ex = cum;
+            if (ex > 50.0f) ex = 50.0f;
+            if (ex < -50.0f) ex = -50.0f;
+            qd[t] = expf(ex);
+        }
+    }
+    __syncthreads();
+
+    int n_elem = cs * cs;
+    for (int idx = threadIdx.x; idx < n_elem; idx += blockDim.x) {
+        int i = idx / cs, j = idx % cs;
+        float v;
+        if (j > i) v = 0.0f;
+        else if (i == j) v = 1.0f;
+        else {
+            float diff = cg[i] - cg[j];
+            if (diff > 50.0f) diff = 50.0f;
+            if (diff < -50.0f) diff = -50.0f;
+            v = expf(diff);
+        }
+        dm[idx] = v;
+    }
+}
+
+/* ---- Masked cs x cs GEMM: out[h][i][j] = dot(A[kh][i], B[kh][j]) *
+ * decay_mask[h][i][j] for j<=i, else 0. Reused for both M (A=B=chunk_k,
+ * "Step 2" in the CPU scalar path) and kq (A=chunk_q, B=chunk_k,
+ * part of CPU "Step 5"). One threadblock per v-head, threads stride
+ * over the cs*cs output elements; each does a length-d dot product --
+ * no tiling, deliberately simple for a first correctness pass (see
+ * design doc). ---- */
+__global__ void
+ssm_chunk_masked_gemm_kernel(float *out_cs_cs, const float *A, const float *B,
+                              const float *decay_mask,
+                              int n_v_heads, int repeat, int cs, int d) {
+    int h = blockIdx.x;
+    if (h >= n_v_heads) return;
+    int kh = h / repeat;
+    const float *Ah = A + (size_t)kh * cs * d;
+    const float *Bh = B + (size_t)kh * cs * d;
+    const float *dm = decay_mask + (size_t)h * cs * cs;
+    float *out = out_cs_cs + (size_t)h * cs * cs;
+
+    int n_elem = cs * cs;
+    for (int idx = threadIdx.x; idx < n_elem; idx += blockDim.x) {
+        int i = idx / cs, j = idx % cs;
+        if (j > i) { out[idx] = 0.0f; continue; }
+        const float *ai = Ah + (size_t)i * d;
+        const float *bj = Bh + (size_t)j * d;
+        float dot = 0.0f;
+        for (int c = 0; c < d; c++) dot += ai[c] * bj[c];
+        out[idx] = dot * dm[idx];
+    }
+}
+
+/* ---- cs x d matvec-GEMM: out[h][i][r] = sum_c state[h][r][c] * X[kh][i][c],
+ * i.e. out = X @ State^T. Reused for sk (X=chunk_k) and sq (X=chunk_q)
+ * -- CPU "Kernel 1"/"Kernel 1b" in the SIMD path, inlined into "Step 3"
+ * /"Step 5" in the scalar path. ---- */
+__global__ void
+ssm_chunk_matvec_kernel(float *out, const float *state, const float *chunk_x,
+                         int n_v_heads, int repeat, int cs, int d) {
+    int h = blockIdx.x;
+    if (h >= n_v_heads) return;
+    int kh = h / repeat;
+    const float *x_h = chunk_x + (size_t)kh * cs * d;
+    const float *st = state + (size_t)h * d * d;
+    float *o = out + (size_t)h * cs * d;
+
+    int n_elem = cs * d;
+    for (int idx = threadIdx.x; idx < n_elem; idx += blockDim.x) {
+        int i = idx / d, r = idx % d;
+        const float *xi = x_h + (size_t)i * d;
+        const float *st_row = st + (size_t)r * d;
+        float sum = 0.0f;
+        for (int c = 0; c < d; c++) sum += st_row[c] * xi[c];
+        o[idx] = sum;
+    }
+}
+
+/* ---- V_eff assembly: direct port of CPU "Step 3". ---- */
+__global__ void
+ssm_chunk_veff_kernel(float *v_eff, const float *chunk_v, const float *sk,
+                       const float *q_decay, const float *chunk_beta,
+                       int n_v_heads, int cs, int d) {
+    int h = blockIdx.x;
+    if (h >= n_v_heads) return;
+    const float *v_h = chunk_v + (size_t)h * cs * d;
+    const float *sk_h = sk + (size_t)h * cs * d;
+    const float *qd_h = q_decay + (size_t)h * cs;
+    const float *bt_h = chunk_beta + (size_t)h * cs;
+    float *ve_h = v_eff + (size_t)h * cs * d;
+
+    int n_elem = cs * d;
+    for (int idx = threadIdx.x; idx < n_elem; idx += blockDim.x) {
+        int i = idx / d;
+        ve_h[idx] = bt_h[i] * (v_h[idx] - qd_h[i] * sk_h[idx]);
+    }
+}
+
+/* ---- Forward substitution / triangular solve for V_hat: the one
+ * inherently sequential part of this whole algorithm. Direct port of
+ * CPU "Step 4". One threadblock per v-head; blockDim.x should cover d
+ * (loops if not). cs sequential steps over i, ascending, with
+ * __syncthreads() between each: v_hat[i] must be fully written by all
+ * r-threads before any thread reads it for i+1 (every later i' > i
+ * reads all of v_hat[0..i'-1]). This is the piece flagged in the
+ * design doc as needing the most dedicated validation (small-cs and
+ * boundary-chunk cases especially). ---- */
+__global__ void
+ssm_chunk_trisolve_kernel(float *v_hat, const float *v_eff, const float *M_mat,
+                           const float *chunk_beta,
+                           int n_v_heads, int cs, int d) {
+    int h = blockIdx.x;
+    if (h >= n_v_heads) return;
+    const float *ve_h = v_eff + (size_t)h * cs * d;
+    const float *M_h = M_mat + (size_t)h * cs * cs;
+    const float *bt_h = chunk_beta + (size_t)h * cs;
+    float *vh_h = v_hat + (size_t)h * cs * d;
+
+    for (int i = 0; i < cs; i++) {
+        float bt = bt_h[i];
+        const float *Mi = M_h + (size_t)i * cs;
+        for (int r = threadIdx.x; r < d; r += blockDim.x) {
+            float sum_mv = 0.0f;
+            for (int j = 0; j < i; j++) sum_mv += Mi[j] * vh_h[(size_t)j * d + r];
+            vh_h[(size_t)i * d + r] = ve_h[(size_t)i * d + r] - bt * sum_mv;
+        }
+        __syncthreads();
+    }
+}
+
+/* ---- Output assembly: direct port of CPU "Step 5". kq already has
+ * the decay_mask factor folded in (from ssm_chunk_masked_gemm_kernel),
+ * matching kq[i][j] == CPU's `attn` exactly -- no separate mask lookup
+ * needed here, same as the CPU scalar path's `attn = k_dot_q * dm`
+ * being precomputed rather than looked up in the AVX/NEON paths. ---- */
+__global__ void
+ssm_chunk_output_kernel(float *chunk_out, const float *sq, const float *q_decay,
+                         const float *kq, const float *v_hat,
+                         int n_v_heads, int cs, int d) {
+    int h = blockIdx.x;
+    if (h >= n_v_heads) return;
+    const float *sq_h = sq + (size_t)h * cs * d;
+    const float *qd_h = q_decay + (size_t)h * cs;
+    const float *kq_h = kq + (size_t)h * cs * cs;
+    const float *vh_h = v_hat + (size_t)h * cs * d;
+    float *out_h = chunk_out + (size_t)h * cs * d;
+
+    int n_elem = cs * d;
+    for (int idx = threadIdx.x; idx < n_elem; idx += blockDim.x) {
+        int i = idx / d, r = idx % d;
+        float acc = sq_h[idx] * qd_h[i];
+        const float *kqi = kq_h + (size_t)i * cs;
+        for (int j = 0; j <= i; j++)
+            acc += kqi[j] * vh_h[(size_t)j * d + r];
+        out_h[idx] = acc;
+    }
+}
+
+/* ---- State update: direct port of CPU "Step 6" (scalar path),
+ * including its exact redundant per-(r,c,j) recomputation of
+ * decay_to_end rather than precomputing it once per j -- kept for
+ * fidelity to the reference rather than "optimized" into a precompute
+ * pass, since this is a correctness-first port. ---- */
+__global__ void
+ssm_chunk_state_update_kernel(float *state, const float *v_hat, const float *chunk_k,
+                               const float *cum_g,
+                               int n_v_heads, int repeat, int cs, int d) {
+    int h = blockIdx.x;
+    if (h >= n_v_heads) return;
+    int kh = h / repeat;
+    const float *vh_h = v_hat + (size_t)h * cs * d;
+    const float *k_h = chunk_k + (size_t)kh * cs * d;
+    const float *cg_h = cum_g + (size_t)h * cs;
+    float *st_h = state + (size_t)h * d * d;
+
+    float cum_last = cg_h[cs - 1];
+    float ex_total = cum_last;
+    if (ex_total > 50.0f) ex_total = 50.0f;
+    if (ex_total < -50.0f) ex_total = -50.0f;
+    float total_decay = expf(ex_total);
+
+    int n_elem = d * d;
+    for (int idx = threadIdx.x; idx < n_elem; idx += blockDim.x) {
+        int r = idx / d, c = idx % d;
+        float update = 0.0f;
+        for (int j = 0; j < cs; j++) {
+            float diff = cum_last - cg_h[j];
+            if (diff > 50.0f) diff = 50.0f;
+            if (diff < -50.0f) diff = -50.0f;
+            float decay_to_end = expf(diff);
+            update += vh_h[(size_t)j * d + r] * k_h[(size_t)j * d + c] * decay_to_end;
+        }
+        st_h[idx] = st_h[idx] * total_decay + update;
+    }
+}
+
+/* ---- Scatter: chunk_out [n_v_heads][cs][d] -> xb2_batch
+ * [n_tokens][value_dim] head-major, matching ssm_chunked_recurrence()'s
+ * CPU reshape loop exactly. ---- */
+__global__ void
+ssm_chunk_scatter_kernel(float *xb2_batch, const float *chunk_out,
+                          int chunk_start, int cs_actual, int value_dim,
+                          int head_v_dim, int n_v_heads) {
+    int h = blockIdx.x;
+    if (h >= n_v_heads) return;
+    const float *co_h = chunk_out + (size_t)h * cs_actual * head_v_dim;
+    int n_elem = cs_actual * head_v_dim;
+    for (int idx = threadIdx.x; idx < n_elem; idx += blockDim.x) {
+        int t = idx / head_v_dim, r = idx % head_v_dim;
+        xb2_batch[(size_t)(chunk_start + t) * value_dim + h * head_v_dim + r] = co_h[idx];
+    }
+}
+
+/* ---- Host driver ----
+ * Mirrors ssm_chunked_recurrence()'s structure: allocate scratch sized
+ * for the max chunk size once, then loop over chunks sequentially
+ * (state carries forward within a head across chunks -- chunks
+ * themselves cannot be parallelized). Everything (conv_batch, alpha,
+ * beta, state, xb2_batch) is uploaded/downloaded ONCE for the whole
+ * call, not once per chunk: state and xb2_batch stay device-resident
+ * across the entire chunk loop, only leaving the GPU once at the end
+ * on success.
+ *
+ * Safe to fall back to the CPU path on ANY failure, at ANY point in
+ * the chunk loop: state_host and xb2_batch_host are only overwritten
+ * by the final D2H copies after every chunk has succeeded and the
+ * whole thing has been synced -- unlike the decode-path _dev
+ * functions, there's no in-place mutation of the sole copy of truth
+ * here (same reasoning as picolm_gpu_ssm_conv1d_batch above). On
+ * failure, the device-side partial work is simply discarded and
+ * state_host/xb2_batch_host are exactly as they were on entry, so the
+ * caller's ssm_chunked_recurrence() CPU fallback is always correct.
+ *
+ * Returns 0 unconditionally unless PICOLM_SSM_CHUNKED_GPU_VALIDATED is
+ * defined by the build -- see the section-header comment above. */
+extern "C" int
+picolm_gpu_ssm_chunked_recurrence(const float *conv_batch_host,
+                                   const float *alpha_batch_host,
+                                   const float *beta_batch_host,
+                                   float *state_host,
+                                   float *xb2_batch_host,
+                                   int n_tokens, int value_dim,
+                                   int d_state, int n_k_heads, int n_v_heads,
+                                   int head_v_dim, int repeat,
+                                   int conv_dim, int cs, int device) {
+#ifndef PICOLM_SSM_CHUNKED_GPU_VALIDATED
+    (void)conv_batch_host; (void)alpha_batch_host; (void)beta_batch_host;
+    (void)state_host; (void)xb2_batch_host; (void)n_tokens; (void)value_dim;
+    (void)d_state; (void)n_k_heads; (void)n_v_heads; (void)head_v_dim;
+    (void)repeat; (void)conv_dim; (void)cs; (void)device;
+    return 0;
+#else
+    if (d_state != head_v_dim) return 0; /* architectural invariant this whole port relies on */
+    if (cs <= 0) cs = 64;
+    if (cs > n_tokens) cs = n_tokens;
+    int n_chunks = (n_tokens + cs - 1) / cs;
+    if (n_chunks < 1) n_chunks = 1;
+    int qk_dim = d_state * n_k_heads;
+    int d = d_state;
+
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+
+    /* Single pre-allocated scratch buffer, grow-only (no per-call malloc) */
+    size_t conv_bytes = (size_t)n_tokens * conv_dim * sizeof(float);
+    size_t alpha_bytes = (size_t)n_tokens * n_v_heads * sizeof(float);
+    size_t state_bytes = (size_t)n_v_heads * d * d * sizeof(float);
+    size_t xb2_bytes = (size_t)n_tokens * value_dim * sizeof(float);
+    size_t qk_sc_bytes = (size_t)n_k_heads * cs * d * sizeof(float);
+    size_t v_sc_bytes = (size_t)n_v_heads * cs * d * sizeof(float);
+    size_t scalar_sc_bytes = (size_t)n_v_heads * cs * sizeof(float);
+    size_t sq_sc_bytes = (size_t)n_v_heads * cs * cs * sizeof(float);
+
+    size_t total = conv_bytes + alpha_bytes + alpha_bytes + state_bytes + xb2_bytes;
+    total += qk_sc_bytes + qk_sc_bytes + v_sc_bytes + scalar_sc_bytes + scalar_sc_bytes;
+    total += scalar_sc_bytes + scalar_sc_bytes + sq_sc_bytes + sq_sc_bytes + sq_sc_bytes;
+    total += v_sc_bytes + v_sc_bytes + v_sc_bytes + v_sc_bytes + v_sc_bytes;
+
+    if (!reserve(&ctx->ssm_prefill_scratch, &ctx->ssm_prefill_scratch_cap, total)) return 0;
+    float *scratch = ctx->ssm_prefill_scratch;
+    float *d_conv = scratch;
+    float *d_alpha = scratch + n_tokens * conv_dim;
+    float *d_beta = d_alpha + n_tokens * n_v_heads;
+    float *d_state_buf = d_beta + n_tokens * n_v_heads;
+    float *d_xb2 = d_state_buf + n_v_heads * d * d;
+    float *d_chunk_q = d_xb2 + n_tokens * value_dim;
+    float *d_chunk_k = d_chunk_q + n_k_heads * cs * d;
+    float *d_chunk_v = d_chunk_k + n_k_heads * cs * d;
+    float *d_chunk_beta = d_chunk_v + n_v_heads * cs * d;
+    float *d_gate_log = d_chunk_beta + n_v_heads * cs;
+    float *d_cum_g = d_gate_log + n_v_heads * cs;
+    float *d_q_decay = d_cum_g + n_v_heads * cs;
+    float *d_decay_mask = d_q_decay + n_v_heads * cs;
+    float *d_M = d_decay_mask + n_v_heads * cs * cs;
+    float *d_kq = d_M + n_v_heads * cs * cs;
+    float *d_v_eff = d_kq + n_v_heads * cs * cs;
+    float *d_v_hat = d_v_eff + n_v_heads * cs * d;
+    float *d_sk = d_v_hat + n_v_heads * cs * d;
+    float *d_sq = d_sk + n_v_heads * cs * d;
+    float *d_chunk_out = d_sq + n_v_heads * cs * d;
+
+    int ok = 1;
+    ok = ok && gpu_ok(gpuMemcpy(d_conv, conv_batch_host, conv_bytes, gpuMemcpyHostToDevice), "chunk conv h2d");
+    ok = ok && gpu_ok(gpuMemcpy(d_alpha, alpha_batch_host, alpha_bytes, gpuMemcpyHostToDevice), "chunk alpha h2d");
+    ok = ok && gpu_ok(gpuMemcpy(d_beta, beta_batch_host, alpha_bytes, gpuMemcpyHostToDevice), "chunk beta h2d");
+    ok = ok && gpu_ok(gpuMemcpy(d_state_buf, state_host, state_bytes, gpuMemcpyHostToDevice), "chunk state h2d");
+
+    if (ok) {
+        int n_threads = 256;
+        for (int ci = 0; ci < n_chunks && ok; ci++) {
+            int cs_actual = (ci == n_chunks - 1) ? (n_tokens - ci * cs) : cs;
+            if (cs_actual <= 0) break;
+            int chunk_start = ci * cs;
+
+            ssm_chunk_gather_qk_kernel<<<n_k_heads, n_threads, 0, ctx->stream>>>(
+                (float *)d_chunk_q, (float *)d_chunk_k, (const float *)d_conv,
+                chunk_start, cs_actual, conv_dim, qk_dim, d_state, n_k_heads);
+            ssm_chunk_gather_v_kernel<<<n_v_heads, n_threads, 0, ctx->stream>>>(
+                (float *)d_chunk_v, (float *)d_chunk_beta, (float *)d_gate_log,
+                (const float *)d_conv, (const float *)d_alpha, (const float *)d_beta,
+                chunk_start, cs_actual, conv_dim, qk_dim, head_v_dim, n_v_heads);
+
+            ssm_chunk_decay_kernel<<<n_v_heads, n_threads, 0, ctx->stream>>>(
+                (float *)d_cum_g, (float *)d_q_decay, (float *)d_decay_mask,
+                (const float *)d_gate_log, n_v_heads, cs_actual);
+
+            ssm_chunk_masked_gemm_kernel<<<n_v_heads, n_threads, 0, ctx->stream>>>(
+                (float *)d_M, (const float *)d_chunk_k, (const float *)d_chunk_k,
+                (const float *)d_decay_mask, n_v_heads, repeat, cs_actual, d);
+
+            ssm_chunk_matvec_kernel<<<n_v_heads, n_threads, 0, ctx->stream>>>(
+                (float *)d_sk, (const float *)d_state_buf, (const float *)d_chunk_k,
+                n_v_heads, repeat, cs_actual, d);
+
+            ssm_chunk_veff_kernel<<<n_v_heads, n_threads, 0, ctx->stream>>>(
+                (float *)d_v_eff, (const float *)d_chunk_v, (const float *)d_sk,
+                (const float *)d_q_decay, (const float *)d_chunk_beta, n_v_heads, cs_actual, d);
+
+            {
+                int tri_threads = d < 1024 ? d : 1024;
+                ssm_chunk_trisolve_kernel<<<n_v_heads, tri_threads, 0, ctx->stream>>>(
+                    (float *)d_v_hat, (const float *)d_v_eff, (const float *)d_M,
+                    (const float *)d_chunk_beta, n_v_heads, cs_actual, d);
+            }
+
+            ssm_chunk_matvec_kernel<<<n_v_heads, n_threads, 0, ctx->stream>>>(
+                (float *)d_sq, (const float *)d_state_buf, (const float *)d_chunk_q,
+                n_v_heads, repeat, cs_actual, d);
+
+            ssm_chunk_masked_gemm_kernel<<<n_v_heads, n_threads, 0, ctx->stream>>>(
+                (float *)d_kq, (const float *)d_chunk_q, (const float *)d_chunk_k,
+                (const float *)d_decay_mask, n_v_heads, repeat, cs_actual, d);
+
+            ssm_chunk_output_kernel<<<n_v_heads, n_threads, 0, ctx->stream>>>(
+                (float *)d_chunk_out, (const float *)d_sq, (const float *)d_q_decay,
+                (const float *)d_kq, (const float *)d_v_hat, n_v_heads, cs_actual, d);
+
+            ssm_chunk_scatter_kernel<<<n_v_heads, n_threads, 0, ctx->stream>>>(
+                (float *)d_xb2, (const float *)d_chunk_out,
+                chunk_start, cs_actual, value_dim, head_v_dim, n_v_heads);
+
+            /* State update must come after gather/matvec/output above
+             * have all read the PRE-update state for this chunk --
+             * stream ordering guarantees that since everything above
+             * is submitted first on the same stream. */
+            ssm_chunk_state_update_kernel<<<n_v_heads, n_threads, 0, ctx->stream>>>(
+                (float *)d_state_buf, (const float *)d_v_hat, (const float *)d_chunk_k,
+                (const float *)d_cum_g, n_v_heads, repeat, cs_actual, d);
+
+            ok = gpu_ok(gpuGetLastError(), "ssm chunked recurrence chunk");
+        }
+    }
+
+    ok = ok && gpu_ok(gpuDeviceSynchronize(), "ssm chunked recurrence sync");
+    if (ok) {
+        ok = gpu_ok(gpuMemcpy(xb2_batch_host, d_xb2, xb2_bytes, gpuMemcpyDeviceToHost), "chunk xb2 d2h");
+        ok = ok && gpu_ok(gpuMemcpy(state_host, d_state_buf, state_bytes, gpuMemcpyDeviceToHost), "chunk state d2h");
+    }
+
+    return ok;
+#endif
 }
 
 /* ================================================================

@@ -2141,7 +2141,7 @@ static void mm_id_down_expert_task(int idx, void *ctxp) {
 void matmul_batch(float *out, const float *x, int n_batch,
                    const void *W, int n, int d, gguf_type_t qtype) {
 #ifdef PICOLM_GPU
-    if (gpu_tensor && n_batch > 0 && d > 0 && n > 0) {
+        if (gpu_tensor && n_batch > 0 && d > 0 && n > 0) {
         gpu_assert_orchestrator("matmul_batch GPU dispatch");
         /* Try WMMA Tensor Core for aligned Q4_0 batched matmul */
         if (picolm_gpu_w4a16_matmul(gpu_tensor, out, x, n_batch, gpu_device)) {
@@ -2152,12 +2152,10 @@ void matmul_batch(float *out, const float *x, int n_batch,
             return;
         }
         if (picolm_gpu_matmul(gpu_tensor, out, x, n_batch, gpu_device)) {
-            static int gpu_batch_count = 0;
-            if (gpu_batch_count++ == 0) {
-                fprintf(stderr, "INFO: GPU batch matmul active\n");
-            }
             return;
         }
+        if (n == 6144 || d == 6144) fprintf(stderr, "WARN: GPU batch matmul failed (n=%d d=%d batch=%d qtype=%d gpu_tensor=%p) -> CPU\n",
+            n, d, n_batch, qtype, gpu_tensor);
     }
 #endif
     size_t row_bytes = gguf_type_row_size(qtype, n);
@@ -2511,6 +2509,8 @@ static void dual_q8_row_task(int i, void *ctxp) {
 void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                         const void *W1, const void *W2,
                         int n, int d, gguf_type_t qtype1, gguf_type_t qtype2) {
+    fprintf(stderr, "WARN: matmul_dual_batch (CPU only, no GPU path) n=%d d=%d batch=%d qtype=%d/%d\n",
+        n, d, n_batch, qtype1, qtype2);
 #if defined(PICOLM_AVX2)
     /* Same reasoning as matmul_batch's Q4_0_8_8 branch: reuse the
      * validated gemv kernel once per token, parallelized over tokens.

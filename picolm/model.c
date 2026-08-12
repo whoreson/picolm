@@ -7755,6 +7755,27 @@ ssm_forward_gpu(model_t *m, run_state_t *s, float *x, float *residual,
     if (!gw->ssm_dt_dev[il] || !gw->ssm_norm_dev[il]) return 0;
     if (!gw->ssm_conv_state_dev[il] || !gw->ssm_state_dev[il]) return 0;
 
+    /* Bug 3 fix (2026-08-11): this GPU-native path has no MoE FFN
+     * implementation -- step 16 below only wires up dense ffn_gate/up/
+     * down. On a MoE layer gl->ffn_gate would be NULL and that whole
+     * block would silently no-op, dropping the FFN's contribution
+     * entirely (not a numerical difference -- a missing computation).
+     * Bail here, before anything below has mutated persistent state, so
+     * the caller's CPU-hybrid ssm_forward() fallback (which does call
+     * moe_forward()) is always safe to take. */
+    if (c->has_moe) return 0;
+
+    /* Bug 2 fix (2026-08-11): picolm_gpu_ssm_vecdot_kernel only
+     * implements F32/Q4_0/Q8_0 and silently leaves output at 0.0f for
+     * any other type (see steps 9-10 below). Check up front -- like
+     * has_moe above, this must happen before conv1d touches persistent
+     * state, not at the point of use, or a return-0 there would no
+     * longer be safe for the caller to fall back from. */
+    if (lw->type_ssm_alpha != GGUF_TYPE_F32 && lw->type_ssm_alpha != GGUF_TYPE_Q4_0 &&
+        lw->type_ssm_alpha != GGUF_TYPE_Q8_0) return 0;
+    if (lw->type_ssm_beta != GGUF_TYPE_F32 && lw->type_ssm_beta != GGUF_TYPE_Q4_0 &&
+        lw->type_ssm_beta != GGUF_TYPE_Q8_0) return 0;
+
     /* Pipeline buffers */
     float *pipe_x = picolm_gpu_pipe_x(device);
     float *pipe_xb = picolm_gpu_pipe_xb(device);
@@ -8984,6 +9005,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
      * not uploaded for this layer is NULL and matmul_batch falls back to CPU. */
     if (gpu_lw) {
         gpu_layer_weights_t *gl = &((gpu_layer_weights_t *)gpu_lw)[l];
+        if (l == 0) fprintf(stderr, "[GPU SSM] l=0: attn_qkv=%p attn_gate_ssm=%p ssm_out=%p\n", (void*)gl->attn_qkv, (void*)gl->attn_gate_ssm, (void*)gl->ssm_out);
         tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->attn_qkv, m->gpu.device);
     }
 #endif
@@ -9034,21 +9056,31 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
 
     /* 4. Convolution + silu (sequential per token: conv_state is stateful)
      * Each token sees a different conv_state because we shift after each token. */
-    for (bi = 0; bi < n_tokens; bi++) {
-        float *qkv = qkv_batch + bi * conv_dim;
-        float *conv_out = conv_batch + bi * conv_dim;
-        for (int co = 0; co < conv_dim; co++) {
-            float sum = 0.0f;
-            for (int d = 0; d < n_state_rows; d++)
-                sum += conv1d_w[d + co * c->ssm_d_conv] * conv_state[d * state_stride + co];
-            sum += conv1d_w[(c->ssm_d_conv - 1) + co * c->ssm_d_conv] * qkv[co];
-            float v = sum;
-            conv_out[co] = v * (1.0f / (1.0f + expf(-v)));
+    int conv1d_gpu_done = 0;
+#ifdef PICOLM_GPU
+    if (gpu_lw) {
+        conv1d_gpu_done = picolm_gpu_ssm_conv1d_batch(conv_batch, conv_state, qkv_batch,
+                                                        conv1d_w, conv_dim, c->ssm_d_conv,
+                                                        n_tokens, m->gpu.device);
+    }
+#endif
+    if (!conv1d_gpu_done) {
+        for (bi = 0; bi < n_tokens; bi++) {
+            float *qkv = qkv_batch + bi * conv_dim;
+            float *conv_out = conv_batch + bi * conv_dim;
+            for (int co = 0; co < conv_dim; co++) {
+                float sum = 0.0f;
+                for (int d = 0; d < n_state_rows; d++)
+                    sum += conv1d_w[d + co * c->ssm_d_conv] * conv_state[d * state_stride + co];
+                sum += conv1d_w[(c->ssm_d_conv - 1) + co * c->ssm_d_conv] * qkv[co];
+                float v = sum;
+                conv_out[co] = v * (1.0f / (1.0f + expf(-v)));
+            }
+            /* Shift conv_state and append new token */
+            for (int r = 0; r < n_state_rows - 1; r++)
+                memcpy(conv_state + r * state_stride, conv_state + (r + 1) * state_stride, state_stride * sizeof(float));
+            memcpy(conv_state + (n_state_rows - 1) * state_stride, qkv, state_stride * sizeof(float));
         }
-        /* Shift conv_state and append new token */
-        for (int r = 0; r < n_state_rows - 1; r++)
-            memcpy(conv_state + r * state_stride, conv_state + (r + 1) * state_stride, state_stride * sizeof(float));
-        memcpy(conv_state + (n_state_rows - 1) * state_stride, qkv, state_stride * sizeof(float));
     }
 
     /* 5. Split Q/K/V + L2 norm + Q scale (batched across tokens) */
@@ -9067,23 +9099,35 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
         free(vt);
     }
     float q_scale = 1.0f / sqrtf((float)d_state);
-    for (bi = 0; bi < n_tokens; bi++) {
-        float *conv = conv_batch + bi * conv_dim;
-        float *q = conv;
-        float *k = conv + qk_dim;
-        for (int h = 0; h < n_k_heads; h++) {
-            float *qh = q + h * d_state;
-            float nrm = 0.0f;
-            for (int d = 0; d < d_state; d++) nrm += qh[d] * qh[d];
-            nrm = 1.0f / sqrtf(nrm + 1e-12f) * q_scale;
-            for (int d = 0; d < d_state; d++) qh[d] *= nrm;
-        }
-        for (int h = 0; h < n_k_heads; h++) {
-            float *kh = k + h * d_state;
-            float nrm = 0.0f;
-            for (int d = 0; d < d_state; d++) nrm += kh[d] * kh[d];
-            nrm = 1.0f / sqrtf(nrm + 1e-12f);
-            for (int d = 0; d < d_state; d++) kh[d] *= nrm;
+    int l2norm_gpu_done = 0;
+#ifdef PICOLM_GPU
+    if (gpu_lw) {
+        l2norm_gpu_done =
+            picolm_gpu_ssm_l2norm_batch(conv_batch, d_state, n_k_heads, n_tokens,
+                                         conv_dim, 1e-12f, q_scale, m->gpu.device) &&
+            picolm_gpu_ssm_l2norm_batch(conv_batch + qk_dim, d_state, n_k_heads, n_tokens,
+                                         conv_dim, 1e-12f, 1.0f, m->gpu.device);
+    }
+#endif
+    if (!l2norm_gpu_done) {
+        for (bi = 0; bi < n_tokens; bi++) {
+            float *conv = conv_batch + bi * conv_dim;
+            float *q = conv;
+            float *k = conv + qk_dim;
+            for (int h = 0; h < n_k_heads; h++) {
+                float *qh = q + h * d_state;
+                float nrm = 0.0f;
+                for (int d = 0; d < d_state; d++) nrm += qh[d] * qh[d];
+                nrm = 1.0f / sqrtf(nrm + 1e-12f) * q_scale;
+                for (int d = 0; d < d_state; d++) qh[d] *= nrm;
+            }
+            for (int h = 0; h < n_k_heads; h++) {
+                float *kh = k + h * d_state;
+                float nrm = 0.0f;
+                for (int d = 0; d < d_state; d++) nrm += kh[d] * kh[d];
+                nrm = 1.0f / sqrtf(nrm + 1e-12f);
+                for (int d = 0; d < d_state; d++) kh[d] *= nrm;
+            }
         }
     }
 
@@ -9108,6 +9152,36 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
             beta_map[h] = do_remap ? qwen35_vhead_gguf(h, n_vpk, n_k) : h;
         }
 
+        int vecdot_gpu_done = 0;
+#ifdef PICOLM_GPU
+        /* Type-guarded exactly like ssm_forward_gpu's alpha/beta steps --
+         * picolm_gpu_ssm_vecdot_batch only implements F32/Q4_0/Q8_0.
+         * Decided jointly for alpha+beta (rather than independently) to
+         * avoid splitting the shared Q8_0-quantize-once-per-token setup
+         * the CPU fallback below uses for both. */
+        if (gpu_lw &&
+            (alpha_type == GGUF_TYPE_F32 || alpha_type == GGUF_TYPE_Q4_0 || alpha_type == GGUF_TYPE_Q8_0) &&
+            (beta_type == GGUF_TYPE_F32 || beta_type == GGUF_TYPE_Q4_0 || beta_type == GGUF_TYPE_Q8_0)) {
+            vecdot_gpu_done =
+                picolm_gpu_ssm_vecdot_batch(alpha_batch, ssm_xb, lw->ssm_alpha, alpha_type,
+                                             dim, n_v_heads, n_tokens, (int)row_bytes_alpha,
+                                             do_remap ? alpha_map : NULL, m->gpu.device) &&
+                picolm_gpu_ssm_vecdot_batch(beta_batch, ssm_xb, lw->ssm_beta, beta_type,
+                                             dim, n_v_heads, n_tokens, (int)row_bytes_beta,
+                                             do_remap ? beta_map : NULL, m->gpu.device);
+            if (vecdot_gpu_done) {
+                /* GPU vecdot doesn't fuse the dt_w bias (matches the
+                 * un-fused contract of every other GPU vecdot call in
+                 * this file) -- add it here, same as the CPU path's
+                 * `al[h] = sum + s->ssm_dt_w[l][h]` below. */
+                for (bi = 0; bi < n_tokens; bi++) {
+                    float *al = alpha_batch + bi * n_v_heads;
+                    for (int h = 0; h < n_v_heads; h++) al[h] += s->ssm_dt_w[l][h];
+                }
+            }
+        }
+#endif
+        if (!vecdot_gpu_done) {
         /* Quantize all xb tokens to Q8_0 once for fast vec_dot */
         int nb_xb = dim / 32;
         uint8_t *xb_q8_batch = (uint8_t *)malloc((size_t)n_tokens * nb_xb * 34);
@@ -9151,6 +9225,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
         free(xb_q8_batch);
         free(xb_q8_d_batch);
         /* alpha_map and beta_map are stack-allocated */
+        }
 
         /* Post-process: alpha -> softplus -> gate -> exp; beta -> sigmoid */
         for (bi = 0; bi < n_tokens; bi++) {
@@ -9174,12 +9249,26 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
     * For single-token inputs, falls back to the standard per-token path. */
     {
         if (n_tokens > 1) {
-            ssm_chunked_recurrence(
-                conv_batch, alpha_batch, beta_batch,
-                state, xb2_batch,
-                n_tokens, value_dim,
-                d_state, n_k_heads, n_v_heads, head_v_dim, repeat,
-                conv_dim, m->ssm_chunk_size);
+            int chunked_gpu_done = 0;
+#ifdef PICOLM_GPU
+            if (gpu_lw) {
+                chunked_gpu_done = picolm_gpu_ssm_chunked_recurrence(
+                    conv_batch, alpha_batch, beta_batch,
+                    state, xb2_batch,
+                    n_tokens, value_dim,
+                    d_state, n_k_heads, n_v_heads, head_v_dim, repeat,
+                    conv_dim, m->ssm_chunk_size, m->gpu.device);
+                if (l == 0) fprintf(stderr, "[GPU SSM] chunked_recurrence l=%d result=%d\n", l, chunked_gpu_done);
+            }
+#endif
+            if (!chunked_gpu_done) {
+                ssm_chunked_recurrence(
+                    conv_batch, alpha_batch, beta_batch,
+                    state, xb2_batch,
+                    n_tokens, value_dim,
+                    d_state, n_k_heads, n_v_heads, head_v_dim, repeat,
+                    conv_dim, m->ssm_chunk_size);
+            }
         } else {
             /* Single token: use the standard per-token path */
             float *ssm_output = (float *)malloc((size_t)d_state * n_v_heads * sizeof(float));
@@ -9207,30 +9296,43 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
     free(beta_batch);
 
     /* 8. Gated normalization (batched across tokens) */
-    for (bi = 0; bi < n_tokens; bi++) {
-        float *ssm_out = xb2_batch + bi * value_dim;
-        float *z = z_batch + bi * value_dim;
-        float *norm_w = s->ssm_norm_w[l];
-        for (int h = 0; h < n_v_heads; h++) {
-            float nrm = 0.0f;
-            for (int d = 0; d < head_v_dim; d++) {
-                float v = ssm_out[h * head_v_dim + d];
-                nrm += v * v;
-            }
-            nrm = 1.0f / sqrtf(nrm / (float)head_v_dim + eps);
-            for (int d = 0; d < head_v_dim; d++) {
-                float v = ssm_out[h * head_v_dim + d];
-                float zv = z[h * head_v_dim + d];
-                ssm_out[h * head_v_dim + d] = v * nrm * norm_w[d] *
-                    zv * (1.0f / (1.0f + expf(-zv)));
+    int gated_norm_gpu_done = 0;
+#ifdef PICOLM_GPU
+    if (gpu_lw) {
+        gated_norm_gpu_done = picolm_gpu_ssm_prefill_gated_norm(
+            xb2_batch, z_batch, s->ssm_norm_w[l], head_v_dim, n_v_heads, n_tokens, eps, m->gpu.device);
+    }
+#endif
+    if (!gated_norm_gpu_done) {
+        for (bi = 0; bi < n_tokens; bi++) {
+            float *ssm_out = xb2_batch + bi * value_dim;
+            float *z = z_batch + bi * value_dim;
+            float *norm_w = s->ssm_norm_w[l];
+            for (int h = 0; h < n_v_heads; h++) {
+                float nrm = 0.0f;
+                for (int d = 0; d < head_v_dim; d++) {
+                    float v = ssm_out[h * head_v_dim + d];
+                    nrm += v * v;
+                }
+                nrm = 1.0f / sqrtf(nrm / (float)head_v_dim + eps);
+                for (int d = 0; d < head_v_dim; d++) {
+                    float v = ssm_out[h * head_v_dim + d];
+                    float zv = z[h * head_v_dim + d];
+                    ssm_out[h * head_v_dim + d] = v * nrm * norm_w[d] *
+                        zv * (1.0f / (1.0f + expf(-zv)));
+                }
             }
         }
     }
 
     /* 9. Output projection (batched) */
+#ifdef PICOLM_GPU
+    if (gpu_lw) {
+        gpu_layer_weights_t *gl = &((gpu_layer_weights_t *)gpu_lw)[l];
+        tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->ssm_out, m->gpu.device);
+    }
+#endif
     if (do_remap) {
-        /* Reorder to GGUF column order, then matmul per token.
-         * Allocate temp buffer once outside the loop. */
         float *fo_gguf = (float *)malloc(value_dim * sizeof(float));
         for (bi = 0; bi < n_tokens; bi++) {
             float *fo = xb2_batch + bi * value_dim;
@@ -9246,10 +9348,10 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
 #ifdef PICOLM_GPU
         if (gpu_lw) {
             gpu_layer_weights_t *gl = &((gpu_layer_weights_t *)gpu_lw)[l];
+            if (l == 0) fprintf(stderr, "[GPU SSM] l=0 ssm_out gl->ssm_out=%p\n", (void*)gl->ssm_out);
             tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->ssm_out, m->gpu.device);
         }
 #endif
-        /* Cannot alias in/out when value_dim != dim (strides differ, cross-token corruption) */
         float *ssm_out_buf = (float *)malloc((size_t)n_tokens * dim * sizeof(float));
         matmul_batch(ssm_out_buf, xb2_batch, n_tokens, lw->ssm_out, value_dim, dim, lw->type_ssm_out);
         for (bi = 0; bi < n_tokens; bi++)
@@ -9281,21 +9383,42 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
         for (bi = 0; bi < n_tokens; bi++)
             rmsnorm(ssm_xb + bi * dim, x_batch + bi * dim, s->post_attn_norm_w[l], dim, eps);
 
-        tensor_set_repacked(m->repack_used[ri+7] ? m->repack_buffers[ri+7] : NULL);
-        matmul_dual_batch(hb_batch, hb2_batch, ssm_xb, n_tokens,
-                          lw->ffn_gate, lw->ffn_up, dim, c->n_ffn,
-                          lw->type_ffn_gate, lw->type_ffn_up);
-        tensor_set_repacked(NULL);
-
-        for (bi = 0; bi < n_tokens; bi++) {
-            silu(hb_batch + bi * c->n_ffn, c->n_ffn);
-            elemwise_mul(hb_batch + bi * c->n_ffn, hb_batch + bi * c->n_ffn,
-                         hb2_batch + bi * c->n_ffn, c->n_ffn);
+        /* Fused batched FFN on GPU: y = down(silu(gate(x)) * up(x)) for all
+         * n_tokens in one call (one H2D, one D2H total). Previously this
+         * branch always used matmul_dual_batch for gate+up, which has NO
+         * GPU dispatch implemented at all (unlike matmul_batch, it never
+         * checks the gpu_tensor global) -- so SSM-layer FFN during prefill
+         * was 100% CPU no matter what. */
+        int ffn_gpu_done = 0;
+#ifdef PICOLM_GPU
+        if (gpu_lw) {
+            gpu_layer_weights_t *gl = &((gpu_layer_weights_t *)gpu_lw)[l];
+            if (gl->ffn_gate && gl->ffn_up && gl->ffn_down) {
+                ffn_gpu_done = picolm_gpu_expert_mlp(
+                    (picolm_gpu_tensor_t *)gl->ffn_gate,
+                    (picolm_gpu_tensor_t *)gl->ffn_up,
+                    (picolm_gpu_tensor_t *)gl->ffn_down,
+                    xb2_batch, ssm_xb, n_tokens);
+            }
         }
+#endif
+        if (!ffn_gpu_done) {
+            tensor_set_repacked(m->repack_used[ri+7] ? m->repack_buffers[ri+7] : NULL);
+            matmul_dual_batch(hb_batch, hb2_batch, ssm_xb, n_tokens,
+                              lw->ffn_gate, lw->ffn_up, dim, c->n_ffn,
+                              lw->type_ffn_gate, lw->type_ffn_up);
+            tensor_set_repacked(NULL);
 
-        tensor_set_repacked(m->repack_used[ri+8] ? m->repack_buffers[ri+8] : NULL);
-        matmul_batch(xb2_batch, hb_batch, n_tokens, lw->ffn_down, c->n_ffn, dim, lw->type_ffn_down);
-        tensor_set_repacked(NULL);
+            for (bi = 0; bi < n_tokens; bi++) {
+                silu(hb_batch + bi * c->n_ffn, c->n_ffn);
+                elemwise_mul(hb_batch + bi * c->n_ffn, hb_batch + bi * c->n_ffn,
+                             hb2_batch + bi * c->n_ffn, c->n_ffn);
+            }
+
+            tensor_set_repacked(m->repack_used[ri+8] ? m->repack_buffers[ri+8] : NULL);
+            matmul_batch(xb2_batch, hb_batch, n_tokens, lw->ffn_down, c->n_ffn, dim, lw->type_ffn_down);
+            tensor_set_repacked(NULL);
+        }
 
         for (bi = 0; bi < n_tokens; bi++) {
             float *a = x_batch + bi * dim, *b = xb2_batch + bi * dim;
@@ -10682,7 +10805,54 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
         gl = &gw->layers[l];
 
         if (c->has_ssm && !lw->is_attn_layer) {
-            return model_forward_prefill(m, tokens, n_tokens, start_pos, interrupt);
+            static int ssm_hybrid_prefill_warn = 0;
+            if (!ssm_hybrid_prefill_warn) {
+                fprintf(stderr, "WARN: SSM layer %d in prefill: using hybrid GPU-CPU path (GPU kernels for conv/l2norm/vecdot/gnorm/ffn, CPU or GPU chunked recurrence)\n", l);
+                ssm_hybrid_prefill_warn = 1;
+            }
+            /* D2H: bx (device batch) -> s->x (host buffer) */
+            size_t batch_bytes = (size_t)n_tokens * dim * sizeof(float);
+            picolm_gpu_sync(gpu_dev);
+            picolm_gpu_memcpy(s->x, bx, batch_bytes, 0, gpu_dev);
+            /* Run batched SSM layer on host (uses GPU kernels for conv/vecdot/l2norm/gnorm/ffn) */
+            {
+                int xb2_stride = dim;
+                if (c->ssm_d_inner > dim) xb2_stride = c->ssm_d_inner;
+                int ffn_buf_size = n_ffn;
+                int q_dim2 = c->n_heads * c->head_dim;
+                if (q_dim2 > ffn_buf_size) ffn_buf_size = q_dim2;
+                int max_dim = c->n_heads * 2 * c->head_dim;
+                if (dim > max_dim) max_dim = dim;
+                int kv_dim = c->n_kv_heads * c->head_dim;
+                int q_full_dim = (c->has_ssm && lw->is_attn_layer) ? (q_dim2 * 2) : q_dim2;
+                size_t sz = (size_t)n_tokens * (dim + max_dim + xb2_stride + q_full_dim + 2 * kv_dim + 2 * ffn_buf_size);
+                float *buf = (float *)malloc(sz * sizeof(float));
+                if (!buf) {
+                    return model_forward_prefill(m, tokens, n_tokens, start_pos, interrupt);
+                }
+                float *p2 = buf;
+                float *x_batch = p2; p2 += n_tokens * dim;
+                float *xb_batch = p2; p2 += n_tokens * max_dim;
+                float *xb2_batch = p2; p2 += n_tokens * xb2_stride;
+                float *q_batch = p2; p2 += n_tokens * q_full_dim;
+                (void)q_batch;
+                float *k_batch = p2; p2 += n_tokens * kv_dim;
+                (void)k_batch;
+                float *v_batch = p2; p2 += n_tokens * kv_dim;
+                (void)v_batch;
+                float *hb_batch = p2; p2 += n_tokens * ffn_buf_size;
+                float *hb2_batch = p2; p2 += n_tokens * ffn_buf_size;
+                memcpy(x_batch, s->x, batch_bytes);
+                ssm_prefill_layer(m, s, x_batch, xb_batch, xb2_batch,
+                    hb_batch, hb2_batch, lw, l,
+                    n_tokens, start_pos, xb2_stride,
+                    (void **)m->gpu.layers);
+                /* H2D: result back to bx (device batch) */
+                memcpy(s->x, x_batch, batch_bytes);
+                picolm_gpu_memcpy(bx, s->x, batch_bytes, 1, gpu_dev);
+                free(buf);
+            }
+            continue;
         }
 
         /* A. RMSNorm batched: one launch for all n_tokens */
