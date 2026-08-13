@@ -312,6 +312,7 @@ typedef struct {
     float *gemma3n_altup_state;        /* [n_altup * n_embd] for gen */
     float *gemma3n_per_layer_inp;      /* [n_embd_altup * n_layer] projected per-layer input */
     float *gemma3n_inp_gate_out;       /* [n_embd_altup] gated per-layer output */
+    float *gemma3n_first_pred;         /* [n_embd] first prediction (corrected_active * altup_correct_scale) */
     float *gemma3n_laurel_out;         /* [n_embd] laurel output */
     float *gemma3n_predictions;        /* [n_altup * n_embd] saved predictions for correct step */
     float *gemma3n_router_out;         /* [n_altup] router output */

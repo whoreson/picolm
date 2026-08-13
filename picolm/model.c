@@ -19,6 +19,10 @@
 
 #ifdef PICOLM_GPU
 #include "backend_gpu.h"
+#ifdef PICOLM_GPU
+extern int cudaProfilerStart(void);
+extern int cudaProfilerStop(void);
+#endif
 #endif
 #ifdef PICOLM_VIZ
 #include "viz.h"
@@ -1542,6 +1546,7 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                     lw->altup_router_norm = ptr;
                 } else if (strcmp(suffix, "laurel_l.weight") == 0) {
                     lw->laurel_l = ptr; lw->type_laurel_l = qtype;
+                    fprintf(stderr, "DBG laurel_l type=%d\n", qtype);
                     /* Derive laurel_rank from tensor shape [n_embd, laurel_rank] */
                     for (uint64_t ti = 0; ti < total_tensor_count; ti++) {
                         if (tinfos[ti].name.len > 4 && memcmp(tinfos[ti].name.str, "blk.", 4) == 0) {
@@ -1558,6 +1563,7 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                     }
                 } else if (strcmp(suffix, "laurel_r.weight") == 0) {
                     lw->laurel_r = ptr; lw->type_laurel_r = qtype;
+                    fprintf(stderr, "DBG laurel_r type=%d\n", qtype);
                 } else if (strcmp(suffix, "laurel_post_norm.weight") == 0) {
                     lw->laurel_post_norm = ptr;
                 }
@@ -1844,6 +1850,7 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         sz_gemma3n += (size_t)n_altup * n_embd * sizeof(float);         /* predictions buffer */
         sz_gemma3n += (size_t)n_embd_altup * c->n_layers * sizeof(float); /* per_layer_inp */
         sz_gemma3n += (size_t)n_embd_altup * sizeof(float);              /* inp_gate_out */
+        sz_gemma3n += (size_t)n_embd * sizeof(float);                    /* first_pred */
         sz_gemma3n += (size_t)n_embd * sizeof(float);                    /* laurel_out */
         sz_gemma3n += (size_t)n_altup * sizeof(float);                  /* router_out */
         /* Extra norm weights per layer */
@@ -2210,6 +2217,7 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         s->gemma3n_predictions = gp; gp += (size_t)n_altup * n_embd;
         s->gemma3n_per_layer_inp = gp; gp += (size_t)n_embd_altup * c->n_layers;
         s->gemma3n_inp_gate_out = gp; gp += (size_t)n_embd_altup;
+        s->gemma3n_first_pred = gp; gp += (size_t)n_embd;
         s->gemma3n_laurel_out = gp; gp += (size_t)n_embd;
         s->gemma3n_router_out = gp; gp += (size_t)n_altup;
 
@@ -4835,7 +4843,7 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
             /* altup_proj: [n_embd, n_embd, n_altup-1], take slice a -> [n_embd, n_embd] */
             float *dst = s->gemma3n_altup_state + a_dst * dim;
             matmul(dst, s->x, (const float *)w->altup_proj + a * dim * dim,
-                   dim, dim, GGUF_TYPE_F16);
+                   dim, dim, w->type_altup_proj);
             /* Normalize to target magnitude */
             float new_mag = gemma3n_calc_magnitude(dst, dim);
             gemma3n_normalize(dst, dim, new_mag);
@@ -5252,7 +5260,7 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
          * corrected[1:] += first_prediction
          */
         {
-            float *first_pred = s->gemma3n_inp_gate_out;
+            float *first_pred = s->gemma3n_first_pred;
             /* Take active corrected altup */
             float *corrected_active = s->gemma3n_altup_state + i_altup_act * dim;
             /* Scale by altup_correct_scale */
@@ -5348,7 +5356,7 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
             float *src = s->gemma3n_altup_state + a_src * dim;
             /* unembed: altup_unembd_proj * src */
             matmul(s->xb, src, (const float *)w->altup_unembd_proj + a * dim * dim,
-                   dim, dim, GGUF_TYPE_F16);
+                   dim, dim, w->type_altup_unembd_proj);
             /* Normalize to target magnitude */
             float new_mag = gemma3n_calc_magnitude(s->xb, dim);
             gemma3n_normalize(s->xb, dim, new_mag);
@@ -9002,6 +9010,7 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
 
 /* ================================================================
  * Batched SSM prefill layer.
+
  *
  * All projection matmuls batched across tokens (weights read once).
  * Convolution, alpha/beta projections also batched.
@@ -9065,7 +9074,6 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
      * not uploaded for this layer is NULL and matmul_batch falls back to CPU. */
     if (gpu_lw) {
         gpu_layer_weights_t *gl = &((gpu_layer_weights_t *)gpu_lw)[l];
-        if (l == 0) fprintf(stderr, "[GPU SSM] l=0: attn_qkv=%p attn_gate_ssm=%p ssm_out=%p\n", (void*)gl->attn_qkv, (void*)gl->attn_gate_ssm, (void*)gl->ssm_out);
         tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->attn_qkv, m->gpu.device);
     }
 #endif
@@ -9318,7 +9326,6 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
                     n_tokens, value_dim,
                     d_state, n_k_heads, n_v_heads, head_v_dim, repeat,
                     conv_dim, m->ssm_chunk_size, m->gpu.device);
-                if (l == 0) fprintf(stderr, "[GPU SSM] chunked_recurrence l=%d result=%d\n", l, chunked_gpu_done);
             }
 #endif
             if (!chunked_gpu_done) {
@@ -9386,32 +9393,50 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
     }
 
     /* 9. Output projection (batched) */
-#ifdef PICOLM_GPU
-    if (gpu_lw) {
-        gpu_layer_weights_t *gl = &((gpu_layer_weights_t *)gpu_lw)[l];
-        tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->ssm_out, m->gpu.device);
-    }
-#endif
     if (do_remap) {
-        float *fo_gguf = (float *)malloc(value_dim * sizeof(float));
+        /* Reorder ALL tokens to GGUF column order first (cheap CPU
+         * pass), then ONE batched GPU matmul across all n_tokens --
+         * NOT n_tokens separate single-token matmul() calls. The old
+         * per-token loop here was, per profiling, the single largest
+         * cost in prefill: each single-token GPU matmul call pays its
+         * own full H2D+kernel+D2H (and, via matmul()'s own scratch
+         * management, malloc) overhead, so a 36-token prompt paid that
+         * fixed per-call overhead 36 times per layer instead of once. */
+        float *fo_gguf_batch = (float *)malloc((size_t)n_tokens * value_dim * sizeof(float));
         for (bi = 0; bi < n_tokens; bi++) {
             float *fo = xb2_batch + bi * value_dim;
+            float *dst = fo_gguf_batch + bi * value_dim;
             for (int h = 0; h < n_v_heads; h++) {
                 int gh = qwen35_vhead_gguf(h, n_vpk, n_k);
-                memcpy(fo_gguf + gh * head_v_dim, fo + h * head_v_dim, head_v_dim * sizeof(float));
+                memcpy(dst + gh * head_v_dim, fo + h * head_v_dim, head_v_dim * sizeof(float));
             }
-            matmul(xb2_batch + bi * xb2_stride, fo_gguf, lw->ssm_out, value_dim, dim, lw->type_ssm_out);
         }
-        free(fo_gguf);
+        tensor_set_repacked(m->repack_used[ri+5] ? m->repack_buffers[ri+5] : NULL);
+#ifdef PICOLM_GPU
+        if (gpu_lw) {
+            gpu_layer_weights_t *gl = &((gpu_layer_weights_t *)gpu_lw)[l];
+            tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->ssm_out, m->gpu.device);
+        }
+#endif
+        float *ssm_out_buf = (float *)malloc((size_t)n_tokens * dim * sizeof(float));
+        matmul_batch(ssm_out_buf, fo_gguf_batch, n_tokens, lw->ssm_out, value_dim, dim, lw->type_ssm_out);
+        for (bi = 0; bi < n_tokens; bi++)
+            memcpy(xb2_batch + bi * xb2_stride, ssm_out_buf + bi * dim, dim * sizeof(float));
+        free(ssm_out_buf);
+        free(fo_gguf_batch);
+        tensor_set_repacked(NULL);
+#ifdef PICOLM_GPU
+        if (gpu_lw) tensor_set_gpu_tensor(NULL, 0);
+#endif
     } else {
         tensor_set_repacked(m->repack_used[ri+5] ? m->repack_buffers[ri+5] : NULL);
 #ifdef PICOLM_GPU
         if (gpu_lw) {
             gpu_layer_weights_t *gl = &((gpu_layer_weights_t *)gpu_lw)[l];
-            if (l == 0) fprintf(stderr, "[GPU SSM] l=0 ssm_out gl->ssm_out=%p\n", (void*)gl->ssm_out);
             tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->ssm_out, m->gpu.device);
         }
 #endif
+        /* Cannot alias in/out when value_dim != dim (strides differ, cross-token corruption) */
         float *ssm_out_buf = (float *)malloc((size_t)n_tokens * dim * sizeof(float));
         matmul_batch(ssm_out_buf, xb2_batch, n_tokens, lw->ssm_out, value_dim, dim, lw->type_ssm_out);
         for (bi = 0; bi < n_tokens; bi++)
@@ -10801,6 +10826,10 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
  * Keeps activations on-device across all layers with S=n_tokens batching.
  * Falls back to model_forward_prefill() if pipeline not ready. */
 float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt) {
+#ifdef PICOLM_GPU
+    /* Allow nsys to skip model upload: profile only this function */
+    cudaProfilerStart();
+#endif
     model_config_t *c = &m->config;
     model_weights_t *w = &m->weights;
     gpu_weights_t *gw = &m->gpu;
@@ -10865,6 +10894,7 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
         gl = &gw->layers[l];
 
         if (c->has_ssm && !lw->is_attn_layer) {
+            /* SSM/hybrid layer: try GPU-native path first, fallback to CPU hybrid */
             if (ssm_prefill_layer_gpu(m, s, bx, bxb, bq, battn_out, bffn_norm, bgate, bup, lw, l, n_tokens, start_pos, gpu_dev)) {
                 static int w1 = 0;
                 if (!w1) { fprintf(stderr, "INFO: SSM prefill device-native GPU active\n"); w1 = 1; }
@@ -10893,6 +10923,7 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
         }
 
         /* A. RMSNorm batched: one launch for all n_tokens */
+
         picolm_gpu_rmsnorm_batched_dev(bxb, bx,
                                         (float *)gw->attn_norm_dev[l],
                                         dim, c->rms_norm_eps, n_tokens, gpu_dev);
@@ -11033,6 +11064,9 @@ void picolm_ssm_state_sync_to_device(model_t *m, int device) {
             picolm_gpu_memcpy(m->gpu.ssm_conv_state_dev[l], m->state.ssm_conv_state[l], sz, 1, device);
         }
     }
+#ifdef PICOLM_GPU
+    cudaProfilerStop();
+#endif
 }
 
 #endif /* PICOLM_GPU */

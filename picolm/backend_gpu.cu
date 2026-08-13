@@ -2153,14 +2153,10 @@ typedef struct {
     float *ssm_output;       /* [ssm_d_inner] recurrence output */
     float *ssm_final_output; /* [ssm_d_inner] gated_norm output */
     int ssm_ready;           /* 1 once SSM buffers are allocated */
-    /* Prefill SSM scratch buffer: grow-only, reused across all batched
-     * kernel calls (conv1d_batch, l2norm_batch, vecdot_batch, gated_norm_batch,
-     * chunked_recurrence). Eliminates per-call cudaMalloc/cudaFree. */
+    /* Prefill SSM scratch buffer: grow-only, used by ssm_chunked_recurrence_dev */
     float *ssm_prefill_scratch;
     size_t ssm_prefill_scratch_cap;
-    int8_t *ssm_prefill_scratch_i8;
-    size_t ssm_prefill_scratch_i8_cap;
-} gpu_device_ctx_t;
+    } gpu_device_ctx_t;
 
 static gpu_device_ctx_t g_gpu_ctx[PICOLM_GPU_MAX_DEVICES];
 static int g_nctx;
@@ -2213,6 +2209,30 @@ static __host__ void gpu_mutex_unlock(void) {
 #else
     pthread_mutex_unlock(&g_resize_mutex);
 #endif
+}
+
+/* Grow-only device buffer helper, mirroring model.c's ssm_mm_alloc /
+ * the existing g_ssm_mm_*_dev pattern used for the decode-path GPU
+ * matmul scratch buffers. The batched SSM prefill wrappers below
+ * (conv1d_batch, l2norm_batch, vecdot_batch, prefill_gated_norm,
+ * chunked_recurrence) originally did a fresh gpuMalloc/gpuFree on
+ * EVERY call -- since ssm_prefill_layer runs once per layer, that's
+ * 30-40 cudaMalloc/cudaFree pairs per layer, ~1500-2000 per prompt for
+ * a typical model. Profiling showed cudaMalloc alone costing multiple
+ * seconds (individual calls up to several hundred ms, consistent with
+ * allocator fragmentation from repeated alloc/free of varying sizes)
+ * and cudaMemcpy costing tens of seconds (individual calls blocking
+ * for seconds, consistent with waiting behind queued work rather than
+ * pure PCIe transfer time) -- exactly what shows up in `perf` as
+ * unresolved 0x... addresses inside the driver. Buffers allocated via
+ * this helper are grown as needed and never freed until the device
+ * changes, eliminating that overhead from the hot path entirely. */
+static int ssm_batch_scratch_ensure(void **buf, size_t *cap, size_t need) {
+    if (*buf && *cap >= need) return 1;
+    if (*buf) { gpuFree(*buf); *buf = NULL; *cap = 0; }
+    if (!gpu_ok(gpuMalloc(buf, need), "ssm batch scratch grow")) { *cap = 0; return 0; }
+    *cap = need;
+    return 1;
 }
 
 static int reserve(float **ptr, size_t *cap, size_t bytes) {
@@ -2629,26 +2649,17 @@ void *picolm_gpu_upload_int(const int *host, size_t n, int device) {
 
 int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, int device) {
     if (!t || !y || !x || S < 1) return 0;
-    if (t->I < 512 || t->O < 256) {
-        static int small_cnt = 0;
-        if (small_cnt++ < 3) fprintf(stderr, "WARN: GPU matmul bail: I=%d O=%d (need I>=512 O>=256)\n", t->I, t->O);
-        return 0;
-    }
+    /* Minimum I for GPU to be worthwhile vs CPU kernel launch overhead.
+     * Smaller tensors: kernel launch (~200us) dominates compute. */
+    if (t->I < 512 || t->O < 256) return 0;
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!select_ctx(ctx)) return 0;
-
-    static int gpm_cnt = 0;
-    if (++gpm_cnt <= 10) fprintf(stderr, "[GPU matmul] #=%d I=%d O=%d S=%d qtype=%d\n", gpm_cnt, t->I, t->O, S, t->qtype);
 
     int I = t->I, O = t->O;
     size_t xb = (size_t)S * I * sizeof(float);
     size_t yb = (size_t)S * O * sizeof(float);
     if (!reserve(&ctx->x, &ctx->x_cap, xb) ||
-        !reserve(&ctx->y, &ctx->y_cap, yb)) {
-        static int res_fail = 0;
-        if (res_fail++ < 3) fprintf(stderr, "WARN: GPU matmul reserve fail xb=%zu yb=%zu\n", xb, yb);
-        return 0;
-    }
+        !reserve(&ctx->y, &ctx->y_cap, yb)) return 0;
 
     /* ---- Q8_0 special path: quantize x to Q8_0 on GPU, then int8 MAC ----
      * This matches the CPU path in tensor.c exactly:
@@ -2662,19 +2673,13 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
         if (n_blocks < 1 || I % 32 != 0) return 0; /* must be aligned */
 
         /* Upload fp32 input */
-        if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) {
-            static int h2d_fail = 0; if (h2d_fail++ < 3) fprintf(stderr, "WARN: GPU Q8 H2D fail xb=%zu\n", xb);
-            return 0;
-        }
+        if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
 
         /* Allocate quantized input buffers: qs (int8_t[S*I]) + d (float[S*n_blocks]) */
         size_t xq_bytes = (size_t)S * I;
         size_t xd_bytes = (size_t)S * n_blocks * sizeof(float);
         if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, xq_bytes) ||
-            !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) {
-            static int q8_res_fail = 0; if (q8_res_fail++ < 3) fprintf(stderr, "WARN: GPU Q8 reserve fail xq=%zu xd=%zu\n", xq_bytes, xd_bytes);
-            return 0;
-        }
+            !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
 
         /* Step 1: Quantize x to Q8_0 on GPU */
         dim3 q_grid((unsigned)n_blocks, (unsigned)S);
@@ -2693,11 +2698,7 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
                 ctx->y, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes);
         }
         if (!gpu_ok(gpuGetLastError(), "q8 matmul") ||
-            !gpu_ok(gpuDeviceSynchronize(), "q8 matmul sync")) {
-            static int q8_fail = 0;
-            if (q8_fail++ < 3) fprintf(stderr, "WARN: GPU Q8 matmul kernel fail O=%d S=%d\n", O, S);
-            return 0;
-        }
+            !gpu_ok(gpuDeviceSynchronize(), "q8 matmul sync")) return 0;
 
         if (!gpu_ok(gpuMemcpy(y, ctx->y, yb, gpuMemcpyDeviceToHost), "output download")) return 0;
         return 1;
@@ -3392,14 +3393,14 @@ picolm_gpu_ssm_l2norm_batch(float *x_host, int head_dim, int n_heads,
      * n_tokens of them, and avoids needing a strided-memcpy helper. */
     size_t span = (size_t)(n_tokens - 1) * token_stride + (size_t)n_heads * head_dim;
     size_t bytes = span * sizeof(float);
-    if (!reserve(&ctx->ssm_prefill_scratch, &ctx->ssm_prefill_scratch_cap, bytes)) return 0;
-    float *d_x = ctx->ssm_prefill_scratch;
+    static void *d_x = NULL; static size_t d_x_cap = 0;
+    if (!ssm_batch_scratch_ensure(&d_x, &d_x_cap, bytes)) return 0;
     if (!gpu_ok(gpuMemcpy(d_x, x_host, bytes, gpuMemcpyHostToDevice), "l2norm batch h2d")) return 0;
 
     int n_threads = min(head_dim, 256);
     dim3 grid((unsigned)n_heads, (unsigned)n_tokens, 1);
     picolm_gpu_ssm_l2norm_batch_kernel<<<grid, n_threads, 0, ctx->stream>>>(
-        d_x, head_dim, n_heads, n_tokens, token_stride, eps, extra_scale);
+        (float *)d_x, head_dim, n_heads, n_tokens, token_stride, eps, extra_scale);
 
     if (!gpu_ok(gpuGetLastError(), "ssm l2norm batch") ||
         !gpu_ok(gpuDeviceSynchronize(), "ssm l2norm batch sync")) return 0;
@@ -3601,13 +3602,16 @@ picolm_gpu_ssm_conv1d_batch(float *conv_output_host,      /* out [n_tokens][conv
     size_t input_bytes = (size_t)n_tokens * conv_dim * sizeof(float);
     size_t w_bytes = (size_t)conv_dim * d_conv * sizeof(float);
     size_t out_bytes = input_bytes;
-    size_t total = out_bytes + state_bytes + input_bytes + w_bytes;
-    if (!reserve(&ctx->ssm_prefill_scratch, &ctx->ssm_prefill_scratch_cap, total)) return 0;
 
-    float *d_out = ctx->ssm_prefill_scratch;
-    float *d_state = d_out + n_tokens * conv_dim;
-    float *d_in = d_state + (d_conv - 1) * conv_dim;
-    float *d_w = d_in + n_tokens * conv_dim;
+    static void *d_out = NULL; static size_t d_out_cap = 0;
+    static void *d_state = NULL; static size_t d_state_cap = 0;
+    static void *d_in = NULL; static size_t d_in_cap = 0;
+    static void *d_w = NULL; static size_t d_w_cap = 0;
+
+    if (!ssm_batch_scratch_ensure(&d_out, &d_out_cap, out_bytes) ||
+        !ssm_batch_scratch_ensure(&d_state, &d_state_cap, state_bytes > 0 ? state_bytes : 1) ||
+        !ssm_batch_scratch_ensure(&d_in, &d_in_cap, input_bytes) ||
+        !ssm_batch_scratch_ensure(&d_w, &d_w_cap, w_bytes)) return 0;
 
     int ok = 1;
     if (state_bytes > 0)
@@ -3619,7 +3623,7 @@ picolm_gpu_ssm_conv1d_batch(float *conv_output_host,      /* out [n_tokens][conv
     int n_threads = 256;
     int n_blocks = (conv_dim + n_threads - 1) / n_threads;
     picolm_gpu_ssm_conv1d_batch_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
-        d_out, d_state, d_in, d_w,
+        (float *)d_out, (float *)d_state, (const float *)d_in, (const float *)d_w,
         conv_dim, d_conv, n_tokens);
 
     if (!gpu_ok(gpuGetLastError(), "ssm conv1d batch") ||
@@ -3805,12 +3809,14 @@ picolm_gpu_ssm_prefill_gated_norm(float *ssm_out_host,   /* in/out [n_tokens][n_
 
     size_t so_bytes = (size_t)n_tokens * n_v_heads * head_v_dim * sizeof(float);
     size_t nw_bytes = (size_t)head_v_dim * sizeof(float);
-    size_t total = so_bytes + so_bytes + nw_bytes;
-    if (!reserve(&ctx->ssm_prefill_scratch, &ctx->ssm_prefill_scratch_cap, total)) return 0;
 
-    float *d_so = ctx->ssm_prefill_scratch;
-    float *d_z = d_so + n_tokens * n_v_heads * head_v_dim;
-    float *d_nw = d_z + n_tokens * n_v_heads * head_v_dim;
+    static void *d_so = NULL; static size_t d_so_cap = 0;
+    static void *d_z = NULL; static size_t d_z_cap = 0;
+    static void *d_nw = NULL; static size_t d_nw_cap = 0;
+
+    if (!ssm_batch_scratch_ensure(&d_so, &d_so_cap, so_bytes) ||
+        !ssm_batch_scratch_ensure(&d_z, &d_z_cap, so_bytes) ||
+        !ssm_batch_scratch_ensure(&d_nw, &d_nw_cap, nw_bytes)) return 0;
 
     if (!gpu_ok(gpuMemcpy(d_so, ssm_out_host, so_bytes, gpuMemcpyHostToDevice), "prefill gn so h2d") ||
         !gpu_ok(gpuMemcpy(d_z, z_host, so_bytes, gpuMemcpyHostToDevice), "prefill gn z h2d") ||
@@ -3818,7 +3824,7 @@ picolm_gpu_ssm_prefill_gated_norm(float *ssm_out_host,   /* in/out [n_tokens][n_
 
     dim3 grid((unsigned)n_v_heads, (unsigned)n_tokens, 1);
     picolm_gpu_ssm_prefill_gated_norm_kernel<<<grid, min(head_v_dim, 256), 0, ctx->stream>>>(
-        d_so, d_z, d_nw, head_v_dim, n_v_heads, n_tokens, eps);
+        (float *)d_so, (const float *)d_z, (const float *)d_nw, head_v_dim, n_v_heads, n_tokens, eps);
 
     if (!gpu_ok(gpuGetLastError(), "ssm prefill gated norm") ||
         !gpu_ok(gpuDeviceSynchronize(), "ssm prefill gn sync")) return 0;
@@ -3904,15 +3910,17 @@ picolm_gpu_ssm_vecdot_batch(float *out_host,       /* out [n_tokens][n_v_heads] 
     size_t x_bytes = (size_t)n_tokens * dim * sizeof(float);
     size_t w_bytes = (size_t)n_v_heads * row_bytes;
     size_t out_bytes = (size_t)n_tokens * n_v_heads * sizeof(float);
-    size_t hm_bytes = head_map ? (size_t)n_v_heads * sizeof(int) : 0;
+    size_t hm_bytes = (size_t)n_v_heads * sizeof(int);
 
-    size_t total = x_bytes + w_bytes + out_bytes + hm_bytes;
-    if (!reserve(&ctx->ssm_prefill_scratch, &ctx->ssm_prefill_scratch_cap, total)) return 0;
+    static void *x_dev = NULL; static size_t x_dev_cap = 0;
+    static void *w_dev = NULL; static size_t w_dev_cap = 0;
+    static void *out_dev = NULL; static size_t out_dev_cap = 0;
+    static void *hm_dev = NULL; static size_t hm_dev_cap = 0;
 
-    float *x_dev = ctx->ssm_prefill_scratch;
-    float *w_dev = x_dev + n_tokens * dim;
-    float *out_dev = w_dev + (row_bytes + 7) / 8 * n_v_heads;
-    int *hm_dev = (int *)((float *)out_dev + n_tokens * n_v_heads);
+    if (!ssm_batch_scratch_ensure(&x_dev, &x_dev_cap, x_bytes) ||
+        !ssm_batch_scratch_ensure(&w_dev, &w_dev_cap, w_bytes) ||
+        !ssm_batch_scratch_ensure(&out_dev, &out_dev_cap, out_bytes)) return 0;
+    if (head_map && !ssm_batch_scratch_ensure(&hm_dev, &hm_dev_cap, hm_bytes)) return 0;
 
     int ok = gpu_ok(gpuMemcpy(x_dev, x_host, x_bytes, gpuMemcpyHostToDevice), "vecdot batch x h2d") &&
              gpu_ok(gpuMemcpy(w_dev, weights_host, w_bytes, gpuMemcpyHostToDevice), "vecdot batch w h2d");
@@ -3922,8 +3930,8 @@ picolm_gpu_ssm_vecdot_batch(float *out_host,       /* out [n_tokens][n_v_heads] 
 
     dim3 grid((unsigned)n_v_heads, (unsigned)n_tokens, 1);
     picolm_ssm_vecdot_batch_kernel<<<grid, 256, 0, ctx->stream>>>(
-        out_dev, x_dev, w_dev, qtype, dim, n_v_heads, n_tokens,
-        row_bytes, head_map ? hm_dev : NULL);
+        (float *)out_dev, (const float *)x_dev, w_dev, qtype, dim, n_v_heads, n_tokens,
+        row_bytes, head_map ? (const int *)hm_dev : NULL);
 
     if (!gpu_ok(gpuGetLastError(), "ssm vecdot batch") ||
         !gpu_ok(gpuDeviceSynchronize(), "ssm vecdot batch sync")) return 0;
@@ -4343,49 +4351,73 @@ picolm_gpu_ssm_chunked_recurrence(const float *conv_batch_host,
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
 
-    /* Single pre-allocated scratch buffer, grow-only (no per-call malloc) */
+    /* Per-call, uploaded/downloaded once */
     size_t conv_bytes = (size_t)n_tokens * conv_dim * sizeof(float);
     size_t alpha_bytes = (size_t)n_tokens * n_v_heads * sizeof(float);
     size_t state_bytes = (size_t)n_v_heads * d * d * sizeof(float);
     size_t xb2_bytes = (size_t)n_tokens * value_dim * sizeof(float);
+
+    /* Per-chunk scratch, sized for the max chunk size, reused every chunk */
     size_t qk_sc_bytes = (size_t)n_k_heads * cs * d * sizeof(float);
     size_t v_sc_bytes = (size_t)n_v_heads * cs * d * sizeof(float);
     size_t scalar_sc_bytes = (size_t)n_v_heads * cs * sizeof(float);
     size_t sq_sc_bytes = (size_t)n_v_heads * cs * cs * sizeof(float);
 
-    size_t total = conv_bytes + alpha_bytes + alpha_bytes + state_bytes + xb2_bytes;
-    total += qk_sc_bytes + qk_sc_bytes + v_sc_bytes + scalar_sc_bytes + scalar_sc_bytes;
-    total += scalar_sc_bytes + scalar_sc_bytes + sq_sc_bytes + sq_sc_bytes + sq_sc_bytes;
-    total += v_sc_bytes + v_sc_bytes + v_sc_bytes + v_sc_bytes + v_sc_bytes + v_sc_bytes + v_sc_bytes;
-
-    if (!reserve(&ctx->ssm_prefill_scratch, &ctx->ssm_prefill_scratch_cap, total)) return 0;
-    float *scratch = ctx->ssm_prefill_scratch;
-    float *d_conv = scratch;
-    float *d_alpha = scratch + n_tokens * conv_dim;
-    float *d_beta = d_alpha + n_tokens * n_v_heads;
-    float *d_state_buf = d_beta + n_tokens * n_v_heads;
-    float *d_xb2 = d_state_buf + n_v_heads * d * d;
-    float *d_chunk_q = d_xb2 + n_tokens * value_dim;
-    float *d_chunk_k = d_chunk_q + n_k_heads * cs * d;
-    float *d_chunk_v = d_chunk_k + n_k_heads * cs * d;
-    float *d_chunk_beta = d_chunk_v + n_v_heads * cs * d;
-    float *d_gate_log = d_chunk_beta + n_v_heads * cs;
-    float *d_cum_g = d_gate_log + n_v_heads * cs;
-    float *d_q_decay = d_cum_g + n_v_heads * cs;
-    float *d_decay_mask = d_q_decay + n_v_heads * cs;
-    float *d_M = d_decay_mask + n_v_heads * cs * cs;
-    float *d_kq = d_M + n_v_heads * cs * cs;
-    float *d_v_eff = d_kq + n_v_heads * cs * cs;
-    float *d_v_hat = d_v_eff + n_v_heads * cs * d;
-    float *d_sk = d_v_hat + n_v_heads * cs * d;
-    float *d_sq = d_sk + n_v_heads * cs * d;
-    float *d_chunk_out = d_sq + n_v_heads * cs * d;
+    /* All buffers persistent/grow-only across calls (see
+     * ssm_batch_scratch_ensure's comment): this function alone was
+     * ~20 gpuMalloc/gpuFree pairs EVERY call, and it's called once per
+     * layer -- for a 48-layer model that's ~1000 alloc/free pairs per
+     * prompt just from this one function. Grown to the largest chunk
+     * size seen so far and never freed until the device changes. */
+    static void *d_conv = NULL; static size_t d_conv_cap = 0;
+    static void *d_alpha = NULL; static size_t d_alpha_cap = 0;
+    static void *d_beta = NULL; static size_t d_beta_cap = 0;
+    static void *d_state_buf = NULL; static size_t d_state_buf_cap = 0;
+    static void *d_xb2 = NULL; static size_t d_xb2_cap = 0;
+    static void *d_chunk_q = NULL; static size_t d_chunk_q_cap = 0;
+    static void *d_chunk_k = NULL; static size_t d_chunk_k_cap = 0;
+    static void *d_chunk_v = NULL; static size_t d_chunk_v_cap = 0;
+    static void *d_chunk_beta = NULL; static size_t d_chunk_beta_cap = 0;
+    static void *d_gate_log = NULL; static size_t d_gate_log_cap = 0;
+    static void *d_cum_g = NULL; static size_t d_cum_g_cap = 0;
+    static void *d_q_decay = NULL; static size_t d_q_decay_cap = 0;
+    static void *d_decay_mask = NULL; static size_t d_decay_mask_cap = 0;
+    static void *d_M = NULL; static size_t d_M_cap = 0;
+    static void *d_kq = NULL; static size_t d_kq_cap = 0;
+    static void *d_v_eff = NULL; static size_t d_v_eff_cap = 0;
+    static void *d_v_hat = NULL; static size_t d_v_hat_cap = 0;
+    static void *d_sk = NULL; static size_t d_sk_cap = 0;
+    static void *d_sq = NULL; static size_t d_sq_cap = 0;
+    static void *d_chunk_out = NULL; static size_t d_chunk_out_cap = 0;
 
     int ok = 1;
-    ok = ok && gpu_ok(gpuMemcpy(d_conv, conv_batch_host, conv_bytes, gpuMemcpyHostToDevice), "chunk conv h2d");
-    ok = ok && gpu_ok(gpuMemcpy(d_alpha, alpha_batch_host, alpha_bytes, gpuMemcpyHostToDevice), "chunk alpha h2d");
-    ok = ok && gpu_ok(gpuMemcpy(d_beta, beta_batch_host, alpha_bytes, gpuMemcpyHostToDevice), "chunk beta h2d");
-    ok = ok && gpu_ok(gpuMemcpy(d_state_buf, state_host, state_bytes, gpuMemcpyHostToDevice), "chunk state h2d");
+    ok = ok && ssm_batch_scratch_ensure(&d_conv, &d_conv_cap, conv_bytes);
+    ok = ok && ssm_batch_scratch_ensure(&d_alpha, &d_alpha_cap, alpha_bytes);
+    ok = ok && ssm_batch_scratch_ensure(&d_beta, &d_beta_cap, alpha_bytes);
+    ok = ok && ssm_batch_scratch_ensure(&d_state_buf, &d_state_buf_cap, state_bytes);
+    ok = ok && ssm_batch_scratch_ensure(&d_xb2, &d_xb2_cap, xb2_bytes);
+    ok = ok && ssm_batch_scratch_ensure(&d_chunk_q, &d_chunk_q_cap, qk_sc_bytes);
+    ok = ok && ssm_batch_scratch_ensure(&d_chunk_k, &d_chunk_k_cap, qk_sc_bytes);
+    ok = ok && ssm_batch_scratch_ensure(&d_chunk_v, &d_chunk_v_cap, v_sc_bytes);
+    ok = ok && ssm_batch_scratch_ensure(&d_chunk_beta, &d_chunk_beta_cap, scalar_sc_bytes);
+    ok = ok && ssm_batch_scratch_ensure(&d_gate_log, &d_gate_log_cap, scalar_sc_bytes);
+    ok = ok && ssm_batch_scratch_ensure(&d_cum_g, &d_cum_g_cap, scalar_sc_bytes);
+    ok = ok && ssm_batch_scratch_ensure(&d_q_decay, &d_q_decay_cap, scalar_sc_bytes);
+    ok = ok && ssm_batch_scratch_ensure(&d_decay_mask, &d_decay_mask_cap, sq_sc_bytes);
+    ok = ok && ssm_batch_scratch_ensure(&d_M, &d_M_cap, sq_sc_bytes);
+    ok = ok && ssm_batch_scratch_ensure(&d_kq, &d_kq_cap, sq_sc_bytes);
+    ok = ok && ssm_batch_scratch_ensure(&d_v_eff, &d_v_eff_cap, v_sc_bytes);
+    ok = ok && ssm_batch_scratch_ensure(&d_v_hat, &d_v_hat_cap, v_sc_bytes);
+    ok = ok && ssm_batch_scratch_ensure(&d_sk, &d_sk_cap, v_sc_bytes);
+    ok = ok && ssm_batch_scratch_ensure(&d_sq, &d_sq_cap, v_sc_bytes);
+    ok = ok && ssm_batch_scratch_ensure(&d_chunk_out, &d_chunk_out_cap, v_sc_bytes);
+
+    if (ok) {
+        ok = ok && gpu_ok(gpuMemcpy(d_conv, conv_batch_host, conv_bytes, gpuMemcpyHostToDevice), "chunk conv h2d");
+        ok = ok && gpu_ok(gpuMemcpy(d_alpha, alpha_batch_host, alpha_bytes, gpuMemcpyHostToDevice), "chunk alpha h2d");
+        ok = ok && gpu_ok(gpuMemcpy(d_beta, beta_batch_host, alpha_bytes, gpuMemcpyHostToDevice), "chunk beta h2d");
+        ok = ok && gpu_ok(gpuMemcpy(d_state_buf, state_host, state_bytes, gpuMemcpyHostToDevice), "chunk state h2d");
+    }
 
     if (ok) {
         int n_threads = 256;
@@ -4458,16 +4490,13 @@ picolm_gpu_ssm_chunked_recurrence(const float *conv_batch_host,
         ok = gpu_ok(gpuMemcpy(xb2_batch_host, d_xb2, xb2_bytes, gpuMemcpyDeviceToHost), "chunk xb2 d2h");
         ok = ok && gpu_ok(gpuMemcpy(state_host, d_state_buf, state_bytes, gpuMemcpyDeviceToHost), "chunk state d2h");
     }
-
     return ok;
 #endif
 }
 
-/* ================================================================
- * Phase 1: GPU-resident KV cache + attention - Host API
- * ================================================================ */
-
 /* Per-device KV cache pointers */
+
+
 static uint16_t *g_kv_k_dev[PICOLM_GPU_MAX_DEVICES];
 static uint16_t *g_kv_v_dev[PICOLM_GPU_MAX_DEVICES];
 static size_t g_kv_k_cap[PICOLM_GPU_MAX_DEVICES];
@@ -4587,7 +4616,10 @@ picolm_gpu_pipeline_batch_alloc(int dim, int q_dim, int kv_dim, int ffn_hidden,
 
     int ok = 1;
     ok &= gpu_ok(gpuMalloc(&ctx->pipe_x_b, db), "pipe_x_b alloc");
-    ok &= gpu_ok(gpuMalloc(&ctx->pipe_xb_b, db), "pipe_xb_b alloc");
+    /* pipe_xb_b is used by both attention layers (dim stride) and SSM layers
+     * (conv_dim stride, which can exceed dim). Allocate with q_dim stride to
+     * accommodate the larger SSM conv_dim = 2*d_state*n_k + ssm_d_inner. */
+    ok &= gpu_ok(gpuMalloc(&ctx->pipe_xb_b, qb), "pipe_xb_b alloc");
     ok &= gpu_ok(gpuMalloc(&ctx->pipe_q_b, qb), "pipe_q_b alloc");
     ok &= gpu_ok(gpuMalloc(&ctx->pipe_k_b, kvb), "pipe_k_b alloc");
     ok &= gpu_ok(gpuMalloc(&ctx->pipe_v_b, kvb), "pipe_v_b alloc");
@@ -5505,56 +5537,6 @@ picolm_gpu_memcpy(void *dst, const void *src, size_t bytes, int dir, int device)
                     gpuMemcpy(dst, src, bytes, gpuMemcpyDeviceToDevice);
     return gpu_ok(err, "pipeline memcpy");
 }
-
-
-/* ================================================================
- * Device-native batched SSM kernels (no H2D/D2H)
- * ================================================================ */
-
-/* Head permute kernel */
-__global__ void
-picolm_gpu_ssm_head_permute_batch_kernel(float *dst, const float *src,
-                                          const int *head_map,
-                                          int head_dim, int n_heads, int n_tokens,
-                                          int src_stride) {
-    int h = blockIdx.x; int t = blockIdx.y;
-    if (h >= n_heads || t >= n_tokens) return;
-    int gh = head_map[h];
-    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
-        dst[t*n_heads*head_dim + h*head_dim + d] = src[t*src_stride + gh*head_dim + d];
-}
-
-int picolm_gpu_ssm_head_permute_batch_dev(float *dd, const float *sd, const int *hm,
-    int hd, int nh, int nt, int ss, int dev) {
-    gpu_device_ctx_t *ctx = find_ctx(dev);
-    if (!ctx || !select_ctx(ctx)) return 0;
-    picolm_gpu_ssm_head_permute_batch_kernel<<<dim3((unsigned)nh,(unsigned)nt),128,0,ctx->stream>>>(dd,sd,hm,hd,nh,nt,ss);
-    return gpu_ok(gpuGetLastError(),"head permute batch dev");
-}
-
-/* Gate/beta kernel */
-__global__ void
-picolm_ssm_gate_beta_batch_kernel(float *ge, float *be,
-    const float *ai, const float *bi, const float *dw, const float *aw,
-    int nvh, int nt) {
-    int h = blockIdx.x, t = blockIdx.y;
-    if (h >= nvh || t >= nt) return;
-    if (threadIdx.x != 0) return;
-    float a = ai[t*nvh+h] + dw[h];
-    float sp = (a>20.0f)?a:(a<-20.0f)?expf(a):logf(1.0f+expf(a));
-    float g = sp * aw[h];
-    ge[t*nvh+h] = (g<-50.0f)?0.0f:expf(g);
-    be[t*nvh+h] = 1.0f/(1.0f+expf(-bi[t*nvh+h]));
-}
-
-int picolm_gpu_ssm_gate_beta_batch_dev(float *ge, float *be, const float *ai, const float *bi,
-    const float *dw, const float *aw, int nvh, int nt, int dev) {
-    gpu_device_ctx_t *ctx = find_ctx(dev);
-    if (!ctx || !select_ctx(ctx)) return 0;
-    picolm_ssm_gate_beta_batch_kernel<<<dim3((unsigned)nvh,(unsigned)nt),1,0,ctx->stream>>>(ge,be,ai,bi,dw,aw,nvh,nt);
-    return gpu_ok(gpuGetLastError(),"gate beta batch dev");
-}
-
 int picolm_gpu_ssm_conv1d_batch_dev(float *od, float *sd, const float *id, const float *wd,
     int cd, int dc, int nt, int dev) {
     if(cd<1||dc<1||nt<1) return 0;
@@ -5593,6 +5575,48 @@ int picolm_gpu_ssm_prefill_gated_norm_dev(float *od, const float *zd, const floa
     return gpu_ok(gpuGetLastError(),"gated norm dev");
 }
 
+__global__ void
+picolm_gpu_ssm_head_permute_batch_kernel(float *dst, const float *src,
+                                          const int *head_map,
+                                          int head_dim, int n_heads, int n_tokens,
+                                          int src_stride) {
+    int h = blockIdx.x; int t = blockIdx.y;
+    if (h >= n_heads || t >= n_tokens) return;
+    int gh = head_map[h];
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+        dst[t*n_heads*head_dim + h*head_dim + d] = src[t*src_stride + gh*head_dim + d];
+}
+
+int picolm_gpu_ssm_head_permute_batch_dev(float *dd, const float *sd, const int *hm,
+    int hd, int nh, int nt, int ss, int dev) {
+    gpu_device_ctx_t *ctx = find_ctx(dev);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    picolm_gpu_ssm_head_permute_batch_kernel<<<dim3((unsigned)nh,(unsigned)nt),128,0,ctx->stream>>>(dd,sd,hm,hd,nh,nt,ss);
+    return gpu_ok(gpuGetLastError(),"head permute batch dev");
+}
+
+__global__ void
+picolm_ssm_gate_beta_batch_kernel(float *ge, float *be,
+    const float *ai, const float *bi, const float *dw, const float *aw,
+    int nvh, int nt) {
+    int h = blockIdx.x, t = blockIdx.y;
+    if (h >= nvh || t >= nt) return;
+    if (threadIdx.x != 0) return;
+    float a = ai[t*nvh+h] + dw[h];
+    float sp = (a>20.0f)?a:(a<-20.0f)?expf(a):logf(1.0f+expf(a));
+    float g = sp * aw[h];
+    ge[t*nvh+h] = (g<-50.0f)?0.0f:expf(g);
+    be[t*nvh+h] = 1.0f/(1.0f+expf(-bi[t*nvh+h]));
+}
+
+int picolm_gpu_ssm_gate_beta_batch_dev(float *ge, float *be, const float *ai, const float *bi,
+    const float *dw, const float *aw, int nvh, int nt, int dev) {
+    gpu_device_ctx_t *ctx = find_ctx(dev);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    picolm_ssm_gate_beta_batch_kernel<<<dim3((unsigned)nvh,(unsigned)nt),1,0,ctx->stream>>>(ge,be,ai,bi,dw,aw,nvh,nt);
+    return gpu_ok(gpuGetLastError(),"gate beta batch dev");
+}
+
 int picolm_gpu_expert_mlp_dev(picolm_gpu_tensor_t *g, picolm_gpu_tensor_t *u, picolm_gpu_tensor_t *d,
     float *yd, const float *xd, int S, int dev) {
     if(!g||!u||!d||!xd||!yd||S<1) return 0;
@@ -5606,36 +5630,6 @@ int picolm_gpu_expert_mlp_dev(picolm_gpu_tensor_t *g, picolm_gpu_tensor_t *u, pi
     picolm_silu_mul<<<(unsigned)((S*I+255)/256),256>>>(ctx->gate,ctx->up,S*I);
     picolm_quant_matmul<<<dim3((unsigned)D,(unsigned)S),256>>>(yd,ctx->gate,d->weights,d->qtype,S,I,D,(int)d->row_bytes);
     return gpu_ok(gpuGetLastError(),"expert MLP dev");
-}
-
-/* Chunked recurrence: disabled on sm_121 (kernel crashes) */
-
-__global__ void ssm_chunk_matvec_kernel_tiled(float *out, const float *state, const float *chunk_x,
-    int n_v_heads, int repeat, int cs, int d) {
-    extern __shared__ float sbuf[];
-    float *sx = sbuf;
-    float *ss = sbuf + d;
-    int h = blockIdx.x;
-    if (h >= n_v_heads) return;
-    int kh = h / repeat;
-    const float *x_base = chunk_x + (size_t)kh * cs * d;
-    const float *st_base = state + (size_t)h * d * d;
-    float *o_base = out + (size_t)h * cs * d;
-    for (int i = 0; i < cs; i++) {
-        for (int c = threadIdx.x; c < d; c += blockDim.x)
-            sx[c] = x_base[i * d + c];
-        __syncthreads();
-        for (int r = threadIdx.x; r < d; r += blockDim.x)
-            ss[r] = st_base[r * d + threadIdx.x % d];
-        __syncthreads();
-        int r = threadIdx.x;
-        for (int idx = r; idx < cs * d; idx += blockDim.x) {
-            int ii = idx / d, rr = idx % d;
-            float sum = 0.0f;
-            for (int c = 0; c < d; c++) sum += ss[c] * sx[ii * d + c];
-            o_base[idx] = sum;
-        }
-    }
 }
 
 int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv_dev, const float *alpha_dev,

@@ -297,7 +297,7 @@ cuda: backend_gpu.o.cuda gpu-clean-objs
 	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_defines_for,-march=native) -DPICOLM_GPU=1" GPU_OBJS="backend_gpu.o.cuda" GPU_LIBS="-L$(CUDA_LIB) -lcudart -lstdc++ -Wl,-rpath,$(CUDA_LIB)"
 
 backend_gpu.o.cuda: backend_gpu.cu backend_gpu.h quant.h
-	$(NVCC) $(CUDAFLAGS) $(CUDA_GENCODE) -DPICOLM_GPU=1 -DPICOLM_SSM_WARP_KERNEL_VALIDATED -DPICOLM_SSM_CHUNKED_GPU_VALIDATED -c -o $@ $< -I.
+	$(NVCC) $(CUDAFLAGS) $(CUDA_GENCODE) -DPICOLM_GPU=1 -DPICOLM_SSM_WARP_KERNEL_VALIDATED -c -o $@ $< -I.
 
 # --- Metal (Apple Silicon) backend -- RAW Metal framework, no MLX-C ---
 # macOS only. No external dependencies beyond the Metal framework that ships
