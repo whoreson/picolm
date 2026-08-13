@@ -4356,7 +4356,7 @@ picolm_gpu_ssm_chunked_recurrence(const float *conv_batch_host,
     size_t total = conv_bytes + alpha_bytes + alpha_bytes + state_bytes + xb2_bytes;
     total += qk_sc_bytes + qk_sc_bytes + v_sc_bytes + scalar_sc_bytes + scalar_sc_bytes;
     total += scalar_sc_bytes + scalar_sc_bytes + sq_sc_bytes + sq_sc_bytes + sq_sc_bytes;
-    total += v_sc_bytes + v_sc_bytes + v_sc_bytes + v_sc_bytes + v_sc_bytes;
+    total += v_sc_bytes + v_sc_bytes + v_sc_bytes + v_sc_bytes + v_sc_bytes + v_sc_bytes + v_sc_bytes;
 
     if (!reserve(&ctx->ssm_prefill_scratch, &ctx->ssm_prefill_scratch_cap, total)) return 0;
     float *scratch = ctx->ssm_prefill_scratch;
@@ -5609,9 +5609,98 @@ int picolm_gpu_expert_mlp_dev(picolm_gpu_tensor_t *g, picolm_gpu_tensor_t *u, pi
 }
 
 /* Chunked recurrence: disabled on sm_121 (kernel crashes) */
-int picolm_gpu_ssm_chunked_recurrence_dev(const float *cd, const float *ad, const float *bd,
-    float *sd, float *xd, int nt, int vd, int ds, int nk, int nv, int hvd, int rep, int cdim, int cs, int dev) {
-    (void)cd;(void)ad;(void)bd;(void)sd;(void)xd;(void)nt;(void)vd;
-    (void)ds;(void)nk;(void)nv;(void)hvd;(void)rep;(void)cdim;(void)cs;(void)dev;
-    return 0; /* disabled */
+
+__global__ void ssm_chunk_matvec_kernel_tiled(float *out, const float *state, const float *chunk_x,
+    int n_v_heads, int repeat, int cs, int d) {
+    extern __shared__ float sbuf[];
+    float *sx = sbuf;
+    float *ss = sbuf + d;
+    int h = blockIdx.x;
+    if (h >= n_v_heads) return;
+    int kh = h / repeat;
+    const float *x_base = chunk_x + (size_t)kh * cs * d;
+    const float *st_base = state + (size_t)h * d * d;
+    float *o_base = out + (size_t)h * cs * d;
+    for (int i = 0; i < cs; i++) {
+        for (int c = threadIdx.x; c < d; c += blockDim.x)
+            sx[c] = x_base[i * d + c];
+        __syncthreads();
+        for (int r = threadIdx.x; r < d; r += blockDim.x)
+            ss[r] = st_base[r * d + threadIdx.x % d];
+        __syncthreads();
+        int r = threadIdx.x;
+        for (int idx = r; idx < cs * d; idx += blockDim.x) {
+            int ii = idx / d, rr = idx % d;
+            float sum = 0.0f;
+            for (int c = 0; c < d; c++) sum += ss[c] * sx[ii * d + c];
+            o_base[idx] = sum;
+        }
+    }
+}
+
+int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv_dev, const float *alpha_dev,
+    const float *beta_dev, float *state_dev, float *xb2_dev,
+    int n_tokens, int value_dim, int d_state, int n_k_heads, int n_v_heads,
+    int head_v_dim, int repeat, int conv_dim, int cs, int device) {
+    (void)conv_dim;
+#ifndef PICOLM_SSM_CHUNKED_GPU_VALIDATED
+    (void)conv_dev;(void)alpha_dev;(void)beta_dev;(void)state_dev;(void)xb2_dev;
+    (void)n_tokens;(void)value_dim;(void)d_state;(void)n_k_heads;
+    (void)n_v_heads;(void)head_v_dim;(void)repeat;(void)cs;(void)device;
+    return 0;
+#else
+    if(d_state!=head_v_dim) return 0;
+    if(cs<=0) cs=64; if(cs>n_tokens) cs=n_tokens;
+    int nc=(n_tokens+cs-1)/cs; if(nc<1) nc=1;
+    int d=d_state, qk_dim=d_state*n_k_heads;
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if(!ctx||!select_ctx(ctx)) return 0;
+    size_t qk_s=(size_t)n_k_heads*cs*d*sizeof(float);
+    size_t v_s=(size_t)n_v_heads*cs*d*sizeof(float);
+    size_t s_s=(size_t)n_v_heads*cs*sizeof(float);
+    size_t sq_s=(size_t)n_v_heads*cs*cs*sizeof(float);
+    size_t tot=qk_s*2+v_s*7+s_s*4+sq_s*3;
+    if(!reserve(&ctx->ssm_prefill_scratch,&ctx->ssm_prefill_scratch_cap,tot)) return 0;
+    if(!gpu_ok(gpuMemset(ctx->ssm_prefill_scratch,0,tot),"ssm_scratch_zero"))return 0;
+    float *sc=ctx->ssm_prefill_scratch,*cq=sc;sc+=n_k_heads*cs*d;
+    float *ck=sc;sc+=n_k_heads*cs*d; float *cv=sc;sc+=n_v_heads*cs*d;
+    float *cb=sc;sc+=n_v_heads*cs*d; float *gl=sc;sc+=n_v_heads*cs;
+    float *cg=sc;sc+=n_v_heads*cs; float *qd=sc;sc+=n_v_heads*cs;
+    float *dc=sc;sc+=n_v_heads*cs; float *dm=sc;sc+=n_v_heads*cs*cs;
+    float *cM=sc;sc+=n_v_heads*cs*cs; float *kq=sc;sc+=n_v_heads*cs*cs;
+    float *ve=sc;sc+=n_v_heads*cs*d; float *vh=sc;sc+=n_v_heads*cs*d;
+    float *sk=sc;sc+=n_v_heads*cs*d; float *sq=sc;sc+=n_v_heads*cs*d;
+    float *co=sc;sc+=n_v_heads*cs*d;
+    int ok=1,nt=256;
+    for(int ci=0;ci<nc&&ok;ci++){
+      int ca=(ci==nc-1)?(n_tokens-ci*cs):cs; if(ca<=0)break;
+      int co2=ci*cs;
+      ssm_chunk_gather_qk_kernel<<<n_k_heads,nt,0,ctx->stream>>>(cq,ck,conv_dev,co2,ca,conv_dim,qk_dim,d_state,n_k_heads);
+      if(!gpu_ok(gpuGetLastError(),"gather_qk"))return 0;
+      ssm_chunk_gather_v_kernel<<<n_v_heads,nt,0,ctx->stream>>>(cv,cb,gl,conv_dev,alpha_dev,beta_dev,co2,ca,conv_dim,qk_dim,head_v_dim,n_v_heads);
+      if(!gpu_ok(gpuGetLastError(),"gather_v"))return 0;
+      ssm_chunk_decay_kernel<<<n_v_heads,nt,0,ctx->stream>>>(cg,qd,dm,gl,n_v_heads,ca);
+      if(!gpu_ok(gpuGetLastError(),"decay"))return 0;
+      ssm_chunk_masked_gemm_kernel<<<n_v_heads,nt,0,ctx->stream>>>(cM,ck,ck,dm,n_v_heads,repeat,ca,d);
+      if(!gpu_ok(gpuGetLastError(),"M_gemm"))return 0;
+      ssm_chunk_matvec_kernel<<<n_v_heads,nt,0,ctx->stream>>>(sk,state_dev,ck,n_v_heads,repeat,ca,d);
+      if(!gpu_ok(gpuGetLastError(),"sk_matvec"))return 0;
+      ssm_chunk_veff_kernel<<<n_v_heads,nt,0,ctx->stream>>>(ve,cv,sk,qd,cb,n_v_heads,ca,d);
+      if(!gpu_ok(gpuGetLastError(),"veff"))return 0;
+      {int tr=d<1024?d:1024; ssm_chunk_trisolve_kernel<<<n_v_heads,tr,0,ctx->stream>>>(vh,ve,cM,cb,n_v_heads,ca,d);}
+      if(!gpu_ok(gpuGetLastError(),"trisolve"))return 0;
+      ssm_chunk_matvec_kernel<<<n_v_heads,nt,0,ctx->stream>>>(sq,state_dev,cq,n_v_heads,repeat,ca,d);
+      if(!gpu_ok(gpuGetLastError(),"sq_matvec"))return 0;
+      if(!gpu_ok(gpuGetLastError(),"sq_matvec"))return 0;
+      ssm_chunk_masked_gemm_kernel<<<n_v_heads,nt,0,ctx->stream>>>(kq,cq,ck,dm,n_v_heads,repeat,ca,d);
+      if(!gpu_ok(gpuGetLastError(),"kq_gemm"))return 0;
+      ssm_chunk_output_kernel<<<n_v_heads,nt,0,ctx->stream>>>(co,sq,qd,kq,vh,n_v_heads,ca,d);
+      if(!gpu_ok(gpuGetLastError(),"output"))return 0;
+      ssm_chunk_scatter_kernel<<<n_v_heads,nt,0,ctx->stream>>>(xb2_dev,co,co2,ca,value_dim,head_v_dim,n_v_heads);
+      if(!gpu_ok(gpuGetLastError(),"scatter"))return 0;
+      ssm_chunk_state_update_kernel<<<n_v_heads,nt,0,ctx->stream>>>(state_dev,vh,ck,cg,n_v_heads,repeat,ca,d);
+      if(!gpu_ok(gpuGetLastError(),"state_up"))return 0;
+    }
+    return ok;
+#endif
 }
