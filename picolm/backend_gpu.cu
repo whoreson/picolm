@@ -2804,24 +2804,83 @@ int picolm_gpu_expert_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
 
     if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "expert input")) return 0;
 
-    /* gate projection */
-    dim3 hidden_grid((unsigned)I, (unsigned)S);
-    picolm_quant_matmul<<<hidden_grid, 256>>>(ctx->gate, ctx->x, gate->weights,
-        gate->qtype, S, D, I, (int)gate->row_bytes);
-    /* up projection */
-    picolm_quant_matmul<<<hidden_grid, 256>>>(ctx->up, ctx->x, up->weights,
-        up->qtype, S, D, I, (int)up->row_bytes);
-    /* silu(gate) * up */
-    size_t n = (size_t)S * I;
-    picolm_silu_mul<<<(unsigned)((n + 255) / 256), 256>>>(ctx->gate, ctx->up, n);
-    /* down projection */
-    dim3 output_grid((unsigned)D, (unsigned)S);
-    picolm_quant_matmul<<<output_grid, 256>>>(ctx->y, ctx->gate, down->weights,
-        down->qtype, S, I, D, (int)down->row_bytes);
+    /* ---- Q8_0 fast path: quantize F32 input to Q8_0, then int8 MAC ----
+     * All 3 projections (gate, up, down) use Q8_0 weights. The input to
+     * gate+up is the same F32 vector, so we quantize it once and reuse
+     * the Q8_0 copy for both. The input to down is silu(gate)*up (F32),
+     * which we quantize again before the down projection.
+     * This replaces the slow per-block picolm_quant_matmul kernel with
+     * the fast picolm_q8_q8_matmul_tiled kernel that tiles the Q8_0
+     * weight row in shared memory across 32 query positions. */
+    int d_blocks = D / 32;
+    int i_blocks = I / 32;
+    if (d_blocks < 1 || i_blocks < 1) return 0; /* must be aligned */
 
-    if (!gpu_ok(gpuGetLastError(), "expert MLP")) return 0;
-    if (!gpu_ok(gpuMemcpy(y, ctx->y, xb, gpuMemcpyDeviceToHost), "expert output")) return 0;
-    return 1;
+    size_t xq_d_bytes = (size_t)S * D;
+    size_t xd_d_bytes = (size_t)S * d_blocks * sizeof(float);
+    size_t xq_i_bytes = (size_t)S * I;
+    size_t xd_i_bytes = (size_t)S * i_blocks * sizeof(float);
+
+    if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, xq_d_bytes > xq_i_bytes ? xq_d_bytes : xq_i_bytes) ||
+        !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_d_bytes > xd_i_bytes ? xd_d_bytes : xd_i_bytes)) return 0;
+
+    /* Step 1: Quantize F32 input [D*S] to Q8_0 */
+    dim3 q_grid_d((unsigned)d_blocks, (unsigned)S);
+    picolm_quantize_q8_0<<<q_grid_d, 32, 32 * sizeof(float), ctx->stream>>>(
+        ctx->q8_xq, ctx->q8_xd, ctx->x, D, S);
+    if (!gpu_ok(gpuGetLastError(), "expert q8 quantize input")) return 0;
+
+    /* Step 2: gate = q8_q8_tiled(input_q8, gate_weights) -> F32[I*S] */
+    int use_tiled = (S > 1 && gate->row_bytes + 2048 <= 49152);
+    if (use_tiled) {
+        dim3 grid((unsigned)I, (unsigned)((S + Q8_TILE_S - 1) / Q8_TILE_S));
+        picolm_q8_q8_matmul_tiled<<<grid, 256, (unsigned)gate->row_bytes, ctx->stream>>>(
+            ctx->gate, ctx->q8_xq, ctx->q8_xd, gate->weights, S, D, I, (int)gate->row_bytes);
+    } else {
+        dim3 grid((unsigned)I, (unsigned)S);
+        picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
+            ctx->gate, ctx->q8_xq, ctx->q8_xd, gate->weights, S, D, I, (int)gate->row_bytes);
+    }
+    if (!gpu_ok(gpuGetLastError(), "expert q8 gate")) return 0;
+
+    /* Step 3: up = q8_q8_tiled(input_q8, up_weights) -> F32[I*S] */
+    if (use_tiled) {
+        dim3 grid((unsigned)I, (unsigned)((S + Q8_TILE_S - 1) / Q8_TILE_S));
+        picolm_q8_q8_matmul_tiled<<<grid, 256, (unsigned)up->row_bytes, ctx->stream>>>(
+            ctx->up, ctx->q8_xq, ctx->q8_xd, up->weights, S, D, I, (int)up->row_bytes);
+    } else {
+        dim3 grid((unsigned)I, (unsigned)S);
+        picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
+            ctx->up, ctx->q8_xq, ctx->q8_xd, up->weights, S, D, I, (int)up->row_bytes);
+    }
+    if (!gpu_ok(gpuGetLastError(), "expert q8 up")) return 0;
+
+    /* Step 4: silu(gate) * up -> ctx->gate (in-place, F32[I*S]) */
+    size_t n = (size_t)S * I;
+    picolm_silu_mul<<<(unsigned)((n + 255) / 256), 256, 0, ctx->stream>>>(ctx->gate, ctx->up, n);
+    if (!gpu_ok(gpuGetLastError(), "expert silu")) return 0;
+
+    /* Step 5: Quantize F32 silu*up [I*S] to Q8_0 for down projection */
+    dim3 q_grid_i((unsigned)i_blocks, (unsigned)S);
+    picolm_quantize_q8_0<<<q_grid_i, 32, 32 * sizeof(float), ctx->stream>>>(
+        ctx->q8_xq, ctx->q8_xd, ctx->gate, I, S);
+    if (!gpu_ok(gpuGetLastError(), "expert q8 quantize hidden")) return 0;
+
+    /* Step 6: y = q8_q8_tiled(hidden_q8, down_weights) -> F32[D*S] */
+    int use_tiled_down = (S > 1 && down->row_bytes + 2048 <= 49152);
+    if (use_tiled_down) {
+        dim3 grid((unsigned)D, (unsigned)((S + Q8_TILE_S - 1) / Q8_TILE_S));
+        picolm_q8_q8_matmul_tiled<<<grid, 256, (unsigned)down->row_bytes, ctx->stream>>>(
+            ctx->y, ctx->q8_xq, ctx->q8_xd, down->weights, S, I, D, (int)down->row_bytes);
+    } else {
+        dim3 grid((unsigned)D, (unsigned)S);
+        picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
+            ctx->y, ctx->q8_xq, ctx->q8_xd, down->weights, S, I, D, (int)down->row_bytes);
+    }
+    if (!gpu_ok(gpuGetLastError(), "expert q8 down")) return 0;
+
+    if (!gpu_ok(gpuDeviceSynchronize(), "expert MLP sync")) return 0;
+    return gpu_ok(gpuMemcpy(y, ctx->y, xb, gpuMemcpyDeviceToHost), "expert output");
 }
 
 int picolm_gpu_w4a16_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
@@ -4061,8 +4120,9 @@ ssm_chunk_gather_v_kernel(float *chunk_v, float *chunk_beta, float *gate_log,
     }
     for (int t = threadIdx.x; t < cs_actual; t += blockDim.x) {
         cb_h[t] = beta_batch[(size_t)(chunk_start + t) * n_v_heads + h];
-        float ge = alpha_batch[(size_t)(chunk_start + t) * n_v_heads + h];
-        gl_h[t] = (ge <= 0.0f) ? -50.0f : logf(ge);
+        /* alpha_batch now contains gate_log directly (log-space), not expf(gate).
+         * No logf needed -- direct copy, matching the CPU path. */
+        gl_h[t] = alpha_batch[(size_t)(chunk_start + t) * n_v_heads + h];
     }
 }
 
@@ -5596,6 +5656,10 @@ int picolm_gpu_ssm_head_permute_batch_dev(float *dd, const float *sd, const int 
 }
 
 __global__ void
+/* Gate/beta post-process: outputs gate_log (log-space gate value) directly.
+ * Previously this kernel did expf(gate) and the recurrence did logf(expf(gate))
+ * -- a useless exp/log round-trip that compounded floating-point error.
+ * Now it outputs gate_log = softplus(alpha + dt_w) * a_w, matching the CPU path. */
 picolm_ssm_gate_beta_batch_kernel(float *ge, float *be,
     const float *ai, const float *bi, const float *dw, const float *aw,
     int nvh, int nt) {
@@ -5604,8 +5668,7 @@ picolm_ssm_gate_beta_batch_kernel(float *ge, float *be,
     if (threadIdx.x != 0) return;
     float a = ai[t*nvh+h] + dw[h];
     float sp = (a>20.0f)?a:(a<-20.0f)?expf(a):logf(1.0f+expf(a));
-    float g = sp * aw[h];
-    ge[t*nvh+h] = (g<-50.0f)?0.0f:expf(g);
+    ge[t*nvh+h] = sp * aw[h];
     be[t*nvh+h] = 1.0f/(1.0f+expf(-bi[t*nvh+h]));
 }
 
@@ -5625,11 +5688,67 @@ int picolm_gpu_expert_mlp_dev(picolm_gpu_tensor_t *g, picolm_gpu_tensor_t *u, pi
     int D=g->I, I=g->O;
     if(!reserve(&ctx->gate,&ctx->gate_cap,(size_t)S*I*sizeof(float))||
        !reserve(&ctx->up,&ctx->up_cap,(size_t)S*I*sizeof(float))) return 0;
-    picolm_quant_matmul<<<dim3((unsigned)I,(unsigned)S),256>>>(ctx->gate,xd,g->weights,g->qtype,S,D,I,(int)g->row_bytes);
-    picolm_quant_matmul<<<dim3((unsigned)I,(unsigned)S),256>>>(ctx->up,xd,u->weights,u->qtype,S,D,I,(int)u->row_bytes);
-    picolm_silu_mul<<<(unsigned)((S*I+255)/256),256>>>(ctx->gate,ctx->up,S*I);
-    picolm_quant_matmul<<<dim3((unsigned)D,(unsigned)S),256>>>(yd,ctx->gate,d->weights,d->qtype,S,I,D,(int)d->row_bytes);
-    return gpu_ok(gpuGetLastError(),"expert MLP dev");
+
+    /* Q8_0 fast path: quantize F32 input to Q8_0, then int8 MAC */
+    int d_blocks = D / 32;
+    int i_blocks = I / 32;
+    if (d_blocks < 1 || i_blocks < 1) return 0;
+
+    size_t xq_d = (size_t)S * D;
+    size_t xd_d = (size_t)S * d_blocks * sizeof(float);
+    size_t xq_i = (size_t)S * I;
+    size_t xd_i = (size_t)S * i_blocks * sizeof(float);
+    if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, xq_d > xq_i ? xq_d : xq_i) ||
+        !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_d > xd_i ? xd_d : xd_i)) return 0;
+
+    /* Quantize F32 input [D*S] to Q8_0 */
+    picolm_quantize_q8_0<<<dim3((unsigned)d_blocks,(unsigned)S),32,32*sizeof(float),ctx->stream>>>(
+        ctx->q8_xq, ctx->q8_xd, xd, D, S);
+    if (!gpu_ok(gpuGetLastError(), "expert q8 quantize input (dev)")) return 0;
+
+    /* gate = q8_q8_tiled(input_q8, gate_weights) */
+    int use_tiled = (S > 1 && g->row_bytes + 2048 <= 49152);
+    if (use_tiled) {
+        dim3 grid((unsigned)I, (unsigned)((S + Q8_TILE_S - 1) / Q8_TILE_S));
+        picolm_q8_q8_matmul_tiled<<<grid,256,(unsigned)g->row_bytes,ctx->stream>>>(
+            ctx->gate, ctx->q8_xq, ctx->q8_xd, g->weights, S, D, I, (int)g->row_bytes);
+    } else {
+        picolm_q8_q8_matmul<<<dim3((unsigned)I,(unsigned)S),256,0,ctx->stream>>>(
+            ctx->gate, ctx->q8_xq, ctx->q8_xd, g->weights, S, D, I, (int)g->row_bytes);
+    }
+    if (!gpu_ok(gpuGetLastError(), "expert q8 gate (dev)")) return 0;
+
+    /* up = q8_q8_tiled(input_q8, up_weights) */
+    if (use_tiled) {
+        dim3 grid((unsigned)I, (unsigned)((S + Q8_TILE_S - 1) / Q8_TILE_S));
+        picolm_q8_q8_matmul_tiled<<<grid,256,(unsigned)u->row_bytes,ctx->stream>>>(
+            ctx->up, ctx->q8_xq, ctx->q8_xd, u->weights, S, D, I, (int)u->row_bytes);
+    } else {
+        picolm_q8_q8_matmul<<<dim3((unsigned)I,(unsigned)S),256,0,ctx->stream>>>(
+            ctx->up, ctx->q8_xq, ctx->q8_xd, u->weights, S, D, I, (int)u->row_bytes);
+    }
+    if (!gpu_ok(gpuGetLastError(), "expert q8 up (dev)")) return 0;
+
+    /* silu(gate) * up -> ctx->gate */
+    picolm_silu_mul<<<(unsigned)((S*I+255)/256),256,0,ctx->stream>>>(ctx->gate, ctx->up, S*I);
+    if (!gpu_ok(gpuGetLastError(), "expert silu (dev)")) return 0;
+
+    /* Quantize F32 hidden [I*S] to Q8_0 for down */
+    picolm_quantize_q8_0<<<dim3((unsigned)i_blocks,(unsigned)S),32,32*sizeof(float),ctx->stream>>>(
+        ctx->q8_xq, ctx->q8_xd, ctx->gate, I, S);
+    if (!gpu_ok(gpuGetLastError(), "expert q8 quantize hidden (dev)")) return 0;
+
+    /* y = q8_q8_tiled(hidden_q8, down_weights) */
+    int use_tiled_down = (S > 1 && d->row_bytes + 2048 <= 49152);
+    if (use_tiled_down) {
+        dim3 grid((unsigned)D, (unsigned)((S + Q8_TILE_S - 1) / Q8_TILE_S));
+        picolm_q8_q8_matmul_tiled<<<grid,256,(unsigned)d->row_bytes,ctx->stream>>>(
+            yd, ctx->q8_xq, ctx->q8_xd, d->weights, S, I, D, (int)d->row_bytes);
+    } else {
+        picolm_q8_q8_matmul<<<dim3((unsigned)D,(unsigned)S),256,0,ctx->stream>>>(
+            yd, ctx->q8_xq, ctx->q8_xd, d->weights, S, I, D, (int)d->row_bytes);
+    }
+    return gpu_ok(gpuGetLastError(), "expert MLP dev");
 }
 
 int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv_dev, const float *alpha_dev,

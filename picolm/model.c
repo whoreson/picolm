@@ -1546,7 +1546,6 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                     lw->altup_router_norm = ptr;
                 } else if (strcmp(suffix, "laurel_l.weight") == 0) {
                     lw->laurel_l = ptr; lw->type_laurel_l = qtype;
-                    fprintf(stderr, "DBG laurel_l type=%d\n", qtype);
                     /* Derive laurel_rank from tensor shape [n_embd, laurel_rank] */
                     for (uint64_t ti = 0; ti < total_tensor_count; ti++) {
                         if (tinfos[ti].name.len > 4 && memcmp(tinfos[ti].name.str, "blk.", 4) == 0) {
@@ -1563,7 +1562,6 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                     }
                 } else if (strcmp(suffix, "laurel_r.weight") == 0) {
                     lw->laurel_r = ptr; lw->type_laurel_r = qtype;
-                    fprintf(stderr, "DBG laurel_r type=%d\n", qtype);
                 } else if (strcmp(suffix, "laurel_post_norm.weight") == 0) {
                     lw->laurel_post_norm = ptr;
                 }
@@ -1579,6 +1577,7 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                     w->per_layer_model_proj = ptr; w->type_per_layer_model_proj = qtype;
                 } else if (str_eq(tinfos[i].name, "per_layer_proj_norm.weight")) {
                     w->per_layer_proj_norm = ptr;
+                    fprintf(stderr, "DBG per_layer_proj_norm type=%d\n", qtype);
                 }
             }
         }
@@ -7000,7 +6999,7 @@ static void ssm_chunk_head_task(int h, void *ctxp) {
  *
  * conv_batch layout: [n_tokens][conv_dim] where conv_dim = 2*qk_dim + value_dim
  *   Within each token: [Q[n_k_heads][d_state] | K[n_k_heads][d_state] | V[n_v_heads][head_v_dim]]
- * alpha_batch: [n_tokens][n_v_heads] gate_exp values
+ * alpha_batch: [n_tokens][n_v_heads] gate_log values (log-space: softplus(alpha+dt_w)*a_w)
  * beta_batch:  [n_tokens][n_v_heads] sigmoid(beta) values
  * state:       [n_v_heads][d_state][d_state] recurrent state (updated in-place)
  * xb2_batch:   [n_tokens][value_dim] head-major output [h*head_v_dim + d]
@@ -7079,8 +7078,7 @@ static void ssm_chunked_recurrence(
                 memcpy(chunk_v + (size_t)h * cs_actual * head_v_dim + t * head_v_dim,
                        tok + 2 * qk_dim + h * head_v_dim, head_v_dim * sizeof(float));
                 chunk_beta[h * cs_actual + t] = beta_batch[(chunk_start + t) * n_v_heads + h];
-                float ge = alpha_batch[(chunk_start + t) * n_v_heads + h];
-                gate_log[h * cs_actual + t] = (ge <= 0.0f) ? -50.0f : logf(ge);
+                gate_log[h * cs_actual + t] = alpha_batch[(chunk_start + t) * n_v_heads + h];
             }
         }
 
@@ -9295,15 +9293,18 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
         /* alpha_map and beta_map are stack-allocated */
         }
 
-        /* Post-process: alpha -> softplus -> gate -> exp; beta -> sigmoid */
+        /* Post-process: alpha -> softplus -> gate_log; beta -> sigmoid */
+        /* Store gate_log = softplus(alpha + dt_w) * a_w directly in alpha_batch.
+         * The chunked recurrence uses gate_log to build cum_g and decay_mask.
+         * Previously we did expf(gate) here and logf(expf(gate)) in the recurrence --
+         * a useless exp/log round-trip that compounds floating-point error. */
         for (bi = 0; bi < n_tokens; bi++) {
             float *al = alpha_batch + bi * n_v_heads;
             float *bt = beta_batch + bi * n_v_heads;
             for (int h = 0; h < n_v_heads; h++) {
                 float a = al[h];
                 float sp = (a > 20.0f) ? a : (a < -20.0f) ? expf(a) : logf(1.0f + expf(a));
-                float gate = sp * s->ssm_a_w[l][h];
-                al[h] = (gate < -50.0f) ? 0.0f : expf(gate);
+                al[h] = sp * s->ssm_a_w[l][h];
                 bt[h] = 1.0f / (1.0f + expf(-bt[h]));
             }
         }
