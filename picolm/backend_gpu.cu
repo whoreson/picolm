@@ -5506,3 +5506,112 @@ picolm_gpu_memcpy(void *dst, const void *src, size_t bytes, int dir, int device)
     return gpu_ok(err, "pipeline memcpy");
 }
 
+
+/* ================================================================
+ * Device-native batched SSM kernels (no H2D/D2H)
+ * ================================================================ */
+
+/* Head permute kernel */
+__global__ void
+picolm_gpu_ssm_head_permute_batch_kernel(float *dst, const float *src,
+                                          const int *head_map,
+                                          int head_dim, int n_heads, int n_tokens,
+                                          int src_stride) {
+    int h = blockIdx.x; int t = blockIdx.y;
+    if (h >= n_heads || t >= n_tokens) return;
+    int gh = head_map[h];
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x)
+        dst[t*n_heads*head_dim + h*head_dim + d] = src[t*src_stride + gh*head_dim + d];
+}
+
+int picolm_gpu_ssm_head_permute_batch_dev(float *dd, const float *sd, const int *hm,
+    int hd, int nh, int nt, int ss, int dev) {
+    gpu_device_ctx_t *ctx = find_ctx(dev);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    picolm_gpu_ssm_head_permute_batch_kernel<<<dim3((unsigned)nh,(unsigned)nt),128,0,ctx->stream>>>(dd,sd,hm,hd,nh,nt,ss);
+    return gpu_ok(gpuGetLastError(),"head permute batch dev");
+}
+
+/* Gate/beta kernel */
+__global__ void
+picolm_ssm_gate_beta_batch_kernel(float *ge, float *be,
+    const float *ai, const float *bi, const float *dw, const float *aw,
+    int nvh, int nt) {
+    int h = blockIdx.x, t = blockIdx.y;
+    if (h >= nvh || t >= nt) return;
+    if (threadIdx.x != 0) return;
+    float a = ai[t*nvh+h] + dw[h];
+    float sp = (a>20.0f)?a:(a<-20.0f)?expf(a):logf(1.0f+expf(a));
+    float g = sp * aw[h];
+    ge[t*nvh+h] = (g<-50.0f)?0.0f:expf(g);
+    be[t*nvh+h] = 1.0f/(1.0f+expf(-bi[t*nvh+h]));
+}
+
+int picolm_gpu_ssm_gate_beta_batch_dev(float *ge, float *be, const float *ai, const float *bi,
+    const float *dw, const float *aw, int nvh, int nt, int dev) {
+    gpu_device_ctx_t *ctx = find_ctx(dev);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    picolm_ssm_gate_beta_batch_kernel<<<dim3((unsigned)nvh,(unsigned)nt),1,0,ctx->stream>>>(ge,be,ai,bi,dw,aw,nvh,nt);
+    return gpu_ok(gpuGetLastError(),"gate beta batch dev");
+}
+
+int picolm_gpu_ssm_conv1d_batch_dev(float *od, float *sd, const float *id, const float *wd,
+    int cd, int dc, int nt, int dev) {
+    if(cd<1||dc<1||nt<1) return 0;
+    if(dc>PICOLM_SSM_CONV_MAX_D_CONV) return 0;
+    gpu_device_ctx_t *ctx = find_ctx(dev);
+    if(!ctx||!select_ctx(ctx)) return 0;
+    int nb=(cd+255)/256;
+    picolm_gpu_ssm_conv1d_batch_kernel<<<nb,256,0,ctx->stream>>>(od,sd,id,wd,cd,dc,nt);
+    return gpu_ok(gpuGetLastError(),"conv1d batch dev");
+}
+
+int picolm_gpu_ssm_l2norm_batch_dev(float *xd, int hd, int nh, int nt, int ts, float eps, float es, int dev) {
+    if(hd<1||nh<1||hd>256||nt<1) return 0;
+    gpu_device_ctx_t *ctx = find_ctx(dev);
+    if(!ctx||!select_ctx(ctx)) return 0;
+    picolm_gpu_ssm_l2norm_batch_kernel<<<dim3((unsigned)nh,(unsigned)nt),min(hd,256),0,ctx->stream>>>(xd,hd,nh,nt,ts,eps,es);
+    return gpu_ok(gpuGetLastError(),"l2norm batch dev");
+}
+
+int picolm_gpu_ssm_vecdot_batch_dev(float *od, const float *xd, const void *wd, gguf_type_t qt,
+    int dim, int nvh, int nt, int rb, const int *hm, int dev) {
+    if(nvh<=0||dim<=0||nt<=0) return 0;
+    if(dim>PICOLM_SSM_VECDOT_MAX_DIM) return 0;
+    gpu_device_ctx_t *ctx = find_ctx(dev);
+    if(!ctx||!select_ctx(ctx)) return 0;
+    picolm_ssm_vecdot_batch_kernel<<<dim3((unsigned)nvh,(unsigned)nt),256,0,ctx->stream>>>(od,xd,wd,qt,dim,nvh,nt,rb,hm);
+    return gpu_ok(gpuGetLastError(),"vecdot batch dev");
+}
+
+int picolm_gpu_ssm_prefill_gated_norm_dev(float *od, const float *zd, const float *nd,
+    int hd, int nh, int nt, float eps, int dev) {
+    if(hd<1||nh<1||nt<1) return 0;
+    gpu_device_ctx_t *ctx = find_ctx(dev);
+    if(!ctx||!select_ctx(ctx)) return 0;
+    picolm_gpu_ssm_prefill_gated_norm_kernel<<<dim3((unsigned)nh,(unsigned)nt),min(hd,256),0,ctx->stream>>>(od,zd,nd,hd,nh,nt,eps);
+    return gpu_ok(gpuGetLastError(),"gated norm dev");
+}
+
+int picolm_gpu_expert_mlp_dev(picolm_gpu_tensor_t *g, picolm_gpu_tensor_t *u, picolm_gpu_tensor_t *d,
+    float *yd, const float *xd, int S, int dev) {
+    if(!g||!u||!d||!xd||!yd||S<1) return 0;
+    gpu_device_ctx_t *ctx = find_ctx(dev);
+    if(!ctx||!select_ctx(ctx)) return 0;
+    int D=g->I, I=g->O;
+    if(!reserve(&ctx->gate,&ctx->gate_cap,(size_t)S*I*sizeof(float))||
+       !reserve(&ctx->up,&ctx->up_cap,(size_t)S*I*sizeof(float))) return 0;
+    picolm_quant_matmul<<<dim3((unsigned)I,(unsigned)S),256>>>(ctx->gate,xd,g->weights,g->qtype,S,D,I,(int)g->row_bytes);
+    picolm_quant_matmul<<<dim3((unsigned)I,(unsigned)S),256>>>(ctx->up,xd,u->weights,u->qtype,S,D,I,(int)u->row_bytes);
+    picolm_silu_mul<<<(unsigned)((S*I+255)/256),256>>>(ctx->gate,ctx->up,S*I);
+    picolm_quant_matmul<<<dim3((unsigned)D,(unsigned)S),256>>>(yd,ctx->gate,d->weights,d->qtype,S,I,D,(int)d->row_bytes);
+    return gpu_ok(gpuGetLastError(),"expert MLP dev");
+}
+
+/* Chunked recurrence: disabled on sm_121 (kernel crashes) */
+int picolm_gpu_ssm_chunked_recurrence_dev(const float *cd, const float *ad, const float *bd,
+    float *sd, float *xd, int nt, int vd, int ds, int nk, int nv, int hvd, int rep, int cdim, int cs, int dev) {
+    (void)cd;(void)ad;(void)bd;(void)sd;(void)xd;(void)nt;(void)vd;
+    (void)ds;(void)nk;(void)nv;(void)hvd;(void)rep;(void)cdim;(void)cs;(void)dev;
+    return 0; /* disabled */
+}
