@@ -55,6 +55,17 @@ extern int cudaProfilerStop(void);
 #include <pthread.h>
 #endif
 
+/* Forward declarations from backend_gpu.cu (avoids nvcc extern "C" overload
+ * confusion when backend_gpu.h is included from the .cu compilation unit). */
+extern int picolm_gpu_pipeline_batch_alloc(int dim, int q_dim, int kv_dim, int ffn_hidden,
+                                            int xb_stride, int max_seq_len, int device);
+extern int picolm_gpu_prealloc_q8(size_t max_xq_bytes, size_t max_xd_bytes, int device);
+extern int picolm_gpu_ssm_head_permute_batch_dev(float *dst, const float *src,
+                                                  const int *head_map,
+                                                  int head_dim, int n_heads,
+                                                  int n_tokens, int src_stride,
+                                                  int dst_stride, int device);
+
 #if defined(__APPLE__) && defined(__ppc__) && defined(__ALTIVEC__)
 /* Swap uint16 values in-place using Altivec vec_perm.
  * Uses static 64-byte aligned buffer to avoid alignment issues. */
@@ -1451,15 +1462,15 @@ static int parse_gguf(model_t *m, int max_seq_len) {
             if (layer >= 0 && layer < MAX_LAYERS) {
                 layer_weights_t *lw = &w->layers[layer];
                 if (strcmp(suffix, "attn_norm.weight") == 0) {
-                    lw->attn_norm = ptr; lw->type_attn_norm = qtype;
+                    lw->attn_norm = ptr; lw->type_attn_norm = qtype; if (layer == 0) fprintf(stderr, "DBG attn_norm type=%d\n", qtype);
                 } else if (strcmp(suffix, "attn_q.weight") == 0) {
-                    lw->attn_q = ptr; lw->type_attn_q = qtype;
+                    lw->attn_q = ptr; lw->type_attn_q = qtype; if (layer == 0) fprintf(stderr, "DBG attn_q type=%d\n", qtype);
                 } else if (strcmp(suffix, "attn_k.weight") == 0) {
-                    lw->attn_k = ptr; lw->type_attn_k = qtype; lw->is_attn_layer = 1;
+                    lw->attn_k = ptr; lw->type_attn_k = qtype; if (layer == 0) fprintf(stderr, "DBG attn_k type=%d\n", qtype); lw->is_attn_layer = 1;
                 } else if (strcmp(suffix, "attn_v.weight") == 0) {
-                    lw->attn_v = ptr; lw->type_attn_v = qtype; lw->is_attn_layer = 1;
+                    lw->attn_v = ptr; lw->type_attn_v = qtype; if (layer == 0) fprintf(stderr, "DBG attn_v type=%d\n", qtype); lw->is_attn_layer = 1;
                 } else if (strcmp(suffix, "attn_output.weight") == 0) {
-                    lw->attn_output = ptr; lw->type_attn_output = qtype;
+                    lw->attn_output = ptr; lw->type_attn_output = qtype; if (layer == 0) fprintf(stderr, "DBG attn_output type=%d\n", qtype);
                 } else if (strcmp(suffix, "attn_q_norm.weight") == 0) {
                     lw->attn_q_norm = ptr; lw->type_attn_q_norm = qtype;
                 } else if (strcmp(suffix, "attn_k_norm.weight") == 0) {
@@ -1476,11 +1487,11 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                         lw->post_attn_norm = ptr; lw->type_post_attn_norm = qtype;
                     }
                 } else if (strcmp(suffix, "ffn_gate.weight") == 0) {
-                    lw->ffn_gate = ptr; lw->type_ffn_gate = qtype;
+                    lw->ffn_gate = ptr; lw->type_ffn_gate = qtype; if (layer == 0) fprintf(stderr, "DBG ffn_gate type=%d\n", qtype);
                 } else if (strcmp(suffix, "ffn_down.weight") == 0) {
-                    lw->ffn_down = ptr; lw->type_ffn_down = qtype;
+                    lw->ffn_down = ptr; lw->type_ffn_down = qtype; if (layer == 0) fprintf(stderr, "DBG ffn_down type=%d\n", qtype);
                 } else if (strcmp(suffix, "ffn_up.weight") == 0) {
-                    lw->ffn_up = ptr; lw->type_ffn_up = qtype;
+                    lw->ffn_up = ptr; lw->type_ffn_up = qtype; if (layer == 0) fprintf(stderr, "DBG ffn_up type=%d\n", qtype);
                 }
                 /* MoE tensors (qwen35moe) */
                 else if (strcmp(suffix, "ffn_gate_exps.weight") == 0) {
@@ -1528,9 +1539,11 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                 } else if (strcmp(suffix, "per_layer_inp_gate.weight") == 0
                         || strcmp(suffix, "inp_gate.weight") == 0) {
                     lw->per_layer_inp_gate = ptr; lw->type_per_layer_inp_gate = qtype;
+                    if (layer == 0) fprintf(stderr, "DBG per_layer_inp_gate type=%d\n", qtype);
                 } else if (strcmp(suffix, "per_layer_proj.weight") == 0
                         || strcmp(suffix, "proj.weight") == 0) {
                     lw->per_layer_proj = ptr; lw->type_per_layer_proj = qtype;
+                    if (layer == 0) fprintf(stderr, "DBG per_layer_proj type=%d\n", qtype);
                 } else if (strcmp(suffix, "per_layer_post_norm.weight") == 0
                         || strcmp(suffix, "post_norm.weight") == 0) {
                     lw->per_layer_post_norm = ptr; lw->type_per_layer_post_norm = qtype;
@@ -1538,6 +1551,7 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                     lw->altup_correct_coef = ptr;
                 } else if (strcmp(suffix, "altup_correct_scale.weight") == 0) {
                     lw->altup_correct_scale = ptr;
+                    if (layer == 0) fprintf(stderr, "DBG altup_correct_scale type=%d\n", qtype);
                 } else if (strcmp(suffix, "altup_predict_coef.weight") == 0) {
                     lw->altup_predict_coef = ptr;
                 } else if (strcmp(suffix, "altup_router.weight") == 0) {
@@ -1546,6 +1560,7 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                     lw->altup_router_norm = ptr;
                 } else if (strcmp(suffix, "laurel_l.weight") == 0) {
                     lw->laurel_l = ptr; lw->type_laurel_l = qtype;
+                    if (layer == 0) fprintf(stderr, "DBG laurel_l type=%d\n", qtype);
                     /* Derive laurel_rank from tensor shape [n_embd, laurel_rank] */
                     for (uint64_t ti = 0; ti < total_tensor_count; ti++) {
                         if (tinfos[ti].name.len > 4 && memcmp(tinfos[ti].name.str, "blk.", 4) == 0) {
@@ -1562,6 +1577,7 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                     }
                 } else if (strcmp(suffix, "laurel_r.weight") == 0) {
                     lw->laurel_r = ptr; lw->type_laurel_r = qtype;
+                    if (layer == 0) fprintf(stderr, "DBG laurel_r type=%d\n", qtype);
                 } else if (strcmp(suffix, "laurel_post_norm.weight") == 0) {
                     lw->laurel_post_norm = ptr;
                 }
@@ -1569,12 +1585,16 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                 /* Gemma-3n global tensors (not under blk.) */
                 if (str_eq(tinfos[i].name, "altup_proj.weight")) {
                     w->altup_proj = ptr; w->type_altup_proj = qtype;
+                    fprintf(stderr, "DBG altup_proj type=%d\n", qtype);
                 } else if (str_eq(tinfos[i].name, "altup_unembd_proj.weight")) {
                     w->altup_unembd_proj = ptr; w->type_altup_unembd_proj = qtype;
+                    fprintf(stderr, "DBG altup_unembd_proj type=%d\n", qtype);
                 } else if (str_eq(tinfos[i].name, "per_layer_token_embd.weight")) {
                     w->per_layer_tok_embd = ptr; w->type_per_layer_tok_embd = qtype;
+                    fprintf(stderr, "DBG per_layer_tok_embd type=%d\n", qtype);
                 } else if (str_eq(tinfos[i].name, "per_layer_model_proj.weight")) {
                     w->per_layer_model_proj = ptr; w->type_per_layer_model_proj = qtype;
+                    fprintf(stderr, "DBG per_layer_model_proj type=%d\n", qtype);
                 } else if (str_eq(tinfos[i].name, "per_layer_proj_norm.weight")) {
                     w->per_layer_proj_norm = ptr;
                     fprintf(stderr, "DBG per_layer_proj_norm type=%d\n", qtype);
@@ -2810,11 +2830,28 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                             if (!picolm_gpu_pipeline_alloc(c->n_embd, q_pipeline_dim, kv_dim, c->n_ffn, device)) {
                                 fprintf(stderr, "WARN: GPU pipeline buffer alloc failed\n");
                             }
-                            /* Prefill batch buffers */
+                            /* Prefill batch buffers - xb_stride must accommodate both
+                             * q_pipeline_dim (attention QKV) and ssm_conv_dim (SSM QKV) */
+                            int ssm_conv_dim = 2 * c->ssm_d_state * c->ssm_n_group + c->ssm_d_inner;
+                            int xb_stride = q_pipeline_dim;
+                            if (ssm_conv_dim > xb_stride) xb_stride = ssm_conv_dim;
+                            if (c->n_embd > xb_stride) xb_stride = c->n_embd;
                             if (!picolm_gpu_pipeline_batch_alloc(c->n_embd, q_pipeline_dim, kv_dim,
-                                                                 c->n_ffn, c->max_seq_len, device)) {
+                                                                 c->n_ffn, xb_stride, c->max_seq_len, device)) {
                                 fprintf(stderr, "WARN: GPU prefill batch buffer alloc failed\n");
                             }
+
+                            /* Pre-allocate Q8_0 scratch buffers to max size needed
+                             * to avoid runtime reallocation races between GPU work
+                             * and host-side cudaFree/cudaMalloc in reserve/reserve_i8.
+                             * Max input dim = max(q_pipeline_dim, ssm_conv_dim, n_ffn).
+                             * Max batch = c->max_seq_len. */
+                            int max_q8_dim = q_pipeline_dim;
+                            if (ssm_conv_dim > max_q8_dim) max_q8_dim = ssm_conv_dim;
+                            if (c->n_ffn > max_q8_dim) max_q8_dim = c->n_ffn;
+                            size_t max_xq = (size_t)c->max_seq_len * max_q8_dim;
+                            size_t max_xd = (size_t)c->max_seq_len * (max_q8_dim + 31) / 32 * sizeof(float);
+                            picolm_gpu_prealloc_q8(max_xq, max_xd, device);
 
                             /* Upload norm weights and RoPE tables to device */
                             run_state_t *s = &m->state;
@@ -4936,13 +4973,13 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
             /* Active prediction */
             active_pred = predictions + i_altup_act * dim;
             if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
-                double pm = 0; for(int i=0;i<dim;i++){double v=active_pred[i]; pm+=v*v;}
-                fprintf(stderr, "DBG L0 active_pred_rms=%.4f [0:5]={", sqrt(pm/dim));
+                double apm=0; for(int i=0;i<dim;i++){double v=active_pred[i]; apm+=v*v;}
+                for(int a=0;a<n_altup;a++){
+                    double pm=0; for(int i=0;i<dim;i++){double v=predictions[a*dim+i]; pm+=v*v;}
+                    fprintf(stderr,"DBG L0 pred[%d]_rms=%.4f\n", a, sqrt(pm/dim));
+                }
+                fprintf(stderr, "DBG L0 active_pred_rms=%.4f [0:5]={", sqrt(apm/dim));
                 for(int i=0;i<5;i++) fprintf(stderr,"%.4f%s",active_pred[i],i<4?",":"");
-                fprintf(stderr, "}\n");
-                double pm2 = 0; for(int i=0;i<dim;i++){double v=predictions[dim+i]; pm2+=v*v;}
-                fprintf(stderr, "DBG L0 pred[1]_rms=%.4f [0:5]={", sqrt(pm2/dim));
-                for(int i=0;i<5;i++) fprintf(stderr,"%.4f%s",predictions[dim+i],i<4?",":"");
                 fprintf(stderr, "}\n");
             }
             /* ATTN NORM */
@@ -4974,8 +5011,22 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
                     matmul(s->gemma3n_laurel_out, s->hb, lw->laurel_r, laurel_rank, dim, lw->type_laurel_r);
                 }
                 rmsnorm(s->gemma3n_laurel_out, s->gemma3n_laurel_out, s->laurel_post_norm_w[l], dim, rms_norm_eps);
+                if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
+                    double wm = 0; for(int i=0;i<dim;i++){double v=s->laurel_post_norm_w[l][i]; wm+=v*v;}
+                    double am = 0; for(int i=0;i<dim;i++){double v=s->gemma3n_laurel_out[i]; am+=v*v;}
+                    fprintf(stderr, "DBG L0 laurel_post_norm_rms=%.4f laurel_normed_rms=%.4f\n", sqrt(wm/dim), sqrt(am/dim));
+                }
                 /* Residual: laurel_out + x_normed (not active_pred!) */
                 for (int i = 0; i < dim; i++) s->gemma3n_laurel_out[i] += s->xb[i];
+            }
+            if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
+                double am = 0; for(int i=0;i<dim;i++){double v=s->xb[i]; am+=v*v;}
+                fprintf(stderr, "DBG L0 attn_norm_rms=%.4f\n", sqrt(am/dim));
+                int skip_laurel = getenv("PICOLM_SKIP_LAUREL") ? 1 : 0;
+                if (!skip_laurel) {
+                    double lm = 0; for(int i=0;i<dim;i++){double v=s->gemma3n_laurel_out[i]; lm+=v*v;}
+                    fprintf(stderr, "DBG L0 laurel_out_rms=%.4f\n", sqrt(lm/dim));
+                }
             }
         }
 
@@ -5370,10 +5421,17 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
     }
 
     /* 6. Final RMSNorm */
+    if (pos <= 1 && getenv("PICOLM_DBG")) {
+        double om = 0; for(int i=0;i<dim;i++){double v=s->x[i]; om+=v*v;}
+        fprintf(stderr, "DBG pos=%d unembed_rms=%.4f [0:5]={", pos, sqrt(om/dim));
+        for(int i=0;i<5;i++) fprintf(stderr,"%.4f%s",s->x[i],i<4?",":"");
+        fprintf(stderr, "}\n");
+    }
     rmsnorm(s->x, s->x, s->output_norm_w, dim, rms_norm_eps);
 
-    if (pos == 0 && getenv("PICOLM_DBG")) {
+    if (pos <= 1 && getenv("PICOLM_DBG")) {
         double om = 0; for(int i=0;i<dim;i++){double v=s->x[i]; om+=v*v;}
+        fprintf(stderr, "DBG pos=%d output_norm_rms=%.4f [0:5]={", pos, sqrt(om/dim));
         for(int i=0;i<5;i++) fprintf(stderr,"%.4f%s",s->x[i],i<4?",":"");
         fprintf(stderr, "}\n");
     }
@@ -5386,6 +5444,23 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
         for (int i = 0; i < c->vocab_size; i++) {
             s->logits[i] = tanhf(s->logits[i] * inv_cap) * c->f_final_logit_softcapping;
         }
+    }
+
+    if (pos <= 1 && getenv("PICOLM_DBG")) {
+        fprintf(stderr, "DBG pos=%d top5 logits: ", pos);
+        int top_idx[5]; float top_val[5];
+        for (int rank = 0; rank < 5; rank++) {
+            int best = -1; float bestv = -1e30f;
+            for (int i = 0; i < c->vocab_size; i++) {
+                if (s->logits[i] > bestv) { bestv = s->logits[i]; best = i; }
+            }
+            top_idx[rank] = best; top_val[rank] = bestv;
+            s->logits[best] = -1e30f;
+            fprintf(stderr, "[%d:%.4f] ", best, bestv);
+        }
+        for (int rank = 0; rank < 5; rank++)
+            s->logits[top_idx[rank]] = top_val[rank];
+        fprintf(stderr, "\n");
     }
 
     return s->logits;
@@ -8949,6 +9024,7 @@ static void batch_attention_tiled(
 /* ================================================================
  * Device-native batched SSM prefill layer (zero H2D/D2H)
  * ================================================================ */
+#define SSM_DBG_SYNC /* disabled */
 static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
     float *bx, float *bxb, float *bq, float *battn_out, float *bffn_norm,
     float *bgate, float *bup, layer_weights_t *lw, int l,
@@ -8968,36 +9044,251 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
     float *cs_dev=(float*)gw->ssm_conv_state_dev[l];
     float *st_dev=(float*)gw->ssm_state_dev[l];
     if(!cs_dev||!st_dev||!gl->ssm_conv1d||!gl->attn_qkv||!gl->attn_gate_ssm||!gl->ssm_out) return 0;
+    /* do_remap: must match CPU reference (ssm_prefill_layer, ssm_forward, ssm_forward_gpu) */
+    int n_vpk = n_k > 0 ? n_v / n_k : 0, half_vpk = n_vpk / 2;
+    int do_remap = !m->from_safetensors && n_k > 0 && n_k < n_v && half_vpk > 0;
     int ok=1;
-    ok&=picolm_gpu_rmsnorm_batched_dev(bxb,bx,(float*)s->attn_norm_w[l],dim,eps,n_tokens,dev);
-    ok&=picolm_gpu_matmul_dev((picolm_gpu_tensor_t*)gl->attn_qkv,bxb,bx,n_tokens,dev);
-    ok&=picolm_gpu_matmul_dev((picolm_gpu_tensor_t*)gl->attn_gate_ssm,bq,bx,n_tokens,dev);
-    ok&=picolm_gpu_ssm_conv1d_batch_dev(bxb,cs_dev,bxb,(float*)gl->ssm_conv1d,conv_dim,c->ssm_d_conv,n_tokens,dev);
+    /* bffn_norm temporarily holds the RMSNorm'd input until vecdot consumes it.
+     * bxb becomes the Q/K/V-conv working buffer immediately after. */
+    ok&=picolm_gpu_rmsnorm_batched_dev(bffn_norm,bx,(float*)s->attn_norm_w[l],dim,eps,n_tokens,dev);
+    SSM_DBG_SYNC;
+    /* QKV + Z-gate projections (read from RMSNorm'd input) */
+    ok&=picolm_gpu_matmul_dev((picolm_gpu_tensor_t*)gl->attn_qkv,bxb,bffn_norm,n_tokens,dev);
+    SSM_DBG_SYNC;
+    ok&=picolm_gpu_matmul_dev((picolm_gpu_tensor_t*)gl->attn_gate_ssm,bq,bffn_norm,n_tokens,dev);
+    SSM_DBG_SYNC;
+    /* Conv1d + silu (in-place on bxb which has QKV output) */
+    ok&=picolm_gpu_ssm_conv1d_batch_dev(bxb,cs_dev,bxb,(float*)picolm_gpu_tensor_weights((picolm_gpu_tensor_t*)gl->ssm_conv1d),conv_dim,c->ssm_d_conv,n_tokens,dev);
+    SSM_DBG_SYNC;
+    /* L2 norm Q/K */
     if(ok){float qs=1.0f/sqrtf((float)d_state);
       ok&=picolm_gpu_ssm_l2norm_batch_dev(bxb,d_state,n_k,n_tokens,conv_dim,1e-12f,qs,dev);
+    SSM_DBG_SYNC;
       ok&=picolm_gpu_ssm_l2norm_batch_dev(bxb+qk_dim,d_state,n_k,n_tokens,conv_dim,1e-12f,1.0f,dev);}
-    if(ok){int dr=c->n_kv_heads!=c->ssm_dt_rank||c->ssm_n_group!=c->ssm_dt_rank;
-      if(dr&&gw->ssm_head_map_dev)
-        ok&=picolm_gpu_ssm_head_permute_batch_dev(bxb+2*qk_dim,bxb+2*qk_dim,(const int*)gw->ssm_head_map_dev,hvdim,n_v,n_tokens,conv_dim/sizeof(float),dev);}
+    SSM_DBG_SYNC;
+    /* Head permute V. bxb+2*qk_dim can't be permuted into itself --
+     * that races whenever head_map isn't the identity (concurrent
+     * threadblocks, no ordering guarantee, one can overwrite a
+     * position another hasn't read yet). Snapshot it out unaliased
+     * first (identity copy, head_map=NULL), then permute from that
+     * snapshot directly into its real strided destination -- both
+     * steps are the same primitive, so this is "permute" used twice
+     * (once as a plain copy) rather than a permute paired with an
+     * unrelated generic copy kernel. */
+    if(ok&&do_remap&&gw->ssm_head_map_dev){
+      ok&=picolm_gpu_ssm_head_permute_batch_dev(battn_out,bxb+2*qk_dim,NULL,hvdim,n_v,n_tokens,conv_dim,value_dim,dev);
+    SSM_DBG_SYNC;
+      ok&=picolm_gpu_ssm_head_permute_batch_dev(bxb+2*qk_dim,battn_out,(const int*)gw->ssm_head_map_dev,hvdim,n_v,n_tokens,value_dim,conv_dim,dev);}
+    SSM_DBG_SYNC;
+    /* Alpha/beta vecdot (read from RMSNorm'd bffn_norm) */
     if(ok){gguf_type_t at=lw->type_ssm_alpha,bt=lw->type_ssm_beta;
       size_t ra=gguf_type_row_size(at,dim),rb=gguf_type_row_size(bt,dim);
-      if(at!=0&&at!=2&&at!=8)return 0;
-      if(bt!=0&&bt!=2&&bt!=8)return 0;
-      const int *hm=gw->ssm_head_map_dev?(const int*)gw->ssm_head_map_dev:NULL;
-      ok&=picolm_gpu_ssm_vecdot_batch_dev(bgate,bx,(void*)gl->ssm_alpha,at,dim,n_v,n_tokens,(int)ra,hm,dev);
-      ok&=picolm_gpu_ssm_vecdot_batch_dev(bup,bx,(void*)gl->ssm_beta,bt,dim,n_v,n_tokens,(int)rb,hm,dev);}
+      if(at!=0&&at!=2&&at!=8&&at!=30){static int w1=0;if(!w1){fprintf(stderr,"WARN: ssm_prefill_layer_gpu bail: alpha type=%d (need F32/Q4_0/Q8_0/BF16)\n",(int)at);w1=1;}return 0;}
+      if(bt!=0&&bt!=2&&bt!=8&&bt!=30){static int w2=0;if(!w2){fprintf(stderr,"WARN: ssm_prefill_layer_gpu bail: beta type=%d (need F32/Q4_0/Q8_0/BF16)\n",(int)bt);w2=1;}return 0;}
+      const int *hm=do_remap&&gw->ssm_head_map_dev?(const int*)gw->ssm_head_map_dev:NULL;
+      ok&=picolm_gpu_ssm_vecdot_batch_dev(bgate,bffn_norm,(void*)picolm_gpu_tensor_weights((picolm_gpu_tensor_t*)gl->ssm_alpha),at,dim,n_v,n_tokens,(int)ra,hm,dev);
+    SSM_DBG_SYNC;
+      ok&=picolm_gpu_ssm_vecdot_batch_dev(bup,bffn_norm,(void*)picolm_gpu_tensor_weights((picolm_gpu_tensor_t*)gl->ssm_beta),bt,dim,n_v,n_tokens,(int)rb,hm,dev);}
+    SSM_DBG_SYNC;
+#ifdef PICOLM_SSM_VERIFY
+    if(ok && l == 0) {
+        picolm_gpu_sync(dev);
+        float vtmp[8];
+        picolm_gpu_memcpy(vtmp, bgate, sizeof(vtmp), -1, dev);
+        fprintf(stderr, "SSM_VERIFY l=0 gpu alpha_raw[:4]={%.6f,%.6f,%.6f,%.6f}\n",
+            vtmp[0],vtmp[1],vtmp[2],vtmp[3]);
+        picolm_gpu_memcpy(vtmp, bup, sizeof(vtmp), -1, dev);
+        fprintf(stderr, "SSM_VERIFY l=0 gpu beta_raw[:4]={%.6f,%.6f,%.6f,%.6f}\n",
+            vtmp[0],vtmp[1],vtmp[2],vtmp[3]);
+    }
+#endif
+    /* Gate/beta post-process */
     if(ok){float *dw=(float*)gw->ssm_dt_dev[l],*aw=(float*)gw->ssm_a_dev[l];
       if(!dw||!aw)return 0;
       ok&=picolm_gpu_ssm_gate_beta_batch_dev(bgate,bup,bgate,bup,dw,aw,n_v,n_tokens,dev);}
-    if(ok) ok&=picolm_gpu_ssm_chunked_recurrence_dev(bxb,bgate,bup,st_dev,battn_out,n_tokens,value_dim,d_state,n_k,n_v,hvdim,repeat,conv_dim,64,dev);
+    SSM_DBG_SYNC;
+    /* Chunked recurrence */
+    if(ok){
+        ok&=picolm_gpu_ssm_chunked_recurrence_dev(bxb,bgate,bup,st_dev,battn_out,n_tokens,value_dim,d_state,n_k,n_v,hvdim,repeat,conv_dim,64,dev);
+    SSM_DBG_SYNC;
+        if(ok && getenv("PICOLM_SSM_VERIFY") && (l%16==0)) {
+            /* D2H GPU recurrence output and compare with CPU reference */
+            size_t xb2_bytes=(size_t)n_tokens*value_dim*sizeof(float);
+            float *xb2_gpu=(float*)malloc(xb2_bytes);
+            float *xb2_cpu=(float*)calloc(n_tokens*value_dim,sizeof(float));
+            if(xb2_gpu&&xb2_cpu){
+                picolm_gpu_sync(dev);
+                picolm_gpu_memcpy(xb2_gpu,battn_out,xb2_bytes,0,dev);
+                /* Run CPU recurrence on same inputs */
+                size_t cb=(size_t)n_tokens*conv_dim*sizeof(float);
+                size_t ab=(size_t)n_tokens*n_v*sizeof(float);
+                float *ch=(float*)malloc(cb),*ah=(float*)malloc(ab),*bh=(float*)malloc(ab);
+                if(ch&&ah&&bh){
+                    picolm_gpu_memcpy(ch,bxb,cb,0,dev);
+                    picolm_gpu_memcpy(ah,bgate,ab,0,dev);
+                    picolm_gpu_memcpy(bh,bup,ab,0,dev);
+                    float *sh=(float*)calloc(n_v*d_state*d_state,sizeof(float));
+                    ssm_chunked_recurrence(ch,ah,bh,sh,xb2_cpu,n_tokens,value_dim,d_state,n_k,n_v,hvdim,repeat,conv_dim,m->ssm_chunk_size);
+                    free(sh);
+                    /* Compare */
+                    float maxd=0;
+                    for(int i=0;i<n_tokens*value_dim;i++){float d=xb2_gpu[i]-xb2_cpu[i];if(d<0)d=-d;if(d>maxd)maxd=d;}
+                    double gr=0,cr=0;
+                    for(int i=0;i<n_tokens*value_dim;i++){gr+=xb2_gpu[i]*xb2_gpu[i];cr+=xb2_cpu[i]*xb2_cpu[i];}
+                    fprintf(stderr,"[DBG] l=0 GPU vs CPU rec: max_diff=%.6e gpu_rms=%.6e cpu_rms=%.6e\n",
+                        maxd, sqrt(gr/(n_tokens*value_dim)), sqrt(cr/(n_tokens*value_dim)));
+                }
+                free(ch);free(ah);free(bh);
+            }
+            free(xb2_gpu);free(xb2_cpu);
+        }
+    }
+    if(ok && l == 0 && getenv("PICOLM_SSM_VERIFY")) {
+        picolm_gpu_sync(dev);
+        /* D2H the conv_batch from device, run host-facing GPU recurrence, compare xb2 */
+        size_t conv_bytes = (size_t)n_tokens * conv_dim * sizeof(float);
+        float *conv_h = (float *)malloc(conv_bytes);
+        size_t alpha_bytes = (size_t)n_tokens * n_v * sizeof(float);
+        float *alpha_h = (float *)malloc(alpha_bytes);
+        float *beta_h = (float *)malloc(alpha_bytes);
+        size_t state_bytes = (size_t)n_v * d_state * d_state * sizeof(float);
+        float *state_h = (float *)malloc(state_bytes);
+        if (conv_h && alpha_h && beta_h && state_h) {
+            picolm_gpu_memcpy(conv_h, bxb, conv_bytes, -1, dev);
+            picolm_gpu_memcpy(alpha_h, bgate, alpha_bytes, -1, dev);
+            picolm_gpu_memcpy(beta_h, bup, alpha_bytes, -1, dev);
+            picolm_gpu_memcpy(state_h, st_dev, state_bytes, -1, dev);
+            /* Save dev xb2 for comparison */
+            size_t xb2_sz = (size_t)n_tokens * value_dim * sizeof(float);
+            float *xb2_dev = (float *)malloc(xb2_sz);
+            picolm_gpu_memcpy(xb2_dev, battn_out, xb2_sz, -1, dev);
+            /* Run host-facing GPU recurrence */
+            float *xb2_host = (float *)calloc(n_tokens * value_dim, sizeof(float));
+            if (xb2_host) {
+                picolm_gpu_ssm_chunked_recurrence(conv_h, alpha_h, beta_h, state_h, xb2_host,
+                    n_tokens, value_dim, d_state, n_k, n_v, hvdim, repeat, conv_dim, 64, dev);
+                float max_diff = 0;
+                for (int i = 0; i < n_tokens * value_dim; i++) {
+                    float d = fabsf(xb2_dev[i] - xb2_host[i]);
+                    if (d > max_diff) max_diff = d;
+                }
+                fprintf(stderr, "SSM_VERIFY l=0 dev_vs_host xb2_max_diff=%.6e\n", max_diff);
+                fprintf(stderr, "SSM_VERIFY l=0 dev xb2[:4]={%.6f,%.6f,%.6f,%.6f}\n",
+                    xb2_dev[0],xb2_dev[1],xb2_dev[2],xb2_dev[3]);
+                fprintf(stderr, "SSM_VERIFY l=0 host xb2[:4]={%.6f,%.6f,%.6f,%.6f}\n",
+                    xb2_host[0],xb2_host[1],xb2_host[2],xb2_host[3]);
+                /* Per-token RMS comparison */
+                fprintf(stderr, "SSM_VERIFY l=0 dev_per_token RMS:");
+                for(int t=0;t<3;t++){double r=0;for(int i=0;i<value_dim;i++) r+=xb2_dev[t*value_dim+i]*xb2_dev[t*value_dim+i];fprintf(stderr," t%d=%.4e",t,sqrt(r/value_dim));}
+                fprintf(stderr,"\n");
+                fprintf(stderr, "SSM_VERIFY l=0 host_per_token RMS:");
+                for(int t=0;t<3;t++){double r=0;for(int i=0;i<value_dim;i++) r+=xb2_host[t*value_dim+i]*xb2_host[t*value_dim+i];fprintf(stderr," t%d=%.4e",t,sqrt(r/value_dim));}
+                fprintf(stderr,"\n");
+                free(xb2_host);
+            }
+            free(xb2_dev);
+        }
+        free(conv_h); free(alpha_h); free(beta_h); free(state_h);
+    }
+    if(ok && l == 0 && getenv("PICOLM_SSM_VERIFY")) {
+        picolm_gpu_sync(dev);
+        size_t st_sz = (size_t)n_v * d_state * d_state * sizeof(float);
+        float *st_gpu = (float *)malloc(st_sz);
+        if (st_gpu) {
+            picolm_gpu_memcpy(st_gpu, st_dev, st_sz, -1, dev);
+            fprintf(stderr, "SSM_VERIFY l=0 gpu_state[0][0][:4]={");
+            for (int i = 0; i < 4; i++) fprintf(stderr, "%s%.6f", i ? ", " : "", st_gpu[i]);
+            fprintf(stderr, "}\n");
+        }
+        free(st_gpu);
+        /* Dump xb2 */
+        size_t xb2_sz = (size_t)n_tokens * value_dim * sizeof(float);
+        float *xb2_gpu = (float *)malloc(xb2_sz);
+        if (xb2_gpu) {
+            picolm_gpu_memcpy(xb2_gpu, battn_out, xb2_sz, -1, dev);
+            int lt = n_tokens - 1;
+            fprintf(stderr, "SSM_VERIFY l=0 gpu xb2_last[:8]={");
+            for (int i = 0; i < 8; i++) fprintf(stderr, "%s%.6f", i ? ", " : "", xb2_gpu[lt * value_dim + i]);
+            fprintf(stderr, "}\n");
+            free(xb2_gpu);
+        }
+        /* Dump post-ssm_out bx (last token) */
+        float tmp8[8];
+        picolm_gpu_memcpy(tmp8, bx + (size_t)(n_tokens-1)*dim, sizeof(tmp8), -1, dev);
+        fprintf(stderr, "SSM_VERIFY l=0 gpu bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n",
+            tmp8[0],tmp8[1],tmp8[2],tmp8[3]);
+        /* Dump ssm_out matmul output (in bffn_norm, last token) */
+        float ssm_out8[8];
+        picolm_gpu_memcpy(ssm_out8, bffn_norm + (size_t)(n_tokens-1)*dim, sizeof(ssm_out8), -1, dev);
+        fprintf(stderr, "SSM_VERIFY l=0 gpu ssm_out_last[:4]={%.6f,%.6f,%.6f,%.6f}\n",
+            ssm_out8[0],ssm_out8[1],ssm_out8[2],ssm_out8[3]);
+        /* Dump gate_log (bgate) and beta (bup) for first 4 heads */
+        float vtmp[8];
+        picolm_gpu_memcpy(vtmp, bgate, sizeof(vtmp), -1, dev);
+        fprintf(stderr, "SSM_VERIFY l=0 gpu gate_log[:4]={%.6f,%.6f,%.6f,%.6f}\n",
+            vtmp[0],vtmp[1],vtmp[2],vtmp[3]);
+        picolm_gpu_memcpy(vtmp, bup, sizeof(vtmp), -1, dev);
+        fprintf(stderr, "SSM_VERIFY l=0 gpu beta[:4]={%.6f,%.6f,%.6f,%.6f}\n",
+            vtmp[0],vtmp[1],vtmp[2],vtmp[3]);
+        /* Dump raw vecdot output (before gate/beta post-process) */
+        /* Need to dump before gate_beta modifies bgate. Move earlier. */
+    }
     if(ok){float *nw=(float*)gw->ssm_norm_dev[l];
       if(!nw)return 0;
       ok&=picolm_gpu_ssm_prefill_gated_norm_dev(battn_out,bq,nw,hvdim,n_v,n_tokens,eps,dev);}
-    if(ok) ok&=picolm_gpu_matmul_dev((picolm_gpu_tensor_t*)gl->ssm_out,bx,battn_out,n_tokens,dev);
+    SSM_DBG_SYNC;
+    /* Output projection: reuse bffn_norm as temp, then residual add into bx */
+    if(ok && l == 0 && getenv("PICOLM_SSM_VERIFY")) {
+        picolm_gpu_sync(dev);
+        size_t xb2_all_sz = (size_t)n_tokens * value_dim * sizeof(float);
+        float *xb2_all = (float *)malloc(xb2_all_sz);
+        if (xb2_all) {
+            picolm_gpu_memcpy(xb2_all, battn_out, xb2_all_sz, -1, dev);
+            fprintf(stderr, "SSM_VERIFY l=0 gpu xb2 per-token (RMS, maxabs):");
+            for (int t = 0; t < n_tokens; t++) {
+                double xrms = 0, maxa = 0;
+                for (int i = 0; i < value_dim; i++) {
+                    double v = xb2_all[t*value_dim+i];
+                    xrms += v*v;
+                    double av = v < 0 ? -v : v;
+                    if (av > maxa) maxa = av;
+                }
+                if (t < 5 || t == n_tokens-1)
+                    fprintf(stderr, " t%d=(%.4e,%.4e)", t, sqrt(xrms/value_dim), maxa);
+            }
+            fprintf(stderr, "\n");
+            free(xb2_all);
+        }
+    }
+    if(ok){
+      ok&=picolm_gpu_matmul_dev((picolm_gpu_tensor_t*)gl->ssm_out,bffn_norm,battn_out,n_tokens,dev);
+    SSM_DBG_SYNC;
+      if(getenv("PICOLM_SSM_VERIFY") && (l%16==0)) {
+          picolm_gpu_sync(dev);
+          float so[4]; picolm_gpu_memcpy(so,bffn_norm+(size_t)(n_tokens-1)*dim,16,0,dev);
+          fprintf(stderr,"[DBG] ssm_out_last l=%d: {%.6f,%.6f,%.6f,%.6f}\n",l,so[0],so[1],so[2],so[3]);
+      }
+      if(l == 0 && getenv("PICOLM_SSM_VERIFY")) {
+          size_t dim_sz = (size_t)dim * sizeof(float);
+          float *out_cpu = (float *)malloc(dim_sz);
+          if (out_cpu) {
+              picolm_gpu_sync(dev);
+              picolm_gpu_memcpy(out_cpu, bffn_norm + (size_t)(n_tokens-1)*dim, dim_sz, -1, dev);
+              double orm = 0; for(int i=0;i<dim;i++) orm+=out_cpu[i]*out_cpu[i];
+              fprintf(stderr, "SSM_VERIFY l=0 gpu ssm_out_rms=%.6e\n", sqrt(orm/dim));
+              free(out_cpu);
+          }
+      }
+      ok&=picolm_gpu_residual_add(bx,bx,bffn_norm,n_tokens*dim,dev);}
+    SSM_DBG_SYNC;
+    /* FFN */
     if(ok&&lw->ffn_gate&&lw->ffn_up&&lw->ffn_down){
       ok&=picolm_gpu_rmsnorm_batched_dev(bffn_norm,bx,(float*)s->post_attn_norm_w[l],dim,eps,n_tokens,dev);
+    SSM_DBG_SYNC;
       ok&=picolm_gpu_expert_mlp_dev((picolm_gpu_tensor_t*)gl->ffn_gate,(picolm_gpu_tensor_t*)gl->ffn_up,(picolm_gpu_tensor_t*)gl->ffn_down,battn_out,bffn_norm,n_tokens,dev);
+    SSM_DBG_SYNC;
       ok&=picolm_gpu_residual_add(bx,bx,battn_out,n_tokens*dim,dev);}
+    SSM_DBG_SYNC;
     return ok;
 #else
     (void)m;(void)s;(void)bx;(void)bxb;(void)bq;(void)battn_out;(void)bffn_norm;
@@ -9319,6 +9610,15 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
     {
         if (n_tokens > 1) {
             int chunked_gpu_done = 0;
+#ifdef PICOLM_SSM_VERIFY
+            /* Save state+xb2 before GPU modifies them */
+            size_t xb2_sz = (size_t)n_tokens * value_dim * sizeof(float);
+            size_t st_sz = (size_t)n_v_heads * d_state * d_state * sizeof(float);
+            float *xb2_pre = malloc(xb2_sz);
+            float *st_pre = malloc(st_sz);
+            if (xb2_pre) memcpy(xb2_pre, xb2_batch, xb2_sz);
+            if (st_pre) memcpy(st_pre, state, st_sz);
+#endif
 #ifdef PICOLM_GPU
             if (gpu_lw) {
                 chunked_gpu_done = picolm_gpu_ssm_chunked_recurrence(
@@ -9337,6 +9637,47 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
                     d_state, n_k_heads, n_v_heads, head_v_dim, repeat,
                     conv_dim, m->ssm_chunk_size);
             }
+#ifdef PICOLM_SSM_VERIFY
+            if (xb2_pre && st_pre && chunked_gpu_done) {
+                /* GPU ran via host-facing wrapper. Restore state, run CPU, compare.
+                 * Only verify first SSM layer to keep overhead low. */
+                static int verify_cnt = 0;
+                if (++verify_cnt <= 3) {
+                    float *xb2_cpu = malloc(xb2_sz);
+                    if (xb2_cpu) {
+                        memcpy(state, st_pre, st_sz);
+                        ssm_chunked_recurrence(
+                            conv_batch, alpha_batch, beta_batch,
+                            state, xb2_cpu,
+                            n_tokens, value_dim,
+                            d_state, n_k_heads, n_v_heads, head_v_dim, repeat,
+                            conv_dim, m->ssm_chunk_size);
+                        float max_diff = 0;
+                        for (int i = 0; i < n_tokens * value_dim; i++) {
+                            float d = fabsf(xb2_batch[i] - xb2_cpu[i]);
+                            if (d > max_diff) max_diff = d;
+                        }
+                        fprintf(stderr, "SSM_VERIFY l=%d xb2_max_diff=%.6e\n", l, max_diff);
+                        if (l == 0) {
+                            fprintf(stderr, "SSM_VERIFY l=0 cpu_xb2[:8]={");
+                            for (int i = 0; i < 8; i++) fprintf(stderr, "%s%.6f", i ? ", " : "", xb2_cpu[i]);
+                            fprintf(stderr, "}\n");
+                            fprintf(stderr, "SSM_VERIFY l=0 gpu_xb2[:8]={");
+                            for (int i = 0; i < 8; i++) fprintf(stderr, "%s%.6f", i ? ", " : "", xb2_batch[i]);
+                            fprintf(stderr, "}\n");
+                            /* Dump post-ssm_out bx (residual target) from CPU path */
+                            fprintf(stderr, "SSM_VERIFY l=0 cpu_post_out xb2_batch_last[:8]={");
+                            int lt = n_tokens - 1;
+                            for (int i = 0; i < 8; i++) fprintf(stderr, "%s%.6f", i ? ", " : "", xb2_batch[lt * xb2_stride + i]);
+                            fprintf(stderr, "}\n");
+                        }
+                    }
+                    free(xb2_cpu);
+                }
+            }
+            free(xb2_pre);
+            free(st_pre);
+#endif
         } else {
             /* Single token: use the standard per-token path */
             float *ssm_output = (float *)malloc((size_t)d_state * n_v_heads * sizeof(float));
@@ -9511,7 +9852,25 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
             for (int d = 0; d < dim; d++) a[d] += b[d];
         }
     }
-
+#ifdef PICOLM_SSM_VERIFY
+    if (l == 0 && getenv("PICOLM_SSM_VERIFY")) {
+        int lt = n_tokens - 1;
+        fprintf(stderr, "SSM_VERIFY l=0 cpu bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n",
+            x_batch[lt*dim], x_batch[lt*dim+1], x_batch[lt*dim+2], x_batch[lt*dim+3]);
+        /* Dump RMS of xb2 (last token) for input comparison */
+        { double xrms = 0;
+          for(int i = 0; i < value_dim; i++) xrms += xb2_batch[lt*xb2_stride+i]*xb2_batch[lt*xb2_stride+i];
+          fprintf(stderr, "SSM_VERIFY l=0 cpu xb2_rms=%.6e\n", sqrt(xrms/value_dim)); }
+        /* Dump ssm_out matmul output for last token */
+        { float *ssm_out_buf = (float *)malloc((size_t)n_tokens * dim * sizeof(float));
+          matmul_batch(ssm_out_buf, xb2_batch, n_tokens, lw->ssm_out, value_dim, dim, lw->type_ssm_out);
+          double orm = 0; for(int i=0;i<dim;i++) orm+=ssm_out_buf[lt*dim+i]*ssm_out_buf[lt*dim+i];
+          fprintf(stderr, "SSM_VERIFY l=0 cpu ssm_out_rms=%.6e\n", sqrt(orm/dim));
+          fprintf(stderr, "SSM_VERIFY l=0 cpu ssm_out_last[:4]={%.6f,%.6f,%.6f,%.6f}\n",
+              ssm_out_buf[lt*dim],ssm_out_buf[lt*dim+1],ssm_out_buf[lt*dim+2],ssm_out_buf[lt*dim+3]);
+          free(ssm_out_buf); }
+    }
+#endif
     free(ssm_buf);
 }
 
@@ -10904,7 +11263,7 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
                 if (!w2) { fprintf(stderr, "WARN: SSM prefill GPU->hybrid CPU\n"); w2 = 1; }
                 size_t batch_bytes = (size_t)n_tokens * dim * sizeof(float);
                 picolm_gpu_sync(gpu_dev);
-                picolm_gpu_memcpy(s->x, bx, batch_bytes, 0, gpu_dev);
+                picolm_gpu_memcpy(s->x, bx, batch_bytes, -1, gpu_dev);
                 { int xb2s=dim;if(c->ssm_d_inner>dim)xb2s=c->ssm_d_inner;
                   int fs=n_ffn,md=c->n_heads*2*c->head_dim;if(dim>md)md=dim;
                   int kd=c->n_kv_heads*c->head_dim,qf=c->n_heads*2*c->head_dim;
@@ -10920,19 +11279,54 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
                   memcpy(s->x,xb,batch_bytes);
                   picolm_gpu_memcpy(bx,s->x,batch_bytes,1,gpu_dev);free(buf);}
             }
+            if(getenv("PICOLM_SSM_VERIFY") && (l%16==0||l==47)){
+                size_t bsz=(size_t)n_tokens*dim*sizeof(float);
+                float *bx_tmp=(float*)malloc(bsz);
+                if(bx_tmp){picolm_gpu_sync(gpu_dev);picolm_gpu_memcpy(bx_tmp,bx,bsz,0,gpu_dev);
+                    double r=0;for(int i=0;i<n_tokens*dim;i++)r+=bx_tmp[i]*bx_tmp[i];
+                    int nan=0;for(int i=0;i<n_tokens*dim;i++) if(isnanf(bx_tmp[i]))nan++;
+                    fprintf(stderr,"[DBG] bx_rms after l=%d: %.6e nan=%d\n",l,sqrt(r/(n_tokens*dim)),nan);free(bx_tmp);}}
             continue;
         }
 
         /* A. RMSNorm batched: one launch for all n_tokens */
-
+#ifdef PICOLM_SSM_VERIFY
+        if (l == 0 || l == 47 || l == 59 || l == 64) {
+            float tmp8[8];
+            picolm_gpu_sync(gpu_dev);
+            picolm_gpu_memcpy(tmp8, bx, sizeof(tmp8), -1, gpu_dev);
+            int bn=0; for(int i=0;i<8;i++) if(isnanf(tmp8[i])) bn++;
+            fprintf(stderr, "SSM_VERIFY attn_pre l=%d bx_first[:4]={%.4f,%.4f,%.4f,%.4f} nan=%d\n",
+                l, tmp8[0],tmp8[1],tmp8[2],tmp8[3],bn);
+            float tmpl[8];
+            picolm_gpu_memcpy(tmpl, bx + (size_t)(n_tokens-1)*dim, sizeof(tmpl), -1, gpu_dev);
+            fprintf(stderr, "SSM_VERIFY attn_pre l=%d bx_last[:4]={%.4f,%.4f,%.4f,%.4f}\n",
+                l, tmpl[0],tmpl[1],tmpl[2],tmpl[3]);
+        }
+#endif
         picolm_gpu_rmsnorm_batched_dev(bxb, bx,
                                         (float *)gw->attn_norm_dev[l],
                                         dim, c->rms_norm_eps, n_tokens, gpu_dev);
+#ifdef PICOLM_SSM_VERIFY
+        if (l == 48 || l == 64) {
+            float tmp8[8];
+            picolm_gpu_sync(gpu_dev);
+            picolm_gpu_memcpy(tmp8, bxb, sizeof(tmp8), -1, gpu_dev);
+            int bn=0; for(int i=0;i<8;i++) if(isnanf(tmp8[i])) bn++;
+            fprintf(stderr, "SSM_VERIFY attn_rms l=%d bxb[:4]={%.4f,%.4f,%.4f,%.4f} nan=%d\n",
+                l, tmp8[0],tmp8[1],tmp8[2],tmp8[3],bn);
+        }
+#endif
 
         /* B. Q projection: bq = attn_q @ bxb (S=n_tokens)
          * For SSM models this writes q_full_dim = 2*q_dim per token. */
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
                                bq, bxb, n_tokens, gpu_dev);
+
+        if(getenv("PICOLM_SSM_VERIFY") && l==64){
+            float bq_last[4]; picolm_gpu_sync(gpu_dev);
+            picolm_gpu_memcpy(bq_last, bq+(size_t)(n_tokens-1)*n_heads*2*head_dim, 16, -1, gpu_dev);
+            fprintf(stderr,"[DBG] bq_last l=64[:4]={%.6f,%.6f,%.6f,%.6f}\n",bq_last[0],bq_last[1],bq_last[2],bq_last[3]);}
 
         /* B1. For SSM models: de-interleave Q+gate from bq.
          * After this, bq holds compacted Q[q_dim] per token,
@@ -10950,12 +11344,13 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
         }
 
         /* C. K projection: bk = attn_k @ bxb */
-        picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_k,
-                               bk, bxb, n_tokens, gpu_dev);
+        int k_ok = picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_k, bk, bxb, n_tokens, gpu_dev);
+
 
         /* D. V projection: bv = attn_v @ bxb */
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_v,
                                bv, bxb, n_tokens, gpu_dev);
+
 
         /* D1. QK-norm (Qwen3): per-head RMSNorm on Q and K (batched over S).
          * bq is [S][n_heads][head_dim], weight is [head_dim].
@@ -10987,6 +11382,13 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
                                          bk, n_kv_heads, head_dim, seq_len, gpu_dev);
         picolm_gpu_kv_store_dev_batched(0, this_attn_ordinal, start_pos, n_tokens,
                                          bv, n_kv_heads, head_dim, seq_len, gpu_dev);
+        if(getenv("PICOLM_SSM_VERIFY") && l == 64){
+            float bk_sample[4];
+            picolm_gpu_sync(gpu_dev);
+            picolm_gpu_memcpy(bk_sample, bk, 16, -1, gpu_dev);
+            fprintf(stderr,"[DBG] K_f32 l=64 token0[:4]={%.6f,%.6f,%.6f,%.6f}\n",
+                bk_sample[0],bk_sample[1],bk_sample[2],bk_sample[3]);
+        }
         this_attn_ordinal++;
 
         /* H. Attention prefill: battn_out = attn_prefill(bq) */
@@ -10994,6 +11396,9 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
                                           this_attn_ordinal - 1, start_pos, n_tokens,
                                           n_heads, n_kv_heads, head_dim,
                                           seq_len, gpu_dev);
+        if(getenv("PICOLM_SSM_VERIFY") && l==64){
+            float aol[4]; picolm_gpu_sync(gpu_dev); picolm_gpu_memcpy(aol, battn_out+(size_t)(n_tokens-1)*n_heads*head_dim, 16, -1, gpu_dev);
+            fprintf(stderr,"[DBG] attn_raw l=64 last[:4]={%.6f,%.6f,%.6f,%.6f}\n",aol[0],aol[1],aol[2],aol[3]);}
 
         /* H1. For SSM models: apply gate sigmoid to attention output. */
         if (c->has_ssm) {
@@ -11001,13 +11406,25 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
             picolm_gpu_sigmoid_mul_batched_dev(battn_out, bgate,
                                                 q_dim, n_tokens, gpu_dev);
         }
+        if(getenv("PICOLM_SSM_VERIFY") && l==64){
+            float ao[4], aol[4]; picolm_gpu_sync(gpu_dev); picolm_gpu_memcpy(ao, battn_out, 16, -1, gpu_dev);
+            picolm_gpu_memcpy(aol, battn_out+(size_t)(n_tokens-1)*n_heads*2*head_dim, 16, -1, gpu_dev);
+            fprintf(stderr,"[DBG] attn_gate l=64 first[:4]={%.6f,%.6f,%.6f,%.6f} last[:4]={%.6f,%.6f,%.6f,%.6f}\n",
+                ao[0],ao[1],ao[2],ao[3], aol[0],aol[1],aol[2],aol[3]);}
 
         /* I. Output projection: bxb = attn_output @ battn_out */
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_output,
                                bxb, battn_out, n_tokens, gpu_dev);
 
+        if(getenv("PICOLM_SSM_VERIFY") && l==64){
+            float oo[4]; picolm_gpu_sync(gpu_dev); picolm_gpu_memcpy(oo, bxb+(size_t)(n_tokens-1)*dim, 16, -1, gpu_dev);
+            fprintf(stderr,"[DBG] outproj l=64 last[:4]={%.6f,%.6f,%.6f,%.6f}\n",oo[0],oo[1],oo[2],oo[3]);}
+
         /* J. Residual add: bx += bxb (batched, single launch) */
         picolm_gpu_residual_add(bx, bx, bxb, n_tokens * dim, gpu_dev);
+        if(getenv("PICOLM_SSM_VERIFY") && l==64){
+            float rx[4]; picolm_gpu_sync(gpu_dev); picolm_gpu_memcpy(rx, bx+(size_t)(n_tokens-1)*dim, 16, -1, gpu_dev);
+            fprintf(stderr,"[DBG] resid l=64 bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n",rx[0],rx[1],rx[2],rx[3]);}
 
         /* K. FFN: rmsnorm (batched) */
         picolm_gpu_rmsnorm_batched_dev(bffn_norm, bx,
@@ -11031,13 +11448,24 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
 
         /* FFN residual: bx += bxb (batched, single launch) */
         picolm_gpu_residual_add(bx, bx, bxb, n_tokens * dim, gpu_dev);
+        if(getenv("PICOLM_SSM_VERIFY") && (l==48||l==56||l==64)){
+            float tmp[4]; picolm_gpu_sync(gpu_dev);
+            picolm_gpu_memcpy(tmp,bx+(size_t)(n_tokens-1)*dim,16,0,gpu_dev);
+            fprintf(stderr,"[DBG] attn_post l=%d bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n",l,tmp[0],tmp[1],tmp[2],tmp[3]);
+        }
     }
 
     /* 3. Final rmsnorm + sync + D2H + host lm_head matmul */
     {
         float *last_x = bx + (size_t)(n_tokens - 1) * dim;
         picolm_gpu_sync(gpu_dev);
-        picolm_gpu_memcpy(s->x, last_x, dim * sizeof(float), 0, gpu_dev);
+        picolm_gpu_memcpy(s->x, last_x, dim * sizeof(float), -1, gpu_dev);
+        if(getenv("PICOLM_SSM_VERIFY")){
+            fprintf(stderr,"[DBG] prefill_last x[:4]={%.6f,%.6f,%.6f,%.6f}\n",
+                s->x[0],s->x[1],s->x[2],s->x[3]);
+            double r=0;for(int i=0;i<dim;i++)r+=s->x[i]*s->x[i];
+            fprintf(stderr,"[DBG] prefill_last x_rms=%.6e\n",sqrt(r/dim));
+        }
     }
 
     rmsnorm(s->x, s->x, s->output_norm_w, dim, c->rms_norm_eps);

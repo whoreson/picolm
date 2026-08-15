@@ -318,7 +318,7 @@ int picolm_gpu_ssm_head_permute_batch_dev(float *dst, const float *src,
                                            const int *head_map,
                                            int head_dim, int n_heads,
                                            int n_tokens, int src_stride,
-                                           int device);
+                                           int dst_stride, int device);
 int picolm_gpu_ssm_gate_beta_batch_dev(float *gate_exp_out, float *beta_out,
                                         const float *alpha_in, const float *beta_in,
                                         const float *dt_w, const float *a_w,
@@ -452,8 +452,7 @@ int picolm_gpu_pipeline_alloc(int dim, int q_dim, int kv_dim, int ffn_hidden, in
 
 /* Allocate prefill batch pipeline buffers: [max_seq_len][dim] for S>1.
  * Same shape as pipeline_alloc but sized for batched prefill. */
-int picolm_gpu_pipeline_batch_alloc(int dim, int q_dim, int kv_dim, int ffn_hidden,
-                                     int max_seq_len, int device);
+/* (declaration moved to model.c to avoid nvcc extern "C" overload confusion) */
 
 /* Allocate SSM-specific pipeline buffers for hybrid SSM+attention layers.
  * Called after picolm_gpu_pipeline_alloc succeeds for SSM-eligible models.
@@ -463,6 +462,7 @@ int picolm_gpu_ssm_pipeline_alloc(int conv_dim, int ssm_d_inner, int n_v_heads, 
 
 /* Free all pipeline buffers on all devices. */
 void picolm_gpu_pipeline_free(void);
+int picolm_gpu_prealloc_q8(size_t max_xq_bytes, size_t max_xd_bytes, int device);
 
 /* Accessors for the pipeline buffers -- gpu_device_ctx_t is file-static
  * to backend_gpu.cu, so model.c reaches the buffers through these rather
