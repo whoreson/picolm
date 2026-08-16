@@ -7333,9 +7333,9 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
             ssm_qkv_gate_dev_scratch_ensure(m->gpu.device, xb_bytes, qkv_bytes, gate_bytes) &&
             picolm_gpu_memcpy(g_ssm_mm_xb_dev, s->xb, xb_bytes, 1, m->gpu.device) &&
             picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_qkv,
-                                   g_ssm_mm_qkv_dev, g_ssm_mm_xb_dev, 1, m->gpu.device) &&
+                                   g_ssm_mm_qkv_dev, g_ssm_mm_xb_dev, 1, m->gpu.device, 0, 0) &&
             picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_gate_ssm,
-                                   g_ssm_mm_gate_dev, g_ssm_mm_xb_dev, 1, m->gpu.device) &&
+                                   g_ssm_mm_gate_dev, g_ssm_mm_xb_dev, 1, m->gpu.device, 0, 0) &&
             picolm_gpu_sync(m->gpu.device) &&
             picolm_gpu_memcpy(s->q, g_ssm_mm_qkv_dev, qkv_bytes, -1, m->gpu.device) &&
             picolm_gpu_memcpy(s->xb2, g_ssm_mm_gate_dev, gate_bytes, -1, m->gpu.device)) {
@@ -7738,7 +7738,7 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
             ssm_out_dev_scratch_ensure(m->gpu.device, in_bytes, out_bytes) &&
             picolm_gpu_memcpy(g_ssm_mm_outin_dev, ssm_out_src, in_bytes, 1, m->gpu.device) &&
             picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ssm_out,
-                                   g_ssm_mm_outres_dev, g_ssm_mm_outin_dev, 1, m->gpu.device) &&
+                                   g_ssm_mm_outres_dev, g_ssm_mm_outin_dev, 1, m->gpu.device, 0, 0) &&
             picolm_gpu_sync(m->gpu.device) &&
             picolm_gpu_memcpy(residual, g_ssm_mm_outres_dev, out_bytes, -1, m->gpu.device)) {
             ssm_out_gpu_done = 1;
@@ -7899,11 +7899,11 @@ ssm_forward_gpu(model_t *m, run_state_t *s, float *x, float *residual,
 
     /* 2. QKV projection: ssm_qkv_raw = attn_qkv @ pipe_xb */
     if (!picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_qkv,
-            ssm_qkv_raw, pipe_xb, 1, device)) return 0;
+            ssm_qkv_raw, pipe_xb, 1, device, 0, 0)) return 0;
 
     /* 3. Z gate: ssm_xb2 = attn_gate_ssm @ pipe_xb */
     if (!picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_gate_ssm,
-            ssm_xb2, pipe_xb, 1, device)) return 0;
+            ssm_xb2, pipe_xb, 1, device, 0, 0)) return 0;
 
     /* 3b. Head permute xb2 (GGUF v-head reorder) */
     float *xb2_src = ssm_xb2;
@@ -8065,7 +8065,7 @@ ssm_forward_gpu(model_t *m, run_state_t *s, float *x, float *residual,
 
     /* 14. SSM output projection: pipe_xb = ssm_out @ ssm_final_output */
     if (!picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ssm_out,
-            pipe_xb, ssm_final_output, 1, device)) {
+            pipe_xb, ssm_final_output, 1, device, 0, 0)) {
         fprintf(stderr, "FATAL: GPU SSM output projection failed for layer %d, pos %d.\n", il, pos);
         abort();
     }
@@ -9056,24 +9056,52 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
     int n_vpk = n_k > 0 ? n_v / n_k : 0, half_vpk = n_vpk / 2;
     int do_remap = !m->from_safetensors && n_k > 0 && n_k < n_v && half_vpk > 0;
     int ok=1;
+    /* Pipe buffer stride: matches pipeline_batch_alloc */
+    int xb2_stride = c->n_heads * c->head_dim * (c->has_ssm ? 2 : 1);
     /* bffn_norm temporarily holds the RMSNorm'd input until vecdot consumes it.
      * bxb becomes the Q/K/V-conv working buffer immediately after. */
+
+    /* Per-step diagnostic: dump last token RMS to compare GPU vs CPU */
+    #define _DBG_RMS(name, ptr, stride) do { \
+        if (l == 0) { \
+            float _rms=0; float _v[8]; \
+            picolm_gpu_memcpy(_v, ptr + (size_t)(n_tokens-1) * stride, 32, -1, dev); \
+            for (int _i=0;_i<8;_i++) _rms += _v[_i]*_v[_i]; \
+            _rms = sqrtf(_rms/8); \
+            fprintf(stderr, "[DBG l%d] %s rms_last=%.6f {%.6f %.6f %.6f %.6f}\n", l, name, _rms, _v[0],_v[1],_v[2],_v[3]); \
+        } \
+    } while(0)
+
     ok&=picolm_gpu_rmsnorm_batched_dev(bffn_norm,bx,(float*)s->attn_norm_w[l],dim,eps,n_tokens,dev);
     SSM_DBG_SYNC;
+    _DBG_RMS("rmsnorm",bffn_norm,dim);
     /* QKV + Z-gate projections (read from RMSNorm'd input) */
-    ok&=picolm_gpu_matmul_dev((picolm_gpu_tensor_t*)gl->attn_qkv,bxb,bffn_norm,n_tokens,dev);
+    ok&=picolm_gpu_matmul_dev((picolm_gpu_tensor_t*)gl->attn_qkv,bxb,bffn_norm,n_tokens,dev,xb2_stride,0);
     SSM_DBG_SYNC;
-    ok&=picolm_gpu_matmul_dev((picolm_gpu_tensor_t*)gl->attn_gate_ssm,bq,bffn_norm,n_tokens,dev);
+    _DBG_RMS("qkv",bxb,xb2_stride);
+    ok&=picolm_gpu_matmul_dev((picolm_gpu_tensor_t*)gl->attn_gate_ssm,bq,bffn_norm,n_tokens,dev,xb2_stride,0);
     SSM_DBG_SYNC;
+    _DBG_RMS("gate",bq,xb2_stride);
+    /* Dump conv1d weight for debugging */
+    if (l == 0) {
+        float cw[16], cs[12];
+        picolm_gpu_memcpy(cw, gw->ssm_conv1d_dev[l], 64, -1, dev);
+        fprintf(stderr, "[DBG l0] conv1d_w[0][:4]={%.6f,%.6f,%.6f,%.6f} w[1][:4]={%.6f,%.6f,%.6f,%.6f}\n", cw[0],cw[1],cw[2],cw[3],cw[4],cw[5],cw[6],cw[7]);
+        picolm_gpu_memcpy(cs, cs_dev, 48, -1, dev);
+        fprintf(stderr, "[DBG l0] conv_state[0][:4]={%.6f,%.6f,%.6f,%.6f}\n", cs[0],cs[1],cs[2],cs[3]);
+    }
     /* Conv1d + silu (in-place on bxb which has QKV output) */
-    ok&=picolm_gpu_ssm_conv1d_batch_dev(bxb,cs_dev,bxb,(float*)picolm_gpu_tensor_weights((picolm_gpu_tensor_t*)gl->ssm_conv1d),conv_dim,c->ssm_d_conv,n_tokens,dev);
+    ok&=picolm_gpu_ssm_conv1d_batch_dev(bxb,cs_dev,bxb,(float*)gw->ssm_conv1d_dev[l],conv_dim,c->ssm_d_conv,n_tokens,dev,xb2_stride);
     SSM_DBG_SYNC;
+    _DBG_RMS("conv1d",bxb,xb2_stride);
     /* L2 norm Q/K */
+    _DBG_RMS("pre_l2_q",bxb,xb2_stride);
     if(ok){float qs=1.0f/sqrtf((float)d_state);
-      ok&=picolm_gpu_ssm_l2norm_batch_dev(bxb,d_state,n_k,n_tokens,conv_dim,1e-12f,qs,dev);
+      ok&=picolm_gpu_ssm_l2norm_batch_dev(bxb,d_state,n_k,n_tokens,xb2_stride,1e-12f,qs,dev);
     SSM_DBG_SYNC;
-      ok&=picolm_gpu_ssm_l2norm_batch_dev(bxb+qk_dim,d_state,n_k,n_tokens,conv_dim,1e-12f,1.0f,dev);}
-    SSM_DBG_SYNC;
+    _DBG_RMS("l2norm_q",bxb,xb2_stride);
+      ok&=picolm_gpu_ssm_l2norm_batch_dev(bxb+qk_dim,d_state,n_k,n_tokens,xb2_stride,1e-12f,1.0f,dev);
+    _DBG_RMS("l2norm_k",bxb+qk_dim,xb2_stride);}
     /* Head permute V. bxb+2*qk_dim can't be permuted into itself --
      * that races whenever head_map isn't the identity (concurrent
      * threadblocks, no ordering guarantee, one can overwrite a
@@ -9084,9 +9112,9 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
      * (once as a plain copy) rather than a permute paired with an
      * unrelated generic copy kernel. */
     if(ok&&do_remap&&gw->ssm_head_map_dev){
-      ok&=picolm_gpu_ssm_head_permute_batch_dev(battn_out,bxb+2*qk_dim,NULL,hvdim,n_v,n_tokens,conv_dim,value_dim,dev);
+      ok&=picolm_gpu_ssm_head_permute_batch_dev(battn_out,bxb+2*qk_dim,NULL,hvdim,n_v,n_tokens,xb2_stride,value_dim,dev);
     SSM_DBG_SYNC;
-      ok&=picolm_gpu_ssm_head_permute_batch_dev(bxb+2*qk_dim,battn_out,(const int*)gw->ssm_head_map_dev,hvdim,n_v,n_tokens,value_dim,conv_dim,dev);}
+      ok&=picolm_gpu_ssm_head_permute_batch_dev(bxb+2*qk_dim,battn_out,(const int*)gw->ssm_head_map_dev,hvdim,n_v,n_tokens,value_dim,xb2_stride,dev);}
     SSM_DBG_SYNC;
     /* Alpha/beta vecdot (read from RMSNorm'd bffn_norm) */
     if(ok){gguf_type_t at=lw->type_ssm_alpha,bt=lw->type_ssm_beta;
@@ -9116,10 +9144,6 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
       ok&=picolm_gpu_ssm_gate_beta_batch_dev(bgate,bup,bgate,bup,dw,aw,n_v,n_tokens,dev);}
     SSM_DBG_SYNC;
     /* Chunked recurrence */
-    /* xb2_stride: pipe_attn_out_b was allocated with q_pipeline_dim =
-     * n_heads*head_dim*(has_ssm?2:1). The scatter kernel and the ssm_out
-     * matmul both need this stride to access the pipe buffer correctly. */
-    int xb2_stride = c->n_heads * c->head_dim * (c->has_ssm ? 2 : 1);
     if(ok){
         ok&=picolm_gpu_ssm_chunked_recurrence_dev(bxb,bgate,bup,st_dev,battn_out,n_tokens,value_dim,xb2_stride,d_state,n_k,n_v,hvdim,repeat,conv_dim,64,dev);
     SSM_DBG_SYNC;
@@ -9247,7 +9271,7 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
     }
     if(ok){float *nw=(float*)gw->ssm_norm_dev[l];
       if(!nw)return 0;
-      ok&=picolm_gpu_ssm_prefill_gated_norm_dev(battn_out,bq,nw,hvdim,n_v,n_tokens,eps,dev);}
+      ok&=picolm_gpu_ssm_prefill_gated_norm_dev(battn_out,bq,nw,hvdim,n_v,n_tokens,eps,value_dim,value_dim,dev);}
     SSM_DBG_SYNC;
     /* Output projection: reuse bffn_norm as temp, then residual add into bx */
     if(ok && l == 0 && getenv("PICOLM_SSM_VERIFY")) {
@@ -9282,7 +9306,7 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
         ok&=picolm_gpu_ssm_head_permute_batch_dev(bxb,battn_out,NULL,hvdim,n_v,n_tokens,xb2_stride,value_dim,dev);
       SSM_DBG_SYNC;
       if(!ok) return 0;
-      ok&=picolm_gpu_matmul_dev((picolm_gpu_tensor_t*)gl->ssm_out,bffn_norm,bxb,n_tokens,dev);
+      ok&=picolm_gpu_matmul_dev((picolm_gpu_tensor_t*)gl->ssm_out,bffn_norm,bxb,n_tokens,dev,dim,0);
     SSM_DBG_SYNC;
       if(getenv("PICOLM_SSM_VERIFY") && (l%16==0)) {
           picolm_gpu_sync(dev);
@@ -9401,6 +9425,15 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
         }
     matmul_batch(qkv_batch, ssm_xb, n_tokens, lw->attn_qkv, dim, conv_dim, lw->type_attn_qkv);
     tensor_set_repacked(NULL);
+    if (l == 0) {
+        float qkv_rms=0; float qkv_v[4];
+        for (int i=0;i<4;i++) qkv_v[i]=qkv_batch[(n_tokens-1)*conv_dim+i];
+        for (int i=0;i<4;i++) qkv_rms += qkv_v[i]*qkv_v[i];
+        qkv_rms = sqrtf(qkv_rms/4);
+        fprintf(stderr, "[CPU l%d] qkv rms_last=%.6f {%.6f %.6f %.6f %.6f}\n", l, qkv_rms, qkv_v[0],qkv_v[1],qkv_v[2],qkv_v[3]);
+        float *cw = s->ssm_conv1d_w[l];
+        fprintf(stderr, "[CPU l%d] conv1d_w[0][:4]={%.6f,%.6f,%.6f,%.6f}\n", l, cw[0],cw[1],cw[2],cw[3]);
+    }
 #ifdef PICOLM_GPU
     if (gpu_lw) {
         gpu_layer_weights_t *gl = &((gpu_layer_weights_t *)gpu_lw)[l];
@@ -9753,6 +9786,12 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
                 }
             }
         }
+    }
+    if (l == 0) {
+        float gn_rms=0; float gn_v[4];
+        for (int i=0;i<4;i++) { gn_v[i]=xb2_batch[(n_tokens-1)*value_dim+i]; gn_rms+=gn_v[i]*gn_v[i]; }
+        gn_rms = sqrtf(gn_rms/4);
+        fprintf(stderr, "[CPU l%d] gated_norm rms_last=%.6f {%.6f %.6f %.6f %.6f}\n", l, gn_rms, gn_v[0],gn_v[1],gn_v[2],gn_v[3]);
     }
 
     /* 9. Output projection (batched) */
@@ -11025,7 +11064,7 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
              * For SSM models this writes q_full_dim = 2*q_dim
              * (interleaved [Q0,Gate0,Q1,Gate1,...]). */
             picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
-                                   pipe_q, pipe_xb, 1, gpu_dev);
+                                   pipe_q, pipe_xb, 1, gpu_dev, 0, 0);
 
             /* B1. For SSM models: de-interleave Q+gate from pipe_q.
              * After this, pipe_q holds compacted Q[q_dim], pipe_gate
@@ -11055,11 +11094,11 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
 
             /* C. K projection: pipe_k = attn_k @ pipe_xb */
             picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_k,
-                                   pipe_k, pipe_xb, 1, gpu_dev);
+                                   pipe_k, pipe_xb, 1, gpu_dev, 0, 0);
 
             /* D. V projection: pipe_v = attn_v @ pipe_xb */
             picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_v,
-                                   pipe_v, pipe_xb, 1, gpu_dev);
+                                   pipe_v, pipe_xb, 1, gpu_dev, 0, 0);
 
             /* E. QK-norm (Qwen3): per-head RMSNorm on Q and K.
              * pipe_q is [n_heads][head_dim], weight is [head_dim].
@@ -11131,7 +11170,7 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
 
             /* I2. Output projection: pipe_xb = attn_output @ pipe_attn_out */
             picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_output,
-                                   pipe_xb, pipe_attn_out, 1, gpu_dev);
+                                   pipe_xb, pipe_attn_out, 1, gpu_dev, 0, 0);
 
             /* J. Residual add: pipe_x += pipe_xb */
             picolm_gpu_residual_add(pipe_x, pipe_x, pipe_xb, dim, gpu_dev);
@@ -11164,18 +11203,18 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
 
             /* L. Gate: pipe_gate = ffn_gate @ pipe_ffn_norm */
             picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_gate,
-                                   pipe_gate, pipe_ffn_norm, 1, gpu_dev);
+                                   pipe_gate, pipe_ffn_norm, 1, gpu_dev, 0, 0);
 
             /* M. Up: pipe_up = ffn_up @ pipe_ffn_norm */
             picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_up,
-                                   pipe_up, pipe_ffn_norm, 1, gpu_dev);
+                                   pipe_up, pipe_ffn_norm, 1, gpu_dev, 0, 0);
 
             /* N. SiLU-mul: pipe_gate = silu(pipe_gate) * pipe_up (in-place on gate) */
             picolm_gpu_silu_mul_dev(pipe_gate, pipe_up, n_ffn, gpu_dev);
 
             /* O. Down: pipe_xb = ffn_down @ pipe_gate */
             picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_down,
-                                   pipe_xb, pipe_gate, 1, gpu_dev);
+                                   pipe_xb, pipe_gate, 1, gpu_dev, 0, 0);
 
             /* P. Residual add: pipe_x += pipe_xb */
             picolm_gpu_residual_add(pipe_x, pipe_x, pipe_xb, dim, gpu_dev);
@@ -11342,7 +11381,7 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
         /* B. Q projection: bq = attn_q @ bxb (S=n_tokens)
          * For SSM models this writes q_full_dim = 2*q_dim per token. */
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
-                               bq, bxb, n_tokens, gpu_dev);
+                               bq, bxb, n_tokens, gpu_dev, 0, 0);
 
         if(getenv("PICOLM_SSM_VERIFY") && l==64){
             float bq_last[4]; picolm_gpu_sync(gpu_dev);
@@ -11365,12 +11404,12 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
         }
 
         /* C. K projection: bk = attn_k @ bxb */
-        int k_ok = picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_k, bk, bxb, n_tokens, gpu_dev);
+        int k_ok = picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_k, bk, bxb, n_tokens, gpu_dev, 0, 0);
 
 
         /* D. V projection: bv = attn_v @ bxb */
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_v,
-                               bv, bxb, n_tokens, gpu_dev);
+                               bv, bxb, n_tokens, gpu_dev, 0, 0);
 
 
         /* D1. QK-norm (Qwen3): per-head RMSNorm on Q and K (batched over S).
@@ -11435,7 +11474,7 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
 
         /* I. Output projection: bxb = attn_output @ battn_out */
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_output,
-                               bxb, battn_out, n_tokens, gpu_dev);
+                               bxb, battn_out, n_tokens, gpu_dev, 0, 0);
 
         if(getenv("PICOLM_SSM_VERIFY") && l==64){
             float oo[4]; picolm_gpu_sync(gpu_dev); picolm_gpu_memcpy(oo, bxb+(size_t)(n_tokens-1)*dim, 16, -1, gpu_dev);
@@ -11454,18 +11493,18 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
 
         /* FFN gate */
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_gate,
-                               bgate, bffn_norm, n_tokens, gpu_dev);
+                               bgate, bffn_norm, n_tokens, gpu_dev, 0, 0);
 
         /* FFN up */
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_up,
-                               bup, bffn_norm, n_tokens, gpu_dev);
+                               bup, bffn_norm, n_tokens, gpu_dev, 0, 0);
 
         /* FFN silu_mul: bgate = silu(bgate) * bup (batched, single launch) */
         picolm_gpu_silu_mul_dev(bgate, bup, n_tokens * n_ffn, gpu_dev);
 
         /* FFN down: bxb = down_proj @ bgate */
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_down,
-                               bxb, bgate, n_tokens, gpu_dev);
+                               bxb, bgate, n_tokens, gpu_dev, 0, 0);
 
         /* FFN residual: bx += bxb (batched, single launch) */
         picolm_gpu_residual_add(bx, bx, bxb, n_tokens * dim, gpu_dev);

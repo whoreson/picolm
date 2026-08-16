@@ -483,7 +483,7 @@ __device__ static inline float dequant_q5_K(const void *blk, int i) {
 
 __global__ void
 picolm_quant_matmul(float *y, const float *x, const void *weights,
-                    gguf_type_t qtype, int S, int I, int O, int row_bytes, int x_stride) {
+                    gguf_type_t qtype, int S, int I, int O, int row_bytes, int x_stride, int y_stride) {
     /* bytes_per_block: stride between consecutive blocks in memory */
     int bytes_per_block;
     switch (qtype) {
@@ -505,6 +505,7 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
     int s = gpuBlockIdx_y;
     if (o >= O || s >= S) return;
     size_t rs = x_stride > 0 ? (size_t)x_stride : (size_t)I;
+    int ys = y_stride > 0 ? y_stride : O;
 
     double sum = 0.0;
     const char *wrow = (const char *)weights + (size_t)o * row_bytes;
@@ -656,7 +657,7 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
         gpuSyncthreads();
     }
     if (!gpuThreadIdx_x)
-        y[(size_t)s * O + o] = (float)partial[0];
+        y[(size_t)s * ys + o] = (float)partial[0];
 }
 
 /* ---- GPU-side Q8_0 quantization kernel ----
@@ -750,10 +751,11 @@ __global__ void
 picolm_q8_q8_matmul(float *y,
                      const int8_t *xq, const float *xd,
                      const void *weights,
-                     int S, int I, int O, int row_bytes) {
+                     int S, int I, int O, int row_bytes, int y_stride) {
     int o = gpuBlockIdx_x;
     int s = gpuBlockIdx_y;
     if (o >= O || s >= S) return;
+    int ys = y_stride > 0 ? y_stride : O;
 
     int n_blocks = I / 32;
     const char *wrow = (const char *)weights + (size_t)o * row_bytes;
@@ -807,7 +809,7 @@ picolm_q8_q8_matmul(float *y,
         gpuSyncthreads();
     }
     if (!gpuThreadIdx_x)
-        y[(size_t)s * O + o] = (float)partial[0];
+        y[(size_t)s * ys + o] = (float)partial[0];
 }
 
 /* Number of sequence positions per tile in the tiled Q8_0 matmul.
@@ -827,13 +829,14 @@ __global__ void
 picolm_q8_q8_matmul_tiled(float *y,
                            const int8_t *xq, const float *xd,
                            const void *weights,
-                           int S, int I, int O, int row_bytes) {
+                           int S, int I, int O, int row_bytes, int y_stride) {
     int o = gpuBlockIdx_x;
     int tile = gpuBlockIdx_y;
     if (o >= O) return;
     int s0 = tile * Q8_TILE_S;
     if (s0 >= S) return;
     int s_count = min(Q8_TILE_S, S - s0);
+    int ys = y_stride > 0 ? y_stride : O;
 
     int n_blocks = I / 32;
     const uint8_t *wrow = (const uint8_t *)weights + (size_t)o * row_bytes;
@@ -894,7 +897,7 @@ picolm_q8_q8_matmul_tiled(float *y,
             gpuSyncthreads();
         }
         if (!gpuThreadIdx_x)
-            y[(size_t)s * O + o] = (float)partial[0];
+            y[(size_t)s * ys + o] = (float)partial[0];
         gpuSyncthreads();
     }
 }
@@ -1690,11 +1693,11 @@ picolm_gpu_ssm_conv1d_kernel(float *conv_output, float *conv_state,
 #define PICOLM_SSM_CONV_MAX_D_CONV 16
 
 __global__ void
-picolm_gpu_ssm_conv1d_batch_kernel(float *conv_output,     /* out [n_tokens][conv_dim] */
+picolm_gpu_ssm_conv1d_batch_kernel(float *conv_output,     /* out [n_tokens][stride] */
                                     float *conv_state,      /* in/out [d_conv-1][conv_dim], persistent */
-                                    const float *new_input, /* in [n_tokens][conv_dim] */
+                                    const float *new_input, /* in [n_tokens][stride] */
                                     const float *conv1d_w,  /* in [conv_dim][d_conv] */
-                                    int conv_dim, int d_conv, int n_tokens) {
+                                    int conv_dim, int d_conv, int n_tokens, int stride) {
     int co = (int)gpuBlockIdx_x * gpuBlockDim_x + gpuThreadIdx_x;
     if (co >= conv_dim) return;
 
@@ -1709,12 +1712,12 @@ picolm_gpu_ssm_conv1d_batch_kernel(float *conv_output,     /* out [n_tokens][con
         w[d] = conv1d_w[d + co * d_conv];
 
     for (int t = 0; t < n_tokens; t++) {
-        float new_sample = new_input[(size_t)t * conv_dim + co];
+        float new_sample = new_input[(size_t)t * stride + co];
         float sum = 0.0f;
         for (int d = 0; d < n_state_rows; d++)
             sum += w[d] * hist[d];
         sum += w[n_state_rows] * new_sample;
-        conv_output[(size_t)t * conv_dim + co] = sum / (1.0f + expf(-sum)); /* silu */
+        conv_output[(size_t)t * stride + co] = sum / (1.0f + expf(-sum)); /* silu */
 
         for (int r = 0; r < n_state_rows - 1; r++)
             hist[r] = hist[r + 1];
@@ -2796,11 +2799,11 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
         if (S > 1 && t->row_bytes + 2048 <= 49152) {
             dim3 grid((unsigned)O, (unsigned)((S + Q8_TILE_S - 1) / Q8_TILE_S));
             picolm_q8_q8_matmul_tiled<<<grid, 256, (unsigned)t->row_bytes, ctx->stream>>>(
-                ctx->y, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes);
+                ctx->y, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, O);
         } else {
             dim3 grid((unsigned)O, (unsigned)S);
             picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
-                ctx->y, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes);
+                ctx->y, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, O);
         }
         if (!gpu_ok(gpuGetLastError(), "q8 matmul") ||
             !gpu_ok(gpuDeviceSynchronize(), "q8 matmul sync")) return 0;
@@ -2816,7 +2819,7 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
     dim3 grid((unsigned)O, (unsigned)S);
     picolm_quant_matmul<<<grid, 256, 0, ctx->stream>>>(ctx->y, ctx->x, t->weights,
                                         t->qtype, S, I, O,
-                                        (int)t->row_bytes, 0);
+                                        (int)t->row_bytes, 0, 0);
     if (!gpu_ok(gpuGetLastError(), "matmul launch") ||
         !gpu_ok(gpuDeviceSynchronize(), "matmul sync")) return 0;
 
@@ -2846,13 +2849,14 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
  * dedicated pipeline buffers. */
 extern "C" int
 picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
-                       int S, int device) {
+                       int S, int device, int y_stride, int x_stride) {
     if (!t || !y_dev || !x_dev || S < 1) return 0;
     if (t->I < 512 || t->O < 256) return 0;
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!select_ctx(ctx)) return 0;
 
     int I = t->I, O = t->O;
+    int ys = y_stride > 0 ? y_stride : O;
 
     if (t->qtype == GGUF_TYPE_Q8_0) {
         int n_blocks = I / 32;
@@ -2864,13 +2868,18 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
         gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
         gpuMemsetAsync(ctx->q8_xd, 0, xd_bytes, ctx->stream);
         dim3 q_grid((unsigned)n_blocks, (unsigned)S);
-        picolm_quantize_q8_0<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
-            ctx->q8_xq, ctx->q8_xd, x_dev, I, S);
+        if (x_stride > 0) {
+            picolm_quantize_q8_0_strided<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
+                ctx->q8_xq, ctx->q8_xd, x_dev, I, S, x_stride);
+        } else {
+            picolm_quantize_q8_0<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
+                ctx->q8_xq, ctx->q8_xd, x_dev, I, S);
+        }
         if (!gpu_ok(gpuGetLastError(), "q8 quantize (dev)")) return 0;
         gpuDeviceSynchronize();
         dim3 grid((unsigned)O, (unsigned)S);
         picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
-            y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes);
+            y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
         if (!gpu_ok(gpuGetLastError(), "q8 matmul (dev)")) return 0;
         return 1;
     }
@@ -2878,7 +2887,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
     dim3 grid((unsigned)O, (unsigned)S);
     picolm_quant_matmul<<<grid, 256, 0, ctx->stream>>>(y_dev, x_dev, t->weights,
                                         t->qtype, S, I, O,
-                                        (int)t->row_bytes, 0);
+                                        (int)t->row_bytes, x_stride, ys);
     if (!gpu_ok(gpuGetLastError(), "matmul launch (dev)")) return 0;
     return 1;
 }
@@ -2887,12 +2896,13 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
  * Only called for SSM output projection where pipe buffer stride != value_dim. */
 extern "C" int
 picolm_gpu_matmul_dev_strided(picolm_gpu_tensor_t *t, float *y_dev,
-                               const float *x_dev, int S, int device, int x_stride) {
+                               const float *x_dev, int S, int device, int x_stride, int y_stride) {
     if (!t || !y_dev || !x_dev || S < 1 || x_stride <= 0) return 0;
     if (t->I < 512 || t->O < 256) return 0;
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!select_ctx(ctx)) return 0;
     int I = t->I, O = t->O;
+    int ys = y_stride > 0 ? y_stride : O;
     if (t->qtype == GGUF_TYPE_Q8_0) {
         int n_blocks = I / 32;
         if (n_blocks < 1 || I % 32 != 0) return 0;
@@ -2909,13 +2919,13 @@ picolm_gpu_matmul_dev_strided(picolm_gpu_tensor_t *t, float *y_dev,
         gpuDeviceSynchronize();
         dim3 grid((unsigned)O, (unsigned)S);
         picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
-            y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes);
+            y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
         if (!gpu_ok(gpuGetLastError(), "q8 matmul strided (dev)")) return 0;
         return 1;
     }
     dim3 grid((unsigned)O, (unsigned)S);
     picolm_quant_matmul<<<grid, 256, 0, ctx->stream>>>(y_dev, x_dev, t->weights,
-                                        t->qtype, S, I, O, (int)t->row_bytes, x_stride);
+                                        t->qtype, S, I, O, (int)t->row_bytes, x_stride, ys);
     if (!gpu_ok(gpuGetLastError(), "matmul strided (dev)")) return 0;
     return 1;
 }
@@ -2971,11 +2981,11 @@ int picolm_gpu_expert_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
     if (use_tiled) {
         dim3 grid((unsigned)I, (unsigned)((S + Q8_TILE_S - 1) / Q8_TILE_S));
         picolm_q8_q8_matmul_tiled<<<grid, 256, (unsigned)gate->row_bytes, ctx->stream>>>(
-            ctx->gate, ctx->q8_xq, ctx->q8_xd, gate->weights, S, D, I, (int)gate->row_bytes);
+            ctx->gate, ctx->q8_xq, ctx->q8_xd, gate->weights, S, D, I, (int)gate->row_bytes, I);
     } else {
         dim3 grid((unsigned)I, (unsigned)S);
         picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
-            ctx->gate, ctx->q8_xq, ctx->q8_xd, gate->weights, S, D, I, (int)gate->row_bytes);
+            ctx->gate, ctx->q8_xq, ctx->q8_xd, gate->weights, S, D, I, (int)gate->row_bytes, I);
     }
     if (!gpu_ok(gpuGetLastError(), "expert q8 gate")) return 0;
 
@@ -2983,11 +2993,11 @@ int picolm_gpu_expert_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
     if (use_tiled) {
         dim3 grid((unsigned)I, (unsigned)((S + Q8_TILE_S - 1) / Q8_TILE_S));
         picolm_q8_q8_matmul_tiled<<<grid, 256, (unsigned)up->row_bytes, ctx->stream>>>(
-            ctx->up, ctx->q8_xq, ctx->q8_xd, up->weights, S, D, I, (int)up->row_bytes);
+            ctx->up, ctx->q8_xq, ctx->q8_xd, up->weights, S, D, I, (int)up->row_bytes, I);
     } else {
         dim3 grid((unsigned)I, (unsigned)S);
         picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
-            ctx->up, ctx->q8_xq, ctx->q8_xd, up->weights, S, D, I, (int)up->row_bytes);
+            ctx->up, ctx->q8_xq, ctx->q8_xd, up->weights, S, D, I, (int)up->row_bytes, I);
     }
     if (!gpu_ok(gpuGetLastError(), "expert q8 up")) return 0;
 
@@ -3007,11 +3017,11 @@ int picolm_gpu_expert_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
     if (use_tiled_down) {
         dim3 grid((unsigned)D, (unsigned)((S + Q8_TILE_S - 1) / Q8_TILE_S));
         picolm_q8_q8_matmul_tiled<<<grid, 256, (unsigned)down->row_bytes, ctx->stream>>>(
-            ctx->y, ctx->q8_xq, ctx->q8_xd, down->weights, S, I, D, (int)down->row_bytes);
+            ctx->y, ctx->q8_xq, ctx->q8_xd, down->weights, S, I, D, (int)down->row_bytes, D);
     } else {
         dim3 grid((unsigned)D, (unsigned)S);
         picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
-            ctx->y, ctx->q8_xq, ctx->q8_xd, down->weights, S, I, D, (int)down->row_bytes);
+            ctx->y, ctx->q8_xq, ctx->q8_xd, down->weights, S, I, D, (int)down->row_bytes, D);
     }
     if (!gpu_ok(gpuGetLastError(), "expert q8 down")) return 0;
 
@@ -3545,8 +3555,8 @@ picolm_gpu_ssm_l2norm_batch_kernel(float *x, int head_dim, int n_heads,
 
     float nrm = 0.0f;
     for (int d = 0; d < head_dim; d++) nrm += xh[d] * xh[d];
-    nrm = (1.0f / sqrtf(nrm + eps)) * extra_scale;
-    for (int d = 0; d < head_dim; d++) xh[d] *= nrm;
+    float nrm_inv = (1.0f / sqrtf(nrm + eps)) * extra_scale;
+    for (int d = 0; d < head_dim; d++) xh[d] *= nrm_inv;
 }
 
 /* Device-native, in-place. eps must match the CPU reference (1e-12).
@@ -3817,9 +3827,10 @@ picolm_gpu_ssm_conv1d_batch(float *conv_output_host,      /* out [n_tokens][conv
 
     int n_threads = 256;
     int n_blocks = (conv_dim + n_threads - 1) / n_threads;
+    int stride = conv_dim;
     picolm_gpu_ssm_conv1d_batch_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
         (float *)d_out, (float *)d_state, (const float *)d_in, (const float *)d_w,
-        conv_dim, d_conv, n_tokens);
+        conv_dim, d_conv, n_tokens, stride);
 
     if (!gpu_ok(gpuGetLastError(), "ssm conv1d batch") ||
         !gpu_ok(gpuDeviceSynchronize(), "ssm conv1d batch sync")) return 0;
@@ -3968,14 +3979,15 @@ picolm_gpu_ssm_prefill_gated_norm_kernel(float *ssm_out,   /* in/out [n_tokens][
                                           const float *z,   /* in [n_tokens][n_v_heads][head_v_dim] */
                                           const float *norm_w, /* in [head_v_dim] */
                                           int head_v_dim, int n_v_heads,
-                                          int n_tokens, float eps) {
+                                          int n_tokens, float eps,
+                                          int so_stride, int z_stride) {
     int h = (int)gpuBlockIdx_x;
     int t = (int)gpuBlockIdx_y;
     if (h >= n_v_heads || t >= n_tokens) return;
     if (gpuThreadIdx_x != 0) return;
 
-    float *out_h = ssm_out + ((size_t)t * n_v_heads + h) * head_v_dim;
-    const float *z_h = z + ((size_t)t * n_v_heads + h) * head_v_dim;
+    float *out_h = ssm_out + (size_t)t * so_stride + (size_t)h * head_v_dim;
+    const float *z_h = z + (size_t)t * z_stride + (size_t)h * head_v_dim;
 
     float nrm = 0.0f;
     for (int d = 0; d < head_v_dim; d++) {
@@ -4017,9 +4029,10 @@ picolm_gpu_ssm_prefill_gated_norm(float *ssm_out_host,   /* in/out [n_tokens][n_
         !gpu_ok(gpuMemcpy(d_z, z_host, so_bytes, gpuMemcpyHostToDevice), "prefill gn z h2d") ||
         !gpu_ok(gpuMemcpy(d_nw, norm_w_host, nw_bytes, gpuMemcpyHostToDevice), "prefill gn nw h2d")) return 0;
 
+    int so_stride = n_v_heads * head_v_dim, z_stride = n_v_heads * head_v_dim;
     dim3 grid((unsigned)n_v_heads, (unsigned)n_tokens, 1);
     picolm_gpu_ssm_prefill_gated_norm_kernel<<<grid, min(head_v_dim, 256), 0, ctx->stream>>>(
-        (float *)d_so, (const float *)d_z, (const float *)d_nw, head_v_dim, n_v_heads, n_tokens, eps);
+        (float *)d_so, (const float *)d_z, (const float *)d_nw, head_v_dim, n_v_heads, n_tokens, eps, so_stride, z_stride);
 
     if (!gpu_ok(gpuGetLastError(), "ssm prefill gated norm") ||
         !gpu_ok(gpuDeviceSynchronize(), "ssm prefill gn sync")) return 0;
@@ -4221,7 +4234,7 @@ picolm_gpu_ssm_vecdot_dev(float *out_dev,
 __global__ void
 ssm_chunk_gather_qk_kernel(float *chunk_q, float *chunk_k,
                             const float *conv_batch,
-                            int chunk_start, int cs_actual, int conv_dim,
+                            int chunk_start, int cs_actual, int conv_stride,
                             int qk_dim, int d_state, int n_k_heads) {
     int h = blockIdx.x;
     if (h >= n_k_heads) return;
@@ -4230,7 +4243,7 @@ ssm_chunk_gather_qk_kernel(float *chunk_q, float *chunk_k,
     int n_elem = cs_actual * d_state;
     for (int idx = threadIdx.x; idx < n_elem; idx += blockDim.x) {
         int t = idx / d_state, di = idx % d_state;
-        const float *tok = conv_batch + (size_t)(chunk_start + t) * conv_dim;
+        const float *tok = conv_batch + (size_t)(chunk_start + t) * conv_stride;
         cq_h[idx] = tok[h * d_state + di];
         ck_h[idx] = tok[qk_dim + h * d_state + di];
     }
@@ -4240,7 +4253,7 @@ __global__ void
 ssm_chunk_gather_v_kernel(float *chunk_v, float *chunk_beta, float *gate_log,
                            const float *conv_batch, const float *alpha_batch,
                            const float *beta_batch,
-                           int chunk_start, int cs_actual, int conv_dim,
+                           int chunk_start, int cs_actual, int conv_stride,
                            int qk_dim, int head_v_dim, int n_v_heads) {
     int h = blockIdx.x;
     if (h >= n_v_heads) return;
@@ -4251,7 +4264,7 @@ ssm_chunk_gather_v_kernel(float *chunk_v, float *chunk_beta, float *gate_log,
     int n_elem = cs_actual * head_v_dim;
     for (int idx = threadIdx.x; idx < n_elem; idx += blockDim.x) {
         int t = idx / head_v_dim, di = idx % head_v_dim;
-        const float *tok = conv_batch + (size_t)(chunk_start + t) * conv_dim;
+        const float *tok = conv_batch + (size_t)(chunk_start + t) * conv_stride;
         cv_h[idx] = tok[2 * qk_dim + h * head_v_dim + di];
     }
     for (int t = threadIdx.x; t < cs_actual; t += blockDim.x) {
@@ -5776,13 +5789,13 @@ picolm_gpu_memcpy(void *dst, const void *src, size_t bytes, int dir, int device)
     return gpu_ok(gpuDeviceSynchronize(), "pipeline memcpy sync");
 }
 int picolm_gpu_ssm_conv1d_batch_dev(float *od, float *sd, const float *id, const float *wd,
-    int cd, int dc, int nt, int dev) {
+    int cd, int dc, int nt, int dev, int stride) {
     if(cd<1||dc<1||nt<1) return 0;
     if(dc>PICOLM_SSM_CONV_MAX_D_CONV) return 0;
     gpu_device_ctx_t *ctx = find_ctx(dev);
     if(!ctx||!select_ctx(ctx)) return 0;
     int nb=(cd+255)/256;
-    picolm_gpu_ssm_conv1d_batch_kernel<<<nb,256,0,ctx->stream>>>(od,sd,id,wd,cd,dc,nt);
+    picolm_gpu_ssm_conv1d_batch_kernel<<<nb,256,0,ctx->stream>>>(od,sd,id,wd,cd,dc,nt,stride);
     return gpu_ok(gpuGetLastError(),"conv1d batch dev");
 }
 
@@ -5805,11 +5818,11 @@ int picolm_gpu_ssm_vecdot_batch_dev(float *od, const float *xd, const void *wd, 
 }
 
 int picolm_gpu_ssm_prefill_gated_norm_dev(float *od, const float *zd, const float *nd,
-    int hd, int nh, int nt, float eps, int dev) {
+    int hd, int nh, int nt, float eps, int so_stride, int z_stride, int dev) {
     if(hd<1||nh<1||nt<1) return 0;
     gpu_device_ctx_t *ctx = find_ctx(dev);
     if(!ctx||!select_ctx(ctx)) return 0;
-    picolm_gpu_ssm_prefill_gated_norm_kernel<<<dim3((unsigned)nh,(unsigned)nt),min(hd,256),0,ctx->stream>>>(od,zd,nd,hd,nh,nt,eps);
+    picolm_gpu_ssm_prefill_gated_norm_kernel<<<dim3((unsigned)nh,(unsigned)nt),min(hd,256),0,ctx->stream>>>(od,zd,nd,hd,nh,nt,eps,so_stride,z_stride);
     return gpu_ok(gpuGetLastError(),"gated norm dev");
 }
 
@@ -5889,10 +5902,10 @@ int picolm_gpu_expert_mlp_dev(picolm_gpu_tensor_t *g, picolm_gpu_tensor_t *u, pi
     if (use_tiled) {
         dim3 grid((unsigned)I, (unsigned)((S + Q8_TILE_S - 1) / Q8_TILE_S));
         picolm_q8_q8_matmul_tiled<<<grid,256,(unsigned)g->row_bytes,ctx->stream>>>(
-            ctx->gate, ctx->q8_xq, ctx->q8_xd, g->weights, S, D, I, (int)g->row_bytes);
+            ctx->gate, ctx->q8_xq, ctx->q8_xd, g->weights, S, D, I, (int)g->row_bytes, I);
     } else {
         picolm_q8_q8_matmul<<<dim3((unsigned)I,(unsigned)S),256,0,ctx->stream>>>(
-            ctx->gate, ctx->q8_xq, ctx->q8_xd, g->weights, S, D, I, (int)g->row_bytes);
+            ctx->gate, ctx->q8_xq, ctx->q8_xd, g->weights, S, D, I, (int)g->row_bytes, I);
     }
     if (!gpu_ok(gpuGetLastError(), "expert q8 gate (dev)")) return 0;
 
@@ -5900,10 +5913,10 @@ int picolm_gpu_expert_mlp_dev(picolm_gpu_tensor_t *g, picolm_gpu_tensor_t *u, pi
     if (use_tiled) {
         dim3 grid((unsigned)I, (unsigned)((S + Q8_TILE_S - 1) / Q8_TILE_S));
         picolm_q8_q8_matmul_tiled<<<grid,256,(unsigned)u->row_bytes,ctx->stream>>>(
-            ctx->up, ctx->q8_xq, ctx->q8_xd, u->weights, S, D, I, (int)u->row_bytes);
+            ctx->up, ctx->q8_xq, ctx->q8_xd, u->weights, S, D, I, (int)u->row_bytes, I);
     } else {
         picolm_q8_q8_matmul<<<dim3((unsigned)I,(unsigned)S),256,0,ctx->stream>>>(
-            ctx->up, ctx->q8_xq, ctx->q8_xd, u->weights, S, D, I, (int)u->row_bytes);
+            ctx->up, ctx->q8_xq, ctx->q8_xd, u->weights, S, D, I, (int)u->row_bytes, I);
     }
     if (!gpu_ok(gpuGetLastError(), "expert q8 up (dev)")) return 0;
 
@@ -5921,10 +5934,10 @@ int picolm_gpu_expert_mlp_dev(picolm_gpu_tensor_t *g, picolm_gpu_tensor_t *u, pi
     if (use_tiled_down) {
         dim3 grid((unsigned)D, (unsigned)((S + Q8_TILE_S - 1) / Q8_TILE_S));
         picolm_q8_q8_matmul_tiled<<<grid,256,(unsigned)d->row_bytes,ctx->stream>>>(
-            yd, ctx->q8_xq, ctx->q8_xd, d->weights, S, I, D, (int)d->row_bytes);
+            yd, ctx->q8_xq, ctx->q8_xd, d->weights, S, I, D, (int)d->row_bytes, D);
     } else {
         picolm_q8_q8_matmul<<<dim3((unsigned)D,(unsigned)S),256,0,ctx->stream>>>(
-            yd, ctx->q8_xq, ctx->q8_xd, d->weights, S, I, D, (int)d->row_bytes);
+            yd, ctx->q8_xq, ctx->q8_xd, d->weights, S, I, D, (int)d->row_bytes, D);
     }
     return gpu_ok(gpuGetLastError(), "expert MLP dev");
 }
@@ -5934,7 +5947,7 @@ int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv_dev, const float *al
     int n_tokens, int value_dim, int xb2_stride,
     int d_state, int n_k_heads, int n_v_heads,
     int head_v_dim, int repeat, int conv_dim, int cs, int device) {
-    (void)conv_dim; (void)xb2_stride;
+    (void)conv_dim; /* conv_dim is used for offset calculations, xb2_stride for striding */
 #ifndef PICOLM_SSM_CHUNKED_GPU_VALIDATED
     (void)conv_dev;(void)alpha_dev;(void)beta_dev;(void)state_dev;(void)xb2_dev;
     (void)n_tokens;(void)value_dim;(void)xb2_stride;(void)d_state;(void)n_k_heads;
@@ -5983,9 +5996,9 @@ int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv_dev, const float *al
     for(int ci=0;ci<nc&&ok;ci++){
       int ca=(ci==nc-1)?(n_tokens-ci*cs):cs; if(ca<=0)break;
       int co2=ci*cs;
-      ssm_chunk_gather_qk_kernel<<<n_k_heads,n_threads,0,ctx->stream>>>((float*)d_cq,(float*)d_ck,conv_dev,co2,ca,conv_dim,qk_dim,d_state,n_k_heads);
+      ssm_chunk_gather_qk_kernel<<<n_k_heads,n_threads,0,ctx->stream>>>((float*)d_cq,(float*)d_ck,conv_dev,co2,ca,xb2_stride,qk_dim,d_state,n_k_heads);
       if(!gpu_ok(gpuGetLastError(),"gather_qk"))return 0;
-      ssm_chunk_gather_v_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>((float*)d_cv,(float*)d_cb,(float*)d_gl,conv_dev,alpha_dev,beta_dev,co2,ca,conv_dim,qk_dim,head_v_dim,n_v_heads);
+      ssm_chunk_gather_v_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>((float*)d_cv,(float*)d_cb,(float*)d_gl,conv_dev,alpha_dev,beta_dev,co2,ca,xb2_stride,qk_dim,head_v_dim,n_v_heads);
       if(!gpu_ok(gpuGetLastError(),"gather_v"))return 0;
       ssm_chunk_decay_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>((float*)d_cg,(float*)d_qd,(float*)d_dm,(float*)d_gl,n_v_heads,ca);
       if(!gpu_ok(gpuGetLastError(),"decay"))return 0;

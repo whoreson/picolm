@@ -59,9 +59,9 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t,
  * buffers picolm_gpu_matmul() itself uses internally. Returns 1 on
  * success. */
 int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t,
-                           float *y_dev, const float *x_dev, int S, int device);
+                           float *y_dev, const float *x_dev, int S, int device, int y_stride, int x_stride);
 int picolm_gpu_matmul_dev_strided(picolm_gpu_tensor_t *t, float *y_dev,
-                                   const float *x_dev, int S, int device, int x_stride);
+                                   const float *x_dev, int S, int device, int x_stride, int y_stride);
 
 /* Fused expert-style MLP: y = down(silu(gate(x)) * up(x))
  * All three tensors must be resident on the same device.
@@ -303,7 +303,7 @@ int picolm_gpu_ssm_chunked_recurrence(const float *conv_batch_host,
 /* Device-native batched wrappers (no H2D/D2H, no malloc, no sync) */
 int picolm_gpu_ssm_conv1d_batch_dev(float *out, float *state, const float *inp,
                                      const float *w, int conv_dim, int d_conv,
-                                     int n_tokens, int device);
+                                     int n_tokens, int device, int stride);
 int picolm_gpu_ssm_l2norm_batch_dev(float *x, int head_dim, int n_heads,
                                      int n_tokens, int token_stride,
                                      float eps, float extra_scale, int device);
@@ -315,7 +315,7 @@ int picolm_gpu_ssm_vecdot_batch_dev(float *out, const float *x,
 int picolm_gpu_ssm_prefill_gated_norm_dev(float *ssm_out, const float *z,
                                            const float *norm_w,
                                            int head_v_dim, int n_v_heads,
-                                           int n_tokens, float eps, int device);
+                                           int n_tokens, float eps, int so_stride, int z_stride, int device);
 int picolm_gpu_ssm_head_permute_batch_dev(float *dst, const float *src,
                                            const int *head_map,
                                            int head_dim, int n_heads,
