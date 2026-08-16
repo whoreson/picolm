@@ -60,6 +60,8 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t,
  * success. */
 int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t,
                            float *y_dev, const float *x_dev, int S, int device);
+int picolm_gpu_matmul_dev_strided(picolm_gpu_tensor_t *t, float *y_dev,
+                                   const float *x_dev, int S, int device, int x_stride);
 
 /* Fused expert-style MLP: y = down(silu(gate(x)) * up(x))
  * All three tensors must be resident on the same device.
@@ -326,8 +328,8 @@ int picolm_gpu_ssm_gate_beta_batch_dev(float *gate_exp_out, float *beta_out,
 int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv, const float *alpha,
                                            const float *beta, float *state,
                                            float *xb2, int n_tokens,
-                                           int value_dim, int d_state,
-                                           int n_k_heads, int n_v_heads,
+                                           int value_dim, int xb2_stride,
+                                           int d_state, int n_k_heads, int n_v_heads,
                                            int head_v_dim, int repeat,
                                            int conv_dim, int cs, int device);
 int picolm_gpu_expert_mlp_dev(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,

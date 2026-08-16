@@ -2755,10 +2755,18 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
              * picolm_gpu_tensor_t*). Extract the .weights device pointer. */
             {
                 gpu_weights_t *gw = &m->gpu;
+                int conv_dim = 2 * c->ssm_d_state * c->ssm_n_group + c->ssm_d_inner;
                 for (int l = 0; l < c->n_layers; l++) {
                     gpu_layer_weights_t *gl = &m->gpu.layers[l];
-                    if (gl->ssm_conv1d)
-                        gw->ssm_conv1d_dev[l] = (void *)picolm_gpu_tensor_weights((picolm_gpu_tensor_t *)gl->ssm_conv1d);
+                    if (gl->ssm_conv1d) {
+                        /* Upload dequantized F32 conv1d weight for GPU.
+                         * The raw tensor is Q8_0, but the conv1d kernel
+                         * expects F32 weights (like the CPU path). */
+                        void *f32_w = picolm_gpu_upload_f32(
+                            m->state.ssm_conv1d_w[l],
+                            (size_t)c->ssm_d_conv * conv_dim, device);
+                        gw->ssm_conv1d_dev[l] = f32_w;
+                    }
                     if (gl->ssm_alpha)
                         gw->ssm_alpha_dev[l] = (void *)picolm_gpu_tensor_weights((picolm_gpu_tensor_t *)gl->ssm_alpha);
                     if (gl->ssm_beta)
@@ -9108,8 +9116,12 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
       ok&=picolm_gpu_ssm_gate_beta_batch_dev(bgate,bup,bgate,bup,dw,aw,n_v,n_tokens,dev);}
     SSM_DBG_SYNC;
     /* Chunked recurrence */
+    /* xb2_stride: pipe_attn_out_b was allocated with q_pipeline_dim =
+     * n_heads*head_dim*(has_ssm?2:1). The scatter kernel and the ssm_out
+     * matmul both need this stride to access the pipe buffer correctly. */
+    int xb2_stride = c->n_heads * c->head_dim * (c->has_ssm ? 2 : 1);
     if(ok){
-        ok&=picolm_gpu_ssm_chunked_recurrence_dev(bxb,bgate,bup,st_dev,battn_out,n_tokens,value_dim,d_state,n_k,n_v,hvdim,repeat,conv_dim,64,dev);
+        ok&=picolm_gpu_ssm_chunked_recurrence_dev(bxb,bgate,bup,st_dev,battn_out,n_tokens,value_dim,xb2_stride,d_state,n_k,n_v,hvdim,repeat,conv_dim,64,dev);
     SSM_DBG_SYNC;
         if(ok && getenv("PICOLM_SSM_VERIFY") && (l%16==0)) {
             /* D2H GPU recurrence output and compare with CPU reference */
@@ -9261,7 +9273,16 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
         }
     }
     if(ok){
-      ok&=picolm_gpu_matmul_dev((picolm_gpu_tensor_t*)gl->ssm_out,bffn_norm,battn_out,n_tokens,dev);
+      /* Head-permute battn_out to GGUF column order before ssm_out matmul.
+       * Read from battn_out (stride xb2_stride), write to bxb (stride xb_stride >= value_dim).
+       * Then matmul reads bxb with stride value_dim and writes to bffn_norm (stride dim). */
+      if(do_remap && gw->ssm_head_map_dev)
+        ok&=picolm_gpu_ssm_head_permute_batch_dev(bxb,battn_out,(const int*)gw->ssm_head_map_dev,hvdim,n_v,n_tokens,xb2_stride,value_dim,dev);
+      else
+        ok&=picolm_gpu_ssm_head_permute_batch_dev(bxb,battn_out,NULL,hvdim,n_v,n_tokens,xb2_stride,value_dim,dev);
+      SSM_DBG_SYNC;
+      if(!ok) return 0;
+      ok&=picolm_gpu_matmul_dev((picolm_gpu_tensor_t*)gl->ssm_out,bffn_norm,bxb,n_tokens,dev);
     SSM_DBG_SYNC;
       if(getenv("PICOLM_SSM_VERIFY") && (l%16==0)) {
           picolm_gpu_sync(dev);

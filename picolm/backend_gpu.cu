@@ -483,7 +483,7 @@ __device__ static inline float dequant_q5_K(const void *blk, int i) {
 
 __global__ void
 picolm_quant_matmul(float *y, const float *x, const void *weights,
-                    gguf_type_t qtype, int S, int I, int O, int row_bytes) {
+                    gguf_type_t qtype, int S, int I, int O, int row_bytes, int x_stride) {
     /* bytes_per_block: stride between consecutive blocks in memory */
     int bytes_per_block;
     switch (qtype) {
@@ -504,6 +504,7 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
     int o = gpuBlockIdx_x;
     int s = gpuBlockIdx_y;
     if (o >= O || s >= S) return;
+    size_t rs = x_stride > 0 ? (size_t)x_stride : (size_t)I;
 
     double sum = 0.0;
     const char *wrow = (const char *)weights + (size_t)o * row_bytes;
@@ -511,21 +512,21 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
     switch (qtype) {
     case 0: /* GGUF_TYPE_F32 */
         for (int i = gpuThreadIdx_x; i < I; i += gpuBlockDim_x) {
-            sum += x[(size_t)s * I + i] * ((const float *)(wrow))[i];
+            sum += x[rs*s+i] * ((const float *)(wrow))[i];
         }
         break;
 
     case 1: /* GGUF_TYPE_F16 */
         /* Raw FP16 array, no block structure. Dequant on-the-fly. */
         for (int i = gpuThreadIdx_x; i < I; i += gpuBlockDim_x) {
-            sum += x[(size_t)s * I + i] * dequant_f16(wrow, i);
+            sum += x[rs*s+i] * dequant_f16(wrow, i);
         }
         break;
 
     case 30: /* GGUF_TYPE_BF16 */
         /* Raw BF16 array, no block structure. Dequant on-the-fly. */
         for (int i = gpuThreadIdx_x; i < I; i += gpuBlockDim_x) {
-            sum += x[(size_t)s * I + i] * dequant_bf16(wrow, i);
+            sum += x[rs*s+i] * dequant_bf16(wrow, i);
         }
         break;
 
@@ -537,7 +538,7 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
                 const void *blk = wrow + (size_t)bi * bytes_per_block;
                 for (int j = 0; j < 32; j++) {
                     int i = bi * 32 + j;
-                    sum += x[(size_t)s * I + i] * dequant_q4_0(blk, j);
+                    sum += x[rs*s+i] * dequant_q4_0(blk, j);
                 }
             }
         }
@@ -551,7 +552,7 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
                 const void *blk = wrow + (size_t)bi * bytes_per_block;
                 for (int j = 0; j < 32; j++) {
                     int i = bi * 32 + j;
-                    sum += x[(size_t)s * I + i] * dequant_q8_0(blk, j);
+                    sum += x[rs*s+i] * dequant_q8_0(blk, j);
                 }
             }
         }
@@ -565,7 +566,7 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
                 const void *blk = wrow + (size_t)bi * bytes_per_block;
                 for (int j = 0; j < 256; j++) {
                     int i = bi * 256 + j;
-                    sum += x[(size_t)s * I + i] * dequant_q2_K(blk, j);
+                    sum += x[rs*s+i] * dequant_q2_K(blk, j);
                 }
             }
         }
@@ -579,7 +580,7 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
                 const void *blk = wrow + (size_t)bi * bytes_per_block;
                 for (int j = 0; j < 256; j++) {
                     int i = bi * 256 + j;
-                    sum += x[(size_t)s * I + i] * dequant_q4_K(blk, j);
+                    sum += x[rs*s+i] * dequant_q4_K(blk, j);
                 }
             }
         }
@@ -593,7 +594,7 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
                 const void *blk = wrow + (size_t)bi * bytes_per_block;
                 for (int j = 0; j < 256; j++) {
                     int i = bi * 256 + j;
-                    sum += x[(size_t)s * I + i] * dequant_q5_K(blk, j);
+                    sum += x[rs*s+i] * dequant_q5_K(blk, j);
                 }
             }
         }
@@ -607,7 +608,7 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
                 const void *blk = wrow + (size_t)bi * bytes_per_block;
                 for (int j = 0; j < 256; j++) {
                     int i = bi * 256 + j;
-                    sum += x[(size_t)s * I + i] * dequant_q6_K(blk, j);
+                    sum += x[rs*s+i] * dequant_q6_K(blk, j);
                 }
             }
         }
@@ -621,7 +622,7 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
                 const void *blk = wrow + (size_t)bi * bytes_per_block;
                 for (int j = 0; j < 128; j++) {
                     int i = bi * 128 + j;
-                    sum += x[(size_t)s * I + i] * dequant_q1_0(blk, j);
+                    sum += x[rs*s+i] * dequant_q1_0(blk, j);
                 }
             }
         }
@@ -635,7 +636,7 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
                 const void *blk = wrow + (size_t)bi * bytes_per_block;
                 for (int j = 0; j < 128; j++) {
                     int i = bi * 128 + j;
-                    sum += x[(size_t)s * I + i] * dequant_q2_0(blk, j);
+                    sum += x[rs*s+i] * dequant_q2_0(blk, j);
                 }
             }
         }
@@ -697,6 +698,37 @@ picolm_quantize_q8_0(int8_t *qs_out, float *d_out,
     if (q > 127) q = 127;
     if (q < -128) q = -128;
 
+    qs_out[(size_t)s * (size_t)n_blocks * 32 + (size_t)block * 32 + tid] = (int8_t)q;
+    if (tid == 0)
+        d_out[(size_t)s * (size_t)n_blocks + block] = d;
+}
+
+/* Strided variant: x_stride > 0 overrides the default s*I stride.
+ * Output is always contiguous [S][I]. Only called when x_stride != I. */
+__global__ void
+picolm_quantize_q8_0_strided(int8_t *qs_out, float *d_out,
+                              const float *x, int I, int S, int x_stride) {
+    int s = gpuBlockIdx_y;
+    int block = gpuBlockIdx_x;
+    int tid = gpuThreadIdx_x;
+    int n_blocks = (I + 31) / 32;
+    if (block >= n_blocks || s >= S) return;
+    const float *xb = x + (size_t)s * x_stride + (size_t)block * 32;
+    __shared__ float amax_shared[32];
+    float v = (tid < I - block * 32) ? xb[tid] : 0.0f;
+    amax_shared[tid] = fabsf(v);
+    gpuSyncthreads();
+    for (int stride = 16; stride; stride >>= 1) {
+        if (tid < stride)
+            amax_shared[tid] = fmaxf(amax_shared[tid], amax_shared[tid + stride]);
+        gpuSyncthreads();
+    }
+    float amax = amax_shared[0];
+    float d = amax / 127.0f;
+    float id = (d > 0.0f) ? 1.0f / d : 0.0f;
+    int q = (int)lrintf(v * id);
+    if (q > 127) q = 127;
+    if (q < -128) q = -128;
     qs_out[(size_t)s * (size_t)n_blocks * 32 + (size_t)block * 32 + tid] = (int8_t)q;
     if (tid == 0)
         d_out[(size_t)s * (size_t)n_blocks + block] = d;
@@ -2784,7 +2816,7 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
     dim3 grid((unsigned)O, (unsigned)S);
     picolm_quant_matmul<<<grid, 256, 0, ctx->stream>>>(ctx->y, ctx->x, t->weights,
                                         t->qtype, S, I, O,
-                                        (int)t->row_bytes);
+                                        (int)t->row_bytes, 0);
     if (!gpu_ok(gpuGetLastError(), "matmul launch") ||
         !gpu_ok(gpuDeviceSynchronize(), "matmul sync")) return 0;
 
@@ -2846,8 +2878,45 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
     dim3 grid((unsigned)O, (unsigned)S);
     picolm_quant_matmul<<<grid, 256, 0, ctx->stream>>>(y_dev, x_dev, t->weights,
                                         t->qtype, S, I, O,
-                                        (int)t->row_bytes);
+                                        (int)t->row_bytes, 0);
     if (!gpu_ok(gpuGetLastError(), "matmul launch (dev)")) return 0;
+    return 1;
+}
+
+/* Strided variant: x_stride > 0 overrides default I stride.
+ * Only called for SSM output projection where pipe buffer stride != value_dim. */
+extern "C" int
+picolm_gpu_matmul_dev_strided(picolm_gpu_tensor_t *t, float *y_dev,
+                               const float *x_dev, int S, int device, int x_stride) {
+    if (!t || !y_dev || !x_dev || S < 1 || x_stride <= 0) return 0;
+    if (t->I < 512 || t->O < 256) return 0;
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!select_ctx(ctx)) return 0;
+    int I = t->I, O = t->O;
+    if (t->qtype == GGUF_TYPE_Q8_0) {
+        int n_blocks = I / 32;
+        if (n_blocks < 1 || I % 32 != 0) return 0;
+        size_t xq_bytes = (size_t)S * I;
+        size_t xd_bytes = (size_t)S * n_blocks * sizeof(float);
+        if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, xq_bytes) ||
+            !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
+        gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
+        gpuMemsetAsync(ctx->q8_xd, 0, xd_bytes, ctx->stream);
+        dim3 q_grid((unsigned)n_blocks, (unsigned)S);
+        picolm_quantize_q8_0_strided<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
+            ctx->q8_xq, ctx->q8_xd, x_dev, I, S, x_stride);
+        if (!gpu_ok(gpuGetLastError(), "q8 quantize strided (dev)")) return 0;
+        gpuDeviceSynchronize();
+        dim3 grid((unsigned)O, (unsigned)S);
+        picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
+            y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes);
+        if (!gpu_ok(gpuGetLastError(), "q8 matmul strided (dev)")) return 0;
+        return 1;
+    }
+    dim3 grid((unsigned)O, (unsigned)S);
+    picolm_quant_matmul<<<grid, 256, 0, ctx->stream>>>(y_dev, x_dev, t->weights,
+                                        t->qtype, S, I, O, (int)t->row_bytes, x_stride);
+    if (!gpu_ok(gpuGetLastError(), "matmul strided (dev)")) return 0;
     return 1;
 }
 
@@ -5862,12 +5931,13 @@ int picolm_gpu_expert_mlp_dev(picolm_gpu_tensor_t *g, picolm_gpu_tensor_t *u, pi
 
 int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv_dev, const float *alpha_dev,
     const float *beta_dev, float *state_dev, float *xb2_dev,
-    int n_tokens, int value_dim, int d_state, int n_k_heads, int n_v_heads,
+    int n_tokens, int value_dim, int xb2_stride,
+    int d_state, int n_k_heads, int n_v_heads,
     int head_v_dim, int repeat, int conv_dim, int cs, int device) {
-    (void)conv_dim;
+    (void)conv_dim; (void)xb2_stride;
 #ifndef PICOLM_SSM_CHUNKED_GPU_VALIDATED
     (void)conv_dev;(void)alpha_dev;(void)beta_dev;(void)state_dev;(void)xb2_dev;
-    (void)n_tokens;(void)value_dim;(void)d_state;(void)n_k_heads;
+    (void)n_tokens;(void)value_dim;(void)xb2_stride;(void)d_state;(void)n_k_heads;
     (void)n_v_heads;(void)head_v_dim;(void)repeat;(void)cs;(void)device;
     return 0;
 #else
@@ -5933,7 +6003,7 @@ int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv_dev, const float *al
       if(!gpu_ok(gpuGetLastError(),"kq_gemm"))return 0;
       ssm_chunk_output_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>((float*)d_co,(const float*)d_sq,(const float*)d_qd,(const float*)d_kq,(const float*)d_vh,n_v_heads,ca,d);
       if(!gpu_ok(gpuGetLastError(),"output"))return 0;
-      ssm_chunk_scatter_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>(xb2_dev,(const float*)d_co,co2,ca,value_dim,head_v_dim,n_v_heads);
+      ssm_chunk_scatter_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>(xb2_dev,(const float*)d_co,co2,ca,xb2_stride,head_v_dim,n_v_heads);
       if(!gpu_ok(gpuGetLastError(),"scatter"))return 0;
       ssm_chunk_state_update_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>(state_dev,(const float*)d_vh,(const float*)d_ck,(const float*)d_cg,n_v_heads,repeat,ca,d);
       if(!gpu_ok(gpuGetLastError(),"state_up"))return 0;
