@@ -11712,17 +11712,26 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
                                bv, bxb, n_tokens, gpu_dev, 0, 0);
 
 
-        /* D1. QK-norm (Qwen3): per-head RMSNorm on Q and K (batched over S).
-         * bq is [S][n_heads][head_dim], weight is [head_dim].
-         * bk is [S][n_kv_heads][head_dim], same weight layout.
-         * Total heads for batched RMSNorm: S * n_heads. */
+        /* D1. QK-norm (Qwen3): per-head RMSNorm on Q and K.
+         * Pipe buffers have stride q_pipeline_dim between tokens,
+         * so rmsnorm must be called per-head with that stride. */
         if (gw->attn_qk_norm_q_dev[l]) {
-            picolm_gpu_rmsnorm_batched(bq, bq,
-                                       (float *)gw->attn_qk_norm_q_dev[l],
-                                       head_dim, c->rms_norm_eps, n_heads * n_tokens, 0, gpu_dev);
-            picolm_gpu_rmsnorm_batched(bk, bk,
-                                       (float *)gw->attn_qk_norm_k_dev[l],
-                                       head_dim, c->rms_norm_eps, n_kv_heads * n_tokens, 0, gpu_dev);
+            int q_stride = c->has_ssm ? (q_dim * 2) : q_dim;
+            if (dim > q_stride) q_stride = dim;
+            int ssm_conv_dim = c->ssm_d_inner + 2 * c->ssm_d_state * c->ssm_n_group;
+            if (ssm_conv_dim > q_stride) q_stride = ssm_conv_dim;
+            for (int h = 0; h < n_heads; h++) {
+                float *bq_h = bq + h * head_dim;
+                picolm_gpu_rmsnorm_batched(bq_h, bq_h,
+                                           (float *)gw->attn_qk_norm_q_dev[l],
+                                           head_dim, c->rms_norm_eps, n_tokens, q_stride, gpu_dev);
+            }
+            for (int h = 0; h < n_kv_heads; h++) {
+                float *bk_h = bk + h * head_dim;
+                picolm_gpu_rmsnorm_batched(bk_h, bk_h,
+                                           (float *)gw->attn_qk_norm_k_dev[l],
+                                           head_dim, c->rms_norm_eps, n_tokens, q_stride, gpu_dev);
+            }
         }
 
         /* E. RoPE on Q (batched, one launch for whole chunk) */

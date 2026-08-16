@@ -1347,32 +1347,13 @@ picolm_gpu_attention_prefill_kernel(
                 for (int d = tid; d < head_dim; d += n_threads) {
                     score += qg[d] * gpu_fp16_to_fp32(k_tile[ti * head_dim + d]);
                 }
-                /* Warp-shuffle reduce to avoid gpuSyncthreads() inside
-                 * a loop with divergent branches (sm_121 non-determinism).
-                 * Phase 1: intra-warp reduce via shuffle. */
-                int lane_id = tid % 32;
-                int warp_id = tid / 32;
-                float warp_score = score;
-                #pragma unroll
-                for (int offset = 16; offset > 0; offset /= 2) {
-                    warp_score += __shfl_down_sync(0xffffffff, warp_score, offset);
-                }
-                /* Phase 2: inter-warp reduce via shared memory.
-                 * Each warp leader writes its partial sum to reduce_sh. */
-                if (lane_id == 0) {
-                    reduce_sh[warp_id] = warp_score;
-                }
+                /* Reduce to thread 0 via shared memory tree reduction (matching decode kernel) */
+                reduce_sh[tid] = score;
                 gpuSyncthreads();
-
-                /* Phase 3: thread 0 sums the warp partials. */
-                if (tid == 0) {
-                    float total = 0.0f;
-                    for (int w = 0; w < n_threads / 32; w++) {
-                        total += reduce_sh[w];
-                    }
-                    reduce_sh[0] = total;
+                for (int s = n_threads / 2; s > 0; s >>= 1) {
+                    if (tid < s) reduce_sh[tid] += reduce_sh[tid + s];
+                    gpuSyncthreads();
                 }
-                gpuSyncthreads();
                 score = reduce_sh[0] / sqrt_hd;
 
                 /* Online softmax branch decision on thread 0, broadcast
@@ -5402,8 +5383,9 @@ __global__ void
 picolm_gpu_rmsnorm_batched_kernel(float *out, const float *x, const float *weight,
                                    int dim, float eps, int x_stride) {
     int row = (int)gpuBlockIdx_x;
-    const float *xr = x + (size_t)row * (x_stride > 0 ? x_stride : dim);
-    float *outr = out + (size_t)row * dim;
+    int stride = (x_stride > 0) ? x_stride : dim;
+    const float *xr = x + (size_t)row * stride;
+    float *outr = out + (size_t)row * stride;
 
     float sum_sq = 0.0f;
     for (int i = gpuThreadIdx_x; i < dim; i += gpuBlockDim_x) {
