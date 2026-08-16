@@ -334,7 +334,7 @@ int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv, const float *alpha,
                                            int conv_dim, int cs, int device);
 int picolm_gpu_expert_mlp_dev(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
                                picolm_gpu_tensor_t *down,
-                               float *y_dev, const float *x_dev, int S, int device);
+                               float *y_dev, const float *x_dev, int S, int x_stride, int y_stride, int device);
 
 /* Generic device memory allocation. Returns NULL on failure. */
 
@@ -527,10 +527,10 @@ int picolm_gpu_rmsnorm(float *out, const float *x, const float *weight,
 
 /* Device-native batched rmsnorm: all device pointers, no H2D/D2H/sync. */
 int picolm_gpu_rmsnorm_batched_dev(float *out, const float *x, const float *weight,
-                                    int dim, float eps, int S, int device);
+                                    int dim, float eps, int S, int x_stride, int device);
 /* Host-side batched rmsnorm: takes host pointers, does H2D/D2H/sync. */
 int picolm_gpu_rmsnorm_batched(float *out, const float *x, const float *weight,
-                                int dim, float eps, int S, int device);
+                                int dim, float eps, int S, int x_stride, int device);
 
 /* RoPE (rotary position embedding) on device.
  * Applies pairwise sin/cos rotation to x in-place.
@@ -551,7 +551,7 @@ int picolm_gpu_rope_apply_batched(float *x, int n_heads, int head_dim,
 /* Residual add on device: out[i] = a[i] + b[i] for i = 0..n-1.
  * All device pointers. Returns 1 on success. */
 int picolm_gpu_residual_add(float *out, const float *a, const float *b,
-                             int n, int device);
+                             int n, int dim, int stride, int device);
 
 /* SiLU-mul on device, in place: gate[i] = silu(gate[i]) * up[i].
  * All device pointers, on ctx->stream (required for pipeline ordering --
