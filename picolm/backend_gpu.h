@@ -311,7 +311,7 @@ int picolm_gpu_ssm_vecdot_batch_dev(float *out, const float *x,
                                      const void *weights, gguf_type_t qtype,
                                      int dim, int n_v_heads, int n_tokens,
                                      int row_bytes, const int *head_map,
-                                     int device);
+                                     int device, int out_stride);
 int picolm_gpu_ssm_prefill_gated_norm_dev(float *ssm_out, const float *z,
                                            const float *norm_w,
                                            int head_v_dim, int n_v_heads,
@@ -324,7 +324,7 @@ int picolm_gpu_ssm_head_permute_batch_dev(float *dst, const float *src,
 int picolm_gpu_ssm_gate_beta_batch_dev(float *gate_exp_out, float *beta_out,
                                         const float *alpha_in, const float *beta_in,
                                         const float *dt_w, const float *a_w,
-                                        int n_v_heads, int n_tokens, int device);
+                                        int n_v_heads, int n_tokens, int device, int stride);
 int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv, const float *alpha,
                                            const float *beta, float *state,
                                            float *xb2, int n_tokens,

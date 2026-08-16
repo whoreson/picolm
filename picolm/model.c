@@ -9071,6 +9071,19 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
             fprintf(stderr, "[DBG l%d] %s rms_last=%.6f {%.6f %.6f %.6f %.6f}\n", l, name, _rms, _v[0],_v[1],_v[2],_v[3]); \
         } \
     } while(0)
+    /* Canonical xb2_stride-aware per-token dump: reads 4 floats per token, reports RMS */
+    #define _DBG_TOK(name, ptr) do { \
+        if (l == 0) { \
+            float _vt[40]; \
+            for (int _ti=0;_ti<10;_ti++) \
+                picolm_gpu_memcpy(_vt+_ti*4, ptr + (size_t)_ti * xb2_stride, 16, -1, dev); \
+            float _trms=0; \
+            for (int _ti=0;_ti<10;_ti++) { float _r=0; for(int _j=0;_j<4;_j++) _r+=_vt[_ti*4+_j]*_vt[_ti*4+_j]; _r=sqrtf(_r/4); _trms+=_r*_r; } \
+            _trms=sqrtf(_trms/10); \
+            fprintf(stderr, "[DBG l%d] %s tok0={%.6f %.6f %.6f %.6f} tok9={%.6f %.6f %.6f %.6f} mean_rms=%.6f\n", \
+                l, name, _vt[0],_vt[1],_vt[2],_vt[3], _vt[36],_vt[37],_vt[38],_vt[39], _trms); \
+        } \
+    } while(0)
 
     ok&=picolm_gpu_rmsnorm_batched_dev(bffn_norm,bx,(float*)s->attn_norm_w[l],dim,eps,n_tokens,dev);
     SSM_DBG_SYNC;
@@ -9101,7 +9114,8 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
     SSM_DBG_SYNC;
     _DBG_RMS("l2norm_q",bxb,xb2_stride);
       ok&=picolm_gpu_ssm_l2norm_batch_dev(bxb+qk_dim,d_state,n_k,n_tokens,xb2_stride,1e-12f,1.0f,dev);
-    _DBG_RMS("l2norm_k",bxb+qk_dim,xb2_stride);}
+    _DBG_RMS("l2norm_k",bxb+qk_dim,xb2_stride);
+      _DBG_TOK("Q",bxb);}
     /* Head permute V. bxb+2*qk_dim can't be permuted into itself --
      * that races whenever head_map isn't the identity (concurrent
      * threadblocks, no ordering guarantee, one can overwrite a
@@ -9116,15 +9130,16 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
     SSM_DBG_SYNC;
       ok&=picolm_gpu_ssm_head_permute_batch_dev(bxb+2*qk_dim,battn_out,(const int*)gw->ssm_head_map_dev,hvdim,n_v,n_tokens,value_dim,xb2_stride,dev);}
     SSM_DBG_SYNC;
+      _DBG_TOK("V",bxb+2*qk_dim);
     /* Alpha/beta vecdot (read from RMSNorm'd bffn_norm) */
     if(ok){gguf_type_t at=lw->type_ssm_alpha,bt=lw->type_ssm_beta;
       size_t ra=gguf_type_row_size(at,dim),rb=gguf_type_row_size(bt,dim);
       if(at!=0&&at!=2&&at!=8&&at!=30){static int w1=0;if(!w1){fprintf(stderr,"WARN: ssm_prefill_layer_gpu bail: alpha type=%d (need F32/Q4_0/Q8_0/BF16)\n",(int)at);w1=1;}return 0;}
       if(bt!=0&&bt!=2&&bt!=8&&bt!=30){static int w2=0;if(!w2){fprintf(stderr,"WARN: ssm_prefill_layer_gpu bail: beta type=%d (need F32/Q4_0/Q8_0/BF16)\n",(int)bt);w2=1;}return 0;}
       const int *hm=do_remap&&gw->ssm_head_map_dev?(const int*)gw->ssm_head_map_dev:NULL;
-      ok&=picolm_gpu_ssm_vecdot_batch_dev(bgate,bffn_norm,(void*)picolm_gpu_tensor_weights((picolm_gpu_tensor_t*)gl->ssm_alpha),at,dim,n_v,n_tokens,(int)ra,hm,dev);
+      ok&=picolm_gpu_ssm_vecdot_batch_dev(bgate,bffn_norm,(void*)picolm_gpu_tensor_weights((picolm_gpu_tensor_t*)gl->ssm_alpha),at,dim,n_v,n_tokens,(int)ra,hm,dev,xb2_stride);
     SSM_DBG_SYNC;
-      ok&=picolm_gpu_ssm_vecdot_batch_dev(bup,bffn_norm,(void*)picolm_gpu_tensor_weights((picolm_gpu_tensor_t*)gl->ssm_beta),bt,dim,n_v,n_tokens,(int)rb,hm,dev);}
+      ok&=picolm_gpu_ssm_vecdot_batch_dev(bup,bffn_norm,(void*)picolm_gpu_tensor_weights((picolm_gpu_tensor_t*)gl->ssm_beta),bt,dim,n_v,n_tokens,(int)rb,hm,dev,xb2_stride);}
     SSM_DBG_SYNC;
 #ifdef PICOLM_SSM_VERIFY
     if(ok && l == 0) {
@@ -9141,12 +9156,68 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
     /* Gate/beta post-process */
     if(ok){float *dw=(float*)gw->ssm_dt_dev[l],*aw=(float*)gw->ssm_a_dev[l];
       if(!dw||!aw)return 0;
-      ok&=picolm_gpu_ssm_gate_beta_batch_dev(bgate,bup,bgate,bup,dw,aw,n_v,n_tokens,dev);}
+      ok&=picolm_gpu_ssm_gate_beta_batch_dev(bgate,bup,bgate,bup,dw,aw,n_v,n_tokens,dev,xb2_stride);}
     SSM_DBG_SYNC;
     /* Chunked recurrence */
+    /* Step-by-step verify: D2H intermediates after each GPU kernel, compare with CPU */
+    if(ok && getenv("PICOLM_SSM_VERIFY") && l == 0) {
+        picolm_gpu_sync(dev);
+        int cs = 64; if(cs > n_tokens) cs = n_tokens;
+        int d = d_state;
+        size_t cb = (size_t)n_tokens * conv_dim * sizeof(float);
+        size_t ab = (size_t)n_tokens * n_v * sizeof(float);
+        float *ch = (float*)malloc(cb), *ah = (float*)malloc(ab), *bh = (float*)malloc(ab);
+        float *sh = (float*)calloc(n_v * d * d, sizeof(float));
+        /* D2H conv_batch (Q+K+V), alpha, beta */
+        for (int _t = 0; _t < n_tokens; _t++) {
+            picolm_gpu_memcpy(ch + _t * conv_dim, bxb + (size_t)_t * xb2_stride, conv_dim * sizeof(float), -1, dev);
+            picolm_gpu_memcpy(ah + _t * n_v, bgate + (size_t)_t * xb2_stride, n_v * sizeof(float), -1, dev);
+            picolm_gpu_memcpy(bh + _t * n_v, bup + (size_t)_t * xb2_stride, n_v * sizeof(float), -1, dev);
+        }
+        /* D2H state */
+        float *st_h = (float*)calloc(n_v * d * d, sizeof(float));
+        picolm_gpu_memcpy(st_h, st_dev, n_v * d * d * sizeof(float), -1, dev);
+        /* Run CPU recurrence to get intermediates */
+        /* We'll manually replicate the chunked steps on CPU and compare with GPU D2H dumps */
+        int ca = cs; int co2 = 0;
+        /* === DECAY KERNEL === */
+        /* D2H d_gl (gate_log), compute CPU decay_mask, D2H GPU decay_mask */
+        {
+            float *d_gl_dev = (float*)malloc(n_v * ca * sizeof(float));
+            float *d_gl_cpu = (float*)calloc(n_v * ca, sizeof(float));
+            float *d_dm_dev = (float*)malloc(n_v * ca * ca * sizeof(float));
+            float *d_dm_cpu = (float*)calloc(n_v * ca * ca, sizeof(float));
+            /* gate_log is ah (alpha_batch) after gate/beta post-process */
+            /* Copy gate_log from ah[co2..co2+ca] for all heads */
+            for (int h = 0; h < n_v; h++)
+                memcpy(d_gl_cpu + h * ca, ah + (co2 * n_v + h), ca * sizeof(float));
+            /* Compute CPU decay: cum_g, q_decay, decay_mask */
+            for (int h = 0; h < n_v; h++) {
+                float cg = 0.0f;
+                for (int t = 0; t < ca; t++) {
+                    cg += d_gl_cpu[h * ca + t];
+                    if (cg > 50) cg = 50;
+                }
+                float *dm = d_dm_cpu + h * ca * ca;
+                for (int t1 = 0; t1 < ca; t1++) {
+                    float g = 0.0f;
+                    for (int t2 = 0; t2 <= t1; t2++) {
+                        g += d_gl_cpu[h * ca + t2];
+                        dm[t1 * ca + t2] = expf(-g);
+                    }
+                }
+            }
+            fprintf(stderr, "[STEP l0] decay_mask CPU dm[0][0..3]={%.6f,%.6f,%.6f,%.6f} dm[ca-1][0..3]={%.6f,%.6f,%.6f,%.6f}\n",
+                d_dm_cpu[0], d_dm_cpu[1], d_dm_cpu[2], d_dm_cpu[3],
+                d_dm_cpu[(ca-1)*ca], d_dm_cpu[(ca-1)*ca+1], d_dm_cpu[(ca-1)*ca+2], d_dm_cpu[(ca-1)*ca+3]);
+            free(d_gl_dev); free(d_gl_cpu); free(d_dm_dev); free(d_dm_cpu);
+        }
+        free(ch); free(ah); free(bh); free(sh); free(st_h);
+    }
     if(ok){
         ok&=picolm_gpu_ssm_chunked_recurrence_dev(bxb,bgate,bup,st_dev,battn_out,n_tokens,value_dim,xb2_stride,d_state,n_k,n_v,hvdim,repeat,conv_dim,64,dev);
     SSM_DBG_SYNC;
+        _DBG_TOK("xb2",battn_out);
         if(ok && getenv("PICOLM_SSM_VERIFY") && (l%16==0)) {
             /* D2H GPU recurrence output and compare with CPU reference */
             size_t xb2_bytes=(size_t)n_tokens*value_dim*sizeof(float);
@@ -9154,18 +9225,28 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
             float *xb2_cpu=(float*)calloc(n_tokens*value_dim,sizeof(float));
             if(xb2_gpu&&xb2_cpu){
                 picolm_gpu_sync(dev);
-                picolm_gpu_memcpy(xb2_gpu,battn_out,xb2_bytes,0,dev);
+                /* Copy xb2 with proper xb2_stride (battn_out is strided) */
+                for (int _t = 0; _t < n_tokens; _t++)
+                    picolm_gpu_memcpy(xb2_gpu + _t * value_dim, battn_out + (size_t)_t * xb2_stride, value_dim * sizeof(float), -1, dev);
                 /* Run CPU recurrence on same inputs */
                 size_t cb=(size_t)n_tokens*conv_dim*sizeof(float);
                 size_t ab=(size_t)n_tokens*n_v*sizeof(float);
                 float *ch=(float*)malloc(cb),*ah=(float*)malloc(ab),*bh=(float*)malloc(ab);
                 if(ch&&ah&&bh){
-                    picolm_gpu_memcpy(ch,bxb,cb,0,dev);
-                    picolm_gpu_memcpy(ah,bgate,ab,0,dev);
-                    picolm_gpu_memcpy(bh,bup,ab,0,dev);
+                    /* Copy conv_batch with proper xb2_stride (not contiguous) */
+                    for (int _t = 0; _t < n_tokens; _t++) {
+                        picolm_gpu_memcpy(ch + _t * conv_dim, bxb + (size_t)_t * xb2_stride, conv_dim * sizeof(float), -1, dev);
+                        picolm_gpu_memcpy(ah + _t * n_v, bgate + (size_t)_t * xb2_stride, n_v * sizeof(float), -1, dev);
+                        picolm_gpu_memcpy(bh + _t * n_v, bup + (size_t)_t * xb2_stride, n_v * sizeof(float), -1, dev);
+                    }
+                    fprintf(stderr, "[DBG] l0 gate_log D2H h0: t0=%.6f t1=%.6f t5=%.6f t10=%.6f t20=%.6f t35=%.6f\n",
+                        ah[0], ah[n_v], ah[5*n_v], ah[10*n_v], ah[20*n_v], ah[35*n_v]);
                     float *sh=(float*)calloc(n_v*d_state*d_state,sizeof(float));
                     ssm_chunked_recurrence(ch,ah,bh,sh,xb2_cpu,n_tokens,value_dim,d_state,n_k,n_v,hvdim,repeat,conv_dim,m->ssm_chunk_size);
                     free(sh);
+                    fprintf(stderr, "[DBG] l0 CPU xb2 tok0={%.6f %.6f %.6f %.6f} tok9={%.6f %.6f %.6f %.6f}\n",
+                        xb2_cpu[0],xb2_cpu[1],xb2_cpu[2],xb2_cpu[3],
+                        xb2_cpu[9*value_dim],xb2_cpu[9*value_dim+1],xb2_cpu[9*value_dim+2],xb2_cpu[9*value_dim+3]);
                     /* Compare */
                     float maxd=0;
                     for(int i=0;i<n_tokens*value_dim;i++){float d=xb2_gpu[i]-xb2_cpu[i];if(d<0)d=-d;if(d>maxd)maxd=d;}
@@ -9272,7 +9353,9 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
     if(ok){float *nw=(float*)gw->ssm_norm_dev[l];
       if(!nw)return 0;
       ok&=picolm_gpu_ssm_prefill_gated_norm_dev(battn_out,bq,nw,hvdim,n_v,n_tokens,eps,value_dim,value_dim,dev);}
+    if(ok) ok&=picolm_gpu_sync(dev);
     SSM_DBG_SYNC;
+      _DBG_TOK("gn_out",battn_out);
     /* Output projection: reuse bffn_norm as temp, then residual add into bx */
     if(ok && l == 0 && getenv("PICOLM_SSM_VERIFY")) {
         picolm_gpu_sync(dev);
@@ -9298,14 +9381,16 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
     }
     if(ok){
       /* Head-permute battn_out to GGUF column order before ssm_out matmul.
-       * Read from battn_out (stride xb2_stride), write to bxb (stride xb_stride >= value_dim).
-       * Then matmul reads bxb with stride value_dim and writes to bffn_norm (stride dim). */
+       * Read from battn_out (stride xb2_stride), write to bxb with stride value_dim (packed).
+       * Then matmul reads bxb with stride value_dim (x_stride=0 -> defaults to I=value_dim).
+       * Writes to bffn_norm with stride dim. */
       if(do_remap && gw->ssm_head_map_dev)
         ok&=picolm_gpu_ssm_head_permute_batch_dev(bxb,battn_out,(const int*)gw->ssm_head_map_dev,hvdim,n_v,n_tokens,xb2_stride,value_dim,dev);
       else
         ok&=picolm_gpu_ssm_head_permute_batch_dev(bxb,battn_out,NULL,hvdim,n_v,n_tokens,xb2_stride,value_dim,dev);
       SSM_DBG_SYNC;
       if(!ok) return 0;
+      /* ssm_out matmul: read bxb packed at value_dim, write bffn_norm packed at dim */
       ok&=picolm_gpu_matmul_dev((picolm_gpu_tensor_t*)gl->ssm_out,bffn_norm,bxb,n_tokens,dev,dim,0);
     SSM_DBG_SYNC;
       if(getenv("PICOLM_SSM_VERIFY") && (l%16==0)) {
@@ -9328,12 +9413,38 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
     SSM_DBG_SYNC;
     /* FFN */
     if(ok&&lw->ffn_gate&&lw->ffn_up&&lw->ffn_down){
+      if(l == 0 && getenv("PICOLM_SSM_VERIFY")) {
+          float ffn_in[8];
+          picolm_gpu_sync(dev);
+          picolm_gpu_memcpy(ffn_in, bx + (size_t)(n_tokens-1)*dim, sizeof(ffn_in), -1, dev);
+          fprintf(stderr, "[DBG] l0 FFN bx_in[:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+              ffn_in[0],ffn_in[1],ffn_in[2],ffn_in[3],ffn_in[4],ffn_in[5],ffn_in[6],ffn_in[7]);
+      }
       ok&=picolm_gpu_rmsnorm_batched_dev(bffn_norm,bx,(float*)s->post_attn_norm_w[l],dim,eps,n_tokens,dev);
     SSM_DBG_SYNC;
       ok&=picolm_gpu_expert_mlp_dev((picolm_gpu_tensor_t*)gl->ffn_gate,(picolm_gpu_tensor_t*)gl->ffn_up,(picolm_gpu_tensor_t*)gl->ffn_down,battn_out,bffn_norm,n_tokens,dev);
     SSM_DBG_SYNC;
       ok&=picolm_gpu_residual_add(bx,bx,battn_out,n_tokens*dim,dev);}
     SSM_DBG_SYNC;
+    /* Dump FFN output (battn_out, last token) */
+    if (l == 0 && ok && getenv("PICOLM_SSM_VERIFY")) {
+        float ff[8];
+        picolm_gpu_sync(dev);
+        picolm_gpu_memcpy(ff, battn_out + (size_t)(n_tokens-1)*dim, sizeof(ff), -1, dev);
+        fprintf(stderr, "[DBG] l0 FFN out_last[:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+            ff[0],ff[1],ff[2],ff[3],ff[4],ff[5],ff[6],ff[7]);
+    }
+    /* Dump bx_last for bit-exact GPU vs CPU comparison */
+    if (l == 0 && ok) {
+        picolm_gpu_sync(dev);
+        float bx_v[100];
+        picolm_gpu_memcpy(bx_v, bx + (size_t)(n_tokens-1)*dim, 400, -1, dev);
+        float bx_rms=0;
+        for (int i=0;i<100;i++) bx_rms += bx_v[i]*bx_v[i];
+        bx_rms = sqrtf(bx_rms/100);
+        fprintf(stderr, "[GPU l%d] bx_last[:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f} rms100=%.6f\n",
+            l, bx_v[0],bx_v[1],bx_v[2],bx_v[3],bx_v[4],bx_v[5],bx_v[6],bx_v[7], bx_rms);
+    }
     return ok;
 #else
     (void)m;(void)s;(void)bx;(void)bxb;(void)bq;(void)battn_out;(void)bffn_norm;
@@ -9931,6 +10042,12 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
           free(ssm_out_buf); }
     }
 #endif
+    if (l == 0 && n_tokens > 0) {
+        int lt = n_tokens - 1;
+        fprintf(stderr, "[CPU l0] bx_last[:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+            x_batch[lt*dim], x_batch[lt*dim+1], x_batch[lt*dim+2], x_batch[lt*dim+3],
+            x_batch[lt*dim+4], x_batch[lt*dim+5], x_batch[lt*dim+6], x_batch[lt*dim+7]);
+    }
     free(ssm_buf);
 }
 
@@ -11337,6 +11454,15 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
                   memcpy(xb,s->x,batch_bytes);
                   ssm_prefill_layer(m,s,xb,xbb,xb2,hb,hb2,lw,l,n_tokens,start_pos,xb2s,(void**)m->gpu.layers);
                   memcpy(s->x,xb,batch_bytes);
+                  /* Dump bx_last for bit-exact GPU vs CPU comparison */
+                  if (l == 0) {
+                      float bx_rms=0;
+                      for (int i=0;i<100;i++) bx_rms += xb[(n_tokens-1)*dim+i]*xb[(n_tokens-1)*dim+i];
+                      bx_rms = sqrtf(bx_rms/100);
+                      fprintf(stderr, "[CPU l0] bx_last[:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f} rms100=%.6f\n",
+                          xb[(n_tokens-1)*dim],xb[(n_tokens-1)*dim+1],xb[(n_tokens-1)*dim+2],xb[(n_tokens-1)*dim+3],
+                          xb[(n_tokens-1)*dim+4],xb[(n_tokens-1)*dim+5],xb[(n_tokens-1)*dim+6],xb[(n_tokens-1)*dim+7], bx_rms);
+                  }
                   picolm_gpu_memcpy(bx,s->x,batch_bytes,1,gpu_dev);free(buf);}
             }
             if(getenv("PICOLM_SSM_VERIFY") && (l%16==0||l==47)){

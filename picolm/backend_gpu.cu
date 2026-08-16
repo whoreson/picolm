@@ -1546,7 +1546,7 @@ picolm_ssm_vecdot_batch_kernel(float *out,
                                 gguf_type_t qtype,
                                 int dim, int n_v_heads, int n_tokens,
                                 int row_bytes,
-                                const int *head_map) {
+                                const int *head_map, int out_stride) {
     int h = gpuBlockIdx_x;
     int t = gpuBlockIdx_y;
     if (h >= n_v_heads || t >= n_tokens) return;
@@ -1633,7 +1633,8 @@ picolm_ssm_vecdot_batch_kernel(float *out,
     default:
         break;
     }
-    out[(size_t)t * n_v_heads + h] = sum;
+    int _os = out_stride > 0 ? out_stride : n_v_heads;
+    out[(size_t)t * _os + h] = sum;
 }
 
 /* ---- SSM causal conv1d + state shift (fused) ----
@@ -2858,7 +2859,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
     int I = t->I, O = t->O;
     int ys = y_stride > 0 ? y_stride : O;
 
-    if (t->qtype == GGUF_TYPE_Q8_0) {
+    if (t->qtype == GGUF_TYPE_Q8_0 && !getenv("PICOLM_FORCE_F32_MATMUL")) {
         int n_blocks = I / 32;
         if (n_blocks < 1 || I % 32 != 0) return 0;
         size_t xq_bytes = (size_t)S * I;
@@ -2881,6 +2882,15 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
         picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
             y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
         if (!gpu_ok(gpuGetLastError(), "q8 matmul (dev)")) return 0;
+        return 1;
+    }
+    if (t->qtype == GGUF_TYPE_Q8_0) {
+        /* Fallback: use per-thread F32 dequant for Q8_0 */
+        dim3 grid((unsigned)O, (unsigned)S);
+        picolm_quant_matmul<<<grid, 256, 0, ctx->stream>>>(y_dev, x_dev, t->weights,
+                                            t->qtype, S, I, O,
+                                            (int)t->row_bytes, x_stride, ys);
+        if (!gpu_ok(gpuGetLastError(), "q8 matmul f32 fallback (dev)")) return 0;
         return 1;
     }
     /* Non-Q8_0 types: use per-thread dequant + F32 accumulation */
@@ -4139,7 +4149,7 @@ picolm_gpu_ssm_vecdot_batch(float *out_host,       /* out [n_tokens][n_v_heads] 
     dim3 grid((unsigned)n_v_heads, (unsigned)n_tokens, 1);
     picolm_ssm_vecdot_batch_kernel<<<grid, 256, 0, ctx->stream>>>(
         (float *)out_dev, (const float *)x_dev, w_dev, qtype, dim, n_v_heads, n_tokens,
-        row_bytes, head_map ? (const int *)hm_dev : NULL);
+        row_bytes, head_map ? (const int *)hm_dev : NULL, 0);
 
     if (!gpu_ok(gpuGetLastError(), "ssm vecdot batch") ||
         !gpu_ok(gpuDeviceSynchronize(), "ssm vecdot batch sync")) return 0;
@@ -4254,7 +4264,8 @@ ssm_chunk_gather_v_kernel(float *chunk_v, float *chunk_beta, float *gate_log,
                            const float *conv_batch, const float *alpha_batch,
                            const float *beta_batch,
                            int chunk_start, int cs_actual, int conv_stride,
-                           int qk_dim, int head_v_dim, int n_v_heads) {
+                           int qk_dim, int head_v_dim, int n_v_heads,
+                           int ab_stride) {
     int h = blockIdx.x;
     if (h >= n_v_heads) return;
     float *cv_h = chunk_v + (size_t)h * cs_actual * head_v_dim;
@@ -4267,11 +4278,12 @@ ssm_chunk_gather_v_kernel(float *chunk_v, float *chunk_beta, float *gate_log,
         const float *tok = conv_batch + (size_t)(chunk_start + t) * conv_stride;
         cv_h[idx] = tok[2 * qk_dim + h * head_v_dim + di];
     }
+    int as = ab_stride > 0 ? ab_stride : n_v_heads;
     for (int t = threadIdx.x; t < cs_actual; t += blockDim.x) {
-        cb_h[t] = beta_batch[(size_t)(chunk_start + t) * n_v_heads + h];
+        cb_h[t] = beta_batch[(size_t)(chunk_start + t) * as + h];
         /* alpha_batch now contains gate_log directly (log-space), not expf(gate).
          * No logf needed -- direct copy, matching the CPU path. */
-        gl_h[t] = alpha_batch[(size_t)(chunk_start + t) * n_v_heads + h];
+        gl_h[t] = alpha_batch[(size_t)(chunk_start + t) * as + h];
     }
 }
 
@@ -4282,10 +4294,11 @@ ssm_chunk_gather_v_kernel(float *chunk_v, float *chunk_beta, float *gate_log,
  * cs x cs mask in parallel once cum_g is visible via __syncthreads(). ---- */
 __global__ void
 ssm_chunk_decay_kernel(float *cum_g, float *q_decay, float *decay_mask,
-                        const float *gate_log, int n_v_heads, int cs) {
+                        const float *gate_log, int n_v_heads, int cs, int gl_stride) {
     int h = blockIdx.x;
     if (h >= n_v_heads) return;
     const float *gl = gate_log + (size_t)h * cs;
+    (void)gl_stride; /* scratch buffer is contiguous head-major */
     float *cg = cum_g + (size_t)h * cs;
     float *qd = q_decay + (size_t)h * cs;
     float *dm = decay_mask + (size_t)h * cs * cs;
@@ -4498,7 +4511,7 @@ ssm_chunk_state_update_kernel(float *state, const float *v_hat, const float *chu
  * CPU reshape loop exactly. ---- */
 __global__ void
 ssm_chunk_scatter_kernel(float *xb2_batch, const float *chunk_out,
-                          int chunk_start, int cs_actual, int value_dim,
+                          int chunk_start, int cs_actual, int xb2_stride,
                           int head_v_dim, int n_v_heads) {
     int h = blockIdx.x;
     if (h >= n_v_heads) return;
@@ -4506,7 +4519,7 @@ ssm_chunk_scatter_kernel(float *xb2_batch, const float *chunk_out,
     int n_elem = cs_actual * head_v_dim;
     for (int idx = threadIdx.x; idx < n_elem; idx += blockDim.x) {
         int t = idx / head_v_dim, r = idx % head_v_dim;
-        xb2_batch[(size_t)(chunk_start + t) * value_dim + h * head_v_dim + r] = co_h[idx];
+        xb2_batch[(size_t)(chunk_start + t) * xb2_stride + h * head_v_dim + r] = co_h[idx];
     }
 }
 
@@ -4641,11 +4654,11 @@ picolm_gpu_ssm_chunked_recurrence(const float *conv_batch_host,
             ssm_chunk_gather_v_kernel<<<n_v_heads, n_threads, 0, ctx->stream>>>(
                 (float *)d_chunk_v, (float *)d_chunk_beta, (float *)d_gate_log,
                 (const float *)d_conv, (const float *)d_alpha, (const float *)d_beta,
-                chunk_start, cs_actual, conv_dim, qk_dim, head_v_dim, n_v_heads);
+                chunk_start, cs_actual, conv_dim, qk_dim, head_v_dim, n_v_heads, 0);
 
             ssm_chunk_decay_kernel<<<n_v_heads, n_threads, 0, ctx->stream>>>(
                 (float *)d_cum_g, (float *)d_q_decay, (float *)d_decay_mask,
-                (const float *)d_gate_log, n_v_heads, cs_actual);
+                (const float *)d_gate_log, n_v_heads, cs_actual, cs_actual);
 
             ssm_chunk_masked_gemm_kernel<<<n_v_heads, n_threads, 0, ctx->stream>>>(
                 (float *)d_M, (const float *)d_chunk_k, (const float *)d_chunk_k,
@@ -5808,12 +5821,12 @@ int picolm_gpu_ssm_l2norm_batch_dev(float *xd, int hd, int nh, int nt, int ts, f
 }
 
 int picolm_gpu_ssm_vecdot_batch_dev(float *od, const float *xd, const void *wd, gguf_type_t qt,
-    int dim, int nvh, int nt, int rb, const int *hm, int dev) {
+    int dim, int nvh, int nt, int rb, const int *hm, int dev, int out_stride) {
     if(nvh<=0||dim<=0||nt<=0) return 0;
     if(dim>PICOLM_SSM_VECDOT_MAX_DIM) return 0;
     gpu_device_ctx_t *ctx = find_ctx(dev);
     if(!ctx||!select_ctx(ctx)) return 0;
-    picolm_ssm_vecdot_batch_kernel<<<dim3((unsigned)nvh,(unsigned)nt),256,0,ctx->stream>>>(od,xd,wd,qt,dim,nvh,nt,rb,hm);
+    picolm_ssm_vecdot_batch_kernel<<<dim3((unsigned)nvh,(unsigned)nt),256,0,ctx->stream>>>(od,xd,wd,qt,dim,nvh,nt,rb,hm,out_stride);
     return gpu_ok(gpuGetLastError(),"vecdot batch dev");
 }
 
@@ -5853,21 +5866,22 @@ __global__ void
  * Now it outputs gate_log = softplus(alpha + dt_w) * a_w, matching the CPU path. */
 picolm_ssm_gate_beta_batch_kernel(float *ge, float *be,
     const float *ai, const float *bi, const float *dw, const float *aw,
-    int nvh, int nt) {
+    int nvh, int nt, int stride) {
     int h = blockIdx.x, t = blockIdx.y;
     if (h >= nvh || t >= nt) return;
     if (threadIdx.x != 0) return;
-    float a = ai[t*nvh+h] + dw[h];
+    int s = stride > 0 ? stride : nvh;
+    float a = ai[t*s+h] + dw[h];
     float sp = (a>20.0f)?a:(a<-20.0f)?expf(a):logf(1.0f+expf(a));
-    ge[t*nvh+h] = sp * aw[h];
-    be[t*nvh+h] = 1.0f/(1.0f+expf(-bi[t*nvh+h]));
+    ge[t*s+h] = sp * aw[h];
+    be[t*s+h] = 1.0f/(1.0f+expf(-bi[t*s+h]));
 }
 
 int picolm_gpu_ssm_gate_beta_batch_dev(float *ge, float *be, const float *ai, const float *bi,
-    const float *dw, const float *aw, int nvh, int nt, int dev) {
+    const float *dw, const float *aw, int nvh, int nt, int dev, int stride) {
     gpu_device_ctx_t *ctx = find_ctx(dev);
     if (!ctx || !select_ctx(ctx)) return 0;
-    picolm_ssm_gate_beta_batch_kernel<<<dim3((unsigned)nvh,(unsigned)nt),1,0,ctx->stream>>>(ge,be,ai,bi,dw,aw,nvh,nt);
+    picolm_ssm_gate_beta_batch_kernel<<<dim3((unsigned)nvh,(unsigned)nt),1,0,ctx->stream>>>(ge,be,ai,bi,dw,aw,nvh,nt,stride);
     return gpu_ok(gpuGetLastError(),"gate beta batch dev");
 }
 
@@ -5998,10 +6012,26 @@ int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv_dev, const float *al
       int co2=ci*cs;
       ssm_chunk_gather_qk_kernel<<<n_k_heads,n_threads,0,ctx->stream>>>((float*)d_cq,(float*)d_ck,conv_dev,co2,ca,xb2_stride,qk_dim,d_state,n_k_heads);
       if(!gpu_ok(gpuGetLastError(),"gather_qk"))return 0;
-      ssm_chunk_gather_v_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>((float*)d_cv,(float*)d_cb,(float*)d_gl,conv_dev,alpha_dev,beta_dev,co2,ca,xb2_stride,qk_dim,head_v_dim,n_v_heads);
+      ssm_chunk_gather_v_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>((float*)d_cv,(float*)d_cb,(float*)d_gl,conv_dev,alpha_dev,beta_dev,co2,ca,xb2_stride,qk_dim,head_v_dim,n_v_heads,xb2_stride);
       if(!gpu_ok(gpuGetLastError(),"gather_v"))return 0;
-      ssm_chunk_decay_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>((float*)d_cg,(float*)d_qd,(float*)d_dm,(float*)d_gl,n_v_heads,ca);
+      ssm_chunk_decay_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>((float*)d_cg,(float*)d_qd,(float*)d_dm,(float*)d_gl,n_v_heads,ca,ca);
       if(!gpu_ok(gpuGetLastError(),"decay"))return 0;
+#ifdef PICOLM_GPU
+      if (getenv("PICOLM_SSM_STEP_VERIFY") && ci == 0) {
+          /* D2H decay_mask and gate_log scratch */
+          float _dm[16], _gl[40], _cg[40];
+          cudaDeviceSynchronize();
+          cudaMemcpy(_dm, d_dm, 64, cudaMemcpyDeviceToHost);
+          cudaMemcpy(_gl, d_gl, 160, cudaMemcpyDeviceToHost);
+          cudaMemcpy(_cg, d_cg, 160, cudaMemcpyDeviceToHost);
+          float _dm_full[1300];
+          cudaMemcpy(_dm_full, d_dm, 5200, cudaMemcpyDeviceToHost);
+          fprintf(stderr, "[STEP l0] dm row0=[%.6f %.6f %.6f %.6f] row1=[%.6f %.6f %.6f %.6f] dm35_0=%.6f dm35_35=%.6f cg0=%.6f cg35=%.6f\n",
+              _dm_full[0],_dm_full[1],_dm_full[2],_dm_full[3],
+              _dm_full[36],_dm_full[37],_dm_full[38],_dm_full[39],
+              _dm_full[35*ca+0], _dm_full[35*ca+35], _cg[0], _cg[35]);
+      }
+#endif
       ssm_chunk_masked_gemm_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>((float*)d_M,(const float*)d_ck,(const float*)d_ck,(const float*)d_dm,n_v_heads,repeat,ca,d);
       if(!gpu_ok(gpuGetLastError(),"M_gemm"))return 0;
       ssm_chunk_matvec_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>((float*)d_sk,state_dev,(const float*)d_ck,n_v_heads,repeat,ca,d);
@@ -6016,6 +6046,18 @@ int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv_dev, const float *al
       if(!gpu_ok(gpuGetLastError(),"kq_gemm"))return 0;
       ssm_chunk_output_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>((float*)d_co,(const float*)d_sq,(const float*)d_qd,(const float*)d_kq,(const float*)d_vh,n_v_heads,ca,d);
       if(!gpu_ok(gpuGetLastError(),"output"))return 0;
+#ifdef PICOLM_GPU
+      if (getenv("PICOLM_SSM_STEP_VERIFY") && ci == 0) {
+          /* D2H v_eff[0][0..3] and v_hat[0][0..3] for head 0 */
+          float _ve[4], _vh[4], _co[4];
+          cudaDeviceSynchronize();
+          cudaMemcpy(_ve, d_ve, 16, cudaMemcpyDeviceToHost);
+          cudaMemcpy(_vh, d_vh, 16, cudaMemcpyDeviceToHost);
+          cudaMemcpy(_co, d_co, 16, cudaMemcpyDeviceToHost);
+          fprintf(stderr, "[STEP l0] GPU ve[0][0..3]={%.6f,%.6f,%.6f,%.6f} vh[0][0..3]={%.6f,%.6f,%.6f,%.6f} co[0][0..3]={%.6f,%.6f,%.6f,%.6f}\n",
+              _ve[0],_ve[1],_ve[2],_ve[3], _vh[0],_vh[1],_vh[2],_vh[3], _co[0],_co[1],_co[2],_co[3]);
+      }
+#endif
       ssm_chunk_scatter_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>(xb2_dev,(const float*)d_co,co2,ca,xb2_stride,head_v_dim,n_v_heads);
       if(!gpu_ok(gpuGetLastError(),"scatter"))return 0;
       ssm_chunk_state_update_kernel<<<n_v_heads,n_threads,0,ctx->stream>>>(state_dev,(const float*)d_vh,(const float*)d_ck,(const float*)d_cg,n_v_heads,repeat,ca,d);
