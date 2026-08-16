@@ -2600,6 +2600,7 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
 /* Forward declaration for SSM v-head remap function (used during GPU weight upload,
  * defined later in the file) */
 static inline int qwen35_vhead_gguf(int h, int n_vpk, int n_k);
+static inline int qwen35_vhead_natural(int g, int n_vpk, int n_k);
 
 /* ---- Public API ---- */
 
@@ -2936,9 +2937,13 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                                                 n_kh < n_vh && half_vpk > 0;
                                     if (do_rm) {
                                         int *hmap = alloca(n_vh * sizeof(int));
-                                        for (int h = 0; h < n_vh; h++)
+                                        int *himap = alloca(n_vh * sizeof(int));
+                                        for (int h = 0; h < n_vh; h++) {
                                             hmap[h] = qwen35_vhead_gguf(h, n_vpk, n_kh);
+                                            himap[h] = qwen35_vhead_natural(h, n_vpk, n_kh);
+                                        }
                                         m->gpu.ssm_head_map_dev = picolm_gpu_upload_int(hmap, n_vh, device);
+                                        m->gpu.ssm_head_invmap_dev = picolm_gpu_upload_int(himap, n_vh, device);
                                     }
                                 }
                             }
@@ -2995,9 +3000,13 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                                     int n_k_heads = c->ssm_n_group;
                                     int n_vpk = c->ssm_dt_rank / n_k_heads;
                                     int *hmap = alloca(n_v_heads * sizeof(int));
-                                    for (int h = 0; h < n_v_heads; h++)
+                                    int *himap = alloca(n_v_heads * sizeof(int));
+                                    for (int h = 0; h < n_v_heads; h++) {
                                         hmap[h] = qwen35_vhead_gguf(h, n_vpk, n_k_heads);
+                                        himap[h] = qwen35_vhead_natural(h, n_vpk, n_k_heads);
+                                    }
                                     m->gpu.ssm_head_map_dev = picolm_gpu_upload_int(hmap, n_v_heads, device);
+                                    m->gpu.ssm_head_invmap_dev = picolm_gpu_upload_int(himap, n_v_heads, device);
                                 }
                             }
                         }
@@ -5503,6 +5512,15 @@ static inline int qwen35_vhead_gguf(int h, int n_vpk, int n_k) {
     int k = h / n_vpk;
     int v = h % n_vpk;
     return v * n_k + k;
+}
+
+/* Inverse: given GGUF head g, recover natural head h.
+ * gguf: g = v*n_k + k, where k=h/n_vpk, v=h%n_vpk
+ * inverse: v = g/n_k, k = g%n_k, h = k*n_vpk + v */
+static inline int qwen35_vhead_natural(int g, int n_vpk, int n_k) {
+    int v = g / n_k;
+    int k = g % n_k;
+    return k * n_vpk + v;
 }
 
 /* ---- SSM per-head task (threaded state recurrence) ----
@@ -9128,7 +9146,12 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
     if(ok&&do_remap&&gw->ssm_head_map_dev){
       ok&=picolm_gpu_ssm_head_permute_batch_dev(battn_out,bxb+2*qk_dim,NULL,hvdim,n_v,n_tokens,xb2_stride,value_dim,dev);
     SSM_DBG_SYNC;
-      ok&=picolm_gpu_ssm_head_permute_batch_dev(bxb+2*qk_dim,battn_out,(const int*)gw->ssm_head_map_dev,hvdim,n_v,n_tokens,value_dim,xb2_stride,dev);}
+      ok&=picolm_gpu_ssm_head_permute_batch_dev(bxb+2*qk_dim,battn_out,(const int*)gw->ssm_head_map_dev,hvdim,n_v,n_tokens,value_dim,xb2_stride,dev);
+      /* Z-gate (bq) permute: GGUF order -> natural order, same two-step trick */
+    SSM_DBG_SYNC;
+      ok&=picolm_gpu_ssm_head_permute_batch_dev(battn_out,bq,NULL,hvdim,n_v,n_tokens,xb2_stride,value_dim,dev);
+    SSM_DBG_SYNC;
+      ok&=picolm_gpu_ssm_head_permute_batch_dev(bq,battn_out,(const int*)gw->ssm_head_map_dev,hvdim,n_v,n_tokens,value_dim,xb2_stride,dev);}
     SSM_DBG_SYNC;
       _DBG_TOK("V",bxb+2*qk_dim);
     /* Alpha/beta vecdot (read from RMSNorm'd bffn_norm) */
@@ -9271,9 +9294,49 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
             xb2_last[0],xb2_last[1],xb2_last[2],xb2_last[3],xb2_last[4],xb2_last[5],xb2_last[6],xb2_last[7], (float)xrms);
         free(xb2_last);
     }
+    if(l == 0 && getenv("PICOLM_SSM_VERIFY")) {
+        /* xb2 per-head dump before gated_norm */
+        { size_t lt2=(size_t)(n_tokens-1)*xb2_stride;
+            float *a2=malloc(value_dim*sizeof(float));
+            for(int hh=0;hh<n_v;hh++){
+                float *seg=a2+hh*hvdim;
+                picolm_gpu_memcpy(seg,battn_out+lt2+hh*hvdim,hvdim*sizeof(float),-1,dev);
+                double h_rms=0; for(int dd=0;dd<hvdim;dd++) h_rms+=seg[dd]*seg[dd];
+                if(hh<4||hh>=n_v-2||sqrt(h_rms/hvdim)>0.001){
+                    fprintf(stderr,"[CMP l0] xb2_h%d rms=%.6f first4={%.6f,%.6f,%.6f,%.6f}\n",
+                        hh,(float)sqrt(h_rms/hvdim),seg[0],seg[1],seg[2],seg[3]);
+                }
+            }
+            free(a2);
+        }
+    }
     if(ok){float *nw=(float*)gw->ssm_norm_dev[l];
       if(!nw)return 0;
+      if(l==0&&getenv("PICOLM_SSM_VERIFY")){
+          float *nwf=(float*)gw->ssm_norm_dev[0];
+          float *nwa=malloc(hvdim*sizeof(float));picolm_gpu_memcpy(nwa,nwf,(size_t)hvdim*sizeof(float),-1,dev);
+          double nr=0;for(int i=0;i<hvdim;i++)nr+=nwa[i]*nwa[i];
+          fprintf(stderr,"[CMP l0] ssm_norm_w rms=%.6f first8={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+              (float)sqrt(nr/hvdim),nwa[0],nwa[1],nwa[2],nwa[3],nwa[4],nwa[5],nwa[6],nwa[7]);
+          free(nwa);
+      }
       ok&=picolm_gpu_ssm_prefill_gated_norm_dev(battn_out,bq,nw,hvdim,n_v,n_tokens,eps,xb2_stride,xb2_stride,dev);}
+    if(l==0&&getenv("PICOLM_SSM_VERIFY")){
+        /* Z-gate (bq) per-head dump */
+        { size_t lt2=(size_t)(n_tokens-1)*xb2_stride;
+            float *a2=malloc(value_dim*sizeof(float));
+            for(int hh=0;hh<n_v;hh++){
+                float *seg=a2+hh*hvdim;
+                picolm_gpu_memcpy(seg,bq+lt2+hh*hvdim,hvdim*sizeof(float),-1,dev);
+                double h_rms=0;float hmax=0; for(int dd=0;dd<hvdim;dd++){h_rms+=seg[dd]*seg[dd];float av=seg[dd];if(av<0)av=-av;if(av>hmax)hmax=av;}
+                if(hh<4||hh>=n_v-2||sqrt(h_rms/hvdim)>0.01){
+                    fprintf(stderr,"[CMP l0] z_h%d rms=%.6f maxabs=%.6f first4={%.6f,%.6f,%.6f,%.6f}\n",
+                        hh,(float)sqrt(h_rms/hvdim),hmax,seg[0],seg[1],seg[2],seg[3]);
+                }
+            }
+            free(a2);
+        }
+    }
     if(ok) ok&=picolm_gpu_sync(dev);
     SSM_DBG_SYNC;
       _DBG_TOK("gn_out",battn_out);
@@ -9286,10 +9349,13 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
     /* Output projection: reuse bffn_norm as temp, then residual add into bx */
     if(ok){
       /* Head-permute battn_out to GGUF column order before ssm_out matmul.
-       * Read from battn_out (stride xb2_stride), write to bxb with stride value_dim (packed).
-       * Then matmul reads bxb with stride value_dim (x_stride=0 -> defaults to I=value_dim).
-       * Writes to bffn_norm with stride dim. */
-      if(do_remap && gw->ssm_head_map_dev)
+       * CPU does: fo_gguf[gh] = xb2_natural[h]  (scatter, forward map)
+       * GPU kernel does: dst[h] = src[map[h]]  (gather)
+       * To match: need dst[h] = src[inv_gguf[h]] so that dst[gh] = src[h].
+       * i.e. use the INVERSE map so the gather reproduces the scatter. */
+      if(do_remap && gw->ssm_head_invmap_dev)
+        ok&=picolm_gpu_ssm_head_permute_batch_dev(bxb,battn_out,(const int*)gw->ssm_head_invmap_dev,hvdim,n_v,n_tokens,xb2_stride,value_dim,dev);
+      else if(do_remap && gw->ssm_head_map_dev)
         ok&=picolm_gpu_ssm_head_permute_batch_dev(bxb,battn_out,(const int*)gw->ssm_head_map_dev,hvdim,n_v,n_tokens,xb2_stride,value_dim,dev);
       else
         ok&=picolm_gpu_ssm_head_permute_batch_dev(bxb,battn_out,NULL,hvdim,n_v,n_tokens,xb2_stride,value_dim,dev);
@@ -9301,6 +9367,37 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
           float hb[8];picolm_gpu_memcpy(hb,bxb+(size_t)(n_tokens-1)*value_dim,32,-1,dev);
           double hr=0;for(int _i=0;_i<8;_i++)hr+=hb[_i]*hb[_i];
           fprintf(stderr,"[CMP l0] hperm_last[:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f} rms8=%.6f\n",hb[0],hb[1],hb[2],hb[3],hb[4],hb[5],hb[6],hb[7],sqrt(hr/8));
+          /* Full bxb last-token dump: per-head RMS */
+          { size_t lt_off=(size_t)(n_tokens-1)*value_dim;
+            int n_vh=value_dim; // = n_v * hvdim = 48*128 = 6144
+            float *hbuf=malloc(n_vh*sizeof(float));
+            picolm_gpu_memcpy(hbuf,bxb+lt_off,(size_t)n_vh*sizeof(float),-1,dev);
+            double frms=0; for(int fi=0;fi<n_vh;fi++) frms+=hbuf[fi]*hbuf[fi];
+            fprintf(stderr,"[CMP l0] bxb_full_rms=%.6f n_vh=%d\n",sqrt(frms/n_vh),n_vh);
+            for(int hh=0;hh<n_v;hh++){
+                double h_rms=0; for(int dd=0;dd<hvdim;dd++) h_rms+=hbuf[hh*hvdim+dd]*hbuf[hh*hvdim+dd];
+                if(hh<4||hh>=n_v-2||sqrt(h_rms/hvdim)>0.01){
+                    fprintf(stderr,"[CMP l0] bxb_h%d rms=%.6f first4={%.6f,%.6f,%.6f,%.6f}\n",
+                        hh,(float)sqrt(h_rms/hvdim),hbuf[hh*hvdim],hbuf[hh*hvdim+1],hbuf[hh*hvdim+2],hbuf[hh*hvdim+3]);
+                }
+            }
+            free(hbuf);
+          }
+          /* battn_out per-head dump (same token, same stride) for comparison */
+          { size_t lt2=(size_t)(n_tokens-1)*xb2_stride;
+            float *a2=malloc(value_dim*sizeof(float));
+            // Read head-by-head from battn_out at xb2_stride offsets
+            for(int hh=0;hh<n_v;hh++){
+                float *seg=a2+hh*hvdim;
+                picolm_gpu_memcpy(seg,battn_out+lt2+hh*hvdim,hvdim*sizeof(float),-1,dev);
+                double h_rms=0; for(int dd=0;dd<hvdim;dd++) h_rms+=seg[dd]*seg[dd];
+                if(hh<4||hh>=n_v-2||sqrt(h_rms/hvdim)>0.01){
+                    fprintf(stderr,"[CMP l0] attn_h%d rms=%.6f first4={%.6f,%.6f,%.6f,%.6f}\n",
+                        hh,(float)sqrt(h_rms/hvdim),seg[0],seg[1],seg[2],seg[3]);
+                }
+            }
+            free(a2);
+          }
       }
       ok&=picolm_gpu_matmul_dev((picolm_gpu_tensor_t*)gl->ssm_out,bffn_norm,bxb,n_tokens,dev,dim,0);
     SSM_DBG_SYNC;
@@ -9803,6 +9900,36 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
         for (int i=0;i<4;i++) { gn_v[i]=xb2_batch[(n_tokens-1)*value_dim+i]; gn_rms+=gn_v[i]*gn_v[i]; }
         gn_rms = sqrtf(gn_rms/4);
         fprintf(stderr, "[CPU l%d] gated_norm rms_last=%.6f {%.6f %.6f %.6f %.6f}\n", l, gn_rms, gn_v[0],gn_v[1],gn_v[2],gn_v[3]);
+        /* Per-head dump after gated_norm */
+        { int lt=n_tokens-1; const float *xb2l=xb2_batch+lt*value_dim;
+          const float *nwm=s->ssm_norm_w[l];
+          double nw_rms=0;for(int i=0;i<head_v_dim;i++)nw_rms+=nwm[i]*nwm[i];
+          fprintf(stderr,"[CPU l0] ssm_norm_w rms=%.6f first8={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+              sqrtf(nw_rms/head_v_dim),nwm[0],nwm[1],nwm[2],nwm[3],nwm[4],nwm[5],nwm[6],nwm[7]);
+          for(int hh=0;hh<n_v_heads;hh++){
+              float h_rms=0; for(int dd=0;dd<head_v_dim;dd++) h_rms+=xb2l[hh*head_v_dim+dd]*xb2l[hh*head_v_dim+dd];
+              if(hh<4||hh>=n_v_heads-2||sqrtf(h_rms/head_v_dim)>0.01){
+                  fprintf(stderr,"[CPU l0] gn_h%d rms=%.6f first4={%.6f,%.6f,%.6f,%.6f}\n",
+                      hh,sqrtf(h_rms/head_v_dim),xb2l[hh*head_v_dim],xb2l[hh*head_v_dim+1],xb2l[hh*head_v_dim+2],xb2l[hh*head_v_dim+3]);
+              }
+          }
+        }
+    }
+
+    /* Per-head gated_norm dump for CPU (always, after both GPU-assisted and pure CPU paths) */
+    if (l == 0) {
+        int lt=n_tokens-1; const float *xb2l=xb2_batch+lt*value_dim;
+        const float *nwm=s->ssm_norm_w[l];
+        double nw_rms=0;for(int i=0;i<head_v_dim;i++)nw_rms+=nwm[i]*nwm[i];
+        fprintf(stderr,"[CPU l0] ssm_norm_w rms=%.6f first8={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+            sqrtf(nw_rms/head_v_dim),nwm[0],nwm[1],nwm[2],nwm[3],nwm[4],nwm[5],nwm[6],nwm[7]);
+        for(int hh=0;hh<n_v_heads;hh++){
+            float h_rms=0; for(int dd=0;dd<head_v_dim;dd++) h_rms+=xb2l[hh*head_v_dim+dd]*xb2l[hh*head_v_dim+dd];
+            if(hh<4||hh>=n_v_heads-2||sqrtf(h_rms/head_v_dim)>0.01){
+                fprintf(stderr,"[CPU l0] gn_h%d rms=%.6f first4={%.6f,%.6f,%.6f,%.6f}\n",
+                    hh,sqrtf(h_rms/head_v_dim),xb2l[hh*head_v_dim],xb2l[hh*head_v_dim+1],xb2l[hh*head_v_dim+2],xb2l[hh*head_v_dim+3]);
+            }
+        }
     }
 
     /* 9. Output projection (batched) */
@@ -9831,6 +9958,18 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
             tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->ssm_out, m->gpu.device);
         }
 #endif
+        if (l == 0) {
+            int lt=n_tokens-1; const float *fb=fo_gguf_batch+lt*value_dim;
+            double frms=0; for(int fi=0;fi<value_dim;fi++) frms+=fb[fi]*fb[fi];
+            fprintf(stderr,"[CPU l0] fo_gguf_rms=%.6f n_vh=%d\n",sqrtf(frms/value_dim),value_dim);
+            for(int hh=0;hh<n_v_heads;hh++){
+                float h_rms=0; for(int dd=0;dd<head_v_dim;dd++) h_rms+=fb[hh*head_v_dim+dd]*fb[hh*head_v_dim+dd];
+                if(hh<4||hh>=n_v_heads-2||sqrtf(h_rms/head_v_dim)>0.01){
+                    fprintf(stderr,"[CPU l0] fo_h%d rms=%.6f first4={%.6f,%.6f,%.6f,%.6f}\n",
+                        hh,sqrtf(h_rms/head_v_dim),fb[hh*head_v_dim],fb[hh*head_v_dim+1],fb[hh*head_v_dim+2],fb[hh*head_v_dim+3]);
+                }
+            }
+        }
         float *ssm_out_buf = (float *)malloc((size_t)n_tokens * dim * sizeof(float));
         matmul_batch(ssm_out_buf, fo_gguf_batch, n_tokens, lw->ssm_out, value_dim, dim, lw->type_ssm_out);
         for (bi = 0; bi < n_tokens; bi++)
@@ -11350,7 +11489,7 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
 
         if (c->has_ssm && !lw->is_attn_layer) {
             /* SSM/hybrid layer: try GPU-native path first, fallback to CPU hybrid */
-            if (l == 0 && ssm_prefill_layer_gpu(m, s, bx, bxb, bq, battn_out, bffn_norm, bgate, bup, lw, l, n_tokens, start_pos, gpu_dev)) {
+            if (ssm_prefill_layer_gpu(m, s, bx, bxb, bq, battn_out, bffn_norm, bgate, bup, lw, l, n_tokens, start_pos, gpu_dev)) {
                 static int w1 = 0;
                 if (!w1) { fprintf(stderr, "INFO: SSM prefill device-native GPU active\n"); w1 = 1; }
             } else {
