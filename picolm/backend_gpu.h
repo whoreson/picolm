@@ -442,6 +442,7 @@ int picolm_gpu_attention_prefill_f32kv(float *xb_out_dev, const float *q_dev,
                                         int device);
 
 /* Free GPU KV cache allocations. */
+void picolm_gpu_kv_cache_clear(int device);
 void picolm_gpu_kv_free(void);
 
 /* ================================================================

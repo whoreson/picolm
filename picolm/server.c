@@ -604,6 +604,9 @@ static void cache_adjust_stepback(model_t *model, int n_prompt, int *start_pos) 
         } else {
             *start_pos = 0;
             model_ssm_state_reset(model);
+#ifdef PICOLM_GPU
+            if (model->gpu.kv_active) { model_ssm_state_reset_gpu(model); picolm_gpu_kv_cache_clear(model->gpu.device); }
+#endif
             checkpoint_restore_log(target, 0, 0, 0);
         }
     } else {
@@ -660,8 +663,19 @@ static float *prefill_with_checkpoints(SOCKET sock, model_t *model,
     /* Non-SSM model, or checkpointing disabled: single batched call */
     if (!model->config.has_ssm || srv.max_checkpoints <= 0) {
         if (n_prefill > 0) {
-            logits = model_forward_prefill(model, tokens, n_prefill, start_pos,
-                                           client_check ? &interrupt : NULL);
+            #ifdef PICOLM_GPU
+            if (model->gpu.kv_active) {
+                logits = model_forward_prefill_gpu(model, tokens, n_prefill, start_pos,
+                                                   client_check ? &interrupt : NULL);
+                if (!logits)
+#endif
+                    logits = model_forward_prefill(model, tokens, n_prefill, start_pos,
+                                                   client_check ? &interrupt : NULL);
+#ifdef PICOLM_GPU
+            } else
+#endif
+                logits = model_forward_prefill(model, tokens, n_prefill, start_pos,
+                                               client_check ? &interrupt : NULL);
             if (!logits) {
                 /* Interrupted during prefill */
                 *out_n_processed = n_processed;
@@ -707,8 +721,19 @@ static float *prefill_with_checkpoints(SOCKET sock, model_t *model,
             checkpoint_save(cur_pos);
         }
 
-        logits = model_forward_prefill(model, tokens + offset, chunk_size, cur_pos,
-                                       client_check ? &interrupt : NULL);
+        #ifdef PICOLM_GPU
+        if (model->gpu.kv_active) {
+            logits = model_forward_prefill_gpu(model, tokens + offset, chunk_size, cur_pos,
+                                               client_check ? &interrupt : NULL);
+            if (!logits)
+#endif
+                logits = model_forward_prefill(model, tokens + offset, chunk_size, cur_pos,
+                                               client_check ? &interrupt : NULL);
+#ifdef PICOLM_GPU
+        } else
+#endif
+            logits = model_forward_prefill(model, tokens + offset, chunk_size, cur_pos,
+                                           client_check ? &interrupt : NULL);
         if (!logits) {
             /* Interrupted inside model_forward_prefill */
             *out_n_processed = n_processed;
@@ -1754,6 +1779,9 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             /* No suitable checkpoint found. Must reprocess everything from scratch. */
             start_pos = 0;
             model_ssm_state_reset(model);
+#ifdef PICOLM_GPU
+            if (model->gpu.kv_active) { model_ssm_state_reset_gpu(model); picolm_gpu_kv_cache_clear(model->gpu.device); }
+#endif
             checkpoint_restore_log(cache_start, 0, cache_start, 0);
         }
     }
@@ -1766,6 +1794,9 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         /* Clear checkpoints and reset SSM state on full reprocess */
         checkpoint_clear();
         model_ssm_state_reset(model);
+#ifdef PICOLM_GPU
+        if (model->gpu.kv_active) { model_ssm_state_reset_gpu(model); picolm_gpu_kv_cache_clear(model->gpu.device); }
+#endif
     }
 
     /* Save prompt tokens for next request */
@@ -2366,6 +2397,9 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         } else {
             start_pos = 0;
             model_ssm_state_reset(model);
+#ifdef PICOLM_GPU
+            if (model->gpu.kv_active) { model_ssm_state_reset_gpu(model); picolm_gpu_kv_cache_clear(model->gpu.device); }
+#endif
             checkpoint_restore_log(cache_start, 0, cache_start, 0);
         }
     }
@@ -2378,6 +2412,9 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         /* Clear checkpoints and reset SSM state on full reprocess */
         checkpoint_clear();
         model_ssm_state_reset(model);
+#ifdef PICOLM_GPU
+        if (model->gpu.kv_active) { model_ssm_state_reset_gpu(model); picolm_gpu_kv_cache_clear(model->gpu.device); }
+#endif
     }
 
     /* Save prompt tokens for next request */

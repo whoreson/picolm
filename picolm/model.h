@@ -576,5 +576,7 @@ size_t model_ssm_state_restore(model_t *m, const uint8_t *buf, size_t buf_size);
 
 /* Reset all SSM state to zero (fresh start). No-op for non-SSM models. */
 void model_ssm_state_reset(model_t *m);
+void model_ssm_state_reset_gpu(model_t *m);
+void picolm_gpu_kv_cache_clear(int device);
 
 #endif /* MODEL_H */

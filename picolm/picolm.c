@@ -869,7 +869,13 @@ int main(int argc, char **argv) {
 
             /* Reset model state for fresh iteration */
             model_ssm_state_reset(&model);
-            /* Zero KV cache */
+#ifdef PICOLM_GPU
+            if (model.gpu.kv_active) {
+                model_ssm_state_reset_gpu(&model);
+                picolm_gpu_kv_cache_clear(model.gpu.device);
+            }
+#endif
+            /* Zero host KV cache (redundant when GPU active, but safe) */
             if (model.state.kv_block)
                 memset(model.state.kv_block, 0, model.state.kv_size);
 

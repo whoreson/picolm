@@ -11353,6 +11353,25 @@ void model_ssm_state_reset(model_t *m) {
 }
 
 #ifdef PICOLM_GPU
+void model_ssm_state_reset_gpu(model_t *m) {
+    const model_config_t *c = &m->config;
+    if (!c->has_ssm || !m->gpu.kv_active) return;
+
+    int device = m->gpu.device;
+    int conv_dim = 2 * c->ssm_d_state * c->ssm_n_group + c->ssm_d_inner;
+    for (int l = 0; l < c->n_layers; l++) {
+        if (m->weights.layers[l].is_attn_layer) continue;
+        if (m->gpu.ssm_state_dev[l]) {
+            size_t st_bytes = (size_t)c->ssm_d_state * c->ssm_d_inner * sizeof(float);
+            picolm_gpu_device_memset(m->gpu.ssm_state_dev[l], 0, st_bytes, device);
+        }
+        if (m->gpu.ssm_conv_state_dev[l]) {
+            size_t cs_bytes = (size_t)(c->ssm_d_conv - 1) * conv_dim * sizeof(float);
+            picolm_gpu_device_memset(m->gpu.ssm_conv_state_dev[l], 0, cs_bytes, device);
+        }
+    }
+}
+
 /* Phase 2: GPU-pipelined decode (skeleton)
  * Keeps activations on-device across all layers.
  * Falls back to model_forward until fully implemented.
@@ -11527,6 +11546,7 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
              * SSM/hybrid layers below have no KV cache entry at all, they
              * index ssm_state_dev/ssm_conv_state_dev by the raw layer index
              * `l` instead. */
+            /* H. Attention decode: pipe_attn_out = attn(pipe_q) */
             picolm_gpu_attention_decode_dev(pipe_attn_out, pipe_q,
                                              this_attn_ordinal - 1, pos,
                                              n_heads, n_kv_heads, head_dim,
@@ -11696,7 +11716,11 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
 
         if (c->has_ssm && !lw->is_attn_layer) {
             /* SSM/hybrid layer: try GPU-native path first, fallback to CPU hybrid */
-            if (ssm_prefill_layer_gpu(m, s, bx, bxb, bq, battn_out, bffn_norm, bgate, bup, lw, l, n_tokens, start_pos, gpu_dev)) {
+            /* GPU SSM prefill disabled: Q8_0 matmul accumulation order differs from
+             * CPU, producing ~3% error per FFN layer that compounds across 48 SSM
+             * layers. The recurrence and all other GPU kernels are correct.
+             * TODO: fix picolm_quant_matmul accumulation order to match CPU NEON. */
+            if (0 && ssm_prefill_layer_gpu(m, s, bx, bxb, bq, battn_out, bffn_norm, bgate, bup, lw, l, n_tokens, start_pos, gpu_dev)) {
                 static int w1 = 0;
                 if (!w1) { fprintf(stderr, "INFO: SSM prefill device-native GPU active\n"); w1 = 1; }
             } else {

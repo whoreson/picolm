@@ -1017,17 +1017,23 @@ picolm_gpu_attention_decode_kernel(
 
         for (int g = 0; g < kv_mul; g++) {
             const float *qg = q_dev + (size_t)(first_qh + g) * head_dim;
-            float score = 0.0f;
-            for (int d = tid; d < head_dim; d += n_threads) {
-                score += qg[d] * gpu_fp16_to_fp32(k_sh[d]);
+            float score;
+            if (tid == 0) {
+                /* Match CPU AVX-512 accumulation: 8 chunks of 16, tree reduce */
+                float chunk[8] = {0};
+                for (int c = 0; c < 8; c++) {
+                    float s = 0;
+                    for (int d = c * 16; d < (c + 1) * 16; d++) {
+                        s = fmaf(qg[d], gpu_fp16_to_fp32(k_sh[d]), s);
+                    }
+                    chunk[c] = s;
+                }
+                chunk[0] += chunk[4]; chunk[1] += chunk[5];
+                chunk[2] += chunk[6]; chunk[3] += chunk[7];
+                chunk[0] += chunk[2]; chunk[1] += chunk[3];
+                chunk[0] += chunk[1];
+                score = chunk[0] / sqrt_hd;
             }
-            reduce_sh[tid] = score;
-            gpuSyncthreads();
-            for (int s = n_threads / 2; s > 0; s >>= 1) {
-                if (tid < s) reduce_sh[tid] += reduce_sh[tid + s];
-                gpuSyncthreads();
-            }
-            score = reduce_sh[0] / sqrt_hd;
 
             if (tid == 0) {
                 if (score > max_score_sh[g]) {
@@ -1045,7 +1051,14 @@ picolm_gpu_attention_decode_kernel(
 
             float *accg = acc_sh + (size_t)g * head_dim;
             for (int d = tid; d < head_dim; d += n_threads) {
-                accg[d] = accg[d] * rescale_sh + weight_sh * gpu_fp16_to_fp32(v_sh[d]);
+                /* Match CPU AVX-512 FMA accumulation order.
+                 * Correction path (score > max): acc = fmaf(acc, rescale, v)
+                 * Weight path (score <= max): acc = fmaf(v, weight, acc)
+                 * Both paths produce: acc*rescale + weight*v but with different
+                 * rounding order. Since rescale=1 in weight path and weight=1 in
+                 * correction path, either fmaf works. Use the correction path form. */
+                float v_f = gpu_fp16_to_fp32(v_sh[d]);
+                accg[d] = fmaf(accg[d], rescale_sh, fmaf(weight_sh, v_f, 0.0f));
             }
             gpuSyncthreads(); /* reduce_sh/rescale_sh/weight_sh reused next g/t iter */
         }
@@ -1141,16 +1154,22 @@ picolm_gpu_attention_decode_split_kernel(
 
             for (int g = 0; g < kv_mul; g++) {
                 const float *qg = q_dev + (size_t)(first_qh + g) * head_dim;
-                float score = 0.0f;
-                for (int d = tid; d < head_dim; d += n_threads)
-                    score += qg[d] * gpu_fp16_to_fp32(k_sh[d]);
-                reduce_sh[tid] = score;
-                gpuSyncthreads();
-                for (int s = n_threads / 2; s > 0; s >>= 1) {
-                    if (tid < s) reduce_sh[tid] += reduce_sh[tid + s];
-                    gpuSyncthreads();
+                float score;
+                if (tid == 0) {
+                    float chunk[8] = {0};
+                    for (int c = 0; c < 8; c++) {
+                        float s = 0;
+                        for (int d = c * 16; d < (c + 1) * 16; d++) {
+                            s = fmaf(qg[d], gpu_fp16_to_fp32(k_sh[d]), s);
+                        }
+                        chunk[c] = s;
+                    }
+                    chunk[0] += chunk[4]; chunk[1] += chunk[5];
+                    chunk[2] += chunk[6]; chunk[3] += chunk[7];
+                    chunk[0] += chunk[2]; chunk[1] += chunk[3];
+                    chunk[0] += chunk[1];
+                    score = chunk[0] / sqrt_hd;
                 }
-                score = reduce_sh[0] / sqrt_hd;
 
                 if (tid == 0) {
                     if (score > max_score_sh[g]) {
@@ -1167,8 +1186,10 @@ picolm_gpu_attention_decode_split_kernel(
                 gpuSyncthreads();
 
                 float *accg = acc_sh + (size_t)g * head_dim;
-                for (int d = tid; d < head_dim; d += n_threads)
-                    accg[d] = accg[d] * rescale_sh + weight_sh * gpu_fp16_to_fp32(v_sh[d]);
+                for (int d = tid; d < head_dim; d += n_threads) {
+                    float v_f2 = gpu_fp16_to_fp32(v_sh[d]);
+                    accg[d] = fmaf(accg[d], rescale_sh, fmaf(weight_sh, v_f2, 0.0f));
+                }
                 gpuSyncthreads();
             }
         }
@@ -1361,7 +1382,7 @@ picolm_gpu_attention_prefill_f32kv_kernel(
                 gpuSyncthreads();
 
                 for (int d = tid; d < head_dim; d += n_threads) {
-                    accqi[d] = accqi[d] * rescale_sh + weight_sh * v_tile_f[ti * head_dim + d];
+                    accqi[d] = fmaf(accqi[d], rescale_sh, fmaf(weight_sh, v_tile_f[ti * head_dim + d], 0.0f));
                 }
                 gpuSyncthreads();
             }
@@ -1520,7 +1541,7 @@ picolm_gpu_attention_prefill_kernel(
                 gpuSyncthreads();
 
                 for (int d = tid; d < head_dim; d += n_threads) {
-                    accqi[d] = accqi[d] * rescale_sh + weight_sh * gpu_fp16_to_fp32(v_tile[ti * head_dim + d]);
+                    accqi[d] = fmaf(accqi[d], rescale_sh, fmaf(weight_sh, gpu_fp16_to_fp32(v_tile[ti * head_dim + d]), 0.0f));
                 }
                 gpuSyncthreads(); /* reduce_sh/rescale_sh/weight_sh reused next ti/qi */
             }
@@ -4916,6 +4937,15 @@ picolm_gpu_kv_alloc(size_t kv_k_bytes, size_t kv_v_bytes, int device) {
     }
 
     return 1;
+}
+
+extern "C" void
+picolm_gpu_kv_cache_clear(int device) {
+    if (device < 0 || device >= PICOLM_GPU_MAX_DEVICES) return;
+    if (g_kv_k_dev[device] && g_kv_k_cap[device])
+        gpuMemset(g_kv_k_dev[device], 0, g_kv_k_cap[device]);
+    if (g_kv_v_dev[device] && g_kv_v_cap[device])
+        gpuMemset(g_kv_v_dev[device], 0, g_kv_v_cap[device]);
 }
 
 extern "C" void
