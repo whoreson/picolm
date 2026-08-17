@@ -5932,6 +5932,16 @@ int picolm_gpu_expert_mlp_dev(picolm_gpu_tensor_t *g, picolm_gpu_tensor_t *u, pi
     if(!reserve(&ctx->gate,&ctx->gate_cap,(size_t)S*I*sizeof(float))||
        !reserve(&ctx->up,&ctx->up_cap,(size_t)S*I*sizeof(float))) return 0;
 
+    /* F32 fallback for debugging: bypass Q8_0 int8 MAC entirely */
+    if (getenv("PICOLM_FORCE_F32_MLP") || getenv("PICOLM_FORCE_F32_MATMUL")) {
+        if (!picolm_gpu_matmul_dev(g, ctx->gate, xd, S, dev, I, x_stride)) return 0;
+        if (!picolm_gpu_matmul_dev(u, ctx->up, xd, S, dev, I, x_stride)) return 0;
+        picolm_silu_mul<<<(unsigned)((S*I+255)/256),256,0,ctx->stream>>>(ctx->gate, ctx->up, S*I);
+        if (!gpu_ok(gpuGetLastError(), "expert silu")) return 0;
+        int ys = y_stride > 0 ? y_stride : D;
+        if (!picolm_gpu_matmul_dev(d, yd, ctx->gate, S, dev, ys, I)) return 0;
+        return 1;
+    }
     /* Q8_0 fast path: quantize F32 input to Q8_0, then int8 MAC */
     int d_blocks = D / 32;
     int i_blocks = I / 32;

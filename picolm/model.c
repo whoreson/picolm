@@ -9075,8 +9075,11 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
     int n_vpk = n_k > 0 ? n_v / n_k : 0, half_vpk = n_vpk / 2;
     int do_remap = !m->from_safetensors && n_k > 0 && n_k < n_v && half_vpk > 0;
     int ok=1;
-    /* Pipe buffer stride: matches pipeline_batch_alloc */
+    /* Pipe buffer stride: must match pipeline_batch_alloc's xb_stride calculation */
     int xb2_stride = c->n_heads * c->head_dim * (c->has_ssm ? 2 : 1);
+    if (dim > xb2_stride) xb2_stride = dim;
+    int ssm_conv_dim = 2 * c->ssm_d_state * c->ssm_n_group + c->ssm_d_inner;
+    if (ssm_conv_dim > xb2_stride) xb2_stride = ssm_conv_dim;
     /* bffn_norm temporarily holds the RMSNorm'd input until vecdot consumes it.
      * bxb becomes the Q/K/V-conv working buffer immediately after. */
 
@@ -9114,6 +9117,14 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
     ok&=picolm_gpu_matmul_dev((picolm_gpu_tensor_t*)gl->attn_gate_ssm,bq,bffn_norm,n_tokens,dev,xb2_stride,xb2_stride);
     SSM_DBG_SYNC;
     _DBG_RMS("gate",bq,xb2_stride);
+    if(l<=4&&getenv("PICOLM_SSM_VERIFY")) {
+        /* Dump FFN gate matmul output for comparison */
+        { float fi[4];
+          picolm_gpu_sync(dev);
+          picolm_gpu_memcpy(fi, bffn_norm, 16, -1, dev);
+          fprintf(stderr,"[DBG] l=%d bffn_norm_tok0[:4]={%.6f,%.6f,%.6f,%.6f}\n",l,fi[0],fi[1],fi[2],fi[3]);
+        }
+    }
     /* Dump conv1d weight for debugging */
     if (l == 0) {
         float cw[16], cs[12];
@@ -9452,16 +9463,49 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
     }
     /* FFN */
     if(ok&&lw->ffn_gate&&lw->ffn_up&&lw->ffn_down){
+      if(l<=4&&getenv("PICOLM_SSM_VERIFY")) {
+        /* Dump FFN rmsnorm output (bffn_norm) token 0 for comparison with CPU */
+        { float ffn0[4];
+          picolm_gpu_sync(dev);
+          picolm_gpu_memcpy(ffn0, bffn_norm, 16, -1, dev);
+          fprintf(stderr,"[DBG] l=%d ffn_norm_out_tok0[:4]={%.6f,%.6f,%.6f,%.6f}\n",l,ffn0[0],ffn0[1],ffn0[2],ffn0[3]);
+        }
+          float pw[dim]; picolm_gpu_sync(dev);
+          picolm_gpu_memcpy(pw, s->post_attn_norm_w[l], dim*4, -1, dev);
+          double pr=0; for(int _i=0;_i<dim;_i++) pr += (double)pw[_i]*pw[_i];
+          fprintf(stderr,"[DBG] l=%d post_attn_norm_w rms=%.6f\n",l,sqrt(pr/dim));
+          /* Also dump bx input rms */
+          float bxi[dim];
+          picolm_gpu_memcpy(bxi, bx + (size_t)(n_tokens-1)*xb2_stride, dim*4, -1, dev);
+          double br=0; for(int _i=0;_i<dim;_i++) br += (double)bxi[_i]*bxi[_i];
+          fprintf(stderr,"[DBG] l=%d bx_ffn_in rms=%.6f\n",l,sqrt(br/dim));
+      }
       ok&=picolm_gpu_rmsnorm_batched_dev(bffn_norm,bx,(float*)s->post_attn_norm_w[l],dim,eps,n_tokens,xb2_stride,dev);
     SSM_DBG_SYNC;
+    if(l<=4&&getenv("PICOLM_SSM_VERIFY")) {
+        float bn[5120]; picolm_gpu_sync(dev);
+        picolm_gpu_memcpy(bn, bffn_norm + (size_t)(n_tokens-1)*xb2_stride, 5120*4, -1, dev);
+        double ss=0; for(int _i=0;_i<5120;_i++) ss += (double)bn[_i]*bn[_i];
+        double rms = sqrt(ss/5120);
+        fprintf(stderr,"[DBG] l=%d bffn_norm_last rms=%.6f stride=%d (want ~1.0)\n",l,rms,xb2_stride);
+        /* Also dump first 4 elements */
+        fprintf(stderr,"[DBG] l=%d bffn_norm_last[:4]={%.6f,%.6f,%.6f,%.6f}\n",l,bn[0],bn[1],bn[2],bn[3]);
+    }
       ok&=picolm_gpu_expert_mlp_dev((picolm_gpu_tensor_t*)gl->ffn_gate,(picolm_gpu_tensor_t*)gl->ffn_up,(picolm_gpu_tensor_t*)gl->ffn_down,battn_out,bffn_norm,n_tokens,xb2_stride,xb2_stride,dev);
     SSM_DBG_SYNC;
+      if(l<=4&&getenv("PICOLM_SSM_VERIFY")) {
+        { float ffn0o[4];
+          picolm_gpu_sync(dev);
+          picolm_gpu_memcpy(ffn0o, battn_out, 16, -1, dev);
+          fprintf(stderr,"[DBG] l=%d ffn_out_tok0[:4]={%.6f,%.6f,%.6f,%.6f}\n",l,ffn0o[0],ffn0o[1],ffn0o[2],ffn0o[3]);
+        }
+      }
       ok&=picolm_gpu_residual_add(bx,bx,battn_out,n_tokens,dim,xb2_stride,dev);}
     SSM_DBG_SYNC;
     if (l == 0 && ok && getenv("PICOLM_SSM_VERIFY")) {
         float fi[8];
         picolm_gpu_sync(dev);
-        picolm_gpu_memcpy(fi, bffn_norm + (size_t)(n_tokens-1)*dim, sizeof(fi), -1, dev);
+        picolm_gpu_memcpy(fi, bffn_norm + (size_t)(n_tokens-1)*xb2_stride, sizeof(fi), -1, dev);
         double firms=0;for(int _i=0;_i<8;_i++)firms+=fi[_i]*fi[_i];
         fprintf(stderr,"[CMP l%d] ffn_in_last[:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f} rms8=%.6f\n",
             l, fi[0],fi[1],fi[2],fi[3],fi[4],fi[5],fi[6],fi[7],sqrt(firms/8));
@@ -10142,6 +10186,14 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
                               lw->ffn_gate, lw->ffn_up, dim, c->n_ffn,
                               lw->type_ffn_gate, lw->type_ffn_up);
             tensor_set_repacked(NULL);
+            if(l==0 && getenv("PICOLM_SSM_VERIFY")) {
+                float *g0 = hb_batch;  /* token 0 gate output */
+                fprintf(stderr,"[CPU l0] ffn_gate_tok0[:4]={%.6f,%.6f,%.6f,%.6f}\n",g0[0],g0[1],g0[2],g0[3]);
+                /* RMSNorm input (ssm_xb) for token 0 */
+                float *s0 = ssm_xb;
+                double sr=0; for(int _i=0;_i<8;_i++) sr+=s0[_i]*s0[_i];
+                fprintf(stderr,"[CPU l0] ffn_norm_in_tok0[:4]={%.6f,%.6f,%.6f,%.6f} rms8=%.6f\n",s0[0],s0[1],s0[2],s0[3],sqrt(sr/8));
+            }
 
             for (bi = 0; bi < n_tokens; bi++) {
                 silu(hb_batch + bi * c->n_ffn, c->n_ffn);
@@ -10152,6 +10204,16 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
             tensor_set_repacked(m->repack_used[ri+8] ? m->repack_buffers[ri+8] : NULL);
             matmul_batch(xb2_batch, hb_batch, n_tokens, lw->ffn_down, c->n_ffn, dim, lw->type_ffn_down);
             tensor_set_repacked(NULL);
+        }
+        if(l==0 && getenv("PICOLM_SSM_VERIFY")) {
+            float *xb2l = xb2_batch + (n_tokens-1)*dim;
+            float *xb20 = xb2_batch;  /* token 0 */
+            double fr=0; for(int _i=0;_i<8;_i++) fr += xb2l[_i]*xb2l[_i];
+            fprintf(stderr,"[CPU l0] ffn_out_last[:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f} rms8=%.6f\n",
+                xb2l[0],xb2l[1],xb2l[2],xb2l[3],xb2l[4],xb2l[5],xb2l[6],xb2l[7],sqrt(fr/8));
+            double f0=0; for(int _i=0;_i<8;_i++) f0 += xb20[_i]*xb20[_i];
+            fprintf(stderr,"[CPU l0] ffn_out_tok0[:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f} rms8=%.6f\n",
+                xb20[0],xb20[1],xb20[2],xb20[3],xb20[4],xb20[5],xb20[6],xb20[7],sqrt(f0/8));
         }
 
         for (bi = 0; bi < n_tokens; bi++) {
