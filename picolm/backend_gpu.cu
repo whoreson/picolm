@@ -1535,14 +1535,15 @@ picolm_ssm_vecdot_batch_kernel(float *out,
                                 gguf_type_t qtype,
                                 int dim, int n_v_heads, int n_tokens,
                                 int row_bytes,
-                                const int *head_map, int out_stride) {
+                                const int *head_map, int in_stride, int out_stride) {
     int h = gpuBlockIdx_x;
     int t = gpuBlockIdx_y;
     if (h >= n_v_heads || t >= n_tokens) return;
     int tid = gpuThreadIdx_x;
     int gh = head_map ? head_map[h] : h;
     const char *wrow = (const char *)weights + (size_t)gh * row_bytes;
-    const float *xt = x + (size_t)t * dim;
+    int ts = in_stride > 0 ? in_stride : dim;
+    const float *xt = x + (size_t)t * ts;
 
     __shared__ int8_t xq[PICOLM_SSM_VECDOT_MAX_DIM];
     __shared__ float xq_d[PICOLM_SSM_VECDOT_MAX_DIM / 32];
@@ -4177,7 +4178,7 @@ picolm_gpu_ssm_vecdot_batch(float *out_host,       /* out [n_tokens][n_v_heads] 
     dim3 grid((unsigned)n_v_heads, (unsigned)n_tokens, 1);
     picolm_ssm_vecdot_batch_kernel<<<grid, 256, 0, ctx->stream>>>(
         (float *)out_dev, (const float *)x_dev, w_dev, qtype, dim, n_v_heads, n_tokens,
-        row_bytes, head_map ? (const int *)hm_dev : NULL, 0);
+        row_bytes, head_map ? (const int *)hm_dev : NULL, dim, 0);
 
     if (!gpu_ok(gpuGetLastError(), "ssm vecdot batch") ||
         !gpu_ok(gpuDeviceSynchronize(), "ssm vecdot batch sync")) return 0;
@@ -5859,12 +5860,12 @@ int picolm_gpu_ssm_l2norm_batch_dev(float *xd, int hd, int nh, int nt, int ts, f
 }
 
 int picolm_gpu_ssm_vecdot_batch_dev(float *od, const float *xd, const void *wd, gguf_type_t qt,
-    int dim, int nvh, int nt, int rb, const int *hm, int dev, int out_stride) {
+    int dim, int nvh, int nt, int rb, const int *hm, int dev, int in_stride, int out_stride) {
     if(nvh<=0||dim<=0||nt<=0) return 0;
     if(dim>PICOLM_SSM_VECDOT_MAX_DIM) return 0;
     gpu_device_ctx_t *ctx = find_ctx(dev);
     if(!ctx||!select_ctx(ctx)) return 0;
-    picolm_ssm_vecdot_batch_kernel<<<dim3((unsigned)nvh,(unsigned)nt),256,0,ctx->stream>>>(od,xd,wd,qt,dim,nvh,nt,rb,hm,out_stride);
+    picolm_ssm_vecdot_batch_kernel<<<dim3((unsigned)nvh,(unsigned)nt),256,0,ctx->stream>>>(od,xd,wd,qt,dim,nvh,nt,rb,hm,in_stride,out_stride);
     return gpu_ok(gpuGetLastError(),"vecdot batch dev");
 }
 

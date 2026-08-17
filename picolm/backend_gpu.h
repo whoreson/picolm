@@ -311,7 +311,7 @@ int picolm_gpu_ssm_vecdot_batch_dev(float *out, const float *x,
                                      const void *weights, gguf_type_t qtype,
                                      int dim, int n_v_heads, int n_tokens,
                                      int row_bytes, const int *head_map,
-                                     int device, int out_stride);
+                                     int device, int in_stride, int out_stride);
 int picolm_gpu_ssm_prefill_gated_norm_dev(float *ssm_out, const float *z,
                                            const float *norm_w,
                                            int head_v_dim, int n_v_heads,
