@@ -10655,6 +10655,26 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                                       1.0f / sqrtf((float)head_dim));
             }
         }
+        /* Dump attn_raw (pre-gate) for comparison */
+        if (getenv("PICOLM_SSM_VERIFY") && l == 3) {
+            int lt = n_tokens - 1;
+            fprintf(stderr, "[DBG CPU attn_raw l=%d] last[:4]={%.6f,%.6f,%.6f,%.6f}\n", l,
+                xb_batch[lt*max_dim], xb_batch[lt*max_dim+1], xb_batch[lt*max_dim+2], xb_batch[lt*max_dim+3]);
+            /* Per-KV-head RMS */
+            fprintf(stderr, "[DBG CPU attn_raw l=3] per-kv-head RMS:");
+            for (int kh = 0; kh < c->n_kv_heads; kh++) {
+                double r = 0;
+                for (int qh = kh * (n_heads / c->n_kv_heads);
+                     qh < (kh + 1) * (n_heads / c->n_kv_heads); qh++) {
+                    for (int d = 0; d < head_dim; d++)
+                        r += xb_batch[lt*max_dim + qh*head_dim + d] *
+                             xb_batch[lt*max_dim + qh*head_dim + d];
+                }
+                r = sqrt(r / (head_dim * (n_heads / c->n_kv_heads)));
+                fprintf(stderr, " h%d=%.4f", kh, (float)r);
+            }
+            fprintf(stderr, "\n");
+        }
 
         /* Hadamard rotation of attention output back to original space (prefill) */
         if (s->kv_hadamard_v) {
@@ -11684,7 +11704,11 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
                 if (!w2) { fprintf(stderr, "WARN: SSM prefill GPU->hybrid CPU\n"); w2 = 1; }
                 size_t batch_bytes = (size_t)n_tokens * dim * sizeof(float);
                 picolm_gpu_sync(gpu_dev);
-                picolm_gpu_memcpy(s->x, bx, batch_bytes, -1, gpu_dev);
+                /* D2H with correct stride: bx has stride xb_stride, s->x is contiguous */
+                for (int _ci = 0; _ci < n_tokens; _ci++) {
+                    picolm_gpu_memcpy(s->x + (size_t)_ci * dim,
+                        bx + (size_t)_ci * xb_stride, dim * sizeof(float), -1, gpu_dev);
+                }
                 { int xb2s=dim;if(c->ssm_d_inner>dim)xb2s=c->ssm_d_inner;
                   int fs=n_ffn,md=c->n_heads*2*c->head_dim;if(dim>md)md=dim;
                   int kd=c->n_kv_heads*c->head_dim,qf=c->n_heads*2*c->head_dim;
@@ -11871,19 +11895,11 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
                   qtok0[23*128],qtok0[23*128+1],qtok0[23*128+2],qtok0[23*128+3]);
               free(qtok0); }
         }
-        /* For SSM-hybrid models: use FP32 K/V directly to avoid FP16 round-trip error */
-        if (c->has_ssm) {
-            picolm_gpu_attention_prefill_f32kv(battn_out, bq,
-                                                bk, bv,
-                                                start_pos, n_tokens,
-                                                n_heads, n_kv_heads, head_dim,
-                                                gpu_dev);
-        } else {
-            picolm_gpu_attention_prefill_dev(battn_out, bq,
-                                              this_attn_ordinal - 1, start_pos, n_tokens,
-                                              n_heads, n_kv_heads, head_dim,
-                                              seq_len, gpu_dev);
-        }
+        /* Standard attention prefill with FP16 KV cache */
+        picolm_gpu_attention_prefill_dev(battn_out, bq,
+                                          this_attn_ordinal - 1, start_pos, n_tokens,
+                                          n_heads, n_kv_heads, head_dim,
+                                          seq_len, gpu_dev);
         if(getenv("PICOLM_SSM_VERIFY") && l==3){
             float vb_verify[4];
             { int vb_off = (size_t)(n_tokens * n_heads) * head_dim - 64;
@@ -11902,6 +11918,21 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
         if(getenv("PICOLM_SSM_VERIFY") && (l==64||l==3)){
             float aol[4]; picolm_gpu_sync(gpu_dev); picolm_gpu_memcpy(aol, battn_out+(size_t)(n_tokens-1)*n_heads*head_dim, 16, -1, gpu_dev);
             fprintf(stderr,"[DBG] attn_raw l=%d last[:4]={%.6f,%.6f,%.6f,%.6f}\n",l,aol[0],aol[1],aol[2],aol[3]);}
+        /* GPU per-KV-head RMS for layer 3 */
+        if(getenv("PICOLM_SSM_VERIFY") && l==3){
+            float *attn_dmp = (float*)malloc(n_heads*head_dim*sizeof(float));
+            picolm_gpu_sync(gpu_dev);
+            picolm_gpu_memcpy(attn_dmp, battn_out+(size_t)(n_tokens-1)*n_heads*head_dim, n_heads*head_dim*sizeof(float), -1, gpu_dev);
+            fprintf(stderr,"[DBG GPU attn_raw l=3] per-kv-head RMS:");
+            for(int kh=0;kh<c->n_kv_heads;kh++){
+                double r=0;
+                for(int qh=kh*(n_heads/c->n_kv_heads);qh<(kh+1)*(n_heads/c->n_kv_heads);qh++)
+                    for(int d=0;d<head_dim;d++) r+=attn_dmp[qh*head_dim+d]*attn_dmp[qh*head_dim+d];
+                r=sqrt(r/(head_dim*(n_heads/c->n_kv_heads)));
+                fprintf(stderr," h%d=%.4f",kh,(float)r);
+            }
+            fprintf(stderr,"\n");
+            free(attn_dmp);}
 
         /* H1. For SSM models: apply gate sigmoid to attention output. */
         if (c->has_ssm) {
