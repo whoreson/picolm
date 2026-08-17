@@ -9107,11 +9107,11 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
     ok&=picolm_gpu_rmsnorm_batched_dev(bffn_norm,bx,(float*)s->attn_norm_w[l],dim,eps,n_tokens,xb2_stride,dev);
     SSM_DBG_SYNC;
     _DBG_RMS("rmsnorm",bffn_norm,xb2_stride);
-    /* QKV + Z-gate projections (read from RMSNorm'd input) */
-    ok&=picolm_gpu_matmul_dev((picolm_gpu_tensor_t*)gl->attn_qkv,bxb,bffn_norm,n_tokens,dev,xb2_stride,0);
+    /* QKV + Z-gate projections (read from RMSNorm'd input at xb2_stride) */
+    ok&=picolm_gpu_matmul_dev((picolm_gpu_tensor_t*)gl->attn_qkv,bxb,bffn_norm,n_tokens,dev,xb2_stride,xb2_stride);
     SSM_DBG_SYNC;
     _DBG_RMS("qkv",bxb,xb2_stride);
-    ok&=picolm_gpu_matmul_dev((picolm_gpu_tensor_t*)gl->attn_gate_ssm,bq,bffn_norm,n_tokens,dev,xb2_stride,0);
+    ok&=picolm_gpu_matmul_dev((picolm_gpu_tensor_t*)gl->attn_gate_ssm,bq,bffn_norm,n_tokens,dev,xb2_stride,xb2_stride);
     SSM_DBG_SYNC;
     _DBG_RMS("gate",bq,xb2_stride);
     /* Dump conv1d weight for debugging */
@@ -9454,7 +9454,7 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
     if(ok&&lw->ffn_gate&&lw->ffn_up&&lw->ffn_down){
       ok&=picolm_gpu_rmsnorm_batched_dev(bffn_norm,bx,(float*)s->post_attn_norm_w[l],dim,eps,n_tokens,xb2_stride,dev);
     SSM_DBG_SYNC;
-      ok&=picolm_gpu_expert_mlp_dev((picolm_gpu_tensor_t*)gl->ffn_gate,(picolm_gpu_tensor_t*)gl->ffn_up,(picolm_gpu_tensor_t*)gl->ffn_down,battn_out,bffn_norm,n_tokens,dim,xb2_stride,dev);
+      ok&=picolm_gpu_expert_mlp_dev((picolm_gpu_tensor_t*)gl->ffn_gate,(picolm_gpu_tensor_t*)gl->ffn_up,(picolm_gpu_tensor_t*)gl->ffn_down,battn_out,bffn_norm,n_tokens,xb2_stride,xb2_stride,dev);
     SSM_DBG_SYNC;
       ok&=picolm_gpu_residual_add(bx,bx,battn_out,n_tokens,dim,xb2_stride,dev);}
     SSM_DBG_SYNC;
