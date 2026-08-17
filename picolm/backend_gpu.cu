@@ -1245,7 +1245,7 @@ picolm_gpu_attention_decode_merge_kernel(
  * Grid: [n_heads, ceil(n_tokens / TOKEN_TILE)]
  * Each block handles one head and one tile of query tokens.
  * Inner loop tiles over KV positions. */
-#define ATTN_TILE_K 64
+#define ATTN_TILE_K 32
 #define ATTN_TILE_Q 32
 
 /* FP32 K/V variant: reads K/V as FP32 instead of FP16 from KV cache.
@@ -1327,6 +1327,12 @@ picolm_gpu_attention_prefill_f32kv_kernel(
                         score += qg[d] * k_tile_f[ti * head_dim + d];
                     }
                     score /= sqrt_hd;
+                    /* Debug: first Q token, first KV pos, head 0 */
+                    if (h == 0 && qi == 0 && ti == 0) {
+                        printf("ATNDBG: f32kv q0[:4]={%.6f,%.6f,%.6f,%.6f} k0[:4]={%.6f,%.6f,%.6f,%.6f} score=%.6f\n",
+                            qg[0], qg[1], qg[2], qg[3],
+                            k_tile_f[0], k_tile_f[1], k_tile_f[2], k_tile_f[3], score);
+                    }
                 }
 
                 if (tid == 0) {
@@ -5489,8 +5495,21 @@ picolm_gpu_attention_prefill_f32kv(float *xb_out_dev, const float *q_dev,
     if (!ctx || !select_ctx(ctx)) return 0;
     if (head_dim > 256) return 0;
     int n_tiles_q = (n_tokens + ATTN_TILE_Q - 1) / ATTN_TILE_Q;
-    size_t shared_bytes = attn_prefill_shared_bytes(head_dim);
-    if (!ensure_attn_prefill_shared_mem(shared_bytes)) return 0;
+    /* FP32 K/V tiles are 4x larger than FP16 */
+    size_t shared_bytes = 2 * (size_t)ATTN_TILE_K * head_dim * sizeof(float)
+         + 256 * sizeof(float)
+         + (size_t)ATTN_TILE_Q * head_dim * sizeof(float)
+         + 2 * (size_t)ATTN_TILE_Q * sizeof(float)
+         + 2 * sizeof(float);
+    /* Opt-in FP32 kernel to larger shared memory */
+    if (shared_bytes > 49152) {
+        cudaError_t e = gpuFuncSetAttribute((const void *)picolm_gpu_attention_prefill_f32kv_kernel,
+            gpuFuncAttributeMaxDynamicSharedMemorySize, (int)shared_bytes);
+        if (e != cudaSuccess) {
+            fprintf(stderr, "[GPU] f32kv opt-in fail: err=%d (%s) bytes=%zu\n",
+                (int)e, cudaGetErrorString(e), shared_bytes);
+        }
+    }
     int block_threads = 128;
     dim3 grid((unsigned)n_heads, (unsigned)n_tiles_q, 1);
     picolm_gpu_attention_prefill_f32kv_kernel<<<grid, block_threads, (unsigned)shared_bytes, ctx->stream>>>(

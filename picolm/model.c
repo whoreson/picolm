@@ -11840,9 +11840,9 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
         /* G. KV cache store: batched F32->F16 pack+store, 2 launches per layer
          * Store BEFORE attention so the decode phase has the KV cache ready. */
         if(getenv("PICOLM_SSM_VERIFY") && l==3 && c->has_ssm){
-            float bk0[4]; picolm_gpu_sync(gpu_dev);
-            picolm_gpu_memcpy(bk0, bk, 16, -1, gpu_dev);
-            fprintf(stderr,"[DBG] bk_fp32 l=3 h0[:4]={%.6f,%.6f,%.6f,%.6f}\n",bk0[0],bk0[1],bk0[2],bk0[3]);}
+            float bv0[4]; picolm_gpu_sync(gpu_dev);
+            picolm_gpu_memcpy(bv0, bv, 16, -1, gpu_dev);
+            fprintf(stderr,"[DBG] bv_fp32 l=3 h0[:4]={%.6f,%.6f,%.6f,%.6f}\n",bv0[0],bv0[1],bv0[2],bv0[3]);}
         picolm_gpu_kv_store_dev_batched(1, this_attn_ordinal, start_pos, n_tokens,
                                          bk, n_kv_heads, head_dim, seq_len, gpu_dev);
         picolm_gpu_kv_store_dev_batched(0, this_attn_ordinal, start_pos, n_tokens,
@@ -11871,11 +11871,19 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
                   qtok0[23*128],qtok0[23*128+1],qtok0[23*128+2],qtok0[23*128+3]);
               free(qtok0); }
         }
-        /* For SSM-hybrid models: use FP16 KV cache (same as non-SSM) */
-        picolm_gpu_attention_prefill_dev(battn_out, bq,
-                                          this_attn_ordinal - 1, start_pos, n_tokens,
-                                          n_heads, n_kv_heads, head_dim,
-                                          seq_len, gpu_dev);
+        /* For SSM-hybrid models: use FP32 K/V directly to avoid FP16 round-trip error */
+        if (c->has_ssm) {
+            picolm_gpu_attention_prefill_f32kv(battn_out, bq,
+                                                bk, bv,
+                                                start_pos, n_tokens,
+                                                n_heads, n_kv_heads, head_dim,
+                                                gpu_dev);
+        } else {
+            picolm_gpu_attention_prefill_dev(battn_out, bq,
+                                              this_attn_ordinal - 1, start_pos, n_tokens,
+                                              n_heads, n_kv_heads, head_dim,
+                                              seq_len, gpu_dev);
+        }
         if(getenv("PICOLM_SSM_VERIFY") && l==3){
             float vb_verify[4];
             { int vb_off = (size_t)(n_tokens * n_heads) * head_dim - 64;
