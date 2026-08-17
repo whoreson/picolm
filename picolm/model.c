@@ -9106,7 +9106,7 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
 
     ok&=picolm_gpu_rmsnorm_batched_dev(bffn_norm,bx,(float*)s->attn_norm_w[l],dim,eps,n_tokens,xb2_stride,dev);
     SSM_DBG_SYNC;
-    _DBG_RMS("rmsnorm",bffn_norm,dim);
+    _DBG_RMS("rmsnorm",bffn_norm,xb2_stride);
     /* QKV + Z-gate projections (read from RMSNorm'd input) */
     ok&=picolm_gpu_matmul_dev((picolm_gpu_tensor_t*)gl->attn_qkv,bxb,bffn_norm,n_tokens,dev,xb2_stride,0);
     SSM_DBG_SYNC;
@@ -9321,7 +9321,7 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
               l, (float)sqrt(nr/hvdim),nwa[0],nwa[1],nwa[2],nwa[3],nwa[4],nwa[5],nwa[6],nwa[7]);
           free(nwa);
       }
-      ok&=picolm_gpu_ssm_prefill_gated_norm_dev(battn_out,bq,nw,hvdim,n_v,n_tokens,eps,xb2_stride,xb2_stride,dev);}
+      ok&=picolm_gpu_ssm_prefill_gated_norm_dev(battn_out,bq,nw,hvdim,n_v,n_tokens,eps,xb2_stride,value_dim,dev);}
     if(l<=4&&getenv("PICOLM_SSM_VERIFY")){
         /* Z-gate (bq) per-head dump */
         { size_t lt2=(size_t)(n_tokens-1)*xb2_stride;
@@ -10435,6 +10435,16 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                 int rope_dim_pf = (c->rope_dim > 0) ? c->rope_dim : head_dim;
                 int rope_half_pf = rope_dim_pf / 2;
                 rope(q_pos, k_pos, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos, c->rope_type, rope_half_pf);
+                /* Debug: compute score for first Q token, KV pos 0, head 0 */
+                if (l == 3 && pos == 0 && getenv("PICOLM_SSM_VERIFY")) {
+                    float cpu_score = 0.0f;
+                    for (int d = 0; d < head_dim; d++)
+                        cpu_score += q_pos[d] * k_pos[d];
+                    cpu_score /= sqrtf((float)head_dim);
+                    fprintf(stderr, "ATNDBG: CPU l=%d q0[:4]={%.6f,%.6f,%.6f,%.6f} k0[:4]={%.6f,%.6f,%.6f,%.6f} score=%.6f\n",
+                            l, q_pos[0], q_pos[1], q_pos[2], q_pos[3],
+                            k_pos[0], k_pos[1], k_pos[2], k_pos[3], cpu_score);
+                }
 
                 /* KV cache store: GQA row quantization */
                 {
@@ -11544,6 +11554,8 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
     int seq_len = c->max_seq_len;
     int rope_half = head_dim / 2;
     int q_dim = n_heads * head_dim;
+    int kv_dim = n_kv_heads * head_dim;
+    int q_full_dim = c->has_ssm ? (q_dim * 2) : q_dim;
     int xb_stride = c->has_ssm ? (q_dim * 2) : q_dim;
     if (dim > xb_stride) xb_stride = dim;
     int ssm_conv_dim = c->ssm_d_inner + 2 * c->ssm_d_state * c->ssm_n_group;
@@ -11639,7 +11651,7 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
             }
             if(getenv("PICOLM_SSM_VERIFY")){
                 picolm_gpu_sync(gpu_dev);
-                float lt8[8];picolm_gpu_memcpy(lt8,bx+(size_t)(n_tokens-1)*xb_stride,32,0,gpu_dev);
+                float lt8[8];picolm_gpu_memcpy(lt8,bx+(size_t)(n_tokens-1)*xb_stride,32,-1,gpu_dev);
                 fprintf(stderr,"[DBG GPU l=%d] bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n",l,lt8[0],lt8[1],lt8[2],lt8[3]);}
             continue;
         }
@@ -11713,24 +11725,32 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
 
 
         /* D1. QK-norm (Qwen3): per-head RMSNorm on Q and K.
-         * Pipe buffers have stride q_pipeline_dim between tokens,
-         * so rmsnorm must be called per-head with that stride. */
+         * After deinterleave: bq has compacted Q at stride q_dim (n_heads*head_dim).
+         * K was written by matmul at stride kv_dim (n_kv_heads*head_dim). */
         if (gw->attn_qk_norm_q_dev[l]) {
-            int q_stride = c->has_ssm ? (q_dim * 2) : q_dim;
-            if (dim > q_stride) q_stride = dim;
-            int ssm_conv_dim = c->ssm_d_inner + 2 * c->ssm_d_state * c->ssm_n_group;
-            if (ssm_conv_dim > q_stride) q_stride = ssm_conv_dim;
+            int q_stride = q_dim; /* deinterleave output stride: n_heads*head_dim */
+            int kv_stride = kv_dim;
+            if(getenv("PICOLM_SSM_VERIFY") && l==3){
+                float bq_pre[4]; picolm_gpu_sync(gpu_dev);
+                picolm_gpu_memcpy(bq_pre, bq, 16, -1, gpu_dev);
+                fprintf(stderr,"ATNDBG: GPU Q_pre norm l=3 h0[:4]={%.6f,%.6f,%.6f,%.6f}\n",bq_pre[0],bq_pre[1],bq_pre[2],bq_pre[3]);
+            }
             for (int h = 0; h < n_heads; h++) {
                 float *bq_h = bq + h * head_dim;
                 picolm_gpu_rmsnorm_batched(bq_h, bq_h,
                                            (float *)gw->attn_qk_norm_q_dev[l],
                                            head_dim, c->rms_norm_eps, n_tokens, q_stride, gpu_dev);
             }
+            if(getenv("PICOLM_SSM_VERIFY") && l==3){
+                float bq_post[4]; picolm_gpu_sync(gpu_dev);
+                picolm_gpu_memcpy(bq_post, bq, 16, -1, gpu_dev);
+                fprintf(stderr,"ATNDBG: GPU Q_post norm l=3 h0[:4]={%.6f,%.6f,%.6f,%.6f}\n",bq_post[0],bq_post[1],bq_post[2],bq_post[3]);
+            }
             for (int h = 0; h < n_kv_heads; h++) {
                 float *bk_h = bk + h * head_dim;
                 picolm_gpu_rmsnorm_batched(bk_h, bk_h,
                                            (float *)gw->attn_qk_norm_k_dev[l],
-                                           head_dim, c->rms_norm_eps, n_tokens, q_stride, gpu_dev);
+                                           head_dim, c->rms_norm_eps, n_tokens, kv_stride, gpu_dev);
             }
         }
 
@@ -11746,6 +11766,11 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
                                        (float *)gw->rope_sin_dev,
                                        rope_half, start_pos, n_tokens, c->rope_type, gpu_dev);
 
+        if(getenv("PICOLM_SSM_VERIFY") && l==3){
+            float bq_rope[4]; picolm_gpu_sync(gpu_dev);
+            picolm_gpu_memcpy(bq_rope, bq, 16, -1, gpu_dev);
+            fprintf(stderr,"ATNDBG: GPU Q_post_rope l=3 h0[:4]={%.6f,%.6f,%.6f,%.6f}\n",bq_rope[0],bq_rope[1],bq_rope[2],bq_rope[3]);
+        }
         /* G. KV cache store: batched F32->F16 pack+store, 2 launches per layer */
         picolm_gpu_kv_store_dev_batched(1, this_attn_ordinal, start_pos, n_tokens,
                                          bk, n_kv_heads, head_dim, seq_len, gpu_dev);
@@ -11762,23 +11787,37 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
 
         /* H. Attention prefill: battn_out = attn_prefill(bq) */
         if(getenv("PICOLM_SSM_VERIFY") && l==3){
-            /* Per-head RMS of attn output (pre-gate) */
-            float *odmp = (float*)malloc(n_heads*head_dim*sizeof(float));
+            float bq_pre_attn[4]; picolm_gpu_sync(gpu_dev);
+            picolm_gpu_memcpy(bq_pre_attn, bq, 16, -1, gpu_dev);
+            fprintf(stderr,"ATNDBG: GPU Q_pre_attn l=3 h0[:4]={%.6f,%.6f,%.6f,%.6f} bq=%p\n",
+                bq_pre_attn[0],bq_pre_attn[1],bq_pre_attn[2],bq_pre_attn[3],(void*)bq);
+            { float *qtok0 = (float*)malloc(n_heads*head_dim*sizeof(float));
+              picolm_gpu_memcpy(qtok0, bq, n_heads*head_dim*sizeof(float), -1, gpu_dev);
+              fprintf(stderr,"ATNDBG: GPU Q_tok0 h0-3[:4]={%.6f,%.6f,%.6f,%.6f} h1[:4]={%.6f,%.6f,%.6f,%.6f} h22[:4]={%.6f,%.6f,%.6f,%.6f} h23[:4]={%.6f,%.6f,%.6f,%.6f}\n",
+                  qtok0[0],qtok0[1],qtok0[2],qtok0[3],
+                  qtok0[128],qtok0[129],qtok0[130],qtok0[131],
+                  qtok0[22*128],qtok0[22*128+1],qtok0[22*128+2],qtok0[22*128+3],
+                  qtok0[23*128],qtok0[23*128+1],qtok0[23*128+2],qtok0[23*128+3]);
+              free(qtok0); }
             picolm_gpu_attention_prefill_dev(battn_out, bq,
                                               this_attn_ordinal - 1, start_pos, n_tokens,
                                               n_heads, n_kv_heads, head_dim,
                                               seq_len, gpu_dev);
-            picolm_gpu_sync(gpu_dev);
-            picolm_gpu_memcpy(odmp, battn_out+(size_t)(n_tokens-1)*n_heads*head_dim, n_heads*head_dim*sizeof(float), -1, gpu_dev);
-            fprintf(stderr,"[DBG] attn_O l=3 per-head RMS (pre-gate): ");
-            for(int h=0;h<n_heads;h++){double hr=0;for(int d=0;d<head_dim;d++)hr+=odmp[(h*head_dim+d)]*odmp[(h*head_dim+d)];fprintf(stderr,"h%d=%.4f ",h,sqrt(hr/head_dim));}
-            fprintf(stderr,"\n");
-            free(odmp);
-        } else {
-            picolm_gpu_attention_prefill_dev(battn_out, bq,
-                                              this_attn_ordinal - 1, start_pos, n_tokens,
-                                              n_heads, n_kv_heads, head_dim,
-                                              seq_len, gpu_dev);
+        }
+        if(getenv("PICOLM_SSM_VERIFY") && l==3){
+            float vb_verify[4];
+            { int vb_off = (size_t)(n_tokens * n_heads) * head_dim - 64;
+              picolm_gpu_sync(gpu_dev);
+              picolm_gpu_memcpy(vb_verify, battn_out + vb_off, 16, -1, gpu_dev);
+              fprintf(stderr,"ATNDBG: GPU Q_kernwritten l=3={%.6f,%.6f,%.6f,%.6f}\n",
+                  vb_verify[0],vb_verify[1],vb_verify[2],vb_verify[3]);
+            }
+            /* After kernel: D2H bq to verify data survived */
+            { float bq_post[4];
+              picolm_gpu_memcpy(bq_post, bq, 16, -1, gpu_dev);
+              fprintf(stderr,"ATNDBG: GPU Q_post_kernel l=3 h0[:4]={%.6f,%.6f,%.6f,%.6f}\n",
+                  bq_post[0],bq_post[1],bq_post[2],bq_post[3]);
+            }
         }
         if(getenv("PICOLM_SSM_VERIFY") && (l==64||l==3)){
             float aol[4]; picolm_gpu_sync(gpu_dev); picolm_gpu_memcpy(aol, battn_out+(size_t)(n_tokens-1)*n_heads*head_dim, 16, -1, gpu_dev);

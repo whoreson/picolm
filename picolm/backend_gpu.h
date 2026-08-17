@@ -517,6 +517,8 @@ float *picolm_gpu_ssm_gate_exp(int device);
 float *picolm_gpu_ssm_beta(int device);
 float *picolm_gpu_ssm_output(int device);
 float *picolm_gpu_ssm_final_output(int device);
+uint16_t *picolm_gpu_kv_k_dev(int device);
+uint16_t *picolm_gpu_kv_v_dev(int device);
 
 /* Device-native rmsnorm: x/out/weight are device pointers, no H2D/D2H, no sync. */
 int picolm_gpu_rmsnorm_dev(float *out, const float *x, const float *weight,

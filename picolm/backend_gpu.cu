@@ -1267,7 +1267,6 @@ picolm_gpu_attention_prefill_kernel(
 
     int kv_h = h / (n_heads / n_kv_heads);
     float sqrt_hd = sqrtf((float)head_dim);
-
     /* Layer base offset in uint16_t */
     size_t layer_base = (size_t)layer_ordinal * max_seq_len * n_kv_heads * head_dim;
 
@@ -1355,6 +1354,15 @@ picolm_gpu_attention_prefill_kernel(
                     gpuSyncthreads();
                 }
                 score = reduce_sh[0] / sqrt_hd;
+                /* Debug: dump Q and K first 4 elements for first Q token, first KV pos, head 0 */
+                if (h == 0 && qi == 0 && ti == 0 && tid == 0) {
+                    printf("ATNDBG: prefill l=%d q0[:4]={%.6f,%.6f,%.6f,%.6f} k0[:4]={%.6f,%.6f,%.6f,%.6f} score=%.6f\n",
+                        layer_ordinal,
+                        qg[0], qg[1], qg[2], qg[3],
+                        gpu_fp16_to_fp32(k_tile[0]), gpu_fp16_to_fp32(k_tile[1]),
+                        gpu_fp16_to_fp32(k_tile[2]), gpu_fp16_to_fp32(k_tile[3]),
+                        score);
+                }
 
                 /* Online softmax branch decision on thread 0, broadcast
                  * via shared scalars; accumulator update parallelized
@@ -4743,6 +4751,7 @@ static uint16_t *g_kv_k_dev[PICOLM_GPU_MAX_DEVICES];
 static uint16_t *g_kv_v_dev[PICOLM_GPU_MAX_DEVICES];
 static size_t g_kv_k_cap[PICOLM_GPU_MAX_DEVICES];
 static size_t g_kv_v_cap[PICOLM_GPU_MAX_DEVICES];
+static float *g_verify_buf_dev[PICOLM_GPU_MAX_DEVICES];  /* device verification buffer */
 
 extern "C" int
 picolm_gpu_kv_alloc(size_t kv_k_bytes, size_t kv_v_bytes, int device) {
@@ -4868,9 +4877,10 @@ picolm_gpu_pipeline_batch_alloc(int dim, int q_dim, int kv_dim, int ffn_hidden,
     ok &= gpu_ok(gpuMalloc(&ctx->pipe_k_b, kvb), "pipe_k_b alloc");
     ok &= gpu_ok(gpuMalloc(&ctx->pipe_v_b, kvb), "pipe_v_b alloc");
     ok &= gpu_ok(gpuMalloc(&ctx->pipe_attn_out_b, qb), "pipe_attn_out_b alloc");
-    ok &= gpu_ok(gpuMalloc(&ctx->pipe_ffn_norm_b, db), "pipe_ffn_norm_b alloc");
+    ok &= gpu_ok(gpuMalloc(&ctx->pipe_ffn_norm_b, xb), "pipe_ffn_norm_b alloc");
     ok &= gpu_ok(gpuMalloc(&ctx->pipe_gate_b, fb), "pipe_gate_b alloc");
     ok &= gpu_ok(gpuMalloc(&ctx->pipe_up_b, fb), "pipe_up_b alloc");
+    ok &= gpu_ok(gpuMalloc(&g_verify_buf_dev[ctx->device], 64 * sizeof(float)), "verify_buf alloc");
     if (!ok) return 0;
 
     ctx->pipe_b_ready = 1;
@@ -4907,6 +4917,7 @@ picolm_gpu_pipeline_free(void) {
         if (ctx->pipe_ffn_norm_b) gpuFree(ctx->pipe_ffn_norm_b);
         if (ctx->pipe_gate_b) gpuFree(ctx->pipe_gate_b);
         if (ctx->pipe_up_b) gpuFree(ctx->pipe_up_b);
+        if (g_verify_buf_dev[ctx->device]) { gpuFree(g_verify_buf_dev[ctx->device]); g_verify_buf_dev[ctx->device] = NULL; }
         ctx->pipe_x_b = ctx->pipe_xb_b = ctx->pipe_q_b = ctx->pipe_k_b = ctx->pipe_v_b =
             ctx->pipe_attn_out_b = ctx->pipe_ffn_norm_b = ctx->pipe_gate_b = ctx->pipe_up_b = NULL;
         ctx->pipe_b_ready = 0;
@@ -4972,6 +4983,7 @@ extern "C" float *picolm_gpu_pipe_attn_out_b(int device)   { gpu_device_ctx_t *c
 extern "C" float *picolm_gpu_pipe_ffn_norm_b(int device)   { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_ffn_norm_b : NULL; }
 extern "C" float *picolm_gpu_pipe_gate_b(int device)       { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_gate_b : NULL; }
 extern "C" float *picolm_gpu_pipe_up_b(int device)         { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_up_b : NULL; }
+extern "C" float *picolm_gpu_verify_buf(int device)        { return g_verify_buf_dev[device]; }
 
 /* SSM pipeline buffer accessors */
 extern "C" float *picolm_gpu_ssm_qkv_raw(int device)       { gpu_device_ctx_t *c = find_ctx(device); return c ? c->ssm_qkv_raw : NULL; }
@@ -4985,6 +4997,8 @@ extern "C" float *picolm_gpu_ssm_gate_exp(int device)      { gpu_device_ctx_t *c
 extern "C" float *picolm_gpu_ssm_beta(int device)          { gpu_device_ctx_t *c = find_ctx(device); return c ? c->ssm_beta : NULL; }
 extern "C" float *picolm_gpu_ssm_output(int device)        { gpu_device_ctx_t *c = find_ctx(device); return c ? c->ssm_output : NULL; }
 extern "C" float *picolm_gpu_ssm_final_output(int device)  { gpu_device_ctx_t *c = find_ctx(device); return c ? c->ssm_final_output : NULL; }
+extern "C" uint16_t *picolm_gpu_kv_k_dev(int device)       { return g_kv_k_dev[device]; }
+extern "C" uint16_t *picolm_gpu_kv_v_dev(int device)       { return g_kv_v_dev[device]; }
 
 /* Bit-exact device port of the host fp32_to_fp16() in quant.c -- NOT
  * CUDA's __float2half (different rounding/tie behavior in edge cases),
