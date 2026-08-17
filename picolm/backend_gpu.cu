@@ -1248,6 +1248,120 @@ picolm_gpu_attention_decode_merge_kernel(
 #define ATTN_TILE_K 64
 #define ATTN_TILE_Q 32
 
+/* FP32 K/V variant: reads K/V as FP32 instead of FP16 from KV cache.
+ * Identical algorithm to picolm_gpu_attention_prefill_kernel but takes
+ * FP32 K/V buffers with layout [pos][kv_head][head_dim]. */
+__global__ void
+picolm_gpu_attention_prefill_f32kv_kernel(
+        float *xb_out,       /* [n_tokens][n_heads][head_dim] */
+        const float *q_dev,  /* [n_tokens][n_heads][head_dim] */
+        const float *kv_k,   /* [pos][kv_head][head_dim] FP32 */
+        const float *kv_v,   /* [pos][kv_head][head_dim] FP32 */
+        int start_pos, int n_tokens,
+        int n_heads, int n_kv_heads, int head_dim)
+{
+    int h = (int)gpuBlockIdx_x;
+    int tile_q_idx = (int)gpuBlockIdx_y;
+    int tid = gpuThreadIdx_x;
+    int n_threads = gpuBlockDim_x;
+
+    int kv_h = h / (n_heads / n_kv_heads);
+    float sqrt_hd = sqrtf((float)head_dim);
+
+    int q_start = tile_q_idx * ATTN_TILE_Q;
+    int q_end = min(q_start + ATTN_TILE_Q, n_tokens);
+    int n_q = q_end - q_start;
+
+    /* Shared memory: K tile + V tile (FP32) + reduce + acc + max/sum */
+    extern __shared__ uint8_t smem[];
+    float *k_tile_f = (float *)smem;
+    float *v_tile_f = k_tile_f + ATTN_TILE_K * head_dim;
+    float *reduce_sh = v_tile_f + ATTN_TILE_K * head_dim;
+    float *acc_sh = reduce_sh + 256;
+    float *max_score_sh = acc_sh + (size_t)ATTN_TILE_Q * head_dim;
+    float *sum_exp_sh = max_score_sh + ATTN_TILE_Q;
+    __shared__ float rescale_sh, weight_sh;
+
+    for (int i = tid; i < ATTN_TILE_Q * head_dim; i += n_threads) acc_sh[i] = 0.0f;
+    for (int qi = tid; qi < ATTN_TILE_Q; qi += n_threads) {
+        max_score_sh[qi] = -1e30f;
+        sum_exp_sh[qi] = 0.0f;
+    }
+    for (int i = tid; i < 32; i += n_threads) reduce_sh[i] = 0.0f;
+    gpuSyncthreads();
+
+    int total_kv = start_pos + n_tokens;
+    size_t kv_pos_stride = (size_t)n_kv_heads * head_dim;
+    size_t kv_head_stride = head_dim;
+
+    for (int t0 = 0; t0 < total_kv; t0 += ATTN_TILE_K) {
+        int t_end = min(t0 + ATTN_TILE_K, total_kv);
+        int tile_k_size = t_end - t0;
+
+        for (int d = tid; d < head_dim; d += n_threads) {
+            for (int ti = 0; ti < tile_k_size; ti++) {
+                size_t off = (size_t)(t0 + ti) * kv_pos_stride + kv_h * kv_head_stride + d;
+                k_tile_f[ti * head_dim + d] = kv_k[off];
+                v_tile_f[ti * head_dim + d] = kv_v[off];
+            }
+        }
+        gpuSyncthreads();
+
+        for (int qi = 0; qi < n_q; qi++) {
+            int global_q = q_start + qi;
+            int global_pos = start_pos + global_q;
+            const float *qg = q_dev + (size_t)(global_q * n_heads + h) * head_dim;
+            float *accqi = acc_sh + (size_t)qi * head_dim;
+
+            if (tid == 0) { rescale_sh = 1.0f; weight_sh = 1.0f; }
+            gpuSyncthreads();
+
+            for (int ti = 0; ti < tile_k_size; ti++) {
+                int global_kv = t0 + ti;
+                if (global_kv > global_pos) continue;
+
+                float score;
+                if (tid == 0) {
+                    score = 0.0f;
+                    for (int d = 0; d < head_dim; d++) {
+                        score += qg[d] * k_tile_f[ti * head_dim + d];
+                    }
+                    score /= sqrt_hd;
+                }
+
+                if (tid == 0) {
+                    if (score > max_score_sh[qi]) {
+                        rescale_sh = expf(max_score_sh[qi] - score);
+                        weight_sh = 1.0f;
+                        sum_exp_sh[qi] = sum_exp_sh[qi] * rescale_sh + 1.0f;
+                        max_score_sh[qi] = score;
+                    } else {
+                        rescale_sh = 1.0f;
+                        weight_sh = expf(score - max_score_sh[qi]);
+                        sum_exp_sh[qi] += weight_sh;
+                    }
+                }
+                gpuSyncthreads();
+
+                for (int d = tid; d < head_dim; d += n_threads) {
+                    accqi[d] = accqi[d] * rescale_sh + weight_sh * v_tile_f[ti * head_dim + d];
+                }
+                gpuSyncthreads();
+            }
+        }
+    }
+
+    for (int qi = 0; qi < n_q; qi++) {
+        int global_q = q_start + qi;
+        float inv_sum = 1.0f / sum_exp_sh[qi];
+        float *xbhg = xb_out + (size_t)(global_q * n_heads + h) * head_dim;
+        float *accqi = acc_sh + (size_t)qi * head_dim;
+        for (int d = tid; d < head_dim; d += n_threads) {
+            xbhg[d] = accqi[d] * inv_sum;
+        }
+    }
+}
+
 __global__ void
 picolm_gpu_attention_prefill_kernel(
         float *xb_out,        /* [n_tokens][n_heads][head_dim] */
@@ -1341,19 +1455,18 @@ picolm_gpu_attention_prefill_kernel(
                 int global_kv = t0 + ti;
                 if (global_kv > global_pos) continue;
 
-                /* Compute score with thread parallelization */
-                float score = 0.0f;
-                for (int d = tid; d < head_dim; d += n_threads) {
-                    score += qg[d] * gpu_fp16_to_fp32(k_tile[ti * head_dim + d]);
+                /* Compute score: thread-0 only sequential accumulation
+                 * to bit-match CPU scalar accumulation order. */
+                float score;
+                if (tid == 0) {
+                    score = 0.0f;
+                    for (int d = 0; d < head_dim; d++) {
+                        score += qg[d] * gpu_fp16_to_fp32(k_tile[ti * head_dim + d]);
+                    }
+                    score /= sqrt_hd;
+                    reduce_sh[0] = score;
                 }
-                /* Reduce to thread 0 via shared memory tree reduction (matching decode kernel) */
-                reduce_sh[tid] = score;
-                gpuSyncthreads();
-                for (int s = n_threads / 2; s > 0; s >>= 1) {
-                    if (tid < s) reduce_sh[tid] += reduce_sh[tid + s];
-                    gpuSyncthreads();
-                }
-                score = reduce_sh[0] / sqrt_hd;
+                if (tid == 0) score = reduce_sh[0];
                 /* Debug: dump Q and K first 4 elements for first Q token, first KV pos, head 0 */
                 if (h == 0 && qi == 0 && ti == 0 && tid == 0) {
                     printf("ATNDBG: prefill l=%d q0[:4]={%.6f,%.6f,%.6f,%.6f} k0[:4]={%.6f,%.6f,%.6f,%.6f} score=%.6f\n",
@@ -5359,6 +5472,31 @@ picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
         layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim, max_seq_len,
         kv_pos_stride_bytes, kv_head_stride_bytes);
     if (!gpu_ok(gpuGetLastError(), "attn prefill (dev)")) return 0;
+    return 1;
+}
+
+/* Device-native prefill attention with FP32 K/V (no KV cache read).
+ * Used for SSM-hybrid models where FP16 KV round-trip causes too much
+ * numerical drift. K and V are passed as FP32 projection buffers
+ * with the same layout as the KV cache: [pos][kv_head][head_dim]. */
+extern "C" int
+picolm_gpu_attention_prefill_f32kv(float *xb_out_dev, const float *q_dev,
+                                    const float *k_dev, const float *v_dev,
+                                    int start_pos, int n_tokens,
+                                    int n_heads, int n_kv_heads, int head_dim,
+                                    int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    if (head_dim > 256) return 0;
+    int n_tiles_q = (n_tokens + ATTN_TILE_Q - 1) / ATTN_TILE_Q;
+    size_t shared_bytes = attn_prefill_shared_bytes(head_dim);
+    if (!ensure_attn_prefill_shared_mem(shared_bytes)) return 0;
+    int block_threads = 128;
+    dim3 grid((unsigned)n_heads, (unsigned)n_tiles_q, 1);
+    picolm_gpu_attention_prefill_f32kv_kernel<<<grid, block_threads, (unsigned)shared_bytes, ctx->stream>>>(
+        xb_out_dev, q_dev, k_dev, v_dev,
+        start_pos, n_tokens, n_heads, n_kv_heads, head_dim);
+    if (!gpu_ok(gpuGetLastError(), "attn prefill f32kv (dev)")) return 0;
     return 1;
 }
 

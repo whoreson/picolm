@@ -433,6 +433,14 @@ int picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
                                       int n_heads, int n_kv_heads, int head_dim,
                                       int max_seq_len, int device);
 
+/* Device-native prefill attention with FP32 K/V (no KV cache read).
+ * K/V are FP32 buffers with layout [pos][kv_head][head_dim]. */
+int picolm_gpu_attention_prefill_f32kv(float *xb_out_dev, const float *q_dev,
+                                        const float *k_dev, const float *v_dev,
+                                        int start_pos, int n_tokens,
+                                        int n_heads, int n_kv_heads, int head_dim,
+                                        int device);
+
 /* Free GPU KV cache allocations. */
 void picolm_gpu_kv_free(void);
 
