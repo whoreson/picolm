@@ -11822,11 +11822,11 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
         /* B. Q projection: bq = attn_q @ bxb (S=n_tokens)
          * For SSM models this writes q_full_dim = 2*q_dim per token. */
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
-                               bq, bxb, n_tokens, gpu_dev, n_heads*2*head_dim, xb_stride);
+                               bq, bxb, n_tokens, gpu_dev, q_full_dim, xb_stride);
 
         if(getenv("PICOLM_SSM_VERIFY") && l==64){
             float bq_last[4]; picolm_gpu_sync(gpu_dev);
-            picolm_gpu_memcpy(bq_last, bq+(size_t)(n_tokens-1)*n_heads*2*head_dim, 16, -1, gpu_dev);
+            picolm_gpu_memcpy(bq_last, bq+(size_t)(n_tokens-1)*q_full_dim, 16, -1, gpu_dev);
             fprintf(stderr,"[DBG] bq_last l=64[:4]={%.6f,%.6f,%.6f,%.6f}\n",bq_last[0],bq_last[1],bq_last[2],bq_last[3]);}
 
         /* B1. For SSM models: de-interleave Q+gate from bq.
@@ -11993,7 +11993,7 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
         }
         if(getenv("PICOLM_SSM_VERIFY") && l==64){
             float ao[4], aol[4]; picolm_gpu_sync(gpu_dev); picolm_gpu_memcpy(ao, battn_out, 16, -1, gpu_dev);
-            picolm_gpu_memcpy(aol, battn_out+(size_t)(n_tokens-1)*n_heads*2*head_dim, 16, -1, gpu_dev);
+            picolm_gpu_memcpy(aol, battn_out+(size_t)(n_tokens-1)*n_heads*head_dim, 16, -1, gpu_dev);
             fprintf(stderr,"[DBG] attn_gate l=64 first[:4]={%.6f,%.6f,%.6f,%.6f} last[:4]={%.6f,%.6f,%.6f,%.6f}\n",
                 ao[0],ao[1],ao[2],ao[3], aol[0],aol[1],aol[2],aol[3]);}
 
