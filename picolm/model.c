@@ -11961,11 +11961,21 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
                   qtok0[23*128],qtok0[23*128+1],qtok0[23*128+2],qtok0[23*128+3]);
               free(qtok0); }
         }
-        /* Standard attention prefill with FP16 KV cache */
-        picolm_gpu_attention_prefill_dev(battn_out, bq,
-                                          this_attn_ordinal - 1, start_pos, n_tokens,
-                                          n_heads, n_kv_heads, head_dim,
-                                          seq_len, gpu_dev);
+        /* For SSM-hybrid models, use FP32 K/V buffers directly to avoid
+         * FP16 round-trip quantization error in the attention prefill.
+         * The FP16 KV cache is still stored (above) for the decode phase. */
+        if (c->has_ssm) {
+            picolm_gpu_attention_prefill_f32kv(battn_out, bq,
+                                                bk, bv,
+                                                start_pos, n_tokens,
+                                                n_heads, n_kv_heads, head_dim,
+                                                gpu_dev);
+        } else {
+            picolm_gpu_attention_prefill_dev(battn_out, bq,
+                                              this_attn_ordinal - 1, start_pos, n_tokens,
+                                              n_heads, n_kv_heads, head_dim,
+                                              seq_len, gpu_dev);
+        }
         if (getenv("PICOLM_SSM_VERIFY")) {
             float _chk[4]; picolm_gpu_sync(gpu_dev);
             picolm_gpu_memcpy(_chk, battn_out + (size_t)(n_tokens-1)*n_heads*head_dim, 16, -1, gpu_dev);
