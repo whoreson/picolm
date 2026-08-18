@@ -7849,14 +7849,6 @@ ssm_forward_gpu(model_t *m, run_state_t *s, float *x, float *residual,
      * dropping the FFN entirely. Bail before any state mutation. */
     if (c->has_moe) return 0;
 
-    /* Bug 2 fix: picolm_gpu_ssm_vecdot_kernel only implements F32/Q4_0/Q8_0
-     * and silently leaves output at 0.0f for any other type. Check up front,
-     * before conv1d touches persistent state. */
-    if (lw->type_ssm_alpha != GGUF_TYPE_F32 && lw->type_ssm_alpha != GGUF_TYPE_Q4_0 &&
-        lw->type_ssm_alpha != GGUF_TYPE_Q8_0) return 0;
-    if (lw->type_ssm_beta != GGUF_TYPE_F32 && lw->type_ssm_beta != GGUF_TYPE_Q4_0 &&
-        lw->type_ssm_beta != GGUF_TYPE_Q8_0) return 0;
-
     /* Prerequisites: all GPU tensors must be resident */
     if (!gl->attn_qkv || !gl->attn_gate_ssm || !gl->ssm_out || !gl->ssm_conv1d) return 0;
     if (!gw->ssm_alpha_dev[il] || !gw->ssm_beta_dev[il] || !gw->ssm_a_dev[il]) return 0;
@@ -7872,17 +7864,6 @@ ssm_forward_gpu(model_t *m, run_state_t *s, float *x, float *residual,
      * the caller's CPU-hybrid ssm_forward() fallback (which does call
      * moe_forward()) is always safe to take. */
     if (c->has_moe) return 0;
-
-    /* Bug 2 fix (2026-08-11): picolm_gpu_ssm_vecdot_kernel only
-     * implements F32/Q4_0/Q8_0 and silently leaves output at 0.0f for
-     * any other type (see steps 9-10 below). Check up front -- like
-     * has_moe above, this must happen before conv1d touches persistent
-     * state, not at the point of use, or a return-0 there would no
-     * longer be safe for the caller to fall back from. */
-    if (lw->type_ssm_alpha != GGUF_TYPE_F32 && lw->type_ssm_alpha != GGUF_TYPE_Q4_0 &&
-        lw->type_ssm_alpha != GGUF_TYPE_Q8_0) return 0;
-    if (lw->type_ssm_beta != GGUF_TYPE_F32 && lw->type_ssm_beta != GGUF_TYPE_Q4_0 &&
-        lw->type_ssm_beta != GGUF_TYPE_Q8_0) return 0;
 
     /* Pipeline buffers */
     float *pipe_x = picolm_gpu_pipe_x(device);
