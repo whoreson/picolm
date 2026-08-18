@@ -756,10 +756,10 @@ int main(int argc, char **argv) {
     int *prompt_tokens = (int *)malloc((size_t)max_prompt_tokens * sizeof(int));
     int n_prompt;
     if (use_qwen_tok) {
-        /* Qwen3.5 GGUF has no bos_token_id, so tok_bos_id=11 is just the gpt2 fallback.
-           Don't prepend it - llama.cpp doesn't either (add_bos=false for qwen35 pretype).
-           Qwen3.6 has bos_token_id=248044 from GGUF, so prepend that. */
-        if (tokenizer.bos_id != 11) {
+        /* Respect tok_add_bos from GGUF metadata. Qwen3.5 models typically have
+           add_bos=false, Qwen3.6 GGUFs may set it to 0 or 1. The server path
+           doesn't prepend BOS for Qwen models, so CLI should match. */
+        if (model.tok_add_bos && tokenizer.bos_id != 11) {
             n_prompt = qwen_tokenize_encode(&qwen_enc, prompt, prompt_tokens + 1, max_prompt_tokens - 1);
             prompt_tokens[0] = (int)tokenizer.bos_id;
             n_prompt++;
@@ -992,19 +992,26 @@ int main(int argc, char **argv) {
     if (n_prompt > 0) {
         /* All models use model_forward_prefill.
          * SSM models: batched by default, use --ssm-serial for per-token path. */
-        #ifdef PICOLM_GPU
+        int gpu_prefill_used = 0;
+#ifdef PICOLM_GPU
         if (model.gpu.kv_active) {
             logits = model_forward_prefill_gpu(&model, prompt_tokens, n_prompt, start_pos, NULL);
-            if (!logits) logits = model_forward_prefill(&model, prompt_tokens, n_prompt, start_pos, NULL);
+            if (logits) {
+                gpu_prefill_used = 1;
+            } else {
+                logits = model_forward_prefill(&model, prompt_tokens, n_prompt, start_pos, NULL);
+            }
         } else
 #endif
         {
             logits = model_forward_prefill(&model, prompt_tokens, n_prompt, start_pos, NULL);
         }
         pos = start_pos + n_prompt - 1;
-        /* Sync SSM state from host to device after CPU prefill */
+        /* Sync SSM state from host to device after CPU prefill only.
+         * After GPU prefill, the device already has correct state and
+         * syncing stale CPU state would overwrite it. */
 #ifdef PICOLM_GPU
-        if (model.gpu.kv_active && model.config.has_ssm) {
+        if (model.gpu.kv_active && model.config.has_ssm && !gpu_prefill_used) {
             picolm_ssm_state_sync_to_device(&model, model.gpu.device);
         }
 #endif

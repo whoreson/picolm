@@ -1724,7 +1724,13 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
     int n_prompt;
     double t_tok = get_time_ms();
     if (srv.use_qwen_tok) {
-        n_prompt = qwen_tokenize_encode(&srv.qwen_enc, prompt, ptokens, max_pt);
+        if (srv.model.tok_add_bos && srv.qwen_enc.bos_id != 11) {
+            n_prompt = qwen_tokenize_encode(&srv.qwen_enc, prompt, ptokens + 1, max_pt - 1);
+            ptokens[0] = srv.qwen_enc.bos_id;
+            n_prompt++;
+        } else {
+            n_prompt = qwen_tokenize_encode(&srv.qwen_enc, prompt, ptokens, max_pt);
+        }
     } else {
         n_prompt = tokenizer_encode(tokenizer, prompt, ptokens, max_pt, srv.model.tok_add_bos);
     }
@@ -2347,7 +2353,13 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         int max_pt = (int)strlen(prompt) + 3 + 1;
         ptokens = (int *)malloc((size_t)max_pt * sizeof(int));
         if (srv.use_qwen_tok) {
-            n_prompt = qwen_tokenize_encode(&srv.qwen_enc, prompt, ptokens, max_pt);
+            if (srv.model.tok_add_bos && srv.qwen_enc.bos_id != 11) {
+                n_prompt = qwen_tokenize_encode(&srv.qwen_enc, prompt, ptokens + 1, max_pt - 1);
+                ptokens[0] = srv.qwen_enc.bos_id;
+                n_prompt++;
+            } else {
+                n_prompt = qwen_tokenize_encode(&srv.qwen_enc, prompt, ptokens, max_pt);
+            }
         } else {
             n_prompt = tokenizer_encode(tokenizer, prompt, ptokens, max_pt, srv.model.tok_add_bos);
         }
