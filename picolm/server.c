@@ -66,6 +66,12 @@ typedef int SOCKET;
 /* Declared in picolm.c */
 extern double get_time_ms(void);
 
+/* GPU path selection: 0=model_forward (CPU-hybrid), 1=model_forward_gpu (full GPU).
+ * Defaults to 0 for server (unchanged behavior), 1 for CLI. */
+#ifndef PICOLM_SERVER_DEFAULT_GPU_PATH
+#define PICOLM_SERVER_DEFAULT_GPU_PATH 0
+#endif
+
 #ifndef PICO_SERVER_BACKLOG
 #define PICO_SERVER_BACKLOG 8
 #endif
@@ -168,7 +174,27 @@ static int check_stop_words(const char *text, int text_len, const char *last_pie
     return 0;
 }
 
-/* Send an HTTP response and close the connection. */
+/* GPU decode path selector for server. */
+static float *server_model_forward(model_t *model, int token, int pos) {
+    static int gpu_path = -1;
+    if (gpu_path < 0) {
+        const char *gp = getenv("PICOLM_GPU_PATH");
+        gpu_path = gp ? atoi(gp) : PICOLM_SERVER_DEFAULT_GPU_PATH;
+        if (gpu_path != 0 && gpu_path != 1) {
+            fprintf(stderr, "WARNING: PICOLM_GPU_PATH=%d invalid, using %d\n",
+                    gpu_path, PICOLM_SERVER_DEFAULT_GPU_PATH);
+            gpu_path = PICOLM_SERVER_DEFAULT_GPU_PATH;
+        }
+    }
+#ifdef PICOLM_GPU
+    if (gpu_path == 1 && model->gpu.kv_active) {
+        float *logits = model_forward_gpu(model, token, pos);
+        if (logits) return logits;
+    }
+#endif
+    return model_forward(model, token, pos);
+}
+
 /* Send data with HTTP chunked transfer encoding framing.
  * Each call sends: chunk_length_hex\r\n data chunk\r\n
  * Returns 0 on success, -1 if the client has disconnected. */
@@ -1879,7 +1905,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         if (n_prefill <= 0) {
             /* Fully cached: need logits for first gen token */
             int token = ptokens[n_prompt - 1];
-            logits = model_forward(model, token, n_prompt);
+            logits = server_model_forward(model, token, n_prompt);
         }
         /* else: logits already computed by prefill for last prompt token */
 
@@ -1973,7 +1999,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
 
             if (stopped || next == (int)tokenizer->eos_id) break;
             token = next;
-            logits = model_forward(model, token, pos);
+            logits = server_model_forward(model, token, pos);
         }
 
         free(generated_stream);
@@ -2095,7 +2121,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             /* Generation phase */
             if (n_prefill_ns <= 0) {
                 int token = ptokens[n_prompt - 1];
-                logits_ns = model_forward(model, token, n_prompt);
+                logits_ns = server_model_forward(model, token, n_prompt);
             }
 
             int token = ptokens[n_prompt - 1];
@@ -2142,7 +2168,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
                 if (gen_count >= max_tokens) { finish_reason = "length"; break; }
                 token = next;
                 gen_count_ns++;
-                logits_ns = model_forward(model, token, pos);
+                logits_ns = server_model_forward(model, token, pos);
             }
             total_generation_tokens += gen_count;
 
@@ -2540,7 +2566,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         /* ---- Generation phase ---- */
         if (n_prefill <= 0) {
             token = ptokens[n_prompt - 1];
-            logits = model_forward(model, token, n_prompt);
+            logits = server_model_forward(model, token, n_prompt);
         }
 
         int gen_count = 0;
@@ -2636,7 +2662,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
                 break;
             }
             token = next;
-            logits = model_forward(model, token, pos);
+            logits = server_model_forward(model, token, pos);
         }
 
         free(generated_stream);
@@ -2738,7 +2764,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         /* ---- Generation phase ---- */
         if (n_prefill_ns2 <= 0) {
             token = ptokens[n_prompt - 1];
-            logits_ns2 = model_forward(model, token, n_prompt);
+            logits_ns2 = server_model_forward(model, token, n_prompt);
         }
 
         token = ptokens[n_prompt - 1];
@@ -2790,7 +2816,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             }
             if (gen_count >= n_predict) { stop_type = "limit"; break; }
             token = next;
-            logits_ns2 = model_forward(model, token, pos);
+            logits_ns2 = server_model_forward(model, token, pos);
         }
 
         double t_end = get_time_ms();

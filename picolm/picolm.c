@@ -796,6 +796,21 @@ int main(int argc, char **argv) {
             n_prompt, max_tokens, (double)temperature, (double)top_p, num_threads);
     fprintf(stderr, "---\n");
 
+#ifdef PICOLM_GPU
+    /* PICOLM_GPU_PATH: 0=model_forward (CPU-hybrid), 1=model_forward_gpu (full GPU).
+     * Controls decode path for both benchmark and interactive modes.
+     * static: initialized once, shared across benchmark iterations. */
+    static int gpu_path = -1;
+    if (gpu_path < 0) {
+        const char *gp = getenv("PICOLM_GPU_PATH");
+        gpu_path = gp ? atoi(gp) : 1;
+        if (gpu_path != 0 && gpu_path != 1) {
+            fprintf(stderr, "WARNING: PICOLM_GPU_PATH=%d invalid, using 1\n", gpu_path);
+            gpu_path = 1;
+        }
+    }
+#endif
+
     /* ---- Benchmark mode ---- */
     if (benchmark_mode) {
         fprintf(stderr, "\nBenchmark mode (Ctrl-C to stop)\n");
@@ -918,7 +933,7 @@ int main(int argc, char **argv) {
                     bench.gen_tokens++;
                     pos++;
 #ifdef PICOLM_GPU
-                    if (model.gpu.kv_active) {
+                    if (model.gpu.kv_active && gpu_path == 1) {
                         logits = model_forward_gpu(&model, token, pos);
                         if (!logits) logits = model_forward(&model, token, pos);
 
@@ -1070,7 +1085,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "INFO: PICOLM_DBG_PIPELINE active (default loop)\n");
             }
         }
-        if (model.gpu.kv_active) {
+        if (model.gpu.kv_active && gpu_path == 1) {
             logits = model_forward_gpu(&model, token, pos + 1);
             if (!logits) logits = model_forward(&model, token, pos + 1);
             /* PICOLM_DBG_PIPELINE: compare GPU pipeline vs CPU at first token only
