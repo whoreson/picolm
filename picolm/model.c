@@ -9088,7 +9088,7 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
         } \
     } while(0)
 
-    ok&=picolm_gpu_rmsnorm_batched_dev(bffn_norm,bx,(float*)s->attn_norm_w[l],dim,eps,n_tokens,xb2_stride,dev);
+    ok&=picolm_gpu_rmsnorm_batched_dev(bffn_norm,bx,(float*)gw->attn_norm_dev[l],dim,eps,n_tokens,xb2_stride,dev);
     SSM_DBG_SYNC;
     _DBG_RMS("rmsnorm",bffn_norm,xb2_stride);
     /* QKV + Z-gate projections (read from RMSNorm'd input at xb2_stride) */
@@ -9426,6 +9426,22 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
             free(hbuf);
           }
       }
+      /* Dump ssm_out weight row 0 (dequant from BF16) and bxb last token dot product */
+      if(l==0 && getenv("PICOLM_SSM_VERIFY")){
+          const void *sw_raw = picolm_gpu_tensor_weights((picolm_gpu_tensor_t*)gl->ssm_out);
+          int sw_rb = (int)gguf_type_row_size(lw->type_ssm_out, value_dim);
+          uint16_t *sw_bf = (uint16_t*)malloc(sw_rb);
+          picolm_gpu_memcpy(sw_bf, sw_raw, sw_rb, -1, dev);
+          /* D2H the bxb last token (value_dim floats, at offset (n_tokens-1)*value_dim) */
+          float *xb_last = (float*)malloc(value_dim * sizeof(float));
+          picolm_gpu_memcpy(xb_last, bxb + (size_t)(n_tokens-1)*value_dim, value_dim * sizeof(float), -1, dev);
+          /* Compute dot product row 0 manually */
+          float dot0 = 0;
+          for(int _i=0;_i<value_dim;_i++) dot0 += bf16_to_fp32(sw_bf[_i]) * xb_last[_i];
+          double xb_rms=0; for(int _i=0;_i<value_dim;_i++) xb_rms+=xb_last[_i]*xb_last[_i];
+          fprintf(stderr,"[DBG l0] ssm_out: dot0=%.6f bxb_rms=%.6f\n", dot0, sqrt(xb_rms/value_dim));
+          free(sw_bf); free(xb_last);
+      }
       ok&=picolm_gpu_matmul_dev((picolm_gpu_tensor_t*)gl->ssm_out,bffn_norm,bxb,n_tokens,dev,xb2_stride,value_dim);
     SSM_DBG_SYNC;
       if(l <= 4 && getenv("PICOLM_SSM_VERIFY")) {
@@ -9452,7 +9468,7 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
           fprintf(stderr,"[DBG] l=%d ffn_norm_out_tok0[:4]={%.6f,%.6f,%.6f,%.6f}\n",l,ffn0[0],ffn0[1],ffn0[2],ffn0[3]);
         }
           float pw[dim]; picolm_gpu_sync(dev);
-          picolm_gpu_memcpy(pw, s->post_attn_norm_w[l], dim*4, -1, dev);
+          picolm_gpu_memcpy(pw, gw->post_attn_norm_dev[l], dim*4, -1, dev);
           double pr=0; for(int _i=0;_i<dim;_i++) pr += (double)pw[_i]*pw[_i];
           fprintf(stderr,"[DBG] l=%d post_attn_norm_w rms=%.6f\n",l,sqrt(pr/dim));
           /* Also dump bx input rms */
@@ -9461,7 +9477,7 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
           double br=0; for(int _i=0;_i<dim;_i++) br += (double)bxi[_i]*bxi[_i];
           fprintf(stderr,"[DBG] l=%d bx_ffn_in rms=%.6f\n",l,sqrt(br/dim));
       }
-      ok&=picolm_gpu_rmsnorm_batched_dev(bffn_norm,bx,(float*)s->post_attn_norm_w[l],dim,eps,n_tokens,xb2_stride,dev);
+      ok&=picolm_gpu_rmsnorm_batched_dev(bffn_norm,bx,(float*)gw->post_attn_norm_dev[l],dim,eps,n_tokens,xb2_stride,dev);
     SSM_DBG_SYNC;
     if(l<=4&&getenv("PICOLM_SSM_VERIFY")) {
         float *bn=(float*)malloc(dim*4); picolm_gpu_sync(dev);

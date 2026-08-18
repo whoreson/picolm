@@ -25,6 +25,7 @@ extern "C" {
 /* Forward declarations for use in inline helpers below */
 float fp16_to_fp32(uint16_t h);
 float fp16_to_fp32_lookup(uint16_t h);
+float bf16_to_fp32(uint16_t x);
 void fp16_table_init(void);
 
 /* ARMv8.2 SDOT/UDOT (vdotq_laneq_s32 etc). Distinct from PICOLM_NEON since
