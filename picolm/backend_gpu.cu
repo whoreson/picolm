@@ -1019,19 +1019,19 @@ picolm_gpu_attention_decode_kernel(
             const float *qg = q_dev + (size_t)(first_qh + g) * head_dim;
             float score;
             if (tid == 0) {
-                /* Match CPU AVX-512 accumulation: 8 chunks of 16, tree reduce */
+                /* Match CPU AVX-512 accumulation: n_chunks of 16, tree reduce */
+                int n_chunks = head_dim / 16;
                 float chunk[8] = {0};
-                for (int c = 0; c < 8; c++) {
+                for (int c = 0; c < n_chunks; c++) {
                     float s = 0;
                     for (int d = c * 16; d < (c + 1) * 16; d++) {
                         s = fmaf(qg[d], gpu_fp16_to_fp32(k_sh[d]), s);
                     }
                     chunk[c] = s;
                 }
-                chunk[0] += chunk[4]; chunk[1] += chunk[5];
-                chunk[2] += chunk[6]; chunk[3] += chunk[7];
-                chunk[0] += chunk[2]; chunk[1] += chunk[3];
-                chunk[0] += chunk[1];
+                if (n_chunks >= 5) { chunk[0] += chunk[4]; chunk[1] += chunk[5]; chunk[2] += chunk[6]; chunk[3] += chunk[7]; }
+                if (n_chunks >= 3) { chunk[0] += chunk[2]; chunk[1] += chunk[3]; }
+                if (n_chunks >= 2) chunk[0] += chunk[1];
                 score = chunk[0] / sqrt_hd;
             }
 
@@ -1066,7 +1066,7 @@ picolm_gpu_attention_decode_kernel(
 
     /* Normalize and write output, parallelized across threads */
     for (int g = 0; g < kv_mul; g++) {
-        float inv_sum = 1.0f / sum_exp_sh[g];
+        float inv_sum = (sum_exp_sh[g] > 0.0f) ? (1.0f / sum_exp_sh[g]) : 0.0f;
         float *xbhg = xb_out + (size_t)(first_qh + g) * head_dim;
         float *accg = acc_sh + (size_t)g * head_dim;
         for (int d = tid; d < head_dim; d += n_threads) {
@@ -1345,19 +1345,18 @@ picolm_gpu_attention_prefill_f32kv_kernel(
                 if (tid == 0) {
                     /* Match CPU AVX-512 accumulation order: 16-wide chunks + tree reduce.
                      * This produces bit-identical scores to the CPU vec_dot_f16_f32. */
+                    int n_chunks = head_dim / 16;
                     float chunk[8] = {0};
-                    for (int c = 0; c < 8; c++) {
+                    for (int c = 0; c < n_chunks; c++) {
                         float s = 0;
                         for (int d = c * 16; d < (c + 1) * 16; d++) {
                             s = fmaf(qg[d], k_tile_f[ti * head_dim + d], s);
                         }
                         chunk[c] = s;
                     }
-                    /* Tree reduce: same order as _mm512_reduce_add_ps */
-                    chunk[0] += chunk[4]; chunk[1] += chunk[5];
-                    chunk[2] += chunk[6]; chunk[3] += chunk[7];
-                    chunk[0] += chunk[2]; chunk[1] += chunk[3];
-                    chunk[0] += chunk[1];
+                    if (n_chunks >= 5) { chunk[0] += chunk[4]; chunk[1] += chunk[5]; chunk[2] += chunk[6]; chunk[3] += chunk[7]; }
+                    if (n_chunks >= 3) { chunk[0] += chunk[2]; chunk[1] += chunk[3]; }
+                    if (n_chunks >= 2) chunk[0] += chunk[1];
                     score = chunk[0] / sqrt_hd;
                     /* Debug: first Q token, first KV pos, head 0 */
                     if (h == 0 && qi == 0 && ti == 0) {
@@ -1391,7 +1390,7 @@ picolm_gpu_attention_prefill_f32kv_kernel(
 
     for (int qi = 0; qi < n_q; qi++) {
         int global_q = q_start + qi;
-        float inv_sum = 1.0f / sum_exp_sh[qi];
+        float inv_sum = (sum_exp_sh[qi] > 0.0f) ? (1.0f / sum_exp_sh[qi]) : 0.0f;
         float *xbhg = xb_out + (size_t)(global_q * n_heads + h) * head_dim;
         float *accqi = acc_sh + (size_t)qi * head_dim;
         for (int d = tid; d < head_dim; d += n_threads) {
@@ -1497,18 +1496,18 @@ picolm_gpu_attention_prefill_kernel(
                  * 8 chunks of 16 with fmaf, then tree reduce (same as _mm512_reduce_add_ps). */
                 float score;
                 if (tid == 0) {
+                    int n_chunks = head_dim / 16;
                     float chunk[8] = {0};
-                    for (int c = 0; c < 8; c++) {
+                    for (int c = 0; c < n_chunks; c++) {
                         float s = 0;
                         for (int d = c * 16; d < (c + 1) * 16; d++) {
                             s = fmaf(qg[d], gpu_fp16_to_fp32(k_tile[ti * head_dim + d]), s);
                         }
                         chunk[c] = s;
                     }
-                    chunk[0] += chunk[4]; chunk[1] += chunk[5];
-                    chunk[2] += chunk[6]; chunk[3] += chunk[7];
-                    chunk[0] += chunk[2]; chunk[1] += chunk[3];
-                    chunk[0] += chunk[1];
+                    if (n_chunks >= 5) { chunk[0] += chunk[4]; chunk[1] += chunk[5]; chunk[2] += chunk[6]; chunk[3] += chunk[7]; }
+                    if (n_chunks >= 3) { chunk[0] += chunk[2]; chunk[1] += chunk[3]; }
+                    if (n_chunks >= 2) chunk[0] += chunk[1];
                     score = chunk[0] / sqrt_hd;
                     reduce_sh[0] = score;
                 }
@@ -1551,7 +1550,7 @@ picolm_gpu_attention_prefill_kernel(
     /* Normalize and write output, parallelized across threads */
     for (int qi = 0; qi < n_q; qi++) {
         int global_q = q_start + qi;
-        float inv_sum = 1.0f / sum_exp_sh[qi];
+        float inv_sum = (sum_exp_sh[qi] > 0.0f) ? (1.0f / sum_exp_sh[qi]) : 0.0f;
         float *xbhg = xb_out + (size_t)(global_q * n_heads + h) * head_dim;
         float *accqi = acc_sh + (size_t)qi * head_dim;
         for (int d = tid; d < head_dim; d += n_threads) {
