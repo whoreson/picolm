@@ -3184,13 +3184,13 @@ static void attn_core(
 #ifdef PICOLM_AVX512
                 { __m512 cv = _mm512_set1_ps(correction); int d = 0;
                   for (; d + 15 < head_dim; d += 16) { __m512 vf = fp16x16_to_fp32_inline(vt16 + d); __m512 af = _mm512_loadu_ps(acc + d); _mm512_storeu_ps(acc + d, _mm512_fmadd_ps(af, cv, vf)); }
-                  for (; d < head_dim; d++) acc[d] = acc[d] * correction + fp16_to_fp32(vt16[d]); }
+                  for (; d < head_dim; d++) acc[d] = fmaf(acc[d], correction, fp16_to_fp32(vt16[d])); }
 #elif defined(PICOLM_AVX)
                 { __m256 cv = _mm256_set1_ps(correction); int d = 0;
                   for (; d + 7 < head_dim; d += 8) { __m256 vf = fp16x8_to_fp32_inline(vt16 + d); __m256 af = _mm256_loadu_ps(acc + d); _mm256_storeu_ps(acc + d, _mm256_add_ps(_mm256_mul_ps(af, cv), vf)); }
-                  for (; d < head_dim; d++) acc[d] = acc[d] * correction + fp16_to_fp32(vt16[d]); }
+                  for (; d < head_dim; d++) acc[d] = fmaf(acc[d], correction, fp16_to_fp32(vt16[d])); }
 #else
-                for (int d = 0; d < head_dim; d++) acc[d] = acc[d] * correction + fp16_to_fp32(vt16[d]);
+                for (int d = 0; d < head_dim; d++) acc[d] = fmaf(acc[d], correction, fp16_to_fp32(vt16[d]));
 #endif
             }
             max_score = score;
@@ -3206,13 +3206,13 @@ static void attn_core(
 #ifdef PICOLM_AVX512
                 { __m512 wv = _mm512_set1_ps(w); int d = 0;
                   for (; d + 15 < head_dim; d += 16) { __m512 vf = fp16x16_to_fp32_inline(vt16 + d); __m512 af = _mm512_loadu_ps(acc + d); _mm512_storeu_ps(acc + d, _mm512_fmadd_ps(vf, wv, af)); }
-                  for (; d < head_dim; d++) acc[d] += w * fp16_to_fp32(vt16[d]); }
+                  for (; d < head_dim; d++) acc[d] = fmaf(w, fp16_to_fp32(vt16[d]), acc[d]); }
 #elif defined(PICOLM_AVX)
                 { __m256 wv = _mm256_set1_ps(w); int d = 0;
                   for (; d + 7 < head_dim; d += 8) { __m256 vf = fp16x8_to_fp32_inline(vt16 + d); __m256 af = _mm256_loadu_ps(acc + d); _mm256_storeu_ps(acc + d, _mm256_add_ps(_mm256_mul_ps(vf, wv), af)); }
-                  for (; d < head_dim; d++) acc[d] += w * fp16_to_fp32(vt16[d]); }
+                  for (; d < head_dim; d++) acc[d] = fmaf(w, fp16_to_fp32(vt16[d]), acc[d]); }
 #else
-                for (int d = 0; d < head_dim; d++) acc[d] += w * fp16_to_fp32(vt16[d]);
+                for (int d = 0; d < head_dim; d++) acc[d] = fmaf(w, fp16_to_fp32(vt16[d]), acc[d]);
 #endif
             }
         }
@@ -3450,7 +3450,7 @@ static void attention_group(int kv_head_idx, void *ctx_ptr) {
                     _mm512_storeu_ps(accg + d, _mm512_fmadd_ps(af, cv, vf));
                 }
                 for (; d < head_dim; d++)
-                    accg[d] = accg[d] * correction + v_f32[d];
+                    accg[d] = fmaf(accg[d], correction, v_f32[d]);
                 max_score[g] = score;
             } else {
                 float w = expf(score - max_score[g]);
@@ -3463,7 +3463,7 @@ static void attention_group(int kv_head_idx, void *ctx_ptr) {
                     _mm512_storeu_ps(accg + d, _mm512_fmadd_ps(vf, wv, af));
                 }
                 for (; d < head_dim; d++)
-                    accg[d] += w * v_f32[d];
+                    accg[d] = fmaf(w, v_f32[d], accg[d]);
             }
         }
 #else
@@ -3497,7 +3497,7 @@ static void attention_group(int kv_head_idx, void *ctx_ptr) {
                 else if (ctx->kv_type_v == KV_CACHE_TQ4) fma_scale_tq4_f32(accg, correction, vt, head_dim);
                 else {
                     const uint16_t *vt16 = (const uint16_t *)vt;
-                    for (int d = 0; d < head_dim; d++) accg[d] = accg[d] * correction + fp16_to_fp32(vt16[d]);
+                    for (int d = 0; d < head_dim; d++) accg[d] = fmaf(accg[d], correction, fp16_to_fp32(vt16[d]));
                 }
                 max_score[g] = score;
             } else {
@@ -3509,7 +3509,7 @@ static void attention_group(int kv_head_idx, void *ctx_ptr) {
                 else if (ctx->kv_type_v == KV_CACHE_TQ4) scale_add_tq4_f32(accg, w, vt, head_dim);
                 else {
                     const uint16_t *vt16 = (const uint16_t *)vt;
-                    for (int d = 0; d < head_dim; d++) accg[d] += w * fp16_to_fp32(vt16[d]);
+                    for (int d = 0; d < head_dim; d++) accg[d] = fmaf(w, fp16_to_fp32(vt16[d]), accg[d]);
                 }
             }
         }
@@ -11792,7 +11792,7 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
 
         /* A. RMSNorm batched: one launch for all n_tokens */
 #ifdef PICOLM_SSM_VERIFY
-        if (l == 0 || l == 47 || l == 59 || l == 64) {
+        if (l == 0 || l == 47 || l == 59 || l == 64 || l == 7 || l == 8) {
             float tmp8[8];
             picolm_gpu_sync(gpu_dev);
             picolm_gpu_memcpy(tmp8, bx, sizeof(tmp8), -1, gpu_dev);
@@ -11805,6 +11805,13 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
                 l, tmpl[0],tmpl[1],tmpl[2],tmpl[3]);
         }
 #endif
+        /* NaN guard: detect where NaN first appears in the pipeline */
+        if (getenv("PICOLM_SSM_VERIFY")) {
+            float _chk[4]; picolm_gpu_sync(gpu_dev);
+            picolm_gpu_memcpy(_chk, bx + (size_t)(n_tokens-1)*xb_stride, 16, -1, gpu_dev);
+            int _nan=0; for(int _i=0;_i<4;_i++) if(isnanf(_chk[_i])) _nan++;
+            if (_nan > 0) fprintf(stderr, "!!! NaN in bx input to layer %d\n", l);
+        }
         picolm_gpu_rmsnorm_batched_dev(bxb, bx,
                                         (float *)gw->attn_norm_dev[l],
                                         dim, c->rms_norm_eps, n_tokens, xb_stride, gpu_dev);
@@ -11845,6 +11852,12 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
         }
 
         /* C. K projection: bk = attn_k @ bxb */
+        if (getenv("PICOLM_SSM_VERIFY")) {
+            float _chk[4]; picolm_gpu_sync(gpu_dev);
+            picolm_gpu_memcpy(_chk, bxb + (size_t)(n_tokens-1)*xb_stride, 16, -1, gpu_dev);
+            int _nan=0; for(int _i=0;_i<4;_i++) if(isnanf(_chk[_i])) _nan++;
+            if(_nan>0) fprintf(stderr,"!!! NaN in rmsnorm output bxb layer %d\n",l);
+        }
         int k_ok = picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_k, bk, bxb, n_tokens, gpu_dev, n_kv_heads*head_dim, xb_stride);
         if(getenv("PICOLM_SSM_VERIFY") && l==3){
             float bk8[8]; picolm_gpu_sync(gpu_dev);
@@ -11856,6 +11869,15 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
         /* D. V projection: bv = attn_v @ bxb */
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_v,
                                bv, bxb, n_tokens, gpu_dev, n_kv_heads*head_dim, xb_stride);
+        if (getenv("PICOLM_SSM_VERIFY")) {
+            float _chk[4]; picolm_gpu_sync(gpu_dev);
+            picolm_gpu_memcpy(_chk, bk + (size_t)(n_tokens-1)*n_kv_heads*head_dim, 16, -1, gpu_dev);
+            int _nan=0; for(int _i=0;_i<4;_i++) if(isnanf(_chk[_i])) _nan++;
+            if(_nan>0) fprintf(stderr,"!!! NaN in bk (K proj) layer %d\n",l);
+            picolm_gpu_memcpy(_chk, bq + (size_t)(n_tokens-1)*q_full_dim, 16, -1, gpu_dev);
+            _nan=0; for(int _i=0;_i<4;_i++) if(isnanf(_chk[_i])) _nan++;
+            if(_nan>0) fprintf(stderr,"!!! NaN in bq (Q proj) layer %d\n",l);
+        }
 
 
         /* D1. QK-norm (Qwen3): per-head RMSNorm on Q and K.
@@ -11944,6 +11966,12 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
                                           this_attn_ordinal - 1, start_pos, n_tokens,
                                           n_heads, n_kv_heads, head_dim,
                                           seq_len, gpu_dev);
+        if (getenv("PICOLM_SSM_VERIFY")) {
+            float _chk[4]; picolm_gpu_sync(gpu_dev);
+            picolm_gpu_memcpy(_chk, battn_out + (size_t)(n_tokens-1)*n_heads*head_dim, 16, -1, gpu_dev);
+            int _nan=0; for(int _i=0;_i<4;_i++) if(isnanf(_chk[_i])) _nan++;
+            if(_nan>0) fprintf(stderr,"!!! NaN in attn_out layer %d\n",l);
+        }
         if(getenv("PICOLM_SSM_VERIFY") && l==3){
             float vb_verify[4];
             { int vb_off = (size_t)(n_tokens * n_heads) * head_dim - 64;
@@ -12000,7 +12028,12 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
         /* I. Output projection: bxb = attn_output @ battn_out */
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_output,
                                bxb, battn_out, n_tokens, gpu_dev, xb_stride, attn_out_stride);
-
+        if (getenv("PICOLM_SSM_VERIFY")) {
+            float _chk[4]; picolm_gpu_sync(gpu_dev);
+            picolm_gpu_memcpy(_chk, bxb + (size_t)(n_tokens-1)*xb_stride, 16, -1, gpu_dev);
+            int _nan=0; for(int _i=0;_i<4;_i++) if(isnanf(_chk[_i])) _nan++;
+            if(_nan>0) fprintf(stderr,"!!! NaN in attn_output proj bxb layer %d\n",l);
+        }
         if(getenv("PICOLM_SSM_VERIFY") && (l==64||l==3)){
             float oo[4]; picolm_gpu_sync(gpu_dev); picolm_gpu_memcpy(oo, bxb+(size_t)(n_tokens-1)*xb_stride, 16, -1, gpu_dev);
             fprintf(stderr,"[DBG] outproj l=%d last[:4]={%.6f,%.6f,%.6f,%.6f}\n",l,oo[0],oo[1],oo[2],oo[3]);}
