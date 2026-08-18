@@ -1054,7 +1054,7 @@ picolm_gpu_attention_decode_kernel(
                 /* Match CPU rounding: acc*rescale + (weight*v) where weight*v uses
                  * mul+add (2 roundings), matching CPU's mul+add path. */
                 float v_f = gpu_fp16_to_fp32(v_sh[d]);
-                accg[d] = fmaf(accg[d], rescale_sh, fmaf(weight_sh, v_f, 0.0f));
+                accg[d] = fmaf(accg[d], rescale_sh, weight_sh * v_f);
             }
             gpuSyncthreads(); /* reduce_sh/rescale_sh/weight_sh reused next g/t iter */
         }
@@ -1184,7 +1184,7 @@ picolm_gpu_attention_decode_split_kernel(
                 float *accg = acc_sh + (size_t)g * head_dim;
                 for (int d = tid; d < head_dim; d += n_threads) {
                     float v_f2 = gpu_fp16_to_fp32(v_sh[d]);
-                    accg[d] = fmaf(accg[d], rescale_sh, fmaf(weight_sh, v_f2, 0.0f));
+                    accg[d] = fmaf(accg[d], rescale_sh, weight_sh * v_f2);
                 }
                 gpuSyncthreads();
             }
@@ -1382,7 +1382,7 @@ picolm_gpu_attention_prefill_f32kv_kernel(
                      * or: acc + (w * vf) (score<=max, 2 roundings via mul+add)
                      * Using weight * v (mul+add, 2 roundings) instead of
                      * fmaf(weight, v, 0) (1 rounding) to match CPU behavior. */
-                    accqi[d] = fmaf(accqi[d], rescale_sh, fmaf(weight_sh, v_tile_f[ti * head_dim + d], 0.0f));
+                    accqi[d] = fmaf(accqi[d], rescale_sh, weight_sh * v_tile_f[ti * head_dim + d]);
                 }
                 gpuSyncthreads();
             }
@@ -1541,7 +1541,7 @@ picolm_gpu_attention_prefill_kernel(
                 gpuSyncthreads();
 
                 for (int d = tid; d < head_dim; d += n_threads) {
-                    accqi[d] = fmaf(accqi[d], rescale_sh, fmaf(weight_sh, gpu_fp16_to_fp32(v_tile[ti * head_dim + d]), 0.0f));
+                    accqi[d] = fmaf(accqi[d], rescale_sh, weight_sh * gpu_fp16_to_fp32(v_tile[ti * head_dim + d]));
                 }
                 gpuSyncthreads(); /* reduce_sh/rescale_sh/weight_sh reused next ti/qi */
             }
