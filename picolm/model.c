@@ -11716,11 +11716,7 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
 
         if (c->has_ssm && !lw->is_attn_layer) {
             /* SSM/hybrid layer: try GPU-native path first, fallback to CPU hybrid */
-            /* GPU SSM prefill disabled: Q8_0 matmul accumulation order differs from
-             * CPU, producing ~3% error per FFN layer that compounds across 48 SSM
-             * layers. The recurrence and all other GPU kernels are correct.
-             * TODO: fix picolm_quant_matmul accumulation order to match CPU NEON. */
-            if (0 && ssm_prefill_layer_gpu(m, s, bx, bxb, bq, battn_out, bffn_norm, bgate, bup, lw, l, n_tokens, start_pos, gpu_dev)) {
+            if (ssm_prefill_layer_gpu(m, s, bx, bxb, bq, battn_out, bffn_norm, bgate, bup, lw, l, n_tokens, start_pos, gpu_dev)) {
                 static int w1 = 0;
                 if (!w1) { fprintf(stderr, "INFO: SSM prefill device-native GPU active\n"); w1 = 1; }
             } else {
