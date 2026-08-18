@@ -1004,7 +1004,7 @@ picolm_gpu_attention_decode_kernel(
     }
     gpuSyncthreads();
 
-    float sqrt_hd = sqrtf((float)head_dim);
+    float attn_scale = 1.0f / sqrtf((float)head_dim);
 
     for (int t = 0; t <= pos; t++) {
         size_t k_off = layer_base + (size_t)t * kv_pos_stride_bytes / 2 + kv_h * kv_head_stride_bytes / 2;
@@ -1032,7 +1032,7 @@ picolm_gpu_attention_decode_kernel(
                 if (n_chunks >= 5) { chunk[0] += chunk[4]; chunk[1] += chunk[5]; chunk[2] += chunk[6]; chunk[3] += chunk[7]; }
                 if (n_chunks >= 3) { chunk[0] += chunk[2]; chunk[1] += chunk[3]; }
                 if (n_chunks >= 2) chunk[0] += chunk[1];
-                score = chunk[0] / sqrt_hd;
+                score = chunk[0] * attn_scale;
             }
 
             if (tid == 0) {
@@ -1051,12 +1051,8 @@ picolm_gpu_attention_decode_kernel(
 
             float *accg = acc_sh + (size_t)g * head_dim;
             for (int d = tid; d < head_dim; d += n_threads) {
-                /* Match CPU AVX-512 FMA accumulation order.
-                 * Correction path (score > max): acc = fmaf(acc, rescale, v)
-                 * Weight path (score <= max): acc = fmaf(v, weight, acc)
-                 * Both paths produce: acc*rescale + weight*v but with different
-                 * rounding order. Since rescale=1 in weight path and weight=1 in
-                 * correction path, either fmaf works. Use the correction path form. */
+                /* Match CPU rounding: acc*rescale + (weight*v) where weight*v uses
+                 * mul+add (2 roundings), matching CPU's mul+add path. */
                 float v_f = gpu_fp16_to_fp32(v_sh[d]);
                 accg[d] = fmaf(accg[d], rescale_sh, fmaf(weight_sh, v_f, 0.0f));
             }
@@ -1142,7 +1138,7 @@ picolm_gpu_attention_decode_split_kernel(
 
     if (t0 < t1) {
         size_t layer_base = (size_t)layer_ordinal * max_seq_len * n_kv_heads * head_dim;
-        float sqrt_hd = sqrtf((float)head_dim);
+        float attn_scale = 1.0f / sqrtf((float)head_dim);
 
         for (int t = t0; t < t1; t++) {
             size_t k_off = layer_base + (size_t)t * kv_pos_stride_bytes / 2 + kv_h * kv_head_stride_bytes / 2;
@@ -1168,7 +1164,7 @@ picolm_gpu_attention_decode_split_kernel(
                     chunk[2] += chunk[6]; chunk[3] += chunk[7];
                     chunk[0] += chunk[2]; chunk[1] += chunk[3];
                     chunk[0] += chunk[1];
-                    score = chunk[0] / sqrt_hd;
+                    score = chunk[0] * attn_scale;
                 }
 
                 if (tid == 0) {
@@ -1287,7 +1283,7 @@ picolm_gpu_attention_prefill_f32kv_kernel(
     int n_threads = gpuBlockDim_x;
 
     int kv_h = h / (n_heads / n_kv_heads);
-    float sqrt_hd = sqrtf((float)head_dim);
+    float attn_scale = 1.0f / sqrtf((float)head_dim);
 
     int q_start = tile_q_idx * ATTN_TILE_Q;
     int q_end = min(q_start + ATTN_TILE_Q, n_tokens);
@@ -1357,7 +1353,7 @@ picolm_gpu_attention_prefill_f32kv_kernel(
                     if (n_chunks >= 5) { chunk[0] += chunk[4]; chunk[1] += chunk[5]; chunk[2] += chunk[6]; chunk[3] += chunk[7]; }
                     if (n_chunks >= 3) { chunk[0] += chunk[2]; chunk[1] += chunk[3]; }
                     if (n_chunks >= 2) chunk[0] += chunk[1];
-                    score = chunk[0] / sqrt_hd;
+                    score = chunk[0] * attn_scale;
                     /* Debug: first Q token, first KV pos, head 0 */
                     if (h == 0 && qi == 0 && ti == 0) {
                         printf("ATNDBG: f32kv q0[:4]={%.6f,%.6f,%.6f,%.6f} k0[:4]={%.6f,%.6f,%.6f,%.6f} score=%.6f\n",
@@ -1381,6 +1377,11 @@ picolm_gpu_attention_prefill_f32kv_kernel(
                 gpuSyncthreads();
 
                 for (int d = tid; d < head_dim; d += n_threads) {
+                    /* Match CPU rounding: acc * rescale + (weight * v)
+                     * CPU does: acc * correction + vf (score>max, 1 rounding via FMA)
+                     * or: acc + (w * vf) (score<=max, 2 roundings via mul+add)
+                     * Using weight * v (mul+add, 2 roundings) instead of
+                     * fmaf(weight, v, 0) (1 rounding) to match CPU behavior. */
                     accqi[d] = fmaf(accqi[d], rescale_sh, fmaf(weight_sh, v_tile_f[ti * head_dim + d], 0.0f));
                 }
                 gpuSyncthreads();
@@ -1417,7 +1418,7 @@ picolm_gpu_attention_prefill_kernel(
     int n_threads = gpuBlockDim_x;
 
     int kv_h = h / (n_heads / n_kv_heads);
-    float sqrt_hd = sqrtf((float)head_dim);
+    float attn_scale = 1.0f / sqrtf((float)head_dim);
     /* Layer base offset in uint16_t */
     size_t layer_base = (size_t)layer_ordinal * max_seq_len * n_kv_heads * head_dim;
 
@@ -1508,7 +1509,7 @@ picolm_gpu_attention_prefill_kernel(
                     if (n_chunks >= 5) { chunk[0] += chunk[4]; chunk[1] += chunk[5]; chunk[2] += chunk[6]; chunk[3] += chunk[7]; }
                     if (n_chunks >= 3) { chunk[0] += chunk[2]; chunk[1] += chunk[3]; }
                     if (n_chunks >= 2) chunk[0] += chunk[1];
-                    score = chunk[0] / sqrt_hd;
+                    score = chunk[0] * attn_scale;
                     reduce_sh[0] = score;
                 }
                 if (tid == 0) score = reduce_sh[0];
