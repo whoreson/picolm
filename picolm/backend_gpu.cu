@@ -3135,6 +3135,13 @@ int picolm_gpu_expert_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
         gate->I != up->I || gate->O != up->O ||
         down->I != gate->O || down->O != gate->I) return 0;
 
+    /* Only the Q8_0 int8-MAC path is implemented here.
+     * For all other types (F32, BF16, Q4_K etc.), return 0
+     * so the caller falls back to the per-matmul CPU path. */
+    if (gate->qtype != GGUF_TYPE_Q8_0 ||
+        up->qtype != GGUF_TYPE_Q8_0 ||
+        down->qtype != GGUF_TYPE_Q8_0) return 0;
+
     gpu_device_ctx_t *ctx = find_ctx(gate->device);
     if (!select_ctx(ctx)) return 0;
 
@@ -6138,9 +6145,10 @@ int picolm_gpu_expert_mlp_dev(picolm_gpu_tensor_t *g, picolm_gpu_tensor_t *u, pi
     int D=g->I, I=g->O;
     if(!reserve(&ctx->gate,&ctx->gate_cap,(size_t)S*I*sizeof(float))||
        !reserve(&ctx->up,&ctx->up_cap,(size_t)S*I*sizeof(float))) return 0;
-
-    /* F32 fallback for debugging: bypass Q8_0 int8 MAC entirely */
-    if (getenv("PICOLM_FORCE_F32_MLP") || getenv("PICOLM_FORCE_F32_MATMUL")) {
+    /* F32 fallback: always use picolm_gpu_matmul_dev for non-Q8_0 weights
+     * (BF16, F32, etc.). For Q8_0 weights, the int8-MAC path is used below. */
+    if (g->qtype != GGUF_TYPE_Q8_0 || u->qtype != GGUF_TYPE_Q8_0 || d->qtype != GGUF_TYPE_Q8_0 ||
+        getenv("PICOLM_FORCE_F32_MLP") || getenv("PICOLM_FORCE_F32_MATMUL")) {
         if (!picolm_gpu_matmul_dev(g, ctx->gate, xd, S, dev, I, x_stride)) return 0;
         if (!picolm_gpu_matmul_dev(u, ctx->up, xd, S, dev, I, x_stride)) return 0;
         picolm_silu_mul<<<(unsigned)((S*I+255)/256),256,0,ctx->stream>>>(ctx->gate, ctx->up, S*I);

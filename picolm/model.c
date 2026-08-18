@@ -11570,13 +11570,40 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
             /* SSM/hybrid layer: try GPU-native path first, fallback to CPU hybrid */
             if (!ssm_forward_gpu(m, s, s->x, s->xb2, lw, l, pos,
                                   &m->gpu.layers[l], gpu_dev)) {
-                /* Fallback to CPU hybrid */
-                picolm_gpu_sync(gpu_dev);
+                /* Fallback to CPU hybrid.
+                 * When GPU prefill was used, the SSM persistent state (conv_state,
+                 * recurrence state) lives only on GPU. Sync it to CPU so that
+                 * ssm_forward below reads correct values. */
+                /* Sync only on first fallback per layer -- state lives on GPU
+                 * after GPU prefill and must be available for CPU ssm_forward.
+                 * After each CPU ssm_forward call, state is synced back to GPU
+                 * so subsequent tokens are correct. */
+                { int cd = 2*c->ssm_d_state*c->ssm_n_group+c->ssm_d_inner;
+                  int sd = c->ssm_dt_rank*c->ssm_d_state*c->ssm_d_state;
+                  if (gw->ssm_state_dev[l] && s->ssm_state[l]) {
+                      picolm_gpu_sync(gpu_dev);
+                      picolm_gpu_memcpy(s->ssm_state[l], gw->ssm_state_dev[l], sd*sizeof(float), -1, gpu_dev);
+                  }
+                  if (gw->ssm_conv_state_dev[l] && s->ssm_conv_state[l]) {
+                      picolm_gpu_memcpy(s->ssm_conv_state[l], gw->ssm_conv_state_dev[l], (c->ssm_d_conv-1)*cd*sizeof(float), -1, gpu_dev);
+                  }
+                }
                 picolm_gpu_memcpy(s->x, pipe_x, (size_t)dim * sizeof(float), -1, gpu_dev);
 
                 float *ssm_residual = s->xb2;
                 ssm_forward(m, s, s->x, ssm_residual, lw, l, pos, &m->gpu.layers[l]);
 
+                /* Sync updated SSM state back to GPU so subsequent tokens
+                 * that succeed on GPU (or fall back again) have correct state. */
+                { int cd = 2*c->ssm_d_state*c->ssm_n_group+c->ssm_d_inner;
+                  int sd = c->ssm_dt_rank*c->ssm_d_state*c->ssm_d_state;
+                  if (gw->ssm_state_dev[l] && s->ssm_state[l]) {
+                      picolm_gpu_memcpy(gw->ssm_state_dev[l], s->ssm_state[l], sd*sizeof(float), 1, gpu_dev);
+                  }
+                  if (gw->ssm_conv_state_dev[l] && s->ssm_conv_state[l]) {
+                      picolm_gpu_memcpy(gw->ssm_conv_state_dev[l], s->ssm_conv_state[l], (c->ssm_d_conv-1)*cd*sizeof(float), 1, gpu_dev);
+                  }
+                }
                 picolm_gpu_memcpy(pipe_x, s->x, (size_t)dim * sizeof(float), 1, gpu_dev);
                 did_cpu_ssm = 1;
             }
@@ -12057,6 +12084,27 @@ void picolm_ssm_state_sync_to_device(model_t *m, int device) {
 #ifdef PICOLM_GPU
     cudaProfilerStop();
 #endif
+}
+
+/* Sync SSM state from GPU device memory back to CPU host memory.
+ * Used when ssm_forward_gpu bails (e.g. BF16 alpha/beta unsupported)
+ * so that the CPU ssm_forward fallback has correct persistent state. */
+void picolm_ssm_state_sync_to_host(model_t *m, int device) {
+    model_config_t *c = &m->config;
+    if (!c->has_ssm) return;
+    int conv_dim = 2 * c->ssm_d_state * c->ssm_n_group + c->ssm_d_inner;
+    picolm_gpu_sync(device);
+    for (int l = 0; l < c->n_layers; l++) {
+        if (m->weights.layers[l].is_attn_layer) continue;
+        if (m->gpu.ssm_state_dev[l] && m->state.ssm_state[l]) {
+            size_t sz = (size_t)c->ssm_dt_rank * c->ssm_d_state * c->ssm_d_state * sizeof(float);
+            picolm_gpu_memcpy(m->state.ssm_state[l], m->gpu.ssm_state_dev[l], sz, -1, device);
+        }
+        if (m->gpu.ssm_conv_state_dev[l] && m->state.ssm_conv_state[l]) {
+            size_t sz = (size_t)(c->ssm_d_conv - 1) * (size_t)conv_dim * sizeof(float);
+            picolm_gpu_memcpy(m->state.ssm_conv_state[l], m->gpu.ssm_conv_state_dev[l], sz, -1, device);
+        }
+    }
 }
 
 #endif /* PICOLM_GPU */
