@@ -405,14 +405,9 @@ int tokenizer_encode(const tokenizer_t *t, const char *text, int *tokens, int ma
 const char *tokenizer_decode(const tokenizer_t *t, int prev_token, int token) {
     if (token < 0 || token >= t->vocab_size) return "";
 
-    /* Suppress special tokens (control=3, user_defined=4) */
-    if (t->token_type) {
-        int nn = t->n_token_type;
-        if (token < nn) {
-            int32_t ty = GGUF_LE32((uint32_t)t->token_type[token]);
-            if (ty == 3 || ty == 4) return "";
-        }
-    }
+    /* Only hide BOS/EOS; other special tokens (tool_call tags, etc.)
+     * must still be printed so stop-word matching can see them. */
+    if ((uint32_t)token == t->bos_id || (uint32_t)token == t->eos_id) return "";
 
     const char *str = t->vocab[token];
 

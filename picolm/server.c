@@ -1784,12 +1784,12 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
     if (n_choices > 4) n_choices = 4;
     /* Parse stop words - MUST copy before cJSON_Delete.
      * Accept both array ["stop1","stop2"] and single string "stop". */
-    char *stop_words[16];
+    char *stop_words[256];
     int n_stop_words = 0;
     cJSON *stop_item = cJSON_GetObjectItem(req, "stop");
     if (stop_item && cJSON_IsArray(stop_item)) {
         int n = cJSON_GetArraySize(stop_item);
-        if (n > 16) n = 16;
+        if (n > 256) { fprintf(stderr, "[server] WARNING: stop words capped from %d to 256\n", n); n = 256; }
         for (int i = 0; i < n; i++) {
             cJSON *sw = cJSON_GetArrayItem(stop_item, i);
             if (cJSON_IsString(sw)) {
@@ -2406,12 +2406,12 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
 
     /* Parse stop words - MUST copy before cJSON_Delete.
      * Accept both array ["stop1","stop2"] and single string "stop". */
-    char *stop_words[16];
+    char *stop_words[256];
     int n_stop_words = 0;
     cJSON *stop_item = cJSON_GetObjectItem(req, "stop");
     if (stop_item && cJSON_IsArray(stop_item)) {
         int n = cJSON_GetArraySize(stop_item);
-        if (n > 16) n = 16;
+        if (n > 256) { fprintf(stderr, "[server] WARNING: stop words capped from %d to 256\n", n); n = 256; }
         for (int i = 0; i < n; i++) {
             cJSON *sw = cJSON_GetArrayItem(stop_item, i);
             if (cJSON_IsString(sw)) {
