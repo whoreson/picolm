@@ -394,6 +394,14 @@ int picolm_gpu_kv_store_dev_batched(int is_k, int layer_ordinal, int start_pos, 
                                      const float *src_dev, int n_kv_heads, int head_dim,
                                      int max_seq_len, int device);
 
+/* Bulk KV cache upload from host F16 cache.
+ * Copies all n_positions for a single layer from host_rows (contiguous
+ * F16 rows) to device KV cache starting at pos 0.
+ * Used for KV cache restoration from file. */
+int picolm_gpu_kv_upload_layer(int is_k, int layer_ordinal, int n_positions,
+                                const uint16_t *host_rows, int n_kv_heads,
+                                int head_dim, int max_seq_len, int device);
+
 /* Decode-path attention: S=1, one query per head, online softmax over pos+1
  * cached positions. q is host pointer [n_heads][head_dim] in F32.
  * Output xb_out [n_heads][head_dim] in F32.

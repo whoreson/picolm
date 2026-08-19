@@ -12,6 +12,7 @@
  */
 
 #include "model.h"
+#include "backend_gpu.h"
 #include "tensor.h"
 #include "tokenizer.h"
 #include "sampler.h"
@@ -1172,6 +1173,35 @@ static void handle_slots_post(SOCKET sock, const char *body) {
         char full_path[2048];
         build_slot_path(full_path, sizeof(full_path), filename);
 
+        /* Download GPU KV cache to CPU mirror before saving.
+         * GPU generation bypasses CPU s->key_cache/s->val_cache entirely,
+         * so kvcache_save would save all-zeros without this sync. */
+#ifdef PICOLM_GPU
+        if (srv.model.gpu.kv_active && srv.model.gpu.device >= 0 &&
+            srv.model.state.kv_type_k == KV_CACHE_F16 &&
+            srv.model.state.kv_type_v == KV_CACHE_F16) {
+            model_t *model = &srv.model;
+            const model_config_t *c = &model->config;
+            int gpu_dev = model->gpu.device;
+            size_t pos_stride_k = model->state.kv_row_size_k;
+            size_t pos_stride_v = model->state.kv_row_size_v;
+            uint8_t *gpu_k = (uint8_t *)picolm_gpu_kv_k_dev(gpu_dev);
+            uint8_t *gpu_v = (uint8_t *)picolm_gpu_kv_v_dev(gpu_dev);
+            picolm_gpu_sync(gpu_dev);
+            for (int l = 0; l < c->n_layers; l++) {
+                if (!model->weights.layers[l].is_attn_layer) continue;
+                int ao = model->state.kv_layer_ordinal[l];
+                size_t layer_bytes_k = (size_t)srv.kv_pos * pos_stride_k;
+                size_t layer_bytes_v = (size_t)srv.kv_pos * pos_stride_v;
+                uint8_t *cpu_k = model->state.key_cache + (size_t)ao * c->max_seq_len * pos_stride_k;
+                uint8_t *cpu_v = model->state.val_cache + (size_t)ao * c->max_seq_len * pos_stride_v;
+                picolm_gpu_memcpy(cpu_k, gpu_k + (size_t)ao * c->max_seq_len * pos_stride_k,
+                    layer_bytes_k, -1, gpu_dev);
+                picolm_gpu_memcpy(cpu_v, gpu_v + (size_t)ao * c->max_seq_len * pos_stride_v,
+                    layer_bytes_v, -1, gpu_dev);
+            }
+        }
+#endif
         double t0 = get_time_ms();
         int rc = kvcache_save(&srv.model, full_path, srv.kv_pos, srv.last_prompt_tokens);
         double t_ms = get_time_ms() - t0;
@@ -1265,6 +1295,35 @@ static void handle_slots_post(SOCKET sock, const char *body) {
         }
 
         srv.kv_pos = n_restored;
+        /* Sync restored CPU state to GPU: KV cache + SSM state */
+#ifdef PICOLM_GPU
+        {
+            model_t *model = &srv.model;
+            int gpu_dev = model->gpu.device;
+            if (model->gpu.kv_active && gpu_dev >= 0) {
+                const model_config_t *c = &model->config;
+                /* Upload KV cache from CPU to GPU (F16 only for now) */
+                if (model->state.kv_type_k == KV_CACHE_F16 &&
+                    model->state.kv_type_v == KV_CACHE_F16) {
+                    for (int l = 0; l < c->n_layers; l++) {
+                        if (!model->weights.layers[l].is_attn_layer) continue;
+                        int ao = model->state.kv_layer_ordinal[l];
+                        const uint16_t *k_rows = (const uint16_t *)(model->state.key_cache +
+                            (size_t)ao * c->max_seq_len * model->state.kv_row_size_k);
+                        const uint16_t *v_rows = (const uint16_t *)(model->state.val_cache +
+                            (size_t)ao * c->max_seq_len * model->state.kv_row_size_v);
+                        picolm_gpu_kv_upload_layer(1, ao, n_restored,
+                            k_rows, c->n_kv_heads, c->head_dim, c->max_seq_len, gpu_dev);
+                        picolm_gpu_kv_upload_layer(0, ao, n_restored,
+                            v_rows, c->n_kv_heads, c->head_dim, c->max_seq_len, gpu_dev);
+                    }
+                    picolm_gpu_sync(gpu_dev);
+                }
+                /* Upload SSM state */
+                picolm_ssm_state_sync_to_device(model, gpu_dev);
+            }
+        }
+#endif
         /* Clear checkpoints on restore (conversation state is from file) */
         checkpoint_clear();
         /* Restore last_prompt_tokens from saved token sequence */

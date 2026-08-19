@@ -5337,6 +5337,29 @@ picolm_gpu_kv_store_rows(int is_k, int layer_ordinal, int start_pos, int n_posit
     return 1;
 }
 
+/* Bulk upload: copy all n_positions for one layer from host F16 cache to device.
+ * host_rows: [n_positions][n_kv_heads][head_dim] contiguous uint16_t. */
+extern "C" int
+picolm_gpu_kv_upload_layer(int is_k, int layer_ordinal, int n_positions,
+                            const uint16_t *host_rows, int n_kv_heads,
+                            int head_dim, int max_seq_len, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    if (!g_kv_k_dev[device] || !g_kv_v_dev[device]) return 0;
+
+    size_t row_bytes = (size_t)n_kv_heads * head_dim * sizeof(uint16_t);
+    uint16_t *dst_base = is_k ? g_kv_k_dev[device] : g_kv_v_dev[device];
+    size_t layer_off_bytes = (size_t)layer_ordinal * max_seq_len * row_bytes;
+    uint8_t *dst = (uint8_t *)dst_base + layer_off_bytes;
+
+    size_t copy_bytes = (size_t)n_positions * row_bytes;
+    if (!gpu_ok(gpuMemcpyAsync(dst, host_rows, copy_bytes,
+                               gpuMemcpyHostToDevice, ctx->stream),
+                "kv_upload_layer async copy"))
+        return 0;
+    return 1;
+}
+
 /* Shared dispatch for both picolm_gpu_attention_decode and _dev: chooses
  * single-pass (grid=n_kv_heads, matching the pre-split-K behavior
  * exactly -- no regression risk for short contexts) vs split-K (grid=
