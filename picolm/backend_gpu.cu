@@ -1368,11 +1368,13 @@ picolm_gpu_attention_prefill_f32kv_kernel(
                     }
                     score = chunk[0] * attn_scale;
                     /* Debug: first Q token, first KV pos, head 0 */
+#ifdef PICOLM_SSM_VERIFY
                     if (h == 0 && qi == 0 && ti == 0) {
                         printf("ATNDBG: f32kv q0[:4]={%.6f,%.6f,%.6f,%.6f} k0[:4]={%.6f,%.6f,%.6f,%.6f} score=%.6f\n",
                             qg[0], qg[1], qg[2], qg[3],
                             k_tile_f[0], k_tile_f[1], k_tile_f[2], k_tile_f[3], score);
                     }
+#endif
                 }
 
                 if (tid == 0) {
@@ -1528,6 +1530,7 @@ picolm_gpu_attention_prefill_kernel(
                 }
                 if (tid == 0) score = reduce_sh[0];
                 /* Debug: dump Q and K first 4 elements for first Q token, first KV pos, head 0 */
+#ifdef PICOLM_SSM_VERIFY
                 if (h == 0 && qi == 0 && ti == 0 && tid == 0) {
                     printf("ATNDBG: prefill l=%d q0[:4]={%.6f,%.6f,%.6f,%.6f} k0[:4]={%.6f,%.6f,%.6f,%.6f} score=%.6f\n",
                         layer_ordinal,
@@ -1536,6 +1539,7 @@ picolm_gpu_attention_prefill_kernel(
                         gpu_fp16_to_fp32(k_tile[2]), gpu_fp16_to_fp32(k_tile[3]),
                         score);
                 }
+#endif
 
                 /* Online softmax branch decision on thread 0, broadcast
                  * via shared scalars; accumulator update parallelized
@@ -2846,6 +2850,7 @@ int picolm_gpu_tensor_upload(void **tensor,
     return 1;
 }
 
+#ifdef PICOLM_SSM_VERIFY
 extern "C" void picolm_gpu_debug_tensor(const char *name, void *tp, int device, int layer, int dump_weights) {
     picolm_gpu_tensor_t *t = (picolm_gpu_tensor_t *)tp;
     if (!t) return;
@@ -2884,6 +2889,7 @@ extern "C" void picolm_gpu_debug_tensor(const char *name, void *tp, int device, 
         fprintf(stderr, "[DBG l%d] %s_w rms64=%.6f\n", layer, name, sqrt(wr / 64));
     }
 }
+#endif /* PICOLM_SSM_VERIFY */
 
 void picolm_gpu_tensor_free(picolm_gpu_tensor_t *t) {
     if (!t) return;
