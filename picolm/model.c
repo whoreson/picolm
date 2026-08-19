@@ -9119,7 +9119,7 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
         }
     }
     /* Dump conv1d weight for debugging */
-    if (l == 0) {
+    if (l == 0 && _SSM_DBG) {
         float cw[16], cs[12];
         picolm_gpu_memcpy(cw, gw->ssm_conv1d_dev[l], 64, -1, dev);
         fprintf(stderr, "[DBG l%d] conv1d_w[0][:4]={%.6f,%.6f,%.6f,%.6f} w[1][:4]={%.6f,%.6f,%.6f,%.6f}\n", l, cw[0],cw[1],cw[2],cw[3],cw[4],cw[5],cw[6],cw[7]);
@@ -10010,8 +10010,8 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
         }
     }
 
-    /* Per-head gated_norm dump for CPU (always, after both GPU-assisted and pure CPU paths) */
-    if (l == 0) {
+    /* Per-head gated_norm dump for CPU (guarded by _SSM_DBG) */
+    if (l == 0 && _SSM_DBG) {
         int lt=n_tokens-1; const float *xb2l=xb2_batch+lt*value_dim;
         const float *nwm=s->ssm_norm_w[l];
         double nw_rms=0;for(int i=0;i<head_v_dim;i++)nw_rms+=nwm[i]*nwm[i];
@@ -10071,7 +10071,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
             tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->ssm_out, m->gpu.device);
         }
 #endif
-        if (l == 0) {
+        if (l == 0 && _SSM_DBG) {
             int lt=n_tokens-1; const float *fb=fo_gguf_batch+lt*value_dim;
             double frms=0; for(int fi=0;fi<value_dim;fi++) frms+=fb[fi]*fb[fi];
             fprintf(stderr,"[CPU l0] fo_gguf_rms=%.6f n_vh=%d\n",sqrtf(frms/value_dim),value_dim);
@@ -11798,7 +11798,7 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
                   ssm_prefill_layer(m,s,xb,xbb,xb2,hb,hb2,lw,l,n_tokens,start_pos,xb2s,(void**)m->gpu.layers);
                   memcpy(s->x,xb,batch_bytes);
                   /* Dump bx_last for bit-exact GPU vs CPU comparison */
-                  if (l == 0) {
+                  if (l == 0 && _SSM_DBG) {
                       float bx_rms=0;
                       for (int i=0;i<100;i++) bx_rms += xb[(n_tokens-1)*dim+i]*xb[(n_tokens-1)*dim+i];
                       bx_rms = sqrtf(bx_rms/100);
