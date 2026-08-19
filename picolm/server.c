@@ -1721,21 +1721,27 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
     if ((item = cJSON_GetObjectItem(req, "n"))) n_choices = (int)cJSON_GetNumberValue(item);
     if (n_choices < 1) n_choices = 1;
     if (n_choices > 4) n_choices = 4;
-    /* Parse stop words - MUST copy before cJSON_Delete */
+    /* Parse stop words - MUST copy before cJSON_Delete.
+     * Accept both array ["stop1","stop2"] and single string "stop". */
     char *stop_words[16];
     int n_stop_words = 0;
-    cJSON *stop_arr = cJSON_GetObjectItem(req, "stop");
-    if (stop_arr && cJSON_IsArray(stop_arr)) {
-        int n = cJSON_GetArraySize(stop_arr);
+    cJSON *stop_item = cJSON_GetObjectItem(req, "stop");
+    if (stop_item && cJSON_IsArray(stop_item)) {
+        int n = cJSON_GetArraySize(stop_item);
         if (n > 16) n = 16;
         for (int i = 0; i < n; i++) {
-            cJSON *sw = cJSON_GetArrayItem(stop_arr, i);
+            cJSON *sw = cJSON_GetArrayItem(stop_item, i);
             if (cJSON_IsString(sw)) {
                 const char *s = cJSON_GetStringValue(sw);
                 if (s && strlen(s) > 0) {
                     stop_words[n_stop_words++] = strdup(s);
                 }
             }
+        }
+    } else if (stop_item && cJSON_IsString(stop_item)) {
+        const char *s = cJSON_GetStringValue(stop_item);
+        if (s && strlen(s) > 0) {
+            stop_words[n_stop_words++] = strdup(s);
         }
     }
 
@@ -2337,21 +2343,27 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
     if ((item = cJSON_GetObjectItem(req, "model")) && cJSON_IsString(item))
         model_name = strdup(item->valuestring);
 
-    /* Parse stop words - MUST copy before cJSON_Delete */
+    /* Parse stop words - MUST copy before cJSON_Delete.
+     * Accept both array ["stop1","stop2"] and single string "stop". */
     char *stop_words[16];
     int n_stop_words = 0;
-    cJSON *stop_arr = cJSON_GetObjectItem(req, "stop");
-    if (stop_arr && cJSON_IsArray(stop_arr)) {
-        int n = cJSON_GetArraySize(stop_arr);
+    cJSON *stop_item = cJSON_GetObjectItem(req, "stop");
+    if (stop_item && cJSON_IsArray(stop_item)) {
+        int n = cJSON_GetArraySize(stop_item);
         if (n > 16) n = 16;
         for (int i = 0; i < n; i++) {
-            cJSON *sw = cJSON_GetArrayItem(stop_arr, i);
+            cJSON *sw = cJSON_GetArrayItem(stop_item, i);
             if (cJSON_IsString(sw)) {
                 const char *s = cJSON_GetStringValue(sw);
                 if (s && strlen(s) > 0) {
                     stop_words[n_stop_words++] = strdup(s);
                 }
             }
+        }
+    } else if (stop_item && cJSON_IsString(stop_item)) {
+        const char *s = cJSON_GetStringValue(stop_item);
+        if (s && strlen(s) > 0) {
+            stop_words[n_stop_words++] = strdup(s);
         }
     }
 
