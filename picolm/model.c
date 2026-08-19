@@ -2865,10 +2865,11 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
 
                             /* Upload norm weights and RoPE tables to device */
                             run_state_t *s = &m->state;
-                            /* RoPE cos/sin: [max_seq_len * half_dim] */
+                            /* RoPE cos/sin: [max_seq_len * rope_half] */
                             {
-                                int half_dim = c->head_dim / 2;
-                                size_t rope_n = (size_t)c->max_seq_len * half_dim;
+                                int rope_dim = (c->rope_dim > 0) ? c->rope_dim : c->head_dim;
+                                int rope_half = rope_dim / 2;
+                                size_t rope_n = (size_t)c->max_seq_len * rope_half;
                                 m->gpu.rope_cos_dev = picolm_gpu_upload_f32(s->rope_cos, rope_n, device);
                                 m->gpu.rope_sin_dev = picolm_gpu_upload_f32(s->rope_sin, rope_n, device);
                             }
@@ -11392,7 +11393,8 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
     int q_dim = n_heads * head_dim;
     int kv_dim = n_kv_heads * head_dim;
     int seq_len = c->max_seq_len;
-    int rope_half = head_dim / 2;
+    int rope_dim = (c->rope_dim > 0) ? c->rope_dim : head_dim;
+    int rope_half = rope_dim / 2;
     int q_pipeline_dim = c->has_ssm ? (q_dim * 2) : q_dim;
 
     /* Verify pipeline is ready */
@@ -11678,7 +11680,8 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
     int n_kv_heads = c->n_kv_heads;
     int head_dim = c->head_dim;
     int seq_len = c->max_seq_len;
-    int rope_half = head_dim / 2;
+    int rope_dim = (c->rope_dim > 0) ? c->rope_dim : head_dim;
+    int rope_half = rope_dim / 2;
     int q_dim = n_heads * head_dim;
     int kv_dim = n_kv_heads * head_dim;
     int q_full_dim = c->has_ssm ? (q_dim * 2) : q_dim;
