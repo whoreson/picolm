@@ -577,8 +577,10 @@ static void checkpoint_save(int n_tokens) {
  * Returns 0 on success (checkpoint restored), -1 if no suitable checkpoint found.
  * On success, *actual_n_tokens is set to the checkpoint's n_tokens. */
 static int checkpoint_restore(int n_tokens, int *actual_n_tokens) {
-    if (srv.max_checkpoints <= 0) return -1;
+    /* Allow restore even when checkpoint-max=0, as long as checkpoints
+     * were loaded from a slot save file. Saving is gated by max_checkpoints. */
     if (srv.checkpoint_snapshot_size == 0) return -1;
+    if (!srv.checkpoints) return -1;
 
     /* Find the latest checkpoint with n_tokens <= target */
     picolm_checkpoint_t *best = NULL;
@@ -619,7 +621,7 @@ static void checkpoint_restore_log(int target, int actual, int kv_match, int suc
 static void cache_adjust_stepback(model_t *model, int n_prompt, int *start_pos) {
     if (*start_pos < n_prompt || *start_pos <= 0) return;
 
-    if (model->config.has_ssm && srv.max_checkpoints > 0) {
+    if (model->config.has_ssm && srv.checkpoints) {
         int target = n_prompt - 1;
         int actual = 0;
         if (checkpoint_restore(target, &actual) == 0) {
