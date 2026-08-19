@@ -864,7 +864,7 @@ static int server_init(const char *model_path, int num_threads, int do_prefault,
             return -1;
         }
         srv.tokenizer.bos_id = srv.qwen_enc.bos_id;
-        srv.tokenizer.eos_id = srv.qwen_enc.bos_id;
+        srv.tokenizer.eos_id = srv.qwen_enc.eos_id;
         srv.tokenizer.vocab_size = srv.qwen_enc.vocab_size;
         fprintf(stderr, "[server] Using native Qwen GPT-2 BPE tokenizer\n");
     } else {
