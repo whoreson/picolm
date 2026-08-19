@@ -11290,6 +11290,14 @@ size_t model_ssm_state_save(const model_t *m, uint8_t *buf, size_t buf_size) {
         return 0;
     }
 
+#ifdef PICOLM_GPU
+    /* Sync GPU SSM state to CPU before saving.
+     * When GPU decode is active, the device state is the only up-to-date copy. */
+    if (m->gpu.device >= 0 && m->gpu.ssm_state_dev[0]) {
+        picolm_ssm_state_sync_to_host(m, m->gpu.device);
+    }
+#endif
+
     int conv_dim = 2 * c->ssm_d_state * c->ssm_n_group + c->ssm_d_inner;
     size_t off = 0;
     /* First pass: save all conv_states */
@@ -11341,6 +11349,15 @@ size_t model_ssm_state_restore(model_t *m, const uint8_t *buf, size_t buf_size) 
         memcpy(m->state.ssm_state[l], buf + off, sz);
         off += sz;
     }
+
+#ifdef PICOLM_GPU
+    /* Sync CPU SSM state to GPU after restoring.
+     * The GPU decode path reads from device state, not CPU state. */
+    if (m->gpu.device >= 0 && m->gpu.ssm_state_dev[0]) {
+        picolm_ssm_state_sync_to_device(m, m->gpu.device);
+    }
+#endif
+
     return off;
 }
 
