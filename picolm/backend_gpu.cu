@@ -2507,7 +2507,12 @@ static __host__ void gpu_mutex_unlock(void) {
 static int ssm_batch_scratch_ensure(void **buf, size_t *cap, size_t need) {
     if (*buf && *cap >= need) return 1;
     if (*buf) { gpuDeviceSynchronize(); gpuFree(*buf); *buf = NULL; *cap = 0; }
-    if (!gpu_ok(gpuMalloc(buf, need), "ssm batch scratch grow")) { *cap = 0; return 0; }
+    if (!gpu_ok(gpuMalloc(buf, need), "ssm batch scratch grow")) {
+        { size_t fb=0,tb=0; gpuMemGetInfo(&fb,&tb);
+          fprintf(stderr,"[GPU] ssm_batch_scratch_ensure OOM: need=%zu KB, gpu_free=%.1f MB, gpu_total=%.1f MB\n",
+              need/1024, fb/(1024.0*1024), tb/(1024.0*1024)); }
+        *cap = 0; return 0;
+    }
     *cap = need;
     return 1;
 }
@@ -2526,6 +2531,9 @@ static int reserve(float **ptr, size_t *cap, size_t bytes) {
      * kernel launches. */
     gpuError_t err = gpuMalloc(ptr, bytes);
     if (!gpu_ok(err, "scratch allocation")) {
+        { size_t fb=0,tb=0; gpuMemGetInfo(&fb,&tb);
+          fprintf(stderr,"[GPU] reserve OOM: need=%zu KB, gpu_free=%.1f MB, gpu_total=%.1f MB\n",
+              bytes/1024, fb/(1024.0*1024), tb/(1024.0*1024)); }
         gpu_mutex_unlock();
         return 0;
     }
@@ -2563,6 +2571,9 @@ static int reserve_i8(int8_t **ptr, size_t *cap, size_t bytes) {
     *ptr = NULL; *cap = 0;
     gpuError_t err = gpuMalloc(ptr, bytes);
     if (!gpu_ok(err, "int8 scratch allocation")) {
+        { size_t fb=0,tb=0; gpuMemGetInfo(&fb,&tb);
+          fprintf(stderr,"[GPU] reserve_i8 OOM: need=%zu KB, gpu_free=%.1f MB, gpu_total=%.1f MB\n",
+              bytes/1024, fb/(1024.0*1024), tb/(1024.0*1024)); }
         gpu_mutex_unlock();
         return 0;
     }
@@ -3098,10 +3109,21 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
                 ctx->q8_xq, ctx->q8_xd, x_dev, I, S);
         }
         if (!gpu_ok(gpuGetLastError(), "q8 quantize (dev)")) return 0;
-        gpuDeviceSynchronize();
-        dim3 grid((unsigned)O, (unsigned)S);
-        picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
-            y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
+        /* No gpuDeviceSynchronize() needed: quantize kernel is on ctx->stream,
+         * matmul kernel is also on ctx->stream. CUDA guarantees in-order execution
+         * of kernels on the same stream. */
+        if (S >= Q8_TILE_S && t->row_bytes + 2048 <= 49152) {
+            /* Tiled: load weight row into shared mem once per tile of Q8_TILE_S positions.
+             * Only beneficial when S >= Q8_TILE_S, since for smaller S the shared memory
+             * overhead exceeds the savings from reduced global memory reads. */
+            dim3 grid((unsigned)O, (unsigned)((S + Q8_TILE_S - 1) / Q8_TILE_S));
+            picolm_q8_q8_matmul_tiled<<<grid, 256, (unsigned)t->row_bytes, ctx->stream>>>(
+                y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
+        } else {
+            dim3 grid((unsigned)O, (unsigned)S);
+            picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
+                y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
+        }
         if (!gpu_ok(gpuGetLastError(), "q8 matmul (dev)")) return 0;
         return 1;
     }
@@ -3147,7 +3169,7 @@ picolm_gpu_matmul_dev_strided(picolm_gpu_tensor_t *t, float *y_dev,
         picolm_quantize_q8_0_strided<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
             ctx->q8_xq, ctx->q8_xd, x_dev, I, S, x_stride);
         if (!gpu_ok(gpuGetLastError(), "q8 quantize strided (dev)")) return 0;
-        gpuDeviceSynchronize();
+        /* No gpuDeviceSynchronize() needed: stream ordering guarantees correctness. */
         dim3 grid((unsigned)O, (unsigned)S);
         picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
             y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
@@ -6109,6 +6131,22 @@ picolm_gpu_memcpy(void *dst, const void *src, size_t bytes, int dir, int device)
     if (!gpu_ok(err, "pipeline memcpy async")) return 0;
     return gpu_ok(gpuDeviceSynchronize(), "pipeline memcpy sync");
 }
+
+/* Async variant: copies on ctx->stream without synchronizing.
+ * Caller is responsible for ensuring ordering via subsequent
+ * kernel launches or explicit syncs. Only safe for D2D copies
+ * and for cases where the caller knows the stream ordering is sufficient. */
+extern "C" int
+picolm_gpu_memcpy_async(void *dst, const void *src, size_t bytes, int dir, int device) {
+    if (!dst || !src || bytes < 1) return 0;
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+
+    cudaMemcpyKind kind = (dir > 0) ? gpuMemcpyHostToDevice :
+                           (dir < 0) ? gpuMemcpyDeviceToHost :
+                                       gpuMemcpyDeviceToDevice;
+    return gpu_ok(gpuMemcpyAsync(dst, src, bytes, kind, ctx->stream), "pipeline memcpy async");
+}
 int picolm_gpu_ssm_conv1d_batch_dev(float *od, float *sd, const float *id, const float *wd,
     int cd, int dc, int nt, int dev, int stride) {
     if(cd<1||dc<1||nt<1) return 0;
@@ -6300,13 +6338,15 @@ int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv_dev, const float *al
     gpu_device_ctx_t *ctx = find_ctx(device);
     if(!ctx||!select_ctx(ctx)) return 0;
     int n_threads=256;
-    /* Use per-buffer allocations identical to host-facing driver,
-     * eliminating single-buffer offset arithmetic entirely. */
-    float *d_cq=NULL,*d_ck=NULL,*d_cv=NULL,*d_cb=NULL;
-    float *d_gl=NULL,*d_cg=NULL,*d_qd=NULL,*d_dm=NULL;
-    float *d_M=NULL,*d_kq=NULL,*d_ve=NULL,*d_vh=NULL;
-    float *d_sk=NULL,*d_sq=NULL,*d_co=NULL;
-    size_t caps[15]={0};
+    /* Persistent scratch buffers: must be static so they survive across
+     * calls (one per SSM layer per layer loop). ssm_batch_scratch_ensure
+     * is a grow-only allocator that checks *cap >= need before allocating.
+     * If these were local variables, every call would re-allocate and leak. */
+    static float *d_cq=NULL,*d_ck=NULL,*d_cv=NULL,*d_cb=NULL;
+    static float *d_gl=NULL,*d_cg=NULL,*d_qd=NULL,*d_dm=NULL;
+    static float *d_M=NULL,*d_kq=NULL,*d_ve=NULL,*d_vh=NULL;
+    static float *d_sk=NULL,*d_sq=NULL,*d_co=NULL;
+    static size_t caps[15]={0};
     size_t szs[15]={
         (size_t)n_k_heads*cs*d*sizeof(float),  /* cq */
         (size_t)n_k_heads*cs*d*sizeof(float),  /* ck */

@@ -11502,16 +11502,12 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
                  * pipe_attn_out is sized for q_pipeline_dim (>= q_full_dim).
                  * pipe_ffn_norm is only dim-sized and would overflow.
                  *
-                 * SYNC BEFORE D2D to ensure Q projection (on ctx->stream)
-                 * completes before the D2D copy (on stream 0) reads pipe_q. */
-                picolm_gpu_sync(gpu_dev);
-                picolm_gpu_memcpy(pipe_attn_out, pipe_q,
+                 * Use async D2D copy on ctx->stream - the Q projection matmul
+                 * is already on ctx->stream, and stream ordering ensures the
+                 * D2D copy and subsequent deinterleave kernel see the data. */
+                picolm_gpu_memcpy_async(pipe_attn_out, pipe_q,
                                    (size_t)n_heads * 2 * head_dim * sizeof(float),
                                    0, gpu_dev);
-                /* D2D is synchronous on stream 0, but ctx->stream (cudaStreamNonBlocking)
-                 * doesn't synchronize with stream 0. Sync again to ensure the de-interleave
-                 * kernel on ctx->stream doesn't start reading pipe_attn_out before D2D writes it. */
-                picolm_gpu_sync(gpu_dev);
                 picolm_gpu_qg_deinterleave_dev(pipe_attn_out, pipe_q,
                                                 pipe_gate, n_heads, head_dim,
                                                 gpu_dev);
@@ -11702,6 +11698,11 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
 #ifdef PICOLM_GPU
     /* Allow nsys to skip model upload: profile only this function */
     cudaProfilerStart();
+    /* Diagnostic: print GPU memory state at prefill entry */
+    { size_t fb=0,tb=0;
+      if(picolm_gpu_mem_info(m->gpu.device, &fb, &tb))
+        fprintf(stderr,"[GPU] prefill entry: n_tokens=%d, gpu_free=%.1f MB, gpu_total=%.1f MB\n",
+            n_tokens, fb/(1024.0*1024), tb/(1024.0*1024)); }
 #endif
     model_config_t *c = &m->config;
     model_weights_t *w = &m->weights;
@@ -11762,10 +11763,14 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
             float *dst = host_embd + (size_t)bi * dim;
             dequantize_row(embd_row, dst, dim, w->type_token_embd);
         }
-        /* Strided H2D for entire batch (pipe_x_b has xb_stride, not dim) */
+        /* Strided H2D for entire batch (pipe_x_b has xb_stride, not dim)
+         * Use async copies on ctx->stream to avoid per-token device syncs. */
         for (int bi = 0; bi < n_tokens; bi++) {
-            picolm_gpu_memcpy(bx + (size_t)bi * xb_stride, host_embd + (size_t)bi * dim, dim * sizeof(float), 1, gpu_dev);
+            picolm_gpu_memcpy_async(bx + (size_t)bi * xb_stride, host_embd + (size_t)bi * dim, dim * sizeof(float), 1, gpu_dev);
         }
+        /* Ensure all H2D copies complete before any kernel reads the data.
+         * Single sync at the end instead of n_tokens syncs. */
+        picolm_gpu_sync(gpu_dev);
         free(host_embd);
     }
 
@@ -11880,10 +11885,12 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
         if (c->has_ssm) {
             int q_dim = n_heads * head_dim;
             /* Copy raw Q+gate to battn_out (scratch) before de-interleaving.
-             * Same in-place aliasing bug as decode path. */
+             * Use async D2D copy - stream ordering ensures the subsequent
+             * deinterleave kernel sees the data. */
             size_t qg_bytes = (size_t)n_tokens * n_heads * 2 * head_dim * sizeof(float);
-            picolm_gpu_memcpy(battn_out, bq, qg_bytes, 0, gpu_dev);
-            picolm_gpu_sync(gpu_dev); /* ensure D2D copy completes before kernel */
+            picolm_gpu_memcpy_async(battn_out, bq, qg_bytes, 0, gpu_dev);
+            /* No explicit sync needed: deinterleave kernel on same stream will
+             * wait for the memcpy to complete via stream ordering. */
             picolm_gpu_qg_deinterleave_batched_dev(battn_out, bq, bgate,
                                                     n_heads, head_dim,
                                                     n_tokens, gpu_dev);
