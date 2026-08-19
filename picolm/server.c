@@ -69,7 +69,7 @@ extern double get_time_ms(void);
 /* GPU path selection: 0=model_forward (CPU-hybrid), 1=model_forward_gpu (full GPU).
  * Defaults to 0 for server (unchanged behavior), 1 for CLI. */
 #ifndef PICOLM_SERVER_DEFAULT_GPU_PATH
-#define PICOLM_SERVER_DEFAULT_GPU_PATH 0
+#define PICOLM_SERVER_DEFAULT_GPU_PATH 1
 #endif
 
 #ifndef PICO_SERVER_BACKLOG
