@@ -9935,8 +9935,15 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
             free(st_pre);
 #endif
         } else {
-            /* Single token: use the standard per-token path */
+            /* Single token: use the standard per-token path.
+             * alpha_batch now stores gate_log (log-space), so we must
+             * convert to gate_exp = expf(gate) for the per-token recurrence. */
             float *ssm_output = (float *)malloc((size_t)d_state * n_v_heads * sizeof(float));
+            float *gate_exp_buf = (float *)alloca(n_v_heads * sizeof(float));
+            for (int h = 0; h < n_v_heads; h++) {
+                float g = alpha_batch[bi * n_v_heads + h];
+                gate_exp_buf[h] = (g < -50.0f) ? 0.0f : expf(g);
+            }
             ssm_head_ctx_t ssm_ctx;
             ssm_ctx.state = state;
             ssm_ctx.d_state = d_state;
@@ -9947,8 +9954,8 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
             ssm_ctx.q_conv = conv_batch;
             ssm_ctx.k_conv = conv_batch + qk_dim;
             ssm_ctx.v_conv = conv_batch + 2 * qk_dim;
-            ssm_ctx.gate_exp = alpha_batch;
-            ssm_ctx.beta = beta_batch;
+            ssm_ctx.gate_exp = gate_exp_buf;
+            ssm_ctx.beta = beta_batch + bi * n_v_heads;
             tensor_parallel_for(n_v_heads, ssm_head_task, &ssm_ctx);
             for (int d = 0; d < d_state; d++)
                 for (int h = 0; h < n_v_heads; h++)
