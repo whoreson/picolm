@@ -74,7 +74,9 @@ extern int picolm_gpu_ssm_head_permute_batch_dev(float *dst, const float *src,
                                                   int head_dim, int n_heads,
                                                   int n_tokens, int src_stride,
                                                   int dst_stride, int device);
+#ifdef PICOLM_SSM_VERIFY
 extern void picolm_gpu_debug_tensor(const char *name, void *tensor, int device, int layer, int dump_weights);
+#endif
 
 #if defined(__APPLE__) && defined(__ppc__) && defined(__ALTIVEC__)
 /* Swap uint16 values in-place using Altivec vec_perm.
@@ -1570,7 +1572,7 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                     lw->altup_router_norm = ptr;
                 } else if (strcmp(suffix, "laurel_l.weight") == 0) {
                     lw->laurel_l = ptr; lw->type_laurel_l = qtype;
-                    if (layer == 0) fprintf(stderr, "DBG laurel_l type=%d\n", qtype);
+                    if (layer == 0 && _SSM_DBG) fprintf(stderr, "DBG laurel_l type=%d\n", qtype);
                     /* Derive laurel_rank from tensor shape [n_embd, laurel_rank] */
                     for (uint64_t ti = 0; ti < total_tensor_count; ti++) {
                         if (tinfos[ti].name.len > 4 && memcmp(tinfos[ti].name.str, "blk.", 4) == 0) {
@@ -1587,7 +1589,7 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                     }
                 } else if (strcmp(suffix, "laurel_r.weight") == 0) {
                     lw->laurel_r = ptr; lw->type_laurel_r = qtype;
-                    if (layer == 0) fprintf(stderr, "DBG laurel_r type=%d\n", qtype);
+                    if (layer == 0 && _SSM_DBG) fprintf(stderr, "DBG laurel_r type=%d\n", qtype);
                 } else if (strcmp(suffix, "laurel_post_norm.weight") == 0) {
                     lw->laurel_post_norm = ptr;
                 }
@@ -7928,7 +7930,7 @@ ssm_forward_gpu(model_t *m, run_state_t *s, float *x, float *residual,
     float *dbg_pre_state = NULL;
     float *dbg_qkv_raw = NULL;
     float *dbg_conv_w = NULL;
-    if (il == 0 && pos < 40 && getenv("PICOLM_SSM_DBG")) {
+    if (il == 0 && pos < 40 && _SSM_DBG) {
         dbg_pre_state = alloca((d_conv - 1) * conv_dim * sizeof(float));
         dbg_qkv_raw = alloca(conv_dim * sizeof(float));
         dbg_conv_w = alloca(d_conv * conv_dim * sizeof(float));
@@ -7949,7 +7951,7 @@ ssm_forward_gpu(model_t *m, run_state_t *s, float *x, float *residual,
     }
 
     /* DEBUG: compare GPU conv1d output with CPU reference */
-    if (il == 0 && pos < 40 && getenv("PICOLM_SSM_DBG")) {
+    if (il == 0 && pos < 40 && _SSM_DBG) {
         picolm_gpu_sync(device);
         float *gpu_conv_out_buf = alloca(8 * sizeof(float));
         float *cpu_conv_out_buf = alloca(8 * sizeof(float));
@@ -8054,7 +8056,7 @@ ssm_forward_gpu(model_t *m, run_state_t *s, float *x, float *residual,
     }
 
     /* DEBUG: dump recurrence output (dim-major ssm_output) for comparison */
-    if (il == 0 && pos < 40 && getenv("PICOLM_SSM_DBG")) {
+    if (il == 0 && pos < 40 && _SSM_DBG) {
         picolm_gpu_sync(device);
         float *dbg_ssm_out = alloca(8 * sizeof(float));
         picolm_gpu_memcpy(dbg_ssm_out, ssm_output, 8 * sizeof(float), -1, device);
@@ -8081,7 +8083,7 @@ ssm_forward_gpu(model_t *m, run_state_t *s, float *x, float *residual,
     }
 
     /* DEBUG: run CPU ssm_forward in parallel to compare intermediate values */
-    if (il == 0 && pos < 38 && getenv("PICOLM_SSM_DBG")) {
+    if (il == 0 && pos < 38 && _SSM_DBG) {
         picolm_gpu_sync(device);
         /* Download GPU intermediates */
         float *gpu_final = alloca(c->ssm_d_inner * sizeof(float));
@@ -9076,7 +9078,7 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
 
     /* Per-step diagnostic: dump last token RMS to compare GPU vs CPU */
     #define _DBG_RMS(name, ptr, stride) do { \
-        if (l == 0) { \
+        if (l == 0 && _SSM_DBG) { \
             float _rms=0; float _v[8]; \
             picolm_gpu_memcpy(_v, ptr + (size_t)(n_tokens-1) * stride, 32, -1, dev); \
             for (int _i=0;_i<8;_i++) _rms += _v[_i]*_v[_i]; \
@@ -9086,7 +9088,7 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
     } while(0)
     /* Canonical xb2_stride-aware per-token dump: reads 4 floats per token, reports RMS */
     #define _DBG_TOK(name, ptr) do { \
-        if (l == 0) { \
+        if (l == 0 && _SSM_DBG) { \
             float _vt[40]; \
             for (int _ti=0;_ti<10;_ti++) \
                 picolm_gpu_memcpy(_vt+_ti*4, ptr + (size_t)_ti * xb2_stride, 16, -1, dev); \
@@ -9524,7 +9526,7 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
             l, ff[0],ff[1],ff[2],ff[3],ff[4],ff[5],ff[6],ff[7],sqrt(frms/8));
     }
     /* Dump bx_last for bit-exact GPU vs CPU comparison */
-    if (l == 0 && ok) {
+    if (l == 0 && ok && _SSM_DBG) {
         picolm_gpu_sync(dev);
         float bx_v[100];
         picolm_gpu_memcpy(bx_v, bx + (size_t)(n_tokens-1)*xb2_stride, 400, -1, dev);
