@@ -9560,7 +9560,6 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
                               int n_tokens, int start_pos, int xb2_stride,
                               void **gpu_lw) {
     int bi;
-    (void)start_pos;
     (void)gpu_lw;
     (void)xb_batch; /* not used: SSM layer uses local ssm_xb buffer */
     model_config_t *c = &m->config;

@@ -2674,6 +2674,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
 
             /* Check stop words (full + partial match, llama.cpp style) */
             int stopped = 0;
+            int partial = 0;
             {
                 int sw_stop_idx, sw_stop_pos;
                 int sw_result = check_stop_words(generated_stream,
@@ -2684,14 +2685,15 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
                     stop_type = "word";
                     stopping_word = stop_words[sw_stop_idx];
                     if (sw_stop_pos >= 0) generated_stream[sw_stop_pos] = '\0';
+                } else if (sw_result == -1) {
+                    partial = 1; /* withhold this token, keep generating */
                 }
-                /* Partial match (sw_result == -1): withhold sending, continue */
             }
 
             /* Build streaming response: {content, tokens, stop} */
             cJSON *resp = cJSON_CreateObject();
-            /* If stopped by stop word, suppress the piece that triggered it */
-            if (stopped) {
+            /* If stopped or partial match, suppress the piece */
+            if (stopped || partial) {
                 cJSON_AddStringToObject(resp, "content", "");
             } else {
                 cJSON_AddStringToObject(resp, "content", piece);
