@@ -48,6 +48,7 @@ typedef int socklen_t;
 /* On Windows, INVALID_SOCKET is the standard way to check for error */
 #define SOCKET_INVALID INVALID_SOCKET
 #else
+#include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
