@@ -21,7 +21,7 @@ endif
 CFLAGS_STRICT = -Wshadow -Wdouble-promotion -Wimplicit-fallthrough -Wconversion -Wmisleading-indentation $(WARN_GCC_ONLY) -Wfloat-conversion -Wsign-conversion -Wcast-qual -Wformat-nonliteral
 
 CFLAGS  ?= -O3 -g -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic -fno-common -fopenmp
-LDFLAGS = -fuse-ld=bfd -lm -lpthread -fopenmp
+LDFLAGS = -lm -lpthread -fopenmp
 
 # Windows needs ws2_32 for server mode
 ifeq ($(OS),Windows_NT)
@@ -33,6 +33,11 @@ SHELL := cmd.exe
 RM = cmd /c del /f /q
 else
 RM = rm -f
+endif
+
+# FreeBSD 8.4: system ld (2.15) doesn't support -plugin; use BFD
+ifeq ($(shell uname -s 2>/dev/null),FreeBSD)
+LDFLAGS += -fuse-ld=bfd
 endif
 
 # Source files and corresponding .o files
