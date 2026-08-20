@@ -6,12 +6,13 @@
 #include <stdio.h>
 /* SSM verification debug (used in GGUF parsing) */
 #ifdef PICOLM_SSM_VERIFY
-#define _SSM_DBG _SSM_DBG
+#define _SSM_DBG 1
 #else
 #define _SSM_DBG (0)
 #endif
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
 #ifdef _WIN32
 #include <windows.h>
 #include <io.h>

@@ -7,7 +7,7 @@
  * When undefined, the macro expands to 0, eliminating all debug code at compile time.
  * When defined, falls back to _SSM_DBG for runtime toggle. */
 #ifdef PICOLM_SSM_VERIFY
-#define _SSM_DBG _SSM_DBG
+#define _SSM_DBG 1
 #else
 #define _SSM_DBG (0)
 #endif
@@ -100,7 +100,7 @@ static unsigned char _f16swap_mask[16] __attribute__((aligned(64))) =
     {1,0,3,2,5,4,7,6,9,8,11,10,13,12,15,14};
 static vector unsigned char _f16swap_vmask;
 
-static void swap_f16_block(uint16_t *dst, size_t n) {
+void swap_f16_block(uint16_t *dst, size_t n) {
     /* Lazily initialize the permute mask from the static array */
     static int initialized = 0;
     if (!initialized) {
@@ -1153,8 +1153,6 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
 
 /* Forward declaration for SSM v-head remap function (used during GPU weight upload,
  * defined later in the file) */
-static inline int qwen35_vhead_gguf(int h, int n_vpk, int n_k);
-static inline int qwen35_vhead_natural(int g, int n_vpk, int n_k);
 
 /* ---- Public API ---- */
 

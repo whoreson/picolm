@@ -46,6 +46,16 @@ extern void attn_core(
         size_t kv_head_stride_k, size_t kv_head_stride_v,
         int head_dim, float attn_scale);
 extern void attention_group(int kv_head_idx, void *ctx_ptr);
+extern void batch_attention_layer(
+        float *xb_batch, const float *q_batch,
+        const uint8_t *kcache, const uint8_t *vcache,
+        int n_tokens, int start_pos,
+        int n_heads, int n_kv_heads, int head_dim,
+        int xb_stride,
+        int kv_type_k, int kv_type_v,
+        size_t kv_row_size_k, size_t kv_row_size_v,
+        size_t kv_head_stride_k, size_t kv_head_stride_v,
+        float attn_scale);
 
 /* Shared attention context struct */
 typedef struct {
@@ -100,7 +110,22 @@ extern const char *gguf_type_name(uint32_t type);
 extern void prepare_mmap(const void *addr, size_t size);
 extern void _do_prefault(const void *addr, size_t size);
 
-#endif /* MODEL_INTERNAL_H */
+/* --- Swap helper (PPC big-endian) --- */
+#if defined(__APPLE__) && defined(__ppc__) && defined(__ALTIVEC__)
+extern void swap_f16_block(uint16_t *dst, size_t n);
+#endif
+
+/* ---- Qwen3.5 vision head mapping helpers ---- */
+static inline int qwen35_vhead_gguf(int h, int n_vpk, int n_k) {
+    int k = h / n_vpk;
+    int v = h % n_vpk;
+    return v * n_k + k;
+}
+static inline int qwen35_vhead_natural(int g, int n_vpk, int n_k) {
+    int v = g / n_k;
+    int k = g % n_k;
+    return k * n_vpk + v;
+}
 
 /* ---- AVX2 horizontal reduction (needed by SSM) ---- */
 #if defined(PICOLM_AVX2) || defined(PICOLM_AVX)
@@ -115,11 +140,13 @@ static inline float hreduce256_ps(__m256 a) {
 }
 #endif
 
-/* ---- aligned_alloc polyfill for FreeBSD 8.4 ---- */
+/* ---- aligned_alloc polyfill for systems without it (FreeBSD 8.4, macOS PPC) ---- */
 #ifndef HAVE_ALIGNED_ALLOC
-static inline void *aligned_alloc(size_t alignment, size_t size) {
-    void *ptr;
-    if (posix_memalign(&ptr, alignment, size) != 0) return NULL;
-    return ptr;
-}
+/* aligned_alloc is C11; provide fallback for C99 / old macOS / FreeBSD 8.4.
+ * valloc returns page-aligned memory (4096), which satisfies any alignment
+ * up to a page. All current callers ask for 64-byte alignment.
+ * valloc'd memory is free()-able like any other malloc'd memory. */
+#define aligned_alloc(a, s) valloc((s) + (a) - 1)
 #endif
+
+#endif /* MODEL_INTERNAL_H */

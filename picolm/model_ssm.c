@@ -28,7 +28,7 @@
  * When undefined, the macro expands to 0, eliminating all debug code at compile time.
  * When defined, falls back to _SSM_DBG for runtime toggle. */
 #ifdef PICOLM_SSM_VERIFY
-#define _SSM_DBG _SSM_DBG
+#define _SSM_DBG 1
 #else
 #define _SSM_DBG (0)
 #endif
@@ -57,22 +57,6 @@ static void dbg_vec(const char *tag, float *v, int n, int max_print) {
  *   attn_gate_ssm, attn_qkv V portion, ssm_conv1d V channels,
  *   ssm_alpha, ssm_beta, ssm_out columns, dt_bias, ssm_a.
  */
-
-/* Simple transpose: sequential head h -> GGUF index */
-static inline int qwen35_vhead_gguf(int h, int n_vpk, int n_k) {
-    int k = h / n_vpk;
-    int v = h % n_vpk;
-    return v * n_k + k;
-}
-
-/* Inverse: given GGUF head g, recover natural head h.
- * gguf: g = v*n_k + k, where k=h/n_vpk, v=h%n_vpk
- * inverse: v = g/n_k, k = g%n_k, h = k*n_vpk + v */
-static inline int qwen35_vhead_natural(int g, int n_vpk, int n_k) {
-    int v = g / n_k;
-    int k = g % n_k;
-    return k * n_vpk + v;
-}
 
 /* ---- SSM per-head task (threaded state recurrence) ----
  * Each of the n_v_heads has its own independent [d_state x d_state]

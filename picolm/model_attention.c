@@ -5,6 +5,8 @@
 
 #include <string.h>
 #include <math.h>
+#include <stdlib.h>
+#include <assert.h>
 
 #ifdef _OPENMP
 #include <omp.h>
