@@ -18,7 +18,7 @@
 #include <io.h>
 #include <fcntl.h>
 #include <unistd.h>
-#else
+#elif !defined(PICOLM_DOS)
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -192,7 +192,7 @@ int mmap_file(model_t *m, const char *path) {
 #ifdef _WIN32
     m->file_handle = m->splits[0].file_handle;
     m->map_handle  = m->splits[0].map_handle;
-#else
+#elif !defined(PICOLM_DOS)
     m->fd = m->splits[0].fd;
 #endif
     m->n_splits = 1;
@@ -281,6 +281,26 @@ static int mmap_one_file(split_mmap_t *s, const char *path) {
     s->mmap_addr  = addr;
     s->file_handle = fh;
     s->map_handle  = mh;
+#elif defined(PICOLM_DOS)
+    /* DOS: no mmap, load entire file into malloc'd memory */
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "Cannot open split file: %s\n", path);
+        return -1;
+    }
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    s->mmap_size = (size_t)fsize;
+    void *buf = malloc(s->mmap_size);
+    if (!buf || fread(buf, 1, s->mmap_size, f) != s->mmap_size) {
+        fprintf(stderr, "Failed to read split file: %s\n", path);
+        fclose(f);
+        free(buf);
+        return -1;
+    }
+    fclose(f);
+    s->mmap_addr = buf;
 #else
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
@@ -312,6 +332,8 @@ void munmap_one_file(split_mmap_t *s) {
     UnmapViewOfFile(s->mmap_addr);
     CloseHandle(s->map_handle);
     CloseHandle(s->file_handle);
+#elif defined(PICOLM_DOS)
+    free(s->mmap_addr);
 #else
     munmap(s->mmap_addr, s->mmap_size);
     close(s->fd);
@@ -408,6 +430,17 @@ int model_list_tensors(const char *path) {
     if (!addr) {
         fprintf(stderr, "MapViewOfFile failed\n");
         goto out;
+    }
+#elif defined(PICOLM_DOS)
+    {
+        FILE *f = fopen(path, "rb");
+        if (!f) { perror("fopen"); return -1; }
+        fseek(f, 0, SEEK_END);
+        fsize = (size_t)ftell(f);
+        fseek(f, 0, SEEK_SET);
+        addr = malloc(fsize);
+        if (!addr || fread(addr, 1, fsize, f) != fsize) { addr = NULL; fclose(f); goto out; }
+        fclose(f);
     }
 #else
     fd = open(path, O_RDONLY);
@@ -513,6 +546,8 @@ out:
     if (addr) UnmapViewOfFile(addr);
     if (mh) CloseHandle(mh);
     if (fh != INVALID_HANDLE_VALUE) CloseHandle(fh);
+#elif defined(PICOLM_DOS)
+    if (addr) free(addr);
 #else
     if (addr) munmap(addr, fsize);
     if (fd >= 0) close(fd);
@@ -540,6 +575,17 @@ int model_list_kv(const char *path) {
     HANDLE mh = CreateFileMappingA(fh, NULL, PAGE_READONLY, 0, 0, NULL);
     if (mh) {
         addr = (uint8_t *)MapViewOfFile(mh, FILE_MAP_READ, 0, 0, fsize);
+    }
+#elif defined(PICOLM_DOS)
+    {
+        FILE *f = fopen(path, "rb");
+        if (!f) { perror("fopen"); return -1; }
+        fseek(f, 0, SEEK_END);
+        fsize = (size_t)ftell(f);
+        fseek(f, 0, SEEK_SET);
+        addr = malloc(fsize);
+        if (!addr || fread(addr, 1, fsize, f) != fsize) { addr = NULL; fclose(f); goto out; }
+        fclose(f);
     }
 #else
     int fd = open(path, O_RDONLY);
@@ -623,6 +669,8 @@ out:
     if (addr) UnmapViewOfFile(addr);
     if (mh) CloseHandle(mh);
     if (fh != INVALID_HANDLE_VALUE) CloseHandle(fh);
+#elif defined(PICOLM_DOS)
+    if (addr) free(addr);
 #else
     if (addr) munmap(addr, fsize);
     if (fd >= 0) close(fd);

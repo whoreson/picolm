@@ -1,6 +1,16 @@
 #ifndef MODEL_INTERNAL_H
 #define MODEL_INTERNAL_H
 
+#include <math.h>
+
+/* fmaf() polyfill for platforms without C11 fused multiply-add (e.g. DJGPP) */
+#ifndef PICOLM_DOS
+/* Use native fmaf when available */
+#endif
+#ifdef PICOLM_DOS
+#define fmaf(a, b, c) (((a)*(b))+(c))
+#endif
+
 /* Internal forward declarations shared between model_*.c files.
  * These are static in model.c but need cross-file visibility after the split. */
 

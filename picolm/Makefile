@@ -466,3 +466,26 @@ hunger:
 	echo del /q $(HUNGER_CUOBS) 2^>nul >> .hunger_build.bat
 	echo del .hunger_build.bat >> .hunger_build.bat
 	cmd /c .hunger_build.bat
+
+# ---- DJGPP (MS-DOS) target ----
+# Build host: Linux with cross-compiler at /data4/work/djgpp-build/djgpp-toolchain/bin/
+# Run on DOS/DOSEMU/DOSBox. No GPU, no SIMD, no threading, no server/viz.
+DJGPP_CC   = /data4/work/djgpp-build/djgpp-toolchain/bin/i586-pc-msdosdjgpp-gcc
+DJGPP_CFLAGS = -Os -std=c11 -DPICOLM_DOS=1 -Wall
+DJGPP_SRCS = picolm.c $(MODEL_SRCS) tensor.c quant.c tokenizer.c qwen_tokenize.c \
+             sampler.c grammar.c cJSON.c csafetensors.c json.c safetensors.c
+DJGPP_OBJS = $(DJGPP_SRCS:.c=.o.dos)
+DJGPP_RUNTIME = /data4/work/djgpp-build/djgpp-runtime
+
+%.o.dos: %.c model.h quant.h tensor.h model_internal.h
+	$(DJGPP_CC) $(DJGPP_CFLAGS) -c -o $@ $<
+
+dos_stubs.o.dos: dos_stubs.c
+	$(DJGPP_CC) $(DJGPP_CFLAGS) -c -o $@ $<
+
+dos: dos_stubs.o.dos $(DJGPP_OBJS)
+	$(DJGPP_CC) -nostartfiles -o picolm.exe $< $(DJGPP_RUNTIME)/lib/crt0.o \
+	 $(DJGPP_OBJS) -L$(DJGPP_RUNTIME)/lib -lc -lm -lgcc
+
+dos-clean:
+	-rm -f $(DJGPP_OBJS) dos_stubs.o.dos picolm.exe

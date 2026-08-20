@@ -432,7 +432,7 @@ typedef struct {
 #ifdef _WIN32
     void  *file_handle;
     void  *map_handle;
-#else
+#elif !defined(PICOLM_DOS)
     int    fd;
 #endif
 } split_mmap_t;

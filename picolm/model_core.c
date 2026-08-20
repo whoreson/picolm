@@ -37,6 +37,9 @@
 #include <assert.h>
 #include <inttypes.h>
 #include <stdlib.h>
+#ifdef PICOLM_DOS
+#include <alloca.h>
+#endif
 #include <string.h>
 #include <math.h>
 
@@ -68,7 +71,7 @@ extern int cudaProfilerStop(void);
 #include <security.h>
 #include <accctrl.h>
 #include <aclapi.h>
-#else
+#elif !defined(PICOLM_DOS)
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -238,7 +241,7 @@ static void bench_emit(int l, int is_prefill, double elapsed_ms, long minflt, lo
 /* Inline-like macro for benchmarking a layer: captures rusage before, time before,
  * caller does work, then bench_emit_after does the rest. */
 double get_time_ms(void);
-#ifdef _WIN32
+#if defined(_WIN32) || defined(PICOLM_DOS)
 #define BENCH_LAYER_START() double _bench_t0 = get_time_ms()
 #define BENCH_LAYER_END(_l, _pref) bench_emit(_l, _pref, get_time_ms() - (_bench_t0), 0, 0)
 #else
@@ -626,6 +629,12 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         base = calloc(1, total_alloc);
         if (!base) {
             fprintf(stderr, "OOM: calloc failed for %zu bytes\n", total_alloc);
+            return -1;
+        }
+#elif defined(PICOLM_DOS)
+        base = malloc(total_alloc);
+        if (!base) {
+            fprintf(stderr, "OOM: malloc failed for %zu bytes\n", total_alloc);
             return -1;
         }
 #else
@@ -2255,6 +2264,8 @@ void model_free(model_t *m) {
         /* mem_block and kv_block are contiguously allocated; release */
 #ifdef _WIN32
         free(m->state.mem_block);
+#elif defined(PICOLM_DOS)
+        free(m->state.mem_block);
 #else
         munmap(m->state.mem_block, m->state.mem_size);
 #endif
@@ -2341,12 +2352,17 @@ static const uint8_t *page_align_down(const uint8_t *p) {
  *
  * Returns the number of layers locked, or 0 on failure. */
 int model_lock_layers(model_t *m, size_t mem_bytes) {
+#if defined(_WIN32) || defined(PICOLM_DOS)
+    (void)m; (void)mem_bytes;
+    return 0;
+}
+#else
     const model_config_t *c = &m->config;
 
     /* Cap budget to RLIMIT_MEMLOCK minus page alignment overhead.
      * On Windows, VirtualLock has no such limit, so skip this check. */
     size_t effective_budget = mem_bytes;
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(PICOLM_DOS)
     {
         struct rlimit rl;
         if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) {
@@ -2540,9 +2556,15 @@ int model_lock_layers(model_t *m, size_t mem_bytes) {
 }
 #undef ADD_RANGE
 #undef NR_MAX
+#endif /* !_WIN32 && !PICOLM_DOS */
 
 /* Unlock previously pinned weight layers. */
 int model_unlock_layers(model_t *m) {
+#if defined(_WIN32) || defined(PICOLM_DOS)
+    (void)m;
+    return 0;
+}
+#else
     if (m->locked_layers == 0) return 0;
 
     const model_config_t *c = &m->config;
@@ -2629,6 +2651,7 @@ int model_unlock_layers(model_t *m) {
     fprintf(stderr, "Unlock: released %.1f MB\n", (double)total_unlocked / (1024.0 * 1024.0));
     return 0;
 }
+#endif
 
 /* ================================================================
  * Batched attention for prefill: computes attention for all tokens

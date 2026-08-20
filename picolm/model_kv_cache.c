@@ -5,14 +5,20 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#ifdef PICOLM_DOS
+#include <alloca.h>
+#endif
 
 #include <errno.h>
 #ifdef _WIN32
 #include <windows.h>
 #include <io.h>
 #include <fcntl.h>
-#else
+#elif !defined(PICOLM_DOS)
 #include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
+#else
 #include <fcntl.h>
 #include <unistd.h>
 #endif

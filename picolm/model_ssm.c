@@ -4,6 +4,9 @@
 #include "model_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef PICOLM_DOS
+#include <alloca.h>
+#endif
 #include <string.h>
 #include <math.h>
 #include <assert.h>

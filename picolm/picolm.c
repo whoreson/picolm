@@ -15,6 +15,11 @@
 #include <signal.h>
 #include <errno.h>
 #include <math.h>
+#ifdef PICOLM_DOS
+#include <alloca.h>
+#include <time.h>
+#include <fcntl.h>
+#endif
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -32,14 +37,25 @@ double get_time_ms(void) {
     return (double)count.QuadPart / (double)freq.QuadPart * 1000.0;
 }
 #else
+#ifndef PICOLM_DOS
 #include <sys/time.h>
 #include <time.h>
 #include <sys/types.h>
 #include <unistd.h>
+#endif
 double get_time_ms(void) {
+#ifdef _WIN32
+    LARGE_INTEGER freq, count;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&count);
+    return (double)count.QuadPart / (double)freq.QuadPart * 1000.0;
+#elif defined(PICOLM_DOS)
+    return (double)clock() / (double)CLOCKS_PER_SEC * 1000.0;
+#else
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (double)tv.tv_sec * 1000.0 + (double)tv.tv_usec / 1000.0;
+#endif
 }
 #endif
 
@@ -355,7 +371,7 @@ int main(int argc, char **argv) {
     int    v_cache_hadamard = 0;  /* -vhad: Walsh-Hadamard rotation for V cache */
     int    mem_mb = 0;      /* --mem budget in megabytes (0=disabled) */
     int    do_prefault = 0; /* --prefault (touch all mmap pages at load time) */
-    #ifndef _WIN32
+    #if !defined(_WIN32) && !defined(PICOLM_DOS)
     int    server_daemon = 0;
 #endif
     int    server_mode = 0;
@@ -388,8 +404,15 @@ int main(int argc, char **argv) {
             continue;
         }
         if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+#ifdef PICOLM_DOS
+            { size_t len = strlen(argv[i+1]) + 1;
+              prompt_buf = malloc(len);
+              if (!prompt_buf) { fprintf(stderr, "strdup failed\n"); return 1; }
+              memcpy(prompt_buf, argv[++i], len); }
+#else
             prompt_buf = strdup(argv[++i]);
             if (!prompt_buf) { fprintf(stderr, "strdup failed\n"); return 1; }
+#endif
             unescape_prompt(prompt_buf);
             prompt = prompt_buf;
         } else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
@@ -406,7 +429,7 @@ int main(int argc, char **argv) {
             context_override = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-j") == 0 && i + 1 < argc) {
             num_threads = atoi(argv[++i]);
-        #ifndef _WIN32
+        #if !defined(_WIN32) && !defined(PICOLM_DOS)
         } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--daemon") == 0) {
             server_daemon = 1;
 #endif
@@ -505,12 +528,12 @@ int main(int argc, char **argv) {
             stdin_prompt = read_stdin();
             prompt = stdin_prompt;
         }
-#else
+#elif !defined(PICOLM_DOS)
         if (!isatty(fileno(stdin))) {
             stdin_prompt = read_stdin();
             prompt = stdin_prompt;
         }
-#endif
+#endif /* _WIN32 */
     }
 
     /* Resolve thread count: if not specified, auto-detect physical cores */
@@ -521,7 +544,7 @@ int main(int argc, char **argv) {
     /* Server mode: start HTTP server (no prompt needed) */
     if (server_mode) {
         /* Daemonize if requested (Unix-only) */
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(PICOLM_DOS)
         if (server_daemon) {
             pid_t pid = fork();
             if (pid < 0) { perror("fork"); return 1; }
@@ -629,7 +652,7 @@ int main(int argc, char **argv) {
     model_set_prefault(do_prefault);
 
     int is_safetensors = 0;
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(PICOLM_DOS)
     {
         char idx_path[4096];
         snprintf(idx_path, sizeof(idx_path), "%s/model.safetensors.index.json", model_path);
@@ -639,7 +662,7 @@ int main(int argc, char **argv) {
             if (access(idx_path, F_OK) == 0) is_safetensors = 1;
         }
     }
-#else
+#elif defined(_WIN32)
     {
         char idx_path[4096];
         snprintf(idx_path, sizeof(idx_path), "%s/model.safetensors.index.json", model_path);

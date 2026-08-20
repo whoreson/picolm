@@ -14,7 +14,7 @@
 #endif
 #include <windows.h>
 #include <synchapi.h>
-#else
+#elif !defined(PICOLM_DOS)
 #include <pthread.h>
 #include <unistd.h>
 #include <dirent.h>
@@ -90,6 +90,11 @@ static int sysconf_compat(int name) {
 typedef HANDLE            win_thread_t;
 typedef SRWLOCK           win_mutex_t;
 typedef CONDITION_VARIABLE win_cond_t;
+#elif defined(PICOLM_DOS)
+/* DOS: no threading. Stubs for compilation. */
+typedef int               win_thread_t;
+typedef int               win_mutex_t;
+typedef int               win_cond_t;
 #else
 typedef pthread_t  win_thread_t;
 typedef pthread_mutex_t win_mutex_t;
@@ -137,6 +142,7 @@ typedef struct {
  * Returns number of groups found (0 = fallback to single group).
  * Groups are sorted by max_freq ascending (little first, big last). */
 static int detect_cpu_groups(cpu_group_t groups[], int max_groups) {
+#if !defined(PICOLM_DOS)
     DIR *root = opendir("/sys/devices/system/cpu/cpufreq");
     if (!root) return 0;
 
@@ -188,7 +194,11 @@ static int detect_cpu_groups(cpu_group_t groups[], int max_groups) {
         if (g->nids > 0) ng++;
     }
     closedir(root);
+#else
+    return 0;
+#endif
 
+#if !defined(PICOLM_DOS)
     /* Sort groups by max_freq ascending (bubble sort, small N) */
     for (int i = 0; i < ng - 1; i++) {
         for (int j = i + 1; j < ng; j++) {
@@ -217,6 +227,9 @@ static int detect_cpu_groups(cpu_group_t groups[], int max_groups) {
         }
     }
     return merged;
+#else
+    return 0;
+#endif
 }
 
 #endif /* _WIN32 */
@@ -249,6 +262,9 @@ static int count_physical_cores(void) {
         GetSystemInfo(&si);
         return (int)si.dwNumberOfProcessors;
     }
+#elif defined(PICOLM_DOS)
+    /* DOS: single thread */
+    return 1;
 #else /* Linux / POSIX */
     {
         /* Count physical cores from /sys topology files.
@@ -433,6 +449,16 @@ static void win_cond_broadcast(win_cond_t *c) { WakeAllConditionVariable(c); }
 static void win_cond_destroy(win_cond_t *c) { (void)c; }
 static void win_thread_create(win_thread_t *t, DWORD (WINAPI *fn)(void*), void *arg) { *t = CreateThread(NULL, 0, fn, arg, 0, NULL); }
 static void win_thread_join(win_thread_t *t) { WaitForSingleObject(*t, INFINITE); CloseHandle(*t); }
+#elif defined(PICOLM_DOS)
+static void win_mutex_init(win_mutex_t *m) { (void)m; }
+static void win_mutex_lock(win_mutex_t *m) { (void)m; }
+static void win_mutex_unlock(win_mutex_t *m) { (void)m; }
+static void win_cond_init(win_cond_t *c) { (void)c; }
+static void win_cond_wait(win_cond_t *c, win_mutex_t *m) { (void)c; (void)m; }
+static void win_cond_broadcast(win_cond_t *c) { (void)c; }
+static void win_cond_destroy(win_cond_t *c) { (void)c; }
+static void win_thread_create(win_thread_t *t, void (*fn)(void*), void *arg) { (void)t; (void)fn; (void)arg; }
+static void win_thread_join(win_thread_t *t) { (void)t; }
 #else
 static void win_mutex_init(win_mutex_t *m) { pthread_mutex_init(m, NULL); }
 static void win_mutex_lock(win_mutex_t *m) { pthread_mutex_lock(m); }

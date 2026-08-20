@@ -7,7 +7,9 @@
 #include <string.h>
 #ifndef _WIN32
 #include <unistd.h>
+#ifndef PICOLM_DOS
 #include <sys/mman.h>
+#endif
 #else
 #include <io.h>
 #define F_OK 0
