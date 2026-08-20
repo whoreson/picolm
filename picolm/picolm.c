@@ -728,6 +728,11 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "%0.1fms: tokenizer loaded\n", (double)(clock() - t_tok_start) / CLOCKS_PER_SEC * 1000.0);
 
+    /* Warn about unsupported tokenizer types */
+    if (model.tok_unknown_model) {
+        fprintf(stderr, "WARN: tokenizer model type not supported by PicoLM (using SPM fallback). Output may differ from reference.\n");
+    }
+
     /* Init sampler */
     sampler_t sampler;
     sampler_init(&sampler, temperature, top_p, top_k, 0.05f, seed);
@@ -1047,9 +1052,7 @@ int main(int argc, char **argv) {
 
                 grammar_apply(&grammar, logits, model.config.vocab_size);
         next = sampler_sample(&sampler, logits, model.config.vocab_size);
-        #ifdef PICOLM_GEN_DEBUG
         fprintf(stderr, "[GEN] pos=%d next=%d eos=%d\n", pos, next, (int)tokenizer.eos_id);
-#endif
 
         /* Update grammar state with the generated token */
         grammar_advance(&grammar, &tokenizer, next);

@@ -479,6 +479,7 @@ typedef struct {
     uint32_t    tok_eos_id;
     /* Pre-tokenizer type: 0=U+2581 (default), 1=U+0100 (smollm), 2=literal space, 3=qwen35 */
     int         tok_space_marker;
+    int         tok_unknown_model; /* non-zero if tokenizer.ggml.model is unsupported (e.g. gpt2) */
     /* GGUF tokenizer flags */
     int         tok_add_bos;          /* tokenizer.ggml.add_bos_token (default: 1) */
     int         tok_add_space_prefix; /* tokenizer.ggml.add_space_prefix (default: 1) */

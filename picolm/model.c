@@ -1192,6 +1192,7 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                 if (model_name.len == 4 && strncmp(model_name.str, "gpt2", 4) == 0) {
                     /* gpt2 tokenizer: BOS=11, like llama.cpp */
                     if (m->tok_bos_id == 1) m->tok_bos_id = 11;
+                    m->tok_unknown_model = 1; /* clear when pre=smollm etc is seen */
                 } else if (model_name.len == 5 && strncmp(model_name.str, "llama", 5) == 0) {
                     /* llama tokenizer: BOS=1 (already default) */
                     ;
@@ -1208,10 +1209,13 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                 gguf_str_t pre = read_gguf_string(&r);
                 if (pre.len >= 6 && strncmp(pre.str, "smollm", 6) == 0) {
                     m->tok_space_marker = 1; /* U+0100 */
+                    m->tok_unknown_model = 0; /* smollm pre-tokenizer works with SPM */
                 } else if (pre.len >= 6 && strncmp(pre.str, "qwen35", 6) == 0) {
                     m->tok_space_marker = 3; /* qwen35: U+0100, no prefix on first token */
-                } else if (pre.len >= 5 && strncmp(pre.str, "gpt-2", 5) == 0) {
-                    m->tok_space_marker = 1; /* GPT-2 BPE: U+0100 space marker */
+                    m->tok_unknown_model = 0;
+                } else if (pre.len >= 10 && strncmp(pre.str, "llama-bpe", 9) == 0) {
+                    /* llama-bpe: GPT-2 BPE with Llama preprocessing - unsupported, use U+0100 as best guess */
+                    m->tok_space_marker = 1;
                 } else {
                     m->tok_space_marker = 0; /* U+2581 (default, SPM models) */
                 }
