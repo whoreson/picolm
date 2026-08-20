@@ -1496,15 +1496,15 @@ static int parse_gguf(model_t *m, int max_seq_len) {
             if (layer >= 0 && layer < MAX_LAYERS) {
                 layer_weights_t *lw = &w->layers[layer];
                 if (strcmp(suffix, "attn_norm.weight") == 0) {
-                    lw->attn_norm = ptr; lw->type_attn_norm = qtype; if (layer == 0) fprintf(stderr, "DBG attn_norm type=%d\n", qtype);
+                    lw->attn_norm = ptr; lw->type_attn_norm = qtype;
                 } else if (strcmp(suffix, "attn_q.weight") == 0) {
-                    lw->attn_q = ptr; lw->type_attn_q = qtype; if (layer == 0) fprintf(stderr, "DBG attn_q type=%d\n", qtype);
+                    lw->attn_q = ptr; lw->type_attn_q = qtype;
                 } else if (strcmp(suffix, "attn_k.weight") == 0) {
-                    lw->attn_k = ptr; lw->type_attn_k = qtype; if (layer == 0) fprintf(stderr, "DBG attn_k type=%d\n", qtype); lw->is_attn_layer = 1;
+                    lw->attn_k = ptr; lw->type_attn_k = qtype; lw->is_attn_layer = 1;
                 } else if (strcmp(suffix, "attn_v.weight") == 0) {
-                    lw->attn_v = ptr; lw->type_attn_v = qtype; if (layer == 0) fprintf(stderr, "DBG attn_v type=%d\n", qtype); lw->is_attn_layer = 1;
+                    lw->attn_v = ptr; lw->type_attn_v = qtype; lw->is_attn_layer = 1;
                 } else if (strcmp(suffix, "attn_output.weight") == 0) {
-                    lw->attn_output = ptr; lw->type_attn_output = qtype; if (layer == 0) fprintf(stderr, "DBG attn_output type=%d\n", qtype);
+                    lw->attn_output = ptr; lw->type_attn_output = qtype;
                 } else if (strcmp(suffix, "attn_q_norm.weight") == 0) {
                     lw->attn_q_norm = ptr; lw->type_attn_q_norm = qtype;
                 } else if (strcmp(suffix, "attn_k_norm.weight") == 0) {
@@ -1521,11 +1521,11 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                         lw->post_attn_norm = ptr; lw->type_post_attn_norm = qtype;
                     }
                 } else if (strcmp(suffix, "ffn_gate.weight") == 0) {
-                    lw->ffn_gate = ptr; lw->type_ffn_gate = qtype; if (layer == 0) fprintf(stderr, "DBG ffn_gate type=%d\n", qtype);
+                    lw->ffn_gate = ptr; lw->type_ffn_gate = qtype;
                 } else if (strcmp(suffix, "ffn_down.weight") == 0) {
-                    lw->ffn_down = ptr; lw->type_ffn_down = qtype; if (layer == 0) fprintf(stderr, "DBG ffn_down type=%d\n", qtype);
+                    lw->ffn_down = ptr; lw->type_ffn_down = qtype;
                 } else if (strcmp(suffix, "ffn_up.weight") == 0) {
-                    lw->ffn_up = ptr; lw->type_ffn_up = qtype; if (layer == 0) fprintf(stderr, "DBG ffn_up type=%d\n", qtype);
+                    lw->ffn_up = ptr; lw->type_ffn_up = qtype;
                 }
                 /* MoE tensors (qwen35moe) */
                 else if (strcmp(suffix, "ffn_gate_exps.weight") == 0) {
@@ -1573,11 +1573,9 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                 } else if (strcmp(suffix, "per_layer_inp_gate.weight") == 0
                         || strcmp(suffix, "inp_gate.weight") == 0) {
                     lw->per_layer_inp_gate = ptr; lw->type_per_layer_inp_gate = qtype;
-                    if (layer == 0) fprintf(stderr, "DBG per_layer_inp_gate type=%d\n", qtype);
                 } else if (strcmp(suffix, "per_layer_proj.weight") == 0
                         || strcmp(suffix, "proj.weight") == 0) {
                     lw->per_layer_proj = ptr; lw->type_per_layer_proj = qtype;
-                    if (layer == 0) fprintf(stderr, "DBG per_layer_proj type=%d\n", qtype);
                 } else if (strcmp(suffix, "per_layer_post_norm.weight") == 0
                         || strcmp(suffix, "post_norm.weight") == 0) {
                     lw->per_layer_post_norm = ptr; lw->type_per_layer_post_norm = qtype;
@@ -1585,7 +1583,6 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                     lw->altup_correct_coef = ptr;
                 } else if (strcmp(suffix, "altup_correct_scale.weight") == 0) {
                     lw->altup_correct_scale = ptr;
-                    if (layer == 0) fprintf(stderr, "DBG altup_correct_scale type=%d\n", qtype);
                 } else if (strcmp(suffix, "altup_predict_coef.weight") == 0) {
                     lw->altup_predict_coef = ptr;
                 } else if (strcmp(suffix, "altup_router.weight") == 0) {
@@ -1619,16 +1616,12 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                 /* Gemma-3n global tensors (not under blk.) */
                 if (str_eq(tinfos[i].name, "altup_proj.weight")) {
                     w->altup_proj = ptr; w->type_altup_proj = qtype;
-                    fprintf(stderr, "DBG altup_proj type=%d\n", qtype);
                 } else if (str_eq(tinfos[i].name, "altup_unembd_proj.weight")) {
                     w->altup_unembd_proj = ptr; w->type_altup_unembd_proj = qtype;
-                    fprintf(stderr, "DBG altup_unembd_proj type=%d\n", qtype);
                 } else if (str_eq(tinfos[i].name, "per_layer_token_embd.weight")) {
                     w->per_layer_tok_embd = ptr; w->type_per_layer_tok_embd = qtype;
-                    fprintf(stderr, "DBG per_layer_tok_embd type=%d\n", qtype);
                 } else if (str_eq(tinfos[i].name, "per_layer_model_proj.weight")) {
                     w->per_layer_model_proj = ptr; w->type_per_layer_model_proj = qtype;
-                    fprintf(stderr, "DBG per_layer_model_proj type=%d\n", qtype);
                 } else if (str_eq(tinfos[i].name, "per_layer_proj_norm.weight")) {
                     w->per_layer_proj_norm = ptr;
                     if (_SSM_DBG) fprintf(stderr, "DBG per_layer_proj_norm type=%d\n", qtype);
@@ -2579,13 +2572,6 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
             if (lw->per_layer_post_norm) {
                 dequantize_row(lw->per_layer_post_norm, s->per_layer_post_norm_w[l], n_embd, lw->type_per_layer_post_norm);
                 if (m->from_safetensors) { float *w = s->per_layer_post_norm_w[l]; for (int i = 0; i < n_embd; i++) w[i] += 1.0f; }
-                if (l == 0) {
-                    float maxw = 0; int maxw_i = 0;
-                    for(int i=0;i<n_embd;i++) if(fabsf(s->per_layer_post_norm_w[l][i])>maxw){maxw=fabsf(s->per_layer_post_norm_w[l][i]);maxw_i=i;}
-                    fprintf(stderr, "DBG per_layer_post_norm type=%d max|w|=%.4f@%d [1328:1335]={", lw->type_per_layer_post_norm, maxw, maxw_i);
-                    for(int i=1328;i<1335;i++) fprintf(stderr,"%.4f%s",s->per_layer_post_norm_w[l][i],i<1334?",":"");
-                    fprintf(stderr, "}\n");
-                }
             } else { float *w = s->per_layer_post_norm_w[l]; for (int i = 0; i < n_embd; i++) w[i] = 1.0f; }
             /* laurel_post_norm */
             if (lw->laurel_post_norm) {
@@ -5431,8 +5417,6 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
                     /* Wait, matmul(out, x, W, n, d) = out[i] = sum_j x[j] * W[i*n + j] */
                     /* So W is [d, n] = [2048, 256], row d is at offset d*256 */
                 }
-                /* Actually let's just print the weight type */
-                fprintf(stderr, "DBG L0 per_layer_proj type=%d\n", lw->type_per_layer_proj);
             }
             matmul(s->hb, s->gemma3n_inp_gate_out, lw->per_layer_proj, n_embd_altup, dim, lw->type_per_layer_proj);
             if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
