@@ -291,6 +291,29 @@ typedef struct picolm_checkpoint {
     struct picolm_checkpoint *next; /* linked list, ordered by n_tokens ascending */
 } picolm_checkpoint_t;
 
+/* Shared completion parameters (parsed from either OpenAI or llama.cpp JSON) */
+typedef struct {
+    const char *prompt;
+    int *ptokens;            /* encoded prompt tokens */
+    int n_prompt;
+    int max_tokens;
+    float temperature;
+    float top_p;
+    int top_k;
+    float repeat_penalty;
+    int repeat_last_n;
+    int seed;
+    int do_stream;
+    int ignore_eos;
+    int return_tokens;       /* llama.cpp: return token IDs in stream */
+    char *stop_words[256];
+    int n_stop_words;
+    char *model_name;
+    int is_chat;             /* OpenAI chat mode */
+    int llama_mode;          /* llama.cpp response format */
+    char *chat_prompt;       /* freed by caller */
+} completion_params_t;
+
 /* Forward declaration of global server state */
 static struct _server_state {
     SOCKET listen_sock;
@@ -1925,6 +1948,10 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         sampler_t sampler;
         sampler_init(&sampler, temperature, top_p, top_k, 0.05f, seed);
 
+        /* Withheld buffer for partial stop word matches */
+        char *withheld = (char *)calloc(1, 1024);
+        int withheld_cap = 1024;
+
         double t_start = get_time_ms();
 
         /* ---- Prefill phase ---- */
@@ -1952,6 +1979,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         if (n_processed < n_prompt) {
             /* Client disconnected during prefill */
             fprintf(stderr, "[server] prefill cancelled at token %d/%d\n", n_processed, n_prompt);
+            free(withheld);
             free(chat_prompt); free(raw_prompt_copy); free(model_name); free(ptokens);
             for (int _si = 0; _si < n_stop_words; _si++) free(stop_words[_si]);
             return;
@@ -2020,12 +2048,33 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             cJSON *delta = cJSON_CreateObject();
             if (gen_count == 0) cJSON_AddStringToObject(delta, "role", is_chat ? "assistant" : "");
             if (stopped || partial) {
+                if (partial) {
+                    int w_len = (int)strlen(withheld);
+                    int p_len = (int)strlen(piece);
+                    if (w_len + p_len + 1 > withheld_cap) {
+                        withheld_cap = (w_len + p_len + 1) * 2;
+                        withheld = (char *)realloc(withheld, (size_t)withheld_cap);
+                    }
+                    memcpy(withheld + w_len, piece, (size_t)(p_len + 1));
+                }
                 cJSON_AddStringToObject(delta, "content", "");
                 cJSON_AddStringToObject(choice, "finish_reason", stopped ? "stop" : "");
             } else {
-                cJSON_AddStringToObject(delta, "content", piece);
+                const char *send_piece = piece;
+                if (withheld[0] != '\0') {
+                    int w_len = (int)strlen(withheld);
+                    int p_len = (int)strlen(piece);
+                    if (w_len + p_len + 1 > withheld_cap) {
+                        withheld_cap = (w_len + p_len + 1) * 2;
+                        withheld = (char *)realloc(withheld, (size_t)withheld_cap);
+                    }
+                    memcpy(withheld + w_len, piece, (size_t)(p_len + 1));
+                    send_piece = withheld;
+                    withheld[0] = '\0';
+                }
+                cJSON_AddStringToObject(delta, "content", send_piece);
                 cJSON_AddStringToObject(choice, "finish_reason", "");
-                if (!is_chat) cJSON_AddStringToObject(choice, "text", piece);
+                if (!is_chat) cJSON_AddStringToObject(choice, "text", send_piece);
             }
             cJSON *choices = cJSON_CreateArray();
             cJSON_AddItemToArray(choices, choice);
@@ -2070,6 +2119,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         }
 
         free(generated_stream);
+        free(withheld);
         double t_end = get_time_ms();
         double t_prefill_ms = t_prefill_end > 0 ? t_prefill_end - t_start : t_end - t_start;
         double t_gen_ms = t_prefill_end > 0 ? t_end - t_prefill_end : 0;
@@ -2586,6 +2636,8 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         const char *stopping_word = "";
         char *generated_stream = (char *)calloc(1, 1024);
         int generated_stream_cap = 1024;
+        char *withheld = (char *)calloc(1, 1024);
+        int withheld_cap = 1024;
 
         /* If the entire prompt is cached (start_pos >= n_prompt), step back
          * to position n_prompt - 1 so model_forward produces correct logits
@@ -2692,11 +2744,35 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
 
             /* Build streaming response: {content, tokens, stop} */
             cJSON *resp = cJSON_CreateObject();
-            /* If stopped or partial match, suppress the piece */
+            /* If stopped or partial match, suppress the piece;
+             * if partial resolves, flush previously withheld content */
             if (stopped || partial) {
+                if (partial) {
+                    /* Accumulate in withheld buffer */
+                    int w_len = (int)strlen(withheld);
+                    int p_len = (int)strlen(piece);
+                    if (w_len + p_len + 1 > withheld_cap) {
+                        withheld_cap = (w_len + p_len + 1) * 2;
+                        withheld = (char *)realloc(withheld, (size_t)withheld_cap);
+                    }
+                    memcpy(withheld + w_len, piece, (size_t)(p_len + 1));
+                }
                 cJSON_AddStringToObject(resp, "content", "");
             } else {
-                cJSON_AddStringToObject(resp, "content", piece);
+                /* Flush withheld + current piece */
+                if (withheld[0] != '\0') {
+                    int w_len = (int)strlen(withheld);
+                    int p_len = (int)strlen(piece);
+                    if (w_len + p_len + 1 > withheld_cap) {
+                        withheld_cap = (w_len + p_len + 1) * 2;
+                        withheld = (char *)realloc(withheld, (size_t)withheld_cap);
+                    }
+                    memcpy(withheld + w_len, piece, (size_t)(p_len + 1));
+                    cJSON_AddStringToObject(resp, "content", withheld);
+                    withheld[0] = '\0';
+                } else {
+                    cJSON_AddStringToObject(resp, "content", piece);
+                }
             }
 
             if (return_tokens || do_stream) {
@@ -2741,6 +2817,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         }
 
         free(generated_stream);
+        free(withheld);
         double t_end = get_time_ms();
         double t_prefill_ms = t_prefill_end > 0 ? t_prefill_end - t_start : t_end - t_start;
         double gen_ms = t_prefill_end > 0 ? t_end - t_prefill_end : t_end - t_start;
