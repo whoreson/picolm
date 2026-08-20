@@ -1,6 +1,7 @@
 #include "model.h"
 #include "tensor.h"
 #include "quant.h"
+#include "model_internal.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -164,7 +165,7 @@ static void moe_expert_worker(int i, void *vctx) {
 /* Optimized MoE forward: pre-quantize x, Q8xQ8 dot products for gate+up,
  * AVX-512 vectorized accumulation. Experts processed in parallel via
  * tensor_parallel_for for multi-threaded generation. */
-static void moe_forward(model_t *m, run_state_t *s, const float *x, float *residual,
+void moe_forward(model_t *m, run_state_t *s, const float *x, float *residual,
                         const layer_weights_t *lw) {
     model_config_t *c = &m->config;
     int dim = c->n_embd;
@@ -392,7 +393,7 @@ static void moe_forward(model_t *m, run_state_t *s, const float *x, float *resid
  * x_batch:        input [n_tokens * dim], stride = dim
  * residual_batch: output [n_tokens * dim], stride = dim
  */
-static void moe_forward_batch(model_t *m, run_state_t *s,
+void moe_forward_batch(model_t *m, run_state_t *s,
                               const float *x_batch, float *residual_batch,
                               int n_tokens, const layer_weights_t *lw) {
     model_config_t *c = &m->config;

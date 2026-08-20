@@ -264,14 +264,6 @@ static int cpu_has_avx2(void) {
 
 /* AVX2/AVX horizontal sum: reduce 8 FP32 lanes to one float */
 #if defined(PICOLM_AVX2) || defined(PICOLM_AVX)
-static inline float hreduce256_ps(__m256 a) {
-    __m256 t1 = _mm256_permute2f128_ps(a, a, 1);
-    __m256 t2 = _mm256_add_ps(a, t1);
-    __m128 t3 = _mm256_castps256_ps128(t2);
-    t3 = _mm_add_ss(t3, _mm_movehl_ps(t3, t3));
-    t3 = _mm_add_ss(t3, _mm_shuffle_ps(t3, t3, 0x1));
-    return _mm_cvtss_f32(t3);
-}
 #endif /* PICOLM_AVX2 || PICOLM_AVX */
 
 static void repack_model_weights_q4_0x8(model_t *m);

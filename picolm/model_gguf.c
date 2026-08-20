@@ -174,11 +174,10 @@ static uint64_t skip_meta_value(reader_t *r, uint32_t vtype, int *is_numeric) {
 
 /* Forward declarations for split mmap helpers */
 static int mmap_one_file(split_mmap_t *s, const char *path);
-static void munmap_one_file(split_mmap_t *s);
 static int split_path_prefix(char *prefix, size_t maxlen, const char *split_path);
 static void split_path_build(char *path, size_t maxlen, const char *prefix, int split_no, int split_count);
 
-static int mmap_file(model_t *m, const char *path) {
+int mmap_file(model_t *m, const char *path) {
     /* Store path for split derivation later */
     strncpy(m->first_split_path, path, sizeof(m->first_split_path) - 1);
     m->first_split_path[sizeof(m->first_split_path) - 1] = '\0';
@@ -306,7 +305,7 @@ static int mmap_one_file(split_mmap_t *s, const char *path) {
 }
 
 /* Unmap a single split file. */
-static void munmap_one_file(split_mmap_t *s) {
+void munmap_one_file(split_mmap_t *s) {
     if (!s->mmap_addr) return;
 #ifdef _WIN32
     UnmapViewOfFile(s->mmap_addr);
@@ -321,7 +320,7 @@ static void munmap_one_file(split_mmap_t *s) {
 
 /* ---- Tensor listing ---- */
 
-static const char *gguf_type_name(uint32_t type) {
+const char *gguf_type_name(uint32_t type) {
     switch (type) {
         case 0:  return "f32";
         case 1:  return "f16";

@@ -1,6 +1,7 @@
 #include "model.h"
 #include "tensor.h"
 #include "quant.h"
+#include "model_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1855,7 +1856,7 @@ static int ssm_out_dev_scratch_ensure(int device, size_t in_bytes, size_t out_by
 }
 #endif
 
-static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
+void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
                         layer_weights_t *lw, int il, int pos, void *gpu_lw) {
 #ifndef PICOLM_GPU
     (void)gpu_lw;
@@ -2667,7 +2668,7 @@ ssm_forward_gpu(model_t *m, run_state_t *s, float *x, float *residual,
  * ================================================================ */
 #define SSM_DBG_SYNC /* disabled */
 #ifdef PICOLM_GPU
-static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
+int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
     float *bx, float *bxb, float *bq, float *battn_out, float *bffn_norm,
     float *bgate, float *bup, layer_weights_t *lw, int l,
     int n_tokens, int start_pos, int dev) {
@@ -3176,7 +3177,7 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
  * State recurrence remains sequential per token but uses threaded
  * ssm_head_task across v-heads within each token.
  * ================================================================ */
-static void ssm_prefill_layer(model_t *m, run_state_t *s,
+void ssm_prefill_layer(model_t *m, run_state_t *s,
                               float *x_batch, float *xb_batch, float *xb2_batch,
                               float *hb_batch, float *hb2_batch,
                               layer_weights_t *lw, int l,

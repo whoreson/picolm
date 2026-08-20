@@ -46,7 +46,6 @@ extern void attn_core(
         size_t kv_head_stride_k, size_t kv_head_stride_v,
         int head_dim, float attn_scale);
 extern void attention_group(int kv_head_idx, void *ctx_ptr);
-extern void prefill_attn_task(int flat_idx, void *ctx_ptr);
 
 /* Shared attention context struct */
 typedef struct {
@@ -83,7 +82,6 @@ extern void moe_forward(model_t *m, run_state_t *s, const float *x, float *resid
 extern void moe_forward_batch(model_t *m, run_state_t *s,
                               const float *x_batch, float *residual_batch,
                               int n_tokens, const layer_weights_t *lw);
-extern void moe_expert_worker(int i, void *vctx);
 
 /* --- Gemma-3n --- */
 float *model_forward_gemma3n(model_t *m, int token, int pos);
@@ -92,13 +90,36 @@ extern void gemma3n_router(float *out, float *inp, int n_embd, int n_altup,
                            float rms_norm_eps, float *tmp_buf);
 
 /* --- KV Cache --- */
-extern int _kv_flush(int fd, uint8_t *buf, size_t *buf_off);
-extern void _kv_close(int fd, uint8_t *buf, size_t *buf_off);
 
 /* --- GGUF Loader --- */
 typedef struct { const uint8_t *data; size_t pos; size_t size; } reader_t;
 extern int parse_gguf(model_t *m, int max_seq_len);
+extern int mmap_file(model_t *m, const char *path);
+extern void munmap_one_file(split_mmap_t *s);
+extern const char *gguf_type_name(uint32_t type);
 extern void prepare_mmap(const void *addr, size_t size);
 extern void _do_prefault(const void *addr, size_t size);
 
 #endif /* MODEL_INTERNAL_H */
+
+/* ---- AVX2 horizontal reduction (needed by SSM) ---- */
+#if defined(PICOLM_AVX2) || defined(PICOLM_AVX)
+#include <immintrin.h>
+static inline float hreduce256_ps(__m256 a) {
+    __m256 t1 = _mm256_permute2f128_ps(a, a, 1);
+    __m256 t2 = _mm256_add_ps(a, t1);
+    __m128 t3 = _mm256_castps256_ps128(t2);
+    t3 = _mm_add_ss(t3, _mm_movehl_ps(t3, t3));
+    t3 = _mm_add_ss(t3, _mm_shuffle_ps(t3, t3, 0x1));
+    return _mm_cvtss_f32(t3);
+}
+#endif
+
+/* ---- aligned_alloc polyfill for FreeBSD 8.4 ---- */
+#ifndef HAVE_ALIGNED_ALLOC
+static inline void *aligned_alloc(size_t alignment, size_t size) {
+    void *ptr;
+    if (posix_memalign(&ptr, alignment, size) != 0) return NULL;
+    return ptr;
+}
+#endif

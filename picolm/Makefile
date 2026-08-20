@@ -21,7 +21,7 @@ endif
 CFLAGS_STRICT = -Wshadow -Wdouble-promotion -Wimplicit-fallthrough -Wconversion -Wmisleading-indentation $(WARN_GCC_ONLY) -Wfloat-conversion -Wsign-conversion -Wcast-qual -Wformat-nonliteral
 
 CFLAGS  ?= -O3 -g -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic -fno-common -fopenmp
-LDFLAGS = -lm -lpthread -fopenmp
+LDFLAGS = -fuse-ld=bfd -lm -lpthread -fopenmp
 
 # Windows needs ws2_32 for server mode
 ifeq ($(OS),Windows_NT)
@@ -50,6 +50,10 @@ VIZ_OBJS = $(VIZ_SRCS:.c=.o)
 HIPFLAGS ?= -O3 -std=c++11 -fPIC -fPIE
 HIP_LIBS = -lamdhip64
 GPU_OBJS =
+
+# GPU host .cu sources (backend_gpu.cu has been split into modular files)
+GPU_SRCS = backend_gpu_host_core.cu backend_gpu_host_ssm.cu backend_gpu_host_misc.cu
+GPU_CUH  = backend_gpu_common.cuh backend_gpu_dequant.cuh backend_gpu_kernels.cuh
 
 PREFIX  ?= /usr/local
 MODEL_DIR ?= /opt/picolm/models
@@ -157,7 +161,13 @@ $(TARGET): $(OBJS) $(GPU_OBJS)
 # Header dependencies
 picolm.o: picolm.c quant.h tensor.h model.h tokenizer.h sampler.h grammar.h
 viz.o:  viz.c  viz.h
-model.o:  model.c  model.h quant.h tensor.h
+model_core.o:   model_core.c  model.h quant.h tensor.h model_internal.h
+model_gguf.o:   model_gguf.c  model.h quant.h tensor.h model_internal.h
+model_attention.o: model_attention.c  model.h quant.h tensor.h model_internal.h
+model_moe.o:    model_moe.c  model.h quant.h tensor.h model_internal.h
+model_gemma3n.o: model_gemma3n.c  model.h quant.h tensor.h model_internal.h
+model_ssm.o:    model_ssm.c  model.h quant.h tensor.h model_internal.h
+model_kv_cache.o: model_kv_cache.c  model.h quant.h tensor.h model_internal.h
 tensor.o: tensor.c tensor.h quant.h model.h
 quant.o:  quant.c  quant.h
 tokenizer.o: tokenizer.c tokenizer.h
@@ -228,6 +238,7 @@ model:
 
 clean:
 	-$(RM) $(TARGET) $(TARGET).exe $(OBJS) $(VIZ_OBJS) backend_gpu.o backend_gpu.o.hip backend_gpu.o.cuda backend_metal.o
+	-$(RM) $(GPU_SRCS:%.cu=%-hip.o) $(GPU_SRCS:%.cu=%-cuda.o)
 
 
 .PHONY: asan
@@ -242,6 +253,7 @@ asan:
 .PHONY: gpu-clean-objs
 gpu-clean-objs:
 	-$(RM) model.o tensor.o quant.o picolm.o
+	-$(RM) model_core.o model_attention.o model_moe.o model_gemma3n.o model_ssm.o model_kv_cache.o model_gguf.o
 
 # --- ROCm/HIP GPU backend ---
 
@@ -275,11 +287,14 @@ endif
 #   Auto-detected via rocminfo when possible. Override with HIP_ARCH=gfx940 etc.
 #   Options: gfx906/908 (RDNA2/3, no WMMA), gfx940/941/942 (CDNA2+, WMMA)
 
-.PHONY: hip
-hip: backend_gpu.o.hip gpu-clean-objs
-	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_defines_for,-march=native) -DPICOLM_GPU=1" GPU_OBJS="backend_gpu.o.hip" GPU_LIBS="-L$(ROCM_LIB) -lamdhip64 -lstdc++ -Wl,-rpath,$(ROCM_LIB)"
+# HIP: compile each GPU host .cu independently
+HIP_OBJS := $(GPU_SRCS:%.cu=%-hip.o)
 
-backend_gpu.o.hip: backend_gpu.cu backend_gpu.h quant.h
+.PHONY: hip
+hip: $(HIP_OBJS) gpu-clean-objs
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_defines_for,-march=native) -DPICOLM_GPU=1" GPU_OBJS="$(HIP_OBJS)" GPU_LIBS="-L$(ROCM_LIB) -lamdhip64 -lstdc++ -Wl,-rpath,$(ROCM_LIB)"
+
+$(HIP_OBJS): %-hip.o: %.cu $(GPU_CUH) backend_gpu.h quant.h
 	$(HIPCC) $(HIPFLAGS) --offload-arch=$(HIP_ARCH) -DPICOLM_GPU=1 -c -o $@ $< -I.
 
 # --- CUDA (NVIDIA) GPU backend ---
@@ -301,11 +316,14 @@ CUDA_GENCODE := $(foreach arch,$(CUDA_ARCHS),-gencode arch=compute_$(subst sm_,,
 
 CUDAFLAGS   ?= -O3 -std=c++11 -Xcompiler="-fPIC"
 
-.PHONY: cuda
-cuda: backend_gpu.o.cuda gpu-clean-objs
-	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_defines_for,-march=native) -DPICOLM_GPU=1" GPU_OBJS="backend_gpu.o.cuda" GPU_LIBS="-L$(CUDA_LIB) -lcudart -lstdc++ -Wl,-rpath,$(CUDA_LIB)"
+# CUDA: compile each GPU host .cu independently
+CUDA_OBJS := $(GPU_SRCS:%.cu=%-cuda.o)
 
-backend_gpu.o.cuda: backend_gpu.cu backend_gpu.h quant.h
+.PHONY: cuda
+cuda: $(CUDA_OBJS) gpu-clean-objs
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_defines_for,-march=native) -DPICOLM_GPU=1" GPU_OBJS="$(CUDA_OBJS)" GPU_LIBS="-L$(CUDA_LIB) -lcudart -lstdc++ -Wl,-rpath,$(CUDA_LIB)"
+
+$(CUDA_OBJS): %-cuda.o: %.cu $(GPU_CUH) backend_gpu.h quant.h
 	$(NVCC) $(CUDAFLAGS) $(CUDA_GENCODE) -DPICOLM_GPU=1 -DPICOLM_SSM_WARP_KERNEL_VALIDATED -DPICOLM_SSM_CHUNKED_GPU_VALIDATED -c -o $@ $< -I.
 
 # --- Metal (Apple Silicon) backend -- RAW Metal framework, no MLX-C ---
@@ -384,20 +402,37 @@ HUNGER_MSVC_VER   ?= 14.44.35207
 HUNGER_CL_DIR = $(HUNGER_VS_ROOT)/VC/Tools/MSVC/$(HUNGER_MSVC_VER)/bin/Hostx64/x64
 HUNGER_CL = "$(HUNGER_CL_DIR)/cl.exe"
 HUNGER_LNK = "$(HUNGER_CL_DIR)/link.exe"
-HUNGER_CFILES = picolm.c model.c tensor.c quant.c tokenizer.c qwen_tokenize.c sampler.c grammar.c cJSON.c server.c csafetensors.c json.c safetensors.c
+HUNGER_CFILES = picolm.c model_core.c model_attention.c model_moe.c model_gemma3n.c model_ssm.c model_kv_cache.c model_gguf.c tensor.c quant.c tokenizer.c qwen_tokenize.c sampler.c grammar.c cJSON.c server.c csafetensors.c json.c safetensors.c
 HUNGER_COBJS = $(HUNGER_CFILES:.c=.obj)
+HUNGER_CUOBS = backend_gpu_host_core_win.obj backend_gpu_host_ssm_win.obj backend_gpu_host_misc_win.obj
 # cl.exe flags - all Make vars, NO batch %VAR% references
 HUNGER_CF = /O2 /W3 /wd4996 /arch:AVX512 /D PICOLM_GPU=1 /D _CRT_SECURE_NO_WARNINGS /I. /openmp /c
 
 hunger:
 	echo @echo off > .hunger_build.bat
-	echo del /q picolm.exe backend_gpu_cuda_win.obj $(HUNGER_COBJS) 2^>nul >> .hunger_build.bat
+	echo del /q picolm.exe $(HUNGER_CUOBS) $(HUNGER_COBJS) 2^>nul >> .hunger_build.bat
 	echo call "$(HUNGER_VS_ROOT)/VC/Auxiliary/Build/vcvars64.bat" >> .hunger_build.bat
-	echo "$(HUNGER_CUDA_ROOT)/bin/nvcc.exe" -O3 -std=c++14 -DPICOLM_GPU=1 -ccbin $(HUNGER_CL) -Xcompiler "/EHsc /O2 /W3 /std:c++14 /arch:AVX512" -gencode arch=compute_89,code=$(HUNGER_CUDA_ARCH) -c -o backend_gpu_cuda_win.obj backend_gpu.cu -I. >> .hunger_build.bat
+	echo "$(HUNGER_CUDA_ROOT)/bin/nvcc.exe" -O3 -std=c++14 -DPICOLM_GPU=1 -ccbin $(HUNGER_CL) -Xcompiler "/EHsc /O2 /W3 /std:c++14 /arch:AVX512" -gencode arch=compute_89,code=$(HUNGER_CUDA_ARCH) -c -o backend_gpu_host_core_win.obj backend_gpu_host_core.cu -I. >> .hunger_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
+	echo "$(HUNGER_CUDA_ROOT)/bin/nvcc.exe" -O3 -std=c++14 -DPICOLM_GPU=1 -ccbin $(HUNGER_CL) -Xcompiler "/EHsc /O2 /W3 /std:c++14 /arch:AVX512" -gencode arch=compute_89,code=$(HUNGER_CUDA_ARCH) -c -o backend_gpu_host_ssm_win.obj backend_gpu_host_ssm.cu -I. >> .hunger_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
+	echo "$(HUNGER_CUDA_ROOT)/bin/nvcc.exe" -O3 -std=c++14 -DPICOLM_GPU=1 -ccbin $(HUNGER_CL) -Xcompiler "/EHsc /O2 /W3 /std:c++14 /arch:AVX512" -gencode arch=compute_89,code=$(HUNGER_CUDA_ARCH) -c -o backend_gpu_host_misc_win.obj backend_gpu_host_misc.cu -I. >> .hunger_build.bat
 	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
 	echo $(HUNGER_CL) $(HUNGER_CF) picolm.c >> .hunger_build.bat
 	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo $(HUNGER_CL) $(HUNGER_CF) model.c >> .hunger_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF) model_core.c >> .hunger_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF) model_attention.c >> .hunger_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF) model_moe.c >> .hunger_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF) model_gemma3n.c >> .hunger_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF) model_ssm.c >> .hunger_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF) model_kv_cache.c >> .hunger_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF) model_gguf.c >> .hunger_build.bat
 	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
 	echo $(HUNGER_CL) $(HUNGER_CF) tensor.c >> .hunger_build.bat
 	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
@@ -421,8 +456,8 @@ hunger:
 	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
 	echo $(HUNGER_CL) $(HUNGER_CF) safetensors.c >> .hunger_build.bat
 	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo $(HUNGER_LNK) /OUT:picolm.exe $(HUNGER_COBJS) backend_gpu_cuda_win.obj "$(HUNGER_CUDA_ROOT)/lib/x64/cudart.lib" ws2_32.lib advapi32.lib >> .hunger_build.bat
+	echo $(HUNGER_LNK) /OUT:picolm.exe $(HUNGER_COBJS) $(HUNGER_CUOBS) "$(HUNGER_CUDA_ROOT)/lib/x64/cudart.lib" ws2_32.lib advapi32.lib >> .hunger_build.bat
 	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo del /q backend_gpu_cuda_win.obj 2^>nul >> .hunger_build.bat
+	echo del /q $(HUNGER_CUOBS) 2^>nul >> .hunger_build.bat
 	echo del .hunger_build.bat >> .hunger_build.bat
 	cmd /c .hunger_build.bat

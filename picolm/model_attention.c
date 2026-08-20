@@ -423,18 +423,6 @@ void attention_group(int kv_head_idx, void *ctx_ptr) {
 
 /* ---- MoE Forward Pass ---- */
 
-/* ================================================================
-
- * Prefill attention: tiled single-pass attention for prefill phase.
-
- * Each (kv_head, token_group) task is threaded; within each task,
-
- * single tensor_parallel_for() call threads the whole layer's attention
-
- * at once (previously this was a fresh, unthreaded, F32-dequanting
-
- * reimplementation that also scored the full [0, n_kv) range before
-
 static void prefill_attn_task(int flat_idx, void *ctx_ptr) {
     prefill_attn_ctx_t *ctx = (prefill_attn_ctx_t *)ctx_ptr;
     int bi = flat_idx / ctx->n_heads;
@@ -465,7 +453,10 @@ static void batch_attention_tiled(
         size_t kv_head_stride_k, size_t kv_head_stride_v,
         float attn_scale);
 
-static void batch_attention_layer(
+/* Forward declaration for callback to tensor_parallel_for */
+static void prefill_attn_task(int flat_idx, void *ctx_ptr);
+
+void batch_attention_layer(
         float *xb_batch, const float *q_batch,
         const uint8_t *kcache, const uint8_t *vcache,
         int n_tokens, int start_pos,
