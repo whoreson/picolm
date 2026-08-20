@@ -140,10 +140,10 @@ static inline float hreduce256_ps(__m256 a) {
 }
 #endif
 
-/* ---- aligned_alloc polyfill for systems without it (FreeBSD 8.4, macOS PPC) ---- */
-#ifndef HAVE_ALIGNED_ALLOC
-/* aligned_alloc is C11; provide fallback for C99 / old macOS / FreeBSD 8.4.
- * valloc returns page-aligned memory (4096), which satisfies any alignment
+/* ---- aligned_alloc polyfill for C99 / old macOS PPC (FreeBSD 8.4) ---- */
+/* Android (API 28+) and modern Linux provide aligned_alloc natively. */
+#if !defined(__STDC_VERSION__) || __STDC_VERSION__ < 201112L
+/* valloc returns page-aligned memory (4096), which satisfies any alignment
  * up to a page. All current callers ask for 64-byte alignment.
  * valloc'd memory is free()-able like any other malloc'd memory. */
 #define aligned_alloc(a, s) valloc((s) + (a) - 1)
