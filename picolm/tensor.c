@@ -406,7 +406,12 @@ typedef struct {
 
 static generic_task_t  generic_tasks[MAX_THREADS];
 static volatile int    pool_mode = 0; /* 0 = matmul_task_t, 1 = generic_task_t */
-static __thread int    pool_my_tid = 0; /* TLS: current thread's pool index (0 for main) */
+#if defined(_WIN32) || defined(__APPLE__)
+/* MSVC and old Mac OS X don't support __thread */
+static int             pool_my_tid = 0;
+#else
+static __thread int    pool_my_tid = 0;
+#endif /* TLS: current thread's pool index (0 for main) */
 
 /* Return current thread's pool index (0 for main thread, 1..n-1 for workers) */
 int tensor_get_thread_id(void) {
@@ -1708,6 +1713,8 @@ void matmul_mm_id_down(float *down_out,
      * q8_per_token = moe_q8_buf_per_token from run_state_t. */
 
     if (n_tokens <= 0 || n_used <= 0 || dim <= 0 || n_ff <= 0) return;
+
+    (void)exp_down_qx_d_all;
 
     size_t row_bytes = gguf_type_row_size(type, n_ff);
     size_t dnb = n_ff / 32;

@@ -1007,7 +1007,9 @@ int main(int argc, char **argv) {
     if (n_prompt > 0) {
         /* All models use model_forward_prefill.
          * SSM models: batched by default, use --ssm-serial for per-token path. */
+        #ifdef PICOLM_GPU
         int gpu_prefill_used = 0;
+#endif
 #ifdef PICOLM_GPU
         if (model.gpu.kv_active) {
             logits = model_forward_prefill_gpu(&model, prompt_tokens, n_prompt, start_pos, NULL);

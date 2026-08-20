@@ -19,6 +19,19 @@
 #undef vec_add
 #endif
 
+/* Mac OS X uses MAP_ANON instead of MAP_ANONYMOUS */
+#if defined(__APPLE__) && !defined(MAP_ANONYMOUS)
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+
+/* aligned_alloc is C11; provide fallback for C99 / old macOS */
+#if !defined(__STDC_VERSION__) || __STDC_VERSION__ < 201112L
+/* valloc returns page-aligned memory (4096), which satisfies any
+ * alignment up to a page. All current callers ask for 64-byte alignment.
+ * valloc'd memory is free()-able like any other malloc'd memory. */
+#define aligned_alloc(a, s) valloc((s) + (a) - 1)
+#endif
+
 #include <stdio.h>
 #include <assert.h>
 #include <inttypes.h>
@@ -87,6 +100,12 @@ static unsigned char _f16swap_mask[16] __attribute__((aligned(64))) =
 static vector unsigned char _f16swap_vmask;
 
 static void swap_f16_block(uint16_t *dst, size_t n) {
+    /* Lazily initialize the permute mask from the static array */
+    static int initialized = 0;
+    if (!initialized) {
+        _f16swap_vmask = vec_ld(0, (const unsigned char *)_f16swap_mask);
+        initialized = 1;
+    }
     vector unsigned char vm = _f16swap_vmask;
     size_t i;
     for (i = 0; i + 8 <= n; i += 8) {
@@ -600,6 +619,9 @@ static int mmap_one_file(split_mmap_t *s, const char *path) {
     struct stat st;
     fstat(fd, &st);
     s->mmap_size = (size_t)st.st_size;
+    /* PROT_READ only: PROT_WRITE causes COW fault storms over CIFS/NFS on
+     * large models (see 9c1b3a5). PPC big-endian needs write access for the
+     * in-place byte-swap loop; it uses mprotect() around the swap region. */
     void *addr = mmap(NULL, s->mmap_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (addr == MAP_FAILED) {
         fprintf(stderr, "mmap failed for split file %s: %s\n", path, strerror(errno));
@@ -1692,10 +1714,27 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                 cfg->n_layer_kv_from_start, (double)cfg->f_final_logit_softcapping);
     }
     /* On big-endian, GGUF stores all multi-byte values as little-endian.
-     * Swap F16 values in-place for all quantized block types that contain FP16 scales. */
+     * Swap F16 values in-place for all quantized block types that contain FP16 scales.
+     *
+     * The mmap is PROT_READ (COW mappings over CIFS fail with PROT_WRITE on
+     * low-RAM machines; see 9c1b3a5). We temporarily mprotect each split to
+     * PROT_READ|PROT_WRITE for the swap loop, then restore PROT_READ. */
 #if defined(__APPLE__) && defined(__ppc__)
     { int be_start = clock();
     fprintf(stderr, "Big-endian: swapping F16 values...\n");
+
+    /* Temporarily make all split mmap regions writable for in-place byte swap.
+     * We must do this because GGUF stores all multi-byte values in LE, and the
+     * quantized block scales (FP16) need swapping. Original commit 6ddcd2d used
+     * PROT_READ|PROT_WRITE from the start; 9c1b3a5 changed to PROT_READ for
+     * CIFS compatibility, so we use mprotect around the swap. */
+    for (int _si = 0; _si < m->n_splits; _si++) {
+        if (m->splits[_si].mmap_addr && m->splits[_si].mmap_size > 0) {
+            mprotect(m->splits[_si].mmap_addr, m->splits[_si].mmap_size,
+                     PROT_READ | PROT_WRITE);
+        }
+    }
+
     for (uint64_t i = 0; i < total_tensor_count; i++) {
         gguf_type_t qt = (gguf_type_t)tinfos[i].type;
         int _si = tinfos[i].split_idx;
@@ -1751,6 +1790,13 @@ static int parse_gguf(model_t *m, int max_seq_len) {
         }
     }
     fprintf(stderr, "Big-endian: swap done (%.0fms)\n", (clock() - be_start) / (double)CLOCKS_PER_SEC * 1000);
+
+    /* Restore mmap regions to read-only */
+    for (int _si = 0; _si < m->n_splits; _si++) {
+        if (m->splits[_si].mmap_addr && m->splits[_si].mmap_size > 0) {
+            mprotect(m->splits[_si].mmap_addr, m->splits[_si].mmap_size, PROT_READ);
+        }
+    }
 }
 #endif
 
@@ -5379,7 +5425,6 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
             /* per_layer_proj: [n_embd_altup, n_embd] */
             if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
                 /* Check per_layer_proj weight at row 1331 */
-                float max_w = 0; int max_w_row = 0;
                 for(int i=0;i<n_embd_altup;i++) {
                     /* per_layer_proj is [n_embd_altup, n_embd] = [256, 2048], row i is at offset i*n_embd */
                     /* matmul computes out[d] = sum_j x[j] * W[d * n_embd_altup + j] */
@@ -7323,6 +7368,7 @@ static void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
                         layer_weights_t *lw, int il, int pos, void *gpu_lw) {
 #ifndef PICOLM_GPU
     (void)gpu_lw;
+    (void)pos;
 #endif
     model_config_t *c = &m->config;
     int dim = c->n_embd;
@@ -9045,6 +9091,7 @@ static void batch_attention_tiled(
  * Device-native batched SSM prefill layer (zero H2D/D2H)
  * ================================================================ */
 #define SSM_DBG_SYNC /* disabled */
+#ifdef PICOLM_GPU
 static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
     float *bx, float *bxb, float *bq, float *battn_out, float *bffn_norm,
     float *bgate, float *bup, layer_weights_t *lw, int l,
@@ -9543,6 +9590,7 @@ static int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
     return 0;
 #endif
 }
+#endif /* PICOLM_GPU */
 
 /* ================================================================
  * Batched SSM prefill layer.
@@ -9562,6 +9610,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
     int bi;
     (void)gpu_lw;
     (void)xb_batch; /* not used: SSM layer uses local ssm_xb buffer */
+    (void)start_pos;
     model_config_t *c = &m->config;
     int dim = c->n_embd;
     int d_state = c->ssm_d_state;
@@ -9613,7 +9662,6 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
     }
 #endif
     if (l <= 1 && n_tokens > 0) {
-        float vd = vec_dot(lw->attn_qkv, ssm_xb, dim, lw->type_attn_qkv);
         /* Check activation values */
         float amax = 0, amin = 0;
         int isnan_cnt = 0;

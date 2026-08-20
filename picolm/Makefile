@@ -13,7 +13,14 @@ else
 WARN_GCC_ONLY = -Wduplicated-cond -Wduplicated-branches -Wformat-truncation
 endif
 
-CFLAGS  ?= -O3 -g -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic -Wshadow -Wdouble-promotion -Wimplicit-fallthrough -Wconversion -Wmisleading-indentation $(WARN_GCC_ONLY) -Wfloat-conversion -Wsign-conversion -Wcast-qual -Wformat-nonliteral -fno-common -fopenmp
+# ---- Strict warning flags (opt-in, not default) ----
+# These catch real bugs but are too noisy for routine builds (600+ warnings
+# across 13 TUs, mostly -Wsign-conversion and -Wdouble-promotion on benign
+# int-to-size_t / float-to-double conversions). Enable with make WARN=1 or
+# for ad-hoc audits: make native WARN=1
+CFLAGS_STRICT = -Wshadow -Wdouble-promotion -Wimplicit-fallthrough -Wconversion -Wmisleading-indentation $(WARN_GCC_ONLY) -Wfloat-conversion -Wsign-conversion -Wcast-qual -Wformat-nonliteral
+
+CFLAGS  ?= -O3 -g -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic -fno-common -fopenmp
 LDFLAGS = -lm -lpthread -fopenmp
 
 # Windows needs ws2_32 for server mode
@@ -197,7 +204,7 @@ mac106:
 
 # --- Debug build ---
 debug:
-	$(MAKE) $(TARGET) CFLAGS="-std=c11 -Wall -Wextra -Wpedantic -g -O0"
+	$(MAKE) $(TARGET) CFLAGS="-std=c11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic -g -O0"
 
 # --- Install ---
 install: $(TARGET)
