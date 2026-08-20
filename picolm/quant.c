@@ -99,7 +99,7 @@ float fp16_to_fp32(uint16_t h) {
 
     uint32_t exp_offset = 0xE0U << 23;
     float exp_scale;
-    memcpy(&exp_scale, "\x00\x00\x80\x07", sizeof(float)); /* 0x07800000 = 2^-112 */
+    { uint32_t escale = 0x07800000U; memcpy(&exp_scale, &escale, sizeof(float)); } /* 0x07800000 = 2^-112 */
     float normalized_value;
     { uint32_t nbits = (two_w >> 4) + exp_offset; memcpy(&normalized_value, &nbits, sizeof(float)); }
     normalized_value *= exp_scale;
