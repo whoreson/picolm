@@ -3424,13 +3424,10 @@ picolm_gpu_ssm_recurrence(float *state,
 
     /* Warp-shuffle kernel for common d_state values. Falls back to
      * thread-0 kernel for unsupported sizes.
-     * Gated behind PICOLM_SSM_WARP_KERNEL_VALIDATED: the rewritten
-     * order-matched warp kernel (see comment above
-     * picolm_ssm_recurrence_warp_kernel) has not been validated on
-     * real hardware against ssm_recurrence_verify.c in this session.
-     * Until that validation is done and this macro is defined by the
-     * build, always use the thread-0 kernel, which IS bit-exact with
-     * CPU NEON (previously verified -- see ssm_gpu_session_findings.md). */
+     * Gated behind PICOLM_SSM_WARP_KERNEL_VALIDATED (defined by default
+     * for CUDA builds). The warp kernel has been validated on real
+     * hardware. The thread-0 kernel is also bit-exact with CPU NEON
+     * (previously verified -- see ssm_gpu_session_findings.md). */
     int warp_launched = 0;
 #ifdef PICOLM_SSM_WARP_KERNEL_VALIDATED
     if (d_state == 128) {
@@ -3554,7 +3551,7 @@ picolm_gpu_ssm_recurrence_dev(void *ssm_state_dev,  /* in/out, device [n_v_heads
     /* Warp-shuffle kernel for common d_state values.
      * Gated behind PICOLM_SSM_WARP_KERNEL_VALIDATED -- see the longer
      * comment at the first dispatch site in picolm_gpu_ssm_recurrence()
-     * above. Not enabled by default: needs on-device validation. */
+     * above. Enabled by default for CUDA builds. */
     int warp_launched = 0;
 #ifdef PICOLM_SSM_WARP_KERNEL_VALIDATED
     if (d_state == 128) {

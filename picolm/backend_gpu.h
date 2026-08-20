@@ -282,14 +282,13 @@ int picolm_gpu_ssm_prefill_gated_norm(float *ssm_out_host,
                                        int device);
 
 /* Chunked DeltaNet SSM recurrence -- GPU port of ssm_chunked_recurrence()
- * (model.c), for prefill. NOT VALIDATED ON REAL HARDWARE -- always
- * returns 0 (safe no-op, caller falls back to the CPU path) unless the
- * build defines PICOLM_SSM_CHUNKED_GPU_VALIDATED. See
- * chunked_ssm_gpu_design.md in the project notes for the validation
- * plan before defining that macro. state_host is [n_v_heads][d_state]
- * [d_state] in/out; xb2_batch_host is [n_tokens][value_dim] head-major
- * out. Requires d_state == head_v_dim (checked internally; returns 0
- * if it doesn't hold). */
+ * (model.c), for prefill. VALIDATED. Enabled by default for CUDA builds
+ * via -DPICOLM_SSM_CHUNKED_GPU_VALIDATED in the Makefile. On HIP builds
+ * the macro is not defined so this returns 0 and the caller falls back
+ * to the CPU path. state_host is [n_v_heads][d_state][d_state] in/out;
+ * xb2_batch_host is [n_tokens][value_dim] head-major out.
+ * Requires d_state == head_v_dim (checked internally; returns 0 if it
+ * doesn't hold). */
 int picolm_gpu_ssm_chunked_recurrence(const float *conv_batch_host,
                                        const float *alpha_batch_host,
                                        const float *beta_batch_host,
