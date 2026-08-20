@@ -10,11 +10,25 @@
 #include <stdio.h>
 #include <string.h>
 
-/* DJGPP runtime globals (normally provided by stubify) */
+/* DJGPP runtime globals (normally provided by stubify).
+ * Declared as COMMON (uninitialized) so the linker places them in BSS.
+ * The DJGPP go32 extender patches these at runtime with real values
+ * (DPMI base address, data segment selector, stack boundaries, etc.).
+ * This is the cross-platform substitute for stubify.exe which can't
+ * run on Linux build hosts. */
 struct _reent;
-struct _reent *_impure_ptr = NULL;
-char **_environ = NULL;
-const unsigned char _ctype_[257] = {0};
+struct _reent *_impure_ptr;
+char **_environ;
+unsigned char _ctype_[257];
+unsigned long ___djgpp_base_address;
+unsigned long ___djgpp_ds_alias;
+unsigned long ___djgpp_stack_top;
+unsigned long ___djgpp_stack_limit;
+unsigned long ___djgpp_selector_limit;
+unsigned long _stklen;
+unsigned long _crt0_startup_flags;
+unsigned long _crt0_init_mcount;
+unsigned long _stubinfo;
 
 int *__errno(void) {
     static int errno_val;
