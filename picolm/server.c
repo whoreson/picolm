@@ -3077,7 +3077,7 @@ static void handle_tokenize(SOCKET sock, const char *request_body) {
 
     (void)parse_special; /* BPE tokenizer doesn't need special token parsing */
 
-    int max_tokens = 4096;
+    int max_tokens = (int)(strlen(content) + 1); /* 1 char >= 1 token */
     int *tokens = (int *)malloc((size_t)max_tokens * sizeof(int));
     int n_tokens = 0;
 
