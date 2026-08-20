@@ -3533,7 +3533,7 @@ void gemm_q4_0_4x8_q8_0(const void *W, const void *X, int n,
 
 float vec_dot_q8_0_q8_0_deltas(const void *qx, const float *qx_d, const void *qw, int n) {
     static int vd_cnt = 0;
-    if (++vd_cnt <= 5) fprintf(stderr, "WARN: vec_dot_q8_0_q8_0_deltas called (call #%d, n=%d)\n", vd_cnt, n);
+    if (++vd_cnt <= 5 && getenv("PICOLM_GPU")) fprintf(stderr, "WARN: vec_dot_q8_0_q8_0_deltas called (call #%d, n=%d)\n", vd_cnt, n);
     const block_q8_0 *x = (const block_q8_0 *)qx;
     const block_q8_0 *w = (const block_q8_0 *)qw;
     int nb = n / 32;
