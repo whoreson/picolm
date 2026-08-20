@@ -1609,7 +1609,7 @@ static int parse_gguf(model_t *m, int max_seq_len) {
                     fprintf(stderr, "DBG per_layer_model_proj type=%d\n", qtype);
                 } else if (str_eq(tinfos[i].name, "per_layer_proj_norm.weight")) {
                     w->per_layer_proj_norm = ptr;
-                    fprintf(stderr, "DBG per_layer_proj_norm type=%d\n", qtype);
+                    if (_SSM_DBG) fprintf(stderr, "DBG per_layer_proj_norm type=%d\n", qtype);
                 }
             }
         }
@@ -9627,7 +9627,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
         }
     matmul_batch(qkv_batch, ssm_xb, n_tokens, lw->attn_qkv, dim, conv_dim, lw->type_attn_qkv);
     tensor_set_repacked(NULL);
-    if (l == 0) {
+    if (l == 0 && _SSM_DBG) {
         float qkv_rms=0; float qkv_v[4];
         for (int i=0;i<4;i++) qkv_v[i]=qkv_batch[(n_tokens-1)*conv_dim+i];
         for (int i=0;i<4;i++) qkv_rms += qkv_v[i]*qkv_v[i];
@@ -9997,7 +9997,7 @@ static void ssm_prefill_layer(model_t *m, run_state_t *s,
             }
         }
     }
-    if (l == 0) {
+    if (l == 0 && _SSM_DBG) {
         float gn_rms=0; float gn_v[4];
         for (int i=0;i<4;i++) { gn_v[i]=xb2_batch[(n_tokens-1)*value_dim+i]; gn_rms+=gn_v[i]*gn_v[i]; }
         gn_rms = sqrtf(gn_rms/4);
