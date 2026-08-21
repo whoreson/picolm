@@ -1313,8 +1313,12 @@ int picolm_gpu_expert_mlp_dev(picolm_gpu_tensor_t *g, picolm_gpu_tensor_t *u, pi
     if (!gpu_ok(gpuGetLastError(), "expert q8 quantize input (dev)")) return 0;
 
     /* gate = q8_q8_tiled(input_q8, gate_weights) */
-    int use_tiled = (S > 1 && g->row_bytes + 2048 <= 49152);
-    if (use_tiled) {
+    /* gate = q8_q8 matmul(input_q8, gate_weights) */
+    if (ctx->compute_major >= 8 && S >= 16 && I >= 8) {
+        dim3 grid((unsigned)((I + 7) / 8), (unsigned)((S + 15) / 16));
+        picolm_q8_q8_matmul_imma<<<grid,32,0,ctx->stream>>>(
+            ctx->gate, ctx->q8_xq, ctx->q8_xd, g->weights, S, D, I, (int)g->row_bytes, I);
+    } else if (S > 1 && g->row_bytes + 2048 <= 49152) {
         dim3 grid((unsigned)I, (unsigned)((S + Q8_TILE_S - 1) / Q8_TILE_S));
         picolm_q8_q8_matmul_tiled<<<grid,256,(unsigned)g->row_bytes,ctx->stream>>>(
             ctx->gate, ctx->q8_xq, ctx->q8_xd, g->weights, S, D, I, (int)g->row_bytes, I);
@@ -1324,8 +1328,12 @@ int picolm_gpu_expert_mlp_dev(picolm_gpu_tensor_t *g, picolm_gpu_tensor_t *u, pi
     }
     if (!gpu_ok(gpuGetLastError(), "expert q8 gate (dev)")) return 0;
 
-    /* up = q8_q8_tiled(input_q8, up_weights) */
-    if (use_tiled) {
+    /* up = q8_q8 matmul(input_q8, up_weights) */
+    if (ctx->compute_major >= 8 && S >= 16 && I >= 8) {
+        dim3 grid((unsigned)((I + 7) / 8), (unsigned)((S + 15) / 16));
+        picolm_q8_q8_matmul_imma<<<grid,32,0,ctx->stream>>>(
+            ctx->up, ctx->q8_xq, ctx->q8_xd, u->weights, S, D, I, (int)u->row_bytes, I);
+    } else if (S > 1 && u->row_bytes + 2048 <= 49152) {
         dim3 grid((unsigned)I, (unsigned)((S + Q8_TILE_S - 1) / Q8_TILE_S));
         picolm_q8_q8_matmul_tiled<<<grid,256,(unsigned)u->row_bytes,ctx->stream>>>(
             ctx->up, ctx->q8_xq, ctx->q8_xd, u->weights, S, D, I, (int)u->row_bytes, I);
@@ -1344,10 +1352,13 @@ int picolm_gpu_expert_mlp_dev(picolm_gpu_tensor_t *g, picolm_gpu_tensor_t *u, pi
         ctx->q8_xq, ctx->q8_xd, ctx->gate, I, S);
     if (!gpu_ok(gpuGetLastError(), "expert q8 quantize hidden (dev)")) return 0;
 
-    /* y = q8_q8_tiled(hidden_q8, down_weights) */
-    int use_tiled_down = (S > 1 && d->row_bytes + 2048 <= 49152);
+    /* y = q8_q8 matmul(hidden_q8, down_weights) */
     int ys = y_stride > 0 ? y_stride : D;
-    if (use_tiled_down) {
+    if (ctx->compute_major >= 8 && S >= 16 && D >= 8) {
+        dim3 grid((unsigned)((D + 7) / 8), (unsigned)((S + 15) / 16));
+        picolm_q8_q8_matmul_imma<<<grid,32,0,ctx->stream>>>(
+            yd, ctx->q8_xq, ctx->q8_xd, d->weights, S, I, D, (int)d->row_bytes, ys);
+    } else if (S > 1 && d->row_bytes + 2048 <= 49152) {
         dim3 grid((unsigned)D, (unsigned)((S + Q8_TILE_S - 1) / Q8_TILE_S));
         picolm_q8_q8_matmul_tiled<<<grid,256,(unsigned)d->row_bytes,ctx->stream>>>(
             yd, ctx->q8_xq, ctx->q8_xd, d->weights, S, I, D, (int)d->row_bytes, ys);
