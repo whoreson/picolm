@@ -565,7 +565,12 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
         if (!gpu_ok(gpuGetLastError(), "q8 quantize") ||
             !gpu_ok(gpuDeviceSynchronize(), "q8 quantize sync")) return 0;
 
-        if (S > 1 && t->row_bytes + 2048 <= 49152) {
+        size_t imma_shmem = 16 * (size_t)t->row_bytes;
+        if (ctx->compute_major >= 8 && imma_shmem <= 49152U && S >= 16 && O >= 16) {
+            dim3 grid((unsigned)((O + 15) / 16), (unsigned)((S + 15) / 16));
+            picolm_q8_q8_matmul_imma<<<grid, 64, (unsigned)imma_shmem, ctx->stream>>>(
+                ctx->y, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, O);
+        } else if (S > 1 && t->row_bytes + 2048 <= 49152) {
             dim3 grid((unsigned)O, (unsigned)((S + Q8_TILE_S - 1) / Q8_TILE_S));
             picolm_q8_q8_matmul_tiled<<<grid, 256, (unsigned)t->row_bytes, ctx->stream>>>(
                 ctx->y, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, O);
@@ -648,10 +653,20 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
         /* No gpuDeviceSynchronize() needed: quantize kernel is on ctx->stream,
          * matmul kernel is also on ctx->stream. CUDA guarantees in-order execution
          * of kernels on the same stream. */
-        if (S >= Q8_TILE_S && t->row_bytes + 2048 <= 49152) {
-            /* Tiled: load weight row into shared mem once per tile of Q8_TILE_S positions.
-             * Only beneficial when S >= Q8_TILE_S, since for smaller S the shared memory
-             * overhead exceeds the savings from reduced global memory reads. */
+
+        /* Prefer IMMA (Tensor Core) kernel on sm_80+.
+         * Shared memory: 16 * row_bytes (weight row staging for both warps).
+         * For row_bytes up to ~2KB, total ~32KB, well within 48KB/block.
+         * For larger rows, may exceed limit and fall back to tiled scalar.
+         *
+         * Fall back to tiled scalar kernel if shared memory budget exceeded
+         * or arch < sm_80. */
+        size_t imma_shmem = 16 * (size_t)t->row_bytes;
+        if (ctx->compute_major >= 8 && imma_shmem <= 49152U) {
+            dim3 grid((unsigned)((O + 15) / 16), (unsigned)((S + 15) / 16));
+            picolm_q8_q8_matmul_imma<<<grid, 64, (unsigned)imma_shmem, ctx->stream>>>(
+                y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
+        } else if (S >= Q8_TILE_S && t->row_bytes + 2048 <= 49152) {
             dim3 grid((unsigned)O, (unsigned)((S + Q8_TILE_S - 1) / Q8_TILE_S));
             picolm_q8_q8_matmul_tiled<<<grid, 256, (unsigned)t->row_bytes, ctx->stream>>>(
                 y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);

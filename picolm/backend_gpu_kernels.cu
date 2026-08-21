@@ -394,6 +394,187 @@ picolm_q8_q8_matmul_tiled(float *y,
     }
 }
 
+/* ================================================================
+ * Tensor Core Q8_0 x Q8_0 IMMA GEMM Kernel
+ *
+ * Uses mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 (sm_80+).
+ * For sm_70 and HIP: falls back to scalar int8 MAC (same correctness).
+ *
+ * Y[s,o] = sum_i X[s,i] * W[o,i]   (both Q8_0 quantized)
+ *
+ * Block = 64 threads (2 warps). Each warp computes a 16x8 output tile.
+ * Together: 16x16 output tile per block.
+ * Grid: [ceil(O/16), ceil(S/16)]
+ *
+ * Shared memory: 8 * row_bytes per warp (weight row staging).
+ * ================================================================ */
+
+/* IMMA PTX wrapper: m16n8k32 INT8 multiply-accumulate.
+ * D (4 int32, inout) += A (4 int32) @ B (2 int32).
+ * A: 16x32 row-major int8, packed 4 ints8 per int32 register.
+ * B: 32x8 col-major int8, packed 4 int8 per int32 register.
+ * D: 16x8 col-major int32 accumulator. */
+static __device__ __forceinline__ void
+picolm_imma_m16n8k32(int &d0, int &d1, int &d2, int &d3,
+                      const int &a0, const int &a1, const int &a2, const int &a3,
+                      const int &b0, const int &b1) {
+#ifdef __CUDA_ARCH__
+#if __CUDA_ARCH__ >= 800
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+r"(d0), "+r"(d1), "+r"(d2), "+r"(d3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
+    /* sm_70 fallback: scalar int8 MAC over 32 K elements */
+    const int8_t *aa = (const int8_t *)&a0;
+    const int8_t *bb = (const int8_t *)&b0;
+    int lane = gpuThreadIdx_x % 32;
+    int row = lane % 16;
+    int col_base = (lane >= 16) ? 4 : 0;
+    for (int k = 0; k < 32; k++) {
+        d0 += (int)aa[k] * (int)bb[k * 8 + col_base + 0];
+        d1 += (int)aa[k] * (int)bb[k * 8 + col_base + 1];
+        d2 += (int)aa[k] * (int)bb[k * 8 + col_base + 2];
+        d3 += (int)aa[k] * (int)bb[k * 8 + col_base + 3];
+    }
+#endif
+#else
+    /* HIP fallback: scalar */
+    const int8_t *aa = (const int8_t *)&a0;
+    const int8_t *bb = (const int8_t *)&b0;
+    int lane = gpuThreadIdx_x % 32;
+    int col_base = (lane >= 16) ? 4 : 0;
+    for (int k = 0; k < 32; k++) {
+        d0 += (int)aa[k] * (int)bb[k * 8 + col_base + 0];
+        d1 += (int)aa[k] * (int)bb[k * 8 + col_base + 1];
+        d2 += (int)aa[k] * (int)bb[k * 8 + col_base + 2];
+        d3 += (int)aa[k] * (int)bb[k * 8 + col_base + 3];
+    }
+#endif
+}
+
+__global__ void
+picolm_q8_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
+                          const void *weights, int S, int I, int O,
+                          int row_bytes, int y_stride) {
+    int tile_o  = gpuBlockIdx_x * 16;
+    int tile_s  = gpuBlockIdx_y * 16;
+    int tid     = gpuThreadIdx_x;
+    int warp    = tid / 32;       /* 0 or 1 */
+    int lane    = tid % 32;       /* 0..31 */
+
+    /* Each warp handles 8 output columns: warp 0 -> [0..7], warp 1 -> [8..15] */
+    int col_base = tile_o + warp * 8;
+    int ys       = y_stride > 0 ? y_stride : O;
+    int n_blocks = I / 32;
+
+    /* Shared memory: 8 weight rows for this warp (8 * row_bytes each).
+     * Total shared memory: 16 * row_bytes (both warps). */
+    extern __shared__ uint8_t w_sh[];
+    uint8_t *warp_sh = w_sh + (size_t)warp * 8 * row_bytes;
+
+    /* Load 8 weight rows into shared memory (coalesced). */
+    {
+        const uint8_t *src = (const uint8_t *)weights + (size_t)col_base * row_bytes;
+        for (size_t b = lane; b < 8 * (size_t)row_bytes; b += 32) {
+            warp_sh[b] = src[b];
+        }
+        gpuSyncthreads();
+    }
+
+    /* Accumulators: 4 int32 per thread */
+    int acc[4] = {0, 0, 0, 0};
+
+    /* Process K in tiles of 32 (one Q8_0 block per tile).
+     * For each tile: load A from xq, load B from w_sh, IMMA, scale.
+     * Weights are already in shared memory (w_sh), including the FP16 scales
+     * at offset 0-1 of each Q8_0 block. Scales are converted on-the-fly. */
+    for (int kb = 0; kb < n_blocks; kb++) {
+        /* --- Load A tile (16 rows x 32 cols, row-major) ---
+         * Each thread handles one row (row = lane % 16).
+         * Threads 0..15 handle first 16 K-cols, threads 16..31 handle last 16.
+         * Fragment f (0..3): 4 consecutive columns.
+         * Thread l < 16: frags cover cols 0..15 (f*4 .. f*4+3)
+         * Thread l >= 16: frags cover cols 16..31 (f*4+16 .. f*4+19) */
+        int a_row = lane % 16;
+        int a_col0 = (lane >= 16) ? 16 : 0;
+        const int8_t *a_src = xq + (size_t)(tile_s + a_row) * I + kb * 32 + a_col0;
+
+        int a0, a1, a2, a3;
+        {
+            int c0 = a_col0, c1 = a_col0 + 4, c2 = a_col0 + 8, c3 = a_col0 + 12;
+            a0 = ((uint32_t)(uint8_t)a_src[c0])     | (((uint32_t)(uint8_t)a_src[c0+1]) << 8) |
+                 (((uint32_t)(uint8_t)a_src[c0+2]) << 16) | (((uint32_t)(uint8_t)a_src[c0+3]) << 24);
+            a1 = ((uint32_t)(uint8_t)a_src[c1])     | (((uint32_t)(uint8_t)a_src[c1+1]) << 8) |
+                 (((uint32_t)(uint8_t)a_src[c1+2]) << 16) | (((uint32_t)(uint8_t)a_src[c1+3]) << 24);
+            a2 = ((uint32_t)(uint8_t)a_src[c2])     | (((uint32_t)(uint8_t)a_src[c2+1]) << 8) |
+                 (((uint32_t)(uint8_t)a_src[c2+2]) << 16) | (((uint32_t)(uint8_t)a_src[c2+3]) << 24);
+            a3 = ((uint32_t)(uint8_t)a_src[c3])     | (((uint32_t)(uint8_t)a_src[c3+1]) << 8) |
+                 (((uint32_t)(uint8_t)a_src[c3+2]) << 16) | (((uint32_t)(uint8_t)a_src[c3+3]) << 24);
+        }
+
+        /* --- Load B tile (32 rows x 8 cols, col-major) ---
+         * B[row, col] = weight[col][kb*32 + row] for col=0..7, row=0..31.
+         * Thread lane l (0..31) = row within B.
+         * Fragment 0: cols 0..3, Fragment 1: cols 4..7. */
+        int w_off = kb * GPU_BLOCK_Q8_0_SIZE + 2;  /* offset of int8 data in this block */
+        int row = lane;
+        int b0, b1;
+        {
+            int8_t bv[8];
+            bv[0] = (int8_t)warp_sh[0 * row_bytes + w_off + row];
+            bv[1] = (int8_t)warp_sh[1 * row_bytes + w_off + row];
+            bv[2] = (int8_t)warp_sh[2 * row_bytes + w_off + row];
+            bv[3] = (int8_t)warp_sh[3 * row_bytes + w_off + row];
+            bv[4] = (int8_t)warp_sh[4 * row_bytes + w_off + row];
+            bv[5] = (int8_t)warp_sh[5 * row_bytes + w_off + row];
+            bv[6] = (int8_t)warp_sh[6 * row_bytes + w_off + row];
+            bv[7] = (int8_t)warp_sh[7 * row_bytes + w_off + row];
+            b0 = ((uint32_t)(uint8_t)bv[0]) | (((uint32_t)(uint8_t)bv[1]) << 8) |
+                 (((uint32_t)(uint8_t)bv[2]) << 16) | (((uint32_t)(uint8_t)bv[3]) << 24);
+            b1 = ((uint32_t)(uint8_t)bv[4]) | (((uint32_t)(uint8_t)bv[5]) << 8) |
+                 (((uint32_t)(uint8_t)bv[6]) << 16) | (((uint32_t)(uint8_t)bv[7]) << 24);
+        }
+
+        /* --- IMMA --- */
+        picolm_imma_m16n8k32(acc[0], acc[1], acc[2], acc[3], a0, a1, a2, a3, b0, b1);
+
+        /* --- Apply scales ---
+         * For each of the 4 D fragments:
+         *   row = lane % 16, col = (lane>=16?4:0) + frag_idx
+         *   scale = xd[tile_s + row][kb] * dw[col][kb]
+         * dw is extracted from w_sh on-the-fly: FP16 at offset kb*GPU_BLOCK_Q8_0_SIZE
+         * of each weight row. */
+        float dx = xd[(size_t)(tile_s + a_row) * n_blocks + kb];
+        int col_off = (lane >= 16) ? 4 : 0;
+        int wb_base = kb * GPU_BLOCK_Q8_0_SIZE;  /* base offset of scale in this block */
+        for (int f = 0; f < 4; f++) {
+            int wc = col_off + f;
+            uint16_t wd_raw = warp_sh[wc * row_bytes + wb_base] |
+                              ((uint16_t)warp_sh[wc * row_bytes + wb_base + 1] << 8);
+            float dw = gpu_fp16_to_fp32(wd_raw);
+            acc[f] = (int)((float)acc[f] * dx * dw);
+        }
+    }
+
+    /* --- Write output ---
+     * D fragment f of thread l: row = l%16, col = (l>=16?4:0) + f
+     * y[(tile_s + row) * ys + (col_base + col)] = (float)acc[f]
+     * Guard against out-of-bounds when S or O not multiple of 16. */
+    {
+        int row = lane % 16;
+        int col_off = (lane >= 16) ? 4 : 0;
+        for (int f = 0; f < 4; f++) {
+            int r = tile_s + row;
+            int c = col_base + col_off + f;
+            if (r < S && c < O) {
+                y[(size_t)r * ys + (size_t)c] = (float)acc[f];
+            }
+        }
+    }
+}
+
 /* lines 430-437 from backend_gpu_kernels.cuh */
 __global__ void
 picolm_silu_mul(float *gate, const float *up, size_t n) {
