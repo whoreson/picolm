@@ -1,6 +1,13 @@
 // backend_gpu_host_misc.cu - KV cache, pipeline, attention, rmsnorm, rope, residual, misc
 #include "backend_gpu_kernels.cuh"
 
+/* Static globals (were file-static in monolithic backend_gpu.cu) */
+static uint16_t *g_kv_k_dev[PICOLM_GPU_MAX_DEVICES];
+static uint16_t *g_kv_v_dev[PICOLM_GPU_MAX_DEVICES];
+static size_t g_kv_k_cap[PICOLM_GPU_MAX_DEVICES];
+static size_t g_kv_v_cap[PICOLM_GPU_MAX_DEVICES];
+static float *g_verify_buf_dev[PICOLM_GPU_MAX_DEVICES];
+extern "C" int
 picolm_gpu_kv_alloc(size_t kv_k_bytes, size_t kv_v_bytes, int device) {
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!select_ctx(ctx)) return 0;
@@ -1172,6 +1179,7 @@ picolm_gpu_memcpy_async(void *dst, const void *src, size_t bytes, int dir, int d
                                        gpuMemcpyDeviceToDevice;
     return gpu_ok(gpuMemcpyAsync(dst, src, bytes, kind, ctx->stream), "pipeline memcpy async");
 }
+extern "C"
 int picolm_gpu_ssm_conv1d_batch_dev(float *od, float *sd, const float *id, const float *wd,
     int cd, int dc, int nt, int dev, int stride) {
     if(cd<1||dc<1||nt<1) return 0;
@@ -1183,6 +1191,7 @@ int picolm_gpu_ssm_conv1d_batch_dev(float *od, float *sd, const float *id, const
     return gpu_ok(gpuGetLastError(),"conv1d batch dev");
 }
 
+extern "C"
 int picolm_gpu_ssm_l2norm_batch_dev(float *xd, int hd, int nh, int nt, int ts, float eps, float es, int dev) {
     if(hd<1||nh<1||hd>256||nt<1) return 0;
     gpu_device_ctx_t *ctx = find_ctx(dev);
@@ -1191,6 +1200,7 @@ int picolm_gpu_ssm_l2norm_batch_dev(float *xd, int hd, int nh, int nt, int ts, f
     return gpu_ok(gpuGetLastError(),"l2norm batch dev");
 }
 
+extern "C"
 int picolm_gpu_ssm_vecdot_batch_dev(float *od, const float *xd, const void *wd, gguf_type_t qt,
     int dim, int nvh, int nt, int rb, const int *hm, int dev, int in_stride, int out_stride) {
     if(nvh<=0||dim<=0||nt<=0) return 0;
@@ -1201,6 +1211,7 @@ int picolm_gpu_ssm_vecdot_batch_dev(float *od, const float *xd, const void *wd, 
     return gpu_ok(gpuGetLastError(),"vecdot batch dev");
 }
 
+extern "C"
 int picolm_gpu_ssm_prefill_gated_norm_dev(float *od, const float *zd, const float *nd,
     int hd, int nh, int nt, float eps, int so_stride, int z_stride, int dev) {
     if(hd<1||nh<1||nt<1) return 0;
@@ -1222,6 +1233,7 @@ picolm_gpu_ssm_head_permute_batch_kernel(float *dst, const float *src,
         dst[(size_t)t * dst_stride + h * head_dim + d] = src[(size_t)t * src_stride + gh * head_dim + d];
 }
 
+extern "C"
 int picolm_gpu_ssm_head_permute_batch_dev(float *dd, const float *sd, const int *hm,
     int hd, int nh, int nt, int ss, int ds, int dev) {
     gpu_device_ctx_t *ctx = find_ctx(dev);
@@ -1248,6 +1260,7 @@ picolm_ssm_gate_beta_batch_kernel(float *ge, float *be,
     be[t*s+h] = 1.0f/(1.0f+expf(-bi[t*s+h]));
 }
 
+extern "C"
 int picolm_gpu_ssm_gate_beta_batch_dev(float *ge, float *be, const float *ai, const float *bi,
     const float *dw, const float *aw, int nvh, int nt, int dev, int stride) {
     gpu_device_ctx_t *ctx = find_ctx(dev);
@@ -1256,6 +1269,7 @@ int picolm_gpu_ssm_gate_beta_batch_dev(float *ge, float *be, const float *ai, co
     return gpu_ok(gpuGetLastError(),"gate beta batch dev");
 }
 
+extern "C"
 int picolm_gpu_expert_mlp_dev(picolm_gpu_tensor_t *g, picolm_gpu_tensor_t *u, picolm_gpu_tensor_t *d,
     float *yd, const float *xd, int S, int x_stride, int y_stride, int dev) {
     if(!g||!u||!d||!xd||!yd||S<1) return 0;
@@ -1344,6 +1358,7 @@ int picolm_gpu_expert_mlp_dev(picolm_gpu_tensor_t *g, picolm_gpu_tensor_t *u, pi
     return gpu_ok(gpuGetLastError(), "expert MLP dev");
 }
 
+extern "C"
 int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv_dev, const float *alpha_dev,
     const float *beta_dev, float *state_dev, float *xb2_dev,
     int n_tokens, int value_dim, int xb2_stride,

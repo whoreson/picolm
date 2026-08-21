@@ -1,6 +1,7 @@
 // backend_gpu_host_ssm.cu - SSM GPU functions (recurrence, conv1d, gated_norm, vecdot, etc.)
 #include "backend_gpu_kernels.cuh"
 
+extern "C" int
 picolm_gpu_ssm_recurrence(float *state,
                            const float *q_conv,
                            const float *k_conv,

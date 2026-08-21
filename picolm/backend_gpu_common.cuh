@@ -1,3 +1,6 @@
+#ifndef BACKEND_GPU_COMMON_CUH
+#define BACKEND_GPU_COMMON_CUH
+
 /* backend_gpu.cu
  *
  * CUDA/HIP backend for PicoLM. Single source compiled with hipcc (ROCm) or
@@ -229,9 +232,33 @@ __host__ __device__ PICOLM_UNUSED static inline unsigned short gpu_fp32_to_fp16(
  * and produced garbage output. */
 
 /* ---- Forward declarations for cross-module host calls ---- */
+typedef struct {
+    int device; int compute_major, compute_minor;
+    float *x, *y, *gate, *up;
+    size_t x_cap, y_cap, gate_cap, up_cap;
+    float *host_x, *host_y;
+    size_t host_x_cap, host_y_cap;
+    int8_t *q8_xq; float *q8_xd;
+    size_t q8_xq_cap, q8_xd_cap;
+    gpuStream_t stream;
+    size_t tensor_count, tensor_bytes;
+    float *pipe_x, *pipe_xb, *pipe_q, *pipe_k, *pipe_v,
+          *pipe_attn_out, *pipe_ffn_norm, *pipe_gate, *pipe_up;
+    int pipe_ready;
+    float *attn_partial; size_t attn_partial_cap;
+    float *pipe_x_b, *pipe_xb_b, *pipe_q_b, *pipe_k_b, *pipe_v_b,
+          *pipe_attn_out_b, *pipe_ffn_norm_b, *pipe_gate_b, *pipe_up_b;
+    int pipe_b_ready;
+    float *ssm_qkv_raw, *ssm_conv_out, *ssm_xb2, *ssm_xb2_remap,
+          *ssm_v_remap, *ssm_alpha_raw, *ssm_beta_raw, *ssm_gate_exp,
+          *ssm_beta, *ssm_output, *ssm_final_output;
+    int ssm_ready;
+    float *ssm_prefill_scratch; size_t ssm_prefill_scratch_cap;
+    void *rmsnorm_w_dev[64]; const void *rmsnorm_w_keys[64];
+    int rmsnorm_w_n;
+} gpu_device_ctx_t;
 extern gpu_device_ctx_t g_gpu_ctx[PICOLM_GPU_MAX_DEVICES];
 extern int g_nctx;
-
 static inline int gpu_ok(gpuError_t err, const char *what) {
     if (err != gpuSuccess) {
         fprintf(stderr, "[GPU] %s: %d %s\n", what, (int)err, gpuGetErrorString(err));
@@ -267,3 +294,5 @@ extern int reserve(float **ptr, size_t *cap, size_t bytes);
 PICOLM_UNUSED extern int reserve_pinned(float **ptr, size_t *cap, size_t bytes);
 extern int reserve_i8(int8_t **ptr, size_t *cap, size_t bytes);
 extern int ssm_batch_scratch_ensure(void **buf, size_t *cap, size_t need);
+
+#endif /* BACKEND_GPU_COMMON_CUH */

@@ -109,6 +109,7 @@ int reserve_i8(int8_t **ptr, size_t *cap, size_t bytes) {
 
 /* ---- Public API ---- */
 
+extern "C"
 int picolm_gpu_init(const int *devices, int count) {
     int available = 0;
     if (!devices || count < 1 || count > PICOLM_GPU_MAX_DEVICES) return 0;
@@ -161,6 +162,7 @@ int picolm_gpu_init(const int *devices, int count) {
     return 1;
 }
 
+extern "C"
 void picolm_gpu_shutdown(void) {
     /* Free KV cache allocations */
     picolm_gpu_kv_free();
@@ -209,12 +211,15 @@ static PICOLM_UNUSED int is_unified_memory(void) {
 #endif
 }
 
+extern "C"
 int picolm_gpu_device_count(void) { return g_nctx; }
 
+extern "C"
 int picolm_gpu_device_at(int index) {
     return index >= 0 && index < g_nctx ? g_gpu_ctx[index].device : -1;
 }
 
+extern "C"
 int picolm_gpu_mem_info(int device, size_t *free_bytes, size_t *total_bytes) {
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!free_bytes || !total_bytes || !select_ctx(ctx)) return 0;
@@ -242,6 +247,7 @@ static int gguf_block_size(gguf_type_t qtype) {
     }
 }
 
+extern "C"
 int picolm_gpu_tensor_upload(void **tensor,
                               const void *weights,
                               gguf_type_t qtype, int I, int O, int device) {
@@ -427,6 +433,7 @@ extern "C" void picolm_gpu_debug_tensor(const char *name, void *tp, int device, 
 }
 #endif /* PICOLM_SSM_VERIFY */
 
+extern "C"
 void picolm_gpu_tensor_free(picolm_gpu_tensor_t *t) {
     if (!t) return;
     gpu_device_ctx_t *ctx = find_ctx(t->device);
@@ -447,10 +454,12 @@ void picolm_gpu_tensor_free(picolm_gpu_tensor_t *t) {
     free(t);
 }
 
+extern "C"
 size_t picolm_gpu_tensor_bytes(const picolm_gpu_tensor_t *t) {
     return t ? t->row_bytes * (size_t)t->O : 0;
 }
 
+extern "C"
 int picolm_gpu_tensor_device(const picolm_gpu_tensor_t *t) {
     return t ? t->device : -1;
 }
@@ -491,6 +500,7 @@ void *picolm_gpu_alloc_device(size_t bytes, int device) {
 }
 
 /* Device memory set to value. Uses gpuMemset (zero-fill). */
+extern "C"
 int picolm_gpu_device_memset(void *dev_ptr, int value, size_t bytes, int device) {
     if (!dev_ptr || bytes < 1) return 0;
     gpu_device_ctx_t *ctx = find_ctx(device);
@@ -513,6 +523,7 @@ void *picolm_gpu_upload_int(const int *host, size_t n, int device) {
     return dev;
 }
 
+extern "C"
 int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, int device) {
     if (!t || !y || !x || S < 1) return 0;
     /* Minimum I for GPU to be worthwhile vs CPU kernel launch overhead.
@@ -708,6 +719,7 @@ picolm_gpu_matmul_dev_strided(picolm_gpu_tensor_t *t, float *y_dev,
     return 1;
 }
 
+extern "C"
 int picolm_gpu_expert_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
                            picolm_gpu_tensor_t *down, float *y, const float *x, int S) {
     if (!gate || !up || !down || !x || !y || S < 1 ||
@@ -814,6 +826,7 @@ int picolm_gpu_expert_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
     return gpu_ok(gpuMemcpy(y, ctx->y, xb, gpuMemcpyDeviceToHost), "expert output");
 }
 
+extern "C"
 int picolm_gpu_w4a16_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
                           picolm_gpu_tensor_t *down, float *y, const float *x, int S) {
 #ifdef PICOLM_GPU_WMMA_AVAILABLE
@@ -866,6 +879,7 @@ int picolm_gpu_w4a16_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
  * M = rows (S in our convention), K = columns (I), N = output (O)
  * Returns 1 on success, 0 to fall back to quant_matmul.
  * Constraints: qtype must be Q4_0, N%64==0, M%16==0, K%32==0. */
+extern "C"
 int picolm_gpu_w4a16_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, int device) {
 #ifdef PICOLM_GPU_WMMA_AVAILABLE
     if (!t || !y || !x || S < 1 || t->qtype != 2) return 0; /* Q4_0 only */

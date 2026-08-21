@@ -57,7 +57,7 @@ HIP_LIBS = -lamdhip64
 GPU_OBJS =
 
 # GPU host .cu sources (backend_gpu.cu has been split into modular files)
-GPU_SRCS = backend_gpu_host_core.cu backend_gpu_host_ssm.cu backend_gpu_host_misc.cu
+GPU_SRCS = backend_gpu_kernels.cu backend_gpu_host_core.cu backend_gpu_host_ssm.cu backend_gpu_host_misc.cu
 GPU_CUH  = backend_gpu_common.cuh backend_gpu_dequant.cuh backend_gpu_kernels.cuh
 
 PREFIX  ?= /usr/local
@@ -243,8 +243,7 @@ model:
 
 clean:
 	-$(RM) $(TARGET) $(TARGET).exe $(OBJS) $(VIZ_OBJS) backend_gpu.o backend_gpu.o.hip backend_gpu.o.cuda backend_metal.o
-	-$(RM) $(GPU_SRCS:%.cu=%-hip.o) $(GPU_SRCS:%.cu=%-cuda.o)
-
+	-$(RM) $(GPU_SRCS:%.cu=%-hip.o) $(GPU_SRCS:%.cu=%-cuda.o) backend_gpu.dlink.o
 
 .PHONY: asan
 asan:
@@ -304,6 +303,7 @@ $(HIP_OBJS): %-hip.o: %.cu $(GPU_CUH) backend_gpu.h quant.h
 
 # --- CUDA (NVIDIA) GPU backend ---
 NVCC      ?= nvcc
+CUDA_INC  ?= /usr/local/cuda/include
 CUDA_LIB  ?= /usr/local/cuda/lib64
 
 # CUDA target architecture(s).
@@ -326,7 +326,7 @@ CUDA_OBJS := $(GPU_SRCS:%.cu=%-cuda.o)
 
 .PHONY: cuda
 cuda: $(CUDA_OBJS) gpu-clean-objs
-	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_defines_for,-march=native) -DPICOLM_GPU=1" GPU_OBJS="$(CUDA_OBJS)" GPU_LIBS="-L$(CUDA_LIB) -lcudart -lstdc++ -Wl,-rpath,$(CUDA_LIB)"
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_defines_for,-march=native) -DPICOLM_GPU=1 -I$(CUDA_INC)" GPU_OBJS="$(CUDA_OBJS)" GPU_LIBS="-L$(CUDA_LIB) -lcudart -lstdc++ -Wl,-rpath,$(CUDA_LIB)"
 
 $(CUDA_OBJS): %-cuda.o: %.cu $(GPU_CUH) backend_gpu.h quant.h
 	$(NVCC) $(CUDAFLAGS) $(CUDA_GENCODE) -DPICOLM_GPU=1 -DPICOLM_SSM_WARP_KERNEL_VALIDATED -DPICOLM_SSM_CHUNKED_GPU_VALIDATED -c -o $@ $< -I.
