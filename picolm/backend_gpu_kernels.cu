@@ -1066,38 +1066,29 @@ picolm_gpu_attention_prefill_kernel(
                 int global_kv = t0 + ti;
                 if (global_kv > global_pos) continue;
 
-                /* Compute score: thread-0 only, AVX-512 matching accumulation.
-                 * n_chunks of 16 with fmaf, then tree reduce. */
+                /* Compute score: parallel across threads, same 16-element chunk
+                 * accumulation order as the CPU AVX-512 reference. Each thread
+                 * handles one chunk (head_dim/16 chunks, <= 16 for head_dim<=256).
+                 * Tree reduce across threads. Bit-exact with original because
+                 * chunk boundaries and fma order are preserved. */
                 float score;
-                if (tid == 0) {
+                {
                     int n_chunks = head_dim / 16;
-                    float chunk[16] = {0};
-                    for (int c = 0; c < n_chunks; c++) {
-                        float s = 0;
-                        for (int d = c * 16; d < (c + 1) * 16; d++) {
-                            s = fmaf(qg[d], gpu_fp16_to_fp32(k_tile[ti * head_dim + d]), s);
+                    float local_chunk = 0;
+                    if (tid < n_chunks) {
+                        for (int d = tid * 16; d < (tid + 1) * 16; d++) {
+                            local_chunk = fmaf(qg[d], gpu_fp16_to_fp32(k_tile[ti * head_dim + d]), local_chunk);
                         }
-                        chunk[c] = s;
                     }
-                    for (int stride = n_chunks / 2; stride > 0; stride >>= 1) {
-                        for (int c = 0; c < stride; c++) chunk[c] += chunk[c + stride];
+                    reduce_sh[tid] = local_chunk;
+                    gpuSyncthreads();
+                    for (int stride = n_threads / 2; stride > 0; stride >>= 1) {
+                        if (tid < stride) reduce_sh[tid] += reduce_sh[tid + stride];
+                        gpuSyncthreads();
                     }
-                    score = chunk[0] * attn_scale;
-                    reduce_sh[0] = score;
+                    score = reduce_sh[0] * attn_scale;
                 }
-                if (tid == 0) score = reduce_sh[0];
-                /* Debug: dump Q and K first 4 elements for first Q token, first KV pos, head 0 */
-#ifdef PICOLM_SSM_VERIFY
-                if (h == 0 && qi == 0 && ti == 0 && tid == 0) {
-                    printf("ATNDBG: prefill l=%d q0[:4]={%.6f,%.6f,%.6f,%.6f} k0[:4]={%.6f,%.6f,%.6f,%.6f} score=%.6f\n",
-                        layer_ordinal,
-                        qg[0], qg[1], qg[2], qg[3],
-                        gpu_fp16_to_fp32(k_tile[0]), gpu_fp16_to_fp32(k_tile[1]),
-                        gpu_fp16_to_fp32(k_tile[2]), gpu_fp16_to_fp32(k_tile[3]),
-                        score);
-                }
-#endif
-
+                
                 /* Online softmax branch decision on thread 0, broadcast
                  * via shared scalars; accumulator update parallelized
                  * across all threads below. */
