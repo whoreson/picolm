@@ -20,6 +20,9 @@
 #include <time.h>
 #include <fcntl.h>
 #endif
+#ifdef PICOLM_GPU
+#include <cuda_profiler_api.h>
+#endif
 #ifdef _OPENMP
 #include <omp.h>
 #endif

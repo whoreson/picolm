@@ -54,12 +54,6 @@ __global__ void picolm_q8_q8_matmul(float *y, const int8_t *xq, const float *xd,
 
 __global__ void picolm_q8_q8_matmul_tiled(float *y, const int8_t *xq, const float *xd, const void *weights, int S, int I, int O, int row_bytes, int y_stride);
 
-/* Tensor Core Q8_0 x Q8_0 IMMA matmul kernel.
- * Uses mma.sync.aligned.m16n8k32 on sm_80+. Falls back to scalar on older archs/HIP.
- * Block: 64 threads (2 warps), produces 16x16 output tile.
- * Grid: [ceil(O/16), ceil(S/16)].
- * Shared memory: 16 * row_bytes (weight staging) + 8*256*sizeof(float) (scale cache). */
-
 __global__ void picolm_q8_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
                                           const void *weights, int S, int I, int O,
                                           int row_bytes, int y_stride);

@@ -4,6 +4,9 @@
 #include "model_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef PICOLM_GPU
+#include <cuda_profiler_api.h>
+#endif
 #ifdef PICOLM_DOS
 #include <alloca.h>
 #endif
