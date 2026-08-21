@@ -1134,7 +1134,269 @@ picolm_gpu_attention_prefill_kernel(
     }
 }
 
-/* lines 1136-1237 from backend_gpu_kernels.cuh */
+/* FA2 kernel - FP16 Tensor Core Flash Attention 2 Prefill
+ *
+ * mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 for Q@K scoring.
+ * One block per (KV head, Q-tile of 64 rows). 4 warps per block, each
+ * warp handles 16 Q rows for 1 query head within the GQA group.
+ *
+ * Shared memory: K tile (2KB) + V tile (2KB) + Q tile FP16 (8KB)
+ *   + score buffer (4KB) + acc (32KB) + max/sum (512B) = 48.5KB
+ *
+ * Grid: [n_kv_heads, ceil(n_tokens/64)], Block: 128 threads.
+ *
+ * NOTE: NOT bit-exact with scalar kernel due to different accumulation
+ * order in IMMA. Validate using tolerance (1e-2).
+ */
+
+#define FA2_TILE_Q 16
+#define FA2_TILE_K 16
+
+__global__ void
+picolm_gpu_attention_prefill_fa2_kernel(
+    float *xb_out, const float *q_dev,
+    const uint16_t *kv_k, const uint16_t *kv_v,
+    int layer_ordinal, int start_pos, int n_tokens,
+    int n_heads, int n_kv_heads, int head_dim, int max_seq_len,
+    size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes)
+{
+    int kv_h = gpuBlockIdx_x;
+    int q_tile_idx = gpuBlockIdx_y;
+    int t = gpuThreadIdx_x;   /* 0..127 */
+    int lt = t % 32;          /* lane: 0..31 */
+    int warp = t / 32;        /* 0..3 */
+    int kv_mul = n_heads / n_kv_heads;
+
+    float attn_scale = 1.0f / sqrtf((float)head_dim);
+    size_t layer_base = (size_t)layer_ordinal * max_seq_len * n_kv_heads * head_dim;
+
+    int n_total_kv = start_pos + n_tokens;
+    int n_k16 = head_dim / 16;
+    int n_h2 = head_dim / 2;
+
+    /* Each warp: qh = kv_h*kv_mul + (warp%kv_mul), 16 Q rows */
+    int warp_qh = kv_h * kv_mul + (warp % kv_mul);
+    int warp_q_base = q_tile_idx * 64 + warp * FA2_TILE_Q;
+    int groupID = lt >> 2;        /* 0..7 */
+    int tid_in_grp = lt & 3;      /* 0..3 */
+
+    /* Shared memory regions */
+    extern __shared__ uint8_t smem[];
+    uint16_t *k_tile_sh = (uint16_t *)smem;
+    uint16_t *v_tile_sh = k_tile_sh + FA2_TILE_K * n_h2;
+    uint16_t *q_tile_sh = v_tile_sh + FA2_TILE_K * n_h2;
+    float *score_sh = (float *)((uint8_t *)q_tile_sh + 64 * n_h2 * sizeof(uint16_t));
+    /* score_sh: [4 warps][16 rows][FA2_TILE_K] FP32 */
+    float *acc_sh = score_sh + 4 * 16 * FA2_TILE_K + 64 * head_dim;
+    float *max_sh = acc_sh + 64 * head_dim;
+    float *sum_sh = max_sh + 64;
+
+    /* ---- Phase 1: Load Q for this warp into shared memory (F32->FP16) ----
+     * All 4 warps load concurrently. Each warp writes to its own 16 rows.
+     * No sync needed between warps for Q loading. */
+    {
+        for (int h2 = lt; h2 < FA2_TILE_Q * n_h2; h2 += 32) {
+            int row = h2 / n_h2;     /* 0..15 within warp */
+            int d2 = h2 % n_h2;      /* 0..63 for head_dim=128 */
+            int global_q = warp_q_base + row;
+            if (global_q < n_tokens) {
+                const float *q_row = q_dev + (size_t)(global_q * n_heads + warp_qh) * head_dim;
+                q_tile_sh[row * n_h2 + d2] =
+                    gpu_fp32_to_fp16(q_row[d2 * 2]) |
+                    (gpu_fp32_to_fp16(q_row[d2 * 2 + 1]) << 16);
+            }
+        }
+    }
+    __syncwarp();
+    gpuSyncthreads(); /* Ensure all warps' Q data is in shared memory */
+
+    /* ---- Phase 2: Initialize acc, max, sum for all 64 Q rows ---- */
+    for (int i = t; i < 64 * head_dim; i += 128) acc_sh[i] = 0.0f;
+    for (int i = t; i < 64; i += 128) { max_sh[i] = -1e30f; sum_sh[i] = 0.0f; }
+    gpuSyncthreads();
+
+    /* ---- Phase 3: Tile over KV positions ---- */
+    for (int t0 = 0; t0 < n_total_kv; t0 += FA2_TILE_K) {
+        int t_end = min(t0 + FA2_TILE_K, n_total_kv);
+        int tk_size = t_end - t0;
+
+        /* Load K and V tile into shared memory (all threads cooperate) */
+        {
+            for (int h2 = t; h2 < tk_size * n_h2; h2 += 128) {
+                int ti = h2 / n_h2;
+                int d2 = h2 % n_h2;
+                size_t kv_off = layer_base + kv_h * kv_head_stride_bytes / 2
+                    + (size_t)(t0 + ti) * kv_pos_stride_bytes / 2 + d2;
+                k_tile_sh[ti * n_h2 + d2] = kv_k[kv_off];
+                v_tile_sh[ti * n_h2 + d2] = kv_v[kv_off];
+            }
+        }
+        gpuSyncthreads();
+
+        /* Zero score buffer for this warp */
+        {
+            int warp_score_base = warp * 16 * FA2_TILE_K;
+            for (int i = lt; i < 16 * FA2_TILE_K; i += 32) {
+                score_sh[warp_score_base + i] = 0.0f;
+            }
+        }
+        __syncwarp();
+
+        /* ---- IMMA: Q@K scoring for this warp ----
+         * Each warp computes 16 Q rows x tk_size KV positions scores.
+         * A = Q[16 x 16] FP16, B = K^T[16 x 8] FP16, D = scores[16 x 8] FP32
+         *
+         * Register fragment layout (PTX ISA manual, verified):
+         *   A (16x16 row-major): 8 FP16 per thread (4 int32 regs)
+         *     a[0,1]: row=groupID, col=tid_in_grp*2, tid_in_grp*2+1
+         *     a[2,3]: row=groupID+8, col=tid_in_grp*2, tid_in_grp*2+1
+         *     a[4,5]: row=groupID, col=tid_in_grp*2+8, tid_in_grp*2+9
+         *     a[6,7]: row=groupID+8, col=tid_in_grp*2+8, tid_in_grp*2+9
+         *
+         *   B (16x8 col-major): 4 FP16 per thread (2 int32 regs)
+         *     b[0,1]: row=tid_in_grp*2, tid_in_grp*2+1, col=groupID
+         *     b[2,3]: row=tid_in_grp*2+8, tid_in_grp*2+9, col=groupID
+         *
+         *   D (16x8 col-major): 4 FP32 per thread
+         *     d[0,1]: row=groupID, col=tid_in_grp*2, tid_in_grp*2+1
+         *     d[2,3]: row=groupID+8, col=tid_in_grp*2, tid_in_grp*2+1
+         *
+         * For head_dim=128: n_k16=8 IMMA iterations over K dimension.
+         * For each k16: ceil(tk_size/8) IMMA iterations over KV positions.
+         *
+         * Each IMMA accumulates into D registers, then spills D to
+         * score_sh (read-modify-write). */
+
+        int warp_score_base = warp * 16 * FA2_TILE_K;
+
+        for (int k16 = 0; k16 < n_k16; k16++) {
+            for (int ki8 = 0; ki8 < tk_size; ki8 += 8) {
+                /* Load A fragment (Q tile, 16x16 FP16) */
+                int a0, a1, a2, a3;
+                {
+                    int mc = tid_in_grp * 2;
+                    a0 = ((int *)q_tile_sh)[groupID * n_h2 + k16 * 16 + mc];
+                    a1 = ((int *)q_tile_sh)[(groupID + 8) * n_h2 + k16 * 16 + mc];
+                    a2 = ((int *)q_tile_sh)[groupID * n_h2 + k16 * 16 + mc + 8];
+                    a3 = ((int *)q_tile_sh)[(groupID + 8) * n_h2 + k16 * 16 + mc + 8];
+                }
+
+                /* Load B fragment (K tile transposed, 16x8 FP16 col-major)
+                 * B col = groupID -> KV position = ki8 + groupID
+                 * B row = head_dim index within k16 chunk */
+                int b0, b1;
+                {
+                    int ki = ki8 + groupID;
+                    int d2 = k16 * 16 + tid_in_grp * 2;
+                    b0 = ki < tk_size ? ((int *)k_tile_sh)[ki * n_h2 + d2] : 0;
+                    b1 = ki < tk_size ? ((int *)k_tile_sh)[ki * n_h2 + d2 + 8] : 0;
+                }
+
+                /* D accumulators */
+                float d0 = 0.0f, d1 = 0.0f, d2_ = 0.0f, d3 = 0.0f;
+
+                /* IMMA instruction */
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                    "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+                    : "+f"(d0), "+f"(d1), "+f"(d2_), "+f"(d3)
+                    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1)
+                );
+
+                /* Spill D to score_sh (accumulate) */
+                {
+                    /* d[0]: row=groupID, col=tid_in_grp*2 */
+                    {
+                        int ki = ki8 + tid_in_grp * 2;
+                        if (ki < tk_size)
+                            score_sh[warp_score_base + groupID * FA2_TILE_K + ki] += d0;
+                    }
+                    /* d[1]: row=groupID, col=tid_in_grp*2+1 */
+                    {
+                        int ki = ki8 + tid_in_grp * 2 + 1;
+                        if (ki < tk_size)
+                            score_sh[warp_score_base + groupID * FA2_TILE_K + ki] += d1;
+                    }
+                    /* d[2]: row=groupID+8, col=tid_in_grp*2 */
+                    {
+                        int ki = ki8 + tid_in_grp * 2;
+                        if (ki < tk_size)
+                            score_sh[warp_score_base + (groupID + 8) * FA2_TILE_K + ki] += d2_;
+                    }
+                    /* d[3]: row=groupID+8, col=tid_in_grp*2+1 */
+                    {
+                        int ki = ki8 + tid_in_grp * 2 + 1;
+                        if (ki < tk_size)
+                            score_sh[warp_score_base + (groupID + 8) * FA2_TILE_K + ki] += d3;
+                    }
+                }
+            }
+        }
+        __syncwarp();
+
+        /* ---- Softmax + V accumulation for this K-tile ----
+         * Each thread handles one Q row within this warp (32 threads, 16 rows
+         * -> threads 0-15 handle rows 0-15, threads 16-31 idle).
+         * For each Q row, iterate over tk_size KV positions, applying online
+         * softmax and accumulating V values. */
+        {
+            int qi_local = lt;
+            if (qi_local >= FA2_TILE_Q) {
+                /* Idle thread - just wait */
+            } else {
+                int global_q = warp_q_base + qi_local;
+                if (global_q < n_tokens) {
+                    float *acc_qi = acc_sh + (q_tile_idx * 64 + qi_local) * head_dim;
+                    float row_max = max_sh[q_tile_idx * 64 + qi_local];
+                    float row_sum = sum_sh[q_tile_idx * 64 + qi_local];
+
+                    for (int ti = 0; ti < tk_size; ti++) {
+                        int global_kv = t0 + ti;
+                        if (global_kv > start_pos + global_q) continue;
+
+                        float score = score_sh[warp_score_base + qi_local * FA2_TILE_K + ti] * attn_scale;
+
+                        /* Online softmax update */
+                        if (score > row_max) {
+                            float rescale = expf(row_max - score);
+                            for (int d = 0; d < head_dim; d++) {
+                                acc_qi[d] = fmaf(acc_qi[d], rescale,
+                                    gpu_fp16_to_fp32(v_tile_sh[ti * n_h2 + d / 2]));
+                            }
+                            row_sum = row_sum * rescale + 1.0f;
+                            row_max = score;
+                        } else {
+                            float weight = expf(score - row_max);
+                            for (int d = 0; d < head_dim; d++) {
+                                acc_qi[d] = fmaf(weight,
+                                    gpu_fp16_to_fp32(v_tile_sh[ti * n_h2 + d / 2]), acc_qi[d]);
+                            }
+                            row_sum += weight;
+                        }
+                    }
+
+                    max_sh[q_tile_idx * 64 + qi_local] = row_max;
+                    sum_sh[q_tile_idx * 64 + qi_local] = row_sum;
+                }
+            }
+        }
+        gpuSyncthreads();
+    }
+
+    /* ---- Phase 4: Normalize and write output ---- */
+    for (int qi_local = lt; qi_local < FA2_TILE_Q; qi_local += 32) {
+        int global_q = warp_q_base + qi_local;
+        if (global_q >= n_tokens) continue;
+        int qi_global = q_tile_idx * 64 + qi_local;
+        float inv_sum = (sum_sh[qi_global] > 0.0f) ? (1.0f / sum_sh[qi_global]) : 0.0f;
+        float *xbhg = xb_out + (size_t)(global_q * n_heads + warp_qh) * head_dim;
+        float *acc_qi = acc_sh + qi_global * head_dim;
+        for (int d = lt; d < head_dim; d += 32) {
+            xbhg[d] = acc_qi[d] * inv_sum;
+        }
+    }
+}
+
 __global__ void
 picolm_ssm_vecdot_kernel(float *out,
                           const float *x,

@@ -1,6 +1,14 @@
 // backend_gpu_host_core.cu - GPU initialization, memory, tensor, matmul, expert MLP
 #include "backend_gpu_kernels.cuh"
 
+static void gpu_dispatch_print(const char *name) {
+    static char seen[64][64] = {0};
+    for (int i = 0; i < 64; i++) {
+        if (seen[i][0] == '\0') { snprintf(seen[i], 64, "%s", name); fprintf(stderr, "[GPU] kernel: %s\n", name); return; }
+        if (strcmp(seen[i], name) == 0) return;
+    }
+}
+
 gpu_device_ctx_t g_gpu_ctx[PICOLM_GPU_MAX_DEVICES];
 int g_nctx;
 
@@ -566,14 +574,17 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
             !gpu_ok(gpuDeviceSynchronize(), "q8 quantize sync")) return 0;
 
         if (ctx->compute_major >= 8 && S >= 16 && O >= 8) {
+            gpu_dispatch_print("matmul_imma_host");
             dim3 grid((unsigned)((O + 7) / 8), (unsigned)((S + 15) / 16));
             picolm_q8_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(
                 ctx->y, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, O);
         } else if (S > 1 && t->row_bytes + 2048 <= 49152) {
+            gpu_dispatch_print("matmul_tiled_host");
             dim3 grid((unsigned)O, (unsigned)((S + Q8_TILE_S - 1) / Q8_TILE_S));
             picolm_q8_q8_matmul_tiled<<<grid, 256, (unsigned)t->row_bytes, ctx->stream>>>(
                 ctx->y, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, O);
         } else {
+            gpu_dispatch_print("matmul_scalar_host");
             dim3 grid((unsigned)O, (unsigned)S);
             picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
                 ctx->y, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, O);
@@ -589,6 +600,7 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
     /* Scratch buffers are in device memory. Explicit H2D copy needed. */
     if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
 
+    gpu_dispatch_print("matmul_quant_host");
     dim3 grid((unsigned)O, (unsigned)S);
     picolm_quant_matmul<<<grid, 256, 0, ctx->stream>>>(ctx->y, ctx->x, t->weights,
                                         t->qtype, S, I, O,
@@ -650,14 +662,17 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
         }
         if (!gpu_ok(gpuGetLastError(), "q8 quantize (dev)")) return 0;
         if (ctx->compute_major >= 8 && S >= 16 && O >= 8) {
+            gpu_dispatch_print("matmul_imma_dev");
             dim3 grid((unsigned)((O + 7) / 8), (unsigned)((S + 15) / 16));
             picolm_q8_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(
                 y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
         } else if (S >= Q8_TILE_S && t->row_bytes + 2048 <= 49152) {
+            gpu_dispatch_print("matmul_tiled_dev");
             dim3 grid((unsigned)O, (unsigned)((S + Q8_TILE_S - 1) / Q8_TILE_S));
             picolm_q8_q8_matmul_tiled<<<grid, 256, (unsigned)t->row_bytes, ctx->stream>>>(
                 y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
         } else {
+            gpu_dispatch_print("matmul_scalar_dev");
             dim3 grid((unsigned)O, (unsigned)S);
             picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
                 y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
@@ -667,6 +682,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
     }
     if (t->qtype == GGUF_TYPE_Q8_0) {
         /* Fallback: use per-thread F32 dequant for Q8_0 */
+        gpu_dispatch_print("matmul_quant_dev_fallback");
         dim3 grid((unsigned)O, (unsigned)S);
         picolm_quant_matmul<<<grid, 256, 0, ctx->stream>>>(y_dev, x_dev, t->weights,
                                             t->qtype, S, I, O,
@@ -675,6 +691,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
         return 1;
     }
     /* Non-Q8_0 types: use per-thread dequant + F32 accumulation */
+    gpu_dispatch_print("matmul_quant_dev");
     dim3 grid((unsigned)O, (unsigned)S);
     picolm_quant_matmul<<<grid, 256, 0, ctx->stream>>>(y_dev, x_dev, t->weights,
                                         t->qtype, S, I, O,
@@ -708,12 +725,14 @@ picolm_gpu_matmul_dev_strided(picolm_gpu_tensor_t *t, float *y_dev,
             ctx->q8_xq, ctx->q8_xd, x_dev, I, S, x_stride);
         if (!gpu_ok(gpuGetLastError(), "q8 quantize strided (dev)")) return 0;
         /* No gpuDeviceSynchronize() needed: stream ordering guarantees correctness. */
+        gpu_dispatch_print("matmul_scalar_strided_dev");
         dim3 grid((unsigned)O, (unsigned)S);
         picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
             y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
         if (!gpu_ok(gpuGetLastError(), "q8 matmul strided (dev)")) return 0;
         return 1;
     }
+    gpu_dispatch_print("matmul_quant_strided_dev");
     dim3 grid((unsigned)O, (unsigned)S);
     picolm_quant_matmul<<<grid, 256, 0, ctx->stream>>>(y_dev, x_dev, t->weights,
                                         t->qtype, S, I, O, (int)t->row_bytes, x_stride, ys);
@@ -777,14 +796,17 @@ int picolm_gpu_expert_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
 
     /* Step 2: gate = q8_q8 matmul(input_q8, gate_weights) -> F32[I*S] */
     if (ctx->compute_major >= 8 && S >= 16 && I >= 8) {
+        gpu_dispatch_print("expert_mlp_gate_imma_host");
         dim3 grid((unsigned)((I + 7) / 8), (unsigned)((S + 15) / 16));
         picolm_q8_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(
             ctx->gate, ctx->q8_xq, ctx->q8_xd, gate->weights, S, D, I, (int)gate->row_bytes, I);
     } else if (S > 1 && gate->row_bytes + 2048 <= 49152) {
+        gpu_dispatch_print("expert_mlp_gate_tiled_host");
         dim3 grid((unsigned)I, (unsigned)((S + Q8_TILE_S - 1) / Q8_TILE_S));
         picolm_q8_q8_matmul_tiled<<<grid, 256, (unsigned)gate->row_bytes, ctx->stream>>>(
             ctx->gate, ctx->q8_xq, ctx->q8_xd, gate->weights, S, D, I, (int)gate->row_bytes, I);
     } else {
+        gpu_dispatch_print("expert_mlp_gate_scalar_host");
         dim3 grid((unsigned)I, (unsigned)S);
         picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
             ctx->gate, ctx->q8_xq, ctx->q8_xd, gate->weights, S, D, I, (int)gate->row_bytes, I);
@@ -793,14 +815,17 @@ int picolm_gpu_expert_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
 
     /* Step 3: up = q8_q8 matmul(input_q8, up_weights) -> F32[I*S] */
     if (ctx->compute_major >= 8 && S >= 16 && I >= 8) {
+        gpu_dispatch_print("expert_mlp_up_imma_host");
         dim3 grid((unsigned)((I + 7) / 8), (unsigned)((S + 15) / 16));
         picolm_q8_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(
             ctx->up, ctx->q8_xq, ctx->q8_xd, up->weights, S, D, I, (int)up->row_bytes, I);
     } else if (S > 1 && up->row_bytes + 2048 <= 49152) {
+        gpu_dispatch_print("expert_mlp_up_tiled_host");
         dim3 grid((unsigned)I, (unsigned)((S + Q8_TILE_S - 1) / Q8_TILE_S));
         picolm_q8_q8_matmul_tiled<<<grid, 256, (unsigned)up->row_bytes, ctx->stream>>>(
             ctx->up, ctx->q8_xq, ctx->q8_xd, up->weights, S, D, I, (int)up->row_bytes, I);
     } else {
+        gpu_dispatch_print("expert_mlp_up_scalar_host");
         dim3 grid((unsigned)I, (unsigned)S);
         picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
             ctx->up, ctx->q8_xq, ctx->q8_xd, up->weights, S, D, I, (int)up->row_bytes, I);
@@ -820,14 +845,17 @@ int picolm_gpu_expert_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
 
     /* Step 6: y = q8_q8 matmul(hidden_q8, down_weights) -> F32[D*S] */
     if (ctx->compute_major >= 8 && S >= 16 && D >= 8) {
+        gpu_dispatch_print("expert_mlp_down_imma_host");
         dim3 grid((unsigned)((D + 7) / 8), (unsigned)((S + 15) / 16));
         picolm_q8_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(
             ctx->y, ctx->q8_xq, ctx->q8_xd, down->weights, S, I, D, (int)down->row_bytes, D);
     } else if (S > 1 && down->row_bytes + 2048 <= 49152) {
+        gpu_dispatch_print("expert_mlp_down_tiled_host");
         dim3 grid((unsigned)D, (unsigned)((S + Q8_TILE_S - 1) / Q8_TILE_S));
         picolm_q8_q8_matmul_tiled<<<grid, 256, (unsigned)down->row_bytes, ctx->stream>>>(
             ctx->y, ctx->q8_xq, ctx->q8_xd, down->weights, S, I, D, (int)down->row_bytes, D);
     } else {
+        gpu_dispatch_print("expert_mlp_down_scalar_host");
         dim3 grid((unsigned)D, (unsigned)S);
         picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
             ctx->y, ctx->q8_xq, ctx->q8_xd, down->weights, S, I, D, (int)down->row_bytes, D);

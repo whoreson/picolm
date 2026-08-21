@@ -1,6 +1,19 @@
 // backend_gpu_host_misc.cu - KV cache, pipeline, attention, rmsnorm, rope, residual, misc
 #include "backend_gpu_kernels.cuh"
 
+/* Print once per kernel type when first dispatched */
+static void gpu_dispatch_print(const char *name) {
+    static char seen_names[64][64] = {0};
+    for (int i = 0; i < 64; i++) {
+        if (seen_names[i][0] == '\0') {
+            snprintf(seen_names[i], sizeof(seen_names[i]), "%s", name);
+            fprintf(stderr, "[GPU] kernel: %s\n", name);
+            return;
+        }
+        if (strcmp(seen_names[i], name) == 0) return;
+    }
+}
+
 /* Static globals (were file-static in monolithic backend_gpu.cu) */
 static uint16_t *g_kv_k_dev[PICOLM_GPU_MAX_DEVICES];
 static uint16_t *g_kv_v_dev[PICOLM_GPU_MAX_DEVICES];
@@ -446,6 +459,7 @@ attn_decode_dispatch(float *xb_dev, const float *q_dev,
                          + 2 * sizeof(float); /* rescale_sh + weight_sh */
 
     if (n_splits <= 1) {
+        gpu_dispatch_print("attn_decode");
         dim3 grid((unsigned)n_kv_heads, 1, 1);
         picolm_gpu_attention_decode_kernel<<<grid, 256, (unsigned)shared_bytes, ctx->stream>>>(
             xb_dev, q_dev, g_kv_k_dev[device], g_kv_v_dev[device],
@@ -462,6 +476,7 @@ attn_decode_dispatch(float *xb_dev, const float *q_dev,
     float *partial_sum = partial_max + (size_t)n_heads * n_splits;
     float *partial_acc = partial_sum + (size_t)n_heads * n_splits;
 
+    gpu_dispatch_print("attn_decode_split");
     dim3 grid_split((unsigned)n_kv_heads, (unsigned)n_splits, 1);
     picolm_gpu_attention_decode_split_kernel<<<grid_split, 256, (unsigned)shared_bytes, ctx->stream>>>(
         partial_max, partial_sum, partial_acc,
@@ -471,6 +486,7 @@ attn_decode_dispatch(float *xb_dev, const float *q_dev,
     if (!gpu_ok(gpuGetLastError(), "attn decode split kernel")) return 0;
 
     size_t merge_shared = (size_t)kv_mul * 2 * sizeof(float);
+    gpu_dispatch_print("attn_decode_merge");
     dim3 grid_merge((unsigned)n_kv_heads, 1, 1);
     picolm_gpu_attention_decode_merge_kernel<<<grid_merge, 128, (unsigned)merge_shared, ctx->stream>>>(
         xb_dev, partial_max, partial_sum, partial_acc,
@@ -576,6 +592,18 @@ ensure_attn_prefill_shared_mem(size_t bytes) {
     return 1;
 }
 
+static int
+ensure_attn_fa2_shared_mem(size_t bytes) {
+    static size_t configured = 49152;
+    if (bytes <= configured) return 1;
+    if (!gpu_ok(gpuFuncSetAttribute((const void *)picolm_gpu_attention_prefill_fa2_kernel,
+                                     gpuFuncAttributeMaxDynamicSharedMemorySize, (int)bytes),
+                "attn fa2 shared mem opt-in"))
+        return 0;
+    configured = bytes;
+    return 1;
+}
+
 extern "C" int
 picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
                               int layer_ordinal, int start_pos, int n_tokens,
@@ -597,17 +625,43 @@ picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
     size_t kv_pos_stride_bytes = (size_t)n_kv_heads * head_dim * sizeof(uint16_t);
     size_t kv_head_stride_bytes = head_dim * sizeof(uint16_t);
 
-    int n_tiles_q = (n_tokens + ATTN_TILE_Q - 1) / ATTN_TILE_Q;
-    size_t shared_bytes = attn_prefill_shared_bytes(head_dim);
-    if (!ensure_attn_prefill_shared_mem(shared_bytes)) return 0;
-    int block_threads = 128; /* enough for head_dim up to 256 */
+    /* Try FA2 (tensor core) kernel when available */
+    int use_fa2 = ctx->compute_major >= 8 && n_tokens >= 64;
+    if (use_fa2) {
+        int n_q_tiles = (n_tokens + 63) / 64;
+        size_t fa2_shared = (size_t)FA2_TILE_K * (head_dim / 2) * 2 * sizeof(uint16_t)
+            + 64 * (head_dim / 2) * sizeof(uint16_t)
+            + 4 * 16 * FA2_TILE_K * sizeof(float)
+            + 64 * head_dim * sizeof(float)
+            + 128 * sizeof(float);
+        if (fa2_shared <= 98304 && ensure_attn_fa2_shared_mem(fa2_shared)) {
+            gpu_dispatch_print("attn_prefill_fa2_host");
+            dim3 grid((unsigned)n_kv_heads, (unsigned)n_q_tiles, 1);
+            picolm_gpu_attention_prefill_fa2_kernel<<<grid, 128, (unsigned)fa2_shared, ctx->stream>>>(
+                ctx->y, ctx->x,
+                g_kv_k_dev[device], g_kv_v_dev[device],
+                layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim, max_seq_len,
+                kv_pos_stride_bytes, kv_head_stride_bytes);
+            if (!gpu_ok(gpuGetLastError(), "attn prefill fa2 (host)")) return 0;
+        } else {
+            use_fa2 = 0;
+        }
+    }
 
-    dim3 grid((unsigned)n_heads, (unsigned)n_tiles_q, 1);
-    picolm_gpu_attention_prefill_kernel<<<grid, block_threads, (unsigned)shared_bytes, ctx->stream>>>(
-        ctx->y, ctx->x,
-        g_kv_k_dev[device], g_kv_v_dev[device],
-        layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim, max_seq_len,
-        kv_pos_stride_bytes, kv_head_stride_bytes);
+    if (!use_fa2) {
+        gpu_dispatch_print("attn_prefill_scalar_host");
+        int n_tiles_q = (n_tokens + ATTN_TILE_Q - 1) / ATTN_TILE_Q;
+        size_t shared_bytes = attn_prefill_shared_bytes(head_dim);
+        if (!ensure_attn_prefill_shared_mem(shared_bytes)) return 0;
+        int block_threads = 128;
+
+        dim3 grid((unsigned)n_heads, (unsigned)n_tiles_q, 1);
+        picolm_gpu_attention_prefill_kernel<<<grid, block_threads, (unsigned)shared_bytes, ctx->stream>>>(
+            ctx->y, ctx->x,
+            g_kv_k_dev[device], g_kv_v_dev[device],
+            layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim, max_seq_len,
+            kv_pos_stride_bytes, kv_head_stride_bytes);
+    }
 
     if (!gpu_ok(gpuGetLastError(), "attn prefill kernel") ||
         !gpu_ok(gpuDeviceSynchronize(), "attn prefill sync")) return 0;
@@ -628,10 +682,39 @@ picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
     if (!ctx || !select_ctx(ctx)) return 0;
     if (!g_kv_k_dev[device] || !g_kv_v_dev[device]) return 0;
     if (head_dim > 256) return 0;
+    if (head_dim % 16 != 0) return 0;
 
     size_t kv_pos_stride_bytes = (size_t)n_kv_heads * head_dim * sizeof(uint16_t);
     size_t kv_head_stride_bytes = head_dim * sizeof(uint16_t);
 
+    /* Use FA2 (tensor core) kernel when available */
+    if (ctx->compute_major >= 8 && n_tokens >= 64) {
+        int n_q_tiles = (n_tokens + 63) / 64;  /* ceil, kernel handles OOB */
+        /* Shared memory: K(2KB) + V(2KB) + Q_fp16(8KB) + score_buf(4KB) + acc(32KB) + max/sum(512B)
+         * For head_dim=128: 48.5KB. For head_dim=256: ~92KB. */
+        size_t fa2_shared = (size_t)FA2_TILE_K * (head_dim / 2) * 2 * sizeof(uint16_t)  /* K + V tiles */
+            + 64 * (head_dim / 2) * sizeof(uint16_t)  /* Q tile FP16 (4 warps) */
+            + 4 * 16 * FA2_TILE_K * sizeof(float)  /* score buffer */
+            + 64 * head_dim * sizeof(float)  /* acc */
+            + 128 * sizeof(float);  /* max + sum */
+        if (fa2_shared > 98304) {
+            /* Too large for head_dim=256, fall through to scalar */
+        } else {
+            if (!ensure_attn_fa2_shared_mem(fa2_shared)) return 0;
+            gpu_dispatch_print("attn_prefill_fa2_dev");
+            dim3 grid((unsigned)n_kv_heads, (unsigned)n_q_tiles, 1);
+            picolm_gpu_attention_prefill_fa2_kernel<<<grid, 128, (unsigned)fa2_shared, ctx->stream>>>(
+                xb_out_dev, q_dev,
+                g_kv_k_dev[device], g_kv_v_dev[device],
+                layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim, max_seq_len,
+                kv_pos_stride_bytes, kv_head_stride_bytes);
+            if (!gpu_ok(gpuGetLastError(), "attn prefill fa2 (dev)")) return 0;
+            return 1;
+        }
+    }
+
+    gpu_dispatch_print("attn_prefill_scalar_dev");
+    /* Scalar fallback */
     int n_tiles_q = (n_tokens + ATTN_TILE_Q - 1) / ATTN_TILE_Q;
     size_t shared_bytes = attn_prefill_shared_bytes(head_dim);
     if (!ensure_attn_prefill_shared_mem(shared_bytes)) return 0;
@@ -676,6 +759,7 @@ picolm_gpu_attention_prefill_f32kv(float *xb_out_dev, const float *q_dev,
                 (int)e, cudaGetErrorString(e), shared_bytes);
         }
     }
+    gpu_dispatch_print("attn_prefill_f32kv_dev");
     int block_threads = 128;
     dim3 grid((unsigned)n_heads, (unsigned)n_tiles_q, 1);
     picolm_gpu_attention_prefill_f32kv_kernel<<<grid, block_threads, (unsigned)shared_bytes, ctx->stream>>>(
@@ -1282,14 +1366,17 @@ int picolm_gpu_ssm_vecdot_batch_dev(float *od, const float *xd, const void *wd, 
 
             /* Dispatch: IMMA >= sm_80, else tiled, else scalar */
             if (ctx->compute_major >= 8 && nt >= 16 && nvh >= 8) {
+                gpu_dispatch_print("vecdot_imma_dev");
                 dim3 grid((unsigned)((nvh + 7) / 8), (unsigned)((nt + 15) / 16));
                 picolm_q8_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(
                     y_target, ctx->q8_xq, ctx->q8_xd, wq8, nt, dim, nvh, wq8_rb, ys);
             } else if (nt >= Q8_TILE_S && wq8_rb + 2048 <= 49152) {
+                gpu_dispatch_print("vecdot_tiled_dev");
                 dim3 grid((unsigned)nvh, (unsigned)((nt + Q8_TILE_S - 1) / Q8_TILE_S));
                 picolm_q8_q8_matmul_tiled<<<grid, 256, (unsigned)wq8_rb, ctx->stream>>>(
                     y_target, ctx->q8_xq, ctx->q8_xd, wq8, nt, dim, nvh, wq8_rb, ys);
             } else {
+                gpu_dispatch_print("vecdot_scalar_dev");
                 dim3 grid((unsigned)nvh, (unsigned)nt);
                 picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
                     y_target, ctx->q8_xq, ctx->q8_xd, wq8, nt, dim, nvh, wq8_rb, ys);
@@ -1308,6 +1395,7 @@ int picolm_gpu_ssm_vecdot_batch_dev(float *od, const float *xd, const void *wd, 
 
 vecdot_serial:
     /* Serial vecdot fallback for Q4_0 weights, misaligned dims, or OOM */
+    gpu_dispatch_print("vecdot_serial_dev");
     picolm_ssm_vecdot_batch_kernel<<<dim3((unsigned)nvh,(unsigned)nt),256,0,ctx->stream>>>(
         od,xd,wd,qt,dim,nvh,nt,rb,hm,in_stride,out_stride);
     return gpu_ok(gpuGetLastError(),"vecdot batch dev");
