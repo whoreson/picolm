@@ -23,6 +23,17 @@ __global__ void picolm_quantize_q8_0(int8_t *qs_out, float *d_out, const float *
 
 __global__ void picolm_quantize_q8_0_strided(int8_t *qs_out, float *d_out, const float *x, int I, int S, int x_stride);
 
+/* Quantize F32/BF16 weight rows to Q8_0 block format (34 bytes per 32 elements).
+ * Each thread block quantizes one weight row (one head).
+ * Input: F32 or BF16 array [I] elements per row.
+ * Output: block_q8_0 format [n_blocks * 34] bytes per row.
+ * Grid: [n_heads], Block: 32 threads.
+ * Each block outputs one row's worth of Q8_0 blocks to dst[row * n_blocks * 34 + ...]. */
+
+__global__ void picolm_quantize_weights_to_q8_0(
+    void *dst, const float *src, gguf_type_t qtype,
+    int I, int n_heads, int src_stride, int dst_block_stride);
+
 /* ---- Q8_0 x Q8_0 integer-MAC matmul kernel ----
  *
  * Matches CPU vec_dot_q8_0_q8_0_deltas exactly:

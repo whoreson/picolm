@@ -220,6 +220,74 @@ picolm_quantize_q8_0(int8_t *qs_out, float *d_out,
         d_out[(size_t)s * (size_t)n_blocks + block] = d;
 }
 
+/* Quantize F32/BF16 weight rows to Q8_0 block format.
+ * Each block handles one weight row (one head).
+ * Output: contiguous block_q8_0 layout [n_heads][n_blocks*GPU_BLOCK_Q8_0_SIZE].
+ * Grid: [n_heads], Block: 32 threads.
+ * Each block quantizes all 32-element sub-blocks of its row. */
+__global__ void
+picolm_quantize_weights_to_q8_0(void *dst, const float *src, gguf_type_t qtype,
+                                 int I, int n_heads, int src_stride, int dst_block_stride) {
+    int h = gpuBlockIdx_x;
+    if (h >= n_heads) return;
+    int tid = gpuThreadIdx_x;
+
+    int n_blocks = I / 32;
+    int rs = src_stride > 0 ? src_stride : I;
+    int ds = dst_block_stride > 0 ? dst_block_stride : n_blocks * GPU_BLOCK_Q8_0_SIZE;
+    uint8_t *dst_row = (uint8_t *)dst + (size_t)h * ds;
+
+    const float *row_f = src + (size_t)h * rs;
+
+    /* For BF16 input, dequant in the load */
+    if (qtype == 30) {
+        const uint16_t *row_bf = (const uint16_t *)src + (size_t)h * (rs / sizeof(uint16_t));
+        for (int bi = tid; bi < n_blocks; bi += 32) {
+            uint8_t *blk = dst_row + (size_t)bi * GPU_BLOCK_Q8_0_SIZE;
+            float amax = 0.0f;
+            for (int j = 0; j < 32; j++) {
+                float v = dequant_bf16((const void *)(row_bf + bi * 32 + j), 0);
+                if (v < 0.0f) v = -v;
+                if (v > amax) amax = v;
+            }
+            float d = amax / 127.0f;
+            uint16_t d_raw = gpu_fp32_to_fp16(d);
+            blk[0] = d_raw & 0xFF; blk[1] = (d_raw >> 8) & 0xFF;
+            float id = (amax != 0.0f) ? 127.0f / amax : 0.0f;
+            int8_t *qs = (int8_t *)(blk + 2);
+            for (int j = 0; j < 32; j++) {
+                float v = dequant_bf16((const void *)(row_bf + bi * 32 + j), 0);
+                int q = (int)lroundf(v * id);
+                if (q > 127) q = 127;
+                if (q < -128) q = -128;
+                qs[j] = (int8_t)q;
+            }
+        }
+    } else {
+        for (int bi = tid; bi < n_blocks; bi += 32) {
+            uint8_t *blk = dst_row + (size_t)bi * GPU_BLOCK_Q8_0_SIZE;
+            const float *xb = row_f + bi * 32;
+            float amax = 0.0f;
+            for (int j = 0; j < 32; j++) {
+                float v = xb[j];
+                if (v < 0.0f) v = -v;
+                if (v > amax) amax = v;
+            }
+            float d = amax / 127.0f;
+            uint16_t d_raw = gpu_fp32_to_fp16(d);
+            blk[0] = d_raw & 0xFF; blk[1] = (d_raw >> 8) & 0xFF;
+            float id = (amax != 0.0f) ? 127.0f / amax : 0.0f;
+            int8_t *qs = (int8_t *)(blk + 2);
+            for (int j = 0; j < 32; j++) {
+                int q = (int)lroundf(xb[j] * id);
+                if (q > 127) q = 127;
+                if (q < -128) q = -128;
+                qs[j] = (int8_t)q;
+            }
+        }
+    }
+}
+
 /* lines 232-259 from backend_gpu_kernels.cuh */
 __global__ void
 picolm_quantize_q8_0_strided(int8_t *qs_out, float *d_out,

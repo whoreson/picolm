@@ -1201,13 +1201,115 @@ int picolm_gpu_ssm_l2norm_batch_dev(float *xd, int hd, int nh, int nt, int ts, f
 }
 
 extern "C"
+/* Forward declaration: defined later in this file */
+__global__ void picolm_gpu_ssm_head_permute_batch_kernel(float *dst, const float *src,
+    const int *head_map, int head_dim, int n_heads, int n_tokens,
+    int src_stride, int dst_stride);
+
+/* IMMA-accelerated vecdot: x[n_tokens][dim] @ weights[n_heads][dim]^T -> y[n_tokens][n_heads].
+ * Mathematically a matmul with S=n_tokens, I=dim, O=n_heads.
+ * For Q8_0 weights: quantize x to Q8_0 on-device, dispatch IMMA/tiled/scalar kernel.
+ * For F32/BF16 weights: pre-quantize to Q8_0 on first use, cache in static buffer,
+ *   then dispatch IMMA/tiled/scalar kernel.
+ * For Q4_0: fall back to the serial vecdot kernel.
+ * When head_map != NULL, post-permute output from GGUF head order to natural head order. */
 int picolm_gpu_ssm_vecdot_batch_dev(float *od, const float *xd, const void *wd, gguf_type_t qt,
     int dim, int nvh, int nt, int rb, const int *hm, int dev, int in_stride, int out_stride) {
     if(nvh<=0||dim<=0||nt<=0) return 0;
     if(dim>PICOLM_SSM_VECDOT_MAX_DIM) return 0;
     gpu_device_ctx_t *ctx = find_ctx(dev);
     if(!ctx||!select_ctx(ctx)) return 0;
-    picolm_ssm_vecdot_batch_kernel<<<dim3((unsigned)nvh,(unsigned)nt),256,0,ctx->stream>>>(od,xd,wd,qt,dim,nvh,nt,rb,hm,in_stride,out_stride);
+
+    /* IMMA fast path for Q8_0, F32, BF16 weights */
+    if ((qt == GGUF_TYPE_Q8_0 || qt == GGUF_TYPE_F32 || qt == 30) && !getenv("PICOLM_FORCE_F32_MATMUL")) {
+        int n_blocks = dim / 32;
+        if (n_blocks >= 1 && dim % 32 == 0) {
+            void *wq8 = (void *)wd; /* Q8_0: use directly, others: use pre-quantized copy */
+            int wq8_rb = rb; /* Q8_0: use original row_bytes */
+
+            /* For F32/BF16: pre-quantize weights to Q8_0 once per (wd, qt, dim, nvh) */
+            if (qt != GGUF_TYPE_Q8_0) {
+                /* Static cache: one pre-quantized Q8_0 copy per device context.
+                 * The weights don't change between calls, so this is a one-time cost. */
+                static float *vd_wq8_cache = NULL;
+                static const void *vd_wq8_key = NULL;
+                static int vd_wq8_qt = -1;
+                static size_t vd_wq8_cap = 0;
+                size_t q8_rb = (size_t)n_blocks * GPU_BLOCK_Q8_0_SIZE;
+                size_t q8_bytes = (size_t)nvh * q8_rb;
+
+                if (vd_wq8_key != wd || vd_wq8_qt != (int)qt || q8_bytes > vd_wq8_cap) {
+                    if (!reserve(&vd_wq8_cache, &vd_wq8_cap, q8_bytes)) goto vecdot_serial;
+                    vd_wq8_key = wd;
+                    vd_wq8_qt = (int)qt;
+                    /* Quantize F32/BF16 weights to Q8_0 on-device */
+                    int src_stride = (qt == 30) ? rb / (int)sizeof(uint16_t) : rb / (int)sizeof(float);
+                    picolm_quantize_weights_to_q8_0<<<(unsigned)nvh, 32, 0, ctx->stream>>>(
+                        (void *)vd_wq8_cache, (const float *)wd, qt, dim, nvh, src_stride, q8_rb);
+                    if (!gpu_ok(gpuGetLastError(), "vecdot wq8 quantize")) goto vecdot_serial;
+                }
+                wq8 = (void *)vd_wq8_cache;
+                wq8_rb = (int)q8_rb;
+            }
+
+            /* Quantize strided input to Q8_0 */
+            size_t xq_bytes = (size_t)nt * dim;
+            size_t xd_bytes = (size_t)nt * n_blocks * sizeof(float);
+            if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, xq_bytes) ||
+                !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) goto vecdot_serial;
+
+            dim3 q_grid((unsigned)n_blocks, (unsigned)nt);
+            if (in_stride > 0 && in_stride != dim) {
+                picolm_quantize_q8_0_strided<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
+                    ctx->q8_xq, ctx->q8_xd, xd, dim, nt, in_stride);
+            } else {
+                picolm_quantize_q8_0<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
+                    ctx->q8_xq, ctx->q8_xd, xd, dim, nt);
+            }
+            if (!gpu_ok(gpuGetLastError(), "vecdot q8 quantize")) return 0;
+
+            int ys = out_stride > 0 ? out_stride : nvh;
+            float *y_target = od;
+            int y_tmp_needed = 0;
+            if (hm) {
+                size_t tmp_bytes = (size_t)nt * nvh * sizeof(float);
+                if (reserve(&ctx->gate, &ctx->gate_cap, tmp_bytes)) {
+                    y_target = ctx->gate;
+                    ys = nvh;
+                    y_tmp_needed = 1;
+                }
+            }
+
+            /* Dispatch: IMMA >= sm_80, else tiled, else scalar */
+            if (ctx->compute_major >= 8 && nt >= 16 && nvh >= 8) {
+                dim3 grid((unsigned)((nvh + 7) / 8), (unsigned)((nt + 15) / 16));
+                picolm_q8_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(
+                    y_target, ctx->q8_xq, ctx->q8_xd, wq8, nt, dim, nvh, wq8_rb, ys);
+            } else if (nt >= Q8_TILE_S && wq8_rb + 2048 <= 49152) {
+                dim3 grid((unsigned)nvh, (unsigned)((nt + Q8_TILE_S - 1) / Q8_TILE_S));
+                picolm_q8_q8_matmul_tiled<<<grid, 256, (unsigned)wq8_rb, ctx->stream>>>(
+                    y_target, ctx->q8_xq, ctx->q8_xd, wq8, nt, dim, nvh, wq8_rb, ys);
+            } else {
+                dim3 grid((unsigned)nvh, (unsigned)nt);
+                picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
+                    y_target, ctx->q8_xq, ctx->q8_xd, wq8, nt, dim, nvh, wq8_rb, ys);
+            }
+            if (!gpu_ok(gpuGetLastError(), "vecdot q8 matmul")) return 0;
+
+            if (y_tmp_needed) {
+                picolm_gpu_ssm_head_permute_batch_kernel<<<
+                    dim3((unsigned)nvh, (unsigned)nt), 1, 0, ctx->stream>>>(
+                    od, y_target, hm, 1, nvh, nt, nvh, ys);
+                if (!gpu_ok(gpuGetLastError(), "vecdot head permute")) return 0;
+            }
+            return 1;
+        }
+    }
+
+vecdot_serial:
+    /* Serial vecdot fallback for Q4_0 weights, misaligned dims, or OOM */
+    picolm_ssm_vecdot_batch_kernel<<<dim3((unsigned)nvh,(unsigned)nt),256,0,ctx->stream>>>(
+        od,xd,wd,qt,dim,nvh,nt,rb,hm,in_stride,out_stride);
     return gpu_ok(gpuGetLastError(),"vecdot batch dev");
 }
 
