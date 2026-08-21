@@ -649,7 +649,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
                 ctx->q8_xq, ctx->q8_xd, x_dev, I, S);
         }
         if (!gpu_ok(gpuGetLastError(), "q8 quantize (dev)")) return 0;
-        if (ctx->compute_major >= 8) {
+        if (ctx->compute_major >= 8 && S >= 16 && O >= 8) {
             dim3 grid((unsigned)((O + 7) / 8), (unsigned)((S + 15) / 16));
             picolm_q8_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(
                 y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
