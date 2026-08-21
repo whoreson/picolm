@@ -1337,8 +1337,9 @@ int picolm_gpu_ssm_vecdot_batch_dev(float *od, const float *xd, const void *wd, 
             }
 
             /* Quantize strided input to Q8_0 */
-            size_t xq_bytes = (size_t)nt * dim;
-            size_t xd_bytes = (size_t)nt * n_blocks * sizeof(float);
+            int nt_padded = (nt + 15) & ~15;
+            size_t xq_bytes = (size_t)nt_padded * dim;
+            size_t xd_bytes = (size_t)nt_padded * n_blocks * sizeof(float);
             if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, xq_bytes) ||
                 !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) goto vecdot_serial;
 
@@ -1485,10 +1486,11 @@ int picolm_gpu_expert_mlp_dev(picolm_gpu_tensor_t *g, picolm_gpu_tensor_t *u, pi
     int i_blocks = I / 32;
     if (d_blocks < 1 || i_blocks < 1) return 0;
 
-    size_t xq_d = (size_t)S * D;
-    size_t xd_d = (size_t)S * d_blocks * sizeof(float);
-    size_t xq_i = (size_t)S * I;
-    size_t xd_i = (size_t)S * i_blocks * sizeof(float);
+    int S_padded = (S + 15) & ~15;
+    size_t xq_d = (size_t)S_padded * D;
+    size_t xd_d = (size_t)S_padded * d_blocks * sizeof(float);
+    size_t xq_i = (size_t)S_padded * I;
+    size_t xd_i = (size_t)S_padded * i_blocks * sizeof(float);
     if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, xq_d > xq_i ? xq_d : xq_i) ||
         !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_d > xd_i ? xd_d : xd_i)) return 0;
 

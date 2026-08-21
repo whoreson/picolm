@@ -560,9 +560,13 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
         /* Upload fp32 input */
         if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
 
-        /* Allocate quantized input buffers: qs (int8_t[S*I]) + d (float[S*n_blocks]) */
-        size_t xq_bytes = (size_t)S * I;
-        size_t xd_bytes = (size_t)S * n_blocks * sizeof(float);
+        /* Allocate quantized input buffers: qs (int8_t[S*I]) + d (float[S*n_blocks])
+         * Round S up to multiple of 16 for IMMA kernel (reads up to S+15 in tail tile).
+         * The quantize kernel writes exactly S rows; the IMMA kernel reads up to S+15
+         * but only writes output for rows < S. Padding prevents OOB reads. */
+        int S_padded = (S + 15) & ~15;
+        size_t xq_bytes = (size_t)S_padded * I;
+        size_t xd_bytes = (size_t)S_padded * n_blocks * sizeof(float);
         if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, xq_bytes) ||
             !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
 
@@ -646,8 +650,9 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
     if (t->qtype == GGUF_TYPE_Q8_0 && !getenv("PICOLM_FORCE_F32_MATMUL")) {
         int n_blocks = I / 32;
         if (n_blocks < 1 || I % 32 != 0) return 0;
-        size_t xq_bytes = (size_t)S * I;
-        size_t xd_bytes = (size_t)S * n_blocks * sizeof(float);
+        int S_padded = (S + 15) & ~15;
+        size_t xq_bytes = (size_t)S_padded * I;
+        size_t xd_bytes = (size_t)S_padded * n_blocks * sizeof(float);
         if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, xq_bytes) ||
             !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
         gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
@@ -714,8 +719,9 @@ picolm_gpu_matmul_dev_strided(picolm_gpu_tensor_t *t, float *y_dev,
     if (t->qtype == GGUF_TYPE_Q8_0) {
         int n_blocks = I / 32;
         if (n_blocks < 1 || I % 32 != 0) return 0;
-        size_t xq_bytes = (size_t)S * I;
-        size_t xd_bytes = (size_t)S * n_blocks * sizeof(float);
+        int S_padded = (S + 15) & ~15;
+        size_t xq_bytes = (size_t)S_padded * I;
+        size_t xd_bytes = (size_t)S_padded * n_blocks * sizeof(float);
         if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, xq_bytes) ||
             !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
         gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
@@ -780,10 +786,12 @@ int picolm_gpu_expert_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
     int i_blocks = I / 32;
     if (d_blocks < 1 || i_blocks < 1) return 0; /* must be aligned */
 
-    size_t xq_d_bytes = (size_t)S * D;
-    size_t xd_d_bytes = (size_t)S * d_blocks * sizeof(float);
-    size_t xq_i_bytes = (size_t)S * I;
-    size_t xd_i_bytes = (size_t)S * i_blocks * sizeof(float);
+    /* Round S up for IMMA kernel tail-tile reads */
+    int S_padded = (S + 15) & ~15;
+    size_t xq_d_bytes = (size_t)S_padded * D;
+    size_t xd_d_bytes = (size_t)S_padded * d_blocks * sizeof(float);
+    size_t xq_i_bytes = (size_t)S_padded * I;
+    size_t xd_i_bytes = (size_t)S_padded * i_blocks * sizeof(float);
 
     if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, xq_d_bytes > xq_i_bytes ? xq_d_bytes : xq_i_bytes) ||
         !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_d_bytes > xd_i_bytes ? xd_d_bytes : xd_i_bytes)) return 0;
