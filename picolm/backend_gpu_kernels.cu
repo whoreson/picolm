@@ -398,46 +398,50 @@ __global__ void
 picolm_q8_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
                           const void *weights, int S, int I, int O,
                           int row_bytes, int y_stride) {
+    /* PTX ISA m16n8k32: groupID=t/4, tid_in_group=t%4 (ALL operands) */
+    int gid = gpuThreadIdx_x / 4;
+    int tid = gpuThreadIdx_x % 4;
     int tile_o = gpuBlockIdx_x * 8;
     int tile_s = gpuBlockIdx_y * 16;
-    int t = gpuThreadIdx_x;
     int ys = y_stride > 0 ? y_stride : O;
     int n_blocks = I / 32;
     const uint8_t *w = (const uint8_t *)weights;
     float sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     for (int kb = 0; kb < n_blocks; kb++) {
+        /* A: f=0->row=gid,col=tid*4; f=1->row=gid+8,col=tid*4
+           f=2->row=gid,col=tid*4+16; f=3->row=gid+8,col=tid*4+16 */
         int a0, a1, a2, a3;
         {
-            int r0 = t / 4;
-            int c0 = (t % 4) * 8;
-            int c1 = c0 + 4;
-            int r2 = r0 + 8;
-            int src0 = (int)(tile_s + r0) * I + kb * 32 + c0;
-            int src1 = (int)(tile_s + r0) * I + kb * 32 + c1;
-            int src2 = (int)(tile_s + r2) * I + kb * 32 + c0;
-            int src3 = (int)(tile_s + r2) * I + kb * 32 + c1;
+            int c0 = tid * 4;
+            int c2 = c0 + 16;
+            int src0 = (int)(tile_s + gid) * I + kb * 32 + c0;
+            int src1 = (int)(tile_s + gid + 8) * I + kb * 32 + c0;
+            int src2 = (int)(tile_s + gid) * I + kb * 32 + c2;
+            int src3 = (int)(tile_s + gid + 8) * I + kb * 32 + c2;
             int32_t *p = (int32_t *)(const int8_t *)(&xq[src0]); a0 = p[0];
             p = (int32_t *)(const int8_t *)(&xq[src1]); a1 = p[0];
             p = (int32_t *)(const int8_t *)(&xq[src2]); a2 = p[0];
             p = (int32_t *)(const int8_t *)(&xq[src3]); a3 = p[0];
         }
+        /* B: f=0->row=tid*4,col=gid; f=1->row=tid*4+16,col=gid */
         int b0, b1;
         {
-            int col = t % 8;
-            int k0 = (t / 8) * 8;
-            int k1 = k0 + 4;
-            int wc = tile_o + col;
+            int wc = tile_o + gid;
+            int r0 = tid * 4;
+            int r1 = r0 + 16;
             int8_t bv[8];
             for (int v = 0; v < 4; v++) {
-                int k = kb * 32 + k0 + v;
-                const uint8_t *wb = w + (size_t)wc * row_bytes + (size_t)(k / 32) * GPU_BLOCK_Q8_0_SIZE + 2;
+                int k = kb * 32 + r0 + v;
+                const uint8_t *wb = w + (size_t)wc * row_bytes +
+                                    (size_t)(k / 32) * GPU_BLOCK_Q8_0_SIZE + 2;
                 bv[v] = (int8_t)wb[k % 32];
             }
             memcpy(&b0, bv, 4);
             for (int v = 0; v < 4; v++) {
-                int k = kb * 32 + k1 + v;
-                const uint8_t *wb = w + (size_t)wc * row_bytes + (size_t)(k / 32) * GPU_BLOCK_Q8_0_SIZE + 2;
+                int k = kb * 32 + r1 + v;
+                const uint8_t *wb = w + (size_t)wc * row_bytes +
+                                    (size_t)(k / 32) * GPU_BLOCK_Q8_0_SIZE + 2;
                 bv[v] = (int8_t)wb[k % 32];
             }
             memcpy(&b1, bv, 4);
@@ -450,9 +454,11 @@ picolm_q8_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
             : "+r"(d0), "+r"(d1), "+r"(d2), "+r"(d3)
             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 #endif
+        /* D: f=0->row=gid,col=tid*2; f=1->row=gid,col=tid*2+1
+           f=2->row=gid+8,col=tid*2; f=3->row=gid+8,col=tid*2+1 */
         for (int f = 0; f < 4; f++) {
-            int row = ((f / 2) * 8) + (t / 4);
-            int col = (t % 4) * 2 + (f % 2);
+            int row = (f < 2) ? gid : gid + 8;
+            int col = tid * 2 + (f % 2);
             float dv = (f == 0) ? (float)d0 : (f == 1) ? (float)d1 : (f == 2) ? (float)d2 : (float)d3;
             float dx = xd[(size_t)(tile_s + row) * n_blocks + kb];
             int wc = tile_o + col;
@@ -462,8 +468,8 @@ picolm_q8_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
         }
     }
     for (int f = 0; f < 4; f++) {
-        int row = ((f / 2) * 8) + (t / 4);
-        int col = (t % 4) * 2 + (f % 2);
+        int row = (f < 2) ? gid : gid + 8;
+        int col = tid * 2 + (f % 2);
         int gr = tile_s + row;
         int gc = tile_o + col;
         if (gr < S && gc < O)
