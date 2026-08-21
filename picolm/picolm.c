@@ -8,6 +8,9 @@
 #ifdef PICOLM_VIZ
 #include "viz.h"
 #endif
+#ifdef PICOLM_GPU
+#include "backend_gpu.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -138,6 +141,10 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --cache <file> KV cache file (saves/loads prompt state)\n");
     fprintf(stderr, "  -ctk <type>    Key cache type: f16, q8_0, q4_0, tq3, tq4 (default: f16)\n");
     fprintf(stderr, "  -ctv <type>    Val cache type: f16, q8_0, q4_0, tq3, tq4 (default: f16)\n");
+    fprintf(stderr, "\nGPU debug options:\n");
+    fprintf(stderr, "  --gpu-diff <S> I O  Diff GPU kernels (IMMA vs scalar) on random input\n");
+    fprintf(stderr, "                  S=seq_len, I=input_dim, O=output_dim (must be multiples of 16/8/32)\n");
+    fprintf(stderr, "                  Example: --gpu-diff 32 512 1024\n");
     fprintf(stderr, "  -khad          Apply Walsh-Hadamard rotation to K cache before quantization\n");
     fprintf(stderr, "  -vhad          Apply Walsh-Hadamard rotation to V cache before quantization\n");
     fprintf(stderr, "\nServer slot options:\n");
@@ -349,6 +356,123 @@ static void bench_summary(const bench_ctx_t *bc, int iteration, double wall_sec)
     fprintf(stderr, "----------------------------------\n\n");
 }
 
+#ifdef PICOLM_GPU
+#include <cuda_runtime.h>
+
+/* Full struct definition needed from C (forward decl in tensor.h is opaque) */
+struct picolm_gpu_tensor {
+    void *weights;
+    int qtype;
+    int I, O, device;
+    size_t row_bytes;
+    int block_size;
+    int tracked;
+    int zero_copy;
+};
+
+/* GPU kernel diff test: quantize random input to Q8_0, run IMMA and scalar
+ * matmul on the same data, diff outputs. Used to validate kernel correctness. */
+static void gpu_matmul_diff(int S, int I, int O) {
+    if (I % 32 != 0) { fprintf(stderr, "I must be multiple of 32\n"); exit(1); }
+    if (S % 16 != 0) { fprintf(stderr, "S must be multiple of 16\n"); exit(1); }
+    if (O % 8 != 0) { fprintf(stderr, "O must be multiple of 8\n"); exit(1); }
+
+    size_t ib = (size_t)S * I * sizeof(float);
+    size_t ob = (size_t)S * O * sizeof(float);
+
+    float *x = (float *)malloc(ib);
+    float *y_imma = (float *)malloc(ob);
+    float *y_scalar = (float *)malloc(ob);
+    if (!x || !y_imma || !y_scalar) { fprintf(stderr, "OOM\n"); exit(1); }
+
+    /* Generate random weights as Q8_0 blocks on host */
+    int n_blocks = I / 32;
+    size_t w_bytes = (size_t)O * (2 + 32 * n_blocks);
+    uint8_t *w = (uint8_t *)malloc(w_bytes);
+    if (!w) { fprintf(stderr, "OOM\n"); exit(1); }
+
+    srand48(42);
+    for (int i = 0; i < S * I; i++) x[i] = (float)(drand48() * 2.0 - 1.0);
+
+    for (int o = 0; o < O; o++) {
+        for (int b = 0; b < n_blocks; b++) {
+            uint8_t *blk = w + (size_t)o * (2 + 32 * n_blocks) + b * 34;
+            float d = 0.01f + (float)drand48() * 0.1f;
+            /* FP16 conversion: use simple bit hack matching CPU path */
+            union { uint32_t u; float f; } u32;
+            u32.f = d;
+            uint16_t d16 = (uint16_t)(u32.u >> 16); /* crude but works for positive floats */
+            blk[0] = d16 & 0xFF;
+            blk[1] = (d16 >> 8) & 0xFF;
+            for (int j = 0; j < 32; j++)
+                blk[2 + j] = (uint8_t)((int)(drand48() * 256) - 128);
+        }
+    }
+
+    void *d_x, *d_y_imma, *d_y_scalar, *d_w;
+    cudaError_t e;
+    if ((e = cudaMalloc(&d_x, ib)) != cudaSuccess) { fprintf(stderr, "cudaMalloc x: %s\n", cudaGetErrorString(e)); exit(1); }
+    if ((e = cudaMalloc(&d_y_imma, ob)) != cudaSuccess) { fprintf(stderr, "cudaMalloc y: %s\n", cudaGetErrorString(e)); exit(1); }
+    if ((e = cudaMalloc(&d_y_scalar, ob)) != cudaSuccess) { fprintf(stderr, "cudaMalloc y: %s\n", cudaGetErrorString(e)); exit(1); }
+    if ((e = cudaMalloc(&d_w, w_bytes)) != cudaSuccess) { fprintf(stderr, "cudaMalloc w: %s\n", cudaGetErrorString(e)); exit(1); }
+    cudaMemcpy(d_x, x, ib, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_w, w, w_bytes, cudaMemcpyHostToDevice);
+
+    struct picolm_gpu_tensor tensor;
+    memset(&tensor, 0, sizeof(tensor));
+    tensor.I = I;
+    tensor.O = O;
+    tensor.qtype = 8; /* GGUF_TYPE_Q8_0 */
+    tensor.row_bytes = 2 + 32 * n_blocks;
+    tensor.weights = d_w;
+    tensor.device = 0;
+
+    /* Initialize GPU context */
+    int devs[1] = {0};
+    if (!picolm_gpu_init(devs, 1)) {
+        fprintf(stderr, "GPU init failed\n"); exit(1);
+    }
+
+    if (!picolm_gpu_matmul(&tensor, y_imma, x, S, 0)) {
+        fprintf(stderr, "IMMA matmul failed (I=%d O=%d S=%d, need I>=512 O>=256)\n", I, O, S); exit(1);
+    }
+
+    setenv("PICOLM_FORCE_F32_MATMUL", "1", 1);
+    if (!picolm_gpu_matmul(&tensor, y_scalar, x, S, 0)) {
+        fprintf(stderr, "Scalar matmul failed\n"); exit(1);
+    }
+    unsetenv("PICOLM_FORCE_F32_MATMUL");
+
+    float max_abs_err = 0.0f, max_rel_err = 0.0f;
+    int max_err_pos = 0;
+    size_t n = (size_t)S * O;
+    for (size_t i = 0; i < n; i++) {
+        float diff = y_imma[i] - y_scalar[i];
+        if (diff < 0) diff = -diff;
+        float rel = (fabsf(y_scalar[i]) > 1e-8f) ? diff / fabsf(y_scalar[i]) : diff;
+        if (diff > max_abs_err) {
+            max_abs_err = diff; max_rel_err = rel; max_err_pos = (int)i;
+        }
+    }
+
+    int sy = max_err_pos / O, oy = max_err_pos % O;
+    fprintf(stderr, "GPU kernel diff: S=%d I=%d O=%d, %zu elements\n", S, I, O, n);
+    fprintf(stderr, "  max_abs_err = %.6f (at s=%d, o=%d)\n", max_abs_err, sy, oy);
+    fprintf(stderr, "  max_rel_err = %.6f\n", max_rel_err);
+    fprintf(stderr, "  y_imma[%d][%d] = %f\n", sy, oy, y_imma[max_err_pos]);
+    fprintf(stderr, "  y_scalar[%d][%d] = %f\n", sy, oy, y_scalar[max_err_pos]);
+
+    if (max_rel_err > 0.01f) {
+        fprintf(stderr, "  RESULT: FAIL (rel_err > 1%%)\n");
+    } else {
+        fprintf(stderr, "  RESULT: PASS (rel_err <= 1%%)\n");
+    }
+
+    cudaFree(d_x); cudaFree(d_y_imma); cudaFree(d_y_scalar); cudaFree(d_w);
+    free(x); free(y_imma); free(y_scalar); free(w);
+}
+#endif
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         usage(argv[0]);
@@ -374,6 +498,8 @@ int main(int argc, char **argv) {
     int    v_cache_hadamard = 0;  /* -vhad: Walsh-Hadamard rotation for V cache */
     int    mem_mb = 0;      /* --mem budget in megabytes (0=disabled) */
     int    do_prefault = 0; /* --prefault (touch all mmap pages at load time) */
+    int    gpu_diff = 0;    /* --gpu-diff S I O */
+    int    gpu_diff_S = 32, gpu_diff_I = 512, gpu_diff_O = 1024;
     #if !defined(_WIN32) && !defined(PICOLM_DOS)
     int    server_daemon = 0;
 #endif
@@ -475,6 +601,11 @@ int main(int argc, char **argv) {
             checkpoint_tail_offset = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--slot-save-path") == 0 && i + 1 < argc) {
             slot_save_path = argv[++i];
+        } else if (strcmp(argv[i], "--gpu-diff") == 0 && i + 3 < argc) {
+            gpu_diff = 1;
+            gpu_diff_S = atoi(argv[++i]);
+            gpu_diff_I = atoi(argv[++i]);
+            gpu_diff_O = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--ssm-batched") == 0) {
             /* no-op: batched is now the default */
         } else if (strcmp(argv[i], "--ssm-serial") == 0) {
@@ -507,6 +638,16 @@ int main(int argc, char **argv) {
             usage(argv[0]);
             return 1;
         }
+    }
+
+    /* --gpu-diff: standalone GPU kernel diff test, no model needed */
+    if (gpu_diff) {
+        if (getenv("PICOLM_GPU") == NULL) {
+            fprintf(stderr, "GPU not available (PICOLM_GPU not set)\n");
+            return 1;
+        }
+        gpu_matmul_diff(gpu_diff_S, gpu_diff_I, gpu_diff_O);
+        return 0;
     }
 
     /* --list-tensors / --list-kv: now that model_path is known regardless of arg order */
