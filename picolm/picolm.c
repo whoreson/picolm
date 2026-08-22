@@ -24,11 +24,8 @@
 #include <fcntl.h>
 #endif
 #ifdef PICOLM_GPU
-/* cuda_profiler_api.h is CUDA-only; HIP has no equivalent.
- * Only include when building with CUDA (PICOLM_CUDA defined in Makefile). */
-#ifdef PICOLM_CUDA
+/* cuda_profiler_api.h is CUDA-only; HIP has no equivalent. */
 #include <cuda_profiler_api.h>
-#endif
 #endif
 #ifdef _OPENMP
 #include <omp.h>
@@ -473,6 +470,10 @@ static void benchmark_context_scaling(const char *model_path, const char *base_p
         int ctx_at_step = start_pos;
 
         /* Prefill only the NEW tokens at start_pos */
+#ifdef PICOLM_GPU
+        if (ctx_at_step == 0) { cudaProfilerStart(); }
+        else if (ctx_at_step > 1000) { cudaProfilerStart(); }
+#endif
         double t0 = get_time_ms();
 
         float *logits = NULL;
@@ -490,6 +491,10 @@ static void benchmark_context_scaling(const char *model_path, const char *base_p
         }
 
         double t_prefill = get_time_ms();
+#ifdef PICOLM_GPU
+        if (ctx_at_step == 0) { cudaProfilerStop(); }
+        else if (ctx_at_step > 1000) { cudaProfilerStop(); }
+#endif
         float prefill_ms = (float)(t_prefill - t0);
         start_pos += n_base;  /* advance cached position past new tokens */
 
