@@ -716,8 +716,11 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
         if (!gpu_ok(gpuGetLastError(), "q8 matmul (dev)")) return 0;
         return 1;
     }
-    /* FP16/BF16 tiled path for device-resident tensors */
+    /* FP16/BF16 tiled path for device-resident tensors.
+     * Tiled kernel assumes contiguous x (stride == I); fall through to
+     * generic path when x_stride is set and differs from I. */
     if ((t->qtype == GGUF_TYPE_F16 || t->qtype == GGUF_TYPE_BF16) &&
+        (x_stride <= 0 || x_stride == I) &&
         S >= F16_TILE_S && (int)t->row_bytes + 2048 <= 49152) {
         dim3 grid((unsigned)O, (unsigned)((S + F16_TILE_S - 1) / F16_TILE_S));
         unsigned smem = (unsigned)(t->row_bytes + 256 * sizeof(double));
