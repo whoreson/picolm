@@ -1541,7 +1541,6 @@ picolm_gpu_attention_prefill_fa2_kernel(
         }
     }
     gpuSyncthreads();
-    gpuSyncthreads();
 
     /* Phase 2: Init all 64 Q rows */
     for (int i = t; i < 64 * head_dim; i += 128) acc_sh[i] = 0.0f;
@@ -1566,7 +1565,12 @@ picolm_gpu_attention_prefill_fa2_kernel(
         gpuSyncthreads();
 
         { for (int i = lt; i < 16 * FA2_TILE_K; i += 32) score_sh[(warp*FA2_TILE_Q) * FA2_TILE_K + i] = 0.0f; }
+        /* Warp-level sync: each warp only reads its own score_sh region */
+#ifndef __HIP__
+        __syncwarp();
+#else
         gpuSyncthreads();
+#endif
 
         for (int k16 = 0; k16 < n_k16; k16++) {
 #ifndef __HIP__
@@ -1604,24 +1608,14 @@ picolm_gpu_attention_prefill_fa2_kernel(
                     if (k < tk_size) score_sh[(warp*FA2_TILE_Q + groupID + 8) * FA2_TILE_K + k] += d3;
                 }
             }
-#else
-            /* HIP scalar fallback: each thread computes 2 score elements */
-            for (int ki8 = 0; ki8 < tk_size; ki8++) {
-                int ki = ki8 + groupID;
-                for (int qo = tid_in_grp; qo < 16; qo += 4) {
-                    float s = 0.0f;
-                    for (int d = 0; d < head_dim; d++) {
-                        float qv = gpu_fp16_to_fp32(q_tile_sh[(warp*FA2_TILE_Q + qo) * head_dim + d]);
-                        float kv = ki < tk_size ? gpu_fp16_to_fp32(k_tile_sh[ki * head_dim + d]) : 0.0f;
-                        s += qv * kv;
-                    }
-                    if (ki8 < tk_size)
-                        score_sh[(warp*FA2_TILE_Q + qo) * FA2_TILE_K + ki8] = s;
-                }
-            }
-#endif
+#endif /* !__HIP__ */
         }
+        /* Warp-level sync: each warp only reads its own score_sh region */
+#ifndef __HIP__
+        __syncwarp();
+#else
         gpuSyncthreads();
+#endif
 
         /* Softmax + V accumulation per K-tile */
         {
