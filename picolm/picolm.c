@@ -145,6 +145,9 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --gpu-diff <S> I O  Diff GPU kernels (IMMA vs scalar) on random input\n");
     fprintf(stderr, "                  S=seq_len, I=input_dim, O=output_dim (must be multiples of 16/8/32)\n");
     fprintf(stderr, "                  Example: --gpu-diff 32 512 1024\n");
+    fprintf(stderr, "  --gpu-attn-diff <n_tok> <n_heads> <n_kv_heads> <head_dim>  Diff attention (FA2 vs scalar)\n");
+    fprintf(stderr, "                  Generates random Q/K/V, runs FA2 and scalar kernels, diffs output.\n");
+    fprintf(stderr, "                  n_tok must be >= 64, head_dim must be multiple of 16.\n");
     fprintf(stderr, "  -khad          Apply Walsh-Hadamard rotation to K cache before quantization\n");
     fprintf(stderr, "  -vhad          Apply Walsh-Hadamard rotation to V cache before quantization\n");
     fprintf(stderr, "\nServer slot options:\n");
@@ -471,6 +474,102 @@ static void gpu_matmul_diff(int S, int I, int O) {
     cudaFree(d_x); cudaFree(d_y_imma); cudaFree(d_y_scalar); cudaFree(d_w);
     free(x); free(y_imma); free(y_scalar); free(w);
 }
+
+/* GPU attention diff test: generate random Q/K/V, run FA2 and scalar
+ * attention kernels, diff the output. No model needed. */
+static void gpu_attn_diff_test(int n_tokens, int n_heads, int n_kv_heads, int head_dim) {
+    if (n_tokens < 64) { fprintf(stderr, "n_tokens must be >= 64\n"); exit(1); }
+    if (head_dim % 16 != 0) { fprintf(stderr, "head_dim must be multiple of 16\n"); exit(1); }
+    if (n_heads % n_kv_heads != 0) { fprintf(stderr, "n_heads must be multiple of n_kv_heads\n"); exit(1); }
+
+    /* Initialize GPU */
+    int devs[1] = {0};
+    if (!picolm_gpu_init(devs, 1)) { fprintf(stderr, "GPU init failed\n"); exit(1); }
+
+    size_t q_bytes = (size_t)n_tokens * n_heads * head_dim * sizeof(float);
+    size_t kv_bytes = (size_t)n_tokens * n_kv_heads * head_dim * sizeof(uint16_t);
+    size_t out_bytes = q_bytes;
+
+    /* Allocate host buffers */
+    float *q_h = (float *)malloc(q_bytes);
+    uint16_t *k_h = (uint16_t *)malloc(kv_bytes);
+    uint16_t *v_h = (uint16_t *)malloc(kv_bytes);
+    float *y_fa2 = (float *)malloc(out_bytes);
+    float *y_scalar = (float *)malloc(out_bytes);
+    if (!q_h || !k_h || !v_h || !y_fa2 || !y_scalar) { fprintf(stderr, "OOM\n"); exit(1); }
+
+    /* Generate random Q (FP32), K (FP16), V (FP16) */
+    srand48(12345);
+    for (int i = 0; i < n_tokens * n_heads * head_dim; i++) {
+        q_h[i] = (float)(drand48() * 2.0 - 1.0) * 0.5f;
+    }
+    for (int i = 0; i < n_tokens * n_kv_heads * head_dim; i++) {
+        float vf = (float)(drand48() * 2.0 - 1.0) * 0.5f;
+        union { uint32_t u; float f; } u32;
+        u32.f = vf;
+        k_h[i] = u32.u >> 16;
+        vf = (float)(drand48() * 2.0 - 1.0) * 0.5f;
+        u32.f = vf;
+        v_h[i] = u32.u >> 16;
+    }
+
+    /* Set up KV cache (required by attention kernels) */
+    size_t layer_kv_bytes = (size_t)n_tokens * n_kv_heads * head_dim * sizeof(uint16_t);
+    int max_seq_len = n_tokens;
+    if (!picolm_gpu_kv_alloc(layer_kv_bytes, layer_kv_bytes, 0)) { fprintf(stderr, "KV alloc failed\n"); exit(1); }
+
+    /* Store K and V into KV cache using host API */
+    size_t row_bytes = (size_t)n_kv_heads * head_dim * sizeof(uint16_t);
+    /* k_h and v_h are flat [n_tokens][n_kv_heads][head_dim] uint16_t */
+    for (int p = 0; p < n_tokens; p++) {
+        uint16_t *row = k_h + (size_t)p * n_kv_heads * head_dim;
+        picolm_gpu_kv_store_rows(1, 0, p, 1, row, row_bytes,
+            n_kv_heads, head_dim, max_seq_len, 0);
+    }
+    for (int p = 0; p < n_tokens; p++) {
+        uint16_t *row = v_h + (size_t)p * n_kv_heads * head_dim;
+        picolm_gpu_kv_store_rows(0, 0, p, 1, row, row_bytes,
+            n_kv_heads, head_dim, max_seq_len, 0);
+    }
+
+    /* FA2 attention via host path (handles Q upload internally) */
+    unsetenv("PICOLM_FORCE_SCALAR_ATTN");
+    if (!picolm_gpu_attention_prefill(y_fa2, q_h, 0, 0, n_tokens,
+            n_heads, n_kv_heads, head_dim, max_seq_len, 0)) {
+        fprintf(stderr, "FA2 attention failed\n"); exit(1);
+    }
+
+    /* Scalar attention */
+    setenv("PICOLM_FORCE_SCALAR_ATTN", "1", 1);
+    if (!picolm_gpu_attention_prefill(y_scalar, q_h, 0, 0, n_tokens,
+            n_heads, n_kv_heads, head_dim, max_seq_len, 0)) {
+        fprintf(stderr, "Scalar attention failed\n"); exit(1);
+    }
+    unsetenv("PICOLM_FORCE_SCALAR_ATTN");
+
+    /* Diff */
+    float max_abs = 0, max_rel = 0;
+    int max_pos = 0;
+    size_t n = (size_t)n_tokens * n_heads * head_dim;
+    for (size_t i = 0; i < n; i++) {
+        float diff = y_fa2[i] - y_scalar[i];
+        if (diff < 0) diff = -diff;
+        float rel = (fabsf(y_scalar[i]) > 1e-8f) ? diff / fabsf(y_scalar[i]) : diff;
+        if (diff > max_abs) { max_abs = diff; max_rel = rel; max_pos = (int)i; }
+    }
+    int tk = max_pos / (n_heads * head_dim);
+    int hh = (max_pos / head_dim) % n_heads;
+    int dd = max_pos % head_dim;
+    fprintf(stderr, "GPU attn diff: %d tok, %d heads, %d kv_heads, hd=%d, %zu elements\n",
+        n_tokens, n_heads, n_kv_heads, head_dim, n);
+    fprintf(stderr, "  max_abs_err = %.6f (tok=%d, head=%d, dim=%d)\n",
+        max_abs, tk, hh, dd);
+    fprintf(stderr, "  max_rel_err = %.6f\n", max_rel);
+    if (max_rel > 0.01f) fprintf(stderr, "  RESULT: DIFFER (rel_err > 1%%)\n");
+    else fprintf(stderr, "  RESULT: MATCH (rel_err <= 1%%)\n");
+
+    free(q_h); free(k_h); free(v_h); free(y_fa2); free(y_scalar);
+}
 #endif
 
 int main(int argc, char **argv) {
@@ -500,6 +599,8 @@ int main(int argc, char **argv) {
     int    do_prefault = 0; /* --prefault (touch all mmap pages at load time) */
     int    gpu_diff = 0;    /* --gpu-diff S I O */
     int    gpu_diff_S = 32, gpu_diff_I = 512, gpu_diff_O = 1024;
+    int    do_attn_diff = 0;  /* --gpu-attn-diff n_tok n_heads n_kv_heads head_dim */
+    int    attn_n_tok = 64, attn_n_heads = 40, attn_n_kv = 8, attn_head_dim = 128;
     #if !defined(_WIN32) && !defined(PICOLM_DOS)
     int    server_daemon = 0;
 #endif
@@ -606,6 +707,12 @@ int main(int argc, char **argv) {
             gpu_diff_S = atoi(argv[++i]);
             gpu_diff_I = atoi(argv[++i]);
             gpu_diff_O = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--gpu-attn-diff") == 0 && i + 4 < argc) {
+            do_attn_diff = 1;
+            attn_n_tok = atoi(argv[++i]);
+            attn_n_heads = atoi(argv[++i]);
+            attn_n_kv = atoi(argv[++i]);
+            attn_head_dim = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--ssm-batched") == 0) {
             /* no-op: batched is now the default */
         } else if (strcmp(argv[i], "--ssm-serial") == 0) {
@@ -638,6 +745,16 @@ int main(int argc, char **argv) {
             usage(argv[0]);
             return 1;
         }
+    }
+
+    /* --gpu-attn-diff: attention kernel diff test (FA2 vs scalar) */
+    if (do_attn_diff) {
+        if (getenv("PICOLM_GPU") == NULL) {
+            fprintf(stderr, "GPU not available (PICOLM_GPU not set)\n");
+            return 1;
+        }
+        gpu_attn_diff_test(attn_n_tok, attn_n_heads, attn_n_kv, attn_head_dim);
+        return 0;
     }
 
     /* --gpu-diff: standalone GPU kernel diff test, no model needed */
