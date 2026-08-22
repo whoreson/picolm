@@ -148,6 +148,11 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --gpu-attn-diff <n_tok> <n_heads> <n_kv_heads> <head_dim>  Diff attention (FA2 vs scalar)\n");
     fprintf(stderr, "                  Generates random Q/K/V, runs FA2 and scalar kernels, diffs output.\n");
     fprintf(stderr, "                  n_tok must be >= 64, head_dim must be multiple of 16.\n");
+    fprintf(stderr, "  --benchmark-ctx          Benchmark prefill+gen speed at growing context sizes.\n");
+    fprintf(stderr, "                  Works with -c to set max context. Starts from a base prompt,\n");
+    fprintf(stderr, "                  appends generated tokens, and at each step inserts 2 new tokens\n");
+    fprintf(stderr, "                  before the cached content to force a fresh prefill over the\n");
+    fprintf(stderr, "                  growing cached context. Outputs CSV: ctx_size,prefill_tok/s,gen_tok/s\n");
     fprintf(stderr, "  -khad          Apply Walsh-Hadamard rotation to K cache before quantization\n");
     fprintf(stderr, "  -vhad          Apply Walsh-Hadamard rotation to V cache before quantization\n");
     fprintf(stderr, "\nServer slot options:\n");
@@ -372,6 +377,138 @@ struct picolm_gpu_tensor {
     int tracked;
     int zero_copy;
 };
+
+/* Context scaling benchmark: --benchmark-ctx
+ * Mirrors bench5.py: starts from a base prompt, generates tokens,
+ * then at each step appends the base prompt again to force a prefill
+ * over the growing cached context. Reports prefill and gen tok/s at
+ * each context size.
+ *
+ * The key difference from the main generation loop:
+ * - We ignore EOS tokens (force continue)
+ * - We measure timing per step
+ * - We output CSV: ctx_size,prefill_tok/s,gen_tok/s
+ */
+static void benchmark_context_scaling(const char *model_path, const char *base_prompt,
+        int ctx_size_limit, float temperature, int top_k, int max_tokens,
+        uint64_t seed, int num_threads, int do_prefault) {
+
+    fprintf(stderr, "Loading model %s...\n", model_path);
+    model_t model;
+    if (model_load(&model, model_path, ctx_size_limit,
+            KV_CACHE_F16, KV_CACHE_F16, 0, 0, num_threads) != 0) {
+        fprintf(stderr, "Failed to load model\n"); exit(1);
+    }
+
+    fprintf(stderr, "Loading tokenizer...\n");
+    tokenizer_t tokenizer;
+    int use_qwen_tok = qwen_tokenize_should_use(&model);
+    qwen_enc_t qwen_enc;
+    if (use_qwen_tok) {
+        qwen_tokenize_init(&qwen_enc, &model);
+        tokenizer.bos_id = qwen_enc.bos_id;
+        tokenizer.eos_id = qwen_enc.eos_id;
+        tokenizer.vocab_size = qwen_enc.vocab_size;
+    } else {
+        tokenizer_load(&tokenizer, &model);
+    }
+
+    /* Tokenize base prompt */
+    int *base_tokens = NULL;
+    int n_base = 0;
+    if (use_qwen_tok) {
+        n_base = qwen_tokenize_encode(&qwen_enc, base_prompt, NULL, 0);
+        if (n_base < 0) n_base = -n_base;
+        base_tokens = malloc(n_base * sizeof(int));
+        qwen_tokenize_encode(&qwen_enc, base_prompt, base_tokens, n_base + 1);
+    } else {
+        base_tokens = malloc(1024 * sizeof(int));
+        n_base = tokenizer_encode(&tokenizer, base_prompt, base_tokens, 1024, model.tok_add_bos);
+    }
+
+    fprintf(stderr, "Base prompt: %d tokens\n", n_base);
+
+    /* Init sampler */
+    sampler_t sampler;
+    sampler_init(&sampler, temperature, 0.95f, top_k, 0.05f, seed);
+
+    /* Allocate prompt buffer (grows as context grows) */
+    int *prompt_tokens = malloc(ctx_size_limit * sizeof(int));
+    memcpy(prompt_tokens, base_tokens, n_base * sizeof(int));
+    int total_tokens = n_base;
+
+    /* Output CSV header */
+    fprintf(stderr, "ctx_size,prefill_tok/s,gen_tok/s\n");
+
+    /* Benchmark loop: grow context by generating, then prepend 2 extra tokens */
+    int extra_prefix[2] = {264, 464};  /* space + "The" - common tokens */
+    srand48(seed);
+    const int chunk_size = max_tokens;  /* tokens to generate per step */
+
+    while (total_tokens < ctx_size_limit) {
+        /* Prepare prompt: 2 extra tokens + all cached tokens */
+        int *step_prompt = malloc((2 + total_tokens) * sizeof(int));
+        step_prompt[0] = extra_prefix[0];
+        step_prompt[1] = extra_prefix[1];
+        memcpy(step_prompt + 2, prompt_tokens, total_tokens * sizeof(int));
+        int step_n = 2 + total_tokens;
+
+        /* Record current context size (the cached part) */
+        int ctx_at_step = total_tokens;
+
+        /* Prefill */
+        double t0 = get_time_ms();
+
+        float *logits = NULL;
+#ifdef PICOLM_GPU
+        if (getenv("PICOLM_GPU") && model.gpu.kv_active) {
+            logits = model_forward_prefill_gpu(&model, step_prompt, step_n, 0, NULL);
+            if (!logits)
+#endif
+                logits = model_forward_prefill(&model, step_prompt, step_n, 0, NULL);
+#ifdef PICOLM_GPU
+        } else
+#endif
+        {
+            logits = model_forward_prefill(&model, step_prompt, step_n, 0, NULL);
+        }
+
+        double t_prefill = get_time_ms();
+        float prefill_ms = (float)(t_prefill - t0);
+
+        /* Generate tokens */
+        int pos = step_n - 1;
+        int n_gen = 0;
+        for (; n_gen < chunk_size; n_gen++) {
+            if (!logits) break;
+            int next = sampler_sample(&sampler, logits, model.config.vocab_size);
+
+            total_tokens++;
+            if (total_tokens <= ctx_size_limit)
+                prompt_tokens[total_tokens - 1] = next;
+
+            logits = model_forward(&model, next, pos);
+            pos++;
+        }
+
+        double t_end = get_time_ms();
+        float gen_ms = (float)(t_end - t_prefill);
+
+        float prefill_tok_per_sec = (prefill_ms > 0) ? ((float)(step_n) * 1000.0f / prefill_ms) : 0;
+        float gen_tok_per_sec = (gen_ms > 0) ? ((float)n_gen * 1000.0f / gen_ms) : 0;
+
+        fprintf(stderr, "%d,%.1f,%.1f\n", ctx_at_step, prefill_tok_per_sec, gen_tok_per_sec);
+        fflush(stderr);
+
+        free(step_prompt);
+
+        if (total_tokens >= ctx_size_limit) break;
+    }
+
+    free(prompt_tokens);
+    if (use_qwen_tok) free(base_tokens);
+    else free(base_tokens);
+}
 
 /* GPU kernel diff test: quantize random input to Q8_0, run IMMA and scalar
  * matmul on the same data, diff outputs. Used to validate kernel correctness. */
@@ -609,6 +746,7 @@ int main(int argc, char **argv) {
     int    gpu_diff_S = 32, gpu_diff_I = 512, gpu_diff_O = 1024;
     int    do_attn_diff = 0;  /* --gpu-attn-diff n_tok n_heads n_kv_heads head_dim */
     int    attn_n_tok = 64, attn_n_heads = 40, attn_n_kv = 8, attn_head_dim = 128;
+    int    do_benchmark_ctx = 0;  /* --benchmark-ctx */
     #if !defined(_WIN32) && !defined(PICOLM_DOS)
     int    server_daemon = 0;
 #endif
@@ -721,6 +859,8 @@ int main(int argc, char **argv) {
             attn_n_heads = atoi(argv[++i]);
             attn_n_kv = atoi(argv[++i]);
             attn_head_dim = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--benchmark-ctx") == 0) {
+            do_benchmark_ctx = 1;
         } else if (strcmp(argv[i], "--ssm-batched") == 0) {
             /* no-op: batched is now the default */
         } else if (strcmp(argv[i], "--ssm-serial") == 0) {
@@ -772,6 +912,15 @@ int main(int argc, char **argv) {
             return 1;
         }
         gpu_matmul_diff(gpu_diff_S, gpu_diff_I, gpu_diff_O);
+        return 0;
+    }
+
+    /* --benchmark-ctx: context scaling benchmark */
+    if (do_benchmark_ctx) {
+        if (!model_path) { fprintf(stderr, "No model file specified\n"); usage(argv[0]); return 1; }
+        benchmark_context_scaling(model_path, prompt ? prompt :
+            "You are standing in a dungeon. The darkness surrounds you, making it impossible to see more than a few feet in front of you. The air is thick with the stench of rot and decay. A faint luminescent glow emanates from your right hand.",
+            context_override, temperature, top_k, max_tokens, seed, num_threads, do_prefault);
         return 0;
     }
 
