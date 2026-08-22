@@ -64,6 +64,7 @@
 #define gpuMalloc hipMalloc
 #define gpuFree hipFree
 #define gpuMemcpy hipMemcpy
+#define gpuMemcpyKind hipMemcpyKind
 #define gpuMemcpyHostToDevice hipMemcpyHostToDevice
 #define gpuMemcpyDeviceToHost hipMemcpyDeviceToHost
 #define gpuMemcpyDeviceToDevice hipMemcpyDeviceToDevice
@@ -123,6 +124,7 @@ typedef hipEvent_t gpuEvent_t;
 #define gpuMalloc cudaMalloc
 #define gpuFree cudaFree
 #define gpuMemcpy cudaMemcpy
+#define gpuMemcpyKind cudaMemcpyKind
 #define gpuMemcpyHostToDevice cudaMemcpyHostToDevice
 #define gpuMemcpyDeviceToHost cudaMemcpyDeviceToHost
 #define gpuMemcpyDeviceToDevice cudaMemcpyDeviceToDevice
@@ -234,6 +236,10 @@ __host__ __device__ PICOLM_UNUSED static inline unsigned short gpu_fp32_to_fp16(
 /* ---- Forward declarations for cross-module host calls ---- */
 typedef struct {
     int device; int compute_major, compute_minor;
+    /* Platform capabilities: set at init time.
+     * has_imma: NVIDIA Turing+ (sm_80+) INT8 Tensor Cores (m16n8k32).
+     *   Not available on HIP or Metal (no PTX). */
+    int has_imma;
     float *x, *y, *gate, *up;
     size_t x_cap, y_cap, gate_cap, up_cap;
     float *host_x, *host_y;

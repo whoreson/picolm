@@ -153,6 +153,11 @@ int picolm_gpu_init(const int *devices, int count) {
         }
         ctx->compute_major = prop.major;
         ctx->compute_minor = prop.minor;
+#ifdef __HIP__
+        ctx->has_imma = 0;  /* HIP: no NVIDIA PTX IMMA support */
+#else
+        ctx->has_imma = (prop.major >= 8);  /* NVIDIA: Turing+ sm_80 */
+#endif
         if (!gpu_ok(gpuStreamCreateWithFlags(&ctx->stream,
 #ifdef __HIP__
                                               hipStreamNonBlocking
@@ -577,7 +582,7 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
         if (!gpu_ok(gpuGetLastError(), "q8 quantize") ||
             !gpu_ok(gpuDeviceSynchronize(), "q8 quantize sync")) return 0;
 
-        if (ctx->compute_major >= 8 && S >= 16 && O >= 8) {
+        if (ctx->has_imma && S >= 16 && O >= 8) {
             gpu_dispatch_print("matmul_imma_host");
             dim3 grid((unsigned)((O + 7) / 8), (unsigned)((S + 15) / 16));
             picolm_q8_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(
@@ -666,7 +671,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
                 ctx->q8_xq, ctx->q8_xd, x_dev, I, S);
         }
         if (!gpu_ok(gpuGetLastError(), "q8 quantize (dev)")) return 0;
-        if (ctx->compute_major >= 8 && S >= 16 && O >= 8) {
+        if (ctx->has_imma && S >= 16 && O >= 8) {
             gpu_dispatch_print("matmul_imma_dev");
             dim3 grid((unsigned)((O + 7) / 8), (unsigned)((S + 15) / 16));
             picolm_q8_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(
@@ -803,7 +808,7 @@ int picolm_gpu_expert_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
     if (!gpu_ok(gpuGetLastError(), "expert q8 quantize input")) return 0;
 
     /* Step 2: gate = q8_q8 matmul(input_q8, gate_weights) -> F32[I*S] */
-    if (ctx->compute_major >= 8 && S >= 16 && I >= 8) {
+    if (ctx->has_imma && S >= 16 && I >= 8) {
         gpu_dispatch_print("expert_mlp_gate_imma_host");
         dim3 grid((unsigned)((I + 7) / 8), (unsigned)((S + 15) / 16));
         picolm_q8_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(
@@ -822,7 +827,7 @@ int picolm_gpu_expert_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
     if (!gpu_ok(gpuGetLastError(), "expert q8 gate")) return 0;
 
     /* Step 3: up = q8_q8 matmul(input_q8, up_weights) -> F32[I*S] */
-    if (ctx->compute_major >= 8 && S >= 16 && I >= 8) {
+    if (ctx->has_imma && S >= 16 && I >= 8) {
         gpu_dispatch_print("expert_mlp_up_imma_host");
         dim3 grid((unsigned)((I + 7) / 8), (unsigned)((S + 15) / 16));
         picolm_q8_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(
@@ -852,7 +857,7 @@ int picolm_gpu_expert_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
     if (!gpu_ok(gpuGetLastError(), "expert q8 quantize hidden")) return 0;
 
     /* Step 6: y = q8_q8 matmul(hidden_q8, down_weights) -> F32[D*S] */
-    if (ctx->compute_major >= 8 && S >= 16 && D >= 8) {
+    if (ctx->has_imma && S >= 16 && D >= 8) {
         gpu_dispatch_print("expert_mlp_down_imma_host");
         dim3 grid((unsigned)((D + 7) / 8), (unsigned)((S + 15) / 16));
         picolm_q8_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(

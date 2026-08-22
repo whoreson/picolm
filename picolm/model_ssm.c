@@ -5,7 +5,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #ifdef PICOLM_GPU
+#ifdef PICOLM_CUDA
 #include <cuda_profiler_api.h>
+#endif
 #endif
 #ifdef PICOLM_DOS
 #include <alloca.h>
@@ -4304,7 +4306,9 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
 float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt) {
 #ifdef PICOLM_GPU
     /* Allow nsys to skip model upload: profile only this function */
+#ifdef PICOLM_CUDA
     cudaProfilerStart();
+#endif
     /* Diagnostic: print GPU memory state at prefill entry */
     { size_t fb=0,tb=0;
       if(picolm_gpu_mem_info(m->gpu.device, &fb, &tb))
@@ -4763,7 +4767,9 @@ void picolm_ssm_state_sync_to_device(model_t *m, int device) {
         }
     }
 #ifdef PICOLM_GPU
+    #ifdef PICOLM_CUDA
     cudaProfilerStop();
+#endif
 #endif
 }
 

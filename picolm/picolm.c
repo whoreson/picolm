@@ -24,7 +24,11 @@
 #include <fcntl.h>
 #endif
 #ifdef PICOLM_GPU
+/* cuda_profiler_api.h is CUDA-only; HIP has no equivalent.
+ * Only include when building with CUDA (PICOLM_CUDA defined in Makefile). */
+#ifdef PICOLM_CUDA
 #include <cuda_profiler_api.h>
+#endif
 #endif
 #ifdef _OPENMP
 #include <omp.h>
@@ -365,7 +369,13 @@ static void bench_summary(const bench_ctx_t *bc, int iteration, double wall_sec)
 }
 
 #ifdef PICOLM_GPU
+#ifdef PICOLM_CUDA
 #include <cuda_runtime.h>
+#else
+/* HIP: no raw CUDA API needed in picolm.c; all GPU ops go through
+ * picolm_gpu_* C bindings which handle HIP/CUDA abstraction internally.
+ * The --gpu-diff test requires CUDA, so it's disabled for HIP. */
+#endif
 
 /* Full struct definition needed from C (forward decl in tensor.h is opaque) */
 struct picolm_gpu_tensor {
@@ -440,44 +450,51 @@ static void benchmark_context_scaling(const char *model_path, const char *base_p
     /* Output CSV header */
     fprintf(stderr, "ctx_size,prefill_tok/s,gen_tok/s\n");
 
-    /* Benchmark loop: grow context by generating, then prepend 2 extra tokens */
-    int extra_prefix[2] = {264, 464};  /* space + "The" - common tokens */
+    /* Benchmark loop: grow context incrementally, measuring speed at each step.
+     * Each step prepends the user's base prompt (-p) before the cached
+     * content. Only the new tokens are prefilled, but attention scans
+     * over the entire growing cached context.
+     *
+     * -p controls the prefill length per step (use ~70+ tokens to trigger FA2).
+     * -n controls tokens generated per step (context growth rate).
+     * -c controls max context size.
+     *
+     * The KV cache accumulates: start_pos tracks the cached position. */
     srand48(seed);
     const int chunk_size = max_tokens;  /* tokens to generate per step */
+    int start_pos = 0;  /* current KV cache position */
 
-    while (total_tokens < ctx_size_limit) {
-        /* Prepare prompt: 2 extra tokens + all cached tokens */
-        int *step_prompt = malloc((2 + total_tokens) * sizeof(int));
-        step_prompt[0] = extra_prefix[0];
-        step_prompt[1] = extra_prefix[1];
-        memcpy(step_prompt + 2, prompt_tokens, total_tokens * sizeof(int));
-        int step_n = 2 + total_tokens;
+    while (start_pos + n_base + chunk_size <= ctx_size_limit) {
+        /* Build the new prompt segment: just the base prompt */
+        int *new_prompt = malloc(n_base * sizeof(int));
+        memcpy(new_prompt, base_tokens, n_base * sizeof(int));
 
-        /* Record current context size (the cached part) */
-        int ctx_at_step = total_tokens;
+        /* Record context size BEFORE prefill (the cached part) */
+        int ctx_at_step = start_pos;
 
-        /* Prefill */
+        /* Prefill only the NEW tokens at start_pos */
         double t0 = get_time_ms();
 
         float *logits = NULL;
 #ifdef PICOLM_GPU
         if (getenv("PICOLM_GPU") && model.gpu.kv_active) {
-            logits = model_forward_prefill_gpu(&model, step_prompt, step_n, 0, NULL);
+            logits = model_forward_prefill_gpu(&model, new_prompt, n_base, start_pos, NULL);
             if (!logits)
 #endif
-                logits = model_forward_prefill(&model, step_prompt, step_n, 0, NULL);
+                logits = model_forward_prefill(&model, new_prompt, n_base, start_pos, NULL);
 #ifdef PICOLM_GPU
         } else
 #endif
         {
-            logits = model_forward_prefill(&model, step_prompt, step_n, 0, NULL);
+            logits = model_forward_prefill(&model, new_prompt, n_base, start_pos, NULL);
         }
 
         double t_prefill = get_time_ms();
         float prefill_ms = (float)(t_prefill - t0);
+        start_pos += n_base;  /* advance cached position past new tokens */
 
-        /* Generate tokens */
-        int pos = step_n - 1;
+        /* Generate tokens (these are also cached incrementally) */
+        int pos = start_pos - 1;
         int n_gen = 0;
         for (; n_gen < chunk_size; n_gen++) {
             if (!logits) break;
@@ -489,27 +506,28 @@ static void benchmark_context_scaling(const char *model_path, const char *base_p
 
             logits = model_forward(&model, next, pos);
             pos++;
+            start_pos++;  /* advance past generated token */
         }
 
         double t_end = get_time_ms();
         float gen_ms = (float)(t_end - t_prefill);
 
-        float prefill_tok_per_sec = (prefill_ms > 0) ? ((float)(step_n) * 1000.0f / prefill_ms) : 0;
+        float prefill_tok_per_sec = (prefill_ms > 0) ? ((float)n_base * 1000.0f / prefill_ms) : 0;
         float gen_tok_per_sec = (gen_ms > 0) ? ((float)n_gen * 1000.0f / gen_ms) : 0;
 
         fprintf(stderr, "%d,%.1f,%.1f\n", ctx_at_step, prefill_tok_per_sec, gen_tok_per_sec);
         fflush(stderr);
 
-        free(step_prompt);
+        free(new_prompt);
 
-        if (total_tokens >= ctx_size_limit) break;
-    }
+        }
 
     free(prompt_tokens);
     if (use_qwen_tok) free(base_tokens);
     else free(base_tokens);
 }
 
+#ifdef PICOLM_CUDA
 /* GPU kernel diff test: quantize random input to Q8_0, run IMMA and scalar
  * matmul on the same data, diff outputs. Used to validate kernel correctness. */
 static void gpu_matmul_diff(int S, int I, int O) {
@@ -611,6 +629,7 @@ static void gpu_matmul_diff(int S, int I, int O) {
     cudaFree(d_x); cudaFree(d_y_imma); cudaFree(d_y_scalar); cudaFree(d_w);
     free(x); free(y_imma); free(y_scalar); free(w);
 }
+#endif /* PICOLM_CUDA */
 
 /* GPU attention diff test: generate random Q/K/V, run FA2 and scalar
  * attention kernels, diff the output. No model needed. */
@@ -906,6 +925,7 @@ int main(int argc, char **argv) {
     }
 
     /* --gpu-diff: standalone GPU kernel diff test, no model needed */
+#ifdef PICOLM_CUDA
     if (gpu_diff) {
         if (getenv("PICOLM_GPU") == NULL) {
             fprintf(stderr, "GPU not available (PICOLM_GPU not set)\n");
@@ -914,12 +934,18 @@ int main(int argc, char **argv) {
         gpu_matmul_diff(gpu_diff_S, gpu_diff_I, gpu_diff_O);
         return 0;
     }
+#else
+    if (gpu_diff) {
+        fprintf(stderr, "--gpu-diff requires CUDA, not available in HIP build\n");
+        return 1;
+    }
+#endif
 
     /* --benchmark-ctx: context scaling benchmark */
     if (do_benchmark_ctx) {
         if (!model_path) { fprintf(stderr, "No model file specified\n"); usage(argv[0]); return 1; }
         benchmark_context_scaling(model_path, prompt ? prompt :
-            "You are standing in a dungeon. The darkness surrounds you, making it impossible to see more than a few feet in front of you. The air is thick with the stench of rot and decay. A faint luminescent glow emanates from your right hand.",
+            "You are standing in a dungeon. The darkness surrounds you, making it impossible to see more than a few feet in front of you. The air is thick with the stench of rot and decay. A faint luminescent glow emanates from your right hand. You notice a heavy iron door to your left, covered in strange runes that seem to pulse with an otherworldly energy.",
             context_override, temperature, top_k, max_tokens, seed, num_threads, do_prefault);
         return 0;
     }

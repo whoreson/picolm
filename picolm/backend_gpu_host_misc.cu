@@ -625,8 +625,8 @@ picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
     size_t kv_pos_stride_bytes = (size_t)n_kv_heads * head_dim * sizeof(uint16_t);
     size_t kv_head_stride_bytes = head_dim * sizeof(uint16_t);
 
-    /* Try FA2 (tensor core) kernel when available */
-    int use_fa2 = ctx->compute_major >= 8 && n_tokens >= 64 && !getenv("PICOLM_FORCE_SCALAR_ATTN");
+    /* Try FA2 (tensor core) kernel when available (NVIDIA IMMA only) */
+    int use_fa2 = ctx->has_imma && n_tokens >= 64 && !getenv("PICOLM_FORCE_SCALAR_ATTN");
     if (use_fa2) {
         int n_q_tiles = (n_tokens + 63) / 64;
         /* Shared memory per block (one query head, 4 warps * 16 Q rows):
@@ -690,8 +690,9 @@ picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
     size_t kv_pos_stride_bytes = (size_t)n_kv_heads * head_dim * sizeof(uint16_t);
     size_t kv_head_stride_bytes = head_dim * sizeof(uint16_t);
 
-    /* Use FA2 (tensor core) kernel when available */
-    if (ctx->compute_major >= 8 && n_tokens >= 64 && !getenv("PICOLM_FORCE_SCALAR_ATTN")) {
+    /* Use FA2 (tensor core) kernel only on NVIDIA with IMMA.
+     * HIP scalar fallback is too slow (10-15s for 200 tokens). */
+    if (ctx->has_imma && n_tokens >= 64 && !getenv("PICOLM_FORCE_SCALAR_ATTN")) {
         int n_q_tiles = (n_tokens + 63) / 64;  /* ceil, kernel handles OOB */
         /* Shared memory per block (one query head):
          * K(16*hd) + V(16*hd) + Q(16*hd) uint16_t + score(16*16) + acc(16*hd) + max/sum float
@@ -756,11 +757,11 @@ picolm_gpu_attention_prefill_f32kv(float *xb_out_dev, const float *q_dev,
          + 2 * sizeof(float);
     /* Opt-in FP32 kernel to larger shared memory */
     if (shared_bytes > 49152) {
-        cudaError_t e = gpuFuncSetAttribute((const void *)picolm_gpu_attention_prefill_f32kv_kernel,
+        gpuError_t e = gpuFuncSetAttribute((const void *)picolm_gpu_attention_prefill_f32kv_kernel,
             gpuFuncAttributeMaxDynamicSharedMemorySize, (int)shared_bytes);
-        if (e != cudaSuccess) {
+        if (e != gpuSuccess) {
             fprintf(stderr, "[GPU] f32kv opt-in fail: err=%d (%s) bytes=%zu\n",
-                (int)e, cudaGetErrorString(e), shared_bytes);
+                (int)e, gpuGetErrorString(e), shared_bytes);
         }
     }
     gpu_dispatch_print("attn_prefill_f32kv_dev");
@@ -1241,9 +1242,9 @@ picolm_gpu_memcpy(void *dst, const void *src, size_t bytes, int dir, int device)
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
 
-    cudaMemcpyKind kind = (dir > 0) ? gpuMemcpyHostToDevice :
-                           (dir < 0) ? gpuMemcpyDeviceToHost :
-                                       gpuMemcpyDeviceToDevice;
+    gpuMemcpyKind kind = (dir > 0) ? gpuMemcpyHostToDevice :
+                          (dir < 0) ? gpuMemcpyDeviceToHost :
+                                      gpuMemcpyDeviceToDevice;
 
     /* Use async copy on ctx->stream + sync to avoid default-stream
      * interleaving on GB10 multi-engine scheduler. */
@@ -1262,9 +1263,9 @@ picolm_gpu_memcpy_async(void *dst, const void *src, size_t bytes, int dir, int d
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
 
-    cudaMemcpyKind kind = (dir > 0) ? gpuMemcpyHostToDevice :
-                           (dir < 0) ? gpuMemcpyDeviceToHost :
-                                       gpuMemcpyDeviceToDevice;
+    gpuMemcpyKind kind = (dir > 0) ? gpuMemcpyHostToDevice :
+                          (dir < 0) ? gpuMemcpyDeviceToHost :
+                                      gpuMemcpyDeviceToDevice;
     return gpu_ok(gpuMemcpyAsync(dst, src, bytes, kind, ctx->stream), "pipeline memcpy async");
 }
 extern "C"
@@ -1369,8 +1370,8 @@ int picolm_gpu_ssm_vecdot_batch_dev(float *od, const float *xd, const void *wd, 
                 }
             }
 
-            /* Dispatch: IMMA >= sm_80, else tiled, else scalar */
-            if (ctx->compute_major >= 8 && nt >= 16 && nvh >= 8) {
+            /* Dispatch: IMMA (NVIDIA Turing+), else tiled, else scalar */
+            if (ctx->has_imma && nt >= 16 && nvh >= 8) {
                 gpu_dispatch_print("vecdot_imma_dev");
                 dim3 grid((unsigned)((nvh + 7) / 8), (unsigned)((nt + 15) / 16));
                 picolm_q8_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(
@@ -1510,7 +1511,7 @@ int picolm_gpu_expert_mlp_dev(picolm_gpu_tensor_t *g, picolm_gpu_tensor_t *u, pi
 
     /* gate = q8_q8_tiled(input_q8, gate_weights) */
     /* gate = q8_q8 matmul(input_q8, gate_weights) */
-    if (ctx->compute_major >= 8 && S >= 16 && I >= 8) {
+    if (ctx->has_imma && S >= 16 && I >= 8) {
         dim3 grid((unsigned)((I + 7) / 8), (unsigned)((S + 15) / 16));
         picolm_q8_q8_matmul_imma<<<grid,32,0,ctx->stream>>>(
             ctx->gate, ctx->q8_xq, ctx->q8_xd, g->weights, S, D, I, (int)g->row_bytes, I);
@@ -1525,7 +1526,7 @@ int picolm_gpu_expert_mlp_dev(picolm_gpu_tensor_t *g, picolm_gpu_tensor_t *u, pi
     if (!gpu_ok(gpuGetLastError(), "expert q8 gate (dev)")) return 0;
 
     /* up = q8_q8 matmul(input_q8, up_weights) */
-    if (ctx->compute_major >= 8 && S >= 16 && I >= 8) {
+    if (ctx->has_imma && S >= 16 && I >= 8) {
         dim3 grid((unsigned)((I + 7) / 8), (unsigned)((S + 15) / 16));
         picolm_q8_q8_matmul_imma<<<grid,32,0,ctx->stream>>>(
             ctx->up, ctx->q8_xq, ctx->q8_xd, u->weights, S, D, I, (int)u->row_bytes, I);
@@ -1550,7 +1551,7 @@ int picolm_gpu_expert_mlp_dev(picolm_gpu_tensor_t *g, picolm_gpu_tensor_t *u, pi
 
     /* y = q8_q8 matmul(hidden_q8, down_weights) */
     int ys = y_stride > 0 ? y_stride : D;
-    if (ctx->compute_major >= 8 && S >= 16 && D >= 8) {
+    if (ctx->has_imma && S >= 16 && D >= 8) {
         dim3 grid((unsigned)((D + 7) / 8), (unsigned)((S + 15) / 16));
         picolm_q8_q8_matmul_imma<<<grid,32,0,ctx->stream>>>(
             yd, ctx->q8_xq, ctx->q8_xd, d->weights, S, I, D, (int)d->row_bytes, ys);
