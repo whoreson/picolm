@@ -37,6 +37,23 @@
 #ifndef strdup
 #define strdup _strdup
 #endif
+/* POSIX polyfills for Windows */
+#include <stdlib.h>
+#include <stdint.h>
+#ifndef M_E
+#define M_E 2.71828182845904523536
+#endif
+static int32_t _picolm_rand48_val = 0;
+static void srand48_win(int32_t seed) { _picolm_rand48_val = seed ^ 0x330e; }
+static double drand48_win(void) {
+    _picolm_rand48_val = (_picolm_rand48_val * 0x5851FUL + 0x330eUL) & 0x7fffUL;
+    return (double)_picolm_rand48_val / (double)0x8000UL;
+}
+#define srand48(s)     srand48_win((int32_t)(s))
+#define drand48 drand48_win
+#define setenv(k,v,o)     do { _putenv_s((k),(v)); } while(0)
+#define unsetenv(k)       _putenv_s((k),"")
+
 double get_time_ms(void) {
     LARGE_INTEGER freq, count;
     QueryPerformanceFrequency(&freq);

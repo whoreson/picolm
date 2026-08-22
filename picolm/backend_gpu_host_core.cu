@@ -129,7 +129,11 @@ int picolm_gpu_init(const int *devices, int count) {
      * no measured perf cost since we already sync per call). Must be set
      * before the first CUDA driver call, so this has to be the very first
      * thing in init. overwrite=0: respect an explicit user-set value. */
+#ifdef _WIN32
+    _putenv_s("CUDA_DEVICE_MAX_CONNECTIONS", "1");
+#else
     setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1", 0);
+#endif
 #endif
     if (!gpu_ok(gpuGetDeviceCount(&available), "device discovery")) return 0;
     g_nctx = 0;

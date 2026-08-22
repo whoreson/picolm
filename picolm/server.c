@@ -37,11 +37,14 @@
 #include <errno.h>
 #include <io.h>
 #include <fcntl.h>
-#include <unistd.h>
 #ifdef _MSC_VER
 #pragma comment(lib, "ws2_32.lib")
 #endif
 typedef int socklen_t;
+typedef SSIZE_T ssize_t;
+#ifndef off_t
+typedef long long off_t;
+#endif
 #define SHUT_RD SD_RECEIVE
 #define SHUT_WR SD_SEND
 #define SHUT_RDWR SD_BOTH
@@ -1416,7 +1419,11 @@ static void handle_slots_post(SOCKET sock, const char *body) {
                     if (ver >= 4) {
                         /* Read layer bitmap to count attention layers */
                         uint8_t *layer_map = (uint8_t *)alloca(file_layers);
+                        #ifdef _WIN32
+                        _lseeki64(fd, (off_t)sizeof(header) + (file_n_pos > 0 ? (off_t)file_n_pos * (off_t)sizeof(uint32_t) : 0), SEEK_SET);
+#else
                         lseek(fd, (off_t)sizeof(header) + (file_n_pos > 0 ? (off_t)file_n_pos * (off_t)sizeof(uint32_t) : 0), SEEK_SET);
+#endif
 #ifdef _WIN32
                         _read(fd, (char *)layer_map, (unsigned)file_layers);
 #else
@@ -1431,7 +1438,11 @@ static void handle_slots_post(SOCKET sock, const char *body) {
                         attn_layers = file_layers;
                     }
                     /* Reset file position to beginning (we lseek'd for bitmap read) */
+#ifdef _WIN32
+                    _lseeki64(fd, 0, SEEK_SET);
+#else
                     lseek(fd, 0, SEEK_SET);
+#endif
                     kv_end += (off_t)attn_layers * file_n_pos * (off_t)(pos_stride_k + pos_stride_v);
 
                     /* SSM state (v4 only) */
@@ -3197,6 +3208,8 @@ static void handle_detokenize(SOCKET sock, const char *request_body) {
 }
 
 /* ---- Request Router ---- */
+
+static void handle_slots(SOCKET sock);  /* fwd decl */
 
 static void handle_request(SOCKET sock) {
     char method[16], path[512];
