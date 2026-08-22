@@ -605,6 +605,32 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
         return 1;
     }
 
+    /* FP16/BF16 tiled path: load weight row into shared memory once per
+     * tile of F16_TILE_S positions, reducing global weight reads by
+     * S/TILE_S. Falls back to picolm_quant_matmul for small S or
+     * when shared memory is insufficient. */
+    if ((t->qtype == GGUF_TYPE_F16 || t->qtype == GGUF_TYPE_BF16) &&
+        S >= F16_TILE_S && (int)t->row_bytes + 2048 <= 49152) {
+        if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
+        dim3 grid((unsigned)O, (unsigned)((S + F16_TILE_S - 1) / F16_TILE_S));
+        unsigned smem = (unsigned)(t->row_bytes + 256 * sizeof(double));
+        if (t->qtype == GGUF_TYPE_F16) {
+            gpu_dispatch_print("matmul_f16_tiled_host");
+            picolm_f16_f16_matmul_tiled<<<grid, 256, smem, ctx->stream>>>(
+                ctx->y, ctx->x, (const uint16_t *)t->weights, S, I, O,
+                (int)t->row_bytes, O);
+        } else {
+            gpu_dispatch_print("matmul_bf16_tiled_host");
+            picolm_bf16_f32_matmul_tiled<<<grid, 256, smem, ctx->stream>>>(
+                ctx->y, ctx->x, (const uint16_t *)t->weights, S, I, O,
+                (int)t->row_bytes, O);
+        }
+        if (!gpu_ok(gpuGetLastError(), "f16 tiled matmul") ||
+            !gpu_ok(gpuDeviceSynchronize(), "f16 tiled matmul sync")) return 0;
+        if (!gpu_ok(gpuMemcpy(y, ctx->y, yb, gpuMemcpyDeviceToHost), "output download")) return 0;
+        return 1;
+    }
+
     /* Generic path for all other quant types */
     /* Scratch buffers are in device memory. Explicit H2D copy needed. */
     if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
@@ -690,6 +716,26 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
         if (!gpu_ok(gpuGetLastError(), "q8 matmul (dev)")) return 0;
         return 1;
     }
+    /* FP16/BF16 tiled path for device-resident tensors */
+    if ((t->qtype == GGUF_TYPE_F16 || t->qtype == GGUF_TYPE_BF16) &&
+        S >= F16_TILE_S && (int)t->row_bytes + 2048 <= 49152) {
+        dim3 grid((unsigned)O, (unsigned)((S + F16_TILE_S - 1) / F16_TILE_S));
+        unsigned smem = (unsigned)(t->row_bytes + 256 * sizeof(double));
+        if (t->qtype == GGUF_TYPE_F16) {
+            gpu_dispatch_print("matmul_f16_tiled_dev");
+            picolm_f16_f16_matmul_tiled<<<grid, 256, smem, ctx->stream>>>(
+                y_dev, x_dev, (const uint16_t *)t->weights, S, I, O,
+                (int)t->row_bytes, ys);
+        } else {
+            gpu_dispatch_print("matmul_bf16_tiled_dev");
+            picolm_bf16_f32_matmul_tiled<<<grid, 256, smem, ctx->stream>>>(
+                y_dev, x_dev, (const uint16_t *)t->weights, S, I, O,
+                (int)t->row_bytes, ys);
+        }
+        if (!gpu_ok(gpuGetLastError(), "f16 tiled matmul (dev)")) return 0;
+        return 1;
+    }
+
     if (t->qtype == GGUF_TYPE_Q8_0) {
         /* Fallback: use per-thread F32 dequant for Q8_0 */
         gpu_dispatch_print("matmul_quant_dev_fallback");
@@ -743,6 +789,25 @@ picolm_gpu_matmul_dev_strided(picolm_gpu_tensor_t *t, float *y_dev,
         if (!gpu_ok(gpuGetLastError(), "q8 matmul strided (dev)")) return 0;
         return 1;
     }
+    /* FP16/BF16 tiled path for strided tensors (only when x is contiguous) */
+    if ((t->qtype == GGUF_TYPE_F16 || t->qtype == GGUF_TYPE_BF16) &&
+        x_stride == I && S >= F16_TILE_S && (int)t->row_bytes + 2048 <= 49152) {
+        dim3 grid((unsigned)O, (unsigned)((S + F16_TILE_S - 1) / F16_TILE_S));
+        unsigned smem = (unsigned)(t->row_bytes + 256 * sizeof(double));
+        if (t->qtype == GGUF_TYPE_F16) {
+            gpu_dispatch_print("matmul_f16_tiled_strided_dev");
+            picolm_f16_f16_matmul_tiled<<<grid, 256, smem, ctx->stream>>>(
+                y_dev, x_dev, (const uint16_t *)t->weights, S, I, O,
+                (int)t->row_bytes, ys);
+        } else {
+            gpu_dispatch_print("matmul_bf16_tiled_strided_dev");
+            picolm_bf16_f32_matmul_tiled<<<grid, 256, smem, ctx->stream>>>(
+                y_dev, x_dev, (const uint16_t *)t->weights, S, I, O,
+                (int)t->row_bytes, ys);
+        }
+        if (!gpu_ok(gpuGetLastError(), "f16 tiled matmul strided (dev)")) return 0;
+        return 1;
+    }
     gpu_dispatch_print("matmul_quant_strided_dev");
     dim3 grid((unsigned)O, (unsigned)S);
     picolm_quant_matmul<<<grid, 256, 0, ctx->stream>>>(y_dev, x_dev, t->weights,
@@ -759,12 +824,13 @@ int picolm_gpu_expert_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
         gate->I != up->I || gate->O != up->O ||
         down->I != gate->O || down->O != gate->I) return 0;
 
-    /* Only the Q8_0 int8-MAC path is implemented here.
-     * For all other types (F32, BF16, Q4_K etc.), return 0
+    /* Only Q8_0 int8-MAC and FP16/BF16 tiled paths are implemented here.
+     * For all other types (F32, Q4_K etc.), return 0
      * so the caller falls back to the per-matmul CPU path. */
-    if (gate->qtype != GGUF_TYPE_Q8_0 ||
-        up->qtype != GGUF_TYPE_Q8_0 ||
-        down->qtype != GGUF_TYPE_Q8_0) return 0;
+    int is_f16 = (gate->qtype == GGUF_TYPE_F16 || gate->qtype == GGUF_TYPE_BF16);
+    int is_q80 = (gate->qtype == GGUF_TYPE_Q8_0);
+    if (!(is_f16 || is_q80)) return 0;
+    if (gate->qtype != up->qtype || gate->qtype != down->qtype) return 0;
 
     gpu_device_ctx_t *ctx = find_ctx(gate->device);
     if (!select_ctx(ctx)) return 0;
@@ -778,6 +844,70 @@ int picolm_gpu_expert_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
         !reserve(&ctx->up, &ctx->up_cap, ib)) return 0;
 
     if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "expert input")) return 0;
+
+    /* ---- FP16/BF16 tiled path ----
+     * Direct F32 x FP16/BF16 matmul with tiled weight loading.
+     * No quantization needed. */
+    if (is_f16 && S >= F16_TILE_S &&
+        (int)gate->row_bytes + 2048 <= 49152 &&
+        (int)up->row_bytes + 2048 <= 49152 &&
+        (int)down->row_bytes + 2048 <= 49152) {
+        unsigned smem = (unsigned)(gate->row_bytes + 256 * sizeof(double));
+
+        /* Step 1: gate = f16 tiled(input, gate_weights) -> F32[I*S] */
+        dim3 grid_g((unsigned)I, (unsigned)((S + F16_TILE_S - 1) / F16_TILE_S));
+        if (gate->qtype == GGUF_TYPE_F16) {
+            gpu_dispatch_print("expert_mlp_gate_f16_tiled_host");
+            picolm_f16_f16_matmul_tiled<<<grid_g, 256, smem, ctx->stream>>>(
+                ctx->gate, ctx->x, (const uint16_t *)gate->weights, S, D, I,
+                (int)gate->row_bytes, I);
+        } else {
+            gpu_dispatch_print("expert_mlp_gate_bf16_tiled_host");
+            picolm_bf16_f32_matmul_tiled<<<grid_g, 256, smem, ctx->stream>>>(
+                ctx->gate, ctx->x, (const uint16_t *)gate->weights, S, D, I,
+                (int)gate->row_bytes, I);
+        }
+        if (!gpu_ok(gpuGetLastError(), "expert f16 gate")) return 0;
+
+        /* Step 2: up = f16 tiled(input, up_weights) -> F32[I*S] */
+        unsigned smem_up = (unsigned)(up->row_bytes + 256 * sizeof(double));
+        if (up->qtype == GGUF_TYPE_F16) {
+            gpu_dispatch_print("expert_mlp_up_f16_tiled_host");
+            picolm_f16_f16_matmul_tiled<<<grid_g, 256, smem_up, ctx->stream>>>(
+                ctx->up, ctx->x, (const uint16_t *)up->weights, S, D, I,
+                (int)up->row_bytes, I);
+        } else {
+            gpu_dispatch_print("expert_mlp_up_bf16_tiled_host");
+            picolm_bf16_f32_matmul_tiled<<<grid_g, 256, smem_up, ctx->stream>>>(
+                ctx->up, ctx->x, (const uint16_t *)up->weights, S, D, I,
+                (int)up->row_bytes, I);
+        }
+        if (!gpu_ok(gpuGetLastError(), "expert f16 up")) return 0;
+
+        /* Step 3: silu(gate) * up -> ctx->gate */
+        size_t n = (size_t)S * I;
+        picolm_silu_mul<<<(unsigned)((n + 255) / 256), 256, 0, ctx->stream>>>(ctx->gate, ctx->up, n);
+        if (!gpu_ok(gpuGetLastError(), "expert silu")) return 0;
+
+        /* Step 4: y = f16 tiled(silu*up, down_weights) -> F32[D*S] */
+        unsigned smem_dn = (unsigned)(down->row_bytes + 256 * sizeof(double));
+        dim3 grid_d((unsigned)D, (unsigned)((S + F16_TILE_S - 1) / F16_TILE_S));
+        if (down->qtype == GGUF_TYPE_F16) {
+            gpu_dispatch_print("expert_mlp_down_f16_tiled_host");
+            picolm_f16_f16_matmul_tiled<<<grid_d, 256, smem_dn, ctx->stream>>>(
+                ctx->y, ctx->gate, (const uint16_t *)down->weights, S, I, D,
+                (int)down->row_bytes, D);
+        } else {
+            gpu_dispatch_print("expert_mlp_down_bf16_tiled_host");
+            picolm_bf16_f32_matmul_tiled<<<grid_d, 256, smem_dn, ctx->stream>>>(
+                ctx->y, ctx->gate, (const uint16_t *)down->weights, S, I, D,
+                (int)down->row_bytes, D);
+        }
+        if (!gpu_ok(gpuGetLastError(), "expert f16 down")) return 0;
+
+        if (!gpu_ok(gpuDeviceSynchronize(), "expert f16 MLP sync")) return 0;
+        return gpu_ok(gpuMemcpy(y, ctx->y, xb, gpuMemcpyDeviceToHost), "expert output");
+    }
 
     /* ---- Q8_0 fast path: quantize F32 input to Q8_0, then int8 MAC ----
      * All 3 projections (gate, up, down) use Q8_0 weights. The input to

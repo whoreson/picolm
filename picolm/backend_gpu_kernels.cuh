@@ -54,6 +54,7 @@ __global__ void picolm_q8_q8_matmul(float *y, const int8_t *xq, const float *xd,
  * doesn't depend on this constant -- positions are handled in an inner
  * loop, not concurrently. Stays well under the default 48KB/block. */
 #define Q8_TILE_S 32
+#define F16_TILE_S 32
 
 /* Tiled Q8_0 matmul: loads each weight row into shared memory once per
  * tile of Q8_TILE_S query positions, then reuses it in the inner loop.
@@ -68,6 +69,15 @@ __global__ void picolm_q8_q8_matmul_tiled(float *y, const int8_t *xq, const floa
 __global__ void picolm_q8_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
                                           const void *weights, int S, int I, int O,
                                           int row_bytes, int y_stride);
+
+/* FP16 tiled matmul: loads FP16 weight rows into shared memory once per tile.
+ * FP32 activations, FP16 weights, FP32 output. */
+__global__ void picolm_f16_f16_matmul_tiled(float *y, const float *x, const uint16_t *w,
+                                             int S, int I, int O, int row_bytes, int y_stride);
+
+/* BF16 tiled matmul: same tiling, BF16 weights -> FP32 output. */
+__global__ void picolm_bf16_f32_matmul_tiled(float *y, const float *x, const uint16_t *w,
+                                              int S, int I, int O, int row_bytes, int y_stride);
 
 /* ---- silu_mul kernel ----
  * Element-wise: gate[i] = gate[i] / (1 + exp(-gate[i])) * up[i] */

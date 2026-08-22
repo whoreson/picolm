@@ -462,6 +462,135 @@ picolm_q8_q8_matmul_tiled(float *y,
     }
 }
 
+/* ---- FP16 tiled matmul kernel ----
+ *
+ * Loads each FP16 weight row into shared memory once per tile of F16_TILE_S
+ * query positions, then reuses it for all positions in the tile. This
+ * eliminates redundant global memory reads of the weight row (S/TILE_S
+ * reduction). FP32 activations are read from global memory per position.
+ *
+ * When FAST_FP16_AVAILABLE is defined (HIP all archs, CUDA sm_60+), the
+ * inner loop processes two FP16 values at once via half2, halving the
+ * number of FP16->FP32 conversions. */
+__global__ void
+picolm_f16_f16_matmul_tiled(
+    float *y,           /* [S][O] output, FP32 */
+    const float *x,     /* [S][I] activations, FP32 */
+    const uint16_t *w,  /* [O][I] weights, FP16 */
+    int S, int I, int O, int row_bytes, int y_stride) {
+    int o = gpuBlockIdx_x;
+    int tile = gpuBlockIdx_y;
+    if (o >= O) return;
+    int s0 = tile * F16_TILE_S;
+    if (s0 >= S) return;
+    int s_count = min(F16_TILE_S, S - s0);
+    int ys = y_stride > 0 ? y_stride : O;
+
+    const uint8_t *wrow = (const uint8_t *)w + (size_t)o * row_bytes;
+
+    /* Load weight row into shared memory (raw bytes) */
+    extern __shared__ uint8_t wrow_sh[];
+    for (int b = gpuThreadIdx_x; b < row_bytes; b += gpuBlockDim_x)
+        wrow_sh[b] = wrow[b];
+    gpuSyncthreads();
+
+    const uint16_t *wrow_h = (const uint16_t *)wrow_sh;
+    __shared__ double partial[256];
+
+    for (int ls = 0; ls < s_count; ls++) {
+        int s = s0 + ls;
+        const float *xrow = x + (size_t)s * I;
+
+        double sum = 0.0;
+#ifdef FAST_FP16_AVAILABLE
+        /* Process two FP16 values per iteration using half2 */
+        for (int i = gpuThreadIdx_x * 2; i + 1 < I; i += gpuBlockDim_x * 2) {
+            half2 wh = make_half2(__ushort_as_half(wrow_h[i]),
+                                  __ushort_as_half(wrow_h[i + 1]));
+            float2 xf;
+            xf.x = xrow[i];
+            xf.y = xrow[i + 1];
+            float2 pf = __half22float2(wh);
+            sum += (double)xf.x * (double)pf.x + (double)xf.y * (double)pf.y;
+        }
+        /* Handle odd remainder: thread 0 does the last element */
+        if (threadIdx.x == 0 && (I & 1))
+            sum += (double)xrow[I - 1] * (double)gpu_fp16_to_fp32(wrow_h[I - 1]);
+#else
+        for (int i = gpuThreadIdx_x; i < I; i += gpuBlockDim_x)
+            sum += (double)xrow[i] * (double)gpu_fp16_to_fp32(wrow_h[i]);
+#endif
+
+        /* Shared-memory tree reduce with double precision */
+        partial[gpuThreadIdx_x] = sum;
+        gpuSyncthreads();
+        for (int n = gpuBlockDim_x >> 1; n; n >>= 1) {
+            if (gpuThreadIdx_x < n)
+                partial[gpuThreadIdx_x] += partial[gpuThreadIdx_x + n];
+            gpuSyncthreads();
+        }
+        if (!gpuThreadIdx_x)
+            y[(size_t)s * ys + o] = (float)partial[0];
+        gpuSyncthreads();
+    }
+}
+
+/* ---- BF16 tiled matmul kernel ----
+ *
+ * Same tiling as picolm_f16_f16_matmul_tiled, but BF16->FP32 conversion
+ * is a simple zero-extend of the upper 16 bits: ((uint32_t)w[i]) << 16. */
+__global__ void
+picolm_bf16_f32_matmul_tiled(
+    float *y,           /* [S][O] output, FP32 */
+    const float *x,     /* [S][I] activations, FP32 */
+    const uint16_t *w,  /* [O][I] weights, BF16 raw */
+    int S, int I, int O, int row_bytes, int y_stride) {
+    int o = gpuBlockIdx_x;
+    int tile = gpuBlockIdx_y;
+    if (o >= O) return;
+    int s0 = tile * F16_TILE_S;
+    if (s0 >= S) return;
+    int s_count = min(F16_TILE_S, S - s0);
+    int ys = y_stride > 0 ? y_stride : O;
+
+    const uint8_t *wrow = (const uint8_t *)w + (size_t)o * row_bytes;
+
+    /* Load weight row into shared memory (raw bytes) */
+    extern __shared__ uint8_t wrow_sh[];
+    for (int b = gpuThreadIdx_x; b < row_bytes; b += gpuBlockDim_x)
+        wrow_sh[b] = wrow[b];
+    gpuSyncthreads();
+
+    const uint16_t *wrow_h = (const uint16_t *)wrow_sh;
+    __shared__ double partial[256];
+
+    for (int ls = 0; ls < s_count; ls++) {
+        int s = s0 + ls;
+        const float *xrow = x + (size_t)s * I;
+
+        double sum = 0.0;
+        for (int i = gpuThreadIdx_x; i < I; i += gpuBlockDim_x) {
+            /* BF16 -> FP32: zero-extend upper 16 bits, reinterpret as float */
+            uint32_t bits = ((uint32_t)wrow_h[i]) << 16;
+            float wf;
+            memcpy(&wf, &bits, sizeof(float));
+            sum += (double)xrow[i] * (double)wf;
+        }
+
+        /* Shared-memory tree reduce with double precision */
+        partial[gpuThreadIdx_x] = sum;
+        gpuSyncthreads();
+        for (int n = gpuBlockDim_x >> 1; n; n >>= 1) {
+            if (gpuThreadIdx_x < n)
+                partial[gpuThreadIdx_x] += partial[gpuThreadIdx_x + n];
+            gpuSyncthreads();
+        }
+        if (!gpuThreadIdx_x)
+            y[(size_t)s * ys + o] = (float)partial[0];
+        gpuSyncthreads();
+    }
+}
+
 __global__ void
 picolm_q8_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
                           const void *weights, int S, int I, int O,
@@ -873,12 +1002,15 @@ picolm_gpu_attention_prefill_f32kv_kernel(
     for (int i = tid; i < 32; i += n_threads) reduce_sh[i] = 0.0f;
     gpuSyncthreads();
 
-    int total_kv = start_pos + n_tokens;
+    /* Causal early-exit: this block processes Q tokens [q_start .. q_end).
+     * The last Q token can attend to KV positions up to start_pos + q_end - 1.
+     * Cap the KV loop to this block's own horizon, not the global prompt length. */
+    int block_kv_limit = min(start_pos + n_tokens, start_pos + q_end);
     size_t kv_pos_stride = (size_t)n_kv_heads * head_dim;
     size_t kv_head_stride = head_dim;
 
-    for (int t0 = 0; t0 < total_kv; t0 += ATTN_TILE_K) {
-        int t_end = min(t0 + ATTN_TILE_K, total_kv);
+    for (int t0 = 0; t0 < block_kv_limit; t0 += ATTN_TILE_K) {
+        int t_end = min(t0 + ATTN_TILE_K, block_kv_limit);
         int tile_k_size = t_end - t0;
 
         for (int d = tid; d < head_dim; d += n_threads) {
@@ -1031,12 +1163,14 @@ picolm_gpu_attention_prefill_kernel(
     for (int i = tid; i < 32; i += n_threads) reduce_sh[i] = 0.0f;
     gpuSyncthreads();
 
-    /* Total KV positions visible: start_pos + n_tokens */
-    int total_kv = start_pos + n_tokens;
+    /* Causal early-exit: this block processes Q tokens [q_start .. q_end).
+     * The last Q token can attend to KV positions up to start_pos + q_end - 1.
+     * Cap the KV loop to this block's own horizon, not the global prompt length. */
+    int block_kv_limit = min(start_pos + n_tokens, start_pos + q_end);
 
-    /* Tile over KV positions */
-    for (int t0 = 0; t0 < total_kv; t0 += ATTN_TILE_K) {
-        int t_end = min(t0 + ATTN_TILE_K, total_kv);
+    /* Tile over KV positions (bounded by this block's causal horizon) */
+    for (int t0 = 0; t0 < block_kv_limit; t0 += ATTN_TILE_K) {
+        int t_end = min(t0 + ATTN_TILE_K, block_kv_limit);
         int tile_k_size = t_end - t0;
 
         /* Load K and V tile into shared memory */
@@ -1547,9 +1681,13 @@ picolm_gpu_attention_prefill_fa2_kernel(
     for (int i = t; i < 64; i += 128) { max_sh[i] = -1e30f; sum_sh[i] = 0.0f; }
     gpuSyncthreads();
 
-    /* Phase 3: KV tiling */
-    for (int t0 = 0; t0 < n_total_kv; t0 += FA2_TILE_K) {
-        int t_end = min(t0 + FA2_TILE_K, n_total_kv);
+    /* Phase 3: KV tiling with causal early-exit.
+     * This block processes Q rows [warp_q_base .. warp_q_base + 64).
+     * The last Q row can attend to KV positions up to start_pos + warp_q_base + 63.
+     * Cap the loop to this horizon instead of the global n_total_kv. */
+    int block_kv_limit_fa2 = min(n_total_kv, start_pos + warp_q_base + 64);
+    for (int t0 = 0; t0 < block_kv_limit_fa2; t0 += FA2_TILE_K) {
+        int t_end = min(t0 + FA2_TILE_K, block_kv_limit_fa2);
         int tk_size = t_end - t0;
 
         {
