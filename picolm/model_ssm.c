@@ -3094,15 +3094,17 @@ int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
           picolm_gpu_memcpy(ffn0, bffn_norm, 16, -1, dev);
           fprintf(stderr,"[DBG] l=%d ffn_norm_out_tok0[:4]={%.6f,%.6f,%.6f,%.6f}\n",l,ffn0[0],ffn0[1],ffn0[2],ffn0[3]);
         }
-          float pw[dim]; picolm_gpu_sync(dev);
+          float *pw=(float*)malloc(dim*4); picolm_gpu_sync(dev);
           picolm_gpu_memcpy(pw, gw->post_attn_norm_dev[l], dim*4, -1, dev);
           double pr=0; for(int _i=0;_i<dim;_i++) pr += (double)pw[_i]*pw[_i];
           fprintf(stderr,"[DBG] l=%d post_attn_norm_w rms=%.6f\n",l,sqrt(pr/dim));
+          free(pw);
           /* Also dump bx input rms */
-          float bxi[dim];
+          float *bxi=(float*)malloc(dim*4);
           picolm_gpu_memcpy(bxi, bx + (size_t)(n_tokens-1)*xb2_stride, dim*4, -1, dev);
           double br=0; for(int _i=0;_i<dim;_i++) br += (double)bxi[_i]*bxi[_i];
           fprintf(stderr,"[DBG] l=%d bx_ffn_in rms=%.6f\n",l,sqrt(br/dim));
+          free(bxi);
       }
       ok&=picolm_gpu_rmsnorm_batched_dev(bffn_norm,bx,(float*)gw->post_attn_norm_dev[l],dim,eps,n_tokens,xb2_stride,dev);
     SSM_DBG_SYNC;

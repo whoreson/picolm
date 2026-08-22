@@ -17,7 +17,6 @@
 #include <windows.h>
 #include <io.h>
 #include <fcntl.h>
-#include <unistd.h>
 #elif !defined(PICOLM_DOS)
 #include <sys/mman.h>
 #include <sys/stat.h>

@@ -65,7 +65,6 @@ extern int cudaProfilerStop(void);
 #include <windows.h>
 #include <io.h>
 #include <fcntl.h>
-#include <unistd.h>
 #include <malloc.h>
 #define SECURITY_WIN32
 #include <security.h>
@@ -2101,7 +2100,8 @@ float *model_forward(model_t *m, int token, int pos) {
         {
             const char *dbg_attn = getenv("PICOLM_DBG_ATTN");
             if (dbg_attn && atoi(dbg_attn) && gpu_ok && m->gpu.kv_active && s->kv_type_k == KV_CACHE_F16) {
-                float xb_cpu[n_heads * 256];
+                size_t xb_cpu_sz = (size_t)n_heads * 256 * sizeof(float);
+                float *xb_cpu = (float *)malloc(xb_cpu_sz);
                 memcpy(xb_cpu, s->xb, n_heads * head_dim * sizeof(float));
                 tensor_parallel_for(c->n_kv_heads, attention_group, &gctx);
                 float max_diff = 0.0f;
@@ -2114,6 +2114,7 @@ float *model_forward(model_t *m, int token, int pos) {
                     fprintf(stderr, "[ATTN_DBG decode] layer=%d pos=%d max_diff=%.6f\n", l, pos, max_diff);
                 }
                 memcpy(s->xb, xb_cpu, n_heads * head_dim * sizeof(float));
+                free(xb_cpu);
             }
         }
 #endif

@@ -409,14 +409,16 @@ HUNGER_CL = "$(HUNGER_CL_DIR)/cl.exe"
 HUNGER_LNK = "$(HUNGER_CL_DIR)/link.exe"
 HUNGER_CFILES = picolm.c model_core.c model_attention.c model_moe.c model_gemma3n.c model_ssm.c model_kv_cache.c model_gguf.c tensor.c quant.c tokenizer.c qwen_tokenize.c sampler.c grammar.c cJSON.c server.c csafetensors.c json.c safetensors.c
 HUNGER_COBJS = $(HUNGER_CFILES:.c=.obj)
-HUNGER_CUOBS = backend_gpu_host_core_win.obj backend_gpu_host_ssm_win.obj backend_gpu_host_misc_win.obj
+HUNGER_CUOBS = backend_gpu_kernels_win.obj backend_gpu_host_core_win.obj backend_gpu_host_ssm_win.obj backend_gpu_host_misc_win.obj
 # cl.exe flags - all Make vars, NO batch %VAR% references
-HUNGER_CF = /O2 /W3 /wd4996 /arch:AVX512 /D PICOLM_GPU=1 /D _CRT_SECURE_NO_WARNINGS /I. /openmp /c
+HUNGER_CF = /O2 /W3 /wd4996 /arch:AVX512 /D PICOLM_GPU=1 /D _CRT_SECURE_NO_WARNINGS /I. /I"$(HUNGER_CUDA_ROOT)/include" /openmp /c
 
 hunger:
 	echo @echo off > .hunger_build.bat
 	echo del /q picolm.exe $(HUNGER_CUOBS) $(HUNGER_COBJS) 2^>nul >> .hunger_build.bat
 	echo call "$(HUNGER_VS_ROOT)/VC/Auxiliary/Build/vcvars64.bat" >> .hunger_build.bat
+	echo "$(HUNGER_CUDA_ROOT)/bin/nvcc.exe" -O3 -std=c++14 -DPICOLM_GPU=1 -ccbin $(HUNGER_CL) -Xcompiler "/EHsc /O2 /W3 /std:c++14 /arch:AVX512" -gencode arch=compute_89,code=$(HUNGER_CUDA_ARCH) -c -o backend_gpu_kernels_win.obj backend_gpu_kernels.cu -I. >> .hunger_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
 	echo "$(HUNGER_CUDA_ROOT)/bin/nvcc.exe" -O3 -std=c++14 -DPICOLM_GPU=1 -ccbin $(HUNGER_CL) -Xcompiler "/EHsc /O2 /W3 /std:c++14 /arch:AVX512" -gencode arch=compute_89,code=$(HUNGER_CUDA_ARCH) -c -o backend_gpu_host_core_win.obj backend_gpu_host_core.cu -I. >> .hunger_build.bat
 	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
 	echo "$(HUNGER_CUDA_ROOT)/bin/nvcc.exe" -O3 -std=c++14 -DPICOLM_GPU=1 -ccbin $(HUNGER_CL) -Xcompiler "/EHsc /O2 /W3 /std:c++14 /arch:AVX512" -gencode arch=compute_89,code=$(HUNGER_CUDA_ARCH) -c -o backend_gpu_host_ssm_win.obj backend_gpu_host_ssm.cu -I. >> .hunger_build.bat

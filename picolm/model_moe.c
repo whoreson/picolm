@@ -469,11 +469,12 @@ void moe_forward_batch(model_t *m, run_state_t *s,
     }
 
     /* Per-token expert routing tables: [n_tokens][n_used] */
-    int all_ids[n_tokens][8];       /* 8 = max n_expert_used */
-    float all_weights[n_tokens][8];
+    /* MSVC has no VLAs, so use heap for all platforms */
+    int *all_ids = (int *)malloc((size_t)n_tokens * 8 * sizeof(int));
+    float *all_weights = (float *)malloc((size_t)n_tokens * 8 * sizeof(float));
 
     /* Per-token: number of experts assigned (for variable top-K) */
-    int n_experts_per_token[n_tokens];
+    int *n_experts_per_token = (int *)malloc((size_t)n_tokens * sizeof(int));
 
     /* ---- Phase 1: Route all tokens ---- */
     {
@@ -491,8 +492,8 @@ void moe_forward_batch(model_t *m, run_state_t *s,
 
                 /* Top-K selection */
                 {
-                    int *ids = all_ids[t];
-                    float *weights = all_weights[t];
+                    int *ids = all_ids + t * 8;
+                    float *weights = all_weights + t * 8;
                 for (int i = 0; i < n_expert; i++) idx[i] = i;
                 for (int i = 0; i < n_used; i++) {
                     int best = i;
@@ -539,7 +540,7 @@ void moe_forward_batch(model_t *m, run_state_t *s,
         for (int t = 0; t < n_tokens; t++) {
             int n_tok_experts = n_experts_per_token[t];
             for (int sl = 0; sl < n_tok_experts; sl++) {
-                int eid = all_ids[t][sl];
+                int eid = all_ids[t * 8 + sl];
                 int idx = s->expert_counts[eid];
                 s->expert_assignments[eid * n_tokens + idx] = (t << 8) | sl;
                 s->expert_counts[eid]++;
@@ -589,7 +590,7 @@ void moe_forward_batch(model_t *m, run_state_t *s,
             memset(out, 0, dim * sizeof(float));
 
             for (int sl = 0; sl < n_used; sl++) {
-                float w_i = all_weights[t][sl];
+                float w_i = all_weights[t * 8 + sl];
                 float *expert_out = mm_down_out + (size_t)t * n_used * dim + (size_t)sl * dim;
 
 #ifdef PICOLM_AVX512
@@ -693,5 +694,8 @@ void moe_forward_batch(model_t *m, run_state_t *s,
         }
     }
 
+    free(all_ids);
+    free(all_weights);
+    free(n_experts_per_token);
     tensor_set_n_threads(saved_threads);
 }

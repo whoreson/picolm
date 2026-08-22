@@ -14,6 +14,13 @@
 #include <windows.h>
 #include <io.h>
 #include <fcntl.h>
+/* POSIX type polyfills for MSVC */
+#ifndef ssize_t
+typedef SSIZE_T ssize_t;
+#endif
+#ifndef off_t
+typedef long long off_t;
+#endif
 #elif !defined(PICOLM_DOS)
 #include <sys/mman.h>
 #include <fcntl.h>
@@ -64,7 +71,11 @@ static int _kv_ensure(int fd, uint8_t *buf, size_t buf_size,
     size_t consume_start = *file_offset;
     size_t consumed_in_buf = *buf_pos;
     size_t next_offset = consume_start + consumed_in_buf;
+    #ifdef _WIN32
+    if (_lseeki64(fd, (off_t)next_offset, SEEK_SET) < 0) {
+#else
     if (lseek(fd, (off_t)next_offset, SEEK_SET) < 0) {
+#endif
 #ifdef _WIN32
         _close(fd);
 #else
@@ -268,7 +279,11 @@ int kvcache_load(model_t *m, const char *path, int **tokens_out) {
 
     if ((header[0] & 0xFFFFFFF0) != KVCACHE_MAGIC || (header[0] & 0xF) != 4) {
         /* Fall back to v3 (9 entries) */
+        #ifdef _WIN32
+        if (_lseeki64(fd, 0, SEEK_SET) < 0) { _kv_close(fd); return 0; }
+#else
         if (lseek(fd, 0, SEEK_SET) < 0) { _kv_close(fd); return 0; }
+#endif
         buf_avail = 0; buf_pos = 0;
         {
             ssize_t r;
@@ -285,7 +300,11 @@ int kvcache_load(model_t *m, const char *path, int **tokens_out) {
                 buf_avail = (size_t)r;
             } else {
                 /* Fall back to v2 (7 entries) */
+                #ifdef _WIN32
+                if (_lseeki64(fd, 0, SEEK_SET) < 0) { _kv_close(fd); return 0; }
+#else
                 if (lseek(fd, 0, SEEK_SET) < 0) { _kv_close(fd); return 0; }
+#endif
                 buf_avail = 0; buf_pos = 0;
 #ifdef _WIN32
                 r = (ssize_t)_read(fd, (char *)buf, (unsigned)buf_size);
