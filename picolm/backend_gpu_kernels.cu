@@ -1644,12 +1644,13 @@ picolm_gpu_attention_prefill_fa2_kernel(
 
     /* Phase 4: Normalize and write output */
     gpuSyncthreads();
-    for (int wr = warp * FA2_TILE_Q; wr < (warp + 1) * FA2_TILE_Q && wr < 64; wr++) {
+    for (int wr = 0; wr < FA2_TILE_Q; wr++) {
         int gq = warp_q_base + wr;
         if (gq >= n_tokens) continue;
-        float inv = (sum_sh[warp * FA2_TILE_Q + wr] > 0.0f) ? (1.0f / sum_sh[warp * FA2_TILE_Q + wr]) : 0.0f;
+        int qi = warp * FA2_TILE_Q + wr;
+        float inv = (sum_sh[qi] > 0.0f) ? (1.0f / sum_sh[qi]) : 0.0f;
         float *xb = xb_out + (size_t)(gq * n_heads + q_h) * head_dim;
-        float *aq = acc_sh + (warp * FA2_TILE_Q + wr) * head_dim;
+        float *aq = acc_sh + qi * head_dim;
         for (int d = lt; d < head_dim; d += 32)
             xb[d] = aq[d] * inv;
     }
