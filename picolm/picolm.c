@@ -478,7 +478,7 @@ static void gpu_matmul_diff(int S, int I, int O) {
 /* GPU attention diff test: generate random Q/K/V, run FA2 and scalar
  * attention kernels, diff the output. No model needed. */
 static void gpu_attn_diff_test(int n_tokens, int n_heads, int n_kv_heads, int head_dim) {
-    if (n_tokens < 1) { fprintf(stderr, "n_tokens must be >= 64\n"); exit(1); }
+    if (n_tokens < 64) { fprintf(stderr, "n_tokens must be >= 64\n"); exit(1); }
     if (head_dim % 16 != 0) { fprintf(stderr, "head_dim must be multiple of 16\n"); exit(1); }
     if (n_heads % n_kv_heads != 0) { fprintf(stderr, "n_heads must be multiple of n_kv_heads\n"); exit(1); }
 
@@ -532,50 +532,49 @@ static void gpu_attn_diff_test(int n_tokens, int n_heads, int n_kv_heads, int he
             n_kv_heads, head_dim, max_seq_len, 0);
     }
 
-    /* FA2 attention via host path (handles Q upload internally) */
+    /* Run FA2 and scalar kernels multiple times on the same stream to
+     * stress-test for race conditions / stale shared memory / OOB writes */
+    const int n_iters = 500;
+    fprintf(stderr, "Running %d stress iterations...\n", n_iters);
+
     unsetenv("PICOLM_FORCE_SCALAR_ATTN");
-    if (!picolm_gpu_attention_prefill(y_fa2, q_h, 0, 0, n_tokens,
-            n_heads, n_kv_heads, head_dim, max_seq_len, 0)) {
-        fprintf(stderr, "FA2 attention failed\n"); exit(1);
+    for (int iter = 0; iter < n_iters; iter++) {
+        if (!picolm_gpu_attention_prefill(y_fa2, q_h, 0, 0, n_tokens,
+                n_heads, n_kv_heads, head_dim, max_seq_len, 0)) {
+            fprintf(stderr, "FA2 attention failed iter %d\n", iter); exit(1);
+        }
+        setenv("PICOLM_FORCE_SCALAR_ATTN", "1", 1);
+        if (!picolm_gpu_attention_prefill(y_scalar, q_h, 0, 0, n_tokens,
+                n_heads, n_kv_heads, head_dim, max_seq_len, 0)) {
+            fprintf(stderr, "Scalar attention failed iter %d\n", iter); exit(1);
+        }
+        unsetenv("PICOLM_FORCE_SCALAR_ATTN");
+
+        /* Check after each iteration */
+        float max_abs = 0, max_rel = 0;
+        int max_pos = 0;
+        size_t n = (size_t)n_tokens * n_heads * head_dim;
+        for (size_t i = 0; i < n; i++) {
+            float diff = y_fa2[i] - y_scalar[i];
+            if (diff < 0) diff = -diff;
+            float rel = (fabsf(y_scalar[i]) > 1e-8f) ? diff / fabsf(y_scalar[i]) : diff;
+            if (diff > max_abs) { max_abs = diff; max_rel = rel; max_pos = (int)i; }
+        }
+        if (max_rel > 0.01f) {
+            int tk = max_pos / (n_heads * head_dim);
+            int hh = (max_pos / head_dim) % n_heads;
+            int dd = max_pos % head_dim;
+            fprintf(stderr, "  max_abs_err = %.6f (tok=%d, head=%d, dim=%d) at iter %d\n",
+                max_abs, tk, hh, dd, iter);
+            fprintf(stderr, "  max_rel_err = %.6f\n", max_rel);
+            fprintf(stderr, "  RESULT: DIFFER (rel_err > 1%%)\n");
+            return;
+        }
     }
 
-    /* Scalar attention */
-    setenv("PICOLM_FORCE_SCALAR_ATTN", "1", 1);
-    if (!picolm_gpu_attention_prefill(y_scalar, q_h, 0, 0, n_tokens,
-            n_heads, n_kv_heads, head_dim, max_seq_len, 0)) {
-        fprintf(stderr, "Scalar attention failed\n"); exit(1);
-    }
-    unsetenv("PICOLM_FORCE_SCALAR_ATTN");
-
-    /* Diff */
-    float max_abs = 0, max_rel = 0;
-    int max_pos = 0;
-    size_t n = (size_t)n_tokens * n_heads * head_dim;
-    for (size_t i = 0; i < n; i++) {
-        float diff = y_fa2[i] - y_scalar[i];
-        if (diff < 0) diff = -diff;
-        float rel = (fabsf(y_scalar[i]) > 1e-8f) ? diff / fabsf(y_scalar[i]) : diff;
-        if (diff > max_abs) { max_abs = diff; max_rel = rel; max_pos = (int)i; }
-    }
-    int tk = max_pos / (n_heads * head_dim);
-    int hh = (max_pos / head_dim) % n_heads;
-    int dd = max_pos % head_dim;
-    fprintf(stderr, "GPU attn diff: %d tok, %d heads, %d kv_heads, hd=%d, %zu elements\n",
-        n_tokens, n_heads, n_kv_heads, head_dim, n);
-    fprintf(stderr, "  max_abs_err = %.6f (tok=%d, head=%d, dim=%d)\n",
-        max_abs, tk, hh, dd);
-    fprintf(stderr, "  max_rel_err = %.6f\n", max_rel);
-    fprintf(stderr, "  FA2 y[%d][%d][0:4]={%.6f,%.6f,%.6f,%.6f}\n",
-        tk, hh, y_fa2[max_pos], y_fa2[max_pos+1], y_fa2[max_pos+2], y_fa2[max_pos+3]);
-    fprintf(stderr, "  SC  y[%d][%d][0:4]={%.6f,%.6f,%.6f,%.6f}\n",
-        tk, hh, y_scalar[max_pos], y_scalar[max_pos+1], y_scalar[max_pos+2], y_scalar[max_pos+3]);
-    /* Also print first token, first head */
-    fprintf(stderr, "  FA2 y[0][0][0:4]={%.6f,%.6f,%.6f,%.6f}\n",
-        y_fa2[0], y_fa2[1], y_fa2[2], y_fa2[3]);
-    fprintf(stderr, "  SC  y[0][0][0:4]={%.6f,%.6f,%.6f,%.6f}\n",
-        y_scalar[0], y_scalar[1], y_scalar[2], y_scalar[3]);
-    if (max_rel > 0.01f) fprintf(stderr, "  RESULT: DIFFER (rel_err > 1%%)\n");
-    else fprintf(stderr, "  RESULT: MATCH (rel_err <= 1%%)\n");
+    fprintf(stderr, "GPU attn diff: %d tok, %d heads, %d kv_heads, hd=%d, %d iters\n",
+        n_tokens, n_heads, n_kv_heads, head_dim, n_iters);
+    fprintf(stderr, "  RESULT: MATCH (all %d iterations)\n", n_iters);
 
     free(q_h); free(k_h); free(v_h); free(y_fa2); free(y_scalar);
 }

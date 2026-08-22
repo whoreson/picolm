@@ -1543,9 +1543,9 @@ picolm_gpu_attention_prefill_fa2_kernel(
     __syncwarp();
     gpuSyncthreads();
 
-    /* Phase 2: Init */
-    for (int i = t; i < 16 * head_dim; i += 128) acc_sh[i] = 0.0f;
-    for (int i = t; i < 16; i += 128) { max_sh[i] = -1e30f; sum_sh[i] = 0.0f; }
+    /* Phase 2: Init all 64 Q rows */
+    for (int i = t; i < 64 * head_dim; i += 128) acc_sh[i] = 0.0f;
+    for (int i = t; i < 64; i += 128) { max_sh[i] = -1e30f; sum_sh[i] = 0.0f; }
     gpuSyncthreads();
 
     /* Phase 3: KV tiling */
@@ -1606,10 +1606,11 @@ picolm_gpu_attention_prefill_fa2_kernel(
         }
         __syncwarp();
 
+        /* Softmax + V accumulation per K-tile */
         {
-            /* Each IMMA group (4 threads) computed scores for 2 Q rows:
-             * groupID and groupID+8. Thread 0 and 1 in each group do softmax
-             * for those 2 rows. Threads 2 and 3 are idle in softmax. */
+            /* Each IMMA group (4 threads) computed scores for 2 Q rows.
+             * Threads 0,1 in each group do softmax for those 2 rows.
+             * Threads 2,3 are idle in softmax. */
             int srow = (tid_in_grp < 2) ? (groupID + tid_in_grp * 8) : -1;
             if (srow >= 0) {
                 int qi = warp * FA2_TILE_Q + srow;
@@ -1638,9 +1639,7 @@ picolm_gpu_attention_prefill_fa2_kernel(
             }
         }
         gpuSyncthreads();
-
-        /* Debug: softmax state for specific qi values */
-        }
+    }
 
     /* Phase 4: Normalize and write output */
     gpuSyncthreads();
