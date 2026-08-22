@@ -184,6 +184,14 @@ typedef hipEvent_t gpuEvent_t;
 
 /* ---- Device-side FP16 helpers ---- */
 
+/* FAST_FP16_AVAILABLE: native FP16 arithmetic (half2 mul/add).
+ * AMD HIP has fast native FP16 on all architectures.
+ * CUDA has it on Pascal+ (sm_60+). Only sm_61 (Pascal) lacks it
+ * due to missing native FP16 instructions. */
+#if defined(__HIP__) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 600 && __CUDA_ARCH__ != 610)
+#define FAST_FP16_AVAILABLE
+#endif
+
 #ifdef __HIP_PLATFORM_AMD__
 #ifdef __HIP__
 #include <hip/hip_fp16.h>
@@ -193,6 +201,18 @@ __host__ __device__ static inline float gpu_fp16_to_fp32(uint16_t h) {
 __host__ __device__ static inline uint16_t gpu_fp32_to_fp16(float f) {
     return __half_as_ushort(__float2half(f));
 }
+
+/* Native FP16 FMA: acc += v * u, operating on half2 pairs.
+ * On HIP, native FP16 arithmetic is fast on all architectures. */
+#ifdef FAST_FP16_AVAILABLE
+__device__ static inline void gpu_fp16_mad(float &acc, const half2 v, const half2 u) {
+    const float2 tmp = __half22float2(v * u);
+    acc += tmp.x + tmp.y;
+}
+__device__ static inline void gpu_fp16_mad(half2 &acc, const half2 v, const half2 u) {
+    acc += v * u;
+}
+#endif
 #else
 __host__ __device__ static inline float gpu_fp16_to_fp32(uint16_t h) {
     return (float)__half_raw(h);
@@ -200,6 +220,15 @@ __host__ __device__ static inline float gpu_fp16_to_fp32(uint16_t h) {
 __host__ __device__ static inline uint16_t gpu_fp32_to_fp16(float f) {
     return __half_as_ushort(__float2half(f));
 }
+#ifdef FAST_FP16_AVAILABLE
+__device__ static inline void gpu_fp16_mad(float &acc, const half2 v, const half2 u) {
+    const float2 tmp = __half22float2(v * u);
+    acc += tmp.x + tmp.y;
+}
+__device__ static inline void gpu_fp16_mad(half2 &acc, const half2 v, const half2 u) {
+    acc += v * u;
+}
+#endif
 #endif
 #else
 /* CUDA: __half is a native type */
@@ -209,6 +238,15 @@ __host__ __device__ static inline float gpu_fp16_to_fp32(unsigned short h) {
 __host__ __device__ PICOLM_UNUSED static inline unsigned short gpu_fp32_to_fp16(float f) {
     return __half_as_ushort(__float2half(f));
 }
+#ifdef FAST_FP16_AVAILABLE
+__device__ static inline void gpu_fp16_mad(float &acc, const half2 v, const half2 u) {
+    const float2 tmp = __half22float2(v * u);
+    acc += tmp.x + tmp.y;
+}
+__device__ static inline void gpu_fp16_mad(half2 &acc, const half2 v, const half2 u) {
+    acc += v * u;
+}
+#endif
 #endif
 
 /* ---- Device-side quantization block dequantization ----
