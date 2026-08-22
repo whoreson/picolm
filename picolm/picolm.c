@@ -478,7 +478,7 @@ static void gpu_matmul_diff(int S, int I, int O) {
 /* GPU attention diff test: generate random Q/K/V, run FA2 and scalar
  * attention kernels, diff the output. No model needed. */
 static void gpu_attn_diff_test(int n_tokens, int n_heads, int n_kv_heads, int head_dim) {
-    if (n_tokens < 64) { fprintf(stderr, "n_tokens must be >= 64\n"); exit(1); }
+    if (n_tokens < 1) { fprintf(stderr, "n_tokens must be >= 64\n"); exit(1); }
     if (head_dim % 16 != 0) { fprintf(stderr, "head_dim must be multiple of 16\n"); exit(1); }
     if (n_heads % n_kv_heads != 0) { fprintf(stderr, "n_heads must be multiple of n_kv_heads\n"); exit(1); }
 
@@ -565,6 +565,15 @@ static void gpu_attn_diff_test(int n_tokens, int n_heads, int n_kv_heads, int he
     fprintf(stderr, "  max_abs_err = %.6f (tok=%d, head=%d, dim=%d)\n",
         max_abs, tk, hh, dd);
     fprintf(stderr, "  max_rel_err = %.6f\n", max_rel);
+    fprintf(stderr, "  FA2 y[%d][%d][0:4]={%.6f,%.6f,%.6f,%.6f}\n",
+        tk, hh, y_fa2[max_pos], y_fa2[max_pos+1], y_fa2[max_pos+2], y_fa2[max_pos+3]);
+    fprintf(stderr, "  SC  y[%d][%d][0:4]={%.6f,%.6f,%.6f,%.6f}\n",
+        tk, hh, y_scalar[max_pos], y_scalar[max_pos+1], y_scalar[max_pos+2], y_scalar[max_pos+3]);
+    /* Also print first token, first head */
+    fprintf(stderr, "  FA2 y[0][0][0:4]={%.6f,%.6f,%.6f,%.6f}\n",
+        y_fa2[0], y_fa2[1], y_fa2[2], y_fa2[3]);
+    fprintf(stderr, "  SC  y[0][0][0:4]={%.6f,%.6f,%.6f,%.6f}\n",
+        y_scalar[0], y_scalar[1], y_scalar[2], y_scalar[3]);
     if (max_rel > 0.01f) fprintf(stderr, "  RESULT: DIFFER (rel_err > 1%%)\n");
     else fprintf(stderr, "  RESULT: MATCH (rel_err <= 1%%)\n");
 
