@@ -259,6 +259,17 @@ extern "C" float *picolm_gpu_pipe_attn_out_b(int device)   { gpu_device_ctx_t *c
 extern "C" float *picolm_gpu_pipe_ffn_norm_b(int device)   { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_ffn_norm_b : NULL; }
 extern "C" float *picolm_gpu_pipe_gate_b(int device)       { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_gate_b : NULL; }
 extern "C" float *picolm_gpu_pipe_up_b(int device)         { gpu_device_ctx_t *c = find_ctx(device); return c ? c->pipe_up_b : NULL; }
+
+/* Pinned host staging buffer accessor. Returns a page-locked host pointer
+ * that is safe for async H2D copies via gpuMemcpyAsync. Auto-grows to
+ * accommodate the requested byte count. Returns NULL on OOM. */
+extern "C" float *picolm_gpu_staging_host(int device, size_t bytes) {
+    gpu_device_ctx_t *c = find_ctx(device);
+    if (!c) return NULL;
+    if (!reserve_pinned(&c->host_x, &c->host_x_cap, bytes)) return NULL;
+    return c->host_x;
+}
+
 extern "C" float *picolm_gpu_verify_buf(int device)        { return g_verify_buf_dev[device]; }
 
 /* SSM pipeline buffer accessors */
@@ -619,7 +630,7 @@ picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
     if (!reserve(&ctx->x, &ctx->x_cap, x_bytes) ||
         !reserve(&ctx->y, &ctx->y_cap, y_bytes)) return 0;
 
-    if (!gpu_ok(gpuMemcpy(ctx->x, q_host, x_bytes, gpuMemcpyHostToDevice),
+    if (!gpu_ok(gpuMemcpyAsync(ctx->x, q_host, x_bytes, gpuMemcpyHostToDevice, ctx->stream),
                 "attn prefill Q upload")) return 0;
 
     size_t kv_pos_stride_bytes = (size_t)n_kv_heads * head_dim * sizeof(uint16_t);
@@ -666,10 +677,11 @@ picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
             kv_pos_stride_bytes, kv_head_stride_bytes);
     }
 
-    if (!gpu_ok(gpuGetLastError(), "attn prefill kernel") ||
-        !gpu_ok(gpuDeviceSynchronize(), "attn prefill sync")) return 0;
+    if (!gpu_ok(gpuGetLastError(), "attn prefill kernel")) return 0;
 
-    if (!gpu_ok(gpuMemcpy(xb_out, ctx->y, y_bytes, gpuMemcpyDeviceToHost),
+    /* Stream ordering ensures kernel completes before D2H starts.
+     * Async D2H implicitly blocks CPU on completion, no explicit sync needed. */
+    if (!gpu_ok(gpuMemcpyAsync(xb_out, ctx->y, y_bytes, gpuMemcpyDeviceToHost, ctx->stream),
                 "attn prefill output download")) return 0;
     return 1;
 }

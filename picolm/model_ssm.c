@@ -4043,8 +4043,8 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
 
     /* Verify pipeline is ready */
     if (!gw->kv_active) return model_forward(m, token, pos);
-    if (!picolm_gpu_pipe_x(gpu_dev)) return model_forward(m, token, pos);
-    if (!gw->rope_cos_dev || !gw->rope_sin_dev) return model_forward(m, token, pos);
+    if (!picolm_gpu_pipe_x(gpu_dev)) { fprintf(stderr, "[GPU] fw_gpu fallback: !pipe_x\n"); return model_forward(m, token, pos); }
+    if (!gw->rope_cos_dev || !gw->rope_sin_dev) { fprintf(stderr, "[GPU] fw_gpu fallback: !rope\n"); return model_forward(m, token, pos); }
 
     /* Pipeline buffer pointers */
     float *pipe_x = picolm_gpu_pipe_x(gpu_dev);
@@ -4060,8 +4060,8 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
     /* GPU layer weight handles */
     gpu_layer_weights_t *gl;
 
-    /* 1. Embedding lookup on CPU (same path as model_forward), then H2D */
-    /* For Fimbulvetr (type=1 F16 embd), the generic dequantize_row works.
+    /* 1. Embedding lookup on CPU, then async H2D to pipe_x.
+     * Dequantize into pinned staging buffer for async copy.
      * For interleaved Q4_0 formats, fall back to CPU path. */
     if (w->type_token_embd == GGUF_TYPE_Q4_0_8_8 ||
         w->type_token_embd == GGUF_TYPE_Q4_0_4_4 ||
@@ -4073,8 +4073,15 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
     {
         size_t row_bytes = gguf_type_row_size(w->type_token_embd, dim);
         const void *embd_row = (const uint8_t *)w->token_embd + (size_t)token * row_bytes;
-        dequantize_row(embd_row, s->x, dim, w->type_token_embd);
-        picolm_gpu_memcpy(pipe_x, s->x, dim * sizeof(float), 1, gpu_dev);
+        float *staging = picolm_gpu_staging_host(gpu_dev, dim * sizeof(float));
+        if (!staging) {
+            /* Fallback: sync copy via s->x heap buffer */
+            dequantize_row(embd_row, s->x, dim, w->type_token_embd);
+            picolm_gpu_memcpy(pipe_x, s->x, dim * sizeof(float), 1, gpu_dev);
+        } else {
+            dequantize_row(embd_row, staging, dim, w->type_token_embd);
+            picolm_gpu_memcpy_async(pipe_x, staging, dim * sizeof(float), 1, gpu_dev);
+        }
     }
 
     /* KV cache store is now fully device-native (picolm_gpu_kv_store_dev),

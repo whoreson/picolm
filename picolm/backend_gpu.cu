@@ -5556,7 +5556,7 @@ picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
     if (!reserve(&ctx->x, &ctx->x_cap, x_bytes) ||
         !reserve(&ctx->y, &ctx->y_cap, y_bytes)) return 0;
 
-    if (!gpu_ok(gpuMemcpy(ctx->x, q_host, x_bytes, gpuMemcpyHostToDevice),
+    if (!gpu_ok(gpuMemcpyAsync(ctx->x, q_host, x_bytes, gpuMemcpyHostToDevice, ctx->stream),
                 "attn prefill Q upload")) return 0;
 
     size_t kv_pos_stride_bytes = (size_t)n_kv_heads * head_dim * sizeof(uint16_t);
@@ -5574,10 +5574,11 @@ picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
         layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim, max_seq_len,
         kv_pos_stride_bytes, kv_head_stride_bytes);
 
-    if (!gpu_ok(gpuGetLastError(), "attn prefill kernel") ||
-        !gpu_ok(gpuDeviceSynchronize(), "attn prefill sync")) return 0;
+    if (!gpu_ok(gpuGetLastError(), "attn prefill kernel")) return 0;
 
-    if (!gpu_ok(gpuMemcpy(xb_out, ctx->y, y_bytes, gpuMemcpyDeviceToHost),
+    /* Stream ordering ensures kernel completes before D2H starts.
+     * Async D2H implicitly blocks CPU on completion, no explicit sync needed. */
+    if (!gpu_ok(gpuMemcpyAsync(xb_out, ctx->y, y_bytes, gpuMemcpyDeviceToHost, ctx->stream),
                 "attn prefill output download")) return 0;
     return 1;
 }

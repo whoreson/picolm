@@ -602,6 +602,8 @@ float *picolm_gpu_upload_f32(const float *host, size_t n, int device);
 int picolm_gpu_memcpy(void *dst, const void *src, size_t bytes, int dir, int device);
 /* Async variant: no device sync, caller manages stream ordering. */
 int picolm_gpu_memcpy_async(void *dst, const void *src, size_t bytes, int dir, int device);
+/* Pinned host staging buffer for async H2D. Auto-grows. */
+float *picolm_gpu_staging_host(int device, size_t bytes);
 
 #ifdef __cplusplus
 }

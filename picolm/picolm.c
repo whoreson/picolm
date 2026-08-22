@@ -471,8 +471,7 @@ static void benchmark_context_scaling(const char *model_path, const char *base_p
 
         /* Prefill only the NEW tokens at start_pos */
 #ifdef PICOLM_GPU
-        if (ctx_at_step == 0) { cudaProfilerStart(); }
-        else if (ctx_at_step > 1000) { cudaProfilerStart(); }
+        if (ctx_at_step > 800) { cudaProfilerStart(); }
 #endif
         double t0 = get_time_ms();
 
@@ -492,8 +491,7 @@ static void benchmark_context_scaling(const char *model_path, const char *base_p
 
         double t_prefill = get_time_ms();
 #ifdef PICOLM_GPU
-        if (ctx_at_step == 0) { cudaProfilerStop(); }
-        else if (ctx_at_step > 1000) { cudaProfilerStop(); }
+        if (ctx_at_step > 800) { cudaProfilerStop(); }
 #endif
         float prefill_ms = (float)(t_prefill - t0);
         start_pos += n_base;  /* advance cached position past new tokens */
@@ -509,7 +507,12 @@ static void benchmark_context_scaling(const char *model_path, const char *base_p
             if (total_tokens <= ctx_size_limit)
                 prompt_tokens[total_tokens - 1] = next;
 
+            #ifdef PICOLM_GPU
+            logits = model_forward_gpu(&model, next, pos);
+            if (!logits) logits = model_forward(&model, next, pos);
+#else
             logits = model_forward(&model, next, pos);
+#endif
             pos++;
             start_pos++;  /* advance past generated token */
         }
