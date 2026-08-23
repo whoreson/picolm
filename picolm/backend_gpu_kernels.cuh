@@ -76,6 +76,10 @@ __global__ void picolm_q8_q8_matmul_imma(float *y, const int8_t *xq, const float
                                           const void *weights, int S, int I, int O,
                                           int row_bytes, int y_stride);
 
+__global__ void picolm_q8_q8_matmul_imma_w16(float *y, const int8_t *xq, const float *xd,
+                                              const void *weights, int S, int I, int O,
+                                              int row_bytes, int y_stride);
+
 /* FP16 tiled matmul: loads FP16 weight rows into shared memory once per tile.
  * FP32 activations, FP16 weights, FP32 output. */
 __global__ void picolm_f16_f16_matmul_tiled(float *y, const float *x, const uint16_t *w,
@@ -199,7 +203,7 @@ __global__ void picolm_gpu_attention_prefill_kernel( float *xb_out,  const float
  * Uses mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 for Q@K scoring.
  * NOT bit-exact with scalar kernel. head_dim must be multiple of 16. */
 #define FA2_TILE_Q 16
-#define FA2_TILE_K 16
+#define FA2_TILE_K 32
 
 __global__ void picolm_gpu_attention_prefill_fa2_kernel(
     float *xb_out, const float *q_dev,

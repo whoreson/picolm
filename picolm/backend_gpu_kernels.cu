@@ -676,7 +676,7 @@ picolm_q6_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
          *   ql byte: ql_base + e (low or high nibble)
          *   qh byte: qh_base + e (extract qh_shift..qh_shift+1 bits)
          *   6-bit value: (nibble ? ql>>4 : ql&0xF) | (qh_bits << 4)
-         *   int8 value: 6bit - 32 (use __vsub4 for per-byte subtraction) */
+         *   int8 value: 6bit - 32 (per-byte subtraction) */
 
         /* Load ql bytes for b0 (4 bytes) and b1 (4 bytes) */
         uint32_t ql0_raw, ql1_raw;
@@ -720,8 +720,8 @@ picolm_q6_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
 
         /* Combine: 6-bit value = ql_nibble | qh_bits, then subtract 32 per byte */
         uint32_t b0, b1;
-        asm("vsub.u8.u32.u32 %0, %1, %2, 0;" : "=r"(b0) : "r"(ql0 | qh0), "r"(0x20202020));
-        asm("vsub.u8.u32.u32 %0, %1, %2, 0;" : "=r"(b1) : "r"(ql1 | qh1), "r"(0x20202020));
+        { uint32_t v = ql0 | qh0; b0 = ((v & 0xFF) - 32) | (((v >> 8) & 0xFF) - 32) << 8 | (((v >> 16) & 0xFF) - 32) << 16 | ((v >> 24) - 32) << 24; }
+        { uint32_t v = ql1 | qh1; b1 = ((v & 0xFF) - 32) | (((v >> 8) & 0xFF) - 32) << 8 | (((v >> 16) & 0xFF) - 32) << 16 | ((v >> 24) - 32) << 24; }
 
         /* Two IMMA calls: first K[0..15] with b0, then K[16..31] with b1 */
         int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
@@ -1012,7 +1012,7 @@ picolm_q4_0_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
          *
          * For IMMA s8, each byte must be sign-extended to int8.
          * Q4_0 stores values 0..15, actual -8..7 after subtracting 8.
-         * We use __vsub4 to subtract 0x08 from each byte before IMMA. */
+         * We subtract 0x08 from each byte before IMMA (per-byte). */
         int b0, b1;
         {
             int wc = tile_o + gid;
@@ -1032,8 +1032,8 @@ picolm_q4_0_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
             hi |= ((raw1 >> 20) & 0x0F) << 24;
 
             /* Subtract 8 from each byte for signed interpretation */
-            asm("vsub.u8.u32.u32 %0, %1, %2, 0;" : "=r"(b0) : "r"(lo), "r"(0x08080808));
-            asm("vsub.u8.u32.u32 %0, %1, %2, 0;" : "=r"(b1) : "r"(hi), "r"(0x08080808));
+            { uint32_t v = lo; b0 = ((v & 0xFF) - 8) | (((v >> 8) & 0xFF) - 8) << 8 | (((v >> 16) & 0xFF) - 8) << 16 | ((v >> 24) - 8) << 24; }
+            { uint32_t v = hi; b1 = ((v & 0xFF) - 8) | (((v >> 8) & 0xFF) - 8) << 8 | (((v >> 16) & 0xFF) - 8) << 16 | ((v >> 24) - 8) << 24; }
         }
 
         int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
@@ -1250,8 +1250,8 @@ picolm_q2_0_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
                           | (((v0 >> 4) & 3) << 16) | ((v0 >> 6) << 24);
             uint32_t raw1 = (v1 & 3) | (((v1 >> 2) & 3) << 8)
                           | (((v1 >> 4) & 3) << 16) | ((v1 >> 6) << 24);
-            asm("vsub.u8.u32.u32 %0, %1, %2, 0;" : "=r"(b0) : "r"(raw0), "r"(0x01010101));
-            asm("vsub.u8.u32.u32 %0, %1, %2, 0;" : "=r"(b1) : "r"(raw1), "r"(0x01010101));
+            { uint32_t v = raw0; b0 = ((v & 0xFF) - 1) | (((v >> 8) & 0xFF) - 1) << 8 | (((v >> 16) & 0xFF) - 1) << 16 | ((v >> 24) - 1) << 24; }
+            { uint32_t v = raw1; b1 = ((v & 0xFF) - 1) | (((v >> 8) & 0xFF) - 1) << 8 | (((v >> 16) & 0xFF) - 1) << 16 | ((v >> 24) - 1) << 24; }
         }
 
         int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
@@ -1464,15 +1464,15 @@ picolm_q5_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
 
             uint32_t ql, qh_bits;
             ql = (qs0_raw & 0x0F) | (((qs0_raw >> 4) & 0x0F) << 8)
-               | (((qs0_raw >> 8) & 0x0F) << 16) | ((qs0_raw >> 12) & 0x0F) << 24);
+               | (((qs0_raw >> 8) & 0x0F) << 16) | ((((qs0_raw >> 12) & 0x0F)) << 24);
             qh_bits = (qh0_raw & 1) | (((qh0_raw >> 1) & 1) << 8)
-                    | (((qh0_raw >> 8) & 1) << 16) | ((qh0_raw >> 9) & 1) << 24);
+                    | (((qh0_raw >> 8) & 1) << 16) | ((((qh0_raw >> 9) & 1)) << 24);
             b0 = ql | (qh_bits << 4);
 
             ql = (qs1_raw & 0x0F) | (((qs1_raw >> 4) & 0x0F) << 8)
-               | (((qs1_raw >> 8) & 0x0F) << 16) | ((qs1_raw >> 12) & 0x0F) << 24);
+               | (((qs1_raw >> 8) & 0x0F) << 16) | ((((qs1_raw >> 12) & 0x0F)) << 24);
             qh_bits = (qh1_raw & 1) | (((qh1_raw >> 1) & 1) << 8)
-                    | (((qh1_raw >> 8) & 1) << 16) | ((qh1_raw >> 9) & 1) << 24);
+                    | (((qh1_raw >> 8) & 1) << 16) | ((((qh1_raw >> 9) & 1)) << 24);
             b1 = ql | (qh_bits << 4);
         }
 
@@ -1640,9 +1640,9 @@ picolm_q4_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
             } else {
                 /* Low nibbles: mask with 0x0F */
                 raw0 = (raw0 & 0x0F) | (((raw0 >> 4) & 0x0F) << 8)
-                     | (((raw0 >> 8) & 0x0F) << 16) | ((raw0 >> 12) & 0x0F) << 24;
+                     | (((raw0 >> 8) & 0x0F) << 16) | ((((raw0 >> 12) & 0x0F)) << 24);
                 raw1 = (raw1 & 0x0F) | (((raw1 >> 4) & 0x0F) << 8)
-                     | (((raw1 >> 8) & 0x0F) << 16) | ((raw1 >> 12) & 0x0F) << 24;
+                     | (((raw1 >> 8) & 0x0F) << 16) | ((((raw1 >> 12) & 0x0F)) << 24);
             }
             b0 = raw0;
             b1 = raw1;
@@ -2674,8 +2674,7 @@ picolm_gpu_attention_prefill_kernel(
  * order in IMMA. Validate using tolerance (1e-2).
  */
 
-#define FA2_TILE_Q 16
-#define FA2_TILE_K 32
+/* FA2_TILE_Q and FA2_TILE_K are defined in backend_gpu_kernels.cuh. */
 
 __global__ void
 picolm_ssm_vecdot_kernel(float *out,

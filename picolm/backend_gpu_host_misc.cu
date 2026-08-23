@@ -641,8 +641,9 @@ picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
     if (use_fa2) {
         int n_q_tiles = (n_tokens + 63) / 64;
         /* Shared memory per block (one query head, 4 warps * 16 Q rows):
-         * K(16*hd) + V(16*hd) + Q(16*hd) uint16_t + score(16*16) + acc(16*hd) + max(16) + sum(16) float
-         * For hd=128: 29.1KB. For hd=256: 57.1KB. */
+         * K(FA2_TILE_K*hd) + V(FA2_TILE_K*hd) + Q(64*hd) uint16_t
+         * + score(64*FA2_TILE_K) + acc(64*hd) + max(64) + sum(64) float
+         * For hd=128, TILE_K=32: 72.5KB. For hd=256, TILE_K=32: 137KB (exceeds limit, scalar fallback). */
         size_t fa2_shared = (size_t)FA2_TILE_K * head_dim * 2 * sizeof(uint16_t)
             + 64 * head_dim * sizeof(uint16_t)
             + 64 * FA2_TILE_K * sizeof(float)
@@ -707,8 +708,9 @@ picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
     if (ctx->has_imma && n_tokens >= 64 && !getenv("PICOLM_FORCE_SCALAR_ATTN")) {
         int n_q_tiles = (n_tokens + 63) / 64;  /* ceil, kernel handles OOB */
         /* Shared memory per block (one query head):
-         * K(16*hd) + V(16*hd) + Q(16*hd) uint16_t + score(16*16) + acc(16*hd) + max/sum float
-         * For hd=128: 29.1KB. For hd=256: 57.1KB. */
+         * K(FA2_TILE_K*hd) + V(FA2_TILE_K*hd) + Q(64*hd) uint16_t
+         * + score(64*FA2_TILE_K) + acc(64*hd) + max/sum float
+         * For hd=128, TILE_K=32: 72.5KB. For hd=256, TILE_K=32: 137KB (exceeds 96KB, scalar fallback). */
         size_t fa2_shared = (size_t)FA2_TILE_K * head_dim * 2 * sizeof(uint16_t)
             + 64 * head_dim * sizeof(uint16_t)
             + 64 * FA2_TILE_K * sizeof(float)
