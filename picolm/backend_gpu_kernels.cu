@@ -591,6 +591,182 @@ picolm_bf16_f32_matmul_tiled(
     }
 }
 
+/* Q6_K x Q8_0 IMMA kernel.
+ *
+ * Q6_K: 210 bytes per 256 weights. 6-bit values (stored 0..63, actual -32..31).
+ * Layout: ql[128] + qh[64] + scales[16] + d[2].
+ * 256 elements = 8 groups of 32. Each group has 2 int8 sub-scales (per 16 elems).
+ *
+ * IMMA m16n8k32: b0 covers K[0..15], b1 covers K[16..31].
+ * Two IMMA calls per K-step: (b0=real,b1=0) then (b0=0,b1=real).
+ *
+ * Grid: [(O+7)/8, (S+15)/16], Block: 32 threads. Same as Q8_0 IMMA.
+ */
+__global__ void
+picolm_q6_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
+                          const void *weights, int S, int I, int O,
+                          int row_bytes, int y_stride) {
+    int gid = gpuThreadIdx_x / 4;
+    int tid = gpuThreadIdx_x % 4;
+    int tile_o = gpuBlockIdx_x * 8;
+    int tile_s = gpuBlockIdx_y * 16;
+    int ys = y_stride > 0 ? y_stride : O;
+    int n_blocks = I / 32;
+    const uint8_t *w = (const uint8_t *)weights;
+    float sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int kb = 0; kb < n_blocks; kb++) {
+        /* Q6_K block + group within block.
+         * Each Q6_K block has 8 groups of 32 elements (8 IMMA K-steps). */
+        int q6_block = kb / 8;
+        int g = kb % 8;
+
+        /* Weight column offset (O-dimension) */
+        int wc = tile_o + gid;
+        size_t wrow_base = (size_t)wc * row_bytes + q6_block * GPU_BLOCK_Q6_K_SIZE;
+
+        /* Super-scale d (fp16 at offset 196 within Q6_K block) */
+        const uint8_t *wb_d = w + wrow_base;
+        float wd = gpu_fp16_to_fp32(wb_d[196] | ((uint16_t)wb_d[197] << 8));
+
+        /* Sub-scales for this group (2 int8 values, at offset 192 + g*2 and +g*2+1) */
+        float wsc0 = (float)(int8_t)wb_d[192 + g * 2];
+        float wsc1 = (float)(int8_t)wb_d[192 + g * 2 + 1];
+
+        /* Determine ql and qh byte offsets within this Q6_K block for group g.
+         *
+         * Chunk (0 or 1): chunk 0 = elems 0..127, chunk 1 = elems 128..255
+         * Half (0 or 1): 0 = first 32 elems of chunk (ql[0..31] or [64..95]),
+         *                1 = second 32 (ql[32..63] or [96..127])
+         * Nibble (0 or 1): 0 = low nibble of ql, 1 = high nibble
+         * QH pair (0..3): which pair of 2 bits from qh (0=bits 0-1, 1=bits 2-3,
+         *                 2=bits 4-5, 3=bits 6-7)
+         *
+         * Group -> (chunk, half, nibble, qh_pair):
+         *   0: (0, 0, 0, 0)  1: (0, 1, 0, 1)  2: (0, 0, 1, 2)  3: (0, 1, 1, 3)
+         *   4: (1, 0, 0, 0)  5: (1, 1, 0, 1)  6: (1, 0, 1, 2)  7: (1, 1, 1, 3) */
+        int chunk = g / 4;
+        int half = (g % 4) / 2;
+        int nibble = g % 2;
+        int qh_pair = g % 4;
+
+        int ql_base = chunk * 64 + half * 32;  /* ql byte offset within Q6_K block */
+        int qh_base = chunk * 32;               /* qh byte offset within Q6_K block */
+        int qh_shift = qh_pair * 2;             /* bit shift for qh extraction */
+
+        /* A: activation fragments (Q8_0, identical to Q8_0 IMMA kernel) */
+        int a0, a1, a2, a3;
+        {
+            int c0 = tid * 4;
+            int c2 = c0 + 16;
+            int src0 = (int)(tile_s + gid) * I + kb * 32 + c0;
+            int src1 = (int)(tile_s + gid + 8) * I + kb * 32 + c0;
+            int src2 = (int)(tile_s + gid) * I + kb * 32 + c2;
+            int src3 = (int)(tile_s + gid + 8) * I + kb * 32 + c2;
+            int32_t *p = (int32_t *)(const int8_t *)(&xq[src0]); a0 = p[0];
+            p = (int32_t *)(const int8_t *)(&xq[src1]); a1 = p[0];
+            p = (int32_t *)(const int8_t *)(&xq[src2]); a2 = p[0];
+            p = (int32_t *)(const int8_t *)(&xq[src3]); a3 = p[0];
+        }
+
+        /* B: unpack Q6_K 6-bit values to int8, packed 4-per-int32.
+         * b0 = elements tid*4..tid*4+3 (K[0..15]), b1 = tid*4+16..tid*4+19 (K[16..31]).
+         *
+         * Each element e uses:
+         *   ql byte: ql_base + e (low or high nibble)
+         *   qh byte: qh_base + e (extract qh_shift..qh_shift+1 bits)
+         *   6-bit value: (nibble ? ql>>4 : ql&0xF) | (qh_bits << 4)
+         *   int8 value: 6bit - 32 (use __vsub4 for per-byte subtraction) */
+
+        /* Load ql bytes for b0 (4 bytes) and b1 (4 bytes) */
+        uint32_t ql0_raw, ql1_raw;
+        {
+            const uint8_t *qlp = w + wrow_base + ql_base;
+            memcpy(&ql0_raw, qlp + tid * 4, 4);
+            memcpy(&ql1_raw, qlp + 16 + tid * 4, 4);
+        }
+        /* Extract low/high nibble */
+        uint32_t ql0, ql1;
+        if (nibble) {
+            ql0 = ql0_raw >> 4;
+            ql1 = ql1_raw >> 4;
+        } else {
+            ql0 = ql0_raw & 0x0F0F0F0F;
+            ql1 = ql1_raw & 0x0F0F0F0F;
+        }
+
+        /* Load qh bytes and extract 2-bit high values */
+        uint32_t qh0, qh1;
+        {
+            const uint8_t *qhp = w + wrow_base + qh_base;
+            uint32_t qh0_raw, qh1_raw;
+            memcpy(&qh0_raw, qhp + tid * 4, 4);
+            memcpy(&qh1_raw, qhp + 16 + tid * 4, 4);
+            /* Extract 2 bits from each byte and shift to bits 4-5 */
+            if (qh_shift == 0) {
+                qh0 = (qh0_raw << 4) & 0x30303030;
+                qh1 = (qh1_raw << 4) & 0x30303030;
+            } else if (qh_shift == 2) {
+                qh0 = (qh0_raw << 2) & 0x30303030;
+                qh1 = (qh1_raw << 2) & 0x30303030;
+            } else if (qh_shift == 4) {
+                qh0 = qh0_raw & 0x30303030;
+                qh1 = qh1_raw & 0x30303030;
+            } else {
+                qh0 = (qh0_raw >> 2) & 0x30303030;
+                qh1 = (qh1_raw >> 2) & 0x30303030;
+            }
+        }
+
+        /* Combine: 6-bit value = ql_nibble | qh_bits, then subtract 32 per byte */
+        uint32_t b0, b1;
+        asm("vsub.u8.u32.u32 %0, %1, %2, 0;" : "=r"(b0) : "r"(ql0 | qh0), "r"(0x20202020));
+        asm("vsub.u8.u32.u32 %0, %1, %2, 0;" : "=r"(b1) : "r"(ql1 | qh1), "r"(0x20202020));
+
+        /* Two IMMA calls: first K[0..15] with b0, then K[16..31] with b1 */
+        int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+        int d0b = 0, d1b = 0, d2b = 0, d3b = 0;
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+        /* First IMMA: b0 real, b1 zero */
+        asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+            : "+r"(d0), "+r"(d1), "+r"(d2), "+r"(d3)
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(0));
+        /* Second IMMA: b0 zero, b1 real */
+        asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+            : "+r"(d0b), "+r"(d1b), "+r"(d2b), "+r"(d3b)
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(0), "r"(b1));
+#endif
+
+        /* Epilogue: apply scales.
+         * d0-d3 accumulated from K[0..15] with sub-scale wsc0.
+         * d0b-d3b accumulated from K[16..31] with sub-scale wsc1.
+         * Activation scales: dx0 for rows gid, gid+8.
+         * Output columns: tid*2 and tid*2+1 (2 per thread). */
+        float dx0 = xd[(size_t)(tile_s + gid) * n_blocks + kb];
+        float dx1 = xd[(size_t)(tile_s + gid + 8) * n_blocks + kb];
+        float wds0 = wd * wsc0;
+        float wds1 = wd * wsc1;
+
+        sum[0] += (float)d0  * dx0 * wds0 + (float)d0b  * dx0 * wds1;
+        sum[1] += (float)d1  * dx0 * wds0 + (float)d1b  * dx0 * wds1;
+        sum[2] += (float)d2  * dx1 * wds0 + (float)d2b  * dx1 * wds1;
+        sum[3] += (float)d3  * dx1 * wds0 + (float)d3b  * dx1 * wds1;
+    }
+    for (int f = 0; f < 4; f++) {
+        int row = (f < 2) ? gid : gid + 8;
+        int col = tid * 2 + (f % 2);
+        int gr = tile_s + row;
+        int gc = tile_o + col;
+        if (gr < S && gc < O)
+            y[(size_t)gr * ys + (size_t)gc] = sum[f];
+    }
+}
+
 __global__ void
 picolm_q8_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
                           const void *weights, int S, int I, int O,

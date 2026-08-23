@@ -302,12 +302,35 @@ int picolm_gpu_tensor_upload(void **tensor,
     t->qtype = qtype; t->I = I; t->O = O; t->device = device;
     t->row_bytes = row_bytes; t->block_size = bs;
 
-    /* Q2_K/Q3_K/Q4_K/Q5_K/Q6_K fast path: convert to Q8_0 at upload time for the int8-MAC kernel.
-     * These have per-sub-block scales that the Q8_0 kernel can't handle,
-     * but requantizing to Q8_0 (1 scale per 32 elements) is accurate enough
-     * and enables the highly-optimized picolm_q8_q8_matmul path. */
+    /* Q6_K native path: upload as-is, use picolm_q6_q8_matmul_imma kernel.
+     * Q2_K/Q3_K/Q4_K/Q5_K: convert to Q8_0 at upload time (no native kernel yet). */
+    if (qtype == 14 && (I % 256) == 0 && ctx->has_imma && S >= 16 && O >= 8) {
+        /* Q6_K: keep native format, upload directly */
+        size_t q6_total = (size_t)I / 256 * GPU_BLOCK_Q6_K_SIZE * (size_t)O;
+        if (!gpu_ok(gpuMalloc(&t->weights, q6_total), "tensor allocation (q6)") ||
+            !gpu_ok(gpuMemcpy(t->weights, weights, q6_total, gpuMemcpyHostToDevice),
+                    "tensor upload (q6)")) {
+            gpuFree(t->weights); free(t); return 0;
+        }
+        t->qtype = (gguf_type_t)14;
+        t->block_size = GPU_BLOCK_Q6_K_SIZE;
+        t->row_bytes = (size_t)I / 256 * GPU_BLOCK_Q6_K_SIZE;
+        t->zero_copy = 0;
+        t->tracked = 1;
+        ctx->tensor_count++;
+        ctx->tensor_bytes += q6_total;
+        {
+            static int first_print = 1;
+            if (first_print) {
+                fprintf(stderr, "[GPU] upload mode: q6_k native (IMMA fast path)\n");
+                first_print = 0;
+            }
+        }
+        *tp = t;
+        return 1;
+    }
     if (qtype == 10 || qtype == 11 || qtype == 12 || qtype == 13 || qtype == 14) {
-        /* Dequant Q2_K/Q3_K/Q4_K/Q5_K/Q6_K to F32, then requant to Q8_0 */
+        /* Fallback for Q2_K..Q6_K: dequant to F32, requant to Q8_0 */
         size_t f32_bytes = (size_t)I * (size_t)O * sizeof(float);
         float *f32_buf = (float *)calloc(I * O, sizeof(float));
         if (!f32_buf) { gpuFree(t->weights); free(t); return 0; }
@@ -609,6 +632,38 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
         return 1;
     }
 
+    /* Q6_K x Q8_0 IMMA path */
+    if (t->qtype == GGUF_TYPE_Q6_K && ctx->has_imma && S >= 16 && O >= 8 && I % 256 == 0) {
+        int n_blocks = I / 32;
+        if (n_blocks < 1) return 0;
+
+        /* Upload fp32 input */
+        if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
+
+        /* Quantize x to Q8_0 on GPU (same as Q8_0 path) */
+        int S_padded = (S + 15) & ~15;
+        size_t xq_bytes = (size_t)S_padded * I;
+        size_t xd_bytes = (size_t)S_padded * n_blocks * sizeof(float);
+        if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, xq_bytes) ||
+            !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
+
+        dim3 q_grid((unsigned)n_blocks, (unsigned)S);
+        picolm_quantize_q8_0<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
+            ctx->q8_xq, ctx->q8_xd, ctx->x, I, S);
+        if (!gpu_ok(gpuGetLastError(), "q8 quantize") ||
+            !gpu_ok(gpuDeviceSynchronize(), "q8 quantize sync")) return 0;
+
+        gpu_dispatch_print("matmul_q6_imma_host");
+        dim3 grid((unsigned)((O + 7) / 8), (unsigned)((S + 15) / 16));
+        picolm_q6_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(
+            ctx->y, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, O);
+        if (!gpu_ok(gpuGetLastError(), "q6 matmul") ||
+            !gpu_ok(gpuDeviceSynchronize(), "q6 matmul sync")) return 0;
+
+        if (!gpu_ok(gpuMemcpy(y, ctx->y, yb, gpuMemcpyDeviceToHost), "output download")) return 0;
+        return 1;
+    }
+
     /* FP16/BF16 tiled path: load weight row into shared memory once per
      * tile of F16_TILE_S positions, reducing global weight reads by
      * S/TILE_S. Falls back to picolm_quant_matmul for small S or
@@ -718,6 +773,34 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
                 y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
         }
         if (!gpu_ok(gpuGetLastError(), "q8 matmul (dev)")) return 0;
+        return 1;
+    }
+
+    /* Q6_K x Q8_0 IMMA path (device) */
+    if (t->qtype == GGUF_TYPE_Q6_K && ctx->has_imma && S >= 16 && O >= 8 && I % 256 == 0) {
+        int n_blocks = I / 32;
+        if (n_blocks < 1) return 0;
+        int S_padded = (S + 15) & ~15;
+        size_t xq_bytes = (size_t)S_padded * I;
+        size_t xd_bytes = (size_t)S_padded * n_blocks * sizeof(float);
+        if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, xq_bytes) ||
+            !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
+        gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
+        gpuMemsetAsync(ctx->q8_xd, 0, xd_bytes, ctx->stream);
+        dim3 q_grid((unsigned)n_blocks, (unsigned)S);
+        if (x_stride > 0) {
+            picolm_quantize_q8_0_strided<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
+                ctx->q8_xq, ctx->q8_xd, x_dev, I, S, x_stride);
+        } else {
+            picolm_quantize_q8_0<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
+                ctx->q8_xq, ctx->q8_xd, x_dev, I, S);
+        }
+        if (!gpu_ok(gpuGetLastError(), "q8 quantize (dev)")) return 0;
+        gpu_dispatch_print("matmul_q6_imma_dev");
+        dim3 grid((unsigned)((O + 7) / 8), (unsigned)((S + 15) / 16));
+        picolm_q6_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(
+            y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
+        if (!gpu_ok(gpuGetLastError(), "q6 matmul (dev)")) return 0;
         return 1;
     }
     /* FP16/BF16 tiled path for device-resident tensors.
