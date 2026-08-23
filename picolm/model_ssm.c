@@ -4103,52 +4103,41 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
                                     (float *)gw->attn_norm_dev[l],
                                     dim, c->rms_norm_eps, gpu_dev);
 
-            /* B/D. Q+K+V projections: quantize pipe_xb once, run 3x IMMA.
-             * For SSM models: Q produces interleaved Q+gate, de-interleave
-             * happens before K+V, so keep Q separate and fuse K+V.
-             * For non-SSM models: fuse all three Q+K+V. */
-            if (!c->has_ssm) {
-                /* Non-SSM: fused Q+K+V (Phase 1) */
-                if (!picolm_gpu_matmul_dev_qkv(
-                        (picolm_gpu_tensor_t *)gl->attn_q,
-                        (picolm_gpu_tensor_t *)gl->attn_k,
-                        (picolm_gpu_tensor_t *)gl->attn_v,
-                        pipe_q, pipe_k, pipe_v,
-                        pipe_xb, 1, gpu_dev,
-                        0, 0, 0)) {
-                    /* Fallback */
-                    static int dqkv_fb=1; if(dqkv_fb){dqkv_fb=0; fprintf(stderr,"INFO: decode QKV matmul fallback (3x separate quantize+IMMA)\n");}
-                    picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
-                        pipe_q, pipe_xb, 1, gpu_dev, 0, 0);
-                    picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_k,
-                        pipe_k, pipe_xb, 1, gpu_dev, 0, 0);
-                    picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_v,
-                        pipe_v, pipe_xb, 1, gpu_dev, 0, 0);
-                }
-            } else {
-                /* SSM: Q separate (interleaved Q+gate), fuse K+V */
-                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
-                    pipe_q, pipe_xb, 1, gpu_dev, 0, 0);
+            /* B. Q projection: pipe_q = attn_q @ pipe_xb
+             * For SSM models this writes q_full_dim = 2*q_dim
+             * (interleaved [Q0,Gate0,Q1,Gate1,...]). */
+            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
+                                   pipe_q, pipe_xb, 1, gpu_dev, 0, 0);
 
-                /* B1. De-interleave Q+gate from pipe_q */
+            /* B1. For SSM models: de-interleave Q+gate from pipe_q.
+             * After this, pipe_q holds compacted Q[q_dim], pipe_gate
+             * holds gate[q_dim]. For non-SSM models, skip. */
+            if (c->has_ssm) {
+                /* De-interleave Q+gate. Cannot write Q in-place to pipe_q:
+                 * thread h writes pipe_q[h*head_dim] which overlaps with
+                 * thread h+1's read from pipe_q[(h+1)*2*head_dim].
+                 * Use pipe_attn_out as temp scratch for raw Q+gate data.
+                 * pipe_attn_out is sized for q_pipeline_dim (>= q_full_dim).
+                 * pipe_ffn_norm is only dim-sized and would overflow.
+                 *
+                 * Use async D2D copy on ctx->stream - the Q projection matmul
+                 * is already on ctx->stream, and stream ordering ensures the
+                 * D2D copy and subsequent deinterleave kernel see the data. */
                 picolm_gpu_memcpy_async(pipe_attn_out, pipe_q,
-                    (size_t)n_heads * 2 * head_dim * sizeof(float), 0, gpu_dev);
+                                   (size_t)n_heads * 2 * head_dim * sizeof(float),
+                                   0, gpu_dev);
                 picolm_gpu_qg_deinterleave_dev(pipe_attn_out, pipe_q,
-                    pipe_gate, n_heads, head_dim, gpu_dev);
-
-                /* C+D. Fused K+V (Phase 1) */
-                if (!picolm_gpu_matmul_dev_gu(
-                        (picolm_gpu_tensor_t *)gl->attn_k,
-                        (picolm_gpu_tensor_t *)gl->attn_v,
-                        pipe_k, pipe_v,
-                        pipe_xb, 1, gpu_dev, 0, 0)) {
-                    static int dkv_fb=1; if(dkv_fb){dkv_fb=0; fprintf(stderr,"INFO: decode K+V matmul fallback (2x separate quantize+IMMA)\n");}
-                    picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_k,
-                        pipe_k, pipe_xb, 1, gpu_dev, 0, 0);
-                    picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_v,
-                        pipe_v, pipe_xb, 1, gpu_dev, 0, 0);
-                }
+                                                pipe_gate, n_heads, head_dim,
+                                                gpu_dev);
             }
+
+            /* C. K projection: pipe_k = attn_k @ pipe_xb */
+            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_k,
+                                   pipe_k, pipe_xb, 1, gpu_dev, 0, 0);
+
+            /* D. V projection: pipe_v = attn_v @ pipe_xb */
+            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_v,
+                                   pipe_v, pipe_xb, 1, gpu_dev, 0, 0);
 
             /* E. QK-norm (Qwen3): per-head RMSNorm on Q and K.
              * pipe_q is [n_heads][head_dim], weight is [head_dim].
@@ -4279,19 +4268,13 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
                                     (float *)gw->post_attn_norm_dev[l],
                                     dim, c->rms_norm_eps, gpu_dev);
 
-            /* L+M. Fused gate+up (Phase 2): quantize pipe_ffn_norm once, run 2x IMMA */
-            if (!picolm_gpu_matmul_dev_gu(
-                    (picolm_gpu_tensor_t *)gl->ffn_gate,
-                    (picolm_gpu_tensor_t *)gl->ffn_up,
-                    pipe_gate, pipe_up,
-                    pipe_ffn_norm, 1, gpu_dev, 0, 0)) {
-                /* Fallback */
-                static int dgu_fb=1; if(dgu_fb){dgu_fb=0; fprintf(stderr,"INFO: decode gate+up matmul fallback (2x separate quantize+IMMA)\n");}
-                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_gate,
-                    pipe_gate, pipe_ffn_norm, 1, gpu_dev, 0, 0);
-                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_up,
-                    pipe_up, pipe_ffn_norm, 1, gpu_dev, 0, 0);
-            }
+            /* L. Gate: pipe_gate = ffn_gate @ pipe_ffn_norm */
+            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_gate,
+                                   pipe_gate, pipe_ffn_norm, 1, gpu_dev, 0, 0);
+
+            /* M. Up: pipe_up = ffn_up @ pipe_ffn_norm */
+            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_up,
+                                   pipe_up, pipe_ffn_norm, 1, gpu_dev, 0, 0);
 
             /* N. SiLU-mul: pipe_gate = silu(pipe_gate) * pipe_up (in-place on gate) */
             picolm_gpu_silu_mul_dev(pipe_gate, pipe_up, n_ffn, gpu_dev);
@@ -4326,8 +4309,239 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
     return s->logits;
 }
 
-/* Phase 2: GPU-pipelined prefill forward pass.
- * Keeps activations on-device across all layers with S=n_tokens batching.
+
+/* Process one ubatch through all layers.
+ * The ubatch's token embeddings are already loaded into bx.
+ * start_pos is the global position of the first token in this ubatch.
+ * n_ubatch is the number of tokens in this ubatch.
+ * Returns 0 on success, -1 on failure. */
+static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
+    int gpu_dev, int dim, int n_ffn, int n_heads, int n_kv_heads, int head_dim,
+    int seq_len, int rope_dim, int rope_half,
+    int q_dim, int kv_dim, int q_full_dim, int xb_stride,
+    float *bx, float *bxb, float *bq, float *bk, float *bv,
+    float *battn_out, float *bffn_norm, float *bgate, float *bup,
+    int n_ubatch, int start_pos, volatile int *interrupt) {
+    model_config_t *c = &m->config;
+    model_weights_t *w = &m->weights;
+    gpu_layer_weights_t *gl;
+
+    (void)rope_dim;
+
+    /* NaN guard macro for debugging */
+#if 1
+    #define _PFX_NAN_CHECK(_buf, _label) \
+        do { if (_SSM_DBG) { \
+            float _chk[4]; picolm_gpu_sync(gpu_dev); \
+            picolm_gpu_memcpy(_chk, _buf + (size_t)(n_ubatch-1) * xb_stride, 16, -1, gpu_dev); \
+            if (_chk[0] != _chk[0]) fprintf(stderr, "[NAN] %s at layer %d\n", _label, l); \
+        } } while(0)
+#else
+    #define _PFX_NAN_CHECK(_buf, _label) ((void)0)
+#endif
+
+    /* Track attention layer ordinal as we iterate */
+    int attn_ord = 0;
+
+    for (int l = 0; l < c->n_layers; l++) {
+        if (interrupt && *interrupt) return -1;
+
+        layer_weights_t *lw = &w->layers[l];
+        gl = &gw->layers[l];
+
+        if (c->has_ssm && !lw->is_attn_layer) {
+            if (ssm_prefill_layer_gpu(m, s, bx, bxb, bq, battn_out, bffn_norm, bgate, bup, lw, l, n_ubatch, start_pos, gpu_dev)) {
+                /* GPU-native SSM succeeded */
+            } else {
+                static int w2 = 0;
+                if (!w2) { fprintf(stderr, "WARN: SSM prefill GPU->hybrid CPU\n"); w2 = 1; }
+                size_t batch_bytes = (size_t)n_ubatch * dim * sizeof(float);
+                picolm_gpu_sync(gpu_dev);
+                for (int _ci = 0; _ci < n_ubatch; _ci++) {
+                    picolm_gpu_memcpy(s->x + (size_t)_ci * dim,
+                        bx + (size_t)_ci * xb_stride, dim * sizeof(float), -1, gpu_dev);
+                }
+                { int xb2s=dim;if(c->ssm_d_inner>dim)xb2s=c->ssm_d_inner;
+                  int fs=n_ffn,md=c->n_heads*2*c->head_dim;if(dim>md)md=dim;
+                  int kd=c->n_kv_heads*c->head_dim,qf=c->n_heads*2*c->head_dim;
+                  size_t sz=(size_t)n_ubatch*(dim+md+xb2s+qf+2*kd+2*fs);
+                  float *buf=(float*)malloc(sz*sizeof(float));
+                  if(!buf)return -1;
+                  float *p2=buf;float *xb=p2;p2+=n_ubatch*dim;float *xbb=p2;p2+=n_ubatch*md;
+                  float *xb2=p2;p2+=n_ubatch*xb2s;float *qb=p2;p2+=n_ubatch*qf;(void)qb;
+                  float *kb=p2;p2+=n_ubatch*kd;(void)kb;float *vb=p2;p2+=n_ubatch*kd;(void)vb;
+                  float *hb=p2;p2+=n_ubatch*fs;float *hb2=p2;p2+=n_ubatch*fs;
+                  memcpy(xb,s->x,batch_bytes);
+                  ssm_prefill_layer(m,s,xb,xbb,xb2,hb,hb2,lw,l,n_ubatch,start_pos,xb2s,(void**)m->gpu.layers);
+                  memcpy(s->x,xb,batch_bytes);
+                  for(int _bi=0;_bi<n_ubatch;_bi++){
+                      picolm_gpu_memcpy(bx+(size_t)_bi*xb_stride,s->x+(size_t)_bi*dim,dim*sizeof(float),1,gpu_dev);}
+                  free(buf);
+                }
+            }
+            if(_SSM_DBG){
+                picolm_gpu_sync(gpu_dev);
+                float lt8[8];picolm_gpu_memcpy(lt8,bx+(size_t)(n_ubatch-1)*xb_stride,32,-1,gpu_dev);
+                fprintf(stderr,"[DBG GPU l=%d] bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n",l,lt8[0],lt8[1],lt8[2],lt8[3]);}
+            continue;
+        }
+
+        int attn_out_stride = n_heads * head_dim;
+        int attn_ffn_stride = n_ffn;
+
+        if (_SSM_DBG) {
+            float _chk[4]; picolm_gpu_sync(gpu_dev);
+            picolm_gpu_memcpy(_chk, bx + (size_t)(n_ubatch-1)*xb_stride, 16, -1, gpu_dev);
+            int _nan=0; for(int _i=0;_i<4;_i++) if(isnanf(_chk[_i])) _nan++;
+            if (_nan > 0) fprintf(stderr, "!!! NaN in bx input to layer %d\n", l);
+        }
+        picolm_gpu_rmsnorm_batched_dev(bxb, bx,
+                                        (float *)gw->attn_norm_dev[l],
+                                        dim, c->rms_norm_eps, n_ubatch, xb_stride, gpu_dev);
+
+        /* NaN guard after RMSNorm -- catches NaNs at the earliest point */
+        _PFX_NAN_CHECK(bxb, "post_rmsnorm");
+
+        /* QKV projections */
+        if (!c->has_ssm) {
+            if (!picolm_gpu_matmul_dev_qkv(
+                    (picolm_gpu_tensor_t *)gl->attn_q,
+                    (picolm_gpu_tensor_t *)gl->attn_k,
+                    (picolm_gpu_tensor_t *)gl->attn_v,
+                    bq, bk, bv,
+                    bxb, n_ubatch, gpu_dev,
+                    q_full_dim, n_kv_heads*head_dim, xb_stride)) {
+                static int qkv_fb=1; if(qkv_fb){qkv_fb=0; fprintf(stderr,"INFO: QKV matmul fallback (S=%d)\n",n_ubatch);}
+                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
+                    bq, bxb, n_ubatch, gpu_dev, q_full_dim, xb_stride);
+                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_k,
+                    bk, bxb, n_ubatch, gpu_dev, n_kv_heads*head_dim, xb_stride);
+                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_v,
+                    bv, bxb, n_ubatch, gpu_dev, n_kv_heads*head_dim, xb_stride);
+            }
+        } else {
+            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
+                bq, bxb, n_ubatch, gpu_dev, q_full_dim, xb_stride);
+            {
+                size_t qg_bytes = (size_t)n_ubatch * n_heads * 2 * head_dim * sizeof(float);
+                picolm_gpu_memcpy_async(battn_out, bq, qg_bytes, 0, gpu_dev);
+                picolm_gpu_qg_deinterleave_batched_dev(battn_out, bq, bgate,
+                    n_heads, head_dim, n_ubatch, gpu_dev);
+            }
+            if (!picolm_gpu_matmul_dev_gu(
+                    (picolm_gpu_tensor_t *)gl->attn_k,
+                    (picolm_gpu_tensor_t *)gl->attn_v,
+                    bk, bv,
+                    bxb, n_ubatch, gpu_dev,
+                    n_kv_heads*head_dim, xb_stride)) {
+                static int kv_fb=1; if(kv_fb){kv_fb=0; fprintf(stderr,"INFO: KV matmul fallback (S=%d)\n",n_ubatch);}
+                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_k,
+                    bk, bxb, n_ubatch, gpu_dev, n_kv_heads*head_dim, xb_stride);
+                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_v,
+                    bv, bxb, n_ubatch, gpu_dev, n_kv_heads*head_dim, xb_stride);
+            }
+        }
+
+        /* QK-norm */
+        if (gw->attn_qk_norm_q_dev[l]) {
+            int q_stride = q_dim;
+            int kv_stride = kv_dim;
+            for (int h = 0; h < n_heads; h++) {
+                float *bq_h = bq + h * head_dim;
+                picolm_gpu_rmsnorm_batched(bq_h, bq_h,
+                                           (float *)gw->attn_qk_norm_q_dev[l],
+                                           head_dim, c->rms_norm_eps, n_ubatch, q_stride, gpu_dev);
+            }
+            for (int h = 0; h < n_kv_heads; h++) {
+                float *bk_h = bk + h * head_dim;
+                picolm_gpu_rmsnorm_batched(bk_h, bk_h,
+                                           (float *)gw->attn_qk_norm_k_dev[l],
+                                           head_dim, c->rms_norm_eps, n_ubatch, kv_stride, gpu_dev);
+            }
+        }
+
+        /* RoPE */
+        {
+            picolm_gpu_rope_apply_batched(bq, n_heads, head_dim,
+                (float *)gw->rope_cos_dev, (float *)gw->rope_sin_dev,
+                rope_half, start_pos, n_ubatch, c->rope_type, gpu_dev);
+            picolm_gpu_rope_apply_batched(bk, n_kv_heads, head_dim,
+                (float *)gw->rope_cos_dev, (float *)gw->rope_sin_dev,
+                rope_half, start_pos, n_ubatch, c->rope_type, gpu_dev);
+        }
+
+        /* KV cache store */
+        /* attn_ord already tracks the ordinal from the loop counter above */
+
+        picolm_gpu_kv_store_dev_batched(1, attn_ord, start_pos, n_ubatch,
+                                         bk, n_kv_heads, head_dim, seq_len, gpu_dev);
+        picolm_gpu_kv_store_dev_batched(0, attn_ord, start_pos, n_ubatch,
+                                         bv, n_kv_heads, head_dim, seq_len, gpu_dev);
+
+        /* Attention */
+        picolm_gpu_attention_prefill_dev(battn_out, bq,
+                                          attn_ord, start_pos, n_ubatch,
+                                          n_heads, n_kv_heads, head_dim,
+                                          seq_len, gpu_dev);
+
+        /* SSM gate sigmoid */
+        if (c->has_ssm) {
+            int q_dim_l = n_heads * head_dim;
+            picolm_gpu_sigmoid_mul_batched_dev(battn_out, bgate,
+                                                q_dim_l, n_ubatch, gpu_dev);
+        }
+
+        /* Output projection */
+        picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_output,
+                               bxb, battn_out, n_ubatch, gpu_dev, xb_stride, attn_out_stride);
+
+        /* Residual add */
+        picolm_gpu_residual_add(bx, bx, bxb, n_ubatch, dim, xb_stride, gpu_dev);
+
+        /* FFN RMSNorm */
+        picolm_gpu_rmsnorm_batched_dev(bffn_norm, bx,
+                                        (float *)gw->post_attn_norm_dev[l],
+                                        dim, c->rms_norm_eps, n_ubatch, xb_stride, gpu_dev);
+
+        /* FFN gate+up */
+        if (!picolm_gpu_matmul_dev_gu(
+                (picolm_gpu_tensor_t *)gl->ffn_gate,
+                (picolm_gpu_tensor_t *)gl->ffn_up,
+                bgate, bup,
+                bffn_norm, n_ubatch, gpu_dev,
+                attn_ffn_stride, xb_stride)) {
+            static int gu_fb=1; if(gu_fb){gu_fb=0; fprintf(stderr,"INFO: FFN GU matmul fallback (S=%d)\n",n_ubatch);}
+            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_gate,
+                bgate, bffn_norm, n_ubatch, gpu_dev, attn_ffn_stride, xb_stride);
+            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_up,
+                bup, bffn_norm, n_ubatch, gpu_dev, attn_ffn_stride, xb_stride);
+        }
+
+        /* FFN silu_mul */
+        picolm_gpu_silu_mul_dev(bgate, bup, n_ubatch * n_ffn, gpu_dev);
+
+        /* FFN down */
+        picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_down,
+                               bxb, bgate, n_ubatch, gpu_dev, xb_stride, attn_ffn_stride);
+
+        /* FFN residual */
+        picolm_gpu_residual_add(bx, bx, bxb, n_ubatch, dim, xb_stride, gpu_dev);
+
+        /* Increment attention ordinal for next layer */
+        attn_ord++;
+
+        if(_SSM_DBG && (l==3||l==48)){
+            float tmp[4]; picolm_gpu_sync(gpu_dev);
+            picolm_gpu_memcpy(tmp,bx+(size_t)(n_ubatch-1)*xb_stride,16,0,gpu_dev);
+            fprintf(stderr,"[DBG] attn_post l=%d bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n",l,tmp[0],tmp[1],tmp[2],tmp[3]);
+        }
+    }
+    return 0;
+}
+
+/* Phase 2+ubatch: GPU-pipelined prefill forward pass with two-tier batching.
+ * Large prompts are split into ubatches of ~PICOLM_UBATCH tokens (default 1024).
+ * Each ubatch goes through all layers; KV cache is incrementally built.
  * Falls back to model_forward_prefill() if pipeline not ready. */
 float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt) {
 #ifdef PICOLM_GPU
@@ -4335,11 +4549,6 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
 #ifdef PICOLM_CUDA
     cudaProfilerStart();
 #endif
-    /* Diagnostic: print GPU memory state at prefill entry (commented out to reduce benchmark noise)
-    { size_t fb=0,tb=0;
-      if(picolm_gpu_mem_info(m->gpu.device, &fb, &tb))
-        fprintf(stderr,"[GPU] prefill entry: n_tokens=%d, gpu_free=%.1f MB, gpu_total=%.1f MB\n",
-            n_tokens, fb/(1024.0*1024), tb/(1024.0*1024)); } */
 #endif
     model_config_t *c = &m->config;
     model_weights_t *w = &m->weights;
@@ -4380,9 +4589,8 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
     float *bgate = picolm_gpu_pipe_gate_b(gpu_dev);
     float *bup = picolm_gpu_pipe_up_b(gpu_dev);
 
-    gpu_layer_weights_t *gl;
-
-    /* 1. Embedding lookup (CPU) into host buffer, then single H2D */
+    /* 1. Embedding lookup + two-tier batching */
+    int last_ubatch_size = n_tokens;
     {
         size_t row_bytes = gguf_type_row_size(w->type_token_embd, dim);
         if (w->type_token_embd == GGUF_TYPE_Q4_0_8_8 ||
@@ -4390,394 +4598,82 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
             w->type_token_embd == GGUF_TYPE_Q4_0_4_8) {
             return model_forward_prefill(m, tokens, n_tokens, start_pos, interrupt);
         }
-        size_t embd_bytes = (size_t)n_tokens * dim * sizeof(float);
-        float *host_embd = (float *)malloc(embd_bytes);
+
+        /* Two-tier batching: determine ubatch size.
+         * llama.cpp defaults: n_batch=2048 (caller limit), n_ubatch=512 (compute chunk).
+         * Our PICOLM_UBATCH maps to n_ubatch: the physical chunk size for IMMA kernels.
+         * 512 is the sweet spot: good IMMA occupancy, manageable L2 cache footprint,
+         * and the Q8_0 quantized activation (512*4096 = 2MB) fits well in L2.
+         * Smaller prompts fit in one ubatch with zero overhead. */
+        int ubatch_size = 0;
+        {
+            const char *ev = getenv("PICOLM_UBATCH");
+            if (ev) ubatch_size = atoi(ev);
+            if (ubatch_size <= 0) ubatch_size = 512;
+        }
+
+        /* Dequantize embeddings per-ubatch to avoid huge host allocations
+         * for very long prompts. Each ubatch's embeddings fit in a small
+         * host buffer that gets freed/recycled each iteration. */
+        size_t ubatch_embd_bytes = (size_t)ubatch_size * dim * sizeof(float);
+        float *host_embd = (float *)malloc(ubatch_embd_bytes);
         if (!host_embd) {
             return model_forward_prefill(m, tokens, n_tokens, start_pos, interrupt);
         }
-        for (int bi = 0; bi < n_tokens; bi++) {
-            const void *embd_row = (const uint8_t *)w->token_embd + (size_t)tokens[bi] * row_bytes;
-            float *dst = host_embd + (size_t)bi * dim;
-            dequantize_row(embd_row, dst, dim, w->type_token_embd);
+
+        int offset = 0;
+        while (offset < n_tokens) {
+            int this_ubatch = n_tokens - offset;
+            if (ubatch_size > 0 && this_ubatch > ubatch_size)
+                this_ubatch = ubatch_size;
+
+            int ubatch_start_pos = start_pos + offset;
+
+            /* Dequantize this ubatch's embeddings on CPU */
+            for (int bi = 0; bi < this_ubatch; bi++) {
+                const void *embd_row = (const uint8_t *)w->token_embd + (size_t)tokens[offset + bi] * row_bytes;
+                float *dst = host_embd + (size_t)bi * dim;
+                dequantize_row(embd_row, dst, dim, w->type_token_embd);
+            }
+
+            /* H2D this ubatch's embeddings to bx (strided).
+             * No explicit sync needed -- the subsequent kernels on
+             * the same stream will wait for the transfer to complete. */
+            for (int bi = 0; bi < this_ubatch; bi++) {
+                picolm_gpu_memcpy_async(bx + (size_t)bi * xb_stride,
+                    host_embd + (size_t)bi * dim,
+                    dim * sizeof(float), 1, gpu_dev);
+            }
+
+            /* Process this ubatch through all layers */
+            if (_prefill_gpu_ubatch(m, s, gw, gpu_dev,
+                dim, n_ffn, n_heads, n_kv_heads, head_dim,
+                seq_len, rope_dim, rope_half,
+                q_dim, kv_dim, q_full_dim, xb_stride,
+                bx, bxb, bq, bk, bv,
+                battn_out, bffn_norm, bgate, bup,
+                this_ubatch, ubatch_start_pos, interrupt)) {
+                free(host_embd);
+                return NULL;
+            }
+
+            last_ubatch_size = this_ubatch;
+            offset += this_ubatch;
         }
-        /* Strided H2D for entire batch (pipe_x_b has xb_stride, not dim)
-         * Use async copies on ctx->stream to avoid per-token device syncs. */
-        for (int bi = 0; bi < n_tokens; bi++) {
-            picolm_gpu_memcpy_async(bx + (size_t)bi * xb_stride, host_embd + (size_t)bi * dim, dim * sizeof(float), 1, gpu_dev);
-        }
-        /* Ensure all H2D copies complete before any kernel reads the data.
-         * Single sync at the end instead of n_tokens syncs. */
-        picolm_gpu_sync(gpu_dev);
         free(host_embd);
     }
 
-    int this_attn_ordinal = 0;
-
-    /* 2. Per-layer pipeline (S=n_tokens batched) */
-    for (int l = 0; l < c->n_layers; l++) {
-        layer_weights_t *lw = &w->layers[l];
-        gl = &gw->layers[l];
-
-        if (c->has_ssm && !lw->is_attn_layer) {
-            /* SSM/hybrid layer: try GPU-native path first, fallback to CPU hybrid */
-            if (ssm_prefill_layer_gpu(m, s, bx, bxb, bq, battn_out, bffn_norm, bgate, bup, lw, l, n_tokens, start_pos, gpu_dev)) {
-                static int w1 = 0;
-                if (!w1) { fprintf(stderr, "INFO: SSM prefill device-native GPU active\n"); w1 = 1; }
-            } else {
-                static int w2 = 0;
-                if (!w2) { fprintf(stderr, "WARN: SSM prefill GPU->hybrid CPU\n"); w2 = 1; }
-                size_t batch_bytes = (size_t)n_tokens * dim * sizeof(float);
-                picolm_gpu_sync(gpu_dev);
-                /* D2H with correct stride: bx has stride xb_stride, s->x is contiguous */
-                for (int _ci = 0; _ci < n_tokens; _ci++) {
-                    picolm_gpu_memcpy(s->x + (size_t)_ci * dim,
-                        bx + (size_t)_ci * xb_stride, dim * sizeof(float), -1, gpu_dev);
-                }
-                { int xb2s=dim;if(c->ssm_d_inner>dim)xb2s=c->ssm_d_inner;
-                  int fs=n_ffn,md=c->n_heads*2*c->head_dim;if(dim>md)md=dim;
-                  int kd=c->n_kv_heads*c->head_dim,qf=c->n_heads*2*c->head_dim;
-                  size_t sz=(size_t)n_tokens*(dim+md+xb2s+qf+2*kd+2*fs);
-                  float *buf=(float*)malloc(sz*sizeof(float));
-                  if(!buf)return model_forward_prefill(m,tokens,n_tokens,start_pos,interrupt);
-                  float *p2=buf;float *xb=p2;p2+=n_tokens*dim;float *xbb=p2;p2+=n_tokens*md;
-                  float *xb2=p2;p2+=n_tokens*xb2s;float *qb=p2;p2+=n_tokens*qf;(void)qb;
-                  float *kb=p2;p2+=n_tokens*kd;(void)kb;float *vb=p2;p2+=n_tokens*kd;(void)vb;
-                  float *hb=p2;p2+=n_tokens*fs;float *hb2=p2;p2+=n_tokens*fs;
-                  memcpy(xb,s->x,batch_bytes);
-                  ssm_prefill_layer(m,s,xb,xbb,xb2,hb,hb2,lw,l,n_tokens,start_pos,xb2s,(void**)m->gpu.layers);
-                  memcpy(s->x,xb,batch_bytes);
-                  /* Dump bx_last for bit-exact GPU vs CPU comparison */
-                  if (l == 0 && _SSM_DBG) {
-                      float bx_rms=0;
-                      for (int i=0;i<100;i++) bx_rms += xb[(n_tokens-1)*dim+i]*xb[(n_tokens-1)*dim+i];
-                      bx_rms = sqrtf(bx_rms/100);
-                      fprintf(stderr, "[CPU l0] bx_last[:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f} rms100=%.6f\n",
-                          xb[(n_tokens-1)*dim],xb[(n_tokens-1)*dim+1],xb[(n_tokens-1)*dim+2],xb[(n_tokens-1)*dim+3],
-                          xb[(n_tokens-1)*dim+4],xb[(n_tokens-1)*dim+5],xb[(n_tokens-1)*dim+6],xb[(n_tokens-1)*dim+7], bx_rms);
-                  }
-                  for(int _bi=0;_bi<n_tokens;_bi++){
-                      picolm_gpu_memcpy(bx+(size_t)_bi*xb_stride,s->x+(size_t)_bi*dim,dim*sizeof(float),1,gpu_dev);}
-                  free(buf);}
-            }
-            if(_SSM_DBG){
-                picolm_gpu_sync(gpu_dev);
-                float lt8[8];picolm_gpu_memcpy(lt8,bx+(size_t)(n_tokens-1)*xb_stride,32,-1,gpu_dev);
-                fprintf(stderr,"[DBG GPU l=%d] bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n",l,lt8[0],lt8[1],lt8[2],lt8[3]);}
-            continue;
-        }
-
-        /* Strides for this layer's attention path */
-        int attn_out_stride = n_heads * head_dim;  /* attention kernel writes battn_out at n_heads*head_dim per token */
-        int attn_ffn_stride = n_ffn;  /* FFN gate/up write bgate/bup at n_ffn per token */
-
-        /* A. RMSNorm batched: one launch for all n_tokens */
-#ifdef PICOLM_SSM_VERIFY
-        if (l == 0 || l == 47 || l == 59 || l == 64 || l == 7 || l == 8) {
-            float tmp8[8];
-            picolm_gpu_sync(gpu_dev);
-            picolm_gpu_memcpy(tmp8, bx, sizeof(tmp8), -1, gpu_dev);
-            int bn=0; for(int i=0;i<8;i++) if(isnanf(tmp8[i])) bn++;
-            fprintf(stderr, "SSM_VERIFY attn_pre l=%d bx_first[:4]={%.4f,%.4f,%.4f,%.4f} nan=%d\n",
-                l, tmp8[0],tmp8[1],tmp8[2],tmp8[3],bn);
-            float tmpl[8];
-            picolm_gpu_memcpy(tmpl, bx + (size_t)(n_tokens-1)*dim, sizeof(tmpl), -1, gpu_dev);
-            fprintf(stderr, "SSM_VERIFY attn_pre l=%d bx_last[:4]={%.4f,%.4f,%.4f,%.4f}\n",
-                l, tmpl[0],tmpl[1],tmpl[2],tmpl[3]);
-        }
-#endif
-        /* NaN guard: detect where NaN first appears in the pipeline */
-        if (_SSM_DBG) {
-            float _chk[4]; picolm_gpu_sync(gpu_dev);
-            picolm_gpu_memcpy(_chk, bx + (size_t)(n_tokens-1)*xb_stride, 16, -1, gpu_dev);
-            int _nan=0; for(int _i=0;_i<4;_i++) if(isnanf(_chk[_i])) _nan++;
-            if (_nan > 0) fprintf(stderr, "!!! NaN in bx input to layer %d\n", l);
-        }
-        picolm_gpu_rmsnorm_batched_dev(bxb, bx,
-                                        (float *)gw->attn_norm_dev[l],
-                                        dim, c->rms_norm_eps, n_tokens, xb_stride, gpu_dev);
-#ifdef PICOLM_SSM_VERIFY
-        if (l == 48 || l == 64) {
-            float tmp8[8];
-            picolm_gpu_sync(gpu_dev);
-            picolm_gpu_memcpy(tmp8, bxb, sizeof(tmp8), -1, gpu_dev);
-            int bn=0; for(int i=0;i<8;i++) if(isnanf(tmp8[i])) bn++;
-            fprintf(stderr, "SSM_VERIFY attn_rms l=%d bxb[:4]={%.4f,%.4f,%.4f,%.4f} nan=%d\n",
-                l, tmp8[0],tmp8[1],tmp8[2],tmp8[3],bn);
-        }
-#endif
-
-        /* B/D. Q+K+V projections: quantize bxb once, run 3x IMMA matmuls.
-         * For SSM models: Q produces interleaved Q+gate (q_full_dim=2*q_dim)
-         * which must be de-interleaved before K+V, so we keep Q separate and
-         * fuse only K+V. For non-SSM models: fuse all three Q+K+V. */
-        if (!c->has_ssm) {
-            /* Non-SSM: fused Q+K+V (Phase 1) */
-            if (!picolm_gpu_matmul_dev_qkv(
-                    (picolm_gpu_tensor_t *)gl->attn_q,
-                    (picolm_gpu_tensor_t *)gl->attn_k,
-                    (picolm_gpu_tensor_t *)gl->attn_v,
-                    bq, bk, bv,
-                    bxb, n_tokens, gpu_dev,
-                    q_full_dim, n_kv_heads*head_dim, xb_stride)) {
-                static int qkv_fb=1; if(qkv_fb){qkv_fb=0; fprintf(stderr,"INFO: QKV matmul fallback (3x separate quantize+IMMA, S=%d)\n",n_tokens);}
-                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
-                    bq, bxb, n_tokens, gpu_dev, q_full_dim, xb_stride);
-                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_k,
-                    bk, bxb, n_tokens, gpu_dev, n_kv_heads*head_dim, xb_stride);
-                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_v,
-                    bv, bxb, n_tokens, gpu_dev, n_kv_heads*head_dim, xb_stride);
-            }
-        } else {
-            /* SSM: Q is separate (interleaved Q+gate output), fuse K+V */
-            /* B. Q projection */
-            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
-                bq, bxb, n_tokens, gpu_dev, q_full_dim, xb_stride);
-
-            /* B1. De-interleave Q+gate from bq */
-            {
-                int q_dim = n_heads * head_dim;
-                size_t qg_bytes = (size_t)n_tokens * n_heads * 2 * head_dim * sizeof(float);
-                picolm_gpu_memcpy_async(battn_out, bq, qg_bytes, 0, gpu_dev);
-                picolm_gpu_qg_deinterleave_batched_dev(battn_out, bq, bgate,
-                    n_heads, head_dim, n_tokens, gpu_dev);
-            }
-
-            /* C+D. Fused K+V (Phase 1, reusing gu pattern) */
-            if (!picolm_gpu_matmul_dev_gu(
-                    (picolm_gpu_tensor_t *)gl->attn_k,
-                    (picolm_gpu_tensor_t *)gl->attn_v,
-                    bk, bv,
-                    bxb, n_tokens, gpu_dev,
-                    n_kv_heads*head_dim, xb_stride)) {
-                static int kv_fb=1; if(kv_fb){kv_fb=0; fprintf(stderr,"INFO: K+V matmul fallback (2x separate quantize+IMMA, S=%d)\n",n_tokens);}
-                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_k,
-                    bk, bxb, n_tokens, gpu_dev, n_kv_heads*head_dim, xb_stride);
-                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_v,
-                    bv, bxb, n_tokens, gpu_dev, n_kv_heads*head_dim, xb_stride);
-            }
-        }
-        if (_SSM_DBG) {
-            float _chk[4]; picolm_gpu_sync(gpu_dev);
-            picolm_gpu_memcpy(_chk, bk + (size_t)(n_tokens-1)*n_kv_heads*head_dim, 16, -1, gpu_dev);
-            int _nan=0; for(int _i=0;_i<4;_i++) if(isnanf(_chk[_i])) _nan++;
-            if(_nan>0) fprintf(stderr,"!!! NaN in bk (K proj) layer %d\n",l);
-            picolm_gpu_memcpy(_chk, bq + (size_t)(n_tokens-1)*q_full_dim, 16, -1, gpu_dev);
-            _nan=0; for(int _i=0;_i<4;_i++) if(isnanf(_chk[_i])) _nan++;
-            if(_nan>0) fprintf(stderr,"!!! NaN in bq (Q proj) layer %d\n",l);
-        }
-
-
-        /* D1. QK-norm (Qwen3): per-head RMSNorm on Q and K.
-         * After deinterleave: bq has compacted Q at stride q_dim (n_heads*head_dim).
-         * K was written by matmul at stride kv_dim (n_kv_heads*head_dim). */
-        if (gw->attn_qk_norm_q_dev[l]) {
-            int q_stride = q_dim; /* deinterleave output stride: n_heads*head_dim */
-            int kv_stride = kv_dim;
-            if(_SSM_DBG && l==3){
-                float bq_pre[4]; picolm_gpu_sync(gpu_dev);
-                picolm_gpu_memcpy(bq_pre, bq, 16, -1, gpu_dev);
-                fprintf(stderr,"ATNDBG: GPU Q_pre norm l=3 h0[:4]={%.6f,%.6f,%.6f,%.6f}\n",bq_pre[0],bq_pre[1],bq_pre[2],bq_pre[3]);
-            }
-            for (int h = 0; h < n_heads; h++) {
-                float *bq_h = bq + h * head_dim;
-                picolm_gpu_rmsnorm_batched(bq_h, bq_h,
-                                           (float *)gw->attn_qk_norm_q_dev[l],
-                                           head_dim, c->rms_norm_eps, n_tokens, q_stride, gpu_dev);
-            }
-            if(_SSM_DBG && l==3){
-                float bq_post[4]; picolm_gpu_sync(gpu_dev);
-                picolm_gpu_memcpy(bq_post, bq, 16, -1, gpu_dev);
-                fprintf(stderr,"ATNDBG: GPU Q_post norm l=3 h0[:4]={%.6f,%.6f,%.6f,%.6f}\n",bq_post[0],bq_post[1],bq_post[2],bq_post[3]);
-            }
-            for (int h = 0; h < n_kv_heads; h++) {
-                float *bk_h = bk + h * head_dim;
-                picolm_gpu_rmsnorm_batched(bk_h, bk_h,
-                                           (float *)gw->attn_qk_norm_k_dev[l],
-                                           head_dim, c->rms_norm_eps, n_tokens, kv_stride, gpu_dev);
-            }
-        }
-
-        /* E. RoPE on Q (batched, one launch for whole chunk) */
-        picolm_gpu_rope_apply_batched(bq, n_heads, head_dim,
-                                       (float *)gw->rope_cos_dev,
-                                       (float *)gw->rope_sin_dev,
-                                       rope_half, start_pos, n_tokens, c->rope_type, gpu_dev);
-
-        /* F. RoPE on K (batched) */
-        picolm_gpu_rope_apply_batched(bk, n_kv_heads, head_dim,
-                                       (float *)gw->rope_cos_dev,
-                                       (float *)gw->rope_sin_dev,
-                                       rope_half, start_pos, n_tokens, c->rope_type, gpu_dev);
-
-        if(_SSM_DBG && l==3){
-            float bq_rope[4]; picolm_gpu_sync(gpu_dev);
-            picolm_gpu_memcpy(bq_rope, bq, 16, -1, gpu_dev);
-            fprintf(stderr,"ATNDBG: GPU Q_post_rope l=3 h0[:4]={%.6f,%.6f,%.6f,%.6f}\n",bq_rope[0],bq_rope[1],bq_rope[2],bq_rope[3]);
-        }
-        /* G. KV cache store: batched F32->F16 pack+store, 2 launches per layer
-         * Store BEFORE attention so the decode phase has the KV cache ready. */
-        if(_SSM_DBG && l==3 && c->has_ssm){
-            float bv0[4]; picolm_gpu_sync(gpu_dev);
-            picolm_gpu_memcpy(bv0, bv, 16, -1, gpu_dev);
-            fprintf(stderr,"[DBG] bv_fp32 l=3 h0[:4]={%.6f,%.6f,%.6f,%.6f}\n",bv0[0],bv0[1],bv0[2],bv0[3]);}
-        picolm_gpu_kv_store_dev_batched(1, this_attn_ordinal, start_pos, n_tokens,
-                                         bk, n_kv_heads, head_dim, seq_len, gpu_dev);
-        picolm_gpu_kv_store_dev_batched(0, this_attn_ordinal, start_pos, n_tokens,
-                                         bv, n_kv_heads, head_dim, seq_len, gpu_dev);
-        if(_SSM_DBG && l == 64){
-            float bk_sample[4];
-            picolm_gpu_sync(gpu_dev);
-            picolm_gpu_memcpy(bk_sample, bk, 16, -1, gpu_dev);
-            fprintf(stderr,"[DBG] K_f32 l=64 token0[:4]={%.6f,%.6f,%.6f,%.6f}\n",
-                bk_sample[0],bk_sample[1],bk_sample[2],bk_sample[3]);
-        }
-        this_attn_ordinal++;
-
-        /* H. Attention prefill: battn_out = attn_prefill(bq) */
-        if(_SSM_DBG && l==3){
-            float bq_pre_attn[4]; picolm_gpu_sync(gpu_dev);
-            picolm_gpu_memcpy(bq_pre_attn, bq, 16, -1, gpu_dev);
-            fprintf(stderr,"ATNDBG: GPU Q_pre_attn l=3 h0[:4]={%.6f,%.6f,%.6f,%.6f} bq=%p\n",
-                bq_pre_attn[0],bq_pre_attn[1],bq_pre_attn[2],bq_pre_attn[3],(void*)bq);
-            { float *qtok0 = (float*)malloc(n_heads*head_dim*sizeof(float));
-              picolm_gpu_memcpy(qtok0, bq, n_heads*head_dim*sizeof(float), -1, gpu_dev);
-              fprintf(stderr,"ATNDBG: GPU Q_tok0 h0-3[:4]={%.6f,%.6f,%.6f,%.6f} h1[:4]={%.6f,%.6f,%.6f,%.6f} h22[:4]={%.6f,%.6f,%.6f,%.6f} h23[:4]={%.6f,%.6f,%.6f,%.6f}\n",
-                  qtok0[0],qtok0[1],qtok0[2],qtok0[3],
-                  qtok0[128],qtok0[129],qtok0[130],qtok0[131],
-                  qtok0[22*128],qtok0[22*128+1],qtok0[22*128+2],qtok0[22*128+3],
-                  qtok0[23*128],qtok0[23*128+1],qtok0[23*128+2],qtok0[23*128+3]);
-              free(qtok0); }
-        }
-        picolm_gpu_attention_prefill_dev(battn_out, bq,
-                                          this_attn_ordinal - 1, start_pos, n_tokens,
-                                          n_heads, n_kv_heads, head_dim,
-                                          seq_len, gpu_dev);
-        if (_SSM_DBG) {
-            float _chk[4]; picolm_gpu_sync(gpu_dev);
-            picolm_gpu_memcpy(_chk, battn_out + (size_t)(n_tokens-1)*n_heads*head_dim, 16, -1, gpu_dev);
-            int _nan=0; for(int _i=0;_i<4;_i++) if(isnanf(_chk[_i])) _nan++;
-            if(_nan>0) fprintf(stderr,"!!! NaN in attn_out layer %d\n",l);
-        }
-        if(_SSM_DBG && l==3){
-            float vb_verify[4];
-            { int vb_off = (size_t)(n_tokens * n_heads) * head_dim - 64;
-              picolm_gpu_sync(gpu_dev);
-              picolm_gpu_memcpy(vb_verify, battn_out + vb_off, 16, -1, gpu_dev);
-              fprintf(stderr,"ATNDBG: GPU Q_kernwritten l=3={%.6f,%.6f,%.6f,%.6f}\n",
-                  vb_verify[0],vb_verify[1],vb_verify[2],vb_verify[3]);
-            }
-            /* After kernel: D2H bq to verify data survived */
-            { float bq_post[4];
-              picolm_gpu_memcpy(bq_post, bq, 16, -1, gpu_dev);
-              fprintf(stderr,"ATNDBG: GPU Q_post_kernel l=3 h0[:4]={%.6f,%.6f,%.6f,%.6f}\n",
-                  bq_post[0],bq_post[1],bq_post[2],bq_post[3]);
-            }
-        }
-        if(_SSM_DBG && (l==64||l==3)){
-            float aol[4]; picolm_gpu_sync(gpu_dev); picolm_gpu_memcpy(aol, battn_out+(size_t)(n_tokens-1)*n_heads*head_dim, 16, -1, gpu_dev);
-            fprintf(stderr,"[DBG] attn_raw l=%d last[:4]={%.6f,%.6f,%.6f,%.6f}\n",l,aol[0],aol[1],aol[2],aol[3]);}
-        /* GPU per-KV-head RMS for layer 3 */
-        if(_SSM_DBG && l==3){
-            float *attn_dmp = (float*)malloc(n_heads*head_dim*sizeof(float));
-            picolm_gpu_sync(gpu_dev);
-            picolm_gpu_memcpy(attn_dmp, battn_out+(size_t)(n_tokens-1)*n_heads*head_dim, n_heads*head_dim*sizeof(float), -1, gpu_dev);
-            fprintf(stderr,"[DBG GPU attn_raw l=3] per-kv-head RMS:");
-            for(int kh=0;kh<c->n_kv_heads;kh++){
-                double r=0;
-                for(int qh=kh*(n_heads/c->n_kv_heads);qh<(kh+1)*(n_heads/c->n_kv_heads);qh++)
-                    for(int d=0;d<head_dim;d++) r+=attn_dmp[qh*head_dim+d]*attn_dmp[qh*head_dim+d];
-                r=sqrt(r/(head_dim*(n_heads/c->n_kv_heads)));
-                fprintf(stderr," h%d=%.4f",kh,(float)r);
-            }
-            fprintf(stderr,"\n");
-            free(attn_dmp);}
-
-        /* H1. For SSM models: apply gate sigmoid to attention output. */
-        if (c->has_ssm) {
-            int q_dim = n_heads * head_dim;
-            picolm_gpu_sigmoid_mul_batched_dev(battn_out, bgate,
-                                                q_dim, n_tokens, gpu_dev);
-        if(_SSM_DBG && l==3){
-            float *gdmp = (float*)malloc(q_dim*sizeof(float));
-            picolm_gpu_sync(gpu_dev);
-            picolm_gpu_memcpy(gdmp, battn_out+(size_t)(n_tokens-1)*q_dim, q_dim*sizeof(float), -1, gpu_dev);
-            double gr=0;for(int _i=0;_i<q_dim;_i++)gr+=gdmp[_i]*gdmp[_i];
-            fprintf(stderr,"[DBG] attn_gated l=3 token_rms=%.6f first4={%.6f,%.6f,%.6f,%.6f}\n",sqrt(gr/q_dim),gdmp[0],gdmp[1],gdmp[2],gdmp[3]);
-            free(gdmp);}
-        }
-        if(_SSM_DBG && l==64){
-            float ao[4], aol[4]; picolm_gpu_sync(gpu_dev); picolm_gpu_memcpy(ao, battn_out, 16, -1, gpu_dev);
-            picolm_gpu_memcpy(aol, battn_out+(size_t)(n_tokens-1)*n_heads*head_dim, 16, -1, gpu_dev);
-            fprintf(stderr,"[DBG] attn_gate l=64 first[:4]={%.6f,%.6f,%.6f,%.6f} last[:4]={%.6f,%.6f,%.6f,%.6f}\n",
-                ao[0],ao[1],ao[2],ao[3], aol[0],aol[1],aol[2],aol[3]);}
-
-        /* I. Output projection: bxb = attn_output @ battn_out */
-        picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_output,
-                               bxb, battn_out, n_tokens, gpu_dev, xb_stride, attn_out_stride);
-        if (_SSM_DBG) {
-            float _chk[4]; picolm_gpu_sync(gpu_dev);
-            picolm_gpu_memcpy(_chk, bxb + (size_t)(n_tokens-1)*xb_stride, 16, -1, gpu_dev);
-            int _nan=0; for(int _i=0;_i<4;_i++) if(isnanf(_chk[_i])) _nan++;
-            if(_nan>0) fprintf(stderr,"!!! NaN in attn_output proj bxb layer %d\n",l);
-        }
-        if(_SSM_DBG && (l==64||l==3)){
-            float oo[4]; picolm_gpu_sync(gpu_dev); picolm_gpu_memcpy(oo, bxb+(size_t)(n_tokens-1)*xb_stride, 16, -1, gpu_dev);
-            fprintf(stderr,"[DBG] outproj l=%d last[:4]={%.6f,%.6f,%.6f,%.6f}\n",l,oo[0],oo[1],oo[2],oo[3]);}
-
-        /* J. Residual add: bx += bxb (batched, single launch) */
-        picolm_gpu_residual_add(bx, bx, bxb, n_tokens, dim, xb_stride, gpu_dev);
-        if(_SSM_DBG && l==64){
-            float rx[4]; picolm_gpu_sync(gpu_dev); picolm_gpu_memcpy(rx, bx+(size_t)(n_tokens-1)*xb_stride, 16, -1, gpu_dev);
-            fprintf(stderr,"[DBG] resid l=64 bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n",rx[0],rx[1],rx[2],rx[3]);}
-
-        /* K. FFN: rmsnorm (batched) */
-        picolm_gpu_rmsnorm_batched_dev(bffn_norm, bx,
-                                        (float *)gw->post_attn_norm_dev[l],
-                                        dim, c->rms_norm_eps, n_tokens, xb_stride, gpu_dev);
-
-        /* FFN gate+up: fused activation quantization (Phase 2)
-         * bgate = ffn_gate @ bffn_norm, bup = ffn_up @ bffn_norm
-         * Quantize bffn_norm once, run gate+up IMMA with same q8 data. */
-        if (!picolm_gpu_matmul_dev_gu(
-                (picolm_gpu_tensor_t *)gl->ffn_gate,
-                (picolm_gpu_tensor_t *)gl->ffn_up,
-                bgate, bup,
-                bffn_norm, n_tokens, gpu_dev,
-                attn_ffn_stride, xb_stride)) {
-            /* Fallback: 2 separate matmul_dev calls */
-            static int gu_fb=1; if(gu_fb){gu_fb=0; fprintf(stderr,"INFO: prefill gate+up matmul fallback (2x separate quantize+IMMA, S=%d)\n",n_tokens);}
-            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_gate,
-                bgate, bffn_norm, n_tokens, gpu_dev, attn_ffn_stride, xb_stride);
-            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_up,
-                bup, bffn_norm, n_tokens, gpu_dev, attn_ffn_stride, xb_stride);
-        }
-
-        /* FFN silu_mul: bgate = silu(bgate) * bup (batched, single launch) */
-        picolm_gpu_silu_mul_dev(bgate, bup, n_tokens * n_ffn, gpu_dev);
-
-        /* FFN down: bxb = ffn_down @ bgate, read bgate at n_ffn stride, write bxb at xb_stride */
-        picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_down,
-                               bxb, bgate, n_tokens, gpu_dev, xb_stride, attn_ffn_stride);
-
-        /* FFN residual: bx += bxb (batched, single launch) */
-        picolm_gpu_residual_add(bx, bx, bxb, n_tokens, dim, xb_stride, gpu_dev);
-        if(_SSM_DBG && (l==3||l==48||l==56||l==64)){
-            float tmp[4]; picolm_gpu_sync(gpu_dev);
-            picolm_gpu_memcpy(tmp,bx+(size_t)(n_tokens-1)*xb_stride,16,0,gpu_dev);
-            fprintf(stderr,"[DBG] attn_post l=%d bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n",l,tmp[0],tmp[1],tmp[2],tmp[3]);
-        }
-    }
-
-    /* 3. Final rmsnorm + sync + D2H + host lm_head matmul */
+    /* 3. Final rmsnorm + sync + D2H + host lm_head matmul
+     * After the last ubatch, bx[0..last_ubatch_size-1] holds the hidden
+     * states for the last ubatch's tokens. The very last token is at
+     * bx[last_ubatch_size - 1] (0-indexed within the ubatch). */
     {
-        float *last_x = bx + (size_t)(n_tokens - 1) * xb_stride;
+        float *last_x = bx + (size_t)(last_ubatch_size - 1) * xb_stride;
         picolm_gpu_sync(gpu_dev);
         picolm_gpu_memcpy(s->x, last_x, dim * sizeof(float), -1, gpu_dev);
         if(_SSM_DBG){
             fprintf(stderr,"[DBG] prefill_last x[:4]={%.6f,%.6f,%.6f,%.6f}\n",
                 s->x[0],s->x[1],s->x[2],s->x[3]);
-            double r=0;for(int i=0;i<dim;i++)r+=s->x[i]*s->x[i];
-            fprintf(stderr,"[DBG] prefill_last x_rms=%.6e\n",sqrt(r/dim));
         }
     }
 
