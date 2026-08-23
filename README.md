@@ -23,7 +23,7 @@
 - GPU-pipelined prefill path (`model_forward_prefill_gpu`)
 - FFN rewrite: Q8_0 tiled matmul, 2.6x faster on GPU
 - GGUF split-file loader
-- Gemma-3n architecture support (AltUp, Laurel)
+- Gemma-3n architecture support (WIP, doesn't work yet)
 - TurboQuant TQ3/TQ4 KV cache
 - Deterministic sign randomization for Walsh-Hadamard transform
 - `--benchmark-ctx` context scaling benchmark, `--gpu-diff` kernel diff test
