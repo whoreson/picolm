@@ -51,8 +51,8 @@ static double drand48_win(void) {
 }
 #define srand48(s)     srand48_win((int32_t)(s))
 #define drand48 drand48_win
-#define setenv(k,v,o)     do { _putenv_s((k),(v)); } while(0)
-#define unsetenv(k)       _putenv_s((k),"")
+#define setenv(k,v,o)     do { SetEnvironmentVariableA(k, v); } while(0)
+#define unsetenv(k)       do { SetEnvironmentVariableA(k, NULL); } while(0)
 
 double get_time_ms(void) {
     LARGE_INTEGER freq, count;
@@ -609,12 +609,6 @@ static void gpu_matmul_diff(int S, int I, int O) {
     tensor.weights = d_w;
     tensor.device = 0;
 
-    /* Initialize GPU context */
-    int devs[1] = {0};
-    if (!picolm_gpu_init(devs, 1)) {
-        fprintf(stderr, "GPU init failed\n"); exit(1);
-    }
-
     if (!picolm_gpu_matmul(&tensor, y_imma, x, S, 0)) {
         fprintf(stderr, "IMMA matmul failed (I=%d O=%d S=%d, need I>=512 O>=256)\n", I, O, S); exit(1);
     }
@@ -961,6 +955,12 @@ int main(int argc, char **argv) {
         if (getenv("PICOLM_GPU") == NULL) {
             fprintf(stderr, "GPU not available (PICOLM_GPU not set)\n");
             return 1;
+        }
+        {
+            int devs[1] = {0};
+            if (!picolm_gpu_init(devs, 1)) {
+                fprintf(stderr, "GPU init failed\n"); exit(1);
+            }
         }
         gpu_matmul_diff(gpu_diff_S, gpu_diff_I, gpu_diff_O);
         return 0;

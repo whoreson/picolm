@@ -206,7 +206,11 @@ __global__ void picolm_gpu_attention_prefill_kernel( float *xb_out,  const float
  * Uses mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 for Q@K scoring.
  * NOT bit-exact with scalar kernel. head_dim must be multiple of 16. */
 #define FA2_TILE_Q 16
+#ifdef PICOLM_IMMA_W16
 #define FA2_TILE_K 32
+#else
+#define FA2_TILE_K 16
+#endif
 
 __global__ void picolm_gpu_attention_prefill_fa2_kernel(
     float *xb_out, const float *q_dev,

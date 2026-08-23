@@ -130,7 +130,7 @@ int picolm_gpu_init(const int *devices, int count) {
      * before the first CUDA driver call, so this has to be the very first
      * thing in init. overwrite=0: respect an explicit user-set value. */
 #ifdef _WIN32
-    _putenv_s("CUDA_DEVICE_MAX_CONNECTIONS", "1");
+    /* _putenv_s removed: crashes on Windows WDDM */ 
 #else
     setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1", 0);
 #endif
@@ -171,6 +171,9 @@ int picolm_gpu_init(const int *devices, int count) {
                                               ), "stream creation")) {
             g_nctx = 0; return 0;
         }
+        /* On Windows WDDM, force CUDA context creation early to avoid TDR timeout */
+        { void *tmp; if (gpuMalloc(&tmp, 256) == gpuSuccess) gpuFree(tmp); }
+
         g_nctx++;
         fprintf(stderr, "[GPU] device %d: %s, %.1f GB VRAM, sm_%d%d\n",
                 device, prop.name, prop.totalGlobalMem / 1e9,
