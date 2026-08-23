@@ -940,6 +940,7 @@ int main(int argc, char **argv) {
     }
 
     /* --gpu-attn-diff: attention kernel diff test (FA2 vs scalar) */
+#ifdef PICOLM_GPU
     if (do_attn_diff) {
         if (getenv("PICOLM_GPU") == NULL) {
             fprintf(stderr, "GPU not available (PICOLM_GPU not set)\n");
@@ -948,6 +949,12 @@ int main(int argc, char **argv) {
         gpu_attn_diff_test(attn_n_tok, attn_n_heads, attn_n_kv, attn_head_dim);
         return 0;
     }
+#else
+    if (do_attn_diff) {
+        fprintf(stderr, "--gpu-attn-diff requires GPU build\n");
+        return 1;
+    }
+#endif
 
     /* --gpu-diff: standalone GPU kernel diff test, no model needed */
 #ifdef PICOLM_CUDA
@@ -967,6 +974,7 @@ int main(int argc, char **argv) {
 #endif
 
     /* --benchmark-ctx: context scaling benchmark */
+#ifdef PICOLM_GPU
     if (do_benchmark_ctx) {
         if (!model_path) { fprintf(stderr, "No model file specified\n"); usage(argv[0]); return 1; }
         benchmark_context_scaling(model_path, prompt ? prompt :
@@ -974,6 +982,12 @@ int main(int argc, char **argv) {
             context_override, temperature, top_k, max_tokens, seed, num_threads, do_prefault);
         return 0;
     }
+#else
+    if (do_benchmark_ctx) {
+        fprintf(stderr, "--benchmark-ctx requires GPU build\n");
+        return 1;
+    }
+#endif
 
     /* --list-tensors / --list-kv: now that model_path is known regardless of arg order */
     if (list_tensors || list_kv) {
