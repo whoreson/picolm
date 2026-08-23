@@ -1002,6 +1002,170 @@ picolm_q5_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
     }
 }
 
+/* Q4_K x Q8_0 IMMA kernel.
+ * Q4_K: 256 values in 144 bytes. block_q4_K layout:
+ *   d(2), dmin(2), scales[12], qs[128].
+ *   8 sub-blocks of 32 values each. Each sub-block has its own 6-bit
+ *   scale (sc) and 6-bit min (mn), packed via get_scale_min_k4.
+ *   qs[128]: 4-bit nibbles. Sub-blocks 0,2,4,6 use low nibbles of
+ *   qs[0..31], qs[32..63], qs[64..95], qs[96..127]. Sub-blocks
+ *   1,3,5,7 use high nibbles of the same bytes.
+ *   Dequant: val = d * sc * qs4 - dmin * mn.
+ *
+ * Same IMMA m16n8k32 pattern as Q5_K. 32 threads (1 warp), 16x8 tile.
+ * Activation is pre-quantized to Q8_0 (int8 + per-32-element scale). */
+__global__ void
+picolm_q4_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
+                            const void *weights, int S, int I, int O,
+                            int row_bytes, int y_stride) {
+    int gid = gpuThreadIdx_x / 4;
+    int tid = gpuThreadIdx_x % 4;
+    int tile_o = gpuBlockIdx_x * 8;
+    int tile_s = gpuBlockIdx_y * 16;
+    int ys = y_stride > 0 ? y_stride : O;
+    int n_blocks = I / 32;
+    const uint8_t *w = (const uint8_t *)weights;
+    float sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int kb = 0; kb < n_blocks; kb++) {
+        int q4_block = kb / 8;
+        int g = kb % 8;  /* sub-block index 0..7 within the 256-value block */
+
+        int wc = tile_o + gid;
+        size_t wrow_base = (size_t)wc * row_bytes + q4_block * GPU_BLOCK_Q4_K_SIZE;
+        const uint8_t *wb = w + wrow_base;
+
+        /* Super-scales d and dm (fp16 at offsets 0, 2) */
+        float wd = gpu_fp16_to_fp32(wb[0] | ((uint16_t)wb[1] << 8));
+        float wdm = gpu_fp16_to_fp32(wb[2] | ((uint16_t)wb[3] << 8));
+
+        /* Unpack sub-scale and sub-min via get_scale_min_k4 */
+        uint8_t sc, mn;
+        {
+            const uint8_t *scales = wb + 4;
+            if (g < 4) {
+                sc = scales[g] & 63;
+                mn = scales[g + 4] & 63;
+            } else {
+                sc = (uint8_t)((scales[g + 4] & 0xF) | ((scales[g - 4] >> 6) << 4));
+                mn = (uint8_t)((scales[g + 4] >> 4) | ((scales[g] >> 6) << 4));
+            }
+        }
+        float wds = wd * (float)sc;
+        float wdmn = wdm * (float)mn;
+
+        /* A: activation fragments (same as Q5_K) */
+        int a0, a1, a2, a3;
+        {
+            int c0 = tid * 4;
+            int c2 = c0 + 16;
+            int src0 = (int)(tile_s + gid) * I + kb * 32 + c0;
+            int src1 = (int)(tile_s + gid + 8) * I + kb * 32 + c0;
+            int src2 = (int)(tile_s + gid) * I + kb * 32 + c2;
+            int src3 = (int)(tile_s + gid + 8) * I + kb * 32 + c2;
+            int32_t *p = (int32_t *)(const int8_t *)(&xq[src0]); a0 = p[0];
+            p = (int32_t *)(const int8_t *)(&xq[src1]); a1 = p[0];
+            p = (int32_t *)(const int8_t *)(&xq[src2]); a2 = p[0];
+            p = (int32_t *)(const int8_t *)(&xq[src3]); a3 = p[0];
+        }
+
+        /* B: unpack Q4_K 4-bit nibbles to int32 (4 per register).
+         * Block: d(0-1), dm(2-3), scales(4-15), qs(16-143).
+         * qs starts at offset 16. 8 sub-blocks of 32 values each.
+         * Sub-blocks 0,2,4,6 = low nibbles of qs groups 0..3.
+         * Sub-blocks 1,3,5,7 = high nibbles of qs groups 0..3.
+         * qs group j = qs[16 + j*32 .. 16 + j*32 + 31].
+         *
+         * g/2 selects the qs group (0..3). g&1 selects low vs high nibble.
+         * Within the group, each thread (tid 0..3) loads 2 bytes covering
+         * 4 elements for b0 (offsets 0..3) and 2 bytes for b1 (offsets 16..19).
+         *
+         * For IMMA s8 format, nibbles need to be sign-extended to 8-bit.
+         * The m16n8k32.s8 instruction sign-extends each byte to int8.
+         * Nibbles 0..15: values 0..15, but Q4_K stores them as unsigned
+         * 0..15. The min-correction subtracts dmin*mn*sum(q8) to handle
+         * the offset. So we keep them as unsigned 0..15 in the low byte,
+         * and the upper 3 bytes of each int32 can be anything (they'll be
+         * sign-extended from the low byte by IMMA). */
+        int b0, b1;
+        {
+            int qs_group = g >> 1;  /* 0..3 */
+            const uint8_t *qs_p = wb + 16 + qs_group * 32;
+            uint32_t raw0, raw1;
+            /* b0: elements 0..3 (qs bytes tid*2, tid*2+1) */
+            memcpy(&raw0, qs_p + tid * 2, 2);
+            /* b1: elements 16..19 (qs bytes tid*2+16, tid*2+17) */
+            memcpy(&raw1, qs_p + 16 + tid * 2, 2);
+
+            if (g & 1) {
+                /* High nibbles: shift right by 4 */
+                raw0 = ((raw0 >> 4) & 0x0F) | (((raw0 >> 4) & 0x0F) << 8)
+                     | (((raw0 >> 8) & 0x0F) << 16) | (((raw0 >> 12) & 0x0F) << 24);
+                raw1 = ((raw1 >> 4) & 0x0F) | (((raw1 >> 4) & 0x0F) << 8)
+                     | (((raw1 >> 8) & 0x0F) << 16) | (((raw1 >> 12) & 0x0F) << 24);
+            } else {
+                /* Low nibbles: mask with 0x0F */
+                raw0 = (raw0 & 0x0F) | (((raw0 >> 4) & 0x0F) << 8)
+                     | (((raw0 >> 8) & 0x0F) << 16) | ((raw0 >> 12) & 0x0F) << 24;
+                raw1 = (raw1 & 0x0F) | (((raw1 >> 4) & 0x0F) << 8)
+                     | (((raw1 >> 8) & 0x0F) << 16) | ((raw1 >> 12) & 0x0F) << 24;
+            }
+            b0 = raw0;
+            b1 = raw1;
+        }
+
+        /* IMMA m16n8k32 */
+        int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+        asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+            : "+r"(d0), "+r"(d1), "+r"(d2), "+r"(d3)
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
+
+        /* Min-correction: same pattern as Q5_K */
+        int sq0 = 0, sq1 = 0;
+        {
+            int8_t *av;
+            av = (int8_t *)&a0; sq0 += av[0] + av[1] + av[2] + av[3];
+            av = (int8_t *)&a2; sq0 += av[0] + av[1] + av[2] + av[3];
+            av = (int8_t *)&a1; sq1 += av[0] + av[1] + av[2] + av[3];
+            av = (int8_t *)&a3; sq1 += av[0] + av[1] + av[2] + av[3];
+        }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 300
+        {
+            unsigned mask = 0xF << (gid * 4);
+            sq0 += __shfl_down_sync(mask, sq0, 2);
+            sq1 += __shfl_down_sync(mask, sq1, 2);
+            sq0 += __shfl_down_sync(mask, sq0, 1);
+            sq1 += __shfl_down_sync(mask, sq1, 1);
+        }
+#endif
+
+        /* Epilogue: apply scales and subtract min-correction */
+        float dx0 = xd[(size_t)(tile_s + gid) * n_blocks + kb];
+        float dx1 = xd[(size_t)(tile_s + gid + 8) * n_blocks + kb];
+
+        if (tid == 0) {
+            sum[0] -= wdmn * dx0 * (float)sq0;
+            sum[2] -= wdmn * dx1 * (float)sq1;
+        }
+        sum[0] += wds * dx0 * (float)d0;
+        sum[1] += wds * dx0 * (float)d1;
+        sum[2] += wds * dx1 * (float)d2;
+        sum[3] += wds * dx1 * (float)d3;
+    }
+    for (int f = 0; f < 4; f++) {
+        int row = (f < 2) ? gid : gid + 8;
+        int col = tid * 2 + (f % 2);
+        int gr = tile_s + row;
+        int gc = tile_o + col;
+        if (gr < S && gc < O)
+            y[(size_t)gr * ys + (size_t)gc] = sum[f];
+    }
+}
+
 /* lines 430-437 from backend_gpu_kernels.cuh */
 __global__ void
 picolm_silu_mul(float *gate, const float *up, size_t n) {
