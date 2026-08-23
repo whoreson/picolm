@@ -11,730 +11,350 @@
 
 <h1 align="center">PicoLM</h1>
 
-<p align="center">
-  <strong>Run LLMs (up to 70B tested) on a $10 board with 256MB RAM.</strong><br>
-</p>
+# PicoLM - But It's Actually Useful
 
----
+## What's New
 
-# PicoLM - But It's Actually Useful (v1.0-beta2)
+**v1.0-beta3** (upcoming)
 
-> **143 commits (alpha1) + 132 commits (beta1-beta2). Zero new dependencies. Up to 70B models.**
+- GPU architecture rewrite: device-native pipeline replacing the old D2H/H2D matmul crutch
+- IMMA Tensor Core kernels for all quant types: Q8_0, Q6_K, Q5_K, Q4_K, Q4_0, Q4_1, Q3_K, Q2_K, Q1_0
+- FlashAttention-2 tensor core prefill kernel
+- Split-K decode attention (flash-decoding pattern)
+- GPU-resident KV cache, device-native RMSNorm, RoPE, elementwise ops
+- Device-native SSM batched kernels: conv1d, l2norm, vecdot, gated_norm, head_permute, expert_mlp
+- GPU-pipelined prefill path (`model_forward_prefill_gpu`)
+- FFN rewrite: Q8_0 tiled matmul, 2.6x faster on GPU
+- GGUF split-file loader
+- Gemma-3n architecture support (AltUp, Laurel)
+- TurboQuant TQ3/TQ4 KV cache
+- Deterministic sign randomization for Walsh-Hadamard transform
+- `--benchmark-ctx` context scaling benchmark, `--gpu-diff` kernel diff test
+- Big.LITTLE core awareness, `--list-kv`, `PICOLM_GPU_PATH` env var
 
-The original PicoLM was a clever proof-of-concept: mmap a GGUF, stream layers through 45MB of RAM, call it a day. Noble effort, but it was missing basically everything you need to actually use an LLM. So [gabucino](http://gabucino.hu) went in and added hundreds of commits across quantization acceleration, model support, HTTP server, GPU backends, and cross-platform fixes.
+## What all this is
+
+The original PicoLM was a clever proof-of-concept: mmap a GGUF, stream layers through 45MB of RAM, call it a day. Noble effort, but it was missing basically everything you need to actually use an LLM. So [I](http://gabucino.hu) went in and added hundreds of commits across quantization acceleration, model support, HTTP server, GPU backends, and cross-platform fixes.
+
+Since then, progress has been steady. The main goals are (beyond satisfying
+curiosity on what Qwen-3.6-27B can and can't do):
+
+- **First, portability.** The only good software is one that runs (and is tested) on everything from the last 50 years. PicoLM runs from 32-bit MS-DOS through Raspberry Pi, MIPS/OpenWRT, AMD ROCm (MI50 tested), Metal (if someone bothers), to RTX 4090 or DGX Spark.
+- **Second, speed.** Compete with llama.cpp in as many areas as possible. 100% emphasis on CPU and GPU optimizations. Reaching ik_llama.cpp speeds is impossible, of course, courtesy of 40k lines of matmul engines. Work needs to be done on prefill (prompt processing). As far as token generation is concerned, it's already there, and in some cases outpacing llama.cpp.
+- **Third: model support.** Slopped and benchmaxxed 2023+ models aren't priorities, except Qwen 3.6-27B which is a first-tier model that PicoLM supports (both CPU and GPU, between Q1_0 and f16). Exceptions are made for small models like Gemma-3/4n and sorts, fitting the project profile. Fimbulvetr (SOLAR-10.7b finetune) is also tier 1, and Miqu-70B is known to work. Original Mistral Nemo is planned (needs tokenizer support), and DeepSeek V3-0325 is also on TODO, later versions not at all. MoE and SSM architecture in place, tested with Qwen 3.6-31B-A3B (which is not a good model btw but whatever).
+
+PicoLM doesn't preload weights in RAM, therefore doesn't have a hard RAM requirement like llama.cpp. This has the disadvantage of not being able to reorder tensors to col-major, but this is the niche we're in. Support for transposing tensors on-disk (breaking file compatibility) is on the table. The `--prefault` option preloads all weights for faster first reply, when enough RAM is available.
+
+In low-memory environments, to avoid weights needlessly being rotated round-robin to/from the RAM by the OS, PicoLM has a `--mem` option which does a `mlock()`/`VirtualLock()` on the most important weights (explicit MoE support too), keeping them in the RAM at all times, while only the rest is being streamed. Very measurable speed increase.
+
+Per-layer activation heatmap, viewable over the built-in VNC server, with no speed loss. Looks cool. Also can enable/disable/reorder layers with the pointer, though the Basilisk probably won't be very approving of this. Think about the future, Eckhardt! More visualizations planned, even console ANSI.
 
 **What was added since the upstream baseline:**
 
 | Category | Details |
 |----------|---------|
-| **Quantization** | Q8_0, Q4_K, Q4_0, Q4_1, Q2_K, Q3_K, Q5_K, Q6_K, Q8_K, Q4_0_8_8, Q4_0_4_4, Q1_0, Q2_0, F16, BF16, F32 |
-| **SIMD: x86** | AVX-512 (VNNI, fp16x16, vec_dot, rmsnorm, RoPE, attention, Q6_K, Q3_K, SSM), AVX2 (full int8 MAC, Q6_K, Q3_K, SSM), AVX/SSE2 (Q8_0, Q4_K, attention FMA, SSM) |
-| **SIMD: ARM** | NEON (RoPE, FP16 HW convert, Q8_0 int8 MAC, attention, SSM kernels), DotProd (Q4_0_4_4, ARMv8.2+ SDOT) |
-| **Models** | Llama 1/2/3, Qwen2, Qwen3 (non-uniform head_dim), Qwen3.5/3.6 (SSM/Mamba hybrid) |
-| **Scale** | Tested up to 70B parameters (miq-70b), 128 layers max |
+| **Quantization** | Q8_0, Q4_K, Q4_0, Q4_1, Q2_K, Q3_K, Q5_K, Q6_K, Q8_K, Q4_0_8_8, Q4_0_4_8, Q4_0_4_4, Q1_0, Q2_0, F16, BF16, F32 |
+| **SIMD: x86** | AVX-512/VNNI/AVX2/AVX/SSE (fp16x16, vec_dot, rmsnorm, RoPE, attention, all quants, SSM) |
+| **SIMD: ARM** | NEON (RoPE, FP16 HW convert, Q8_0 int8 MAC, attention, SSM kernels), DotProd, i8mm (Q4_0_4_4, Q4_0_4_8, ARMv8.2+ SDOT) |
+| **GPU** | CUDA/HIP IMMA Tensor Core GEMM (m16n8k32), FA2 prefill, Split-K decode, device-native SSM/attention/RMSNorm/RoPE, all quants Q1_0..Q8_0, Metal SSM kernels |
+| **Models** | Llama 1/2/3, Qwen2, Qwen3 (non-uniform head_dim), Qwen3.5/3.6 (SSM/Mamba hybrid), Gemma-3n (AltUp/Laurel) |
+| **Scale** | Tested up to 70B parameters (miqu-70b) |
 | **HTTP server** | OpenAI API (`/v1/completions`, `/v1/chat/completions`, `/v1/models`), llama.cpp-compatible (`/completion`, `/props`), `/tokenize`, `/detokenize`, `/health`, streaming, persistent model/KV cache |
-| **Threading** | Persistent thread pool (gen-counter barrier), physical core auto-detect, GQA grouped attention, tiled/blocked attention for prefill, batched GEMV |
-| **Platform** | Linux (AVX-512/VNNI, ARM NEON, RISC-V), Windows (SRWLOCK, MinGW, VirtualLock, `--mem`) |
-| **KV cache** | F16, Q8_0 (53% memory), Q4_0 (34% memory), Walsh-Hadamard rotation (`-khad`/`-vhad`), persistent with prefix matching |
-| **Misc** | 64KB FP16 lookup table, `--mem` mlock, `--prefault`, `--daemon`, `--json` grammar, VNC visualization server, `bench.zsh` benchmark harness |
+| **Threading** | Persistent thread pool (gen-counter barrier), physical core auto-detect, big.LITTLE awareness, GQA grouped attention, tiled/blocked attention for prefill, batched GEMV |
+| **Platform** | Linux (AVX-512/VNNI, ARM NEON, RISC-V), Windows 7-11 (SRWLOCK, MinGW, VirtualLock, `--mem`), Mac OS/X 10.4-10.6, MS-DOS, PPC/Altivec, Android, FreeBSD |
+| **KV cache** | F16, Q8_0, Q4_0, Walsh-Hadamard rotation (`-khad`/`-vhad`), persistent with prefix matching, TQ4, TQ3 |
+| **Misc** | 64KB FP16 lookup table, `--mem` mlock, `--prefault`, `--daemon`, `--json` grammar, VNC visualization server, GGUF split-file loader |
 
-**GPU:** Metal backend for Apple Silicon (`make metal`, SSM kernels, multi-output GEMV, FFN fusion). CUDA (Q4_0/Q4_K/Q8_0, WMMA Tensor Core, SSM) and HIP/ROCm also supported.
+**What it will never have**
 
----
-
-<p align="center">
-  <code>echo "Explain gravity" | ./picolm model.gguf -n 100 -j 4</code>
-</p>
+Support for fucking Jinja chat templates. Raw text-completion only, write your own prompts or fuck the fuck off. Maybe an external Python proxy/shim.
 
 ---
 
-## The Perfect Match: PicoLM + PicoClaw
-
-<div align="center">
-  <img src="picolm.jpg" alt="PicoLM — Run a 1-billion parameter LLM on a $10 board" width="640">
-  <br><br>
-</div>
-
-PicoLM was built as the **local brain** for [PicoClaw](https://github.com/sipeed/picoclaw) — an ultra-lightweight AI assistant in Go that runs on $10 hardware. Together, they form a **fully offline AI agent** — no cloud, no API keys, no internet, no monthly bills.
-
-> **Every other LLM provider needs the internet. PicoLM doesn't.**
-
-<table align="center">
-  <tr align="center">
-    <td><b>The Hardware</b></td>
-    <td><b>The Architecture</b></td>
-  </tr>
-  <tr>
-    <td align="center"><img src="https://raw.githubusercontent.com/sipeed/picoclaw/main/assets/licheervnano.png" alt="$9.90 LicheeRV Nano" width="360"></td>
-    <td align="center"><img src="https://raw.githubusercontent.com/sipeed/picoclaw/main/assets/arch.jpg" alt="PicoClaw architecture — PicoLM sits in the LLM box" width="420"></td>
-  </tr>
-  <tr>
-    <td align="center"><em>$9.90 — that's the entire server</em></td>
-    <td align="center"><em>PicoLM powers the LLM box in PicoClaw's agent loop</em></td>
-  </tr>
-</table>
-
-### Why they're a perfect fit
-
-| | Cloud Provider (OpenAI, etc.) | PicoLM (Local) |
-|---|---|---|
-| **Cost** | Pay per token, forever | Free forever |
-| **Privacy** | Your data sent to servers | Everything stays on-device |
-| **Internet** | Required for every request | Not needed at all |
-| **Latency** | Network round-trip + inference | Inference only |
-| **Hardware** | Needs a $599 Mac Mini | Runs on a $10 board |
-| **Binary** | N/A | ~80KB single file |
-| **RAM** | N/A | 45 MB total |
-
-### How it works
-
-PicoClaw's agent loop spawns PicoLM as a subprocess. Messages come in from Telegram, Discord, or CLI — PicoClaw formats them into a chat template, pipes the prompt to `picolm` via stdin, and reads the response from stdout. When tools are needed, `--json` grammar mode guarantees valid JSON even from a 1B model.
-
 ```
-Telegram / Discord / CLI
-        │
-        ▼
-   ┌──────────┐    stdin: prompt     ┌───────────┐
-   │ PicoClaw │ ──────────────────►  │  picolm   │
-   │   (Go)   │ ◄──────────────────  │   (C)     │
-   └──────────┘    stdout: response  │ + model   │
-        │                            └───────────┘
-        ▼                            45 MB RAM
-   User gets reply                   No internet
+                    +--------------------------------------------------+
+   What goes        |         45 MB Runtime RAM                        |
+   in RAM           |  +-----------+ +------------+ +---------------+  |
+                    |  | Buffers   | | FP16 KV    | | Tokenizer     |  |
+                    |  |  1.2 MB   | | Cache      | |   4.5 MB      |  |
+                    |  |           | |  ~40 MB    | |               |  |
+                    |  +-----------+ +------------+ +---------------+  |
+                    +--------------------------------------------------+
+
+                    +--------------------------------------------------+
+   What stays       |             Model on Disk                        |
+   on disk          |       (mmap - OS pages in layers                 |
+   (via mmap)       |        as needed, ~1 at a time)                  |
+                    +--------------------------------------------------+
 ```
 
-### Quick setup
-
-```bash
-# 1. Build PicoLM
-cd picolm && make native    # or: make pi (Raspberry Pi)
-
-# 2. Download model (one-time, 638 MB)
-make model
-
-# 3. Build PicoClaw
-cd ../picoclaw && make deps && make build
-
-# 4. Configure (~/.picoclaw/config.json)
-```
-
-```json
-{
-  "agents": {
-    "defaults": {
-      "provider": "picolm",
-      "model": "picolm-local"
-    }
-  },
-  "providers": {
-    "picolm": {
-      "binary": "~/.picolm/bin/picolm",
-      "model": "~/.picolm/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
-      "max_tokens": 256,
-      "threads": 4,
-      "template": "chatml"
-    }
-  }
-}
-```
-
-```bash
-# 5. Chat — fully offline!
-picoclaw agent -m "What is photosynthesis?"
-```
-
-### Or install everything in one line
-
-```bash
-curl -sSL https://raw.githubusercontent.com/RightNow-AI/picolm/main/install.sh | bash
-```
-
-### Performance on real hardware
-
-| Device | Price | Generation Speed | RAM Used |
-|--------|-------|-----------------|----------|
-| **Pi 5** (4-core) | $60 | ~10 tok/s | 45 MB |
-| **Pi 4** (4-core) | $35 | ~8 tok/s | 45 MB |
-| **Pi 3B+** | $25 | ~4 tok/s | 45 MB |
-| **Pi Zero 2W** | $15 | ~2 tok/s | 45 MB |
-| **LicheeRV Nano** | $10 | ~1 tok/s | 45 MB |
-
-### JSON tool calling
-
-PicoClaw automatically activates `--json` grammar mode when it needs structured output. This **guarantees syntactically valid JSON** even from a 1B parameter model — essential for reliable tool calling on tiny hardware:
-
-```bash
-picoclaw agent -m "Search for weather in Tokyo"
-# → PicoLM generates: {"tool_calls": [{"function": {"name": "web_search", "arguments": "{\"query\": \"weather Tokyo\"}"}}]}
-```
-
-> For the full PicoClaw documentation, see the [PicoClaw README](https://github.com/sipeed/picoclaw).
-
----
-
-## What is PicoLM?
-
-PicoLM is a **minimal, from-scratch LLM inference engine** written in ~2,500 lines of C11. It runs [TinyLlama 1.1B](https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0) (and other LLaMA-architecture models in GGUF format) on hardware that most inference frameworks won't even consider:
-
-- **Raspberry Pi Zero 2W** ($15, 512MB RAM, ARM Cortex-A53)
-- **Sipeed LicheeRV** ($12, 512MB RAM, RISC-V)
-- **Raspberry Pi 3/4/5** (1-8GB RAM, ARM NEON SIMD)
-- Any Linux/Windows/macOS x86-64 machine
-
-The model file (638MB) stays on disk. PicoLM **memory-maps** it and streams one layer at a time through RAM. Total runtime memory: **~45MB** including the FP16 KV cache.
-
-```
-                    ┌──────────────────────────────────────────┐
-   What goes        │         45 MB Runtime RAM                │
-   in RAM           │  ┌─────────┐ ┌──────────┐ ┌───────────┐  │
-                    │  │ Buffers │ │ FP16 KV  │ │ Tokenizer │  │
-                    │  │  1.2 MB │ │ Cache    │ │   4.5 MB  │  │
-                    │  │         │ │  ~40 MB  │ │           │  │
-                    │  └─────────┘ └──────────┘ └───────────┘  │
-                    └──────────────────────────────────────────┘
-
-                    ┌──────────────────────────────────────────┐
-   What stays       │        638 MB Model on Disk              │
-   on disk          │       (mmap — OS pages in layers         │
-   (via mmap)       │        as needed, ~1 at a time)          │
-                    └──────────────────────────────────────────┘
-```
-
----
-
-## Features
-
-| Feature | Description |
-|---------|-------------|
-| **GGUF Native** | Reads GGUF v2/v3 files directly — no conversion needed |
-| **K-Quant Support** | Q1_0, Q2_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, Q4_1, F16, BF16, F32 |
-| **mmap Layer Streaming** | Model weights stay on disk; OS pages in one layer at a time |
-| **FP16 KV Cache** | Halves KV cache memory (44MB vs 88MB for 2048 context) |
-| **Flash Attention** | Online softmax — no O(seq_len) attention buffer needed |
-| **Pre-computed RoPE** | cos/sin lookup tables eliminate transcendentals from hot loop |
-| **SIMD Acceleration** | ARM NEON (Pi 3/4/5), x86 SSE2/SSE3/AVX/AVX2/AVX-512 (VNNI) - auto-detected at compile time |
-| **Fused Dot Products** | Dequantize + dot-product in one pass — no intermediate buffer |
-| **Multi-threaded matmul** | Parallel matrix-vector multiply across CPU cores |
-| **Grammar-Constrained JSON** | `--json` flag forces valid JSON output (for tool calling) |
-| **KV Cache Persistence** | `--cache` saves/loads prompt state — skip prefill on re-runs |
-| **BPE Tokenizer** | Score-based byte-pair encoding, loaded from GGUF metadata |
-| **Top-p Sampling** | Temperature + nucleus sampling with configurable seed |
-| **Pipe-friendly** | Reads prompts from stdin: `echo "Hello" \| ./picolm model.gguf` |
-| **Zero Dependencies** | Only libc, libm, libpthread. No external libraries. |
-| **Cross-platform** | Linux, Windows (MSVC), macOS. ARM, x86-64, RISC-V. |
-
----
-
-## Quick Start
-
-### One-liner install (Raspberry Pi / Linux)
-
-```bash
-curl -sSL https://raw.githubusercontent.com/RightNow-AI/picolm/main/install.sh | bash
-```
-
-This will:
-1. Detect your platform (ARM64, ARMv7, x86-64)
-2. Install build dependencies (`gcc`, `make`, `curl`)
-3. Build PicoLM with optimal SIMD flags for your CPU
-4. Download TinyLlama 1.1B Q4_K_M (638 MB)
-5. Run a quick test
-6. Generate PicoClaw config
-7. Add `picolm` to your PATH
-
-### Build from source
-
-```bash
-git clone https://github.com/rightnow-ai/picolm.git
-cd picolm/picolm
-
-# Auto-detect CPU (enables SSE2/AVX on x86, NEON on ARM)
-make native
-
-# Download a model
-make model
-
-# Run it
-./picolm /opt/picolm/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
-    -p "The meaning of life is" -n 100
-```
-
-### Build on Windows (MSVC)
-
-```cmd
-cd picolm
-build.bat           :: SSE2 baseline (any x86-64)
-build.bat avx2      :: AVX2 (Haswell+ / Excavator+, fastest)
-build.bat avx       :: AVX  (Sandy Bridge+ / Bulldozer+)
-build.bat scalar    :: no SIMD (portable fallback)
-picolm.exe model.gguf -p "Hello world" -n 50
-```
-
-### Platform-specific builds
-
-```bash
-make native      # x86/ARM auto-detect (recommended for local machine)
-make x86         # x86-64 safe default (SSE2 only — runs on any x86-64)
-make sse2        # x86-64 SSE2 only (same as x86)
-make sse3        # x86-64 SSE2+SSE3+SSSE3 (AMD Phenom/Athlon, older Intel)
-make avx         # x86-64 AVX (Sandy Bridge+, Bulldozer+ — wider SIMD, faster)
-make avx2        # x86-64 AVX2 (Haswell+, Excavator+ — widest SIMD, fastest)
-make scalar      # No SIMD (portable scalar fallback, any architecture)
-make pi          # Raspberry Pi 3/4/5 (64-bit ARM + NEON SIMD)
-make pi-arm32    # Pi Zero / Pi 1 (32-bit ARM)
-make cross-pi    # Cross-compile for Pi from x86 (static binary)
-make riscv       # RISC-V (Sipeed LicheeRV, etc.)
-make static      # Static binary for single-file deployment
-make debug       # Debug build with symbols, no optimization
-make metal       # Apple Silicon GPU backend (Metal; macOS only, no deps)
-```
-
-### Metal backend (Apple Silicon)
-
-PicoLM ships a Metal backend implemented directly against the Metal framework
-(no MLX-C, no CMake, no Homebrew — just `clang++` + the macOS SDK). It compiles
-the matmul kernels from Metal Shading Language source at runtime and maps model
-weights **zero-copy** into the GPU's unified memory, so large models don't
-double their resident RAM.
-
-```bash
-make metal                          # builds picolm with -DPICOLM_GPU=1
-PICOLM_GPU=1 ./picolm model.gguf -p "Hello" -n 50    # run on the GPU
-```
-
-Supported quantizations: F32, F16, Q4_0, Q8_0, Q4_K, Q5_K, Q6_K.
-The dequant kernels are faithful ports of PicoLM's CPU `dequantize_row_*` (the GGUF/
-llama.cpp block layouts). A self-contained kernel smoke-test lives in
-`probes/metal_reduction_probe.mm` (`make metal-probe-run`).
-
----
-
-## Usage
-
-```
-PicoLM — ultra-lightweight LLM inference engine
-
-Usage: picolm <model.gguf> [options]
-
-Generation options:
-  -p <prompt>    Input prompt (or pipe via stdin)
-  -n <int>       Max tokens to generate (default: 256)
-  -t <float>     Temperature (default: 0.8, 0=greedy)
-  -k <float>     Top-p / nucleus sampling (default: 0.9)
-  -s <int>       RNG seed (default: 42)
-  -c <int>       Context length override
-  -j <int>       Number of threads (default: 4)
-
-Advanced options:
-  --json         Grammar-constrained JSON output mode
-  --cache <file> KV cache file (saves/loads prompt state)
-```
-
-### Examples
-
-**Basic generation:**
-```bash
-./picolm model.gguf -p "Once upon a time" -n 200
-```
-
-**Greedy decoding (deterministic, temperature=0):**
-```bash
-./picolm model.gguf -p "The capital of France is" -n 20 -t 0
-# Output: Paris. It is the largest city in France and...
-```
-
-**Chat with TinyLlama (ChatML format):**
-```bash
-./picolm model.gguf -n 200 -t 0.7 -p "<|user|>
-What is photosynthesis?</s>
-<|assistant|>
-"
-```
-
-**Force JSON output (for tool calling / structured data):**
-```bash
-./picolm model.gguf --json -t 0.3 -n 100 -p "<|user|>
-Return the current time as JSON.</s>
-<|assistant|>
-"
-# Output: {"time": "12:00 PM"}
-```
-
-**Pipe from stdin:**
-```bash
-echo "Explain quantum computing in one sentence" | ./picolm model.gguf -n 50
-```
-
-**KV cache — skip repeated prefill:**
-```bash
-# First run: processes prompt + saves cache
-./picolm model.gguf --cache prompt.kvc -p "Long system prompt here..." -n 50
-
-# Second run: loads cache, skips prompt prefill (74% faster)
-./picolm model.gguf --cache prompt.kvc -p "Long system prompt here..." -n 50
-# Output: "Skipping 25 cached prompt tokens"
-```
-
-**Multi-threaded on a Pi 4 (4 cores):**
-```bash
-./picolm model.gguf -p "Hello" -n 100 -j 4
-```
-
----
-
-## Performance
-
-Measured on TinyLlama 1.1B Q4_K_M (638 MB model):
-
-| Metric | x86-64 (8 threads) | Pi 4 (4 cores, NEON) | Pi Zero 2W |
-|--------|--------------------|-----------------------|------------|
-| **Prefill** | ~11 tok/s | ~6 tok/s | ~1.5 tok/s |
-| **Generation** | ~13 tok/s | ~8 tok/s* | ~2 tok/s* |
-| **Runtime RAM** | 45 MB | 45 MB | 45 MB |
-| **First token** | ~2.3s | ~4s | ~16s |
-| **Binary size** | ~80 KB | ~70 KB | ~65 KB |
-
-*\*Estimated with NEON SIMD enabled. Actual numbers depend on SD card speed and thermal throttling.*
-
-### What makes it fast
-
-```
- Raw C inference          ████████████░░░░░░░░  13.5 tok/s  (baseline: 1.6)
- + Fused dot products     ████████████████░░░░  (eliminate dequant buffer)
- + Multi-threaded matmul  █████████████████░░░  (4-8 cores in parallel)
- + FP16 KV cache          █████████████████░░░  (halve memory bandwidth)
- + Pre-computed RoPE      ██████████████████░░  (no sin/cos in hot loop)
- + Flash attention        ██████████████████░░  (no O(n) attention alloc)
- + NEON/SSE2/AVX SIMD     ███████████████████░  (4-wide to 8-wide vector ops)
- + KV cache persistence   ████████████████████  (skip prefill entirely)
-```
-
----
-
-## Architecture
-
-```
-                          ┌─────────────────────────────────┐
-                          │           picolm.c              │
-                          │     CLI + Generation Loop       │
-                          └──────┬──────────────┬───────────┘
-                                 │              │
-                    ┌────────────┘              └────────────┐
-                    │                                        │
-           ┌────────┴────────┐                    ┌──────────┴──────────┐
-           │    model.h/c    │                    │    sampler.h/c      │
-           │  GGUF Parser    │                    │  Temperature +      │
-           │  mmap Layer     │                    │  Top-p Sampling     │
-           │  Streaming      │                    └──────────┬──────────┘
-           │  Forward Pass   │                               │
-           │  KV Cache I/O   │                    ┌──────────┴──────────┐
-           └───┬────────┬────┘                    │    grammar.h/c      │
-               │        │                         │  JSON Constraint    │
-      ┌────────┘        └───────┐                 │  Logit Masking      │
-      │                         │                 └─────────────────────┘
-┌─────┴──────┐          ┌───────┴────────┐
-│ tensor.h/c │          │ tokenizer.h/c  │
-│ matmul     │          │ BPE Encode     │
-│ rmsnorm    │          │ Decode         │
-│ softmax    │          │ Vocab Lookup   │
-│ rope       │          └────────────────┘
-│ silu       │
-│ threading  │
-└─────┬──────┘
-      │
-┌─────┴──────┐
-│  quant.h/c │
-│ Q4_K, Q6_K │
-│ Q3_K, Q2_K │
-│ FP16, F32  │
-│ NEON + SSE │
-│ Fused Dots │
-└────────────┘
-```
-
-### The LLaMA Forward Pass (what happens for each token)
-
-```
-Input Token
-    │
-    ▼
-┌───────────────┐
-│ Embedding     │  Dequantize row from token_embd → x[2048]
-│ Lookup        │
-└───────┬───────┘
-        │
-        ▼
-┌───────────────┐  ×22 layers
-│ RMSNorm       │─────────────────────────────────────────┐
-│               │                                         │
-│ Q = xb @ Wq   │  Matrix-vector multiply (quantized)     │
-│ K = xb @ Wk   │  Store K,V in FP16 KV cache             │
-│ V = xb @ Wv   │                                         │
-│               │                                         │
-│ RoPE(Q, K)    │  Rotary position encoding (table lookup)│
-│               │                                         │
-│ Attention     │  Flash attention with online softmax    │
-│ (GQA 32→4)    │  Grouped-query: 32 Q heads, 4 KV heads  │
-│               │                                         │
-│ x += Out@Wo   │  Output projection + residual           │
-│               │                                         │
-│ RMSNorm       │                                         │
-│               │                                         │
-│ SwiGLU FFN    │  gate=SiLU(xb@Wg), up=xb@Wu             │
-│               │  x += (gate*up) @ Wd                    │
-└───────┬───────┘─────────────────────────────────────────┘
-        │
-        ▼
-┌───────────────┐
-│ Final RMSNorm │
-│ x @ W_output  │─→ logits[32000]
-└───────┬───────┘
-        │
-        ▼
-┌───────────────┐
-│ Grammar Mask  │  (if --json: force valid JSON structure)
-│ Sample Token  │  temperature → softmax → top-p → pick
-└───────────────┘
-```
-
----
-
-## Memory Budget
-
-For TinyLlama 1.1B Q4_K_M with 2048 context length:
-
-| Component | Size | Notes |
-|-----------|------|-------|
-| FP16 KV cache | ~40 MB | 22 layers x 2 x 2048 x 256 x 2 bytes |
-| Tokenizer | ~4.5 MB | 32K vocab strings + scores + sorted index |
-| Activation buffers | ~0.14 MB | x, xb, xb2, q, hb, hb2 |
-| Logits buffer | ~0.12 MB | 32000 x 4 bytes |
-| Dequant scratch | ~0.02 MB | Max(n_embd, n_ffn) floats |
-| Norm weights (pre-dequant) | ~0.35 MB | 45 norm vectors x 2048 x 4 bytes |
-| RoPE tables | ~0.03 MB | cos + sin x 2048 x 32 entries |
-| **Total runtime** | **~45 MB** | |
-| | | |
-| Model file (on disk) | 638 MB | Memory-mapped, ~1 layer in RAM at a time |
-
-With 512 context (for constrained devices):
-
-| Component | Size |
-|-----------|------|
-| FP16 KV cache | ~10 MB |
-| Everything else | ~5 MB |
-| **Total** | **~15 MB** |
-
----
-
-## Optimizations Deep-Dive
-
-PicoLM implements 9 optimizations that brought generation speed from **1.6 tok/s to 13.5 tok/s** on x86, with even larger gains expected on ARM with NEON:
-
-### 1. ARM NEON SIMD
-
-4-wide float vector operations for all hot paths. Example: dequantizing Q4_K nibbles with `vmovl_u8` → `vmovl_u16` → `vcvtq_f32_u32`, and RoPE with interleaved `vld2q_f32` / `vst2q_f32`.
-
-### 2. x86 SIMD (SSE2 / SSE3 / AVX / AVX2)
-
-Four compile-time tiers for Intel/AMD:
-
-- **SSE2** (`make sse2` or `make x86`): 4-wide `__m128` operations for dot products, RMSNorm, softmax, RoPE, and element-wise ops. Safe baseline for all x86-64 CPUs.
-- **SSE3** (`make sse3`): adds `_mm_addsub_ps` for a cleaner RoPE rotation kernel (no sign-mask workaround needed).
-- **AVX** (`make avx`): 8-wide `__m256` float accumulators for all ops. Q4_K and Q6_K dot products widen the float accumulation stage while keeping integer nibble extraction at 128-bit (no AVX2 required). RoPE processes 4 complex pairs per iteration with `_mm256_addsub_ps`.
-- **AVX2** (`make avx2`): adds 256-bit integer operations. Q4_0 nibble extraction uses `_mm256_cvtepu8_epi32` (8 nibbles → 8 int32 in 2 ops vs. 4-step unpack chain). Q6_K weight extraction uses `_mm256_cvtepi8_epi32` (8 int8 → 8 int32 in 2 ops vs. 4-instruction macro chain). Targets Haswell+ Intel and Excavator+ AMD.
-
-### 3. FP16 KV Cache
-
-Key and value vectors stored as 16-bit floats instead of 32-bit. Halves KV cache memory from ~88MB to ~44MB. Conversion uses software `fp32_to_fp16()` / `fp16_to_fp32()` — no hardware FP16 support required.
-
-### 4. Pre-computed RoPE Tables
-
-Sine and cosine values for all positions computed once at model load. The forward pass does a table lookup instead of calling `sinf()` / `cosf()` / `powf()` 64 times per token.
-
-### 5. Flash Attention (Online Softmax)
-
-Single-pass attention with running maximum rescaling. Eliminates the `O(seq_len)` attention score buffer — critical for long contexts on memory-constrained devices.
-
-### 6. Fused Dequantize + Dot Product
-
-`vec_dot_q4_K_f32()` dequantizes and accumulates in one pass. No intermediate float buffer for the weight row. Reduces memory traffic by ~50% for matmul.
-
-### 7. Multi-threaded Matrix Multiply
-
-`matmul()` distributes output rows across threads using pthreads. Each thread processes its chunk independently with fused dot products. Scales linearly up to ~8 cores.
-
-### 8. Grammar-Constrained JSON
-
-The `--json` mode pre-analyzes every token in the vocabulary at load time (brace delta, bracket delta, quote parity). During generation, it masks logits to guarantee syntactically valid JSON — essential for tool-calling with small models.
-
-### 9. KV Cache Persistence
-
-`--cache file.kvc` saves the FP16 KV cache state after prompt processing. On the next run with the same prompt, it loads the cache and skips prefill entirely. **74% latency reduction** for repeated system prompts.
-
----
-
-## Supported Models
-
-PicoLM supports any LLaMA-architecture model in GGUF format:
-
-| Model | Parameters | GGUF Size (Q4_K_M) | RAM Needed |
-|-------|-----------|---------------------|------------|
-| **TinyLlama 1.1B** | 1.1B | 638 MB | ~45 MB |
-| **Llama 2 7B** | 7B | 4.1 GB | ~200 MB |
-| **Phi-2** | 2.7B | 1.6 GB | ~90 MB |
-
-> **Recommended for embedded:** TinyLlama 1.1B Q4_K_M — fits comfortably on devices with 256MB+ RAM.
-
-### Supported quantization formats
-
-`Q2_K` `Q3_K` `Q4_K` `Q4_0` `Q5_K` `Q6_K` `Q8_0` `F16` `F32`
-
----
-
-## File Structure
-
-```
-PicoLM/
-├── README.md              ← you are here
-├── BLOG.md                ← technical deep-dive blog post
-├── install.sh             ← one-liner Pi installer
-│
-├── picolm/                ← the inference engine (pure C)
-│   ├── picolm.c           ← CLI entry point, generation loop (273 lines)
-│   ├── model.h/c          ← GGUF parser, mmap, forward pass (146 + 833 lines)
-│   ├── tensor.h/c         ← matmul, rmsnorm, softmax, rope (44 + 298 lines)
-│   ├── quant.h/c          ← dequantization, SIMD kernels (140 + 534 lines)
-│   ├── tokenizer.h/c      ← BPE tokenizer (32 + ~200 lines)
-│   ├── sampler.h/c        ← temperature + top-p sampling (19 + ~100 lines)
-│   ├── grammar.h/c        ← JSON grammar constraints (64 + 175 lines)
-│   ├── Makefile           ← build targets for all platforms
-│   └── build.bat          ← Windows MSVC build script
-│
-└── tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf  ← model file (638 MB, not in git)
-```
-
-**Total C source: ~2,500 lines.** That's the entire inference engine — GGUF parsing, mmap, dequantization, matrix math, attention, tokenization, sampling, and grammar constraints.
-
----
-
-## How It Works
-
-### The mmap trick
-
-Traditional inference engines load the entire model into RAM. PicoLM doesn't. Instead:
-
-1. The model file is **memory-mapped** (`mmap` on Linux/macOS, `MapViewOfFile` on Windows)
-2. Weight pointers point directly into the mapped file — no copying
-3. During the forward pass, each layer's weights are accessed sequentially
-4. The OS automatically pages in the needed weights and evicts old ones
-5. `madvise(MADV_SEQUENTIAL)` hints the access pattern to the kernel
-
-**Result:** A 638MB model runs on a device with 256MB RAM. Only ~30MB of the model is in physical memory at any time.
-
-### Quantization
-
-Weights are stored in 4-bit quantized format (Q4_K_M). For TinyLlama:
-- **Original:** 1.1B parameters x 4 bytes = 4.4 GB
-- **Q4_K:** 1.1B parameters x ~0.56 bytes = 638 MB
-- **Quality loss:** Minimal — Q4_K preserves 6-bit scales per 32-weight sub-block
-
-### Grouped-Query Attention (GQA)
-
-TinyLlama uses 32 query heads but only 4 key/value heads. Each KV head is shared by 8 query heads. This reduces KV cache size by 8x compared to full multi-head attention.
-
----
-
-## Building & Testing
-
-### Prerequisites
-
-| Platform | Requirements |
-|----------|-------------|
-| **Linux/Pi** | `gcc`, `make` (install via `apt install build-essential`) |
-| **macOS** | Xcode Command Line Tools (`xcode-select --install`) |
-| **Windows** | Visual Studio Build Tools (cl.exe) |
-
-### Verify your build
-
-```bash
-# Build
-make native
-
-# Test with greedy decoding (deterministic output)
-./picolm model.gguf -p "The capital of France is" -n 20 -t 0
-# Expected: "Paris. It is the largest city in France..."
-
-# Test JSON mode
-./picolm model.gguf --json -p "Return JSON with name and age" -n 50 -t 0.3
-# Expected: valid JSON like {"name": "...", "age": ...}
-
-# Test KV cache
-./picolm model.gguf --cache test.kvc -p "Hello" -n 10 -t 0
-./picolm model.gguf --cache test.kvc -p "Hello" -n 10 -t 0
-# Second run should say "Skipping N cached prompt tokens"
-```
-
-### Memory verification
-
-PicoLM prints memory stats to stderr:
-
-```
-Memory: 1.17 MB runtime state (FP16 KV cache separate)
-```
-
-Total = runtime state + FP16 KV cache. For TinyLlama with 2048 context: ~45 MB.
-
----
-
-## FAQ
-
-**Q: Can this run Llama 2 7B?**
-A: Yes, if you have enough RAM for the KV cache (~1.4 GB for 7B with 4096 context). The model file stays on disk via mmap. On a Pi 4 with 4GB RAM, it works but is slow (~1-2 tok/s).
-
-**Q: Why not use llama.cpp?**
-A: llama.cpp is excellent but requires ~200MB+ for the runtime on small models, has complex build dependencies, and targets desktop/server use cases. PicoLM is purpose-built for embedded: 45MB RAM, 80KB binary, zero dependencies.
-
-**Q: Is the output quality good?**
-A: TinyLlama 1.1B is a small model — it handles simple tasks (Q&A, summarization, basic reasoning, JSON generation) well. It won't match GPT-4, but it runs on a $10 board with no internet. For structured output, the `--json` grammar mode guarantees valid JSON regardless of model quality.
-
-**Q: What about GPU acceleration?**
-A: On Apple Silicon, PicoLM has a native Metal backend — `make metal` then run
-with `PICOLM_GPU=1`. It's zero-dependency (raw Metal framework) and maps weights
-zero-copy into unified memory. The original $10-15 target boards have no GPU, so
-the CPU path (NEON/SSE2/AVX SIMD) remains the focus there; CUDA/HIP
-infrastructure also exists for discrete GPUs.
-
-**Q: Can I use a different model?**
-A: Any LLaMA-architecture GGUF model works. Download from [HuggingFace](https://huggingface.co/models?search=gguf) and point PicoLM at it. Recommended quantizations: Q4_K_M (best quality/size balance) or Q2_K (smallest, lower quality).
-
----
-
-## Roadmap
-
-- [x] AVX kernels for x86 (`make avx` — 8-wide float ops, ~2x vs SSE2)
-- [x] AVX2 kernels for x86 (`make avx2` — 256-bit integer ops for Q4_0 and Q6_K quantized paths)
-- [x] Metal backend for Apple Silicon (`make metal` — zero-copy, raw Metal framework, no deps)
-- [ ] AVX-512 kernels for x86 (512-bit ops for server CPUs)
-- [ ] Speculative decoding with a draft model
-- [ ] Context sliding window (infinite generation beyond max_seq_len)
-- [ ] Weight pruning for further memory reduction
-- [ ] Continuous batching for server mode
-- [ ] Mistral / Phi architecture support
-
----
-
-## Technical Blog
-
-For a detailed writeup of the optimization journey (with code snippets and war stories), see [**BLOG.md**](BLOG.md).
-
----
+## Past Releases
+
+### v1.0-beta2
+
+    KV cache v4 with token sequences and streamed SSM I/O, Q2_K/Q6_K/Q3_K
+    SIMD acceleration, Metal SSM kernels, Walsh-Hadamard KV cache rotation,
+    and embedded VNC visualization server.
+
+    132 commits since beta1.
+
+    KV Cache v4: Persistence with Token Sequences and SSM
+      Slot files now embed the token sequence alongside KV cache data,
+        enabling full state save/restore without re-tokenizing the prompt
+      Streamed SSM I/O: SSM state checkpoints saved/restored within slot files
+      Server-side slot management with per-request isolation
+      KV layer mapping for mixed SSM/attention models (ordinal tracking)
+      kvcache_load() returns malloc'd token array for caller to free
+
+    Quantization: Q2_K, Q6_K, Q3_K SIMD Fast Paths
+      Q2_K: vec_dot_q2_K_q8_K with NEON SIMD (vmull_s8 + vpaddlq_s16)
+        RPi 4: 2-5x speedup on cached layers, 200ms -> 109-170ms/layer
+      Q6_K: vec_dot_q6_K_q8_K with AVX2/AVX/AVX-512 SIMD paths
+        27B gen: 2.3 tok/s (was 0.3, now ~90% of Q8_0)
+      Q3_K: vec_dot_q3_K_q8_K ported from llama.cpp (AVX2/AVX/scalar)
+        Q3_K_S 27B gen: 2.7 tok/s (was 0.6, 4.5x speedup)
+      Q5_K: vec_dot_q5_K_q8_K added, scale field bug fixed (dm vs d)
+      Q4_0: GGUF nibble layout corrected (first/second-half pairing)
+      Q4_0_8_8: parallelized batched matmul, closing 2x prefill gap on AVX2
+
+    KV Cache: Walsh-Hadamard Rotation and Layout Refactor
+      Walsh-Hadamard transform before quantization (-khad/-vhad flags)
+      Reduces outlier impact on Q4_0 block scales, dot products preserved
+      Q8_0 and Q4_0 KV cache quantization fixed (-ctk/-ctv options)
+      GQA full-row KV cache layout for quantized types
+
+    SSM: Correctness, Speed, GPU Support
+      Batched SSM prefill is now the default (was --ssm-batched)
+      --ssm-chunk-size N: configurable chunk size (was compile-time CS=64)
+      AVX2, AVX1/FMA, and NEON SSM kernels for per-token + chunked recurrence
+      Critical fix: veff/sq transpose bug in all SIMD SSM kernels
+      Critical fix: dot product double-count in SSM kernels
+      Qwen tokenizer fix: symbol runs kept together (backticks)
+
+    Metal Backend: SSM Kernels and Performance
+      SSM vecdot (alpha/beta) + DeltaNet recurrence kernels on GPU
+      Multi-output GEMV for Q4_K/Q6_K matmuls
+      FFN fused into single GPU command buffer
+      GPU profiling (PICOLM_GPU_PROFILE=1)
+
+    CUDA/HIP: Infrastructure and Fixes
+      Q8_0xQ8_0 GPU matmul matching CPU path exactly
+      F16/BF16 GPU support, Q4_K device dequant
+      ROCm: auto-detect path/arch, guard WMMA for < 6.4
+      Windows CUDA build target (make hunger)
+
+    Server: Features and Critical Bug Fixes
+      Stop word support on /v1/completions (two-phase: full match + partial prefix)
+      Prefill cancellation on client disconnect (all endpoints, all layer types)
+      KV cache corruption when prompt fully cached (2nd identical request)
+      SSE [DONE] unterminated message, dangling model_name pointer (UAF)
+      Final timing chunk missing content field (llama.vim crash)
+      max_tokens accepted as alias for n_predict on /completion
+
+    Build & Platform
+      Auto-detect SIMD level, enable AVX2/AVX512 by default
+      Makefile SIMD detection fixed for mingw
+      -mf16c conditional on actual CPU F16C support
+      SSSE3, AVX1 compatibility fixes (sumf declaration, fmadd fusion)
+
+    VNC Visualization Server
+      Live activation heatmap via embedded RFB 3.3 VNC protocol
+      X axis = token index (time), Y axis = layer index
+      Per-layer bucket-RMS of residual stream, normalized with adaptive color
+      Dynamic layer skipping via mouse click, drag-and-drop layer permutation
+      Wired into server mode; zero-cost when no client connected
+
+    Tokenizer & Correctness
+      Unescape all whitespace markers (U+2581, U+0100) in tokenizer_decode()
+      V-cache OOB in tiled attention (GQA ratio 8, 513+ prompt tokens)
+      fp16 SIMD tail overflow in tiled attention (ASan-catchable)
+      Q2_K NEON double-consumption segfault fix
+
+    Developer Tooling
+      --benchmark mode: per-layer timing, ETA, and I/O stats
+      --list-tensors works before model path, Q1_0/Q2_0 type names fixed
+
+    Incoming Soon
+      GBNF grammar support: full PEG parser replacing the JSON-only grammar.
+        Arbitrary .gbnf files via --grammar flag, Unicode character classes,
+        server-side grammar constraints on /v1/completions. ~1000-1500 lines.
+      RoPE scaling: linear, YaRN, and longrope methods. Pre-computed cos/sin
+        tables modified per the GGUF rope.scaling metadata (freq_scale,
+        ext_factor, attn_factor, beta_fast/slow). Enables extended context.
+      Gemma 3 Next (gemma3n): AltUp (alternate embeddings) and Laurel
+        (low-rank attention enrichment) architecture. Per-layer token
+        embeddings, sliding window attention patterns, Q/K norm, FFN post-norm.
+      Refactored GPU acceleration
+
+### v1.0-beta1
+
+    SSM state checkpointing for Mamba-based models, Qwen3.6 special token
+    handling, and the /slots monitoring endpoint.
+
+    Ten commits since alpha2, adding support for state checkpointing in hybrid
+    SSM/Transformer models, fixing Qwen3.6 tokenizer special token visibility,
+    and porting to big-endian and legacy platforms.
+
+    SSM State Checkpointing (Qwen3.5/3.6, Mamba models)
+      Model-level API: model_ssm_snapshot_size(), model_ssm_state_save(),
+        model_ssm_state_restore(), model_ssm_state_reset() in model.h/model.c.
+        Captures and restores the full SSM state vector at any KV cache position.
+      Server-side checkpoint management:
+        Interval-based checkpoints during prefill (--checkpoint-every-nt, default 256)
+        Interval-based checkpoints during generation (--checkpoint-every-nt-gen, default 64)
+        Tail checkpoint (--checkpoint-tail-offset, default 5)
+        End-of-prompt checkpoint (always, when enabled)
+        Variance-based eviction when at capacity (minimizes gap variance)
+      Integrated into prefix-match logic: on partial KV cache reuse, restores
+        the closest SSM checkpoint and reprocesses the delta tokens. Without
+        this, SSM models produce garbled output after cache reuse.
+      CLI options: --checkpoint-max, --checkpoint-every-nt, --checkpoint-every-nt-gen,
+        --checkpoint-tail-offset. Max defaults to 0 (disabled).
+      Snapshot size: ~50 MB for Qwen3.5-4B, proportional to hidden_dim * n_ssm_states.
+
+    Tokenizer: Special Token Visibility
+      qwen_tokenize_decode2(): add add_special parameter. By default, BOS and
+        EOS tokens produce empty output (hidden), but all other control and
+        user-defined tokens (thinking tags, tool_call tags, FIM tokens, push/pop
+        markers, etc.) are now printed with their raw vocab bytes. This allows
+        client harnesses to detect and parse model-generated tag structure.
+      Stop word matching fix: streaming /completion responses no longer leak
+        the stop token's decoded content in the final SSE chunk when a stop
+        word is matched.
+
+    Server Endpoints
+      GET /slots and GET /v1/slots: llama.cpp-compatible slot state endpoint.
+        Returns a JSON array with one slot object (id=0) containing n_ctx,
+        is_processing, params (defaults), and next_token state.
+
+    Debugging
+      PICOLM_DBG_TOKEN=1 env var: prints token ID and decoded text for every
+        generated token to stderr. Useful for diagnosing tokenizer issues.
+
+    Porting & Build
+      Big-endian PPC support for GGUF model loading (byte-swap headers,
+        tensor shapes, and GGUF scalar values)
+      Altivec SIMD: PPC G4 support for rmsnorm and F16/F32 byte swap
+      Mac OS X 10.6 Snow Leopard (Core 2 Duo, GCC 4.2.1) port
+      GCC 15: eliminate all compilation warnings (AVX-512, fread, misc)
+
+### v1.0-alpha2
+
+    Q1_0 and Q2_0 extreme quantization support with full SIMD acceleration.
+
+    Nine commits since alpha1, focusing on making the lowest-precision quant types
+    (1-bit and 2-bit per weight) correct and fast across all supported architectures.
+
+    Quantization: Q1_0 and Q2_0 (GGUF types 41/42)
+      Q1_0 (128 values per 18-byte block, 1-bit sign + FP16 scale):
+        AVX-512: VNNI via Q8_0 delegation
+        AVX2: bytes_from_bits_32 bit expansion + maddubs_epi16 int8 MAC
+        AVX/SSSE3: 128-bit pshufb bit expansion + maddubs
+        NEON: table-based sign mask expansion + vpaddlq_s8
+        Scalar: sign-flip accumulation
+      Q2_0 (128 values per 34-byte block, 2-bit values + FP16 scale):
+        AVX-512-VNNI: dpbusd unpack (2x gen speedup vs scalar)
+        AVX2/AVX/SSSE3: scalar fallback (VNNI required for SIMD)
+        NEON: vqtbl1q_u8 unpack + vmull_s8 wide multiply
+        Scalar: shift-and-mask 2-bit unpack
+      matmul() and matmul_dual_batch(): Q8_0 activation pre-quantization,
+        matching the approach already used for Q4_0/Q4_K/Q8_0. This enables the
+        int8 MAC kernels instead of scalar dequantize-per-element.
+      vec_dot_q*_f32: inline Q8_0 delegation allows SSM alpha/beta paths to
+        benefit from SIMD (AVX2 for Q1_0, VNNI for Q2_0).
+      Benchmark (Qwen3.6-27B, AVX-512 host):
+        Q2_0: 1.1 -> 2.2 tok/s gen (2x), 0.5 -> 1.2 tok/s prefill
+        Q1_0: 2.0 -> 2.5 tok/s prefill, 1.8 -> 2.2 tok/s gen
+        Memory: 230 MB (Q2_0) vs 3.1 GB (Q8_0)
+
+    Bugfixes
+      Q1_0 bit expansion: fixed AVX and SSSE3 paths that incorrectly used
+        _mm_shufflelo_epi16 to extract bytes 2-3 of a 32-bit sign value
+        (word indices 2-3 were always zero, corrupting sign masks for bits 16-31).
+
+    CLI & Build
+      Tokenization timing prints around tokenizer load and encode stages.
+      PICOLM_EXIT_AFTER_TOKENIZE env var for benchmarking without forward pass.
+      Windows: include <time.h> in _WIN32 block (fixes missing clock_t),
+        add -lws2_32 to Makefile LDFLAGS (fixes server mode with MinGW/GCC).
+
+### v1.0-alpha1
+
+    From proof-of-concept to production inference engine. 143 commits, zero new
+    dependencies.
+
+    The original PicoLM was a clever demonstration: mmap a GGUF, stream one layer
+    at a time, ~45MB RAM. It was missing everything needed for real-world use.
+    This release adds the missing pieces across 143 commits, transforming it from
+    a demo into a serious, multi-architecture inference engine that supports models
+    up to 70B parameters, multiple model families (Llama, Qwen2/3, Qwen3.5/3.6 SSM),
+    a full HTTP server, and SIMD acceleration on x86 and ARM.
+
+    Quantization Support (was scalar-only, now fully accelerated)
+      Q8_0:      AVX-512 (VNNI), AVX2, SSE4.1, NEON - pre-converted delta path, int8 MAC
+      Q4_K:      AVX2, AVX, SSE2, NEON - multi-block scales, AVX-512 VNNI
+      Q4_0:      AVX2, AVX, SSE2, NEON - activation quantization + int8 MAC
+      Q4_1:      Scalar - full dequantize + vec_dot support
+      Q4_0_8_8:  AVX2 - interleaved 8-row batched format
+      Q4_0_4_4:  ARM DotProd - interleaved 4-row batched format (ARMv8.2+ SDOT)
+      Q2_K-Q8_K: Scalar - K-quants via generic dequantize + vec_dot
+      Q1_0/Q2_0: AVX2 (Q1_0), Scalar (Q2_0) - extreme quantization (1-2 bits/weight)
+      F16/BF16:  AVX-512/AVX/NEON - full precision paths
+      64KB FP16 lookup table replaces arithmetic fp16->fp32, ~4x faster on non-F16C
+
+    Model Architecture Support
+      Llama 1/2/3 (including all Qwen2 derivatives)
+      Qwen3 (non-uniform head_dim, pairwise RoPE)
+      Qwen3.5/3.6 (SSM/Mamba hybrid, interleaved Q+gate, v-head reordering,
+        Gemma-style RMSNorm, rope_dim, MTP detection)
+      Up to 70B parameters tested (miq-70b, Mistral-derived Llama architecture)
+      MAX_LAYERS increased from 64 to 128
+
+    SIMD & Performance
+      AVX-512: VNNI integer MAC, fp16x16>fp32 conversion, vec_dot, rmsnorm, RoPE,
+        attention Q*K and V-accumulation
+      AVX2: Full Q8_0/Q4_K/Q4_0/Q4_0_8_8/Q1_0 int8 MAC paths
+      AVX/SSE2: Q8_0/Q4_K paths, attention FMA
+      ARM NEON: RoPE, FP16 HW conversion, Q8_0 int8 MAC, attention Q*K and V-accumulation
+      ARM DotProd: Q4_0_4_4 interleaved format (vdotq_laneq_s32, ARMv8.2+)
+      Persistent thread pool (generation-counter barrier, zero thread churn)
+      Physical core count auto-detection (avoids hyperthreading overhead)
+      Tiled/blocked attention for prefill (online softmax, F16 KV cache)
+      Batched GEMV for prefill (activation quantization, per-token parallelization)
+      GQA grouped attention (kv_mul heads share one KV scan)
+
+    HTTP Server (OpenAI API Compatible)
+      /v1/completions, /v1/chat/completions (OpenAI-compatible)
+      /completion (llama.cpp-compatible, stop words, grammar, timings)
+      /v1/models, /props, /health
+      /tokenize, /detokenize
+      Streaming responses with chunked transfer encoding
+      Persistent model loading (model stays in memory across requests)
+      KV cache reuse with prompt prefix matching (skip prefill on overlapping prompts)
+        - SSM models: KV cache reuse supported but rewinding not yet (requires checkpointing)
+      Client disconnect detection (abort prefill/generation on disconnect)
+      --daemon mode, --prefault for deterministic prefill timing
+      --mem option to mlock() layer weights in RAM
+
+    Platform & Compatibility
+      Linux: Full support, AVX-512/VNNI, ARM NEON, RISC-V
+      Windows: SRWLOCK+CONDITION_VARIABLE thread pool, VirtualLock privilege acquisition,
+        MinGW/ucrt64 support, --mem with working set quota
+      Quantized KV cache: F16 (default), Q8_0 (53% of F16 memory), Q4_0 (34% of F16 memory)
+
+    What's Not Here Yet
+      GPU backend (HIP/CUDA infrastructure exists, not functional)
+      SSM KV cache rewinding (checkpointing for Qwen3.5/3.6 mid-prompt truncation)
+      Full batched GEMM kernels for AVX2 (currently uses GEMV)
+
+## Inference Supported By
+
+Hunger and A'rpi/MPlayer
+
+## Patrons
+
+a Lajos
 
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
-
----
-
-<p align="center">
-  <strong>PicoLM</strong> — because intelligence shouldn't require a data center.
-</p>
