@@ -16,7 +16,7 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
         case GGUF_TYPE_Q4_0: bytes_per_block = GPU_BLOCK_Q4_0_SIZE; break;  /* 18 */
         case GGUF_TYPE_Q8_0: bytes_per_block = GPU_BLOCK_Q8_0_SIZE; break;  /* 34 */
         case 10:             bytes_per_block = GPU_BLOCK_Q2_K_SIZE; break;  /* Q2_K: 84 */
-        case 11:             bytes_per_block = 110; break;                   /* Q3_K: 110 */
+        case 11:             bytes_per_block = GPU_BLOCK_Q3_K_SIZE; break;   /* Q3_K: 110 */
         case GGUF_TYPE_Q4_K: bytes_per_block = GPU_BLOCK_Q4_K_SIZE; break;  /* 144 */
         case 13:             bytes_per_block = GPU_BLOCK_Q5_K_SIZE; break;  /* Q5_K: 176 */
         case 14:             bytes_per_block = GPU_BLOCK_Q6_K_SIZE; break;  /* Q6_K: 210 */
@@ -1392,6 +1392,168 @@ picolm_q4_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
     }
 }
 
+/* Q3_K x Q8_0 IMMA kernel.
+ * Q3_K: 256 values in 110 bytes. block_q3_K layout:
+ *   hmask[32] (0..31) + qs[64] (32..95) + scales[12] (96..107) + d[2] (108..109).
+ *   16 sub-blocks of 16 values each. Each sub-block has a 6-bit scale.
+ *   Value: 2-bit qs + 1-bit hmask -> 3-bit signed [-4..3].
+ *   Dequant: val = d * (scale_i - 32) * q3_val.
+ *
+ * IMMA m16n8k32: two calls per K-step (like Q6_K).
+ *   Call 1: b0=real(K[0..15]), b1=0
+ *   Call 2: b0=0, b1=real(K[16..31])
+ * Grid: [(O+7)/8, (S+15)/16], Block: 32 threads.
+ * Activation is pre-quantized to Q8_0 (int8 + per-32-element scale). */
+__global__ void
+picolm_q3_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
+                            const void *weights, int S, int I, int O,
+                            int row_bytes, int y_stride) {
+    int gid = gpuThreadIdx_x / 4;
+    int tid = gpuThreadIdx_x % 4;
+    int tile_o = gpuBlockIdx_x * 8;
+    int tile_s = gpuBlockIdx_y * 16;
+    int ys = y_stride > 0 ? y_stride : O;
+    int n_blocks = I / 32;
+    const uint8_t *w = (const uint8_t *)weights;
+    float sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int kb = 0; kb < n_blocks; kb++) {
+        /* Q3_K: 256 values = 16 sub-blocks of 16. Each IMMA step covers
+         * 32 K-values = 2 sub-blocks of 16. Two IMMA calls per step:
+         * call 1: b0=real(K[0..15]), b1=0; call 2: b0=0, b1=real(K[16..31]). */
+        int q3_block = kb / 8;           /* which 256-value block */
+        int g = (kb % 8) * 2;           /* even sub-block: 0,2,4,...,14 */
+
+        int wc = tile_o + gid;
+        size_t wrow_base = (size_t)wc * row_bytes + q3_block * GPU_BLOCK_Q3_K_SIZE;
+        const uint8_t *wb = w + wrow_base;
+
+        /* Super-scale d (fp16 at offset 108) */
+        float wd = gpu_fp16_to_fp32(wb[108] | ((uint16_t)wb[109] << 8));
+
+        /* Unpack 16 scales from 12 bytes (offset 96). Same bit-interleave as CPU. */
+        uint32_t aux[4];
+        memcpy(aux, wb + 96, 12);
+        uint32_t tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & 0x0F0F0F0F) | (((tmp >> 4) & 0x03030303) << 4);
+        aux[3] = ((aux[1] >> 4) & 0x0F0F0F0F) | (((tmp >> 6) & 0x03030303) << 4);
+        aux[0] = (aux[0] & 0x0F0F0F0F) | (((tmp >> 0) & 0x03030303) << 4);
+        aux[1] = (aux[1] & 0x0F0F0F0F) | (((tmp >> 2) & 0x03030303) << 4);
+        const int8_t *scales = (const int8_t *)aux;
+
+        /* Q3_K layout: 2 chunks of 128 values. Each chunk: 8 sub-blocks of 16.
+         * Each sub-block: 16 qs bytes (shared across groups via bit shift),
+         * 16 hmask bytes (shared across groups via bit selection).
+         * g -> chunk (0..1), group (0..3), sub (0..1).
+         * qs bytes for sub: [chunk*32 + sub*16 .. chunk*32 + sub*16 + 15], shift = group*2.
+         * hm bytes for sub: [chunk*16 + sub*16 .. chunk*16 + sub*16 + 15], bit = 1<<group. */
+        int chunk = g / 8;
+        int group = (g % 8) / 2;  /* 0..3 */
+        int sub = g % 2;          /* 0 or 1 */
+
+        int bit_shift = group * 2;    /* qs bit shift: 0, 2, 4, 6 */
+        int hbit = 1 << group;        /* hmask bit: 1, 2, 4, or 8 */
+
+        const uint8_t *qs_base = wb + 32 + chunk * 32 + sub * 16;
+        const uint8_t *hm_base = wb + chunk * 16 + sub * 16;
+
+        float wds = wd * (float)(scales[g] - 32);
+
+        /* A: activation fragments */
+        int a0, a1, a2, a3;
+        {
+            int c0 = tid * 4;
+            int c2 = c0 + 16;
+            int src0 = (int)(tile_s + gid) * I + kb * 32 + c0;
+            int src1 = (int)(tile_s + gid + 8) * I + kb * 32 + c0;
+            int src2 = (int)(tile_s + gid) * I + kb * 32 + c2;
+            int src3 = (int)(tile_s + gid + 8) * I + kb * 32 + c2;
+            int32_t *p = (int32_t *)(const int8_t *)(&xq[src0]); a0 = p[0];
+            p = (int32_t *)(const int8_t *)(&xq[src1]); a1 = p[0];
+            p = (int32_t *)(const int8_t *)(&xq[src2]); a2 = p[0];
+            p = (int32_t *)(const int8_t *)(&xq[src3]); a3 = p[0];
+        }
+
+        /* B: unpack Q3_K 3-bit values to int8, 4 per int32.
+         * qs: 1 byte per value, 4 values packed as 2-bit each. Thread tid processes
+         * elements tid*4..tid*4+3 within the sub-block.
+         * hmask: 1 byte per value, extract bit corresponding to `group`. */
+
+        int8_t qs4[4];
+        for (int e = 0; e < 4; e++) {
+            qs4[e] = (int8_t)((qs_base[tid * 4 + e] >> bit_shift) & 3);
+        }
+
+        uint8_t hm_bit[4];
+        for (int e = 0; e < 4; e++) {
+            hm_bit[e] = (hm_base[tid * 4 + e] & hbit) ? 1 : 0;
+        }
+
+        /* Combine: val = qs - (hmask_bit ? 0 : 4) -> [-4..3] */
+        int8_t q3_4[4];
+        for (int e = 0; e < 4; e++) {
+            q3_4[e] = qs4[e] - (hm_bit[e] ? 0 : 4);
+        }
+        int b0;
+        memcpy(&b0, q3_4, 4);
+
+        /* IMMA call 1: b0 real, b1=0 */
+        int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+        int d0b = 0, d1b = 0, d2b = 0, d3b = 0;
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+        asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+            : "+r"(d0), "+r"(d1), "+r"(d2), "+r"(d3)
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(0));
+#endif
+
+        /* Paired sub-block g+1: same chunk, same group, toggled sub. */
+        int sub2 = 1 - sub;
+        const uint8_t *qs_base2 = wb + 32 + chunk * 32 + sub2 * 16;
+        const uint8_t *hm_base2 = wb + chunk * 16 + sub2 * 16;
+
+        int b1;
+        {
+            int8_t q3_4_2[4];
+            for (int e = 0; e < 4; e++) {
+                int8_t qs_val = (int8_t)((qs_base2[tid * 4 + e] >> bit_shift) & 3);
+                uint8_t hm_val = (hm_base2[tid * 4 + e] & hbit) ? 1 : 0;
+                q3_4_2[e] = qs_val - (hm_val ? 0 : 4);
+            }
+            memcpy(&b1, q3_4_2, 4);
+        }
+
+        float wds2 = wd * (float)(scales[g + 1] - 32);
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+        asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+            : "+r"(d0b), "+r"(d1b), "+r"(d2b), "+r"(d3b)
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(0), "r"(b1));
+#endif
+
+        /* Epilogue: accumulate both halves with their respective scales */
+        float dx0 = xd[(size_t)(tile_s + gid) * n_blocks + kb];
+        float dx1 = xd[(size_t)(tile_s + gid + 8) * n_blocks + kb];
+
+        sum[0] += wds * dx0 * (float)d0 + wds2 * dx0 * (float)d0b;
+        sum[1] += wds * dx0 * (float)d1 + wds2 * dx0 * (float)d1b;
+        sum[2] += wds * dx1 * (float)d2 + wds2 * dx1 * (float)d2b;
+        sum[3] += wds * dx1 * (float)d3 + wds2 * dx1 * (float)d3b;
+    }
+    for (int f = 0; f < 4; f++) {
+        int row = (f < 2) ? gid : gid + 8;
+        int col = tid * 2 + (f % 2);
+        int gr = tile_s + row;
+        int gc = tile_o + col;
+        if (gr < S && gc < O)
+            y[(size_t)gr * ys + (size_t)gc] = sum[f];
+    }
+}
+
 /* lines 430-437 from backend_gpu_kernels.cuh */
 __global__ void
 picolm_silu_mul(float *gate, const float *up, size_t n) {
@@ -2002,7 +2164,7 @@ picolm_gpu_attention_prefill_kernel(
  */
 
 #define FA2_TILE_Q 16
-#define FA2_TILE_K 16
+#define FA2_TILE_K 32
 
 __global__ void
 picolm_ssm_vecdot_kernel(float *out,

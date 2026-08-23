@@ -494,7 +494,7 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
         case GGUF_TYPE_Q4_0: bytes_per_block = GPU_BLOCK_Q4_0_SIZE; break;  /* 18 */
         case GGUF_TYPE_Q8_0: bytes_per_block = GPU_BLOCK_Q8_0_SIZE; break;  /* 34 */
         case 10:             bytes_per_block = GPU_BLOCK_Q2_K_SIZE; break;  /* Q2_K: 84 */
-        case 11:             bytes_per_block = 110; break;                   /* Q3_K: 110 */
+        case 11:             bytes_per_block = GPU_BLOCK_Q3_K_SIZE; break;   /* Q3_K: 110 */
         case GGUF_TYPE_Q4_K: bytes_per_block = GPU_BLOCK_Q4_K_SIZE; break;  /* 144 */
         case 13:             bytes_per_block = GPU_BLOCK_Q5_K_SIZE; break;  /* Q5_K: 176 */
         case 14:             bytes_per_block = GPU_BLOCK_Q6_K_SIZE; break;  /* Q6_K: 210 */
@@ -2708,7 +2708,7 @@ static int gguf_block_size(gguf_type_t qtype) {
     case 2:  return 18;   /* Q4_0: 18 bytes per 32 values */
     case 8:  return GPU_BLOCK_Q8_0_SIZE; /* Q8_0: 34 bytes per 32 values */
     case 10: return 84;    /* Q2_K: 84 bytes per 256 values */
-    case 11: return 110;   /* Q3_K: 110 bytes per 256 values */
+    case 11: return GPU_BLOCK_Q3_K_SIZE;  /* Q3_K: 110 bytes per 256 values */
     case 12: return GPU_BLOCK_Q4_K_SIZE;  /* Q4_K: 144 bytes per 256 values */
     case 13: return GPU_BLOCK_Q5_K_SIZE;  /* Q5_K: 176 bytes per 256 values */
     case 14: return GPU_BLOCK_Q6_K_SIZE;  /* Q6_K: 210 bytes per 256 values */
