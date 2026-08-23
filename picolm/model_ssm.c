@@ -4318,11 +4318,11 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
 #ifdef PICOLM_CUDA
     cudaProfilerStart();
 #endif
-    /* Diagnostic: print GPU memory state at prefill entry */
+    /* Diagnostic: print GPU memory state at prefill entry (commented out to reduce benchmark noise)
     { size_t fb=0,tb=0;
       if(picolm_gpu_mem_info(m->gpu.device, &fb, &tb))
         fprintf(stderr,"[GPU] prefill entry: n_tokens=%d, gpu_free=%.1f MB, gpu_total=%.1f MB\n",
-            n_tokens, fb/(1024.0*1024), tb/(1024.0*1024)); }
+            n_tokens, fb/(1024.0*1024), tb/(1024.0*1024)); } */
 #endif
     model_config_t *c = &m->config;
     model_weights_t *w = &m->weights;
