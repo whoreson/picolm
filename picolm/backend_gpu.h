@@ -63,6 +63,23 @@ int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t,
 int picolm_gpu_matmul_dev_strided(picolm_gpu_tensor_t *t, float *y_dev,
                                    const float *x_dev, int S, int device, int x_stride, int y_stride);
 
+/* Fused QKV matmul: quantize activation once, run Q+K+V IMMA matmuls.
+ * bq = tq @ x_dev, bk = tk @ x_dev, bv = tv @ x_dev
+ * All three tensors must share the same device and input dimension I.
+ * Returns 1 on success, 0 on failure (falls back to caller using 3x matmul_dev). */
+int picolm_gpu_matmul_dev_qkv(picolm_gpu_tensor_t *tq, picolm_gpu_tensor_t *tk, picolm_gpu_tensor_t *tv,
+                               float *bq, float *bk, float *bv,
+                               const float *x_dev, int S, int device,
+                               int y_stride_q, int y_stride_kv, int x_stride);
+
+/* Fused gate+up matmul: quantize activation once, run gate+up IMMA matmuls.
+ * bgate = tg @ x_dev, bup = tu @ x_dev
+ * Returns 1 on success, 0 on failure. */
+int picolm_gpu_matmul_dev_gu(picolm_gpu_tensor_t *tg, picolm_gpu_tensor_t *tu,
+                              float *bgate, float *bup,
+                              const float *x_dev, int S, int device,
+                              int y_stride, int x_stride);
+
 /* Fused expert-style MLP: y = down(silu(gate(x)) * up(x))
  * All three tensors must be resident on the same device.
  * Activations cross PCIe once in each direction.

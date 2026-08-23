@@ -4103,41 +4103,52 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
                                     (float *)gw->attn_norm_dev[l],
                                     dim, c->rms_norm_eps, gpu_dev);
 
-            /* B. Q projection: pipe_q = attn_q @ pipe_xb
-             * For SSM models this writes q_full_dim = 2*q_dim
-             * (interleaved [Q0,Gate0,Q1,Gate1,...]). */
-            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
-                                   pipe_q, pipe_xb, 1, gpu_dev, 0, 0);
+            /* B/D. Q+K+V projections: quantize pipe_xb once, run 3x IMMA.
+             * For SSM models: Q produces interleaved Q+gate, de-interleave
+             * happens before K+V, so keep Q separate and fuse K+V.
+             * For non-SSM models: fuse all three Q+K+V. */
+            if (!c->has_ssm) {
+                /* Non-SSM: fused Q+K+V (Phase 1) */
+                if (!picolm_gpu_matmul_dev_qkv(
+                        (picolm_gpu_tensor_t *)gl->attn_q,
+                        (picolm_gpu_tensor_t *)gl->attn_k,
+                        (picolm_gpu_tensor_t *)gl->attn_v,
+                        pipe_q, pipe_k, pipe_v,
+                        pipe_xb, 1, gpu_dev,
+                        0, 0, 0)) {
+                    /* Fallback */
+                    static int dqkv_fb=1; if(dqkv_fb){dqkv_fb=0; fprintf(stderr,"INFO: decode QKV matmul fallback (3x separate quantize+IMMA)\n");}
+                    picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
+                        pipe_q, pipe_xb, 1, gpu_dev, 0, 0);
+                    picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_k,
+                        pipe_k, pipe_xb, 1, gpu_dev, 0, 0);
+                    picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_v,
+                        pipe_v, pipe_xb, 1, gpu_dev, 0, 0);
+                }
+            } else {
+                /* SSM: Q separate (interleaved Q+gate), fuse K+V */
+                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
+                    pipe_q, pipe_xb, 1, gpu_dev, 0, 0);
 
-            /* B1. For SSM models: de-interleave Q+gate from pipe_q.
-             * After this, pipe_q holds compacted Q[q_dim], pipe_gate
-             * holds gate[q_dim]. For non-SSM models, skip. */
-            if (c->has_ssm) {
-                /* De-interleave Q+gate. Cannot write Q in-place to pipe_q:
-                 * thread h writes pipe_q[h*head_dim] which overlaps with
-                 * thread h+1's read from pipe_q[(h+1)*2*head_dim].
-                 * Use pipe_attn_out as temp scratch for raw Q+gate data.
-                 * pipe_attn_out is sized for q_pipeline_dim (>= q_full_dim).
-                 * pipe_ffn_norm is only dim-sized and would overflow.
-                 *
-                 * Use async D2D copy on ctx->stream - the Q projection matmul
-                 * is already on ctx->stream, and stream ordering ensures the
-                 * D2D copy and subsequent deinterleave kernel see the data. */
+                /* B1. De-interleave Q+gate from pipe_q */
                 picolm_gpu_memcpy_async(pipe_attn_out, pipe_q,
-                                   (size_t)n_heads * 2 * head_dim * sizeof(float),
-                                   0, gpu_dev);
+                    (size_t)n_heads * 2 * head_dim * sizeof(float), 0, gpu_dev);
                 picolm_gpu_qg_deinterleave_dev(pipe_attn_out, pipe_q,
-                                                pipe_gate, n_heads, head_dim,
-                                                gpu_dev);
+                    pipe_gate, n_heads, head_dim, gpu_dev);
+
+                /* C+D. Fused K+V (Phase 1) */
+                if (!picolm_gpu_matmul_dev_gu(
+                        (picolm_gpu_tensor_t *)gl->attn_k,
+                        (picolm_gpu_tensor_t *)gl->attn_v,
+                        pipe_k, pipe_v,
+                        pipe_xb, 1, gpu_dev, 0, 0)) {
+                    static int dkv_fb=1; if(dkv_fb){dkv_fb=0; fprintf(stderr,"INFO: decode K+V matmul fallback (2x separate quantize+IMMA)\n");}
+                    picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_k,
+                        pipe_k, pipe_xb, 1, gpu_dev, 0, 0);
+                    picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_v,
+                        pipe_v, pipe_xb, 1, gpu_dev, 0, 0);
+                }
             }
-
-            /* C. K projection: pipe_k = attn_k @ pipe_xb */
-            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_k,
-                                   pipe_k, pipe_xb, 1, gpu_dev, 0, 0);
-
-            /* D. V projection: pipe_v = attn_v @ pipe_xb */
-            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_v,
-                                   pipe_v, pipe_xb, 1, gpu_dev, 0, 0);
 
             /* E. QK-norm (Qwen3): per-head RMSNorm on Q and K.
              * pipe_q is [n_heads][head_dim], weight is [head_dim].
@@ -4268,13 +4279,19 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
                                     (float *)gw->post_attn_norm_dev[l],
                                     dim, c->rms_norm_eps, gpu_dev);
 
-            /* L. Gate: pipe_gate = ffn_gate @ pipe_ffn_norm */
-            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_gate,
-                                   pipe_gate, pipe_ffn_norm, 1, gpu_dev, 0, 0);
-
-            /* M. Up: pipe_up = ffn_up @ pipe_ffn_norm */
-            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_up,
-                                   pipe_up, pipe_ffn_norm, 1, gpu_dev, 0, 0);
+            /* L+M. Fused gate+up (Phase 2): quantize pipe_ffn_norm once, run 2x IMMA */
+            if (!picolm_gpu_matmul_dev_gu(
+                    (picolm_gpu_tensor_t *)gl->ffn_gate,
+                    (picolm_gpu_tensor_t *)gl->ffn_up,
+                    pipe_gate, pipe_up,
+                    pipe_ffn_norm, 1, gpu_dev, 0, 0)) {
+                /* Fallback */
+                static int dgu_fb=1; if(dgu_fb){dgu_fb=0; fprintf(stderr,"INFO: decode gate+up matmul fallback (2x separate quantize+IMMA)\n");}
+                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_gate,
+                    pipe_gate, pipe_ffn_norm, 1, gpu_dev, 0, 0);
+                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_up,
+                    pipe_up, pipe_ffn_norm, 1, gpu_dev, 0, 0);
+            }
 
             /* N. SiLU-mul: pipe_gate = silu(pipe_gate) * pipe_up (in-place on gate) */
             picolm_gpu_silu_mul_dev(pipe_gate, pipe_up, n_ffn, gpu_dev);
@@ -4489,51 +4506,56 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
         }
 #endif
 
-        /* B. Q projection: bq = attn_q @ bxb (S=n_tokens)
-         * For SSM models this writes q_full_dim = 2*q_dim per token. */
-        picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
-                               bq, bxb, n_tokens, gpu_dev, q_full_dim, xb_stride);
+        /* B/D. Q+K+V projections: quantize bxb once, run 3x IMMA matmuls.
+         * For SSM models: Q produces interleaved Q+gate (q_full_dim=2*q_dim)
+         * which must be de-interleaved before K+V, so we keep Q separate and
+         * fuse only K+V. For non-SSM models: fuse all three Q+K+V. */
+        if (!c->has_ssm) {
+            /* Non-SSM: fused Q+K+V (Phase 1) */
+            if (!picolm_gpu_matmul_dev_qkv(
+                    (picolm_gpu_tensor_t *)gl->attn_q,
+                    (picolm_gpu_tensor_t *)gl->attn_k,
+                    (picolm_gpu_tensor_t *)gl->attn_v,
+                    bq, bk, bv,
+                    bxb, n_tokens, gpu_dev,
+                    q_full_dim, n_kv_heads*head_dim, xb_stride)) {
+                static int qkv_fb=1; if(qkv_fb){qkv_fb=0; fprintf(stderr,"INFO: QKV matmul fallback (3x separate quantize+IMMA, S=%d)\n",n_tokens);}
+                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
+                    bq, bxb, n_tokens, gpu_dev, q_full_dim, xb_stride);
+                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_k,
+                    bk, bxb, n_tokens, gpu_dev, n_kv_heads*head_dim, xb_stride);
+                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_v,
+                    bv, bxb, n_tokens, gpu_dev, n_kv_heads*head_dim, xb_stride);
+            }
+        } else {
+            /* SSM: Q is separate (interleaved Q+gate output), fuse K+V */
+            /* B. Q projection */
+            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
+                bq, bxb, n_tokens, gpu_dev, q_full_dim, xb_stride);
 
-        if(_SSM_DBG && l==64){
-            float bq_last[4]; picolm_gpu_sync(gpu_dev);
-            picolm_gpu_memcpy(bq_last, bq+(size_t)(n_tokens-1)*q_full_dim, 16, -1, gpu_dev);
-            fprintf(stderr,"[DBG] bq_last l=64[:4]={%.6f,%.6f,%.6f,%.6f}\n",bq_last[0],bq_last[1],bq_last[2],bq_last[3]);}
+            /* B1. De-interleave Q+gate from bq */
+            {
+                int q_dim = n_heads * head_dim;
+                size_t qg_bytes = (size_t)n_tokens * n_heads * 2 * head_dim * sizeof(float);
+                picolm_gpu_memcpy_async(battn_out, bq, qg_bytes, 0, gpu_dev);
+                picolm_gpu_qg_deinterleave_batched_dev(battn_out, bq, bgate,
+                    n_heads, head_dim, n_tokens, gpu_dev);
+            }
 
-        /* B1. For SSM models: de-interleave Q+gate from bq.
-         * After this, bq holds compacted Q[q_dim] per token,
-         * bgate holds gate[q_dim] per token. */
-        if (c->has_ssm) {
-            int q_dim = n_heads * head_dim;
-            /* Copy raw Q+gate to battn_out (scratch) before de-interleaving.
-             * Use async D2D copy - stream ordering ensures the subsequent
-             * deinterleave kernel sees the data. */
-            size_t qg_bytes = (size_t)n_tokens * n_heads * 2 * head_dim * sizeof(float);
-            picolm_gpu_memcpy_async(battn_out, bq, qg_bytes, 0, gpu_dev);
-            /* No explicit sync needed: deinterleave kernel on same stream will
-             * wait for the memcpy to complete via stream ordering. */
-            picolm_gpu_qg_deinterleave_batched_dev(battn_out, bq, bgate,
-                                                    n_heads, head_dim,
-                                                    n_tokens, gpu_dev);
+            /* C+D. Fused K+V (Phase 1, reusing gu pattern) */
+            if (!picolm_gpu_matmul_dev_gu(
+                    (picolm_gpu_tensor_t *)gl->attn_k,
+                    (picolm_gpu_tensor_t *)gl->attn_v,
+                    bk, bv,
+                    bxb, n_tokens, gpu_dev,
+                    n_kv_heads*head_dim, xb_stride)) {
+                static int kv_fb=1; if(kv_fb){kv_fb=0; fprintf(stderr,"INFO: K+V matmul fallback (2x separate quantize+IMMA, S=%d)\n",n_tokens);}
+                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_k,
+                    bk, bxb, n_tokens, gpu_dev, n_kv_heads*head_dim, xb_stride);
+                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_v,
+                    bv, bxb, n_tokens, gpu_dev, n_kv_heads*head_dim, xb_stride);
+            }
         }
-
-        /* C. K projection: bk = attn_k @ bxb */
-        if (_SSM_DBG) {
-            float _chk[4]; picolm_gpu_sync(gpu_dev);
-            picolm_gpu_memcpy(_chk, bxb + (size_t)(n_tokens-1)*xb_stride, 16, -1, gpu_dev);
-            int _nan=0; for(int _i=0;_i<4;_i++) if(isnanf(_chk[_i])) _nan++;
-            if(_nan>0) fprintf(stderr,"!!! NaN in rmsnorm output bxb layer %d\n",l);
-        }
-        int k_ok = picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_k, bk, bxb, n_tokens, gpu_dev, n_kv_heads*head_dim, xb_stride);
-        if(_SSM_DBG && l==3){
-            float bk8[8]; picolm_gpu_sync(gpu_dev);
-            picolm_gpu_memcpy(bk8, bk+(size_t)(n_tokens-1)*n_kv_heads*head_dim, sizeof(bk8), -1, gpu_dev);
-            double br=0;for(int _i=0;_i<8;_i++)br+=bk8[_i]*bk8[_i];
-            fprintf(stderr,"[DBG] attn_K l=3 last[:4]={%.6f,%.6f,%.6f,%.6f} rms8=%.6f\n",bk8[0],bk8[1],bk8[2],bk8[3],sqrt(br/8));}
-
-
-        /* D. V projection: bv = attn_v @ bxb */
-        picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_v,
-                               bv, bxb, n_tokens, gpu_dev, n_kv_heads*head_dim, xb_stride);
         if (_SSM_DBG) {
             float _chk[4]; picolm_gpu_sync(gpu_dev);
             picolm_gpu_memcpy(_chk, bk + (size_t)(n_tokens-1)*n_kv_heads*head_dim, 16, -1, gpu_dev);
@@ -4713,13 +4735,22 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
                                         (float *)gw->post_attn_norm_dev[l],
                                         dim, c->rms_norm_eps, n_tokens, xb_stride, gpu_dev);
 
-        /* FFN gate: bgate = ffn_gate @ bffn_norm, write bgate at n_ffn stride */
-        picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_gate,
-                               bgate, bffn_norm, n_tokens, gpu_dev, attn_ffn_stride, xb_stride);
-
-        /* FFN up: bup = ffn_up @ bffn_norm, write bup at n_ffn stride */
-        picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_up,
-                               bup, bffn_norm, n_tokens, gpu_dev, attn_ffn_stride, xb_stride);
+        /* FFN gate+up: fused activation quantization (Phase 2)
+         * bgate = ffn_gate @ bffn_norm, bup = ffn_up @ bffn_norm
+         * Quantize bffn_norm once, run gate+up IMMA with same q8 data. */
+        if (!picolm_gpu_matmul_dev_gu(
+                (picolm_gpu_tensor_t *)gl->ffn_gate,
+                (picolm_gpu_tensor_t *)gl->ffn_up,
+                bgate, bup,
+                bffn_norm, n_tokens, gpu_dev,
+                attn_ffn_stride, xb_stride)) {
+            /* Fallback: 2 separate matmul_dev calls */
+            static int gu_fb=1; if(gu_fb){gu_fb=0; fprintf(stderr,"INFO: prefill gate+up matmul fallback (2x separate quantize+IMMA, S=%d)\n",n_tokens);}
+            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_gate,
+                bgate, bffn_norm, n_tokens, gpu_dev, attn_ffn_stride, xb_stride);
+            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_up,
+                bup, bffn_norm, n_tokens, gpu_dev, attn_ffn_stride, xb_stride);
+        }
 
         /* FFN silu_mul: bgate = silu(bgate) * bup (batched, single launch) */
         picolm_gpu_silu_mul_dev(bgate, bup, n_tokens * n_ffn, gpu_dev);
