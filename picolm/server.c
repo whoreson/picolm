@@ -39,12 +39,17 @@
 #include <fcntl.h>
 #ifdef _MSC_VER
 #pragma comment(lib, "ws2_32.lib")
-#endif
+/* MSVC-specific polyfills: MinGW/MSYS2 provides these types natively */
+#ifndef socklen_t
 typedef int socklen_t;
+#endif
+#ifndef ssize_t
 typedef SSIZE_T ssize_t;
+#endif
 #ifndef off_t
 typedef long long off_t;
 #endif
+#endif /* _MSC_VER */
 #define SHUT_RD SD_RECEIVE
 #define SHUT_WR SD_SEND
 #define SHUT_RDWR SD_BOTH

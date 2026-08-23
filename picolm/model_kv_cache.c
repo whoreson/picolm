@@ -14,12 +14,14 @@
 #include <windows.h>
 #include <io.h>
 #include <fcntl.h>
-/* POSIX type polyfills for MSVC */
+/* POSIX type polyfills for MSVC (MinGW/MSYS2 provides these natively) */
+#if defined(_MSC_VER)
 #ifndef ssize_t
 typedef SSIZE_T ssize_t;
 #endif
 #ifndef off_t
 typedef long long off_t;
+#endif
 #endif
 #elif !defined(PICOLM_DOS)
 #include <sys/mman.h>
