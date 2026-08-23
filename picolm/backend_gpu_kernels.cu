@@ -842,6 +842,166 @@ picolm_q8_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
     }
 }
 
+/* Q5_K x Q8_0 IMMA kernel.
+ *
+ * Q5_K: 176 bytes per 256 weights. 5-bit values (stored 0..31).
+ * Layout: d[2] + dm[2] + scales[12] + qh[32] + qs[128].
+ * 256 elements = 8 sub-blocks of 32. Each sub-block has one 6-bit scale
+ * and one 6-bit min (packed in scales[12] via get_scale_min_k4).
+ * Dequant: val = d * sc * qs5 - dm * mn, where qs5 = low4 | (high1 << 4).
+ *
+ * GPU activations are Q8_0 (32-block, no bsums). The -dm*mn term is
+ * handled per-K-block: compute sum(q8[32]) per row via warp shfl,
+ * then subtract dm*mn*sum_q8*dx from the partial sum.
+ *
+ * IMMA m16n8k32: 1 call per K-step (uniform scale per 32).
+ * Grid: [(O+7)/8, (S+15)/16], Block: 32 threads. Same as Q8_0 IMMA.
+ */
+__global__ void
+picolm_q5_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
+                            const void *weights, int S, int I, int O,
+                            int row_bytes, int y_stride) {
+    int gid = gpuThreadIdx_x / 4;
+    int tid = gpuThreadIdx_x % 4;
+    int tile_o = gpuBlockIdx_x * 8;
+    int tile_s = gpuBlockIdx_y * 16;
+    int ys = y_stride > 0 ? y_stride : O;
+    int n_blocks = I / 32;
+    const uint8_t *w = (const uint8_t *)weights;
+    float sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int kb = 0; kb < n_blocks; kb++) {
+        int q5_block = kb / 8;
+        int g = kb % 8;
+
+        int wc = tile_o + gid;
+        size_t wrow_base = (size_t)wc * row_bytes + q5_block * GPU_BLOCK_Q5_K_SIZE;
+        const uint8_t *wb = w + wrow_base;
+
+        /* Super-scales d and dm (fp16 at offsets 0, 2) */
+        float wd = gpu_fp16_to_fp32(wb[0] | ((uint16_t)wb[1] << 8));
+        float wdm = gpu_fp16_to_fp32(wb[2] | ((uint16_t)wb[3] << 8));
+
+        /* Unpack sub-scale and sub-min via get_scale_min_k4 */
+        uint8_t sc, mn;
+        {
+            const uint8_t *scales = wb + 4;
+            if (g < 4) {
+                sc = scales[g] & 63;
+                mn = scales[g + 4] & 63;
+            } else {
+                sc = (uint8_t)((scales[g + 4] & 0xF) | ((scales[g - 4] >> 6) << 4));
+                mn = (uint8_t)((scales[g + 4] >> 4) | ((scales[g] >> 6) << 4));
+            }
+        }
+        float wds = wd * (float)sc;
+        float wdmn = wdm * (float)mn;
+
+        /* A: activation fragments */
+        int a0, a1, a2, a3;
+        {
+            int c0 = tid * 4;
+            int c2 = c0 + 16;
+            int src0 = (int)(tile_s + gid) * I + kb * 32 + c0;
+            int src1 = (int)(tile_s + gid + 8) * I + kb * 32 + c0;
+            int src2 = (int)(tile_s + gid) * I + kb * 32 + c2;
+            int src3 = (int)(tile_s + gid + 8) * I + kb * 32 + c2;
+            int32_t *p = (int32_t *)(const int8_t *)(&xq[src0]); a0 = p[0];
+            p = (int32_t *)(const int8_t *)(&xq[src1]); a1 = p[0];
+            p = (int32_t *)(const int8_t *)(&xq[src2]); a2 = p[0];
+            p = (int32_t *)(const int8_t *)(&xq[src3]); a3 = p[0];
+        }
+
+        /* B: unpack Q5_K 5-bit values to int32 (4 per register).
+         * Block: d(0-1), dm(2-3), scales(4-15), qh(16-47), qs(48-175).
+         * sub-block g: qh[16+g*16..], qs[48+g*16..].
+         * Each qs byte = 2 nibbles, each qh byte = 2 high bits (bit0=low,bit1=high).
+         * b0: elements 0..3 (qs bytes tid*2, tid*2+1)
+         * b1: elements 16..19 (qs bytes tid*2+16, tid*2+17) */
+        int b0, b1;
+        {
+            const uint8_t *qs_p = wb + 48 + g * 16;
+            const uint8_t *qh_p = wb + 16 + g * 16;
+            uint32_t qs0_raw, qs1_raw, qh0_raw, qh1_raw;
+            memcpy(&qs0_raw, qs_p + tid * 2, 2);
+            memcpy(&qs1_raw, qs_p + 16 + tid * 2, 2);
+            memcpy(&qh0_raw, qh_p + tid * 2, 2);
+            memcpy(&qh1_raw, qh_p + 16 + tid * 2, 2);
+
+            uint32_t ql, qh_bits;
+            ql = (qs0_raw & 0x0F) | (((qs0_raw >> 4) & 0x0F) << 8)
+               | (((qs0_raw >> 8) & 0x0F) << 16) | ((qs0_raw >> 12) & 0x0F) << 24);
+            qh_bits = (qh0_raw & 1) | (((qh0_raw >> 1) & 1) << 8)
+                    | (((qh0_raw >> 8) & 1) << 16) | ((qh0_raw >> 9) & 1) << 24);
+            b0 = ql | (qh_bits << 4);
+
+            ql = (qs1_raw & 0x0F) | (((qs1_raw >> 4) & 0x0F) << 8)
+               | (((qs1_raw >> 8) & 0x0F) << 16) | ((qs1_raw >> 12) & 0x0F) << 24);
+            qh_bits = (qh1_raw & 1) | (((qh1_raw >> 1) & 1) << 8)
+                    | (((qh1_raw >> 8) & 1) << 16) | ((qh1_raw >> 9) & 1) << 24);
+            b1 = ql | (qh_bits << 4);
+        }
+
+        /* IMMA m16n8k32 */
+        int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+        asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+            : "+r"(d0), "+r"(d1), "+r"(d2), "+r"(d3)
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
+
+        /* Min-correction: compute sum(q8[32]) per row via shfl.
+         * Each thread holds 4 values per row (a0 for gid, a2 for gid+16 cols).
+         * 4 threads * 4 values = 16 per row, but we need 32.
+         * a0 covers cols tid*4..tid*4+3 (4 vals), a2 covers tid*4+16..+19 (4 vals).
+         * So each thread has 8 vals for row gid (a0+a2), 8 for gid+8 (a1+a3).
+         * 4 threads * 8 = 32. Correct. */
+        int sq0 = 0, sq1 = 0; /* sum q8 for row gid and row gid+8 */
+        {
+            int8_t *av;
+            av = (int8_t *)&a0; sq0 += av[0] + av[1] + av[2] + av[3];
+            av = (int8_t *)&a2; sq0 += av[0] + av[1] + av[2] + av[3];
+            av = (int8_t *)&a1; sq1 += av[0] + av[1] + av[2] + av[3];
+            av = (int8_t *)&a3; sq1 += av[0] + av[1] + av[2] + av[3];
+        }
+        /* Reduce across 4 threads in IMMA group via tree shfl.
+         * Mask must cover threads gid*4..gid*4+3. */
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 300
+        {
+            unsigned mask = 0xF << (gid * 4);
+            sq0 += __shfl_down_sync(mask, sq0, 2);
+            sq1 += __shfl_down_sync(mask, sq1, 2);
+            sq0 += __shfl_down_sync(mask, sq0, 1);
+            sq1 += __shfl_down_sync(mask, sq1, 1);
+            /* tid==0 now has the full row sum for both rows */
+        }
+#endif
+
+        /* Epilogue: apply scales and subtract min-correction */
+        float dx0 = xd[(size_t)(tile_s + gid) * n_blocks + kb];
+        float dx1 = xd[(size_t)(tile_s + gid + 8) * n_blocks + kb];
+
+        if (tid == 0) {
+            sum[0] -= wdmn * dx0 * (float)sq0;
+            sum[2] -= wdmn * dx1 * (float)sq1;
+        }
+        sum[0] += wds * dx0 * (float)d0;
+        sum[1] += wds * dx0 * (float)d1;
+        sum[2] += wds * dx1 * (float)d2;
+        sum[3] += wds * dx1 * (float)d3;
+    }
+    for (int f = 0; f < 4; f++) {
+        int row = (f < 2) ? gid : gid + 8;
+        int col = tid * 2 + (f % 2);
+        int gr = tile_s + row;
+        int gc = tile_o + col;
+        if (gr < S && gc < O)
+            y[(size_t)gr * ys + (size_t)gc] = sum[f];
+    }
+}
+
 /* lines 430-437 from backend_gpu_kernels.cuh */
 __global__ void
 picolm_silu_mul(float *gate, const float *up, size_t n) {
