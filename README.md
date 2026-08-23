@@ -5,7 +5,6 @@
   <img src="https://img.shields.io/badge/Dependencies-Zero-success?style=flat-square" alt="Zero Dependencies">
   <img src="https://img.shields.io/badge/License-MIT-yellow?style=flat-square" alt="MIT License">
   <img src="https://img.shields.io/badge/HTTP_Server-OpenAI_API-red?style=flat-square" alt="HTTP Server">
-  <img src="https://img.shields.io/badge/SIMD-AVX-512%2CAVX2%2CNEON%2CDotProd-purple?style=flat-square" alt="SIMD">
   <img src="https://img.shields.io/badge/Models-Qwen3%2CSmolLM%2CLlama-blue?style=flat-square" alt="Models">
 </p>
 
