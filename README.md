@@ -9,9 +9,7 @@
   <img src="https://img.shields.io/badge/Models-Qwen3%2CSmolLM%2CLlama-blue?style=flat-square" alt="Models">
 </p>
 
-<h1 align="center">PicoLM</h1>
-
-# PicoLM - But It's Actually Useful
+<h1 align="center">PicoLM - But It's Actually Useful</h1>
 
 ## What's New
 
@@ -40,7 +38,7 @@ Since then, progress has been steady. The main goals are (beyond satisfying
 curiosity on what Qwen-3.6-27B can and can't do):
 
 - **First, portability.** The only good software is one that runs (and is tested) on everything from the last 50 years. PicoLM runs from 32-bit MS-DOS through Raspberry Pi, MIPS/OpenWRT, AMD ROCm (MI50 tested), Metal (if someone bothers), to RTX 4090 or DGX Spark.
-- **Second, speed.** Compete with llama.cpp in as many areas as possible. 100% emphasis on CPU and GPU optimizations. Reaching ik_llama.cpp speeds is impossible, of course, courtesy of 40k lines of matmul engines. Work needs to be done on prefill (prompt processing). As far as token generation is concerned, it's already there, and in some cases outpacing llama.cpp.
+- **Second, speed.** Compete with llama.cpp in as many areas as possible. 100% emphasis on CPU and GPU optimizations. Reaching ik_llama.cpp speeds is impossible, of course, courtesy of 40k lines of matmul engines. Work needs to be done on prefill (prompt processing). As far as token generation is concerned, it's already there, and in some cases outpaces llama.cpp.
 - **Third: model support.** Slopped and benchmaxxed 2023+ models aren't priorities, except Qwen 3.6-27B which is a first-tier model that PicoLM supports (both CPU and GPU, between Q1_0 and f16). Exceptions are made for small models like Gemma-3/4n and sorts, fitting the project profile. Fimbulvetr (SOLAR-10.7b finetune) is also tier 1, and Miqu-70B is known to work. Original Mistral Nemo is planned (needs tokenizer support), and DeepSeek V3-0325 is also on TODO, later versions not at all. MoE and SSM architecture in place, tested with Qwen 3.6-31B-A3B (which is not a good model btw but whatever).
 
 PicoLM doesn't preload weights in RAM, therefore doesn't have a hard RAM requirement like llama.cpp. This has the disadvantage of not being able to reorder tensors to col-major, but this is the niche we're in. Support for transposing tensors on-disk (breaking file compatibility) is on the table. The `--prefault` option preloads all weights for faster first reply, when enough RAM is available.
