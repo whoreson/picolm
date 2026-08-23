@@ -1554,6 +1554,209 @@ picolm_q3_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
     }
 }
 
+/* Q2_K x Q8_0 IMMA kernel.
+ *
+ * Q2_K: 256 values in 84 bytes. block_q2_K layout:
+ *   scales[16] (0..15) + qs[64] (16..79) + d(80-81) + dmin(82-83).
+ *   16 sub-blocks of 16 values each. Each sub-block has a 4-bit scale
+ *   and a 4-bit min.
+ *   Value: 2-bit qs (unsigned 0..3).
+ *   Dequant: val = d * scale * q - dmin * min.
+ *
+ * Layout per 256-value block:
+ *   2 chunks of 128 values. Each chunk: 4 groups (bit-shift 0,2,4,6)
+ *   x 2 sub-blocks of 16 values = 8 sub-blocks per chunk.
+ *   Sub-block g (0..15): chunk = (g/4)/2, group = (g/2)%4, sub = g%2.
+ *   qs offset: 16 + chunk*32 + sub*16, bit shift = group*2.
+ *   scale = scales[g] & 0xF, min = scales[g] >> 4.
+ *
+ * IMMA m16n8k32: two calls per K-step (like Q3_K).
+ *   Call 1: b0=real(K[0..15]), b1=0  (sub-block g)
+ *   Call 2: b0=0, b1=real(K[16..31]) (sub-block g+1)
+ *   Each call processes 16 weight values against 32 activation values.
+ *
+ * Min-correction: per-sub-block mins. Each sub-block's min is applied
+ * only to its respective 16 activation values. We need half-sums:
+ *   sq0_first = sum of a0's 4 int8 values x 4 threads (first 16 of row)
+ *   sq0_second = sum of a2's 4 int8 values x 4 threads (second 16 of row)
+ *
+ * Grid: [(O+7)/8, (S+15)/16], Block: 32 threads.
+ * Activation is pre-quantized to Q8_0 (int8 + per-32-element scale). */
+__global__ void
+picolm_q2_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
+                            const void *weights, int S, int I, int O,
+                            int row_bytes, int y_stride) {
+    int gid = gpuThreadIdx_x / 4;
+    int tid = gpuThreadIdx_x % 4;
+    int tile_o = gpuBlockIdx_x * 8;
+    int tile_s = gpuBlockIdx_y * 16;
+    int ys = y_stride > 0 ? y_stride : O;
+    int n_blocks = I / 32;
+    const uint8_t *w = (const uint8_t *)weights;
+    float sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int kb = 0; kb < n_blocks; kb++) {
+        /* Q2_K: 256 values = 16 sub-blocks of 16. Each IMMA step covers
+         * 32 K-values = 2 sub-blocks of 16. Two IMMA calls per step. */
+        int q2_block = kb / 8;            /* which 256-value block */
+        int g = (kb % 8) * 2;            /* even sub-block: 0,2,4,...,14 */
+
+        int wc = tile_o + gid;
+        size_t wrow_base = (size_t)wc * row_bytes + q2_block * GPU_BLOCK_Q2_K_SIZE;
+        const uint8_t *wb = w + wrow_base;
+
+        /* Super-scales d and dmin (fp16 at offsets 80, 82) */
+        float wd = gpu_fp16_to_fp32(wb[80] | ((uint16_t)wb[81] << 8));
+        float wdm = gpu_fp16_to_fp32(wb[82] | ((uint16_t)wb[83] << 8));
+
+        /* Q2_K layout: 2 chunks of 128 values. Each chunk: 4 groups x 2 subs.
+         * g -> chunk (0..1), group (0..3), sub (0..1). */
+        int chunk = g / 8;
+        int group = (g % 8) / 2;
+        int sub = g % 2;
+
+        int bit_shift = group * 2;    /* qs bit shift: 0, 2, 4, 6 */
+
+        /* Scales: straightforward, 1 byte per sub-block.
+         * scale = low nibble, min = high nibble. */
+        uint8_t sc0 = wb[g] & 0xF;
+        uint8_t mn0 = wb[g] >> 4;
+        float wds0 = wd * (float)sc0;
+        float wdmn0 = wdm * (float)mn0;
+
+        /* A: activation fragments */
+        int a0, a1, a2, a3;
+        {
+            int c0 = tid * 4;
+            int c2 = c0 + 16;
+            int src0 = (int)(tile_s + gid) * I + kb * 32 + c0;
+            int src1 = (int)(tile_s + gid + 8) * I + kb * 32 + c0;
+            int src2 = (int)(tile_s + gid) * I + kb * 32 + c2;
+            int src3 = (int)(tile_s + gid + 8) * I + kb * 32 + c2;
+            int32_t *p = (int32_t *)(const int8_t *)(&xq[src0]); a0 = p[0];
+            p = (int32_t *)(const int8_t *)(&xq[src1]); a1 = p[0];
+            p = (int32_t *)(const int8_t *)(&xq[src2]); a2 = p[0];
+            p = (int32_t *)(const int8_t *)(&xq[src3]); a3 = p[0];
+        }
+
+        /* B: unpack Q2_K 2-bit values to int32 (4 per register).
+         * qs: 64 bytes starting at offset 16. Per chunk: 32 bytes.
+         * Per sub: 16 bytes. Each byte holds 4 values (2 bits each).
+         * Thread tid processes elements tid*4..tid*4+3 within the sub-block. */
+        const uint8_t *qs_base = wb + 16 + chunk * 32 + sub * 16;
+        int8_t q2_4[4];
+        for (int e = 0; e < 4; e++) {
+            q2_4[e] = (int8_t)((qs_base[tid * 4 + e] >> bit_shift) & 3);
+        }
+        int b0;
+        memcpy(&b0, q2_4, 4);
+
+        /* Paired sub-block g+1 */
+        int sub2 = 1 - sub;
+        const uint8_t *qs_base2 = wb + 16 + chunk * 32 + sub2 * 16;
+        int8_t q2_4_2[4];
+        for (int e = 0; e < 4; e++) {
+            q2_4_2[e] = (int8_t)((qs_base2[tid * 4 + e] >> bit_shift) & 3);
+        }
+        int b1;
+        memcpy(&b1, q2_4_2, 4);
+
+        uint8_t sc1 = wb[g + 1] & 0xF;
+        uint8_t mn1 = wb[g + 1] >> 4;
+        float wds1 = wd * (float)sc1;
+        float wdmn1 = wdm * (float)mn1;
+
+        /* IMMA call 1: b0 real, b1=0 (sub-block g) */
+        int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+        int d0b = 0, d1b = 0, d2b = 0, d3b = 0;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+        asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+            : "+r"(d0), "+r"(d1), "+r"(d2), "+r"(d3)
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(0));
+#endif
+        /* IMMA call 2: b0=0, b1 real (sub-block g+1) */
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+        asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+            : "+r"(d0b), "+r"(d1b), "+r"(d2b), "+r"(d3b)
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(0), "r"(b1));
+#endif
+
+        /* Min-correction: per-sub-block mins applied to their respective
+         * activation halves. a0+a2 cover K[0..15] of the 32-window (first
+         * 16 activation values), a1 covers row+8 first 16, a2+a3 cover
+         * the second 16. But the IMMA call 1 (b0) processes a0/a2 (K[0..3]
+         * and K[16..19] per thread) against b0 (16 weight values).
+         * The IMMA call 2 (b1) processes a0/a2 against b1.
+         *
+         * Each IMMA call processes 4 Q rows x 16 K values = 64 multiplications.
+         * For the min-correction, we need the sum of the 16 activation values
+         * that each Q row processes. a0 has 4 int8 values for row gid, K[0..3].
+         * a2 has 4 int8 values for row gid, K[16..19].
+         * Together (across 4 threads), that's 16 values for row gid.
+         *
+         * We compute half-sums: sq0 covers a0+a2 (first row, all 16 values
+         * via reduction), sq1 covers a1+a3 (second row, all 16 values). */
+        int sq0 = 0, sq1 = 0;
+        {
+            int8_t *av;
+            av = (int8_t *)&a0; sq0 += av[0] + av[1] + av[2] + av[3];
+            av = (int8_t *)&a2; sq0 += av[0] + av[1] + av[2] + av[3];
+            av = (int8_t *)&a1; sq1 += av[0] + av[1] + av[2] + av[3];
+            av = (int8_t *)&a3; sq1 += av[0] + av[1] + av[2] + av[3];
+        }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 300
+        {
+            unsigned mask = 0xF << (gid * 4);
+            sq0 += __shfl_down_sync(mask, sq0, 2);
+            sq1 += __shfl_down_sync(mask, sq1, 2);
+            sq0 += __shfl_down_sync(mask, sq0, 1);
+            sq1 += __shfl_down_sync(mask, sq1, 1);
+        }
+#endif
+
+        /* Epilogue: apply scales and subtract min-corrections.
+         * Each sub-block has its own min. The activation sum sq0/sq1
+         * covers all 32 elements, but each IMMA call only processes 16
+         * K-values. However, the min-correction multiplies by the
+         * activation values, not the weight values. The 32 activation
+         * values are the same for both IMMA calls (a0..a3 don't change
+         * between calls). So sq0/sq1 represent the sum of all 32
+         * activation values per row.
+         *
+         * For sub-block g (IMMA call 1, d0..d3): the 16 weight values
+         * correspond to 16 of the 32 activation values? No -- IMMA
+         * processes ALL 32 activation values against 16 weight values.
+         * The min-correction for sub-block g is:
+         *   sum -= dmin * min_g * sum_of_32_activations * dx
+         * For sub-block g+1 (IMMA call 2, d0b..d3b):
+         *   sum -= dmin * min_{g+1} * sum_of_32_activations * dx */
+
+        float dx0 = xd[(size_t)(tile_s + gid) * n_blocks + kb];
+        float dx1 = xd[(size_t)(tile_s + gid + 8) * n_blocks + kb];
+
+        if (tid == 0) {
+            sum[0] -= wdmn0 * dx0 * (float)sq0 + wdmn1 * dx0 * (float)sq0;
+            sum[2] -= wdmn0 * dx1 * (float)sq1 + wdmn1 * dx1 * (float)sq1;
+        }
+        sum[0] += wds0 * dx0 * (float)d0 + wds1 * dx0 * (float)d0b;
+        sum[1] += wds0 * dx0 * (float)d1 + wds1 * dx0 * (float)d1b;
+        sum[2] += wds0 * dx1 * (float)d2 + wds1 * dx1 * (float)d2b;
+        sum[3] += wds0 * dx1 * (float)d3 + wds1 * dx1 * (float)d3b;
+    }
+    for (int f = 0; f < 4; f++) {
+        int row = (f < 2) ? gid : gid + 8;
+        int col = tid * 2 + (f % 2);
+        int gr = tile_s + row;
+        int gc = tile_o + col;
+        if (gr < S && gc < O)
+            y[(size_t)gr * ys + (size_t)gc] = sum[f];
+    }
+}
+
 /* lines 430-437 from backend_gpu_kernels.cuh */
 __global__ void
 picolm_silu_mul(float *gate, const float *up, size_t n) {
