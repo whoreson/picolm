@@ -12,6 +12,9 @@ __global__ void picolm_q4_k_q8_matmul_imma(float *y, const int8_t *xq, const flo
 __global__ void picolm_q3_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd, const void *weights, int S, int I, int O, int row_bytes, int y_stride);
 __global__ void picolm_q2_0_q8_matmul_imma(float *y, const int8_t *xq, const float *xd, const void *weights, int S, int I, int O, int row_bytes, int y_stride);
 __global__ void picolm_q1_0_q8_matmul_imma(float *y, const int8_t *xq, const float *xd, const void *weights, int S, int I, int O, int row_bytes, int y_stride);
+__global__ void picolm_q4_0_q8_matmul_imma(float *y, const int8_t *xq, const float *xd, const void *weights, int S, int I, int O, int row_bytes, int y_stride);
+__global__ void picolm_q4_1_q8_matmul_imma(float *y, const int8_t *xq, const float *xd, const void *weights, int S, int I, int O, int row_bytes, int y_stride);
+__global__ void picolm_q2_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd, const void *weights, int S, int I, int O, int row_bytes, int y_stride);
 
 /* ---- GPU-side Q8_0 quantization kernel ----
  *

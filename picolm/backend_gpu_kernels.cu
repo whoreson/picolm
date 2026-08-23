@@ -2769,7 +2769,6 @@ picolm_ssm_vecdot_kernel(float *out,
         break;
     }
     case 30: { /* BF16 -- dequant each weight to F32, accumulate */
-        const uint16_t *wrow_bf = (const uint16_t *)wrow;
         for (int i = 0; i < dim; i++) sum += dequant_bf16(wrow, i) * x[i];
         break;
     }
@@ -2868,7 +2867,6 @@ picolm_ssm_vecdot_batch_kernel(float *out,
     case 30: {
         /* BF16: raw bf16 array, no block structure.
          * Use dequant_bf16 (portable zero-extend), not __bfloat162float (broken). */
-        const uint16_t *wrow_bf = (const uint16_t *)wrow;
         for (int i = 0; i < dim; i++) sum += dequant_bf16(wrow, i) * xt[i];
         break;
     }

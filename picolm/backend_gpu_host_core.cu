@@ -307,7 +307,7 @@ int picolm_gpu_tensor_upload(void **tensor,
      * Q5_K native path: upload as-is, use picolm_q5_k_q8_matmul_imma kernel.
      * Q4_K native path: upload as-is, use picolm_q4_k_q8_matmul_imma kernel.
      * Q2_K/Q3_K: convert to Q8_0 at upload time (no native kernel yet). */
-    if ((qtype == 12 || qtype == 13 || qtype == 14) && (I % 256) == 0 && ctx->has_imma && S >= 16 && O >= 8) {
+    if ((qtype == 12 || qtype == 13 || qtype == 14) && (I % 256) == 0 && ctx->has_imma && O >= 8) {
         size_t blk_size = (qtype == 14) ? GPU_BLOCK_Q6_K_SIZE :
                           (qtype == 13) ? GPU_BLOCK_Q5_K_SIZE :
                                           GPU_BLOCK_Q4_K_SIZE;
