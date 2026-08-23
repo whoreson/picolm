@@ -842,6 +842,129 @@ picolm_q8_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
     }
 }
 
+/* Q8_0 x Q8_0 IMMA kernel with 16-wide output tiles.
+ *
+ * Same as picolm_q8_q8_matmul_imma but processes 16 output columns per block
+ * instead of 8. Two m16n8k32 MMA invocations share the same A fragment
+ * (activations), doubling arithmetic intensity per byte of activation read.
+ * Grid: [(O+15)/16, (S+15)/16], Block: 32 threads (1 warp).
+ *
+ * Register pressure: 8 accumulators (vs 4), 4 B-fragment regs (vs 2),
+ * 4 weight-scale reads (vs 2). Activation reads unchanged.
+ */
+__global__ void
+picolm_q8_q8_matmul_imma_w16(float *y, const int8_t *xq, const float *xd,
+                              const void *weights, int S, int I, int O,
+                              int row_bytes, int y_stride) {
+    int gid = gpuThreadIdx_x / 4;
+    int tid = gpuThreadIdx_x % 4;
+    int tile_o = gpuBlockIdx_x * 16;
+    int tile_s = gpuBlockIdx_y * 16;
+    int ys = y_stride > 0 ? y_stride : O;
+    int n_blocks = I / 32;
+    const uint8_t *w = (const uint8_t *)weights;
+    float sum[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int kb = 0; kb < n_blocks; kb++) {
+        /* A fragment: 16 rows x 32 cols of int8 (shared by both MMA invocations) */
+        int a0, a1, a2, a3;
+        {
+            int c0 = tid * 4;
+            int c2 = c0 + 16;
+            int src0 = (int)(tile_s + gid) * I + kb * 32 + c0;
+            int src1 = (int)(tile_s + gid + 8) * I + kb * 32 + c0;
+            int src2 = (int)(tile_s + gid) * I + kb * 32 + c2;
+            int src3 = (int)(tile_s + gid + 8) * I + kb * 32 + c2;
+            int32_t *p = (int32_t *)(const int8_t *)(&xq[src0]); a0 = p[0];
+            p = (int32_t *)(const int8_t *)(&xq[src1]); a1 = p[0];
+            p = (int32_t *)(const int8_t *)(&xq[src2]); a2 = p[0];
+            p = (int32_t *)(const int8_t *)(&xq[src3]); a3 = p[0];
+        }
+
+        /* B fragment for first 8 output cols (tile_o + 0..7) */
+        int b0a, b1a;
+        {
+            int wc = tile_o + gid;
+            int r0 = tid * 4;
+            int r1 = r0 + 16;
+            const uint8_t *wblk = w + (size_t)wc * row_bytes +
+                                  (size_t)kb * GPU_BLOCK_Q8_0_SIZE + 2;
+            memcpy(&b0a, wblk + r0, 4);
+            memcpy(&b1a, wblk + r1, 4);
+        }
+        /* B fragment for second 8 output cols (tile_o + 8..15) */
+        int b0b, b1b;
+        {
+            int wc = tile_o + gid + 8;
+            int r0 = tid * 4;
+            int r1 = r0 + 16;
+            const uint8_t *wblk = w + (size_t)wc * row_bytes +
+                                  (size_t)kb * GPU_BLOCK_Q8_0_SIZE + 2;
+            memcpy(&b0b, wblk + r0, 4);
+            memcpy(&b1b, wblk + r1, 4);
+        }
+
+        int d0a = 0, d1a = 0, d2a = 0, d3a = 0;
+        int d0b = 0, d1b = 0, d2b = 0, d3b = 0;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+        asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+            : "+r"(d0a), "+r"(d1a), "+r"(d2a), "+r"(d3a)
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0a), "r"(b1a));
+        asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+            : "+r"(d0b), "+r"(d1b), "+r"(d2b), "+r"(d3b)
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0b), "r"(b1b));
+#endif
+        /* Activation scales (shared by both 8-col halves) */
+        float dx0 = xd[(size_t)(tile_s + gid) * n_blocks + kb];
+        float dx1 = xd[(size_t)(tile_s + gid + 8) * n_blocks + kb];
+
+        /* Weight scales for first 8 cols */
+        int wc0 = tile_o + tid * 2;
+        int wc1 = tile_o + tid * 2 + 1;
+        const uint8_t *wb0 = w + (size_t)wc0 * row_bytes + (size_t)kb * GPU_BLOCK_Q8_0_SIZE;
+        const uint8_t *wb1 = w + (size_t)wc1 * row_bytes + (size_t)kb * GPU_BLOCK_Q8_0_SIZE;
+        float wd0 = gpu_fp16_to_fp32(wb0[0] | ((uint16_t)wb0[1] << 8));
+        float wd1 = gpu_fp16_to_fp32(wb1[0] | ((uint16_t)wb1[1] << 8));
+
+        /* Weight scales for second 8 cols */
+        int wc2 = tile_o + tid * 2 + 8;
+        int wc3 = tile_o + tid * 2 + 9;
+        const uint8_t *wb2 = w + (size_t)wc2 * row_bytes + (size_t)kb * GPU_BLOCK_Q8_0_SIZE;
+        const uint8_t *wb3 = w + (size_t)wc3 * row_bytes + (size_t)kb * GPU_BLOCK_Q8_0_SIZE;
+        float wd2 = gpu_fp16_to_fp32(wb2[0] | ((uint16_t)wb2[1] << 8));
+        float wd3 = gpu_fp16_to_fp32(wb3[0] | ((uint16_t)wb3[1] << 8));
+
+        /* Accumulate first 8 cols: sum[0..3] */
+        sum[0] += (float)d0a * dx0 * wd0;
+        sum[1] += (float)d1a * dx0 * wd1;
+        sum[2] += (float)d2a * dx1 * wd0;
+        sum[3] += (float)d3a * dx1 * wd1;
+
+        /* Accumulate second 8 cols: sum[4..7] */
+        sum[4] += (float)d0b * dx0 * wd2;
+        sum[5] += (float)d1b * dx0 * wd3;
+        sum[6] += (float)d2b * dx1 * wd2;
+        sum[7] += (float)d3b * dx1 * wd3;
+    }
+
+    /* Write 16x16 output tile: 8 values per thread.
+     * sum[0..3] -> first 8 cols (same layout as 16x8 kernel)
+     * sum[4..7] -> second 8 cols (offset by 8) */
+    for (int f = 0; f < 8; f++) {
+        int row = (f % 4 < 2) ? gid : gid + 8;
+        int half = f / 4;  /* 0 = first 8 cols, 1 = second 8 cols */
+        int col = tid * 2 + (f % 2) + half * 8;
+        int gr = tile_s + row;
+        int gc = tile_o + col;
+        if (gr < S && gc < O)
+            y[(size_t)gr * ys + (size_t)gc] = sum[f];
+    }
+}
+
 /* Q4_0 x Q8_0 IMMA kernel.
  *
  * Q4_0: 18 bytes per 32 weights. 4-bit values (stored 0..15, actual -8..7).
@@ -1053,6 +1176,191 @@ picolm_q4_1_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
             sum[0] += wm * dx0 * (float)sq0;
             sum[2] += wm * dx1 * (float)sq1;
         }
+        sum[0] += wd * dx0 * (float)d0;
+        sum[1] += wd * dx0 * (float)d1;
+        sum[2] += wd * dx1 * (float)d2;
+        sum[3] += wd * dx1 * (float)d3;
+    }
+    for (int f = 0; f < 4; f++) {
+        int row = (f < 2) ? gid : gid + 8;
+        int col = tid * 2 + (f % 2);
+        int gr = tile_s + row;
+        int gc = tile_o + col;
+        if (gr < S && gc < O)
+            y[(size_t)gr * ys + (size_t)gc] = sum[f];
+    }
+}
+
+/* Q2_0 x Q8_0 IMMA kernel.
+ *
+ * Q2_0: 34 bytes per 128 weights. 2-bit values (stored 0..3).
+ * Layout: d[2] (fp16 scale) + qs[32] (packed 2-bit values).
+ * Dequant: val = (qs_val - 1) * d, mapping {0,1,2,3} -> {-d, 0, +d, +2d}.
+ * Each qs byte holds 4 values at bit positions [0..1], [2..3], [4..5], [6..7].
+ * 128 values = 4 IMMA steps of 32 K-values each, all sharing one scale d.
+ *
+ * Per IMMA step (32 K-values = 8 qs bytes): thread tid reads one qs byte
+ * for K[tid*4..tid*4+3] and one qs byte for K[tid*4+16..tid*4+19].
+ *
+ * Grid: [(O+7)/8, (S+15)/16], Block: 32 threads. Same as Q8_0 IMMA.
+ */
+__global__ void
+picolm_q2_0_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
+                            const void *weights, int S, int I, int O,
+                            int row_bytes, int y_stride) {
+    int gid = gpuThreadIdx_x / 4;
+    int tid = gpuThreadIdx_x % 4;
+    int tile_o = gpuBlockIdx_x * 8;
+    int tile_s = gpuBlockIdx_y * 16;
+    int ys = y_stride > 0 ? y_stride : O;
+    int n_blocks = I / 32;
+    const uint8_t *w = (const uint8_t *)weights;
+    float sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int kb = 0; kb < n_blocks; kb++) {
+        /* A: activation fragments (same as Q8_0) */
+        int a0, a1, a2, a3;
+        {
+            int c0 = tid * 4;
+            int c2 = c0 + 16;
+            int src0 = (int)(tile_s + gid) * I + kb * 32 + c0;
+            int src1 = (int)(tile_s + gid + 8) * I + kb * 32 + c0;
+            int src2 = (int)(tile_s + gid) * I + kb * 32 + c2;
+            int src3 = (int)(tile_s + gid + 8) * I + kb * 32 + c2;
+            int32_t *p = (int32_t *)(const int8_t *)(&xq[src0]); a0 = p[0];
+            p = (int32_t *)(const int8_t *)(&xq[src1]); a1 = p[0];
+            p = (int32_t *)(const int8_t *)(&xq[src2]); a2 = p[0];
+            p = (int32_t *)(const int8_t *)(&xq[src3]); a3 = p[0];
+        }
+
+        /* B: unpack one Q2_0 qs byte per fragment.
+         * q2_block = kb / 4. qs_off = (kb % 4) * 8 within qs[32].
+         * tid reads byte qs_off+tid (K[0..3]) and qs_off+4+tid (K[16..19]). */
+        int b0, b1;
+        {
+            int wc = tile_o + gid;
+            int q2_block = kb / 4;
+            int qs_off = (kb & 3) * 8;
+            const uint8_t *qs = w + (size_t)wc * row_bytes +
+                                (size_t)q2_block * GPU_BLOCK_Q2_0_SIZE + 2;
+            uint32_t v0 = qs[qs_off + tid];
+            uint32_t v1 = qs[qs_off + 4 + tid];
+
+            uint32_t raw0 = (v0 & 3) | (((v0 >> 2) & 3) << 8)
+                          | (((v0 >> 4) & 3) << 16) | ((v0 >> 6) << 24);
+            uint32_t raw1 = (v1 & 3) | (((v1 >> 2) & 3) << 8)
+                          | (((v1 >> 4) & 3) << 16) | ((v1 >> 6) << 24);
+            asm("vsub.u8.u32.u32 %0, %1, %2, 0;" : "=r"(b0) : "r"(raw0), "r"(0x01010101));
+            asm("vsub.u8.u32.u32 %0, %1, %2, 0;" : "=r"(b1) : "r"(raw1), "r"(0x01010101));
+        }
+
+        int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+        asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+            : "+r"(d0), "+r"(d1), "+r"(d2), "+r"(d3)
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
+
+        float dx0 = xd[(size_t)(tile_s + gid) * n_blocks + kb];
+        float dx1 = xd[(size_t)(tile_s + gid + 8) * n_blocks + kb];
+        int wc = tile_o + gid;
+        const uint8_t *wb = w + (size_t)wc * row_bytes +
+                            (size_t)(kb / 4) * GPU_BLOCK_Q2_0_SIZE;
+        float wd = gpu_fp16_to_fp32(wb[0] | ((uint16_t)wb[1] << 8));
+
+        sum[0] += wd * dx0 * (float)d0;
+        sum[1] += wd * dx0 * (float)d1;
+        sum[2] += wd * dx1 * (float)d2;
+        sum[3] += wd * dx1 * (float)d3;
+    }
+    for (int f = 0; f < 4; f++) {
+        int row = (f < 2) ? gid : gid + 8;
+        int col = tid * 2 + (f % 2);
+        int gr = tile_s + row;
+        int gc = tile_o + col;
+        if (gr < S && gc < O)
+            y[(size_t)gr * ys + (size_t)gc] = sum[f];
+    }
+}
+
+/* Q1_0 x Q8_0 IMMA kernel.
+ *
+ * Q1_0: 18 bytes per 128 weights. 1-bit sign + scale.
+ * Layout: d[2] (fp16 scale) + qs[16] (128 sign bits).
+ * Dequant: val = (bit ? +d : -d).
+ * Each qs byte holds 8 sign bits. 128 values = 4 IMMA steps of 32.
+ *
+ * Per IMMA step: 32 K-values = 4 qs bytes. Thread tid reads one qs byte
+ * for K[tid*4..tid*4+3] (bits (tid%2)*4..(tid%2)*4+3 of byte qs_off+tid/2)
+ * and one qs byte for K[tid*4+16..tid*4+19] (same bits of byte qs_off+2+tid/2).
+ * Each sign bit is converted to {-1, +1}: bit=0 -> 0xFF, bit=1 -> 0x01.
+ *
+ * Grid: [(O+7)/8, (S+15)/16], Block: 32 threads. Same as Q8_0 IMMA.
+ */
+__global__ void
+picolm_q1_0_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
+                            const void *weights, int S, int I, int O,
+                            int row_bytes, int y_stride) {
+    int gid = gpuThreadIdx_x / 4;
+    int tid = gpuThreadIdx_x % 4;
+    int tile_o = gpuBlockIdx_x * 8;
+    int tile_s = gpuBlockIdx_y * 16;
+    int ys = y_stride > 0 ? y_stride : O;
+    int n_blocks = I / 32;
+    const uint8_t *w = (const uint8_t *)weights;
+    float sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int kb = 0; kb < n_blocks; kb++) {
+        int a0, a1, a2, a3;
+        {
+            int c0 = tid * 4;
+            int c2 = c0 + 16;
+            int src0 = (int)(tile_s + gid) * I + kb * 32 + c0;
+            int src1 = (int)(tile_s + gid + 8) * I + kb * 32 + c0;
+            int src2 = (int)(tile_s + gid) * I + kb * 32 + c2;
+            int src3 = (int)(tile_s + gid + 8) * I + kb * 32 + c2;
+            int32_t *p = (int32_t *)(const int8_t *)(&xq[src0]); a0 = p[0];
+            p = (int32_t *)(const int8_t *)(&xq[src1]); a1 = p[0];
+            p = (int32_t *)(const int8_t *)(&xq[src2]); a2 = p[0];
+            p = (int32_t *)(const int8_t *)(&xq[src3]); a3 = p[0];
+        }
+
+        int b0, b1;
+        {
+            int wc = tile_o + gid;
+            int q1_block = kb / 4;
+            int qs_off = (kb & 3) * 4;
+            const uint8_t *qs = w + (size_t)wc * row_bytes +
+                                (size_t)q1_block * GPU_BLOCK_Q1_0_SIZE + 2;
+            uint32_t shift = (tid & 1) << 2;
+            uint32_t raw0 = (qs[qs_off + (tid >> 1)] >> shift) & 0x0F;
+            uint32_t raw1 = (qs[qs_off + 2 + (tid >> 1)] >> shift) & 0x0F;
+            /* Convert 4 sign bits to {-1,+1} packed int32. */
+            b0 = 0; b1 = 0;
+            for (int i = 0; i < 4; i++) {
+                b0 |= (int)(((raw0 >> i) & 1) ? 0xFF : 0x01) << (i * 8);
+                b1 |= (int)(((raw1 >> i) & 1) ? 0xFF : 0x01) << (i * 8);
+            }
+        }
+
+        int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+        asm volatile(
+            "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+            : "+r"(d0), "+r"(d1), "+r"(d2), "+r"(d3)
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
+
+        float dx0 = xd[(size_t)(tile_s + gid) * n_blocks + kb];
+        float dx1 = xd[(size_t)(tile_s + gid + 8) * n_blocks + kb];
+        int wc = tile_o + gid;
+        const uint8_t *wb = w + (size_t)wc * row_bytes +
+                            (size_t)(kb / 4) * GPU_BLOCK_Q1_0_SIZE;
+        float wd = gpu_fp16_to_fp32(wb[0] | ((uint16_t)wb[1] << 8));
+
         sum[0] += wd * dx0 * (float)d0;
         sum[1] += wd * dx0 * (float)d1;
         sum[2] += wd * dx1 * (float)d2;

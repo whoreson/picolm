@@ -263,6 +263,8 @@ __device__ static inline void gpu_fp16_mad(half2 &acc, const half2 v, const half
 #define GPU_BLOCK_Q4_K_SIZE  144 /* block_q4_K from quant.h */
 #define GPU_BLOCK_Q5_K_SIZE  176 /* block_q5_K: d+dm+scales[12]+qh[32]+qs[128] */
 #define GPU_BLOCK_Q6_K_SIZE  210 /* block_q6_K: ql[128]+qh[64]+scales[16]+d[2] */
+#define GPU_BLOCK_Q1_0_SIZE  18  /* uint16_t d + uint8_t qs[16]  (128 values) */
+#define GPU_BLOCK_Q2_0_SIZE  34  /* uint16_t d + uint8_t qs[32]  (128 values) */
 #define GPU_BLOCK_Q8_0_SIZE  34  /* uint16_t d + int8_t qs[32] */
 
 /* block_q4_0: 18 bytes = 2B scale(FP16) + 16B qs (32 values)
