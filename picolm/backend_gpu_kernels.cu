@@ -621,27 +621,17 @@ picolm_q8_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
             p = (int32_t *)(const int8_t *)(&xq[src2]); a2 = p[0];
             p = (int32_t *)(const int8_t *)(&xq[src3]); a3 = p[0];
         }
-        /* B: f=0->row=tid*4,col=gid; f=1->row=tid*4+16,col=gid */
+        /* B: f=0->row=tid*4,col=gid; f=1->row=tid*4+16,col=gid.
+           Vectorized: 4 bytes per register are contiguous in Q8_0 block. */
         int b0, b1;
         {
             int wc = tile_o + gid;
             int r0 = tid * 4;
             int r1 = r0 + 16;
-            int8_t bv[8];
-            for (int v = 0; v < 4; v++) {
-                int k = kb * 32 + r0 + v;
-                const uint8_t *wb = w + (size_t)wc * row_bytes +
-                                    (size_t)(k / 32) * GPU_BLOCK_Q8_0_SIZE + 2;
-                bv[v] = (int8_t)wb[k % 32];
-            }
-            memcpy(&b0, bv, 4);
-            for (int v = 0; v < 4; v++) {
-                int k = kb * 32 + r1 + v;
-                const uint8_t *wb = w + (size_t)wc * row_bytes +
-                                    (size_t)(k / 32) * GPU_BLOCK_Q8_0_SIZE + 2;
-                bv[v] = (int8_t)wb[k % 32];
-            }
-            memcpy(&b1, bv, 4);
+            const uint8_t *wblk = w + (size_t)wc * row_bytes +
+                                  (size_t)kb * GPU_BLOCK_Q8_0_SIZE + 2;
+            memcpy(&b0, wblk + r0, 4);
+            memcpy(&b1, wblk + r1, 4);
         }
         int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
@@ -651,18 +641,20 @@ picolm_q8_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
             : "+r"(d0), "+r"(d1), "+r"(d2), "+r"(d3)
             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 #endif
-        /* D: f=0->row=gid,col=tid*2; f=1->row=gid,col=tid*2+1
-           f=2->row=gid+8,col=tid*2; f=3->row=gid+8,col=tid*2+1 */
-        for (int f = 0; f < 4; f++) {
-            int row = (f < 2) ? gid : gid + 8;
-            int col = tid * 2 + (f % 2);
-            float dv = (f == 0) ? (float)d0 : (f == 1) ? (float)d1 : (f == 2) ? (float)d2 : (float)d3;
-            float dx = xd[(size_t)(tile_s + row) * n_blocks + kb];
-            int wc = tile_o + col;
-            const uint8_t *wb = w + (size_t)wc * row_bytes + (size_t)kb * GPU_BLOCK_Q8_0_SIZE;
-            uint16_t wd = wb[0] | ((uint16_t)wb[1] << 8);
-            sum[f] += dv * dx * gpu_fp16_to_fp32(wd);
-        }
+        /* D: Epilogue dedup. dx depends only on row (2 vals), wd on col (2 vals). */
+        float dx0 = xd[(size_t)(tile_s + gid) * n_blocks + kb];
+        float dx1 = xd[(size_t)(tile_s + gid + 8) * n_blocks + kb];
+        int wc0 = tile_o + tid * 2;
+        int wc1 = tile_o + tid * 2 + 1;
+        const uint8_t *wb0 = w + (size_t)wc0 * row_bytes + (size_t)kb * GPU_BLOCK_Q8_0_SIZE;
+        const uint8_t *wb1 = w + (size_t)wc1 * row_bytes + (size_t)kb * GPU_BLOCK_Q8_0_SIZE;
+        float wd0 = gpu_fp16_to_fp32(wb0[0] | ((uint16_t)wb0[1] << 8));
+        float wd1 = gpu_fp16_to_fp32(wb1[0] | ((uint16_t)wb1[1] << 8));
+
+        sum[0] += (float)d0 * dx0 * wd0;
+        sum[1] += (float)d1 * dx0 * wd1;
+        sum[2] += (float)d2 * dx1 * wd0;
+        sum[3] += (float)d3 * dx1 * wd1;
     }
     for (int f = 0; f < 4; f++) {
         int row = (f < 2) ? gid : gid + 8;
