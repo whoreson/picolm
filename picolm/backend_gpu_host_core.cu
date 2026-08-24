@@ -989,7 +989,6 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
                        int S, int device, int y_stride, int x_stride) {
     if (!t || !y_dev || !x_dev || S < 1) return 0;
     if (t->I < 512 || t->O < 256) return 0;
-    static int _dbg_top = 0; if(!_dbg_top++){fprintf(stderr,"[DBG] matmul_dev ENTRY I=%d O=%d S=%d qtype=%d ys=%d xs=%d\n",t->I,t->O,S,(int)t->qtype,y_stride,x_stride);}
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!select_ctx(ctx)) return 0;
 
@@ -997,7 +996,6 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
     int ys = y_stride > 0 ? y_stride : O;
 
     if (t->qtype == GGUF_TYPE_Q8_0 && !getenv("PICOLM_FORCE_F32_MATMUL")) {
-        static int _dbg_q8 = 0; if(!_dbg_q8++){fprintf(stderr,"[DBG] matmul_dev q8 path S=%d I=%d O=%d ys=%d stride=%d qtype=%d\n",S,I,O,ys,x_stride,(int)t->qtype);}
         int n_blocks = I / 32;
         if (n_blocks < 1 || I % 32 != 0) return 0;
         int S_padded = (S + 15) & ~15;
@@ -1019,7 +1017,6 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
         /* Phase 6 abandoned: Q8_0 34-byte blocks cause misaligned access. */
         /* Phase 8: shared-memory staged IMMA (32x16 tiles, 64 threads). */
         if (!getenv("PICOLM_NO_SM_IMMA") && ctx->has_imma && S >= 32 && O >= 16) {
-            static int _smw16_dbg = 0; if(!_smw16_dbg++) fprintf(stderr,"[DBG] smw16 dispatch S=%d O=%d\n",S,O);
             gpu_dispatch_print("matmul_imma_smw16_dev");
             dim3 grid((unsigned)((O + 15) / 16), (unsigned)((S + 31) / 32));
             int smem = 16 * GPU_BLOCK_Q8_0_SIZE;
@@ -1425,7 +1422,6 @@ static int imma_dev_q8(picolm_gpu_tensor_t *t, float *y_dev,
     /* Phase 6 abandoned: Q8_0 34-byte blocks cause misaligned access. */
     /* Phase 8: try shared-memory staged IMMA W16 (32x16 tiles, 64 threads). */
     if (!getenv("PICOLM_NO_SM_IMMA") && ctx->has_imma && S >= 32 && O >= 16) {
-        static int _smw16_dbg = 0; if(!_smw16_dbg++) fprintf(stderr,"[DBG] smw16 imma_dev_q8 S=%d O=%d\n",S,O);
         gpu_dispatch_print("matmul_imma_smw16_dev");
         dim3 grid((unsigned)((O + 15) / 16), (unsigned)((S + 31) / 32));
         int smem = 16 * GPU_BLOCK_Q8_0_SIZE; /* ~544 bytes */
