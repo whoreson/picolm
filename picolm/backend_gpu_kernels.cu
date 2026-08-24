@@ -840,7 +840,8 @@ picolm_q8_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
         if (gr < S && gc < O)
             y[(size_t)gr * ys + (size_t)gc] = sum[f];
     }
-}
+
+    }
 
 /* Q8_0 x Q8_0 IMMA kernel with 16-wide output tiles.
  *
@@ -964,14 +965,7 @@ picolm_q8_q8_matmul_imma_w16(float *y, const int8_t *xq, const float *xd,
             y[(size_t)gr * ys + (size_t)gc] = sum[f];
     }
 
-    /* DBG: dump first output tile from thread 0 */
-    if (gpuThreadIdx_x == 0 && gpuBlockIdx_x == 0 && gpuBlockIdx_y == 0) {
-        printf("[W16-DBG] tile_o=%d tile_s=%d S=%d I=%d O=%d row_bytes=%d ys=%d kb=%d: sums=",
-               tile_o, tile_s, S, I, O, row_bytes, ys, I/32);
-        for(int f=0;f<8;f++) printf(" %.4f", sum[f]);
-        printf("\n");
     }
-}
 
 /* Phase 6 (abandoned): cp.async pipelined IMMA was attempted but
  * Q8_0's 34-byte block format produces misaligned global memory
@@ -1133,14 +1127,7 @@ picolm_q8_q8_matmul_imma_smw16(float *y, const int8_t *xq, const float *xd,
             y[(size_t)gr * ys + (size_t)gc] = sum[f];
     }
 
-    /* DBG: dump first output tile from warp 0 thread 0 */
-    if (gpuThreadIdx_x == 0 && gpuBlockIdx_x == 0 && gpuBlockIdx_y == 0) {
-        printf("[SMW16-DBG] tile_o=%d tile_s=%d S=%d I=%d O=%d row_bytes=%d ys=%d kb=%d: sums=",
-               tile_o, tile_s, S, I, O, row_bytes, ys, I/32);
-        for(int f=0;f<8;f++) printf(" %.4f", sum[f]);
-        printf("\n");
     }
-}
 
 /* ================================================================
  * Phase 7: Fused RMSNorm + Quantize kernel
