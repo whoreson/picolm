@@ -1918,13 +1918,19 @@ picolm_q5_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
         }
 #endif
 
-        /* Epilogue: apply scales and subtract min-correction */
+        /* Epilogue: apply scales and subtract min-correction.
+         * Min-correction applies to ALL output elements (all 4 sum slots),
+         * not just sum[0] and sum[2]. */
         float dx0 = xd[(size_t)(tile_s + gid) * n_blocks + kb];
         float dx1 = xd[(size_t)(tile_s + gid + 8) * n_blocks + kb];
 
         if (tid == 0) {
-            sum[0] -= wdmn * dx0 * (float)sq0;
-            sum[2] -= wdmn * dx1 * (float)sq1;
+            float corr0 = wdmn * dx0 * (float)sq0;
+            float corr1 = wdmn * dx1 * (float)sq1;
+            sum[0] -= corr0;
+            sum[1] -= corr0;
+            sum[2] -= corr1;
+            sum[3] -= corr1;
         }
         sum[0] += wds * dx0 * (float)d0;
         sum[1] += wds * dx0 * (float)d1;
@@ -2082,13 +2088,18 @@ picolm_q4_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
         }
 #endif
 
-        /* Epilogue: apply scales and subtract min-correction */
+        /* Epilogue: apply scales and subtract min-correction.
+         * Min-correction applies to ALL output elements (all 4 sum slots). */
         float dx0 = xd[(size_t)(tile_s + gid) * n_blocks + kb];
         float dx1 = xd[(size_t)(tile_s + gid + 8) * n_blocks + kb];
 
         if (tid == 0) {
-            sum[0] -= wdmn * dx0 * (float)sq0;
-            sum[2] -= wdmn * dx1 * (float)sq1;
+            float corr0 = wdmn * dx0 * (float)sq0;
+            float corr1 = wdmn * dx1 * (float)sq1;
+            sum[0] -= corr0;
+            sum[1] -= corr0;
+            sum[2] -= corr1;
+            sum[3] -= corr1;
         }
         sum[0] += wds * dx0 * (float)d0;
         sum[1] += wds * dx0 * (float)d1;
@@ -2452,8 +2463,12 @@ picolm_q2_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
         float dx1 = xd[(size_t)(tile_s + gid + 8) * n_blocks + kb];
 
         if (tid == 0) {
-            sum[0] -= wdmn0 * dx0 * (float)sq0 + wdmn1 * dx0 * (float)sq0;
-            sum[2] -= wdmn0 * dx1 * (float)sq1 + wdmn1 * dx1 * (float)sq1;
+            float corr0 = (wdmn0 + wdmn1) * dx0 * (float)sq0;
+            float corr1 = (wdmn0 + wdmn1) * dx1 * (float)sq1;
+            sum[0] -= corr0;
+            sum[1] -= corr0;
+            sum[2] -= corr1;
+            sum[3] -= corr1;
         }
         sum[0] += wds0 * dx0 * (float)d0 + wds1 * dx0 * (float)d0b;
         sum[1] += wds0 * dx0 * (float)d1 + wds1 * dx0 * (float)d1b;
