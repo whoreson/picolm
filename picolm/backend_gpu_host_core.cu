@@ -1009,6 +1009,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
                 ctx->q8_xq, ctx->q8_xd, x_dev, I, S);
         }
         if (!gpu_ok(gpuGetLastError(), "q8 quantize (dev)")) return 0;
+        /* Phase 6 abandoned: Q8_0 34-byte blocks cause misaligned access. */
 #if defined(PICOLM_IMMA_W16)
         if (ctx->has_imma && S >= 16 && O >= 16) {
             gpu_dispatch_print("matmul_imma_w16_dev");
@@ -1404,6 +1405,7 @@ picolm_gpu_matmul_dev_strided(picolm_gpu_tensor_t *t, float *y_dev,
 static int imma_dev_q8(picolm_gpu_tensor_t *t, float *y_dev,
     const int8_t *xq, const float *xd, int S, int I, int O,
     int ys, gpu_device_ctx_t *ctx) {
+    /* Phase 6 abandoned: Q8_0 34-byte blocks cause misaligned access. */
 #if defined(PICOLM_IMMA_W16)
     if (ctx->has_imma && S >= 16 && O >= 16) {
         gpu_dispatch_print("matmul_imma_w16_dev");
@@ -1470,13 +1472,36 @@ int picolm_gpu_matmul_dev_qkv(picolm_gpu_tensor_t *tq, picolm_gpu_tensor_t *tk, 
     if (!gpu_ok(gpuGetLastError(), "q8 quantize QKV (dev)")) return 0;
 
     static int qkv_info = 1;
-    /* bq = tq @ xq */
     int ys_q = y_stride_q > 0 ? y_stride_q : tq->O;
-    if (!imma_dev_q8(tq, bq, ctx->q8_xq, ctx->q8_xd, S, I, tq->O, ys_q, ctx)) return 0;
-    /* bk = tk @ xq (same quantized activation) */
     int ys_kv = y_stride_kv > 0 ? y_stride_kv : tk->O;
+
+    /* Phase 4: try fused QKV IMMA kernel (single launch for all 3).
+     * Only on CUDA sm_80+ where IMMA is available. Falls back to 3x separate IMMA. */
+#ifdef PICOLM_CUDA
+    if (0 && ctx->has_imma && S >= 16 && tq->O >= 8 && tk->O >= 8 && tv->O >= 8 &&
+        !getenv("PICOLM_NO_FUSED_QKV")) {
+        int max_o = tq->O;
+        if (tk->O > max_o) max_o = tk->O;
+        if (tv->O > max_o) max_o = tv->O;
+        dim3 grid((unsigned)((max_o + 7) / 8), (unsigned)((S + 15) / 16));
+        picolm_q8_q8_matmul_imma_qkv<<<grid, 32, 0, ctx->stream>>>(
+            bq, bk, bv,
+            ctx->q8_xq, ctx->q8_xd,
+            tq->weights, tk->weights, tv->weights,
+            S, I, tq->O, tk->O, tv->O,
+            (int)tq->row_bytes, ys_q, ys_kv);
+        if (gpu_ok(gpuGetLastError(), "q8 fused qkv imma (dev)")) {
+            gpu_dispatch_print("matmul_imma_qkv_dev");
+            static int fused_info = 1;
+            if (fused_info) { fused_info = 0; fprintf(stderr, "INFO: QKV fused IMMA (1 launch, 1 quantize, S=%d)\n", S); }
+            return 1;
+        }
+    }
+#endif
+
+    /* Fallback: 3 separate IMMA matmuls. */
+    if (!imma_dev_q8(tq, bq, ctx->q8_xq, ctx->q8_xd, S, I, tq->O, ys_q, ctx)) return 0;
     if (!imma_dev_q8(tk, bk, ctx->q8_xq, ctx->q8_xd, S, I, tk->O, ys_kv, ctx)) return 0;
-    /* bv = tv @ xq (same quantized activation) */
     if (!imma_dev_q8(tv, bv, ctx->q8_xq, ctx->q8_xd, S, I, tv->O, ys_kv, ctx)) return 0;
 
     if (qkv_info) { qkv_info = 0; fprintf(stderr, "INFO: QKV matmul fused (1 quantize, 3x IMMA, S=%d)\n", S); }

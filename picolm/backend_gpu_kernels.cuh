@@ -83,6 +83,24 @@ __global__ void picolm_q8_q8_matmul_imma_w16(float *y, const int8_t *xq, const f
                                               const void *weights, int S, int I, int O,
                                               int row_bytes, int y_stride);
 
+/* Phase 6 (abandoned): see backend_gpu_kernels.cu for details.
+ * PICOLM_ASYNC_SLOT_BYTES kept for backwards compat in dispatch dead-code. */
+#ifndef PICOLM_ASYNC_SLOT_BYTES
+#define PICOLM_ASYNC_SLOT_BYTES 1536u
+#endif
+
+/* Phase 4: Fused QKV IMMA kernel (CUDA sm_80+).
+ * Single kernel for Q+K+V projections sharing activation reads.
+ * Grid: [(max(Oq,Ok,Ov)+7)/8, (S+15)/16], Block: 32 threads. */
+__global__ void picolm_q8_q8_matmul_imma_qkv(float *bq, float *bk, float *bv,
+                                              const int8_t *xq, const float *xd,
+                                              const void *weights_q, const void *weights_k,
+                                              const void *weights_v,
+                                              int S, int I,
+                                              int Oq, int Ok, int Ov,
+                                              int row_bytes,
+                                              int ys_q, int ys_kv);
+
 /* FP16 tiled matmul: loads FP16 weight rows into shared memory once per tile.
  * FP32 activations, FP16 weights, FP32 output. */
 __global__ void picolm_f16_f16_matmul_tiled(float *y, const float *x, const uint16_t *w,
