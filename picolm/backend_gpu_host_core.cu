@@ -335,7 +335,7 @@ int picolm_gpu_tensor_upload(void **tensor,
         {
             static int first_print = 1;
             if (first_print) {
-                fprintf(stderr, "[GPU] upload mode: q%d_k native (IMMA fast path)\n", qtype - 10);
+                fprintf(stderr, "[GPU] upload mode: q%d_k native (IMMA fast path)\n", qtype - 8);
                 first_print = 0;
             }
         }
