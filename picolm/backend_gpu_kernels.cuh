@@ -83,6 +83,13 @@ __global__ void picolm_q8_q8_matmul_imma_w16(float *y, const int8_t *xq, const f
                                               const void *weights, int S, int I, int O,
                                               int row_bytes, int y_stride);
 
+/* Phase 7: Fused RMSNorm + Quantize kernel.
+ * Replaces separate RMSNorm + quantize kernels, eliminating F32 bxb buffer.
+ * Grid: [S] (one block per row), Block: 256 threads. */
+__global__ void picolm_rmsnorm_quantize_q8_0_kernel(int8_t *qs_out, float *d_out,
+                                                     const float *x, const float *weight,
+                                                     int dim, float eps, int S, int x_stride);
+
 /* Phase 6 (abandoned): see backend_gpu_kernels.cu for details.
  * PICOLM_ASYNC_SLOT_BYTES kept for backwards compat in dispatch dead-code. */
 #ifndef PICOLM_ASYNC_SLOT_BYTES

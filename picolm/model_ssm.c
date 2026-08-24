@@ -4395,6 +4395,31 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
             int _nan=0; for(int _i=0;_i<4;_i++) if(isnanf(_chk[_i])) _nan++;
             if (_nan > 0) fprintf(stderr, "!!! NaN in bx input to layer %d\n", l);
         }
+        /* Phase 7: try fused RMSNorm + QKV (eliminates bxb buffer for QKV).
+         * Only for non-SSM models with Q8_0 attention weights. */
+        extern int picolm_gpu_rmsnorm_matmul_dev_qkv(picolm_gpu_tensor_t *tq, picolm_gpu_tensor_t *tk, picolm_gpu_tensor_t *tv,
+                                                      float *bq, float *bk, float *bv,
+                                                      const float *bx, const float *rmsnorm_w,
+                                                      int dim, float eps, int S, int xb_stride,
+                                                      int device, int y_stride_q, int y_stride_kv);
+
+        if (!c->has_ssm && !getenv("PICOLM_NO_PHASE7")) {
+            if (!picolm_gpu_rmsnorm_matmul_dev_qkv(
+                    (picolm_gpu_tensor_t *)gl->attn_q,
+                    (picolm_gpu_tensor_t *)gl->attn_k,
+                    (picolm_gpu_tensor_t *)gl->attn_v,
+                    bq, bk, bv,
+                    bx, (float *)gw->attn_norm_dev[l],
+                    dim, c->rms_norm_eps, n_ubatch, xb_stride,
+                    gpu_dev, q_full_dim, n_kv_heads*head_dim)) {
+                /* Phase 7 unavailable, fall through to standard path. */
+            } else {
+                /* Phase 7 succeeded, skip to post-QKV code. */
+                goto after_qkv;
+            }
+        }
+
+        /* Standard path: RMSNorm -> QKV (uses bxb intermediate buffer). */
         picolm_gpu_rmsnorm_batched_dev(bxb, bx,
                                         (float *)gw->attn_norm_dev[l],
                                         dim, c->rms_norm_eps, n_ubatch, xb_stride, gpu_dev);
@@ -4441,6 +4466,7 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
                     bv, bxb, n_ubatch, gpu_dev, n_kv_heads*head_dim, xb_stride);
             }
         }
+after_qkv:
 
         /* QK-norm */
         if (gw->attn_qk_norm_q_dev[l]) {

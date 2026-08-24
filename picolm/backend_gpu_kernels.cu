@@ -973,6 +973,80 @@ picolm_q8_q8_matmul_imma_w16(float *y, const int8_t *xq, const float *xd,
  * See /data4/work/notes/picolm/phase6_cpasync_alignment_issue.md */
 
 /* ================================================================
+ * Phase 7: Fused RMSNorm + Quantize kernel
+ * ================================================================
+ * Replaces: picolm_gpu_rmsnorm_batched_dev() + quantize kernel
+ * Input: bx[S][dim] (strided) + rmsnorm weight[dim]
+ * Output: q8_xq[S][I] + q8_xd[S][n_blocks]  (same buffers as regular quantize)
+ *
+ * One block per row, 256 threads. Two phases:
+ *  Phase 1: RMSNorm reduction (sum of squares -> inv_rms)
+ *  Phase 2: Normalize * weight, quantize to Q8_0 per 32-element block
+ *
+ * This eliminates the F32 bxb intermediate buffer entirely.
+ * ================================================================ */
+__global__ void
+picolm_rmsnorm_quantize_q8_0_kernel(int8_t *qs_out, float *d_out,
+                                     const float *x, const float *weight,
+                                     int dim, float eps, int S, int x_stride) {
+    int row = gpuBlockIdx_x;
+    if (row >= S) return;
+    int tid = gpuThreadIdx_x;
+    int n_threads = gpuBlockDim_x;
+
+    const float *xr = x + (size_t)row * x_stride;
+    int n_blocks = (dim + 31) / 32;
+
+    /* Phase 1: RMSNorm reduction. */
+    float sum_sq = 0.0f;
+    for (int i = tid; i < dim; i += n_threads) {
+        sum_sq += xr[i] * xr[i];
+    }
+    __shared__ float ssum[256];
+    ssum[tid] = sum_sq;
+    gpuSyncthreads();
+    for (int s = n_threads / 2; s > 0; s >>= 1) {
+        if (tid < s) ssum[tid] += ssum[tid + s];
+        gpuSyncthreads();
+    }
+    float inv_rms = rsqrtf(ssum[0] / dim + eps);
+
+    /* Phase 2: Normalize * weight, quantize to Q8_0.
+     * Each thread handles one 32-element block of this row. */
+    for (int block = tid; block < n_blocks; block += n_threads) {
+        const float *xb = xr + block * 32;
+        int n = dim - block * 32;
+        if (n > 32) n = 32;
+
+        /* Find max abs value in this block (normalized). */
+        float amax = 0.0f;
+        for (int j = 0; j < n; j++) {
+            float v = fabsf(xb[j] * inv_rms * weight[block * 32 + j]);
+            if (v > amax) amax = v;
+        }
+        float d = amax / 127.0f;
+        float id = (d > 0.0f) ? 1.0f / d : 0.0f;
+
+        /* Quantize. */
+        int8_t *qs_row = qs_out + (size_t)row * (size_t)n_blocks * 32 + (size_t)block * 32;
+        for (int j = 0; j < n; j++) {
+            float v = xb[j] * inv_rms * weight[block * 32 + j];
+            int q = (int)lrintf(v * id);
+            if (q > 127) q = 127;
+            if (q < -128) q = -128;
+            qs_row[j] = (int8_t)q;
+        }
+        /* Zero out any padding elements for the last (partial) block. */
+        for (int j = n; j < 32; j++) {
+            qs_row[j] = 0;
+        }
+
+        /* Write scale for this block. */
+        d_out[(size_t)row * n_blocks + block] = d;
+    }
+}
+
+/* ================================================================
  * Phase 4: Fused QKV IMMA kernel (W16 variant)
  * ================================================================
  * Single kernel launch for Q+K+V projections.

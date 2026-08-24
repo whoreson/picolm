@@ -1509,6 +1509,85 @@ int picolm_gpu_matmul_dev_qkv(picolm_gpu_tensor_t *tq, picolm_gpu_tensor_t *tk, 
 }
 
 /* ================================================================
+ * Phase 7: Fused RMSNorm + Quantize + QKV IMMA
+ * ================================================================
+ * Replaces: rmsnorm_batched_dev() + quantize() + fused QKV IMMA
+ * Reads bx[S][xb_stride] directly, does per-row RMSNorm with the
+ * attention norm weight, quantizes to Q8_0, then runs fused QKV
+ * IMMA. Eliminates the F32 bxb intermediate buffer entirely.
+ * ================================================================ */
+
+extern "C"
+int picolm_gpu_rmsnorm_matmul_dev_qkv(picolm_gpu_tensor_t *tq, picolm_gpu_tensor_t *tk, picolm_gpu_tensor_t *tv,
+                                       float *bq, float *bk, float *bv,
+                                       const float *bx, const float *rmsnorm_w,
+                                       int dim, float eps, int S, int xb_stride,
+                                       int device, int y_stride_q, int y_stride_kv) {
+    if (!tq || !tk || !tv || !bq || !bk || !bv || !bx || S < 1) return 0;
+    if (tq->I < 512 || tk->I < 512 || tv->I < 512) return 0;
+    if (tq->I != tk->I || tq->I != tv->I) return 0;
+    if (tq->qtype != GGUF_TYPE_Q8_0 || tk->qtype != GGUF_TYPE_Q8_0 || tv->qtype != GGUF_TYPE_Q8_0)
+        return 0;
+    if (getenv("PICOLM_FORCE_F32_MATMUL")) return 0;
+
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!select_ctx(ctx)) return 0;
+    if (!ctx->has_imma) return 0;
+    int I = tq->I;
+    int n_blocks = I / 32;
+    if (n_blocks < 1 || I % 32 != 0) return 0;
+
+    int S_padded = (S + 15) & ~15;
+    size_t xq_bytes = (size_t)S_padded * I;
+    size_t xd_bytes = (size_t)S_padded * n_blocks * sizeof(float);
+    if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, xq_bytes) ||
+        !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
+
+    gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
+    gpuMemsetAsync(ctx->q8_xd, 0, xd_bytes, ctx->stream);
+
+    /* Phase 7: fused RMSNorm + quantize (one kernel, no F32 bxb). */
+    {
+        int n_threads = min(dim, 256);
+        dim3 grid((unsigned)S, 1, 1);
+        picolm_rmsnorm_quantize_q8_0_kernel<<<grid, n_threads, 0, ctx->stream>>>(
+            ctx->q8_xq, ctx->q8_xd, bx, rmsnorm_w,
+            dim, eps, S, xb_stride);
+        if (!gpu_ok(gpuGetLastError(), "rmsnorm+quantize fused (dev)")) return 0;
+    }
+
+    int ys_q = y_stride_q > 0 ? y_stride_q : tq->O;
+    int ys_kv = y_stride_kv > 0 ? y_stride_kv : tk->O;
+
+#ifdef PICOLM_CUDA
+    if (ctx->has_imma && S >= 16 && tq->O >= 8 && tk->O >= 8 && tv->O >= 8 &&
+        !getenv("PICOLM_NO_FUSED_QKV")) {
+        int max_o = tq->O;
+        if (tk->O > max_o) max_o = tk->O;
+        if (tv->O > max_o) max_o = tv->O;
+        dim3 grid((unsigned)((max_o + 15) / 16), (unsigned)((S + 15) / 16));
+        picolm_q8_q8_matmul_imma_qkv<<<grid, 32, 0, ctx->stream>>>(
+            bq, bk, bv,
+            ctx->q8_xq, ctx->q8_xd,
+            tq->weights, tk->weights, tv->weights,
+            S, I, tq->O, tk->O, tv->O,
+            (int)tq->row_bytes, ys_q, ys_kv);
+        if (gpu_ok(gpuGetLastError(), "q8 fused qkv imma w16 (rmsnorm)")) {
+            static int ph7_info = 1;
+            if (ph7_info) { ph7_info = 0; fprintf(stderr, "INFO: Phase 7 active: RMSNorm+quantize+QKV fused (S=%d)\n", S); }
+            return 1;
+        }
+    }
+#endif
+
+    /* Fallback: 3 separate IMMA. */
+    if (!imma_dev_q8(tq, bq, ctx->q8_xq, ctx->q8_xd, S, I, tq->O, ys_q, ctx)) return 0;
+    if (!imma_dev_q8(tk, bk, ctx->q8_xq, ctx->q8_xd, S, I, tk->O, ys_kv, ctx)) return 0;
+    if (!imma_dev_q8(tv, bv, ctx->q8_xq, ctx->q8_xd, S, I, tv->O, ys_kv, ctx)) return 0;
+    return 1;
+}
+
+/* ================================================================
  * Phase 2: Fused gate+up activation quantization + IMMA matmuls
  * ================================================================
  * Quantize x_dev once to Q8_0, then run gate+up IMMA matmuls
