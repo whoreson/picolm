@@ -973,6 +973,160 @@ picolm_q8_q8_matmul_imma_w16(float *y, const int8_t *xq, const float *xd,
  * See /data4/work/notes/picolm/phase6_cpasync_alignment_issue.md */
 
 /* ================================================================
+ * Phase 8: Shared-memory staged IMMA kernel (w16)
+ * ================================================================
+ * New approach: stage weight rows in shared memory to reduce L2
+ * traffic. Each block processes a 32x16 output tile (2 warps,
+ * 64 threads). Weight data for the 16 output columns is loaded
+ * once per KB-tile into shared memory, then reused by all 32
+ * rows. This doubles the arithmetic intensity per weight byte
+ * fetched (32 rows vs 16 rows per weight fetch).
+ *
+ * Shared memory per KB-tile: 16 cols * GPU_BLOCK_Q8_0_SIZE bytes
+ * = 16 * 34 = 544 bytes. Fits easily in 48KB.
+ *
+ * Grid: [(O+15)/16, (S+31)/32], Block: 64 threads (2 warps).
+ * Dynamic shared memory: (O/16 block width doesn't matter,
+ * one KB-tile staged at a time = ~544B).
+ *
+ * Key insight: the "double-load penalty" of staging weights in
+ * shared memory is acceptable because each staged weight block
+ * is reused across 32 output rows (2x the w16 kernel), netting
+ * a 2x improvement in arithmetic intensity for weight reads.
+ * ================================================================ */
+__global__ void
+picolm_q8_q8_matmul_imma_smw16(float *y, const int8_t *xq, const float *xd,
+                                const void *weights, int S, int I, int O,
+                                int row_bytes, int y_stride) {
+    extern __shared__ uint8_t smem[];
+
+    int warp_id = gpuThreadIdx_x / 32;   /* 0 or 1 */
+    int wid   = gpuThreadIdx_x % 32;     /* 0..31 within warp */
+    int gid   = wid / 4;                 /* 0..7 within warp */
+    int tid   = wid % 4;                 /* 0..3 within subgroup */
+
+    int tile_o = gpuBlockIdx_x * 16;
+    int tile_s = gpuBlockIdx_y * 32;     /* 32 rows per block (2 warps of 16) */
+    int ys = y_stride > 0 ? y_stride : O;
+    int n_blocks = I / 32;
+    const uint8_t *w = (const uint8_t *)weights;
+
+    /* Each warp handles 16 rows: warp 0 = tile_s..tile_s+15,
+     * warp 1 = tile_s+16..tile_s+31. */
+    int warp_s_base = tile_s + warp_id * 16;
+
+    float sum[8] = {0};
+
+    /* Shared memory layout per KB-tile:
+     * [wc*34 bytes for each of the 16 output columns]
+     * Total: 16 * GPU_BLOCK_Q8_0_SIZE = 544 bytes */
+    int smem_stride = GPU_BLOCK_Q8_0_SIZE; /* bytes per weight col in smem */
+
+    for (int kb = 0; kb < n_blocks; kb++) {
+        /* --- Stage 16 weight columns into shared memory ---
+         * 16 columns x 34 bytes = 544B. 64 threads x 8.5 bytes/thread.
+         * Each thread loads 8 or 9 bytes (byte-by-byte to avoid
+         * crossing 34-byte block boundaries). */
+        {
+            for (int b = gpuThreadIdx_x; b < 16 * smem_stride; b += 64) {
+                int src_col = b / smem_stride;
+                int src_off = b % smem_stride;
+                int wc = tile_o + src_col;
+                smem[b] = w[(size_t)wc * row_bytes +
+                            (size_t)kb * GPU_BLOCK_Q8_0_SIZE + src_off];
+            }
+        }
+        gpuSyncthreads();
+
+        /* --- Compute for this warp's 16 rows --- */
+        {
+            /* Activation scales for this warp's rows. */
+            float dx0 = xd[(size_t)(warp_s_base + gid) * n_blocks + kb];
+            float dx1 = xd[(size_t)(warp_s_base + gid + 8) * n_blocks + kb];
+
+            /* A fragments: 4 x 4B reads from activation. */
+            int a0, a1, a2, a3;
+            {
+                int c0 = tid * 4;
+                int c2 = c0 + 16;
+                int src0 = (int)(warp_s_base + gid) * I + kb * 32 + c0;
+                int src1 = (int)(warp_s_base + gid + 8) * I + kb * 32 + c0;
+                int src2 = (int)(warp_s_base + gid) * I + kb * 32 + c2;
+                int src3 = (int)(warp_s_base + gid + 8) * I + kb * 32 + c2;
+                int32_t *p = (int32_t *)(const int8_t *)(&xq[src0]); a0 = p[0];
+                p = (int32_t *)(const int8_t *)(&xq[src1]); a1 = p[0];
+                p = (int32_t *)(const int8_t *)(&xq[src2]); a2 = p[0];
+                p = (int32_t *)(const int8_t *)(&xq[src3]); a3 = p[0];
+            }
+
+            /* B fragments from shared memory: two halves (cols 0-7, 8-15). */
+            int b0a, b1a, b0b, b1b;
+            {
+                /* First half: cols tile_o + 0..7 */
+                int r0 = tid * 4;
+                int r1 = r0 + 16;
+                memcpy(&b0a, smem + gid * smem_stride + 2 + r0, 4);
+                memcpy(&b1a, smem + gid * smem_stride + 2 + r1, 4);
+                /* Second half: cols tile_o + 8..15 */
+                memcpy(&b0b, smem + (gid + 8) * smem_stride + 2 + r0, 4);
+                memcpy(&b1b, smem + (gid + 8) * smem_stride + 2 + r1, 4);
+            }
+
+            int d0a = 0, d1a = 0, d2a = 0, d3a = 0;
+            int d0b = 0, d1b = 0, d2b = 0, d3b = 0;
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                : "+r"(d0a), "+r"(d1a), "+r"(d2a), "+r"(d3a)
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0a), "r"(b1a));
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                : "+r"(d0b), "+r"(d1b), "+r"(d2b), "+r"(d3b)
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0b), "r"(b1b));
+
+            /* Weight scales from shared memory. */
+            {
+                int wc0 = tid * 2, wc1 = wc0 + 1;
+                uint16_t wd0_raw, wd1_raw;
+                memcpy(&wd0_raw, smem + wc0 * smem_stride, 2);
+                memcpy(&wd1_raw, smem + wc1 * smem_stride, 2);
+                float wd0 = gpu_fp16_to_fp32(wd0_raw);
+                float wd1 = gpu_fp16_to_fp32(wd1_raw);
+                sum[0] += (float)d0a * dx0 * wd0;
+                sum[1] += (float)d1a * dx0 * wd1;
+                sum[2] += (float)d2a * dx1 * wd0;
+                sum[3] += (float)d3a * dx1 * wd1;
+            }
+            {
+                int wc2 = tid * 2 + 8, wc3 = wc2 + 1;
+                uint16_t wd2_raw, wd3_raw;
+                memcpy(&wd2_raw, smem + wc2 * smem_stride, 2);
+                memcpy(&wd3_raw, smem + wc3 * smem_stride, 2);
+                float wd2 = gpu_fp16_to_fp32(wd2_raw);
+                float wd3 = gpu_fp16_to_fp32(wd3_raw);
+                sum[4] += (float)d0b * dx0 * wd2;
+                sum[5] += (float)d1b * dx0 * wd3;
+                sum[6] += (float)d2b * dx1 * wd2;
+                sum[7] += (float)d3b * dx1 * wd3;
+            }
+        }
+        gpuSyncthreads(); /* needed before next iteration's smem write */
+    }
+
+    /* Write 16 output values per thread (8 accumulators). */
+    for (int f = 0; f < 8; f++) {
+        int row = (f % 4 < 2) ? gid : gid + 8;
+        int half = f / 4;
+        int col = tid * 2 + (f % 2) + half * 8;
+        int gr = warp_s_base + row;
+        int gc = tile_o + col;
+        if (gr < S && gc < O)
+            y[(size_t)gr * ys + (size_t)gc] = sum[f];
+    }
+}
+
+/* ================================================================
  * Phase 7: Fused RMSNorm + Quantize kernel
  * ================================================================
  * Replaces: picolm_gpu_rmsnorm_batched_dev() + quantize kernel

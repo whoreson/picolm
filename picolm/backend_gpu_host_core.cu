@@ -1,6 +1,11 @@
 // backend_gpu_host_core.cu - GPU initialization, memory, tensor, matmul, expert MLP
 #include "backend_gpu_kernels.cuh"
 
+/* Phase 8: forward declare for nvcc/MSVC cross-TU kernel launch.
+ * The .cuh declaration isn't picked up by MSVC's C++ front-end. */
+__global__ void picolm_q8_q8_matmul_imma_smw16(float *, const int8_t *, const float *,
+                                                const void *, int, int, int, int, int);
+
 static void gpu_dispatch_print(const char *name) {
     static char seen[64][64] = {0};
     for (int i = 0; i < 64; i++) {
@@ -1010,6 +1015,15 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
         }
         if (!gpu_ok(gpuGetLastError(), "q8 quantize (dev)")) return 0;
         /* Phase 6 abandoned: Q8_0 34-byte blocks cause misaligned access. */
+        /* Phase 8: shared-memory staged IMMA (32x16 tiles, 64 threads). */
+        if (!getenv("PICOLM_NO_SM_IMMA") && ctx->has_imma && S >= 32 && O >= 16) {
+            gpu_dispatch_print("matmul_imma_smw16_dev");
+            dim3 grid((unsigned)((O + 15) / 16), (unsigned)((S + 31) / 32));
+            int smem = 16 * GPU_BLOCK_Q8_0_SIZE;
+            picolm_q8_q8_matmul_imma_smw16<<<grid, 64, smem, ctx->stream>>>(
+                y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
+            if (gpu_ok(gpuGetLastError(), "q8 smw16 matmul (dev)")) return 1;
+        }
 #if defined(PICOLM_IMMA_W16)
         if (ctx->has_imma && S >= 16 && O >= 16) {
             gpu_dispatch_print("matmul_imma_w16_dev");
@@ -1406,6 +1420,16 @@ static int imma_dev_q8(picolm_gpu_tensor_t *t, float *y_dev,
     const int8_t *xq, const float *xd, int S, int I, int O,
     int ys, gpu_device_ctx_t *ctx) {
     /* Phase 6 abandoned: Q8_0 34-byte blocks cause misaligned access. */
+    /* Phase 8: try shared-memory staged IMMA W16 (32x16 tiles, 64 threads). */
+    if (!getenv("PICOLM_NO_SM_IMMA") && ctx->has_imma && S >= 32 && O >= 16) {
+        gpu_dispatch_print("matmul_imma_smw16_dev");
+        dim3 grid((unsigned)((O + 15) / 16), (unsigned)((S + 31) / 32));
+        int smem = 16 * GPU_BLOCK_Q8_0_SIZE; /* ~544 bytes */
+        picolm_q8_q8_matmul_imma_smw16<<<grid, 64, smem, ctx->stream>>>(
+            y_dev, xq, xd, t->weights, S, I, O, (int)t->row_bytes, ys);
+        if (gpu_ok(gpuGetLastError(), "q8 smw16 matmul (dev)")) return 1;
+        /* Fall through to regular IMMA on error. */
+    }
 #if defined(PICOLM_IMMA_W16)
     if (ctx->has_imma && S >= 16 && O >= 16) {
         gpu_dispatch_print("matmul_imma_w16_dev");

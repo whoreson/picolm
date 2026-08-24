@@ -90,6 +90,14 @@ __global__ void picolm_rmsnorm_quantize_q8_0_kernel(int8_t *qs_out, float *d_out
                                                      const float *x, const float *weight,
                                                      int dim, float eps, int S, int x_stride);
 
+/* Phase 8: Shared-memory staged IMMA W16.
+ * 64 threads/block (2 warps), 32x16 output tiles.
+ * Weights staged in shared memory, reused across 32 output rows.
+ * Dynamic shared memory: 16 * GPU_BLOCK_Q8_0_SIZE bytes (~544B). */
+__global__ void picolm_q8_q8_matmul_imma_smw16(float *y, const int8_t *xq, const float *xd,
+                                                const void *weights, int S, int I, int O,
+                                                int row_bytes, int y_stride);
+
 /* Phase 6 (abandoned): see backend_gpu_kernels.cu for details.
  * PICOLM_ASYNC_SLOT_BYTES kept for backwards compat in dispatch dead-code. */
 #ifndef PICOLM_ASYNC_SLOT_BYTES
