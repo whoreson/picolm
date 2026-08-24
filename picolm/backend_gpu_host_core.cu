@@ -996,6 +996,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
     int ys = y_stride > 0 ? y_stride : O;
 
     if (t->qtype == GGUF_TYPE_Q8_0 && !getenv("PICOLM_FORCE_F32_MATMUL")) {
+        static int _dbg_q8 = 0; if(!_dbg_q8++){fprintf(stderr,"[DBG] matmul_dev q8 path S=%d I=%d O=%d ys=%d stride=%d qtype=%d\n",S,I,O,ys,x_stride,(int)t->qtype);}
         int n_blocks = I / 32;
         if (n_blocks < 1 || I % 32 != 0) return 0;
         int S_padded = (S + 15) & ~15;
