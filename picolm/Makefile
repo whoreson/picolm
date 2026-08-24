@@ -412,6 +412,8 @@ HUNGER_COBJS = $(HUNGER_CFILES:.c=.obj)
 HUNGER_CUOBS = backend_gpu_kernels_win.obj backend_gpu_host_core_win.obj backend_gpu_host_ssm_win.obj backend_gpu_host_misc_win.obj
 # cl.exe flags - all Make vars, NO batch %VAR% references
 HUNGER_CF = /O2 /W3 /wd4996 /arch:AVX512 /D PICOLM_GPU=1 /D PICOLM_CUDA=1 /D _CRT_SECURE_NO_WARNINGS /I. /I"$(HUNGER_CUDA_ROOT)/include" /openmp /c
+# hunger-nogpu: same as hunger but without GPU backend (pure MSVC, no nvcc, no cudart)
+HUNGER_CF_NOGPU = /O2 /W3 /wd4996 /arch:AVX512 /D _CRT_SECURE_NO_WARNINGS /I. /openmp /c
 
 hunger:
 	echo @echo off > .hunger_build.bat
@@ -468,6 +470,62 @@ hunger:
 	echo del /q $(HUNGER_CUOBS) 2^>nul >> .hunger_build.bat
 	echo del .hunger_build.bat >> .hunger_build.bat
 	cmd /c .hunger_build.bat
+
+# --- hunger-nogpu: pure MSVC build, no CUDA, no GPU backend ---
+# Useful for isolating CPU-only bugs on Windows (same compiler as hunger,
+# but without PICOLM_GPU so all GPU code is excluded at compile time).
+# Usage: make hunger-nogpu
+HUNGER_NOGPU_OBJS = $(HUNGER_CFILES:.c=.obj)
+
+hunger-nogpu:
+	echo @echo off > .hunger_nogpu_build.bat
+	echo del /q picolm.exe $(HUNGER_NOGPU_OBJS) 2^>nul >> .hunger_nogpu_build.bat
+	echo call "$(HUNGER_VS_ROOT)/VC/Auxiliary/Build/vcvars64.bat" >> .hunger_nogpu_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF_NOGPU) picolm.c >> .hunger_nogpu_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF_NOGPU) model_core.c >> .hunger_nogpu_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF_NOGPU) model_attention.c >> .hunger_nogpu_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF_NOGPU) model_moe.c >> .hunger_nogpu_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF_NOGPU) model_gemma3n.c >> .hunger_nogpu_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF_NOGPU) model_ssm.c >> .hunger_nogpu_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF_NOGPU) model_kv_cache.c >> .hunger_nogpu_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF_NOGPU) model_gguf.c >> .hunger_nogpu_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF_NOGPU) tensor.c >> .hunger_nogpu_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF_NOGPU) quant.c >> .hunger_nogpu_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF_NOGPU) tokenizer.c >> .hunger_nogpu_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF_NOGPU) qwen_tokenize.c >> .hunger_nogpu_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF_NOGPU) sampler.c >> .hunger_nogpu_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF_NOGPU) grammar.c >> .hunger_nogpu_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF_NOGPU) cJSON.c >> .hunger_nogpu_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF_NOGPU) server.c >> .hunger_nogpu_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF_NOGPU) csafetensors.c >> .hunger_nogpu_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF_NOGPU) json.c >> .hunger_nogpu_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF_NOGPU) safetensors.c >> .hunger_nogpu_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
+	echo $(HUNGER_LNK) /OUT:picolm.exe $(HUNGER_NOGPU_OBJS) ws2_32.lib advapi32.lib >> .hunger_nogpu_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
+	echo del /q $(HUNGER_NOGPU_OBJS) 2^>nul >> .hunger_nogpu_build.bat
+	echo del .hunger_nogpu_build.bat >> .hunger_nogpu_build.bat
+	cmd /c .hunger_nogpu_build.bat
+
+.PHONY: hunger-nogpu
 
 # ---- DJGPP (MS-DOS) target ----
 # Build host: Linux with cross-compiler at /data4/work/djgpp-build/djgpp-toolchain/bin/
