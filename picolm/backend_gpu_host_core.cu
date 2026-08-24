@@ -1475,25 +1475,25 @@ int picolm_gpu_matmul_dev_qkv(picolm_gpu_tensor_t *tq, picolm_gpu_tensor_t *tk, 
     int ys_q = y_stride_q > 0 ? y_stride_q : tq->O;
     int ys_kv = y_stride_kv > 0 ? y_stride_kv : tk->O;
 
-    /* Phase 4: try fused QKV IMMA kernel (single launch for all 3).
+    /* Phase 4: try fused QKV IMMA W16 kernel (single launch for all 3, 16x16 tiles).
      * Only on CUDA sm_80+ where IMMA is available. Falls back to 3x separate IMMA. */
 #ifdef PICOLM_CUDA
-    if (0 && ctx->has_imma && S >= 16 && tq->O >= 8 && tk->O >= 8 && tv->O >= 8 &&
+    if (ctx->has_imma && S >= 16 && tq->O >= 8 && tk->O >= 8 && tv->O >= 8 &&
         !getenv("PICOLM_NO_FUSED_QKV")) {
         int max_o = tq->O;
         if (tk->O > max_o) max_o = tk->O;
         if (tv->O > max_o) max_o = tv->O;
-        dim3 grid((unsigned)((max_o + 7) / 8), (unsigned)((S + 15) / 16));
+        dim3 grid((unsigned)((max_o + 15) / 16), (unsigned)((S + 15) / 16));
         picolm_q8_q8_matmul_imma_qkv<<<grid, 32, 0, ctx->stream>>>(
             bq, bk, bv,
             ctx->q8_xq, ctx->q8_xd,
             tq->weights, tk->weights, tv->weights,
             S, I, tq->O, tk->O, tv->O,
             (int)tq->row_bytes, ys_q, ys_kv);
-        if (gpu_ok(gpuGetLastError(), "q8 fused qkv imma (dev)")) {
-            gpu_dispatch_print("matmul_imma_qkv_dev");
+        if (gpu_ok(gpuGetLastError(), "q8 fused qkv imma w16 (dev)")) {
+            gpu_dispatch_print("matmul_imma_qkv_w16_dev");
             static int fused_info = 1;
-            if (fused_info) { fused_info = 0; fprintf(stderr, "INFO: QKV fused IMMA (1 launch, 1 quantize, S=%d)\n", S); }
+            if (fused_info) { fused_info = 0; fprintf(stderr, "INFO: QKV fused IMMA W16 (1 launch, 1 quantize, S=%d)\n", S); }
             return 1;
         }
     }
