@@ -989,6 +989,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
                        int S, int device, int y_stride, int x_stride) {
     if (!t || !y_dev || !x_dev || S < 1) return 0;
     if (t->I < 512 || t->O < 256) return 0;
+    static int _dbg_top = 0; if(!_dbg_top++){fprintf(stderr,"[DBG] matmul_dev ENTRY I=%d O=%d S=%d qtype=%d ys=%d xs=%d\n",t->I,t->O,S,(int)t->qtype,y_stride,x_stride);}
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!select_ctx(ctx)) return 0;
 
