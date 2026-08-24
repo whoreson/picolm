@@ -1017,6 +1017,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
         /* Phase 6 abandoned: Q8_0 34-byte blocks cause misaligned access. */
         /* Phase 8: shared-memory staged IMMA (32x16 tiles, 64 threads). */
         if (!getenv("PICOLM_NO_SM_IMMA") && ctx->has_imma && S >= 32 && O >= 16) {
+            static int _smw16_dbg = 0; if(!_smw16_dbg++) fprintf(stderr,"[DBG] smw16 dispatch S=%d O=%d\n",S,O);
             gpu_dispatch_print("matmul_imma_smw16_dev");
             dim3 grid((unsigned)((O + 15) / 16), (unsigned)((S + 31) / 32));
             int smem = 16 * GPU_BLOCK_Q8_0_SIZE;
@@ -1422,6 +1423,7 @@ static int imma_dev_q8(picolm_gpu_tensor_t *t, float *y_dev,
     /* Phase 6 abandoned: Q8_0 34-byte blocks cause misaligned access. */
     /* Phase 8: try shared-memory staged IMMA W16 (32x16 tiles, 64 threads). */
     if (!getenv("PICOLM_NO_SM_IMMA") && ctx->has_imma && S >= 32 && O >= 16) {
+        static int _smw16_dbg = 0; if(!_smw16_dbg++) fprintf(stderr,"[DBG] smw16 imma_dev_q8 S=%d O=%d\n",S,O);
         gpu_dispatch_print("matmul_imma_smw16_dev");
         dim3 grid((unsigned)((O + 15) / 16), (unsigned)((S + 31) / 32));
         int smem = 16 * GPU_BLOCK_Q8_0_SIZE; /* ~544 bytes */
