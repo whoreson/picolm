@@ -718,6 +718,23 @@ static void checkpoint_clear(void) {
  * The 'client_check' parameter is 1 to check client_alive between tokens,
  * 0 to skip (e.g. non-streaming paths that don't need per-token checks).
  */
+
+/* Unified prefill dispatch: GPU with CPU fallback, or CPU-only.
+ * Wraps the PICOLM_GPU #ifdef so callers never have to deal with it.
+ * This prevents double-call bugs from broken preprocessor nesting. */
+static float *server_model_prefill(model_t *model, const int *tokens,
+                                    int n_tokens, int start_pos,
+                                    volatile int *interrupt) {
+#ifdef PICOLM_GPU
+    if (model->gpu.kv_active) {
+        float *r = model_forward_prefill_gpu(model, tokens, n_tokens, start_pos, interrupt);
+        if (r) return r;
+        /* GPU failed, fall through to CPU */
+    }
+#endif
+    return model_forward_prefill(model, tokens, n_tokens, start_pos, interrupt);
+}
+
 static float *prefill_with_checkpoints(SOCKET sock, model_t *model,
                                        const int *tokens, int n_prefill, int start_pos,
                                        int *out_n_processed, int client_check) {
@@ -730,19 +747,8 @@ static float *prefill_with_checkpoints(SOCKET sock, model_t *model,
     /* Non-SSM model, or checkpointing disabled: single batched call */
     if (!model->config.has_ssm || srv.max_checkpoints <= 0) {
         if (n_prefill > 0) {
-            #ifdef PICOLM_GPU
-            if (model->gpu.kv_active) {
-                logits = model_forward_prefill_gpu(model, tokens, n_prefill, start_pos,
-                                                   client_check ? &interrupt : NULL);
-                if (!logits)
-#endif
-                    logits = model_forward_prefill(model, tokens, n_prefill, start_pos,
-                                                   client_check ? &interrupt : NULL);
-#ifdef PICOLM_GPU
-            } else
-#endif
-                logits = model_forward_prefill(model, tokens, n_prefill, start_pos,
-                                               client_check ? &interrupt : NULL);
+            logits = server_model_prefill(model, tokens, n_prefill, start_pos,
+                                          client_check ? &interrupt : NULL);
             if (!logits) {
                 /* Interrupted during prefill */
                 *out_n_processed = n_processed;
@@ -788,19 +794,8 @@ static float *prefill_with_checkpoints(SOCKET sock, model_t *model,
             checkpoint_save(cur_pos);
         }
 
-        #ifdef PICOLM_GPU
-        if (model->gpu.kv_active) {
-            logits = model_forward_prefill_gpu(model, tokens + offset, chunk_size, cur_pos,
-                                               client_check ? &interrupt : NULL);
-            if (!logits)
-#endif
-                logits = model_forward_prefill(model, tokens + offset, chunk_size, cur_pos,
-                                               client_check ? &interrupt : NULL);
-#ifdef PICOLM_GPU
-        } else
-#endif
-            logits = model_forward_prefill(model, tokens + offset, chunk_size, cur_pos,
-                                           client_check ? &interrupt : NULL);
+        logits = server_model_prefill(model, tokens + offset, chunk_size, cur_pos,
+                                      client_check ? &interrupt : NULL);
         if (!logits) {
             /* Interrupted inside model_forward_prefill */
             *out_n_processed = n_processed;
