@@ -2683,6 +2683,7 @@ int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
     int n_vpk = n_k > 0 ? n_v / n_k : 0, half_vpk = n_vpk / 2;
     int do_remap = !m->from_safetensors && n_k > 0 && n_k < n_v && half_vpk > 0;
     int ok=1;
+    #define _SSM_OK_CHECK(step) do { if(!ok) { fprintf(stderr,"WARN: ssm_prefill_layer_gpu l=%d failed at %s\n",l,step); return 0; } } while(0)
     /* Pipe buffer stride: must match pipeline_batch_alloc's xb_stride calculation */
     int xb2_stride = c->n_heads * c->head_dim * (c->has_ssm ? 2 : 1);
     if (dim > xb2_stride) xb2_stride = dim;
@@ -2716,13 +2717,16 @@ int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
     } while(0)
 
     ok&=picolm_gpu_rmsnorm_batched_dev(bffn_norm,bx,(float*)gw->attn_norm_dev[l],dim,eps,n_tokens,xb2_stride,dev);
+    _SSM_OK_CHECK("rmsnorm");
     SSM_DBG_SYNC;
     _DBG_RMS("rmsnorm",bffn_norm,xb2_stride);
     /* QKV + Z-gate projections (read from RMSNorm'd input at xb2_stride) */
     ok&=picolm_gpu_matmul_dev((picolm_gpu_tensor_t*)gl->attn_qkv,bxb,bffn_norm,n_tokens,dev,xb2_stride,xb2_stride);
+    _SSM_OK_CHECK("qkv_matmul");
     SSM_DBG_SYNC;
     _DBG_RMS("qkv",bxb,xb2_stride);
     ok&=picolm_gpu_matmul_dev((picolm_gpu_tensor_t*)gl->attn_gate_ssm,bq,bffn_norm,n_tokens,dev,xb2_stride,xb2_stride);
+    _SSM_OK_CHECK("gate_matmul");
     SSM_DBG_SYNC;
     _DBG_RMS("gate",bq,xb2_stride);
     if(l<=4&&_SSM_DBG) {
@@ -2742,16 +2746,19 @@ int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
         fprintf(stderr, "[DBG l%d] conv_state[0][:4]={%.6f,%.6f,%.6f,%.6f}\n", l, cs[0],cs[1],cs[2],cs[3]);
     }
     /* Conv1d + silu (in-place on bxb which has QKV output) */
-    ok&=picolm_gpu_ssm_conv1d_batch_dev(bxb,cs_dev,bxb,(float*)gw->ssm_conv1d_dev[l],conv_dim,c->ssm_d_conv,n_tokens,dev,xb2_stride);
+        ok&=picolm_gpu_ssm_conv1d_batch_dev(bxb,cs_dev,bxb,(float*)gw->ssm_conv1d_dev[l],conv_dim,c->ssm_d_conv,n_tokens,dev,xb2_stride);
+    _SSM_OK_CHECK("conv1d");
     SSM_DBG_SYNC;
     _DBG_RMS("conv1d",bxb,xb2_stride);
     /* L2 norm Q/K */
     _DBG_RMS("pre_l2_q",bxb,xb2_stride);
     if(ok){float qs=1.0f/sqrtf((float)d_state);
-      ok&=picolm_gpu_ssm_l2norm_batch_dev(bxb,d_state,n_k,n_tokens,xb2_stride,1e-12f,qs,dev);
+            ok&=picolm_gpu_ssm_l2norm_batch_dev(bxb,d_state,n_k,n_tokens,xb2_stride,1e-12f,qs,dev);
+      _SSM_OK_CHECK("l2norm_q");
     SSM_DBG_SYNC;
     _DBG_RMS("l2norm_q",bxb,xb2_stride);
-      ok&=picolm_gpu_ssm_l2norm_batch_dev(bxb+qk_dim,d_state,n_k,n_tokens,xb2_stride,1e-12f,1.0f,dev);
+            ok&=picolm_gpu_ssm_l2norm_batch_dev(bxb+qk_dim,d_state,n_k,n_tokens,xb2_stride,1e-12f,1.0f,dev);
+      _SSM_OK_CHECK("l2norm_k");
     _DBG_RMS("l2norm_k",bxb+qk_dim,xb2_stride);
       _DBG_TOK("Q",bxb);}
     /* Head permute V. bxb+2*qk_dim can't be permuted into itself --
@@ -2781,8 +2788,11 @@ int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
       if(bt!=0&&bt!=2&&bt!=8&&bt!=30){static int w2=0;if(!w2){fprintf(stderr,"WARN: ssm_prefill_layer_gpu bail: beta type=%d (need F32/Q4_0/Q8_0/BF16)\n",(int)bt);w2=1;}return 0;}
       const int *hm=do_remap&&gw->ssm_head_map_dev?(const int*)gw->ssm_head_map_dev:NULL;
       ok&=picolm_gpu_ssm_vecdot_batch_dev(bgate,bffn_norm,(void*)picolm_gpu_tensor_weights((picolm_gpu_tensor_t*)gl->ssm_alpha),at,dim,n_v,n_tokens,(int)ra,hm,dev,xb2_stride,xb2_stride);
+      _SSM_OK_CHECK("vecdot_alpha");
     SSM_DBG_SYNC;
-      ok&=picolm_gpu_ssm_vecdot_batch_dev(bup,bffn_norm,(void*)picolm_gpu_tensor_weights((picolm_gpu_tensor_t*)gl->ssm_beta),bt,dim,n_v,n_tokens,(int)rb,hm,dev,xb2_stride,xb2_stride);}
+      ok&=picolm_gpu_ssm_vecdot_batch_dev(bup,bffn_norm,(void*)picolm_gpu_tensor_weights((picolm_gpu_tensor_t*)gl->ssm_beta),bt,dim,n_v,n_tokens,(int)rb,hm,dev,xb2_stride,xb2_stride);
+      _SSM_OK_CHECK("vecdot_beta");
+    }
     SSM_DBG_SYNC;
 #ifdef PICOLM_SSM_VERIFY
     if(ok && l == 0) {
@@ -2799,7 +2809,9 @@ int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
     /* Gate/beta post-process */
     if(ok){float *dw=(float*)gw->ssm_dt_dev[l],*aw=(float*)gw->ssm_a_dev[l];
       if(!dw||!aw)return 0;
-      ok&=picolm_gpu_ssm_gate_beta_batch_dev(bgate,bup,bgate,bup,dw,aw,n_v,n_tokens,dev,xb2_stride);}
+      ok&=picolm_gpu_ssm_gate_beta_batch_dev(bgate,bup,bgate,bup,dw,aw,n_v,n_tokens,dev,xb2_stride);
+      _SSM_OK_CHECK("gate_beta");
+    }
     SSM_DBG_SYNC;
     /* Chunked recurrence */
     /* Step-by-step verify: D2H intermediates after each GPU kernel, compare with CPU */
@@ -2859,6 +2871,7 @@ int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
     }
     if(ok){
         ok&=picolm_gpu_ssm_chunked_recurrence_dev(bxb,bgate,bup,st_dev,battn_out,n_tokens,value_dim,xb2_stride,d_state,n_k,n_v,hvdim,repeat,conv_dim,64,dev);
+        _SSM_OK_CHECK("chunked_recurrence");
     SSM_DBG_SYNC;
         _DBG_TOK("xb2",battn_out);
         if(ok && _SSM_DBG && l <= 4) {
@@ -2940,7 +2953,9 @@ int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
               l, (float)sqrt(nr/hvdim),nwa[0],nwa[1],nwa[2],nwa[3],nwa[4],nwa[5],nwa[6],nwa[7]);
           free(nwa);
       }
-      ok&=picolm_gpu_ssm_prefill_gated_norm_dev(battn_out,bq,nw,hvdim,n_v,n_tokens,eps,xb2_stride,value_dim,dev);}
+      ok&=picolm_gpu_ssm_prefill_gated_norm_dev(battn_out,bq,nw,hvdim,n_v,n_tokens,eps,xb2_stride,value_dim,dev);
+      _SSM_OK_CHECK("gated_norm");
+    }
     if(l<=4&&_SSM_DBG){
         /* Z-gate (bq) per-head dump (bq has value_dim stride from head_permute) */
         { size_t lt2=(size_t)(n_tokens-1)*value_dim;
@@ -3070,6 +3085,7 @@ int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
           free(sw_bf); free(xb_last);
       }
       ok&=picolm_gpu_matmul_dev((picolm_gpu_tensor_t*)gl->ssm_out,bffn_norm,bxb,n_tokens,dev,xb2_stride,value_dim);
+      _SSM_OK_CHECK("ssm_out_matmul");
     SSM_DBG_SYNC;
       if(l <= 4 && _SSM_DBG) {
           picolm_gpu_sync(dev);
@@ -3077,7 +3093,9 @@ int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
           double srms=0;for(int _i=0;_i<8;_i++)srms+=so[_i]*so[_i];
           fprintf(stderr,"[CMP l%d] ssm_out_last[:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f} rms8=%.6f\n",l,so[0],so[1],so[2],so[3],so[4],so[5],so[6],so[7],sqrt(srms/8));
       }
-      ok&=picolm_gpu_residual_add(bx,bx,bffn_norm,n_tokens,dim,xb2_stride,dev);}
+      ok&=picolm_gpu_residual_add(bx,bx,bffn_norm,n_tokens,dim,xb2_stride,dev);
+      _SSM_OK_CHECK("ssm_residual");
+    }
     SSM_DBG_SYNC;
     if(l <= 4 && _SSM_DBG) {
         picolm_gpu_sync(dev);
@@ -3107,6 +3125,7 @@ int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
           free(bxi);
       }
       ok&=picolm_gpu_rmsnorm_batched_dev(bffn_norm,bx,(float*)gw->post_attn_norm_dev[l],dim,eps,n_tokens,xb2_stride,dev);
+      _SSM_OK_CHECK("ffn_rmsnorm");
     SSM_DBG_SYNC;
     if(l<=4&&_SSM_DBG) {
         float *bn=(float*)malloc(dim*4); picolm_gpu_sync(dev);
@@ -3118,6 +3137,7 @@ int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
         fprintf(stderr,"[DBG] l=%d bffn_norm_last[:4]={%.6f,%.6f,%.6f,%.6f}\n",l,bn[0],bn[1],bn[2],bn[3]);
     }
       ok&=picolm_gpu_expert_mlp_dev((picolm_gpu_tensor_t*)gl->ffn_gate,(picolm_gpu_tensor_t*)gl->ffn_up,(picolm_gpu_tensor_t*)gl->ffn_down,battn_out,bffn_norm,n_tokens,xb2_stride,xb2_stride,dev);
+      _SSM_OK_CHECK("ffn_expert_mlp");
     SSM_DBG_SYNC;
       if(l<=4&&_SSM_DBG) {
         { float ffn0o[4];
@@ -3126,7 +3146,9 @@ int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
           fprintf(stderr,"[DBG] l=%d ffn_out_tok0[:4]={%.6f,%.6f,%.6f,%.6f}\n",l,ffn0o[0],ffn0o[1],ffn0o[2],ffn0o[3]);
         }
       }
-      ok&=picolm_gpu_residual_add(bx,bx,battn_out,n_tokens,dim,xb2_stride,dev);}
+      ok&=picolm_gpu_residual_add(bx,bx,battn_out,n_tokens,dim,xb2_stride,dev);
+      _SSM_OK_CHECK("ffn_residual");
+    }
     SSM_DBG_SYNC;
     if (l == 0 && ok && _SSM_DBG) {
         float fi[8];
