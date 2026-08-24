@@ -2437,21 +2437,25 @@ ssm_forward_gpu(model_t *m, run_state_t *s, float *x, float *residual,
 
     /* 1. RMSNorm: pipe_xb = rmsnorm(pipe_x, attn_norm) */
     if (!picolm_gpu_rmsnorm_dev(pipe_xb, pipe_x,
-            (float *)gw->attn_norm_dev[il], dim, eps, device)) return 0;
+            (float *)gw->attn_norm_dev[il], dim, eps, device)) {
+        fprintf(stderr,"WARN: ssm_forward_gpu l=%d p=%d failed at rmsnorm\n",il,pos); return 0; }
 
     /* 2. QKV projection: ssm_qkv_raw = attn_qkv @ pipe_xb */
     if (!picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_qkv,
-            ssm_qkv_raw, pipe_xb, 1, device, 0, 0)) return 0;
+            ssm_qkv_raw, pipe_xb, 1, device, 0, 0)) {
+        fprintf(stderr,"WARN: ssm_forward_gpu l=%d p=%d failed at qkv_proj\n",il,pos); return 0; }
 
     /* 3. Z gate: ssm_xb2 = attn_gate_ssm @ pipe_xb */
     if (!picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_gate_ssm,
-            ssm_xb2, pipe_xb, 1, device, 0, 0)) return 0;
+            ssm_xb2, pipe_xb, 1, device, 0, 0)) {
+        fprintf(stderr,"WARN: ssm_forward_gpu l=%d p=%d failed at gate_proj\n",il,pos); return 0; }
 
     /* 3b. Head permute xb2 (GGUF v-head reorder) */
     float *xb2_src = ssm_xb2;
     if (do_remap) {
         if (!picolm_gpu_ssm_head_permute_dev(ssm_xb2_remap, ssm_xb2,
-                head_map_dev, head_v_dim, n_v_heads, device)) return 0;
+                head_map_dev, head_v_dim, n_v_heads, device)) {
+            fprintf(stderr,"WARN: ssm_forward_gpu l=%d p=%d failed at xb2_permute\n",il,pos); return 0; }
         xb2_src = ssm_xb2_remap;
     }
 
@@ -4240,6 +4244,8 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
             /* SSM/hybrid layer: try GPU-native path first, fallback to CPU hybrid */
             if (!ssm_forward_gpu(m, s, s->x, s->xb2, lw, l, pos,
                                   &m->gpu.layers[l], gpu_dev)) {
+                static int w2 = 0;
+                if (!w2) { fprintf(stderr, "WARN: SSM decode GPU->CPU fallback\n"); w2 = 1; }
                 /* Fallback to CPU hybrid.
                  * When GPU prefill was used, the SSM persistent state (conv_state,
                  * recurrence state) lives only on GPU. Sync it to CPU so that
