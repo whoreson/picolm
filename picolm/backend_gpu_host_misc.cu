@@ -1324,7 +1324,7 @@ int picolm_gpu_ssm_vecdot_batch_dev(float *od, const float *xd, const void *wd, 
     if(!ctx||!select_ctx(ctx)) return 0;
 
     /* IMMA fast path for Q8_0, F32, BF16 weights */
-    if ((qt == GGUF_TYPE_Q8_0 || qt == GGUF_TYPE_F32 || qt == 30) && !getenv("PICOLM_FORCE_F32_MATMUL") && !getenv("PICOLM_NO_VECDOT_IMMA")) {
+    if (qt == GGUF_TYPE_Q8_0 && !getenv("PICOLM_FORCE_F32_MATMUL") && !getenv("PICOLM_NO_VECDOT_IMMA")) {
         int n_blocks = dim / 32;
         if (n_blocks >= 1 && dim % 32 == 0) {
             void *wq8 = (void *)wd; /* Q8_0: use directly, others: use pre-quantized copy */
