@@ -137,11 +137,76 @@ static char *unescape_prompt(char *s) {
     return s;
 }
 
+/* Hardcoded chat templates, indexed by model type */
+static const char *tmpl_gemma_prefix = "<start_of_turn>user\n";
+static const char *tmpl_gemma_suffix = "<end_of_turn>\n<start_of_turn>model\n";
+
+static const char *tmpl_chatml_prefix =
+    "<|im_start|>system\n"
+    "A chat between a curious user and an assistant.\n"
+    "<|im_end|>\n"
+    "<|im_start|>user\n";
+static const char *tmpl_chatml_suffix =
+    "<|im_end|>\n"
+    "<|im_start|>assistant\n"
+    "<think>\n"
+    "\n"
+    "</think>\n";
+
+static const char *tmpl_alpaca_prefix =
+    "Below is an instruction that describes a task. Write a response that appropriately completes the request.\r\n\r\n"
+    "### Instruction:\r\n";
+static const char *tmpl_alpaca_suffix = "\r\n\r\n### Response:\r\n";
+
+/* Apply model-appropriate chat template to a prompt string.
+ * Returns a newly malloc'd string on success, NULL on failure. */
+static char *apply_chat_template(const char *model_path, const char *raw_prompt) {
+    const char *prefix, *suffix;
+
+    /* Extract basename from model_path */
+    const char *base = strrchr(model_path, '/');
+    if (base) base++;
+    else base = model_path;
+    if (base == NULL) return NULL;
+
+    /* Case-insensitive match */
+    char lower[512];
+    size_t blen = strlen(base);
+    if (blen >= sizeof(lower)) blen = sizeof(lower) - 1;
+    for (size_t i = 0; i < blen; i++) {
+        lower[i] = (char)((base[i] >= 'A' && base[i] <= 'Z') ? base[i] + 32 : base[i]);
+    }
+    lower[blen] = '\0';
+
+    if (strstr(lower, "gemma")) {
+        prefix = tmpl_gemma_prefix;
+        suffix = tmpl_gemma_suffix;
+    } else if (strstr(lower, "qwen")) {
+        prefix = tmpl_chatml_prefix;
+        suffix = tmpl_chatml_suffix;
+    } else {
+        prefix = tmpl_alpaca_prefix;
+        suffix = tmpl_alpaca_suffix;
+    }
+
+    size_t pflen = strlen(prefix);
+    size_t p_len = strlen(raw_prompt);
+    size_t sflen = strlen(suffix);
+    char *result = malloc(pflen + p_len + sflen + 1);
+    if (!result) return NULL;
+    memcpy(result, prefix, pflen);
+    memcpy(result + pflen, raw_prompt, p_len);
+    memcpy(result + pflen + p_len, suffix, sflen);
+    result[pflen + p_len + sflen] = '\0';
+    return result;
+}
+
 static void usage(const char *prog) {
     fprintf(stderr, "PicoLLM - ultra-lightweight LLM inference engine\n\n");
     fprintf(stderr, "Usage: %s <model.gguf> [options]\n", prog);
     fprintf(stderr, "\nGeneration options:\n");
     fprintf(stderr, "  -p <prompt>    Input prompt (or pipe via stdin)\n");
+    fprintf(stderr, "  -pf <prompt>   Like -p, but wraps prompt in model-appropriate chat template\n");
     fprintf(stderr, "  -n <int>       Max tokens to generate (default: 256)\n");
     fprintf(stderr, "  -t <float>     Temperature (default: 0.8, 0=greedy)\n");
     fprintf(stderr, "  -k <float>     Top-p / nucleus sampling (default: 0.9)\n");
@@ -763,6 +828,7 @@ int main(int argc, char **argv) {
     const char *model_path = NULL;
     char *prompt_buf = NULL;   /* malloc'd buffer for -p prompt (may be modified by unescape) */
     const char *prompt = NULL;
+    int prompt_flag_f = 0;     /* -pf: apply chat template */
     int    max_tokens = 256;
     float  temperature = 0.8f;
     float  top_p = 0.9f;
@@ -817,6 +883,19 @@ int main(int argc, char **argv) {
             continue;
         }
         if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+#ifdef PICOLM_DOS
+            { size_t len = strlen(argv[i+1]) + 1;
+              prompt_buf = malloc(len);
+              if (!prompt_buf) { fprintf(stderr, "strdup failed\n"); return 1; }
+              memcpy(prompt_buf, argv[++i], len); }
+#else
+            prompt_buf = strdup(argv[++i]);
+            if (!prompt_buf) { fprintf(stderr, "strdup failed\n"); return 1; }
+#endif
+            unescape_prompt(prompt_buf);
+            prompt = prompt_buf;
+        } else if (strcmp(argv[i], "-pf") == 0 && i + 1 < argc) {
+            prompt_flag_f = 1;
 #ifdef PICOLM_DOS
             { size_t len = strlen(argv[i+1]) + 1;
               prompt_buf = malloc(len);
@@ -1258,6 +1337,19 @@ int main(int argc, char **argv) {
     int *cache_tokens = NULL;
     if (cache_file) {
         cache_pos = kvcache_load(&model, cache_file, &cache_tokens);
+    }
+
+    /* Apply chat template for -pf */
+    if (prompt_flag_f) {
+        char *templated = apply_chat_template(model_path, prompt);
+        if (templated) {
+            fprintf(stderr, "Applied chat template\n");
+            if (prompt_buf) free(prompt_buf);
+            prompt_buf = templated;
+            prompt = prompt_buf;
+        } else {
+            fprintf(stderr, "WARN: failed to apply chat template, using raw prompt\n");
+        }
     }
 
     /* Encode prompt */
