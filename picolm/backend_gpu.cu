@@ -5277,7 +5277,6 @@ picolm_gpu_kv_pack_store_kernel(uint16_t *dst_row, const float *src, int n) {
     }
 }
 
-/* Device-native KV store: src_dev is pipe_k/pipe_v (F32, already on
  * device, kv_dim = n_kv_heads*head_dim elements). No transfer, no sync --
  * same ctx->stream ordering argument as the other _dev primitives.
  * Caller must call this (K then V) before picolm_gpu_attention_decode_dev
@@ -5310,30 +5309,6 @@ picolm_gpu_kv_store_dev(int is_k, int layer_ordinal, int pos,
  * since the device KV cache has no per-row padding, S contiguous source
  * rows map to S contiguous destination rows. One launch for the whole
  * prefill chunk. */
-extern "C" int
-picolm_gpu_kv_store_dev_batched(int is_k, int layer_ordinal, int start_pos, int n_positions,
-                                 const float *src_dev, int n_kv_heads, int head_dim,
-                                 int max_seq_len, int device) {
-    gpu_device_ctx_t *ctx = find_ctx(device);
-    if (!ctx || !select_ctx(ctx)) return 0;
-    if (!g_kv_k_dev[device] || !g_kv_v_dev[device]) return 0;
-
-    int kv_dim = n_kv_heads * head_dim;
-    size_t row_bytes = (size_t)kv_dim * sizeof(uint16_t);
-    uint16_t *dst_base = is_k ? g_kv_k_dev[device] : g_kv_v_dev[device];
-    uint16_t *dst_row = dst_base
-        + ((size_t)layer_ordinal * max_seq_len * row_bytes
-           + (size_t)start_pos * row_bytes) / sizeof(uint16_t);
-
-    int total = n_positions * kv_dim;
-    int n_threads = 256;
-    int n_blocks = min((total + n_threads - 1) / n_threads, 4096);
-    picolm_gpu_kv_pack_store_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
-        dst_row, src_dev, total);
-    if (!gpu_ok(gpuGetLastError(), "kv pack+store batched (dev)")) return 0;
-    return 1;
-}
-
 extern "C" int
 picolm_gpu_kv_store_rows(int is_k, int layer_ordinal, int start_pos, int n_positions,
                           const void *host_rows, size_t row_bytes,

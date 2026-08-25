@@ -2768,6 +2768,13 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #ifdef PICOLM_GPU
     int gpu_ok = m->gpu.active;
     int gpu_dev = m->gpu.device;
+    /* PICOLM_PREFILL_CPU: force all GPU dispatches in prefill to CPU fallback.
+     * Setting gpu_ok=0 disables every if(gpu_ok) branch in this function,
+     * and tensor_set_gpu_tensor(NULL) prevents matmul/matmul_batch from
+     * dispatching to GPU. SSM layers also pass NULL for gpu_lw. */
+    if (getenv("PICOLM_PREFILL_CPU")) {
+        gpu_ok = 0;
+    }
 #endif
     int n_active_layers = c->n_layers - c->n_mtp_layers;
     for (int slot = 0; slot < n_active_layers; slot++) {
@@ -2803,7 +2810,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                 ssm_prefill_layer(m, s, x_batch, xb_batch, xb2_batch,
                                   hb_batch, hb2_batch, lw, l,
                                   n_tokens, start_pos, xb2_stride,
-                                  (void **)m->gpu.layers);
+                                  gpu_ok ? (void **)m->gpu.layers : NULL);
 #else
                 ssm_prefill_layer(m, s, x_batch, xb_batch, xb2_batch,
                                   hb_batch, hb2_batch, lw, l,
@@ -2815,7 +2822,8 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                     memcpy(s->x, x_batch + bi * dim, dim * sizeof(float));
                     float *ssm_residual = s->xb2;
 #ifdef PICOLM_GPU
-                    ssm_forward(m, s, s->x, ssm_residual, lw, l, start_pos + bi, &m->gpu.layers[l]);
+                    ssm_forward(m, s, s->x, ssm_residual, lw, l, start_pos + bi,
+                                gpu_ok ? &m->gpu.layers[l] : NULL);
 #else
                     ssm_forward(m, s, s->x, ssm_residual, lw, l, start_pos + bi, NULL);
 #endif
@@ -2826,6 +2834,14 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
             /* Push the last token in the batch for visualization */
             viz_push_layer(l, x_batch + (n_tokens - 1) * dim, dim);
 #endif
+            if (getenv("PICOLM_ATTN_DBG")) {
+                int lt = n_tokens - 1;
+                double r=0;for(int _i=0;_i<8;_i++){float a=x_batch[lt*dim+_i];r+=a*a;}
+                fprintf(stderr, "[ATN_DBG l=%d S] last_tok[:4]={", l);
+                for(int _i=0;_i<4;_i++) fprintf(stderr,"%.6f ",x_batch[lt*dim+_i]);
+                fprintf(stderr, "} rms8=%.6f\n", sqrtf(r/8));
+                fflush(stderr);
+            }
             BENCH_LAYER_END(l, 1);
             continue;
         }
@@ -2833,6 +2849,14 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         /* RMSNorm */
         for (bi = 0; bi < n_tokens; bi++)
             rmsnorm(xb_batch + bi * dim, x_batch + bi * dim, s->attn_norm_w[l], dim, c->rms_norm_eps);
+
+        /* Diagnostic: dump RMSNorm'd input to first attention layer */
+        if (getenv("PICOLM_ATTN_DBG") && lw->is_attn_layer) {
+            int lt = n_tokens - 1;
+            fprintf(stderr, "[ATN_DBG l=%d C_RN] last_tok[:8]={", l);
+            for(int _i=0;_i<8;_i++) fprintf(stderr,"%.6f ",xb_batch[lt*dim+_i]);
+            fprintf(stderr, "}\n"); fflush(stderr);
+        }
 
         /* Q projection (batched) */
         tensor_set_repacked(m->repack_used[2+l*9] ? m->repack_buffers[2+l*9] : NULL);
@@ -3208,6 +3232,15 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #ifdef PICOLM_VIZ
         viz_push_layer(l, x_batch + (n_tokens - 1) * dim, dim);
 #endif
+        if (getenv("PICOLM_ATTN_DBG")) {
+            int lt = n_tokens - 1;
+            double r=0;for(int _i=0;_i<8;_i++){float a=x_batch[lt*dim+_i];r+=a*a;}
+            char *tag = lw->is_attn_layer ? "A" : "S";
+            fprintf(stderr, "[ATN_DBG l=%d %s] last_tok[:4]={", l, tag);
+            for(int _i=0;_i<4;_i++) fprintf(stderr,"%.6f ",x_batch[lt*dim+_i]);
+            fprintf(stderr, "} rms8=%.6f\n", sqrtf(r/8));
+            fflush(stderr);
+        }
         if (_SSM_DBG && lw->is_attn_layer) {
             int lt = n_tokens - 1;
             fprintf(stderr, "[DBG CPU attn l=%d] bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n", l, x_batch[lt*dim], x_batch[lt*dim+1], x_batch[lt*dim+2], x_batch[lt*dim+3]);
@@ -3229,6 +3262,24 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #ifdef PICOLM_GPU
     tensor_set_gpu_tensor(NULL, 0);
 #endif
+
+    /* Diagnostic: dump CPU prefill logits top-5 */
+    if (getenv("PICOLM_PREFILL_LOGITS")) {
+        { int top_t[5]; float top_v[5];
+          for(int t=0;t<5;t++){top_t[t]=-1;top_v[t]=-1e30f;}
+          for(int v=0;v<m->config.vocab_size;v++){
+            float val=s->logits[v];
+            if(val<=top_v[4]) continue;
+            int ip=4;while(ip>0&&val>top_v[ip-1]){top_v[ip]=top_v[ip-1];top_t[ip]=top_t[ip-1];ip--;}
+            top_v[ip]=val;top_t[ip]=v;
+          }
+          fprintf(stderr,"[PFX_LOGITS] CPU: ");
+          for(int t=0;t<5;t++) fprintf(stderr,"%d(%+.4f) ",top_t[t],top_v[t]);
+          fprintf(stderr,"\n");
+          fflush(stderr);
+        }
+    }
+
     free(buf);
     return s->logits;
 }

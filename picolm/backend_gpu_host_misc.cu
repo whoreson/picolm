@@ -1,6 +1,11 @@
 // backend_gpu_host_misc.cu - KV cache, pipeline, attention, rmsnorm, rope, residual, misc
 #include "backend_gpu_kernels.cuh"
 
+extern "C" {
+__global__ void picolm_gpu_kv_pack_store_kernel(uint16_t *dst_row, const float *src, int n);
+}
+
+
 /* Print once per kernel type when first dispatched */
 static void gpu_dispatch_print(const char *name) {
     static char seen_names[64][64] = {0};
@@ -321,6 +326,20 @@ picolm_gpu_fp32_to_fp16(float f) {
     return (uint16_t)(sign | ((uint32_t)exp << 10) | (mant >> 13));
 }
 
+/* Strided KV pack+store kernel: src has tokens packed at src_stride (not kv_dim).
+ * Used by GPU prefill ubatch loop where bk/bv have xb_stride layout. */
+__global__ void
+picolm_gpu_kv_pack_store_strided_kernel(uint16_t *dst_row, const float *src,
+    int kv_dim, int n_tokens, int src_stride) {
+    for (int i = gpuThreadIdx_x + (int)gpuBlockIdx_x * gpuBlockDim_x;
+         i < n_tokens * kv_dim;
+         i += (int)gridDim.x * gpuBlockDim_x) {
+        int t = i / kv_dim;
+        int d = i % kv_dim;
+        dst_row[i] = picolm_gpu_fp32_to_fp16(src[(size_t)t * src_stride + d]);
+    }
+}
+
 /* Pack a device-resident F32 [n_kv_heads*head_dim] vector to F16 and
  * write it directly into the device KV cache row for (layer_ordinal,
  * pos). One thread per element, grid-stride, no shared memory. This
@@ -372,6 +391,14 @@ extern "C" int
 picolm_gpu_kv_store_dev_batched(int is_k, int layer_ordinal, int start_pos, int n_positions,
                                  const float *src_dev, int n_kv_heads, int head_dim,
                                  int max_seq_len, int device) {
+    return picolm_gpu_kv_store_dev_batched_strided(is_k, layer_ordinal, start_pos,
+        n_positions, src_dev, n_kv_heads, head_dim, max_seq_len, device, 0);
+}
+
+extern "C" int
+picolm_gpu_kv_store_dev_batched_strided(int is_k, int layer_ordinal, int start_pos, int n_positions,
+                                         const float *src_dev, int n_kv_heads, int head_dim,
+                                         int max_seq_len, int device, int src_stride) {
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
     if (!g_kv_k_dev[device] || !g_kv_v_dev[device]) return 0;
@@ -386,9 +413,30 @@ picolm_gpu_kv_store_dev_batched(int is_k, int layer_ordinal, int start_pos, int 
     int total = n_positions * kv_dim;
     int n_threads = 256;
     int n_blocks = min((total + n_threads - 1) / n_threads, 4096);
-    picolm_gpu_kv_pack_store_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
-        dst_row, src_dev, total);
+    if (src_stride > 0 && src_stride != kv_dim) {
+        picolm_gpu_kv_pack_store_strided_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
+            dst_row, src_dev, kv_dim, n_positions, src_stride);
+    } else {
+        picolm_gpu_kv_pack_store_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
+            dst_row, src_dev, total);
+    }
     if (!gpu_ok(gpuGetLastError(), "kv pack+store batched (dev)")) return 0;
+    return 1;
+}
+
+extern "C" int
+picolm_gpu_kv_debug_dump(int is_k, int layer_ordinal, int pos,
+                          uint16_t *dst, int n_elements, int n_kv_heads,
+                          int head_dim, int max_seq_len, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    if (!g_kv_k_dev[device]) return 0;
+    uint16_t *src_base = is_k ? g_kv_k_dev[device] : g_kv_v_dev[device];
+    int kv_dim = n_kv_heads * head_dim;
+    uint16_t *src_row = src_base + (size_t)layer_ordinal * max_seq_len * kv_dim + (size_t)pos * kv_dim;
+    if (!gpu_ok(gpuMemcpy(dst, src_row, n_elements * sizeof(uint16_t), gpuMemcpyDeviceToHost),
+                "kv_debug_dump D2H"))
+        return 0;
     return 1;
 }
 

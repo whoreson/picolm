@@ -409,6 +409,9 @@ int picolm_gpu_kv_store_dev(int is_k, int layer_ordinal, int pos,
 int picolm_gpu_kv_store_dev_batched(int is_k, int layer_ordinal, int start_pos, int n_positions,
                                      const float *src_dev, int n_kv_heads, int head_dim,
                                      int max_seq_len, int device);
+int picolm_gpu_kv_store_dev_batched_strided(int is_k, int layer_ordinal, int start_pos, int n_positions,
+                                             const float *src_dev, int n_kv_heads, int head_dim,
+                                             int max_seq_len, int device, int src_stride);
 
 /* Bulk KV cache upload from host F16 cache.
  * Copies all n_positions for a single layer from host_rows (contiguous
@@ -417,6 +420,11 @@ int picolm_gpu_kv_store_dev_batched(int is_k, int layer_ordinal, int start_pos, 
 int picolm_gpu_kv_upload_layer(int is_k, int layer_ordinal, int n_positions,
                                 const uint16_t *host_rows, int n_kv_heads,
                                 int head_dim, int max_seq_len, int device);
+
+/* Debug: read KV cache from device to host. dst must have space for n_elements. */
+int picolm_gpu_kv_debug_dump(int is_k, int layer_ordinal, int pos,
+                              uint16_t *dst, int n_elements, int n_kv_heads,
+                              int head_dim, int max_seq_len, int device);
 
 /* Decode-path attention: S=1, one query per head, online softmax over pos+1
  * cached positions. q is host pointer [n_heads][head_dim] in F32.

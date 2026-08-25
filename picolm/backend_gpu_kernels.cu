@@ -727,7 +727,7 @@ picolm_q6_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
         int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
         int d0b = 0, d1b = 0, d2b = 0, d3b = 0;
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__)
         /* First IMMA: b0 real, b1 zero */
         asm volatile(
             "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
@@ -810,7 +810,7 @@ picolm_q8_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
             memcpy(&b1, wblk + r1, 4);
         }
         int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__)
         asm volatile(
             "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -907,7 +907,7 @@ picolm_q8_q8_matmul_imma_w16(float *y, const int8_t *xq, const float *xd,
 
         int d0a = 0, d1a = 0, d2a = 0, d3a = 0;
         int d0b = 0, d1b = 0, d2b = 0, d3b = 0;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__)
         asm volatile(
             "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -1076,6 +1076,7 @@ picolm_q8_q8_matmul_imma_smw16(float *y, const int8_t *xq, const float *xd,
 
             int d0a = 0, d1a = 0, d2a = 0, d3a = 0;
             int d0b = 0, d1b = 0, d2b = 0, d3b = 0;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__)
             asm volatile(
                 "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -1086,6 +1087,9 @@ picolm_q8_q8_matmul_imma_smw16(float *y, const int8_t *xq, const float *xd,
                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                 : "+r"(d0b), "+r"(d1b), "+r"(d2b), "+r"(d3b)
                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0b), "r"(b1b));
+#else
+            d0a = d1a = d2a = d3a = 0; d0b = d1b = d2b = d3b = 0;
+#endif
 
             /* Weight scales from shared memory. */
             {
@@ -1216,7 +1220,7 @@ picolm_rmsnorm_quantize_q8_0_kernel(int8_t *qs_out, float *d_out,
  * Per KB-tile: 1 A-fragment read + 6 IMMA invocations (2 per projection).
  * Grid: [(max(Oq,Ok,Ov)+15)/16, (S+15)/16], Block: 32 threads.
  * ================================================================ */
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__)
 
 /* Helper: compute one 16x16 IMMA tile for a single weight matrix.
  * Reads A fragments per KB-tile. Accumulates into sum[8]. */
@@ -1266,6 +1270,7 @@ imma_qkv_one_w16(const uint8_t *w, const int8_t *xq, const float *xd,
 
         int d0a = 0, d1a = 0, d2a = 0, d3a = 0;
         int d0b = 0, d1b = 0, d2b = 0, d3b = 0;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__)
         asm volatile(
             "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -1276,6 +1281,9 @@ imma_qkv_one_w16(const uint8_t *w, const int8_t *xq, const float *xd,
             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
             : "+r"(d0b), "+r"(d1b), "+r"(d2b), "+r"(d3b)
             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0b), "r"(b1b));
+#else
+        d0a = d1a = d2a = d3a = 0; d0b = d1b = d2b = d3b = 0;
+#endif
 
         /* Activation scales (shared by both 8-col halves). */
         float dx0 = xd[(size_t)(tile_s + gid) * n_blocks + kb];
@@ -1445,7 +1453,7 @@ picolm_q4_0_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
         }
 
         int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__)
         asm volatile(
             "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -1544,7 +1552,7 @@ picolm_q4_1_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
         }
 
         int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__)
         asm volatile(
             "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -1663,7 +1671,7 @@ picolm_q2_0_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
         }
 
         int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__)
         asm volatile(
             "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -1754,7 +1762,7 @@ picolm_q1_0_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
         }
 
         int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__)
         asm volatile(
             "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -1886,7 +1894,7 @@ picolm_q5_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
 
         /* IMMA m16n8k32 */
         int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__)
         asm volatile(
             "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -2064,7 +2072,7 @@ picolm_q4_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
 
         /* IMMA m16n8k32 */
         int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__)
         asm volatile(
             "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -2228,7 +2236,7 @@ picolm_q3_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
         int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
         int d0b = 0, d1b = 0, d2b = 0, d3b = 0;
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__)
         asm volatile(
             "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -2254,7 +2262,7 @@ picolm_q3_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
 
         float wds2 = wd * (float)(scales[g + 1] - 32);
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__)
         asm volatile(
             "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -2396,7 +2404,7 @@ picolm_q2_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
         /* IMMA call 1: b0 real, b1=0 (sub-block g) */
         int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
         int d0b = 0, d1b = 0, d2b = 0, d3b = 0;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__)
         asm volatile(
             "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -2404,7 +2412,7 @@ picolm_q2_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(0));
 #endif
         /* IMMA call 2: b0=0, b1 real (sub-block g+1) */
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__)
         asm volatile(
             "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"

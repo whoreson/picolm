@@ -838,7 +838,7 @@ static int pool_total_threads(int requested) {
 
 void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t qtype) {
 #ifdef PICOLM_GPU
-    if (gpu_tensor && d > 0 && n > 0) {
+    if (gpu_tensor && d > 0 && n > 0 && !getenv("PICOLM_PREFILL_CPU") && !getenv("PICOLM_SSM_PREFILL_CPU")) {
         gpu_assert_orchestrator("matmul GPU dispatch");
         /* GPU path: single-token GEMV (S=1). WMMA requires S>=16 so skip it here. */
         if (picolm_gpu_matmul(gpu_tensor, out, x, 1, gpu_device)) {
@@ -2174,7 +2174,7 @@ static void mm_id_down_expert_task(int idx, void *ctxp) {
 void matmul_batch(float *out, const float *x, int n_batch,
                    const void *W, int n, int d, gguf_type_t qtype) {
 #ifdef PICOLM_GPU
-        if (gpu_tensor && n_batch > 0 && d > 0 && n > 0) {
+        if (gpu_tensor && n_batch > 0 && d > 0 && n > 0 && !getenv("PICOLM_PREFILL_CPU") && !getenv("PICOLM_SSM_PREFILL_CPU")) {
         gpu_assert_orchestrator("matmul_batch GPU dispatch");
         /* Try WMMA Tensor Core for aligned Q4_0 batched matmul */
         if (picolm_gpu_w4a16_matmul(gpu_tensor, out, x, n_batch, gpu_device)) {

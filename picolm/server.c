@@ -191,6 +191,29 @@ static int check_stop_words(const char *text, int text_len, const char *last_pie
 }
 
 /* GPU decode path selector for server. */
+/* Debug: dump top-5 logits per decode token. Use PICOLM_LOGITS_DUMP env var. */
+static void dump_top_logits(const char *label, const float *logits, int vocab_size, int pos, int top_n) {
+    int top_tok[10]; float top_val[10];
+    for (int t = 0; t < top_n; t++) { top_tok[t] = -1; top_val[t] = -1e30f; }
+    for (int v = 0; v < vocab_size; v++) {
+        float val = logits[v];
+        if (val <= top_val[top_n-1]) continue; /* not in top-n */
+        /* Shift down to make room */
+        int insert_pos = top_n - 1;
+        while (insert_pos > 0 && val > top_val[insert_pos-1]) {
+            top_val[insert_pos] = top_val[insert_pos-1];
+            top_tok[insert_pos] = top_tok[insert_pos-1];
+            insert_pos--;
+        }
+        top_val[insert_pos] = val;
+        top_tok[insert_pos] = v;
+    }
+    fprintf(stderr, "[%s pos=%d] ", label, pos);
+    for (int t = 0; t < top_n; t++) fprintf(stderr, "%d(%+.4f) ", top_tok[t], top_val[t]);
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
 static float *server_model_forward(model_t *model, int token, int pos) {
     static int gpu_path = -1;
     if (gpu_path < 0) {
@@ -721,10 +744,95 @@ static void checkpoint_clear(void) {
 
 /* Unified prefill dispatch: GPU with CPU fallback, or CPU-only.
  * Wraps the PICOLM_GPU #ifdef so callers never have to deal with it.
- * This prevents double-call bugs from broken preprocessor nesting. */
+ * This prevents double-call bugs from broken preprocessor nesting.
+ *
+ * PICOLM_PREFILL_CPU: force prefill to CPU, then sync SSM state + KV cache
+ * to GPU so decode can still run on GPU. Used to isolate prefill vs decode bugs. */
 static float *server_model_prefill(model_t *model, const int *tokens,
                                     int n_tokens, int start_pos,
                                     volatile int *interrupt) {
+    /* Check if prefill-CPU override is active */
+    int force_cpu_prefill = 0;
+#ifdef PICOLM_GPU
+    if (model->gpu.kv_active && getenv("PICOLM_PREFILL_CPU")) {
+        force_cpu_prefill = 1;
+    }
+#endif
+
+    if (force_cpu_prefill) {
+#ifdef PICOLM_GPU
+        /* Run prefill on CPU */
+        float *r = model_forward_prefill(model, tokens, n_tokens, start_pos, interrupt);
+        if (!r) return NULL;
+
+        /* After CPU prefill, sync SSM state to GPU device buffers and
+         * upload KV cache to GPU device cache, so GPU decode can proceed. */
+        {
+            gpu_weights_t *gw = &model->gpu;
+            model_config_t *c = &model->config;
+            run_state_t *s = &model->state;
+            int gpu_dev = gw->device;
+
+            /* 1. Sync SSM persistent state (conv + recurrence) from host -> device */
+            if (c->has_ssm) {
+                int conv_dim = 2 * c->ssm_d_state * c->ssm_n_group + c->ssm_d_inner;
+                size_t ssm_st_bytes = (size_t)c->ssm_d_state *
+                                      (size_t)c->ssm_d_state *
+                                      (size_t)c->ssm_dt_rank * sizeof(float);
+                size_t conv_st_bytes = (size_t)(c->ssm_d_conv - 1) *
+                                       (size_t)conv_dim * sizeof(float);
+                for (int l = 0; l < c->n_layers; l++) {
+                    layer_weights_t *lw = &model->weights.layers[l];
+                    if (lw->is_attn_layer) continue;
+                    if (gw->ssm_state_dev[l] && s->ssm_state[l]) {
+                        picolm_gpu_memcpy(gw->ssm_state_dev[l], s->ssm_state[l],
+                                          ssm_st_bytes, 1, gpu_dev);
+                    }
+                    if (gw->ssm_conv_state_dev[l] && s->ssm_conv_state[l]) {
+                        picolm_gpu_memcpy(gw->ssm_conv_state_dev[l],
+                                          s->ssm_conv_state[l],
+                                          conv_st_bytes, 1, gpu_dev);
+                    }
+                }
+            }
+
+            /* 2. Upload host KV cache -> device KV cache for attention layers.
+             * Device KV cache always stores F16. Only upload when host KV
+             * cache is also F16 (matching row_bytes). For quantized KV
+             * caches the formats differ and cannot be memcpied directly. */
+            if (s->kv_type_k == KV_CACHE_F16 && s->kv_type_v == KV_CACHE_F16) {
+                int kv_ordinal = 0;
+                int n_kv_heads = c->n_kv_heads;
+                int head_dim = c->head_dim;
+                int seq_len = c->max_seq_len;
+                for (int l = 0; l < c->n_layers; l++) {
+                    layer_weights_t *lw = &model->weights.layers[l];
+                    if (!c->has_ssm || lw->is_attn_layer) {
+                        uint8_t *kbase = s->key_cache + (size_t)kv_ordinal * seq_len * s->kv_row_size_k;
+                        uint8_t *vbase = s->val_cache + (size_t)kv_ordinal * seq_len * s->kv_row_size_v;
+                        picolm_gpu_kv_store_rows(1, kv_ordinal, 0, n_tokens,
+                                                 kbase, s->kv_row_size_k,
+                                                 n_kv_heads, head_dim, seq_len, gpu_dev);
+                        picolm_gpu_kv_store_rows(0, kv_ordinal, 0, n_tokens,
+                                                 vbase, s->kv_row_size_v,
+                                                 n_kv_heads, head_dim, seq_len, gpu_dev);
+                        if (getenv("PICOLM_ATTN_DBG") && kv_ordinal == 0) {
+                            uint16_t *k_u16 = (uint16_t *)kbase;
+                            fprintf(stderr, "[ATN_DBG_KV_CPU] first_attn_K_tok0[:16] raw_u16={");
+                            for(int _i=0;_i<16;_i++) fprintf(stderr,"%04x ",k_u16[_i]);
+                            fprintf(stderr, "}\n");fflush(stderr);
+                        }
+                        kv_ordinal++;
+                    }
+                }
+                picolm_gpu_sync(gpu_dev);
+            }
+            fprintf(stderr, "[PICOLM_PREFILL_CPU] CPU prefill done, synced %d tokens to GPU\n", n_tokens);
+        }
+        return r;
+#endif
+    }
+
 #ifdef PICOLM_GPU
     if (model->gpu.kv_active) {
         float *r = model_forward_prefill_gpu(model, tokens, n_tokens, start_pos, interrupt);
@@ -2930,6 +3038,12 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         }
 
         fprintf(stderr, "[server] %.1fms: starting generation (%d threads)\n", get_time_ms() - t0, tensor_get_threads());
+        fprintf(stderr, "[DBG] env: LOGITS_DUMP=%s SSM_PREFILL_CPU=%s PREFILL_CPU=%s GPU_PATH=%s\n",
+            getenv("PICOLM_LOGITS_DUMP")?getenv("PICOLM_LOGITS_DUMP"):"(null)",
+            getenv("PICOLM_SSM_PREFILL_CPU")?getenv("PICOLM_SSM_PREFILL_CPU"):"(null)",
+            getenv("PICOLM_PREFILL_CPU")?getenv("PICOLM_PREFILL_CPU"):"(null)",
+            getenv("PICOLM_GPU_PATH")?getenv("PICOLM_GPU_PATH"):"(null)");
+        fflush(stderr);
 
         /* ---- Generation phase ---- */
         if (n_prefill_ns2 <= 0) {
@@ -2987,6 +3101,8 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             if (gen_count >= n_predict) { stop_type = "limit"; break; }
             token = next;
             logits_ns2 = server_model_forward(model, token, pos);
+            if (getenv("PICOLM_LOGITS_DUMP"))
+                dump_top_logits("LOGITS", logits_ns2, model->config.vocab_size, pos, 5);
         }
 
         double t_end = get_time_ms();
