@@ -149,7 +149,7 @@ avx:
 
 # --- x86-64 with AVX2 (Haswell and newer Intel; Excavator and newer AMD) ---
 avx2:
-	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -mavx2 -mfma -mpopcnt -mf16c -DPICOLM_AVX2 -DPICOLM_FMA -DPICOLM_SSE2"
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -mavx2 -mfma -mpopcnt -mf16c -DPICOLM_AVX2 -DPICOLM_FMA -DPICOLM_AVX -DPICOLM_SSE2"
 
 # --- Persistent thread pool (WIP, for development) ---
 threadpool:
