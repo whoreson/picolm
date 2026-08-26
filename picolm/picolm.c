@@ -1679,8 +1679,9 @@ int main(int argc, char **argv) {
         if (getenv("PICOLM_LOGITS_DUMP"))
             dump_top_logits(logits, model.config.vocab_size, pos, 5);
         next = sampler_sample(&sampler, logits, model.config.vocab_size);
-        fprintf(stderr, "[GEN] pos=%d next=%d eos=%d\n", pos, next, (int)tokenizer.eos_id);
-
+        if (getenv("PICOLM_DBG")) {
+            fprintf(stderr, "[GEN] pos=%d next=%d eos=%d\n", pos, next, (int)tokenizer.eos_id);
+        }
         /* Update grammar state with the generated token */
         grammar_advance(&grammar, &tokenizer, next);
 
