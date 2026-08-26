@@ -4850,7 +4850,7 @@ float vec_dot_q2_K_q8_K(const void *src_q2, const void *src_q8, int n) {
 
                 s = sc[is++] & 0xF;
                 isuml = 0;
-                for (int l = 0; l < 16; ++l) isuml += q8[l + 16] * ((q2[l] >> shift) & 3);
+                for (int l = 0; l < 16; ++l) isuml += q8[l + 16] * ((q2[l + 16] >> shift) & 3);
                 isum += s * isuml;
 
                 shift += 2;
