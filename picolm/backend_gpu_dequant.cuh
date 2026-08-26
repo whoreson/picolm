@@ -17,6 +17,24 @@ __device__ static inline float dequant_q4_0(const void *blk, int i) {
     return (float)(v - 8) * d;
 }
 
+/* block_q4_1: 20 bytes = 2B scale(FP16) + 2B min(FP16) + 16B qs (32 values)
+ * Dequant: val = qs[j] * d + m  (unsigned nibble, no sign extension) */
+__device__ static inline float dequant_q4_1(const void *blk, int i) {
+    const uint8_t *b = (const uint8_t *)blk;
+    uint16_t d_raw = b[0] | ((uint16_t)b[1] << 8);
+    uint16_t m_raw = b[2] | ((uint16_t)b[3] << 8);
+    float d = gpu_fp16_to_fp32(d_raw);
+    float m = gpu_fp16_to_fp32(m_raw);
+    const uint8_t *qs = b + 4;
+    int v;
+    if (i < 16) {
+        v = qs[i] & 0xF;           /* low nibble: values 0-15 */
+    } else {
+        v = qs[i - 16] >> 4;       /* high nibble: values 16-31 */
+    }
+    return (float)v * d + m;
+}
+
 /* block_q8_0: 34 bytes = 2B scale(FP16) + 32B qs (32 values)
  * dequant(i) = qs[i] * d */
 __device__ static inline float dequant_q8_0(const void *blk, int i) {

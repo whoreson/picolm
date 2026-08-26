@@ -230,10 +230,10 @@ __global__ void picolm_gpu_attention_decode_merge_kernel( float *xb_out, const f
  * Identical algorithm to picolm_gpu_attention_prefill_kernel but takes
  * FP32 K/V buffers with layout [pos][kv_head][head_dim]. */
 
-__global__ void picolm_gpu_attention_prefill_f32kv_kernel( float *xb_out,  const float *q_dev,  const float *kv_k,  const float *kv_v,  int start_pos, int n_tokens, int n_heads, int n_kv_heads, int head_dim);
+__global__ void picolm_gpu_attention_prefill_f32kv_kernel( float *xb_out,  const float *q_dev,  const float *kv_k,  const float *kv_v,  int start_pos, int n_tokens, int n_heads, int n_kv_heads, int head_dim, int tile_q);
 
 
-__global__ void picolm_gpu_attention_prefill_kernel( float *xb_out,  const float *q_dev,  const uint16_t *kv_k,  const uint16_t *kv_v,  int layer_ordinal, int start_pos, int n_tokens, int n_heads, int n_kv_heads, int head_dim, int max_seq_len, size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes);
+__global__ void picolm_gpu_attention_prefill_kernel( float *xb_out,  const float *q_dev,  const uint16_t *kv_k,  const uint16_t *kv_v,  int layer_ordinal, int start_pos, int n_tokens, int n_heads, int n_kv_heads, int head_dim, int max_seq_len, size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, int tile_q);
 
 /* FP16 Tensor Core Flash Attention 2 Prefill kernel.
  * Uses mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 for Q@K scoring.

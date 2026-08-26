@@ -299,7 +299,7 @@ hip: $(HIP_OBJS) gpu-clean-objs
 	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_defines_for,-march=native) -DPICOLM_GPU=1 -DPICOLM_HIP=1" GPU_OBJS="$(HIP_OBJS)" GPU_LIBS="-L$(ROCM_LIB) -lamdhip64 -lstdc++ -Wl,-rpath,$(ROCM_LIB)"
 
 $(HIP_OBJS): %-hip.o: %.cu $(GPU_CUH) backend_gpu.h quant.h
-	$(HIPCC) $(HIPFLAGS) --offload-arch=$(HIP_ARCH) -DPICOLM_GPU=1 -c -o $@ $< -I.
+	$(HIPCC) $(HIPFLAGS) --offload-arch=$(HIP_ARCH) -DPICOLM_GPU=1 -DPICOLM_SSM_WARP_KERNEL_VALIDATED -DPICOLM_SSM_CHUNKED_GPU_VALIDATED -c -o $@ $< -I.
 
 # --- CUDA (NVIDIA) GPU backend ---
 NVCC      ?= nvcc

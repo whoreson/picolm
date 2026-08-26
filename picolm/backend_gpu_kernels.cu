@@ -14,6 +14,7 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
         case GGUF_TYPE_F16:  bytes_per_block = 2; break;      /* 1 uint16_t */
         case 30:             bytes_per_block = 2; break;      /* BF16 */
         case GGUF_TYPE_Q4_0: bytes_per_block = GPU_BLOCK_Q4_0_SIZE; break;  /* 18 */
+        case GGUF_TYPE_Q4_1: bytes_per_block = 20; break;                   /* Q4_1: 20 */
         case GGUF_TYPE_Q8_0: bytes_per_block = GPU_BLOCK_Q8_0_SIZE; break;  /* 34 */
         case 10:             bytes_per_block = GPU_BLOCK_Q2_K_SIZE; break;  /* Q2_K: 84 */
         case 11:             bytes_per_block = GPU_BLOCK_Q3_K_SIZE; break;   /* Q3_K: 110 */
@@ -63,6 +64,20 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
                 for (int j = 0; j < 32; j++) {
                     int i = bi * 32 + j;
                     sum += x[rs*s+i] * dequant_q4_0(blk, j);
+                }
+            }
+        }
+        break;
+
+    case 3: /* GGUF_TYPE_Q4_1 */
+        /* I values in 32-value blocks (20 bytes each) */
+        {
+            int n_blocks = I / 32;
+            for (int bi = gpuThreadIdx_x; bi < n_blocks; bi += gpuBlockDim_x) {
+                const void *blk = wrow + (size_t)bi * bytes_per_block;
+                for (int j = 0; j < 32; j++) {
+                    int i = bi * 32 + j;
+                    sum += x[rs*s+i] * dequant_q4_1(blk, j);
                 }
             }
         }
@@ -167,6 +182,10 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
         break;
 
     default:
+        /* Unsupported quantization type - output will be zero */
+        if (gpuThreadIdx_x == 0 && s == 0) {
+            printf("[GPU WARN] picolm_quant_matmul: unsupported qtype=%d (I=%d O=%d) - output zeroed\n", (int)qtype, I, O);
+        }
         break;
     }
 
@@ -1574,10 +1593,10 @@ picolm_q4_1_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 300
         {
             unsigned mask = 0xF << (gid * 4);
-            sq0 += __shfl_down_sync(mask, sq0, 2);
-            sq1 += __shfl_down_sync(mask, sq1, 2);
-            sq0 += __shfl_down_sync(mask, sq0, 1);
-            sq1 += __shfl_down_sync(mask, sq1, 1);
+            sq0 += gpuShflDownSync(mask, sq0, 2);
+            sq1 += gpuShflDownSync(mask, sq1, 2);
+            sq0 += gpuShflDownSync(mask, sq0, 1);
+            sq1 += gpuShflDownSync(mask, sq1, 1);
         }
 #endif
 
@@ -1921,10 +1940,10 @@ picolm_q5_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 300
         {
             unsigned mask = 0xF << (gid * 4);
-            sq0 += __shfl_down_sync(mask, sq0, 2);
-            sq1 += __shfl_down_sync(mask, sq1, 2);
-            sq0 += __shfl_down_sync(mask, sq0, 1);
-            sq1 += __shfl_down_sync(mask, sq1, 1);
+            sq0 += gpuShflDownSync(mask, sq0, 2);
+            sq1 += gpuShflDownSync(mask, sq1, 2);
+            sq0 += gpuShflDownSync(mask, sq0, 1);
+            sq1 += gpuShflDownSync(mask, sq1, 1);
             /* tid==0 now has the full row sum for both rows */
         }
 #endif
@@ -2092,10 +2111,10 @@ picolm_q4_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 300
         {
             unsigned mask = 0xF << (gid * 4);
-            sq0 += __shfl_down_sync(mask, sq0, 2);
-            sq1 += __shfl_down_sync(mask, sq1, 2);
-            sq0 += __shfl_down_sync(mask, sq0, 1);
-            sq1 += __shfl_down_sync(mask, sq1, 1);
+            sq0 += gpuShflDownSync(mask, sq0, 2);
+            sq1 += gpuShflDownSync(mask, sq1, 2);
+            sq0 += gpuShflDownSync(mask, sq0, 1);
+            sq1 += gpuShflDownSync(mask, sq1, 1);
         }
 #endif
 
@@ -2446,10 +2465,10 @@ picolm_q2_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 300
         {
             unsigned mask = 0xF << (gid * 4);
-            sq0 += __shfl_down_sync(mask, sq0, 2);
-            sq1 += __shfl_down_sync(mask, sq1, 2);
-            sq0 += __shfl_down_sync(mask, sq0, 1);
-            sq1 += __shfl_down_sync(mask, sq1, 1);
+            sq0 += gpuShflDownSync(mask, sq0, 2);
+            sq1 += gpuShflDownSync(mask, sq1, 2);
+            sq0 += gpuShflDownSync(mask, sq0, 1);
+            sq1 += gpuShflDownSync(mask, sq1, 1);
         }
 #endif
 
@@ -2792,7 +2811,8 @@ picolm_gpu_attention_prefill_f32kv_kernel(
         const float *kv_k,   /* [pos][kv_head][head_dim] FP32 */
         const float *kv_v,   /* [pos][kv_head][head_dim] FP32 */
         int start_pos, int n_tokens,
-        int n_heads, int n_kv_heads, int head_dim)
+        int n_heads, int n_kv_heads, int head_dim,
+        int tile_q)
 {
     int h = (int)gpuBlockIdx_x;
     int tile_q_idx = (int)gpuBlockIdx_y;
@@ -2802,8 +2822,8 @@ picolm_gpu_attention_prefill_f32kv_kernel(
     int kv_h = h / (n_heads / n_kv_heads);
     float attn_scale = 1.0f / sqrtf((float)head_dim);
 
-    int q_start = tile_q_idx * ATTN_TILE_Q;
-    int q_end = min(q_start + ATTN_TILE_Q, n_tokens);
+    int q_start = tile_q_idx * tile_q;
+    int q_end = min(q_start + tile_q, n_tokens);
     int n_q = q_end - q_start;
 
     /* Shared memory: K tile + V tile (FP32) + reduce + acc + max/sum */
@@ -2812,12 +2832,12 @@ picolm_gpu_attention_prefill_f32kv_kernel(
     float *v_tile_f = k_tile_f + ATTN_TILE_K * head_dim;
     float *reduce_sh = v_tile_f + ATTN_TILE_K * head_dim;
     float *acc_sh = reduce_sh + 256;
-    float *max_score_sh = acc_sh + (size_t)ATTN_TILE_Q * head_dim;
-    float *sum_exp_sh = max_score_sh + ATTN_TILE_Q;
+    float *max_score_sh = acc_sh + (size_t)tile_q * head_dim;
+    float *sum_exp_sh = max_score_sh + tile_q;
     __shared__ float rescale_sh, weight_sh;
 
-    for (int i = tid; i < ATTN_TILE_Q * head_dim; i += n_threads) acc_sh[i] = 0.0f;
-    for (int qi = tid; qi < ATTN_TILE_Q; qi += n_threads) {
+    for (int i = tid; i < tile_q * head_dim; i += n_threads) acc_sh[i] = 0.0f;
+    for (int qi = tid; qi < tile_q; qi += n_threads) {
         max_score_sh[qi] = -1e30f;
         sum_exp_sh[qi] = 0.0f;
     }
@@ -2937,7 +2957,8 @@ picolm_gpu_attention_prefill_kernel(
         int start_pos, int n_tokens,
         int n_heads, int n_kv_heads, int head_dim, int max_seq_len,
         size_t kv_pos_stride_bytes,
-        size_t kv_head_stride_bytes)
+        size_t kv_head_stride_bytes,
+        int tile_q)
 {
     int h = (int)gpuBlockIdx_x;       /* query head */
     int tile_q_idx = (int)gpuBlockIdx_y; /* tile of query tokens */
@@ -2950,13 +2971,13 @@ picolm_gpu_attention_prefill_kernel(
     size_t layer_base = (size_t)layer_ordinal * max_seq_len * n_kv_heads * head_dim;
 
     /* Which query tokens does this block handle? */
-    int q_start = tile_q_idx * ATTN_TILE_Q;
-    int q_end = min(q_start + ATTN_TILE_Q, n_tokens);
+    int q_start = tile_q_idx * tile_q;
+    int q_end = min(q_start + tile_q, n_tokens);
     int n_q = q_end - q_start;
 
     /* Shared memory: K tile + V tile (u16) + reduce (256 float) +
-     * acc[ATTN_TILE_Q][head_dim] (float) + max_score[ATTN_TILE_Q] +
-     * sum_exp[ATTN_TILE_Q] (float). Sized by the host wrapper, which
+     * acc[tile_q][head_dim] (float) + max_score[tile_q] +
+     * sum_exp[tile_q] (float). Sized by the host wrapper, which
      * also opts into extended dynamic shared memory since this total
      * exceeds the default 48KB for typical head_dim/tile sizes.
      *
@@ -2971,13 +2992,13 @@ picolm_gpu_attention_prefill_kernel(
     uint16_t *k_tile = (uint16_t *)smem;
     uint16_t *v_tile = k_tile + ATTN_TILE_K * head_dim;
     float *reduce_sh = (float *)((uint8_t *)v_tile + ATTN_TILE_K * head_dim * sizeof(uint16_t));
-    float *acc_sh = reduce_sh + 256;               /* [ATTN_TILE_Q][head_dim] */
-    float *max_score_sh = acc_sh + (size_t)ATTN_TILE_Q * head_dim;  /* [ATTN_TILE_Q] */
-    float *sum_exp_sh = max_score_sh + ATTN_TILE_Q; /* [ATTN_TILE_Q] */
+    float *acc_sh = reduce_sh + 256;               /* [tile_q][head_dim] */
+    float *max_score_sh = acc_sh + (size_t)tile_q * head_dim;  /* [tile_q] */
+    float *sum_exp_sh = max_score_sh + tile_q; /* [tile_q] */
     __shared__ float rescale_sh, weight_sh;
 
-    for (int i = tid; i < ATTN_TILE_Q * head_dim; i += n_threads) acc_sh[i] = 0.0f;
-    for (int qi = tid; qi < ATTN_TILE_Q; qi += n_threads) {
+    for (int i = tid; i < tile_q * head_dim; i += n_threads) acc_sh[i] = 0.0f;
+    for (int qi = tid; qi < tile_q; qi += n_threads) {
         max_score_sh[qi] = -1e30f;
         sum_exp_sh[qi] = 0.0f;
     }

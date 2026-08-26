@@ -615,21 +615,21 @@ picolm_gpu_attention_decode_dev(float *xb_out_dev, const float *q_dev,
 }
 
 /* Total dynamic shared memory picolm_gpu_attention_prefill_kernel needs:
- * K tile + V tile (u16) + reduce (256 float) + acc[ATTN_TILE_Q][head_dim]
- * (float) + max_score[ATTN_TILE_Q] + sum_exp[ATTN_TILE_Q] (float).
- * For head_dim=128 this is ~50KB -- over the default 48KB/block limit,
- * so the caller must opt in via gpuFuncSetAttribute before launching
- * with this size (see ensure_attn_prefill_shared_mem below). */
+ * K tile + V tile (u16) + reduce (256 float) + acc[tile_q][head_dim]
+ * (float) + max_score[tile_q] + sum_exp[tile_q] (float).
+ * tile_q is chosen by the caller based on available shared memory.
+ * For head_dim=128 with tile_q=32 this is ~50KB -- over the default
+ * 48KB/block limit, so the caller must opt in via gpuFuncSetAttribute. */
 static size_t
-attn_prefill_shared_bytes(int head_dim) {
+attn_prefill_shared_bytes(int head_dim, int tile_q) {
     /* Dynamic shared memory (extern __shared__): K tile + V tile + reduce +
      * acc + max_score + sum_exp. Plus 8 bytes of static __shared__ for
      * rescale_sh/weight_sh. Total must be set via gpuFuncSetAttribute. */
     return 2 * (size_t)ATTN_TILE_K * head_dim * sizeof(uint16_t)
          + 256 * sizeof(float)
-         + (size_t)ATTN_TILE_Q * head_dim * sizeof(float)
-         + (size_t)ATTN_TILE_Q * sizeof(float)
-         + (size_t)ATTN_TILE_Q * sizeof(float)
+         + (size_t)tile_q * head_dim * sizeof(float)
+         + (size_t)tile_q * sizeof(float)
+         + (size_t)tile_q * sizeof(float)
          + 2 * sizeof(float); /* rescale_sh + weight_sh (static __shared__) */
 }
 
@@ -637,8 +637,7 @@ attn_prefill_shared_bytes(int head_dim) {
  * Idempotent: tracks the largest size already configured so repeated
  * calls (every prefill call, every layer) are a cheap no-op after the
  * first. Returns 1 if `bytes` is safe to launch with, 0 if the opt-in
- * itself failed (e.g. device doesn't support this much shared memory --
- * would need a fallback path, not expected on GB10/Blackwell). */
+ * itself failed (e.g. device doesn't support this much shared memory). */
 static int
 ensure_attn_prefill_shared_mem(size_t bytes) {
     static size_t configured = 49152; /* default limit, no opt-in needed under this */
@@ -649,6 +648,32 @@ ensure_attn_prefill_shared_mem(size_t bytes) {
         return 0;
     configured = bytes;
     return 1;
+}
+
+/* Query device for maximum shared memory per block (in bytes).
+ * Returns 0 on failure. */
+static size_t
+get_device_shared_mem_per_block(int device) {
+    static size_t cached[PICOLM_GPU_MAX_DEVICES] = {0};
+    if (device < 0 || device >= PICOLM_GPU_MAX_DEVICES) return 0;
+    if (cached[device]) return cached[device];
+    int value = 0;
+    if (!gpu_ok(gpuDeviceGetAttribute(&value, gpuDeviceAttributeMaxSharedMemoryPerBlockOptin, device),
+                "get shared mem per block")) {
+        /* Fall back to device total shared memory per multiprocessor / max blocks per SM.
+         * Some older drivers don't support the optin attribute. */
+        int smem_mp = 0, blocks_sm = 1;
+        gpuDeviceGetAttribute(&smem_mp, gpuDeviceAttributeMaxSharedMemoryPerMultiprocessor, device);
+        gpuDeviceGetAttribute(&blocks_sm, gpuDeviceAttributeMaxBlocksPerMultiprocessor, device);
+        if (smem_mp > 0 && blocks_sm > 0) {
+            cached[device] = (size_t)smem_mp / blocks_sm;
+            return cached[device];
+        }
+        cached[device] = 49152; /* conservative default */
+        return cached[device];
+    }
+    cached[device] = (size_t)value;
+    return cached[device];
 }
 
 static int
@@ -713,8 +738,14 @@ picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
 
     if (!use_fa2) {
         gpu_dispatch_print("attn_prefill_scalar_host");
-        int n_tiles_q = (n_tokens + ATTN_TILE_Q - 1) / ATTN_TILE_Q;
-        size_t shared_bytes = attn_prefill_shared_bytes(head_dim);
+        /* Choose tile_q that fits device shared memory */
+        int tile_q = ATTN_TILE_Q;
+        size_t smem_max = get_device_shared_mem_per_block(device);
+        while (tile_q > 8 && attn_prefill_shared_bytes(head_dim, tile_q) > smem_max) {
+            tile_q /= 2;
+        }
+        int n_tiles_q = (n_tokens + tile_q - 1) / tile_q;
+        size_t shared_bytes = attn_prefill_shared_bytes(head_dim, tile_q);
         if (!ensure_attn_prefill_shared_mem(shared_bytes)) return 0;
         int block_threads = 128;
 
@@ -723,7 +754,7 @@ picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
             ctx->y, ctx->x,
             g_kv_k_dev[device], g_kv_v_dev[device],
             layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim, max_seq_len,
-            kv_pos_stride_bytes, kv_head_stride_bytes);
+            kv_pos_stride_bytes, kv_head_stride_bytes, tile_q);
     }
 
     if (!gpu_ok(gpuGetLastError(), "attn prefill kernel")) return 0;
@@ -781,9 +812,15 @@ picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
     }
 
     gpu_dispatch_print("attn_prefill_scalar_dev");
-    /* Scalar fallback */
-    int n_tiles_q = (n_tokens + ATTN_TILE_Q - 1) / ATTN_TILE_Q;
-    size_t shared_bytes = attn_prefill_shared_bytes(head_dim);
+    /* Scalar fallback: choose tile_q that fits device shared memory.
+     * Start with 32, halve until it fits. Minimum is 8. */
+    int tile_q = ATTN_TILE_Q;
+    size_t smem_max = get_device_shared_mem_per_block(device);
+    while (tile_q > 8 && attn_prefill_shared_bytes(head_dim, tile_q) > smem_max) {
+        tile_q /= 2;
+    }
+    int n_tiles_q = (n_tokens + tile_q - 1) / tile_q;
+    size_t shared_bytes = attn_prefill_shared_bytes(head_dim, tile_q);
     if (!ensure_attn_prefill_shared_mem(shared_bytes)) return 0;
     int block_threads = 128;
 
@@ -792,7 +829,7 @@ picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
         xb_out_dev, q_dev,
         g_kv_k_dev[device], g_kv_v_dev[device],
         layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim, max_seq_len,
-        kv_pos_stride_bytes, kv_head_stride_bytes);
+        kv_pos_stride_bytes, kv_head_stride_bytes, tile_q);
     if (!gpu_ok(gpuGetLastError(), "attn prefill (dev)")) return 0;
     return 1;
 }
@@ -810,13 +847,25 @@ picolm_gpu_attention_prefill_f32kv(float *xb_out_dev, const float *q_dev,
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
     if (head_dim > 256) return 0;
-    int n_tiles_q = (n_tokens + ATTN_TILE_Q - 1) / ATTN_TILE_Q;
-    /* FP32 K/V tiles are 4x larger than FP16 */
-    size_t shared_bytes = 2 * (size_t)ATTN_TILE_K * head_dim * sizeof(float)
-         + 256 * sizeof(float)
-         + (size_t)ATTN_TILE_Q * head_dim * sizeof(float)
-         + 2 * (size_t)ATTN_TILE_Q * sizeof(float)
-         + 2 * sizeof(float);
+
+    /* FP32 K/V tiles are 4x larger than FP16.
+     * shared_bytes(tile_q) = 2*ATTN_TILE_K*hd*4 + 256*4 + tile_q*hd*4 + 2*tile_q*4 + 8
+     * For hd=256, tile_q=32: 65536+1024+32768+256+8 = 99592 (~97KB) -- too big for gfx906.
+     * Choose tile_q adaptively. */
+    int tile_q = ATTN_TILE_Q;
+    size_t smem_max = get_device_shared_mem_per_block(device);
+    auto f32kv_smem = [](int hd, int tq) -> size_t {
+        return 2 * (size_t)ATTN_TILE_K * hd * sizeof(float)
+             + 256 * sizeof(float)
+             + (size_t)tq * hd * sizeof(float)
+             + 2 * (size_t)tq * sizeof(float)
+             + 2 * sizeof(float);
+    };
+    while (tile_q > 8 && f32kv_smem(head_dim, tile_q) > smem_max) {
+        tile_q /= 2;
+    }
+    int n_tiles_q = (n_tokens + tile_q - 1) / tile_q;
+    size_t shared_bytes = f32kv_smem(head_dim, tile_q);
     /* Opt-in FP32 kernel to larger shared memory */
     if (shared_bytes > 49152) {
         gpuError_t e = gpuFuncSetAttribute((const void *)picolm_gpu_attention_prefill_f32kv_kernel,
@@ -831,7 +880,7 @@ picolm_gpu_attention_prefill_f32kv(float *xb_out_dev, const float *q_dev,
     dim3 grid((unsigned)n_heads, (unsigned)n_tiles_q, 1);
     picolm_gpu_attention_prefill_f32kv_kernel<<<grid, block_threads, (unsigned)shared_bytes, ctx->stream>>>(
         xb_out_dev, q_dev, k_dev, v_dev,
-        start_pos, n_tokens, n_heads, n_kv_heads, head_dim);
+        start_pos, n_tokens, n_heads, n_kv_heads, head_dim, tile_q);
     if (!gpu_ok(gpuGetLastError(), "attn prefill f32kv (dev)")) return 0;
     return 1;
 }
@@ -1679,7 +1728,7 @@ int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv_dev, const float *al
     int ok=1;
     for(int i=0;i<15&&ok;i++){
         ok&=ssm_batch_scratch_ensure((void**)ptrs[i],&caps[i],szs[i]);
-        if(ok) ok&=gpu_ok(cudaMemsetAsync(*(void**)ptrs[i],0,szs[i],ctx->stream),"scratch zero");
+        if(ok) ok&=gpu_ok(gpuMemsetAsync(*(void**)ptrs[i],0,szs[i],ctx->stream),"scratch zero");
     }
     if(!ok) return 0;
     for(int ci=0;ci<nc&&ok;ci++){
@@ -1695,12 +1744,12 @@ int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv_dev, const float *al
       if (getenv("PICOLM_SSM_STEP_VERIFY") && ci == 0) {
           /* D2H decay_mask and gate_log scratch */
           float _dm[16], _gl[40], _cg[40];
-          cudaDeviceSynchronize();
-          cudaMemcpy(_dm, d_dm, 64, cudaMemcpyDeviceToHost);
-          cudaMemcpy(_gl, d_gl, 160, cudaMemcpyDeviceToHost);
-          cudaMemcpy(_cg, d_cg, 160, cudaMemcpyDeviceToHost);
+          gpuDeviceSynchronize();
+          gpuMemcpy(_dm, d_dm, 64, gpuMemcpyDeviceToHost);
+          gpuMemcpy(_gl, d_gl, 160, gpuMemcpyDeviceToHost);
+          gpuMemcpy(_cg, d_cg, 160, gpuMemcpyDeviceToHost);
           float _dm_full[1300];
-          cudaMemcpy(_dm_full, d_dm, 5200, cudaMemcpyDeviceToHost);
+          gpuMemcpy(_dm_full, d_dm, 5200, gpuMemcpyDeviceToHost);
           fprintf(stderr, "[STEP l0] dm row0=[%.6f %.6f %.6f %.6f] row1=[%.6f %.6f %.6f %.6f] dm35_0=%.6f dm35_35=%.6f cg0=%.6f cg35=%.6f\n",
               _dm_full[0],_dm_full[1],_dm_full[2],_dm_full[3],
               _dm_full[36],_dm_full[37],_dm_full[38],_dm_full[39],
@@ -1725,10 +1774,10 @@ int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv_dev, const float *al
       if (getenv("PICOLM_SSM_STEP_VERIFY") && ci == 0) {
           /* D2H v_eff[0][0..3] and v_hat[0][0..3] for head 0 */
           float _ve[4], _vh[4], _co[4];
-          cudaDeviceSynchronize();
-          cudaMemcpy(_ve, d_ve, 16, cudaMemcpyDeviceToHost);
-          cudaMemcpy(_vh, d_vh, 16, cudaMemcpyDeviceToHost);
-          cudaMemcpy(_co, d_co, 16, cudaMemcpyDeviceToHost);
+          gpuDeviceSynchronize();
+          gpuMemcpy(_ve, d_ve, 16, gpuMemcpyDeviceToHost);
+          gpuMemcpy(_vh, d_vh, 16, gpuMemcpyDeviceToHost);
+          gpuMemcpy(_co, d_co, 16, gpuMemcpyDeviceToHost);
           fprintf(stderr, "[STEP l0] GPU ve[0][0..3]={%.6f,%.6f,%.6f,%.6f} vh[0][0..3]={%.6f,%.6f,%.6f,%.6f} co[0][0..3]={%.6f,%.6f,%.6f,%.6f}\n",
               _ve[0],_ve[1],_ve[2],_ve[3], _vh[0],_vh[1],_vh[2],_vh[3], _co[0],_co[1],_co[2],_co[3]);
       }

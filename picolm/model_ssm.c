@@ -2748,22 +2748,6 @@ int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
 
     SSM_DBG_SYNC;
     _DBG_RMS("gate",bq,xb2_stride);
-    if(l<=4&&_SSM_DBG) {
-        /* Dump FFN gate matmul output for comparison */
-        { float fi[4];
-          picolm_gpu_sync(dev);
-          picolm_gpu_memcpy(fi, bffn_norm, 16, -1, dev);
-          fprintf(stderr,"[DBG] l=%d bffn_norm_tok0[:4]={%.6f,%.6f,%.6f,%.6f}\n",l,fi[0],fi[1],fi[2],fi[3]);
-        }
-    }
-    /* Dump conv1d weight for debugging */
-    if (l == 0 && _SSM_DBG) {
-        float cw[16], cs[12];
-        picolm_gpu_memcpy(cw, gw->ssm_conv1d_dev[l], 64, -1, dev);
-        fprintf(stderr, "[DBG l%d] conv1d_w[0][:4]={%.6f,%.6f,%.6f,%.6f} w[1][:4]={%.6f,%.6f,%.6f,%.6f}\n", l, cw[0],cw[1],cw[2],cw[3],cw[4],cw[5],cw[6],cw[7]);
-        picolm_gpu_memcpy(cs, cs_dev, 48, -1, dev);
-        fprintf(stderr, "[DBG l%d] conv_state[0][:4]={%.6f,%.6f,%.6f,%.6f}\n", l, cs[0],cs[1],cs[2],cs[3]);
-    }
     /* Conv1d + silu (in-place on bxb which has QKV output) */
         ok&=picolm_gpu_ssm_conv1d_batch_dev(bxb,cs_dev,bxb,(float*)gw->ssm_conv1d_dev[l],conv_dim,c->ssm_d_conv,n_tokens,dev,xb2_stride);
 
@@ -2978,7 +2962,7 @@ int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
               l, (float)sqrt(nr/hvdim),nwa[0],nwa[1],nwa[2],nwa[3],nwa[4],nwa[5],nwa[6],nwa[7]);
           free(nwa);
       }
-      ok&=picolm_gpu_ssm_prefill_gated_norm_dev(battn_out,bq,nw,hvdim,n_v,n_tokens,eps,xb2_stride,value_dim,dev);
+      ok&=picolm_gpu_ssm_prefill_gated_norm_dev(battn_out,bq,nw,hvdim,n_v,n_tokens,eps,xb2_stride,xb2_stride,dev);
 
     }
     if(l<=4&&_SSM_DBG){

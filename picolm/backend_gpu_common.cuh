@@ -110,6 +110,13 @@ typedef hipEvent_t gpuEvent_t;
 #define gpuMemsetAsync hipMemsetAsync
 #define gpuFuncSetAttribute hipFuncSetAttribute
 #define gpuFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
+#define gpuDeviceGetAttribute hipDeviceGetAttribute
+/* HIP doesn't have MaxSharedMemoryPerBlockOptin; use the regular one.
+ * The opt-in variant exists on CUDA (for >48KB blocks) but on HIP the
+ * regular attribute reports the true maximum including opt-in. */
+#define gpuDeviceAttributeMaxSharedMemoryPerBlockOptin hipDeviceAttributeMaxSharedMemoryPerBlock
+#define gpuDeviceAttributeMaxSharedMemoryPerMultiprocessor hipDeviceAttributeMaxSharedMemoryPerMultiprocessor
+#define gpuDeviceAttributeMaxBlocksPerMultiprocessor hipDeviceAttributeMaxBlocksPerMultiProcessor
 /* HIP: no hipMemAdvise equivalent; unified memory is automatic on HIP */
 #define GPU_WARP_SIZE __AMDGCN_WAVEFRONT_SIZE
 #else
@@ -137,6 +144,10 @@ typedef hipEvent_t gpuEvent_t;
 #define gpuMemGetInfo cudaMemGetInfo
 #define gpuFuncSetAttribute cudaFuncSetAttribute
 #define gpuFuncAttributeMaxDynamicSharedMemorySize cudaFuncAttributeMaxDynamicSharedMemorySize
+#define gpuDeviceGetAttribute cudaDeviceGetAttribute
+#define gpuDeviceAttributeMaxSharedMemoryPerBlockOptin cudaDevAttrMaxSharedMemoryPerBlockOptin
+#define gpuDeviceAttributeMaxSharedMemoryPerMultiprocessor cudaDevAttrMaxSharedMemoryPerMultiprocessor
+#define gpuDeviceAttributeMaxBlocksPerMultiprocessor cudaDevAttrMaxBlocksPerMultiprocessor
 #define gpuMallocHost cudaMallocHost
 #define gpuFreeHost cudaFreeHost
 #define gpuEvent_t cudaEvent_t
@@ -159,6 +170,29 @@ typedef hipEvent_t gpuEvent_t;
 #define gpuDeviceSynchronize cudaDeviceSynchronize
 #define gpuShflSync __shfl_sync
 #define gpuShflUpSync __shfl_up_sync
+
+/* __shfl_down_sync: available on NVIDIA CUDA and ROCm >= 6.4.
+ * On older ROCm (e.g. 6.3.3), only __shfl_down exists.
+ * The sync variant adds an explicit active mask; using 0xffffffff
+ * covers the full warp/wavefront, equivalent to the non-sync version. */
+/* Match __shfl_down_sync(mask, var, lane_delta, width) signature.
+ * On older ROCm, __shfl_down_sync doesn't exist; use __shfl_down(var, lane_delta, width). */
+#ifdef __HIP_DEVICE_COMPILE__
+__device__ inline int gpuShflDownSync(unsigned mask, int var, int lane_delta, int width = 0) {
+    (void)mask; return __shfl_down(var, lane_delta, width);
+}
+__device__ inline unsigned int gpuShflDownSync(unsigned mask, unsigned int var, int lane_delta, int width = 0) {
+    (void)mask; return __shfl_down(var, lane_delta, width);
+}
+__device__ inline float gpuShflDownSync(unsigned mask, float var, int lane_delta, int width = 0) {
+    (void)mask; return __shfl_down(var, lane_delta, width);
+}
+__device__ inline double gpuShflDownSync(unsigned mask, double var, int lane_delta, int width = 0) {
+    (void)mask; return __shfl_down(var, lane_delta, width);
+}
+#else
+#define gpuShflDownSync __shfl_down_sync
+#endif
 #define gpuLaunchBlockPerMultiprocessor cudaDevAttrMaxThreadsPerMultiProcessor
 #define gpuDevice cudaDevice
 #define gpuHostRegister cudaHostRegister
