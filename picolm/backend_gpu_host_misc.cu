@@ -5,6 +5,11 @@ extern "C" {
 __global__ void picolm_gpu_kv_pack_store_kernel(uint16_t *dst_row, const float *src, int n);
 }
 
+extern "C" int
+picolm_gpu_kv_store_dev_batched_strided(int is_k, int layer_ordinal, int start_pos, int n_positions,
+                                         const float *src_dev, int n_kv_heads, int head_dim,
+                                         int max_seq_len, int device, int src_stride);
+
 
 /* Print once per kernel type when first dispatched */
 static void gpu_dispatch_print(const char *name) {
