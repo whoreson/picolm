@@ -4637,16 +4637,72 @@ after_qkv:
 
         /* KV cache store */
         /* attn_ord already tracks the ordinal from the loop counter above */
+#ifndef PICOLM_HIP
+        /* CUDA: use strided variant (bk/bv have xb_stride layout, not kv_dim).
+         * This avoids reading gaps between rows as zero-pad. */
+        { static int kv_info = 0;
+          if (!kv_info) { fprintf(stderr, "INFO: KV cache strided store (xb_stride=%d, kv_dim=%d)\n", xb_stride, n_kv_heads*head_dim); kv_info = 1; } }
+        picolm_gpu_kv_store_dev_batched_strided(1, attn_ord, start_pos, n_ubatch,
+                                         bk, n_kv_heads, head_dim, seq_len, gpu_dev, xb_stride);
+        picolm_gpu_kv_store_dev_batched_strided(0, attn_ord, start_pos, n_ubatch,
+                                         bv, n_kv_heads, head_dim, seq_len, gpu_dev, xb_stride);
+#else
+        /* HIP: use non-strided variant. The strided path reads incorrectly
+         * because pipe_k_b/pipe_v_b are allocated as contiguous kv_dim rows. */
+        { static int kv_info = 0;
+          if (!kv_info) { fprintf(stderr, "INFO: KV cache non-strided store (HIP)\n"); kv_info = 1; } }
         picolm_gpu_kv_store_dev_batched(1, attn_ord, start_pos, n_ubatch,
                                          bk, n_kv_heads, head_dim, seq_len, gpu_dev);
         picolm_gpu_kv_store_dev_batched(0, attn_ord, start_pos, n_ubatch,
                                          bv, n_kv_heads, head_dim, seq_len, gpu_dev);
+#endif
 
-        /* Attention */
+        /* Diagnostic: dump first attention layer K values after store */
+        if (getenv("PICOLM_ATTN_DBG") && attn_ord == 0 && start_pos == 0) {
+            picolm_gpu_sync(gpu_dev);
+            float k_dbg[32];
+            picolm_gpu_memcpy(k_dbg, bk, 32 * sizeof(float), -1, gpu_dev);
+            fprintf(stderr, "[ATN_DBG l=%d attn_ord=%d] bk_tok0[:8]={", l, attn_ord);
+            for (int _i = 0; _i < 8; _i++) fprintf(stderr, "%.6f ", k_dbg[_i]);
+            fprintf(stderr, "}\n");
+            fflush(stderr);
+            /* Also dump Q values for first attention layer */
+            { float q_dbg[32];
+              picolm_gpu_memcpy(q_dbg, bq, 32 * sizeof(float), -1, gpu_dev);
+              float qrms=0; for(int _i=0;_i<32;_i++) qrms+=q_dbg[_i]*q_dbg[_i];
+              fprintf(stderr,"[ATN_DBG l=%d] bq_tok0[:8]={",l);
+              for(int _i=0;_i<8;_i++) fprintf(stderr,"%.6f ",q_dbg[_i]);
+              fprintf(stderr,"} rms=%.6f\n",sqrtf(qrms/32)); fflush(stderr); }
+        }
+
+        /* Attention: use F32 K/V directly (bypass F16 KV cache round-trip)
+         * to avoid quantization drift in SSM-hybrid prefill. The KV cache
+         * store above is still needed for decode phase.
+         *
+         * HIP: F32KV kernel needs ~73-97 KB shared memory for head_dim=256
+         * (gfx906/MI50 has 64 KB hard limit, no opt-in). Falls back to
+         * standard FP16 KV cache path which has no such constraint. */
+#ifndef PICOLM_HIP
+        picolm_gpu_attention_prefill_f32kv(battn_out, bq, bk, bv,
+                                            start_pos, n_ubatch,
+                                            n_heads, n_kv_heads, head_dim,
+                                            gpu_dev);
+#else
         picolm_gpu_attention_prefill_dev(battn_out, bq,
                                           attn_ord, start_pos, n_ubatch,
                                           n_heads, n_kv_heads, head_dim,
                                           seq_len, gpu_dev);
+#endif
+        /* Diagnostic: dump attention output for first layer */
+        if (getenv("PICOLM_ATTN_DBG") && attn_ord == 0 && start_pos == 0) {
+            picolm_gpu_sync(gpu_dev);
+            { float aout[32];
+              picolm_gpu_memcpy(aout, battn_out, 32 * sizeof(float), -1, gpu_dev);
+              float arms=0; for(int _i=0;_i<32;_i++) arms+=aout[_i]*aout[_i];
+              fprintf(stderr,"[ATN_DBG l=%d] attn_out_tok0[:8]={",l);
+              for(int _i=0;_i<8;_i++) fprintf(stderr,"%.6f ",aout[_i]);
+              fprintf(stderr,"} rms=%.6f\n",sqrtf(arms/32)); fflush(stderr); }
+        }
 
         /* SSM gate sigmoid */
         if (c->has_ssm) {
