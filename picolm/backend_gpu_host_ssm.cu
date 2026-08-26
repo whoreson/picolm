@@ -1184,6 +1184,14 @@ ssm_dot_gemm(const float *a, const float *b, int d) {
         }
     }
 
+    /* Handle d % 16 remainder elements (for non-multiples of 16).
+     * Accumulated into acc0 to match CPU AVX-512 remainder pattern. */
+    { int rem = d - d16 * 16;
+      for (int lane = 0; lane < rem; lane++) {
+          acc0[lane] = __fmaf_rn(a[d16 * 16 + lane], b[d16 * 16 + lane], acc0[lane]);
+      }
+    }
+
     return ssm_reduce_16(acc0) + ssm_reduce_16(acc1)
          + ssm_reduce_16(acc2) + ssm_reduce_16(acc3);
 }
@@ -1205,9 +1213,15 @@ ssm_dot_matvec(const float *a, const float *b, int d) {
         }
     }
 
+    /* Handle d % 16 remainder elements. */
+    { int rem = d - d16 * 16;
+      for (int lane = 0; lane < rem; lane++) {
+          acc[lane] = __fmaf_rn(a[d16 * 16 + lane], b[d16 * 16 + lane], acc[lane]);
+      }
+    }
+
     return ssm_reduce_16(acc);
 }
-
 
 /* ---- Gather: gate_log/beta/Q/K/V for one chunk, from the token-major
  * conv_batch/alpha_batch/beta_batch buffers, into the head-major
@@ -1405,7 +1419,8 @@ ssm_chunk_trisolve_kernel(float *v_hat, const float *v_eff, const float *M_mat,
         const float *Mi = M_h + (size_t)i * cs;
         for (int r = threadIdx.x; r < d; r += blockDim.x) {
             float sum_mv = 0.0f;
-            for (int j = 0; j < i; j++) sum_mv += Mi[j] * vh_h[(size_t)j * d + r];
+            for (int j = 0; j < i; j++)
+                sum_mv = __fmaf_rn(Mi[j], vh_h[(size_t)j * d + r], sum_mv);
             vh_h[(size_t)i * d + r] = ve_h[(size_t)i * d + r] - bt * sum_mv;
         }
         __syncthreads();
@@ -1437,7 +1452,7 @@ ssm_chunk_output_kernel(float *chunk_out, const float *sq, const float *q_decay,
         for (int j = 0; j <= i; j++) {
             float attn = kqi[j];
             if (attn == 0.0f) continue;
-            acc += attn * vh_h[(size_t)j * d + r];
+            acc = __fmaf_rn(attn, vh_h[(size_t)j * d + r], acc);
         }
         out_h[idx] = acc;
     }
@@ -1700,8 +1715,6 @@ picolm_gpu_ssm_chunked_recurrence(const float *conv_batch_host,
 }
 
 /* Per-device KV cache pointers */
-
-
 static uint16_t *g_kv_k_dev[PICOLM_GPU_MAX_DEVICES];
 static uint16_t *g_kv_v_dev[PICOLM_GPU_MAX_DEVICES];
 static size_t g_kv_k_cap[PICOLM_GPU_MAX_DEVICES];
