@@ -2978,7 +2978,13 @@ int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
               l, (float)sqrt(nr/hvdim),nwa[0],nwa[1],nwa[2],nwa[3],nwa[4],nwa[5],nwa[6],nwa[7]);
           free(nwa);
       }
-      ok&=picolm_gpu_ssm_prefill_gated_norm_dev(battn_out,bq,nw,hvdim,n_v,n_tokens,eps,xb2_stride,xb2_stride,dev);
+      /* bq stride depends on whether head_permute was applied:
+       * do_remap=true:  bq was rewritten by head_permute with dst_stride=value_dim
+       * do_remap=false: bq retains matmul output stride=xb2_stride
+       * Using the wrong stride causes the kernel to read garbage Z values
+       * for tokens > 0, corrupting the gated_norm output. */
+      int z_stride_gn = (do_remap && gw->ssm_head_map_dev) ? value_dim : xb2_stride;
+      ok&=picolm_gpu_ssm_prefill_gated_norm_dev(battn_out,bq,nw,hvdim,n_v,n_tokens,eps,xb2_stride,z_stride_gn,dev);
 
     }
     if(l<=4&&_SSM_DBG){
