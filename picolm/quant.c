@@ -1779,7 +1779,11 @@ void quantize_row_q8_K(const float *x, void *dst, int n) {
  * high 8 lanes need scale 2s+1 (bytes 4s+2,4s+3).
  * Matches llama.cpp's get_scale_shuffle_q3k (128 bytes, 4 entries). */
 static inline __m256i get_scale_shuffle_q2k(int shift) {
+    #ifdef _MSC_VER
+    static const __declspec(align(32)) uint8_t k_shuffle[128] = {
+#else
     static const uint8_t k_shuffle[128] __attribute__((aligned(32))) = {
+#endif
          0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,  2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3,
          4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5,  6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7,
          8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,
