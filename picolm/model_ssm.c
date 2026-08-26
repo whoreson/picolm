@@ -2748,6 +2748,22 @@ int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
 
     SSM_DBG_SYNC;
     _DBG_RMS("gate",bq,xb2_stride);
+    if(l<=4&&_SSM_DBG) {
+        /* Dump FFN gate matmul output for comparison */
+        { float fi[4];
+          picolm_gpu_sync(dev);
+          picolm_gpu_memcpy(fi, bffn_norm, 16, -1, dev);
+          fprintf(stderr,"[DBG] l=%d bffn_norm_tok0[:4]={%.6f,%.6f,%.6f,%.6f}\n",l,fi[0],fi[1],fi[2],fi[3]);
+        }
+    }
+    /* Dump conv1d weight for debugging */
+    if (l == 0 && _SSM_DBG) {
+        float cw[16], cs[12];
+        picolm_gpu_memcpy(cw, gw->ssm_conv1d_dev[l], 64, -1, dev);
+        fprintf(stderr, "[DBG l%d] conv1d_w[0][:4]={%.6f,%.6f,%.6f,%.6f} w[1][:4]={%.6f,%.6f,%.6f,%.6f}\n", l, cw[0],cw[1],cw[2],cw[3],cw[4],cw[5],cw[6],cw[7]);
+        picolm_gpu_memcpy(cs, cs_dev, 48, -1, dev);
+        fprintf(stderr, "[DBG l%d] conv_state[0][:4]={%.6f,%.6f,%.6f,%.6f}\n", l, cs[0],cs[1],cs[2],cs[3]);
+    }
     /* Conv1d + silu (in-place on bxb which has QKV output) */
         ok&=picolm_gpu_ssm_conv1d_batch_dev(bxb,cs_dev,bxb,(float*)gw->ssm_conv1d_dev[l],conv_dim,c->ssm_d_conv,n_tokens,dev,xb2_stride);
 
@@ -4621,47 +4637,16 @@ after_qkv:
 
         /* KV cache store */
         /* attn_ord already tracks the ordinal from the loop counter above */
-        /* Use strided variant: bk/bv have xb_stride layout, not kv_dim */
-        picolm_gpu_kv_store_dev_batched_strided(1, attn_ord, start_pos, n_ubatch,
-                                         bk, n_kv_heads, head_dim, seq_len, gpu_dev, xb_stride);
-        picolm_gpu_kv_store_dev_batched_strided(0, attn_ord, start_pos, n_ubatch,
-                                         bv, n_kv_heads, head_dim, seq_len, gpu_dev, xb_stride);
+        picolm_gpu_kv_store_dev_batched(1, attn_ord, start_pos, n_ubatch,
+                                         bk, n_kv_heads, head_dim, seq_len, gpu_dev);
+        picolm_gpu_kv_store_dev_batched(0, attn_ord, start_pos, n_ubatch,
+                                         bv, n_kv_heads, head_dim, seq_len, gpu_dev);
 
-        /* Diagnostic: dump first attention layer K values after store */
-        if (getenv("PICOLM_ATTN_DBG") && attn_ord == 0 && start_pos == 0) {
-            picolm_gpu_sync(gpu_dev);
-            float k_dbg[32];
-            picolm_gpu_memcpy(k_dbg, bk, 32 * sizeof(float), -1, gpu_dev);
-            fprintf(stderr, "[ATN_DBG l=%d attn_ord=%d] bk_tok0[:8]={", l, attn_ord);
-            for (int _i = 0; _i < 8; _i++) fprintf(stderr, "%.6f ", k_dbg[_i]);
-            fprintf(stderr, "}\n");
-            fflush(stderr);
-            /* Also dump Q values for first attention layer */
-            { float q_dbg[32];
-              picolm_gpu_memcpy(q_dbg, bq, 32 * sizeof(float), -1, gpu_dev);
-              float qrms=0; for(int _i=0;_i<32;_i++) qrms+=q_dbg[_i]*q_dbg[_i];
-              fprintf(stderr,"[ATN_DBG l=%d] bq_tok0[:8]={",l);
-              for(int _i=0;_i<8;_i++) fprintf(stderr,"%.6f ",q_dbg[_i]);
-              fprintf(stderr,"} rms=%.6f\n",sqrtf(qrms/32)); fflush(stderr); }
-        }
-
-        /* Attention: use F32 K/V directly (bypass F16 KV cache round-trip)
-         * to avoid quantization drift in SSM-hybrid prefill. The KV cache
-         * store above is still needed for decode phase. */
-        picolm_gpu_attention_prefill_f32kv(battn_out, bq, bk, bv,
-                                            start_pos, n_ubatch,
-                                            n_heads, n_kv_heads, head_dim,
-                                            gpu_dev);
-        /* Diagnostic: dump attention output for first layer */
-        if (getenv("PICOLM_ATTN_DBG") && attn_ord == 0 && start_pos == 0) {
-            picolm_gpu_sync(gpu_dev);
-            { float aout[32];
-              picolm_gpu_memcpy(aout, battn_out, 32 * sizeof(float), -1, gpu_dev);
-              float arms=0; for(int _i=0;_i<32;_i++) arms+=aout[_i]*aout[_i];
-              fprintf(stderr,"[ATN_DBG l=%d] attn_out_tok0[:8]={",l);
-              for(int _i=0;_i<8;_i++) fprintf(stderr,"%.6f ",aout[_i]);
-              fprintf(stderr,"} rms=%.6f\n",sqrtf(arms/32)); fflush(stderr); }
-        }
+        /* Attention */
+        picolm_gpu_attention_prefill_dev(battn_out, bq,
+                                          attn_ord, start_pos, n_ubatch,
+                                          n_heads, n_kv_heads, head_dim,
+                                          seq_len, gpu_dev);
 
         /* SSM gate sigmoid */
         if (c->has_ssm) {

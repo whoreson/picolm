@@ -1015,6 +1015,7 @@ picolm_q8_q8_matmul_imma_w16(float *y, const int8_t *xq, const float *xd,
  * is reused across 32 output rows (2x the w16 kernel), netting
  * a 2x improvement in arithmetic intensity for weight reads.
  * ================================================================ */
+#ifndef __HIP__
 __global__ void
 picolm_q8_q8_matmul_imma_smw16(float *y, const int8_t *xq, const float *xd,
                                 const void *weights, int S, int I, int O,
@@ -1095,7 +1096,6 @@ picolm_q8_q8_matmul_imma_smw16(float *y, const int8_t *xq, const float *xd,
 
             int d0a = 0, d1a = 0, d2a = 0, d3a = 0;
             int d0b = 0, d1b = 0, d2b = 0, d3b = 0;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__)
             asm volatile(
                 "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -1106,9 +1106,6 @@ picolm_q8_q8_matmul_imma_smw16(float *y, const int8_t *xq, const float *xd,
                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                 : "+r"(d0b), "+r"(d1b), "+r"(d2b), "+r"(d3b)
                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0b), "r"(b1b));
-#else
-            d0a = d1a = d2a = d3a = 0; d0b = d1b = d2b = d3b = 0;
-#endif
 
             /* Weight scales from shared memory. */
             {
@@ -1151,6 +1148,7 @@ picolm_q8_q8_matmul_imma_smw16(float *y, const int8_t *xq, const float *xd,
     }
 
     }
+#endif /* __HIP__ */
 
 /* ================================================================
  * Phase 7: Fused RMSNorm + Quantize kernel
@@ -1243,6 +1241,7 @@ picolm_rmsnorm_quantize_q8_0_kernel(int8_t *qs_out, float *d_out,
 
 /* Helper: compute one 16x16 IMMA tile for a single weight matrix.
  * Reads A fragments per KB-tile. Accumulates into sum[8]. */
+#ifndef __HIP__
 __device__ void
 imma_qkv_one_w16(const uint8_t *w, const int8_t *xq, const float *xd,
                  int tile_o, int tile_s, int gid, int tid,
@@ -1289,7 +1288,6 @@ imma_qkv_one_w16(const uint8_t *w, const int8_t *xq, const float *xd,
 
         int d0a = 0, d1a = 0, d2a = 0, d3a = 0;
         int d0b = 0, d1b = 0, d2b = 0, d3b = 0;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__)
         asm volatile(
             "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
@@ -1300,9 +1298,6 @@ imma_qkv_one_w16(const uint8_t *w, const int8_t *xq, const float *xd,
             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
             : "+r"(d0b), "+r"(d1b), "+r"(d2b), "+r"(d3b)
             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0b), "r"(b1b));
-#else
-        d0a = d1a = d2a = d3a = 0; d0b = d1b = d2b = d3b = 0;
-#endif
 
         /* Activation scales (shared by both 8-col halves). */
         float dx0 = xd[(size_t)(tile_s + gid) * n_blocks + kb];
@@ -1341,8 +1336,10 @@ imma_qkv_one_w16(const uint8_t *w, const int8_t *xq, const float *xd,
         }
     }
 }
+#endif /* __HIP__ */
 
 /* Write 8 FP32 output values from sum[] to the output buffer. */
+#ifndef __HIP__
 __device__ void
 imma_qkv_write_tile(float *out, int tile_o, int tile_s, int gid, int tid,
                     int S, int O, int ys, const float sum[8]) {
@@ -1396,6 +1393,7 @@ picolm_q8_q8_matmul_imma_qkv(float *bq, float *bk, float *bv,
         imma_qkv_write_tile(bv, tile_o, tile_s, gid, tid, S, Ov, ys_kv, sum);
     }
 }
+#endif /* __HIP__ */
 
 #endif /* __CUDA_ARCH__ >= 800 */
 

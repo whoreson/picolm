@@ -1015,6 +1015,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
         }
         if (!gpu_ok(gpuGetLastError(), "q8 quantize (dev)")) return 0;
         /* Phase 6 abandoned: Q8_0 34-byte blocks cause misaligned access. */
+        #ifndef __HIP__
         /* Phase 8: shared-memory staged IMMA (32x16 tiles, 64 threads). */
         if (!getenv("PICOLM_NO_SM_IMMA") && ctx->has_imma && S >= 32 && O >= 16) {
             gpu_dispatch_print("matmul_imma_smw16_dev");
@@ -1024,6 +1025,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
                 y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
             if (gpu_ok(gpuGetLastError(), "q8 smw16 matmul (dev)")) return 1;
         }
+#endif
 #if defined(PICOLM_IMMA_W16)
         if (ctx->has_imma && S >= 16 && O >= 16) {
             gpu_dispatch_print("matmul_imma_w16_dev");
@@ -1420,6 +1422,7 @@ static int imma_dev_q8(picolm_gpu_tensor_t *t, float *y_dev,
     const int8_t *xq, const float *xd, int S, int I, int O,
     int ys, gpu_device_ctx_t *ctx) {
     /* Phase 6 abandoned: Q8_0 34-byte blocks cause misaligned access. */
+#ifndef __HIP__
     /* Phase 8: try shared-memory staged IMMA W16 (32x16 tiles, 64 threads). */
     if (!getenv("PICOLM_NO_SM_IMMA") && ctx->has_imma && S >= 32 && O >= 16) {
         gpu_dispatch_print("matmul_imma_smw16_dev");
@@ -1430,6 +1433,7 @@ static int imma_dev_q8(picolm_gpu_tensor_t *t, float *y_dev,
         if (gpu_ok(gpuGetLastError(), "q8 smw16 matmul (dev)")) return 1;
         /* Fall through to regular IMMA on error. */
     }
+#endif
 #if defined(PICOLM_IMMA_W16)
     if (ctx->has_imma && S >= 16 && O >= 16) {
         gpu_dispatch_print("matmul_imma_w16_dev");
