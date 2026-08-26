@@ -1105,6 +1105,109 @@ picolm_gpu_ssm_vecdot_dev(float *out_dev,
  * dispatch (safe fallback to CPU) if it doesn't hold, rather than
  * assume it silently.
  * ================================================================ */
+/* ---- AVX-512-matching reduction helpers for GPU dot products.
+ *
+ * The CPU AVX-512 path uses 16-wide __m512 accumulators with
+ * _mm512_fmadd_ps (fused multiply-add, single rounding) and
+ * _mm512_reduce_add_ps (balanced binary tree horizontal reduce).
+ * The GPU scalar path uses sequential left-to-right accumulation
+ * with --fmad=false (separate multiply and add, double rounding).
+ *
+ * This mismatch in reduction order causes ~0.5% RMS divergence that
+ * compounds across 24 SSM layers, making some seeds fail.
+ *
+ * These helpers replicate the exact AVX-512 reduction structure:
+ *   1. 16-element groups, each lane accumulated independently via FMA
+ *   2. Balanced binary tree horizontal reduce within each 16-lane group
+ *   3. For GEMM: 4 independent 16-lane accumulators (unroll-by-4),
+ *      groups distributed round-robin, then 4 reduces summed
+ *   4. For matvec: 1 accumulator, all groups sequential, then 1 reduce
+ *
+ * __fmaf_rn is used to match the CPU's _mm512_fmadd_ps single-rounding
+ * behavior regardless of the --fmad=false build flag. ---- */
+
+__device__ __forceinline__ float
+ssm_reduce_16(const float v[16]) {
+    /* Match _mm512_reduce_add_ps: balanced binary tree of 16 floats.
+     * Step 1: [0+8, 1+9, 2+10, 3+11, 4+12, 5+13, 6+14, 7+15] (8 elems)
+     * Step 2: pair-wise to 4 elements
+     * Step 3: pair-wise to 2 elements
+     * Step 4: final sum */
+    float s0 = v[0] + v[8];
+    float s1 = v[1] + v[9];
+    float s2 = v[2] + v[10];
+    float s3 = v[3] + v[11];
+    float s4 = v[4] + v[12];
+    float s5 = v[5] + v[13];
+    float s6 = v[6] + v[14];
+    float s7 = v[7] + v[15];
+
+    float t0 = s0 + s4;
+    float t1 = s1 + s5;
+    float t2 = s2 + s6;
+    float t3 = s3 + s7;
+
+    float u0 = t0 + t2;
+    float u1 = t1 + t3;
+
+    return u0 + u1;
+}
+
+/* GEMM-style dot product: matches ssm_kernel_interaction and
+ * ssm_kernel_output_cross AVX-512 pattern. 4 accumulators of 16 lanes,
+ * unroll-by-4 over d/16 groups, remainder to acc0. Final result is
+ * sum of 4 horizontal reduces. */
+__device__ __forceinline__ float
+ssm_dot_gemm(const float *a, const float *b, int d) {
+    int d16 = d / 16;
+    float acc0[16], acc1[16], acc2[16], acc3[16];
+    #pragma unroll
+    for (int lane = 0; lane < 16; lane++) {
+        acc0[lane] = 0.f; acc1[lane] = 0.f;
+        acc2[lane] = 0.f; acc3[lane] = 0.f;
+    }
+
+    int v;
+    for (v = 0; v + 3 < d16; v += 4) {
+        #pragma unroll
+        for (int lane = 0; lane < 16; lane++) {
+            acc0[lane] = __fmaf_rn(a[(v+0)*16 + lane], b[(v+0)*16 + lane], acc0[lane]);
+            acc1[lane] = __fmaf_rn(a[(v+1)*16 + lane], b[(v+1)*16 + lane], acc1[lane]);
+            acc2[lane] = __fmaf_rn(a[(v+2)*16 + lane], b[(v+2)*16 + lane], acc2[lane]);
+            acc3[lane] = __fmaf_rn(a[(v+3)*16 + lane], b[(v+3)*16 + lane], acc3[lane]);
+        }
+    }
+    for (; v < d16; v++) {
+        #pragma unroll
+        for (int lane = 0; lane < 16; lane++) {
+            acc0[lane] = __fmaf_rn(a[v*16 + lane], b[v*16 + lane], acc0[lane]);
+        }
+    }
+
+    return ssm_reduce_16(acc0) + ssm_reduce_16(acc1)
+         + ssm_reduce_16(acc2) + ssm_reduce_16(acc3);
+}
+
+/* Matvec-style dot product: matches ssm_kernel_veff and ssm_kernel_sq
+ * AVX-512 pattern. 1 accumulator of 16 lanes, all d/16 groups
+ * sequential, then single horizontal reduce. */
+__device__ __forceinline__ float
+ssm_dot_matvec(const float *a, const float *b, int d) {
+    int d16 = d / 16;
+    float acc[16];
+    #pragma unroll
+    for (int lane = 0; lane < 16; lane++) acc[lane] = 0.f;
+
+    for (int v = 0; v < d16; v++) {
+        #pragma unroll
+        for (int lane = 0; lane < 16; lane++) {
+            acc[lane] = __fmaf_rn(a[v*16 + lane], b[v*16 + lane], acc[lane]);
+        }
+    }
+
+    return ssm_reduce_16(acc);
+}
+
 
 /* ---- Gather: gate_log/beta/Q/K/V for one chunk, from the token-major
  * conv_batch/alpha_batch/beta_batch buffers, into the head-major
@@ -1228,8 +1331,7 @@ ssm_chunk_masked_gemm_kernel(float *out_cs_cs, const float *A, const float *B,
         if (j > i) { out[idx] = 0.0f; continue; }
         const float *ai = Ah + (size_t)i * d;
         const float *bj = Bh + (size_t)j * d;
-        float dot = 0.0f;
-        for (int c = 0; c < d; c++) dot += ai[c] * bj[c];
+        float dot = ssm_dot_gemm(ai, bj, d);
         out[idx] = dot * dm[idx];
     }
 }
@@ -1253,8 +1355,7 @@ ssm_chunk_matvec_kernel(float *out, const float *state, const float *chunk_x,
         int i = idx / d, r = idx % d;
         const float *xi = x_h + (size_t)i * d;
         const float *st_row = st + (size_t)r * d;
-        float sum = 0.0f;
-        for (int c = 0; c < d; c++) sum += st_row[c] * xi[c];
+        float sum = ssm_dot_matvec(st_row, xi, d);
         o[idx] = sum;
     }
 }
@@ -1333,8 +1434,11 @@ ssm_chunk_output_kernel(float *chunk_out, const float *sq, const float *q_decay,
         int i = idx / d, r = idx % d;
         float acc = sq_h[idx] * qd_h[i];
         const float *kqi = kq_h + (size_t)i * cs;
-        for (int j = 0; j <= i; j++)
-            acc += kqi[j] * vh_h[(size_t)j * d + r];
+        for (int j = 0; j <= i; j++) {
+            float attn = kqi[j];
+            if (attn == 0.0f) continue;
+            acc += attn * vh_h[(size_t)j * d + r];
+        }
         out_h[idx] = acc;
     }
 }
@@ -1365,15 +1469,23 @@ ssm_chunk_state_update_kernel(float *state, const float *v_hat, const float *chu
     int n_elem = d * d;
     for (int idx = threadIdx.x; idx < n_elem; idx += blockDim.x) {
         int r = idx / d, c = idx % d;
-        float update = 0.0f;
+        /* Match CPU AVX-512 order: scale state by total_decay first,
+         * then accumulate k[j][c] * (v_hat[j][r] * decay_to_end[j])
+         * via FMA, exactly as _mm512_fmadd_ps(kv, set1(v*dj), state).
+         * The CPU computes v*dj as a scalar multiply (one rounding),
+         * then fma(k, v*dj, state) (one rounding for mul+add fused).
+         * __fmaf_rn matches the FMA rounding. */
+        float s = st_h[idx] * total_decay;
         for (int j = 0; j < cs; j++) {
             float diff = cum_last - cg_h[j];
             if (diff > 50.0f) diff = 50.0f;
             if (diff < -50.0f) diff = -50.0f;
             float decay_to_end = expf(diff);
-            update += vh_h[(size_t)j * d + r] * k_h[(size_t)j * d + c] * decay_to_end;
+            if (decay_to_end == 0.0f) continue;
+            float vd = vh_h[(size_t)j * d + r] * decay_to_end;
+            s = __fmaf_rn(k_h[(size_t)j * d + c], vd, s);
         }
-        st_h[idx] = st_h[idx] * total_decay + update;
+        st_h[idx] = s;
     }
 }
 
