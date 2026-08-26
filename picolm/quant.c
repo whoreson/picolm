@@ -1770,8 +1770,26 @@ void quantize_row_q8_K(const float *x, void *dst, int n) {
     }
 }
 
-/* ================================================================
- * vec_dot_q4_K_q8_K: int8 MAC for Q4_K weights * Q8_K input
+/* ================================================================ */
+#ifdef PICOLM_AVX2
+/* Q2_K scale shuffle table for AVX2.
+ * The pattern is identical for both chunks (j=0 and j=1) since scales[j]
+ * holds 8 local scale int16s duplicated across both 128-bit lanes.
+ * For shift s: low 8 lanes need scale 2s (bytes 4s,4s+1),
+ * high 8 lanes need scale 2s+1 (bytes 4s+2,4s+3).
+ * Matches llama.cpp's get_scale_shuffle_q3k (128 bytes, 4 entries). */
+static inline __m256i get_scale_shuffle_q2k(int shift) {
+    static const uint8_t k_shuffle[128] __attribute__((aligned(32))) = {
+         0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,  2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3,
+         4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5,  6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7,
+         8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,
+        12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13, 14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,
+    };
+    return _mm256_loadu_si256((const __m256i*)k_shuffle + shift);
+}
+#endif
+
+/* vec_dot_q4_K_q8_K: int8 MAC for Q4_K weights * Q8_K input
  * Adapted from llama.cpp's ggml_vec_dot_q4_K_q8_K (AVX2, AVX1, NEON, scalar)
  * The key optimization: nibble extraction to int8, int8 MAC with
  * per-subblock scale factors, only 8 final float ops per block.
@@ -4821,6 +4839,188 @@ float vec_dot_q2_K_q8_K(const void *src_q2, const void *src_q8, int n) {
         }
 
         sumf += d * (float)isum - dmin * (float)summs;
+    }
+
+#elif defined(PICOLM_AVX2)
+    /* AVX2 path: 256-bit SIMD for Q2_K dot product.
+     * Extracts 4 shifts of 2-bit quants (0,2,4,6) from 32 bytes per iteration,
+     * processes with maddubs+madd_epi16. Adapted from llama.cpp. */
+    {
+        const __m256i m3 = _mm256_set1_epi8(3);
+        const __m128i m4 = _mm_set1_epi8(0xF);
+
+        __m256 acc = _mm256_setzero_ps();
+
+        for (int i = 0; i < nb; ++i) {
+            const float d = y[i].d * fp16_to_fp32_lookup(x[i].d);
+            const float dmin = -y[i].d * fp16_to_fp32_lookup(x[i].dmin);
+
+            const uint8_t *q2 = x[i].qs;
+            const int8_t  *q8 = y[i].qs;
+
+            /* Load all 16 scale+min bytes at once */
+            const __m128i mins_and_scales = _mm_loadu_si128((const __m128i*)x[i].scales);
+            const __m128i scales8 = _mm_and_si128(mins_and_scales, m4);
+            const __m128i mins8   = _mm_and_si128(_mm_srli_epi16(mins_and_scales, 4), m4);
+
+            /* Min correction: dmin * sum(bsums[j] * mins[j]) */
+            const __m256i mins = _mm256_cvtepi8_epi16(mins8);
+            const __m256i prod = _mm256_madd_epi16(mins, _mm256_loadu_si256((const __m256i*)y[i].bsums));
+            acc = _mm256_fmadd_ps(_mm256_broadcast_ss(&dmin), _mm256_cvtepi32_ps(prod), acc);
+
+            /* Prepare scales: convert 16 scale bytes to 16 int16, split into
+             * low 8 and high 8, each duplicated into a __m256i for shuffling. */
+            const __m256i all_scales = _mm256_cvtepi8_epi16(scales8);
+            const __m128i l_scales = _mm256_extracti128_si256(all_scales, 0);
+            const __m128i h_scales = _mm256_extracti128_si256(all_scales, 1);
+            const __m256i scales[2] = {
+                _mm256_set_m128i(l_scales, l_scales),
+                _mm256_set_m128i(h_scales, h_scales),
+            };
+
+            __m256i sumi = _mm256_setzero_si256();
+
+            /* 256 q2 values = 64 bytes = 2 chunks of 32 bytes.
+             * Each chunk: 4 shifts (bits 0,2,4,6), 32 q2 values per shift. */
+            for (int j = 0; j < 2; ++j) {
+                const __m256i q2bits = _mm256_loadu_si256((const __m256i*)q2);
+                q2 += 32;
+
+                const __m256i q8_0 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+                const __m256i q8_1 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+                const __m256i q8_2 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+                const __m256i q8_3 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+
+                const __m256i q2_0 = _mm256_and_si256(q2bits, m3);
+                const __m256i q2_1 = _mm256_and_si256(_mm256_srli_epi16(q2bits, 2), m3);
+                const __m256i q2_2 = _mm256_and_si256(_mm256_srli_epi16(q2bits, 4), m3);
+                const __m256i q2_3 = _mm256_and_si256(_mm256_srli_epi16(q2bits, 6), m3);
+
+                __m256i p0 = _mm256_maddubs_epi16(q2_0, q8_0);
+                __m256i p1 = _mm256_maddubs_epi16(q2_1, q8_1);
+                __m256i p2 = _mm256_maddubs_epi16(q2_2, q8_2);
+                __m256i p3 = _mm256_maddubs_epi16(q2_3, q8_3);
+
+                /* Shuffle scales: same pattern for both chunks, indexed by shift only.
+                 * Each shift uses 2 consecutive scales (one per 16-element half). */
+                p0 = _mm256_madd_epi16(_mm256_shuffle_epi8(scales[j], get_scale_shuffle_q2k(0)), p0);
+                p1 = _mm256_madd_epi16(_mm256_shuffle_epi8(scales[j], get_scale_shuffle_q2k(1)), p1);
+                p2 = _mm256_madd_epi16(_mm256_shuffle_epi8(scales[j], get_scale_shuffle_q2k(2)), p2);
+                p3 = _mm256_madd_epi16(_mm256_shuffle_epi8(scales[j], get_scale_shuffle_q2k(3)), p3);
+
+                p0 = _mm256_add_epi32(p0, p1);
+                p2 = _mm256_add_epi32(p2, p3);
+                sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p0, p2));
+            }
+
+            acc = _mm256_fmadd_ps(_mm256_broadcast_ss(&d), _mm256_cvtepi32_ps(sumi), acc);
+        }
+
+        sumf = hsum_avx(acc);
+    }
+
+#elif defined(PICOLM_AVX)
+    /* AVX1 path: 128-bit integer + 256-bit float accumulation.
+     * Processes 16 q2 bytes per iteration (8 shifts of 2-bit quants).
+     * Adapted from llama.cpp. */
+    {
+        const __m128i m3 = _mm_set1_epi8(0x3);
+        const __m128i m4 = _mm_set1_epi8(0xF);
+        const __m128i m2 = _mm_set1_epi8(0x2);
+
+        __m256 acc = _mm256_setzero_ps();
+
+        for (int i = 0; i < nb; ++i) {
+            const float dall = y[i].d * fp16_to_fp32_lookup(x[i].d);
+            const float dmin = -y[i].d * fp16_to_fp32_lookup(x[i].dmin);
+
+            const uint8_t *q2 = x[i].qs;
+            const int8_t  *q8 = y[i].qs;
+
+            /* Min correction */
+            const __m128i mins_and_scales = _mm_loadu_si128((const __m128i*)x[i].scales);
+            const __m128i scales16 = _mm_and_si128(mins_and_scales, m4);
+            const __m128i mins16 = _mm_and_si128(_mm_srli_epi16(mins_and_scales, 4), m4);
+            const __m128i mins_0 = _mm_cvtepi8_epi16(mins16);
+            const __m128i mins_1 = _mm_cvtepi8_epi16(_mm_unpackhi_epi64(mins16, mins16));
+            const __m128i summs_0 = _mm_madd_epi16(mins_0, _mm_loadu_si128((const __m128i*)&y[i].bsums[0]));
+            const __m128i summs_1 = _mm_madd_epi16(mins_1, _mm_loadu_si128((const __m128i*)&y[i].bsums[8]));
+            acc = _mm256_add_ps(_mm256_mul_ps(_mm256_broadcast_ss(&dmin),
+                    _mm256_cvtepi32_ps(_mm256_set_m128i(summs_1, summs_0))), acc);
+
+            /* Prepare scales */
+            const __m128i scales_0 = _mm_cvtepi8_epi16(scales16);
+            const __m128i scales_1 = _mm_cvtepi8_epi16(_mm_unpackhi_epi64(scales16, scales16));
+            const __m128i scales[2] = {scales_0, scales_1};
+
+            __m128i sumi_0 = _mm_setzero_si128();
+            __m128i sumi_1 = _mm_setzero_si128();
+
+            for (int j = 0; j < 2; ++j) {
+                /* Load 32 q2 bytes as 2x16, extract 8 shifts total */
+                __m128i q2bits = _mm_loadu_si128((const __m128i*)q2); q2 += 16;
+                const __m128i q2_0 = _mm_and_si128(q2bits, m3);
+                const __m128i q2_2 = _mm_and_si128(_mm_srli_epi16(q2bits, 2), m3);
+                const __m128i q2_4 = _mm_and_si128(_mm_srli_epi16(q2bits, 4), m3);
+                const __m128i q2_6 = _mm_and_si128(_mm_srli_epi16(q2bits, 6), m3);
+                q2bits = _mm_loadu_si128((const __m128i*)q2); q2 += 16;
+                const __m128i q2_1 = _mm_and_si128(q2bits, m3);
+                const __m128i q2_3 = _mm_and_si128(_mm_srli_epi16(q2bits, 2), m3);
+                const __m128i q2_5 = _mm_and_si128(_mm_srli_epi16(q2bits, 4), m3);
+                const __m128i q2_7 = _mm_and_si128(_mm_srli_epi16(q2bits, 6), m3);
+
+                /* Load 8x16 q8 bytes */
+                const __m128i q8_0 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
+                const __m128i q8_1 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
+                const __m128i q8_2 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
+                const __m128i q8_3 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
+                const __m128i q8_4 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
+                const __m128i q8_5 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
+                const __m128i q8_6 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
+                const __m128i q8_7 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
+
+                __m128i p0 = _mm_maddubs_epi16(q2_0, q8_0);
+                __m128i p1 = _mm_maddubs_epi16(q2_1, q8_1);
+                __m128i p2 = _mm_maddubs_epi16(q2_2, q8_2);
+                __m128i p3 = _mm_maddubs_epi16(q2_3, q8_3);
+                __m128i p4 = _mm_maddubs_epi16(q2_4, q8_4);
+                __m128i p5 = _mm_maddubs_epi16(q2_5, q8_5);
+                __m128i p6 = _mm_maddubs_epi16(q2_6, q8_6);
+                __m128i p7 = _mm_maddubs_epi16(q2_7, q8_7);
+
+                /* Shuffle scales: 0x0100 pattern, stepping by 0x0200 */
+                __m128i shuffle = _mm_set1_epi16(0x0100);
+                p0 = _mm_madd_epi16(_mm_shuffle_epi8(scales[j], shuffle), p0);
+                shuffle = _mm_add_epi16(shuffle, m2);
+                p1 = _mm_madd_epi16(_mm_shuffle_epi8(scales[j], shuffle), p1);
+                shuffle = _mm_add_epi16(shuffle, m2);
+                p2 = _mm_madd_epi16(_mm_shuffle_epi8(scales[j], shuffle), p2);
+                shuffle = _mm_add_epi16(shuffle, m2);
+                p3 = _mm_madd_epi16(_mm_shuffle_epi8(scales[j], shuffle), p3);
+                shuffle = _mm_add_epi16(shuffle, m2);
+                p4 = _mm_madd_epi16(_mm_shuffle_epi8(scales[j], shuffle), p4);
+                shuffle = _mm_add_epi16(shuffle, m2);
+                p5 = _mm_madd_epi16(_mm_shuffle_epi8(scales[j], shuffle), p5);
+                shuffle = _mm_add_epi16(shuffle, m2);
+                p6 = _mm_madd_epi16(_mm_shuffle_epi8(scales[j], shuffle), p6);
+                shuffle = _mm_add_epi16(shuffle, m2);
+                p7 = _mm_madd_epi16(_mm_shuffle_epi8(scales[j], shuffle), p7);
+
+                p0 = _mm_add_epi32(p0, p1);
+                p2 = _mm_add_epi32(p2, p3);
+                p4 = _mm_add_epi32(p4, p5);
+                p6 = _mm_add_epi32(p6, p7);
+
+                sumi_0 = _mm_add_epi32(sumi_0, _mm_add_epi32(p0, p2));
+                sumi_1 = _mm_add_epi32(sumi_1, _mm_add_epi32(p4, p6));
+            }
+
+            __m256i sumi = _mm256_set_m128i(sumi_1, sumi_0);
+            acc = _mm256_add_ps(_mm256_mul_ps(_mm256_broadcast_ss(&dall),
+                    _mm256_cvtepi32_ps(sumi)), acc);
+        }
+
+        sumf = hsum_avx(acc);
     }
 
 #else
