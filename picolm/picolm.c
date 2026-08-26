@@ -137,6 +137,28 @@ static char *unescape_prompt(char *s) {
     return s;
 }
 
+/* Debug: dump top-N logits (env: PICOLM_LOGITS_DUMP) */
+static void dump_top_logits(const float *logits, int vocab_size, int pos, int top_n) {
+    /* Find top-N indices via partial selection */
+    int *indices = (int*)malloc(vocab_size * sizeof(int));
+    for (int i = 0; i < vocab_size; i++) indices[i] = i;
+    /* Partial sort: bring top_n to the front */
+    for (int i = 0; i < top_n; i++) {
+        int max_idx = i;
+        for (int j = i + 1; j < vocab_size; j++) {
+            if (logits[indices[j]] > logits[indices[max_idx]]) max_idx = j;
+        }
+        int tmp = indices[i]; indices[i] = indices[max_idx]; indices[max_idx] = tmp;
+    }
+    fprintf(stderr, "[LOGITS pos=%d] ", pos);
+    for (int i = 0; i < top_n; i++) {
+        int idx = indices[i];
+        fprintf(stderr, "%d(+%.4f) ", idx, logits[idx]);
+    }
+    fprintf(stderr, "\n");
+    free(indices);
+}
+
 /* Hardcoded chat templates, indexed by model type */
 static const char *tmpl_gemma_prefix = "<start_of_turn>user\n";
 static const char *tmpl_gemma_suffix = "<end_of_turn>\n<start_of_turn>model\n";
@@ -582,6 +604,8 @@ static void benchmark_context_scaling(const char *model_path, const char *base_p
         int n_gen = 0;
         for (; n_gen < chunk_size; n_gen++) {
             if (!logits) break;
+            if (getenv("PICOLM_LOGITS_DUMP"))
+                dump_top_logits(logits, model.config.vocab_size, start_pos - 1 + n_gen, 5);
             int next = sampler_sample(&sampler, logits, model.config.vocab_size);
 
             total_tokens++;
@@ -1529,6 +1553,8 @@ int main(int argc, char **argv) {
                 int token = 0, next = 0;
                 for (int g = 0; g < max_tokens; g++) {
                     grammar_apply(&grammar, logits, model.config.vocab_size);
+                    if (getenv("PICOLM_LOGITS_DUMP"))
+                        dump_top_logits(logits, model.config.vocab_size, pos, 5);
                     next = sampler_sample(&sampler, logits, model.config.vocab_size);
                     grammar_advance(&grammar, &tokenizer, next);
                     token = next;
@@ -1648,6 +1674,8 @@ int main(int argc, char **argv) {
         }
 
                 grammar_apply(&grammar, logits, model.config.vocab_size);
+        if (getenv("PICOLM_LOGITS_DUMP"))
+            dump_top_logits(logits, model.config.vocab_size, pos, 5);
         next = sampler_sample(&sampler, logits, model.config.vocab_size);
         fprintf(stderr, "[GEN] pos=%d next=%d eos=%d\n", pos, next, (int)tokenizer.eos_id);
 
