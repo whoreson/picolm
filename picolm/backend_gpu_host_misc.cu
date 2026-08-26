@@ -1422,6 +1422,7 @@ int picolm_gpu_ssm_vecdot_batch_dev(float *od, const float *xd, const void *wd, 
     int dim, int nvh, int nt, int rb, const int *hm, int dev, int in_stride, int out_stride) {
     if(nvh<=0||dim<=0||nt<=0) return 0;
     if(dim>PICOLM_SSM_VECDOT_MAX_DIM) return 0;
+    if(!wd) return 0;
     gpu_device_ctx_t *ctx = find_ctx(dev);
     if(!ctx||!select_ctx(ctx)) return 0;
 

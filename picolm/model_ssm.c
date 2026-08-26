@@ -2697,7 +2697,7 @@ int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
     float *st_dev=(float*)gw->ssm_state_dev[l];
     /* PICOLM_SSM_PREFILL_CPU: force SSM prefill to CPU hybrid fallback */
     if (getenv("PICOLM_SSM_PREFILL_CPU")) return 0;
-    if(!cs_dev||!st_dev||!gl->ssm_conv1d||!gl->attn_qkv||!gl->attn_gate_ssm||!gl->ssm_out) return 0;
+    if(!cs_dev||!st_dev||!gl->ssm_conv1d||!gl->attn_qkv||!gl->attn_gate_ssm||!gl->ssm_out||!gl->ssm_alpha||!gl->ssm_beta) return 0;
     /* do_remap: must match CPU reference (ssm_prefill_layer, ssm_forward, ssm_forward_gpu) */
     int n_vpk = n_k > 0 ? n_v / n_k : 0, half_vpk = n_vpk / 2;
     int do_remap = !m->from_safetensors && n_k > 0 && n_k < n_v && half_vpk > 0;
@@ -2805,6 +2805,7 @@ int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
       size_t ra=gguf_type_row_size(at,dim),rb=gguf_type_row_size(bt,dim);
       if(at!=0&&at!=2&&at!=8&&at!=30){static int w1=0;if(!w1){fprintf(stderr,"WARN: ssm_prefill_layer_gpu bail: alpha type=%d (need F32/Q4_0/Q8_0/BF16)\n",(int)at);w1=1;}return 0;}
       if(bt!=0&&bt!=2&&bt!=8&&bt!=30){static int w2=0;if(!w2){fprintf(stderr,"WARN: ssm_prefill_layer_gpu bail: beta type=%d (need F32/Q4_0/Q8_0/BF16)\n",(int)bt);w2=1;}return 0;}
+      if(!gl->ssm_alpha||!gl->ssm_beta){static int w3=0;if(!w3){fprintf(stderr,"WARN: ssm_prefill_layer_gpu bail: alpha/beta not uploaded to GPU\n");w3=1;}return 0;}
       const int *hm=do_remap&&gw->ssm_head_map_dev?(const int*)gw->ssm_head_map_dev:NULL;
       ok&=picolm_gpu_ssm_vecdot_batch_dev(bgate,bffn_norm,(void*)picolm_gpu_tensor_weights((picolm_gpu_tensor_t*)gl->ssm_alpha),at,dim,n_v,n_tokens,(int)ra,hm,dev,xb2_stride,xb2_stride);
 
