@@ -2523,6 +2523,16 @@ picolm_silu_mul(float *gate, const float *up, size_t n) {
     }
 }
 
+/* TODO: decode kernel is thread-0-serial for the Q@K dot product.
+ * Each of pos+1 KV positions: tid==0 computes head_dim FMAs alone,
+ * syncthreads, then all threads distribute V-accumulation. At pos=2000,
+ * head_dim=128 that's ~256k serial FMAs while 127 threads idle per block.
+ * The split-kernel path (decode_split_kernel) partially mitigates via
+ * cross-block parallelism, but within a single block the problem is the
+ * same. A warp-shuffle reduction (same pattern as
+ * picolm_gpu_attention_prefill_warpgrp_kernel) would be the direct fix.
+ * Lower priority than prefill because decode slope is gentler (~40%
+ * slowdown over 2900 tokens vs prefill's old 8x), but worth addressing. */
 /* lines 488-599 from backend_gpu_kernels.cuh */
 __global__ void
 picolm_gpu_attention_decode_kernel(
@@ -3224,14 +3234,46 @@ picolm_gpu_attention_prefill_warpgrp_kernel(
         int t_end = min(t0 + ATTN_TILE_K, block_kv_limit);
         int tile_k_size = t_end - t0;
 
-        /* Collective K/V tile load -- unchanged, every thread in the
-         * block participates regardless of subgroup. */
-        for (int d = tid; d < head_dim; d += n_threads) {
+        /* Collective K/V tile load -- every thread in the block
+         * participates regardless of subgroup. Vectorized to uint4
+         * (8 half-precision elements, 16B) per transaction when the
+         * layout allows it: this only changes how the bytes are
+         * fetched, not their values, so it stays bit-exact with the
+         * scalar path. Falls back to the original 2-byte-at-a-time
+         * loop for any head_dim not a multiple of 8 (kept for safety,
+         * not expected to trigger on head_dim in {64,96,128,256}).
+         *
+         * Alignment note: base_off (in uint16 units) is
+         * layer_base + kv_h*(kv_head_stride_bytes/2) + pos*(kv_pos_stride_bytes/2).
+         * Given the documented [layer][pos][kv_head][head_dim] layout,
+         * kv_head_stride_bytes/2 == head_dim and kv_pos_stride_bytes/2
+         * == n_kv_heads*head_dim, so every term is a multiple of
+         * head_dim -- base_off is a multiple of 8 whenever head_dim is,
+         * which is what uint4 (8-element) alignment needs. Device
+         * allocations are at minimum 256B-aligned, so the base pointer
+         * itself is never the constraint. */
+        if ((head_dim & 7) == 0) {
+            int vec_elems = head_dim >> 3;
             for (int ti = 0; ti < tile_k_size; ti++) {
-                size_t k_off = layer_base + kv_h * kv_head_stride_bytes / 2
-                    + (size_t)(t0 + ti) * kv_pos_stride_bytes / 2 + d;
-                k_tile[ti * head_dim + d] = kv_k[k_off];
-                v_tile[ti * head_dim + d] = kv_v[k_off];
+                size_t base_off = layer_base + kv_h * kv_head_stride_bytes / 2
+                    + (size_t)(t0 + ti) * kv_pos_stride_bytes / 2;
+                const uint4 *k_src = (const uint4 *)(kv_k + base_off);
+                const uint4 *v_src = (const uint4 *)(kv_v + base_off);
+                uint4 *k_dst = (uint4 *)(k_tile + ti * head_dim);
+                uint4 *v_dst = (uint4 *)(v_tile + ti * head_dim);
+                for (int vd = tid; vd < vec_elems; vd += n_threads) {
+                    k_dst[vd] = k_src[vd];
+                    v_dst[vd] = v_src[vd];
+                }
+            }
+        } else {
+            for (int d = tid; d < head_dim; d += n_threads) {
+                for (int ti = 0; ti < tile_k_size; ti++) {
+                    size_t k_off = layer_base + kv_h * kv_head_stride_bytes / 2
+                        + (size_t)(t0 + ti) * kv_pos_stride_bytes / 2 + d;
+                    k_tile[ti * head_dim + d] = kv_k[k_off];
+                    v_tile[ti * head_dim + d] = kv_v[k_off];
+                }
             }
         }
         gpuSyncthreads(); /* only barrier in the whole KV-tile body */
@@ -3250,6 +3292,15 @@ picolm_gpu_attention_prefill_warpgrp_kernel(
                 int global_kv = t0 + ti;
                 if (global_kv > global_pos) continue;
 
+                /* TODO: replace scalar fmaf+gpu_fp16_to_fp32 per-element with
+                 * v_dot2_f32_f16 (1 instruction = 2 FP16 FMAs, FP32 accumulate).
+                 * Available on gfx906, CDNA, RDNA2+. Would halve instruction count
+                 * here and is the single biggest remaining win vs llama.cpp's
+                 * fattn-tile kernel on MI50. Requires keeping K tile as half2
+                 * in shared memory (not uint16_t) and Q as float2 pairs.
+                 * Bit-exactness needs careful verification since the FMAs are
+                 * paired differently (d[2k]*q[2k] + d[2k+1]*q[2k+1] in one
+                 * instruction vs sequential fmaf). */
                 float local_chunk = 0.0f;
                 if (lane < n_chunks) {
                     for (int d = lane * 16; d < (lane + 1) * 16; d++) {
