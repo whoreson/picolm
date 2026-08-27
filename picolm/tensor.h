@@ -90,6 +90,7 @@ extern void matmul_mm_id_down(float *down_out,
 
 /* RMS normalization: out[i] = x[i] / sqrt(mean(x^2) + eps) * weight[i] */
 void rmsnorm(float *out, const float *x, const float *weight, int size, float eps);
+void layernorm(float *out, const float *x, const float *weight, const float *bias, int size, float eps);
 
 /* In-place softmax over x[0..size-1] */
 void softmax(float *x, int size);

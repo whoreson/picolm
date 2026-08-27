@@ -3063,6 +3063,156 @@ void rmsnorm(float *out, const float *x, const float *weight, int size, float ep
 #endif
 }
 
+/* LayerNorm (with weight and bias) - GPT-2 style.
+ * out = (x - mean(x)) / sqrt(var(x) + eps) * weight + bias */
+void layernorm(float *out, const float *x, const float *weight, const float *bias, int size, float eps) {
+    float ss = 0.0f;
+    int i;
+
+    /* Compute mean */
+#ifdef PICOLM_AVX512
+    __m512 acc = _mm512_setzero_ps();
+    i = 0;
+    for (; i + 15 < size; i += 16) {
+        __m512 v = _mm512_loadu_ps(x + i);
+        acc = _mm512_add_ps(acc, v);
+    }
+    ss = _mm512_reduce_add_ps(acc);
+    for (; i < size; i++) ss += x[i];
+#elif defined(PICOLM_NEON)
+    float32x4_t acc = vdupq_n_f32(0);
+    i = 0;
+    for (; i + 3 < size; i += 4) {
+        float32x4_t v = vld1q_f32(x + i);
+        acc = vaddq_f32(acc, v);
+    }
+    ss = vaddvq_f32_compat(acc);
+    for (; i < size; i++) ss += x[i];
+#elif defined(PICOLM_AVX)
+    __m256 acc = _mm256_setzero_ps();
+    i = 0;
+    for (; i + 7 < size; i += 8) {
+        __m256 v = _mm256_loadu_ps(x + i);
+        acc = _mm256_add_ps(acc, v);
+    }
+    ss = hsum_avx(acc);
+    for (; i < size; i++) ss += x[i];
+#elif defined(PICOLM_SSE2)
+    __m128 acc = _mm_setzero_ps();
+    i = 0;
+    for (; i + 3 < size; i += 4) {
+        __m128 v = _mm_loadu_ps(x + i);
+        acc = _mm_add_ps(acc, v);
+    }
+    ss = hsum_sse(acc);
+    for (; i < size; i++) ss += x[i];
+#else
+    for (i = 0; i < size; i++) ss += x[i];
+#endif
+    float mean = ss / (float)size;
+
+    /* Compute variance and apply normalization */
+    ss = 0.0f;
+#ifdef PICOLM_AVX512
+    __m512 mean_v = _mm512_set1_ps(mean);
+    __m512 acc2 = _mm512_setzero_ps();
+    i = 0;
+    for (; i + 15 < size; i += 16) {
+        __m512 v = _mm512_loadu_ps(x + i);
+        __m512 d = _mm512_sub_ps(v, mean_v);
+        acc2 = _mm512_fmadd_ps(d, d, acc2);
+    }
+    ss = _mm512_reduce_add_ps(acc2);
+    for (; i < size; i++) { float d = x[i] - mean; ss += d * d; }
+    __m512 scale = _mm512_set1_ps(1.0f / sqrtf(ss / (float)size + eps));
+    __m512 sc = _mm512_broadcast_ss(&scale);
+    scale = sc;
+    i = 0;
+    for (; i + 15 < size; i += 16) {
+        __m512 v = _mm512_loadu_ps(x + i);
+        __m512 w = _mm512_loadu_ps(weight + i);
+        __m512 b = _mm512_loadu_ps(bias + i);
+        __m512 d = _mm512_sub_ps(v, mean_v);
+        _mm512_storeu_ps(out + i, _mm512_add_ps(_mm512_mul_ps(_mm512_mul_ps(d, scale), w), b));
+    }
+    for (; i < size; i++) out[i] = (x[i] - mean) * (float)(1.0f / sqrtf(ss / (float)size + eps)) * weight[i] + bias[i];
+#elif defined(PICOLM_NEON)
+    float32x4_t mean_v = vdupq_n_f32(mean);
+    float32x4_t acc2 = vdupq_n_f32(0);
+    i = 0;
+    for (; i + 3 < size; i += 4) {
+        float32x4_t v = vld1q_f32(x + i);
+        float32x4_t d = vsubq_f32(v, mean_v);
+        acc2 = vmlaq_f32(acc2, d, d);
+    }
+    ss = vaddvq_f32_compat(acc2);
+    for (; i < size; i++) { float d = x[i] - mean; ss += d * d; }
+    float scale = 1.0f / sqrtf(ss / (float)size + eps);
+    float32x4_t scale_v = vdupq_n_f32(scale);
+    i = 0;
+    for (; i + 3 < size; i += 4) {
+        float32x4_t v = vld1q_f32(x + i);
+        float32x4_t w = vld1q_f32(weight + i);
+        float32x4_t b = vld1q_f32(bias + i);
+        float32x4_t d = vsubq_f32(v, mean_v);
+        vst1q_f32(out + i, vaddq_f32(vmulq_f32(vmulq_f32(d, scale_v), w), b));
+    }
+    for (; i < size; i++) out[i] = (x[i] - mean) * scale * weight[i] + bias[i];
+#elif defined(PICOLM_AVX)
+    __m256 mean_v = _mm256_set1_ps(mean);
+    __m256 acc2 = _mm256_setzero_ps();
+    i = 0;
+    for (; i + 7 < size; i += 8) {
+        __m256 v = _mm256_loadu_ps(x + i);
+        __m256 d = _mm256_sub_ps(v, mean_v);
+        acc2 = _mm256_add_ps(acc2, _mm256_mul_ps(d, d));
+    }
+    ss = hsum_avx(acc2);
+    for (; i < size; i++) { float d = x[i] - mean; ss += d * d; }
+    float scale = 1.0f / sqrtf(ss / (float)size + eps);
+    __m256 scale_v = _mm256_set1_ps(scale);
+    __m256 mean_v2 = _mm256_set1_ps(mean);
+    i = 0;
+    for (; i + 7 < size; i += 8) {
+        __m256 v = _mm256_loadu_ps(x + i);
+        __m256 w = _mm256_loadu_ps(weight + i);
+        __m256 b = _mm256_loadu_ps(bias + i);
+        __m256 d = _mm256_sub_ps(v, mean_v2);
+        _mm256_storeu_ps(out + i, _mm256_add_ps(_mm256_mul_ps(_mm256_mul_ps(d, scale_v), w), b));
+    }
+    for (; i < size; i++) out[i] = (x[i] - mean) * scale * weight[i] + bias[i];
+#elif defined(PICOLM_SSE2)
+    __m128 mean_v = _mm_set1_ps(mean);
+    __m128 acc2 = _mm_setzero_ps();
+    i = 0;
+    for (; i + 3 < size; i += 4) {
+        __m128 v = _mm_loadu_ps(x + i);
+        __m128 d = _mm_sub_ps(v, mean_v);
+        acc2 = _mm_add_ps(acc2, _mm_mul_ps(d, d));
+    }
+    ss = hsum_sse(acc2);
+    for (; i < size; i++) { float d = x[i] - mean; ss += d * d; }
+    float scale = 1.0f / sqrtf(ss / (float)size + eps);
+    __m128 scale_v = _mm_set1_ps(scale);
+    __m128 mean_v2 = _mm_set1_ps(mean);
+    i = 0;
+    for (; i + 3 < size; i += 4) {
+        __m128 v = _mm_loadu_ps(x + i);
+        __m128 w = _mm_loadu_ps(weight + i);
+        __m128 b = _mm_loadu_ps(bias + i);
+        __m128 d = _mm_sub_ps(v, mean_v2);
+        _mm_storeu_ps(out + i, _mm_add_ps(_mm_mul_ps(_mm_mul_ps(d, scale_v), w), b));
+    }
+    for (; i < size; i++) out[i] = (x[i] - mean) * scale * weight[i] + bias[i];
+#else
+    float variance = ss / (float)size;
+    float inv_std = 1.0f / sqrtf(variance + eps);
+    for (i = 0; i < size; i++) {
+        out[i] = (x[i] - mean) * inv_std * weight[i] + bias[i];
+    }
+#endif
+}
+
 void softmax(float *x, int size) {
     float max_val = x[0];
     for (int i = 1; i < size; i++) {
