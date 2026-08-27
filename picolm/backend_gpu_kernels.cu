@@ -3356,6 +3356,184 @@ picolm_gpu_attention_prefill_warpgrp_kernel(
     }
 }
 
+/* ---- Warp/wavefront-group scalar attention prefill, dot2 variant ----
+ *
+ * Same structure as picolm_gpu_attention_prefill_warpgrp_kernel above
+ * (same subgroup-per-query-row scheme, same tiling, same online
+ * softmax), but the per-element fmaf+gpu_fp16_to_fp32 score loop is
+ * replaced with gpu_fp16_mad() -- 1 packed FP16x2 multiply + FP32
+ * horizontal-add per two elements, matching llama.cpp's
+ * v_dot2_f32_f16 usage on gfx906/CDNA/RDNA2+.
+ *
+ * NOT bit-exact with the CPU AVX-512 reference or with the fmaf
+ * warpgrp kernel above: the two products in each pair are computed at
+ * native FP16 multiply precision before being widened and summed in
+ * FP32, and Q is downcast fp32->fp16 to form the packed operand (K
+ * needs no conversion -- it's already stored as raw FP16 bits, so
+ * reinterpreting adjacent uint16 pairs as half2 is free). This is a
+ * real precision change, not just a reordering, so max_diff against
+ * the CPU reference will be nonzero. Validate with PICOLM_LOGITS_DUMP
+ * across a full 48-layer forward pass at realistic context lengths
+ * before trusting it for anything beyond a benchmark: llama.cpp has
+ * no CPU-bit-exact requirement to begin with, picolm does, and this
+ * kernel deliberately trades that away for throughput on non-IMMA
+ * GPUs. Gated behind PICOLM_ATTN_WARPGRP=2, off by default. Falls
+ * back to the fmaf warpgrp kernel at compile time if FAST_FP16_AVAILABLE
+ * isn't defined for the target.
+ *
+ * CAUTION: written and reasoned through without a GPU in this session,
+ * same disclaimer as the kernels above it. */
+#ifdef FAST_FP16_AVAILABLE
+__global__ void
+picolm_gpu_attention_prefill_warpgrp_dot2_kernel(
+        float *xb_out, const float *q_dev,
+        const uint16_t *kv_k, const uint16_t *kv_v,
+        int layer_ordinal,
+        int start_pos, int n_tokens,
+        int n_heads, int n_kv_heads, int head_dim, int max_seq_len,
+        size_t kv_pos_stride_bytes,
+        size_t kv_head_stride_bytes,
+        int tile_q)
+{
+    const int GRP = ATTN_WARPGRP_SIZE;
+    int h = (int)gpuBlockIdx_x;
+    int tile_q_idx = (int)gpuBlockIdx_y;
+    int tid = gpuThreadIdx_x;
+    int n_threads = gpuBlockDim_x;
+    int n_groups = n_threads / GRP;
+    int gid = tid / GRP;
+    int lane = tid % GRP;
+
+    int kv_h = h / (n_heads / n_kv_heads);
+    float attn_scale = 1.0f / sqrtf((float)head_dim);
+    size_t layer_base = (size_t)layer_ordinal * max_seq_len * n_kv_heads * head_dim;
+
+    int q_start = tile_q_idx * tile_q;
+    int q_end = min(q_start + tile_q, n_tokens);
+    int n_q = q_end - q_start;
+
+    extern __shared__ uint8_t smem[];
+    uint16_t *k_tile = (uint16_t *)smem;
+    uint16_t *v_tile = k_tile + ATTN_TILE_K * head_dim;
+    float *acc_sh = (float *)((uint8_t *)v_tile + ATTN_TILE_K * head_dim * sizeof(uint16_t));
+    float *max_score_sh = acc_sh + (size_t)tile_q * head_dim;
+    float *sum_exp_sh = max_score_sh + tile_q;
+
+    for (int i = tid; i < tile_q * head_dim; i += n_threads) acc_sh[i] = 0.0f;
+    for (int qi = tid; qi < tile_q; qi += n_threads) {
+        max_score_sh[qi] = -1e30f;
+        sum_exp_sh[qi] = 0.0f;
+    }
+    gpuSyncthreads();
+
+    int block_kv_limit = min(start_pos + n_tokens, start_pos + q_end);
+    int n_chunks = head_dim / 16; /* each chunk = 8 half2 pairs */
+
+    for (int t0 = 0; t0 < block_kv_limit; t0 += ATTN_TILE_K) {
+        int t_end = min(t0 + ATTN_TILE_K, block_kv_limit);
+        int tile_k_size = t_end - t0;
+
+        if ((head_dim & 7) == 0) {
+            int vec_elems = head_dim >> 3;
+            for (int ti = 0; ti < tile_k_size; ti++) {
+                size_t base_off = layer_base + kv_h * kv_head_stride_bytes / 2
+                    + (size_t)(t0 + ti) * kv_pos_stride_bytes / 2;
+                const uint4 *k_src = (const uint4 *)(kv_k + base_off);
+                const uint4 *v_src = (const uint4 *)(kv_v + base_off);
+                uint4 *k_dst = (uint4 *)(k_tile + ti * head_dim);
+                uint4 *v_dst = (uint4 *)(v_tile + ti * head_dim);
+                for (int vd = tid; vd < vec_elems; vd += n_threads) {
+                    k_dst[vd] = k_src[vd];
+                    v_dst[vd] = v_src[vd];
+                }
+            }
+        } else {
+            for (int d = tid; d < head_dim; d += n_threads) {
+                for (int ti = 0; ti < tile_k_size; ti++) {
+                    size_t k_off = layer_base + kv_h * kv_head_stride_bytes / 2
+                        + (size_t)(t0 + ti) * kv_pos_stride_bytes / 2 + d;
+                    k_tile[ti * head_dim + d] = kv_k[k_off];
+                    v_tile[ti * head_dim + d] = kv_v[k_off];
+                }
+            }
+        }
+        gpuSyncthreads();
+
+        for (int qi = gid; qi < n_q; qi += n_groups) {
+            int global_q = q_start + qi;
+            int global_pos = start_pos + global_q;
+            const float *qg = q_dev + (size_t)(global_q * n_heads + h) * head_dim;
+            float *accqi = acc_sh + (size_t)qi * head_dim;
+
+            for (int ti = 0; ti < tile_k_size; ti++) {
+                int global_kv = t0 + ti;
+                if (global_kv > global_pos) continue;
+
+                /* 8 packed FMAs instead of 16 scalar ones. K is read as
+                 * half2 directly from the raw FP16 bits already in shared
+                 * memory; Q is packed to half2 here, which is the
+                 * precision-losing step. Uses gpu_fp16_dot2 (v_dot2_f32_f16,
+                 * 1 ISA instruction per pair) when available on the target
+                 * arch, falls back to gpu_fp16_mad (half2 mul + fp32 hadd). */
+                float local_chunk = 0.0f;
+                if (lane < n_chunks) {
+                    const half2 *k2 = (const half2 *)&k_tile[ti * head_dim + lane * 16];
+                    for (int p = 0; p < 8; p++) {
+                        half2 q2 = __floats2half2_rn(qg[lane * 16 + p * 2], qg[lane * 16 + p * 2 + 1]);
+#ifdef GPU_FP16_DOT2_AVAILABLE
+                        gpu_fp16_dot2(local_chunk, q2, k2[p]);
+#else
+                        gpu_fp16_mad(local_chunk, q2, k2[p]);
+#endif
+                    }
+                }
+                float val = local_chunk;
+                val += gpuShflDownSync(0xffffffff, val, 16, GRP);
+                val += gpuShflDownSync(0xffffffff, val, 8, GRP);
+                val += gpuShflDownSync(0xffffffff, val, 4, GRP);
+                val += gpuShflDownSync(0xffffffff, val, 2, GRP);
+                val += gpuShflDownSync(0xffffffff, val, 1, GRP);
+                float score = gpu_shfl_bcast0(val * attn_scale, GRP);
+
+                float old_max = max_score_sh[qi];
+                float rescale, weight;
+                if (score > old_max) {
+                    rescale = expf(old_max - score);
+                    weight = 1.0f;
+                    if (lane == 0) {
+                        sum_exp_sh[qi] = sum_exp_sh[qi] * rescale + 1.0f;
+                        max_score_sh[qi] = score;
+                    }
+                } else {
+                    rescale = 1.0f;
+                    weight = expf(score - old_max);
+                    if (lane == 0) sum_exp_sh[qi] += weight;
+                }
+
+                for (int d = lane; d < head_dim; d += GRP) {
+                    if (weight == 1.0f) {
+                        accqi[d] = fmaf(accqi[d], rescale, gpu_fp16_to_fp32(v_tile[ti * head_dim + d]));
+                    } else {
+                        accqi[d] = fmaf(weight, gpu_fp16_to_fp32(v_tile[ti * head_dim + d]), accqi[d]);
+                    }
+                }
+            }
+        }
+        gpuSyncthreads();
+    }
+
+    for (int qi = 0; qi < n_q; qi++) {
+        int global_q = q_start + qi;
+        float inv_sum = (sum_exp_sh[qi] > 0.0f) ? (1.0f / sum_exp_sh[qi]) : 0.0f;
+        float *xbhg = xb_out + (size_t)(global_q * n_heads + h) * head_dim;
+        float *accqi = acc_sh + (size_t)qi * head_dim;
+        for (int d = tid; d < head_dim; d += n_threads) {
+            xbhg[d] = accqi[d] * inv_sum;
+        }
+    }
+}
+#endif /* FAST_FP16_AVAILABLE */
+
 /* FA2 kernel - FP16 Tensor Core Flash Attention 2 Prefill
  *
  * mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 for Q@K scoring.

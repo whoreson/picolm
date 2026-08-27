@@ -245,6 +245,15 @@ __global__ void picolm_gpu_attention_prefill_kernel( float *xb_out,  const float
 #define ATTN_WARPGRP_SIZE 32
 __global__ void picolm_gpu_attention_prefill_warpgrp_kernel( float *xb_out,  const float *q_dev,  const uint16_t *kv_k,  const uint16_t *kv_v,  int layer_ordinal, int start_pos, int n_tokens, int n_heads, int n_kv_heads, int head_dim, int max_seq_len, size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, int tile_q);
 
+/* dot2 variant: same signature, only defined when FAST_FP16_AVAILABLE
+ * (see backend_gpu_common.cuh). Not bit-exact -- see kernel comment in
+ * backend_gpu_kernels.cu. Declared unconditionally here so host dispatch
+ * code compiles on all platforms; guard the *call site*, not this
+ * declaration, with #ifdef FAST_FP16_AVAILABLE. */
+#ifdef FAST_FP16_AVAILABLE
+__global__ void picolm_gpu_attention_prefill_warpgrp_dot2_kernel( float *xb_out,  const float *q_dev,  const uint16_t *kv_k,  const uint16_t *kv_v,  int layer_ordinal, int start_pos, int n_tokens, int n_heads, int n_kv_heads, int head_dim, int max_seq_len, size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, int tile_q);
+#endif
+
 /* FP16 Tensor Core Flash Attention 2 Prefill kernel.
  * Uses mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 for Q@K scoring.
  * NOT bit-exact with scalar kernel. head_dim must be multiple of 16. */
