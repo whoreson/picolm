@@ -40,6 +40,7 @@ typedef struct {
     int vocab_size;     /* vocabulary size (e.g. 32000) */
     int is_qwen;        /* 1 if model architecture is qwen3/qwen35 */
     int is_gemma3n;     /* 1 if model architecture is gemma3n */
+    int is_gpt2;        /* 1 if model architecture is gpt2 */
     int max_seq_len;    /* maximum sequence length (e.g. 2048) */
     int head_dim;       /* = n_embd / n_heads */
     float rope_freq_base; /* RoPE theta base (e.g. 10000.0) */
@@ -152,6 +153,16 @@ typedef struct {
     const void *ffn_gate;
     const void *ffn_down;
     const void *ffn_up;
+    /* GPT-2: fused QKV and per-tensor biases */
+    const void *attn_qkv;       /* GPT-2: fused [n_embd, 3*n_embd] / SSM: [n_embd, conv_dim] */
+    const void *attn_qkv_bias;  /* GPT-2: [3*n_embd] F32 */
+    const void *attn_output_bias; /* GPT-2: [n_embd] F32 */
+    const void *ffn_up_bias;    /* GPT-2: [n_ffn] F32 */
+    const void *ffn_down_bias;  /* GPT-2: [n_embd] F32 */
+    /* GPT-2 LayerNorm biases (F32) */
+    const void *attn_norm_bias; /* GPT-2: [n_embd] F32 */
+    const void *post_attn_norm_bias; /* GPT-2: [n_embd] F32 */
+    const void *attn_gate_ssm;  /* SSM: [n_embd, value_dim] */
     /* MoE tensors (3D expert weights) */
     const void *ffn_gate_exps;      /* [n_embd, n_ff_exp, n_expert] */
     const void *ffn_up_exps;        /* [n_embd, n_ff_exp, n_expert] */
@@ -170,9 +181,7 @@ typedef struct {
     gguf_type_t type_ffn_gate_shexp;
     gguf_type_t type_ffn_up_shexp;
     gguf_type_t type_ffn_down_shexp;
-    /* SSM layer weights (Qwen3.5) */
-    const void *attn_qkv;       /* SSM: [n_embd, conv_dim] */
-    const void *attn_gate_ssm;  /* SSM: [n_embd, value_dim] */
+    /* SSM layer weights (Qwen3.5) - attn_qkv and attn_gate_ssm declared above */
     const void *ssm_a;          /* SSM: [dt_rank] F32 */
     const void *ssm_alpha;      /* SSM: [n_embd, dt_rank] F32/Q8_0 */
     const void *ssm_beta;       /* SSM: [n_embd, dt_rank] F32/Q8_0 */
@@ -245,6 +254,9 @@ typedef struct {
     const void *per_layer_model_proj;  /* [n_embd, n_embd_altup * n_layer] */
     gguf_type_t type_per_layer_model_proj;
     const void *per_layer_proj_norm;   /* [n_embd_altup] */
+    const void *position_embd;         /* GPT-2: learned positional embeddings [n_embd, max_seq_len] */
+    gguf_type_t type_position_embd;
+    const void *output_norm_bias;      /* GPT-2: [n_embd] F32 */
     layer_weights_t layers[MAX_LAYERS];
 } model_weights_t;
 
@@ -295,10 +307,13 @@ typedef struct {
     /* Pre-dequantized norm weights (small, keep in RAM) */
     float *norm_weights;
     float *attn_norm_w[MAX_LAYERS];
+    float *attn_norm_b[MAX_LAYERS];    /* GPT-2: LayerNorm bias for attn_norm */
     float *post_attn_norm_w[MAX_LAYERS]; /* post-attention norm (was ffn_norm) */
+    float *post_attn_norm_b[MAX_LAYERS]; /* GPT-2: LayerNorm bias for post_attn_norm */
     float *attn_q_norm_w[MAX_LAYERS];  /* QK-norm (Qwen3) */
     float *attn_k_norm_w[MAX_LAYERS];  /* QK-norm (Qwen3) */
     float *output_norm_w;
+    float *output_norm_b;              /* GPT-2: LayerNorm bias for output_norm */
     /* SSM runtime state (Qwen3.5) */
     float *ssm_conv_state[MAX_LAYERS]; /* [(d_conv-1) * conv_dim] per SSM layer */
     float *ssm_state[MAX_LAYERS];      /* [ssm_d_state * ssm_d_inner] per SSM layer */
