@@ -26,14 +26,14 @@ LDFLAGS = -lm -lpthread -fopenmp
 # Windows needs ws2_32 for server mode
 ifeq ($(OS),Windows_NT)
 LDFLAGS += -lws2_32
-# Force cmd.exe as shell for consistency across Windows 7 through 11.
-SHELL := cmd.exe
-# Wrap del in cmd /c for compatibility with GNU Make on Windows 7 where
-# CreateProcess(NULL, "del ...", ...) fails for internal commands.
-RM = cmd /c del /f /q
-else
-RM = rm -f
+# Do NOT set SHELL := cmd.exe. On MSYS/MinGW, $(shell ...) pipe chains
+# (echo | gcc -E -dM - | grep -c '__AVX2__') fail when SHELL is cmd.exe
+# because MinGW gcc.exe cannot write stdout through a cmd.exe pipe to an
+# MSYS binary like grep. MSYS sh.exe handles these pipes correctly.
+# rm -f from MSYS works fine on Windows for cleaning .o files.
 endif
+
+RM = rm -f
 
 # FreeBSD 8.4: system ld (2.15) doesn't support -plugin; use BFD
 ifeq ($(shell uname -s 2>/dev/null),FreeBSD)
