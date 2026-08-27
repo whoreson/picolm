@@ -3109,6 +3109,202 @@ picolm_gpu_attention_prefill_kernel(
     }
 }
 
+/* ---- Broadcast lane 0's value to every lane in a `width`-wide subgroup.
+ * Used below to replace the old kernel's "thread 0 decides -> shared
+ * scalar -> syncthreads -> everyone reads" pattern with a register-only
+ * equivalent. Uses raw __shfl_sync/__shfl (not the gpuShflSync macro from
+ * backend_gpu_common.cuh) because we need the source-lane argument, not
+ * the XOR/UP/DOWN variants. */
+#if !defined(__HIP__)
+__device__ inline float
+gpu_shfl_bcast0(float var, int width) {
+    return __shfl_sync(0xffffffff, var, 0, width);
+}
+#else
+__device__ inline float
+gpu_shfl_bcast0(float var, int width) {
+    return __shfl(var, 0, width);
+}
+#endif
+
+/* ---- Warp/wavefront-group scalar attention prefill ----
+ *
+ * Same algorithm, same tiling, same online-softmax as
+ * picolm_gpu_attention_prefill_kernel above. The only change: instead of
+ * one block of 128 threads cooperating on ONE query row at a time via a
+ * full tree-reduce + syncthreads for every (query row, KV position) pair,
+ * the block is split into ATTN_WARPGRP_SIZE-wide subgroups (4 groups of
+ * 32 for a 128-thread block). Each subgroup owns a disjoint, fixed subset
+ * of this tile's query rows for the kernel's entire duration and runs
+ * fully independently: warp-shuffle reduction, no shared-memory tree, no
+ * syncthreads except around the collective K/V tile load that all
+ * subgroups read from.
+ *
+ * On a GPU with no tensor cores (gfx906/MI50 and similar), this is what
+ * FA2 already gets NVIDIA for free via 4-warps-per-block parallelism --
+ * here it's the same structural idea applied to the scalar dot product.
+ *
+ * Bit-exactness argument (why this matches the CPU AVX-512 reference
+ * exactly, same as the block-wide kernel above):
+ * The old kernel reduces head_dim/16 nonzero partial sums (n_chunks,
+ * always <=16 since head_dim<=256) across a 128-wide shared-memory tree
+ * with descending strides 64,32,16,8,4,2,1. Strides 64 and 32 are
+ * UNCONDITIONALLY no-ops: at stride=64, every lane tid<64 adds
+ * reduce_sh[tid+64], and tid+64>=64>16>=n_chunks is always zero (adding
+ * exact 0.0 changes no bits); at stride=32 the same holds since
+ * tid+32>=32>16>=n_chunks. So the real computation only ever starts at
+ * stride=16, and strides 16,8,4,2,1 over a 128-wide zero-padded buffer
+ * are data-flow-identical to the same five strides over a 32-wide
+ * zero-padded buffer, which is exactly what a width-32 descending
+ * shfl_down_sync reduction computes into lane 0. Every other lane's
+ * value at the end is unused garbage, same as the old kernel only ever
+ * reading reduce_sh[0]. Lane 0's value is then broadcast (not reduced --
+ * a bit-copy, not a floating op) to the rest of its subgroup so all 32
+ * lanes take the same online-softmax branch; the V-accumulation step is
+ * a plain per-dimension fmaf update with no cross-lane summation, so
+ * distributing it 32-wide instead of 128-wide changes nothing (each
+ * output dimension is still touched by exactly one lane, in the same
+ * across-KV-tile order, for the whole kernel).
+ *
+ * Default scalar path on both HIP and CUDA. The legacy block-wide-reduce
+ * kernel is still available behind PICOLM_ATTN_SLOW_SCALAR=1. */
+__global__ void
+picolm_gpu_attention_prefill_warpgrp_kernel(
+        float *xb_out,        /* [n_tokens][n_heads][head_dim] */
+        const float *q_dev,   /* [n_tokens][n_heads][head_dim] */
+        const uint16_t *kv_k, /* [layer][pos][kv_head][head_dim] FP16 */
+        const uint16_t *kv_v, /* [layer][pos][kv_head][head_dim] FP16 */
+        int layer_ordinal,
+        int start_pos, int n_tokens,
+        int n_heads, int n_kv_heads, int head_dim, int max_seq_len,
+        size_t kv_pos_stride_bytes,
+        size_t kv_head_stride_bytes,
+        int tile_q)
+{
+    const int GRP = ATTN_WARPGRP_SIZE;
+    int h = (int)gpuBlockIdx_x;
+    int tile_q_idx = (int)gpuBlockIdx_y;
+    int tid = gpuThreadIdx_x;
+    int n_threads = gpuBlockDim_x;
+    int n_groups = n_threads / GRP;
+    int gid = tid / GRP;   /* which query-row subgroup this thread belongs to */
+    int lane = tid % GRP;  /* lane within the subgroup, 0..GRP-1 */
+
+    int kv_h = h / (n_heads / n_kv_heads);
+    float attn_scale = 1.0f / sqrtf((float)head_dim);
+    size_t layer_base = (size_t)layer_ordinal * max_seq_len * n_kv_heads * head_dim;
+
+    int q_start = tile_q_idx * tile_q;
+    int q_end = min(q_start + tile_q, n_tokens);
+    int n_q = q_end - q_start;
+
+    /* Shared memory: K tile + V tile (u16) + acc[tile_q][head_dim] +
+     * max_score[tile_q] + sum_exp[tile_q] (float). No reduce_sh buffer --
+     * that 256-float block-wide scratch is gone, since reduction is now
+     * entirely warp-local. Sized by attn_prefill_warpgrp_shared_bytes()
+     * on the host side. */
+    extern __shared__ uint8_t smem[];
+    uint16_t *k_tile = (uint16_t *)smem;
+    uint16_t *v_tile = k_tile + ATTN_TILE_K * head_dim;
+    float *acc_sh = (float *)((uint8_t *)v_tile + ATTN_TILE_K * head_dim * sizeof(uint16_t));
+    float *max_score_sh = acc_sh + (size_t)tile_q * head_dim;
+    float *sum_exp_sh = max_score_sh + tile_q;
+
+    for (int i = tid; i < tile_q * head_dim; i += n_threads) acc_sh[i] = 0.0f;
+    for (int qi = tid; qi < tile_q; qi += n_threads) {
+        max_score_sh[qi] = -1e30f;
+        sum_exp_sh[qi] = 0.0f;
+    }
+    gpuSyncthreads();
+
+    int block_kv_limit = min(start_pos + n_tokens, start_pos + q_end);
+    int n_chunks = head_dim / 16; /* always <= 16, see bit-exactness note above */
+
+    for (int t0 = 0; t0 < block_kv_limit; t0 += ATTN_TILE_K) {
+        int t_end = min(t0 + ATTN_TILE_K, block_kv_limit);
+        int tile_k_size = t_end - t0;
+
+        /* Collective K/V tile load -- unchanged, every thread in the
+         * block participates regardless of subgroup. */
+        for (int d = tid; d < head_dim; d += n_threads) {
+            for (int ti = 0; ti < tile_k_size; ti++) {
+                size_t k_off = layer_base + kv_h * kv_head_stride_bytes / 2
+                    + (size_t)(t0 + ti) * kv_pos_stride_bytes / 2 + d;
+                k_tile[ti * head_dim + d] = kv_k[k_off];
+                v_tile[ti * head_dim + d] = kv_v[k_off];
+            }
+        }
+        gpuSyncthreads(); /* only barrier in the whole KV-tile body */
+
+        /* Each subgroup independently owns a fixed, disjoint rotation of
+         * this tile's query rows. From here to the next tile's load,
+         * subgroups never touch each other's acc_sh/max_score_sh/
+         * sum_exp_sh slots, so no further syncthreads is needed. */
+        for (int qi = gid; qi < n_q; qi += n_groups) {
+            int global_q = q_start + qi;
+            int global_pos = start_pos + global_q;
+            const float *qg = q_dev + (size_t)(global_q * n_heads + h) * head_dim;
+            float *accqi = acc_sh + (size_t)qi * head_dim;
+
+            for (int ti = 0; ti < tile_k_size; ti++) {
+                int global_kv = t0 + ti;
+                if (global_kv > global_pos) continue;
+
+                float local_chunk = 0.0f;
+                if (lane < n_chunks) {
+                    for (int d = lane * 16; d < (lane + 1) * 16; d++) {
+                        local_chunk = fmaf(qg[d], gpu_fp16_to_fp32(k_tile[ti * head_dim + d]), local_chunk);
+                    }
+                }
+                float val = local_chunk;
+                val += gpuShflDownSync(0xffffffff, val, 16, GRP);
+                val += gpuShflDownSync(0xffffffff, val, 8, GRP);
+                val += gpuShflDownSync(0xffffffff, val, 4, GRP);
+                val += gpuShflDownSync(0xffffffff, val, 2, GRP);
+                val += gpuShflDownSync(0xffffffff, val, 1, GRP);
+                /* Only lane 0 now holds the true sum (see bit-exactness
+                 * note); broadcast it so every lane in the subgroup takes
+                 * the identical online-softmax branch below. */
+                float score = gpu_shfl_bcast0(val * attn_scale, GRP);
+
+                float old_max = max_score_sh[qi];
+                float rescale, weight;
+                if (score > old_max) {
+                    rescale = expf(old_max - score);
+                    weight = 1.0f;
+                    if (lane == 0) {
+                        sum_exp_sh[qi] = sum_exp_sh[qi] * rescale + 1.0f;
+                        max_score_sh[qi] = score;
+                    }
+                } else {
+                    rescale = 1.0f;
+                    weight = expf(score - old_max);
+                    if (lane == 0) sum_exp_sh[qi] += weight;
+                }
+
+                for (int d = lane; d < head_dim; d += GRP) {
+                    if (weight == 1.0f) {
+                        accqi[d] = fmaf(accqi[d], rescale, gpu_fp16_to_fp32(v_tile[ti * head_dim + d]));
+                    } else {
+                        accqi[d] = fmaf(weight, gpu_fp16_to_fp32(v_tile[ti * head_dim + d]), accqi[d]);
+                    }
+                }
+            }
+        }
+        gpuSyncthreads(); /* before next tile overwrites k_tile/v_tile */
+    }
+
+    for (int qi = 0; qi < n_q; qi++) {
+        int global_q = q_start + qi;
+        float inv_sum = (sum_exp_sh[qi] > 0.0f) ? (1.0f / sum_exp_sh[qi]) : 0.0f;
+        float *xbhg = xb_out + (size_t)(global_q * n_heads + h) * head_dim;
+        float *accqi = acc_sh + (size_t)qi * head_dim;
+        for (int d = tid; d < head_dim; d += n_threads) {
+            xbhg[d] = accqi[d] * inv_sum;
+        }
+    }
+}
+
 /* FA2 kernel - FP16 Tensor Core Flash Attention 2 Prefill
  *
  * mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 for Q@K scoring.

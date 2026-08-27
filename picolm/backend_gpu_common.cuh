@@ -87,6 +87,21 @@
 #define gpuSyncthreads __syncthreads
 #define gpuShflSync hipShflSync
 #define gpuShflUpSync hipShflUpSync
+/* HIP has __shfl_down(var, delta, width) but no __shfl_down_sync.
+ * gpuShflDownSync is called with an explicit mask and width; the mask
+ * is ignored on HIP (full-wavefront active is implicit). */
+__device__ inline int gpuShflDownSync(unsigned mask, int var, int lane_delta, int width = 0) {
+    (void)mask; return __shfl_down(var, lane_delta, width);
+}
+__device__ inline unsigned int gpuShflDownSync(unsigned mask, unsigned int var, int lane_delta, int width = 0) {
+    (void)mask; return __shfl_down(var, lane_delta, width);
+}
+__device__ inline float gpuShflDownSync(unsigned mask, float var, int lane_delta, int width = 0) {
+    (void)mask; return __shfl_down(var, lane_delta, width);
+}
+__device__ inline double gpuShflDownSync(unsigned mask, double var, int lane_delta, int width = 0) {
+    (void)mask; return __shfl_down(var, lane_delta, width);
+}
 #define gpuDeviceSynchronize hipDeviceSynchronize
 typedef hipDeviceProp_t gpuDeviceProp_t;
 typedef hipError_t gpuError_t;
@@ -175,22 +190,11 @@ typedef hipEvent_t gpuEvent_t;
  * On older ROCm (e.g. 6.3.3), only __shfl_down exists.
  * The sync variant adds an explicit active mask; using 0xffffffff
  * covers the full warp/wavefront, equivalent to the non-sync version. */
-/* Match __shfl_down_sync(mask, var, lane_delta, width) signature.
- * On older ROCm, __shfl_down_sync doesn't exist; use __shfl_down(var, lane_delta, width). */
-#ifdef __HIP_DEVICE_COMPILE__
-__device__ inline int gpuShflDownSync(unsigned mask, int var, int lane_delta, int width = 0) {
-    (void)mask; return __shfl_down(var, lane_delta, width);
-}
-__device__ inline unsigned int gpuShflDownSync(unsigned mask, unsigned int var, int lane_delta, int width = 0) {
-    (void)mask; return __shfl_down(var, lane_delta, width);
-}
-__device__ inline float gpuShflDownSync(unsigned mask, float var, int lane_delta, int width = 0) {
-    (void)mask; return __shfl_down(var, lane_delta, width);
-}
-__device__ inline double gpuShflDownSync(unsigned mask, double var, int lane_delta, int width = 0) {
-    (void)mask; return __shfl_down(var, lane_delta, width);
-}
-#else
+/* HIP path: gpuShflDownSync inline overloads are already defined in the
+ * top-level HIP section above (__HIP_PLATFORM_AMD__). They map to
+ * __shfl_down(var, lane_delta, width) ignoring the mask.
+ * CUDA path: __shfl_down_sync exists natively with the 4-arg signature. */
+#ifndef __HIP_PLATFORM_AMD__
 #define gpuShflDownSync __shfl_down_sync
 #endif
 #define gpuLaunchBlockPerMultiprocessor cudaDevAttrMaxThreadsPerMultiProcessor
