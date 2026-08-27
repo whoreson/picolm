@@ -331,6 +331,15 @@ int qwen_tokenize_init(qwen_enc_t *enc, const model_t *m) {
             if (ty[id] == 3 || ty[id] == 4) enc->spec[enc->n_spec++] = id;
         }
     }
+    /* For GPT-2 models, explicitly add BOS/EOS as special tokens */
+    if (m->config.is_gpt2 && enc->n_spec < 511) {
+        if (enc->bos_id >= 0 && enc->bos_id < enc->vocab_size) {
+            enc->spec[enc->n_spec++] = enc->bos_id;
+        }
+        if (enc->eos_id != enc->bos_id && enc->eos_id >= 0 && enc->eos_id < enc->vocab_size) {
+            enc->spec[enc->n_spec++] = enc->eos_id;
+        }
+    }
 
     return 0;
 }
