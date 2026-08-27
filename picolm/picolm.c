@@ -275,6 +275,9 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --gpu-attn-diff <n_tok> <n_heads> <n_kv_heads> <head_dim>  Diff attention (FA2 vs scalar)\n");
     fprintf(stderr, "                  Generates random Q/K/V, runs FA2 and scalar kernels, diffs output.\n");
     fprintf(stderr, "                  n_tok must be >= 64, head_dim must be multiple of 16.\n");
+    fprintf(stderr, "  --gpu-attn-scalar-diff <n_tok> <n_heads> <n_kv_heads> <head_dim>\n");
+    fprintf(stderr, "                  Diff attention (warpgrp vs slow scalar) for bit-exactness.\n");
+    fprintf(stderr, "                  Example: --gpu-attn-scalar-diff 64 40 8 128\n");
 #ifdef PICOLM_VIZ
     fprintf(stderr, "\nVisualization options:\n");
     fprintf(stderr, "  --viz             Start VNC visualization server (requires PICOLM_VIZ)\n");
@@ -549,8 +552,9 @@ static void benchmark_context_scaling(const char *model_path, const char *base_p
     memcpy(prompt_tokens, base_tokens, n_base * sizeof(int));
     int total_tokens = n_base;
 
-    /* Output CSV header */
-    fprintf(stderr, "ctx_size,prefill_tok/s,gen_tok/s\n");
+    /* Output CSV header to stdout for easy redirection */
+    fprintf(stdout, "ctx_size,prefill_tok/s,gen_tok/s\n");
+    fflush(stdout);
 
     /* Benchmark loop: grow context incrementally, measuring speed at each step.
      * Each step prepends the user's base prompt (-p) before the cached
@@ -630,8 +634,8 @@ static void benchmark_context_scaling(const char *model_path, const char *base_p
         float prefill_tok_per_sec = (prefill_ms > 0) ? ((float)n_base * 1000.0f / prefill_ms) : 0;
         float gen_tok_per_sec = (gen_ms > 0) ? ((float)n_gen * 1000.0f / gen_ms) : 0;
 
-        fprintf(stderr, "%d,%.1f,%.1f\n", ctx_at_step, prefill_tok_per_sec, gen_tok_per_sec);
-        fflush(stderr);
+        fprintf(stdout, "%d,%.1f,%.1f\n", ctx_at_step, prefill_tok_per_sec, gen_tok_per_sec);
+        fflush(stdout);
 
         free(new_prompt);
 
@@ -843,6 +847,103 @@ static void gpu_attn_diff_test(int n_tokens, int n_heads, int n_kv_heads, int he
 
     free(q_h); free(k_h); free(v_h); free(y_fa2); free(y_scalar);
 }
+
+/* GPU attention scalar diff test: compare warpgrp vs slow scalar kernels
+ * for bit-exactness. Uses the same Q/K/V setup as gpu_attn_diff_test but
+ * runs both scalar variants and expects zero difference. */
+static void gpu_attn_scalar_diff_test(int n_tokens, int n_heads, int n_kv_heads, int head_dim) {
+    if (n_tokens < 8) { fprintf(stderr, "n_tokens must be >= 8\n"); exit(1); }
+    if (head_dim % 16 != 0) { fprintf(stderr, "head_dim must be multiple of 16\n"); exit(1); }
+    if (n_heads % n_kv_heads != 0) { fprintf(stderr, "n_heads must be multiple of n_kv_heads\n"); exit(1); }
+
+    int devs[1] = {0};
+    if (!picolm_gpu_init(devs, 1)) { fprintf(stderr, "GPU init failed\n"); exit(1); }
+
+    size_t q_bytes = (size_t)n_tokens * n_heads * head_dim * sizeof(float);
+    size_t kv_bytes = (size_t)n_tokens * n_kv_heads * head_dim * sizeof(uint16_t);
+
+    float *q_h = (float *)malloc(q_bytes);
+    uint16_t *k_h = (uint16_t *)malloc(kv_bytes);
+    uint16_t *v_h = (uint16_t *)malloc(kv_bytes);
+    float *y_warpgrp = (float *)malloc(q_bytes);
+    float *y_slow = (float *)malloc(q_bytes);
+    if (!q_h || !k_h || !v_h || !y_warpgrp || !y_slow) { fprintf(stderr, "OOM\n"); exit(1); }
+
+    srand48(12345);
+    for (int i = 0; i < n_tokens * n_heads * head_dim; i++) {
+        q_h[i] = (float)(drand48() * 2.0 - 1.0) * 0.5f;
+    }
+    for (int i = 0; i < n_tokens * n_kv_heads * head_dim; i++) {
+        float vf = (float)(drand48() * 2.0 - 1.0) * 0.5f;
+        union { uint32_t u; float f; } u32;
+        u32.f = vf;
+        k_h[i] = u32.u >> 16;
+        vf = (float)(drand48() * 2.0 - 1.0) * 0.5f;
+        u32.f = vf;
+        v_h[i] = u32.u >> 16;
+    }
+
+    size_t layer_kv_bytes = (size_t)n_tokens * n_kv_heads * head_dim * sizeof(uint16_t);
+    int max_seq_len = n_tokens;
+    if (!picolm_gpu_kv_alloc(layer_kv_bytes, layer_kv_bytes, 0)) { fprintf(stderr, "KV alloc failed\n"); exit(1); }
+
+    size_t row_bytes = (size_t)n_kv_heads * head_dim * sizeof(uint16_t);
+    for (int p = 0; p < n_tokens; p++) {
+        uint16_t *row = k_h + (size_t)p * n_kv_heads * head_dim;
+        picolm_gpu_kv_store_rows(1, 0, p, 1, row, row_bytes, n_kv_heads, head_dim, max_seq_len, 0);
+    }
+    for (int p = 0; p < n_tokens; p++) {
+        uint16_t *row = v_h + (size_t)p * n_kv_heads * head_dim;
+        picolm_gpu_kv_store_rows(0, 0, p, 1, row, row_bytes, n_kv_heads, head_dim, max_seq_len, 0);
+    }
+
+    const int n_iters = 500;
+    fprintf(stderr, "Running %d stress iterations (warpgrp vs slow scalar)...\n", n_iters);
+
+    for (int iter = 0; iter < n_iters; iter++) {
+        unsetenv("PICOLM_ATTN_SLOW_SCALAR");
+        setenv("PICOLM_FORCE_SCALAR_ATTN", "1", 1);
+        if (!picolm_gpu_attention_prefill(y_warpgrp, q_h, 0, 0, n_tokens,
+                n_heads, n_kv_heads, head_dim, max_seq_len, 0)) {
+            fprintf(stderr, "Warpgrp attention failed iter %d\n", iter); exit(1);
+        }
+        setenv("PICOLM_ATTN_SLOW_SCALAR", "1", 1);
+        if (!picolm_gpu_attention_prefill(y_slow, q_h, 0, 0, n_tokens,
+                n_heads, n_kv_heads, head_dim, max_seq_len, 0)) {
+            fprintf(stderr, "Slow scalar attention failed iter %d\n", iter); exit(1);
+        }
+        unsetenv("PICOLM_FORCE_SCALAR_ATTN");
+        unsetenv("PICOLM_ATTN_SLOW_SCALAR");
+
+        float max_abs = 0, max_rel = 0;
+        int max_pos = 0;
+        size_t n = (size_t)n_tokens * n_heads * head_dim;
+        for (size_t i = 0; i < n; i++) {
+            float diff = y_warpgrp[i] - y_slow[i];
+            if (diff < 0) diff = -diff;
+            float rel = (fabsf(y_slow[i]) > 1e-8f) ? diff / fabsf(y_slow[i]) : diff;
+            if (diff > max_abs) { max_abs = diff; max_rel = rel; max_pos = (int)i; }
+        }
+        if (max_abs > 0.0f) {
+            int tk = max_pos / (n_heads * head_dim);
+            int hh = (max_pos / head_dim) % n_heads;
+            int dd = max_pos % head_dim;
+            fprintf(stderr, "  max_abs_err = %.10f (tok=%d, head=%d, dim=%d) at iter %d\n",
+                max_abs, tk, hh, dd, iter);
+            fprintf(stderr, "  max_rel_err = %.10f\n", max_rel);
+            fprintf(stderr, "  y_warpgrp = %f, y_slow = %f\n", y_warpgrp[max_pos], y_slow[max_pos]);
+            fprintf(stderr, "  RESULT: DIFFER (expected bit-exact match)\n");
+            goto done;
+        }
+    }
+
+    fprintf(stderr, "GPU attn scalar diff: %d tok, %d heads, %d kv_heads, hd=%d, %d iters\n",
+        n_tokens, n_heads, n_kv_heads, head_dim, n_iters);
+    fprintf(stderr, "  RESULT: BIT-EXACT MATCH (all %d iterations)\n", n_iters);
+
+done:
+    free(q_h); free(k_h); free(v_h); free(y_warpgrp); free(y_slow);
+}
 #endif
 
 int main(int argc, char **argv) {
@@ -874,6 +975,7 @@ int main(int argc, char **argv) {
     int    gpu_diff = 0;    /* --gpu-diff S I O */
     int    gpu_diff_S = 32, gpu_diff_I = 512, gpu_diff_O = 1024;
     int    do_attn_diff = 0;  /* --gpu-attn-diff n_tok n_heads n_kv_heads head_dim */
+    int    do_attn_scalar_diff = 0;  /* --gpu-attn-scalar-diff */
     int    attn_n_tok = 64, attn_n_heads = 40, attn_n_kv = 8, attn_head_dim = 128;
     int    do_benchmark_ctx = 0;  /* --benchmark-ctx */
     #if !defined(_WIN32) && !defined(PICOLM_DOS)
@@ -1001,6 +1103,12 @@ int main(int argc, char **argv) {
             attn_n_heads = atoi(argv[++i]);
             attn_n_kv = atoi(argv[++i]);
             attn_head_dim = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--gpu-attn-scalar-diff") == 0 && i + 4 < argc) {
+            do_attn_scalar_diff = 1;
+            attn_n_tok = atoi(argv[++i]);
+            attn_n_heads = atoi(argv[++i]);
+            attn_n_kv = atoi(argv[++i]);
+            attn_head_dim = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--benchmark-ctx") == 0) {
             do_benchmark_ctx = 1;
         } else if (strcmp(argv[i], "--ssm-batched") == 0) {
@@ -1047,9 +1155,22 @@ int main(int argc, char **argv) {
         gpu_attn_diff_test(attn_n_tok, attn_n_heads, attn_n_kv, attn_head_dim);
         return 0;
     }
+    /* --gpu-attn-scalar-diff: warpgrp vs slow scalar bit-exactness test */
+    if (do_attn_scalar_diff) {
+        if (getenv("PICOLM_GPU") == NULL) {
+            fprintf(stderr, "GPU not available (PICOLM_GPU not set)\n");
+            return 1;
+        }
+        gpu_attn_scalar_diff_test(attn_n_tok, attn_n_heads, attn_n_kv, attn_head_dim);
+        return 0;
+    }
 #else
     if (do_attn_diff) {
         fprintf(stderr, "--gpu-attn-diff requires GPU build\n");
+        return 1;
+    }
+    if (do_attn_scalar_diff) {
+        fprintf(stderr, "--gpu-attn-scalar-diff requires GPU build\n");
         return 1;
     }
 #endif
