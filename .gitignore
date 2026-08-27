@@ -59,3 +59,7 @@ bench_logs/
 .debug.txt
 geminiprompt.txt
 win-err.txt
+picolm/new/
+picolm/0.bat
+picolm/*.bak
+picolm/*.o.tmp

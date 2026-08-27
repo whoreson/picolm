@@ -717,6 +717,22 @@ ensure_attn_prefill_warpgrp_shared_mem(size_t bytes) {
     return 1;
 }
 
+#ifdef FAST_FP16_AVAILABLE
+/* Separate cache from the fmaf variant above: different kernel symbol,
+ * needs its own gpuFuncSetAttribute call, same shared-mem layout. */
+static int
+ensure_attn_prefill_warpgrp_dot2_shared_mem(size_t bytes) {
+    static size_t configured = 49152;
+    if (bytes <= configured) return 1;
+    if (!gpu_ok(gpuFuncSetAttribute((const void *)picolm_gpu_attention_prefill_warpgrp_dot2_kernel,
+                                     gpuFuncAttributeMaxDynamicSharedMemorySize, (int)bytes),
+                "attn prefill warpgrp dot2 shared mem opt-in"))
+        return 0;
+    configured = bytes;
+    return 1;
+}
+#endif
+
 /* Default: warp-group scalar kernel (fast path).
  * PICOLM_ATTN_SLOW_SCALAR=1 forces the legacy block-wide-reduce scalar
  * kernel for debugging/comparison. FA2 always wins when has_imma is
@@ -725,6 +741,29 @@ static int
 use_attn_warpgrp(void) {
     static int cached = -1;
     if (cached < 0) cached = getenv("PICOLM_ATTN_SLOW_SCALAR") ? 0 : 1;
+    return cached;
+}
+
+/* Opt-in on top of the warpgrp path: PICOLM_ATTN_DOT2=1 swaps the
+ * fmaf+gpu_fp16_to_fp32 score loop for the v_dot2_f32_f16-equivalent
+ * packed-half2 path. NOT bit-exact with the CPU reference -- see the
+ * kernel comment in backend_gpu_kernels.cu. Off by default; validate
+ * with PICOLM_LOGITS_DUMP before trusting it beyond a benchmark run.
+ * Silently inert (falls back to the fmaf kernel) if FAST_FP16_AVAILABLE
+ * isn't defined for this build. */
+static int
+use_attn_dot2(void) {
+    static int cached = -1;
+    if (cached < 0) {
+#ifdef FAST_FP16_AVAILABLE
+        cached = getenv("PICOLM_ATTN_DOT2") ? 1 : 0;
+#else
+        if (getenv("PICOLM_ATTN_DOT2"))
+            fprintf(stderr, "PICOLM_ATTN_DOT2=1 requested but FAST_FP16_AVAILABLE "
+                            "is not defined for this build; using fmaf warpgrp kernel instead\n");
+        cached = 0;
+#endif
+    }
     return cached;
 }
 
@@ -782,20 +821,37 @@ picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
         int block_threads = 128;
 
         if (use_attn_warpgrp()) {
-            gpu_dispatch_print("attn_prefill_warpgrp_host");
+            /* 256 threads (8 x 32-lane subgroups) instead of 128:
+             * pure occupancy increase, no precision impact -- more
+             * subgroups working the same tile_q rows in parallel,
+             * hiding K/V-load latency across more warps/wavefronts. */
+            block_threads = 256;
             while (tile_q > 8 && attn_prefill_warpgrp_shared_bytes(head_dim, tile_q) > smem_max) {
                 tile_q /= 2;
             }
             int n_tiles_q = (n_tokens + tile_q - 1) / tile_q;
             size_t shared_bytes = attn_prefill_warpgrp_shared_bytes(head_dim, tile_q);
-            if (!ensure_attn_prefill_warpgrp_shared_mem(shared_bytes)) return 0;
-
             dim3 grid((unsigned)n_heads, (unsigned)n_tiles_q, 1);
-            picolm_gpu_attention_prefill_warpgrp_kernel<<<grid, block_threads, (unsigned)shared_bytes, ctx->stream>>>(
-                ctx->y, ctx->x,
-                g_kv_k_dev[device], g_kv_v_dev[device],
-                layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim, max_seq_len,
-                kv_pos_stride_bytes, kv_head_stride_bytes, tile_q);
+#ifdef FAST_FP16_AVAILABLE
+            if (use_attn_dot2()) {
+                gpu_dispatch_print("attn_prefill_warpgrp_dot2_host");
+                if (!ensure_attn_prefill_warpgrp_dot2_shared_mem(shared_bytes)) return 0;
+                picolm_gpu_attention_prefill_warpgrp_dot2_kernel<<<grid, block_threads, (unsigned)shared_bytes, ctx->stream>>>(
+                    ctx->y, ctx->x,
+                    g_kv_k_dev[device], g_kv_v_dev[device],
+                    layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim, max_seq_len,
+                    kv_pos_stride_bytes, kv_head_stride_bytes, tile_q);
+            } else
+#endif
+            {
+                gpu_dispatch_print("attn_prefill_warpgrp_host");
+                if (!ensure_attn_prefill_warpgrp_shared_mem(shared_bytes)) return 0;
+                picolm_gpu_attention_prefill_warpgrp_kernel<<<grid, block_threads, (unsigned)shared_bytes, ctx->stream>>>(
+                    ctx->y, ctx->x,
+                    g_kv_k_dev[device], g_kv_v_dev[device],
+                    layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim, max_seq_len,
+                    kv_pos_stride_bytes, kv_head_stride_bytes, tile_q);
+            }
         } else {
             gpu_dispatch_print("attn_prefill_scalar_host");
             /* Choose tile_q that fits device shared memory */
@@ -874,15 +930,28 @@ picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
     int block_threads = 128;
 
     if (use_attn_warpgrp()) {
-        gpu_dispatch_print("attn_prefill_warpgrp_dev");
+        block_threads = 256;
         while (tile_q > 8 && attn_prefill_warpgrp_shared_bytes(head_dim, tile_q) > smem_max) {
             tile_q /= 2;
         }
         int n_tiles_q = (n_tokens + tile_q - 1) / tile_q;
         size_t shared_bytes = attn_prefill_warpgrp_shared_bytes(head_dim, tile_q);
-        if (!ensure_attn_prefill_warpgrp_shared_mem(shared_bytes)) return 0;
-
         dim3 grid((unsigned)n_heads, (unsigned)n_tiles_q, 1);
+#ifdef FAST_FP16_AVAILABLE
+        if (use_attn_dot2()) {
+            gpu_dispatch_print("attn_prefill_warpgrp_dot2_dev");
+            if (!ensure_attn_prefill_warpgrp_dot2_shared_mem(shared_bytes)) return 0;
+            picolm_gpu_attention_prefill_warpgrp_dot2_kernel<<<grid, block_threads, (unsigned)shared_bytes, ctx->stream>>>(
+                xb_out_dev, q_dev,
+                g_kv_k_dev[device], g_kv_v_dev[device],
+                layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim, max_seq_len,
+                kv_pos_stride_bytes, kv_head_stride_bytes, tile_q);
+            if (!gpu_ok(gpuGetLastError(), "attn prefill warpgrp dot2 (dev)")) return 0;
+            return 1;
+        }
+#endif
+        gpu_dispatch_print("attn_prefill_warpgrp_dev");
+        if (!ensure_attn_prefill_warpgrp_shared_mem(shared_bytes)) return 0;
         picolm_gpu_attention_prefill_warpgrp_kernel<<<grid, block_threads, (unsigned)shared_bytes, ctx->stream>>>(
             xb_out_dev, q_dev,
             g_kv_k_dev[device], g_kv_v_dev[device],
