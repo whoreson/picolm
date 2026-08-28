@@ -3413,13 +3413,30 @@ picolm_gpu_attention_prefill_warpgrp_dot2_kernel(
     int n_q = q_end - q_start;
 
     extern __shared__ uint8_t smem[];
-    uint16_t *k_tile = (uint16_t *)smem;
+    /* Shared memory layout:
+     *   Q tile: tile_q * head_dim * 2 bytes (FP16)
+     *   K tile: ATTN_TILE_K * head_dim * 2 bytes
+     *   V tile: ATTN_TILE_K * head_dim * 2 bytes
+     *   acc:    tile_q * head_dim * 4 bytes
+     *   max:    tile_q * 4 bytes
+     *   sum:    tile_q * 4 bytes
+     */
+    uint16_t *q_tile = (uint16_t *)smem;
+    uint16_t *k_tile = q_tile + (size_t)tile_q * head_dim;
     uint16_t *v_tile = k_tile + ATTN_TILE_K * head_dim;
     float *acc_sh = (float *)((uint8_t *)v_tile + ATTN_TILE_K * head_dim * sizeof(uint16_t));
     float *max_score_sh = acc_sh + (size_t)tile_q * head_dim;
     float *sum_exp_sh = max_score_sh + tile_q;
 
-    for (int i = tid; i < tile_q * head_dim; i += n_threads) acc_sh[i] = 0.0f;
+    /* Load Q tile from global FP32 into shared FP16. */
+    for (int i = tid; i < tile_q * head_dim; i += n_threads) {
+        int qi = i / head_dim;
+        int d  = i % head_dim;
+        int global_q = q_start + qi;
+        const float *qg = q_dev + (size_t)(global_q * n_heads + h) * head_dim;
+        q_tile[i] = gpu_fp32_to_fp16(qg[d]);
+        acc_sh[i] = 0.0f;
+    }
     for (int qi = tid; qi < tile_q; qi += n_threads) {
         max_score_sh[qi] = -1e30f;
         sum_exp_sh[qi] = 0.0f;
@@ -3462,28 +3479,29 @@ picolm_gpu_attention_prefill_warpgrp_dot2_kernel(
         for (int qi = gid; qi < n_q; qi += n_groups) {
             int global_q = q_start + qi;
             int global_pos = start_pos + global_q;
-            const float *qg = q_dev + (size_t)(global_q * n_heads + h) * head_dim;
+            /* Read Q from shared memory (FP16) instead of global (FP32).
+             * Eliminates __floats2half2_rn and global memory traffic per
+             * KV position. */
+            const half2 *q2_base = (const half2 *)&q_tile[(size_t)qi * head_dim];
             float *accqi = acc_sh + (size_t)qi * head_dim;
 
             for (int ti = 0; ti < tile_k_size; ti++) {
                 int global_kv = t0 + ti;
                 if (global_kv > global_pos) continue;
 
-                /* 8 packed FMAs instead of 16 scalar ones. K is read as
-                 * half2 directly from the raw FP16 bits already in shared
-                 * memory; Q is packed to half2 here, which is the
-                 * precision-losing step. Uses gpu_fp16_dot2 (v_dot2_f32_f16,
-                 * 1 ISA instruction per pair) when available on the target
-                 * arch, falls back to gpu_fp16_mad (half2 mul + fp32 hadd). */
+                /* 8 packed FMAs instead of 16 scalar ones. Both Q and K
+                 * are read as half2 directly from shared memory FP16.
+                 * Uses gpu_fp16_dot2 (v_dot2_f32_f16, 1 ISA instruction
+                 * per pair) when available, falls back to gpu_fp16_mad. */
                 float local_chunk = 0.0f;
                 if (lane < n_chunks) {
+                    const half2 *q2 = &q2_base[lane * 8];
                     const half2 *k2 = (const half2 *)&k_tile[ti * head_dim + lane * 16];
                     for (int p = 0; p < 8; p++) {
-                        half2 q2 = __floats2half2_rn(qg[lane * 16 + p * 2], qg[lane * 16 + p * 2 + 1]);
 #ifdef GPU_FP16_DOT2_AVAILABLE
-                        gpu_fp16_dot2(local_chunk, q2, k2[p]);
+                        gpu_fp16_dot2(local_chunk, q2[p], k2[p]);
 #else
-                        gpu_fp16_mad(local_chunk, q2, k2[p]);
+                        gpu_fp16_mad(local_chunk, q2[p], k2[p]);
 #endif
                     }
                 }
