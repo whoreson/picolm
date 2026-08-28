@@ -1,0 +1,149 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer X  { float x[]; };
+layout(std430, binding = 1) readonly buffer W  { uint  w[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    int fmt;
+    int S, I, O;
+    int rowWords;
+} p;
+
+shared float xsh[7968];
+shared float sg_sum[8];
+
+float f16tof32(uint h) {
+    uint s = (h >> 15u) & 1u;
+    uint e = (h >> 10u) & 31u;
+    uint m = h & 1023u;
+    if (e == 0u) {
+        if (m == 0u) return s != 0u ? -0.0 : 0.0;
+        float v = float(m) * 5.960464477539063e-8;
+        return s != 0u ? -v : v;
+    }
+    if (e == 31u) return s != 0u ? -1.0/0.0 : 1.0/0.0;
+    uint bits = (s << 31u) | ((e - 15u + 127u) << 23u) | (m << 13u);
+    return uintBitsToFloat(bits);
+}
+
+void main() {
+    int s   = int(gl_WorkGroupID.y);
+    int tid = int(gl_LocalInvocationID.x);
+    int nth = int(gl_WorkGroupSize.x);
+    int sg      = int(gl_SubgroupID);
+    int lane    = int(gl_SubgroupInvocationID);
+    int sgsize  = int(gl_SubgroupSize);
+
+    int o = int(gl_WorkGroupID.x);
+    if (o >= p.O) return;
+
+    bool staged = p.I <= 7968;
+    if (staged) {
+        for (int i = tid; i < p.I; i += nth)
+            xsh[i] = x[s * p.I + i];
+    }
+    memoryBarrierShared();
+    barrier();
+
+    int xoff = s * p.I;
+    uint rowBase = uint(o) * uint(p.rowWords);
+    float sum = 0.0;
+
+    if (p.fmt == 8) {
+        // Q8_0: blocks of 34 bytes (d16 + qs[32]), tightly packed in row.
+        // Block bi starts at byte bi*34 within the row.
+        // Read via byte-offset into uint32 words.
+        int nblocks = (p.I + 31) / 32;
+        for (int bi = tid; bi < nblocks; bi += nth) {
+            uint blockByteOff = uint(bi) * 34u;
+            // d16 at blockByteOff+0, blockByteOff+1
+            uint dWord = rowBase + blockByteOff / 4u;
+            uint dShift = (blockByteOff % 4u) * 8u;
+            uint dLo = (w[dWord] >> dShift) & 0xffu;
+            uint dHi = (w[dWord] >> (dShift + 8u)) & 0xffu;
+            float d = f16tof32(dLo | (dHi << 8u));
+
+            // qs[v] at blockByteOff + 2 + v
+            for (int v = 0; v < 32; v++) {
+                int vi = bi * 32 + v;
+                if (vi >= p.I) break;
+                uint byteOff = blockByteOff + 2u + uint(v);
+                uint wIdx = rowBase + byteOff / 4u;
+                uint bShift = (byteOff % 4u) * 8u;
+                uint bv = (w[wIdx] >> bShift) & 0xffu;
+                int val = int(bv); if (val >= 128) val -= 256;
+                float xval = staged ? xsh[vi] : x[xoff + vi];
+                sum += xval * float(val) * d;
+            }
+        }
+    } else if (p.fmt == 2) {
+        // Q4_0: blocks of 18 bytes (d16 + qs[16]), tightly packed.
+        // Block bi starts at byte bi*18 within the row.
+        int nblocks = (p.I + 31) / 32;
+        for (int bi = tid; bi < nblocks; bi += nth) {
+            uint blockByteOff = uint(bi) * 18u;
+            uint dWord = rowBase + blockByteOff / 4u;
+            uint dShift = (blockByteOff % 4u) * 8u;
+            uint dLo = (w[dWord] >> dShift) & 0xffu;
+            uint dHi = (w[dWord] >> (dShift + 8u)) & 0xffu;
+            float d = f16tof32(dLo | (dHi << 8u));
+
+            // qs[v] for v=0..31: byte index = blockByteOff + 2 + nibble_idx
+            // where nibble_idx = v for v<16, v-16 for v>=16
+            for (int v = 0; v < 32; v++) {
+                int vi = bi * 32 + v;
+                if (vi >= p.I) break;
+                uint nibbleIdx;
+                uint nibbleShift;
+                if (v < 16) {
+                    nibbleIdx = uint(v);
+                    nibbleShift = 0u;
+                } else {
+                    nibbleIdx = uint(v - 16);
+                    nibbleShift = 4u;
+                }
+                uint byteOff = blockByteOff + 2u + nibbleIdx;
+                uint wIdx = rowBase + byteOff / 4u;
+                uint bShift = (byteOff % 4u) * 8u;
+                uint bv = (w[wIdx] >> bShift) & 0xffu;
+                int val = int((bv >> nibbleShift) & 0xfu) - 8;
+                float xval = staged ? xsh[vi] : x[xoff + vi];
+                sum += xval * float(val) * d;
+            }
+        }
+    } else if (p.fmt == 1) {
+        // F16: 2 bytes per value
+        for (int i = tid; i < p.I; i += nth) {
+            float xval = staged ? xsh[i] : x[xoff + i];
+            uint byteOff = uint(i) * 2u;
+            uint wIdx = rowBase + byteOff / 4u;
+            uint bShift = (byteOff % 4u) * 8u;
+            uint lo = (w[wIdx] >> bShift) & 0xffu;
+            uint hi = (w[wIdx] >> (bShift + 8u)) & 0xffu;
+            sum += xval * f16tof32(lo | (hi << 8u));
+        }
+    } else {
+        // F32: 4 bytes per value (already word-aligned)
+        for (int i = tid; i < p.I; i += nth) {
+            float xval = staged ? xsh[i] : x[xoff + i];
+            sum += xval * uintBitsToFloat(w[rowBase + uint(i)]);
+        }
+    }
+
+    // Intra-subgroup reduction
+    float tot = subgroupAdd(sum);
+    if (lane == 0) sg_sum[sg] = tot;
+    barrier();
+
+    // Cross-subgroup reduction
+    int nsubgroups = nth / sgsize;
+    if (sg == 0) {
+        float final = 0.0;
+        for (int si = lane; si < nsubgroups; si += sgsize) final += sg_sum[si];
+        final = subgroupAdd(final);
+        if (lane == 0) y[s * p.O + o] = final;
+    }
+}
