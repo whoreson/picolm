@@ -253,13 +253,13 @@ __device__ static inline void gpu_fp16_mad(half2 &acc, const half2 v, const half
 
 /* gpu_fp16_dot2: v_dot2_f32_f16 -- 1 ISA instruction for 2 FP16 FMAs with FP32 accumulate.
  * Available on gfx906 (Vega20), all CDNA, RDNA2/3/4.
- * CUDA equivalent on Turing+ uses the same asm syntax.
- * This is the instruction that gives llama.cpp its fattn-tile speed advantage. */
+ * This is the instruction that gives llama.cpp its fattn-tile speed advantage.
+ * HIP/AMDGPU only -- there is no NVIDIA equivalent at this level (see the
+ * comment further down where CUDA's gpu_fp16_dot2 is deliberately absent). */
 #if (defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx940__) || \
      defined(__gfx941__) || defined(__gfx942__) || defined(__gfx1030__) || defined(__gfx1031__) || \
      defined(__gfx1032__) || defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
-     defined(__gfx1103__) || defined(CDNA) || defined(RDNA2) || defined(RDNA3) || defined(RDNA4) || \
-     (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750))
+     defined(__gfx1103__) || defined(CDNA) || defined(RDNA2) || defined(RDNA3) || defined(RDNA4))
 #define GPU_FP16_DOT2_AVAILABLE
 __device__ static inline void gpu_fp16_dot2(float &acc, const half2 v, const half2 u) {
     asm volatile("v_dot2_f32_f16 %0, %1, %2, %0" : "+v"(acc) : "v"(v), "v"(u));
@@ -300,14 +300,19 @@ __device__ static inline void gpu_fp16_mad(half2 &acc, const half2 v, const half
     acc += v * u;
 }
 
-/* gpu_fp16_dot2: v_dot2_f32_f16 on Turing+ (sm_75+).
- * 1 ISA instruction for 2 FP16 FMAs with FP32 accumulate. */
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
-#define GPU_FP16_DOT2_AVAILABLE
-__device__ static inline void gpu_fp16_dot2(float &acc, const half2 v, const half2 u) {
-    asm volatile("v_dot2_f32_f16 %0, %1, %2, %0" : "+v"(acc) : "v"(v), "v"(u));
-}
-#endif
+/* No gpu_fp16_dot2 on CUDA: there is no PTX equivalent of GCN's
+ * v_dot2_f32_f16 (that mnemonic is raw AMDGPU ISA, not valid PTX --
+ * pasting it into an nvcc asm volatile block fails to assemble).
+ * NVIDIA's packed dot-accumulate instructions (__dp2a_lo/hi, __dp4a)
+ * are integer-only; the real FP16x2->FP32 fast path on NVIDIA is the
+ * tensor core (mma.sync), which needs a warp-cooperative tile layout,
+ * not a per-thread scalar accumulate -- this project already has that
+ * as the FA2 kernel. GPU_FP16_DOT2_AVAILABLE is intentionally left
+ * undefined here so the dot2 kernel's existing `#ifdef
+ * GPU_FP16_DOT2_AVAILABLE ... #else gpu_fp16_mad ... #endif` falls
+ * back correctly. In practice this never matters at runtime: any CUDA
+ * device with has_imma takes the FA2 path and never reaches the
+ * warpgrp/dot2 fallback at all. */
 #endif
 #endif
 
