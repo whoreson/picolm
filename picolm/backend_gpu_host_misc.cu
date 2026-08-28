@@ -699,7 +699,9 @@ ensure_attn_fa2_shared_mem(size_t bytes) {
  * dynamic-shared-memory opt-in kicks in. */
 static size_t
 attn_prefill_warpgrp_shared_bytes(int head_dim, int tile_q) {
-    return 2 * (size_t)ATTN_TILE_K * head_dim * sizeof(uint16_t)
+    /* Q tile (FP16) + K tile (FP16) + V tile (FP16) + acc (FP32) + max/sum (FP32) */
+    return (size_t)tile_q * head_dim * sizeof(uint16_t)
+         + 2 * (size_t)ATTN_TILE_K * head_dim * sizeof(uint16_t)
          + (size_t)tile_q * head_dim * sizeof(float)
          + (size_t)tile_q * sizeof(float)
          + (size_t)tile_q * sizeof(float);
