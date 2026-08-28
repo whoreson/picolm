@@ -251,12 +251,13 @@ __device__ static inline void gpu_fp16_mad(half2 &acc, const half2 v, const half
     acc += v * u;
 }
 
-/* gpu_fp16_dot2: v_dot2_f32_f16 -- 1 ISA instruction for 2 FP16 FMAs with FP32 accumulate.
- * Available on gfx906 (Vega20), all CDNA, RDNA2/3/4.
- * This is the instruction that gives llama.cpp its fattn-tile speed advantage.
- * HIP/AMDGPU only -- there is no NVIDIA equivalent at this level (see the
- * comment further down where CUDA's gpu_fp16_dot2 is deliberately absent). */
-#if (defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx940__) || \
+/* GPU_FP16_DOT2_AVAILABLE: v_dot2_f32_f16 is available on gfx906 (Vega20),
+ * all CDNA, RDNA2/3/4. Defined here at host-visible scope so the dispatch
+ * code in backend_gpu_host_misc.cu can gate on it. The actual __device__
+ * function is further down inside __HIP__ device-only scope.
+ * HIP/AMDGPU only -- no NVIDIA equivalent. */
+#if defined(__HIP_PLATFORM_AMD__) && defined(__HIP_DEVICE_COMPILE__) && \
+    (defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx940__) || \
      defined(__gfx941__) || defined(__gfx942__) || defined(__gfx1030__) || defined(__gfx1031__) || \
      defined(__gfx1032__) || defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
      defined(__gfx1103__) || defined(CDNA) || defined(RDNA2) || defined(RDNA3) || defined(RDNA4))
@@ -264,6 +265,19 @@ __device__ static inline void gpu_fp16_mad(half2 &acc, const half2 v, const half
 __device__ static inline void gpu_fp16_dot2(float &acc, const half2 v, const half2 u) {
     asm volatile("v_dot2_f32_f16 %0, %1, %2, %0" : "+v"(acc) : "v"(v), "v"(u));
 }
+#endif
+
+/* Host-visible predefine for the dispatch code. On HIP/AMD builds the dot2
+ * instruction is available on all architectures that hipcc supports. */
+#if defined(__HIP_PLATFORM_AMD__)
+#define GPU_FP16_DOT2_AVAILABLE
+#endif
+
+/* Host-parse forward declaration: hipcc needs to see the function signature
+ * during the initial host compilation pass, even though the body is
+ * __device__-only. */
+#ifdef GPU_FP16_DOT2_AVAILABLE
+__device__ static inline void gpu_fp16_dot2(float &acc, const half2 v, const half2 u);
 #endif
 #endif
 #else
