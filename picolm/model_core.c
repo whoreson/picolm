@@ -1453,7 +1453,7 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                             /* SSM models use q_full_dim = 2*q_dim for attention Q+gate projection.
                              * pipe_q and pipe_attn_out must be sized for the larger output. */
                             int q_pipeline_dim = c->has_ssm ? (q_dim * 2) : q_dim;
-                            if (!picolm_gpu_pipeline_alloc(c->n_embd, q_pipeline_dim, kv_dim, c->n_ffn, device)) {
+                            if (!picolm_gpu_pipeline_alloc(c->n_embd, q_pipeline_dim, kv_dim, c->n_ffn, c->vocab_size, device)) {
                                 fprintf(stderr, "WARN: GPU pipeline buffer alloc failed\n");
                             }
                             /* Prefill batch buffers - xb_stride must accommodate both

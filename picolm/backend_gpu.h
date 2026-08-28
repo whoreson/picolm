@@ -62,6 +62,10 @@ int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t,
                            float *y_dev, const float *x_dev, int S, int device, int y_stride, int x_stride);
 int picolm_gpu_matmul_dev_strided(picolm_gpu_tensor_t *t, float *y_dev,
                                    const float *x_dev, int S, int device, int x_stride, int y_stride);
+/* Output projection on GPU (S=1, Q8_0 weights).
+ * Input/output are device pointers. Returns 1 on success. */
+int picolm_gpu_matmul_logits(picolm_gpu_tensor_t *t, float *logits_dev,
+                              const float *x_dev, int device);
 
 /* Fused QKV matmul: quantize activation once, run Q+K+V IMMA matmuls.
  * bq = tq @ x_dev, bk = tk @ x_dev, bv = tv @ x_dev
@@ -491,7 +495,7 @@ void picolm_gpu_kv_free(void);
  * Idempotent (safe to call again; no-op once allocated for this
  * device -- these buffers never grow). Returns 1 on success, 0 ->
  * caller must not use model_forward_gpu() for this model/device. */
-int picolm_gpu_pipeline_alloc(int dim, int q_dim, int kv_dim, int ffn_hidden, int device);
+int picolm_gpu_pipeline_alloc(int dim, int q_dim, int kv_dim, int ffn_hidden, int vocab_size, int device);
 
 /* Allocate prefill batch pipeline buffers: [max_seq_len][dim] for S>1.
  * Same shape as pipeline_alloc but sized for batched prefill. */
@@ -520,6 +524,7 @@ float *picolm_gpu_pipe_attn_out(int device);
 float *picolm_gpu_pipe_ffn_norm(int device);
 float *picolm_gpu_pipe_gate(int device);
 float *picolm_gpu_pipe_up(int device);
+float *picolm_gpu_pipe_logits(int device);
 
 /* Q+gate de-interleave for SSM attention layers. */
 int picolm_gpu_qg_deinterleave_dev(const float *raw_dev, float *out_q_dev,
