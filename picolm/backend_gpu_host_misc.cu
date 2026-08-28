@@ -717,7 +717,7 @@ ensure_attn_prefill_warpgrp_shared_mem(size_t bytes) {
     return 1;
 }
 
-#ifdef FAST_FP16_AVAILABLE
+#ifdef GPU_FP16_DOT2_AVAILABLE
 /* Separate cache from the fmaf variant above: different kernel symbol,
  * needs its own gpuFuncSetAttribute call, same shared-mem layout. */
 static int
@@ -749,17 +749,17 @@ use_attn_warpgrp(void) {
  * packed-half2 path. NOT bit-exact with the CPU reference -- see the
  * kernel comment in backend_gpu_kernels.cu. Off by default; validate
  * with PICOLM_LOGITS_DUMP before trusting it beyond a benchmark run.
- * Silently inert (falls back to the fmaf kernel) if FAST_FP16_AVAILABLE
+ * Silently inert (falls back to the fmaf kernel) if GPU_FP16_DOT2_AVAILABLE
  * isn't defined for this build. */
 static int
 use_attn_dot2(void) {
     static int cached = -1;
     if (cached < 0) {
-#ifdef FAST_FP16_AVAILABLE
+#ifdef GPU_FP16_DOT2_AVAILABLE
         cached = getenv("PICOLM_ATTN_DOT2") ? 1 : 0;
 #else
         if (getenv("PICOLM_ATTN_DOT2"))
-            fprintf(stderr, "PICOLM_ATTN_DOT2=1 requested but FAST_FP16_AVAILABLE "
+            fprintf(stderr, "PICOLM_ATTN_DOT2=1 requested but GPU_FP16_DOT2_AVAILABLE "
                             "is not defined for this build; using fmaf warpgrp kernel instead\n");
         cached = 0;
 #endif
@@ -832,7 +832,7 @@ picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
             int n_tiles_q = (n_tokens + tile_q - 1) / tile_q;
             size_t shared_bytes = attn_prefill_warpgrp_shared_bytes(head_dim, tile_q);
             dim3 grid((unsigned)n_heads, (unsigned)n_tiles_q, 1);
-#ifdef FAST_FP16_AVAILABLE
+#ifdef GPU_FP16_DOT2_AVAILABLE
             if (use_attn_dot2()) {
                 gpu_dispatch_print("attn_prefill_warpgrp_dot2_host");
                 if (!ensure_attn_prefill_warpgrp_dot2_shared_mem(shared_bytes)) return 0;
@@ -937,7 +937,7 @@ picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
         int n_tiles_q = (n_tokens + tile_q - 1) / tile_q;
         size_t shared_bytes = attn_prefill_warpgrp_shared_bytes(head_dim, tile_q);
         dim3 grid((unsigned)n_heads, (unsigned)n_tiles_q, 1);
-#ifdef FAST_FP16_AVAILABLE
+#ifdef GPU_FP16_DOT2_AVAILABLE
         if (use_attn_dot2()) {
             gpu_dispatch_print("attn_prefill_warpgrp_dot2_dev");
             if (!ensure_attn_prefill_warpgrp_dot2_shared_mem(shared_bytes)) return 0;
