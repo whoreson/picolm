@@ -406,7 +406,6 @@ metal-model-bench:
 
 # Vulkan SDK auto-detection: check VULKAN_SDK, then common paths.
 # Provides VK_INC (headers), VK_LIB (loader library), VK_BIN (glslc).
-VULKAN_SDK  ?= $(shell echo $(VULKAN_SDK))
 ifneq ($(VULKAN_SDK),)
 VK_INC      := $(VULKAN_SDK)/include
 VK_LIB      := $(VULKAN_SDK)/lib
@@ -447,7 +446,7 @@ shaders/%.spv: shaders/%.comp
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@
 
 .PHONY: vulkan
-vulkan: backend_vulkan.o shaders/qmatmul_vk.spv
+vulkan: backend_vulkan.o shaders/qmatmul_vk.spv shaders/elementwise_vk.spv
 	$(MAKE) $(TARGET) \
 	  CFLAGS="$(filter-out -fopenmp,$(CFLAGS)) -march=native -DPICOLM_GPU=1 $(call simd_flags_for,-march=native) $(call simd_defines_for,-march=native) $(VK_EXTRA_INC)" \
 	  LDFLAGS="$(filter-out -fopenmp,$(LDFLAGS)) $(VK_EXTRA_LIB)" \
@@ -457,7 +456,7 @@ backend_vulkan.o: backend_vulkan.c backend_gpu.h quant.h
 	$(VK_CC) $(VK_CFLAGS) -DPICOLM_GPU=1 -c -o $@ $< -I.
 
 .PHONY: vulkan-shaders
-vulkan-shaders: shaders/qmatmul_vk.spv shaders/rmsnorm_vk.spv
+vulkan-shaders: shaders/qmatmul_vk.spv shaders/rmsnorm_vk.spv shaders/elementwise_vk.spv
 
 # --- hunger: CUDA build for Windows 11 (MSYS2 + MSVC + CUDA 12.4) ---
 # Target box: Windows 11, MSYS2 make, VS2022 Community on D:, CUDA on C:
