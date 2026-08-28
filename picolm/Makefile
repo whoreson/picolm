@@ -242,8 +242,9 @@ model:
 	fi
 
 clean:
-	-$(RM) $(TARGET) $(TARGET).exe $(OBJS) $(VIZ_OBJS) backend_gpu.o backend_gpu.o.hip backend_gpu.o.cuda backend_metal.o
+	-$(RM) $(TARGET) $(TARGET).exe $(OBJS) $(VIZ_OBJS) backend_gpu.o backend_gpu.o.hip backend_gpu.o.cuda backend_metal.o backend_vulkan.o
 	-$(RM) $(GPU_SRCS:%.cu=%-hip.o) $(GPU_SRCS:%.cu=%-cuda.o) backend_gpu.dlink.o
+	-$(RM) shaders/*.spv
 
 .PHONY: asan
 asan:
@@ -386,7 +387,77 @@ metal-bench-run: metal-bench
 .PHONY: metal-model-bench
 metal-model-bench:
 	./probes/metal_model_bench.sh
-.PHONY: hip cuda metal hunger
+.PHONY: hip cuda metal vulkan hunger
+
+# --- Vulkan compute backend ---
+# Works on any Vulkan 1.2 GPU (AMD, NVIDIA, Intel, Windows drivers).
+# Requires: vulkan loader headers (vulkan/vulkan.h), glslc (shaderc).
+#
+#   make vulkan                               # auto-detect SDK or use PATH
+#   make vulkan VULKAN_SDK=/path/to/sdk       # explicit SDK root
+#     On Windows: VULKAN_SDK=C:/data/util/vulkansdk/1.4.309.0
+#     On Linux:    VULKAN_SDK=/opt/vulkan-sdk
+#   make vulkan GLSLC=/path/to/glslc          # custom shader compiler
+#
+# Run with: PICOLM_GPU=1 ./picolm model.gguf -p "hello"
+# On Windows MinGW: -lvulkan links against vulkan-1.dll (shipped by drivers).
+# Shader .spv files are built from .comp sources; alternatively pre-compiled
+# .spv files can be placed in ./shaders/ and set PICOLM_VK_SHADER_DIR.
+
+# Vulkan SDK auto-detection: check VULKAN_SDK, then common paths.
+# Provides VK_INC (headers), VK_LIB (loader library), VK_BIN (glslc).
+VULKAN_SDK  ?= $(shell echo $(VULKAN_SDK))
+ifneq ($(VULKAN_SDK),)
+VK_INC      := $(VULKAN_SDK)/include
+VK_LIB      := $(VULKAN_SDK)/lib
+VK_BIN      := $(VULKAN_SDK)/bin
+else
+# Common SDK locations (Linux + Windows via MSYS path translation)
+VK_INC      := $(shell for d in /opt/vulkan-sdk/include /usr/include; do \
+               if [ -d "$$d" ]; then echo "$$d"; break; fi; done)
+VK_LIB      := $(shell for d in /opt/vulkan-sdk/lib /usr/lib; do \
+               if [ -d "$$d" ]; then echo "$$d"; break; fi; done)
+VK_BIN      := $(shell for d in /opt/vulkan-sdk/bin /usr/bin; do \
+               if [ -d "$$d" ]; then echo "$$d"; break; fi; done)
+endif
+
+# glslc: from SDK bin dir first, then PATH
+ifneq ($(VK_BIN),)
+GLSLC       ?= $(VK_BIN)/glslc
+else
+GLSLC       ?= glslc
+endif
+
+VK_CC       ?= gcc
+VK_CXX      ?= gcc
+# -I$(VK_INC) only added when VK_INC is non-empty and exists
+VK_EXTRA_INC = $(if $(VK_INC),$(shell if [ -d "$(VK_INC)" ]; then echo "-I$(VK_INC)"; fi))
+# On Windows SDK: MinGW ld can link against MSVC vulkan-1.lib (COFF format).
+# On Linux SDK: lib/libvulkan.a or libvulkan.so.
+# Fallback: -lvulkan from system paths.
+# Note: pass full path to .lib to avoid -L/path libname split issues.
+VK_EXTRA_LIB = $(if $(VULKAN_SDK),$(shell \
+               if [ -f "$(VULKAN_SDK)/Lib/vulkan-1.lib" ]; then echo "$(VULKAN_SDK)/Lib/vulkan-1.lib"; \
+               elif [ -f "$(VK_LIB)/libvulkan.a" ] || [ -f "$(VK_LIB)/libvulkan.so" ]; then echo "-L$(VK_LIB) -lvulkan"; \
+               else echo "-lvulkan"; fi))
+VK_CFLAGS   ?= -O3 -std=c11 -fPIC -Wall $(VK_EXTRA_INC)
+VK_LDFLAGS  ?= $(VK_EXTRA_LIB)
+
+shaders/%.spv: shaders/%.comp
+	$(GLSLC) --target-env=vulkan1.2 $< -o $@
+
+.PHONY: vulkan
+vulkan: backend_vulkan.o shaders/qmatmul_vk.spv
+	$(MAKE) $(TARGET) \
+	  CFLAGS="$(filter-out -fopenmp,$(CFLAGS)) -march=native -DPICOLM_GPU=1 $(call simd_flags_for,-march=native) $(call simd_defines_for,-march=native) $(VK_EXTRA_INC)" \
+	  LDFLAGS="$(filter-out -fopenmp,$(LDFLAGS)) $(VK_EXTRA_LIB)" \
+	  GPU_OBJS="backend_vulkan.o"
+
+backend_vulkan.o: backend_vulkan.c backend_gpu.h quant.h
+	$(VK_CC) $(VK_CFLAGS) -DPICOLM_GPU=1 -c -o $@ $< -I.
+
+.PHONY: vulkan-shaders
+vulkan-shaders: shaders/qmatmul_vk.spv shaders/rmsnorm_vk.spv
 
 # --- hunger: CUDA build for Windows 11 (MSYS2 + MSVC + CUDA 12.4) ---
 # Target box: Windows 11, MSYS2 make, VS2022 Community on D:, CUDA on C:

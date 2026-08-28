@@ -1,0 +1,40 @@
+#version 450
+// RMS norm: y[s,i] = x[s,i] * w[i] / sqrt(mean(x[s,:]^2) + eps)
+// One workgroup per row, 256 threads.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer X { float x[]; };
+layout(std430, binding = 1) readonly  buffer W { float w[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    int S, D;
+    float eps;
+    int pad;
+} p;
+
+shared float red[256];
+
+void main() {
+    int s = int(gl_WorkGroupID.x);
+    if (s >= p.S) return;
+    int tid = int(gl_LocalInvocationID.x);
+    uint base = uint(s) * uint(p.D);
+
+    float acc = 0.0;
+    for (int i = tid; i < p.D; i += 256) {
+        float v = x[base + uint(i)];
+        acc += v * v;
+    }
+    red[tid] = acc;
+    barrier();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off) red[tid] += red[tid + off];
+        barrier();
+    }
+    float r = 1.0 / sqrt(red[0] / float(p.D) + p.eps);
+    for (int i = tid; i < p.D; i += 256)
+        y[base + uint(i)] = x[base + uint(i)] * r * w[i];
+}
+

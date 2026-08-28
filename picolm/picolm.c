@@ -24,8 +24,8 @@
 #include <fcntl.h>
 #endif
 #ifdef PICOLM_GPU
-/* cuda_profiler_api.h is CUDA-only; HIP has no equivalent. */
-#ifndef PICOLM_HIP
+#ifdef PICOLM_CUDA
+/* cuda_profiler_api.h is CUDA-only. */
 #include <cuda_profiler_api.h>
 #endif
 #endif
@@ -579,7 +579,7 @@ static void benchmark_context_scaling(const char *model_path, const char *base_p
         int ctx_at_step = start_pos;
 
         /* Prefill only the NEW tokens at start_pos */
-#if defined(PICOLM_GPU) && !defined(PICOLM_HIP)
+#ifdef PICOLM_CUDA
         if (ctx_at_step > 800) { cudaProfilerStart(); }
 #endif
         double t0 = get_time_ms();
@@ -599,7 +599,7 @@ static void benchmark_context_scaling(const char *model_path, const char *base_p
         }
 
         double t_prefill = get_time_ms();
-#if defined(PICOLM_GPU) && !defined(PICOLM_HIP)
+#ifdef PICOLM_CUDA
         if (ctx_at_step > 800) { cudaProfilerStop(); }
 #endif
         float prefill_ms = (float)(t_prefill - t0);
