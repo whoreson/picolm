@@ -2398,7 +2398,8 @@ typedef struct {
      * alias x/y/q8_xq/q8_xd above (those stay used internally by
      * picolm_gpu_matmul_dev's Q8_0 path). */
     float *pipe_x, *pipe_xb, *pipe_q, *pipe_k, *pipe_v,
-          *pipe_attn_out, *pipe_ffn_norm, *pipe_gate, *pipe_up;
+          *pipe_attn_out, *pipe_ffn_norm, *pipe_gate, *pipe_up,
+          *pipe_logits;
     int pipe_ready; /* 1 once the above are allocated for this device */
     /* Split-K decode attention scratch: [n_heads*n_splits] max + sum
      * floats, then [n_heads*n_splits*head_dim] acc floats, grown via
@@ -5024,7 +5025,8 @@ picolm_gpu_kv_free(void) {
  * need to grow, unlike reserve()-based scratch, since decode is always
  * S=1). Returns 1 on success. */
 extern "C" int
-picolm_gpu_pipeline_alloc(int dim, int q_dim, int kv_dim, int ffn_hidden, int device) {
+picolm_gpu_pipeline_alloc(int dim, int q_dim, int kv_dim, int ffn_hidden,
+                           int vocab_size, int device) {
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
     if (ctx->pipe_ready) return 1;
@@ -5033,6 +5035,7 @@ picolm_gpu_pipeline_alloc(int dim, int q_dim, int kv_dim, int ffn_hidden, int de
     size_t qb = (size_t)q_dim * sizeof(float);
     size_t kvb = (size_t)kv_dim * sizeof(float);
     size_t fb = (size_t)ffn_hidden * sizeof(float);
+    size_t vb = (size_t)vocab_size * sizeof(float);
 
     int ok = 1;
     ok &= gpu_ok(gpuMalloc(&ctx->pipe_x, db), "pipe_x alloc");
@@ -5044,6 +5047,7 @@ picolm_gpu_pipeline_alloc(int dim, int q_dim, int kv_dim, int ffn_hidden, int de
     ok &= gpu_ok(gpuMalloc(&ctx->pipe_ffn_norm, db), "pipe_ffn_norm alloc");
     ok &= gpu_ok(gpuMalloc(&ctx->pipe_gate, fb), "pipe_gate alloc");
     ok &= gpu_ok(gpuMalloc(&ctx->pipe_up, fb), "pipe_up alloc");
+    ok &= gpu_ok(gpuMalloc(&ctx->pipe_logits, vb), "pipe_logits alloc");
     if (!ok) return 0;
 
     ctx->pipe_ready = 1;
@@ -5130,8 +5134,10 @@ picolm_gpu_pipeline_free(void) {
         if (ctx->pipe_ffn_norm) gpuFree(ctx->pipe_ffn_norm);
         if (ctx->pipe_gate) gpuFree(ctx->pipe_gate);
         if (ctx->pipe_up) gpuFree(ctx->pipe_up);
+        if (ctx->pipe_logits) gpuFree(ctx->pipe_logits);
         ctx->pipe_x = ctx->pipe_xb = ctx->pipe_q = ctx->pipe_k = ctx->pipe_v =
-            ctx->pipe_attn_out = ctx->pipe_ffn_norm = ctx->pipe_gate = ctx->pipe_up = NULL;
+            ctx->pipe_attn_out = ctx->pipe_ffn_norm = ctx->pipe_gate = ctx->pipe_up =
+            ctx->pipe_logits = NULL;
         ctx->pipe_ready = 0;
     }
     for (int i = 0; i < PICOLM_GPU_MAX_DEVICES; i++) {

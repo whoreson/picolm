@@ -1349,6 +1349,48 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
     return 1;
 }
 
+/* picolm_gpu_matmul_logits: output projection (lm_head) on GPU.
+ * Specialized for S=1 (single token), Q8_0 weights.
+ * Takes input from device, writes logits to device.
+ * Avoids the D2H+H2D round-trip of picolm_gpu_matmul. */
+extern "C"
+int picolm_gpu_matmul_logits(picolm_gpu_tensor_t *t, float *logits_dev,
+                              const float *x_dev, int device) {
+    if (!t || !logits_dev || !x_dev) return 0;
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!select_ctx(ctx)) return 0;
+
+    int I = t->I, O = t->O;
+    int S = 1;
+
+    if (t->qtype == GGUF_TYPE_Q8_0) {
+        int n_blocks = I / 32;
+        if (n_blocks < 1 || I % 32 != 0) return 0;
+
+        /* Quantize F32 input [I] to Q8_0 on GPU */
+        size_t xq_bytes = (size_t)I;
+        size_t xd_bytes = (size_t)n_blocks * sizeof(float);
+        if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, xq_bytes) ||
+            !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
+
+        dim3 q_grid((unsigned)n_blocks, (unsigned)1);
+        picolm_quantize_q8_0<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
+            ctx->q8_xq, ctx->q8_xd, x_dev, I, 1);
+        if (!gpu_ok(gpuGetLastError(), "logits q8 quantize")) return 0;
+
+        /* S=1: can't use IMMA (needs S>=16) or tiled (needs S>=Q8_TILE_S).
+         * Use scalar kernel with O blocks, each computing one logit. */
+        gpu_dispatch_print("matmul_logits_dev");
+        dim3 grid((unsigned)O, (unsigned)1);
+        picolm_q8_q8_matmul<<<grid, 256, 0, ctx->stream>>>(
+            logits_dev, ctx->q8_xq, ctx->q8_xd, t->weights,
+            1, I, O, (int)t->row_bytes, O);
+        if (!gpu_ok(gpuGetLastError(), "logits matmul")) return 0;
+        return 1;
+    }
+    return 0; /* unsupported type */
+}
+
 /* Strided variant: x_stride > 0 overrides default I stride.
  * Only called for SSM output projection where pipe buffer stride != value_dim. */
 extern "C" int

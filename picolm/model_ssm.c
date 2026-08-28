@@ -4400,18 +4400,28 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
                             (float *)gw->output_norm_dev,
                             dim, c->rms_norm_eps, gpu_dev);
 
-    /* 4. Sync once, then lm_head on host */
-    picolm_gpu_sync(gpu_dev);
-
-    /* Download pipe_x to host */
-    picolm_gpu_memcpy(s->x, pipe_x, dim * sizeof(float), -1, gpu_dev);
-
-    /* 5. Output projection -> logits (host-facing, needs D2H anyway for sampling) */
-    tensor_set_repacked(m->repack_used[1] ? m->repack_buffers[1] : NULL);
-    tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gw->output, gpu_dev);
-    matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
-    tensor_set_repacked(NULL);
-    tensor_set_gpu_tensor(NULL, 0);
+    /* 4. Output projection on GPU: pipe_logits = output_weights @ pipe_x
+     * Keep the matmul on device to avoid the D2H+H2D round-trip of the
+     * hidden state. Only the final logits (vocab_size floats) need to
+     * come back to host for sampling. */
+    extern int picolm_gpu_matmul_logits(picolm_gpu_tensor_t *t,
+                                         float *logits_dev, const float *x_dev,
+                                         int device);
+    float *pipe_logits = picolm_gpu_pipe_logits(gpu_dev);
+    if (pipe_logits && picolm_gpu_matmul_logits((picolm_gpu_tensor_t *)gw->output,
+                                                  pipe_logits, pipe_x, gpu_dev)) {
+        /* D2H only the logits */
+        size_t logits_bytes = (size_t)c->vocab_size * sizeof(float);
+        picolm_gpu_memcpy(s->logits, pipe_logits, logits_bytes, -1, gpu_dev);
+    } else {
+        /* Fallback: D2H hidden, CPU matmul */
+        picolm_gpu_memcpy(s->x, pipe_x, dim * sizeof(float), -1, gpu_dev);
+        tensor_set_repacked(m->repack_used[1] ? m->repack_buffers[1] : NULL);
+        tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gw->output, gpu_dev);
+        matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
+        tensor_set_repacked(NULL);
+        tensor_set_gpu_tensor(NULL, 0);
+    }
 
     return s->logits;
 }

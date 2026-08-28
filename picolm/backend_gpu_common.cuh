@@ -372,7 +372,8 @@ typedef struct {
     gpuStream_t stream;
     size_t tensor_count, tensor_bytes;
     float *pipe_x, *pipe_xb, *pipe_q, *pipe_k, *pipe_v,
-          *pipe_attn_out, *pipe_ffn_norm, *pipe_gate, *pipe_up;
+          *pipe_attn_out, *pipe_ffn_norm, *pipe_gate, *pipe_up,
+          *pipe_logits;
     int pipe_ready;
     float *attn_partial; size_t attn_partial_cap;
     float *pipe_x_b, *pipe_xb_b, *pipe_q_b, *pipe_k_b, *pipe_v_b,
