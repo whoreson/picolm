@@ -3125,8 +3125,6 @@ void layernorm(float *out, const float *x, const float *weight, const float *bia
     ss = _mm512_reduce_add_ps(acc2);
     for (; i < size; i++) { float d = x[i] - mean; ss += d * d; }
     __m512 scale = _mm512_set1_ps(1.0f / sqrtf(ss / (float)size + eps));
-    __m512 sc = _mm512_broadcast_ss(&scale);
-    scale = sc;
     i = 0;
     for (; i + 15 < size; i += 16) {
         __m512 v = _mm512_loadu_ps(x + i);
