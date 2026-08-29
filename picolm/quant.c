@@ -4779,23 +4779,30 @@ float vec_dot_q1_0_q8_0(const void *vx, const void *wy, int n) {
         sumf = hsum_sse(_mm_add_ps(_mm_add_ps(acc_0, acc_1), _mm_add_ps(acc_2, acc_3)));
         return sumf;
     }
-#elif 0
-    /* Plain NEON: expand 32 sign bits -> 32 sign masks, XOR+subtract Q8_0, sum.
-     * 1 bit/value, 128 values/block = 16 bytes qs + 2 bytes d.
-     * 4 sub-blocks per Q1_0 block, each matching 1 Q8_0 block (32 values).
+#elif defined(PICOLM_NEON)
+    /* Plain NEON: expand 32 sign bits -> 32 sign masks via vcreate_u8 from
+     * precomputed lookup table (mirrors llama.cpp approach), XOR+subtract Q8_0,
+     * accumulate with vpadalq_s16. 1 bit/value, 128 values/block.
      *
-     * Approach: replicate each byte of qs 8x via vtbl1_u8, AND with bit
-     * masks per byte, then cmpeq with zero -> 0x00 for set, 0xFF for clear.
-     * Mirrors the x86 SSSE3 byte_shuf + bit_masks + cmpeq pattern. */
+     * table_q1_mask: 256 entries of 8 bytes each. For each input byte value
+     * 0..255, each of its 8 bits expands to a sign mask byte:
+     *   bit=1 -> 0x00 (keep Q8_0 sign), bit=0 -> 0xFF (negate Q8_0).
+     * vcreate_u8 converts each 64-bit table entry directly into a uint8x8_t. */
     {
-        /* pshufb index: replicate each byte 8 times (8-byte index) */
-        static const uint8_t byte_shuf0[8] = {0,0,0,0,0,0,0,0};
-        static const uint8_t byte_shuf1[8] = {1,1,1,1,1,1,1,1};
-        /* Bit test masks: 1,2,4,8,16,32,64,128 */
-        static const uint8_t bit_masks[8] = {1,2,4,8,16,32,64,128};
-        const uint8x8_t idx0 = vld1_u8(byte_shuf0);
-        const uint8x8_t idx1 = vld1_u8(byte_shuf1);
-        const uint8x8_t bmasks = vld1_u8(bit_masks);
+        /* Generate table at first call: for byte value v, each bit i
+         * produces byte (v & (1<<i)) ? 0x00 : 0xFF */
+        static uint64_t table_q1_mask[256];
+        static int tbl_init = 0;
+        if (!tbl_init) {
+            for (int v = 0; v < 256; v++) {
+                uint64_t entry = 0;
+                for (int i = 0; i < 8; i++) {
+                    entry |= (uint64_t)((v & (1 << i)) ? 0x00 : 0xFF) << (i * 8);
+                }
+                table_q1_mask[v] = entry;
+            }
+            tbl_init = 1;
+        }
 
         float sumf = 0.0f;
         for (int ib = 0; ib < nb; ib++) {
@@ -4807,50 +4814,27 @@ float vec_dot_q1_0_q8_0(const void *vx, const void *wy, int n) {
             for (int K = 0; K < 4; K++) {
                 const uint8_t *bits = &qs[K * 4];
 
-                /* Expand 32 sign bits -> two int8x16 sign masks.
-                 * Each 16 bits = 2 bytes of qs -> 16 sign mask bytes.
-                 * Replicate each byte 8x via vtbl1_u8, AND with bit mask,
-                 * cmpeq(0) -> 0x00 for set bit, 0xFF for clear bit. */
-                int8x16_t sm0, sm1;
-                /* Low 16 bits: bytes bits[0], bits[1] -> sm0 (16 sign mask bytes)
-                 * vtbl1_u8(bits8, idx0) replicates bits[0] 8x.
-                 * vtbl1_u8(bits8, idx1) replicates bits[1] 8x. */
-                {
-                    uint8x8_t bits8_lo = vld1_u8(bits);
-                    uint8x8_t rep0 = vtbl1_u8(bits8_lo, idx0);  /* bits[0] replicated 8x */
-                    uint8x8_t rep1 = vtbl1_u8(bits8_lo, idx1);  /* bits[1] replicated 8x */
-                    uint8x8_t sm0a = vceq_u8(vand_u8(rep0, bmasks), vdup_n_u8(0));
-                    uint8x8_t sm0b = vceq_u8(vand_u8(rep1, bmasks), vdup_n_u8(0));
-                    sm0 = vreinterpretq_s8_u8(vcombine_u8(sm0a, sm0b));
-                }
-                /* High 16 bits: bytes bits[2], bits[3] -> sm1 (16 sign mask bytes) */
-                {
-                    uint8x8_t bits8_hi = vld1_u8(bits + 2);
-                    uint8x8_t rep2 = vtbl1_u8(bits8_hi, idx0);  /* bits[2] replicated 8x */
-                    uint8x8_t rep3 = vtbl1_u8(bits8_hi, idx1);  /* bits[3] replicated 8x */
-                    uint8x8_t sm1a = vceq_u8(vand_u8(rep2, bmasks), vdup_n_u8(0));
-                    uint8x8_t sm1b = vceq_u8(vand_u8(rep3, bmasks), vdup_n_u8(0));
-                    sm1 = vreinterpretq_s8_u8(vcombine_u8(sm1a, sm1b));
-                }
+                /* Expand 4 bytes of sign bits -> 32 sign mask bytes
+                 * via 4 table lookups + vcreate_u8 -> 2 int8x16 vectors */
+                const int8x16_t sm0 = vreinterpretq_s8_u8(
+                    vcombine_u8(vcreate_u8(table_q1_mask[bits[0]]),
+                                vcreate_u8(table_q1_mask[bits[1]])));
+                const int8x16_t sm1 = vreinterpretq_s8_u8(
+                    vcombine_u8(vcreate_u8(table_q1_mask[bits[2]]),
+                                vcreate_u8(table_q1_mask[bits[3]])));
 
                 /* sy = xor(qy, sm) - sm: bit=1 -> +qy, bit=0 -> -qy */
                 const int8x16_t qy0 = vld1q_s8(yp[K].qs);
                 const int8x16_t qy1 = vld1q_s8(yp[K].qs + 16);
-                int8x16_t sy0 = vsubq_s8(veorq_s8(qy0, sm0), sm0);
-                int8x16_t sy1 = vsubq_s8(veorq_s8(qy1, sm1), sm1);
+                const int8x16_t sy0 = vsubq_s8(veorq_s8(qy0, sm0), sm0);
+                const int8x16_t sy1 = vsubq_s8(veorq_s8(qy1, sm1), sm1);
 
-                /* Horizontal sum: widen int8 -> int16 -> int32 */
-                int16x8_t s0 = vmovl_s8(vget_low_s8(sy0));
-                int16x8_t s1 = vmovl_s8(vget_high_s8(sy0));
-                int16x8_t s2 = vmovl_s8(vget_low_s8(sy1));
-                int16x8_t s3 = vmovl_s8(vget_high_s8(sy1));
-                int32x4_t sum_0 = vpaddlq_s16(s0);
-                int32x4_t sum_1 = vpaddlq_s16(s1);
-                int32x4_t sum_2 = vpaddlq_s16(s2);
-                int32x4_t sum_3 = vpaddlq_s16(s3);
-                int32_t total = vaddvq_s32(vaddq_s32(vaddq_s32(sum_0, sum_1), vaddq_s32(sum_2, sum_3)));
+                /* Horizontal sum: pairwise add long accumulate */
+                int32x4_t p = vdupq_n_s32(0);
+                p = vpadalq_s16(p, vpaddlq_s8(sy0));
+                p = vpadalq_s16(p, vpaddlq_s8(sy1));
                 float d1 = fp16_to_fp32_lookup(yp[K].d);
-                sumi += d1 * (float)total;
+                sumi += d1 * (float)vaddvq_s32(p);
             }
             sumf += d0 * sumi;
         }
