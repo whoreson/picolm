@@ -4918,7 +4918,71 @@ float vec_dot_q2_0_q8_0(const void *vx, const void *wy, int n) {
             sumf += d0 * sumi;
         }
     }
+#elif defined(PICOLM_NEON)
+    /* Plain NEON: expand 2-bit codes from qs via vqtbl1q_u8 table lookup,
+     * subtract offset 1, multiply by Q8_0, sum with vmull_s8 + vpaddlq_s16.
+     * Mirrors llama.cpp approach but without DOTPROD.
+     *
+     * Each Q2_0 block: 32 bytes qs = 128 2-bit values, matching 4 Q8_0 blocks.
+     * Per Q8_0 sub-block: 8 bytes of qs -> 32 2-bit codes -> 32 int8 values. */
+    {
+        /* Replicate pattern: each of 4 bytes repeated 4 times */
+        static const uint8_t tbl_idx_lo[16] = {0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3};
+        static const uint8_t tbl_idx_hi[16] = {4,4,4,4, 5,5,5,5, 6,6,6,6, 7,7,7,7};
+        /* Arithmetic right-shift by 0,2,4,6 for each 2-bit field */
+        static const int8_t shift_vals[16] = {0,-2,-4,-6, 0,-2,-4,-6, 0,-2,-4,-6, 0,-2,-4,-6};
+        const uint8x16_t idx_lo = vld1q_u8(tbl_idx_lo);
+        const uint8x16_t idx_hi = vld1q_u8(tbl_idx_hi);
+        const int8x16_t shifts = vld1q_s8(shift_vals);
+        const uint8x16_t mask2 = vdupq_n_u8(3);
+        const int8x16_t one = vdupq_n_s8(1);
+
+        for (int i = 0; i < nb; i++) {
+            const float d0 = fp16_to_fp32_lookup(x[i].d);
+            float sumi = 0.0f;
+
+            for (int k = 0; k < 4; k++) {
+                const block_q8_0 *yb = &y[i * 4 + k];
+                const float d1 = fp16_to_fp32_lookup(yb->d);
+
+                /* Load 8 bytes of packed 2-bit values, duplicate to fill 16 */
+                const uint8x8_t raw = vld1_u8(&x[i].qs[k * 8]);
+                const uint8x16_t raw16 = vcombine_u8(raw, raw);
+
+                /* Expand bytes 0-3: replicate each byte 4x, shift, mask -> 16 2-bit codes */
+                uint8x16_t bytes0 = vqtbl1q_u8(raw16, idx_lo);
+                int8x16_t qv0 = vsubq_s8(
+                    vreinterpretq_s8_u8(vandq_u8(vshlq_u8(bytes0, shifts), mask2)),
+                    one);
+
+                /* Expand bytes 4-7: replicate each byte 4x, shift, mask -> 16 2-bit codes */
+                uint8x16_t bytes1 = vqtbl1q_u8(raw16, idx_hi);
+                int8x16_t qv1 = vsubq_s8(
+                    vreinterpretq_s8_u8(vandq_u8(vshlq_u8(bytes1, shifts), mask2)),
+                    one);
+
+                /* Dot product: vmull_s8 + vpaddlq_s16 (no DOTPROD) */
+                const int8x16_t y0 = vld1q_s8(yb->qs);
+                const int8x16_t y1 = vld1q_s8(yb->qs + 16);
+
+                /* qv0 . y0 */
+                int16x8_t p0 = vmull_s8(vget_low_s8(qv0), vget_low_s8(y0));
+                int16x8_t p1 = vmull_s8(vget_high_s8(qv0), vget_high_s8(y0));
+                /* qv1 . y1 */
+                int16x8_t p2 = vmull_s8(vget_low_s8(qv1), vget_low_s8(y1));
+                int16x8_t p3 = vmull_s8(vget_high_s8(qv1), vget_high_s8(y1));
+
+                int32x4_t s0 = vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1));
+                int32x4_t s1 = vaddq_s32(vpaddlq_s16(p2), vpaddlq_s16(p3));
+                int32_t total = vaddvq_s32(vaddq_s32(s0, s1));
+
+                sumi += d1 * (float)total;
+            }
+            sumf += d0 * sumi;
+        }
+    }
 #else
+    /* Scalar fallback */
     for (int ib = 0; ib < nb; ib++) {
         float d0 = fp16_to_fp32_lookup(x[ib].d);
         float sumi = 0.0f;
