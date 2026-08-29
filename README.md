@@ -23,6 +23,7 @@
 - GPU-pipelined prefill path (`model_forward_prefill_gpu`), fused RMSNorm+Quantize+QKV IMMA, two-tier batching
 - FFN rewrite: Q8_0 tiled matmul, 2.6x faster on GPU
 - GPT-2 architecture support with batched prefill and native tokenizer
+- MS-DOS (DJGPP) build target
 - GGUF split-file loader
 - Gemma-3n architecture support (WIP, doesn't work yet)
 - TurboQuant TQ3/TQ4 KV cache
