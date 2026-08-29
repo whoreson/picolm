@@ -93,6 +93,17 @@ void attn_core(
                 { __m256 cv = _mm256_set1_ps(correction); int d = 0;
                   for (; d + 7 < head_dim; d += 8) { __m256 vf = fp16x8_to_fp32_inline(vt16 + d); __m256 af = _mm256_loadu_ps(acc + d); _mm256_storeu_ps(acc + d, _mm256_add_ps(_mm256_mul_ps(af, cv), vf)); }
                   for (; d < head_dim; d++) acc[d] = fmaf(acc[d], correction, fp16_to_fp32(vt16[d])); }
+#elif defined(PICOLM_NEON)
+                { int d = 0;
+                  float32x4_t cv = vdupq_n_f32(correction);
+                  for (; d + 3 < head_dim; d += 4) {
+                      float16x4_t hf = vld1_f16((const float16_t *)(vt16 + d));
+                      float32x4_t vf = vcvt_f32_f16(hf);
+                      float32x4_t af = vld1q_f32(acc + d);
+                      vst1q_f32(acc + d, vaddq_f32(vmulq_f32(af, cv), vf));
+                  }
+                  for (; d < head_dim; d++) acc[d] = fmaf(acc[d], correction, fp16_to_fp32(vt16[d]));
+                }
 #else
                 for (int d = 0; d < head_dim; d++) acc[d] = fmaf(acc[d], correction, fp16_to_fp32(vt16[d]));
 #endif
@@ -115,6 +126,17 @@ void attn_core(
                 { __m256 wv = _mm256_set1_ps(w); int d = 0;
                   for (; d + 7 < head_dim; d += 8) { __m256 vf = fp16x8_to_fp32_inline(vt16 + d); __m256 af = _mm256_loadu_ps(acc + d); _mm256_storeu_ps(acc + d, _mm256_add_ps(_mm256_mul_ps(vf, wv), af)); }
                   for (; d < head_dim; d++) acc[d] = fmaf(w, fp16_to_fp32(vt16[d]), acc[d]); }
+#elif defined(PICOLM_NEON)
+                { int d = 0;
+                  float32x4_t wv = vdupq_n_f32(w);
+                  for (; d + 3 < head_dim; d += 4) {
+                      float16x4_t hf = vld1_f16((const float16_t *)(vt16 + d));
+                      float32x4_t vf = vcvt_f32_f16(hf);
+                      float32x4_t af = vld1q_f32(acc + d);
+                      vst1q_f32(acc + d, vaddq_f32(af, vmulq_f32(vf, wv)));
+                  }
+                  for (; d < head_dim; d++) acc[d] = fmaf(w, fp16_to_fp32(vt16[d]), acc[d]);
+                }
 #else
                 for (int d = 0; d < head_dim; d++) acc[d] = fmaf(w, fp16_to_fp32(vt16[d]), acc[d]);
 #endif
@@ -129,6 +151,10 @@ void attn_core(
 #elif defined(PICOLM_AVX)
     { __m256 inv = _mm256_set1_ps(inv_sum); int d = 0;
       for (; d + 7 < head_dim; d += 8) { __m256 af = _mm256_loadu_ps(acc + d); _mm256_storeu_ps(xbh + d, _mm256_mul_ps(af, inv)); }
+      for (; d < head_dim; d++) xbh[d] = acc[d] * inv_sum; }
+#elif defined(PICOLM_NEON)
+    { float32x4_t inv = vdupq_n_f32(inv_sum); int d = 0;
+      for (; d + 3 < head_dim; d += 4) { float32x4_t af = vld1q_f32(acc + d); vst1q_f32(xbh + d, vmulq_f32(af, inv)); }
       for (; d < head_dim; d++) xbh[d] = acc[d] * inv_sum; }
 #elif defined(PICOLM_SSE2)
     { __m128 inv = _mm_set1_ps(inv_sum); int d = 0;

@@ -1,4 +1,5 @@
 #include "tensor.h"
+#include "sgemm.h"
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
@@ -1391,6 +1392,13 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
         /* If allocation failed, fall through to generic path */
     }
 
+    /* Tiled GEMM fast path for F32/F16 weights.
+     * Much faster than vec_dot gemv for large matrices because
+     * the activation vector is reused across tiles. */
+    if (picolm_sgemm(d, 1, n, wptr, n, x, n, out, d, qtype, GGUF_TYPE_F32, 0, 1)) {
+        return;
+    }
+
     if (n_threads <= 1 || d < 4 || d < matmul_min_rows) {
         for (int i = 0; i < d; i++) {
             out[i] = vec_dot(wptr + (size_t)i * row_bytes, x, n, qtype);
@@ -2193,6 +2201,14 @@ void matmul_batch(float *out, const float *x, int n_batch,
 #endif
     size_t row_bytes = gguf_type_row_size(qtype, n);
     const char *wptr = (const char *)W;
+
+    /* Tiled GEMM for F16/F32 weights with batched F32 activations.
+     * Much faster than per-row gemv because activation tokens are
+     * reused across weight tiles. */
+    /* DISABLED for debugging */
+    /* if (picolm_sgemm(d, n_batch, n, wptr, n, x, n, out, d, qtype, GGUF_TYPE_F32, 0, n_threads)) {
+        return;
+    } */
 
 #if defined(PICOLM_AVX2)
     /* Parallelize across (token, 8-row-group) pairs. Each group is processed
@@ -3463,13 +3479,8 @@ void silu(float *x, int size) {
 }
 
 void gelu(float *x, int size) {
-    /* GELU: x * Phi(x) ≈ 0.5*x*(1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3))) */
-    for (int i = 0; i < size; i++) {
-        float xi = x[i];
-        x[i] = 0.5f * xi * (1.0f + tanhf(0.79788456f * (xi + 0.044715f * xi * xi * xi)));
-    }
+    picolm_gelu_table_f32(x, size);
 }
-
 void elemwise_mul(float *out, const float *a, const float *b, int size) {
 #ifdef PICOLM_AVX512
     int i = 0;

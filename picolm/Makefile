@@ -43,7 +43,7 @@ endif
 # Source files and corresponding .o files
 # model.c has been split into modular files
 MODEL_SRCS = model_core.c model_attention.c model_moe.c model_gemma3n.c model_ssm.c model_kv_cache.c model_gguf.c
-SRCS    = picolm.c $(MODEL_SRCS) tensor.c quant.c tokenizer.c qwen_tokenize.c sampler.c grammar.c cJSON.c server.c csafetensors.c json.c safetensors.c
+SRCS    = picolm.c $(MODEL_SRCS) tensor.c quant.c sgemm.c tokenizer.c qwen_tokenize.c sampler.c grammar.c cJSON.c server.c csafetensors.c json.c safetensors.c
 OBJS    = $(SRCS:.c=.o)
 TARGET  = picolm
 
@@ -75,6 +75,8 @@ _have_sse3   = $(shell echo | $(CC) -E -dM $(1) - 2>/dev/null | grep -c '__SSSE3
 _have_sse2   = $(shell echo | $(CC) -E -dM $(1) - 2>/dev/null | grep -c '__SSE2__')
 _have_fma    = $(shell echo | $(CC) -E -dM $(1) - 2>/dev/null | grep -c '__FMA__')
 _have_f16c   = $(shell echo | $(CC) -E -dM $(1) - 2>/dev/null | grep -c '__F16C__')
+_have_neon   = $(shell echo | $(CC) -E -dM $(1) - 2>/dev/null | grep -c 'define __ARM_NEON ')
+_have_i8mm   = $(shell echo | $(CC) -E -dM $(1) - 2>/dev/null | grep -c '__ARM_FEATURE_MATMUL_INT8')
 
 # Pick the highest SIMD level and emit the right -DPICOLM_* preprocessor defines.
 # Cascading if/elif/else: only the first (highest) matching level is emitted.
@@ -112,11 +114,11 @@ simd_flags_for = $(strip \
 # --- Default target: build with -march=native + auto-detected SIMD ---
 .PHONY: all
 all:
-	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_flags_for,-march=native) $(call simd_defines_for,-march=native)"
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_flags_for,-march=native) $(call simd_defines_for,-march=native) $(if $(filter 1,$(call _have_neon,-march=native)),-DPICOLM_NEON,) $(if $(filter 1,$(call _have_i8mm,-march=native)),-DPICOLM_I8MM,)"
 
 # --- Native build: -march=native with auto-detected SIMD defines ---
 native:
-	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_flags_for,-march=native) $(call simd_defines_for,-march=native)"
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_flags_for,-march=native) $(call simd_defines_for,-march=native) $(if $(filter 1,$(call _have_neon,-march=native)),-DPICOLM_NEON,) $(if $(filter 1,$(call _have_i8mm,-march=native)),-DPICOLM_I8MM,)"
 
 # --- VIZ build: native with embedded VNC visualization server ---
 # Remove affected .o files so the sub-make recompiles with -DPICOLM_VIZ.
@@ -175,6 +177,7 @@ model_ssm.o:    model_ssm.c  model.h quant.h tensor.h model_internal.h
 model_kv_cache.o: model_kv_cache.c  model.h quant.h tensor.h model_internal.h
 tensor.o: tensor.c tensor.h quant.h model.h
 quant.o:  quant.c  quant.h
+sgemm.o:  sgemm.c  sgemm.h quant.h
 tokenizer.o: tokenizer.c tokenizer.h
 sampler.o: sampler.c sampler.h
 grammar.o: grammar.c grammar.h

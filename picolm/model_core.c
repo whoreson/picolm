@@ -1877,11 +1877,8 @@ static float *model_forward_gpt2(model_t *m, int token, int pos) {
             for (int i = 0; i < n_ffn; i++) s->hb[i] += bias[i];
         }
 
-        /* GELU activation */
-        for (int i = 0; i < n_ffn; i++) {
-            float x = s->hb[i];
-            s->hb[i] = 0.5f * x * (1.0f + tanhf(x * 0.79788456f * (1.0f + 0.044715f * x * x)));
-        }
+        /* GELU activation (lookup table for speed) */
+        picolm_gelu_table_f32(s->hb, n_ffn);
 
         /* FFN down: [n_ffn, dim] */
         tensor_set_repacked(m->repack_used[ri+5] ? m->repack_buffers[ri+5] : NULL);
@@ -1910,6 +1907,7 @@ static float *model_forward_gpt2(model_t *m, int token, int pos) {
 
 /* ---- GPT-2 forward pass (specialized) ---- */
 static float *model_forward_gpt2(model_t *m, int token, int pos);
+static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt);
 
 float *model_forward(model_t *m, int token, int pos) {
     /* Gemma-3n has a fundamentally different architecture */
@@ -2891,6 +2889,206 @@ int model_unlock_layers(model_t *m) {
 #endif
 
 /* ================================================================
+ * Batched GPT-2 prefill
+ * ================================================================ */
+static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt) {
+    model_config_t *c = &m->config;
+    model_weights_t *w = &m->weights;
+    run_state_t *s = &m->state;
+
+    int dim = c->n_embd;
+    int n_ffn = c->n_ffn;
+    int n_heads = c->n_heads;
+    int head_dim = c->head_dim;
+    int q_dim = n_heads * head_dim;
+    int kv_dim = dim; /* GPT-2: no GQA */
+    int seq_len = c->max_seq_len;
+    int max_dim = (q_dim > dim) ? q_dim : dim;
+
+    /* Allocate batch buffers: x, xb, xb2, q(3*dim), k, v, hb */
+    size_t bs = (size_t)n_tokens;
+    size_t sz = bs * (dim + max_dim + dim + 3 * dim + 2 * kv_dim + n_ffn);
+    float *buf = (float *)malloc(sz * sizeof(float));
+    if (!buf) { fprintf(stderr, "OOM: GPT-2 prefill batch\n"); exit(1); }
+    float *p = buf;
+    float *x_batch = p;    p += bs * dim;
+    float *xb_batch = p;   p += bs * max_dim;
+    float *xb2_batch = p;  p += bs * dim;
+    float *q_batch = p;    p += bs * 3 * dim;
+    float *k_batch = p;    p += bs * kv_dim;
+    float *v_batch = p;    p += bs * kv_dim;
+    float *hb_batch = p;   p += bs * n_ffn;
+
+    /* Embedding lookup + positional embeddings */
+    {
+        size_t row_bytes = gguf_type_row_size(w->type_token_embd, dim);
+        size_t pos_row_bytes = w->position_embd ? gguf_type_row_size(w->type_position_embd, dim) : 0;
+        for (int bi = 0; bi < n_tokens; bi++) {
+            int pos = start_pos + bi;
+            const void *embd_row = (const uint8_t *)w->token_embd + (size_t)tokens[bi] * row_bytes;
+            dequantize_row(embd_row, x_batch + bi * dim, dim, w->type_token_embd);
+            /* Add learned positional embedding */
+            if (pos_row_bytes > 0) {
+                const void *pos_row = (const uint8_t *)w->position_embd + (size_t)pos * pos_row_bytes;
+                float *pos_embd = xb_batch + bi * dim; /* reuse xb_batch as temp */
+                dequantize_row(pos_row, pos_embd, dim, w->type_position_embd);
+                vec_add(x_batch + bi * dim, pos_embd, dim);
+            }
+        }
+    }
+
+    int n_active_layers = c->n_layers;
+    for (int slot = 0; slot < n_active_layers; slot++) {
+        int l = slot;
+        layer_weights_t *lw = &w->layers[l];
+        BENCH_LAYER_START();
+        /* LayerNorm */
+        for (int bi = 0; bi < n_tokens; bi++)
+            layernorm(xb_batch + bi * dim, x_batch + bi * dim,
+                      s->attn_norm_w[l], s->attn_norm_b[l], dim, c->rms_norm_eps);
+
+        /* Fused QKV projection (batched): [dim, 3*dim] */
+        tensor_set_repacked(m->repack_used[2 + l * 9] ? m->repack_buffers[2 + l * 9] : NULL);
+        matmul_batch(q_batch, xb_batch, n_tokens, lw->attn_qkv, dim, 3 * dim, lw->type_attn_qkv);
+        tensor_set_repacked(NULL);
+        /* Add bias */
+        if (lw->attn_qkv_bias) {
+            const float *bias = (const float *)lw->attn_qkv_bias;
+            for (int bi = 0; bi < n_tokens; bi++) {
+                float *q = q_batch + bi * 3 * dim;
+                for (int i = 0; i < 3 * dim; i++) q[i] += bias[i];
+            }
+        }
+
+        /* Split K, V from fused output into compact per-token buffers.
+         * Q stays in-place at q_batch[bi*3*dim], but attention will be
+         * called with per-token Q pointers (no stride issue for batch_attention).
+         * For batch_attention_layer we need stride = dim, so compact Q. */
+        {
+            /* Copy Q to xb_batch (reuse as compact Q buffer), copy K and V */
+            for (int bi = 0; bi < n_tokens; bi++) {
+                float *qf = q_batch + bi * 3 * dim;
+                memcpy(xb2_batch + bi * dim, qf, dim * sizeof(float));      /* Q */
+                memcpy(k_batch + bi * kv_dim, qf + dim, dim * sizeof(float));  /* K */
+                memcpy(v_batch + bi * kv_dim, qf + 2 * dim, dim * sizeof(float)); /* V */
+            }
+        }
+
+        /* Store K and V in KV cache */
+        {
+            uint8_t *kcl = s->key_cache + (size_t)l * seq_len * s->kv_row_size_k;
+            uint8_t *vcl = s->val_cache + (size_t)l * seq_len * s->kv_row_size_v;
+            for (int bi = 0; bi < n_tokens; bi++) {
+                int pos = start_pos + bi;
+                uint8_t *kp = kcl + (size_t)pos * s->kv_row_size_k;
+                uint8_t *vp = vcl + (size_t)pos * s->kv_row_size_v;
+                if (s->kv_type_k == KV_CACHE_Q8_0) {
+                    quantize_row_q8_0(k_batch + bi * kv_dim, kp, kv_dim);
+                } else if (s->kv_type_k == KV_CACHE_Q4_0) {
+                    quantize_row_q4_0(k_batch + bi * kv_dim, kp, kv_dim);
+                } else {
+                    uint16_t *kf = (uint16_t *)kp;
+                    for (int d2 = 0; d2 < kv_dim; d2++) kf[d2] = fp32_to_fp16(k_batch[bi * kv_dim + d2]);
+                }
+                if (s->kv_type_v == KV_CACHE_Q8_0) {
+                    quantize_row_q8_0(v_batch + bi * kv_dim, vp, kv_dim);
+                } else if (s->kv_type_v == KV_CACHE_Q4_0) {
+                    quantize_row_q4_0(v_batch + bi * kv_dim, vp, kv_dim);
+                } else {
+                    uint16_t *vf = (uint16_t *)vp;
+                    for (int d2 = 0; d2 < kv_dim; d2++) vf[d2] = fp32_to_fp16(v_batch[bi * kv_dim + d2]);
+                }
+            }
+        }
+
+        /* Attention (batched) - Q is in xb2_batch (compact), output goes to xb_batch */
+        memset(xb_batch, 0, (size_t)n_tokens * max_dim * sizeof(float));
+        {
+            batch_attention_layer(xb_batch, xb2_batch,
+                                  s->key_cache + (size_t)l * seq_len * s->kv_row_size_k,
+                                  s->val_cache + (size_t)l * seq_len * s->kv_row_size_v,
+                                  n_tokens, start_pos,
+                                  n_heads, n_heads, head_dim,
+                                  dim, s->kv_type_k, s->kv_type_v,
+                                  s->kv_row_size_k, s->kv_row_size_v,
+                                  s->kv_head_stride_k, s->kv_head_stride_v,
+                                  1.0f / sqrtf((float)head_dim));
+        }
+
+        /* Output projection (batched) */
+        tensor_set_repacked(m->repack_used[5 + l * 9] ? m->repack_buffers[5 + l * 9] : NULL);
+        matmul_batch(xb2_batch, xb_batch, n_tokens, lw->attn_output, q_dim, dim, lw->type_attn_output);
+        tensor_set_repacked(NULL);
+        /* Add bias */
+        if (lw->attn_output_bias) {
+            const float *bias = (const float *)lw->attn_output_bias;
+            for (int bi = 0; bi < n_tokens; bi++) {
+                float *xb = xb2_batch + bi * dim;
+                for (int i = 0; i < dim; i++) xb[i] += bias[i];
+            }
+        }
+        /* Residual: x += attn_out */
+        for (int bi = 0; bi < n_tokens; bi++) {
+            float *a = x_batch + bi * dim, *b = xb2_batch + bi * dim;
+            for (int d2 = 0; d2 < dim; d2++) a[d2] += b[d2];
+        }
+
+        /* FFN LayerNorm */
+        for (int bi = 0; bi < n_tokens; bi++)
+            layernorm(xb_batch + bi * dim, x_batch + bi * dim,
+                      s->post_attn_norm_w[l], s->post_attn_norm_b[l], dim, c->rms_norm_eps);
+
+        /* FFN up (batched): [dim, n_ffn] */
+        tensor_set_repacked(m->repack_used[8 + l * 9] ? m->repack_buffers[8 + l * 9] : NULL);
+        matmul_batch(hb_batch, xb_batch, n_tokens, lw->ffn_up, dim, n_ffn, lw->type_ffn_up);
+        tensor_set_repacked(NULL);
+        /* Add bias */
+        if (lw->ffn_up_bias) {
+            const float *bias = (const float *)lw->ffn_up_bias;
+            for (int bi = 0; bi < n_tokens; bi++) {
+                float *hb = hb_batch + bi * n_ffn;
+                for (int i = 0; i < n_ffn; i++) hb[i] += bias[i];
+            }
+        }
+
+        /* GELU activation (batched) */
+        for (int bi = 0; bi < n_tokens; bi++)
+            picolm_gelu_table_f32(hb_batch + bi * n_ffn, n_ffn);
+
+        /* FFN down (batched): [n_ffn, dim] */
+        tensor_set_repacked(m->repack_used[7 + l * 9] ? m->repack_buffers[7 + l * 9] : NULL);
+        matmul_batch(xb_batch, hb_batch, n_tokens, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
+        tensor_set_repacked(NULL);
+        /* Add bias */
+        if (lw->ffn_down_bias) {
+            const float *bias = (const float *)lw->ffn_down_bias;
+            for (int bi = 0; bi < n_tokens; bi++) {
+                float *xb = xb_batch + bi * dim;
+                for (int i = 0; i < dim; i++) xb[i] += bias[i];
+            }
+        }
+        /* Residual: x += ffn_out */
+        for (int bi = 0; bi < n_tokens; bi++) {
+            float *a = x_batch + bi * dim, *b = xb_batch + bi * dim;
+            for (int d2 = 0; d2 < dim; d2++) a[d2] += b[d2];
+        }
+        BENCH_LAYER_END(l, 1);
+    }
+
+    /* Final LayerNorm */
+    layernorm(s->x, x_batch + (n_tokens - 1) * dim,
+              s->output_norm_w, s->output_norm_b, dim, c->rms_norm_eps);
+
+    /* Output projection -> logits */
+    tensor_set_repacked(m->repack_used[1] ? m->repack_buffers[1] : NULL);
+    matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
+    tensor_set_repacked(NULL);
+
+    free(buf);
+    return s->logits;
+}
+
+/* ================================================================
  * Batched attention for prefill: computes attention for all tokens
  * and all heads in a single batched operation per layer.
  *
@@ -2913,13 +3111,9 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         }
         return m->state.logits;
     }
-    /* GPT-2: use per-token forward pass (batched prefill not yet implemented) */
+    /* GPT-2 batched prefill */
     if (m->config.is_gpt2) {
-        for (int i = 0; i < n_tokens; i++) {
-            if (interrupt && *interrupt) break;
-            (void)model_forward(m, tokens[i], start_pos + i);
-        }
-        return m->state.logits;
+        return model_forward_prefill_gpt2(m, tokens, n_tokens, start_pos, interrupt);
     }
 
     model_config_t *c = &m->config;

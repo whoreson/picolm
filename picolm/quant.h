@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -225,11 +226,13 @@ static inline float hsum_neon(float32x4_t v) {
 }
 
 static inline float32x4_t fp16x4_to_fp32_inline(const uint16_t *p) {
-    float32x4_t r = vdupq_n_f32(fp16_to_fp32_lookup(p[0]));
-    r = vsetq_lane_f32(fp16_to_fp32_lookup(p[1]), r, 1);
-    r = vsetq_lane_f32(fp16_to_fp32_lookup(p[2]), r, 2);
-    r = vsetq_lane_f32(fp16_to_fp32_lookup(p[3]), r, 3);
-    return r;
+    __fp16 h0, h1, h2, h3;
+    memcpy(&h0, &p[0], 2); memcpy(&h1, &p[1], 2);
+    memcpy(&h2, &p[2], 2); memcpy(&h3, &p[3], 2);
+    return vsetq_lane_f32((float)h3,
+           vsetq_lane_f32((float)h2,
+           vsetq_lane_f32((float)h1,
+           vdupq_n_f32((float)h0), 1), 2), 3);
 }
 #endif
 
@@ -698,6 +701,12 @@ void picolm_fast_ht(float *x, int n, const float *signs);
 /* Apply fast_ht(nrot) to each nrot-element block in x.
  * x has head_dim elements. head_dim % nrot == 0. */
 void picolm_hadamard_transform(float *x, int head_dim, int nrot);
+
+/* GELU lookup table: 256K entries for F16->GELU mapping */
+extern uint16_t picolm_gelu_table[65536];
+void picolm_init_gelu_table(void);
+/* NEON-accelerated GELU using lookup table (same formula as GPT-2 gelu) */
+void picolm_gelu_table_f32(float *x, int size);
 
 #ifdef __cplusplus
 }
