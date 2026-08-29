@@ -143,7 +143,7 @@ sse2:
 
 # --- x86-64 with SSE2+SSE3+SSSE3 (covers AMD Phenom/Athlon and similar without AVX) ---
 sse3:
-	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -msse2 -msse3 -mssse3 -mpopcnt -DPICOLM_SSE3 -DPICOLM_SSE2"
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -msse2 -msse3 -mssse3 -mpopcnt -DPICOLM_SSE3 -DPICOLM_SSSE3 -DPICOLM_SSE2"
 
 # --- x86-64 with AVX (Sandy Bridge and newer Intel; Bulldozer and newer AMD) ---
 avx:
