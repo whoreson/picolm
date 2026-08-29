@@ -16,18 +16,22 @@
 
 - GPU architecture rewrite: device-native pipeline replacing the old D2H/H2D matmul crutch
 - IMMA Tensor Core kernels for all quant types: Q8_0, Q6_K, Q5_K, Q4_K, Q4_0, Q4_1, Q3_K, Q2_K, Q1_0
-- FlashAttention-2 tensor core prefill kernel
-- Split-K decode attention (flash-decoding pattern)
+- FlashAttention-2 tensor core prefill kernel, warp-group scalar attention (new default), shared-memory staged IMMA W16 (+17% small ctx)
+- Split-K decode attention (flash-decoding pattern), GPU-resident output projection
 - GPU-resident KV cache, device-native RMSNorm, RoPE, elementwise ops
 - Device-native SSM batched kernels: conv1d, l2norm, vecdot, gated_norm, head_permute, expert_mlp
-- GPU-pipelined prefill path (`model_forward_prefill_gpu`)
+- GPU-pipelined prefill path (`model_forward_prefill_gpu`), fused RMSNorm+Quantize+QKV IMMA, two-tier batching
 - FFN rewrite: Q8_0 tiled matmul, 2.6x faster on GPU
+- GPT-2 architecture support with batched prefill and native tokenizer
 - GGUF split-file loader
 - Gemma-3n architecture support (WIP, doesn't work yet)
 - TurboQuant TQ3/TQ4 KV cache
 - Deterministic sign randomization for Walsh-Hadamard transform
+- `sgemm` tiled GEMM engine for F16/F32 matmuls
+- NEON acceleration for Q4_0, Q4_K, Q5_K, Q6_K, Q3_K, Q2_0, Q1_0 vec_dot paths
+- AVX2/AVX/SSSE3 SIMD paths for Q2_K and Q4_K (Q4_K SSE3: 3.3x vs scalar)
 - `--benchmark-ctx` context scaling benchmark, `--gpu-diff` kernel diff test
-- Big.LITTLE core awareness, `--list-kv`, `PICOLM_GPU_PATH` env var
+- `-pf` option (auto-apply chat template), Big.LITTLE awareness, `--list-kv`, `PICOLM_GPU_PATH` env var
 
 ## What all this is
 
@@ -51,16 +55,16 @@ Per-layer activation heatmap, viewable over the built-in VNC server, with no spe
 | Category | Details |
 |----------|---------|
 | **Quantization** | Q8_0, Q4_K, Q4_0, Q4_1, Q2_K, Q3_K, Q5_K, Q6_K, Q8_K, Q4_0_8_8, Q4_0_4_8, Q4_0_4_4, Q1_0, Q2_0, F16, BF16, F32 |
-| **SIMD: x86** | AVX-512/VNNI/AVX2/AVX/SSE (fp16x16, vec_dot, rmsnorm, RoPE, attention, all quants, SSM) |
-| **SIMD: ARM** | NEON (RoPE, FP16 HW convert, Q8_0 int8 MAC, attention, SSM kernels), DotProd, i8mm (Q4_0_4_4, Q4_0_4_8, ARMv8.2+ SDOT) |
-| **GPU** | CUDA/HIP IMMA Tensor Core GEMM (m16n8k32), FA2 prefill, Split-K decode, device-native SSM/attention/RMSNorm/RoPE, all quants Q1_0..Q8_0, Metal SSM kernels |
-| **Models** | Llama 1/2/3, Qwen2, Qwen3 (non-uniform head_dim), Qwen3.5/3.6 (SSM/Mamba hybrid), Gemma-3n (AltUp/Laurel) |
+| **SIMD: x86** | AVX-512/VNNI/AVX2/AVX/SSSE3/SSE (fp16x16, vec_dot, rmsnorm, RoPE, attention, all quants, SSM, sgemm) |
+| **SIMD: ARM** | NEON (RoPE, FP16 HW convert, Q8_0/Q4_0/Q4_K/Q5_K/Q6_K/Q3_K/Q2_0/Q1_0 vec_dot, attention, SSM kernels), DotProd, i8mm (Q4_0_4_4, Q4_0_4_8, ARMv8.2+ SDOT) |
+| **GPU** | CUDA/HIP IMMA Tensor Core GEMM (m16n8k32, W16 shared-memory staged), FA2 prefill, warp-group scalar attention, Split-K decode, device-native SSM/attention/RMSNorm/RoPE, all quants Q1_0..Q8_0, Metal SSM kernels |
+| **Models** | Llama 1/2/3, GPT-2, Qwen2, Qwen3 (non-uniform head_dim), Qwen3.5/3.6 (SSM/Mamba hybrid), Gemma-3n (AltUp/Laurel) |
 | **Scale** | Tested up to 70B parameters (miqu-70b) |
 | **HTTP server** | OpenAI API (`/v1/completions`, `/v1/chat/completions`, `/v1/models`), llama.cpp-compatible (`/completion`, `/props`), `/tokenize`, `/detokenize`, `/health`, streaming, persistent model/KV cache |
 | **Threading** | Persistent thread pool (gen-counter barrier), physical core auto-detect, big.LITTLE awareness, GQA grouped attention, tiled/blocked attention for prefill, batched GEMV |
 | **Platform** | Linux (AVX-512/VNNI, ARM NEON, RISC-V), Windows 7-11 (SRWLOCK, MinGW, VirtualLock, `--mem`), Mac OS/X 10.4-10.6, MS-DOS, PPC/Altivec, Android, FreeBSD |
-| **KV cache** | F16, Q8_0, Q4_0, Walsh-Hadamard rotation (`-khad`/`-vhad`), persistent with prefix matching, TQ4, TQ3 |
-| **Misc** | 64KB FP16 lookup table, `--mem` mlock, `--prefault`, `--daemon`, `--json` grammar, VNC visualization server, GGUF split-file loader |
+| **KV cache** | F16, Q8_0, Q4_0, TQ4, TQ3, Walsh-Hadamard rotation (`-khad`/`-vhad`), persistent with prefix matching |
+| **Misc** | 64KB FP16 lookup table, `--mem` mlock, `--prefault`, `--daemon`, `-pf` chat template, `--json` grammar, VNC visualization server, GGUF split-file loader, `sgemm` tiled GEMM |
 
 **What it will never have**
 
