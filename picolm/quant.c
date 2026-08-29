@@ -26,7 +26,13 @@ void fp16_table_init(void) {
 
 /* Fast lookup-based FP16->FP32 conversion */
 float fp16_to_fp32_lookup(uint16_t h) {
+#ifdef PICOLM_NEON
+    __fp16 tmp;
+    memcpy(&tmp, &h, 2);
+    return (float)tmp;
+#else
     return fp16_to_fp32_table[h];
+#endif
 }
 
 /* ================================================================
@@ -52,10 +58,13 @@ float vec_dot_f16_f32(const void *src, const float *x, int n) {
     float32x4_t acc1 = vdupq_n_f32(0.0f);
     int i = 0;
     for (; i + 7 < n; i += 8) {
-        float32x4_t kf0 = fp16x4_to_fp32_inline(k + i);
+        /* vcvt_f32_f16: hardware vector F16->F32 conversion (4 at a time) */
+        float16x4_t hf0 = vld1_f16((const float16_t *)k + i);
+        float32x4_t kf0 = vcvt_f32_f16(hf0);
         float32x4_t xf0 = vld1q_f32(x + i);
         acc0 = vmlaq_f32(acc0, kf0, xf0);
-        float32x4_t kf1 = fp16x4_to_fp32_inline(k + i + 4);
+        float16x4_t hf1 = vld1_f16((const float16_t *)k + i + 4);
+        float32x4_t kf1 = vcvt_f32_f16(hf1);
         float32x4_t xf1 = vld1q_f32(x + i + 4);
         acc1 = vmlaq_f32(acc1, kf1, xf1);
     }
@@ -158,6 +167,12 @@ void dequantize_row_bf16(const void *src, float *dst, int n) {
 }
 
 uint16_t fp32_to_fp16(float f) {
+#ifdef PICOLM_NEON
+    __fp16 tmp = f;
+    uint16_t res;
+    memcpy(&res, &tmp, 2);
+    return res;
+#else
     uint32_t bits;
     memcpy(&bits, &f, sizeof(float));
 
@@ -194,6 +209,7 @@ uint16_t fp32_to_fp16(float f) {
         if (exp >= 31) return (uint16_t)(sign | 0x7C00);
     }
     return (uint16_t)(sign | ((uint32_t)exp << 10) | (mant >> 13));
+#endif
 }
 
 /* ---- Q4_K helpers ---- */
@@ -507,9 +523,23 @@ void dequantize_row_q4_0_8_8(const void *src, float *dst, int n) {
 
 void dequantize_row_f16(const void *src, float *dst, int n) {
     const uint16_t *fp16 = (const uint16_t *)src;
+#ifdef PICOLM_NEON
+    int i;
+    for (i = 0; i + 3 < n; i += 4) {
+        float16x4_t hf = vld1_f16((const float16_t *)fp16 + i);
+        float32x4_t xf = vcvt_f32_f16(hf);
+        vst1q_f32(dst + i, xf);
+    }
+    __fp16 tmp;
+    for (; i < n; i++) {
+        memcpy(&tmp, &fp16[i], 2);
+        dst[i] = (float)tmp;
+    }
+#else
     for (int i = 0; i < n; i++) {
         dst[i] = fp16_to_fp32_lookup(fp16[i]);
     }
+#endif
 }
 
 void dequantize_row_f32(const void *src, float *dst, int n) {
@@ -4918,6 +4948,99 @@ float vec_dot_q2_0_q8_0(const void *vx, const void *wy, int n) {
             sumf += d0 * sumi;
         }
     }
+#elif defined(PICOLM_AVX2)
+    /* AVX2 path: same 2-bit unpack as VNNI (pshufb + cvtepu8 + mul+shift),
+     * but dot product via pmaddubsw + pmaddwd instead of dpbusd.
+     * codes in {0,1,2,3} -> sign-extend to int8 -> pmaddubsw with qy.
+     * Then subtract dot(1, qy) for the offset. */
+    {
+        const __m128i idxlo  = _mm_setr_epi8(0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3);
+        const __m128i idxhi  = _mm_setr_epi8(4,4,4,4,5,5,5,5,6,6,6,6,7,7,7,7);
+        const __m256i mul    = _mm256_setr_epi16(64,16,4,1, 64,16,4,1, 64,16,4,1, 64,16,4,1);
+        const __m256i three  = _mm256_set1_epi16(3);
+        const __m256i ones   = _mm256_set1_epi8(1);
+
+        for (int i = 0; i < nb; i++) {
+            const float d0 = fp16_to_fp32_lookup(x[i].d);
+            float sumi = 0.0f;
+            for (int k = 0; k < 4; k++) {
+                const block_q8_0 *yb = &y[i * 4 + k];
+                const float d1 = fp16_to_fp32_lookup(yb->d);
+                const __m256i qy = _mm256_loadu_si256((const __m256i *)yb->qs);
+                /* Unpack 8 bytes of qs -> 32 2-bit codes (same as VNNI) */
+                const __m128i src = _mm_loadl_epi64((const __m128i *)&x[i].qs[k * 8]);
+                const __m256i rep = _mm256_set_m128i(
+                    _mm_shuffle_epi8(src, idxhi), _mm_shuffle_epi8(src, idxlo));
+                __m256i r0 = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(rep));
+                __m256i r1 = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(rep, 1));
+                r0 = _mm256_and_si256(_mm256_srli_epi16(_mm256_mullo_epi16(r0, mul), 6), three);
+                r1 = _mm256_and_si256(_mm256_srli_epi16(_mm256_mullo_epi16(r1, mul), 6), three);
+                __m256i codes = _mm256_permute4x64_epi64(_mm256_packus_epi16(r0, r1), 0xD8);
+                /* Dot product: codes are unsigned {0,1,2,3}, qy is signed int8.
+                 * pmaddubsw: unsigned x signed -> signed 16-bit (16 pairs).
+                 * pmaddwd: sum adjacent 16-bit -> 32-bit (8 sums). */
+                __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(codes, qy),
+                                                _mm256_set1_epi16(1));
+                int dp = hsum_i32_8(p);
+                /* Subtract offset: dot(1, qy) */
+                __m256i sy_p = _mm256_madd_epi16(_mm256_maddubs_epi16(ones, qy),
+                                                   _mm256_set1_epi16(1));
+                int sy = hsum_i32_8(sy_p);
+                sumi += d1 * (float)(dp - sy);
+            }
+            sumf += d0 * sumi;
+        }
+    }
+#elif defined(PICOLM_AVX)
+    /* AVX (FMA) path: 128-bit unpack + maddubs. Process one Q8_0 block at a time
+     * using 128-bit pshufb for the 2-bit expansion. Two 128-bit halves per block. */
+    {
+        const __m128i idxlo  = _mm_setr_epi8(0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3);
+        const __m128i idxhi  = _mm_setr_epi8(4,4,4,4,5,5,5,5,6,6,6,6,7,7,7,7);
+        const __m128i ones_16 = _mm_set1_epi16(1);
+        const __m128i ones_8  = _mm_set1_epi8(1);
+        __m256 acc = _mm256_setzero_ps();
+
+        for (int i = 0; i < nb; i++) {
+            const float d0 = fp16_to_fp32_lookup(x[i].d);
+            __m256 acc_block = _mm256_setzero_ps();
+            for (int k = 0; k < 4; k++) {
+                const block_q8_0 *yb = &y[i * 4 + k];
+                const float d1 = fp16_to_fp32_lookup(yb->d);
+                const __m128i src = _mm_loadl_epi64((const __m128i *)&x[i].qs[k * 8]);
+
+                /* Unpack low 4 bytes of qs (16 2-bit codes) -> 16 int8 values */
+                {
+                    const __m128i rep = _mm_shuffle_epi8(src, idxlo);
+                    __m128i r0 = _mm_cvtepu8_epi16(rep);
+                    r0 = _mm_and_si128(_mm_srli_epi16(_mm_mullo_epi16(r0, _mm_setr_epi16(64,16,4,1,64,16,4,1,64,16,4,1,64,16,4,1)), 6), _mm_set1_epi16(3));
+                    __m128i codes = _mm_packus_epi16(r0, r0);
+                    /* codes: 16 unsigned bytes {0,1,2,3}; qy0: 16 signed bytes */
+                    const __m128i qy0 = _mm_loadl_epi64((const __m128i *)&yb->qs[0]);
+                    __m128i p = _mm_madd_epi16(_mm_maddubs_epi16(codes, qy0), ones_16);
+                    __m128i sy = _mm_madd_epi16(_mm_maddubs_epi16(ones_8, qy0), ones_16);
+                    p = _mm_sub_epi32(p, sy);
+                    acc_block = _mm256_fmadd_ps(_mm256_castps128_ps256(_mm_cvtepi32_ps(p)),
+                                                 _mm256_set1_ps(d1), acc_block);
+                }
+                /* Unpack high 4 bytes of qs (16 2-bit codes) -> 16 int8 values */
+                {
+                    const __m128i rep = _mm_shuffle_epi8(src, idxhi);
+                    __m128i r0 = _mm_cvtepu8_epi16(rep);
+                    r0 = _mm_and_si128(_mm_srli_epi16(_mm_mullo_epi16(r0, _mm_setr_epi16(64,16,4,1,64,16,4,1,64,16,4,1,64,16,4,1)), 6), _mm_set1_epi16(3));
+                    __m128i codes = _mm_packus_epi16(r0, r0);
+                    const __m128i qy0 = _mm_loadl_epi64((const __m128i *)&yb->qs[16]);
+                    __m128i p = _mm_madd_epi16(_mm_maddubs_epi16(codes, qy0), ones_16);
+                    __m128i sy = _mm_madd_epi16(_mm_maddubs_epi16(ones_8, qy0), ones_16);
+                    p = _mm_sub_epi32(p, sy);
+                    acc_block = _mm256_fmadd_ps(_mm256_castps128_ps256(_mm_cvtepi32_ps(p)),
+                                                 _mm256_set1_ps(d1), acc_block);
+                }
+            }
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(d0), acc_block, acc);
+        }
+        sumf = hsum_avx(acc);
+    }
 #elif defined(PICOLM_NEON)
     /* Plain NEON: expand 2-bit codes from qs via vqtbl1q_u8 table lookup,
      * subtract offset 1, multiply by Q8_0, sum with vmull_s8 + vpaddlq_s16.
@@ -6531,4 +6654,46 @@ void fma_scale_tq4_f32(float *dst, float correction, const void *src, int n) {
         for (int i = 0; i < TQ4_BLOCK_SIZE; i++)
             dptr[i] = dptr[i] * correction + reconstructed[i] * block_scale;
     }
+}
+
+/* ================================================================
+ * GELU lookup table (mirrors llama.cpp approach)
+ * ================================================================ */
+uint16_t picolm_gelu_table[65536];
+
+static float gelu_f32(float x) {
+    return 0.5f * x * (1.0f + tanhf(0.79788456f * (x + 0.044715f * x * x * x)));
+}
+
+void picolm_init_gelu_table(void) {
+    for (int i = 0; i < 65536; i++) {
+        float f = fp16_to_fp32_lookup(i);
+        float g = gelu_f32(f);
+        picolm_gelu_table[i] = fp32_to_fp16(g);
+    }
+}
+
+void picolm_gelu_table_f32(float *x, int size) {
+#ifdef PICOLM_NEON
+    int i;
+    for (i = 0; i + 3 < size; i += 4) {
+        uint16_t t0 = fp32_to_fp16(x[i]);
+        uint16_t t1 = fp32_to_fp16(x[i+1]);
+        uint16_t t2 = fp32_to_fp16(x[i+2]);
+        uint16_t t3 = fp32_to_fp16(x[i+3]);
+        x[i]   = fp16_to_fp32_lookup(picolm_gelu_table[t0]);
+        x[i+1] = fp16_to_fp32_lookup(picolm_gelu_table[t1]);
+        x[i+2] = fp16_to_fp32_lookup(picolm_gelu_table[t2]);
+        x[i+3] = fp16_to_fp32_lookup(picolm_gelu_table[t3]);
+    }
+    for (; i < size; i++) {
+        uint16_t t = fp32_to_fp16(x[i]);
+        x[i] = fp16_to_fp32_lookup(picolm_gelu_table[t]);
+    }
+#else
+    for (int i = 0; i < size; i++) {
+        uint16_t t = fp32_to_fp16(x[i]);
+        x[i] = fp16_to_fp32_lookup(picolm_gelu_table[t]);
+    }
+#endif
 }
