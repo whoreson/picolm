@@ -2015,8 +2015,8 @@ float vec_dot_q4_K_q8_K(const void *src_q4, const void *src_q8, int n) {
         utmp[0] &= kmask1;
 
         const __m128i utmps = _mm_set_epi32(utmp[3], utmp[2], utmp[1], utmp[0]);
-        const __m128i scales128 = _mm_cvtepu8_epi16(utmps);
-        const __m128i mins128 = _mm_cvtepu8_epi16(_mm_unpackhi_epi64(utmps, utmps));
+        const __m128i scales128 = _mm_unpacklo_epi8(utmps, _mm_setzero_si128());
+        const __m128i mins128 = _mm_unpacklo_epi8(_mm_unpackhi_epi64(utmps, utmps), _mm_setzero_si128());
 
         const __m128i q8sums_0 = _mm_loadu_si128((const __m128i*)&y[i].bsums[0]);
         const __m128i q8sums_1 = _mm_loadu_si128((const __m128i*)&y[i].bsums[8]);
@@ -2470,8 +2470,8 @@ float vec_dot_q5_K_q8_K(const void *src_q5, const void *src_q8, int n) {
         utmp[0] &= kmask1;
 
         const __m128i utmps = _mm_set_epi32(utmp[3], utmp[2], utmp[1], utmp[0]);
-        const __m128i scales = _mm_cvtepu8_epi16(utmps);
-        const __m128i mins = _mm_cvtepu8_epi16(_mm_unpackhi_epi64(utmps, utmps));
+        const __m128i scales = _mm_unpacklo_epi8(utmps, _mm_setzero_si128());
+        const __m128i mins = _mm_unpacklo_epi8(_mm_unpackhi_epi64(utmps, utmps), _mm_setzero_si128());
 
         const __m128i q8sums_0 = _mm_loadu_si128((const __m128i*)&y[i].bsums[0]);
         const __m128i q8sums_1 = _mm_loadu_si128((const __m128i*)&y[i].bsums[8]);
@@ -4991,14 +4991,19 @@ float vec_dot_q2_0_q8_0(const void *vx, const void *wy, int n) {
             sumf += d0 * sumi;
         }
     }
-#elif defined(PICOLM_AVX)
-    /* AVX (FMA) path: 128-bit unpack + maddubs. Process one Q8_0 block at a time
-     * using 128-bit pshufb for the 2-bit expansion. Two 128-bit halves per block. */
+#elif defined(PICOLM_FMA)
+    /* AVX+FMA path: 128-bit unpack + maddubs. Process one Q2_0 block at a time
+     * using 128-bit pshufb for the 2-bit expansion. Two 128-bit halves per block.
+     * Uses SSE2 punpcklbw/punpckhbw for byte->16-bit expansion (AVX2-only
+     * _mm_cvtepu8_epi16 not available without AVX2). */
     {
-        const __m128i idxlo  = _mm_setr_epi8(0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3);
-        const __m128i idxhi  = _mm_setr_epi8(4,4,4,4,5,5,5,5,6,6,6,6,7,7,7,7);
+        const __m128i idxlo   = _mm_setr_epi8(0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3);
+        const __m128i idxhi   = _mm_setr_epi8(4,4,4,4,5,5,5,5,6,6,6,6,7,7,7,7);
         const __m128i ones_16 = _mm_set1_epi16(1);
         const __m128i ones_8  = _mm_set1_epi8(1);
+        const __m128i mul     = _mm_setr_epi16(64,16,4,1, 64,16,4,1, 0,0,0,0, 0,0,0,0);
+        const __m128i mulhi   = _mm_setr_epi16(0,0,0,0, 0,0,0,0, 64,16,4,1, 64,16,4,1);
+        const __m128i three   = _mm_set1_epi16(3);
         __m256 acc = _mm256_setzero_ps();
 
         for (int i = 0; i < nb; i++) {
@@ -5012,9 +5017,12 @@ float vec_dot_q2_0_q8_0(const void *vx, const void *wy, int n) {
                 /* Unpack low 4 bytes of qs (16 2-bit codes) -> 16 int8 values */
                 {
                     const __m128i rep = _mm_shuffle_epi8(src, idxlo);
-                    __m128i r0 = _mm_cvtepu8_epi16(rep);
-                    r0 = _mm_and_si128(_mm_srli_epi16(_mm_mullo_epi16(r0, _mm_setr_epi16(64,16,4,1,64,16,4,1,64,16,4,1,64,16,4,1)), 6), _mm_set1_epi16(3));
-                    __m128i codes = _mm_packus_epi16(r0, r0);
+                    /* punpcklbw + punpckhbw replaces AVX2-only _mm_cvtepu8_epi16 */
+                    __m128i r0 = _mm_unpacklo_epi8(rep, _mm_setzero_si128());
+                    r0 = _mm_and_si128(_mm_srli_epi16(_mm_mullo_epi16(r0, mul), 6), three);
+                    __m128i r1 = _mm_unpackhi_epi8(rep, _mm_setzero_si128());
+                    r1 = _mm_and_si128(_mm_srli_epi16(_mm_mullo_epi16(r1, mulhi), 6), three);
+                    __m128i codes = _mm_packus_epi16(r0, r1);
                     /* codes: 16 unsigned bytes {0,1,2,3}; qy0: 16 signed bytes */
                     const __m128i qy0 = _mm_loadl_epi64((const __m128i *)&yb->qs[0]);
                     __m128i p = _mm_madd_epi16(_mm_maddubs_epi16(codes, qy0), ones_16);
@@ -5026,9 +5034,11 @@ float vec_dot_q2_0_q8_0(const void *vx, const void *wy, int n) {
                 /* Unpack high 4 bytes of qs (16 2-bit codes) -> 16 int8 values */
                 {
                     const __m128i rep = _mm_shuffle_epi8(src, idxhi);
-                    __m128i r0 = _mm_cvtepu8_epi16(rep);
-                    r0 = _mm_and_si128(_mm_srli_epi16(_mm_mullo_epi16(r0, _mm_setr_epi16(64,16,4,1,64,16,4,1,64,16,4,1,64,16,4,1)), 6), _mm_set1_epi16(3));
-                    __m128i codes = _mm_packus_epi16(r0, r0);
+                    __m128i r0 = _mm_unpacklo_epi8(rep, _mm_setzero_si128());
+                    r0 = _mm_and_si128(_mm_srli_epi16(_mm_mullo_epi16(r0, mul), 6), three);
+                    __m128i r1 = _mm_unpackhi_epi8(rep, _mm_setzero_si128());
+                    r1 = _mm_and_si128(_mm_srli_epi16(_mm_mullo_epi16(r1, mulhi), 6), three);
+                    __m128i codes = _mm_packus_epi16(r0, r1);
                     const __m128i qy0 = _mm_loadl_epi64((const __m128i *)&yb->qs[16]);
                     __m128i p = _mm_madd_epi16(_mm_maddubs_epi16(codes, qy0), ones_16);
                     __m128i sy = _mm_madd_epi16(_mm_maddubs_epi16(ones_8, qy0), ones_16);
