@@ -3107,6 +3107,66 @@ float vec_dot_q4_0_q8_0(const void *vx, const void *wy, int n) {
         }
     }
 
+#elif defined(PICOLM_NEON)
+    /* Plain NEON: vmull_s8 + vpaddlq_s16.
+     * Two blocks per iteration for better throughput. */
+    {
+        const uint8x16_t mask4 = vdupq_n_u8(0x0F);
+        const int8x16_t off = vdupq_n_s8(8);
+
+        for (; ib + 1 < nb; ib += 2) {
+            float d0 = fp16_to_fp32_lookup(x[ib + 0].d) * fp16_to_fp32_lookup(y[ib + 0].d);
+            float d1 = fp16_to_fp32_lookup(x[ib + 1].d) * fp16_to_fp32_lookup(y[ib + 1].d);
+
+            /* Block ib */
+            {
+                const uint8x16_t qx = vld1q_u8(x[ib].qs);
+                const int8x16_t qy0 = vld1q_s8(y[ib].qs);
+                const int8x16_t qy1 = vld1q_s8(y[ib].qs + 16);
+                int8x16_t qxl = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(qx, mask4)), off);
+                int8x16_t qxh = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(qx, 4)), off);
+                int16x8_t p0 = vmull_s8(vget_low_s8(qxl), vget_low_s8(qy0));
+                int16x8_t p1 = vmull_s8(vget_high_s8(qxl), vget_high_s8(qy0));
+                int16x8_t p2 = vmull_s8(vget_low_s8(qxh), vget_low_s8(qy1));
+                int16x8_t p3 = vmull_s8(vget_high_s8(qxh), vget_high_s8(qy1));
+                int32x4_t s = vaddq_s32(vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)),
+                                        vaddq_s32(vpaddlq_s16(p2), vpaddlq_s16(p3)));
+                sumf += d0 * (float)vaddvq_s32(s);
+            }
+            /* Block ib+1 */
+            {
+                const uint8x16_t qx = vld1q_u8(x[ib + 1].qs);
+                const int8x16_t qy0 = vld1q_s8(y[ib + 1].qs);
+                const int8x16_t qy1 = vld1q_s8(y[ib + 1].qs + 16);
+                int8x16_t qxl = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(qx, mask4)), off);
+                int8x16_t qxh = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(qx, 4)), off);
+                int16x8_t p0 = vmull_s8(vget_low_s8(qxl), vget_low_s8(qy0));
+                int16x8_t p1 = vmull_s8(vget_high_s8(qxl), vget_high_s8(qy0));
+                int16x8_t p2 = vmull_s8(vget_low_s8(qxh), vget_low_s8(qy1));
+                int16x8_t p3 = vmull_s8(vget_high_s8(qxh), vget_high_s8(qy1));
+                int32x4_t s = vaddq_s32(vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)),
+                                        vaddq_s32(vpaddlq_s16(p2), vpaddlq_s16(p3)));
+                sumf += d1 * (float)vaddvq_s32(s);
+            }
+        }
+        /* Tail: single block */
+        for (; ib < nb; ib++) {
+            float d0 = fp16_to_fp32_lookup(x[ib].d) * fp16_to_fp32_lookup(y[ib].d);
+            const uint8x16_t qx = vld1q_u8(x[ib].qs);
+            const int8x16_t qy0 = vld1q_s8(y[ib].qs);
+            const int8x16_t qy1 = vld1q_s8(y[ib].qs + 16);
+            int8x16_t qxl = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(qx, mask4)), off);
+            int8x16_t qxh = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(qx, 4)), off);
+            int16x8_t p0 = vmull_s8(vget_low_s8(qxl), vget_low_s8(qy0));
+            int16x8_t p1 = vmull_s8(vget_high_s8(qxl), vget_high_s8(qy0));
+            int16x8_t p2 = vmull_s8(vget_low_s8(qxh), vget_low_s8(qy1));
+            int16x8_t p3 = vmull_s8(vget_high_s8(qxh), vget_high_s8(qy1));
+            int32x4_t s = vaddq_s32(vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)),
+                                    vaddq_s32(vpaddlq_s16(p2), vpaddlq_s16(p3)));
+            sumf += d0 * (float)vaddvq_s32(s);
+        }
+    }
+
 #elif defined(PICOLM_SSSE3)
     {
         const __m128i mask4 = _mm_set1_epi8(15);
