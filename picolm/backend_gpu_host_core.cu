@@ -771,7 +771,7 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
     }
 
     /* Q6_K x Q8_0 IMMA path: quantize activations to Q8_0, native Q6_K weights */
-    if (t->qtype == GGUF_TYPE_Q6_K && ctx->has_imma && S >= 16 && O >= 8 && I % 256 == 0) {
+    if (t->qtype == GGUF_TYPE_Q6_K && ctx->has_imma && !getenv("PICOLM_NO_Q6K_IMMA") && S >= 16 && O >= 8 && I % 256 == 0) {
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
 
@@ -1235,7 +1235,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
 
     /* Q6_K x Q8_0 IMMA path (device): quantize activations to Q8_0, native Q6_K weights.
      * Uses picolm_q6_q8_matmul_imma (m16n8k32 tensor cores, 2 IMMA per K-step). */
-    if (t->qtype == GGUF_TYPE_Q6_K && ctx->has_imma && S >= 16 && O >= 8 && I % 256 == 0) {
+    if (t->qtype == GGUF_TYPE_Q6_K && ctx->has_imma && !getenv("PICOLM_NO_Q6K_IMMA") && S >= 16 && O >= 8 && I % 256 == 0) {
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
         int S_padded = (S + 15) & ~15;
