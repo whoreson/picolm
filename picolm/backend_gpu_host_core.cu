@@ -771,7 +771,7 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
     }
 
     /* Q6_K x Q8_0 IMMA path: quantize activations to Q8_0, native Q6_K weights */
-    if (t->qtype == GGUF_TYPE_Q6_K && ctx->has_imma && !getenv("PICOLM_NO_Q6K_IMMA") && S >= 16 && O >= 8 && I % 256 == 0) {
+    if (t->qtype == GGUF_TYPE_Q6_K && ctx->has_imma && S >= 16 && O >= 8 && I % 256 == 0) {
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
 
@@ -1235,7 +1235,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
 
     /* Q6_K x Q8_0 IMMA path (device): quantize activations to Q8_0, native Q6_K weights.
      * Uses picolm_q6_q8_matmul_imma (m16n8k32 tensor cores, 2 IMMA per K-step). */
-    if (t->qtype == GGUF_TYPE_Q6_K && ctx->has_imma && !getenv("PICOLM_NO_Q6K_IMMA") && S >= 16 && O >= 8 && I % 256 == 0) {
+    if (t->qtype == GGUF_TYPE_Q6_K && ctx->has_imma && S >= 16 && O >= 8 && I % 256 == 0) {
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
         int S_padded = (S + 15) & ~15;
@@ -1259,25 +1259,6 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
         picolm_q6_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(
             y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
         if (!gpu_ok(gpuGetLastError(), "q6 matmul (dev)")) return 0;
-
-        /* Debug: verify first output value against scalar reference */
-        { static int q6_debug_done = 0;
-          if (!q6_debug_done && getenv("PICOLM_Q6K_DEBUG")) {
-              q6_debug_done = 1;
-              float *dbg_buf;
-              if (gpu_ok(gpuMalloc(&dbg_buf, 10 * sizeof(float)), "debug alloc")) {
-                  picolm_q6_imma_debug_verify<<<dim3(1), dim3(1), 0, ctx->stream>>>(
-                      t->weights, ctx->q8_xq, ctx->q8_xd, y_dev, dbg_buf, S, I, O, (int)t->row_bytes, ys);
-                  gpuDeviceSynchronize();
-                  float host_buf[10];
-                  gpuMemcpy(host_buf, dbg_buf, 10 * sizeof(float), gpuMemcpyDeviceToHost);
-                  /* y_dev[0] is at dbg_buf[0], scalar at dbg_buf[1], weights[0..7] at dbg_buf[2..9] */
-                  fprintf(stderr, "[Q6K DBG] IMMA[0]=%.4f scalar[0]=%.4f w[0..7]=%.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n",
-                      host_buf[0], host_buf[1], host_buf[2], host_buf[3], host_buf[4], host_buf[5], host_buf[6], host_buf[7], host_buf[8], host_buf[9]);
-                  gpuFree(dbg_buf);
-              }
-          }
-        }
 
         return 1;
     }
