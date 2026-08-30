@@ -557,6 +557,32 @@ hunger:
 # --- hunger-nogpu: pure MSVC build, no CUDA, no GPU backend ---
 # Useful for isolating CPU-only bugs on Windows (same compiler as hunger,
 # but without PICOLM_GPU so all GPU code is excluded at compile time).
+# --- hunger-msys-direct: compile directly from MSYS2 bash (no .bat, no cmd.exe) ---
+# Requires env vars set BEFORE make:
+#   MSYSTEM=UCRT64 MINGW_PREFIX=/ucrt64 MINGW_CHOST=x86_64-w64-mingw32
+#   MSYSTEM_CARCH=x86_64 MSYSTEM_CHOST=x86_64-w64-mingw32 MSYSTEM_PREFIX=/ucrt64
+#   PATH must include: CUDA bin + MSVC cl.exe bin + MSYS2 bin (/ucrt64/bin:/usr/bin:/bin)
+#   INCLUDE: MSVC include + Windows SDK (ucrt, um, shared) with backslash paths
+#   LIB: MSVC lib + Windows SDK lib (ucrt, um) with backslash paths
+#   MSYS2_ARG_CONV_EXCL="*" (required for cl.exe /flags)
+# See /data4/work/notes/picolm/msys2-build-notes.md for full setup.
+HUNGER_CL_WIN = D:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/$(HUNGER_MSVC_VER)/bin/Hostx64/x64/cl.exe
+HUNGER_LINK_WIN = D:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/$(HUNGER_MSVC_VER)/bin/Hostx64/x64/link.exe
+HUNGER_CUDA_WIN = C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4
+HUNGER_NVCC_FLAGS = -O3 --fmad=false -std=c++14 -DPICOLM_GPU=1 -DPICOLM_CUDA=1 -DPICOLM_SSM_WARP_KERNEL_VALIDATED -DPICOLM_SSM_CHUNKED_GPU_VALIDATED -ccbin "$(HUNGER_CL_WIN)" -Xcompiler "/EHsc /O2 /W3 /std:c++14 /arch:AVX2 /wd4244 /wd4267 /wd4101 /wd4102 /DPICOLM_AVX2=1 /DPICOLM_AVX=1 /DPICOLM_SSE3=1 /DPICOLM_SSE2=1 /DPICOLM_FMA=1" -gencode arch=compute_89,code=$(HUNGER_CUDA_ARCH) -c -o
+HUNGER_CL_FLAGS = /O2 /W3 /wd4996 /wd4244 /wd4267 /wd4101 /wd4102 /wd4090 /wd4018 /wd4477 /arch:AVX2 /D PICOLM_GPU=1 /D PICOLM_CUDA=1 /D _CRT_SECURE_NO_WARNINGS /D _CRT_AMD64 /I. /openmp /c /D PICOLM_AVX2=1 /D PICOLM_AVX=1 /D PICOLM_SSE3=1 /D PICOLM_SSE2=1 /D PICOLM_FMA=1
+
+.PHONY: hunger-msys-direct
+hunger-msys-direct: gpu-clean-objs
+	TEMP=/tmp TMP=/tmp $(NVCC) $(HUNGER_NVCC_FLAGS) backend_gpu_kernels_win.obj backend_gpu_kernels.cu -I.
+	TEMP=/tmp TMP=/tmp $(NVCC) $(HUNGER_NVCC_FLAGS) backend_gpu_host_core_win.obj backend_gpu_host_core.cu -I.
+	TEMP=/tmp TMP=/tmp $(NVCC) $(HUNGER_NVCC_FLAGS) backend_gpu_host_ssm_win.obj backend_gpu_host_ssm.cu -I.
+	TEMP=/tmp TMP=/tmp $(NVCC) $(HUNGER_NVCC_FLAGS) backend_gpu_host_misc_win.obj backend_gpu_host_misc.cu -I.
+	@export MSYS2_ARG_CONV_EXCL="*" && export INCLUDE="$(INCLUDE);$(HUNGER_CUDA_WIN)/include" && TEMP=/tmp TMP=/tmp "$(HUNGER_CL_WIN)" $(HUNGER_CL_FLAGS) $(HUNGER_CFILES)
+	@export MSYS2_ARG_CONV_EXCL="*" && export LIB="$(LIB);$(HUNGER_CUDA_WIN)/lib/x64" && TEMP=/tmp TMP=/tmp "$(HUNGER_LINK_WIN)" /OUT:picolm.exe $(HUNGER_COBJS) $(HUNGER_CUOBS) "$(HUNGER_CUDA_WIN)/lib/x64/cudart.lib" ws2_32.lib advapi32.lib
+	-$(RM) $(HUNGER_CUOBS)
+
+# --- hunger-nogpu: pure MSVC build, no CUDA, no GPU backend ---
 # Usage: make hunger-nogpu
 HUNGER_NOGPU_OBJS = $(HUNGER_CFILES:.c=.obj)
 
