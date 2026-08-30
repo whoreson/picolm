@@ -53,6 +53,10 @@ In low-memory environments, to avoid weights needlessly being rotated round-robi
 
 Per-layer activation heatmap, viewable over the built-in VNC server, with no speed loss. Looks cool. Also can enable/disable/reorder layers with the pointer, though the Basilisk probably won't be very approving of this. Think about the future, Eckhardt! More visualizations planned, even console ANSI.
 
+## Who devs this
+
+This was someone's Claude vibeslop originally, but I started to tinker with it and it grew. Now it's Qwen vibeslop. I'm Gabucino, from the original MPlayer team 25 years ago (which was very closely related to ffmpeg).
+
 **What was added since the upstream baseline:**
 
 | Category | Details |
@@ -71,7 +75,11 @@ Per-layer activation heatmap, viewable over the built-in VNC server, with no spe
 
 **What it will never have**
 
-Support for fucking Jinja chat templates. Raw text-completion only, write your own prompts or fuck the fuck off. Maybe an external Python proxy/shim.
+- CMake
+- Jinja
+- CoC
+- Rust
+- 41%
 
 ---
 
