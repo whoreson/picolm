@@ -214,10 +214,12 @@ typedef hipEvent_t gpuEvent_t;
 #endif
 
 /* Cross-platform unused attribute */
-#ifdef _WIN32
+#if defined(_MSC_VER)
 #define PICOLM_UNUSED
-#else
+#elif defined(__clang__) || defined(__GNUC__)
 #define PICOLM_UNUSED __attribute__((unused))
+#else
+#define PICOLM_UNUSED
 #endif
 
 /* ---- Device-side FP16 helpers ---- */

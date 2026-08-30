@@ -216,7 +216,6 @@ void attention_group(int kv_head_idx, void *ctx_ptr) {
             /* For AVX512 path, dequant to f32 for uniform dot product */
             float k_f32_tq3[256];
             for (int hkv_block = 0; hkv_block < head_dim; hkv_block += TQ3_BLOCK_SIZE) {
-                float tmp[32];
                 const block_tq3 *tb = (const block_tq3 *)kt;
                 /* Inline TQ3 dequant per block */
                 const block_tq3 *blk = &tb[hkv_block / TQ3_BLOCK_SIZE];

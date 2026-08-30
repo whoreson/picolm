@@ -15,6 +15,8 @@
 **v1.0-beta3** (upcoming)
 
 - GPU architecture rewrite: device-native pipeline replacing the old D2H/H2D matmul crutch
+- **Note: MoE model GPU tensor upload is not yet supported on HIP/ROCm** (CUDA works fine).
+  MoE models on HIP fall back to CPU SSM matmul; full GPU upload path planned for next release.
 - IMMA Tensor Core kernels for all quant types: Q8_0, Q6_K, Q5_K, Q4_K, Q4_0, Q4_1, Q3_K, Q2_K, Q1_0
 - FlashAttention-2 tensor core prefill kernel, warp-group scalar attention (new default), shared-memory staged IMMA W16 (+17% small ctx)
 - Split-K decode attention (flash-decoding pattern), GPU-resident output projection

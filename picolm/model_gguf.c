@@ -1209,7 +1209,7 @@ int parse_gguf(model_t *m, int max_seq_len) {
             for (int _d = 0; _d < tinfos[i].n_dims - 1; _d++) rows *= tinfos[i].dims[_d];
             size_t sz = rows * row_sz;
             if (off + sz > m->splits[si].mmap_size) {
-                fprintf(stderr, "ERROR: tensor '%.*s' data extends beyond file bounds (offset=%zu, size=%zu, file=%zu). Model is corrupted or incomplete.\n",
+                fprintf(stderr, "ERROR: tensor '%.*s' data extends beyond file bounds (offset=%lu, size=%lu, file=%lu). Model is corrupted or incomplete.\n",
                         (int)tinfos[i].name.len, tinfos[i].name.str, (unsigned long)off, (unsigned long)sz, (unsigned long)m->splits[si].mmap_size);
                 free(tinfos);
                 return -1;

@@ -932,7 +932,7 @@ picolm_gpu_ssm_vecdot(float *out_host,
                        const int *head_map,
                        int device) {
     if (n_v_heads <= 0 || dim <= 0) return 0;
-    if (qtype != 0 && qtype != 2 && qtype != 8) return 0;
+    if (qtype != 0 && qtype != 2 && qtype != 8 && qtype != 41) return 0;
     if (dim > PICOLM_SSM_VECDOT_MAX_DIM) return 0;
 
     if (!gpu_ok(gpuSetDevice(device), "ssm vecdot device")) return 0;
@@ -993,7 +993,7 @@ picolm_gpu_ssm_vecdot_batch(float *out_host,       /* out [n_tokens][n_v_heads] 
                              const int *head_map,
                              int device) {
     if (n_v_heads <= 0 || dim <= 0 || n_tokens <= 0) return 0;
-    if (qtype != 0 && qtype != 2 && qtype != 8) return 0;
+    if (qtype != 0 && qtype != 2 && qtype != 8 && qtype != 41) return 0;
     if (dim > PICOLM_SSM_VECDOT_MAX_DIM) return 0;
 
     gpu_device_ctx_t *ctx = find_ctx(device);
@@ -1048,7 +1048,7 @@ picolm_gpu_ssm_vecdot_dev(float *out_dev,
                            const int *head_map_dev,
                            int device) {
     if (n_v_heads <= 0 || dim <= 0) return 0;
-    if (qtype != 0 && qtype != 2 && qtype != 8 && qtype != 30) return 0;
+    if (qtype != 0 && qtype != 2 && qtype != 8 && qtype != 30 && qtype != 41) return 0;
     if (dim > PICOLM_SSM_VECDOT_MAX_DIM) return 0;
 
     gpu_device_ctx_t *ctx = find_ctx(device);
@@ -1713,11 +1713,4 @@ picolm_gpu_ssm_chunked_recurrence(const float *conv_batch_host,
     return ok;
 #endif
 }
-
-/* Per-device KV cache pointers */
-static uint16_t *g_kv_k_dev[PICOLM_GPU_MAX_DEVICES];
-static uint16_t *g_kv_v_dev[PICOLM_GPU_MAX_DEVICES];
-static size_t g_kv_k_cap[PICOLM_GPU_MAX_DEVICES];
-static size_t g_kv_v_cap[PICOLM_GPU_MAX_DEVICES];
-static float *g_verify_buf_dev[PICOLM_GPU_MAX_DEVICES];  /* device verification buffer */
 

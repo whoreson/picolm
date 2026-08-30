@@ -153,7 +153,6 @@ picolm_gpu_pipeline_batch_alloc(int dim, int q_dim, int kv_dim, int ffn_hidden,
     if (ctx->pipe_b_ready) return 1;
 
     size_t bsz = (size_t)max_seq_len;
-    size_t db = bsz * dim * sizeof(float);
     size_t qb = bsz * q_dim * sizeof(float);
     size_t xb = bsz * xb_stride * sizeof(float);
     size_t kvb = bsz * kv_dim * sizeof(float);
@@ -759,21 +758,16 @@ use_attn_warpgrp(void) {
  * with PICOLM_LOGITS_DUMP before trusting it beyond a benchmark run.
  * Silently inert (falls back to the fmaf kernel) if GPU_FP16_DOT2_AVAILABLE
  * isn't defined for this build. */
+#ifdef GPU_FP16_DOT2_AVAILABLE
 static int
 use_attn_dot2(void) {
     static int cached = -1;
     if (cached < 0) {
-#ifdef GPU_FP16_DOT2_AVAILABLE
         cached = getenv("PICOLM_ATTN_DOT2") ? 1 : 0;
-#else
-        if (getenv("PICOLM_ATTN_DOT2"))
-            fprintf(stderr, "PICOLM_ATTN_DOT2=1 requested but GPU_FP16_DOT2_AVAILABLE "
-                            "is not defined for this build; using fmaf warpgrp kernel instead\n");
-        cached = 0;
-#endif
     }
     return cached;
 }
+#endif
 
 extern "C" int
 picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
@@ -1041,7 +1035,7 @@ picolm_gpu_attention_prefill_f32kv(float *xb_out_dev, const float *q_dev,
 }
 
 /* ================================================================
- * Phase 2: Device-resident elementwise kernels (stubs)
+ * Device-resident elementwise kernels
  * ================================================================ */
 
 /* RMSNorm kernel: out[d] = x[d] * rsqrt(mean(x^2) + eps) * weight[d].

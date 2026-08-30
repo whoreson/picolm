@@ -3383,7 +3383,7 @@ picolm_gpu_attention_prefill_warpgrp_kernel(
  *
  * CAUTION: written and reasoned through without a GPU in this session,
  * same disclaimer as the kernels above it. */
-#ifdef FAST_FP16_AVAILABLE
+#ifdef GPU_FP16_DOT2_AVAILABLE
 __global__ void
 picolm_gpu_attention_prefill_warpgrp_dot2_kernel(
         float *xb_out, const float *q_dev,
@@ -3550,7 +3550,7 @@ picolm_gpu_attention_prefill_warpgrp_dot2_kernel(
         }
     }
 }
-#endif /* FAST_FP16_AVAILABLE */
+#endif /* GPU_FP16_DOT2_AVAILABLE */
 
 /* FA2 kernel - FP16 Tensor Core Flash Attention 2 Prefill
  *
@@ -3665,6 +3665,23 @@ picolm_ssm_vecdot_kernel(float *out,
         for (int i = 0; i < dim; i++) sum += dequant_bf16(wrow, i) * x[i];
         break;
     }
+    case 41: { /* Q1_0 -- 128 values per block, sign bits.
+                * val[j] = (bit[j] ? +d : -d) = d * (2*bit[j] - 1)
+                * sum += d * (signed_sum_of_bits) * x[j] */
+        int n_blocks = dim / 128;
+        for (int bi = 0; bi < n_blocks; bi++) {
+            const uint8_t *blk = (const uint8_t *)wrow + (size_t)bi * 18;
+            uint16_t d_raw = blk[0] | ((uint16_t)blk[1] << 8);
+            float wd = gpu_fp16_to_fp32(d_raw);
+            const uint8_t *qs = blk + 2; /* 16 bytes = 128 sign bits */
+            for (int j = 0; j < 128; j++) {
+                int bit = (qs[j >> 3] >> (j & 7)) & 1;
+                int sign = (bit ? 1 : -1);
+                sum += wd * sign * x[bi * 128 + j];
+            }
+        }
+        break;
+    }
     default:
         break;
     }
@@ -3761,6 +3778,21 @@ picolm_ssm_vecdot_batch_kernel(float *out,
         /* BF16: raw bf16 array, no block structure.
          * Use dequant_bf16 (portable zero-extend), not __bfloat162float (broken). */
         for (int i = 0; i < dim; i++) sum += dequant_bf16(wrow, i) * xt[i];
+        break;
+    }
+    case 41: { /* Q1_0 -- 128 values per block, sign bits */
+        int n_blocks = dim / 128;
+        for (int bi = 0; bi < n_blocks; bi++) {
+            const uint8_t *blk = (const uint8_t *)wrow + (size_t)bi * 18;
+            uint16_t d_raw = blk[0] | ((uint16_t)blk[1] << 8);
+            float wd = gpu_fp16_to_fp32(d_raw);
+            const uint8_t *qs = blk + 2; /* 16 bytes = 128 sign bits */
+            for (int j = 0; j < 128; j++) {
+                int bit = (qs[j >> 3] >> (j & 7)) & 1;
+                int sign = (bit ? 1 : -1);
+                sum += wd * sign * xt[bi * 128 + j];
+            }
+        }
         break;
     }
     default:
