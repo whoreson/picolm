@@ -1265,14 +1265,15 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
           if (!q6_debug_done && getenv("PICOLM_Q6K_DEBUG")) {
               q6_debug_done = 1;
               float *dbg_buf;
-              if (gpu_ok(gpuMalloc(&dbg_buf, 9 * sizeof(float)), "debug alloc")) {
+              if (gpu_ok(gpuMalloc(&dbg_buf, 10 * sizeof(float)), "debug alloc")) {
                   picolm_q6_imma_debug_verify<<<dim3(1), dim3(1), 0, ctx->stream>>>(
                       t->weights, ctx->q8_xq, ctx->q8_xd, y_dev, dbg_buf, S, I, O, (int)t->row_bytes, ys);
                   gpuDeviceSynchronize();
-                  float host_buf[9];
-                  gpuMemcpy(host_buf, dbg_buf, 9 * sizeof(float), gpuMemcpyDeviceToHost);
+                  float host_buf[10];
+                  gpuMemcpy(host_buf, dbg_buf, 10 * sizeof(float), gpuMemcpyDeviceToHost);
+                  /* y_dev[0] is at dbg_buf[0], scalar at dbg_buf[1], weights[0..7] at dbg_buf[2..9] */
                   fprintf(stderr, "[Q6K DBG] IMMA[0]=%.4f scalar[0]=%.4f w[0..7]=%.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f\n",
-                      y_dev[0], host_buf[0], host_buf[1], host_buf[2], host_buf[3], host_buf[4], host_buf[5], host_buf[6], host_buf[7], host_buf[8]);
+                      host_buf[0], host_buf[1], host_buf[2], host_buf[3], host_buf[4], host_buf[5], host_buf[6], host_buf[7], host_buf[8], host_buf[9]);
                   gpuFree(dbg_buf);
               }
           }
