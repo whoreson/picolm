@@ -717,19 +717,20 @@ picolm_q6_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
             uint32_t qh0_raw, qh1_raw;
             memcpy(&qh0_raw, qhp + tid * 4, 4);
             memcpy(&qh1_raw, qhp + 16 + tid * 4, 4);
-            /* Extract 2 bits from each byte and shift to bits 4-5 */
+            /* Extract 2 bits from each byte, place at bits 4-5.
+             * Must mask BEFORE shifting to avoid cross-byte contamination. */
             if (qh_shift == 0) {
-                qh0 = (qh0_raw << 4) & 0x30303030;
-                qh1 = (qh1_raw << 4) & 0x30303030;
+                qh0 = (qh0_raw & 0x03030303) << 4;
+                qh1 = (qh1_raw & 0x03030303) << 4;
             } else if (qh_shift == 2) {
-                qh0 = (qh0_raw << 2) & 0x30303030;
-                qh1 = (qh1_raw << 2) & 0x30303030;
+                qh0 = ((qh0_raw >> 2) & 0x03030303) << 4;
+                qh1 = ((qh1_raw >> 2) & 0x03030303) << 4;
             } else if (qh_shift == 4) {
                 qh0 = qh0_raw & 0x30303030;
                 qh1 = qh1_raw & 0x30303030;
             } else {
-                qh0 = (qh0_raw >> 2) & 0x30303030;
-                qh1 = (qh1_raw >> 2) & 0x30303030;
+                qh0 = ((qh0_raw >> 6) & 0x03030303) << 4;
+                qh1 = ((qh1_raw >> 6) & 0x03030303) << 4;
             }
         }
 
