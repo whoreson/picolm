@@ -818,12 +818,13 @@ picolm_q6_imma_debug_verify(const void *weights, const int8_t *xq, const float *
             sum_scalar += (float)xq[k] * xd[bi] * wval;
         }
     }
-    y_scalar[0] = sum_scalar;
+    y_scalar[0] = y_imma[0];   /* IMMA result for y[0][0] */
+    y_scalar[1] = sum_scalar;   /* Scalar reference for y[0][0] */
 
     /* Dump first 8 dequantized weights for inspection */
     const void *blk0 = w + (size_t)row * row_bytes;
     for (int j = 0; j < 8; j++) {
-        y_scalar[1 + j] = gpu_dequant_q6_K_scalar(blk0, j);
+        y_scalar[2 + j] = gpu_dequant_q6_K_scalar(blk0, j);
     }
 }
 
