@@ -140,6 +140,16 @@ static inline void f32x4_to_fp16_hw(uint16_t *p, float32x4_t v) {
 #  undef vec_add
 #endif
 
+/* Compile-time warning if no SIMD path was detected.
+ * Falling back to scalar code is correct but dramatically slower.
+ * This typically means -march=native was not used, or the compiler
+ * did not define the expected architecture macros. */
+#if !defined(PICOLM_AVX512) && !defined(PICOLM_AVX2) && !defined(PICOLM_AVX) && \
+    !defined(PICOLM_SSE3) && !defined(PICOLM_SSSE3) && !defined(PICOLM_SSE2) && \
+    !defined(PICOLM_NEON) && !defined(PICOLM_ALTIVEC)
+#  warning "PICOLM: no SIMD detected (AVX/AVX2/AVX512/SSE/NEON/Altivec). Scalar fallback active. Use -march=native for best performance."
+#endif
+
 /* Include x86 SIMD header once for any x86 SIMD level.
  * <immintrin.h> is the modern umbrella header (GCC 4.7+).
  * Older compilers (e.g. GCC 4.2 on Mac OS X 10.6) need individual headers. */

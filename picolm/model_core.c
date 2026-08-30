@@ -1891,6 +1891,9 @@ static float *model_forward_gpt2(model_t *m, int token, int pos) {
         }
 
         vec_add(s->x, s->xb, dim);
+#ifdef PICOLM_VIZ
+        viz_push_layer(l, s->x, dim);
+#endif
         BENCH_LAYER_END(l, 0);
     }
 
@@ -3072,6 +3075,9 @@ static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_to
             float *a = x_batch + bi * dim, *b = xb_batch + bi * dim;
             for (int d2 = 0; d2 < dim; d2++) a[d2] += b[d2];
         }
+#ifdef PICOLM_VIZ
+        viz_push_layer(l, x_batch + (n_tokens - 1) * dim, dim);
+#endif
         BENCH_LAYER_END(l, 1);
     }
 

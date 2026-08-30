@@ -122,13 +122,15 @@ native:
 
 # --- VIZ build: native with embedded VNC visualization server ---
 # Remove affected .o files so the sub-make recompiles with -DPICOLM_VIZ.
+# After model.c was split into modular files, we must also clean the model
+# modules that contain #ifdef PICOLM_VIZ blocks (viz_push_layer calls).
 # Uses $(RM) (Make built-in, defaults to `rm -f`) for cross-platform safety.
 .PHONY: viz-clean-objs
 viz-clean-objs:
-	-$(RM) model.o picolm.o server.o
+	-$(RM) model.o picolm.o server.o model_core.o model_ssm.o model_attention.o model_gemma3n.o
 
 viz: viz-clean-objs
-	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_flags_for,-march=native) $(call simd_defines_for,-march=native) -DPICOLM_VIZ=1 -DPICOLM_SERVER" OBJS="$(OBJS) viz.o"
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_flags_for,-march=native) $(call simd_defines_for,-march=native) $(if $(filter 1,$(call _have_neon,-march=native)),-DPICOLM_NEON,) $(if $(filter 1,$(call _have_i8mm,-march=native)),-DPICOLM_I8MM,) -DPICOLM_VIZ=1 -DPICOLM_SERVER" OBJS="$(OBJS) viz.o"
 
 # --- x86-64 default: -march=native + GPU disabled, safe fallback ---
 x86: sse2
