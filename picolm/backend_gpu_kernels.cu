@@ -838,17 +838,19 @@ picolm_q6_imma_debug_verify(const void *weights, const int8_t *xq, const float *
                              int row_bytes, int y_stride) {
     if (gpuThreadIdx_x != 0 || gpuBlockIdx_x != 0) return;  // single thread
 
-    /* Compute scalar reference for y[0][0] */
+    /* Compute scalar reference for y[0][0].
+     * xd has one entry per 32 activation elements (Q8_0 quantization). */
     float sum_scalar = 0.0f;
     const uint8_t *w = (const uint8_t *)weights;
     int row = 0;
-    int n_blocks = I / 256;
-    for (int bi = 0; bi < n_blocks; bi++) {
+    int n_blocks_256 = I / 256;
+    for (int bi = 0; bi < n_blocks_256; bi++) {
         const void *blk = w + (size_t)row * row_bytes + (size_t)bi * GPU_BLOCK_Q6_K_SIZE;
         for (int j = 0; j < 256; j++) {
             int k = bi * 256 + j;
             float wval = gpu_dequant_q6_K_scalar(blk, j);
-            sum_scalar += (float)xq[k] * xd[bi] * wval;
+            int xd_idx = k / 32;  /* Q8_0: one scale per 32 elements */
+            sum_scalar += (float)xq[k] * xd[xd_idx] * wval;
         }
     }
     y_scalar[0] = y_imma[0];   /* IMMA result for y[0][0] */
