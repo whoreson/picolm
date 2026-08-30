@@ -147,7 +147,8 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
                 const void *blk = wrow + (size_t)bi * bytes_per_block;
                 for (int j = 0; j < 256; j++) {
                     int i = bi * 256 + j;
-                    sum += x[rs*s+i] * dequant_q6_K(blk, j);
+                    float wval = dequant_q6_K(blk, j);
+                    sum += x[rs*s+i] * wval;
                 }
             }
         }
@@ -644,13 +645,8 @@ picolm_q6_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
         int wc = tile_o + gid;
         size_t wrow_base = (size_t)wc * row_bytes + q6_block * GPU_BLOCK_Q6_K_SIZE;
 
-        /* Super-scale d (fp16 at offset 196 within Q6_K block) */
-        const uint8_t *wb_d = w + wrow_base;
-        float wd = gpu_fp16_to_fp32(wb_d[196] | ((uint16_t)wb_d[197] << 8));
-
-        /* Sub-scales for this group (2 int8 values, at offset 192 + g*2 and +g*2+1) */
-        float wsc0 = (float)(int8_t)wb_d[192 + g * 2];
-        float wsc1 = (float)(int8_t)wb_d[192 + g * 2 + 1];
+        /* Scales are read in epilogue from correct output columns (wc0,wc1),
+         * not from gid column (which was only for B-fragment feeding). */
 
         /* Determine ql and qh byte offsets within this Q6_K block for group g.
          *
@@ -665,8 +661,8 @@ picolm_q6_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
          *   0: (0, 0, 0, 0)  1: (0, 1, 0, 1)  2: (0, 0, 1, 2)  3: (0, 1, 1, 3)
          *   4: (1, 0, 0, 0)  5: (1, 1, 0, 1)  6: (1, 0, 1, 2)  7: (1, 1, 1, 3) */
         int chunk = g / 4;
-        int half = (g % 4) / 2;
-        int nibble = g % 2;
+        int half = (g % 4) % 2;      // 0,1,0,1 for g=0,1,2,3
+        int nibble = (g % 4) / 2;    // 0,0,1,1 for g=0,1,2,3
         int qh_pair = g % 4;
 
         int ql_base = chunk * 64 + half * 32;  /* ql byte offset within Q6_K block */
@@ -737,10 +733,12 @@ picolm_q6_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
             }
         }
 
-        /* Combine: 6-bit value = ql_nibble | qh_bits, then subtract 32 per byte */
+        /* Combine: 6-bit value = ql_nibble | qh_bits, then subtract 32 per byte.
+         * Each byte holds a 6-bit value (0..63) -> subtract 32 -> (-32..31) as signed int8.
+         * Must mask each byte to 8 bits after subtraction to avoid sign-extension leakage. */
         uint32_t b0, b1;
-        { uint32_t v = ql0 | qh0; b0 = ((v & 0xFF) - 32) | (((v >> 8) & 0xFF) - 32) << 8 | (((v >> 16) & 0xFF) - 32) << 16 | ((v >> 24) - 32) << 24; }
-        { uint32_t v = ql1 | qh1; b1 = ((v & 0xFF) - 32) | (((v >> 8) & 0xFF) - 32) << 8 | (((v >> 16) & 0xFF) - 32) << 16 | ((v >> 24) - 32) << 24; }
+        { uint32_t v = ql0 | qh0; b0 = (((v & 0xFF) - 32) & 0xFF) | ((((v >> 8) & 0xFF) - 32) & 0xFF) << 8 | ((((v >> 16) & 0xFF) - 32) & 0xFF) << 16 | (((v >> 24) - 32) & 0xFF) << 24; }
+        { uint32_t v = ql1 | qh1; b1 = (((v & 0xFF) - 32) & 0xFF) | ((((v >> 8) & 0xFF) - 32) & 0xFF) << 8 | ((((v >> 16) & 0xFF) - 32) & 0xFF) << 16 | (((v >> 24) - 32) & 0xFF) << 24; }
 
         /* Two IMMA calls: first K[0..15] with b0, then K[16..31] with b1 */
         int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
@@ -761,20 +759,31 @@ picolm_q6_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(0), "r"(b1));
 #endif
 
-        /* Epilogue: apply scales.
-         * d0-d3 accumulated from K[0..15] with sub-scale wsc0.
-         * d0b-d3b accumulated from K[16..31] with sub-scale wsc1.
-         * Activation scales: dx0 for rows gid, gid+8.
-         * Output columns: tid*2 and tid*2+1 (2 per thread). */
+        /* Epilogue: apply scales from the CORRECT output columns (tid*2, tid*2+1),
+         * NOT from gid (which was only used for B-fragment feeding).
+         * Matches picolm_q8_q8_matmul_imma epilogue pattern.
+         * sum[0] -> col tid*2, row gid; sum[1] -> col tid*2+1, row gid
+         * sum[2] -> col tid*2, row gid+8; sum[3] -> col tid*2+1, row gid+8 */
         float dx0 = xd[(size_t)(tile_s + gid) * n_blocks + kb];
         float dx1 = xd[(size_t)(tile_s + gid + 8) * n_blocks + kb];
-        float wds0 = wd * wsc0;
-        float wds1 = wd * wsc1;
 
-        sum[0] += (float)d0  * dx0 * wds0 + (float)d0b  * dx0 * wds1;
-        sum[1] += (float)d1  * dx0 * wds0 + (float)d1b  * dx0 * wds1;
-        sum[2] += (float)d2  * dx1 * wds0 + (float)d2b  * dx1 * wds1;
-        sum[3] += (float)d3  * dx1 * wds0 + (float)d3b  * dx1 * wds1;
+        /* Read scales for output column wc0 = tile_o + tid*2 */
+        { size_t wb0_off = (size_t)(tile_o + tid * 2) * row_bytes + q6_block * GPU_BLOCK_Q6_K_SIZE;
+          const uint8_t *wb0 = w + wb0_off;
+          float wd0 = gpu_fp16_to_fp32(wb0[208] | ((uint16_t)wb0[209] << 8));
+          float sc00 = wd0 * (float)(int8_t)wb0[192 + g * 2];
+          float sc01 = wd0 * (float)(int8_t)wb0[192 + g * 2 + 1];
+          sum[0] += (float)d0  * dx0 * sc00 + (float)d0b  * dx0 * sc01;
+          sum[2] += (float)d2  * dx1 * sc00 + (float)d2b  * dx1 * sc01; }
+
+        /* Read scales for output column wc1 = tile_o + tid*2 + 1 */
+        { size_t wb1_off = (size_t)(tile_o + tid * 2 + 1) * row_bytes + q6_block * GPU_BLOCK_Q6_K_SIZE;
+          const uint8_t *wb1 = w + wb1_off;
+          float wd1 = gpu_fp16_to_fp32(wb1[208] | ((uint16_t)wb1[209] << 8));
+          float sc10 = wd1 * (float)(int8_t)wb1[192 + g * 2];
+          float sc11 = wd1 * (float)(int8_t)wb1[192 + g * 2 + 1];
+          sum[1] += (float)d1  * dx0 * sc10 + (float)d1b  * dx0 * sc11;
+          sum[3] += (float)d3  * dx1 * sc10 + (float)d3b  * dx1 * sc11; }
     }
     for (int f = 0; f < 4; f++) {
         int row = (f < 2) ? gid : gid + 8;
@@ -784,6 +793,79 @@ picolm_q6_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
         if (gr < S && gc < O)
             y[(size_t)gr * ys + (size_t)gc] = sum[f];
     }
+}
+
+/* Q6_K decode warp-shuffle kernel (S=1, one token).
+ *
+ * Each thread computes one output column. All 32 threads cooperatively
+ * dequantize one Q6_K block (256 values, 210 bytes) from global memory,
+ * then perform the dot product against the single-token activation.
+ *
+ * Q6_K layout per block (210 bytes):
+ *   ql[128] + qh[64] + scales[16] + d[2]
+ * Each block has 16 sub-blocks of 16 values, each with its own int8 scale.
+ * 6-bit values: 4 bits from ql, 2 bits from qh, stored unsigned [0..63],
+ * actual value = stored - 32 (range -32..+31).
+ *
+ * Grid: [O], Block: 32 threads. */
+__global__ void
+picolm_q6_k_decode_warp(float *y, const float *x,
+                         const void *weights, int I, int O,
+                         int row_bytes) {
+    int o = gpuBlockIdx_x;
+    int tid = gpuThreadIdx_x;
+    if (o >= O) return;
+
+    const uint8_t *w = (const uint8_t *)weights;
+    const uint8_t *wrow = w + (size_t)o * row_bytes;
+    const float *xp = x;
+
+    int n_blocks = I / 256;
+    double sum = 0.0;
+
+    for (int bi = 0; bi < n_blocks; bi++) {
+        const uint8_t *blk = wrow + (size_t)bi * GPU_BLOCK_Q6_K_SIZE;
+        const uint8_t *ql = blk;
+        const uint8_t *qh = blk + 128;
+        const int8_t *scales = (const int8_t *)(qh + 64);
+        uint16_t d_raw = blk[208] | ((uint16_t)blk[209] << 8);
+        float d = gpu_fp16_to_fp32(d_raw);
+
+        for (int half = 0; half < 2; half++) {
+            const uint8_t *ql_c = ql + half * 64;
+            const uint8_t *qh_c = qh + half * 32;
+            for (int sub_chunk = 0; sub_chunk < 4; sub_chunk++) {
+                /* Two scale groups per sub_chunk: low (sub_l 0..15) and high (16..31) */
+                for (int sc_half = 0; sc_half < 2; sc_half++) {
+                    int sc_idx = half * 8 + sub_chunk * 2 + sc_half;
+                    float sc_v = (float)scales[sc_idx];
+                    int sub_l_base = sc_half * 16;
+
+                    for (int sub_l = tid + sub_l_base; sub_l < sub_l_base + 32; sub_l += 32) {
+                        uint8_t ql_val, qh_val;
+                        if (sub_chunk == 0) {
+                            ql_val = ql_c[sub_l] & 0xF;
+                            qh_val = (qh_c[sub_l] >> 0) & 3;
+                        } else if (sub_chunk == 1) {
+                            ql_val = ql_c[sub_l + 32] & 0xF;
+                            qh_val = (qh_c[sub_l] >> 2) & 3;
+                        } else if (sub_chunk == 2) {
+                            ql_val = ql_c[sub_l] >> 4;
+                            qh_val = (qh_c[sub_l] >> 4) & 3;
+                        } else {
+                            ql_val = ql_c[sub_l + 32] >> 4;
+                            qh_val = (qh_c[sub_l] >> 6) & 3;
+                        }
+
+                        int q = (ql_val | (qh_val << 4)) - 32;
+                        int elem_idx = bi * 256 + half * 128 + sub_chunk * 32 + sub_l;
+                        sum += (double)xp[elem_idx] * (double)d * (double)sc_v * (double)q;
+                    }
+                }
+            }
+        }
+    }
+    y[o] = (float)sum;
 }
 
 __global__ void
@@ -3682,6 +3764,48 @@ picolm_ssm_vecdot_kernel(float *out,
         }
         break;
     }
+    case 14: { /* Q6_K -- 256 values per block, 210 bytes */
+        int n_blocks = dim / 256;
+        for (int bi = 0; bi < n_blocks; bi++) {
+            const uint8_t *blk = (const uint8_t *)wrow + (size_t)bi * GPU_BLOCK_Q6_K_SIZE;
+            const uint8_t *ql = blk;
+            const uint8_t *qh = blk + 128;
+            const int8_t *scales = (const int8_t *)(qh + 64);
+            uint16_t d_raw = blk[208] | ((uint16_t)blk[209] << 8);
+            float wd = gpu_fp16_to_fp32(d_raw);
+
+            for (int half = 0; half < 2; half++) {
+                const uint8_t *ql_c = ql + half * 64;
+                const uint8_t *qh_c = qh + half * 32;
+                for (int sub_chunk = 0; sub_chunk < 4; sub_chunk++) {
+                    for (int sc_half = 0; sc_half < 2; sc_half++) {
+                        int sc_idx = half * 8 + sub_chunk * 2 + sc_half;
+                        float sc_v = (float)scales[sc_idx];
+                        int sub_l_base = sc_half * 16;
+                        for (int sub_l = 0; sub_l < 32; sub_l++) {
+                            uint8_t ql_val, qh_val;
+                            if (sub_chunk == 0) {
+                                ql_val = ql_c[sub_l] & 0xF;
+                                qh_val = (qh_c[sub_l] >> 0) & 3;
+                            } else if (sub_chunk == 1) {
+                                ql_val = ql_c[sub_l + 32] & 0xF;
+                                qh_val = (qh_c[sub_l] >> 2) & 3;
+                            } else if (sub_chunk == 2) {
+                                ql_val = ql_c[sub_l] >> 4;
+                                qh_val = (qh_c[sub_l] >> 4) & 3;
+                            } else {
+                                ql_val = ql_c[sub_l + 32] >> 4;
+                                qh_val = (qh_c[sub_l] >> 6) & 3;
+                            }
+                            int q = (ql_val | (qh_val << 4)) - 32;
+                            sum += wd * sc_v * (float)q * x[bi * 256 + half * 128 + sub_chunk * 32 + sub_l_base + sub_l];
+                        }
+                    }
+                }
+            }
+        }
+        break;
+    }
     default:
         break;
     }
@@ -3791,6 +3915,48 @@ picolm_ssm_vecdot_batch_kernel(float *out,
                 int bit = (qs[j >> 3] >> (j & 7)) & 1;
                 int sign = (bit ? 1 : -1);
                 sum += wd * sign * xt[bi * 128 + j];
+            }
+        }
+        break;
+    }
+    case 14: { /* Q6_K -- 256 values per block, 210 bytes */
+        int n_blocks = dim / 256;
+        for (int bi = 0; bi < n_blocks; bi++) {
+            const uint8_t *blk = (const uint8_t *)wrow + (size_t)bi * GPU_BLOCK_Q6_K_SIZE;
+            const uint8_t *ql = blk;
+            const uint8_t *qh = blk + 128;
+            const int8_t *scales = (const int8_t *)(qh + 64);
+            uint16_t d_raw = blk[208] | ((uint16_t)blk[209] << 8);
+            float wd = gpu_fp16_to_fp32(d_raw);
+
+            for (int half = 0; half < 2; half++) {
+                const uint8_t *ql_c = ql + half * 64;
+                const uint8_t *qh_c = qh + half * 32;
+                for (int sub_chunk = 0; sub_chunk < 4; sub_chunk++) {
+                    for (int sc_half = 0; sc_half < 2; sc_half++) {
+                        int sc_idx = half * 8 + sub_chunk * 2 + sc_half;
+                        float sc_v = (float)scales[sc_idx];
+                        int sub_l_base = sc_half * 16;
+                        for (int sub_l = 0; sub_l < 32; sub_l++) {
+                            uint8_t ql_val, qh_val;
+                            if (sub_chunk == 0) {
+                                ql_val = ql_c[sub_l] & 0xF;
+                                qh_val = (qh_c[sub_l] >> 0) & 3;
+                            } else if (sub_chunk == 1) {
+                                ql_val = ql_c[sub_l + 32] & 0xF;
+                                qh_val = (qh_c[sub_l] >> 2) & 3;
+                            } else if (sub_chunk == 2) {
+                                ql_val = ql_c[sub_l] >> 4;
+                                qh_val = (qh_c[sub_l] >> 4) & 3;
+                            } else {
+                                ql_val = ql_c[sub_l + 32] >> 4;
+                                qh_val = (qh_c[sub_l] >> 6) & 3;
+                            }
+                            int q = (ql_val | (qh_val << 4)) - 32;
+                            sum += wd * sc_v * (float)q * xt[bi * 256 + half * 128 + sub_chunk * 32 + sub_l_base + sub_l];
+                        }
+                    }
+                }
             }
         }
         break;
