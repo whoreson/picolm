@@ -796,6 +796,70 @@ picolm_q6_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
     }
 }
 
+/* ================================================================
+ * Q6_K IMMA debug: compare against scalar dequant for row 0, col 0
+ * ================================================================ */
+__global__ void
+picolm_q6_imma_debug_verify(const void *weights, const int8_t *xq, const float *xd,
+                             float *y_imma, float *y_scalar, int S, int I, int O,
+                             int row_bytes, int y_stride) {
+    if (gpuThreadIdx_x != 0 || gpuBlockIdx_x != 0) return;  // single thread
+
+    /* Compute scalar reference for y[0][0] */
+    float sum_scalar = 0.0f;
+    const uint8_t *w = (const uint8_t *)weights;
+    int row = 0;
+    int n_blocks = I / 256;
+    for (int bi = 0; bi < n_blocks; bi++) {
+        const void *blk = w + (size_t)row * row_bytes + (size_t)bi * GPU_BLOCK_Q6_K_SIZE;
+        for (int j = 0; j < 256; j++) {
+            int k = bi * 256 + j;
+            float wval = gpu_dequant_q6_K_scalar(blk, j);
+            sum_scalar += (float)xq[k] * xd[bi] * wval;
+        }
+    }
+    y_scalar[0] = sum_scalar;
+
+    /* Dump first 8 dequantized weights for inspection */
+    const void *blk0 = w + (size_t)row * row_bytes;
+    for (int j = 0; j < 8; j++) {
+        y_scalar[1 + j] = gpu_dequant_q6_K_scalar(blk0, j);
+    }
+}
+
+/* Minimal scalar dequant for debug kernel (inline, no function call overhead) */
+__device__ static inline float gpu_dequant_q6_K_scalar(const void *blk, int i) {
+    const uint8_t *ql = (const uint8_t *)blk;
+    const uint8_t *qh = ql + 128;
+    const int8_t *scales = (const int8_t *)(qh + 64);
+    uint16_t d_raw = ((const uint16_t *)(scales + 16))[0];
+    float d = gpu_fp16_to_fp32(d_raw);
+    int chunk = i / 128;
+    int l = i % 128;
+    const uint8_t *ql_c = ql + chunk * 64;
+    const uint8_t *qh_c = qh + chunk * 32;
+    int sub_chunk = l / 32;
+    int sub_l = l % 32;
+    int is_base = chunk * 8;
+    int sc_idx = is_base + (sub_chunk * 2) + (sub_l / 16);
+    uint8_t ql_val, qh_val;
+    if (sub_chunk == 0) {
+        ql_val = ql_c[sub_l] & 0xF;
+        qh_val = (qh_c[sub_l] >> 0) & 3;
+    } else if (sub_chunk == 1) {
+        ql_val = ql_c[sub_l + 32] & 0xF;
+        qh_val = (qh_c[sub_l] >> 2) & 3;
+    } else if (sub_chunk == 2) {
+        ql_val = ql_c[sub_l] >> 4;
+        qh_val = (qh_c[sub_l] >> 4) & 3;
+    } else {
+        ql_val = ql_c[sub_l + 32] >> 4;
+        qh_val = (qh_c[sub_l] >> 6) & 3;
+    }
+    int q = (ql_val | (qh_val << 4)) - 32;
+    return d * (float)scales[sc_idx] * (float)q;
+}
+
 /* Q6_K decode warp-shuffle kernel (S=1, one token).
  *
  * Each thread computes one output column. All 32 threads cooperatively
