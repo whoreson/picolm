@@ -4654,25 +4654,12 @@ after_qkv:
 
         /* KV cache store */
         /* attn_ord already tracks the ordinal from the loop counter above */
-#ifndef PICOLM_HIP
-        /* CUDA: use strided variant (bk/bv have xb_stride layout, not kv_dim).
-         * This avoids reading gaps between rows as zero-pad. */
-        { static int kv_info = 0;
-          if (!kv_info) { fprintf(stderr, "INFO: KV cache strided store (xb_stride=%d, kv_dim=%d)\n", xb_stride, n_kv_heads*head_dim); kv_info = 1; } }
-        picolm_gpu_kv_store_dev_batched_strided(1, attn_ord, start_pos, n_ubatch,
-                                         bk, n_kv_heads, head_dim, seq_len, gpu_dev, xb_stride);
-        picolm_gpu_kv_store_dev_batched_strided(0, attn_ord, start_pos, n_ubatch,
-                                         bv, n_kv_heads, head_dim, seq_len, gpu_dev, xb_stride);
-#else
-        /* HIP: use non-strided variant. The strided path reads incorrectly
-         * because pipe_k_b/pipe_v_b are allocated as contiguous kv_dim rows. */
-        { static int kv_info = 0;
-          if (!kv_info) { fprintf(stderr, "INFO: KV cache non-strided store (HIP)\n"); kv_info = 1; } }
+        /* bk/bv are contiguous kv_dim rows from matmul (y_stride_kv = kv_dim),
+         * NOT strided at xb_stride. Use non-strided variant on all platforms. */
         picolm_gpu_kv_store_dev_batched(1, attn_ord, start_pos, n_ubatch,
                                          bk, n_kv_heads, head_dim, seq_len, gpu_dev);
         picolm_gpu_kv_store_dev_batched(0, attn_ord, start_pos, n_ubatch,
                                          bv, n_kv_heads, head_dim, seq_len, gpu_dev);
-#endif
 
         /* Diagnostic: dump first attention layer K values after store */
         if (getenv("PICOLM_ATTN_DBG") && attn_ord == 0 && start_pos == 0) {
