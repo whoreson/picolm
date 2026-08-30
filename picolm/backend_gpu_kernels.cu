@@ -703,8 +703,8 @@ picolm_q6_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
         /* Extract low/high nibble */
         uint32_t ql0, ql1;
         if (nibble) {
-            ql0 = ql0_raw >> 4;
-            ql1 = ql1_raw >> 4;
+            ql0 = (ql0_raw >> 4) & 0x0F0F0F0F;
+            ql1 = (ql1_raw >> 4) & 0x0F0F0F0F;
         } else {
             ql0 = ql0_raw & 0x0F0F0F0F;
             ql1 = ql1_raw & 0x0F0F0F0F;
