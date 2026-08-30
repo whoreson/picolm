@@ -1260,36 +1260,6 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
             y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
         if (!gpu_ok(gpuGetLastError(), "q6 matmul (dev)")) return 0;
 
-        /* Compare IMMA vs scalar for first row (debug, env-gated) */
-        { static int q6_cmp_done = 0;
-          if (!q6_cmp_done && getenv("PICOLM_Q6K_CMP")) {
-              q6_cmp_done = 1;
-              int cmp_O = O < 64 ? O : 64;
-              int cmp_S = S < 4 ? S : 4;
-              float *scalar_y;
-              gpuMalloc(&scalar_y, (size_t)cmp_S * cmp_O * sizeof(float));
-              dim3 grid2((unsigned)cmp_O, (unsigned)cmp_S);
-              picolm_quant_matmul<<<grid2, 256, 0, ctx->stream>>>(
-                  scalar_y, x_dev, t->weights, GGUF_TYPE_Q6_K, cmp_S, I, cmp_O,
-                  (int)t->row_bytes, x_stride, cmp_O);
-              gpuDeviceSynchronize();
-              float h_imma[64], h_scalar[64];
-              gpuMemcpy(h_imma, y_dev, 64 * sizeof(float), gpuMemcpyDeviceToHost);
-              gpuMemcpy(h_scalar, scalar_y, 64 * sizeof(float), gpuMemcpyDeviceToHost);
-              float maxdiff = 0;
-              for (int i = 0; i < 64; i++) {
-                  float d = fabsf(h_imma[i] - h_scalar[i]);
-                  if (d > maxdiff) {
-                      maxdiff = d;
-                      fprintf(stderr, "[Q6K CMP] row=%d col=%d IMMA=%.6f scalar=%.6f diff=%.6f\n",
-                          i / cmp_O, i % cmp_O, h_imma[i], h_scalar[i], d);
-                  }
-              }
-              fprintf(stderr, "[Q6K CMP] maxdiff=%.6f\n", maxdiff);
-              gpuFree(scalar_y);
-          }
-        }
-
         return 1;
     }
 
