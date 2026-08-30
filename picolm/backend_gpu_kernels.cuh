@@ -249,8 +249,8 @@ __global__ void picolm_gpu_attention_prefill_warpgrp_kernel( float *xb_out,  con
  * (see backend_gpu_common.cuh). Not bit-exact -- see kernel comment in
  * backend_gpu_kernels.cu. Declared unconditionally here so host dispatch
  * code compiles on all platforms; guard the *call site*, not this
- * declaration, with #ifdef FAST_FP16_AVAILABLE. */
-#ifdef FAST_FP16_AVAILABLE
+ * declaration, with #ifdef GPU_FP16_DOT2_AVAILABLE. */
+#ifdef GPU_FP16_DOT2_AVAILABLE
 __global__ void picolm_gpu_attention_prefill_warpgrp_dot2_kernel( float *xb_out,  const float *q_dev,  const uint16_t *kv_k,  const uint16_t *kv_v,  int layer_ordinal, int start_pos, int n_tokens, int n_heads, int n_kv_heads, int head_dim, int max_seq_len, size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, int tile_q);
 #endif
 

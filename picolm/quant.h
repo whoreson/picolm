@@ -147,7 +147,11 @@ static inline void f32x4_to_fp16_hw(uint16_t *p, float32x4_t v) {
 #if !defined(PICOLM_AVX512) && !defined(PICOLM_AVX2) && !defined(PICOLM_AVX) && \
     !defined(PICOLM_SSE3) && !defined(PICOLM_SSSE3) && !defined(PICOLM_SSE2) && \
     !defined(PICOLM_NEON) && !defined(PICOLM_ALTIVEC)
+#ifdef _MSC_VER
+#  pragma message("PICOLM: no SIMD detected (AVX/AVX2/AVX512/SSE/NEON/Altivec). Scalar fallback active. Use -march=native for best performance.")
+#else
 #  warning "PICOLM: no SIMD detected (AVX/AVX2/AVX512/SSE/NEON/Altivec). Scalar fallback active. Use -march=native for best performance."
+#endif
 #endif
 
 /* Include x86 SIMD header once for any x86 SIMD level.

@@ -1929,7 +1929,6 @@ static void mm_id_gate_expert_task(int idx, void *ctxp) {
     }
     } /* end if (c->type == GGUF_TYPE_Q8_0) */
     if (c->type == GGUF_TYPE_Q8_0) return;
-    scalar_gateup:
     /* For non-Q8_0 weights, dequantize each row to float once, then
      * compute dot products with Q8_0 activations. AVX-512 batch4 path
      * keeps the weight row resident while processing 4 tokens at a time. */

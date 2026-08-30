@@ -482,25 +482,31 @@ HUNGER_MSVC_VER   ?= 14.44.35207
 HUNGER_CL_DIR = $(HUNGER_VS_ROOT)/VC/Tools/MSVC/$(HUNGER_MSVC_VER)/bin/Hostx64/x64
 HUNGER_CL = "$(HUNGER_CL_DIR)/cl.exe"
 HUNGER_LNK = "$(HUNGER_CL_DIR)/link.exe"
-HUNGER_CFILES = picolm.c model_core.c model_attention.c model_moe.c model_gemma3n.c model_ssm.c model_kv_cache.c model_gguf.c tensor.c quant.c tokenizer.c qwen_tokenize.c sampler.c grammar.c cJSON.c server.c csafetensors.c json.c safetensors.c
+HUNGER_CFILES = $(SRCS)
 HUNGER_COBJS = $(HUNGER_CFILES:.c=.obj)
 HUNGER_CUOBS = backend_gpu_kernels_win.obj backend_gpu_host_core_win.obj backend_gpu_host_ssm_win.obj backend_gpu_host_misc_win.obj
 # cl.exe flags - all Make vars, NO batch %VAR% references
-HUNGER_CF = /O2 /W3 /wd4996 /arch:AVX512 /D PICOLM_GPU=1 /D PICOLM_CUDA=1 /D _CRT_SECURE_NO_WARNINGS /I. /I"$(HUNGER_CUDA_ROOT)/include" /openmp /c
+# MSVC /arch:AVX512 enables the codegen but the C code relies on PICOLM_*
+# preprocessor macros for SIMD dispatch. These are not auto-derived by
+# quant.h on MSVC (detection chain is GCC/Clang-centric), so we define
+# them explicitly here. Cascade: AVX512 implies AVX2 implies AVX etc.
+HUNGER_SIMD = /D PICOLM_AVX512=1 /D PICOLM_AVX2=1 /D PICOLM_AVX=1 /D PICOLM_SSE3=1 /D PICOLM_SSE2=1 /D PICOLM_FMA=1
+HUNGER_WD = /wd4996 /wd4244 /wd4267 /wd4101 /wd4102 /wd4090 /wd4018 /wd4477
+HUNGER_CF = /O2 /W3 $(HUNGER_WD) /arch:AVX512 /D PICOLM_GPU=1 /D PICOLM_CUDA=1 /D _CRT_SECURE_NO_WARNINGS /I. /I"$(HUNGER_CUDA_ROOT)/include" /openmp /c $(HUNGER_SIMD)
 # hunger-nogpu: same as hunger but without GPU backend (pure MSVC, no nvcc, no cudart)
-HUNGER_CF_NOGPU = /O2 /W3 /wd4996 /arch:AVX512 /D _CRT_SECURE_NO_WARNINGS /I. /openmp /c
+HUNGER_CF_NOGPU = /O2 /W3 $(HUNGER_WD) /arch:AVX512 /D _CRT_SECURE_NO_WARNINGS /I. /openmp /c $(HUNGER_SIMD)
 
 hunger:
 	echo @echo off > .hunger_build.bat
 	echo del /q picolm.exe $(HUNGER_CUOBS) $(HUNGER_COBJS) 2^>nul >> .hunger_build.bat
 	echo call "$(HUNGER_VS_ROOT)/VC/Auxiliary/Build/vcvars64.bat" >> .hunger_build.bat
-	echo "$(HUNGER_CUDA_ROOT)/bin/nvcc.exe" -O3 --fmad=false -std=c++14 -DPICOLM_GPU=1 -DPICOLM_CUDA=1 -DPICOLM_SSM_WARP_KERNEL_VALIDATED -DPICOLM_SSM_CHUNKED_GPU_VALIDATED -ccbin $(HUNGER_CL) -Xcompiler "/EHsc /O2 /W3 /std:c++14 /arch:AVX512" -gencode arch=compute_89,code=$(HUNGER_CUDA_ARCH) -c -o backend_gpu_kernels_win.obj backend_gpu_kernels.cu -I. >> .hunger_build.bat
+	echo "$(HUNGER_CUDA_ROOT)/bin/nvcc.exe" -O3 --fmad=false -std=c++14 -DPICOLM_GPU=1 -DPICOLM_CUDA=1 -DPICOLM_SSM_WARP_KERNEL_VALIDATED -DPICOLM_SSM_CHUNKED_GPU_VALIDATED -ccbin $(HUNGER_CL) -Xcompiler "/EHsc /O2 /W3 /std:c++14 /arch:AVX512 /wd4244 /wd4267 /wd4101 /wd4102 /DPICOLM_AVX512=1 /DPICOLM_AVX2=1 /DPICOLM_AVX=1 /DPICOLM_SSE3=1 /DPICOLM_SSE2=1 /DPICOLM_FMA=1" -gencode arch=compute_89,code=$(HUNGER_CUDA_ARCH) -c -o backend_gpu_kernels_win.obj backend_gpu_kernels.cu -I. >> .hunger_build.bat
 	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo "$(HUNGER_CUDA_ROOT)/bin/nvcc.exe" -O3 --fmad=false -std=c++14 -DPICOLM_GPU=1 -DPICOLM_CUDA=1 -DPICOLM_SSM_WARP_KERNEL_VALIDATED -DPICOLM_SSM_CHUNKED_GPU_VALIDATED -ccbin $(HUNGER_CL) -Xcompiler "/EHsc /O2 /W3 /std:c++14 /arch:AVX512" -gencode arch=compute_89,code=$(HUNGER_CUDA_ARCH) -c -o backend_gpu_host_core_win.obj backend_gpu_host_core.cu -I. >> .hunger_build.bat
+	echo "$(HUNGER_CUDA_ROOT)/bin/nvcc.exe" -O3 --fmad=false -std=c++14 -DPICOLM_GPU=1 -DPICOLM_CUDA=1 -DPICOLM_SSM_WARP_KERNEL_VALIDATED -DPICOLM_SSM_CHUNKED_GPU_VALIDATED -ccbin $(HUNGER_CL) -Xcompiler "/EHsc /O2 /W3 /std:c++14 /arch:AVX512 /wd4244 /wd4267 /wd4101 /wd4102 /DPICOLM_AVX512=1 /DPICOLM_AVX2=1 /DPICOLM_AVX=1 /DPICOLM_SSE3=1 /DPICOLM_SSE2=1 /DPICOLM_FMA=1" -gencode arch=compute_89,code=$(HUNGER_CUDA_ARCH) -c -o backend_gpu_host_core_win.obj backend_gpu_host_core.cu -I. >> .hunger_build.bat
 	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo "$(HUNGER_CUDA_ROOT)/bin/nvcc.exe" -O3 --fmad=false -std=c++14 -DPICOLM_GPU=1 -DPICOLM_CUDA=1 -DPICOLM_SSM_WARP_KERNEL_VALIDATED -DPICOLM_SSM_CHUNKED_GPU_VALIDATED -ccbin $(HUNGER_CL) -Xcompiler "/EHsc /O2 /W3 /std:c++14 /arch:AVX512" -gencode arch=compute_89,code=$(HUNGER_CUDA_ARCH) -c -o backend_gpu_host_ssm_win.obj backend_gpu_host_ssm.cu -I. >> .hunger_build.bat
+	echo "$(HUNGER_CUDA_ROOT)/bin/nvcc.exe" -O3 --fmad=false -std=c++14 -DPICOLM_GPU=1 -DPICOLM_CUDA=1 -DPICOLM_SSM_WARP_KERNEL_VALIDATED -DPICOLM_SSM_CHUNKED_GPU_VALIDATED -ccbin $(HUNGER_CL) -Xcompiler "/EHsc /O2 /W3 /std:c++14 /arch:AVX512 /wd4244 /wd4267 /wd4101 /wd4102 /DPICOLM_AVX512=1 /DPICOLM_AVX2=1 /DPICOLM_AVX=1 /DPICOLM_SSE3=1 /DPICOLM_SSE2=1 /DPICOLM_FMA=1" -gencode arch=compute_89,code=$(HUNGER_CUDA_ARCH) -c -o backend_gpu_host_ssm_win.obj backend_gpu_host_ssm.cu -I. >> .hunger_build.bat
 	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo "$(HUNGER_CUDA_ROOT)/bin/nvcc.exe" -O3 --fmad=false -std=c++14 -DPICOLM_GPU=1 -DPICOLM_CUDA=1 -DPICOLM_SSM_WARP_KERNEL_VALIDATED -DPICOLM_SSM_CHUNKED_GPU_VALIDATED -ccbin $(HUNGER_CL) -Xcompiler "/EHsc /O2 /W3 /std:c++14 /arch:AVX512" -gencode arch=compute_89,code=$(HUNGER_CUDA_ARCH) -c -o backend_gpu_host_misc_win.obj backend_gpu_host_misc.cu -I. >> .hunger_build.bat
+	echo "$(HUNGER_CUDA_ROOT)/bin/nvcc.exe" -O3 --fmad=false -std=c++14 -DPICOLM_GPU=1 -DPICOLM_CUDA=1 -DPICOLM_SSM_WARP_KERNEL_VALIDATED -DPICOLM_SSM_CHUNKED_GPU_VALIDATED -ccbin $(HUNGER_CL) -Xcompiler "/EHsc /O2 /W3 /std:c++14 /arch:AVX512 /wd4244 /wd4267 /wd4101 /wd4102 /DPICOLM_AVX512=1 /DPICOLM_AVX2=1 /DPICOLM_AVX=1 /DPICOLM_SSE3=1 /DPICOLM_SSE2=1 /DPICOLM_FMA=1" -gencode arch=compute_89,code=$(HUNGER_CUDA_ARCH) -c -o backend_gpu_host_misc_win.obj backend_gpu_host_misc.cu -I. >> .hunger_build.bat
 	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
 	echo $(HUNGER_CL) $(HUNGER_CF) picolm.c >> .hunger_build.bat
 	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
@@ -521,6 +527,8 @@ hunger:
 	echo $(HUNGER_CL) $(HUNGER_CF) tensor.c >> .hunger_build.bat
 	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
 	echo $(HUNGER_CL) $(HUNGER_CF) quant.c >> .hunger_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF) sgemm.c >> .hunger_build.bat
 	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
 	echo $(HUNGER_CL) $(HUNGER_CF) tokenizer.c >> .hunger_build.bat
 	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
@@ -576,6 +584,8 @@ hunger-nogpu:
 	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
 	echo $(HUNGER_CL) $(HUNGER_CF_NOGPU) quant.c >> .hunger_nogpu_build.bat
 	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF_NOGPU) sgemm.c >> .hunger_nogpu_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
 	echo $(HUNGER_CL) $(HUNGER_CF_NOGPU) tokenizer.c >> .hunger_nogpu_build.bat
 	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
 	echo $(HUNGER_CL) $(HUNGER_CF_NOGPU) qwen_tokenize.c >> .hunger_nogpu_build.bat
@@ -608,7 +618,7 @@ hunger-nogpu:
 DJGPP_CC   = /data4/work/djgpp-build/djgpp-toolchain/bin/i586-pc-msdosdjgpp-gcc
 DJGPP_CFLAGS = -Os -std=c11 -DPICOLM_DOS=1 -Wall
 DJGPP_SRCS = picolm.c $(MODEL_SRCS) tensor.c quant.c tokenizer.c qwen_tokenize.c \
-             sampler.c grammar.c cJSON.c csafetensors.c json.c safetensors.c
+	sampler.c grammar.c cJSON.c csafetensors.c json.c safetensors.c sgemm.c
 DJGPP_OBJS = $(DJGPP_SRCS:.c=.o.dos)
 DJGPP_RUNTIME = /data4/work/djgpp-build/djgpp-runtime
 

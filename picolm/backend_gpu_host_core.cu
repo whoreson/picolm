@@ -222,20 +222,6 @@ void picolm_gpu_shutdown(void) {
     g_nctx = 0;
 }
 
-/* Detect if we're on a unified memory SoC (Grace-Blackwell, Apple Silicon, etc.) */
-static PICOLM_UNUSED int is_unified_memory(void) {
-#ifdef __HIP__
-    return 0; /* HIP: treat as discrete GPU (conservative) */
-#else
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 0);
-    /* On Grace-Blackwell, unifiedAddressing is true and the device has no
-     * separate PCIe link width (it's chip-to-chip). Check for integrated
-     * memory by looking at the bus type. */
-    return prop.unifiedAddressing && prop.l2CacheSize > 0;
-#endif
-}
-
 extern "C"
 int picolm_gpu_device_count(void) { return g_nctx; }
 
@@ -345,7 +331,6 @@ int picolm_gpu_tensor_upload(void **tensor,
     if (qtype == 10 || qtype == 11 || qtype == 12 || qtype == 13 || qtype == 14) {
         /* Fallback for K-quantized types when native path unavailable:
          * dequant to F32, requant to Q8_0 */
-        size_t f32_bytes = (size_t)I * (size_t)O * sizeof(float);
         float *f32_buf = (float *)calloc(I * O, sizeof(float));
         if (!f32_buf) { gpuFree(t->weights); free(t); return 0; }
 
@@ -742,7 +727,7 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
     }
 
     /* Q1_0 x Q8_0 IMMA path (host) */
-    if (0 && t->qtype == GGUF_TYPE_Q1_0 && ctx->has_imma && S >= 16 && O >= 8) { /* UNTESTED */
+    if (t->qtype == GGUF_TYPE_Q1_0 && ctx->has_imma && S >= 16 && O >= 8) {
         int n_blocks = I / 32;
         if (n_blocks < 1 || I % 32 != 0) return 0;
         if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
@@ -1138,8 +1123,8 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
         return 1;
     }
 
-    /* Q1_0 x Q8_0 IMMA path (device) -- UNTESTED, disabled */
-    if (0 && t->qtype == GGUF_TYPE_Q1_0 && ctx->has_imma && S >= 16 && O >= 8) {
+    /* Q1_0 x Q8_0 IMMA path (device) */
+    if (t->qtype == GGUF_TYPE_Q1_0 && ctx->has_imma && S >= 16 && O >= 8) {
         int n_blocks = I / 32;
         if (n_blocks < 1 || I % 32 != 0) return 0;
         int S_padded = (S + 15) & ~15;
@@ -1361,7 +1346,6 @@ int picolm_gpu_matmul_logits(picolm_gpu_tensor_t *t, float *logits_dev,
     if (!select_ctx(ctx)) return 0;
 
     int I = t->I, O = t->O;
-    int S = 1;
 
     if (t->qtype == GGUF_TYPE_Q8_0) {
         int n_blocks = I / 32;

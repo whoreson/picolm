@@ -64,10 +64,10 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
         for (int64_t bi=0;bi<BM*RM;bi+=RM) {
             int64_t ii=iib+bi;
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
-                F32_V Cv[RN][RM];
+                F32_V Cv[F32_RN][F32_RM];
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=F32_ZERO;
                 for (int64_t l=0;l<k;l+=KN) {
-                    F32_V Av[RM];
+                    F32_V Av[F32_RM];
                     for(int c=0;c<RM;c++) Av[c]=F32_LDA(A+lda*(ii+c)+l);
                     for(int r=0;r<RN;r++) { F32_V Bv=F32_LDB(B+ldb*(jj+r)+l);
                         for(int c=0;c<RM;c++) Cv[r][c]=F32_MADD(Av[c],Bv,Cv[r][c]); }
@@ -75,7 +75,7 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) C[ldc*(jj+r)+(ii+c)]=F32_HSUM(Cv[r][c]);
             }
             for (int64_t jj=jj1;jj<jj2;jj++) {
-                F32_V Cv[RM];
+                F32_V Cv[F32_RM];
                 for(int c=0;c<RM;c++) Cv[c]=F32_ZERO;
                 for (int64_t l=0;l<k;l+=KN)
                     for(int c=0;c<RM;c++) Cv[c]=F32_MADD(F32_LDA(A+lda*(ii+c)+l),F32_LDB(B+ldb*jj+l),Cv[c]);
@@ -95,18 +95,6 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
 #undef F32_MADD
 #undef F32_HSUM
 
-#elif (defined(__AVX__) || defined(__AVX2__)) && defined(__FMA__)
-
-#define F32_KN 8
-#define F32_RM 4
-#define F32_RN 3
-#define F32_BN 24
-#define F32_V __m256
-#define F32_ZERO _mm256_setzero_ps()
-#define F32_LDA(p) _mm256_loadu_ps(p)
-#define F32_LDB(p) _mm256_loadu_ps(p)
-#define F32_MADD(a,b,c) _mm256_fmadd_ps(a,b,c)
-
 #elif defined(__AVX__) || defined(__AVX2__)
 
 #define F32_KN 8
@@ -117,7 +105,11 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
 #define F32_ZERO _mm256_setzero_ps()
 #define F32_LDA(p) _mm256_loadu_ps(p)
 #define F32_LDB(p) _mm256_loadu_ps(p)
+#ifdef __FMA__
+#define F32_MADD(a,b,c) _mm256_fmadd_ps(a,b,c)
+#else
 #define F32_MADD(a,b,c) _mm256_add_ps(_mm256_mul_ps(a,b),c)
+#endif
 
 static float f32_hsum(F32_V x) {
     __m128 s=_mm_add_ps(_mm256_castps256_ps128(x),_mm256_extractf128_ps(x,1));
@@ -142,10 +134,10 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
         for (int64_t bi=0;bi<BM*RM;bi+=RM) {
             int64_t ii=iib+bi;
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
-                F32_V Cv[RN][RM];
+                F32_V Cv[F32_RN][F32_RM];
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=F32_ZERO;
                 for (int64_t l=0;l<k;l+=KN) {
-                    F32_V Av[RM];
+                    F32_V Av[F32_RM];
                     for(int c=0;c<RM;c++) Av[c]=F32_LDA(A+lda*(ii+c)+l);
                     for(int r=0;r<RN;r++) { F32_V Bv=F32_LDB(B+ldb*(jj+r)+l);
                         for(int c=0;c<RM;c++) Cv[r][c]=F32_MADD(Av[c],Bv,Cv[r][c]); }
@@ -153,7 +145,7 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) C[ldc*(jj+r)+(ii+c)]=F32_HSUM(Cv[r][c]);
             }
             for (int64_t jj=jj1;jj<jj2;jj++) {
-                F32_V Cv[RM];
+                F32_V Cv[F32_RM];
                 for(int c=0;c<RM;c++) Cv[c]=F32_ZERO;
                 for (int64_t l=0;l<k;l+=KN)
                     for(int c=0;c<RM;c++) Cv[c]=F32_MADD(F32_LDA(A+lda*(ii+c)+l),F32_LDB(B+ldb*jj+l),Cv[c]);
@@ -162,6 +154,9 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
         }
     }
 }
+#undef F32_HSUM
+#undef f32_hsum
+
 #undef F32_KN
 #undef F32_RM
 #undef F32_RN
@@ -171,8 +166,6 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
 #undef F32_LDA
 #undef F32_LDB
 #undef F32_MADD
-#undef F32_HSUM
-#undef f32_hsum
 
 #elif defined(__SSE__)
 
@@ -209,10 +202,10 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
         for (int64_t bi=0;bi<BM*RM;bi+=RM) {
             int64_t ii=iib+bi;
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
-                F32_V Cv[RN][RM];
+                F32_V Cv[F32_RN][F32_RM];
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=F32_ZERO;
                 for (int64_t l=0;l<k;l+=KN) {
-                    F32_V Av[RM];
+                    F32_V Av[F32_RM];
                     for(int c=0;c<RM;c++) Av[c]=F32_LDA(A+lda*(ii+c)+l);
                     for(int r=0;r<RN;r++) { F32_V Bv=F32_LDB(B+ldb*(jj+r)+l);
                         for(int c=0;c<RM;c++) Cv[r][c]=F32_MADD(Av[c],Bv,Cv[r][c]); }
@@ -220,7 +213,7 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) C[ldc*(jj+r)+(ii+c)]=F32_HSUM(Cv[r][c]);
             }
             for (int64_t jj=jj1;jj<jj2;jj++) {
-                F32_V Cv[RM];
+                F32_V Cv[F32_RM];
                 for(int c=0;c<RM;c++) Cv[c]=F32_ZERO;
                 for (int64_t l=0;l<k;l+=KN)
                     for(int c=0;c<RM;c++) Cv[c]=F32_MADD(F32_LDA(A+lda*(ii+c)+l),F32_LDB(B+ldb*jj+l),Cv[c]);
@@ -270,10 +263,10 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
         for (int64_t bi=0;bi<BM*RM;bi+=RM) {
             int64_t ii=iib+bi;
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
-                F32_V Cv[RN][RM];
+                F32_V Cv[F32_RN][F32_RM];
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=F32_ZERO;
                 for (int64_t l=0;l<k;l+=KN) {
-                    F32_V Av[RM];
+                    F32_V Av[F32_RM];
                     for(int c=0;c<RM;c++) Av[c]=F32_LDA(A+lda*(ii+c)+l);
                     for(int r=0;r<RN;r++) { F32_V Bv=F32_LDB(B+ldb*(jj+r)+l);
                         for(int c=0;c<RM;c++) Cv[r][c]=F32_MADD(Cv[r][c],Av[c],Bv); }
@@ -281,7 +274,7 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) C[ldc*(jj+r)+(ii+c)]=F32_HSUM(Cv[r][c]);
             }
             for (int64_t jj=jj1;jj<jj2;jj++) {
-                F32_V Cv[RM];
+                F32_V Cv[F32_RM];
                 for(int c=0;c<RM;c++) Cv[c]=F32_ZERO;
                 for (int64_t l=0;l<k;l+=KN)
                     for(int c=0;c<RM;c++) Cv[c]=F32_MADD(Cv[c],F32_LDA(A+lda*(ii+c)+l),F32_LDB(B+ldb*jj+l));
@@ -333,10 +326,10 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
         for (int64_t bi=0;bi<BM*RM;bi+=RM) {
             int64_t ii=iib+bi;
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
-                v4sf Cv[RN][RM];
+                v4sf Cv[F32_RN][F32_RM];
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=z;
                 for (int64_t l=0;l<k;l+=KN) {
-                    v4sf Av[RM];
+                    v4sf Av[F32_RM];
                     for(int c=0;c<RM;c++) Av[c]=vec_ld(0,A+lda*(ii+c)+l);
                     for(int r=0;r<RN;r++) { v4sf Bv=vec_ld(0,B+ldb*(jj+r)+l);
                         for(int c=0;c<RM;c++) Cv[r][c]=vec_madd(Av[c],Bv,Cv[r][c]); }
@@ -347,7 +340,7 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
                     C[ldc*(jj+r)+(ii+c)]=vec_extract(s,0); }
             }
             for (int64_t jj=jj1;jj<jj2;jj++) {
-                v4sf Cv[RM];
+                v4sf Cv[F32_RM];
                 for(int c=0;c<RM;c++) Cv[c]=z;
                 for (int64_t l=0;l<k;l+=KN)
                     for(int c=0;c<RM;c++) Cv[c]=vec_madd(vec_ld(0,A+lda*(ii+c)+l),vec_ld(0,B+ldb*jj+l),Cv[c]);
@@ -391,11 +384,11 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
         for (int64_t bi=0;bi<BM*RM;bi+=RM) {
             int64_t ii=iib+bi;
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
-                vfloat32m4_t Cv[RN][RM];
+                vfloat32m4_t Cv[F32_RN][F32_RM];
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=__riscv_vfmv_v_f_f32m4(0,vlmax);
                 for (int64_t l=0;l<k;l+=vlmax) {
                     vlen_t vl=__riscv_vsetvl_e32m4(vlmax);
-                    vfloat32m4_t Av[RM];
+                    vfloat32m4_t Av[F32_RM];
                     for(int c=0;c<RM;c++) Av[c]=__riscv_vle32_v_f32m4(A+lda*(ii+c)+l,vl);
                     for(int r=0;r<RN;r++) {
                         vfloat32m4_t Bv=__riscv_vle32_v_f32m4(B+ldb*(jj+r)+l,vl);
@@ -406,7 +399,7 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
                     C[ldc*(jj+r)+(ii+c)]=__riscv_vfmv_f_s_f32(__riscv_vfredusum_vs_f32m4_f32(Cv[r][c],__riscv_vfmv_v_f_f32(0,vlmax),vlmax));
             }
             for (int64_t jj=jj1;jj<jj2;jj++) {
-                vfloat32m4_t Cv[RM];
+                vfloat32m4_t Cv[F32_RM];
                 for(int c=0;c<RM;c++) Cv[c]=__riscv_vfmv_v_f_f32m4(0,vlmax);
                 for (int64_t l=0;l<k;l+=vlmax) {
                     vlen_t vl=__riscv_vsetvl_e32m4(vlmax);
@@ -434,6 +427,10 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
 static void sgemm_f16_f32(int m, int n, int k, const uint16_t *A, int lda,
                            const float *B, int ldb, float *C, int ldc,
                            int ith, int nth) {
+#define SGEMM_KN 16
+#define SGEMM_RM 4
+#define SGEMM_RN 6
+#define SGEMM_BN 12
     const int64_t KN=16, RM=4, RN=6, BN=12;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
@@ -447,10 +444,10 @@ static void sgemm_f16_f32(int m, int n, int k, const uint16_t *A, int lda,
         for (int64_t bi=0;bi<BM*RM;bi+=RM) {
             int64_t ii=iib+bi;
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
-                __m512 Cv[RN][RM];
+                __m512 Cv[SGEMM_RN][SGEMM_RM];
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=_mm512_setzero_ps();
                 for (int64_t l=0;l<k;l+=KN) {
-                    __m512 Av[RM];
+                    __m512 Av[SGEMM_RM];
                     for(int c=0;c<RM;c++) Av[c]=_mm512_cvtph_ps(_mm256_loadu_si256((__m256i*)(A+lda*(ii+c)+l)));
                     for(int r=0;r<RN;r++) { __m512 Bv=_mm512_loadu_ps(B+ldb*(jj+r)+l);
                         for(int c=0;c<RM;c++) Cv[r][c]=_mm512_fmadd_ps(Av[c],Bv,Cv[r][c]); }
@@ -458,7 +455,7 @@ static void sgemm_f16_f32(int m, int n, int k, const uint16_t *A, int lda,
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) C[ldc*(jj+r)+(ii+c)]=_mm512_reduce_add_ps(Cv[r][c]);
             }
             for (int64_t jj=jj1;jj<jj2;jj++) {
-                __m512 Cv[RM];
+                __m512 Cv[SGEMM_RM];
                 for(int c=0;c<RM;c++) Cv[c]=_mm512_setzero_ps();
                 for (int64_t l=0;l<k;l+=KN)
                     for(int c=0;c<RM;c++) Cv[c]=_mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256((__m256i*)(A+lda*(ii+c)+l))),_mm512_loadu_ps(B+ldb*jj+l),Cv[c]);
@@ -478,6 +475,10 @@ static void sgemm_f16_f32(int m, int n, int k, const uint16_t *A, int lda,
 static void sgemm_f16_f32(int m, int n, int k, const uint16_t *A, int lda,
                            const float *B, int ldb, float *C, int ldc,
                            int ith, int nth) {
+#define SGEMM_KN 8
+#define SGEMM_RM 4
+#define SGEMM_RN 3
+#define SGEMM_BN 24
     const int64_t KN=8, RM=4, RN=3, BN=24;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
@@ -491,10 +492,10 @@ static void sgemm_f16_f32(int m, int n, int k, const uint16_t *A, int lda,
         for (int64_t bi=0;bi<BM*RM;bi+=RM) {
             int64_t ii=iib+bi;
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
-                __m256 Cv[RN][RM];
+                __m256 Cv[SGEMM_RN][SGEMM_RM];
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=_mm256_setzero_ps();
                 for (int64_t l=0;l<k;l+=KN) {
-                    __m256 Av[RM];
+                    __m256 Av[SGEMM_RM];
                     for(int c=0;c<RM;c++) Av[c]=_mm256_cvtph_ps(_mm_loadu_si128((__m128i*)(A+lda*(ii+c)+l)));
                     for(int r=0;r<RN;r++) { __m256 Bv=_mm256_loadu_ps(B+ldb*(jj+r)+l);
                         for(int c=0;c<RM;c++) Cv[r][c]=SGEMM_FMA(Av[c],Bv,Cv[r][c]); }
@@ -507,7 +508,7 @@ static void sgemm_f16_f32(int m, int n, int k, const uint16_t *A, int lda,
                     C[ldc*(jj+r)+(ii+c)]=_mm_cvtss_f32(lo); }
             }
             for (int64_t jj=jj1;jj<jj2;jj++) {
-                __m256 Cv[RM];
+                __m256 Cv[SGEMM_RM];
                 for(int c=0;c<RM;c++) Cv[c]=_mm256_setzero_ps();
                 for (int64_t l=0;l<k;l+=KN)
                     for(int c=0;c<RM;c++) Cv[c]=SGEMM_FMA(_mm256_cvtph_ps(_mm_loadu_si128((__m128i*)(A+lda*(ii+c)+l))),_mm256_loadu_ps(B+ldb*jj+l),Cv[c]);
@@ -527,6 +528,10 @@ static void sgemm_f16_f32(int m, int n, int k, const uint16_t *A, int lda,
 static void sgemm_f16_f32(int m, int n, int k, const uint16_t *A, int lda,
                            const float *B, int ldb, float *C, int ldc,
                            int ith, int nth) {
+#define SGEMM_KN 4
+#define SGEMM_RM 4
+#define SGEMM_RN 6
+#define SGEMM_BN 12
     const int64_t KN=4, RM=4, RN=6, BN=12;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
@@ -540,10 +545,10 @@ static void sgemm_f16_f32(int m, int n, int k, const uint16_t *A, int lda,
         for (int64_t bi=0;bi<BM*RM;bi+=RM) {
             int64_t ii=iib+bi;
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
-                float32x4_t Cv[RN][RM];
+                float32x4_t Cv[SGEMM_RN][SGEMM_RM];
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=vdupq_n_f32(0);
                 for (int64_t l=0;l<k;l+=KN) {
-                    float32x4_t Av[RM];
+                    float32x4_t Av[SGEMM_RM];
                     for(int c=0;c<RM;c++) Av[c]=vcvt_f32_f16(vld1_f16((const float16_t*)(A+lda*(ii+c)+l)));
                     for(int r=0;r<RN;r++) { float32x4_t Bv=vld1q_f32(B+ldb*(jj+r)+l);
                         for(int c=0;c<RM;c++) Cv[r][c]=vfmaq_f32(Cv[r][c],Av[c],Bv); }
@@ -551,7 +556,7 @@ static void sgemm_f16_f32(int m, int n, int k, const uint16_t *A, int lda,
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) C[ldc*(jj+r)+(ii+c)]=vaddvq_f32(Cv[r][c]);
             }
             for (int64_t jj=jj1;jj<jj2;jj++) {
-                float32x4_t Cv[RM];
+                float32x4_t Cv[SGEMM_RM];
                 for(int c=0;c<RM;c++) Cv[c]=vdupq_n_f32(0);
                 for (int64_t l=0;l<k;l+=KN)
                     for(int c=0;c<RM;c++) Cv[c]=vfmaq_f32(Cv[c],vcvt_f32_f16(vld1_f16((const float16_t*)(A+lda*(ii+c)+l))),vld1q_f32(B+ldb*jj+l));
@@ -570,6 +575,10 @@ static void sgemm_f16_f32(int m, int n, int k, const uint16_t *A, int lda,
 static void sgemm_f16_f16(int m, int n, int k, const uint16_t *A, int lda,
                            const uint16_t *B, int ldb, float *C, int ldc,
                            int ith, int nth) {
+#define SGEMM_KN 16
+#define SGEMM_RM 4
+#define SGEMM_RN 6
+#define SGEMM_BN 12
     const int64_t KN=16, RM=4, RN=6, BN=12;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
@@ -583,10 +592,10 @@ static void sgemm_f16_f16(int m, int n, int k, const uint16_t *A, int lda,
         for (int64_t bi=0;bi<BM*RM;bi+=RM) {
             int64_t ii=iib+bi;
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
-                __m512 Cv[RN][RM];
+                __m512 Cv[SGEMM_RN][SGEMM_RM];
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=_mm512_setzero_ps();
                 for (int64_t l=0;l<k;l+=KN) {
-                    __m512 Av[RM];
+                    __m512 Av[SGEMM_RM];
                     for(int c=0;c<RM;c++) Av[c]=_mm512_cvtph_ps(_mm256_loadu_si256((__m256i*)(A+lda*(ii+c)+l)));
                     for(int r=0;r<RN;r++) { __m512 Bv=_mm512_cvtph_ps(_mm256_loadu_si256((__m256i*)(B+ldb*(jj+r)+l)));
                         for(int c=0;c<RM;c++) Cv[r][c]=_mm512_fmadd_ps(Av[c],Bv,Cv[r][c]); }
@@ -594,7 +603,7 @@ static void sgemm_f16_f16(int m, int n, int k, const uint16_t *A, int lda,
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) C[ldc*(jj+r)+(ii+c)]=_mm512_reduce_add_ps(Cv[r][c]);
             }
             for (int64_t jj=jj1;jj<jj2;jj++) {
-                __m512 Cv[RM];
+                __m512 Cv[SGEMM_RM];
                 for(int c=0;c<RM;c++) Cv[c]=_mm512_setzero_ps();
                 for (int64_t l=0;l<k;l+=KN)
                     for(int c=0;c<RM;c++) Cv[c]=_mm512_fmadd_ps(_mm512_cvtph_ps(_mm256_loadu_si256((__m256i*)(A+lda*(ii+c)+l))),_mm512_cvtph_ps(_mm256_loadu_si256((__m256i*)(B+ldb*jj+l))),Cv[c]);
@@ -613,6 +622,10 @@ static void sgemm_f16_f16(int m, int n, int k, const uint16_t *A, int lda,
 static void sgemm_f16_f16(int m, int n, int k, const uint16_t *A, int lda,
                            const uint16_t *B, int ldb, float *C, int ldc,
                            int ith, int nth) {
+#define SGEMM_KN 8
+#define SGEMM_RM 4
+#define SGEMM_RN 3
+#define SGEMM_BN 24
     const int64_t KN=8, RM=4, RN=3, BN=24;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
@@ -626,10 +639,10 @@ static void sgemm_f16_f16(int m, int n, int k, const uint16_t *A, int lda,
         for (int64_t bi=0;bi<BM*RM;bi+=RM) {
             int64_t ii=iib+bi;
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
-                __m256 Cv[RN][RM];
+                __m256 Cv[SGEMM_RN][SGEMM_RM];
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=_mm256_setzero_ps();
                 for (int64_t l=0;l<k;l+=KN) {
-                    __m256 Av[RM];
+                    __m256 Av[SGEMM_RM];
                     for(int c=0;c<RM;c++) Av[c]=_mm256_cvtph_ps(_mm_loadu_si128((__m128i*)(A+lda*(ii+c)+l)));
                     for(int r=0;r<RN;r++) { __m256 Bv=_mm256_cvtph_ps(_mm_loadu_si128((__m128i*)(B+ldb*(jj+r)+l)));
                         for(int c=0;c<RM;c++) Cv[r][c]=SGEMM_FMA(Av[c],Bv,Cv[r][c]); }
@@ -642,7 +655,7 @@ static void sgemm_f16_f16(int m, int n, int k, const uint16_t *A, int lda,
                     C[ldc*(jj+r)+(ii+c)]=_mm_cvtss_f32(lo); }
             }
             for (int64_t jj=jj1;jj<jj2;jj++) {
-                __m256 Cv[RM];
+                __m256 Cv[SGEMM_RM];
                 for(int c=0;c<RM;c++) Cv[c]=_mm256_setzero_ps();
                 for (int64_t l=0;l<k;l+=KN)
                     for(int c=0;c<RM;c++) Cv[c]=SGEMM_FMA(_mm256_cvtph_ps(_mm_loadu_si128((__m128i*)(A+lda*(ii+c)+l))),_mm256_cvtph_ps(_mm_loadu_si128((__m128i*)(B+ldb*jj+l))),Cv[c]);
@@ -662,6 +675,10 @@ static void sgemm_f16_f16(int m, int n, int k, const uint16_t *A, int lda,
 static void sgemm_f16_f16(int m, int n, int k, const uint16_t *A, int lda,
                            const uint16_t *B, int ldb, float *C, int ldc,
                            int ith, int nth) {
+#define SGEMM_KN 8
+#define SGEMM_RM 4
+#define SGEMM_RN 6
+#define SGEMM_BN 12
     const int64_t KN=8, RM=4, RN=6, BN=12;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
@@ -675,10 +692,10 @@ static void sgemm_f16_f16(int m, int n, int k, const uint16_t *A, int lda,
         for (int64_t bi=0;bi<BM*RM;bi+=RM) {
             int64_t ii=iib+bi;
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
-                float32x4_t Cv[RN][RM];
+                float32x4_t Cv[SGEMM_RN][SGEMM_RM];
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=vdupq_n_f32(0);
                 for (int64_t l=0;l<k;l+=KN) {
-                    float16x8_t Av[RM];
+                    float16x8_t Av[SGEMM_RM];
                     for(int c=0;c<RM;c++) Av[c]=vld1q_f16((const float16_t*)(A+lda*(ii+c)+l));
                     for(int r=0;r<RN;r++) {
                         float16x8_t Bv=vld1q_f16((const float16_t*)(B+ldb*(jj+r)+l));
@@ -692,7 +709,7 @@ static void sgemm_f16_f16(int m, int n, int k, const uint16_t *A, int lda,
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) C[ldc*(jj+r)+(ii+c)]=vaddvq_f32(Cv[r][c]);
             }
             for (int64_t jj=jj1;jj<jj2;jj++) {
-                float32x4_t Cv[RM];
+                float32x4_t Cv[SGEMM_RM];
                 for(int c=0;c<RM;c++) Cv[c]=vdupq_n_f32(0);
                 for (int64_t l=0;l<k;l+=KN)
                     for(int c=0;c<RM;c++) {
