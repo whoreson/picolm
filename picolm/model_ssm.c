@@ -2066,7 +2066,7 @@ void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
 #ifdef PICOLM_GPU
         if (gpu_lw && ssm_vecdot_gpu_ready && m->gpu.ssm_alpha_dev[il] &&
             (!do_remap || ssm_vecdot_hmap_dev) &&
-            (alpha_type == GGUF_TYPE_F32 || alpha_type == GGUF_TYPE_Q4_0 || alpha_type == GGUF_TYPE_Q8_0) &&
+            (alpha_type == GGUF_TYPE_F32 || alpha_type == GGUF_TYPE_Q4_0 || alpha_type == GGUF_TYPE_Q8_0 || alpha_type == GGUF_TYPE_Q6_K) &&
             picolm_gpu_ssm_vecdot_dev(g_ssm_vecdot_out_dev, g_ssm_vecdot_x_dev,
                                        m->gpu.ssm_alpha_dev[il], alpha_type, dim,
                                        n_v_heads, (int)row_bytes, ssm_vecdot_hmap_dev,
@@ -2116,7 +2116,7 @@ void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
 #ifdef PICOLM_GPU
         if (gpu_lw && ssm_vecdot_gpu_ready && m->gpu.ssm_beta_dev[il] &&
             (!do_remap || ssm_vecdot_hmap_dev) &&
-            (beta_type == GGUF_TYPE_F32 || beta_type == GGUF_TYPE_Q4_0 || beta_type == GGUF_TYPE_Q8_0) &&
+            (beta_type == GGUF_TYPE_F32 || beta_type == GGUF_TYPE_Q4_0 || beta_type == GGUF_TYPE_Q8_0 || beta_type == GGUF_TYPE_Q6_K) &&
             picolm_gpu_ssm_vecdot_dev(g_ssm_vecdot_out_dev, g_ssm_vecdot_x_dev,
                                        m->gpu.ssm_beta_dev[il], beta_type, dim,
                                        n_v_heads, (int)row_bytes, ssm_vecdot_hmap_dev,
@@ -2803,8 +2803,8 @@ int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
     /* Alpha/beta vecdot (read from RMSNorm'd bffn_norm) */
     if(ok){gguf_type_t at=lw->type_ssm_alpha,bt=lw->type_ssm_beta;
       size_t ra=gguf_type_row_size(at,dim),rb=gguf_type_row_size(bt,dim);
-      if(at!=0&&at!=2&&at!=8&&at!=30&&at!=41){static int w1=0;if(!w1){fprintf(stderr,"WARN: ssm_prefill_layer_gpu bail: alpha type=%d (need F32/Q4_0/Q8_0/BF16/Q1_0)\n",(int)at);w1=1;}return 0;}
-      if(bt!=0&&bt!=2&&bt!=8&&bt!=30&&bt!=41){static int w2=0;if(!w2){fprintf(stderr,"WARN: ssm_prefill_layer_gpu bail: beta type=%d (need F32/Q4_0/Q8_0/BF16/Q1_0)\n",(int)bt);w2=1;}return 0;}
+      if(at!=0&&at!=2&&at!=8&&at!=14&&at!=30&&at!=41){static int w1=0;if(!w1){fprintf(stderr,"WARN: ssm_prefill_layer_gpu bail: alpha type=%d (need F32/Q4_0/Q8_0/Q6_K/BF16/Q1_0)\n",(int)at);w1=1;}return 0;}
+      if(bt!=0&&bt!=2&&bt!=8&&bt!=14&&bt!=30&&bt!=41){static int w2=0;if(!w2){fprintf(stderr,"WARN: ssm_prefill_layer_gpu bail: beta type=%d (need F32/Q4_0/Q8_0/Q6_K/BF16/Q1_0)\n",(int)bt);w2=1;}return 0;}
       if(!gl->ssm_alpha||!gl->ssm_beta){static int w3=0;if(!w3){fprintf(stderr,"WARN: ssm_prefill_layer_gpu bail: alpha/beta not uploaded to GPU\n");w3=1;}return 0;}
       const int *hm=do_remap&&gw->ssm_head_map_dev?(const int*)gw->ssm_head_map_dev:NULL;
       ok&=picolm_gpu_ssm_vecdot_batch_dev(bgate,bffn_norm,(void*)picolm_gpu_tensor_weights((picolm_gpu_tensor_t*)gl->ssm_alpha),at,dim,n_v,n_tokens,(int)ra,hm,dev,xb2_stride,xb2_stride);

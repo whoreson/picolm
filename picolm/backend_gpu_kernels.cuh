@@ -7,6 +7,7 @@
 
 __global__ void picolm_quant_matmul(float *y, const float *x, const void *weights, gguf_type_t qtype, int S, int I, int O, int row_bytes, int x_stride, int y_stride);
 __global__ void picolm_q6_q8_matmul_imma(float *y, const int8_t *xq, const float *xd, const void *weights, int S, int I, int O, int row_bytes, int y_stride);
+__global__ void picolm_q6_k_decode_warp(float *y, const float *x, const void *weights, int I, int O, int row_bytes);
 __global__ void picolm_q5_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd, const void *weights, int S, int I, int O, int row_bytes, int y_stride);
 __global__ void picolm_q4_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd, const void *weights, int S, int I, int O, int row_bytes, int y_stride);
 __global__ void picolm_q3_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd, const void *weights, int S, int I, int O, int row_bytes, int y_stride);
