@@ -665,9 +665,9 @@ picolm_q6_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
         int nibble = (g % 4) / 2;    // 0,0,1,1 for g=0,1,2,3
         int qh_pair = g % 4;
 
-        int ql_base = chunk * 64 + half * 32;  /* ql byte offset within Q6_K block */
-        int qh_base = chunk * 32;               /* qh byte offset within Q6_K block */
-        int qh_shift = qh_pair * 2;             /* bit shift for qh extraction */
+        int ql_base = chunk * 64 + half * 32;   /* ql byte offset within Q6_K block */
+        int qh_base = 128 + chunk * 32;          /* qh byte offset (128 = ql[128] end) */
+        int qh_shift = qh_pair * 2;              /* bit shift for qh extraction */
 
         /* A: activation fragments (Q8_0, identical to Q8_0 IMMA kernel) */
         int a0, a1, a2, a3;
