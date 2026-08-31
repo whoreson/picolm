@@ -1,0 +1,15 @@
+#!/bin/bash
+# Source this before `make hunger-msys-direct`
+# Sets all env vars needed for MSVC+nvcc build via MSYS2 bash (non-interactive SSH)
+export MSYSTEM=UCRT64
+export MINGW_PREFIX=/ucrt64
+export MINGW_CHOST=x86_64-w64-mingw32
+export MSYSTEM_CARCH=x86_64
+export MSYSTEM_CHOST=x86_64-w64-mingw32
+export MSYSTEM_PREFIX=/ucrt64
+export PATH="/c/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4/bin:/D/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64:/ucrt64/bin:/usr/local/bin:/usr/bin:/bin"
+export INCLUDE="/D/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.44.35207/include;/C/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/ucrt;/C/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/um;/C/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0/shared"
+export LIB="/D/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.44.35207/lib/x64;/C/Program Files (x86)/Windows Kits/10/Lib/10.0.26100.0/ucrt/x64;/C/Program Files (x86)/Windows Kits/10/Lib/10.0.26100.0/um/x64"
+export LIBPATH="/D/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.44.35207/lib/x64"
+export MSYS2_ARG_CONV_EXCL="*"
+

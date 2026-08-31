@@ -1,0 +1,20 @@
+***************
+*** 251,259 ****
+   * backend_gpu_kernels.cu. Declared unconditionally here so host dispatch
+   * code compiles on all platforms; guard the *call site*, not this
+   * declaration, with #ifdef GPU_FP16_DOT2_AVAILABLE. */
+- #ifdef GPU_FP16_DOT2_AVAILABLE
+- __global__ void picolm_gpu_attention_prefill_warpgrp_dot2_kernel( float *xb_out,  const float *q_dev,  const uint16_t *kv_k,  const uint16_t *kv_v,  int layer_ordinal, int start_pos, int n_tokens, int n_heads, int n_kv_heads, int head_dim, int max_seq_len, size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, int tile_q);
+- #endif
+  
+  /* FP16 Tensor Core Flash Attention 2 Prefill kernel.
+   * Uses mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 for Q@K scoring.
+--- 251,258 ----
+   * backend_gpu_kernels.cu. Declared unconditionally here so host dispatch
+   * code compiles on all platforms; guard the *call site*, not this
+   * declaration, with #ifdef GPU_FP16_DOT2_AVAILABLE. */
++ /* Always declare for cudafe stub generation (body is conditional). */
++ extern __global__ void picolm_gpu_attention_prefill_warpgrp_dot2_kernel( float *xb_out,  const float *q_dev,  const uint16_t *kv_k,  const uint16_t *kv_v,  int layer_ordinal, int start_pos, int n_tokens, int n_heads, int n_kv_heads, int head_dim, int max_seq_len, size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, int tile_q);
+  
+  /* FP16 Tensor Core Flash Attention 2 Prefill kernel.
+   * Uses mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 for Q@K scoring.
