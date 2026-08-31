@@ -152,6 +152,49 @@ __device__ static inline float dequant_q2_K(const void *blk, int i) {
     return d * (float)sc * (float)v - dmin * (float)mn;
 }
 
+/* Q3_K dequant: 256 values in 110 bytes.
+ * Layout: hmask[32] (offset 0), qs[64] (offset 32), scales[12] (offset 96), d(2) (offset 108).
+ * 16 sub-blocks of 16 values each, each with a 6-bit scale (packed via bit-interleaving).
+ * Value = d * (scale - 32) * (qs_2bit - (hmask_bit ? 0 : 4)).
+ * qs has 2-bit values with shifting (0,2,4,6 per group within 128-element chunk).
+ * hmask provides the high bit, cycling through bit positions (1,2,4,8). */
+__device__ static inline float dequant_q3_K(const void *blk, int i) {
+    const uint8_t *b = (const uint8_t *)blk;
+    uint16_t d_raw = b[108] | ((uint16_t)b[109] << 8);
+    float d = gpu_fp16_to_fp32(d_raw);
+
+    /* Unpack 16 scales from 12 bytes (same bit-interleaving as CPU) */
+    uint32_t aux[4];
+    aux[0] = b[96] | ((uint32_t)b[97] << 8) | ((uint32_t)b[98] << 16) | ((uint32_t)b[99] << 24);
+    aux[1] = b[100] | ((uint32_t)b[101] << 8) | ((uint32_t)b[102] << 16) | ((uint32_t)b[103] << 24);
+    aux[2] = b[104] | ((uint32_t)b[105] << 8) | ((uint32_t)b[106] << 16) | ((uint32_t)b[107] << 24);
+    aux[2] = ((aux[0] >> 4) & 0x0F0F0F0F) | (((aux[2] >> 4) & 0x03030303) << 4);
+    aux[3] = ((aux[1] >> 4) & 0x0F0F0F0F) | (((aux[2] >> 6) & 0x03030303) << 4);
+    aux[0] = (aux[0] & 0x0F0F0F0F) | (((aux[2] >> 0) & 0x03030303) << 4);
+    aux[1] = (aux[1] & 0x0F0F0F0F) | (((aux[2] >> 2) & 0x03030303) << 4);
+    const int8_t *scales = (const int8_t *)aux;
+
+    const uint8_t *qs = b + 32;  /* offset 32 */
+    const uint8_t *hm = b;       /* offset 0 (hmask) */
+
+    int chunk = i / 128;         /* 0 or 1 */
+    int i_in_chunk = i % 128;    /* 0..127 */
+    int group = i_in_chunk / 16; /* 0..7 (8 groups of 16 per chunk) */
+    int l = i_in_chunk % 16;     /* 0..15 */
+
+    int shift = (group % 4) * 2; /* 0, 2, 4, 6 */
+    int half = group / 4;        /* 0 or 1 */
+    int scale_idx = chunk * 8 + group; /* 0..15 */
+
+    int qs_base = chunk * 32 + half * 16;
+    int v = (qs[qs_base + l] >> shift) & 3;
+
+    uint8_t m = 1 << (group % 4);  /* high mask bit: 1, 2, 4, 8 cycling */
+    int q3_val = v - ((hm[l] & m) ? 0 : 4);
+
+    return d * (float)(scales[scale_idx] - 32) * (float)q3_val;
+}
+
 __device__ static inline float dequant_q4_K(const void *blk, int i) {
     const uint8_t *b = (const uint8_t *)blk;
     uint16_t d_raw = b[0] | ((uint16_t)b[1] << 8);

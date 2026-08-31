@@ -297,7 +297,7 @@ int picolm_gpu_tensor_upload(void **tensor,
     t->qtype = qtype; t->I = I; t->O = O; t->device = device;
     t->row_bytes = row_bytes; t->block_size = bs;
 
-    /* Q6_K native path (Q4_K/Q5_K/Q3_K/Q2_K use Q8_0 conversion for now). */
+    /* Q6_K native only. Q2/3/4/5_K use Q8_0 conversion for now (native upload produces garbage). */
     if (qtype == 14 && (I % 256) == 0 && O >= 8) {
         size_t blk_size = (qtype == 14) ? GPU_BLOCK_Q6_K_SIZE :
                           (qtype == 13) ? GPU_BLOCK_Q5_K_SIZE :
@@ -893,7 +893,7 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
     }
 
     /* Q4_K x Q8_0 IMMA path: quantize activations to Q8_0, native Q4_K weights. */
-    if (0 && t->qtype == GGUF_TYPE_Q4_K && ctx->has_imma && S >= 16 && O >= 8 && I % 256 == 0) { /* DEBUG: disable IMMA */
+    if (t->qtype == GGUF_TYPE_Q4_K && ctx->has_imma && S >= 16 && O >= 8 && I % 256 == 0) {
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
 
@@ -1292,7 +1292,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
     }
 
     /* Q4_K x Q8_0 IMMA path: device-resident. */
-    if (0 && t->qtype == GGUF_TYPE_Q4_K && ctx->has_imma && S >= 16 && O >= 8 && I % 256 == 0) { /* DEBUG: disable IMMA */
+    if (t->qtype == GGUF_TYPE_Q4_K && ctx->has_imma && S >= 16 && O >= 8 && I % 256 == 0) {
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
         int S_padded = (S + 15) & ~15;
