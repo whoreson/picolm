@@ -138,8 +138,8 @@ __device__ static inline float dequant_q2_K(const void *blk, int i) {
     int group = i_in_chunk / 16;      /* 0..7 */
     int l = i_in_chunk % 16;          /* 0..15 */
 
-    int shift = (group % 4) * 2;      /* 0, 2, 4, 6 */
-    int half = group / 4;             /* 0 or 1 (first or second half of qs bytes) */
+    int shift = (group / 2) * 2;      /* 0,0,2,2,4,4,6,6 for group 0..7 */
+    int half = group % 2;             /* 0 or 1: alternates per group (q[0..15] vs q[16..31]) */
     int scale_idx = chunk * 8 + group; /* 0..15 */
 
     uint8_t sc_byte = scales[scale_idx];
@@ -153,46 +153,45 @@ __device__ static inline float dequant_q2_K(const void *blk, int i) {
 }
 
 /* Q3_K dequant: 256 values in 110 bytes.
- * Layout: hmask[32] (offset 0), qs[64] (offset 32), scales[12] (offset 96), d(2) (offset 108).
- * 16 sub-blocks of 16 values each, each with a 6-bit scale (packed via bit-interleaving).
- * Value = d * (scale - 32) * (qs_2bit - (hmask_bit ? 0 : 4)).
- * qs has 2-bit values with shifting (0,2,4,6 per group within 128-element chunk).
- * hmask provides the high bit, cycling through bit positions (1,2,4,8). */
+ * Layout: hmask[32] (0..31) + qs[64] (32..95) + scales[12] (96..107) + d fp16 (108..109).
+ * 16 sub-blocks of 16 values, each with a 6-bit signed scale (bias 32).
+ * Value: 2-bit qs + 1-bit hmask -> signed [-4..3].
+ * Ported index-for-index from the CPU reference dequantize_row_q3_K() in quant.c
+ * (this GPU version was previously MISSING entirely -- see debug onboarding doc). */
 __device__ static inline float dequant_q3_K(const void *blk, int i) {
     const uint8_t *b = (const uint8_t *)blk;
+    const uint8_t *hmask = b;            /* 32 bytes, offset 0 */
+    const uint8_t *qs = b + 32;          /* 64 bytes, offset 32 */
+    const uint8_t *scales_raw = b + 96;  /* 12 bytes, offset 96 */
     uint16_t d_raw = b[108] | ((uint16_t)b[109] << 8);
     float d = gpu_fp16_to_fp32(d_raw);
 
-    /* Unpack 16 scales from 12 bytes (same bit-interleaving as CPU) */
+    /* Unpack 16 signed 6-bit scales from 12 bytes (same bit-interleaving as CPU) */
     uint32_t aux[4];
-    aux[0] = b[96] | ((uint32_t)b[97] << 8) | ((uint32_t)b[98] << 16) | ((uint32_t)b[99] << 24);
-    aux[1] = b[100] | ((uint32_t)b[101] << 8) | ((uint32_t)b[102] << 16) | ((uint32_t)b[103] << 24);
-    aux[2] = b[104] | ((uint32_t)b[105] << 8) | ((uint32_t)b[106] << 16) | ((uint32_t)b[107] << 24);
-    aux[2] = ((aux[0] >> 4) & 0x0F0F0F0F) | (((aux[2] >> 4) & 0x03030303) << 4);
-    aux[3] = ((aux[1] >> 4) & 0x0F0F0F0F) | (((aux[2] >> 6) & 0x03030303) << 4);
-    aux[0] = (aux[0] & 0x0F0F0F0F) | (((aux[2] >> 0) & 0x03030303) << 4);
-    aux[1] = (aux[1] & 0x0F0F0F0F) | (((aux[2] >> 2) & 0x03030303) << 4);
+    memcpy(aux, scales_raw, 12);
+    uint32_t tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & 0x0F0F0F0F) | (((tmp >> 4) & 0x03030303) << 4);
+    aux[3] = ((aux[1] >> 4) & 0x0F0F0F0F) | (((tmp >> 6) & 0x03030303) << 4);
+    aux[0] = (aux[0] & 0x0F0F0F0F) | (((tmp >> 0) & 0x03030303) << 4);
+    aux[1] = (aux[1] & 0x0F0F0F0F) | (((tmp >> 2) & 0x03030303) << 4);
     const int8_t *scales = (const int8_t *)aux;
 
-    const uint8_t *qs = b + 32;  /* offset 32 */
-    const uint8_t *hm = b;       /* offset 0 (hmask) */
+    int chunk = i / 128;             /* 0 or 1 */
+    int pos = i % 128;               /* 0..127 */
+    int j = pos / 32;                /* 0..3 */
+    int sub = (pos % 32) / 16;       /* 0 or 1 */
+    int l = pos % 16;                /* 0..15 */
 
-    int chunk = i / 128;         /* 0 or 1 */
-    int i_in_chunk = i % 128;    /* 0..127 */
-    int group = i_in_chunk / 16; /* 0..7 (8 groups of 16 per chunk) */
-    int l = i_in_chunk % 16;     /* 0..15 */
+    int gj = chunk * 4 + j;              /* 0..7: selects hmask bit position */
+    int scale_idx = chunk * 8 + j * 2 + sub; /* 0..15 */
+    int shift = j * 2;                   /* 0,2,4,6 */
+    uint8_t m = (uint8_t)(1u << gj);
+    int hm_idx = sub * 16 + l;           /* 0..31 (shared across both chunks) */
+    int qs_idx = chunk * 32 + sub * 16 + l; /* 0..63 */
 
-    int shift = (group % 4) * 2; /* 0, 2, 4, 6 */
-    int half = group / 4;        /* 0 or 1 */
-    int scale_idx = chunk * 8 + group; /* 0..15 */
-
-    int qs_base = chunk * 32 + half * 16;
-    int v = (qs[qs_base + l] >> shift) & 3;
-
-    uint8_t m = 1 << (group % 4);  /* high mask bit: 1, 2, 4, 8 cycling */
-    int q3_val = v - ((hm[l] & m) ? 0 : 4);
-
-    return d * (float)(scales[scale_idx] - 32) * (float)q3_val;
+    float dl = d * (float)(scales[scale_idx] - 32);
+    int qval = (int)((int8_t)((qs[qs_idx] >> shift) & 3)) - ((hmask[hm_idx] & m) ? 0 : 4);
+    return dl * (float)qval;
 }
 
 __device__ static inline float dequant_q4_K(const void *blk, int i) {

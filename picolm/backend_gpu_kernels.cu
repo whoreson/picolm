@@ -111,6 +111,20 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
         }
         break;
 
+    case 11: /* GGUF_TYPE_Q3_K */
+        /* 256 values per block (110 bytes). Per-element dequant via helper. */
+        {
+            int n_blocks = I / 256;
+            for (int bi = gpuThreadIdx_x; bi < n_blocks; bi += gpuBlockDim_x) {
+                const void *blk = wrow + (size_t)bi * bytes_per_block;
+                for (int j = 0; j < 256; j++) {
+                    int i = bi * 256 + j;
+                    sum += x[rs*s+i] * dequant_q3_K(blk, j);
+                }
+            }
+        }
+        break;
+
     case 12: /* GGUF_TYPE_Q4_K */
         /* 256 values per block (144 bytes). Per-element dequant via helper. */
         {
@@ -1678,6 +1692,9 @@ picolm_q4_1_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
             sq1 += gpuShflDownSync(mask, sq1, 2);
             sq0 += gpuShflDownSync(mask, sq0, 1);
             sq1 += gpuShflDownSync(mask, sq1, 1);
+            /* Broadcast reduced sums to all threads in the group */
+            sq0 = gpuShflSync(mask, sq0, 0);
+            sq1 = gpuShflSync(mask, sq1, 0);
         }
 #endif
 
@@ -1970,11 +1987,11 @@ picolm_q5_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
 
             /* b0: elements 0..3 */
             uint32_t b0_val = 0;
+            int bit_shift = 2 * group + sub;  /* sub=0: bits 0,2,4,6; sub=1: bits 1,3,5,7 */
             for (int e = 0; e < 4; e++) {
                 int l = tid * 4 + e;
                 uint8_t qs_byte = qs_base[l];
                 uint8_t nibble = sub ? (qs_byte >> 4) : (qs_byte & 0xF);
-                int bit_shift = sub ? (2 + 2 * group) : (2 * group);
                 uint8_t high = ((qh_base[l] >> bit_shift) & 1) ? 16 : 0;
                 b0_val |= (uint32_t)(nibble + high) << (e * 8);
             }
@@ -1986,7 +2003,6 @@ picolm_q5_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
                 int l = 16 + tid * 4 + e;
                 uint8_t qs_byte = qs_base[l];
                 uint8_t nibble = sub ? (qs_byte >> 4) : (qs_byte & 0xF);
-                int bit_shift = sub ? (2 + 2 * group) : (2 * group);
                 uint8_t high = ((qh_base[l] >> bit_shift) & 1) ? 16 : 0;
                 b1_val |= (uint32_t)(nibble + high) << (e * 8);
             }
@@ -2019,6 +2035,9 @@ picolm_q5_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
             sq1 += gpuShflDownSync(mask, sq1, 2);
             sq0 += gpuShflDownSync(mask, sq0, 1);
             sq1 += gpuShflDownSync(mask, sq1, 1);
+            /* Broadcast reduced sums to all threads in the group */
+            sq0 = gpuShflSync(mask, sq0, 0);
+            sq1 = gpuShflSync(mask, sq1, 0);
         }
 #endif
 
@@ -2145,9 +2164,11 @@ picolm_q4_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
             memcpy(&raw1, qs_p + 16 + tid * 4, 4);
 
             if (g & 1) {
-                /* High nibbles: shift right by 4 */
-                raw0 = (raw0 >> 4) & 0x0F0F0F0F;
-                raw1 = (raw1 >> 4) & 0x0F0F0F0F;
+                /* High nibbles: extract independently per byte */
+                raw0 = ((raw0 >> 4) & 0x0F) | (((raw0 >> 12) & 0x0F) << 8)
+                     | (((raw0 >> 20) & 0x0F) << 16) | (((raw0 >> 28) & 0x0F) << 24);
+                raw1 = ((raw1 >> 4) & 0x0F) | (((raw1 >> 12) & 0x0F) << 8)
+                     | (((raw1 >> 20) & 0x0F) << 16) | (((raw1 >> 28) & 0x0F) << 24);
             } else {
                 /* Low nibbles: mask with 0x0F */
                 raw0 = raw0 & 0x0F0F0F0F;
@@ -2183,6 +2204,9 @@ picolm_q4_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
             sq1 += gpuShflDownSync(mask, sq1, 2);
             sq0 += gpuShflDownSync(mask, sq0, 1);
             sq1 += gpuShflDownSync(mask, sq1, 1);
+            /* Broadcast reduced sums to all threads in the group */
+            sq0 = gpuShflSync(mask, sq0, 0);
+            sq1 = gpuShflSync(mask, sq1, 0);
         }
 #endif
 
@@ -2282,11 +2306,11 @@ picolm_q3_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
         int group = (g % 8) / 2;  /* 0..3 */
         int sub = g % 2;          /* 0 or 1 */
 
-        int bit_shift = group * 2;    /* qs bit shift: 0, 2, 4, 6 */
-        int hbit = 1 << group;        /* hmask bit: 1, 2, 4, or 8 */
+        int bit_shift = group * 2;    /* qs bit shift: 0, 2, 4, 6 (resets per chunk) */
+        int hbit = 1 << (chunk * 4 + group);  /* hmask bit cycles 1,2,4,8,16,32,64,128 */
 
         const uint8_t *qs_base = wb + 32 + chunk * 32 + sub * 16;
-        const uint8_t *hm_base = wb + chunk * 16 + sub * 16;
+        const uint8_t *hm_base = wb + sub * 16;  /* hmask is shared across both chunks */
 
         /* A: activation fragments */
         int a0, a1, a2, a3;
@@ -2341,7 +2365,7 @@ picolm_q3_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
         /* Paired sub-block g+1: same chunk, same group, toggled sub. */
         int sub2 = 1 - sub;
         const uint8_t *qs_base2 = wb + 32 + chunk * 32 + sub2 * 16;
-        const uint8_t *hm_base2 = wb + chunk * 16 + sub2 * 16;
+        const uint8_t *hm_base2 = wb + sub2 * 16;  /* hmask shared across chunks */
 
         int b1;
         {
@@ -2487,8 +2511,9 @@ picolm_q2_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
         /* B: unpack Q2_K 2-bit values to int32 (4 per register).
          * qs: 64 bytes starting at offset 16. Per chunk: 32 bytes.
          * Per sub: 16 bytes. Each byte holds 4 values (2 bits each).
-         * Thread tid processes elements tid*4..tid*4+3 within the sub-block. */
-        /* Determine chunk/group/sub from g for B-fragment loading from gid column */
+         * Thread tid processes elements tid*4..tid*4+3 within the sub-block.
+         * g is the sub-block index (0,2,4,...,14). group=g/2 within chunk maps
+         * to CPU's inner loop iteration (j=group/2, sub=group%2). */
         int chunk = g / 8;
         int group = (g % 8) / 2;
         int sub = g % 2;
@@ -2531,36 +2556,50 @@ picolm_q2_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(0), "r"(b1));
 #endif
 
-        /* Min-correction: per-sub-block mins applied to their respective
-         * activation halves. a0+a2 cover K[0..15] of the 32-window (first
-         * 16 activation values), a1 covers row+8 first 16, a2+a3 cover
-         * the second 16. But the IMMA call 1 (b0) processes a0/a2 (K[0..3]
-         * and K[16..19] per thread) against b0 (16 weight values).
-         * The IMMA call 2 (b1) processes a0/a2 against b1.
+        /* Min-correction: Q2_K formula is val = d*scale*q - dmin*min.
          *
-         * Each IMMA call processes 4 Q rows x 16 K values = 64 multiplications.
-         * For the min-correction, we need the sum of the 16 activation values
-         * that each Q row processes. a0 has 4 int8 values for row gid, K[0..3].
-         * a2 has 4 int8 values for row gid, K[16..19].
-         * Together (across 4 threads), that's 16 values for row gid.
+         * IMMA fragment layout (m16n8k32, s8):
+         *   a0: row=gid,     K cols 0..15 (first 16 activations)
+         *   a1: row=gid+8,   K cols 0..15 (first 16 activations)
+         *   a2: row=gid,     K cols 16..31 (second 16 activations)
+         *   a3: row=gid+8,   K cols 16..31 (second 16 activations)
+         *   b0: K rows 0..15 (sub-block g weights), col=groupID
+         *   b1: K rows 16..31 (sub-block g+1 weights), col=groupID
          *
-         * We compute half-sums: sq0 covers a0+a2 (first row, all 16 values
-         * via reduction), sq1 covers a1+a3 (second row, all 16 values). */
-        int sq0 = 0, sq1 = 0;
+         * Call 1 (b0=real,b1=0): d0 = sum(first_16_act * q2_g)
+         * Call 2 (b0=0,b1=real): d0b = sum(second_16_act * q2_g+1)
+         *
+         * Min-correction per sub-block:
+         *   sub-block g:   dmin * mn_g   * sum(first_16_act)
+         *   sub-block g+1: dmin * mn_g+1 * sum(second_16_act)
+         *
+         * We need SEPARATE activation sums for the first 16 and second 16.
+         * a0/a1 contribute to the first-half sum, a2/a3 to the second-half sum. */
+        int sq0a = 0, sq0b = 0;  /* row gid: first-16 / second-16 sums */
+        int sq1a = 0, sq1b = 0;  /* row gid+8: first-16 / second-16 sums */
         {
             int8_t *av;
-            av = (int8_t *)&a0; sq0 += av[0] + av[1] + av[2] + av[3];
-            av = (int8_t *)&a2; sq0 += av[0] + av[1] + av[2] + av[3];
-            av = (int8_t *)&a1; sq1 += av[0] + av[1] + av[2] + av[3];
-            av = (int8_t *)&a3; sq1 += av[0] + av[1] + av[2] + av[3];
+            av = (int8_t *)&a0; sq0a += av[0] + av[1] + av[2] + av[3];
+            av = (int8_t *)&a2; sq0b += av[0] + av[1] + av[2] + av[3];
+            av = (int8_t *)&a1; sq1a += av[0] + av[1] + av[2] + av[3];
+            av = (int8_t *)&a3; sq1b += av[0] + av[1] + av[2] + av[3];
         }
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 300
         {
             unsigned mask = 0xF << (gid * 4);
-            sq0 += gpuShflDownSync(mask, sq0, 2);
-            sq1 += gpuShflDownSync(mask, sq1, 2);
-            sq0 += gpuShflDownSync(mask, sq0, 1);
-            sq1 += gpuShflDownSync(mask, sq1, 1);
+            sq0a += gpuShflDownSync(mask, sq0a, 2);
+            sq0b += gpuShflDownSync(mask, sq0b, 2);
+            sq1a += gpuShflDownSync(mask, sq1a, 2);
+            sq1b += gpuShflDownSync(mask, sq1b, 2);
+            sq0a += gpuShflDownSync(mask, sq0a, 1);
+            sq0b += gpuShflDownSync(mask, sq0b, 1);
+            sq1a += gpuShflDownSync(mask, sq1a, 1);
+            sq1b += gpuShflDownSync(mask, sq1b, 1);
+            /* Broadcast reduced sums to all threads in the group */
+            sq0a = gpuShflSync(mask, sq0a, 0);
+            sq0b = gpuShflSync(mask, sq0b, 0);
+            sq1a = gpuShflSync(mask, sq1a, 0);
+            sq1b = gpuShflSync(mask, sq1b, 0);
         }
 #endif
 
@@ -2583,9 +2622,10 @@ picolm_q2_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
             float wdmn0 = wdm0 * (float)mn0;
             float wds1 = wd0 * (float)sc1;
             float wdmn1 = wdm0 * (float)mn1;
-            float corr0 = (wdmn0 + wdmn1) * dx0 * (float)sq0;
+            /* min-correction: mn_g * first_half_sum + mn_g+1 * second_half_sum */
+            float corr0 = wdmn0 * dx0 * (float)sq0a + wdmn1 * dx0 * (float)sq0b;
             sum[0] += wds0 * dx0 * (float)d0 + wds1 * dx0 * (float)d0b - corr0;
-            float corr1 = (wdmn0 + wdmn1) * dx1 * (float)sq1;
+            float corr1 = wdmn0 * dx1 * (float)sq1a + wdmn1 * dx1 * (float)sq1b;
             sum[2] += wds0 * dx1 * (float)d2 + wds1 * dx1 * (float)d2b - corr1;
         }
         /* Read scales for output column wc1 = tile_o + tid*2+1 */
@@ -2602,9 +2642,9 @@ picolm_q2_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
             float wdmn0 = wdm1 * (float)mn0;
             float wds1 = wd1 * (float)sc1;
             float wdmn1 = wdm1 * (float)mn1;
-            float corr0 = (wdmn0 + wdmn1) * dx0 * (float)sq0;
+            float corr0 = wdmn0 * dx0 * (float)sq0a + wdmn1 * dx0 * (float)sq0b;
             sum[1] += wds0 * dx0 * (float)d1 + wds1 * dx0 * (float)d1b - corr0;
-            float corr1 = (wdmn0 + wdmn1) * dx1 * (float)sq1;
+            float corr1 = wdmn0 * dx1 * (float)sq1a + wdmn1 * dx1 * (float)sq1b;
             sum[3] += wds0 * dx1 * (float)d3 + wds1 * dx1 * (float)d3b - corr1;
         }
     }
