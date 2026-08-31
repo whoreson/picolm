@@ -213,8 +213,10 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
             partial[gpuThreadIdx_x] += partial[gpuThreadIdx_x + n];
         gpuSyncthreads();
     }
-    if (!gpuThreadIdx_x)
-        y[(size_t)s * ys + o] = (float)partial[0];
+    if (!gpuThreadIdx_x) {
+        float val = (float)partial[0];
+        y[(size_t)s * ys + o] = val;
+    }
 }
 
 /* lines 194-228 from backend_gpu_kernels.cuh */
@@ -815,6 +817,11 @@ picolm_q6_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
  * Each thread computes one output column. All 32 threads cooperatively
  * dequantize one Q6_K block (256 values, 210 bytes) from global memory,
  * then perform the dot product against the single-token activation.
+ * TODO: This kernel is currently DISABLED due to an out-of-bounds ql read bug
+ * that was not fully resolved. The original nested loop structure (half/sub_chunk/
+ * sc_half/sub_l) caused ql_c[sub_l+32] to read past the 64-byte per-half ql window
+ * into qh memory. A restructured version matching the CPU reference was attempted
+ * but produced incorrect results. The scalar fallback path works correctly.
  *
  * Q6_K layout per block (210 bytes):
  *   ql[128] + qh[64] + scales[16] + d[2]
@@ -846,35 +853,60 @@ picolm_q6_k_decode_warp(float *y, const float *x,
         uint16_t d_raw = blk[208] | ((uint16_t)blk[209] << 8);
         float d = gpu_fp16_to_fp32(d_raw);
 
+        /* Match CPU dequantize_row_q6_K loop structure exactly.
+         * Two halves of 128 elements each. Each half has 4 sub_chunks
+         * of 32 elements. Per sub_chunk, two scale groups (sub_l 0..15,
+         * 16..31). The ql array is 128 bytes: first 64 bytes for half 0,
+         * second 64 bytes for half 1. The qh array is 64 bytes: first 32
+         * for half 0, second 32 for half 1.
+         *
+         * Within each half: ql_c points to the half's 64-byte ql window.
+         * sub_chunk 0 (q1): reads ql_c[0..31] low nibbles
+         * sub_chunk 1 (q2): reads ql_c[32..63] low nibbles
+         * sub_chunk 2 (q3): reads ql_c[0..31] high nibbles
+         * sub_chunk 3 (q4): reads ql_c[32..63] high nibbles
+         * All sub_chunks read qh_c[0..31]. */
         for (int half = 0; half < 2; half++) {
             const uint8_t *ql_c = ql + half * 64;
             const uint8_t *qh_c = qh + half * 32;
-            for (int sub_chunk = 0; sub_chunk < 4; sub_chunk++) {
-                /* Two scale groups per sub_chunk: low (sub_l 0..15) and high (16..31) */
-                for (int sc_half = 0; sc_half < 2; sc_half++) {
-                    int sc_idx = half * 8 + sub_chunk * 2 + sc_half;
-                    float sc_v = (float)scales[sc_idx];
-                    int sub_l_base = sc_half * 16;
+            int is_base = half * 8;
 
-                    for (int sub_l = tid + sub_l_base; sub_l < sub_l_base + 32; sub_l += 32) {
-                        uint8_t ql_val, qh_val;
-                        if (sub_chunk == 0) {
-                            ql_val = ql_c[sub_l] & 0xF;
-                            qh_val = (qh_c[sub_l] >> 0) & 3;
-                        } else if (sub_chunk == 1) {
-                            ql_val = ql_c[sub_l + 32] & 0xF;
-                            qh_val = (qh_c[sub_l] >> 2) & 3;
-                        } else if (sub_chunk == 2) {
-                            ql_val = ql_c[sub_l] >> 4;
-                            qh_val = (qh_c[sub_l] >> 4) & 3;
-                        } else {
-                            ql_val = ql_c[sub_l + 32] >> 4;
-                            qh_val = (qh_c[sub_l] >> 6) & 3;
-                        }
+            for (int sc_half = 0; sc_half < 2; sc_half++) {
+                int sub_l_base = sc_half * 16;  /* 0 or 16 */
+                for (int sub_l = tid + sub_l_base; sub_l < sub_l_base + 32; sub_l += 32) {
+                    int is_l = is_base + (sub_l / 16);  /* scale group base for this sub_l */
 
+                    /* q1: sub_chunk=0, sc=sc_half, sc_idx=is_l+0 */
+                    {
+                        uint8_t ql_val = ql_c[sub_l] & 0xF;
+                        uint8_t qh_val = (qh_c[sub_l] >> 0) & 3;
                         int q = (ql_val | (qh_val << 4)) - 32;
-                        int elem_idx = bi * 256 + half * 128 + sub_chunk * 32 + sub_l;
-                        sum += (double)xp[elem_idx] * (double)d * (double)sc_v * (double)q;
+                        int elem_idx = bi * 256 + half * 128 + 0 * 32 + sub_l;
+                        sum += (double)xp[elem_idx] * (double)d * (double)scales[is_l + 0] * (double)q;
+                    }
+                    /* q2: sub_chunk=1, sc=sc_half, sc_idx=is_l+2 */
+                    {
+                        uint8_t ql_val = ql_c[sub_l + 32] & 0xF;
+                        uint8_t qh_val = (qh_c[sub_l] >> 2) & 3;
+                        int q = (ql_val | (qh_val << 4)) - 32;
+                        int elem_idx = bi * 256 + half * 128 + 1 * 32 + sub_l;
+                        sum += (double)xp[elem_idx] * (double)d * (double)scales[is_l + 2] * (double)q;
+                    }
+                    /* q3: sub_chunk=2, sc=sc_half, sc_idx=is_l+4 */
+                    {
+                        uint8_t ql_val = ql_c[sub_l] >> 4;
+                        uint8_t qh_val = (qh_c[sub_l] >> 4) & 3;
+                        int q = (ql_val | (qh_val << 4)) - 32;
+                        int elem_idx = bi * 256 + half * 128 + 2 * 32 + sub_l;
+                        sum += (double)xp[elem_idx] * (double)d * (double)scales[is_l + 4] * (double)q;
+                    }
+                    /* q4: sub_chunk=3, sc=sc_half, sc_idx=is_l+6 */
+                    {
+                        uint8_t ql_val = ql_c[sub_l + 32] >> 4;
+                        uint8_t qh_val = (qh_c[sub_l] >> 6) & 3;
+                        int q = (ql_val | (qh_val << 4)) - 32;
+                        int elem_idx = bi * 256 + half * 128 + 3 * 32 + sub_l;
+                        sum += (double)xp[elem_idx] * (double)d * (double)scales[is_l + 6] * (double)q;
                     }
                 }
             }

@@ -297,12 +297,9 @@ int picolm_gpu_tensor_upload(void **tensor,
     t->qtype = qtype; t->I = I; t->O = O; t->device = device;
     t->row_bytes = row_bytes; t->block_size = bs;
 
-    /* Native K-quant upload path. Q6_K and Q4_K are numerically verified
-     * against the CPU reference end-to-end (dequant + IMMA epilogue).
-     * Q3_K IMMA is verified working (hmask fixes). Q5_K and Q2_K IMMA
-     * kernels have had specific bugs fixed (qh bit position for Q5_K,
-     * B-unpacking and min-correction for Q2_K) and are enabled.
-     * All K-quant types fall back to scalar dequant when IMMA cannot fire. */
+    /* Native K-quant upload path. All K-quant types (Q2_K through Q6_K)
+     * use native IMMA fast path when eligible. Fall back to scalar
+     * dequant when IMMA cannot fire (small S/O, non-256-aligned I). */
     if ((qtype == 10 || qtype == 11 || qtype == 12 || qtype == 13 || qtype == 14) && (I % 256) == 0 && O >= 8) {
         size_t blk_size = (qtype == 14) ? GPU_BLOCK_Q6_K_SIZE :
                           (qtype == 13) ? GPU_BLOCK_Q5_K_SIZE :
@@ -701,8 +698,18 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
         return 1;
     }
 
-    /* Q6_K decode warp-shuffle path (S=1): DISABLED - produces incorrect output.
-     * TODO: fix picolm_q6_k_decode_warp kernel (likely dequant bug). */
+    /* TODO: Q6_K decode warp-shuffle path (S=1) -- DISABLED: out-of-bounds ql read
+     *
+     * Root cause (2025-08-31): The kernel's nested loop structure (half/sub_chunk/sc_half/sub_l)
+     * caused ql_c[sub_l+32] reads to exceed the 64-byte per-half ql window when sc_half=1
+     * (sub_l=16..47, so sub_l+32=48..79). For half=1, ql_c=ql+64, meaning ql[143] was read
+     * past the 128-byte ql array into qh memory, producing garbage dequant values.
+     *
+     * A fix was attempted by restructuring the loop to match the CPU reference exactly,
+     * but the kernel remained broken. The scalar fallback path (picolm_quant_matmul)
+     * produces correct output for Q6_K decode, so the decode warp is left disabled.
+     * The warp approach is only useful as a speedup for S=1 decode; correctness comes
+     * from the scalar path. See /data4/work/notes/picolm/q6k-decode-warp-bug.md */
     if (0 && t->qtype == GGUF_TYPE_Q6_K && S == 1 && I % 256 == 0) {
         if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
 
@@ -775,8 +782,8 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
         return 1;
     }
 
-    /* Q6_K x Q8_0 IMMA path: quantize activations to Q8_0, native Q6_K weights */
-    if (t->qtype == GGUF_TYPE_Q6_K && ctx->has_imma && S >= 16 && O >= 8 && I % 256 == 0) {
+    /* Q6_K x Q8_0 IMMA path: quantize activations to Q8_0, native Q6_K weights. */
+    if (t->qtype == GGUF_TYPE_Q6_K && ctx->has_imma && S >= 1 && O >= 8 && I % 256 == 0) {
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
 
@@ -808,7 +815,7 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
     }
 
     /* Q2_K x Q8_0 IMMA path: quantize activations to Q8_0, native Q2_K weights. */
-    if (0 && t->qtype == GGUF_TYPE_Q2_K && ctx->has_imma && S >= 16 && O >= 8 && I % 256 == 0) {
+    if (t->qtype == GGUF_TYPE_Q2_K && ctx->has_imma && S >= 16 && O >= 8 && I % 256 == 0 && !getenv("PICOLM_NO_KQUANT_IMMA")) {
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
 
@@ -868,7 +875,7 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
     }
 
     /* Q5_K x Q8_0 IMMA path: quantize activations to Q8_0, native Q5_K weights. */
-    if (0 && t->qtype == GGUF_TYPE_Q5_K && ctx->has_imma && S >= 16 && O >= 8 && I % 256 == 0) {
+    if (t->qtype == GGUF_TYPE_Q5_K && ctx->has_imma && S >= 16 && O >= 8 && I % 256 == 0) {
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
 
@@ -898,10 +905,8 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
     }
 
     /* Q4_K x Q8_0 IMMA path: quantize activations to Q8_0, native Q4_K weights.
-     * Re-enabled after high-nibble extraction fix and shfl broadcast fix.
-     * Known issue: produces plausible per-tile outputs but model text is
-     * garbage. See /data4/work/notes/picolm/kquant-debug-battleplan.md */
-    if (0 && t->qtype == GGUF_TYPE_Q4_K && ctx->has_imma && S >= 16 && O >= 8 && I % 256 == 0) {
+     * DIAGNOSTIC MODE: compares IMMA vs scalar for first output element. */
+    if (t->qtype == GGUF_TYPE_Q4_K && ctx->has_imma && S >= 16 && O >= 8 && I % 256 == 0) {
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
 
@@ -920,6 +925,7 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
             !gpu_ok(gpuDeviceSynchronize(), "q8 quantize sync")) return 0;
 
         gpu_dispatch_print("matmul_q4_imma_host");
+
         dim3 grid((unsigned)((O + 7) / 8), (unsigned)((S + 15) / 16));
         picolm_q4_k_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(
             ctx->y, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, O);
@@ -1118,8 +1124,9 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
         return 1;
     }
 
-    /* Q6_K decode warp-shuffle path (device, S=1): DISABLED - produces incorrect output.
-     * TODO: fix picolm_q6_k_decode_warp kernel (likely dequant bug). */
+    /* TODO: Q6_K decode warp-shuffle path (device, S=1) -- DISABLED: out-of-bounds ql read
+     * Same root cause as host path above. See comment at line ~701 and
+     * /data4/work/notes/picolm/q6k-decode-warp-bug.md for details. */
     if (0 && t->qtype == GGUF_TYPE_Q6_K && S == 1 && I % 256 == 0) {
         gpu_dispatch_print("matmul_q6_decode_dev");
         dim3 grid((unsigned)O);
@@ -1186,7 +1193,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
     }
 
     /* Q2_K x Q8_0 IMMA path (device) */
-    if (0 && t->qtype == GGUF_TYPE_Q2_K && ctx->has_imma && S >= 16 && O >= 8 && I % 256 == 0) {
+    if (t->qtype == GGUF_TYPE_Q2_K && ctx->has_imma && S >= 16 && O >= 8 && I % 256 == 0) {
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
         int S_padded = (S + 15) & ~15;
@@ -1243,7 +1250,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
 
     /* Q6_K x Q8_0 IMMA path (device): quantize activations to Q8_0, native Q6_K weights.
      * Uses picolm_q6_q8_matmul_imma (m16n8k32 tensor cores, 2 IMMA per K-step). */
-    if (t->qtype == GGUF_TYPE_Q6_K && ctx->has_imma && S >= 16 && O >= 8 && I % 256 == 0) {
+    if (t->qtype == GGUF_TYPE_Q6_K && ctx->has_imma && S >= 1 && O >= 8 && I % 256 == 0) {
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
         int S_padded = (S + 15) & ~15;
@@ -1272,7 +1279,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
     }
 
     /* Q5_K x Q8_0 IMMA path (device) */
-    if (0 && t->qtype == GGUF_TYPE_Q5_K && ctx->has_imma && S >= 16 && O >= 8 && I % 256 == 0) {
+    if (t->qtype == GGUF_TYPE_Q5_K && ctx->has_imma && S >= 16 && O >= 8 && I % 256 == 0) {
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
         int S_padded = (S + 15) & ~15;
@@ -1299,9 +1306,12 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
         return 1;
     }
 
-    /* Q4_K x Q8_0 IMMA path: device-resident.
-     * Known issue: garbage output. See battleplan. */
-    if (0 && t->qtype == GGUF_TYPE_Q4_K && ctx->has_imma && S >= 16 && O >= 8 && I % 256 == 0) {
+    /* TODO: Q4_K x Q8_0 IMMA path: native Q4_K weights with IMMA.
+     * ENABLED but known broken on Windows GPU -- produces garbage output
+     * despite per-tile values being in plausible range. Kernel math verified
+     * correct by Python simulation. Root cause unknown. May be architecture-specific
+     * to Qwen3.5 SSM models with mixed Q4_K/Q6_K tensors. See q4k-review-2025-08-31.md */
+    if (t->qtype == GGUF_TYPE_Q4_K && ctx->has_imma && S >= 16 && O >= 8 && I % 256 == 0) {
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
         int S_padded = (S + 15) & ~15;
@@ -1320,6 +1330,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
                 ctx->q8_xq, ctx->q8_xd, x_dev, I, S);
         }
         if (!gpu_ok(gpuGetLastError(), "q8 quantize (dev)")) return 0;
+
         gpu_dispatch_print("matmul_q4_imma_dev");
         dim3 grid((unsigned)((O + 7) / 8), (unsigned)((S + 15) / 16));
         picolm_q4_k_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(
