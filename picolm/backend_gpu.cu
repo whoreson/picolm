@@ -575,7 +575,10 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
         break;
 
     case 11: /* GGUF_TYPE_Q3_K */
-        /* 256 values per block (110 bytes). Per-element dequant via helper. */
+        /* 256 values per block (110 bytes). Per-element dequant via helper.
+         * NOTE: this case was previously missing entirely, causing every
+         * Q3_K matmul to silently fall through to `default: break;` and
+         * produce all-zero output (sum never accumulated). */
         {
             int n_blocks = I / 256;
             for (int bi = gpuThreadIdx_x; bi < n_blocks; bi += gpuBlockDim_x) {
