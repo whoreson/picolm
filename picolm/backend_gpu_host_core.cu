@@ -297,7 +297,12 @@ int picolm_gpu_tensor_upload(void **tensor,
     t->qtype = qtype; t->I = I; t->O = O; t->device = device;
     t->row_bytes = row_bytes; t->block_size = bs;
 
-    /* Q6_K/Q5_K/Q4_K/Q3_K/Q2_K native path: upload as-is, use native IMMA or scalar fallback. */
+    /* Native K-quant upload path. Q6_K and Q4_K are numerically verified
+     * against the CPU reference end-to-end (dequant + IMMA epilogue).
+     * Q3_K IMMA is verified working (hmask fixes). Q5_K and Q2_K IMMA
+     * kernels have had specific bugs fixed (qh bit position for Q5_K,
+     * B-unpacking and min-correction for Q2_K) and are enabled.
+     * All K-quant types fall back to scalar dequant when IMMA cannot fire. */
     if ((qtype == 10 || qtype == 11 || qtype == 12 || qtype == 13 || qtype == 14) && (I % 256) == 0 && O >= 8) {
         size_t blk_size = (qtype == 14) ? GPU_BLOCK_Q6_K_SIZE :
                           (qtype == 13) ? GPU_BLOCK_Q5_K_SIZE :
@@ -892,8 +897,11 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
         return 1;
     }
 
-    /* Q4_K x Q8_0 IMMA path: quantize activations to Q8_0, native Q4_K weights. */
-    if (t->qtype == GGUF_TYPE_Q4_K && ctx->has_imma && S >= 16 && O >= 8 && I % 256 == 0) {
+    /* Q4_K x Q8_0 IMMA path: quantize activations to Q8_0, native Q4_K weights.
+     * Re-enabled after high-nibble extraction fix and shfl broadcast fix.
+     * Known issue: produces plausible per-tile outputs but model text is
+     * garbage. See /data4/work/notes/picolm/kquant-debug-battleplan.md */
+    if (0 && t->qtype == GGUF_TYPE_Q4_K && ctx->has_imma && S >= 16 && O >= 8 && I % 256 == 0) {
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
 
@@ -1291,8 +1299,9 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
         return 1;
     }
 
-    /* Q4_K x Q8_0 IMMA path: device-resident. */
-    if (t->qtype == GGUF_TYPE_Q4_K && ctx->has_imma && S >= 16 && O >= 8 && I % 256 == 0) {
+    /* Q4_K x Q8_0 IMMA path: device-resident.
+     * Known issue: garbage output. See battleplan. */
+    if (0 && t->qtype == GGUF_TYPE_Q4_K && ctx->has_imma && S >= 16 && O >= 8 && I % 256 == 0) {
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
         int S_padded = (S + 15) & ~15;
