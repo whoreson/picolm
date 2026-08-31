@@ -947,6 +947,7 @@ done:
 #endif
 
 int main(int argc, char **argv) {
+    fp16_table_init();
     picolm_init_gelu_table();
     if (argc < 2) {
         usage(argv[0]);

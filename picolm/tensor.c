@@ -3218,6 +3218,8 @@ void layernorm(float *out, const float *x, const float *weight, const float *bia
     }
     for (; i < size; i++) out[i] = (x[i] - mean) * scale * weight[i] + bias[i];
 #else
+    /* Scalar variance accumulation (missing from SSSE3 path below) */
+    for (i = 0; i < size; i++) { float d = x[i] - mean; ss += d * d; }
     float variance = ss / (float)size;
     float inv_std = 1.0f / sqrtf(variance + eps);
     for (i = 0; i < size; i++) {
