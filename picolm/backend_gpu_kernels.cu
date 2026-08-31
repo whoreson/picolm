@@ -1985,9 +1985,17 @@ picolm_q5_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
             /* qh is always at offset 16, 32 bytes total */
             const uint8_t *qh_base = wb + 16;
 
+            /* FIXED: the qh high-bit position must match the CPU reference's
+             * u1/u2 masks exactly: u1 = 1 << (2*group), u2 = 2 << (2*group).
+             * The previous code used bit_shift = 2 + 2*group for sub=1,
+             * which is off by one (tests bit 2*group+2, not 2*group+1).
+             * At group=3 this even shifted by 8, always reading 0.
+             * Verified against quant.c dequantize_row_q5_K: 4/8
+             * (group,sub) combinations were wrong before this fix. */
+            int bit_shift = 2 * group + sub;  /* sub=0: bits 0,2,4,6; sub=1: bits 1,3,5,7 */
+
             /* b0: elements 0..3 */
             uint32_t b0_val = 0;
-            int bit_shift = 2 * group + sub;  /* sub=0: bits 0,2,4,6; sub=1: bits 1,3,5,7 */
             for (int e = 0; e < 4; e++) {
                 int l = tid * 4 + e;
                 uint8_t qs_byte = qs_base[l];

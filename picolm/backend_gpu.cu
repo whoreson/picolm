@@ -579,6 +579,7 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
          * NOTE: this case was previously missing entirely, causing every
          * Q3_K matmul to silently fall through to `default: break;` and
          * produce all-zero output (sum never accumulated). */
+        /* Also present in backend_gpu_kernels.cu picolm_quant_matmul. */
         {
             int n_blocks = I / 256;
             for (int bi = gpuThreadIdx_x; bi < n_blocks; bi += gpuBlockDim_x) {
