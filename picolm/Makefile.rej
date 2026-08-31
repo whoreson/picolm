@@ -1,0 +1,48 @@
+***************
+*** 554,559 ****
+  	echo del .hunger_build.bat >> .hunger_build.bat
+  	cmd /c .hunger_build.bat
+  
+  # --- hunger-nogpu: pure MSVC build, no CUDA, no GPU backend ---
+  # Useful for isolating CPU-only bugs on Windows (same compiler as hunger,
+  # but without PICOLM_GPU so all GPU code is excluded at compile time).
+--- 554,592 ----
+  	echo del .hunger_build.bat >> .hunger_build.bat
+  	cmd /c .hunger_build.bat
+  
++ # --- hunger-msys: same as hunger but works from MSYS2 SSH (non-interactive) ---
++ # Generates the .bat via perl (available on MSYS2 unlike python3).
++ hunger-msys:
++ 	@perl gen_hunger.pl "$(HUNGER_VS_ROOT)" "$(HUNGER_CUDA_ROOT)" "$(HUNGER_MSVC_VER)" "$(HUNGER_CUDA_ARCH)" $(HUNGER_CFILES)
++ 	@cmd.exe /c .hunger_build.bat
++ 
++ # --- hunger-msys-direct: compile directly from MSYS2 bash (no .bat, no cmd.exe) ---
++ # Requires: PATH set to include CUDA bin + MSVC cl.exe bin + MSYS2 env vars
++ # See build_hunger.sh for the full env setup (MSYSTEM, MINGW_PREFIX, etc.)
++ # INCLUDE and LIB must be set for cl.exe (normally done by vcvars64.bat)
++ # MSYS2_ARG_CONV_EXCL="*" is required so cl.exe args aren't mangled to paths
++ HUNGER_CL_WIN = D:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/$(HUNGER_MSVC_VER)/bin/Hostx64/x64/cl.exe
++ HUNGER_LINK_WIN = D:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/$(HUNGER_MSVC_VER)/bin/Hostx64/x64/link.exe
++ HUNGER_CUDA_WIN = C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4
++ HUNGER_NVCC_FLAGS = -O3 --fmad=false -std=c++14 -DPICOLM_GPU=1 -DPICOLM_CUDA=1 -DPICOLM_SSM_WARP_KERNEL_VALIDATED -DPICOLM_SSM_CHUNKED_GPU_VALIDATED -ccbin "$(HUNGER_CL_WIN)" -Xcompiler "/EHsc /O2 /W3 /std:c++14 /arch:AVX2 /wd4244 /wd4267 /wd4101 /wd4102 /DPICOLM_AVX2=1 /DPICOLM_AVX=1 /DPICOLM_SSE3=1 /DPICOLM_SSE2=1 /DPICOLM_FMA=1" -gencode arch=compute_89,code=$(HUNGER_CUDA_ARCH) -c -o
++ # cl.exe flags: pass via MSYS2_ARG_CONV_EXCL, no spaces in args
++ # Paths with spaces passed via INCLUDE env var, not command line
++ # NOTE: MSVC 14.44 (VS 2022 17.0) does NOT support AVX-512 intrinsics.
++ # Use AVX2 for CPU code, GPU handles the heavy lifting via CUDA.
++ HUNGER_CL_FLAGS = /O2 /W3 /wd4996 /wd4244 /wd4267 /wd4101 /wd4102 /wd4090 /wd4018 /wd4477 /arch:AVX2 /D PICOLM_GPU=1 /D PICOLM_CUDA=1 /D _CRT_SECURE_NO_WARNINGS /D _CRT_AMD64 /I. /openmp /c /D PICOLM_AVX2=1 /D PICOLM_AVX=1 /D PICOLM_SSE3=1 /D PICOLM_SSE2=1 /D PICOLM_FMA=1
++ 
++ .PHONY: hunger-msys-direct
++ hunger-msys-direct: gpu-clean-objs
++ 	@export MSYSTEM=UCRT64 MINGW_PREFIX=/ucrt64 MINGW_CHOST=x86_64-w64-mingw32 MSYSTEM_CARCH=x86_64 MSYSTEM_CHOST=x86_64-w64-mingw32 MSYSTEM_PREFIX=/ucrt64 TEMP=/tmp TMP=/tmp && $(NVCC) $(HUNGER_NVCC_FLAGS) backend_gpu_kernels_win.obj backend_gpu_kernels.cu -I.
++ 	@export MSYSTEM=UCRT64 MINGW_PREFIX=/ucrt64 MINGW_CHOST=x86_64-w64-mingw32 MSYSTEM_CARCH=x86_64 MSYSTEM_CHOST=x86_64-w64-mingw32 MSYSTEM_PREFIX=/ucrt64 TEMP=/tmp TMP=/tmp && $(NVCC) $(HUNGER_NVCC_FLAGS) backend_gpu_host_core_win.obj backend_gpu_host_core.cu -I.
++ 	@export MSYSTEM=UCRT64 MINGW_PREFIX=/ucrt64 MINGW_CHOST=x86_64-w64-mingw32 MSYSTEM_CARCH=x86_64 MSYSTEM_CHOST=x86_64-w64-mingw32 MSYSTEM_PREFIX=/ucrt64 TEMP=/tmp TMP=/tmp && $(NVCC) $(HUNGER_NVCC_FLAGS) backend_gpu_host_ssm_win.obj backend_gpu_host_ssm.cu -I.
++ 	@export MSYSTEM=UCRT64 MINGW_PREFIX=/ucrt64 MINGW_CHOST=x86_64-w64-mingw32 MSYSTEM_CARCH=x86_64 MSYSTEM_CHOST=x86_64-w64-mingw32 MSYSTEM_PREFIX=/ucrt64 TEMP=/tmp TMP=/tmp && $(NVCC) $(HUNGER_NVCC_FLAGS) backend_gpu_host_misc_win.obj backend_gpu_host_misc.cu -I.
++ 	@export MSYS2_ARG_CONV_EXCL="*" && export INCLUDE="$(INCLUDE);$(HUNGER_CUDA_WIN)/include" && "$(HUNGER_CL_WIN)" $(HUNGER_CL_FLAGS) $(HUNGER_CFILES)
++ 	@export MSYS2_ARG_CONV_EXCL="*" && export LIB="$(LIB);$(HUNGER_CUDA_WIN)/lib/x64" && "$(HUNGER_LINK_WIN)" /OUT:picolm.exe $(HUNGER_COBJS) $(HUNGER_CUOBS) "$(HUNGER_CUDA_WIN)/lib/x64/cudart.lib" ws2_32.lib advapi32.lib
++ 	-$(RM) $(HUNGER_CUOBS)
++ 
++ .PHONY: hunger-msys
++ 
+  # --- hunger-nogpu: pure MSVC build, no CUDA, no GPU backend ---
+  # Useful for isolating CPU-only bugs on Windows (same compiler as hunger,
+  # but without PICOLM_GPU so all GPU code is excluded at compile time).
