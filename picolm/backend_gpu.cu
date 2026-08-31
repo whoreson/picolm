@@ -574,6 +574,20 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
         }
         break;
 
+    case 11: /* GGUF_TYPE_Q3_K */
+        /* 256 values per block (110 bytes). Per-element dequant via helper. */
+        {
+            int n_blocks = I / 256;
+            for (int bi = gpuThreadIdx_x; bi < n_blocks; bi += gpuBlockDim_x) {
+                const void *blk = wrow + (size_t)bi * bytes_per_block;
+                for (int j = 0; j < 256; j++) {
+                    int i = bi * 256 + j;
+                    sum += x[rs*s+i] * dequant_q3_K(blk, j);
+                }
+            }
+        }
+        break;
+
     case 12: /* GGUF_TYPE_Q4_K */
         /* 256 values per block (144 bytes). Per-element dequant via helper. */
         {
