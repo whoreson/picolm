@@ -153,10 +153,14 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
 
         for (int a = 0; a < n_altup - 1; a++) {
             int a_dst = (a < i_altup_act) ? a : a + 1;
-            /* altup_proj: [n_embd, n_embd, n_altup-1], take slice a -> [n_embd, n_embd] */
+            /* altup_proj: [n_embd, n_embd, n_altup-1], take slice a -> [n_embd, n_embd]
+             * GGUF layout: ne[0]=dim, ne[1]=dim, ne[2]=n_altup-1 (fastest to slowest)
+             * Slice a starts at byte offset a * dim * dim * elem_size.
+             * Use uint8_t pointer for correct byte arithmetic regardless of element type (F16=2B). */
             float *dst = s->gemma3n_altup_state + a_dst * dim;
-            matmul(dst, s->x, (const float *)w->altup_proj + a * dim * dim,
-                   dim, dim, w->type_altup_proj);
+            size_t proj_elem_size = gguf_type_quant_size(w->type_altup_proj) / gguf_type_block_size(w->type_altup_proj);
+            const void *proj_a = (const uint8_t *)w->altup_proj + a * dim * dim * proj_elem_size;
+            matmul(dst, s->x, proj_a, dim, dim, w->type_altup_proj);
             /* Normalize to target magnitude */
             float new_mag = gemma3n_calc_magnitude(dst, dim);
             gemma3n_normalize(dst, dim, new_mag);
@@ -681,9 +685,11 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
         for (int a = 0; a < n_altup - 1; a++) {
             int a_src = (a < i_altup_act) ? a : a + 1;
             float *src = s->gemma3n_altup_state + a_src * dim;
-            /* unembed: altup_unembd_proj * src */
-            matmul(s->xb, src, (const float *)w->altup_unembd_proj + a * dim * dim,
-                   dim, dim, w->type_altup_unembd_proj);
+            /* unembed: altup_unembd_proj * src
+             * Same F16 byte offset fix as altup_proj above. */
+            size_t unembd_elem_size = gguf_type_quant_size(w->type_altup_unembd_proj) / gguf_type_block_size(w->type_altup_unembd_proj);
+            const void *unembd_a = (const uint8_t *)w->altup_unembd_proj + a * dim * dim * unembd_elem_size;
+            matmul(s->xb, src, unembd_a, dim, dim, w->type_altup_unembd_proj);
             /* Normalize to target magnitude */
             float new_mag = gemma3n_calc_magnitude(s->xb, dim);
             gemma3n_normalize(s->xb, dim, new_mag);
