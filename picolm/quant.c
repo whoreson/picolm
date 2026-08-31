@@ -3349,6 +3349,15 @@ float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n) {
     int nb = n / 32;
     float sumf = 0.0f;
     int i = 0;
+#if !defined(PICOLM_VNNI) && !defined(PICOLM_I8MM) && !defined(PICOLM_NEON) && !defined(PICOLM_AVX2) && !defined(PICOLM_AVX) && !defined(PICOLM_SSSE3)
+    /* Pure scalar path: no SIMD available */
+    for (i = 0; i < nb; i++) {
+        int sumi = 0;
+        for (int j = 0; j < 32; j++) sumi += x[i].qs[j] * w[i].qs[j];
+        sumf += (float)sumi * fp16_to_fp32_lookup(x[i].d) * fp16_to_fp32_lookup(w[i].d);
+    }
+    return sumf;
+#endif
 
 #ifdef PICOLM_VNNI
     /* AVX-512 VNNI: dpbusd + sign trick for signed int8 MAC.
@@ -3997,6 +4006,15 @@ float vec_dot_q8_0_q8_0_deltas(const void *qx, const float *qx_d, const void *qw
     int nb = n / 32;
     float sumf = 0.0f;
     int i = 0;
+#if !defined(PICOLM_I8MM) && !defined(PICOLM_NEON) && !defined(PICOLM_AVX512) && !defined(PICOLM_AVX2) && !defined(PICOLM_AVX) && !defined(PICOLM_SSSE3)
+    /* Pure scalar path: no SIMD available */
+    for (i = 0; i < nb; i++) {
+        int sumi = 0;
+        for (int j = 0; j < 32; j++) sumi += x[i].qs[j] * w[i].qs[j];
+        sumf += (float)sumi * qx_d[i] * fp16_to_fp32_lookup(w[i].d);
+    }
+    return sumf;
+#endif
 
 #ifdef PICOLM_I8MM
     /* I8MM: vmmlaq_s32 processes 16 int8 elements -> 4 int32 lanes.
