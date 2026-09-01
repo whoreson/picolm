@@ -332,6 +332,22 @@ static void init_rope_tables(run_state_t *s, const model_config_t *c) {
     }
 }
 
+/* Initialize SWA RoPE tables (Gemma-3n uses freq_base=10000 for SWA layers) */
+static void init_swa_rope_tables(run_state_t *s, const model_config_t *c) {
+    int rope_dim = (c->rope_dim > 0) ? c->rope_dim : c->head_dim;
+    int half_dim = rope_dim / 2;
+    float freq_base_swa = 10000.0f; /* Gemma-3n SWA freq_base */
+    for (int pos = 0; pos < c->max_seq_len; pos++) {
+        float *cos_row = s->rope_cos_swa + (size_t)pos * half_dim;
+        float *sin_row = s->rope_sin_swa + (size_t)pos * half_dim;
+        for (int i = 0; i < half_dim; i++) {
+            float theta = (float)pos / powf(freq_base_swa, (float)(2 * i) / (float)rope_dim);
+            cos_row[i] = cosf(theta);
+            sin_row[i] = sinf(theta);
+        }
+    }
+}
+
 /* ---- Buffer allocation ---- */
 
 /* Compute row size in bytes for a given KV cache type and number of elements */
@@ -740,6 +756,11 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
     /* RoPE tables */
     s->rope_cos = p; p += (size_t)c->max_seq_len * half_dim;
     s->rope_sin = p; p += (size_t)c->max_seq_len * half_dim;
+    /* SWA RoPE tables (Gemmma-3n: freq_base=10000 for SWA layers) */
+    if (c->is_gemma3n) {
+        s->rope_cos_swa = p; p += (size_t)c->max_seq_len * half_dim;
+        s->rope_sin_swa = p; p += (size_t)c->max_seq_len * half_dim;
+    }
 
     /* Norm weights */
     s->norm_weights = p;
@@ -1188,6 +1209,9 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
 
     /* Pre-compute RoPE tables (eliminates powf/cosf/sinf from hot path) */
     init_rope_tables(s, c);
+    if (c->is_gemma3n) {
+        init_swa_rope_tables(s, c);
+    }
 
 #ifdef PICOLM_GPU
     /* Initialize GPU backend if requested via environment variable */

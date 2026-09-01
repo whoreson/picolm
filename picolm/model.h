@@ -303,6 +303,9 @@ typedef struct {
     /* Pre-computed RoPE cos/sin tables [max_seq_len * head_dim/2] */
     float *rope_cos;
     float *rope_sin;
+    /* SWA-specific RoPE tables (for Gemma-3n, freq_base=10000 vs 1000000) */
+    float *rope_cos_swa;
+    float *rope_sin_swa;
 
     /* Pre-dequantized norm weights (small, keep in RAM) */
     float *norm_weights;
