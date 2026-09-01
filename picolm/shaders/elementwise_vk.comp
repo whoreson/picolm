@@ -1,0 +1,58 @@
+#version 450
+// Elementwise operations: residual_add, silu_mul, rope_apply
+// 4 STORAGE_BUFFER bindings, 16-byte push constant
+//
+// op=0: residual_add  bind0=a(ro), bind1=b(ro), bind2=out(rw)
+// op=1: silu_mul      bind0=gate(rw), bind1=up(ro), bind2=gate(rw, same buf as 0)
+// op=2: rope_apply    bind0=x(rw),   bind1=cos(ro), bind2=sin(ro)
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer B0 { float d0[]; };
+layout(set = 0, binding = 1) buffer B1 { float d1[]; };
+layout(set = 0, binding = 2) buffer B2 { float d2[]; };
+
+layout(push_constant) uniform PC {
+    int op;
+    int n;
+    float fp;
+    int pad;
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+
+    if (pc.op == 0) {
+        // residual_add: d2[i] = d0[i] + d1[i]
+        if (gid < uint(pc.n)) {
+            d2[gid] = d0[gid] + d1[gid];
+        }
+    } else if (pc.op == 1) {
+        // silu_mul: d0[i] = d0[i] * silu(d0[i]) * d1[i]  (in-place gate *= silu(gate) * up)
+        if (gid < uint(pc.n)) {
+            float g = d0[gid];
+            d0[gid] = g * (g / (1.0 + exp(-g))) * d1[gid];
+        }
+    } else if (pc.op == 2) {
+        // rope_apply: rotate pairs in d0 using d1=cos, d2=sin
+        // x layout: [head0][2*half_dim], [head1][2*half_dim], ...
+        // Each thread handles one pair index across all heads
+        // pc.n = half_dim, pc.fp = n_heads (as float), pc.pad = rope_type
+        uint hd2 = uint(pc.n);
+        int n_heads = int(pc.fp);
+        int rope_type = pc.pad;
+        int stride = 2 * int(hd2);
+
+        if (gid < hd2) {
+            for (int h = 0; h < n_heads; h++) {
+                int base = h * stride + 2 * int(gid);
+                float x0 = d0[base];
+                float x1 = d0[base + 1];
+                float c = d1[gid];
+                float s = d2[gid];
+                d0[base]     = x0 * c - x1 * s;
+                d0[base + 1] = x0 * s + x1 * c;
+            }
+        }
+    }
+}

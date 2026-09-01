@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 199309L
 // backend_vulkan.c
 //
 // Vulkan compute backend for PicoLM. Implements the backend_gpu.h C ABI using
@@ -367,6 +368,8 @@ static size_t gguf_row_bytes(gguf_type_t q, int I) {
         case GGUF_TYPE_Q4_0_4_8: return (size_t)((I + 31) / 32) * 18;
         case GGUF_TYPE_Q1_0:   return (size_t)((I + 127) / 128) * 18;
         case GGUF_TYPE_Q2_0:   return (size_t)((I + 127) / 128) * 34;
+        case GGUF_TYPE_Q2_K:   return (size_t)((I + 255) / 256) * 84;
+        case GGUF_TYPE_Q3_K:   return (size_t)((I + 255) / 256) * 110;
         default: return 0;
     }
 }
@@ -833,6 +836,42 @@ int picolm_gpu_tensor_upload(void **tensor, const void *weights,
     if (!arena_suballoc(total, &wbuf, &wptr)) {
                 return 0;
     }
+    // For K-quant formats (Q2_K, Q3_K), dequantize to F32 on CPU and upload as F32.
+    // The shader doesn't handle K-quant dequant correctly on weak GPUs.
+    gguf_type_t upload_qtype = qtype;
+    if (qtype == 10 || qtype == 11 || qtype == 14) {
+        // Convert to F32: each row is I floats = I*4 bytes
+        int f32_rw = (I * 4 + 3) / 4;
+        size_t f32_stride = (size_t)f32_rw * 4;
+        size_t f32_total = f32_stride * (size_t)O;
+        
+        // Reallocate if needed (F32 might be larger than quantized)
+        if (f32_total > total) {
+            vkDestroyBuffer(G.dev, wbuf, NULL);
+            if (!arena_suballoc(f32_total, &wbuf, &wptr)) return 0;
+            total = f32_total;
+        }
+        
+        // Dequantize each row to F32
+        float *f32_buf = malloc(I * sizeof(float));
+        if (!f32_buf) { vkDestroyBuffer(G.dev, wbuf, NULL); return 0; }
+        for (int o = 0; o < O; o++) {
+            dequantize_row((const uint8_t *)weights + (size_t)o * rb, f32_buf, I, qtype);
+            memcpy((uint8_t *)wptr + (size_t)o * f32_stride, f32_buf, I * sizeof(float));
+        }
+        free(f32_buf);
+        upload_qtype = 0; // F32
+        
+        picolm_gpu_tensor_t *t = calloc(1, sizeof(*t));
+        if (!t) { vkDestroyBuffer(G.dev, wbuf, NULL); return 0; }
+        t->wbuf = wbuf; t->wmem = VK_NULL_HANDLE;
+        t->qtype = upload_qtype; t->I = I; t->O = O; t->device = device;
+        t->row_bytes = I * 4; t->row_words = f32_rw; t->wbytes = total;
+        G.used_bytes += total;
+        *slot = t;
+        return 1;
+    }
+    
     for (int o = 0; o < O; o++) {
         memcpy((uint8_t *)wptr + (size_t)o * gpu_stride,
                (const uint8_t *)weights + (size_t)o * rb, rb);
@@ -2036,4 +2075,16 @@ int picolm_gpu_rmsnorm_matmul_dev_qkv(picolm_gpu_tensor_t *tq,
     (void)tq;(void)tk;(void)tv;(void)bq;(void)bk;(void)bv;
     (void)bx;(void)rw;(void)dim;(void)eps;(void)S;
     (void)xs;(void)device;(void)ysq;(void)ysk; return 0;
+}
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// MISSING STUBS (functions added in commits after 79c9912)
+// ---------------------------------------------------------------------------
+
+float *picolm_gpu_pipe_logits(int device) { (void)device; return NULL; }
+
+int picolm_gpu_matmul_logits(picolm_gpu_tensor_t *t, float *logits_dev,
+                              const float *x_dev, int device) {
+    (void)t; (void)logits_dev; (void)x_dev; (void)device; return 0;
 }
