@@ -4242,16 +4242,20 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
                                            head_dim, c->rms_norm_eps, n_kv_heads, 0, gpu_dev);
             }
 
-            /* F. RoPE on Q (in-place): rope(pipe_q, n_heads) */
-            /* RoPE tables for this position on device */
-            float *rope_cos_pos = (float *)gw->rope_cos_dev + (size_t)pos * rope_half;
-            float *rope_sin_pos = (float *)gw->rope_sin_dev + (size_t)pos * rope_half;
-            picolm_gpu_rope_apply(pipe_q, n_heads, head_dim,
-                                   rope_cos_pos, rope_sin_pos, rope_half, c->rope_type, gpu_dev);
+            /* F. RoPE on Q (in-place): rope(pipe_q, n_heads)
+             * SWA layers (il % swa_period < swa_period-1) use freq_base=10000,
+             * global layers (il % swa_period == swa_period-1) use freq_base=1000000. */
+            {
+                int is_swa = (c->swa_period > 0) && ((l % c->swa_period) < (c->swa_period - 1));
+                float *rope_cos_pos = (float *)(is_swa ? gw->rope_cos_swa_dev : gw->rope_cos_dev) + (size_t)pos * rope_half;
+                float *rope_sin_pos = (float *)(is_swa ? gw->rope_sin_swa_dev : gw->rope_sin_dev) + (size_t)pos * rope_half;
+                picolm_gpu_rope_apply(pipe_q, n_heads, head_dim,
+                                       rope_cos_pos, rope_sin_pos, rope_half, c->rope_type, gpu_dev);
 
-            /* G. RoPE on K (in-place): rope(pipe_k, n_kv_heads) */
-            picolm_gpu_rope_apply(pipe_k, n_kv_heads, head_dim,
-                                   rope_cos_pos, rope_sin_pos, rope_half, c->rope_type, gpu_dev);
+                /* G. RoPE on K (in-place): rope(pipe_k, n_kv_heads) */
+                picolm_gpu_rope_apply(pipe_k, n_kv_heads, head_dim,
+                                       rope_cos_pos, rope_sin_pos, rope_half, c->rope_type, gpu_dev);
+            }
 
             /* G. KV cache store: pack F32 -> F16 and write directly into the
              * device KV cache, entirely device-to-device. The previous
@@ -4640,13 +4644,16 @@ after_qkv:
             }
         }
 
-        /* RoPE */
+        /* RoPE: per-layer SWA/global selection */
         {
+            int is_swa = (c->swa_period > 0) && ((l % c->swa_period) < (c->swa_period - 1));
+            void *rope_cos_tbl = is_swa ? gw->rope_cos_swa_dev : gw->rope_cos_dev;
+            void *rope_sin_tbl = is_swa ? gw->rope_sin_swa_dev : gw->rope_sin_dev;
             picolm_gpu_rope_apply_batched(bq, n_heads, head_dim,
-                (float *)gw->rope_cos_dev, (float *)gw->rope_sin_dev,
+                (float *)rope_cos_tbl, (float *)rope_sin_tbl,
                 rope_half, start_pos, n_ubatch, c->rope_type, gpu_dev);
             picolm_gpu_rope_apply_batched(bk, n_kv_heads, head_dim,
-                (float *)gw->rope_cos_dev, (float *)gw->rope_sin_dev,
+                (float *)rope_cos_tbl, (float *)rope_sin_tbl,
                 rope_half, start_pos, n_ubatch, c->rope_type, gpu_dev);
         }
 

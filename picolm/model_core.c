@@ -1510,6 +1510,14 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                                 size_t rope_n = (size_t)c->max_seq_len * rope_half;
                                 m->gpu.rope_cos_dev = picolm_gpu_upload_f32(s->rope_cos, rope_n, device);
                                 m->gpu.rope_sin_dev = picolm_gpu_upload_f32(s->rope_sin, rope_n, device);
+                                /* SWA RoPE tables (Gemma-3n: freq_base=10000 for SWA layers) */
+                                if (c->is_gemma3n) {
+                                    m->gpu.rope_cos_swa_dev = picolm_gpu_upload_f32(s->rope_cos_swa, rope_n, device);
+                                    m->gpu.rope_sin_swa_dev = picolm_gpu_upload_f32(s->rope_sin_swa, rope_n, device);
+                                } else {
+                                    m->gpu.rope_cos_swa_dev = NULL;
+                                    m->gpu.rope_sin_swa_dev = NULL;
+                                }
                             }
                             /* Output norm */
                             m->gpu.output_norm_dev = picolm_gpu_upload_f32(s->output_norm_w, c->n_embd, device);
