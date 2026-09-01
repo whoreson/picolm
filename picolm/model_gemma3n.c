@@ -21,6 +21,9 @@
  * Gemma-3n forward pass
  * ================================================================ */
 
+/* Plumbing debug file handle */
+static FILE *g_plumbing_fp = NULL;
+
 /* Compute magnitude: sqrt(sum of squared elements) */
 static float gemma3n_calc_magnitude(float *x, int n) {
     float sum = 0.0f;
@@ -89,6 +92,15 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
         dequantize_row(embd_row, s->x, dim, w->type_token_embd);
         for (int i = 0; i < dim; i++) s->x[i] *= sqrt_dim;
     }
+    /* Plumbing check: dump embedding for specific token/pos */
+    { 
+      if(!g_plumbing_fp){const char *p=getenv("PICOLM_PLUMBING");if(p)g_plumbing_fp=fopen(p,"w");}
+      if(g_plumbing_fp && pos==18 && token==496){ /* pos=18, token=" a" (496) */
+        fprintf(g_plumbing_fp,"EMB token=%d rms=%.6f first5=%.6f,%.6f,%.6f,%.6f,%.6f\n",token,
+          0,s->x[0],s->x[1],s->x[2],s->x[3],s->x[4]);
+        double sm=0; for(int i=0;i<dim;i++){double v=s->x[i];sm+=v*v;}
+        fprintf(g_plumbing_fp,"EMB rms=%.6f\n",sqrt(sm/dim));
+      }}
     if (pos == 0 && getenv("PICOLM_DBG")) {
         double em = 0; for(int i=0;i<dim;i++){double v=s->x[i]; em+=v*v;}
     }
@@ -171,6 +183,15 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
             }
             fprintf(stderr, "}\n");
         }
+    }
+
+    /* Plumbing check: dump altup state after expand */
+    { if(g_plumbing_fp && pos==18 && token==496){
+        fprintf(g_plumbing_fp,"ALTUP_EXPAND rms=");
+        for(int a=0;a<n_altup;a++){
+          double sm=0;for(int i=0;i<dim;i++){double v=s->gemma3n_altup_state[a*dim+i];sm+=v*v;}
+          fprintf(g_plumbing_fp,"%.6f",sqrt(sm/dim));if(a<n_altup-1)fputc(',',g_plumbing_fp);}
+        fputc('\n',g_plumbing_fp);}
     }
 
     /* 4. Transformer layers */
@@ -475,10 +496,10 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
                 float mean = 0.0f;
                 for (int i = 0; i < n_ffn; i++) mean += gp[i];
                 mean /= (float)n_ffn;
-                /* std = sqrt(sum((x - mean)^2) / (n_ffn - 1)) */
+                /* std = sqrt(sum((x - mean)^2) / n_ffn) -- population std, matching jnp.std(ddof=0) */
                 float var = 0.0f;
                 for (int i = 0; i < n_ffn; i++) { float d = gp[i] - mean; var += d * d; }
-                var /= (float)(n_ffn - 1);
+                var /= (float)n_ffn;
                 float std = sqrtf(var);
                 /* cutoff = mean + std * f_sparsity_std_mul */
                 float cutoff = mean + std * c->f_sparsity_std_mul;
@@ -646,12 +667,21 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
             /* Active altup already set by correct step */
         }
 
-        /* cur = corrected predictions (all altups) -> next layer input is the concat */
+                /* cur = corrected predictions (all altups) -> next layer input is the concat */
 #ifdef PICOLM_VIZ
         viz_push_layer(l, s->gemma3n_altup_state + i_altup_act * dim, dim);
 #endif
     }
     } /* end of stop_layer scope */
+
+    /* Plumbing check: dump final altup state before unembed */
+    { if(g_plumbing_fp && pos==18 && token==496){
+        fprintf(g_plumbing_fp,"POST_LAYERS rms=");
+        for(int a=0;a<n_altup;a++){
+          double sm=0;for(int i=0;i<dim;i++){double v=s->gemma3n_altup_state[a*dim+i];sm+=v*v;}
+          fprintf(g_plumbing_fp,"%.6f",sqrt(sm/dim));if(a<n_altup-1)fputc(',',g_plumbing_fp);}
+        fputc('\n',g_plumbing_fp);}
+    }
 
     /* 5. ALTUP unembed: merge all altups back to single copy
      * llama.cpp always uses altup 0 as the base (not the active altup),
@@ -684,13 +714,28 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
         for (int i = 0; i < dim; i++) s->x[i] *= inv_n;
     }
 
+            /* Plumbing debug: dump hidden state at generation positions */
+    if (pos >= 16 && pos <= 20) {
+        double _sm = 0; for(int _i = 0; _i < dim; _i++) { double _v = s->x[_i]; _sm += _v*_v; }
+        float _rms = sqrtf(_sm / dim);
+        fprintf(stderr, "[PLUMB pos=%d rms=%.6f x0=%.6f]\n", pos, _rms, s->x[0]);
+    }
     /* 6. Final RMSNorm */
     if (pos <= 1 && getenv("PICOLM_DBG")) {
         double om = 0; for(int i=0;i<dim;i++){double v=s->x[i]; om+=v*v;}
         for(int i=0;i<5;i++) fprintf(stderr,"%.4f%s",s->x[i],i<4?",":"");
         fprintf(stderr, "}\n");
     }
+    /* Plumbing check: dump hidden state before and after final norm */
+    { if(g_plumbing_fp && pos==18 && token==496){
+        double sm=0;for(int i=0;i<dim;i++){double v=s->x[i];sm+=v*v;}
+        fprintf(g_plumbing_fp,"PRE_NORM rms=%.6f first5=%.6f,%.6f,%.6f,%.6f,%.6f\n",sqrt(sm/dim),s->x[0],s->x[1],s->x[2],s->x[3],s->x[4]);}
+    }
     rmsnorm(s->x, s->x, s->output_norm_w, dim, rms_norm_eps);
+    { if(g_plumbing_fp && pos==18 && token==496){
+        double sm=0;for(int i=0;i<dim;i++){double v=s->x[i];sm+=v*v;}
+        fprintf(g_plumbing_fp,"POST_NORM rms=%.6f first5=%.6f,%.6f,%.6f,%.6f,%.6f\n",sqrt(sm/dim),s->x[0],s->x[1],s->x[2],s->x[3],s->x[4]);}
+    }
 
     if (pos <= 1 && getenv("PICOLM_DBG")) {
         double om = 0; for(int i=0;i<dim;i++){double v=s->x[i]; om+=v*v;}
@@ -700,12 +745,29 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
     /* 7. Output projection -> logits */
     matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
 
+    /* Plumbing check: dump logits before and after softcap */
+    { if(g_plumbing_fp && pos==18 && token==496){
+        fprintf(g_plumbing_fp,"RAW_LOGITS top5=");
+        for(int rank=0;rank<5;rank++){
+            int best=-1;float bestv=-1e30f;
+            for(int i=0;i<c->vocab_size;i++) if(s->logits[i]>bestv){bestv=s->logits[i];best=i;}
+            fprintf(g_plumbing_fp,"%d(%.4f) ",best,bestv);s->logits[best]=-1e30f;}
+        fprintf(g_plumbing_fp,"\n");}
+    }
     /* 8. Logit soft-capping: tanh(logits / softcap) * softcap */
     if (c->f_final_logit_softcapping > 0) {
         float inv_cap = 1.0f / c->f_final_logit_softcapping;
         for (int i = 0; i < c->vocab_size; i++) {
             s->logits[i] = tanhf(s->logits[i] * inv_cap) * c->f_final_logit_softcapping;
         }
+    }
+    { if(g_plumbing_fp && pos==18 && token==496){
+        fprintf(g_plumbing_fp,"CAP_LOGITS top5=");
+        for(int rank=0;rank<5;rank++){
+            int best=-1;float bestv=-1e30f;
+            for(int i=0;i<c->vocab_size;i++) if(s->logits[i]>bestv){bestv=s->logits[i];best=i;}
+            fprintf(g_plumbing_fp,"%d(%.4f) ",best,bestv);s->logits[best]=-1e30f;}
+        fprintf(g_plumbing_fp,"\n");fclose(g_plumbing_fp);g_plumbing_fp=NULL;}
     }
 
     if (pos <= 1 && getenv("PICOLM_DBG")) {
