@@ -3480,7 +3480,13 @@ void silu(float *x, int size) {
 }
 
 void gelu(float *x, int size) {
-    picolm_gelu_table_f32(x, size);
+    /* Gemma-3n: use F32 GELU for numerical accuracy.
+     * The F16 table lookup introduces quantization error that compounds over 35 layers. */
+    if (getenv("PICOLM_GELU_F32")) {
+        picolm_gelu_f32(x, size);
+    } else {
+        picolm_gelu_table_f32(x, size);
+    }
 }
 void elemwise_mul(float *out, const float *a, const float *b, int size) {
 #ifdef PICOLM_AVX512

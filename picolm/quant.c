@@ -6768,14 +6768,20 @@ void fma_scale_tq4_f32(float *dst, float correction, const void *src, int n) {
  * ================================================================ */
 uint16_t picolm_gelu_table[65536];
 
-static float gelu_f32(float x) {
+static float gelu_f32_scalar(float x) {
     return 0.5f * x * (1.0f + tanhf(0.79788456f * (x + 0.044715f * x * x * x)));
+}
+
+void picolm_gelu_f32(float *x, int size) {
+    for (int i = 0; i < size; i++) {
+        x[i] = gelu_f32_scalar(x[i]);
+    }
 }
 
 void picolm_init_gelu_table(void) {
     for (int i = 0; i < 65536; i++) {
         float f = fp16_to_fp32_lookup(i);
-        float g = gelu_f32(f);
+        float g = gelu_f32_scalar(f);
         picolm_gelu_table[i] = fp32_to_fp16(g);
     }
 }

@@ -649,11 +649,31 @@ int model_list_kv(const char *path) {
               keybuf[klen-3] = '.'; keybuf[klen-2] = '.'; keybuf[klen-1] = '.';
           }
 
-          /* Format the value */
-          char valbuf[80];
+          /* Format the value (use large buffer for chat templates etc.) */
+          char valbuf[65536];
           gguf_format_value(valbuf, (int)sizeof(valbuf), &r, vtype);
 
-          APPEND("%-50s %s\n", keybuf, valbuf);
+          /* Replace newlines in value with \\n for single-line display, or print multiline */
+          size_t vlen = strlen(valbuf);
+          /* Check if multiline */
+          if (strchr(valbuf, '\n')) {
+              /* Print key on its own line, then value indented */
+              APPEND("%s:\n", keybuf);
+              /* Indent each line of value */
+              const char *line = valbuf;
+              while (*line) {
+                  const char *nl = strchr(line, '\n');
+                  if (nl) {
+                      APPEND("  %.*s\n", (int)(nl - line), line);
+                      line = nl + 1;
+                  } else {
+                      APPEND("  %s\n", line);
+                      break;
+                  }
+              }
+          } else {
+              APPEND("%-50s %s\n", keybuf, valbuf);
+          }
       }
       #undef APPEND
 
