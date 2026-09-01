@@ -278,7 +278,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "\nInfo options:\n");
     fprintf(stderr, "  --list-tensors   List all tensors (name, shape, type) and exit\n");
     fprintf(stderr, "  --list-kv        List all KV metadata entries and exit\n");
-    fprintf(stderr, "  --benchmark      Continuous benchmark loop (Ctrl-C to stop)\n");
+    fprintf(stderr, "  --benchmark [N]  Benchmark loop (N times, omit for continuous)\n");
     fprintf(stderr, "  --benchmark-ctx  Benchmark prefill+gen speed at growing context sizes.\n");
     fprintf(stderr, "                  Works with -c to set max context. Starts from a base prompt,\n");
     fprintf(stderr, "                  appends generated tokens, and at each step inserts 2 new tokens\n");
@@ -464,11 +464,11 @@ static void bench_callback(int layer, int is_prefill, double elapsed_ms, long mi
 
 /* Print benchmark summary */
 static void bench_summary(const bench_ctx_t *bc, int iteration, double wall_sec) {
-    fprintf(stderr, "\n--- Iteration %d (%.2fs wall) ---\n", iteration, wall_sec);
+    fprintf(stdout, "\n--- Iteration %d (%.2fs wall) ---\n", iteration, wall_sec);
     if (bc->prefill_layer_count > 0) {
         double prefill_tok_s = (bc->prefill_total_ms > 0) ?
             (double)bc->n_prompt_tokens / (bc->prefill_total_ms / 1000.0) : 0;
-        fprintf(stderr, "  Prefill: %d tokens, %d layers, %.1fms (%.1f tok/s, %.1fms/layer)\n",
+        fprintf(stdout, "  Prefill: %d tokens, %d layers, %.1fms (%.1f tok/s, %.1fms/layer)\n",
                 bc->n_prompt_tokens, bc->prefill_layer_count,
                 bc->prefill_total_ms, prefill_tok_s,
                 bc->prefill_total_ms / bc->prefill_layer_count);
@@ -476,17 +476,17 @@ static void bench_summary(const bench_ctx_t *bc, int iteration, double wall_sec)
     if (bc->gen_layer_count > 0) {
         double gen_tok_s = (bc->gen_total_ms > 0) ?
             (double)bc->gen_tokens / (bc->gen_total_ms / 1000.0) : 0;
-        fprintf(stderr, "  Generation: %d tokens, %d layers, %.1fms (%.1f tok/s, %.1fms/token)\n",
+        fprintf(stdout, "  Generation: %d tokens, %d layers, %.1fms (%.1f tok/s, %.1fms/token)\n",
                 bc->gen_tokens, bc->gen_layer_count,
                 bc->gen_total_ms, gen_tok_s,
                 bc->gen_total_ms / bc->gen_tokens);
     }
     if (bc->total_minflt > 0 || bc->total_majflt > 0) {
-        fprintf(stderr, "  Page faults: %lu minor, %lu major\n",
+        fprintf(stdout, "  Page faults: %lu minor, %lu major\n",
                 (unsigned long)bc->total_minflt, (unsigned long)bc->total_majflt);
     }
-    fprintf(stderr, "  Total wall time: %.2fs\n", wall_sec);
-    fprintf(stderr, "----------------------------------\n\n");
+    fprintf(stdout, "  Total wall time: %.2fs\n", wall_sec);
+    fprintf(stdout, "----------------------------------\n\n");
 }
 
 #ifdef PICOLM_GPU
@@ -996,6 +996,7 @@ int main(int argc, char **argv) {
     int    do_attn_scalar_diff = 0;  /* --gpu-attn-scalar-diff */
     int    attn_n_tok = 64, attn_n_heads = 40, attn_n_kv = 8, attn_head_dim = 128;
     int    do_benchmark_ctx = 0;  /* --benchmark-ctx */
+    int    benchmark_iters = 0;   /* 0=infinite, N=run N times */
     #if !defined(_WIN32) && !defined(PICOLM_DOS)
     int    server_daemon = 0;
 #endif
@@ -1141,6 +1142,9 @@ int main(int argc, char **argv) {
             }
         } else if (strcmp(argv[i], "--benchmark") == 0) {
             benchmark_mode = 1;
+            if (i + 1 < argc && argv[i+1][0] != '-') {
+                benchmark_iters = atoi(argv[++i]);
+            }
 #ifdef PICOLM_VIZ
         } else if (strcmp(argv[i], "--viz") == 0) {
             viz_mode = 1;
@@ -1594,29 +1598,33 @@ int main(int argc, char **argv) {
 
     /* ---- Benchmark mode ---- */
     if (benchmark_mode) {
-        fprintf(stderr, "\nBenchmark mode (Ctrl-C to stop)\n");
-        fprintf(stderr, "  Model: %.1f GB | SIMD: ", (double)model.mmap_size / (1024.0*1024.0*1024.0));
+        fprintf(stdout, "\nBenchmark mode");
+        if (benchmark_iters > 0) {
+            fprintf(stdout, " (%d iterations)", benchmark_iters);
+        }
+        fprintf(stdout, "\n");
+        fprintf(stdout, "  Model: %.1f GB | SIMD: ", (double)model.mmap_size / (1024.0*1024.0*1024.0));
 #if defined(PICOLM_AVX512)
-        fprintf(stderr, "AVX-512");
+        fprintf(stdout, "AVX-512");
 #elif defined(PICOLM_AVX2)
-        fprintf(stderr, "AVX2");
+        fprintf(stdout, "AVX2");
 #elif defined(PICOLM_AVX)
-        fprintf(stderr, "AVX");
+        fprintf(stdout, "AVX");
 #elif defined(PICOLM_SSE3)
-        fprintf(stderr, "SSE3");
+        fprintf(stdout, "SSE3");
 #elif defined(PICOLM_SSE2)
-        fprintf(stderr, "SSE2");
+        fprintf(stdout, "SSE2");
 #elif defined(PICOLM_NEON)
-        fprintf(stderr, "NEON");
+        fprintf(stdout, "NEON");
 #elif defined(PICOLM_ALTIVEC)
-        fprintf(stderr, "Altivec");
+        fprintf(stdout, "Altivec");
 #else
-        fprintf(stderr, "scalar");
+        fprintf(stdout, "scalar");
 #endif
-        fprintf(stderr, " | Threads: %d\n", num_threads);
-        fprintf(stderr, "  Context: %d | KV cache: %.0f MB\n",
+        fprintf(stdout, " | Threads: %d\n", num_threads);
+        fprintf(stdout, "  Context: %d | KV cache: %.0f MB\n",
                 model.config.max_seq_len, (double)model.state.kv_size / (1024.0*1024.0));
-        fprintf(stderr, "  Prompt: %d tokens | Generate: %d tokens\n\n", n_prompt, max_tokens);
+        fprintf(stdout, "  Prompt: %d tokens | Generate: %d tokens\n\n", n_prompt, max_tokens);
 
         /* Set up benchmark context */
         bench_ctx_t bench;
@@ -1647,6 +1655,7 @@ int main(int argc, char **argv) {
 
         while (1) {
             iteration++;
+            if (benchmark_iters > 0 && iteration > benchmark_iters) break;
             bench.iteration = iteration;
             bench.prefill_total_ms = 0;
             bench.gen_total_ms = 0;
