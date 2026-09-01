@@ -29,6 +29,119 @@ float f16tof32(uint h) {
     return uintBitsToFloat(bits);
 }
 
+uint read_byte(uint rowBase, uint byteOff) {
+    uint wIdx = rowBase + byteOff / 4u;
+    return (w[wIdx] >> ((byteOff % 4u) * 8u)) & 0xffu;
+}
+
+// Q2_K: 256 values in 84 bytes: scales[16] + qs[64] + d(fp16) + dmin(fp16)
+float dequant_q2_K(uint rowBase, uint bo, int i) {
+    uint d_raw = read_byte(rowBase, bo+80u) | (read_byte(rowBase, bo+81u) << 8u);
+    uint dm_raw = read_byte(rowBase, bo+82u) | (read_byte(rowBase, bo+83u) << 8u);
+    float d = f16tof32(d_raw);
+    float dmin = f16tof32(dm_raw);
+    
+    int chunk = i / 128;
+    int i_in_chunk = i % 128;
+    int group = i_in_chunk / 16;
+    int l = i_in_chunk % 16;
+    int shift = (group % 4) * 2;
+    int half = group / 4;
+    int scale_idx = chunk * 8 + group;
+    
+    uint sc_byte = read_byte(rowBase, bo + uint(scale_idx));
+    uint sc = sc_byte & 0xfu;
+    uint mn = sc_byte >> 4u;
+    
+    uint qs_val = read_byte(rowBase, bo + 16u + uint(chunk*32 + half*16 + l));
+    int v = int((qs_val >> shift) & 3u);
+    
+    return d * float(sc) * float(v) - dmin * float(mn);
+}
+
+// Q3_K: 256 values in 110 bytes: hmask[32] + qs[64] + scales[12] + d(fp16)
+// Unpacks 16 six-bit scales from 12 bytes, then dequantizes per-element
+float dequant_q3_K(uint rowBase, uint bo, int i) {
+    // Read d (fp16 at offset 108)
+    uint d_raw = read_byte(rowBase, bo+108u) | (read_byte(rowBase, bo+109u) << 8u);
+    float d = f16tof32(d_raw);
+    
+    // Read scales[12] at offset 96, unpack into 16 six-bit values
+    // scales: bytes 96..107 of block (12 bytes = 3 uint32)
+    uint s0 = w[rowBase + (bo + 96u) / 4u];
+    uint s1 = w[rowBase + (bo + 100u) / 4u];
+    uint s2 = w[rowBase + (bo + 104u) / 4u];
+    
+    // Adjust for byte alignment within words
+    uint bo_mod = bo % 4u;
+    if (bo_mod != 0u) {
+        uint shift0 = bo_mod * 8u;
+        s0 = (s0 >> shift0) | (w[rowBase + (bo + 96u) / 4u + 1u] << (32u - shift0));
+        s1 = (w[rowBase + (bo + 100u) / 4u] >> shift0) | (w[rowBase + (bo + 100u) / 4u + 1u] << (32u - shift0));
+        s2 = (w[rowBase + (bo + 104u) / 4u] >> shift0) | (w[rowBase + (bo + 104u) / 4u + 1u] << (32u - shift0));
+    }
+    
+    // Unpack 16 six-bit scales from 3 uint32
+    // From CPU: tmp=aux[2], then:
+    // aux[0] = (s0&0x0F0F0F0F) | (((s2>>0)&0x03030303)<<4)
+    // aux[1] = (s1&0x0F0F0F0F) | (((s2>>2)&0x03030303)<<4)
+    // aux[2] = ((s0>>4)&0x0F0F0F0F) | (((s2>>4)&0x03030303)<<4)
+    // aux[3] = ((s1>>4)&0x0F0F0F0F) | (((s2>>6)&0x03030303)<<4)
+    uint tmp = s2;
+    uint a0 = (s0 & 0x0F0F0F0F) | ((tmp & 0x03030303) << 4);
+    uint a1 = (s1 & 0x0F0F0F0F) | (((tmp >> 2) & 0x03030303) << 4);
+    uint a2 = ((s0 >> 4) & 0x0F0F0F0F) | (((tmp >> 4) & 0x03030303) << 4);
+    uint a3 = ((s1 >> 4) & 0x0F0F0F0F) | (((tmp >> 6) & 0x03030303) << 4);
+    
+    // Now a0..a3 each have 4 nibbles, each nibble is a 6-bit scale value [0..63]
+    // scales[0..3] in a0, [4..7] in a1, [8..11] in a2, [12..15] in a3
+    // Each 6-bit value is stored in a byte position
+    
+    int chunk = i / 128;              // 0..1
+    int i_in_chunk = i % 128;         // 0..127
+    int sub_16 = i_in_chunk / 16;     // 0..7
+    int l = i_in_chunk % 16;          // 0..15
+    
+    // Determine which aux word and which nibble
+    int aux_word = sub_16 / 4;       // 0..1 (a0/a1 for first 8, a2/a3 for second 8)
+    // Wait, 8 sub-groups per chunk, 2 aux words per chunk? No.
+    // 16 scales total: a0=0..3, a1=4..7, a2=8..11, a3=12..15
+    int scale_idx = chunk * 8 + sub_16;  // 0..15
+    
+    // Extract the 6-bit scale from the appropriate aux word
+    int aux_idx = scale_idx / 4;     // 0..3
+    int nibble = scale_idx % 4;       // 0..3
+    uint aux_val;
+    if (aux_idx == 0) aux_val = a0;
+    else if (aux_idx == 1) aux_val = a1;
+    else if (aux_idx == 2) aux_val = a2;
+    else aux_val = a3;
+    int scale = int((aux_val >> (nibble * 8u)) & 0xffu);
+    
+    // Read quant value: 2-bit from qs, with hmask offset
+    // qs layout: 64 bytes, 2 chunks of 32 bytes
+    // hmask: 32 bytes
+    int shift = (sub_16 % 4) * 2;    // 0,2,4,6
+    int qs_half = sub_16 / 4;         // 0 or 1
+    
+    int qs_idx = chunk * 32 + qs_half * 16 + l;
+    uint qs_val = read_byte(rowBase, bo + 32u + uint(qs_idx));  // qs at offset 32
+    int q = int((qs_val >> shift) & 3u);
+    
+    // hmask: bit l of byte (chunk*16 + sub_16*2 + qs_half) 
+    // Actually from CPU code: hm[l] & m where m starts at 1 and shifts per group
+    // m <<= 1 after each pair of sub-groups (j=0: m=1, j=1: m=2, j=2: m=4, j=3: m=8)
+    // Then for second chunk, m resets to 1
+    int hm_byte_idx = chunk * 16 + qs_half * 8 + l;
+    int hm_bit = (sub_16 % 4);  // which bit of the byte
+    uint hm_byte = read_byte(rowBase, bo + uint(hm_byte_idx));  // hmask at offset 0
+    int hm_bit_val = int((hm_byte >> hm_bit) & 1u);
+    
+    int offset = hm_bit_val ? 0 : 4;
+    float val = d * float(scale - 32) * float(q - offset);
+    return val;
+}
+
 void main() {
     int s   = int(gl_WorkGroupID.y);
     int tid = int(gl_LocalInvocationID.x);
@@ -53,83 +166,72 @@ void main() {
     float sum = 0.0;
 
     if (p.fmt == 8) {
-        // Q8_0: blocks of 34 bytes (d16 + qs[32]), tightly packed in row.
-        // Block bi starts at byte bi*34 within the row.
-        // Read via byte-offset into uint32 words.
+        // Q8_0: 34 bytes/block, 32 values/block
         int nblocks = (p.I + 31) / 32;
         for (int bi = tid; bi < nblocks; bi += nth) {
-            uint blockByteOff = uint(bi) * 34u;
-            // d16 at blockByteOff+0, blockByteOff+1
-            uint dWord = rowBase + blockByteOff / 4u;
-            uint dShift = (blockByteOff % 4u) * 8u;
-            uint dLo = (w[dWord] >> dShift) & 0xffu;
-            uint dHi = (w[dWord] >> (dShift + 8u)) & 0xffu;
-            float d = f16tof32(dLo | (dHi << 8u));
-
-            // qs[v] at blockByteOff + 2 + v
+            uint bo = uint(bi) * 34u;
+            uint dWord = rowBase + bo / 4u;
+            uint dShift = (bo % 4u) * 8u;
+            float d = f16tof32((w[dWord] >> dShift) & 0xffffu);
             for (int v = 0; v < 32; v++) {
                 int vi = bi * 32 + v;
                 if (vi >= p.I) break;
-                uint byteOff = blockByteOff + 2u + uint(v);
-                uint wIdx = rowBase + byteOff / 4u;
-                uint bShift = (byteOff % 4u) * 8u;
-                uint bv = (w[wIdx] >> bShift) & 0xffu;
+                uint bv = read_byte(rowBase, bo + 2u + uint(v));
                 int val = int(bv); if (val >= 128) val -= 256;
                 float xval = staged ? xsh[vi] : x[xoff + vi];
                 sum += xval * float(val) * d;
             }
         }
     } else if (p.fmt == 2) {
-        // Q4_0: blocks of 18 bytes (d16 + qs[16]), tightly packed.
-        // Block bi starts at byte bi*18 within the row.
+        // Q4_0: 18 bytes/block, 32 values/block
         int nblocks = (p.I + 31) / 32;
         for (int bi = tid; bi < nblocks; bi += nth) {
-            uint blockByteOff = uint(bi) * 18u;
-            uint dWord = rowBase + blockByteOff / 4u;
-            uint dShift = (blockByteOff % 4u) * 8u;
-            uint dLo = (w[dWord] >> dShift) & 0xffu;
-            uint dHi = (w[dWord] >> (dShift + 8u)) & 0xffu;
-            float d = f16tof32(dLo | (dHi << 8u));
-
-            // qs[v] for v=0..31: byte index = blockByteOff + 2 + nibble_idx
-            // where nibble_idx = v for v<16, v-16 for v>=16
+            uint bo = uint(bi) * 18u;
+            float d = f16tof32(read_byte(rowBase, bo) | (read_byte(rowBase, bo+1u) << 8u));
             for (int v = 0; v < 32; v++) {
                 int vi = bi * 32 + v;
                 if (vi >= p.I) break;
-                uint nibbleIdx;
-                uint nibbleShift;
-                if (v < 16) {
-                    nibbleIdx = uint(v);
-                    nibbleShift = 0u;
-                } else {
-                    nibbleIdx = uint(v - 16);
-                    nibbleShift = 4u;
-                }
-                uint byteOff = blockByteOff + 2u + nibbleIdx;
-                uint wIdx = rowBase + byteOff / 4u;
-                uint bShift = (byteOff % 4u) * 8u;
-                uint bv = (w[wIdx] >> bShift) & 0xffu;
-                int val = int((bv >> nibbleShift) & 0xfu) - 8;
+                uint ni = v < 16 ? uint(v) : uint(v - 16);
+                uint ns = v < 16 ? 0u : 4u;
+                uint bv = read_byte(rowBase, bo + 2u + ni);
+                int val = int((bv >> ns) & 0xfu) - 8;
                 float xval = staged ? xsh[vi] : x[xoff + vi];
                 sum += xval * float(val) * d;
             }
         }
     } else if (p.fmt == 1) {
-        // F16: 2 bytes per value
+        // F16
         for (int i = tid; i < p.I; i += nth) {
             float xval = staged ? xsh[i] : x[xoff + i];
-            uint byteOff = uint(i) * 2u;
-            uint wIdx = rowBase + byteOff / 4u;
-            uint bShift = (byteOff % 4u) * 8u;
-            uint lo = (w[wIdx] >> bShift) & 0xffu;
-            uint hi = (w[wIdx] >> (bShift + 8u)) & 0xffu;
-            sum += xval * f16tof32(lo | (hi << 8u));
+            sum += xval * f16tof32(read_byte(rowBase, uint(i)*2u) | (read_byte(rowBase, uint(i)*2u+1u) << 8u));
         }
-    } else {
-        // F32: 4 bytes per value (already word-aligned)
+    } else if (p.fmt == 0) {
+        // F32
         for (int i = tid; i < p.I; i += nth) {
             float xval = staged ? xsh[i] : x[xoff + i];
             sum += xval * uintBitsToFloat(w[rowBase + uint(i)]);
+        }
+    } else if (p.fmt == 10) {
+        // Q2_K: 84 bytes/block, 256 values/block
+        int nblocks = (p.I + 255) / 256;
+        for (int bi = tid; bi < nblocks; bi += nth) {
+            uint bo = uint(bi) * 84u;
+            for (int j = 0; j < 256; j++) {
+                int vi = bi * 256 + j;
+                if (vi >= p.I) break;
+                sum += (staged ? xsh[vi] : x[xoff + vi]) * dequant_q2_K(rowBase, bo, j);
+            }
+        }
+    } else if (p.fmt == 11) {
+        // Q3_K: 110 bytes/block, 256 values/block
+        int nblocks = (p.I + 255) / 256;
+        for (int bi = tid; bi < nblocks; bi += nth) {
+            uint bo = uint(bi) * 110u;
+            for (int j = 0; j < 256; j++) {
+                int vi = bi * 256 + j;
+                if (vi >= p.I) break;
+                sum += (staged ? xsh[vi] : x[xoff + vi]) * dequant_q3_K(rowBase, bo, j);
+            }
         }
     }
 
