@@ -79,8 +79,8 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
     float sqrt_2 = sqrtf(2.0f);
     float sqrt_embd = sqrtf((float)dim);
 
-    float *cos_pos = s->rope_cos + (size_t)pos * half_dim;
-    float *sin_pos = s->rope_sin + (size_t)pos * half_dim;
+    /* Per-layer RoPE table selection for SWA (done inside layer loop) */
+    int swa_period = c->swa_period;
 
     /* 1. Token embedding lookup, scaled by sqrt(n_embd) */
     {
@@ -331,8 +331,15 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
               }
             }
 
-            /* RoPE */
-            rope(s->q, s->xb2, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos, c->rope_type, half_dim);
+            /* RoPE: select SWA or global table per layer
+             * llama.cpp: is_swa(il) = il % swa_period < (swa_period - 1)
+             * SWA layers use freq_base=10000, global uses freq_base=1000000 */
+            {
+                int is_swa = (swa_period > 0) && ((l % swa_period) < (swa_period - 1));
+                float *lcos = (is_swa ? s->rope_cos_swa : s->rope_cos) + (size_t)pos * half_dim;
+                float *lsin = (is_swa ? s->rope_sin_swa : s->rope_sin) + (size_t)pos * half_dim;
+                rope(s->q, s->xb2, head_dim, n_heads, n_kv_heads, lcos, lsin, c->rope_type, half_dim);
+            }
 
             /* Store K/V */
             {
@@ -392,8 +399,13 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
                     rmsnorm(s->q + h * head_dim, s->q + h * head_dim, qnw, head_dim, rms_norm_eps);
             }
 
-            /* RoPE on Q only */
-            rope(s->q, s->xb2, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos, c->rope_type, half_dim);
+            /* RoPE on Q only (same SWA/global selection as KV layer above) */
+            {
+                int is_swa = (swa_period > 0) && ((l % swa_period) < (swa_period - 1));
+                float *lcos = (is_swa ? s->rope_cos_swa : s->rope_cos) + (size_t)pos * half_dim;
+                float *lsin = (is_swa ? s->rope_sin_swa : s->rope_sin) + (size_t)pos * half_dim;
+                rope(s->q, s->xb2, head_dim, n_heads, n_kv_heads, lcos, lsin, c->rope_type, half_dim);
+            }
 
             /* Attention (reuse KV from layer n_layer_kv-1) */
             {
