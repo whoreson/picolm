@@ -642,7 +642,8 @@ hunger-nogpu:
 # Build host: Linux with cross-compiler at /data4/work/djgpp-build/djgpp-toolchain/bin/
 # Run on DOS/DOSEMU/DOSBox. No GPU, no SIMD, no threading, no server/viz.
 DJGPP_CC   = /data4/work/djgpp-build/djgpp-toolchain/bin/i586-pc-msdosdjgpp-gcc
-DJGPP_CFLAGS = -Os -std=c11 -DPICOLM_DOS=1 -Wall
+DJGPP_INCLUDES = -nostdinc -isystem /data4/work/djgpp-build/djgpp-toolchain/lib/gcc/i586-pc-msdosdjgpp/7.5.0/include -isystem /data4/work/djgpp-build/djgpp-runtime/include
+DJGPP_CFLAGS = -Os -mmmx -march=k6 -std=gnu11 -DPICOLM_DOS=1 -Wall $(DJGPP_INCLUDES)
 DJGPP_SRCS = picolm.c $(MODEL_SRCS) tensor.c quant.c tokenizer.c qwen_tokenize.c \
 	sampler.c grammar.c cJSON.c csafetensors.c json.c safetensors.c sgemm.c
 DJGPP_OBJS = $(DJGPP_SRCS:.c=.o.dos)

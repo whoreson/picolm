@@ -19,9 +19,9 @@
 #include <errno.h>
 #include <math.h>
 #ifdef PICOLM_DOS
-#include <alloca.h>
 #include <time.h>
 #include <fcntl.h>
+#include <dpmi.h>
 #endif
 #ifdef PICOLM_GPU
 #ifdef PICOLM_CUDA
@@ -1329,6 +1329,19 @@ int main(int argc, char **argv) {
 
     /* Load model */
     fprintf(stderr, "PicoLM v1.0-beta2\n");
+#ifdef PICOLM_DOS
+    {
+        /* DOS: print DPMI memory diagnostic */
+        __dpmi_free_mem_info info;
+        if (__dpmi_get_free_memory_information(&info) >= 0) {
+            unsigned long total_mb = info.total_number_of_physical_pages * 4 / 1024;
+            unsigned long free_mb  = info.total_number_of_free_pages * 4 / 1024;
+            unsigned long usable   = free_mb > 5 ? free_mb - 5 : 0;
+            fprintf(stderr, "DPMI memory: %lu MB total, %lu MB free, ~%lu MB usable for model\n",
+                    total_mb, free_mb, usable);
+        }
+    }
+#endif
     fprintf(stderr, "Loading model: %s\n", model_path);
     #if defined(PICOLM_AVX512)
     fprintf(stderr, "SIMD: AVX-512\n");

@@ -9,9 +9,7 @@
 #include <cuda_profiler_api.h>
 #endif
 #endif
-#ifdef PICOLM_DOS
-#include <alloca.h>
-#endif
+/* DJGPP: no alloca.h needed, uses __builtin_alloca */
 #include <string.h>
 #include <math.h>
 #include <assert.h>

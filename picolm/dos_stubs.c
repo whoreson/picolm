@@ -16,8 +16,6 @@
  * (DPMI base address, data segment selector, stack boundaries, etc.).
  * This is the cross-platform substitute for stubify.exe which can't
  * run on Linux build hosts. */
-struct _reent;
-struct _reent *_impure_ptr;
 char **_environ;
 unsigned char _ctype_[257];
 unsigned long ___djgpp_base_address;
