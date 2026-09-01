@@ -161,6 +161,22 @@ static void dump_top_logits(const float *logits, int vocab_size, int pos, int to
     free(indices);
 }
 
+/* Debug: dump logits to file for external comparison (env: PICOLM_DUMP_LOGITS=/path) */
+static FILE *g_logits_dump_fp = NULL;
+static void dump_logits_to_file(const float *logits, int vocab_size, int pos) {
+    if (!g_logits_dump_fp) {
+        const char *path = getenv("PICOLM_DUMP_LOGITS");
+        if (!path) return;
+        g_logits_dump_fp = fopen(path, "w");
+        if (!g_logits_dump_fp) return;
+    }
+    fprintf(g_logits_dump_fp, "pos=%d vocab=%d\n", pos, vocab_size);
+    for (int i = 0; i < vocab_size; i++) {
+        fprintf(g_logits_dump_fp, "%d %.6f\n", i, logits[i]);
+    }
+    fflush(g_logits_dump_fp);
+}
+
 /* Hardcoded chat templates, indexed by model type */
 static const char *tmpl_gemma_prefix = "<start_of_turn>user\n";
 static const char *tmpl_gemma_suffix = "<end_of_turn>\n<start_of_turn>model\n";
@@ -1802,6 +1818,7 @@ int main(int argc, char **argv) {
                 grammar_apply(&grammar, logits, model.config.vocab_size);
         if (getenv("PICOLM_LOGITS_DUMP"))
             dump_top_logits(logits, model.config.vocab_size, pos, 5);
+        dump_logits_to_file(logits, model.config.vocab_size, pos);
         next = sampler_sample(&sampler, logits, model.config.vocab_size);
         if (getenv("PICOLM_DBG")) {
             fprintf(stderr, "[GEN] pos=%d next=%d eos=%d\n", pos, next, (int)tokenizer.eos_id);
@@ -1916,6 +1933,7 @@ int main(int argc, char **argv) {
     if (model.locked_layers > 0)
         model_unlock_layers(&model);
     grammar_free(&grammar);
+    if (g_logits_dump_fp) fclose(g_logits_dump_fp);
     free(prompt_tokens);
     free(prompt_buf);
     free(stdin_prompt);
