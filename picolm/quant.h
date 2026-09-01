@@ -721,6 +721,7 @@ extern uint16_t picolm_gelu_table[65536];
 void picolm_init_gelu_table(void);
 /* NEON-accelerated GELU using lookup table (same formula as GPT-2 gelu) */
 void picolm_gelu_table_f32(float *x, int size);
+void picolm_gelu_f32(float *x, int size);
 
 #ifdef __cplusplus
 }
