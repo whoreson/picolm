@@ -5,10 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#ifdef PICOLM_DOS
-#include <alloca.h>
-#endif
-
+/* DJGPP: no alloca.h needed, uses __builtin_alloca */
 #include <errno.h>
 #ifdef _WIN32
 #include <windows.h>

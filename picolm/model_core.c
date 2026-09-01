@@ -37,9 +37,7 @@
 #include <assert.h>
 #include <inttypes.h>
 #include <stdlib.h>
-#ifdef PICOLM_DOS
-#include <alloca.h>
-#endif
+/* DJGPP: no alloca.h needed, uses __builtin_alloca */
 #include <string.h>
 #include <math.h>
 
