@@ -641,20 +641,22 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
     }
     } /* end of stop_layer scope */
 
-    /* 5. ALTUP unembed: merge all altups back to single copy */
+    /* 5. ALTUP unembed: merge all altups back to single copy
+     * llama.cpp always uses altup 0 as the base (not the active altup),
+     * and unembeds altups 1..n_altup-1 through altup_unembd_proj[0..n_altup-2].
+     * Target magnitude comes from the active altup. */
     {
         float *active = s->gemma3n_altup_state + i_altup_act * dim;
         float target_mag = gemma3n_calc_magnitude(active, dim);
 
-        /* Start with active altup */
-        memcpy(s->x, active, dim * sizeof(float));
+        /* Start with altup 0 (always, not the active one) */
+        memcpy(s->x, s->gemma3n_altup_state, dim * sizeof(float));
 
+        size_t unembd_elem_size = gguf_type_quant_size(w->type_altup_unembd_proj) / gguf_type_block_size(w->type_altup_unembd_proj);
         for (int a = 0; a < n_altup - 1; a++) {
-            int a_src = (a < i_altup_act) ? a : a + 1;
-            float *src = s->gemma3n_altup_state + a_src * dim;
-            /* unembed: altup_unembd_proj * src
-             * Same F16 byte offset fix as altup_proj above. */
-            size_t unembd_elem_size = gguf_type_quant_size(w->type_altup_unembd_proj) / gguf_type_block_size(w->type_altup_unembd_proj);
+            /* altup a+1 is the source (skipping altup 0) */
+            float *src = s->gemma3n_altup_state + (a + 1) * dim;
+            /* unembed: altup_unembd_proj[a] * src */
             const void *unembd_a = (const uint8_t *)w->altup_unembd_proj + a * dim * dim * unembd_elem_size;
             matmul(s->xb, src, unembd_a, dim, dim, w->type_altup_unembd_proj);
             /* Normalize to target magnitude */
