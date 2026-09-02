@@ -245,17 +245,22 @@ static int bpe_piece(qwen_enc_t *enc, const char *s, int n, int *out, int cap) {
 
 /* Check if a model should use the Qwen tokenizer */
 int qwen_tokenize_should_use(const model_t *m) {
-    /* Use Qwen tokenizer for Qwen3/Qwen3.5 architectures and GPT-2 models.
-     * Both use GPT-2 BPE tokenization with merges.
-     * Llama and other architectures may also have token_type metadata
-     * but should use the old tokenizer. Safetensors Qwen models also
-     * use this tokenizer (from_safetensors path). */
-    return m->config.is_qwen || m->config.is_gpt2 || m->from_safetensors;
+    /* Use Qwen tokenizer only for Qwen3/Qwen3.5 architectures.
+     * These have tok_tokens_data and tok_merges_data in the expected
+     * format. GPT-2 GGUF models use the legacy tokenizer_load path.
+     * Safetensors Qwen models also use this tokenizer. */
+    return m->config.is_qwen || m->from_safetensors;
 }
 
 /* Initialize the Qwen tokenizer from model data */
 int qwen_tokenize_init(qwen_enc_t *enc, const model_t *m) {
     if (!g_maps_ready) build_maps();
+
+    /* Guard: Qwen tokenizer requires tok_tokens_data from GGUF */
+    if (!m->tok_tokens_data || !m->tok_n_tokens) {
+        fprintf(stderr, "ERROR: Qwen tokenizer requested but tok_tokens_data is missing\n");
+        return -1;
+    }
 
     /* Parse vocab strings from tok_tokens_data: [u64 len][bytes]... */
     {
@@ -291,6 +296,10 @@ int qwen_tokenize_init(qwen_enc_t *enc, const model_t *m) {
     }
 
     /* Parse merges from GGUF metadata */
+    if (!m->tok_merges_data) {
+        fprintf(stderr, "ERROR: Qwen tokenizer requested but tok_merges_data is missing\n");
+        return -1;
+    }
     const uint8_t *p = (const uint8_t *)m->tok_merges_data;
     uint64_t n_merges = m->tok_n_merges;
     enc->n_merges = (int)n_merges;
