@@ -720,7 +720,7 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
     }
 
             /* Plumbing debug: dump hidden state at generation positions */
-    if (pos >= 16 && pos <= 20) {
+    if (getenv("PICOLM_PLUMBING") && pos >= 16 && pos <= 20) {
         double _sm = 0; for(int _i = 0; _i < dim; _i++) { double _v = s->x[_i]; _sm += _v*_v; }
         float _rms = sqrtf(_sm / dim);
         fprintf(stderr, "[PLUMB pos=%d rms=%.6f x0=%.6f]\n", pos, _rms, s->x[0]);
