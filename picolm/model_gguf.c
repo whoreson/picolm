@@ -182,6 +182,12 @@ int mmap_file(model_t *m, const char *path) {
     strncpy(m->first_split_path, path, sizeof(m->first_split_path) - 1);
     m->first_split_path[sizeof(m->first_split_path) - 1] = '\0';
 
+    /* .ffug = pre-processed big-endian swap (GGUF backwards) -- skip runtime swap */
+    size_t plen = strlen(path);
+    if (plen >= 5 && strcmp(path + plen - 5, ".ffug") == 0) {
+        m->be_preprocessed = 1;
+    }
+
     /* Mmap as split 0 */
     if (mmap_one_file(&m->splits[0], path) != 0) return -1;
 
@@ -1505,8 +1511,9 @@ int parse_gguf(model_t *m, int max_seq_len) {
      * low-RAM machines; see 9c1b3a5). We temporarily mprotect each split to
      * PROT_READ|PROT_WRITE for the swap loop, then restore PROT_READ. */
 #if defined(__APPLE__) && defined(__ppc__)
-    { int be_start = clock();
-    fprintf(stderr, "Big-endian: swapping F16 values...\n");
+    if (!m->be_preprocessed) {
+        int be_start = clock();
+        fprintf(stderr, "Big-endian: swapping F16 values...\n");
 
     /* Temporarily make all split mmap regions writable for in-place byte swap.
      * We must do this because GGUF stores all multi-byte values in LE, and the
@@ -1574,15 +1581,17 @@ int parse_gguf(model_t *m, int max_seq_len) {
             }
         }
     }
-    fprintf(stderr, "Big-endian: swap done (%.0fms)\n", (clock() - be_start) / (double)CLOCKS_PER_SEC * 1000);
+        fprintf(stderr, "Big-endian: swap done (%.0fms)\n", (clock() - be_start) / (double)CLOCKS_PER_SEC * 1000);
 
-    /* Restore mmap regions to read-only */
-    for (int _si = 0; _si < m->n_splits; _si++) {
-        if (m->splits[_si].mmap_addr && m->splits[_si].mmap_size > 0) {
-            mprotect(m->splits[_si].mmap_addr, m->splits[_si].mmap_size, PROT_READ);
+        /* Restore mmap regions to read-only */
+        for (int _si = 0; _si < m->n_splits; _si++) {
+            if (m->splits[_si].mmap_addr && m->splits[_si].mmap_size > 0) {
+                mprotect(m->splits[_si].mmap_addr, m->splits[_si].mmap_size, PROT_READ);
+            }
         }
+    } else {
+        fprintf(stderr, "Big-endian: pre-processed (.ffug), skipping swap\n");
     }
-}
 #endif
 
     free(tinfos);

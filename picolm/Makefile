@@ -661,3 +661,9 @@ dos: dos_stubs.o.dos $(DJGPP_OBJS)
 
 dos-clean:
 	-rm -f $(DJGPP_OBJS) dos_stubs.o.dos picolm.exe
+
+test_quant: util/test_quant.c quant.c sgemm.c
+	$(CC) $(CFLAGS) -o $@ util/test_quant.c quant.c sgemm.c -lm
+
+gguf_be_swap: util/gguf_be_swap.c
+	$(CC) -O2 -std=c99 -o $@ util/gguf_be_swap.c -lm
