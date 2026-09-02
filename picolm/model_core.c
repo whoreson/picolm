@@ -3139,9 +3139,6 @@ static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_to
  * ================================================================ */
 
 float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt) {
-    fprintf(stderr, "DBG model_forward_prefill ENTER: is_gpt2=%d is_gemma3n=%d is_ssm=%d n_tokens=%d\n",
-        m->config.is_gpt2, m->config.is_gemma3n, m->config.has_ssm, n_tokens);
-    fflush(stderr);
     /* TODO: Gemma-3n batched prefill not yet implemented -- falls back to per-token forward */
     if (m->config.is_gemma3n) {
         for (int i = 0; i < n_tokens; i++) {
