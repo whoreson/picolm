@@ -458,6 +458,7 @@ static void prefill_attn_task(int flat_idx, void *ctx_ptr) {
     int kv_h = h / ctx->kv_mul;
     const float *qh = ctx->q_batch + (size_t)bi * ctx->n_heads * ctx->head_dim + h * ctx->head_dim;
     float *xbh = ctx->xb_batch + (size_t)bi * ctx->xb_stride + h * ctx->head_dim;
+
     attn_core(xbh, qh, kv_h, pos, ctx->kcache, ctx->vcache,
               ctx->kv_type_k, ctx->kv_type_v,
               ctx->kv_row_size_k, ctx->kv_row_size_v,

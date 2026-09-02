@@ -767,6 +767,9 @@ int parse_gguf(model_t *m, int max_seq_len) {
                     }
                 }
                 /* Check for gpt2 */
+                fprintf(stderr, "DBG arch: len=%d str='%.*s' (%.4s) is_gpt2_check: %d\n",
+                    arch.len, arch.len, arch.str, arch.str,
+                    (arch.len == 4 && strncmp(arch.str, "gpt2", 4) == 0));
                 if (arch.len == 4 && strncmp(arch.str, "gpt2", 4) == 0) {
                     cfg->is_gpt2 = 1;
                 }
@@ -1223,8 +1226,7 @@ int parse_gguf(model_t *m, int max_seq_len) {
         size_t off = m->tensor_data_base[si] + tinfos[i].offset;
         gguf_type_t qtype = (gguf_type_t)tinfos[i].type;
         /* Check tensor data is within file bounds */
-        {
-            size_t row_sz = gguf_type_row_size(qtype, (int)tinfos[i].dims[tinfos[i].n_dims - 1]);
+        size_t row_sz = gguf_type_row_size(qtype, (int)tinfos[i].dims[tinfos[i].n_dims - 1]);
             size_t rows = 1;
             for (int _d = 0; _d < tinfos[i].n_dims - 1; _d++) rows *= tinfos[i].dims[_d];
             size_t sz = rows * row_sz;
@@ -1234,7 +1236,6 @@ int parse_gguf(model_t *m, int max_seq_len) {
                 free(tinfos);
                 return -1;
             }
-        }
         const void *ptr = (const uint8_t *)m->splits[si].mmap_addr + off;
 
         if (str_eq(tinfos[i].name, "token_embd.weight")) {
