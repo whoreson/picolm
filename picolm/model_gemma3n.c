@@ -496,10 +496,10 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
                 float mean = 0.0f;
                 for (int i = 0; i < n_ffn; i++) mean += gp[i];
                 mean /= (float)n_ffn;
-                /* std = sqrt(sum((x - mean)^2) / n_ffn) -- population std, matching jnp.std(ddof=0) */
+                /* std = sqrt(sum((x - mean)^2) / (n_ffn - 1)) -- sample std (ddof=1), matching llama.cpp gaussian_topk */
                 float var = 0.0f;
                 for (int i = 0; i < n_ffn; i++) { float d = gp[i] - mean; var += d * d; }
-                var /= (float)n_ffn;
+                var /= (float)(n_ffn - 1);
                 float std = sqrtf(var);
                 /* cutoff = mean + std * f_sparsity_std_mul */
                 float cutoff = mean + std * c->f_sparsity_std_mul;
