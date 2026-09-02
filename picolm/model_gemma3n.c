@@ -319,7 +319,12 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
             }
         }
 
-        int kv_ordinal = (l < n_layer_kv) ? l : (n_layer_kv - 1);
+        /* KV ordinal: for non-KV layers (l >= n_layer_kv), reuse the last KV layer
+         * of the same type (SWA vs global). Matching llama.cpp reuse callback:
+         *   is_swa(il) ? n_layer_kv_from_start - 2 : n_layer_kv_from_start - 1
+         * i.e. last SWA layer (n_layer_kv-2) or last global layer (n_layer_kv-1) */
+        int is_swa = (swa_period > 0) && ((l % swa_period) < (swa_period - 1));
+        int kv_ordinal = (l < n_layer_kv) ? l : (is_swa ? n_layer_kv - 2 : n_layer_kv - 1);
         uint8_t *kcache_layer = s->key_cache + (size_t)kv_ordinal * seq_len * s->kv_row_size_k;
         uint8_t *vcache_layer = s->val_cache + (size_t)kv_ordinal * seq_len * s->kv_row_size_v;
 
