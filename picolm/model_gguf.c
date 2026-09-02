@@ -654,7 +654,6 @@ int model_list_kv(const char *path) {
           gguf_format_value(valbuf, (int)sizeof(valbuf), &r, vtype);
 
           /* Replace newlines in value with \\n for single-line display, or print multiline */
-          size_t vlen = strlen(valbuf);
           /* Check if multiline */
           if (strchr(valbuf, '\n')) {
               /* Print key on its own line, then value indented */
@@ -766,10 +765,6 @@ int parse_gguf(model_t *m, int max_seq_len) {
                         cfg->is_gemma3n = 1; break;
                     }
                 }
-                /* Check for gpt2 */
-                fprintf(stderr, "DBG arch: len=%d str='%.*s' (%.4s) is_gpt2_check: %d\n",
-                    arch.len, arch.len, arch.str, arch.str,
-                    (arch.len == 4 && strncmp(arch.str, "gpt2", 4) == 0));
                 if (arch.len == 4 && strncmp(arch.str, "gpt2", 4) == 0) {
                     cfg->is_gpt2 = 1;
                 }
