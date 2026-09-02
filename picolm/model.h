@@ -485,6 +485,7 @@ typedef struct {
     int        split_tensors_count;        /* split.tensors.count total (0 if not split) */
     size_t     tensor_data_base[MAX_SPLIT_FILES]; /* tensor data base per split */
     char       first_split_path[512];      /* path to first split file */
+    int        be_preprocessed;            /* 1 if .ffug (pre-swapped for BE) */
 
     /* Tokenizer data offsets (filled by GGUF parser, used by tokenizer_load) */
     const void *tok_tokens_data;
