@@ -2984,9 +2984,13 @@ float vec_dot_q3_K_q8_K(const void *src_q3, const void *src_q8, int n) {
         for (int chunk = 0; chunk < 2; chunk++) {
             const uint8x16_t q3a_raw = vld1q_u8(q3);
             const uint8x16_t q3b_raw = vld1q_u8(q3 + 16);
+            /* vshrq_n_u8 requires compile-time constant shift; accumulate by 2 each iteration */
+            uint8x16_t q3a_shifted = q3a_raw, q3b_shifted = q3b_raw;
             for (int j = 0; j < 4; j++) {
-                uint8x16_t q3l_a = j == 0 ? vandq_u8(q3a_raw, m3) : vandq_u8(vshrq_n_u8(q3a_raw, j*2), m3);
-                uint8x16_t q3l_b = j == 0 ? vandq_u8(q3b_raw, m3) : vandq_u8(vshrq_n_u8(q3b_raw, j*2), m3);
+                uint8x16_t q3l_a = vandq_u8(q3a_shifted, m3);
+                uint8x16_t q3l_b = vandq_u8(q3b_shifted, m3);
+                q3a_shifted = vshrq_n_u8(q3a_shifted, 2);
+                q3b_shifted = vshrq_n_u8(q3b_shifted, 2);
                 uint8_t hm_sub_a[16], hm_sub_b[16];
                 for (int l = 0; l < 16; l++) {
                     hm_sub_a[l] = (hm[l] & hmv) ? 0 : 4;
