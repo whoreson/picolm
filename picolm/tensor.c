@@ -2194,7 +2194,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
         if (picolm_gpu_matmul(gpu_tensor, out, x, n_batch, gpu_device)) {
             return;
         }
-        if (n == 6144 || d == 6144) fprintf(stderr, "WARN: GPU batch matmul failed (n=%d d=%d batch=%d qtype=%d gpu_tensor=%p) -> CPU\n",
+        if ((n == 6144 || d == 6144) && getenv("PICOLM_GPU")) fprintf(stderr, "WARN: GPU batch matmul failed (n=%d d=%d batch=%d qtype=%d gpu_tensor=%p) -> CPU\n",
             n, d, n_batch, qtype, gpu_tensor);
     }
 #endif
@@ -2557,9 +2557,11 @@ static void dual_q8_row_task(int i, void *ctxp) {
 void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                         const void *W1, const void *W2,
                         int n, int d, gguf_type_t qtype1, gguf_type_t qtype2) {
-    #ifdef PICOLM_GPU
-    fprintf(stderr, "WARN: matmul_dual_batch (CPU only, no GPU path) n=%d d=%d batch=%d qtype=%d/%d\n",
-        n, d, n_batch, qtype1, qtype2);
+#ifdef PICOLM_GPU
+    if (getenv("PICOLM_GPU")) {
+        fprintf(stderr, "WARN: matmul_dual_batch (CPU only, no GPU path) n=%d d=%d batch=%d qtype=%d/%d\n",
+            n, d, n_batch, qtype1, qtype2);
+    }
 #endif
 #if defined(PICOLM_AVX2)
     /* Same reasoning as matmul_batch's Q4_0_8_8 branch: reuse the
