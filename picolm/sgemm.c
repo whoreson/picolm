@@ -304,7 +304,16 @@ typedef vector float v4sf;
 #define F32_V v4sf
 #define F32_LDA(p) vec_ld(0,p)
 #define F32_LDB(p) vec_ld(0,p)
-#define F32_MADD(a,b,c) vec_madd(a,b,c)
+/* GCC 4.0.1 on Mac OS X 10.4 PPC lacks altivec.h vec_sld/vec_extract prototypes.
+   Use C vector operators for madd; horizontal sum via store+scalar fallback. */
+#define F32_MADD(a,b,c) ((a)*(b) + (c))
+
+/* Horizontal sum of 4 floats in a vector: store to scratch, accumulate scalar */
+static float sgemm_altivec_hsum(v4sf v) {
+    float tmp[4];
+    vec_st(v, 0, tmp);
+    return tmp[0] + tmp[1] + tmp[2] + tmp[3];
+}
 
 static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
                            const float *B, int ldb, float *C, int ldc,
@@ -332,22 +341,18 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
                     v4sf Av[F32_RM];
                     for(int c=0;c<RM;c++) Av[c]=vec_ld(0,A+lda*(ii+c)+l);
                     for(int r=0;r<RN;r++) { v4sf Bv=vec_ld(0,B+ldb*(jj+r)+l);
-                        for(int c=0;c<RM;c++) Cv[r][c]=vec_madd(Av[c],Bv,Cv[r][c]); }
+                        for(int c=0;c<RM;c++) Cv[r][c]=F32_MADD(Av[c],Bv,Cv[r][c]); }
                 }
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) {
-                    v4sf s=Cv[r][c]; v4sf t=vec_sld(s,s,8); s=vec_add(s,t);
-                    t=vec_sld(s,s,4); s=vec_add(s,t);
-                    C[ldc*(jj+r)+(ii+c)]=vec_extract(s,0); }
+                    C[ldc*(jj+r)+(ii+c)] = sgemm_altivec_hsum(Cv[r][c]); }
             }
             for (int64_t jj=jj1;jj<jj2;jj++) {
                 v4sf Cv[F32_RM];
                 for(int c=0;c<RM;c++) Cv[c]=z;
                 for (int64_t l=0;l<k;l+=KN)
-                    for(int c=0;c<RM;c++) Cv[c]=vec_madd(vec_ld(0,A+lda*(ii+c)+l),vec_ld(0,B+ldb*jj+l),Cv[c]);
+                    for(int c=0;c<RM;c++) Cv[c]=F32_MADD(vec_ld(0,A+lda*(ii+c)+l),vec_ld(0,B+ldb*jj+l),Cv[c]);
                 for(int c=0;c<RM;c++) {
-                    v4sf s=Cv[c]; v4sf t=vec_sld(s,s,8); s=vec_add(s,t);
-                    t=vec_sld(s,s,4); s=vec_add(s,t);
-                    C[ldc*jj+(ii+c)]=vec_extract(s,0); }
+                    C[ldc*jj+(ii+c)] = sgemm_altivec_hsum(Cv[c]); }
             }
         }
     }
