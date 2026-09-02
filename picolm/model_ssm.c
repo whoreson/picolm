@@ -4684,24 +4684,32 @@ after_qkv:
               fprintf(stderr,"} rms=%.6f\n",sqrtf(qrms/32)); fflush(stderr); }
         }
 
-        /* Attention: use F32 K/V directly (bypass F16 KV cache round-trip)
-         * to avoid quantization drift in SSM-hybrid prefill. The KV cache
-         * store above is still needed for decode phase.
+        /* Attention: default to F16 KV cache path (FA2/warpgrp) for all
+         * models. SSM-hybrid models can optionally use F32 K/V directly
+         * (bypass F16 KV cache round-trip) via PICOLM_F32KV env var to
+         * avoid quantization drift during SSM prefill.
          *
          * HIP: F32KV kernel needs ~73-97 KB shared memory for head_dim=256
          * (gfx906/MI50 has 64 KB hard limit, no opt-in). Falls back to
          * standard FP16 KV cache path which has no such constraint. */
+        if (c->has_ssm && getenv("PICOLM_F32KV")) {
 #ifndef PICOLM_HIP
-        picolm_gpu_attention_prefill_f32kv(battn_out, bq, bk, bv,
-                                            start_pos, n_ubatch,
-                                            n_heads, n_kv_heads, head_dim,
-                                            gpu_dev);
+            picolm_gpu_attention_prefill_f32kv(battn_out, bq, bk, bv,
+                                                start_pos, n_ubatch,
+                                                n_heads, n_kv_heads, head_dim,
+                                                gpu_dev);
 #else
-        picolm_gpu_attention_prefill_dev(battn_out, bq,
-                                          attn_ord, start_pos, n_ubatch,
-                                          n_heads, n_kv_heads, head_dim,
-                                          seq_len, gpu_dev);
+            picolm_gpu_attention_prefill_dev(battn_out, bq,
+                                              attn_ord, start_pos, n_ubatch,
+                                              n_heads, n_kv_heads, head_dim,
+                                              seq_len, gpu_dev);
 #endif
+        } else {
+            picolm_gpu_attention_prefill_dev(battn_out, bq,
+                                              attn_ord, start_pos, n_ubatch,
+                                              n_heads, n_kv_heads, head_dim,
+                                              seq_len, gpu_dev);
+        }
         /* Diagnostic: dump attention output for first layer */
         if (getenv("PICOLM_ATTN_DBG") && attn_ord == 0 && start_pos == 0) {
             picolm_gpu_sync(gpu_dev);
