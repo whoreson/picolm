@@ -536,6 +536,26 @@ typedef struct {
     uint8_t  qs[16];     /* 4-bit quantized values */
 } block_q4_1;            /* 20 bytes */
 
+/* Q5_0 block: 32 weights (5-bit values + FP16 scale, 22 bytes)
+ * Layout: half d (scale), uchar qh[4] (5th bits), uchar qs[16] (low 4 bits)
+ * Dequant: val = ((qs & 0xF) | (qh_bit << 4)) * d
+ * qh holds 1 bit per value: value j's 5th bit is bit j of the 32-bit qh. */
+typedef struct {
+    uint16_t d;          /* scale (FP16) */
+    uint8_t  qh[4];      /* 5th bit of each quant (32 bits) */
+    uint8_t  qs[16];     /* low 4 bits of each quant */
+} block_q5_0;            /* 22 bytes */
+
+/* Q5_1 block: 32 weights (5-bit values + FP16 scale + FP16 min, 24 bytes)
+ * Layout: half d (scale), half m (min), uchar qh[4], uchar qs[16]
+ * Dequant: val = ((qs & 0xF) | (qh_bit << 4)) * d + m */
+typedef struct {
+    uint16_t d;          /* scale (FP16) */
+    uint16_t m;          /* min (FP16) */
+    uint8_t  qh[4];      /* 5th bit of each quant (32 bits) */
+    uint8_t  qs[16];     /* low 4 bits of each quant */
+} block_q5_1;            /* 24 bytes */
+
 /* Q1_0 block: 128 weights (1-bit sign + FP16 scale, 18 bytes)
  * Dequant: val[j] = (bit[j] ? +d : -d) */
 typedef struct {

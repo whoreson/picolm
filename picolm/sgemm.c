@@ -2,6 +2,7 @@
 // MIT License (Copyright 2024 Mozilla Foundation).
 // Tiled GEMM: C[n x m] = A^T[m x k] * B[k x n]
 #include "sgemm.h"
+#include "quant.h"
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
@@ -364,7 +365,168 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
 #undef F32_V
 #undef F32_LDA
 #undef F32_LDB
-#undef F32_MADD
+/* Keep F32_MADD for F16 kernels below (same vector type v4sf) */
+
+/* ============================================================
+ * F16 x F32 kernel for Altivec (PPC G4, no hardware F16)
+ * Convert F16->F32 via lookup table, then use F32 vector math.
+ * ============================================================ */
+static void sgemm_f16_f32_altivec(int m, int n, int k, const uint16_t *A, int lda,
+                                   const float *B, int ldb, float *C, int ldc,
+                                   int ith, int nth) {
+#define F16F32_KN 4
+#define F16F32_RM 4
+#define F16F32_RN 3
+#define F16F32_BN 24
+    const int64_t KN=F16F32_KN, RM=F16F32_RM, RN=F16F32_RN, BN=F16F32_BN;
+    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
+    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1, jB=nB-(nB*sB-xt);
+    int64_t nj=yt*nB, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    static char hsbuf[128];
+    unsigned long hba=((unsigned long)hsbuf+63)/64*64;
+    ((float *)hsbuf)[0]=1.0f;
+    v4sf z=vec_splat(vec_ld(0-hba,(float *)hba),0);
+    for (int64_t j=js;j<je;j++) {
+        int64_t iib=(j%yt)*RM*BM, jb=j/yt;
+        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
+        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);
+        int64_t jj1=jj2<jR*RN?jj2:jR*RN;
+        for (int64_t bi=0;bi<BM*RM;bi+=RM) {
+            int64_t ii=iib+bi;
+            for (int64_t jj=jj0;jj<jj1;jj+=RN) {
+                v4sf Cv[F16F32_RN][F16F32_RM];
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=z;
+                for (int64_t l=0;l<k;l+=KN) {
+                    v4sf Av[F16F32_RM];
+                    for(int c=0;c<RM;c++) {
+                        /* Convert 4 F16 -> F32 via lookup table */
+                        float tmp[4];
+                        const uint16_t *ap = A+lda*(ii+c)+l;
+                        tmp[0]=fp16_to_fp32_lookup(ap[0]);
+                        tmp[1]=fp16_to_fp32_lookup(ap[1]);
+                        tmp[2]=fp16_to_fp32_lookup(ap[2]);
+                        tmp[3]=fp16_to_fp32_lookup(ap[3]);
+                        Av[c]=vec_ld(0,tmp);
+                    }
+                    for(int r=0;r<RN;r++) { v4sf Bv=vec_ld(0,B+ldb*(jj+r)+l);
+                        for(int c=0;c<RM;c++) Cv[r][c]=F32_MADD(Av[c],Bv,Cv[r][c]); }
+                }
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) {
+                    C[ldc*(jj+r)+(ii+c)] = sgemm_altivec_hsum(Cv[r][c]); }
+            }
+            for (int64_t jj=jj1;jj<jj2;jj++) {
+                v4sf Cv[F16F32_RM];
+                for(int c=0;c<RM;c++) Cv[c]=z;
+                for (int64_t l=0;l<k;l+=KN) {
+                    for(int c=0;c<RM;c++) {
+                        float tmp[4];
+                        const uint16_t *ap = A+lda*(ii+c)+l;
+                        tmp[0]=fp16_to_fp32_lookup(ap[0]);
+                        tmp[1]=fp16_to_fp32_lookup(ap[1]);
+                        tmp[2]=fp16_to_fp32_lookup(ap[2]);
+                        tmp[3]=fp16_to_fp32_lookup(ap[3]);
+                        Cv[c]=F32_MADD(vec_ld(0,tmp),vec_ld(0,B+ldb*jj+l),Cv[c]);
+                    }
+                }
+                for(int c=0;c<RM;c++) {
+                    C[ldc*jj+(ii+c)] = sgemm_altivec_hsum(Cv[c]); }
+            }
+        }
+    }
+}
+#undef F16F32_KN
+#undef F16F32_RM
+#undef F16F32_RN
+#undef F16F32_BN
+
+/* ============================================================
+ * F16 x F16 kernel for Altivec
+ * Both A and B converted F16->F32, then F32 vector math.
+ * ============================================================ */
+static void sgemm_f16_f16_altivec(int m, int n, int k, const uint16_t *A, int lda,
+                                   const uint16_t *B, int ldb, float *C, int ldc,
+                                   int ith, int nth) {
+#define F16F16_KN 4
+#define F16F16_RM 4
+#define F16F16_RN 3
+#define F16F16_BN 24
+    const int64_t KN=F16F16_KN, RM=F16F16_RM, RN=F16F16_RN, BN=F16F16_BN;
+    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
+    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1, jB=nB-(nB*sB-xt);
+    int64_t nj=yt*nB, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    static char hsbuf[128];
+    unsigned long hba=((unsigned long)hsbuf+63)/64*64;
+    ((float *)hsbuf)[0]=1.0f;
+    v4sf z=vec_splat(vec_ld(0-hba,(float *)hba),0);
+    for (int64_t j=js;j<je;j++) {
+        int64_t iib=(j%yt)*RM*BM, jb=j/yt;
+        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
+        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);
+        int64_t jj1=jj2<jR*RN?jj2:jR*RN;
+        for (int64_t bi=0;bi<BM*RM;bi+=RM) {
+            int64_t ii=iib+bi;
+            for (int64_t jj=jj0;jj<jj1;jj+=RN) {
+                v4sf Cv[F16F16_RN][F16F16_RM];
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=z;
+                for (int64_t l=0;l<k;l+=KN) {
+                    v4sf Av[F16F16_RM];
+                    for(int c=0;c<RM;c++) {
+                        float tmp[4];
+                        const uint16_t *ap = A+lda*(ii+c)+l;
+                        tmp[0]=fp16_to_fp32_lookup(ap[0]);
+                        tmp[1]=fp16_to_fp32_lookup(ap[1]);
+                        tmp[2]=fp16_to_fp32_lookup(ap[2]);
+                        tmp[3]=fp16_to_fp32_lookup(ap[3]);
+                        Av[c]=vec_ld(0,tmp);
+                    }
+                    for(int r=0;r<RN;r++) {
+                        float tmp[4];
+                        const uint16_t *bp = B+ldb*(jj+r)+l;
+                        tmp[0]=fp16_to_fp32_lookup(bp[0]);
+                        tmp[1]=fp16_to_fp32_lookup(bp[1]);
+                        tmp[2]=fp16_to_fp32_lookup(bp[2]);
+                        tmp[3]=fp16_to_fp32_lookup(bp[3]);
+                        v4sf Bv=vec_ld(0,tmp);
+                        for(int c=0;c<RM;c++) Cv[r][c]=F32_MADD(Av[c],Bv,Cv[r][c]);
+                    }
+                }
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) {
+                    C[ldc*(jj+r)+(ii+c)] = sgemm_altivec_hsum(Cv[r][c]); }
+            }
+            for (int64_t jj=jj1;jj<jj2;jj++) {
+                v4sf Cv[F16F16_RM];
+                for(int c=0;c<RM;c++) Cv[c]=z;
+                for (int64_t l=0;l<k;l+=KN) {
+                    /* B is shared across RM columns for this jj row */
+                    float tmpb[4];
+                    const uint16_t *bp = B+ldb*jj+l;
+                    tmpb[0]=fp16_to_fp32_lookup(bp[0]);
+                    tmpb[1]=fp16_to_fp32_lookup(bp[1]);
+                    tmpb[2]=fp16_to_fp32_lookup(bp[2]);
+                    tmpb[3]=fp16_to_fp32_lookup(bp[3]);
+                    v4sf Bv=vec_ld(0,tmpb);
+                    for(int c=0;c<RM;c++) {
+                        float tmpa[4];
+                        const uint16_t *ap = A+lda*(ii+c)+l;
+                        tmpa[0]=fp16_to_fp32_lookup(ap[0]);
+                        tmpa[1]=fp16_to_fp32_lookup(ap[1]);
+                        tmpa[2]=fp16_to_fp32_lookup(ap[2]);
+                        tmpa[3]=fp16_to_fp32_lookup(ap[3]);
+                        Cv[c]=F32_MADD(vec_ld(0,tmpa),Bv,Cv[c]);
+                    }
+                }
+                for(int c=0;c<RM;c++) {
+                    C[ldc*jj+(ii+c)] = sgemm_altivec_hsum(Cv[c]); }
+            }
+        }
+    }
+}
+#undef F16F16_KN
+#undef F16F16_RM
+#undef F16F16_RN
+#undef F16F16_BN
 
 #elif defined(__riscv_v_intrinsic)
 
@@ -768,6 +930,8 @@ int picolm_sgemm(int m, int n, int k,
 #elif defined(__ARM_NEON)
         if (n < 4) return 0;
         if (k % 4 == 0 && m % 4 == 0) { sgemm_f16_f32(m,n,k,(const uint16_t*)A,lda,(const float*)B,ldb,C,ldc,ith,nth); return 1; }
+#elif defined(__ALTIVEC__)
+        if (k % 4 == 0 && m % 4 == 0) { sgemm_f16_f32_altivec(m,n,k,(const uint16_t*)A,lda,(const float*)B,ldb,C,ldc,ith,nth); return 1; }
 #endif
     }
     if (Atype == GGUF_TYPE_F16 && Btype == GGUF_TYPE_F16) {
@@ -779,6 +943,8 @@ int picolm_sgemm(int m, int n, int k,
 #endif
 #elif defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
         if (n >= 8 && m % 4 == 0) { sgemm_f16_f16(m,n,k,(const uint16_t*)A,lda,(const uint16_t*)B,ldb,C,ldc,ith,nth); return 1; }
+#elif defined(__ALTIVEC__)
+        if (k % 4 == 0 && m % 4 == 0) { sgemm_f16_f16_altivec(m,n,k,(const uint16_t*)A,lda,(const uint16_t*)B,ldb,C,ldc,ith,nth); return 1; }
 #endif
     }
     return 0;

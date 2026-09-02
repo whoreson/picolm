@@ -421,6 +421,53 @@ void dequantize_row_q4_1(const void *src, float *dst, int n) {
     }
 }
 
+/* Dequantize Q5_0: val = ((qs & 0xF) | (qh_bit << 4)) * d */
+void dequantize_row_q5_0(const void *src, float *dst, int n) {
+    /* Q5_0: signed 5-bit values (-16..15), block = d(FP16) + qh[4] + qs[16] = 22 bytes/32 vals
+     * qh layout: bits 0..15 are 5th bits for low nibbles (vals 0..15),
+     *            bits 16..31 are 5th bits for high nibbles (vals 16..31).
+     * Dequant: val = (5bit_val - 16) * d  (centered around 0) */
+    const block_q5_0 *blocks = (const block_q5_0 *)src;
+    int nb = n / 32;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = fp16_to_fp32_lookup(blocks[i].d);
+        uint32_t qh;
+        memcpy(&qh, blocks[i].qh, sizeof(qh));
+        float *dp = dst + i * 32;
+        for (int j = 0; j < 16; j++) {
+            uint8_t byte = blocks[i].qs[j];
+            int x0 = ((byte & 0x0F) | (((qh >> j) & 1) << 4)) - 16;
+            int x1 = ((byte >> 4)     | (((qh >> (j + 16)) & 1) << 4)) - 16;
+            dp[j]      = (float)x0 * d;
+            dp[j + 16] = (float)x1 * d;
+        }
+    }
+}
+
+/* Dequantize Q5_1: val = 5bit_val * d + m (unsigned 5-bit: 0..31)
+ * block = d(FP16) + m(FP16) + qh[4] + qs[16] = 24 bytes/32 vals
+ * qh layout: bits 0..15 for low nibbles, bits 12..27 for high nibbles. */
+void dequantize_row_q5_1(const void *src, float *dst, int n) {
+    const block_q5_1 *blocks = (const block_q5_1 *)src;
+    int nb = n / 32;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = fp16_to_fp32_lookup(blocks[i].d);
+        const float m = fp16_to_fp32_lookup(blocks[i].m);
+        uint32_t qh;
+        memcpy(&qh, blocks[i].qh, sizeof(qh));
+        float *dp = dst + i * 32;
+        for (int j = 0; j < 16; j++) {
+            uint8_t byte = blocks[i].qs[j];
+            int x0 = (byte & 0x0F) | (((qh >> j) & 1) << 4);
+            int x1 = (byte >> 4)     | (((qh >> (j + 16)) & 1) << 4);
+            dp[j]      = (float)x0 * d + m;
+            dp[j + 16] = (float)x1 * d + m;
+        }
+    }
+}
+
 /* Dequantize Q1_0: val[j] = (bit[j] ? +d : -d) */
 void dequantize_row_q1_0(const void *src, float *dst, int n) {
     const block_q1_0 *blocks = (const block_q1_0 *)src;
@@ -616,6 +663,8 @@ void dequantize_row(const void *src, float *dst, int n, gguf_type_t type) {
         case GGUF_TYPE_BF16:  dequantize_row_bf16(src, dst, n); break;
         case GGUF_TYPE_Q4_0:  dequantize_row_q4_0(src, dst, n); break;
         case GGUF_TYPE_Q4_1:  dequantize_row_q4_1(src, dst, n); break;
+        case GGUF_TYPE_Q5_0:  dequantize_row_q5_0(src, dst, n); break;
+        case GGUF_TYPE_Q5_1:  dequantize_row_q5_1(src, dst, n); break;
         case GGUF_TYPE_Q8_0:  dequantize_row_q8_0(src, dst, n); break;
         case GGUF_TYPE_Q2_K:  dequantize_row_q2_K(src, dst, n); break;
         case GGUF_TYPE_Q3_K:  dequantize_row_q3_K(src, dst, n); break;
@@ -691,7 +740,16 @@ size_t gguf_type_row_size(gguf_type_t type, int n) {
     int bs = gguf_type_block_size(type);
     int qs = gguf_type_quant_size(type);
     if (bs == 0 || qs == 0) return 0;
-    return (size_t)(n / bs) * (size_t)qs;
+    /* Compute full row size including partial blocks: qs * n / bs.
+     * The GGUF stores tensors as flat block arrays. For non-block-aligned
+     * dimensions (e.g. n=960 with bs=256), the row stride includes the
+     * fractional block. The vec_dot functions only process n/bs complete
+     * blocks per row, so the partial block's data is present but unused.
+     *
+     * Using qs*(n/bs) would match GGML's nb[1] computation but would cause
+     * our weight pointers to diverge from the actual GGUF data layout when
+     * n is not a multiple of bs (the GGUF stores the full row data). */
+    return (size_t)qs * (size_t)n / (size_t)bs;
 }
 
 /* ================================================================
@@ -2622,7 +2680,7 @@ float vec_dot_q5_K_q8_K(const void *src_q5, const void *src_q8, int n) {
     float sumf = 0.0f;
     for (int i = 0; i < nb; i++) {
         const uint8_t *q4 = x[i].qs;
-        const uint8_t *qh = x[i].qh;
+        const uint8_t *qh = x[i].qh;  /* 32 bytes: 1 bit per quant, shared across all sub-blocks */
         const int8_t  *q8 = y[i].qs;
         memcpy(utmp, x[i].scales, 12);
         utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
@@ -2644,14 +2702,18 @@ float vec_dot_q5_K_q8_K(const void *src_q5, const void *src_q8, int n) {
             const int8x16_t q4lo_b = vreinterpretq_s8_u8(vandq_u8(q4b, m4));
             const int8x16_t q4hi_a = vreinterpretq_s8_u8(vshrq_n_u8(q4a, 4));
             const int8x16_t q4hi_b = vreinterpretq_s8_u8(vshrq_n_u8(q4b, 4));
-            /* Build high-bit correction arrays */
+            /* Build high-bit correction arrays. All 32 values use the same
+             * bit position within their qh byte. Low nibble uses bit 2*j,
+             * high nibble uses bit 2*j+1. */
+            int qh_hi_bit = qh_bit << 1;
             int8_t qh_a[16], qh_b[16], qh_c[16], qh_d[16];
             for (int l = 0; l < 16; l++) {
                 qh_a[l] = (qh[l] & qh_bit) ? 16 : 0;
                 qh_b[l] = (qh[l+16] & qh_bit) ? 16 : 0;
-                qh_c[l] = (qh[l+32] & qh_bit) ? 16 : 0;
-                qh_d[l] = (qh[l+48] & qh_bit) ? 16 : 0;
+                qh_c[l] = (qh[l] & qh_hi_bit) ? 16 : 0;
+                qh_d[l] = (qh[l+16] & qh_hi_bit) ? 16 : 0;
             }
+            qh_bit <<= 2;
             const int8x16_t qha = vld1q_s8(qh_a);
             const int8x16_t qhb = vld1q_s8(qh_b);
             const int8x16_t qhc = vld1q_s8(qh_c);
@@ -2682,7 +2744,6 @@ float vec_dot_q5_K_q8_K(const void *src_q5, const void *src_q8, int n) {
                 int32x4_t s = vaddq_s32(vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)), vaddq_s32(vpaddlq_s16(p2), vpaddlq_s16(p3)));
                 sub_sums[j*2+1] += vaddvq_s32(s) * (int)scales8[j*2+1];
             }
-            qh_bit <<= 1;
         }
         int32_t total = 0;
         for (int j = 0; j < 8; j++) total += sub_sums[j];
@@ -4648,6 +4709,60 @@ float vec_dot_q4_1_f32(const void *src, const float *x, int n) {
     return sumf;
 }
 
+/* vec_dot_q5_0_f32: fused dequant + dot for Q5_0 x float32
+ * Q5_0: signed 5-bit (-16..15). qh bits 0..15 for low nibbles, 16..31 for high. */
+float vec_dot_q5_0_f32(const void *src, const float *x, int n) {
+    const block_q5_0 *blocks = (const block_q5_0 *)src;
+    int nb = n / 32;
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        float d = fp16_to_fp32_lookup(blocks[i].d);
+        uint32_t qh;
+        memcpy(&qh, blocks[i].qh, sizeof(qh));
+        const uint8_t *qs = blocks[i].qs;
+        const float *xp = x + i * 32;
+        float block_sum = 0.0f;
+        for (int j = 0; j < 16; j++) {
+            int x0 = ((qs[j] & 0x0F) | (((qh >> j) & 1) << 4)) - 16;
+            int x1 = ((qs[j] >> 4)     | (((qh >> (j + 16)) & 1) << 4)) - 16;
+            block_sum += (float)x0 * xp[j];
+            block_sum += (float)x1 * xp[j + 16];
+        }
+        sumf += d * block_sum;
+    }
+    return sumf;
+}
+
+/* vec_dot_q5_1_f32: fused dequant + dot for Q5_1 x float32
+ * Q5_1: unsigned 5-bit (0..31) + min offset. qh bits 0..15 for low, 16..31 for high. */
+float vec_dot_q5_1_f32(const void *src, const float *x, int n) {
+    const block_q5_1 *blocks = (const block_q5_1 *)src;
+    int nb = n / 32;
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        float d = fp16_to_fp32_lookup(blocks[i].d);
+        float m = fp16_to_fp32_lookup(blocks[i].m);
+        uint32_t qh;
+        memcpy(&qh, blocks[i].qh, sizeof(qh));
+        const uint8_t *qs = blocks[i].qs;
+        const float *xp = x + i * 32;
+        float block_sum = 0.0f;
+        float m_sum = 0.0f;
+        for (int j = 0; j < 16; j++) {
+            int x0 = (qs[j] & 0x0F) | (((qh >> j) & 1) << 4);
+            int x1 = (qs[j] >> 4)     | (((qh >> (j + 16)) & 1) << 4);
+            block_sum += (float)x0 * xp[j];
+            block_sum += (float)x1 * xp[j + 16];
+            m_sum += xp[j];
+            m_sum += xp[j + 16];
+        }
+        sumf += d * block_sum + m * m_sum;
+    }
+    return sumf;
+}
+
 /* vec_dot_q1_0_f32: fused dequant + dot for Q1_0 x float32
  * Q1_0 block: 16 bytes qs (128 bits) + 2 bytes d(FP16) = 18 bytes per 128 values.
  * Dequant: val[j] = (bit[j] ? +d : -d) */
@@ -5823,32 +5938,36 @@ float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
     switch (type) {
         case GGUF_TYPE_Q4_K: return vec_dot_q4_K_f32(src, x, n);
         case GGUF_TYPE_Q5_K: {
-            /* Scalar fallback: dequantize to float, then dot */
+            /* Scalar fallback: dequantize to float, then dot.
+             * Only nb*256 values are dequantized (complete blocks).
+             * For non-block-aligned n, pass the aligned count. */
+            const int nb5 = n / 256;
+            const int n5 = nb5 * 256;
 #if defined(_WIN32)
-            /* MSVC has no __thread; use plain static */
             static float q5_tmp[4096];
 #elif defined(__APPLE__)
-            /* __thread not supported on old Mac OS X; use static buffer */
             static float q5_tmp[4096];
 #else
             static __thread float q5_tmp[4096];
 #endif
-            if (n > 4096) {
-                float *tmp = (float *)malloc((size_t)n * sizeof(float));
+            if (n5 > 4096) {
+                float *tmp = (float *)malloc((size_t)n5 * sizeof(float));
                 float r;
                 dequantize_row_q5_K(src, tmp, n);
-                r = vec_dot_f32_f32(tmp, x, n);
+                r = vec_dot_f32_f32(tmp, x, n5);
                 free(tmp);
                 return r;
             }
             dequantize_row_q5_K(src, q5_tmp, n);
-            return vec_dot_f32_f32(q5_tmp, x, n);
+            return vec_dot_f32_f32(q5_tmp, x, n5);
         }
         case GGUF_TYPE_Q6_K: return vec_dot_q6_K_f32(src, x, n);
         case GGUF_TYPE_F32:  return vec_dot_f32_f32(src, x, n);
         case GGUF_TYPE_Q8_0: return vec_dot_q8_0_f32(src, x, n);
         case GGUF_TYPE_Q4_0: return vec_dot_q4_0_f32(src, x, n);
         case GGUF_TYPE_Q4_1: return vec_dot_q4_1_f32(src, x, n);
+        case GGUF_TYPE_Q5_0: return vec_dot_q5_0_f32(src, x, n);
+        case GGUF_TYPE_Q5_1: return vec_dot_q5_1_f32(src, x, n);
         case GGUF_TYPE_Q1_0: return vec_dot_q1_0_f32(src, x, n);
         case GGUF_TYPE_Q2_0: return vec_dot_q2_0_f32(src, x, n);
         case GGUF_TYPE_Q2_K:  return vec_dot_q2_K_f32(src, x, n);
@@ -5858,11 +5977,16 @@ float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
         case GGUF_TYPE_F16:  return vec_dot_f16_f32(src, x, n);
         case GGUF_TYPE_BF16: return vec_dot_bf16_f32(src, x, n);
         default: {
-            /* Fallback: dequantize to temp buffer, then dot */
+            /* Fallback: dequantize to temp buffer, then dot.
+             * For block-based quants (K types, Q4_0, etc.), the dequantize
+             * function only processes nb = n/bs complete blocks. Pass the
+             * aligned count to vec_dot_f32_f32 to avoid reading garbage. */
+            const int bs = gguf_type_block_size(type);
+            const int n_aligned = (bs > 1) ? ((n / bs) * bs) : n;
             float tmp[8192];
             float *buf = (n <= 8192) ? tmp : (float *)malloc((size_t)n * sizeof(float));
             dequantize_row(src, buf, n, type);
-            float sum = vec_dot_f32_f32(buf, x, n);
+            float sum = vec_dot_f32_f32(buf, x, n_aligned);
             if (buf != tmp) free(buf);
             return sum;
         }
