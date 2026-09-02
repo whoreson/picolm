@@ -531,6 +531,9 @@ static void benchmark_context_scaling(const char *model_path, const char *base_p
         fprintf(stderr, "Failed to load model\n"); exit(1);
     }
 
+    /* Use the model's GGUF context length if -c was not specified */
+    int ctx = ctx_size_limit > 0 ? ctx_size_limit : model.config.max_seq_len;
+
     fprintf(stderr, "Loading tokenizer...\n");
     tokenizer_t tokenizer;
     int use_qwen_tok = qwen_tokenize_should_use(&model);
@@ -564,7 +567,7 @@ static void benchmark_context_scaling(const char *model_path, const char *base_p
     sampler_init(&sampler, temperature, 0.95f, top_k, 0.05f, seed);
 
     /* Allocate prompt buffer (grows as context grows) */
-    int *prompt_tokens = malloc(ctx_size_limit * sizeof(int));
+    int *prompt_tokens = malloc(ctx * sizeof(int));
     memcpy(prompt_tokens, base_tokens, n_base * sizeof(int));
     int total_tokens = n_base;
 
@@ -586,7 +589,7 @@ static void benchmark_context_scaling(const char *model_path, const char *base_p
     const int chunk_size = max_tokens;  /* tokens to generate per step */
     int start_pos = 0;  /* current KV cache position */
 
-    while (start_pos + n_base + chunk_size <= ctx_size_limit) {
+    while (start_pos + n_base + chunk_size <= ctx) {
         /* Build the new prompt segment: just the base prompt */
         int *new_prompt = malloc(n_base * sizeof(int));
         memcpy(new_prompt, base_tokens, n_base * sizeof(int));
@@ -631,7 +634,7 @@ static void benchmark_context_scaling(const char *model_path, const char *base_p
             int next = sampler_sample(&sampler, logits, model.config.vocab_size);
 
             total_tokens++;
-            if (total_tokens <= ctx_size_limit)
+            if (total_tokens <= ctx)
                 prompt_tokens[total_tokens - 1] = next;
 
             #ifdef PICOLM_GPU
