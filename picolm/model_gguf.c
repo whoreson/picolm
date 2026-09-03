@@ -264,7 +264,8 @@ static int mmap_one_file(split_mmap_t *s, const char *path) {
     HANDLE fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (fh == INVALID_HANDLE_VALUE) {
-        fprintf(stderr, "Cannot open split file: %s\n", path);
+        fprintf(stderr, "ERROR: cannot open model file '%s': %s\n",
+                path, GetLastError() > 0 ? "file not found or access denied" : "unknown error");
         return -1;
     }
     LARGE_INTEGER fsize;
@@ -272,13 +273,13 @@ static int mmap_one_file(split_mmap_t *s, const char *path) {
     s->mmap_size = (size_t)fsize.QuadPart;
     HANDLE mh = CreateFileMappingA(fh, NULL, PAGE_READONLY, 0, 0, NULL);
     if (!mh) {
-        fprintf(stderr, "CreateFileMapping failed for: %s\n", path);
+        fprintf(stderr, "ERROR: cannot map model file '%s' into memory\n", path);
         CloseHandle(fh);
         return -1;
     }
     void *addr = MapViewOfFile(mh, FILE_MAP_READ, 0, 0, 0);
     if (!addr) {
-        fprintf(stderr, "MapViewOfFile failed for: %s\n", path);
+        fprintf(stderr, "ERROR: cannot view mapped model file '%s'\n", path);
         CloseHandle(mh);
         CloseHandle(fh);
         return -1;
@@ -290,7 +291,7 @@ static int mmap_one_file(split_mmap_t *s, const char *path) {
     /* DOS: no mmap, load entire file into malloc'd memory */
     FILE *f = fopen(path, "rb");
     if (!f) {
-        fprintf(stderr, "Cannot open split file: %s\n", path);
+        fprintf(stderr, "ERROR: cannot open model file '%s': %s\n", path, strerror(errno));
         return -1;
     }
     fseek(f, 0, SEEK_END);
@@ -299,7 +300,7 @@ static int mmap_one_file(split_mmap_t *s, const char *path) {
     s->mmap_size = (size_t)fsize;
     void *buf = malloc(s->mmap_size);
     if (!buf || fread(buf, 1, s->mmap_size, f) != s->mmap_size) {
-        fprintf(stderr, "Failed to read split file: %s\n", path);
+        fprintf(stderr, "ERROR: failed to read model file '%s': %s\n", path, strerror(errno));
         fclose(f);
         free(buf);
         return -1;
@@ -309,7 +310,7 @@ static int mmap_one_file(split_mmap_t *s, const char *path) {
 #else
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
-        fprintf(stderr, "Cannot open split file: %s\n", path);
+        fprintf(stderr, "ERROR: cannot open model file '%s': %s\n", path, strerror(errno));
         return -1;
     }
     struct stat st;
@@ -320,7 +321,7 @@ static int mmap_one_file(split_mmap_t *s, const char *path) {
      * in-place byte-swap loop; it uses mprotect() around the swap region. */
     void *addr = mmap(NULL, s->mmap_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (addr == MAP_FAILED) {
-        fprintf(stderr, "mmap failed for split file %s: %s\n", path, strerror(errno));
+        fprintf(stderr, "ERROR: cannot map model file '%s': %s\n", path, strerror(errno));
         close(fd);
         return -1;
     }
@@ -417,7 +418,7 @@ int model_list_tensors(const char *path) {
     fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
                      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (fh == INVALID_HANDLE_VALUE) {
-        fprintf(stderr, "Cannot open file: %s\n", path);
+        fprintf(stderr, "ERROR: cannot open model file '%s'\n", path);
         return -1;
     }
 
@@ -427,34 +428,40 @@ int model_list_tensors(const char *path) {
 
     mh = CreateFileMappingA(fh, NULL, PAGE_READONLY, 0, 0, NULL);
     if (!mh) {
-        fprintf(stderr, "CreateFileMapping failed\n");
+        fprintf(stderr, "ERROR: cannot map model file '%s' into memory\n", path);
         goto out;
     }
 
     addr = MapViewOfFile(mh, FILE_MAP_READ, 0, 0, 0);
     if (!addr) {
-        fprintf(stderr, "MapViewOfFile failed\n");
+        fprintf(stderr, "ERROR: cannot view mapped model file '%s'\n", path);
         goto out;
     }
 #elif defined(PICOLM_DOS)
     {
         FILE *f = fopen(path, "rb");
-        if (!f) { perror("fopen"); return -1; }
+        if (!f) { fprintf(stderr, "ERROR: cannot open model file '%s': %s\n", path, strerror(errno)); return -1; }
         fseek(f, 0, SEEK_END);
         fsize = (size_t)ftell(f);
         fseek(f, 0, SEEK_SET);
         addr = malloc(fsize);
-        if (!addr || fread(addr, 1, fsize, f) != fsize) { addr = NULL; fclose(f); goto out; }
+        if (!addr || fread(addr, 1, fsize, f) != fsize) {
+            fprintf(stderr, "ERROR: failed to read model file '%s'\n", path);
+            addr = NULL; fclose(f); goto out;
+        }
         fclose(f);
     }
 #else
     fd = open(path, O_RDONLY);
-    if (fd < 0) { perror("open"); return -1; }
+    if (fd < 0) { fprintf(stderr, "ERROR: cannot open model file '%s': %s\n", path, strerror(errno)); return -1; }
 
     { struct stat st;
       if (fstat(fd, &st) < 0) goto out;
       addr = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-      if (addr == MAP_FAILED) { addr = NULL; goto out; }
+      if (addr == MAP_FAILED) {
+          fprintf(stderr, "ERROR: cannot map model file '%s': %s\n", path, strerror(errno));
+          addr = NULL; goto out;
+      }
       fsize = (size_t)st.st_size; }
 #endif
 
@@ -462,13 +469,13 @@ int model_list_tensors(const char *path) {
 
     { uint32_t magic = read_u32(&r);
       if (magic != GGUF_MAGIC) {
-          fprintf(stderr, "Invalid GGUF magic: 0x%08X\n", magic);
+          fprintf(stderr, "ERROR: '%s' is not a valid GGUF file (bad magic 0x%08X)\n", path, magic);
           goto out;
       } }
 
     uint32_t version = read_u32(&r);
     if (version < 2 || version > 3) {
-        fprintf(stderr, "Unsupported GGUF version: %u (only v2/v3 supported)\n", version);
+        fprintf(stderr, "ERROR: '%s' has unsupported GGUF version %u (need v2 or v3)\n", path, version);
         goto out;
     }
     uint64_t n_tensors = read_u64(&r);
@@ -491,7 +498,7 @@ int model_list_tensors(const char *path) {
     { size_t buf_size = 128 + (n_tensors + 2) * 96;
       buf = malloc(buf_size);
       if (!buf) {
-          fprintf(stderr, "error: out of memory\n");
+          fprintf(stderr, "ERROR: out of memory\n");
           goto out;
       }
 
@@ -571,7 +578,7 @@ int model_list_kv(const char *path) {
     HANDLE fh = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
                             FILE_ATTRIBUTE_NORMAL, NULL);
     if (fh == INVALID_HANDLE_VALUE) {
-        fprintf(stderr, "Cannot open '%s'\n", path);
+        fprintf(stderr, "ERROR: cannot open model file '%s'\n", path);
         return -1;
     }
     { LARGE_INTEGER sz;
@@ -584,17 +591,20 @@ int model_list_kv(const char *path) {
 #elif defined(PICOLM_DOS)
     {
         FILE *f = fopen(path, "rb");
-        if (!f) { perror("fopen"); return -1; }
+        if (!f) { fprintf(stderr, "ERROR: cannot open model file '%s': %s\n", path, strerror(errno)); return -1; }
         fseek(f, 0, SEEK_END);
         fsize = (size_t)ftell(f);
         fseek(f, 0, SEEK_SET);
         addr = malloc(fsize);
-        if (!addr || fread(addr, 1, fsize, f) != fsize) { addr = NULL; fclose(f); goto out; }
+        if (!addr || fread(addr, 1, fsize, f) != fsize) {
+            fprintf(stderr, "ERROR: failed to read model file '%s'\n", path);
+            addr = NULL; fclose(f); goto out;
+        }
         fclose(f);
     }
 #else
     int fd = open(path, O_RDONLY);
-    if (fd < 0) { perror("open"); return -1; }
+    if (fd < 0) { fprintf(stderr, "ERROR: cannot open model file '%s': %s\n", path, strerror(errno)); return -1; }
     { struct stat st;
       if (fstat(fd, &st) < 0) goto out;
       addr = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -603,7 +613,7 @@ int model_list_kv(const char *path) {
 #endif
 
     if (!addr) {
-        fprintf(stderr, "Failed to map '%s'\n", path);
+        fprintf(stderr, "ERROR: failed to map model file '%s'\n", path);
         goto out;
     }
 
@@ -611,13 +621,13 @@ int model_list_kv(const char *path) {
 
     { uint32_t magic = read_u32(&r);
       if (magic != GGUF_MAGIC) {
-          fprintf(stderr, "Invalid GGUF magic: 0x%08X\n", magic);
+          fprintf(stderr, "ERROR: '%s' is not a valid GGUF file (bad magic 0x%08X)\n", path, magic);
           goto out;
       } }
 
     uint32_t version = read_u32(&r);
     if (version < 2 || version > 3) {
-        fprintf(stderr, "Unsupported GGUF version: %u (only v2/v3 supported)\n", version);
+        fprintf(stderr, "ERROR: '%s' has unsupported GGUF version %u (need v2 or v3)\n", path, version);
         goto out;
     }
     uint64_t n_tensors = read_u64(&r);
@@ -627,7 +637,7 @@ int model_list_kv(const char *path) {
     { size_t buf_size = 1024 + n_metadata * 128;
       buf = malloc(buf_size);
       if (!buf) {
-          fprintf(stderr, "error: out of memory\n");
+          fprintf(stderr, "ERROR: out of memory\n");
           goto out;
       }
 
@@ -710,13 +720,13 @@ int parse_gguf(model_t *m, int max_seq_len) {
 
     uint32_t magic = read_u32(&r);
     if (magic != GGUF_MAGIC) {
-        fprintf(stderr, "Invalid GGUF magic: 0x%08X\n", magic);
+        fprintf(stderr, "ERROR: model file is not a valid GGUF (bad magic 0x%08X)\n", magic);
         return -1;
     }
 
     uint32_t version = read_u32(&r);
     if (version < 2 || version > 3) {
-        fprintf(stderr, "Unsupported GGUF version: %u\n", version);
+        fprintf(stderr, "ERROR: model has unsupported GGUF version %u (need v2 or v3)\n", version);
         return -1;
     }
 
@@ -1534,7 +1544,15 @@ int parse_gguf(model_t *m, int max_seq_len) {
         size_t nrows = tinfos[i].dims[0];
         for (uint64_t d = 1; d < tinfos[i].n_dims; d++) nrows *= tinfos[i].dims[d];
 
-        if (qt == GGUF_TYPE_F16 || qt == GGUF_TYPE_BF16) {
+        if (qt == GGUF_TYPE_F32) {
+            size_t total = nrows;
+            size_t _fi;
+            for (_fi = 0; _fi < total; _fi++) {
+                uint32_t v = ((uint32_t *)ptr)[_fi];
+                ((uint32_t *)ptr)[_fi] = (v >> 24) | ((v >> 8) & 0xff00) |
+                                          ((v << 8) & 0xff0000) | (v << 24);
+            }
+        } else if (qt == GGUF_TYPE_F16 || qt == GGUF_TYPE_BF16) {
             uint16_t *f16p = (uint16_t *)ptr;
             swap_f16_block(f16p, nrows);
         } else if (qt == GGUF_TYPE_Q8_0) {
@@ -1578,6 +1596,19 @@ int parse_gguf(model_t *m, int max_seq_len) {
             for (size_t b = 0; b < nblocks; b++) {
                 block_q6_K *blk = (block_q6_K *)((uint8_t *)ptr + b * sizeof(block_q6_K));
                 blk->d = GGUF_LE16(blk->d);
+            }
+        } else if (qt == GGUF_TYPE_Q3_K) {
+            size_t nblocks = nrows / 256;
+            for (size_t b = 0; b < nblocks; b++) {
+                block_q3_K *blk = (block_q3_K *)((uint8_t *)ptr + b * sizeof(block_q3_K));
+                blk->d = GGUF_LE16(blk->d);
+            }
+        } else if (qt == GGUF_TYPE_Q2_K) {
+            size_t nblocks = nrows / 256;
+            for (size_t b = 0; b < nblocks; b++) {
+                block_q2_K *blk = (block_q2_K *)((uint8_t *)ptr + b * sizeof(block_q2_K));
+                blk->d = GGUF_LE16(blk->d);
+                blk->dmin = GGUF_LE16(blk->dmin);
             }
         }
     }

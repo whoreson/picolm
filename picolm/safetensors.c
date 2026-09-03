@@ -227,7 +227,7 @@ static int load_safetensors_files(const char *model_dir, st_state_t *st) {
     }
 
     if (st->n_files == 0) {
-        fprintf(stderr, "No safetensors files found in %s\n", model_dir);
+        fprintf(stderr, "ERROR: no safetensors files found in '%s'\n", model_dir);
         return -1;
     }
     return 0;
@@ -502,12 +502,12 @@ int model_load_safetensors(model_t *m, const char *model_dir, int max_seq_len, k
     if (m->config.has_ssm) {
         if (!lw->attn_qkv || !lw->attn_gate_ssm || !lw->ssm_a || !lw->ssm_alpha ||
             !lw->ssm_beta || !lw->ssm_conv1d || !lw->ssm_dt || !lw->ssm_norm || !lw->ssm_out) {
-            fprintf(stderr, "Missing SSM tensors\n");
+            fprintf(stderr, "ERROR: SSM model is missing required tensors\n");
             return -1;
         }
     } else {
         if (!lw->attn_q || !lw->attn_k || !lw->attn_v || !lw->attn_output) {
-            fprintf(stderr, "Missing attention tensors\n");
+            fprintf(stderr, "ERROR: model is missing required attention tensors\n");
             return -1;
         }
     }
