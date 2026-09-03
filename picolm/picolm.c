@@ -1337,7 +1337,7 @@ int main(int argc, char **argv) {
     }
 
     /* Load model */
-    fprintf(stderr, "PicoLM v1.0-beta2\n");
+    fprintf(stderr, "PicoLM v1.0-rc1 \"Yura Kana\"\n");
 #ifdef PICOLM_DOS
     {
         /* DOS: print DPMI memory diagnostic */
