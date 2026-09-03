@@ -168,20 +168,11 @@ int picolm_gpu_init(const int *devices, int count) {
     int available = 0;
     if (!devices || count < 1 || count > PICOLM_GPU_MAX_DEVICES) return 0;
 #ifndef __HIP__
-    /* CUDA multi-engine scheduling: with the driver default of 8 hardware
-     * work queues, H2D/kernel/D2H submissions on different streams can be
-     * dispatched to different engines whose completion is signaled out of
-     * program order under driver/WDDM batching -- even when the application
-     * uses correct sync primitives. Forcing a single queue eliminates this
-     * degree of freedom.
-     *
-     * Empirically isolated: PICOLM_NGL=2..47 (partial GPU offload) produced
-     * run-to-run nondeterministic garbage on Windows WDDM (RTX 4090, CUDA 12.4,
-     * MSYS2). Full GPU (NGL=48) and CPU-only (NGL=0) were fine. Setting this
-     * to 1 fixes it 8/8 with no measured perf cost (we already sync per call).
-     *
-     * Must be set BEFORE the first CUDA driver API call, so this is the very
-     * first thing in picolm_gpu_init(). overwrite=0: respect user override.
+    /* Windows WDDM: On Windows, the default-stream gpuMemcpy() may return
+     * before the data is actually readable by device kernels on ctx->stream.
+     * The host-path matmul (picolm_gpu_matmul) works around this with explicit
+     * gpuDeviceSynchronize() after each H2D. For safety, also reduce the
+     * number of hardware work queues to 1 for more deterministic scheduling.
      *
      * On Windows: _putenv_s() crashes because this TU (compiled by nvcc/MSVC)
      * may use a different CRT instance than the one the CUDA driver queries
@@ -196,31 +187,6 @@ int picolm_gpu_init(const int *devices, int count) {
         char existing[8];
         if (GetEnvironmentVariableA("CUDA_DEVICE_MAX_CONNECTIONS", existing, sizeof(existing)) == 0) {
             SetEnvironmentVariableA("CUDA_DEVICE_MAX_CONNECTIONS", "1");
-        }
-        /* Windows WDDM driver: cudaDeviceSynchronize() does not reliably
-         * wait for kernel completion under concurrent work scheduling.
-         * This causes non-determinism in the host-path matmul (H2D -> quantize
-         * -> IMMA -> D2H) when PICOLM_NGL is used with partial offload
-         * (0 < NGL < n_layers). Full-GPU device path and CPU-only are fine.
-         *
-         * We can't know n_layers at init time, so we warn for any positive
-         * NGL. Full-GPU users can ignore this warning.
-         * If using partial NGL on Windows, set CUDA_LAUNCH_BLOCKING=1 for
-         * correctness. See ngl-phase2-summary.md for details. */
-        {
-            const char *ngl_env = getenv("PICOLM_NGL");
-            if (ngl_env) {
-                int ngl_val = atoi(ngl_env);
-                if (ngl_val > 0) {
-                    char lblocking[8];
-                    if (GetEnvironmentVariableA("CUDA_LAUNCH_BLOCKING", lblocking, sizeof(lblocking)) == 0) {
-                        fprintf(stderr, "[GPU] WARN: PICOLM_NGL=%d on Windows: set "
-                                "CUDA_LAUNCH_BLOCKING=1 for correctness\n"
-                                "       (WDDM driver race on host-path; ignore if NGL=n_layers)\n",
-                                ngl_val);
-                    }
-                }
-            }
         }
     }
 #else
@@ -695,6 +661,14 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
 
         /* Upload fp32 input */
         if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
+        /* WDDM: default-stream H2D may return before device reads */
+        gpuDeviceSynchronize();
+        /* TODO(optimization): This per-matmul H2D + sync + D2H cycle is ~50ms
+         * overhead per layer on the host path. With NGL=1, prefill drops to
+         * ~20 tok/s vs ~287 tok/s CPU-only. The real fix is to route NGL
+         * through the device path (picolm_gpu_matmul_dev) with device-resident
+         * buffers, eliminating per-matmul H2D/D2H entirely. See also:
+         * picolm_gpu_matmul_dev() below and model_forward_prefill_gpu(). */
 
         /* Allocate quantized input buffers: qs (int8_t[S*I]) + d (float[S*n_blocks])
          * Round S up to multiple of 16 for IMMA kernel (reads up to S+15 in tail tile).
@@ -762,6 +736,8 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
         int n_blocks = I / 32;
         if (n_blocks < 1 || I % 32 != 0) return 0;
         if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
+        /* WDDM: default-stream H2D may return before device reads */
+        gpuDeviceSynchronize();
 
         int S_padded = (S + 15) & ~15;
         size_t xq_bytes = (size_t)S_padded * I;
@@ -793,6 +769,8 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
         int n_blocks = I / 32;
         if (n_blocks < 1 || I % 32 != 0) return 0;
         if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
+        /* WDDM: default-stream H2D may return before device reads */
+        gpuDeviceSynchronize();
 
         int S_padded = (S + 15) & ~15;
         size_t xq_bytes = (size_t)S_padded * I;
@@ -834,6 +812,8 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
      * from the scalar path. See /data4/work/notes/picolm/q6k-decode-warp-bug.md */
     if (0 && t->qtype == GGUF_TYPE_Q6_K && S == 1 && I % 256 == 0) {
         if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
+        /* WDDM: default-stream H2D may return before device reads */
+        gpuDeviceSynchronize();
 
         gpu_dispatch_print("matmul_q6_decode_host");
         dim3 grid((unsigned)O);
@@ -851,6 +831,8 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
         int n_blocks = I / 32;
         if (n_blocks < 1 || I % 32 != 0) return 0;
         if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
+        /* WDDM: default-stream H2D may return before device reads */
+        gpuDeviceSynchronize();
 
         int S_padded = (S + 15) & ~15;
         size_t xq_bytes = (size_t)S_padded * I;
@@ -883,6 +865,8 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
         int n_blocks = I / 32;
         if (n_blocks < 1 || I % 32 != 0) return 0;
         if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
+        /* WDDM: default-stream H2D may return before device reads */
+        gpuDeviceSynchronize();
 
         int S_padded = (S + 15) & ~15;
         size_t xq_bytes = (size_t)S_padded * I;
@@ -917,6 +901,8 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
 
         /* Upload fp32 input */
         if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
+        /* WDDM: default-stream H2D may return before device reads */
+        gpuDeviceSynchronize();
 
         /* Quantize x to Q8_0 on GPU (same as Q8_0 path) */
         int S_padded = (S + 15) & ~15;
@@ -952,6 +938,8 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
         if (n_blocks < 1) return 0;
 
         if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
+        /* WDDM: default-stream H2D may return before device reads */
+        gpuDeviceSynchronize();
 
         int S_padded = (S + 15) & ~15;
         size_t xq_bytes = (size_t)S_padded * I;
@@ -986,6 +974,8 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
         if (n_blocks < 1) return 0;
 
         if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
+        /* WDDM: default-stream H2D may return before device reads */
+        gpuDeviceSynchronize();
 
         int S_padded = (S + 15) & ~15;
         size_t xq_bytes = (size_t)S_padded * I;
@@ -1020,6 +1010,8 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
         if (n_blocks < 1) return 0;
 
         if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
+        /* WDDM: default-stream H2D may return before device reads */
+        gpuDeviceSynchronize();
 
         int S_padded = (S + 15) & ~15;
         size_t xq_bytes = (size_t)S_padded * I;
@@ -1054,6 +1046,8 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
         if (n_blocks < 1) return 0;
 
         if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
+        /* WDDM: default-stream H2D may return before device reads */
+        gpuDeviceSynchronize();
 
         int S_padded = (S + 15) & ~15;
         size_t xq_bytes = (size_t)S_padded * I;
@@ -1089,6 +1083,8 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
     if ((t->qtype == GGUF_TYPE_F16 || t->qtype == GGUF_TYPE_BF16) &&
         S >= F16_TILE_S && (int)t->row_bytes + 2048 <= 49152) {
         if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
+        /* WDDM: default-stream H2D may return before device reads */
+        gpuDeviceSynchronize();
         dim3 grid((unsigned)O, (unsigned)((S + F16_TILE_S - 1) / F16_TILE_S));
         unsigned smem = (unsigned)(t->row_bytes + 256 * sizeof(double));
         if (t->qtype == GGUF_TYPE_F16) {
@@ -1111,6 +1107,8 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
     /* Generic path for all other quant types */
     /* Scratch buffers are in device memory. Explicit H2D copy needed. */
     if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
+        /* WDDM: default-stream H2D may return before device reads */
+        gpuDeviceSynchronize();
 
     gpu_dispatch_print("matmul_quant_host");
     dim3 grid((unsigned)O, (unsigned)S);
@@ -1923,6 +1921,7 @@ int picolm_gpu_expert_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
         !reserve(&ctx->up, &ctx->up_cap, ib)) return 0;
 
     if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "expert input")) return 0;
+    gpuDeviceSynchronize(); /* WDDM: H2D may return early */
 
     /* ---- FP16/BF16 tiled path ----
      * Direct F32 x FP16/BF16 matmul with tiled weight loading.
@@ -2135,6 +2134,7 @@ int picolm_gpu_w4a16_mlp(picolm_gpu_tensor_t *gate, picolm_gpu_tensor_t *up,
         !reserve(&ctx->y, &ctx->y_cap, xb)) return 0;
 
     if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "w4a16 input")) return 0;
+    gpuDeviceSynchronize(); /* WDDM: H2D may return early */
 
     /* fused gate+up via WMMA */
     dim3 hidden((unsigned)((I + 63) / 64), (unsigned)((S + 15) / 16));
@@ -2184,6 +2184,7 @@ int picolm_gpu_w4a16_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, in
         !reserve(&ctx->y, &ctx->y_cap, yb)) return 0;
 
     if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "w4a16 input")) return 0;
+    gpuDeviceSynchronize(); /* WDDM: H2D may return early */
 
     dim3 grid((unsigned)((N + 63) / 64), (unsigned)((M + 15) / 16));
     picolm_w4a16_matmul<<<grid, 256>>>(ctx->y, ctx->x, t->weights, M, K, N, t->block_size);
