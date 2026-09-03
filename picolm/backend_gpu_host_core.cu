@@ -1,6 +1,19 @@
 // backend_gpu_host_core.cu - GPU initialization, memory, tensor, matmul, expert MLP
 #include "backend_gpu_kernels.cuh"
 
+/* Win32 API forward declarations for CUDA_DEVICE_MAX_CONNECTIONS env var
+ * management on Windows. Avoids pulling in <windows.h> (min/max/byte macro
+ * pollution) into a .cu file compiled by nvcc with CUDA/C++ headers.
+ * kernel32.lib is part of MSVC's default link libraries. */
+#ifdef _WIN32
+extern "C" {
+    __declspec(dllimport) unsigned long __stdcall
+        GetEnvironmentVariableA(const char *, char *, unsigned long);
+    __declspec(dllimport) int __stdcall
+        SetEnvironmentVariableA(const char *, const char *);
+}
+#endif
+
 /* Phase 8: forward declare for nvcc/MSVC cross-TU kernel launch.
  * The .cuh declaration isn't picked up by MSVC's C++ front-end. */
 __global__ void picolm_q8_q8_matmul_imma_smw16(float *, const int8_t *, const float *,
@@ -155,15 +168,61 @@ int picolm_gpu_init(const int *devices, int count) {
     int available = 0;
     if (!devices || count < 1 || count > PICOLM_GPU_MAX_DEVICES) return 0;
 #ifndef __HIP__
-    /* CUDA 13 / GB10 (sm_121): multi-engine scheduling can reorder/overlap
-     * H2D, kernel, and D2H work even though our code issues everything
-     * synchronously per-call, causing run-to-run nondeterminism at temp=0
-     * (see gpu_nondeterminism.md -- isolated empirically, fixes it 8/8 with
-     * no measured perf cost since we already sync per call). Must be set
-     * before the first CUDA driver call, so this has to be the very first
-     * thing in init. overwrite=0: respect an explicit user-set value. */
+    /* CUDA multi-engine scheduling: with the driver default of 8 hardware
+     * work queues, H2D/kernel/D2H submissions on different streams can be
+     * dispatched to different engines whose completion is signaled out of
+     * program order under driver/WDDM batching -- even when the application
+     * uses correct sync primitives. Forcing a single queue eliminates this
+     * degree of freedom.
+     *
+     * Empirically isolated: PICOLM_NGL=2..47 (partial GPU offload) produced
+     * run-to-run nondeterministic garbage on Windows WDDM (RTX 4090, CUDA 12.4,
+     * MSYS2). Full GPU (NGL=48) and CPU-only (NGL=0) were fine. Setting this
+     * to 1 fixes it 8/8 with no measured perf cost (we already sync per call).
+     *
+     * Must be set BEFORE the first CUDA driver API call, so this is the very
+     * first thing in picolm_gpu_init(). overwrite=0: respect user override.
+     *
+     * On Windows: _putenv_s() crashes because this TU (compiled by nvcc/MSVC)
+     * may use a different CRT instance than the one the CUDA driver queries
+     * getenv() through. Mixing CRT-owned environment blocks corrupts the
+     * process env block. SetEnvironmentVariableA writes the OS-level process
+     * environment block directly, visible to all CRTs and the CUDA driver.
+     * We forward-declare the Win32 APIs to avoid pulling in <windows.h>
+     * (min/max/byte macro pollution) into a .cu file with CUDA/C++ headers.
+     * See also: picolm.c uses the same SetEnvironmentVariableA pattern. */
 #ifdef _WIN32
-    /* _putenv_s removed: crashes on Windows WDDM */ 
+    {
+        char existing[8];
+        if (GetEnvironmentVariableA("CUDA_DEVICE_MAX_CONNECTIONS", existing, sizeof(existing)) == 0) {
+            SetEnvironmentVariableA("CUDA_DEVICE_MAX_CONNECTIONS", "1");
+        }
+        /* Windows WDDM driver: cudaDeviceSynchronize() does not reliably
+         * wait for kernel completion under concurrent work scheduling.
+         * This causes non-determinism in the host-path matmul (H2D -> quantize
+         * -> IMMA -> D2H) when PICOLM_NGL is used with partial offload
+         * (0 < NGL < n_layers). Full-GPU device path and CPU-only are fine.
+         *
+         * We can't know n_layers at init time, so we warn for any positive
+         * NGL. Full-GPU users can ignore this warning.
+         * If using partial NGL on Windows, set CUDA_LAUNCH_BLOCKING=1 for
+         * correctness. See ngl-phase2-summary.md for details. */
+        {
+            const char *ngl_env = getenv("PICOLM_NGL");
+            if (ngl_env) {
+                int ngl_val = atoi(ngl_env);
+                if (ngl_val > 0) {
+                    char lblocking[8];
+                    if (GetEnvironmentVariableA("CUDA_LAUNCH_BLOCKING", lblocking, sizeof(lblocking)) == 0) {
+                        fprintf(stderr, "[GPU] WARN: PICOLM_NGL=%d on Windows: set "
+                                "CUDA_LAUNCH_BLOCKING=1 for correctness\n"
+                                "       (WDDM driver race on host-path; ignore if NGL=n_layers)\n",
+                                ngl_val);
+                    }
+                }
+            }
+        }
+    }
 #else
     setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1", 0);
 #endif
@@ -642,13 +701,26 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
          * The quantize kernel writes exactly S rows; the IMMA kernel reads up to S+15
          * but only writes output for rows < S. Padding prevents OOB reads. */
         int S_padded = (S + 15) & ~15;
+        /* TODO(rc1): The quantize kernel (picolm_quantize_q8_0) computes
+         * n_blocks = (I+31)/32 and writes S * n_blocks * 32 bytes to qs_out.
+         * xq_bytes = S_padded * I is correct when I%32==0 (always guaranteed
+         * by caller guards: I%32!=0 or I%256==0). If any caller ever passes
+         * non-32-aligned I, this becomes an OOB write. Consider using
+         * xq_bytes = S_padded * n_blocks * 32 for defensive correctness.
+         * Applies to all xq_bytes allocations in this file (24 sites). */
         size_t xq_bytes = (size_t)S_padded * I;
         size_t xd_bytes = (size_t)S_padded * n_blocks * sizeof(float);
         if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, xq_bytes) ||
             !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
 
+        /* Zero-fill before quantize (matches device path: gpuMemsetAsync).
+         * reserve() only zeros on initial allocation. On reuse, stale data
+         * from a larger previous S can leak into IMMA tail tiles. */
+        gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
+        gpuMemsetAsync(ctx->q8_xd, 0, xd_bytes, ctx->stream);
+
         /* Step 1: Quantize x to Q8_0 on GPU */
-        dim3 q_grid((unsigned)n_blocks, (unsigned)S);
+    dim3 q_grid((unsigned)n_blocks, (unsigned)S);
         picolm_quantize_q8_0<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
             ctx->q8_xq, ctx->q8_xd, ctx->x, I, S);
         if (!gpu_ok(gpuGetLastError(), "q8 quantize") ||
@@ -697,7 +769,9 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
         if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, xq_bytes) ||
             !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
 
-        dim3 q_grid((unsigned)n_blocks, (unsigned)S);
+        gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
+        gpuMemsetAsync(ctx->q8_xd, 0, xd_bytes, ctx->stream);
+    dim3 q_grid((unsigned)n_blocks, (unsigned)S);
         picolm_quantize_q8_0<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
             ctx->q8_xq, ctx->q8_xd, ctx->x, I, S);
         if (!gpu_ok(gpuGetLastError(), "q8 quantize") ||
@@ -726,7 +800,10 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
         if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, xq_bytes) ||
             !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
 
-        dim3 q_grid((unsigned)n_blocks, (unsigned)S);
+        gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
+        gpuMemsetAsync(ctx->q8_xd, 0, xd_bytes, ctx->stream);
+
+    dim3 q_grid((unsigned)n_blocks, (unsigned)S);
         picolm_quantize_q8_0<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
             ctx->q8_xq, ctx->q8_xd, ctx->x, I, S);
         if (!gpu_ok(gpuGetLastError(), "q8 quantize") ||
@@ -781,7 +858,10 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
         if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, xq_bytes) ||
             !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
 
-        dim3 q_grid((unsigned)n_blocks, (unsigned)S);
+        gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
+        gpuMemsetAsync(ctx->q8_xd, 0, xd_bytes, ctx->stream);
+
+    dim3 q_grid((unsigned)n_blocks, (unsigned)S);
         picolm_quantize_q8_0<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
             ctx->q8_xq, ctx->q8_xd, ctx->x, I, S);
         if (!gpu_ok(gpuGetLastError(), "q8 quantize") ||
@@ -810,7 +890,10 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
         if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, xq_bytes) ||
             !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
 
-        dim3 q_grid((unsigned)n_blocks, (unsigned)S);
+        gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
+        gpuMemsetAsync(ctx->q8_xd, 0, xd_bytes, ctx->stream);
+
+    dim3 q_grid((unsigned)n_blocks, (unsigned)S);
         picolm_quantize_q8_0<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
             ctx->q8_xq, ctx->q8_xd, ctx->x, I, S);
         if (!gpu_ok(gpuGetLastError(), "q8 quantize") ||
@@ -842,7 +925,10 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
         if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, xq_bytes) ||
             !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
 
-        dim3 q_grid((unsigned)n_blocks, (unsigned)S);
+        gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
+        gpuMemsetAsync(ctx->q8_xd, 0, xd_bytes, ctx->stream);
+
+    dim3 q_grid((unsigned)n_blocks, (unsigned)S);
         picolm_quantize_q8_0<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
             ctx->q8_xq, ctx->q8_xd, ctx->x, I, S);
         if (!gpu_ok(gpuGetLastError(), "q8 quantize") ||
@@ -873,7 +959,10 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
         if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, xq_bytes) ||
             !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
 
-        dim3 q_grid((unsigned)n_blocks, (unsigned)S);
+        gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
+        gpuMemsetAsync(ctx->q8_xd, 0, xd_bytes, ctx->stream);
+
+    dim3 q_grid((unsigned)n_blocks, (unsigned)S);
         picolm_quantize_q8_0<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
             ctx->q8_xq, ctx->q8_xd, ctx->x, I, S);
         if (!gpu_ok(gpuGetLastError(), "q8 quantize") ||
@@ -904,7 +993,10 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
         if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, xq_bytes) ||
             !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
 
-        dim3 q_grid((unsigned)n_blocks, (unsigned)S);
+        gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
+        gpuMemsetAsync(ctx->q8_xd, 0, xd_bytes, ctx->stream);
+
+    dim3 q_grid((unsigned)n_blocks, (unsigned)S);
         picolm_quantize_q8_0<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
             ctx->q8_xq, ctx->q8_xd, ctx->x, I, S);
         if (!gpu_ok(gpuGetLastError(), "q8 quantize") ||
@@ -935,7 +1027,10 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
         if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, xq_bytes) ||
             !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
 
-        dim3 q_grid((unsigned)n_blocks, (unsigned)S);
+        gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
+        gpuMemsetAsync(ctx->q8_xd, 0, xd_bytes, ctx->stream);
+
+    dim3 q_grid((unsigned)n_blocks, (unsigned)S);
         picolm_quantize_q8_0<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
             ctx->q8_xq, ctx->q8_xd, ctx->x, I, S);
         if (!gpu_ok(gpuGetLastError(), "q8 quantize") ||
@@ -966,7 +1061,10 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
         if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, xq_bytes) ||
             !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
 
-        dim3 q_grid((unsigned)n_blocks, (unsigned)S);
+        gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
+        gpuMemsetAsync(ctx->q8_xd, 0, xd_bytes, ctx->stream);
+
+    dim3 q_grid((unsigned)n_blocks, (unsigned)S);
         picolm_quantize_q8_0<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
             ctx->q8_xq, ctx->q8_xd, ctx->x, I, S);
         if (!gpu_ok(gpuGetLastError(), "q8 quantize") ||
@@ -1067,7 +1165,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
             !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
         gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
         gpuMemsetAsync(ctx->q8_xd, 0, xd_bytes, ctx->stream);
-        dim3 q_grid((unsigned)n_blocks, (unsigned)S);
+    dim3 q_grid((unsigned)n_blocks, (unsigned)S);
         if (x_stride > 0) {
             picolm_quantize_q8_0_strided<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
                 ctx->q8_xq, ctx->q8_xd, x_dev, I, S, x_stride);
@@ -1098,9 +1196,6 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
 #endif
         if (ctx->has_imma && !picolm_gpu_no_imma() && S >= 16 && O >= 8) {
             gpu_dispatch_print("matmul_imma_dev");
-            { static int q8dbg=0; if(!q8dbg){q8dbg=1;
-                fprintf(stderr,"[Q8_DEV] S=%d I=%d O=%d x_stride=%d y_stride=%d row_bytes=%d ys=%d\n",
-                    S,I,O,x_stride,y_stride,(int)t->row_bytes,ys); } }
             dim3 grid((unsigned)((O + 7) / 8), (unsigned)((S + 15) / 16));
             picolm_q8_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(
                 y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
@@ -1130,7 +1225,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
             !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
         gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
         gpuMemsetAsync(ctx->q8_xd, 0, xd_bytes, ctx->stream);
-        dim3 q_grid((unsigned)n_blocks, (unsigned)S);
+    dim3 q_grid((unsigned)n_blocks, (unsigned)S);
         if (x_stride > 0) {
             picolm_quantize_q8_0_strided<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
                 ctx->q8_xq, ctx->q8_xd, x_dev, I, S, x_stride);
@@ -1158,7 +1253,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
             !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
         gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
         gpuMemsetAsync(ctx->q8_xd, 0, xd_bytes, ctx->stream);
-        dim3 q_grid((unsigned)n_blocks, (unsigned)S);
+    dim3 q_grid((unsigned)n_blocks, (unsigned)S);
         if (x_stride > 0) {
             picolm_quantize_q8_0_strided<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
                 ctx->q8_xq, ctx->q8_xd, x_dev, I, S, x_stride);
@@ -1198,7 +1293,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
             !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
         gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
         gpuMemsetAsync(ctx->q8_xd, 0, xd_bytes, ctx->stream);
-        dim3 q_grid((unsigned)n_blocks, (unsigned)S);
+    dim3 q_grid((unsigned)n_blocks, (unsigned)S);
         if (x_stride > 0) {
             picolm_quantize_q8_0_strided<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
                 ctx->q8_xq, ctx->q8_xd, x_dev, I, S, x_stride);
@@ -1226,7 +1321,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
             !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
         gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
         gpuMemsetAsync(ctx->q8_xd, 0, xd_bytes, ctx->stream);
-        dim3 q_grid((unsigned)n_blocks, (unsigned)S);
+    dim3 q_grid((unsigned)n_blocks, (unsigned)S);
         if (x_stride > 0) {
             picolm_quantize_q8_0_strided<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
                 ctx->q8_xq, ctx->q8_xd, x_dev, I, S, x_stride);
@@ -1255,7 +1350,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
             !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
         gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
         gpuMemsetAsync(ctx->q8_xd, 0, xd_bytes, ctx->stream);
-        dim3 q_grid((unsigned)n_blocks, (unsigned)S);
+    dim3 q_grid((unsigned)n_blocks, (unsigned)S);
         if (x_stride > 0) {
             picolm_quantize_q8_0_strided<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
                 ctx->q8_xq, ctx->q8_xd, x_dev, I, S, x_stride);
@@ -1284,7 +1379,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
             !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
         gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
         gpuMemsetAsync(ctx->q8_xd, 0, xd_bytes, ctx->stream);
-        dim3 q_grid((unsigned)n_blocks, (unsigned)S);
+    dim3 q_grid((unsigned)n_blocks, (unsigned)S);
         if (x_stride > 0) {
             picolm_quantize_q8_0_strided<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
                 ctx->q8_xq, ctx->q8_xd, x_dev, I, S, x_stride);
@@ -1313,7 +1408,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
             !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
         gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
         gpuMemsetAsync(ctx->q8_xd, 0, xd_bytes, ctx->stream);
-        dim3 q_grid((unsigned)n_blocks, (unsigned)S);
+    dim3 q_grid((unsigned)n_blocks, (unsigned)S);
         if (x_stride > 0) {
             picolm_quantize_q8_0_strided<<<q_grid, 32, 32*sizeof(float), ctx->stream>>>(
                 ctx->q8_xq, ctx->q8_xd, x_dev, I, S, x_stride);
@@ -1343,7 +1438,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
             !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
         gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
         gpuMemsetAsync(ctx->q8_xd, 0, xd_bytes, ctx->stream);
-        dim3 q_grid((unsigned)n_blocks, (unsigned)S);
+    dim3 q_grid((unsigned)n_blocks, (unsigned)S);
         if (x_stride > 0) {
             picolm_quantize_q8_0_strided<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
                 ctx->q8_xq, ctx->q8_xd, x_dev, I, S, x_stride);
@@ -1372,7 +1467,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
             !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
         gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
         gpuMemsetAsync(ctx->q8_xd, 0, xd_bytes, ctx->stream);
-        dim3 q_grid((unsigned)n_blocks, (unsigned)S);
+    dim3 q_grid((unsigned)n_blocks, (unsigned)S);
         if (x_stride > 0) {
             picolm_quantize_q8_0_strided<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
                 ctx->q8_xq, ctx->q8_xd, x_dev, I, S, x_stride);
@@ -1458,6 +1553,9 @@ int picolm_gpu_matmul_logits(picolm_gpu_tensor_t *t, float *logits_dev,
         if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, xq_bytes) ||
             !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
 
+        gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
+        gpuMemsetAsync(ctx->q8_xd, 0, xd_bytes, ctx->stream);
+
         dim3 q_grid((unsigned)n_blocks, (unsigned)1);
         picolm_quantize_q8_0<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
             ctx->q8_xq, ctx->q8_xd, x_dev, I, 1);
@@ -1497,7 +1595,7 @@ picolm_gpu_matmul_dev_strided(picolm_gpu_tensor_t *t, float *y_dev,
             !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
         gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
         gpuMemsetAsync(ctx->q8_xd, 0, xd_bytes, ctx->stream);
-        dim3 q_grid((unsigned)n_blocks, (unsigned)S);
+    dim3 q_grid((unsigned)n_blocks, (unsigned)S);
         picolm_quantize_q8_0_strided<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
             ctx->q8_xq, ctx->q8_xd, x_dev, I, S, x_stride);
         if (!gpu_ok(gpuGetLastError(), "q8 quantize strided (dev)")) return 0;

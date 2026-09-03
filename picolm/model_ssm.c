@@ -4136,6 +4136,10 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
     if (!gw->kv_active) return model_forward(m, token, pos);
     if (!picolm_gpu_pipe_x(gpu_dev)) { fprintf(stderr, "[GPU] fw_gpu fallback: !pipe_x\n"); return model_forward(m, token, pos); }
     if (!gw->rope_cos_dev || !gw->rope_sin_dev) { fprintf(stderr, "[GPU] fw_gpu fallback: !rope\n"); return model_forward(m, token, pos); }
+    /* If not all layers on GPU, fall back to CPU path (which uses GPU tensors for uploaded layers) */
+    { int _ngl = gw->n_gpu_layers; if (_ngl <= 0) _ngl = c->n_layers;
+      if (_ngl < c->n_layers) { fprintf(stderr,"[DBG] decode ngl fallback: ngl=%d n_layers=%d\n",_ngl,c->n_layers);
+        return model_forward(m, token, pos); } }
 
     /* Pipeline buffer pointers */
     float *pipe_x = picolm_gpu_pipe_x(gpu_dev);
@@ -4824,6 +4828,11 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
         if (!w) { fprintf(stderr, "INFO: PICOLM_ATTN_PREFILL_CPU=1, falling through to CPU prefill\n"); w = 1; }
         return model_forward_prefill(m, tokens, n_tokens, start_pos, interrupt);
     }
+    /* If not all layers on GPU, fall back to CPU prefill */
+    { gpu_weights_t *gw2 = &m->gpu; int _ngl2 = gw2->n_gpu_layers;
+      if (_ngl2 <= 0) _ngl2 = m->config.n_layers;
+      if (_ngl2 < m->config.n_layers) { fprintf(stderr,"[DBG] prefill ngl fallback: ngl=%d n_layers=%d\n",_ngl2,m->config.n_layers);
+        return model_forward_prefill(m, tokens, n_tokens, start_pos, interrupt); } }
 #ifdef PICOLM_GPU
     /* Allow nsys to skip model upload: profile only this function */
 #ifdef PICOLM_CUDA

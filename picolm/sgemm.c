@@ -1,6 +1,9 @@
 // Port of llama.cpp llamafile/sgemm.cpp tinyBLAS tiled GEMM to C.
 // MIT License (Copyright 2024 Mozilla Foundation).
 // Tiled GEMM: C[n x m] = A^T[m x k] * B[k x n]
+#ifndef PICOLM_NOSGEMM
+#define PICOLM_NOSGEMM 0
+#endif
 #include "sgemm.h"
 #include "quant.h"
 #include <stdio.h>
@@ -915,7 +918,7 @@ int picolm_sgemm(int m, int n, int k,
         if (n < 4) return 0;
         if (k % 4 == 0 && m % 4 == 0) { sgemm_f32_f32(m,n,k,(const float*)A,lda,(const float*)B,ldb,C,ldc,ith,nth); return 1; }
 #elif defined(__ALTIVEC__)
-        if (k % 4 == 0 && m % 4 == 0) { sgemm_f32_f32(m,n,k,(const float*)A,lda,(const float*)B,ldb,C,ldc,ith,nth); return 1; }
+        if (k % 4 == 0 && m % 4 == 0 && !PICOLM_NOSGEMM) { sgemm_f32_f32(m,n,k,(const float*)A,lda,(const float*)B,ldb,C,ldc,ith,nth); return 1; }
 #elif defined(__riscv_v_intrinsic)
         if (m % 4 == 0) { sgemm_f32_f32(m,n,k,(const float*)A,lda,(const float*)B,ldb,C,ldc,ith,nth); return 1; }
 #endif
@@ -931,7 +934,7 @@ int picolm_sgemm(int m, int n, int k,
         if (n < 4) return 0;
         if (k % 4 == 0 && m % 4 == 0) { sgemm_f16_f32(m,n,k,(const uint16_t*)A,lda,(const float*)B,ldb,C,ldc,ith,nth); return 1; }
 #elif defined(__ALTIVEC__)
-        if (k % 4 == 0 && m % 4 == 0) { sgemm_f16_f32_altivec(m,n,k,(const uint16_t*)A,lda,(const float*)B,ldb,C,ldc,ith,nth); return 1; }
+        if (k % 4 == 0 && m % 4 == 0 && !PICOLM_NOSGEMM) { sgemm_f16_f32_altivec(m,n,k,(const uint16_t*)A,lda,(const float*)B,ldb,C,ldc,ith,nth); return 1; }
 #endif
     }
     if (Atype == GGUF_TYPE_F16 && Btype == GGUF_TYPE_F16) {
@@ -944,7 +947,7 @@ int picolm_sgemm(int m, int n, int k,
 #elif defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
         if (n >= 8 && m % 4 == 0) { sgemm_f16_f16(m,n,k,(const uint16_t*)A,lda,(const uint16_t*)B,ldb,C,ldc,ith,nth); return 1; }
 #elif defined(__ALTIVEC__)
-        if (k % 4 == 0 && m % 4 == 0) { sgemm_f16_f16_altivec(m,n,k,(const uint16_t*)A,lda,(const uint16_t*)B,ldb,C,ldc,ith,nth); return 1; }
+        if (k % 4 == 0 && m % 4 == 0 && !PICOLM_NOSGEMM) { sgemm_f16_f16_altivec(m,n,k,(const uint16_t*)A,lda,(const uint16_t*)B,ldb,C,ldc,ith,nth); return 1; }
 #endif
     }
     return 0;

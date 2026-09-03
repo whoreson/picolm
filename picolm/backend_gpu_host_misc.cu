@@ -875,10 +875,12 @@ picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
 
     if (!gpu_ok(gpuGetLastError(), "attn prefill kernel")) return 0;
 
-    /* Stream ordering ensures kernel completes before D2H starts.
-     * Async D2H implicitly blocks CPU on completion, no explicit sync needed. */
+    /* Async D2H on ctx->stream. Must sync before CPU reads xb_out, since
+     * the caller (model_core.c prefill loop) uses xb_batch immediately
+     * for Hadamard transforms, output projection matmul, etc. */
     if (!gpu_ok(gpuMemcpyAsync(xb_out, ctx->y, y_bytes, gpuMemcpyDeviceToHost, ctx->stream),
                 "attn prefill output download")) return 0;
+    if (!gpu_ok(gpuStreamSynchronize(ctx->stream), "attn prefill D2H sync")) return 0;
     return 1;
 }
 

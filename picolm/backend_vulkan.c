@@ -836,45 +836,14 @@ int picolm_gpu_tensor_upload(void **tensor, const void *weights,
     if (!arena_suballoc(total, &wbuf, &wptr)) {
                 return 0;
     }
-    // For K-quant formats (Q2_K, Q3_K), dequantize to F32 on CPU and upload as F32.
-    // The shader doesn't handle K-quant dequant correctly on weak GPUs.
-    gguf_type_t upload_qtype = qtype;
-    if (qtype == 10 || qtype == 11 || qtype == 14) {
-        // Convert to F32: each row is I floats = I*4 bytes
-        int f32_rw = (I * 4 + 3) / 4;
-        size_t f32_stride = (size_t)f32_rw * 4;
-        size_t f32_total = f32_stride * (size_t)O;
-        
-        // Reallocate if needed (F32 might be larger than quantized)
-        if (f32_total > total) {
-            vkDestroyBuffer(G.dev, wbuf, NULL);
-            if (!arena_suballoc(f32_total, &wbuf, &wptr)) return 0;
-            total = f32_total;
-        }
-        
-        // Dequantize each row to F32
-        float *f32_buf = malloc(I * sizeof(float));
-        if (!f32_buf) { vkDestroyBuffer(G.dev, wbuf, NULL); return 0; }
+    /* Upload weights: bulk memcpy when no padding, else row-by-row */
+    if (rb == gpu_stride) {
+        memcpy(wptr, weights, total);
+    } else {
         for (int o = 0; o < O; o++) {
-            dequantize_row((const uint8_t *)weights + (size_t)o * rb, f32_buf, I, qtype);
-            memcpy((uint8_t *)wptr + (size_t)o * f32_stride, f32_buf, I * sizeof(float));
+            memcpy((uint8_t *)wptr + (size_t)o * gpu_stride,
+                   (const uint8_t *)weights + (size_t)o * rb, rb);
         }
-        free(f32_buf);
-        upload_qtype = 0; // F32
-        
-        picolm_gpu_tensor_t *t = calloc(1, sizeof(*t));
-        if (!t) { vkDestroyBuffer(G.dev, wbuf, NULL); return 0; }
-        t->wbuf = wbuf; t->wmem = VK_NULL_HANDLE;
-        t->qtype = upload_qtype; t->I = I; t->O = O; t->device = device;
-        t->row_bytes = I * 4; t->row_words = f32_rw; t->wbytes = total;
-        G.used_bytes += total;
-        *slot = t;
-        return 1;
-    }
-    
-    for (int o = 0; o < O; o++) {
-        memcpy((uint8_t *)wptr + (size_t)o * gpu_stride,
-               (const uint8_t *)weights + (size_t)o * rb, rb);
     }
 
     picolm_gpu_tensor_t *t = calloc(1, sizeof(*t));
@@ -923,6 +892,7 @@ typedef struct {
 
 int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x,
                        int S, int device) {
+    struct timespec _t0, _t1; clock_gettime(CLOCK_MONOTONIC, &_t0);
     if (!G.ready || !t || device != 0 || S < 1) {
         if (G.ready && t && S >= 1) fprintf(stderr, "[VK] matmul skip: dev=%d\n", device);
         return 0;
@@ -977,6 +947,10 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x,
         return 0;
     }
     memcpy(y, G.y_buf.ptr, yb);
+    clock_gettime(CLOCK_MONOTONIC, &_t1);
+    { double _ms = (_t1.tv_sec - _t0.tv_sec)*1000.0 + (_t1.tv_nsec - _t0.tv_nsec)/1e6;
+      if (_ms > 0.5) fprintf(stderr, "[GPU_MAT I=%d O=%d S=%d fmt=%d] %.1fms\n",
+          t->I, t->O, S, t->qtype, _ms); }
     return 1;
 }
 

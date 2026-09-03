@@ -43,7 +43,7 @@
 
 #ifdef PICOLM_GPU
 #include "backend_gpu.h"
-#ifdef PICOLM_GPU
+#ifdef PICOLM_CUDA
 extern int cudaProfilerStart(void);
 extern int cudaProfilerStop(void);
 #endif
@@ -1313,6 +1313,15 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
             int q_dim = c->n_heads * c->head_dim;
             int kv_dim = c->n_kv_heads * c->head_dim;
             int uploaded = 0, attempted = 0;
+            /* PICOLM_NGL: number of GPU layers (like llama.cpp -ngl, 0 or -1 = all) */
+            int ngl = c->n_layers;
+            { const char *ngl_env = getenv("PICOLM_NGL");
+              if (ngl_env) { int v = atoi(ngl_env);
+                if (v > 0 && v < c->n_layers) ngl = v;
+                else if (v <= 0) ngl = c->n_layers; }
+              m->gpu.n_gpu_layers = ngl; }
+            if (ngl < c->n_layers)
+                fprintf(stderr, "INFO: GPU layers = %d/%d (PICOLM_NGL=%s)\n", ngl, c->n_layers, getenv("PICOLM_NGL"));
 
             /* Output projection: [vocab_size, n_embd] */
             attempted++;
@@ -1320,7 +1329,7 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                     m->weights.output, m->weights.type_output,
                     c->n_embd, c->vocab_size, device)) uploaded++;
 
-            for (int l = 0; l < c->n_layers; l++) {
+            for (int l = 0; l < ngl; l++) {
                 layer_weights_t *lw = &m->weights.layers[l];
                 gpu_layer_weights_t *gl = &m->gpu.layers[l];
 
@@ -1521,8 +1530,8 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                             }
                             /* Output norm */
                             m->gpu.output_norm_dev = picolm_gpu_upload_f32(s->output_norm_w, c->n_embd, device);
-                            /* Per-layer norm weights */
-                            for (int l = 0; l < c->n_layers; l++) {
+                            /* Per-layer norm weights (only for GPU layers) */
+                            for (int l = 0; l < ngl; l++) {
                                 m->gpu.attn_norm_dev[l] =
                                     picolm_gpu_upload_f32(s->attn_norm_w[l], c->n_embd, device);
                                 m->gpu.post_attn_norm_dev[l] =
@@ -3381,6 +3390,16 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
           if(_SSM_DBG && l==3){
               int lt=n_tokens-1; double qr=0;for(int _i=0;_i<q_dim;_i++)qr+=q_batch[lt*q_full_dim+_i]*q_batch[lt*q_full_dim+_i];
               fprintf(stderr,"[DBG CPU attn_Q l=%d] last_token_rms=%.6f\n",l,sqrt(qr/q_dim));}
+        }
+        /* NGL debug: dump Q projection output for first 3 GPU layers */
+        {
+            const char *ngl_env = getenv("PICOLM_NGL");
+            if (ngl_env && getenv("PICOLM_ATTN_DBG") && l < atoi(ngl_env) && lw->is_attn_layer) {
+                int lt = n_tokens - 1;
+                fprintf(stderr, "[ATN_DBG l=%d Q_OUT] last_tok[:4]={", l);
+                for(int _i=0;_i<4;_i++) fprintf(stderr,"%.6f ", q_batch[lt*q_dim+_i]);
+                fprintf(stderr, "}\n");
+            }
         }
         tensor_set_repacked(NULL);
 

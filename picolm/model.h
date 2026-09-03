@@ -138,6 +138,7 @@ typedef struct {
     void *ssm_state_dev[MAX_LAYERS];      /* device state: [n_v_heads x d_state x d_state] */
     void *ssm_head_map_dev;               /* device copy of forward head_map: natural->GGUF [n_v_heads] */
     void *ssm_head_invmap_dev;            /* device copy of inverse head_map: GGUF->natural [n_v_heads] */
+    int n_gpu_layers;                     /* -ngl: layers 0..n-1 on GPU, rest on CPU (0=-1=all) */
 } gpu_weights_t;
 #endif /* PICOLM_GPU */
 
