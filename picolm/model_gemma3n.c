@@ -60,6 +60,13 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
     model_weights_t *w = &m->weights;
     run_state_t *s = &m->state;
 
+    /* Bounds check: pos must be within KV cache allocation */
+    if (pos >= c->max_seq_len) {
+        fprintf(stderr, "WARN: model_forward_gemma3n pos=%d >= max_seq_len=%d, returning last logits\n",
+                pos, c->max_seq_len);
+        return s->logits;
+    }
+
     int dim = c->n_embd;
     int n_ffn = c->n_ffn;
     int n_heads = c->n_heads;

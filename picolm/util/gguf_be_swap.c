@@ -211,7 +211,7 @@ int main(int argc, char **argv) {
         int needs_swap = 0;
 
         switch (qt) {
-            case G_F16: case G_BF16: case G_Q8_0: case G_Q4_0: case G_Q4_1:
+            case G_F32: case G_F16: case G_BF16: case G_Q8_0: case G_Q4_0: case G_Q4_1:
             case G_Q4_0X4: case G_Q4_0X8: case G_Q2_0: case G_Q1_0:
             case G_Q4_K: case G_Q5_K: case G_Q6_K: case G_Q3_K: case G_Q2_K:
             case G_Q5_0: case G_Q5_1:
@@ -221,6 +221,17 @@ int main(int argc, char **argv) {
         if (!needs_swap) { nskipped++; continue; }
 
         switch (qt) {
+            case G_F32: {
+                size_t total = (size_t)nrows * (size_t)n;
+                size_t ii2;
+                for (ii2 = 0; ii2 < total; ii2++) {
+                    uint32_t v = ((uint32_t *)ptr)[ii2];
+                    ((uint32_t *)ptr)[ii2] = (v >> 24) | ((v >> 8) & 0xff00) |
+                                              ((v << 8) & 0xff0000) | (v << 24);
+                }
+                nswapped += (int)total;
+                break;
+            }
             case G_F16: case G_BF16: {
                 for (size_t i = 0; i < nrows * n; i++)
                     ((uint16_t *)ptr)[i] = swap16(((uint16_t *)ptr)[i]);

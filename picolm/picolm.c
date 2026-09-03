@@ -191,7 +191,8 @@ static const char *tmpl_chatml_suffix =
     "<|im_start|>assistant\n"
     "<think>\n"
     "\n"
-    "</think>\n";
+    "</think>\n"
+    "\n";
 
 static const char *tmpl_alpaca_prefix =
     "Below is an instruction that describes a task. Write a response that appropriately completes the request.\r\n\r\n"
@@ -221,7 +222,7 @@ static char *apply_chat_template(const char *model_path, const char *raw_prompt)
     if (strstr(lower, "gemma")) {
         prefix = tmpl_gemma_prefix;
         suffix = tmpl_gemma_suffix;
-    } else if (strstr(lower, "qwen") || strstr(lower, "smollm2")) {
+    } else if (strstr(lower, "qwen") || strstr(lower, "smollm") && strstr(lower, "instruct")) {
         prefix = tmpl_chatml_prefix;
         suffix = tmpl_chatml_suffix;
     } else {
@@ -524,11 +525,12 @@ static void benchmark_context_scaling(const char *model_path, const char *base_p
         int ctx_size_limit, float temperature, int top_k, int max_tokens,
         uint64_t seed, int num_threads, int do_prefault) {
 
-    fprintf(stderr, "Loading model %s...\n", model_path);
+    fprintf(stderr, "Loading model '%s'...\n", model_path);
     model_t model;
     if (model_load(&model, model_path, ctx_size_limit,
             KV_CACHE_F16, KV_CACHE_F16, 0, 0, num_threads) != 0) {
-        fprintf(stderr, "Failed to load model\n"); exit(1);
+        fprintf(stderr, "ERROR: failed to load model '%s' (see error above)\n", model_path);
+        exit(1);
     }
 
     /* Use the model's GGUF context length if -c was not specified */
@@ -1434,7 +1436,7 @@ int main(int argc, char **argv) {
         load_ok = (model_load(&model, model_path, context_override, kv_type_k, kv_type_v, k_cache_hadamard, v_cache_hadamard, num_threads) == 0);
     }
     if (!load_ok) {
-        fprintf(stderr, "Failed to load model\n");
+        fprintf(stderr, "ERROR: failed to load model '%s' (see error above)\n", model_path);
         return 1;
     }
 
@@ -1484,7 +1486,7 @@ int main(int argc, char **argv) {
 
     if (use_qwen_tok) {
         if (qwen_tokenize_init(&qwen_enc, &model) != 0) {
-            fprintf(stderr, "Failed to init Qwen tokenizer\n");
+            fprintf(stderr, "ERROR: failed to initialize Qwen tokenizer\n");
             model_free(&model);
             return 1;
         }
@@ -1690,19 +1692,31 @@ int main(int argc, char **argv) {
             int pos = 0;
             float *logits = NULL;
 
+            /* Truncate prompt if it exceeds context size (benchmark mode) */
+            int bench_n_prompt = n_prompt;
+            if (bench_n_prompt > model.config.max_seq_len) {
+                bench_n_prompt = model.config.max_seq_len;
+            }
+            /* Cap max_tokens so total context doesn't exceed model limit */
+            int bench_max_tokens = max_tokens;
+            if (bench_n_prompt + bench_max_tokens > model.config.max_seq_len) {
+                bench_max_tokens = model.config.max_seq_len - bench_n_prompt;
+                if (bench_max_tokens < 0) bench_max_tokens = 0;
+            }
+
             /* Prefill phase */
             if (do_prefill) {
                 bench.is_prefill = 1;
 #ifdef PICOLM_GPU
                 if (model.gpu.kv_active) {
-                    logits = model_forward_prefill_gpu(&model, prompt_tokens, n_prompt, 0, NULL);
-                    if (!logits) logits = model_forward_prefill(&model, prompt_tokens, n_prompt, 0, NULL);
+                    logits = model_forward_prefill_gpu(&model, prompt_tokens, bench_n_prompt, 0, NULL);
+                    if (!logits) logits = model_forward_prefill(&model, prompt_tokens, bench_n_prompt, 0, NULL);
                 } else
 #endif
                 {
-                    logits = model_forward_prefill(&model, prompt_tokens, n_prompt, 0, NULL);
+                    logits = model_forward_prefill(&model, prompt_tokens, bench_n_prompt, 0, NULL);
                 }
-                pos = n_prompt - 1;
+                pos = bench_n_prompt - 1;
                 /* Sync SSM state from host to device after CPU prefill */
 #ifdef PICOLM_GPU
                 if (model.gpu.kv_active && model.config.has_ssm) {
@@ -1718,7 +1732,7 @@ int main(int argc, char **argv) {
             if (do_generate) {
                 bench.is_prefill = 0;
                 int token = 0, next = 0;
-                for (int g = 0; g < max_tokens; g++) {
+                for (int g = 0; g < bench_max_tokens; g++) {
                     grammar_apply(&grammar, logits, model.config.vocab_size);
                     if (getenv("PICOLM_LOGITS_DUMP"))
                         dump_top_logits(logits, model.config.vocab_size, pos, 5);
@@ -1792,7 +1806,27 @@ int main(int argc, char **argv) {
     double t_end = 0;
 
     int pos = start_pos;
-    int total_steps = n_prompt + max_tokens;
+
+    /* Truncate prompt if it exceeds context size */
+    if (start_pos + n_prompt > model.config.max_seq_len) {
+        int orig_n_prompt = n_prompt;
+        n_prompt = model.config.max_seq_len - start_pos;
+        fprintf(stderr, "Truncating prompt from %d to %d tokens to fit context %d (start_pos=%d)\n",
+                orig_n_prompt, n_prompt, model.config.max_seq_len, start_pos);
+    }
+
+    /* Cap max_tokens so total context doesn't exceed model limit */
+    if (start_pos + n_prompt + max_tokens > model.config.max_seq_len) {
+        int orig_max_tokens = max_tokens;
+        max_tokens = model.config.max_seq_len - start_pos - n_prompt;
+        if (max_tokens < 0) max_tokens = 0;
+        if (orig_max_tokens != max_tokens) {
+            fprintf(stderr, "Capping max_tokens from %d to %d to fit context %d (start_pos=%d, prompt=%d)\n",
+                    orig_max_tokens, max_tokens, model.config.max_seq_len, start_pos, n_prompt);
+        }
+    }
+
+    int total_steps = start_pos + n_prompt + max_tokens;
     if (total_steps > model.config.max_seq_len) {
         total_steps = model.config.max_seq_len;
     }

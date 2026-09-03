@@ -1244,7 +1244,7 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
     if (parse_gguf(m, max_seq_len) != 0) return -1;
 
     if (m->config.n_layers > MAX_LAYERS) {
-        fprintf(stderr, "ERROR: model has %d layers but MAX_LAYERS=%d\n", m->config.n_layers, MAX_LAYERS);
+        fprintf(stderr, "ERROR: model has %d layers, exceeds limit %d\n", m->config.n_layers, MAX_LAYERS);
         return -1;
     }
 
@@ -1256,7 +1256,7 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
             if (!lw->ffn_gate_exps || !lw->ffn_up_exps || !lw->ffn_down_exps ||
                 !lw->ffn_gate_inp || !lw->ffn_gate_inp_shexp ||
                 !lw->ffn_gate_shexp || !lw->ffn_up_shexp || !lw->ffn_down_shexp) {
-                fprintf(stderr, "Missing MoE tensors\n");
+                fprintf(stderr, "ERROR: model is missing required MoE tensors\n");
                 return -1;
             }
             /* MoE models also have SSM tensors (like qwen35) */
@@ -1264,7 +1264,7 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                 if (!lw->attn_qkv || !lw->attn_gate_ssm || !lw->ssm_a ||
                     !lw->ssm_alpha || !lw->ssm_beta || !lw->ssm_conv1d ||
                     !lw->ssm_dt || !lw->ssm_norm || !lw->ssm_out) {
-                    fprintf(stderr, "Missing SSM tensors in MoE model\n");
+                    fprintf(stderr, "ERROR: MoE model is missing required SSM tensors\n");
                     return -1;
                 }
             }
@@ -1273,21 +1273,21 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
             if (!lw->attn_qkv || !lw->attn_gate_ssm || !lw->ssm_a ||
                 !lw->ssm_alpha || !lw->ssm_beta || !lw->ssm_conv1d ||
                 !lw->ssm_dt || !lw->ssm_norm || !lw->ssm_out) {
-                fprintf(stderr, "Missing SSM tensors\n");
+                fprintf(stderr, "ERROR: SSM model is missing required SSM tensors\n");
                 return -1;
             }
         } else if (m->config.is_gpt2) {
             /* GPT-2: fused QKV, no gate, has biases */
             if (!lw->attn_qkv || !lw->attn_output ||
                 !lw->ffn_up || !lw->ffn_down) {
-                fprintf(stderr, "Missing GPT-2 tensors\n");
+                fprintf(stderr, "ERROR: GPT-2 model is missing required tensors\n");
                 return -1;
             }
         } else {
             /* Standard transformer: check attention tensors */
             if (!lw->attn_q || !lw->attn_k || !lw->attn_v || !lw->attn_output ||
                 !lw->ffn_gate || !lw->ffn_up || !lw->ffn_down) {
-                fprintf(stderr, "Unsupported model architecture (missing standard transformer tensors)\n");
+                fprintf(stderr, "ERROR: unsupported model architecture (missing required transformer tensors)\n");
                 return -1;
             }
         }
@@ -1772,6 +1772,13 @@ static float *model_forward_gpt2(model_t *m, int token, int pos) {
     model_weights_t *w = &m->weights;
     run_state_t *s = &m->state;
 
+    /* Bounds check: pos must be within KV cache allocation */
+    if (pos >= c->max_seq_len) {
+        fprintf(stderr, "WARN: model_forward_gpt2 pos=%d >= max_seq_len=%d, returning last logits\n",
+                pos, c->max_seq_len);
+        return s->logits;
+    }
+
     int dim = c->n_embd;
     int n_ffn = c->n_ffn;
     int n_heads = c->n_heads;
@@ -1943,6 +1950,12 @@ static float *model_forward_gpt2(model_t *m, int token, int pos);
 static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt);
 
 float *model_forward(model_t *m, int token, int pos) {
+    /* Bounds check: pos must be within KV cache allocation */
+    if (pos >= m->config.max_seq_len) {
+        fprintf(stderr, "WARN: model_forward pos=%d >= max_seq_len=%d, returning last logits\n",
+                pos, m->config.max_seq_len);
+        return m->state.logits;
+    }
     /* Gemma-3n has a fundamentally different architecture */
     if (m->config.is_gemma3n) {
         return model_forward_gemma3n(m, token, pos);
@@ -2929,6 +2942,19 @@ static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_to
     model_weights_t *w = &m->weights;
     run_state_t *s = &m->state;
 
+    /* Bounds check: truncate n_tokens if start_pos + n_tokens exceeds max_seq_len */
+    if (start_pos + n_tokens > c->max_seq_len) {
+        int orig = n_tokens;
+        n_tokens = c->max_seq_len - start_pos;
+        if (n_tokens <= 0) {
+            fprintf(stderr, "WARN: prefill_gpt2 start_pos=%d >= max_seq_len=%d, skipping\n",
+                    start_pos, c->max_seq_len);
+            return s->logits;
+        }
+        fprintf(stderr, "WARN: prefill_gpt2 truncating %d->%d tokens (start_pos=%d, max_seq_len=%d)\n",
+                orig, n_tokens, start_pos, c->max_seq_len);
+    }
+
     int dim = c->n_embd;
     int n_ffn = c->n_ffn;
     int n_heads = c->n_heads;
@@ -3139,6 +3165,19 @@ static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_to
  * ================================================================ */
 
 float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt) {
+    /* Bounds check: truncate n_tokens if start_pos + n_tokens exceeds max_seq_len */
+    if (start_pos + n_tokens > m->config.max_seq_len) {
+        int orig = n_tokens;
+        n_tokens = m->config.max_seq_len - start_pos;
+        if (n_tokens <= 0) {
+            fprintf(stderr, "WARN: prefill start_pos=%d >= max_seq_len=%d, skipping\n",
+                    start_pos, m->config.max_seq_len);
+            return m->state.logits;
+        }
+        fprintf(stderr, "WARN: prefill truncating %d->%d tokens (start_pos=%d, max_seq_len=%d)\n",
+                orig, n_tokens, start_pos, m->config.max_seq_len);
+    }
+
     /* TODO: Gemma-3n batched prefill not yet implemented -- falls back to per-token forward */
     if (m->config.is_gemma3n) {
         for (int i = 0; i < n_tokens; i++) {
