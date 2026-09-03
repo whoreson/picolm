@@ -12,29 +12,33 @@
 
 ## What's New
 
-**v1.0-beta3** (upcoming)
+<table><tr><td><b>v1.0-rc1</b> ("Yura Kana")</td><td align="right"><img src="yura_kana.jpg" width="80" alt="Yura Kana"></td></tr></table>
 
 - GPU architecture rewrite: device-native pipeline replacing the old D2H/H2D matmul crutch
 - **Note: MoE model GPU tensor upload is not yet supported on HIP/ROCm** (CUDA works fine).
   MoE models on HIP fall back to CPU SSM matmul; full GPU upload path planned for next release.
-- IMMA Tensor Core kernels for all quant types: Q8_0, Q6_K, Q5_K, Q4_K, Q4_0, Q4_1, Q3_K, Q2_K, Q1_0
-- FlashAttention-2 tensor core prefill kernel, warp-group scalar attention (new default), shared-memory staged IMMA W16 (+17% small ctx)
+- IMMA Tensor Core kernels for all quant types: Q8_0, Q6_K, Q4_0, Q4_1, Q1_0(don't work yet: Q5_K, Q4_K, Q3_K, Q2_K, use the PICOLM_NO_IMMA flag to disable them)
+- FlashAttention-2 tensor core prefill kernel, warp-group scalar attention (new default), shared-memory staged IMMA W16
 - Split-K decode attention (flash-decoding pattern), GPU-resident output projection
 - GPU-resident KV cache, device-native RMSNorm, RoPE, elementwise ops
 - Device-native SSM batched kernels: conv1d, l2norm, vecdot, gated_norm, head_permute, expert_mlp
 - GPU-pipelined prefill path (`model_forward_prefill_gpu`), fused RMSNorm+Quantize+QKV IMMA, two-tier batching
-- FFN rewrite: Q8_0 tiled matmul, 2.6x faster on GPU
+- FFN rewrite: Q8_0 tiled matmul
+- rudimentary Vulkan attempt
+
 - GPT-2 architecture support with batched prefill and native tokenizer
 - MS-DOS (DJGPP) build target
 - GGUF split-file loader
-- Gemma-3n architecture support (WIP, doesn't work yet)
-- TurboQuant TQ3/TQ4 KV cache
+- Gemma-3n architecture support (works, but no SWE yet)
+- TurboQuant TQ4 KV cache (TQ3 does not work)
 - Deterministic sign randomization for Walsh-Hadamard transform
 - `sgemm` tiled GEMM engine for F16/F32 matmuls
 - NEON acceleration for Q4_0, Q4_K, Q5_K, Q6_K, Q3_K, Q2_0, Q1_0 vec_dot paths
 - AVX2/AVX/SSSE3 SIMD paths for Q2_K and Q4_K (Q4_K SSE3: 3.3x vs scalar)
 - `--benchmark-ctx` context scaling benchmark, `--gpu-diff` kernel diff test
 - `-pf` option (auto-apply chat template), Big.LITTLE awareness, `--list-kv`, `PICOLM_GPU_PATH` env var
+- MSYS2 CUDA build target: `hunger-msys-direct` Makefile target for MSYS2 SSH builds with nvcc+cl.exe
+- DJGPP optimizations: `-O2` and `-ffast-math` for fastest build on K6/2-450, DPMI memory diagnostic restored
 
 ## What all this is
 
@@ -44,8 +48,8 @@ Since then, progress has been steady. The main goals are (beyond satisfying
 curiosity on what Qwen-3.6-27B can and can't do):
 
 - **First, portability.** The only good software is one that runs (and is tested) on everything from the last 50 years. PicoLM runs from 32-bit MS-DOS through Raspberry Pi, MIPS/OpenWRT, AMD ROCm (MI50 tested), Metal (if someone bothers), to RTX 4090 or DGX Spark.
-- **Second, speed.** Compete with llama.cpp in as many areas as possible. 100% emphasis on CPU and GPU optimizations. Reaching ik_llama.cpp speeds is impossible, of course, courtesy of 40k lines of matmul engines. Work needs to be done on prefill (prompt processing). As far as token generation is concerned, it's already there, and in some cases outpaces llama.cpp.
-- **Third: model support.** Slopped and benchmaxxed 2023+ models aren't priorities, except Qwen 3.6-27B which is a first-tier model that PicoLM supports (both CPU and GPU, between Q1_0 and f16). Exceptions are made for small models like Gemma-3/4n and sorts, fitting the project profile. Fimbulvetr (SOLAR-10.7b finetune) is also tier 1, and Miqu-70B is known to work. Original Mistral Nemo is planned (needs tokenizer support), and DeepSeek V3-0325 is also on TODO, later versions not at all. MoE and SSM architecture in place, tested with Qwen 3.6-31B-A3B (which is not a good model btw but whatever).
+- **Second, speed.** Compete with llama.cpp in as many areas as possible, achieve "self-hosting" of Qwen-3.6-27B with comparable speed. 100% emphasis on CPU and GPU optimizations. Reaching ik_llama.cpp speeds is impossible, of course, courtesy of 40k lines of matmul engine. Work needs to be done on prefill (prompt processing). As far as token generation is concerned, it's already there, and in some cases outpaces llama.cpp.
+- **Third: model support.** Slopped and benchmaxxed 2023+ models aren't priorities, except Qwen 3.6-27B which is a first-tier model that PicoLM supports (both CPU and GPU, between Q1_0 and f16). Exceptions are made for small models like Gemma-3/4n and sorts, fitting the project profile. Fimbulvetr (SOLAR-10.7b finetune) is also tier 1, and Miqu-70B is known to work. Original Mistral Nemo is planned (needs tokenizer support), and DeepSeek V3-0325 is also on TODO, later versions not at all. Qwen MoE and SSM architecture in place, tested with Qwen 3.6-31B-A3B (which is a dumb model btw but whatever). And if someone finally leaks LaMDA...
 
 PicoLM doesn't preload weights in RAM, therefore doesn't have a hard RAM requirement like llama.cpp. This has the disadvantage of not being able to reorder tensors to col-major, but this is the niche we're in. Support for transposing tensors on-disk (breaking file compatibility) is on the table. The `--prefault` option preloads all weights for faster first reply, when enough RAM is available.
 
@@ -55,7 +59,7 @@ Per-layer activation heatmap, viewable over the built-in VNC server, with no spe
 
 ## Who devs this
 
-This was someone's Claude vibeslop originally, but I started to tinker with it and it grew. Now it's Qwen vibeslop. I'm Gabucino, from the original MPlayer team 25 years ago (which was very closely related to ffmpeg).
+This was someone's Claude vibeslop originally, but I started to tinker with it and it grew. Now it's Qwen vibeslop. I'm Gabucino, member of the original MPlayer team from 25 years ago (which was very closely related to ffmpeg).
 
 **What was added since the upstream baseline:**
 
@@ -79,6 +83,7 @@ This was someone's Claude vibeslop originally, but I started to tinker with it a
 - Jinja
 - CoC
 - Rust
+- JS
 - 41%
 
 ---
