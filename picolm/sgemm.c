@@ -896,6 +896,250 @@ static void sgemm_f16_f16(int m, int n, int k, const uint16_t *A, int lda,
 
 
 /* ============================================================
+ * BF16 x F32 / BF16 x BF16 kernels (BF16 weights)
+ * BF16 dequant: zero-extend 16-bit to 32-bit, shift left 16, reinterpret as float.
+ * AVX-512: _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(...)))
+ *   converts 8 bf16 -> 8 f32 (cvtepu16: 8x16->8x32 zero-extend)
+ * AVX2:    _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(...)))
+ *   converts 8 bf16 -> 8 f32 (pmovzxwd is AVX2)
+ * ============================================================ */
+
+#if defined(__AVX512F__)
+static void sgemm_bf16_f32(int m, int n, int k, const uint16_t *A, int lda,
+                            const float *B, int ldb, float *C, int ldc,
+                            int ith, int nth) {
+#define SGEMM_KN 16
+#define SGEMM_RM 4
+#define SGEMM_RN 6
+#define SGEMM_BN 12
+    const int64_t KN=16, RM=4, RN=6, BN=12;
+    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
+    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1, jB=nB-(nB*sB-xt);
+    int64_t nj=yt*nB, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    for (int64_t j=js;j<je;j++) {
+        int64_t iib=(j%yt)*RM*BM, jb=j/yt;
+        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
+        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);
+        int64_t jj1=jj2<jR*RN?jj2:jR*RN;
+        for (int64_t bi=0;bi<BM*RM;bi+=RM) {
+            int64_t ii=iib+bi;
+            for (int64_t jj=jj0;jj<jj1;jj+=RN) {
+                __m512 Cv[SGEMM_RN][SGEMM_RM];
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=_mm512_setzero_ps();
+                for (int64_t l=0;l<k;l+=KN) {
+                    __m512 Av[SGEMM_RM];
+                    for(int c=0;c<RM;c++) {
+                        __m256i raw = _mm256_loadu_si256((__m256i*)(A+lda*(ii+c)+l));
+                        Av[c] = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(raw), 16));
+                    }
+                    for(int r=0;r<RN;r++) { __m512 Bv=_mm512_loadu_ps(B+ldb*(jj+r)+l);
+                        for(int c=0;c<RM;c++) Cv[r][c]=_mm512_fmadd_ps(Av[c],Bv,Cv[r][c]); }
+                }
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) C[ldc*(jj+r)+(ii+c)]=_mm512_reduce_add_ps(Cv[r][c]);
+            }
+            for (int64_t jj=jj1;jj<jj2;jj++) {
+                __m512 Cv[SGEMM_RM];
+                for(int c=0;c<RM;c++) Cv[c]=_mm512_setzero_ps();
+                for (int64_t l=0;l<k;l+=KN)
+                    for(int c=0;c<RM;c++) {
+                        __m256i raw = _mm256_loadu_si256((__m256i*)(A+lda*(ii+c)+l));
+                        __m512 Av = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(raw), 16));
+                        Cv[c]=_mm512_fmadd_ps(Av,_mm512_loadu_ps(B+ldb*jj+l),Cv[c]);
+                    }
+                for(int c=0;c<RM;c++) C[ldc*jj+(ii+c)]=_mm512_reduce_add_ps(Cv[c]);
+            }
+        }
+    }
+}
+#undef SGEMM_KN; #undef SGEMM_RM; #undef SGEMM_RN; #undef SGEMM_BN
+
+static void sgemm_bf16_bf16(int m, int n, int k, const uint16_t *A, int lda,
+                             const uint16_t *B, int ldb, float *C, int ldc,
+                             int ith, int nth) {
+#define SGEMM_KN 16
+#define SGEMM_RM 4
+#define SGEMM_RN 6
+#define SGEMM_BN 12
+    const int64_t KN=16, RM=4, RN=6, BN=12;
+    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
+    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1, jB=nB-(nB*sB-xt);
+    int64_t nj=yt*nB, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    for (int64_t j=js;j<je;j++) {
+        int64_t iib=(j%yt)*RM*BM, jb=j/yt;
+        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
+        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);
+        int64_t jj1=jj2<jR*RN?jj2:jR*RN;
+        for (int64_t bi=0;bi<BM*RM;bi+=RM) {
+            int64_t ii=iib+bi;
+            for (int64_t jj=jj0;jj<jj1;jj+=RN) {
+                __m512 Cv[SGEMM_RN][SGEMM_RM];
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=_mm512_setzero_ps();
+                for (int64_t l=0;l<k;l+=KN) {
+                    __m512 Av[SGEMM_RM];
+                    for(int c=0;c<RM;c++) {
+                        __m256i raw = _mm256_loadu_si256((__m256i*)(A+lda*(ii+c)+l));
+                        Av[c] = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(raw), 16));
+                    }
+                    for(int r=0;r<RN;r++) {
+                        __m256i raw = _mm256_loadu_si256((__m256i*)(B+ldb*(jj+r)+l));
+                        __m512 Bv = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(raw), 16));
+                        for(int c=0;c<RM;c++) Cv[r][c]=_mm512_fmadd_ps(Av[c],Bv,Cv[r][c]);
+                    }
+                }
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) C[ldc*(jj+r)+(ii+c)]=_mm512_reduce_add_ps(Cv[r][c]);
+            }
+            for (int64_t jj=jj1;jj<jj2;jj++) {
+                __m512 Cv[SGEMM_RM];
+                for(int c=0;c<RM;c++) Cv[c]=_mm512_setzero_ps();
+                for (int64_t l=0;l<k;l+=KN)
+                    for(int c=0;c<RM;c++) {
+                        __m256i raw_a = _mm256_loadu_si256((__m256i*)(A+lda*(ii+c)+l));
+                        __m512 Av = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(raw_a), 16));
+                        __m256i raw_b = _mm256_loadu_si256((__m256i*)(B+ldb*jj+l));
+                        __m512 Bv = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(raw_b), 16));
+                        Cv[c]=_mm512_fmadd_ps(Av,Bv,Cv[c]);
+                    }
+                for(int c=0;c<RM;c++) C[ldc*jj+(ii+c)]=_mm512_reduce_add_ps(Cv[c]);
+            }
+        }
+    }
+}
+#undef SGEMM_KN; #undef SGEMM_RM; #undef SGEMM_RN; #undef SGEMM_BN
+
+#elif defined(__AVX__) || defined(__AVX2__)
+#if defined(__FMA__)
+#define SGEMM_FMA(a,b,c) _mm256_fmadd_ps(a,b,c)
+#else
+#define SGEMM_FMA(a,b,c) _mm256_add_ps(_mm256_mul_ps(a,b),c)
+#endif
+static void sgemm_bf16_f32(int m, int n, int k, const uint16_t *A, int lda,
+                            const float *B, int ldb, float *C, int ldc,
+                            int ith, int nth) {
+#define SGEMM_KN 8
+#define SGEMM_RM 4
+#define SGEMM_RN 3
+#define SGEMM_BN 24
+    const int64_t KN=8, RM=4, RN=3, BN=24;
+    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
+    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1, jB=nB-(nB*sB-xt);
+    int64_t nj=yt*nB, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    for (int64_t j=js;j<je;j++) {
+        int64_t iib=(j%yt)*RM*BM, jb=j/yt;
+        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
+        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);
+        int64_t jj1=jj2<jR*RN?jj2:jR*RN;
+        for (int64_t bi=0;bi<BM*RM;bi+=RM) {
+            int64_t ii=iib+bi;
+            for (int64_t jj=jj0;jj<jj1;jj+=RN) {
+                __m256 Cv[SGEMM_RN][SGEMM_RM];
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=_mm256_setzero_ps();
+                for (int64_t l=0;l<k;l+=KN) {
+                    __m256 Av[SGEMM_RM];
+                    for(int c=0;c<RM;c++) {
+                        __m128i raw = _mm_loadu_si128((__m128i*)(A+lda*(ii+c)+l));
+                        Av[c] = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw)));
+                    }
+                    for(int r=0;r<RN;r++) { __m256 Bv=_mm256_loadu_ps(B+ldb*(jj+r)+l);
+                        for(int c=0;c<RM;c++) Cv[r][c]=SGEMM_FMA(Av[c],Bv,Cv[r][c]); }
+                }
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) {
+                    __m256 s=Cv[r][c]; __m128 lo=_mm256_castps256_ps128(s);
+                    lo=_mm_add_ps(lo,_mm256_extractf128_ps(s,1));
+                    lo=_mm_add_ps(lo,_mm_movehl_ps(lo,lo));
+                    lo=_mm_add_ss(lo,_mm_movehdup_ps(lo));
+                    C[ldc*(jj+r)+(ii+c)]=_mm_cvtss_f32(lo); }
+            }
+            for (int64_t jj=jj1;jj<jj2;jj++) {
+                __m256 Cv[SGEMM_RM];
+                for(int c=0;c<RM;c++) Cv[c]=_mm256_setzero_ps();
+                for (int64_t l=0;l<k;l+=KN)
+                    for(int c=0;c<RM;c++) {
+                        __m128i raw = _mm_loadu_si128((__m128i*)(A+lda*(ii+c)+l));
+                        __m256 Av = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw)));
+                        Cv[c]=SGEMM_FMA(Av,_mm256_loadu_ps(B+ldb*jj+l),Cv[c]);
+                    }
+                for(int c=0;c<RM;c++) {
+                    __m256 s=Cv[c]; __m128 lo=_mm256_castps256_ps128(s);
+                    lo=_mm_add_ps(lo,_mm256_extractf128_ps(s,1));
+                    lo=_mm_add_ps(lo,_mm_movehl_ps(lo,lo));
+                    lo=_mm_add_ss(lo,_mm_movehdup_ps(lo));
+                    C[ldc*jj+(ii+c)]=_mm_cvtss_f32(lo); }
+            }
+        }
+    }
+}
+#undef SGEMM_KN; #undef SGEMM_RM; #undef SGEMM_RN; #undef SGEMM_BN
+
+static void sgemm_bf16_bf16(int m, int n, int k, const uint16_t *A, int lda,
+                             const uint16_t *B, int ldb, float *C, int ldc,
+                             int ith, int nth) {
+#define SGEMM_KN 8
+#define SGEMM_RM 4
+#define SGEMM_RN 3
+#define SGEMM_BN 24
+    const int64_t KN=8, RM=4, RN=3, BN=24;
+    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
+    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1, jB=nB-(nB*sB-xt);
+    int64_t nj=yt*nB, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    for (int64_t j=js;j<je;j++) {
+        int64_t iib=(j%yt)*RM*BM, jb=j/yt;
+        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
+        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);
+        int64_t jj1=jj2<jR*RN?jj2:jR*RN;
+        for (int64_t bi=0;bi<BM*RM;bi+=RM) {
+            int64_t ii=iib+bi;
+            for (int64_t jj=jj0;jj<jj1;jj+=RN) {
+                __m256 Cv[SGEMM_RN][SGEMM_RM];
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=_mm256_setzero_ps();
+                for (int64_t l=0;l<k;l+=KN) {
+                    __m256 Av[SGEMM_RM];
+                    for(int c=0;c<RM;c++) {
+                        __m128i raw = _mm_loadu_si128((__m128i*)(A+lda*(ii+c)+l));
+                        Av[c] = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw)));
+                    }
+                    for(int r=0;r<RN;r++) {
+                        __m128i raw = _mm_loadu_si128((__m128i*)(B+ldb*(jj+r)+l));
+                        __m256 Bv = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw)));
+                        for(int c=0;c<RM;c++) Cv[r][c]=SGEMM_FMA(Av[c],Bv,Cv[r][c]);
+                    }
+                }
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) {
+                    __m256 s=Cv[r][c]; __m128 lo=_mm256_castps256_ps128(s);
+                    lo=_mm_add_ps(lo,_mm256_extractf128_ps(s,1));
+                    lo=_mm_add_ps(lo,_mm_movehl_ps(lo,lo));
+                    lo=_mm_add_ss(lo,_mm_movehdup_ps(lo));
+                    C[ldc*(jj+r)+(ii+c)]=_mm_cvtss_f32(lo); }
+            }
+            for (int64_t jj=jj1;jj<jj2;jj++) {
+                __m256 Cv[SGEMM_RM];
+                for(int c=0;c<RM;c++) Cv[c]=_mm256_setzero_ps();
+                for (int64_t l=0;l<k;l+=KN)
+                    for(int c=0;c<RM;c++) {
+                        __m128i raw_a = _mm_loadu_si128((__m128i*)(A+lda*(ii+c)+l));
+                        __m256 Av = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw_a)));
+                        __m128i raw_b = _mm_loadu_si128((__m128i*)(B+ldb*jj+l));
+                        __m256 Bv = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw_b)));
+                        Cv[c]=SGEMM_FMA(Av,Bv,Cv[c]);
+                    }
+                for(int c=0;c<RM;c++) {
+                    __m256 s=Cv[c]; __m128 lo=_mm256_castps256_ps128(s);
+                    lo=_mm_add_ps(lo,_mm256_extractf128_ps(s,1));
+                    lo=_mm_add_ps(lo,_mm_movehl_ps(lo,lo));
+                    lo=_mm_add_ss(lo,_mm_movehdup_ps(lo));
+                    C[ldc*jj+(ii+c)]=_mm_cvtss_f32(lo); }
+            }
+        }
+    }
+}
+#undef SGEMM_FMA
+#undef SGEMM_KN; #undef SGEMM_RM; #undef SGEMM_RN; #undef SGEMM_BN
+#endif /* AVX2 F16C chain */
+
+/* ============================================================
  * Quantized GEMM kernels (Q8_0 x Q8_0, Q4_0 x Q8_0, Q5_0 x Q8_0)
  * Port of llamafile tinyBLAS_Q0 to C.
  *
@@ -1532,6 +1776,34 @@ int picolm_sgemm(int m, int n, int k,
         if (k % 4 == 0 && m % 4 == 0 && !PICOLM_NOSGEMM) { sgemm_f16_f16_altivec(m,n,k,(const uint16_t*)A,lda,(const uint16_t*)B,ldb,C,ldc,ith,nth); return 1; }
 #endif
     }
+
+    /* BF16 weights: A=BF16 (uint16), B=F32 or BF16 */
+    if (Atype == GGUF_TYPE_BF16) {
+        if (Btype == GGUF_TYPE_F32) {
+#if defined(__AVX512F__)
+            if (k % 16 == 0 && m % 4 == 0) { sgemm_bf16_f32(m,n,k,(const uint16_t*)A,lda,(const float*)B,ldb,C,ldc,ith,nth); return 1; }
+#elif defined(__AVX__) || defined(__AVX2__)
+            if (k % 8 == 0 && m % 4 == 0) { sgemm_bf16_f32(m,n,k,(const uint16_t*)A,lda,(const float*)B,ldb,C,ldc,ith,nth); return 1; }
+#endif
+        }
+        if (Btype == GGUF_TYPE_BF16) {
+#if defined(__AVX512F__)
+            if (k % 16 == 0 && m % 4 == 0) { sgemm_bf16_bf16(m,n,k,(const uint16_t*)A,lda,(const uint16_t*)B,ldb,C,ldc,ith,nth); return 1; }
+#elif defined(__AVX__) || defined(__AVX2__)
+            if (k % 8 == 0 && m % 4 == 0) { sgemm_bf16_bf16(m,n,k,(const uint16_t*)A,lda,(const uint16_t*)B,ldb,C,ldc,ith,nth); return 1; }
+#endif
+        }
+    }
+
+    /* Quantized GEMM: A=quantized weights, B=Q8_0 pre-quantized activations
+     * k is number of blocks (k_blocks), each block has 32 values. */
+    /* TODO: Add IQ4_NL GEMM path (Atype==GGUF_TYPE_IQ4_NL, Btype==GGUF_TYPE_Q8_0).
+     * IQ4_NL uses a 16-entry LUT (kvalues_iq4nl) for dequant instead of linear
+     * (qs-8)*d scaling. Requires a new kernel with LUT-based dequant inside the
+     * GEMM tile. PicoLM currently lacks IQ4_NL vec_dot/quant support, so this
+     * is blocked on adding IQ4_NL to quant.c first.
+     * llama.cpp reference: tinyBLAS_Q0_AVX<block_iq4_nl, block_q8_0, float> in
+     * ggml/src/ggml-cpu/llamafile/sgemm.cpp case GGML_TYPE_IQ4_NL. */
 
     /* Quantized GEMM: A=quantized weights, B=Q8_0 pre-quantized activations
      * k is number of blocks (k_blocks), each block has 32 values. */
