@@ -9,6 +9,12 @@
  * Tiled GEMM: C[n x m] = A^T[m x k] * B[k x n]
  * Column-major semantics.
  * Returns 1 if handled, 0 if caller should fall back to gemv.
+ *
+ * Quantized GEMM support:
+ *   Atype=GGUF_TYPE_Q8_0, Btype=GGUF_TYPE_Q8_0 -> AVX2 sign-trick + maddubs/dpbusd
+ *   Atype=GGUF_TYPE_Q4_0, Btype=GGUF_TYPE_Q8_0 -> AVX2 nibble dequant + maddubs
+ *   Atype=GGUF_TYPE_Q5_0, Btype=GGUF_TYPE_Q8_0 -> AVX2 Q5 dequant + maddubs
+ *   k is number of blocks (each block = 32 values).
  */
 
 #include "quant.h"

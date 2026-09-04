@@ -2372,6 +2372,21 @@ void matmul_batch(float *out, const float *x, int n_batch,
         }
     }
 
+    /* Quantized GEMM fast path: try tiled GEMM with pre-quantized Q8_0 activations.
+     * Much faster than per-row gemv because activation tokens are reused across
+     * weight tiles. k_blocks = n / 32. m = d (output rows), n = n_batch (tokens).
+     * A = weights in quantized blocks, B = Q8_0 activations. */
+    if (have_qx && n_batch >= 2 && d >= 4 && (qtype == GGUF_TYPE_Q8_0 ||
+        qtype == GGUF_TYPE_Q4_0 || qtype == GGUF_TYPE_Q5_0)) {
+        int k_blocks = n / 32;
+        int nth = pool_total_threads(1);
+        if (picolm_sgemm(d, n_batch, k_blocks, W, k_blocks, qx_buf, k_blocks,
+                          out, d, qtype, GGUF_TYPE_Q8_0, 0, nth)) {
+            if (qx_buf) { free(qx_buf); if (qx_d_buf) free(qx_d_buf); }
+            return;
+        }
+    }
+
     /* Q4_0_4_4 fast path for batched matmul */
     if (qtype == GGUF_TYPE_Q4_0_4_4 && n_batch > 0 && n > 0) {
         size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
