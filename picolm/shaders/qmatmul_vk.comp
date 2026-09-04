@@ -46,14 +46,14 @@ float dequant_q2_K(uint rowBase, uint bo, int i) {
     int group = i_in_chunk / 16;
     int l = i_in_chunk % 16;
     int shift = (group % 4) * 2;
-    int hl = group / 4;
-    int scale_idx = chunk * 8 + (group % 4) * 2 + hl;
+    int half = group / 4;
+    int scale_idx = chunk * 8 + group;
     
     uint sc_byte = read_byte(rowBase, bo + uint(scale_idx));
     uint sc = sc_byte & 0xfu;
     uint mn = sc_byte >> 4u;
     
-    uint qs_val = read_byte(rowBase, bo + 16u + uint(chunk*32 + hl*16 + l));
+    uint qs_val = read_byte(rowBase, bo + 16u + uint(chunk*32 + half*16 + l));
     int v = int((qs_val >> shift) & 3u);
     
     return d * float(sc) * float(v) - dmin * float(mn);
@@ -137,7 +137,7 @@ float dequant_q3_K(uint rowBase, uint bo, int i) {
     uint hm_byte = read_byte(rowBase, bo + uint(hm_byte_idx));  // hmask at offset 0
     int hm_bit_val = int((hm_byte >> hm_bit) & 1u);
     
-    int offset; if (hm_bit_val != 0) offset = 0; else offset = 4;
+    int offset = hm_bit_val ? 0 : 4;
     float val = d * float(scale - 32) * float(q - offset);
     return val;
 }
