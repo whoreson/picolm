@@ -4112,13 +4112,6 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
     gpu_weights_t *gw = &m->gpu;
     run_state_t *s = &m->state;
 
-    /* Bounds check: pos must be within KV cache allocation */
-    if (pos >= c->max_seq_len) {
-        fprintf(stderr, "WARN: model_forward_gpu pos=%d >= max_seq_len=%d, returning last logits\n",
-                pos, c->max_seq_len);
-        return s->logits;
-    }
-
     int gpu_dev = gw->device;
     int dim = c->n_embd;
     int n_ffn = c->n_ffn;
@@ -4136,10 +4129,6 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
     if (!gw->kv_active) return model_forward(m, token, pos);
     if (!picolm_gpu_pipe_x(gpu_dev)) { fprintf(stderr, "[GPU] fw_gpu fallback: !pipe_x\n"); return model_forward(m, token, pos); }
     if (!gw->rope_cos_dev || !gw->rope_sin_dev) { fprintf(stderr, "[GPU] fw_gpu fallback: !rope\n"); return model_forward(m, token, pos); }
-    /* If not all layers on GPU, fall back to CPU path (which uses GPU tensors for uploaded layers) */
-    { int _ngl = gw->n_gpu_layers; if (_ngl <= 0) _ngl = c->n_layers;
-      if (_ngl < c->n_layers) { fprintf(stderr,"[DBG] decode ngl fallback: ngl=%d n_layers=%d\n",_ngl,c->n_layers);
-        return model_forward(m, token, pos); } }
 
     /* Pipeline buffer pointers */
     float *pipe_x = picolm_gpu_pipe_x(gpu_dev);
@@ -4804,19 +4793,6 @@ after_qkv:
  * Each ubatch goes through all layers; KV cache is incrementally built.
  * Falls back to model_forward_prefill() if pipeline not ready. */
 float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt) {
-    /* Bounds check: truncate n_tokens if start_pos + n_tokens exceeds max_seq_len */
-    if (start_pos + n_tokens > m->config.max_seq_len) {
-        int orig = n_tokens;
-        n_tokens = m->config.max_seq_len - start_pos;
-        if (n_tokens <= 0) {
-            fprintf(stderr, "WARN: prefill_gpu start_pos=%d >= max_seq_len=%d, skipping\n",
-                    start_pos, m->config.max_seq_len);
-            return m->state.logits;
-        }
-        fprintf(stderr, "WARN: prefill_gpu truncating %d->%d tokens (start_pos=%d, max_seq_len=%d)\n",
-                orig, n_tokens, start_pos, m->config.max_seq_len);
-    }
-
     /* PICOLM_ATTN_PREFILL_CPU: the GPU prefill ubatch loop has no per-layer
      * CPU fallback for attention layers (unlike SSM which has hybrid fallback).
      * Setting this env var forces the entire prefill to fall through to CPU,
@@ -4828,11 +4804,6 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
         if (!w) { fprintf(stderr, "INFO: PICOLM_ATTN_PREFILL_CPU=1, falling through to CPU prefill\n"); w = 1; }
         return model_forward_prefill(m, tokens, n_tokens, start_pos, interrupt);
     }
-    /* If not all layers on GPU, fall back to CPU prefill */
-    { gpu_weights_t *gw2 = &m->gpu; int _ngl2 = gw2->n_gpu_layers;
-      if (_ngl2 <= 0) _ngl2 = m->config.n_layers;
-      if (_ngl2 < m->config.n_layers) { fprintf(stderr,"[DBG] prefill ngl fallback: ngl=%d n_layers=%d\n",_ngl2,m->config.n_layers);
-        return model_forward_prefill(m, tokens, n_tokens, start_pos, interrupt); } }
 #ifdef PICOLM_GPU
     /* Allow nsys to skip model upload: profile only this function */
 #ifdef PICOLM_CUDA
