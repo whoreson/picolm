@@ -896,6 +896,250 @@ static void sgemm_f16_f16(int m, int n, int k, const uint16_t *A, int lda,
 
 
 /* ============================================================
+ * BF16 x F32 / BF16 x BF16 kernels (BF16 weights)
+ * BF16 dequant: zero-extend 16-bit to 32-bit, shift left 16, reinterpret as float.
+ * AVX-512: _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(...)))
+ *   converts 8 bf16 -> 8 f32 (cvtepu16: 8x16->8x32 zero-extend)
+ * AVX2:    _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(...)))
+ *   converts 8 bf16 -> 8 f32 (pmovzxwd is AVX2)
+ * ============================================================ */
+
+#if defined(__AVX512F__)
+static void sgemm_bf16_f32(int m, int n, int k, const uint16_t *A, int lda,
+                            const float *B, int ldb, float *C, int ldc,
+                            int ith, int nth) {
+#define SGEMM_KN 16
+#define SGEMM_RM 4
+#define SGEMM_RN 6
+#define SGEMM_BN 12
+    const int64_t KN=16, RM=4, RN=6, BN=12;
+    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
+    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1, jB=nB-(nB*sB-xt);
+    int64_t nj=yt*nB, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    for (int64_t j=js;j<je;j++) {
+        int64_t iib=(j%yt)*RM*BM, jb=j/yt;
+        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
+        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);
+        int64_t jj1=jj2<jR*RN?jj2:jR*RN;
+        for (int64_t bi=0;bi<BM*RM;bi+=RM) {
+            int64_t ii=iib+bi;
+            for (int64_t jj=jj0;jj<jj1;jj+=RN) {
+                __m512 Cv[SGEMM_RN][SGEMM_RM];
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=_mm512_setzero_ps();
+                for (int64_t l=0;l<k;l+=KN) {
+                    __m512 Av[SGEMM_RM];
+                    for(int c=0;c<RM;c++) {
+                        __m256i raw = _mm256_loadu_si256((__m256i*)(A+lda*(ii+c)+l));
+                        Av[c] = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(raw), 16));
+                    }
+                    for(int r=0;r<RN;r++) { __m512 Bv=_mm512_loadu_ps(B+ldb*(jj+r)+l);
+                        for(int c=0;c<RM;c++) Cv[r][c]=_mm512_fmadd_ps(Av[c],Bv,Cv[r][c]); }
+                }
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) C[ldc*(jj+r)+(ii+c)]=_mm512_reduce_add_ps(Cv[r][c]);
+            }
+            for (int64_t jj=jj1;jj<jj2;jj++) {
+                __m512 Cv[SGEMM_RM];
+                for(int c=0;c<RM;c++) Cv[c]=_mm512_setzero_ps();
+                for (int64_t l=0;l<k;l+=KN)
+                    for(int c=0;c<RM;c++) {
+                        __m256i raw = _mm256_loadu_si256((__m256i*)(A+lda*(ii+c)+l));
+                        __m512 Av = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(raw), 16));
+                        Cv[c]=_mm512_fmadd_ps(Av,_mm512_loadu_ps(B+ldb*jj+l),Cv[c]);
+                    }
+                for(int c=0;c<RM;c++) C[ldc*jj+(ii+c)]=_mm512_reduce_add_ps(Cv[c]);
+            }
+        }
+    }
+}
+#undef SGEMM_KN; #undef SGEMM_RM; #undef SGEMM_RN; #undef SGEMM_BN
+
+static void sgemm_bf16_bf16(int m, int n, int k, const uint16_t *A, int lda,
+                             const uint16_t *B, int ldb, float *C, int ldc,
+                             int ith, int nth) {
+#define SGEMM_KN 16
+#define SGEMM_RM 4
+#define SGEMM_RN 6
+#define SGEMM_BN 12
+    const int64_t KN=16, RM=4, RN=6, BN=12;
+    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
+    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1, jB=nB-(nB*sB-xt);
+    int64_t nj=yt*nB, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    for (int64_t j=js;j<je;j++) {
+        int64_t iib=(j%yt)*RM*BM, jb=j/yt;
+        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
+        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);
+        int64_t jj1=jj2<jR*RN?jj2:jR*RN;
+        for (int64_t bi=0;bi<BM*RM;bi+=RM) {
+            int64_t ii=iib+bi;
+            for (int64_t jj=jj0;jj<jj1;jj+=RN) {
+                __m512 Cv[SGEMM_RN][SGEMM_RM];
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=_mm512_setzero_ps();
+                for (int64_t l=0;l<k;l+=KN) {
+                    __m512 Av[SGEMM_RM];
+                    for(int c=0;c<RM;c++) {
+                        __m256i raw = _mm256_loadu_si256((__m256i*)(A+lda*(ii+c)+l));
+                        Av[c] = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(raw), 16));
+                    }
+                    for(int r=0;r<RN;r++) {
+                        __m256i raw = _mm256_loadu_si256((__m256i*)(B+ldb*(jj+r)+l));
+                        __m512 Bv = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(raw), 16));
+                        for(int c=0;c<RM;c++) Cv[r][c]=_mm512_fmadd_ps(Av[c],Bv,Cv[r][c]);
+                    }
+                }
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) C[ldc*(jj+r)+(ii+c)]=_mm512_reduce_add_ps(Cv[r][c]);
+            }
+            for (int64_t jj=jj1;jj<jj2;jj++) {
+                __m512 Cv[SGEMM_RM];
+                for(int c=0;c<RM;c++) Cv[c]=_mm512_setzero_ps();
+                for (int64_t l=0;l<k;l+=KN)
+                    for(int c=0;c<RM;c++) {
+                        __m256i raw_a = _mm256_loadu_si256((__m256i*)(A+lda*(ii+c)+l));
+                        __m512 Av = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(raw_a), 16));
+                        __m256i raw_b = _mm256_loadu_si256((__m256i*)(B+ldb*jj+l));
+                        __m512 Bv = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(raw_b), 16));
+                        Cv[c]=_mm512_fmadd_ps(Av,Bv,Cv[c]);
+                    }
+                for(int c=0;c<RM;c++) C[ldc*jj+(ii+c)]=_mm512_reduce_add_ps(Cv[c]);
+            }
+        }
+    }
+}
+#undef SGEMM_KN; #undef SGEMM_RM; #undef SGEMM_RN; #undef SGEMM_BN
+
+#elif defined(__AVX__) || defined(__AVX2__)
+#if defined(__FMA__)
+#define SGEMM_FMA(a,b,c) _mm256_fmadd_ps(a,b,c)
+#else
+#define SGEMM_FMA(a,b,c) _mm256_add_ps(_mm256_mul_ps(a,b),c)
+#endif
+static void sgemm_bf16_f32(int m, int n, int k, const uint16_t *A, int lda,
+                            const float *B, int ldb, float *C, int ldc,
+                            int ith, int nth) {
+#define SGEMM_KN 8
+#define SGEMM_RM 4
+#define SGEMM_RN 3
+#define SGEMM_BN 24
+    const int64_t KN=8, RM=4, RN=3, BN=24;
+    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
+    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1, jB=nB-(nB*sB-xt);
+    int64_t nj=yt*nB, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    for (int64_t j=js;j<je;j++) {
+        int64_t iib=(j%yt)*RM*BM, jb=j/yt;
+        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
+        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);
+        int64_t jj1=jj2<jR*RN?jj2:jR*RN;
+        for (int64_t bi=0;bi<BM*RM;bi+=RM) {
+            int64_t ii=iib+bi;
+            for (int64_t jj=jj0;jj<jj1;jj+=RN) {
+                __m256 Cv[SGEMM_RN][SGEMM_RM];
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=_mm256_setzero_ps();
+                for (int64_t l=0;l<k;l+=KN) {
+                    __m256 Av[SGEMM_RM];
+                    for(int c=0;c<RM;c++) {
+                        __m128i raw = _mm_loadu_si128((__m128i*)(A+lda*(ii+c)+l));
+                        Av[c] = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw)));
+                    }
+                    for(int r=0;r<RN;r++) { __m256 Bv=_mm256_loadu_ps(B+ldb*(jj+r)+l);
+                        for(int c=0;c<RM;c++) Cv[r][c]=SGEMM_FMA(Av[c],Bv,Cv[r][c]); }
+                }
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) {
+                    __m256 s=Cv[r][c]; __m128 lo=_mm256_castps256_ps128(s);
+                    lo=_mm_add_ps(lo,_mm256_extractf128_ps(s,1));
+                    lo=_mm_add_ps(lo,_mm_movehl_ps(lo,lo));
+                    lo=_mm_add_ss(lo,_mm_movehdup_ps(lo));
+                    C[ldc*(jj+r)+(ii+c)]=_mm_cvtss_f32(lo); }
+            }
+            for (int64_t jj=jj1;jj<jj2;jj++) {
+                __m256 Cv[SGEMM_RM];
+                for(int c=0;c<RM;c++) Cv[c]=_mm256_setzero_ps();
+                for (int64_t l=0;l<k;l+=KN)
+                    for(int c=0;c<RM;c++) {
+                        __m128i raw = _mm_loadu_si128((__m128i*)(A+lda*(ii+c)+l));
+                        __m256 Av = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw)));
+                        Cv[c]=SGEMM_FMA(Av,_mm256_loadu_ps(B+ldb*jj+l),Cv[c]);
+                    }
+                for(int c=0;c<RM;c++) {
+                    __m256 s=Cv[c]; __m128 lo=_mm256_castps256_ps128(s);
+                    lo=_mm_add_ps(lo,_mm256_extractf128_ps(s,1));
+                    lo=_mm_add_ps(lo,_mm_movehl_ps(lo,lo));
+                    lo=_mm_add_ss(lo,_mm_movehdup_ps(lo));
+                    C[ldc*jj+(ii+c)]=_mm_cvtss_f32(lo); }
+            }
+        }
+    }
+}
+#undef SGEMM_KN; #undef SGEMM_RM; #undef SGEMM_RN; #undef SGEMM_BN
+
+static void sgemm_bf16_bf16(int m, int n, int k, const uint16_t *A, int lda,
+                             const uint16_t *B, int ldb, float *C, int ldc,
+                             int ith, int nth) {
+#define SGEMM_KN 8
+#define SGEMM_RM 4
+#define SGEMM_RN 3
+#define SGEMM_BN 24
+    const int64_t KN=8, RM=4, RN=3, BN=24;
+    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
+    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1, jB=nB-(nB*sB-xt);
+    int64_t nj=yt*nB, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    for (int64_t j=js;j<je;j++) {
+        int64_t iib=(j%yt)*RM*BM, jb=j/yt;
+        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
+        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);
+        int64_t jj1=jj2<jR*RN?jj2:jR*RN;
+        for (int64_t bi=0;bi<BM*RM;bi+=RM) {
+            int64_t ii=iib+bi;
+            for (int64_t jj=jj0;jj<jj1;jj+=RN) {
+                __m256 Cv[SGEMM_RN][SGEMM_RM];
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=_mm256_setzero_ps();
+                for (int64_t l=0;l<k;l+=KN) {
+                    __m256 Av[SGEMM_RM];
+                    for(int c=0;c<RM;c++) {
+                        __m128i raw = _mm_loadu_si128((__m128i*)(A+lda*(ii+c)+l));
+                        Av[c] = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw)));
+                    }
+                    for(int r=0;r<RN;r++) {
+                        __m128i raw = _mm_loadu_si128((__m128i*)(B+ldb*(jj+r)+l));
+                        __m256 Bv = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw)));
+                        for(int c=0;c<RM;c++) Cv[r][c]=SGEMM_FMA(Av[c],Bv,Cv[r][c]);
+                    }
+                }
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) {
+                    __m256 s=Cv[r][c]; __m128 lo=_mm256_castps256_ps128(s);
+                    lo=_mm_add_ps(lo,_mm256_extractf128_ps(s,1));
+                    lo=_mm_add_ps(lo,_mm_movehl_ps(lo,lo));
+                    lo=_mm_add_ss(lo,_mm_movehdup_ps(lo));
+                    C[ldc*(jj+r)+(ii+c)]=_mm_cvtss_f32(lo); }
+            }
+            for (int64_t jj=jj1;jj<jj2;jj++) {
+                __m256 Cv[SGEMM_RM];
+                for(int c=0;c<RM;c++) Cv[c]=_mm256_setzero_ps();
+                for (int64_t l=0;l<k;l+=KN)
+                    for(int c=0;c<RM;c++) {
+                        __m128i raw_a = _mm_loadu_si128((__m128i*)(A+lda*(ii+c)+l));
+                        __m256 Av = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw_a)));
+                        __m128i raw_b = _mm_loadu_si128((__m128i*)(B+ldb*jj+l));
+                        __m256 Bv = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw_b)));
+                        Cv[c]=SGEMM_FMA(Av,Bv,Cv[c]);
+                    }
+                for(int c=0;c<RM;c++) {
+                    __m256 s=Cv[c]; __m128 lo=_mm256_castps256_ps128(s);
+                    lo=_mm_add_ps(lo,_mm256_extractf128_ps(s,1));
+                    lo=_mm_add_ps(lo,_mm_movehl_ps(lo,lo));
+                    lo=_mm_add_ss(lo,_mm_movehdup_ps(lo));
+                    C[ldc*jj+(ii+c)]=_mm_cvtss_f32(lo); }
+            }
+        }
+    }
+}
+#undef SGEMM_FMA
+#undef SGEMM_KN; #undef SGEMM_RM; #undef SGEMM_RN; #undef SGEMM_BN
+#endif /* AVX2 F16C chain */
+
+/* ============================================================
  * Quantized GEMM kernels (Q8_0 x Q8_0, Q4_0 x Q8_0, Q5_0 x Q8_0)
  * Port of llamafile tinyBLAS_Q0 to C.
  *
@@ -1343,6 +1587,44 @@ static __m256i qg_q5_qs(const block_q5_0 *b) {
     (C)[(ldc)*(jj)+(ii)] = q8_hsum_f32(acc);                                    \
 } while (0)
 
+/* 4(weight rows) x N(activation rows, N=1..3) tail tile.
+ * Vectorized over weight rows (4 at a time via CV accumulators),
+ * but handles variable activation row count for the n%4 tail.
+ * This is ~100x faster than QGEMM_CELL_1x1 for the n-tail case
+ * because it reuses weight data across all leftover activation rows. */
+#define QGEMM_TILE_4xN(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d, C, ldc, ii, jj, n_tail, k_blocks) do { \
+    __m256 Cv[4][4]; /* Cv[jr][ir], jr=0..n_tail-1, ir=0..3 */                \
+    for (int jr=0;jr<(n_tail);jr++) for (int c=0;c<4;c++) Cv[jr][c]=_mm256_setzero_ps(); \
+    for (int64_t l = 0; l < (k_blocks); ++l) {                                 \
+        uint64_t ad = qg_pack4_d(*QG_D_PTR((A)+(lda)*((ii)+0)+l),               \
+                                 *QG_D_PTR((A)+(lda)*((ii)+1)+l),              \
+                                 *QG_D_PTR((A)+(lda)*((ii)+2)+l),              \
+                                 *QG_D_PTR((A)+(lda)*((ii)+3)+l));             \
+        __m128 da = _mm_cvtph_ps(_mm_set_epi64x(0, ad));                       \
+        __m256i a0 = load_qs_fn((A)+(lda)*((ii)+0)+l);                         \
+        __m256i a1 = load_qs_fn((A)+(lda)*((ii)+1)+l);                         \
+        __m256i a2 = load_qs_fn((A)+(lda)*((ii)+2)+l);                         \
+        __m256i a3 = load_qs_fn((A)+(lda)*((ii)+3)+l);                         \
+        for (int64_t jr=0; jr<(n_tail); ++jr) {                                \
+            __m256i b = qg_q8_qs((B) + (ldb)*((jj)+jr) + l);                   \
+            __m128 db = _mm_set1_ps((B_d)[(ldb_d)*((jj)+jr) + l]);             \
+            __m128 _da_db = _mm_mul_ps(da, db);                                 \
+            __m256 dv = _mm256_broadcast_ps(&_da_db);                           \
+            Cv[jr][0]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv,dv,0x00),            \
+                qg_updot(_mm256_sign_epi8(a0,a0),_mm256_sign_epi8(b,a0)),Cv[jr][0]); \
+            Cv[jr][1]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv,dv,0x55),            \
+                qg_updot(_mm256_sign_epi8(a1,a1),_mm256_sign_epi8(b,a1)),Cv[jr][1]); \
+            Cv[jr][2]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv,dv,0xAA),            \
+                qg_updot(_mm256_sign_epi8(a2,a2),_mm256_sign_epi8(b,a2)),Cv[jr][2]); \
+            Cv[jr][3]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv,dv,0xFF),            \
+                qg_updot(_mm256_sign_epi8(a3,a3),_mm256_sign_epi8(b,a3)),Cv[jr][3]); \
+        }                                                                        \
+    }                                                                              \
+    for (int64_t jr=0;jr<(n_tail);++jr)                                           \
+        for (int64_t ir=0;ir<4;++ir)                                              \
+            (C)[(ldc)*((jj)+jr)+((ii)+ir)]=q8_hsum_f32(Cv[jr][ir]);                \
+} while (0)
+
 /* mnpack-style tiling: main body is a flat grid of ytiles x xtiles 4x2
  * tiles, split evenly across [0,nth) by flat tile index -- no bloc_pos,
  * no uneven remainder distribution, no per-tile lookup overhead. Every
@@ -1359,27 +1641,29 @@ static void sgemm_##load_qs_fn##_d(int m, int n, int k_blocks,                  
                                    int ith, int nth) {                          \
     int64_t ytiles = m / 4;                                                     \
     int64_t xtiles = n / 2;                                                     \
-    int64_t tiles = ytiles * xtiles;                                            \
-    if (tiles > 0) {                                                            \
-        int64_t duty = (tiles + nth - 1) / nth;                                 \
-        int64_t start = duty * ith;                                             \
-        int64_t end = start + duty;                                             \
-        if (end > tiles) end = tiles;                                           \
-        for (int64_t job = start; job < end; ++job) {                           \
-            int64_t ii = (job / xtiles) * 4;   /* weight rows */                 \
-            int64_t jj = (job % xtiles) * 2;   /* activation cols */             \
-            QGEMM_TILE_4x2(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d,        \
-                           C, ldc, ii, jj, k_blocks);                            \
-        }                                                                        \
+    int64_t n_tail = n - xtiles * 2;                                            \
+    /* Merge n-tail into the tile grid so it gets parallelized. */              \
+    { int64_t xtiles_ext = xtiles + (n_tail > 0 ? 1 : 0);                       \
+      int64_t tiles = ytiles * xtiles_ext;                                      \
+      if (tiles > 0) {                                                          \
+          int64_t duty = (tiles + nth - 1) / nth;                               \
+          int64_t start = duty * ith;                                           \
+          int64_t end = start + duty;                                           \
+          if (end > tiles) end = tiles;                                         \
+          for (int64_t job = start; job < end; ++job) {                         \
+              int64_t ii = (job / xtiles_ext) * 4;  /* weight rows */           \
+              int64_t xt = job % xtiles_ext;                                    \
+              if (xt < xtiles) {                                                \
+                  QGEMM_TILE_4x2(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d, \
+                                 C, ldc, ii, xt * 2, k_blocks);                  \
+              } else {                                                          \
+                  QGEMM_TILE_4xN(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d, \
+                                 C, ldc, ii, xtiles * 2, n_tail, k_blocks);      \
+              }                                                                  \
+          }                                                                      \
+      }                                                                          \
     }                                                                            \
     if (ith == 0) {                                                             \
-        /* n-tail: leftover activation column when n is odd, all m rows. */     \
-        for (int64_t jj = xtiles * 2; jj < n; ++jj) {                           \
-            for (int64_t ii = 0; ii < ytiles * 4; ++ii) {                       \
-                QGEMM_CELL_1x1(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d,    \
-                               C, ldc, ii, jj, k_blocks);                        \
-            }                                                                    \
-        }                                                                        \
         /* m-tail: leftover weight rows when m%4 != 0, all n columns. */        \
         for (int64_t ii = ytiles * 4; ii < m; ++ii) {                           \
             for (int64_t jj = 0; jj < n; ++jj) {                                \
@@ -1407,26 +1691,32 @@ static void sgemm_##load_qs_fn##_d4(int m, int n, int k_blocks,                 
                                     int ith, int nth) {                         \
     int64_t ytiles = m / 4;                                                     \
     int64_t xtiles = n / 4;                                                     \
-    int64_t tiles = ytiles * xtiles;                                            \
-    if (tiles > 0) {                                                            \
-        int64_t duty = (tiles + nth - 1) / nth;                                 \
-        int64_t start = duty * ith;                                             \
-        int64_t end = start + duty;                                             \
-        if (end > tiles) end = tiles;                                           \
-        for (int64_t job = start; job < end; ++job) {                           \
-            int64_t ii = (job / xtiles) * 4;   /* y-major = weight rows */       \
-            int64_t jj = (job % xtiles) * 4;   /* x-major = activation cols */   \
-            QGEMM_TILE_4x4(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d,       \
-                           C, ldc, ii, jj, k_blocks);                            \
-        }                                                                        \
+    int64_t n_tail = n - xtiles * 4;                                            \
+    /* Merge n-tail into the tile grid so it gets parallelized.                  \
+     * Each ytile row has (xtiles + 1) tiles when n_tail > 0.                   \
+     * The last tile in each ytile row uses QGEMM_TILE_4xN. */                 \
+    { int64_t xtiles_ext = xtiles + (n_tail > 0 ? 1 : 0);                       \
+      int64_t tiles = ytiles * xtiles_ext;                                      \
+      if (tiles > 0) {                                                          \
+          int64_t duty = (tiles + nth - 1) / nth;                               \
+          int64_t start = duty * ith;                                           \
+          int64_t end = start + duty;                                           \
+          if (end > tiles) end = tiles;                                         \
+          for (int64_t job = start; job < end; ++job) {                         \
+              int64_t ii = (job / xtiles_ext) * 4;  /* weight rows */           \
+              int64_t xt = job % xtiles_ext;                                    \
+              if (xt < xtiles) {                                                \
+                  QGEMM_TILE_4x4(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d, \
+                                 C, ldc, ii, xt * 4, k_blocks);                  \
+              } else {                                                          \
+                  QGEMM_TILE_4xN(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d, \
+                                 C, ldc, ii, xtiles * 4, n_tail, k_blocks);      \
+              }                                                                  \
+          }                                                                      \
+      }                                                                          \
     }                                                                            \
     if (ith == 0) {                                                             \
-        for (int64_t jj = xtiles * 4; jj < n; ++jj) {                           \
-            for (int64_t ii = 0; ii < ytiles * 4; ++ii) {                       \
-                QGEMM_CELL_1x1(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d,    \
-                               C, ldc, ii, jj, k_blocks);                        \
-            }                                                                    \
-        }                                                                        \
+        /* m-tail: leftover weight rows when m%4 != 0, all n columns. */        \
         for (int64_t ii = ytiles * 4; ii < m; ++ii) {                           \
             for (int64_t jj = 0; jj < n; ++jj) {                                \
                 QGEMM_CELL_1x1(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d,    \
@@ -1498,6 +1788,34 @@ int picolm_sgemm(int m, int n, int k,
         if (k % 4 == 0 && m % 4 == 0 && !PICOLM_NOSGEMM) { sgemm_f16_f16_altivec(m,n,k,(const uint16_t*)A,lda,(const uint16_t*)B,ldb,C,ldc,ith,nth); return 1; }
 #endif
     }
+
+    /* BF16 weights: A=BF16 (uint16), B=F32 or BF16 */
+    if (Atype == GGUF_TYPE_BF16) {
+        if (Btype == GGUF_TYPE_F32) {
+#if defined(__AVX512F__)
+            if (k % 16 == 0 && m % 4 == 0) { sgemm_bf16_f32(m,n,k,(const uint16_t*)A,lda,(const float*)B,ldb,C,ldc,ith,nth); return 1; }
+#elif defined(__AVX__) || defined(__AVX2__)
+            if (k % 8 == 0 && m % 4 == 0) { sgemm_bf16_f32(m,n,k,(const uint16_t*)A,lda,(const float*)B,ldb,C,ldc,ith,nth); return 1; }
+#endif
+        }
+        if (Btype == GGUF_TYPE_BF16) {
+#if defined(__AVX512F__)
+            if (k % 16 == 0 && m % 4 == 0) { sgemm_bf16_bf16(m,n,k,(const uint16_t*)A,lda,(const uint16_t*)B,ldb,C,ldc,ith,nth); return 1; }
+#elif defined(__AVX__) || defined(__AVX2__)
+            if (k % 8 == 0 && m % 4 == 0) { sgemm_bf16_bf16(m,n,k,(const uint16_t*)A,lda,(const uint16_t*)B,ldb,C,ldc,ith,nth); return 1; }
+#endif
+        }
+    }
+
+    /* Quantized GEMM: A=quantized weights, B=Q8_0 pre-quantized activations
+     * k is number of blocks (k_blocks), each block has 32 values. */
+    /* TODO: Add IQ4_NL GEMM path (Atype==GGUF_TYPE_IQ4_NL, Btype==GGUF_TYPE_Q8_0).
+     * IQ4_NL uses a 16-entry LUT (kvalues_iq4nl) for dequant instead of linear
+     * (qs-8)*d scaling. Requires a new kernel with LUT-based dequant inside the
+     * GEMM tile. PicoLM currently lacks IQ4_NL vec_dot/quant support, so this
+     * is blocked on adding IQ4_NL to quant.c first.
+     * llama.cpp reference: tinyBLAS_Q0_AVX<block_iq4_nl, block_q8_0, float> in
+     * ggml/src/ggml-cpu/llamafile/sgemm.cpp case GGML_TYPE_IQ4_NL. */
 
     /* Quantized GEMM: A=quantized weights, B=Q8_0 pre-quantized activations
      * k is number of blocks (k_blocks), each block has 32 values. */

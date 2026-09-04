@@ -2244,6 +2244,9 @@ void matmul_batch(float *out, const float *x, int n_batch,
      * the row-parallel strategy of the Q8_0 batch path and provides enough
      * work units even for small n_batch (e.g. 51 tokens x ~1280 groups =
      * 65K work units on a 27B model). */
+    /* WIP: Interleaved Q4_0_8_8 GEMM path (sgemm_q4_0x8.c).
+     * Disabled by default due to known bugs. Enable with PICOLM_Q4_0x8_GEMM=1.
+     * See sgemm_q4_0x8.c header for details and known issues. */
     if (qtype == GGUF_TYPE_Q4_0_8_8 && n_batch > 0 && n > 0) {
         size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
         void *qbuf = malloc((size_t)n_batch * q8_rb);

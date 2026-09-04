@@ -655,6 +655,18 @@ void repack_q4_0_to_q4_0x4(const void *src, void *dst, int nrows, int ncols);
  * dst must have space for (n / 32) * sizeof(block_q8_0) bytes. */
 void quantize_row_q8_0(const float *x, void *dst, int n);
 
+/* Q8_0x4 interleaved block: 4 rows of Q8_0 packed for AVX2/AVX-512 GEMM.
+ * 4 FP16 deltas + 128 interleaved int8 values. */
+#pragma pack(push, 1)
+typedef struct {
+    uint16_t d[4];      /* 4 FP16 deltas */
+    int8_t   qs[128];    /* interleaved int8 (4 rows x 32 values) */
+} block_q8_0x4;          /* 136 bytes */
+#pragma pack(pop)
+
+/* Quantize 4 rows of F32 to interleaved block_q8_0x4. */
+void quantize_mat_q8_0x4(const float *x, void *dst, int n, int row_stride);
+
 /* Quantize a float32 vector to Q4_0 blocks.
  * dst must have space for (n / 32) * sizeof(block_q4_0) bytes. */
 void quantize_row_q4_0(const float *x, void *dst, int n);

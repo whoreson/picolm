@@ -1789,6 +1789,33 @@ void quantize_row_q8_0(const float *x, void *dst, int n) {
 #endif
 }
 
+/* Quantize 4 rows of F32 activations into interleaved block_q8_0x4. */
+void quantize_mat_q8_0x4(const float *x, void *dst, int n, int row_stride) {
+    block_q8_0x4 *y = (block_q8_0x4 *)dst;
+    int nb = n / 32;
+    for (int b = 0; b < nb; b++) {
+        float srcv[4][32];
+        float id[4];
+        for (int r = 0; r < 4; r++) {
+            const float *xr = x + r * row_stride + b * 32;
+            float amax = 0.0f;
+            for (int j = 0; j < 32; j++) {
+                srcv[r][j] = xr[j];
+                float a = xr[j] < 0 ? -xr[j] : xr[j];
+                if (a > amax) amax = a;
+            }
+            id[r] = amax == 0 ? 1e-30f : 127.0f / amax;
+            int8_t *q = y[b].qs + r * 32;
+            for (int j = 0; j < 32; j++)
+                q[j] = roundf(srcv[r][j] * id[r]);
+        }
+        /* Store scales as FP16 */
+        for (int r = 0; r < 4; r++)
+            y[b].d[r] = fp32_to_fp16(id[r]);
+    }
+}
+
+
 /* ================================================================
  * quantize_row_q8_K: quantize float32 -> Q8_K blocks
  * Used for intermediate quantization in Q4_K/Q6_K matmul
