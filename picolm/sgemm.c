@@ -1234,6 +1234,110 @@ static __m256i qg_q5_qs(const block_q5_0 *b) {
 /* Helper to get fp16 delta pointer from any block type */
 #define QG_D_PTR(b) ((const uint16_t*)&(b)->d)
 
+/* Compute one 4(weight rows) x 2(activation rows) tile at (ii,jj).
+ * Shared by the main tiled loop and both tail loops below so there is
+ * exactly one place that implements the actual math -- tiling logic
+ * changes can't silently diverge from it again. */
+#define QGEMM_TILE_4x2(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d, C, ldc, ii, jj, k_blocks) do { \
+    __m256 Cv[2][4];                                                            \
+    for (int r=0;r<2;r++) for (int c=0;c<4;c++) Cv[r][c]=_mm256_setzero_ps();    \
+    for (int64_t l = 0; l < (k_blocks); ++l) {                                  \
+        uint64_t ad = qg_pack4_d(*QG_D_PTR((A)+(lda)*((ii)+0)+l),                \
+                                 *QG_D_PTR((A)+(lda)*((ii)+1)+l),               \
+                                 *QG_D_PTR((A)+(lda)*((ii)+2)+l),               \
+                                 *QG_D_PTR((A)+(lda)*((ii)+3)+l));              \
+        __m128 da = _mm_cvtph_ps(_mm_set_epi64x(0, ad));                        \
+        __m256i a0 = load_qs_fn((A)+(lda)*((ii)+0)+l);                          \
+        __m256i a1 = load_qs_fn((A)+(lda)*((ii)+1)+l);                          \
+        __m256i a2 = load_qs_fn((A)+(lda)*((ii)+2)+l);                          \
+        __m256i a3 = load_qs_fn((A)+(lda)*((ii)+3)+l);                          \
+        __m256i b0 = qg_q8_qs((B) + (ldb)*((jj)+0) + l);                        \
+        __m128 db0 = _mm_set1_ps((B_d)[(ldb_d)*((jj)+0) + l]);                  \
+        __m256i b1 = qg_q8_qs((B) + (ldb)*((jj)+1) + l);                        \
+        __m128 db1 = _mm_set1_ps((B_d)[(ldb_d)*((jj)+1) + l]);                  \
+        __m128 _da_db0 = _mm_mul_ps(da, db0);                                    \
+        __m128 _da_db1 = _mm_mul_ps(da, db1);                                    \
+        __m256 dv0 = _mm256_broadcast_ps(&_da_db0);                             \
+        __m256 dv1 = _mm256_broadcast_ps(&_da_db1);                             \
+        Cv[0][0]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv0,dv0,0x00),               \
+            qg_updot(_mm256_sign_epi8(a0,a0),_mm256_sign_epi8(b0,a0)),Cv[0][0]); \
+        Cv[0][1]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv0,dv0,0x55),               \
+            qg_updot(_mm256_sign_epi8(a1,a1),_mm256_sign_epi8(b0,a1)),Cv[0][1]); \
+        Cv[0][2]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv0,dv0,0xAA),               \
+            qg_updot(_mm256_sign_epi8(a2,a2),_mm256_sign_epi8(b0,a2)),Cv[0][2]); \
+        Cv[0][3]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv0,dv0,0xFF),               \
+            qg_updot(_mm256_sign_epi8(a3,a3),_mm256_sign_epi8(b0,a3)),Cv[0][3]); \
+        Cv[1][0]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv1,dv1,0x00),               \
+            qg_updot(_mm256_sign_epi8(a0,a0),_mm256_sign_epi8(b1,a0)),Cv[1][0]); \
+        Cv[1][1]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv1,dv1,0x55),               \
+            qg_updot(_mm256_sign_epi8(a1,a1),_mm256_sign_epi8(b1,a1)),Cv[1][1]); \
+        Cv[1][2]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv1,dv1,0xAA),               \
+            qg_updot(_mm256_sign_epi8(a2,a2),_mm256_sign_epi8(b1,a2)),Cv[1][2]); \
+        Cv[1][3]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv1,dv1,0xFF),               \
+            qg_updot(_mm256_sign_epi8(a3,a3),_mm256_sign_epi8(b1,a3)),Cv[1][3]); \
+    }                                                                            \
+    for (int64_t jr=0;jr<2;++jr)                                                \
+        for (int64_t ir=0;ir<4;++ir)                                            \
+            (C)[(ldc)*((jj)+jr)+((ii)+ir)]=q8_hsum_f32(Cv[jr][ir]);              \
+} while (0)
+
+/* 4x4 tile: 4 weight rows x 4 activation rows. Matches llama.cpp gemm4xN<4>. */
+#define QGEMM_TILE_4x4(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d, C, ldc, ii, jj, k_blocks) do { \
+    __m256 Cv[4][4];                                                           \
+    for (int r=0;r<4;r++) for (int c=0;c<4;c++) Cv[r][c]=_mm256_setzero_ps();   \
+    for (int64_t l = 0; l < (k_blocks); ++l) {                                 \
+        uint64_t ad = qg_pack4_d(*QG_D_PTR((A)+(lda)*((ii)+0)+l),               \
+                                 *QG_D_PTR((A)+(lda)*((ii)+1)+l),              \
+                                 *QG_D_PTR((A)+(lda)*((ii)+2)+l),              \
+                                 *QG_D_PTR((A)+(lda)*((ii)+3)+l));             \
+        __m128 da = _mm_cvtph_ps(_mm_set_epi64x(0, ad));                       \
+        __m256i a0 = load_qs_fn((A)+(lda)*((ii)+0)+l);                         \
+        __m256i a1 = load_qs_fn((A)+(lda)*((ii)+1)+l);                         \
+        __m256i a2 = load_qs_fn((A)+(lda)*((ii)+2)+l);                         \
+        __m256i a3 = load_qs_fn((A)+(lda)*((ii)+3)+l);                         \
+        for (int64_t jr=0; jr<4; ++jr) {                                       \
+            __m256i b = qg_q8_qs((B) + (ldb)*((jj)+jr) + l);                   \
+            __m128 db = _mm_set1_ps((B_d)[(ldb_d)*((jj)+jr) + l]);             \
+            __m128 _da_db = _mm_mul_ps(da, db);                                 \
+            __m256 dv = _mm256_broadcast_ps(&_da_db);                           \
+            Cv[jr][0]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv,dv,0x00),            \
+                qg_updot(_mm256_sign_epi8(a0,a0),_mm256_sign_epi8(b,a0)),Cv[jr][0]); \
+            Cv[jr][1]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv,dv,0x55),            \
+                qg_updot(_mm256_sign_epi8(a1,a1),_mm256_sign_epi8(b,a1)),Cv[jr][1]); \
+            Cv[jr][2]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv,dv,0xAA),            \
+                qg_updot(_mm256_sign_epi8(a2,a2),_mm256_sign_epi8(b,a2)),Cv[jr][2]); \
+            Cv[jr][3]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv,dv,0xFF),            \
+                qg_updot(_mm256_sign_epi8(a3,a3),_mm256_sign_epi8(b,a3)),Cv[jr][3]); \
+        }                                                                        \
+    }                                                                              \
+    for (int64_t jr=0;jr<4;++jr)                                                  \
+        for (int64_t ir=0;ir<4;++ir)                                              \
+            (C)[(ldc)*((jj)+jr)+((ii)+ir)]=q8_hsum_f32(Cv[jr][ir]);                \
+} while (0)
+
+/* Scalar-ish fallback for a single weight row x single activation column,
+ * used only in the rare m%4 tail (kept simple and correct, not fast --
+ * it runs on at most 3 rows out of m). */
+#define QGEMM_CELL_1x1(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d, C, ldc, ii, jj, k_blocks) do { \
+    __m256 acc = _mm256_setzero_ps();                                           \
+    for (int64_t l = 0; l < (k_blocks); ++l) {                                  \
+        float da = fp16_to_fp32(*QG_D_PTR((A)+(lda)*(ii)+l));                    \
+        float db = (B_d)[(ldb_d)*(jj) + l];                                     \
+        __m256i a = load_qs_fn((A)+(lda)*(ii)+l);                               \
+        __m256i b = qg_q8_qs((B) + (ldb)*(jj) + l);                             \
+        __m256 dot = qg_updot(_mm256_sign_epi8(a,a), _mm256_sign_epi8(b,a));     \
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(da*db), dot, acc);                 \
+    }                                                                            \
+    (C)[(ldc)*(jj)+(ii)] = q8_hsum_f32(acc);                                    \
+} while (0)
+
+/* mnpack-style tiling: main body is a flat grid of ytiles x xtiles 4x2
+ * tiles, split evenly across [0,nth) by flat tile index -- no bloc_pos,
+ * no uneven remainder distribution, no per-tile lookup overhead. Every
+ * tile is exactly the same shape and cost, so the split is exact.
+ * m%4 and n%2 tails (m, n need not be multiples of 4/2) are handled by
+ * ith==0 alone after the main body's barrier-free completion; they are
+ * a tiny fraction of total work and not worth splitting further. */
 #define QGEMM_D_IMPL(load_qs_fn, blk_t)                                         \
 static void sgemm_##load_qs_fn##_d(int m, int n, int k_blocks,                   \
                                    const blk_t *A, int lda,                     \
@@ -1241,96 +1345,85 @@ static void sgemm_##load_qs_fn##_d(int m, int n, int k_blocks,                  
                                    const float *B_d, int ldb_d,                 \
                                    float *C, int ldc,                           \
                                    int ith, int nth) {                          \
-    int64_t BM = (m >= 16*(int64_t)nth) ? 4 : (m%8==0) ? 2 : 1;                \
-    int64_t yt = m/(4*BM), xt = (n+1)/2, jR = xt-(xt*2-n);                     \
-    int64_t nB = xt<12?1:(xt+6)/12, sB = xt%nB==0?xt/nB:xt/nB+1;               \
-    int64_t jB = nB-(nB*sB-xt), nj = yt*nB;                                     \
-    int64_t js = JSTART(nj,ith,nth), je = JEND(nj,ith,nth);                     \
-    for (int64_t j = js; j < je; j++) {                                         \
-        int64_t iib = (j%yt)*4*BM, jb = j/yt;                                   \
-        int64_t jr0 = bloc_pos(jb,jB,sB), jrN = bloc_pos(jb+1,jB,sB);          \
-        int64_t jj0 = bloc_pos(jr0,jR,2), jj2 = bloc_pos(jrN,jR,2);            \
-        int64_t jj1 = jj2<jR*2?jj2:jR*2;                                        \
-        for (int64_t bi = 0; bi < BM*4; bi += 4) {                              \
-            int64_t ii = iib + bi;                                              \
-            for (int64_t jj = jj0; jj < jj1; jj += 2) {                         \
-                __m256 Cv[2][4];                                                \
-                for (int r=0;r<2;r++) for (int c=0;c<4;c++) Cv[r][c]=_mm256_setzero_ps(); \
-                for (int64_t l = 0; l < k_blocks; ++l) {                        \
-                    uint64_t ad = qg_pack4_d(*QG_D_PTR(A+lda*(ii+0)+l),         \
-                                             *QG_D_PTR(A+lda*(ii+1)+l),        \
-                                             *QG_D_PTR(A+lda*(ii+2)+l),        \
-                                             *QG_D_PTR(A+lda*(ii+3)+l));       \
-                    __m128 da = _mm_cvtph_ps(_mm_set_epi64x(0, ad));            \
-                    __m256i a0 = load_qs_fn(A+lda*(ii+0)+l);                    \
-                    __m256i a1 = load_qs_fn(A+lda*(ii+1)+l);                    \
-                    __m256i a2 = load_qs_fn(A+lda*(ii+2)+l);                    \
-                    __m256i a3 = load_qs_fn(A+lda*(ii+3)+l);                    \
-                    __m256i b0 = qg_q8_qs(B + ldb*(jj) + l);                    \
-                    __m128 db0 = _mm_set1_ps(B_d[ldb_d*jj + l]);                \
-                    __m256i b1 = qg_q8_qs(B + ldb*(jj+1) + l);                  \
-                    __m128 db1 = _mm_set1_ps(B_d[ldb_d*(jj+1) + l]);            \
-                    __m128 _da_db0 = _mm_mul_ps(da, db0);                       \
-                    __m128 _da_db1 = _mm_mul_ps(da, db1);                       \
-                    __m256 dv0 = _mm256_broadcast_ps(&_da_db0);                 \
-                    __m256 dv1 = _mm256_broadcast_ps(&_da_db1);                 \
-                    Cv[0][0]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv0,dv0,0x00),   \
-                        qg_updot(_mm256_sign_epi8(a0,a0),_mm256_sign_epi8(b0,a0)),Cv[0][0]); \
-                    Cv[0][1]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv0,dv0,0x55),   \
-                        qg_updot(_mm256_sign_epi8(a1,a1),_mm256_sign_epi8(b0,a1)),Cv[0][1]); \
-                    Cv[0][2]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv0,dv0,0xAA),   \
-                        qg_updot(_mm256_sign_epi8(a2,a2),_mm256_sign_epi8(b0,a2)),Cv[0][2]); \
-                    Cv[0][3]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv0,dv0,0xFF),   \
-                        qg_updot(_mm256_sign_epi8(a3,a3),_mm256_sign_epi8(b0,a3)),Cv[0][3]); \
-                    Cv[1][0]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv1,dv1,0x00),   \
-                        qg_updot(_mm256_sign_epi8(a0,a0),_mm256_sign_epi8(b1,a0)),Cv[1][0]); \
-                    Cv[1][1]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv1,dv1,0x55),   \
-                        qg_updot(_mm256_sign_epi8(a1,a1),_mm256_sign_epi8(b1,a1)),Cv[1][1]); \
-                    Cv[1][2]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv1,dv1,0xAA),   \
-                        qg_updot(_mm256_sign_epi8(a2,a2),_mm256_sign_epi8(b1,a2)),Cv[1][2]); \
-                    Cv[1][3]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv1,dv1,0xFF),   \
-                        qg_updot(_mm256_sign_epi8(a3,a3),_mm256_sign_epi8(b1,a3)),Cv[1][3]); \
-                }                                                               \
-                for (int64_t jr=0;jr<2;++jr)                                    \
-                    for (int64_t ir=0;ir<4;++ir)                                 \
-                        C[ldc*(jj+jr)+(ii+ir)]=q8_hsum_f32(Cv[jr][ir]);         \
-            }                                                                   \
-            for (int64_t jj=jj1; jj<jj2; ++jj) {                                \
-                __m256 Cv[4];                                                   \
-                for (int c=0;c<4;c++) Cv[c]=_mm256_setzero_ps();                \
-                for (int64_t l = 0; l < k_blocks; ++l) {                        \
-                    uint64_t ad = qg_pack4_d(*QG_D_PTR(A+lda*(ii+0)+l),         \
-                                             *QG_D_PTR(A+lda*(ii+1)+l),        \
-                                             *QG_D_PTR(A+lda*(ii+2)+l),        \
-                                             *QG_D_PTR(A+lda*(ii+3)+l));       \
-                    __m128 da = _mm_cvtph_ps(_mm_set_epi64x(0, ad));            \
-                    __m256i a0 = load_qs_fn(A+lda*(ii+0)+l);                    \
-                    __m256i a1 = load_qs_fn(A+lda*(ii+1)+l);                    \
-                    __m256i a2 = load_qs_fn(A+lda*(ii+2)+l);                    \
-                    __m256i a3 = load_qs_fn(A+lda*(ii+3)+l);                    \
-                    __m256i b = qg_q8_qs(B + ldb*jj + l);                       \
-                    __m128 db = _mm_set1_ps(B_d[ldb_d*jj + l]);                 \
-                    __m128 _da_db = _mm_mul_ps(da, db);                         \
-                    __m256 dv = _mm256_broadcast_ps(&_da_db);                   \
-                    Cv[0]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv,dv,0x00),        \
-                        qg_updot(_mm256_sign_epi8(a0,a0),_mm256_sign_epi8(b,a0)),Cv[0]); \
-                    Cv[1]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv,dv,0x55),        \
-                        qg_updot(_mm256_sign_epi8(a1,a1),_mm256_sign_epi8(b,a1)),Cv[1]); \
-                    Cv[2]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv,dv,0xAA),        \
-                        qg_updot(_mm256_sign_epi8(a2,a2),_mm256_sign_epi8(b,a2)),Cv[2]); \
-                    Cv[3]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv,dv,0xFF),        \
-                        qg_updot(_mm256_sign_epi8(a3,a3),_mm256_sign_epi8(b,a3)),Cv[3]); \
-                }                                                               \
-                for (int64_t ir=0;ir<4;++ir)                                     \
-                    C[ldc*jj+(ii+ir)]=q8_hsum_f32(Cv[ir]);                      \
-            }                                                                   \
-        }                                                                       \
-    }                                                                           \
+    int64_t ytiles = m / 4;                                                     \
+    int64_t xtiles = n / 2;                                                     \
+    int64_t tiles = ytiles * xtiles;                                            \
+    if (tiles > 0) {                                                            \
+        int64_t duty = (tiles + nth - 1) / nth;                                 \
+        int64_t start = duty * ith;                                             \
+        int64_t end = start + duty;                                             \
+        if (end > tiles) end = tiles;                                           \
+        for (int64_t job = start; job < end; ++job) {                           \
+            int64_t ii = (job % ytiles) * 4;                                    \
+            int64_t jj = (job / ytiles) * 2;                                    \
+            QGEMM_TILE_4x2(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d,        \
+                           C, ldc, ii, jj, k_blocks);                            \
+        }                                                                        \
+    }                                                                            \
+    if (ith == 0) {                                                             \
+        /* n-tail: leftover activation column when n is odd, all m rows. */     \
+        for (int64_t jj = xtiles * 2; jj < n; ++jj) {                           \
+            for (int64_t ii = 0; ii < ytiles * 4; ++ii) {                       \
+                QGEMM_CELL_1x1(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d,    \
+                               C, ldc, ii, jj, k_blocks);                        \
+            }                                                                    \
+        }                                                                        \
+        /* m-tail: leftover weight rows when m%4 != 0, all n columns. */        \
+        for (int64_t ii = ytiles * 4; ii < m; ++ii) {                           \
+            for (int64_t jj = 0; jj < n; ++jj) {                                \
+                QGEMM_CELL_1x1(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d,    \
+                               C, ldc, ii, jj, k_blocks);                        \
+            }                                                                    \
+        }                                                                        \
+    }                                                                            \
 }
 
 QGEMM_D_IMPL(qg_q8_qs, block_q8_0)
 QGEMM_D_IMPL(qg_q4_qs, block_q4_0)
 QGEMM_D_IMPL(qg_q5_qs, block_q5_0)
+
+/* RN=4 variant: 4x4 tiles for AVX-512 (32 vector registers). */
+#define QGEMM_D4_IMPL(load_qs_fn, blk_t)                                       \
+static void sgemm_##load_qs_fn##_d4(int m, int n, int k_blocks,                 \
+                                    const blk_t *A, int lda,                    \
+                                    const block_q8_0 *B, int ldb,               \
+                                    const float *B_d, int ldb_d,                \
+                                    float *C, int ldc,                          \
+                                    int ith, int nth) {                         \
+    int64_t ytiles = m / 4;                                                     \
+    int64_t xtiles = n / 4;                                                     \
+    int64_t tiles = ytiles * xtiles;                                            \
+    if (tiles > 0) {                                                            \
+        int64_t duty = (tiles + nth - 1) / nth;                                 \
+        int64_t start = duty * ith;                                             \
+        int64_t end = start + duty;                                             \
+        if (end > tiles) end = tiles;                                           \
+        for (int64_t job = start; job < end; ++job) {                           \
+            int64_t ii = (job % ytiles) * 4;                                    \
+            int64_t jj = (job / ytiles) * 4;                                    \
+            QGEMM_TILE_4x4(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d,       \
+                           C, ldc, ii, jj, k_blocks);                            \
+        }                                                                        \
+    }                                                                            \
+    if (ith == 0) {                                                             \
+        for (int64_t jj = xtiles * 4; jj < n; ++jj) {                           \
+            for (int64_t ii = 0; ii < ytiles * 4; ++ii) {                       \
+                QGEMM_CELL_1x1(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d,    \
+                               C, ldc, ii, jj, k_blocks);                        \
+            }                                                                    \
+        }                                                                        \
+        for (int64_t ii = ytiles * 4; ii < m; ++ii) {                           \
+            for (int64_t jj = 0; jj < n; ++jj) {                                \
+                QGEMM_CELL_1x1(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d,    \
+                               C, ldc, ii, jj, k_blocks);                        \
+            }                                                                    \
+        }                                                                        \
+    }                                                                            \
+}
+
+QGEMM_D4_IMPL(qg_q8_qs, block_q8_0)
+QGEMM_D4_IMPL(qg_q4_qs, block_q4_0)
+QGEMM_D4_IMPL(qg_q5_qs, block_q5_0)
 
 #endif /* AVX2+F16C */
 
@@ -1431,13 +1524,17 @@ int picolm_sgemm_d(int m, int n, int k_blocks,
     if (m < 4 || n < 2 || k_blocks < 1)
         return 0;
 #if defined(__AVX2__) && defined(__F16C__)
+    /* Prefer 4x4 tiles (RN=4) when n >= 4: better activation cache reuse */
     if (Atype == GGUF_TYPE_Q8_0) {
+        if (n >= 4) { sgemm_qg_q8_qs_d4(m, n, k_blocks, (const block_q8_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth); return 1; }
         sgemm_qg_q8_qs_d(m, n, k_blocks, (const block_q8_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth);
         return 1;
     } else if (Atype == GGUF_TYPE_Q4_0) {
+        if (n >= 4) { sgemm_qg_q4_qs_d4(m, n, k_blocks, (const block_q4_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth); return 1; }
         sgemm_qg_q4_qs_d(m, n, k_blocks, (const block_q4_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth);
         return 1;
     } else if (Atype == GGUF_TYPE_Q5_0) {
+        if (n >= 4) { sgemm_qg_q5_qs_d4(m, n, k_blocks, (const block_q5_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth); return 1; }
         sgemm_qg_q5_qs_d(m, n, k_blocks, (const block_q5_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth);
         return 1;
     }
