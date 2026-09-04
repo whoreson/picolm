@@ -2584,6 +2584,36 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
             n, d, n_batch, qtype1, qtype2);
     }
 #endif
+    /* Quantized GEMM fast path for dual batch (K+V or gate+up projections).
+     * Pre-quantize activations once, then use picolm_sgemm_d for both matmuls. */
+    if (n_batch >= 8 && d >= 4 && n > 0 &&
+        (qtype1 == GGUF_TYPE_Q8_0 || qtype1 == GGUF_TYPE_Q4_0 || qtype1 == GGUF_TYPE_Q5_0) &&
+        (qtype2 == GGUF_TYPE_Q8_0 || qtype2 == GGUF_TYPE_Q4_0 || qtype2 == GGUF_TYPE_Q5_0)) {
+        size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
+        int nb = n / 32;
+        void *qbuf = malloc((size_t)n_batch * q8_rb);
+        float *dbuf = (float *)malloc((size_t)n_batch * nb * sizeof(float));
+        if (qbuf && dbuf) {
+            for (int b = 0; b < n_batch; b++) {
+                quantize_row_q8_0(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
+                const block_q8_0 *blk = (const block_q8_0 *)((char *)qbuf + (size_t)b * q8_rb);
+                for (int k = 0; k < nb; k++) dbuf[(size_t)b * nb + k] = fp16_to_fp32(blk[k].d);
+            }
+            int k_blocks = n / 32;
+            int nth = pool_total_threads(1);
+            int gemm1 = picolm_sgemm_d(d, n_batch, k_blocks, W1, k_blocks,
+                                        (const block_q8_0*)qbuf, k_blocks,
+                                        dbuf, k_blocks,
+                                        out1, d, qtype1, 0, nth);
+            int gemm2 = picolm_sgemm_d(d, n_batch, k_blocks, W2, k_blocks,
+                                        (const block_q8_0*)qbuf, k_blocks,
+                                        dbuf, k_blocks,
+                                        out2, d, qtype2, 0, nth);
+            free(qbuf); free(dbuf);
+            if (gemm1 && gemm2) return;
+        }
+    }
+
 #if defined(PICOLM_AVX2)
     /* Same reasoning as matmul_batch's Q4_0_8_8 branch: reuse the
      * validated gemv kernel once per token, parallelized over tokens.
