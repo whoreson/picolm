@@ -1331,6 +1331,44 @@ static __m256i qg_q5_qs(const block_q5_0 *b) {
     (C)[(ldc)*(jj)+(ii)] = q8_hsum_f32(acc);                                    \
 } while (0)
 
+/* 4(weight rows) x N(activation rows, N=1..3) tail tile.
+ * Vectorized over weight rows (4 at a time via CV accumulators),
+ * but handles variable activation row count for the n%4 tail.
+ * This is ~100x faster than QGEMM_CELL_1x1 for the n-tail case
+ * because it reuses weight data across all leftover activation rows. */
+#define QGEMM_TILE_4xN(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d, C, ldc, ii, jj, n_tail, k_blocks) do { \
+    __m256 Cv[4][4]; /* Cv[jr][ir], jr=0..n_tail-1, ir=0..3 */                \
+    for (int jr=0;jr<(n_tail);jr++) for (int c=0;c<4;c++) Cv[jr][c]=_mm256_setzero_ps(); \
+    for (int64_t l = 0; l < (k_blocks); ++l) {                                 \
+        uint64_t ad = qg_pack4_d(*QG_D_PTR((A)+(lda)*((ii)+0)+l),               \
+                                 *QG_D_PTR((A)+(lda)*((ii)+1)+l),              \
+                                 *QG_D_PTR((A)+(lda)*((ii)+2)+l),              \
+                                 *QG_D_PTR((A)+(lda)*((ii)+3)+l));             \
+        __m128 da = _mm_cvtph_ps(_mm_set_epi64x(0, ad));                       \
+        __m256i a0 = load_qs_fn((A)+(lda)*((ii)+0)+l);                         \
+        __m256i a1 = load_qs_fn((A)+(lda)*((ii)+1)+l);                         \
+        __m256i a2 = load_qs_fn((A)+(lda)*((ii)+2)+l);                         \
+        __m256i a3 = load_qs_fn((A)+(lda)*((ii)+3)+l);                         \
+        for (int64_t jr=0; jr<(n_tail); ++jr) {                                \
+            __m256i b = qg_q8_qs((B) + (ldb)*((jj)+jr) + l);                   \
+            __m128 db = _mm_set1_ps((B_d)[(ldb_d)*((jj)+jr) + l]);             \
+            __m128 _da_db = _mm_mul_ps(da, db);                                 \
+            __m256 dv = _mm256_broadcast_ps(&_da_db);                           \
+            Cv[jr][0]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv,dv,0x00),            \
+                qg_updot(_mm256_sign_epi8(a0,a0),_mm256_sign_epi8(b,a0)),Cv[jr][0]); \
+            Cv[jr][1]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv,dv,0x55),            \
+                qg_updot(_mm256_sign_epi8(a1,a1),_mm256_sign_epi8(b,a1)),Cv[jr][1]); \
+            Cv[jr][2]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv,dv,0xAA),            \
+                qg_updot(_mm256_sign_epi8(a2,a2),_mm256_sign_epi8(b,a2)),Cv[jr][2]); \
+            Cv[jr][3]=_mm256_fmadd_ps(_mm256_shuffle_ps(dv,dv,0xFF),            \
+                qg_updot(_mm256_sign_epi8(a3,a3),_mm256_sign_epi8(b,a3)),Cv[jr][3]); \
+        }                                                                        \
+    }                                                                              \
+    for (int64_t jr=0;jr<(n_tail);++jr)                                           \
+        for (int64_t ir=0;ir<4;++ir)                                              \
+            (C)[(ldc)*((jj)+jr)+((ii)+ir)]=q8_hsum_f32(Cv[jr][ir]);                \
+} while (0)
+
 /* mnpack-style tiling: main body is a flat grid of ytiles x xtiles 4x2
  * tiles, split evenly across [0,nth) by flat tile index -- no bloc_pos,
  * no uneven remainder distribution, no per-tile lookup overhead. Every
@@ -1347,27 +1385,29 @@ static void sgemm_##load_qs_fn##_d(int m, int n, int k_blocks,                  
                                    int ith, int nth) {                          \
     int64_t ytiles = m / 4;                                                     \
     int64_t xtiles = n / 2;                                                     \
-    int64_t tiles = ytiles * xtiles;                                            \
-    if (tiles > 0) {                                                            \
-        int64_t duty = (tiles + nth - 1) / nth;                                 \
-        int64_t start = duty * ith;                                             \
-        int64_t end = start + duty;                                             \
-        if (end > tiles) end = tiles;                                           \
-        for (int64_t job = start; job < end; ++job) {                           \
-            int64_t ii = (job / xtiles) * 4;   /* weight rows */                 \
-            int64_t jj = (job % xtiles) * 2;   /* activation cols */             \
-            QGEMM_TILE_4x2(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d,        \
-                           C, ldc, ii, jj, k_blocks);                            \
-        }                                                                        \
+    int64_t n_tail = n - xtiles * 2;                                            \
+    /* Merge n-tail into the tile grid so it gets parallelized. */              \
+    { int64_t xtiles_ext = xtiles + (n_tail > 0 ? 1 : 0);                       \
+      int64_t tiles = ytiles * xtiles_ext;                                      \
+      if (tiles > 0) {                                                          \
+          int64_t duty = (tiles + nth - 1) / nth;                               \
+          int64_t start = duty * ith;                                           \
+          int64_t end = start + duty;                                           \
+          if (end > tiles) end = tiles;                                         \
+          for (int64_t job = start; job < end; ++job) {                         \
+              int64_t ii = (job / xtiles_ext) * 4;  /* weight rows */           \
+              int64_t xt = job % xtiles_ext;                                    \
+              if (xt < xtiles) {                                                \
+                  QGEMM_TILE_4x2(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d, \
+                                 C, ldc, ii, xt * 2, k_blocks);                  \
+              } else {                                                          \
+                  QGEMM_TILE_4xN(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d, \
+                                 C, ldc, ii, xtiles * 2, n_tail, k_blocks);      \
+              }                                                                  \
+          }                                                                      \
+      }                                                                          \
     }                                                                            \
     if (ith == 0) {                                                             \
-        /* n-tail: leftover activation column when n is odd, all m rows. */     \
-        for (int64_t jj = xtiles * 2; jj < n; ++jj) {                           \
-            for (int64_t ii = 0; ii < ytiles * 4; ++ii) {                       \
-                QGEMM_CELL_1x1(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d,    \
-                               C, ldc, ii, jj, k_blocks);                        \
-            }                                                                    \
-        }                                                                        \
         /* m-tail: leftover weight rows when m%4 != 0, all n columns. */        \
         for (int64_t ii = ytiles * 4; ii < m; ++ii) {                           \
             for (int64_t jj = 0; jj < n; ++jj) {                                \
@@ -1395,26 +1435,32 @@ static void sgemm_##load_qs_fn##_d4(int m, int n, int k_blocks,                 
                                     int ith, int nth) {                         \
     int64_t ytiles = m / 4;                                                     \
     int64_t xtiles = n / 4;                                                     \
-    int64_t tiles = ytiles * xtiles;                                            \
-    if (tiles > 0) {                                                            \
-        int64_t duty = (tiles + nth - 1) / nth;                                 \
-        int64_t start = duty * ith;                                             \
-        int64_t end = start + duty;                                             \
-        if (end > tiles) end = tiles;                                           \
-        for (int64_t job = start; job < end; ++job) {                           \
-            int64_t ii = (job / xtiles) * 4;   /* y-major = weight rows */       \
-            int64_t jj = (job % xtiles) * 4;   /* x-major = activation cols */   \
-            QGEMM_TILE_4x4(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d,       \
-                           C, ldc, ii, jj, k_blocks);                            \
-        }                                                                        \
+    int64_t n_tail = n - xtiles * 4;                                            \
+    /* Merge n-tail into the tile grid so it gets parallelized.                  \
+     * Each ytile row has (xtiles + 1) tiles when n_tail > 0.                   \
+     * The last tile in each ytile row uses QGEMM_TILE_4xN. */                 \
+    { int64_t xtiles_ext = xtiles + (n_tail > 0 ? 1 : 0);                       \
+      int64_t tiles = ytiles * xtiles_ext;                                      \
+      if (tiles > 0) {                                                          \
+          int64_t duty = (tiles + nth - 1) / nth;                               \
+          int64_t start = duty * ith;                                           \
+          int64_t end = start + duty;                                           \
+          if (end > tiles) end = tiles;                                         \
+          for (int64_t job = start; job < end; ++job) {                         \
+              int64_t ii = (job / xtiles_ext) * 4;  /* weight rows */           \
+              int64_t xt = job % xtiles_ext;                                    \
+              if (xt < xtiles) {                                                \
+                  QGEMM_TILE_4x4(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d, \
+                                 C, ldc, ii, xt * 4, k_blocks);                  \
+              } else {                                                          \
+                  QGEMM_TILE_4xN(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d, \
+                                 C, ldc, ii, xtiles * 4, n_tail, k_blocks);      \
+              }                                                                  \
+          }                                                                      \
+      }                                                                          \
     }                                                                            \
     if (ith == 0) {                                                             \
-        for (int64_t jj = xtiles * 4; jj < n; ++jj) {                           \
-            for (int64_t ii = 0; ii < ytiles * 4; ++ii) {                       \
-                QGEMM_CELL_1x1(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d,    \
-                               C, ldc, ii, jj, k_blocks);                        \
-            }                                                                    \
-        }                                                                        \
+        /* m-tail: leftover weight rows when m%4 != 0, all n columns. */        \
         for (int64_t ii = ytiles * 4; ii < m; ++ii) {                           \
             for (int64_t jj = 0; jj < n; ++jj) {                                \
                 QGEMM_CELL_1x1(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d,    \
