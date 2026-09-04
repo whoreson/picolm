@@ -1161,6 +1161,121 @@ static void sgemm_q8_q8_neon(int m, int n, int k_blocks,
     }
 }
 #endif /* ARM_NEON */
+
+/* ============================================================
+ * Optimized quantized GEMM with pre-converted activation deltas.
+ * B_d is float32 delta array (stride ldb_d blocks per activation row).
+ * Weight deltas use fp16_to_fp32_lookup (table, no FPU div/sqrt).
+ * This avoids fp16_to_fp32() calls in the inner loop.
+ * RM=4 weight rows, RN=2 activation rows per tile.
+ * ============================================================ */
+#if defined(__AVX2__) || defined(__AVX__)
+
+#define QGEMM_DEFINE_D(load_fn, blk_t)                                          \
+static void sgemm_##load_fn##_d(int m, int n, int k_blocks,                     \
+                            const blk_t *A, int lda,                            \
+                            const block_q8_0 *B, int ldb,                       \
+                            const float *B_d, int ldb_d,                        \
+                            float *C, int ldc,                                  \
+                            int ith, int nth) {                                 \
+    int64_t BM = (m >= 16*(int64_t)nth) ? 4 : (m%8==0) ? 2 : 1;                \
+    int64_t yt=m/(4*BM), xt=(n+1)/2, jR=xt-(xt*2-n);                           \
+    int64_t nB=xt<12?1:(xt+6)/12, sB=xt%nB==0?xt/nB:xt/nB+1;                   \
+    int64_t jB=nB-(nB*sB-xt), nj=yt*nB;                                        \
+    int64_t js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);                        \
+    for (int64_t j=js; j<je; j++) {                                            \
+        int64_t iib=(j%yt)*4*BM, jb=j/yt;                                      \
+        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);             \
+        int64_t jj0=bloc_pos(jr0,jR,2), jj2=bloc_pos(jrN,jR,2);               \
+        int64_t jj1=jj2<jR*2?jj2:jR*2;                                         \
+        for (int64_t bi=0; bi<BM*4; bi+=4) {                                   \
+            int64_t ii=iib+bi;                                                 \
+            float da0[k_blocks], da1[k_blocks], da2[k_blocks], da3[k_blocks];  \
+            for (int64_t l=0; l<k_blocks; l++) {                               \
+                da0[l]=fp16_to_fp32_lookup(A[lda*(ii+0)+l].d);                 \
+                da1[l]=fp16_to_fp32_lookup(A[lda*(ii+1)+l].d);                 \
+                da2[l]=fp16_to_fp32_lookup(A[lda*(ii+2)+l].d);                 \
+                da3[l]=fp16_to_fp32_lookup(A[lda*(ii+3)+l].d);                 \
+            }                                                                   \
+            for (int64_t jj=jj0; jj<jj1; jj+=2) {                              \
+                __m256 Cv[2][4];                                               \
+                for(int r=0;r<2;r++) for(int c=0;c<4;c++) Cv[r][c]=_mm256_setzero_ps(); \
+                for (int64_t l=0; l<k_blocks; ++l) {                           \
+                    __m256i a0=load_fn(A+lda*(ii+0)+l);                        \
+                    __m256i a1=load_fn(A+lda*(ii+1)+l);                        \
+                    __m256i a2=load_fn(A+lda*(ii+2)+l);                        \
+                    __m256i a3=load_fn(A+lda*(ii+3)+l);                        \
+                    __m256i b0=q8_load_qs(B+ldb*(jj)+l);                       \
+                    __m256 db0=_mm256_set1_ps(B_d[ldb_d*jj+l]);                \
+                    __m256i b1=q8_load_qs(B+ldb*(jj+1)+l);                     \
+                    __m256 db1=_mm256_set1_ps(B_d[ldb_d*(jj+1)+l]);            \
+                    __m256 s00=_mm256_set1_ps(da0[l]),s01=_mm256_set1_ps(da1[l]); \
+                    __m256 s02=_mm256_set1_ps(da2[l]),s03=_mm256_set1_ps(da3[l]); \
+                    Cv[0][0]=_mm256_fmadd_ps(q8_updot_avx(                     \
+                        _mm256_sign_epi8(a0,a0),_mm256_sign_epi8(b0,a0)),      \
+                        _mm256_mul_ps(db0,s00),Cv[0][0]);                      \
+                    Cv[0][1]=_mm256_fmadd_ps(q8_updot_avx(                     \
+                        _mm256_sign_epi8(a1,a1),_mm256_sign_epi8(b0,a1)),      \
+                        _mm256_mul_ps(db0,s01),Cv[0][1]);                      \
+                    Cv[0][2]=_mm256_fmadd_ps(q8_updot_avx(                     \
+                        _mm256_sign_epi8(a2,a2),_mm256_sign_epi8(b0,a2)),      \
+                        _mm256_mul_ps(db0,s02),Cv[0][2]);                      \
+                    Cv[0][3]=_mm256_fmadd_ps(q8_updot_avx(                     \
+                        _mm256_sign_epi8(a3,a3),_mm256_sign_epi8(b0,a3)),      \
+                        _mm256_mul_ps(db0,s03),Cv[0][3]);                      \
+                    Cv[1][0]=_mm256_fmadd_ps(q8_updot_avx(                     \
+                        _mm256_sign_epi8(a0,a0),_mm256_sign_epi8(b1,a0)),      \
+                        _mm256_mul_ps(db1,s00),Cv[1][0]);                      \
+                    Cv[1][1]=_mm256_fmadd_ps(q8_updot_avx(                     \
+                        _mm256_sign_epi8(a1,a1),_mm256_sign_epi8(b1,a1)),      \
+                        _mm256_mul_ps(db1,s01),Cv[1][1]);                      \
+                    Cv[1][2]=_mm256_fmadd_ps(q8_updot_avx(                     \
+                        _mm256_sign_epi8(a2,a2),_mm256_sign_epi8(b1,a2)),      \
+                        _mm256_mul_ps(db1,s02),Cv[1][2]);                      \
+                    Cv[1][3]=_mm256_fmadd_ps(q8_updot_avx(                     \
+                        _mm256_sign_epi8(a3,a3),_mm256_sign_epi8(b1,a3)),      \
+                        _mm256_mul_ps(db1,s03),Cv[1][3]);                      \
+                }                                                               \
+                for (int64_t jr=0;jr<2;++jr)                                   \
+                    for (int64_t ir=0;ir<4;++ir)                                \
+                        C[ldc*(jj+jr)+(ii+ir)]=q8_hsum_f32(Cv[jr][ir]);        \
+            }                                                                   \
+            for (int64_t jj=jj1; jj<jj2; ++jj) {                               \
+                __m256 Cv[4];                                                  \
+                for(int c=0;c<4;c++) Cv[c]=_mm256_setzero_ps();                \
+                for (int64_t l=0; l<k_blocks; ++l) {                           \
+                    __m256i a0=load_fn(A+lda*(ii+0)+l);                        \
+                    __m256i a1=load_fn(A+lda*(ii+1)+l);                        \
+                    __m256i a2=load_fn(A+lda*(ii+2)+l);                        \
+                    __m256i a3=load_fn(A+lda*(ii+3)+l);                        \
+                    __m256i b=q8_load_qs(B+ldb*jj+l);                          \
+                    __m256 db=_mm256_set1_ps(B_d[ldb_d*jj+l]);                 \
+                    Cv[0]=_mm256_fmadd_ps(q8_updot_avx(                        \
+                        _mm256_sign_epi8(a0,a0),_mm256_sign_epi8(b,a0)),       \
+                        _mm256_mul_ps(db,_mm256_set1_ps(da0[l])),Cv[0]);       \
+                    Cv[1]=_mm256_fmadd_ps(q8_updot_avx(                        \
+                        _mm256_sign_epi8(a1,a1),_mm256_sign_epi8(b,a1)),       \
+                        _mm256_mul_ps(db,_mm256_set1_ps(da1[l])),Cv[1]);       \
+                    Cv[2]=_mm256_fmadd_ps(q8_updot_avx(                        \
+                        _mm256_sign_epi8(a2,a2),_mm256_sign_epi8(b,a2)),       \
+                        _mm256_mul_ps(db,_mm256_set1_ps(da2[l])),Cv[2]);       \
+                    Cv[3]=_mm256_fmadd_ps(q8_updot_avx(                        \
+                        _mm256_sign_epi8(a3,a3),_mm256_sign_epi8(b,a3)),       \
+                        _mm256_mul_ps(db,_mm256_set1_ps(da3[l])),Cv[3]);       \
+                }                                                               \
+                for (int64_t ir=0;ir<4;++ir)                                    \
+                    C[ldc*jj+(ii+ir)]=q8_hsum_f32(Cv[ir]);                     \
+            }                                                                   \
+        }                                                                       \
+    }                                                                           \
+}
+
+QGEMM_DEFINE_D(q8_load_qs, block_q8_0)
+QGEMM_DEFINE_D(q4_load_qs, block_q4_0)
+QGEMM_DEFINE_D(q5_load_qs, block_q5_0)
+
+#endif /* AVX2/AVX */
+
 /* ============================================================
  * Dispatch function
  * ============================================================ */
@@ -1242,5 +1357,31 @@ int picolm_sgemm(int m, int n, int k,
         }
     }
 
+    return 0;
+}
+
+/* Dispatch with pre-converted activation deltas (B_d).
+ * ldb_d = stride in floats for B_d (typically k_blocks). */
+int picolm_sgemm_d(int m, int n, int k_blocks,
+                   const void *A, int lda,
+                   const block_q8_0 *B, int ldb,
+                   const float *B_d, int ldb_d,
+                   float *C, int ldc,
+                   int Atype,
+                   int ith, int nth) {
+    if (m < 4 || n < 2 || k_blocks < 1)
+        return 0;
+#if defined(__AVX2__) || defined(__AVX__)
+    if (Atype == GGUF_TYPE_Q8_0) {
+        sgemm_q8_load_qs_d(m, n, k_blocks, (const block_q8_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth);
+        return 1;
+    } else if (Atype == GGUF_TYPE_Q4_0) {
+        sgemm_q4_load_qs_d(m, n, k_blocks, (const block_q4_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth);
+        return 1;
+    } else if (Atype == GGUF_TYPE_Q5_0) {
+        sgemm_q5_load_qs_d(m, n, k_blocks, (const block_q5_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth);
+        return 1;
+    }
+#endif
     return 0;
 }
