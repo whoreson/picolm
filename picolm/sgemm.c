@@ -894,6 +894,273 @@ static void sgemm_f16_f16(int m, int n, int k, const uint16_t *A, int lda,
 }
 #endif /* F16xF16 arch chain */
 
+
+/* ============================================================
+ * Quantized GEMM kernels (Q8_0 x Q8_0, Q4_0 x Q8_0, Q5_0 x Q8_0)
+ * Port of llamafile tinyBLAS_Q0 to C.
+ *
+ * Semantics: C[n x m] = A^T[m x k_blocks] * B[k_blocks x n]
+ * A is weights in quantized blocks (block_q8_0, block_q4_0, etc.)
+ * B is pre-quantized activations in block_q8_0 format.
+ * k_blocks = k / 32 (each block has 32 values).
+ *
+ * The sign trick: _mm256_sign_epi8(a,a) *_mm256_sign_epi8(b,a)
+ * computes |a|*|b| with correct sign for signed int8 multiply
+ * using unsigned multiply hardware (maddubs or dpbusd).
+ * ============================================================ */
+
+#if defined(__AVX2__) || defined(__AVX__)
+
+/* Horizontal sum of __m256 -> float */
+static float q8_hsum_f32(__m256 x) {
+    __m128 lo = _mm256_castps256_ps128(x);
+    lo = _mm_add_ps(lo, _mm256_extractf128_ps(x, 1));
+    lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
+    lo = _mm_add_ss(lo, _mm_movehdup_ps(lo));
+    return _mm_cvtss_f32(lo);
+}
+
+/* updot: unsigned int8 dot product -> 4x int32 -> 4x float */
+static __m256 q8_updot_avx(__m256i u, __m256i s) {
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+    __m256i res = _mm256_dpbusd_epi32(_mm256_setzero_si256(), u, s);
+#else
+    __m256i res = _mm256_madd_epi16(_mm256_set1_epi16(1), _mm256_maddubs_epi16(u, s));
+#endif
+    return _mm256_cvtepi32_ps(res);
+}
+
+/* Load 32 int8 values from block_q8_0 */
+static __m256i q8_load_qs(const block_q8_0 *b) {
+    return _mm256_loadu_si256((const __m256i *)b->qs);
+}
+
+/* Load 32 signed int8 values from block_q4_0 (nibble dequant, subtract 8) */
+static __m256i q4_load_qs(const block_q4_0 *b) {
+    __m128i x = _mm_loadu_si128((const __m128i *)b->qs);
+    __m128i lo128 = _mm_and_si128(_mm_set1_epi8(15), x);
+    __m128i hi128 = _mm_and_si128(_mm_set1_epi8(15), _mm_srli_epi16(x, 4));
+    __m256i lo = _mm256_castsi128_si256(lo128);
+    __m256i hi = _mm256_insertf128_si256(lo, hi128, 1);
+    __m256i eight = _mm256_set1_epi8(8);
+    return _mm256_sub_epi8(hi, eight);
+}
+
+/* Load 32 signed int8 values from block_q5_0 */
+static __m256i q5_load_qs(const block_q5_0 *b) {
+    __m128i x = _mm_loadu_si128((const __m128i *)b->qs);
+    uint32_t qh32;
+    memcpy(&qh32, b->qh, sizeof(uint32_t));
+    __m128i hi_nib = _mm_and_si128(_mm_set1_epi8(15), _mm_srli_epi16(x, 4));
+    __m128i lo_nib = _mm_and_si128(_mm_set1_epi8(15), x);
+    __m256i lo = _mm256_castsi128_si256(lo_nib);
+    __m256i xs = _mm256_insertf128_si256(lo, hi_nib, 1);
+    /* Extract 5th bits from qh */
+    __m256i qh256 = _mm256_set1_epi32(qh32);
+    __m256i idx0 = _mm256_set_epi64x(0x0101010101010101ULL,0x0000000000000000ULL,
+                                      0x0101010101010101ULL,0x0000000000000000ULL);
+    __m256i idx1 = _mm256_set_epi64x(0x0303030303030303ULL,0x0202020202020202ULL,
+                                      0x0303030303030303ULL,0x0202020202020202ULL);
+    __m256i pat = _mm256_set1_epi64x(0x7fbfdfeff7fbfdfeULL);
+    __m256i r0 = _mm256_andnot_si256(
+        _mm256_cmpeq_epi8(pat, _mm256_or_si256(pat, _mm256_shuffle_epi8(qh256, idx0))),
+        _mm256_set1_epi8((char)0xF0));
+    __m256i r1 = _mm256_andnot_si256(
+        _mm256_cmpeq_epi8(pat, _mm256_or_si256(pat, _mm256_shuffle_epi8(qh256, idx1))),
+        _mm256_set1_epi8((char)0xF0));
+    __m128i bits0 = _mm256_castsi256_si128(r0);
+    __m128i bits1 = _mm256_extracti128_si256(r1, 1);
+    __m256i qhbits = _mm256_insertf128_si256(
+        _mm256_castsi128_si256(bits0), bits1, 1);
+    return _mm256_or_si256(xs, qhbits);
+}
+
+/* Generic quantized GEMM for AVX2/AVX. RM=4 weight rows, RN=2 act rows. */
+#define QGEMM_DEFINE(load_fn, blk_t)                                            \
+static void sgemm_##load_fn(int m, int n, int k_blocks,                         \
+                            const blk_t *A, int lda,                            \
+                            const block_q8_0 *B, int ldb,                       \
+                            float *C, int ldc,                                  \
+                            int ith, int nth) {                                 \
+    const int64_t RM=4, RN=2, BN=12;                                            \
+    int64_t BM = (m >= RM*4*(int64_t)nth) ? 4 : (m%8==0) ? 2 : 1;              \
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);                     \
+    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1;               \
+    int64_t jB=nB-(nB*sB-xt), nj=yt*nB;                                        \
+    int64_t js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);                        \
+    for (int64_t j=js; j<je; j++) {                                            \
+        int64_t iib=(j%yt)*RM*BM, jb=j/yt;                                     \
+        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);             \
+        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);             \
+        int64_t jj1=jj2<jR*RN?jj2:jR*RN;                                       \
+        for (int64_t bi=0; bi<BM*RM; bi+=RM) {                                 \
+            int64_t ii=iib+bi;                                                 \
+            for (int64_t jj=jj0; jj<jj1; jj+=RN) {                             \
+                __m256 Cv[RN][RM] = {};                                        \
+                for (int64_t l=0; l<k_blocks; ++l) {                           \
+                    __m256i a0=load_fn(A+lda*(ii+0)+l);                        \
+                    __m256i a1=load_fn(A+lda*(ii+1)+l);                        \
+                    __m256i a2=load_fn(A+lda*(ii+2)+l);                        \
+                    __m256i a3=load_fn(A+lda*(ii+3)+l);                        \
+                    float da0=fp16_to_fp32(A[lda*(ii+0)+l].d);                 \
+                    float da1=fp16_to_fp32(A[lda*(ii+1)+l].d);                 \
+                    float da2=fp16_to_fp32(A[lda*(ii+2)+l].d);                 \
+                    float da3=fp16_to_fp32(A[lda*(ii+3)+l].d);                 \
+                    for (int64_t jr=0; jr<RN; ++jr) {                          \
+                        __m256i b=q8_load_qs(B+ldb*(jj+jr)+l);                 \
+                        float db=fp16_to_fp32(B[ldb*(jj+jr)+l].d);             \
+                        Cv[jr][0]=_mm256_add_ps(Cv[jr][0],                     \
+                            _mm256_mul_ps(q8_updot_avx(                         \
+                                _mm256_sign_epi8(a0,a0),                       \
+                                _mm256_sign_epi8(b,a0)),                       \
+                                _mm256_set1_ps(da0*db)));                      \
+                        Cv[jr][1]=_mm256_add_ps(Cv[jr][1],                     \
+                            _mm256_mul_ps(q8_updot_avx(                         \
+                                _mm256_sign_epi8(a1,a1),                       \
+                                _mm256_sign_epi8(b,a1)),                       \
+                                _mm256_set1_ps(da1*db)));                      \
+                        Cv[jr][2]=_mm256_add_ps(Cv[jr][2],                     \
+                            _mm256_mul_ps(q8_updot_avx(                         \
+                                _mm256_sign_epi8(a2,a2),                       \
+                                _mm256_sign_epi8(b,a2)),                       \
+                                _mm256_set1_ps(da2*db)));                      \
+                        Cv[jr][3]=_mm256_add_ps(Cv[jr][3],                     \
+                            _mm256_mul_ps(q8_updot_avx(                         \
+                                _mm256_sign_epi8(a3,a3),                       \
+                                _mm256_sign_epi8(b,a3)),                       \
+                                _mm256_set1_ps(da3*db)));                      \
+                    }                                                           \
+                }                                                               \
+                for (int64_t jr=0;jr<RN;++jr)                                  \
+                    for (int64_t ir=0;ir<RM;++ir)                               \
+                        C[ldc*(jj+jr)+(ii+ir)]=q8_hsum_f32(Cv[jr][ir]);        \
+            }                                                                   \
+            for (int64_t jj=jj1; jj<jj2; ++jj) {                               \
+                __m256 Cv[RM] = {};                                            \
+                for (int64_t l=0; l<k_blocks; ++l) {                           \
+                    __m256i a0=load_fn(A+lda*(ii+0)+l);                        \
+                    __m256i a1=load_fn(A+lda*(ii+1)+l);                        \
+                    __m256i a2=load_fn(A+lda*(ii+2)+l);                        \
+                    __m256i a3=load_fn(A+lda*(ii+3)+l);                        \
+                    float da0=fp16_to_fp32(A[lda*(ii+0)+l].d);                 \
+                    float da1=fp16_to_fp32(A[lda*(ii+1)+l].d);                 \
+                    float da2=fp16_to_fp32(A[lda*(ii+2)+l].d);                 \
+                    float da3=fp16_to_fp32(A[lda*(ii+3)+l].d);                 \
+                    __m256i b=q8_load_qs(B+ldb*jj+l);                          \
+                    float db=fp16_to_fp32(B[ldb*jj+l].d);                      \
+                    Cv[0]=_mm256_add_ps(Cv[0],                                 \
+                        _mm256_mul_ps(q8_updot_avx(                             \
+                            _mm256_sign_epi8(a0,a0),                           \
+                            _mm256_sign_epi8(b,a0)),                           \
+                            _mm256_set1_ps(da0*db)));                          \
+                    Cv[1]=_mm256_add_ps(Cv[1],                                 \
+                        _mm256_mul_ps(q8_updot_avx(                             \
+                            _mm256_sign_epi8(a1,a1),                           \
+                            _mm256_sign_epi8(b,a1)),                           \
+                            _mm256_set1_ps(da1*db)));                          \
+                    Cv[2]=_mm256_add_ps(Cv[2],                                 \
+                        _mm256_mul_ps(q8_updot_avx(                             \
+                            _mm256_sign_epi8(a2,a2),                           \
+                            _mm256_sign_epi8(b,a2)),                           \
+                            _mm256_set1_ps(da2*db)));                          \
+                    Cv[3]=_mm256_add_ps(Cv[3],                                 \
+                        _mm256_mul_ps(q8_updot_avx(                             \
+                            _mm256_sign_epi8(a3,a3),                           \
+                            _mm256_sign_epi8(b,a3)),                           \
+                            _mm256_set1_ps(da3*db)));                          \
+                }                                                               \
+                for (int64_t ir=0;ir<RM;++ir)                                   \
+                    C[ldc*jj+(ii+ir)]=q8_hsum_f32(Cv[ir]);                     \
+            }                                                                   \
+        }                                                                       \
+    }                                                                           \
+}
+
+QGEMM_DEFINE(q8_load_qs, block_q8_0)
+QGEMM_DEFINE(q4_load_qs, block_q4_0)
+QGEMM_DEFINE(q5_load_qs, block_q5_0)
+
+#endif /* AVX2/AVX */
+
+/* ARM NEON / I8MM / DOTPROD path */
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+
+static void sgemm_q8_q8_neon(int m, int n, int k_blocks,
+                              const block_q8_0 *A, int lda,
+                              const block_q8_0 *B, int ldb,
+                              float *C, int ldc,
+                              int ith, int nth) {
+    const int64_t RM=4, RN=3, BN=12;
+    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
+    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1;
+    int64_t jB=nB-(nB*sB-xt), nj=yt*nB;
+    int64_t js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    for (int64_t j=js; j<je; j++) {
+        int64_t iib=(j%yt)*RM*BM, jb=j/yt;
+        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
+        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);
+        int64_t jj1=jj2<jR*RN?jj2:jR*RN;
+        for (int64_t bi=0; bi<BM*RM; bi+=RM) {
+            int64_t ii=iib+bi;
+            for (int64_t jj=jj0; jj<jj1; jj+=RN) {
+                float32x4_t Cv[RN][RM];
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=vdupq_n_f32(0);
+                for (int64_t l=0; l<k_blocks; ++l) {
+                    for (int64_t jr=0; jr<RN; ++jr) {
+                        const block_q8_0 *br=B+ldb*(jj+jr)+l;
+                        float32x4_t dr=vdupq_n_f32(fp16_to_fp32(br->d));
+                        int8x16_t blo=vld1q_s8(br->qs);
+                        int8x16_t bhi=vld1q_s8(br->qs+16);
+                        for (int64_t ir=0; ir<RM; ++ir) {
+                            const block_q8_0 *ar=A+lda*(ii+ir)+l;
+                            float32x4_t scale=vmulq_n_f32(dr,fp16_to_fp32(ar->d));
+                            int8x16_t alo=vld1q_s8(ar->qs);
+                            int8x16_t ahi=vld1q_s8(ar->qs+16);
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+                            float32x4_t s=vmulq_f32(vcvtaq_f32_s32(
+                                vmmlaq_s32(vmmlaq_s32(vdupq_n_s32(0),alo,blo),ahi,bhi)),scale);
+#else
+                            float32x4_t s=vmulq_f32(vcvtaq_f32_s32(
+                                vdotq_s32(vdotq_s32(vdupq_n_s32(0),alo,blo),ahi,bhi)),scale);
+#endif
+                            Cv[jr][ir]=vaddq_f32(Cv[jr][ir],s);
+                        }
+                    }
+                }
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++)
+                    C[ldc*(jj+r)+(ii+c)]=vaddvq_f32(Cv[r][c]);
+            }
+            for (int64_t jj=jj1; jj<jj2; ++jj) {
+                float32x4_t Cv[RM];
+                for(int c=0;c<RM;c++) Cv[c]=vdupq_n_f32(0);
+                for (int64_t l=0; l<k_blocks; ++l) {
+                    const block_q8_0 *br=B+ldb*jj+l;
+                    float32x4_t dr=vdupq_n_f32(fp16_to_fp32(br->d));
+                    int8x16_t blo=vld1q_s8(br->qs);
+                    int8x16_t bhi=vld1q_s8(br->qs+16);
+                    for (int64_t ir=0; ir<RM; ++ir) {
+                        const block_q8_0 *ar=A+lda*(ii+ir)+l;
+                        float32x4_t scale=vmulq_n_f32(dr,fp16_to_fp32(ar->d));
+                        int8x16_t alo=vld1q_s8(ar->qs);
+                        int8x16_t ahi=vld1q_s8(ar->qs+16);
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+                        float32x4_t s=vmulq_f32(vcvtaq_f32_s32(
+                            vmmlaq_s32(vmmlaq_s32(vdupq_n_s32(0),alo,blo),ahi,bhi)),scale);
+#else
+                        float32x4_t s=vmulq_f32(vcvtaq_f32_s32(
+                            vdotq_s32(vdotq_s32(vdupq_n_s32(0),alo,blo),ahi,bhi)),scale);
+#endif
+                        Cv[ir]=vaddq_f32(Cv[ir],s);
+                    }
+                }
+                for(int c=0;c<RM;c++) C[ldc*jj+(ii+c)]=vaddvq_f32(Cv[c]);
+            }
+        }
+    }
+}
+#endif /* ARM_NEON */
 /* ============================================================
  * Dispatch function
  * ============================================================ */
@@ -950,5 +1217,30 @@ int picolm_sgemm(int m, int n, int k,
         if (k % 4 == 0 && m % 4 == 0 && !PICOLM_NOSGEMM) { sgemm_f16_f16_altivec(m,n,k,(const uint16_t*)A,lda,(const uint16_t*)B,ldb,C,ldc,ith,nth); return 1; }
 #endif
     }
+
+    /* Quantized GEMM: A=quantized weights, B=Q8_0 pre-quantized activations
+     * k is number of blocks (k_blocks), each block has 32 values. */
+    if (Btype == GGUF_TYPE_Q8_0 && m % 4 == 0 && n >= 2 && k >= 1) {
+        if (Atype == GGUF_TYPE_Q8_0) {
+#if defined(__AVX2__) || defined(__AVX__)
+            sgemm_q8_load_qs(m, n, k, (const block_q8_0*)A, lda, (const block_q8_0*)B, ldb, C, ldc, ith, nth);
+            return 1;
+#elif defined(__ARM_NEON)
+            sgemm_q8_q8_neon(m, n, k, (const block_q8_0*)A, lda, (const block_q8_0*)B, ldb, C, ldc, ith, nth);
+            return 1;
+#endif
+        } else if (Atype == GGUF_TYPE_Q4_0) {
+#if defined(__AVX2__) || defined(__AVX__)
+            sgemm_q4_load_qs(m, n, k, (const block_q4_0*)A, lda, (const block_q8_0*)B, ldb, C, ldc, ith, nth);
+            return 1;
+#endif
+        } else if (Atype == GGUF_TYPE_Q5_0) {
+#if defined(__AVX2__) || defined(__AVX__)
+            sgemm_q5_load_qs(m, n, k, (const block_q5_0*)A, lda, (const block_q8_0*)B, ldb, C, ldc, ith, nth);
+            return 1;
+#endif
+        }
+    }
+
     return 0;
 }
