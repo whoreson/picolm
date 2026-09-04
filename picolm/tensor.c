@@ -2178,6 +2178,29 @@ static void mm_id_down_expert_task(int idx, void *ctxp) {
 #endif
 }
 
+/* GEMM threading context: dispatches picolm_sgemm_d via tensor_parallel_for.
+ * Each worker thread gets a distinct idx (its ith), ensuring ALL output tiles
+ * are computed. Without this, picolm_sgemm_d(..., ith=0, nth=16) would only
+ * compute 1/16 of the output matrix. */
+#if defined(__AVX2__) && defined(__F16C__)
+typedef struct {
+    int m, n, k_blocks;
+    const void *A; int lda;
+    const block_q8_0 *B; int ldb;
+    const float *B_d; int ldb_d;
+    float *C; int ldc;
+    int Atype;
+    int nth;
+} qgemm_d_ctx_t;
+
+static void qgemm_d_task(int idx, void *ctxp) {
+    qgemm_d_ctx_t *c = (qgemm_d_ctx_t *)ctxp;
+    picolm_sgemm_d(c->m, c->n, c->k_blocks, c->A, c->lda,
+                   c->B, c->ldb, c->B_d, c->ldb_d,
+                   c->C, c->ldc, c->Atype, idx, c->nth);
+}
+#endif
+
 void matmul_batch(float *out, const float *x, int n_batch,
                    const void *W, int n, int d, gguf_type_t qtype) {
 #ifdef PICOLM_GPU
@@ -2373,25 +2396,31 @@ void matmul_batch(float *out, const float *x, int n_batch,
     }
 
     /* Quantized GEMM fast path: try tiled GEMM with pre-quantized Q8_0 activations.
-     * On AVX-512 VNNI, per-row vec_dot_q8_0_q8_0_deltas is already near-optimal
-     * due to dpbusd's throughput. GEMM only wins when n_batch is large enough
-     * that activation reuse across RM weight rows amortizes tile overhead.
+     * Uses tensor_parallel_for to dispatch nth worker threads, each calling
+     * picolm_sgemm_d with a distinct ith. This ensures ALL output tiles are
+     * computed (not just thread 0's 1/nth slice).
      * Threshold: n_batch >= 32 for Q8_0, >= 8 for Q4_0/Q5_0. */
+#if defined(__AVX2__) && defined(__F16C__)
     if (have_qx && qx_d_buf && d >= 4 &&
         (qtype == GGUF_TYPE_Q8_0 || qtype == GGUF_TYPE_Q4_0 || qtype == GGUF_TYPE_Q5_0)) {
         int min_batch = (qtype == GGUF_TYPE_Q8_0) ? 32 : 8;
         if (n_batch >= min_batch) {
             int k_blocks = n / 32;
             int nth = pool_total_threads(1);
-            if (picolm_sgemm_d(d, n_batch, k_blocks, W, k_blocks,
-                                (const block_q8_0*)qx_buf, k_blocks,
-                                qx_d_buf, k_blocks,
-                                out, d, qtype, 0, nth)) {
-                if (qx_buf) { free(qx_buf); if (qx_d_buf) free(qx_d_buf); }
-                return;
-            }
+            qgemm_d_ctx_t ctx = {
+                .m = d, .n = n_batch, .k_blocks = k_blocks,
+                .A = W, .lda = k_blocks,
+                .B = (const block_q8_0*)qx_buf, .ldb = k_blocks,
+                .B_d = qx_d_buf, .ldb_d = k_blocks,
+                .C = out, .ldc = d,
+                .Atype = qtype, .nth = nth,
+            };
+            tensor_parallel_for(nth, qgemm_d_task, &ctx);
+            if (qx_buf) { free(qx_buf); if (qx_d_buf) free(qx_d_buf); }
+            return;
         }
     }
+#endif
 
     /* Q4_0_4_4 fast path for batched matmul */
     if (qtype == GGUF_TYPE_Q4_0_4_4 && n_batch > 0 && n > 0) {
@@ -2585,7 +2614,9 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
     }
 #endif
     /* Quantized GEMM fast path for dual batch (K+V or gate+up projections).
-     * Pre-quantize activations once, then use picolm_sgemm_d for both matmuls. */
+     * Pre-quantize activations once, then use picolm_sgemm_d via tensor_parallel_for
+     * for both matmuls. Each worker thread gets a distinct ith. */
+#if defined(__AVX2__) && defined(__F16C__)
     if (n_batch >= 8 && d >= 4 && n > 0 &&
         (qtype1 == GGUF_TYPE_Q8_0 || qtype1 == GGUF_TYPE_Q4_0 || qtype1 == GGUF_TYPE_Q5_0) &&
         (qtype2 == GGUF_TYPE_Q8_0 || qtype2 == GGUF_TYPE_Q4_0 || qtype2 == GGUF_TYPE_Q5_0)) {
@@ -2601,18 +2632,29 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
             }
             int k_blocks = n / 32;
             int nth = pool_total_threads(1);
-            int gemm1 = picolm_sgemm_d(d, n_batch, k_blocks, W1, k_blocks,
-                                        (const block_q8_0*)qbuf, k_blocks,
-                                        dbuf, k_blocks,
-                                        out1, d, qtype1, 0, nth);
-            int gemm2 = picolm_sgemm_d(d, n_batch, k_blocks, W2, k_blocks,
-                                        (const block_q8_0*)qbuf, k_blocks,
-                                        dbuf, k_blocks,
-                                        out2, d, qtype2, 0, nth);
+            qgemm_d_ctx_t ctx1 = {
+                .m = d, .n = n_batch, .k_blocks = k_blocks,
+                .A = W1, .lda = k_blocks,
+                .B = (const block_q8_0*)qbuf, .ldb = k_blocks,
+                .B_d = dbuf, .ldb_d = k_blocks,
+                .C = out1, .ldc = d,
+                .Atype = qtype1, .nth = nth,
+            };
+            tensor_parallel_for(nth, qgemm_d_task, &ctx1);
+            qgemm_d_ctx_t ctx2 = {
+                .m = d, .n = n_batch, .k_blocks = k_blocks,
+                .A = W2, .lda = k_blocks,
+                .B = (const block_q8_0*)qbuf, .ldb = k_blocks,
+                .B_d = dbuf, .ldb_d = k_blocks,
+                .C = out2, .ldc = d,
+                .Atype = qtype2, .nth = nth,
+            };
+            tensor_parallel_for(nth, qgemm_d_task, &ctx2);
             free(qbuf); free(dbuf);
-            if (gemm1 && gemm2) return;
+            return;
         }
     }
+#endif
 
 #if defined(PICOLM_AVX2)
     /* Same reasoning as matmul_batch's Q4_0_8_8 branch: reuse the

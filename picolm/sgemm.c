@@ -1354,8 +1354,8 @@ static void sgemm_##load_qs_fn##_d(int m, int n, int k_blocks,                  
         int64_t end = start + duty;                                             \
         if (end > tiles) end = tiles;                                           \
         for (int64_t job = start; job < end; ++job) {                           \
-            int64_t ii = (job % ytiles) * 4;                                    \
-            int64_t jj = (job / ytiles) * 2;                                    \
+            int64_t ii = (job / xtiles) * 4;   /* weight rows */                 \
+            int64_t jj = (job % xtiles) * 2;   /* activation cols */             \
             QGEMM_TILE_4x2(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d,        \
                            C, ldc, ii, jj, k_blocks);                            \
         }                                                                        \
@@ -1382,7 +1382,10 @@ QGEMM_D_IMPL(qg_q8_qs, block_q8_0)
 QGEMM_D_IMPL(qg_q4_qs, block_q4_0)
 QGEMM_D_IMPL(qg_q5_qs, block_q5_0)
 
-/* RN=4 variant: 4x4 tiles for AVX-512 (32 vector registers). */
+/* RN=4 variant: 4x4 tiles. Uses x-major traversal (llama.cpp style):
+ * iterate over xtiles (activation columns) first within each job,
+ * then ytiles (weight rows). This keeps weight data in cache across
+ * consecutive tiles, which is optimal when m >> n (typical prefill shape). */
 #define QGEMM_D4_IMPL(load_qs_fn, blk_t)                                       \
 static void sgemm_##load_qs_fn##_d4(int m, int n, int k_blocks,                 \
                                     const blk_t *A, int lda,                    \
@@ -1399,8 +1402,8 @@ static void sgemm_##load_qs_fn##_d4(int m, int n, int k_blocks,                 
         int64_t end = start + duty;                                             \
         if (end > tiles) end = tiles;                                           \
         for (int64_t job = start; job < end; ++job) {                           \
-            int64_t ii = (job % ytiles) * 4;                                    \
-            int64_t jj = (job / ytiles) * 4;                                    \
+            int64_t ii = (job / xtiles) * 4;   /* y-major = weight rows */       \
+            int64_t jj = (job % xtiles) * 4;   /* x-major = activation cols */   \
             QGEMM_TILE_4x4(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d,       \
                            C, ldc, ii, jj, k_blocks);                            \
         }                                                                        \
