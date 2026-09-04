@@ -694,7 +694,7 @@ static void sgemm_f16_f32(int m, int n, int k, const uint16_t *A, int lda,
 }
 #undef SGEMM_FMA
 #endif
-#elif defined(__ARM_NEON)
+#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
 static void sgemm_f16_f32(int m, int n, int k, const uint16_t *A, int lda,
                            const float *B, int ldb, float *C, int ldc,
                            int ith, int nth) {
@@ -1119,11 +1119,17 @@ static void sgemm_q8_q8_neon(int m, int n, int k_blocks,
                             int8x16_t alo=vld1q_s8(ar->qs);
                             int8x16_t ahi=vld1q_s8(ar->qs+16);
 #if defined(__ARM_FEATURE_MATMUL_INT8)
-                            float32x4_t s=vmulq_f32(vcvtaq_f32_s32(
-                                vmmlaq_s32(vmmlaq_s32(vdupq_n_s32(0),alo,blo),ahi,bhi)),scale);
+                            int32x4_t acc=vmmlaq_s32(vmmlaq_s32(vdupq_n_s32(0),alo,blo),ahi,bhi);
+                            float32x4_t s=vmulq_f32(vcvtq_f32_s32(acc),scale);
+#elif defined(__ARM_FEATURE_DOTPROD)
+                            int32x4_t acc=vdotq_s32(vdotq_s32(vdupq_n_s32(0),alo,blo),ahi,bhi);
+                            float32x4_t s=vmulq_f32(vcvtq_f32_s32(acc),scale);
 #else
-                            float32x4_t s=vmulq_f32(vcvtaq_f32_s32(
-                                vdotq_s32(vdotq_s32(vdupq_n_s32(0),alo,blo),ahi,bhi)),scale);
+                            /* Scalar fallback: plain NEON without DOTPROD/I8MM */
+                            int32_t acc_s = 0;
+                            for (int v = 0; v < 16; v++) acc_s += (int32_t)vgetq_lane_s8(alo,v) * vgetq_lane_s8(blo,v);
+                            for (int v = 0; v < 16; v++) acc_s += (int32_t)vgetq_lane_s8(ahi,v) * vgetq_lane_s8(bhi,v);
+                            float32x4_t s = vmulq_n_f32(scale, (float)acc_s);
 #endif
                             Cv[jr][ir]=vaddq_f32(Cv[jr][ir],s);
                         }
@@ -1146,11 +1152,17 @@ static void sgemm_q8_q8_neon(int m, int n, int k_blocks,
                         int8x16_t alo=vld1q_s8(ar->qs);
                         int8x16_t ahi=vld1q_s8(ar->qs+16);
 #if defined(__ARM_FEATURE_MATMUL_INT8)
-                        float32x4_t s=vmulq_f32(vcvtaq_f32_s32(
-                            vmmlaq_s32(vmmlaq_s32(vdupq_n_s32(0),alo,blo),ahi,bhi)),scale);
+                        int32x4_t acc=vmmlaq_s32(vmmlaq_s32(vdupq_n_s32(0),alo,blo),ahi,bhi);
+                        float32x4_t s=vmulq_f32(vcvtq_f32_s32(acc),scale);
+#elif defined(__ARM_FEATURE_DOTPROD)
+                        int32x4_t acc=vdotq_s32(vdotq_s32(vdupq_n_s32(0),alo,blo),ahi,bhi);
+                        float32x4_t s=vmulq_f32(vcvtq_f32_s32(acc),scale);
 #else
-                        float32x4_t s=vmulq_f32(vcvtaq_f32_s32(
-                            vdotq_s32(vdotq_s32(vdupq_n_s32(0),alo,blo),ahi,bhi)),scale);
+                        /* Scalar fallback: plain NEON without DOTPROD/I8MM */
+                        int32_t acc_s = 0;
+                        for (int v = 0; v < 16; v++) acc_s += (int32_t)vgetq_lane_s8(alo,v) * vgetq_lane_s8(blo,v);
+                        for (int v = 0; v < 16; v++) acc_s += (int32_t)vgetq_lane_s8(ahi,v) * vgetq_lane_s8(bhi,v);
+                        float32x4_t s = vmulq_n_f32(scale, (float)acc_s);
 #endif
                         Cv[ir]=vaddq_f32(Cv[ir],s);
                     }
@@ -1466,7 +1478,7 @@ int picolm_sgemm(int m, int n, int k,
 #if defined(__F16C__)
         if (k % 8 == 0 && m % 4 == 0) { sgemm_f16_f32(m,n,k,(const uint16_t*)A,lda,(const float*)B,ldb,C,ldc,ith,nth); return 1; }
 #endif
-#elif defined(__ARM_NEON)
+#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
         if (n < 4) return 0;
         if (k % 4 == 0 && m % 4 == 0) { sgemm_f16_f32(m,n,k,(const uint16_t*)A,lda,(const float*)B,ldb,C,ldc,ith,nth); return 1; }
 #elif defined(__ALTIVEC__)
