@@ -2406,7 +2406,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
 #if defined(__AVX2__) && defined(__F16C__)
     if (have_qx && qx_d_buf && d >= 4 &&
         (qtype == GGUF_TYPE_Q8_0 || qtype == GGUF_TYPE_Q4_0 || qtype == GGUF_TYPE_Q5_0)) {
-        int min_batch = (qtype == GGUF_TYPE_Q8_0) ? 32 : 8;
+        int min_batch = 8;
         if (n_batch >= min_batch) {
             int k_blocks = n / 32;
             int nth = pool_total_threads(1);
