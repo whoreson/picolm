@@ -2373,17 +2373,23 @@ void matmul_batch(float *out, const float *x, int n_batch,
     }
 
     /* Quantized GEMM fast path: try tiled GEMM with pre-quantized Q8_0 activations.
-     * Much faster than per-row gemv because activation tokens are reused across
-     * weight tiles. k_blocks = n / 32. m = d (output rows), n = n_batch (tokens).
-     * A = weights in quantized blocks, B = Q8_0 activations. */
-    if (have_qx && n_batch >= 2 && d >= 4 && (qtype == GGUF_TYPE_Q8_0 ||
-        qtype == GGUF_TYPE_Q4_0 || qtype == GGUF_TYPE_Q5_0)) {
-        int k_blocks = n / 32;
-        int nth = pool_total_threads(1);
-        if (picolm_sgemm(d, n_batch, k_blocks, W, k_blocks, qx_buf, k_blocks,
-                          out, d, qtype, GGUF_TYPE_Q8_0, 0, nth)) {
-            if (qx_buf) { free(qx_buf); if (qx_d_buf) free(qx_d_buf); }
-            return;
+     * On AVX-512 VNNI, per-row vec_dot_q8_0_q8_0_deltas is already near-optimal
+     * due to dpbusd's throughput. GEMM only wins when n_batch is large enough
+     * that activation reuse across RM weight rows amortizes tile overhead.
+     * Threshold: n_batch >= 32 for Q8_0, >= 8 for Q4_0/Q5_0. */
+    if (have_qx && qx_d_buf && d >= 4 &&
+        (qtype == GGUF_TYPE_Q8_0 || qtype == GGUF_TYPE_Q4_0 || qtype == GGUF_TYPE_Q5_0)) {
+        int min_batch = (qtype == GGUF_TYPE_Q8_0) ? 32 : 8;
+        if (n_batch >= min_batch) {
+            int k_blocks = n / 32;
+            int nth = pool_total_threads(1);
+            if (picolm_sgemm_d(d, n_batch, k_blocks, W, k_blocks,
+                                (const block_q8_0*)qx_buf, k_blocks,
+                                qx_d_buf, k_blocks,
+                                out, d, qtype, 0, nth)) {
+                if (qx_buf) { free(qx_buf); if (qx_d_buf) free(qx_d_buf); }
+                return;
+            }
         }
     }
 

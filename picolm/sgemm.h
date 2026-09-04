@@ -30,6 +30,16 @@ int picolm_sgemm(int m, int n, int k,
                  int Atype, int Btype,
                  int ith, int nth);
 
+/* Quantized GEMM with pre-converted activation deltas.
+ * B_d is float32 delta array, ldb_d stride in floats per activation row. */
+int picolm_sgemm_d(int m, int n, int k_blocks,
+                   const void *A, int lda,
+                   const block_q8_0 *B, int ldb,
+                   const float *B_d, int ldb_d,
+                   float *C, int ldc,
+                   int Atype,
+                   int ith, int nth);
+
 #ifdef __cplusplus
 }
 #endif
