@@ -63,9 +63,10 @@ typedef long long off_t;
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <signal.h>
-/* macOS 10.4 (GCC 4.0.1) with -std=c99 doesn't declare signal()
- * even with <signal.h>. Provide a forward declaration only there. */
-#if defined(__APPLE__) && defined(__GNUC__) && __GNUC__ >= 4 && __GNUC__ <= 4 && __GNUC_MINOR__ <= 2
+/* Very old macOS 10.4 SDK (GCC 4.0.x, no _DARWIN_C_SOURCE) didn't declare
+ * signal() with -std=c99. Newer SDKs and iOS SDKs declare it properly.
+ * Only provide our own declaration when _DARWIN_C_SOURCE is NOT defined. */
+#if defined(__APPLE__) && defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ <= 2 && !defined(_DARWIN_C_SOURCE)
 extern int signal(int signum, void (*handler)(int));
 #endif
 #include <fcntl.h>

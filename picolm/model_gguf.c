@@ -313,14 +313,44 @@ static int mmap_one_file(split_mmap_t *s, const char *path) {
         fprintf(stderr, "ERROR: cannot open model file '%s': %s\n", path, strerror(errno));
         return -1;
     }
+    /* Get file size: prefer fstat, but fall back to lseek on platforms where
+     * fstat returns garbage (e.g. iPhoneOS 1 on original iPhone, where
+     * st_size is a 7.6-exabyte nonsense value that truncates to 0 on 32-bit). */
     struct stat st;
     fstat(fd, &st);
     s->mmap_size = (size_t)st.st_size;
+    if (s->mmap_size == 0) {
+        off_t off = lseek(fd, 0, SEEK_END);
+        if (off > 0) {
+            lseek(fd, 0, SEEK_SET);
+            s->mmap_size = (size_t)off;
+        }
+    }
     /* PROT_READ only: PROT_WRITE causes COW fault storms over CIFS/NFS on
      * large models (see 9c1b3a5). PPC big-endian needs write access for the
      * in-place byte-swap loop; it uses mprotect() around the swap region. */
     void *addr = mmap(NULL, s->mmap_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (addr == MAP_FAILED) {
+        /* Fallback: some platforms (e.g. iPhoneOS 1) have broken file-backed
+         * mmap. Load entire file into malloc'd memory instead. */
+        void *buf = malloc(s->mmap_size);
+        if (buf && s->mmap_size > 0) {
+            size_t total = 0;
+            while (total < s->mmap_size) {
+                ssize_t n = read(fd, (char*)buf + total, s->mmap_size - total);
+                if (n <= 0) break;
+                total += (size_t)n;
+            }
+            close(fd);
+            if (total == s->mmap_size) {
+                fprintf(stderr, "WARN: mmap failed (%s), using malloc+read fallback for '%s'\n",
+                        strerror(errno), path);
+                s->mmap_addr = buf;
+                s->fd = -1; /* signal: malloc'd, not mmap'd */
+                return 0;
+            }
+            free(buf);
+        }
         fprintf(stderr, "ERROR: cannot map model file '%s': %s\n", path, strerror(errno));
         close(fd);
         return -1;
@@ -341,8 +371,14 @@ void munmap_one_file(split_mmap_t *s) {
 #elif defined(PICOLM_DOS)
     free(s->mmap_addr);
 #else
-    munmap(s->mmap_addr, s->mmap_size);
-    close(s->fd);
+    if (s->fd >= 0) {
+        /* Normal mmap path */
+        munmap(s->mmap_addr, s->mmap_size);
+        close(s->fd);
+    } else {
+        /* malloc+read fallback (broken mmap platforms like iPhoneOS 1) */
+        free(s->mmap_addr);
+    }
 #endif
     s->mmap_addr = NULL;
 }
@@ -456,13 +492,18 @@ int model_list_tensors(const char *path) {
     if (fd < 0) { fprintf(stderr, "ERROR: cannot open model file '%s': %s\n", path, strerror(errno)); return -1; }
 
     { struct stat st;
-      if (fstat(fd, &st) < 0) goto out;
-      addr = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+      off_t off;
+      if (fstat(fd, &st) >= 0) fsize = (size_t)st.st_size;
+      else fsize = 0;
+      if (fsize == 0) {
+          off = lseek(fd, 0, SEEK_END);
+          if (off > 0) { lseek(fd, 0, SEEK_SET); fsize = (size_t)off; }
+      }
+      addr = mmap(NULL, fsize, PROT_READ, MAP_PRIVATE, fd, 0);
       if (addr == MAP_FAILED) {
           fprintf(stderr, "ERROR: cannot map model file '%s': %s\n", path, strerror(errno));
           addr = NULL; goto out;
-      }
-      fsize = (size_t)st.st_size; }
+      } }
 #endif
 
     reader_t r = { .data = addr, .pos = 0, .size = fsize };
@@ -606,10 +647,15 @@ int model_list_kv(const char *path) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) { fprintf(stderr, "ERROR: cannot open model file '%s': %s\n", path, strerror(errno)); return -1; }
     { struct stat st;
-      if (fstat(fd, &st) < 0) goto out;
-      addr = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-      if (addr == MAP_FAILED) { addr = NULL; goto out; }
-      fsize = (size_t)st.st_size; }
+      off_t off;
+      if (fstat(fd, &st) >= 0) fsize = (size_t)st.st_size;
+      else fsize = 0;
+      if (fsize == 0) {
+          off = lseek(fd, 0, SEEK_END);
+          if (off > 0) { lseek(fd, 0, SEEK_SET); fsize = (size_t)off; }
+      }
+      addr = mmap(NULL, fsize, PROT_READ, MAP_PRIVATE, fd, 0);
+      if (addr == MAP_FAILED) { addr = NULL; goto out; } }
 #endif
 
     if (!addr) {
