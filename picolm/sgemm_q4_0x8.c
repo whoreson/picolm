@@ -207,18 +207,29 @@ static int sgemm_q4x8_q8x4_avx512(
         float *s, size_t bs, int nr, int nc)
 {
     const int nb = k / 32;
-    const __m512i lut512 = build_lut512();
-    const __m256i reorder = _mm256_set_epi32(3,2,1,0,7,6,5,4);
-    int y = 0;
     const int anr = nr - nr % 16;
     const int anc = nc - nc % 16;
 
-    for (; y < anr / 4; y += 4) {
-        const block_q8_0x4 *ap[4];
-        ap[0] = ap_start + (y * nb);
-        for (int i = 0; i < 3; i++) ap[i+1] = ap[i] + nb;
+    /* Thread over (y,x) tiles: each tile is independent.
+     * Total tiles = (anr/4) * (anc/8) / 2, divided by 2 because x steps by 2.
+     * For n_batch=44, d=4096: 2 * 256 = 512 tiles. */
+    const int n_tiles = (anr / 4) * (anc / 16);
+    const int nth = getenv("PICOLM_Q4_0x8_THREADS") ? atoi(getenv("PICOLM_Q4_0x8_THREADS")) : 16;
 
-        for (int x = 0; x < anc / 8; x += 2) {
+#pragma omp parallel num_threads(nth)
+    {
+        const __m512i lut512 = build_lut512();
+        const __m256i reorder = _mm256_set_epi32(3,2,1,0,7,6,5,4);
+        int tile;
+#pragma omp for schedule(static)
+        for (tile = 0; tile < n_tiles; tile++) {
+            int y = (tile / (anc / 16)) * 4;
+            int x = (tile % (anc / 16)) * 8;
+
+            const block_q8_0x4 *ap[4];
+            ap[0] = ap_start + (y * nb);
+            for (int i = 0; i < 3; i++) ap[i+1] = ap[i] + nb;
+
             const block_q4_0x8 *bp0 = bp_start + (x * nb);
             const block_q4_0x8 *bp1 = bp_start + ((x+1) * nb);
 
@@ -329,7 +340,11 @@ static int sgemm_q4x8_q8x4_avx512(
                     const __m512i v22s2 = _mm512_shuffle_epi32(v22, (_MM_PERM_ENUM)221);
                     const __m512i v23s2 = _mm512_shuffle_epi32(v23, (_MM_PERM_ENUM)221);
 
-                    /* dpbusd MAC: 4 activation chunks x 4 weight chunks x 2 shuffles */
+                    /* dpbusd MAC: 4 activation chunks x 4 weight chunks x 2 shuffles
+                     * Each dpbusd_512 call produces 16 int32 results (one per weight row B0-B15).
+                     * The i00/i01/i10/i11 each have 16 int32 = dot products for 16 weight rows
+                     * against a single activation row (A0/A1/A2/A3 respectively).
+                     * No straightening needed: each lane already corresponds to one weight row. */
                     const __m512i zero = _mm512_setzero_epi32();
 
                     __m512i i00 = _mm512_add_epi32(
@@ -353,66 +368,123 @@ static int sgemm_q4x8_q8x4_avx512(
                         dpbusd_512(dpbusd_512(dpbusd_512(dpbusd_512(zero,
                             v23s2, ro3s2), v22s2, ro2s2), v21s2, ro1s2), v20s2, ro0s2));
 
-                    /* Straighten to 4 row vectors (4 int32 each) */
-                    const __m256i i00lo = _mm512_castsi512_si256(i00);
-                    const __m256i i01lo = _mm512_castsi512_si256(i01);
-                    const __m256i i10lo = _mm512_castsi512_si256(i10);
-                    const __m256i i11lo = _mm512_castsi512_si256(i11);
+                    /* FIX for Bug #6: Direct conversion, no straightening blend/permute.
+                     * i00 = 16 int32 for weight rows B0-B15 x activation A0
+                     * i01 = 16 int32 for weight rows B0-B15 x activation A1
+                     * i10 = 16 int32 for weight rows B0-B15 x activation A2
+                     * i11 = 16 int32 for weight rows B0-B15 x activation A3
+                     * Convert each to 16 FP32, multiply by cs * rs, accumulate into acc[0..15].
+                     * Each acc[i] accumulates dot products for weight row B_i across all 4 activation rows. */
 
-                    __m256i row0 = _mm256_blend_epi32(i00lo, _mm256_shuffle_epi32(i01lo, 78), 204);
-                    __m256i row1 = _mm256_blend_epi32(_mm256_shuffle_epi32(i00lo, 78), i01lo, 204);
-                    __m256i row2 = _mm256_blend_epi32(i10lo, _mm256_shuffle_epi32(i11lo, 78), 204);
-                    __m256i row3 = _mm256_blend_epi32(_mm256_shuffle_epi32(i10lo, 78), i11lo, 204);
+                    __m512 f00 = _mm512_cvtepi32_ps(i00);
+                    __m512 f01 = _mm512_cvtepi32_ps(i01);
+                    __m512 f10 = _mm512_cvtepi32_ps(i10);
+                    __m512 f11 = _mm512_cvtepi32_ps(i11);
 
-                    /* Activation row scales (FIX for Bug #3 + #4):
-                     * Use PICOLM_F32Cx16_REPEAT_LOAD which:
-                     * 1. Loads exactly 8 bytes from d[4] via _mm_loadl_epi64 (not 16)
-                     * 2. Replicates                     * 2. Replicates the 4 FP32 to all 16 lanes of __m512
-                     * This matches llama.cpp's GGML_F32Cx16_REPEAT_LOAD pattern. */
+                    /* Activation scales: 4 FP16 -> 4 FP32, each broadcast to 16 lanes */
+                    /* rs0 = activation A0 scale, rs1 = A1, rs2 = A2, rs3 = A3 */
                     __m128i row_scale_f16 = _mm_loadl_epi64((const __m128i*)a[b].d);
                     __m512 rs = PICOLM_F32Cx16_REPEAT_LOAD(row_scale_f16);
 
-                    /* int32[4] -> float[4] -> broadcast to 16 lanes.
-                     * FIX Bug #5: row0..row3 are __m256i with 4 int32 each.
-                     * Convert to __m128 (4 FP32), broadcast to __m512 (16 lanes). */
-                    int rb = rp * 4;  /* llama.cpp: acc_rows[rp*4..rp*4+3] */
-                    /* row0..row3 are __m256i with 4 int32 in the low lane.
-                     * Extract low 128 bits -> convert 4 int32 to 4 FP32 -> broadcast to 16. */
-                    __m512 r0f = _mm512_castps128_ps512(
-                        _mm_cvtepi32_ps(_mm256_castsi256_si128(row0)));
-                    r0f = _mm512_shuffle_f32x4(r0f, r0f, 0);
-                    __m512 r1f = _mm512_castps128_ps512(
-                        _mm_cvtepi32_ps(_mm256_castsi256_si128(row1)));
-                    r1f = _mm512_shuffle_f32x4(r1f, r1f, 0);
-                    __m512 r2f = _mm512_castps128_ps512(
-                        _mm_cvtepi32_ps(_mm256_castsi256_si128(row2)));
-                    r2f = _mm512_shuffle_f32x4(r2f, r2f, 0);
-                    __m512 r3f = _mm512_castps128_ps512(
-                        _mm_cvtepi32_ps(_mm256_castsi256_si128(row3)));
-                    r3f = _mm512_shuffle_f32x4(r3f, r3f, 0);
+                    /* Shuffle rs to extract each of the 4 activation scales, broadcast to 16 lanes */
+                    __m512 rs0 = _mm512_shuffle_ps(rs, rs, 0);    /* lane 0 -> all 16 */
+                    __m512 rs1 = _mm512_shuffle_ps(rs, rs, 85);   /* lane 4 -> all 16 */
+                    __m512 rs2 = _mm512_shuffle_ps(rs, rs, 170);  /* lane 8 -> all 16 */
+                    __m512 rs3 = _mm512_shuffle_ps(rs, rs, 255);  /* lane 12 -> all 16 */
 
-                    acc[rb+0] = _mm512_fmadd_ps(
-                        r0f, _mm512_mul_ps(cs, _mm512_shuffle_ps(rs,rs,0)),  acc[rb+0]);
-                    acc[rb+1] = _mm512_fmadd_ps(
-                        r1f, _mm512_mul_ps(cs, _mm512_shuffle_ps(rs,rs,85)), acc[rb+1]);
-                    acc[rb+2] = _mm512_fmadd_ps(
-                        r2f, _mm512_mul_ps(cs, _mm512_shuffle_ps(rs,rs,170)),acc[rb+2]);
-                    acc[rb+3] = _mm512_fmadd_ps(
-                        r3f, _mm512_mul_ps(cs, _mm512_shuffle_ps(rs,rs,255)),acc[rb+3]);
+                    /* Combine weight scales * activation scales */
+                    __m512 cs0 = _mm512_mul_ps(cs, rs0);
+                    __m512 cs1 = _mm512_mul_ps(cs, rs1);
+                    __m512 cs2 = _mm512_mul_ps(cs, rs2);
+                    __m512 cs3 = _mm512_mul_ps(cs, rs3);
+
+                    /* FIX: Direct accumulation using the 16-lane __m512 vectors.
+                     * f00[0..15] = dot products for weight rows B0-B15 x activation A0
+                     * cs0[0..15] = combined scales for B0-B15 x activation A0
+                     * acc[0] accumulates all activations for weight row B0, etc.
+                     * We broadcast each lane of f00*cs0 into acc[i], then do the same for
+                     * f01*cs1, f10*cs2, f11*cs3. */
+
+                    /* Pre-compute the scaled results for each activation row.
+                     * Each has 16 FP32 values, one per weight row B0-B15. */
+                    __m512 s00 = _mm512_mul_ps(f00, cs0);
+                    __m512 s01 = _mm512_mul_ps(f01, cs1);
+                    __m512 s10 = _mm512_mul_ps(f10, cs2);
+                    __m512 s11 = _mm512_mul_ps(f11, cs3);
+
+                    /* Transpose 4x16: extract 4 lanes from each of the 4 vectors,
+                     * sum them, and accumulate into acc[0..15].
+                     * Each acc[i] gets one lane from each of s00/s01/s10/s11, summed.
+                     * Process 4 lanes at a time using 4 __m128 extractions. */
+                    {
+                        __m128 e00a = _mm512_extractf32x4_ps(s00, 0);
+                        __m128 e01a = _mm512_extractf32x4_ps(s01, 0);
+                        __m128 e10a = _mm512_extractf32x4_ps(s10, 0);
+                        __m128 e11a = _mm512_extractf32x4_ps(s11, 0);
+                        __m128 ea = _mm_add_ps(_mm_add_ps(e00a, e01a), _mm_add_ps(e10a, e11a));
+                        /* Broadcast each of 4 lanes to full __m512 and fmadd into acc[0..3] */
+                        acc[0] = _mm512_fmadd_ps(_mm512_castps128_ps512(_mm_shuffle_ps(ea,ea,0)),
+                               _mm512_castps128_ps512(_mm_set1_ps(1.0f)), acc[0]);
+                        acc[1] = _mm512_fmadd_ps(_mm512_castps128_ps512(_mm_shuffle_ps(ea,ea,85)),
+                               _mm512_castps128_ps512(_mm_set1_ps(1.0f)), acc[1]);
+                        acc[2] = _mm512_fmadd_ps(_mm512_castps128_ps512(_mm_shuffle_ps(ea,ea,170)),
+                               _mm512_castps128_ps512(_mm_set1_ps(1.0f)), acc[2]);
+                        acc[3] = _mm512_fmadd_ps(_mm512_castps128_ps512(_mm_shuffle_ps(ea,ea,255)),
+                               _mm512_castps128_ps512(_mm_set1_ps(1.0f)), acc[3]);
+
+                        __m128 e00b = _mm512_extractf32x4_ps(s00, 1);
+                        __m128 e01b = _mm512_extractf32x4_ps(s01, 1);
+                        __m128 e10b = _mm512_extractf32x4_ps(s10, 1);
+                        __m128 e11b = _mm512_extractf32x4_ps(s11, 1);
+                        __m128 eb = _mm_add_ps(_mm_add_ps(e00b, e01b), _mm_add_ps(e10b, e11b));
+                        acc[4] = _mm512_fmadd_ps(_mm512_castps128_ps512(_mm_shuffle_ps(eb,eb,0)),
+                               _mm512_castps128_ps512(_mm_set1_ps(1.0f)), acc[4]);
+                        acc[5] = _mm512_fmadd_ps(_mm512_castps128_ps512(_mm_shuffle_ps(eb,eb,85)),
+                               _mm512_castps128_ps512(_mm_set1_ps(1.0f)), acc[5]);
+                        acc[6] = _mm512_fmadd_ps(_mm512_castps128_ps512(_mm_shuffle_ps(eb,eb,170)),
+                               _mm512_castps128_ps512(_mm_set1_ps(1.0f)), acc[6]);
+                        acc[7] = _mm512_fmadd_ps(_mm512_castps128_ps512(_mm_shuffle_ps(eb,eb,255)),
+                               _mm512_castps128_ps512(_mm_set1_ps(1.0f)), acc[7]);
+
+                        __m128 e00c = _mm512_extractf32x4_ps(s00, 2);
+                        __m128 e01c = _mm512_extractf32x4_ps(s01, 2);
+                        __m128 e10c = _mm512_extractf32x4_ps(s10, 2);
+                        __m128 e11c = _mm512_extractf32x4_ps(s11, 2);
+                        __m128 ec = _mm_add_ps(_mm_add_ps(e00c, e01c), _mm_add_ps(e10c, e11c));
+                        acc[8] = _mm512_fmadd_ps(_mm512_castps128_ps512(_mm_shuffle_ps(ec,ec,0)),
+                               _mm512_castps128_ps512(_mm_set1_ps(1.0f)), acc[8]);
+                        acc[9] = _mm512_fmadd_ps(_mm512_castps128_ps512(_mm_shuffle_ps(ec,ec,85)),
+                               _mm512_castps128_ps512(_mm_set1_ps(1.0f)), acc[9]);
+                        acc[10] = _mm512_fmadd_ps(_mm512_castps128_ps512(_mm_shuffle_ps(ec,ec,170)),
+                               _mm512_castps128_ps512(_mm_set1_ps(1.0f)), acc[10]);
+                        acc[11] = _mm512_fmadd_ps(_mm512_castps128_ps512(_mm_shuffle_ps(ec,ec,255)),
+                               _mm512_castps128_ps512(_mm_set1_ps(1.0f)), acc[11]);
+
+                        __m128 e00d = _mm512_extractf32x4_ps(s00, 3);
+                        __m128 e01d = _mm512_extractf32x4_ps(s01, 3);
+                        __m128 e10d = _mm512_extractf32x4_ps(s10, 3);
+                        __m128 e11d = _mm512_extractf32x4_ps(s11, 3);
+                        __m128 ed = _mm_add_ps(_mm_add_ps(e00d, e01d), _mm_add_ps(e10d, e11d));
+                        acc[12] = _mm512_fmadd_ps(_mm512_castps128_ps512(_mm_shuffle_ps(ed,ed,0)),
+                               _mm512_castps128_ps512(_mm_set1_ps(1.0f)), acc[12]);
+                        acc[13] = _mm512_fmadd_ps(_mm512_castps128_ps512(_mm_shuffle_ps(ed,ed,85)),
+                               _mm512_castps128_ps512(_mm_set1_ps(1.0f)), acc[13]);
+                        acc[14] = _mm512_fmadd_ps(_mm512_castps128_ps512(_mm_shuffle_ps(ed,ed,170)),
+                               _mm512_castps128_ps512(_mm_set1_ps(1.0f)), acc[14]);
+                        acc[15] = _mm512_fmadd_ps(_mm512_castps128_ps512(_mm_shuffle_ps(ed,ed,255)),
+                               _mm512_castps128_ps512(_mm_set1_ps(1.0f)), acc[15]);
+                    }
                 }
             }
 
             /* Store output: C[nr][nc] = C[n_batch][d], bs = nc (= d)
              * llama.cpp: s[(y*4+i)*bs + x*8]
-             * y = output row group (activation group)
-             * i = 0..15 (output row within tile)
-             * x = output col group (weight group)
              * Each acc[i] = 16 FP32 values for output cols x*8..x*8+15 */
             for (int i = 0; i < 16; i++) {
-                _mm512_storeu_ps((float*)(s + ((y*4+i)*bs + x*8)), acc[i]);
+                _mm512_storeu_ps((float*)(s + ((y*4+i)*bs + x)), acc[i]);
             }
         }
-    }
+    } /* #pragma omp parallel */
     return anr;
 }
 #endif /* AVX512BW + AVX512DQ */

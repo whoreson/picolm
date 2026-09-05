@@ -40,6 +40,12 @@ int picolm_sgemm_d(int m, int n, int k_blocks,
                    int Atype,
                    int ith, int nth);
 
+/* Interleaved Q4_0_8_8 GEMM: C[nr][nc] = A[nr][k] @ B[nc][k]^T
+ * nr = activation rows (n_batch), nc = weight rows (d), k = shared dim
+ * Returns number of rows computed (aligned to 16). */
+int sgemm_q4_0x8_q8_0x4(int nr, int nc, int k,
+        const void *vx, const void *vy, float *s, size_t bs);
+
 #ifdef __cplusplus
 }
 #endif

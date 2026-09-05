@@ -1793,9 +1793,18 @@ void quantize_row_q8_0(const float *x, void *dst, int n) {
 void quantize_mat_q8_0x4(const float *x, void *dst, int n, int row_stride) {
     block_q8_0x4 *y = (block_q8_0x4 *)dst;
     int nb = n / 32;
+    /* Interleave 4 rows in 8-byte chunks (llama.cpp block<8,4> layout).
+     * qs[j] = srcv[src_id][src_offset] where:
+     *   src_offset = (j / 32) * 8 + (j % 8)
+     *   src_id     = (j % 32) / 8
+     * So: qs[0..7]=row0[0..7], qs[8..15]=row1[0..7], qs[16..23]=row2[0..7], qs[24..31]=row3[0..7],
+     *     qs[32..39]=row0[8..15], qs[40..47]=row1[8..15], ...
+     *
+     * GEMM expects d = scale = amax/127 (dequant: value = qs * d).
+     * Quantization uses inverse scale: qs = roundf(x * id) where id = 127/amax. */
     for (int b = 0; b < nb; b++) {
         float srcv[4][32];
-        float id[4];
+        float amax_r[4];
         for (int r = 0; r < 4; r++) {
             const float *xr = x + r * row_stride + b * 32;
             float amax = 0.0f;
@@ -1804,14 +1813,20 @@ void quantize_mat_q8_0x4(const float *x, void *dst, int n, int row_stride) {
                 float a = xr[j] < 0 ? -xr[j] : xr[j];
                 if (a > amax) amax = a;
             }
-            id[r] = amax == 0 ? 1e-30f : 127.0f / amax;
-            int8_t *q = y[b].qs + r * 32;
-            for (int j = 0; j < 32; j++)
-                q[j] = roundf(srcv[r][j] * id[r]);
+            amax_r[r] = amax;
         }
-        /* Store scales as FP16 */
-        for (int r = 0; r < 4; r++)
-            y[b].d[r] = fp32_to_fp16(id[r]);
+        /* Store scales as FP16 (d = amax/127, the scale factor) */
+        for (int r = 0; r < 4; r++) {
+            float scale = amax_r[r] == 0 ? 1e-30f : amax_r[r] / 127.0f;
+            y[b].d[r] = fp32_to_fp16(scale);
+        }
+        /* Quantize and interleave */
+        for (int j = 0; j < 128; j++) {
+            int src_offset = (j / 32) * 8 + (j % 8);
+            int src_id = (j % 32) / 8;
+            float id = amax_r[src_id] == 0 ? 1e-30f : 127.0f / amax_r[src_id];
+            y[b].qs[j] = roundf(srcv[src_id][src_offset] * id);
+        }
     }
 }
 

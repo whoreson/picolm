@@ -2244,9 +2244,56 @@ void matmul_batch(float *out, const float *x, int n_batch,
      * the row-parallel strategy of the Q8_0 batch path and provides enough
      * work units even for small n_batch (e.g. 51 tokens x ~1280 groups =
      * 65K work units on a 27B model). */
-    /* WIP: Interleaved Q4_0_8_8 GEMM path (sgemm_q4_0x8.c).
-     * Disabled by default due to known bugs. Enable with PICOLM_Q4_0x8_GEMM=1.
-     * See sgemm_q4_0x8.c header for details and known issues. */
+    /* Interleaved Q4_0_8_8 GEMM path (sgemm_q4_0x8.c).
+     * GEMM computes anr = n_batch - n_batch%16 rows.
+     * Tail handled by vec_dot. */
+    if (qtype == GGUF_TYPE_Q4_0_8_8 && n_batch > 0 && n > 0 &&
+        d % 8 == 0 && n_batch % 4 == 0 && n % 32 == 0) {
+        int n_act_rg = n_batch / 4;
+        int nb = n / 32;
+        size_t abuf_size = (size_t)n_act_rg * nb * sizeof(block_q8_0x4);
+        void *abuf = malloc(abuf_size);
+        int anr = 0;
+        if (abuf) {
+            for (int rg = 0; rg < n_act_rg; rg++) {
+                float *xr = (float *)x + (size_t)(rg * 4) * n;
+                block_q8_0x4 *y = (block_q8_0x4 *)abuf + rg * nb;
+                quantize_mat_q8_0x4(xr, y, n, n);
+            }
+            float *tmp_out = malloc((size_t)n_batch * d * sizeof(float));
+            if (tmp_out) {
+                anr = sgemm_q4_0x8_q8_0x4(n_batch, d, n, wptr, abuf, tmp_out, d);
+                for (int t = 0; t < anr; t++) {
+                    for (int w = 0; w < d; w++) {
+                        out[w * n_batch + t] = tmp_out[t * d + w];
+                    }
+                }
+                free(tmp_out);
+            }
+            free(abuf);
+        }
+        /* Handle tail rows via vec_dot */
+        {
+            int n_tail = n_batch - anr;
+            if (n_tail > 0) {
+                size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
+                void *qbuf_tail = malloc((size_t)n_tail * q8_rb);
+                if (qbuf_tail) {
+                    for (int b = 0; b < n_tail; b++)
+                        quantize_row_q8_0(x + (size_t)(anr + b) * n,
+                            (char *)qbuf_tail + (size_t)b * q8_rb, n);
+                    int total_groups = (d + 7) / 8;
+                    q4_0_8_8_batch_ctx_t ctx = { wptr, row_bytes, qbuf_tail, q8_rb,
+                        out + (size_t)anr * d, n, d, n_tail };
+                    tensor_parallel_for(n_tail * total_groups, q4_0_8_8_batch_task, &ctx);
+                    free(qbuf_tail);
+                }
+            }
+        }
+        return;
+    }
+
+    /* Vec dot path for Q4_0_8_8 (fallback) */
     if (qtype == GGUF_TYPE_Q4_0_8_8 && n_batch > 0 && n > 0) {
         size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
         void *qbuf = malloc((size_t)n_batch * q8_rb);
@@ -2259,9 +2306,6 @@ void matmul_batch(float *out, const float *x, int n_batch,
             free(qbuf);
             return;
         }
-        /* malloc failed: fall through to the generic path below, which is
-         * WRONG for this interleaved layout -- but malloc failure at this
-         * size is already a bigger problem than a wrong matmul result. */
     }
 #endif /* PICOLM_AVX2 */
     /* Same idea, 4-row groups -- this is the format ARM NEON dotprod/SDOT
