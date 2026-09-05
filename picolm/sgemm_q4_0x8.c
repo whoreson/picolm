@@ -46,6 +46,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <immintrin.h>
+#include <pthread.h>
 #include "quant.h"
 
 /* ============================================================
@@ -210,28 +211,21 @@ static int sgemm_q4x8_q8x4_avx512(
     const int anr = nr - nr % 16;
     const int anc = nc - nc % 16;
 
-    /* Thread over (y,x) tiles: each tile is independent.
-     * Total tiles = (anr/4) * (anc/8) / 2, divided by 2 because x steps by 2.
-     * For n_batch=44, d=4096: 2 * 256 = 512 tiles. */
-    const int n_tiles = (anr / 4) * (anc / 16);
-    const int nth = getenv("PICOLM_Q4_0x8_THREADS") ? atoi(getenv("PICOLM_Q4_0x8_THREADS")) : 16;
+    /* Process tiles in serial. Threading is handled at the tensor.c level
+     * via the GEMM dispatch. Each GEMM call handles all anr rows. */
+    const __m512i lut512 = build_lut512();
+    const __m256i reorder = _mm256_set_epi32(3,2,1,0,7,6,5,4);
 
-#pragma omp parallel num_threads(nth)
-    {
-        const __m512i lut512 = build_lut512();
-        const __m256i reorder = _mm256_set_epi32(3,2,1,0,7,6,5,4);
-        int tile;
-#pragma omp for schedule(static)
-        for (tile = 0; tile < n_tiles; tile++) {
-            int y = (tile / (anc / 16)) * 4;
-            int x = (tile % (anc / 16)) * 8;
+    for (int y = 0; y < anr / 4; y += 4) {
+        const block_q8_0x4 *ap[4];
+        ap[0] = ap_start + (y * nb);
+        for (int i = 0; i < 3; i++) ap[i+1] = ap[i] + nb;
 
-            const block_q8_0x4 *ap[4];
-            ap[0] = ap_start + (y * nb);
-            for (int i = 0; i < 3; i++) ap[i+1] = ap[i] + nb;
-
-            const block_q4_0x8 *bp0 = bp_start + (x * nb);
-            const block_q4_0x8 *bp1 = bp_start + ((x+1) * nb);
+        for (int xg = 0; xg < anc / 8; xg += 2) {
+            /* xg = column group index (0, 2, 4, ..., anc/8-1).
+             * Each xg handles 16 output columns starting at xg*8. */
+            const block_q4_0x8 *bp0 = bp_start + (xg * nb);
+            const block_q4_0x8 *bp1 = bp_start + ((xg+1) * nb);
 
             __m512 acc[16];
             for (int i = 0; i < 16; i++) acc[i] = _mm512_setzero_ps();
@@ -479,12 +473,13 @@ static int sgemm_q4x8_q8x4_avx512(
 
             /* Store output: C[nr][nc] = C[n_batch][d], bs = nc (= d)
              * llama.cpp: s[(y*4+i)*bs + x*8]
-             * Each acc[i] = 16 FP32 values for output cols x*8..x*8+15 */
+             * xg = column group, xg*8 = starting column offset.
+             * Each acc[i] = 16 FP32 values for output cols xg*8..xg*8+15 */
             for (int i = 0; i < 16; i++) {
-                _mm512_storeu_ps((float*)(s + ((y*4+i)*bs + x)), acc[i]);
+                _mm512_storeu_ps((float*)(s + ((y*4+i)*bs + xg*8)), acc[i]);
             }
         }
-    } /* #pragma omp parallel */
+    }
     return anr;
 }
 #endif /* AVX512BW + AVX512DQ */
@@ -635,14 +630,14 @@ int sgemm_q4_0x8_q8_0x4(int nr, int nc, int k,
 #if defined(__AVX512BW__) && defined(__AVX512DQ__)
     {
     int yd = sgemm_q4x8_q8x4_avx512(k, bp, ap, s, bs, nr, nc);
-    if (yd >= nr) return 1;
+    if (yd > 0) return yd;
     }
 #endif
 
 #if defined(__AVX2__) && defined(__F16C__)
     {
     int yd = sgemm_q4x8_q8x4_avx2(k, bp, ap, s, bs, nr, nc);
-    if (yd >= nr) return 1;
+    if (yd > 0) return yd;
     }
 #endif
 
