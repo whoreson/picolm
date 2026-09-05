@@ -2182,7 +2182,7 @@ static void mm_id_down_expert_task(int idx, void *ctxp) {
  * Each worker thread gets a distinct idx (its ith), ensuring ALL output tiles
  * are computed. Without this, picolm_sgemm_d(..., ith=0, nth=16) would only
  * compute 1/16 of the output matrix. */
-#if defined(__AVX2__) && defined(__F16C__)
+#if (defined(__AVX2__) && defined(__F16C__)) || defined(__ARM_NEON)
 typedef struct {
     int m, n, k_blocks;
     const void *A; int lda;
@@ -2226,17 +2226,11 @@ void matmul_batch(float *out, const float *x, int n_batch,
 
     /* Tiled GEMM for F16/F32 weights with batched F32 activations.
      * Much faster than per-row gemv because activation tokens are
-     * reused across weight tiles.
-     * picolm_sgemm handles: F32xF32, F16xF32, F16xF16, Q8_0xQ8_0 (ARM NEON too). */
-    if (picolm_sgemm(d, n_batch, n, wptr, n, x, n, out, d, qtype, GGUF_TYPE_F32, 0, n_threads)) {
-        if (getenv("PICOLM_DISPATCH")) {
-            fprintf(stderr, "DISPATCH matmul_batch: d=%d n=%d batch=%d qtype=%d -> SGEMM\n", d, n, n_batch, qtype);
-        }
+     * reused across weight tiles. */
+    /* DISABLED for debugging */
+    /* if (picolm_sgemm(d, n_batch, n, wptr, n, x, n, out, d, qtype, GGUF_TYPE_F32, 0, n_threads)) {
         return;
-    }
-    if (getenv("PICOLM_DISPATCH")) {
-        fprintf(stderr, "DISPATCH matmul_batch: d=%d n=%d batch=%d qtype=%d -> vec_dot\n", d, n, n_batch, qtype);
-    }
+    } */
 
 #if defined(PICOLM_AVX2)
     /* Parallelize across (token, 8-row-group) pairs. Each group is processed
@@ -2405,13 +2399,14 @@ void matmul_batch(float *out, const float *x, int n_batch,
     }
 
     /* Quantized GEMM fast path: try tiled GEMM with pre-quantized Q8_0 activations.
-     * AVX2+F16C: uses picolm_sgemm_d (delta-optimized, _mm_cvtph_ps).
-     * ARM NEON: uses picolm_sgemm (Q8_0xQ8_0 path, no delta optimization).
-     * Threshold: n_batch >= 8 for all quant types. */
+     * Uses tensor_parallel_for to dispatch nth worker threads, each calling
+     * picolm_sgemm_d with a distinct ith. This ensures ALL output tiles are
+     * computed (not just thread 0's 1/nth slice).
+     * Threshold: n_batch >= 32 for Q8_0, >= 8 for Q4_0/Q5_0. */
 #if defined(__AVX2__) && defined(__F16C__)
     if (have_qx && qx_d_buf && d >= 4 &&
         (qtype == GGUF_TYPE_Q8_0 || qtype == GGUF_TYPE_Q4_0 || qtype == GGUF_TYPE_Q5_0)) {
-        int min_batch = 8;
+        int min_batch = (qtype == GGUF_TYPE_Q8_0) ? 32 : 8;
         if (n_batch >= min_batch) {
             int k_blocks = n / 32;
             int nth = pool_total_threads(1);
@@ -2424,27 +2419,34 @@ void matmul_batch(float *out, const float *x, int n_batch,
                 .Atype = qtype, .nth = nth,
             };
             tensor_parallel_for(nth, qgemm_d_task, &ctx);
-            if (getenv("PICOLM_DISPATCH")) fprintf(stderr, "DISPATCH matmul_batch: d=%d n=%d batch=%d qtype=%d -> GEMM_d\n", d, n, n_batch, qtype);
             if (qx_buf) { free(qx_buf); if (qx_d_buf) free(qx_d_buf); }
             return;
         }
     }
 #endif
-#if defined(__ARM_NEON) && (defined(__ARM_FEATURE_DOTPROD) || defined(__ARM_FEATURE_MATMUL_INT8))
-    /* ARM NEON GEMM only useful with DOTPROD or I8MM.
-     * Plain NEON scalar fallback is slower than vec_dot. */
-    if (have_qx && qx_stride && d >= 4 &&
+#if defined(__ARM_NEON)
+    /* NEON tiled GEMM with pre-converted deltas.
+     * On basic NEON (no DOTPROD/I8MM), the per-row vec_dot path is already
+     * quite efficient (2-block interleaved vmull_s8 + vpaddlq_s16). The tiled
+     * GEMM only helps when the tile overhead is amortized over a large batch.
+     * Threshold is high because 128-bit NEON can't match the per-row throughput. */
+    if (have_qx && qx_d_buf && d >= 4 &&
         (qtype == GGUF_TYPE_Q8_0 || qtype == GGUF_TYPE_Q4_0 || qtype == GGUF_TYPE_Q5_0)) {
-        if (n_batch >= 8) {
+        int min_batch = (qtype == GGUF_TYPE_Q8_0) ? 128 : 64;
+        if (n_batch >= min_batch) {
             int k_blocks = n / 32;
             int nth = pool_total_threads(1);
-            if (picolm_sgemm(d, n_batch, k_blocks, W, k_blocks,
-                             qx_buf, k_blocks, out, d,
-                             qtype, GGUF_TYPE_Q8_0, 0, nth)) {
-                if (getenv("PICOLM_DISPATCH")) fprintf(stderr, "DISPATCH matmul_batch: d=%d n=%d batch=%d qtype=%d -> SGEMM(Q8_0)\n", d, n, n_batch, qtype);
-                if (qx_buf) { free(qx_buf); if (qx_d_buf) free(qx_d_buf); }
-                return;
-            }
+            qgemm_d_ctx_t ctx = {
+                .m = d, .n = n_batch, .k_blocks = k_blocks,
+                .A = W, .lda = k_blocks,
+                .B = (const block_q8_0*)qx_buf, .ldb = k_blocks,
+                .B_d = qx_d_buf, .ldb_d = k_blocks,
+                .C = out, .ldc = d,
+                .Atype = qtype, .nth = nth,
+            };
+            tensor_parallel_for(nth, qgemm_d_task, &ctx);
+            if (qx_buf) { free(qx_buf); if (qx_d_buf) free(qx_d_buf); }
+            return;
         }
     }
 #endif
@@ -2645,6 +2647,46 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
      * for both matmuls. Each worker thread gets a distinct ith. */
 #if defined(__AVX2__) && defined(__F16C__)
     if (n_batch >= 8 && d >= 4 && n > 0 &&
+        (qtype1 == GGUF_TYPE_Q8_0 || qtype1 == GGUF_TYPE_Q4_0 || qtype1 == GGUF_TYPE_Q5_0) &&
+        (qtype2 == GGUF_TYPE_Q8_0 || qtype2 == GGUF_TYPE_Q4_0 || qtype2 == GGUF_TYPE_Q5_0)) {
+        size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
+        int nb = n / 32;
+        void *qbuf = malloc((size_t)n_batch * q8_rb);
+        float *dbuf = (float *)malloc((size_t)n_batch * nb * sizeof(float));
+        if (qbuf && dbuf) {
+            for (int b = 0; b < n_batch; b++) {
+                quantize_row_q8_0(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
+                const block_q8_0 *blk = (const block_q8_0 *)((char *)qbuf + (size_t)b * q8_rb);
+                for (int k = 0; k < nb; k++) dbuf[(size_t)b * nb + k] = fp16_to_fp32(blk[k].d);
+            }
+            int k_blocks = n / 32;
+            int nth = pool_total_threads(1);
+            qgemm_d_ctx_t ctx1 = {
+                .m = d, .n = n_batch, .k_blocks = k_blocks,
+                .A = W1, .lda = k_blocks,
+                .B = (const block_q8_0*)qbuf, .ldb = k_blocks,
+                .B_d = dbuf, .ldb_d = k_blocks,
+                .C = out1, .ldc = d,
+                .Atype = qtype1, .nth = nth,
+            };
+            tensor_parallel_for(nth, qgemm_d_task, &ctx1);
+            qgemm_d_ctx_t ctx2 = {
+                .m = d, .n = n_batch, .k_blocks = k_blocks,
+                .A = W2, .lda = k_blocks,
+                .B = (const block_q8_0*)qbuf, .ldb = k_blocks,
+                .B_d = dbuf, .ldb_d = k_blocks,
+                .C = out2, .ldc = d,
+                .Atype = qtype2, .nth = nth,
+            };
+            tensor_parallel_for(nth, qgemm_d_task, &ctx2);
+            free(qbuf); free(dbuf);
+            return;
+        }
+    }
+#endif
+#if defined(__ARM_NEON)
+    /* NEON tiled GEMM for dual batch. Same structure as AVX2 path. */
+    if (n_batch >= 4 && d >= 4 && n > 0 &&
         (qtype1 == GGUF_TYPE_Q8_0 || qtype1 == GGUF_TYPE_Q4_0 || qtype1 == GGUF_TYPE_Q5_0) &&
         (qtype2 == GGUF_TYPE_Q8_0 || qtype2 == GGUF_TYPE_Q4_0 || qtype2 == GGUF_TYPE_Q5_0)) {
         size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);

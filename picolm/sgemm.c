@@ -694,7 +694,7 @@ static void sgemm_f16_f32(int m, int n, int k, const uint16_t *A, int lda,
 }
 #undef SGEMM_FMA
 #endif
-#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+#elif defined(__ARM_NEON)
 static void sgemm_f16_f32(int m, int n, int k, const uint16_t *A, int lda,
                            const float *B, int ldb, float *C, int ldc,
                            int ith, int nth) {
@@ -1330,6 +1330,28 @@ QGEMM_DEFINE(q5_load_qs, block_q5_0)
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 
+/* Compute dot product of two Q8_0 blocks (32 values each),
+ * return int32x4_t with the sum in all 4 lanes.
+ * Basic NEON widen path (works on Pi 4 Cortex-A72 without DOTPROD/I8MM). */
+static inline int32x4_t neon_vdot_32(int8x16_t a_lo, int8x16_t b_lo,
+                                     int8x16_t a_hi, int8x16_t b_hi) {
+    int16x8_t m0 = vmull_s8(vget_low_s8(a_lo), vget_low_s8(b_lo));
+    int16x8_t m1 = vmull_high_s8(a_lo, b_lo);
+    int16x8_t m2 = vmull_s8(vget_low_s8(a_hi), vget_low_s8(b_hi));
+    int16x8_t m3 = vmull_high_s8(a_hi, b_hi);
+    int32x4_t s = vaddq_s32(vpaddlq_s16(m0), vpaddlq_s16(m1));
+    s = vaddq_s32(s, vaddq_s32(vpaddlq_s16(m2), vpaddlq_s16(m3)));
+    return s;
+}
+
+/* Scaled accumulation: C += dot(a,b) * scale, where scale is a scalar broadcast. */
+static inline float32x4_t neon_vdot_accum(float32x4_t C,
+    int8x16_t a_lo, int8x16_t b_lo, int8x16_t a_hi, int8x16_t b_hi,
+    float32x4_t scale) {
+    int32x4_t s = neon_vdot_32(a_lo, b_lo, a_hi, b_hi);
+    return vmlaq_f32(C, vcvtq_f32_s32(s), scale);
+}
+
 static void sgemm_q8_q8_neon(int m, int n, int k_blocks,
                               const block_q8_0 *A, int lda,
                               const block_q8_0 *B, int ldb,
@@ -1363,17 +1385,11 @@ static void sgemm_q8_q8_neon(int m, int n, int k_blocks,
                             int8x16_t alo=vld1q_s8(ar->qs);
                             int8x16_t ahi=vld1q_s8(ar->qs+16);
 #if defined(__ARM_FEATURE_MATMUL_INT8)
-                            int32x4_t acc=vmmlaq_s32(vmmlaq_s32(vdupq_n_s32(0),alo,blo),ahi,bhi);
-                            float32x4_t s=vmulq_f32(vcvtq_f32_s32(acc),scale);
-#elif defined(__ARM_FEATURE_DOTPROD)
-                            int32x4_t acc=vdotq_s32(vdotq_s32(vdupq_n_s32(0),alo,blo),ahi,bhi);
-                            float32x4_t s=vmulq_f32(vcvtq_f32_s32(acc),scale);
+                            float32x4_t s=vmulq_f32(vcvtq_f32_s32(
+                                vmmlaq_s32(vmmlaq_s32(vdupq_n_s32(0),alo,blo),ahi,bhi)),scale);
 #else
-                            /* Scalar fallback: plain NEON without DOTPROD/I8MM */
-                            int32_t acc_s = 0;
-                            for (int v = 0; v < 16; v++) acc_s += (int32_t)vgetq_lane_s8(alo,v) * vgetq_lane_s8(blo,v);
-                            for (int v = 0; v < 16; v++) acc_s += (int32_t)vgetq_lane_s8(ahi,v) * vgetq_lane_s8(bhi,v);
-                            float32x4_t s = vmulq_n_f32(scale, (float)acc_s);
+                            float32x4_t s=vmulq_f32(vcvtq_f32_s32(
+                                neon_vdot_32(alo,blo,ahi,bhi)),scale);
 #endif
                             Cv[jr][ir]=vaddq_f32(Cv[jr][ir],s);
                         }
@@ -1396,17 +1412,11 @@ static void sgemm_q8_q8_neon(int m, int n, int k_blocks,
                         int8x16_t alo=vld1q_s8(ar->qs);
                         int8x16_t ahi=vld1q_s8(ar->qs+16);
 #if defined(__ARM_FEATURE_MATMUL_INT8)
-                        int32x4_t acc=vmmlaq_s32(vmmlaq_s32(vdupq_n_s32(0),alo,blo),ahi,bhi);
-                        float32x4_t s=vmulq_f32(vcvtq_f32_s32(acc),scale);
-#elif defined(__ARM_FEATURE_DOTPROD)
-                        int32x4_t acc=vdotq_s32(vdotq_s32(vdupq_n_s32(0),alo,blo),ahi,bhi);
-                        float32x4_t s=vmulq_f32(vcvtq_f32_s32(acc),scale);
+                        float32x4_t s=vmulq_f32(vcvtq_f32_s32(
+                            vmmlaq_s32(vmmlaq_s32(vdupq_n_s32(0),alo,blo),ahi,bhi)),scale);
 #else
-                        /* Scalar fallback: plain NEON without DOTPROD/I8MM */
-                        int32_t acc_s = 0;
-                        for (int v = 0; v < 16; v++) acc_s += (int32_t)vgetq_lane_s8(alo,v) * vgetq_lane_s8(blo,v);
-                        for (int v = 0; v < 16; v++) acc_s += (int32_t)vgetq_lane_s8(ahi,v) * vgetq_lane_s8(bhi,v);
-                        float32x4_t s = vmulq_n_f32(scale, (float)acc_s);
+                        float32x4_t s=vmulq_f32(vcvtq_f32_s32(
+                            neon_vdot_32(alo,blo,ahi,bhi)),scale);
 #endif
                         Cv[ir]=vaddq_f32(Cv[ir],s);
                     }
@@ -1417,6 +1427,268 @@ static void sgemm_q8_q8_neon(int m, int n, int k_blocks,
     }
 }
 #endif /* ARM_NEON */
+
+/* ============================================================
+ * ARM NEON QGEMM with pre-converted activation deltas (picolm_sgemm_d)
+ * Uses vdotq_s32 (DOTPROD, available on Cortex-A72 Pi 4) or
+ * vmmlaq_s32 (I8MM) if available.
+ * Tile structure mirrors the AVX2 QGEMM_D_IMPL/D4_IMPL exactly.
+ * ============================================================ */
+#if defined(__ARM_NEON)
+
+/* Helper to get fp16 delta pointer from any block type */
+#define QG_D_PTR(b) ((const uint16_t*)&(b)->d)
+
+static inline float neon_hsum_f32(float32x4_t v) {
+    return vaddvq_f32(v);
+}
+
+/* NEON tile: 4 weight rows x 2 activation rows.
+ * B_d is pre-converted float32 delta array.
+ * A weights have fp16 deltas read from block, converted in-kernel. */
+#define NEON_QGEMM_TILE_4x2(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d, C, ldc, ii, jj, k_blocks) do { \
+    float32x4_t Cv[2][4];                                                     \
+    for (int r=0;r<2;r++) for (int c=0;c<4;c++) Cv[r][c]=vdupq_n_f32(0);      \
+    for (int64_t l = 0; l < (k_blocks); ++l) {                                \
+        float tmp_da[4];                                                               tmp_da[0] = fp16_to_fp32(*QG_D_PTR((A)+(lda)*((ii)+0)+l));                    tmp_da[1] = fp16_to_fp32(*QG_D_PTR((A)+(lda)*((ii)+1)+l));                    tmp_da[2] = fp16_to_fp32(*QG_D_PTR((A)+(lda)*((ii)+2)+l));                    tmp_da[3] = fp16_to_fp32(*QG_D_PTR((A)+(lda)*((ii)+3)+l));            \
+        int8x16_t a0_lo, a0_hi, a1_lo, a1_hi, a2_lo, a2_hi, a3_lo, a3_hi;    \
+        load_qs_fn((A)+(lda)*((ii)+0)+l, &a0_lo, &a0_hi);                     \
+        load_qs_fn((A)+(lda)*((ii)+1)+l, &a1_lo, &a1_hi);                     \
+        load_qs_fn((A)+(lda)*((ii)+2)+l, &a2_lo, &a2_hi);                     \
+        load_qs_fn((A)+(lda)*((ii)+3)+l, &a3_lo, &a3_hi);                     \
+        int8x16_t b0_lo, b0_hi, b1_lo, b1_hi;                                 \
+        neon_q8_qs((B) + (ldb)*((jj)+0) + l, &b0_lo, &b0_hi);                 \
+        neon_q8_qs((B) + (ldb)*((jj)+1) + l, &b1_lo, &b1_hi);                 \
+        float32x4_t db0 = vld1q_dup_f32((B_d)+(ldb_d)*((jj)+0) + l);          \
+        float32x4_t db1 = vld1q_dup_f32((B_d)+(ldb_d)*((jj)+1) + l);          \
+        float32x4_t scale0[4], scale1[4];                                      \
+        scale0[0] = vmulq_n_f32(db0, tmp_da[0]); scale0[1] = vmulq_n_f32(db0, tmp_da[1]); \
+        scale0[2] = vmulq_n_f32(db0, tmp_da[2]); scale0[3] = vmulq_n_f32(db0, tmp_da[3]); \
+        scale1[0] = vmulq_n_f32(db1, tmp_da[0]); scale1[1] = vmulq_n_f32(db1, tmp_da[1]); \
+        scale1[2] = vmulq_n_f32(db1, tmp_da[2]); scale1[3] = vmulq_n_f32(db1, tmp_da[3]); \
+        Cv[0][0] = neon_vdot_accum(Cv[0][0], a0_lo, b0_lo, a0_hi, b0_hi, scale0[0]); \
+        Cv[0][1] = neon_vdot_accum(Cv[0][1], a1_lo, b0_lo, a1_hi, b0_hi, scale0[1]); \
+        Cv[0][2] = neon_vdot_accum(Cv[0][2], a2_lo, b0_lo, a2_hi, b0_hi, scale0[2]); \
+        Cv[0][3] = neon_vdot_accum(Cv[0][3], a3_lo, b0_lo, a3_hi, b0_hi, scale0[3]); \
+        Cv[1][0] = neon_vdot_accum(Cv[1][0], a0_lo, b1_lo, a0_hi, b1_hi, scale1[0]); \
+        Cv[1][1] = neon_vdot_accum(Cv[1][1], a1_lo, b1_lo, a1_hi, b1_hi, scale1[1]); \
+        Cv[1][2] = neon_vdot_accum(Cv[1][2], a2_lo, b1_lo, a2_hi, b1_hi, scale1[2]); \
+        Cv[1][3] = neon_vdot_accum(Cv[1][3], a3_lo, b1_lo, a3_hi, b1_hi, scale1[3]); \
+    }                                                                          \
+    for (int64_t jr=0;jr<2;++jr)                                               \
+        for (int64_t ir=0;ir<4;++ir)                                           \
+            (C)[(ldc)*((jj)+jr)+((ii)+ir)] = neon_hsum_f32(Cv[jr][ir]);       \
+} while (0)
+
+/* NEON tile: 4 weight rows x 4 activation rows */
+#define NEON_QGEMM_TILE_4x4(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d, C, ldc, ii, jj, k_blocks) do { \
+    float32x4_t Cv[4][4];                                                     \
+    for (int r=0;r<4;r++) for (int c=0;c<4;c++) Cv[r][c]=vdupq_n_f32(0);      \
+    for (int64_t l = 0; l < (k_blocks); ++l) {                                \
+        float tmp_da[4];                                                       \
+        tmp_da[0] = fp16_to_fp32(*QG_D_PTR((A)+(lda)*((ii)+0)+l));            \
+        tmp_da[1] = fp16_to_fp32(*QG_D_PTR((A)+(lda)*((ii)+1)+l));            \
+        tmp_da[2] = fp16_to_fp32(*QG_D_PTR((A)+(lda)*((ii)+2)+l));            \
+        tmp_da[3] = fp16_to_fp32(*QG_D_PTR((A)+(lda)*((ii)+3)+l));            \
+        int8x16_t a0_lo, a0_hi, a1_lo, a1_hi, a2_lo, a2_hi, a3_lo, a3_hi;    \
+        load_qs_fn((A)+(lda)*((ii)+0)+l, &a0_lo, &a0_hi);                     \
+        load_qs_fn((A)+(lda)*((ii)+1)+l, &a1_lo, &a1_hi);                     \
+        load_qs_fn((A)+(lda)*((ii)+2)+l, &a2_lo, &a2_hi);                     \
+        load_qs_fn((A)+(lda)*((ii)+3)+l, &a3_lo, &a3_hi);                     \
+        for (int64_t jr=0; jr<4; ++jr) {                                      \
+            int8x16_t b_lo, b_hi;                                              \
+            neon_q8_qs((B) + (ldb)*((jj)+jr) + l, &b_lo, &b_hi);              \
+            float32x4_t db = vld1q_dup_f32((B_d)+(ldb_d)*((jj)+jr) + l);      \
+            float32x4_t sc[4];                                                  \
+            sc[0]=vmulq_n_f32(db,tmp_da[0]); sc[1]=vmulq_n_f32(db,tmp_da[1]); \
+            sc[2]=vmulq_n_f32(db,tmp_da[2]); sc[3]=vmulq_n_f32(db,tmp_da[3]); \
+            Cv[jr][0] = neon_vdot_accum(Cv[jr][0], a0_lo, b_lo, a0_hi, b_hi, sc[0]); \
+            Cv[jr][1] = neon_vdot_accum(Cv[jr][1], a1_lo, b_lo, a1_hi, b_hi, sc[1]); \
+            Cv[jr][2] = neon_vdot_accum(Cv[jr][2], a2_lo, b_lo, a2_hi, b_hi, sc[2]); \
+            Cv[jr][3] = neon_vdot_accum(Cv[jr][3], a3_lo, b_lo, a3_hi, b_hi, sc[3]); \
+        }                                                                      \
+    }                                                                          \
+    for (int64_t jr=0;jr<4;++jr)                                               \
+        for (int64_t ir=0;ir<4;++ir)                                           \
+            (C)[(ldc)*((jj)+jr)+((ii)+ir)] = neon_hsum_f32(Cv[jr][ir]);       \
+} while (0)
+
+/* NEON tile: 4 weight rows x N activation rows (N=1..3 tail) */
+#define NEON_QGEMM_TILE_4xN(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d, C, ldc, ii, jj, n_tail, k_blocks) do { \
+    float32x4_t Cv[4][4]; /* Cv[jr][ir], jr=0..n_tail-1, ir=0..3 */            \
+    for (int jr=0;jr<(n_tail);jr++) for (int c=0;c<4;c++) Cv[jr][c]=vdupq_n_f32(0); \
+    for (int64_t l = 0; l < (k_blocks); ++l) {                                \
+        float tmp_da[4];                                                       \
+        tmp_da[0] = fp16_to_fp32(*QG_D_PTR((A)+(lda)*((ii)+0)+l));            \
+        tmp_da[1] = fp16_to_fp32(*QG_D_PTR((A)+(lda)*((ii)+1)+l));            \
+        tmp_da[2] = fp16_to_fp32(*QG_D_PTR((A)+(lda)*((ii)+2)+l));            \
+        tmp_da[3] = fp16_to_fp32(*QG_D_PTR((A)+(lda)*((ii)+3)+l));            \
+        int8x16_t a0_lo, a0_hi, a1_lo, a1_hi, a2_lo, a2_hi, a3_lo, a3_hi;    \
+        load_qs_fn((A)+(lda)*((ii)+0)+l, &a0_lo, &a0_hi);                     \
+        load_qs_fn((A)+(lda)*((ii)+1)+l, &a1_lo, &a1_hi);                     \
+        load_qs_fn((A)+(lda)*((ii)+2)+l, &a2_lo, &a2_hi);                     \
+        load_qs_fn((A)+(lda)*((ii)+3)+l, &a3_lo, &a3_hi);                     \
+        for (int64_t jr=0; jr<(n_tail); ++jr) {                               \
+            int8x16_t b_lo, b_hi;                                              \
+            neon_q8_qs((B) + (ldb)*((jj)+jr) + l, &b_lo, &b_hi);              \
+            float32x4_t db = vld1q_dup_f32((B_d)+(ldb_d)*((jj)+jr) + l);      \
+            float32x4_t sc[4];                                                  \
+            sc[0]=vmulq_n_f32(db,tmp_da[0]); sc[1]=vmulq_n_f32(db,tmp_da[1]); \
+            sc[2]=vmulq_n_f32(db,tmp_da[2]); sc[3]=vmulq_n_f32(db,tmp_da[3]); \
+            Cv[jr][0] = neon_vdot_accum(Cv[jr][0], a0_lo, b_lo, a0_hi, b_hi, sc[0]); \
+            Cv[jr][1] = neon_vdot_accum(Cv[jr][1], a1_lo, b_lo, a1_hi, b_hi, sc[1]); \
+            Cv[jr][2] = neon_vdot_accum(Cv[jr][2], a2_lo, b_lo, a2_hi, b_hi, sc[2]); \
+            Cv[jr][3] = neon_vdot_accum(Cv[jr][3], a3_lo, b_lo, a3_hi, b_hi, sc[3]); \
+        }                                                                      \
+    }                                                                          \
+    for (int64_t jr=0;jr<(n_tail);++jr)                                        \
+        for (int64_t ir=0;ir<4;++ir)                                           \
+            (C)[(ldc)*((jj)+jr)+((ii)+ir)] = neon_hsum_f32(Cv[jr][ir]);       \
+} while (0)
+
+/* NEON scalar cell: 1 weight row x 1 activation row (m%4 tail) */
+#define NEON_QGEMM_CELL_1x1(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d, C, ldc, ii, jj, k_blocks) do { \
+    float32x4_t acc = vdupq_n_f32(0);                                          \
+    for (int64_t l = 0; l < (k_blocks); ++l) {                                 \
+        float da = fp16_to_fp32(*QG_D_PTR((A)+(lda)*(ii)+l));                  \
+        float db = (B_d)[(ldb_d)*(jj) + l];                                    \
+        int8x16_t a_lo, a_hi, b_lo, b_hi;                                      \
+        load_qs_fn((A)+(lda)*(ii)+l, &a_lo, &a_hi);                            \
+        neon_q8_qs((B) + (ldb)*(jj) + l, &b_lo, &b_hi);                        \
+        acc = neon_vdot_accum(acc, a_lo, b_lo, a_hi, b_hi, vdupq_n_f32(db*da)); \
+    }                                                                          \
+    (C)[(ldc)*(jj)+(ii)] = neon_hsum_f32(acc);                                 \
+} while (0)
+
+/* NEON load helpers: split a block into lo/hi int8x16 halves */
+static inline void neon_q8_qs(const block_q8_0 *b, int8x16_t *lo, int8x16_t *hi) {
+    *lo = vld1q_s8(b->qs);
+    *hi = vld1q_s8(b->qs + 16);
+}
+
+static inline void neon_q4_qs(const block_q4_0 *b, int8x16_t *lo, int8x16_t *hi) {
+    uint8x16_t x = vld1q_u8(b->qs);
+    *lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(x, vdupq_n_u8(0x0f))), vdupq_n_s8(8));
+    *hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(x, 4)), vdupq_n_s8(8));
+}
+
+static inline void neon_q5_qs(const block_q5_0 *b, int8x16_t *lo, int8x16_t *hi) {
+    uint8x16_t x = vld1q_u8(b->qs);
+    uint8x16_t lo4 = vandq_u8(x, vdupq_n_u8(0x0f));
+    uint8x16_t hi4 = vshrq_n_u8(x, 4);
+    uint8x8_t qh = vld1_u8(b->qh);
+    uint8x8_t qh0 = vdup_n_u8(vget_lane_u8(qh, 0));
+    uint8x8_t qh1 = vdup_n_u8(vget_lane_u8(qh, 1));
+    uint8x8_t qh2 = vdup_n_u8(vget_lane_u8(qh, 2));
+    uint8x8_t qh3 = vdup_n_u8(vget_lane_u8(qh, 3));
+    static const uint8_t bitidx[8] __attribute__((aligned(16))) = {0,1,2,3,4,5,6,7};
+    uint8x8_t sh = vld1_u8(bitidx);
+    int8x8_t shs = vreinterpret_s8_u8(sh);
+    uint8x8_t b0 = vand_u8(vshl_u8(qh0, vneg_s8(shs)), vdup_n_u8(1));
+    uint8x8_t b1 = vand_u8(vshl_u8(qh1, vneg_s8(shs)), vdup_n_u8(1));
+    uint8x8_t b2 = vand_u8(vshl_u8(qh2, vneg_s8(shs)), vdup_n_u8(1));
+    uint8x8_t b3 = vand_u8(vshl_u8(qh3, vneg_s8(shs)), vdup_n_u8(1));
+    b0 = vshl_n_u8(b0, 4); b1 = vshl_n_u8(b1, 4);
+    b2 = vshl_n_u8(b2, 4); b3 = vshl_n_u8(b3, 4);
+    uint8x16_t bit_lo = vcombine_u8(b0, b1);
+    uint8x16_t bit_hi = vcombine_u8(b2, b3);
+    lo4 = vorrq_u8(lo4, bit_lo);
+    hi4 = vorrq_u8(hi4, bit_hi);
+    *lo = vsubq_s8(vreinterpretq_s8_u8(lo4), vdupq_n_s8(16));
+    *hi = vsubq_s8(vreinterpretq_s8_u8(hi4), vdupq_n_s8(16));
+}
+
+/* NEON QGEMM D implementation: 4x2 tiles (mirrors AVX2 QGEMM_D_IMPL) */
+#define NEON_QGEMM_D_IMPL(load_qs_fn, blk_t)                                    \
+static void sgemm_##load_qs_fn##_d(int m, int n, int k_blocks,                  \
+                                   const blk_t *A, int lda,                     \
+                                   const block_q8_0 *B, int ldb,                \
+                                   const float *B_d, int ldb_d,                 \
+                                   float *C, int ldc,                           \
+                                   int ith, int nth) {                          \
+    int64_t ytiles = m / 4;                                                     \
+    int64_t xtiles = n / 2;                                                     \
+    int64_t n_tail = n - xtiles * 2;                                            \
+    { int64_t xtiles_ext = xtiles + (n_tail > 0 ? 1 : 0);                       \
+      int64_t tiles = ytiles * xtiles_ext;                                      \
+      if (tiles > 0) {                                                          \
+          int64_t duty = (tiles + nth - 1) / nth;                               \
+          int64_t start = duty * ith;                                           \
+          int64_t end = start + duty;                                           \
+          if (end > tiles) end = tiles;                                         \
+          for (int64_t job = start; job < end; ++job) {                         \
+              int64_t ii = (job / xtiles_ext) * 4;                              \
+              int64_t xt = job % xtiles_ext;                                    \
+              if (xt < xtiles) {                                                \
+                  NEON_QGEMM_TILE_4x2(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d, \
+                                      C, ldc, ii, xt * 2, k_blocks);             \
+              } else {                                                          \
+                  NEON_QGEMM_TILE_4xN(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d, \
+                                      C, ldc, ii, xtiles * 2, n_tail, k_blocks); \
+              }                                                                 \
+          }                                                                     \
+      }                                                                         \
+    }                                                                           \
+    if (ith == 0) {                                                             \
+        for (int64_t ii = ytiles * 4; ii < m; ++ii) {                           \
+            for (int64_t jj = 0; jj < n; ++jj) {                                \
+                NEON_QGEMM_CELL_1x1(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d, \
+                                    C, ldc, ii, jj, k_blocks);                   \
+            }                                                                   \
+        }                                                                       \
+    }                                                                           \
+}
+
+NEON_QGEMM_D_IMPL(neon_q8_qs, block_q8_0)
+NEON_QGEMM_D_IMPL(neon_q4_qs, block_q4_0)
+NEON_QGEMM_D_IMPL(neon_q5_qs, block_q5_0)
+
+/* NEON QGEMM D4 implementation: 4x4 tiles */
+#define NEON_QGEMM_D4_IMPL(load_qs_fn, blk_t)                                  \
+static void sgemm_##load_qs_fn##_d4(int m, int n, int k_blocks,                \
+                                    const blk_t *A, int lda,                    \
+                                    const block_q8_0 *B, int ldb,               \
+                                    const float *B_d, int ldb_d,                \
+                                    float *C, int ldc,                          \
+                                    int ith, int nth) {                         \
+    int64_t ytiles = m / 4;                                                     \
+    int64_t xtiles = n / 4;                                                     \
+    int64_t n_tail = n - xtiles * 4;                                            \
+    { int64_t xtiles_ext = xtiles + (n_tail > 0 ? 1 : 0);                       \
+      int64_t tiles = ytiles * xtiles_ext;                                      \
+      if (tiles > 0) {                                                          \
+          int64_t duty = (tiles + nth - 1) / nth;                               \
+          int64_t start = duty * ith;                                           \
+          int64_t end = start + duty;                                           \
+          if (end > tiles) end = tiles;                                         \
+          for (int64_t job = start; job < end; ++job) {                         \
+              int64_t ii = (job / xtiles_ext) * 4;                              \
+              int64_t xt = job % xtiles_ext;                                    \
+              if (xt < xtiles) {                                                \
+                  NEON_QGEMM_TILE_4x4(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d, \
+                                      C, ldc, ii, xt * 4, k_blocks);             \
+              } else {                                                          \
+                  NEON_QGEMM_TILE_4xN(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d, \
+                                      C, ldc, ii, xtiles * 4, n_tail, k_blocks); \
+              }                                                                 \
+          }                                                                     \
+      }                                                                         \
+    }                                                                           \
+    if (ith == 0) {                                                             \
+        for (int64_t ii = ytiles * 4; ii < m; ++ii) {                           \
+            for (int64_t jj = 0; jj < n; ++jj) {                                \
+                NEON_QGEMM_CELL_1x1(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d, \
+                                    C, ldc, ii, jj, k_blocks);                   \
+            }                                                                   \
+        }                                                                       \
+    }                                                                           \
+}
+
+NEON_QGEMM_D4_IMPL(neon_q8_qs, block_q8_0)
+NEON_QGEMM_D4_IMPL(neon_q4_qs, block_q4_0)
+NEON_QGEMM_D4_IMPL(neon_q5_qs, block_q5_0)
+
+#endif /* __ARM_NEON */
 
 /* ============================================================
  * Optimized quantized GEMM using _mm_cvtph_ps for delta conversion.
@@ -1486,9 +1758,6 @@ static __m256i qg_q5_qs(const block_q5_0 *b) {
         _mm256_extracti128_si256(r1, 1), 1);
     return _mm256_or_si256(xs, qhbits);
 }
-
-/* Helper to get fp16 delta pointer from any block type */
-#define QG_D_PTR(b) ((const uint16_t*)&(b)->d)
 
 /* Compute one 4(weight rows) x 2(activation rows) tile at (ii,jj).
  * Shared by the main tiled loop and both tail loops below so there is
@@ -1768,7 +2037,7 @@ int picolm_sgemm(int m, int n, int k,
 #if defined(__F16C__)
         if (k % 8 == 0 && m % 4 == 0) { sgemm_f16_f32(m,n,k,(const uint16_t*)A,lda,(const float*)B,ldb,C,ldc,ith,nth); return 1; }
 #endif
-#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+#elif defined(__ARM_NEON)
         if (n < 4) return 0;
         if (k % 4 == 0 && m % 4 == 0) { sgemm_f16_f32(m,n,k,(const uint16_t*)A,lda,(const float*)B,ldb,C,ldc,ith,nth); return 1; }
 #elif defined(__ALTIVEC__)
@@ -1869,6 +2138,23 @@ int picolm_sgemm_d(int m, int n, int k_blocks,
     } else if (Atype == GGUF_TYPE_Q5_0) {
         if (n >= 4) { sgemm_qg_q5_qs_d4(m, n, k_blocks, (const block_q5_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth); return 1; }
         sgemm_qg_q5_qs_d(m, n, k_blocks, (const block_q5_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth);
+        return 1;
+    }
+#elif defined(__ARM_NEON)
+    /* NEON: use vdotq_s32 (DOTPROD) or vmmlaq_s32 (I8MM) with pre-converted deltas.
+     * Pi 4 (Cortex-A72) has DOTPROD but not I8MM.
+     * Prefer 4x4 tiles when n >= 4 for better cache reuse. */
+    if (Atype == GGUF_TYPE_Q8_0) {
+        if (n >= 4) { sgemm_neon_q8_qs_d4(m, n, k_blocks, (const block_q8_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth); return 1; }
+        sgemm_neon_q8_qs_d(m, n, k_blocks, (const block_q8_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth);
+        return 1;
+    } else if (Atype == GGUF_TYPE_Q4_0) {
+        if (n >= 4) { sgemm_neon_q4_qs_d4(m, n, k_blocks, (const block_q4_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth); return 1; }
+        sgemm_neon_q4_qs_d(m, n, k_blocks, (const block_q4_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth);
+        return 1;
+    } else if (Atype == GGUF_TYPE_Q5_0) {
+        if (n >= 4) { sgemm_neon_q5_qs_d4(m, n, k_blocks, (const block_q5_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth); return 1; }
+        sgemm_neon_q5_qs_d(m, n, k_blocks, (const block_q5_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth);
         return 1;
     }
 #endif
