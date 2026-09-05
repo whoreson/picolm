@@ -580,19 +580,20 @@ static int sgemm_q4x8_q8x4_avx2(
 
                 __m256i acc = _mm256_setzero_si256();
                 for (int w = 0; w < 4; w++) {
-                    const __m256i *wv_p, *wo_p;
-                    if (w < 2) { wv_p = &rl0 + w; wo_p = &ro0 + w; }
-                    else { wv_p = &rl2 + w-2; wo_p = &ro2 + w-2; }
-                    __m256i sy1 = _mm256_sign_epi8(*wv_p, as1);
-                    __m256i sy2 = _mm256_sign_epi8(*wo_p, as2);
+                    __m256i sy1, sy2;
+                    if (w == 0) { sy1 = _mm256_sign_epi8(rl0, as1); sy2 = _mm256_sign_epi8(ro0, as2); }
+                    else if (w == 1) { sy1 = _mm256_sign_epi8(rl1, as1); sy2 = _mm256_sign_epi8(ro1, as2); }
+                    else if (w == 2) { sy1 = _mm256_sign_epi8(rl2, as1); sy2 = _mm256_sign_epi8(ro2, as2); }
+                    else { sy1 = _mm256_sign_epi8(rl3, as1); sy2 = _mm256_sign_epi8(ro3, as2); }
                     acc = dpbusd_256(dpbusd_256(acc, axs1, sy1), axs2, sy2);
                 }
 
-                /* Horizontal sum of 8 int32 */
+                /* Horizontal sum of 8 int32 via stack array (no extract_epi32 runtime index) */
+                int32_t acc_s[8];
+                _mm256_storeu_si256((__m256i*)acc_s, acc);
                 float dsum = 0;
                 for (int i = 0; i < 8; i++) {
-                    int32_t v = _mm256_extract_epi32(acc, i);
-                    dsum += (float)v;
+                    dsum += (float)acc_s[i];
                 }
                 sum += dsum * wscale_v;
             }
