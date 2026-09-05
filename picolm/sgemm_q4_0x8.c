@@ -10,26 +10,33 @@
  *   Repack:  ~/llama.cpp/ggml/src/ggml-cpu/repack.cpp
  *            ggml_quantize_mat_q8_0_4x8_generic (~line 173)
  *
- * BUGS FIXED (2025-09-04, based on code analysis):
- *   0. Unterminated comment fragment (line 35) -- FIXED: removed orphan text
- *   1. g_nibble_lut broadcast -- FIXED: use _mm_set_epi8 + permute2f128
- *      (was _mm256_set1_epi64x of raw pointer, only loaded 8 of 16 entries)
- *   2. AVX2 acc[4] OOB write -- FIXED: expanded to acc[16], compute all 4
- *      activation row groups (was only computing 2, missing rows 2-3)
- *   3. AVX-512 rs unreplicated -- FIXED: use GGML_F32Cx16_REPEAT_LOAD pattern
- *      (was _mm512_castps256_ps512 leaving upper 256 bits undefined)
- *   4. Activation delta over-read -- FIXED: use _mm_loadl_epi64 for d[4]
- *      (was _mm_loadu_si128 reading 16 bytes from 8-byte field)
- *   5. _mm512_permute_ps wrong intrinsic -- FIXED: replaced with
- *      _mm512_cvtepi32_ps (llama.cpp style: convert all 16 int32 at once)
+ * BUGS FIXED:
+ *   0. Unterminated comment fragment -- FIXED
+ *   1. g_nibble_lut broadcast (only 8 of 16 entries) -- FIXED
+ *   2. AVX2 acc[4] OOB write -- FIXED (expanded to acc[16])
+ *   3. AVX-512 rs unreplicated -- FIXED (PICOLM_F32Cx16_REPEAT_LOAD)
+ *   4. Activation delta over-read (16 bytes from 8-byte d[4]) -- FIXED
+ *   5. _mm512_permute_ps wrong intrinsic -- FIXED (_mm_cvtepi32_ps)
+ *   7. dpbusd_512 missing abs(x) -- FIXED (sign trick for first operand)
+ *   8. quantize_mat_q8_0x4 non-interleaved -- FIXED (proper 8-byte chunk interleave)
+ *   9. AVX2 path row 2/3 copy-pasted from 0/1 -- FIXED (rewrote as GEMV)
+ *  10. Return value in wrong units (y vs anr) -- FIXED (return anr)
+ *  11. rb = rp*4+x*8 OOB -- FIXED (rb = rp*4, matching llama.cpp)
  *
- * REMAINING TODO:
- *   6. dpbusd accumulator straightening shuffles need verification against
- *      llama.cpp's mul_sum_i8_pairs_acc_int32x16. The blend/permute pattern
- *      was ported structurally but not exhaustively hand-traced.
+ * REMAINING BUGS (blocks enabling):
+ *   6. dpbusd accumulator straightening shuffles unverified against reference.
+ *      The blend/permute pattern (78, 204, 0xCCCC) was ported structurally
+ *      but not exhaustively hand-traced. Without this, even with all other
+ *      fixes, the kernel produces wrong output ("read more to identify the N"
+ *      instead of "Paris" for Q4_0_8_8 prefill).
  *
- * TO ENABLE (when bug #6 is verified):
- *   Set PICOLM_Q4_0x8_GEMM=1 in tensor.c to bypass vec_dot path.
+ *   Additional issues found during integration:
+ *   - Output store layout: llama.cpp writes C[nr][nc] with contiguous columns.
+ *     Our caller needs a transposed layout. Requires temp buffer + transpose.
+ *   - Parameter convention: llama.cpp's nr/nc map to our n_batch/d differently.
+ *     The dispatcher handles this swap.
+ *
+ * NOT WIRED INTO tensor.c dispatch. The vec_dot fallback remains active.
  *
  * Performance target: 2-3x over vec_dot Q4_0_8_8 path (18 tok/s -> 40+ tok/s)
  * ================================================================ */
@@ -45,19 +52,24 @@
  * Helpers: sign-trick dpbusd MAC
  * ============================================================ */
 /* 512-bit dpbusd MAC: sign trick + dpbusd or maddubs fallback.
+ * dpbusd/maddubs require the first operand to be UNSIGNED.
+ * The sign trick: |x| * sign(y,x) = x*y.
+ * sign(x,x) = |x| (absolute value), NOT x.
  * Note: _mm512_sign_epi8 is NOT available in gcc 15 headers.
  * We implement it via two _mm256_sign_epi8 + merge. */
 #if defined(__AVX512VNNI__) && defined(__AVX512BW__) && defined(__AVX512DQ__)
 static inline __m512i dpbusd_512(const __m512i acc, const __m512i x, const __m512i y) {
-    /* sign(x,x) = x (identity), sign(y,x) via 256-bit halves */
     __m256i xlo = _mm512_castsi512_si256(x);
     __m256i xhi = _mm512_extracti32x8_epi32(x, 1);
     __m256i ylo = _mm512_castsi512_si256(y);
     __m256i yhi = _mm512_extracti32x8_epi32(y, 1);
-    __m256i sylo = _mm256_sign_epi8(ylo, xlo);
-    __m256i syhi = _mm256_sign_epi8(yhi, xhi);
+    __m256i axlo = _mm256_sign_epi8(xlo, xlo);  /* |x| low */
+    __m256i axhi = _mm256_sign_epi8(xhi, xhi);  /* |x| high */
+    __m256i sylo = _mm256_sign_epi8(ylo, xlo);  /* sign(y,x) low */
+    __m256i syhi = _mm256_sign_epi8(yhi, xhi);  /* sign(y,x) high */
+    __m512i ax = _mm512_inserti32x8(_mm512_castsi256_si512(axlo), axhi, 1);
     __m512i sy = _mm512_inserti32x8(_mm512_castsi256_si512(sylo), syhi, 1);
-    return _mm512_dpbusd_epi32(acc, x, sy);
+    return _mm512_dpbusd_epi32(acc, ax, sy);
 }
 #elif defined(__AVX512BW__) && defined(__AVX512DQ__)
 /* Fallback: maddubs + madd (no VNNI) */
@@ -66,10 +78,13 @@ static inline __m512i dpbusd_512(const __m512i acc, const __m512i x, const __m51
     __m256i xhi = _mm512_extracti32x8_epi32(x, 1);
     __m256i ylo = _mm512_castsi512_si256(y);
     __m256i yhi = _mm512_extracti32x8_epi32(y, 1);
-    __m256i sylo = _mm256_sign_epi8(ylo, xlo);
-    __m256i syhi = _mm256_sign_epi8(yhi, xhi);
+    __m256i axlo = _mm256_sign_epi8(xlo, xlo);  /* |x| low */
+    __m256i axhi = _mm256_sign_epi8(xhi, xhi);  /* |x| high */
+    __m256i sylo = _mm256_sign_epi8(ylo, xlo);  /* sign(y,x) low */
+    __m256i syhi = _mm256_sign_epi8(yhi, xhi);  /* sign(y,x) high */
+    __m512i ax = _mm512_inserti32x8(_mm512_castsi256_si512(axlo), axhi, 1);
     __m512i sy = _mm512_inserti32x8(_mm512_castsi256_si512(sylo), syhi, 1);
-    const __m512i dot = _mm512_maddubs_epi16(x, sy);
+    const __m512i dot = _mm512_maddubs_epi16(ax, sy);
     return _mm512_add_epi32(acc, _mm512_madd_epi16(_mm512_set1_epi16(1), dot));
 }
 #endif
@@ -360,7 +375,7 @@ static int sgemm_q4x8_q8x4_avx512(
                     /* int32[4] -> float[4] -> broadcast to 16 lanes.
                      * FIX Bug #5: row0..row3 are __m256i with 4 int32 each.
                      * Convert to __m128 (4 FP32), broadcast to __m512 (16 lanes). */
-                    int rb = rp * 4 + x * 8;
+                    int rb = rp * 4;  /* llama.cpp: acc_rows[rp*4..rp*4+3] */
                     /* row0..row3 are __m256i with 4 int32 in the low lane.
                      * Extract low 128 bits -> convert 4 int32 to 4 FP32 -> broadcast to 16. */
                     __m512 r0f = _mm512_castps128_ps512(
@@ -387,18 +402,27 @@ static int sgemm_q4x8_q8x4_avx512(
                 }
             }
 
-            /* Store output */
+            /* Store output: C[nr][nc] = C[n_batch][d], bs = nc (= d)
+             * llama.cpp: s[(y*4+i)*bs + x*8]
+             * y = output row group (activation group)
+             * i = 0..15 (output row within tile)
+             * x = output col group (weight group)
+             * Each acc[i] = 16 FP32 values for output cols x*8..x*8+15 */
             for (int i = 0; i < 16; i++) {
                 _mm512_storeu_ps((float*)(s + ((y*4+i)*bs + x*8)), acc[i]);
             }
         }
     }
-    return y;
+    return anr;
 }
 #endif /* AVX512BW + AVX512DQ */
 
 /* ============================================================
- * AVX2 path: 16x8 output tiles
+ * AVX2 path: GEMV (single output row at a time)
+ * Processes 8 weight rows x 1 activation row per dpbusd call.
+ * This follows llama.cpp's approach: AVX2 has only gemv, not gemm,
+ * for Q4_0_8_8. The gemv is still faster than scalar vec_dot
+ * due to AVX2 maddubs throughput and LUT-based dequant.
  * ============================================================ */
 #if defined(__AVX2__) && defined(__F16C__)
 static int sgemm_q4x8_q8x4_avx2(
@@ -409,24 +433,31 @@ static int sgemm_q4x8_q8x4_avx2(
     const int nb = k / 32;
     const __m256i lut256 = build_lut256();
     const __m256i reorder = _mm256_set_epi32(3,2,1,0,7,6,5,4);
-    int y = 0;
     const int anr = nr - nr % 16;
     const int anc = nc - nc % 8;
 
-    for (; y < anr / 4; y += 4) {
-        const block_q8_0x4 *ap[4];
-        ap[0] = ap_start + (y * nb);
-        for (int i = 0; i < 3; i++) ap[i+1] = ap[i] + nb;
+    for (int y = 0; y < anr; y++) {
+        /* Activation row group: 4 rows starting at y, we process row y only */
+        int y_block = y / 4;
+        int y_off = y % 4;
+        const block_q8_0x4 *ap = ap_start + y_block * nb;
 
-        for (int x = 0; x < anc / 8; x++) {
-            const block_q4_0x8 *bp = bp_start + (x * nb);
+        /* Extract one activation row from the interleaved block_q8_0x4:
+         * row y_off's data is at qs offsets: for each 8-byte chunk,
+         * the y_off-th group of 8 bytes. I.e., qs[y_off*8 .. y_off*8+7],
+         * qs[(y_off*8+32) .. (y_off*8+39)], etc.
+         * This gives us 32 int8 values per block. */
 
-            /* FIX Bug #2: acc needs 16 entries (4 rp x 4 rows), not 4 */
-            __m256 acc[16];
-            for (int i = 0; i < 16; i++) acc[i] = _mm256_setzero_ps();
+        for (int x = 0; x < anc; x++) {
+            /* Output row y, column x (one activation row) */
+            int x_block = x / 8;
+            int x_off = x % 8;
+            const block_q4_0x8 *bp = bp_start + x_block * nb;
+
+            float sum = 0.0f;
 
             for (int b = 0; b < nb; b++) {
-                /* Load 8 rows of Q4_0 nibbles (1 block_q4_0x8) */
+                /* Load 8 rows of Q4_0 nibbles */
                 const __m256i w00 = _mm256_loadu_si256((const __m256i*)(bp[b].qs));
                 const __m256i w10 = _mm256_loadu_si256((const __m256i*)(bp[b].qs+32));
                 const __m256i w01 = _mm256_loadu_si256((const __m256i*)(bp[b].qs+64));
@@ -442,7 +473,7 @@ static int sgemm_q4x8_q8x4_avx2(
                 const __m256i wo1 = _mm256_blend_epi32(
                     _mm256_permutevar8x32_epi32(w01, reorder), w11, 240);
 
-                /* 4-bit -> 8-bit via LUT */
+                /* Dequant 4-bit -> 8-bit via LUT */
                 const __m256i rl0 = nibble_to_i8_256(we0, lut256);
                 const __m256i rl1 = nibble_to_i8_256(we1, lut256);
                 const __m256i rl2 = nibble_to_i8_hi_256(we0, lut256);
@@ -452,129 +483,94 @@ static int sgemm_q4x8_q8x4_avx2(
                 const __m256i ro2 = nibble_to_i8_hi_256(wo0, lut256);
                 const __m256i ro3 = nibble_to_i8_hi_256(wo1, lut256);
 
-                /* Shuffle patterns for dpbusd */
-                const __m256i rl0s1 = _mm256_shuffle_epi32(rl0, 136);
-                const __m256i rl1s1 = _mm256_shuffle_epi32(rl1, 136);
-                const __m256i rl2s1 = _mm256_shuffle_epi32(rl2, 136);
-                const __m256i rl3s1 = _mm256_shuffle_epi32(rl3, 136);
-                const __m256i ro0s1 = _mm256_shuffle_epi32(ro0, 136);
-                const __m256i ro1s1 = _mm256_shuffle_epi32(ro1, 136);
-                const __m256i ro2s1 = _mm256_shuffle_epi32(ro2, 136);
-                const __m256i ro3s1 = _mm256_shuffle_epi32(ro3, 136);
-                const __m256i rl0s2 = _mm256_shuffle_epi32(rl0, 221);
-                const __m256i rl1s2 = _mm256_shuffle_epi32(rl1, 221);
-                const __m256i rl2s2 = _mm256_shuffle_epi32(rl2, 221);
-                const __m256i rl3s2 = _mm256_shuffle_epi32(rl3, 221);
-                const __m256i ro0s2 = _mm256_shuffle_epi32(ro0, 221);
-                const __m256i ro1s2 = _mm256_shuffle_epi32(ro1, 221);
-                const __m256i ro2s2 = _mm256_shuffle_epi32(ro2, 221);
-                const __m256i ro3s2 = _mm256_shuffle_epi32(ro3, 221);
-
-                /* Weight column scales (8 rows, 16 bytes) */
+                /* Weight scale for row x_off (runtime index, need extract not shuffle) */
                 __m256 cs = fp16x8_to_fp32(bp[b].d);
+                float wscale[8];
+                _mm256_storeu_ps(wscale, cs);
+                float wscale_v = wscale[x_off];
 
-                /* Process 4 activation row groups (FIX Bug #2: was only 2) */
-                for (int rp = 0; rp < 4; rp++) {
-                    const block_q8_0x4 *a = ap[rp];
+                /* Extract one activation row from interleaved block:
+                 * row y_off is at byte offset y_off*8 in each 32-byte group.
+                 * We need 32 bytes total (4 groups of 8). */
+                const uint8_t *aqs = ap[b].qs;
+                __m128i c0 = _mm_loadl_epi64((const __m128i*)(aqs + 0*32 + y_off*8));
+                __m128i c1 = _mm_loadl_epi64((const __m128i*)(aqs + 1*32 + y_off*8));
+                __m128i c2 = _mm_loadl_epi64((const __m128i*)(aqs + 2*32 + y_off*8));
+                __m128i c3 = _mm_loadl_epi64((const __m128i*)(aqs + 3*32 + y_off*8));
+                /* Use _mm256_set_m128i (lo, hi) to avoid inserti128 immediate issues */
+                __m256i alo = _mm256_set_m128i(c1, c0);
+                __m256i ahi = _mm256_set_m128i(c3, c2);
+                __m256i a = _mm256_permute2x128_si256(alo, ahi, 0x20);
 
-                    /* Load Q8_0 activations (128 int8 = 4 x 32) */
-                    __m256i a0 = _mm256_loadu_si256((const __m256i*)(a[b].qs));
-                    __m256i a1 = _mm256_loadu_si256((const __m256i*)(a[b].qs+32));
-                    __m256i a2 = _mm256_loadu_si256((const __m256i*)(a[b].qs+64));
-                    __m256i a3 = _mm256_loadu_si256((const __m256i*)(a[b].qs+96));
+                /* Sign trick: |a| * sign(w,a) = a*w */
+                __m256i ax = _mm256_sign_epi8(a, a);
 
-                    /* Shuffle activations for dpbusd */
-                    const __m256i a0s1 = _mm256_shuffle_epi32(a0, 136);
-                    const __m256i a1s1 = _mm256_shuffle_epi32(a1, 136);
-                    const __m256i a2s1 = _mm256_shuffle_epi32(a2, 136);
-                    const __m256i a3s1 = _mm256_shuffle_epi32(a3, 136);
-                    const __m256i a0s2 = _mm256_shuffle_epi32(a0, 221);
-                    const __m256i a1s2 = _mm256_shuffle_epi32(a1, 221);
-                    const __m256i a2s2 = _mm256_shuffle_epi32(a2, 221);
-                    const __m256i a3s2 = _mm256_shuffle_epi32(a3, 221);
+                /* Shuffle for dpbusd: split 32 bytes into two 16-byte groups */
+                __m256i as1 = _mm256_shuffle_epi32(a, 136);
+                __m256i as2 = _mm256_shuffle_epi32(a, 221);
+                __m256i axs1 = _mm256_shuffle_epi32(ax, 136);
+                __m256i axs2 = _mm256_shuffle_epi32(ax, 221);
 
-                    /* dpbusd MAC: 4 activation x 4 weight x 2 shuffle */
-                    const __m256i zero = _mm256_setzero_si256();
-                    __m256i i00 = _mm256_add_epi32(
-                        dpbusd_256(dpbusd_256(dpbusd_256(dpbusd_256(zero,
-                            a3s1, rl3s1), a2s1, rl2s1), a1s1, rl1s1), a0s1, rl0s1),
-                        dpbusd_256(dpbusd_256(dpbusd_256(dpbusd_256(zero,
-                            a3s2, rl3s2), a2s2, rl2s2), a1s2, rl1s2), a0s2, rl0s2));
-                    __m256i i01 = _mm256_add_epi32(
-                        dpbusd_256(dpbusd_256(dpbusd_256(dpbusd_256(zero,
-                            a3s1, ro3s1), a2s1, ro2s1), a1s1, ro1s1), a0s1, ro0s1),
-                        dpbusd_256(dpbusd_256(dpbusd_256(dpbusd_256(zero,
-                            a3s2, ro3s2), a2s2, ro2s2), a1s2, ro1s2), a0s2, ro0s2));
-                    __m256i i10 = _mm256_add_epi32(
-                        dpbusd_256(dpbusd_256(dpbusd_256(dpbusd_256(zero,
-                            a3s1, rl3s1), a2s1, rl2s1), a1s1, rl1s1), a0s1, rl0s1),
-                        dpbusd_256(dpbusd_256(dpbusd_256(dpbusd_256(zero,
-                            a3s2, rl3s2), a2s2, rl2s2), a1s2, rl1s2), a0s2, rl0s2));
-                    __m256i i11 = _mm256_add_epi32(
-                        dpbusd_256(dpbusd_256(dpbusd_256(dpbusd_256(zero,
-                            a3s1, ro3s1), a2s1, ro2s1), a1s1, ro1s1), a0s1, ro0s1),
-                        dpbusd_256(dpbusd_256(dpbusd_256(dpbusd_256(zero,
-                            a3s2, ro3s2), a2s2, ro2s2), a1s2, ro1s2), a0s2, ro0s2));
-
-                    /* Straighten to 4 row vectors (4 int32 each) */
-                    __m256i row0 = _mm256_blend_epi32(i00, _mm256_shuffle_epi32(i01,78), 204);
-                    __m256i row1 = _mm256_blend_epi32(_mm256_shuffle_epi32(i00,78), i01, 204);
-                    __m256i row2 = _mm256_blend_epi32(i10, _mm256_shuffle_epi32(i11,78), 204);
-                    __m256i row3 = _mm256_blend_epi32(_mm256_shuffle_epi32(i10,78), i11, 204);
-
-                    /* Activation scales (FIX Bug #3 + #4): load 4 FP16, convert to 16 FP32 */
-                    __m128i rs_f16 = _mm_loadl_epi64((const __m128i*)a[b].d);
-                    __m256 rs = _mm256_cvtph_ps(rs_f16);
-
-                    /* Scale and accumulate: all 4 row groups */
-                    int rb = rp * 4 + x * 8;
-                    acc[rb+0] = _mm256_fmadd_ps(
-                        _mm256_cvtepi32_ps(row0), _mm256_mul_ps(cs,
-                        _mm256_shuffle_ps(rs,rs,0)), acc[rb+0]);
-                    acc[rb+1] = _mm256_fmadd_ps(
-                        _mm256_cvtepi32_ps(row1), _mm256_mul_ps(cs,
-                        _mm256_shuffle_ps(rs,rs,85)), acc[rb+1]);
-                    acc[rb+2] = _mm256_fmadd_ps(
-                        _mm256_cvtepi32_ps(row2), _mm256_mul_ps(cs,
-                        _mm256_shuffle_ps(rs,rs,170)), acc[rb+2]);
-                    acc[rb+3] = _mm256_fmadd_ps(
-                        _mm256_cvtepi32_ps(row3), _mm256_mul_ps(cs,
-                        _mm256_shuffle_ps(rs,rs,255)), acc[rb+3]);
+                __m256i acc = _mm256_setzero_si256();
+                for (int w = 0; w < 4; w++) {
+                    const __m256i *wv_p, *wo_p;
+                    if (w < 2) { wv_p = &rl0 + w; wo_p = &ro0 + w; }
+                    else { wv_p = &rl2 + w-2; wo_p = &ro2 + w-2; }
+                    __m256i sy1 = _mm256_sign_epi8(*wv_p, as1);
+                    __m256i sy2 = _mm256_sign_epi8(*wo_p, as2);
+                    acc = dpbusd_256(dpbusd_256(acc, axs1, sy1), axs2, sy2);
                 }
+
+                /* Horizontal sum of 8 int32 */
+                float dsum = 0;
+                for (int i = 0; i < 8; i++) {
+                    int32_t v = _mm256_extract_epi32(acc, i);
+                    dsum += (float)v;
+                }
+                sum += dsum * wscale_v;
             }
 
-            /* Store output (16 rows) */
-            for (int i = 0; i < 16; i++) {
-                _mm256_storeu_ps((float*)(s + ((y*4+i)*bs + x*8)), acc[i]);
-            }
+            /* Activation scale for row y_off */
+            float ascale = fp16_to_fp32(ap[0].d[y_off]);
+            /* C[nr][nc] = C[n_batch][d], bs = nc = d
+             * y = token index (row in C), x = weight row index (col in C) */
+            s[y * bs + x] = sum * ascale;
         }
     }
-    return y;
+    return anr;
 }
 #endif /* AVX2 + F16C */
 
 /* ============================================================
  * Top-level dispatcher
- * ============================================================ */
-int sgemm_q4_0x8_q8_0x4(int m, int n, int k,
+ * ============================================================
+ * llama.cpp convention: C[nr][nc] = A[nr][k] @ B[nc][k]^T
+ *   nr = activation rows (= n_batch, tokens)
+ *   nc = weight rows (= d, model dim)
+ *   k = inner dimension (aligned to 32)
+ *   vx = weights in block_q4_0x8[nc/8][k/32]
+ *   vy = activations in block_q8_0x4[nr/4][k/32]
+ *   bs = nc (= d, output stride)
+ */
+int sgemm_q4_0x8_q8_0x4(int nr, int nc, int k,
         const void *vx, const void *vy, float *s, size_t bs)
 {
     const block_q4_0x8 *bp = (const block_q4_0x8 *)vx;
     const block_q8_0x4 *ap = (const block_q8_0x4 *)vy;
 
-    if (m < 16 || n < 8 || k % 32 != 0) return 0;
+    if (nc < 8 || nr < 4 || k % 32 != 0) return 0;
 
 #if defined(__AVX512BW__) && defined(__AVX512DQ__)
     {
-    int yd = sgemm_q4x8_q8x4_avx512(k, bp, ap, s, bs, m, n);
-    if (yd >= m) return 1;
+    int yd = sgemm_q4x8_q8x4_avx512(k, bp, ap, s, bs, nr, nc);
+    if (yd >= nr) return 1;
     }
 #endif
 
 #if defined(__AVX2__) && defined(__F16C__)
     {
-    int yd = sgemm_q4x8_q8x4_avx2(k, bp, ap, s, bs, m, n);
-    if (yd >= m) return 1;
+    int yd = sgemm_q4x8_q8x4_avx2(k, bp, ap, s, bs, nr, nc);
+    if (yd >= nr) return 1;
     }
 #endif
 
