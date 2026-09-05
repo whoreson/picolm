@@ -245,11 +245,12 @@ static int bpe_piece(qwen_enc_t *enc, const char *s, int n, int *out, int cap) {
 
 /* Check if a model should use the Qwen tokenizer */
 int qwen_tokenize_should_use(const model_t *m) {
-    /* Use Qwen tokenizer only for Qwen3/Qwen3.5 architectures.
-     * These have tok_tokens_data and tok_merges_data in the expected
-     * format. GPT-2 GGUF models use the legacy tokenizer_load path.
-     * Safetensors Qwen models also use this tokenizer. */
-    return m->config.is_qwen || m->from_safetensors;
+    /* Use Qwen tokenizer for Qwen3/Qwen3.5 architectures and GPT-2 models.
+     * Both use GPT-2 BPE tokenization with merges.
+     * Llama and other architectures may also have token_type metadata
+     * but should use the old tokenizer. Safetensors Qwen models also
+     * use this tokenizer (from_safetensors path). */
+    return m->config.is_qwen || m->config.is_gpt2 || m->from_safetensors;
 }
 
 /* Initialize the Qwen tokenizer from model data */
