@@ -2253,9 +2253,6 @@ void matmul_batch(float *out, const float *x, int n_batch,
             free(qbuf);
             return;
         }
-        /* malloc failed: fall through to the generic path below, which is
-         * WRONG for this interleaved layout -- but malloc failure at this
-         * size is already a bigger problem than a wrong matmul result. */
     }
 #endif /* PICOLM_AVX2 */
     /* Same idea, 4-row groups -- this is the format ARM NEON dotprod/SDOT
