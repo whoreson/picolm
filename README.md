@@ -30,7 +30,7 @@
 - MS-DOS (DJGPP) build target
 - GGUF split-file loader
 - Gemma-3n architecture support (works, but no SWE yet)
-- TurboQuant TQ4 KV cache (TQ3 does not work)
+- TurboQuant TQ3/TQ4 KV cache
 - Deterministic sign randomization for Walsh-Hadamard transform
 - `sgemm` tiled GEMM engine for F16/F32 matmuls
 - NEON acceleration for Q4_0, Q4_K, Q5_K, Q6_K, Q3_K, Q2_0, Q1_0 vec_dot paths
