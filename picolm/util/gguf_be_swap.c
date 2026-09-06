@@ -324,10 +324,12 @@ int main(int argc, char **argv) {
                 break;
             }
             case G_Q6_K: {
+                /* block_q6_K: ql[128] + qh[64] + scales[16] + d(F16) = 210 bytes
+                   d is at offset 208, NOT at offset 0! */
                 size_t nb = nrows * n / 256;
                 for (size_t b = 0; b < nb; b++) {
                     uint8_t *bl = ptr + b * BS_Q6K;
-                    ((uint16_t *)bl)[0] = swap16(((uint16_t *)bl)[0]);
+                    ((uint16_t *)(bl + 208))[0] = swap16(((uint16_t *)(bl + 208))[0]);
                 }
                 nswapped += (int)nb;
                 break;

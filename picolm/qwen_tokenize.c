@@ -263,7 +263,11 @@ int qwen_tokenize_init(qwen_enc_t *enc, const model_t *m) {
         return -1;
     }
 
-    /* Parse vocab strings from tok_tokens_data: [u64 len][bytes]... */
+    /* Parse vocab strings from tok_tokens_data.
+     * Two formats:
+     * - Safetensors: [u64 len][bytes]... (native endian, written by safetensors.c)
+     * - GGUF:         [u32_le len][bytes]... (raw GGUF string array, little-endian)
+     * GGUF strings are not necessarily aligned; read byte-by-byte. */
     {
         const uint8_t *pp = (const uint8_t *)m->tok_tokens_data;
         uint64_t nn = m->tok_n_tokens;
@@ -273,7 +277,16 @@ int qwen_tokenize_init(qwen_enc_t *enc, const model_t *m) {
         enc->vocab_len = (int *)malloc(nn * sizeof(int));
         if (!enc->vocab_len) return -1;
         for (uint64_t i = 0; i < nn; i++) {
-            uint64_t sl; memcpy(&sl, pp, 8); pp += 8;
+            uint32_t sl;
+            /* Both Safetensors and GGUF v3 use [u64 LE len][bytes] format.
+               GGUF v2 used [u32 LE len] but all current files are v3.
+               Read as LE u64 to work on both BE and LE architectures. */
+            uint32_t sl32 = (uint32_t)pp[0] | ((uint32_t)pp[1] << 8) |
+                            ((uint32_t)pp[2] << 16) | ((uint32_t)pp[3] << 24);
+            uint32_t sl32hi = (uint32_t)pp[4] | ((uint32_t)pp[5] << 8) |
+                              ((uint32_t)pp[6] << 16) | ((uint32_t)pp[7] << 24);
+            sl = (uint32_t)(sl32 | ((uint64_t)sl32hi << 32));
+            pp += 8;
             enc->vocab_len[i] = (int)sl;
             enc->vocab[i] = (const char *)pp;
             pp += sl;
@@ -315,8 +328,13 @@ int qwen_tokenize_init(qwen_enc_t *enc, const model_t *m) {
         uint32_t mm = mc - 1;
 
         for (int i = 0; i < enc->n_merges; i++) {
-            uint64_t l;
-            memcpy(&l, p, 8); p += 8;
+            /* GGUF v3: [u64 LE len][bytes]. Same format as vocab strings. */
+            uint32_t l32 = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+            uint32_t l32hi = (uint32_t)p[4] | ((uint32_t)p[5] << 8) |
+                             ((uint32_t)p[6] << 16) | ((uint32_t)p[7] << 24);
+            uint32_t l = (uint32_t)(l32 | ((uint64_t)l32hi << 32));
+            p += 8;
             const char *s = (const char *)p; p += l;
             int sp = -1;
             for (int j = 0; j < (int)l; j++) { if (s[j] == ' ') { sp = j; break; } }

@@ -327,10 +327,7 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
     int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1, jB=nB-(nB*sB-xt);
     int64_t nj=yt*nB, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
-    static char hsbuf[128];
-    unsigned long hba=((unsigned long)hsbuf+63)/64*64;
-    ((float *)hsbuf)[0]=1.0f;
-    v4sf z=vec_splat(vec_ld(0-hba,(float *)hba),0);
+    v4sf z; z=vec_ctf(vec_splat_u32(0),0);
     for (int64_t j=js;j<je;j++) {
         int64_t iib=(j%yt)*RM*BM, jb=j/yt;
         int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
@@ -386,10 +383,7 @@ static void sgemm_f16_f32_altivec(int m, int n, int k, const uint16_t *A, int ld
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
     int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1, jB=nB-(nB*sB-xt);
     int64_t nj=yt*nB, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
-    static char hsbuf[128];
-    unsigned long hba=((unsigned long)hsbuf+63)/64*64;
-    ((float *)hsbuf)[0]=1.0f;
-    v4sf z=vec_splat(vec_ld(0-hba,(float *)hba),0);
+    v4sf z; z=vec_ctf(vec_splat_u32(0),0);
     for (int64_t j=js;j<je;j++) {
         int64_t iib=(j%yt)*RM*BM, jb=j/yt;
         int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
@@ -459,10 +453,7 @@ static void sgemm_f16_f16_altivec(int m, int n, int k, const uint16_t *A, int ld
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
     int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1, jB=nB-(nB*sB-xt);
     int64_t nj=yt*nB, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
-    static char hsbuf[128];
-    unsigned long hba=((unsigned long)hsbuf+63)/64*64;
-    ((float *)hsbuf)[0]=1.0f;
-    v4sf z=vec_splat(vec_ld(0-hba,(float *)hba),0);
+    v4sf z; z=vec_ctf(vec_splat_u32(0),0);
     for (int64_t j=js;j<je;j++) {
         int64_t iib=(j%yt)*RM*BM, jb=j/yt;
         int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
