@@ -900,7 +900,7 @@ static void sgemm_f16_f16(int m, int n, int k, const uint16_t *A, int lda,
  * BF16 dequant: zero-extend 16-bit to 32-bit, shift left 16, reinterpret as float.
  * AVX-512: _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(...)))
  *   converts 8 bf16 -> 8 f32 (cvtepu16: 8x16->8x32 zero-extend)
- * AVX2:    _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(...)))
+ * AVX2:    _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(...), 16))
  *   converts 8 bf16 -> 8 f32 (pmovzxwd is AVX2)
  * ============================================================ */
 
@@ -952,7 +952,10 @@ static void sgemm_bf16_f32(int m, int n, int k, const uint16_t *A, int lda,
         }
     }
 }
-#undef SGEMM_KN; #undef SGEMM_RM; #undef SGEMM_RN; #undef SGEMM_BN
+#undef SGEMM_KN
+#undef SGEMM_RM
+#undef SGEMM_RN
+#undef SGEMM_BN
 
 static void sgemm_bf16_bf16(int m, int n, int k, const uint16_t *A, int lda,
                              const uint16_t *B, int ldb, float *C, int ldc,
@@ -1006,7 +1009,10 @@ static void sgemm_bf16_bf16(int m, int n, int k, const uint16_t *A, int lda,
         }
     }
 }
-#undef SGEMM_KN; #undef SGEMM_RM; #undef SGEMM_RN; #undef SGEMM_BN
+#undef SGEMM_KN
+#undef SGEMM_RM
+#undef SGEMM_RN
+#undef SGEMM_BN
 
 #elif defined(__AVX__) || defined(__AVX2__)
 #if defined(__FMA__)
@@ -1040,7 +1046,7 @@ static void sgemm_bf16_f32(int m, int n, int k, const uint16_t *A, int lda,
                     __m256 Av[SGEMM_RM];
                     for(int c=0;c<RM;c++) {
                         __m128i raw = _mm_loadu_si128((__m128i*)(A+lda*(ii+c)+l));
-                        Av[c] = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw)));
+                        Av[c] = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw), 16));
                     }
                     for(int r=0;r<RN;r++) { __m256 Bv=_mm256_loadu_ps(B+ldb*(jj+r)+l);
                         for(int c=0;c<RM;c++) Cv[r][c]=SGEMM_FMA(Av[c],Bv,Cv[r][c]); }
@@ -1058,7 +1064,7 @@ static void sgemm_bf16_f32(int m, int n, int k, const uint16_t *A, int lda,
                 for (int64_t l=0;l<k;l+=KN)
                     for(int c=0;c<RM;c++) {
                         __m128i raw = _mm_loadu_si128((__m128i*)(A+lda*(ii+c)+l));
-                        __m256 Av = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw)));
+                        __m256 Av = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw), 16));
                         Cv[c]=SGEMM_FMA(Av,_mm256_loadu_ps(B+ldb*jj+l),Cv[c]);
                     }
                 for(int c=0;c<RM;c++) {
@@ -1071,7 +1077,10 @@ static void sgemm_bf16_f32(int m, int n, int k, const uint16_t *A, int lda,
         }
     }
 }
-#undef SGEMM_KN; #undef SGEMM_RM; #undef SGEMM_RN; #undef SGEMM_BN
+#undef SGEMM_KN
+#undef SGEMM_RM
+#undef SGEMM_RN
+#undef SGEMM_BN
 
 static void sgemm_bf16_bf16(int m, int n, int k, const uint16_t *A, int lda,
                              const uint16_t *B, int ldb, float *C, int ldc,
@@ -1099,11 +1108,11 @@ static void sgemm_bf16_bf16(int m, int n, int k, const uint16_t *A, int lda,
                     __m256 Av[SGEMM_RM];
                     for(int c=0;c<RM;c++) {
                         __m128i raw = _mm_loadu_si128((__m128i*)(A+lda*(ii+c)+l));
-                        Av[c] = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw)));
+                        Av[c] = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw), 16));
                     }
                     for(int r=0;r<RN;r++) {
                         __m128i raw = _mm_loadu_si128((__m128i*)(B+ldb*(jj+r)+l));
-                        __m256 Bv = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw)));
+                        __m256 Bv = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw), 16));
                         for(int c=0;c<RM;c++) Cv[r][c]=SGEMM_FMA(Av[c],Bv,Cv[r][c]);
                     }
                 }
@@ -1120,9 +1129,9 @@ static void sgemm_bf16_bf16(int m, int n, int k, const uint16_t *A, int lda,
                 for (int64_t l=0;l<k;l+=KN)
                     for(int c=0;c<RM;c++) {
                         __m128i raw_a = _mm_loadu_si128((__m128i*)(A+lda*(ii+c)+l));
-                        __m256 Av = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw_a)));
+                        __m256 Av = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw_a), 16));
                         __m128i raw_b = _mm_loadu_si128((__m128i*)(B+ldb*jj+l));
-                        __m256 Bv = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw_b)));
+                        __m256 Bv = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(raw_b), 16));
                         Cv[c]=SGEMM_FMA(Av,Bv,Cv[c]);
                     }
                 for(int c=0;c<RM;c++) {
@@ -1136,7 +1145,10 @@ static void sgemm_bf16_bf16(int m, int n, int k, const uint16_t *A, int lda,
     }
 }
 #undef SGEMM_FMA
-#undef SGEMM_KN; #undef SGEMM_RM; #undef SGEMM_RN; #undef SGEMM_BN
+#undef SGEMM_KN
+#undef SGEMM_RM
+#undef SGEMM_RN
+#undef SGEMM_BN
 #endif /* AVX2 F16C chain */
 
 /* ============================================================
@@ -1240,7 +1252,8 @@ static void sgemm_##load_fn(int m, int n, int k_blocks,                         
         for (int64_t bi=0; bi<BM*RM; bi+=RM) {                                 \
             int64_t ii=iib+bi;                                                 \
             for (int64_t jj=jj0; jj<jj1; jj+=RN) {                             \
-                __m256 Cv[RN][RM] = {};                                        \
+                __m256 Cv[RN][RM];                                             \
+                for (int64_t _cv_r=0; _cv_r<RN; ++_cv_r) for (int64_t _cv_c=0; _cv_c<RM; ++_cv_c) Cv[_cv_r][_cv_c] = _mm256_setzero_ps(); \
                 for (int64_t l=0; l<k_blocks; ++l) {                           \
                     __m256i a0=load_fn(A+lda*(ii+0)+l);                        \
                     __m256i a1=load_fn(A+lda*(ii+1)+l);                        \
@@ -1280,7 +1293,8 @@ static void sgemm_##load_fn(int m, int n, int k_blocks,                         
                         C[ldc*(jj+jr)+(ii+ir)]=q8_hsum_f32(Cv[jr][ir]);        \
             }                                                                   \
             for (int64_t jj=jj1; jj<jj2; ++jj) {                               \
-                __m256 Cv[RM] = {};                                            \
+                __m256 Cv[RM];                                                 \
+                for (int64_t _cv_c=0; _cv_c<RM; ++_cv_c) Cv[_cv_c] = _mm256_setzero_ps(); \
                 for (int64_t l=0; l<k_blocks; ++l) {                           \
                     __m256i a0=load_fn(A+lda*(ii+0)+l);                        \
                     __m256i a1=load_fn(A+lda*(ii+1)+l);                        \
@@ -1713,6 +1727,9 @@ static __m256 qg_updot(__m256i u, __m256i s) {
 
 /* Horizontal sum __m256 -> float (reuse q8_hsum_f32) */
 /* q8_hsum_f32 already defined above */
+
+/* Helper to get fp16 delta pointer from any block type */
+#define QG_D_PTR(b) ((const uint16_t*)&(b)->d)
 
 /* Pack 4x uint16 deltas into uint64 for _mm_cvtph_ps (little-endian) */
 static inline uint64_t qg_pack4_d(uint16_t d0, uint16_t d1, uint16_t d2, uint16_t d3) {

@@ -222,7 +222,7 @@ static char *apply_chat_template(const char *model_path, const char *raw_prompt)
     if (strstr(lower, "gemma")) {
         prefix = tmpl_gemma_prefix;
         suffix = tmpl_gemma_suffix;
-    } else if (strstr(lower, "qwen") || strstr(lower, "smollm") && strstr(lower, "instruct")) {
+    } else if (strstr(lower, "qwen") || (strstr(lower, "smollm") && strstr(lower, "instruct"))) {
         prefix = tmpl_chatml_prefix;
         suffix = tmpl_chatml_suffix;
     } else {

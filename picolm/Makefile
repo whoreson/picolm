@@ -43,7 +43,7 @@ endif
 # Source files and corresponding .o files
 # model.c has been split into modular files
 MODEL_SRCS = model_core.c model_attention.c model_moe.c model_gemma3n.c model_ssm.c model_kv_cache.c model_gguf.c
-SRCS    = picolm.c $(MODEL_SRCS) tensor.c quant.c sgemm.c tokenizer.c qwen_tokenize.c sampler.c grammar.c cJSON.c server.c csafetensors.c json.c safetensors.c
+SRCS    = picolm.c $(MODEL_SRCS) tensor.c quant.c sgemm.c sgemm_q4_0x8.c tokenizer.c qwen_tokenize.c sampler.c grammar.c cJSON.c server.c csafetensors.c json.c safetensors.c
 OBJS    = $(SRCS:.c=.o)
 TARGET  = picolm
 
