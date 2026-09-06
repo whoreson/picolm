@@ -1848,6 +1848,16 @@ static float *model_forward_gpt2(model_t *m, int token, int pos) {
                 quantize_row_q8_0(k_ptr, key_pos, kv_dim);
             } else if (s->kv_type_k == KV_CACHE_Q4_0) {
                 quantize_row_q4_0(k_ptr, key_pos, kv_dim);
+            } else if (s->kv_type_k == KV_CACHE_TQ3) {
+                for (int h = 0; h < n_heads; h++) {
+                    quantize_row_tq3(k_ptr + h * head_dim,
+                        key_pos + h * s->kv_head_stride_k, head_dim);
+                }
+            } else if (s->kv_type_k == KV_CACHE_TQ4) {
+                for (int h = 0; h < n_heads; h++) {
+                    quantize_row_tq4(k_ptr + h * head_dim,
+                        key_pos + h * s->kv_head_stride_k, head_dim);
+                }
             } else {
                 /* FP16 */
                 uint16_t *kf = (uint16_t *)key_pos;
@@ -1871,6 +1881,16 @@ static float *model_forward_gpt2(model_t *m, int token, int pos) {
                 quantize_row_q8_0(v_ptr, val_pos, kv_dim);
             } else if (s->kv_type_v == KV_CACHE_Q4_0) {
                 quantize_row_q4_0(v_ptr, val_pos, kv_dim);
+            } else if (s->kv_type_v == KV_CACHE_TQ3) {
+                for (int h = 0; h < n_heads; h++) {
+                    quantize_row_tq3(v_ptr + h * head_dim,
+                        val_pos + h * s->kv_head_stride_v, head_dim);
+                }
+            } else if (s->kv_type_v == KV_CACHE_TQ4) {
+                for (int h = 0; h < n_heads; h++) {
+                    quantize_row_tq4(v_ptr + h * head_dim,
+                        val_pos + h * s->kv_head_stride_v, head_dim);
+                }
             } else {
                 uint16_t *vf = (uint16_t *)val_pos;
 #ifdef PICOLM_FP16_HW
@@ -1882,6 +1902,13 @@ static float *model_forward_gpt2(model_t *m, int token, int pos) {
 #else
                 for (int d = 0; d < kv_dim; d++) vf[d] = fp32_to_fp16(v_ptr[d]);
 #endif
+            }
+        }
+
+        /* Rotate Q for TQ4 KV cache (WHT forward, block=32) */
+        if (s->kv_type_k == KV_CACHE_TQ4) {
+            for (int h = 0; h < n_heads; h++) {
+                picolm_hadamard_transform(q_ptr + h * head_dim, head_dim, TQ4_BLOCK_SIZE);
             }
         }
 
@@ -3054,6 +3081,16 @@ static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_to
                     quantize_row_q8_0(k_batch + bi * kv_dim, kp, kv_dim);
                 } else if (s->kv_type_k == KV_CACHE_Q4_0) {
                     quantize_row_q4_0(k_batch + bi * kv_dim, kp, kv_dim);
+                } else if (s->kv_type_k == KV_CACHE_TQ3) {
+                    for (int hkv = 0; hkv < n_heads; hkv++) {
+                        quantize_row_tq3(k_batch + bi * kv_dim + hkv * head_dim,
+                            kp + hkv * s->kv_head_stride_k, head_dim);
+                    }
+                } else if (s->kv_type_k == KV_CACHE_TQ4) {
+                    for (int hkv = 0; hkv < n_heads; hkv++) {
+                        quantize_row_tq4(k_batch + bi * kv_dim + hkv * head_dim,
+                            kp + hkv * s->kv_head_stride_k, head_dim);
+                    }
                 } else {
                     uint16_t *kf = (uint16_t *)kp;
                     for (int d2 = 0; d2 < kv_dim; d2++) kf[d2] = fp32_to_fp16(k_batch[bi * kv_dim + d2]);
@@ -3062,9 +3099,29 @@ static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_to
                     quantize_row_q8_0(v_batch + bi * kv_dim, vp, kv_dim);
                 } else if (s->kv_type_v == KV_CACHE_Q4_0) {
                     quantize_row_q4_0(v_batch + bi * kv_dim, vp, kv_dim);
+                } else if (s->kv_type_v == KV_CACHE_TQ3) {
+                    for (int hkv = 0; hkv < n_heads; hkv++) {
+                        quantize_row_tq3(v_batch + bi * kv_dim + hkv * head_dim,
+                            vp + hkv * s->kv_head_stride_v, head_dim);
+                    }
+                } else if (s->kv_type_v == KV_CACHE_TQ4) {
+                    for (int hkv = 0; hkv < n_heads; hkv++) {
+                        quantize_row_tq4(v_batch + bi * kv_dim + hkv * head_dim,
+                            vp + hkv * s->kv_head_stride_v, head_dim);
+                    }
                 } else {
                     uint16_t *vf = (uint16_t *)vp;
                     for (int d2 = 0; d2 < kv_dim; d2++) vf[d2] = fp32_to_fp16(v_batch[bi * kv_dim + d2]);
+                }
+            }
+        }
+
+        /* Rotate Q for TQ4 KV cache (WHT forward, block=32) */
+        if (s->kv_type_k == KV_CACHE_TQ4) {
+            for (int bi = 0; bi < n_tokens; bi++) {
+                float *q_pos = xb2_batch + bi * dim;
+                for (int h = 0; h < n_heads; h++) {
+                    picolm_hadamard_transform(q_pos + h * head_dim, head_dim, TQ4_BLOCK_SIZE);
                 }
             }
         }
