@@ -285,7 +285,8 @@ int qwen_tokenize_init(qwen_enc_t *enc, const model_t *m) {
                             ((uint32_t)pp[2] << 16) | ((uint32_t)pp[3] << 24);
             uint32_t sl32hi = (uint32_t)pp[4] | ((uint32_t)pp[5] << 8) |
                               ((uint32_t)pp[6] << 16) | ((uint32_t)pp[7] << 24);
-            sl = (uint32_t)(sl32 | ((uint64_t)sl32hi << 32));
+            uint64_t sl64 = (uint64_t)sl32 | ((uint64_t)sl32hi << 32);
+            sl = (uint32_t)sl64;
             pp += 8;
             enc->vocab_len[i] = (int)sl;
             enc->vocab[i] = (const char *)pp;
@@ -333,7 +334,8 @@ int qwen_tokenize_init(qwen_enc_t *enc, const model_t *m) {
                            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
             uint32_t l32hi = (uint32_t)p[4] | ((uint32_t)p[5] << 8) |
                              ((uint32_t)p[6] << 16) | ((uint32_t)p[7] << 24);
-            uint32_t l = (uint32_t)(l32 | ((uint64_t)l32hi << 32));
+            uint64_t l64 = (uint64_t)l32 | ((uint64_t)l32hi << 32);
+            uint32_t l = (uint32_t)l64;
             p += 8;
             const char *s = (const char *)p; p += l;
             int sp = -1;

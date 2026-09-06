@@ -58,8 +58,8 @@ enum {
 #define BS_Q2K    84
 #define BS_Q5_0   22
 #define BS_Q5_1   24
-#define BS_Q4X4   18
-#define BS_Q4X8   144
+#define BS_Q4X4   72    /* block_q4_0x4: d[4](8) + qs[64](64) = 72 bytes */
+#define BS_Q4X8   144   /* block_q4_0x8: d[8](16) + qs[128](128) = 144 bytes */
 
 #define MAX_TENSORS 8192
 
@@ -257,26 +257,35 @@ int main(int argc, char **argv) {
                 break;
             }
             case G_Q4_1: {
+                /* block_q4_1: uint16_t d + uint16_t m + uint8_t qs[16] = 20 bytes
+                   Both d (offset 0) and m (offset 2) are FP16 and need swapping. */
                 size_t nb = nrows * n / 32;
                 for (size_t b = 0; b < nb; b++) {
                     uint8_t *bl = ptr + b * BS_Q4_1;
                     ((uint16_t *)bl)[0] = swap16(((uint16_t *)bl)[0]);
-                }
-                nswapped += (int)nb;
-                break;
-            }
-            case G_Q4_0X4: {
-                size_t nb = nrows * n / 32;
-                for (size_t b = 0; b < nb; b++) {
-                    uint8_t *bl = ptr + b * BS_Q4X4;
-                    for (int i = 0; i < 2; i++)
-                        ((uint16_t *)bl)[i] = swap16(((uint16_t *)bl)[i]);
+                    ((uint16_t *)bl)[1] = swap16(((uint16_t *)bl)[1]);
                 }
                 nswapped += (int)(nb * 2);
                 break;
             }
+            case G_Q4_0X4: {
+                /* block_q4_0x4: uint16_t d[4] + uint8_t qs[64] = 72 bytes
+                   Each block covers 4 rows x 32 values = 128 values.
+                   All 4 FP16 deltas need swapping. */
+                size_t nb = nrows * n / 128;
+                for (size_t b = 0; b < nb; b++) {
+                    uint8_t *bl = ptr + b * BS_Q4X4;
+                    for (int i = 0; i < 4; i++)
+                        ((uint16_t *)bl)[i] = swap16(((uint16_t *)bl)[i]);
+                }
+                nswapped += (int)(nb * 4);
+                break;
+            }
             case G_Q4_0X8: {
-                size_t nb = nrows * n / 32;
+                /* block_q4_0x8: uint16_t d[8] + uint8_t qs[128] = 144 bytes
+                   Each block covers 8 rows x 32 values = 256 values.
+                   All 8 FP16 deltas need swapping. */
+                size_t nb = nrows * n / 256;
                 for (size_t b = 0; b < nb; b++) {
                     uint8_t *bl = ptr + b * BS_Q4X8;
                     for (int i = 0; i < 8; i++)
@@ -363,12 +372,15 @@ int main(int argc, char **argv) {
                 break;
             }
             case G_Q5_1: {
+                /* block_q5_1: uint16_t d + uint16_t m + uint8_t qh[4] + uint8_t qs[16] = 24 bytes
+                   Both d (offset 0) and m (offset 2) are FP16 and need swapping. */
                 size_t nb = nrows * n / 32;
                 for (size_t b = 0; b < nb; b++) {
                     uint8_t *bl = ptr + b * BS_Q5_1;
                     ((uint16_t *)bl)[0] = swap16(((uint16_t *)bl)[0]);
+                    ((uint16_t *)bl)[1] = swap16(((uint16_t *)bl)[1]);
                 }
-                nswapped += (int)nb;
+                nswapped += (int)(nb * 2);
                 break;
             }
         }
