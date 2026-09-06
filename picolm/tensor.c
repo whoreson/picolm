@@ -1392,9 +1392,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
         /* If allocation failed, fall through to generic path */
     }
 
-    /* Tiled GEMM fast path for F32/F16 weights.
-     * Much faster than vec_dot gemv for large matrices because
-     * the activation vector is reused across tiles. */
+    /* F32/F16 tiled GEMM. jR<0 clamp + simple block indexing (no super-blocks). */
     if (picolm_sgemm(d, 1, n, wptr, n, x, n, out, d, qtype, GGUF_TYPE_F32, 0, 1)) {
         return;
     }
@@ -2283,14 +2281,8 @@ void matmul_batch(float *out, const float *x, int n_batch,
      * Much faster than per-row gemv because activation tokens are
      * reused across weight tiles.
      * picolm_sgemm handles: F32xF32, F16xF32, F16xF16, Q8_0xQ8_0 (ARM NEON too). */
-    if (picolm_sgemm(d, n_batch, n, wptr, n, x, n, out, d, qtype, GGUF_TYPE_F32, 0, n_threads)) {
-        if (getenv("PICOLM_DISPATCH")) {
-            fprintf(stderr, "DISPATCH matmul_batch: d=%d n=%d batch=%d qtype=%d -> SGEMM\n", d, n, n_batch, qtype);
-        }
+    if (picolm_sgemm(d, n_batch, n, wptr, n, x, n, out, d, qtype, GGUF_TYPE_F32, 0, 1)) {
         return;
-    }
-    if (getenv("PICOLM_DISPATCH")) {
-        fprintf(stderr, "DISPATCH matmul_batch: d=%d n=%d batch=%d qtype=%d -> vec_dot\n", d, n, n_batch, qtype);
     }
 
 #if defined(PICOLM_AVX2)

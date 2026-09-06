@@ -57,14 +57,12 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
                            int ith, int nth) {
     const int64_t KN=F32_KN, RM=F32_RM, RN=F32_RN, BN=F32_BN;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
-    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
-    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1, jB=nB-(nB*sB-xt);
-    int64_t nj=yt*nB, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
+    int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js;j<je;j++) {
         int64_t iib=(j%yt)*RM*BM, jb=j/yt;
-        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
-        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);
-        int64_t jj1=jj2<jR*RN?jj2:jR*RN;
+        int64_t jj0=jb*RN, jj2=jj0+RN; if(jj2>n)jj2=n;
+        int64_t jj1=(jb<jR)?jj2:jj0;
         for (int64_t bi=0;bi<BM*RM;bi+=RM) {
             int64_t ii=iib+bi;
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
@@ -127,14 +125,12 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
                            int ith, int nth) {
     const int64_t KN=F32_KN, RM=F32_RM, RN=F32_RN, BN=F32_BN;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
-    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
-    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1, jB=nB-(nB*sB-xt);
-    int64_t nj=yt*nB, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
+    int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js;j<je;j++) {
         int64_t iib=(j%yt)*RM*BM, jb=j/yt;
-        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
-        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);
-        int64_t jj1=jj2<jR*RN?jj2:jR*RN;
+        int64_t jj0=jb*RN, jj2=jj0+RN; if(jj2>n)jj2=n;
+        int64_t jj1=(jb<jR)?jj2:jj0;
         for (int64_t bi=0;bi<BM*RM;bi+=RM) {
             int64_t ii=iib+bi;
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
@@ -195,14 +191,12 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
                            int ith, int nth) {
     const int64_t KN=F32_KN, RM=F32_RM, RN=F32_RN, BN=F32_BN;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
-    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
-    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1, jB=nB-(nB*sB-xt);
-    int64_t nj=yt*nB, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
+    int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js;j<je;j++) {
         int64_t iib=(j%yt)*RM*BM, jb=j/yt;
-        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
-        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);
-        int64_t jj1=jj2<jR*RN?jj2:jR*RN;
+        int64_t jj0=jb*RN, jj2=jj0+RN; if(jj2>n)jj2=n;
+        int64_t jj1=(jb<jR)?jj2:jj0;
         for (int64_t bi=0;bi<BM*RM;bi+=RM) {
             int64_t ii=iib+bi;
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
@@ -256,14 +250,12 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
                            int ith, int nth) {
     const int64_t KN=F32_KN, RM=F32_RM, RN=F32_RN, BN=F32_BN;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
-    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
-    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1, jB=nB-(nB*sB-xt);
-    int64_t nj=yt*nB, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
+    int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js;j<je;j++) {
         int64_t iib=(j%yt)*RM*BM, jb=j/yt;
-        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
-        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);
-        int64_t jj1=jj2<jR*RN?jj2:jR*RN;
+        int64_t jj0=jb*RN, jj2=jj0+RN; if(jj2>n)jj2=n;
+        int64_t jj1=(jb<jR)?jj2:jj0;
         for (int64_t bi=0;bi<BM*RM;bi+=RM) {
             int64_t ii=iib+bi;
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
@@ -324,15 +316,13 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
                            int ith, int nth) {
     const int64_t KN=F32_KN, RM=F32_RM, RN=F32_RN, BN=F32_BN;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
-    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
-    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1, jB=nB-(nB*sB-xt);
-    int64_t nj=yt*nB, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
+    int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     v4sf z; z=vec_ctf(vec_splat_u32(0),0);
     for (int64_t j=js;j<je;j++) {
         int64_t iib=(j%yt)*RM*BM, jb=j/yt;
-        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
-        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);
-        int64_t jj1=jj2<jR*RN?jj2:jR*RN;
+        int64_t jj0=jb*RN, jj2=jj0+RN; if(jj2>n)jj2=n;
+        int64_t jj1=(jb<jR)?jj2:jj0;
         for (int64_t bi=0;bi<BM*RM;bi+=RM) {
             int64_t ii=iib+bi;
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
@@ -380,15 +370,13 @@ static void sgemm_f16_f32_altivec(int m, int n, int k, const uint16_t *A, int ld
 #define F16F32_BN 24
     const int64_t KN=F16F32_KN, RM=F16F32_RM, RN=F16F32_RN, BN=F16F32_BN;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
-    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
-    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1, jB=nB-(nB*sB-xt);
-    int64_t nj=yt*nB, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
+    int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     v4sf z; z=vec_ctf(vec_splat_u32(0),0);
     for (int64_t j=js;j<je;j++) {
         int64_t iib=(j%yt)*RM*BM, jb=j/yt;
-        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
-        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);
-        int64_t jj1=jj2<jR*RN?jj2:jR*RN;
+        int64_t jj0=jb*RN, jj2=jj0+RN; if(jj2>n)jj2=n;
+        int64_t jj1=(jb<jR)?jj2:jj0;
         for (int64_t bi=0;bi<BM*RM;bi+=RM) {
             int64_t ii=iib+bi;
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
@@ -450,15 +438,13 @@ static void sgemm_f16_f16_altivec(int m, int n, int k, const uint16_t *A, int ld
 #define F16F16_BN 24
     const int64_t KN=F16F16_KN, RM=F16F16_RM, RN=F16F16_RN, BN=F16F16_BN;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
-    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
-    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1, jB=nB-(nB*sB-xt);
-    int64_t nj=yt*nB, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
+    int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     v4sf z; z=vec_ctf(vec_splat_u32(0),0);
     for (int64_t j=js;j<je;j++) {
         int64_t iib=(j%yt)*RM*BM, jb=j/yt;
-        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
-        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);
-        int64_t jj1=jj2<jR*RN?jj2:jR*RN;
+        int64_t jj0=jb*RN, jj2=jj0+RN; if(jj2>n)jj2=n;
+        int64_t jj1=(jb<jR)?jj2:jj0;
         for (int64_t bi=0;bi<BM*RM;bi+=RM) {
             int64_t ii=iib+bi;
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
@@ -533,15 +519,13 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
                            int ith, int nth) {
     const int64_t RM=F32_RM, RN=F32_RN, BN=F32_BN;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
-    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
-    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1, jB=nB-(nB*sB-xt);
-    int64_t nj=yt*nB, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
+    int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     const vlen_t vlmax=__riscv_vsetvlmax_e32m4();
     for (int64_t j=js;j<je;j++) {
         int64_t iib=(j%yt)*RM*BM, jb=j/yt;
-        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
-        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);
-        int64_t jj1=jj2<jR*RN?jj2:jR*RN;
+        int64_t jj0=jb*RN, jj2=jj0+RN; if(jj2>n)jj2=n;
+        int64_t jj1=(jb<jR)?jj2:jj0;
         for (int64_t bi=0;bi<BM*RM;bi+=RM) {
             int64_t ii=iib+bi;
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
@@ -594,14 +578,12 @@ static void sgemm_f16_f32(int m, int n, int k, const uint16_t *A, int lda,
 #define SGEMM_BN 12
     const int64_t KN=16, RM=4, RN=6, BN=12;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
-    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
-    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1, jB=nB-(nB*sB-xt);
-    int64_t nj=yt*nB, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
+    int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js;j<je;j++) {
         int64_t iib=(j%yt)*RM*BM, jb=j/yt;
-        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
-        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);
-        int64_t jj1=jj2<jR*RN?jj2:jR*RN;
+        int64_t jj0=jb*RN, jj2=jj0+RN; if(jj2>n)jj2=n;
+        int64_t jj1=(jb<jR)?jj2:jj0;
         for (int64_t bi=0;bi<BM*RM;bi+=RM) {
             int64_t ii=iib+bi;
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
@@ -642,14 +624,12 @@ static void sgemm_f16_f32(int m, int n, int k, const uint16_t *A, int lda,
 #define SGEMM_BN 24
     const int64_t KN=8, RM=4, RN=3, BN=24;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
-    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
-    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1, jB=nB-(nB*sB-xt);
-    int64_t nj=yt*nB, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
+    int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js;j<je;j++) {
         int64_t iib=(j%yt)*RM*BM, jb=j/yt;
-        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
-        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);
-        int64_t jj1=jj2<jR*RN?jj2:jR*RN;
+        int64_t jj0=jb*RN, jj2=jj0+RN; if(jj2>n)jj2=n;
+        int64_t jj1=(jb<jR)?jj2:jj0;
         for (int64_t bi=0;bi<BM*RM;bi+=RM) {
             int64_t ii=iib+bi;
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
@@ -695,14 +675,12 @@ static void sgemm_f16_f32(int m, int n, int k, const uint16_t *A, int lda,
 #define SGEMM_BN 12
     const int64_t KN=4, RM=4, RN=6, BN=12;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
-    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
-    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1, jB=nB-(nB*sB-xt);
-    int64_t nj=yt*nB, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
+    int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js;j<je;j++) {
         int64_t iib=(j%yt)*RM*BM, jb=j/yt;
-        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
-        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);
-        int64_t jj1=jj2<jR*RN?jj2:jR*RN;
+        int64_t jj0=jb*RN, jj2=jj0+RN; if(jj2>n)jj2=n;
+        int64_t jj1=(jb<jR)?jj2:jj0;
         for (int64_t bi=0;bi<BM*RM;bi+=RM) {
             int64_t ii=iib+bi;
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
@@ -742,14 +720,12 @@ static void sgemm_f16_f16(int m, int n, int k, const uint16_t *A, int lda,
 #define SGEMM_BN 12
     const int64_t KN=16, RM=4, RN=6, BN=12;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
-    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
-    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1, jB=nB-(nB*sB-xt);
-    int64_t nj=yt*nB, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
+    int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js;j<je;j++) {
         int64_t iib=(j%yt)*RM*BM, jb=j/yt;
-        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
-        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);
-        int64_t jj1=jj2<jR*RN?jj2:jR*RN;
+        int64_t jj0=jb*RN, jj2=jj0+RN; if(jj2>n)jj2=n;
+        int64_t jj1=(jb<jR)?jj2:jj0;
         for (int64_t bi=0;bi<BM*RM;bi+=RM) {
             int64_t ii=iib+bi;
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
@@ -789,14 +765,12 @@ static void sgemm_f16_f16(int m, int n, int k, const uint16_t *A, int lda,
 #define SGEMM_BN 24
     const int64_t KN=8, RM=4, RN=3, BN=24;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
-    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
-    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1, jB=nB-(nB*sB-xt);
-    int64_t nj=yt*nB, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
+    int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js;j<je;j++) {
         int64_t iib=(j%yt)*RM*BM, jb=j/yt;
-        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
-        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);
-        int64_t jj1=jj2<jR*RN?jj2:jR*RN;
+        int64_t jj0=jb*RN, jj2=jj0+RN; if(jj2>n)jj2=n;
+        int64_t jj1=(jb<jR)?jj2:jj0;
         for (int64_t bi=0;bi<BM*RM;bi+=RM) {
             int64_t ii=iib+bi;
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
@@ -842,14 +816,12 @@ static void sgemm_f16_f16(int m, int n, int k, const uint16_t *A, int lda,
 #define SGEMM_BN 12
     const int64_t KN=8, RM=4, RN=6, BN=12;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
-    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
-    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1, jB=nB-(nB*sB-xt);
-    int64_t nj=yt*nB, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
+    int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js;j<je;j++) {
         int64_t iib=(j%yt)*RM*BM, jb=j/yt;
-        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
-        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);
-        int64_t jj1=jj2<jR*RN?jj2:jR*RN;
+        int64_t jj0=jb*RN, jj2=jj0+RN; if(jj2>n)jj2=n;
+        int64_t jj1=(jb<jR)?jj2:jj0;
         for (int64_t bi=0;bi<BM*RM;bi+=RM) {
             int64_t ii=iib+bi;
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
@@ -905,14 +877,12 @@ static void sgemm_bf16_f32(int m, int n, int k, const uint16_t *A, int lda,
 #define SGEMM_BN 12
     const int64_t KN=16, RM=4, RN=6, BN=12;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
-    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
-    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1, jB=nB-(nB*sB-xt);
-    int64_t nj=yt*nB, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
+    int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js;j<je;j++) {
         int64_t iib=(j%yt)*RM*BM, jb=j/yt;
-        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
-        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);
-        int64_t jj1=jj2<jR*RN?jj2:jR*RN;
+        int64_t jj0=jb*RN, jj2=jj0+RN; if(jj2>n)jj2=n;
+        int64_t jj1=(jb<jR)?jj2:jj0;
         for (int64_t bi=0;bi<BM*RM;bi+=RM) {
             int64_t ii=iib+bi;
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
@@ -957,14 +927,12 @@ static void sgemm_bf16_bf16(int m, int n, int k, const uint16_t *A, int lda,
 #define SGEMM_BN 12
     const int64_t KN=16, RM=4, RN=6, BN=12;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
-    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
-    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1, jB=nB-(nB*sB-xt);
-    int64_t nj=yt*nB, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
+    int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js;j<je;j++) {
         int64_t iib=(j%yt)*RM*BM, jb=j/yt;
-        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
-        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);
-        int64_t jj1=jj2<jR*RN?jj2:jR*RN;
+        int64_t jj0=jb*RN, jj2=jj0+RN; if(jj2>n)jj2=n;
+        int64_t jj1=(jb<jR)?jj2:jj0;
         for (int64_t bi=0;bi<BM*RM;bi+=RM) {
             int64_t ii=iib+bi;
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
@@ -1020,14 +988,12 @@ static void sgemm_bf16_f32(int m, int n, int k, const uint16_t *A, int lda,
 #define SGEMM_BN 24
     const int64_t KN=8, RM=4, RN=3, BN=24;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
-    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
-    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1, jB=nB-(nB*sB-xt);
-    int64_t nj=yt*nB, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
+    int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js;j<je;j++) {
         int64_t iib=(j%yt)*RM*BM, jb=j/yt;
-        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
-        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);
-        int64_t jj1=jj2<jR*RN?jj2:jR*RN;
+        int64_t jj0=jb*RN, jj2=jj0+RN; if(jj2>n)jj2=n;
+        int64_t jj1=(jb<jR)?jj2:jj0;
         for (int64_t bi=0;bi<BM*RM;bi+=RM) {
             int64_t ii=iib+bi;
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
@@ -1082,14 +1048,12 @@ static void sgemm_bf16_bf16(int m, int n, int k, const uint16_t *A, int lda,
 #define SGEMM_BN 24
     const int64_t KN=8, RM=4, RN=3, BN=24;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
-    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
-    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1, jB=nB-(nB*sB-xt);
-    int64_t nj=yt*nB, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
+    int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js;j<je;j++) {
         int64_t iib=(j%yt)*RM*BM, jb=j/yt;
-        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
-        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);
-        int64_t jj1=jj2<jR*RN?jj2:jR*RN;
+        int64_t jj0=jb*RN, jj2=jj0+RN; if(jj2>n)jj2=n;
+        int64_t jj1=(jb<jR)?jj2:jj0;
         for (int64_t bi=0;bi<BM*RM;bi+=RM) {
             int64_t ii=iib+bi;
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
@@ -1231,15 +1195,12 @@ static void sgemm_##load_fn(int m, int n, int k_blocks,                         
                             int ith, int nth) {                                 \
     const int64_t RM=4, RN=2, BN=12;                                            \
     int64_t BM = (m >= RM*4*(int64_t)nth) ? 4 : (m%8==0) ? 2 : 1;              \
-    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);                     \
-    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1;               \
-    int64_t jB=nB-(nB*sB-xt), nj=yt*nB;                                        \
-    int64_t js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);                        \
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;                     \
+    int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);              \
     for (int64_t j=js; j<je; j++) {                                            \
         int64_t iib=(j%yt)*RM*BM, jb=j/yt;                                     \
-        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);             \
-        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);             \
-        int64_t jj1=jj2<jR*RN?jj2:jR*RN;                                       \
+        int64_t jj0=jb*RN, jj2=jj0+RN; if(jj2>n)jj2=n;                         \
+        int64_t jj1=(jb<jR)?jj2:jj0;                                           \
         for (int64_t bi=0; bi<BM*RM; bi+=RM) {                                 \
             int64_t ii=iib+bi;                                                 \
             for (int64_t jj=jj0; jj<jj1; jj+=RN) {                             \
@@ -1364,15 +1325,12 @@ static void sgemm_q8_q8_neon(int m, int n, int k_blocks,
                               int ith, int nth) {
     const int64_t RM=4, RN=3, BN=12;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
-    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n);
-    int64_t nB=xt<BN?1:(xt+BN/2)/BN, sB=xt%nB==0?xt/nB:xt/nB+1;
-    int64_t jB=nB-(nB*sB-xt), nj=yt*nB;
-    int64_t js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
+    int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js; j<je; j++) {
         int64_t iib=(j%yt)*RM*BM, jb=j/yt;
-        int64_t jr0=bloc_pos(jb,jB,sB), jrN=bloc_pos(jb+1,jB,sB);
-        int64_t jj0=bloc_pos(jr0,jR,RN), jj2=bloc_pos(jrN,jR,RN);
-        int64_t jj1=jj2<jR*RN?jj2:jR*RN;
+        int64_t jj0=jb*RN, jj2=jj0+RN; if(jj2>n)jj2=n;
+        int64_t jj1=(jb<jR)?jj2:jj0;
         for (int64_t bi=0; bi<BM*RM; bi+=RM) {
             int64_t ii=iib+bi;
             for (int64_t jj=jj0; jj<jj1; jj+=RN) {
