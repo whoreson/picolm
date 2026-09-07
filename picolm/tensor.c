@@ -2543,14 +2543,12 @@ void matmul_batch(float *out, const float *x, int n_batch,
     }
 #endif
 #if defined(__ARM_NEON)
-    /* NEON tiled GEMM with pre-converted deltas.
-     * On basic NEON (no DOTPROD/I8MM), the per-row vec_dot path is already
-     * quite efficient (2-block interleaved vmull_s8 + vpaddlq_s16). The tiled
-     * GEMM only helps when the tile overhead is amortized over a large batch.
-     * Threshold is high because 128-bit NEON can't match the per-row throughput. */
+    /* NEON tiled GEMM with pre-converted deltas (picolm_sgemm_d).
+     * Activation reuse across 4 weight rows per tile benefits even
+     * basic NEON (widen). Lower threshold to match AVX2 path. */
     if (have_qx && qx_d_buf && d >= 4 &&
         (qtype == GGUF_TYPE_Q8_0 || qtype == GGUF_TYPE_Q4_0 || qtype == GGUF_TYPE_Q5_0)) {
-        int min_batch = (qtype == GGUF_TYPE_Q8_0) ? 128 : 64;
+        int min_batch = (qtype == GGUF_TYPE_Q8_0) ? 16 : 4;
         if (n_batch >= min_batch) {
             int k_blocks = n / 32;
             int nth = pool_total_threads(1);

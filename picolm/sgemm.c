@@ -1389,6 +1389,17 @@ static void sgemm_q8_q8_neon(int m, int n, int k_blocks,
         }
     }
 }
+
+/* ARM NEON Q4_0 x Q8_0 GEMM (tinyBLAS_Q0_ARM port from llama.cpp) */
+static void sgemm_q4_q8_neon(int m, int n, int k_blocks,
+                              const block_q4_0 *A, int lda,
+                              const block_q8_0 *B, int ldb,
+                              float *C, int ldc, int ith, int nth);
+/* ARM NEON Q5_0 x Q8_0 GEMM */
+static void sgemm_q5_q8_neon(int m, int n, int k_blocks,
+                              const block_q5_0 *A, int lda,
+                              const block_q8_0 *B, int ldb,
+                              float *C, int ldc, int ith, int nth);
 #endif /* ARM_NEON */
 
 /* ============================================================
@@ -1651,6 +1662,141 @@ NEON_QGEMM_D4_IMPL(neon_q8_qs, block_q8_0)
 NEON_QGEMM_D4_IMPL(neon_q4_qs, block_q4_0)
 NEON_QGEMM_D4_IMPL(neon_q5_qs, block_q5_0)
 
+/* ARM NEON Q4_0 x Q8_0 GEMM (tinyBLAS_Q0_ARM<block_q4_0> port from llama.cpp) */
+static void sgemm_q4_q8_neon(int m, int n, int k_blocks,
+                              const block_q4_0 *A, int lda,
+                              const block_q8_0 *B, int ldb,
+                              float *C, int ldc, int ith, int nth) {
+    const int64_t RM=4, RN=3, BN=12;
+    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
+    int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    for (int64_t j=js; j<je; j++) {
+        int64_t iib=(j%yt)*RM*BM, jb=j/yt;
+        int64_t jj0=jb*RN, jj2=jj0+RN; if(jj2>n)jj2=n;
+        int64_t jj1=(jb<jR)?jj2:jj0;
+        for (int64_t bi=0; bi<BM*RM; bi+=RM) {
+            int64_t ii=iib+bi;
+            for (int64_t jj=jj0; jj<jj1; jj+=RN) {
+                float32x4_t Cv[RN][RM];
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=vdupq_n_f32(0);
+                for (int64_t l=0; l<k_blocks; ++l) {
+                    for (int64_t jr=0; jr<RN; ++jr) {
+                        const block_q8_0 *br=B+ldb*(jj+jr)+l;
+                        float32x4_t dr=vdupq_n_f32(fp16_to_fp32(br->d));
+                        int8x16_t blo=vld1q_s8(br->qs), bhi=vld1q_s8(br->qs+16);
+                        for (int64_t ir=0; ir<RM; ++ir) {
+                            const block_q4_0 *ar=(const block_q4_0*)A+lda*(ii+ir)+l;
+                            float32x4_t scale=vmulq_n_f32(dr,fp16_to_fp32(ar->d));
+                            int8x16_t alo, ahi; neon_q4_qs(ar, &alo, &ahi);
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+                            float32x4_t s=vmulq_f32(vcvtq_f32_s32(
+                                vmmlaq_s32(vmmlaq_s32(vdupq_n_s32(0),alo,blo),ahi,bhi)),scale);
+#else
+                            float32x4_t s=vmulq_f32(vcvtq_f32_s32(
+                                neon_vdot_32(alo,blo,ahi,bhi)),scale);
+#endif
+                            Cv[jr][ir]=vaddq_f32(Cv[jr][ir],s);
+                        }
+                    }
+                }
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++)
+                    C[ldc*(jj+r)+(ii+c)]=vaddvq_f32(Cv[r][c]);
+            }
+            for (int64_t jj=jj1; jj<jj2; ++jj) {
+                float32x4_t Cv[RM];
+                for(int c=0;c<RM;c++) Cv[c]=vdupq_n_f32(0);
+                for (int64_t l=0; l<k_blocks; ++l) {
+                    const block_q8_0 *br=B+ldb*jj+l;
+                    float32x4_t dr=vdupq_n_f32(fp16_to_fp32(br->d));
+                    int8x16_t blo=vld1q_s8(br->qs), bhi=vld1q_s8(br->qs+16);
+                    for (int64_t ir=0; ir<RM; ++ir) {
+                        const block_q4_0 *ar=(const block_q4_0*)A+lda*(ii+ir)+l;
+                        float32x4_t scale=vmulq_n_f32(dr,fp16_to_fp32(ar->d));
+                        int8x16_t alo, ahi; neon_q4_qs(ar, &alo, &ahi);
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+                        float32x4_t s=vmulq_f32(vcvtq_f32_s32(
+                            vmmlaq_s32(vmmlaq_s32(vdupq_n_s32(0),alo,blo),ahi,bhi)),scale);
+#else
+                        float32x4_t s=vmulq_f32(vcvtq_f32_s32(
+                            neon_vdot_32(alo,blo,ahi,bhi)),scale);
+#endif
+                        Cv[ir]=vaddq_f32(Cv[ir],s);
+                    }
+                }
+                for(int c=0;c<RM;c++) C[ldc*jj+(ii+c)]=vaddvq_f32(Cv[c]);
+            }
+        }
+    }
+}
+
+/* ARM NEON Q5_0 x Q8_0 GEMM */
+static void sgemm_q5_q8_neon(int m, int n, int k_blocks,
+                              const block_q5_0 *A, int lda,
+                              const block_q8_0 *B, int ldb,
+                              float *C, int ldc, int ith, int nth) {
+    const int64_t RM=4, RN=3, BN=12;
+    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
+    int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    for (int64_t j=js; j<je; j++) {
+        int64_t iib=(j%yt)*RM*BM, jb=j/yt;
+        int64_t jj0=jb*RN, jj2=jj0+RN; if(jj2>n)jj2=n;
+        int64_t jj1=(jb<jR)?jj2:jj0;
+        for (int64_t bi=0; bi<BM*RM; bi+=RM) {
+            int64_t ii=iib+bi;
+            for (int64_t jj=jj0; jj<jj1; jj+=RN) {
+                float32x4_t Cv[RN][RM];
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=vdupq_n_f32(0);
+                for (int64_t l=0; l<k_blocks; ++l) {
+                    for (int64_t jr=0; jr<RN; ++jr) {
+                        const block_q8_0 *br=B+ldb*(jj+jr)+l;
+                        float32x4_t dr=vdupq_n_f32(fp16_to_fp32(br->d));
+                        int8x16_t blo=vld1q_s8(br->qs), bhi=vld1q_s8(br->qs+16);
+                        for (int64_t ir=0; ir<RM; ++ir) {
+                            const block_q5_0 *ar=(const block_q5_0*)A+lda*(ii+ir)+l;
+                            float32x4_t scale=vmulq_n_f32(dr,fp16_to_fp32(ar->d));
+                            int8x16_t alo, ahi; neon_q5_qs(ar, &alo, &ahi);
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+                            float32x4_t s=vmulq_f32(vcvtq_f32_s32(
+                                vmmlaq_s32(vmmlaq_s32(vdupq_n_s32(0),alo,blo),ahi,bhi)),scale);
+#else
+                            float32x4_t s=vmulq_f32(vcvtq_f32_s32(
+                                neon_vdot_32(alo,blo,ahi,bhi)),scale);
+#endif
+                            Cv[jr][ir]=vaddq_f32(Cv[jr][ir],s);
+                        }
+                    }
+                }
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++)
+                    C[ldc*(jj+r)+(ii+c)]=vaddvq_f32(Cv[r][c]);
+            }
+            for (int64_t jj=jj1; jj<jj2; ++jj) {
+                float32x4_t Cv[RM];
+                for(int c=0;c<RM;c++) Cv[c]=vdupq_n_f32(0);
+                for (int64_t l=0; l<k_blocks; ++l) {
+                    const block_q8_0 *br=B+ldb*jj+l;
+                    float32x4_t dr=vdupq_n_f32(fp16_to_fp32(br->d));
+                    int8x16_t blo=vld1q_s8(br->qs), bhi=vld1q_s8(br->qs+16);
+                    for (int64_t ir=0; ir<RM; ++ir) {
+                        const block_q5_0 *ar=(const block_q5_0*)A+lda*(ii+ir)+l;
+                        float32x4_t scale=vmulq_n_f32(dr,fp16_to_fp32(ar->d));
+                        int8x16_t alo, ahi; neon_q5_qs(ar, &alo, &ahi);
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+                        float32x4_t s=vmulq_f32(vcvtq_f32_s32(
+                            vmmlaq_s32(vmmlaq_s32(vdupq_n_s32(0),alo,blo),ahi,bhi)),scale);
+#else
+                        float32x4_t s=vmulq_f32(vcvtq_f32_s32(
+                            neon_vdot_32(alo,blo,ahi,bhi)),scale);
+#endif
+                        Cv[ir]=vaddq_f32(Cv[ir],s);
+                    }
+                }
+                for(int c=0;c<RM;c++) C[ldc*jj+(ii+c)]=vaddvq_f32(Cv[c]);
+            }
+        }
+    }
+}
 #endif /* __ARM_NEON */
 
 /* ============================================================
@@ -2067,10 +2213,16 @@ int picolm_sgemm(int m, int n, int k,
 #if defined(__AVX2__) || defined(__AVX__)
             sgemm_q4_load_qs(m, n, k, (const block_q4_0*)A, lda, (const block_q8_0*)B, ldb, C, ldc, ith, nth);
             return 1;
+#elif defined(__ARM_NEON)
+            sgemm_q4_q8_neon(m, n, k, (const block_q4_0*)A, lda, (const block_q8_0*)B, ldb, C, ldc, ith, nth);
+            return 1;
 #endif
         } else if (Atype == GGUF_TYPE_Q5_0) {
 #if defined(__AVX2__) || defined(__AVX__)
             sgemm_q5_load_qs(m, n, k, (const block_q5_0*)A, lda, (const block_q8_0*)B, ldb, C, ldc, ith, nth);
+            return 1;
+#elif defined(__ARM_NEON)
+            sgemm_q5_q8_neon(m, n, k, (const block_q5_0*)A, lda, (const block_q8_0*)B, ldb, C, ldc, ith, nth);
             return 1;
 #endif
         }
