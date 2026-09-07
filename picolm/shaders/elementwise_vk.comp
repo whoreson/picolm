@@ -1,16 +1,19 @@
 #version 450
-// Elementwise operations: residual_add, silu_mul, rope_apply
-// 4 STORAGE_BUFFER bindings, 16-byte push constant
+// Elementwise operations: residual_add, silu_mul, rope_apply, f32_to_f16, sigmoid_mul
+// 4 STORAGE_BUFFER bindings, 20-byte push constant
 //
-// op=0: residual_add  bind0=a(ro), bind1=b(ro), bind2=out(rw)
-// op=1: silu_mul      bind0=gate(rw), bind1=up(ro), bind2=gate(rw, same buf as 0)
-// op=2: rope_apply    bind0=x(rw),   bind1=cos(ro), bind2=sin(ro)
+// op=0: residual_add    bind0=a(ro), bind1=b(ro), bind2=out(rw), bind3=unused
+// op=1: silu_mul        bind0=gate(rw), bind1=up(ro), bind2=gate(rw, same as 0), bind3=unused
+// op=2: rope_apply      bind0=x(rw), bind1=cos(ro), bind2=sin(ro), bind3=unused
+// op=3: f32_to_f16      bind0=src_f32(ro), bind1=unused, bind2=unused, bind3=dst_u32(rw)
+// op=4: sigmoid_mul     bind0=out(rw), bind1=gate(ro), bind2=unused, bind3=unused
 
 layout(local_size_x = 256) in;
 
 layout(set = 0, binding = 0) buffer B0 { float d0[]; };
 layout(set = 0, binding = 1) buffer B1 { float d1[]; };
 layout(set = 0, binding = 2) buffer B2 { float d2[]; };
+layout(set = 0, binding = 3) buffer B3 { uint d3[]; };
 
 layout(push_constant) uniform PC {
     int op;
@@ -19,30 +22,38 @@ layout(push_constant) uniform PC {
     int pad;
 } pc;
 
+uint f32tof16_bits(float v) {
+    // Reinterpret float bits as uint via floatBitsToInt + bitcast
+    // GLSL doesn't have uintBitsToUint, but we can use pack/unpack tricks
+    // or just do the math directly:
+    int iv = floatBitsToInt(v);
+    // bitcast int to uint: just reinterpret the bits
+    uint fv = bitfieldInsert(0u, uint(iv), 0, 32);
+    uint sign = (fv >> 16u) & 0x8000u;
+    uint exp = (fv >> 23u) & 0xffu;
+    uint frac = fv & 0x7fffffu;
+    if (exp == 0u) return sign;
+    if (exp == 0xffu) return sign | 0x7c00u;
+    int e = int(exp) - 127 + 15;
+    if (e <= 0) return sign;
+    if (e >= 31) return sign | 0x7c00u;
+    return sign | uint(e) << 10u | (frac >> 13u);
+}
+
 void main() {
     uint gid = gl_GlobalInvocationID.x;
 
     if (pc.op == 0) {
-        // residual_add: d2[i] = d0[i] + d1[i]
-        if (gid < uint(pc.n)) {
-            d2[gid] = d0[gid] + d1[gid];
-        }
+        if (gid < uint(pc.n)) d2[gid] = d0[gid] + d1[gid];
     } else if (pc.op == 1) {
-        // silu_mul: d0[i] = d0[i] * silu(d0[i]) * d1[i]  (in-place gate *= silu(gate) * up)
         if (gid < uint(pc.n)) {
             float g = d0[gid];
             d0[gid] = g * (g / (1.0 + exp(-g))) * d1[gid];
         }
     } else if (pc.op == 2) {
-        // rope_apply: rotate pairs in d0 using d1=cos, d2=sin
-        // x layout: [head0][2*half_dim], [head1][2*half_dim], ...
-        // Each thread handles one pair index across all heads
-        // pc.n = half_dim, pc.fp = n_heads (as float), pc.pad = rope_type
         uint hd2 = uint(pc.n);
         int n_heads = int(pc.fp);
-        int rope_type = pc.pad;
         int stride = 2 * int(hd2);
-
         if (gid < hd2) {
             for (int h = 0; h < n_heads; h++) {
                 int base = h * stride + 2 * int(gid);
@@ -54,5 +65,21 @@ void main() {
                 d0[base + 1] = x0 * s + x1 * c;
             }
         }
+    } else if (pc.op == 3) {
+        // F32->F16 pack: output as uint32 with 2 F16 per word
+        if (gid < uint(pc.n)) {
+            uint f16 = f32tof16_bits(d0[gid]);
+            uint word_idx = gid / 2u;
+            uint shift = (gid % 2u) * 16u;
+            // Each thread writes to a unique (word_idx, byte_lane) pair.
+            // Since threads 2k and 2k+1 write to the same word_idx but
+            // different 16-bit halves, we can use atomicOr safely.
+            atomicOr(d3[word_idx], f16 << shift);
+        }
+    } else if (pc.op == 4) {
+        if (gid < uint(pc.n)) {
+            d0[gid] *= 1.0 / (1.0 + exp(-d1[gid]));
+        }
     }
 }
+

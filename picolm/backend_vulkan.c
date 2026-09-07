@@ -129,6 +129,30 @@ static struct {
     VkDescriptorPool dpool_attn_prefill;
     VkDescriptorSet dset_attn_prefill;
 
+    // Q8_0 quantize pipeline (F32->Q8_0 on device)
+    VkShaderModule shader_quantize;
+    VkDescriptorSetLayout dsl_quantize;
+    VkPipelineLayout plyt_quantize;
+    VkPipeline pipe_quantize;
+    VkDescriptorPool dpool_quantize;
+    VkDescriptorSet dset_quantize;
+
+    // Q8_0 x Q8_0 matmul pipeline (pre-quantized activations)
+    VkShaderModule shader_q8q8;
+    VkDescriptorSetLayout dsl_q8q8;
+    VkPipelineLayout plyt_q8q8;
+    VkPipeline pipe_q8q8;
+    VkDescriptorPool dpool_q8q8;
+    VkDescriptorSet dset_q8q8;
+
+    // F16 pack pipeline (F32->F16 for KV cache store)
+    VkShaderModule shader_f16pack;
+    VkDescriptorSetLayout dsl_f16pack;
+    VkPipelineLayout plyt_f16pack;
+    VkPipeline pipe_f16pack;
+    VkDescriptorPool dpool_f16pack;
+    VkDescriptorSet dset_f16pack;
+
     VkCommandPool cpool;
     VkCommandBuffer cmd;       // Phase 1: single-command sync
     VkCommandBuffer cmd_nrm;   // RMSNorm host-facing
@@ -180,6 +204,8 @@ static struct {
     VkBuffer q8_xq_buf, q8_xd_buf;
     VkDeviceMemory q8_xq_mem, q8_xd_mem;
     size_t q8_xq_cap, q8_xd_cap;
+    /* Cached wrappers for q8 scratch */
+    void *q8_xq_d, *q8_xd_d;
 
     // Command caching for matmul
     picolm_gpu_tensor_t *bound_tensor;
@@ -605,7 +631,7 @@ int picolm_gpu_init(const int *devices, int count) {
     if (!build_pipeline(G.dev, 3, 20, G.shader, &G.dsl, &G.plyt, &G.pipe,
                         &G.dpool, &G.dset)) return 0;
 
-    // Optional: RMSNorm shader
+    // Optional: RMSNorm shader (push: int S, int D, float eps, int x_stride = 20 bytes)
     G.shader_nrm = load_spv(G.dev, "rmsnorm_vk.spv");
     if (G.shader_nrm) {
         if (!build_pipeline(G.dev, 3, 20, G.shader_nrm, &G.dsl_nrm, &G.plyt_nrm,
@@ -664,6 +690,39 @@ int picolm_gpu_init(const int *devices, int count) {
                             &G.plyt_attn_prefill, &G.pipe_attn_prefill, &G.dpool_attn_prefill,
                             &G.dset_attn_prefill)) {
             G.shader_attn_prefill = VK_NULL_HANDLE;
+        }
+    }
+
+    // Load Q8_0 quantize shader (F32->Q8_0 on device)
+    G.shader_quantize = load_spv(G.dev, "quantize_q8_vk.spv");
+    if (G.shader_quantize) {
+        // 3 buffers (x, qs, d), push: int I, int S, int pad = 12 bytes
+        if (!build_pipeline(G.dev, 3, 12, G.shader_quantize, &G.dsl_quantize,
+                            &G.plyt_quantize, &G.pipe_quantize, &G.dpool_quantize,
+                            &G.dset_quantize)) {
+            G.shader_quantize = VK_NULL_HANDLE;
+        }
+    }
+
+    // Load Q8_0 x Q8_0 matmul shader
+    G.shader_q8q8 = load_spv(G.dev, "q8_q8_matmul_vk.spv");
+    if (G.shader_q8q8) {
+        // 4 buffers (xq, xd, w, y), push: int I, int S, int O, int rowWords = 16 bytes
+        if (!build_pipeline(G.dev, 4, 16, G.shader_q8q8, &G.dsl_q8q8,
+                            &G.plyt_q8q8, &G.pipe_q8q8, &G.dpool_q8q8,
+                            &G.dset_q8q8)) {
+            G.shader_q8q8 = VK_NULL_HANDLE;
+        }
+    }
+
+    // Load F16 pack shader (F32->F16)
+    G.shader_f16pack = load_spv(G.dev, "elementwise_vk.spv");
+    // Reuse elementwise pipeline for f16 pack (op=3), but need 4 bindings
+    if (G.shader_f16pack) {
+        if (!build_pipeline(G.dev, 4, 20, G.shader_f16pack, &G.dsl_f16pack,
+                            &G.plyt_f16pack, &G.pipe_f16pack, &G.dpool_f16pack,
+                            &G.dset_f16pack)) {
+            G.shader_f16pack = VK_NULL_HANDLE;
         }
     }
 
@@ -728,6 +787,27 @@ void picolm_gpu_shutdown(void) {
     if (G.pipe_attn_prefill)  vkDestroyPipeline(G.dev, G.pipe_attn_prefill, NULL);
     if (G.plyt_attn_prefill)  vkDestroyPipelineLayout(G.dev, G.plyt_attn_prefill, NULL);
     if (G.shader_attn_prefill) vkDestroyShaderModule(G.dev, G.shader_attn_prefill, NULL);
+
+    if (G.dset_quantize)  vkFreeDescriptorSets(G.dev, G.dpool_quantize, 1, &G.dset_quantize);
+    if (G.dpool_quantize) vkDestroyDescriptorPool(G.dev, G.dpool_quantize, NULL);
+    if (G.dsl_quantize)   vkDestroyDescriptorSetLayout(G.dev, G.dsl_quantize, NULL);
+    if (G.pipe_quantize)  vkDestroyPipeline(G.dev, G.pipe_quantize, NULL);
+    if (G.plyt_quantize)  vkDestroyPipelineLayout(G.dev, G.plyt_quantize, NULL);
+    if (G.shader_quantize) vkDestroyShaderModule(G.dev, G.shader_quantize, NULL);
+
+    if (G.dset_q8q8)  vkFreeDescriptorSets(G.dev, G.dpool_q8q8, 1, &G.dset_q8q8);
+    if (G.dpool_q8q8) vkDestroyDescriptorPool(G.dev, G.dpool_q8q8, NULL);
+    if (G.dsl_q8q8)   vkDestroyDescriptorSetLayout(G.dev, G.dsl_q8q8, NULL);
+    if (G.pipe_q8q8)  vkDestroyPipeline(G.dev, G.pipe_q8q8, NULL);
+    if (G.plyt_q8q8)  vkDestroyPipelineLayout(G.dev, G.plyt_q8q8, NULL);
+    if (G.shader_q8q8) vkDestroyShaderModule(G.dev, G.shader_q8q8, NULL);
+
+    if (G.dset_f16pack)  vkFreeDescriptorSets(G.dev, G.dpool_f16pack, 1, &G.dset_f16pack);
+    if (G.dpool_f16pack) vkDestroyDescriptorPool(G.dev, G.dpool_f16pack, NULL);
+    if (G.dsl_f16pack)   vkDestroyDescriptorSetLayout(G.dev, G.dsl_f16pack, NULL);
+    if (G.pipe_f16pack)  vkDestroyPipeline(G.dev, G.pipe_f16pack, NULL);
+    if (G.plyt_f16pack)  vkDestroyPipelineLayout(G.dev, G.plyt_f16pack, NULL);
+    if (G.shader_f16pack) vkDestroyShaderModule(G.dev, G.shader_f16pack, NULL);
 
     if (G.cmd)   vkFreeCommandBuffers(G.dev, G.cpool, 1, &G.cmd);
     if (G.cmd_nrm) vkFreeCommandBuffers(G.dev, G.cpool, 1, &G.cmd_nrm);
@@ -1003,11 +1083,7 @@ static VkDescriptorBufferInfo desc_buf_info(const void *p);
 // RMSNorm: host-facing
 // ---------------------------------------------------------------------------
 
-typedef struct {
-    int S, D;
-    float eps;
-    int pad; // alignment padding to 20 bytes
-} PC_RmsNorm;
+// PC_RmsNorm replaced by inline struct in dispatch functions
 
 int picolm_gpu_rmsnorm(float *out, const float *x, const float *weight,
                         int dim, float eps, int device) {
@@ -1047,7 +1123,8 @@ int picolm_gpu_rmsnorm_batched(float *out, const float *x, const float *weight,
     vkCmdBindPipeline(G.cmd_nrm, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_nrm);
     vkCmdBindDescriptorSets(G.cmd_nrm, VK_PIPELINE_BIND_POINT_COMPUTE,
                             G.plyt_nrm, 0, 1, &G.dset_nrm, 0, NULL);
-    PC_RmsNorm pc = {S, dim, eps, 0};
+    typedef struct { int S, D; float eps; int x_stride; } PC_RmsNorm2;
+    PC_RmsNorm2 pc = {S, dim, eps, x_stride};
     vkCmdPushConstants(G.cmd_nrm, G.plyt_nrm, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd_nrm, (uint32_t)S, 1, 1);
@@ -1376,6 +1453,7 @@ int picolm_gpu_prealloc_q8(size_t mxq, size_t mxd, int device) {
     if (mxq > G.q8_xq_cap) {
         if (G.q8_xq_buf) { vkDestroyBuffer(G.dev, G.q8_xq_buf, NULL); G.q8_xq_buf = VK_NULL_HANDLE; }
         if (G.q8_xq_mem) { vkFreeMemory(G.dev, G.q8_xq_mem, NULL); G.q8_xq_mem = VK_NULL_HANDLE; }
+        if (G.q8_xq_d) { free(G.q8_xq_d); G.q8_xq_d = NULL; }
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
             .size = mxq, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
             .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
@@ -1386,10 +1464,12 @@ int picolm_gpu_prealloc_q8(size_t mxq, size_t mxd, int device) {
         if (vkAllocateMemory(G.dev, &ai, NULL, &G.q8_xq_mem) != VK_SUCCESS) return 0;
         vkBindBufferMemory(G.dev, G.q8_xq_buf, G.q8_xq_mem, 0);
         G.q8_xq_cap = mxq;
+        G.q8_xq_d = wrap_buf(G.q8_xq_buf, G.q8_xq_mem, 0, mxq);
     }
     if (mxd > G.q8_xd_cap) {
         if (G.q8_xd_buf) { vkDestroyBuffer(G.dev, G.q8_xd_buf, NULL); G.q8_xd_buf = VK_NULL_HANDLE; }
         if (G.q8_xd_mem) { vkFreeMemory(G.dev, G.q8_xd_mem, NULL); G.q8_xd_mem = VK_NULL_HANDLE; }
+        if (G.q8_xd_d) { free(G.q8_xd_d); G.q8_xd_d = NULL; }
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
             .size = mxd, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
             .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
@@ -1400,6 +1480,7 @@ int picolm_gpu_prealloc_q8(size_t mxq, size_t mxd, int device) {
         if (vkAllocateMemory(G.dev, &ai, NULL, &G.q8_xd_mem) != VK_SUCCESS) return 0;
         vkBindBufferMemory(G.dev, G.q8_xd_buf, G.q8_xd_mem, 0);
         G.q8_xd_cap = mxd;
+        G.q8_xd_d = wrap_buf(G.q8_xd_buf, G.q8_xd_mem, 0, mxd);
     }
     return 1;
 }
@@ -1444,6 +1525,57 @@ uint16_t *picolm_gpu_kv_v_dev(int d) { return (d==0&&G.kv_v_d)?(uint16_t*)G.kv_v
 // ---------------------------------------------------------------------------
 
 static int _matmul_dev_skip_cnt = 0;
+
+/* Device-native quantize F32->Q8_0. Dispatches quantize kernel on cmd_dev. */
+static int _quantize_dev(const float *x_dev, int I, int S) {
+    if (!G.shader_quantize) return 0;
+    int n_blocks = (I + 31) / 32;
+    int S_padded = (S + 15) & ~15;
+    size_t xq_bytes = (size_t)S_padded * I;     // int8 packed as uint32: S*I bytes
+    size_t xd_bytes = (size_t)S_padded * n_blocks * sizeof(float);
+    if (!picolm_gpu_prealloc_q8(xq_bytes, xd_bytes, 0)) return 0;
+
+    VkDescriptorBufferInfo bi[3] = {
+        desc_buf_info(x_dev),
+        desc_buf_info(G.q8_xq_d),
+        desc_buf_info(G.q8_xd_d)
+    };
+    wr_desc(G.dset_quantize, 3, bi);
+    typedef struct { int I, S, pad; } PC_Q;
+    PC_Q pc = {I, S, 0};
+    vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_quantize);
+    vkCmdBindDescriptorSets(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            G.plyt_quantize, 0, 1, &G.dset_quantize, 0, NULL);
+    vkCmdPushConstants(G.cmd_dev, G.plyt_quantize, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(pc), &pc);
+    vkCmdDispatch(G.cmd_dev, (uint32_t)n_blocks, (uint32_t)S, 1);
+    return 1;
+}
+
+/* Device-native Q8xQ8 matmul. Dispatches q8_q8 kernel on cmd_dev. */
+static int _q8q8_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, int S) {
+    if (!G.shader_q8q8) return 0;
+    int n_blocks = t->I / 32;
+    if (n_blocks < 1 || t->I % 32 != 0) return 0;
+
+    VkDescriptorBufferInfo bi[4] = {
+        desc_buf_info(G.q8_xq_d),   // xq (uint32-packed int8)
+        desc_buf_info(G.q8_xd_d),   // xd (float deltas)
+        {t->wbuf, 0, VK_WHOLE_SIZE}, // weights
+        desc_buf_info(y_dev)        // output
+    };
+    wr_desc(G.dset_q8q8, 4, bi);
+    typedef struct { int I, S, O, rowWords; } PC_Q8;
+    PC_Q8 pc = {t->I, S, t->O, (int)t->row_words};
+    vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_q8q8);
+    vkCmdBindDescriptorSets(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            G.plyt_q8q8, 0, 1, &G.dset_q8q8, 0, NULL);
+    vkCmdPushConstants(G.cmd_dev, G.plyt_q8q8, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(pc), &pc);
+    vkCmdDispatch(G.cmd_dev, (uint32_t)t->O, (uint32_t)S, 1);
+    return 1;
+}
+
 int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
                            int S, int device, int y_stride, int x_stride) {
     if (!G.ready || !t || device != 0 || S < 1) return 0;
@@ -1453,26 +1585,37 @@ int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_d
     }
     (void)x_stride; (void)y_stride;
     VkDescriptorBufferInfo xbi = desc_buf_info(x_dev), ybi = desc_buf_info(y_dev);
-    if (!xbi.buffer || !ybi.buffer) {
-        return 0;
-    }
-    VkDescriptorBufferInfo bi[3] = {xbi, {t->wbuf,0,VK_WHOLE_SIZE}, ybi};
-    wr_desc(G.dset, 3, bi);
-    /* Wait for prior fence before reusing cmd_dev */
+    if (!xbi.buffer || !ybi.buffer) return 0;
+
     vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     vkResetCommandBuffer(G.cmd_dev, 0);
     vkBeginCommandBuffer(G.cmd_dev, &begin);
-    vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
-    vkCmdBindDescriptorSets(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt, 0, 1, &G.dset, 0, NULL);
-    PC_Matmul pc = {t->qtype, S, t->I, t->O, (int)t->row_words};
-    vkCmdPushConstants(G.cmd_dev, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-    vkCmdDispatch(G.cmd_dev, (uint32_t)t->O, (uint32_t)S, 1);
+
+    int ok = 1;
+    // Q8_0 path: quantize F32->Q8 on device, then Q8xQ8 matmul
+    if (t->qtype == GGUF_TYPE_Q8_0 && G.shader_quantize && G.shader_q8q8) {
+        ok &= _quantize_dev(x_dev, t->I, S);
+        ok &= _q8q8_matmul_dev(t, y_dev, S);
+    }
+    // Fallback: scalar dequant matmul (existing shader)
+    if (!ok) {
+        VkDescriptorBufferInfo bi[3] = {xbi, {t->wbuf,0,VK_WHOLE_SIZE}, ybi};
+        wr_desc(G.dset, 3, bi);
+        vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
+        vkCmdBindDescriptorSets(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                G.plyt, 0, 1, &G.dset, 0, NULL);
+        PC_Matmul pc = {t->qtype, S, t->I, t->O, (int)t->row_words};
+        vkCmdPushConstants(G.cmd_dev, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, sizeof(pc), &pc);
+        vkCmdDispatch(G.cmd_dev, (uint32_t)t->O, (uint32_t)S, 1);
+    }
+
     vkEndCommandBuffer(G.cmd_dev);
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_dev};
     vkResetFences(G.dev, 1, &G.fence_dev);
     vkQueueSubmit(G.queue, 1, &si, G.fence_dev);
-    return 1;
+    return ok;
 }
 
 int picolm_gpu_matmul_dev_strided(picolm_gpu_tensor_t *t, float *y_dev,
@@ -1525,7 +1668,9 @@ int picolm_gpu_rmsnorm_batched_dev(float *out, const float *x, const float *weig
     vkBeginCommandBuffer(G.cmd_nrm, &begin);
     vkCmdBindPipeline(G.cmd_nrm, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_nrm);
     vkCmdBindDescriptorSets(G.cmd_nrm, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_nrm, 0, 1, &G.dset_nrm, 0, NULL);
-    PC_RmsNorm pc = {S, dim, eps, 0};
+    // Push constant layout: int S, int D, float eps, int x_stride = 20 bytes
+    typedef struct { int S, D; float eps; int x_stride; } PC_RmsNorm2;
+    PC_RmsNorm2 pc = {S, dim, eps, xs};
     vkCmdPushConstants(G.cmd_nrm, G.plyt_nrm, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd_nrm, (uint32_t)S, 1, 1);
     vkEndCommandBuffer(G.cmd_nrm);
@@ -1615,10 +1760,48 @@ int picolm_gpu_rope_apply_batched(float *x, int n_heads, int head_dim,
                                    const float *cos_tbl_base, const float *sin_tbl_base,
                                    int half_dim, int start_pos, int S,
                                    int rope_type, int device) {
-    /* Batched rope: not yet implemented, fall back */
-    (void)x; (void)n_heads; (void)head_dim; (void)cos_tbl_base; (void)sin_tbl_base;
-    (void)half_dim; (void)start_pos; (void)S; (void)rope_type; (void)device;
-    return 0;
+    if (!G.ready || !G.shader_elem || device != 0 || half_dim < 1 || S < 1) return 0;
+
+    // Batched rope: process each token sequentially, each with its own cos/sin offset
+    // cos/sin tables are [max_seq_len][half_dim], offset by start_pos+token_idx
+    for (int si = 0; si < S; si++) {
+        // Token si's x data at offset si * n_heads * head_dim
+        float *x_tok = (float *)((uintptr_t)x + (uintptr_t)(size_t)si * n_heads * head_dim * sizeof(float));
+        const float *cos_tok = (const float *)((uintptr_t)cos_tbl_base + (uintptr_t)(size_t)(start_pos + si) * half_dim * sizeof(float));
+        const float *sin_tok = (const float *)((uintptr_t)sin_tbl_base + (uintptr_t)(size_t)(start_pos + si) * half_dim * sizeof(float));
+
+        VkBuffer xb = unwrap_buf(x_tok);
+        VkDeviceSize cos_off = 0, sin_off = 0;
+        VkBuffer cb = unwrap_buf_offset(cos_tok, &cos_off);
+        VkBuffer sb = unwrap_buf_offset(sin_tok, &sin_off);
+        if (!xb || !cb || !sb) return 0;
+
+        VkDescriptorBufferInfo bi[4] = {
+            {xb, 0, VK_WHOLE_SIZE},
+            {cb, cos_off, VK_WHOLE_SIZE},
+            {sb, sin_off, VK_WHOLE_SIZE},
+            {VK_NULL_HANDLE, 0, 0}
+        };
+        wr_desc(G.dset_elem, 4, bi);
+
+        vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
+        VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        vkResetCommandBuffer(G.cmd_dev, 0);
+        vkBeginCommandBuffer(G.cmd_dev, &begin);
+        vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_elem);
+        vkCmdBindDescriptorSets(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                G.plyt_elem, 0, 1, &G.dset_elem, 0, NULL);
+        typedef struct { int op, n; float fp; int pad; } PC_Elem;
+        PC_Elem pc = {2, half_dim, (float)n_heads, rope_type};
+        vkCmdPushConstants(G.cmd_dev, G.plyt_elem, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, sizeof(pc), &pc);
+        vkCmdDispatch(G.cmd_dev, (uint32_t)half_dim, 1, 1);
+        vkEndCommandBuffer(G.cmd_dev);
+        VkSubmitInfo si_info = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_dev};
+        vkResetFences(G.dev, 1, &G.fence_dev);
+        vkQueueSubmit(G.queue, 1, &si_info, G.fence_dev);
+    }
+    return 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -1740,8 +1923,70 @@ int picolm_gpu_kv_store_dev(int is_k, int lo, int pos,
 int picolm_gpu_kv_store_dev_batched(int is_k, int lo, int sp, int np,
                                      const float *sd, int nkh, int hd,
                                      int msl, int device) {
-    (void)is_k; (void)lo; (void)sp; (void)np; (void)sd; (void)nkh; (void)hd; (void)msl; (void)device;
-    return 0;
+    if (!G.ready || !sd || device != 0) return 0;
+    VkBuffer dst_buf = is_k ? G.kv_k_buf : G.kv_v_buf;
+    if (!dst_buf) return 0;
+
+    int kv_dim = nkh * hd;
+    size_t total_f32 = (size_t)np * kv_dim;
+    size_t total_f16 = total_f32 * sizeof(uint16_t);
+
+    // Allocate a temporary device buffer for F16 output
+    VkBuffer f16_buf; VkDeviceMemory f16_mem;
+    if (!alloc_device_local(total_f16, &f16_buf, &f16_mem)) return 0;
+    void *f16_d = wrap_buf(f16_buf, f16_mem, 0, total_f16);
+
+    // Use elementwise shader (op=3: f32_to_f16)
+    if (!G.shader_f16pack) {
+        vkDestroyBuffer(G.dev, f16_buf, NULL);
+        vkFreeMemory(G.dev, f16_mem, NULL);
+        free(f16_d);
+        return 0;
+    }
+
+    vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkResetCommandBuffer(G.cmd_dev, 0);
+    vkBeginCommandBuffer(G.cmd_dev, &begin);
+
+    // F32->F16 pack kernel
+    VkDescriptorBufferInfo bi[4] = {
+        desc_buf_info(sd),      // src F32
+        {VK_NULL_HANDLE, 0, 0}, // unused
+        {VK_NULL_HANDLE, 0, 0}, // unused
+        desc_buf_info(f16_d)    // dst F16 (uint32 buffer)
+    };
+    wr_desc(G.dset_f16pack, 4, bi);
+    typedef struct { int op, n; float fp; int pad; } PC_Elem;
+    PC_Elem pc = {3, (int)total_f32, 0.0f, 0};
+    vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_f16pack);
+    vkCmdBindDescriptorSets(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            G.plyt_f16pack, 0, 1, &G.dset_f16pack, 0, NULL);
+    vkCmdPushConstants(G.cmd_dev, G.plyt_f16pack, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(pc), &pc);
+    uint32_t n_groups = (total_f32 + 255) / 256;
+    vkCmdDispatch(G.cmd_dev, n_groups, 1, 1);
+
+    // D2D copy: f16_buf -> KV cache at offset
+    size_t dst_off = (size_t)lo * msl * total_f16 + (size_t)sp * total_f16;
+    VkBufferCopy bc = {0, (VkDeviceSize)dst_off, total_f16};
+    vkCmdCopyBuffer(G.cmd_dev, f16_buf, dst_buf, 1, &bc);
+
+    vkEndCommandBuffer(G.cmd_dev);
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_dev};
+    vkResetFences(G.dev, 1, &G.fence_dev);
+    vkQueueSubmit(G.queue, 1, &si, G.fence_dev);
+
+    // Clean up temp buffer (async, will be reclaimed after fence)
+    // For safety, keep it until fence. But since we submit the same fence,
+    // we need to not free until next sync. Use a lazy approach: just leak it
+    // for now (it's small, one per layer). TODO: use a pool.
+    // Actually, let's not leak. Free after sync.
+    vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
+    vkDestroyBuffer(G.dev, f16_buf, NULL);
+    vkFreeMemory(G.dev, f16_mem, NULL);
+    free(f16_d);
+    return 1;
 }
 
 int picolm_gpu_kv_store_dev_batched_strided(int is_k, int lo, int sp, int np,
@@ -1892,9 +2137,38 @@ int picolm_gpu_attention_decode_dev(float *xb_out_dev, const float *q_dev,
                                      int lo, int pos, int nh, int nkh,
                                      int hd, int msl, int device) {
     if (!G.ready || !G.shader_attn_dec || device != 0) return 0;
-    /* TODO: implement decode attention kernel */
-    (void)xb_out_dev; (void)q_dev; (void)lo; (void)pos; (void)nh; (void)nkh;
-    (void)hd; (void)msl; return 0;
+
+    VkDescriptorBufferInfo bi[4] = {
+        desc_buf_info(q_dev),
+        {G.kv_k_buf, 0, VK_WHOLE_SIZE},
+        {G.kv_v_buf, 0, VK_WHOLE_SIZE},
+        desc_buf_info(xb_out_dev)
+    };
+    if (!bi[0].buffer || !bi[3].buffer) return 0;
+    wr_desc(G.dset_attn_dec, 4, bi);
+
+    vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkResetCommandBuffer(G.cmd_dev, 0);
+    vkBeginCommandBuffer(G.cmd_dev, &begin);
+    vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_attn_dec);
+    vkCmdBindDescriptorSets(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            G.plyt_attn_dec, 0, 1, &G.dset_attn_dec, 0, NULL);
+
+    typedef struct {
+        int layer_ordinal, pos;
+        int n_heads, n_kv_heads, head_dim;
+        int max_seq_len, pad;
+    } PC_AttnD;
+    PC_AttnD pc = {lo, pos, nh, nkh, hd, msl, 0};
+    vkCmdPushConstants(G.cmd_dev, G.plyt_attn_dec, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(pc), &pc);
+    vkCmdDispatch(G.cmd_dev, (uint32_t)nh, 1, 1);
+    vkEndCommandBuffer(G.cmd_dev);
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_dev};
+    vkResetFences(G.dev, 1, &G.fence_dev);
+    vkQueueSubmit(G.queue, 1, &si, G.fence_dev);
+    return 1;
 }
 int picolm_gpu_attention_prefill(float *xb_out, const float *q,
                                   int lo, int sp, int nt,
@@ -1907,10 +2181,41 @@ int picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
                                       int lo, int sp, int nt,
                                       int nh, int nkh, int hd,
                                       int msl, int device) {
-    if (!G.ready || !G.shader_attn_prefill || device != 0) return 0;
-    /* TODO: implement prefill attention kernel */
-    (void)xb_out_dev; (void)q_dev; (void)lo; (void)sp; (void)nt;
-    (void)nh; (void)nkh; (void)hd; (void)msl; return 0;
+    if (!G.ready || !G.shader_attn_prefill || device != 0 || nt < 1) return 0;
+
+    VkDescriptorBufferInfo bi[4] = {
+        desc_buf_info(q_dev),
+        {G.kv_k_buf, 0, VK_WHOLE_SIZE},
+        {G.kv_v_buf, 0, VK_WHOLE_SIZE},
+        desc_buf_info(xb_out_dev)
+    };
+    if (!bi[0].buffer || !bi[3].buffer) return 0;
+    wr_desc(G.dset_attn_prefill, 4, bi);
+
+    // Launch one workgroup per (head, token) pair
+    uint32_t total = (uint32_t)nh * (uint32_t)nt;
+    vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkResetCommandBuffer(G.cmd_dev, 0);
+    vkBeginCommandBuffer(G.cmd_dev, &begin);
+    vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_attn_prefill);
+    vkCmdBindDescriptorSets(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            G.plyt_attn_prefill, 0, 1, &G.dset_attn_prefill, 0, NULL);
+
+    typedef struct {
+        int layer_ordinal, start_pos, n_tokens;
+        int n_heads, n_kv_heads, head_dim;
+        int max_seq_len, pad;
+    } PC_Attn;
+    PC_Attn pc = {lo, sp, nt, nh, nkh, hd, msl, 0};
+    vkCmdPushConstants(G.cmd_dev, G.plyt_attn_prefill, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(pc), &pc);
+    vkCmdDispatch(G.cmd_dev, total, 1, 1);
+    vkEndCommandBuffer(G.cmd_dev);
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_dev};
+    vkResetFences(G.dev, 1, &G.fence_dev);
+    vkQueueSubmit(G.queue, 1, &si, G.fence_dev);
+    return 1;
 }
 int picolm_gpu_attention_prefill_f32kv(float *xb_out_dev, const float *q_dev,
                                         const float *k_dev, const float *v_dev,

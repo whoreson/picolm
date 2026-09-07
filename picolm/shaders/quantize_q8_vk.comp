@@ -1,0 +1,75 @@
+#version 450
+// Quantize F32 activations to Q8_0 block format on device.
+// Each workgroup (32 threads) handles one 32-value block of one activation row.
+//
+// Input x:     [S][I] float32, contiguous
+// Output qs:   [S][n_blocks][8] uint32 (32 int8 values packed as 8 uint32 words)
+// Output d:    [S][n_blocks] float32
+//
+// Push constants: int I, int S, int pad (zero) = 12 bytes
+// Binding 0: readonly X (float)
+// Binding 1: writeonly QS (uint32 words)
+// Binding 2: writeonly D (float)
+//
+// Grid: [n_blocks, S, 1], Block: 32 threads
+
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) readonly buffer X  { float x[]; };
+layout(std430, binding = 1) writeonly buffer QS { uint qs[]; };
+layout(std430, binding = 2) writeonly buffer D  { float d[]; };
+
+layout(push_constant) uniform P {
+    int I;
+    int S;
+    int pad;
+} p;
+
+shared float amax_sh[32];
+shared uint qs_sh[8];
+
+void main() {
+    uint s   = gl_WorkGroupID.y;
+    uint blk = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+
+    uint n_blocks = (uint(p.I) + 31u) / 32u;
+    if (blk >= n_blocks || s >= uint(p.S)) return;
+
+    uint base = s * uint(p.I) + blk * 32u;
+    int valid = p.I - int(blk) * 32;
+
+    float v = (tid < uint(valid)) ? x[base + tid] : 0.0;
+
+    amax_sh[tid] = abs(v);
+    memoryBarrierShared();
+    barrier();
+
+    for (uint stride = 16; stride > 0u; stride >>= 1) {
+        if (tid < stride)
+            amax_sh[tid] = max(amax_sh[tid], amax_sh[tid + stride]);
+        memoryBarrierShared();
+        barrier();
+    }
+    float amax0 = amax_sh[0];
+
+    float d_val = amax0 / 127.0;
+    float id = (d_val > 0.0) ? (1.0 / d_val) : 0.0;
+    float qs_val = v * id;
+    int qi = int(qs_val + (qs_val >= 0.0 ? 0.5 : -0.5));
+    qi = clamp(qi, -128, 127);
+
+    // Pack int8 into shared uint32 words (4 bytes per word)
+    uint packed = uint(qi + 128);  // convert to unsigned 0..255
+    qs_sh[tid / 4u] |= packed << ((tid % 4u) * 8u);
+    memoryBarrierShared();
+    barrier();
+
+    if (tid == 0u) {
+        uint out_base = (s * n_blocks * 32u + blk * 32u) / 4u;
+        for (uint w = 0; w < 8; w++)
+            qs[out_base + w] = qs_sh[w];
+        d[s * n_blocks + blk] = d_val;
+    }
+}
+

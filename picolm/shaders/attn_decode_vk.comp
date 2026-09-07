@@ -1,0 +1,124 @@
+#version 450
+// Decode attention kernel (single token, S=1).
+// Each workgroup processes one attention head.
+// KV cache is F16, Q is F32, output is F32.
+//
+// Grid: [n_heads, 1, 1], Block: 256 threads
+//
+// Push constants (28 bytes):
+//   int layer_ordinal, int pos
+//   int n_heads, int n_kv_heads, int head_dim
+//   int max_seq_len, int pad
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Q    { float q_data[]; };
+layout(std430, binding = 1) readonly buffer KV_K { uint kv_k[]; };
+layout(std430, binding = 2) readonly buffer KV_V { uint kv_v[]; };
+layout(std430, binding = 3) writeonly buffer OUT { float xb_out[]; };
+
+layout(push_constant) uniform P {
+    int layer_ordinal;
+    int pos;
+    int n_heads;
+    int n_kv_heads;
+    int head_dim;
+    int max_seq_len;
+    int pad;
+} p;
+
+float f16tof32(uint h) {
+    uint s = (h >> 15u) & 1u;
+    uint e = (h >> 10u) & 31u;
+    uint m = h & 1023u;
+    if (e == 0u) {
+        if (m == 0u) return s != 0u ? -0.0 : 0.0;
+        float v = float(m) * 5.960464477539063e-8;
+        return s != 0u ? -v : v;
+    }
+    if (e == 31u) return s != 0u ? -1.0/0.0 : 1.0/0.0;
+    uint bits = (s << 31u) | ((e - 15u + 127u) << 23u) | (m << 13u);
+    return uintBitsToFloat(bits);
+}
+
+shared float reduce_sh[256];
+shared float max_sh, sum_sh, rescale_sh, weight_sh;
+
+#define MAX_ELEMS_PER_THREAD 32
+float acc_arr[MAX_ELEMS_PER_THREAD];
+
+void main() {
+    int h = int(gl_WorkGroupID.x);
+    int tid = int(gl_LocalInvocationID.x);
+    int nt = int(gl_WorkGroupSize.x);
+
+    if (h >= p.n_heads) return;
+
+    int kv_h = h / (p.n_heads / p.n_kv_heads);
+    float attn_scale = 1.0 / sqrt(float(p.head_dim));
+
+    int q_off = h * p.head_dim;
+
+    int layer_base_f16 = p.layer_ordinal * p.max_seq_len * p.n_kv_heads * p.head_dim;
+    int kv_row_stride = p.n_kv_heads * p.head_dim;
+
+    int my_n = (p.head_dim + nt - 1) / nt;
+    for (int e = 0; e < my_n; e++) acc_arr[e] = 0.0;
+
+    if (tid == 0) { max_sh = -1e30; sum_sh = 0.0; rescale_sh = 1.0; weight_sh = 1.0; }
+    barrier();
+
+    for (int kv_pos = 0; kv_pos <= p.pos; kv_pos++) {
+        int kv_head_base_f16 = layer_base_f16 + kv_h * p.head_dim + kv_pos * kv_row_stride;
+        int kv_head_base_u32 = kv_head_base_f16 / 2;
+
+        float local_score = 0.0;
+        for (int e = 0; e < my_n; e++) {
+            int d = tid + e * nt;
+            if (d < p.head_dim) {
+                float qv = q_data[q_off + d];
+                uint f16_raw = (kv_k[kv_head_base_u32 + d / 2] >> ((d % 2) * 16)) & 0xffffu;
+                float kv = f16tof32(f16_raw);
+                local_score += qv * kv;
+            }
+        }
+        reduce_sh[tid] = local_score;
+        barrier();
+        for (int s = nt / 2; s > 0; s /= 2) {
+            if (tid < s) reduce_sh[tid] += reduce_sh[tid + s];
+            barrier();
+        }
+        float score = reduce_sh[0] * attn_scale;
+
+        if (tid == 0) {
+            if (score > max_sh) {
+                rescale_sh = exp(max_sh - score);
+                max_sh = score;
+                weight_sh = 1.0;
+                sum_sh = sum_sh * rescale_sh + 1.0;
+            } else {
+                rescale_sh = 1.0;
+                weight_sh = exp(score - max_sh);
+                sum_sh += weight_sh;
+            }
+        }
+        barrier();
+
+        for (int e = 0; e < my_n; e++) {
+            int d = tid + e * nt;
+            if (d < p.head_dim) {
+                uint f16_raw = (kv_v[kv_head_base_u32 + d / 2] >> ((d % 2) * 16)) & 0xffffu;
+                float vv = f16tof32(f16_raw);
+                acc_arr[e] = acc_arr[e] * rescale_sh + vv * weight_sh;
+            }
+        }
+    }
+
+    float inv_sum = 1.0 / sum_sh;
+    for (int e = 0; e < my_n; e++) {
+        int d = tid + e * nt;
+        if (d < p.head_dim) {
+            xb_out[h * p.head_dim + d] = acc_arr[e] * inv_sum;
+        }
+    }
+}
+
