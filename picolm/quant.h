@@ -327,8 +327,15 @@ typedef enum {
     GGUF_TYPE_Q2_0       = 42,  /* 2-bit values + scale, 128 values/block */
 } gguf_type_t;
 
+/* Cross-platform packed struct attribute */
+#ifdef _MSC_VER
+#define __PICO_PACKED __declspec(align(1))
+#else
+#define __PICO_PACKED __attribute__((packed))
+#endif
+
 /* Q4_K block: 256 weights in 144 bytes */
-typedef struct __attribute__((packed)) {
+typedef struct __PICO_PACKED {
     uint16_t d;          /* super-block scale (FP16) */
     uint16_t dmin;       /* super-block min   (FP16) */
     uint8_t  scales[12]; /* packed 6-bit scales and mins for 8 sub-blocks */
@@ -358,7 +365,7 @@ typedef struct {
  *
  * Total: 4*2 + 4*16 = 72 bytes (same as 4 standard Q4_0 blocks)
  * Each block covers 4 rows x 32 values = 128 values. */
-typedef struct __attribute__((packed)) {
+typedef struct __PICO_PACKED {
     uint16_t d[4];      /* 4 FP16 deltas, one per row */
     uint8_t  qs[64];    /* interleaved nibble-bytes (4 rows x 16 bytes, XOR'd with 0x88) */
 } block_q4_0x4;         /* 72 bytes */
@@ -377,13 +384,13 @@ typedef struct __attribute__((packed)) {
  * Total: 8*2 + 8*16 = 144 bytes (same as 8 standard Q4_0 blocks)
  * Each block covers 8 rows x 32 values = 256 values.
  * Used by AVX2 kernel that processes 8 output rows simultaneously. */
-typedef struct __attribute__((packed)) {
+typedef struct __PICO_PACKED {
     uint16_t d[8];      /* 8 FP16 deltas, one per row */
     uint8_t  qs[128];   /* interleaved nibble-bytes (8 rows x 16 bytes, XOR'd with 0x88) */
 } block_q4_0x8;         /* 144 bytes */
 
 /* Q3_K block: 256 weights in 110 bytes, layout: hmask[32] + qs[64] + scales[12] + d[2] */
-typedef struct __attribute__((packed)) {
+typedef struct __PICO_PACKED {
     uint8_t  hmask[32];  /* high bit mask */
     uint8_t  qs[64];     /* 2-bit low quants */
     uint8_t  scales[12]; /* packed 6-bit scales */
@@ -391,7 +398,7 @@ typedef struct __attribute__((packed)) {
 } block_q3_K;            /* 110 bytes */
 
 /* Q2_K block: 256 weights in 84 bytes */
-typedef struct __attribute__((packed)) {
+typedef struct __PICO_PACKED {
     uint8_t  scales[16]; /* packed scales and mins (4-bit each) */
     uint8_t  qs[64];     /* 2-bit quantized values */
     uint16_t d;          /* super-block scale (FP16) */
@@ -399,7 +406,7 @@ typedef struct __attribute__((packed)) {
 } block_q2_K;            /* 84 bytes */
 
 /* Q8_0 block: 32 weights */
-typedef struct __attribute__((packed)) {
+typedef struct __PICO_PACKED {
     uint16_t d;          /* scale (FP16) */
     int8_t   qs[32];     /* 8-bit quantized values */
 } block_q8_0;            /* 34 bytes */
@@ -410,7 +417,7 @@ typedef struct __attribute__((packed)) {
  *
  * Layout: 2 bytes fp16 RMS scale + 12 bytes packed 3-bit indices.
  * 8-element Lloyd-Max codebook for N(0,1): {-2.15, -1.34, -0.76, -0.25, 0.25, 0.76, 1.34, 2.15} */
-typedef struct __attribute__((packed)) {
+typedef struct __PICO_PACKED {
     uint16_t d;          /* RMS scale (FP16) */
     uint8_t  qs[12];     /* 32 values x 3-bit packed = 12 bytes */
 } block_tq3;             /* 14 bytes */
@@ -419,7 +426,7 @@ typedef struct __attribute__((packed)) {
  * Same WHT rotation as TQ3, but 16-entry Lloyd-Max codebook + nibble packing.
  * D_mse ~0.0095 (vs TQ3 D_mse ~0.032) -- 3.4x better accuracy.
  * Layout: 2 bytes fp16 RMS scale + 16 bytes packed 4-bit indices. */
-typedef struct __attribute__((packed)) {
+typedef struct __PICO_PACKED {
     uint16_t d;          /* RMS scale (FP16) */
     uint8_t  qs[16];     /* 32 values x 4-bit packed = 16 bytes */
 } block_tq4;             /* 18 bytes */
@@ -487,7 +494,7 @@ static inline void tq3_unpack_3bit_8(uint8_t *dst, const uint8_t *src) {
  * Storage: int8_t[32] per block (same as Q8_0 qs, but rearranged). */
 
 /* Q5_K block: 256 weights in 176 bytes */
-typedef struct __attribute__((packed)) {
+typedef struct __PICO_PACKED {
     uint16_t d;          /* super-block scale (FP16) */
     uint16_t dm;         /* super-block min   (FP16) */
     uint8_t  scales[12]; /* packed 6-bit scales+mins (get_scale_min_k4) */
@@ -496,7 +503,7 @@ typedef struct __attribute__((packed)) {
 } block_q5_K;            /* 176 bytes */
 
 /* Q6_K block: 256 weights in 210 bytes */
-typedef struct __attribute__((packed)) {
+typedef struct __PICO_PACKED {
     uint8_t  ql[128];    /* low 4 bits of quants */
     uint8_t  qh[64];     /* high 2 bits of quants */
     int8_t   scales[16]; /* 8-bit scales */
@@ -504,7 +511,7 @@ typedef struct __attribute__((packed)) {
 } block_q6_K;            /* 210 bytes */
 
 /* Q4_0 block: 32 weights */
-typedef struct __attribute__((packed)) {
+typedef struct __PICO_PACKED {
     uint16_t d;          /* scale (FP16) */
     uint8_t  qs[16];     /* 4-bit quantized values */
 } block_q4_0;            /* 18 bytes */
@@ -512,7 +519,7 @@ typedef struct __attribute__((packed)) {
 /* Q4_1 block: 32 weights (old GGML format, used by some GGUF models)
  * Layout: half d (scale), half m (min), uchar qs[16] (nibbles)
  * Dequant: val = qs[j] * d + m  (unsigned nibble, no sign extension) */
-typedef struct __attribute__((packed)) {
+typedef struct __PICO_PACKED {
     uint16_t d;          /* scale (FP16) */
     uint16_t m;          /* min (FP16) */
     uint8_t  qs[16];     /* 4-bit quantized values */
@@ -522,7 +529,7 @@ typedef struct __attribute__((packed)) {
  * Layout: half d (scale), uchar qh[4] (5th bits), uchar qs[16] (low 4 bits)
  * Dequant: val = ((qs & 0xF) | (qh_bit << 4)) * d
  * qh holds 1 bit per value: value j's 5th bit is bit j of the 32-bit qh. */
-typedef struct __attribute__((packed)) {
+typedef struct __PICO_PACKED {
     uint16_t d;          /* scale (FP16) */
     uint8_t  qh[4];      /* 5th bit of each quant (32 bits) */
     uint8_t  qs[16];     /* low 4 bits of each quant */
@@ -531,7 +538,7 @@ typedef struct __attribute__((packed)) {
 /* Q5_1 block: 32 weights (5-bit values + FP16 scale + FP16 min, 24 bytes)
  * Layout: half d (scale), half m (min), uchar qh[4], uchar qs[16]
  * Dequant: val = ((qs & 0xF) | (qh_bit << 4)) * d + m */
-typedef struct __attribute__((packed)) {
+typedef struct __PICO_PACKED {
     uint16_t d;          /* scale (FP16) */
     uint16_t m;          /* min (FP16) */
     uint8_t  qh[4];      /* 5th bit of each quant (32 bits) */
@@ -540,14 +547,14 @@ typedef struct __attribute__((packed)) {
 
 /* Q1_0 block: 128 weights (1-bit sign + FP16 scale, 18 bytes)
  * Dequant: val[j] = (bit[j] ? +d : -d) */
-typedef struct __attribute__((packed)) {
+typedef struct __PICO_PACKED {
     uint16_t d;          /* scale (FP16) = mean(|values|) */
     uint8_t  qs[16];     /* 128 sign bits (1 bit per value) */
 } block_q1_0;            /* 18 bytes */
 
 /* Q2_0 block: 128 weights (2-bit values + FP16 scale, 34 bytes)
  * Dequant: val[j] = ((qs[j] - 1) * d), {0,1,2,3} -> {-d, 0, +d, +2d} */
-typedef struct __attribute__((packed)) {
+typedef struct __PICO_PACKED {
     uint16_t d;          /* scale (FP16) = max(|values|) */
     uint8_t  qs[32];     /* 128 values * 2 bits each */
 } block_q2_0;            /* 34 bytes */
@@ -637,7 +644,7 @@ void quantize_row_q8_0(const float *x, void *dst, int n);
 
 /* Q8_0x4 interleaved block: 4 rows of Q8_0 packed for AVX2/AVX-512 GEMM.
  * 4 FP16 deltas + 128 interleaved int8 values. */
-typedef struct __attribute__((packed)) {
+typedef struct __PICO_PACKED {
     uint16_t d[4];      /* 4 FP16 deltas */
     int8_t   qs[128];    /* interleaved int8 (4 rows x 32 values) */
 } block_q8_0x4;          /* 136 bytes */
