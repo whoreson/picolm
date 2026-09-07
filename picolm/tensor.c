@@ -2261,7 +2261,9 @@ static void sgemm_q8_worker(int idx, void *ctxp) {
                  c->Atype, c->Btype, idx, c->nth);
 }
 
-/* Q4_0_8_8 GEMM threading context */
+#endif /* AVX2+F16C || ARM NEON for qgemm_d_ctx_t / sgemm_q8_ctx_t */
+
+/* Q4_0_8_8 GEMM threading context (not tied to AVX2+F16C/NEON, used under PICOLM_AVX2) */
 typedef struct {
     int nr, nc, k;
     const void *w;
@@ -2275,13 +2277,23 @@ static void qgemm_q4x8_task(int idx, void *ctxp) {
     int nth = pool_total_threads(1);
     sgemm_q4_0x8_q8_0x4(c->nr, c->nc, c->k, c->w, c->abuf, c->out, c->bs, idx, nth);
 }
-#endif
 
 /* Profiling: per-path timing for matmul_batch (PICOLM_PROFILE=1) */
+#ifdef _MSC_VER
+#include <windows.h>
+static inline double picolm_now(void) {
+    static double freq = 0;
+    if (!freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); freq = (double)f.QuadPart; }
+    LARGE_INTEGER t; QueryPerformanceCounter(&t);
+    return (double)t.QuadPart / freq;
+}
+#else
+#include <time.h>
 static inline double picolm_now(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 }
+#endif
 static double prof_f32_gemm, prof_q8_d, prof_q4_d, prof_q5_d, prof_scalar_par, prof_scalar_seq, prof_other;
 static int    cnt_f32_gemm, cnt_q8_d, cnt_q4_d, cnt_q5_d, cnt_scalar_par, cnt_scalar_seq, cnt_other;
 static int    prof_active;
@@ -2869,8 +2881,7 @@ static void dual_q8_row_task(int i, void *ctxp) {
     }
 }
 
-/* Q4_0_8_8 GEMM helpers for dual-batch */
-#if (defined(__AVX2__) && defined(__F16C__)) || defined(__ARM_NEON)
+/* Q4_0_8_8 GEMM helpers for dual-batch (used under PICOLM_AVX2, not tied to GCC intrinsics) */
 static void qgemm_q4x8_dual_single(const float *x, int n_batch, int d, int n,
                                     const void *W, float *out)
 {
@@ -2905,7 +2916,6 @@ static void qgemm_q4x8_dual_single(const float *x, int n_batch, int d, int n,
         memcpy(out + (size_t)t * d, tmp + (size_t)t * d, (size_t)d * sizeof(float));
     free(tmp); free(abuf);
 }
-#endif
 
 static void qgemm_q4x8_fallback(const float *x, int n_batch, int d, int n,
                                  const void *W, float *out, gguf_type_t qtype)

@@ -1196,7 +1196,7 @@ static void sgemm_##load_fn(int m, int n, int k_blocks,                         
                             const block_q8_0 *B, int ldb,                       \
                             float *C, int ldc,                                  \
                             int ith, int nth) {                                 \
-    const int64_t RM=4, RN=2, BN=12;                                            \
+    enum { RM=4, RN=2, BN=12 };                                                 \
     int64_t BM = (m >= RM*4*(int64_t)nth) ? 4 : (m%8==0) ? 2 : 1;              \
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;                     \
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);              \
