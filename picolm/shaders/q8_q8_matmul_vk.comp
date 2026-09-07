@@ -64,7 +64,7 @@ void main() {
 
     int nblocks = p.I / 32;
     uint rowBase = uint(o) * uint(p.rowWords);
-    uint xq_base = uint(s) * uint(p.I);
+    uint xq_base = uint(s) * uint(p.I) / 4u;  // uint32 words: I bytes / 4
     int xd_base = s * nblocks;
 
     float sum = 0.0;
@@ -77,15 +77,16 @@ void main() {
         float ad = xd[xd_base + bi];
         float scale = wd * ad;
 
-        uint wqs_base = rowBase + (bo + 2u) / 4u;
-        uint aqs_base = xq_base + uint(bi) * 32u;
+        uint aqs_base = xq_base + uint(bi) * 8u;  // 8 uint32 words per 32-value block
 
         for (int v = 0; v < 32; v++) {
             int vi = bi * 32 + v;
             if (vi >= p.I) break;
 
-            uint wb_idx = wqs_base + uint(v) / 4u;
-            uint wbyte = (w[wb_idx] >> ((uint(v) % 4u) * 8u)) & 0xffu;
+            // Weight byte offset: bi*34 + 2(v for qs skip delta) + v
+            uint wbyte_off = rowBase + (bo + 2u + uint(v)) / 4u;
+            uint wshift = ((bo + 2u + uint(v)) % 4u) * 8u;
+            uint wbyte = (w[wbyte_off] >> wshift) & 0xffu;
             int wval = int(wbyte);
             if (wval >= 128) wval -= 256;
 

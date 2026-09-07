@@ -1198,6 +1198,24 @@ static void *wrap_buf(VkBuffer b, VkDeviceMemory m, size_t off, size_t sz) {
     return (void*)((uintptr_t)d->idx << 48);
 }
 
+/* Remove a vk_dev_buf_t from the global list and free it.
+ * Used when a temporary device buffer is no longer needed. */
+static void free_dev_buf(void *p) {
+    if (!p) return;
+    int idx = (int)((uintptr_t)p >> 48);
+    vk_dev_buf_t **pp = &g_dev_buf_list;
+    while (*pp) {
+        if ((*pp)->idx == idx) {
+            vk_dev_buf_t *d = *pp;
+            *pp = d->next;
+            g_dev_buf_count--;
+            free(d);
+            return;
+        }
+        pp = &(*pp)->next;
+    }
+}
+
 /* Unwrap a device pointer to get (VkBuffer, offset).
  * Handles offset pointers from CUDA-style pointer arithmetic:
  * (float*)base + N produces an address = base + N*4 bytes.
@@ -1312,20 +1330,41 @@ int picolm_gpu_memcpy_async(void *dst, const void *src, size_t bytes, int dir, i
     if (dir == 1) { /* H2D via staging */
         if (!staging_ensure(bytes)) return 0;
         memcpy(G.staging_ptr, src, bytes);
-        VkBuffer dst_buf = unwrap_buf(dst);
+        VkDeviceSize dst_off = 0;
+        VkBuffer dst_buf = unwrap_buf_offset(dst, &dst_off);
         if (!dst_buf) return 0;
         /* Ensure prior xfer is done before reusing cmd_xfer */
         vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
         VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         vkResetCommandBuffer(G.cmd_xfer, 0);
         vkBeginCommandBuffer(G.cmd_xfer, &begin);
-        VkBufferCopy bc = {0, 0, bytes};
+        VkBufferCopy bc = {0, dst_off, bytes};
         vkCmdCopyBuffer(G.cmd_xfer, G.staging_buf, dst_buf, 1, &bc);
         vkEndCommandBuffer(G.cmd_xfer);
         VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
             .commandBufferCount = 1, .pCommandBuffers = &G.cmd_xfer};
         vkResetFences(G.dev, 1, &G.fence_xfer);
         vkQueueSubmit(G.queue, 1, &si, G.fence_xfer);
+        return 1;
+    }
+    if (dir == -1) { /* D2H via staging */
+        if (!staging_ensure(bytes)) return 0;
+        VkDeviceSize src_off = 0;
+        VkBuffer src_buf = unwrap_buf_offset(src, &src_off);
+        if (!src_buf) return 0;
+        vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
+        VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        vkResetCommandBuffer(G.cmd_xfer, 0);
+        vkBeginCommandBuffer(G.cmd_xfer, &begin);
+        VkBufferCopy bc = {src_off, 0, bytes};
+        vkCmdCopyBuffer(G.cmd_xfer, src_buf, G.staging_buf, 1, &bc);
+        vkEndCommandBuffer(G.cmd_xfer);
+        VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .commandBufferCount = 1, .pCommandBuffers = &G.cmd_xfer};
+        vkResetFences(G.dev, 1, &G.fence_xfer);
+        vkQueueSubmit(G.queue, 1, &si, G.fence_xfer);
+        vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
+        memcpy(dst, G.staging_ptr, bytes);
         return 1;
     }
     return 0;
@@ -1453,7 +1492,7 @@ int picolm_gpu_prealloc_q8(size_t mxq, size_t mxd, int device) {
     if (mxq > G.q8_xq_cap) {
         if (G.q8_xq_buf) { vkDestroyBuffer(G.dev, G.q8_xq_buf, NULL); G.q8_xq_buf = VK_NULL_HANDLE; }
         if (G.q8_xq_mem) { vkFreeMemory(G.dev, G.q8_xq_mem, NULL); G.q8_xq_mem = VK_NULL_HANDLE; }
-        if (G.q8_xq_d) { free(G.q8_xq_d); G.q8_xq_d = NULL; }
+        if (G.q8_xq_d) { free_dev_buf(G.q8_xq_d); G.q8_xq_d = NULL; }
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
             .size = mxq, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
             .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
@@ -1469,7 +1508,7 @@ int picolm_gpu_prealloc_q8(size_t mxq, size_t mxd, int device) {
     if (mxd > G.q8_xd_cap) {
         if (G.q8_xd_buf) { vkDestroyBuffer(G.dev, G.q8_xd_buf, NULL); G.q8_xd_buf = VK_NULL_HANDLE; }
         if (G.q8_xd_mem) { vkFreeMemory(G.dev, G.q8_xd_mem, NULL); G.q8_xd_mem = VK_NULL_HANDLE; }
-        if (G.q8_xd_d) { free(G.q8_xd_d); G.q8_xd_d = NULL; }
+        if (G.q8_xd_d) { free_dev_buf(G.q8_xd_d); G.q8_xd_d = NULL; }
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
             .size = mxd, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
             .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
@@ -1594,7 +1633,7 @@ int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_d
 
     int ok = 1;
     // Q8_0 path: quantize F32->Q8 on device, then Q8xQ8 matmul
-    if (t->qtype == GGUF_TYPE_Q8_0 && G.shader_quantize && G.shader_q8q8) {
+    if (t->qtype == GGUF_TYPE_Q8_0 && G.shader_quantize && G.shader_q8q8) { // TEMP: disable Q8 path
         ok &= _quantize_dev(x_dev, t->I, S);
         ok &= _q8q8_matmul_dev(t, y_dev, S);
     }
@@ -1609,6 +1648,7 @@ int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_d
         vkCmdPushConstants(G.cmd_dev, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT,
                            0, sizeof(pc), &pc);
         vkCmdDispatch(G.cmd_dev, (uint32_t)t->O, (uint32_t)S, 1);
+        ok = 1;
     }
 
     vkEndCommandBuffer(G.cmd_dev);
@@ -1940,7 +1980,7 @@ int picolm_gpu_kv_store_dev_batched(int is_k, int lo, int sp, int np,
     if (!G.shader_f16pack) {
         vkDestroyBuffer(G.dev, f16_buf, NULL);
         vkFreeMemory(G.dev, f16_mem, NULL);
-        free(f16_d);
+        free_dev_buf(f16_d);
         return 0;
     }
 
@@ -1964,7 +2004,7 @@ int picolm_gpu_kv_store_dev_batched(int is_k, int lo, int sp, int np,
                             G.plyt_f16pack, 0, 1, &G.dset_f16pack, 0, NULL);
     vkCmdPushConstants(G.cmd_dev, G.plyt_f16pack, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(pc), &pc);
-    uint32_t n_groups = (total_f32 + 255) / 256;
+    uint32_t n_groups = ((total_f32 + 1u) / 2u + 255u) / 256u;
     vkCmdDispatch(G.cmd_dev, n_groups, 1, 1);
 
     // D2D copy: f16_buf -> KV cache at offset
@@ -1985,7 +2025,7 @@ int picolm_gpu_kv_store_dev_batched(int is_k, int lo, int sp, int np,
     vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
     vkDestroyBuffer(G.dev, f16_buf, NULL);
     vkFreeMemory(G.dev, f16_mem, NULL);
-    free(f16_d);
+    free_dev_buf(f16_d);
     return 1;
 }
 

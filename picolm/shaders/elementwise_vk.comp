@@ -66,15 +66,17 @@ void main() {
             }
         }
     } else if (pc.op == 3) {
-        // F32->F16 pack: output as uint32 with 2 F16 per word
-        if (gid < uint(pc.n)) {
-            uint f16 = f32tof16_bits(d0[gid]);
-            uint word_idx = gid / 2u;
-            uint shift = (gid % 2u) * 16u;
-            // Each thread writes to a unique (word_idx, byte_lane) pair.
-            // Since threads 2k and 2k+1 write to the same word_idx but
-            // different 16-bit halves, we can use atomicOr safely.
-            atomicOr(d3[word_idx], f16 << shift);
+        // F32->F16 pack: each thread handles one output word (2 F16 values)
+        uint word_gid = gid;
+        uint idx0 = word_gid * 2u;
+        if (idx0 < uint(pc.n)) {
+            uint lo = f32tof16_bits(d0[idx0]);
+            if (idx0 + 1u < uint(pc.n)) {
+                uint hi = f32tof16_bits(d0[idx0 + 1u]);
+                d3[word_gid] = lo | (hi << 16u);
+            } else {
+                d3[word_gid] = lo;
+            }
         }
     } else if (pc.op == 4) {
         if (gid < uint(pc.n)) {
