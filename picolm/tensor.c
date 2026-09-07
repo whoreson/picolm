@@ -19,6 +19,8 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <time.h>
+#include <stdlib.h>
 #endif
 
 #ifdef PICOLM_GPU
@@ -2254,8 +2256,35 @@ static void qgemm_q4x8_task(int idx, void *ctxp) {
 }
 #endif
 
+/* Profiling: per-path timing for matmul_batch (PICOLM_PROFILE=1) */
+static inline double picolm_now(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+static double prof_f32_gemm, prof_q8_d, prof_q4_d, prof_q5_d, prof_scalar_par, prof_scalar_seq, prof_other;
+static int    cnt_f32_gemm, cnt_q8_d, cnt_q4_d, cnt_q5_d, cnt_scalar_par, cnt_scalar_seq, cnt_other;
+static int    prof_active;
+static void prof_print(void) {
+    double total = prof_f32_gemm + prof_q8_d + prof_q4_d + prof_q5_d + prof_scalar_par + prof_scalar_seq + prof_other;
+    if (total < 0.001) return;
+    fprintf(stderr, "\n=== matmul_batch profile (total %.1fms) ===\n", total*1000);
+    #define P(l,v,n) if(n) fprintf(stderr, "  %16s: %4d calls %7.1fms %5.1f%%\n", l, n, v*1000, v/total*100)
+    P("f32_gemm", prof_f32_gemm, cnt_f32_gemm);
+    P("neon_q4_d", prof_q4_d, cnt_q4_d);
+    P("neon_q5_d", prof_q5_d, cnt_q5_d);
+    P("neon_q8_d", prof_q8_d, cnt_q8_d);
+    P("scalar_par", prof_scalar_par, cnt_scalar_par);
+    P("scalar_seq", prof_scalar_seq, cnt_scalar_seq);
+    P("other", prof_other, cnt_other);
+    fprintf(stderr, "===========================================\n");
+    #undef P
+}
+
 void matmul_batch(float *out, const float *x, int n_batch,
                    const void *W, int n, int d, gguf_type_t qtype) {
+    static int init;
+    if (!init && getenv("PICOLM_PROFILE")) { init = 1; prof_active = 1; atexit(prof_print); }
+    double t0 = prof_active ? picolm_now() : 0;
 #ifdef PICOLM_GPU
         if (gpu_tensor && n_batch > 0 && d > 0 && n > 0 && !getenv("PICOLM_PREFILL_CPU") && !getenv("PICOLM_SSM_PREFILL_CPU")) {
         gpu_assert_orchestrator("matmul_batch GPU dispatch");
@@ -2282,6 +2311,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
      * reused across weight tiles.
      * picolm_sgemm handles: F32xF32, F16xF32, F16xF16, Q8_0xQ8_0 (ARM NEON too). */
     if (picolm_sgemm(d, n_batch, n, wptr, n, x, n, out, d, qtype, GGUF_TYPE_F32, 0, 1)) {
+        if (prof_active) { double dt = picolm_now()-t0; prof_f32_gemm+=dt; cnt_f32_gemm++; }
         return;
     }
 
@@ -2533,6 +2563,11 @@ void matmul_batch(float *out, const float *x, int n_batch,
                 .Atype = qtype, .nth = nth,
             };
             tensor_parallel_for(nth, qgemm_d_task, &ctx);
+            if (prof_active) { double dt = picolm_now()-t0;
+                if (qtype==GGUF_TYPE_Q4_0) { prof_q4_d+=dt; cnt_q4_d++; }
+                else if (qtype==GGUF_TYPE_Q5_0) { prof_q5_d+=dt; cnt_q5_d++; }
+                else { prof_q8_d+=dt; cnt_q8_d++; }
+            }
             if (qx_buf) { free(qx_buf); if (qx_d_buf) free(qx_d_buf); }
             return;
         }
@@ -2603,6 +2638,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
                     out[b * d + i] = vec_dot(wrow, x + b * n, n, qtype);
             }
         }
+        if (prof_active) { double dt = picolm_now()-t0; prof_scalar_seq+=dt; cnt_scalar_seq++; }
         if (qx_buf) { free(qx_buf); if (qx_d_buf) free(qx_d_buf); }
         return;
     }
@@ -2627,6 +2663,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
     pool_wake(nt);
     matmul_worker_f(&pool_tasks[0]);
     pool_wait(nt);
+    if (prof_active) { double dt = picolm_now()-t0; prof_scalar_par+=dt; cnt_scalar_par++; }
     if (qx_buf) { free(qx_buf); if (qx_d_buf) free(qx_d_buf); }
 }
 
