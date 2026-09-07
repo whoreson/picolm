@@ -7,6 +7,7 @@
 #include "sgemm.h"
 #include "quant.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <assert.h>
 #if defined(__ARM_NEON)
@@ -1318,6 +1319,12 @@ static inline float32x4_t neon_vdot_accum(float32x4_t C,
     return vmlaq_f32(C, vcvtq_f32_s32(s), scale);
 }
 
+/* ARM NEON Q8_0 x Q8_0 GEMM.
+ *
+ * TODO: UNTESTED IN PRACTICE. Wired in picolm_sgemm (Btype=Q8_0, Atype=Q8_0) but
+ * Q8_0 weights are rare in production models. The delta path (sgemm_neon_q8_qs_d4)
+ * is used instead by tensor.c's default dispatch. Would need a Q8_0 weight model
+ * to verify correctness and performance. */
 static void sgemm_q8_q8_neon(int m, int n, int k_blocks,
                               const block_q8_0 *A, int lda,
                               const block_q8_0 *B, int ldb,
@@ -1662,7 +1669,14 @@ NEON_QGEMM_D4_IMPL(neon_q8_qs, block_q8_0)
 NEON_QGEMM_D4_IMPL(neon_q4_qs, block_q4_0)
 NEON_QGEMM_D4_IMPL(neon_q5_qs, block_q5_0)
 
-/* ARM NEON Q4_0 x Q8_0 GEMM (tinyBLAS_Q0_ARM<block_q4_0> port from llama.cpp) */
+/* ARM NEON Q4_0 x Q8_0 GEMM (tinyBLAS_Q0_ARM<block_q4_0> port from llama.cpp).
+ *
+ * TODO: SLOWER than delta path. 3x4 tiles with inline fp16->fp32 delta conversion.
+ * Benchmarks: Q4_0 132ms/layer vs 98ms/layer for sgemm_neon_q4_qs_d4 (delta, 4x4 tiles).
+ * Q5_0 163ms/layer vs 110ms/layer. Only reachable via picolm_sgemm(Btype=Q8_0) which
+ * tensor.c only calls when PICOLM_NEON_Q4=nondelta. Not called by default.
+ * The fp16->fp32 conversion inside the inner loop is the bottleneck on basic NEON.
+ * On I8MM devices (vmmlaq_s32), this may be competitive -- needs verification. */
 static void sgemm_q4_q8_neon(int m, int n, int k_blocks,
                               const block_q4_0 *A, int lda,
                               const block_q8_0 *B, int ldb,
@@ -1730,7 +1744,139 @@ static void sgemm_q4_q8_neon(int m, int n, int k_blocks,
     }
 }
 
-/* ARM NEON Q5_0 x Q8_0 GEMM */
+/* ARM NEON Q4_0 x Q8_0 GEMM with pre-converted activation deltas.
+ * 4x4 tiled kernel: same structure as the _d4 delta path but called
+ * from the non-delta dispatch (picolm_sgemm). Accepts B_d (F32 deltas)
+ * extracted from Q8_0 blocks by the caller, avoiding fp16->fp32 conversion
+ * in the inner loop. This is the optimization target for basic NEON.
+ * On I8MM devices, vmmlaq_s32 path is used instead of widen.
+ *
+ * TODO: DEAD CODE. This function is never called by any dispatch path.
+ * picolm_sgemm dispatches sgemm_q4_q8_neon (non-delta, 3x4 tiles), not this.
+ * picolm_sgemm_d dispatches sgemm_neon_q4_qs_d4 (4x4 tiles, delta macro), not this.
+ * tensor.c routes through picolm_sgemm_d (delta path), never reaching picolm_sgemm's
+ * Q8_0 Btype dispatch. Was intended as an optimization target but has no caller.
+ * Consider: wire into picolm_sgemm_d as replacement for sgemm_neon_q4_qs_d4, or remove. */
+static void sgemm_q4_q8_d4_neon(int m, int n, int k_blocks,
+                                 const block_q4_0 *A, int lda,
+                                 const block_q8_0 *B, int ldb,
+                                 const float *B_d, int ldb_d,
+                                 float *C, int ldc, int ith, int nth) {
+    int64_t ytiles = m / 4;
+    int64_t xtiles = n / 4;
+    int64_t n_tail = n - xtiles * 4;
+    {
+        int64_t xtiles_ext = xtiles + (n_tail > 0 ? 1 : 0);
+        int64_t tiles = ytiles * xtiles_ext;
+        if (tiles > 0) {
+            int64_t duty = (tiles + nth - 1) / nth;
+            int64_t start = duty * ith;
+            int64_t end = start + duty;
+            if (end > tiles) end = tiles;
+            for (int64_t job = start; job < end; ++job) {
+                int64_t ii = (job / xtiles_ext) * 4;
+                int64_t xt = job % xtiles_ext;
+                if (xt < xtiles) {
+                    /* 4x4 tile */
+                    float32x4_t Cv[4][4];
+                    for (int r=0;r<4;r++) for (int c=0;c<4;c++) Cv[r][c]=vdupq_n_f32(0);
+                    int64_t jj = xt * 4;
+                    for (int64_t l = 0; l < k_blocks; ++l) {
+                        float tmp_da[4];
+                        tmp_da[0] = fp16_to_fp32(A[lda*(ii+0)+l].d);
+                        tmp_da[1] = fp16_to_fp32(A[lda*(ii+1)+l].d);
+                        tmp_da[2] = fp16_to_fp32(A[lda*(ii+2)+l].d);
+                        tmp_da[3] = fp16_to_fp32(A[lda*(ii+3)+l].d);
+                        int8x16_t a0_lo, a0_hi, a1_lo, a1_hi, a2_lo, a2_hi, a3_lo, a3_hi;
+                        neon_q4_qs(&A[lda*(ii+0)+l], &a0_lo, &a0_hi);
+                        neon_q4_qs(&A[lda*(ii+1)+l], &a1_lo, &a1_hi);
+                        neon_q4_qs(&A[lda*(ii+2)+l], &a2_lo, &a2_hi);
+                        neon_q4_qs(&A[lda*(ii+3)+l], &a3_lo, &a3_hi);
+                        for (int64_t jr=0; jr<4; ++jr) {
+                            const block_q8_0 *br = B + ldb*(jj+jr) + l;
+                            float32x4_t db = vld1q_dup_f32(B_d + ldb_d*(jj+jr) + l);
+                            int8x16_t blo = vld1q_s8(br->qs), bhi = vld1q_s8(br->qs+16);
+                            float32x4_t sc[4];
+                            sc[0]=vmulq_n_f32(db,tmp_da[0]); sc[1]=vmulq_n_f32(db,tmp_da[1]);
+                            sc[2]=vmulq_n_f32(db,tmp_da[2]); sc[3]=vmulq_n_f32(db,tmp_da[3]);
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+                            Cv[jr][0] = vmlaq_f32(Cv[jr][0], vcvtq_f32_s32(vmmlaq_s32(vmmlaq_s32(vdupq_n_s32(0),a0_lo,blo),a0_hi,bhi)), sc[0]);
+                            Cv[jr][1] = vmlaq_f32(Cv[jr][1], vcvtq_f32_s32(vmmlaq_s32(vmmlaq_s32(vdupq_n_s32(0),a1_lo,blo),a1_hi,bhi)), sc[1]);
+                            Cv[jr][2] = vmlaq_f32(Cv[jr][2], vcvtq_f32_s32(vmmlaq_s32(vmmlaq_s32(vdupq_n_s32(0),a2_lo,blo),a2_hi,bhi)), sc[2]);
+                            Cv[jr][3] = vmlaq_f32(Cv[jr][3], vcvtq_f32_s32(vmmlaq_s32(vmmlaq_s32(vdupq_n_s32(0),a3_lo,blo),a3_hi,bhi)), sc[3]);
+#else
+                            Cv[jr][0] = neon_vdot_accum(Cv[jr][0], a0_lo, blo, a0_hi, bhi, sc[0]);
+                            Cv[jr][1] = neon_vdot_accum(Cv[jr][1], a1_lo, blo, a1_hi, bhi, sc[1]);
+                            Cv[jr][2] = neon_vdot_accum(Cv[jr][2], a2_lo, blo, a2_hi, bhi, sc[2]);
+                            Cv[jr][3] = neon_vdot_accum(Cv[jr][3], a3_lo, blo, a3_hi, bhi, sc[3]);
+#endif
+                        }
+                    }
+                    for (int64_t jr=0; jr<4; ++jr)
+                        for (int64_t ir=0; ir<4; ++ir)
+                            C[ldc*(jj+jr)+(ii+ir)] = neon_hsum_f32(Cv[jr][ir]);
+                } else {
+                    /* 4xN tail tile */
+                    float32x4_t Cv[n_tail][4];
+                    for (int r=0;r<n_tail;r++) for (int c=0;c<4;c++) Cv[r][c]=vdupq_n_f32(0);
+                    int64_t jj = xtiles * 4;
+                    for (int64_t l = 0; l < k_blocks; ++l) {
+                        float tmp_da[4];
+                        tmp_da[0] = fp16_to_fp32(A[lda*(ii+0)+l].d);
+                        tmp_da[1] = fp16_to_fp32(A[lda*(ii+1)+l].d);
+                        tmp_da[2] = fp16_to_fp32(A[lda*(ii+2)+l].d);
+                        tmp_da[3] = fp16_to_fp32(A[lda*(ii+3)+l].d);
+                        int8x16_t a0_lo, a0_hi, a1_lo, a1_hi, a2_lo, a2_hi, a3_lo, a3_hi;
+                        neon_q4_qs(&A[lda*(ii+0)+l], &a0_lo, &a0_hi);
+                        neon_q4_qs(&A[lda*(ii+1)+l], &a1_lo, &a1_hi);
+                        neon_q4_qs(&A[lda*(ii+2)+l], &a2_lo, &a2_hi);
+                        neon_q4_qs(&A[lda*(ii+3)+l], &a3_lo, &a3_hi);
+                        for (int64_t jr=0; jr<n_tail; ++jr) {
+                            const block_q8_0 *br = B + ldb*(jj+jr) + l;
+                            float32x4_t db = vld1q_dup_f32(B_d + ldb_d*(jj+jr) + l);
+                            int8x16_t blo = vld1q_s8(br->qs), bhi = vld1q_s8(br->qs+16);
+                            float32x4_t sc[4];
+                            sc[0]=vmulq_n_f32(db,tmp_da[0]); sc[1]=vmulq_n_f32(db,tmp_da[1]);
+                            sc[2]=vmulq_n_f32(db,tmp_da[2]); sc[3]=vmulq_n_f32(db,tmp_da[3]);
+                            Cv[jr][0] = neon_vdot_accum(Cv[jr][0], a0_lo, blo, a0_hi, bhi, sc[0]);
+                            Cv[jr][1] = neon_vdot_accum(Cv[jr][1], a1_lo, blo, a1_hi, bhi, sc[1]);
+                            Cv[jr][2] = neon_vdot_accum(Cv[jr][2], a2_lo, blo, a2_hi, bhi, sc[2]);
+                            Cv[jr][3] = neon_vdot_accum(Cv[jr][3], a3_lo, blo, a3_hi, bhi, sc[3]);
+                        }
+                    }
+                    for (int64_t jr=0; jr<n_tail; ++jr)
+                        for (int64_t ir=0; ir<4; ++ir)
+                            C[ldc*(jj+jr)+(ii+ir)] = neon_hsum_f32(Cv[jr][ir]);
+                }
+            }
+        }
+    }
+    /* Remainder rows (m % 4) */
+    if (ith == 0) {
+        for (int64_t ii = ytiles*4; ii < m; ++ii) {
+            for (int64_t jj = 0; jj < n; ++jj) {
+                float32x4_t acc = vdupq_n_f32(0);
+                for (int64_t l=0; l<k_blocks; ++l) {
+                    const block_q4_0 *ar = &A[lda*ii+l];
+                    const block_q8_0 *br = B + ldb*jj + l;
+                    float32x4_t scale = vmulq_n_f32(
+                        vdupq_n_f32(fp16_to_fp32(br->d)),
+                        fp16_to_fp32(ar->d));
+                    int8x16_t alo, ahi; neon_q4_qs(ar, &alo, &ahi);
+                    int8x16_t blo = vld1q_s8(br->qs), bhi = vld1q_s8(br->qs+16);
+                    acc = neon_vdot_accum(acc, alo, blo, ahi, bhi, scale);
+                }
+                C[ldc*jj+ii] = neon_hsum_f32(acc);
+            }
+        }
+    }
+}
+
+/* ARM NEON Q5_0 x Q8_0 GEMM.
+ *
+ * TODO: SLOWER than delta path. Same 3x4 tile structure as sgemm_q4_q8_neon.
+ * Benchmarks: Q5_0 163ms/layer vs 110ms/layer for sgemm_neon_q5_qs_d4 (delta).
+ * 48% slower. Only reachable via PICOLM_NEON_Q4=nondelta. */
 static void sgemm_q5_q8_neon(int m, int n, int k_blocks,
                               const block_q5_0 *A, int lda,
                               const block_q8_0 *B, int ldb,
@@ -2199,10 +2345,18 @@ int picolm_sgemm(int m, int n, int k,
      * ggml/src/ggml-cpu/llamafile/sgemm.cpp case GGML_TYPE_IQ4_NL. */
 
     /* Quantized GEMM: A=quantized weights, B=Q8_0 pre-quantized activations
-     * k is number of blocks (k_blocks), each block has 32 values. */
+     * k is number of blocks (k_blocks), each block has 32 values.
+     *
+     * TODO: AVX2 non-delta paths are BROKEN. sgemm_q4_load_qs, sgemm_q5_load_qs,
+     * sgemm_q8_load_qs are called but never defined anywhere. Would cause linker
+     * errors if this dispatch arm is reached on AVX2. tensor.c always passes
+     * Btype=F32 for AVX2 (line 2313), so these are currently unreachable.
+     * To fix: either port the AVX2 QxQ8 kernels from llama.cpp, or remove the
+     * #if AVX2 blocks and fall through to NEON-only or _d path. */
     if (Btype == GGUF_TYPE_Q8_0 && m % 4 == 0 && n >= 2 && k >= 1) {
         if (Atype == GGUF_TYPE_Q8_0) {
 #if defined(__AVX2__) || defined(__AVX__)
+            /* TODO: DEAD/BROKEN - sgemm_q8_load_qs not defined. Would link-fail. */
             sgemm_q8_load_qs(m, n, k, (const block_q8_0*)A, lda, (const block_q8_0*)B, ldb, C, ldc, ith, nth);
             return 1;
 #elif defined(__ARM_NEON)
@@ -2211,18 +2365,22 @@ int picolm_sgemm(int m, int n, int k,
 #endif
         } else if (Atype == GGUF_TYPE_Q4_0) {
 #if defined(__AVX2__) || defined(__AVX__)
+            /* TODO: DEAD/BROKEN - sgemm_q4_load_qs not defined. Would link-fail. */
             sgemm_q4_load_qs(m, n, k, (const block_q4_0*)A, lda, (const block_q8_0*)B, ldb, C, ldc, ith, nth);
             return 1;
 #elif defined(__ARM_NEON)
-            sgemm_q4_q8_neon(m, n, k, (const block_q4_0*)A, lda, (const block_q8_0*)B, ldb, C, ldc, ith, nth);
+            { static int t_q4nd; if(getenv("PICOLM_DISPATCH")&&!t_q4nd) { t_q4nd=1; fprintf(stderr,"TRACE kernel: sgemm_q4_q8_neon (non-delta)\n"); }
+            sgemm_q4_q8_neon(m, n, k, (const block_q4_0*)A, lda, (const block_q8_0*)B, ldb, C, ldc, ith, nth); }
             return 1;
 #endif
         } else if (Atype == GGUF_TYPE_Q5_0) {
 #if defined(__AVX2__) || defined(__AVX__)
+            /* TODO: DEAD/BROKEN - sgemm_q5_load_qs not defined. Would link-fail. */
             sgemm_q5_load_qs(m, n, k, (const block_q5_0*)A, lda, (const block_q8_0*)B, ldb, C, ldc, ith, nth);
             return 1;
 #elif defined(__ARM_NEON)
-            sgemm_q5_q8_neon(m, n, k, (const block_q5_0*)A, lda, (const block_q8_0*)B, ldb, C, ldc, ith, nth);
+            { static int t_q5nd; if(getenv("PICOLM_DISPATCH")&&!t_q5nd) { t_q5nd=1; fprintf(stderr,"TRACE kernel: sgemm_q5_q8_neon (non-delta)\n"); }
+            sgemm_q5_q8_neon(m, n, k, (const block_q5_0*)A, lda, (const block_q8_0*)B, ldb, C, ldc, ith, nth); }
             return 1;
 #endif
         }
@@ -2241,6 +2399,12 @@ int picolm_sgemm_d(int m, int n, int k_blocks,
                    float *C, int ldc,
                    int Atype,
                    int ith, int nth) {
+    static int traced;
+    if (getenv("PICOLM_DISPATCH") && !traced && ith == 0) {
+        traced = 1;
+        const char *qname = Atype == GGUF_TYPE_Q8_0 ? "Q8_0" : Atype == GGUF_TYPE_Q4_0 ? "Q4_0" : Atype == GGUF_TYPE_Q5_0 ? "Q5_0" : "UNK";
+        fprintf(stderr, "TRACE picolm_sgemm_d: m=%d n=%d k=%d type=%s nth=%d\n", m, n, k_blocks, qname, nth);
+    }
     if (m < 4 || n < 2 || k_blocks < 1)
         return 0;
 #if defined(__AVX2__) && defined(__F16C__)
@@ -2267,11 +2431,13 @@ int picolm_sgemm_d(int m, int n, int k_blocks,
         sgemm_neon_q8_qs_d(m, n, k_blocks, (const block_q8_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth);
         return 1;
     } else if (Atype == GGUF_TYPE_Q4_0) {
-        if (n >= 4) { sgemm_neon_q4_qs_d4(m, n, k_blocks, (const block_q4_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth); return 1; }
+        static int t_d4; if(n >= 4) { if(getenv("PICOLM_DISPATCH")&&!t_d4) { t_d4=1; fprintf(stderr,"TRACE kernel: sgemm_neon_q4_qs_d4\n"); } sgemm_neon_q4_qs_d4(m, n, k_blocks, (const block_q4_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth); return 1; }
+        static int t_d; if(getenv("PICOLM_DISPATCH")&&!t_d) { t_d=1; fprintf(stderr,"TRACE kernel: sgemm_neon_q4_qs_d\n"); }
         sgemm_neon_q4_qs_d(m, n, k_blocks, (const block_q4_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth);
         return 1;
     } else if (Atype == GGUF_TYPE_Q5_0) {
-        if (n >= 4) { sgemm_neon_q5_qs_d4(m, n, k_blocks, (const block_q5_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth); return 1; }
+        static int t5_d4; if(n >= 4) { if(getenv("PICOLM_DISPATCH")&&!t5_d4) { t5_d4=1; fprintf(stderr,"TRACE kernel: sgemm_neon_q5_qs_d4\n"); } sgemm_neon_q5_qs_d4(m, n, k_blocks, (const block_q5_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth); return 1; }
+        static int t5_d; if(getenv("PICOLM_DISPATCH")&&!t5_d) { t5_d=1; fprintf(stderr,"TRACE kernel: sgemm_neon_q5_qs_d\n"); }
         sgemm_neon_q5_qs_d(m, n, k_blocks, (const block_q5_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth);
         return 1;
     }

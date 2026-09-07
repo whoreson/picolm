@@ -2240,6 +2240,27 @@ static void qgemm_d_task(int idx, void *ctxp) {
                    c->C, c->ldc, c->Atype, idx, c->nth);
 }
 
+/* Non-delta GEMM worker: dispatches picolm_sgemm with Btype=Q8_0.
+ *
+ * TODO: This worker routes to sgemm_q4_q8_neon/sgemm_q5_q8_neon which are SLOWER
+ * than the delta path. Only used when PICOLM_NEON_Q4=nondelta. The delta path
+ * (qgemm_d_task -> picolm_sgemm_d) is the default and fastest on basic NEON. */
+typedef struct {
+    int m, n, k_blocks;
+    const void *A; int lda;
+    const void *B; int ldb;
+    float *C; int ldc;
+    int Atype, Btype;
+    int nth;
+} sgemm_q8_ctx_t;
+
+static void sgemm_q8_worker(int idx, void *ctxp) {
+    sgemm_q8_ctx_t *c = (sgemm_q8_ctx_t *)ctxp;
+    picolm_sgemm(c->m, c->n, c->k_blocks, c->A, c->lda,
+                 c->B, c->ldb, c->C, c->ldc,
+                 c->Atype, c->Btype, idx, c->nth);
+}
+
 /* Q4_0_8_8 GEMM threading context */
 typedef struct {
     int nr, nc, k;
@@ -2313,6 +2334,87 @@ void matmul_batch(float *out, const float *x, int n_batch,
     if (picolm_sgemm(d, n_batch, n, wptr, n, x, n, out, d, qtype, GGUF_TYPE_F32, 0, 1)) {
         if (prof_active) { double dt = picolm_now()-t0; prof_f32_gemm+=dt; cnt_f32_gemm++; }
         return;
+    }
+
+    /* Q4_0/Q5_0/Q8_0 weights: quantize activations to Q8_0, then dispatch
+     * to tiled GEMM via picolm_sgemm or picolm_sgemm_d.
+     *
+     * PICOLM_NEON_Q4 controls which NEON Q4_0/Q5_0/Q8_0 path is used:
+     *   auto     - use _d path (pre-converted deltas, 4x4 tiles) -- FASTEST
+     *   delta    - same as auto
+     *   nondelta - use non-delta picolm_sgemm (Btype=Q8_0) -- SLOWER, for testing
+     *   scalar   - skip all GEMM, use scalar vec_dot (fast for Q4_0, terrible for Q5_0)
+     *   newd     - same as auto (kept for symmetry)
+     */
+    {
+        static const char *neon_q4_mode = NULL;
+        static int neon_q4_traced = 0;
+        if (!neon_q4_mode) neon_q4_mode = getenv("PICOLM_NEON_Q4");
+        int want_scalar = (neon_q4_mode && strcmp(neon_q4_mode, "scalar") == 0);
+        int want_delta  = (neon_q4_mode && (strcmp(neon_q4_mode, "delta") == 0 ||
+                                            strcmp(neon_q4_mode, "newd") == 0));
+        /* auto = delta path (non-delta is slower on basic NEON).
+         * Use non-delta only if explicitly requested. */
+        int want_nondelta = (neon_q4_mode && strcmp(neon_q4_mode, "nondelta") == 0);
+        if (!want_nondelta) want_delta = 1;
+        if (!want_scalar && n_batch >= 4 && d >= 4 && n % 32 == 0 &&
+            (qtype == GGUF_TYPE_Q4_0 || qtype == GGUF_TYPE_Q5_0 || qtype == GGUF_TYPE_Q8_0)) {
+            size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
+            void *qbuf = malloc((size_t)n_batch * q8_rb);
+            if (qbuf) {
+                int k_blocks = n / 32;
+                int nth = pool_total_threads(1);
+                for (int b = 0; b < n_batch; b++)
+                    quantize_row_q8_0(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
+
+                /* TODO: NON-DELTA PATH IS SLOWER. Only taken when PICOLM_NEON_Q4=nondelta.
+                 * Benchmarks: Q4_0 132ms/layer vs 98ms/layer for delta. Q5_0 163ms vs 110ms.
+                 * The 3x4 tiles with inline fp16->fp32 conversion are worse than 4x4 tiles
+                 * with pre-converted deltas. Kept for testing/comparison only. */
+                if (!want_delta) {
+                    /* picolm_sgemm(..., Btype=Q8_0) dispatches to sgemm_q4_q8_neon etc.
+                     * Multi-threaded: call once per thread via tensor_parallel_for. */
+                    sgemm_q8_ctx_t sa = { d, n_batch, k_blocks, W, k_blocks,
+                                          qbuf, k_blocks, out, d, qtype,
+                                          GGUF_TYPE_Q8_0, nth };
+                    tensor_parallel_for(nth, sgemm_q8_worker, &sa);
+                    if (getenv("PICOLM_DISPATCH") && !neon_q4_traced) {
+                        neon_q4_traced = 1;
+                        fprintf(stderr, "TRACE tensor.c: NON-DELTA picolm_sgemm (Btype=Q8_0)\n");
+                    }
+                    free(qbuf);
+                    if (prof_active) { double dt = picolm_now()-t0; prof_f32_gemm+=dt; cnt_f32_gemm++; }
+                    return;
+                }
+
+                /* Delta path: extract F32 deltas from Q8_0 blocks, use picolm_sgemm_d.
+                 * 4x4 tiles with pre-converted deltas (sgemm_neon_q4_qs_d4). */
+                float *qd_buf = malloc((size_t)n_batch * k_blocks * sizeof(float));
+                if (qd_buf) {
+                    const block_q8_0 *qb = (const block_q8_0 *)qbuf;
+                    for (int b = 0; b < n_batch; b++)
+                        for (int k = 0; k < k_blocks; k++)
+                            qd_buf[(size_t)b * k_blocks + k] = fp16_to_fp32(qb[(size_t)b * k_blocks + k].d);
+                    qgemm_d_ctx_t ctx = {
+                        .m = d, .n = n_batch, .k_blocks = k_blocks,
+                        .A = W, .lda = k_blocks,
+                        .B = (const block_q8_0 *)qbuf, .ldb = k_blocks,
+                        .B_d = qd_buf, .ldb_d = k_blocks,
+                        .C = out, .ldc = d, .Atype = qtype, .nth = nth,
+                    };
+                    tensor_parallel_for(nth, qgemm_d_task, &ctx);
+                    if (getenv("PICOLM_DISPATCH") && !neon_q4_traced) {
+                        neon_q4_traced = 1;
+                        fprintf(stderr, "TRACE tensor.c: DELTA picolm_sgemm_d\n");
+                    }
+                    free(qd_buf);
+                    free(qbuf);
+                    if (prof_active) { double dt = picolm_now()-t0; prof_f32_gemm+=dt; cnt_f32_gemm++; }
+                    return;
+                }
+                free(qbuf);
+            }
+        }
     }
 
 #if defined(PICOLM_AVX2)
@@ -2545,9 +2647,16 @@ void matmul_batch(float *out, const float *x, int n_batch,
 #if defined(__ARM_NEON)
     /* NEON tiled GEMM with pre-converted deltas (picolm_sgemm_d).
      * Activation reuse across 4 weight rows per tile benefits even
-     * basic NEON (widen). Lower threshold to match AVX2 path. */
-    if (have_qx && qx_d_buf && d >= 4 &&
+     * basic NEON (widen). Lower threshold to match AVX2 path.
+     * PICOLM_NEON_Q4=scalar skips this path entirely.
+     * PICOLM_NEON_Q4=delta forces this path (skips the early intercept above). */
+    static const char *neon_q4_mode2 = NULL;
+    static int neon_q4_traced_delta = 0;
+    if (!neon_q4_mode2) neon_q4_mode2 = getenv("PICOLM_NEON_Q4");
+    int neon_q4_scalar = (neon_q4_mode2 && strcmp(neon_q4_mode2, "scalar") == 0);
+    if (!neon_q4_scalar && have_qx && qx_d_buf && d >= 4 &&
         (qtype == GGUF_TYPE_Q8_0 || qtype == GGUF_TYPE_Q4_0 || qtype == GGUF_TYPE_Q5_0)) {
+        if (getenv("PICOLM_DISPATCH") && !neon_q4_traced_delta) { neon_q4_traced_delta = 1; fprintf(stderr, "TRACE tensor.c: EXISTING _d path taken (mode=%s)\n", neon_q4_mode2); }
         int min_batch = (qtype == GGUF_TYPE_Q8_0) ? 16 : 4;
         if (n_batch >= min_batch) {
             int k_blocks = n / 32;
@@ -2857,7 +2966,15 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
     }
 #endif
 #if defined(__ARM_NEON)
-    /* NEON tiled GEMM for dual batch. Same structure as AVX2 path. */
+    /* NEON tiled GEMM for dual batch. Same structure as AVX2 path.
+     *
+     * TODO: This path is NOT guarded by PICOLM_NEON_Q4. It always uses the
+     * delta GEMM path (picolm_sgemm_d) regardless of mode setting. This means
+     * PICOLM_NEON_Q4=scalar still runs GEMM for K+V/gate+up projections.
+     * Only ~3 of 7 matmuls per layer go through matmul_batch (Q/O/FFN-down).
+     * The other ~4 go through matmul_dual_batch (K,V,gate,up) and always hit GEMM.
+     * To fix: add same PICOLM_NEON_Q4 guard here, or accept that scalar mode
+     * only affects single-batch paths. */
     if (n_batch >= 4 && d >= 4 && n > 0 &&
         (qtype1 == GGUF_TYPE_Q8_0 || qtype1 == GGUF_TYPE_Q4_0 || qtype1 == GGUF_TYPE_Q5_0) &&
         (qtype2 == GGUF_TYPE_Q8_0 || qtype2 == GGUF_TYPE_Q4_0 || qtype2 == GGUF_TYPE_Q5_0)) {
