@@ -423,7 +423,7 @@ else
 # Common SDK locations (Linux + Windows via MSYS path translation)
 VK_INC      := $(shell for d in /opt/vulkan-sdk/include /usr/include; do \
                if [ -d "$$d" ]; then echo "$$d"; break; fi; done)
-VK_LIB      := $(shell for d in /opt/vulkan-sdk/lib /usr/lib; do \
+VK_LIB      := $(shell for d in /opt/vulkan-sdk/lib /usr/lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu/vulkan /usr/lib; do \
                if [ -d "$$d" ]; then echo "$$d"; break; fi; done)
 VK_BIN      := $(shell for d in /opt/vulkan-sdk/bin /usr/bin; do \
                if [ -d "$$d" ]; then echo "$$d"; break; fi; done)
@@ -447,6 +447,8 @@ VK_EXTRA_INC = $(if $(VK_INC),$(shell if [ -d "$(VK_INC)" ]; then echo "-I$(VK_I
 VK_EXTRA_LIB = $(if $(VULKAN_SDK),$(shell \
                if [ -f "$(VULKAN_SDK)/Lib/vulkan-1.lib" ]; then echo "$(VULKAN_SDK)/Lib/vulkan-1.lib"; \
                elif [ -f "$(VK_LIB)/libvulkan.a" ] || [ -f "$(VK_LIB)/libvulkan.so" ]; then echo "-L$(VK_LIB) -lvulkan"; \
+               else echo "-lvulkan"; fi),$(shell \
+               if [ -f "$(VK_LIB)/libvulkan.a" ] || [ -f "$(VK_LIB)/libvulkan.so" ]; then echo "-L$(VK_LIB) -lvulkan"; \
                else echo "-lvulkan"; fi))
 VK_CFLAGS   ?= -O3 -std=c11 -fPIC -Wall $(VK_EXTRA_INC)
 VK_LDFLAGS  ?= $(VK_EXTRA_LIB)

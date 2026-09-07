@@ -980,6 +980,7 @@ static void sgemm_bf16_bf16(int m, int n, int k, const uint16_t *A, int lda,
 #else
 #define SGEMM_FMA(a,b,c) _mm256_add_ps(_mm256_mul_ps(a,b),c)
 #endif
+#if defined(__AVX2__)
 static void sgemm_bf16_f32(int m, int n, int k, const uint16_t *A, int lda,
                             const float *B, int ldb, float *C, int ldc,
                             int ith, int nth) {
@@ -1106,6 +1107,7 @@ static void sgemm_bf16_bf16(int m, int n, int k, const uint16_t *A, int lda,
 #undef SGEMM_RN
 #undef SGEMM_BN
 #endif /* AVX2 F16C chain */
+#endif /* AVX__ || AVX2__ chain */
 
 /* ============================================================
  * Quantized GEMM kernels (Q8_0 x Q8_0, Q4_0 x Q8_0, Q5_0 x Q8_0)
@@ -1121,7 +1123,7 @@ static void sgemm_bf16_bf16(int m, int n, int k, const uint16_t *A, int lda,
  * using unsigned multiply hardware (maddubs or dpbusd).
  * ============================================================ */
 
-#if defined(__AVX2__) || defined(__AVX__)
+#if defined(__AVX2__)
 
 /* Horizontal sum of __m256 -> float */
 static float q8_hsum_f32(__m256 x) {
@@ -1291,7 +1293,7 @@ QGEMM_DEFINE(q8_load_qs, block_q8_0)
 QGEMM_DEFINE(q4_load_qs, block_q4_0)
 QGEMM_DEFINE(q5_load_qs, block_q5_0)
 
-#endif /* AVX2/AVX */
+#endif /* AVX2 */
 
 /* ARM NEON / I8MM / DOTPROD path */
 #if defined(__ARM_NEON)
@@ -2321,14 +2323,14 @@ int picolm_sgemm(int m, int n, int k,
         if (Btype == GGUF_TYPE_F32) {
 #if defined(__AVX512F__)
             if (k % 16 == 0 && m % 4 == 0) { sgemm_bf16_f32(m,n,k,(const uint16_t*)A,lda,(const float*)B,ldb,C,ldc,ith,nth); return 1; }
-#elif defined(__AVX__) || defined(__AVX2__)
+#elif defined(__AVX2__)
             if (k % 8 == 0 && m % 4 == 0) { sgemm_bf16_f32(m,n,k,(const uint16_t*)A,lda,(const float*)B,ldb,C,ldc,ith,nth); return 1; }
 #endif
         }
         if (Btype == GGUF_TYPE_BF16) {
 #if defined(__AVX512F__)
             if (k % 16 == 0 && m % 4 == 0) { sgemm_bf16_bf16(m,n,k,(const uint16_t*)A,lda,(const uint16_t*)B,ldb,C,ldc,ith,nth); return 1; }
-#elif defined(__AVX__) || defined(__AVX2__)
+#elif defined(__AVX2__)
             if (k % 8 == 0 && m % 4 == 0) { sgemm_bf16_bf16(m,n,k,(const uint16_t*)A,lda,(const uint16_t*)B,ldb,C,ldc,ith,nth); return 1; }
 #endif
         }
@@ -2355,7 +2357,7 @@ int picolm_sgemm(int m, int n, int k,
      * #if AVX2 blocks and fall through to NEON-only or _d path. */
     if (Btype == GGUF_TYPE_Q8_0 && m % 4 == 0 && n >= 2 && k >= 1) {
         if (Atype == GGUF_TYPE_Q8_0) {
-#if defined(__AVX2__) || defined(__AVX__)
+#if defined(__AVX2__)
             /* TODO: DEAD/BROKEN - sgemm_q8_load_qs not defined. Would link-fail. */
             sgemm_q8_load_qs(m, n, k, (const block_q8_0*)A, lda, (const block_q8_0*)B, ldb, C, ldc, ith, nth);
             return 1;
@@ -2364,7 +2366,7 @@ int picolm_sgemm(int m, int n, int k,
             return 1;
 #endif
         } else if (Atype == GGUF_TYPE_Q4_0) {
-#if defined(__AVX2__) || defined(__AVX__)
+#if defined(__AVX2__)
             /* TODO: DEAD/BROKEN - sgemm_q4_load_qs not defined. Would link-fail. */
             sgemm_q4_load_qs(m, n, k, (const block_q4_0*)A, lda, (const block_q8_0*)B, ldb, C, ldc, ith, nth);
             return 1;
@@ -2374,7 +2376,7 @@ int picolm_sgemm(int m, int n, int k,
             return 1;
 #endif
         } else if (Atype == GGUF_TYPE_Q5_0) {
-#if defined(__AVX2__) || defined(__AVX__)
+#if defined(__AVX2__)
             /* TODO: DEAD/BROKEN - sgemm_q5_load_qs not defined. Would link-fail. */
             sgemm_q5_load_qs(m, n, k, (const block_q5_0*)A, lda, (const block_q8_0*)B, ldb, C, ldc, ith, nth);
             return 1;

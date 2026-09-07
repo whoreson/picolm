@@ -2346,6 +2346,9 @@ void matmul_batch(float *out, const float *x, int n_batch,
      *   scalar   - skip all GEMM, use scalar vec_dot (fast for Q4_0, terrible for Q5_0)
      *   newd     - same as auto (kept for symmetry)
      */
+    /* Requires AVX2+F16C or ARM NEON for the GEMM worker types/functions.
+     * Guarded by the same preprocessor condition as qgemm_d_ctx_t et al. */
+    #if (defined(__AVX2__) && defined(__F16C__)) || defined(__ARM_NEON)
     {
         static const char *neon_q4_mode = NULL;
         static int neon_q4_traced = 0;
@@ -2416,6 +2419,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
             }
         }
     }
+    #endif /* AVX2+F16C || ARM NEON for qgemm_d_ctx_t / sgemm_q8_ctx_t */
 
 #if defined(PICOLM_AVX2)
     /* Q4_0_8_8 tiled GEMM (AVX-512 only, 16-row tiles).
