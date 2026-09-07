@@ -1950,8 +1950,8 @@ static float *model_forward_gpt2(model_t *m, int token, int pos) {
             for (int i = 0; i < n_ffn; i++) s->hb[i] += bias[i];
         }
 
-        /* GELU activation (lookup table for speed) */
-        picolm_gelu_table_f32(s->hb, n_ffn);
+        /* GELU activation -- use F32 formula for numerical accuracy (PICOLM_GELU_F32=1) */
+        gelu(s->hb, n_ffn);
 
         /* FFN down: [n_ffn, dim] */
         tensor_set_repacked(m->repack_used[ri+5] ? m->repack_buffers[ri+5] : NULL);
@@ -3176,9 +3176,9 @@ static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_to
             }
         }
 
-        /* GELU activation (batched) */
+        /* GELU activation (batched) -- use F32 formula for accuracy (PICOLM_GELU_F32=1) */
         for (int bi = 0; bi < n_tokens; bi++)
-            picolm_gelu_table_f32(hb_batch + bi * n_ffn, n_ffn);
+            gelu(hb_batch + bi * n_ffn, n_ffn);
 
         /* FFN down (batched): [n_ffn, dim] */
         tensor_set_repacked(m->repack_used[7 + l * 9] ? m->repack_buffers[7 + l * 9] : NULL);
