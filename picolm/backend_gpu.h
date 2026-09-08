@@ -510,6 +510,7 @@ int picolm_gpu_ssm_pipeline_alloc(int conv_dim, int ssm_d_inner, int n_v_heads, 
 /* Free all pipeline buffers on all devices. */
 void picolm_gpu_pipeline_free(void);
 int picolm_gpu_prealloc_q8(size_t max_xq_bytes, size_t max_xd_bytes, int device);
+int picolm_gpu_pipeline_logits_alloc(size_t bytes, int device);
 
 /* Accessors for the pipeline buffers -- gpu_device_ctx_t is file-static
  * to backend_gpu.cu, so model.c reaches the buffers through these rather

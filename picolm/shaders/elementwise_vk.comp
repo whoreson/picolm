@@ -48,7 +48,8 @@ void main() {
     } else if (pc.op == 1) {
         if (gid < uint(pc.n)) {
             float g = d0[gid];
-            d0[gid] = g * (g / (1.0 + exp(-g))) * d1[gid];
+            float silu_g = g / (1.0 + exp(-g));
+            d0[gid] = silu_g * d1[gid];
         }
     } else if (pc.op == 2) {
         uint hd2 = uint(pc.n);

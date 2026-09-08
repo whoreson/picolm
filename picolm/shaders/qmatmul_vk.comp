@@ -1,6 +1,4 @@
 #version 450
-#extension GL_KHR_shader_subgroup_arithmetic : require
-#extension GL_KHR_shader_subgroup_basic : require
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer X  { float x[]; };
@@ -13,8 +11,7 @@ layout(push_constant) uniform P {
     int rowWords;
 } p;
 
-shared float xsh[7968];
-shared float sg_sum[8];
+shared float red[256];
 
 float f16tof32(uint h) {
     uint s = (h >> 15u) & 1u;
@@ -35,109 +32,17 @@ uint read_byte(uint rowBase, uint byteOff) {
     return (w[wIdx] >> ((byteOff % 4u) * 8u)) & 0xffu;
 }
 
-// Q2_K: 256 values in 84 bytes: scales[16] + qs[64] + d(fp16) + dmin(fp16)
-float dequant_q2_K(uint rowBase, uint bo, int i) {
-    uint d_raw = read_byte(rowBase, bo+80u) | (read_byte(rowBase, bo+81u) << 8u);
-    uint dm_raw = read_byte(rowBase, bo+82u) | (read_byte(rowBase, bo+83u) << 8u);
-    float d = f16tof32(d_raw);
-    float dmin = f16tof32(dm_raw);
-    
-    int chunk = i / 128;
-    int i_in_chunk = i % 128;
-    int group = i_in_chunk / 16;
-    int l = i_in_chunk % 16;
-    int shift = (group % 4) * 2;
-    int half_grp = group / 4;
-    int scale_idx = chunk * 8 + group;
-    
-    uint sc_byte = read_byte(rowBase, bo + uint(scale_idx));
-    uint sc = sc_byte & 0xfu;
-    uint mn = sc_byte >> 4u;
-    
-    uint qs_val = read_byte(rowBase, bo + 16u + uint(chunk*32 + half_grp*16 + l));
-    int v = int((qs_val >> shift) & 3u);
-    
-    return d * float(sc) * float(v) - dmin * float(mn);
-}
-
-// Q3_K: 256 values in 110 bytes
-float dequant_q3_K(uint rowBase, uint bo, int i) {
-    uint d_raw = read_byte(rowBase, bo+108u) | (read_byte(rowBase, bo+109u) << 8u);
-    float d = f16tof32(d_raw);
-    
-    uint s0 = w[rowBase + (bo + 96u) / 4u];
-    uint s1 = w[rowBase + (bo + 100u) / 4u];
-    uint s2 = w[rowBase + (bo + 104u) / 4u];
-    
-    uint bo_mod = bo % 4u;
-    if (bo_mod != 0u) {
-        uint shift0 = bo_mod * 8u;
-        s0 = (s0 >> shift0) | (w[rowBase + (bo + 96u) / 4u + 1u] << (32u - shift0));
-        s1 = (s1 >> shift0) | (w[rowBase + (bo + 100u) / 4u + 1u] << (32u - shift0));
-        s2 = (s2 >> shift0) | (w[rowBase + (bo + 104u) / 4u + 1u] << (32u - shift0));
-    }
-    
-    uint tmp = s2;
-    uint a0 = (s0 & 0x0F0F0F0F) | ((tmp & 0x03030303) << 4);
-    uint a1 = (s1 & 0x0F0F0F0F) | (((tmp >> 2) & 0x03030303) << 4);
-    uint a2 = ((s0 >> 4) & 0x0F0F0F0F) | (((tmp >> 4) & 0x03030303) << 4);
-    uint a3 = ((s1 >> 4) & 0x0F0F0F0F) | (((tmp >> 6) & 0x03030303) << 4);
-    
-    int chunk = i / 128;
-    int i_in_chunk = i % 128;
-    int sub_16 = i_in_chunk / 16;
-    int l = i_in_chunk % 16;
-    int scale_idx = chunk * 8 + sub_16;
-    int aux_idx = scale_idx / 4;
-    int nibble = scale_idx % 4;
-    uint aux_val;
-    if (aux_idx == 0) aux_val = a0;
-    else if (aux_idx == 1) aux_val = a1;
-    else if (aux_idx == 2) aux_val = a2;
-    else aux_val = a3;
-    int scale = int((aux_val >> (nibble * 8u)) & 0xffu);
-    
-    int shift = (sub_16 % 4) * 2;
-    int qs_half = sub_16 / 4;
-    int qs_idx = chunk * 32 + qs_half * 16 + l;
-    uint qs_val = read_byte(rowBase, bo + 32u + uint(qs_idx));
-    int q = int((qs_val >> shift) & 3u);
-    
-    int hm_byte_idx = chunk * 16 + qs_half * 8 + l;
-    int hm_bit = (sub_16 % 4);
-    uint hm_byte = read_byte(rowBase, bo + uint(hm_byte_idx));
-    int hm_bit_val = int((hm_byte >> hm_bit) & 1u);
-    
-    int offset = (hm_bit_val != 0) ? 0 : 4;
-    return d * float(scale - 32) * float(q - offset);
-}
-
 void main() {
     int s   = int(gl_WorkGroupID.y);
     int tid = int(gl_LocalInvocationID.x);
-    int nth = int(gl_WorkGroupSize.x);
-    int sg      = int(gl_SubgroupID);
-    int lane    = int(gl_SubgroupInvocationID);
-    int sgsize  = int(gl_SubgroupSize);
-
-    int o = int(gl_WorkGroupID.x);
-    if (o >= p.O) return;
-
-    bool staged = p.I <= 7968;
-    if (staged) {
-        for (int i = tid; i < p.I; i += nth)
-            xsh[i] = x[s * p.I + i];
-    }
-    memoryBarrierShared();
-    barrier();
-
+    int o   = int(gl_WorkGroupID.x);
     int xoff = s * p.I;
     uint rowBase = uint(o) * uint(p.rowWords);
     float sum = 0.0;
 
     if (p.fmt == 8) {
         int nblocks = (p.I + 31) / 32;
-        for (int bi = tid; bi < nblocks; bi += nth) {
+        for (int bi = tid; bi < nblocks; bi += 256) {
             uint bo = uint(bi) * 34u;
             uint dWord = rowBase + bo / 4u;
             uint dShift = (bo % 4u) * 8u;
@@ -147,13 +52,12 @@ void main() {
                 if (vi >= p.I) break;
                 uint bv = read_byte(rowBase, bo + 2u + uint(v));
                 int val = int(bv); if (val >= 128) val -= 256;
-                float xval = staged ? xsh[vi] : x[xoff + vi];
-                sum += xval * float(val) * d;
+                sum += x[xoff + vi] * float(val) * d;
             }
         }
     } else if (p.fmt == 2) {
         int nblocks = (p.I + 31) / 32;
-        for (int bi = tid; bi < nblocks; bi += nth) {
+        for (int bi = tid; bi < nblocks; bi += 256) {
             uint bo = uint(bi) * 18u;
             float d = f16tof32(read_byte(rowBase, bo) | (read_byte(rowBase, bo+1u) << 8u));
             for (int v = 0; v < 32; v++) {
@@ -163,52 +67,26 @@ void main() {
                 uint ns = v < 16 ? 0u : 4u;
                 uint bv = read_byte(rowBase, bo + 2u + ni);
                 int val = int((bv >> ns) & 0xfu) - 8;
-                float xval = staged ? xsh[vi] : x[xoff + vi];
-                sum += xval * float(val) * d;
+                sum += x[xoff + vi] * float(val) * d;
             }
         }
     } else if (p.fmt == 1) {
-        for (int i = tid; i < p.I; i += nth) {
-            float xval = staged ? xsh[i] : x[xoff + i];
-            sum += xval * f16tof32(read_byte(rowBase, uint(i)*2u) | (read_byte(rowBase, uint(i)*2u+1u) << 8u));
+        for (int i = tid; i < p.I; i += 256) {
+            sum += x[xoff + i] * f16tof32(read_byte(rowBase, uint(i)*2u) | (read_byte(rowBase, uint(i)*2u+1u) << 8u));
         }
     } else if (p.fmt == 0) {
-        for (int i = tid; i < p.I; i += nth) {
-            float xval = staged ? xsh[i] : x[xoff + i];
-            sum += xval * uintBitsToFloat(w[rowBase + uint(i)]);
-        }
-    } else if (p.fmt == 10) {
-        int nblocks = (p.I + 255) / 256;
-        for (int bi = tid; bi < nblocks; bi += nth) {
-            uint bo = uint(bi) * 84u;
-            for (int j = 0; j < 256; j++) {
-                int vi = bi * 256 + j;
-                if (vi >= p.I) break;
-                sum += (staged ? xsh[vi] : x[xoff + vi]) * dequant_q2_K(rowBase, bo, j);
-            }
-        }
-    } else if (p.fmt == 11) {
-        int nblocks = (p.I + 255) / 256;
-        for (int bi = tid; bi < nblocks; bi += nth) {
-            uint bo = uint(bi) * 110u;
-            for (int j = 0; j < 256; j++) {
-                int vi = bi * 256 + j;
-                if (vi >= p.I) break;
-                sum += (staged ? xsh[vi] : x[xoff + vi]) * dequant_q3_K(rowBase, bo, j);
-            }
+        for (int i = tid; i < p.I; i += 256) {
+            sum += x[xoff + i] * uintBitsToFloat(w[rowBase + uint(i)]);
         }
     }
 
-    float tot = subgroupAdd(sum);
-    if (lane == 0) sg_sum[sg] = tot;
+    red[tid] = sum;
+    memoryBarrierShared();
     barrier();
-
-    int nsubgroups = nth / sgsize;
-    if (sg == 0) {
-        float final = 0.0;
-        for (int si = lane; si < nsubgroups; si += sgsize) final += sg_sum[si];
-        final = subgroupAdd(final);
-        if (lane == 0) y[s * p.O + o] = final;
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) red[tid] += red[tid + stride];
+        memoryBarrierShared();
+        barrier();
     }
+    if (tid == 0) y[s * p.O + o] = red[0];
 }
-

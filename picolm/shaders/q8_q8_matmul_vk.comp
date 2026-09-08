@@ -1,21 +1,6 @@
 #version 450
-#extension GL_KHR_shader_subgroup_arithmetic : require
-#extension GL_KHR_shader_subgroup_basic : require
 // Q8_0 x Q8_0 matmul: y[S][O] = xq[S][I] * xd[S][n_blocks] @ W[O][I]
-// All on device.
-//
-// xq: int8 activations packed as uint32 words [S][I]
-// xd: float deltas [S][n_blocks] where n_blocks = I/32
-// W:  Q8_0 weight blocks [O][n_blocks][34 bytes] stored as raw uint32 words
-//
-// Each workgroup = one (s, o) output element, 256 threads for reduction.
-//
-// Push constants: int I, int S, int O, int rowWords = 16 bytes
-// Binding 0: readonly XQ (uint32-packed int8)
-// Binding 1: readonly XD (float deltas)
-// Binding 2: readonly W  (uint32-packed Q8_0 blocks)
-// Binding 3: writeonly Y  (float)
-
+// 256 threads per workgroup, pure shared-memory tree reduction.
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer XQ { uint xq[]; };
@@ -30,7 +15,7 @@ layout(push_constant) uniform P {
     int rowWords;
 } p;
 
-shared float sg_sum[8];
+shared float red[256];
 
 float f16tof32(uint h) {
     uint s = (h >> 15u) & 1u;
@@ -46,30 +31,19 @@ float f16tof32(uint h) {
     return uintBitsToFloat(bits);
 }
 
-uint read_byte(uint rowBase, uint byteOff) {
-    uint wIdx = rowBase + byteOff / 4u;
-    return (w[wIdx] >> ((byteOff % 4u) * 8u)) & 0xffu;
-}
-
 void main() {
     int s   = int(gl_WorkGroupID.y);
     int tid = int(gl_LocalInvocationID.x);
-    int nth = int(gl_WorkGroupSize.x);
-    int sg      = int(gl_SubgroupID);
-    int lane    = int(gl_SubgroupInvocationID);
-    int sgsize  = int(gl_SubgroupSize);
-    int o       = int(gl_WorkGroupID.x);
-
-    if (o >= p.O || s >= p.S) return;
+    int o   = int(gl_WorkGroupID.x);
 
     int nblocks = p.I / 32;
     uint rowBase = uint(o) * uint(p.rowWords);
-    uint xq_base = uint(s) * uint(p.I) / 4u;  // uint32 words: I bytes / 4
+    uint xq_base = uint(s) * uint(p.I) / 4u;
     int xd_base = s * nblocks;
 
     float sum = 0.0;
 
-    for (int bi = tid; bi < nblocks; bi += nth) {
+    for (int bi = tid; bi < nblocks; bi += 256) {
         uint bo = uint(bi) * 34u;
         uint dWord = rowBase + bo / 4u;
         uint dShift = (bo % 4u) * 8u;
@@ -77,13 +51,12 @@ void main() {
         float ad = xd[xd_base + bi];
         float scale = wd * ad;
 
-        uint aqs_base = xq_base + uint(bi) * 8u;  // 8 uint32 words per 32-value block
+        uint aqs_base = xq_base + uint(bi) * 8u;
 
         for (int v = 0; v < 32; v++) {
             int vi = bi * 32 + v;
             if (vi >= p.I) break;
 
-            // Weight byte offset: bi*34 + 2(v for qs skip delta) + v
             uint wbyte_off = rowBase + (bo + 2u + uint(v)) / 4u;
             uint wshift = ((bo + 2u + uint(v)) % 4u) * 8u;
             uint wbyte = (w[wbyte_off] >> wshift) & 0xffu;
@@ -99,16 +72,12 @@ void main() {
         }
     }
 
-    float tot = subgroupAdd(sum);
-    if (lane == 0) sg_sum[sg] = tot;
+    // Shared-memory tree reduction
+    red[tid] = sum;
     barrier();
-
-    int nsubgroups = nth / sgsize;
-    if (sg == 0) {
-        float final = 0.0;
-        for (int si = lane; si < nsubgroups; si += sgsize) final += sg_sum[si];
-        final = subgroupAdd(final);
-        if (lane == 0) y[s * p.O + o] = final;
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) red[tid] += red[tid + stride];
+        barrier();
     }
+    if (tid == 0) y[s * p.O + o] = red[0];
 }
-

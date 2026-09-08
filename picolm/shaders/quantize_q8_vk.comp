@@ -41,6 +41,7 @@ void main() {
 
     float v = (tid < uint(valid)) ? x[base + tid] : 0.0;
 
+    // Step 1: Find max absolute value
     amax_sh[tid] = abs(v);
     memoryBarrierShared();
     barrier();
@@ -53,18 +54,27 @@ void main() {
     }
     float amax0 = amax_sh[0];
 
+    // Step 2: Quantize
     float d_val = amax0 / 127.0;
     float id = (d_val > 0.0) ? (1.0 / d_val) : 0.0;
     float qs_val = v * id;
     int qi = int(qs_val + (qs_val >= 0.0 ? 0.5 : -0.5));
     qi = clamp(qi, -128, 127);
 
-    // Pack int8 into shared uint32 words (4 bytes per word)
-    uint packed = uint(qi + 128);  // convert to unsigned 0..255
-    qs_sh[tid / 4u] |= packed << ((tid % 4u) * 8u);
+    // Step 3: Pack int8 into shared uint32 words
+    // Initialize shared words to 0 first, then pack
+    qs_sh[tid / 4u] = uint(qi & 0xffu) << ((tid % 4u) * 8u);
     memoryBarrierShared();
     barrier();
 
+    // Combine 4 words into 1 uint32 using add (no |= race)
+    if (tid % 4u == 0u) {
+        qs_sh[tid / 4u] = qs_sh[tid / 4u] + qs_sh[tid / 4u + 1u] + qs_sh[tid / 4u + 2u] + qs_sh[tid / 4u + 3u];
+        memoryBarrierShared();
+        barrier();
+    }
+
+    // Step 4: Write output
     if (tid == 0u) {
         uint out_base = (s * n_blocks * 32u + blk * 32u) / 4u;
         for (uint w = 0; w < 8; w++)
@@ -72,4 +82,3 @@ void main() {
         d[s * n_blocks + blk] = d_val;
     }
 }
-

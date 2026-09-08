@@ -49,6 +49,10 @@ static double vk_now(void) {
     fprintf(stderr, "[VK] %s:%d %s failed: %d\n", __FILE__, __LINE__, what, (int)_r); \
     return 0; } } while (0)
 
+// Forward decls for shutdown cleanup
+static VkBuffer unwrap_buf_offset(const void *p, VkDeviceSize *out_off);
+static void free_dev_buf(void *p);
+
 // ---------------------------------------------------------------------------
 // Global state
 // ---------------------------------------------------------------------------
@@ -183,16 +187,21 @@ static struct {
              pipe_attn_out_b, pipe_ffn_norm_b, pipe_gate_b, pipe_up_b;
     VkDeviceMemory pipe_x_b_m, pipe_xb_b_m, pipe_q_b_m, pipe_k_b_m, pipe_v_b_m,
                    pipe_attn_out_b_m, pipe_ffn_norm_b_m, pipe_gate_b_m, pipe_up_b_m;
+    VkBuffer pipe_logits_buf; VkDeviceMemory pipe_logits_m;
     size_t pipe_b_max_seq_len, pipe_b_xb_stride;
     /* Cached wrappers for batch pipes */
     void *pipe_x_b_d, *pipe_xb_b_d, *pipe_q_b_d, *pipe_k_b_d, *pipe_v_b_d,
-          *pipe_attn_out_b_d, *pipe_ffn_norm_b_d, *pipe_gate_b_d, *pipe_up_b_d;
+          *pipe_attn_out_b_d, *pipe_ffn_norm_b_d, *pipe_gate_b_d, *pipe_up_b_d, *pipe_logits_d;
 
     // Phase 2: KV cache on device
     VkBuffer kv_k_buf, kv_v_buf;
     VkDeviceMemory kv_k_mem, kv_v_mem;
     size_t kv_k_bytes, kv_v_bytes;
     void *kv_k_d, *kv_v_d;  /* cached wrappers */
+    // KV staging buffer (device-local, for KAVERI shader read workaround)
+    VkBuffer kv_staging_buf;
+    VkDeviceMemory kv_staging_mem;
+    size_t kv_staging_cap;
 
     // Phase 2: staging buffer for H2D transfers
     VkBuffer staging_buf;
@@ -319,7 +328,7 @@ static int pick_memtype_local(VkPhysicalDevice phys) {
 
 static int alloc_device_local(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem) {
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = bytes, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .size = bytes, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
     VKCHECK(vkCreateBuffer(G.dev, &bi, NULL, buf), "vkCreateBuffer(dev)");
     VkMemoryRequirements req;
@@ -351,6 +360,24 @@ static int alloc_hostvis_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem,
     VKCHECK(vkBindBufferMemory(G.dev, *buf, *mem, 0), "vkBindBufferMemory");
     if (ptr) {
         VKCHECK(vkMapMemory(G.dev, *mem, 0, bytes, 0, ptr), "vkMapMemory");
+            }
+    return 1;
+}
+
+static int alloc_hostvis_mt2(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem,
+                            void **ptr, uint32_t memtype, VkBufferUsageFlags usage) {
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = bytes, .usage = usage,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    VKCHECK(vkCreateBuffer(G.dev, &bi, NULL, buf), "vkCreateBuffer(hv2)");
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(G.dev, *buf, &req);
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = req.size, .memoryTypeIndex = memtype};
+    VKCHECK(vkAllocateMemory(G.dev, &ai, NULL, mem), "vkAllocateMemory(hv2)");
+    VKCHECK(vkBindBufferMemory(G.dev, *buf, *mem, 0), "vkBindBufferMemory(hv2)");
+    if (ptr) {
+        VKCHECK(vkMapMemory(G.dev, *mem, 0, bytes, 0, ptr), "vkMapMemory(hv2)");
             }
     return 1;
 }
@@ -580,10 +607,11 @@ int picolm_gpu_init(const int *devices, int count) {
     // Print device limits for debugging
     VkPhysicalDeviceProperties pdev;
     vkGetPhysicalDeviceProperties(G.phys, &pdev);
-    fprintf(stderr, "[VK] limits: maxSharedMem=%u maxWorkGroupSize=%u maxComputeWorkGroupCount[0]=%u\n",
+    fprintf(stderr, "[VK] limits: maxSharedMem=%u maxWGSize=%u maxWGCount=%u maxStorageBuf=%u\n",
             (unsigned)pdev.limits.maxComputeSharedMemorySize,
             (unsigned)pdev.limits.maxComputeWorkGroupSize[0],
-            (unsigned)pdev.limits.maxComputeWorkGroupCount[0]);
+            (unsigned)pdev.limits.maxComputeWorkGroupCount[0],
+            (unsigned)pdev.limits.maxStorageBufferRange);
 
     int mt = pick_memtype(G.phys);
     if (mt < 0) { fprintf(stderr, "[VK] no host-visible memory\n"); return 0; }
@@ -598,6 +626,36 @@ int picolm_gpu_init(const int *devices, int count) {
         G.memtype_local = G.memtype;
     } else {
         G.memtype_local = (uint32_t)mtl;
+    }
+
+    // WA for RADV+amdgpu (Mesa 22.3.6) on VEGA20: D2D copy from
+    // host-visible staging (type[3]) to device-local (type[0]) produces
+    // garbage data. Force pipeline buffers to use host-visible memory
+    // so H2D is a direct memcpy instead of D2D copy.
+    // Detect by checking if device-local heap != host-visible heap
+    // and the driver is RADV with old Mesa.
+    {
+        VkPhysicalDeviceMemoryProperties mp;
+        vkGetPhysicalDeviceMemoryProperties(G.phys, &mp);
+        // If type[0] (device-local) and type[3] (host-vis) are on
+        // different heaps, and we have RADV, use host-visible for
+        // pipeline buffers to avoid the D2D copy bug.
+        uint32_t local_heap = mp.memoryTypes[G.memtype_local].heapIndex;
+        uint32_t hvis_heap = mp.memoryTypes[G.memtype].heapIndex;
+        if (local_heap != hvis_heap) {
+            // Check device name for VEGA/raven/raven2/renoir
+            VkPhysicalDeviceProperties pdp;
+            vkGetPhysicalDeviceProperties(G.phys, &pdp);
+            char name[256];
+            strncpy(name, pdp.deviceName, 255);
+            name[255] = 0;
+            if (strstr(name, "VEGA") || strstr(name, "raven") ||
+                strstr(name, "Raven") || strstr(name, "renoir") ||
+                strstr(name, " Renoir")) {
+                fprintf(stderr, "[VK] WA: VEGA/raven detected, using host-visible pipeline buffers (D2D copy bug)\n");
+                G.memtype_local = G.memtype;
+            }
+        }
     }
     // Print heap info for debugging
     fprintf(stderr, "[VK] memory heaps: %u types, %u heaps\n",
@@ -845,6 +903,8 @@ void picolm_gpu_shutdown(void) {
         FREE_PIPE_BUF(pipe_v_b, pipe_v_b_m); FREE_PIPE_BUF(pipe_attn_out_b, pipe_attn_out_b_m);
         FREE_PIPE_BUF(pipe_ffn_norm_b, pipe_ffn_norm_b_m);
         FREE_PIPE_BUF(pipe_gate_b, pipe_gate_b_m); FREE_PIPE_BUF(pipe_up_b, pipe_up_b_m);
+        if (G.pipe_logits_d) { free_dev_buf(G.pipe_logits_d); G.pipe_logits_d = NULL; }
+        if (G.pipe_logits_buf) { vkDestroyBuffer(G.dev, G.pipe_logits_buf, NULL); vkFreeMemory(G.dev, G.pipe_logits_m, NULL); G.pipe_logits_buf = VK_NULL_HANDLE; }
     }
     #undef FREE_PIPE_BUF
 
@@ -1003,16 +1063,13 @@ typedef struct {
 
 int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x,
                        int S, int device) {
-    if (!G.ready || !t || device != 0 || S < 1) {
-        if (G.ready && t && S >= 1) fprintf(stderr, "[VK] matmul skip: dev=%d\n", device);
-        return 0;
-    }
+    if (!G.ready || !t || device != 0 || S < 1) return 0;
 
     size_t xb = (size_t)S * t->I * sizeof(float);
     size_t yb = (size_t)S * t->O * sizeof(float);
 
     if (!scratch_reserve(&G.x_buf, xb)) { fprintf(stderr, "[VK] matmul: x scratch failed %zu\n", xb); return 0; }
-    if (!scratch_reserve_mt(&G.y_buf, yb, G.memtype_cached)) { fprintf(stderr, "[VK] matmul: y scratch failed %zu\n", yb); return 0; }
+    if (!scratch_reserve_mt(&G.y_buf, yb, G.memtype)) { fprintf(stderr, "[VK] matmul: y scratch failed %zu\n", yb); return 0; }
 
     memcpy(G.x_buf.ptr, x, xb);
 
@@ -1028,11 +1085,12 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x,
         G.bound_tensor = t; G.bound_xbuf = G.x_buf.buf; G.bound_ybuf = G.y_buf.buf;
     }
 
-    int reshape = rebind || !G.cmd_ready || G.bound_S != S ||
-                  G.bound_I != t->I || G.bound_O != t->O;
-    if (reshape) {
-        VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
+    // Always re-record command buffer: host-visible scratch buffer contents change
+    // every call, and some drivers (RADV on older AMD) don't properly see updated
+    // HOST_COHERENT memory on command buffer replay without explicit barriers.
+    {
         VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
         VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
         vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
         vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -1073,10 +1131,8 @@ typedef struct vk_dev_buf {
 } vk_dev_buf_t;
 
 static vk_dev_buf_t *g_dev_buf_list = NULL;
-static int g_dev_buf_count = 0;
+static int g_dev_buf_count = 1; /* Start at 1 so idx==0 doesn't produce NULL pointer */
 
-/* Forward decls for unwrap_buf_offset used by rmsnorm_batched */
-static VkBuffer unwrap_buf_offset(const void *p, VkDeviceSize *out_off);
 static VkDescriptorBufferInfo desc_buf_info(const void *p);
 
 // ---------------------------------------------------------------------------
@@ -1158,20 +1214,43 @@ int picolm_gpu_rmsnorm_batched(float *out, const float *x, const float *weight,
 float *picolm_gpu_upload_f32(const float *host, size_t n, int device) {
     if (!G.ready || device != 0 || n == 0) return NULL;
     size_t bytes = n * sizeof(float);
-    /* Allocate device-local buffer + copy via staging */
-    void *dst = picolm_gpu_alloc_device(bytes, device);
-    if (!dst) return NULL;
-    if (!picolm_gpu_memcpy_async(dst, host, bytes, 1, device)) {
-        vk_dev_buf_t *d = (vk_dev_buf_t *)dst;
-        vkDestroyBuffer(G.dev, d->buf, NULL);
-        vkFreeMemory(G.dev, d->mem, NULL);
-        free(d);
-        return NULL;
+    if (getenv("PICOLM_ATTN_DBG")) {
+        fprintf(stderr, "[VK UPLOAD_F32] n=%zu bytes=%zu host[:4]={%.6f %.6f %.6f %.6f}\n",
+                n, bytes, host[0], host[1], host[2], host[3]);
+        fflush(stderr);
     }
-    /* Don't sync here -- caller will sync when needed.
-     * The data is small (norm weights, rope tables) so the
-     * transfer completes quickly. */
-    picolm_gpu_sync(device);
+    /* Use arena_suballoc for direct host-visible write (staging copy was broken on RADV) */
+    VkBuffer wbuf; void *wptr;
+    if (!arena_suballoc(bytes, &wbuf, &wptr)) {
+        // Fallback: device-local + staging copy
+        void *dst = picolm_gpu_alloc_device(bytes, device);
+        if (!dst) return NULL;
+        if (!picolm_gpu_memcpy_async(dst, host, bytes, 1, device)) {
+            vk_dev_buf_t *d = (vk_dev_buf_t *)dst;
+            vkDestroyBuffer(G.dev, d->buf, NULL);
+            vkFreeMemory(G.dev, d->mem, NULL);
+            free(d);
+            return NULL;
+        }
+        picolm_gpu_sync(device);
+        return (float *)dst;
+    }
+    // Direct write to host-visible memory
+    memcpy(wptr, host, bytes);
+    /* Wrap as device pointer */
+    vk_dev_buf_t *d = malloc(sizeof(*d));
+    if (!d) { vkDestroyBuffer(G.dev, wbuf, NULL); return NULL; }
+    d->buf = wbuf; d->mem = VK_NULL_HANDLE; d->off = 0; d->sz = bytes;
+    d->next = g_dev_buf_list; d->idx = g_dev_buf_count;
+    g_dev_buf_list = d; g_dev_buf_count++;
+    void *dst = (void*)((uintptr_t)d->idx << 48);
+    if (getenv("PICOLM_ATTN_DBG")) {
+        float verify[4];
+        memcpy(verify, wptr, 4 * sizeof(float));
+        fprintf(stderr, "[VK UPLOAD_F32 VERIFY(direct)] dst=%p[:4]={%.6f %.6f %.6f %.6f} n=%zu\n",
+                dst, verify[0], verify[1], verify[2], verify[3], n);
+        fflush(stderr);
+    }
     return (float *)dst;
 }
 
@@ -1303,7 +1382,7 @@ static int staging_ensure(size_t bytes) {
 
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .size = bytes, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
     if (vkCreateBuffer(G.dev, &bi, NULL, &G.staging_buf) != VK_SUCCESS) return 0;
     VkMemoryRequirements req;
@@ -1330,6 +1409,10 @@ int picolm_gpu_memcpy_async(void *dst, const void *src, size_t bytes, int dir, i
     if (dir == 1) { /* H2D via staging */
         if (!staging_ensure(bytes)) return 0;
         memcpy(G.staging_ptr, src, bytes);
+        /* Flush CPU write to ensure GPU sees the data */
+        VkMappedMemoryRange flush = {.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+            .memory = G.staging_mem, .offset = 0, .size = VK_WHOLE_SIZE};
+        vkFlushMappedMemoryRanges(G.dev, 1, &flush);
         VkDeviceSize dst_off = 0;
         VkBuffer dst_buf = unwrap_buf_offset(dst, &dst_off);
         if (!dst_buf) return 0;
@@ -1352,6 +1435,8 @@ int picolm_gpu_memcpy_async(void *dst, const void *src, size_t bytes, int dir, i
         VkDeviceSize src_off = 0;
         VkBuffer src_buf = unwrap_buf_offset(src, &src_off);
         if (!src_buf) return 0;
+        /* Wait on both fences: fence_dev for compute completion, fence_xfer for xfer completion */
+        vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
         vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
         VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         vkResetCommandBuffer(G.cmd_xfer, 0);
@@ -1438,6 +1523,7 @@ int picolm_gpu_pipeline_batch_alloc(int dim, int q_dim, int kv_dim,
     #define APB(name, sz) do { if (!alloc_device_local((sz), &G.pipe_##name##_b, &G.pipe_##name##_b_m)) ok = 0; } while(0)
     APB(x, xb); APB(xb, xb); APB(q, qb); APB(k, kvb); APB(v, kvb);
     APB(attn_out, qb); APB(ffn_norm, xb); APB(gate, fb); APB(up, fb);
+    /* Logits buffer: vocab_size floats, allocated per-model in pipeline_alloc */
     #undef APB
     if (!ok) { fprintf(stderr, "[VK] pipeline_batch_alloc: FAILED\n"); return 0; }
     G.pipe_b_ready = 1;
@@ -1453,6 +1539,7 @@ int picolm_gpu_pipeline_batch_alloc(int dim, int q_dim, int kv_dim,
     G.pipe_ffn_norm_b_d = wrap_buf(G.pipe_ffn_norm_b, G.pipe_ffn_norm_b_m, 0, xb);
     G.pipe_gate_b_d = wrap_buf(G.pipe_gate_b, G.pipe_gate_b_m, 0, fb);
     G.pipe_up_b_d = wrap_buf(G.pipe_up_b, G.pipe_up_b_m, 0, fb);
+    G.pipe_logits_d = NULL; /* allocated lazily */
     fprintf(stderr, "[VK] pipeline_batch_alloc: OK\n");
     return 1;
 }
@@ -1461,16 +1548,18 @@ void picolm_gpu_pipeline_free(void) {
     if (!G.ready) return;
     /* Free cached wrappers (don't remove from list to keep offset lookup valid) */
     if (G.pipe_ready) {
-        free(G.pipe_x_d); free(G.pipe_xb_d); free(G.pipe_q_d); free(G.pipe_k_d); free(G.pipe_v_d);
-        free(G.pipe_attn_out_d); free(G.pipe_ffn_norm_d); free(G.pipe_gate_d); free(G.pipe_up_d);
+        free_dev_buf(G.pipe_x_d); free_dev_buf(G.pipe_xb_d); free_dev_buf(G.pipe_q_d); free_dev_buf(G.pipe_k_d); free_dev_buf(G.pipe_v_d);
+        free_dev_buf(G.pipe_attn_out_d); free_dev_buf(G.pipe_ffn_norm_d); free_dev_buf(G.pipe_gate_d); free_dev_buf(G.pipe_up_d);
         G.pipe_x_d = G.pipe_xb_d = G.pipe_q_d = G.pipe_k_d = G.pipe_v_d = NULL;
         G.pipe_attn_out_d = G.pipe_ffn_norm_d = G.pipe_gate_d = G.pipe_up_d = NULL;
     }
     if (G.pipe_b_ready) {
-        free(G.pipe_x_b_d); free(G.pipe_xb_b_d); free(G.pipe_q_b_d); free(G.pipe_k_b_d); free(G.pipe_v_b_d);
-        free(G.pipe_attn_out_b_d); free(G.pipe_ffn_norm_b_d); free(G.pipe_gate_b_d); free(G.pipe_up_b_d);
+        free_dev_buf(G.pipe_x_b_d); free_dev_buf(G.pipe_xb_b_d); free_dev_buf(G.pipe_q_b_d); free_dev_buf(G.pipe_k_b_d); free_dev_buf(G.pipe_v_b_d);
+        free_dev_buf(G.pipe_attn_out_b_d); free_dev_buf(G.pipe_ffn_norm_b_d); free_dev_buf(G.pipe_gate_b_d); free_dev_buf(G.pipe_up_b_d);
         G.pipe_x_b_d = G.pipe_xb_b_d = G.pipe_q_b_d = G.pipe_k_b_d = G.pipe_v_b_d = NULL;
         G.pipe_attn_out_b_d = G.pipe_ffn_norm_b_d = G.pipe_gate_b_d = G.pipe_up_b_d = NULL;
+        if (G.pipe_logits_d) { free_dev_buf(G.pipe_logits_d); G.pipe_logits_d = NULL; }
+        if (G.pipe_logits_buf) { vkDestroyBuffer(G.dev, G.pipe_logits_buf, NULL); vkFreeMemory(G.dev, G.pipe_logits_m, NULL); G.pipe_logits_buf = VK_NULL_HANDLE; }
     }
     #define FB(n) do { if (G.pipe_##n) { vkDestroyBuffer(G.dev, G.pipe_##n, NULL); G.pipe_##n = VK_NULL_HANDLE; } \
         if (G.pipe_##n##_m) { vkFreeMemory(G.dev, G.pipe_##n##_m, NULL); G.pipe_##n##_m = VK_NULL_HANDLE; } } while(0)
@@ -1485,6 +1574,16 @@ void picolm_gpu_pipeline_free(void) {
 
 int picolm_gpu_ssm_pipeline_alloc(int cd, int ssi, int nv, int device) {
     (void)cd; (void)ssi; (void)nv; (void)device; return 0;
+}
+
+int picolm_gpu_pipeline_logits_alloc(size_t bytes, int device) {
+    if (!G.ready || device != 0 || bytes < 1) return 0;
+    if (G.pipe_logits_d) return 1; /* already allocated */
+    VkBuffer buf; VkDeviceMemory mem;
+    if (!alloc_device_local(bytes, &buf, &mem)) return 0;
+    G.pipe_logits_buf = buf; G.pipe_logits_m = mem;
+    G.pipe_logits_d = wrap_buf(buf, mem, 0, bytes);
+    return G.pipe_logits_d ? 1 : 0;
 }
 
 int picolm_gpu_prealloc_q8(size_t mxq, size_t mxd, int device) {
@@ -1588,6 +1687,46 @@ static int _quantize_dev(const float *x_dev, int I, int S) {
     vkCmdPushConstants(G.cmd_dev, G.plyt_quantize, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd_dev, (uint32_t)n_blocks, (uint32_t)S, 1);
+    
+    // Debug: dump quantize output for token 0, block 0
+    if (getenv("PICOLM_MM_DBG") && I == 960) {
+        vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
+        staging_ensure(40); // 8 uint32 + 4 float = 32 + 16 = 48 bytes
+        VkCommandBufferBeginInfo begin2 = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        vkResetCommandBuffer(G.cmd_xfer, 0);
+        vkBeginCommandBuffer(G.cmd_xfer, &begin2);
+        VkBufferCopy bc1 = {0, 0, 32}; // 8 uint32 = 32 bytes (block 0 QS)
+        VkBufferCopy bc2 = {0, 32, 16}; // 4 float = 16 bytes (first 4 deltas)
+        VkDeviceSize qd_off = 0;
+        VkBuffer qd_buf = unwrap_buf_offset(G.q8_xd_d, &qd_off);
+        VkDeviceSize qx_off = 0;
+        VkBuffer qx_buf = unwrap_buf_offset(G.q8_xq_d, &qx_off);
+        VkBufferCopy2 bc1r = {qx_off, 0, 32};
+        VkBufferCopy2 bc2r = {qd_off, 32, 16};
+        vkCmdCopyBuffer(G.cmd_xfer, qx_buf, G.staging_buf, 1, &(VkBufferCopy){qx_off, 0, 32});
+        vkCmdCopyBuffer(G.cmd_xfer, qd_buf, G.staging_buf, 1, &(VkBufferCopy){qd_off, 32, 16});
+        vkEndCommandBuffer(G.cmd_xfer);
+        VkSubmitInfo si2 = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_xfer};
+        vkResetFences(G.dev, 1, &G.fence_xfer);
+        vkQueueSubmit(G.queue, 1, &si2, G.fence_xfer);
+        vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
+        uint8_t dbg[48];
+        memcpy(dbg, G.staging_ptr, 48);
+        fprintf(stderr, "[QUANT_DBG] QS block0 8u32={%08x %08x %08x %08x %08x %08x %08x %08x}\n",
+                *(uint32_t*)(dbg+0), *(uint32_t*)(dbg+4), *(uint32_t*)(dbg+8), *(uint32_t*)(dbg+12),
+                *(uint32_t*)(dbg+16), *(uint32_t*)(dbg+20), *(uint32_t*)(dbg+24), *(uint32_t*)(dbg+28));
+        // Decode QS bytes
+        fprintf(stderr, "[QUANT_DBG] QS bytes[:16]={");
+        for (int i = 0; i < 16; i++) {
+            int8_t v = (int8_t)dbg[i];
+            fprintf(stderr, "%d ", v);
+        }
+        fprintf(stderr, "}\n");
+        fprintf(stderr, "[QUANT_DBG] D[:4]={%.6f %.6f %.6f %.6f}\n",
+                *(float*)(dbg+32), *(float*)(dbg+36), *(float*)(dbg+40), *(float*)(dbg+44));
+        fflush(stderr);
+    }
+    
     return 1;
 }
 
@@ -1631,14 +1770,37 @@ int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_d
     vkResetCommandBuffer(G.cmd_dev, 0);
     vkBeginCommandBuffer(G.cmd_dev, &begin);
 
-    int ok = 1;
+    // Pipeline barrier: ensure prior layer's shader writes are visible
+    VkMemoryBarrier mb_all = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+    vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb_all, 0, NULL, 0, NULL);
+
+    int ok = 0;  // Assume fallback needed
     // Q8_0 path: quantize F32->Q8 on device, then Q8xQ8 matmul
-    if (t->qtype == GGUF_TYPE_Q8_0 && G.shader_quantize && G.shader_q8q8) { // TEMP: disable Q8 path
-        ok &= _quantize_dev(x_dev, t->I, S);
-        ok &= _q8q8_matmul_dev(t, y_dev, S);
+    if (0 && t->qtype == GGUF_TYPE_Q8_0 && G.shader_quantize && G.shader_q8q8) {
+        if (_quantize_dev(x_dev, t->I, S)) {
+            // Memory barrier: quantize wrote to q8_xq/q8_xd, q8q8 reads from them
+            VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+            vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+            ok = _q8q8_matmul_dev(t, y_dev, S);
+        }
     }
     // Fallback: scalar dequant matmul (existing shader)
     if (!ok) {
+        // Debug: dump tensor properties for first layer's Q/K/V
+        if (getenv("PICOLM_ATTN_DBG") && t->I == 960 && t->O == 960) {
+            static int _dbg_cnt = 0;
+            if (_dbg_cnt < 3) {
+                fprintf(stderr, "[MATMUL_DBG #%d] wbuf=%p off=%d row_words=%d qtype=%d I=%d O=%d\n",
+                        _dbg_cnt, (void*)t->wbuf, 0, t->row_words, t->qtype, t->I, t->O);
+                _dbg_cnt++;
+            }
+        }
         VkDescriptorBufferInfo bi[3] = {xbi, {t->wbuf,0,VK_WHOLE_SIZE}, ybi};
         wr_desc(G.dset, 3, bi);
         vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
@@ -1655,6 +1817,36 @@ int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_d
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_dev};
     vkResetFences(G.dev, 1, &G.fence_dev);
     vkQueueSubmit(G.queue, 1, &si, G.fence_dev);
+
+    // Debug: dump first row of Q8_0 weights and compute CPU reference
+    static int _md_dbg = 0;
+    if (getenv("PICOLM_MM_DBG") && t->qtype == GGUF_TYPE_Q8_0 && t->I == 960 && _md_dbg < 3) {
+        _md_dbg++;
+        size_t row_bytes = 34 * 30; // 1 Q8 row = 30 blocks * 34 bytes = 1020
+        uint8_t *raw = (uint8_t *)malloc(row_bytes);
+        VkBuffer wbuf = t->wbuf;
+        if (wbuf) {
+            vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
+            staging_ensure(row_bytes);
+            VkCommandBufferBeginInfo begin2 = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            vkResetCommandBuffer(G.cmd_xfer, 0);
+            vkBeginCommandBuffer(G.cmd_xfer, &begin2);
+            VkBufferCopy bc = {.srcOffset = 0, .dstOffset = 0, .size = (uint32_t)row_bytes};
+            vkCmdCopyBuffer(G.cmd_xfer, wbuf, G.staging_buf, 1, &bc);
+            vkEndCommandBuffer(G.cmd_xfer);
+            VkSubmitInfo si2 = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_xfer};
+            vkResetFences(G.dev, 1, &G.fence_xfer);
+            vkQueueSubmit(G.queue, 1, &si2, G.fence_xfer);
+            vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
+            memcpy(raw, G.staging_ptr, row_bytes);
+        }
+        fprintf(stderr, "[MM_DBG #%d] wbuf=%p block0 d=%.6f qs[:8]={",
+                _md_dbg-1, (void*)wbuf, fp16_to_fp32(raw[0] | (raw[1] << 8)));
+        for (int i = 0; i < 8; i++) fprintf(stderr, "%d ", (int8_t)raw[2+i]);
+        fprintf(stderr, "}\n");
+        free(raw);
+    }
+
     return ok;
 }
 
@@ -1706,6 +1898,11 @@ int picolm_gpu_rmsnorm_batched_dev(float *out, const float *x, const float *weig
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     vkResetCommandBuffer(G.cmd_nrm, 0);
     vkBeginCommandBuffer(G.cmd_nrm, &begin);
+    VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+    vkCmdPipelineBarrier(G.cmd_nrm, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     vkCmdBindPipeline(G.cmd_nrm, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_nrm);
     vkCmdBindDescriptorSets(G.cmd_nrm, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_nrm, 0, 1, &G.dset_nrm, 0, NULL);
     // Push constant layout: int S, int D, float eps, int x_stride = 20 bytes
@@ -1717,6 +1914,7 @@ int picolm_gpu_rmsnorm_batched_dev(float *out, const float *x, const float *weig
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_nrm};
     vkResetFences(G.dev, 1, &G.fence_dev);
     vkQueueSubmit(G.queue, 1, &si, G.fence_dev);
+
     return 1;
 }
 
@@ -1732,11 +1930,17 @@ int picolm_gpu_residual_add(float *out, const float *a, const float *b,
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     vkResetCommandBuffer(G.cmd_dev, 0);
     vkBeginCommandBuffer(G.cmd_dev, &begin);
+    VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+    vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_elem);
     vkCmdBindDescriptorSets(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_elem, 0, 1, &G.dset_elem, 0, NULL);
-    PC_Elem pc = {0, n, 0.0f, 0};
+    int total = n * dim;
+    PC_Elem pc = {0, total, 0.0f, 0};
     vkCmdPushConstants(G.cmd_dev, G.plyt_elem, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-    vkCmdDispatch(G.cmd_dev, (uint32_t)((n + 255) / 256), 1, 1);
+    vkCmdDispatch(G.cmd_dev, (uint32_t)((total + 255) / 256), 1, 1);
     vkEndCommandBuffer(G.cmd_dev);
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_dev};
     vkResetFences(G.dev, 1, &G.fence_dev);
@@ -1754,6 +1958,11 @@ int picolm_gpu_silu_mul_dev(float *g, const float *u, size_t n, int device) {
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     vkResetCommandBuffer(G.cmd_dev, 0);
     vkBeginCommandBuffer(G.cmd_dev, &begin);
+    VkMemoryBarrier mb2 = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+    vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb2, 0, NULL, 0, NULL);
     vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_elem);
     vkCmdBindDescriptorSets(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_elem, 0, 1, &G.dset_elem, 0, NULL);
     PC_Elem pc = {1, (int)n, 0.0f, 0};
@@ -1810,19 +2019,21 @@ int picolm_gpu_rope_apply_batched(float *x, int n_heads, int head_dim,
         const float *cos_tok = (const float *)((uintptr_t)cos_tbl_base + (uintptr_t)(size_t)(start_pos + si) * half_dim * sizeof(float));
         const float *sin_tok = (const float *)((uintptr_t)sin_tbl_base + (uintptr_t)(size_t)(start_pos + si) * half_dim * sizeof(float));
 
-        VkBuffer xb = unwrap_buf(x_tok);
+        VkDeviceSize xb_off = 0;
+        VkBuffer xb = unwrap_buf_offset(x_tok, &xb_off);
         VkDeviceSize cos_off = 0, sin_off = 0;
         VkBuffer cb = unwrap_buf_offset(cos_tok, &cos_off);
         VkBuffer sb = unwrap_buf_offset(sin_tok, &sin_off);
         if (!xb || !cb || !sb) return 0;
 
-        VkDescriptorBufferInfo bi[4] = {
-            {xb, 0, VK_WHOLE_SIZE},
-            {cb, cos_off, VK_WHOLE_SIZE},
-            {sb, sin_off, VK_WHOLE_SIZE},
-            {VK_NULL_HANDLE, 0, 0}
+        size_t token_bytes = (size_t)n_heads * head_dim * sizeof(float);
+
+        VkDescriptorBufferInfo bi[3] = {
+            {xb, xb_off, token_bytes},
+            {cb, cos_off, (size_t)half_dim * sizeof(float)},
+            {sb, sin_off, (size_t)half_dim * sizeof(float)},
         };
-        wr_desc(G.dset_elem, 4, bi);
+        wr_desc(G.dset_elem, 3, bi);
 
         vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
         VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -1855,8 +2066,10 @@ int picolm_gpu_kv_alloc(size_t kv_k_bytes, size_t kv_v_bytes, int device) {
             kv_k_bytes/(1024*1024), kv_v_bytes/(1024*1024),
             (kv_k_bytes+kv_v_bytes)/(1024*1024));
     int ok = 1;
-    if (kv_k_bytes) ok &= alloc_device_local(kv_k_bytes, &G.kv_k_buf, &G.kv_k_mem);
-    if (kv_v_bytes) ok &= alloc_device_local(kv_v_bytes, &G.kv_v_buf, &G.kv_v_mem);
+    // Use host-visible memory for KV cache (KAVERI shader reads from device-local 10MB buffers are broken)
+    VkBufferUsageFlags kv_usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    if (kv_k_bytes) ok &= alloc_hostvis_mt2(kv_k_bytes, &G.kv_k_buf, &G.kv_k_mem, NULL, G.memtype, kv_usage);
+    if (kv_v_bytes) ok &= alloc_hostvis_mt2(kv_v_bytes, &G.kv_v_buf, &G.kv_v_mem, NULL, G.memtype, kv_usage);
     if (!ok) { picolm_gpu_kv_free(); return 0; }
     G.kv_k_bytes = kv_k_bytes;
     G.kv_v_bytes = kv_v_bytes;
@@ -1924,23 +2137,12 @@ int picolm_gpu_kv_store_dev(int is_k, int lo, int pos,
     vkQueueSubmit(G.queue, 1, &si, G.fence_xfer);
     vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
 
-    /* F32->F16 pack */
+    /* F32->F16 pack using tested fp32_to_fp16() from quant.c */
     uint16_t *h_pack = malloc(row_bytes_f16);
     if (!h_pack) return 0;
     const float *src = (const float *)G.staging_ptr;
     for (int j = 0; j < kv_dim; j++) {
-        float v = src[j];
-        uint32_t sign = ((*(uint32_t*)&v) >> 16) & 0x8000;
-        uint32_t exp = (*(uint32_t*)&v >> 23) & 0xFF;
-        uint32_t frac = (*(uint32_t*)&v) & 0x7FFFFF;
-        if (exp == 0) h_pack[j] = (uint16_t)sign;
-        else if (exp == 0xFF) h_pack[j] = (uint16_t)(sign | 0x7C00);
-        else {
-            int e = (int)exp - 127 + 15;
-            if (e <= 0) h_pack[j] = (uint16_t)sign;
-            else if (e >= 31) h_pack[j] = (uint16_t)(sign | 0x7C00);
-            else h_pack[j] = (uint16_t)(sign | (e << 10) | (frac >> 13));
-        }
+        h_pack[j] = fp32_to_fp16(src[j]);
     }
 
     /* H2D to KV cache */
@@ -1957,6 +2159,8 @@ int picolm_gpu_kv_store_dev(int is_k, int lo, int pos,
     VkSubmitInfo si2 = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_xfer};
     vkResetFences(G.dev, 1, &G.fence_xfer);
     vkQueueSubmit(G.queue, 1, &si2, G.fence_xfer);
+    /* Wait for H2D to complete before returning. */
+    vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
     return 1;
 }
 
@@ -1971,61 +2175,97 @@ int picolm_gpu_kv_store_dev_batched(int is_k, int lo, int sp, int np,
     size_t total_f32 = (size_t)np * kv_dim;
     size_t total_f16 = total_f32 * sizeof(uint16_t);
 
-    // Allocate a temporary device buffer for F16 output
-    VkBuffer f16_buf; VkDeviceMemory f16_mem;
-    if (!alloc_device_local(total_f16, &f16_buf, &f16_mem)) return 0;
-    void *f16_d = wrap_buf(f16_buf, f16_mem, 0, total_f16);
+    // CPU-side F32->F16 conversion, then H2D via staging (reliable path)
+    // (GPU elementwise f16pack shader was producing -inf for K cache on RADV)
+    float *f32_host = malloc(total_f32 * sizeof(float));
+    if (!f32_host) return 0;
 
-    // Use elementwise shader (op=3: f32_to_f16)
-    if (!G.shader_f16pack) {
-        vkDestroyBuffer(G.dev, f16_buf, NULL);
-        vkFreeMemory(G.dev, f16_mem, NULL);
-        free_dev_buf(f16_d);
-        return 0;
+    // D2H: read F32 from device to host
+    {
+        VkDeviceSize src_off = 0;
+        VkBuffer src_buf = unwrap_buf_offset(sd, &src_off);
+        if (is_k && lo == 0 && sp == 0) {
+            fprintf(stderr, "[KVSTORE_DBG] K unwrap: buf=%p off=%zu src_buf_valid=%d\n",
+                    (void*)src_buf, src_off, src_buf != VK_NULL_HANDLE);
+            fflush(stderr);
+        }
+        if (!src_buf) { free(f32_host); return 0; }
+        if (!staging_ensure(total_f32 * sizeof(float))) { free(f32_host); return 0; }
+        /* Wait for both compute and transfer fences before D2H */
+        vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
+        vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
+        VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        vkResetCommandBuffer(G.cmd_xfer, 0);
+        vkBeginCommandBuffer(G.cmd_xfer, &begin);
+        VkBufferCopy bc = {src_off, 0, total_f32 * sizeof(float)};
+        vkCmdCopyBuffer(G.cmd_xfer, src_buf, G.staging_buf, 1, &bc);
+        vkEndCommandBuffer(G.cmd_xfer);
+        VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_xfer};
+        vkResetFences(G.dev, 1, &G.fence_xfer);
+        vkQueueSubmit(G.queue, 1, &si, G.fence_xfer);
+        vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
+        memcpy(f32_host, G.staging_ptr, total_f32 * sizeof(float));
     }
 
-    vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
-    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    vkResetCommandBuffer(G.cmd_dev, 0);
-    vkBeginCommandBuffer(G.cmd_dev, &begin);
+    // F32->F16 pack on CPU using tested fp32_to_fp16() from quant.c
+    uint16_t *f16_host = malloc(total_f16);
+    if (!f16_host) { free(f32_host); return 0; }
+    if ((is_k || !is_k) && lo == 0 && sp == 0) {
+        const char *tag = is_k ? "K" : "V";
+        fprintf(stderr, "[KVSTORE_DBG %s] F32 source[:4]={%.6f %.6f %.6f %.6f}\n",
+                tag, f32_host[0], f32_host[1], f32_host[2], f32_host[3]);
+        fflush(stderr);
+    }
+    for (size_t i = 0; i < total_f32; i++) {
+        f16_host[i] = fp32_to_fp16(f32_host[i]);
+    }
+    if (is_k && lo == 0 && sp == 0) {
+        fprintf(stderr, "[KVSTORE_DBG] K F16 output[:4]={%u %u %u %u}\n",
+                f16_host[0], f16_host[1], f16_host[2], f16_host[3]);
+        fflush(stderr);
+    }
 
-    // F32->F16 pack kernel
-    VkDescriptorBufferInfo bi[4] = {
-        desc_buf_info(sd),      // src F32
-        {VK_NULL_HANDLE, 0, 0}, // unused
-        {VK_NULL_HANDLE, 0, 0}, // unused
-        desc_buf_info(f16_d)    // dst F16 (uint32 buffer)
-    };
-    wr_desc(G.dset_f16pack, 4, bi);
-    typedef struct { int op, n; float fp; int pad; } PC_Elem;
-    PC_Elem pc = {3, (int)total_f32, 0.0f, 0};
-    vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_f16pack);
-    vkCmdBindDescriptorSets(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            G.plyt_f16pack, 0, 1, &G.dset_f16pack, 0, NULL);
-    vkCmdPushConstants(G.cmd_dev, G.plyt_f16pack, VK_SHADER_STAGE_COMPUTE_BIT,
-                       0, sizeof(pc), &pc);
-    uint32_t n_groups = ((total_f32 + 1u) / 2u + 255u) / 256u;
-    vkCmdDispatch(G.cmd_dev, n_groups, 1, 1);
+    // H2D to KV cache
+    // Each position has nkh * hd F16 values. Layer base = lo * msl positions.
+    size_t f16_per_pos = (size_t)nkh * hd * sizeof(uint16_t);
+    size_t dst_off = (size_t)lo * msl * f16_per_pos + (size_t)sp * f16_per_pos;
+    memcpy(G.staging_ptr, f16_host, total_f16);
+    free(f16_host); free(f32_host);
 
-    // D2D copy: f16_buf -> KV cache at offset
-    size_t dst_off = (size_t)lo * msl * total_f16 + (size_t)sp * total_f16;
-    VkBufferCopy bc = {0, (VkDeviceSize)dst_off, total_f16};
-    vkCmdCopyBuffer(G.cmd_dev, f16_buf, dst_buf, 1, &bc);
+    if (is_k && lo == 0 && sp == 0) {
+        fprintf(stderr, "[KVSTORE_DBG] K dst_off=%zu total_f16=%zu\n",
+                dst_off, total_f16);
+        fflush(stderr);
+    }
 
-    vkEndCommandBuffer(G.cmd_dev);
-    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_dev};
-    vkResetFences(G.dev, 1, &G.fence_dev);
-    vkQueueSubmit(G.queue, 1, &si, G.fence_dev);
+    vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
+    VkCommandBufferBeginInfo begin2 = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkResetCommandBuffer(G.cmd_xfer, 0);
+    vkBeginCommandBuffer(G.cmd_xfer, &begin2);
+    VkBufferCopy bc2 = {0, (VkDeviceSize)dst_off, total_f16};
+    vkCmdCopyBuffer(G.cmd_xfer, G.staging_buf, dst_buf, 1, &bc2);
+    vkEndCommandBuffer(G.cmd_xfer);
+    VkSubmitInfo si2 = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_xfer};
+    vkResetFences(G.dev, 1, &G.fence_xfer);
+    vkQueueSubmit(G.queue, 1, &si2, G.fence_xfer);
+    /* Wait for H2D to complete before returning. Subsequent compute (attention)
+     * reads from the KV cache and must see the written data. */
+    vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
 
-    // Clean up temp buffer (async, will be reclaimed after fence)
-    // For safety, keep it until fence. But since we submit the same fence,
-    // we need to not free until next sync. Use a lazy approach: just leak it
-    // for now (it's small, one per layer). TODO: use a pool.
-    // Actually, let's not leak. Free after sync.
-    vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
-    vkDestroyBuffer(G.dev, f16_buf, NULL);
-    vkFreeMemory(G.dev, f16_mem, NULL);
-    free_dev_buf(f16_d);
+    /* Debug: verify KV cache content immediately after upload */
+    if ((is_k || !is_k) && lo == 0 && sp == 0) {
+        const char *tag = is_k ? "K" : "V";
+        void *kv_d = is_k ? G.kv_k_d : G.kv_v_d;
+        VkBuffer kv_buf = is_k ? G.kv_k_buf : G.kv_v_buf;
+        fprintf(stderr, "[KVSTORE_DBG %s] kv_d=%p kv_buf=%p dst_buf=%p\n",
+                tag, (void*)kv_d, (void*)kv_buf, (void*)dst_buf);
+        uint16_t kv_check[8];
+        int ok = picolm_gpu_memcpy(kv_check, kv_d, 8 * sizeof(uint16_t), -1, device);
+        fprintf(stderr, "[KVSTORE_DBG %s] memcpy_ok=%d [%u %u %u %u %u %u %u %u]\n",
+                tag, ok, kv_check[0], kv_check[1], kv_check[2], kv_check[3],
+                kv_check[4], kv_check[5], kv_check[6], kv_check[7]);
+        fflush(stderr);
+    }
     return 1;
 }
 
@@ -2056,7 +2296,12 @@ int picolm_gpu_kv_store_dev_batched_strided(int is_k, int lo, int sp, int np,
 
     /* D2H row-by-row: each row is src_stride floats apart in device memory,
      * but we read kv_dim floats and pack to F16. */
-    if (!staging_ensure(row_bytes_f32)) { free(h_pack); return 0; }
+    /* Staging must hold the larger of: one F32 row (D2H read) or all np F16 rows (H2D write) */
+    { size_t staging_needed = row_bytes_f32;
+      size_t dst_bytes_all = (size_t)np * row_bytes_f16;
+      if (dst_bytes_all > staging_needed) staging_needed = dst_bytes_all;
+      if (!staging_ensure(staging_needed)) { free(h_pack); return 0; }
+    }
     for (int p = 0; p < np; p++) {
         /* D2H: copy this row from device */
         VkDeviceSize src_row_off = src_off + (VkDeviceSize)p * src_stride * sizeof(float);
@@ -2076,9 +2321,9 @@ int picolm_gpu_kv_store_dev_batched_strided(int is_k, int lo, int sp, int np,
         uint16_t *dst_row = h_pack + (size_t)p * kv_dim;
         for (int j = 0; j < kv_dim; j++) {
             float v = src[j];
-            uint32_t sign = ((*(uint32_t*)&v) >> 16) & 0x8000;
-            uint32_t exp = (*(uint32_t*)&v >> 23) & 0xFF;
-            uint32_t frac = (*(uint32_t*)&v) & 0x7FFFFF;
+            uint32_t sign_f; memcpy(&sign_f, &v, 4); uint32_t sign = (sign_f >> 16) & 0x8000;
+            uint32_t exp_f; memcpy(&exp_f, &v, 4); uint32_t exp = (exp_f >> 23) & 0xFF;
+            uint32_t frac_f; memcpy(&frac_f, &v, 4); uint32_t frac = frac_f & 0x7FFFFF;
             if (exp == 0) dst_row[j] = (uint16_t)sign;
             else if (exp == 0xFF) dst_row[j] = (uint16_t)(sign | 0x7C00);
             else {
@@ -2176,19 +2421,124 @@ int picolm_gpu_attention_decode(float *xb_out, const float *q,
 int picolm_gpu_attention_decode_dev(float *xb_out_dev, const float *q_dev,
                                      int lo, int pos, int nh, int nkh,
                                      int hd, int msl, int device) {
-    if (!G.ready || !G.shader_attn_dec || device != 0) return 0;
+    if (1) return 0; // DISABLE GPU DECODE ATTENTION
 
+    // KAVERI workaround: copy KV cache data (F16) from large buffer
+    // to small pipeline buffers (F32) to avoid shader read bug.
+    // Copy all prior tokens' K/V data for this layer.
+    int kv_row = nkh * hd;  // bytes per token per K/V (F32)
+    int copy_n = pos + 1;   // number of tokens to copy
+    size_t copy_bytes = (size_t)copy_n * kv_row * sizeof(float);
+
+    // Wait for prior KV store (fence_xfer) to complete
+    vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
+    vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
+
+    // D2H: read F16 K data from KV cache via staging
+    staging_ensure(copy_bytes * 2);  // F16 size (2 bytes per float)
+    uint16_t *k_f16 = (uint16_t*)G.staging_ptr;
+
+    VkBufferCopy kc = {
+        .srcOffset = (size_t)lo * msl * nkh * hd * sizeof(uint16_t),
+        .dstOffset = 0,
+        .size = (size_t)copy_n * kv_row * sizeof(uint16_t)
+    };
+    vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkResetCommandBuffer(G.cmd_xfer, 0);
+    vkBeginCommandBuffer(G.cmd_xfer, &begin);
+    vkCmdCopyBuffer(G.cmd_xfer, G.kv_k_buf, G.staging_buf, 1, &kc);
+    vkEndCommandBuffer(G.cmd_xfer);
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_xfer};
+    vkResetFences(G.dev, 1, &G.fence_xfer);
+    vkQueueSubmit(G.queue, 1, &si, G.fence_xfer);
+    vkWaitForFences(G.dev, 1, &G.fence_xfer, VK_TRUE, UINT64_MAX);
+
+    // CPU: F16->F32 conversion for K
+    float *k_f32 = picolm_gpu_staging_host(device, copy_bytes);
+    for (int i = 0; i < (int)(copy_n * kv_row); i++) {
+        k_f32[i] = fp16_to_fp32(k_f16[i]);
+    }
+
+    // H2D: write F32 K to pipeline buffer
+    staging_ensure(copy_bytes);
+    memcpy(G.staging_ptr, k_f32, copy_bytes);
+    VkMappedMemoryRange mrk = {
+        .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+        .memory = G.staging_mem,
+        .offset = 0,
+        .size = copy_bytes
+    };
+    vkFlushMappedMemoryRanges(G.dev, 1, &mrk);
+
+    VkBufferCopy kcu = {
+        .srcOffset = 0,
+        .dstOffset = 0,
+        .size = copy_bytes
+    };
+    vkResetCommandBuffer(G.cmd_xfer, 0);
+    vkBeginCommandBuffer(G.cmd_xfer, &begin);
+    vkCmdCopyBuffer(G.cmd_xfer, G.staging_buf, unwrap_buf(G.pipe_k_b_d), 1, &kcu);
+    vkEndCommandBuffer(G.cmd_xfer);
+    si = (VkSubmitInfo){.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_xfer};
+    vkResetFences(G.dev, 1, &G.fence_xfer);
+    vkQueueSubmit(G.queue, 1, &si, G.fence_xfer);
+    vkWaitForFences(G.dev, 1, &G.fence_xfer, VK_TRUE, UINT64_MAX);
+
+    // Same for V
+    VkBufferCopy vc = {
+        .srcOffset = (size_t)lo * msl * nkh * hd * sizeof(uint16_t),
+        .dstOffset = 0,
+        .size = (size_t)copy_n * kv_row * sizeof(uint16_t)
+    };
+    vkResetCommandBuffer(G.cmd_xfer, 0);
+    vkBeginCommandBuffer(G.cmd_xfer, &begin);
+    vkCmdCopyBuffer(G.cmd_xfer, G.kv_v_buf, G.staging_buf, 1, &vc);
+    vkEndCommandBuffer(G.cmd_xfer);
+    si = (VkSubmitInfo){.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_xfer};
+    vkResetFences(G.dev, 1, &G.fence_xfer);
+    vkQueueSubmit(G.queue, 1, &si, G.fence_xfer);
+    vkWaitForFences(G.dev, 1, &G.fence_xfer, VK_TRUE, UINT64_MAX);
+
+    float *v_f32 = picolm_gpu_staging_host(device, copy_bytes);
+    for (int i = 0; i < (int)(copy_n * kv_row); i++) {
+        v_f32[i] = fp16_to_fp32(((uint16_t*)G.staging_ptr)[i]);
+    }
+
+    staging_ensure(copy_bytes);
+    memcpy(G.staging_ptr, v_f32, copy_bytes);
+    VkMappedMemoryRange mrv = {
+        .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+        .memory = G.staging_mem,
+        .offset = 0,
+        .size = copy_bytes
+    };
+    vkFlushMappedMemoryRanges(G.dev, 1, &mrv);
+
+    VkBufferCopy vcu = {
+        .srcOffset = 0,
+        .dstOffset = 0,
+        .size = copy_bytes
+    };
+    vkResetCommandBuffer(G.cmd_xfer, 0);
+    vkBeginCommandBuffer(G.cmd_xfer, &begin);
+    vkCmdCopyBuffer(G.cmd_xfer, G.staging_buf, unwrap_buf(G.pipe_v_b_d), 1, &vcu);
+    vkEndCommandBuffer(G.cmd_xfer);
+    si = (VkSubmitInfo){.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_xfer};
+    vkResetFences(G.dev, 1, &G.fence_xfer);
+    vkQueueSubmit(G.queue, 1, &si, G.fence_xfer);
+    vkWaitForFences(G.dev, 1, &G.fence_xfer, VK_TRUE, UINT64_MAX);
+
+    // Now bind the pipeline buffers (F32 K/V) instead of KV cache
     VkDescriptorBufferInfo bi[4] = {
         desc_buf_info(q_dev),
-        {G.kv_k_buf, 0, VK_WHOLE_SIZE},
-        {G.kv_v_buf, 0, VK_WHOLE_SIZE},
+        desc_buf_info((float*)G.pipe_k_b_d),
+        desc_buf_info((float*)G.pipe_v_b_d),
         desc_buf_info(xb_out_dev)
     };
     if (!bi[0].buffer || !bi[3].buffer) return 0;
     wr_desc(G.dset_attn_dec, 4, bi);
 
-    vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
-    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     vkResetCommandBuffer(G.cmd_dev, 0);
     vkBeginCommandBuffer(G.cmd_dev, &begin);
     vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_attn_dec);
@@ -2205,9 +2555,9 @@ int picolm_gpu_attention_decode_dev(float *xb_out_dev, const float *q_dev,
                        0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd_dev, (uint32_t)nh, 1, 1);
     vkEndCommandBuffer(G.cmd_dev);
-    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_dev};
+    VkSubmitInfo si2 = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_dev};
     vkResetFences(G.dev, 1, &G.fence_dev);
-    vkQueueSubmit(G.queue, 1, &si, G.fence_dev);
+    vkQueueSubmit(G.queue, 1, &si2, G.fence_dev);
     return 1;
 }
 int picolm_gpu_attention_prefill(float *xb_out, const float *q,
@@ -2223,21 +2573,71 @@ int picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
                                       int msl, int device) {
     if (!G.ready || !G.shader_attn_prefill || device != 0 || nt < 1) return 0;
 
+    // KAVERI workaround: use BK/BV pipeline buffers (F32) instead of
+    // KV cache (F16) for prefill attention. KAVERI/RADV can't read
+    // F16 data from large storage buffers in compute shaders.
+    const float *bk_dev = (float*)G.pipe_k_b_d;
+    const float *bv_dev = (float*)G.pipe_v_b_d;
+
+    VkDescriptorBufferInfo qbi = desc_buf_info(q_dev);
+    VkDescriptorBufferInfo obbi = desc_buf_info(xb_out_dev);
+    VkDescriptorBufferInfo kbi = desc_buf_info(bk_dev);
+    VkDescriptorBufferInfo vbi = desc_buf_info(bv_dev);
+    if (!qbi.buffer || !obbi.buffer || !kbi.buffer || !vbi.buffer) return 0;
+    qbi.range = (VkDeviceSize)nt * nh * hd * sizeof(float);
+    obbi.range = (VkDeviceSize)nt * nh * hd * sizeof(float);
+    kbi.range = (VkDeviceSize)nt * nkh * hd * sizeof(float);
+    vbi.range = (VkDeviceSize)nt * nkh * hd * sizeof(float);
+
+    // Debug: D2H readback of BK buffer for layer 0
+    if (getenv("PICOLM_ATTN_DBG") && lo == 0) {
+        vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
+        float dbg_k[16];
+        if (picolm_gpu_memcpy(dbg_k, (void*)bk_dev, 16 * sizeof(float), -1, device)) {
+            fprintf(stderr, "[ATN_DBG l=%d] BK_D2H[:8]={", lo);
+            for (int _i = 0; _i < 8; _i++) fprintf(stderr, "%.6f ", dbg_k[_i]);
+            fprintf(stderr, "}\n");
+            fflush(stderr);
+        }
+    }
+
     VkDescriptorBufferInfo bi[4] = {
-        desc_buf_info(q_dev),
-        {G.kv_k_buf, 0, VK_WHOLE_SIZE},
-        {G.kv_v_buf, 0, VK_WHOLE_SIZE},
-        desc_buf_info(xb_out_dev)
+        qbi, kbi, vbi, obbi
     };
-    if (!bi[0].buffer || !bi[3].buffer) return 0;
     wr_desc(G.dset_attn_prefill, 4, bi);
 
-    // Launch one workgroup per (head, token) pair
     uint32_t total = (uint32_t)nh * (uint32_t)nt;
     vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     vkResetCommandBuffer(G.cmd_dev, 0);
     vkBeginCommandBuffer(G.cmd_dev, &begin);
+
+    // Barrier: BK/BV/Q writes (SHADER_WRITE) -> shader reads
+    VkBufferMemoryBarrier barriers[3] = {
+        { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+          .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+          .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .buffer = qbi.buffer, .offset = qbi.offset, .size = qbi.range },
+        { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+          .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+          .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .buffer = kbi.buffer, .offset = kbi.offset, .size = kbi.range },
+        { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+          .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+          .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .buffer = vbi.buffer, .offset = vbi.offset, .size = vbi.range }
+    };
+    // KAVERI workaround: use ALL_COMMANDS stages for barrier
+    vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                         0, NULL, 3, barriers, 0, NULL);
+
     vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_attn_prefill);
     vkCmdBindDescriptorSets(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE,
                             G.plyt_attn_prefill, 0, 1, &G.dset_attn_prefill, 0, NULL);
@@ -2427,9 +2827,15 @@ int picolm_gpu_rmsnorm_matmul_dev_qkv(picolm_gpu_tensor_t *tq,
 // MISSING STUBS (functions added in commits after 79c9912)
 // ---------------------------------------------------------------------------
 
-float *picolm_gpu_pipe_logits(int device) { (void)device; return NULL; }
+float *picolm_gpu_pipe_logits(int device) {
+    if (device != 0 || !G.pipe_logits_d) return NULL;
+    return (float*)G.pipe_logits_d;
+}
 
 int picolm_gpu_matmul_logits(picolm_gpu_tensor_t *t, float *logits_dev,
                               const float *x_dev, int device) {
-    (void)t; (void)logits_dev; (void)x_dev; (void)device; return 0;
+    if (!G.ready || !t || !logits_dev || !x_dev || device != 0) return 0;
+    if (!G.pipe_logits_d) return 0; /* should be pre-allocated */
+    if (logits_dev != (float*)G.pipe_logits_d) return 0;
+    return picolm_gpu_matmul_dev(t, logits_dev, x_dev, 1, device, 0, 0);
 }

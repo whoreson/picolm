@@ -1,132 +1,90 @@
 #version 450
-// Prefill attention kernel (scalar, online softmax).
-// Each workgroup processes one (head, query_token) pair.
-// KV cache is F16, Q is F32, output is F32.
-//
-// Grid: [n_heads * n_tokens, 1, 1], Block: 256 threads
-//
-// Push constants (32 bytes):
-//   int layer_ordinal, int start_pos, int n_tokens
-//   int n_heads, int n_kv_heads, int head_dim
-//   int max_seq_len, int pad
-layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) readonly buffer Q    { float q_data[]; };
-layout(std430, binding = 1) readonly buffer KV_K { uint kv_k[]; };
-layout(std430, binding = 2) readonly buffer KV_V { uint kv_v[]; };
-layout(std430, binding = 3) writeonly buffer OUT { float xb_out[]; };
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer B_Q { float q_data[]; };
+layout(set = 0, binding = 1, std430) readonly buffer B_KK { float kv_k_data[]; };
+layout(set = 0, binding = 2, std430) readonly buffer B_KV { float kv_v_data[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer B_OUT { float xb_out[]; };
 
-layout(push_constant) uniform P {
-    int layer_ordinal;
-    int start_pos;
-    int n_tokens;
-    int n_heads;
-    int n_kv_heads;
-    int head_dim;
-    int max_seq_len;
-    int pad;
+layout(push_constant) uniform PC {
+    int layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim;
+    int max_seq_len, q_dim, pad0, pad1;
 } p;
 
-float f16tof32(uint h) {
-    uint s = (h >> 15u) & 1u;
-    uint e = (h >> 10u) & 31u;
-    uint m = h & 1023u;
-    if (e == 0u) {
-        if (m == 0u) return s != 0u ? -0.0 : 0.0;
-        float v = float(m) * 5.960464477539063e-8;
-        return s != 0u ? -v : v;
-    }
-    if (e == 31u) return s != 0u ? -1.0/0.0 : 1.0/0.0;
-    uint bits = (s << 31u) | ((e - 15u + 127u) << 23u) | (m << 13u);
-    return uintBitsToFloat(bits);
-}
-
-shared float reduce_sh[256];
-shared float max_sh, sum_sh, rescale_sh, weight_sh;
-
-#define MAX_ELEMS_PER_THREAD 32
-float acc_arr[MAX_ELEMS_PER_THREAD];
+shared float q_sh[64];
+shared float k_sh[256];
+shared float v_sh[256];
 
 void main() {
     int gid = int(gl_WorkGroupID.x);
-    int tid = int(gl_LocalInvocationID.x);
-    int nt = int(gl_WorkGroupSize.x);
-
     int h = gid % p.n_heads;
     int qi = gid / p.n_heads;
+    if (qi >= p.n_tokens || h >= p.n_heads) return;
 
-    if (h >= p.n_heads || qi >= p.n_tokens) return;
+    int nkh = p.n_kv_heads;
+    int hd = p.head_dim;
+    int kvh = h % nkh;
+    int nt = p.n_tokens;
+    int sp = p.start_pos;
 
-    int kv_h = h / (p.n_heads / p.n_kv_heads);
-    float attn_scale = 1.0 / sqrt(float(p.head_dim));
-
-    int global_pos = p.start_pos + qi;
-    int q_off = (qi * p.n_heads + h) * p.head_dim;
-
-    // Layer base offset in F16 elements
-    int layer_base_f16 = p.layer_ordinal * p.max_seq_len * p.n_kv_heads * p.head_dim;
-    int kv_row_stride = p.n_kv_heads * p.head_dim;
-
-    int my_n = (p.head_dim + nt - 1) / nt;
-    for (int e = 0; e < my_n; e++) acc_arr[e] = 0.0;
-
-    if (tid == 0) { max_sh = -1e30; sum_sh = 0.0; rescale_sh = 1.0; weight_sh = 1.0; }
-    barrier();
-
-    for (int kv_pos = p.start_pos; kv_pos <= global_pos; kv_pos++) {
-        int kv_head_base_f16 = layer_base_f16 + kv_h * p.head_dim + kv_pos * kv_row_stride;
-        // F16 elements stored as 2-per-uint32 in the buffer
-        int kv_head_base_u32 = kv_head_base_f16 / 2;
-
-        float local_score = 0.0;
-        for (int e = 0; e < my_n; e++) {
-            int d = tid + e * nt;
-            if (d < p.head_dim) {
-                float qv = q_data[q_off + d];
-                uint f16_raw = (kv_k[kv_head_base_u32 + d / 2] >> ((d % 2) * 16)) & 0xffffu;
-                float kv = f16tof32(f16_raw);
-                local_score += qv * kv;
-            }
-        }
-        reduce_sh[tid] = local_score;
-        barrier();
-        for (int s = nt / 2; s > 0; s /= 2) {
-            if (tid < s) reduce_sh[tid] += reduce_sh[tid + s];
-            barrier();
-        }
-        float score = reduce_sh[0] * attn_scale;
-
-        if (tid == 0) {
-            if (score > max_sh) {
-                rescale_sh = exp(max_sh - score);
-                max_sh = score;
-                weight_sh = 1.0;
-                sum_sh = sum_sh * rescale_sh + 1.0;
-            } else {
-                rescale_sh = 1.0;
-                weight_sh = exp(score - max_sh);
-                sum_sh += weight_sh;
-            }
-        }
-        barrier();
-
-        for (int e = 0; e < my_n; e++) {
-            int d = tid + e * nt;
-            if (d < p.head_dim) {
-                uint f16_raw = (kv_v[kv_head_base_u32 + d / 2] >> ((d % 2) * 16)) & 0xffffu;
-                float vv = f16tof32(f16_raw);
-                acc_arr[e] = acc_arr[e] * rescale_sh + vv * weight_sh;
-            }
+    int q_stride = p.n_heads * hd;
+    int q_off = qi * q_stride + h * hd;
+    int kv_stride = nkh * hd;
+    
+    for (int d = 0; d < hd; d++) {
+        q_sh[d] = q_data[q_off + d];
+    }
+    
+    for (int ti = 0; ti < nt; ti++) {
+        int k_off = ti * kv_stride + kvh * hd;
+        int v_off = ti * kv_stride + kvh * hd;
+        for (int d = 0; d < hd; d++) {
+            k_sh[ti * hd + d] = kv_k_data[k_off + d];
+            v_sh[ti * hd + d] = kv_v_data[v_off + d];
         }
     }
-
-    float inv_sum = 1.0 / sum_sh;
-    int out_off = (qi * p.n_heads + h) * p.head_dim;
-    for (int e = 0; e < my_n; e++) {
-        int d = tid + e * nt;
-        if (d < p.head_dim) {
-            xb_out[out_off + d] = acc_arr[e] * inv_sum;
+    
+    barrier();
+    
+    float max_sc = -1e20;
+    float scores[256];
+    int valid = 0;
+    
+    for (int ti = 0; ti < nt; ti++) {
+        float s = 0.0;
+        for (int d = 0; d < hd; d++) {
+            s += q_sh[d] * k_sh[ti * hd + d];
+        }
+        s *= 0.125;
+        scores[valid++] = s;
+        if (s > max_sc) max_sc = s;
+    }
+    
+    float acc[64];
+    for (int d = 0; d < hd; d++) acc[d] = 0.0;
+    float sum_exp = 0.0;
+    
+    for (int ti = 0; ti < valid; ti++) {
+        float e = exp(scores[ti] - max_sc);
+        sum_exp += e;
+        for (int d = 0; d < hd; d++) {
+            acc[d] += e * v_sh[ti * hd + d];
+        }
+    }
+    
+    float inv = (sum_exp > 0.0) ? 1.0 / sum_exp : 0.0;
+    int o_off = qi * q_stride + h * hd;
+    for (int d = 0; d < hd; d++) {
+        xb_out[o_off + d] = acc[d] * inv;
+    }
+    
+    // Debug: head 0, token 0 -> write stats at o_off + hd + 0..7
+    if (h == 0 && qi == 0) {
+        xb_out[o_off + hd + 0] = max_sc;
+        xb_out[o_off + hd + 1] = sum_exp;
+        xb_out[o_off + hd + 2] = inv;
+        for (int ti = 0; ti < valid && ti < 5; ti++) {
+            xb_out[o_off + hd + 3 + ti] = scores[ti];
         }
     }
 }
-

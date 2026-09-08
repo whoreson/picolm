@@ -4713,12 +4713,15 @@ after_qkv:
         /* Diagnostic: dump attention output for first layer */
         if (getenv("PICOLM_ATTN_DBG") && attn_ord == 0 && start_pos == 0) {
             picolm_gpu_sync(gpu_dev);
-            { float aout[32];
-              picolm_gpu_memcpy(aout, battn_out, 32 * sizeof(float), -1, gpu_dev);
-              float arms=0; for(int _i=0;_i<32;_i++) arms+=aout[_i]*aout[_i];
+            { float aout[128];
+              picolm_gpu_memcpy(aout, battn_out, 128 * sizeof(float), -1, gpu_dev);
+              float arms=0; for(int _i=0;_i<96;_i++) arms+=aout[_i]*aout[_i];
               fprintf(stderr,"[ATN_DBG l=%d] attn_out_tok0[:8]={",l);
               for(int _i=0;_i<8;_i++) fprintf(stderr,"%.6f ",aout[_i]);
-              fprintf(stderr,"} rms=%.6f\n",sqrtf(arms/32)); fflush(stderr); }
+              fprintf(stderr,"} rms=%.6f max_sc=%.6f sum_exp=%.6f inv=%.6f scores={",
+                  sqrtf(arms/96), aout[64], aout[65], aout[66]);
+              for(int _i=0;_i<5;_i++) fprintf(stderr,"%.6f ",aout[67+_i]);
+              fprintf(stderr,"}\n"); fflush(stderr); }
         }
 
         /* SSM gate sigmoid */
@@ -4896,13 +4899,27 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
                 dequantize_row(embd_row, dst, dim, w->type_token_embd);
             }
 
-            /* H2D this ubatch's embeddings to bx (strided).
-             * No explicit sync needed -- the subsequent kernels on
-             * the same stream will wait for the transfer to complete. */
+            /* H2D this ubatch's embeddings to bx (strided). */
             for (int bi = 0; bi < this_ubatch; bi++) {
-                picolm_gpu_memcpy_async(bx + (size_t)bi * xb_stride,
+                picolm_gpu_memcpy(bx + (size_t)bi * xb_stride,
                     host_embd + (size_t)bi * dim,
                     dim * sizeof(float), 1, gpu_dev);
+            }
+            fprintf(stderr, "\n[EMB_CHECK] host_embd[:8]={%f %f %f %f %f %f %f %f}\n",
+                host_embd[0],host_embd[1],host_embd[2],host_embd[3],
+                host_embd[4],host_embd[5],host_embd[6],host_embd[7]);
+
+            /* Debug: verify embedding H2D correctness */
+            {
+                float *bx_check = (float *)malloc(dim * sizeof(float));
+                if (bx_check) {
+                    picolm_gpu_memcpy_async(bx_check, bx, dim * sizeof(float), -1, gpu_dev);
+                    picolm_gpu_sync(gpu_dev);
+                    fprintf(stderr, "\n[BX_CHECK] token0[:8]={%f %f %f %f %f %f %f %f}\n",
+                        bx_check[0],bx_check[1],bx_check[2],bx_check[3],
+                        bx_check[4],bx_check[5],bx_check[6],bx_check[7]);
+                    free(bx_check);
+                }
             }
 
             /* Process this ubatch through all layers */

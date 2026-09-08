@@ -521,6 +521,7 @@ typedef struct {
     /* GPU-resident weight tensors */
     gpu_weights_t gpu;
 #endif
+    int _wdbg_done; /* debug flag */
 } model_t;
 
 /* Load a GGUF model file. Returns 0 on success. */
