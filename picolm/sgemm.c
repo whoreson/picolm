@@ -2395,7 +2395,132 @@ static void sgemm_q4k_q8k_d4(int m, int n, int k_blocks,
     }
 }
 
-#endif /* AVX2+F16C */
+#elif defined(__AVX__) || defined(__AVX2__)
+/* AVX1 (128-bit integer, 256-bit float) variant of sgemm_q4k_q8k_d4.
+ * Uses SSSE3 _mm_maddubs_epi16 for int8 MAC.
+ * Same 1x4 tiling strategy as AVX2 version. */
+static void sgemm_q4k_q8k_d4(int m, int n, int k_blocks,
+                             const block_q4_K *A, int lda,
+                             const block_q8_K *B, int ldb,
+                             float *C, int ldc,
+                             int ith, int nth) {
+    static const uint32_t kmask1 = 0x3f3f3f3f;
+    static const uint32_t kmask2 = 0x0f0f0f0f;
+    static const uint32_t kmask3 = 0x03030303;
+    const __m128i m4_128 = _mm_set1_epi8(0xF);
+    const __m128i m2 = _mm_set1_epi8(0x2);
+
+    int64_t n_tiles_x = (n + 3) / 4;
+    int64_t total_tiles = (int64_t)m * n_tiles_x;
+    if (total_tiles <= 0) return;
+
+    int64_t duty = (total_tiles + nth - 1) / nth;
+    int64_t start = duty * ith;
+    int64_t end = start + duty;
+    if (end > total_tiles) end = total_tiles;
+
+    for (int64_t job = start; job < end; ++job) {
+        int64_t ii = job / n_tiles_x;
+        int64_t xt = job % n_tiles_x;
+        int64_t jj = xt * 4;
+        int64_t jj_end = jj + 4;
+        if (jj_end > n) jj_end = n;
+
+        const block_q4_K *aq_row = A + lda * ii;
+
+        for (int64_t jr = jj; jr < jj_end; ++jr) {
+            const block_q8_K *bq_row = B + ldb * jr;
+
+            __m256 acc = _mm256_setzero_ps();
+            __m128 acc_m = _mm_setzero_ps();
+
+            for (int64_t blk = 0; blk < k_blocks; ++blk) {
+                const block_q4_K *aq = aq_row + blk;
+                const block_q8_K *bq = bq_row + blk;
+
+                float d = bq->d * fp16_to_fp32_lookup(aq->d);
+                float dmin = -bq->d * fp16_to_fp32_lookup(aq->dmin);
+
+                uint32_t utmp[4];
+                memcpy(utmp, aq->scales, 12);
+                utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+                const uint32_t uaux = utmp[1] & kmask1;
+                utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+                utmp[2] = uaux;
+                utmp[0] &= kmask1;
+
+                const uint8_t *q4 = aq->qs;
+                const int8_t *q8 = bq->qs;
+
+                const __m128i utmps = _mm_set_epi32(utmp[3], utmp[2], utmp[1], utmp[0]);
+                const __m128i scales128 = _mm_unpacklo_epi8(utmps, _mm_setzero_si128());
+                const __m128i mins128 = _mm_unpacklo_epi8(_mm_unpackhi_epi64(utmps, utmps), _mm_setzero_si128());
+
+                /* Bias term */
+                const __m128i q8sums_0 = _mm_loadu_si128((const __m128i*)&bq->bsums[0]);
+                const __m128i q8sums_1 = _mm_loadu_si128((const __m128i*)&bq->bsums[8]);
+                const __m128i q8s = _mm_hadd_epi16(q8sums_0, q8sums_1);
+                const __m128i prod = _mm_madd_epi16(mins128, q8s);
+                acc_m = _mm_add_ps(_mm_mul_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(prod)), acc_m);
+
+                __m128i sumi_0 = _mm_setzero_si128();
+                __m128i sumi_1 = _mm_setzero_si128();
+
+                __m128i shuffle = _mm_set1_epi16(0x0100);
+                for (int j = 0; j < 4; ++j) {
+                    const __m128i scale_l = _mm_shuffle_epi8(scales128, shuffle);
+                    shuffle = _mm_add_epi16(shuffle, m2);
+                    const __m128i scale_h = _mm_shuffle_epi8(scales128, shuffle);
+                    shuffle = _mm_add_epi16(shuffle, m2);
+
+                    __m128i q4bits = _mm_loadu_si128((const __m128i*)q4); q4 += 16;
+                    const __m128i q4l_0 = _mm_and_si128(q4bits, m4_128);
+                    const __m128i q4h_0 = _mm_and_si128(_mm_srli_epi16(q4bits, 4), m4_128);
+                    q4bits = _mm_loadu_si128((const __m128i*)q4); q4 += 16;
+                    const __m128i q4l_1 = _mm_and_si128(q4bits, m4_128);
+                    const __m128i q4h_1 = _mm_and_si128(_mm_srli_epi16(q4bits, 4), m4_128);
+
+                    const __m128i q8l_0 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
+                    __m128i p16l = _mm_maddubs_epi16(q4l_0, q8l_0);
+                    p16l = _mm_madd_epi16(scale_l, p16l);
+                    sumi_0 = _mm_add_epi32(sumi_0, p16l);
+                    const __m128i q8l_1 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
+                    p16l = _mm_maddubs_epi16(q4l_1, q8l_1);
+                    p16l = _mm_madd_epi16(scale_l, p16l);
+                    sumi_1 = _mm_add_epi32(sumi_1, p16l);
+
+                    const __m128i q8h_0 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
+                    __m128i p16h = _mm_maddubs_epi16(q4h_0, q8h_0);
+                    p16h = _mm_madd_epi16(scale_h, p16h);
+                    sumi_0 = _mm_add_epi32(sumi_0, p16h);
+                    const __m128i q8h_1 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
+                    p16h = _mm_maddubs_epi16(q4h_1, q8h_1);
+                    p16h = _mm_madd_epi16(scale_h, p16h);
+                    sumi_1 = _mm_add_epi32(sumi_1, p16h);
+                }
+
+                __m256 vd = _mm256_set1_ps(d);
+                __m256i sumi = _mm256_insertf128_si256(_mm256_castsi128_si256(sumi_0), sumi_1, 1);
+                acc = _mm256_add_ps(_mm256_mul_ps(vd, _mm256_cvtepi32_ps(sumi)), acc);
+            }
+
+            /* Hsum acc (8 floats -> 1) + bias */
+            __m128 lo_m = acc_m;
+            lo_m = _mm_add_ps(lo_m, _mm_movehl_ps(lo_m, lo_m));
+            lo_m = _mm_add_ss(lo_m, _mm_movehdup_ps(lo_m));
+
+            __m128 lo = _mm256_extractf128_ps(acc, 1);
+            lo = _mm_add_ps(lo, _mm256_castps256_ps128(acc));
+            lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
+            lo = _mm_add_ss(lo, _mm_movehdup_ps(lo));
+
+            lo = _mm_add_ss(lo, lo_m);
+            C[ldc * jr + ii] = _mm_cvtss_f32(lo);
+        }
+    }
+}
+
+#endif /* AVX2+F16C || AVX1 */
 
 /* ============================================================
  * Dispatch function
@@ -2594,6 +2719,12 @@ int picolm_sgemm_d_q4k(int m, int n, int k_blocks_q4k,
                        float *C, int ldc,
                        int ith, int nth) {
 #if defined(__AVX2__) && defined(__F16C__)
+    if (m < 1 || n < 1 || k_blocks_q4k < 1)
+        return 0;
+    sgemm_q4k_q8k_d4(m, n, k_blocks_q4k, (const block_q4_K*)A, lda_q4k,
+                     (const block_q8_K*)B, ldb_q8k, C, ldc, ith, nth);
+    return 1;
+#elif defined(__AVX__) || defined(__AVX2__)
     if (m < 1 || n < 1 || k_blocks_q4k < 1)
         return 0;
     sgemm_q4k_q8k_d4(m, n, k_blocks_q4k, (const block_q4_K*)A, lda_q4k,

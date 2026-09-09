@@ -2260,8 +2260,10 @@ static void sgemm_q8_worker(int idx, void *ctxp) {
                  c->B, c->ldb, c->C, c->ldc,
                  c->Atype, c->Btype, idx, c->nth);
 }
+#endif /* AVX2+F16C || ARM NEON for qgemm_d_ctx_t / sgemm_q8_ctx_t */
 
-/* Q4_K GEMM worker */
+/* Q4_K GEMM worker (AVX2+F16C or AVX1) */
+#if (defined(__AVX2__) && defined(__F16C__)) || defined(__AVX__)
 typedef struct {
     int m, n, k_blocks_q4k;
     const void *A; int lda_q4k;
@@ -2275,8 +2277,7 @@ static void q4k_gemm_task(int idx, void *ctxp) {
     picolm_sgemm_d_q4k(c->m, c->n, c->k_blocks_q4k, c->A, c->lda_q4k,
                        c->B, c->ldb_q8k, c->C, c->ldc, idx, c->nth);
 }
-
-#endif /* AVX2+F16C || ARM NEON for qgemm_d_ctx_t / sgemm_q8_ctx_t */
+#endif /* AVX2+F16C || AVX1 for q4k_gemm_ctx_t */
 
 /* Q4_0_8_8 GEMM threading context (not tied to AVX2+F16C/NEON, used under PICOLM_AVX2) */
 typedef struct {
@@ -2716,10 +2717,11 @@ void matmul_batch(float *out, const float *x, int n_batch,
     }
 #endif
 
-    /* Q4_K tiled GEMM fast path (AVX2).
+    /* Q4_K tiled GEMM fast path (AVX2+F16C or AVX1).
      * Uses picolm_sgemm_d_q4k with block_q4_K weights and block_q8_K activations.
      * n must be a multiple of 256 (block_q4_K granularity).
      * Threshold: n_batch >= 8 (consistent with Q8_0 GEMM). */
+#if (defined(__AVX2__) && defined(__F16C__)) || defined(__AVX__)
     if (have_qx && qtype == GGUF_TYPE_Q4_K && d >= 4 && n % 256 == 0) {
         int min_batch = 8;
         if (n_batch >= min_batch) {
@@ -2738,6 +2740,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
             return;
         }
     }
+#endif /* AVX2+F16C or AVX1 for Q4_K GEMM */
 
     /* Q4_0_4_4 fast path for batched matmul */
     if (qtype == GGUF_TYPE_Q4_0_4_4 && n_batch > 0 && n > 0) {
