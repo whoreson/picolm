@@ -149,7 +149,7 @@ sse3:
 
 # --- x86-64 with AVX (Sandy Bridge and newer Intel; Bulldozer and newer AMD) ---
 avx:
-	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -mavx -mf16c -mpopcnt -DPICOLM_AVX -DPICOLM_SSE2"
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -mavx -mf16c -mpopcnt -DPICOLM_AVX -DPICOLM_SSE2 -DPICOLM_SSE3 -DPICOLM_SSSE3"
 
 # --- x86-64 with AVX2 (Haswell and newer Intel; Excavator and newer AMD) ---
 avx2:
