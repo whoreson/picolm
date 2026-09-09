@@ -1,4 +1,9 @@
 #version 450
+// Scalar dequant matmul: Y[s,o] = sum_i X[s,i] * W[o,i]
+// Grid: [O, S, 1], block: [256, 1, 1]
+// Each thread computes the full dot product (no shared memory, no barriers).
+// This is redundant but correct on all hardware including KAVERI.
+
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer X  { float x[]; };
@@ -10,8 +15,6 @@ layout(push_constant) uniform P {
     int S, I, O;
     int rowWords;
 } p;
-
-shared float red[256];
 
 float f16tof32(uint h) {
     uint s = (h >> 15u) & 1u;
@@ -34,15 +37,15 @@ uint read_byte(uint rowBase, uint byteOff) {
 
 void main() {
     int s   = int(gl_WorkGroupID.y);
-    int tid = int(gl_LocalInvocationID.x);
     int o   = int(gl_WorkGroupID.x);
     int xoff = s * p.I;
     uint rowBase = uint(o) * uint(p.rowWords);
     float sum = 0.0;
 
     if (p.fmt == 8) {
+        // Q8_0: each block is [d:F16][qs:32xI8] = 34 bytes
         int nblocks = (p.I + 31) / 32;
-        for (int bi = tid; bi < nblocks; bi += 256) {
+        for (int bi = 0; bi < nblocks; bi++) {
             uint bo = uint(bi) * 34u;
             uint dWord = rowBase + bo / 4u;
             uint dShift = (bo % 4u) * 8u;
@@ -56,37 +59,57 @@ void main() {
             }
         }
     } else if (p.fmt == 2) {
+        // Q4_0: each block is [d:F16][qs:16xU8] = 18 bytes, 32 values
         int nblocks = (p.I + 31) / 32;
-        for (int bi = tid; bi < nblocks; bi += 256) {
+        for (int bi = 0; bi < nblocks; bi++) {
             uint bo = uint(bi) * 18u;
             float d = f16tof32(read_byte(rowBase, bo) | (read_byte(rowBase, bo+1u) << 8u));
             for (int v = 0; v < 32; v++) {
                 int vi = bi * 32 + v;
                 if (vi >= p.I) break;
                 uint ni = v < 16 ? uint(v) : uint(v - 16);
-                uint ns = v < 16 ? 0u : 4u;
                 uint bv = read_byte(rowBase, bo + 2u + ni);
-                int val = int((bv >> ns) & 0xfu) - 8;
+                int val = int((bv >> (v < 16 ? 0u : 4u)) & 0xfu) - 8;
                 sum += x[xoff + vi] * float(val) * d;
             }
         }
     } else if (p.fmt == 1) {
-        for (int i = tid; i < p.I; i += 256) {
-            sum += x[xoff + i] * f16tof32(read_byte(rowBase, uint(i)*2u) | (read_byte(rowBase, uint(i)*2u+1u) << 8u));
+        // F16 weights
+        for (int i = 0; i < p.I; i++) {
+            uint h = read_byte(rowBase, uint(i)*2u) | (read_byte(rowBase, uint(i)*2u+1u) << 8u);
+            sum += x[xoff + i] * f16tof32(h);
         }
     } else if (p.fmt == 0) {
-        for (int i = tid; i < p.I; i += 256) {
+        // F32 weights (stored as uint32 in the uint buffer)
+        for (int i = 0; i < p.I; i++) {
             sum += x[xoff + i] * uintBitsToFloat(w[rowBase + uint(i)]);
         }
+    } else if (p.fmt == 3) {
+        // Q5_0: each block is [d:F16][qs:16xU8][qh:32 bits] = 22 bytes, 32 values
+        int nblocks = (p.I + 31) / 32;
+        for (int bi = 0; bi < nblocks; bi++) {
+            uint bo = uint(bi) * 22u;
+            float d = f16tof32(read_byte(rowBase, bo) | (read_byte(rowBase, bo+1u) << 8u));
+            // Read 32-bit qh
+            uint qh = read_byte(rowBase, bo+2u) | (read_byte(rowBase, bo+3u) << 8u) |
+                      (read_byte(rowBase, bo+4u) << 16u) | (read_byte(rowBase, bo+5u) << 24u);
+            for (int v = 0; v < 32; v++) {
+                int vi = bi * 32 + v;
+                if (vi >= p.I) break;
+                uint ni = v < 16 ? uint(v) : uint(v - 16);
+                uint bv = read_byte(rowBase, bo + 6u + ni);
+                int val = int((bv >> (v < 16 ? 0u : 4u)) & 0xfu);
+                val = (val << 1u) | (int((qh >> v) & 1u));
+                val -= 16;
+                sum += x[xoff + vi] * float(val) * d;
+            }
+        }
+    } else {
+        // Unknown format: treat as zero
+        sum = 0.0;
     }
 
-    red[tid] = sum;
-    memoryBarrierShared();
-    barrier();
-    for (int stride = 128; stride > 0; stride >>= 1) {
-        if (tid < stride) red[tid] += red[tid + stride];
-        memoryBarrierShared();
-        barrier();
-    }
-    if (tid == 0) y[s * p.O + o] = red[0];
+    // Each thread writes independently (only one thread per output element)
+    y[s * p.O + o] = sum;
 }
+

@@ -1,43 +1,50 @@
 #version 450
 // RMS norm: y[s,i] = x[s,i] * w[i] / sqrt(mean(x[s,:]^2) + eps)
-// One workgroup per row. x_stride supports strided layouts.
-// If x_stride == 0, uses D as stride.
+// NO shared memory, NO subgroup ops -- safe for KAVERI/MI50.
+// Push constant layout matches matmul (PC_Matmul): fmt, S, I(D), O, rowWords(x_stride)
 
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0) readonly  buffer X { float x[]; };
-layout(std430, binding = 1) readonly  buffer W { float w[]; };
+layout(std430, binding = 0) readonly buffer X  { float x[]; };
+layout(std430, binding = 1) readonly buffer W  { float w[]; };
 layout(std430, binding = 2) writeonly buffer Y { float y[]; };
 
 layout(push_constant) uniform P {
-    int S;
-    int D;
-    float eps;
-    int x_stride;  // element stride between rows (0 = use D)
+    int fmt;       // unused
+    int S;         // number of rows
+    int I;         // dimension D
+    int O;         // unused
+    int rowWords;  // x_stride (0 = D)
 } p;
-
-shared float red[256];
 
 void main() {
     int s = int(gl_WorkGroupID.x);
     if (s >= p.S) return;
     int tid = int(gl_LocalInvocationID.x);
-    int stride = p.x_stride > 0 ? p.x_stride : p.D;
+    int D = p.I;
+    int stride = p.rowWords > 0 ? p.rowWords : D;
     uint base = uint(s) * uint(stride);
 
-    float acc = 0.0;
-    for (int i = tid; i < p.D; i += 256) {
+    // Every thread computes the full sum of squares
+    float sum_sq = 0.0;
+    for (int i = 0; i < D; i++) {
         float v = x[base + uint(i)];
-        acc += v * v;
+        sum_sq += v * v;
     }
-    red[tid] = acc;
-    barrier();
-    for (int off = 128; off > 0; off >>= 1) {
-        if (tid < off) red[tid] += red[tid + off];
-        barrier();
+    float r = 1.0 / sqrt(sum_sq / float(D) + 1e-5);
+
+    // Debug diagnostics (token 0, thread 0): write at base + D + 0..5
+    if (tid == 0 && s == 0) {
+        y[base + uint(D) + 0u] = x[base];
+        y[base + uint(D) + 1u] = r;
+        y[base + uint(D) + 2u] = sum_sq;
+        y[base + uint(D) + 3u] = w[0];
+        y[base + uint(D) + 4u] = float(D);
+        y[base + uint(D) + 5u] = float(stride);
     }
-    float r = 1.0 / sqrt(red[0] / float(p.D) + p.eps);
-    for (int i = tid; i < p.D; i += 256)
+
+    // All threads write their assigned outputs
+    for (int i = tid; i < D; i += 256)
         y[base + uint(i)] = x[base + uint(i)] * r * w[i];
 }
 

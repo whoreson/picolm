@@ -4289,11 +4289,15 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
              * SSM/hybrid layers below have no KV cache entry at all, they
              * index ssm_state_dev/ssm_conv_state_dev by the raw layer index
              * `l` instead. */
-            /* H. Attention decode: pipe_attn_out = attn(pipe_q) */
-            picolm_gpu_attention_decode_dev(pipe_attn_out, pipe_q,
-                                             this_attn_ordinal - 1, pos,
-                                             n_heads, n_kv_heads, head_dim,
-                                             seq_len, gpu_dev);
+            /* H. Attention decode: pipe_attn_out = attn(pipe_q)
+             * GPU decode attention is disabled on Vulkan (returns 0).
+             * Fall back to CPU-only decode by returning NULL. */
+            if (!picolm_gpu_attention_decode_dev(pipe_attn_out, pipe_q,
+                                                  this_attn_ordinal - 1, pos,
+                                                  n_heads, n_kv_heads, head_dim,
+                                                  seq_len, gpu_dev)) {
+                return model_forward(m, token, pos);
+            }
             if (getenv("PICOLM_ATTN_DBG") && this_attn_ordinal == 1 && pos == 40) {
                 float dbg_attn[8], dbg_q[8];
                 picolm_gpu_sync(gpu_dev);
@@ -4572,38 +4576,58 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
         }
 
         /* Standard path: RMSNorm -> QKV (uses bxb intermediate buffer). */
-        /* Debug: dump bx buffer before RMSNorm */
+        // Debug: verify bx content BEFORE RMSNorm (layer 0 only)
         if (getenv("PICOLM_ATTN_DBG") && attn_ord == 0 && start_pos == 0 && l == 0) {
             picolm_gpu_sync(gpu_dev);
-            float bx_dbg[8];
-            picolm_gpu_memcpy(bx_dbg, bx, 8 * sizeof(float), -1, gpu_dev);
-            fprintf(stderr, "[BX_PRE_RN l=%d] bx_tok0[:8]={", l);
-            for (int _i = 0; _i < 8; _i++) fprintf(stderr, "%.6f ", bx_dbg[_i]);
-            fprintf(stderr, "}\n"); fflush(stderr);
-        }
-        if (getenv("PICOLM_ATTN_DBG") && attn_ord == 0 && start_pos == 0 && l == 0) {
-            fprintf(stderr, "[RN_PTRS] bx=%p bxb=%p attn_norm=%p\n",
-                (void*)bx, (void*)bxb, (void*)gw->attn_norm_dev[l]);
+            float bx_pre[8];
+            picolm_gpu_memcpy(bx_pre, bx, 8 * sizeof(float), -1, gpu_dev);
+            fprintf(stderr, "[BX_PRE l=0] token0[:8]={%f %f %f %f %f %f %f %f}\n",
+                bx_pre[0],bx_pre[1],bx_pre[2],bx_pre[3],bx_pre[4],bx_pre[5],bx_pre[6],bx_pre[7]);
             fflush(stderr);
         }
         picolm_gpu_rmsnorm_batched_dev(bxb, bx,
                                         (float *)gw->attn_norm_dev[l],
                                         dim, c->rms_norm_eps, n_ubatch, xb_stride, gpu_dev);
 
-        /* NaN guard after RMSNorm -- catches NaNs at the earliest point */
-        _PFX_NAN_CHECK(bxb, "post_rmsnorm");
-
-        /* Debug: dump RMSNorm sum_of_squares debug values */
+        /* NaN guard after RMSNorm */
+        // Debug: read GPU RMSNorm diagnostics AFTER it runs
         if (getenv("PICOLM_ATTN_DBG") && attn_ord == 0 && start_pos == 0 && l == 0) {
+            float rn_diag[6];
             picolm_gpu_sync(gpu_dev);
-            float rn_dbg[16]; // 4*3 tokens + 1 sum + padding
-            picolm_gpu_memcpy(rn_dbg, bxb + dim, 16 * sizeof(float), -1, gpu_dev);
-            fprintf(stderr, "[RN_DBG l=%d] x_tok0={%.6f %.6f %.6f %.6f} x_tok1={%.6f %.6f %.6f %.6f} sum_sq=%.6f\n",
-                l, rn_dbg[0], rn_dbg[1], rn_dbg[2], rn_dbg[3],
-                rn_dbg[4], rn_dbg[5], rn_dbg[6], rn_dbg[7],
-                rn_dbg[12]);
+            picolm_gpu_memcpy(rn_diag, bxb + dim, 6 * sizeof(float), -1, gpu_dev);
+            fprintf(stderr, "[RN_GPU_DBG l=0] x[0]=%.6f inv_rms=%.6f sum_sq=%.6f w[0]=%.6f D_pc=%d stride=%d\n",
+                rn_diag[0], rn_diag[1], rn_diag[2], rn_diag[3], (int)rn_diag[4], (int)rn_diag[5]);
             fflush(stderr);
         }
+        // Debug: CPU RMSNorm vs GPU RMSNorm AFTER
+        if (getenv("PICOLM_ATTN_DBG") && attn_ord == 0 && start_pos == 0 && l == 0) {
+            picolm_gpu_sync(gpu_dev);
+            float bx_tok[dim];
+            picolm_gpu_memcpy(bx_tok, bx, dim * sizeof(float), -1, gpu_dev);
+            float rn_w[dim];
+            if (gw->attn_norm_dev[0]) {
+                picolm_gpu_memcpy(rn_w, gw->attn_norm_dev[0], dim * sizeof(float), -1, gpu_dev);
+            }
+            float cpu_rn[dim];
+            { float sum_sq = 0.0f;
+              for (int _i = 0; _i < dim; _i++) sum_sq += bx_tok[_i] * bx_tok[_i];
+              float r = 1.0f / sqrtf(sum_sq / dim + c->rms_norm_eps);
+              for (int _i = 0; _i < dim; _i++) cpu_rn[_i] = bx_tok[_i] * r * rn_w[_i]; }
+            float gpu_rn[dim];
+            picolm_gpu_memcpy(gpu_rn, bxb, dim * sizeof(float), -1, gpu_dev);
+            float diff = 0.0f;
+            for (int _i = 0; _i < dim; _i++) { float d = cpu_rn[_i] - gpu_rn[_i]; diff += d * d; }
+            float cpu_rms = 0, gpu_rms = 0;
+            for (int _i = 0; _i < dim; _i++) { cpu_rms += cpu_rn[_i]*cpu_rn[_i]; gpu_rms += gpu_rn[_i]*gpu_rn[_i]; }
+            cpu_rms = sqrtf(cpu_rms / dim); gpu_rms = sqrtf(gpu_rms / dim);
+            fprintf(stderr, "[RN_CPU_DBG l=0] w[:4]={%.6f %.6f %.6f %.6f} cpu[:4]={%.6f %.6f %.6f %.6f} gpu[:4]={%.6f %.6f %.6f %.6f} rms cpu=%.6f gpu=%.6f diff_rms=%.6f\n",
+                rn_w[0], rn_w[1], rn_w[2], rn_w[3],
+                cpu_rn[0], cpu_rn[1], cpu_rn[2], cpu_rn[3],
+                gpu_rn[0], gpu_rn[1], gpu_rn[2], gpu_rn[3],
+                cpu_rms, gpu_rms, sqrtf(diff / dim));
+            fflush(stderr);
+        }
+        _PFX_NAN_CHECK(bxb, "post_rmsnorm");
 
         /* Diagnostic: dump RMSNorm'd input to first attention layer */
         if (getenv("PICOLM_ATTN_DBG") && attn_ord == 0) {
