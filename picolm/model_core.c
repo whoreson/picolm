@@ -3538,8 +3538,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #endif
         { int this_q_dim = (c->has_ssm && lw->is_attn_layer) ? q_full_dim : q_dim;
           matmul_batch(q_batch, xb_batch, n_tokens, lw->attn_q, dim, this_q_dim, lw->type_attn_q);
-          fprintf(stderr, "[DBG] matmul_batch done l=%d is_attn=%d qtype=%d\n", l, lw->is_attn_layer, lw->type_attn_q); fflush(stderr);
-          if(getenv("PICOLM_ATTN_DBG") && l == 0 && lw->is_attn_layer) {
+                    if(getenv("PICOLM_ATTN_DBG") && l == 0 && lw->is_attn_layer) {
               int lt = n_tokens - 1;
               fprintf(stderr, "[ATN_DBG l=%d CPU_Q] first_tok[:4]={", l);
               for(int _i=0;_i<4;_i++) fprintf(stderr,"%.6f ", q_batch[_i]);
