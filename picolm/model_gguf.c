@@ -4,6 +4,12 @@
 #include "model_internal.h"
 #include <inttypes.h>
 #include <stdio.h>
+#ifndef PRIu64
+#define PRIu64 "llu"
+#endif
+#ifndef PRId64
+#define PRId64 "lld"
+#endif
 /* SSM verification debug (used in GGUF parsing) */
 #ifdef PICOLM_SSM_VERIFY
 #define _SSM_DBG 1

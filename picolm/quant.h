@@ -5,6 +5,19 @@
 #include <stddef.h>
 #include <string.h>
 
+/* OSF/1 compatibility: provides fmaf macro, snprintf, atoll, roundf. */
+#if defined(__osf__)
+#include "compat/osf1_compat.h"
+#endif
+
+/* Fallback for systems without <inttypes.h> (OSF/1 V4.0, GCC 3.x, etc.) */
+#ifndef PRIu64
+#define PRIu64 "llu"
+#endif
+#ifndef PRId64
+#define PRId64 "lld"
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -24,6 +37,7 @@ extern "C" {
  */
 
 /* Forward declarations for use in inline helpers below */
+/* Note: fp16_to_fp32() uses pure integer arithmetic (no FPU ops). */
 float fp16_to_fp32(uint16_t h);
 float fp16_to_fp32_lookup(uint16_t h);
 float bf16_to_fp32(uint16_t x);

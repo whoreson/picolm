@@ -6,6 +6,9 @@
 #include <string.h>
 #include <stdlib.h>
 /* DJGPP: no alloca.h needed, uses __builtin_alloca */
+#if !defined(_WIN32) && !defined(__DJGPP__)
+#include <alloca.h>
+#endif
 #include <errno.h>
 #ifdef _WIN32
 #include <windows.h>

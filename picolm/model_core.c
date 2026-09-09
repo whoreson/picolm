@@ -40,6 +40,11 @@
 /* DJGPP: no alloca.h needed, uses __builtin_alloca */
 #include <string.h>
 #include <math.h>
+#include <sys/types.h>
+#include <sys/resource.h>
+#if !defined(_WIN32) && !defined(__DJGPP__)
+#include <alloca.h>
+#endif
 
 #ifdef PICOLM_GPU
 #include "backend_gpu.h"
@@ -296,7 +301,7 @@ void _do_prefault(const void *addr, size_t size) {
     const volatile char *p = (const volatile char *)addr;
     for (size_t off = 0; off < size; off += 4096)
         (void)p[off];
-    fprintf(stderr, "Prefaulted %zu pages (%.1f MB)\n", pages, (double)size / (1024.0 * 1024.0));
+    fprintf(stderr, "Prefaulted %ld pages (%.1f MB)\n", (long)pages, (double)size / (1024.0 * 1024.0));
 }
 
 void prepare_mmap(const void *addr, size_t size) {
@@ -2767,9 +2772,11 @@ int model_lock_layers(model_t *m, size_t mem_bytes) {
     const model_config_t *c = &m->config;
 
     /* Cap budget to RLIMIT_MEMLOCK minus page alignment overhead.
-     * On Windows, VirtualLock has no such limit, so skip this check. */
+     * On Windows, VirtualLock has no such limit, so skip this check.
+     * On systems without RLIMIT_MEMLOCK (OSF/1, etc.), skip too. */
     size_t effective_budget = mem_bytes;
 #if !defined(_WIN32) && !defined(PICOLM_DOS)
+#ifdef RLIMIT_MEMLOCK
     {
         struct rlimit rl;
         if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) {
@@ -2779,6 +2786,7 @@ int model_lock_layers(model_t *m, size_t mem_bytes) {
                 effective_budget = rlimit_budget;
         }
     }
+#endif
 #endif
 
     size_t gbytes = global_weight_bytes(m);
@@ -3551,8 +3559,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #endif
         { int this_q_dim = (c->has_ssm && lw->is_attn_layer) ? q_full_dim : q_dim;
           matmul_batch(q_batch, xb_batch, n_tokens, lw->attn_q, dim, this_q_dim, lw->type_attn_q);
-          fprintf(stderr, "[DBG] matmul_batch done l=%d is_attn=%d qtype=%d\n", l, lw->is_attn_layer, lw->type_attn_q); fflush(stderr);
-          if(getenv("PICOLM_ATTN_DBG") && l == 0 && lw->is_attn_layer) {
+                    if(getenv("PICOLM_ATTN_DBG") && l == 0 && lw->is_attn_layer) {
               int lt = n_tokens - 1;
               fprintf(stderr, "[ATN_DBG l=%d CPU_Q] first_tok[:4]={", l);
               for(int _i=0;_i<4;_i++) fprintf(stderr,"%.6f ", q_batch[_i]);

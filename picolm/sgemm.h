@@ -1,4 +1,3 @@
-#pragma once
 #ifndef PICOLM_SGEMM_H
 #define PICOLM_SGEMM_H
 
