@@ -119,7 +119,10 @@ float fp16_to_fp32(uint16_t h) {
         uint32_t m = exp_mant & 0x3FF;
         int shift = 0;
         while ((m & 0x200) == 0) { m <<= 1; shift++; }
-        uint32_t exp32 = 1 - 15 - shift + 127;
+        /* FP32 exponent: normalized FP16 subnormal is 0.m * 2^-14,
+         * after shifting left by 'shift' bits to normalize:
+         * 1.fraction * 2^(-15-shift). FP32 biased exponent = 112 - shift */
+        uint32_t exp32 = 112 - shift;
         uint32_t mant32 = (m & 0x1FF) << (23 - 9);
         uint32_t result = sign | (exp32 << 23) | mant32;
         float rv; memcpy(&rv, &result, sizeof(float)); return rv;
