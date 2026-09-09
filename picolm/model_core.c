@@ -1541,6 +1541,12 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                             m->gpu.output_norm_dev = picolm_gpu_upload_f32(s->output_norm_w, c->n_embd, device);
                             /* Per-layer norm weights (only for GPU layers) */
                             for (int l = 0; l < ngl; l++) {
+                                if (l == 0) {
+                                    fprintf(stderr, "[CPU_ATTN_NORM] s->attn_norm_w[0][:4]={%f %f %f %f}\n",
+                                        s->attn_norm_w[0][0], s->attn_norm_w[0][1], s->attn_norm_w[0][2], s->attn_norm_w[0][3]);
+                                    fprintf(stderr, "[CPU_POST_NORM] s->post_attn_norm_w[0][:4]={%f %f %f %f}\n",
+                                        s->post_attn_norm_w[0][0], s->post_attn_norm_w[0][1], s->post_attn_norm_w[0][2], s->post_attn_norm_w[0][3]);
+                                }
                                 m->gpu.attn_norm_dev[l] =
                                     picolm_gpu_upload_f32(s->attn_norm_w[l], c->n_embd, device);
                                 m->gpu.post_attn_norm_dev[l] =
@@ -3255,6 +3261,15 @@ static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_to
         tensor_set_repacked(m->repack_used[7 + l * 9] ? m->repack_buffers[7 + l * 9] : NULL);
         matmul_batch(xb_batch, hb_batch, n_tokens, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
         tensor_set_repacked(NULL);
+        /* Debug: dump CPU FFN down output for layer 0 */
+        if (l == 0 && getenv("PICOLM_ATTN_DBG") && n_tokens > 0) {
+            float *xb_last = xb_batch + (n_tokens-1) * dim;
+            fprintf(stderr, "[CPU_FFN_DOWN l=0] last_tok[:8]={");
+            for(int _i=0;_i<8;_i++) fprintf(stderr, "%.6f ", xb_last[_i]);
+            double rfd=0; for(int _i=0;_i<8;_i++){float a=xb_last[_i];rfd+=a*a;}
+            fprintf(stderr, "} rms8=%.6f\n", sqrt((double)rfd/8));
+            fflush(stderr);
+        }
         /* Add bias */
         if (lw->ffn_down_bias) {
             const float *bias = (const float *)lw->ffn_down_bias;

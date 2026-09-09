@@ -4385,8 +4385,12 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
             picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_up,
                                    pipe_up, pipe_ffn_norm, 1, gpu_dev, 0, 0);
 
-            /* N. SiLU-mul: pipe_gate = silu(pipe_gate) * pipe_up (in-place on gate) */
-            picolm_gpu_silu_mul_dev(pipe_gate, pipe_up, n_ffn, gpu_dev);
+            /* N. SiLU-mul / GELU-mul */
+            if (c->is_gpt2 || c->is_gemma3n) {
+                picolm_gpu_gelu_mul_dev(pipe_gate, pipe_up, n_ffn, gpu_dev);
+            } else {
+                picolm_gpu_silu_mul_dev(pipe_gate, pipe_up, n_ffn, gpu_dev);
+            }
 
             /* O. Down: pipe_xb = ffn_down @ pipe_gate */
             picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_down,
@@ -4568,12 +4572,38 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
         }
 
         /* Standard path: RMSNorm -> QKV (uses bxb intermediate buffer). */
+        /* Debug: dump bx buffer before RMSNorm */
+        if (getenv("PICOLM_ATTN_DBG") && attn_ord == 0 && start_pos == 0 && l == 0) {
+            picolm_gpu_sync(gpu_dev);
+            float bx_dbg[8];
+            picolm_gpu_memcpy(bx_dbg, bx, 8 * sizeof(float), -1, gpu_dev);
+            fprintf(stderr, "[BX_PRE_RN l=%d] bx_tok0[:8]={", l);
+            for (int _i = 0; _i < 8; _i++) fprintf(stderr, "%.6f ", bx_dbg[_i]);
+            fprintf(stderr, "}\n"); fflush(stderr);
+        }
+        if (getenv("PICOLM_ATTN_DBG") && attn_ord == 0 && start_pos == 0 && l == 0) {
+            fprintf(stderr, "[RN_PTRS] bx=%p bxb=%p attn_norm=%p\n",
+                (void*)bx, (void*)bxb, (void*)gw->attn_norm_dev[l]);
+            fflush(stderr);
+        }
         picolm_gpu_rmsnorm_batched_dev(bxb, bx,
                                         (float *)gw->attn_norm_dev[l],
                                         dim, c->rms_norm_eps, n_ubatch, xb_stride, gpu_dev);
 
         /* NaN guard after RMSNorm -- catches NaNs at the earliest point */
         _PFX_NAN_CHECK(bxb, "post_rmsnorm");
+
+        /* Debug: dump RMSNorm sum_of_squares debug values */
+        if (getenv("PICOLM_ATTN_DBG") && attn_ord == 0 && start_pos == 0 && l == 0) {
+            picolm_gpu_sync(gpu_dev);
+            float rn_dbg[16]; // 4*3 tokens + 1 sum + padding
+            picolm_gpu_memcpy(rn_dbg, bxb + dim, 16 * sizeof(float), -1, gpu_dev);
+            fprintf(stderr, "[RN_DBG l=%d] x_tok0={%.6f %.6f %.6f %.6f} x_tok1={%.6f %.6f %.6f %.6f} sum_sq=%.6f\n",
+                l, rn_dbg[0], rn_dbg[1], rn_dbg[2], rn_dbg[3],
+                rn_dbg[4], rn_dbg[5], rn_dbg[6], rn_dbg[7],
+                rn_dbg[12]);
+            fflush(stderr);
+        }
 
         /* Diagnostic: dump RMSNorm'd input to first attention layer */
         if (getenv("PICOLM_ATTN_DBG") && attn_ord == 0) {
@@ -4757,8 +4787,12 @@ after_qkv:
                 bup, bffn_norm, n_ubatch, gpu_dev, attn_ffn_stride, xb_stride);
         }
 
-        /* FFN silu_mul */
-        picolm_gpu_silu_mul_dev(bgate, bup, n_ubatch * n_ffn, gpu_dev);
+        /* FFN silu_mul / gelu_mul */
+        if (c->is_gpt2 || c->is_gemma3n) {
+            picolm_gpu_gelu_mul_dev(bgate, bup, n_ubatch * n_ffn, gpu_dev);
+        } else {
+            picolm_gpu_silu_mul_dev(bgate, bup, n_ubatch * n_ffn, gpu_dev);
+        }
 
         /* FFN down */
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_down,

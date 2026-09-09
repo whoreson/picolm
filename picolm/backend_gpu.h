@@ -608,6 +608,8 @@ int picolm_gpu_residual_add(float *out, const float *a, const float *b,
  * without this because that function still syncs at the end). */
 int picolm_gpu_silu_mul_dev(float *gate_dev, const float *up_dev,
                              size_t n, int device);
+int picolm_gpu_gelu_mul_dev(float *gate_dev, const float *up_dev,
+                             size_t n, int device);
 
 /* The single sync point for a whole model_forward_gpu() pass -- see the
  * comment on the implementation for why every _dev primitive omits its
