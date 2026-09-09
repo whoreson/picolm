@@ -33,16 +33,6 @@ void main() {
     }
     float r = 1.0 / sqrt(sum_sq / float(D) + 1e-5);
 
-    // Debug diagnostics (token 0, thread 0): write at base + D + 0..5
-    if (tid == 0 && s == 0) {
-        y[base + uint(D) + 0u] = x[base];
-        y[base + uint(D) + 1u] = r;
-        y[base + uint(D) + 2u] = sum_sq;
-        y[base + uint(D) + 3u] = w[0];
-        y[base + uint(D) + 4u] = float(D);
-        y[base + uint(D) + 5u] = float(stride);
-    }
-
     // All threads write their assigned outputs
     for (int i = tid; i < D; i += 256)
         y[base + uint(i)] = x[base + uint(i)] * r * w[i];
