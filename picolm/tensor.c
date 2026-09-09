@@ -2261,6 +2261,21 @@ static void sgemm_q8_worker(int idx, void *ctxp) {
                  c->Atype, c->Btype, idx, c->nth);
 }
 
+/* Q4_K GEMM worker */
+typedef struct {
+    int m, n, k_blocks_q4k;
+    const void *A; int lda_q4k;
+    const void *B; int ldb_q8k;
+    float *C; int ldc;
+    int nth;
+} q4k_gemm_ctx_t;
+
+static void q4k_gemm_task(int idx, void *ctxp) {
+    q4k_gemm_ctx_t *c = (q4k_gemm_ctx_t *)ctxp;
+    picolm_sgemm_d_q4k(c->m, c->n, c->k_blocks_q4k, c->A, c->lda_q4k,
+                       c->B, c->ldb_q8k, c->C, c->ldc, idx, c->nth);
+}
+
 #endif /* AVX2+F16C || ARM NEON for qgemm_d_ctx_t / sgemm_q8_ctx_t */
 
 /* Q4_0_8_8 GEMM threading context (not tied to AVX2+F16C/NEON, used under PICOLM_AVX2) */
@@ -2700,6 +2715,29 @@ void matmul_batch(float *out, const float *x, int n_batch,
         }
     }
 #endif
+
+    /* Q4_K tiled GEMM fast path (AVX2).
+     * Uses picolm_sgemm_d_q4k with block_q4_K weights and block_q8_K activations.
+     * n must be a multiple of 256 (block_q4_K granularity).
+     * Threshold: n_batch >= 8 (consistent with Q8_0 GEMM). */
+    if (have_qx && qtype == GGUF_TYPE_Q4_K && d >= 4 && n % 256 == 0) {
+        int min_batch = 8;
+        if (n_batch >= min_batch) {
+            int k_blocks_q4k = n / 256;
+            int nth = pool_total_threads(1);
+            q4k_gemm_ctx_t ctx4k = {
+                .m = d, .n = n_batch, .k_blocks_q4k = k_blocks_q4k,
+                .A = W, .lda_q4k = k_blocks_q4k,
+                .B = qx_buf, .ldb_q8k = k_blocks_q4k,
+                .C = out, .ldc = d,
+                .nth = nth,
+            };
+            tensor_parallel_for(nth, q4k_gemm_task, &ctx4k);
+            if (getenv("PICOLM_DISPATCH")) fprintf(stderr, "DISPATCH matmul_batch: d=%d n=%d batch=%d qtype=Q4_K -> GEMM_d_q4k\n", d, n, n_batch);
+            free(qx_buf);
+            return;
+        }
+    }
 
     /* Q4_0_4_4 fast path for batched matmul */
     if (qtype == GGUF_TYPE_Q4_0_4_4 && n_batch > 0 && n > 0) {

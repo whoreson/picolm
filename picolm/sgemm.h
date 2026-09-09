@@ -39,6 +39,14 @@ int picolm_sgemm_d(int m, int n, int k_blocks,
                    int Atype,
                    int ith, int nth);
 
+/* Q4_K x Q8_K GEMM (AVX2): C[n][m] = B[n][k] @ A^T[m][k]
+ * m = weight rows (d), n = activation rows (n_batch)
+ * k_blocks_q4k = k / 256 (number of block_q4_K per row) */
+int picolm_sgemm_d_q4k(int m, int n, int k_blocks_q4k,
+                       const void *A, int lda_q4k,
+                       const void *B, int ldb_q8k,
+                       float *C, int ldc, int ith, int nth);
+
 /* Interleaved Q4_0_8_8 GEMM: C[nr][nc] = A[nr][k] @ B[nc][k]^T
  * nr = activation rows (n_batch), nc = weight rows (d), k = shared dim
  * Returns number of rows computed (aligned to 16). */
