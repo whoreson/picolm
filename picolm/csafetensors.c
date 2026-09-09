@@ -32,7 +32,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
-#if defined(_POSIX_MAPPED_FILES) && _POSIX_MAPPED_FILES > 0
+#if defined(_POSIX_MAPPED_FILES)
 #define CSAFETENSORS_HAS_MMAP 1
 #include <sys/mman.h>
 #endif

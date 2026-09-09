@@ -425,8 +425,8 @@ typedef struct {
 
 static generic_task_t  generic_tasks[MAX_THREADS];
 static volatile int    pool_mode = 0; /* 0 = matmul_task_t, 1 = generic_task_t */
-#if defined(_WIN32) || defined(__APPLE__)
-/* MSVC and old Mac OS X don't support __thread */
+#if defined(_WIN32) || defined(__APPLE__) || defined(__osf__)
+/* MSVC, old Mac OS X, OSF/1 Alpha (GCC 3.x) don't support __thread */
 static int             pool_my_tid = 0;
 #else
 static __thread int    pool_my_tid = 0;
@@ -2290,8 +2290,12 @@ static inline double picolm_now(void) {
 #else
 #include <time.h>
 static inline double picolm_now(void) {
+#ifdef CLOCK_MONOTONIC
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + ts.tv_nsec * 1e-9;
+#else
+    return (double)clock() / CLOCKS_PER_SEC;
+#endif
 }
 #endif
 static double prof_f32_gemm, prof_q8_d, prof_q4_d, prof_q5_d, prof_scalar_par, prof_scalar_seq, prof_other;

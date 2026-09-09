@@ -40,6 +40,11 @@
 /* DJGPP: no alloca.h needed, uses __builtin_alloca */
 #include <string.h>
 #include <math.h>
+#include <sys/types.h>
+#include <sys/resource.h>
+#if !defined(_WIN32) && !defined(__DJGPP__)
+#include <alloca.h>
+#endif
 
 #ifdef PICOLM_GPU
 #include "backend_gpu.h"
@@ -296,7 +301,7 @@ void _do_prefault(const void *addr, size_t size) {
     const volatile char *p = (const volatile char *)addr;
     for (size_t off = 0; off < size; off += 4096)
         (void)p[off];
-    fprintf(stderr, "Prefaulted %zu pages (%.1f MB)\n", pages, (double)size / (1024.0 * 1024.0));
+    fprintf(stderr, "Prefaulted %ld pages (%.1f MB)\n", (long)pages, (double)size / (1024.0 * 1024.0));
 }
 
 void prepare_mmap(const void *addr, size_t size) {
@@ -2754,9 +2759,11 @@ int model_lock_layers(model_t *m, size_t mem_bytes) {
     const model_config_t *c = &m->config;
 
     /* Cap budget to RLIMIT_MEMLOCK minus page alignment overhead.
-     * On Windows, VirtualLock has no such limit, so skip this check. */
+     * On Windows, VirtualLock has no such limit, so skip this check.
+     * On systems without RLIMIT_MEMLOCK (OSF/1, etc.), skip too. */
     size_t effective_budget = mem_bytes;
 #if !defined(_WIN32) && !defined(PICOLM_DOS)
+#ifdef RLIMIT_MEMLOCK
     {
         struct rlimit rl;
         if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) {
@@ -2766,6 +2773,7 @@ int model_lock_layers(model_t *m, size_t mem_bytes) {
                 effective_budget = rlimit_budget;
         }
     }
+#endif
 #endif
 
     size_t gbytes = global_weight_bytes(m);

@@ -161,7 +161,11 @@ threadpool:
 
 # --- Link ---
 $(TARGET): $(OBJS) $(GPU_OBJS)
+ifeq ($(OSF1_LINK),1)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(GPU_LIBS)
+else
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(GPU_LIBS) -lstdc++
+endif
 
 # --- Compile each .c to .o independently ---
 %.o: %.c
@@ -220,6 +224,16 @@ ppc:
 iphoneos1:
 	$(MAKE) $(TARGET) CC=/usr/local/arm-apple-darwin-ios1/bin/arm-apple-darwin-gcc CFLAGS="-O2 -g -std=c99 -D_DARWIN_C_SOURCE -D_GNU_SOURCE -Wall -arch armv6" LDFLAGS="-lm"
 
+# --- OSF/1 Tru64 UNIX (DEC Alpha, GCC 3.3.6) ---
+# Scalar only. compat/ has portable snprintf + fmaf/atoll/roundf/memlk stubs.
+osf: compat/snprintf_portable.o compat/snprintf_osf1_supplement.o
+	$(MAKE) $(TARGET) CFLAGS="-O2 -g -std=c99 -D_DARWIN_C_SOURCE -D_GNU_SOURCE -Wall -mieee" LDFLAGS="-lm -lc_r -lpthread" OBJS="$(OBJS) compat/snprintf_portable.o compat/snprintf_osf1_supplement.o" OSF1_LINK=1
+
+compat/snprintf_portable.o: compat/snprintf_portable_src.c compat/osf1_compat.h
+	$(CC) -O2 -g -std=c99 -D_DARWIN_C_SOURCE -D_GNU_SOURCE -Wall -DUSE_SNPRINTF -DHAVE_SNPRINTF -DPREFER_PORTABLE_SNPRINTF -c -o $@ $<
+
+compat/snprintf_osf1_supplement.o: compat/snprintf_osf1_supplement.c compat/osf1_compat.h
+	$(CC) -O2 -g -std=c99 -D_DARWIN_C_SOURCE -D_GNU_SOURCE -Wall -c -o $@ $<
 
 # --- Mac OS X 10.6 Snow Leopard (Core 2 Duo, GCC 4.2.1, SSE4.1) ---
 # GCC 4.2: no -march=native, no -std=c11, no -Wpedantic, no <immintrin.h>

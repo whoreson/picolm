@@ -10,6 +10,9 @@
 #endif
 #endif
 /* DJGPP: no alloca.h needed, uses __builtin_alloca */
+#if !defined(_WIN32) && !defined(__DJGPP__)
+#include <alloca.h>
+#endif
 #include <string.h>
 #include <math.h>
 #include <assert.h>

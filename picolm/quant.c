@@ -101,35 +101,34 @@ float vec_dot_f16_f32(const void *src, const float *x, int n) {
 }
 
 float fp16_to_fp32(uint16_t h) {
-    /* Mirrors llama.cpp's ggml_compute_fp16_to_fp32 for correct subnormal handling */
-    uint32_t w = (uint32_t)h << 16;
-    uint32_t sign = w & 0x80000000U;
-    uint32_t two_w = w + w;
+    /* Pure integer FP16->FP32 conversion. Avoids FPU arithmetic entirely.
+     * Replaces the "magic subtraction" trick which was buggy on GCC 3.3.6
+     * Alpha (FPU register corruption) and works correctly on all platforms. */
+    uint32_t sign = (uint32_t)(h >> 15) << 31;
+    uint32_t exp_mant = h & 0x7FFF;
 
-    uint32_t exp_offset = 0xE0U << 23;
-    float exp_scale;
-    { uint32_t escale = 0x07800000U; memcpy(&exp_scale, &escale, sizeof(float)); } /* 0x07800000 = 2^-112 */
-    float normalized_value;
-    { uint32_t nbits = (two_w >> 4) + exp_offset; memcpy(&normalized_value, &nbits, sizeof(float)); }
-    normalized_value *= exp_scale;
-
-    uint32_t magic_mask = 126U << 23;
-    float magic_bias = 0.5f;
-    float denormalized_value;
-    { uint32_t dbits = (two_w >> 17) | magic_mask; memcpy(&denormalized_value, &dbits, sizeof(float)); }
-    denormalized_value -= magic_bias;
-
-    uint32_t denormalized_cutoff = 1U << 27;
-    uint32_t result;
-    float rv;
-    if (two_w < denormalized_cutoff) {
-        memcpy(&result, &denormalized_value, sizeof(float));
-    } else {
-        memcpy(&result, &normalized_value, sizeof(float));
+    if (exp_mant == 0) {
+        uint32_t result = sign;
+        float rv; memcpy(&rv, &result, sizeof(float)); return rv;
     }
-    result |= sign;
-    memcpy(&rv, &result, sizeof(float));
-    return rv;
+    if (exp_mant >= 0x7C00) {
+        uint32_t result = sign | (exp_mant == 0x7C00 ? 0x7F800000U : 0x7FC00000U);
+        float rv; memcpy(&rv, &result, sizeof(float)); return rv;
+    }
+    if ((exp_mant >> 10) == 0) {
+        uint32_t m = exp_mant & 0x3FF;
+        int shift = 0;
+        while ((m & 0x200) == 0) { m <<= 1; shift++; }
+        uint32_t exp32 = 1 - 15 - shift + 127;
+        uint32_t mant32 = (m & 0x1FF) << (23 - 9);
+        uint32_t result = sign | (exp32 << 23) | mant32;
+        float rv; memcpy(&rv, &result, sizeof(float)); return rv;
+    }
+
+    uint32_t exp16 = exp_mant >> 10;
+    uint32_t mant16 = exp_mant & 0x3FF;
+    uint32_t result = sign | ((exp16 - 15 + 127) << 23) | (mant16 << 13);
+    float rv; memcpy(&rv, &result, sizeof(float)); return rv;
 }
 
 /* BF16 -> FP32 conversion */
@@ -5943,9 +5942,7 @@ float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
              * For non-block-aligned n, pass the aligned count. */
             const int nb5 = n / 256;
             const int n5 = nb5 * 256;
-#if defined(_WIN32)
-            static float q5_tmp[4096];
-#elif defined(__APPLE__)
+#if defined(_WIN32) || defined(__APPLE__) || defined(__osf__)
             static float q5_tmp[4096];
 #else
             static __thread float q5_tmp[4096];

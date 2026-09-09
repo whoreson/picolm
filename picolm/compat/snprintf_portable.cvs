@@ -1,0 +1,2 @@
+cc -DUSE_SNPRINTF -I/usr/sys/include -O2 -c snprintf.c
+
