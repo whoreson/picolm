@@ -11,7 +11,7 @@
  * in-place F16 field swapping. Only the quant block scale fields (uint16_t)
  * need swapping -- F32 is handled at dequant time by quant.c.
  *
- * Types handled: F16, BF16, Q8_0, Q4_0, Q4_1, Q2_0, Q1_0,
+ * Types handled: F16, BF16, Q8_0, Q4_0, IQ4_NL, Q4_1, Q2_0, Q1_0,
  *   Q4_0_4_4, Q4_0_8_8, Q4_K, Q5_K, Q6_K, Q3_K, Q2_K, Q5_0, Q5_1
  *
  * Compile: cc -O2 -o gguf_be_swap gguf_be_swap.c -lm
@@ -44,6 +44,7 @@ enum {
     G_BF16=15, G_Q5_0=6, G_Q5_1=7,
     G_Q4_0X4=31, G_Q4_0X8=33,
     G_Q1_0=41, G_Q2_0=42,
+    G_IQ4_NL=20,
 };
 
 #define BS_Q8_0   34
@@ -68,6 +69,9 @@ typedef struct {
     uint64_t dims[4];
     uint32_t type;
     uint64_t offset;
+    /* tensor name stored inline in the file at this offset */
+    uint64_t name_off;  /* byte offset of name in original file */
+    uint64_t name_len;
 } ti_t;
 
 static uint64_t skip_value(const uint8_t *d, uint64_t pos, uint32_t vt) {
@@ -169,7 +173,10 @@ int main(int argc, char **argv) {
     if (!tis) { fprintf(stderr, "OOM\n"); return 1; }
 
     for (uint64_t ti = 0; ti < n_tensors; ti++) {
-        uint64_t nlen = r64(data + pos); pos += 8 + nlen;
+        uint64_t nlen = r64(data + pos);
+        tis[ti].name_off = pos + 8;
+        tis[ti].name_len = nlen;
+        pos += 8 + nlen;
         tis[ti].n_dims = r32(data + pos); pos += 4;
         for (uint32_t d = 0; d < tis[ti].n_dims; d++) {
             tis[ti].dims[d] = r64(data + pos); pos += 8;
@@ -214,7 +221,7 @@ int main(int argc, char **argv) {
             case G_F32: case G_F16: case G_BF16: case G_Q8_0: case G_Q4_0: case G_Q4_1:
             case G_Q4_0X4: case G_Q4_0X8: case G_Q2_0: case G_Q1_0:
             case G_Q4_K: case G_Q5_K: case G_Q6_K: case G_Q3_K: case G_Q2_K:
-            case G_Q5_0: case G_Q5_1:
+            case G_Q5_0: case G_Q5_1: case G_IQ4_NL:
                 needs_swap = 1; break;
         }
 
@@ -247,7 +254,8 @@ int main(int argc, char **argv) {
                 nswapped += (int)nb;
                 break;
             }
-            case G_Q4_0: {
+            case G_Q4_0: case G_IQ4_NL: {
+                /* IQ4_NL has identical layout to Q4_0: uint16_t d + uint8_t qs[16] = 18 bytes */
                 size_t nb = nrows * n / 32;
                 for (size_t b = 0; b < nb; b++) {
                     uint8_t *bl = ptr + b * BS_Q4_0;
@@ -381,6 +389,21 @@ int main(int argc, char **argv) {
                     ((uint16_t *)bl)[1] = swap16(((uint16_t *)bl)[1]);
                 }
                 nswapped += (int)(nb * 2);
+                break;
+            }
+            default: {
+                char nbuf[128];
+                uint64_t nlen = tis[ti].name_len;
+                const uint8_t *namep = out + ttable_start + tis[ti].name_off - 8; /* name is after length field */
+                /* Re-read name from the original data (still in out since we copied) */
+                /* The name is at ttable_start + name_off, but name_off is offset within the tensor table entry */
+                /* Actually name_off was recorded as absolute offset into the original file */
+                namep = out + tis[ti].name_off;
+                if (nlen > sizeof(nbuf) - 1) nlen = sizeof(nbuf) - 1;
+                memcpy(nbuf, namep, nlen);
+                nbuf[nlen] = '\0';
+                fprintf(stderr, "WARNING: unsupported tensor type %u for tensor '%s' -- F16 scales NOT swapped, data will be corrupted!\n",
+                        (unsigned)qt, nbuf);
                 break;
             }
         }

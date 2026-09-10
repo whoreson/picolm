@@ -1337,14 +1337,6 @@ int parse_gguf(model_t *m, int max_seq_len) {
                 layer_weights_t *lw = &w->layers[layer];
                 if (strcmp(suffix, "attn_norm.weight") == 0) {
                     lw->attn_norm = ptr; lw->type_attn_norm = qtype;
-                    if (layer == 0) {
-                        fprintf(stderr, "[GGUF_PARSE] blk.0 attn_norm ptr=%p file_off=%llu tdata_base=%zu tinfo_off=%llu qtype=%d\n",
-                            (void*)ptr, (unsigned long long)off, (size_t)m->tensor_data_base[si],
-                            (unsigned long long)tinfos[i].offset, qtype);
-                        fprintf(stderr, "[RAW] attn_norm[:8]={%02x %02x %02x %02x %02x %02x %02x %02x}\n",
-                            ((unsigned char*)ptr)[0],((unsigned char*)ptr)[1],((unsigned char*)ptr)[2],((unsigned char*)ptr)[3],
-                            ((unsigned char*)ptr)[4],((unsigned char*)ptr)[5],((unsigned char*)ptr)[6],((unsigned char*)ptr)[7]);
-                    }
                 } else if (strcmp(suffix, "attn_q.weight") == 0) {
                     lw->attn_q = ptr; lw->type_attn_q = qtype;
                 } else if (strcmp(suffix, "attn_k.weight") == 0) {
@@ -1359,14 +1351,6 @@ int parse_gguf(model_t *m, int max_seq_len) {
                     lw->attn_k_norm = ptr; lw->type_attn_k_norm = qtype;
                 } else if (strcmp(suffix, "ffn_norm.weight") == 0) {
                     lw->post_attn_norm = ptr; lw->type_post_attn_norm = qtype;
-                    if (layer == 0) {
-                        fprintf(stderr, "[GGUF_PARSE] blk.0 ffn_norm ptr=%p file_off=%llu tdata_base=%zu tinfo_off=%llu qtype=%d\n",
-                            (void*)ptr, (unsigned long long)off, (size_t)m->tensor_data_base[si],
-                            (unsigned long long)tinfos[i].offset, qtype);
-                        fprintf(stderr, "[RAW] ffn_norm[:8]={%02x %02x %02x %02x %02x %02x %02x %02x}\n",
-                            ((unsigned char*)ptr)[0],((unsigned char*)ptr)[1],((unsigned char*)ptr)[2],((unsigned char*)ptr)[3],
-                            ((unsigned char*)ptr)[4],((unsigned char*)ptr)[5],((unsigned char*)ptr)[6],((unsigned char*)ptr)[7]);
-                    }
                 } else if (strcmp(suffix, "post_attention_norm.weight") == 0) {
                     /* Standard models (Llama, Qwen2/3/3.5/3.6): this is the
                      * FFN pre-norm (alias for ffn_norm).
@@ -1630,6 +1614,7 @@ int parse_gguf(model_t *m, int max_seq_len) {
                 blk->d = GGUF_LE16(blk->d);
             }
         } else if (qt == GGUF_TYPE_Q4_0 || qt == GGUF_TYPE_Q4_1 ||
+                   qt == GGUF_TYPE_IQ4_NL ||
                    qt == GGUF_TYPE_Q4_0_4_4 || qt == GGUF_TYPE_Q4_0_8_8) {
             size_t bs = (qt == GGUF_TYPE_Q4_0_4_4) ? sizeof(block_q4_0x4)
                        : (qt == GGUF_TYPE_Q4_0_8_8) ? sizeof(block_q4_0x8)
@@ -1678,6 +1663,9 @@ int parse_gguf(model_t *m, int max_seq_len) {
                 blk->d = GGUF_LE16(blk->d);
                 blk->dmin = GGUF_LE16(blk->dmin);
             }
+        } else {
+            fprintf(stderr, "WARNING: big-endian BE swap: unsupported tensor type %u (%s) for tensor '%.*s' -- data will be corrupted\n",
+                    (unsigned)qt, gguf_type_name(qt), (int)tinfos[i].name.len, tinfos[i].name.str);
         }
     }
         fprintf(stderr, "Big-endian: swap done (%.0fms)\n", (clock() - be_start) / (double)CLOCKS_PER_SEC * 1000);
