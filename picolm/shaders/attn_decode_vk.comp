@@ -1,61 +1,83 @@
 #version 450
+// Decode attention: single-token causal attention over F16 KV cache
+// Grid: [ceil(n_heads/256), 1, 1], block: [256, 1, 1]
+// Each thread handles one head.
 
-layout(local_size_x = 1) in;
+layout(local_size_x = 256) in;
+
 layout(set = 0, binding = 0, std430) readonly buffer B_Q { float q_data[]; };
-layout(set = 0, binding = 1, std430) readonly buffer B_KK { float kv_k_data[]; };
-layout(set = 0, binding = 2, std430) readonly buffer B_KV { float kv_v_data[]; };
+layout(set = 0, binding = 1, std430) readonly buffer B_KK { uint kv_k_data[]; };
+layout(set = 0, binding = 2, std430) readonly buffer B_KV { uint kv_v_data[]; };
 layout(set = 0, binding = 3, std430) writeonly buffer B_OUT { float xb_out[]; };
 
 layout(push_constant) uniform PC {
-    int layer_ordinal, pos;
-    int n_heads, n_kv_heads, head_dim;
-    int max_seq_len, pad;
+    int lo;       // layer_ordinal
+    int pos;      // current position (0-based)
+    int nt;       // unused
+    int nh;       // n_heads
+    int nkh;      // n_kv_heads
+    int hd;       // head_dim
+    float inv_sqrt_hd;  // 1/sqrt(head_dim)
+    int pad;      // padding
 } p;
 
+// Decode F16 to F32
+float f16_to_f32(uint h) {
+    const uint sign = (h >> 15) & 0x00008000u;
+    const uint exp_mant = (h & 0x7FFFu) << 13;
+    return unpackHalf2x16(exp_mant | sign).x;
+}
+
 void main() {
-    int h = int(gl_WorkGroupID.x);
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= uint(p.nh)) return;
 
-    if (h >= p.n_heads) return;
-
-    int kv_h = h / (p.n_heads / p.n_kv_heads);
-    float attn_scale = 1.0 / sqrt(float(p.head_dim));
-
-    int q_off = h * p.head_dim;
-    int out_off = h * p.head_dim;
-
-    int tokens_stride = p.n_kv_heads * p.head_dim;
-    int head_stride = p.head_dim;
+    int h = int(gid);
+    int nkh = p.nkh;
+    int hd = p.hd;
+    int kvh = h % nkh;
     int n_kv = p.pos + 1;
 
-    // Compute QK dot products (serial)
-    float max_s = -1e30;
-    float scores[512];  // max seq_len
+    int q_off = h * hd;
+    int out_off = h * hd;
+
+    // F16 index into KV cache: (token * nkh + kvh) * hd + d
+    // In uint buffer, divide by 2 for packed pairs
+    float max_s = -1e30f;
+    float scores[512];
 
     for (int kp = 0; kp < n_kv; kp++) {
-        int k_base = kp * tokens_stride + kv_h * head_stride;
-        float sqk = 0.0;
-        for (int d = 0; d < p.head_dim; d++) {
-            sqk += q_data[q_off + d] * kv_k_data[k_base + d];
+        float sqk = 0.0f;
+        uint k_base = (uint(kp) * uint(nkh) + uint(kvh)) * uint(hd);
+        for (int d = 0; d < hd; d++) {
+            uint idx = k_base + uint(d);
+            uint raw = kv_k_data[idx / 2];
+            float k_val = f16_to_f32(idx % 2 == 0 ? (raw & 0xFFFFu) : ((raw >> 16) & 0xFFFFu));
+            sqk += q_data[q_off + d] * k_val;
         }
-        sqk *= attn_scale;
+        sqk *= p.inv_sqrt_hd;
         scores[kp] = sqk;
         if (sqk > max_s) max_s = sqk;
     }
 
-    float sum_w = 0.0;
+    // Softmax
+    float sum_w = 0.0f;
     for (int kp = 0; kp < n_kv; kp++) {
         scores[kp] = exp(scores[kp] - max_s);
         sum_w += scores[kp];
     }
-    if (sum_w < 1e-10) sum_w = 1e-10;
-    float inv_sum = 1.0 / sum_w;
+    if (sum_w < 1e-10f) sum_w = 1e-10f;
+    float inv_sum = 1.0f / sum_w;
 
     // V accumulation
-    for (int d = 0; d < p.head_dim; d++) {
-        float acc = 0.0;
+    for (int d = 0; d < hd; d++) {
+        float acc = 0.0f;
         for (int kp = 0; kp < n_kv; kp++) {
-            int v_base = kp * tokens_stride + kv_h * head_stride;
-            acc += kv_v_data[v_base + d] * scores[kp];
+            uint v_base = (uint(kp) * uint(nkh) + uint(kvh)) * uint(hd);
+            uint idx = v_base + uint(d);
+            uint raw = kv_v_data[idx / 2];
+            float v_val = f16_to_f32(idx % 2 == 0 ? (raw & 0xFFFFu) : ((raw >> 16) & 0xFFFFu));
+            acc += v_val * scores[kp];
         }
         xb_out[out_off + d] = acc * inv_sum;
     }

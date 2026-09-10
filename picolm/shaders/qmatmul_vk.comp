@@ -1,9 +1,9 @@
 #version 450
 // Scalar dequant matmul: Y[s,o] = sum_i X[s,i] * W[o,i]
-// Grid: [ceil(O*S/256), 1, 1], block: [256, 1, 1]
-// Each thread computes one output element via gl_GlobalInvocationID.x
+// Grid: [ceil(O/16), S, 1], block: [16, 1, 1]
+// Each thread computes one output element
 
-layout(local_size_x = 256) in;
+layout(local_size_x = 16) in;
 
 layout(std430, binding = 0) readonly buffer X  { float x[]; };
 layout(std430, binding = 1) readonly buffer W  { uint  w[]; };
@@ -35,12 +35,10 @@ uint read_byte(uint rowBase, uint byteOff) {
 }
 
 void main() {
-    uint gid = gl_GlobalInvocationID.x;
-    uint total = uint(p.S) * uint(p.O);
-    if (gid >= total) return;
-
-    int o = int(gid % uint(p.O));
-    int s = int(gid / uint(p.O));
+    int o = int(gl_WorkGroupID.x) * 16 + int(gl_LocalInvocationID.x);
+    int s = int(gl_WorkGroupID.y);
+    if (o >= p.O || s >= p.S) return;
+    
     int xoff = s * p.I;
     uint rowBase = uint(o) * uint(p.rowWords);
     float sum = 0.0;
@@ -107,10 +105,8 @@ void main() {
             }
         }
     } else {
-        // Unknown format: treat as zero
         sum = 0.0;
     }
 
-    y[gid] = sum;
+    y[uint(o) + uint(s) * uint(p.O)] = sum;
 }
-
