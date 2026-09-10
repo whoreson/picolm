@@ -1,6 +1,10 @@
 #version 450
+// Prefill attention: multi-head causal attention over cached KV
+// Grid: [ceil(n_heads*n_tokens/256), 1, 1], block: [256, 1, 1]
+// Each thread handles one (head, token) pair independently.
 
-layout(local_size_x = 1) in;
+layout(local_size_x = 256) in;
+
 layout(set = 0, binding = 0, std430) readonly buffer B_Q { float q_data[]; };
 layout(set = 0, binding = 1, std430) readonly buffer B_KK { float kv_k_data[]; };
 layout(set = 0, binding = 2, std430) readonly buffer B_KV { float kv_v_data[]; };
@@ -11,80 +15,70 @@ layout(push_constant) uniform PC {
     int max_seq_len, q_dim, pad0, pad1;
 } p;
 
-shared float q_sh[64];
-shared float k_sh[256];
-shared float v_sh[256];
-
 void main() {
-    int gid = int(gl_WorkGroupID.x);
-    int h = gid % p.n_heads;
-    int qi = gid / p.n_heads;
-    if (qi >= p.n_tokens || h >= p.n_heads) return;
+    uint gid = gl_GlobalInvocationID.x;
+    uint total = uint(p.n_heads) * uint(p.n_tokens);
+    if (gid >= total) return;
+
+    int h  = int(gid % uint(p.n_heads));
+    int qi = int(gid / uint(p.n_heads));
 
     int nkh = p.n_kv_heads;
-    int hd = p.head_dim;
+    int hd  = p.head_dim;
     int kvh = h % nkh;
-    int nt = p.n_tokens;
-    int sp = p.start_pos;
+    int nt  = p.n_tokens;
+    int sp  = p.start_pos;
 
     int q_stride = p.n_heads * hd;
-    int q_off = qi * q_stride + h * hd;
     int kv_stride = nkh * hd;
-    
-    for (int d = 0; d < hd; d++) {
-        q_sh[d] = q_data[q_off + d];
-    }
-    
-    for (int ti = 0; ti < nt; ti++) {
-        int k_off = ti * kv_stride + kvh * hd;
-        int v_off = ti * kv_stride + kvh * hd;
-        for (int d = 0; d < hd; d++) {
-            k_sh[ti * hd + d] = kv_k_data[k_off + d];
-            v_sh[ti * hd + d] = kv_v_data[v_off + d];
-        }
-    }
-    
-    barrier();
-    
+
+    int q_off = qi * q_stride + h * hd;
+
+    // Compute attention scores directly (no shared memory needed)
     float max_sc = -1e20;
-    float scores[256];
+    float scores[64];  // max 64 tokens for stack allocation safety
     int valid = 0;
-    
+
     for (int ti = 0; ti < nt; ti++) {
         float s = 0.0;
+        int k_off = ti * kv_stride + kvh * hd;
         for (int d = 0; d < hd; d++) {
-            s += q_sh[d] * k_sh[ti * hd + d];
+            s += q_data[q_off + d] * kv_k_data[k_off + d];
         }
-        s *= 0.125;
+        s *= 0.125; // 1/sqrt(64) for head_dim=64
         scores[valid++] = s;
         if (s > max_sc) max_sc = s;
     }
-    
+
+    // Softmax + weighted V accumulation
+    float inv = 0.0;
     float acc[64];
     for (int d = 0; d < hd; d++) acc[d] = 0.0;
+
+    // First pass: compute exp and sum
     float sum_exp = 0.0;
-    
+    float exps[64];
     for (int ti = 0; ti < valid; ti++) {
-        float e = exp(scores[ti] - max_sc);
-        sum_exp += e;
-        for (int d = 0; d < hd; d++) {
-            acc[d] += e * v_sh[ti * hd + d];
+        exps[ti] = exp(scores[ti] - max_sc);
+        sum_exp += exps[ti];
+    }
+
+    if (sum_exp > 0.0) {
+        inv = 1.0 / sum_exp;
+        // Second pass: accumulate V weighted by softmax
+        for (int ti = 0; ti < valid; ti++) {
+            float w = exps[ti] * inv;
+            int v_off = ti * kv_stride + kvh * hd;
+            for (int d = 0; d < hd; d++) {
+                acc[d] += w * kv_v_data[v_off + d];
+            }
         }
     }
-    
-    float inv = (sum_exp > 0.0) ? 1.0 / sum_exp : 0.0;
+
+    // Write output
     int o_off = qi * q_stride + h * hd;
     for (int d = 0; d < hd; d++) {
-        xb_out[o_off + d] = acc[d] * inv;
-    }
-    
-    // Debug: head 0, token 0 -> write stats at o_off + hd + 0..7
-    if (h == 0 && qi == 0) {
-        xb_out[o_off + hd + 0] = max_sc;
-        xb_out[o_off + hd + 1] = sum_exp;
-        xb_out[o_off + hd + 2] = inv;
-        for (int ti = 0; ti < valid && ti < 5; ti++) {
-            xb_out[o_off + hd + 3 + ti] = scores[ti];
-        }
+        xb_out[o_off + d] = acc[d];
     }
 }
+

@@ -1,6 +1,9 @@
 #version 450
 // Q8_0 x Q8_0 matmul: y[S][O] = xq[S][I] * xd[S][n_blocks] @ W[O][I]
-// 256 threads per workgroup, pure shared-memory tree reduction.
+// Grid: [ceil(O*S/256), 1, 1], block: [256, 1, 1]
+// Each thread computes one output element. Partial sums accumulated per-thread,
+// no shared memory needed for correctness (but slower on KAVERI without subgroups).
+
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer XQ { uint xq[]; };
@@ -14,8 +17,6 @@ layout(push_constant) uniform P {
     int O;
     int rowWords;
 } p;
-
-shared float red[256];
 
 float f16tof32(uint h) {
     uint s = (h >> 15u) & 1u;
@@ -32,9 +33,12 @@ float f16tof32(uint h) {
 }
 
 void main() {
-    int s   = int(gl_WorkGroupID.y);
-    int tid = int(gl_LocalInvocationID.x);
-    int o   = int(gl_WorkGroupID.x);
+    uint gid = gl_GlobalInvocationID.x;
+    uint total = uint(p.S) * uint(p.O);
+    if (gid >= total) return;
+
+    int o = int(gid % uint(p.O));
+    int s = int(gid / uint(p.O));
 
     int nblocks = p.I / 32;
     uint rowBase = uint(o) * uint(p.rowWords);
@@ -43,7 +47,8 @@ void main() {
 
     float sum = 0.0;
 
-    for (int bi = tid; bi < nblocks; bi += 256) {
+    // Each thread does all blocks (no shared memory reduction needed)
+    for (int bi = 0; bi < nblocks; bi++) {
         uint bo = uint(bi) * 34u;
         uint dWord = rowBase + bo / 4u;
         uint dShift = (bo % 4u) * 8u;
@@ -72,12 +77,6 @@ void main() {
         }
     }
 
-    // Shared-memory tree reduction
-    red[tid] = sum;
-    barrier();
-    for (int stride = 128; stride > 0; stride >>= 1) {
-        if (tid < stride) red[tid] += red[tid + stride];
-        barrier();
-    }
-    if (tid == 0) y[s * p.O + o] = red[0];
+    y[gid] = sum;
 }
+

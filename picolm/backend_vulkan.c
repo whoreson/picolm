@@ -1925,7 +1925,8 @@ int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_d
         PC_Matmul pc = {t->qtype, S, t->I, t->O, (int)t->row_words};
         vkCmdPushConstants(G.cmd_dev, G.plyt, VK_SHADER_STAGE_COMPUTE_BIT,
                            0, sizeof(pc), &pc);
-        vkCmdDispatch(G.cmd_dev, (uint32_t)t->O, (uint32_t)S, 1);
+        // Phase 2: ceil(O*S/256) workgroups, each with 256 threads
+        vkCmdDispatch(G.cmd_dev, (uint32_t)(((t->O * S) + 255) / 256), 1, 1);
         ok = 1;
     }
 
@@ -2826,7 +2827,8 @@ int picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
     PC_Attn pc = {lo, sp, nt, nh, nkh, hd, msl, 0};
     vkCmdPushConstants(G.cmd_dev, G.plyt_attn_prefill, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(pc), &pc);
-    vkCmdDispatch(G.cmd_dev, total, 1, 1);
+    // Phase 5: ceil(nh*nt/256) workgroups, each with 256 threads
+    vkCmdDispatch(G.cmd_dev, (uint32_t)((total + 255) / 256), 1, 1);
     VK_BATCH_DISPATCH_POST();
     return 1;
 }
