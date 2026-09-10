@@ -2523,6 +2523,190 @@ static void sgemm_q4k_q8k_d4(int m, int n, int k_blocks,
 #endif /* AVX2+F16C || AVX1 */
 
 /* ============================================================
+ * ARM NEON Q4_K x Q8_K GEMM
+ * Mirrors the AVX2/AVX1 sgemm_q4k_q8k_d4 algorithm.
+ * 1 weight row x up to 4 activation rows per tile.
+ * Uses vmull_s8 + vpaddlq_s16 (basic NEON) for int8 MAC.
+ * I8MM (vmmlaq_s32) path is #if 0 (untested, needs hardware).
+ * Tested on: Pi 4 (Cortex-A72, NEON, no DOTPROD/I8MM).
+ * ============================================================ */
+#if defined(__ARM_NEON)
+
+static void sgemm_q4k_q8k_neon(int m, int n, int k_blocks,
+                               const block_q4_K *A, int lda,
+                               const block_q8_K *B, int ldb,
+                               float *C, int ldc,
+                               int ith, int nth) {
+    static const uint32_t kmask1 = 0x3f3f3f3f;
+    static const uint32_t kmask2 = 0x0f0f0f0f;
+    static const uint32_t kmask3 = 0x03030303;
+    const uint8x16_t m4 = vdupq_n_u8(0x0F);
+
+    /* Tile: 1 weight row x up to 4 activation rows.
+     * Total tiles = m * ceil(n/4). */
+    int64_t n_tiles_x = (n + 3) / 4;
+    int64_t total_tiles = (int64_t)m * n_tiles_x;
+    if (total_tiles <= 0) return;
+
+    int64_t duty = (total_tiles + nth - 1) / nth;
+    int64_t start = duty * ith;
+    int64_t end = start + duty;
+    if (end > total_tiles) end = total_tiles;
+
+    for (int64_t job = start; job < end; ++job) {
+        int64_t ii = job / n_tiles_x;
+        int64_t xt = job % n_tiles_x;
+        int64_t jj = xt * 4;
+        int64_t jj_end = jj + 4;
+        if (jj_end > n) jj_end = n;
+
+        const block_q4_K *aq_row = A + lda * ii;
+
+        for (int64_t jr = jj; jr < jj_end; ++jr) {
+            const block_q8_K *bq_row = B + ldb * jr;
+
+            /* 4 accumulators for 4 float lanes (NEON doesn't have 8-lane float) */
+            float32x4_t acc[2] = { vdupq_n_f32(0), vdupq_n_f32(0) };
+            float bias = 0.0f;
+
+            for (int64_t blk = 0; blk < k_blocks; ++blk) {
+                const block_q4_K *aq = aq_row + blk;
+                const block_q8_K *bq = bq_row + blk;
+
+                float d = bq->d * fp16_to_fp32_lookup(aq->d);
+                float dmin = bq->d * fp16_to_fp32_lookup(aq->dmin);
+
+                /* Decode 6-bit scales and mins from packed 12 bytes */
+                uint32_t utmp[4];
+                memcpy(utmp, aq->scales, 12);
+                utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+                const uint32_t uaux = utmp[1] & kmask1;
+                utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+                utmp[2] = uaux;
+                utmp[0] &= kmask1;
+
+                const uint8_t *scales8 = (const uint8_t *)&utmp[0];
+                const uint8_t *mins8   = (const uint8_t *)&utmp[2];
+
+                /* Bias correction: sum(bsums[j] * mins[j/2]) for j=0..15 */
+                int sumi = 0;
+                for (int j = 0; j < 16; j++)
+                    sumi += bq->bsums[j] * (int)mins8[j / 2];
+
+                const uint8_t *q4 = aq->qs;
+                const int8_t *q8 = bq->qs;
+
+                /* Process 4 groups of 32 Q4 bytes (64 nibbles = 32 low + 32 high)
+                 * Each group pairs with 64 Q8 values (2 groups of 32).
+                 * Sub-blocks j*2 and j*2+1 share the same 32 Q4 bytes.
+                 *
+                 * TODO: I8MM (vmmlaq_s32) path below is UNTESTED. No ARM hardware with
+                 * I8MM is available for Q4_K GEMM validation. The basic NEON path
+                 * (vmull_s8 + vpaddlq_s16) is tested and correct on Pi 4 (Cortex-A72).
+                 * A DGX Spark or equivalent I8MM device is needed to verify this path.
+                 * Guarded with #if 0 to prevent accidental use until verified.
+                 */
+#if 0 /* TODO: I8MM PATH UNTESTED -- needs ARM hardware with __ARM_FEATURE_MATMUL_INT8 */
+                int32_t sub_sums[8] = {0};
+                for (int j = 0; j < 4; j++) {
+                    const uint8x16_t q4a = vld1q_u8(q4);
+                    const uint8x16_t q4b = vld1q_u8(q4 + 16);
+                    q4 += 32;
+
+                    const int8x16_t q4lo_a = vreinterpretq_s8_u8(vandq_u8(q4a, m4));
+                    const int8x16_t q4lo_b = vreinterpretq_s8_u8(vandq_u8(q4b, m4));
+                    const int8x16_t q4hi_a = vreinterpretq_s8_u8(vshrq_n_u8(q4a, 4));
+                    const int8x16_t q4hi_b = vreinterpretq_s8_u8(vshrq_n_u8(q4b, 4));
+
+                    /* Sub-block j*2: low nibbles vs q8[64*j .. 64*j+31] */
+                    const int8x16_t q8a = vld1q_s8(q8); q8 += 16;
+                    const int8x16_t q8b = vld1q_s8(q8); q8 += 16;
+                    int32x4_t s0 = vmmlaq_s32(vdupq_n_s32(0), q4lo_a, q8a);
+                    int32x4_t s1 = vmmlaq_s32(vdupq_n_s32(0), q4lo_b, q8b);
+                    sub_sums[j*2] += vaddvq_s32(vaddq_s32(s0, s1)) * scales8[j*2];
+
+                    /* Sub-block j*2+1: high nibbles vs q8[64*j+32 .. 64*j+63] */
+                    const int8x16_t q8c = vld1q_s8(q8); q8 += 16;
+                    const int8x16_t q8d = vld1q_s8(q8); q8 += 16;
+                    int32x4_t s2 = vmmlaq_s32(vdupq_n_s32(0), q4hi_a, q8c);
+                    int32x4_t s3 = vmmlaq_s32(vdupq_n_s32(0), q4hi_b, q8d);
+                    sub_sums[j*2+1] += vaddvq_s32(vaddq_s32(s2, s3)) * scales8[j*2+1];
+                }
+
+                int32_t total = 0;
+                for (int j = 0; j < 8; j++) total += sub_sums[j];
+                float block_sum = d * (float)total - dmin * (float)sumi;
+                bias += block_sum;
+
+#else /* basic NEON (TESTED on Pi 4 Cortex-A72, no DOTPROD/I8MM) */
+                /* TODO: DOTPROD (vdotq_s32) path is not implemented.
+                 * Unlike Q4_0/Q8_0 GEMM which uses neon_vdot_32 for 32-value blocks,
+                 * Q4_K has 8 sub-blocks of 32 values each with independent scales.
+                 * A DOTPROD variant would need per-sub-block vdotq calls followed
+                 * by scalar scale multiplication. Not wired in yet.
+                 * Basic NEON path: vmull_s8 + vpaddlq_s16 for int8 MAC.
+                 * 4 accumulators of 4 int32 lanes each.
+                 * Process 2 sub-blocks per iteration, 8 int8 MACs each. */
+                for (int j = 0; j < 4; j++) {
+                    const uint8x16_t q4a = vld1q_u8(q4);
+                    const uint8x16_t q4b = vld1q_u8(q4 + 16);
+                    q4 += 32;
+
+                    const int8x16_t q4lo_a = vreinterpretq_s8_u8(vandq_u8(q4a, m4));
+                    const int8x16_t q4lo_b = vreinterpretq_s8_u8(vandq_u8(q4b, m4));
+                    const int8x16_t q4hi_a = vreinterpretq_s8_u8(vshrq_n_u8(q4a, 4));
+                    const int8x16_t q4hi_b = vreinterpretq_s8_u8(vshrq_n_u8(q4b, 4));
+
+                    /* Sub-block j*2: low nibbles (32 values) vs 32 Q8 values */
+                    {
+                        const int8x16_t q8a = vld1q_s8(q8); q8 += 16;
+                        const int8x16_t q8b = vld1q_s8(q8); q8 += 16;
+                        int16x8_t p0 = vmull_s8(vget_low_s8(q4lo_a), vget_low_s8(q8a));
+                        int16x8_t p1 = vmull_s8(vget_high_s8(q4lo_a), vget_high_s8(q8a));
+                        int16x8_t p2 = vmull_s8(vget_low_s8(q4lo_b), vget_low_s8(q8b));
+                        int16x8_t p3 = vmull_s8(vget_high_s8(q4lo_b), vget_high_s8(q8b));
+                        int32x4_t s = vaddq_s32(vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)),
+                                                vaddq_s32(vpaddlq_s16(p2), vpaddlq_s16(p3)));
+                        int32_t sc = scales8[j*2];
+                        acc[0] = vmlaq_f32(acc[0], vcvtq_f32_s32(s), vdupq_n_f32(d * sc));
+                    }
+
+                    /* Sub-block j*2+1: high nibbles (32 values) vs 32 Q8 values */
+                    {
+                        const int8x16_t q8c = vld1q_s8(q8); q8 += 16;
+                        const int8x16_t q8d = vld1q_s8(q8); q8 += 16;
+                        int16x8_t p0 = vmull_s8(vget_low_s8(q4hi_a), vget_low_s8(q8c));
+                        int16x8_t p1 = vmull_s8(vget_high_s8(q4hi_a), vget_high_s8(q8c));
+                        int16x8_t p2 = vmull_s8(vget_low_s8(q4hi_b), vget_low_s8(q8d));
+                        int16x8_t p3 = vmull_s8(vget_high_s8(q4hi_b), vget_high_s8(q8d));
+                        int32x4_t s = vaddq_s32(vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)),
+                                                vaddq_s32(vpaddlq_s16(p2), vpaddlq_s16(p3)));
+                        int32_t sc = scales8[j*2+1];
+                        acc[1] = vmlaq_f32(acc[1], vcvtq_f32_s32(s), vdupq_n_f32(d * sc));
+                    }
+                }
+                bias += -dmin * (float)sumi;
+#endif /* I8MM (untested) vs basic NEON (tested) */
+            }
+
+/* TODO: I8MM output path unreachable (guarded by #if 0 above).
+   Only basic NEON path is active. Remove this #if/#else once I8MM is verified. */
+#if 0
+            /* I8MM path: bias is the complete result */
+            C[ldc * jr + ii] = bias;
+#else
+            /* Basic NEON path: hsum both accumulators + bias */
+            float s0 = vaddvq_f32(acc[0]);
+            float s1 = vaddvq_f32(acc[1]);
+            C[ldc * jr + ii] = s0 + s1 + bias;
+#endif
+        }
+    }
+}
+
+#endif /* ARM_NEON Q4_K */
+
+/* ============================================================
  * Dispatch function
  * ============================================================ */
 
@@ -2729,6 +2913,15 @@ int picolm_sgemm_d_q4k(int m, int n, int k_blocks_q4k,
         return 0;
     sgemm_q4k_q8k_d4(m, n, k_blocks_q4k, (const block_q4_K*)A, lda_q4k,
                      (const block_q8_K*)B, ldb_q8k, C, ldc, ith, nth);
+    return 1;
+#elif defined(__ARM_NEON)
+    /* TODO: I8MM path inside sgemm_q4k_q8k_neon is #if 0 (untested).
+     * Only the basic NEON (vmull_s8) path is active and tested.
+     * Enable I8MM (#if 1) once validated on ARM hardware with __ARM_FEATURE_MATMUL_INT8. */
+    if (m < 1 || n < 1 || k_blocks_q4k < 1)
+        return 0;
+    sgemm_q4k_q8k_neon(m, n, k_blocks_q4k, (const block_q4_K*)A, lda_q4k,
+                       (const block_q8_K*)B, ldb_q8k, C, ldc, ith, nth);
     return 1;
 #else
     return 0;
