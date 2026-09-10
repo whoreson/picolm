@@ -6,6 +6,17 @@
 #include <assert.h>
 
 /* ================================================================
+ * IQ4_NL dequantization lookup table
+ * 16 non-linear int8 values, one per 4-bit index.
+ * Derived from llama.cpp ggml-common.h GGML_TABLE_BEGIN(int8_t, kvalues_iq4nl, 16)
+ * Provides better accuracy than linear Q4_0 mapping at same 2.25 BPW.
+ * ================================================================ */
+const int8_t kvalues_iq4nl[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10,
+      1,   13,   25,  38,  53,  69,  89, 113,
+};
+
+/* ================================================================
  * FP16 <-> FP32 lookup table (mirrors llama.cpp's ggml_table_f32_f16)
  *
  * 64KB table initialized once at startup. Each entry maps a uint16_t
@@ -407,6 +418,23 @@ void dequantize_row_q4_0(const void *src, float *dst, int n) {
     }
 }
 
+/* Dequantize IQ4_NL: val = kvalues_iq4nl[nibble] * d (non-linear LUT) */
+void dequantize_row_iq4_nl(const void *src, float *dst, int n) {
+    const block_iq4_nl *blocks = (const block_iq4_nl *)src;
+    int nb = n / 32;
+
+    for (int i = 0; i < nb; i++) {
+        float d = fp16_to_fp32_lookup(blocks[i].d);
+        const uint8_t *qs = blocks[i].qs;
+        float *dp = dst + i * 32;
+        /* IQ4_NL: same nibble layout as Q4_0, but LUT-based dequant */
+        for (int j = 0; j < 16; j++) {
+            dp[j]      = d * (float)kvalues_iq4nl[qs[j] & 0xF];
+            dp[j + 16] = d * (float)kvalues_iq4nl[qs[j] >> 4];
+        }
+    }
+}
+
 /* Dequantize Q4_1: val = qs[j] * d + m (unsigned nibble) */
 void dequantize_row_q4_1(const void *src, float *dst, int n) {
     const block_q4_1 *blocks = (const block_q4_1 *)src;
@@ -640,6 +668,7 @@ void dequantize_row(const void *src, float *dst, int n, gguf_type_t type) {
         case GGUF_TYPE_Q4_0_8_8: dequantize_row_q4_0_8_8(src, dst, n); break;
         case GGUF_TYPE_Q1_0:     dequantize_row_q1_0(src, dst, n); break;
         case GGUF_TYPE_Q2_0:     dequantize_row_q2_0(src, dst, n); break;
+        case GGUF_TYPE_IQ4_NL:   dequantize_row_iq4_nl(src, dst, n); break;
         default:
             fprintf(stderr, "dequantize_row: unsupported type %d\n", type);
             exit(1);
@@ -654,6 +683,7 @@ int gguf_type_block_size(gguf_type_t type) {
         case GGUF_TYPE_F16:   return 1;
         case GGUF_TYPE_Q4_0:  return 32;
         case GGUF_TYPE_Q4_1:  return 32;
+        case GGUF_TYPE_IQ4_NL: return 32;
         case GGUF_TYPE_Q5_0:  return 32;
         case GGUF_TYPE_Q5_1:  return 32;
         case GGUF_TYPE_Q8_0:  return 32;
@@ -680,6 +710,7 @@ int gguf_type_quant_size(gguf_type_t type) {
         case GGUF_TYPE_F16:   return 2;
         case GGUF_TYPE_Q4_0:  return 18;
         case GGUF_TYPE_Q4_1:  return 20;
+        case GGUF_TYPE_IQ4_NL: return 18;  /* same layout as Q4_0 */
         case GGUF_TYPE_Q5_0:  return 22;
         case GGUF_TYPE_Q5_1:  return 24;
         case GGUF_TYPE_Q8_0:  return 34;
@@ -3396,6 +3427,261 @@ float vec_dot_q4_0_q8_0(const void *vx, const void *wy, int n) {
     return sumf;
 }
 
+/* ================================================================
+ * vec_dot_iq4_nl_q8_0: IQ4_NL weights x Q8_0 input (int8 MAC)
+ * Identical structure to vec_dot_q4_0_q8_0, but uses LUT-based
+ * dequant instead of linear (nibble-8).
+ *
+ * IQ4_NL: 16 bytes qs + 2 bytes d(FP16) per 32 values.
+ * Q8_0: 32 bytes qs + 2 bytes d(FP16) per 32 values.
+ * Both use block size 32.
+ * ================================================================ */
+float vec_dot_iq4_nl_q8_0(const void *vx, const void *wy, int n) {
+    const block_iq4_nl *x = (const block_iq4_nl *)vx;
+    const block_q8_0 *y = (const block_q8_0 *)wy;
+    int nb = n / 32;
+    int ib = 0;
+    float sumf = 0;
+
+#if defined(PICOLM_AVX512)
+    /* AVX-512: 2 blocks per iteration (64 values), VPSHUFB LUT lookup + VNNI dot.
+     * Each block: 16 bytes qs -> low/high nibble VPSHUFB -> 32 int8 values.
+     * Two blocks' int8 data combined into __m512i for mul_sum_i8_pairs_avx512. */
+    {
+        __m512 acc = _mm512_setzero_ps();
+        const __m128i iq4lut = _mm_loadu_si128((const __m128i *)kvalues_iq4nl);
+        const __m128i mask4 = _mm_set1_epi8(15);
+
+        for (; ib + 1 < nb; ib += 2) {
+            /* Block ib: IQ4_NL LUT dequant -> 32 int8 */
+            const __m128i qs0 = _mm_loadu_si128((const __m128i *)x[ib].qs);
+            const __m128i q4lo0 = _mm_and_si128(mask4, qs0);
+            const __m128i q4hi0 = _mm_and_si128(mask4, _mm_srli_epi16(qs0, 4));
+            const __m128i qx0_lo = _mm_shuffle_epi8(iq4lut, q4lo0);
+            const __m128i qx0_hi = _mm_shuffle_epi8(iq4lut, q4hi0);
+            const __m256i qx0 = _mm256_insertf128_si256(_mm256_castsi128_si256(qx0_lo), qx0_hi, 1);
+
+            /* Block ib+1: IQ4_NL LUT dequant -> 32 int8 */
+            const __m128i qs1 = _mm_loadu_si128((const __m128i *)x[ib + 1].qs);
+            const __m128i q4lo1 = _mm_and_si128(mask4, qs1);
+            const __m128i q4hi1 = _mm_and_si128(mask4, _mm_srli_epi16(qs1, 4));
+            const __m128i qx1_lo = _mm_shuffle_epi8(iq4lut, q4lo1);
+            const __m128i qx1_hi = _mm_shuffle_epi8(iq4lut, q4hi1);
+            const __m256i qx1 = _mm256_insertf128_si256(_mm256_castsi128_si256(qx1_lo), qx1_hi, 1);
+
+            /* Combine into 512-bit: 64 dequantized int8 values */
+            const __m512i qx = _mm512_inserti64x4(_mm512_castsi256_si512(qx0), qx1, 1);
+
+            /* Q8_0 activations: 64 int8 values (2 blocks) */
+            const __m256i qy0 = _mm256_loadu_si256((const __m256i *)y[ib].qs);
+            const __m256i qy1 = _mm256_loadu_si256((const __m256i *)y[ib + 1].qs);
+            const __m512i qy = _mm512_inserti64x4(_mm512_castsi256_si512(qy0), qy1, 1);
+
+            const __m512i dot = mul_sum_i8_pairs_avx512(qx, qy);
+            const __m512 f = _mm512_cvtepi32_ps(dot);
+
+            float d0 = fp16_to_fp32_lookup(x[ib].d) * fp16_to_fp32_lookup(y[ib].d);
+            float d1 = fp16_to_fp32_lookup(x[ib + 1].d) * fp16_to_fp32_lookup(y[ib + 1].d);
+            const __m512 dvec = _mm512_insertf32x8(_mm512_castps256_ps512(_mm256_set1_ps(d0)),
+                                                     _mm256_set1_ps(d1), 1);
+            acc = _mm512_fmadd_ps(f, dvec, acc);
+        }
+        sumf = _mm512_reduce_add_ps(acc);
+    }
+
+#elif defined(PICOLM_AVX2)
+    {
+        __m256 acc = _mm256_setzero_ps();
+        /* LUT table loaded once: 2x __m128i for low/high nibble lookup.
+         * _mm_shuffle_epi8 uses the low 4 bits as index, ignores high bits. */
+        const __m128i iq4lut = _mm_loadu_si128((const __m128i *)kvalues_iq4nl);
+
+        for (; ib < nb; ++ib) {
+            const __m256 d = _mm256_set1_ps(
+                fp16_to_fp32_lookup(x[ib].d) * fp16_to_fp32_lookup(y[ib].d));
+            /* Load 16 qs bytes, split into low/high nibbles, lookup each via LUT */
+            const __m128i qs = _mm_loadu_si128((const __m128i *)x[ib].qs);
+            const __m128i q4lo = _mm_and_si128(_mm_set1_epi8(15), qs);
+            const __m128i q4hi = _mm_and_si128(_mm_set1_epi8(15), _mm_srli_epi16(qs, 4));
+            const __m128i qx_lo = _mm_shuffle_epi8(iq4lut, q4lo);
+            const __m128i qx_hi = _mm_shuffle_epi8(iq4lut, q4hi);
+            const __m256i qx = _mm256_insertf128_si256(_mm256_castsi128_si256(qx_lo), qx_hi, 1);
+            const __m256i qy = _mm256_loadu_si256((const __m256i *)y[ib].qs);
+            acc = _mm256_fmadd_ps(d, mul_sum_i8_pairs_float(qx, qy), acc);
+        }
+        sumf = hsum_avx(acc);
+    }
+
+#elif defined(PICOLM_AVX)
+    {
+        __m256 accum = _mm256_setzero_ps();
+        const __m128i mask4 = _mm_set1_epi8(15);
+        const __m128i iq4lut = _mm_loadu_si128((const __m128i *)kvalues_iq4nl);
+
+        for (; ib + 1 < nb; ib += 2) {
+            /* Block ib */
+            {
+                const __m128i qs = _mm_loadu_si128((const __m128i *)x[ib].qs);
+                const __m128i q4lo = _mm_and_si128(mask4, qs);
+                const __m128i q4hi = _mm_and_si128(mask4, _mm_srli_epi16(qs, 4));
+                const __m128i qx_lo = _mm_shuffle_epi8(iq4lut, q4lo);
+                const __m128i qx_hi = _mm_shuffle_epi8(iq4lut, q4hi);
+                const __m128i q8b_0 = _mm_loadu_si128((const __m128i *)y[ib].qs);
+                const __m128i q8b_1 = _mm_loadu_si128((const __m128i *)y[ib].qs + 1);
+                const __m128i p16_0 = mul_add_epi8_sse(qx_lo, q8b_0);
+                const __m128i p16_1 = mul_add_epi8_sse(qx_hi, q8b_1);
+            }
+            /* Block ib+1 */
+            {
+                const __m128i qs = _mm_loadu_si128((const __m128i *)x[ib + 1].qs);
+                const __m128i q4lo = _mm_and_si128(mask4, qs);
+                const __m128i q4hi = _mm_and_si128(mask4, _mm_srli_epi16(qs, 4));
+                const __m128i qx_lo = _mm_shuffle_epi8(iq4lut, q4lo);
+                const __m128i qx_hi = _mm_shuffle_epi8(iq4lut, q4hi);
+                const __m128i q8b_0 = _mm_loadu_si128((const __m128i *)y[ib + 1].qs);
+                const __m128i q8b_1 = _mm_loadu_si128((const __m128i *)y[ib + 1].qs + 1);
+                const __m128i p16_0 = mul_add_epi8_sse(qx_lo, q8b_0);
+                const __m128i p16_1 = mul_add_epi8_sse(qx_hi, q8b_1);
+                const __m128i p = _mm_add_epi16(p16_0, p16_1);
+            }
+            /* AVX: process 2 blocks at once with 4 accumulators */
+            {
+                const __m128i qs1 = _mm_loadu_si128((const __m128i *)x[ib].qs);
+                const __m128i q4lo1 = _mm_and_si128(mask4, qs1);
+                const __m128i q4hi1 = _mm_and_si128(mask4, _mm_srli_epi16(qs1, 4));
+                const __m128i qx1_lo = _mm_shuffle_epi8(iq4lut, q4lo1);
+                const __m128i qx1_hi = _mm_shuffle_epi8(iq4lut, q4hi1);
+                const __m128i q81_0 = _mm_loadu_si128((const __m128i *)y[ib].qs);
+                const __m128i q81_1 = _mm_loadu_si128((const __m128i *)y[ib].qs + 1);
+                const __m128i p16_1_0 = mul_add_epi8_sse(qx1_lo, q81_0);
+                const __m128i p16_1_1 = mul_add_epi8_sse(qx1_hi, q81_1);
+                const __m128i qs2 = _mm_loadu_si128((const __m128i *)x[ib + 1].qs);
+                const __m128i q4lo2 = _mm_and_si128(mask4, qs2);
+                const __m128i q4hi2 = _mm_and_si128(mask4, _mm_srli_epi16(qs2, 4));
+                const __m128i qx2_lo = _mm_shuffle_epi8(iq4lut, q4lo2);
+                const __m128i qx2_hi = _mm_shuffle_epi8(iq4lut, q4hi2);
+                const __m128i q82_0 = _mm_loadu_si128((const __m128i *)y[ib + 1].qs);
+                const __m128i q82_1 = _mm_loadu_si128((const __m128i *)y[ib + 1].qs + 1);
+                const __m128i p16_2_0 = mul_add_epi8_sse(qx2_lo, q82_0);
+                const __m128i p16_2_1 = mul_add_epi8_sse(qx2_hi, q82_1);
+                const __m128i p_1 = _mm_add_epi16(p16_1_0, p16_1_1);
+                const __m128i p_2 = _mm_add_epi16(p16_2_0, p16_2_1);
+                __m256 p = sum_i16_pairs_float(p_2, p_1);
+                float d0 = fp16_to_fp32_lookup(x[ib].d) * fp16_to_fp32_lookup(y[ib].d);
+                float d1 = fp16_to_fp32_lookup(x[ib + 1].d) * fp16_to_fp32_lookup(y[ib + 1].d);
+                __m256 deltas = _mm256_set_m128(_mm_set1_ps(d1), _mm_set1_ps(d0));
+                accum = _mm256_add_ps(_mm256_mul_ps(deltas, p), accum);
+            }
+        }
+        sumf = hsum_avx(accum);
+    }
+
+#elif defined(PICOLM_NEON)
+    /* Plain NEON: vmull_s8 + vpaddlq_s16 with LUT-based dequant.
+     * Uses vqtbl1q_u8 for the 16-entry LUT lookup on each nibble.
+     * BUG FIX: vqtbl1q_u8 uses the full byte as index, so we must mask
+     * low nibble with vandq_u8(mask4, qx). High nibble via vshrq_n_u8
+     * is already in range 0-15 (shifted by 4 bits). */
+    {
+        const uint8x16_t iq4lut = vld1q_u8((const uint8_t *)kvalues_iq4nl);
+
+        for (; ib + 1 < nb; ib += 2) {
+            float d0 = fp16_to_fp32_lookup(x[ib + 0].d) * fp16_to_fp32_lookup(y[ib + 0].d);
+            float d1 = fp16_to_fp32_lookup(x[ib + 1].d) * fp16_to_fp32_lookup(y[ib + 1].d);
+
+            /* Block ib: LUT lookup for low and high nibbles */
+            {
+                const uint8x16_t qx = vld1q_u8(x[ib].qs);
+                const uint8x16_t qx_lo = vandq_u8(vdupq_n_u8(0x0F), qx);
+                const uint8x16_t qx_hi = vshrq_n_u8(qx, 4);
+                const int8x16_t qy0 = vld1q_s8(y[ib].qs);
+                const int8x16_t qy1 = vld1q_s8(y[ib].qs + 16);
+                int8x16_t qxl = vreinterpretq_s8_u8(vqtbl1q_u8(iq4lut, qx_lo));
+                int8x16_t qxh = vreinterpretq_s8_u8(vqtbl1q_u8(iq4lut, qx_hi));
+                int16x8_t p0 = vmull_s8(vget_low_s8(qxl), vget_low_s8(qy0));
+                int16x8_t p1 = vmull_s8(vget_high_s8(qxl), vget_high_s8(qy0));
+                int16x8_t p2 = vmull_s8(vget_low_s8(qxh), vget_low_s8(qy1));
+                int16x8_t p3 = vmull_s8(vget_high_s8(qxh), vget_high_s8(qy1));
+                int32x4_t s = vaddq_s32(vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)),
+                                        vaddq_s32(vpaddlq_s16(p2), vpaddlq_s16(p3)));
+                sumf += d0 * (float)vaddvq_s32(s);
+            }
+            /* Block ib+1 */
+            {
+                const uint8x16_t qx = vld1q_u8(x[ib + 1].qs);
+                const uint8x16_t qx_lo = vandq_u8(vdupq_n_u8(0x0F), qx);
+                const uint8x16_t qx_hi = vshrq_n_u8(qx, 4);
+                const int8x16_t qy0 = vld1q_s8(y[ib + 1].qs);
+                const int8x16_t qy1 = vld1q_s8(y[ib + 1].qs + 16);
+                int8x16_t qxl = vreinterpretq_s8_u8(vqtbl1q_u8(iq4lut, qx_lo));
+                int8x16_t qxh = vreinterpretq_s8_u8(vqtbl1q_u8(iq4lut, qx_hi));
+                int16x8_t p0 = vmull_s8(vget_low_s8(qxl), vget_low_s8(qy0));
+                int16x8_t p1 = vmull_s8(vget_high_s8(qxl), vget_high_s8(qy0));
+                int16x8_t p2 = vmull_s8(vget_low_s8(qxh), vget_low_s8(qy1));
+                int16x8_t p3 = vmull_s8(vget_high_s8(qxh), vget_high_s8(qy1));
+                int32x4_t s = vaddq_s32(vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)),
+                                        vaddq_s32(vpaddlq_s16(p2), vpaddlq_s16(p3)));
+                sumf += d1 * (float)vaddvq_s32(s);
+            }
+        }
+        /* Tail: single block */
+        for (; ib < nb; ib++) {
+            float d0 = fp16_to_fp32_lookup(x[ib].d) * fp16_to_fp32_lookup(y[ib].d);
+            const uint8x16_t qx = vld1q_u8(x[ib].qs);
+            const uint8x16_t qx_lo = vandq_u8(vdupq_n_u8(0x0F), qx);
+            const uint8x16_t qx_hi = vshrq_n_u8(qx, 4);
+            const int8x16_t qy0 = vld1q_s8(y[ib].qs);
+            const int8x16_t qy1 = vld1q_s8(y[ib].qs + 16);
+            int8x16_t qxl = vreinterpretq_s8_u8(vqtbl1q_u8(iq4lut, qx_lo));
+            int8x16_t qxh = vreinterpretq_s8_u8(vqtbl1q_u8(iq4lut, qx_hi));
+            int16x8_t p0 = vmull_s8(vget_low_s8(qxl), vget_low_s8(qy0));
+            int16x8_t p1 = vmull_s8(vget_high_s8(qxl), vget_high_s8(qy0));
+            int16x8_t p2 = vmull_s8(vget_low_s8(qxh), vget_low_s8(qy1));
+            int16x8_t p3 = vmull_s8(vget_high_s8(qxh), vget_high_s8(qy1));
+            int32x4_t s = vaddq_s32(vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)),
+                                    vaddq_s32(vpaddlq_s16(p2), vpaddlq_s16(p3)));
+            sumf += d0 * (float)vaddvq_s32(s);
+        }
+    }
+
+#else
+    /* Scalar fallback */
+#endif
+
+    for (; ib < nb; ++ib) {
+        int sumi0 = 0;
+        int sumi1 = 0;
+        for (int j = 0; j < 16; ++j) {
+            const int v0 = kvalues_iq4nl[x[ib].qs[j] & 0x0F];
+            const int v1 = kvalues_iq4nl[x[ib].qs[j] >> 4];
+            sumi0 += v0 * y[ib].qs[j];
+            sumi1 += v1 * y[ib].qs[j + 16];
+        }
+        sumf += (float)(sumi0 + sumi1) * fp16_to_fp32_lookup(x[ib].d) * fp16_to_fp32_lookup(y[ib].d);
+    }
+
+    return sumf;
+}
+
+/* iq4_nl_row_to_q8_0_shadow: Convert IQ4_NL row to Q8_0 for batched reuse.
+ * IQ4_NL dequant = kvalues_iq4nl[nibble] (not linear like Q4_0).
+ * The output Q8_0 stores int8 values directly with a d=1 scale, since
+ * the LUT values are already the final int8 values. The IQ4_NL's own
+ * d scale is carried in a separate float array (like Q8_0 delta arrays). */
+void iq4_nl_row_to_q8_0_shadow(const void *iq4_row, void *q8_row_out, int n) {
+    const block_iq4_nl *iq4 = (const block_iq4_nl *)iq4_row;
+    block_q8_0 *q8 = (block_q8_0 *)q8_row_out;
+    int nb = n / 32;
+    for (int b = 0; b < nb; b++) {
+        q8[b].d = iq4[b].d;
+        for (int j = 0; j < 16; j++) {
+            uint8_t byte = iq4[b].qs[j];
+            q8[b].qs[j]      = (int8_t)kvalues_iq4nl[byte & 0x0F];
+            q8[b].qs[j + 16] = (int8_t)kvalues_iq4nl[byte >> 4];
+        }
+    }
+}
+
 void q4_0_row_to_q8_0_shadow(const void *q4_row, void *q8_row_out, int n) {
     const block_q4_0 *q4 = (const block_q4_0 *)q4_row;
     block_q8_0 *q8 = (block_q8_0 *)q8_row_out;
@@ -4675,6 +4961,28 @@ float vec_dot_q4_0_f32(const void *src, const float *x, int n) {
         for (int j = 0; j < 16; j++) {
             block_sum += (float)((qs[j] & 0xF) - 8) * xp[j];
             block_sum += (float)((qs[j] >> 4) - 8) * xp[j + 16];
+        }
+        sumf += d * block_sum;
+    }
+    return sumf;
+}
+
+/* vec_dot_iq4_nl_f32: fused dequant + dot for IQ4_NL x float32
+ * IQ4_NL: same nibble layout as Q4_0, but LUT-based dequant.
+ * val = kvalues_iq4nl[nibble] * d */
+float vec_dot_iq4_nl_f32(const void *src, const float *x, int n) {
+    const block_iq4_nl *blocks = (const block_iq4_nl *)src;
+    int nb = n / 32;
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        float d = fp16_to_fp32_lookup(blocks[i].d);
+        const uint8_t *qs = blocks[i].qs;
+        const float *xp = x + i * 32;
+        float block_sum = 0.0f;
+        for (int j = 0; j < 16; j++) {
+            block_sum += (float)kvalues_iq4nl[qs[j] & 0xF] * xp[j];
+            block_sum += (float)kvalues_iq4nl[qs[j] >> 4] * xp[j + 16];
         }
         sumf += d * block_sum;
     }
@@ -5965,6 +6273,7 @@ float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
         case GGUF_TYPE_F32:  return vec_dot_f32_f32(src, x, n);
         case GGUF_TYPE_Q8_0: return vec_dot_q8_0_f32(src, x, n);
         case GGUF_TYPE_Q4_0: return vec_dot_q4_0_f32(src, x, n);
+        case GGUF_TYPE_IQ4_NL: return vec_dot_iq4_nl_f32(src, x, n);
         case GGUF_TYPE_Q4_1: return vec_dot_q4_1_f32(src, x, n);
         case GGUF_TYPE_Q5_0: return vec_dot_q5_0_f32(src, x, n);
         case GGUF_TYPE_Q5_1: return vec_dot_q5_1_f32(src, x, n);
@@ -6284,6 +6593,115 @@ void quantize_row_q4_0(const float *x, void *dst, int n) {
             if (v1 > 15) v1 = 15;
             q[j] = (uint8_t)(v0 | (v1 << 4));
         }
+    }
+}
+
+/* ---- quantize_row_iq4_nl: Float32 -> IQ4_NL (Lloyd-Max non-linear 4-bit) ----
+ * Lloyd-Max quantization using the 16-entry kvalues_iq4nl LUT.
+ * Ported from llama.cpp quantize_row_iq4_nl_ref.
+ *
+ * For each 32-value block: find optimal scale d and 16-bit LUT index per value
+ * by minimizing weighted squared error. Uses weighted least-squares with
+ * w[j] = x[j]^2 as the weight. The scale is found via a few iterations of
+ * re-optimization around the initial guess.
+ * ================================================================ */
+void quantize_row_iq4_nl(const float *x, void *dst, int n) {
+    block_iq4_nl *blocks = (block_iq4_nl *)dst;
+    int nb = n / 32;
+    const int8_t *lut = kvalues_iq4nl;
+
+    for (int i = 0; i < nb; i++) {
+        const float *xb = x + i * 32;
+        uint8_t *q = blocks[i].qs;
+        float d;
+
+        /* Find initial scale: max(|x|) / max(|lut|) */
+        float amax = 0;
+        for (int j = 0; j < 32; j++) {
+            float v = xb[j] < 0 ? -xb[j] : xb[j];
+            if (v > amax) amax = v;
+        }
+        d = amax / (float)127;  /* max |kvalues_iq4nl| = 127 */
+        if (d < 1e-10f) {
+            d = 0;
+            memset(q, 0, 16);
+            blocks[i].d = fp32_to_fp16(0);
+            continue;
+        }
+
+        /* Assign LUT indices with initial scale */
+        float id = 1.0f / d;
+        uint8_t L[32];
+        for (int j = 0; j < 32; j++) {
+            float al = xb[j] * id;
+            /* Binary search for nearest LUT entry */
+            int lo = 0, hi = 15;
+            while (lo < hi) {
+                int mid = (lo + hi) / 2;
+                if (al < (float)lut[mid]) hi = mid; else lo = mid + 1;
+            }
+            if (lo > 0 && al - (float)lut[lo-1] < (float)lut[lo] - al) lo--;
+            if (lo < 0) lo = 0;
+            if (lo > 15) lo = 15;
+            L[j] = (uint8_t)lo;
+        }
+
+        /* Optimize scale via weighted least squares (1 iteration) */
+        float sumqx = 0, sumq2 = 0;
+        for (int j = 0; j < 32; j++) {
+            float w = xb[j] * xb[j];
+            float qv = (float)lut[L[j]];
+            sumqx += w * qv * xb[j];
+            sumq2 += w * qv * qv;
+        }
+        if (sumq2 > 0) d = sumqx / sumq2;
+
+        /* Try a few perturbations of the scale for robustness */
+        float best_err = 1e30f;
+        float best_d = d;
+        for (int itry = -2; itry <= 2; itry++) {
+            float dtry = d * (1.0f + itry * 0.01f);
+            if (dtry <= 0) continue;
+            float idtry = 1.0f / dtry;
+            float err = 0;
+            for (int j = 0; j < 32; j++) {
+                float al = xb[j] * idtry;
+                int lo = 0, hi = 15;
+                while (lo < hi) {
+                    int mid = (lo + hi) / 2;
+                    if (al < (float)lut[mid]) hi = mid; else lo = mid + 1;
+                }
+                if (lo > 0 && al - (float)lut[lo-1] < (float)lut[lo] - al) lo--;
+                if (lo < 0) lo = 0; if (lo > 15) lo = 15;
+                float w = xb[j] * xb[j];
+                float qv = (float)lut[lo] * dtry;
+                err += w * (xb[j] - qv) * (xb[j] - qv);
+            }
+            if (err < best_err) { best_err = err; best_d = dtry; }
+        }
+
+        d = best_d;
+        id = 1.0f / d;
+
+        /* Final assignment */
+        for (int j = 0; j < 32; j++) {
+            float al = xb[j] * id;
+            int lo = 0, hi = 15;
+            while (lo < hi) {
+                int mid = (lo + hi) / 2;
+                if (al < (float)lut[mid]) hi = mid; else lo = mid + 1;
+            }
+            if (lo > 0 && al - (float)lut[lo-1] < (float)lut[lo] - al) lo--;
+            if (lo < 0) lo = 0;
+            if (lo > 15) lo = 15;
+            L[j] = (uint8_t)lo;
+        }
+
+        /* Pack nibbles */
+        for (int j = 0; j < 16; j++) {
+            q[j] = (uint8_t)(L[j] | (L[j + 16] << 4));
+        }
+        blocks[i].d = fp32_to_fp16(d);
     }
 }
 

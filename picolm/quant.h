@@ -337,6 +337,7 @@ typedef enum {
     GGUF_TYPE_Q4_0_4_8   = 32,  /* 4-row interleaved Q4_0, blocklen=8 (pre-repacked, I8MM target) */
     GGUF_TYPE_Q4_0_8_8   = 33,  /* 8-row interleaved Q4_0 (pre-repacked, AVX2) */
     GGUF_TYPE_BF16      = 30,  /* Brain Float 16 (GGUF type 30) */
+    GGUF_TYPE_IQ4_NL    = 20,  /* Non-linear 4-bit quant (LUT-based, same layout as Q4_0) */
     GGUF_TYPE_Q1_0       = 41,  /* 1-bit sign + scale, 128 values/block */
     GGUF_TYPE_Q2_0       = 42,  /* 2-bit values + scale, 128 values/block */
 } gguf_type_t;
@@ -551,6 +552,28 @@ typedef struct PICOLM_PACKED_ATTR {
     uint8_t  qs[16];     /* 4-bit quantized values */
 } block_q4_0;            /* 18 bytes */
 
+/* IQ4_NL block: 32 weights (non-linear 4-bit quant, GGUF type 20)
+ * Identical layout to Q4_0 (18 bytes), but dequant uses a 16-entry LUT
+ * instead of linear (nibble-8) mapping.
+ * LUT values: -127, -104, -83, -65, -49, -35, -22, -10,
+ *              1,   13,   25,  38,  53,  69,  89, 113
+ * Dequant: val = kvalues_iq4nl[nibble] * d
+ * Provides better accuracy than Q4_0 at same 2.25 BPW for typical
+ * LLM weight distributions (mass near zero, heavy tails). */
+typedef struct PICOLM_PACKED_ATTR {
+    uint16_t d;          /* scale (FP16) */
+    uint8_t  qs[16];     /* 4-bit quantized values (indices into LUT) */
+} block_iq4_nl;           /* 18 bytes, identical to block_q4_0 */
+/* Compile-time check: block_iq4_nl must match block_q4_0 layout (18 bytes) */
+#if !defined(_MSC_VER)
+typedef char __compiletime_assert_iq4_nl_size[(sizeof(block_iq4_nl) == sizeof(block_q4_0)) ? 1 : -1] __attribute__((unused));
+#endif
+/* MSVC: checked at link time by sizeof consistency, no compile-time assert needed */
+
+/* IQ4_NL dequantization lookup table (16 entries, int8) */
+/* Derived from llama.cpp ggml-common.h GGML_TABLE_BEGIN(int8_t, kvalues_iq4nl, 16) */
+extern const int8_t kvalues_iq4nl[16];
+
 /* Q4_1 block: 32 weights (old GGML format, used by some GGUF models)
  * Layout: half d (scale), half m (min), uchar qs[16] (nibbles)
  * Dequant: val = qs[j] * d + m  (unsigned nibble, no sign extension) */
@@ -607,6 +630,7 @@ void dequantize_row_q8_0(const void *src, float *dst, int n);
 void dequantize_row_q6_K(const void *src, float *dst, int n);
 void dequantize_row_q5_K(const void *src, float *dst, int n);
 void dequantize_row_q4_0(const void *src, float *dst, int n);
+void dequantize_row_iq4_nl(const void *src, float *dst, int n);
 void dequantize_row_f16(const void *src, float *dst, int n);
 void dequantize_row_f32(const void *src, float *dst, int n);
 
@@ -651,6 +675,10 @@ float vec_dot_q1_0_q8_0(const void *src_q1, const void *src_q8, int n);
 float vec_dot_q2_0_q8_0(const void *src_q2, const void *src_q8, int n);
 /* Q4_0 * Q8_0 dot product: Q4_0 weights with pre-quantized Q8_0 input */
 float vec_dot_q4_0_q8_0(const void *src_q4, const void *src_q8, int n);
+/* IQ4_NL * Q8_0 dot product: IQ4_NL weights with pre-quantized Q8_0 input */
+float vec_dot_iq4_nl_q8_0(const void *src_iq4, const void *src_q8, int n);
+/* IQ4_NL * F32 dot product: fused dequant + dot (scalar fallback) */
+float vec_dot_iq4_nl_f32(const void *src_iq4, const float *x, int n);
 /* Q4_K * Q8_K dot product: Q4_K weights with pre-quantized Q8_K input */
 float vec_dot_q4_K_q8_K(const void *src_q4, const void *src_q8, int n);
 /* Q5_K * Q8_K dot product: Q5_K weights with pre-quantized Q8_K input */
@@ -695,6 +723,11 @@ void quantize_mat_q8_0x4(const float *x, void *dst, int n, int row_stride);
  * dst must have space for (n / 32) * sizeof(block_q4_0) bytes. */
 void quantize_row_q4_0(const float *x, void *dst, int n);
 
+/* Quantize a float32 vector to IQ4_NL blocks (Lloyd-Max 4-bit non-linear).
+ * dst must have space for (n / 32) * sizeof(block_iq4_nl) bytes.
+ * Identical layout to Q4_0 but uses non-linear LUT for better accuracy. */
+void quantize_row_iq4_nl(const float *x, void *dst, int n);
+
 /* Quantize a float32 vector to TQ3 blocks (TurboQuant 3-bit codebook).
  * dst must have space for (n / 32) * sizeof(block_tq3) bytes.
  * n must be a multiple of 32. */
@@ -715,6 +748,7 @@ void quantize_row_tq4(const float *x, void *dst, int n);
  * scratch for every single token. dst must be sized
  * gguf_type_row_size(GGUF_TYPE_Q8_0, n) bytes. */
 void q4_0_row_to_q8_0_shadow(const void *q4_row, void *q8_row_out, int n);
+void iq4_nl_row_to_q8_0_shadow(const void *iq4_row, void *q8_row_out, int n);
 
 /* Quantize a float32 vector to Q8_K blocks (for Q4_K/Q6_K matmul).
  * dst must have space for (n / 256) * sizeof(block_q8_K) bytes. */

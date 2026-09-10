@@ -1293,6 +1293,21 @@ QGEMM_DEFINE(q8_load_qs, block_q8_0)
 QGEMM_DEFINE(q4_load_qs, block_q4_0)
 QGEMM_DEFINE(q5_load_qs, block_q5_0)
 
+/* Load 32 signed int8 values from block_iq4_nl via LUT-based dequant.
+ * Uses _mm_shuffle_epi8 (VPSHUFB) to do 16-entry LUT lookup in parallel.
+ * VPSHUFB uses low 4 bits of each byte as index (high 4 bits irrelevant,
+ * high bit 7 must be clear for valid lookup). */
+static __m256i iq4nl_load_qs(const block_iq4_nl *b) {
+    const __m128i iq4lut = _mm_loadu_si128((const __m128i *)kvalues_iq4nl);
+    const __m128i mask4 = _mm_set1_epi8(15);
+    __m128i x = _mm_loadu_si128((const __m128i *)b->qs);
+    __m128i lo128 = _mm_shuffle_epi8(iq4lut, _mm_and_si128(mask4, x));
+    __m128i hi128 = _mm_shuffle_epi8(iq4lut, _mm_and_si128(mask4, _mm_srli_epi16(x, 4)));
+    return _mm256_insertf128_si256(_mm256_castsi128_si256(lo128), hi128, 1);
+}
+
+QGEMM_DEFINE(iq4nl_load_qs, block_iq4_nl)
+
 #endif /* AVX2 */
 
 /* ARM NEON / I8MM / DOTPROD path */
@@ -1581,6 +1596,18 @@ static inline void neon_q5_qs(const block_q5_0 *b, int8x16_t *lo, int8x16_t *hi)
     *hi = vsubq_s8(vreinterpretq_s8_u8(hi4), vdupq_n_s8(16));
 }
 
+/* NEON IQ4_NL dequant: LUT-based via vqtbl1q_u8.
+ * Returns 32 dequantized int8 values as two int8x16_t registers.
+ * Must mask low nibble before vqtbl1q_u8 (unlike x86 VPSHUFB). */
+static inline void neon_iq4nl_qs(const block_iq4_nl *b, int8x16_t *lo, int8x16_t *hi) {
+    const uint8x16_t iq4lut = vld1q_u8((const uint8_t *)kvalues_iq4nl);
+    uint8x16_t x = vld1q_u8(b->qs);
+    uint8x16_t xlo = vandq_u8(x, vdupq_n_u8(0x0F));
+    uint8x16_t xhi = vshrq_n_u8(x, 4);
+    *lo = vreinterpretq_s8_u8(vqtbl1q_u8(iq4lut, xlo));
+    *hi = vreinterpretq_s8_u8(vqtbl1q_u8(iq4lut, xhi));
+}
+
 /* NEON QGEMM D implementation: 4x2 tiles (mirrors AVX2 QGEMM_D_IMPL) */
 #define NEON_QGEMM_D_IMPL(load_qs_fn, blk_t)                                    \
 static void sgemm_##load_qs_fn##_d(int m, int n, int k_blocks,                  \
@@ -1625,6 +1652,7 @@ static void sgemm_##load_qs_fn##_d(int m, int n, int k_blocks,                  
 NEON_QGEMM_D_IMPL(neon_q8_qs, block_q8_0)
 NEON_QGEMM_D_IMPL(neon_q4_qs, block_q4_0)
 NEON_QGEMM_D_IMPL(neon_q5_qs, block_q5_0)
+NEON_QGEMM_D_IMPL(neon_iq4nl_qs, block_iq4_nl)
 
 /* NEON QGEMM D4 implementation: 4x4 tiles */
 #define NEON_QGEMM_D4_IMPL(load_qs_fn, blk_t)                                  \
@@ -1670,6 +1698,7 @@ static void sgemm_##load_qs_fn##_d4(int m, int n, int k_blocks,                \
 NEON_QGEMM_D4_IMPL(neon_q8_qs, block_q8_0)
 NEON_QGEMM_D4_IMPL(neon_q4_qs, block_q4_0)
 NEON_QGEMM_D4_IMPL(neon_q5_qs, block_q5_0)
+NEON_QGEMM_D4_IMPL(neon_iq4nl_qs, block_iq4_nl)
 
 /* ARM NEON Q4_0 x Q8_0 GEMM (tinyBLAS_Q0_ARM<block_q4_0> port from llama.cpp).
  *
@@ -1994,6 +2023,16 @@ static __m256i qg_q4_qs(const block_q4_0 *b) {
         _mm256_set1_epi8(8));
 }
 
+/* Load IQ4_NL qs (LUT-based dequant via VPSHUFB) */
+static __m256i qg_iq4nl_qs(const block_iq4_nl *b) {
+    const __m128i iq4lut = _mm_loadu_si128((const __m128i *)kvalues_iq4nl);
+    const __m128i mask4 = _mm_set1_epi8(15);
+    __m128i x = _mm_loadu_si128((const __m128i *)b->qs);
+    __m128i lo = _mm_shuffle_epi8(iq4lut, _mm_and_si128(mask4, x));
+    __m128i hi = _mm_shuffle_epi8(iq4lut, _mm_and_si128(mask4, _mm_srli_epi16(x, 4)));
+    return _mm256_insertf128_si256(_mm256_castsi128_si256(lo), hi, 1);
+}
+
 /* Load Q5_0 qs (nibble + 5th bit extraction) */
 static __m256i qg_q5_qs(const block_q5_0 *b) {
     __m128i x = _mm_loadu_si128((const __m128i *)b->qs);
@@ -2206,6 +2245,7 @@ static void sgemm_##load_qs_fn##_d(int m, int n, int k_blocks,                  
 QGEMM_D_IMPL(qg_q8_qs, block_q8_0)
 QGEMM_D_IMPL(qg_q4_qs, block_q4_0)
 QGEMM_D_IMPL(qg_q5_qs, block_q5_0)
+QGEMM_D_IMPL(qg_iq4nl_qs, block_iq4_nl)
 
 /* RN=4 variant: 4x4 tiles. Uses x-major traversal (llama.cpp style):
  * iterate over xtiles (activation columns) first within each job,
@@ -2258,6 +2298,7 @@ static void sgemm_##load_qs_fn##_d4(int m, int n, int k_blocks,                 
 QGEMM_D4_IMPL(qg_q8_qs, block_q8_0)
 QGEMM_D4_IMPL(qg_q4_qs, block_q4_0)
 QGEMM_D4_IMPL(qg_q5_qs, block_q5_0)
+QGEMM_D4_IMPL(qg_iq4nl_qs, block_iq4_nl)
 
 /* ============================================================
  * Q4_K x Q8_K tiled GEMM (AVX2)
@@ -2868,6 +2909,10 @@ int picolm_sgemm_d(int m, int n, int k_blocks,
         if (n >= 4) { sgemm_qg_q5_qs_d4(m, n, k_blocks, (const block_q5_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth); return 1; }
         sgemm_qg_q5_qs_d(m, n, k_blocks, (const block_q5_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth);
         return 1;
+    } else if (Atype == GGUF_TYPE_IQ4_NL) {
+        if (n >= 4) { sgemm_qg_iq4nl_qs_d4(m, n, k_blocks, (const block_iq4_nl*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth); return 1; }
+        sgemm_qg_iq4nl_qs_d(m, n, k_blocks, (const block_iq4_nl*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth);
+        return 1;
     }
 #elif defined(__ARM_NEON)
     /* NEON: use vdotq_s32 (DOTPROD) or vmmlaq_s32 (I8MM) with pre-converted deltas.
@@ -2886,6 +2931,10 @@ int picolm_sgemm_d(int m, int n, int k_blocks,
         static int t5_d4; if(n >= 4) { if(getenv("PICOLM_DISPATCH")&&!t5_d4) { t5_d4=1; fprintf(stderr,"TRACE kernel: sgemm_neon_q5_qs_d4\n"); } sgemm_neon_q5_qs_d4(m, n, k_blocks, (const block_q5_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth); return 1; }
         static int t5_d; if(getenv("PICOLM_DISPATCH")&&!t5_d) { t5_d=1; fprintf(stderr,"TRACE kernel: sgemm_neon_q5_qs_d\n"); }
         sgemm_neon_q5_qs_d(m, n, k_blocks, (const block_q5_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth);
+        return 1;
+    } else if (Atype == GGUF_TYPE_IQ4_NL) {
+        if (n >= 4) { sgemm_neon_iq4nl_qs_d4(m, n, k_blocks, (const block_iq4_nl*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth); return 1; }
+        sgemm_neon_iq4nl_qs_d(m, n, k_blocks, (const block_iq4_nl*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth);
         return 1;
     }
 #endif
