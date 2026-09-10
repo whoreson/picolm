@@ -4473,6 +4473,11 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
     /* Track attention layer ordinal */
     int attn_ord = 0;
 
+    /* Phase 1 refactor: single command buffer for the entire layer loop */
+    extern int picolm_gpu_batch_begin(int device);
+    extern int picolm_gpu_batch_end(int device);
+    picolm_gpu_batch_begin(gpu_dev);
+
     for (int l = 0; l < c->n_layers; l++) {
         if (interrupt && *interrupt) return -1;
 
@@ -4701,6 +4706,17 @@ after_qkv:
             }
         }
 
+        /* Debug: dump Q AFTER matmul but BEFORE RoPE (layer 0 only) */
+        if (getenv("PICOLM_ATTN_DBG") && attn_ord == 0 && start_pos == 0) {
+            picolm_gpu_sync(gpu_dev);
+            { float q_pre_rope[32];
+              picolm_gpu_memcpy(q_pre_rope, bq, 32 * sizeof(float), -1, gpu_dev);
+              float qrms=0; for(int _i=0;_i<32;_i++) qrms+=q_pre_rope[_i]*q_pre_rope[_i];
+              fprintf(stderr,"[ATN_DBG l=%d] Q_PRE_ROPE tok0[:8]={",l);
+              for(int _i=0;_i<8;_i++) fprintf(stderr,"%.6f ",q_pre_rope[_i]);
+              fprintf(stderr,"} rms=%.6f\n",sqrtf(qrms/32)); fflush(stderr); }
+        }
+
         /* RoPE: per-layer SWA/global selection */
         {
             int is_swa = (c->swa_period > 0) && ((l % c->swa_period) < (c->swa_period - 1));
@@ -4849,6 +4865,10 @@ after_qkv:
             fprintf(stderr,"[DBG] attn_post l=%d bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n",l,tmp[0],tmp[1],tmp[2],tmp[3]);
         }
     }
+
+    /* End batch: submit + fence wait */
+    picolm_gpu_batch_end(gpu_dev);
+
     return 0;
 }
 
