@@ -702,7 +702,11 @@ int picolm_gpu_init(const int *devices, int count) {
     // RMSNorm shader (push: int S, int D, float eps, int x_stride = 16 bytes)
     // RMSNorm shader: reuse G.plyt (matmul pipeline layout) for push constants
     G.shader_nrm = load_spv(G.dev, "rmsnorm_vk.spv");
-    if (G.shader_nrm) {
+    if (!G.shader_nrm) {
+        fprintf(stderr, "FATAL: [VK] missing rmsnorm_vk.spv -- GPU backend unusable\n");
+        goto init_fail;
+    }
+    if (1) {
         // Create descriptor set layout for RMSNorm (3 bindings, same as matmul)
         VkDescriptorSetLayoutBinding b[3];
         for (int i = 0; i < 3; i++) b[i] = (VkDescriptorSetLayoutBinding){
@@ -754,10 +758,16 @@ int picolm_gpu_init(const int *devices, int count) {
 
     // Load elementwise shader (residual_add, silu_mul, rope)
     G.shader_elem = load_spv(G.dev, "elementwise_vk.spv");
-    if (G.shader_elem) {
+    if (!G.shader_elem) {
+        fprintf(stderr, "FATAL: [VK] missing elementwise_vk.spv -- GPU backend unusable\n");
+        goto init_fail;
+    }
+    if (1) {
         if (!build_pipeline(G.dev, 4, 20, G.shader_elem, &G.dsl_elem, &G.plyt_elem,
                             &G.pipe_elem, &G.dpool_elem, &G.dset_elem)) {
             G.shader_elem = VK_NULL_HANDLE;
+            fprintf(stderr, "FATAL: [VK] failed to build elementwise pipeline\n");
+            goto init_fail;
         }
     }
 
@@ -772,11 +782,17 @@ int picolm_gpu_init(const int *devices, int count) {
 
     // Load attention prefill shader
     G.shader_attn_prefill = load_spv(G.dev, "attn_prefill_vk.spv");
-    if (G.shader_attn_prefill) {
+    if (!G.shader_attn_prefill) {
+        fprintf(stderr, "FATAL: [VK] missing attn_prefill_vk.spv -- GPU backend unusable\n");
+        goto init_fail;
+    }
+    if (1) {
         if (!build_pipeline(G.dev, 4, 32, G.shader_attn_prefill, &G.dsl_attn_prefill,
                             &G.plyt_attn_prefill, &G.pipe_attn_prefill, &G.dpool_attn_prefill,
                             &G.dset_attn_prefill)) {
             G.shader_attn_prefill = VK_NULL_HANDLE;
+            fprintf(stderr, "FATAL: [VK] failed to build attn_prefill pipeline\n");
+            goto init_fail;
         }
     }
 
@@ -814,6 +830,12 @@ int picolm_gpu_init(const int *devices, int count) {
     }
 
     G.ready = 1;
+
+    init_fail:
+    if (!G.ready) {
+        picolm_gpu_shutdown();
+        return 0;
+    }
     G.device_count = 1;
     G.devices[0] = 0;
 
@@ -1948,7 +1970,8 @@ int picolm_gpu_rmsnorm_dev(float *out, const float *x, const float *weight,
 
 int picolm_gpu_rmsnorm_batched_dev(float *out, const float *x, const float *weight,
                                     int dim, float eps, int S, int xs, int device) {
-    if (!G.ready || !G.shader_nrm || device != 0) return 0;
+    if (!G.shader_nrm) { fprintf(stderr, "FATAL: [VK] rmsnorm dispatch with no shader\n"); abort(); }
+    if (device != 0) return 0;
     VkDescriptorBufferInfo bi[3] = {desc_buf_info(x), desc_buf_info(weight), desc_buf_info(out)};
     if (!bi[0].buffer || !bi[1].buffer || !bi[2].buffer) { 
         fprintf(stderr, "[RN_DESC] FAIL x_buf=%p w_buf=%p y_buf=%p weight=%p x=%p out=%p\n", 
@@ -2720,7 +2743,8 @@ int picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
                                       int lo, int sp, int nt,
                                       int nh, int nkh, int hd,
                                       int msl, int device) {
-    if (!G.ready || !G.shader_attn_prefill || device != 0 || nt < 1) return 0;
+    if (!G.shader_attn_prefill) { fprintf(stderr, "FATAL: [VK] attn_prefill dispatch with no shader\n"); abort(); }
+    if (device != 0 || nt < 1) return 0;
 
     // KAVERI workaround: use BK/BV pipeline buffers (F32) instead of
     // KV cache (F16) for prefill attention. KAVERI/RADV can't read
