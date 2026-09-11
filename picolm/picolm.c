@@ -1738,7 +1738,7 @@ int main(int argc, char **argv) {
                     if (model.gpu.kv_active && gpu_path == 1) {
                         fflush(stderr);
                         logits = model_forward_gpu(&model, token, pos);
-                        fprintf(stderr, "[DECODE_GPU_RET] logits=%p\n", (void*)logits);
+                        if (getenv("PICOLM_DBG")) fprintf(stderr, "[DECODE_GPU_RET] logits=%p\n", (void*)logits);
                         fflush(stderr);
                         if (!logits) logits = model_forward(&model, token, pos);
 
