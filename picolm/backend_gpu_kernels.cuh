@@ -203,7 +203,7 @@ __global__ void picolm_gpu_attention_decode_kernel( float *xb_out, const float *
  * exact equality -- a nonzero-but-below-threshold diff here is correct
  * behavior, not a regression. */
 #define ATTN_DECODE_MAX_SPLITS 32
-#define ATTN_DECODE_MIN_CHUNK  64
+#define ATTN_DECODE_MIN_CHUNK  16  /* Lower threshold to avoid online softmax underflow for small head_dim models */
 
 /* Partial state layout (flat float buffer, sized by the host wrapper):
  *   partial_max: [n_heads][n_splits]

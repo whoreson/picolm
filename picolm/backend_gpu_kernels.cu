@@ -2905,7 +2905,12 @@ picolm_gpu_attention_decode_split_kernel(
                     for (int stride = n_chunks / 2; stride > 0; stride >>= 1) {
                         for (int c = 0; c < stride; c++) chunk[c] += chunk[c + stride];
                     }
-                    score = chunk[0] * attn_scale;
+                    /* Handle tail: elements not covered by complete 16-element chunks */
+                    float tail = 0;
+                    for (int d = n_chunks * 16; d < head_dim; d++) {
+                        tail = fmaf(qg[d], gpu_fp16_to_fp32(k_sh[d]), tail);
+                    }
+                    score = (chunk[0] + tail) * attn_scale;
                 }
 
                 if (tid == 0) {

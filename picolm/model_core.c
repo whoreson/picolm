@@ -3861,10 +3861,11 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         rmsnorm(s->x, last_x, s->output_norm_w, dim, c->rms_norm_eps);
     tensor_set_repacked(m->repack_used[1] ? m->repack_buffers[1] : NULL);
     /* Diagnostic: dump CPU prefill hidden state before output projection */
-    { double cr=0; for(int _i=0;_i<dim;_i++){float a=s->x[_i];cr+=a*a;}
-      for(int _i=0;_i<32;_i++) fprintf(stderr,"%s%.6f",_i?",":"",s->x[_i]);
-      fprintf(stderr, "} rms_full=%.6f\n",sqrtf(cr/dim));
-      fflush(stderr);
+    if (getenv("PICOLM_DBG")) {
+        double cr=0; for(int _i=0;_i<dim;_i++){float a=s->x[_i];cr+=a*a;}
+        for(int _i=0;_i<32;_i++) fprintf(stderr,"%s%.6f",_i?",":"",s->x[_i]);
+        fprintf(stderr, "} rms_full=%.6f\n",sqrtf(cr/dim));
+        fflush(stderr);
     }
 #ifdef PICOLM_GPU
     if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)m->gpu.output, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
