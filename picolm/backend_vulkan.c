@@ -1442,7 +1442,9 @@ int picolm_gpu_memcpy_async(void *dst, const void *src, size_t bytes, int dir, i
         VkDeviceSize src_off = 0;
         VkBuffer src_buf = unwrap_buf_offset(src, &src_off);
         if (!src_buf) return 0;
-        /* Wait on both fences: fence_dev for compute completion, fence_xfer for xfer completion */
+        /* If in a batch, flush it first so GPU has executed the dispatches */
+        if (G.in_batch) picolm_gpu_batch_end(0);
+        /* Now wait on both fences: fence_dev for compute completion, fence_xfer for xfer completion */
         vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
         vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
         VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
