@@ -35,7 +35,8 @@ void main() {
     int h = int(gid);
     int nkh = p.nkh;
     int hd = p.hd;
-    int kvh = h % nkh;
+    int kv_mul = p.nh / nkh;
+    int kvh = h / kv_mul;
     int n_kv = p.pos + 1;
 
     int q_off = h * hd;

@@ -101,7 +101,7 @@ static struct {
     VkPipeline pipe;
     VkShaderModule shader;
     VkDescriptorPool dpool;
-    VkDescriptorSet dset[128];
+    VkDescriptorSet dset[256];
     uint32_t dset_idx;  // ring buffer index for descriptor sets
 
     // RMSNorm pipeline
@@ -560,7 +560,7 @@ static void wr_desc(VkDescriptorSet set, int n, const VkDescriptorBufferInfo *bi
 // Ring-buffer descriptor set update for matmul path.
 // Each call advances G.dset_idx, ensuring the GPU sees a fresh set.
 static void wr_desc_ring(int n, const VkDescriptorBufferInfo *bi) {
-    VkDescriptorSet set = G.dset[G.dset_idx % 128];
+    VkDescriptorSet set = G.dset[G.dset_idx % 256];
     G.dset_idx++;
     wr_desc(set, n, bi);
 }
@@ -719,7 +719,7 @@ int picolm_gpu_init(const int *devices, int count) {
     G.shader = load_spv(G.dev, "qmatmul_vk.spv");
     if (!G.shader) { fprintf(stderr, "[VK] failed to load qmatmul_vk.spv\n"); return 0; }
     // Matmul: 4 sets for ring buffer
-    if (!build_pipeline_unified(G.dev, G.shader, &G.pipe, &G.dpool, G.dset, 128)) return 0;
+    if (!build_pipeline_unified(G.dev, G.shader, &G.pipe, &G.dpool, G.dset, 256)) return 0;
 
     // RMSNorm shader (push: int S, int D, float eps, int x_stride = 16 bytes)
     G.shader_nrm = load_spv(G.dev, "rmsnorm_vk.spv");
@@ -1112,7 +1112,7 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x,
         VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         VKCHECK(vkResetCommandBuffer(G.cmd, 0), "resetCmd");
         VKCHECK(vkBeginCommandBuffer(G.cmd, &begin), "beginCmd");
-        VkDescriptorSet cur_dset = G.dset[(G.dset_idx - 1) % 128];
+        VkDescriptorSet cur_dset = G.dset[(G.dset_idx - 1) % 256];
         vkCmdBindPipeline(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
         vkCmdBindDescriptorSets(G.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                 G.plyt_unified, 0, 1, &cur_dset, 0, NULL);
@@ -1826,7 +1826,7 @@ int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_d
     if (!ok) {
         VkDescriptorBufferInfo bi[3] = {xbi, {t->wbuf,0,VK_WHOLE_SIZE}, ybi};
         wr_desc_ring(3, bi);
-        VkDescriptorSet cur_dset = G.dset[(G.dset_idx - 1) % 128];
+        VkDescriptorSet cur_dset = G.dset[(G.dset_idx - 1) % 256];
         vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
         vkCmdBindDescriptorSets(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE,
                                 G.plyt_unified, 0, 1, &cur_dset, 0, NULL);

@@ -4527,7 +4527,7 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
                   free(buf);
                 }
             }
-            if(_SSM_DBG){
+            if(1){
                 picolm_gpu_sync(gpu_dev);
                 float lt8[8];picolm_gpu_memcpy(lt8,bx+(size_t)(n_ubatch-1)*xb_stride,32,-1,gpu_dev);
                 fprintf(stderr,"[DBG GPU l=%d] bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n",l,lt8[0],lt8[1],lt8[2],lt8[3]);}
@@ -4686,6 +4686,19 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
                     bv, bxb, n_ubatch, gpu_dev, n_kv_heads*head_dim, xb_stride);
             }
         }
+        /* Debug: dump Q, K, V first 4 elements for layer 0 */
+        if (getenv("PICOLM_ATTN_DBG") && l == 0 && attn_ord == 0 && start_pos == 0) {
+            picolm_gpu_sync(gpu_dev);
+            { float dbg_q[4], dbg_k[4], dbg_v[4];
+              picolm_gpu_memcpy(dbg_q, bq, 16, -1, gpu_dev);
+              picolm_gpu_memcpy(dbg_k, bk, 16, -1, gpu_dev);
+              picolm_gpu_memcpy(dbg_v, bv, 16, -1, gpu_dev);
+              fprintf(stderr,"[QKV l=0] Q[:4]={%.4f %.4f %.4f %.4f} K[:4]={%.4f %.4f %.4f %.4f} V[:4]={%.4f %.4f %.4f %.4f}\n",
+                  dbg_q[0],dbg_q[1],dbg_q[2],dbg_q[3],
+                  dbg_k[0],dbg_k[1],dbg_k[2],dbg_k[3],
+                  dbg_v[0],dbg_v[1],dbg_v[2],dbg_v[3]);
+              fflush(stderr); }
+        }
 after_qkv:
 
         /* QK-norm */
@@ -4786,15 +4799,13 @@ after_qkv:
         /* Diagnostic: dump attention output for first layer */
         if (getenv("PICOLM_ATTN_DBG") && attn_ord == 0 && start_pos == 0) {
             picolm_gpu_sync(gpu_dev);
-            { float aout[128];
-              picolm_gpu_memcpy(aout, battn_out, 128 * sizeof(float), -1, gpu_dev);
+            { float aout[256];
+              picolm_gpu_memcpy(aout, battn_out, 256 * sizeof(float), -1, gpu_dev);
               float arms=0; for(int _i=0;_i<96;_i++) arms+=aout[_i]*aout[_i];
               fprintf(stderr,"[ATN_DBG l=%d] attn_out_tok0[:8]={",l);
               for(int _i=0;_i<8;_i++) fprintf(stderr,"%.6f ",aout[_i]);
-              fprintf(stderr,"} rms=%.6f max_sc=%.6f sum_exp=%.6f inv=%.6f scores={",
-                  sqrtf(arms/96), aout[64], aout[65], aout[66]);
-              for(int _i=0;_i<5;_i++) fprintf(stderr,"%.6f ",aout[67+_i]);
-              fprintf(stderr,"}\n"); fflush(stderr); }
+              fprintf(stderr,"} rms=%.6f\n", sqrtf(arms/96));
+              fflush(stderr); }
         }
 
         /* SSM gate sigmoid */
@@ -5029,7 +5040,7 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
         float *last_x = bx + (size_t)(last_ubatch_size - 1) * xb_stride;
         picolm_gpu_sync(gpu_dev);
         picolm_gpu_memcpy(s->x, last_x, dim * sizeof(float), -1, gpu_dev);
-        if(_SSM_DBG){
+        if(1){
             fprintf(stderr,"[DBG] prefill_last x[:4]={%.6f,%.6f,%.6f,%.6f}\n",
                 s->x[0],s->x[1],s->x[2],s->x[3]);
         }

@@ -1,93 +1,49 @@
 #version 450
-// Prefill attention: multi-head causal attention over F32 pipeline buffers
-// Grid: [ceil(n_heads*n_tokens/256), 1, 1], block: [256, 1, 1]
-// Each thread handles one (head, token) pair independently.
-//
-// Data layout (all F32):
-//   Q: [n_tokens][n_heads][head_dim]  -- contiguous per head per token
-//   K: [n_tokens][n_kv_heads][head_dim]
-//   V: [n_tokens][n_kv_heads][head_dim]
-//   Out: same layout as Q
-
 layout(local_size_x = 256) in;
-
 layout(set = 0, binding = 0, std430) readonly buffer B_Q { float q_data[]; };
 layout(set = 0, binding = 1, std430) readonly buffer B_KK { float kv_k_data[]; };
 layout(set = 0, binding = 2, std430) readonly buffer B_KV { float kv_v_data[]; };
 layout(set = 0, binding = 3, std430) writeonly buffer B_OUT { float xb_out[]; };
-
-// Push constant: matches the layout in backend_vulkan.c.
 layout(push_constant) uniform PC {
-    int lo;       // layer_ordinal
-    int sp;       // start_pos
-    int nt;       // n_tokens
-    int nh;       // n_heads
-    int nkh;      // n_kv_heads
-    int hd;       // head_dim
-    float inv_sqrt_hd;  // 1/sqrt(head_dim)
-    int pad;      // padding
+    int lo, sp, nt, nh, nkh, hd; float inv_sqrt_hd; int pad;
 } p;
-
 void main() {
     uint gid = gl_GlobalInvocationID.x;
     uint total = uint(p.nh) * uint(p.nt);
     if (gid >= total) return;
-
-    int h  = int(gid % uint(p.nh));
+    int h = int(gid % uint(p.nh));
     int qi = int(gid / uint(p.nh));
-
-    int nkh = p.nkh;
-    int hd  = p.hd;
-    int kvh = h % nkh;
-    int nt  = p.nt;
-
-    int q_stride = p.nh * hd;
-    int kv_stride = nkh * hd;
-
+    int nkh = p.nkh, hd = p.hd, nt = p.nt;
+    // GQA: contiguous head grouping (not interleaved)
+    int kv_mul = p.nh / nkh;
+    int kvh = h / kv_mul;
+    int q_stride = p.nh * hd, kv_stride = nkh * hd;
     int q_off = qi * q_stride + h * hd;
-
-    // Compute attention scores with online softmax (single pass)
+    float scores[256]; int valid = 0;
     float max_sc = -1e20f;
-    float sum_exp = 0.0f;
-    // Accumulators for weighted V (will need renormalization)
-    // We use a 2-pass approach for simplicity and correctness:
-    // Pass 1: compute all scores, find max
-    // Pass 2: softmax + accumulate V
-
-    // Temporary scores array (max 256 tokens, stack-safe)
-    float scores[256];
-    int valid = 0;
-
     for (int ti = 0; ti < nt; ti++) {
+        // Causal mask: only attend to tokens <= qi
+        if (ti > qi) break;
         float s = 0.0f;
         int k_off = ti * kv_stride + kvh * hd;
-        for (int d = 0; d < hd; d++) {
-            s += q_data[q_off + d] * kv_k_data[k_off + d];
-        }
-        s *= p.inv_sqrt_hd; // 1/sqrt(head_dim) from push constant
+        for (int d = 0; d < hd; d++) s += q_data[q_off + d] * kv_k_data[k_off + d];
+        s *= p.inv_sqrt_hd;
         scores[ti] = s;
         if (s > max_sc) max_sc = s;
         valid = ti + 1;
     }
-
-    // Pass 2: softmax normalization + weighted V accumulation
     float acc[64];
     for (int d = 0; d < hd; d++) acc[d] = 0.0f;
-
+    float sum_exp = 0.0f;
     for (int ti = 0; ti < valid; ti++) {
         float e = exp(scores[ti] - max_sc);
         sum_exp += e;
         int v_off = ti * kv_stride + kvh * hd;
-        for (int d = 0; d < hd; d++) {
-            acc[d] += e * kv_v_data[v_off + d];
-        }
+        for (int d = 0; d < hd; d++) acc[d] += e * kv_v_data[v_off + d];
     }
-
     if (sum_exp > 0.0f) {
         float inv = 1.0f / sum_exp;
         int o_off = qi * q_stride + h * hd;
-        for (int d = 0; d < hd; d++) {
-            xb_out[o_off + d] = acc[d] * inv;
-        }
+        for (int d = 0; d < hd; d++) xb_out[o_off + d] = acc[d] * inv;
     }
 }
