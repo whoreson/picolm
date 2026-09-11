@@ -26,6 +26,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#include <math.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -190,6 +191,7 @@ static struct {
     VkDeviceMemory kv_k_mem, kv_v_mem;
     size_t kv_k_bytes, kv_v_bytes;
     void *kv_k_d, *kv_v_d;  /* cached wrappers */
+    void *kv_k_mapped, *kv_v_mapped;  /* CPU-mapped for readback */
     // KV staging buffer (device-local, for KAVERI shader read workaround)
     VkBuffer kv_staging_buf;
     VkDeviceMemory kv_staging_mem;
@@ -1073,12 +1075,14 @@ const void *picolm_gpu_tensor_weights(const picolm_gpu_tensor_t *tensor) {
 // ---------------------------------------------------------------------------
 
 // Push constant struct for qmatmul shader:
-//   int fmt, int S, int I, int O, int rowWords
-// Must match shader push_constant layout (20 bytes)
+//   int fmt, int S, int I, int O, int rowWords, int x_stride, int y_stride
+// Must match shader push_constant layout (28 bytes, within 48-byte PC range)
 typedef struct {
     int fmt;       // GGUF_TYPE enum value
     int S, I, O;
     int rowWords;  // uint32 words per weight row
+    int x_stride;  // activation stride (0 = I)
+    int y_stride;  // output stride (0 = O)
 } PC_Matmul;
 
 int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x,
@@ -1201,6 +1205,7 @@ int picolm_gpu_rmsnorm_batched(float *out, const float *x, const float *weight,
     vkCmdBindDescriptorSets(G.cmd_nrm, VK_PIPELINE_BIND_POINT_COMPUTE,
                             G.plyt_unified, 0, 1, &G.dset_nrm, 0, NULL);
     PC_Matmul pc_nrm = {0, S, dim, 0, x_stride};
+    memcpy(&pc_nrm.O, &eps, sizeof(float)); // bitcast eps into O field
     vkCmdPushConstants(G.cmd_nrm, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(pc_nrm), &pc_nrm);
     vkCmdDispatch(G.cmd_nrm, (uint32_t)S, 1, 1);
@@ -1802,7 +1807,7 @@ int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_d
         if (_matmul_dev_skip_cnt++ < 3) fprintf(stderr, "[VK] matmul_dev skip: I=%d O=%d (need >=64/32)\n", t->I, t->O);
         return 0;
     }
-    (void)x_stride; (void)y_stride;
+    // x_stride and y_stride are passed through PC_Matmul push constants
     VkDescriptorBufferInfo xbi = desc_buf_info(x_dev), ybi = desc_buf_info(y_dev);
     if (!xbi.buffer || !ybi.buffer) return 0;
 
@@ -1830,7 +1835,7 @@ int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_d
         vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
         vkCmdBindDescriptorSets(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE,
                                 G.plyt_unified, 0, 1, &cur_dset, 0, NULL);
-        PC_Matmul pc = {t->qtype, S, t->I, t->O, (int)t->row_words};
+        PC_Matmul pc = {t->qtype, S, t->I, t->O, (int)t->row_words, x_stride, y_stride};
         vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
                            0, sizeof(pc), &pc);
         // Phase 2: 2D dispatch [O, S, 1], local_size_x=16 -> ceil(O/16) actual groups
@@ -1927,8 +1932,9 @@ int picolm_gpu_rmsnorm_batched_dev(float *out, const float *x, const float *weig
     VkDescriptorBufferInfo rn_bi[3] = {desc_buf_info(x), desc_buf_info(weight), desc_buf_info(out)};
     wr_desc(G.dset_nrm, 3, rn_bi);
     vkCmdBindDescriptorSets(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_unified, 0, 1, &G.dset_nrm, 0, NULL);
-    // Push constants via PC_Matmul format: fmt=0, S, I=dim, O=0, rowWords=xs
+    // Push constants via PC_Matmul format: fmt=0, S, I=dim, O=eps(bitcast), rowWords=xs
     PC_Matmul pc_nrm = {0, S, dim, 0, xs};
+    memcpy(&pc_nrm.O, &eps, sizeof(float));
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_nrm), &pc_nrm);
     vkCmdDispatch(G.cmd_dev, (uint32_t)S, 1, 1);
     VK_BATCH_DISPATCH_POST();
@@ -2099,7 +2105,11 @@ int picolm_gpu_kv_alloc(size_t kv_k_bytes, size_t kv_v_bytes, int device) {
     G.kv_v_bytes = kv_v_bytes;
     G.kv_k_d = kv_k_bytes ? wrap_buf(G.kv_k_buf, G.kv_k_mem, 0, kv_k_bytes) : NULL;
     G.kv_v_d = kv_v_bytes ? wrap_buf(G.kv_v_buf, G.kv_v_mem, 0, kv_v_bytes) : NULL;
-    fprintf(stderr, "[VK] kv_alloc: OK\n");
+    // Map KV cache for CPU readback (needed for CPU decode)
+    G.kv_k_mapped = NULL; G.kv_v_mapped = NULL;
+    if (kv_k_bytes) VKCHECK(vkMapMemory(G.dev, G.kv_k_mem, 0, kv_k_bytes, 0, &G.kv_k_mapped), "mapKvK");
+    if (kv_v_bytes) VKCHECK(vkMapMemory(G.dev, G.kv_v_mem, 0, kv_v_bytes, 0, &G.kv_v_mapped), "mapKvV");
+    fprintf(stderr, "[VK] kv_alloc: OK (mapped for CPU readback)\n");
     return 1;
 }
 
@@ -2379,6 +2389,8 @@ int picolm_gpu_kv_debug_dump(int is_k, int lo, int pos,
 void picolm_gpu_kv_cache_clear(int device) {
     (void)device;
     if (G.ready) {
+        if (G.kv_k_mapped) { vkUnmapMemory(G.dev, G.kv_k_mem); G.kv_k_mapped = NULL; }
+        if (G.kv_v_mapped) { vkUnmapMemory(G.dev, G.kv_v_mem); G.kv_v_mapped = NULL; }
         if (G.kv_k_d) { free(G.kv_k_d); G.kv_k_d = NULL; }
         if (G.kv_v_d) { free(G.kv_v_d); G.kv_v_d = NULL; }
         if (G.kv_k_mem) { vkFreeMemory(G.dev, G.kv_k_mem, NULL); G.kv_k_mem = VK_NULL_HANDLE; }
@@ -2391,6 +2403,42 @@ void picolm_gpu_kv_cache_clear(int device) {
 
 void picolm_gpu_kv_free(void) { picolm_gpu_kv_cache_clear(0); }
 
+// ---------------------------------------------------------------------------
+// KV CACHE FLUSH (GPU -> CPU)
+// ---------------------------------------------------------------------------
+int picolm_gpu_kv_flush_to_cpu(uint8_t *cpu_k, uint8_t *cpu_v,
+                                int n_attn_ord, int max_seq,
+                                int n_pos, size_t row_sz_k, size_t row_sz_v,
+                                int device) {
+    if (!G.ready || !cpu_k || !cpu_v || device != 0) return 0;
+    if (!G.kv_k_mapped || !G.kv_v_mapped) {
+        fprintf(stderr, "[VK] kv_flush: not mapped\n");
+        return 0;
+    }
+    // Wait for GPU writes to complete
+    vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
+    vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
+    // Invalidate mapped memory for CPU read
+    VkMappedMemoryRange inv = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE };
+    inv.memory = G.kv_k_mem; inv.offset = 0; inv.size = G.kv_k_bytes;
+    vkInvalidateMappedMemoryRanges(G.dev, 1, &inv);
+    inv.memory = G.kv_v_mem; inv.size = G.kv_v_bytes;
+    vkInvalidateMappedMemoryRanges(G.dev, 1, &inv);
+    // Copy row-by-row
+    size_t elems_per_row_k = row_sz_k / sizeof(uint16_t);
+    size_t elems_per_row_v = row_sz_v / sizeof(uint16_t);
+    for (int lo = 0; lo < n_attn_ord; lo++) {
+        uint16_t *gk = (uint16_t*)G.kv_k_mapped + (size_t)lo * max_seq * elems_per_row_k;
+        uint16_t *gv = (uint16_t*)G.kv_v_mapped + (size_t)lo * max_seq * elems_per_row_v;
+        uint8_t *ck = cpu_k + (size_t)lo * max_seq * row_sz_k;
+        uint8_t *cv = cpu_v + (size_t)lo * max_seq * row_sz_v;
+        for (int p = 0; p < n_pos; p++) {
+            memcpy(ck + (size_t)p * row_sz_k, gk + (size_t)p * elems_per_row_k, row_sz_k);
+            memcpy(cv + (size_t)p * row_sz_v, gv + (size_t)p * elems_per_row_v, row_sz_v);
+        }
+    }
+    return 1;
+}
 // ---------------------------------------------------------------------------
 // EXPERT MLP + W4A16 (stubs)
 // ---------------------------------------------------------------------------

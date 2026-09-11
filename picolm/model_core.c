@@ -2026,6 +2026,9 @@ static float *model_forward_gpt2(model_t *m, int token, int pos);
 static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt);
 
 float *model_forward(model_t *m, int token, int pos) {
+    if (getenv("PICOLM_ATTN_DBG") && pos >= 2 && pos <= 5) {
+        fprintf(stderr, "[CPU_FWD_ENTRY] pos=%d token=%d\n", pos, token); fflush(stderr);
+    }
     /* Bounds check: pos must be within KV cache allocation */
     if (pos >= m->config.max_seq_len) {
         fprintf(stderr, "WARN: model_forward pos=%d >= max_seq_len=%d, returning last logits\n",
@@ -2286,6 +2289,14 @@ float *model_forward(model_t *m, int token, int pos) {
                 for (int h = 0; h < n_kv_heads; h++)
                     rmsnorm(k_tmp + h * head_dim, k_tmp + h * head_dim, knw, head_dim, c->rms_norm_eps);
             }
+        }
+
+        /* Debug: dump K from KV cache during decode at pos=3 (first decode step) */
+        if (getenv("PICOLM_ATTN_DBG") && l == 0 && pos == 3) {
+            uint16_t *kcache_f16 = (uint16_t*)kcache_layer;
+            fprintf(stderr, "[CPU_DEC_KCACHE l=0 pos=3] cached_K_tok0[:8]={");
+            for (int _i = 0; _i < 8; _i++) fprintf(stderr, "%.4f ", fp16_to_fp32_lookup(kcache_f16[_i]));
+            fprintf(stderr, "}\n"); fflush(stderr);
         }
 
         /* Apply RoPE to Q and K */
@@ -2630,6 +2641,21 @@ ffn_done:
     }
     matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
     tensor_set_repacked(NULL);
+
+    /* Debug: dump top-5 logits at first decode step */
+    if (getenv("PICOLM_ATTN_DBG") && pos >= 3 && pos <= 4) {
+        int top_t[5]; float top_v[5];
+        for(int t=0;t<5;t++){top_t[t]=-1;top_v[t]=-1e30f;}
+        for(int v=0;v<c->vocab_size;v++){
+            float val=s->logits[v];
+            if(val<=top_v[4]) continue;
+            int ip=4;while(ip>0&&val>top_v[ip-1]){top_v[ip]=top_v[ip-1];top_t[ip]=top_t[ip-1];ip--;}
+            top_v[ip]=val;top_t[ip]=v;
+        }
+        fprintf(stderr,"[CPU_DEC_LOGITS pos=%d] top5=",pos);
+        for(int t=0;t<5;t++)fprintf(stderr,"(%d:%.1f) ",top_t[t],top_v[t]);
+        fprintf(stderr,"\n");fflush(stderr);
+    }
 
     return s->logits;
 }
@@ -3608,6 +3634,13 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         matmul_dual_batch(k_batch, v_batch, xb_batch, n_tokens,
                           lw->attn_k, lw->attn_v, dim, kv_dim,
                           lw->type_attn_k, lw->type_attn_v);
+        if(getenv("PICOLM_ATTN_DBG") && l == 0 && lw->is_attn_layer) {
+            fprintf(stderr, "[ATN_DBG l=%d CPU_K] first_tok[:4]={", l);
+            for(int _i=0;_i<4;_i++) fprintf(stderr,"%.6f ", k_batch[_i]);
+            fprintf(stderr, "} CPU_V[:4]={");
+            for(int _i=0;_i<4;_i++) fprintf(stderr,"%.6f ", v_batch[_i]);
+            fprintf(stderr, "}\n"); fflush(stderr);
+        }
         tensor_set_repacked(NULL);
 
         /* Per-position: RoPE, KV store */
@@ -3934,7 +3967,13 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #endif
             matmul_batch(xb2_batch, hb_batch, n_tokens, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
             tensor_set_repacked(NULL);
-
+            if(l==0 && getenv("PICOLM_ATTN_DBG")) {
+                float *xb2l = xb2_batch + (n_tokens-1)*dim;
+                double fr=0; for(int _i=0;_i<dim;_i++){float a=xb2l[_i];fr+=a*a;}
+                fprintf(stderr,"[CPU_FFN_DOWN l=0] last_tok[:4]={%.6f %.6f %.6f %.6f} rms=%.6f\n",
+                    xb2l[0],xb2l[1],xb2l[2],xb2l[3],sqrtf(fr/dim));
+                fflush(stderr);
+            }
             /* Residual: x += ffn_out */
             for (bi = 0; bi < n_tokens; bi++) {
                 float *a = x_batch + bi * dim, *b = xb2_batch + bi * dim;

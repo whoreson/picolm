@@ -1,7 +1,8 @@
 #version 450
 // RMS norm: y[s,i] = x[s,i] * w[i] / sqrt(mean(x[s,:]^2) + eps)
 // NO shared memory, NO subgroup ops -- safe for KAVERI/MI50.
-// Push constant layout matches matmul (PC_Matmul): fmt, S, I(D), O, rowWords(x_stride)
+// Push constant (PC_Matmul layout): fmt, S, I(D), O(eps bitcast), rowWords(x_stride)
+// eps is passed as bitcast float in the O field: floatBitsToInt(eps)
 
 layout(local_size_x = 256) in;
 
@@ -10,11 +11,11 @@ layout(std430, binding = 1) readonly buffer W  { float w[]; };
 layout(std430, binding = 2) writeonly buffer Y { float y[]; };
 
 layout(push_constant) uniform P {
-    int fmt;       // unused
-    int S;         // number of rows
-    int I;         // dimension D
-    int O;         // unused
-    int rowWords;  // x_stride (0 = D)
+    int fmt;
+    int S;
+    int I;
+    int O;
+    int rowWords;
 } p;
 
 void main() {
@@ -25,13 +26,17 @@ void main() {
     int stride = p.rowWords > 0 ? p.rowWords : D;
     uint base = uint(s) * uint(stride);
 
+    // Decode eps from the O field (bitcast float)
+    float eps = intBitsToFloat(p.O);
+    if (eps <= 0.0) eps = 1e-5; // fallback to default
+
     // Every thread computes the full sum of squares
     float sum_sq = 0.0;
     for (int i = 0; i < D; i++) {
         float v = x[base + uint(i)];
         sum_sq += v * v;
     }
-    float r = 1.0 / sqrt(sum_sq / float(D) + 1e-5);
+    float r = 1.0 / sqrt(sum_sq / float(D) + eps);
 
     // All threads write their assigned outputs
     for (int i = tid; i < D; i += 256)

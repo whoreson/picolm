@@ -417,6 +417,12 @@ int picolm_gpu_kv_store_dev_batched_strided(int is_k, int layer_ordinal, int sta
                                              const float *src_dev, int n_kv_heads, int head_dim,
                                              int max_seq_len, int device, int src_stride);
 
+/* Flush GPU KV cache to CPU KV cache (for CPU decode readback). */
+int picolm_gpu_kv_flush_to_cpu(uint8_t *cpu_k, uint8_t *cpu_v,
+                                int n_attn_ord, int max_seq,
+                                int n_pos, size_t row_sz_k, size_t row_sz_v,
+                                int device);
+
 /* Bulk KV cache upload from host F16 cache.
  * Copies all n_positions for a single layer from host_rows (contiguous
  * F16 rows) to device KV cache starting at pos 0.
