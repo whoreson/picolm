@@ -4710,7 +4710,6 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
               fflush(stderr); }
         }
 after_qkv:
-
         /* QK-norm */
         if (gw->attn_qk_norm_q_dev[l]) {
             int q_stride = q_dim;
@@ -4826,6 +4825,7 @@ after_qkv:
             { float aout[512];
               int lt = n_ubatch - 1;
               int a_stride_l = n_heads * head_dim;
+              int kv_str = n_kv_heads * head_dim;
               picolm_gpu_memcpy(aout, battn_out, 256 * sizeof(float), -1, gpu_dev);
               picolm_gpu_memcpy(aout+256, battn_out + (size_t)lt * a_stride_l, 256 * sizeof(float), -1, gpu_dev);
               float arms0=0,armsL=0; for(int _i=0;_i<96;_i++){arms0+=aout[_i]*aout[_i];armsL+=aout[256+_i]*aout[256+_i];}
@@ -4834,7 +4834,24 @@ after_qkv:
               fprintf(stderr,"} rms=%.6f | tok%d[:4]={",lt);
               for(int _i=0;_i<4;_i++) fprintf(stderr,"%.6f ",aout[256+_i]);
               fprintf(stderr,"} rms=%.6f\n",sqrtf(armsL/96));
-              fflush(stderr); }
+              fflush(stderr);
+              /* S=1 identity check: attention output must equal V[kvh] for head 0 */
+              if (n_ubatch == 1) {
+                  float v0[head_dim];
+                  picolm_gpu_memcpy(v0, bv, head_dim * sizeof(float), -1, gpu_dev);
+                  float maxdiff = 0;
+                  for (int _i = 0; _i < head_dim; _i++) {
+                      float d = fabsf(aout[_i] - v0[_i]);
+                      if (d > maxdiff) maxdiff = d;
+                  }
+                  fprintf(stderr,"[S1_IDENTITY l=%d] attn[:8]={%.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f} V[:8]={%.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f} maxdiff=%.6f\n",
+                      l,
+                      aout[0],aout[1],aout[2],aout[3],aout[4],aout[5],aout[6],aout[7],
+                      v0[0],v0[1],v0[2],v0[3],v0[4],v0[5],v0[6],v0[7],
+                      maxdiff);
+                  fflush(stderr);
+              }
+          }
         }
 
         /* SSM gate sigmoid */
@@ -4847,10 +4864,10 @@ after_qkv:
         /* Output projection */
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_output,
                                bxb, battn_out, n_ubatch, gpu_dev, xb_stride, attn_out_stride);
-        if(getenv("PICOLM_ATTN_DBG") && l == 0) {
+        if(getenv("PICOLM_ATTN_DBG") && l == 0 && n_ubatch == 1) {
             picolm_gpu_sync(gpu_dev);
-            float dbg_op[4]; picolm_gpu_memcpy(dbg_op, bxb + (size_t)(n_ubatch-1)*xb_stride, 16, -1, gpu_dev);
-            fprintf(stderr,"[ATN_DBG l=%d OUTP] last_tok[:4]={%.6f %.6f %.6f %.6f}\n",l,dbg_op[0],dbg_op[1],dbg_op[2],dbg_op[3]);
+            float dbg_op[8]; picolm_gpu_memcpy(dbg_op, bxb + (size_t)(n_ubatch-1)*xb_stride, 32, -1, gpu_dev);
+            fprintf(stderr,"[GPU l=0 OUTP] xb2[:8]={%.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f}\n",l,dbg_op[0],dbg_op[1],dbg_op[2],dbg_op[3],dbg_op[4],dbg_op[5],dbg_op[6],dbg_op[7]);
             float dbg_rs[4]; picolm_gpu_memcpy(dbg_rs, bx + (size_t)(n_ubatch-1)*xb_stride, 16, -1, gpu_dev);
             fprintf(stderr,"[ATN_DBG l=%d RSID] last_tok[:4]={%.6f %.6f %.6f %.6f}\n",l,dbg_rs[0],dbg_rs[1],dbg_rs[2],dbg_rs[3]);
             fflush(stderr);
@@ -5073,23 +5090,6 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
                     host_embd + (size_t)bi * dim,
                     dim * sizeof(float), 1, gpu_dev);
             }
-            fprintf(stderr, "\n[EMB_CHECK] host_embd[:8]={%f %f %f %f %f %f %f %f}\n",
-                host_embd[0],host_embd[1],host_embd[2],host_embd[3],
-                host_embd[4],host_embd[5],host_embd[6],host_embd[7]);
-
-            /* Debug: verify embedding H2D correctness */
-            {
-                float *bx_check = (float *)malloc(dim * sizeof(float));
-                if (bx_check) {
-                    picolm_gpu_memcpy_async(bx_check, bx, dim * sizeof(float), -1, gpu_dev);
-                    picolm_gpu_sync(gpu_dev);
-                    fprintf(stderr, "\n[BX_CHECK] token0[:8]={%f %f %f %f %f %f %f %f}\n",
-                        bx_check[0],bx_check[1],bx_check[2],bx_check[3],
-                        bx_check[4],bx_check[5],bx_check[6],bx_check[7]);
-                    free(bx_check);
-                }
-            }
-
             /* Process this ubatch through all layers */
             if (_prefill_gpu_ubatch(m, s, gw, gpu_dev,
                 dim, n_ffn, n_heads, n_kv_heads, head_dim,
@@ -5138,26 +5138,10 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
         for (int _ll = 0; _ll < c->n_layers; _ll++) {
             if (w->layers[_ll].is_attn_layer) n_attn_ord++;
         }
-        if (picolm_gpu_kv_flush_to_cpu(s->key_cache, s->val_cache,
+        picolm_gpu_kv_flush_to_cpu(s->key_cache, s->val_cache,
                                         n_attn_ord, c->max_seq_len, n_tokens,
                                         s->kv_row_size_k, s->kv_row_size_v,
-                                        gpu_dev)) {
-            static int kv_flush_warn = 0;
-            if (!kv_flush_warn) { kv_flush_warn = 1;
-                fprintf(stderr, "INFO: GPU->CPU KV cache flushed (%d attn ordinals, %d positions)\n", n_attn_ord, n_tokens);
-            // Verify: dump first K row from CPU KV cache and compare with GPU
-            {
-                float cpu_kv_check[16];
-                uint16_t *cpu_k = (uint16_t*)(s->key_cache);
-                for (int _i = 0; _i < 16; _i++) {
-                    cpu_kv_check[_i] = fp16_to_fp32(cpu_k[_i]);
-                }
-                fprintf(stderr, "[KV_FLUSH_VERIFY] CPU K_tok0_h0[:16]={");
-                for (int _i = 0; _i < 16; _i++) fprintf(stderr, "%.4f ", cpu_kv_check[_i]);
-                fprintf(stderr, "}\n"); fflush(stderr);
-            }
-            }
-        }
+                                        gpu_dev);
     }
 
     /* Diagnostic: dump KV cache from device after GPU prefill */

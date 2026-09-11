@@ -110,6 +110,8 @@ static struct {
     VkPipeline pipe_nrm;
     VkDescriptorPool dpool_nrm;
     VkDescriptorSet dset_nrm;
+    VkDescriptorPool dpool_nrm_ring;
+    VkDescriptorSet dset_nrm_ring[256];  // ring buffer for batched prefill
     // Push constant staging buffer (legacy, not used with unified layout)
     VkBuffer buf_pc_nrm;
     VkDeviceMemory mem_pc_nrm;
@@ -119,6 +121,8 @@ static struct {
     VkPipeline pipe_elem;
     VkDescriptorPool dpool_elem;
     VkDescriptorSet dset_elem;
+    VkDescriptorPool dpool_elem_ring;
+    VkDescriptorSet dset_elem_ring[256];  // ring buffer for batched prefill
 
     // Attention decode pipeline
     VkShaderModule shader_attn_dec;
@@ -137,12 +141,14 @@ static struct {
     VkPipeline pipe_quantize;
     VkDescriptorPool dpool_quantize;
     VkDescriptorSet dset_quantize;
+    VkDescriptorSet dset_quantize_ring[256];
 
     // Q8_0 x Q8_0 matmul pipeline (pre-quantized activations)
     VkShaderModule shader_q8q8;
     VkPipeline pipe_q8q8;
     VkDescriptorPool dpool_q8q8;
     VkDescriptorSet dset_q8q8;
+    VkDescriptorSet dset_q8q8_ring[256];
 
     // F16 pack: shares elementwise resources (shader, pipeline, dpool, dset)
     VkShaderModule shader_f16pack;
@@ -192,6 +198,8 @@ static struct {
     size_t kv_k_bytes, kv_v_bytes;
     void *kv_k_d, *kv_v_d;  /* cached wrappers */
     void *kv_k_mapped, *kv_v_mapped;  /* CPU-mapped for readback */
+    // Mapped pipe buffers (for direct CPU readback on llvmpipe/RADV)
+    void *pipe_k_b_mapped, *pipe_v_b_mapped;
     // KV staging buffer (device-local, for KAVERI shader read workaround)
     VkBuffer kv_staging_buf;
     VkDeviceMemory kv_staging_mem;
@@ -734,6 +742,17 @@ int picolm_gpu_init(const int *devices, int count) {
         fprintf(stderr, "FATAL: [VK] failed to build rmsnorm pipeline\n");
         goto init_fail;
     }
+    // Build ring buffer for RMSNorm (avoids singleton descriptor aliasing)
+    { VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 256*3};
+      VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 256, .poolSizeCount = 1, .pPoolSizes = &ps};
+      VKCHECK(vkCreateDescriptorPool(G.dev, &dpi, NULL, &G.dpool_nrm_ring), "nrm_ring_pool");
+      for (int _si = 0; _si < 256; _si++) {
+        VkDescriptorSetAllocateInfo dsa = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+          .descriptorPool = G.dpool_nrm_ring, .descriptorSetCount = 1, .pSetLayouts = &G.dsl_unified};
+        vkAllocateDescriptorSets(G.dev, &dsa, &G.dset_nrm_ring[_si]);
+      }
+    }
 
     // Command pool + buffer
     VkCommandPoolCreateInfo cpci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -771,6 +790,17 @@ int picolm_gpu_init(const int *devices, int count) {
         fprintf(stderr, "FATAL: [VK] failed to build elementwise pipeline\n");
         goto init_fail;
     }
+    // Build ring buffer for elementwise (avoids singleton descriptor aliasing)
+    { VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 256*3};
+      VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 256, .poolSizeCount = 1, .pPoolSizes = &ps};
+      VKCHECK(vkCreateDescriptorPool(G.dev, &dpi, NULL, &G.dpool_elem_ring), "elem_ring_pool");
+      for (int _si = 0; _si < 256; _si++) {
+        VkDescriptorSetAllocateInfo dsa = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+          .descriptorPool = G.dpool_elem_ring, .descriptorSetCount = 1, .pSetLayouts = &G.dsl_unified};
+        vkAllocateDescriptorSets(G.dev, &dsa, &G.dset_elem_ring[_si]);
+      }
+    }
 
     // Load attention decode shader
     G.shader_attn_dec = load_spv(G.dev, "attn_decode_vk.spv");
@@ -795,18 +825,18 @@ int picolm_gpu_init(const int *devices, int count) {
     // Load Q8_0 quantize shader (F32->Q8_0 on device)
     G.shader_quantize = load_spv(G.dev, "quantize_q8_vk.spv");
     if (G.shader_quantize) {
-        if (!build_pipeline_unified(G.dev, G.shader_quantize, &G.pipe_quantize, &G.dpool_quantize, &G.dset_quantize, 1)) {
+        if (!build_pipeline_unified(G.dev, G.shader_quantize, &G.pipe_quantize, &G.dpool_quantize, G.dset_quantize_ring, 256)) {
             G.shader_quantize = VK_NULL_HANDLE;
         }
-    }
+        }
 
     // Load Q8_0 x Q8_0 matmul shader
     G.shader_q8q8 = load_spv(G.dev, "q8_q8_matmul_vk.spv");
     if (G.shader_q8q8) {
-        if (!build_pipeline_unified(G.dev, G.shader_q8q8, &G.pipe_q8q8, &G.dpool_q8q8, &G.dset_q8q8, 1)) {
+        if (!build_pipeline_unified(G.dev, G.shader_q8q8, &G.pipe_q8q8, &G.dpool_q8q8, G.dset_q8q8_ring, 256)) {
             G.shader_q8q8 = VK_NULL_HANDLE;
         }
-    }
+        }
 
     // F16 pack: reuse elementwise shader + pipeline (op=3), no separate pipeline needed
     G.shader_f16pack = G.shader_elem;
@@ -853,14 +883,20 @@ void picolm_gpu_shutdown(void) {
     if (G.shader) vkDestroyShaderModule(G.dev, G.shader, NULL);
 
     if (G.dset_nrm)  vkFreeDescriptorSets(G.dev, G.dpool_nrm, 1, &G.dset_nrm);
+    for (int _i = 0; _i < 256 && G.dset_nrm_ring[_i]; _i++)
+        vkFreeDescriptorSets(G.dev, G.dpool_nrm_ring, 1, &G.dset_nrm_ring[_i]);
     if (G.dpool_nrm) vkDestroyDescriptorPool(G.dev, G.dpool_nrm, NULL);
+    if (G.dpool_nrm_ring) vkDestroyDescriptorPool(G.dev, G.dpool_nrm_ring, NULL);
     if (G.pipe_nrm)  vkDestroyPipeline(G.dev, G.pipe_nrm, NULL);
     if (G.shader_nrm) vkDestroyShaderModule(G.dev, G.shader_nrm, NULL);
     if (G.buf_pc_nrm) vkDestroyBuffer(G.dev, G.buf_pc_nrm, NULL);
     if (G.mem_pc_nrm) vkFreeMemory(G.dev, G.mem_pc_nrm, NULL);
 
     if (G.dset_elem)  vkFreeDescriptorSets(G.dev, G.dpool_elem, 1, &G.dset_elem);
+    for (int _i = 0; _i < 256 && G.dset_elem_ring[_i]; _i++)
+        vkFreeDescriptorSets(G.dev, G.dpool_elem_ring, 1, &G.dset_elem_ring[_i]);
     if (G.dpool_elem) vkDestroyDescriptorPool(G.dev, G.dpool_elem, NULL);
+    if (G.dpool_elem_ring) vkDestroyDescriptorPool(G.dev, G.dpool_elem_ring, NULL);
     if (G.pipe_elem)  vkDestroyPipeline(G.dev, G.pipe_elem, NULL);
     if (G.shader_elem) vkDestroyShaderModule(G.dev, G.shader_elem, NULL);
 
@@ -874,13 +910,20 @@ void picolm_gpu_shutdown(void) {
     if (G.pipe_attn_prefill)  vkDestroyPipeline(G.dev, G.pipe_attn_prefill, NULL);
     if (G.shader_attn_prefill) vkDestroyShaderModule(G.dev, G.shader_attn_prefill, NULL);
 
-    if (G.dset_quantize)  vkFreeDescriptorSets(G.dev, G.dpool_quantize, 1, &G.dset_quantize);
-    if (G.dpool_quantize) vkDestroyDescriptorPool(G.dev, G.dpool_quantize, NULL);
+    if (G.dpool_quantize) {
+        // Free all quantize ring descriptor sets (however many were allocated)
+        for (int _i = 0; _i < 256 && G.dset_quantize_ring[_i]; _i++)
+            vkFreeDescriptorSets(G.dev, G.dpool_quantize, 1, &G.dset_quantize_ring[_i]);
+        vkDestroyDescriptorPool(G.dev, G.dpool_quantize, NULL);
+    }
     if (G.pipe_quantize)  vkDestroyPipeline(G.dev, G.pipe_quantize, NULL);
     if (G.shader_quantize) vkDestroyShaderModule(G.dev, G.shader_quantize, NULL);
 
-    if (G.dset_q8q8)  vkFreeDescriptorSets(G.dev, G.dpool_q8q8, 1, &G.dset_q8q8);
-    if (G.dpool_q8q8) vkDestroyDescriptorPool(G.dev, G.dpool_q8q8, NULL);
+    if (G.dpool_q8q8) {
+        for (int _i = 0; _i < 256 && G.dset_q8q8_ring[_i]; _i++)
+            vkFreeDescriptorSets(G.dev, G.dpool_q8q8, 1, &G.dset_q8q8_ring[_i]);
+        vkDestroyDescriptorPool(G.dev, G.dpool_q8q8, NULL);
+    }
     if (G.pipe_q8q8)  vkDestroyPipeline(G.dev, G.pipe_q8q8, NULL);
     if (G.shader_q8q8) vkDestroyShaderModule(G.dev, G.shader_q8q8, NULL);
 
@@ -1620,6 +1663,13 @@ int picolm_gpu_pipeline_batch_alloc(int dim, int q_dim, int kv_dim,
     G.pipe_q_b_d = wrap_buf(G.pipe_q_b, G.pipe_q_b_m, 0, qb);
     G.pipe_k_b_d = wrap_buf(G.pipe_k_b, G.pipe_k_b_m, 0, kvb);
     G.pipe_v_b_d = wrap_buf(G.pipe_v_b, G.pipe_v_b_m, 0, kvb);
+    // Map pipe buffers for direct CPU readback (works on llvmpipe/RADV where memtype is host-visible)
+    G.pipe_k_b_mapped = NULL; G.pipe_v_b_mapped = NULL;
+    VkResult mr;
+    mr = vkMapMemory(G.dev, G.pipe_k_b_m, 0, kvb, 0, &G.pipe_k_b_mapped);
+    if (mr != VK_SUCCESS) G.pipe_k_b_mapped = NULL;
+    mr = vkMapMemory(G.dev, G.pipe_v_b_m, 0, kvb, 0, &G.pipe_v_b_mapped);
+    if (mr != VK_SUCCESS) G.pipe_v_b_mapped = NULL;
     G.pipe_attn_out_b_d = wrap_buf(G.pipe_attn_out_b, G.pipe_attn_out_b_m, 0, qb);
     G.pipe_ffn_norm_b_d = wrap_buf(G.pipe_ffn_norm_b, G.pipe_ffn_norm_b_m, 0, xb);
     G.pipe_gate_b_d = wrap_buf(G.pipe_gate_b, G.pipe_gate_b_m, 0, fb);
@@ -1763,16 +1813,18 @@ static int _quantize_dev(const float *x_dev, int I, int S) {
         desc_buf_info(G.q8_xq_d),
         desc_buf_info(G.q8_xd_d)
     };
-    wr_desc(G.dset_quantize, 3, bi);
+    VkDescriptorSet quant_set = G.dset_quantize_ring[G.dset_idx % 256];
+    G.dset_idx++;
+    wr_desc(quant_set, 3, bi);
     typedef struct { int I, S, pad; } PC_Q;
     PC_Q pc = {I, S, 0};
     vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_quantize);
     vkCmdBindDescriptorSets(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            G.plyt_unified, 0, 1, &G.dset_quantize, 0, NULL);
+                            G.plyt_unified, 0, 1, &quant_set, 0, NULL);
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd_dev, (uint32_t)n_blocks, (uint32_t)S, 1);
-    
+
     return 1;
 }
 
@@ -1781,22 +1833,30 @@ static int _q8q8_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, int S) {
     if (!G.shader_q8q8) return 0;
     int n_blocks = t->I / 32;
     if (n_blocks < 1 || t->I % 32 != 0) return 0;
-
+    uint32_t total = (uint32_t)t->O * (uint32_t)S;
     VkDescriptorBufferInfo bi[4] = {
         desc_buf_info(G.q8_xq_d),   // xq (uint32-packed int8)
         desc_buf_info(G.q8_xd_d),   // xd (float deltas)
         {t->wbuf, 0, VK_WHOLE_SIZE}, // weights
         desc_buf_info(y_dev)        // output
     };
-    wr_desc(G.dset_q8q8, 4, bi);
+    VkDescriptorSet q8q8_set = G.dset_q8q8_ring[G.dset_idx % 256];
+    G.dset_idx++;
+    wr_desc(q8q8_set, 4, bi);
     typedef struct { int I, S, O, rowWords; } PC_Q8;
     PC_Q8 pc = {t->I, S, t->O, (int)t->row_words};
+    // Memory barrier: quantize writes to q8_xq/q8_xd, q8q8 reads them
+    VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+    vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_q8q8);
     vkCmdBindDescriptorSets(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            G.plyt_unified, 0, 1, &G.dset_q8q8, 0, NULL);
+                            G.plyt_unified, 0, 1, &q8q8_set, 0, NULL);
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(pc), &pc);
-    vkCmdDispatch(G.cmd_dev, (uint32_t)t->O, (uint32_t)S, 1);
+    vkCmdDispatch(G.cmd_dev, (total + 255u) / 256u, 1, 1);
     return 1;
 }
 
@@ -1816,7 +1876,7 @@ int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_d
 
     int ok = 0;  // Assume fallback needed
     // Q8_0 path: quantize F32->Q8 on device, then Q8xQ8 matmul
-    if (0 && t->qtype == GGUF_TYPE_Q8_0 && G.shader_quantize && G.shader_q8q8) {
+    if (1 && t->qtype == GGUF_TYPE_Q8_0 && G.shader_quantize && G.shader_q8q8) {
         if (_quantize_dev(x_dev, t->I, S)) {
             // Memory barrier: quantize wrote to q8_xq/q8_xd, q8q8 reads from them
             VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -1896,7 +1956,9 @@ int picolm_gpu_rmsnorm_batched_dev(float *out, const float *x, const float *weig
                 (void*)bi[0].buffer, (void*)bi[1].buffer, (void*)bi[2].buffer, (void*)weight, (void*)x, (void*)out); 
         return 0; 
     }
-    wr_desc(G.dset_nrm, 3, bi);
+    VkDescriptorSet nrm_set = G.dset_nrm_ring[G.dset_idx % 256];
+    G.dset_idx++;
+    wr_desc(nrm_set, 3, bi);
     VK_BATCH_DISPATCH_PRE();
     VK_BATCH_BARRIER();
     vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_nrm);
@@ -1917,6 +1979,10 @@ int picolm_gpu_rmsnorm_batched_dev(float *out, const float *x, const float *weig
     // Write params via H2D transfer through staging buffer
     float params[4] = { (float)S, (float)dim, eps, (float)xs };
     memcpy(G.staging_ptr, params, sizeof(params));
+    /* Ensure CPU write is visible before GPU reads from staging */
+    VkMappedMemoryRange flush = {.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+        .memory = G.staging_mem, .offset = 0, .size = sizeof(params)};
+    vkFlushMappedMemoryRanges(G.dev, 1, &flush);
     VkDescriptorBufferInfo bi_dev[4] = {
         desc_buf_info(x), desc_buf_info(weight), desc_buf_info(out),
         {G.buf_pc_nrm, 0, 64}
@@ -1928,10 +1994,10 @@ int picolm_gpu_rmsnorm_batched_dev(float *out, const float *x, const float *weig
         .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
     vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb_pc, 0, NULL, 0, NULL);
-    // RMSNorm: use G.plyt_unified (matmul layout) for push constants, G.dset_nrm for descriptors
+    // RMSNorm: use ring buffer descriptor set (avoids aliasing in batched prefill)
     VkDescriptorBufferInfo rn_bi[3] = {desc_buf_info(x), desc_buf_info(weight), desc_buf_info(out)};
-    wr_desc(G.dset_nrm, 3, rn_bi);
-    vkCmdBindDescriptorSets(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_unified, 0, 1, &G.dset_nrm, 0, NULL);
+    wr_desc(nrm_set, 3, rn_bi);
+    vkCmdBindDescriptorSets(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_unified, 0, 1, &nrm_set, 0, NULL);
     // Push constants via PC_Matmul format: fmt=0, S, I=dim, O=eps(bitcast), rowWords=xs
     PC_Matmul pc_nrm = {0, S, dim, 0, xs};
     memcpy(&pc_nrm.O, &eps, sizeof(float));
@@ -1949,11 +2015,13 @@ int picolm_gpu_residual_add(float *out, const float *a, const float *b,
     (void)0;  /* debug prints removed */
     VkDescriptorBufferInfo bi[4] = {desc_buf_info(a), desc_buf_info(b), desc_buf_info(out), {VK_NULL_HANDLE,0,0}};
     if (!bi[0].buffer || !bi[1].buffer || !bi[2].buffer) { fprintf(stderr, "[RN_DESC] FAIL x_buf=%p w_buf=%p y_buf=%p\n", (void*)bi[0].buffer, (void*)bi[1].buffer, (void*)bi[2].buffer); return 0; }
-    wr_desc(G.dset_elem, 4, bi);
+    VkDescriptorSet elem_set = G.dset_elem_ring[G.dset_idx % 256];
+    G.dset_idx++;
+    wr_desc(elem_set, 4, bi);
     VK_BATCH_DISPATCH_PRE();
     VK_BATCH_BARRIER();
     vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_elem);
-    vkCmdBindDescriptorSets(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_unified, 0, 1, &G.dset_elem, 0, NULL);
+    vkCmdBindDescriptorSets(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_unified, 0, 1, &elem_set, 0, NULL);
     int total = n * dim;
     PC_Elem pc = {0, total, 0.0f, 0};
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
@@ -1967,11 +2035,13 @@ int picolm_gpu_silu_mul_dev(float *g, const float *u, size_t n, int device) {
     VkDescriptorBufferInfo gbi = desc_buf_info(g), ubi = desc_buf_info(u);
     if (!gbi.buffer || !ubi.buffer) return 0;
     VkDescriptorBufferInfo bi[4] = {gbi, ubi, gbi, {VK_NULL_HANDLE,0,0}};
-    wr_desc(G.dset_elem, 4, bi);
+    VkDescriptorSet elem_set = G.dset_elem_ring[G.dset_idx % 256];
+    G.dset_idx++;
+    wr_desc(elem_set, 4, bi);
     VK_BATCH_DISPATCH_PRE();
     VK_BATCH_BARRIER();
     vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_elem);
-    vkCmdBindDescriptorSets(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_unified, 0, 1, &G.dset_elem, 0, NULL);
+    vkCmdBindDescriptorSets(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_unified, 0, 1, &elem_set, 0, NULL);
     PC_Elem pc = {1, (int)n, 0.0f, 0};
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd_dev, (uint32_t)((n + 255) / 256), 1, 1);
@@ -1985,11 +2055,13 @@ int picolm_gpu_gelu_mul_dev(float *g, const float *u, size_t n, int device) {
     VkDescriptorBufferInfo gbi = desc_buf_info(g), ubi = desc_buf_info(u);
     if (!gbi.buffer || !ubi.buffer) return 0;
     VkDescriptorBufferInfo bi[4] = {gbi, ubi, gbi, {VK_NULL_HANDLE,0,0}};
-    wr_desc(G.dset_elem, 4, bi);
+    VkDescriptorSet elem_set = G.dset_elem_ring[G.dset_idx % 256];
+    G.dset_idx++;
+    wr_desc(elem_set, 4, bi);
     VK_BATCH_DISPATCH_PRE();
     VK_BATCH_BARRIER();
     vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_elem);
-    vkCmdBindDescriptorSets(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_unified, 0, 1, &G.dset_elem, 0, NULL);
+    vkCmdBindDescriptorSets(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_unified, 0, 1, &elem_set, 0, NULL);
     PC_Elem pc = {5, (int)n, 0.0f, 0};
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd_dev, (uint32_t)((n + 255) / 256), 1, 1);
@@ -2010,10 +2082,12 @@ int picolm_gpu_rope_apply(float *x, int n_heads, int head_dim,
     VkBuffer cb = unwrap_buf_offset(cos_tbl, &cos_off), sb = unwrap_buf_offset(sin_tbl, &sin_off);
     if (!xb || !cb || !sb) return 0;
     VkDescriptorBufferInfo bi[4] = {{xb,0,VK_WHOLE_SIZE},{cb,cos_off,VK_WHOLE_SIZE},{sb,sin_off,VK_WHOLE_SIZE},{VK_NULL_HANDLE,0,0}};
-    wr_desc(G.dset_elem, 4, bi);
+    VkDescriptorSet elem_set = G.dset_elem_ring[G.dset_idx % 256];
+    G.dset_idx++;
+    wr_desc(elem_set, 4, bi);
     VK_BATCH_DISPATCH_PRE();
     vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_elem);
-    vkCmdBindDescriptorSets(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_unified, 0, 1, &G.dset_elem, 0, NULL);
+    vkCmdBindDescriptorSets(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_unified, 0, 1, &elem_set, 0, NULL);
     PC_Elem pc = {2, half_dim, (float)n_heads, rope_type};
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd_dev, (uint32_t)((half_dim + 255) / 256), 1, 1);
@@ -2063,11 +2137,13 @@ int picolm_gpu_rope_apply_batched(float *x, int n_heads, int head_dim,
             {cb, cos_off, (size_t)half_dim * sizeof(float)},
             {sb, sin_off, (size_t)half_dim * sizeof(float)},
         };
-        wr_desc(G.dset_elem, 3, bi);
+        VkDescriptorSet elem_set = G.dset_elem_ring[G.dset_idx % 256];
+        G.dset_idx++;
+        wr_desc(elem_set, 3, bi);
 
         vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_elem);
         vkCmdBindDescriptorSets(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                G.plyt_unified, 0, 1, &G.dset_elem, 0, NULL);
+                                G.plyt_unified, 0, 1, &elem_set, 0, NULL);
         typedef struct { int op, n; float fp; int pad; } PC_Elem;
         PC_Elem pc = {2, half_dim, (float)n_heads, rope_type};
         vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
@@ -2209,28 +2285,39 @@ int picolm_gpu_kv_store_dev_batched(int is_k, int lo, int sp, int np,
     size_t total_f32 = (size_t)np * kv_dim;
     size_t total_f16 = total_f32 * sizeof(uint16_t);
 
-    // CPU-side F32->F16 conversion, then H2D via staging (reliable path)
-    // (GPU elementwise f16pack shader was producing -inf for K cache on RADV)
+    /* Flush batch if active so GPU compute completes before we read pipe buffer */
+    int was_in_batch = G.in_batch;
+    if (G.in_batch) picolm_gpu_batch_end(device);
+    picolm_gpu_sync(device);
+    /* On llvmpipe, fences may not fully synchronize. Force device idle. */
+    vkDeviceWaitIdle(G.dev);
+
+    // Fallback: always use D2H via staging buffer (most reliable)
     float *f32_host = malloc(total_f32 * sizeof(float));
     if (!f32_host) return 0;
 
-    /* This function does synchronous D2H+CPU+H2D. If we're inside a batch,
-     * we must flush the batch first so fence_dev is signaled. */
-    int was_in_batch = G.in_batch;
-    if (G.in_batch) picolm_gpu_batch_end(device);
-
-    // D2H: read F32 from device to host
     {
         VkDeviceSize src_off = 0;
         VkBuffer src_buf = unwrap_buf_offset(sd, &src_off);
         if (!src_buf) { free(f32_host); return 0; }
         if (!staging_ensure(total_f32 * sizeof(float))) { free(f32_host); return 0; }
-        /* Wait for both compute and transfer fences before D2H */
         vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
         vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
         VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         vkResetCommandBuffer(G.cmd_xfer, 0);
         vkBeginCommandBuffer(G.cmd_xfer, &begin);
+        VkBufferMemoryBarrier bm = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = src_buf,
+            .offset = src_off,
+            .size = total_f32 * sizeof(float),
+        };
+        vkCmdPipelineBarrier(G.cmd_xfer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 1, &bm, 0, NULL);
         VkBufferCopy bc = {src_off, 0, total_f32 * sizeof(float)};
         vkCmdCopyBuffer(G.cmd_xfer, src_buf, G.staging_buf, 1, &bc);
         vkEndCommandBuffer(G.cmd_xfer);
@@ -2249,11 +2336,11 @@ int picolm_gpu_kv_store_dev_batched(int is_k, int lo, int sp, int np,
     }
 
     // H2D to KV cache
-    // Each position has nkh * hd F16 values. Layer base = lo * msl positions.
     size_t f16_per_pos = (size_t)nkh * hd * sizeof(uint16_t);
     size_t dst_off = (size_t)lo * msl * f16_per_pos + (size_t)sp * f16_per_pos;
     memcpy(G.staging_ptr, f16_host, total_f16);
-    free(f16_host); free(f32_host);
+    free(f16_host);
+    free(f32_host);
 
 
     vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
@@ -2286,6 +2373,7 @@ int picolm_gpu_kv_store_dev_batched_strided(int is_k, int lo, int sp, int np,
     /* This function does synchronous D2H+CPU+H2D. Flush batch if active. */
     int was_in_batch = G.in_batch;
     if (G.in_batch) picolm_gpu_batch_end(device);
+    picolm_gpu_sync(device);  // Same RADV/llvmpipe fence sync fix
 
     /* D2H copy from device, then F32->F16 + strided reorder, then H2D */
     int kv_dim = nkh * hd;
@@ -2391,6 +2479,8 @@ void picolm_gpu_kv_cache_clear(int device) {
     if (G.ready) {
         if (G.kv_k_mapped) { vkUnmapMemory(G.dev, G.kv_k_mem); G.kv_k_mapped = NULL; }
         if (G.kv_v_mapped) { vkUnmapMemory(G.dev, G.kv_v_mem); G.kv_v_mapped = NULL; }
+        if (G.pipe_k_b_mapped) { vkUnmapMemory(G.dev, G.pipe_k_b_m); G.pipe_k_b_mapped = NULL; }
+        if (G.pipe_v_b_mapped) { vkUnmapMemory(G.dev, G.pipe_v_b_m); G.pipe_v_b_mapped = NULL; }
         if (G.kv_k_d) { free(G.kv_k_d); G.kv_k_d = NULL; }
         if (G.kv_v_d) { free(G.kv_v_d); G.kv_v_d = NULL; }
         if (G.kv_k_mem) { vkFreeMemory(G.dev, G.kv_k_mem, NULL); G.kv_k_mem = VK_NULL_HANDLE; }

@@ -33,6 +33,7 @@ float f16tof32(uint h) {
 }
 
 void main() {
+    // Dispatch is [ceil(O*S/256), 1, 1] workgroups with local_size_x=256
     uint gid = gl_GlobalInvocationID.x;
     uint total = uint(p.S) * uint(p.O);
     if (gid >= total) return;

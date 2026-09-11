@@ -27,6 +27,7 @@ layout(push_constant) uniform P {
 
 shared float amax_sh[32];
 shared uint qs_sh[8];
+shared uint qs_raw[32];  // per-thread raw bytes before packing
 
 void main() {
     uint s   = gl_WorkGroupID.y;
@@ -62,14 +63,16 @@ void main() {
     qi = clamp(qi, -128, 127);
 
     // Step 3: Pack int8 into shared uint32 words
-    // Initialize shared words to 0 first, then pack
-    qs_sh[tid / 4u] = uint(qi & 0xffu) << ((tid % 4u) * 8u);
+    // Each thread writes to its own per-thread slot first
+    qs_raw[tid] = uint(qi & 0xffu);
     memoryBarrierShared();
     barrier();
 
-    // Combine 4 words into 1 uint32 using add (no |= race)
+    // Threads 0,4,8,...,28 combine 4 consecutive bytes into one uint32 word
     if (tid % 4u == 0u) {
-        qs_sh[tid / 4u] = qs_sh[tid / 4u] + qs_sh[tid / 4u + 1u] + qs_sh[tid / 4u + 2u] + qs_sh[tid / 4u + 3u];
+        uint widx = tid / 4u;
+        qs_sh[widx] = qs_raw[tid] | (qs_raw[tid + 1u] << 8u) |
+                       (qs_raw[tid + 2u] << 16u) | (qs_raw[tid + 3u] << 24u);
         memoryBarrierShared();
         barrier();
     }

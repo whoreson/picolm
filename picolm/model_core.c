@@ -3919,6 +3919,12 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #endif
           matmul_batch(xb2_batch, attn_out_batch ? attn_out_batch : xb_batch, n_tokens, lw->attn_output, q_dim, dim, lw->type_attn_output);
           if (attn_out_batch) free(attn_out_batch);
+          if (getenv("PICOLM_ATTN_DBG") && start_pos == 0 && l == 0 && n_tokens == 1) {
+              fprintf(stderr,"[CPU l=0 OUTP] xb2[:8]={%.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f}\n",
+                  xb2_batch[0],xb2_batch[1],xb2_batch[2],xb2_batch[3],
+                  xb2_batch[4],xb2_batch[5],xb2_batch[6],xb2_batch[7]);
+              fflush(stderr);
+          }
           if (_SSM_DBG && l == 3) {
               int lt = n_tokens - 1;
               fprintf(stderr, "[DBG CPU outproj l=%d] last[:4]={%.6f,%.6f,%.6f,%.6f}\n", l, xb2_batch[lt*dim], xb2_batch[lt*dim+1], xb2_batch[lt*dim+2], xb2_batch[lt*dim+3]);
