@@ -1559,12 +1559,6 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                             m->gpu.output_norm_dev = picolm_gpu_upload_f32(s->output_norm_w, c->n_embd, device);
                             /* Per-layer norm weights (only for GPU layers) */
                             for (int l = 0; l < ngl; l++) {
-                                if (l == 0) {
-                                    fprintf(stderr, "[CPU_ATTN_NORM] s->attn_norm_w[0][:4]={%f %f %f %f}\n",
-                                        s->attn_norm_w[0][0], s->attn_norm_w[0][1], s->attn_norm_w[0][2], s->attn_norm_w[0][3]);
-                                    fprintf(stderr, "[CPU_POST_NORM] s->post_attn_norm_w[0][:4]={%f %f %f %f}\n",
-                                        s->post_attn_norm_w[0][0], s->post_attn_norm_w[0][1], s->post_attn_norm_w[0][2], s->post_attn_norm_w[0][3]);
-                                }
                                 m->gpu.attn_norm_dev[l] =
                                     picolm_gpu_upload_f32(s->attn_norm_w[l], c->n_embd, device);
                                 m->gpu.post_attn_norm_dev[l] =
@@ -3850,10 +3844,8 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
             }
         }
         /* Per-layer RMS tracking (CPU) */
-        if ((l % 5 == 0 || l >= c->n_layers - 3) && n_tokens == 1) {
-            double r=0; for(int _i=0;_i<dim;_i++){float a=x_batch[_i];r+=a*a;}
-            fprintf(stderr,"[CPU_LRM l=%d] rms=%.6f x[:3]={%.6f %.6f %.6f}\n",l,sqrtf(r/dim),x_batch[0],x_batch[1],x_batch[2]);
-        }
+        /* Per-layer RMS tracking (debug only, disabled) */
+        /* if ((l % 5 == 0 || l >= c->n_layers - 3) && n_tokens == 1) { ... } */
 #ifdef PICOLM_VIZ
         viz_push_layer(l, x_batch + (n_tokens - 1) * dim, dim);
 #endif

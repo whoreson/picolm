@@ -4404,7 +4404,6 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
         tensor_set_gpu_tensor(NULL, 0);
     }
 
-    fprintf(stderr, "[GPU_FWD_RETURN] logits=%p\n", (void*)s->logits);
     return s->logits;
 }
 
