@@ -1960,11 +1960,6 @@ static float *model_forward_gpt2(model_t *m, int token, int pos) {
         tensor_parallel_for(n_heads, attention_group, &gctx);
 
         /* Debug: dump CPU attention output at pos=1, layer 0 */
-        if (getenv("PICOLM_ATTN_DBG") && pos == 1) {
-            fprintf(stderr, "[CPU_ATN l=%d] attn_out[:8]={", l);
-            for(int _i=0;_i<8;_i++) fprintf(stderr,"%.6f ",s->xb[_i]);
-            fprintf(stderr, "}\n"); fflush(stderr);
-        }
 
         /* Output projection */
         tensor_set_repacked(m->repack_used[ri+3] ? m->repack_buffers[ri+3] : NULL);
@@ -2026,8 +2021,6 @@ static float *model_forward_gpt2(model_t *m, int token, int pos);
 static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt);
 
 float *model_forward(model_t *m, int token, int pos) {
-    if (getenv("PICOLM_ATTN_DBG") && pos >= 1 && pos <= 5)
-        fprintf(stderr, "[CPU_FWD_ENTRY] pos=%d token=%d\n", pos, token); fflush(stderr);
     /* Bounds check: pos must be within KV cache allocation */
     if (pos >= m->config.max_seq_len) {
         fprintf(stderr, "WARN: model_forward pos=%d >= max_seq_len=%d, returning last logits\n",
@@ -2197,28 +2190,10 @@ float *model_forward(model_t *m, int token, int pos) {
         }
         /* ---- Attention ---- */
         /* Debug: dump pipe_x input to RMSNorm for layer 0 at pos=0,1 */
-        if (getenv("PICOLM_ATTN_DBG") && pos <= 1 && l == 0) {
-            fprintf(stderr, "[CPU_DEC_PX l=0] pos=%d s->x[:8]={", pos);
-            for(int _i=0;_i<8;_i++) fprintf(stderr,"%.6f ",s->x[_i]);
-            fprintf(stderr, "}\n"); fflush(stderr);
-        }
         rmsnorm(s->xb, s->x, s->attn_norm_w[l], dim, c->rms_norm_eps);
         /* Debug: dump RMSNorm output for layer 0 at pos=1 */
-        if (getenv("PICOLM_ATTN_DBG") && pos == 1 && l == 0) {
-            fprintf(stderr, "[CPU_DEC_RN l=0] pos=1 rmsnorm[:8]={");
-            for(int _i=0;_i<8;_i++) fprintf(stderr,"%.6f ",s->xb[_i]);
-            fprintf(stderr, "}\n"); fflush(stderr);
-        }
 
         /* DEBUG: dump first 4 weight values of Q projection for layer 0 */
-        if (getenv("PICOLM_ATTN_DBG") && l == 0 && pos == 0 && !m->_wdbg_done) {
-            m->_wdbg_done = 1;
-            const uint16_t *wraw = (const uint16_t *)lw->attn_q;
-            fprintf(stderr, "[CPU_WDBG] F16 Q layer0 first 4 weights: 0x%04x 0x%04x 0x%04x 0x%04x = ",
-                    wraw[0], wraw[1], wraw[2], wraw[3]);
-            for(int _i=0;_i<4;_i++) fprintf(stderr,"%.6f ",fp16_to_fp32_lookup(wraw[_i]));
-            fprintf(stderr, "\n"); fflush(stderr);
-        }
 
         /* Q projection (Q+gate joint for Qwen3.5 full attention) */
         tensor_set_repacked(m->repack_used[ri] ? m->repack_buffers[ri] : NULL);
@@ -2256,13 +2231,6 @@ float *model_forward(model_t *m, int token, int pos) {
         float *k_tmp = s->xb2; /* reuse xb2 as temp for K (kv_dim <= dim) */
         matmul(k_tmp, s->xb, lw->attn_k, dim, kv_dim, lw->type_attn_k);
         tensor_set_repacked(NULL);
-        if (getenv("PICOLM_ATTN_DBG") && l == 0) {
-            float krms = 0;
-            for (int _i = 0; _i < kv_dim; _i++) krms += k_tmp[_i] * k_tmp[_i];
-            fprintf(stderr, "[CPU_ATN_DBG l=%d] k_tmp_tok0[:4]={", l);
-            for (int _i = 0; _i < 4; _i++) fprintf(stderr, "%.6f ", k_tmp[_i]);
-            fprintf(stderr, "} krms=%.6f ", sqrtf(krms / kv_dim));
-        }
 
         int this_attn_ordinal = attn_ordinal++;
         /* GQA layout: kcache_layer points to this layer's K cache [seq_len][kv_row_size_gqa] */
@@ -2291,12 +2259,6 @@ float *model_forward(model_t *m, int token, int pos) {
         }
 
         /* Debug: dump K from KV cache during decode at pos=3 (first decode step) */
-        if (getenv("PICOLM_ATTN_DBG") && l == 0 && pos == 3) {
-            uint16_t *kcache_f16 = (uint16_t*)kcache_layer;
-            fprintf(stderr, "[CPU_DEC_KCACHE l=0 pos=3] cached_K_tok0[:8]={");
-            for (int _i = 0; _i < 8; _i++) fprintf(stderr, "%.4f ", fp16_to_fp32_lookup(kcache_f16[_i]));
-            fprintf(stderr, "}\n"); fflush(stderr);
-        }
 
         /* Apply RoPE to Q and K */
         int rope_half = rope_dim / 2;
@@ -2369,14 +2331,6 @@ float *model_forward(model_t *m, int token, int pos) {
         float *v_tmp = s->xb2;
         matmul(v_tmp, s->xb, lw->attn_v, dim, kv_dim, lw->type_attn_v);
         tensor_set_repacked(NULL);
-        if (getenv("PICOLM_ATTN_DBG") && l == 0) {
-            float vrms = 0;
-            for (int _i = 0; _i < kv_dim; _i++) vrms += v_tmp[_i] * v_tmp[_i];
-            fprintf(stderr, "[CPU_ATN_DBG l=%d] v_tmp_tok0[:4]={", l);
-            for (int _i = 0; _i < 4; _i++) fprintf(stderr, "%.6f ", v_tmp[_i]);
-            fprintf(stderr, "} vrms=%.6f\n", sqrtf(vrms / kv_dim));
-            fflush(stderr);
-        }
         /* Store V: GQA row quantization */
         {
             uint8_t *val_pos = vcache_layer + (size_t)pos * s->kv_row_size_v;
@@ -2498,11 +2452,6 @@ float *model_forward(model_t *m, int token, int pos) {
             tensor_parallel_for(c->n_kv_heads, attention_group, &gctx);
         }
         /* Debug: dump CPU decode attention output at pos=1, layer 0 */
-        if (getenv("PICOLM_ATTN_DBG") && pos == 1 && attn_ordinal == 1) {
-            fprintf(stderr, "[CPU_DEC_ATN l=0] attn_out[:8]={");
-            for(int _i=0;_i<8;_i++) fprintf(stderr,"%.6f ",s->xb[_i]);
-            fprintf(stderr, "}\n"); fflush(stderr);
-        }
 
 #ifdef PICOLM_GPU
         /* PICOLM_DBG_ATTN: compare GPU vs CPU attention output */
@@ -2613,11 +2562,6 @@ ffn_done:
             vec_add(s->x, s->xb, dim);
         }
         /* Debug: dump hidden state after each of first 3 layers at pos=1 */
-        if (getenv("PICOLM_ATTN_DBG") && pos == 1 && l < 3) {
-            fprintf(stderr, "[CPU_DEC_L%d] pos=1 hidden[:8]={", l);
-            for(int _i=0;_i<8;_i++) fprintf(stderr,"%.6f ",s->x[_i]);
-            fprintf(stderr, "}\n"); fflush(stderr);
-        }
 #ifdef PICOLM_VIZ
         viz_push_layer(l, s->x, dim);
 #endif
@@ -2633,28 +2577,10 @@ ffn_done:
     if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)m->gpu.output, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
 #endif
     /* Debug: dump CPU decode hidden state at pos=1 */
-    if (getenv("PICOLM_ATTN_DBG") && pos == 1) {
-        fprintf(stderr, "[CPU_DEC_HIDDEN] pos=%d hidden[:8]={", pos);
-        for(int _i=0;_i<8;_i++) fprintf(stderr,"%.6f ",s->x[_i]);
-        fprintf(stderr, "}\n"); fflush(stderr);
-    }
     matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
     tensor_set_repacked(NULL);
 
     /* Debug: dump top-5 logits at first decode step */
-    if (getenv("PICOLM_ATTN_DBG") && pos >= 3 && pos <= 4) {
-        int top_t[5]; float top_v[5];
-        for(int t=0;t<5;t++){top_t[t]=-1;top_v[t]=-1e30f;}
-        for(int v=0;v<c->vocab_size;v++){
-            float val=s->logits[v];
-            if(val<=top_v[4]) continue;
-            int ip=4;while(ip>0&&val>top_v[ip-1]){top_v[ip]=top_v[ip-1];top_t[ip]=top_t[ip-1];ip--;}
-            top_v[ip]=val;top_t[ip]=v;
-        }
-        fprintf(stderr,"[CPU_DEC_LOGITS pos=%d] top5=",pos);
-        for(int t=0;t<5;t++)fprintf(stderr,"(%d:%.1f) ",top_t[t],top_v[t]);
-        fprintf(stderr,"\n");fflush(stderr);
-    }
 
     return s->logits;
 }
@@ -3308,14 +3234,6 @@ static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_to
         matmul_batch(xb_batch, hb_batch, n_tokens, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
         tensor_set_repacked(NULL);
         /* Debug: dump CPU FFN down output for layer 0 */
-        if (l == 0 && getenv("PICOLM_ATTN_DBG") && n_tokens > 0) {
-            float *xb_last = xb_batch + (n_tokens-1) * dim;
-            fprintf(stderr, "[CPU_FFN_DOWN l=0] last_tok[:8]={");
-            for(int _i=0;_i<8;_i++) fprintf(stderr, "%.6f ", xb_last[_i]);
-            double rfd=0; for(int _i=0;_i<8;_i++){float a=xb_last[_i];rfd+=a*a;}
-            fprintf(stderr, "} rms8=%.6f\n", sqrt((double)rfd/8));
-            fflush(stderr);
-        }
         /* Add bias */
         if (lw->ffn_down_bias) {
             const float *bias = (const float *)lw->ffn_down_bias;
@@ -3545,14 +3463,6 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
             /* Push the last token in the batch for visualization */
             viz_push_layer(l, x_batch + (n_tokens - 1) * dim, dim);
 #endif
-            if (getenv("PICOLM_ATTN_DBG")) {
-                int lt = n_tokens - 1;
-                double r=0;for(int _i=0;_i<8;_i++){float a=x_batch[lt*dim+_i];r+=a*a;}
-                fprintf(stderr, "[ATN_DBG l=%d S] last_tok[:4]={", l);
-                for(int _i=0;_i<4;_i++) fprintf(stderr,"%.6f ",x_batch[lt*dim+_i]);
-                fprintf(stderr, "} rms8=%.6f\n", sqrtf(r/8));
-                fflush(stderr);
-            }
             BENCH_LAYER_END(l, 1);
             continue;
         }
@@ -3562,20 +3472,8 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
             rmsnorm(xb_batch + bi * dim, x_batch + bi * dim, s->attn_norm_w[l], dim, c->rms_norm_eps);
 
         /* Diagnostic: dump pre-RMSNorm input to first attention layer */
-        if (getenv("PICOLM_ATTN_DBG") && lw->is_attn_layer && l == 0) {
-            int lt = n_tokens - 1;
-            fprintf(stderr, "[ATN_DBG l=%d C_IN] last_tok[:8]={", l);
-            for(int _i=0;_i<8;_i++) fprintf(stderr,"%.6f ",x_batch[lt*dim+_i]);
-            fprintf(stderr, "}\n"); fflush(stderr);
-        }
 
         /* Diagnostic: dump RMSNorm'd input to first attention layer */
-        if (getenv("PICOLM_ATTN_DBG") && lw->is_attn_layer) {
-            int lt = n_tokens - 1;
-            fprintf(stderr, "[ATN_DBG l=%d C_RN] last_tok[:8]={", l);
-            for(int _i=0;_i<8;_i++) fprintf(stderr,"%.6f ",xb_batch[lt*dim+_i]);
-            fprintf(stderr, "}\n"); fflush(stderr);
-        }
 
         /* Q projection (batched) */
         tensor_set_repacked(m->repack_used[2+l*9] ? m->repack_buffers[2+l*9] : NULL);
@@ -3584,14 +3482,6 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #endif
         { int this_q_dim = (c->has_ssm && lw->is_attn_layer) ? q_full_dim : q_dim;
           matmul_batch(q_batch, xb_batch, n_tokens, lw->attn_q, dim, this_q_dim, lw->type_attn_q);
-                    if(getenv("PICOLM_ATTN_DBG") && l == 0 && lw->is_attn_layer) {
-              int lt = n_tokens - 1;
-              fprintf(stderr, "[ATN_DBG l=%d CPU_Q] first_tok[:4]={", l);
-              for(int _i=0;_i<4;_i++) fprintf(stderr,"%.6f ", q_batch[_i]);
-              fprintf(stderr, "} last_tok[:4]={");
-              for(int _i=0;_i<4;_i++) fprintf(stderr,"%.6f ", q_batch[lt*q_dim+_i]);
-              fprintf(stderr, "}\n"); fflush(stderr);
-          }
           if(_SSM_DBG && l==3){
               int lt=n_tokens-1; double qr=0;for(int _i=0;_i<q_dim;_i++)qr+=q_batch[lt*q_full_dim+_i]*q_batch[lt*q_full_dim+_i];
               fprintf(stderr,"[DBG CPU attn_Q l=%d] last_token_rms=%.6f\n",l,sqrt(qr/q_dim));}
@@ -3599,12 +3489,6 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         /* NGL debug: dump Q projection output for first 3 GPU layers */
         {
             const char *ngl_env = getenv("PICOLM_NGL");
-            if (ngl_env && getenv("PICOLM_ATTN_DBG") && l < atoi(ngl_env) && lw->is_attn_layer) {
-                int lt = n_tokens - 1;
-                fprintf(stderr, "[ATN_DBG l=%d Q_OUT] last_tok[:4]={", l);
-                for(int _i=0;_i<4;_i++) fprintf(stderr,"%.6f ", q_batch[lt*q_dim+_i]);
-                fprintf(stderr, "}\n");
-            }
         }
         tensor_set_repacked(NULL);
 
@@ -3633,13 +3517,6 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         matmul_dual_batch(k_batch, v_batch, xb_batch, n_tokens,
                           lw->attn_k, lw->attn_v, dim, kv_dim,
                           lw->type_attn_k, lw->type_attn_v);
-        if(getenv("PICOLM_ATTN_DBG") && l == 0 && lw->is_attn_layer) {
-            fprintf(stderr, "[ATN_DBG l=%d CPU_K] first_tok[:4]={", l);
-            for(int _i=0;_i<4;_i++) fprintf(stderr,"%.6f ", k_batch[_i]);
-            fprintf(stderr, "} CPU_V[:4]={");
-            for(int _i=0;_i<4;_i++) fprintf(stderr,"%.6f ", v_batch[_i]);
-            fprintf(stderr, "}\n"); fflush(stderr);
-        }
         tensor_set_repacked(NULL);
 
         /* Per-position: RoPE, KV store */
@@ -3918,12 +3795,6 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #endif
           matmul_batch(xb2_batch, attn_out_batch ? attn_out_batch : xb_batch, n_tokens, lw->attn_output, q_dim, dim, lw->type_attn_output);
           if (attn_out_batch) free(attn_out_batch);
-          if (getenv("PICOLM_ATTN_DBG") && start_pos == 0 && l == 0 && n_tokens == 1) {
-              fprintf(stderr,"[CPU l=0 OUTP] xb2[:8]={%.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f}\n",
-                  xb2_batch[0],xb2_batch[1],xb2_batch[2],xb2_batch[3],
-                  xb2_batch[4],xb2_batch[5],xb2_batch[6],xb2_batch[7]);
-              fflush(stderr);
-          }
           if (_SSM_DBG && l == 3) {
               int lt = n_tokens - 1;
               fprintf(stderr, "[DBG CPU outproj l=%d] last[:4]={%.6f,%.6f,%.6f,%.6f}\n", l, xb2_batch[lt*dim], xb2_batch[lt*dim+1], xb2_batch[lt*dim+2], xb2_batch[lt*dim+3]);
@@ -3972,13 +3843,6 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #endif
             matmul_batch(xb2_batch, hb_batch, n_tokens, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
             tensor_set_repacked(NULL);
-            if(l==0 && getenv("PICOLM_ATTN_DBG")) {
-                float *xb2l = xb2_batch + (n_tokens-1)*dim;
-                double fr=0; for(int _i=0;_i<dim;_i++){float a=xb2l[_i];fr+=a*a;}
-                fprintf(stderr,"[CPU_FFN_DOWN l=0] last_tok[:4]={%.6f %.6f %.6f %.6f} rms=%.6f\n",
-                    xb2l[0],xb2l[1],xb2l[2],xb2l[3],sqrtf(fr/dim));
-                fflush(stderr);
-            }
             /* Residual: x += ffn_out */
             for (bi = 0; bi < n_tokens; bi++) {
                 float *a = x_batch + bi * dim, *b = xb2_batch + bi * dim;
@@ -3993,15 +3857,6 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #ifdef PICOLM_VIZ
         viz_push_layer(l, x_batch + (n_tokens - 1) * dim, dim);
 #endif
-        if (getenv("PICOLM_ATTN_DBG")) {
-            int lt = n_tokens - 1;
-            double r8=0,rf=0;for(int _i=0;_i<dim;_i++){float a=x_batch[lt*dim+_i];rf+=a*a;if(_i<8)r8+=a*a;}
-            char *tag = lw->is_attn_layer ? "A" : "S";
-            fprintf(stderr, "[ATN_DBG l=%d %s] last_tok[:4]={", l, tag);
-            for(int _i=0;_i<4;_i++) fprintf(stderr,"%.6f ",x_batch[lt*dim+_i]);
-            fprintf(stderr, "} rms8=%.6f rms_full=%.6f\n", sqrtf(r8/8), sqrtf(rf/dim));
-            fflush(stderr);
-        }
         if (_SSM_DBG && lw->is_attn_layer) {
             int lt = n_tokens - 1;
             fprintf(stderr, "[DBG CPU attn l=%d] bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n", l, x_batch[lt*dim], x_batch[lt*dim+1], x_batch[lt*dim+2], x_batch[lt*dim+3]);
@@ -4012,15 +3867,9 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
     /* Final norm + output (last token only) */
     float *last_x = x_batch + (n_tokens - 1) * dim;
         rmsnorm(s->x, last_x, s->output_norm_w, dim, c->rms_norm_eps);
-    if (getenv("PICOLM_ATTN_DBG")) {
-        fprintf(stderr, "[PFX_SX_CPU] post_rmsnorm[:8]={");
-        for(int _i=0;_i<8;_i++) fprintf(stderr,"%.6f ",s->x[_i]);
-        fprintf(stderr, "}\n");
-    }
     tensor_set_repacked(m->repack_used[1] ? m->repack_buffers[1] : NULL);
     /* Diagnostic: dump CPU prefill hidden state before output projection */
     { double cr=0; for(int _i=0;_i<dim;_i++){float a=s->x[_i];cr+=a*a;}
-      fprintf(stderr,"[CPU_LAST] x[:32]={");
       for(int _i=0;_i<32;_i++) fprintf(stderr,"%s%.6f",_i?",":"",s->x[_i]);
       fprintf(stderr, "} rms_full=%.6f\n",sqrtf(cr/dim));
       fflush(stderr);
@@ -4037,21 +3886,6 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #endif
 
     /* Diagnostic: dump CPU prefill logits top-5 */
-    if (getenv("PICOLM_PREFILL_LOGITS")) {
-        { int top_t[5]; float top_v[5];
-          for(int t=0;t<5;t++){top_t[t]=-1;top_v[t]=-1e30f;}
-          for(int v=0;v<m->config.vocab_size;v++){
-            float val=s->logits[v];
-            if(val<=top_v[4]) continue;
-            int ip=4;while(ip>0&&val>top_v[ip-1]){top_v[ip]=top_v[ip-1];top_t[ip]=top_t[ip-1];ip--;}
-            top_v[ip]=val;top_t[ip]=v;
-          }
-          fprintf(stderr,"[PFX_LOGITS] CPU: ");
-          for(int t=0;t<5;t++) fprintf(stderr,"%d(%+.4f) ",top_t[t],top_v[t]);
-          fprintf(stderr,"\n");
-          fflush(stderr);
-        }
-    }
     free(buf);
     return s->logits;
 }

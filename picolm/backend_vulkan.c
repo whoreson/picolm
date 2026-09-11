@@ -1860,17 +1860,12 @@ int picolm_gpu_d2h_via_mapped(void *dst, const void *src, size_t bytes, int devi
     void *mapped = NULL;
     VkDeviceMemory mem = VK_NULL_HANDLE;
     if (buf == G.pipe_x_b) { mapped = G.pipe_x_b_mapped; mem = G.pipe_x_b_m; }
-    static int _d2h_dbg = 0;
-    if (!_d2h_dbg++) fprintf(stderr, "[D2H_MAPPED] buf=%p mapped=%p mem=%p off=%zu\n", (void*)buf, mapped, (void*)mem, off);
     if (!mapped || !mem) return 0;
     /* Invalidate for CPU read */
     VkMappedMemoryRange inv = {.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
         .memory = mem, .offset = 0, .size = VK_WHOLE_SIZE};
     vkInvalidateMappedMemoryRanges(G.dev, 1, &inv);
     memcpy(dst, (const char*)mapped + off, bytes);
-    { float rms=0; for(int _i=0;_i<bytes/sizeof(float);_i++) rms+=((float*)dst)[_i]*((float*)dst)[_i];
-      rms=sqrtf(rms/(bytes/sizeof(float)));
-      fprintf(stderr, "[D2H_MAPPED] dst_rms=%.4f\n", rms); fflush(stderr); }
     return 1;
 }
 float *picolm_gpu_pipe_ffn_norm_b(int d) { return (d==0&&G.pipe_b_ready)?(float*)G.pipe_ffn_norm_b_d:NULL; }
@@ -2409,7 +2404,6 @@ int picolm_gpu_kv_store_dev_batched(int is_k, int lo, int sp, int np,
      * Must end compute batch first so the K/V matmul writes are visible. */
     int was_in_batch = G.in_batch;
     if (G.in_batch) picolm_gpu_batch_end(device);
-    // Now fence_dev is signaled for the batch that contained the K/V matmul
     vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
 
     // D2H
@@ -2553,8 +2547,26 @@ int picolm_gpu_kv_upload_layer(int is_k, int lo, int np,
 int picolm_gpu_kv_debug_dump(int is_k, int lo, int pos,
                               uint16_t *dst, int ne, int nkh,
                               int hd, int msl, int device) {
-    (void)is_k; (void)lo; (void)pos; (void)dst; (void)ne;
-    (void)nkh; (void)hd; (void)msl; (void)device; return 0;
+    if (!G.ready || !dst || device != 0) return 0;
+    VkBuffer src_buf = is_k ? G.kv_k_buf : G.kv_v_buf;
+    if (!src_buf) return 0;
+    size_t row_bytes = (size_t)nkh * hd * sizeof(uint16_t);
+    size_t off = (size_t)lo * msl * row_bytes + (size_t)pos * row_bytes;
+    size_t copy_bytes = (size_t)ne * sizeof(uint16_t);
+    vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
+    vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
+    if (!staging_ensure(copy_bytes)) return 0;
+    VkCommandBufferBeginInfo bgi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkResetCommandBuffer(G.cmd_xfer, 0); vkBeginCommandBuffer(G.cmd_xfer, &bgi);
+    VkBufferCopy bc = {off, 0, copy_bytes};
+    vkCmdCopyBuffer(G.cmd_xfer, src_buf, G.staging_buf, 1, &bc);
+    vkEndCommandBuffer(G.cmd_xfer);
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_xfer};
+    vkResetFences(G.dev, 1, &G.fence_xfer);
+    vkQueueSubmit(G.queue, 1, &si, G.fence_xfer);
+    vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
+    memcpy(dst, G.staging_ptr, copy_bytes);
+    return 1;
 }
 
 void picolm_gpu_kv_cache_clear(int device) {
@@ -2584,10 +2596,7 @@ int picolm_gpu_kv_flush_to_cpu(uint8_t *cpu_k, uint8_t *cpu_v,
                                 int n_pos, size_t row_sz_k, size_t row_sz_v,
                                 int device) {
     if (!G.ready || !cpu_k || !cpu_v || device != 0) return 0;
-    if (!G.kv_k_mapped || !G.kv_v_mapped) {
-        fprintf(stderr, "[VK] kv_flush: not mapped\n");
-        return 0;
-    }
+    if (!G.kv_k_mapped || !G.kv_v_mapped) return 0;
     // Wait for GPU writes to complete
     vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
     vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);

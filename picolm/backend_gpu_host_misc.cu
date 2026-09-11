@@ -1482,6 +1482,63 @@ picolm_gpu_silu_mul_dev(float *gate_dev, const float *up_dev, size_t n, int devi
     return 1;
 }
 
+/* GELU-multiply: gate *= gelu(up), device-native. Used by GPT-2/Gemma3n arch. */
+__global__ void picolm_gelu_mul(float *gate, const float *up, size_t n) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float u = up[i];
+        float g = gate[i];
+        float u3 = u * u * u;
+        float t = tanhf(0.79788456f * (u + 0.044715f * u3));
+        gate[i] = g * 0.5f * u * (1.0f + t);
+    }
+}
+
+extern "C" int
+picolm_gpu_gelu_mul_dev(float *gate_dev, const float *up_dev, size_t n, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    picolm_gelu_mul<<<(unsigned)((n + 255) / 256), 256, 0, ctx->stream>>>(
+        gate_dev, up_dev, n);
+    if (!gpu_ok(gpuGetLastError(), "gelu_mul (dev)")) return 0;
+    return 1;
+}
+
+/* Vulkan command batch wrappers -- no-ops on CUDA/HIP (single stream model).
+ * Vulkan uses explicit command buffers that need begin/end + fence sync.
+ * CUDA/HIP's stream model provides implicit ordering within a single stream. */
+extern "C" int picolm_gpu_batch_begin(int device) { (void)device; return 1; }
+extern "C" int picolm_gpu_batch_end(int device) { (void)device; return 1; }
+
+/* D2H via mapped memory -- on CUDA/HIP, just use regular D2H memcpy. */
+extern "C" int
+picolm_gpu_d2h_via_mapped(void *dst, const void *src, size_t bytes, int device) {
+    if (!dst || !src || bytes < 1) return 0;
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    return gpu_ok(gpuMemcpyAsync(dst, src, bytes, gpuMemcpyDeviceToHost, ctx->stream), "d2h mapped") &&
+           gpu_ok(gpuDeviceSynchronize(), "d2h mapped sync");
+}
+
+/* Pipeline logits buffer allocation -- no-op on CUDA/HIP (uses shared ctx->y). */
+extern "C" int
+picolm_gpu_pipeline_logits_alloc(size_t bytes, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx) return 0;
+    (void)bytes; /* ctx->y auto-resizes on demand */
+    return 1;
+}
+
+/* KV cache flush to CPU -- no-op on CUDA/HIP (KV cache IS CPU memory). */
+extern "C" int
+picolm_gpu_kv_flush_to_cpu(uint8_t *cpu_k, uint8_t *cpu_v,
+    int n_attn_ord, int max_seq, int n_pos,
+    size_t row_sz_k, size_t row_sz_v, int device) {
+    (void)cpu_k; (void)cpu_v; (void)n_attn_ord; (void)max_seq;
+    (void)n_pos; (void)row_sz_k; (void)row_sz_v; (void)device;
+    return 1;
+}
+
 /* The single sync point for the whole model_forward_gpu() pass: call
  * this exactly once, after the last device-native op (typically the
  * final rmsnorm), before reading anything back via D2H. Every _dev

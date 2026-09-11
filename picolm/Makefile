@@ -474,7 +474,7 @@ shaders/%.spv: shaders/%.comp
 vulkan: backend_vulkan.o shaders/qmatmul_vk.spv shaders/elementwise_vk.spv shaders/rmsnorm_vk.spv shaders/quantize_q8_vk.spv shaders/q8_q8_matmul_vk.spv shaders/attn_prefill_vk.spv shaders/attn_decode_vk.spv
 	$(MAKE) $(TARGET) \
 	  CFLAGS="$(filter-out -fopenmp,$(CFLAGS)) -march=native -DPICOLM_GPU=1 -DPICOLM_VULKAN=1 $(call simd_flags_for,-march=native) $(call simd_defines_for,-march=native) $(VK_EXTRA_INC)" \
-	  LDFLAGS="$(filter-out -fopenmp,$(LDFLAGS)) $(VK_EXTRA_LIB)" \
+	  LDFLAGS="$(LDFLAGS) $(VK_EXTRA_LIB)" \
 	  GPU_OBJS="backend_vulkan.o"
 
 backend_vulkan.o: backend_vulkan.c backend_gpu.h quant.h

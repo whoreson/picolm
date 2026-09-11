@@ -610,7 +610,6 @@ static void benchmark_context_scaling(const char *model_path, const char *base_p
         int pos = start_pos - 1;
         int n_gen = 0;
         for (; n_gen < chunk_size; n_gen++) {
-            fprintf(stderr, "[GEN_LOOP] n_gen=%d chunk_size=%d logits=%p\n", n_gen, chunk_size, (void*)logits);
             if (!logits) break;
             if (getenv("PICOLM_LOGITS_DUMP"))
                 dump_top_logits(logits, model.config.vocab_size, start_pos - 1 + n_gen, 5);
@@ -1737,7 +1736,6 @@ int main(int argc, char **argv) {
                     pos++;
 #ifdef PICOLM_GPU
                     if (model.gpu.kv_active && gpu_path == 1) {
-                        fprintf(stderr, "[DECODE_GPU] g=%d token=%d pos=%d\n", g, token, pos);
                         fflush(stderr);
                         logits = model_forward_gpu(&model, token, pos);
                         fprintf(stderr, "[DECODE_GPU_RET] logits=%p\n", (void*)logits);
@@ -1878,7 +1876,6 @@ int main(int argc, char **argv) {
         dump_logits_to_file(logits, model.config.vocab_size, pos);
         next = sampler_sample(&sampler, logits, model.config.vocab_size);
         if (getenv("PICOLM_DBG"))
-            fprintf(stderr, "[SAMPLE] pos=%d next=%d eos_id=%d\n", pos, next, (int)tokenizer.eos_id);
         if (getenv("PICOLM_DBG")) {
             fprintf(stderr, "[GEN] pos=%d next=%d eos=%d\n", pos, next, (int)tokenizer.eos_id);
         }
