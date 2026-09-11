@@ -1,0 +1,22 @@
+#version 450
+// Test KV store: just write a known pattern to the destination.
+// If we see the pattern, the dispatch/descriptor setup works.
+// If we see zeros, there's a driver bug.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 3) writeonly buffer DST { uint dst[]; };
+
+layout(push_constant) uniform PC {
+    int n;
+    int dst_off;
+    int pad0;
+    int pad1;
+} pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid < uint(pc.n)) {
+        dst[uint(pc.dst_off) + gid] = 0xDEADBEEU + gid;
+    }
+}

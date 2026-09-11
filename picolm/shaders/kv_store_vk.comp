@@ -1,0 +1,53 @@
+#version 450
+// KV cache store: F32->F16 pack and write to KV cache buffer.
+// Entirely device-side, no shared memory, no barriers.
+//
+// Binding 0: src F32 data (readonly) -- pipe buffer K or V output
+// Binding 3: dst KV cache buffer (writeonly, uint typed)
+//
+// Push constants:
+//   int n;          // number of F32 elements to convert
+//   int dst_off;    // destination offset in uint32 words (byte_offset / 4)
+//   int pad[2];
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer SRC { float src[]; };
+layout(std430, binding = 3) writeonly buffer DST { uint dst[]; };
+
+layout(push_constant) uniform PC {
+    int n;
+    int dst_off;
+    int pad0;
+    int pad1;
+} pc;
+
+uint f32tof16_bits(float v) {
+    int iv = floatBitsToInt(v);
+    uint fv = bitfieldInsert(0u, uint(iv), 0, 32);
+    uint sign = (fv >> 16u) & 0x8000u;
+    uint exp = (fv >> 23u) & 0xffu;
+    uint frac = fv & 0x7fffffu;
+    if (exp == 0u) return sign;
+    if (exp == 0xffu) return sign | 0x7c00u;
+    int e = int(exp) - 127 + 15;
+    if (e <= 0) return sign;
+    if (e >= 31) return sign | 0x7c00u;
+    return sign | uint(e) << 10u | (frac >> 13u);
+}
+
+void main() {
+    // Each thread handles 2 F32 inputs -> 1 uint32 output (2 F16 values)
+    uint word_gid = gl_GlobalInvocationID.x;
+    uint idx0 = word_gid * 2u;
+
+    if (idx0 < uint(pc.n)) {
+        uint lo = f32tof16_bits(src[idx0]);
+        uint hi = 0u;
+        if (idx0 + 1u < uint(pc.n)) {
+            hi = f32tof16_bits(src[idx0 + 1u]);
+        }
+        uint val = lo | (hi << 16u);
+        dst[uint(pc.dst_off) + word_gid] = val;
+    }
+}

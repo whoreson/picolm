@@ -4110,6 +4110,7 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
     /* Phase 2: GPU-pipelined forward pass.
      * Keeps activations on-device across all layers.
      * Falls back to model_forward() if pipeline not ready. */
+    fprintf(stderr, "[GPU_FWD_ENTRY] token=%d pos=%d\n", token, pos); fflush(stderr);
     model_config_t *c = &m->config;
     model_weights_t *w = &m->weights;
     gpu_weights_t *gw = &m->gpu;
@@ -4295,6 +4296,7 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
             /* H. Attention decode: pipe_attn_out = attn(pipe_q)
              * GPU decode attention is disabled on Vulkan (returns 0).
              * Fall back to CPU-only decode by returning NULL. */
+            fprintf(stderr, "[GPU_DEC_ATN] l=%d pos=%d attn_ord=%d\n", l, pos, this_attn_ordinal);
             if (!picolm_gpu_attention_decode_dev(pipe_attn_out, pipe_q,
                                                   this_attn_ordinal - 1, pos,
                                                   n_heads, n_kv_heads, head_dim,
@@ -4436,6 +4438,7 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
         tensor_set_gpu_tensor(NULL, 0);
     }
 
+    fprintf(stderr, "[GPU_FWD_RETURN] logits=%p\n", (void*)s->logits);
     return s->logits;
 }
 
@@ -4875,6 +4878,17 @@ after_qkv:
         /* Residual add */
         picolm_gpu_residual_add(bx, bx, bxb, n_ubatch, dim, xb_stride, gpu_dev);
 
+        /* Debug: read bx after last layer */
+        if (l == c->n_layers - 1 && n_ubatch == 1) {
+            picolm_gpu_sync(gpu_dev);
+            float dbg_bx[dim];
+            picolm_gpu_memcpy(dbg_bx, bx, dim * sizeof(float), -1, gpu_dev);
+            { float rms=0; for(int _i=0;_i<dim;_i++) rms+=dbg_bx[_i]*dbg_bx[_i]; rms=sqrtf(rms/dim);
+              fprintf(stderr,"[GPU L%d FINAL bx] rms=%.4f x[:4]={", l, rms);
+              for(int _i=0;_i<4;_i++) fprintf(stderr,"%.6f ",dbg_bx[_i]);
+              fprintf(stderr, "}\n"); fflush(stderr); }
+        }
+
         /* FFN RMSNorm */
         if(getenv("PICOLM_ATTN_DBG") && l < 2) {
             picolm_gpu_sync(gpu_dev);
@@ -5112,25 +5126,17 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
     {
         float *last_x = bx + (size_t)(last_ubatch_size - 1) * xb_stride;
         picolm_gpu_sync(gpu_dev);
-        picolm_gpu_memcpy(s->x, last_x, dim * sizeof(float), -1, gpu_dev);
-        if(1){
-            double gr=0; for(int _i=0;_i<dim;_i++){float a=s->x[_i];gr+=a*a;}
-            fprintf(stderr,"[GPU_PRE_NORM] x[:8]={");
-            for(int _i=0;_i<8;_i++) fprintf(stderr,"%s%.6f",_i?",":"",s->x[_i]);
-            fprintf(stderr, "} rms_full=%.6f\n",sqrtf(gr/dim));
+        /* Try mapped memory first (bypasses broken D2H on RADV/KAVERI) */
+        extern int picolm_gpu_d2h_via_mapped(void *dst, const void *src, size_t bytes, int device);
+        if (!picolm_gpu_d2h_via_mapped(s->x, last_x, dim * sizeof(float), gpu_dev)) {
+            picolm_gpu_memcpy(s->x, last_x, dim * sizeof(float), -1, gpu_dev);
         }
     }
 
     rmsnorm(s->x, s->x, s->output_norm_w, dim, c->rms_norm_eps);
-    { double gr=0; for(int _i=0;_i<dim;_i++){float a=s->x[_i];gr+=a*a;}
-      fprintf(stderr,"[GPU_LAST] x[:32]={");
-      for(int _i=0;_i<32;_i++) fprintf(stderr,"%s%.6f",_i?",":"",s->x[_i]);
-      fprintf(stderr, "} rms_full=%.6f\n",sqrtf(gr/dim));
-    }
 
     /* Flush GPU KV cache to CPU for CPU decode path (needed on Vulkan and CUDA) */
     if (gw->kv_active && s->kv_type_k == KV_CACHE_F16 && s->kv_type_v == KV_CACHE_F16) {
-        // Count attention ordinals (unique attention layers in the model)
         int n_attn_ord = 0;
         for (int _ll = 0; _ll < c->n_layers; _ll++) {
             if (w->layers[_ll].is_attn_layer) n_attn_ord++;
@@ -5141,6 +5147,11 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
                                         gpu_dev);
     }
 
+    tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gw->output, gpu_dev);
+    matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
+    tensor_set_repacked(NULL);
+    tensor_set_gpu_tensor(NULL, 0);
+
     /* Diagnostic: dump KV cache from device after GPU prefill */
     if (getenv("PICOLM_ATTN_DBG") && start_pos == 0) {
         uint16_t kv_dump[32];
@@ -5148,14 +5159,12 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
         for (int _ll = 0; _ll < c->n_layers; _ll++) {
             if (m->weights.layers[_ll].is_attn_layer) break;
         }
-        // Read first K row (pos 0, head 0, first 16 dims) from first attn layer
         if (picolm_gpu_kv_debug_dump(1, attn_ord, 0, kv_dump, 16,
                                      c->n_kv_heads, c->head_dim, c->max_seq_len, gpu_dev)) {
             fprintf(stderr, "[ATN_DBG_KV_GPU] first_attn_K_tok0[:16] raw_u16={");
             for (int _i = 0; _i < 16; _i++) fprintf(stderr, "%04x ", kv_dump[_i]);
             fprintf(stderr, "}\n"); fflush(stderr);
         }
-        // Read last K row (pos 39, head 0, first 16 dims) from first attn layer
         if (picolm_gpu_kv_debug_dump(1, attn_ord, n_tokens-1, kv_dump+16, 16,
                                      c->n_kv_heads, c->head_dim, c->max_seq_len, gpu_dev)) {
             fprintf(stderr, "[ATN_DBG_KV_GPU] first_attn_K_tok39[:16] raw_u16={");
@@ -5163,11 +5172,6 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
             fprintf(stderr, "}\n"); fflush(stderr);
         }
     }
-
-    tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gw->output, gpu_dev);
-    matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
-    tensor_set_repacked(NULL);
-    tensor_set_gpu_tensor(NULL, 0);
 
     /* Diagnostic: dump GPU prefill logits top-5 */
     if (getenv("PICOLM_PREFILL_LOGITS")) {

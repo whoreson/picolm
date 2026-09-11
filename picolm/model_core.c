@@ -2026,9 +2026,8 @@ static float *model_forward_gpt2(model_t *m, int token, int pos);
 static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt);
 
 float *model_forward(model_t *m, int token, int pos) {
-    if (getenv("PICOLM_ATTN_DBG") && pos >= 2 && pos <= 5) {
+    if (getenv("PICOLM_ATTN_DBG") && pos >= 1 && pos <= 5)
         fprintf(stderr, "[CPU_FWD_ENTRY] pos=%d token=%d\n", pos, token); fflush(stderr);
-    }
     /* Bounds check: pos must be within KV cache allocation */
     if (pos >= m->config.max_seq_len) {
         fprintf(stderr, "WARN: model_forward pos=%d >= max_seq_len=%d, returning last logits\n",
@@ -3986,6 +3985,11 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                 for (int d2 = 0; d2 < dim; d2++) a[d2] += b[d2];
             }
         }
+        /* Per-layer RMS tracking (CPU) */
+        if ((l % 5 == 0 || l >= c->n_layers - 3) && n_tokens == 1) {
+            double r=0; for(int _i=0;_i<dim;_i++){float a=x_batch[_i];r+=a*a;}
+            fprintf(stderr,"[CPU_LRM l=%d] rms=%.6f x[:3]={%.6f %.6f %.6f}\n",l,sqrtf(r/dim),x_batch[0],x_batch[1],x_batch[2]);
+        }
 #ifdef PICOLM_VIZ
         viz_push_layer(l, x_batch + (n_tokens - 1) * dim, dim);
 #endif
@@ -4048,7 +4052,6 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
           fflush(stderr);
         }
     }
-
     free(buf);
     return s->logits;
 }

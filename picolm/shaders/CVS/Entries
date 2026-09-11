@@ -2,7 +2,7 @@
 /attn_prefill_vk.comp/1.6/Fri Sep 11 11:02:56 2026//
 /elementwise_vk.comp/1.4/Fri Sep 11 11:02:56 2026//
 /q8_q8_matmul_vk.comp/1.6/Fri Sep 11 12:16:09 2026//
-/qmatmul_vk.comp/1.7/Fri Sep 11 12:49:44 2026//
-/quantize_q8_vk.comp/1.4/Fri Sep 11 12:49:44 2026//
-/rmsnorm_vk.comp/1.5/Fri Sep 11 12:49:44 2026//
+/qmatmul_vk.comp/1.8/Fri Sep 11 12:50:49 2026//
+/quantize_q8_vk.comp/1.5/Fri Sep 11 12:51:16 2026//
+/rmsnorm_vk.comp/1.6/Fri Sep 11 12:50:49 2026//
 D

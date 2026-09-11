@@ -53,6 +53,7 @@ static double vk_now(void) {
 // Forward decls for shutdown cleanup
 static VkBuffer unwrap_buf_offset(const void *p, VkDeviceSize *out_off);
 static void free_dev_buf(void *p);
+static uint16_t f32tof16_cpu(float v);
 
 // ---------------------------------------------------------------------------
 // Global state
@@ -189,6 +190,12 @@ static struct {
     VkDescriptorPool dpool_f16pack;
     VkDescriptorSet dset_f16pack;
 
+    // KV cache store (device-side F32->F16 pack)
+    VkShaderModule shader_kv_store;
+    VkPipeline pipe_kv_store;
+    VkDescriptorPool dpool_kv_store;
+    VkDescriptorSet dset_kv_store_ring[256];
+
     VkCommandPool cpool;
     VkCommandBuffer cmd;       // Phase 1: single-command sync
     VkCommandBuffer cmd_nrm;   // RMSNorm host-facing
@@ -232,7 +239,7 @@ static struct {
     void *kv_k_d, *kv_v_d;  /* cached wrappers */
     void *kv_k_mapped, *kv_v_mapped;  /* CPU-mapped for readback */
     // Mapped pipe buffers (for direct CPU readback on llvmpipe/RADV)
-    void *pipe_k_b_mapped, *pipe_v_b_mapped;
+    void *pipe_k_b_mapped, *pipe_v_b_mapped, *pipe_x_b_mapped;
     // KV staging buffer (device-local, for KAVERI shader read workaround)
     VkBuffer kv_staging_buf;
     VkDeviceMemory kv_staging_mem;
@@ -347,6 +354,15 @@ static int pick_memtype_local(VkPhysicalDevice phys) {
         }
     }
     if (best_heap == (uint32_t)-1) return -1;
+    // Prefer DEVICE_LOCAL + HOST_VISIBLE types (for direct CPU readback)
+    for (uint32_t i = 0; i < m.memoryTypeCount; i++) {
+        VkMemoryPropertyFlags f = m.memoryTypes[i].propertyFlags;
+        if ((f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+            (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+            m.memoryTypes[i].heapIndex == best_heap) {
+            return (int)i;
+        }
+    }
     // Pick the first DEVICE_LOCAL memory type backed by the largest heap
     for (uint32_t i = 0; i < m.memoryTypeCount; i++) {
         VkMemoryPropertyFlags f = m.memoryTypes[i].propertyFlags;
@@ -881,6 +897,14 @@ int picolm_gpu_init(const int *devices, int count) {
     G.dpool_f16pack = G.dpool_elem;
     G.dset_f16pack = G.dset_elem;
 
+    // KV cache store shader (device-side F32->F16)
+    G.shader_kv_store = load_spv(G.dev, "kv_store_vk.spv");
+    if (G.shader_kv_store) {
+        if (!build_pipeline_unified(G.dev, G.shader_kv_store, &G.pipe_kv_store, &G.dpool_kv_store, G.dset_kv_store_ring, 256)) {
+            G.shader_kv_store = VK_NULL_HANDLE;
+        }
+    }
+
     G.ready = 1;
 
     init_fail:
@@ -965,6 +989,15 @@ void picolm_gpu_shutdown(void) {
     if (G.shader_q8q8) vkDestroyShaderModule(G.dev, G.shader_q8q8, NULL);
 
     // f16pack shares elementwise resources - skip
+    // KV store cleanup
+    if (G.dpool_kv_store) {
+        for (int _i = 0; _i < 256 && G.dset_kv_store_ring[_i]; _i++)
+            vkFreeDescriptorSets(G.dev, G.dpool_kv_store, 1, &G.dset_kv_store_ring[_i]);
+        vkDestroyDescriptorPool(G.dev, G.dpool_kv_store, NULL);
+    }
+    if (G.pipe_kv_store) vkDestroyPipeline(G.dev, G.pipe_kv_store, NULL);
+    if (G.shader_kv_store) vkDestroyShaderModule(G.dev, G.shader_kv_store, NULL);
+
     // Destroy unified layout (shared by all pipelines)
     if (G.plyt_unified) vkDestroyPipelineLayout(G.dev, G.plyt_unified, NULL);
     if (G.dsl_unified)  vkDestroyDescriptorSetLayout(G.dev, G.dsl_unified, NULL);
@@ -1707,6 +1740,8 @@ int picolm_gpu_pipeline_batch_alloc(int dim, int q_dim, int kv_dim,
     if (mr != VK_SUCCESS) G.pipe_k_b_mapped = NULL;
     mr = vkMapMemory(G.dev, G.pipe_v_b_m, 0, kvb, 0, &G.pipe_v_b_mapped);
     if (mr != VK_SUCCESS) G.pipe_v_b_mapped = NULL;
+    mr = vkMapMemory(G.dev, G.pipe_x_b_m, 0, xb, 0, &G.pipe_x_b_mapped);
+    if (mr != VK_SUCCESS) { G.pipe_x_b_mapped = NULL; }
     G.pipe_attn_out_b_d = wrap_buf(G.pipe_attn_out_b, G.pipe_attn_out_b_m, 0, qb);
     G.pipe_ffn_norm_b_d = wrap_buf(G.pipe_ffn_norm_b, G.pipe_ffn_norm_b_m, 0, xb);
     G.pipe_gate_b_d = wrap_buf(G.pipe_gate_b, G.pipe_gate_b_m, 0, fb);
@@ -1813,6 +1848,31 @@ float *picolm_gpu_pipe_q_b(int d) { return (d==0&&G.pipe_b_ready)?(float*)G.pipe
 float *picolm_gpu_pipe_k_b(int d) { return (d==0&&G.pipe_b_ready)?(float*)G.pipe_k_b_d:NULL; }
 float *picolm_gpu_pipe_v_b(int d) { return (d==0&&G.pipe_b_ready)?(float*)G.pipe_v_b_d:NULL; }
 float *picolm_gpu_pipe_attn_out_b(int d) { return (d==0&&G.pipe_b_ready)?(float*)G.pipe_attn_out_b_d:NULL; }
+void *picolm_gpu_pipe_x_b_mapped(int d) { return (d==0&&G.pipe_b_ready)?G.pipe_x_b_mapped:NULL; }
+
+int picolm_gpu_d2h_via_mapped(void *dst, const void *src, size_t bytes, int device) {
+    /* D2H via mapped memory for pipe buffers that are host-visible */
+    if (!G.ready || !dst || !src || device != 0) return 0;
+    VkDeviceSize off;
+    VkBuffer buf = unwrap_buf_offset(src, &off);
+    if (!buf) return 0;
+    /* Check if this buffer has a mapped pointer */
+    void *mapped = NULL;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    if (buf == G.pipe_x_b) { mapped = G.pipe_x_b_mapped; mem = G.pipe_x_b_m; }
+    static int _d2h_dbg = 0;
+    if (!_d2h_dbg++) fprintf(stderr, "[D2H_MAPPED] buf=%p mapped=%p mem=%p off=%zu\n", (void*)buf, mapped, (void*)mem, off);
+    if (!mapped || !mem) return 0;
+    /* Invalidate for CPU read */
+    VkMappedMemoryRange inv = {.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+        .memory = mem, .offset = 0, .size = VK_WHOLE_SIZE};
+    vkInvalidateMappedMemoryRanges(G.dev, 1, &inv);
+    memcpy(dst, (const char*)mapped + off, bytes);
+    { float rms=0; for(int _i=0;_i<bytes/sizeof(float);_i++) rms+=((float*)dst)[_i]*((float*)dst)[_i];
+      rms=sqrtf(rms/(bytes/sizeof(float)));
+      fprintf(stderr, "[D2H_MAPPED] dst_rms=%.4f\n", rms); fflush(stderr); }
+    return 1;
+}
 float *picolm_gpu_pipe_ffn_norm_b(int d) { return (d==0&&G.pipe_b_ready)?(float*)G.pipe_ffn_norm_b_d:NULL; }
 float *picolm_gpu_pipe_gate_b(int d) { return (d==0&&G.pipe_b_ready)?(float*)G.pipe_gate_b_d:NULL; }
 float *picolm_gpu_pipe_up_b(int d) { return (d==0&&G.pipe_b_ready)?(float*)G.pipe_up_b_d:NULL; }
@@ -2317,6 +2377,20 @@ int picolm_gpu_kv_store_dev(int is_k, int lo, int pos,
     return 1;
 }
 
+/* CPU-side F32->F16 conversion (same algorithm as kv_store_vk.comp) */
+static uint16_t f32tof16_cpu(float v) {
+    union { float f; uint32_t u; } u = {.f = v};
+    uint32_t sign = (u.u >> 16) & 0x8000u;
+    uint32_t exp = (u.u >> 23) & 0xffu;
+    uint32_t frac = u.u & 0x7fffffu;
+    if (exp == 0) return (uint16_t)sign;
+    if (exp == 255) return (uint16_t)(sign | 0x7c00u);
+    int e = (int)exp - 127 + 15;
+    if (e <= 0) return (uint16_t)sign;
+    if (e >= 31) return (uint16_t)(sign | 0x7c00u);
+    return (uint16_t)(sign | (uint32_t)e << 10 | (frac >> 13));
+}
+
 int picolm_gpu_kv_store_dev_batched(int is_k, int lo, int sp, int np,
                                      const float *sd, int nkh, int hd,
                                      int msl, int device) {
@@ -2328,80 +2402,46 @@ int picolm_gpu_kv_store_dev_batched(int is_k, int lo, int sp, int np,
     size_t total_f32 = (size_t)np * kv_dim;
     size_t total_f16 = total_f32 * sizeof(uint16_t);
 
-    /* Flush batch if active so GPU compute completes before we read pipe buffer */
+    size_t f16_per_pos_bytes = (size_t)nkh * hd * sizeof(uint16_t);
+    size_t dst_byte_off = (size_t)lo * msl * f16_per_pos_bytes + (size_t)sp * f16_per_pos_bytes;
+
+    /* D2H + CPU F32->F16 + H2D path.
+     * Must end compute batch first so the K/V matmul writes are visible. */
     int was_in_batch = G.in_batch;
     if (G.in_batch) picolm_gpu_batch_end(device);
-    picolm_gpu_sync(device);
-    /* On llvmpipe, fences may not fully synchronize. Force device idle. */
-    vkDeviceWaitIdle(G.dev);
-
-    // Fallback: always use D2H via staging buffer (most reliable)
-    float *f32_host = malloc(total_f32 * sizeof(float));
-    if (!f32_host) return 0;
-
-    {
-        VkDeviceSize src_off = 0;
-        VkBuffer src_buf = unwrap_buf_offset(sd, &src_off);
-        if (!src_buf) { free(f32_host); return 0; }
-        if (!staging_ensure(total_f32 * sizeof(float))) { free(f32_host); return 0; }
-        vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
-        vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
-        VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        vkResetCommandBuffer(G.cmd_xfer, 0);
-        vkBeginCommandBuffer(G.cmd_xfer, &begin);
-        VkBufferMemoryBarrier bm = {
-            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .buffer = src_buf,
-            .offset = src_off,
-            .size = total_f32 * sizeof(float),
-        };
-        vkCmdPipelineBarrier(G.cmd_xfer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 1, &bm, 0, NULL);
-        VkBufferCopy bc = {src_off, 0, total_f32 * sizeof(float)};
-        vkCmdCopyBuffer(G.cmd_xfer, src_buf, G.staging_buf, 1, &bc);
-        vkEndCommandBuffer(G.cmd_xfer);
-        VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_xfer};
-        vkResetFences(G.dev, 1, &G.fence_xfer);
-        vkQueueSubmit(G.queue, 1, &si, G.fence_xfer);
-        vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
-        memcpy(f32_host, G.staging_ptr, total_f32 * sizeof(float));
-    }
-
-    // F32->F16 pack on CPU using tested fp32_to_fp16() from quant.c
-    uint16_t *f16_host = malloc(total_f16);
-    if (!f16_host) { free(f32_host); return 0; }
-    for (size_t i = 0; i < total_f32; i++) {
-        f16_host[i] = fp32_to_fp16(f32_host[i]);
-    }
-
-    // H2D to KV cache
-    size_t f16_per_pos = (size_t)nkh * hd * sizeof(uint16_t);
-    size_t dst_off = (size_t)lo * msl * f16_per_pos + (size_t)sp * f16_per_pos;
-    memcpy(G.staging_ptr, f16_host, total_f16);
-    free(f16_host);
-    free(f32_host);
-
-
+    // Now fence_dev is signaled for the batch that contained the K/V matmul
     vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
-    VkCommandBufferBeginInfo begin2 = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    vkResetCommandBuffer(G.cmd_xfer, 0);
-    vkBeginCommandBuffer(G.cmd_xfer, &begin2);
-    VkBufferCopy bc2 = {0, (VkDeviceSize)dst_off, total_f16};
-    vkCmdCopyBuffer(G.cmd_xfer, G.staging_buf, dst_buf, 1, &bc2);
+
+    // D2H
+    if (!staging_ensure(total_f32 * sizeof(float))) return 0;
+    VkDescriptorBufferInfo src_info = desc_buf_info(sd);
+    VkCommandBufferBeginInfo _bgi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkResetCommandBuffer(G.cmd_xfer, 0); vkBeginCommandBuffer(G.cmd_xfer, &_bgi);
+    VkBufferCopy _bc_d2h = {src_info.offset, 0, total_f32 * sizeof(float)};
+    vkCmdCopyBuffer(G.cmd_xfer, src_info.buffer, G.staging_buf, 1, &_bc_d2h);
     vkEndCommandBuffer(G.cmd_xfer);
-    VkSubmitInfo si2 = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_xfer};
+    VkSubmitInfo _si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_xfer};
     vkResetFences(G.dev, 1, &G.fence_xfer);
-    vkQueueSubmit(G.queue, 1, &si2, G.fence_xfer);
-    /* Wait for H2D to complete before returning. Subsequent compute (attention)
-     * reads from the KV cache and must see the written data. */
+    vkQueueSubmit(G.queue, 1, &_si, G.fence_xfer);
     vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
 
-    /* If we were in a batch, restart it for the remaining layer ops */
-    if (was_in_batch) picolm_gpu_batch_begin(device);
+    // CPU F32->F16
+    { float *sf = (float*)G.staging_ptr;
+      uint16_t *pk = (uint16_t*)malloc(total_f16);
+      for(size_t i=0;i<total_f32;i++) pk[i] = f32tof16_cpu(sf[i]);
+      memcpy(G.staging_ptr, pk, total_f16); free(pk); }
+
+    // H2D
+    vkResetCommandBuffer(G.cmd_xfer, 0); vkBeginCommandBuffer(G.cmd_xfer, &_bgi);
+    VkBufferCopy _bc_h2d = {0, dst_byte_off, total_f16};
+    vkCmdCopyBuffer(G.cmd_xfer, G.staging_buf, dst_buf, 1, &_bc_h2d);
+    vkEndCommandBuffer(G.cmd_xfer);
+    vkResetFences(G.dev, 1, &G.fence_xfer);
+    vkQueueSubmit(G.queue, 1, &_si, G.fence_xfer);
+    vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
+
+    // Restore batch state for subsequent dispatches
+    if (was_in_batch && !G.in_batch) picolm_gpu_batch_begin(device);
 
     return 1;
 }
@@ -2570,6 +2610,7 @@ int picolm_gpu_kv_flush_to_cpu(uint8_t *cpu_k, uint8_t *cpu_v,
             memcpy(cv + (size_t)p * row_sz_v, gv + (size_t)p * elems_per_row_v, row_sz_v);
         }
     }
+    // Debug: dump K cache layers 0-3 (check for non-zero entries)
     return 1;
 }
 // ---------------------------------------------------------------------------
