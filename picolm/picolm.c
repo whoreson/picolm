@@ -490,26 +490,6 @@ static void bench_summary(const bench_ctx_t *bc, int iteration, double wall_sec)
     fprintf(stdout, "----------------------------------\n\n");
 }
 
-#ifdef PICOLM_GPU
-#ifdef PICOLM_CUDA
-#include <cuda_runtime.h>
-#else
-/* HIP: no raw CUDA API needed in picolm.c; all GPU ops go through
- * picolm_gpu_* C bindings which handle HIP/CUDA abstraction internally.
- * The --gpu-diff test requires CUDA, so it's disabled for HIP. */
-#endif
-
-/* Full struct definition needed from C (forward decl in tensor.h is opaque) */
-struct picolm_gpu_tensor {
-    void *weights;
-    int qtype;
-    int I, O, device;
-    size_t row_bytes;
-    int block_size;
-    int tracked;
-    int zero_copy;
-};
-
 /* Context scaling benchmark: --benchmark-ctx
  * Mirrors bench5.py: starts from a base prompt, generates tokens,
  * then at each step appends the base prompt again to force a prefill
@@ -667,6 +647,26 @@ static void benchmark_context_scaling(const char *model_path, const char *base_p
     if (use_qwen_tok) free(base_tokens);
     else free(base_tokens);
 }
+
+#ifdef PICOLM_GPU
+#ifdef PICOLM_CUDA
+#include <cuda_runtime.h>
+#else
+/* HIP: no raw CUDA API needed in picolm.c; all GPU ops go through
+ * picolm_gpu_* C bindings which handle HIP/CUDA abstraction internally.
+ * The --gpu-diff test requires CUDA, so it's disabled for HIP. */
+#endif
+
+/* Full struct definition needed from C (forward decl in tensor.h is opaque) */
+struct picolm_gpu_tensor {
+    void *weights;
+    int qtype;
+    int I, O, device;
+    size_t row_bytes;
+    int block_size;
+    int tracked;
+    int zero_copy;
+};
 
 #ifdef PICOLM_CUDA
 /* GPU kernel diff test: quantize random input to Q8_0, run IMMA and scalar
@@ -1227,7 +1227,6 @@ int main(int argc, char **argv) {
 #endif
 
     /* --benchmark-ctx: context scaling benchmark */
-#ifdef PICOLM_GPU
     if (do_benchmark_ctx) {
         if (!model_path) { fprintf(stderr, "No model file specified\n"); usage(argv[0]); return 1; }
         benchmark_context_scaling(model_path, prompt ? prompt :
@@ -1235,12 +1234,6 @@ int main(int argc, char **argv) {
             context_override, temperature, top_k, max_tokens, seed, num_threads, do_prefault);
         return 0;
     }
-#else
-    if (do_benchmark_ctx) {
-        fprintf(stderr, "--benchmark-ctx requires GPU build\n");
-        return 1;
-    }
-#endif
 
     /* --list-tensors / --list-kv: now that model_path is known regardless of arg order */
     if (list_tensors || list_kv) {
