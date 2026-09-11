@@ -4722,12 +4722,17 @@ after_qkv:
         /* Debug: dump Q AFTER matmul but BEFORE RoPE (layer 0 only) */
         if (getenv("PICOLM_ATTN_DBG") && attn_ord == 0 && start_pos == 0) {
             picolm_gpu_sync(gpu_dev);
-            { float q_pre_rope[32];
-              picolm_gpu_memcpy(q_pre_rope, bq, 32 * sizeof(float), -1, gpu_dev);
-              float qrms=0; for(int _i=0;_i<32;_i++) qrms+=q_pre_rope[_i]*q_pre_rope[_i];
+            { float q_pre_rope[64];
+              int q_stride_l = q_full_dim;
+              int lt = n_ubatch - 1;
+              picolm_gpu_memcpy(q_pre_rope, bq + (size_t)0 * q_stride_l, 32 * sizeof(float), -1, gpu_dev);
+              picolm_gpu_memcpy(q_pre_rope + 32, bq + (size_t)lt * q_stride_l, 32 * sizeof(float), -1, gpu_dev);
+              float qrms0=0,qrmsL=0; for(int _i=0;_i<32;_i++){qrms0+=q_pre_rope[_i]*q_pre_rope[_i];qrmsL+=q_pre_rope[32+_i]*q_pre_rope[32+_i];}
               fprintf(stderr,"[ATN_DBG l=%d] Q_PRE_ROPE tok0[:8]={",l);
               for(int _i=0;_i<8;_i++) fprintf(stderr,"%.6f ",q_pre_rope[_i]);
-              fprintf(stderr,"} rms=%.6f\n",sqrtf(qrms/32)); fflush(stderr); }
+              fprintf(stderr, "} rms=%.6f | tok%d[:8]={",lt);
+              for(int _i=0;_i<8;_i++) fprintf(stderr,"%.6f ",q_pre_rope[32+_i]);
+              fprintf(stderr, "} rms=%.6f\n",sqrtf(qrmsL/32)); fflush(stderr); }
         }
 
         /* RoPE: per-layer SWA/global selection */
@@ -4755,19 +4760,28 @@ after_qkv:
         /* Diagnostic: dump first attention layer K values after store */
         if (getenv("PICOLM_ATTN_DBG") && attn_ord == 0 && start_pos == 0) {
             picolm_gpu_sync(gpu_dev);
-            float k_dbg[32];
-            picolm_gpu_memcpy(k_dbg, bk, 32 * sizeof(float), -1, gpu_dev);
-            fprintf(stderr, "[ATN_DBG l=%d attn_ord=%d] bk_tok0[:8]={", l, attn_ord);
-            for (int _i = 0; _i < 8; _i++) fprintf(stderr, "%.6f ", k_dbg[_i]);
-            fprintf(stderr, "}\n");
-            fflush(stderr);
-            /* Also dump Q values for first attention layer */
-            { float q_dbg[32];
+            { float k_dbg[64];
+              int lt = n_ubatch - 1;
+              int kv_stride_l = n_kv_heads * head_dim;
+              picolm_gpu_memcpy(k_dbg, bk, 32 * sizeof(float), -1, gpu_dev);
+              picolm_gpu_memcpy(k_dbg+32, bk + (size_t)lt * kv_stride_l, 32 * sizeof(float), -1, gpu_dev);
+              fprintf(stderr, "[ATN_DBG l=%d attn_ord=%d] bk_tok0[:4]={", l, attn_ord);
+              for (int _i = 0; _i < 4; _i++) fprintf(stderr, "%.6f ", k_dbg[_i]);
+              fprintf(stderr, "} | tok%d[:4]={",lt);
+              for (int _i = 0; _i < 4; _i++) fprintf(stderr, "%.6f ", k_dbg[32+_i]);
+              fprintf(stderr, "}\n"); fflush(stderr); }
+            /* Also dump Q values (after RoPE) for first attention layer */
+            { float q_dbg[64];
+              int lt = n_ubatch - 1;
+              int q_stride_l = q_full_dim;
               picolm_gpu_memcpy(q_dbg, bq, 32 * sizeof(float), -1, gpu_dev);
-              float qrms=0; for(int _i=0;_i<32;_i++) qrms+=q_dbg[_i]*q_dbg[_i];
-              fprintf(stderr,"[ATN_DBG l=%d] bq_tok0[:8]={",l);
-              for(int _i=0;_i<8;_i++) fprintf(stderr,"%.6f ",q_dbg[_i]);
-              fprintf(stderr,"} rms=%.6f\n",sqrtf(qrms/32)); fflush(stderr); }
+              picolm_gpu_memcpy(q_dbg+32, bq + (size_t)lt * q_stride_l, 32 * sizeof(float), -1, gpu_dev);
+              float qrms0=0,qrmsL=0; for(int _i=0;_i<32;_i++){qrms0+=q_dbg[_i]*q_dbg[_i];qrmsL+=q_dbg[32+_i]*q_dbg[32+_i];}
+              fprintf(stderr,"[ATN_DBG l=%d] bq_tok0[:4]={",l);
+              for(int _i=0;_i<4;_i++) fprintf(stderr,"%.6f ",q_dbg[_i]);
+              fprintf(stderr,"} rms=%.6f | tok%d[:4]={",lt);
+              for(int _i=0;_i<4;_i++) fprintf(stderr,"%.6f ",q_dbg[32+_i]);
+              fprintf(stderr,"} rms=%.6f\n",sqrtf(qrmsL/32)); fflush(stderr); }
         }
 
         /* Attention: default to F16 KV cache path (FA2/warpgrp) for all
@@ -4799,12 +4813,17 @@ after_qkv:
         /* Diagnostic: dump attention output for first layer */
         if (getenv("PICOLM_ATTN_DBG") && attn_ord == 0 && start_pos == 0) {
             picolm_gpu_sync(gpu_dev);
-            { float aout[256];
+            { float aout[512];
+              int lt = n_ubatch - 1;
+              int a_stride_l = n_heads * head_dim;
               picolm_gpu_memcpy(aout, battn_out, 256 * sizeof(float), -1, gpu_dev);
-              float arms=0; for(int _i=0;_i<96;_i++) arms+=aout[_i]*aout[_i];
-              fprintf(stderr,"[ATN_DBG l=%d] attn_out_tok0[:8]={",l);
-              for(int _i=0;_i<8;_i++) fprintf(stderr,"%.6f ",aout[_i]);
-              fprintf(stderr,"} rms=%.6f\n", sqrtf(arms/96));
+              picolm_gpu_memcpy(aout+256, battn_out + (size_t)lt * a_stride_l, 256 * sizeof(float), -1, gpu_dev);
+              float arms0=0,armsL=0; for(int _i=0;_i<96;_i++){arms0+=aout[_i]*aout[_i];armsL+=aout[256+_i]*aout[256+_i];}
+              fprintf(stderr,"[ATN_DBG l=%d] attn_tok0[:4]={",l);
+              for(int _i=0;_i<4;_i++) fprintf(stderr,"%.6f ",aout[_i]);
+              fprintf(stderr,"} rms=%.6f | tok%d[:4]={",lt);
+              for(int _i=0;_i<4;_i++) fprintf(stderr,"%.6f ",aout[256+_i]);
+              fprintf(stderr,"} rms=%.6f\n",sqrtf(armsL/96));
               fflush(stderr); }
         }
 
@@ -4858,12 +4877,12 @@ after_qkv:
         /* Diagnostic: dump attention layer output */
         if (getenv("PICOLM_ATTN_DBG")) {
             picolm_gpu_sync(gpu_dev);
-            float dbg_x[8];
-            picolm_gpu_memcpy(dbg_x, bx + (size_t)(n_ubatch-1) * xb_stride, 8 * sizeof(float), -1, gpu_dev);
-            fprintf(stderr, "[ATN_DBG l=%d G] last_tok[:8]={", l);
+            float dbg_x[576];
+            picolm_gpu_memcpy(dbg_x, bx + (size_t)(n_ubatch-1) * xb_stride, dim * sizeof(float), -1, gpu_dev);
+            double r=0;for(int _i=0;_i<dim;_i++){float a=dbg_x[_i];r+=a*a;}
+            fprintf(stderr, "[ATN_DBG l=%d G] last_tok[:8]={",l);
             for (int _i = 0; _i < 8; _i++) fprintf(stderr, "%.6f ", dbg_x[_i]);
-            double r=0;for(int _i=0;_i<8;_i++){float a=dbg_x[_i];r+=a*a;}
-            fprintf(stderr, "} rms8=%.6f\n", sqrtf(r/8));
+            fprintf(stderr, "} rms8=%.6f rms_full=%.6f\n", sqrtf(r/dim), sqrtf(r/dim));
             fflush(stderr);
         }
 
@@ -5041,12 +5060,19 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
         picolm_gpu_sync(gpu_dev);
         picolm_gpu_memcpy(s->x, last_x, dim * sizeof(float), -1, gpu_dev);
         if(1){
-            fprintf(stderr,"[DBG] prefill_last x[:4]={%.6f,%.6f,%.6f,%.6f}\n",
-                s->x[0],s->x[1],s->x[2],s->x[3]);
+            double gr=0; for(int _i=0;_i<dim;_i++){float a=s->x[_i];gr+=a*a;}
+            fprintf(stderr,"[GPU_PRE_NORM] x[:8]={");
+            for(int _i=0;_i<8;_i++) fprintf(stderr,"%s%.6f",_i?",":"",s->x[_i]);
+            fprintf(stderr, "} rms_full=%.6f\n",sqrtf(gr/dim));
         }
     }
 
     rmsnorm(s->x, s->x, s->output_norm_w, dim, c->rms_norm_eps);
+    { double gr=0; for(int _i=0;_i<dim;_i++){float a=s->x[_i];gr+=a*a;}
+      fprintf(stderr,"[GPU_LAST] x[:32]={");
+      for(int _i=0;_i<32;_i++) fprintf(stderr,"%s%.6f",_i?",":"",s->x[_i]);
+      fprintf(stderr, "} rms_full=%.6f\n",sqrtf(gr/dim));
+    }
 
     /* Diagnostic: dump KV cache from device after GPU prefill */
     if (getenv("PICOLM_ATTN_DBG") && start_pos == 0) {

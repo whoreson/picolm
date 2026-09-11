@@ -2023,6 +2023,16 @@ int picolm_gpu_rope_apply_batched(float *x, int n_heads, int head_dim,
 
     if (!G.in_batch) {
         vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
+        VkCommandBufferBeginInfo _vbb = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        vkResetCommandBuffer(G.cmd_dev, 0);
+        vkBeginCommandBuffer(G.cmd_dev, &_vbb);
+    } else {
+        // Memory barrier: Q/K matmul writes must be visible before RoPE reads
+        VkMemoryBarrier _mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
+        vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &_mb, 0, NULL, 0, NULL);
     }
 
     // Batched rope: process each token sequentially, each with its own cos/sin offset
@@ -2049,11 +2059,6 @@ int picolm_gpu_rope_apply_batched(float *x, int n_heads, int head_dim,
         };
         wr_desc(G.dset_elem, 3, bi);
 
-        if (!G.in_batch) {
-            VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-            vkResetCommandBuffer(G.cmd_dev, 0);
-            vkBeginCommandBuffer(G.cmd_dev, &begin);
-        }
         vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_elem);
         vkCmdBindDescriptorSets(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE,
                                 G.plyt_unified, 0, 1, &G.dset_elem, 0, NULL);
@@ -2062,13 +2067,14 @@ int picolm_gpu_rope_apply_batched(float *x, int n_heads, int head_dim,
         vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
                            0, sizeof(pc), &pc);
         vkCmdDispatch(G.cmd_dev, (uint32_t)((half_dim + 255) / 256), 1, 1);
-        if (!G.in_batch) {
-            vkEndCommandBuffer(G.cmd_dev);
-            VkSubmitInfo si_info = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_dev};
-            vkResetFences(G.dev, 1, &G.fence_dev);
-            vkQueueSubmit(G.queue, 1, &si_info, G.fence_dev);
-            vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
-        }
+    }
+
+    if (!G.in_batch) {
+        vkEndCommandBuffer(G.cmd_dev);
+        VkSubmitInfo si_info = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_dev};
+        vkResetFences(G.dev, 1, &G.fence_dev);
+        vkQueueSubmit(G.queue, 1, &si_info, G.fence_dev);
+        vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
     }
     return 1;
 }

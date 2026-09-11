@@ -3946,11 +3946,11 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #endif
         if (getenv("PICOLM_ATTN_DBG")) {
             int lt = n_tokens - 1;
-            double r=0;for(int _i=0;_i<8;_i++){float a=x_batch[lt*dim+_i];r+=a*a;}
+            double r8=0,rf=0;for(int _i=0;_i<dim;_i++){float a=x_batch[lt*dim+_i];rf+=a*a;if(_i<8)r8+=a*a;}
             char *tag = lw->is_attn_layer ? "A" : "S";
             fprintf(stderr, "[ATN_DBG l=%d %s] last_tok[:4]={", l, tag);
             for(int _i=0;_i<4;_i++) fprintf(stderr,"%.6f ",x_batch[lt*dim+_i]);
-            fprintf(stderr, "} rms8=%.6f\n", sqrtf(r/8));
+            fprintf(stderr, "} rms8=%.6f rms_full=%.6f\n", sqrtf(r8/8), sqrtf(rf/dim));
             fflush(stderr);
         }
         if (_SSM_DBG && lw->is_attn_layer) {
@@ -3969,6 +3969,13 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         fprintf(stderr, "}\n");
     }
     tensor_set_repacked(m->repack_used[1] ? m->repack_buffers[1] : NULL);
+    /* Diagnostic: dump CPU prefill hidden state before output projection */
+    { double cr=0; for(int _i=0;_i<dim;_i++){float a=s->x[_i];cr+=a*a;}
+      fprintf(stderr,"[CPU_LAST] x[:32]={");
+      for(int _i=0;_i<32;_i++) fprintf(stderr,"%s%.6f",_i?",":"",s->x[_i]);
+      fprintf(stderr, "} rms_full=%.6f\n",sqrtf(cr/dim));
+      fflush(stderr);
+    }
 #ifdef PICOLM_GPU
     if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)m->gpu.output, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
 #endif
