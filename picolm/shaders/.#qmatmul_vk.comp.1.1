@@ -13,6 +13,8 @@ layout(push_constant) uniform P {
     int fmt;
     int S, I, O;
     int rowWords;
+    int x_stride;  // activation stride (0 = I)
+    int y_stride;  // output stride (0 = O)
 } p;
 
 float f16tof32(uint h) {
@@ -38,8 +40,10 @@ void main() {
     int o = int(gl_WorkGroupID.x) * 16 + int(gl_LocalInvocationID.x);
     int s = int(gl_WorkGroupID.y);
     if (o >= p.O || s >= p.S) return;
-    
-    int xoff = s * p.I;
+
+    int xs = p.x_stride > 0 ? p.x_stride : p.I;
+    int ys = p.y_stride > 0 ? p.y_stride : p.O;
+    int xoff = s * xs;
     uint rowBase = uint(o) * uint(p.rowWords);
     float sum = 0.0;
 
@@ -108,5 +112,5 @@ void main() {
         sum = 0.0;
     }
 
-    y[uint(o) + uint(s) * uint(p.O)] = sum;
+    y[uint(o) + uint(s) * uint(ys)] = sum;
 }

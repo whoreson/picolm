@@ -4946,16 +4946,13 @@ after_qkv:
         /* FFN residual */
         picolm_gpu_residual_add(bx, bx, bxb, n_ubatch, dim, xb_stride, gpu_dev);
 
-        /* Diagnostic: dump attention layer output */
+        /* Per-layer RMS tracking (debug only) */
         if (getenv("PICOLM_ATTN_DBG")) {
             picolm_gpu_sync(gpu_dev);
-            float dbg_x[576];
-            picolm_gpu_memcpy(dbg_x, bx + (size_t)(n_ubatch-1) * xb_stride, dim * sizeof(float), -1, gpu_dev);
-            double r=0;for(int _i=0;_i<dim;_i++){float a=dbg_x[_i];r+=a*a;}
-            fprintf(stderr, "[ATN_DBG l=%d G] last_tok[:8]={",l);
-            for (int _i = 0; _i < 8; _i++) fprintf(stderr, "%.6f ", dbg_x[_i]);
-            fprintf(stderr, "} rms8=%.6f rms_full=%.6f\n", sqrtf(r/dim), sqrtf(r/dim));
-            fflush(stderr);
+            float dbg_xr[576];
+            picolm_gpu_memcpy(dbg_xr, bx + (size_t)(n_ubatch-1) * xb_stride, dim * sizeof(float), -1, gpu_dev);
+            double r=0;for(int _i=0;_i<dim;_i++){float a=dbg_xr[_i];r+=a*a;}
+            fprintf(stderr, "[LAYER_RMS l=%d] rms=%.6f x0=%.6f x1=%.6f x2=%.6f\n", l, sqrtf(r/dim), dbg_xr[0], dbg_xr[1], dbg_xr[2]);
         }
 
         /* Increment attention ordinal for next layer */

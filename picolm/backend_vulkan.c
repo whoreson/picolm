@@ -47,7 +47,7 @@ static double vk_now(void) {
 #endif
 
 #define VKCHECK(x, what) do { VkResult _r = (x); if (_r != VK_SUCCESS) { \
-    fprintf(stderr, "[VK] %s:%d %s failed: %d\n", __FILE__, __LINE__, what, (int)_r); \
+    fprintf(stderr, "[VK] %s:%d %s failed: %s (%d)\n", __FILE__, __LINE__, what, vk_result_str(_r), (int)_r); \
     return 0; } } while (0)
 
 // Forward decls for shutdown cleanup
@@ -78,6 +78,39 @@ typedef struct VkWArena {
 } VkWArena;
 
 #define VK_WARENA_BLOCK ((size_t)256 << 20)
+
+// Human-readable Vulkan result string
+static const char *vk_result_str(VkResult r) {
+    switch ((int)r) {
+        case VK_SUCCESS: return "VK_SUCCESS";
+        case VK_NOT_READY: return "VK_NOT_READY";
+        case VK_TIMEOUT: return "VK_TIMEOUT";
+        case VK_EVENT_SET: return "VK_EVENT_SET";
+        case VK_EVENT_RESET: return "VK_EVENT_RESET";
+        case VK_INCOMPLETE: return "VK_INCOMPLETE";
+        case VK_ERROR_OUT_OF_HOST_MEMORY: return "VK_ERROR_OUT_OF_HOST_MEMORY";
+        case VK_ERROR_OUT_OF_DEVICE_MEMORY: return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+        case VK_ERROR_INITIALIZATION_FAILED: return "VK_ERROR_INITIALIZATION_FAILED";
+        case VK_ERROR_DEVICE_LOST: return "VK_ERROR_DEVICE_LOST";
+        case VK_ERROR_MEMORY_MAP_FAILED: return "VK_ERROR_MEMORY_MAP_FAILED";
+        case VK_ERROR_LAYER_NOT_PRESENT: return "VK_ERROR_LAYER_NOT_PRESENT";
+        case VK_ERROR_EXTENSION_NOT_PRESENT: return "VK_ERROR_EXTENSION_NOT_PRESENT";
+        case VK_ERROR_FEATURE_NOT_PRESENT: return "VK_ERROR_FEATURE_NOT_PRESENT";
+        case VK_ERROR_INCOMPATIBLE_DRIVER: return "VK_ERROR_INCOMPATIBLE_DRIVER";
+        case VK_ERROR_TOO_MANY_OBJECTS: return "VK_ERROR_TOO_MANY_OBJECTS";
+        case VK_ERROR_FORMAT_NOT_SUPPORTED: return "VK_ERROR_FORMAT_NOT_SUPPORTED";
+        case VK_ERROR_FRAGMENTED_POOL: return "VK_ERROR_FRAGMENTED_POOL";
+        case VK_ERROR_OUT_OF_POOL_MEMORY: return "VK_ERROR_OUT_OF_POOL_MEMORY";
+        case VK_ERROR_SURFACE_LOST_KHR: return "VK_ERROR_SURFACE_LOST_KHR";
+        case VK_ERROR_NATIVE_WINDOW_IN_USE_KHR: return "VK_ERROR_NATIVE_WINDOW_IN_USE_KHR";
+        case VK_SUBOPTIMAL_KHR: return "VK_SUBOPTIMAL_KHR";
+        case VK_ERROR_OUT_OF_DATE_KHR: return "VK_ERROR_OUT_OF_DATE_KHR";
+        case VK_ERROR_INCOMPATIBLE_DISPLAY_KHR: return "VK_ERROR_INCOMPATIBLE_DISPLAY_KHR";
+        case VK_ERROR_VALIDATION_FAILED_EXT: return "VK_ERROR_VALIDATION_FAILED_EXT";
+        case VK_ERROR_INVALID_SHADER_NV: return "VK_ERROR_INVALID_SHADER_NV";
+        default: return "(unknown)";
+    }
+}
 
 static struct {
     int ready;
@@ -743,7 +776,7 @@ int picolm_gpu_init(const int *devices, int count) {
         goto init_fail;
     }
     // Build ring buffer for RMSNorm (avoids singleton descriptor aliasing)
-    { VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 256*3};
+    { VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 256*4};
       VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .maxSets = 256, .poolSizeCount = 1, .pPoolSizes = &ps};
       VKCHECK(vkCreateDescriptorPool(G.dev, &dpi, NULL, &G.dpool_nrm_ring), "nrm_ring_pool");
@@ -791,14 +824,18 @@ int picolm_gpu_init(const int *devices, int count) {
         goto init_fail;
     }
     // Build ring buffer for elementwise (avoids singleton descriptor aliasing)
-    { VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 256*3};
+    { VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 256*4};
       VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         .maxSets = 256, .poolSizeCount = 1, .pPoolSizes = &ps};
       VKCHECK(vkCreateDescriptorPool(G.dev, &dpi, NULL, &G.dpool_elem_ring), "elem_ring_pool");
       for (int _si = 0; _si < 256; _si++) {
         VkDescriptorSetAllocateInfo dsa = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
           .descriptorPool = G.dpool_elem_ring, .descriptorSetCount = 1, .pSetLayouts = &G.dsl_unified};
-        vkAllocateDescriptorSets(G.dev, &dsa, &G.dset_elem_ring[_si]);
+        VkResult ar = vkAllocateDescriptorSets(G.dev, &dsa, &G.dset_elem_ring[_si]);
+        if (ar != VK_SUCCESS) {
+          fprintf(stderr, "[VK] elem_ring alloc[%d] failed: %s (%d)\n", _si, vk_result_str(ar), (int)ar);
+          break;
+        }
       }
     }
 
@@ -1876,7 +1913,11 @@ int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_d
 
     int ok = 0;  // Assume fallback needed
     // Q8_0 path: quantize F32->Q8 on device, then Q8xQ8 matmul
-    if (1 && t->qtype == GGUF_TYPE_Q8_0 && G.shader_quantize && G.shader_q8q8) {
+    // Q8_0 path: quantize F32->Q8 on device, then Q8xQ8 matmul
+    if (t->qtype == GGUF_TYPE_Q8_0 && G.shader_quantize && G.shader_q8q8) {
+        if (getenv("PICOLM_DISPATCH")) {
+            static int _q8d=0; if(!_q8d){_q8d=1;fprintf(stderr,"DISPATCH matmul_dev: Q8_0 I=%d O=%d S=%d\n",t->I,t->O,S);}
+        }
         if (_quantize_dev(x_dev, t->I, S)) {
             // Memory barrier: quantize wrote to q8_xq/q8_xd, q8q8 reads from them
             VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -1889,6 +1930,9 @@ int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_d
     }
     // Fallback: scalar dequant matmul (existing shader)
     if (!ok) {
+        if (getenv("PICOLM_DISPATCH")) {
+            static int _fd=0; if(!_fd){_fd=1;fprintf(stderr,"DISPATCH matmul_dev: fallback scalar I=%d O=%d S=%d qtype=%d\n",t->I,t->O,S,t->qtype);}
+        }
         VkDescriptorBufferInfo bi[3] = {xbi, {t->wbuf,0,VK_WHOLE_SIZE}, ybi};
         wr_desc_ring(3, bi);
         VkDescriptorSet cur_dset = G.dset[(G.dset_idx - 1) % 256];
@@ -2012,7 +2056,6 @@ int picolm_gpu_residual_add(float *out, const float *a, const float *b,
                              int n, int dim, int stride, int device) {
     if (!G.ready || !G.shader_elem || device != 0 || n < 1) return 0;
     (void)dim; (void)stride;
-    (void)0;  /* debug prints removed */
     VkDescriptorBufferInfo bi[4] = {desc_buf_info(a), desc_buf_info(b), desc_buf_info(out), {VK_NULL_HANDLE,0,0}};
     if (!bi[0].buffer || !bi[1].buffer || !bi[2].buffer) { fprintf(stderr, "[RN_DESC] FAIL x_buf=%p w_buf=%p y_buf=%p\n", (void*)bi[0].buffer, (void*)bi[1].buffer, (void*)bi[2].buffer); return 0; }
     VkDescriptorSet elem_set = G.dset_elem_ring[G.dset_idx % 256];

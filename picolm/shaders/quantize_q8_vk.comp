@@ -1,6 +1,9 @@
 #version 450
 // Quantize F32 activations to Q8_0 block format on device.
-// Each workgroup (32 threads) handles one 32-value block of one activation row.
+// PURE PER-THREAD: no shared memory, no barriers.
+// Each workgroup (256 threads) handles one 32-value block of one activation row.
+// Thread 0 computes the max abs and writes the d_val.
+// All 32 threads quantize their own element and write directly to QS output.
 //
 // Input x:     [S][I] float32, contiguous
 // Output qs:   [S][n_blocks][8] uint32 (32 int8 values packed as 8 uint32 words)
@@ -9,11 +12,11 @@
 // Push constants: int I, int S, int pad (zero) = 12 bytes
 // Binding 0: readonly X (float)
 // Binding 1: writeonly QS (uint32 words)
-// Binding 2: writeonly D (float)
+// Binding 2: writeonly D  (float)
 //
-// Grid: [n_blocks, S, 1], Block: 32 threads
+// Grid: [n_blocks, S, 1], Block: 256 threads
 
-layout(local_size_x = 32) in;
+layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer X  { float x[]; };
 layout(std430, binding = 1) writeonly buffer QS { uint qs[]; };
@@ -25,13 +28,9 @@ layout(push_constant) uniform P {
     int pad;
 } p;
 
-shared float amax_sh[32];
-shared uint qs_sh[8];
-shared uint qs_raw[32];  // per-thread raw bytes before packing
-
 void main() {
-    uint s   = gl_WorkGroupID.y;
     uint blk = gl_WorkGroupID.x;
+    uint s   = gl_WorkGroupID.y;
     uint tid = gl_LocalInvocationID.x;
 
     uint n_blocks = (uint(p.I) + 31u) / 32u;
@@ -39,49 +38,59 @@ void main() {
 
     uint base = s * uint(p.I) + blk * 32u;
     int valid = p.I - int(blk) * 32;
+    if (valid <= 0) return;
 
-    float v = (tid < uint(valid)) ? x[base + tid] : 0.0;
-
-    // Step 1: Find max absolute value
-    amax_sh[tid] = abs(v);
-    memoryBarrierShared();
-    barrier();
-
-    for (uint stride = 16; stride > 0u; stride >>= 1) {
-        if (tid < stride)
-            amax_sh[tid] = max(amax_sh[tid], amax_sh[tid + stride]);
-        memoryBarrierShared();
-        barrier();
+    // Step 1: Thread 0 scans all 32 elements to find max abs
+    // All other threads do nothing for this step
+    float amax0 = 0.0;
+    if (tid == 0u) {
+        for (uint i = 0; i < 32u; i++) {
+            if (i >= uint(valid)) break;
+            float v = x[base + i];
+            float av = abs(v);
+            if (av > amax0) amax0 = av;
+        }
     }
-    float amax0 = amax_sh[0];
 
-    // Step 2: Quantize
+    // Broadcast amax0 to all threads via a simple per-thread recompute
+    // (avoids shared memory entirely)
+    amax0 = 0.0;
+    for (uint i = 0; i < 32u; i++) {
+        if (i >= uint(valid)) break;
+        float v = x[base + i];
+        float av = abs(v);
+        if (av > amax0) amax0 = av;
+    }
+
+    // Step 2: Compute scale
     float d_val = amax0 / 127.0;
     float id = (d_val > 0.0) ? (1.0 / d_val) : 0.0;
-    float qs_val = v * id;
-    int qi = int(qs_val + (qs_val >= 0.0 ? 0.5 : -0.5));
-    qi = clamp(qi, -128, 127);
 
-    // Step 3: Pack int8 into shared uint32 words
-    // Each thread writes to its own per-thread slot first
-    qs_raw[tid] = uint(qi & 0xffu);
-    memoryBarrierShared();
-    barrier();
-
-    // Threads 0,4,8,...,28 combine 4 consecutive bytes into one uint32 word
-    if (tid % 4u == 0u) {
-        uint widx = tid / 4u;
-        qs_sh[widx] = qs_raw[tid] | (qs_raw[tid + 1u] << 8u) |
-                       (qs_raw[tid + 2u] << 16u) | (qs_raw[tid + 3u] << 24u);
-        memoryBarrierShared();
-        barrier();
+    // Step 3: Thread 0 writes the d_val
+    if (tid == 0u) {
+        d[s * n_blocks + blk] = d_val;
     }
 
-    // Step 4: Write output
-    if (tid == 0u) {
+    // Step 4: Threads 0-31 each quantize their element and write packed
+    // Each thread reads all 4 values that belong to its uint32 word,
+    // then writes the combined word to QS. 8 threads do this.
+    uint widx = tid;
+    if (widx < 8u) {
         uint out_base = (s * n_blocks * 32u + blk * 32u) / 4u;
-        for (uint w = 0; w < 8; w++)
-            qs[out_base + w] = qs_sh[w];
-        d[s * n_blocks + blk] = d_val;
+        uint packed = 0u;
+        for (uint b = 0u; b < 4u; b++) {
+            uint val_idx = widx * 4u + b;
+            if (val_idx >= 32u || val_idx >= uint(valid)) {
+                // Padding byte = 0 (sign bit clear for int8)
+                continue;
+            }
+            float v = x[base + val_idx];
+            float qs_val = v * id;
+            int qi = int(qs_val + (qs_val >= 0.0 ? 0.5 : -0.5));
+            qi = clamp(qi, -128, 127);
+            uint byte_val = uint(qi & 0xffu);
+            packed |= byte_val << (b * 8u);
+        }
+        qs[out_base + widx] = packed;
     }
 }

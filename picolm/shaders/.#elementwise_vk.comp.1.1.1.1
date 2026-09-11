@@ -1,0 +1,88 @@
+#version 450
+// Elementwise operations: residual_add, silu_mul, rope_apply, f32_to_f16, sigmoid_mul
+// 4 STORAGE_BUFFER bindings, 20-byte push constant
+//
+// op=0: residual_add    bind0=a(ro), bind1=b(ro), bind2=out(rw), bind3=unused
+// op=1: silu_mul        bind0=gate(rw), bind1=up(ro), bind2=gate(rw, same as 0), bind3=unused
+// op=2: rope_apply      bind0=x(rw), bind1=cos(ro), bind2=sin(ro), bind3=unused
+// op=3: f32_to_f16      bind0=src_f32(ro), bind1=unused, bind2=unused, bind3=dst_u32(rw)
+// op=4: sigmoid_mul     bind0=out(rw), bind1=gate(ro), bind2=unused, bind3=unused
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer B0 { float d0[]; };
+layout(set = 0, binding = 1) buffer B1 { float d1[]; };
+layout(set = 0, binding = 2) buffer B2 { float d2[]; };
+layout(set = 0, binding = 3) buffer B3 { uint d3[]; };
+
+layout(push_constant) uniform PC {
+    int op;
+    int n;
+    float fp;
+    int pad;
+} pc;
+
+uint f32tof16_bits(float v) {
+    // Reinterpret float bits as uint via floatBitsToInt + bitcast
+    // GLSL doesn't have uintBitsToUint, but we can use pack/unpack tricks
+    // or just do the math directly:
+    int iv = floatBitsToInt(v);
+    // bitcast int to uint: just reinterpret the bits
+    uint fv = bitfieldInsert(0u, uint(iv), 0, 32);
+    uint sign = (fv >> 16u) & 0x8000u;
+    uint exp = (fv >> 23u) & 0xffu;
+    uint frac = fv & 0x7fffffu;
+    if (exp == 0u) return sign;
+    if (exp == 0xffu) return sign | 0x7c00u;
+    int e = int(exp) - 127 + 15;
+    if (e <= 0) return sign;
+    if (e >= 31) return sign | 0x7c00u;
+    return sign | uint(e) << 10u | (frac >> 13u);
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+
+    if (pc.op == 0) {
+        if (gid < uint(pc.n)) d2[gid] = d0[gid] + d1[gid];
+    } else if (pc.op == 1) {
+        if (gid < uint(pc.n)) {
+            float g = d0[gid];
+            float silu_g = g / (1.0 + exp(-g));
+            d0[gid] = silu_g * d1[gid];
+        }
+    } else if (pc.op == 2) {
+        uint hd2 = uint(pc.n);
+        int n_heads = int(pc.fp);
+        int stride = 2 * int(hd2);
+        if (gid < hd2) {
+            for (int h = 0; h < n_heads; h++) {
+                int base = h * stride + 2 * int(gid);
+                float x0 = d0[base];
+                float x1 = d0[base + 1];
+                float c = d1[gid];
+                float s = d2[gid];
+                d0[base]     = x0 * c - x1 * s;
+                d0[base + 1] = x0 * s + x1 * c;
+            }
+        }
+    } else if (pc.op == 3) {
+        // F32->F16 pack: each thread handles one output word (2 F16 values)
+        uint word_gid = gid;
+        uint idx0 = word_gid * 2u;
+        if (idx0 < uint(pc.n)) {
+            uint lo = f32tof16_bits(d0[idx0]);
+            if (idx0 + 1u < uint(pc.n)) {
+                uint hi = f32tof16_bits(d0[idx0 + 1u]);
+                d3[word_gid] = lo | (hi << 16u);
+            } else {
+                d3[word_gid] = lo;
+            }
+        }
+    } else if (pc.op == 4) {
+        if (gid < uint(pc.n)) {
+            d0[gid] *= 1.0 / (1.0 + exp(-d1[gid]));
+        }
+    }
+}
+
