@@ -203,6 +203,7 @@ static struct {
     // Phase 2: device-native pipeline command buffers
     VkCommandBuffer cmd_dev;   // Accumulates device-native work
     VkCommandBuffer cmd_xfer;  // Transfer commands (staging H2D)
+    VkCommandPool cpool_xfer;  // Separate pool for transfer CBs (KAVERI WA)
     VkFence fence;             // Phase 1 sync fence
     VkFence fence_dev;         // Phase 2 sync fence (for picolm_gpu_sync)
     VkFence fence_xfer;        // Transfer fence
@@ -823,7 +824,14 @@ int picolm_gpu_init(const int *devices, int count) {
     VkCommandBufferAllocateInfo cbi2 = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
         .commandPool = G.cpool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
     VKCHECK(vkAllocateCommandBuffers(G.dev, &cbi2, &G.cmd_dev), "cmdBufDev");
-    VKCHECK(vkAllocateCommandBuffers(G.dev, &cbi, &G.cmd_xfer), "cmdBufXfer");
+    // Separate command pool for transfer CBs (KAVERI RADV WA: interleaved
+    // reset/record/submit on same pool causes D2H fence timeout)
+    VkCommandPoolCreateInfo xpci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = G.qfam};
+    VKCHECK(vkCreateCommandPool(G.dev, &xpci, NULL, &G.cpool_xfer), "cmdPoolXfer");
+    VkCommandBufferAllocateInfo cbix = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .commandPool = G.cpool_xfer, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+    VKCHECK(vkAllocateCommandBuffers(G.dev, &cbix, &G.cmd_xfer), "cmdBufXfer");
 
     // Phase 2: staging buffer (HOST_VISIBLE, growable)
     G.staging_cap = 0;
@@ -1005,8 +1013,9 @@ void picolm_gpu_shutdown(void) {
     if (G.cmd)   vkFreeCommandBuffers(G.dev, G.cpool, 1, &G.cmd);
     if (G.cmd_nrm) vkFreeCommandBuffers(G.dev, G.cpool, 1, &G.cmd_nrm);
     if (G.cmd_dev) vkFreeCommandBuffers(G.dev, G.cpool, 1, &G.cmd_dev);
-    if (G.cmd_xfer) vkFreeCommandBuffers(G.dev, G.cpool, 1, &G.cmd_xfer);
+    if (G.cmd_xfer) vkFreeCommandBuffers(G.dev, G.cpool_xfer, 1, &G.cmd_xfer);
     if (G.cpool) vkDestroyCommandPool(G.dev, G.cpool, NULL);
+    if (G.cpool_xfer) vkDestroyCommandPool(G.dev, G.cpool_xfer, NULL);
     if (G.fence) vkDestroyFence(G.dev, G.fence, NULL);
     if (G.fence_dev) vkDestroyFence(G.dev, G.fence_dev, NULL);
     if (G.fence_xfer) vkDestroyFence(G.dev, G.fence_xfer, NULL);
@@ -1437,6 +1446,14 @@ static VkBuffer unwrap_buf_offset(const void *p, VkDeviceSize *out_off) {
         }
     }
     *out_off = 0;
+    return VK_NULL_HANDLE;
+}
+
+/* Get the VkDeviceMemory for a buffer in the device buffer list */
+static VkDeviceMemory unwrap_mem(VkBuffer target_buf) {
+    for (vk_dev_buf_t *d = g_dev_buf_list; d; d = d->next) {
+        if (d->buf == target_buf) return d->mem;
+    }
     return VK_NULL_HANDLE;
 }
 
@@ -2372,6 +2389,20 @@ int picolm_gpu_kv_store_dev(int is_k, int lo, int pos,
     return 1;
 }
 
+/* Helper: D2H copy via vkCmdCopyBuffer (fallback for mapped-read failure) */
+static void _kv_d2h_copy(VkBuffer src_buf, VkDeviceSize src_off, size_t total_f32) {
+    if (!staging_ensure(total_f32 * sizeof(float))) return;
+    VkCommandBufferBeginInfo _bgi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkResetCommandBuffer(G.cmd_xfer, 0); vkBeginCommandBuffer(G.cmd_xfer, &_bgi);
+    VkBufferCopy _bc = {src_off, 0, total_f32 * sizeof(float)};
+    vkCmdCopyBuffer(G.cmd_xfer, src_buf, G.staging_buf, 1, &_bc);
+    vkEndCommandBuffer(G.cmd_xfer);
+    VkSubmitInfo _si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_xfer};
+    vkResetFences(G.dev, 1, &G.fence_xfer);
+    vkQueueSubmit(G.queue, 1, &_si, G.fence_xfer);
+    vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
+}
+
 /* CPU-side F32->F16 conversion (same algorithm as kv_store_vk.comp) */
 static uint16_t f32tof16_cpu(float v) {
     union { float f; uint32_t u; } u = {.f = v};
@@ -2406,18 +2437,28 @@ int picolm_gpu_kv_store_dev_batched(int is_k, int lo, int sp, int np,
     if (G.in_batch) picolm_gpu_batch_end(device);
     vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
 
-    // D2H
-    if (!staging_ensure(total_f32 * sizeof(float))) return 0;
+    // D2H: direct mapped read (KAVERI WA: vkCmdCopyBuffer D2H hangs on RADV KAVERI)
     VkDescriptorBufferInfo src_info = desc_buf_info(sd);
-    VkCommandBufferBeginInfo _bgi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    vkResetCommandBuffer(G.cmd_xfer, 0); vkBeginCommandBuffer(G.cmd_xfer, &_bgi);
-    VkBufferCopy _bc_d2h = {src_info.offset, 0, total_f32 * sizeof(float)};
-    vkCmdCopyBuffer(G.cmd_xfer, src_info.buffer, G.staging_buf, 1, &_bc_d2h);
-    vkEndCommandBuffer(G.cmd_xfer);
-    VkSubmitInfo _si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_xfer};
-    vkResetFences(G.dev, 1, &G.fence_xfer);
-    vkQueueSubmit(G.queue, 1, &_si, G.fence_xfer);
-    vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
+    VkDeviceSize src_off = src_info.offset;
+    VkBuffer src_buf = src_info.buffer;
+    /* Ensure CPU-side staging area is available for F16 packing */
+    if (!staging_ensure(total_f32 * sizeof(float))) return 0;
+    /* Find the source buffer's device memory for direct mapping */
+    VkDeviceMemory src_mem = unwrap_mem(src_buf);
+    if (src_mem) {
+        void *mapped = NULL;
+        VkResult mr = vkMapMemory(G.dev, src_mem, src_off, total_f32 * sizeof(float), 0, &mapped);
+        if (mr == VK_SUCCESS && mapped) {
+            /* Direct memcpy from mapped device memory */
+            memcpy(G.staging_ptr, mapped, total_f32 * sizeof(float));
+            vkUnmapMemory(G.dev, src_mem);
+        } else {
+            /* Fallback: vkCmdCopyBuffer path */
+            _kv_d2h_copy(src_buf, src_off, total_f32);
+        }
+    } else {
+        _kv_d2h_copy(src_buf, src_off, total_f32);
+    }
 
     // CPU F32->F16
     { float *sf = (float*)G.staging_ptr;
@@ -2425,14 +2466,36 @@ int picolm_gpu_kv_store_dev_batched(int is_k, int lo, int sp, int np,
       for(size_t i=0;i<total_f32;i++) pk[i] = f32tof16_cpu(sf[i]);
       memcpy(G.staging_ptr, pk, total_f16); free(pk); }
 
-    // H2D
-    vkResetCommandBuffer(G.cmd_xfer, 0); vkBeginCommandBuffer(G.cmd_xfer, &_bgi);
-    VkBufferCopy _bc_h2d = {0, dst_byte_off, total_f16};
-    vkCmdCopyBuffer(G.cmd_xfer, G.staging_buf, dst_buf, 1, &_bc_h2d);
-    vkEndCommandBuffer(G.cmd_xfer);
-    vkResetFences(G.dev, 1, &G.fence_xfer);
-    vkQueueSubmit(G.queue, 1, &_si, G.fence_xfer);
-    vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
+    // H2D: direct mapped write (KAVERI WA: vkCmdCopyBuffer hangs on RADV KAVERI)
+    { VkDeviceMemory dst_mem = unwrap_mem(dst_buf);
+      if (dst_mem) {
+          void *dst_mapped = NULL;
+          if (vkMapMemory(G.dev, dst_mem, dst_byte_off, total_f16, 0, &dst_mapped) == VK_SUCCESS && dst_mapped) {
+              memcpy(dst_mapped, G.staging_ptr, total_f16);
+              vkUnmapMemory(G.dev, dst_mem);
+          } else {
+              /* Fallback: vkCmdCopyBuffer */
+              VkCommandBufferBeginInfo _hbgi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+              vkResetCommandBuffer(G.cmd_xfer, 0); vkBeginCommandBuffer(G.cmd_xfer, &_hbgi);
+              VkBufferCopy _bc_h2d = {0, dst_byte_off, total_f16};
+              vkCmdCopyBuffer(G.cmd_xfer, G.staging_buf, dst_buf, 1, &_bc_h2d);
+              vkEndCommandBuffer(G.cmd_xfer);
+              VkSubmitInfo _hsi = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_xfer};
+              vkResetFences(G.dev, 1, &G.fence_xfer);
+              vkQueueSubmit(G.queue, 1, &_hsi, G.fence_xfer);
+              vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
+          }
+      } else {
+          VkCommandBufferBeginInfo _hbgi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+          vkResetCommandBuffer(G.cmd_xfer, 0); vkBeginCommandBuffer(G.cmd_xfer, &_hbgi);
+          VkBufferCopy _bc_h2d = {0, dst_byte_off, total_f16};
+          vkCmdCopyBuffer(G.cmd_xfer, G.staging_buf, dst_buf, 1, &_bc_h2d);
+          vkEndCommandBuffer(G.cmd_xfer);
+          VkSubmitInfo _hsi = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_xfer};
+          vkResetFences(G.dev, 1, &G.fence_xfer);
+          vkQueueSubmit(G.queue, 1, &_hsi, G.fence_xfer);
+          vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
+      } }
 
     // Restore batch state for subsequent dispatches
     if (was_in_batch && !G.in_batch) picolm_gpu_batch_begin(device);
