@@ -1,8 +1,8 @@
 #version 450
 // Q8_0 x Q8_0 matmul: y[S][O] = xq[S][I] * xd[S][n_blocks] @ W[O][I]
-// Grid: [ceil(O*S/256), 1, 1], block: [256, 1, 1]
-// Each thread computes one output element. Partial sums accumulated per-thread,
-// no shared memory needed for correctness (but slower on KAVERI without subgroups).
+// Grid: [ceil(O/256), S, 1], block: [256, 1, 1]
+// Each thread computes one output element. 2D dispatch gives more workgroups
+// for better GPU scheduling (especially on GCN1 where more workgroups = better occupancy).
 
 layout(local_size_x = 256) in;
 
@@ -33,13 +33,10 @@ float f16tof32(uint h) {
 }
 
 void main() {
-    // Dispatch is [ceil(O*S/256), 1, 1] workgroups with local_size_x=256
-    uint gid = gl_GlobalInvocationID.x;
-    uint total = uint(p.S) * uint(p.O);
-    if (gid >= total) return;
-
-    int o = int(gid % uint(p.O));
-    int s = int(gid / uint(p.O));
+    // 2D dispatch: [ceil(O/256), S, 1]
+    int o = int(gl_GlobalInvocationID.x % uint(p.O));
+    int s = int(gl_GlobalInvocationID.y);
+    uint gid = uint(s) * uint(p.O) + uint(o);
 
     int nblocks = p.I / 32;
     uint rowBase = uint(o) * uint(p.rowWords);
@@ -80,4 +77,3 @@ void main() {
 
     y[gid] = sum;
 }
-
