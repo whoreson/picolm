@@ -41,8 +41,8 @@
 #include <string.h>
 #include <math.h>
 #include <sys/types.h>
-#include <sys/resource.h>
 #if !defined(_WIN32) && !defined(__DJGPP__)
+#include <sys/resource.h>
 #include <alloca.h>
 #endif
 
@@ -73,12 +73,15 @@ extern int cudaProfilerStop(void);
 #include <security.h>
 #include <accctrl.h>
 #include <aclapi.h>
-#elif !defined(PICOLM_DOS)
+#elif !defined(PICOLM_DOS) && !defined(_WIN32)
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <stdint.h>
+#elif defined(_WIN32)
+#include <sys/stat.h>
 #include <stdint.h>
 #include <pthread.h>
 #endif

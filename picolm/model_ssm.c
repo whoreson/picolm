@@ -4693,7 +4693,7 @@ after_qkv:
         /* Debug: read bx after last layer */
         if (l == c->n_layers - 1 && n_ubatch == 1) {
             picolm_gpu_sync(gpu_dev);
-            float dbg_bx[dim];
+            float *dbg_bx = alloca(dim * sizeof(float));
             picolm_gpu_memcpy(dbg_bx, bx, dim * sizeof(float), -1, gpu_dev);
             { float rms=0; for(int _i=0;_i<dim;_i++) rms+=dbg_bx[_i]*dbg_bx[_i]; rms=sqrtf(rms/dim);
               fprintf(stderr,"[GPU L%d FINAL bx] rms=%.4f x[:4]={", l, rms);
