@@ -131,9 +131,9 @@ void swap_f16_block(uint16_t *dst, size_t n) {
  * mmap region to bring the model into the page cache before inference. */
 static int g_do_prefault = 0;
 
-/* Benchmark layer callback */
-static bench_layer_cb_t g_bench_cb = NULL;
-static void *g_bench_user_data = NULL;
+/* Benchmark layer callback -- exported for use by model_ssm.c GPU prefill path */
+bench_layer_cb_t g_bench_cb = NULL;
+void *g_bench_user_data = NULL;
 
 void model_set_bench_callback(bench_layer_cb_t cb, void *user_data) {
     g_bench_cb = cb;
