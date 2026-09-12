@@ -1,10 +1,5 @@
 #version 450
-// Q8_0 x Q8_0 matmul: y[S][O] = xq[S][I] * xd[S][n_blocks] @ W[O][I]
-// Grid: [ceil(O/256), S, 1], block: [256, 1, 1]
-// Each thread computes one output element. 2D dispatch gives more workgroups
-// for better GPU scheduling (especially on GCN1 where more workgroups = better occupancy).
-
-layout(local_size_x = 256) in;
+layout(local_size_x = 64) in;  // Smaller workgroup = more workgroups
 
 layout(std430, binding = 0) readonly buffer XQ { uint xq[]; };
 layout(std430, binding = 1) readonly buffer XD { float xd[]; };
@@ -33,19 +28,18 @@ float f16tof32(uint h) {
 }
 
 void main() {
-    // 2D dispatch: [ceil(O/256), S, 1]
-    int o = int(gl_GlobalInvocationID.x % uint(p.O));
+    uint o = gl_GlobalInvocationID.x;
     int s = int(gl_GlobalInvocationID.y);
-    uint gid = uint(s) * uint(p.O) + uint(o);
-
+    if (o >= uint(p.O)) return;
+    
+    uint gid = uint(s) * uint(p.O) + o;
     int nblocks = p.I / 32;
-    uint rowBase = uint(o) * uint(p.rowWords);
-    uint xq_base = uint(s) * uint(p.I) / 4u;
+    uint xq_words = uint(p.I) / 4u;
+    uint rowBase = o * uint(p.rowWords);
+    uint xq_base = uint(s) * xq_words;
     int xd_base = s * nblocks;
-
     float sum = 0.0;
 
-    // Each thread does all blocks (no shared memory reduction needed)
     for (int bi = 0; bi < nblocks; bi++) {
         uint bo = uint(bi) * 34u;
         uint dWord = rowBase + bo / 4u;
@@ -53,27 +47,21 @@ void main() {
         float wd = f16tof32((w[dWord] >> dShift) & 0xffffu);
         float ad = xd[xd_base + bi];
         float scale = wd * ad;
-
         uint aqs_base = xq_base + uint(bi) * 8u;
-
         for (int v = 0; v < 32; v++) {
             int vi = bi * 32 + v;
             if (vi >= p.I) break;
-
             uint wbyte_off = rowBase + (bo + 2u + uint(v)) / 4u;
             uint wshift = ((bo + 2u + uint(v)) % 4u) * 8u;
             uint wbyte = (w[wbyte_off] >> wshift) & 0xffu;
             int wval = int(wbyte);
             if (wval >= 128) wval -= 256;
-
             uint ab_idx = aqs_base + uint(v) / 4u;
             uint abyte = (xq[ab_idx] >> ((uint(v) % 4u) * 8u)) & 0xffu;
             int aval = int(abyte);
             if (aval >= 128) aval -= 256;
-
             sum += float(wval) * float(aval) * scale;
         }
     }
-
     y[gid] = sum;
 }

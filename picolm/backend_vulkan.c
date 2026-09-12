@@ -2300,8 +2300,9 @@ static int _q8q8_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, int S) {
     push_desc(G.cmd_dev, 4, bi);
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(pc), &pc);
-    // 2D dispatch: [ceil(O/256), S, 1] for more workgroups = better GPU scheduling
-    vkCmdDispatch(G.cmd_dev, (uint32_t)t->O / 256 + 1, (uint32_t)S, 1);
+    // Fine-grained dispatch: [O, S, 1] with local_size_x=64 = 1 subgroup per workgroup
+    // For O=960,S=7: 6720 workgroups vs 28 with local_size_x=256
+    vkCmdDispatch(G.cmd_dev, (uint32_t)t->O, (uint32_t)S, 1);
     _g_dispatch_cnt++;
     return 1;
 }
