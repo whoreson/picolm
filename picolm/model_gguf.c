@@ -972,14 +972,17 @@ int parse_gguf(model_t *m, int max_seq_len) {
         } else if (str_eq(key, "gemma3n.embedding_length_per_layer_input")) {
             int dummy; cfg->n_embd_altup = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "gemma3n.attention.shared_kv_layers")) {
-            /* shared_kv_layers is f32 in GGUF but represents an integer count.
+            /* shared_kv_layers can be f32 or u32 depending on GGUF provenance.
+             * E4B GGUFs store it as f32, E2B GGUFs store it as u32.
              * Value is the number of layers from the END that share KV.
              * n_layer_kv_from_start = n_layers - shared_kv_layers */
+            int shared_kv = 0;
             if (vtype == GGUF_META_FLOAT32) {
-                cfg->n_layer_kv_from_start = cfg->n_layers - (int)read_f32(&r);
+                shared_kv = (int)read_f32(&r);
             } else {
-                int dummy; skip_meta_value(&r, vtype, &dummy);
+                shared_kv = (int)skip_meta_value(&r, vtype, NULL);
             }
+            cfg->n_layer_kv_from_start = cfg->n_layers - shared_kv;
         } else if (str_eq(key, "gemma3n.attention.sliding_window")) {
             int dummy; cfg->n_swa = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "gemma3n.attention.sliding_window_pattern")) {

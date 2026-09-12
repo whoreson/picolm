@@ -1876,7 +1876,14 @@ void quantize_row_q8_K(const float *x, void *dst, int n) {
             float ax = xb[j] < 0 ? -xb[j] : xb[j];
             if (ax > amax) amax = ax;
         }
-        float id = (amax != 0.0f) ? 127.0f / amax : 0.0f;
+        if (amax == 0.0f) {
+            /* All activations zero: set zero scale/qs/bsums to avoid inf/NaN */
+            y[i].d = 0.0f;
+            memset(y[i].qs, 0, 256);
+            memset(y[i].bsums, 0, 16 * sizeof(int16_t));
+            continue;
+        }
+        float id = 127.0f / amax;
         y[i].d = 1.0f / id;
         
 #ifdef PICOLM_NEON
