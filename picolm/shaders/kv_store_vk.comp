@@ -1,18 +1,14 @@
 #version 450
-// KV cache store: F32 -> F16 pack, write directly to KV cache buffer.
-// Device-side, no shared memory, grid-stride loop.
-// Mirrors CUDA's picolm_gpu_kv_pack_store_kernel.
+// KV cache store: F32->F16 pack and write to KV cache buffer.
+// Entirely device-side, no shared memory, no barriers.
 //
 // Binding 0: src F32 data (readonly) -- pipe buffer K or V output
-// Binding 3: dst KV cache (writeonly, uint std430 buffer)
-//
-// Each thread handles pairs of F32 elements, packing 2x F16 into 1 uint32.
-// No shared memory, no barriers, no atomic operations.
+// Binding 3: dst KV cache buffer (writeonly, uint typed)
 //
 // Push constants:
-//   int n;        // number of F32 elements to convert
-//   int dst_off;  // destination offset in uint32 words (byte_offset / 4)
-//   int pad0, pad1;
+//   int n;          // number of F32 elements to convert
+//   int dst_off;    // destination offset in uint32 words (byte_offset / 4)
+//   int pad[2];
 
 layout(local_size_x = 256) in;
 
@@ -26,15 +22,12 @@ layout(push_constant) uniform PC {
     int pad1;
 } pc;
 
-// Bit-exact F32->F16 conversion matching CUDA picolm_gpu_fp32_to_fp16
-// and host f32tof16_cpu. Truncating (no round-to-nearest).
-// Uses bitfieldInsert to safely bitcast int->uint on RADV.
 uint f32tof16_bits(float v) {
     int iv = floatBitsToInt(v);
-    uint bits = bitfieldInsert(0u, uint(iv), 0, 32);
-    uint sign = (bits >> 16u) & 0x8000u;
-    uint exp = (bits >> 23u) & 0xffu;
-    uint frac = bits & 0x7fffffu;
+    uint fv = bitfieldInsert(0u, uint(iv), 0, 32);
+    uint sign = (fv >> 16u) & 0x8000u;
+    uint exp = (fv >> 23u) & 0xffu;
+    uint frac = fv & 0x7fffffu;
     if (exp == 0u) return sign;
     if (exp == 0xffu) return sign | 0x7c00u;
     int e = int(exp) - 127 + 15;
@@ -44,25 +37,17 @@ uint f32tof16_bits(float v) {
 }
 
 void main() {
-    // Each thread handles pairs: 2 F32 -> 1 uint32 (packed 2x F16)
-    // Total F32 elements: pc.n. Total uint32 output words: (pc.n + 1) / 2
-    // Grid-stride over uint32 words.
-    uint total_words = (uint(pc.n) + 1u) >> 1u;
-    uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    // Each thread handles 2 F32 inputs -> 1 uint32 output (2 F16 values)
+    uint word_gid = gl_GlobalInvocationID.x;
+    uint idx0 = word_gid * 2u;
 
-    for (uint word_gid = gl_GlobalInvocationID.x;
-         word_gid < total_words;
-         word_gid += stride) {
-
-        uint idx0 = word_gid << 1u;  // 2 * word_gid
-        uint lo = 0u;
-        if (idx0 < uint(pc.n)) {
-            lo = f32tof16_bits(src[idx0]);
-        }
+    if (idx0 < uint(pc.n)) {
+        uint lo = f32tof16_bits(src[idx0]);
         uint hi = 0u;
         if (idx0 + 1u < uint(pc.n)) {
             hi = f32tof16_bits(src[idx0 + 1u]);
         }
-        dst[uint(pc.dst_off) + word_gid] = lo | (hi << 16u);
+        uint val = lo | (hi << 16u);
+        dst[uint(pc.dst_off) + word_gid] = val;
     }
 }

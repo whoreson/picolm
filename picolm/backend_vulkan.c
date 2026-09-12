@@ -137,7 +137,17 @@ static struct {
     VkShaderModule shader;
     VkDescriptorPool dpool;
     VkDescriptorSet dset[256];
-    uint32_t dset_idx;  // ring buffer index for descriptor sets
+
+    // Per-ring descriptor set indices (independent counters per ring to avoid
+    // cross-ring wrap-around within large batches). Each ring has 256 sets,
+    // so the counter wraps at 256. With independent counters, each ring
+    // independently cycles through its 256 sets without interference.
+    uint32_t dset_idx;           // legacy/shared (matmul ring via wr_desc_ring)
+    uint32_t dset_idx_quantize;  // quantize ring
+    uint32_t dset_idx_q8q8;      // q8q8 ring
+    uint32_t dset_idx_nrm;       // rmsnorm ring
+    uint32_t dset_idx_elem;      // elementwise ring
+    uint32_t dset_idx_kv;        // kv_store ring
 
     // RMSNorm pipeline
     VkShaderModule shader_nrm;
@@ -1922,8 +1932,8 @@ static int _quantize_dev(const float *x_dev, int I, int S) {
         desc_buf_info(G.q8_xq_d),
         desc_buf_info(G.q8_xd_d)
     };
-    VkDescriptorSet quant_set = G.dset_quantize_ring[G.dset_idx % 256];
-    G.dset_idx++;
+    VkDescriptorSet quant_set = G.dset_quantize_ring[G.dset_idx_quantize % 256];
+    G.dset_idx_quantize++;
     wr_desc(quant_set, 3, bi);
     typedef struct { int I, S, pad; } PC_Q;
     PC_Q pc = {I, S, 0};
@@ -1949,8 +1959,8 @@ static int _q8q8_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, int S) {
         {t->wbuf, 0, VK_WHOLE_SIZE}, // weights
         desc_buf_info(y_dev)        // output
     };
-    VkDescriptorSet q8q8_set = G.dset_q8q8_ring[G.dset_idx % 256];
-    G.dset_idx++;
+    VkDescriptorSet q8q8_set = G.dset_q8q8_ring[G.dset_idx_q8q8 % 256];
+    G.dset_idx_q8q8++;
     wr_desc(q8q8_set, 4, bi);
     typedef struct { int I, S, O, rowWords; } PC_Q8;
     PC_Q8 pc = {t->I, S, t->O, (int)t->row_words};
@@ -2072,8 +2082,8 @@ int picolm_gpu_rmsnorm_batched_dev(float *out, const float *x, const float *weig
                 (void*)bi[0].buffer, (void*)bi[1].buffer, (void*)bi[2].buffer, (void*)weight, (void*)x, (void*)out); 
         return 0; 
     }
-    VkDescriptorSet nrm_set = G.dset_nrm_ring[G.dset_idx % 256];
-    G.dset_idx++;
+    VkDescriptorSet nrm_set = G.dset_nrm_ring[G.dset_idx_nrm % 256];
+    G.dset_idx_nrm++;
     wr_desc(nrm_set, 3, bi);
     VK_BATCH_DISPATCH_PRE();
     VK_BATCH_BARRIER();
@@ -2130,8 +2140,8 @@ int picolm_gpu_residual_add(float *out, const float *a, const float *b,
     (void)dim; (void)stride;
     VkDescriptorBufferInfo bi[4] = {desc_buf_info(a), desc_buf_info(b), desc_buf_info(out), {VK_NULL_HANDLE,0,0}};
     if (!bi[0].buffer || !bi[1].buffer || !bi[2].buffer) { fprintf(stderr, "[RN_DESC] FAIL x_buf=%p w_buf=%p y_buf=%p\n", (void*)bi[0].buffer, (void*)bi[1].buffer, (void*)bi[2].buffer); return 0; }
-    VkDescriptorSet elem_set = G.dset_elem_ring[G.dset_idx % 256];
-    G.dset_idx++;
+    VkDescriptorSet elem_set = G.dset_elem_ring[G.dset_idx_elem % 256];
+    G.dset_idx_elem++;
     wr_desc(elem_set, 4, bi);
     VK_BATCH_DISPATCH_PRE();
     VK_BATCH_BARRIER();
@@ -2150,8 +2160,8 @@ int picolm_gpu_silu_mul_dev(float *g, const float *u, size_t n, int device) {
     VkDescriptorBufferInfo gbi = desc_buf_info(g), ubi = desc_buf_info(u);
     if (!gbi.buffer || !ubi.buffer) return 0;
     VkDescriptorBufferInfo bi[4] = {gbi, ubi, gbi, {VK_NULL_HANDLE,0,0}};
-    VkDescriptorSet elem_set = G.dset_elem_ring[G.dset_idx % 256];
-    G.dset_idx++;
+    VkDescriptorSet elem_set = G.dset_elem_ring[G.dset_idx_elem % 256];
+    G.dset_idx_elem++;
     wr_desc(elem_set, 4, bi);
     VK_BATCH_DISPATCH_PRE();
     VK_BATCH_BARRIER();
@@ -2170,8 +2180,8 @@ int picolm_gpu_gelu_mul_dev(float *g, const float *u, size_t n, int device) {
     VkDescriptorBufferInfo gbi = desc_buf_info(g), ubi = desc_buf_info(u);
     if (!gbi.buffer || !ubi.buffer) return 0;
     VkDescriptorBufferInfo bi[4] = {gbi, ubi, gbi, {VK_NULL_HANDLE,0,0}};
-    VkDescriptorSet elem_set = G.dset_elem_ring[G.dset_idx % 256];
-    G.dset_idx++;
+    VkDescriptorSet elem_set = G.dset_elem_ring[G.dset_idx_elem % 256];
+    G.dset_idx_elem++;
     wr_desc(elem_set, 4, bi);
     VK_BATCH_DISPATCH_PRE();
     VK_BATCH_BARRIER();
@@ -2197,8 +2207,8 @@ int picolm_gpu_rope_apply(float *x, int n_heads, int head_dim,
     VkBuffer cb = unwrap_buf_offset(cos_tbl, &cos_off), sb = unwrap_buf_offset(sin_tbl, &sin_off);
     if (!xb || !cb || !sb) return 0;
     VkDescriptorBufferInfo bi[4] = {{xb,0,VK_WHOLE_SIZE},{cb,cos_off,VK_WHOLE_SIZE},{sb,sin_off,VK_WHOLE_SIZE},{VK_NULL_HANDLE,0,0}};
-    VkDescriptorSet elem_set = G.dset_elem_ring[G.dset_idx % 256];
-    G.dset_idx++;
+    VkDescriptorSet elem_set = G.dset_elem_ring[G.dset_idx_elem % 256];
+    G.dset_idx_elem++;
     wr_desc(elem_set, 4, bi);
     VK_BATCH_DISPATCH_PRE();
     vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_elem);
@@ -2252,8 +2262,8 @@ int picolm_gpu_rope_apply_batched(float *x, int n_heads, int head_dim,
             {cb, cos_off, (size_t)half_dim * sizeof(float)},
             {sb, sin_off, (size_t)half_dim * sizeof(float)},
         };
-        VkDescriptorSet elem_set = G.dset_elem_ring[G.dset_idx % 256];
-        G.dset_idx++;
+        VkDescriptorSet elem_set = G.dset_elem_ring[G.dset_idx_elem % 256];
+        G.dset_idx_elem++;
         wr_desc(elem_set, 3, bi);
 
         vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_elem);
@@ -2304,6 +2314,10 @@ int picolm_gpu_kv_alloc(size_t kv_k_bytes, size_t kv_v_bytes, int device) {
     return 1;
 }
 
+static int _kv_store_native(int is_k, int lo, int sp, int np,
+                             const float *sd, int nkh, int hd,
+                             int msl, int device, int src_stride);
+
 int picolm_gpu_kv_store_rows(int is_k, int lo, int sp, int np,
                               const void *hr, size_t rb,
                               int nkh, int hd, int msl, int device) {
@@ -2333,6 +2347,8 @@ int picolm_gpu_kv_store_dev(int is_k, int lo, int pos,
                              const float *sd, int nkh, int hd,
                              int msl, int device) {
     /* Decode path: single F32 row -> F16 -> KV cache buffer */
+    if (_kv_store_native(is_k, lo, pos, 1, sd, nkh, hd, msl, device, 0)) return 1;
+    /* Fallback: D2H + CPU convert + H2D (only hit if kv_store_vk.spv failed to load) */
     if (!G.ready || !sd || device != 0) return 0;
     VkBuffer dst_buf = is_k ? G.kv_k_buf : G.kv_v_buf;
     if (!dst_buf) return 0;
@@ -2420,6 +2436,8 @@ static uint16_t f32tof16_cpu(float v) {
 int picolm_gpu_kv_store_dev_batched(int is_k, int lo, int sp, int np,
                                      const float *sd, int nkh, int hd,
                                      int msl, int device) {
+    if (_kv_store_native(is_k, lo, sp, np, sd, nkh, hd, msl, device, 0)) return 1;
+    /* Fallback: D2H + CPU convert + H2D (only hit if kv_store_vk.spv failed to load) */
     if (!G.ready || !sd || device != 0) return 0;
     VkBuffer dst_buf = is_k ? G.kv_k_buf : G.kv_v_buf;
     if (!dst_buf) return 0;
@@ -2506,6 +2524,8 @@ int picolm_gpu_kv_store_dev_batched(int is_k, int lo, int sp, int np,
 int picolm_gpu_kv_store_dev_batched_strided(int is_k, int lo, int sp, int np,
                                              const float *sd, int nkh, int hd,
                                              int msl, int device, int src_stride) {
+    if (_kv_store_native(is_k, lo, sp, np, sd, nkh, hd, msl, device, src_stride)) return 1;
+    /* Fallback: D2H + CPU convert + H2D (only hit if kv_store_vk.spv failed to load) */
     if (!G.ready || !sd || device != 0) return 0;
     VkBuffer dst_buf = is_k ? G.kv_k_buf : G.kv_v_buf;
     if (!dst_buf) return 0;
@@ -2595,6 +2615,125 @@ int picolm_gpu_kv_store_dev_batched_strided(int is_k, int lo, int sp, int np,
     /* If we were in a batch, restart it */
     if (was_in_batch) picolm_gpu_batch_begin(device);
 
+    return 1;
+}
+
+/* Device-native KV store: F32->F16 pack + write, entirely on-GPU.
+ * Src is [np][kv_dim] with rows src_stride floats apart (src_stride<=0
+ * means tightly packed, i.e. src_stride == kv_dim). No D2H, no CPU
+ * conversion, no H2D -- this stays inside the current batch when one
+ * is active, so it costs one dispatch, not a full pipeline flush.
+ *
+ * Requires kv_store_vk.spv (G.shader_kv_store); falls back to the
+ * D2H/CPU/H2D path (picolm_gpu_kv_store_dev_batched_strided) if the
+ * shader failed to load, so a missing .spv degrades gracefully instead
+ * of silently corrupting output. */
+/* Return the maximum number of layers that can be recorded in a single
+ * command buffer before any descriptor set ring would wrap around.
+ *
+ * Per-layer dispatch counts per ring (for an attention layer):
+ *   quantize: 7  (Q,K,V,output,gate,up,down projections)
+ *   q8q8:     7  (matching 7 matmuls)
+ *   nrm:      2  (attn rmsnorm + FFN rmsnorm)
+ *   kv:       2  (K store + V store)
+ *   elem:     3 + 2*np  (2 residual + 1 silu + 2*np rope)
+ *
+ * Each ring has 256 descriptor sets. The ring is safe as long as
+ * layers_in_batch * dispatches_per_layer <= 256.
+ * The elem ring (with per-token RoPE dispatches) is always the limiter. */
+static int _safe_layers_per_batch(int np) {
+    int max = 256;  // matmul ring (256 dispatches / 7 per layer ~ 36, not limiting)
+    int elem_per_layer = 3 + 2 * np;  // residual(2) + silu(1) + rope(2*np)
+    if (elem_per_layer > 0) {
+        int elem_max = 256 / elem_per_layer;
+        if (elem_max < max) max = elem_max;
+    }
+    return max > 0 ? max : 1;
+}
+
+static int _kv_store_native(int is_k, int lo, int sp, int np,
+                             const float *sd, int nkh, int hd,
+                             int msl, int device, int src_stride) {
+    if (!G.ready || !G.shader_kv_store || !sd || device != 0 || np < 1) return 0;
+    /* Submit+wait at layer boundary when the batch would exceed descriptor
+     * ring capacity. Each ring has 256 sets and the elem ring (per-token
+     * RoPE dispatches) is the bottleneck. Without this sync, the ring wraps
+     * and descriptor sets are overwritten before the GPU executes them,
+     * causing the shader to read stale/wrong buffer pointers. */
+    if (is_k && G.in_batch) {
+        int safe = _safe_layers_per_batch(np);
+        if (lo > 0 && (lo % safe) == 0) {
+            extern int picolm_gpu_batch_end(int);
+            extern int picolm_gpu_batch_begin(int);
+            picolm_gpu_batch_end(device);
+            picolm_gpu_batch_begin(device);
+        }
+    }
+    VkBuffer dst_buf = is_k ? G.kv_k_buf : G.kv_v_buf;
+    if (!dst_buf) return 0;
+
+    int kv_dim = nkh * hd;
+    if (kv_dim < 1) return 0;
+    int stride = src_stride > 0 ? src_stride : kv_dim;
+
+    VkDescriptorBufferInfo src_info = desc_buf_info(sd);
+    if (!src_info.buffer) return 0;
+
+    size_t row_bytes_f16 = (size_t)kv_dim * sizeof(uint16_t);
+    size_t dst_byte_off = (size_t)lo * msl * row_bytes_f16 + (size_t)sp * row_bytes_f16;
+    if (dst_byte_off % 4 != 0) return 0;
+    int dst_word_off = (int)(dst_byte_off / 4);
+
+    /* Strided source: pack row-by-row */
+    if (stride != kv_dim) {
+        for (int p = 0; p < np; p++) {
+            VkDescriptorBufferInfo row_src = src_info;
+            row_src.offset += (VkDeviceSize)p * stride * sizeof(float);
+            row_src.range = (VkDeviceSize)kv_dim * sizeof(float);
+            VkDescriptorBufferInfo bi[4] = { row_src, {VK_NULL_HANDLE,0,0}, {VK_NULL_HANDLE,0,0},
+                                              {dst_buf, 0, VK_WHOLE_SIZE} };
+            VkDescriptorSet kv_set = G.dset_kv_store_ring[G.dset_idx_kv % 256];
+            G.dset_idx_kv++;
+            wr_desc(kv_set, 4, bi);
+            typedef struct { int n, dst_off, pad0, pad1; } PC_KV;
+            PC_KV pc = { kv_dim, dst_word_off + (int)((size_t)p * kv_dim * sizeof(uint16_t) / 4), 0, 0 };
+            int n_words = (kv_dim + 1) / 2;
+            int n_groups = (n_words + 255) / 256;
+
+            VK_BATCH_DISPATCH_PRE();
+            VK_BATCH_BARRIER();
+            vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_kv_store);
+            vkCmdBindDescriptorSets(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    G.plyt_unified, 0, 1, &kv_set, 0, NULL);
+            vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
+                               0, sizeof(pc), &pc);
+            vkCmdDispatch(G.cmd_dev, (uint32_t)n_groups, 1, 1);
+            VK_BATCH_DISPATCH_POST();
+        }
+        return 1;
+    }
+
+    /* Common case: src is [np*kv_dim] tightly packed -- one dispatch total. */
+    int n = np * kv_dim;
+    VkDescriptorBufferInfo bi[4] = { src_info, {VK_NULL_HANDLE,0,0}, {VK_NULL_HANDLE,0,0},
+                                      {dst_buf, 0, VK_WHOLE_SIZE} };
+    VkDescriptorSet kv_set = G.dset_kv_store_ring[G.dset_idx_kv % 256];
+    G.dset_idx_kv++;
+    wr_desc(kv_set, 4, bi);
+    typedef struct { int n, dst_off, pad0, pad1; } PC_KV;
+    PC_KV pc = { n, dst_word_off, 0, 0 };
+    int n_words = (n + 1) / 2;
+    int n_groups = (n_words + 255) / 256;
+
+    VK_BATCH_DISPATCH_PRE();
+    VK_BATCH_BARRIER();
+    vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_kv_store);
+    vkCmdBindDescriptorSets(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            G.plyt_unified, 0, 1, &kv_set, 0, NULL);
+    vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(pc), &pc);
+    vkCmdDispatch(G.cmd_dev, (uint32_t)n_groups, 1, 1);
+    VK_BATCH_DISPATCH_POST();
     return 1;
 }
 
