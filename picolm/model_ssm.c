@@ -4455,8 +4455,10 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
     /* Phase 1 refactor: single command buffer for the entire layer loop */
     extern int picolm_gpu_batch_begin(int device);
     extern int picolm_gpu_batch_end(int device);
+    extern void picolm_gpu_ts_write(const char *label);
     picolm_gpu_batch_begin(gpu_dev);    for (int l = 0; l < c->n_layers; l++) {
         if (interrupt && *interrupt) return -1;
+        { char _ts_label[64]; snprintf(_ts_label, 64, "LAYER_%d_START", l); picolm_gpu_ts_write(_ts_label); }
 
         layer_weights_t *lw = &w->layers[l];
         gl = &gw->layers[l];
@@ -4605,6 +4607,7 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
             }
         }
         /* Debug: dump Q, K, V first 4 elements for layer 0 */
+        { char _ts_label[64]; snprintf(_ts_label, 64, "LAYER_%d_POSTQKV", l); picolm_gpu_ts_write(_ts_label); }
 after_qkv:
         /* QK-norm */
         if (gw->attn_qk_norm_q_dev[l]) {
@@ -4676,6 +4679,7 @@ after_qkv:
                                               seq_len, gpu_dev);
         }
         /* Diagnostic: dump attention output for first layer */
+        { char _ts_label[64]; snprintf(_ts_label, 64, "LAYER_%d_POSTATTN", l); picolm_gpu_ts_write(_ts_label); }
 
         /* SSM gate sigmoid */
         if (c->has_ssm) {
@@ -4746,6 +4750,7 @@ after_qkv:
             fprintf(stderr,"[DBG] attn_post l=%d bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n",l,tmp[0],tmp[1],tmp[2],tmp[3]);
         }
     }
+    { char _ts_label[64]; snprintf(_ts_label, 64, "ALL_LAYERS_DONE"); picolm_gpu_ts_write(_ts_label); }
 
     /* End batch: submit + fence wait. Measure total GPU execution time,
      * then emit synthetic per-layer benchmark callbacks so the --benchmark

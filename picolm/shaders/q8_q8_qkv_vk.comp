@@ -1,0 +1,109 @@
+#version 450
+// Fused Q8_0 x Q8_0 QKV matmul in a single dispatch.
+// Grid: [ceil(O/256), S, 3] where z=0 is Q, z=1 is K, z=2 is V.
+// Each workgroup computes one output row for one token for one projection.
+// This gives the GCN1 scheduler 3 independent workgroup waves per token.
+//
+// Weights are stored contiguously: W[Oq+Ok+Ov][I] as Q8_0 blocks.
+// The caller provides wq_off, wk_off, wv_off (row offsets) via push constants.
+// Outputs: YQ[S*Oq], YK[S*Ok], YV[S*Ov] in separate buffers.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer XQ { uint xq[]; };
+layout(std430, binding = 1) readonly buffer XD { float xd[]; };
+layout(std430, binding = 2) readonly buffer W  { uint  w[]; };
+layout(std430, binding = 3) writeonly buffer YQ { float yq[]; };
+
+layout(push_constant) uniform P {
+    int I;
+    int S;
+    int Oq;
+    int Ok;
+    int Ov;
+    int rowWords;
+    int wq_rowOff;  // starting row index for Q weights
+    int wk_rowOff;  // starting row index for K weights
+    int wv_rowOff;  // starting row index for V weights
+} p;
+
+// We need separate output buffers for K and V. But we only have 4 descriptor
+// bindings. The trick: use a single combined output buffer and compute offsets.
+// Binding 3 = combined output Y[S*(Oq+Ok+Ov)]. The shader writes to the correct
+// region based on gl_WorkGroupID.z.
+//
+// But we can't declare Y as both binding 3 and something else. So we use
+// a single output buffer and compute the correct offset.
+
+layout(std430, binding = 3) writeonly buffer Y  { float y[]; };
+
+float f16tof32(uint h) {
+    uint s = (h >> 15u) & 1u;
+    uint e = (h >> 10u) & 31u;
+    uint m = h & 1023u;
+    if (e == 0u) {
+        if (m == 0u) return s != 0u ? -0.0 : 0.0;
+        float v = float(m) * 5.960464477539063e-8;
+        return s != 0u ? -v : v;
+    }
+    if (e == 31u) return s != 0u ? -1.0/0.0 : 1.0/0.0;
+    uint bits = (s << 31u) | ((e - 15u + 127u) << 23u) | (m << 13u);
+    return uintBitsToFloat(bits);
+}
+
+void main() {
+    uint z = gl_GlobalInvocationID.z;  // 0=Q, 1=K, 2=V
+    int o, S, O, wOff;
+
+    if (z == 0u) { o = int(gl_GlobalInvocationID.x); S = p.Oq; wOff = p.wq_rowOff; }
+    else if (z == 1u) { o = int(gl_GlobalInvocationID.x); S = p.Ok; wOff = p.wk_rowOff; }
+    else { o = int(gl_GlobalInvocationID.x); S = p.Ov; wOff = p.wv_rowOff; }
+
+    int s = int(gl_GlobalInvocationID.y);
+    if (s >= p.S) return;
+    if (o >= S) return;
+
+    int nblocks = p.I / 32;
+    uint rowBase = uint(wOff + o) * uint(p.rowWords);
+    uint xq_base = uint(s) * uint(p.I) / 4u;
+    int xd_base = s * nblocks;
+
+    float sum = 0.0;
+
+    for (int bi = 0; bi < nblocks; bi++) {
+        uint bo = uint(bi) * 34u;
+        uint dWord = rowBase + bo / 4u;
+        uint dShift = (bo % 4u) * 8u;
+        float wd = f16tof32((w[dWord] >> dShift) & 0xffffu);
+        float ad = xd[xd_base + bi];
+        float scale = wd * ad;
+
+        uint aqs_base = xq_base + uint(bi) * 8u;
+
+        for (int v = 0; v < 32; v++) {
+            int vi = bi * 32 + v;
+            if (vi >= p.I) break;
+
+            uint wbyte_off = rowBase + (bo + 2u + uint(v)) / 4u;
+            uint wshift = ((bo + 2u + uint(v)) % 4u) * 8u;
+            uint wbyte = (w[wbyte_off] >> wshift) & 0xffu;
+            int wval = int(wbyte);
+            if (wval >= 128) wval -= 256;
+
+            uint ab_idx = aqs_base + uint(v) / 4u;
+            uint abyte = (xq[ab_idx] >> ((uint(v) % 4u) * 8u)) & 0xffu;
+            int aval = int(abyte);
+            if (aval >= 128) aval -= 256;
+
+            sum += float(wval) * float(aval) * scale;
+        }
+    }
+
+    // Write to correct output region
+    uint outOff;
+    if (z == 0u) outOff = uint(s) * uint(p.Oq) + uint(o);
+    else if (z == 1u) outOff = uint(p.S) * uint(p.Oq) + uint(s) * uint(p.Ok) + uint(o);
+    else outOff = uint(p.S) * (uint(p.Oq) + uint(p.Ok)) + uint(s) * uint(p.Ov) + uint(o);
+
+    y[outOff] = sum;
+}

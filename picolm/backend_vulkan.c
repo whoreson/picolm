@@ -209,6 +209,14 @@ static struct {
     VkDescriptorPool dpool_kv_store;
     VkDescriptorSet dset_kv_store_ring[256];
 
+    // Fused QKV pipeline (8 bindings, separate DSL)
+    VkDescriptorSetLayout dsl_qkv;
+    VkPipelineLayout plyt_qkv;
+    VkShaderModule shader_qkv;
+    VkPipeline pipe_qkv;
+    VkDescriptorPool dpool_qkv;
+    VkDescriptorSet dset_qkv;
+
     VkCommandPool cpool;
     VkCommandBuffer cmd;       // Phase 1: single-command sync
     VkCommandBuffer cmd_nrm;   // RMSNorm host-facing
@@ -287,6 +295,13 @@ static struct {
 
     int in_batch;   // Phase 1 refactor: non-zero when recording into a single cmd buffer
 
+    // Timestamp profiling support
+    int ts_supported;
+    VkQueryPool ts_query;
+    uint64_t ts_period;  // nanoseconds per timestamp tick
+    int ts_write_idx;
+    #define PICOLM_VK_TS_SLOTS 128
+
     char device_name[256];
     VkPhysicalDeviceMemoryProperties mem_props;
     VkPhysicalDeviceProperties dev_props;
@@ -298,6 +313,7 @@ static struct {
 // ---------------------------------------------------------------------------
 
 static long g_vk_spin_us = -1;
+static int _g_dispatch_cnt = 0, _g_barrier_cnt = 0;
 
 static VkResult vk_fence_wait(VkDevice dev, VkFence f) {
     if (g_vk_spin_us < 0) {
@@ -640,13 +656,23 @@ static void wr_desc(VkDescriptorSet set, int n, const VkDescriptorBufferInfo *bi
 // This replaces the wr_desc + vkCmdBindDescriptorSets pattern for the
 // device-native batched path (cmd_dev).
 static void push_desc(VkCommandBuffer cmd, int n, const VkDescriptorBufferInfo *bi) {
-    VkWriteDescriptorSet w[4];
+    VkWriteDescriptorSet w[8];
     for (int i = 0; i < n; i++) w[i] = (VkWriteDescriptorSet){
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = VK_NULL_HANDLE,
         .dstBinding = (uint32_t)i, .descriptorCount = 1,
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i]};
     G.vkCmdPushDescriptorSetKHR_fn(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                    G.plyt_unified, 0, (uint32_t)n, w);
+}
+
+static void push_desc_8(VkCommandBuffer cmd, int n, const VkDescriptorBufferInfo *bi) {
+    VkWriteDescriptorSet w[8];
+    for (int i = 0; i < n; i++) w[i] = (VkWriteDescriptorSet){
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = VK_NULL_HANDLE,
+        .dstBinding = (uint32_t)i, .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i]};
+    G.vkCmdPushDescriptorSetKHR_fn(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                   G.plyt_qkv, 0, (uint32_t)n, w);
 }
 
 // Legacy ring-buffer descriptor set update for matmul path (non-batched).
@@ -799,6 +825,28 @@ int picolm_gpu_init(const int *devices, int count) {
     else if (G.dev_props.vendorID == 0x10DE) G.subgroup_size = 32;  // NVIDIA
     else G.subgroup_size = 32;  // default
 
+    // Timestamp query pool for profiling
+    // timestampPeriod is in VkPhysicalDeviceProperties (Vulkan 1.0+).
+    // timestampComputeAndGraphics is in VkPhysicalDeviceFeatures (Vulkan 1.1+).
+    // On RADV/GCN1, timestamps are supported but the feature field may not be set.
+    // We try to create the query pool regardless.
+    G.ts_period = (uint64_t)G.dev_props.limits.timestampPeriod;
+    {
+        VkQueryPoolCreateInfo qpci = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+            .queryType = VK_QUERY_TYPE_TIMESTAMP,
+            .queryCount = PICOLM_VK_TS_SLOTS};
+        VkResult ts_r = vkCreateQueryPool(G.dev, &qpci, NULL, &G.ts_query);
+        if (ts_r == VK_SUCCESS) {
+            G.ts_supported = 1;
+            fprintf(stderr, "[VK] timestamps enabled (period=%.1f ns)\n", (double)G.ts_period);
+        } else {
+            fprintf(stderr, "[VK] timestamp query pool creation failed: %d\n", (int)ts_r);
+        }
+    }
+    if (!G.ts_supported) {
+        fprintf(stderr, "[VK] timestamps not supported by device\n");
+    }
+
     // ============================================================
 // UNIFIED PIPELINE LAYOUT (Fixes RADV push constant bug)
 // All shaders share one DSL (4 bindings) and one pipeline layout (48-byte PC).
@@ -819,6 +867,56 @@ int picolm_gpu_init(const int *devices, int count) {
             .setLayoutCount = 1, .pSetLayouts = &G.dsl_unified,
             .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr};
         VKCHECK(vkCreatePipelineLayout(G.dev, &pli, NULL, &G.plyt_unified), "unifiedPlyt");
+    }
+
+    // 8-binding DSL for fused QKV (bindings 0-7)
+    { VkDescriptorSetLayoutBinding b[8] = {};
+      for (int _bi = 0; _bi < 8; _bi++) {
+          b[_bi].binding = _bi;
+          b[_bi].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+          b[_bi].descriptorCount = 1;
+          b[_bi].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+          b[_bi].pImmutableSamplers = NULL;
+      }
+      VkDescriptorSetLayoutCreateInfo dsli = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+          .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+          .bindingCount = 8, .pBindings = b};
+      VkResult dsli_r = vkCreateDescriptorSetLayout(G.dev, &dsli, NULL, &G.dsl_qkv);
+      VkPushConstantRange pcr = {.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = 48};
+      VkPipelineLayoutCreateInfo pli = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+          .setLayoutCount = 1, .pSetLayouts = &G.dsl_qkv,
+          .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr};
+      VkResult pli_r = vkCreatePipelineLayout(G.dev, &pli, NULL, &G.plyt_qkv);
+      if (dsli_r == VK_SUCCESS && pli_r == VK_SUCCESS) {
+          // Load fused QKV shader
+          G.shader_qkv = load_spv(G.dev, "q8_q8_qkv2_vk.spv");
+          if (G.shader_qkv) {
+              VkPipelineShaderStageCreateInfo ps = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                  .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = G.shader_qkv, .pName = "main"};
+              VkComputePipelineCreateInfo pci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                  .layout = G.plyt_qkv, .stage = ps};
+              VkResult pi_r = vkCreateComputePipelines(G.dev, VK_NULL_HANDLE, 1, &pci, NULL, &G.pipe_qkv);
+              if (pi_r != VK_SUCCESS) {
+                  fprintf(stderr, "[VK] fused QKV pipeline creation failed: %d\n", (int)pi_r);
+                  vkDestroyShaderModule(G.dev, G.shader_qkv, NULL);
+                  G.shader_qkv = VK_NULL_HANDLE;
+              } else {
+                  // Descriptor pool for fused QKV
+                  VkDescriptorPoolSize ps2 = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 8};
+                  VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                      .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps2};
+                  vkCreateDescriptorPool(G.dev, &dpi, NULL, &G.dpool_qkv);
+                  VkDescriptorSetAllocateInfo dsa = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                      .descriptorPool = G.dpool_qkv, .descriptorSetCount = 1, .pSetLayouts = &G.dsl_qkv};
+                  vkAllocateDescriptorSets(G.dev, &dsa, &G.dset_qkv);
+                  fprintf(stderr, "[VK] fused QKV pipeline ready (8 bindings)\n");
+              }
+          } else {
+              fprintf(stderr, "[VK] fused QKV shader not found, using separate matmul\n");
+          }
+      } else {
+          fprintf(stderr, "[VK] 8-binding DSL creation failed, using separate matmul\n");
+      }
     }
 
     // Load matmul shader
@@ -1006,6 +1104,14 @@ void picolm_gpu_shutdown(void) {
     if (G.shader_nrm) vkDestroyShaderModule(G.dev, G.shader_nrm, NULL);
     if (G.buf_pc_nrm) vkDestroyBuffer(G.dev, G.buf_pc_nrm, NULL);
     if (G.mem_pc_nrm) vkFreeMemory(G.dev, G.mem_pc_nrm, NULL);
+
+    // Fused QKV
+    if (G.dset_qkv) vkFreeDescriptorSets(G.dev, G.dpool_qkv, 1, &G.dset_qkv);
+    if (G.dpool_qkv) vkDestroyDescriptorPool(G.dev, G.dpool_qkv, NULL);
+    if (G.pipe_qkv)  vkDestroyPipeline(G.dev, G.pipe_qkv, NULL);
+    if (G.shader_qkv) vkDestroyShaderModule(G.dev, G.shader_qkv, NULL);
+    if (G.plyt_qkv)  vkDestroyPipelineLayout(G.dev, G.plyt_qkv, NULL);
+    if (G.dsl_qkv)   vkDestroyDescriptorSetLayout(G.dev, G.dsl_qkv, NULL);
 
     if (G.dset_elem)  vkFreeDescriptorSets(G.dev, G.dpool_elem, 1, &G.dset_elem);
     for (int _i = 0; _i < 256 && G.dset_elem_ring[_i]; _i++)
@@ -1515,6 +1621,10 @@ static VkDescriptorBufferInfo desc_buf_info(const void *p) {
     return (VkDescriptorBufferInfo){b, off, VK_WHOLE_SIZE};
 }
 
+static VkDescriptorBufferInfo desc_tensor_info(picolm_gpu_tensor_t *t) {
+    return (VkDescriptorBufferInfo){t->wbuf, 0, VK_WHOLE_SIZE};
+}
+
 void *picolm_gpu_alloc_device(size_t bytes, int device) {
     if (!G.ready || device != 0 || bytes < 1) return NULL;
     VkBuffer buf; VkDeviceMemory mem;
@@ -1697,23 +1807,39 @@ int picolm_gpu_sync(int device) {
         .dstAccessMask = VK_ACCESS_SHADER_READ_BIT}; \
     vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, \
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &_mb, 0, NULL, 0, NULL); \
+    _g_barrier_cnt++; \
 } while(0)
+
+// Timestamp write helper (no-op if timestamps not supported)
+void picolm_gpu_ts_write(const char *label) {
+    if (!G.ts_supported || !getenv("PICOLM_VK_TS") || G.ts_write_idx >= PICOLM_VK_TS_SLOTS - 1) return;
+    vkCmdWriteTimestamp(G.cmd_dev, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, G.ts_query, G.ts_write_idx);
+    fprintf(stderr, "[VK-TS] slot %d: %s\n", G.ts_write_idx, label);
+    G.ts_write_idx++;
+}
 
 int picolm_gpu_batch_begin(int device) {
     if (!G.ready || device != 0) return 0;
     if (G.in_batch) return 0;  // already in a batch
+    _g_dispatch_cnt = 0; _g_barrier_cnt = 0;
+    G.ts_write_idx = 0;
     // Wait for any prior dev/xfer work to complete before starting
     vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
     vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     vkResetCommandBuffer(G.cmd_dev, 0);
     vkBeginCommandBuffer(G.cmd_dev, &begin);
+    picolm_gpu_ts_write("BATCH_START");
     G.in_batch = 1;
     return 1;
 }
 
 int picolm_gpu_batch_end(int device) {
     if (!G.ready || device != 0 || !G.in_batch) return 0;
+    picolm_gpu_ts_write("BATCH_END");
+    if (getenv("PICOLM_VK_STATS")) {
+        fprintf(stderr, "[VK] batch stats: %d dispatches, %d barriers\n", _g_dispatch_cnt, _g_barrier_cnt);
+    }
     VkResult r = vkEndCommandBuffer(G.cmd_dev);
     if (r != VK_SUCCESS) {
         fprintf(stderr, "[VK] batch_end: vkEndCommandBuffer failed: %d\n", (int)r);
@@ -1725,6 +1851,22 @@ int picolm_gpu_batch_end(int device) {
     vkResetFences(G.dev, 1, &G.fence_dev);
     vkQueueSubmit(G.queue, 1, &si, G.fence_dev);
     vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
+
+    // Read back timestamps (compute deltas between adjacent slots)
+    if (G.ts_supported && getenv("PICOLM_VK_TS") && G.ts_write_idx > 0) {
+        uint64_t timestamps[PICOLM_VK_TS_SLOTS];
+        int n_ts = G.ts_write_idx; // number of written slots (0-based index of last write)
+        if (n_ts >= PICOLM_VK_TS_SLOTS) n_ts = PICOLM_VK_TS_SLOTS - 1;
+        if (vkGetQueryPoolResults(G.dev, G.ts_query, 0, n_ts,
+                (size_t)n_ts * sizeof(uint64_t), timestamps, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            for (int i = 1; i < n_ts; i++) {
+                double total_ms = (timestamps[i] - timestamps[0]) * G.ts_period / 1e9;
+                double delta_ms = (timestamps[i] - timestamps[i-1]) * G.ts_period / 1e9;
+                fprintf(stderr, "[VK-TS] slot %3d: total=%.2f ms, delta=%.3f ms\n", i, total_ms, delta_ms);
+            }
+        }
+    }
+
     G.in_batch = 0;
     return 1;
 }
@@ -1953,7 +2095,6 @@ uint16_t *picolm_gpu_kv_v_dev(int d) { return (d==0&&G.kv_v_d)?(uint16_t*)G.kv_v
 // ---------------------------------------------------------------------------
 
 static int _matmul_dev_skip_cnt = 0;
-
 /* Device-native quantize F32->Q8_0. Dispatches quantize kernel on cmd_dev. */
 static int _quantize_dev(const float *x_dev, int I, int S) {
     if (!G.shader_quantize) return 0;
@@ -1975,11 +2116,13 @@ static int _quantize_dev(const float *x_dev, int I, int S) {
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd_dev, (uint32_t)n_blocks, (uint32_t)S, 1);
+    _g_dispatch_cnt++;
 
     return 1;
 }
 
-/* Device-native Q8xQ8 matmul. Dispatches q8_q8 kernel on cmd_dev. */
+/* Device-native Q8xQ8 matmul. Dispatches q8_q8 kernel on cmd_dev.
+ * Caller MUST have already inserted a barrier making q8_xq/q8_xd visible. */
 static int _q8q8_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, int S) {
     if (!G.shader_q8q8) return 0;
     int n_blocks = t->I / 32;
@@ -1993,17 +2136,12 @@ static int _q8q8_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, int S) {
     };
     typedef struct { int I, S, O, rowWords; } PC_Q8;
     PC_Q8 pc = {t->I, S, t->O, (int)t->row_words};
-    // Memory barrier: quantize writes to q8_xq/q8_xd, q8q8 reads them
-    VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
-    vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_q8q8);
     push_desc(G.cmd_dev, 4, bi);
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd_dev, (total + 255u) / 256u, 1, 1);
+    _g_dispatch_cnt++;
     return 1;
 }
 
@@ -2014,22 +2152,18 @@ int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_d
         if (_matmul_dev_skip_cnt++ < 3) fprintf(stderr, "[VK] matmul_dev skip: I=%d O=%d (need >=64/32)\n", t->I, t->O);
         return 0;
     }
-    // x_stride and y_stride are passed through PC_Matmul push constants
     VkDescriptorBufferInfo xbi = desc_buf_info(x_dev), ybi = desc_buf_info(y_dev);
     if (!xbi.buffer || !ybi.buffer) return 0;
 
     VK_BATCH_DISPATCH_PRE();
     VK_BATCH_BARRIER();
 
-    int ok = 0;  // Assume fallback needed
-    // Q8_0 path: quantize F32->Q8 on device, then Q8xQ8 matmul
-    // Q8_0 path: quantize F32->Q8 on device, then Q8xQ8 matmul
+    int ok = 0;
     if (t->qtype == GGUF_TYPE_Q8_0 && G.shader_quantize && G.shader_q8q8) {
         if (getenv("PICOLM_DISPATCH")) {
             static int _q8d=0; if(!_q8d){_q8d=1;fprintf(stderr,"DISPATCH matmul_dev: Q8_0 I=%d O=%d S=%d\n",t->I,t->O,S);}
         }
         if (_quantize_dev(x_dev, t->I, S)) {
-            // Memory barrier: quantize wrote to q8_xq/q8_xd, q8q8 reads from them
             VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                 .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
                 .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
@@ -2038,7 +2172,6 @@ int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_d
             ok = _q8q8_matmul_dev(t, y_dev, S);
         }
     }
-    // Fallback: scalar dequant matmul (existing shader)
     if (!ok) {
         if (getenv("PICOLM_DISPATCH")) {
             static int _fd=0; if(!_fd){_fd=1;fprintf(stderr,"DISPATCH matmul_dev: fallback scalar I=%d O=%d S=%d qtype=%d\n",t->I,t->O,S,t->qtype);}
@@ -2049,8 +2182,8 @@ int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_d
         PC_Matmul pc = {t->qtype, S, t->I, t->O, (int)t->row_words, x_stride, y_stride};
         vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
                            0, sizeof(pc), &pc);
-        // Phase 2: 2D dispatch [O, S, 1], local_size_x=16 -> ceil(O/16) actual groups
         vkCmdDispatch(G.cmd_dev, (uint32_t)((t->O + 15) / 16), (uint32_t)S, 1);
+        _g_dispatch_cnt++;
         ok = 1;
     }
 
@@ -2070,6 +2203,67 @@ int picolm_gpu_matmul_dev_qkv(picolm_gpu_tensor_t *tq, picolm_gpu_tensor_t *tk,
                                const float *x_dev, int S, int device,
                                int ysq, int ysk, int xs) {
     (void)ysq; (void)ysk; (void)xs;
+    if (!tq || !tk || !tv || device != 0) return 0;
+
+    // Try fused QKV path: quantize once, then 3 separate q8q8 matmuls
+    // TODO: GCN1/KAVERI: 12% regression (3.40s -> 3.82s)
+    // TODO: VEGA20/MI50: 17% improvement (0.18s -> 0.15s)
+    // Controlled by PICOLM_VK_FUSE_QKV=1
+    if (getenv("PICOLM_VK_FUSE_QKV") &&
+        tq->qtype == GGUF_TYPE_Q8_0 && tk->qtype == GGUF_TYPE_Q8_0 &&
+        tv->qtype == GGUF_TYPE_Q8_0 && tq->I == tk->I && tq->I == tv->I &&
+        G.shader_quantize && G.shader_q8q8) {
+        // Barrier before quantize: ensure previous dispatch writes (e.g., RMSNorm -> bxb) are visible
+        VK_BATCH_BARRIER();
+        _quantize_dev(x_dev, tq->I, S);
+        // Barrier after quantize: ensure quantize writes to xq/xd are visible before q8q8 reads
+        VK_BATCH_BARRIER();
+
+        // Dispatch q8q8 for Q
+        { uint32_t total = (uint32_t)tq->O * (uint32_t)S;
+          VkDescriptorBufferInfo bi[4] = {
+              desc_buf_info(G.q8_xq_d), desc_buf_info(G.q8_xd_d),
+              desc_tensor_info(tq), desc_buf_info(bq) };
+          typedef struct { int I, S, O, rowWords; } PC_Q8;
+          PC_Q8 pc = {tq->I, S, tq->O, (int)tq->row_words};
+          vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_q8q8);
+          push_desc(G.cmd_dev, 4, bi);
+          vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+          vkCmdDispatch(G.cmd_dev, (total + 255u) / 256u, 1, 1);
+          _g_dispatch_cnt++; }
+
+        // Dispatch q8q8 for K
+        { uint32_t total = (uint32_t)tk->O * (uint32_t)S;
+          VkDescriptorBufferInfo bi[4] = {
+              desc_buf_info(G.q8_xq_d), desc_buf_info(G.q8_xd_d),
+              desc_tensor_info(tk), desc_buf_info(bk) };
+          typedef struct { int I, S, O, rowWords; } PC_Q8;
+          PC_Q8 pc = {tk->I, S, tk->O, (int)tk->row_words};
+          vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_q8q8);
+          push_desc(G.cmd_dev, 4, bi);
+          vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+          vkCmdDispatch(G.cmd_dev, (total + 255u) / 256u, 1, 1);
+          _g_dispatch_cnt++; }
+
+        // Dispatch q8q8 for V
+        { uint32_t total = (uint32_t)tv->O * (uint32_t)S;
+          VkDescriptorBufferInfo bi[4] = {
+              desc_buf_info(G.q8_xq_d), desc_buf_info(G.q8_xd_d),
+              desc_tensor_info(tv), desc_buf_info(bv) };
+          typedef struct { int I, S, O, rowWords; } PC_Q8;
+          PC_Q8 pc = {tv->I, S, tv->O, (int)tv->row_words};
+          vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_q8q8);
+          push_desc(G.cmd_dev, 4, bi);
+          vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+          vkCmdDispatch(G.cmd_dev, (total + 255u) / 256u, 1, 1);
+          _g_dispatch_cnt++; }
+
+        if (getenv("PICOLM_DISPATCH"))
+            fprintf(stderr, "DISPATCH qkv_dev: FUSED QUANT I=%d S=%d\n", tq->I, S);
+        return 1;
+    }
+
+    // Fallback: 3 separate calls
     if (!picolm_gpu_matmul_dev(tq, bq, x_dev, S, device, 0, 0)) return 0;
     if (!picolm_gpu_matmul_dev(tk, bk, x_dev, S, device, 0, 0)) return 0;
     if (!picolm_gpu_matmul_dev(tv, bv, x_dev, S, device, 0, 0)) return 0;
@@ -2081,6 +2275,46 @@ int picolm_gpu_matmul_dev_gu(picolm_gpu_tensor_t *tg, picolm_gpu_tensor_t *tu,
                               const float *x_dev, int S, int device,
                               int ys, int xs) {
     (void)ys; (void)xs;
+    // Try fused GU path: quantize once, then 2 q8q8 matmuls sharing quantized activations
+    // TODO: GCN1/KAVERI: regresses. On VEGA20/MI50: neutral/slight regression (0.15s -> 0.16s)
+    // Controlled by PICOLM_VK_FUSE_GU=1
+    if (getenv("PICOLM_VK_FUSE_GU") &&
+        tg->qtype == GGUF_TYPE_Q8_0 && tu->qtype == GGUF_TYPE_Q8_0 &&
+        tg->I == tu->I && G.shader_quantize && G.shader_q8q8) {
+        VK_BATCH_BARRIER();
+        _quantize_dev(x_dev, tg->I, S);
+        VK_BATCH_BARRIER();
+
+        { uint32_t total = (uint32_t)tg->O * (uint32_t)S;
+          VkDescriptorBufferInfo bi[4] = {
+              desc_buf_info(G.q8_xq_d), desc_buf_info(G.q8_xd_d),
+              desc_tensor_info(tg), desc_buf_info(bgate) };
+          typedef struct { int I, S, O, rowWords; } PC_Q8;
+          PC_Q8 pc = {tg->I, S, tg->O, (int)tg->row_words};
+          vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_q8q8);
+          push_desc(G.cmd_dev, 4, bi);
+          vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+          vkCmdDispatch(G.cmd_dev, (total + 255u) / 256u, 1, 1);
+          _g_dispatch_cnt++; }
+
+        { uint32_t total = (uint32_t)tu->O * (uint32_t)S;
+          VkDescriptorBufferInfo bi[4] = {
+              desc_buf_info(G.q8_xq_d), desc_buf_info(G.q8_xd_d),
+              desc_tensor_info(tu), desc_buf_info(bup) };
+          typedef struct { int I, S, O, rowWords; } PC_Q8;
+          PC_Q8 pc = {tu->I, S, tu->O, (int)tu->row_words};
+          vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_q8q8);
+          push_desc(G.cmd_dev, 4, bi);
+          vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+          vkCmdDispatch(G.cmd_dev, (total + 255u) / 256u, 1, 1);
+          _g_dispatch_cnt++; }
+
+        if (getenv("PICOLM_DISPATCH"))
+            fprintf(stderr, "DISPATCH gu_dev: FUSED QUANT I=%d S=%d\n", tg->I, S);
+        return 1;
+    }
+
+    // Fallback: 2 separate calls
     if (!picolm_gpu_matmul_dev(tg, bgate, x_dev, S, device, 0, 0)) return 0;
     if (!picolm_gpu_matmul_dev(tu, bup, x_dev, S, device, 0, 0)) return 0;
     return 1;
@@ -2110,13 +2344,12 @@ int picolm_gpu_rmsnorm_batched_dev(float *out, const float *x, const float *weig
     VK_BATCH_DISPATCH_PRE();
     VK_BATCH_BARRIER();
     vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_nrm);
-    // Push descriptors directly (snapshotted at record time, no ring needed)
     push_desc(G.cmd_dev, 3, bi);
-    // Push constants via PC_Matmul format: fmt=0, S, I=dim, O=eps(bitcast), rowWords=xs
     PC_Matmul pc_nrm = {0, S, dim, 0, xs};
     memcpy(&pc_nrm.O, &eps, sizeof(float));
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_nrm), &pc_nrm);
     vkCmdDispatch(G.cmd_dev, (uint32_t)S, 1, 1);
+    _g_dispatch_cnt++;
     VK_BATCH_DISPATCH_POST();
 
     return 1;
@@ -2136,6 +2369,7 @@ int picolm_gpu_residual_add(float *out, const float *a, const float *b,
     PC_Elem pc = {0, total, 0.0f, 0};
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd_dev, (uint32_t)((total + 255) / 256), 1, 1);
+    _g_dispatch_cnt++;
     VK_BATCH_DISPATCH_POST();
     return 1;
 }
@@ -2152,6 +2386,7 @@ int picolm_gpu_silu_mul_dev(float *g, const float *u, size_t n, int device) {
     PC_Elem pc = {1, (int)n, 0.0f, 0};
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd_dev, (uint32_t)((n + 255) / 256), 1, 1);
+    _g_dispatch_cnt++;
     VK_BATCH_DISPATCH_POST();
     return 1;
 }
@@ -2169,6 +2404,7 @@ int picolm_gpu_gelu_mul_dev(float *g, const float *u, size_t n, int device) {
     PC_Elem pc = {5, (int)n, 0.0f, 0};
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd_dev, (uint32_t)((n + 255) / 256), 1, 1);
+    _g_dispatch_cnt++;
     VK_BATCH_DISPATCH_POST();
     return 1;
 }
@@ -2192,6 +2428,7 @@ int picolm_gpu_rope_apply(float *x, int n_heads, int head_dim,
     PC_Elem pc = {2, half_dim, (float)n_heads, rope_type};
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd_dev, (uint32_t)((half_dim + 255) / 256), 1, 1);
+    _g_dispatch_cnt++;
     VK_BATCH_DISPATCH_POST();
     return 1;
 }
@@ -2202,59 +2439,26 @@ int picolm_gpu_rope_apply_batched(float *x, int n_heads, int head_dim,
                                    int rope_type, int device) {
     if (!G.ready || !G.shader_elem || device != 0 || half_dim < 1 || S < 1) return 0;
 
-    if (!G.in_batch) {
-        vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
-        VkCommandBufferBeginInfo _vbb = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        vkResetCommandBuffer(G.cmd_dev, 0);
-        vkBeginCommandBuffer(G.cmd_dev, &_vbb);
-    } else {
-        // Memory barrier: Q/K matmul writes must be visible before RoPE reads
-        VkMemoryBarrier _mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
-        vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &_mb, 0, NULL, 0, NULL);
-    }
+    // Batched RoPE: single dispatch, 2D grid [half_dim/256, S, 1]
+    // Uses op=6 in elementwise_vk shader.
+    VkDescriptorBufferInfo bi[3] = {
+        desc_buf_info(x),
+        desc_buf_info(cos_tbl_base),
+        desc_buf_info(sin_tbl_base),
+    };
+    if (!bi[0].buffer || !bi[1].buffer || !bi[2].buffer) return 0;
 
-    // Batched rope: process each token sequentially, each with its own cos/sin offset
-    // cos/sin tables are [max_seq_len][half_dim], offset by start_pos+token_idx
-    for (int si = 0; si < S; si++) {
-        // Token si's x data at offset si * n_heads * head_dim
-        float *x_tok = (float *)((uintptr_t)x + (uintptr_t)(size_t)si * n_heads * head_dim * sizeof(float));
-        const float *cos_tok = (const float *)((uintptr_t)cos_tbl_base + (uintptr_t)(size_t)(start_pos + si) * half_dim * sizeof(float));
-        const float *sin_tok = (const float *)((uintptr_t)sin_tbl_base + (uintptr_t)(size_t)(start_pos + si) * half_dim * sizeof(float));
+    VK_BATCH_DISPATCH_PRE();
+    VK_BATCH_BARRIER();
+    vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_elem);
+    push_desc(G.cmd_dev, 3, bi);
+    PC_Elem pc = {6, half_dim, (float)n_heads, start_pos};
+    vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(pc), &pc);
+    vkCmdDispatch(G.cmd_dev, (uint32_t)((half_dim + 255u) / 256u), (uint32_t)S, 1);
+    _g_dispatch_cnt++;
+    VK_BATCH_DISPATCH_POST();
 
-        VkDeviceSize xb_off = 0;
-        VkBuffer xb = unwrap_buf_offset(x_tok, &xb_off);
-        VkDeviceSize cos_off = 0, sin_off = 0;
-        VkBuffer cb = unwrap_buf_offset(cos_tok, &cos_off);
-        VkBuffer sb = unwrap_buf_offset(sin_tok, &sin_off);
-        if (!xb || !cb || !sb) return 0;
-
-        size_t token_bytes = (size_t)n_heads * head_dim * sizeof(float);
-
-        VkDescriptorBufferInfo bi[3] = {
-            {xb, xb_off, token_bytes},
-            {cb, cos_off, (size_t)half_dim * sizeof(float)},
-            {sb, sin_off, (size_t)half_dim * sizeof(float)},
-        };
-
-        vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_elem);
-        push_desc(G.cmd_dev, 3, bi);
-        typedef struct { int op, n; float fp; int pad; } PC_Elem;
-        PC_Elem pc = {2, half_dim, (float)n_heads, rope_type};
-        vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
-                           0, sizeof(pc), &pc);
-        vkCmdDispatch(G.cmd_dev, (uint32_t)((half_dim + 255) / 256), 1, 1);
-    }
-
-    if (!G.in_batch) {
-        vkEndCommandBuffer(G.cmd_dev);
-        VkSubmitInfo si_info = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_dev};
-        vkResetFences(G.dev, 1, &G.fence_dev);
-        vkQueueSubmit(G.queue, 1, &si_info, G.fence_dev);
-        vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
-    }
     return 1;
 }
 
@@ -2409,6 +2613,9 @@ int picolm_gpu_kv_store_dev_batched(int is_k, int lo, int sp, int np,
                                      const float *sd, int nkh, int hd,
                                      int msl, int device) {
     if (_kv_store_native(is_k, lo, sp, np, sd, nkh, hd, msl, device, 0)) return 1;
+    if (getenv("PICOLM_DISPATCH")) {
+        static int _kvs_fb=0; if(!_kvs_fb){_kvs_fb=1; fprintf(stderr,"DISPATCH kv_store: FALLBACK (D2H+CPU+H2D)\n");}
+    }
     /* Fallback: D2H + CPU convert + H2D (only hit if kv_store_vk.spv failed to load) */
     if (!G.ready || !sd || device != 0) return 0;
     VkBuffer dst_buf = is_k ? G.kv_k_buf : G.kv_v_buf;
@@ -2639,6 +2846,7 @@ static int _kv_store_native(int is_k, int lo, int sp, int np,
             vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
                                0, sizeof(pc), &pc);
             vkCmdDispatch(G.cmd_dev, (uint32_t)n_groups, 1, 1);
+    _g_dispatch_cnt++;
             VK_BATCH_DISPATCH_POST();
         }
         return 1;
@@ -2660,6 +2868,7 @@ static int _kv_store_native(int is_k, int lo, int sp, int np,
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd_dev, (uint32_t)n_groups, 1, 1);
+    _g_dispatch_cnt++;
     VK_BATCH_DISPATCH_POST();
     return 1;
 }
@@ -2917,6 +3126,7 @@ int picolm_gpu_attention_decode_dev(float *xb_out_dev, const float *q_dev,
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd_dev, (uint32_t)((nh + 255) / 256), 1, 1);
+    _g_dispatch_cnt++;
     vkEndCommandBuffer(G.cmd_dev);
     VkSubmitInfo si2 = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &G.cmd_dev};
     vkResetFences(G.dev, 1, &G.fence_dev);
@@ -2999,6 +3209,7 @@ int picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd_dev, (uint32_t)((total + 255) / 256), 1, 1);
+    _g_dispatch_cnt++;
     VK_BATCH_DISPATCH_POST();
     return 1;
 }

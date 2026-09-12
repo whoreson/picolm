@@ -1,0 +1,118 @@
+#version 450
+// Fused Q8_0 x Q8_0 QKV matmul with separate weight buffers.
+// 8 descriptor bindings (requires DSL extension to 8).
+// Grid: [ceil(Omax/256), S, 3], z=0 -> Q, z=1 -> K, z=2 -> V.
+// Separate weight/output buffers for each projection.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer XQ { uint xq[]; };
+layout(std430, binding = 1) readonly buffer XD { float xd[]; };
+layout(std430, binding = 2) readonly buffer WQ { uint wq[]; };
+layout(std430, binding = 3) writeonly buffer YQ { float yq[]; };
+layout(std430, binding = 4) readonly buffer WK { uint wk[]; };
+layout(std430, binding = 5) writeonly buffer YK { float yk[]; };
+layout(std430, binding = 6) readonly buffer WV { uint wv[]; };
+layout(std430, binding = 7) writeonly buffer YV { float yv[]; };
+
+layout(push_constant) uniform P {
+    int I;
+    int S;
+    int Oq;
+    int Ok;
+    int Ov;
+    int rowWordsQ;
+    int rowWordsK;
+    int rowWordsV;
+} p;
+
+float f16tof32(uint h) {
+    uint s = (h >> 15u) & 1u;
+    uint e = (h >> 10u) & 31u;
+    uint m = h & 1023u;
+    if (e == 0u) {
+        if (m == 0u) return s != 0u ? -0.0 : 0.0;
+        float v = float(m) * 5.960464477539063e-8;
+        return s != 0u ? -v : v;
+    }
+    if (e == 31u) return s != 0u ? -1.0/0.0 : 1.0/0.0;
+    uint bits = (s << 31u) | ((e - 15u + 127u) << 23u) | (m << 13u);
+    return uintBitsToFloat(bits);
+}
+
+void main() {
+    int o = int(gl_GlobalInvocationID.x);
+    int s = int(gl_GlobalInvocationID.y);
+    uint z = gl_GlobalInvocationID.z;
+    if (s >= p.S) return;
+
+    int nblocks = p.I / 32;
+    uint xq_base = uint(s) * uint(p.I) / 4u;
+    int xd_base = s * nblocks;
+    float sum = 0.0;
+
+    if (z == 0u) {
+        // Q projection
+        if (o >= p.Oq) return;
+        uint rowWords = uint(p.rowWordsQ);
+        uint rowBase = uint(o) * rowWords;
+        for (int bi = 0; bi < nblocks; bi++) {
+            uint bo = uint(bi) * 34u;
+            float wd = f16tof32((wq[rowBase + bo / 4u] >> ((bo % 4u) * 8u)) & 0xffffu);
+            float scale = wd * xd[xd_base + bi];
+            uint aqs_base = xq_base + uint(bi) * 8u;
+            for (int v = 0; v < 32; v++) {
+                int vi = bi * 32 + v;
+                if (vi >= p.I) break;
+                int wval = int((wq[rowBase + (bo + 2u + uint(v)) / 4u] >> (((bo + 2u + uint(v)) % 4u) * 8u)) & 0xffu);
+                if (wval >= 128) wval -= 256;
+                int aval = int((xq[aqs_base + uint(v) / 4u] >> ((uint(v) % 4u) * 8u)) & 0xffu);
+                if (aval >= 128) aval -= 256;
+                sum += float(wval) * float(aval) * scale;
+            }
+        }
+        yq[uint(s) * uint(p.Oq) + uint(o)] = sum;
+    } else if (z == 1u) {
+        // K projection
+        if (o >= p.Ok) return;
+        uint rowWords = uint(p.rowWordsK);
+        uint rowBase = uint(o) * rowWords;
+        for (int bi = 0; bi < nblocks; bi++) {
+            uint bo = uint(bi) * 34u;
+            float wd = f16tof32((wk[rowBase + bo / 4u] >> ((bo % 4u) * 8u)) & 0xffffu);
+            float scale = wd * xd[xd_base + bi];
+            uint aqs_base = xq_base + uint(bi) * 8u;
+            for (int v = 0; v < 32; v++) {
+                int vi = bi * 32 + v;
+                if (vi >= p.I) break;
+                int wval = int((wk[rowBase + (bo + 2u + uint(v)) / 4u] >> (((bo + 2u + uint(v)) % 4u) * 8u)) & 0xffu);
+                if (wval >= 128) wval -= 256;
+                int aval = int((xq[aqs_base + uint(v) / 4u] >> ((uint(v) % 4u) * 8u)) & 0xffu);
+                if (aval >= 128) aval -= 256;
+                sum += float(wval) * float(aval) * scale;
+            }
+        }
+        yk[uint(s) * uint(p.Ok) + uint(o)] = sum;
+    } else {
+        // V projection
+        if (o >= p.Ov) return;
+        uint rowWords = uint(p.rowWordsV);
+        uint rowBase = uint(o) * rowWords;
+        for (int bi = 0; bi < nblocks; bi++) {
+            uint bo = uint(bi) * 34u;
+            float wd = f16tof32((wv[rowBase + bo / 4u] >> ((bo % 4u) * 8u)) & 0xffffu);
+            float scale = wd * xd[xd_base + bi];
+            uint aqs_base = xq_base + uint(bi) * 8u;
+            for (int v = 0; v < 32; v++) {
+                int vi = bi * 32 + v;
+                if (vi >= p.I) break;
+                int wval = int((wv[rowBase + (bo + 2u + uint(v)) / 4u] >> (((bo + 2u + uint(v)) % 4u) * 8u)) & 0xffu);
+                if (wval >= 128) wval -= 256;
+                int aval = int((xq[aqs_base + uint(v) / 4u] >> ((uint(v) % 4u) * 8u)) & 0xffu);
+                if (aval >= 128) aval -= 256;
+                sum += float(wval) * float(aval) * scale;
+            }
+        }
+        yv[uint(s) * uint(p.Ov) + uint(o)] = sum;
+    }
+}
