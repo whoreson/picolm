@@ -103,7 +103,18 @@ extern void moe_forward_batch(model_t *m, run_state_t *s,
                               const float *x_batch, float *residual_batch,
                               int n_tokens, const layer_weights_t *lw);
 
-/* --- Benchmark --- */
+/* --- Benchmark ---
+ * Every forward-pass function that iterates over layers MUST wrap the
+ * per-layer body with BENCH_LAYER_START() / BENCH_LAYER_END().
+ *
+ * Omitting these means --benchmark mode will produce NO per-layer output
+ * (no Prefill/Gen lines, no ETA, no throughput stats) for that architecture.
+ *
+ * When adding a new model_forward_* variant, always check:
+ * 1. BENCH_LAYER_START() at the top of the layer loop
+ * 2. BENCH_LAYER_END(l, is_prefill) at the bottom of the layer loop
+ * 3. For prefill fallbacks that call model_forward() per-token,
+ *    set g_is_prefill=1 around the loop (see model_core.c gemma3n fallback). */
 extern void bench_emit(int l, int is_prefill, double elapsed_ms, long minflt, long majflt);
 extern int g_is_prefill;
 double get_time_ms(void);
