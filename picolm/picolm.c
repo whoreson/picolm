@@ -285,6 +285,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "                  appends generated tokens, and at each step inserts 2 new tokens\n");
     fprintf(stderr, "                  before the cached content to force a fresh prefill over the\n");
     fprintf(stderr, "                  growing cached context. Outputs CSV: ctx_size,prefill_tok/s,gen_tok/s\n");
+#ifdef PICOLM_GPU
     fprintf(stderr, "\nGPU debug options:\n");
     fprintf(stderr, "  --gpu-diff <S> I O  Diff GPU kernels (IMMA vs scalar) on random input\n");
     fprintf(stderr, "                  S=seq_len, I=input_dim, O=output_dim (must be multiples of 16/8/32)\n");
@@ -295,6 +296,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --gpu-attn-scalar-diff <n_tok> <n_heads> <n_kv_heads> <head_dim>\n");
     fprintf(stderr, "                  Diff attention (warpgrp vs slow scalar) for bit-exactness.\n");
     fprintf(stderr, "                  Example: --gpu-attn-scalar-diff 64 40 8 128\n");
+#endif
 #ifdef PICOLM_VIZ
     fprintf(stderr, "\nVisualization options:\n");
     fprintf(stderr, "  --viz             Start VNC visualization server (requires PICOLM_VIZ)\n");
