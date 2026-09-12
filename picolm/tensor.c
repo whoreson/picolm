@@ -1190,9 +1190,11 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
         }
 #endif
         /* Non-AVX2: fall through to generic vec_dot path */
-    } else if (qtype == GGUF_TYPE_Q4_K) {
+    } else if (qtype == GGUF_TYPE_Q4_K && n >= 256 && n % 256 == 0) {
         /* Q4_K fast path: quantize x to Q8_K once, then vec_dot_q4_K_q8_K */
         /* vec_dot_q4_K_q8_K has scalar fallback for NEON/non-AVX platforms */
+        /* Requires n >= 256 and n % 256 == 0 (block size). Falls through to
+         * generic vec_dot for small or misaligned activation dimensions. */
         size_t qx_size = (n / 256) * sizeof(block_q8_K);
         block_q8_K *qx = NULL;
         int qx_owned = 0;  /* whether we malloc'd qx */
@@ -1237,12 +1239,14 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
             return;
         }
         /* If allocation failed, fall through to generic path */
-    } else if (qtype == GGUF_TYPE_Q6_K) {
+    } else if (qtype == GGUF_TYPE_Q6_K && n >= 256 && n % 256 == 0) {
         /* Q6_K fast path: quantize x to Q8_K once, then vec_dot_q6_K_q8_K
          * Uses int8 MAC with per-subblock scale shuffling and bsums bias correction.
          * AVX2: maddubs_epi16 + madd_epi16 scale application
          * AVX:  maddubs_epi16 (128-bit) + 256-bit float accumulation
          * Scalar fallback available. */
+        /* Requires n >= 256 and n % 256 == 0 (block size). Falls through to
+         * generic vec_dot for small or misaligned activation dimensions. */
         size_t qx_size = (n / 256) * sizeof(block_q8_K);
         block_q8_K *qx = NULL;
         int qx_owned = 0;
@@ -1285,8 +1289,10 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
             return;
         }
         /* If allocation failed, fall through to generic path */
-    } else if (qtype == GGUF_TYPE_Q3_K) {
+    } else if (qtype == GGUF_TYPE_Q3_K && n >= 256 && n % 256 == 0) {
         /* Q3_K fast path: quantize x to Q8_K once, then vec_dot_q3_K_q8_K */
+        /* Requires n >= 256 and n % 256 == 0 (block size). Falls through to
+         * generic vec_dot for small or misaligned activation dimensions. */
         size_t qx_size = (n / 256) * sizeof(block_q8_K);
         block_q8_K *qx = NULL;
         int qx_owned = 0;
@@ -1329,8 +1335,10 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
             return;
         }
         /* If allocation failed, fall through to generic path */
-    } else if (qtype == GGUF_TYPE_Q5_K) {
+    } else if (qtype == GGUF_TYPE_Q5_K && n >= 256 && n % 256 == 0) {
         /* Q5_K fast path: quantize x to Q8_K once, then vec_dot_q5_K_q8_K */
+        /* Requires n >= 256 and n % 256 == 0 (block size). Falls through to
+         * generic vec_dot for small or misaligned activation dimensions. */
         size_t qx_size = (n / 256) * sizeof(block_q8_K);
         block_q8_K *qx = NULL;
         int qx_owned = 0;
@@ -1425,8 +1433,10 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
             return;
         }
         /* If allocation failed, fall through to generic path */
-    } else if (qtype == GGUF_TYPE_Q2_K) {
+    } else if (qtype == GGUF_TYPE_Q2_K && n >= 256 && n % 256 == 0) {
         /* Q2_K fast path: quantize x to Q8_K once, then vec_dot_q2_K_q8_K */
+        /* Requires n >= 256 and n % 256 == 0 (block size). Falls through to
+         * generic vec_dot for small or misaligned activation dimensions. */
         size_t qx_size = (n / 256) * sizeof(block_q8_K);
         block_q8_K *qx = NULL;
         int qx_owned = 0;
