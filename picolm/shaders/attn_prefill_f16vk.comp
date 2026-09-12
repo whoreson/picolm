@@ -1,0 +1,95 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) readonly buffer B_Q { float q_data[]; };
+layout(set = 0, binding = 1, std430) readonly buffer B_KK { uint kv_k_data[]; };
+layout(set = 0, binding = 2, std430) readonly buffer B_KV { uint kv_v_data[]; };
+layout(set = 0, binding = 3, std430) writeonly buffer B_OUT { float xb_out[]; };
+layout(push_constant) uniform PC {
+    int lo, sp, nt, nh, nkh, hd, msl; float inv_sqrt_hd;
+} p;
+
+// fp16 to fp32 conversion (bit manipulation)
+// Input: uint16_t value passed as lower 16 bits of uint32
+float u16tof32(uint v) {
+    v &= 0xFFFFu;  // mask to 16 bits
+    uint sign = (v >> 15) & 0x1;
+    uint exp = (v >> 10) & 0x1F;
+    uint frac = v & 0x3FF;
+    if (exp == 0) {
+        if (frac == 0) {
+            uint r = (sign << 31);
+            return uintBitsToFloat(r);
+        }
+        uint t = frac;
+        int shift = 0;
+        while ((t & 0x400u) == 0u) { t <<= 1; shift++; }
+        t >>= 1;
+        exp = 1 - shift + (127 - 15);
+        frac = t & 0x3FF;
+    } else if (exp == 31) {
+        uint r = (sign << 31) | 0x7F800000u | ((frac != 0u) ? 1u : 0u);
+        return uintBitsToFloat(r);
+    } else {
+        exp = exp - 15 + 127;
+    }
+    uint r = (sign << 31) | (exp << 23) | (frac << 13);
+    return uintBitsToFloat(r);
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint total = uint(p.nh) * uint(p.nt);
+    if (gid >= total) return;
+    int h = int(gid % uint(p.nh));
+    int qi = int(gid / uint(p.nh));
+    int nkh = p.nkh, hd = p.hd, nt = p.nt, msl = p.msl;
+    int kv_mul = p.nh / nkh;
+    int kvh = h / kv_mul;
+    int q_stride = p.nh * hd;
+    int kv_stride = nkh * hd;  // elements in F16 (uint16_t)
+    int q_off = qi * q_stride + h * hd;
+
+    // KV cache layout: [layer][seq][nkh*hd] of uint16_t (2 bytes each)
+    // std430 uint array: each element is 4 bytes (uint32)
+    // So kv_k_data[i] reads bytes [4*i, 4*i+3], which contains 2 F16 values
+    // F16 index -> uint32 index: f16_idx / 2
+    // F16 index -> extract: (f16_idx % 2 == 0) ? lower 16 bits : upper 16 bits
+
+    int kv_base = p.lo * msl * kv_stride;  // F16 element offset
+    int kv_row = kv_stride;  // F16 elements per row
+
+    float scores[256]; int valid = 0;
+    float max_sc = -1e20f;
+    for (int ti = 0; ti < nt; ti++) {
+        if (ti > qi) break;
+        float s = 0.0f;
+        for (int d = 0; d < hd; d++) {
+            int f16_idx = kv_base + (p.sp + ti) * kv_row + kvh * hd + d;
+            uint packed = kv_k_data[f16_idx >> 1];  // uint32 slot (2 F16 packed)
+            uint f16val = ( (f16_idx & 1) != 0) ? (packed >> 16) : (packed & 0xFFFFu);
+            s += q_data[q_off + d] * u16tof32(f16val);
+        }
+        s *= p.inv_sqrt_hd;
+        scores[ti] = s;
+        if (s > max_sc) max_sc = s;
+        valid = ti + 1;
+    }
+    float acc[64];
+    for (int d = 0; d < hd; d++) acc[d] = 0.0f;
+    float sum_exp = 0.0f;
+    for (int ti = 0; ti < valid; ti++) {
+        float e = exp(scores[ti] - max_sc);
+        sum_exp += e;
+        for (int d = 0; d < hd; d++) {
+            int f16_idx = kv_base + (p.sp + ti) * kv_row + kvh * hd + d;
+            uint packed = kv_v_data[f16_idx >> 1];
+            uint f16val = ( (f16_idx & 1) != 0) ? (packed >> 16) : (packed & 0xFFFFu);
+            acc[d] += e * u16tof32(f16val);
+        }
+    }
+    if (sum_exp > 0.0f) {
+        float inv = 1.0f / sum_exp;
+        int o_off = qi * q_stride + h * hd;
+        for (int d = 0; d < hd; d++) xb_out[o_off + d] = acc[d] * inv;
+    }
+}

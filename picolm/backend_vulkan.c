@@ -183,6 +183,12 @@ static struct {
     VkDescriptorPool dpool_attn_prefill;
     VkDescriptorSet dset_attn_prefill;
 
+    // F16 KV-cache attention (reads uint16 from KV cache, not F32 pipe buffers)
+    VkShaderModule shader_attn_f16;
+    VkPipeline pipe_attn_f16;
+    VkDescriptorPool dpool_attn_f16;
+    VkDescriptorSet dset_attn_f16;
+
     // Q8_0 quantize pipeline (F32->Q8_0 on device)
     VkShaderModule shader_quantize;
     VkPipeline pipe_quantize;
@@ -1027,6 +1033,14 @@ int picolm_gpu_init(const int *devices, int count) {
         goto init_fail;
     }
 
+    // F16 KV-cache attention (optional, reads from F16 KV cache buffer)
+    G.shader_attn_f16 = load_spv(G.dev, "attn_prefill_f16vk.spv");
+    if (G.shader_attn_f16) {
+        if (!build_pipeline_unified(G.dev, G.shader_attn_f16, &G.pipe_attn_f16, &G.dpool_attn_f16, &G.dset_attn_f16, 1)) {
+            G.shader_attn_f16 = VK_NULL_HANDLE;
+        }
+    }
+
     // Load Q8_0 quantize shader (F32->Q8_0 on device)
     G.shader_quantize = load_spv(G.dev, "quantize_q8_vk.spv");
     if (G.shader_quantize) {
@@ -1130,6 +1144,11 @@ void picolm_gpu_shutdown(void) {
     if (G.dpool_attn_prefill) vkDestroyDescriptorPool(G.dev, G.dpool_attn_prefill, NULL);
     if (G.pipe_attn_prefill)  vkDestroyPipeline(G.dev, G.pipe_attn_prefill, NULL);
     if (G.shader_attn_prefill) vkDestroyShaderModule(G.dev, G.shader_attn_prefill, NULL);
+
+    if (G.dset_attn_f16)  vkFreeDescriptorSets(G.dev, G.dpool_attn_f16, 1, &G.dset_attn_f16);
+    if (G.dpool_attn_f16) vkDestroyDescriptorPool(G.dev, G.dpool_attn_f16, NULL);
+    if (G.pipe_attn_f16)  vkDestroyPipeline(G.dev, G.pipe_attn_f16, NULL);
+    if (G.shader_attn_f16) vkDestroyShaderModule(G.dev, G.shader_attn_f16, NULL);
 
     if (G.dpool_quantize) {
         // Free all quantize ring descriptor sets (however many were allocated)
@@ -3144,12 +3163,58 @@ int picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
                                       int lo, int sp, int nt,
                                       int nh, int nkh, int hd,
                                       int msl, int device) {
-    if (!G.shader_attn_prefill) { fprintf(stderr, "FATAL: [VK] attn_prefill dispatch with no shader\n"); abort(); }
     if (device != 0 || nt < 1) return 0;
 
-    // KAVERI workaround: use BK/BV pipeline buffers (F32) instead of
-    // KV cache (F16) for prefill attention. KAVERI/RADV can't read
-    // F16 data from large storage buffers in compute shaders.
+    // Try F16 KV-cache path first (reads from KV cache, not F32 pipe buffers)
+    if (G.shader_attn_f16 && G.kv_k_buf && G.kv_v_buf) {
+        VkDescriptorBufferInfo qbi = desc_buf_info(q_dev);
+        VkDescriptorBufferInfo obbi = desc_buf_info(xb_out_dev);
+        VkDescriptorBufferInfo kbi = { G.kv_k_buf, 0, G.kv_k_bytes };
+        VkDescriptorBufferInfo vbi = { G.kv_v_buf, 0, G.kv_v_bytes };
+        if (!qbi.buffer || !obbi.buffer) return 0;
+
+        VkDescriptorBufferInfo bi[4] = { qbi, kbi, vbi, obbi };
+        uint32_t total = (uint32_t)nh * (uint32_t)nt;
+        VK_BATCH_DISPATCH_PRE();
+
+        // Barrier: Q write -> shader read; KV cache write -> shader read
+        VkBufferMemoryBarrier barriers[2] = {
+            { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+              .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+              .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+              .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+              .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+              .buffer = qbi.buffer, .offset = qbi.offset,
+              .size = (VkDeviceSize)nt * nh * hd * sizeof(float) },
+            { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+              .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+              .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+              .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+              .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+              .buffer = G.kv_k_buf, .offset = 0, .size = G.kv_k_bytes },
+        };
+        vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                             0, NULL, 2, barriers, 0, NULL);
+
+        vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_attn_f16);
+        push_desc(G.cmd_dev, 4, bi);
+
+        typedef struct {
+            int lo, sp, nt, nh, nkh, hd, msl; float inv_sqrt_hd;
+        } PC_AttnF16;
+        PC_AttnF16 pc = {lo, sp, nt, nh, nkh, hd, msl, 1.0f / sqrtf(hd)};
+        vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, sizeof(pc), &pc);
+        vkCmdDispatch(G.cmd_dev, (uint32_t)((total + 255) / 256), 1, 1);
+        _g_dispatch_cnt++;
+        VK_BATCH_DISPATCH_POST();
+        return 1;
+    }
+
+    // Fallback: F32 pipeline buffer path (KAVERI workaround)
+    if (!G.shader_attn_prefill) { fprintf(stderr, "FATAL: [VK] attn_prefill dispatch with no shader\n"); abort(); }
+
     const float *bk_dev = (float*)G.pipe_k_b_d;
     const float *bv_dev = (float*)G.pipe_v_b_d;
 
