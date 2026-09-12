@@ -16,9 +16,6 @@
 #include <string.h>
 #include <math.h>
 #include <assert.h>
-#ifndef _WIN32
-#include <sys/resource.h>
-#endif
 
 #ifdef PICOLM_GPU
 #include "backend_gpu.h"
@@ -46,17 +43,6 @@ static void _gpu_bench_emit(int l, int is_prefill, double elapsed_ms, long minfl
     if (!g_bench_cb) return;
     g_bench_cb(l, is_prefill, elapsed_ms, minflt, majflt, g_bench_user_data);
 }
-
-#if defined(_WIN32) || defined(PICOLM_DOS)
-#define _GPU_BENCH_START() double _bench_t0 = get_time_ms()
-#define _GPU_BENCH_END(_l, _pref) _gpu_bench_emit(_l, _pref, get_time_ms() - (_bench_t0), 0, 0)
-#else
-#define _GPU_BENCH_START() double _bench_t0 = get_time_ms(); struct rusage _bench_ru0; getrusage(RUSAGE_SELF, &_bench_ru0)
-#define _GPU_BENCH_END(_l, _pref) do { struct rusage _bench_ru1; getrusage(RUSAGE_SELF, &_bench_ru1); \
-    _gpu_bench_emit(_l, _pref, get_time_ms() - (_bench_t0), \
-        (long)_bench_ru1.ru_minflt - (long)_bench_ru0.ru_minflt, \
-        (long)_bench_ru1.ru_majflt - (long)_bench_ru0.ru_majflt); } while(0)
-#endif
 
 /* SSM verification debug: guarded by compile-time PICOLM_SSM_VERIFY define or runtime env var.
  * When undefined, checks getenv for runtime toggle. */

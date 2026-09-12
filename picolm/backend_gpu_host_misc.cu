@@ -1504,11 +1504,16 @@ picolm_gpu_gelu_mul_dev(float *gate_dev, const float *up_dev, size_t n, int devi
     return 1;
 }
 
-/* Vulkan command batch wrappers -- no-ops on CUDA/HIP (single stream model).
- * Vulkan uses explicit command buffers that need begin/end + fence sync.
- * CUDA/HIP's stream model provides implicit ordering within a single stream. */
+/* Vulkan command batch wrappers -- on CUDA/HIP, batch_end syncs the stream
+ * so that benchmark timing in _prefill_gpu_ubatch captures actual GPU execution
+ * time rather than just command recording overhead.
+ * Vulkan uses explicit command buffers that need begin/end + fence sync. */
 extern "C" int picolm_gpu_batch_begin(int device) { (void)device; return 1; }
-extern "C" int picolm_gpu_batch_end(int device) { (void)device; return 1; }
+extern "C" int picolm_gpu_batch_end(int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (ctx) gpuDeviceSynchronize();
+    return 1;
+}
 
 /* D2H via mapped memory -- on CUDA/HIP, just use regular D2H memcpy. */
 extern "C" int
