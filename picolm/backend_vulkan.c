@@ -321,6 +321,7 @@ static struct {
     VkPhysicalDeviceProperties dev_props;
     int subgroup_size;
     int gcn1;  // GCN1 detected (KAVERI/HAINAN/KALINDI)
+    VkPipeline bound_pipe;
 } G;
 
 // ---------------------------------------------------------------------------
@@ -1883,6 +1884,16 @@ int picolm_gpu_sync(int device) {
         VkCommandBufferBeginInfo _vb = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; \
         vkResetCommandBuffer(G.cmd_dev, 0); \
         vkBeginCommandBuffer(G.cmd_dev, &_vb); \
+        G.bound_pipe = VK_NULL_HANDLE; \
+    } \
+} while(0)
+
+// Conditional pipeline bind: skip if already bound to the same pipeline.
+// Saves ~1500+ vkCmdBindPipeline calls during prefill. Vulkan pipeline state is sticky.
+#define VK_BATCH_BIND(pipe) do { \
+    if (G.bound_pipe != (pipe)) { \
+        vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, (pipe)); \
+        G.bound_pipe = (pipe); \
     } \
 } while(0)
 
@@ -2260,7 +2271,7 @@ static int _quantize_dev(const float *x_dev, int I, int S) {
     };
     typedef struct { int I, S, pad; } PC_Q;
     PC_Q pc = {I, S, 0};
-    vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_quantize);
+    VK_BATCH_BIND(G.pipe_quantize);
     push_desc(G.cmd_dev, 3, bi);
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(pc), &pc);
@@ -2285,7 +2296,7 @@ static int _q8q8_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, int S) {
     };
     typedef struct { int I, S, O, rowWords; } PC_Q8;
     PC_Q8 pc = {t->I, S, t->O, (int)t->row_words};
-    vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_q8q8);
+    VK_BATCH_BIND(G.pipe_q8q8);
     push_desc(G.cmd_dev, 4, bi);
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(pc), &pc);
@@ -2327,7 +2338,7 @@ int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_d
             static int _fd=0; if(!_fd){_fd=1;fprintf(stderr,"DISPATCH matmul_dev: fallback scalar I=%d O=%d S=%d qtype=%d\n",t->I,t->O,S,t->qtype);}
         }
         VkDescriptorBufferInfo bi[3] = {xbi, {t->wbuf,0,VK_WHOLE_SIZE}, ybi};
-        vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe);
+        VK_BATCH_BIND(G.pipe);
         push_desc(G.cmd_dev, 3, bi);
         PC_Matmul pc = {t->qtype, S, t->I, t->O, (int)t->row_words, x_stride, y_stride};
         vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
@@ -2376,7 +2387,7 @@ int picolm_gpu_matmul_dev_qkv(picolm_gpu_tensor_t *tq, picolm_gpu_tensor_t *tk,
         PC_QKV3 pc = { tq->I, S, tq->O, tk->O, tv->O,
                         (int)tq->row_words, (int)tk->row_words, (int)tv->row_words };
         uint32_t total = (uint32_t)S * (tq->O + tk->O + tv->O);
-        vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_qkv);
+        VK_BATCH_BIND(G.pipe_qkv);
         push_desc_8(G.cmd_dev, 8, bi);
         vkCmdPushConstants(G.cmd_dev, G.plyt_qkv, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         vkCmdDispatch(G.cmd_dev, (total + 255u) / 256u, 1, 1);
@@ -2409,7 +2420,7 @@ int picolm_gpu_matmul_dev_qkv(picolm_gpu_tensor_t *tq, picolm_gpu_tensor_t *tk,
               desc_tensor_info(tq), desc_buf_info(bq) };
           typedef struct { int I, S, O, rowWords; } PC_Q8;
           PC_Q8 pc = {tq->I, S, tq->O, (int)tq->row_words};
-          vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_q8q8);
+          VK_BATCH_BIND(G.pipe_q8q8);
           push_desc(G.cmd_dev, 4, bi);
           vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
           vkCmdDispatch(G.cmd_dev, (total + 255u) / 256u, 1, 1);
@@ -2422,7 +2433,7 @@ int picolm_gpu_matmul_dev_qkv(picolm_gpu_tensor_t *tq, picolm_gpu_tensor_t *tk,
               desc_tensor_info(tk), desc_buf_info(bk) };
           typedef struct { int I, S, O, rowWords; } PC_Q8;
           PC_Q8 pc = {tk->I, S, tk->O, (int)tk->row_words};
-          vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_q8q8);
+          VK_BATCH_BIND(G.pipe_q8q8);
           push_desc(G.cmd_dev, 4, bi);
           vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
           vkCmdDispatch(G.cmd_dev, (total + 255u) / 256u, 1, 1);
@@ -2435,7 +2446,7 @@ int picolm_gpu_matmul_dev_qkv(picolm_gpu_tensor_t *tq, picolm_gpu_tensor_t *tk,
               desc_tensor_info(tv), desc_buf_info(bv) };
           typedef struct { int I, S, O, rowWords; } PC_Q8;
           PC_Q8 pc = {tv->I, S, tv->O, (int)tv->row_words};
-          vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_q8q8);
+          VK_BATCH_BIND(G.pipe_q8q8);
           push_desc(G.cmd_dev, 4, bi);
           vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
           vkCmdDispatch(G.cmd_dev, (total + 255u) / 256u, 1, 1);
@@ -2478,7 +2489,7 @@ int picolm_gpu_matmul_dev_gu(picolm_gpu_tensor_t *tg, picolm_gpu_tensor_t *tu,
         PC_GU3 pc = { tg->I, S, tg->O, tu->O,
                         (int)tg->row_words, (int)tu->row_words };
         uint32_t total = (uint32_t)S * (tg->O + tu->O);
-        vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_gu);
+        VK_BATCH_BIND(G.pipe_gu);
         push_desc_6(G.cmd_dev, 6, bi);
         vkCmdPushConstants(G.cmd_dev, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         vkCmdDispatch(G.cmd_dev, (total + 255u) / 256u, 1, 1);
@@ -2508,7 +2519,7 @@ int picolm_gpu_matmul_dev_gu(picolm_gpu_tensor_t *tg, picolm_gpu_tensor_t *tu,
               desc_tensor_info(tg), desc_buf_info(bgate) };
           typedef struct { int I, S, O, rowWords; } PC_Q8;
           PC_Q8 pc = {tg->I, S, tg->O, (int)tg->row_words};
-          vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_q8q8);
+          VK_BATCH_BIND(G.pipe_q8q8);
           push_desc(G.cmd_dev, 4, bi);
           vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
           vkCmdDispatch(G.cmd_dev, (total + 255u) / 256u, 1, 1);
@@ -2520,7 +2531,7 @@ int picolm_gpu_matmul_dev_gu(picolm_gpu_tensor_t *tg, picolm_gpu_tensor_t *tu,
               desc_tensor_info(tu), desc_buf_info(bup) };
           typedef struct { int I, S, O, rowWords; } PC_Q8;
           PC_Q8 pc = {tu->I, S, tu->O, (int)tu->row_words};
-          vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_q8q8);
+          VK_BATCH_BIND(G.pipe_q8q8);
           push_desc(G.cmd_dev, 4, bi);
           vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
           vkCmdDispatch(G.cmd_dev, (total + 255u) / 256u, 1, 1);
@@ -2561,7 +2572,7 @@ int picolm_gpu_rmsnorm_batched_dev(float *out, const float *x, const float *weig
     VK_BATCH_DISPATCH_PRE();
     // Scoped barrier: sync input buffer (x)
     _batch_barrier_buf(x, (size_t)dim * (size_t)S * sizeof(float));
-    vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_nrm);
+    VK_BATCH_BIND(G.pipe_nrm);
     push_desc(G.cmd_dev, 3, bi);
     PC_Matmul pc_nrm = {0, S, dim, 0, xs};
     memcpy(&pc_nrm.O, &eps, sizeof(float));
@@ -2583,7 +2594,7 @@ int picolm_gpu_residual_add(float *out, const float *a, const float *b,
     // Scoped barrier: sync a and b (both inputs, one vkCmd call)
     _batch_barrier_buf2(a, (size_t)n * (size_t)dim * sizeof(float),
                         b, (size_t)n * (size_t)dim * sizeof(float));
-    vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_elem);
+    VK_BATCH_BIND(G.pipe_elem);
     push_desc(G.cmd_dev, 4, bi);
     int total = n * dim;
     PC_Elem pc = {0, total, 0.0f, 0};
@@ -2619,7 +2630,7 @@ int picolm_gpu_silu_mul_dev(float *g, const float *u, size_t n, int device) {
           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
           0, NULL, 2, bm, 0, NULL);
       _g_barrier_cnt++; }
-    vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_elem);
+    VK_BATCH_BIND(G.pipe_elem);
     push_desc(G.cmd_dev, 4, bi);
     PC_Elem pc = {1, (int)n, 0.0f, 0};
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
@@ -2638,7 +2649,7 @@ int picolm_gpu_gelu_mul_dev(float *g, const float *u, size_t n, int device) {
     VK_BATCH_DISPATCH_PRE();
     // Scoped barrier: sync g and u (one vkCmd call)
     _batch_barrier_buf2(g, n * sizeof(float), u, n * sizeof(float));
-    vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_elem);
+    VK_BATCH_BIND(G.pipe_elem);
     push_desc(G.cmd_dev, 4, bi);
     PC_Elem pc = {5, (int)n, 0.0f, 0};
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
@@ -2662,7 +2673,7 @@ int picolm_gpu_rope_apply(float *x, int n_heads, int head_dim,
     if (!xb || !cb || !sb) return 0;
     VkDescriptorBufferInfo bi[4] = {{xb,0,VK_WHOLE_SIZE},{cb,cos_off,VK_WHOLE_SIZE},{sb,sin_off,VK_WHOLE_SIZE},{VK_NULL_HANDLE,0,0}};
     VK_BATCH_DISPATCH_PRE();
-    vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_elem);
+    VK_BATCH_BIND(G.pipe_elem);
     push_desc(G.cmd_dev, 4, bi);
     PC_Elem pc = {2, half_dim, (float)n_heads, rope_type};
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
@@ -2690,7 +2701,7 @@ int picolm_gpu_rope_apply_batched(float *x, int n_heads, int head_dim,
     VK_BATCH_DISPATCH_PRE();
     // Scoped barrier: sync x (in-place read/write)
     _batch_barrier_buf(x, (size_t)S * (size_t)half_dim * sizeof(float));
-    vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_elem);
+    VK_BATCH_BIND(G.pipe_elem);
     push_desc(G.cmd_dev, 3, bi);
     PC_Elem pc = {6, half_dim, (float)n_heads, start_pos};
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
@@ -3082,7 +3093,7 @@ static int _kv_store_native(int is_k, int lo, int sp, int np,
             VK_BATCH_DISPATCH_PRE();
             // Scoped barrier: sync source buffer (strided KV store)
             _batch_barrier_buf(sd, (VkDeviceSize)np * (VkDeviceSize)stride * sizeof(float));
-            vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_kv_store);
+            VK_BATCH_BIND(G.pipe_kv_store);
             push_desc(G.cmd_dev, 4, bi);
             vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
                                0, sizeof(pc), &pc);
@@ -3105,7 +3116,7 @@ static int _kv_store_native(int is_k, int lo, int sp, int np,
     VK_BATCH_DISPATCH_PRE();
     // Scoped barrier: sync source buffer (rope/matmul output -> KV store input)
     _batch_barrier_buf(sd, (VkDeviceSize)np * (VkDeviceSize)kv_dim * sizeof(float));
-    vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_kv_store);
+    VK_BATCH_BIND(G.pipe_kv_store);
     push_desc(G.cmd_dev, 4, bi);
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(pc), &pc);
@@ -3355,7 +3366,7 @@ int picolm_gpu_attention_decode_dev(float *xb_out_dev, const float *q_dev,
     if (!bi[0].buffer || !bi[3].buffer) return 0;
     vkResetCommandBuffer(G.cmd_dev, 0);
     vkBeginCommandBuffer(G.cmd_dev, &begin);
-    vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_attn_dec);
+    VK_BATCH_BIND(G.pipe_attn_dec);
     push_desc(G.cmd_dev, 4, bi);
 
     typedef struct {
@@ -3420,7 +3431,7 @@ int picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
                              0, NULL, 2, barriers, 0, NULL);
 
-        vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_attn_f16);
+        VK_BATCH_BIND(G.pipe_attn_f16);
         push_desc(G.cmd_dev, 4, bi);
 
         typedef struct {
@@ -3484,7 +3495,7 @@ int picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
                          0, NULL, 3, barriers, 0, NULL);
 
-    vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_attn_prefill);
+    VK_BATCH_BIND(G.pipe_attn_prefill);
     push_desc(G.cmd_dev, 4, bi);
 
     typedef struct {
