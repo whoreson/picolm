@@ -147,8 +147,26 @@ static int gguf_format_value(char *buf, int buflen, reader_t *r, uint32_t vtype)
     }
 }
 
+/* Read a feed_forward_length value: scalar or array of scalars.
+ * Returns the max value in the array (or the scalar value).
+ * This handles Gemma-3n E2B models where feed_forward_length is an array
+ * [8192, 8192, ...] rather than a single scalar. */
+static uint64_t read_ffn_length(reader_t *r, uint32_t vtype) {
+    if (vtype == GGUF_META_ARRAY) {
+        uint32_t arr_type = read_u32(r);
+        uint64_t arr_len  = read_u64(r);
+        uint64_t max_val = 0;
+        for (uint64_t i = 0; i < arr_len; i++) {
+            uint64_t v = skip_meta_value(r, arr_type, NULL);
+            if (v > max_val) max_val = v;
+        }
+        return max_val;
+    }
+    return skip_meta_value(r, vtype, NULL);
+}
+
 static uint64_t skip_meta_value(reader_t *r, uint32_t vtype, int *is_numeric) {
-    *is_numeric = 1;
+    if (is_numeric) *is_numeric = 1;
     switch (vtype) {
         case GGUF_META_UINT8:   return read_u8(r);
         case GGUF_META_INT8:    return (uint64_t)(int64_t)(int8_t)read_u8(r);
@@ -853,7 +871,7 @@ int parse_gguf(model_t *m, int max_seq_len) {
         } else if (str_eq(key, "llama.feed_forward_length") || str_eq(key, "general.feed_forward_length")
             || str_eq(key, "qwen2.feed_forward_length") || str_eq(key, "qwen3.feed_forward_length") || str_eq(key, "qwen35.feed_forward_length")
             || str_eq(key, "gemma3n.feed_forward_length") || str_eq(key, "gpt2.feed_forward_length")) {
-            int dummy; cfg->n_ffn = (int)skip_meta_value(&r, vtype, &dummy);
+            cfg->n_ffn = (int)read_ffn_length(&r, vtype);
         } else if (str_eq(key, "llama.attention.head_count")
             || str_eq(key, "qwen2.attention.head_count") || str_eq(key, "qwen3.attention.head_count") || str_eq(key, "qwen35.attention.head_count") || str_eq(key, "qwen35moe.attention.head_count")
             || str_eq(key, "gemma3n.attention.head_count") || str_eq(key, "gpt2.attention.head_count")) {
