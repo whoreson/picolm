@@ -891,11 +891,12 @@ int parse_gguf(model_t *m, int max_seq_len) {
             || str_eq(key, "gemma3n.attention.head_count_kv") || str_eq(key, "gpt2.attention.head_count_kv")) {
             int dummy; cfg->n_kv_heads = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "attention.key_length")
+            || str_eq(key, "llama.attention.key_length")
             || str_eq(key, "qwen2.attention.key_length")
             || str_eq(key, "qwen3.attention.key_length") || str_eq(key, "qwen35.attention.key_length")
             || str_eq(key, "qwen35moe.attention.key_length")
             || str_eq(key, "gemma3n.attention.key_length")) {
-            /* Explicit head_dim (Qwen3/3.5/Gemma-3n may differ from n_embd/n_heads) */
+            /* Explicit head_dim (Qwen3/3.5/Gemma-3n/Mistral-Nemo may differ from n_embd/n_heads) */
             int dummy; cfg->head_dim = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "llama.block_count")
             || str_eq(key, "qwen2.block_count") || str_eq(key, "qwen3.block_count") || str_eq(key, "qwen35.block_count") || str_eq(key, "qwen35moe.block_count")
@@ -1052,6 +1053,14 @@ int parse_gguf(model_t *m, int max_seq_len) {
                     m->tok_unknown_model = 0; /* smollm pre-tokenizer works with SPM */
                 } else if (pre.len >= 6 && strncmp(pre.str, "qwen35", 6) == 0) {
                     m->tok_space_marker = 3; /* qwen35: U+0100, no prefix on first token */
+                    m->tok_unknown_model = 0;
+                } else if (pre.len == 6 && strncmp(pre.str, "tekken", 6) == 0) {
+                    /* Mistral Tekken tokenizer (Mistral-Nemo-2407 and later).
+                     * Same GPT-2-style byte-level BPE vocab/merges representation as
+                     * Qwen, but with Tekken's own pretokenizer regex. Handled entirely
+                     * by qwen_tokenize.c (native BPE path); tok_space_marker is unused
+                     * for this path (only consulted by the old SPM tokenizer.c). */
+                    cfg->is_tekken = 1;
                     m->tok_unknown_model = 0;
                 } else if (pre.len >= 10 && strncmp(pre.str, "llama-bpe", 9) == 0) {
                     /* llama-bpe: GPT-2 BPE with Llama preprocessing - unsupported, use U+0100 as best guess */

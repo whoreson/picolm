@@ -41,6 +41,9 @@ typedef struct {
     int is_qwen;        /* 1 if model architecture is qwen3/qwen35 */
     int is_gemma3n;     /* 1 if model architecture is gemma3n */
     int is_gpt2;        /* 1 if model architecture is gpt2 */
+    int is_tekken;      /* 1 if tokenizer.ggml.pre == "tekken" (Mistral Tekken tokenizer,
+                            e.g. Mistral-Nemo-2407). GPT-2-style BPE vocab/merges but with
+                            Tekken's own pretokenizer regex; see qwen_tokenize.c. */
     int max_seq_len;    /* maximum sequence length (e.g. 2048) */
     int head_dim;       /* = n_embd / n_heads */
     float rope_freq_base; /* RoPE theta base (e.g. 10000.0) */

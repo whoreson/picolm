@@ -1,12 +1,20 @@
-/* Qwen3.5/3.6 native GPT-2 byte-level BPE tokenizer.
- * Ported from q36 (https://github.com/ambud-sh/q36) for PicoLM.
+/* Native GPT-2 byte-level BPE tokenizer, shared by Qwen3.5/3.6 and Mistral
+ * Tekken (Mistral-Nemo-2407 and later) models.
+ * Qwen support ported from q36 (https://github.com/ambud-sh/q36) for PicoLM.
  *
  * Uses the model's GGUF metadata directly: vocab strings, merges, token_type.
- * The pretokenizer implements the Qwen3.5 rules (contractions, L/N categories,
- * whitespace handling). The BPE engine does byte-level encoding with
- * FNVA hash tables for fast lookup.
+ * The BPE engine (byte<->codepoint mapping, FNV hash tables, rank-based merge
+ * loop) is shared across model families. Only the pretokenizer -- the
+ * function that decides where to cut the input into initial chunks before
+ * BPE merging -- differs, since each family ships its own pretokenizer
+ * regex in tokenizer.json:
+ *   - QWEN_PRETOK_DEFAULT: Qwen3.5/3.6 rules (contractions, L/N categories,
+ *     whitespace handling). Also used as-is for plain GPT-2 models.
+ *   - QWEN_PRETOK_TEKKEN: Mistral's Tekken pretokenizer regex (see
+ *     pretok_next_tekken() below for the exact pattern it approximates).
  *
- * Only used for Qwen models that have tokenizer.ggml.token_type metadata.
+ * Selected at load time by qwen_tokenize_should_use() / qwen_tokenize_init()
+ * based on model.config.is_qwen / is_gpt2 / is_tekken / from_safetensors.
  */
 
 #include <stdio.h>
@@ -197,6 +205,190 @@ static int pretok_next(const char *s, int n) {
     return adv; /* fallback: single codepoint */
 }
 
+/* ---- Tekken pretokenizer (Mistral-Nemo-2407 and later) ----
+ *
+ * Approximates llama.cpp's LLAMA_VOCAB_PRE_TYPE_TEKKEN regex
+ * (src/llama-vocab.cpp), which is itself an ASCII-only-lookahead
+ * approximation of the original tokenizer.json pattern:
+ *
+ *   [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+
+ *   |[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*
+ *   |\p{N}
+ *   | ?[^\s\p{L}\p{N}]+[\r\n/]*
+ *   |\s*[\r\n]+
+ *   |\s+(?!\S)
+ *   |\s+
+ *
+ * Differences from the QWEN_PRETOK_DEFAULT pattern above:
+ *   - No contraction rule ('s/'t/'re/...) -- an apostrophe is just another
+ *     "optional prefix" character and naturally attaches to a following
+ *     letter run (e.g. "it's" -> "it" + "'s"), matching Tekken's regex
+ *     (which has no contraction alternative at all).
+ *   - The letter-run alternatives split on case: a run of "upper-like"
+ *     codepoints (Lu/Lt/Lm/Lo/M) followed by a run of "lower-like"
+ *     codepoints (Ll/Lm/Lo/M) is one pretoken; this is what makes
+ *     "HelloWorld" split into "Hello"+"World" while "HELLO" and
+ *     "HELLOworld" each stay whole. Letters with no case (CJK, Devanagari,
+ *     Arabic, etc.) count as *both* upper-like and lower-like, so they
+ *     behave the same as the QWEN_PRETOK_DEFAULT single-category letters.
+ *   - The trailing run after a punctuation span also swallows '/', not
+ *     just '\r'/'\n' (so "path/to/file" -> "path" + "/to" + "/file").
+ *
+ * Unicode classification here (is_upper/is_lower/is_mark) is a curated
+ * approximation covering ASCII, Latin-1 Supplement, Latin Extended-A,
+ * Greek and Cyrillic (the scripts where case actually matters for
+ * Mistral's training data) plus the common combining-mark blocks, in the
+ * same spirit as the is_L/is_N tables above. Any letter outside these
+ * explicit upper/lower ranges (CJK, Hangul, Devanagari, Arabic, Hebrew,
+ * Thai, etc., all already covered by is_L) is treated as caseless and
+ * folds into both upper-like and lower-like, which is exactly the
+ * behavior \p{Lo} gets in the original regex. */
+
+static int is_tekken_upper(uint32_t cp) {
+    if (cp >= 'A' && cp <= 'Z') return 1;
+    if (cp >= 0xC0 && cp <= 0xD6) return 1;             /* Latin-1 uppercase */
+    if (cp >= 0xD8 && cp <= 0xDE) return 1;
+    if (cp >= 0x100 && cp <= 0x137 && (cp & 1) == 0) return 1; /* Latin Ext-A (approx) */
+    if (cp >= 0x139 && cp <= 0x148 && (cp & 1) == 1) return 1;
+    if (cp >= 0x14A && cp <= 0x177 && (cp & 1) == 0) return 1;
+    if (cp == 0x178 || cp == 0x179 || cp == 0x17B || cp == 0x17D) return 1;
+    if (cp == 0x386 || (cp >= 0x388 && cp <= 0x38F)) return 1; /* Greek accented caps */
+    if (cp >= 0x391 && cp <= 0x3A1) return 1;            /* Greek Alpha..Rho */
+    if (cp >= 0x3A3 && cp <= 0x3AB) return 1;            /* Greek Sigma..Omega/Iota/Upsilon diaeresis */
+    if (cp >= 0x400 && cp <= 0x42F) return 1;            /* Cyrillic uppercase */
+    return 0;
+}
+
+static int is_tekken_lower(uint32_t cp) {
+    if (cp >= 'a' && cp <= 'z') return 1;
+    if (cp >= 0xDF && cp <= 0xF6) return 1;              /* Latin-1 lowercase */
+    if (cp >= 0xF8 && cp <= 0xFF) return 1;
+    if (cp >= 0x100 && cp <= 0x137 && (cp & 1) == 1) return 1; /* Latin Ext-A (approx) */
+    if (cp >= 0x139 && cp <= 0x148 && (cp & 1) == 0) return 1;
+    if (cp >= 0x14A && cp <= 0x177 && (cp & 1) == 1) return 1;
+    if (cp == 0x17A || cp == 0x17C || cp == 0x17E) return 1;
+    if (cp >= 0x3AC && cp <= 0x3CE) return 1;            /* Greek lowercase (incl. accented/final sigma) */
+    if (cp >= 0x430 && cp <= 0x45F) return 1;            /* Cyrillic lowercase */
+    return 0;
+}
+
+static int is_tekken_mark(uint32_t cp) {
+    if (cp >= 0x0300 && cp <= 0x036F) return 1;  /* combining diacritical marks */
+    if (cp >= 0x0483 && cp <= 0x0489) return 1;  /* Cyrillic combining */
+    if (cp >= 0x0591 && cp <= 0x05C7) return 1;  /* Hebrew points (approx) */
+    if (cp >= 0x0610 && cp <= 0x061A) return 1;  /* Arabic marks */
+    if (cp >= 0x064B && cp <= 0x065F) return 1;  /* Arabic diacritics */
+    if (cp == 0x0670) return 1;
+    if (cp >= 0x06D6 && cp <= 0x06ED) return 1;  /* Arabic marks (approx range) */
+    if (cp >= 0x0900 && cp <= 0x0963) return 1;  /* Devanagari marks (approx range) */
+    if (cp >= 0x1AB0 && cp <= 0x1AFF) return 1;
+    if (cp >= 0x1DC0 && cp <= 0x1DFF) return 1;
+    if (cp >= 0x20D0 && cp <= 0x20FF) return 1;
+    if (cp >= 0xFE20 && cp <= 0xFE2F) return 1;
+    return 0;
+}
+
+/* Lu|Lt|Lm|Lo|M : upper/titlecase, plus caseless letters and marks */
+static int is_tekken_upper_like(uint32_t cp) {
+    if (is_tekken_upper(cp) || is_tekken_mark(cp)) return 1;
+    return is_L(cp) && !is_tekken_lower(cp); /* caseless letter */
+}
+/* Ll|Lm|Lo|M : lowercase, plus caseless letters and marks */
+static int is_tekken_lower_like(uint32_t cp) {
+    if (is_tekken_lower(cp) || is_tekken_mark(cp)) return 1;
+    return is_L(cp) && !is_tekken_upper(cp); /* caseless letter */
+}
+
+static int pretok_next_tekken(const char *s, int n) {
+    int cp, adv;
+    adv = utf8_next(s, n, &cp);
+
+    /* 1/2: optional non-[\r\n L N] prefix, then a case-aware letter run:
+     *      upper-like* followed by lower-like+ (alt1), or upper-like+
+     *      optionally followed by lower-like* (alt2). */
+    {
+        int start = -1; /* byte offset (from s) where the letter run itself begins;
+                          * the overall match always starts at offset 0 (either the
+                          * prefix char at 0, or the letter itself at 0). */
+
+        if (cp != '\r' && cp != '\n' && !is_L(cp) && !is_N(cp)) {
+            /* cp is a candidate optional-prefix character; only consume it
+             * if a letter actually follows (regex prefix is greedy but the
+             * overall alternative still requires a letter run). */
+            if (adv < n) {
+                int c2 = 0;
+                (void)utf8_next(s + adv, n - adv, &c2);
+                if (is_L(c2)) start = adv;
+            }
+        } else if (is_L(cp)) {
+            start = 0;
+        }
+
+        if (start >= 0) {
+            int j = start;
+            while (j < n) {
+                int c3, a3 = utf8_next(s + j, n - j, &c3);
+                if (!is_tekken_upper_like(c3)) break;
+                j += a3;
+            }
+            int upper_end = j;
+            while (j < n) {
+                int c3, a3 = utf8_next(s + j, n - j, &c3);
+                if (!is_tekken_lower_like(c3)) break;
+                j += a3;
+            }
+            int lower_end = j;
+
+            if (lower_end > upper_end) return lower_end;   /* alt1 */
+            if (upper_end > start) return upper_end;       /* alt2 */
+            /* Shouldn't happen (is_L implies upper_like||lower_like), but
+             * fall through defensively to the remaining alternatives. */
+        }
+    }
+
+    /* 3: single number */
+    if (is_N(cp)) return adv;
+
+    /* 4: optional space + punct run + trailing \r\n/ */
+    {
+        int j = 0;
+        if (cp == ' ' && adv < n) {
+            int c2;
+            (void)utf8_next(s + adv, n - adv, &c2);
+            if (!is_WS(c2) && !is_L(c2) && !is_N(c2)) j = adv;
+        }
+        if (j > 0 || (!is_WS(cp) && !is_L(cp) && !is_N(cp))) {
+            int k = j;
+            while (k < n) {
+                int c3, a3 = utf8_next(s + k, n - k, &c3);
+                if (is_WS(c3) || is_L(c3) || is_N(c3)) break;
+                k += a3;
+            }
+            if (k > j || j > 0) {
+                while (k < n && (s[k] == '\r' || s[k] == '\n' || s[k] == '/')) k++;
+                if (k > 0) return k;
+            }
+        }
+    }
+
+    /* 5/6/7: whitespace forms (identical semantics to the default
+     * pretokenizer's \s*[\r\n]+ / \s+(?!\S) / \s+ handling). */
+    if (is_WS(cp)) {
+        int j = 0, last_nl = -1;
+        while (j < n) {
+            int c3, a3 = utf8_next(s + j, n - j, &c3);
+            if (!is_WS(c3)) break;
+            if (c3 == '\r' || c3 == '\n') last_nl = j + a3;
+            j += a3;
+        }
+        if (last_nl > 0) return last_nl;
+        if (j < n && j > adv) return (j - 1 == 0) ? adv : j - 1;
+        return j;
+    }
+
+    return adv; /* fallback: single codepoint */
+}
+
 /* ---- BPE encode one pretoken ---- */
 static int bpe_piece(qwen_enc_t *enc, const char *s, int n, int *out, int cap) {
     char buf[2048];
@@ -243,19 +435,23 @@ static int bpe_piece(qwen_enc_t *enc, const char *s, int n, int *out, int cap) {
 
 /* ---- Public API ---- */
 
-/* Check if a model should use the Qwen tokenizer */
+/* Check if a model should use the native GPT-2 BPE tokenizer (this file). */
 int qwen_tokenize_should_use(const model_t *m) {
-    /* Use Qwen tokenizer for Qwen3/Qwen3.5 architectures and GPT-2 models.
-     * Both use GPT-2 BPE tokenization with merges.
-     * Llama and other architectures may also have token_type metadata
-     * but should use the old tokenizer. Safetensors Qwen models also
-     * use this tokenizer (from_safetensors path). */
-    return m->config.is_qwen || m->config.is_gpt2 || m->from_safetensors;
+    /* Use the native BPE tokenizer for Qwen3/Qwen3.5 architectures, GPT-2
+     * models, and Mistral Tekken models (tokenizer.ggml.pre == "tekken",
+     * e.g. Mistral-Nemo-2407). All of these ship a GPT-2-style byte-level
+     * BPE vocab/merges in GGUF, just with different pretokenizer regexes
+     * (see qwen_enc_t.pretok_type / pretok_next vs pretok_next_tekken).
+     * Llama SPM and other architectures should use the old tokenizer.
+     * Safetensors Qwen models also use this tokenizer (from_safetensors path). */
+    return m->config.is_qwen || m->config.is_gpt2 || m->config.is_tekken || m->from_safetensors;
 }
 
 /* Initialize the Qwen tokenizer from model data */
 int qwen_tokenize_init(qwen_enc_t *enc, const model_t *m) {
     if (!g_maps_ready) build_maps();
+
+    enc->pretok_type = m->config.is_tekken ? QWEN_PRETOK_TEKKEN : QWEN_PRETOK_DEFAULT;
 
     /* Guard: Qwen tokenizer requires tok_tokens_data from GGUF */
     if (!m->tok_tokens_data || !m->tok_n_tokens) {
@@ -415,7 +611,9 @@ int qwen_tokenize_encode(qwen_enc_t *enc, const char *text, int *out, int cap) {
 
         int q = pos;
         while (q < end && m2 < cap) {
-            int pl = pretok_next(text + q, end - q);
+            int pl = (enc->pretok_type == QWEN_PRETOK_TEKKEN)
+                      ? pretok_next_tekken(text + q, end - q)
+                      : pretok_next(text + q, end - q);
             if (pl <= 0) pl = 1;
             m2 += bpe_piece(enc, text + q, pl, out + m2, cap - m2);
             q += pl;

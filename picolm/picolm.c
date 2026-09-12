@@ -194,6 +194,9 @@ static const char *tmpl_chatml_suffix =
     "</think>\n"
     "\n";
 
+static const char *tmpl_tekken_prefix = "[INST]";
+static const char *tmpl_tekken_suffix = "[/INST]";
+
 static const char *tmpl_alpaca_prefix =
     "Below is an instruction that describes a task. Write a response that appropriately completes the request.\r\n\r\n"
     "### Instruction:\r\n";
@@ -201,7 +204,7 @@ static const char *tmpl_alpaca_suffix = "\r\n\r\n### Response:\r\n";
 
 /* Apply model-appropriate chat template to a prompt string.
  * Returns a newly malloc'd string on success, NULL on failure. */
-static char *apply_chat_template(const char *model_path, const char *raw_prompt) {
+static char *apply_chat_template(const char *model_path, const model_t *model, const char *raw_prompt) {
     const char *prefix, *suffix;
 
     /* Extract basename from model_path */
@@ -219,7 +222,10 @@ static char *apply_chat_template(const char *model_path, const char *raw_prompt)
     }
     lower[blen] = '\0';
 
-    if (strstr(lower, "gemma")) {
+    if (model && model->config.is_tekken) {
+        prefix = tmpl_tekken_prefix;
+        suffix = tmpl_tekken_suffix;
+    } else if (strstr(lower, "gemma")) {
         prefix = tmpl_gemma_prefix;
         suffix = tmpl_gemma_suffix;
     } else if (strstr(lower, "qwen") || (strstr(lower, "smollm") && strstr(lower, "instruct"))) {
@@ -1523,7 +1529,7 @@ int main(int argc, char **argv) {
 
     /* Apply chat template for -pf */
     if (prompt_flag_f) {
-        char *templated = apply_chat_template(model_path, prompt);
+        char *templated = apply_chat_template(model_path, &model, prompt);
         if (templated) {
             fprintf(stderr, "Applied chat template\n");
             if (prompt_buf) free(prompt_buf);

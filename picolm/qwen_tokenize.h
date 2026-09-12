@@ -7,6 +7,14 @@ typedef struct {
     const char *lp; int ll; const char *rp; int rl;
 } qwen_merge_t;
 
+/* Which pretokenizer regex to use. The BPE engine (hash tables, merge loop,
+ * byte<->codepoint mapping) is shared; only the pretoken-boundary function
+ * differs between model families. */
+enum {
+    QWEN_PRETOK_DEFAULT = 0, /* Qwen3.5/3.6 / GPT-2 style pretokenizer */
+    QWEN_PRETOK_TEKKEN  = 1, /* Mistral Tekken pretokenizer (Mistral-Nemo-2407+) */
+};
+
 typedef struct {
     int *tok_tab;
     int *mrg_tab;
@@ -17,6 +25,7 @@ typedef struct {
     int vocab_size;
     int bos_id;
     int eos_id;
+    int pretok_type; /* QWEN_PRETOK_DEFAULT or QWEN_PRETOK_TEKKEN */
 } qwen_enc_t;
 
 /* Check if a model should use the Qwen tokenizer */
