@@ -1829,6 +1829,54 @@ int picolm_gpu_sync(int device) {
     _g_barrier_cnt++; \
 } while(0)
 
+// Scoped barrier: only syncs specific buffers (read inputs).
+// buf = device pointer to sync (the buffer being READ by the next dispatch).
+// sz = byte size of the region to sync (0 = full buffer).
+static void _batch_barrier_buf(void *buf, size_t sz) {
+    VkBuffer b;
+    VkDeviceSize off;
+    unwrap_buf_offset(buf, &off);
+    b = unwrap_buf(buf);
+    VkBufferMemoryBarrier bm = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = b, .offset = off,
+        .size = sz > 0 ? sz : VK_WHOLE_SIZE
+    };
+    vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+        0, NULL, 1, &bm, 0, NULL);
+    _g_barrier_cnt++;
+}
+
+// Scoped barrier: sync 2 buffers in a single vkCmdPipelineBarrier call.
+static void _batch_barrier_buf2(void *buf1, size_t sz1, void *buf2, size_t sz2) {
+    VkBufferMemoryBarrier bm[2];
+    VkBuffer b1 = unwrap_buf_offset(buf1, &bm[0].offset);
+    VkBuffer b2 = unwrap_buf_offset(buf2, &bm[1].offset);
+    bm[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    bm[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    bm[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    bm[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bm[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bm[0].buffer = b1;
+    bm[0].size = sz1 > 0 ? sz1 : VK_WHOLE_SIZE;
+    bm[1].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    bm[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    bm[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    bm[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bm[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bm[1].buffer = b2;
+    bm[1].size = sz2 > 0 ? sz2 : VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+        0, NULL, 2, bm, 0, NULL);
+    _g_barrier_cnt++;
+}
+
 // Timestamp write helper (no-op if timestamps not supported)
 void picolm_gpu_ts_write(const char *label) {
     if (!G.ts_supported || !getenv("PICOLM_VK_TS") || G.ts_write_idx >= PICOLM_VK_TS_SLOTS - 1) return;
@@ -2175,7 +2223,8 @@ int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_d
     if (!xbi.buffer || !ybi.buffer) return 0;
 
     VK_BATCH_DISPATCH_PRE();
-    VK_BATCH_BARRIER();
+    // Scoped barrier: only sync input buffer (x_dev)
+    _batch_barrier_buf(x_dev, (size_t)t->I * (size_t)S * sizeof(float));
 
     int ok = 0;
     if (t->qtype == GGUF_TYPE_Q8_0 && G.shader_quantize && G.shader_q8q8) {
@@ -2232,11 +2281,11 @@ int picolm_gpu_matmul_dev_qkv(picolm_gpu_tensor_t *tq, picolm_gpu_tensor_t *tk,
         tq->qtype == GGUF_TYPE_Q8_0 && tk->qtype == GGUF_TYPE_Q8_0 &&
         tv->qtype == GGUF_TYPE_Q8_0 && tq->I == tk->I && tq->I == tv->I &&
         G.shader_quantize && G.shader_q8q8) {
-        // Barrier before quantize: ensure previous dispatch writes (e.g., RMSNorm -> bxb) are visible
-        VK_BATCH_BARRIER();
+        // Scoped barrier: sync x_dev (input to quantize)
+        _batch_barrier_buf(x_dev, (size_t)tq->I * (size_t)S * sizeof(float));
         _quantize_dev(x_dev, tq->I, S);
-        // Barrier after quantize: ensure quantize writes to xq/xd are visible before q8q8 reads
-        VK_BATCH_BARRIER();
+        // Scoped barrier: sync q8_xq_d and q8_xd_d (one vkCmd call)
+        _batch_barrier_buf2(G.q8_xq_d, 0, G.q8_xd_d, 0);
 
         // Dispatch q8q8 for Q
         { uint32_t total = (uint32_t)tq->O * (uint32_t)S;
@@ -2300,9 +2349,11 @@ int picolm_gpu_matmul_dev_gu(picolm_gpu_tensor_t *tg, picolm_gpu_tensor_t *tu,
     if (getenv("PICOLM_VK_FUSE_GU") &&
         tg->qtype == GGUF_TYPE_Q8_0 && tu->qtype == GGUF_TYPE_Q8_0 &&
         tg->I == tu->I && G.shader_quantize && G.shader_q8q8) {
-        VK_BATCH_BARRIER();
+        // Scoped barrier: sync x_dev (input to quantize)
+        _batch_barrier_buf(x_dev, (size_t)tg->I * (size_t)S * sizeof(float));
         _quantize_dev(x_dev, tg->I, S);
-        VK_BATCH_BARRIER();
+        // Scoped barrier: sync q8_xq_d and q8_xd_d (one vkCmd call)
+        _batch_barrier_buf2(G.q8_xq_d, 0, G.q8_xd_d, 0);
 
         { uint32_t total = (uint32_t)tg->O * (uint32_t)S;
           VkDescriptorBufferInfo bi[4] = {
@@ -2361,7 +2412,8 @@ int picolm_gpu_rmsnorm_batched_dev(float *out, const float *x, const float *weig
         return 0;
     }
     VK_BATCH_DISPATCH_PRE();
-    VK_BATCH_BARRIER();
+    // Scoped barrier: sync input buffer (x)
+    _batch_barrier_buf(x, (size_t)dim * (size_t)S * sizeof(float));
     vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_nrm);
     push_desc(G.cmd_dev, 3, bi);
     PC_Matmul pc_nrm = {0, S, dim, 0, xs};
@@ -2381,7 +2433,9 @@ int picolm_gpu_residual_add(float *out, const float *a, const float *b,
     VkDescriptorBufferInfo bi[4] = {desc_buf_info(a), desc_buf_info(b), desc_buf_info(out), {VK_NULL_HANDLE,0,0}};
     if (!bi[0].buffer || !bi[1].buffer || !bi[2].buffer) { fprintf(stderr, "[RN_DESC] FAIL x_buf=%p w_buf=%p y_buf=%p\n", (void*)bi[0].buffer, (void*)bi[1].buffer, (void*)bi[2].buffer); return 0; }
     VK_BATCH_DISPATCH_PRE();
-    VK_BATCH_BARRIER();
+    // Scoped barrier: sync a and b (both inputs, one vkCmd call)
+    _batch_barrier_buf2(a, (size_t)n * (size_t)dim * sizeof(float),
+                        b, (size_t)n * (size_t)dim * sizeof(float));
     vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_elem);
     push_desc(G.cmd_dev, 4, bi);
     int total = n * dim;
@@ -2399,7 +2453,25 @@ int picolm_gpu_silu_mul_dev(float *g, const float *u, size_t n, int device) {
     if (!gbi.buffer || !ubi.buffer) return 0;
     VkDescriptorBufferInfo bi[4] = {gbi, ubi, gbi, {VK_NULL_HANDLE,0,0}};
     VK_BATCH_DISPATCH_PRE();
-    VK_BATCH_BARRIER();
+    // Scoped barrier: sync g and u in one barrier call
+    { VkBufferMemoryBarrier bm[2] = {
+        { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+          .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+          .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED },
+        { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+          .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+          .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED }
+    };
+      bm[0].buffer = unwrap_buf(g); bm[0].offset = 0; bm[0].size = n * sizeof(float);
+      bm[1].buffer = unwrap_buf(u); bm[1].offset = 0; bm[1].size = n * sizeof(float);
+      vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+          0, NULL, 2, bm, 0, NULL);
+      _g_barrier_cnt++; }
     vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_elem);
     push_desc(G.cmd_dev, 4, bi);
     PC_Elem pc = {1, (int)n, 0.0f, 0};
@@ -2417,7 +2489,8 @@ int picolm_gpu_gelu_mul_dev(float *g, const float *u, size_t n, int device) {
     if (!gbi.buffer || !ubi.buffer) return 0;
     VkDescriptorBufferInfo bi[4] = {gbi, ubi, gbi, {VK_NULL_HANDLE,0,0}};
     VK_BATCH_DISPATCH_PRE();
-    VK_BATCH_BARRIER();
+    // Scoped barrier: sync g and u (one vkCmd call)
+    _batch_barrier_buf2(g, n * sizeof(float), u, n * sizeof(float));
     vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_elem);
     push_desc(G.cmd_dev, 4, bi);
     PC_Elem pc = {5, (int)n, 0.0f, 0};
@@ -2468,7 +2541,8 @@ int picolm_gpu_rope_apply_batched(float *x, int n_heads, int head_dim,
     if (!bi[0].buffer || !bi[1].buffer || !bi[2].buffer) return 0;
 
     VK_BATCH_DISPATCH_PRE();
-    VK_BATCH_BARRIER();
+    // Scoped barrier: sync x (in-place read/write)
+    _batch_barrier_buf(x, (size_t)S * (size_t)half_dim * sizeof(float));
     vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_elem);
     push_desc(G.cmd_dev, 3, bi);
     PC_Elem pc = {6, half_dim, (float)n_heads, start_pos};
@@ -2859,7 +2933,8 @@ static int _kv_store_native(int is_k, int lo, int sp, int np,
             int n_groups = (n_words + 255) / 256;
 
             VK_BATCH_DISPATCH_PRE();
-            VK_BATCH_BARRIER();
+            // Scoped barrier: sync source buffer (strided KV store)
+            _batch_barrier_buf(sd, (VkDeviceSize)np * (VkDeviceSize)stride * sizeof(float));
             vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_kv_store);
             push_desc(G.cmd_dev, 4, bi);
             vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
@@ -2881,7 +2956,8 @@ static int _kv_store_native(int is_k, int lo, int sp, int np,
     int n_groups = (n_words + 255) / 256;
 
     VK_BATCH_DISPATCH_PRE();
-    VK_BATCH_BARRIER();
+    // Scoped barrier: sync source buffer (rope/matmul output -> KV store input)
+    _batch_barrier_buf(sd, (VkDeviceSize)np * (VkDeviceSize)kv_dim * sizeof(float));
     vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_kv_store);
     push_desc(G.cmd_dev, 4, bi);
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
