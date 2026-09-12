@@ -137,6 +137,9 @@ static int g_do_prefault = 0;
 /* Benchmark layer callback -- exported for use by model_ssm.c GPU prefill path */
 bench_layer_cb_t g_bench_cb = NULL;
 void *g_bench_user_data = NULL;
+/* Prefill flag: set during prefill so gemma3n's per-token fallback knows to
+ * report is_prefill=1 in bench_emit. */
+int g_is_prefill = 0;
 
 void model_set_bench_callback(bench_layer_cb_t cb, void *user_data) {
     g_bench_cb = cb;
@@ -245,24 +248,12 @@ size_t layer_weight_size(model_t *m, int l) {
 }
 
 /* Invoke the benchmark callback for a completed layer */
-static void bench_emit(int l, int is_prefill, double elapsed_ms, long minflt, long majflt) {
+void bench_emit(int l, int is_prefill, double elapsed_ms, long minflt, long majflt) {
     if (!g_bench_cb) return;
     g_bench_cb(l, is_prefill, elapsed_ms, minflt, majflt, g_bench_user_data);
 }
 
-/* Inline-like macro for benchmarking a layer: captures rusage before, time before,
- * caller does work, then bench_emit_after does the rest. */
-double get_time_ms(void);
-#if defined(_WIN32) || defined(PICOLM_DOS)
-#define BENCH_LAYER_START() double _bench_t0 = get_time_ms()
-#define BENCH_LAYER_END(_l, _pref) bench_emit(_l, _pref, get_time_ms() - (_bench_t0), 0, 0)
-#else
-#define BENCH_LAYER_START() double _bench_t0 = get_time_ms(); struct rusage _bench_ru0; getrusage(RUSAGE_SELF, &_bench_ru0)
-#define BENCH_LAYER_END(_l, _pref) do { struct rusage _bench_ru1; getrusage(RUSAGE_SELF, &_bench_ru1); \
-    bench_emit(_l, _pref, get_time_ms() - (_bench_t0), \
-        (long)_bench_ru1.ru_minflt - (long)_bench_ru0.ru_minflt, \
-        (long)_bench_ru1.ru_majflt - (long)_bench_ru0.ru_majflt); } while(0)
-#endif
+/* Inline-like macro for benchmarking a layer: defined in model_internal.h */
 
 void model_set_prefault(int v) {
     g_do_prefault = v;
@@ -3293,10 +3284,12 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 
     /* TODO: Gemma-3n batched prefill not yet implemented -- falls back to per-token forward */
     if (m->config.is_gemma3n) {
+        g_is_prefill = 1;
         for (int i = 0; i < n_tokens; i++) {
             if (interrupt && *interrupt) break;
             (void)model_forward(m, tokens[i], start_pos + i);
         }
+        g_is_prefill = 0;
         return m->state.logits;
     }
     /* GPT-2 batched prefill */

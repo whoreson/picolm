@@ -103,6 +103,22 @@ extern void moe_forward_batch(model_t *m, run_state_t *s,
                               const float *x_batch, float *residual_batch,
                               int n_tokens, const layer_weights_t *lw);
 
+/* --- Benchmark --- */
+extern void bench_emit(int l, int is_prefill, double elapsed_ms, long minflt, long majflt);
+extern int g_is_prefill;
+double get_time_ms(void);
+#if defined(_WIN32) || defined(PICOLM_DOS)
+#define BENCH_LAYER_START() double _bench_t0 = get_time_ms()
+#define BENCH_LAYER_END(_l, _pref) bench_emit(_l, _pref, get_time_ms() - (_bench_t0), 0, 0)
+#else
+#include <sys/resource.h>
+#define BENCH_LAYER_START() double _bench_t0 = get_time_ms(); struct rusage _bench_ru0; getrusage(RUSAGE_SELF, &_bench_ru0)
+#define BENCH_LAYER_END(_l, _pref) do { struct rusage _bench_ru1; getrusage(RUSAGE_SELF, &_bench_ru1); \
+    bench_emit(_l, _pref, get_time_ms() - (_bench_t0), \
+        (long)_bench_ru1.ru_minflt - (long)_bench_ru0.ru_minflt, \
+        (long)_bench_ru1.ru_majflt - (long)_bench_ru0.ru_majflt); } while(0)
+#endif
+
 /* --- Gemma-3n --- */
 float *model_forward_gemma3n(model_t *m, int token, int pos);
 extern void gemma3n_router(float *out, float *inp, int n_embd, int n_altup,
