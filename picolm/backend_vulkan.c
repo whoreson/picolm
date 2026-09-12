@@ -2705,8 +2705,8 @@ void picolm_gpu_kv_cache_clear(int device) {
         if (G.kv_v_mapped) { vkUnmapMemory(G.dev, G.kv_v_mem); G.kv_v_mapped = NULL; }
         if (G.pipe_k_b_mapped) { vkUnmapMemory(G.dev, G.pipe_k_b_m); G.pipe_k_b_mapped = NULL; }
         if (G.pipe_v_b_mapped) { vkUnmapMemory(G.dev, G.pipe_v_b_m); G.pipe_v_b_mapped = NULL; }
-        if (G.kv_k_d) { free(G.kv_k_d); G.kv_k_d = NULL; }
-        if (G.kv_v_d) { free(G.kv_v_d); G.kv_v_d = NULL; }
+        if (G.kv_k_d) { free_dev_buf(G.kv_k_d); G.kv_k_d = NULL; }
+        if (G.kv_v_d) { free_dev_buf(G.kv_v_d); G.kv_v_d = NULL; }
         if (G.kv_k_mem) { vkFreeMemory(G.dev, G.kv_k_mem, NULL); G.kv_k_mem = VK_NULL_HANDLE; }
         if (G.kv_k_buf) { vkDestroyBuffer(G.dev, G.kv_k_buf, NULL); G.kv_k_buf = VK_NULL_HANDLE; }
         if (G.kv_v_mem) { vkFreeMemory(G.dev, G.kv_v_mem, NULL); G.kv_v_mem = VK_NULL_HANDLE; }
