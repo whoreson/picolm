@@ -196,6 +196,16 @@ static uint64_t skip_meta_value(reader_t *r, uint32_t vtype, int *is_numeric) {
     }
 }
 
+/* Warn when a config key is skipped due to unexpected vtype.
+ * Call this instead of bare skip_meta_value() when the else-branch
+ * of a vtype check silently drops a value that SHOULD have been read. */
+static void skip_meta_value_warn(reader_t *r, uint32_t vtype, const char *key_name) {
+    int dummy;
+    fprintf(stderr, "WARNING: key \"%s\" has unexpected GGUF type %u, skipping (value may be incorrect)\n",
+            key_name, vtype);
+    skip_meta_value(r, vtype, &dummy);
+}
+
 /* Forward declarations for split mmap helpers */
 static int mmap_one_file(split_mmap_t *s, const char *path);
 static int split_path_prefix(char *prefix, size_t maxlen, const char *split_path);
@@ -901,7 +911,7 @@ int parse_gguf(model_t *m, int max_seq_len) {
             if (vtype == GGUF_META_FLOAT32) {
                 cfg->rope_freq_base = read_f32(&r);
             } else {
-                int dummy; skip_meta_value(&r, vtype, &dummy);
+                skip_meta_value_warn(&r, vtype, key.str);
             }
         } else if (str_eq(key, "qwen35.rope.dimension_count")
             || str_eq(key, "qwen35moe.rope.dimension_count")
@@ -935,7 +945,7 @@ int parse_gguf(model_t *m, int max_seq_len) {
                  * (c->rope_dim > 0) ? c->rope_dim : head_dim fallback gives head_dim. */
                 cfg->rope_dim = 0;
             } else {
-                int dummy; skip_meta_value(&r, vtype, &dummy);
+                skip_meta_value_warn(&r, vtype, key.str);
             }
         } else if (str_eq(key, "llama.attention.layer_norm_rms_epsilon")
             || str_eq(key, "qwen2.attention.layer_norm_rms_epsilon")
@@ -952,7 +962,7 @@ int parse_gguf(model_t *m, int max_seq_len) {
                 double val; memcpy(&val, &vi, 8);
                 cfg->rms_norm_eps = (float)val;
             } else {
-                int dummy; skip_meta_value(&r, vtype, &dummy);
+                skip_meta_value_warn(&r, vtype, key.str);
             }
         } else if (str_eq(key, "qwen35.ssm.conv_kernel") || str_eq(key, "qwen35moe.ssm.conv_kernel") || str_eq(key, "qwen3.ssm.conv_kernel")) {
             int dummy; cfg->ssm_d_conv = (int)skip_meta_value(&r, vtype, &dummy); cfg->has_ssm = 1;
@@ -1028,7 +1038,7 @@ int parse_gguf(model_t *m, int max_seq_len) {
                     ;
                 }
             } else {
-                int dummy; skip_meta_value(&r, vtype, &dummy);
+                skip_meta_value_warn(&r, vtype, key.str);
             }
         } else if (str_eq(key, "tokenizer.ggml.eos_token_id")) {
             int dummy; m->tok_eos_id = (uint32_t)skip_meta_value(&r, vtype, &dummy);
@@ -1054,7 +1064,7 @@ int parse_gguf(model_t *m, int max_seq_len) {
                     m->tok_space_marker = 0; /* U+2581 (default, SPM models) */
                 }
             } else {
-                int dummy; skip_meta_value(&r, vtype, &dummy);
+                skip_meta_value_warn(&r, vtype, key.str);
             }
         } else if (str_eq(key, "tokenizer.ggml.add_bos_token")) {
             int dummy; m->tok_add_bos = (int)skip_meta_value(&r, vtype, &dummy);
