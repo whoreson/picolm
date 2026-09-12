@@ -1870,9 +1870,10 @@ void quantize_row_q8_K(const float *x, void *dst, int n) {
     int nb = n / 256;
 
     for (int i = 0; i < nb; i++) {
+        const float *xb = x + i * 256;
         float amax = 0.0f;
         for (int j = 0; j < 256; ++j) {
-            float ax = x[j] < 0 ? -x[j] : x[j];
+            float ax = xb[j] < 0 ? -xb[j] : xb[j];
             if (ax > amax) amax = ax;
         }
         float id = (amax != 0.0f) ? 127.0f / amax : 0.0f;
@@ -1880,8 +1881,8 @@ void quantize_row_q8_K(const float *x, void *dst, int n) {
         
 #ifdef PICOLM_NEON
         for (int j = 0; j < 256; j += 8) {
-            float32x4_t v0 = vld1q_f32(x + j);
-            float32x4_t v1 = vld1q_f32(x + j + 4);
+            float32x4_t v0 = vld1q_f32(xb + j);
+            float32x4_t v1 = vld1q_f32(xb + j + 4);
             int32x4_t vi0 = vcvtnq_s32_f32(vmulq_n_f32(v0, id));
             int32x4_t vi1 = vcvtnq_s32_f32(vmulq_n_f32(v1, id));
             int16x4_t s0 = vmovn_s32(vi0);
@@ -1893,10 +1894,10 @@ void quantize_row_q8_K(const float *x, void *dst, int n) {
 #elif defined(PICOLM_AVX)
         const __m256 v_id = _mm256_set1_ps(id);
         for (int j = 0; j < 256; j += 32) {
-            __m256 v0 = _mm256_loadu_ps(x + j + 0);
-            __m256 v1 = _mm256_loadu_ps(x + j + 8);
-            __m256 v2 = _mm256_loadu_ps(x + j + 16);
-            __m256 v3 = _mm256_loadu_ps(x + j + 24);
+            __m256 v0 = _mm256_loadu_ps(xb + j + 0);
+            __m256 v1 = _mm256_loadu_ps(xb + j + 8);
+            __m256 v2 = _mm256_loadu_ps(xb + j + 16);
+            __m256 v3 = _mm256_loadu_ps(xb + j + 24);
             __m256i i0 = _mm256_cvtps_epi32(_mm256_round_ps(_mm256_mul_ps(v0, v_id), _MM_ROUND_NEAREST));
             __m256i i1 = _mm256_cvtps_epi32(_mm256_round_ps(_mm256_mul_ps(v1, v_id), _MM_ROUND_NEAREST));
             __m256i i2 = _mm256_cvtps_epi32(_mm256_round_ps(_mm256_mul_ps(v2, v_id), _MM_ROUND_NEAREST));
@@ -1921,7 +1922,7 @@ void quantize_row_q8_K(const float *x, void *dst, int n) {
         }
 #else
         for (int j = 0; j < 256; j++) {
-            y[i].qs[j] = (int8_t)((int)(x[j] * id + (x[j] >= 0 ? 0.5f : -0.5f)));
+            y[i].qs[j] = (int8_t)((int)(xb[j] * id + (xb[j] >= 0 ? 0.5f : -0.5f)));
         }
 #endif
 
@@ -1965,7 +1966,6 @@ void quantize_row_q8_K(const float *x, void *dst, int n) {
             y[i].bsums[j] = (int16_t)sum;
         }
 #endif
-        x += 256;
     }
 }
 
