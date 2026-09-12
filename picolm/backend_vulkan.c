@@ -223,6 +223,14 @@ static struct {
     VkDescriptorPool dpool_qkv;
     VkDescriptorSet dset_qkv;
 
+    // Fused GU pipeline (6 bindings, separate DSL)
+    VkDescriptorSetLayout dsl_gu;
+    VkPipelineLayout plyt_gu;
+    VkShaderModule shader_gu;
+    VkPipeline pipe_gu;
+    VkDescriptorPool dpool_gu;
+    VkDescriptorSet dset_gu;
+
     VkCommandPool cpool;
     VkCommandBuffer cmd;       // Phase 1: single-command sync
     VkCommandBuffer cmd_nrm;   // RMSNorm host-facing
@@ -312,6 +320,7 @@ static struct {
     VkPhysicalDeviceMemoryProperties mem_props;
     VkPhysicalDeviceProperties dev_props;
     int subgroup_size;
+    int gcn1;  // GCN1 detected (KAVERI/HAINAN/KALINDI)
 } G;
 
 // ---------------------------------------------------------------------------
@@ -681,6 +690,16 @@ static void push_desc_8(VkCommandBuffer cmd, int n, const VkDescriptorBufferInfo
                                    G.plyt_qkv, 0, (uint32_t)n, w);
 }
 
+static void push_desc_6(VkCommandBuffer cmd, int n, const VkDescriptorBufferInfo *bi) {
+    VkWriteDescriptorSet w[6];
+    for (int i = 0; i < n; i++) w[i] = (VkWriteDescriptorSet){
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = VK_NULL_HANDLE,
+        .dstBinding = (uint32_t)i, .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i]};
+    G.vkCmdPushDescriptorSetKHR_fn(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                   G.plyt_gu, 0, (uint32_t)n, w);
+}
+
 // Legacy ring-buffer descriptor set update for matmul path (non-batched).
 // Each call advances G.dset_idx, ensuring the GPU sees a fresh set.
 static void wr_desc_ring(int n, const VkDescriptorBufferInfo *bi) {
@@ -831,6 +850,17 @@ int picolm_gpu_init(const int *devices, int count) {
     else if (G.dev_props.vendorID == 0x10DE) G.subgroup_size = 32;  // NVIDIA
     else G.subgroup_size = 32;  // default
 
+    // Detect GCN1 (KAVERI/HAINAN/KALINDI) -- fused shaders regress on GCN1
+    // because fewer dispatches = worse GPU scheduling
+    // KAVERI: 0x9901-0x991F, 0x9920-0x9940, 0x9948-0x994F, 0x9960-0x997F
+    // HAINAN: 0x9830-0x983F, 0x9840-0x984F
+    // KALINDI: 0x9850-0x985F, 0x9860-0x986F
+    G.gcn1 = (G.dev_props.deviceID >= 0x9830 && G.dev_props.deviceID <= 0x997F) ||
+             (G.dev_props.deviceID >= 0x1600 && G.dev_props.deviceID <= 0x164F);
+    if (G.gcn1)
+        fprintf(stderr, "[VK] detected GCN1 (0x%04X), fused shaders disabled\n",
+                G.dev_props.deviceID);
+
     // Timestamp query pool for profiling
     // timestampPeriod is in VkPhysicalDeviceProperties (Vulkan 1.0+).
     // timestampComputeAndGraphics is in VkPhysicalDeviceFeatures (Vulkan 1.1+).
@@ -875,7 +905,9 @@ int picolm_gpu_init(const int *devices, int count) {
         VKCHECK(vkCreatePipelineLayout(G.dev, &pli, NULL, &G.plyt_unified), "unifiedPlyt");
     }
 
+    // Fused QKV shader: disabled on GCN1 (regresses due to dispatch-count sensitivity)
     // 8-binding DSL for fused QKV (bindings 0-7)
+    if (!G.gcn1) {
     { VkDescriptorSetLayoutBinding b[8] = {};
       for (int _bi = 0; _bi < 8; _bi++) {
           b[_bi].binding = _bi;
@@ -895,7 +927,7 @@ int picolm_gpu_init(const int *devices, int count) {
       VkResult pli_r = vkCreatePipelineLayout(G.dev, &pli, NULL, &G.plyt_qkv);
       if (dsli_r == VK_SUCCESS && pli_r == VK_SUCCESS) {
           // Load fused QKV shader
-          G.shader_qkv = load_spv(G.dev, "q8_q8_qkv2_vk.spv");
+          G.shader_qkv = load_spv(G.dev, "q8_q8_qkv3_vk.spv");
           if (G.shader_qkv) {
               VkPipelineShaderStageCreateInfo ps = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                   .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = G.shader_qkv, .pName = "main"};
@@ -924,6 +956,48 @@ int picolm_gpu_init(const int *devices, int count) {
           fprintf(stderr, "[VK] 8-binding DSL creation failed, using separate matmul\n");
       }
     }
+    } // end !G.gcn1 (fused QKV)
+
+    // Fused GU pipeline (6 bindings: XQ, XD, WG, WU, YG, YU)
+    if (!G.gcn1) {
+    { VkDescriptorSetLayoutBinding b[6];
+      for (int i = 0; i < 6; i++) b[i] = (VkDescriptorSetLayoutBinding){
+          .binding = i, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+          .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT };
+      VkDescriptorSetLayoutCreateInfo dsli = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+          .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+          .bindingCount = 6, .pBindings = b};
+      VkResult dsli_r = vkCreateDescriptorSetLayout(G.dev, &dsli, NULL, &G.dsl_gu);
+      VkPushConstantRange pcr = {.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = 48};
+      VkPipelineLayoutCreateInfo pli = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+          .setLayoutCount = 1, .pSetLayouts = &G.dsl_gu,
+          .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr};
+      VkResult pli_r = vkCreatePipelineLayout(G.dev, &pli, NULL, &G.plyt_gu);
+      if (dsli_r == VK_SUCCESS && pli_r == VK_SUCCESS) {
+          G.shader_gu = load_spv(G.dev, "q8_q8_gu3_vk.spv");
+          if (G.shader_gu) {
+              VkPipelineShaderStageCreateInfo ps = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                  .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = G.shader_gu, .pName = "main"};
+              VkComputePipelineCreateInfo pci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                  .layout = G.plyt_gu, .stage = ps};
+              VkResult pi_r = vkCreateComputePipelines(G.dev, VK_NULL_HANDLE, 1, &pci, NULL, &G.pipe_gu);
+              if (pi_r != VK_SUCCESS) {
+                  vkDestroyShaderModule(G.dev, G.shader_gu, NULL);
+                  G.shader_gu = VK_NULL_HANDLE;
+              } else {
+                  VkDescriptorPoolSize ps2 = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 6};
+                  VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                      .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps2};
+                  vkCreateDescriptorPool(G.dev, &dpi, NULL, &G.dpool_gu);
+                  VkDescriptorSetAllocateInfo dsa = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                      .descriptorPool = G.dpool_gu, .descriptorSetCount = 1, .pSetLayouts = &G.dsl_gu};
+                  vkAllocateDescriptorSets(G.dev, &dsa, &G.dset_gu);
+                  fprintf(stderr, "[VK] fused GU pipeline ready (6 bindings)\n");
+              }
+          }
+      }
+    }
+    } // end !G.gcn1 (fused GU)
 
     // Load matmul shader
     G.shader = load_spv(G.dev, "qmatmul_vk.spv");
@@ -1126,6 +1200,14 @@ void picolm_gpu_shutdown(void) {
     if (G.shader_qkv) vkDestroyShaderModule(G.dev, G.shader_qkv, NULL);
     if (G.plyt_qkv)  vkDestroyPipelineLayout(G.dev, G.plyt_qkv, NULL);
     if (G.dsl_qkv)   vkDestroyDescriptorSetLayout(G.dev, G.dsl_qkv, NULL);
+
+    // Fused GU
+    if (G.dset_gu) vkFreeDescriptorSets(G.dev, G.dpool_gu, 1, &G.dset_gu);
+    if (G.dpool_gu) vkDestroyDescriptorPool(G.dev, G.dpool_gu, NULL);
+    if (G.pipe_gu)  vkDestroyPipeline(G.dev, G.pipe_gu, NULL);
+    if (G.shader_gu) vkDestroyShaderModule(G.dev, G.shader_gu, NULL);
+    if (G.plyt_gu)  vkDestroyPipelineLayout(G.dev, G.plyt_gu, NULL);
+    if (G.dsl_gu)   vkDestroyDescriptorSetLayout(G.dev, G.dsl_gu, NULL);
 
     if (G.dset_elem)  vkFreeDescriptorSets(G.dev, G.dpool_elem, 1, &G.dset_elem);
     for (int _i = 0; _i < 256 && G.dset_elem_ring[_i]; _i++)
@@ -2273,6 +2355,39 @@ int picolm_gpu_matmul_dev_qkv(picolm_gpu_tensor_t *tq, picolm_gpu_tensor_t *tk,
     (void)ysq; (void)ysk; (void)xs;
     if (!tq || !tk || !tv || device != 0) return 0;
 
+    // Try true fused QKV shader: single dispatch for all 3 projections
+    // Quantize once, then single fused matmul dispatch
+    if (tq->qtype == GGUF_TYPE_Q8_0 && tk->qtype == GGUF_TYPE_Q8_0 &&
+        tv->qtype == GGUF_TYPE_Q8_0 && tq->I == tk->I && tq->I == tv->I &&
+        G.shader_quantize && G.shader_qkv) {
+        // Scoped barrier: sync x_dev (input to quantize)
+        _batch_barrier_buf(x_dev, (size_t)tq->I * (size_t)S * sizeof(float));
+        _quantize_dev(x_dev, tq->I, S);
+        // Scoped barrier: sync q8_xq_d and q8_xd_d (quantize output -> fused qkv input)
+        _batch_barrier_buf2(G.q8_xq_d, 0, G.q8_xd_d, 0);
+
+        // 8 descriptors: XQ, XD, WQ, WK, WV, YQ, YK, YV
+        VkDescriptorBufferInfo bi[8] = {
+            desc_buf_info(G.q8_xq_d), desc_buf_info(G.q8_xd_d),
+            desc_tensor_info(tq), desc_tensor_info(tk), desc_tensor_info(tv),
+            desc_buf_info(bq), desc_buf_info(bk), desc_buf_info(bv)
+        };
+        typedef struct { int I, S, Oq, Ok, Ov, rwQ, rwK, rwV; } PC_QKV3;
+        PC_QKV3 pc = { tq->I, S, tq->O, tk->O, tv->O,
+                        (int)tq->row_words, (int)tk->row_words, (int)tv->row_words };
+        uint32_t total = (uint32_t)S * (tq->O + tk->O + tv->O);
+        vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_qkv);
+        push_desc_8(G.cmd_dev, 8, bi);
+        vkCmdPushConstants(G.cmd_dev, G.plyt_qkv, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(G.cmd_dev, (total + 255u) / 256u, 1, 1);
+        _g_dispatch_cnt++;
+
+        if (getenv("PICOLM_DISPATCH"))
+            fprintf(stderr, "DISPATCH qkv_dev: TRUED FUSED QKV I=%d S=%d Oq=%d Ok=%d Ov=%d\n",
+                    tq->I, S, tq->O, tk->O, tv->O);
+        return 1;
+    }
+
     // Try fused QKV path: quantize once, then 3 separate q8q8 matmuls
     // TODO: GCN1/KAVERI: 12% regression (3.40s -> 3.82s)
     // TODO: VEGA20/MI50: 17% improvement (0.18s -> 0.15s)
@@ -2343,7 +2458,39 @@ int picolm_gpu_matmul_dev_gu(picolm_gpu_tensor_t *tg, picolm_gpu_tensor_t *tu,
                               const float *x_dev, int S, int device,
                               int ys, int xs) {
     (void)ys; (void)xs;
-    // Try fused GU path: quantize once, then 2 q8q8 matmuls sharing quantized activations
+    // Try true fused GU shader: single dispatch for gate+up
+    // Quantize once, then single fused matmul dispatch
+    if (tg->qtype == GGUF_TYPE_Q8_0 && tu->qtype == GGUF_TYPE_Q8_0 &&
+        tg->I == tu->I && G.shader_quantize && G.shader_gu) {
+        // Scoped barrier: sync x_dev (input to quantize)
+        _batch_barrier_buf(x_dev, (size_t)tg->I * (size_t)S * sizeof(float));
+        _quantize_dev(x_dev, tg->I, S);
+        // Scoped barrier: sync q8_xq_d and q8_xd_d (quantize output -> fused gu input)
+        _batch_barrier_buf2(G.q8_xq_d, 0, G.q8_xd_d, 0);
+
+        // 6 descriptors: XQ, XD, WG, WU, YG, YU
+        VkDescriptorBufferInfo bi[6] = {
+            desc_buf_info(G.q8_xq_d), desc_buf_info(G.q8_xd_d),
+            desc_tensor_info(tg), desc_tensor_info(tu),
+            desc_buf_info(bgate), desc_buf_info(bup)
+        };
+        typedef struct { int I, S, Og, Ou, rwG, rwU; } PC_GU3;
+        PC_GU3 pc = { tg->I, S, tg->O, tu->O,
+                        (int)tg->row_words, (int)tu->row_words };
+        uint32_t total = (uint32_t)S * (tg->O + tu->O);
+        vkCmdBindPipeline(G.cmd_dev, VK_PIPELINE_BIND_POINT_COMPUTE, G.pipe_gu);
+        push_desc_6(G.cmd_dev, 6, bi);
+        vkCmdPushConstants(G.cmd_dev, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(G.cmd_dev, (total + 255u) / 256u, 1, 1);
+        _g_dispatch_cnt++;
+
+        if (getenv("PICOLM_DISPATCH"))
+            fprintf(stderr, "DISPATCH gu_dev: TRUED FUSED GU I=%d S=%d Og=%d Ou=%d\n",
+                    tg->I, S, tg->O, tu->O);
+        return 1;
+    }
+
+    // Try fused GU path: quantize once, then 2 separate q8q8 matmuls
     // TODO: GCN1/KAVERI: regresses. On VEGA20/MI50: neutral/slight regression (0.15s -> 0.16s)
     // Controlled by PICOLM_VK_FUSE_GU=1
     if (getenv("PICOLM_VK_FUSE_GU") &&

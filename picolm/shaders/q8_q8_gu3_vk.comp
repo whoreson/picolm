@@ -1,0 +1,94 @@
+#version 450
+// Fused GU (gate+up): single dispatch for gate and up projections
+// Each thread computes one output element across both projections
+// Grid: [ceil(S*(Og+Ou)/256), 1, 1], local_size_x = 256
+//
+// Binding 0: XQ (uint, packed int8 activations, shared)
+// Binding 1: XD (float, activation deltas)
+// Binding 2: WG (uint, packed Q8_0 gate weights)
+// Binding 3: WU (uint, packed Q8_0 up weights)
+// Binding 4: YG (float, gate output)
+// Binding 5: YU (float, up output)
+
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer B_XQ { uint xq[]; };
+layout(std430, binding = 1) readonly buffer B_XD { float xd[]; };
+layout(std430, binding = 2) readonly buffer B_WG { uint wg[]; };
+layout(std430, binding = 3) readonly buffer B_WU { uint wu[]; };
+layout(std430, binding = 4) writeonly buffer B_YG { float yg[]; };
+layout(std430, binding = 5) writeonly buffer B_YU { float yu[]; };
+
+layout(push_constant) uniform P {
+    int I, S, Og, Ou;
+    int rwG, rwU;
+} p;
+
+float f16tof32(uint h) {
+    uint s = (h >> 15u) & 1u;
+    uint e = (h >> 10u) & 31u;
+    uint m = h & 1023u;
+    if (e == 0u) {
+        if (m == 0u) return s != 0u ? -0.0 : 0.0;
+        float v = float(m) * 5.960464477539063e-8;
+        return s != 0u ? -v : v;
+    }
+    if (e == 31u) return s != 0u ? -1.0/0.0 : 1.0/0.0;
+    uint bits = (s << 31u) | ((e - 15u + 127u) << 23u) | (m << 13u);
+    return uintBitsToFloat(bits);
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    int S = p.S, I = p.I, Og = p.Og, Ou = p.Ou;
+    int total_O = Og + Ou;
+    int total = S * total_O;
+    if (gid >= uint(total)) return;
+
+    int out_idx = int(gid);
+    int s = out_idx / total_O;
+    int o = out_idx % total_O;
+
+    int nblocks = I / 32;
+    uint xq_base = uint(s) * uint(I) / 4u;
+    int xd_base = s * nblocks;
+    float sum = 0.0;
+
+    if (o < Og) {
+        // Gate projection
+        uint rowBase = uint(o) * uint(p.rwG);
+        for (int bi = 0; bi < nblocks; bi++) {
+            uint bo = uint(bi) * 34u;
+            float wd = f16tof32((wg[rowBase + bo/4u] >> ((bo%4u)*8u)) & 0xffffu);
+            float scale = wd * xd[xd_base + bi];
+            uint aqs_base = xq_base + uint(bi) * 8u;
+            for (int v = 0; v < 32; v++) {
+                int vi = bi * 32 + v; if (vi >= I) break;
+                int wi = int((wg[rowBase + (bo+2u+uint(v))/4u] >> (((bo+2u+uint(v))%4u)*8u)) & 0xffu);
+                if (wi >= 128) wi -= 256;
+                int ai = int((xq[aqs_base + uint(v)/4u] >> ((uint(v)%4u)*8u)) & 0xffu);
+                if (ai >= 128) ai -= 256;
+                sum += float(wi) * float(ai) * scale;
+            }
+        }
+        yg[s * Og + o] = sum;
+    } else {
+        // Up projection
+        int ou = o - Og;
+        uint rowBase = uint(ou) * uint(p.rwU);
+        for (int bi = 0; bi < nblocks; bi++) {
+            uint bo = uint(bi) * 34u;
+            float wd = f16tof32((wu[rowBase + bo/4u] >> ((bo%4u)*8u)) & 0xffffu);
+            float scale = wd * xd[xd_base + bi];
+            uint aqs_base = xq_base + uint(bi) * 8u;
+            for (int v = 0; v < 32; v++) {
+                int vi = bi * 32 + v; if (vi >= I) break;
+                int wi = int((wu[rowBase + (bo+2u+uint(v))/4u] >> (((bo+2u+uint(v))%4u)*8u)) & 0xffu);
+                if (wi >= 128) wi -= 256;
+                int ai = int((xq[aqs_base + uint(v)/4u] >> ((uint(v)%4u)*8u)) & 0xffu);
+                if (ai >= 128) ai -= 256;
+                sum += float(wi) * float(ai) * scale;
+            }
+        }
+        yu[s * Ou + ou] = sum;
+    }
+}
