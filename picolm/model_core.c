@@ -398,8 +398,8 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
 
     /* Calculate sizes for float buffers */
     size_t sz_x      = (size_t)c->n_embd * sizeof(float);
-    size_t sz_xb     = (size_t)max_proj_dim * sizeof(float);
-    size_t sz_xb2    = (size_t)max_proj_dim * sizeof(float);
+    size_t sz_xb     = (size_t)max_dim * sizeof(float);
+    size_t sz_xb2    = (size_t)max_dim * sizeof(float);
     size_t sz_q      = (size_t)max_proj_dim * sizeof(float);
     /* att buffer removed (flash attention) */
     size_t sz_hb     = (size_t)c->n_ffn * sizeof(float);
@@ -742,8 +742,8 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
     /* Carve float pointers */
     float *p = (float *)s->mem_block;
     s->x      = p; p += c->n_embd;
-    s->xb     = p; p += max_proj_dim;
-    s->xb2    = p; p += max_proj_dim;
+    s->xb     = p; p += max_dim;
+    s->xb2    = p; p += max_dim;
     s->q      = p; p += max_proj_dim;
     s->hb     = p; p += c->n_ffn;
     s->hb2    = p; p += c->n_ffn;

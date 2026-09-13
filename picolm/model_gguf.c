@@ -578,16 +578,19 @@ int model_list_tensors(const char *path) {
       }
 
       size_t pos = 0;
-      /* Safe append macro: clamps on truncation */
+      /* Safe append macro: clamps on truncation. Supports zero or more variadic args. */
       #define APPEND(fmt, ...) do {                                          \
-          int _r = snprintf(buf + pos, buf_size - pos, fmt, __VA_ARGS__);    \
+          int _r = snprintf(buf + pos, buf_size - pos, fmt, ##__VA_ARGS__);  \
           if (_r > 0) pos += (size_t)_r < (buf_size - pos) ? (size_t)_r : 0; \
       } while (0)
 
       APPEND("GGUF v%u: %" PRIu64 " metadata entries, %" PRIu64 " tensors\n\n",
              version, n_metadata, n_tensors);
-      APPEND("%-52s %14s %-12s %s\n", "Name", "Shape", "Type", "Type ID");
-      APPEND("%-52s %14s %-12s %s\n", "----", "----", "----", "-------");
+      APPEND("%-52s %14s %-12s %s\n", "Name", "Shape (rows x cols)", "Type", "Type ID");
+      APPEND("%-52s %14s %-12s %s\n", "----", "(outer x inner)", "----", "-------");
+      APPEND("NOTE: GGUF stores dims innermost-first. 2D shapes shown as [num_rows x row_len].\n");
+      APPEND("  For weight tensors: [output_dim x input_dim]. The stored row is contiguous.\n");
+      APPEND("\n");
 
       for (uint64_t i = 0; i < n_tensors; i++) {
           gguf_str_t name = read_gguf_string(&r);
@@ -605,17 +608,45 @@ int model_list_tensors(const char *path) {
               nbuf[nlen-4] = '.'; nbuf[nlen-3] = '.'; nbuf[nlen-2] = '.';
           }
 
-          /* Build shape string with pointer arithmetic instead of strncat */
-          char dstr[16];
+          /* IMPORTANT: GGUF stores dims INNERMOST-FIRST (little-endian order):
+           *   dims[0] = innermost dimension (contiguous in memory, = row length for 2D)
+           *   dims[1] = next dimension up
+           *   dims[n-1] = outermost dimension (number of rows/blocks for 2D)
+           *
+           * For a weight tensor attn_q.weight with GGUF dims [5120, 4096]:
+           *   dims[0]=5120 -> each row has 5120 elements (inner, contiguous)
+           *   dims[1]=4096 -> there are 4096 such rows
+           *   Storage: 4096 rows of 5120 elements = 4096 * row_size(qtype, 5120) bytes
+           *
+           * This is the TRANSPOSE of the neural net convention where
+           * W is [in_features x out_features] = [5120 x 4096].
+           * The GGUF stores it as [4096 rows x 5120 cols] which is W^T.
+           *
+           * PicoLM's matmul(out, x, W, n, d) reads d rows of n elements.
+           * n must match the GGUF row length (dims[0]), d matches dims[1].
+           * This naturally computes W_gguf @ x = W_math^T @ x = correct.
+           *
+           * Print shapes in [rows x cols] = [outer x inner] format to match
+           * neural net convention and avoid confusion. This is NOT the
+           * raw GGUF dimension order. */
+          char dstr[32];
           char *dp = dstr;
           int drem = (int)(sizeof(dstr) - 1);
-          int n = snprintf(dp, drem + 1, "[%" PRIu64, dims[0]);
-          if (n > 0 && n < drem) { dp += n; drem -= n; }
-          for (uint32_t d = 1; d < n_dims && drem > 1; d++) {
-              n = snprintf(dp, drem + 1, ",%" PRIu64, dims[d]);
-              if (n > 0 && n < drem) { dp += n; drem -= n; } else break;
+          if (n_dims == 2) {
+              /* Print as [rows x cols] = [dims[1] x dims[0]] */
+              int n = snprintf(dp, drem + 1, "[%" PRIu64 ",%" PRIu64 "]",
+                               dims[1], dims[0]);
+              if (n > 0 && n < drem) { dp += n; drem -= n; } else dp += (int)sizeof(dstr) - 2;
+          } else {
+              /* For non-2D tensors: print raw GGUF order with annotation */
+              int n = snprintf(dp, drem + 1, "[%" PRIu64, dims[0]);
+              if (n > 0 && n < drem) { dp += n; drem -= n; }
+              for (uint32_t d = 1; d < n_dims && drem > 1; d++) {
+                  n = snprintf(dp, drem + 1, ",%" PRIu64, dims[d]);
+                  if (n > 0 && n < drem) { dp += n; drem -= n; } else break;
+              }
+              if (drem > 0) { *dp = ']'; dp++; }
           }
-          if (drem > 0) { *dp = ']'; dp++; }
           *dp = '\0';
 
           APPEND("%-52s %14s %-12s %u\n", nbuf, dstr, gguf_type_name(type), type);
@@ -729,15 +760,22 @@ int model_list_kv(const char *path) {
 
       APPEND("GGUF v%u: %" PRIu64 " metadata entries, %" PRIu64 " tensors\n\n",
              version, n_metadata, n_tensors);
-      APPEND("%-50s %s\n", "Key", "Value");
-      APPEND("%-50s %s\n", "---", "-----");
+      APPEND("%-44s %-8s %s\n", "Key", "Type", "Value");
+      APPEND("%-44s %-8s %s\n", "---", "----", "-----");
 
       for (uint64_t i = 0; i < n_metadata; i++) {
           gguf_str_t key = read_gguf_string(&r);
           uint32_t vtype = read_u32(&r);
 
+          /* Type name */
+          static const char *vtype_names[] = {
+              "U8","I8","U16","I16","U32","I32","F32",
+              "BOOL","STR","ARR","F64","U64","I64","BYTES"
+          };
+          const char *tname = (vtype < 14) ? vtype_names[vtype] : "???";
+
           /* Truncate key for display */
-          char keybuf[54];
+          char keybuf[48];
           size_t klen = key.len < sizeof(keybuf) - 1 ? key.len : sizeof(keybuf) - 4;
           memcpy(keybuf, key.str, klen);
           keybuf[klen] = '\0';
@@ -753,7 +791,7 @@ int model_list_kv(const char *path) {
           /* Check if multiline */
           if (strchr(valbuf, '\n')) {
               /* Print key on its own line, then value indented */
-              APPEND("%s:\n", keybuf);
+              APPEND("%s [%s]:\n", keybuf, tname);
               /* Indent each line of value */
               const char *line = valbuf;
               while (*line) {
@@ -767,7 +805,7 @@ int model_list_kv(const char *path) {
                   }
               }
           } else {
-              APPEND("%-50s %s\n", keybuf, valbuf);
+              APPEND("%-44s %-8s %s\n", keybuf, tname, valbuf);
           }
       }
       #undef APPEND
