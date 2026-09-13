@@ -4417,17 +4417,16 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
     extern int picolm_gpu_matmul_logits(picolm_gpu_tensor_t *t,
                                          float *logits_dev, const float *x_dev,
                                          int device);
+    /* End batched recording for layer dispatches + RMSNorm */
+    picolm_gpu_batch_end(gpu_dev);
+
+    /* Logits matmul OUTSIDE batch: ensures D2H visibility on KAVERI */
     float *pipe_logits = picolm_gpu_pipe_logits(gpu_dev);
     int logits_ok = 0;
     if (pipe_logits) {
         logits_ok = picolm_gpu_matmul_logits((picolm_gpu_tensor_t *)gw->output,
                                                   pipe_logits, pipe_x, gpu_dev);
     }
-
-    /* End batched recording: submit all layer dispatches + RMSNorm + logits matmul
-     * as ONE command buffer. This eliminates multiple vkQueueSubmit round-trips
-     * per token, which is critical for RADV performance on GCN1. */
-    picolm_gpu_batch_end(gpu_dev);
 
     if (logits_ok) {
         /* D2H only the logits */

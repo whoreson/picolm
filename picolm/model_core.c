@@ -1348,16 +1348,8 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                           lw->attn_q, lw->type_attn_q, c->n_embd, qo, device)) uploaded++; }
                 /* Attention K: [kv_dim, n_embd] */
                 attempted++;
-                if (l == 0) {
-                    fprintf(stderr, "[UPLOAD_DBG] K before: gl->attn_k=%p lw->attn_k=%p lw->attn_q=%p\n",
-                        (void*)gl->attn_k, (void*)lw->attn_k, (void*)lw->attn_q);
-                }
                 if (picolm_gpu_tensor_upload(&gl->attn_k,
                         lw->attn_k, lw->type_attn_k, c->n_embd, kv_dim, device)) uploaded++;
-                if (l == 0) {
-                    fprintf(stderr, "[UPLOAD_DBG] K after: gl->attn_k=%p gl->attn_q=%p\n",
-                        (void*)gl->attn_k, (void*)gl->attn_q);
-                }
                 /* Attention V: [kv_dim, n_embd] */
                 attempted++;
                 if (picolm_gpu_tensor_upload(&gl->attn_v,
