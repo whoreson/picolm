@@ -4397,11 +4397,8 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
         } /* end if (!did_cpu_ssm) */
     }
 
-    /* End batched recording: submit all layer dispatches as one command buffer,
-     * then fence-wait. This is where the GPU actually executes everything. */
-    picolm_gpu_batch_end(gpu_dev);
-
-    /* 3. Final RMSNorm: pipe_x = rmsnorm(pipe_x, output_norm_w) */
+    /* 3. Final RMSNorm: pipe_x = rmsnorm(pipe_x, output_norm_w)
+     * Added to the SAME batch as the layer loop to avoid extra round-trips. */
     picolm_gpu_rmsnorm_dev(pipe_x, pipe_x,
                             (float *)gw->output_norm_dev,
                             dim, c->rms_norm_eps, gpu_dev);
@@ -4419,6 +4416,12 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
         logits_ok = picolm_gpu_matmul_logits((picolm_gpu_tensor_t *)gw->output,
                                                   pipe_logits, pipe_x, gpu_dev);
     }
+
+    /* End batched recording: submit all layer dispatches + RMSNorm + logits matmul
+     * as ONE command buffer. This eliminates multiple vkQueueSubmit round-trips
+     * per token, which is critical for RADV performance on GCN1. */
+    picolm_gpu_batch_end(gpu_dev);
+
     if (logits_ok) {
         /* D2H only the logits */
         size_t logits_bytes = (size_t)c->vocab_size * sizeof(float);

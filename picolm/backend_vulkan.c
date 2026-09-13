@@ -197,8 +197,10 @@ static struct {
     VkDescriptorSet dset_quantize_ring[256];
 
     // Q8_0 x Q8_0 matmul pipeline (pre-quantized activations)
-    VkShaderModule shader_q8q8;
-    VkPipeline pipe_q8q8;
+    VkShaderModule shader_q8q8, shader_q2k, shader_iq4nl, shader_q3k, shader_q6k, shader_q4k;
+    VkPipeline pipe_q8q8, pipe_q2k, pipe_iq4nl, pipe_q3k, pipe_q6k, pipe_q4k;
+    VkDescriptorPool dpool_q2k, dpool_iq4nl, dpool_q3k, dpool_q6k, dpool_q4k;
+    VkDescriptorSet dset_q2k_ring[256], dset_iq4nl_ring[256], dset_q3k_ring[256], dset_q6k_ring[256], dset_q4k_ring[256];
     VkDescriptorPool dpool_q8q8;
     VkDescriptorSet dset_q8q8;
     VkDescriptorSet dset_q8q8_ring[256];
@@ -513,16 +515,19 @@ static size_t gguf_row_bytes(gguf_type_t q, int I) {
         case GGUF_TYPE_F16:    return (size_t)I * 2;
         case GGUF_TYPE_Q8_0:   return (size_t)((I + 31) / 32) * 34;
         case GGUF_TYPE_Q4_0:   return (size_t)((I + 31) / 32) * 18;
+        case GGUF_TYPE_Q5_0:   return (size_t)((I + 31) / 32) * 22;
+        case GGUF_TYPE_Q5_1:   return (size_t)((I + 31) / 32) * 24;
+        case GGUF_TYPE_IQ4_NL: return (size_t)((I + 31) / 32) * 18;
+        case GGUF_TYPE_Q1_0:   return (size_t)((I + 127) / 128) * 18;
+        case GGUF_TYPE_Q2_0:   return (size_t)((I + 127) / 128) * 34;
         case GGUF_TYPE_Q4_K:   return (size_t)((I + 255) / 256) * 144;
         case GGUF_TYPE_Q5_K:   return (size_t)((I + 255) / 256) * 176;
         case GGUF_TYPE_Q6_K:   return (size_t)((I + 255) / 256) * 210;
+        case GGUF_TYPE_Q2_K:   return (size_t)((I + 255) / 256) * 84;
+        case GGUF_TYPE_Q3_K:   return (size_t)((I + 255) / 256) * 110;
         case GGUF_TYPE_BF16:   return (size_t)I * 2;
         case GGUF_TYPE_Q4_0_4_4: return (size_t)((I + 31) / 32) * 18;
         case GGUF_TYPE_Q4_0_4_8: return (size_t)((I + 31) / 32) * 18;
-        case GGUF_TYPE_Q1_0:   return (size_t)((I + 127) / 128) * 18;
-        case GGUF_TYPE_Q2_0:   return (size_t)((I + 127) / 128) * 34;
-        case GGUF_TYPE_Q2_K:   return (size_t)((I + 255) / 256) * 84;
-        case GGUF_TYPE_Q3_K:   return (size_t)((I + 255) / 256) * 110;
         default: return 0;
     }
 }
@@ -543,13 +548,25 @@ static int arena_suballoc(size_t bytes, VkBuffer *buf, void **ptr) {
     VKCHECK(vkCreateBuffer(G.dev, &bi, NULL, buf), "vkCreateBuffer");
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(G.dev, *buf, &req);
-    if (!(req.memoryTypeBits & (1u << G.memtype))) {
-        vkDestroyBuffer(G.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0;
-    }
-    VkDeviceMemory mem;
+
+    // Try primary memory type (DEVICE_LOCAL|HOST_VISIBLE, heap=1) first.
+    // If allocation fails (heap exhausted), fall back to HOST_VISIBLE heap=0.
+    int mt = G.memtype;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
     VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize = req.size, .memoryTypeIndex = G.memtype};
-    VKCHECK(vkAllocateMemory(G.dev, &ai, NULL, &mem), "vkAllocateMemory");
+        .allocationSize = req.size, .memoryTypeIndex = mt};
+    if (vkAllocateMemory(G.dev, &ai, NULL, &mem) != VK_SUCCESS) {
+        // Fallback: find any HOST_VISIBLE|COHERENT type (heap=0)
+        for (uint32_t i = 0; i < G.mem_props.memoryTypeCount; i++) {
+            if (!(req.memoryTypeBits & (1u << i))) continue;
+            uint32_t f = G.mem_props.memoryTypes[i].propertyFlags;
+            if (!(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) continue;
+            ai.memoryTypeIndex = i;
+            if (vkAllocateMemory(G.dev, &ai, NULL, &mem) == VK_SUCCESS) break;
+        }
+    }
+    if (!mem) { vkDestroyBuffer(G.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0; }
+
     VKCHECK(vkBindBufferMemory(G.dev, *buf, mem, 0), "vkBindBufferMemory");
     VkWArena *a = calloc(1, sizeof(*a));
     if (!a) {
@@ -1004,8 +1021,22 @@ int picolm_gpu_init(const int *devices, int count) {
     // Load matmul shader
     G.shader = load_spv(G.dev, "qmatmul_vk.spv");
     if (!G.shader) { fprintf(stderr, "[VK] failed to load qmatmul_vk.spv\n"); return 0; }
-    // Matmul: 4 sets for ring buffer
     if (!build_pipeline_unified(G.dev, G.shader, &G.pipe, &G.dpool, G.dset, 256)) return 0;
+
+    // Dedicated shaders (avoid KAVERI hang from monolithic shader)
+    #define LOAD_DED_SHADER(name, spv_file) do { \
+        G.shader_##name = load_spv(G.dev, spv_file); \
+        if (G.shader_##name) { \
+            if (!build_pipeline_unified(G.dev, G.shader_##name, &G.pipe_##name, &G.dpool_##name, G.dset_##name##_ring, 256)) { \
+                G.shader_##name = VK_NULL_HANDLE; \
+            } \
+        } \
+    } while(0)
+    LOAD_DED_SHADER(q2k, "q2k_matmul_vk.spv");
+    LOAD_DED_SHADER(iq4nl, "iq4nl_matmul_vk.spv");
+    LOAD_DED_SHADER(q3k, "q3k_matmul_vk.spv");
+    LOAD_DED_SHADER(q6k, "q6k_matmul_vk.spv");
+    LOAD_DED_SHADER(q4k, "q4k_matmul_vk.spv");
 
     // RMSNorm shader (push: int S, int D, float eps, int x_stride = 16 bytes)
     G.shader_nrm = load_spv(G.dev, "rmsnorm_vk.spv");
@@ -1376,42 +1407,7 @@ int picolm_gpu_tensor_upload(void **tensor, const void *weights,
     if (!arena_suballoc(total, &wbuf, &wptr)) {
                 return 0;
     }
-    // For K-quant formats (Q2_K, Q3_K), dequantize to F32 on CPU and upload as F32.
-    // The shader doesn't handle K-quant dequant correctly on weak GPUs.
-    gguf_type_t upload_qtype = qtype;
-    if (qtype == 10 || qtype == 11 || qtype == 14) {
-        // Convert to F32: each row is I floats = I*4 bytes
-        int f32_rw = (I * 4 + 3) / 4;
-        size_t f32_stride = (size_t)f32_rw * 4;
-        size_t f32_total = f32_stride * (size_t)O;
-        
-        // Reallocate if needed (F32 might be larger than quantized)
-        if (f32_total > total) {
-            vkDestroyBuffer(G.dev, wbuf, NULL);
-            if (!arena_suballoc(f32_total, &wbuf, &wptr)) return 0;
-            total = f32_total;
-        }
-        
-        // Dequantize each row to F32
-        float *f32_buf = malloc(I * sizeof(float));
-        if (!f32_buf) { vkDestroyBuffer(G.dev, wbuf, NULL); return 0; }
-        for (int o = 0; o < O; o++) {
-            dequantize_row((const uint8_t *)weights + (size_t)o * rb, f32_buf, I, qtype);
-            memcpy((uint8_t *)wptr + (size_t)o * f32_stride, f32_buf, I * sizeof(float));
-        }
-        free(f32_buf);
-        upload_qtype = 0; // F32
-        
-        picolm_gpu_tensor_t *t = calloc(1, sizeof(*t));
-        if (!t) { vkDestroyBuffer(G.dev, wbuf, NULL); return 0; }
-        t->wbuf = wbuf; t->wmem = VK_NULL_HANDLE;
-        t->qtype = upload_qtype; t->I = I; t->O = O; t->device = device;
-        t->row_bytes = I * 4; t->row_words = f32_rw; t->wbytes = total;
-        G.used_bytes += total;
-        *slot = t;
-        return 1;
-    }
-    
+
     for (int o = 0; o < O; o++) {
         memcpy((uint8_t *)wptr + (size_t)o * gpu_stride,
                (const uint8_t *)weights + (size_t)o * rb, rb);
@@ -1808,16 +1804,31 @@ int picolm_gpu_memcpy(void *dst, const void *src, size_t bytes, int dir, int dev
 
 int picolm_gpu_memcpy_async(void *dst, const void *src, size_t bytes, int dir, int device) {
     if (!G.ready || !dst || !src || bytes < 1 || device != 0) return 0;
-    if (dir == 1) { /* H2D via staging */
-        if (!staging_ensure(bytes)) return 0;
-        memcpy(G.staging_ptr, src, bytes);
-        /* Flush CPU write to ensure GPU sees the data */
-        VkMappedMemoryRange flush = {.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-            .memory = G.staging_mem, .offset = 0, .size = VK_WHOLE_SIZE};
-        vkFlushMappedMemoryRanges(G.dev, 1, &flush);
+    if (dir == 1) { /* H2D: try direct mapped write first, fall back to staging */
         VkDeviceSize dst_off = 0;
         VkBuffer dst_buf = unwrap_buf_offset(dst, &dst_off);
         if (!dst_buf) return 0;
+        /* Try direct mapped write for HOST_VISIBLE memory (pipeline buffers on KAVERI use memtype 3) */
+        {
+            vk_dev_buf_t *db = NULL;
+            for (vk_dev_buf_t *d = g_dev_buf_list; d; d = d->next) {
+                if (d->buf == dst_buf) { db = d; break; }
+            }
+            if (db) {
+                void *m = NULL;
+                if (vkMapMemory(G.dev, db->mem, db->off + dst_off, bytes, 0, &m) == VK_SUCCESS) {
+                    memcpy(m, src, bytes);
+                    vkUnmapMemory(G.dev, db->mem);
+                    return 1;
+                }
+            }
+        }
+        /* Fall back to staging buffer */
+        if (!staging_ensure(bytes)) return 0;
+        memcpy(G.staging_ptr, src, bytes);
+        VkMappedMemoryRange flush = {.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+            .memory = G.staging_mem, .offset = 0, .size = VK_WHOLE_SIZE};
+        vkFlushMappedMemoryRanges(G.dev, 1, &flush);
         /* Ensure prior xfer is done before reusing cmd_xfer */
         vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
         VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -1933,6 +1944,8 @@ int picolm_gpu_sync(int device) {
 } while(0)
 
 // Scoped barrier: only syncs specific buffers (read inputs).
+// Forward declarations
+static void _kv_d2h_copy(VkBuffer src_buf, VkDeviceSize src_off, size_t total_f32);
 // buf = device pointer to sync (the buffer being READ by the next dispatch).
 // sz = byte size of the region to sync (0 = full buffer).
 static void _batch_barrier_buf(void *buf, size_t sz) {
@@ -1988,6 +2001,8 @@ void picolm_gpu_ts_write(const char *label) {
     G.ts_write_idx++;
 }
 
+static struct timespec _batch_start_ts;
+
 int picolm_gpu_batch_begin(int device) {
     if (!G.ready || device != 0) return 0;
     if (G.in_batch) return 0;  // already in a batch
@@ -2000,6 +2015,7 @@ int picolm_gpu_batch_begin(int device) {
     vkResetCommandBuffer(G.cmd_dev, 0);
     vkBeginCommandBuffer(G.cmd_dev, &begin);
     picolm_gpu_ts_write("BATCH_START");
+    clock_gettime(CLOCK_MONOTONIC, &_batch_start_ts);
     G.in_batch = 1;
     return 1;
 }
@@ -2016,11 +2032,26 @@ int picolm_gpu_batch_end(int device) {
         G.in_batch = 0;
         return 0;
     }
+    /* Measure CPU-side command recording time vs submit+fence time */
+    struct timespec ts_submit, ts_post;
+    double record_ms = 0;
+    { struct timespec ts_now; clock_gettime(CLOCK_MONOTONIC, &ts_now);
+      record_ms = (ts_now.tv_sec - _batch_start_ts.tv_sec) * 1000.0 + (ts_now.tv_nsec - _batch_start_ts.tv_nsec) / 1e6; }
+
+    clock_gettime(CLOCK_MONOTONIC, &ts_submit);
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .commandBufferCount = 1, .pCommandBuffers = &G.cmd_dev};
     vkResetFences(G.dev, 1, &G.fence_dev);
     vkQueueSubmit(G.queue, 1, &si, G.fence_dev);
     vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
+    clock_gettime(CLOCK_MONOTONIC, &ts_post);
+    double submit_fence_ms = (ts_post.tv_sec - ts_submit.tv_sec) * 1000.0 + (ts_post.tv_nsec - ts_submit.tv_nsec) / 1e6;
+    double total_ms = record_ms + submit_fence_ms;
+
+    if (getenv("PICOLM_VK_STATS") || getenv("PICOLM_VK_LATENCY")) {
+        fprintf(stderr, "[VK] batch: %d dispatches, %d barriers, %.1f ms record + %.1f ms submit+fence = %.1f ms total\n",
+                _g_dispatch_cnt, _g_barrier_cnt, record_ms, submit_fence_ms, total_ms);
+    }
 
     // Read back timestamps (compute deltas between adjacent slots)
     if (G.ts_supported && getenv("PICOLM_VK_TS") && G.ts_write_idx > 0) {
@@ -2349,21 +2380,42 @@ int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_d
         }
     }
     if (!ok) {
-        if (getenv("PICOLM_DISPATCH")) {
-            static int _fd=0; if(!_fd){_fd=1;fprintf(stderr,"DISPATCH matmul_dev: fallback scalar I=%d O=%d S=%d qtype=%d\n",t->I,t->O,S,t->qtype);}
+        // Dedicated shaders (avoid KAVERI hang from monolithic shader)
+        #define TRY_DED_SHADER(qtype_const, name) \
+            if (!ok && t->qtype == qtype_const && G.shader_##name) { \
+                VkDescriptorBufferInfo bi[3] = {xbi, {t->wbuf,0,VK_WHOLE_SIZE}, ybi}; \
+                VK_BATCH_BIND(G.pipe_##name); \
+                push_desc(G.cmd_dev, 3, bi); \
+                int pc[4] = {S, t->I, t->O, (int)t->row_words}; \
+                vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, \
+                                   0, sizeof(pc), pc); \
+                vkCmdDispatch(G.cmd_dev, (uint32_t)((t->O + 15) / 16), (uint32_t)S, 1); \
+                _g_dispatch_cnt++; ok = 1; \
+            }
+        TRY_DED_SHADER(GGUF_TYPE_Q2_K, q2k);
+        TRY_DED_SHADER(GGUF_TYPE_IQ4_NL, iq4nl);
+        TRY_DED_SHADER(GGUF_TYPE_Q3_K, q3k);
+        TRY_DED_SHADER(GGUF_TYPE_Q6_K, q6k);
+        TRY_DED_SHADER(GGUF_TYPE_Q4_K, q4k);
+        if (!ok) {
+            if (getenv("PICOLM_DISPATCH")) {
+                static int _fd=0; if(!_fd){_fd=1;fprintf(stderr,"DISPATCH matmul_dev: fallback scalar I=%d O=%d S=%d qtype=%d\n",t->I,t->O,S,t->qtype);}
+            }
+            VkDescriptorBufferInfo bi[3] = {xbi, {t->wbuf,0,VK_WHOLE_SIZE}, ybi};
+            VK_BATCH_BIND(G.pipe);
+            push_desc(G.cmd_dev, 3, bi);
+            PC_Matmul pc = {t->qtype, S, t->I, t->O, (int)t->row_words, x_stride, y_stride};
+            vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
+                               0, sizeof(pc), &pc);
+            vkCmdDispatch(G.cmd_dev, (uint32_t)((t->O + 15) / 16), (uint32_t)S, 1);
+            _g_dispatch_cnt++;
+            ok = 1;
         }
-        VkDescriptorBufferInfo bi[3] = {xbi, {t->wbuf,0,VK_WHOLE_SIZE}, ybi};
-        VK_BATCH_BIND(G.pipe);
-        push_desc(G.cmd_dev, 3, bi);
-        PC_Matmul pc = {t->qtype, S, t->I, t->O, (int)t->row_words, x_stride, y_stride};
-        vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
-                           0, sizeof(pc), &pc);
-        vkCmdDispatch(G.cmd_dev, (uint32_t)((t->O + 15) / 16), (uint32_t)S, 1);
-        _g_dispatch_cnt++;
-        ok = 1;
     }
 
     VK_BATCH_DISPATCH_POST();
+
+    // Debug: Q2_K dump (disabled)
 
     return ok;
 }
@@ -2379,6 +2431,7 @@ int picolm_gpu_matmul_dev_qkv(picolm_gpu_tensor_t *tq, picolm_gpu_tensor_t *tk,
                                const float *x_dev, int S, int device,
                                int ysq, int ysk, int xs) {
     (void)ysq; (void)ysk; (void)xs;
+    // No debug QKV
     if (!tq || !tk || !tv || device != 0) return 0;
 
     // Try true fused QKV shader: single dispatch for all 3 projections

@@ -1,7 +1,9 @@
 #version 450
 // Scalar dequant matmul: Y[s,o] = sum_i X[s,i] * W[o,i]
 // Grid: [ceil(O/16), S, 1], block: [16, 1, 1]
-// Each thread computes one output element
+// Supports: F32(0), F16(1), Q4_0(2), Q5_0(6), Q8_0(8),
+//           Q2_K(10), Q3_K(11), Q4_K(12), Q5_K(13), Q6_K(14),
+//           IQ4_NL(20), Q1_0(41), Q2_0(42)
 
 layout(local_size_x = 16) in;
 
@@ -34,33 +36,70 @@ uint read_byte(uint rowBase, uint byteOff) {
     return (w[wIdx] >> ((byteOff % 4u) * 8u)) & 0xffu;
 }
 
+// IQ4_NL dequantization lookup table (16 entries)
+int iq4_nl_lut(uint idx) {
+    return int(
+        (idx == 0u) ? -127 :
+        (idx == 1u) ? -104 :
+        (idx == 2u) ? -83 :
+        (idx == 3u) ? -65 :
+        (idx == 4u) ? -49 :
+        (idx == 5u) ? -35 :
+        (idx == 6u) ? -22 :
+        (idx == 7u) ? -10 :
+        (idx == 8u) ? 1 :
+        (idx == 9u) ? 13 :
+        (idx == 10u) ? 25 :
+        (idx == 11u) ? 38 :
+        (idx == 12u) ? 53 :
+        (idx == 13u) ? 69 :
+        (idx == 14u) ? 89 :
+        113
+    );
+}
+
+// get_scale_min_k4: extract 6-bit scale and min from packed scales
+// scales_base: rowBase uint offset, scales_bo: byte offset within row to scales array
+// Returns scale in lower 8 bits, min in upper 8 bits
+uint get_scale_min_k4(uint rowBase, uint scales_bo, int j) {
+    uint sc, mn;
+    if (j < 4) {
+        sc = read_byte(rowBase, scales_bo + uint(j)) & 63u;
+        mn = read_byte(rowBase, scales_bo + uint(j + 4)) & 63u;
+    } else {
+        // j >= 4: mixed bit extraction from scales[j+4] and scales[j-4] high bits
+        sc = (read_byte(rowBase, scales_bo + uint(j + 4)) & 0x0Fu) |
+             ((read_byte(rowBase, scales_bo + uint(j - 4)) >> 6u) << 4u);
+        mn = ((read_byte(rowBase, scales_bo + uint(j + 4)) >> 4u) & 0x0Fu) |
+             ((read_byte(rowBase, scales_bo + uint(j)) >> 6u) << 4u);
+    }
+    return sc | (mn << 8u);
+}
+
 void main() {
     int o = int(gl_WorkGroupID.x) * 16 + int(gl_LocalInvocationID.x);
     int s = int(gl_WorkGroupID.y);
     if (o >= p.O || s >= p.S) return;
-    
+
     int xoff = s * p.I;
     uint rowBase = uint(o) * uint(p.rowWords);
     float sum = 0.0;
 
-    if (p.fmt == 8) {
-        // Q8_0: each block is [d:F16][qs:32xI8] = 34 bytes
-        int nblocks = (p.I + 31) / 32;
-        for (int bi = 0; bi < nblocks; bi++) {
-            uint bo = uint(bi) * 34u;
-            uint dWord = rowBase + bo / 4u;
-            uint dShift = (bo % 4u) * 8u;
-            float d = f16tof32((w[dWord] >> dShift) & 0xffffu);
-            for (int v = 0; v < 32; v++) {
-                int vi = bi * 32 + v;
-                if (vi >= p.I) break;
-                uint bv = read_byte(rowBase, bo + 2u + uint(v));
-                int val = int(bv); if (val >= 128) val -= 256;
-                sum += x[xoff + vi] * float(val) * d;
-            }
+    // ---- F32 (fmt==0) ----
+    if (p.fmt == 0) {
+        for (int i = 0; i < p.I; i++) {
+            sum += x[xoff + i] * uintBitsToFloat(w[rowBase + uint(i)]);
         }
-    } else if (p.fmt == 2) {
-        // Q4_0: each block is [d:F16][qs:16xU8] = 18 bytes, 32 values
+    }
+    // ---- F16 (fmt==1) ----
+    else if (p.fmt == 1) {
+        for (int i = 0; i < p.I; i++) {
+            uint h = read_byte(rowBase, uint(i)*2u) | (read_byte(rowBase, uint(i)*2u+1u) << 8u);
+            sum += x[xoff + i] * f16tof32(h);
+        }
+    }
+    // ---- Q4_0 (fmt==2): 32 weights, 18 bytes = [d:F16][qs:16xU8] ----
+    else if (p.fmt == 2) {
         int nblocks = (p.I + 31) / 32;
         for (int bi = 0; bi < nblocks; bi++) {
             uint bo = uint(bi) * 18u;
@@ -74,37 +113,313 @@ void main() {
                 sum += x[xoff + vi] * float(val) * d;
             }
         }
-    } else if (p.fmt == 1) {
-        // F16 weights
-        for (int i = 0; i < p.I; i++) {
-            uint h = read_byte(rowBase, uint(i)*2u) | (read_byte(rowBase, uint(i)*2u+1u) << 8u);
-            sum += x[xoff + i] * f16tof32(h);
-        }
-    } else if (p.fmt == 0) {
-        // F32 weights (stored as uint32 in the uint buffer)
-        for (int i = 0; i < p.I; i++) {
-            sum += x[xoff + i] * uintBitsToFloat(w[rowBase + uint(i)]);
-        }
-    } else if (p.fmt == 3) {
-        // Q5_0: each block is [d:F16][qs:16xU8][qh:32 bits] = 22 bytes, 32 values
+    }
+    // ---- Q5_0 (fmt==6): 32 weights, 22 bytes = [d:F16][qh:4xU8][qs:16xU8] ----
+    else if (p.fmt == 6) {
         int nblocks = (p.I + 31) / 32;
         for (int bi = 0; bi < nblocks; bi++) {
             uint bo = uint(bi) * 22u;
             float d = f16tof32(read_byte(rowBase, bo) | (read_byte(rowBase, bo+1u) << 8u));
             uint qh = read_byte(rowBase, bo+2u) | (read_byte(rowBase, bo+3u) << 8u) |
                       read_byte(rowBase, bo+4u) << 16u | read_byte(rowBase, bo+5u) << 24u;
+            for (int j = 0; j < 16; j++) {
+                uint bv = read_byte(rowBase, bo + 6u + uint(j));
+                int x0 = int((bv & 0x0Fu) | (((qh >> uint(j)) & 1u) << 4u)) - 16;
+                int x1 = int((bv >> 4u) | (((qh >> uint(j + 16u)) & 1u) << 4u)) - 16;
+                int vi0 = bi * 32 + j;
+                int vi1 = bi * 32 + j + 16;
+                if (vi0 < p.I) sum += x[xoff + vi0] * float(x0) * d;
+                if (vi1 < p.I) sum += x[xoff + vi1] * float(x1) * d;
+            }
+        }
+    }
+    // ---- Q8_0 (fmt==8): 32 weights, 34 bytes = [d:F16][qs:32xI8] ----
+    else if (p.fmt == 8) {
+        int nblocks = (p.I + 31) / 32;
+        for (int bi = 0; bi < nblocks; bi++) {
+            uint bo = uint(bi) * 34u;
+            float d = f16tof32(read_byte(rowBase, bo) | (read_byte(rowBase, bo+1u) << 8u));
+            for (int v = 0; v < 32; v++) {
+                int vi = bi * 32 + v;
+                if (vi >= p.I) break;
+                uint bv = read_byte(rowBase, bo + 2u + uint(v));
+                int val = int(bv); if (val >= 128) val -= 256;
+                sum += x[xoff + vi] * float(val) * d;
+            }
+        }
+    }
+    // ---- Q4_K (fmt==12): 256 weights, 144 bytes
+    //   Layout: [d:F16][dmin:F16][scales:12xU8][qs:128xU8]
+    else if (p.fmt == 12) {
+        int nblocks = (p.I + 255) / 256;
+        for (int bi = 0; bi < nblocks; bi++) {
+            uint bo = uint(bi) * 144u;
+            float d = f16tof32(read_byte(rowBase, bo) | (read_byte(rowBase, bo+1u) << 8u));
+            float dmin = f16tof32(read_byte(rowBase, bo+2u) | (read_byte(rowBase, bo+3u) << 8u));
+            uint sc_bo = bo + 4u;  // scales byte offset
+            uint qs_bo = bo + 16u; // qs byte offset
+            for (int g = 0; g < 4; g++) {
+                uint sm1 = get_scale_min_k4(rowBase, sc_bo, g * 2);
+                float d1 = d * float(sm1 & 0xffu);
+                float m1 = dmin * float((sm1 >> 8u) & 0xffu);
+                uint sm2 = get_scale_min_k4(rowBase, sc_bo, g * 2 + 1);
+                float d2 = d * float(sm2 & 0xffu);
+                float m2 = dmin * float((sm2 >> 8u) & 0xffu);
+                uint gqs = qs_bo + uint(g) * 32u;
+                for (int l = 0; l < 32; l++) {
+                    int vi = bi * 256 + g * 64 + l;
+                    if (vi >= p.I) break;
+                    uint bv = read_byte(rowBase, gqs + uint(l));
+                    int val = int(bv & 0x0fu);
+                    sum += x[xoff + vi] * (d1 * float(val) - m1);
+                }
+                for (int l = 0; l < 32; l++) {
+                    int vi = bi * 256 + g * 64 + 32 + l;
+                    if (vi >= p.I) break;
+                    uint bv = read_byte(rowBase, gqs + uint(l));
+                    int val = int(bv >> 4u);
+                    sum += x[xoff + vi] * (d2 * float(val) - m2);
+                }
+            }
+        }
+    }
+    // ---- Q5_K (fmt==13): 256 weights, 176 bytes
+    //   Layout: [d:F16][dm:F16][scales:12xU8][qh:32xU8][qs:128xU8]
+    else if (p.fmt == 13) {
+        int nblocks = (p.I + 255) / 256;
+        for (int bi = 0; bi < nblocks; bi++) {
+            uint bo = uint(bi) * 176u;
+            float d = f16tof32(read_byte(rowBase, bo) | (read_byte(rowBase, bo+1u) << 8u));
+            float dmin = f16tof32(read_byte(rowBase, bo+2u) | (read_byte(rowBase, bo+3u) << 8u));
+            uint sc_bo = bo + 4u;
+            uint qh_bo = bo + 16u;
+            uint qs_bo = bo + 48u;
+            for (int g = 0; g < 4; g++) {
+                uint sm1 = get_scale_min_k4(rowBase, sc_bo, g * 2);
+                float d1 = d * float(sm1 & 0xffu);
+                float m1 = dmin * float((sm1 >> 8u) & 0xffu);
+                uint sm2 = get_scale_min_k4(rowBase, sc_bo, g * 2 + 1);
+                float d2 = d * float(sm2 & 0xffu);
+                float m2 = dmin * float((sm2 >> 8u) & 0xffu);
+                uint gqh = qh_bo + uint(g) * 8u;
+                uint gqs = qs_bo + uint(g) * 32u;
+                for (int l = 0; l < 32; l++) {
+                    int vi = bi * 256 + g * 64 + l;
+                    if (vi >= p.I) break;
+                    uint bv = read_byte(rowBase, gqs + uint(l));
+                    uint val = (bv & 0x0fu) << 1u;
+                    uint qhb = read_byte(rowBase, gqh + uint(l / 4u));
+                    val |= (qhb >> uint((l % 4u) * 2u)) & 1u;
+                    sum += x[xoff + vi] * (d1 * float(int(val)) - m1);
+                }
+                for (int l = 0; l < 32; l++) {
+                    int vi = bi * 256 + g * 64 + 32 + l;
+                    if (vi >= p.I) break;
+                    uint bv = read_byte(rowBase, gqs + uint(l));
+                    uint val = (bv >> 4u) << 1u;
+                    uint qhb = read_byte(rowBase, gqh + uint(l / 4u));
+                    val |= (qhb >> uint((l % 4u) * 2u + 1u)) & 1u;
+                    sum += x[xoff + vi] * (d2 * float(int(val)) - m2);
+                }
+            }
+        }
+    }
+    // ---- IQ4_NL (fmt==20): 32 weights, 18 bytes (same layout as Q4_0) ----
+    else if (p.fmt == 20) {
+        int nblocks = (p.I + 31) / 32;
+        for (int bi = 0; bi < nblocks; bi++) {
+            uint bo = uint(bi) * 18u;
+            float d = f16tof32(read_byte(rowBase, bo) | (read_byte(rowBase, bo+1u) << 8u));
             for (int v = 0; v < 32; v++) {
                 int vi = bi * 32 + v;
                 if (vi >= p.I) break;
                 uint ni = v < 16 ? uint(v) : uint(v - 16);
-                uint bv = read_byte(rowBase, bo + 6u + ni);
-                int val = int((bv >> (v < 16 ? 0u : 4u)) & 0xfu);
-                val = (val << 1u) | (int((qh >> v) & 1u));
-                val -= 16;
+                uint bv = read_byte(rowBase, bo + 2u + ni);
+                uint idx = (bv >> (v < 16 ? 0u : 4u)) & 0xfu;
+                int val = iq4_nl_lut(idx);
                 sum += x[xoff + vi] * float(val) * d;
             }
         }
-    } else {
+    }
+    // ---- Q1_0 (fmt==41): 128 weights, 18 bytes = [d:F16][qs:16xU8] ----
+    else if (p.fmt == 41) {
+        int nblocks = (p.I + 127) / 128;
+        for (int bi = 0; bi < nblocks; bi++) {
+            uint bo = uint(bi) * 18u;
+            float d = f16tof32(read_byte(rowBase, bo) | (read_byte(rowBase, bo+1u) << 8u));
+            for (int v = 0; v < 128; v++) {
+                int vi = bi * 128 + v;
+                if (vi >= p.I) break;
+                uint bv = read_byte(rowBase, bo + 2u + uint(v / 8));
+                int sign = int((bv >> uint(v % 8)) & 1u);
+                float val = (sign == 1) ? d : -d;
+                sum += x[xoff + vi] * val;
+            }
+        }
+    }
+    // ---- Q2_0 (fmt==42): 128 weights, 34 bytes = [d:F16][qs:32xU8] ----
+    else if (p.fmt == 42) {
+        int nblocks = (p.I + 127) / 128;
+        for (int bi = 0; bi < nblocks; bi++) {
+            uint bo = uint(bi) * 34u;
+            float d = f16tof32(read_byte(rowBase, bo) | (read_byte(rowBase, bo+1u) << 8u));
+            for (int v = 0; v < 128; v++) {
+                int vi = bi * 128 + v;
+                if (vi >= p.I) break;
+                uint bv = read_byte(rowBase, bo + 2u + uint(v / 4));
+                int val = int((bv >> (uint(v % 4) * 2u)) & 0x3u);
+                sum += x[xoff + vi] * float(val - 1) * d;
+            }
+        }
+    }
+    // ---- Q2_K (fmt==10): 256 weights, 84 bytes
+    //   Layout: [scales:16][qs:64][d:F16][dmin:F16]
+    else if (p.fmt == 10) {
+        int nblocks = (p.I + 255) / 256;
+        for (int bi = 0; bi < nblocks; bi++) {
+            uint bo = uint(bi) * 84u;
+            float d = f16tof32(read_byte(rowBase, bo+80u) | (read_byte(rowBase, bo+81u) << 8u));
+            float dmin = f16tof32(read_byte(rowBase, bo+82u) | (read_byte(rowBase, bo+83u) << 8u));
+            for (int chunk = 0; chunk < 2; chunk++) {
+                int shift = 0;
+                uint qs1 = bo + 16u + uint(chunk * 32u);    // sub-block 1 qs base
+                uint qs2 = bo + 16u + uint(chunk * 32u) + 16u; // sub-block 2 qs base
+                for (int j = 0; j < 4; j++) {
+                    uint sc = read_byte(rowBase, bo + uint(chunk * 8 + j * 2));
+                    float dl = d * float(sc & 0xFu);
+                    float ml = dmin * float((sc >> 4) & 0xFu);
+                    for (int l = 0; l < 16; l++) {
+                        int vi = bi * 256 + chunk * 128 + j * 32 + l;
+                        if (vi >= p.I) break;
+                        uint bv = read_byte(rowBase, qs1 + uint(l));
+                        int val = int((bv >> uint(shift)) & 3u);
+                        sum += x[xoff + vi] * (dl * float(val) - ml);
+                    }
+                    sc = read_byte(rowBase, bo + uint(chunk * 8 + j * 2 + 1));
+                    dl = d * float(sc & 0xFu);
+                    ml = dmin * float((sc >> 4) & 0xFu);
+                    for (int l = 0; l < 16; l++) {
+                        int vi = bi * 256 + chunk * 128 + j * 32 + 16 + l;
+                        if (vi >= p.I) break;
+                        uint bv = read_byte(rowBase, qs2 + uint(l));
+                        int val = int((bv >> uint(shift)) & 3u);
+                        sum += x[xoff + vi] * (dl * float(val) - ml);
+                    }
+                    shift += 2;
+                }
+            }
+        }
+    }
+    // ---- Q3_K (fmt==11): 256 weights, 110 bytes
+    //   Layout: [hmask:32][qs:64][scales:12][d:F16]
+    else if (p.fmt == 11) {
+        int nblocks = (p.I + 255) / 256;
+        for (int bi = 0; bi < nblocks; bi++) {
+            uint bo = uint(bi) * 110u;
+            float d = f16tof32(read_byte(rowBase, bo+108u) | (read_byte(rowBase, bo+109u) << 8u));
+            uint s0 = read_byte(rowBase, bo+96u) | (read_byte(rowBase, bo+97u) << 8u) |
+                      (read_byte(rowBase, bo+98u) << 16u) | (read_byte(rowBase, bo+99u) << 24u);
+            uint s1 = read_byte(rowBase, bo+100u) | (read_byte(rowBase, bo+101u) << 8u) |
+                      (read_byte(rowBase, bo+102u) << 16u) | (read_byte(rowBase, bo+103u) << 24u);
+            uint s2 = read_byte(rowBase, bo+104u) | (read_byte(rowBase, bo+105u) << 8u) |
+                      (read_byte(rowBase, bo+106u) << 16u) | (read_byte(rowBase, bo+107u) << 24u);
+            uint a0 = s0, a1 = s1, a2 = s2, a3 = 0u;
+            uint tmp = a2;
+            a2 = ((a0 >> 4u) & 0x0F0F0F0Fu) | (((tmp >> 4u) & 0x03030303u) << 4u);
+            a3 = ((a1 >> 4u) & 0x0F0F0F0Fu) | (((tmp >> 6u) & 0x03030303u) << 4u);
+            a0 = (a0 & 0x0F0F0F0Fu) | (((tmp >> 0u) & 0x03030303u) << 4u);
+            a1 = (a1 & 0x0F0F0F0Fu) | (((tmp >> 2u) & 0x03030303u) << 4u);
+            int sc[16];
+            sc[0]=int(a0&0xFF)-32; sc[1]=int((a0>>8)&0xFF)-32;
+            sc[2]=int((a0>>16)&0xFF)-32; sc[3]=int(a0>>24)-32;
+            sc[4]=int(a1&0xFF)-32; sc[5]=int((a1>>8)&0xFF)-32;
+            sc[6]=int((a1>>16)&0xFF)-32; sc[7]=int(a1>>24)-32;
+            sc[8]=int(a2&0xFF)-32; sc[9]=int((a2>>8)&0xFF)-32;
+            sc[10]=int((a2>>16)&0xFF)-32; sc[11]=int(a2>>24)-32;
+            sc[12]=int(a3&0xFF)-32; sc[13]=int((a3>>8)&0xFF)-32;
+            sc[14]=int((a3>>16)&0xFF)-32; sc[15]=int(a3>>24)-32;
+            uint hm = 1u;
+            for (int chunk = 0; chunk < 2; chunk++) {
+                int shift = 0;
+                int is = chunk * 8;
+                uint qs1 = bo + 32u + uint(chunk * 32u);    // sub-block 1 qs base
+                uint qs2 = bo + 32u + uint(chunk * 32u) + 16u; // sub-block 2 qs base
+                // hmask is shared across both chunks (32 bytes total at offset 0)
+                uint hm1 = bo + 0u;                          // hmask[0..15]
+                uint hm2 = bo + 16u;                         // hmask[16..31]
+                for (int j = 0; j < 4; j++) {
+                    float dl = d * float(sc[is++]);
+                    for (int l = 0; l < 16; l++) {
+                        int vi = bi * 256 + chunk * 128 + j * 32 + l;
+                        if (vi >= p.I) break;
+                        uint bv = read_byte(rowBase, qs1 + uint(l));
+                        int val = int((bv >> uint(shift)) & 3u);
+                        uint hval = read_byte(rowBase, hm1 + uint(l));
+                        if ((hval & hm) == 0u) val -= 4;
+                        sum += x[xoff + vi] * (dl * float(val));
+                    }
+                    dl = d * float(sc[is++]);
+                    for (int l = 0; l < 16; l++) {
+                        int vi = bi * 256 + chunk * 128 + j * 32 + 16 + l;
+                        if (vi >= p.I) break;
+                        uint bv = read_byte(rowBase, qs2 + uint(l));
+                        int val = int((bv >> uint(shift)) & 3u);
+                        uint hval = read_byte(rowBase, hm2 + uint(l));
+                        if ((hval & hm) == 0u) val -= 4;
+                        sum += x[xoff + vi] * (dl * float(val));
+                    }
+                    shift += 2;
+                    hm <<= 1u;
+                }
+            }
+        }
+    }
+    // ---- Q6_K (fmt==14): 256 weights, 210 bytes
+    //   Layout: [ql:128][qh:64][scales:16][d:F16]
+    else if (p.fmt == 14) {
+        int nblocks = (p.I + 255) / 256;
+        for (int bi = 0; bi < nblocks; bi++) {
+            uint bo = uint(bi) * 210u;
+            float d = f16tof32(read_byte(rowBase, bo+208u) | (read_byte(rowBase, bo+209u) << 8u));
+            uint scbase = bo + 192u;
+            for (int chunk = 0; chunk < 2; chunk++) {
+                uint ql_off = bo + uint(chunk * 64u);
+                uint qh_off = bo + 128u + uint(chunk * 32u);
+                int is_base = chunk * 8;
+                for (int l = 0; l < 32; l++) {
+                    int vi1 = bi * 256 + chunk * 128 + l;
+                    int vi2 = bi * 256 + chunk * 128 + 32 + l;
+                    int vi3 = bi * 256 + chunk * 128 + 64 + l;
+                    int vi4 = bi * 256 + chunk * 128 + 96 + l;
+                    if (vi4 >= p.I && vi3 >= p.I && vi2 >= p.I && vi1 >= p.I) break;
+                    uint ql0 = read_byte(rowBase, ql_off + uint(l));
+                    uint ql1 = read_byte(rowBase, ql_off + uint(l + 32u));
+                    uint qh0 = read_byte(rowBase, qh_off + uint(l));
+                    int q1 = int((ql0 & 0xFu) | (((qh0 >> 0u) & 3u) << 4u)) - 32;
+                    int q2 = int((ql1 & 0xFu) | (((qh0 >> 2u) & 3u) << 4u)) - 32;
+                    int q3 = int((ql0 >> 4u)  | (((qh0 >> 4u) & 3u) << 4u)) - 32;
+                    int q4 = int((ql1 >> 4u)  | (((qh0 >> 6u) & 3u) << 4u)) - 32;
+                    int is_l = is_base + (l / 16);
+                    float s1 = float(read_byte(rowBase, scbase + uint(is_l)));
+                    if (s1 >= 128.0) s1 -= 256.0;
+                    if (vi1 < p.I) sum += x[xoff + vi1] * d * s1 * float(q1);
+                    is_l += 2;
+                    float s2 = float(read_byte(rowBase, scbase + uint(is_l)));
+                    if (s2 >= 128.0) s2 -= 256.0;
+                    if (vi2 < p.I) sum += x[xoff + vi2] * d * s2 * float(q2);
+                    is_l += 2;
+                    float s3 = float(read_byte(rowBase, scbase + uint(is_l)));
+                    if (s3 >= 128.0) s3 -= 256.0;
+                    if (vi3 < p.I) sum += x[xoff + vi3] * d * s3 * float(q3);
+                    is_l += 2;
+                    float s4 = float(read_byte(rowBase, scbase + uint(is_l)));
+                    if (s4 >= 128.0) s4 -= 256.0;
+                    if (vi4 < p.I) sum += x[xoff + vi4] * d * s4 * float(q4);
+                }
+            }
+        }
+    }
+    else {
         sum = 0.0;
     }
 

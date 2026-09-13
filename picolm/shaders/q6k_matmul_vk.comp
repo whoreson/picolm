@@ -1,0 +1,88 @@
+#version 450
+// Q6_K scalar matmul: 256 weights, 210 bytes
+// Layout: [ql:128][qh:64][scales:16][d:F16]
+// Grid: [ceil(O/16), S, 1], block: [16, 1, 1]
+
+layout(local_size_x = 16) in;
+
+layout(std430, binding = 0) readonly buffer X  { float x[]; };
+layout(std430, binding = 1) readonly buffer W  { uint  w[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    int S, I, O;
+    int rowWords;
+} p;
+
+float f16tof32(uint h) {
+    uint s = (h >> 15u) & 1u;
+    uint e = (h >> 10u) & 31u;
+    uint m = h & 1023u;
+    if (e == 0u) {
+        if (m == 0u) return s != 0u ? -0.0 : 0.0;
+        float v = float(m) * 5.960464477539063e-8;
+        return s != 0u ? -v : v;
+    }
+    if (e == 31u) return s != 0u ? -1.0/0.0 : 1.0/0.0;
+    uint bits = (s << 31u) | ((e - 15u + 127u) << 23u) | (m << 13u);
+    return uintBitsToFloat(bits);
+}
+
+uint read_byte(uint rowBase, uint byteOff) {
+    uint wIdx = rowBase + byteOff / 4u;
+    return (w[wIdx] >> ((byteOff % 4u) * 8u)) & 0xffu;
+}
+
+void main() {
+    int o = int(gl_WorkGroupID.x) * 16 + int(gl_LocalInvocationID.x);
+    int s = int(gl_WorkGroupID.y);
+    if (o >= p.O || s >= p.S) return;
+
+    int xoff = s * p.I;
+    uint rowBase = uint(o) * uint(p.rowWords);
+    float sum = 0.0;
+    int nblocks = (p.I + 255) / 256;
+
+    for (int bi = 0; bi < nblocks; bi++) {
+        uint bo = uint(bi) * 210u;
+        float d = f16tof32(read_byte(rowBase, bo+208u) | (read_byte(rowBase, bo+209u) << 8u));
+        uint scbase = bo + 192u;
+        for (int chunk = 0; chunk < 2; chunk++) {
+            uint ql_off = bo + uint(chunk * 64u);
+            uint qh_off = bo + 128u + uint(chunk * 32u);
+            int is_base = chunk * 8;
+            for (int l = 0; l < 32; l++) {
+                int vi1 = bi * 256 + chunk * 128 + l;
+                int vi2 = bi * 256 + chunk * 128 + 32 + l;
+                int vi3 = bi * 256 + chunk * 128 + 64 + l;
+                int vi4 = bi * 256 + chunk * 128 + 96 + l;
+                if (vi4 >= p.I && vi3 >= p.I && vi2 >= p.I && vi1 >= p.I) break;
+                uint ql0 = read_byte(rowBase, ql_off + uint(l));
+                uint ql1 = read_byte(rowBase, ql_off + uint(l + 32u));
+                uint qh0 = read_byte(rowBase, qh_off + uint(l));
+                int q1 = int((ql0 & 0xFu) | (((qh0 >> 0u) & 3u) << 4u)) - 32;
+                int q2 = int((ql1 & 0xFu) | (((qh0 >> 2u) & 3u) << 4u)) - 32;
+                int q3 = int((ql0 >> 4u)  | (((qh0 >> 4u) & 3u) << 4u)) - 32;
+                int q4 = int((ql1 >> 4u)  | (((qh0 >> 6u) & 3u) << 4u)) - 32;
+                int is_l = is_base + (l / 16);
+                float s1 = float(read_byte(rowBase, scbase + uint(is_l)));
+                if (s1 >= 128.0) s1 -= 256.0;
+                if (vi1 < p.I) sum += x[xoff + vi1] * d * s1 * float(q1);
+                is_l += 2;
+                float s2 = float(read_byte(rowBase, scbase + uint(is_l)));
+                if (s2 >= 128.0) s2 -= 256.0;
+                if (vi2 < p.I) sum += x[xoff + vi2] * d * s2 * float(q2);
+                is_l += 2;
+                float s3 = float(read_byte(rowBase, scbase + uint(is_l)));
+                if (s3 >= 128.0) s3 -= 256.0;
+                if (vi3 < p.I) sum += x[xoff + vi3] * d * s3 * float(q3);
+                is_l += 2;
+                float s4 = float(read_byte(rowBase, scbase + uint(is_l)));
+                if (s4 >= 128.0) s4 -= 256.0;
+                if (vi4 < p.I) sum += x[xoff + vi4] * d * s4 * float(q4);
+            }
+        }
+    }
+    y[uint(o) * uint(p.S) + uint(s)] = sum;
+}
+

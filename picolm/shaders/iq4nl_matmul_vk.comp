@@ -1,0 +1,70 @@
+#version 450
+// IQ4_NL scalar matmul: Y[s,o] = sum_i X[s,i] * iq4_nl_lut[W[o,i] & 0xF] * d
+// Grid: [ceil(O/16), S, 1], block: [16, 1, 1]
+
+layout(local_size_x = 16) in;
+
+layout(std430, binding = 0) readonly buffer X  { float x[]; };
+layout(std430, binding = 1) readonly buffer W  { uint  w[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    int S, I, O;
+    int rowWords;
+} p;
+
+float f16tof32(uint h) {
+    uint s = (h >> 15u) & 1u;
+    uint e = (h >> 10u) & 31u;
+    uint m = h & 1023u;
+    if (e == 0u) {
+        if (m == 0u) return s != 0u ? -0.0 : 0.0;
+        float v = float(m) * 5.960464477539063e-8;
+        return s != 0u ? -v : v;
+    }
+    if (e == 31u) return s != 0u ? -1.0/0.0 : 1.0/0.0;
+    uint bits = (s << 31u) | ((e - 15u + 127u) << 23u) | (m << 13u);
+    return uintBitsToFloat(bits);
+}
+
+uint read_byte(uint rowBase, uint byteOff) {
+    uint wIdx = rowBase + byteOff / 4u;
+    return (w[wIdx] >> ((byteOff % 4u) * 8u)) & 0xffu;
+}
+
+int iq4_nl_lut(uint idx) {
+    return int(
+        (idx == 0u) ? -127 : (idx == 1u) ? -104 : (idx == 2u) ? -83 :
+        (idx == 3u) ? -65 : (idx == 4u) ? -49 : (idx == 5u) ? -35 :
+        (idx == 6u) ? -22 : (idx == 7u) ? -10 : (idx == 8u) ? 1 :
+        (idx == 9u) ? 13 : (idx == 10u) ? 25 : (idx == 11u) ? 38 :
+        (idx == 12u) ? 53 : (idx == 13u) ? 69 : (idx == 14u) ? 89 : 113
+    );
+}
+
+void main() {
+    int o = int(gl_WorkGroupID.x) * 16 + int(gl_LocalInvocationID.x);
+    int s = int(gl_WorkGroupID.y);
+    if (o >= p.O || s >= p.S) return;
+
+    int xoff = s * p.I;
+    uint rowBase = uint(o) * uint(p.rowWords);
+    float sum = 0.0;
+    int nblocks = (p.I + 31) / 32;
+
+    for (int bi = 0; bi < nblocks; bi++) {
+        uint bo = uint(bi) * 18u;
+        float d = f16tof32(read_byte(rowBase, bo) | (read_byte(rowBase, bo+1u) << 8u));
+        for (int v = 0; v < 32; v++) {
+            int vi = bi * 32 + v;
+            if (vi >= p.I) break;
+            uint ni = v < 16 ? uint(v) : uint(v - 16);
+            uint bv = read_byte(rowBase, bo + 2u + ni);
+            uint idx = (bv >> (v < 16 ? 0u : 4u)) & 0xfu;
+            int val = iq4_nl_lut(idx);
+            sum += x[xoff + vi] * float(val) * d;
+        }
+    }
+    y[uint(o) * uint(p.S) + uint(s)] = sum;
+}
+

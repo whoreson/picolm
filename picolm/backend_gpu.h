@@ -549,6 +549,7 @@ int picolm_gpu_sigmoid_mul_batched_dev(float *out_dev, const float *gate_dev,
 
 /* Prefill batch buffer accessors (S>1, [max_seq_len][dim] layout). */
 float *picolm_gpu_pipe_x_b(int device);
+void *picolm_gpu_pipe_x_b_mapped(int device);
 float *picolm_gpu_pipe_xb_b(int device);
 float *picolm_gpu_pipe_q_b(int device);
 float *picolm_gpu_pipe_k_b(int device);

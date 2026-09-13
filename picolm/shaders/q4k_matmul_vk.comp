@@ -1,0 +1,92 @@
+#version 450
+// Q4_K scalar matmul: 256 weights, 144 bytes
+// Layout: [d:F16][dmin:F16][scales:12xU8][qs:128xU8]
+// Grid: [ceil(O/16), S, 1], block: [16, 1, 1]
+
+layout(local_size_x = 16) in;
+
+layout(std430, binding = 0) readonly buffer X  { float x[]; };
+layout(std430, binding = 1) readonly buffer W  { uint  w[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    int S, I, O;
+    int rowWords;
+} p;
+
+float f16tof32(uint h) {
+    uint s = (h >> 15u) & 1u;
+    uint e = (h >> 10u) & 31u;
+    uint m = h & 1023u;
+    if (e == 0u) {
+        if (m == 0u) return s != 0u ? -0.0 : 0.0;
+        float v = float(m) * 5.960464477539063e-8;
+        return s != 0u ? -v : v;
+    }
+    if (e == 31u) return s != 0u ? -1.0/0.0 : 1.0/0.0;
+    uint bits = (s << 31u) | ((e - 15u + 127u) << 23u) | (m << 13u);
+    return uintBitsToFloat(bits);
+}
+
+uint read_byte(uint rowBase, uint byteOff) {
+    uint wIdx = rowBase + byteOff / 4u;
+    return (w[wIdx] >> ((byteOff % 4u) * 8u)) & 0xffu;
+}
+
+uint get_scale_min_k4(uint rowBase, uint scales_bo, int j) {
+    uint sc, mn;
+    if (j < 4) {
+        sc = read_byte(rowBase, scales_bo + uint(j)) & 63u;
+        mn = read_byte(rowBase, scales_bo + uint(j + 4)) & 63u;
+    } else {
+        sc = (read_byte(rowBase, scales_bo + uint(j + 4)) & 0x0Fu) |
+             ((read_byte(rowBase, scales_bo + uint(j - 4)) >> 6u) << 4u);
+        mn = ((read_byte(rowBase, scales_bo + uint(j + 4)) >> 4u) & 0x0Fu) |
+             ((read_byte(rowBase, scales_bo + uint(j)) >> 6u) << 4u);
+    }
+    return sc | (mn << 8u);
+}
+
+void main() {
+    int o = int(gl_WorkGroupID.x) * 16 + int(gl_LocalInvocationID.x);
+    int s = int(gl_WorkGroupID.y);
+    if (o >= p.O || s >= p.S) return;
+
+    int xoff = s * p.I;
+    uint rowBase = uint(o) * uint(p.rowWords);
+    float sum = 0.0;
+    int nblocks = (p.I + 255) / 256;
+
+    for (int bi = 0; bi < nblocks; bi++) {
+        uint bo = uint(bi) * 144u;
+        float d = f16tof32(read_byte(rowBase, bo) | (read_byte(rowBase, bo+1u) << 8u));
+        float dmin = f16tof32(read_byte(rowBase, bo+2u) | (read_byte(rowBase, bo+3u) << 8u));
+        uint sc_bo = bo + 4u;
+        uint qs_bo = bo + 16u;
+        for (int g = 0; g < 4; g++) {
+            uint sm1 = get_scale_min_k4(rowBase, sc_bo, g * 2);
+            float d1 = d * float(sm1 & 0xffu);
+            float m1 = dmin * float((sm1 >> 8u) & 0xffu);
+            uint sm2 = get_scale_min_k4(rowBase, sc_bo, g * 2 + 1);
+            float d2 = d * float(sm2 & 0xffu);
+            float m2 = dmin * float((sm2 >> 8u) & 0xffu);
+            uint gqs = qs_bo + uint(g) * 32u;
+            for (int l = 0; l < 32; l++) {
+                int vi = bi * 256 + g * 64 + l;
+                if (vi >= p.I) break;
+                uint bv = read_byte(rowBase, gqs + uint(l));
+                int val = int(bv & 0x0fu);
+                sum += x[xoff + vi] * (d1 * float(val) - m1);
+            }
+            for (int l = 0; l < 32; l++) {
+                int vi = bi * 256 + g * 64 + 32 + l;
+                if (vi >= p.I) break;
+                uint bv = read_byte(rowBase, gqs + uint(l));
+                int val = int(bv >> 4u);
+                sum += x[xoff + vi] * (d2 * float(val) - m2);
+            }
+        }
+    }
+    y[uint(o) * uint(p.S) + uint(s)] = sum;
+}
+

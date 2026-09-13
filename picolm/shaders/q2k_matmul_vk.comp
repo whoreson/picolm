@@ -1,0 +1,79 @@
+#version 450
+// Q2_K scalar matmul: Y[s,o] = sum_i X[s,i] * dequant_W[o,i]
+// Grid: [ceil(O/16), S, 1], block: [16, 1, 1]
+
+layout(local_size_x = 16) in;
+
+layout(std430, binding = 0) readonly buffer X  { float x[]; };
+layout(std430, binding = 1) readonly buffer W  { uint  w[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform P {
+    int S, I, O;
+    int rowWords;
+} p;
+
+float f16tof32(uint h) {
+    uint s = (h >> 15u) & 1u;
+    uint e = (h >> 10u) & 31u;
+    uint m = h & 1023u;
+    if (e == 0u) {
+        if (m == 0u) return s != 0u ? -0.0 : 0.0;
+        float v = float(m) * 5.960464477539063e-8;
+        return s != 0u ? -v : v;
+    }
+    if (e == 31u) return s != 0u ? -1.0/0.0 : 1.0/0.0;
+    uint bits = (s << 31u) | ((e - 15u + 127u) << 23u) | (m << 13u);
+    return uintBitsToFloat(bits);
+}
+
+uint read_byte(uint rowBase, uint byteOff) {
+    uint wIdx = rowBase + byteOff / 4u;
+    return (w[wIdx] >> ((byteOff % 4u) * 8u)) & 0xffu;
+}
+
+void main() {
+    int o = int(gl_WorkGroupID.x) * 16 + int(gl_LocalInvocationID.x);
+    int s = int(gl_WorkGroupID.y);
+    if (o >= p.O || s >= p.S) return;
+
+    int xoff = s * p.I;
+    uint rowBase = uint(o) * uint(p.rowWords);
+    float sum = 0.0;
+    int nblocks = (p.I + 255) / 256;
+
+    for (int bi = 0; bi < nblocks; bi++) {
+        uint bo = uint(bi) * 84u;
+        float d = f16tof32(read_byte(rowBase, bo+80u) | (read_byte(rowBase, bo+81u) << 8u));
+        float dmin = f16tof32(read_byte(rowBase, bo+82u) | (read_byte(rowBase, bo+83u) << 8u));
+
+        for (int chunk = 0; chunk < 2; chunk++) {
+            int shift = 0;
+            uint qs1 = bo + 16u + uint(chunk * 32u);
+            uint qs2 = qs1 + 16u;
+            for (int j = 0; j < 4; j++) {
+                uint sc = read_byte(rowBase, bo + uint(chunk * 8 + j * 2));
+                float dl = d * float(sc & 0xFu);
+                float ml = dmin * float((sc >> 4) & 0xFu);
+                for (int l = 0; l < 16; l++) {
+                    int vi = bi * 256 + chunk * 128 + j * 32 + l;
+                    if (vi >= p.I) break;
+                    uint bv = read_byte(rowBase, qs1 + uint(l));
+                    sum += x[xoff + vi] * (dl * float((bv >> uint(shift)) & 3u) - ml);
+                }
+                sc = read_byte(rowBase, bo + uint(chunk * 8 + j * 2 + 1));
+                dl = d * float(sc & 0xFu);
+                ml = dmin * float((sc >> 4) & 0xFu);
+                for (int l = 0; l < 16; l++) {
+                    int vi = bi * 256 + chunk * 128 + j * 32 + 16 + l;
+                    if (vi >= p.I) break;
+                    uint bv = read_byte(rowBase, qs2 + uint(l));
+                    sum += x[xoff + vi] * (dl * float((bv >> uint(shift)) & 3u) - ml);
+                }
+                shift += 2;
+            }
+        }
+    }
+    y[uint(o) * uint(p.S) + uint(s)] = sum;
+}
+
