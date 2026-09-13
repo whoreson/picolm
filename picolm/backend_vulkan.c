@@ -151,6 +151,7 @@ static struct {
 
     // Dynamically loaded extension function pointers
     PFN_vkCmdPushDescriptorSetKHR vkCmdPushDescriptorSetKHR_fn;
+    int push_desc_supported;     // 0 when VK_KHR_push_descriptor unavailable
 
     // RMSNorm pipeline
     VkShaderModule shader_nrm;
@@ -204,6 +205,11 @@ static struct {
     VkDescriptorPool dpool_q8q8;
     VkDescriptorSet dset_q8q8;
     VkDescriptorSet dset_q8q8_ring[256];
+
+    // Batch descriptor pool for push_desc ring-buffer fallback (no push descriptors)
+    VkDescriptorPool dpool_batch;
+    VkDescriptorSet dset_batch_ring[2048];
+    uint32_t dset_batch_idx;
 
     // F16 pack: shares elementwise resources (shader, pipeline, dpool, dset)
     VkShaderModule shader_f16pack;
@@ -439,8 +445,18 @@ static int alloc_device_local(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem) 
         .allocationSize = req.size, .memoryTypeIndex = G.memtype_local};
     VkResult r = vkAllocateMemory(G.dev, &ai, NULL, mem);
     if (r != VK_SUCCESS) {
-        fprintf(stderr, "[VK] alloc_device_local FAILED: bytes=%zu req.size=%zu memtype=%u error=%d\n",
-                bytes, (size_t)req.size, G.memtype_local, (int)r);
+        // Fallback: try any other DEVICE_LOCAL memory type
+        for (uint32_t i = 0; i < G.mem_props.memoryTypeCount; i++) {
+            if (!(req.memoryTypeBits & (1u << i))) continue;
+            if (G.mem_props.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) {
+                ai.memoryTypeIndex = i;
+                if ((r = vkAllocateMemory(G.dev, &ai, NULL, mem)) == VK_SUCCESS) break;
+            }
+        }
+    }
+    if (r != VK_SUCCESS) {
+        fprintf(stderr, "[VK] alloc_device_local FAILED: bytes=%zu req.size=%zu error=%d\n",
+                bytes, (size_t)req.size, (int)r);
         vkDestroyBuffer(G.dev, *buf, NULL); *buf = VK_NULL_HANDLE;
         return 0;
     }
@@ -458,7 +474,18 @@ static int alloc_hostvis_mt(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem,
     vkGetBufferMemoryRequirements(G.dev, *buf, &req);
     VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
         .allocationSize = req.size, .memoryTypeIndex = memtype};
-    VKCHECK(vkAllocateMemory(G.dev, &ai, NULL, mem), "vkAllocateMemory");
+    VkDeviceMemory hv_mem = VK_NULL_HANDLE;
+    if (vkAllocateMemory(G.dev, &ai, NULL, &hv_mem) != VK_SUCCESS) {
+        for (uint32_t i = 0; i < G.mem_props.memoryTypeCount; i++) {
+            if (!(req.memoryTypeBits & (1u << i))) continue;
+            if (G.mem_props.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
+                ai.memoryTypeIndex = i;
+                if (vkAllocateMemory(G.dev, &ai, NULL, &hv_mem) == VK_SUCCESS) break;
+            }
+        }
+    }
+    if (!hv_mem) { vkDestroyBuffer(G.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0; }
+    *mem = hv_mem;
     VKCHECK(vkBindBufferMemory(G.dev, *buf, *mem, 0), "vkBindBufferMemory");
     if (ptr) {
         VKCHECK(vkMapMemory(G.dev, *mem, 0, bytes, 0, ptr), "vkMapMemory");
@@ -476,7 +503,18 @@ static int alloc_hostvis_mt2(size_t bytes, VkBuffer *buf, VkDeviceMemory *mem,
     vkGetBufferMemoryRequirements(G.dev, *buf, &req);
     VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
         .allocationSize = req.size, .memoryTypeIndex = memtype};
-    VKCHECK(vkAllocateMemory(G.dev, &ai, NULL, mem), "vkAllocateMemory(hv2)");
+    VkDeviceMemory hv2_mem = VK_NULL_HANDLE;
+    if (vkAllocateMemory(G.dev, &ai, NULL, &hv2_mem) != VK_SUCCESS) {
+        for (uint32_t i = 0; i < G.mem_props.memoryTypeCount; i++) {
+            if (!(req.memoryTypeBits & (1u << i))) continue;
+            if (G.mem_props.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
+                ai.memoryTypeIndex = i;
+                if (vkAllocateMemory(G.dev, &ai, NULL, &hv2_mem) == VK_SUCCESS) break;
+            }
+        }
+    }
+    if (!hv2_mem) { vkDestroyBuffer(G.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0; }
+    *mem = hv2_mem;
     VKCHECK(vkBindBufferMemory(G.dev, *buf, *mem, 0), "vkBindBufferMemory(hv2)");
     if (ptr) {
         VKCHECK(vkMapMemory(G.dev, *mem, 0, bytes, 0, ptr), "vkMapMemory(hv2)");
@@ -687,19 +725,32 @@ static void wr_desc(VkDescriptorSet set, int n, const VkDescriptorBufferInfo *bi
 // Push descriptors directly into the command buffer. Snapshotted at record
 // time, so multiple dispatches in the same command buffer see different
 // descriptors without needing separate descriptor sets or ring buffers.
-// This replaces the wr_desc + vkCmdBindDescriptorSets pattern for the
-// device-native batched path (cmd_dev).
+// Falls back to ring-buffer descriptors when push descriptors unavailable (WDDM).
 static void push_desc(VkCommandBuffer cmd, int n, const VkDescriptorBufferInfo *bi) {
-    VkWriteDescriptorSet w[8];
-    for (int i = 0; i < n; i++) w[i] = (VkWriteDescriptorSet){
-        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = VK_NULL_HANDLE,
-        .dstBinding = (uint32_t)i, .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i]};
-    G.vkCmdPushDescriptorSetKHR_fn(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                   G.plyt_unified, 0, (uint32_t)n, w);
+    if (G.push_desc_supported && G.vkCmdPushDescriptorSetKHR_fn) {
+        VkWriteDescriptorSet w[8];
+        for (int i = 0; i < n; i++) w[i] = (VkWriteDescriptorSet){
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = VK_NULL_HANDLE,
+            .dstBinding = (uint32_t)i, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i]};
+        G.vkCmdPushDescriptorSetKHR_fn(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                       G.plyt_unified, 0, (uint32_t)n, w);
+    } else {
+        int idx = G.dset_batch_idx % 2048;
+        VkDescriptorSet set = G.dset_batch_ring[idx];
+        VkWriteDescriptorSet w[8];
+        for (int i = 0; i < n; i++) w[i] = (VkWriteDescriptorSet){
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set,
+            .dstBinding = (uint32_t)i, .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i]};
+        vkUpdateDescriptorSets(G.dev, (uint32_t)n, w, 0, NULL);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, G.plyt_unified, 0, 1, &set, 0, NULL);
+        G.dset_batch_idx++;
+    }
 }
 
 static void push_desc_8(VkCommandBuffer cmd, int n, const VkDescriptorBufferInfo *bi) {
+    if (!G.push_desc_supported) return;
     VkWriteDescriptorSet w[8];
     for (int i = 0; i < n; i++) w[i] = (VkWriteDescriptorSet){
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = VK_NULL_HANDLE,
@@ -710,6 +761,7 @@ static void push_desc_8(VkCommandBuffer cmd, int n, const VkDescriptorBufferInfo
 }
 
 static void push_desc_6(VkCommandBuffer cmd, int n, const VkDescriptorBufferInfo *bi) {
+    if (!G.push_desc_supported) return;
     VkWriteDescriptorSet w[6];
     for (int i = 0; i < n; i++) w[i] = (VkWriteDescriptorSet){
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = VK_NULL_HANDLE,
@@ -773,22 +825,36 @@ int picolm_gpu_init(const int *devices, int count) {
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
         .queueFamilyIndex = G.qfam, .queueCount = 1, .pQueuePriorities = &prio};
-    // Enable VK_KHR_push_descriptor for vkCmdPushDescriptorSetKHR -- allows
-    // descriptor contents to be snapshotted at command recording time rather
-    // than execute time, eliminating the need for ring buffers.
+    // Try VK_KHR_push_descriptor first. On WDDM (Windows AMD drivers), this
+    // extension is not available, so we fall back to ring-buffer descriptors.
     const char *dev_exts[] = { VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME };
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi,
         .enabledExtensionCount = 1, .ppEnabledExtensionNames = dev_exts};
-    VKCHECK(vkCreateDevice(G.phys, &di, NULL, &G.dev), "vkCreateDevice");
+    VkResult r = vkCreateDevice(G.phys, &di, NULL, &G.dev);
+    if (r != VK_SUCCESS) {
+        fprintf(stderr, "[VK] push descriptors not supported (err=%d), retrying without\n", (int)r);
+        di.enabledExtensionCount = 0;
+        di.ppEnabledExtensionNames = NULL;
+        r = vkCreateDevice(G.phys, &di, NULL, &G.dev);
+        if (r != VK_SUCCESS) {
+            fprintf(stderr, "[VK] vkCreateDevice failed: %s (%d)\n", vk_result_str(r), (int)r);
+            return 0;
+        }
+        G.push_desc_supported = 0;
+        fprintf(stderr, "[VK] NOTE: batched GPU dispatch requires push descriptors.\n");
+        fprintf(stderr, "[VK] On WDDM (Windows) without push descriptors, GPU inference\n");
+        fprintf(stderr, "[VK] will be catastrophically slow due to per-dispatch context switches.\n");
+        fprintf(stderr, "[VK] Falling back to ring buffers -- expect severe slowdown on large models.\n");
+    } else {
+        G.push_desc_supported = 1;
+    }
     vkGetDeviceQueue(G.dev, G.qfam, 0, &G.queue);
 
     // Load VK_KHR_push_descriptor functions dynamically
-    G.vkCmdPushDescriptorSetKHR_fn = (PFN_vkCmdPushDescriptorSetKHR)
-        vkGetDeviceProcAddr(G.dev, "vkCmdPushDescriptorSetKHR");
-    if (!G.vkCmdPushDescriptorSetKHR_fn) {
-        fprintf(stderr, "[VK] vkCmdPushDescriptorSetKHR not available\n");
-        return 0;
+    if (G.push_desc_supported) {
+        G.vkCmdPushDescriptorSetKHR_fn = (PFN_vkCmdPushDescriptorSetKHR)
+            vkGetDeviceProcAddr(G.dev, "vkCmdPushDescriptorSetKHR");
     }
 
     // Print device limits for debugging
@@ -914,7 +980,7 @@ int picolm_gpu_init(const int *devices, int count) {
             .binding = (uint32_t)i, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
             .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT};
         VkDescriptorSetLayoutCreateInfo dsli = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-            .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+            .flags = G.push_desc_supported ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0,
             .bindingCount = 4, .pBindings = b};
         VKCHECK(vkCreateDescriptorSetLayout(G.dev, &dsli, NULL, &G.dsl_unified), "unifiedDSL");
         VkPushConstantRange pcr = {.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = 48};
@@ -936,7 +1002,7 @@ int picolm_gpu_init(const int *devices, int count) {
           b[_bi].pImmutableSamplers = NULL;
       }
       VkDescriptorSetLayoutCreateInfo dsli = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-          .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+          .flags = G.push_desc_supported ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0,
           .bindingCount = 8, .pBindings = b};
       VkResult dsli_r = vkCreateDescriptorSetLayout(G.dev, &dsli, NULL, &G.dsl_qkv);
       VkPushConstantRange pcr = {.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = 48};
@@ -984,7 +1050,7 @@ int picolm_gpu_init(const int *devices, int count) {
           .binding = i, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
           .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT };
       VkDescriptorSetLayoutCreateInfo dsli = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-          .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+          .flags = G.push_desc_supported ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0,
           .bindingCount = 6, .pBindings = b};
       VkResult dsli_r = vkCreateDescriptorSetLayout(G.dev, &dsli, NULL, &G.dsl_gu);
       VkPushConstantRange pcr = {.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = 48};
@@ -1178,6 +1244,23 @@ int picolm_gpu_init(const int *devices, int count) {
         }
     }
 
+    // Batch descriptor pool for push_desc ring-buffer fallback
+    { VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 2048 * 4};
+      VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 2048, .poolSizeCount = 1, .pPoolSizes = &ps};
+      VKCHECK(vkCreateDescriptorPool(G.dev, &dpi, NULL, &G.dpool_batch), "batch_ring_pool");
+      for (int _si = 0; _si < 2048; _si++) {
+        VkDescriptorSetAllocateInfo dsa = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+          .descriptorPool = G.dpool_batch, .descriptorSetCount = 1, .pSetLayouts = &G.dsl_unified};
+        VkResult ar = vkAllocateDescriptorSets(G.dev, &dsa, &G.dset_batch_ring[_si]);
+        if (ar != VK_SUCCESS) {
+          fprintf(stderr, "[VK] batch_ring alloc[%d] failed\n", _si);
+          break;
+        }
+      }
+      G.dset_batch_idx = 0;
+    }
+
     G.ready = 1;
 
     init_fail:
@@ -1247,6 +1330,7 @@ void picolm_gpu_shutdown(void) {
         vkFreeDescriptorSets(G.dev, G.dpool_elem_ring, 1, &G.dset_elem_ring[_i]);
     if (G.dpool_elem) vkDestroyDescriptorPool(G.dev, G.dpool_elem, NULL);
     if (G.dpool_elem_ring) vkDestroyDescriptorPool(G.dev, G.dpool_elem_ring, NULL);
+    if (G.dpool_batch) vkDestroyDescriptorPool(G.dev, G.dpool_batch, NULL);
     if (G.pipe_elem)  vkDestroyPipeline(G.dev, G.pipe_elem, NULL);
     if (G.shader_elem) vkDestroyShaderModule(G.dev, G.shader_elem, NULL);
 
@@ -1361,6 +1445,7 @@ void picolm_gpu_shutdown(void) {
 }
 
 int picolm_gpu_device_count(void) { return G.ready ? G.device_count : 0; }
+int picolm_gpu_has_push_descriptors(void) { return G.ready ? G.push_desc_supported : 0; }
 
 int picolm_gpu_device_at(int index) {
     if (index < 0 || index >= G.device_count) return -1;
@@ -1772,10 +1857,10 @@ void *picolm_gpu_upload_int(const int *host, size_t n, int device) {
 
 static int staging_ensure(size_t bytes) {
     if (G.staging_cap >= bytes) return 1;
+    // Destroy in reverse order: unmap, free mem, destroy buf
     if (G.staging_ptr) vkUnmapMemory(G.dev, G.staging_mem);
-    if (G.staging_buf) vkDestroyBuffer(G.dev, G.staging_buf, NULL);
-    if (G.staging_mem) vkFreeMemory(G.dev, G.staging_mem, NULL);
-    G.staging_buf = VK_NULL_HANDLE; G.staging_mem = VK_NULL_HANDLE;
+    if (G.staging_mem) { vkFreeMemory(G.dev, G.staging_mem, NULL); G.staging_mem = VK_NULL_HANDLE; }
+    if (G.staging_buf) { vkDestroyBuffer(G.dev, G.staging_buf, NULL); G.staging_buf = VK_NULL_HANDLE; }
     G.staging_ptr = NULL; G.staging_cap = 0;
 
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -1788,10 +1873,11 @@ static int staging_ensure(size_t bytes) {
     VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
         .allocationSize = req.size, .memoryTypeIndex = G.memtype_staging};
     if (vkAllocateMemory(G.dev, &ai, NULL, &G.staging_mem) != VK_SUCCESS) {
-        vkDestroyBuffer(G.dev, G.staging_buf, NULL); return 0;
+        vkDestroyBuffer(G.dev, G.staging_buf, NULL); G.staging_buf = VK_NULL_HANDLE; return 0;
     }
     vkBindBufferMemory(G.dev, G.staging_buf, G.staging_mem, 0);
-    vkMapMemory(G.dev, G.staging_mem, 0, VK_WHOLE_SIZE, 0, &G.staging_ptr);
+    VkResult mr = vkMapMemory(G.dev, G.staging_mem, 0, VK_WHOLE_SIZE, 0, &G.staging_ptr);
+    if (mr != VK_SUCCESS) { vkFreeMemory(G.dev, G.staging_mem, NULL); vkDestroyBuffer(G.dev, G.staging_buf, NULL); G.staging_mem = VK_NULL_HANDLE; G.staging_buf = VK_NULL_HANDLE; return 0; }
     G.staging_cap = bytes;
     return 1;
 }
@@ -2194,11 +2280,12 @@ int picolm_gpu_pipeline_logits_alloc(size_t bytes, int device) {
     if (!G.ready || device != 0 || bytes < 1) return 0;
     if (G.pipe_logits_d) return 1; /* already allocated */
     VkBuffer buf; VkDeviceMemory mem;
-    if (!alloc_device_local(bytes, &buf, &mem)) return 0;
+    void *ptr = NULL;
+    /* Must use HOST_VISIBLE memory for mapped readback */
+    if (!alloc_hostvis(bytes, &buf, &mem, &ptr)) return 0;
     G.pipe_logits_buf = buf; G.pipe_logits_m = mem;
     G.pipe_logits_d = wrap_buf(buf, mem, 0, bytes);
-    /* Map logits buffer for direct CPU readback (HOST_VISIBLE on KAVERI) */
-    vkMapMemory(G.dev, mem, 0, bytes, 0, &G.pipe_logits_mapped);
+    G.pipe_logits_mapped = ptr;
     return G.pipe_logits_d ? 1 : 0;
 }
 

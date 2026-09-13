@@ -4181,12 +4181,19 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
      * All layer dispatches (RMSNorm, matmul, KV store, attention, elementwise)
      * accumulate into a single command buffer. One submit + fence at the end.
      * This eliminates ~3700 per-dispatch vkCmd round-trips on RADV. */
+    // Without push descriptors (WDDM), flush every layer to avoid TDR timeout
+    extern int picolm_gpu_has_push_descriptors(void);
+    int batch_flush_interval = picolm_gpu_has_push_descriptors() ? c->n_layers : 1;
     picolm_gpu_batch_begin(gpu_dev);
 
     int this_attn_ordinal = 0;
 
     /* 2. Per-layer pipeline */
     for (int l = 0; l < c->n_layers; l++) {
+        if (l > 0 && (l % batch_flush_interval) == 0) {
+            picolm_gpu_batch_end(gpu_dev);
+            picolm_gpu_batch_begin(gpu_dev);
+        }
         layer_weights_t *lw = &w->layers[l];
         gl = &gw->layers[l];
         int did_cpu_ssm = 0;
@@ -4480,7 +4487,14 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
     extern int picolm_gpu_batch_begin(int device);
     extern int picolm_gpu_batch_end(int device);
     extern void picolm_gpu_ts_write(const char *label);
-    picolm_gpu_batch_begin(gpu_dev);    for (int l = 0; l < c->n_layers; l++) {
+    // Without push descriptors (WDDM), flush every 8 layers to balance TDR risk vs overhead
+    int batch_flush_interval = picolm_gpu_has_push_descriptors() ? c->n_layers : 8;
+    picolm_gpu_batch_begin(gpu_dev);
+    for (int l = 0; l < c->n_layers; l++) {
+        if (l > 0 && (l % batch_flush_interval) == 0) {
+            picolm_gpu_batch_end(gpu_dev);
+            picolm_gpu_batch_begin(gpu_dev);
+        }
         if (interrupt && *interrupt) return -1;
         { char _ts_label[64]; snprintf(_ts_label, 64, "LAYER_%d_START", l); picolm_gpu_ts_write(_ts_label); }
 

@@ -29,6 +29,9 @@ int picolm_gpu_device_count(void);
 /* Get the GPU ordinal at index. Returns -1 on invalid index. */
 int picolm_gpu_device_at(int index);
 
+/* Returns 1 if push descriptors are available, 0 otherwise. */
+int picolm_gpu_has_push_descriptors(void);
+
 /* Memory info for a device. Returns 1 on success. */
 int picolm_gpu_mem_info(int device, size_t *free_bytes, size_t *total_bytes);
 
