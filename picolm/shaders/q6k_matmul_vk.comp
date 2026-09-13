@@ -2,6 +2,8 @@
 // Q6_K scalar matmul: 256 weights, 210 bytes
 // Layout: [ql:128][qh:64][scales:16][d:F16]
 // Grid: [ceil(O/16), S, 1], block: [16, 1, 1]
+// TODO: Broken on WDDM (Vulkan 1.2, no push descriptors). Works on Linux KAVERI.
+// Same push_desc fallback path used by working Q3_K shader. Root cause unknown.
 
 layout(local_size_x = 16) in;
 
@@ -83,6 +85,6 @@ void main() {
             }
         }
     }
-    y[uint(o) * uint(p.S) + uint(s)] = sum;
+    y[uint(s) * uint(p.O) + uint(o)] = sum;
 }
 

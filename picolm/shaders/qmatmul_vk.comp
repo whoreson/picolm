@@ -134,6 +134,8 @@ void main() {
         }
     }
     // ---- Q8_0 (fmt==8): 32 weights, 34 bytes = [d:F16][qs:32xI8] ----
+    // WDDM (Vulkan 1.2) driver bug: int(bv) cast + conditional subtract
+    // produces wrong results. Use bit-shift sign extension instead.
     else if (p.fmt == 8) {
         int nblocks = (p.I + 31) / 32;
         for (int bi = 0; bi < nblocks; bi++) {
@@ -143,8 +145,32 @@ void main() {
                 int vi = bi * 32 + v;
                 if (vi >= p.I) break;
                 uint bv = read_byte(rowBase, bo + 2u + uint(v));
-                int val = int(bv); if (val >= 128) val -= 256;
+                int val = int(bv << 24u); val = val >> 24;
                 sum += x[xoff + vi] * float(val) * d;
+            }
+        }
+    }
+    // ---- Q5_1 (fmt==7): 32 weights, 24 bytes = [d:F16][m:F16][qh:4xU8][qs:16xU8] ----
+    else if (p.fmt == 7) {
+        int nblocks = (p.I + 31) / 32;
+        for (int bi = 0; bi < nblocks; bi++) {
+            uint bo = uint(bi) * 24u;
+            float d = f16tof32(read_byte(rowBase, bo) | (read_byte(rowBase, bo+1u) << 8u));
+            float m = f16tof32(read_byte(rowBase, bo+2u) | (read_byte(rowBase, bo+3u) << 8u));
+            uint qh_val = read_byte(rowBase, bo+4u)
+                        | (read_byte(rowBase, bo+5u) << 8u)
+                        | (read_byte(rowBase, bo+6u) << 16u)
+                        | (read_byte(rowBase, bo+7u) << 24u);
+            uint qs_bo = bo + 8u;
+            for (int j = 0; j < 32; j++) {
+                int vi = bi * 32 + j;
+                if (vi >= p.I) break;
+                uint byte_idx = uint(j) < 16u ? uint(j) : uint(j - 16);
+                uint bv = read_byte(rowBase, qs_bo + byte_idx);
+                uint nibble = uint(j) < 16u ? (bv & 0x0fu) : ((bv >> 4u) & 0x0fu);
+                uint hbit = (qh_val >> uint(j)) & 1u;
+                uint val = nibble | (hbit << 4u);
+                sum += x[xoff + vi] * (d * float(int(val)) + m);
             }
         }
     }
@@ -185,6 +211,8 @@ void main() {
     }
     // ---- Q5_K (fmt==13): 256 weights, 176 bytes
     //   Layout: [d:F16][dm:F16][scales:12xU8][qh:32xU8][qs:128xU8]
+    //   qh is a single 32-byte block; each qh[l] byte holds 4 pairs of hbits
+    //   for the 4 groups (bits 0,1 = group 0; bits 2,3 = group 1; etc.)
     else if (p.fmt == 13) {
         int nblocks = (p.I + 255) / 256;
         for (int bi = 0; bi < nblocks; bi++) {
@@ -192,7 +220,7 @@ void main() {
             float d = f16tof32(read_byte(rowBase, bo) | (read_byte(rowBase, bo+1u) << 8u));
             float dmin = f16tof32(read_byte(rowBase, bo+2u) | (read_byte(rowBase, bo+3u) << 8u));
             uint sc_bo = bo + 4u;
-            uint qh_bo = bo + 16u;
+            uint qh_bo = bo + 16u;   // 32 bytes total, shared across all groups
             uint qs_bo = bo + 48u;
             for (int g = 0; g < 4; g++) {
                 uint sm1 = get_scale_min_k4(rowBase, sc_bo, g * 2);
@@ -201,24 +229,26 @@ void main() {
                 uint sm2 = get_scale_min_k4(rowBase, sc_bo, g * 2 + 1);
                 float d2 = d * float(sm2 & 0xffu);
                 float m2 = dmin * float((sm2 >> 8u) & 0xffu);
-                uint gqh = qh_bo + uint(g) * 8u;
                 uint gqs = qs_bo + uint(g) * 32u;
+                uint hibit = uint(g) * 2u;  // bit position within qh[l]
                 for (int l = 0; l < 32; l++) {
                     int vi = bi * 256 + g * 64 + l;
                     if (vi >= p.I) break;
                     uint bv = read_byte(rowBase, gqs + uint(l));
-                    uint val = (bv & 0x0fu) << 1u;
-                    uint qhb = read_byte(rowBase, gqh + uint(l / 4u));
-                    val |= (qhb >> uint((l % 4u) * 2u)) & 1u;
+                    uint nibble = bv & 0x0fu;
+                    uint qhb = read_byte(rowBase, qh_bo + uint(l));
+                    uint hbit = (qhb >> hibit) & 1u;
+                    uint val = nibble | (hbit << 4u);
                     sum += x[xoff + vi] * (d1 * float(int(val)) - m1);
                 }
                 for (int l = 0; l < 32; l++) {
                     int vi = bi * 256 + g * 64 + 32 + l;
                     if (vi >= p.I) break;
                     uint bv = read_byte(rowBase, gqs + uint(l));
-                    uint val = (bv >> 4u) << 1u;
-                    uint qhb = read_byte(rowBase, gqh + uint(l / 4u));
-                    val |= (qhb >> uint((l % 4u) * 2u + 1u)) & 1u;
+                    uint nibble = (bv >> 4u) & 0x0fu;
+                    uint qhb = read_byte(rowBase, qh_bo + uint(l));
+                    uint hbit = (qhb >> (hibit + 1u)) & 1u;
+                    uint val = nibble | (hbit << 4u);
                     sum += x[xoff + vi] * (d2 * float(int(val)) - m2);
                 }
             }

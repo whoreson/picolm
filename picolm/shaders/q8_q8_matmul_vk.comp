@@ -54,12 +54,10 @@ void main() {
             uint wbyte_off = rowBase + (bo + 2u + uint(v)) / 4u;
             uint wshift = ((bo + 2u + uint(v)) % 4u) * 8u;
             uint wbyte = (w[wbyte_off] >> wshift) & 0xffu;
-            int wval = int(wbyte);
-            if (wval >= 128) wval -= 256;
+            int wval = int(wbyte << 24u); wval = wval >> 24;
             uint ab_idx = aqs_base + uint(v) / 4u;
             uint abyte = (xq[ab_idx] >> ((uint(v) % 4u) * 8u)) & 0xffu;
-            int aval = int(abyte);
-            if (aval >= 128) aval -= 256;
+            int aval = int(abyte << 24u); aval = aval >> 24;
             sum += float(wval) * float(aval) * scale;
         }
     }

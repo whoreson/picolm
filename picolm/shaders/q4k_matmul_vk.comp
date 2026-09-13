@@ -87,6 +87,6 @@ void main() {
             }
         }
     }
-    y[uint(o) * uint(p.S) + uint(s)] = sum;
+    y[uint(s) * uint(p.O) + uint(o)] = sum;
 }
 
