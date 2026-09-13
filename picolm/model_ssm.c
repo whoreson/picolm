@@ -4174,6 +4174,15 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
     /* KV cache store is now fully device-native (picolm_gpu_kv_store_dev),
      * no host scratch buffer needed. */
 
+    /* Sync any pending H2D transfers (embedding upload) before starting batch */
+    picolm_gpu_sync(gpu_dev);
+
+    /* Begin batched command buffer recording.
+     * All layer dispatches (RMSNorm, matmul, KV store, attention, elementwise)
+     * accumulate into a single command buffer. One submit + fence at the end.
+     * This eliminates ~3700 per-dispatch vkCmd round-trips on RADV. */
+    picolm_gpu_batch_begin(gpu_dev);
+
     int this_attn_ordinal = 0;
 
     /* 2. Per-layer pipeline */
@@ -4286,7 +4295,8 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
              * `l` instead. */
             /* H. Attention decode: pipe_attn_out = attn(pipe_q)
              * GPU decode attention is disabled on Vulkan (returns 0).
-             * Fall back to CPU-only decode by returning NULL. */            if (!picolm_gpu_attention_decode_dev(pipe_attn_out, pipe_q,
+             * Fall back to CPU-only decode by returning NULL. */
+            if (!picolm_gpu_attention_decode_dev(pipe_attn_out, pipe_q,
                                                   this_attn_ordinal - 1, pos,
                                                   n_heads, n_kv_heads, head_dim,
                                                   seq_len, gpu_dev)) {
@@ -4387,6 +4397,10 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
         } /* end if (!did_cpu_ssm) */
     }
 
+    /* End batched recording: submit all layer dispatches as one command buffer,
+     * then fence-wait. This is where the GPU actually executes everything. */
+    picolm_gpu_batch_end(gpu_dev);
+
     /* 3. Final RMSNorm: pipe_x = rmsnorm(pipe_x, output_norm_w) */
     picolm_gpu_rmsnorm_dev(pipe_x, pipe_x,
                             (float *)gw->output_norm_dev,
@@ -4400,11 +4414,18 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
                                          float *logits_dev, const float *x_dev,
                                          int device);
     float *pipe_logits = picolm_gpu_pipe_logits(gpu_dev);
-    if (pipe_logits && picolm_gpu_matmul_logits((picolm_gpu_tensor_t *)gw->output,
-                                                  pipe_logits, pipe_x, gpu_dev)) {
+    int logits_ok = 0;
+    if (pipe_logits) {
+        logits_ok = picolm_gpu_matmul_logits((picolm_gpu_tensor_t *)gw->output,
+                                                  pipe_logits, pipe_x, gpu_dev);
+    }
+    if (logits_ok) {
         /* D2H only the logits */
         size_t logits_bytes = (size_t)c->vocab_size * sizeof(float);
-        picolm_gpu_memcpy(s->logits, pipe_logits, logits_bytes, -1, gpu_dev);
+        extern int picolm_gpu_logits_d2h_mapped(float *dst, size_t bytes, int device);
+        if (!picolm_gpu_logits_d2h_mapped(s->logits, logits_bytes, gpu_dev)) {
+            picolm_gpu_memcpy(s->logits, pipe_logits, logits_bytes, -1, gpu_dev);
+        }
     } else {
         /* Fallback: D2H hidden, CPU matmul */
         picolm_gpu_memcpy(s->x, pipe_x, dim * sizeof(float), -1, gpu_dev);
@@ -4935,10 +4956,6 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
     matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
     tensor_set_repacked(NULL);
     tensor_set_gpu_tensor(NULL, 0);
-
-    /* Diagnostic: dump KV cache from device after GPU prefill */
-
-    /* Diagnostic: dump GPU prefill logits top-5 */
 
     /* Note: SSM state sync is no longer needed here. During GPU prefill,
      * ssm_prefill_layer_gpu updates ssm_state_dev directly. The CPU

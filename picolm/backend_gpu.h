@@ -622,6 +622,13 @@ int picolm_gpu_gelu_mul_dev(float *gate_dev, const float *up_dev,
  * own sync. */
 int picolm_gpu_sync(int device);
 
+/* Batched command buffer recording.
+ * All _dev dispatches between begin/end accumulate into a single command
+ * buffer. One submit + fence wait at the end. Eliminates per-dispatch
+ * host<->GPU round-trips. Must be balanced (begin==end). */
+int picolm_gpu_batch_begin(int device);
+int picolm_gpu_batch_end(int device);
+
 /* Free a GPU tensor (device memory + host handle). */
 void picolm_gpu_tensor_free(picolm_gpu_tensor_t *tensor);
 
