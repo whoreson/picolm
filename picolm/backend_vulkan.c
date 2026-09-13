@@ -1488,10 +1488,19 @@ int picolm_gpu_tensor_upload(void **tensor, const void *weights,
     size_t rb = gguf_row_bytes(qtype, I);
     if (rb == 0) { fprintf(stderr, "[VK] upload: rb=0 for qtype=%d I=%d\n", qtype, I); return 0; }
 
-    int rw = gguf_row_words(qtype, I);
+    // Q8_0: repack 34 bytes/block -> 36 bytes/block for word alignment.
+    // The WDDM driver (Vulkan 1.2) has a shader compiler bug that fails
+    // on the non-uniform byte-straddling pattern of 34-byte blocks.
+    // 36 bytes per block ensures each block starts at a 4-byte boundary.
+    size_t padded_rb = rb;
+    if (qtype == GGUF_TYPE_Q8_0) {
+        int nblocks = (I + 31) / 32;
+        padded_rb = (size_t)nblocks * 36;
+    }
+    int rw = (padded_rb + 3) / 4;
     size_t gpu_stride = (size_t)rw * 4;
     size_t total = gpu_stride * (size_t)O;
-    
+
     void *wptr;
     VkBuffer wbuf;
     if (!arena_suballoc(total, &wbuf, &wptr)) {
@@ -1499,15 +1508,26 @@ int picolm_gpu_tensor_upload(void **tensor, const void *weights,
     }
 
     for (int o = 0; o < O; o++) {
-        memcpy((uint8_t *)wptr + (size_t)o * gpu_stride,
-               (const uint8_t *)weights + (size_t)o * rb, rb);
+        uint8_t *dst = (uint8_t *)wptr + (size_t)o * gpu_stride;
+        const uint8_t *src = (const uint8_t *)weights + (size_t)o * rb;
+        if (qtype == GGUF_TYPE_Q8_0) {
+            // Repack: 34 -> 36 bytes per block (2 padding bytes)
+            int nblocks = (I + 31) / 32;
+            for (int bi = 0; bi < nblocks; bi++) {
+                memcpy(dst + bi * 36, src + bi * 34, 34);
+                dst[bi * 36 + 34] = 0;
+                dst[bi * 36 + 35] = 0;
+            }
+        } else {
+            memcpy(dst, src, rb);
+        }
     }
 
     picolm_gpu_tensor_t *t = calloc(1, sizeof(*t));
     if (!t) { vkDestroyBuffer(G.dev, wbuf, NULL); return 0; }
     t->wbuf = wbuf; t->wmem = VK_NULL_HANDLE;
     t->qtype = qtype; t->I = I; t->O = O; t->device = device;
-    t->row_bytes = rb; t->row_words = (size_t)rw; t->wbytes = total;
+    t->row_bytes = padded_rb; t->row_words = (size_t)rw; t->wbytes = total;
 
     G.used_bytes += total;
     *slot = t;
@@ -2498,9 +2518,9 @@ int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_d
             VkDescriptorBufferInfo bi[3] = {xbi, {t->wbuf,0,VK_WHOLE_SIZE}, ybi};
             VK_BATCH_BIND(G.pipe);
             push_desc(G.cmd_dev, 3, bi);
-            PC_Matmul pc = {t->qtype, S, t->I, t->O, (int)t->row_words, x_stride, y_stride};
+            int pc_raw[7] = {t->qtype, S, t->I, t->O, (int)t->row_words, x_stride, y_stride};
             vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
-                               0, sizeof(pc), &pc);
+                               0, sizeof(pc_raw), pc_raw);
             vkCmdDispatch(G.cmd_dev, (uint32_t)((t->O + 15) / 16), (uint32_t)S, 1);
             _g_dispatch_cnt++;
             ok = 1;

@@ -40,8 +40,9 @@ void main() {
     int xd_base = s * nblocks;
     float sum = 0.0;
 
+    // Q8_0 weights padded to 36 bytes/block during upload (word-aligned)
     for (int bi = 0; bi < nblocks; bi++) {
-        uint bo = uint(bi) * 34u;
+        uint bo = uint(bi) * 36u;
         uint dWord = rowBase + bo / 4u;
         uint dShift = (bo % 4u) * 8u;
         float wd = f16tof32((w[dWord] >> dShift) & 0xffffu);

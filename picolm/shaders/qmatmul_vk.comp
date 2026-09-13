@@ -134,19 +134,21 @@ void main() {
         }
     }
     // ---- Q8_0 (fmt==8): 32 weights, 34 bytes = [d:F16][qs:32xI8] ----
-    // WDDM (Vulkan 1.2) driver bug: int(bv) cast + conditional subtract
-    // produces wrong results. Use bit-shift sign extension instead.
+    // Q8_0 (fmt==8): 32 weights, 36 bytes/block = [d:F16][qs:32xI8][pad:2xU8]
+    // Padded from 34 to 36 bytes/block during upload for word alignment.
+    // WDDM (Vulkan 1.2) driver bug with sign extension: avoid >> 24.
+    // Use formula: val = bv - ((bv >> 7) * 256) which is equivalent to sign-extending.
     else if (p.fmt == 8) {
         int nblocks = (p.I + 31) / 32;
         for (int bi = 0; bi < nblocks; bi++) {
-            uint bo = uint(bi) * 34u;
+            uint bo = uint(bi) * 36u;
             float d = f16tof32(read_byte(rowBase, bo) | (read_byte(rowBase, bo+1u) << 8u));
             for (int v = 0; v < 32; v++) {
                 int vi = bi * 32 + v;
                 if (vi >= p.I) break;
                 uint bv = read_byte(rowBase, bo + 2u + uint(v));
-                int val = int(bv << 24u); val = val >> 24;
-                sum += x[xoff + vi] * float(val) * d;
+                float val = float(bv) - float(bv >> 7u) * 256.0f;
+                sum += x[xoff + vi] * val * d;
             }
         }
     }
