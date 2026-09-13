@@ -355,7 +355,10 @@ static VkResult vk_fence_wait(VkDevice dev, VkFence f) {
             if (r != VK_NOT_READY) return r;
         } while ((vk_now() - t0) * 1000.0 < (double)g_vk_spin_us);
     }
-    return vkWaitForFences(dev, 1, &f, VK_TRUE, 10000000000ULL);
+    // 20s timeout. llvmpipe can be extremely slow for large dispatches.
+    // TODO: Make timeout adaptive or per-backend. A slow weight upload
+    // can cause fence timeouts here, which currently disables GPU entirely.
+    return vkWaitForFences(dev, 1, &f, VK_TRUE, 20000000000ULL);
 }
 
 static VkResult vk_fence_wait_timeout(VkDevice dev, VkFence f, uint64_t timeout_ns) {
