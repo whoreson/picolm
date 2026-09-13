@@ -843,74 +843,118 @@ static float *server_model_prefill(model_t *model, const int *tokens,
     return model_forward_prefill(model, tokens, n_tokens, start_pos, interrupt);
 }
 
+/* Send a prefill progress SSE chunk (llama.cpp format).
+ * Both OpenAI and llama.cpp endpoints embed prompt_progress at the top level. */
+static void send_progress_chunk(SOCKET sock, int total, int cache, int processed, double time_ms) {
+    cJSON *progress = cJSON_CreateObject();
+    cJSON_AddNumberToObject(progress, "total", total);
+    cJSON_AddNumberToObject(progress, "cache", cache);
+    cJSON_AddNumberToObject(progress, "processed", processed);
+    cJSON_AddNumberToObject(progress, "time_ms", time_ms);
+    cJSON *chunk = cJSON_CreateObject();
+    cJSON_AddItemToObject(chunk, "prompt_progress", progress);
+    char *cj = cJSON_PrintUnformatted(chunk);
+    sse_send(sock, cj, NULL);
+    free(cj);
+    cJSON_Delete(chunk);
+}
+
 static float *prefill_with_checkpoints(SOCKET sock, model_t *model,
                                        const int *tokens, int n_prefill, int start_pos,
-                                       int *out_n_processed, int client_check) {
+                                       int *out_n_processed, int client_check,
+                                       int return_progress, int total_prompt_tokens, int cache_start, double t_start_progress) {
     float *logits = NULL;
     int n_processed = start_pos;
 
     /* Interrupt flag: set by client_alive check, polled inside model_forward_prefill */
     volatile int interrupt = 0;
 
-    /* Non-SSM model, or checkpointing disabled: single batched call */
-    if (!model->config.has_ssm || srv.max_checkpoints <= 0) {
+    /* Send initial progress chunk: tells client how many tokens are cached
+     * before any new computation begins. Matches llama.cpp behavior. */
+    if (return_progress && n_prefill > 0) {
+        send_progress_chunk(sock, total_prompt_tokens, cache_start,
+                            start_pos, 0.0);
+    }
+
+    /* Determine chunking strategy.
+     * - SSM + checkpointing: use checkpoint intervals
+     * - return_progress enabled: chunk at ~512 tokens (matches GPU ubatch)
+     * - otherwise: single batched call */
+    int do_chunking = 0;
+    int ubatch_size = 512; /* matches GPU prefill ubatch */
+
+    if (model->config.has_ssm && srv.max_checkpoints > 0) {
+        do_chunking = 1;
+    } else if (return_progress && n_prefill > 1) {
+        do_chunking = 1;
+    }
+
+    if (!do_chunking) {
+        /* Single batched call */
         if (n_prefill > 0) {
             logits = server_model_prefill(model, tokens, n_prefill, start_pos,
                                           client_check ? &interrupt : NULL);
             if (!logits) {
-                /* Interrupted during prefill */
                 *out_n_processed = n_processed;
                 return NULL;
             }
             n_processed = start_pos + n_prefill;
+            /* Send final progress chunk after the single batch completes */
+            if (return_progress) {
+                double elapsed = get_time_ms() - t_start_progress;
+                send_progress_chunk(sock, total_prompt_tokens, cache_start,
+                                    n_processed, elapsed);
+            }
         }
         *out_n_processed = n_processed;
         return logits;
     }
 
-    /* SSM model with checkpointing enabled: split into chunks */
-    /* Always use chunked path for SSM models with checkpointing, even for short
-     * prompts. This ensures a tail checkpoint is created at n_prompt-1, which
-     * cache_adjust_stepback() needs when the prompt is fully cached on retry. */
+    /* Chunked prefill loop */
     int tail_pos = start_pos + n_prefill - srv.checkpoint_tail_offset;
-    if (tail_pos < start_pos) tail_pos = start_pos; /* clamp: tail at first token */
+    if (tail_pos < start_pos) tail_pos = start_pos; /* clamp */
 
     int offset = 0;
     while (offset < n_prefill) {
         int cur_pos = start_pos + offset;
         int remaining = n_prefill - offset;
+        int chunk_size;
 
-        /* Distance to next interval boundary from cur_pos */
-        int mod = cur_pos % srv.checkpoint_interval;
-        int interval_dist = (mod == 0) ? srv.checkpoint_interval : (srv.checkpoint_interval - mod);
+        if (model->config.has_ssm && srv.max_checkpoints > 0) {
+            /* SSM checkpoint-driven chunking */
+            int mod = cur_pos % srv.checkpoint_interval;
+            int interval_dist = (mod == 0) ? srv.checkpoint_interval : (srv.checkpoint_interval - mod);
+            int tail_dist = tail_pos - cur_pos;
 
-        /* Distance to tail position from cur_pos */
-        int tail_dist = tail_pos - cur_pos;
+            chunk_size = interval_dist;
+            if (tail_dist > 0 && tail_dist < chunk_size) {
+                chunk_size = tail_dist;
+            }
+            if (chunk_size > remaining) chunk_size = remaining;
+            if (chunk_size <= 0) chunk_size = 1;
 
-        /* Chunk size: whichever boundary (interval, tail, or end) comes first */
-        int chunk_size = interval_dist;
-        if (tail_dist > 0 && tail_dist < chunk_size) {
-            chunk_size = tail_dist;
-        }
-        if (chunk_size > remaining) {
-            chunk_size = remaining;
-        }
-        if (chunk_size <= 0) chunk_size = 1; /* safety */
-
-        /* Checkpoint at the current position if we've already processed some tokens */
-        if (offset > 0) {
-            checkpoint_save(cur_pos);
+            /* Save checkpoint before processing this chunk */
+            if (offset > 0) checkpoint_save(cur_pos);
+        } else {
+            /* Progress-driven chunking: use ubatch_size */
+            chunk_size = (remaining < ubatch_size) ? remaining : ubatch_size;
         }
 
         logits = server_model_prefill(model, tokens + offset, chunk_size, cur_pos,
                                       client_check ? &interrupt : NULL);
         if (!logits) {
-            /* Interrupted inside model_forward_prefill */
             *out_n_processed = n_processed;
             return NULL;
         }
         n_processed = cur_pos + chunk_size;
         offset += chunk_size;
+
+        /* Send progress chunk if requested */
+        if (return_progress) {
+            double elapsed = get_time_ms() - t_start_progress;
+            send_progress_chunk(sock, total_prompt_tokens, cache_start,
+                                n_processed, elapsed);
+        }
 
         if (client_check && !client_alive(sock)) {
             interrupt = 1;
@@ -1955,6 +1999,11 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         }
     }
 
+    /* llama.cpp: return_progress - report prefill progress via SSE */
+    int return_progress = 0;
+    if ((item = cJSON_GetObjectItem(req, "return_progress")) && cJSON_IsTrue(item))
+        return_progress = 1;
+
     if ((item = cJSON_GetObjectItem(req, "model")) && cJSON_IsString(item))
         model_name = strdup(item->valuestring);
     cJSON_Delete(req);
@@ -2089,7 +2138,8 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         int n_processed = start_pos;
         if (n_prefill > 0) {
             /* Checkpoint-aware prefill: creates interval + tail checkpoints for SSM models */
-            logits = prefill_with_checkpoints(sock, model, ptokens + start_pos, n_prefill, start_pos, &n_processed, 1);
+            logits = prefill_with_checkpoints(sock, model, ptokens + start_pos, n_prefill, start_pos, &n_processed, 1,
+                                              return_progress, n_prompt, start_pos, t_start);
         }
         /* else: fully cached (n_prefill <= 0), no prefill needed */
 
@@ -2336,7 +2386,8 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             int n_processed_ns = start_pos;
             if (n_prefill_ns > 0) {
                 /* Checkpoint-aware prefill */
-                logits_ns = prefill_with_checkpoints(sock, model, ptokens + start_pos, n_prefill_ns, start_pos, &n_processed_ns, 1);
+                logits_ns = prefill_with_checkpoints(sock, model, ptokens + start_pos, n_prefill_ns, start_pos, &n_processed_ns, 1,
+                                                     0, n_prompt, start_pos, t_start_ns);
             }
 
             /* Save cache: only the tokens actually processed */
@@ -2604,6 +2655,11 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         }
     }
 
+    /* return_progress - report prefill progress via SSE */
+    int return_progress_llama = 0;
+    if ((item = cJSON_GetObjectItem(req, "return_progress")) && cJSON_IsTrue(item))
+        return_progress_llama = 1;
+
     char *prompt_copy = NULL;
     if (prompt) {
         prompt_copy = (char *)malloc(strlen(prompt) + 1);
@@ -2789,7 +2845,8 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         int n_processed = start_pos;
         if (n_prefill > 0) {
             /* Checkpoint-aware prefill */
-            logits = prefill_with_checkpoints(sock, model, ptokens + start_pos, n_prefill, start_pos, &n_processed, 1);
+            logits = prefill_with_checkpoints(sock, model, ptokens + start_pos, n_prefill, start_pos, &n_processed, 1,
+                                              return_progress_llama, n_prompt, start_pos, t_start);
         }
         /* else: fully cached */
 
@@ -3013,7 +3070,8 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         int n_processed_ns2 = start_pos;
         if (n_prefill_ns2 > 0) {
             /* Checkpoint-aware prefill */
-            logits_ns2 = prefill_with_checkpoints(sock, model, ptokens + start_pos, n_prefill_ns2, start_pos, &n_processed_ns2, 1);
+            logits_ns2 = prefill_with_checkpoints(sock, model, ptokens + start_pos, n_prefill_ns2, start_pos, &n_processed_ns2, 1,
+                                                  0, n_prompt, start_pos, t_start);
         }
 
         t_prefill_end_ns = get_time_ms();
