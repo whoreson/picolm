@@ -4434,13 +4434,7 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
         } /* end if (!did_cpu_ssm) */
     }
 
-    /* 3. Final RMSNorm: pipe_x = rmsnorm(pipe_x, output_norm_w)
-     * Added to the SAME batch as the layer loop to avoid extra round-trips. */
-    picolm_gpu_rmsnorm_dev(pipe_x, pipe_x,
-                            (float *)gw->output_norm_dev,
-                            dim, c->rms_norm_eps, gpu_dev);
-
-    /* 4. Output projection on GPU: pipe_logits = output_weights @ pipe_x
+    /* 3. Output projection on GPU: pipe_logits = output_weights @ pipe_x
      * Keep the matmul on device to avoid the D2H+H2D round-trip of the
      * hidden state. Only the final logits (vocab_size floats) need to
      * come back to host for sampling. */
