@@ -1557,8 +1557,17 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                             for (int l = 0; l < ngl; l++) {
                                 m->gpu.attn_norm_dev[l] =
                                     picolm_gpu_upload_f32(s->attn_norm_w[l], c->n_embd, device);
+                                /* GPT-2 LayerNorm bias */
+                                if (s->attn_norm_b[l]) {
+                                    m->gpu.attn_norm_bias_dev[l] =
+                                        picolm_gpu_upload_f32(s->attn_norm_b[l], c->n_embd, device);
+                                }
                                 m->gpu.post_attn_norm_dev[l] =
                                     picolm_gpu_upload_f32(s->post_attn_norm_w[l], c->n_embd, device);
+                                if (s->post_attn_norm_b[l]) {
+                                    m->gpu.post_attn_norm_bias_dev[l] =
+                                        picolm_gpu_upload_f32(s->post_attn_norm_b[l], c->n_embd, device);
+                                }
                                 /* QK-norm weights (Qwen3): per-head RMSNorm [head_dim]
                                  * Only upload if the model actually has QK-norm tensors
                                  * (w->layers[l].attn_q_norm non-NULL). The host buffer
@@ -3086,15 +3095,27 @@ static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_to
         int l = slot;
         layer_weights_t *lw = &w->layers[l];
         BENCH_LAYER_START();
+        if (getenv("PICOLM_CPUDBG") && l == 0) {
+            fprintf(stderr, "[CPUL0DBG x_raw][:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                x_batch[0],x_batch[1],x_batch[2],x_batch[3],x_batch[4],x_batch[5],x_batch[6],x_batch[7]);
+        }
         /* LayerNorm */
         for (int bi = 0; bi < n_tokens; bi++)
             layernorm(xb_batch + bi * dim, x_batch + bi * dim,
                       s->attn_norm_w[l], s->attn_norm_b[l], dim, c->rms_norm_eps);
 
+        if (getenv("PICOLM_CPUDBG") && l == 0) {
+            fprintf(stderr, "[CPUL0DBG xb_in8][:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                xb_batch[0],xb_batch[1],xb_batch[2],xb_batch[3],xb_batch[4],xb_batch[5],xb_batch[6],xb_batch[7]);
+        }
         /* Fused QKV projection (batched): [dim, 3*dim] */
         tensor_set_repacked(m->repack_used[2 + l * 9] ? m->repack_buffers[2 + l * 9] : NULL);
         matmul_batch(q_batch, xb_batch, n_tokens, lw->attn_qkv, dim, 3 * dim, lw->type_attn_qkv);
         tensor_set_repacked(NULL);
+        if (getenv("PICOLM_CPUDBG") && l == 0) {
+            fprintf(stderr, "[CPUL0DBG bq8][:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                q_batch[0],q_batch[1],q_batch[2],q_batch[3],q_batch[4],q_batch[5],q_batch[6],q_batch[7]);
+        }
         /* Add bias */
         if (lw->attn_qkv_bias) {
             const float *bias = (const float *)lw->attn_qkv_bias;
@@ -3177,6 +3198,9 @@ static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_to
 
         /* Attention (batched) - Q is in xb2_batch (compact), output goes to xb_batch */
         memset(xb_batch, 0, (size_t)n_tokens * max_dim * sizeof(float));
+        if (getenv("PICOLM_CPUDBG") && l == 0) {
+            fprintf(stderr, "[CPUL0DBG bq][:4]={%.6f,%.6f,%.6f,%.6f}\n", xb2_batch[0],xb2_batch[1],xb2_batch[2],xb2_batch[3]);
+        }
         {
             batch_attention_layer(xb_batch, xb2_batch,
                                   s->key_cache + (size_t)l * seq_len * s->kv_row_size_k,
@@ -3190,6 +3214,15 @@ static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_to
         }
 
         /* Output projection (batched) */
+        /* Debug: dump attention output for layer 0, last token */
+        if (getenv("PICOLM_CPUDBG") && l == 0) {
+            int lt = n_tokens - 1;
+            fprintf(stderr, "[CPUDBG attn_out L0][:4]={%.6f,%.6f,%.6f,%.6f}\n",
+                    xb_batch[lt*dim], xb_batch[lt*dim+1], xb_batch[lt*dim+2], xb_batch[lt*dim+3]);
+            /* After output projection */
+            fprintf(stderr, "[CPUDBG post_outproj L0][:4]={%.6f,%.6f,%.6f,%.6f}\n",
+                    xb2_batch[lt*dim], xb2_batch[lt*dim+1], xb2_batch[lt*dim+2], xb2_batch[lt*dim+3]);
+        }
         tensor_set_repacked(m->repack_used[5 + l * 9] ? m->repack_buffers[5 + l * 9] : NULL);
         matmul_batch(xb2_batch, xb_batch, n_tokens, lw->attn_output, q_dim, dim, lw->type_attn_output);
         tensor_set_repacked(NULL);

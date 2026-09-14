@@ -4200,10 +4200,16 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
 
         if (!c->has_ssm || lw->is_attn_layer) {
             /* Diagnostic: dump pipe_x (input to attention layer) for first decode token */
-            /* A. RMSNorm: pipe_xb = rmsnorm(pipe_x, attn_norm_w[l]) */
-            picolm_gpu_rmsnorm_dev(pipe_xb, pipe_x,
-                                    (float *)gw->attn_norm_dev[l],
-                                    dim, c->rms_norm_eps, gpu_dev);
+            /* A. RMSNorm/LayerNorm: pipe_xb = norm(pipe_x, attn_norm_w[l]) */
+            if (gw->attn_norm_bias_dev[l]) {
+                picolm_gpu_layernorm_dev(pipe_xb, pipe_x,
+                    (float *)gw->attn_norm_dev[l], (float *)gw->attn_norm_bias_dev[l],
+                    dim, c->rms_norm_eps, gpu_dev);
+            } else {
+                picolm_gpu_rmsnorm_dev(pipe_xb, pipe_x,
+                    (float *)gw->attn_norm_dev[l],
+                    dim, c->rms_norm_eps, gpu_dev);
+            }
 
             /* B. Q projection: pipe_q = attn_q @ pipe_xb
              * For SSM models this writes q_full_dim = 2*q_dim
@@ -4380,10 +4386,16 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
          * has one, so running this again for a CPU-hybrid SSM layer
          * would apply the FFN twice. */
         if (!did_cpu_ssm) {
-            /* K. FFN: pipe_xb = rmsnorm(pipe_x, post_attn_norm_w[l]) */
-            picolm_gpu_rmsnorm_dev(pipe_ffn_norm, pipe_x,
-                                    (float *)gw->post_attn_norm_dev[l],
-                                    dim, c->rms_norm_eps, gpu_dev);
+            /* K. FFN: pipe_ffn_norm = rmsnorm/layernorm(pipe_x, post_attn_norm_w[l]) */
+            if (gw->post_attn_norm_bias_dev[l]) {
+                picolm_gpu_layernorm_dev(pipe_ffn_norm, pipe_x,
+                    (float *)gw->post_attn_norm_dev[l], (float *)gw->post_attn_norm_bias_dev[l],
+                    dim, c->rms_norm_eps, gpu_dev);
+            } else {
+                picolm_gpu_rmsnorm_dev(pipe_ffn_norm, pipe_x,
+                    (float *)gw->post_attn_norm_dev[l],
+                    dim, c->rms_norm_eps, gpu_dev);
+            }
 
             if (gl->ffn_gate) {
                 /* L. Gate: pipe_gate = ffn_gate @ pipe_ffn_norm */
@@ -4604,10 +4616,30 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
         }
 
         /* Standard path: RMSNorm -> QKV (uses bxb intermediate buffer). */
-        // Debug: verify bx content BEFORE RMSNorm (layer 0 only)
-        picolm_gpu_rmsnorm_batched_dev(bxb, bx,
-                                        (float *)gw->attn_norm_dev[l],
-                                        dim, c->rms_norm_eps, n_ubatch, xb_stride, gpu_dev);
+        if (getenv("PICOLM_L0DBG") && l == 0) {
+            float _emb[8];
+            picolm_gpu_memcpy(_emb, bx, 32, -1, gpu_dev);
+            fprintf(stderr, "[L0DBG bx_raw][:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                _emb[0],_emb[1],_emb[2],_emb[3],_emb[4],_emb[5],_emb[6],_emb[7]);
+            float _wn[8];
+            picolm_gpu_memcpy(_wn, gw->attn_norm_dev[0], 32, -1, gpu_dev);
+            fprintf(stderr, "[L0DBG wn_raw][:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                _wn[0],_wn[1],_wn[2],_wn[3],_wn[4],_wn[5],_wn[6],_wn[7]);
+        }
+        /* GPT-2 uses LayerNorm (with bias), modern models use RMSNorm */
+        if (gw->attn_norm_bias_dev[l]) {
+            /* LayerNorm path */
+            if (!picolm_gpu_layernorm_batched_dev(bxb, bx,
+                    (float *)gw->attn_norm_dev[l], (float *)gw->attn_norm_bias_dev[l],
+                    dim, c->rms_norm_eps, n_ubatch, xb_stride, gpu_dev)) {
+                return -1; /* LayerNorm unavailable */
+            }
+        } else {
+            /* RMSNorm path */
+            picolm_gpu_rmsnorm_batched_dev(bxb, bx,
+                                            (float *)gw->attn_norm_dev[l],
+                                            dim, c->rms_norm_eps, n_ubatch, xb_stride, gpu_dev);
+        }
 
         /* NaN guard after RMSNorm */
         // Debug: read GPU RMSNorm diagnostics AFTER it runs
@@ -4616,9 +4648,9 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
 
         /* Diagnostic: dump layer-0 intermediates */
         if (getenv("PICOLM_L0DBG") && l == 0) {
-            float _t[4]; picolm_gpu_sync(gpu_dev);
-            picolm_gpu_memcpy(_t, bxb + (size_t)(n_ubatch-1)*xb_stride, 16, -1, gpu_dev);
-            fprintf(stderr, "[L0DBG bxb_rmsnorm][:4]={%.6f,%.6f,%.6f,%.6f}\n", _t[0],_t[1],_t[2],_t[3]);
+            float _t[8]; picolm_gpu_sync(gpu_dev);
+            picolm_gpu_memcpy(_t, bxb, 32, -1, gpu_dev);
+            fprintf(stderr, "[L0DBG bxb_rmsnorm][:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n", _t[0],_t[1],_t[2],_t[3],_t[4],_t[5],_t[6],_t[7]);
         }
 
         /* QKV projections */
@@ -4629,6 +4661,12 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
                     fprintf(stderr,"INFO: GPT-2 fused QKV path (S=%d)\n",n_ubatch);}
                 picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_qkv,
                     bq, bxb, n_ubatch, gpu_dev, 3*dim, xb_stride);
+                if (getenv("PICOLM_L0DBG") && l == 0) {
+                    float _dq[8]; picolm_gpu_sync(gpu_dev);
+                    picolm_gpu_memcpy(_dq, bq, 32, -1, gpu_dev);
+                    fprintf(stderr, "[L0DBG bq8][:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                        _dq[0],_dq[1],_dq[2],_dq[3],_dq[4],_dq[5],_dq[6],_dq[7]);
+                }
                 /* bq=[S][3*dim] -> split: Q at [0:dim], K at [dim:2*dim], V at [2*dim:3*dim] */
                 { size_t q_bytes = (size_t)n_ubatch * dim * sizeof(float);
                   picolm_gpu_memcpy_async(bk, (const float *)bq + n_ubatch*dim, q_bytes, 0, gpu_dev);
@@ -4732,6 +4770,12 @@ after_qkv:
 
         /* Diagnostic: dump first attention layer K values after store */
 
+        /* Diagnostic: dump Q values for first layer */
+        if (getenv("PICOLM_L0DBG") && l == 0) {
+            float _q[4]; picolm_gpu_sync(gpu_dev);
+            picolm_gpu_memcpy(_q, bq, 16, -1, gpu_dev);
+            fprintf(stderr, "[L0DBG bq][:4]={%.6f,%.6f,%.6f,%.6f}\n", _q[0],_q[1],_q[2],_q[3]);
+        }
         /* Attention: default to F16 KV cache path (FA2/warpgrp) for all
          * models. SSM-hybrid models can optionally use F32 K/V directly
          * (bypass F16 KV cache round-trip) via PICOLM_F32KV env var to
@@ -4802,10 +4846,18 @@ after_qkv:
               fprintf(stderr, "}\n"); fflush(stderr); }
         }
 
-        /* FFN RMSNorm */
-        picolm_gpu_rmsnorm_batched_dev(bffn_norm, bx,
-                                        (float *)gw->post_attn_norm_dev[l],
-                                        dim, c->rms_norm_eps, n_ubatch, xb_stride, gpu_dev);
+        /* FFN LayerNorm/RMSNorm */
+        if (gw->post_attn_norm_bias_dev[l]) {
+            if (!picolm_gpu_layernorm_batched_dev(bffn_norm, bx,
+                    (float *)gw->post_attn_norm_dev[l], (float *)gw->post_attn_norm_bias_dev[l],
+                    dim, c->rms_norm_eps, n_ubatch, xb_stride, gpu_dev)) {
+                return -1; /* LayerNorm unavailable */
+            }
+        } else {
+            picolm_gpu_rmsnorm_batched_dev(bffn_norm, bx,
+                                            (float *)gw->post_attn_norm_dev[l],
+                                            dim, c->rms_norm_eps, n_ubatch, xb_stride, gpu_dev);
+        }
 
         /* FFN gate+up: SwiGLU (gate+up) vs GELU (up only, no separate gate) */
         if (gl->ffn_gate) {
@@ -4864,6 +4916,21 @@ after_qkv:
     double _gpu_layer_t0 = get_time_ms();
     picolm_gpu_batch_end(gpu_dev);
     double _gpu_layer_total = get_time_ms() - _gpu_layer_t0;
+    /* Debug: dump KV cache for layer 0 */
+    if (getenv("PICOLM_L0DBG")) {
+        uint16_t *_kd = (uint16_t*)malloc(4 * 25 * 64 * sizeof(uint16_t));
+        uint16_t *_vd = (uint16_t*)malloc(4 * 25 * 64 * sizeof(uint16_t));
+        if (_kd && _vd) {
+            picolm_gpu_kv_flush_to_cpu((uint8_t*)_kd, (uint8_t*)_vd, 1, 64, 4, 25*64, 25*64, gpu_dev);
+            float _kvals[8];
+            for(int _i=0;_i<8;_i++) _kvals[_i] = (float)_kd[_i];
+            fprintf(stderr, "[L0DBG kv_cache_k][:8]={%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f}\n",
+                    _kvals[0],_kvals[1],_kvals[2],_kvals[3],_kvals[4],_kvals[5],_kvals[6],_kvals[7]);
+            fprintf(stderr, "[L0DBG kv_cache_raw][:8]={0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x}\n",
+                    _kd[0],_kd[1],_kd[2],_kd[3],_kd[4],_kd[5],_kd[6],_kd[7]);
+            free(_kd); free(_vd);
+        }
+    }
     double _gpu_per_layer = _gpu_layer_total / (double)c->n_layers;
     for (int _bl = 0; _bl < c->n_layers; _bl++) {
         _gpu_bench_emit(_bl, 1, _gpu_per_layer, 0, 0);
@@ -4975,11 +5042,20 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
 
             int ubatch_start_pos = start_pos + offset;
 
-            /* Dequantize this ubatch's embeddings on CPU */
+            /* Dequantize this ubatch's embeddings on CPU + positional embeddings */
+            size_t pos_row_bytes = w->position_embd ? gguf_type_row_size(w->type_position_embd, dim) : 0;
             for (int bi = 0; bi < this_ubatch; bi++) {
                 const void *embd_row = (const uint8_t *)w->token_embd + (size_t)tokens[offset + bi] * row_bytes;
                 float *dst = host_embd + (size_t)bi * dim;
                 dequantize_row(embd_row, dst, dim, w->type_token_embd);
+                /* Add learned positional embedding (GPT-2) */
+                if (pos_row_bytes > 0) {
+                    int pos = ubatch_start_pos + bi;
+                    const void *pos_row = (const uint8_t *)w->position_embd + (size_t)pos * pos_row_bytes;
+                    float *pos_embd = alloca(dim * sizeof(float));
+                    dequantize_row(pos_row, pos_embd, dim, w->type_position_embd);
+                    for (int d2 = 0; d2 < dim; d2++) dst[d2] += pos_embd[d2];
+                }
             }
 
             /* H2D this ubatch's embeddings to bx (strided). */

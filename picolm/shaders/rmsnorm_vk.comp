@@ -1,7 +1,8 @@
 #version 450
 // RMS norm: y[s,i] = x[s,i] * w[i] / sqrt(mean(x[s,:]^2) + eps)
 // NO shared memory, NO subgroup ops -- safe for KAVERI/MI50.
-// Push constant layout matches matmul (PC_Matmul): fmt, S, I(D), O, rowWords(x_stride)
+// Push constant layout (PC_Matmul): fmt, S, I(D), eps(bitcast), rowWords(x_stride)
+// Note: O field is bitcast from float eps
 
 layout(local_size_x = 256) in;
 
@@ -13,7 +14,7 @@ layout(push_constant) uniform P {
     int fmt;       // unused
     int S;         // number of rows
     int I;         // dimension D
-    int O;         // unused
+    float eps;     // epsilon (bitcast from int O field)
     int rowWords;  // x_stride (0 = D)
 } p;
 
@@ -31,7 +32,7 @@ void main() {
         float v = x[base + uint(i)];
         sum_sq += v * v;
     }
-    float r = 1.0 / sqrt(sum_sq / float(D) + 1e-5);
+    float r = 1.0 / sqrt(sum_sq / float(D) + p.eps);
 
     // All threads write their assigned outputs
     for (int i = tid; i < D; i += 256)

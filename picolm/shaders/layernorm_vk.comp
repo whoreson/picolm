@@ -1,0 +1,66 @@
+#version 450
+// Layer norm: y[s,i] = (x[s,i] - mean) / sqrt(var + eps) * w[i] + b[i]
+// Two-pass: pass 1 computes mean, pass 2 normalizes.
+// NO shared memory, NO subgroup ops -- safe for KAVERI/MI50.
+// Push constant layout (PC_Matmul): fmt, S, I(D), O(eps), rowWords(x_stride)
+// binding 3: bias buffer (B), read-only
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer X  { float x[]; };
+layout(std430, binding = 1) readonly buffer W  { float w[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+layout(std430, binding = 3) readonly buffer B  { float b[]; };
+
+layout(push_constant) uniform P {
+    int fmt;       // unused
+    int S;         // number of rows
+    int I;         // dimension D
+    float eps;     // epsilon (bitcast from int O field)
+    int rowWords;  // x_stride (0 = D)
+} p;
+
+void main() {
+    int s = int(gl_WorkGroupID.x);
+    if (s >= p.S) return;
+    int tid = int(gl_LocalInvocationID.x);
+    int D = p.I;
+    int stride = p.rowWords > 0 ? p.rowWords : D;
+    uint base = uint(s) * uint(stride);
+
+    // Pass 1: compute mean
+    float mean = 0.0;
+    for (int i = tid; i < D; i += 256) {
+        mean += x[base + uint(i)];
+    }
+    // Reduction across threads
+    // Simple linear reduction (256 -> 1)
+    for (int i = 128; i > 0; i >>= 1) {
+        float other = (tid < D && tid + i < 256) ? 0.0 : 0.0;
+        // Use a shared approach: each thread writes its partial sum
+        // Actually, GLSL doesn't have shared memory atomics easily.
+        // Use a simpler approach: single-thread reduction.
+        barrier();
+    }
+    // Simpler: just have thread 0 compute the total
+    // Actually, let's use a different approach: every thread computes full sum.
+    // This is simpler and works without shared memory.
+    mean = 0.0;
+    for (int i = 0; i < D; i++) {
+        mean += x[base + uint(i)];
+    }
+    mean /= float(D);
+
+    // Pass 2: compute variance
+    float var = 0.0;
+    for (int i = 0; i < D; i++) {
+        float diff = x[base + uint(i)] - mean;
+        var += diff * diff;
+    }
+    var /= float(D);
+    float r = 1.0 / sqrt(var + p.eps);
+
+    // Write output
+    for (int i = tid; i < D; i += 256)
+        y[base + uint(i)] = (x[base + uint(i)] - mean) * r * w[i] + b[i];
+}

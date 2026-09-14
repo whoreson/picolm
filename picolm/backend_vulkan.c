@@ -160,6 +160,10 @@ static struct {
     VkDescriptorSet dset_nrm;
     VkDescriptorPool dpool_nrm_ring;
     VkDescriptorSet dset_nrm_ring[256];  // ring buffer for batched prefill
+
+    // LayerNorm pipeline (mean + bias)
+    VkShaderModule shader_ln;
+    VkPipeline pipe_ln;
     // Push constant staging buffer (legacy, not used with unified layout)
     VkBuffer buf_pc_nrm;
     VkDeviceMemory mem_pc_nrm;
@@ -1166,6 +1170,20 @@ int picolm_gpu_init(const int *devices, int count) {
         fprintf(stderr, "FATAL: [VK] failed to build rmsnorm pipeline\n");
         goto init_fail;
     }
+    // LayerNorm shader (mean + bias)
+    G.shader_ln = load_spv(G.dev, "layernorm_vk.spv");
+    if (G.shader_ln) {
+        VkComputePipelineCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                      .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = G.shader_ln, .pName = "main"},
+            .layout = G.plyt_unified};
+        VkResult lnrc = vkCreateComputePipelines(G.dev, VK_NULL_HANDLE, 1, &cpi, NULL, &G.pipe_ln);
+        if (lnrc != VK_SUCCESS) {
+            fprintf(stderr, "[VK] LayerNorm pipeline creation failed: %d, disabling\n", (int)lnrc);
+            vkDestroyShaderModule(G.dev, G.shader_ln, NULL);
+            G.shader_ln = VK_NULL_HANDLE;
+        }
+    }
     // Build ring buffer for RMSNorm (avoids singleton descriptor aliasing)
     { VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 256*4};
       VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -1356,7 +1374,9 @@ void picolm_gpu_shutdown(void) {
     if (G.dpool_nrm) vkDestroyDescriptorPool(G.dev, G.dpool_nrm, NULL);
     if (G.dpool_nrm_ring) vkDestroyDescriptorPool(G.dev, G.dpool_nrm_ring, NULL);
     if (G.pipe_nrm)  vkDestroyPipeline(G.dev, G.pipe_nrm, NULL);
+    if (G.pipe_ln)   vkDestroyPipeline(G.dev, G.pipe_ln, NULL);
     if (G.shader_nrm) vkDestroyShaderModule(G.dev, G.shader_nrm, NULL);
+    if (G.shader_ln) vkDestroyShaderModule(G.dev, G.shader_ln, NULL);
     if (G.buf_pc_nrm) vkDestroyBuffer(G.dev, G.buf_pc_nrm, NULL);
     if (G.mem_pc_nrm) vkFreeMemory(G.dev, G.mem_pc_nrm, NULL);
 
@@ -2035,6 +2055,34 @@ int picolm_gpu_memcpy_async(void *dst, const void *src, size_t bytes, int dir, i
             return 0;
         }
         memcpy(dst, G.staging_ptr, bytes);
+        return 1;
+    }
+    if (dir == 0) { /* D2D copy via vkCmdCopyBuffer */
+        VkDeviceSize src_off = 0;
+        VkBuffer src_buf = unwrap_buf_offset(src, &src_off);
+        VkDeviceSize dst_off = 0;
+        VkBuffer dst_buf = unwrap_buf_offset(dst, &dst_off);
+        if (!src_buf || !dst_buf) return 0;
+
+        /* Inline VK_BATCH_DISPATCH_PRE */
+        if (!G.in_batch) {
+            vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
+            VkCommandBufferBeginInfo _vb = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            vkResetCommandBuffer(G.cmd_dev, 0);
+            vkBeginCommandBuffer(G.cmd_dev, &_vb);
+            G.bound_pipe = VK_NULL_HANDLE;
+        }
+        VkBufferCopy bc = {src_off, dst_off, bytes};
+        vkCmdCopyBuffer(G.cmd_dev, src_buf, dst_buf, 1, &bc);
+        /* Inline VK_BATCH_DISPATCH_POST */
+        if (!G.in_batch) {
+            vkEndCommandBuffer(G.cmd_dev);
+            VkSubmitInfo _vsi = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                .commandBufferCount = 1, .pCommandBuffers = &G.cmd_dev};
+            vkResetFences(G.dev, 1, &G.fence_dev);
+            vkQueueSubmit(G.queue, 1, &_vsi, G.fence_dev);
+            vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
+        }
         return 1;
     }
     return 0;
@@ -2818,6 +2866,39 @@ int picolm_gpu_rmsnorm_batched_dev(float *out, const float *x, const float *weig
     return 1;
 }
 
+// Batched LayerNorm (mean subtraction + bias): GPT-2/CodeGen path
+int picolm_gpu_layernorm_batched_dev(float *out, const float *x, const float *weight,
+                                      const float *bias, int dim, float eps,
+                                      int S, int xs, int device) {
+    if (!G.shader_ln) {
+        fprintf(stderr, "[LN] no layernorm shader, falling back to CPU\n");
+        return 0;
+    }
+    if (device != 0) return 0;
+    VkDescriptorBufferInfo bi[4] = {desc_buf_info(x), desc_buf_info(weight),
+                                     desc_buf_info(out), desc_buf_info(bias)};
+    if (!bi[0].buffer || !bi[1].buffer || !bi[2].buffer || !bi[3].buffer) {
+        return 0;
+    }
+    VK_BATCH_DISPATCH_PRE();
+    _batch_barrier_buf(x, (size_t)dim * (size_t)S * sizeof(float));
+    VK_BATCH_BIND(G.pipe_ln);
+    push_desc(G.cmd_dev, 4, bi);
+    PC_Matmul pc_ln = {0, S, dim, 0, xs};
+    memcpy(&pc_ln.O, &eps, sizeof(float));
+    vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_ln), &pc_ln);
+    vkCmdDispatch(G.cmd_dev, (uint32_t)S, 1, 1);
+    _g_dispatch_cnt++;
+    VK_BATCH_DISPATCH_POST();
+    return 1;
+}
+
+// Single-token LayerNorm (decode path, uses batched shader with S=1)
+int picolm_gpu_layernorm_dev(float *out, const float *x, const float *weight,
+                              const float *bias, int dim, float eps, int device) {
+    return picolm_gpu_layernorm_batched_dev(out, x, weight, bias, dim, eps, 1, 0, device);
+}
+
 int picolm_gpu_residual_add(float *out, const float *a, const float *b,
                              int n, int dim, int stride, int device) {
     if (!G.ready || !G.shader_elem || device != 0 || n < 1) return 0;
@@ -3584,6 +3665,7 @@ int picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
 
         VkDescriptorBufferInfo bi[4] = { qbi, kbi, vbi, obbi };
         uint32_t total = (uint32_t)nh * (uint32_t)nt;
+        fprintf(stderr, "[VK] attn_f16: lo=%d sp=%d nt=%d nh=%d nkh=%d hd=%d msl=%d total=%d\n", lo, sp, nt, nh, nkh, hd, msl, total);
         VK_BATCH_DISPATCH_PRE();
 
         // Barrier: Q write -> shader read; KV cache write -> shader read
