@@ -4227,9 +4227,16 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
                     picolm_gpu_residual_add(pipe_gate + dim, pipe_gate + dim, bk_bias, 1, dim, 0, gpu_dev);
                     picolm_gpu_residual_add(pipe_gate + 2*dim, pipe_gate + 2*dim, bv_bias, 1, dim, 0, gpu_dev);
                 }
-                picolm_gpu_memcpy_async(pipe_q, pipe_gate, (size_t)dim * sizeof(float), 0, gpu_dev);
-                picolm_gpu_memcpy_async(pipe_k, pipe_gate + dim, (size_t)dim * sizeof(float), 0, gpu_dev);
-                picolm_gpu_memcpy_async(pipe_v, pipe_gate + 2*dim, (size_t)dim * sizeof(float), 0, gpu_dev);
+                /* GPT-2 decode: split fused QKV from pipe_gate (ffn_hidden >= 3*dim)
+                 * into pipe_q/pipe_k/pipe_v. Same per-row D2D copy pattern as prefill. */
+                { size_t row_bytes = (size_t)dim * sizeof(float);
+                  if (!picolm_gpu_memcpy_async(pipe_q, pipe_gate, row_bytes, 0, gpu_dev) ||
+                      !picolm_gpu_memcpy_async(pipe_k, pipe_gate + dim, row_bytes, 0, gpu_dev) ||
+                      !picolm_gpu_memcpy_async(pipe_v, pipe_gate + 2*dim, row_bytes, 0, gpu_dev)) {
+                      fprintf(stderr, "ERROR: GPT-2 decode fused QKV split failed\n");
+                      return -1;
+                  }
+                }
             } else {
                 picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
                                        pipe_q, pipe_xb, 1, gpu_dev, 0, 0);
@@ -4676,16 +4683,34 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
                         _dq[0],_dq[1],_dq[2],_dq[3],_dq[4],_dq[5],_dq[6],_dq[7]);
                 }
                 /* bq=[S][3*dim] interleaved: [Q0,K0,V0, Q1,K1,V1, ...]
-                 * Split into compact Q, bk=[K0,K1,...], bv=[V0,V1,...]
-                 * Must compact Q because the attention kernel expects stride=dim.
-                 * Use bffn_norm as temp buffer for compact Q (not used yet at
-                 * attention stage, only used later for FFN). */
+                 * SPLIT INTO COMPACT Q/K/V via per-row D2D copies.
+                 *
+                 * CRITICAL: Each row is copied separately because the matmul
+                 * produces [Q0,K0,V0, Q1,K1,V1, ...] layout, not [Q0,Q1,...,K0,K1,...].
+                 * A single block copy would produce garbage K/V.
+                 *
+                 * CRITICAL: Q must be compacted to stride=dim (bffn_norm) because
+                 * the attention kernel expects compact Q. Leaving it in bq at
+                 * stride=3*dim causes the kernel to read wrong data.
+                 *
+                 * Vulkan: D2D copy requires COMPUTE_SHADER->TRANSFER barrier
+                 * (handled in backend_vulkan.c picolm_gpu_memcpy_async).
+                 * Without this barrier, the copy may execute before matmul completes. */
                 { size_t row_bytes = (size_t)dim * sizeof(float);
                   for (int _ri = 0; _ri < n_ubatch; _ri++) {
                       float *row = (float *)bq + _ri * 3 * dim;
-                      picolm_gpu_memcpy_async(bffn_norm + _ri * dim, row, row_bytes, 0, gpu_dev);
-                      picolm_gpu_memcpy_async(bk + _ri * dim, row + dim, row_bytes, 0, gpu_dev);
-                      picolm_gpu_memcpy_async(bv + _ri * dim, row + 2 * dim, row_bytes, 0, gpu_dev);
+                      if (!picolm_gpu_memcpy_async(bffn_norm + _ri * dim, row, row_bytes, 0, gpu_dev)) {
+                          fprintf(stderr, "ERROR: GPT-2 fused QKV Q-split D2D copy failed at row %d\n", _ri);
+                          return -1;
+                      }
+                      if (!picolm_gpu_memcpy_async(bk + _ri * dim, row + dim, row_bytes, 0, gpu_dev)) {
+                          fprintf(stderr, "ERROR: GPT-2 fused QKV K-split D2D copy failed at row %d\n", _ri);
+                          return -1;
+                      }
+                      if (!picolm_gpu_memcpy_async(bv + _ri * dim, row + 2 * dim, row_bytes, 0, gpu_dev)) {
+                          fprintf(stderr, "ERROR: GPT-2 fused QKV V-split D2D copy failed at row %d\n", _ri);
+                          return -1;
+                      }
                   }
                 }
                 if (gw->attn_qkv_bias_dev[l]) {

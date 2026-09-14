@@ -2074,7 +2074,12 @@ int picolm_gpu_memcpy_async(void *dst, const void *src, size_t bytes, int dir, i
             vkBeginCommandBuffer(G.cmd_dev, &_vb);
             G.bound_pipe = VK_NULL_HANDLE;
         }
-        /* Barrier: compute shader write -> transfer read */
+        /* Barrier: compute shader write -> transfer read.
+         * REQUIRED when D2D copy source was produced by a compute dispatch.
+         * Without this, RADV may execute vkCmdCopyBuffer before the compute
+         * shader finishes, causing the copy to read garbage from the buffer.
+         * This manifested as wrong K/V values for GPT-2 fused QKV split.
+         * HIP/CUDA handle this implicitly via stream ordering. */
         { VkBufferMemoryBarrier mb = {
             .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
             .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,

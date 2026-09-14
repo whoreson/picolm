@@ -1504,9 +1504,15 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                             /* Phase 2: allocate pipeline buffers and upload norm/RoPE weights */
                             int q_dim = c->n_heads * c->head_dim;
                             int kv_dim = c->n_kv_heads * c->head_dim;
-                            /* SSM models use q_full_dim = 2*q_dim for attention Q+gate projection.
-                             * GPT-2 uses 3*q_dim for fused QKV (Q+K+V in one buffer).
-                             * pipe_q and pipe_attn_out must be sized for the larger output. */
+                            /* PIPELINE BUFFER SIZING RULE:
+                             * pipe_q and pipe_attn_out must be sized for the LARGEST single
+                             * matmul output per token. Under-allocation causes buffer overflow
+                             * where fused QKV output overwrites adjacent buffers (bk, bv, etc.),
+                             * producing garbage attention output.
+                             *
+                             * SSM: q_dim*2 (interleaved Q+gate)
+                             * GPT-2: q_dim*3 (fused QKV: [Q0,K0,V0, ...])
+                             * Default: q_dim (separate QKV tensors) */
                             int q_pipeline_dim;
                             if (c->has_ssm) q_pipeline_dim = q_dim * 2;
                             else if (c->is_gpt2) q_pipeline_dim = q_dim * 3;
