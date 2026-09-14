@@ -161,6 +161,16 @@ int reserve_i8(int8_t **ptr, size_t *cap, size_t bytes) {
     return 1;
 }
 
+/* Forward declarations for CPU dequant/quant functions (from quant.c).
+ * These are extern "C" in quant.c, linked from the .cu object file. */
+extern void dequantize_row_q2_K(const void *, float *, int);
+extern void dequantize_row_q3_K(const void *, float *, int);
+extern void dequantize_row_q4_K(const void *, float *, int);
+extern void dequantize_row_q5_K(const void *, float *, int);
+extern void dequantize_row_q6_K(const void *, float *, int);
+extern void dequantize_row_iq4_nl(const void *, float *, int);
+extern void quantize_row_q8_0(const float *, void *, int);
+
 /* ---- Public API ---- */
 
 extern "C"
@@ -392,9 +402,12 @@ int picolm_gpu_tensor_upload(void **tensor,
                                     (qtype == 11) ? "Q3_K" :
                                     (qtype == 12) ? "Q4_K" :
                                     (qtype == 13) ? "Q5_K" : "Q6_K";
+                /* Check if IMMA is available on this GPU */
+                const char *path = "GPU dequant + IMMA";
+                if (!ctx->has_imma) path = "GPU dequant (no IMMA, scalar fallback)";
                 fprintf(stderr,
-                    "[GPU] upload mode: %s native (GPU dequant + IMMA, %zu MB)\n",
-                    qname, qk_total / (1024*1024));
+                    "[GPU] upload mode: %s native (%s, %zu MB)\n",
+                    qname, path, qk_total / (1024*1024));
                 first_print = 0;
             }
         }
@@ -480,9 +493,59 @@ int picolm_gpu_tensor_upload(void **tensor,
         return 1;
     }
 
-    /* IQ4_NL (type 20): native upload, same block layout as Q4_0 (18 bytes/32 values).
-     * Dequant via LUT in the picolm_iq4_nl_q8_matmul_imma kernel. */
-    /* Falls through to generic native upload below. */
+    /* IQ4_NL (type 20): convert to Q8_0 at upload time.
+     * On GPUs without IMMA/MFMA (e.g. MI50), the scalar picolm_quant_matmul
+     * dequant path with LUT is extremely slow. Converting to Q8_0 on CPU at
+     * upload time lets us use the much faster Q8_0 scalar int8 MAC path.
+     * On GPUs with IMMA (NVIDIA), a native IQ4_NL IMMA kernel would be better,
+     * but Q8_0 fallback is still fast enough. */
+    if (qtype == 20) {
+        float *f32_buf = (float *)calloc(I * O, sizeof(float));
+        if (!f32_buf) { gpuFree(t->weights); free(t); return 0; }
+
+        /* Dequant IQ4_NL to F32 on CPU */
+        for (int row = 0; row < O; row++) {
+            float *dst = f32_buf + row * I;
+            const void *row_start = (const uint8_t *)weights + row * ((I + 31) / 32) * 18;
+            dequantize_row_iq4_nl(row_start, dst, I);
+        }
+
+        /* Requant to Q8_0 */
+        size_t q8_total = (size_t)O * ((I + 31) / 32) * 34;
+        uint8_t *q8_buf = (uint8_t *)calloc(q8_total, 1);
+        if (!q8_buf) { free(f32_buf); gpuFree(t->weights); free(t); return 0; }
+
+        for (int row = 0; row < O; row++) {
+            const float *src = f32_buf + row * I;
+            block_q8_0 *q8_blocks = (block_q8_0 *)(q8_buf + row * ((I + 31) / 32) * 34);
+            quantize_row_q8_0(src, q8_blocks, I);
+        }
+        free(f32_buf);
+
+        if (!gpu_ok(gpuMalloc(&t->weights, q8_total), "tensor allocation (iq4_nl->q8)") ||
+            !gpu_ok(gpuMemcpy(t->weights, q8_buf, q8_total, gpuMemcpyHostToDevice),
+                    "tensor upload (iq4_nl->q8)")) {
+            free(q8_buf); gpuFree(t->weights); free(t); return 0; }
+        free(q8_buf);
+
+        t->qtype = (gguf_type_t)8;
+        t->block_size = 34;
+        t->row_bytes = ((I + 31) / 32) * 34;
+        t->zero_copy = 0;
+        t->tracked = 1;
+        ctx->tensor_count++;
+        ctx->tensor_bytes += q8_total;
+        static int iq4nl_print = 1;
+        if (iq4nl_print) {
+            size_t native_mb = ((I + 31) / 32) * 18 * (size_t)O / (1024*1024);
+            size_t q8_mb = q8_total / (1024*1024);
+            fprintf(stderr, "[GPU] IQ4_NL -> Q8_0 conversion: %zu MB native -> %zu MB Q8_0 (%.0f%% overhead, scalar LUT dequant too slow on GPU)\n",
+                    native_mb, q8_mb, (double)q8_total / (((I + 31) / 32) * 18 * (size_t)O) * 100.0);
+            iq4nl_print = 0;
+        }
+        *tp = t;
+        return 1;
+    }
 
     /* Try zero-copy first: register CPU memory with GPU (unified memory SoC) */
     /* NOTE: mmap'd file-backed memory can cause zero-copy to silently produce
@@ -506,13 +569,32 @@ int picolm_gpu_tensor_upload(void **tensor,
     t->tracked = 1;
     ctx->tensor_count++;
     ctx->tensor_bytes += total;
-    
-    /* Print upload summary for first tensor */
+
+    /* Per-quant-type upload summary (printed once per type) */
     {
-        static int first_print = 1;
-        if (first_print) {
-            fprintf(stderr, "[GPU] upload mode: %s\n", t->zero_copy ? "zero-copy (unified)" : "copied");
-            first_print = 0;
+        static int seen_types[32] = {0};
+        static int seen_count = 0;
+        int idx = -1;
+        if (qtype < 32) {
+            if (!seen_types[qtype]) {
+                seen_types[qtype] = 1;
+                idx = qtype;
+            }
+        }
+        if (idx >= 0 && seen_count < 4) {
+            const char *qname = "???";
+            switch (qtype) {
+                case 0: qname = "F32"; break;
+                case 1: qname = "F16"; break;
+                case 2: qname = "Q4_0"; break;
+                case 8: qname = "Q8_0"; break;
+                case 30: qname = "BF16"; break;
+                case 41: qname = "Q1_0"; break;
+                case 42: qname = "Q2_0"; break;
+            }
+            fprintf(stderr, "[GPU] upload: %s (type %d) native, copied to GPU (%zu MB)\n",
+                    qname, qtype, total / (1024*1024));
+            seen_count++;
         }
     }
     *tp = t;
