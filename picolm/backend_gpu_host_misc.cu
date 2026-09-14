@@ -1336,6 +1336,18 @@ picolm_gpu_sigmoid_mul_batched_kernel(float *out, const float *gate,
     }
 }
 
+/* Inplace GELU: x[i] = 0.5*x*(1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3))) */
+__global__ void
+picolm_gpu_gelu_inplace_kernel(float *x, size_t n) {
+    size_t i = (size_t)gpuBlockIdx_x * (size_t)gpuBlockDim_x + gpuThreadIdx_x;
+    size_t stride = (size_t)gridDim.x * gpuBlockDim_x;
+    for (; i < n; i += stride) {
+        float xi = x[i];
+        float cubed = xi * xi * xi;
+        x[i] = 0.5f * xi * (1.0f + tanhf(0.79788456f * (xi + 0.044715f * cubed)));
+    }
+}
+
 /* Phase 2 host API */
 /* Device-native rmsnorm: all pointers are device-resident, no H2D/D2H, no sync.
  * Used from model_forward_gpu() pipeline path. */
@@ -1444,6 +1456,41 @@ picolm_gpu_rmsnorm_batched(float *out, const float *x, const float *weight,
 extern "C" int
 picolm_gpu_has_layernorm(int device) {
     return 1; /* CUDA/HIP: LayerNorm kernel always available */
+}
+
+/* Capability query: push descriptors (Vulkan-only, stub for CUDA/HIP) */
+extern "C" int
+picolm_gpu_has_push_descriptors(void) {
+    return 1; /* CUDA/HIP: always has "push" capability (kernel args) */
+}
+
+/* Timestamp write (Vulkan-only, stub for CUDA/HIP) */
+extern "C" void
+picolm_gpu_ts_write(const char *label) {
+    (void)label; /* CUDA/HIP: no Vulkan-style timestamp writes */
+}
+
+/* GELU activation: inplace gelu(x) = 0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3))) */
+extern "C" int
+picolm_gpu_gelu_dev(float *x_dev, size_t n, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    int n_threads = 256;
+    int n_blocks = (int)((n + n_threads - 1) / n_threads);
+    if (n_blocks > 65535) n_blocks = 65535;
+    picolm_gpu_gelu_inplace_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(x_dev, n);
+    if (!gpu_ok(gpuGetLastError(), "gelu inplace kernel")) return 0;
+    return 1;
+}
+
+/* Logits D2H via mapped memory (Vulkan) or plain D2H (CUDA/HIP). */
+extern "C" int
+picolm_gpu_logits_d2h_mapped(float *dst, size_t bytes, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx) || !dst || !ctx->pipe_logits) return 0;
+    if (!gpu_ok(gpuDeviceSynchronize(), "logits sync")) return 0;
+    if (!gpu_ok(gpuMemcpy(dst, ctx->pipe_logits, bytes, gpuMemcpyDeviceToHost), "logits d2h")) return 0;
+    return 1;
 }
 
 /* Device-native LayerNorm: single token, device pointers, no sync. */

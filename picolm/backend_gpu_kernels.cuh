@@ -152,7 +152,9 @@ __global__ void picolm_silu_mul(float *gate, const float *up, size_t n);
  * Shared memory: holds one KV position's K and V (head_dim FP16 each).
  * Each query-head group maintains its own online-softmax state in registers.
  *
- /* ---- Decode attention kernel (one thread block per KV head,
+*/
+
+/* ---- Decode attention kernel (one thread block per KV head,
  * processes all kv_mul Q heads, loop over positions, shared mem K/V) ----
  *
  * Architecture: each block handles one KV head and its kv_mul grouped Q heads.
@@ -163,6 +165,7 @@ __global__ void picolm_silu_mul(float *gate, const float *up, size_t n);
  * Shared memory: [K:head_dim u16][V:head_dim u16][reduce:256 float]
  * The reduce area is oversized (256 floats = 1KB) to handle the tree reduce.
  * For head_dim=128, kv_mul=8: 256+256+1024 = 1536 bytes. */
+
 /* Rewritten: the previous version had every thread declare and
  * zero-init a private acc[8][256] float array (8KB/thread) -- far
  * beyond the register file, so it spills to local memory, and it's

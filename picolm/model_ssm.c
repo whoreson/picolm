@@ -4665,10 +4665,14 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
                     fprintf(stderr, "[L0DBG bq8][:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
                         _dq[0],_dq[1],_dq[2],_dq[3],_dq[4],_dq[5],_dq[6],_dq[7]);
                 }
-                /* bq=[S][3*dim] -> split: Q at [0:dim], K at [dim:2*dim], V at [2*dim:3*dim] */
-                { size_t q_bytes = (size_t)n_ubatch * dim * sizeof(float);
-                  picolm_gpu_memcpy_async(bk, (const float *)bq + n_ubatch*dim, q_bytes, 0, gpu_dev);
-                  picolm_gpu_memcpy_async(bv, (const float *)bq + 2*n_ubatch*dim, q_bytes, 0, gpu_dev);
+                /* bq=[S][3*dim] interleaved: [Q0,K0,V0, Q1,K1,V1, ...]
+                 * Split into compact bk=[K0,K1,...], bv=[V0,V1,...] */
+                { size_t row_bytes = (size_t)dim * sizeof(float);
+                  for (int _ri = 0; _ri < n_ubatch; _ri++) {
+                      float *row = (float *)bq + _ri * 3 * dim;
+                      picolm_gpu_memcpy_async(bk + _ri * dim, row + dim, row_bytes, 0, gpu_dev);
+                      picolm_gpu_memcpy_async(bv + _ri * dim, row + 2 * dim, row_bytes, 0, gpu_dev);
+                  }
                 }
                 if (gw->attn_qkv_bias_dev[l]) {
                     float *bq_bias = (float *)gw->attn_qkv_bias_dev[l];
@@ -4766,7 +4770,14 @@ after_qkv:
         picolm_gpu_kv_store_dev_batched(0, attn_ord, start_pos, n_ubatch,
                                          bv, n_kv_heads, head_dim, seq_len, gpu_dev);
 
-        /* Diagnostic: dump first attention layer K values after store */
+        /* Diagnostic: dump K, V buffers after D2D split */
+        if (NULL && l == 0) {
+            float _k[4], _v[4]; picolm_gpu_sync(gpu_dev);
+            picolm_gpu_memcpy(_k, bk, 16, -1, gpu_dev);
+            picolm_gpu_memcpy(_v, bv, 16, -1, gpu_dev);
+            fprintf(stderr, "[L0DBG bk][:4]={%.6f,%.6f,%.6f,%.6f}\n", _k[0],_k[1],_k[2],_k[3]);
+            fprintf(stderr, "[L0DBG bv][:4]={%.6f,%.6f,%.6f,%.6f}\n", _v[0],_v[1],_v[2],_v[3]);
+        }
 
         /* Diagnostic: dump Q values for first layer */
         if (NULL && l == 0) {

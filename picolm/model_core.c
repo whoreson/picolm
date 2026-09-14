@@ -3149,6 +3149,15 @@ static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_to
             }
         }
 
+        if (NULL && l == 0) {
+            fprintf(stderr, "[CPUL0DBG bq][:4]={%.6f,%.6f,%.6f,%.6f}\n",
+                xb2_batch[0],xb2_batch[1],xb2_batch[2],xb2_batch[3]);
+            fprintf(stderr, "[CPUL0DBG bk][:4]={%.6f,%.6f,%.6f,%.6f}\n",
+                k_batch[0],k_batch[1],k_batch[2],k_batch[3]);
+            fprintf(stderr, "[CPUL0DBG bv][:4]={%.6f,%.6f,%.6f,%.6f}\n",
+                v_batch[0],v_batch[1],v_batch[2],v_batch[3]);
+        }
+
         /* Store K and V in KV cache */
         {
             uint8_t *kcl = s->key_cache + (size_t)l * seq_len * s->kv_row_size_k;
@@ -3229,9 +3238,10 @@ static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_to
             int lt = n_tokens - 1;
             fprintf(stderr, "[CPUDBG attn_out L0][:4]={%.6f,%.6f,%.6f,%.6f}\n",
                     xb_batch[lt*dim], xb_batch[lt*dim+1], xb_batch[lt*dim+2], xb_batch[lt*dim+3]);
-            /* After output projection */
+            /* After output projection + bias + residual */
             fprintf(stderr, "[CPUDBG post_outproj L0][:4]={%.6f,%.6f,%.6f,%.6f}\n",
-                    xb2_batch[lt*dim], xb2_batch[lt*dim+1], xb2_batch[lt*dim+2], xb2_batch[lt*dim+3]);
+                    xb_batch[(lt)*dim] /* will be overwritten by output proj */,
+                    xb_batch[(lt)*dim+1], xb_batch[(lt)*dim+2], xb_batch[(lt)*dim+3]);
         }
         tensor_set_repacked(m->repack_used[5 + l * 9] ? m->repack_buffers[5 + l * 9] : NULL);
         matmul_batch(xb2_batch, xb_batch, n_tokens, lw->attn_output, q_dim, dim, lw->type_attn_output);
