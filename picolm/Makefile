@@ -471,7 +471,7 @@ shaders/%.spv: shaders/%.comp
 	$(GLSLC) --target-env=vulkan1.2 $< -o $@
 
 .PHONY: vulkan
-vulkan: backend_vulkan.o shaders/qmatmul_vk.spv shaders/elementwise_vk.spv shaders/rmsnorm_vk.spv shaders/quantize_q8_vk.spv shaders/q8_q8_matmul_vk.spv shaders/attn_prefill_vk.spv shaders/attn_prefill_f16vk.spv shaders/attn_decode_vk.spv shaders/kv_store_vk.spv shaders/q8_q8_qkv3_vk.spv shaders/q8_q8_gu3_vk.spv shaders/q2k_matmul_vk.spv shaders/q3k_matmul_vk.spv shaders/q4k_matmul_vk.spv shaders/q6k_matmul_vk.spv shaders/iq4nl_matmul_vk.spv
+vulkan: backend_vulkan.o shaders/qmatmul_vk.spv shaders/elementwise_vk.spv shaders/rmsnorm_vk.spv shaders/layernorm_vk.spv shaders/quantize_q8_vk.spv shaders/q8_q8_matmul_vk.spv shaders/attn_prefill_vk.spv shaders/attn_prefill_f16vk.spv shaders/attn_decode_vk.spv shaders/kv_store_vk.spv shaders/q8_q8_qkv3_vk.spv shaders/q8_q8_gu3_vk.spv shaders/q2k_matmul_vk.spv shaders/q3k_matmul_vk.spv shaders/q4k_matmul_vk.spv shaders/q6k_matmul_vk.spv shaders/iq4nl_matmul_vk.spv
 	$(MAKE) $(TARGET) \
 	  CFLAGS="$(filter-out -fopenmp,$(CFLAGS)) -march=native -DPICOLM_GPU=1 -DPICOLM_VULKAN=1 $(call simd_flags_for,-march=native) $(call simd_defines_for,-march=native) $(VK_EXTRA_INC)" \
 	  LDFLAGS="$(LDFLAGS) $(VK_EXTRA_LIB)" \
