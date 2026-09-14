@@ -453,15 +453,16 @@ const char *gguf_type_name(uint32_t type) {
         case 31: return "q4_0_4_4";
         case 32: return "q4_0_4_8";
         case 33: return "q4_0_8_8";
-        case 34: return "tq1_0";
-        case 35: return "tq2_0";
-        case 36: return "mxfp4";
-        case 37: return "q8_4";
-        case 38: return "q3_0";
-        case 39: return "q4_3";
-        case 40: return "nvfp4";
-        case 41: return "q1_0";
-        case 42: return "q2_0";
+        case 34: return "q4i_0_8_8";
+        case 35: return "tq1_0";
+        case 36: return "tq2_0";
+        case 37: return "mxfp4";
+        case 38: return "q8_4";
+        case 39: return "q3_0";
+        case 40: return "q4_3";
+        case 41: return "nvfp4";
+        case 42: return "q1_0";
+        case 43: return "q2_0";
         /* ik_llama repacked types */
         case 202: return "q4_0_r8";
         case 208: return "q8_0_r8";
@@ -1693,9 +1694,11 @@ int parse_gguf(model_t *m, int max_seq_len) {
             }
         } else if (qt == GGUF_TYPE_Q4_0 || qt == GGUF_TYPE_Q4_1 ||
                    qt == GGUF_TYPE_IQ4_NL ||
-                   qt == GGUF_TYPE_Q4_0_4_4 || qt == GGUF_TYPE_Q4_0_8_8) {
+                   qt == GGUF_TYPE_Q4_0_4_4 || qt == GGUF_TYPE_Q4_0_8_8 ||
+                   qt == GGUF_TYPE_Q4I_0_8_8) {
             size_t bs = (qt == GGUF_TYPE_Q4_0_4_4) ? sizeof(block_q4_0x4)
                        : (qt == GGUF_TYPE_Q4_0_8_8) ? sizeof(block_q4_0x8)
+                       : (qt == GGUF_TYPE_Q4I_0_8_8) ? sizeof(block_q4i_0x8)
                        : (qt == GGUF_TYPE_Q4_1) ? sizeof(block_q4_1)
                        : sizeof(block_q4_0);
             size_t nblocks = nrows / 32;

@@ -598,6 +598,48 @@ void dequantize_row_q4_0_8_8(const void *src, float *dst, int n) {
     }
 }
 
+/* Dequantize a single row from Q4I_0_8_8 (pre-dequantized int8) format to float32.
+ * Each row is 32 int8 values within a block_q4i_0x8 (8 rows x 32 values).
+ * The int8 values are stored in dpbusd lane order within each chunk.
+ *
+ * For row r within an 8-row group:
+ *   Row r belongs to either even group {0,1,4,5} or odd group {2,3,6,7}
+ *   Within the group, row r's data is in the appropriate chunk position.
+ *
+ * The qs layout per block:
+ *   chunks 0-3 (offset 0..96):  even rows {0,1,4,5}
+ *   chunks 4-7 (offset 128..224): odd rows {2,3,6,7}
+ *   Each chunk: 4 rows x 8 values = 32 bytes, dpbusd lane order
+ *   Within a chunk: row_ri vals [0..3][4..7] for each of 4 rows
+ */
+void dequantize_row_q4i_0_8_8(const void *src, float *dst, int n) {
+    const block_q4i_0x8 *blocks = (const block_q4i_0x8 *)src;
+    int nb = n / 32;
+    int row_in_group = 0;  /* dequant row 0 of the group */
+
+    /* Row 0 belongs to even group, position 0 within {0,1,4,5}.
+     * Layout: vals 0-3 for all 4 rows first, then vals 4-7.
+     * Row 0's vals 0-3 are at offset 0..3, vals 4-7 at offset 16..19. */
+    int row_pos = 0;  /* position within group */
+
+    for (int b = 0; b < nb; b++) {
+        float d = fp16_to_fp32_lookup(blocks[b].d[row_in_group]);
+        for (int k = 0; k < 4; k++) {
+            /* Even group chunk k: base offset = k*32 */
+            /* vals 0-3 for row_pos: offset = row_pos * 4 */
+            /* vals 4-7 for row_pos: offset = (row_pos + 4) * 4 */
+            const int8_t *vals_lo = blocks[b].qs + k * 32 + row_pos * 4;
+            const int8_t *vals_hi = blocks[b].qs + k * 32 + (row_pos + 4) * 4;
+            for (int j = 0; j < 4; j++) {
+                dst[b * 32 + k * 8 + j] = d * (float)vals_lo[j];
+            }
+            for (int j = 0; j < 4; j++) {
+                dst[b * 32 + k * 8 + 4 + j] = d * (float)vals_hi[j];
+            }
+        }
+    }
+}
+
 void dequantize_row_f16(const void *src, float *dst, int n) {
     const uint16_t *fp16 = (const uint16_t *)src;
 #ifdef PICOLM_NEON
@@ -666,6 +708,7 @@ void dequantize_row(const void *src, float *dst, int n, gguf_type_t type) {
         case GGUF_TYPE_Q4_0_4_4: dequantize_row_q4_0_4_4(src, dst, n); break;
         case GGUF_TYPE_Q4_0_4_8: dequantize_row_q4_0_4_8(src, dst, n); break;
         case GGUF_TYPE_Q4_0_8_8: dequantize_row_q4_0_8_8(src, dst, n); break;
+        case GGUF_TYPE_Q4I_0_8_8: dequantize_row_q4i_0_8_8(src, dst, n); break;
         case GGUF_TYPE_Q1_0:     dequantize_row_q1_0(src, dst, n); break;
         case GGUF_TYPE_Q2_0:     dequantize_row_q2_0(src, dst, n); break;
         case GGUF_TYPE_IQ4_NL:   dequantize_row_iq4_nl(src, dst, n); break;
@@ -697,6 +740,7 @@ int gguf_type_block_size(gguf_type_t type) {
         case GGUF_TYPE_Q4_0_4_4: return 32;  /* each block covers 32 values per row */
         case GGUF_TYPE_Q4_0_4_8: return 32;
         case GGUF_TYPE_Q4_0_8_8: return 32;
+        case GGUF_TYPE_Q4I_0_8_8: return 32;  /* same as Q4_0_8_8: 32 values per row per block */
         case GGUF_TYPE_BF16:     return 1;  /* BF16: 1 element per block, 2 bytes each */
         case GGUF_TYPE_Q1_0:     return 128;
         case GGUF_TYPE_Q2_0:     return 128;
@@ -724,6 +768,7 @@ int gguf_type_quant_size(gguf_type_t type) {
         case GGUF_TYPE_Q4_0_4_4: return (int)sizeof(block_q4_0);  /* 18: GGUF stores same layout as Q4_0 */
         case GGUF_TYPE_Q4_0_4_8: return (int)sizeof(block_q4_0);  /* 18: same per-row stride as Q4_0 */
         case GGUF_TYPE_Q4_0_8_8: return (int)sizeof(block_q4_0);  /* 18: GGUF stores same layout as Q4_0 */
+        case GGUF_TYPE_Q4I_0_8_8: return (int)(sizeof(block_q4i_0x8) / 8);  /* 34: bytes per row per block (272/8) */
         case GGUF_TYPE_BF16:     return 2;  /* BF16: 2 bytes per element */
         case GGUF_TYPE_Q1_0:     return 18;
         case GGUF_TYPE_Q2_0:     return 34;
@@ -6290,6 +6335,13 @@ float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
         case GGUF_TYPE_Q4_0_4_4: return vec_dot_q4_0_4_4_f32(src, x, n);
         case GGUF_TYPE_Q4_0_4_8: return vec_dot_q4_0_4_8_f32(src, x, n);
         case GGUF_TYPE_Q4_0_8_8: return vec_dot_q4_0_8_8_f32(src, x, n);
+        case GGUF_TYPE_Q4I_0_8_8: {
+            /* Q4I: dequantize row 0 of the group, then f32 dot.
+             * For rows 1-7, the caller must use the 8-row group path. */
+            float q4i_tmp[256];
+            dequantize_row_q4i_0_8_8(src, q4i_tmp, n > 256 ? 256 : n);
+            return vec_dot_f32_f32(q4i_tmp, x, n > 256 ? 256 : n);
+        }
         case GGUF_TYPE_F16:  return vec_dot_f16_f32(src, x, n);
         case GGUF_TYPE_BF16: return vec_dot_bf16_f32(src, x, n);
         default: {
@@ -6570,6 +6622,227 @@ void vec_dot_q4_0x8_q8_0_avx2(const void *vx, const void *wy, int n, float *out,
             }
             out[row] = sumf;
         }
+    }
+#endif
+}
+
+/* ---- vec_dot_q4i_0x8_q8_0: Q4I_0_8_8 pre-dequantized int8 x Q8_0 ----
+ * Processes 8 output rows from one interleaved group.
+ * Q4I layout per block (272 bytes):
+ *   d[8]      - 8 FP16 scales (one per row)
+ *   qs[256]   - pre-dequantized int8 values:
+ *     even rows {0,1,4,5}: qs[k*32 + ri*8 + v] = row ri's value at index k*8+v
+ *     odd rows  {2,3,6,7}: qs[128 + k*32 + ri*8 + v] = same
+ *
+ * Precondition: nrows == 8 (full group). Caller handles tails.
+ */
+void vec_dot_q4i_0x8_q8_0(const void *vx, const void *wy, int n, float *out, int nrows) {
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__) && defined(__AVX512DQ__) && defined(__AVX512F__)
+    /* AVX-512 VNNI path: 256-bit dpbusd per chunk (4 rows x 8 values).
+     * Sign trick: dpbusd needs unsigned first operand. Use |act| * sign(wgt,act) = act*wgt.
+     * Per chunk: broadcast 8-byte activation chunk to 32 bytes, dpbusd with 32-byte weight chunk.
+     * Accumulate int32 across all 4 chunks, then extract + scale per block (d_act varies). */
+    const block_q4i_0x8 *bp = (const block_q4i_0x8 *)vx;
+    const block_q8_0 *ap = (const block_q8_0 *)wy;
+    int nb = n / 32;
+
+    float row_acc[8] = {0,0,0,0,0,0,0,0};
+    static const int even_rows[4] = {0, 1, 4, 5};
+    static const int odd_rows[4] = {2, 3, 6, 7};
+
+    /* 2-way block unrolling: independent accumulator pairs break the
+     * dpbusd dependency chain (4-deep per block -> 2 parallel chains). */
+    int nb2 = nb & ~1;  /* even count for unrolled loop */
+    int b = 0;
+    for (; b < nb2; b += 2) {
+        /* Two independent block chains (b, b+1) double dpbusd ILP */
+        const block_q4i_0x8 *blk0 = bp + b;
+        const block_q4i_0x8 *blk1 = bp + b + 1;
+        const block_q8_0 *ablk0 = ap + b;
+        const block_q8_0 *ablk1 = ap + b + 1;
+
+        /* Pre-broadcast activation chunks for both blocks */
+        __m256i act_bc0[4], act_abs0[4];
+        __m256i act_bc1[4], act_abs1[4];
+        for (int k = 0; k < 4; k++) {
+            int64_t a0 = *(const int64_t *)(ablk0->qs + k * 8);
+            int64_t a1 = *(const int64_t *)(ablk1->qs + k * 8);
+            act_bc0[k] = _mm256_set1_epi64x(a0);
+            act_bc1[k] = _mm256_set1_epi64x(a1);
+            act_abs0[k] = _mm256_sign_epi8(act_bc0[k], act_bc0[k]);  /* |act| */
+            act_abs1[k] = _mm256_sign_epi8(act_bc1[k], act_bc1[k]);
+        }
+
+        /* Chain 0: even group, block b */
+        __m256i acc_ev0 = _mm256_setzero_si256();
+        __m256i acc_od0 = _mm256_setzero_si256();
+        /* Chain 1: even group, block b+1 */
+        __m256i acc_ev1 = _mm256_setzero_si256();
+        __m256i acc_od1 = _mm256_setzero_si256();
+        for (int k = 0; k < 4; k++) {
+            __m256i wgt0 = _mm256_loadu_si256((const __m256i *)(blk0->qs + k * 32));
+            __m256i wgt0_s = _mm256_sign_epi8(wgt0, act_bc0[k]);
+            acc_ev0 = _mm256_dpbusd_epi32(acc_ev0, act_abs0[k], wgt0_s);
+            __m256i wgt1 = _mm256_loadu_si256((const __m256i *)(blk1->qs + k * 32));
+            __m256i wgt1_s = _mm256_sign_epi8(wgt1, act_bc1[k]);
+            acc_ev1 = _mm256_dpbusd_epi32(acc_ev1, act_abs1[k], wgt1_s);
+            /* Odd group (offset 128) */
+            __m256i wgt0o = _mm256_loadu_si256((const __m256i *)(blk0->qs + 128 + k * 32));
+            __m256i wgt0o_s = _mm256_sign_epi8(wgt0o, act_bc0[k]);
+            acc_od0 = _mm256_dpbusd_epi32(acc_od0, act_abs0[k], wgt0o_s);
+            __m256i wgt1o = _mm256_loadu_si256((const __m256i *)(blk1->qs + 128 + k * 32));
+            __m256i wgt1o_s = _mm256_sign_epi8(wgt1o, act_bc1[k]);
+            acc_od1 = _mm256_dpbusd_epi32(acc_od1, act_abs1[k], wgt1o_s);
+        }
+
+        /* Extract and accumulate per-block deltas (F16C batch conversion) */
+        int32_t ev0[8], od0[8], ev1[8], od1[8];
+        _mm256_storeu_si256((__m256i *)ev0, acc_ev0);
+        _mm256_storeu_si256((__m256i *)od0, acc_od0);
+        _mm256_storeu_si256((__m256i *)ev1, acc_ev1);
+        _mm256_storeu_si256((__m256i *)od1, acc_od1);
+
+        __m128 dlo0 = _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *)blk0->d));
+        __m128 dhi0 = _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *)(blk0->d + 4)));
+        __m128 dlo1 = _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *)blk1->d));
+        __m128 dhi1 = _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *)(blk1->d + 4)));
+        float dv0[8], dv1[8];
+        _mm_storeu_ps(dv0, dlo0);
+        _mm_storeu_ps(dv0 + 4, dhi0);
+        _mm_storeu_ps(dv1, dlo1);
+        _mm_storeu_ps(dv1 + 4, dhi1);
+        float d_act0 = fp16_to_fp32_table[ablk0->d];
+        float d_act1 = fp16_to_fp32_table[ablk1->d];
+
+        for (int ri = 0; ri < 4; ri++) {
+            int er = even_rows[ri], orr = odd_rows[ri];
+            row_acc[er] += dv0[er] * d_act0 * (float)(ev0[2*ri] + ev0[2*ri+1]);
+            row_acc[orr] += dv0[orr] * d_act0 * (float)(od0[2*ri] + od0[2*ri+1]);
+            row_acc[er] += dv1[er] * d_act1 * (float)(ev1[2*ri] + ev1[2*ri+1]);
+            row_acc[orr] += dv1[orr] * d_act1 * (float)(od1[2*ri] + od1[2*ri+1]);
+        }
+    }
+    /* Tail: odd block count */
+    for (; b < nb; b++) {
+        const block_q4i_0x8 *blk = bp + b;
+        const block_q8_0 *ablk = ap + b;
+        __m256i act_bc[4], act_abs[4];
+        for (int k = 0; k < 4; k++) {
+            int64_t a = *(const int64_t *)(ablk->qs + k * 8);
+            act_bc[k] = _mm256_set1_epi64x(a);
+            act_abs[k] = _mm256_sign_epi8(act_bc[k], act_bc[k]);
+        }
+        __m256i acc_ev = _mm256_setzero_si256();
+        __m256i acc_od = _mm256_setzero_si256();
+        for (int k = 0; k < 4; k++) {
+            __m256i wgt = _mm256_loadu_si256((const __m256i *)(blk->qs + k * 32));
+            acc_ev = _mm256_dpbusd_epi32(acc_ev, act_abs[k], _mm256_sign_epi8(wgt, act_bc[k]));
+            __m256i wgt_o = _mm256_loadu_si256((const __m256i *)(blk->qs + 128 + k * 32));
+            acc_od = _mm256_dpbusd_epi32(acc_od, act_abs[k], _mm256_sign_epi8(wgt_o, act_bc[k]));
+        }
+        int32_t ev[8], od[8];
+        _mm256_storeu_si256((__m256i *)ev, acc_ev);
+        _mm256_storeu_si256((__m256i *)od, acc_od);
+        __m128 dlo = _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *)blk->d));
+        __m128 dhi = _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *)(blk->d + 4)));
+        float dvals[8];
+        _mm_storeu_ps(dvals, dlo);
+        _mm_storeu_ps(dvals + 4, dhi);
+        float d_act = fp16_to_fp32_table[ablk->d];
+        for (int ri = 0; ri < 4; ri++) {
+            row_acc[even_rows[ri]] += dvals[even_rows[ri]] * d_act * (float)(ev[2*ri] + ev[2*ri+1]);
+            row_acc[odd_rows[ri]]  += dvals[odd_rows[ri]] * d_act * (float)(od[2*ri] + od[2*ri+1]);
+        }
+    }
+
+    for (int row = 0; row < 8 && row < nrows; row++)
+        out[row] = row_acc[row];
+    return;
+
+#elif defined(__AVX512BW__) && defined(__AVX512DQ__) && defined(__AVX512F__)
+    /* AVX-512 without VNNI: same layout, use maddubs + madd */
+    const block_q4i_0x8 *bp = (const block_q4i_0x8 *)vx;
+    const block_q8_0 *ap = (const block_q8_0 *)wy;
+    int nb = n / 32;
+
+    float row_acc[8] = {0,0,0,0,0,0,0,0};
+    static const int even_rows[4] = {0, 1, 4, 5};
+    static const int odd_rows[4] = {2, 3, 6, 7};
+    const __m256i ones = _mm256_set1_epi16(1);
+
+    for (int b = 0; b < nb; b++) {
+        const block_q4i_0x8 *blk = bp + b;
+        const block_q8_0 *ablk = ap + b;
+
+        __m256i act_bc[4];
+        __m256i act_abs[4];
+        for (int k = 0; k < 4; k++) {
+            int64_t a = *(const int64_t *)(ablk->qs + k * 8);
+            act_bc[k] = _mm256_set1_epi64x(a);
+            act_abs[k] = _mm256_sign_epi8(act_bc[k], act_bc[k]);
+        }
+
+        __m256i acc_ev = _mm256_setzero_si256();
+        __m256i acc_od = _mm256_setzero_si256();
+        for (int k = 0; k < 4; k++) {
+            __m256i wgt_ev = _mm256_loadu_si256((const __m256i *)(blk->qs + k * 32));
+            __m256i wgt_od = _mm256_loadu_si256((const __m256i *)(blk->qs + 128 + k * 32));
+            __m256i wgt_ev_s = _mm256_sign_epi8(wgt_ev, act_bc[k]);
+            __m256i wgt_od_s = _mm256_sign_epi8(wgt_od, act_bc[k]);
+            __m256i dot_ev = _mm256_maddubs_epi16(act_abs[k], wgt_ev_s);
+            __m256i dot_od = _mm256_maddubs_epi16(act_abs[k], wgt_od_s);
+            acc_ev = _mm256_add_epi32(acc_ev, _mm256_madd_epi16(ones, dot_ev));
+            acc_od = _mm256_add_epi32(acc_od, _mm256_madd_epi16(ones, dot_od));
+        }
+
+        int32_t ev[8], od[8];
+        _mm256_storeu_si256((__m256i *)ev, acc_ev);
+        _mm256_storeu_si256((__m256i *)od, acc_od);
+        float d_act = fp16_to_fp32_lookup(ablk->d);
+        float wd_ev[4], wd_od[4];
+        for (int ri = 0; ri < 4; ri++) {
+            wd_ev[ri] = fp16_to_fp32_lookup(blk->d[even_rows[ri]]) * d_act;
+            wd_od[ri] = fp16_to_fp32_lookup(blk->d[odd_rows[ri]]) * d_act;
+        }
+        for (int ri = 0; ri < 4; ri++) {
+            row_acc[even_rows[ri]] += wd_ev[ri] * (float)(ev[2*ri] + ev[2*ri+1]);
+            row_acc[odd_rows[ri]]  += wd_od[ri] * (float)(od[2*ri] + od[2*ri+1]);
+        }
+    }
+
+    for (int row = 0; row < 8 && row < nrows; row++)
+        out[row] = row_acc[row];
+    return;
+
+#else
+    /* Scalar fallback */
+    const block_q4i_0x8 *bp = (const block_q4i_0x8 *)vx;
+    const block_q8_0 *ap = (const block_q8_0 *)wy;
+    int nb = n / 32;
+    static const int group_rows[2][4] = {{0, 1, 4, 5}, {2, 3, 6, 7}};
+
+    for (int row = 0; row < nrows && row < 8; row++) {
+        int is_even = (row == 0 || row == 1 || row == 4 || row == 5);
+        const int *rows = group_rows[is_even ? 0 : 1];
+        int ri = -1;
+        for (int r = 0; r < 4; r++) if (rows[r] == row) { ri = r; break; }
+        int group_off = is_even ? 0 : 128;
+        float sumf = 0.0f;
+        for (int b = 0; b < nb; b++) {
+            float wd = fp16_to_fp32_lookup(bp[b].d[row]);
+            float ad = fp16_to_fp32_lookup(ap[b].d);
+            const int8_t *wp = bp[b].qs + group_off;
+            const int8_t *aq = ap[b].qs;
+            int32_t sumi = 0;
+            for (int k = 0; k < 4; k++) {
+                const int8_t *wv = wp + k * 32 + ri * 8;
+                const int8_t *av = aq + k * 8;
+                for (int v = 0; v < 8; v++)
+                    sumi += (int32_t)wv[v] * (int32_t)av[v];
+            }
+            sumf += wd * ad * (float)sumi;
+        }
+        out[row] = sumf;
     }
 #endif
 }

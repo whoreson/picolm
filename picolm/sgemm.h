@@ -54,6 +54,11 @@ int sgemm_q4_0x8_q8_0x4(int nr, int nc, int k,
         const void *vx, const void *vy, float *s, size_t bs,
         int ith, int nth);
 
+/* Q4I_0_8_8 GEMM (pre-dequantized int8): same interface, type 34 */
+int sgemm_q4i_0x8_q8_0x4(int nr, int nc, int k,
+        const void *vx, const void *vy, float *s, size_t bs,
+        int ith, int nth);
+
 #ifdef __cplusplus
 }
 #endif

@@ -336,6 +336,7 @@ typedef enum {
     GGUF_TYPE_Q4_0_4_4   = 31,  /* 4-row interleaved Q4_0, blocklen=4 (pre-repacked) */
     GGUF_TYPE_Q4_0_4_8   = 32,  /* 4-row interleaved Q4_0, blocklen=8 (pre-repacked, I8MM target) */
     GGUF_TYPE_Q4_0_8_8   = 33,  /* 8-row interleaved Q4_0 (pre-repacked, AVX2) */
+    GGUF_TYPE_Q4I_0_8_8  = 34,  /* 8-row pre-dequantized int8 Q4_0 (dpbusd lane order, AVX-512) */
     GGUF_TYPE_BF16      = 30,  /* Brain Float 16 (GGUF type 30) */
     GGUF_TYPE_IQ4_NL    = 20,  /* Non-linear 4-bit quant (LUT-based, same layout as Q4_0) */
     GGUF_TYPE_Q1_0       = 41,  /* 1-bit sign + scale, 128 values/block */
@@ -411,6 +412,16 @@ typedef struct PICOLM_PACKED_ATTR {
     uint16_t d[8];      /* 8 FP16 deltas, one per row */
     uint8_t  qs[128];   /* interleaved nibble-bytes (8 rows x 16 bytes, XOR'd with 0x88) */
 } block_q4_0x8;         /* 144 bytes */
+#pragma pack(pop)
+
+/* Q4I_0_8_8 (GGUF type 34): pre-dequantized int8 format for AVX-512 dpbusd.
+ * Layout (272 bytes): d[8] (16B FP16 scales) + qs[256] (8 rows x 32 signed int8).
+ * qs arranged in dpbusd lane order to eliminate blend+permute and LUT shuffles. */
+#pragma pack(push, 1)
+typedef struct PICOLM_PACKED_ATTR {
+    uint16_t d[8];      /* 8 FP16 deltas, one per row */
+    int8_t   qs[256];   /* 8 rows x 32 signed int8, dpbusd lane order */
+} block_q4i_0x8;        /* 272 bytes */
 #pragma pack(pop)
 
 /* Q3_K block: 256 weights in 110 bytes, layout: hmask[32] + qs[64] + scales[12] + d[2] */
@@ -697,6 +708,8 @@ void vec_dot_q4_0x4_4x8_q8_0(const void *vx, const void *wy, int n, float *out, 
 void gemm_q4_0_4x8_q8_0(const void *W, const void *X, int n, float *out, int d, int n_batch);
 /* Q4_0_8x8 interleaved weights x Q8_0 input (AVX2): processes nrows (multiple of 8) simultaneously */
 void vec_dot_q4_0x8_q8_0_avx2(const void *vx, const void *wy, int n, float *out, int nrows);
+/* Q4I_0_8_8 pre-dequantized int8 x Q8_0: AVX-512 VNNI (dpbusd) / maddubs / scalar fallback */
+void vec_dot_q4i_0x8_q8_0(const void *vx, const void *wy, int n, float *out, int nrows);
 /* Repack standard Q4_0 weights to Q4_0_8x8 interleaved format (for AVX2).
  * dst must have the same size as src (1:1 byte mapping, just reordered). */
 void repack_q4_0_to_q4_0x8(const void *src, void *dst, int nrows, int ncols);

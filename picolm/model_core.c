@@ -45,9 +45,12 @@
 #include <string.h>
 #include <math.h>
 #include <sys/types.h>
-#if !defined(_WIN32) && !defined(__DJGPP__)
+#if !defined(_WIN32) && !defined(__DJGPP__) && !defined(__FreeBSD__)
 #include <sys/resource.h>
 #include <alloca.h>
+#elif defined(__FreeBSD__) && !defined(_WIN32) && !defined(__DJGPP__)
+#include <sys/resource.h>
+#include <stdlib.h>  /* alloca() in <stdlib.h> on FreeBSD */
 #endif
 
 #ifdef PICOLM_GPU

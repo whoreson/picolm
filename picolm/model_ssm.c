@@ -10,7 +10,7 @@
 #endif
 #endif
 /* DJGPP: no alloca.h needed, uses __builtin_alloca */
-#if !defined(_WIN32) && !defined(__DJGPP__)
+#if !defined(_WIN32) && !defined(__DJGPP__) && !defined(__FreeBSD__)
 #include <alloca.h>
 #endif
 #include <string.h>
