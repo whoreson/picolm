@@ -1327,6 +1327,15 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                 fprintf(stderr, "WARN: Falling back to CPU inference\n");
                 goto gpu_skip;
             }
+            /* Gemma-3n: GPU path does NOT implement alt-up routing, laurel,
+             * per-layer embeddings, or Gemma-3n-specific norms/FFN structure.
+             * Only the shared MHA+FFN path exists, which would produce garbage.
+             * Block GPU usage entirely for Gemma-3n models. */
+            if (c->is_gemma3n) {
+                fprintf(stderr, "WARN: Gemma-3n architecture not supported on GPU (alt-up/laurel/per-layer-embd missing)\n");
+                fprintf(stderr, "WARN: Falling back to CPU inference\n");
+                goto gpu_skip;
+            }
             int q_dim = c->n_heads * c->head_dim;
             int kv_dim = c->n_kv_heads * c->head_dim;
             int uploaded = 0, attempted = 0;
