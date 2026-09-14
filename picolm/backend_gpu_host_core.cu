@@ -292,7 +292,13 @@ int picolm_gpu_mem_info(int device, size_t *free_bytes, size_t *total_bytes) {
 }
 
 /* Map GGUF_TYPE to block size and values per block.
- * F32 (0), F16 (1), BF16 (30): no blocks, each is an individual element. */
+ * F32 (0), F16 (1), BF16 (30): no blocks, each is an individual element.
+ *
+ * IMPORTANT: When adding a new quantization format, this function MUST be
+ * updated, or GPU tensor uploads will silently fail (return 0 from
+ * gguf_block_size -> upload function returns 0 -> NULL weight pointers ->
+ * garbled GPU output). See also picolm_quant_matmul kernel switch and
+ * picolm_gpu_upload_f32 for F32 tensors. */
 static int gguf_block_size(gguf_type_t qtype) {
     switch (qtype) {
     case 0:  return 0;    /* F32: no blocks */
@@ -306,6 +312,7 @@ static int gguf_block_size(gguf_type_t qtype) {
     case 12: return GPU_BLOCK_Q4_K_SIZE;  /* Q4_K: 144 bytes per 256 values */
     case 13: return GPU_BLOCK_Q5_K_SIZE;  /* Q5_K: 176 bytes per 256 values */
     case 14: return GPU_BLOCK_Q6_K_SIZE;  /* Q6_K: 210 bytes per 256 values */
+    case 20: return 18;   /* IQ4_NL: 18 bytes per 32 values (LUT-based, same layout as Q4_0) */
     case 41: return 18;   /* Q1_0: 18 bytes per 128 values */
     case 42: return 34;   /* Q2_0: 34 bytes per 128 values */
     default: return 0;
@@ -321,7 +328,13 @@ int picolm_gpu_tensor_upload(void **tensor,
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!select_ctx(ctx)) return 0;
     int bs = gguf_block_size(qtype);
-    if (!bs && qtype != 0 && qtype != 1 && qtype != 30) return 0;
+    if (!bs && qtype != 0 && qtype != 1 && qtype != 30) {
+        fprintf(stderr, "[GPU] upload FAIL: unsupported quantization type %d (I=%d O=%d)\n"
+                "  FIX: add case %d: return <block_size>; to gguf_block_size() in backend_gpu_host_core.cu\n"
+                "  Also: add dequant case to picolm_quant_matmul in backend_gpu_kernels.cu\n",
+                (int)qtype, I, O, (int)qtype);
+        return 0;
+    }
     if (*tp) return 1; /* idempotent */
 
     /* Compute row bytes */
@@ -466,6 +479,10 @@ int picolm_gpu_tensor_upload(void **tensor,
         *tp = t;
         return 1;
     }
+
+    /* IQ4_NL (type 20): native upload, same block layout as Q4_0 (18 bytes/32 values).
+     * Dequant via LUT in the picolm_iq4_nl_q8_matmul_imma kernel. */
+    /* Falls through to generic native upload below. */
 
     /* Try zero-copy first: register CPU memory with GPU (unified memory SoC) */
     /* NOTE: mmap'd file-backed memory can cause zero-copy to silently produce
@@ -1525,6 +1542,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
                                         t->qtype, S, I, O,
                                         (int)t->row_bytes, x_stride, ys);
     if (!gpu_ok(gpuGetLastError(), "matmul launch (dev)")) return 0;
+    /* Debug removed: was reading y_dev on default stream while kernel ran on ctx->stream */
     return 1;
 }
 

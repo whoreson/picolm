@@ -56,7 +56,7 @@ HIPFLAGS ?= -O3 -std=c++11 -fPIC -fPIE
 HIP_LIBS = -lamdhip64
 GPU_OBJS =
 
-# GPU host .cu sources (backend_gpu.cu has been split into modular files)
+# GPU host .cu sources (split into modular files)
 GPU_SRCS = backend_gpu_kernels.cu backend_gpu_host_core.cu backend_gpu_host_ssm.cu backend_gpu_host_misc.cu
 GPU_CUH  = backend_gpu_common.cuh backend_gpu_dequant.cuh backend_gpu_kernels.cuh
 
@@ -265,7 +265,7 @@ model:
 	fi
 
 clean:
-	-$(RM) $(TARGET) $(TARGET).exe $(OBJS) $(VIZ_OBJS) backend_gpu.o backend_gpu.o.hip backend_gpu.o.cuda backend_metal.o backend_vulkan.o
+	-$(RM) $(TARGET) $(TARGET).exe $(OBJS) $(VIZ_OBJS) backend_metal.o backend_vulkan.o
 	-$(RM) $(GPU_SRCS:%.cu=%-hip.o) $(GPU_SRCS:%.cu=%-cuda.o) backend_gpu.dlink.o
 	-$(RM) shaders/*.spv
 

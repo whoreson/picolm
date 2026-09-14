@@ -307,6 +307,36 @@ __device__ static inline float dequant_q5_K(const void *blk, int i) {
     return d * (float)sc * (float)(nibble + high_bit) - dm * (float)mn;
 }
 
+/* IQ4_NL dequant: 32 values in 18 bytes, same layout as Q4_0.
+ * Layout: d (fp16, offset 0) + qs[16] (uint8_t, offset 2).
+ * Each byte holds 2 nibbles [0..15]. Dequant via LUT:
+ *   dequant(i) = iq4_nl_lookup_table[nibble] * d
+ * The LUT maps 0..15 -> {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113}
+ * Ported from dequantize_row_iq4_nl() in quant.c. */
+__device__ static inline float dequant_iq4_nl(const void *blk, int i) {
+    const uint8_t *b = (const uint8_t *)blk;
+    uint16_t d_raw = b[0] | ((uint16_t)b[1] << 8);
+    float d = gpu_fp16_to_fp32(d_raw);
+    const uint8_t *qs = b + 2;
+    uint8_t ni;
+    if (i < 16) {
+        ni = qs[i] & 0xF;
+    } else {
+        ni = qs[i - 16] >> 4;
+    }
+    /* Inline LUT: Lloyd-Max 4-bit non-linear quantization levels */
+    int val;
+    if (ni ==  0) val = -127; else if (ni ==  1) val = -104;
+    else if (ni ==  2) val =  -83; else if (ni ==  3) val =  -65;
+    else if (ni ==  4) val =  -49; else if (ni ==  5) val =  -35;
+    else if (ni ==  6) val =  -22; else if (ni ==  7) val =  -10;
+    else if (ni ==  8) val =    1; else if (ni ==  9) val =   13;
+    else if (ni == 10) val =   25; else if (ni == 11) val =   38;
+    else if (ni == 12) val =   53; else if (ni == 13) val =   69;
+    else if (ni == 14) val =   89; else val =  113;
+    return (float)val * d;
+}
+
 /* ---- quant_matmul kernel ----
  *
  * Simple, correct GEMV kernel for all quant formats.
