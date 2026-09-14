@@ -4616,7 +4616,7 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
         }
 
         /* Standard path: RMSNorm -> QKV (uses bxb intermediate buffer). */
-        if (getenv("PICOLM_L0DBG") && l == 0) {
+        if (NULL && l == 0) {
             float _emb[8];
             picolm_gpu_memcpy(_emb, bx, 32, -1, gpu_dev);
             fprintf(stderr, "[L0DBG bx_raw][:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
@@ -4642,12 +4642,10 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
         }
 
         /* NaN guard after RMSNorm */
-        // Debug: read GPU RMSNorm diagnostics AFTER it runs
-        // Debug: CPU RMSNorm vs GPU RMSNorm AFTER
         _PFX_NAN_CHECK(bxb, "post_rmsnorm");
 
         /* Diagnostic: dump layer-0 intermediates */
-        if (getenv("PICOLM_L0DBG") && l == 0) {
+        if (NULL && l == 0) {
             float _t[8]; picolm_gpu_sync(gpu_dev);
             picolm_gpu_memcpy(_t, bxb, 32, -1, gpu_dev);
             fprintf(stderr, "[L0DBG bxb_rmsnorm][:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n", _t[0],_t[1],_t[2],_t[3],_t[4],_t[5],_t[6],_t[7]);
@@ -4661,7 +4659,7 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
                     fprintf(stderr,"INFO: GPT-2 fused QKV path (S=%d)\n",n_ubatch);}
                 picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_qkv,
                     bq, bxb, n_ubatch, gpu_dev, 3*dim, xb_stride);
-                if (getenv("PICOLM_L0DBG") && l == 0) {
+                if (NULL && l == 0) {
                     float _dq[8]; picolm_gpu_sync(gpu_dev);
                     picolm_gpu_memcpy(_dq, bq, 32, -1, gpu_dev);
                     fprintf(stderr, "[L0DBG bq8][:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
@@ -4720,7 +4718,7 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
             }
         }
         /* Debug: dump Q, K, V first 4 elements for layer 0 */
-        if (getenv("PICOLM_L0DBG") && l == 0) {
+        if (NULL && l == 0) {
             float _t[4]; picolm_gpu_sync(gpu_dev);
             picolm_gpu_memcpy(_t, bq, 16, -1, gpu_dev);
             fprintf(stderr, "[L0DBG bq][:4]={%.6f,%.6f,%.6f,%.6f}\n", _t[0],_t[1],_t[2],_t[3]);
@@ -4771,7 +4769,7 @@ after_qkv:
         /* Diagnostic: dump first attention layer K values after store */
 
         /* Diagnostic: dump Q values for first layer */
-        if (getenv("PICOLM_L0DBG") && l == 0) {
+        if (NULL && l == 0) {
             float _q[4]; picolm_gpu_sync(gpu_dev);
             picolm_gpu_memcpy(_q, bq, 16, -1, gpu_dev);
             fprintf(stderr, "[L0DBG bq][:4]={%.6f,%.6f,%.6f,%.6f}\n", _q[0],_q[1],_q[2],_q[3]);
@@ -4803,7 +4801,7 @@ after_qkv:
                                               seq_len, gpu_dev);
         }
         /* Diagnostic: dump attention output for first layer */
-        if (getenv("PICOLM_L0DBG") && l == 0) {
+        if (NULL && l == 0) {
             float _t[4]; picolm_gpu_sync(gpu_dev);
             picolm_gpu_memcpy(_t, battn_out + (size_t)(n_ubatch-1)*attn_out_stride, 16, -1, gpu_dev);
             fprintf(stderr, "[L0DBG attn_out][:4]={%.6f,%.6f,%.6f,%.6f}\n", _t[0],_t[1],_t[2],_t[3]);
@@ -4829,7 +4827,7 @@ after_qkv:
         }
         /* Residual add */
         picolm_gpu_residual_add(bx, bx, bxb, n_ubatch, dim, xb_stride, gpu_dev);
-        if (getenv("PICOLM_L0DBG") && l == 0) {
+        if (NULL && l == 0) {
             float _t[4]; picolm_gpu_sync(gpu_dev);
             picolm_gpu_memcpy(_t, bx + (size_t)(n_ubatch-1)*xb_stride, 16, -1, gpu_dev);
             fprintf(stderr, "[L0DBG bx_post_attn][:4]={%.6f,%.6f,%.6f,%.6f}\n", _t[0],_t[1],_t[2],_t[3]);
@@ -4917,7 +4915,7 @@ after_qkv:
     picolm_gpu_batch_end(gpu_dev);
     double _gpu_layer_total = get_time_ms() - _gpu_layer_t0;
     /* Debug: dump KV cache for layer 0 */
-    if (getenv("PICOLM_L0DBG")) {
+    if (NULL) {
         uint16_t *_kd = (uint16_t*)malloc(4 * 25 * 64 * sizeof(uint16_t));
         uint16_t *_vd = (uint16_t*)malloc(4 * 25 * 64 * sizeof(uint16_t));
         if (_kd && _vd) {

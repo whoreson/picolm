@@ -1318,6 +1318,15 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
             fprintf(stderr, "INFO: uploading model weights to GPU device %d\n", device);
 
             model_config_t *c = &m->config;
+
+            /* Capability check: GPU backend requires RMSNorm (no bias).
+             * GPT-2/CodeGen use LayerNorm (weight + bias). Detect by checking
+             * if the first layer has a norm bias tensor. */
+            if (c->is_gpt2 && !picolm_gpu_has_layernorm(device)) {
+                fprintf(stderr, "WARN: GPT-2 model uses LayerNorm (bias), GPU backend lacks LayerNorm shader\n");
+                fprintf(stderr, "WARN: Falling back to CPU inference\n");
+                goto gpu_skip;
+            }
             int q_dim = c->n_heads * c->head_dim;
             int kv_dim = c->n_kv_heads * c->head_dim;
             int uploaded = 0, attempted = 0;
@@ -1734,6 +1743,7 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
             }
         }
     }
+gpu_skip:;
 #endif
 
     /* Log tensor type distribution */
@@ -3095,7 +3105,7 @@ static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_to
         int l = slot;
         layer_weights_t *lw = &w->layers[l];
         BENCH_LAYER_START();
-        if (getenv("PICOLM_CPUDBG") && l == 0) {
+        if (NULL && l == 0) {
             fprintf(stderr, "[CPUL0DBG x_raw][:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
                 x_batch[0],x_batch[1],x_batch[2],x_batch[3],x_batch[4],x_batch[5],x_batch[6],x_batch[7]);
         }
@@ -3104,7 +3114,7 @@ static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_to
             layernorm(xb_batch + bi * dim, x_batch + bi * dim,
                       s->attn_norm_w[l], s->attn_norm_b[l], dim, c->rms_norm_eps);
 
-        if (getenv("PICOLM_CPUDBG") && l == 0) {
+        if (NULL && l == 0) {
             fprintf(stderr, "[CPUL0DBG xb_in8][:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
                 xb_batch[0],xb_batch[1],xb_batch[2],xb_batch[3],xb_batch[4],xb_batch[5],xb_batch[6],xb_batch[7]);
         }
@@ -3112,7 +3122,7 @@ static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_to
         tensor_set_repacked(m->repack_used[2 + l * 9] ? m->repack_buffers[2 + l * 9] : NULL);
         matmul_batch(q_batch, xb_batch, n_tokens, lw->attn_qkv, dim, 3 * dim, lw->type_attn_qkv);
         tensor_set_repacked(NULL);
-        if (getenv("PICOLM_CPUDBG") && l == 0) {
+        if (NULL && l == 0) {
             fprintf(stderr, "[CPUL0DBG bq8][:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
                 q_batch[0],q_batch[1],q_batch[2],q_batch[3],q_batch[4],q_batch[5],q_batch[6],q_batch[7]);
         }
@@ -3198,7 +3208,7 @@ static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_to
 
         /* Attention (batched) - Q is in xb2_batch (compact), output goes to xb_batch */
         memset(xb_batch, 0, (size_t)n_tokens * max_dim * sizeof(float));
-        if (getenv("PICOLM_CPUDBG") && l == 0) {
+        if (NULL && l == 0) {
             fprintf(stderr, "[CPUL0DBG bq][:4]={%.6f,%.6f,%.6f,%.6f}\n", xb2_batch[0],xb2_batch[1],xb2_batch[2],xb2_batch[3]);
         }
         {
@@ -3215,7 +3225,7 @@ static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_to
 
         /* Output projection (batched) */
         /* Debug: dump attention output for layer 0, last token */
-        if (getenv("PICOLM_CPUDBG") && l == 0) {
+        if (NULL && l == 0) {
             int lt = n_tokens - 1;
             fprintf(stderr, "[CPUDBG attn_out L0][:4]={%.6f,%.6f,%.6f,%.6f}\n",
                     xb_batch[lt*dim], xb_batch[lt*dim+1], xb_batch[lt*dim+2], xb_batch[lt*dim+3]);

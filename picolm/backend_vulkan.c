@@ -1345,9 +1345,10 @@ int picolm_gpu_init(const int *devices, int count) {
     strncpy(G.device_name, p.deviceName, sizeof(G.device_name) - 1);
     G.device_name[sizeof(G.device_name) - 1] = '\0';
 
-    fprintf(stderr, "[VK] ready: %s, compute qfam %u, memtype %u%s, local=%u, sg=%d\n",
+    fprintf(stderr, "[VK] ready: %s, compute qfam %u, memtype %u%s%s, local=%u, sg=%d\n",
             G.device_name, G.qfam, G.memtype,
             G.shader_nrm ? ", rmsnorm" : "",
+            G.shader_ln ? ", layernorm" : "",
             G.memtype_local, G.subgroup_size);
     return 1;
 }
@@ -1517,6 +1518,7 @@ void picolm_gpu_shutdown(void) {
 
 int picolm_gpu_device_count(void) { return G.ready ? G.device_count : 0; }
 int picolm_gpu_has_push_descriptors(void) { return G.ready ? G.push_desc_supported : 0; }
+int picolm_gpu_has_layernorm(int device) { return G.ready && G.shader_ln != VK_NULL_HANDLE && device == 0 ? 1 : 0; }
 
 int picolm_gpu_device_at(int index) {
     if (index < 0 || index >= G.device_count) return -1;
@@ -2580,7 +2582,7 @@ int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_d
     // Q8_0 fast path (quantize + q8q8) requires push descriptors.
     // Falls back to scalar matmul on platforms without push descriptors.
     if (t->qtype == GGUF_TYPE_Q8_0 && G.shader_quantize && G.shader_q8q8 && G.push_desc_supported) {
-        if (getenv("PICOLM_DISPATCH") && _g_dispatch_logged++ < 100 + 100)
+        if (NULL && _g_dispatch_logged++ < 100 + 100)
             fprintf(stderr, "DISPATCH matmul_dev: Q8_0 I=%d O=%d S=%d\n",t->I,t->O,S);
         if (_quantize_dev(x_dev, t->I, S)) {
             VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -2603,7 +2605,7 @@ int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_d
                                    0, sizeof(pc), pc); \
                 vkCmdDispatch(G.cmd_dev, (uint32_t)((t->O + 15) / 16), (uint32_t)S, 1); \
                 _g_dispatch_cnt++; ok = 1; \
-                if (getenv("PICOLM_DISPATCH") && _g_dispatch_logged++ < 100 + 100) \
+                if (NULL && _g_dispatch_logged++ < 100 + 100) \
                     fprintf(stderr, "DISPATCH matmul_dev: dedicated " #name " I=%d O=%d S=%d\n", t->I, t->O, S); \
             }
         TRY_DED_SHADER(GGUF_TYPE_Q2_K, q2k);
@@ -2612,7 +2614,7 @@ int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_d
         TRY_DED_SHADER(GGUF_TYPE_Q6_K, q6k);
         TRY_DED_SHADER(GGUF_TYPE_Q4_K, q4k);
         if (!ok) {
-            if (getenv("PICOLM_DISPATCH") && _g_dispatch_logged++ < 100 + 100)
+            if (NULL && _g_dispatch_logged++ < 100 + 100)
                 fprintf(stderr, "DISPATCH matmul_dev: fallback scalar I=%d O=%d S=%d qtype=%d\n",t->I,t->O,S,t->qtype);
             VkDescriptorBufferInfo bi[3] = {xbi, {t->wbuf,0,VK_WHOLE_SIZE}, ybi};
             VK_BATCH_BIND(G.pipe);
@@ -2674,7 +2676,7 @@ int picolm_gpu_matmul_dev_qkv(picolm_gpu_tensor_t *tq, picolm_gpu_tensor_t *tk,
         vkCmdDispatch(G.cmd_dev, (total + 255u) / 256u, 1, 1);
         _g_dispatch_cnt++;
 
-        if (getenv("PICOLM_DISPATCH"))
+        if (NULL)
             fprintf(stderr, "DISPATCH qkv_dev: TRUED FUSED QKV I=%d S=%d Oq=%d Ok=%d Ov=%d\n",
                     tq->I, S, tq->O, tk->O, tv->O);
         return 1;
@@ -2733,7 +2735,7 @@ int picolm_gpu_matmul_dev_qkv(picolm_gpu_tensor_t *tq, picolm_gpu_tensor_t *tk,
           vkCmdDispatch(G.cmd_dev, (total + 255u) / 256u, 1, 1);
           _g_dispatch_cnt++; }
 
-        if (getenv("PICOLM_DISPATCH"))
+        if (NULL)
             fprintf(stderr, "DISPATCH qkv_dev: FUSED QUANT I=%d S=%d\n", tq->I, S);
         return 1;
     }
@@ -2777,7 +2779,7 @@ int picolm_gpu_matmul_dev_gu(picolm_gpu_tensor_t *tg, picolm_gpu_tensor_t *tu,
         vkCmdDispatch(G.cmd_dev, (total + 255u) / 256u, 1, 1);
         _g_dispatch_cnt++;
 
-        if (getenv("PICOLM_DISPATCH"))
+        if (NULL)
             fprintf(stderr, "DISPATCH gu_dev: TRUED FUSED GU I=%d S=%d Og=%d Ou=%d\n",
                     tg->I, S, tg->O, tu->O);
         return 1;
@@ -2819,7 +2821,7 @@ int picolm_gpu_matmul_dev_gu(picolm_gpu_tensor_t *tg, picolm_gpu_tensor_t *tu,
           vkCmdDispatch(G.cmd_dev, (total + 255u) / 256u, 1, 1);
           _g_dispatch_cnt++; }
 
-        if (getenv("PICOLM_DISPATCH"))
+        if (NULL)
             fprintf(stderr, "DISPATCH gu_dev: FUSED QUANT I=%d S=%d\n", tg->I, S);
         return 1;
     }
@@ -3197,7 +3199,7 @@ int picolm_gpu_kv_store_dev_batched(int is_k, int lo, int sp, int np,
                                      const float *sd, int nkh, int hd,
                                      int msl, int device) {
     if (_kv_store_native(is_k, lo, sp, np, sd, nkh, hd, msl, device, 0)) return 1;
-    if (getenv("PICOLM_DISPATCH") && _g_dispatch_logged++ < 100 + 100)
+    if (NULL && _g_dispatch_logged++ < 100 + 100)
         fprintf(stderr, "DISPATCH kv_store: FALLBACK (D2H+CPU+H2D)\n");
     /* Fallback: D2H + CPU convert + H2D (only hit if kv_store_vk.spv failed to load) */
     if (!G.ready || !sd || device != 0) return 0;
@@ -3635,7 +3637,7 @@ int picolm_gpu_attention_decode_dev(float *xb_out_dev, const float *q_dev,
     uint32_t nwg = (nh + 255) / 256;
     vkCmdDispatch(G.cmd_dev, nwg, 1, 1);
     _g_dispatch_cnt++;
-    if (getenv("PICOLM_DISPATCH")) {
+    if (NULL) {
         fprintf(stderr, "DISPATCH attn_decode_dev: lo=%d pos=%d nh=%d nkh=%d hd=%d msl=%d\n",
                 lo, pos, nh, nkh, hd, msl);
     }
@@ -3665,7 +3667,6 @@ int picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
 
         VkDescriptorBufferInfo bi[4] = { qbi, kbi, vbi, obbi };
         uint32_t total = (uint32_t)nh * (uint32_t)nt;
-        fprintf(stderr, "[VK] attn_f16: lo=%d sp=%d nt=%d nh=%d nkh=%d hd=%d msl=%d total=%d\n", lo, sp, nt, nh, nkh, hd, msl, total);
         VK_BATCH_DISPATCH_PRE();
 
         // Barrier: Q write -> shader read; KV cache write -> shader read

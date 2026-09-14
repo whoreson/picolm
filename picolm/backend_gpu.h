@@ -587,6 +587,8 @@ int picolm_gpu_rmsnorm(float *out, const float *x, const float *weight,
 /* Device-native batched rmsnorm: all device pointers, no H2D/D2H/sync. */
 int picolm_gpu_rmsnorm_batched_dev(float *out, const float *x, const float *weight,
                                     int dim, float eps, int S, int x_stride, int device);
+/* Return 1 if GPU backend supports LayerNorm (mean + bias). */
+int picolm_gpu_has_layernorm(int device);
 /* Batched LayerNorm (mean subtraction + bias): for GPT-2/CodeGen. */
 int picolm_gpu_layernorm_batched_dev(float *out, const float *x, const float *weight,
                                       const float *bias, int dim, float eps,

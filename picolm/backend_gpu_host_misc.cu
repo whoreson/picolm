@@ -1094,6 +1094,87 @@ picolm_gpu_rmsnorm_batched_kernel(float *out, const float *x, const float *weigh
     }
 }
 
+/* LayerNorm kernel (mean subtraction + bias): GPT-2/CodeGen.
+ * Two-pass per block: pass 1 computes mean, pass 2 normalizes + bias.
+ * out[d] = (x[d] - mean) / sqrt(var + eps) * weight[d] + bias[d] */
+__global__ void
+picolm_gpu_layernorm_kernel(float *out, const float *x, const float *weight,
+                             const float *bias, int dim, float eps) {
+    /* Pass 1: compute mean */
+    float sum = 0.0f;
+    for (int i = gpuThreadIdx_x; i < dim; i += gpuBlockDim_x) {
+        sum += x[i];
+    }
+    __shared__ float ssum[256];
+    ssum[gpuThreadIdx_x] = sum;
+    gpuSyncthreads();
+    for (int s = gpuBlockDim_x / 2; s > 0; s >>= 1) {
+        if (gpuThreadIdx_x < s) ssum[gpuThreadIdx_x] += ssum[gpuThreadIdx_x + s];
+        gpuSyncthreads();
+    }
+    float mean = ssum[0] / dim;
+
+    /* Pass 2: compute variance and write output */
+    float var = 0.0f;
+    for (int i = gpuThreadIdx_x; i < dim; i += gpuBlockDim_x) {
+        float diff = x[i] - mean;
+        var += diff * diff;
+    }
+    ssum[gpuThreadIdx_x] = var;
+    gpuSyncthreads();
+    for (int s = gpuBlockDim_x / 2; s > 0; s >>= 1) {
+        if (gpuThreadIdx_x < s) ssum[gpuThreadIdx_x] += ssum[gpuThreadIdx_x + s];
+        gpuSyncthreads();
+    }
+    float inv_rms = 1.0f / sqrtf(ssum[0] / dim + eps);
+
+    for (int d = gpuThreadIdx_x; d < dim; d += gpuBlockDim_x) {
+        out[d] = (x[d] - mean) * inv_rms * weight[d] + bias[d];
+    }
+}
+
+/* Batched LayerNorm: one block per row (S rows). */
+__global__ void
+picolm_gpu_layernorm_batched_kernel(float *out, const float *x, const float *weight,
+                                     const float *bias, int dim, float eps, int x_stride) {
+    int row = (int)gpuBlockIdx_x;
+    int stride = (x_stride > 0) ? x_stride : dim;
+    const float *xr = x + (size_t)row * stride;
+    float *outr = out + (size_t)row * stride;
+
+    /* Pass 1: mean */
+    float sum = 0.0f;
+    for (int i = gpuThreadIdx_x; i < dim; i += gpuBlockDim_x) {
+        sum += xr[i];
+    }
+    __shared__ float ssum[256];
+    ssum[gpuThreadIdx_x] = sum;
+    gpuSyncthreads();
+    for (int s = gpuBlockDim_x / 2; s > 0; s >>= 1) {
+        if (gpuThreadIdx_x < s) ssum[gpuThreadIdx_x] += ssum[gpuThreadIdx_x + s];
+        gpuSyncthreads();
+    }
+    float mean = ssum[0] / dim;
+
+    /* Pass 2: variance + write */
+    float var = 0.0f;
+    for (int i = gpuThreadIdx_x; i < dim; i += gpuBlockDim_x) {
+        float diff = xr[i] - mean;
+        var += diff * diff;
+    }
+    ssum[gpuThreadIdx_x] = var;
+    gpuSyncthreads();
+    for (int s = gpuBlockDim_x / 2; s > 0; s >>= 1) {
+        if (gpuThreadIdx_x < s) ssum[gpuThreadIdx_x] += ssum[gpuThreadIdx_x + s];
+        gpuSyncthreads();
+    }
+    float inv_rms = 1.0f / sqrtf(ssum[0] / dim + eps);
+
+    for (int d = gpuThreadIdx_x; d < dim; d += gpuBlockDim_x) {
+        outr[d] = (xr[d] - mean) * inv_rms * weight[d] + bias[d];
+    }
+}
+
 /* Batched RoPE: each element computes its own absolute position's table
  * row. x is [S][n_heads][head_dim] contiguous, positions start_pos..start_pos+S-1.
  * One launch for the whole prefill chunk. */
@@ -1356,6 +1437,40 @@ picolm_gpu_rmsnorm_batched(float *out, const float *x, const float *weight,
     picolm_gpu_rmsnorm_batched_kernel<<<S, n_threads, 0, ctx->stream>>>(
         out, x, (const float *)w_dev, dim, eps, x_stride);
     if (!gpu_ok(gpuGetLastError(), "rmsnorm batched kernel")) return 0;
+    return 1;
+}
+
+/* Capability query: does this backend support LayerNorm? */
+extern "C" int
+picolm_gpu_has_layernorm(int device) {
+    return 1; /* CUDA/HIP: LayerNorm kernel always available */
+}
+
+/* Device-native LayerNorm: single token, device pointers, no sync. */
+extern "C" int
+picolm_gpu_layernorm_dev(float *out, const float *x, const float *weight,
+                          const float *bias, int dim, float eps, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    int n_threads = min(dim, 256);
+    picolm_gpu_layernorm_kernel<<<1, n_threads, 0, ctx->stream>>>(
+        out, x, weight, bias, dim, eps);
+    if (!gpu_ok(gpuGetLastError(), "layernorm dev kernel")) return 0;
+    return 1;
+}
+
+/* Device-native batched LayerNorm: all device pointers, no H2D/D2H/sync. */
+extern "C" int
+picolm_gpu_layernorm_batched_dev(float *out, const float *x, const float *weight,
+                                  const float *bias, int dim, float eps,
+                                  int S, int x_stride, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    if (S < 1) return 0;
+    int n_threads = min(dim, 256);
+    picolm_gpu_layernorm_batched_kernel<<<S, n_threads, 0, ctx->stream>>>(
+        out, x, weight, bias, dim, eps, x_stride);
+    if (!gpu_ok(gpuGetLastError(), "layernorm batched dev kernel")) return 0;
     return 1;
 }
 
