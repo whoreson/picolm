@@ -2690,7 +2690,7 @@ int picolm_gpu_matmul_dev_qkv(picolm_gpu_tensor_t *tq, picolm_gpu_tensor_t *tk,
         VK_BATCH_BIND(G.pipe_qkv);
         push_desc_8(G.cmd_dev, 8, bi);
         vkCmdPushConstants(G.cmd_dev, G.plyt_qkv, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        vkCmdDispatch(G.cmd_dev, (total + 255u) / 256u, 1, 1);
+        vkCmdDispatch(G.cmd_dev, (total + 63u) / 64u, 1, 1);
         _g_dispatch_cnt++;
 
         if (NULL)
@@ -2793,7 +2793,7 @@ int picolm_gpu_matmul_dev_gu(picolm_gpu_tensor_t *tg, picolm_gpu_tensor_t *tu,
         VK_BATCH_BIND(G.pipe_gu);
         push_desc_6(G.cmd_dev, 6, bi);
         vkCmdPushConstants(G.cmd_dev, G.plyt_gu, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        vkCmdDispatch(G.cmd_dev, (total + 255u) / 256u, 1, 1);
+        vkCmdDispatch(G.cmd_dev, (total + 63u) / 64u, 1, 1);
         _g_dispatch_cnt++;
 
         if (NULL)

@@ -4756,9 +4756,9 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
         }
         /* Debug: dump Q, K, V first 4 elements for layer 0 */
         if (NULL && l == 0) {
-            float _t[4]; picolm_gpu_sync(gpu_dev);
-            picolm_gpu_memcpy(_t, bq, 16, -1, gpu_dev);
-            fprintf(stderr, "[L0DBG bq][:4]={%.6f,%.6f,%.6f,%.6f}\n", _t[0],_t[1],_t[2],_t[3]);
+            float _t[4] = {0}; picolm_gpu_sync(gpu_dev);
+            int rc = picolm_gpu_memcpy(_t, bq, 16, -1, gpu_dev);
+            fprintf(stderr, "[L0DBG bq][:4]={%.6f,%.6f,%.6f,%.6f} ptr=%p rc=%d\n", _t[0],_t[1],_t[2],_t[3], (void*)bq, rc);
         }
         { char _ts_label[64]; snprintf(_ts_label, 64, "LAYER_%d_POSTQKV", l); picolm_gpu_ts_write(_ts_label); }
 after_qkv:
@@ -4846,12 +4846,6 @@ after_qkv:
                                               attn_ord, start_pos, n_ubatch,
                                               n_heads, n_kv_heads, head_dim,
                                               seq_len, gpu_dev);
-        }
-        /* Diagnostic: dump attention output for first layer */
-        if (NULL && l == 0) {
-            float _t[4]; picolm_gpu_sync(gpu_dev);
-            picolm_gpu_memcpy(_t, battn_out + (size_t)(n_ubatch-1)*attn_out_stride, 16, -1, gpu_dev);
-            fprintf(stderr, "[L0DBG attn_out][:4]={%.6f,%.6f,%.6f,%.6f}\n", _t[0],_t[1],_t[2],_t[3]);
         }
         { char _ts_label[64]; snprintf(_ts_label, 64, "LAYER_%d_POSTATTN", l); picolm_gpu_ts_write(_ts_label); }
 
