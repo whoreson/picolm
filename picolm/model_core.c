@@ -1592,6 +1592,14 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                                     picolm_gpu_upload_f32(s->attn_norm_w[l], c->n_embd, device);
                                 /* GPT-2 LayerNorm bias */
                                 if (s->attn_norm_b[l]) {
+                                    if (getenv("PICOLM_DBG") && l == 0) {
+                                        fprintf(stderr, "[CPUDBG LN weight][:4]={%.6f,%.6f,%.6f,%.6f}\n",
+                                                s->attn_norm_w[l][0], s->attn_norm_w[l][1],
+                                                s->attn_norm_w[l][2], s->attn_norm_w[l][3]);
+                                        fprintf(stderr, "[CPUDBG LN bias][:4]={%.6f,%.6f,%.6f,%.6f}\n",
+                                                s->attn_norm_b[l][0], s->attn_norm_b[l][1],
+                                                s->attn_norm_b[l][2], s->attn_norm_b[l][3]);
+                                    }
                                     m->gpu.attn_norm_bias_dev[l] =
                                         picolm_gpu_upload_f32(s->attn_norm_b[l], c->n_embd, device);
                                 }
@@ -1616,11 +1624,20 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                                 if (m->weights.layers[l].attn_qkv_bias) {
                                     m->gpu.attn_qkv_bias_dev[l] =
                                         picolm_gpu_upload_f32((float *)m->weights.layers[l].attn_qkv_bias, 3*c->n_embd, device);
+                                }
                                 /* GPT-2 output bias: [dim] F32 */
                                 if (m->weights.layers[l].attn_output_bias) {
                                     m->gpu.attn_output_bias_dev[l] =
                                         picolm_gpu_upload_f32((float *)m->weights.layers[l].attn_output_bias, c->n_embd, device);
                                 }
+                                /* GPT-2 FFN biases */
+                                if (m->weights.layers[l].ffn_up_bias) {
+                                    m->gpu.ffn_up_bias_dev[l] =
+                                        picolm_gpu_upload_f32((float *)m->weights.layers[l].ffn_up_bias, c->n_ffn, device);
+                                }
+                                if (m->weights.layers[l].ffn_down_bias) {
+                                    m->gpu.ffn_down_bias_dev[l] =
+                                        picolm_gpu_upload_f32((float *)m->weights.layers[l].ffn_down_bias, c->n_embd, device);
                                 }
                             }
 
@@ -3137,6 +3154,11 @@ static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_to
         for (int bi = 0; bi < n_tokens; bi++)
             layernorm(xb_batch + bi * dim, x_batch + bi * dim,
                       s->attn_norm_w[l], s->attn_norm_b[l], dim, c->rms_norm_eps);
+        if (l == 0 && getenv("PICOLM_DBG")) {
+            fprintf(stderr, "[CPUL0 xb_post_ln][:4]={%.6f,%.6f,%.6f,%.6f}\n",
+                    xb_batch[(n_tokens-1)*dim], xb_batch[(n_tokens-1)*dim+1],
+                    xb_batch[(n_tokens-1)*dim+2], xb_batch[(n_tokens-1)*dim+3]);
+        }
 
         if (NULL && l == 0) {
             fprintf(stderr, "[CPUL0DBG xb_in8][:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
@@ -3255,6 +3277,15 @@ static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_to
                                   s->kv_head_stride_k, s->kv_head_stride_v,
                                   1.0f / sqrtf((float)head_dim));
         }
+        /* Debug: dump Q for last token, head 0, layer 0 */
+        if (l == 0 && getenv("PICOLM_DBG")) {
+            int lt = n_tokens - 1;
+            int q_off = lt * dim + 0 * head_dim;  /* head 0 */
+            fprintf(stderr, "[CPUL0 Q_t3_h0][:4]={%.6f,%.6f,%.6f,%.6f}\n",
+                    xb2_batch[q_off], xb2_batch[q_off+1], xb2_batch[q_off+2], xb2_batch[q_off+3]);
+            fprintf(stderr, "[CPUL0 attn_out][:4]={%.6f,%.6f,%.6f,%.6f}\n",
+                    xb_batch[lt*dim], xb_batch[lt*dim+1], xb_batch[lt*dim+2], xb_batch[lt*dim+3]);
+        }
 
         /* Output projection (batched) */
         /* Debug: dump attention output for layer 0, last token */
@@ -3282,6 +3313,11 @@ static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_to
         for (int bi = 0; bi < n_tokens; bi++) {
             float *a = x_batch + bi * dim, *b = xb2_batch + bi * dim;
             for (int d2 = 0; d2 < dim; d2++) a[d2] += b[d2];
+        }
+        if (l == 0 && getenv("PICOLM_DBG")) {
+            fprintf(stderr, "[CPUL0 bx_post_attn][:4]={%.6f,%.6f,%.6f,%.6f}\n",
+                    x_batch[(n_tokens-1)*dim], x_batch[(n_tokens-1)*dim+1],
+                    x_batch[(n_tokens-1)*dim+2], x_batch[(n_tokens-1)*dim+3]);
         }
 
         /* FFN LayerNorm */
@@ -3324,9 +3360,19 @@ static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_to
             float *a = x_batch + bi * dim, *b = xb_batch + bi * dim;
             for (int d2 = 0; d2 < dim; d2++) a[d2] += b[d2];
         }
+        if (l == 0 && getenv("PICOLM_DBG")) {
+            fprintf(stderr, "[CPUL0 x_post_ffn][:4]={%.6f,%.6f,%.6f,%.6f}\n",
+                    x_batch[(n_tokens-1)*dim], x_batch[(n_tokens-1)*dim+1],
+                    x_batch[(n_tokens-1)*dim+2], x_batch[(n_tokens-1)*dim+3]);
+        }
 #ifdef PICOLM_VIZ
         viz_push_layer(l, x_batch + (n_tokens - 1) * dim, dim);
 #endif
+        if (_PICOLM_DBG_RUNTIME && (l < 3 || l == c->n_layers - 1)) {
+            fprintf(stderr, "[CPU PFX l=%d] bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n",
+                    l, x_batch[(n_tokens-1)*dim], x_batch[(n_tokens-1)*dim+1],
+                    x_batch[(n_tokens-1)*dim+2], x_batch[(n_tokens-1)*dim+3]);
+        }
         BENCH_LAYER_END(l, 1);
     }
 
@@ -3334,6 +3380,12 @@ static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_to
     layernorm(s->x, x_batch + (n_tokens - 1) * dim,
               s->output_norm_w, s->output_norm_b, dim, c->rms_norm_eps);
 
+    /* Debug: dump GPT-2 CPU final hidden state */
+    if (getenv("PICOLM_DBG")) {
+        double cr=0; for(int _i=0;_i<dim;_i++){float a=s->x[_i];cr+=a*a;}
+        fprintf(stderr,"[CPU GPT2 s->x][:4]={%.6f,%.6f,%.6f,%.6f} rms=%.6f\n",
+                s->x[0],s->x[1],s->x[2],s->x[3],sqrtf(cr/dim));
+    }
     /* Output projection -> logits */
     tensor_set_repacked(m->repack_used[1] ? m->repack_buffers[1] : NULL);
     matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);

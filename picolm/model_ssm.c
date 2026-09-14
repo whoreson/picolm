@@ -4419,15 +4419,25 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
                     picolm_gpu_silu_mul_dev(pipe_gate, pipe_up, n_ffn, gpu_dev);
                 }
             } else {
-                /* GPT-2 style: gate = GELU(ffn_up @ norm), no separate gate */
+                /* GPT-2 style: gate = GELU(ffn_up @ norm + bias), no separate gate */
                 picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_up,
                                        pipe_gate, pipe_ffn_norm, 1, gpu_dev, 0, 0);
+                /* GPT-2 FFN up bias (decode) */
+                if (gw->ffn_up_bias_dev[l]) {
+                    picolm_gpu_residual_add(pipe_gate, pipe_gate,
+                                            (float *)gw->ffn_up_bias_dev[l], 1, n_ffn, 0, gpu_dev);
+                }
                 picolm_gpu_gelu_dev(pipe_gate, n_ffn, gpu_dev);
             }
 
             /* O. Down: pipe_xb = ffn_down @ pipe_gate */
             picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_down,
                                    pipe_xb, pipe_gate, 1, gpu_dev, q_pipeline_dim, 0);
+            /* GPT-2 FFN down bias (decode) */
+            if (gw->ffn_down_bias_dev[l]) {
+                picolm_gpu_residual_add(pipe_xb, pipe_xb,
+                                        (float *)gw->ffn_down_bias_dev[l], 1, dim, 0, gpu_dev);
+            }
 
             /* P. Residual add: pipe_x += pipe_xb */
             picolm_gpu_residual_add(pipe_x, pipe_x, pipe_xb, 1, dim, q_pipeline_dim, gpu_dev);
@@ -4640,6 +4650,7 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
         /* GPT-2 uses LayerNorm (with bias), modern models use RMSNorm */
         if (gw->attn_norm_bias_dev[l]) {
             /* LayerNorm path */
+            if (getenv("PICOLM_DBG") && l == 0) fprintf(stderr, "[LNDBG] Using LayerNorm path (bias present)\n");
             if (!picolm_gpu_layernorm_batched_dev(bxb, bx,
                     (float *)gw->attn_norm_dev[l], (float *)gw->attn_norm_bias_dev[l],
                     dim, c->rms_norm_eps, n_ubatch, xb_stride, gpu_dev)) {
@@ -4655,7 +4666,18 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
         /* NaN guard after RMSNorm */
         _PFX_NAN_CHECK(bxb, "post_rmsnorm");
 
-        /* Diagnostic: dump layer-0 intermediates */
+        /* Diagnostic: dump layer-0 intermediates (last token only, for CPU comparison) */
+        if (l == 0 && getenv("PICOLM_DBG")) {
+            float _t[8]; picolm_gpu_sync(gpu_dev);
+            void *bx_last = (void*)((uintptr_t)bx + (size_t)(n_ubatch-1) * (size_t)xb_stride * sizeof(float));
+            void *bxb_last = (void*)((uintptr_t)bxb + (size_t)(n_ubatch-1) * (size_t)xb_stride * sizeof(float));
+            picolm_gpu_memcpy(_t, bx_last, 32, -1, gpu_dev);
+            fprintf(stderr, "[GPUT L0 bx_pre_ln][:4]={%.6f,%.6f,%.6f,%.6f}\n", _t[0],_t[1],_t[2],_t[3]);
+            memset(_t, 0, sizeof(_t));
+            picolm_gpu_memcpy(_t, bxb_last, 32, -1, gpu_dev);
+            fprintf(stderr, "[GPUT L0 bxb_post_ln][:4]={%.6f,%.6f,%.6f,%.6f}\n", _t[0],_t[1],_t[2],_t[3]);
+        }
+
         if (NULL && l == 0) {
             float _t[8]; picolm_gpu_sync(gpu_dev);
             picolm_gpu_memcpy(_t, bxb, 32, -1, gpu_dev);
@@ -4803,20 +4825,19 @@ after_qkv:
         picolm_gpu_kv_store_dev_batched(0, attn_ord, start_pos, n_ubatch,
                                          bv, n_kv_heads, head_dim, seq_len, gpu_dev);
 
-        /* Diagnostic: dump K, V buffers after D2D split */
-        if (NULL && l == 0) {
-            float _k[4], _v[4]; picolm_gpu_sync(gpu_dev);
-            picolm_gpu_memcpy(_k, bk, 16, -1, gpu_dev);
-            picolm_gpu_memcpy(_v, bv, 16, -1, gpu_dev);
-            fprintf(stderr, "[L0DBG bk][:4]={%.6f,%.6f,%.6f,%.6f}\n", _k[0],_k[1],_k[2],_k[3]);
-            fprintf(stderr, "[L0DBG bv][:4]={%.6f,%.6f,%.6f,%.6f}\n", _v[0],_v[1],_v[2],_v[3]);
-        }
-
-        /* Diagnostic: dump Q values for first layer */
-        if (NULL && l == 0) {
-            float _q[4]; picolm_gpu_sync(gpu_dev);
-            picolm_gpu_memcpy(_q, bq, 16, -1, gpu_dev);
-            fprintf(stderr, "[L0DBG bq][:4]={%.6f,%.6f,%.6f,%.6f}\n", _q[0],_q[1],_q[2],_q[3]);
+        /* Diagnostic: dump Q/K/V for last token, head 0, layer 0 */
+        if (l == 0 && getenv("PICOLM_DBG")) {
+            float _q[64], _k[256], _v[256]; picolm_gpu_sync(gpu_dev);
+            float *qbuf = (gl->attn_qkv && !gl->attn_q) ? bffn_norm : bq;
+            void *q_last = (void*)((uintptr_t)qbuf + (size_t)(n_ubatch-1) * (size_t)dim * sizeof(float));
+            void *k_tok0 = bk;  /* contiguous kv_dim per token */
+            void *k_tok3 = (void*)((uintptr_t)bk + (size_t)(n_ubatch-1) * (size_t)(n_kv_heads*head_dim) * sizeof(float));
+            picolm_gpu_memcpy(_q, q_last, 64, -1, gpu_dev);
+            picolm_gpu_memcpy(_k, k_tok0, 256, -1, gpu_dev);
+            picolm_gpu_memcpy(_v, k_tok0, 256, -1, gpu_dev);
+            fprintf(stderr, "[GPUT L0 Q_t3_h0][:4]={%.6f,%.6f,%.6f,%.6f}\n", _q[0],_q[1],_q[2],_q[3]);
+            fprintf(stderr, "[GPUT L0 K_t0_h0][:4]={%.6f,%.6f,%.6f,%.6f}\n", _k[0],_k[1],_k[2],_k[3]);
+            fprintf(stderr, "[GPUT L0 K_t3_h0][:4]={%.6f,%.6f,%.6f,%.6f}\n", _k[1600],_k[1601],_k[1602],_k[1603]);
         }
         /* Attention: default to F16 KV cache path (FA2/warpgrp) for all
          * models. SSM-hybrid models can optionally use F32 K/V directly
@@ -4841,11 +4862,27 @@ after_qkv:
                                               n_heads, n_kv_heads, head_dim,
                                               seq_len, gpu_dev);
 #endif
+        } else if (c->is_gpt2) {
+            /* GPT-2: use F32KV attention to avoid F16 KV cache quantization error.
+             * GPT-2 has larger-magnitude KV values than modern models, and the F16
+             * KV cache round-trip introduces enough numerical drift to change
+             * token selection. F32KV keeps prefill attention in full precision. */
+            picolm_gpu_attention_prefill_f32kv(battn_out, q_buf, bk, bv,
+                                                start_pos, n_ubatch,
+                                                n_heads, n_kv_heads, head_dim,
+                                                gpu_dev);
         } else {
             picolm_gpu_attention_prefill_dev(battn_out, q_buf,
                                               attn_ord, start_pos, n_ubatch,
                                               n_heads, n_kv_heads, head_dim,
                                               seq_len, gpu_dev);
+        }
+        /* Debug: dump attention output for layer 0 */
+        if (l == 0 && getenv("ATTNDBG")) {
+            float _ao[4]; picolm_gpu_sync(gpu_dev);
+            picolm_gpu_memcpy(_ao, battn_out, 16, -1, gpu_dev);
+            fprintf(stderr, "[GPU L0 attn_out][:4]={%.6f,%.6f,%.6f,%.6f}\n",
+                    _ao[0],_ao[1],_ao[2],_ao[3]);
         }
         { char _ts_label[64]; snprintf(_ts_label, 64, "LAYER_%d_POSTATTN", l); picolm_gpu_ts_write(_ts_label); }
 
@@ -4856,6 +4893,13 @@ after_qkv:
                                                 q_dim_l, n_ubatch, gpu_dev);
         }
 
+        /* Debug: dump battn_out before output projection (last token) */
+        if (getenv("PICOLM_DBG") && l == 0) {
+            float _ao[4]; picolm_gpu_sync(gpu_dev);
+            void *battn_last = (void*)((uintptr_t)battn_out + (size_t)(n_ubatch-1) * (size_t)attn_out_stride * sizeof(float));
+            picolm_gpu_memcpy(_ao, battn_last, 16, -1, gpu_dev);
+            fprintf(stderr, "[L0DBG battn_out][:4]={%.6f,%.6f,%.6f,%.6f}\n", _ao[0],_ao[1],_ao[2],_ao[3]);
+        }
         /* Output projection */
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_output,
                                bxb, battn_out, n_ubatch, gpu_dev, xb_stride, attn_out_stride);
@@ -4868,10 +4912,15 @@ after_qkv:
         }
         /* Residual add */
         picolm_gpu_residual_add(bx, bx, bxb, n_ubatch, dim, xb_stride, gpu_dev);
-        if (NULL && l == 0) {
+        if (l == 0 && getenv("PICOLM_DBG")) {
             float _t[4]; picolm_gpu_sync(gpu_dev);
-            picolm_gpu_memcpy(_t, bx + (size_t)(n_ubatch-1)*xb_stride, 16, -1, gpu_dev);
-            fprintf(stderr, "[L0DBG bx_post_attn][:4]={%.6f,%.6f,%.6f,%.6f}\n", _t[0],_t[1],_t[2],_t[3]);
+            void *bx_last2 = (void*)((uintptr_t)bx + (size_t)(n_ubatch-1) * (size_t)xb_stride * sizeof(float));
+            void *bxb_last2 = (void*)((uintptr_t)bxb + (size_t)(n_ubatch-1) * (size_t)xb_stride * sizeof(float));
+            picolm_gpu_memcpy(_t, bx_last2, 16, -1, gpu_dev);
+            fprintf(stderr, "[GPUT L0 bx_post_attn][:4]={%.6f,%.6f,%.6f,%.6f}\n", _t[0],_t[1],_t[2],_t[3]);
+            memset(_t, 0, sizeof(_t));
+            picolm_gpu_memcpy(_t, bxb_last2, 16, -1, gpu_dev);
+            fprintf(stderr, "[GPUT L0 attn_out][:4]={%.6f,%.6f,%.6f,%.6f}\n", _t[0],_t[1],_t[2],_t[3]);
         }
 
         /* Debug: read bx after last layer */
@@ -4921,17 +4970,37 @@ after_qkv:
                 picolm_gpu_silu_mul_dev(bgate, bup, n_ubatch * n_ffn, gpu_dev);
             }
         } else {
-            /* GPT-2 style: gate = GELU(ffn_up @ norm), no separate gate projection */
+            /* GPT-2 style: gate = GELU(ffn_up @ norm + bias), no separate gate projection */
             picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_up,
                 bgate, bffn_norm, n_ubatch, gpu_dev, attn_ffn_stride, xb_stride);
+            /* GPT-2 FFN up bias */
+            if (gw->ffn_up_bias_dev[l]) {
+                for (int bi = 0; bi < n_ubatch; bi++) {
+                    picolm_gpu_residual_add(bgate + bi * attn_ffn_stride, bgate + bi * attn_ffn_stride,
+                                            (float *)gw->ffn_up_bias_dev[l], 1, n_ffn, 0, gpu_dev);
+                }
+            }
             picolm_gpu_gelu_dev(bgate, n_ubatch * n_ffn, gpu_dev);
         }
 
         /* FFN down */
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_down,
                                bxb, bgate, n_ubatch, gpu_dev, xb_stride, attn_ffn_stride);
+        /* GPT-2 FFN down bias */
+        if (gw->ffn_down_bias_dev[l]) {
+            for (int bi = 0; bi < n_ubatch; bi++) {
+                picolm_gpu_residual_add(bxb + bi * xb_stride, bxb + bi * xb_stride,
+                                        (float *)gw->ffn_down_bias_dev[l], 1, dim, 0, gpu_dev);
+            }
+        }
         /* FFN residual */
         picolm_gpu_residual_add(bx, bx, bxb, n_ubatch, dim, xb_stride, gpu_dev);
+        if (l == 0 && getenv("PICOLM_DBG")) {
+            float _t[4]; picolm_gpu_sync(gpu_dev);
+            void *bx_last3 = (void*)((uintptr_t)bx + (size_t)(n_ubatch-1) * (size_t)xb_stride * sizeof(float));
+            picolm_gpu_memcpy(_t, bx_last3, 16, -1, gpu_dev);
+            fprintf(stderr, "[GPUT L0 x_post_ffn][:4]={%.6f,%.6f,%.6f,%.6f}\n", _t[0],_t[1],_t[2],_t[3]);
+        }
 
         /* Per-layer RMS tracking (debug only) */
 
@@ -4955,15 +5024,15 @@ after_qkv:
     double _gpu_layer_t0 = get_time_ms();
     picolm_gpu_batch_end(gpu_dev);
     double _gpu_layer_total = get_time_ms() - _gpu_layer_t0;
-    /* Debug: dump KV cache for layer 0 */
-    if (NULL) {
+    /* Debug: dump KV cache for layer 0, token 0 */
+    if (getenv("PICOLM_DBG") && 0) {
         uint16_t *_kd = (uint16_t*)malloc(4 * 25 * 64 * sizeof(uint16_t));
         uint16_t *_vd = (uint16_t*)malloc(4 * 25 * 64 * sizeof(uint16_t));
         if (_kd && _vd) {
             picolm_gpu_kv_flush_to_cpu((uint8_t*)_kd, (uint8_t*)_vd, 1, 64, 4, 25*64, 25*64, gpu_dev);
             float _kvals[8];
             for(int _i=0;_i<8;_i++) _kvals[_i] = (float)_kd[_i];
-            fprintf(stderr, "[L0DBG kv_cache_k][:8]={%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f}\n",
+            fprintf(stderr, "[L0DBG kv_cache_k][:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
                     _kvals[0],_kvals[1],_kvals[2],_kvals[3],_kvals[4],_kvals[5],_kvals[6],_kvals[7]);
             fprintf(stderr, "[L0DBG kv_cache_raw][:8]={0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x}\n",
                     _kd[0],_kd[1],_kd[2],_kd[3],_kd[4],_kd[5],_kd[6],_kd[7]);
@@ -5138,7 +5207,17 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
         }
     }
 
-    rmsnorm(s->x, s->x, s->output_norm_w, dim, c->rms_norm_eps);
+    /* Debug: dump GPU GPT-2 final hidden state (post-norm) */
+    if (getenv("PICOLM_DBG")) {
+        double cr=0; for(int _i=0;_i<dim;_i++){float a=s->x[_i];cr+=a*a;}
+        fprintf(stderr,"[GPU GPT2 s->x][:4]={%.6f,%.6f,%.6f,%.6f} rms=%.6f\n",
+                s->x[0],s->x[1],s->x[2],s->x[3],sqrtf(cr/dim));
+    }
+    if (c->is_gpt2 && s->output_norm_b) {
+        layernorm(s->x, s->x, s->output_norm_w, s->output_norm_b, dim, c->rms_norm_eps);
+    } else {
+        rmsnorm(s->x, s->x, s->output_norm_w, dim, c->rms_norm_eps);
+    }
 
     /* Flush GPU KV cache to CPU for CPU decode path (needed on Vulkan) */
 #ifdef PICOLM_VULKAN

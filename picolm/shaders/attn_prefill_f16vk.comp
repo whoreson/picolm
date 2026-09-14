@@ -1,5 +1,5 @@
 #version 450
-layout(local_size_x = 256) in;
+layout(local_size_x = 64) in;
 layout(set = 0, binding = 0, std430) readonly buffer B_Q { float q_data[]; };
 layout(set = 0, binding = 1, std430) readonly buffer B_KK { uint kv_k_data[]; };
 layout(set = 0, binding = 2, std430) readonly buffer B_KV { uint kv_v_data[]; };

@@ -2903,6 +2903,8 @@ int picolm_gpu_layernorm_batched_dev(float *out, const float *x, const float *we
     _batch_barrier_buf(x, (size_t)dim * (size_t)S * sizeof(float));
     VK_BATCH_BIND(G.pipe_ln);
     push_desc(G.cmd_dev, 4, bi);
+    if (getenv("PICOLM_DBG")) fprintf(stderr, "[LNDBG] dispatch: S=%d D=%d stride=%d buf_x=%p buf_w=%p buf_out=%p buf_b=%p\n",
+            S, dim, xs, (void*)bi[0].buffer, (void*)bi[1].buffer, (void*)bi[2].buffer, (void*)bi[3].buffer);
     PC_Matmul pc_ln = {0, S, dim, 0, xs};
     memcpy(&pc_ln.O, &eps, sizeof(float));
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_ln), &pc_ln);
@@ -2921,22 +2923,55 @@ int picolm_gpu_layernorm_dev(float *out, const float *x, const float *weight,
 int picolm_gpu_residual_add(float *out, const float *a, const float *b,
                              int n, int dim, int stride, int device) {
     if (!G.ready || !G.shader_elem || device != 0 || n < 1) return 0;
-    (void)dim; (void)stride;
-    VkDescriptorBufferInfo bi[4] = {desc_buf_info(a), desc_buf_info(b), desc_buf_info(out), {VK_NULL_HANDLE,0,0}};
-    if (!bi[0].buffer || !bi[1].buffer || !bi[2].buffer) { fprintf(stderr, "[RN_DESC] FAIL x_buf=%p w_buf=%p y_buf=%p\n", (void*)bi[0].buffer, (void*)bi[1].buffer, (void*)bi[2].buffer); return 0; }
-    VK_BATCH_DISPATCH_PRE();
-    // Scoped barrier: sync a and b (both inputs, one vkCmd call)
-    _batch_barrier_buf2(a, (size_t)n * (size_t)dim * sizeof(float),
-                        b, (size_t)n * (size_t)dim * sizeof(float));
-    VK_BATCH_BIND(G.pipe_elem);
-    push_desc(G.cmd_dev, 4, bi);
-    int total = n * dim;
-    PC_Elem pc = {0, total, 0.0f, 0};
-    vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-    vkCmdDispatch(G.cmd_dev, (uint32_t)((total + 255) / 256), 1, 1);
-    _g_dispatch_cnt++;
-    VK_BATCH_DISPATCH_POST();
-    return 1;
+    // Helper: offset an encoded device pointer by byte_offset
+    // The encoded pointer has idx in upper bits, byte offset in lower 48 bits
+    void *dev_ptr_add(const void *p, VkDeviceSize byte_off) {
+        uintptr_t addr = (uintptr_t)p;
+        if (!addr) return NULL;
+        uintptr_t idx_bits = addr & ~DEV_PTR_MASK;  // upper bits (idx)
+        VkDeviceSize cur_off;
+        unwrap_buf_offset(p, &cur_off);              // current byte offset
+        cur_off += byte_off;                          // add offset
+        return (void*)(idx_bits | (cur_off & DEV_PTR_MASK));
+    }
+    // If stride == dim, use single dispatch (contiguous layout)
+    if (stride == dim || stride == 0) {
+        VkDescriptorBufferInfo bi[4] = {desc_buf_info(a), desc_buf_info(b), desc_buf_info(out), {VK_NULL_HANDLE,0,0}};
+        if (!bi[0].buffer || !bi[1].buffer || !bi[2].buffer) { return 0; }
+        VK_BATCH_DISPATCH_PRE();
+        _batch_barrier_buf2(a, (size_t)n * (size_t)dim * sizeof(float),
+                            b, (size_t)n * (size_t)dim * sizeof(float));
+        VK_BATCH_BIND(G.pipe_elem);
+        push_desc(G.cmd_dev, 4, bi);
+        int total = n * dim;
+        PC_Elem pc = {0, total, 0.0f, 0};
+        vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(G.cmd_dev, (uint32_t)((total + 255) / 256), 1, 1);
+        _g_dispatch_cnt++;
+        VK_BATCH_DISPATCH_POST();
+        return 1;
+    }
+    // Strided layout: dispatch per-token to handle non-contiguous rows
+    int ok = 1;
+    VkDeviceSize stride_bytes = (VkDeviceSize)stride * sizeof(float);
+    for (int i = 0; i < n; i++) {
+        void *a_i = dev_ptr_add(a, (VkDeviceSize)i * stride_bytes);
+        void *b_i = dev_ptr_add(b, (VkDeviceSize)i * stride_bytes);
+        void *out_i = dev_ptr_add(out, (VkDeviceSize)i * stride_bytes);
+        VkDescriptorBufferInfo bi[4] = {desc_buf_info(a_i), desc_buf_info(b_i), desc_buf_info(out_i), {VK_NULL_HANDLE,0,0}};
+        if (!bi[0].buffer || !bi[1].buffer || !bi[2].buffer) { ok = 0; break; }
+        VK_BATCH_DISPATCH_PRE();
+        _batch_barrier_buf2(a_i, (VkDeviceSize)dim * sizeof(float),
+                            b_i, (VkDeviceSize)dim * sizeof(float));
+        VK_BATCH_BIND(G.pipe_elem);
+        push_desc(G.cmd_dev, 4, bi);
+        PC_Elem pc = {0, dim, 0.0f, 0};
+        vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+        vkCmdDispatch(G.cmd_dev, (uint32_t)((dim + 255) / 256), 1, 1);
+        _g_dispatch_cnt++;
+        VK_BATCH_DISPATCH_POST();
+    }
+    return ok;
 }
 
 int picolm_gpu_silu_mul_dev(float *g, const float *u, size_t n, int device) {
@@ -3018,6 +3053,7 @@ int picolm_gpu_gelu_dev(float *x, size_t n, int device) {
 int picolm_gpu_rope_apply(float *x, int n_heads, int head_dim,
                            const float *cos_tbl, const float *sin_tbl,
                            int half_dim, int rope_type, int device) {
+    if (rope_type < 0) return 1; /* no RoPE (GPT-2 learned pos embd) */
     if (!G.ready || !G.shader_elem || device != 0 || half_dim < 1) return 0;
     VkBuffer xb = unwrap_buf(x);
     VkDeviceSize cos_off = 0, sin_off = 0;
@@ -3039,6 +3075,7 @@ int picolm_gpu_rope_apply_batched(float *x, int n_heads, int head_dim,
                                    const float *cos_tbl_base, const float *sin_tbl_base,
                                    int half_dim, int start_pos, int S,
                                    int rope_type, int device) {
+    if (rope_type < 0) return 1; /* no RoPE (GPT-2 learned pos embd) */
     if (!G.ready || !G.shader_elem || device != 0 || half_dim < 1 || S < 1) return 0;
 
     // Batched RoPE: single dispatch, 2D grid [half_dim/256, S, 1]
@@ -3715,7 +3752,7 @@ int picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
         PC_AttnF16 pc = {lo, sp, nt, nh, nkh, hd, msl, 1.0f / sqrtf(hd)};
         vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
                            0, sizeof(pc), &pc);
-        vkCmdDispatch(G.cmd_dev, (uint32_t)((total + 255) / 256), 1, 1);
+        vkCmdDispatch(G.cmd_dev, (uint32_t)((total + 63) / 64), 1, 1);
         _g_dispatch_cnt++;
         VK_BATCH_DISPATCH_POST();
         return 1;
@@ -3782,7 +3819,7 @@ int picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
     PC_Attn pc = {lo, sp, nt, nh, nkh, hd, 1.0f / sqrtf(hd), 0};
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(pc), &pc);
-    vkCmdDispatch(G.cmd_dev, (uint32_t)((total + 255) / 256), 1, 1);
+    vkCmdDispatch(G.cmd_dev, (uint32_t)((total + 63) / 64), 1, 1);
     _g_dispatch_cnt++;
     VK_BATCH_DISPATCH_POST();
     return 1;

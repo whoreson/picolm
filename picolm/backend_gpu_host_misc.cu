@@ -1194,6 +1194,7 @@ picolm_gpu_rope_batched_kernel(float *x, int n_heads, int head_dim,
         float *xr = x + (size_t)row * per_row;
         int pos = start_pos + row;
 
+        if (rope_type < 0) continue; /* no RoPE (GPT-2 learned pos embd) */
         if (rope_type) {
             /* Qwen2 interleaved: (x[d], x[d+half_dim]) rotated */
             if (d >= half_dim) continue;
@@ -1231,6 +1232,7 @@ picolm_gpu_rope_kernel(float *x, int n_heads, int head_dim,
         int h = i / head_dim;
         int d = i % head_dim;
 
+        if (rope_type < 0) continue; /* no RoPE (GPT-2 learned pos embd) */
         if (rope_type) {
             /* Qwen2 interleaved: (x[d], x[d+half_dim]) rotated */
             if (d >= half_dim) continue;
@@ -1527,6 +1529,7 @@ picolm_gpu_rope_apply(float *x, int n_heads, int head_dim,
                        int half_dim, int rope_type, int device) {
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
+    if (rope_type < 0) return 1; /* no RoPE (GPT-2 learned pos embd) */
 
     int total = n_heads * head_dim;
     int n_threads = 128;
@@ -1547,6 +1550,7 @@ picolm_gpu_rope_apply_batched(float *x, int n_heads, int head_dim,
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
     if (S < 1) return 0;
+    if (rope_type < 0) return 1; /* no RoPE (GPT-2 learned pos embd) */
 
     int total = S * n_heads * head_dim;
     int n_threads = 256;
