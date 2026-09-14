@@ -2074,6 +2074,18 @@ int picolm_gpu_memcpy_async(void *dst, const void *src, size_t bytes, int dir, i
             vkBeginCommandBuffer(G.cmd_dev, &_vb);
             G.bound_pipe = VK_NULL_HANDLE;
         }
+        /* Barrier: compute shader write -> transfer read */
+        { VkBufferMemoryBarrier mb = {
+            .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = src_buf, .offset = src_off, .size = bytes,
+        };
+        vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 1, &mb, 0, NULL);
+        }
         VkBufferCopy bc = {src_off, dst_off, bytes};
         vkCmdCopyBuffer(G.cmd_dev, src_buf, dst_buf, 1, &bc);
         /* Inline VK_BATCH_DISPATCH_POST */

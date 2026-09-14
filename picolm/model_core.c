@@ -1505,8 +1505,12 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                             int q_dim = c->n_heads * c->head_dim;
                             int kv_dim = c->n_kv_heads * c->head_dim;
                             /* SSM models use q_full_dim = 2*q_dim for attention Q+gate projection.
+                             * GPT-2 uses 3*q_dim for fused QKV (Q+K+V in one buffer).
                              * pipe_q and pipe_attn_out must be sized for the larger output. */
-                            int q_pipeline_dim = c->has_ssm ? (q_dim * 2) : q_dim;
+                            int q_pipeline_dim;
+                            if (c->has_ssm) q_pipeline_dim = q_dim * 2;
+                            else if (c->is_gpt2) q_pipeline_dim = q_dim * 3;
+                            else q_pipeline_dim = q_dim;
                             if (!picolm_gpu_pipeline_alloc(c->n_embd, q_pipeline_dim, kv_dim, c->n_ffn, c->vocab_size, device)) {
                                 fprintf(stderr, "WARN: GPU pipeline buffer alloc failed\n");
                             }
@@ -1562,6 +1566,11 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                             }
                             /* Output norm */
                             m->gpu.output_norm_dev = picolm_gpu_upload_f32(s->output_norm_w, c->n_embd, device);
+                            /* GPT-2: output norm bias */
+                            if (s->output_norm_b) {
+                                m->gpu.output_norm_bias_dev =
+                                    picolm_gpu_upload_f32(s->output_norm_b, c->n_embd, device);
+                            }
                             /* Per-layer norm weights (only for GPU layers) */
                             for (int l = 0; l < ngl; l++) {
                                 m->gpu.attn_norm_dev[l] =

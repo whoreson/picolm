@@ -126,6 +126,7 @@ typedef struct {
     void *rope_cos_swa_dev;      /* device copy of rope_cos_swa [max_seq_len * half_dim] (SWA freq_base=10000) */
     void *rope_sin_swa_dev;      /* device copy of rope_sin_swa [max_seq_len * half_dim] (SWA freq_base=10000) */
     void *output_norm_dev;   /* device copy of output_norm_w [dim] */
+    void *output_norm_bias_dev;  /* device copy of output_norm_b [dim] (GPT-2) */
     void *attn_norm_dev[MAX_LAYERS];      /* device copy of attn_norm_w[l] [dim] */
     void *attn_norm_bias_dev[MAX_LAYERS]; /* device copy of attn_norm_b[l] [dim] (GPT-2) */
     void *post_attn_norm_dev[MAX_LAYERS]; /* device copy of post_attn_norm_w[l] [dim] */

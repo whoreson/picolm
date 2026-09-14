@@ -4126,7 +4126,10 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
     int seq_len = c->max_seq_len;
     int rope_dim = (c->rope_dim > 0) ? c->rope_dim : head_dim;
     int rope_half = rope_dim / 2;
-    int q_pipeline_dim = c->has_ssm ? (q_dim * 2) : q_dim;
+    int q_pipeline_dim;
+    if (c->has_ssm) q_pipeline_dim = q_dim * 2;
+    else if (c->is_gpt2) q_pipeline_dim = q_dim * 3;
+    else q_pipeline_dim = q_dim;
 
     /* Verify pipeline is ready */
     if (!gw->kv_active) return model_forward(m, token, pos);
@@ -4211,41 +4214,37 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
                     dim, c->rms_norm_eps, gpu_dev);
             }
 
-            /* B. Q projection: pipe_q = attn_q @ pipe_xb
-             * For SSM models this writes q_full_dim = 2*q_dim
-             * (interleaved [Q0,Gate0,Q1,Gate1,...]). */
-            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
-                                   pipe_q, pipe_xb, 1, gpu_dev, 0, 0);
-
-            /* B1. For SSM models: de-interleave Q+gate from pipe_q.
-             * After this, pipe_q holds compacted Q[q_dim], pipe_gate
-             * holds gate[q_dim]. For non-SSM models, skip. */
-            if (c->has_ssm) {
-                /* De-interleave Q+gate. Cannot write Q in-place to pipe_q:
-                 * thread h writes pipe_q[h*head_dim] which overlaps with
-                 * thread h+1's read from pipe_q[(h+1)*2*head_dim].
-                 * Use pipe_attn_out as temp scratch for raw Q+gate data.
-                 * pipe_attn_out is sized for q_pipeline_dim (>= q_full_dim).
-                 * pipe_ffn_norm is only dim-sized and would overflow.
-                 *
-                 * Use async D2D copy on ctx->stream - the Q projection matmul
-                 * is already on ctx->stream, and stream ordering ensures the
-                 * D2D copy and subsequent deinterleave kernel see the data. */
-                picolm_gpu_memcpy_async(pipe_attn_out, pipe_q,
-                                   (size_t)n_heads * 2 * head_dim * sizeof(float),
-                                   0, gpu_dev);
-                picolm_gpu_qg_deinterleave_dev(pipe_attn_out, pipe_q,
-                                                pipe_gate, n_heads, head_dim,
-                                                gpu_dev);
+            /* B. Q/K/V projections */
+            if (gl->attn_qkv && !gl->attn_q) {
+                /* GPT-2: fused QKV weight [3*dim x dim] */
+                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_qkv,
+                                       pipe_gate, pipe_xb, 1, gpu_dev, 3*dim, 0);
+                if (gw->attn_qkv_bias_dev[l]) {
+                    float *bq_bias = (float *)gw->attn_qkv_bias_dev[l];
+                    float *bk_bias = bq_bias + dim;
+                    float *bv_bias = bq_bias + 2*dim;
+                    picolm_gpu_residual_add(pipe_gate, pipe_gate, bq_bias, 1, dim, 0, gpu_dev);
+                    picolm_gpu_residual_add(pipe_gate + dim, pipe_gate + dim, bk_bias, 1, dim, 0, gpu_dev);
+                    picolm_gpu_residual_add(pipe_gate + 2*dim, pipe_gate + 2*dim, bv_bias, 1, dim, 0, gpu_dev);
+                }
+                picolm_gpu_memcpy_async(pipe_q, pipe_gate, (size_t)dim * sizeof(float), 0, gpu_dev);
+                picolm_gpu_memcpy_async(pipe_k, pipe_gate + dim, (size_t)dim * sizeof(float), 0, gpu_dev);
+                picolm_gpu_memcpy_async(pipe_v, pipe_gate + 2*dim, (size_t)dim * sizeof(float), 0, gpu_dev);
+            } else {
+                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
+                                       pipe_q, pipe_xb, 1, gpu_dev, 0, 0);
+                if (c->has_ssm) {
+                    picolm_gpu_memcpy_async(pipe_attn_out, pipe_q,
+                               (size_t)n_heads * 2 * head_dim * sizeof(float), 0, gpu_dev);
+                    picolm_gpu_qg_deinterleave_dev(pipe_attn_out, pipe_q,
+                                                    pipe_gate, n_heads, head_dim,
+                                                    gpu_dev);
+                }
+                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_k,
+                                       pipe_k, pipe_xb, 1, gpu_dev, 0, 0);
+                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_v,
+                                       pipe_v, pipe_xb, 1, gpu_dev, 0, 0);
             }
-
-            /* C. K projection: pipe_k = attn_k @ pipe_xb */
-            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_k,
-                                   pipe_k, pipe_xb, 1, gpu_dev, 0, 0);
-
-            /* D. V projection: pipe_v = attn_v @ pipe_xb */
-            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_v,
-                                   pipe_v, pipe_xb, 1, gpu_dev, 0, 0);
 
             /* E. QK-norm (Qwen3): per-head RMSNorm on Q and K.
              * pipe_q is [n_heads][head_dim], weight is [head_dim].
@@ -4441,6 +4440,17 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
     extern int picolm_gpu_matmul_logits(picolm_gpu_tensor_t *t,
                                          float *logits_dev, const float *x_dev,
                                          int device);
+    /* Final RMSNorm/LayerNorm */
+    if (gw->output_norm_bias_dev && c->is_gpt2) {
+        picolm_gpu_layernorm_dev(pipe_x, pipe_x,
+            (float *)gw->output_norm_dev, (float *)gw->output_norm_bias_dev,
+            dim, c->rms_norm_eps, gpu_dev);
+    } else {
+        picolm_gpu_rmsnorm_dev(pipe_x, pipe_x,
+                                (float *)gw->output_norm_dev,
+                                dim, c->rms_norm_eps, gpu_dev);
+    }
+
     /* End batched recording for layer dispatches + RMSNorm */
     picolm_gpu_batch_end(gpu_dev);
 
@@ -4666,10 +4676,14 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
                         _dq[0],_dq[1],_dq[2],_dq[3],_dq[4],_dq[5],_dq[6],_dq[7]);
                 }
                 /* bq=[S][3*dim] interleaved: [Q0,K0,V0, Q1,K1,V1, ...]
-                 * Split into compact bk=[K0,K1,...], bv=[V0,V1,...] */
+                 * Split into compact Q, bk=[K0,K1,...], bv=[V0,V1,...]
+                 * Must compact Q because the attention kernel expects stride=dim.
+                 * Use bffn_norm as temp buffer for compact Q (not used yet at
+                 * attention stage, only used later for FFN). */
                 { size_t row_bytes = (size_t)dim * sizeof(float);
                   for (int _ri = 0; _ri < n_ubatch; _ri++) {
                       float *row = (float *)bq + _ri * 3 * dim;
+                      picolm_gpu_memcpy_async(bffn_norm + _ri * dim, row, row_bytes, 0, gpu_dev);
                       picolm_gpu_memcpy_async(bk + _ri * dim, row + dim, row_bytes, 0, gpu_dev);
                       picolm_gpu_memcpy_async(bv + _ri * dim, row + 2 * dim, row_bytes, 0, gpu_dev);
                   }
@@ -4679,7 +4693,7 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
                     float *bk_bias = bq_bias + dim;
                     float *bv_bias = bq_bias + 2*dim;
                     for (int bi = 0; bi < n_ubatch; bi++) {
-                        picolm_gpu_residual_add(bq + bi*q_full_dim, bq + bi*q_full_dim, bq_bias, 1, dim, 0, gpu_dev);
+                        picolm_gpu_residual_add(bffn_norm + bi*dim, bffn_norm + bi*dim, bq_bias, 1, dim, 0, gpu_dev);
                         picolm_gpu_residual_add(bk + bi*(n_kv_heads*head_dim), bk + bi*(n_kv_heads*head_dim), bk_bias, 1, n_kv_heads*head_dim, 0, gpu_dev);
                         picolm_gpu_residual_add(bv + bi*(n_kv_heads*head_dim), bv + bi*(n_kv_heads*head_dim), bv_bias, 1, n_kv_heads*head_dim, 0, gpu_dev);
                     }
@@ -4793,6 +4807,9 @@ after_qkv:
          * HIP: F32KV kernel needs ~73-97 KB shared memory for head_dim=256
          * (gfx906/MI50 has 64 KB hard limit, no opt-in). Falls back to
          * standard FP16 KV cache path which has no such constraint. */
+        /* For GPT-2 fused QKV, Q was compacted into bffn_norm; for separate
+         * QKV, Q is in bq. */
+        float *q_buf = (gl->attn_qkv && !gl->attn_q) ? bffn_norm : bq;
         if (c->has_ssm && getenv("PICOLM_F32KV")) {
 #ifndef PICOLM_HIP
             picolm_gpu_attention_prefill_f32kv(battn_out, bq, bk, bv,
@@ -4800,13 +4817,13 @@ after_qkv:
                                                 n_heads, n_kv_heads, head_dim,
                                                 gpu_dev);
 #else
-            picolm_gpu_attention_prefill_dev(battn_out, bq,
+            picolm_gpu_attention_prefill_dev(battn_out, q_buf,
                                               attn_ord, start_pos, n_ubatch,
                                               n_heads, n_kv_heads, head_dim,
                                               seq_len, gpu_dev);
 #endif
         } else {
-            picolm_gpu_attention_prefill_dev(battn_out, bq,
+            picolm_gpu_attention_prefill_dev(battn_out, q_buf,
                                               attn_ord, start_pos, n_ubatch,
                                               n_heads, n_kv_heads, head_dim,
                                               seq_len, gpu_dev);
@@ -4986,8 +5003,11 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
     int rope_half = rope_dim / 2;
     int q_dim = n_heads * head_dim;
     int kv_dim = n_kv_heads * head_dim;
-    int q_full_dim = c->has_ssm ? (q_dim * 2) : q_dim;
-    int xb_stride = c->has_ssm ? (q_dim * 2) : q_dim;
+    int q_full_dim;
+    if (c->has_ssm) q_full_dim = q_dim * 2;
+    else if (c->is_gpt2) q_full_dim = q_dim * 3;
+    else q_full_dim = q_dim;
+    int xb_stride = q_full_dim;
     if (dim > xb_stride) xb_stride = dim;
     int ssm_conv_dim = c->ssm_d_inner + 2 * c->ssm_d_state * c->ssm_n_group;
     if (ssm_conv_dim > xb_stride) xb_stride = ssm_conv_dim;
