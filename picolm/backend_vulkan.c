@@ -594,18 +594,46 @@ static int arena_suballoc(size_t bytes, VkBuffer *buf, void **ptr) {
 
     // Try primary memory type (DEVICE_LOCAL|HOST_VISIBLE, heap=1) first.
     // If allocation fails (heap exhausted), fall back to HOST_VISIBLE heap=0.
-    int mt = G.memtype;
+    // Priority: DEVICE_LOCAL-only -> unified (DEVICE_LOCAL|HOST_VISIBLE) -> HOST_VISIBLE-only
+    // On KAVERI RADV, unified memory (memtype 3) has a coherency bug where
+    // CPU mapped writes are not visible to GPU through buffer bindings.
+    // Try DEVICE_LOCAL-only first (memtype 0 on KAVERI).
+    uint32_t mt_primary = G.memtype; // unified (memtype 3)
+    uint32_t mt_local = (uint32_t)-1; // find DEVICE_LOCAL-only
+    for (uint32_t i = 0; i < G.mem_props.memoryTypeCount; i++) {
+        uint32_t f = G.mem_props.memoryTypes[i].propertyFlags;
+        if ((f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && !(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+            mt_local = i;
+            break;
+        }
+    }
     VkDeviceMemory mem = VK_NULL_HANDLE;
     VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize = req.size, .memoryTypeIndex = mt};
+        .allocationSize = req.size};
+    // Try primary (unified) first for small allocations (fast path)
+    ai.memoryTypeIndex = mt_primary;
     if (vkAllocateMemory(G.dev, &ai, NULL, &mem) != VK_SUCCESS) {
-        // Fallback: find any HOST_VISIBLE|COHERENT type (heap=0)
-        for (uint32_t i = 0; i < G.mem_props.memoryTypeCount; i++) {
-            if (!(req.memoryTypeBits & (1u << i))) continue;
-            uint32_t f = G.mem_props.memoryTypes[i].propertyFlags;
-            if (!(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) continue;
-            ai.memoryTypeIndex = i;
-            if (vkAllocateMemory(G.dev, &ai, NULL, &mem) == VK_SUCCESS) break;
+        // Fallback: try DEVICE_LOCAL-only, then HOST_VISIBLE-only
+        if (mt_local != (uint32_t)-1) {
+            ai.memoryTypeIndex = mt_local;
+            if (vkAllocateMemory(G.dev, &ai, NULL, &mem) != VK_SUCCESS) {
+                // Last resort: any HOST_VISIBLE
+                for (uint32_t i = 0; i < G.mem_props.memoryTypeCount; i++) {
+                    if (!(req.memoryTypeBits & (1u << i))) continue;
+                    uint32_t f = G.mem_props.memoryTypes[i].propertyFlags;
+                    if (!(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) continue;
+                    ai.memoryTypeIndex = i;
+                    if (vkAllocateMemory(G.dev, &ai, NULL, &mem) == VK_SUCCESS) break;
+                }
+            }
+        } else {
+            for (uint32_t i = 0; i < G.mem_props.memoryTypeCount; i++) {
+                if (!(req.memoryTypeBits & (1u << i))) continue;
+                uint32_t f = G.mem_props.memoryTypes[i].propertyFlags;
+                if (!(f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) continue;
+                ai.memoryTypeIndex = i;
+                if (vkAllocateMemory(G.dev, &ai, NULL, &mem) == VK_SUCCESS) break;
+            }
         }
     }
     if (!mem) { vkDestroyBuffer(G.dev, *buf, NULL); *buf = VK_NULL_HANDLE; return 0; }
@@ -933,6 +961,24 @@ int picolm_gpu_init(const int *devices, int count) {
             !!(G.mem_props.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT));
     }
     G.memtype_staging = G.memtype;
+    /* Prefer HOST_VISIBLE-only (system RAM) for staging.
+     * On KAVERI RADV, memtype 3 (unified) has a coherency bug where
+     * CPU writes to mapped memory are not visible to the GPU through
+     * buffer bindings or vkCmdCopyBuffer. HOST_VISIBLE-only types
+     * (e.g., memtype 2 on heap 1) don't have this issue. */
+    {
+        uint32_t mt = G.memtype;
+        for (uint32_t i = 0; i < G.mem_props.memoryTypeCount; i++) {
+            uint32_t f = G.mem_props.memoryTypes[i].propertyFlags;
+            if ((f & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+                && !(f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+                mt = i;
+                break;
+            }
+        }
+        G.memtype_staging = mt;
+        fprintf(stderr, "[VK] staging memory type=%u\n", mt);
+    }
 
     vkGetPhysicalDeviceProperties(G.phys, &G.dev_props);
     // Subgroup size: AMD GCN = 64, NVIDIA = 32. Use vendor ID to detect.
@@ -1523,6 +1569,7 @@ int picolm_gpu_tensor_upload(void **tensor, const void *weights,
         }
     }
 
+
     picolm_gpu_tensor_t *t = calloc(1, sizeof(*t));
     if (!t) { vkDestroyBuffer(G.dev, wbuf, NULL); return 0; }
     t->wbuf = wbuf; t->wmem = VK_NULL_HANDLE;
@@ -1531,6 +1578,7 @@ int picolm_gpu_tensor_upload(void **tensor, const void *weights,
 
     G.used_bytes += total;
     *slot = t;
+
     return 1;
 }
 
@@ -1937,9 +1985,12 @@ int picolm_gpu_memcpy_async(void *dst, const void *src, size_t bytes, int dir, i
         /* Fall back to staging buffer */
         if (!staging_ensure(bytes)) return 0;
         memcpy(G.staging_ptr, src, bytes);
-        VkMappedMemoryRange flush = {.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-            .memory = G.staging_mem, .offset = 0, .size = VK_WHOLE_SIZE};
-        vkFlushMappedMemoryRanges(G.dev, 1, &flush);
+        /* RADV KAVERI WA: vkFlushMappedMemoryRanges is ineffective for 
+         * memtype 3 (unified). Workaround: unmap+remap to push CPU writes 
+         * to the GPU-visible side of unified memory. */
+        vkUnmapMemory(G.dev, G.staging_mem);
+        { VkResult mr = vkMapMemory(G.dev, G.staging_mem, 0, VK_WHOLE_SIZE, 0, &G.staging_ptr);
+          if (mr != VK_SUCCESS) { fprintf(stderr, "[VK] staging remap H2D failed: %d\n", (int)mr); return 0; } }
         /* Ensure prior xfer is done before reusing cmd_xfer */
         vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
         VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -2651,6 +2702,7 @@ int picolm_gpu_matmul_dev_gu(picolm_gpu_tensor_t *tg, picolm_gpu_tensor_t *tu,
                               const float *x_dev, int S, int device,
                               int ys, int xs) {
     (void)ys; (void)xs;
+    if (!tg || !tu) return 0;
     // Try true fused GU shader: single dispatch for gate+up
     // Quantize once, then single fused matmul dispatch
     if (tg->qtype == GGUF_TYPE_Q8_0 && tu->qtype == GGUF_TYPE_Q8_0 &&
@@ -2834,6 +2886,24 @@ int picolm_gpu_gelu_mul_dev(float *g, const float *u, size_t n, int device) {
     VK_BATCH_BIND(G.pipe_elem);
     push_desc(G.cmd_dev, 4, bi);
     PC_Elem pc = {5, (int)n, 0.0f, 0};
+    vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(G.cmd_dev, (uint32_t)((n + 255) / 256), 1, 1);
+    _g_dispatch_cnt++;
+    VK_BATCH_DISPATCH_POST();
+    return 1;
+}
+
+// GELU in-place: x = gelu(x) -- for GPT-2 style FFN (no separate gate projection)
+int picolm_gpu_gelu_dev(float *x, size_t n, int device) {
+    if (!G.ready || !G.shader_elem || device != 0 || n < 1) return 0;
+    VkDescriptorBufferInfo xbi = desc_buf_info(x);
+    if (!xbi.buffer) return 0;
+    VkDescriptorBufferInfo bi[4] = {xbi, {VK_NULL_HANDLE,0,0}, {VK_NULL_HANDLE,0,0}, {VK_NULL_HANDLE,0,0}};
+    VK_BATCH_DISPATCH_PRE();
+    _batch_barrier_buf(x, n * sizeof(float));
+    VK_BATCH_BIND(G.pipe_elem);
+    push_desc(G.cmd_dev, 4, bi);
+    PC_Elem pc = {7, (int)n, 0.0f, 0};
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd_dev, (uint32_t)((n + 255) / 256), 1, 1);
     _g_dispatch_cnt++;

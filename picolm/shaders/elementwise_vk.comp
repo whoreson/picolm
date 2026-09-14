@@ -7,6 +7,7 @@
 // op=2: rope_apply      bind0=x(rw), bind1=cos(ro), bind2=sin(ro), bind3=unused
 // op=3: f32_to_f16      bind0=src_f32(ro), bind1=unused, bind2=unused, bind3=dst_u32(rw)
 // op=4: sigmoid_mul     bind0=out(rw), bind1=gate(ro), bind2=unused, bind3=unused
+// op=7: gelu_inplace    bind0=x(rw), bind1=unused, bind2=unused, bind3=unused
 // op=6: rope_batched    bind0=x(rw, strided), bind1=cos_table(ro, 2D), bind2=sin_table(ro, 2D), bind3=unused
 //   2D dispatch: x=half_dim/256, y=S (n_tokens). Uses fp=n_heads, pad=start_pos.
 //   cos_table layout: [max_positions][half_dim], accessed at row (start_pos + y)
@@ -85,6 +86,13 @@ void main() {
     } else if (pc.op == 4) {
         if (gid < uint(pc.n)) {
             d0[gid] *= 1.0 / (1.0 + exp(-d1[gid]));
+        }
+    } else if (pc.op == 7) {
+        // GELU in-place: x = gelu(x)
+        if (gid < uint(pc.n)) {
+            float v = d0[gid];
+            float gelu_v = 0.5 * v * (1.0 + tanh(0.79788456 * (v + 0.044715 * v * v * v)));
+            d0[gid] = gelu_v;
         }
     } else if (pc.op == 6) {
         // Batched RoPE: 2D dispatch, x=half_dim elements, y=token index

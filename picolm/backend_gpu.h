@@ -620,6 +620,7 @@ int picolm_gpu_silu_mul_dev(float *gate_dev, const float *up_dev,
                              size_t n, int device);
 int picolm_gpu_gelu_mul_dev(float *gate_dev, const float *up_dev,
                              size_t n, int device);
+int picolm_gpu_gelu_dev(float *x_dev, size_t n, int device);
 
 /* The single sync point for a whole model_forward_gpu() pass -- see the
  * comment on the implementation for why every _dev primitive omits its

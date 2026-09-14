@@ -11,6 +11,10 @@
 #else
 #define _SSM_DBG (0)
 #endif
+/* Runtime debug toggle (also checked in model_core.c prefill path) */
+#ifndef _PICOLM_DBG_RUNTIME
+#define _PICOLM_DBG_RUNTIME (getenv("PICOLM_SSM_DBG")&&getenv("PICOLM_SSM_DBG")[0]!='0')
+#endif
 #include <inttypes.h>
 
 #if defined(__APPLE__) && defined(__ppc__) && defined(__ALTIVEC__)
@@ -1358,6 +1362,12 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                 attempted++;
                 if (picolm_gpu_tensor_upload(&gl->attn_output,
                         lw->attn_output, lw->type_attn_output, q_dim, c->n_embd, device)) uploaded++;
+                /* GPT-2 fused QKV: [3*dim, dim] */
+                if (c->is_gpt2 && lw->attn_qkv) {
+                    attempted++;
+                    if (picolm_gpu_tensor_upload(&gl->attn_qkv,
+                            lw->attn_qkv, lw->type_attn_qkv, c->n_embd, 3*c->n_embd, device)) uploaded++;
+                }
                 /* FFN gate: [n_ffn, n_embd] */
                 attempted++;
                 if (picolm_gpu_tensor_upload(&gl->ffn_gate,
@@ -1559,6 +1569,16 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                                         picolm_gpu_upload_f32(s->attn_q_norm_w[l], c->head_dim, device);
                                     m->gpu.attn_qk_norm_k_dev[l] =
                                         picolm_gpu_upload_f32(s->attn_k_norm_w[l], c->head_dim, device);
+                                }
+                                /* GPT-2 QKV bias: [3*dim] F32 */
+                                if (m->weights.layers[l].attn_qkv_bias) {
+                                    m->gpu.attn_qkv_bias_dev[l] =
+                                        picolm_gpu_upload_f32((float *)m->weights.layers[l].attn_qkv_bias, 3*c->n_embd, device);
+                                /* GPT-2 output bias: [dim] F32 */
+                                if (m->weights.layers[l].attn_output_bias) {
+                                    m->gpu.attn_output_bias_dev[l] =
+                                        picolm_gpu_upload_f32((float *)m->weights.layers[l].attn_output_bias, c->n_embd, device);
+                                }
                                 }
                             }
 
@@ -3456,6 +3476,11 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         /* Diagnostic: dump pre-RMSNorm input to first attention layer */
 
         /* Diagnostic: dump RMSNorm'd input to first attention layer */
+        if (getenv("PICOLM_L0DBG") && l == 0) {
+            int lt = n_tokens - 1;
+            fprintf(stderr, "[L0DBG CPU xb_rmsnorm][:4]={%.6f,%.6f,%.6f,%.6f}\n",
+                xb_batch[lt*dim], xb_batch[lt*dim+1], xb_batch[lt*dim+2], xb_batch[lt*dim+3]);
+        }
 
         /* Q projection (batched) */
         tensor_set_repacked(m->repack_used[2+l*9] ? m->repack_buffers[2+l*9] : NULL);
@@ -3464,6 +3489,11 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #endif
         { int this_q_dim = (c->has_ssm && lw->is_attn_layer) ? q_full_dim : q_dim;
           matmul_batch(q_batch, xb_batch, n_tokens, lw->attn_q, dim, this_q_dim, lw->type_attn_q);
+          if (getenv("PICOLM_L0DBG") && l == 0) {
+              int lt = n_tokens - 1;
+              fprintf(stderr, "[L0DBG CPU bq][:4]={%.6f,%.6f,%.6f,%.6f}\n",
+                  q_batch[lt*q_full_dim], q_batch[lt*q_full_dim+1], q_batch[lt*q_full_dim+2], q_batch[lt*q_full_dim+3]);
+          }
           if(_SSM_DBG && l==3){
               int lt=n_tokens-1; double qr=0;for(int _i=0;_i<q_dim;_i++)qr+=q_batch[lt*q_full_dim+_i]*q_batch[lt*q_full_dim+_i];
               fprintf(stderr,"[DBG CPU attn_Q l=%d] last_token_rms=%.6f\n",l,sqrt(qr/q_dim));}
@@ -3777,6 +3807,11 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #endif
           matmul_batch(xb2_batch, attn_out_batch ? attn_out_batch : xb_batch, n_tokens, lw->attn_output, q_dim, dim, lw->type_attn_output);
           if (attn_out_batch) free(attn_out_batch);
+          if (getenv("PICOLM_L0DBG") && l == 0) {
+              int lt = n_tokens - 1;
+              fprintf(stderr, "[L0DBG CPU outproj][:4]={%.6f,%.6f,%.6f,%.6f}\n",
+                  xb2_batch[lt*dim], xb2_batch[lt*dim+1], xb2_batch[lt*dim+2], xb2_batch[lt*dim+3]);
+          }
           if (_SSM_DBG && l == 3) {
               int lt = n_tokens - 1;
               fprintf(stderr, "[DBG CPU outproj l=%d] last[:4]={%.6f,%.6f,%.6f,%.6f}\n", l, xb2_batch[lt*dim], xb2_batch[lt*dim+1], xb2_batch[lt*dim+2], xb2_batch[lt*dim+3]);
@@ -3788,6 +3823,11 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         for (bi = 0; bi < n_tokens; bi++) {
             float *a = x_batch + bi * dim, *b = xb2_batch + bi * dim;
             for (int d2 = 0; d2 < dim; d2++) a[d2] += b[d2];
+        }
+        if (getenv("PICOLM_L0DBG") && l == 0) {
+            int lt = n_tokens - 1;
+            fprintf(stderr, "[L0DBG CPU bx_post_attn][:4]={%.6f,%.6f,%.6f,%.6f}\n",
+                x_batch[lt*dim], x_batch[lt*dim+1], x_batch[lt*dim+2], x_batch[lt*dim+3]);
         }
 
         /* FFN (MoE or dense) */
@@ -3837,9 +3877,9 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #ifdef PICOLM_VIZ
         viz_push_layer(l, x_batch + (n_tokens - 1) * dim, dim);
 #endif
-        if (_SSM_DBG && lw->is_attn_layer) {
+        if (_PICOLM_DBG_RUNTIME && (l < 3 || l == c->n_layers - 1)) {
             int lt = n_tokens - 1;
-            fprintf(stderr, "[DBG CPU attn l=%d] bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n", l, x_batch[lt*dim], x_batch[lt*dim+1], x_batch[lt*dim+2], x_batch[lt*dim+3]);
+            fprintf(stderr, "[CPU PFX l=%d] bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n", l, x_batch[lt*dim], x_batch[lt*dim+1], x_batch[lt*dim+2], x_batch[lt*dim+3]);
         }
         BENCH_LAYER_END(l, 1);
     }

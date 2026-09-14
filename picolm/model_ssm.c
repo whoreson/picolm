@@ -3960,9 +3960,9 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
           free(ssm_out_buf); }
     }
 #endif
-    if (n_tokens > 0 && _SSM_DBG) {
+    if (n_tokens > 0 && _SSM_DBG && (l < 3 || l == c->n_layers - 1)) {
         int lt = n_tokens - 1;
-        fprintf(stderr, "[DBG CPU l=%d] bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n", l, x_batch[lt*dim], x_batch[lt*dim+1], x_batch[lt*dim+2], x_batch[lt*dim+3]);
+        fprintf(stderr, "[CPU PFX l=%d] bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n", l, x_batch[lt*dim], x_batch[lt*dim+1], x_batch[lt*dim+2], x_batch[lt*dim+3]);
     }
     free(ssm_buf);
 }
@@ -4321,6 +4321,11 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
             /* I2. Output projection: pipe_xb = attn_output @ pipe_attn_out */
             picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_output,
                                    pipe_xb, pipe_attn_out, 1, gpu_dev, q_pipeline_dim, 0);
+            /* GPT-2 attn output bias */
+            if (gw->attn_output_bias_dev[l]) {
+                picolm_gpu_residual_add(pipe_xb, pipe_xb,
+                                        (float *)gw->attn_output_bias_dev[l], 1, dim, 0, gpu_dev);
+            }
 
             /* J. Residual add: pipe_x += pipe_xb */
             picolm_gpu_residual_add(pipe_x, pipe_x, pipe_xb, 1, dim, q_pipeline_dim, gpu_dev);
@@ -4380,19 +4385,26 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
                                     (float *)gw->post_attn_norm_dev[l],
                                     dim, c->rms_norm_eps, gpu_dev);
 
-            /* L. Gate: pipe_gate = ffn_gate @ pipe_ffn_norm */
-            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_gate,
-                                   pipe_gate, pipe_ffn_norm, 1, gpu_dev, 0, 0);
+            if (gl->ffn_gate) {
+                /* L. Gate: pipe_gate = ffn_gate @ pipe_ffn_norm */
+                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_gate,
+                                       pipe_gate, pipe_ffn_norm, 1, gpu_dev, 0, 0);
 
-            /* M. Up: pipe_up = ffn_up @ pipe_ffn_norm */
-            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_up,
-                                   pipe_up, pipe_ffn_norm, 1, gpu_dev, 0, 0);
+                /* M. Up: pipe_up = ffn_up @ pipe_ffn_norm */
+                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_up,
+                                       pipe_up, pipe_ffn_norm, 1, gpu_dev, 0, 0);
 
-            /* N. SiLU-mul / GELU-mul */
-            if (c->is_gpt2 || c->is_gemma3n) {
-                picolm_gpu_gelu_mul_dev(pipe_gate, pipe_up, n_ffn, gpu_dev);
+                /* N. SiLU-mul / GELU-mul */
+                if (c->is_gpt2 || c->is_gemma3n) {
+                    picolm_gpu_gelu_mul_dev(pipe_gate, pipe_up, n_ffn, gpu_dev);
+                } else {
+                    picolm_gpu_silu_mul_dev(pipe_gate, pipe_up, n_ffn, gpu_dev);
+                }
             } else {
-                picolm_gpu_silu_mul_dev(pipe_gate, pipe_up, n_ffn, gpu_dev);
+                /* GPT-2 style: gate = GELU(ffn_up @ norm), no separate gate */
+                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_up,
+                                       pipe_gate, pipe_ffn_norm, 1, gpu_dev, 0, 0);
+                picolm_gpu_gelu_dev(pipe_gate, n_ffn, gpu_dev);
             }
 
             /* O. Down: pipe_xb = ffn_down @ pipe_gate */
@@ -4602,11 +4614,37 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
         // Debug: CPU RMSNorm vs GPU RMSNorm AFTER
         _PFX_NAN_CHECK(bxb, "post_rmsnorm");
 
-        /* Diagnostic: dump RMSNorm'd input to first attention layer */
+        /* Diagnostic: dump layer-0 intermediates */
+        if (getenv("PICOLM_L0DBG") && l == 0) {
+            float _t[4]; picolm_gpu_sync(gpu_dev);
+            picolm_gpu_memcpy(_t, bxb + (size_t)(n_ubatch-1)*xb_stride, 16, -1, gpu_dev);
+            fprintf(stderr, "[L0DBG bxb_rmsnorm][:4]={%.6f,%.6f,%.6f,%.6f}\n", _t[0],_t[1],_t[2],_t[3]);
+        }
 
         /* QKV projections */
         if (!c->has_ssm) {
-            if (!picolm_gpu_matmul_dev_qkv(
+            if (gl->attn_qkv && !gl->attn_q) {
+                /* GPT-2: fused QKV weight [3*dim x dim], split on GPU after matmul */
+                static int gpt2_qkv_init=1; if(gpt2_qkv_init){gpt2_qkv_init=0;
+                    fprintf(stderr,"INFO: GPT-2 fused QKV path (S=%d)\n",n_ubatch);}
+                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_qkv,
+                    bq, bxb, n_ubatch, gpu_dev, 3*dim, xb_stride);
+                /* bq=[S][3*dim] -> split: Q at [0:dim], K at [dim:2*dim], V at [2*dim:3*dim] */
+                { size_t q_bytes = (size_t)n_ubatch * dim * sizeof(float);
+                  picolm_gpu_memcpy_async(bk, (const float *)bq + n_ubatch*dim, q_bytes, 0, gpu_dev);
+                  picolm_gpu_memcpy_async(bv, (const float *)bq + 2*n_ubatch*dim, q_bytes, 0, gpu_dev);
+                }
+                if (gw->attn_qkv_bias_dev[l]) {
+                    float *bq_bias = (float *)gw->attn_qkv_bias_dev[l];
+                    float *bk_bias = bq_bias + dim;
+                    float *bv_bias = bq_bias + 2*dim;
+                    for (int bi = 0; bi < n_ubatch; bi++) {
+                        picolm_gpu_residual_add(bq + bi*q_full_dim, bq + bi*q_full_dim, bq_bias, 1, dim, 0, gpu_dev);
+                        picolm_gpu_residual_add(bk + bi*(n_kv_heads*head_dim), bk + bi*(n_kv_heads*head_dim), bk_bias, 1, n_kv_heads*head_dim, 0, gpu_dev);
+                        picolm_gpu_residual_add(bv + bi*(n_kv_heads*head_dim), bv + bi*(n_kv_heads*head_dim), bv_bias, 1, n_kv_heads*head_dim, 0, gpu_dev);
+                    }
+                }
+            } else if (!picolm_gpu_matmul_dev_qkv(
                     (picolm_gpu_tensor_t *)gl->attn_q,
                     (picolm_gpu_tensor_t *)gl->attn_k,
                     (picolm_gpu_tensor_t *)gl->attn_v,
@@ -4644,6 +4682,11 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
             }
         }
         /* Debug: dump Q, K, V first 4 elements for layer 0 */
+        if (getenv("PICOLM_L0DBG") && l == 0) {
+            float _t[4]; picolm_gpu_sync(gpu_dev);
+            picolm_gpu_memcpy(_t, bq, 16, -1, gpu_dev);
+            fprintf(stderr, "[L0DBG bq][:4]={%.6f,%.6f,%.6f,%.6f}\n", _t[0],_t[1],_t[2],_t[3]);
+        }
         { char _ts_label[64]; snprintf(_ts_label, 64, "LAYER_%d_POSTQKV", l); picolm_gpu_ts_write(_ts_label); }
 after_qkv:
         /* QK-norm */
@@ -4716,6 +4759,11 @@ after_qkv:
                                               seq_len, gpu_dev);
         }
         /* Diagnostic: dump attention output for first layer */
+        if (getenv("PICOLM_L0DBG") && l == 0) {
+            float _t[4]; picolm_gpu_sync(gpu_dev);
+            picolm_gpu_memcpy(_t, battn_out + (size_t)(n_ubatch-1)*attn_out_stride, 16, -1, gpu_dev);
+            fprintf(stderr, "[L0DBG attn_out][:4]={%.6f,%.6f,%.6f,%.6f}\n", _t[0],_t[1],_t[2],_t[3]);
+        }
         { char _ts_label[64]; snprintf(_ts_label, 64, "LAYER_%d_POSTATTN", l); picolm_gpu_ts_write(_ts_label); }
 
         /* SSM gate sigmoid */
@@ -4728,8 +4776,20 @@ after_qkv:
         /* Output projection */
         picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_output,
                                bxb, battn_out, n_ubatch, gpu_dev, xb_stride, attn_out_stride);
+        /* GPT-2 attn output bias */
+        if (gw->attn_output_bias_dev[l]) {
+            for (int bi = 0; bi < n_ubatch; bi++) {
+                picolm_gpu_residual_add(bxb + bi*xb_stride, bxb + bi*xb_stride,
+                                        (float *)gw->attn_output_bias_dev[l], 1, dim, 0, gpu_dev);
+            }
+        }
         /* Residual add */
         picolm_gpu_residual_add(bx, bx, bxb, n_ubatch, dim, xb_stride, gpu_dev);
+        if (getenv("PICOLM_L0DBG") && l == 0) {
+            float _t[4]; picolm_gpu_sync(gpu_dev);
+            picolm_gpu_memcpy(_t, bx + (size_t)(n_ubatch-1)*xb_stride, 16, -1, gpu_dev);
+            fprintf(stderr, "[L0DBG bx_post_attn][:4]={%.6f,%.6f,%.6f,%.6f}\n", _t[0],_t[1],_t[2],_t[3]);
+        }
 
         /* Debug: read bx after last layer */
         if (l == c->n_layers - 1 && n_ubatch == 1) {
@@ -4747,25 +4807,33 @@ after_qkv:
                                         (float *)gw->post_attn_norm_dev[l],
                                         dim, c->rms_norm_eps, n_ubatch, xb_stride, gpu_dev);
 
-        /* FFN gate+up */
-        if (!picolm_gpu_matmul_dev_gu(
-                (picolm_gpu_tensor_t *)gl->ffn_gate,
-                (picolm_gpu_tensor_t *)gl->ffn_up,
-                bgate, bup,
-                bffn_norm, n_ubatch, gpu_dev,
-                attn_ffn_stride, xb_stride)) {
-            static int gu_fb=1; if(gu_fb){gu_fb=0; fprintf(stderr,"INFO: FFN GU matmul fallback (S=%d)\n",n_ubatch);}
-            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_gate,
-                bgate, bffn_norm, n_ubatch, gpu_dev, attn_ffn_stride, xb_stride);
-            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_up,
-                bup, bffn_norm, n_ubatch, gpu_dev, attn_ffn_stride, xb_stride);
-        }
+        /* FFN gate+up: SwiGLU (gate+up) vs GELU (up only, no separate gate) */
+        if (gl->ffn_gate) {
+            /* SwiGLU: gate = ffn_gate @ norm, up = ffn_up @ norm */
+            if (!picolm_gpu_matmul_dev_gu(
+                    (picolm_gpu_tensor_t *)gl->ffn_gate,
+                    (picolm_gpu_tensor_t *)gl->ffn_up,
+                    bgate, bup,
+                    bffn_norm, n_ubatch, gpu_dev,
+                    attn_ffn_stride, xb_stride)) {
+                static int gu_fb=1; if(gu_fb){gu_fb=0; fprintf(stderr,"INFO: FFN GU matmul fallback (S=%d)\n",n_ubatch);}
+                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_gate,
+                    bgate, bffn_norm, n_ubatch, gpu_dev, attn_ffn_stride, xb_stride);
+                picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_up,
+                    bup, bffn_norm, n_ubatch, gpu_dev, attn_ffn_stride, xb_stride);
+            }
 
-        /* FFN silu_mul / gelu_mul */
-        if (c->is_gpt2 || c->is_gemma3n) {
-            picolm_gpu_gelu_mul_dev(bgate, bup, n_ubatch * n_ffn, gpu_dev);
+            /* FFN silu_mul / gelu_mul */
+            if (c->is_gpt2 || c->is_gemma3n) {
+                picolm_gpu_gelu_mul_dev(bgate, bup, n_ubatch * n_ffn, gpu_dev);
+            } else {
+                picolm_gpu_silu_mul_dev(bgate, bup, n_ubatch * n_ffn, gpu_dev);
+            }
         } else {
-            picolm_gpu_silu_mul_dev(bgate, bup, n_ubatch * n_ffn, gpu_dev);
+            /* GPT-2 style: gate = GELU(ffn_up @ norm), no separate gate projection */
+            picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_up,
+                bgate, bffn_norm, n_ubatch, gpu_dev, attn_ffn_stride, xb_stride);
+            picolm_gpu_gelu_dev(bgate, n_ubatch * n_ffn, gpu_dev);
         }
 
         /* FFN down */
@@ -4781,10 +4849,10 @@ after_qkv:
 
         /* KV store D2H handles its own batch end/begin internally. */
 
-        if(_SSM_DBG && (l==3||l==48)){
-            float tmp[4]; picolm_gpu_sync(gpu_dev);
-            picolm_gpu_memcpy(tmp,bx+(size_t)(n_ubatch-1)*xb_stride,16,0,gpu_dev);
-            fprintf(stderr,"[DBG] attn_post l=%d bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n",l,tmp[0],tmp[1],tmp[2],tmp[3]);
+        if(_SSM_DBG && (l < 3 || l == c->n_layers - 1)){
+            float tmp[8]; picolm_gpu_sync(gpu_dev);
+            picolm_gpu_memcpy(tmp,bx+(size_t)(n_ubatch-1)*xb_stride,32,-1,gpu_dev);
+            fprintf(stderr,"[GPU PFX l=%d] bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n",l,tmp[0],tmp[1],tmp[2],tmp[3]);
         }
     }
     { char _ts_label[64]; snprintf(_ts_label, 64, "ALL_LAYERS_DONE"); picolm_gpu_ts_write(_ts_label); }
