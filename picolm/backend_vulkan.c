@@ -3828,8 +3828,65 @@ int picolm_gpu_attention_prefill_f32kv(float *xb_out_dev, const float *q_dev,
                                         const float *k_dev, const float *v_dev,
                                         int sp, int nt, int nh, int nkh,
                                         int hd, int device) {
-    (void)xb_out_dev; (void)q_dev; (void)k_dev; (void)v_dev;
-    (void)sp; (void)nt; (void)nh; (void)nkh; (void)hd; (void)device; return 0;
+    if (!G.ready || !G.shader_attn_prefill || device != 0 || nt < 1) return 0;
+
+    VkDescriptorBufferInfo qbi = desc_buf_info(q_dev);
+    VkDescriptorBufferInfo obbi = desc_buf_info(xb_out_dev);
+    VkDescriptorBufferInfo kbi = desc_buf_info(k_dev);
+    VkDescriptorBufferInfo vbi = desc_buf_info(v_dev);
+    if (!qbi.buffer || !obbi.buffer || !kbi.buffer || !vbi.buffer) return 0;
+
+    size_t kv_dim = (size_t)nkh * hd * sizeof(float);
+    qbi.range = (VkDeviceSize)nt * nh * hd * sizeof(float);
+    obbi.range = (VkDeviceSize)nt * nh * hd * sizeof(float);
+    kbi.range = (VkDeviceSize)nt * kv_dim;
+    vbi.range = (VkDeviceSize)nt * kv_dim;
+
+    VkDescriptorBufferInfo bi[4] = { qbi, kbi, vbi, obbi };
+    uint32_t total = (uint32_t)nh * (uint32_t)nt;
+
+    VK_BATCH_DISPATCH_PRE();
+
+    VkBufferMemoryBarrier barriers[3] = {
+        { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+          .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+          .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .buffer = qbi.buffer, .offset = qbi.offset, .size = qbi.range },
+        { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+          .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+          .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .buffer = kbi.buffer, .offset = kbi.offset, .size = kbi.range },
+        { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+          .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+          .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .buffer = vbi.buffer, .offset = vbi.offset, .size = vbi.range },
+    };
+    vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                         0, NULL, 3, barriers, 0, NULL);
+
+    VK_BATCH_BIND(G.pipe_attn_prefill);
+    push_desc(G.cmd_dev, 4, bi);
+
+    typedef struct {
+        int layer_ordinal, start_pos, n_tokens;
+        int n_heads, n_kv_heads, head_dim;
+        float inv_sqrt_hd;
+        int pad;
+    } PC_Attn;
+    PC_Attn pc = {0, sp, nt, nh, nkh, hd, 1.0f / sqrtf((float)hd), 0};
+    vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(pc), &pc);
+    vkCmdDispatch(G.cmd_dev, (uint32_t)((total + 63) / 64), 1, 1);
+    _g_dispatch_cnt++;
+    VK_BATCH_DISPATCH_POST();
+    return 1;
 }
 
 // ---------------------------------------------------------------------------

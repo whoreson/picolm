@@ -4866,11 +4866,23 @@ after_qkv:
             /* GPT-2: use F32KV attention to avoid F16 KV cache quantization error.
              * GPT-2 has larger-magnitude KV values than modern models, and the F16
              * KV cache round-trip introduces enough numerical drift to change
-             * token selection. F32KV keeps prefill attention in full precision. */
-            picolm_gpu_attention_prefill_f32kv(battn_out, q_buf, bk, bv,
+             * token selection. F32KV keeps prefill attention in full precision.
+             * Override: PICOLM_F16KV=1 forces F16 KV cache path (for testing). */
+            if (getenv("PICOLM_F16KV")) {
+                picolm_gpu_attention_prefill_dev(battn_out, q_buf,
+                                                  attn_ord, start_pos, n_ubatch,
+                                                  n_heads, n_kv_heads, head_dim,
+                                                  seq_len, gpu_dev);
+            } else if (!picolm_gpu_attention_prefill_f32kv(battn_out, q_buf, bk, bv,
                                                 start_pos, n_ubatch,
                                                 n_heads, n_kv_heads, head_dim,
-                                                gpu_dev);
+                                                gpu_dev)) {
+                /* Fallback if F32KV unavailable: use F16 KV cache path */
+                picolm_gpu_attention_prefill_dev(battn_out, q_buf,
+                                                  attn_ord, start_pos, n_ubatch,
+                                                  n_heads, n_kv_heads, head_dim,
+                                                  seq_len, gpu_dev);
+            }
         } else {
             picolm_gpu_attention_prefill_dev(battn_out, q_buf,
                                               attn_ord, start_pos, n_ubatch,
