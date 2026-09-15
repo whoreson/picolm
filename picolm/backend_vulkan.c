@@ -2282,6 +2282,9 @@ int picolm_gpu_batch_end(int device) {
     vkResetFences(G.dev, 1, &G.fence_dev);
     vkQueueSubmit(G.queue, 1, &si, G.fence_dev);
     vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
+    // KAVERI/RADV: also wait fence_xfer to prevent stale H2D/D2H data
+    // from prior staging transfers corrupting subsequent compute.
+    vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
     clock_gettime(CLOCK_MONOTONIC, &ts_post);
     double submit_fence_ms = (ts_post.tv_sec - ts_submit.tv_sec) * 1000.0 + (ts_post.tv_nsec - ts_submit.tv_nsec) / 1e6;
     double total_ms = record_ms + submit_fence_ms;

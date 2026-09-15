@@ -4798,10 +4798,14 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
             fprintf(stderr, "[GPUT L0 bxb_post_ln][:4]={%.6f,%.6f,%.6f,%.6f}\n", _t[0],_t[1],_t[2],_t[3]);
         }
 
-        if (NULL && l == 0) {
-            float _t[8]; picolm_gpu_sync(gpu_dev);
-            picolm_gpu_memcpy(_t, bxb, 32, -1, gpu_dev);
-            fprintf(stderr, "[L0DBG bxb_rmsnorm][:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n", _t[0],_t[1],_t[2],_t[3],_t[4],_t[5],_t[6],_t[7]);
+        /* KAVERI/RADV: flush batch at layer 0 to prevent multi-ubatch corruption.
+         * On KAVERI with RADV, recording all 24 layers in a single command buffer
+         * per ubatch causes the second ubatch's results to be corrupted when reading
+         * KV cache entries written by the first ubatch. Flushing at layer 0 splits
+         * each ubatch into two smaller batches, avoiding the issue. */
+        if (l == 0) {
+            extern int picolm_gpu_sync(int device);
+            picolm_gpu_sync(gpu_dev);
         }
 
         /* QKV projections */
