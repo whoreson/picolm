@@ -550,6 +550,10 @@ hunger:
 	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
 	echo $(HUNGER_CL) $(HUNGER_CF) sgemm.c >> .hunger_build.bat
 	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF) sgemm_q4_0x8.c >> .hunger_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF) sgemm_q4i_0x8.c >> .hunger_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
 	echo $(HUNGER_CL) $(HUNGER_CF) tokenizer.c >> .hunger_build.bat
 	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
 	echo $(HUNGER_CL) $(HUNGER_CF) qwen_tokenize.c >> .hunger_build.bat
@@ -632,6 +636,10 @@ hunger-nogpu:
 	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
 	echo $(HUNGER_CL) $(HUNGER_CF_NOGPU) sgemm.c >> .hunger_nogpu_build.bat
 	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF_NOGPU) sgemm_q4_0x8.c >> .hunger_nogpu_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF_NOGPU) sgemm_q4i_0x8.c >> .hunger_nogpu_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
 	echo $(HUNGER_CL) $(HUNGER_CF_NOGPU) tokenizer.c >> .hunger_nogpu_build.bat
 	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
 	echo $(HUNGER_CL) $(HUNGER_CF_NOGPU) qwen_tokenize.c >> .hunger_nogpu_build.bat
@@ -664,8 +672,8 @@ hunger-nogpu:
 DJGPP_CC   = /data4/work/djgpp-build/djgpp-toolchain/bin/i586-pc-msdosdjgpp-gcc
 DJGPP_INCLUDES = -nostdinc -isystem /data4/work/djgpp-build/djgpp-toolchain/lib/gcc/i586-pc-msdosdjgpp/7.5.0/include -isystem /data4/work/djgpp-build/djgpp-runtime/include
 DJGPP_CFLAGS = -O2 -mmmx -march=k6 -std=gnu11 -DPICOLM_DOS=1 -Wall -fomit-frame-pointer -funroll-loops -fno-stack-protector -falign-functions=4 -falign-jumps=4 -falign-loops=4 -ffast-math $(DJGPP_INCLUDES)
-DJGPP_SRCS = picolm.c $(MODEL_SRCS) tensor.c quant.c tokenizer.c qwen_tokenize.c \
-	sampler.c grammar.c cJSON.c csafetensors.c json.c safetensors.c sgemm.c
+# Derive from SRCS, excluding server.c (no networking on DOS)
+DJGPP_SRCS = $(filter-out server.c,$(SRCS))
 DJGPP_OBJS = $(DJGPP_SRCS:.c=.o.dos)
 DJGPP_RUNTIME = /data4/work/djgpp-build/djgpp-runtime
 
