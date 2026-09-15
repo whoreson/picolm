@@ -1,9 +1,7 @@
 #version 450
 // Quantize F32 activations to Q8_0 block format on device.
 // PURE PER-THREAD: no shared memory, no barriers.
-// Each workgroup (256 threads) handles one 32-value block of one activation row.
-// Thread 0 computes the max abs and writes the d_val.
-// All 32 threads quantize their own element and write directly to QS output.
+// Each workgroup handles one 32-value block of one activation row.
 //
 // Input x:     [S][x_stride] float32, only first I elements per row are valid.
 //              x_stride MUST match the actual buffer stride (e.g. xb_stride for
@@ -17,9 +15,11 @@
 // Binding 1: writeonly QS (uint32 words)
 // Binding 2: writeonly D  (float)
 //
-// Grid: [n_blocks, S, 1], Block: 256 threads
+// Grid: [n_blocks, S, 1], Block: 8 threads (each writes one packed uint32)
+// All 8 threads independently compute amax (32 loads each = 256 total per block).
+// Acceptable trade-off to avoid shared memory / barriers.
 
-layout(local_size_x = 256) in;
+layout(local_size_x = 8) in;
 
 layout(std430, binding = 0) readonly buffer X  { float x[]; };
 layout(std430, binding = 1) writeonly buffer QS { uint qs[]; };
@@ -43,56 +43,37 @@ void main() {
     int valid = p.I - int(blk) * 32;
     if (valid <= 0) return;
 
-    // Step 1: Thread 0 scans all 32 elements to find max abs
-    // All other threads do nothing for this step
-    float amax0 = 0.0;
-    if (tid == 0u) {
-        for (uint i = 0; i < 32u; i++) {
-            if (i >= uint(valid)) break;
-            float v = x[base + i];
-            float av = abs(v);
-            if (av > amax0) amax0 = av;
-        }
-    }
-
-    // Broadcast amax0 to all threads via a simple per-thread recompute
-    // (avoids shared memory entirely)
-    amax0 = 0.0;
-    for (uint i = 0; i < 32u; i++) {
-        if (i >= uint(valid)) break;
-        float v = x[base + i];
-        float av = abs(v);
+    // Each thread computes amax over all 32 elements.
+    // 8 threads * 32 loads = 256 loads per block (vs 32 with shared mem).
+    // Trade-off: no shared memory or barriers needed.
+    float amax0 = 0.0f;
+    for (uint i = 0u; i < uint(valid); i++) {
+        float av = abs(x[base + i]);
         if (av > amax0) amax0 = av;
     }
 
-    // Step 2: Compute scale (use 127.0/amax for better precision, matches CPU/GPU)
-    float d_val = amax0 / 127.0;
+    // Compute scale (use 127.0/amax for better precision, matches CPU/GPU)
     float id = (amax0 > 0.0) ? (127.0 / amax0) : 0.0;
 
-    // Step 3: Thread 0 writes the d_val
+    // Thread 0 writes the d_val
     if (tid == 0u) {
-        d[s * n_blocks + blk] = d_val;
+        d[s * n_blocks + blk] = amax0 / 127.0;
     }
 
-    // Step 4: Threads 0-31 each quantize their element and write packed
-    // Each thread reads all 4 values that belong to its uint32 word,
-    // then writes the combined word to QS. 8 threads do this.
-    uint widx = tid;
-    if (widx < 8u) {
-        uint out_base = (s * n_blocks * 32u + blk * 32u) / 4u;
-        uint packed = 0u;
-        for (uint b = 0u; b < 4u; b++) {
-            uint val_idx = widx * 4u + b;
-            if (val_idx >= 32u || val_idx >= uint(valid)) {
-                // Padding byte = 0 (sign bit clear for int8)
-                continue;
-            }
-            float v = x[base + val_idx];
-            int qi = int(round(v * id));
-            qi = clamp(qi, -127, 127);
-            uint byte_val = uint(qi & 0xffu);
-            packed |= byte_val << (b * 8u);
+    // Each of 8 threads quantizes 4 elements and writes one packed uint32
+    uint out_base = (s * n_blocks * 32u + blk * 32u) / 4u;
+    uint packed = 0u;
+    for (uint b = 0u; b < 4u; b++) {
+        uint val_idx = tid * 4u + b;
+        if (val_idx >= 32u || val_idx >= uint(valid)) {
+            // Padding byte = 0 (sign bit clear for int8)
+            continue;
         }
-        qs[out_base + widx] = packed;
+        float v = x[base + val_idx];
+        int qi = int(round(v * id));
+        qi = clamp(qi, -127, 127);
+        uint byte_val = uint(qi & 0xffu);
+        packed |= byte_val << (b * 8u);
     }
+    qs[out_base + tid] = packed;
 }

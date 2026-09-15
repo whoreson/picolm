@@ -4799,10 +4799,8 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
         }
 
         /* KAVERI/RADV: flush batch at layer 0 to prevent multi-ubatch corruption.
-         * On KAVERI with RADV, recording all 24 layers in a single command buffer
-         * per ubatch causes the second ubatch's results to be corrupted when reading
-         * KV cache entries written by the first ubatch. Flushing at layer 0 splits
-         * each ubatch into two smaller batches, avoiding the issue. */
+         * batch_end+batch_begin preserves batching but doesn't work on KAVERI.
+         * picolm_gpu_sync works but destroys batching. Use sync for now. */
         if (l == 0) {
             extern int picolm_gpu_sync(int device);
             picolm_gpu_sync(gpu_dev);

@@ -1,13 +1,20 @@
 #version 450
-// Q8_0 x Q8_0 matmul: Y[s,o] = sum_i xq[s,i] * w[o,i]
-// Grid: [O, S, 1], Block: 64 threads
+// Q8_0 x Q8_0 matrix multiplication on device.
+// Input XQ:   [S][I/4] uint32 (packed int8 activations, 4 per word)
+// Input XD:   [S][I/32] float32 (per-block activation deltas)
+// Input W:    [O][I/32*36] uint32 (packed Q8_0 weight blocks, 36 bytes each)
+// Output Y:   [S][y_stride] float32 (result, y_stride >= O)
 //
-// STRIDE SAFETY: y_stride may differ from O (e.g. GPT-2 fused QKV where
-// O=4800 and y_stride=4800). Output index is s*y_stride+o, NOT s*O+o.
-// The Q8 activations (xq/xd) are always contiguous [S][I] from quantize.
-// The weight rowWords is in uint32 words (not bytes). See backend_vulkan.c
-// _q8q8_matmul_dev() PC_Q8 struct (5 ints = 20 bytes). DO NOT reduce.
-layout(local_size_x = 64) in;  // Smaller workgroup = more workgroups
+// Push constants: int I, S, O, rowWords, y_stride = 20 bytes
+// Binding 0: XQ (readonly uint)
+// Binding 1: XD (readonly float)
+// Binding 2: W  (readonly uint)
+// Binding 3: Y  (writeonly float)
+//
+// Grid: [(O+63)/64, S, 1], Block: 64 threads
+// Each thread computes one output element.
+
+layout(local_size_x = 64) in;
 
 layout(std430, binding = 0) readonly buffer XQ { uint xq[]; };
 layout(std430, binding = 1) readonly buffer XD { float xd[]; };
@@ -38,15 +45,15 @@ float f16tof32(uint h) {
 
 void main() {
     uint o = gl_GlobalInvocationID.x;
-    int s = int(gl_GlobalInvocationID.y);
+    uint s = gl_GlobalInvocationID.y;
     if (o >= uint(p.O)) return;
     
-    uint gid = uint(s) * uint(p.y_stride) + o;
     int nblocks = p.I / 32;
     uint xq_words = uint(p.I) / 4u;
     uint rowBase = o * uint(p.rowWords);
     uint xq_base = uint(s) * xq_words;
-    int xd_base = s * nblocks;
+    int xd_base = int(s) * nblocks;
+
     float sum = 0.0;
 
     // Q8_0 weights padded to 36 bytes/block during upload (word-aligned)
@@ -58,18 +65,20 @@ void main() {
         float ad = xd[xd_base + bi];
         float scale = wd * ad;
         uint aqs_base = xq_base + uint(bi) * 8u;
+        
+        // Optimized inner loop: accumulate int products, apply scale once
+        float block_sum = 0.0;
         for (int v = 0; v < 32; v++) {
-            int vi = bi * 32 + v;
-            if (vi >= p.I) break;
             uint wbyte_off = rowBase + (bo + 2u + uint(v)) / 4u;
             uint wshift = ((bo + 2u + uint(v)) % 4u) * 8u;
             uint wbyte = (w[wbyte_off] >> wshift) & 0xffu;
-            int wval = int(wbyte << 24u); wval = wval >> 24;
+            int wval = int(wbyte << 24u); wval = wval >> 24u;
             uint ab_idx = aqs_base + uint(v) / 4u;
             uint abyte = (xq[ab_idx] >> ((uint(v) % 4u) * 8u)) & 0xffu;
-            int aval = int(abyte << 24u); aval = aval >> 24;
-            sum += float(wval) * float(aval) * scale;
+            int aval = int(abyte << 24u); aval = aval >> 24u;
+            block_sum += float(wval * aval);
         }
+        sum += block_sum * scale;
     }
-    y[gid] = sum;
+    y[uint(s) * uint(p.y_stride) + o] = sum;
 }

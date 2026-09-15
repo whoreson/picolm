@@ -2075,21 +2075,18 @@ int picolm_gpu_memcpy_async(void *dst, const void *src, size_t bytes, int dir, i
             G.bound_pipe = VK_NULL_HANDLE;
         }
         /* Barrier: compute shader write -> transfer read.
-         * REQUIRED when D2D copy source was produced by a compute dispatch.
-         * Without this, RADV may execute vkCmdCopyBuffer before the compute
-         * shader finishes, causing the copy to read garbage from the buffer.
-         * This manifested as wrong K/V values for GPT-2 fused QKV split.
-         * HIP/CUDA handle this implicitly via stream ordering. */
+         * Scoped to the copied region only (not whole buffer).
+         * This manifested as wrong K/V values for GPT-2 fused QKV split. */
         { VkBufferMemoryBarrier mb = {
             .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
             .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
             .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .buffer = src_buf, .offset = 0, .size = VK_WHOLE_SIZE,
+            .buffer = src_buf, .offset = src_off, .size = (VkDeviceSize)bytes,
         };
-        vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 1, &mb, 0, NULL);
+        vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 1, &mb, 0, NULL);
         }
         VkBufferCopy bc = {src_off, dst_off, bytes};
         vkCmdCopyBuffer(G.cmd_dev, src_buf, dst_buf, 1, &bc);
@@ -2586,9 +2583,9 @@ static int _q8q8_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, int S, int y_s
     push_desc(G.cmd_dev, 4, bi);
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(pc), &pc);
-    // Fine-grained dispatch: [O, S, 1] with local_size_x=64 = 1 subgroup per workgroup
-    // For O=960,S=7: 6720 workgroups vs 28 with local_size_x=256
-    vkCmdDispatch(G.cmd_dev, (uint32_t)t->O, (uint32_t)S, 1);
+    // Dispatch (O+63)/64 workgroups, each with 64 threads (local_size_x=64)
+    // Each workgroup computes up to 64 output rows.
+    vkCmdDispatch(G.cmd_dev, (uint32_t)((t->O + 63) / 64), (uint32_t)S, 1);
     _g_dispatch_cnt++;
     return 1;
 }
@@ -3684,20 +3681,20 @@ int picolm_gpu_attention_decode_dev(float *xb_out_dev, const float *q_dev,
           .buffer = qbi.buffer, .offset = qbi.offset,
           .size = (VkDeviceSize)nh * hd * sizeof(float) },
         { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-          .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+          .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
           .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
           .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
           .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
           .buffer = G.kv_k_buf, .offset = 0, .size = G.kv_k_bytes },
         { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-          .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+          .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
           .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
           .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
           .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
           .buffer = G.kv_v_buf, .offset = 0, .size = G.kv_v_bytes },
     };
-    vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+    vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
                          0, NULL, 3, barriers, 0, NULL);
 
     VK_BATCH_BIND(G.pipe_attn_dec);
@@ -3756,14 +3753,14 @@ int picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
               .buffer = qbi.buffer, .offset = qbi.offset,
               .size = (VkDeviceSize)nt * nh * hd * sizeof(float) },
             { .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-              .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+              .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
               .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
               .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
               .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
               .buffer = G.kv_k_buf, .offset = 0, .size = G.kv_k_bytes },
         };
-        vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+        vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
                              0, NULL, 2, barriers, 0, NULL);
 
         VK_BATCH_BIND(G.pipe_attn_f16);
@@ -3825,9 +3822,8 @@ int picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
           .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
           .buffer = vbi.buffer, .offset = vbi.offset, .size = vbi.range }
     };
-    // KAVERI workaround: use ALL_COMMANDS stages for barrier
-    vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+    vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
                          0, NULL, 3, barriers, 0, NULL);
 
     VK_BATCH_BIND(G.pipe_attn_prefill);
@@ -3890,8 +3886,8 @@ int picolm_gpu_attention_prefill_f32kv(float *xb_out_dev, const float *q_dev,
           .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
           .buffer = vbi.buffer, .offset = vbi.offset, .size = vbi.range },
     };
-    vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+    vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
                          0, NULL, 3, barriers, 0, NULL);
 
     VK_BATCH_BIND(G.pipe_attn_prefill);
