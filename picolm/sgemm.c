@@ -2751,12 +2751,29 @@ static void sgemm_q4k_q8k_neon(int m, int n, int k_blocks,
  * Dispatch function
  * ============================================================ */
 
+static int picolm_sgemm_disabled(void) {
+    static int checked = 0, disabled = 0, notified = 0;
+    if (!checked) {
+        const char *sv = getenv("PICOLM_SGEMM");
+        if (sv) {
+            disabled = (sv[0] == '0' || (sv[0] == 'f' && sv[1] == 'a'));
+            if (disabled && !notified) {
+                fprintf(stderr, "WARN: PICOLM_SGEMM=%s -- tiled GEMM disabled, using scalar vec_dot fallback\n", sv);
+                notified = 1;
+            }
+        }
+        checked = 1;
+    }
+    return disabled;
+}
+
 int picolm_sgemm(int m, int n, int k,
                  const void *A, int lda,
                  const void *B, int ldb,
                  float *C, int ldc,
                  int Atype, int Btype,
                  int ith, int nth) {
+    if (picolm_sgemm_disabled()) return 0;
     if (m < 4 || n < 2 || k < 1)
         return 0;
 
@@ -2887,6 +2904,7 @@ int picolm_sgemm_d(int m, int n, int k_blocks,
                    float *C, int ldc,
                    int Atype,
                    int ith, int nth) {
+    if (picolm_sgemm_disabled()) return 0;
     static int traced;
     if (getenv("PICOLM_DISPATCH") && !traced && ith == 0) {
         traced = 1;
@@ -2951,6 +2969,7 @@ int picolm_sgemm_d_q4k(int m, int n, int k_blocks_q4k,
                        const void *B, int ldb_q8k,
                        float *C, int ldc,
                        int ith, int nth) {
+    if (picolm_sgemm_disabled()) return 0;
 #if defined(__AVX2__) && defined(__F16C__)
     if (m < 1 || n < 1 || k_blocks_q4k < 1)
         return 0;

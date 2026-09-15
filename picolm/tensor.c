@@ -2408,9 +2408,16 @@ typedef struct {
 
 static void qgemm_d_task(int idx, void *ctxp) {
     qgemm_d_ctx_t *c = (qgemm_d_ctx_t *)ctxp;
-    picolm_sgemm_d(c->m, c->n, c->k_blocks, c->A, c->lda,
+    int ok = picolm_sgemm_d(c->m, c->n, c->k_blocks, c->A, c->lda,
                    c->B, c->ldb, c->B_d, c->ldb_d,
                    c->C, c->ldc, c->Atype, idx, c->nth);
+    /* If picolm_sgemm_d returns 0 here, the output buffer C is partially
+     * uninitialized. This should not happen because the caller checks
+     * PICOLM_SGEMM=0 before entering this path. */
+    if (!ok && idx == 0) {
+        fprintf(stderr, "WARN: qgemm_d_task returned 0 (m=%d n=%d k=%d) -- output may be garbage\n",
+                c->m, c->n, c->k_blocks);
+    }
 }
 
 /* Non-delta GEMM worker: dispatches picolm_sgemm with Btype=Q8_0.
@@ -2429,9 +2436,13 @@ typedef struct {
 
 static void sgemm_q8_worker(int idx, void *ctxp) {
     sgemm_q8_ctx_t *c = (sgemm_q8_ctx_t *)ctxp;
-    picolm_sgemm(c->m, c->n, c->k_blocks, c->A, c->lda,
+    int ok = picolm_sgemm(c->m, c->n, c->k_blocks, c->A, c->lda,
                  c->B, c->ldb, c->C, c->ldc,
                  c->Atype, c->Btype, idx, c->nth);
+    if (!ok && idx == 0) {
+        fprintf(stderr, "WARN: sgemm_q8_worker returned 0 (m=%d n=%d k=%d) -- output may be garbage\n",
+                c->m, c->n, c->k_blocks);
+    }
 }
 #endif /* AVX2+F16C || ARM NEON for qgemm_d_ctx_t / sgemm_q8_ctx_t */
 
@@ -2461,10 +2472,25 @@ typedef struct {
     size_t bs;
 } qgemm_q4x8_ctx_t;
 
+static int picolm_sgemm_disabled_tensor(void) {
+    static int checked = 0, disabled = 0;
+    if (!checked) {
+        const char *sv = getenv("PICOLM_SGEMM");
+        disabled = sv && (sv[0] == '0' || (sv[0] == 'f' && sv[1] == 'a'));
+        checked = 1;
+    }
+    return disabled;
+}
+
 static void qgemm_q4x8_task(int idx, void *ctxp) {
     qgemm_q4x8_ctx_t *c = (qgemm_q4x8_ctx_t *)ctxp;
-    int nth = pool_total_threads(1);
-    sgemm_q4_0x8_q8_0x4(c->nr, c->nc, c->k, c->w, c->abuf, c->out, c->bs, idx, nth);
+    if (!picolm_sgemm_disabled_tensor()) {
+        int nth = pool_total_threads(1);
+        sgemm_q4_0x8_q8_0x4(c->nr, c->nc, c->k, c->w, c->abuf, c->out, c->bs, idx, nth);
+    }
+    /* If SGEMM disabled, output buffer is left untouched. Caller must
+     * handle fallback. The Q4_0_8_8 dispatch in matmul_batch should
+     * not be reached when PICOLM_SGEMM=0 (guarded at entry). */
 }
 
 /* Q4I_0_8_8 GEMM threading context (pre-dequantized int8, AVX-512 only) */
@@ -2478,8 +2504,10 @@ typedef struct {
 
 static void qgemm_q4ix8_task(int idx, void *ctxp) {
     qgemm_q4ix8_ctx_t *c = (qgemm_q4ix8_ctx_t *)ctxp;
-    int nth = pool_total_threads(1);
-    sgemm_q4i_0x8_q8_0x4(c->nr, c->nc, c->k, c->w, c->abuf, c->out, c->bs, idx, nth);
+    if (!picolm_sgemm_disabled_tensor()) {
+        int nth = pool_total_threads(1);
+        sgemm_q4i_0x8_q8_0x4(c->nr, c->nc, c->k, c->w, c->abuf, c->out, c->bs, idx, nth);
+    }
 }
 
 /* Profiling: per-path timing for matmul_batch (PICOLM_PROFILE=1) */
@@ -2580,6 +2608,11 @@ void matmul_batch(float *out, const float *x, int n_batch,
          * Use non-delta only if explicitly requested. */
         int want_nondelta = (neon_q4_mode && strcmp(neon_q4_mode, "nondelta") == 0);
         if (!want_nondelta) want_delta = 1;
+        /* PICOLM_SGEMM=0 forces scalar fallback (same as PICOLM_NEON_Q4=scalar) */
+        { static const char *sgemm_env = NULL;
+          if (!sgemm_env) sgemm_env = getenv("PICOLM_SGEMM");
+          if (sgemm_env && (sgemm_env[0] == '0' || (sgemm_env[0] == 'f' && sgemm_env[1] == 'a')))
+              want_scalar = 1; }
         if (!want_scalar && n_batch >= 4 && d >= 4 && n % 32 == 0 &&
             (qtype == GGUF_TYPE_Q4_0 || qtype == GGUF_TYPE_Q5_0 || qtype == GGUF_TYPE_Q8_0 ||
              qtype == GGUF_TYPE_IQ4_NL)) {
@@ -3270,9 +3303,14 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
 #endif
     /* Quantized GEMM fast path for dual batch (K+V or gate+up projections).
      * Pre-quantize activations once, then use picolm_sgemm_d via tensor_parallel_for
-     * for both matmuls. Each worker thread gets a distinct ith. */
+     * for both matmuls. Each worker thread gets a distinct ith.
+     * PICOLM_SGEMM=0 skips GEMM, falls through to scalar vec_dot below. */
 #if defined(__AVX2__) && defined(__F16C__)
-    if (n_batch >= 8 && d >= 4 && n > 0 &&
+    { static const char *_sgemm_env = NULL;
+      if (!_sgemm_env) _sgemm_env = getenv("PICOLM_SGEMM");
+      int _sgemm_off = _sgemm_env && (_sgemm_env[0] == '0' || (_sgemm_env[0] == 'f' && _sgemm_env[1] == 'a'));
+      if (!_sgemm_off &&
+        n_batch >= 8 && d >= 4 && n > 0 &&
         (qtype1 == GGUF_TYPE_Q8_0 || qtype1 == GGUF_TYPE_Q4_0 || qtype1 == GGUF_TYPE_Q5_0 ||
          qtype1 == GGUF_TYPE_IQ4_NL) &&
         (qtype2 == GGUF_TYPE_Q8_0 || qtype2 == GGUF_TYPE_Q4_0 || qtype2 == GGUF_TYPE_Q5_0 ||
@@ -3311,6 +3349,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
             return;
         }
     }
+    } /* !_sgemm_off */
 #endif
 #if defined(__ARM_NEON)
     /* NEON tiled GEMM for dual batch. Same structure as AVX2 path.
@@ -3322,7 +3361,11 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
      * The other ~4 go through matmul_dual_batch (K,V,gate,up) and always hit GEMM.
      * To fix: add same PICOLM_NEON_Q4 guard here, or accept that scalar mode
      * only affects single-batch paths. */
-    if (n_batch >= 4 && d >= 4 && n > 0 &&
+    { static const char *_sgemm_env2 = NULL;
+      if (!_sgemm_env2) _sgemm_env2 = getenv("PICOLM_SGEMM");
+      int _sgemm_off2 = _sgemm_env2 && (_sgemm_env2[0] == '0' || (_sgemm_env2[0] == 'f' && _sgemm_env2[1] == 'a'));
+      if (!_sgemm_off2 &&
+        n_batch >= 4 && d >= 4 && n > 0 &&
         (qtype1 == GGUF_TYPE_Q8_0 || qtype1 == GGUF_TYPE_Q4_0 || qtype1 == GGUF_TYPE_Q5_0 ||
          qtype1 == GGUF_TYPE_IQ4_NL) &&
         (qtype2 == GGUF_TYPE_Q8_0 || qtype2 == GGUF_TYPE_Q4_0 || qtype2 == GGUF_TYPE_Q5_0 ||
@@ -3361,6 +3404,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
             return;
         }
     }
+    } /* !_sgemm_off2 */
 #endif
 
 #if defined(PICOLM_AVX2)
