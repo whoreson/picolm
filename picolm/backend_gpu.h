@@ -426,6 +426,13 @@ int picolm_gpu_kv_flush_to_cpu(uint8_t *cpu_k, uint8_t *cpu_v,
                                 int n_pos, size_t row_sz_k, size_t row_sz_v,
                                 int device);
 
+/* Upload CPU KV cache to GPU KV cache (H2D).
+ * Used for GPT-2 CPU prefill -> GPU decode path. */
+int picolm_gpu_kv_upload_from_cpu(const uint8_t *cpu_k, const uint8_t *cpu_v,
+                                   int n_attn_ord, int max_seq_len, int n_pos,
+                                   size_t row_sz_k, size_t row_sz_v,
+                                   int device);
+
 /* Bulk KV cache upload from host F16 cache.
  * Copies all n_positions for a single layer from host_rows (contiguous
  * F16 rows) to device KV cache starting at pos 0.

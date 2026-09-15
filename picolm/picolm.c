@@ -595,7 +595,15 @@ static void benchmark_context_scaling(const char *model_path, const char *base_p
 
         float *logits = NULL;
 #ifdef PICOLM_GPU
+        fprintf(stderr, "[PICOLM] prefill path: PICOLM_GPU=%s kv_active=%d\n",
+                getenv("PICOLM_GPU") ? getenv("PICOLM_GPU") : "(null)", model.gpu.kv_active);
         if (getenv("PICOLM_GPU") && model.gpu.kv_active) {
+            /* KV cache comparison: run both CPU and GPU prefills, compare */
+            if (getenv("PICOLM_KV_COMPARE")) {
+                fprintf(stderr, "[PICOLM] KV_COMPARE triggered, calling _kv_compare_prefills\n");
+                extern void _kv_compare_prefills(model_t *m, int *tokens, int n_tokens, int device);
+                _kv_compare_prefills(&model, new_prompt, n_base, 0);
+            }
             logits = model_forward_prefill_gpu(&model, new_prompt, n_base, start_pos, NULL);
             if (!logits)
 #endif
@@ -1845,6 +1853,12 @@ int main(int argc, char **argv) {
 #endif
 #ifdef PICOLM_GPU
         if (model.gpu.kv_active) {
+            /* KV cache comparison: run both CPU and GPU prefills, compare */
+            if (getenv("PICOLM_KV_COMPARE")) {
+                fprintf(stderr, "[PICOLM] KV_COMPARE triggered, calling _kv_compare_prefills\n");
+                extern void _kv_compare_prefills(model_t *m, int *tokens, int n_tokens, int device);
+                _kv_compare_prefills(&model, prompt_tokens, n_prompt, 0);
+            }
             logits = model_forward_prefill_gpu(&model, prompt_tokens, n_prompt, start_pos, NULL);
             if (logits) {
                 gpu_prefill_used = 1;

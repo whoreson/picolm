@@ -925,7 +925,12 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
     if (qtype == GGUF_TYPE_Q8_0 && n > 0) {
         size_t q8_row_size = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
         int nb = n / 32;
-        /* Pre-allocate buffer for: quantized x + pre-converted x deltas */
+        /* Pre-allocate buffer for: quantized x + pre-converted x deltas.
+         * Activation deltas are kept in FP32 (not round-tripped through FP16)
+         * to match GPU behavior and avoid unnecessary precision loss.
+         * block_q8_0 stores d as uint16_t (FP16), but we override with FP32
+         * in the qx_d array. The qs[] int8 values are computed from FP32 delta
+         * before FP16 rounding, so they're correct either way. */
         size_t total_buf = q8_row_size + nb * sizeof(float);
         /* When threading is used, always malloc to avoid data races on scratch_buf */
         float *qx_buf = (n_threads > 1) ? (float *)malloc(total_buf) :
@@ -934,9 +939,20 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
         if (qx_buf) {
             quantize_row_q8_0(x, qx_buf, n);
             const block_q8_0 *qx = (const block_q8_0 *)qx_buf;
-            /* Pre-convert x deltas once for all rows */
+            /* TODO: verify fp32_activation_delta - keep activation deltas in FP32
+             * to match GPU (no FP16 round-trip). Compute d directly from amax.
+             * Previously used: qx_d[bi] = fp16_to_fp32(qx[bi].d); which introduced
+             * unnecessary FP16 quantization error. */
             float *qx_d = qx_buf + (q8_row_size / sizeof(float));
-            for (int bi = 0; bi < nb; bi++) qx_d[bi] = fp16_to_fp32(qx[bi].d);
+            for (int bi = 0; bi < nb; bi++) {
+                float amax = 0.0f;
+                for (int j = 0; j < 32; j++) {
+                    float v = x[bi * 32 + j];
+                    if (v < 0) v = -v;
+                    if (v > amax) amax = v;
+                }
+                qx_d[bi] = amax / 127.0f;
+            }
 
             if (n_threads <= 1 || d < 4 || d < matmul_min_rows) {
                 for (int i = 0; i < d; i++) {
@@ -4336,13 +4352,12 @@ void silu(float *x, int size) {
 }
 
 void gelu(float *x, int size) {
-    /* Gemma-3n: use F32 GELU for numerical accuracy.
-     * The F16 table lookup introduces quantization error that compounds over 35 layers. */
-    if (getenv("PICOLM_GELU_F32")) {
-        picolm_gelu_f32(x, size);
-    } else {
-        picolm_gelu_table_f32(x, size);
-    }
+    /* Always use F32 GELU for numerical accuracy.
+     * The F16 table lookup introduces quantization error that compounds
+     * over 48 layers, especially problematic for GPT-2 on GPU where the
+     * GPU GELU uses F32 tanh approximation. Matching GELU ensures GPU
+     * and CPU produce consistent intermediate values. */
+    picolm_gelu_f32(x, size);
 }
 void elemwise_mul(float *out, const float *a, const float *b, int size) {
 #ifdef PICOLM_AVX512

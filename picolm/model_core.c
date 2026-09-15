@@ -1908,6 +1908,12 @@ static float *model_forward_gpt2(model_t *m, int token, int pos) {
         }
     }
 
+    /* DEBUG: dump input embedding for first decode token */
+    if (getenv("PICOLM_DBG_LAYER")) {
+        fprintf(stderr, "[LNDBG] CPU decode EMB pos=%d s->x[0:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                pos, s->x[0],s->x[1],s->x[2],s->x[3],s->x[4],s->x[5],s->x[6],s->x[7]);
+    }
+
     /* 2. Transformer layers */
     int n_active_layers = c->n_layers;
     for (int slot = 0; slot < n_active_layers; slot++) {
@@ -1919,6 +1925,12 @@ static float *model_forward_gpt2(model_t *m, int token, int pos) {
         /* ---- LayerNorm + Attention ---- */
         layernorm(s->xb, s->x, s->attn_norm_w[l], s->attn_norm_b[l], dim, c->rms_norm_eps);
 
+        /* DEBUG: dump LayerNorm output for layer 0 */
+        if (getenv("PICOLM_DBG_LAYER") && l == 0) {
+            fprintf(stderr, "[LNDBG] CPU decode l=%d LN_out[0:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                    l, s->xb[0],s->xb[1],s->xb[2],s->xb[3],s->xb[4],s->xb[5],s->xb[6],s->xb[7]);
+        }
+
         /* Fused QKV projection: [dim, 3*dim] -> s->q [3*dim] */
         tensor_set_repacked(m->repack_used[ri] ? m->repack_buffers[ri] : NULL);
         matmul(s->q, s->xb, lw->attn_qkv, dim, 3 * dim, lw->type_attn_qkv);
@@ -1927,6 +1939,12 @@ static float *model_forward_gpt2(model_t *m, int token, int pos) {
         if (lw->attn_qkv_bias) {
             const float *bias = (const float *)lw->attn_qkv_bias;
             for (int i = 0; i < 3 * dim; i++) s->q[i] += bias[i];
+        }
+
+        /* DEBUG: dump Q projection for layer 0 */
+        if (getenv("PICOLM_DBG_LAYER") && l == 0) {
+            fprintf(stderr, "[LNDBG] CPU decode l=%d Q[0:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                    l, s->q[0],s->q[1],s->q[2],s->q[3],s->q[4],s->q[5],s->q[6],s->q[7]);
         }
 
         /* Split Q, K, V from fused output */
@@ -2022,7 +2040,11 @@ static float *model_forward_gpt2(model_t *m, int token, int pos) {
         gctx.attn_scale = 1.0f / sqrtf((float)head_dim);
         tensor_parallel_for(n_heads, attention_group, &gctx);
 
-        /* Debug: dump CPU attention output at pos=1, layer 0 */
+        /* DEBUG: dump attention output for layer 0 */
+        if (getenv("PICOLM_DBG_LAYER") && l == 0) {
+            fprintf(stderr, "[LNDBG] CPU decode l=%d ATTN_out[0:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                    l, s->xb[0],s->xb[1],s->xb[2],s->xb[3],s->xb[4],s->xb[5],s->xb[6],s->xb[7]);
+        }
 
         /* Output projection */
         tensor_set_repacked(m->repack_used[ri+3] ? m->repack_buffers[ri+3] : NULL);
@@ -2033,10 +2055,22 @@ static float *model_forward_gpt2(model_t *m, int token, int pos) {
             const float *bias = (const float *)lw->attn_output_bias;
             for (int i = 0; i < dim; i++) s->xb2[i] += bias[i];
         }
+
+        /* DEBUG: dump output projection for layer 0 */
+        if (getenv("PICOLM_DBG_LAYER") && l == 0) {
+            fprintf(stderr, "[LNDBG] CPU decode l=%d OUTPROJ[0:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                    l, s->xb2[0],s->xb2[1],s->xb2[2],s->xb2[3],s->xb2[4],s->xb2[5],s->xb2[6],s->xb2[7]);
+        }
         vec_add(s->x, s->xb2, dim);
 
         /* ---- FFN (standard GELU, no gate) ---- */
         layernorm(s->xb, s->x, s->post_attn_norm_w[l], s->post_attn_norm_b[l], dim, c->rms_norm_eps);
+
+        /* DEBUG: dump FFN LayerNorm output for layer 0 */
+        if (getenv("PICOLM_DBG_LAYER") && l == 0) {
+            fprintf(stderr, "[LNDBG] CPU decode l=%d FFN_LN[0:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                    l, s->xb[0],s->xb[1],s->xb[2],s->xb[3],s->xb[4],s->xb[5],s->xb[6],s->xb[7]);
+        }
 
         /* FFN up: [dim, n_ffn] */
         tensor_set_repacked(m->repack_used[ri+6] ? m->repack_buffers[ri+6] : NULL);
@@ -2046,6 +2080,12 @@ static float *model_forward_gpt2(model_t *m, int token, int pos) {
         if (lw->ffn_up_bias) {
             const float *bias = (const float *)lw->ffn_up_bias;
             for (int i = 0; i < n_ffn; i++) s->hb[i] += bias[i];
+        }
+
+        /* DEBUG: dump FFN up output (pre-GELU) for layer 0 */
+        if (getenv("PICOLM_DBG_LAYER") && l == 0) {
+            fprintf(stderr, "[LNDBG] CPU decode l=%d FFN_up_pre_gelu[0:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                    l, s->hb[0],s->hb[1],s->hb[2],s->hb[3],s->hb[4],s->hb[5],s->hb[6],s->hb[7]);
         }
 
         /* GELU activation -- use F32 formula for numerical accuracy (PICOLM_GELU_F32=1) */
@@ -2061,11 +2101,22 @@ static float *model_forward_gpt2(model_t *m, int token, int pos) {
             for (int i = 0; i < dim; i++) s->xb[i] += bias[i];
         }
 
+        /* DEBUG: dump FFN output for layer 0 */
+        if (getenv("PICOLM_DBG_LAYER") && l == 0) {
+            fprintf(stderr, "[LNDBG] CPU decode l=%d FFN_out[0:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                    l, s->xb[0],s->xb[1],s->xb[2],s->xb[3],s->xb[4],s->xb[5],s->xb[6],s->xb[7]);
+        }
         vec_add(s->x, s->xb, dim);
 #ifdef PICOLM_VIZ
         viz_push_layer(l, s->x, dim);
 #endif
         BENCH_LAYER_END(l, 0);
+
+        /* DEBUG: dump first 8 values after each layer for first decode token */
+        if (getenv("PICOLM_DBG_LAYER") && pos == 3 && l < 3) {
+            fprintf(stderr, "[LNDBG] CPU decode l=%d pos=%d s->x[0:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                    l, pos, s->x[0],s->x[1],s->x[2],s->x[3],s->x[4],s->x[5],s->x[6],s->x[7]);
+        }
     }
 
     /* 3. Final LayerNorm */
@@ -2075,6 +2126,30 @@ static float *model_forward_gpt2(model_t *m, int token, int pos) {
     tensor_set_repacked(m->repack_used[1] ? m->repack_buffers[1] : NULL);
     matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
     tensor_set_repacked(NULL);
+
+    if (getenv("PICOLM_DBG_LOGITS")) {
+        int top_idx[20] = {0};
+        float top_val[20] = {0};
+        for (int j = 0; j < 20; j++) top_val[j] = -1e30f;
+        for (int i = 0; i < c->vocab_size; i++) {
+            for (int j = 0; j < 20; j++) {
+                if (s->logits[i] > top_val[j]) {
+                    for (int k = 19; k > j; k--) {
+                        top_val[k] = top_val[k-1];
+                        top_idx[k] = top_idx[k-1];
+                    }
+                    top_val[j] = s->logits[i];
+                    top_idx[j] = i;
+                    break;
+                }
+            }
+        }
+        if (pos <= 20) {
+            fprintf(stderr, "[CPU DECODE LOGITS token=%d pos=%d] top10: ", token, pos);
+            for (int j = 0; j < 10; j++) fprintf(stderr, "%d(%f) ", top_idx[j], top_val[j]);
+            fprintf(stderr, "\n");
+        }
+    }
 
     return s->logits;
 }
@@ -2643,7 +2718,26 @@ ffn_done:
     matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
     tensor_set_repacked(NULL);
 
-    /* Debug: dump top-5 logits at first decode step */
+    /* Debug: dump top-10 logits at first decode steps */
+    if (getenv("PICOLM_DBG_LOGITS") && pos <= 6) {
+        int top_idx[20] = {0};
+        float top_val[20] = {0};
+        for (int j = 0; j < 20; j++) top_val[j] = -1e30f;
+        for (int i = 0; i < c->vocab_size; i++) {
+            for (int j = 0; j < 20; j++) {
+                if (s->logits[i] > top_val[j]) {
+                    for (int k = 19; k > j; k--) {
+                        top_val[k] = top_val[k-1]; top_idx[k] = top_idx[k-1];
+                    }
+                    top_val[j] = s->logits[i]; top_idx[j] = i;
+                    break;
+                }
+            }
+        }
+        fprintf(stderr, "[CPU DECODE LOGITS token=%d pos=%d] top10: ", token, pos);
+        for (int j = 0; j < 10; j++) fprintf(stderr, "%d(%f) ", top_idx[j], top_val[j]);
+        fprintf(stderr, "\n");
+    }
 
     return s->logits;
 }
@@ -3389,10 +3483,41 @@ static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_to
         fprintf(stderr,"[CPU GPT2 s->x][:4]={%.6f,%.6f,%.6f,%.6f} rms=%.6f\n",
                 s->x[0],s->x[1],s->x[2],s->x[3],sqrtf(cr/dim));
     }
+    if (getenv("PICOLM_DBG_KV")) {
+        /* Dump CPU KV cache layer 0, position 0, first 8 F16 values */
+        uint16_t *k0 = (uint16_t *)(s->key_cache);
+        uint16_t *v0 = (uint16_t *)(s->val_cache);
+        fprintf(stderr, "[CPU KV l=0 p=0] K[0:8]={0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x}\n",
+                k0[0],k0[1],k0[2],k0[3],k0[4],k0[5],k0[6],k0[7]);
+        fprintf(stderr, "[CPU KV l=0 p=0] V[0:8]={0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x}\n",
+                v0[0],v0[1],v0[2],v0[3],v0[4],v0[5],v0[6],v0[7]);
+    }
     /* Output projection -> logits */
     tensor_set_repacked(m->repack_used[1] ? m->repack_buffers[1] : NULL);
     matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
     tensor_set_repacked(NULL);
+
+    if (getenv("PICOLM_DBG_LOGITS")) {
+        int top_idx[5] = {0,0,0,0,0};
+        float top_val[5] = {-1e30f,-1e30f,-1e30f,-1e30f,-1e30f};
+        for (int i = 0; i < c->vocab_size; i++) {
+            for (int j = 0; j < 5; j++) {
+                if (s->logits[i] > top_val[j]) {
+                    for (int k = 4; k > j; k--) {
+                        top_val[k] = top_val[k-1];
+                        top_idx[k] = top_idx[k-1];
+                    }
+                    top_val[j] = s->logits[i];
+                    top_idx[j] = i;
+                    break;
+                }
+            }
+        }
+        fprintf(stderr, "[CPU PREFILL LOGITS] top5: %d(%f) %d(%f) %d(%f) %d(%f) %d(%f)\n",
+                top_idx[0], top_val[0], top_idx[1], top_val[1],
+                top_idx[2], top_val[2], top_idx[3], top_val[3],
+                top_idx[4], top_val[4]);
+    }
 
     free(buf);
     return s->logits;

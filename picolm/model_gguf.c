@@ -1467,8 +1467,7 @@ int parse_gguf(model_t *m, int max_seq_len) {
                 /* SSM tensors (Qwen3.5) / GPT-2 fused QKV */
                 else if (strcmp(suffix, "attn_qkv.weight") == 0) {
                     lw->attn_qkv = ptr; lw->type_attn_qkv = qtype;
-                    /* is_attn_layer: SSM=0, GPT-2=1. Set to 1 by default (GPT-2),
-                     * SSM will override via attn_gate_ssm check in model_init_run_state. */
+                    lw->is_attn_layer = 1;
                 } else if (strcmp(suffix, "attn_gate.weight") == 0) {
                     lw->attn_gate_ssm = ptr; lw->type_attn_gate_ssm = qtype;
                 } else if (strcmp(suffix, "ssm_a") == 0) {

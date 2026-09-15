@@ -1705,8 +1705,41 @@ extern "C" int
 picolm_gpu_kv_flush_to_cpu(uint8_t *cpu_k, uint8_t *cpu_v,
     int n_attn_ord, int max_seq, int n_pos,
     size_t row_sz_k, size_t row_sz_v, int device) {
-    (void)cpu_k; (void)cpu_v; (void)n_attn_ord; (void)max_seq;
-    (void)n_pos; (void)row_sz_k; (void)row_sz_v; (void)device;
+    (void)n_pos;
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    if (!g_kv_k_dev[device] || !g_kv_v_dev[device]) return 0;
+    if (!cpu_k || !cpu_v) return 0;
+    size_t flush_bytes_k = (size_t)n_attn_ord * (size_t)max_seq * row_sz_k;
+    size_t flush_bytes_v = (size_t)n_attn_ord * (size_t)max_seq * row_sz_v;
+    if (!gpu_ok(gpuMemcpy(cpu_k, g_kv_k_dev[device], flush_bytes_k, gpuMemcpyDeviceToHost),
+                "kv flush K D2H")) return 0;
+    if (!gpu_ok(gpuMemcpy(cpu_v, g_kv_v_dev[device], flush_bytes_v, gpuMemcpyDeviceToHost),
+                "kv flush V D2H")) return 0;
+    return 1;
+}
+
+/* Upload CPU KV cache to GPU KV cache (H2D).
+ * Used for GPT-2 CPU prefill -> GPU decode path: CPU prefill writes to
+ * CPU KV cache, then this uploads to GPU KV cache for GPU decode. */
+extern "C" int
+picolm_gpu_kv_upload_from_cpu(const uint8_t *cpu_k, const uint8_t *cpu_v,
+    int n_attn_ord, int max_seq_len, int n_pos,
+    size_t row_sz_k, size_t row_sz_v, int device) {
+    gpu_device_ctx_t *ctx = find_ctx(device);
+    if (!ctx || !select_ctx(ctx)) return 0;
+    if (!g_kv_k_dev[device] || !g_kv_v_dev[device]) return 0;
+    if (!cpu_k || !cpu_v) return 0;
+    /* Copy full layers (all positions), not just the written positions.
+     * CPU KV cache layout: [layer][max_seq_len][kv_dim]. Each layer is
+     * contiguous. GPU KV cache has the same layout. Copy full layers to
+     * maintain alignment. Unwritten positions are zero in both buffers. */
+    size_t upload_bytes_k = (size_t)n_attn_ord * max_seq_len * row_sz_k;
+    size_t upload_bytes_v = (size_t)n_attn_ord * max_seq_len * row_sz_v;
+    if (!gpu_ok(gpuMemcpy(g_kv_k_dev[device], cpu_k, upload_bytes_k, gpuMemcpyHostToDevice),
+                "kv upload K H2D")) return 0;
+    if (!gpu_ok(gpuMemcpy(g_kv_v_dev[device], cpu_v, upload_bytes_v, gpuMemcpyHostToDevice),
+                "kv upload V H2D")) return 0;
     return 1;
 }
 
@@ -1736,8 +1769,12 @@ picolm_gpu_memcpy(void *dst, const void *src, size_t bytes, int dir, int device)
                           (dir < 0) ? gpuMemcpyDeviceToHost :
                                       gpuMemcpyDeviceToDevice;
 
-    /* Use async copy on ctx->stream + sync to avoid default-stream
-     * interleaving on GB10 multi-engine scheduler. */
+    /* Use synchronous copy for D2H to avoid stream issues */
+    if (dir < 0) {
+        gpuError_t err = gpuMemcpy(dst, src, bytes, kind);
+        if (!gpu_ok(err, "pipeline memcpy D2H sync")) return 0;
+        return 1;
+    }
     gpuError_t err = gpuMemcpyAsync(dst, src, bytes, kind, ctx->stream);
     if (!gpu_ok(err, "pipeline memcpy async")) return 0;
     return gpu_ok(gpuDeviceSynchronize(), "pipeline memcpy sync");

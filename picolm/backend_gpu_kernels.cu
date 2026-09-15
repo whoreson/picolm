@@ -260,11 +260,11 @@ picolm_quantize_q8_0(int8_t *qs_out, float *d_out,
 
     float amax = amax_shared[0];
     float d = amax / 127.0f;
-    float id = (d > 0.0f) ? 1.0f / d : 0.0f;
-    int q = (int)lrintf(v * id);
-    /* Clamp to [-128, 127] */
+    float id = (amax > 0.0f) ? 127.0f / amax : 0.0f;
+    int q = (int)lroundf(v * id);
+    /* Clamp to [-127, 127] to match CPU quantize_row_q8_0 */
     if (q > 127) q = 127;
-    if (q < -128) q = -128;
+    if (q < -127) q = -127;
 
     qs_out[(size_t)s * (size_t)n_blocks * 32 + (size_t)block * 32 + tid] = (int8_t)q;
     if (tid == 0)
@@ -360,10 +360,10 @@ picolm_quantize_q8_0_strided(int8_t *qs_out, float *d_out,
     }
     float amax = amax_shared[0];
     float d = amax / 127.0f;
-    float id = (d > 0.0f) ? 1.0f / d : 0.0f;
-    int q = (int)lrintf(v * id);
+    float id = (amax > 0.0f) ? 127.0f / amax : 0.0f;
+    int q = (int)lroundf(v * id);
     if (q > 127) q = 127;
-    if (q < -128) q = -128;
+    if (q < -127) q = -127;
     qs_out[(size_t)s * (size_t)n_blocks * 32 + (size_t)block * 32 + tid] = (int8_t)q;
     if (tid == 0)
         d_out[(size_t)s * (size_t)n_blocks + block] = d;

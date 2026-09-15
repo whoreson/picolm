@@ -4167,9 +4167,25 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
         if (!staging) {
             /* Fallback: sync copy via s->x heap buffer */
             dequantize_row(embd_row, s->x, dim, w->type_token_embd);
+            /* Add positional embedding (GPT-2) */
+            if (w->position_embd) {
+                size_t pos_row_bytes = gguf_type_row_size(w->type_position_embd, dim);
+                const void *pos_row = (const uint8_t *)w->position_embd + (size_t)pos * pos_row_bytes;
+                float *pos_embd = s->xb;
+                dequantize_row(pos_row, pos_embd, dim, w->type_position_embd);
+                vec_add(s->x, pos_embd, dim);
+            }
             picolm_gpu_memcpy(pipe_x, s->x, dim * sizeof(float), 1, gpu_dev);
         } else {
             dequantize_row(embd_row, staging, dim, w->type_token_embd);
+            /* Add positional embedding (GPT-2) */
+            if (w->position_embd) {
+                size_t pos_row_bytes = gguf_type_row_size(w->type_position_embd, dim);
+                const void *pos_row = (const uint8_t *)w->position_embd + (size_t)pos * pos_row_bytes;
+                float *pos_embd = s->xb;
+                dequantize_row(pos_row, pos_embd, dim, w->type_position_embd);
+                vec_add(staging, pos_embd, dim);
+            }
             picolm_gpu_memcpy_async(pipe_x, staging, dim * sizeof(float), 1, gpu_dev);
         }
     }
@@ -4179,6 +4195,14 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
 
     /* Sync any pending H2D transfers (embedding upload) before starting batch */
     picolm_gpu_sync(gpu_dev);
+
+    /* DEBUG: dump input embedding for first decode token */
+    if (getenv("PICOLM_DBG_LAYER")) {
+        float dmp[8];
+        picolm_gpu_memcpy(dmp, pipe_x, 32, -1, gpu_dev);
+        fprintf(stderr, "[LNDBG] GPU decode EMB pos=%d pipe_x[0:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                pos, dmp[0],dmp[1],dmp[2],dmp[3],dmp[4],dmp[5],dmp[6],dmp[7]);
+    }
 
     /* Begin batched command buffer recording.
      * All layer dispatches (RMSNorm, matmul, KV store, attention, elementwise)
@@ -4202,12 +4226,20 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
         int did_cpu_ssm = 0;
 
         if (!c->has_ssm || lw->is_attn_layer) {
-            /* Diagnostic: dump pipe_x (input to attention layer) for first decode token */
             /* A. RMSNorm/LayerNorm: pipe_xb = norm(pipe_x, attn_norm_w[l]) */
             if (gw->attn_norm_bias_dev[l]) {
                 picolm_gpu_layernorm_dev(pipe_xb, pipe_x,
                     (float *)gw->attn_norm_dev[l], (float *)gw->attn_norm_bias_dev[l],
                     dim, c->rms_norm_eps, gpu_dev);
+
+                /* DEBUG: dump LayerNorm output for layer 0 */
+                if (getenv("PICOLM_DBG_LAYER") && l == 0) {
+                    picolm_gpu_sync(gpu_dev);
+                    float dmp[8];
+                    picolm_gpu_memcpy(dmp, pipe_xb, 32, -1, gpu_dev);
+                    fprintf(stderr, "[LNDBG] GPU decode l=%d LN_out[0:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                            l, dmp[0],dmp[1],dmp[2],dmp[3],dmp[4],dmp[5],dmp[6],dmp[7]);
+                }
             } else {
                 picolm_gpu_rmsnorm_dev(pipe_xb, pipe_x,
                     (float *)gw->attn_norm_dev[l],
@@ -4236,6 +4268,15 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
                       fprintf(stderr, "ERROR: GPT-2 decode fused QKV split failed\n");
                       return -1;
                   }
+                }
+
+                /* DEBUG: dump Q projection for layer 0 */
+                if (getenv("PICOLM_DBG_LAYER") && l == 0) {
+                    picolm_gpu_sync(gpu_dev);
+                    float dmp[8];
+                    picolm_gpu_memcpy(dmp, pipe_q, 32, -1, gpu_dev);
+                    fprintf(stderr, "[LNDBG] GPU decode l=%d Q[0:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                            l, dmp[0],dmp[1],dmp[2],dmp[3],dmp[4],dmp[5],dmp[6],dmp[7]);
                 }
             } else {
                 picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_q,
@@ -4322,6 +4363,15 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
                 return model_forward(m, token, pos);
             }
 
+            /* DEBUG: dump attention output for layer 0 */
+            if (getenv("PICOLM_DBG_LAYER") && l == 0) {
+                picolm_gpu_sync(gpu_dev);
+                float dmp[8];
+                picolm_gpu_memcpy(dmp, pipe_attn_out, 32, -1, gpu_dev);
+                fprintf(stderr, "[LNDBG] GPU decode l=%d ATTN_out[0:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                        l, dmp[0],dmp[1],dmp[2],dmp[3],dmp[4],dmp[5],dmp[6],dmp[7]);
+            }
+
             /* I1. For SSM models: apply gate sigmoid to attention output.
              * pipe_attn_out *= sigmoid(pipe_gate)
              * This must happen before the output projection. */
@@ -4339,8 +4389,27 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
                                         (float *)gw->attn_output_bias_dev[l], 1, dim, 0, gpu_dev);
             }
 
+            /* DEBUG: dump output projection (pipe_xb) for layer 0 */
+            if (getenv("PICOLM_DBG_LAYER") && l == 0 && pos == 3) {
+                picolm_gpu_sync(gpu_dev);
+                float dmp[8];
+                picolm_gpu_memcpy(dmp, pipe_xb, 32, -1, gpu_dev);
+                fprintf(stderr, "[LNDBG] GPU decode l=%d OUTPROJ[0:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                        l, dmp[0],dmp[1],dmp[2],dmp[3],dmp[4],dmp[5],dmp[6],dmp[7]);
+            }
+
             /* J. Residual add: pipe_x += pipe_xb */
             picolm_gpu_residual_add(pipe_x, pipe_x, pipe_xb, 1, dim, q_pipeline_dim, gpu_dev);
+
+            /* DEBUG: dump first 8 values of pipe_x after each layer for first decode token */
+            if (getenv("PICOLM_DBG_LAYER") && pos == 3 && l < 3) {
+                picolm_gpu_sync(gpu_dev);
+                float dmp[8];
+                picolm_gpu_memcpy(dmp, pipe_x, 32, -1, gpu_dev);
+                fprintf(stderr, "[LNDBG] GPU decode l=%d pos=%d pipe_x[0:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                        l, pos, dmp[0],dmp[1],dmp[2],dmp[3],dmp[4],dmp[5],dmp[6],dmp[7]);
+            }
+
         } else {
             /* SSM/hybrid layer: try GPU-native path first, fallback to CPU hybrid */
             if (!ssm_forward_gpu(m, s, s->x, s->xb2, lw, l, pos,
@@ -4403,6 +4472,15 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
                     dim, c->rms_norm_eps, gpu_dev);
             }
 
+            /* DEBUG: dump FFN LayerNorm output for layer 0 */
+            if (getenv("PICOLM_DBG_LAYER") && l == 0 && pos == 3) {
+                picolm_gpu_sync(gpu_dev);
+                float dmp[8];
+                picolm_gpu_memcpy(dmp, pipe_ffn_norm, 32, -1, gpu_dev);
+                fprintf(stderr, "[LNDBG] GPU decode l=%d FFN_LN[0:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                        l, dmp[0],dmp[1],dmp[2],dmp[3],dmp[4],dmp[5],dmp[6],dmp[7]);
+            }
+
             if (gl->ffn_gate) {
                 /* L. Gate: pipe_gate = ffn_gate @ pipe_ffn_norm */
                 picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->ffn_gate,
@@ -4427,6 +4505,14 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
                     picolm_gpu_residual_add(pipe_gate, pipe_gate,
                                             (float *)gw->ffn_up_bias_dev[l], 1, n_ffn, 0, gpu_dev);
                 }
+                /* DEBUG: dump FFN up output (pre-GELU) for layer 0 */
+                if (getenv("PICOLM_DBG_LAYER") && l == 0 && pos == 3) {
+                    picolm_gpu_sync(gpu_dev);
+                    float dmp[8];
+                    picolm_gpu_memcpy(dmp, pipe_gate, 32, -1, gpu_dev);
+                    fprintf(stderr, "[LNDBG] GPU decode l=%d FFN_up_pre_gelu[0:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                            l, dmp[0],dmp[1],dmp[2],dmp[3],dmp[4],dmp[5],dmp[6],dmp[7]);
+                }
                 picolm_gpu_gelu_dev(pipe_gate, n_ffn, gpu_dev);
             }
 
@@ -4437,6 +4523,15 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
             if (gw->ffn_down_bias_dev[l]) {
                 picolm_gpu_residual_add(pipe_xb, pipe_xb,
                                         (float *)gw->ffn_down_bias_dev[l], 1, dim, 0, gpu_dev);
+            }
+
+            /* DEBUG: dump FFN output for layer 0 */
+            if (getenv("PICOLM_DBG_LAYER") && l == 0 && pos == 3) {
+                picolm_gpu_sync(gpu_dev);
+                float dmp[8];
+                picolm_gpu_memcpy(dmp, pipe_xb, 32, -1, gpu_dev);
+                fprintf(stderr, "[LNDBG] GPU decode l=%d FFN_out[0:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                        l, dmp[0],dmp[1],dmp[2],dmp[3],dmp[4],dmp[5],dmp[6],dmp[7]);
             }
 
             /* P. Residual add: pipe_x += pipe_xb */
@@ -4488,6 +4583,31 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
         matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
         tensor_set_repacked(NULL);
         tensor_set_gpu_tensor(NULL, 0);
+    }
+
+    if (getenv("PICOLM_DBG_LOGITS")) {
+        int top_idx[20] = {0};
+        float top_val[20] = {0};
+        for (int j = 0; j < 20; j++) top_val[j] = -1e30f;
+        model_config_t *c2 = &m->config;
+        for (int i = 0; i < c2->vocab_size; i++) {
+            for (int j = 0; j < 20; j++) {
+                if (s->logits[i] > top_val[j]) {
+                    for (int k = 19; k > j; k--) {
+                        top_val[k] = top_val[k-1];
+                        top_idx[k] = top_idx[k-1];
+                    }
+                    top_val[j] = s->logits[i];
+                    top_idx[j] = i;
+                    break;
+                }
+            }
+        }
+        if (pos <= 20) {
+            fprintf(stderr, "[GPU DECODE LOGITS token=%d pos=%d] top10: ", token, pos);
+            for (int j = 0; j < 10; j++) fprintf(stderr, "%d(%f) ", top_idx[j], top_val[j]);
+            fprintf(stderr, "\n");
+        }
     }
 
     return s->logits;
@@ -5037,17 +5157,18 @@ after_qkv:
     picolm_gpu_batch_end(gpu_dev);
     double _gpu_layer_total = get_time_ms() - _gpu_layer_t0;
     /* Debug: dump KV cache for layer 0, token 0 */
-    if (getenv("PICOLM_DBG") && 0) {
-        uint16_t *_kd = (uint16_t*)malloc(4 * 25 * 64 * sizeof(uint16_t));
-        uint16_t *_vd = (uint16_t*)malloc(4 * 25 * 64 * sizeof(uint16_t));
+    if (getenv("PICOLM_DBG_KV")) {
+        int kv_dim = n_kv_heads * head_dim;
+        size_t row_sz = (size_t)kv_dim * sizeof(uint16_t);
+        size_t layer_sz = row_sz * c->max_seq_len;
+        uint16_t *_kd = (uint16_t*)malloc(layer_sz);
+        uint16_t *_vd = (uint16_t*)malloc(layer_sz);
         if (_kd && _vd) {
-            picolm_gpu_kv_flush_to_cpu((uint8_t*)_kd, (uint8_t*)_vd, 1, 64, 4, 25*64, 25*64, gpu_dev);
-            float _kvals[8];
-            for(int _i=0;_i<8;_i++) _kvals[_i] = (float)_kd[_i];
-            fprintf(stderr, "[L0DBG kv_cache_k][:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
-                    _kvals[0],_kvals[1],_kvals[2],_kvals[3],_kvals[4],_kvals[5],_kvals[6],_kvals[7]);
-            fprintf(stderr, "[L0DBG kv_cache_raw][:8]={0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x}\n",
+            picolm_gpu_kv_flush_to_cpu((uint8_t*)_kd, (uint8_t*)_vd, 1, c->max_seq_len, n_ubatch, row_sz, row_sz, gpu_dev);
+            fprintf(stderr, "[GPU KV l=0 p=0] K[0:8]={0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x}\n",
                     _kd[0],_kd[1],_kd[2],_kd[3],_kd[4],_kd[5],_kd[6],_kd[7]);
+            fprintf(stderr, "[GPU KV l=0 p=0] V[0:8]={0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x}\n",
+                    _vd[0],_vd[1],_vd[2],_vd[3],_vd[4],_vd[5],_vd[6],_vd[7]);
             free(_kd); free(_vd);
         }
     }
@@ -5231,9 +5352,11 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
         rmsnorm(s->x, s->x, s->output_norm_w, dim, c->rms_norm_eps);
     }
 
-    /* Flush GPU KV cache to CPU for CPU decode path (needed on Vulkan) */
-#ifdef PICOLM_VULKAN
-    if (gw->kv_active && s->kv_type_k == KV_CACHE_F16 && s->kv_type_v == KV_CACHE_F16) {
+    /* Flush GPU KV cache to CPU for CPU decode path.
+     * Required on all GPU backends: GPU prefill writes to GPU KV cache only,
+     * but CPU decode (model_forward_gpt2) reads from CPU KV cache. */
+    if (gw->kv_active && s->kv_type_k == KV_CACHE_F16 && s->kv_type_v == KV_CACHE_F16
+        && !getenv("PICOLM_NO_GPU_FLUSH")) {
         int n_attn_ord = 0;
         for (int _ll = 0; _ll < c->n_layers; _ll++) {
             if (w->layers[_ll].is_attn_layer) n_attn_ord++;
@@ -5243,7 +5366,6 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
                                         s->kv_row_size_k, s->kv_row_size_v,
                                         gpu_dev);
     }
-#endif
 
     tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gw->output, gpu_dev);
     matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
@@ -5257,6 +5379,29 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
      * the per-layer sync happens inline in the fallback code above. */
 
     /* Diagnostic: dump first SSM state elements after prefill */
+
+    if (getenv("PICOLM_DBG_LOGITS")) {
+        /* Find top-5 tokens */
+        int top_idx[5] = {0,0,0,0,0};
+        float top_val[5] = {-1e30f,-1e30f,-1e30f,-1e30f,-1e30f};
+        for (int i = 0; i < c->vocab_size; i++) {
+            for (int j = 0; j < 5; j++) {
+                if (s->logits[i] > top_val[j]) {
+                    for (int k = 4; k > j; k--) {
+                        top_val[k] = top_val[k-1];
+                        top_idx[k] = top_idx[k-1];
+                    }
+                    top_val[j] = s->logits[i];
+                    top_idx[j] = i;
+                    break;
+                }
+            }
+        }
+        fprintf(stderr, "[GPU PREFILL LOGITS] top5: %d(%f) %d(%f) %d(%f) %d(%f) %d(%f)\n",
+                top_idx[0], top_val[0], top_idx[1], top_val[1],
+                top_idx[2], top_val[2], top_idx[3], top_val[3],
+                top_idx[4], top_val[4]);
+    }
 
     return s->logits;
 }
@@ -5302,6 +5447,205 @@ void picolm_ssm_state_sync_to_host(model_t *m, int device) {
             picolm_gpu_memcpy(m->state.ssm_conv_state[l], m->gpu.ssm_conv_state_dev[l], sz, -1, device);
         }
     }
+}
+
+/* ================================================================
+ * KV Cache CPU vs GPU Comparison Utility
+ *
+ * Runs both CPU and GPU prefills on the same prompt, compares KV
+ * cache values layer-by-layer, and reports max absolute difference
+ * per element and per layer.
+ *
+ * Called via: PICOLM_KV_COMPARE=1 ./picolm ...
+ * ================================================================ */
+/*
+ * _kv_compare_prefills: Generic KV cache comparison utility.
+ *
+ * Runs both GPU and CPU prefills on the same input tokens, then compares
+ * the resulting F16 KV cache values element-by-element. Reports per-layer
+ * max absolute differences and overall statistics.
+ *
+ * Triggered by PICOLM_KV_COMPARE=1.
+ *
+ * TODO: picolm_gpu_kv_flush_to_cpu crashes (segfault in gpuMemcpy) if called
+ * twice in sequence on the same GPU device (e.g., CPU prefill first, then GPU
+ * prefill, then flush). The GPU context appears to be corrupted after the CPU
+ * prefill runs with PICOLM_GPU=1. Workaround: GPU prefill runs first (fresh
+ * context), KV cache is downloaded layer-by-layer via picolm_gpu_memcpy D2H,
+ * then CPU prefill runs.
+ */
+void _kv_compare_prefills(model_t *m, int *tokens, int n_tokens, int device) {
+    fprintf(stderr, "[KV_COMP] START: n_tokens=%d, device=%d\n", n_tokens, device);
+    model_config_t *c = &m->config;
+    run_state_t *s = &m->state;
+
+    /* Count attention layers */
+    int n_attn = 0;
+    for (int l = 0; l < c->n_layers; l++) {
+        if (m->weights.layers[l].is_attn_layer) n_attn++;
+    }
+    if (n_attn == 0) {
+        fprintf(stderr, "WARN: _kv_compare_prefills: no attention layers found\n");
+        return;
+    }
+
+    /* Size calculations: only copy the written portion (n_tokens positions) */
+    size_t layer_k = s->kv_row_size_k * (size_t)c->max_seq_len;
+    size_t layer_v = s->kv_row_size_v * (size_t)c->max_seq_len;
+
+    /* === STEP 1: GPU prefill first (fresh GPU context) ===
+     * GPU prefill must run first. Running CPU prefill first then GPU prefill
+     * then flushing GPU KV causes hipMemcpy segfault (GPU context corruption).
+     * See TODO above. */
+    fprintf(stderr, "[KV_COMP] GPU prefill starting...\n");
+    picolm_gpu_kv_cache_clear(device);
+    {
+#ifdef _WIN32
+        _putenv_s("PICOLM_NO_GPU_FLUSH", "1");
+#else
+        setenv("PICOLM_NO_GPU_FLUSH", "1", 1);
+#endif
+        float *logits_gpu = model_forward_prefill_gpu(m, tokens, n_tokens, 0, NULL);
+#ifdef _WIN32
+        _putenv_s("PICOLM_NO_GPU_FLUSH", "");
+#else
+        unsetenv("PICOLM_NO_GPU_FLUSH");
+#endif
+        if (!logits_gpu) {
+            fprintf(stderr, "[KV_COMP] ERROR: GPU prefill returned NULL\n");
+            return;
+        }
+    }
+    fprintf(stderr, "[KV_COMP] GPU prefill done, flushing KV...\n");
+    picolm_gpu_sync(device);
+
+    /* Download GPU KV cache - copy only written positions layer by layer */
+    size_t gpu_k_total = layer_k * (size_t)n_attn;
+    size_t gpu_v_total = layer_v * (size_t)n_attn;
+    uint8_t *gpu_k_full = malloc(gpu_k_total);
+    uint8_t *gpu_v_full = malloc(gpu_v_total);
+    if (!gpu_k_full || !gpu_v_full) {
+        free(gpu_k_full); free(gpu_v_full);
+        fprintf(stderr, "[KV_COMP] malloc failed for GPU KV download\n");
+        return;
+    }
+    /* Copy layer by layer to avoid large single D2H that may fail */
+    for (int attn_l = 0; attn_l < n_attn; attn_l++) {
+        void *gk = (void*)((uintptr_t)m->gpu.kv_k_dev + (size_t)attn_l * layer_k);
+        void *gv = (void*)((uintptr_t)m->gpu.kv_v_dev + (size_t)attn_l * layer_v);
+        if (!picolm_gpu_memcpy(gpu_k_full + (size_t)attn_l * layer_k, gk, layer_k, -1, device)) {
+            fprintf(stderr, "[KV_COMP] GPU K layer %d D2H failed\n", attn_l);
+            free(gpu_k_full); free(gpu_v_full);
+            return;
+        }
+        if (!picolm_gpu_memcpy(gpu_v_full + (size_t)attn_l * layer_v, gv, layer_v, -1, device)) {
+            fprintf(stderr, "[KV_COMP] GPU V layer %d D2H failed\n", attn_l);
+            free(gpu_k_full); free(gpu_v_full);
+            return;
+        }
+    }
+    fprintf(stderr, "[KV_COMP] GPU KV download done\n");
+
+    /* === STEP 2: CPU prefill === */
+    fprintf(stderr, "[KV_COMP] CPU prefill starting...\n");
+    memset(s->key_cache, 0, layer_k * (size_t)n_attn);
+    memset(s->val_cache, 0, layer_v * (size_t)n_attn);
+    model_forward_prefill(m, tokens, n_tokens, 0, NULL);
+    fprintf(stderr, "[KV_COMP] CPU prefill done\n");
+    /* 4. Compare */
+    fprintf(stderr, "\n=== KV CACHE CPU vs GPU COMPARISON ===\n");
+    fprintf(stderr, "  Model: %s (n_layers=%d, attn_layers=%d, n_tokens=%d)\n",
+            c->is_gpt2 ? "gpt2" : (c->is_qwen ? "qwen" : (c->is_gemma3n ? "gemma3n" : "unknown")),
+            c->n_layers, n_attn, n_tokens);
+    fprintf(stderr, "  KV layout: row_size_k=%zu, row_size_v=%zu (%d F16 elems)\n",
+            s->kv_row_size_k, s->kv_row_size_v, (int)(s->kv_row_size_k / sizeof(uint16_t)));
+
+    /* Raw dump of layer 0, token 0, first 8 K values */
+    {
+        int elems = (int)(s->kv_row_size_k / sizeof(uint16_t));
+        const uint16_t *cpu_k0 = (const uint16_t *)s->key_cache;  /* layer 0 starts at offset 0 */
+        const uint16_t *gpu_k0 = (const uint16_t *)gpu_k_full;
+        fprintf(stderr, "  [RAW L0T0 K CPU] "); for (int i = 0; i < 8; i++) fprintf(stderr, "%s%.6f", i?",":"", fp16_to_fp32(cpu_k0[i])); fprintf(stderr, "\n");
+        fprintf(stderr, "  [RAW L0T0 K GPU] "); for (int i = 0; i < 8; i++) fprintf(stderr, "%s%.6f", i?",":"", fp16_to_fp32(gpu_k0[i])); fprintf(stderr, "\n");
+        const uint16_t *cpu_v0 = (const uint16_t *)s->val_cache;
+        const uint16_t *gpu_v0 = (const uint16_t *)gpu_v_full;
+        fprintf(stderr, "  [RAW L0T0 V CPU] "); for (int i = 0; i < 8; i++) fprintf(stderr, "%s%.6f", i?",":"", fp16_to_fp32(cpu_v0[i])); fprintf(stderr, "\n");
+        fprintf(stderr, "  [RAW L0T0 V GPU] "); for (int i = 0; i < 8; i++) fprintf(stderr, "%s%.6f", i?",":"", fp16_to_fp32(gpu_v0[i])); fprintf(stderr, "\n");
+        int cnan=0,cinf=0,gnan=0,ginf=0;
+        for (int i = 0; i < elems; i++) {
+            uint16_t cx = cpu_k0[i]; uint16_t gx = gpu_k0[i];
+            if ((cx>>10)==0x1F && (cx&0x3FF)) cnan++;
+            if ((cx>>10)==0x1F && !(cx&0x3FF) && cx) cinf++;
+            if ((gx>>10)==0x1F && (gx&0x3FF)) gnan++;
+            if ((gx>>10)==0x1F && !(gx&0x3FF) && gx) ginf++;
+        }
+        fprintf(stderr, "  [NAN/INF L0 K] CPU: nan=%d inf=%d GPU: nan=%d inf=%d\n", cnan, cinf, gnan, ginf);
+    }
+
+    float max_diff_k = 0.0f, max_diff_v = 0.0f;
+    int n_diff_k = 0, n_diff_v = 0;
+    int total_elems = s->kv_row_size_k / sizeof(uint16_t) * n_tokens;
+    int first_report = 1;
+
+    for (int attn_l = 0; attn_l < n_attn; attn_l++) {
+        /* Find actual layer index */
+        int layer = 0, acc = 0;
+        while (acc < attn_l) { if (m->weights.layers[layer].is_attn_layer) acc++; layer++; }
+
+        float layer_max_k = 0.0f, layer_max_v = 0.0f;
+        int layer_diff_k = 0, layer_diff_v = 0;
+
+        for (int p = 0; p < n_tokens; p++) {
+            /* CPU: key_cache[layer][p][elem], GPU: gpu_k_full[attn_l * max_seq + p][elem] */
+            const uint16_t *ck = (const uint16_t *)(s->key_cache + (size_t)layer * layer_k + (size_t)p * s->kv_row_size_k);
+            const uint16_t *gk = (const uint16_t *)(gpu_k_full + (size_t)attn_l * layer_k + (size_t)p * s->kv_row_size_k);
+            const uint16_t *cv = (const uint16_t *)(s->val_cache + (size_t)layer * layer_v + (size_t)p * s->kv_row_size_v);
+            const uint16_t *gv = (const uint16_t *)(gpu_v_full + (size_t)attn_l * layer_v + (size_t)p * s->kv_row_size_v);
+            for (int e = 0; e < s->kv_row_size_k / sizeof(uint16_t); e++) {
+                float cpu_val = fp16_to_fp32(ck[e]);
+                float gpu_val = fp16_to_fp32(gk[e]);
+                float diff = fabsf(cpu_val - gpu_val);
+                if (diff > layer_max_k) layer_max_k = diff;
+                if (diff > 1e-5f) layer_diff_k++;
+            }
+            for (int e = 0; e < s->kv_row_size_v / sizeof(uint16_t); e++) {
+                float cpu_val = fp16_to_fp32(cv[e]);
+                float gpu_val = fp16_to_fp32(gv[e]);
+                float diff = fabsf(cpu_val - gpu_val);
+                if (diff > layer_max_v) layer_max_v = diff;
+                if (diff > 1e-5f) layer_diff_v++;
+            }
+        }
+        if (layer_max_k > 0.0f || layer_max_v > 0.0f) {
+            fprintf(stderr, "  Layer %2d: K max_diff=%.6f (%d elems>1e-5), V max_diff=%.6f (%d elems>1e-5)\n",
+                    attn_l, layer_max_k, layer_diff_k, layer_max_v, layer_diff_v);
+            if (first_report && layer_max_k > 0.0f) {
+                first_report = 0;
+                for (int p = 0; p < n_tokens && !first_report; p++) {
+                    const uint16_t *ck = (const uint16_t *)(s->key_cache + (size_t)layer * layer_k + (size_t)p * s->kv_row_size_k);
+                    const uint16_t *gk = (const uint16_t *)(gpu_k_full + (size_t)attn_l * layer_k + (size_t)p * s->kv_row_size_k);
+                    for (int e = 0; e < 8 && e < s->kv_row_size_k / sizeof(uint16_t); e++) {
+                        float cpu_val = fp16_to_fp32(ck[e]);
+                        float gpu_val = fp16_to_fp32(gk[e]);
+                        if (fabsf(cpu_val - gpu_val) > 1e-5f) {
+                            fprintf(stderr, "    K[%d][%d] CPU=%.6f GPU=%.6f diff=%.6f\n",
+                                    p, e, cpu_val, gpu_val, fabsf(cpu_val - gpu_val));
+                        }
+                    }
+                }
+            }
+        }
+        if (layer_max_k > max_diff_k) max_diff_k = layer_max_k;
+        if (layer_max_v > max_diff_v) max_diff_v = layer_max_v;
+        n_diff_k += layer_diff_k;
+        n_diff_v += layer_diff_v;
+    }
+    fprintf(stderr, "  SUMMARY: K max_diff=%.6f (%d/%d elems>1e-5), V max_diff=%.6f (%d/%d elems>1e-5)\n",
+            max_diff_k, n_diff_k, total_elems * n_attn,
+            max_diff_v, n_diff_v, total_elems * n_attn);
+    fprintf(stderr, "=== END KV COMPARISON ===\n\n");
+
+    free(gpu_k_full); free(gpu_v_full);
 }
 
 #endif /* PICOLM_GPU */
