@@ -4,6 +4,14 @@
 // Supports: F32(0), F16(1), Q4_0(2), Q5_0(6), Q8_0(8),
 //           Q2_K(10), Q3_K(11), Q4_K(12), Q5_K(13), Q6_K(14),
 //           IQ4_NL(20), Q1_0(41), Q2_0(42)
+//
+// STRIDE SAFETY: x_stride/y_stride may differ from I/O (e.g. GPT-2 fused QKV
+// has xb_stride=4800 but dim=1600). If x_stride==0, defaults to I (contiguous).
+// If y_stride==0, defaults to O. The backend (backend_vulkan.c) passes these
+// as pc_raw[6] and pc_raw[7] in the 7-int push constant. DO NOT reduce the
+// push constant struct -- all 7 fields must be present or token 1+ will read
+// garbage (s*I != s*x_stride when stride > I). This was the root cause of the
+// GPT-2 Vulkan garbled-text bug (Sep 2025).
 
 layout(local_size_x = 16) in;
 
@@ -11,10 +19,16 @@ layout(std430, binding = 0) readonly buffer X  { float x[]; };
 layout(std430, binding = 1) readonly buffer W  { uint  w[]; };
 layout(std430, binding = 2) writeonly buffer Y { float y[]; };
 
+// Push constant: 7 ints = 28 bytes (fits in 48-byte VK limit).
+// FIELDS 6-7 (x_stride/y_stride) are CRITICAL for S>1 batched matmuls
+// where activation/output buffer stride differs from I/O.
+// See backend_vulkan.c picolm_gpu_matmul_dev() pc_raw[7].
 layout(push_constant) uniform P {
     int fmt;
     int S, I, O;
     int rowWords;
+    int x_stride;  // 0 = use I (contiguous)
+    int y_stride;  // 0 = use O (contiguous)
 } p;
 
 float f16tof32(uint h) {
@@ -81,7 +95,9 @@ void main() {
     int s = int(gl_WorkGroupID.y);
     if (o >= p.O || s >= p.S) return;
 
-    int xoff = s * p.I;
+    int x_stride = p.x_stride > 0 ? p.x_stride : p.I;
+    int y_stride = p.y_stride > 0 ? p.y_stride : p.O;
+    int xoff = s * x_stride;
     uint rowBase = uint(o) * uint(p.rowWords);
     float sum = 0.0;
 
@@ -455,5 +471,5 @@ void main() {
         sum = 0.0;
     }
 
-    y[uint(o) + uint(s) * uint(p.O)] = sum;
+    y[uint(o) + uint(s) * uint(y_stride)] = sum;
 }

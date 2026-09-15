@@ -5,11 +5,14 @@
 // Thread 0 computes the max abs and writes the d_val.
 // All 32 threads quantize their own element and write directly to QS output.
 //
-// Input x:     [S][I] float32, contiguous
+// Input x:     [S][x_stride] float32, only first I elements per row are valid.
+//              x_stride MUST match the actual buffer stride (e.g. xb_stride for
+//              GPT-2 where xb_stride=4800 > I=1600). Using s*I instead of
+//              s*x_stride causes token 1+ to read garbage (root cause, Sep 2025).
 // Output qs:   [S][n_blocks][8] uint32 (32 int8 values packed as 8 uint32 words)
 // Output d:    [S][n_blocks] float32
 //
-// Push constants: int I, int S, int pad (zero) = 12 bytes
+// Push constants: int I, int S, int x_stride = 12 bytes
 // Binding 0: readonly X (float)
 // Binding 1: writeonly QS (uint32 words)
 // Binding 2: writeonly D  (float)
@@ -25,7 +28,7 @@ layout(std430, binding = 2) writeonly buffer D  { float d[]; };
 layout(push_constant) uniform P {
     int I;
     int S;
-    int pad;
+    int x_stride;
 } p;
 
 void main() {
@@ -36,7 +39,7 @@ void main() {
     uint n_blocks = (uint(p.I) + 31u) / 32u;
     if (blk >= n_blocks || s >= uint(p.S)) return;
 
-    uint base = s * uint(p.I) + blk * 32u;
+    uint base = uint(s) * uint(p.x_stride) + blk * 32u;
     int valid = p.I - int(blk) * 32;
     if (valid <= 0) return;
 

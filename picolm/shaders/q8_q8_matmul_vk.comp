@@ -1,4 +1,12 @@
 #version 450
+// Q8_0 x Q8_0 matmul: Y[s,o] = sum_i xq[s,i] * w[o,i]
+// Grid: [O, S, 1], Block: 64 threads
+//
+// STRIDE SAFETY: y_stride may differ from O (e.g. GPT-2 fused QKV where
+// O=4800 and y_stride=4800). Output index is s*y_stride+o, NOT s*O+o.
+// The Q8 activations (xq/xd) are always contiguous [S][I] from quantize.
+// The weight rowWords is in uint32 words (not bytes). See backend_vulkan.c
+// _q8q8_matmul_dev() PC_Q8 struct (5 ints = 20 bytes). DO NOT reduce.
 layout(local_size_x = 64) in;  // Smaller workgroup = more workgroups
 
 layout(std430, binding = 0) readonly buffer XQ { uint xq[]; };
@@ -11,6 +19,7 @@ layout(push_constant) uniform P {
     int S;
     int O;
     int rowWords;
+    int y_stride;
 } p;
 
 float f16tof32(uint h) {
@@ -32,7 +41,7 @@ void main() {
     int s = int(gl_GlobalInvocationID.y);
     if (o >= uint(p.O)) return;
     
-    uint gid = uint(s) * uint(p.O) + o;
+    uint gid = uint(s) * uint(p.y_stride) + o;
     int nblocks = p.I / 32;
     uint xq_words = uint(p.I) / 4u;
     uint rowBase = o * uint(p.rowWords);

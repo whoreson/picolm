@@ -2086,10 +2086,10 @@ int picolm_gpu_memcpy_async(void *dst, const void *src, size_t bytes, int dir, i
             .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .buffer = src_buf, .offset = src_off, .size = bytes,
+            .buffer = src_buf, .offset = 0, .size = VK_WHOLE_SIZE,
         };
-        vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 1, &mb, 0, NULL);
+        vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 1, &mb, 0, NULL);
         }
         VkBufferCopy bc = {src_off, dst_off, bytes};
         vkCmdCopyBuffer(G.cmd_dev, src_buf, dst_buf, 1, &bc);
@@ -2182,16 +2182,22 @@ static void _batch_barrier_buf(void *buf, size_t sz) {
     VkDeviceSize off;
     unwrap_buf_offset(buf, &off);
     b = unwrap_buf(buf);
+    /* Guard against BOTH a prior compute-shader write AND a prior D2D
+     * transfer write (picolm_gpu_memcpy_async dir=0, e.g. GPT-2's fused
+     * QKV split). CUDA/HIP get this ordering for free via stream
+     * semantics; Vulkan does not -- a transfer-write-then-shader-read
+     * with no TRANSFER stage in the barrier is a real, silent race. */
     VkBufferMemoryBarrier bm = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
         .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .buffer = b, .offset = off,
         .size = sz > 0 ? sz : VK_WHOLE_SIZE
     };
-    vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+    vkCmdPipelineBarrier(G.cmd_dev,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
         0, NULL, 1, &bm, 0, NULL);
     _g_barrier_cnt++;
@@ -2203,20 +2209,23 @@ static void _batch_barrier_buf2(void *buf1, size_t sz1, void *buf2, size_t sz2) 
     VkBuffer b1 = unwrap_buf_offset(buf1, &bm[0].offset);
     VkBuffer b2 = unwrap_buf_offset(buf2, &bm[1].offset);
     bm[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-    bm[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    /* See _batch_barrier_buf: also guard against a prior D2D transfer
+     * write, not just a prior compute-shader write. */
+    bm[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     bm[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     bm[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     bm[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     bm[0].buffer = b1;
     bm[0].size = sz1 > 0 ? sz1 : VK_WHOLE_SIZE;
     bm[1].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-    bm[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    bm[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     bm[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     bm[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     bm[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     bm[1].buffer = b2;
     bm[1].size = sz2 > 0 ? sz2 : VK_WHOLE_SIZE;
-    vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+    vkCmdPipelineBarrier(G.cmd_dev,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
         0, NULL, 2, bm, 0, NULL);
     _g_barrier_cnt++;
@@ -2530,7 +2539,7 @@ uint16_t *picolm_gpu_kv_v_dev(int d) { return (d==0&&G.kv_v_d)?(uint16_t*)G.kv_v
 
 static int _matmul_dev_skip_cnt = 0;
 /* Device-native quantize F32->Q8_0. Dispatches quantize kernel on cmd_dev. */
-static int _quantize_dev(const float *x_dev, int I, int S) {
+static int _quantize_dev(const float *x_dev, int I, int S, int x_stride) {
     if (!G.shader_quantize) return 0;
     int n_blocks = (I + 31) / 32;
     int S_padded = (S + 15) & ~15;
@@ -2543,8 +2552,8 @@ static int _quantize_dev(const float *x_dev, int I, int S) {
         desc_buf_info(G.q8_xq_d),
         desc_buf_info(G.q8_xd_d)
     };
-    typedef struct { int I, S, pad; } PC_Q;
-    PC_Q pc = {I, S, 0};
+    typedef struct { int I, S, x_stride; } PC_Q;
+    PC_Q pc = {I, S, x_stride};
     VK_BATCH_BIND(G.pipe_quantize);
     push_desc(G.cmd_dev, 3, bi);
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
@@ -2557,7 +2566,7 @@ static int _quantize_dev(const float *x_dev, int I, int S) {
 
 /* Device-native Q8xQ8 matmul. Dispatches q8_q8 kernel on cmd_dev.
  * Caller MUST have already inserted a barrier making q8_xq/q8_xd visible. */
-static int _q8q8_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, int S) {
+static int _q8q8_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, int S, int y_stride) {
     if (!G.shader_q8q8) return 0;
     int n_blocks = t->I / 32;
     if (n_blocks < 1 || t->I % 32 != 0) return 0;
@@ -2568,8 +2577,8 @@ static int _q8q8_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, int S) {
         {t->wbuf, 0, VK_WHOLE_SIZE}, // weights
         desc_buf_info(y_dev)        // output
     };
-    typedef struct { int I, S, O, rowWords; } PC_Q8;
-    PC_Q8 pc = {t->I, S, t->O, (int)t->row_words};
+    typedef struct { int I, S, O, rowWords, y_stride; } PC_Q8;
+    PC_Q8 pc = {t->I, S, t->O, (int)t->row_words, y_stride};
     VK_BATCH_BIND(G.pipe_q8q8);
     push_desc(G.cmd_dev, 4, bi);
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
@@ -2588,6 +2597,16 @@ int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_d
         if (_matmul_dev_skip_cnt++ < 3) fprintf(stderr, "[VK] matmul_dev skip: I=%d O=%d (need >=64/32)\n", t->I, t->O);
         return 0;
     }
+    /* STRIDE SAFETY CHECK: If S>1 and stride==0, default to I/O (contiguous).
+     * This is CORRECT when xb_stride==I (e.g. SmolLM2: dim=288, xb_stride=288),
+     * but WRONG when xb_stride>I (e.g. GPT-2: dim=1600, xb_stride=4800).
+     * Only warn when the default would be incorrect. */
+    if (S > 1 && x_stride == 0) {
+        x_stride = t->I;
+    }
+    if (S > 1 && y_stride == 0) {
+        y_stride = t->O;
+    }
     VkDescriptorBufferInfo xbi = desc_buf_info(x_dev), ybi = desc_buf_info(y_dev);
     if (!xbi.buffer || !ybi.buffer) return 0;
 
@@ -2601,13 +2620,13 @@ int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_d
     if (t->qtype == GGUF_TYPE_Q8_0 && G.shader_quantize && G.shader_q8q8 && G.push_desc_supported) {
         if (NULL && _g_dispatch_logged++ < 100 + 100)
             fprintf(stderr, "DISPATCH matmul_dev: Q8_0 I=%d O=%d S=%d\n",t->I,t->O,S);
-        if (_quantize_dev(x_dev, t->I, S)) {
+        if (_quantize_dev(x_dev, t->I, S, x_stride)) {
             VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                 .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
                 .dstAccessMask = VK_ACCESS_SHADER_READ_BIT};
             vkCmdPipelineBarrier(G.cmd_dev, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
-            ok = _q8q8_matmul_dev(t, y_dev, S);
+            ok = _q8q8_matmul_dev(t, y_dev, S, y_stride);
         }
     }
     if (!ok) {
@@ -2662,8 +2681,9 @@ int picolm_gpu_matmul_dev_qkv(picolm_gpu_tensor_t *tq, picolm_gpu_tensor_t *tk,
                                picolm_gpu_tensor_t *tv, float *bq, float *bk, float *bv,
                                const float *x_dev, int S, int device,
                                int ysq, int ysk, int xs) {
-    (void)ysq; (void)ysk; (void)xs;
-    // No debug QKV
+    /* STRIDE SAFETY: xs=x_stride, ysq=Q output stride, ysk=K/V output stride.
+     * For S>1, these MUST reflect the actual buffer layout. See GPT-2 bug Sep 2025. */
+    (void)device;
     if (!tq || !tk || !tv || device != 0) return 0;
 
     // Try true fused QKV shader: single dispatch for all 3 projections
@@ -2673,7 +2693,7 @@ int picolm_gpu_matmul_dev_qkv(picolm_gpu_tensor_t *tq, picolm_gpu_tensor_t *tk,
         G.shader_quantize && G.shader_qkv) {
         // Scoped barrier: sync x_dev (input to quantize)
         _batch_barrier_buf(x_dev, (size_t)tq->I * (size_t)S * sizeof(float));
-        _quantize_dev(x_dev, tq->I, S);
+        _quantize_dev(x_dev, tq->I, S, xs);
         // Scoped barrier: sync q8_xq_d and q8_xd_d (quantize output -> fused qkv input)
         _batch_barrier_buf2(G.q8_xq_d, 0, G.q8_xd_d, 0);
 
@@ -2709,7 +2729,7 @@ int picolm_gpu_matmul_dev_qkv(picolm_gpu_tensor_t *tq, picolm_gpu_tensor_t *tk,
         G.shader_quantize && G.shader_q8q8) {
         // Scoped barrier: sync x_dev (input to quantize)
         _batch_barrier_buf(x_dev, (size_t)tq->I * (size_t)S * sizeof(float));
-        _quantize_dev(x_dev, tq->I, S);
+        _quantize_dev(x_dev, tq->I, S, xs);
         // Scoped barrier: sync q8_xq_d and q8_xd_d (one vkCmd call)
         _batch_barrier_buf2(G.q8_xq_d, 0, G.q8_xd_d, 0);
 
@@ -2718,8 +2738,8 @@ int picolm_gpu_matmul_dev_qkv(picolm_gpu_tensor_t *tq, picolm_gpu_tensor_t *tk,
           VkDescriptorBufferInfo bi[4] = {
               desc_buf_info(G.q8_xq_d), desc_buf_info(G.q8_xd_d),
               desc_tensor_info(tq), desc_buf_info(bq) };
-          typedef struct { int I, S, O, rowWords; } PC_Q8;
-          PC_Q8 pc = {tq->I, S, tq->O, (int)tq->row_words};
+          typedef struct { int I, S, O, rowWords, y_stride; } PC_Q8;
+          PC_Q8 pc = {tq->I, S, tq->O, (int)tq->row_words, ysq};
           VK_BATCH_BIND(G.pipe_q8q8);
           push_desc(G.cmd_dev, 4, bi);
           vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
@@ -2731,8 +2751,8 @@ int picolm_gpu_matmul_dev_qkv(picolm_gpu_tensor_t *tq, picolm_gpu_tensor_t *tk,
           VkDescriptorBufferInfo bi[4] = {
               desc_buf_info(G.q8_xq_d), desc_buf_info(G.q8_xd_d),
               desc_tensor_info(tk), desc_buf_info(bk) };
-          typedef struct { int I, S, O, rowWords; } PC_Q8;
-          PC_Q8 pc = {tk->I, S, tk->O, (int)tk->row_words};
+          typedef struct { int I, S, O, rowWords, y_stride; } PC_Q8;
+          PC_Q8 pc = {tk->I, S, tk->O, (int)tk->row_words, ysk};
           VK_BATCH_BIND(G.pipe_q8q8);
           push_desc(G.cmd_dev, 4, bi);
           vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
@@ -2744,8 +2764,8 @@ int picolm_gpu_matmul_dev_qkv(picolm_gpu_tensor_t *tq, picolm_gpu_tensor_t *tk,
           VkDescriptorBufferInfo bi[4] = {
               desc_buf_info(G.q8_xq_d), desc_buf_info(G.q8_xd_d),
               desc_tensor_info(tv), desc_buf_info(bv) };
-          typedef struct { int I, S, O, rowWords; } PC_Q8;
-          PC_Q8 pc = {tv->I, S, tv->O, (int)tv->row_words};
+          typedef struct { int I, S, O, rowWords, y_stride; } PC_Q8;
+          PC_Q8 pc = {tv->I, S, tv->O, (int)tv->row_words, ysk};
           VK_BATCH_BIND(G.pipe_q8q8);
           push_desc(G.cmd_dev, 4, bi);
           vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
@@ -2768,7 +2788,7 @@ int picolm_gpu_matmul_dev_gu(picolm_gpu_tensor_t *tg, picolm_gpu_tensor_t *tu,
                               float *bgate, float *bup,
                               const float *x_dev, int S, int device,
                               int ys, int xs) {
-    (void)ys; (void)xs;
+    
     if (!tg || !tu) return 0;
     // Try true fused GU shader: single dispatch for gate+up
     // Quantize once, then single fused matmul dispatch
@@ -2776,7 +2796,7 @@ int picolm_gpu_matmul_dev_gu(picolm_gpu_tensor_t *tg, picolm_gpu_tensor_t *tu,
         tg->I == tu->I && G.shader_quantize && G.shader_gu) {
         // Scoped barrier: sync x_dev (input to quantize)
         _batch_barrier_buf(x_dev, (size_t)tg->I * (size_t)S * sizeof(float));
-        _quantize_dev(x_dev, tg->I, S);
+        _quantize_dev(x_dev, tg->I, S, xs);
         // Scoped barrier: sync q8_xq_d and q8_xd_d (quantize output -> fused gu input)
         _batch_barrier_buf2(G.q8_xq_d, 0, G.q8_xd_d, 0);
 
@@ -2810,7 +2830,7 @@ int picolm_gpu_matmul_dev_gu(picolm_gpu_tensor_t *tg, picolm_gpu_tensor_t *tu,
         tg->I == tu->I && G.shader_quantize && G.shader_q8q8) {
         // Scoped barrier: sync x_dev (input to quantize)
         _batch_barrier_buf(x_dev, (size_t)tg->I * (size_t)S * sizeof(float));
-        _quantize_dev(x_dev, tg->I, S);
+        _quantize_dev(x_dev, tg->I, S, xs);
         // Scoped barrier: sync q8_xq_d and q8_xd_d (one vkCmd call)
         _batch_barrier_buf2(G.q8_xq_d, 0, G.q8_xd_d, 0);
 
@@ -2818,8 +2838,8 @@ int picolm_gpu_matmul_dev_gu(picolm_gpu_tensor_t *tg, picolm_gpu_tensor_t *tu,
           VkDescriptorBufferInfo bi[4] = {
               desc_buf_info(G.q8_xq_d), desc_buf_info(G.q8_xd_d),
               desc_tensor_info(tg), desc_buf_info(bgate) };
-          typedef struct { int I, S, O, rowWords; } PC_Q8;
-          PC_Q8 pc = {tg->I, S, tg->O, (int)tg->row_words};
+          typedef struct { int I, S, O, rowWords, y_stride; } PC_Q8;
+          PC_Q8 pc = {tg->I, S, tg->O, (int)tg->row_words, ys};
           VK_BATCH_BIND(G.pipe_q8q8);
           push_desc(G.cmd_dev, 4, bi);
           vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
@@ -2830,8 +2850,8 @@ int picolm_gpu_matmul_dev_gu(picolm_gpu_tensor_t *tg, picolm_gpu_tensor_t *tu,
           VkDescriptorBufferInfo bi[4] = {
               desc_buf_info(G.q8_xq_d), desc_buf_info(G.q8_xd_d),
               desc_tensor_info(tu), desc_buf_info(bup) };
-          typedef struct { int I, S, O, rowWords; } PC_Q8;
-          PC_Q8 pc = {tu->I, S, tu->O, (int)tu->row_words};
+          typedef struct { int I, S, O, rowWords, y_stride; } PC_Q8;
+          PC_Q8 pc = {tu->I, S, tu->O, (int)tu->row_words, ys};
           VK_BATCH_BIND(G.pipe_q8q8);
           push_desc(G.cmd_dev, 4, bi);
           vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
@@ -4075,11 +4095,92 @@ int picolm_gpu_logits_d2h_mapped(float *dst, size_t bytes, int device) {
     return 1;
 }
 
+/* The logits matmul is S=1 but O=vocab_size -- 10-100x the O of any other
+ * matmul in the network. Every other dispatch in the forward pass is already
+ * flushed per-layer to avoid WDDM's ~2s TDR kill on platforms without push
+ * descriptors, but this one dispatch runs once after the loop, outside that
+ * protection. On slow GPUs without push descriptors, a single vocab-wide
+ * scalar dispatch can exceed the TDR window -> driver resets queue -> stale/
+ * zeroed logits -> <unk> token every time.
+ *
+ * Fix: when push descriptors unavailable, chunk output rows into bounded
+ * slices with batch flush between chunks. On push-descriptor platforms
+ * (RADV/CUDA) this path is never taken -- zero overhead. */
+#define PICOLM_LOGITS_CHUNK_ROWS 4096
+
+static int _matmul_logits_chunk(picolm_gpu_tensor_t *t, float *logits_dev,
+                                 const float *x_dev, int o_start, int o_count,
+                                 int device) {
+    picolm_gpu_tensor_t tc = *t;
+    tc.O = o_count;
+
+    VkDescriptorBufferInfo xbi = desc_buf_info(x_dev);
+    VkDescriptorBufferInfo ybi = desc_buf_info(logits_dev);
+    if (!xbi.buffer || !ybi.buffer) return 0;
+    ybi.offset += (VkDeviceSize)o_start * sizeof(float);
+
+    VkDeviceSize w_off = (VkDeviceSize)o_start * (VkDeviceSize)t->row_bytes;
+
+    VK_BATCH_DISPATCH_PRE();
+    _batch_barrier_buf(x_dev, (size_t)t->I * sizeof(float));
+
+    int ok = 0;
+    #define TRY_DED_SHADER_CHUNK(qtype_const, name) \
+        if (!ok && t->qtype == qtype_const && G.shader_##name) { \
+            VkDescriptorBufferInfo bi[3] = {xbi, {t->wbuf, w_off, VK_WHOLE_SIZE}, ybi}; \
+            VK_BATCH_BIND(G.pipe_##name); \
+            push_desc(G.cmd_dev, 3, bi); \
+            int pc[4] = {1, t->I, tc.O, (int)t->row_words}; \
+            vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, \
+                               0, sizeof(pc), pc); \
+            vkCmdDispatch(G.cmd_dev, (uint32_t)((tc.O + 15) / 16), 1, 1); \
+            _g_dispatch_cnt++; ok = 1; \
+        }
+    TRY_DED_SHADER_CHUNK(GGUF_TYPE_Q2_K, q2k);
+    TRY_DED_SHADER_CHUNK(GGUF_TYPE_IQ4_NL, iq4nl);
+    TRY_DED_SHADER_CHUNK(GGUF_TYPE_Q3_K, q3k);
+    TRY_DED_SHADER_CHUNK(GGUF_TYPE_Q6_K, q6k);
+    TRY_DED_SHADER_CHUNK(GGUF_TYPE_Q4_K, q4k);
+    #undef TRY_DED_SHADER_CHUNK
+    if (!ok) {
+        VkDescriptorBufferInfo bi[3] = {xbi, {t->wbuf, w_off, VK_WHOLE_SIZE}, ybi};
+        VK_BATCH_BIND(G.pipe);
+        push_desc(G.cmd_dev, 3, bi);
+        PC_Matmul pc = {t->qtype, 1, t->I, tc.O, (int)t->row_words, 0, 0};
+        vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, sizeof(pc), &pc);
+        vkCmdDispatch(G.cmd_dev, (uint32_t)((tc.O + 15) / 16), 1, 1);
+        _g_dispatch_cnt++;
+        ok = 1;
+    }
+    VK_BATCH_DISPATCH_POST();
+    return ok;
+}
+
 int picolm_gpu_matmul_logits(picolm_gpu_tensor_t *t, float *logits_dev,
                               const float *x_dev, int device) {
     if (!G.ready || !t || !logits_dev || !x_dev || device != 0) return 0;
     if (!G.pipe_logits_d) return 0; /* should be pre-allocated */
     if (logits_dev != (float*)G.pipe_logits_d) return 0;
 
-    return picolm_gpu_matmul_dev(t, logits_dev, x_dev, 1, device, 0, 0);
+    if (G.push_desc_supported || t->O <= PICOLM_LOGITS_CHUNK_ROWS) {
+        /* Push descriptors available (or small vocab): single dispatch,
+         * unchanged behavior, zero overhead. */
+        return picolm_gpu_matmul_dev(t, logits_dev, x_dev, 1, device, 0, 0);
+    }
+
+    /* No push descriptors and large vocab: chunk to avoid TDR.
+     * Flush between chunks so no single submission exceeds TDR window. */
+    int was_in_batch = G.in_batch;
+    for (int o_start = 0; o_start < t->O; o_start += PICOLM_LOGITS_CHUNK_ROWS) {
+        int o_count = t->O - o_start;
+        if (o_count > PICOLM_LOGITS_CHUNK_ROWS) o_count = PICOLM_LOGITS_CHUNK_ROWS;
+        if (!_matmul_logits_chunk(t, logits_dev, x_dev, o_start, o_count, device))
+            return 0;
+        if (was_in_batch && o_start + o_count < t->O) {
+            picolm_gpu_batch_end(device);
+            picolm_gpu_batch_begin(device);
+        }
+    }
+    return 1;
 }

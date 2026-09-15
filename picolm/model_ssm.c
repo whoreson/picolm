@@ -4807,7 +4807,12 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
         /* QKV projections */
         if (!c->has_ssm) {
             if (gl->attn_qkv && !gl->attn_q) {
-                /* GPT-2: fused QKV weight [3*dim x dim], split on GPU after matmul */
+                /* GPT-2: fused QKV weight [3*dim x dim], split on GPU after matmul.
+                 * CRITICAL: xb_stride MUST be passed as x_stride (not dim), because
+                 * bxb has layout [S][xb_stride] with xb_stride = max(q_full_dim, dim).
+                 * For GPT-2: q_full_dim=3*dim=4800, dim=1600, so xb_stride=4800.
+                 * If dim were passed instead, token 1+ would read wrong data.
+                 * y_stride = 3*dim matches bq's interleaved [Q,K,V] layout. */
                 static int gpt2_qkv_init=1; if(gpt2_qkv_init){gpt2_qkv_init=0;
                     fprintf(stderr,"INFO: GPT-2 fused QKV path (S=%d)\n",n_ubatch);}
                 picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_qkv,
