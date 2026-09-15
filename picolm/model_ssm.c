@@ -5489,16 +5489,35 @@ void _kv_compare_prefills(model_t *m, int *tokens, int n_tokens, int device) {
         return;
     }
 
-    /* Size calculations: only copy the written portion (n_tokens positions) */
+    /* Size calculations: per-layer total for max_seq_len positions */
     size_t layer_k = s->kv_row_size_k * (size_t)c->max_seq_len;
     size_t layer_v = s->kv_row_size_v * (size_t)c->max_seq_len;
 
+    /* Allocate CPU buffers for GPU KV download */
+    size_t gpu_k_total = layer_k * (size_t)n_attn;
+    size_t gpu_v_total = layer_v * (size_t)n_attn;
+    uint8_t *gpu_k_full = malloc(gpu_k_total);
+    uint8_t *gpu_v_full = malloc(gpu_v_total);
+    if (!gpu_k_full || !gpu_v_full) {
+        free(gpu_k_full); free(gpu_v_full);
+        fprintf(stderr, "[KV_COMP] malloc failed for GPU KV download\n");
+        return;
+    }
+
     /* === STEP 1: GPU prefill first (fresh GPU context) ===
      * GPU prefill must run first. Running CPU prefill first then GPU prefill
-     * then flushing GPU KV causes hipMemcpy segfault (GPU context corruption).
-     * See TODO above. */
+     * then flushing GPU KV causes hipMemcpy segfault (GPU context corruption)
+     * on HIP/CUDA. See TODO above.
+     *
+     * We do NOT call picolm_gpu_kv_cache_clear() because:
+     *   - It destroys GPU KV cache buffers and their wrapper pointers
+     *   - Vulkan: wrapper removal from g_dev_buf_list breaks picolm_gpu_memcpy D2H
+     *     (encoded pointers can no longer be unwrapped)
+     *   - CUDA/HIP: m->gpu.kv_k_dev becomes a stale raw pointer
+     *   - Instead, we use picolm_gpu_kv_flush_to_cpu() which is backend-agnostic
+     *     and uses mapped memory (Vulkan) or direct D2H (CUDA/HIP)
+     */
     fprintf(stderr, "[KV_COMP] GPU prefill starting...\n");
-    picolm_gpu_kv_cache_clear(device);
     {
 #ifdef _WIN32
         _putenv_s("PICOLM_NO_GPU_FLUSH", "1");
@@ -5513,38 +5532,27 @@ void _kv_compare_prefills(model_t *m, int *tokens, int n_tokens, int device) {
 #endif
         if (!logits_gpu) {
             fprintf(stderr, "[KV_COMP] ERROR: GPU prefill returned NULL\n");
+            free(gpu_k_full); free(gpu_v_full);
             return;
         }
     }
     fprintf(stderr, "[KV_COMP] GPU prefill done, flushing KV...\n");
     picolm_gpu_sync(device);
 
-    /* Download GPU KV cache - copy only written positions layer by layer */
-    size_t gpu_k_total = layer_k * (size_t)n_attn;
-    size_t gpu_v_total = layer_v * (size_t)n_attn;
-    uint8_t *gpu_k_full = malloc(gpu_k_total);
-    uint8_t *gpu_v_full = malloc(gpu_v_total);
-    if (!gpu_k_full || !gpu_v_full) {
+    /* Download GPU KV cache using backend-agnostic flush function.
+     * Vulkan: uses mapped memory (G.kv_k_mapped/G.kv_v_mapped)
+     * CUDA/HIP: uses direct D2H via gpuMemcpy
+     * Only copies the written positions (n_tokens), not full max_seq_len. */
+    if (!picolm_gpu_kv_flush_to_cpu(gpu_k_full, gpu_v_full,
+                                     n_attn, c->max_seq_len, n_tokens,
+                                     s->kv_row_size_k, s->kv_row_size_v,
+                                     device)) {
+        fprintf(stderr, "[KV_COMP] ERROR: picolm_gpu_kv_flush_to_cpu failed\n");
         free(gpu_k_full); free(gpu_v_full);
-        fprintf(stderr, "[KV_COMP] malloc failed for GPU KV download\n");
         return;
     }
-    /* Copy layer by layer to avoid large single D2H that may fail */
-    for (int attn_l = 0; attn_l < n_attn; attn_l++) {
-        void *gk = (void*)((uintptr_t)m->gpu.kv_k_dev + (size_t)attn_l * layer_k);
-        void *gv = (void*)((uintptr_t)m->gpu.kv_v_dev + (size_t)attn_l * layer_v);
-        if (!picolm_gpu_memcpy(gpu_k_full + (size_t)attn_l * layer_k, gk, layer_k, -1, device)) {
-            fprintf(stderr, "[KV_COMP] GPU K layer %d D2H failed\n", attn_l);
-            free(gpu_k_full); free(gpu_v_full);
-            return;
-        }
-        if (!picolm_gpu_memcpy(gpu_v_full + (size_t)attn_l * layer_v, gv, layer_v, -1, device)) {
-            fprintf(stderr, "[KV_COMP] GPU V layer %d D2H failed\n", attn_l);
-            free(gpu_k_full); free(gpu_v_full);
-            return;
-        }
-    }
-    fprintf(stderr, "[KV_COMP] GPU KV download done\n");
+    fprintf(stderr, "[KV_COMP] GPU KV download done (%zu MB)\n",
+            (gpu_k_total + gpu_v_total) / (1024*1024));
 
     /* === STEP 2: CPU prefill === */
     fprintf(stderr, "[KV_COMP] CPU prefill starting...\n");
