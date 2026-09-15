@@ -62,9 +62,9 @@ void main() {
         if (av > amax0) amax0 = av;
     }
 
-    // Step 2: Compute scale
+    // Step 2: Compute scale (use 127.0/amax for better precision, matches CPU/GPU)
     float d_val = amax0 / 127.0;
-    float id = (d_val > 0.0) ? (1.0 / d_val) : 0.0;
+    float id = (amax0 > 0.0) ? (127.0 / amax0) : 0.0;
 
     // Step 3: Thread 0 writes the d_val
     if (tid == 0u) {
@@ -85,9 +85,8 @@ void main() {
                 continue;
             }
             float v = x[base + val_idx];
-            float qs_val = v * id;
-            int qi = int(qs_val + (qs_val >= 0.0 ? 0.5 : -0.5));
-            qi = clamp(qi, -128, 127);
+            int qi = int(round(v * id));
+            qi = clamp(qi, -127, 127);
             uint byte_val = uint(qi & 0xffu);
             packed |= byte_val << (b * 8u);
         }
