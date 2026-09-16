@@ -373,9 +373,7 @@ static VkResult vk_fence_wait_timeout(VkDevice dev, VkFence f, uint64_t timeout_
             if (r != VK_NOT_READY) return r;
         } while ((vk_now() - t0) * 1000.0 < (double)g_vk_spin_us);
     }
-    VkResult r = vkWaitForFences(dev, 1, &f, VK_TRUE, timeout_ns);
-    if (r != VK_SUCCESS && r != VK_TIMEOUT) { fprintf(stderr, "[VK] fence error %d\n", (int)r); }
-    return r;
+    return vkWaitForFences(dev, 1, &f, VK_TRUE, timeout_ns);
 }
 
 static int pick_memtype(VkPhysicalDevice phys) {
@@ -775,15 +773,6 @@ static void push_desc(VkCommandBuffer cmd, int n, const VkDescriptorBufferInfo *
         G.vkCmdPushDescriptorSetKHR_fn(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                        G.plyt_unified, 0, (uint32_t)n, w);
     } else {
-        // Prevent ring wraparound within a batch
-        if (G.in_batch && G.dset_batch_idx > 0 && (G.dset_batch_idx % 2048) == 0) {
-            fprintf(stderr, "[VK] descriptor ring wraparound: forcing batch boundary\n");
-            picolm_gpu_batch_end(0);
-            VkCommandBufferBeginInfo _vbi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-            vkResetCommandBuffer(G.cmd_dev, 0);
-            vkBeginCommandBuffer(G.cmd_dev, &_vbi);
-            G.in_batch = 1; G.bound_pipe = VK_NULL_HANDLE;
-        }
         int idx = G.dset_batch_idx % 2048;
         VkDescriptorSet set = G.dset_batch_ring[idx];
         VkWriteDescriptorSet w[8];
@@ -849,6 +838,7 @@ int picolm_gpu_init(const int *devices, int count) {
     VkPhysicalDevice devs[16]; if (nd > 16) nd = 16;
     vkEnumeratePhysicalDevices(G.inst, &nd, devs);
 
+    G.phys = devs[0];
     int bestrank = -1;
     for (uint32_t i = 0; i < nd; i++) {
         VkPhysicalDeviceProperties p;
@@ -2123,8 +2113,8 @@ float *picolm_gpu_staging_host(int device, size_t bytes) {
 int picolm_gpu_sync(int device) {
     if (!G.ready || device != 0) return 0;
     if (G.in_batch) picolm_gpu_batch_end(device);
-    vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
-    vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
+    vk_fence_wait_timeout(G.dev, G.fence_dev, 5ULL*1000*1000*1000);
+    vk_fence_wait_timeout(G.dev, G.fence_xfer, 5ULL*1000*1000*1000);
     return 1;
 }
 
@@ -3095,7 +3085,7 @@ int picolm_gpu_rope_apply(float *x, int n_heads, int head_dim,
     push_desc(G.cmd_dev, 4, bi);
     PC_Elem pc = {2, half_dim, (float)n_heads, rope_type};
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-    vkCmdDispatch(G.cmd_dev, (uint32_t)((half_dim * n_heads + 255) / 256), 1, 1);
+    vkCmdDispatch(G.cmd_dev, (uint32_t)((half_dim + 255) / 256), 1, 1);
     _g_dispatch_cnt++;
     VK_BATCH_DISPATCH_POST();
     return 1;
@@ -3125,7 +3115,7 @@ int picolm_gpu_rope_apply_batched(float *x, int n_heads, int head_dim,
     PC_Elem pc = {6, half_dim, (float)n_heads, start_pos};
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(pc), &pc);
-    vkCmdDispatch(G.cmd_dev, (uint32_t)((half_dim * n_heads + 255u) / 256u), (uint32_t)S, 1);
+    vkCmdDispatch(G.cmd_dev, (uint32_t)((half_dim + 255u) / 256u), (uint32_t)S, 1);
     _g_dispatch_cnt++;
     VK_BATCH_DISPATCH_POST();
 
@@ -3203,8 +3193,8 @@ int picolm_gpu_kv_store_dev(int is_k, int lo, int pos,
     size_t row_bytes_f32 = (size_t)kv_dim * sizeof(float);
     size_t row_bytes_f16 = (size_t)kv_dim * sizeof(uint16_t);
 
-    vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
-    vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
+    vk_fence_wait_timeout(G.dev, G.fence_dev, 5ULL*1000*1000*1000);
+    vk_fence_wait_timeout(G.dev, G.fence_xfer, 5ULL*1000*1000*1000);
 
     VkDeviceSize src_off;
     VkBuffer src_buf = unwrap_buf_offset(sd, &src_off);
@@ -3388,8 +3378,8 @@ int picolm_gpu_kv_store_dev_batched_strided(int is_k, int lo, int sp, int np,
     size_t row_bytes_f32 = (size_t)kv_dim * sizeof(float);
     size_t row_bytes_f16 = (size_t)kv_dim * sizeof(uint16_t);
         /* Wait for both prior dev and xfer fences */
-    vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
-    vk_fence_wait_timeout(G.dev, G.fence_xfer, 10ULL*1000*1000*1000);
+    vk_fence_wait_timeout(G.dev, G.fence_dev, 5ULL*1000*1000*1000);
+    vk_fence_wait_timeout(G.dev, G.fence_xfer, 5ULL*1000*1000*1000);
 
     /* Unwrap the device pointer */
     VkDeviceSize src_off;

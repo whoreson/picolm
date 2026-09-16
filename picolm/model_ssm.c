@@ -4798,13 +4798,11 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
             fprintf(stderr, "[GPUT L0 bxb_post_ln][:4]={%.6f,%.6f,%.6f,%.6f}\n", _t[0],_t[1],_t[2],_t[3]);
         }
 
-        /* KAVERI/RADV: flush batch at layer 0 to prevent multi-ubatch corruption.
-         * batch_end+batch_begin preserves batching but doesn't work on KAVERI.
-         * picolm_gpu_sync works but destroys batching. Use sync for now. */
-        if (l == 0) {
-            extern int picolm_gpu_sync(int device);
-            picolm_gpu_sync(gpu_dev);
-        }
+        /* KAVERI/RADV sync removed: the stride fixes (7d2ed82) and barrier
+         * narrowing (0591ae7) resolved the root cause. The layer-0 sync was
+         * destroying batching and causing corruption on MI50 (wrong output for
+         * Q8_0 models). KAVERI multi-ubatch issues are handled by proper
+         * barriers in _batch_barrier_buf and fence_xfer waits in batch_end. */
 
         /* QKV projections */
         if (!c->has_ssm) {

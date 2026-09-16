@@ -1,8 +1,8 @@
 #version 450
 // Q2_K scalar matmul: Y[s,o] = sum_i X[s,i] * dequant_W[o,i]
-// Grid: [ceil(O/64), S, 1], block: [64, 1, 1]
+// Grid: [ceil(O/16), S, 1], block: [16, 1, 1]
 
-layout(local_size_x = 64) in;
+layout(local_size_x = 16) in;
 
 layout(std430, binding = 0) readonly buffer X  { float x[]; };
 layout(std430, binding = 1) readonly buffer W  { uint  w[]; };
@@ -33,7 +33,7 @@ uint read_byte(uint rowBase, uint byteOff) {
 }
 
 void main() {
-    int o = int(gl_WorkGroupID.x) * 64 + int(gl_LocalInvocationID.x);
+    int o = int(gl_WorkGroupID.x) * 16 + int(gl_LocalInvocationID.x);
     int s = int(gl_WorkGroupID.y);
     if (o >= p.O || s >= p.S) return;
 

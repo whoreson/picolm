@@ -56,21 +56,19 @@ void main() {
             d0[gid] = silu_g * d1[gid];
         }
     } else if (pc.op == 2) {
-        // RoPE decode: flattened over heads. gid covers half_dim * n_heads.
         uint hd2 = uint(pc.n);
         int n_heads = int(pc.fp);
-        int total = int(hd2) * n_heads;
-        if (gid < total) {
-            int h = int(gid) / int(hd2);
-            int g = int(gid) % int(hd2);
-            int stride = 2 * int(hd2);
-            int base = h * stride + 2 * g;
-            float x0 = d0[base];
-            float x1 = d0[base + 1];
-            float c = d1[g];
-            float s = d2[g];
-            d0[base]     = x0 * c - x1 * s;
-            d0[base + 1] = x0 * s + x1 * c;
+        int stride = 2 * int(hd2);
+        if (gid < hd2) {
+            for (int h = 0; h < n_heads; h++) {
+                int base = h * stride + 2 * int(gid);
+                float x0 = d0[base];
+                float x1 = d0[base + 1];
+                float c = d1[gid];
+                float s = d2[gid];
+                d0[base]     = x0 * c - x1 * s;
+                d0[base + 1] = x0 * s + x1 * c;
+            }
         }
     } else if (pc.op == 3) {
         // F32->F16 pack: each thread handles one output word (2 F16 values)
@@ -97,25 +95,25 @@ void main() {
             d0[gid] = gelu_v;
         }
     } else if (pc.op == 6) {
-        // Batched RoPE: flattened over heads. gid covers half_dim * n_heads.
-        // y dimension = token index. No serial loop over heads.
+        // Batched RoPE: 2D dispatch, x=half_dim elements, y=token index
         uint hd2 = uint(pc.n);
         int n_heads = int(pc.fp);
         int start_pos = pc.pad;
         int tok = int(gl_GlobalInvocationID.y);
-        int total = int(hd2) * n_heads;
-        int hdim = int(hd2) * 2;
-        if (gid < total) {
-            int h = int(gid) / int(hd2);
-            int g = int(gid) % int(hd2);
+        int hdim = int(hd2) * 2;  // full head_dim from half_dim
+        if (gid < hd2) {
+            // cos/sin row for this token: (start_pos + tok) * half_dim
             int cs_row = (start_pos + tok) * int(hd2);
-            int tbase = tok * n_heads * hdim + h * hdim + 2 * g;
-            float x0 = d0[tbase];
-            float x1 = d0[tbase + 1];
-            float c = d1[cs_row + g];
-            float s = d2[cs_row + g];
-            d0[tbase]     = x0 * c - x1 * s;
-            d0[tbase + 1] = x0 * s + x1 * c;
+            for (int h = 0; h < n_heads; h++) {
+                // Token's x data: tok * (n_heads * head_dim) + h * head_dim + 2*gid
+                int tbase = tok * n_heads * hdim + h * hdim + 2 * int(gid);
+                float x0 = d0[tbase];
+                float x1 = d0[tbase + 1];
+                float c = d1[cs_row + int(gid)];
+                float s = d2[cs_row + int(gid)];
+                d0[tbase]     = x0 * c - x1 * s;
+                d0[tbase + 1] = x0 * s + x1 * c;
+            }
         }
     }
 }
