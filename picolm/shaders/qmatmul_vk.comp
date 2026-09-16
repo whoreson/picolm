@@ -1,6 +1,6 @@
 #version 450
 // Scalar dequant matmul: Y[s,o] = sum_i X[s,i] * W[o,i]
-// Grid: [ceil(O/16), S, 1], block: [16, 1, 1]
+// Grid: [ceil(O/32), S, 1], block: [32, 1, 1]
 // Supports: F32(0), F16(1), Q4_0(2), Q5_0(6), Q8_0(8),
 //           Q2_K(10), Q3_K(11), Q4_K(12), Q5_K(13), Q6_K(14),
 //           IQ4_NL(20), Q1_0(41), Q2_0(42)
@@ -13,7 +13,7 @@
 // garbage (s*I != s*x_stride when stride > I). This was the root cause of the
 // GPT-2 Vulkan garbled-text bug (Sep 2025).
 
-layout(local_size_x = 16) in;
+layout(local_size_x = 32) in;
 
 layout(std430, binding = 0) readonly buffer X  { float x[]; };
 layout(std430, binding = 1) readonly buffer W  { uint  w[]; };
@@ -91,7 +91,7 @@ uint get_scale_min_k4(uint rowBase, uint scales_bo, int j) {
 }
 
 void main() {
-    int o = int(gl_WorkGroupID.x) * 16 + int(gl_LocalInvocationID.x);
+    int o = int(gl_WorkGroupID.x) * 32 + int(gl_LocalInvocationID.x);
     int s = int(gl_WorkGroupID.y);
     if (o >= p.O || s >= p.S) return;
 

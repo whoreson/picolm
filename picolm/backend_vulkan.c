@@ -373,7 +373,9 @@ static VkResult vk_fence_wait_timeout(VkDevice dev, VkFence f, uint64_t timeout_
             if (r != VK_NOT_READY) return r;
         } while ((vk_now() - t0) * 1000.0 < (double)g_vk_spin_us);
     }
-    return vkWaitForFences(dev, 1, &f, VK_TRUE, timeout_ns);
+    VkResult r = vkWaitForFences(dev, 1, &f, VK_TRUE, timeout_ns);
+    if (r != VK_SUCCESS && r != VK_TIMEOUT) { fprintf(stderr, "[VK] fence error %d\n", (int)r); }
+    return r;
 }
 
 static int pick_memtype(VkPhysicalDevice phys) {
@@ -773,6 +775,15 @@ static void push_desc(VkCommandBuffer cmd, int n, const VkDescriptorBufferInfo *
         G.vkCmdPushDescriptorSetKHR_fn(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                        G.plyt_unified, 0, (uint32_t)n, w);
     } else {
+        // Prevent ring wraparound within a batch
+        if (G.in_batch && G.dset_batch_idx > 0 && (G.dset_batch_idx % 2048) == 0) {
+            fprintf(stderr, "[VK] descriptor ring wraparound: forcing batch boundary\n");
+            picolm_gpu_batch_end(0);
+            VkCommandBufferBeginInfo _vbi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            vkResetCommandBuffer(G.cmd_dev, 0);
+            vkBeginCommandBuffer(G.cmd_dev, &_vbi);
+            G.in_batch = 1; G.bound_pipe = VK_NULL_HANDLE;
+        }
         int idx = G.dset_batch_idx % 2048;
         VkDescriptorSet set = G.dset_batch_ring[idx];
         VkWriteDescriptorSet w[8];
@@ -1685,7 +1696,7 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x,
         vkCmdPushConstants(G.cmd, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
                            0, sizeof(pc), &pc);
         // One workgroup per output row per sequence
-        vkCmdDispatch(G.cmd, (uint32_t)((t->O + 15) / 16), (uint32_t)S, 1);
+        vkCmdDispatch(G.cmd, (uint32_t)((t->O + 31) / 32), (uint32_t)S, 1);
         VKCHECK(vkEndCommandBuffer(G.cmd), "endCmd");
         G.cmd_ready = 1; G.bound_S = S; G.bound_I = t->I; G.bound_O = t->O;
     }
@@ -2284,7 +2295,7 @@ int picolm_gpu_batch_end(int device) {
     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .commandBufferCount = 1, .pCommandBuffers = &G.cmd_dev};
     vkResetFences(G.dev, 1, &G.fence_dev);
-    vkQueueSubmit(G.queue, 1, &si, G.fence_dev);
+    VKCHECK(vkQueueSubmit(G.queue, 1, &si, G.fence_dev), "queueSubmit batch_end");
     vk_fence_wait_timeout(G.dev, G.fence_dev, 10ULL*1000*1000*1000);
     // KAVERI/RADV: also wait fence_xfer to prevent stale H2D/D2H data
     // from prior staging transfers corrupting subsequent compute.
@@ -2646,7 +2657,7 @@ int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_d
                 int pc[4] = {S, t->I, t->O, (int)t->row_words}; \
                 vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, \
                                    0, sizeof(pc), pc); \
-                vkCmdDispatch(G.cmd_dev, (uint32_t)((t->O + 15) / 16), (uint32_t)S, 1); \
+                vkCmdDispatch(G.cmd_dev, (uint32_t)((t->O + 63) / 64), (uint32_t)S, 1); \
                 _g_dispatch_cnt++; ok = 1; \
                 if (NULL && _g_dispatch_logged++ < 100 + 100) \
                     fprintf(stderr, "DISPATCH matmul_dev: dedicated " #name " I=%d O=%d S=%d\n", t->I, t->O, S); \
@@ -2665,7 +2676,7 @@ int picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_d
             int pc_raw[7] = {t->qtype, S, t->I, t->O, (int)t->row_words, x_stride, y_stride};
             vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
                                0, sizeof(pc_raw), pc_raw);
-            vkCmdDispatch(G.cmd_dev, (uint32_t)((t->O + 15) / 16), (uint32_t)S, 1);
+            vkCmdDispatch(G.cmd_dev, (uint32_t)((t->O + 31) / 32), (uint32_t)S, 1);
             _g_dispatch_cnt++;
             ok = 1;
         }
@@ -3092,7 +3103,7 @@ int picolm_gpu_rope_apply(float *x, int n_heads, int head_dim,
     push_desc(G.cmd_dev, 4, bi);
     PC_Elem pc = {2, half_dim, (float)n_heads, rope_type};
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-    vkCmdDispatch(G.cmd_dev, (uint32_t)((half_dim + 255) / 256), 1, 1);
+    vkCmdDispatch(G.cmd_dev, (uint32_t)((half_dim * n_heads + 255) / 256), 1, 1);
     _g_dispatch_cnt++;
     VK_BATCH_DISPATCH_POST();
     return 1;
@@ -3122,7 +3133,7 @@ int picolm_gpu_rope_apply_batched(float *x, int n_heads, int head_dim,
     PC_Elem pc = {6, half_dim, (float)n_heads, start_pos};
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(pc), &pc);
-    vkCmdDispatch(G.cmd_dev, (uint32_t)((half_dim + 255u) / 256u), (uint32_t)S, 1);
+    vkCmdDispatch(G.cmd_dev, (uint32_t)((half_dim * n_heads + 255u) / 256u), (uint32_t)S, 1);
     _g_dispatch_cnt++;
     VK_BATCH_DISPATCH_POST();
 
@@ -4139,7 +4150,7 @@ static int _matmul_logits_chunk(picolm_gpu_tensor_t *t, float *logits_dev,
             int pc[4] = {1, t->I, tc.O, (int)t->row_words}; \
             vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, \
                                0, sizeof(pc), pc); \
-            vkCmdDispatch(G.cmd_dev, (uint32_t)((tc.O + 15) / 16), 1, 1); \
+            vkCmdDispatch(G.cmd_dev, (uint32_t)((tc.O + 63) / 64), 1, 1); \
             _g_dispatch_cnt++; ok = 1; \
         }
     TRY_DED_SHADER_CHUNK(GGUF_TYPE_Q2_K, q2k);
@@ -4155,7 +4166,7 @@ static int _matmul_logits_chunk(picolm_gpu_tensor_t *t, float *logits_dev,
         PC_Matmul pc = {t->qtype, 1, t->I, tc.O, (int)t->row_words, 0, 0};
         vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
                            0, sizeof(pc), &pc);
-        vkCmdDispatch(G.cmd_dev, (uint32_t)((tc.O + 15) / 16), 1, 1);
+        vkCmdDispatch(G.cmd_dev, (uint32_t)((tc.O + 31) / 32), 1, 1);
         _g_dispatch_cnt++;
         ok = 1;
     }
