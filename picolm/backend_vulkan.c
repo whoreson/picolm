@@ -1554,7 +1554,14 @@ int picolm_gpu_tensor_upload(void **tensor, const void *weights,
     }
 
     size_t rb = gguf_row_bytes(qtype, I);
-    if (rb == 0) { fprintf(stderr, "[VK] upload: rb=0 for qtype=%d I=%d\n", qtype, I); return 0; }
+    if (rb == 0) {
+        static int warned = 0;
+        if (!warned++) {
+            fprintf(stderr, "WARN: [VK] unsupported quantization type %d -- "
+                    "skipping tensor upload (GPU backend limitation)\n", qtype);
+        }
+        return 0;
+    }
 
     // Q8_0: repack 34 bytes/block -> 36 bytes/block for word alignment.
     // The WDDM driver (Vulkan 1.2) has a shader compiler bug that fails

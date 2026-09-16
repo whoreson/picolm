@@ -5233,6 +5233,7 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
     if (ssm_conv_dim > xb_stride) xb_stride = ssm_conv_dim;
 
     /* Verify pipeline and batch buffers are ready */
+    if (!m->gpu.active) return model_forward_prefill(m, tokens, n_tokens, start_pos, interrupt);
     if (!gw->kv_active) return model_forward_prefill(m, tokens, n_tokens, start_pos, interrupt);
     if (!picolm_gpu_pipe_x(gpu_dev)) return model_forward_prefill(m, tokens, n_tokens, start_pos, interrupt);
     if (!picolm_gpu_pipe_x_b(gpu_dev)) return model_forward_prefill(m, tokens, n_tokens, start_pos, interrupt);

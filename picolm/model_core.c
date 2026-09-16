@@ -1778,7 +1778,15 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                 /* Count output tensor */
                 int ot = m->weights.type_output;
                 if (ot >= 0 && ot < 512) tcounts[ot]++;
-                fprintf(stderr, "INFO: GPU weights uploaded (%d/%d tensors)\n", uploaded, attempted);
+                if (uploaded < attempted) {
+                    /* Partial upload: some tensor types are unsupported on GPU.
+                     * Running with NULL weight pointers would produce garbage,
+                     * so disable GPU fallback. */
+                    m->gpu.active = 0;
+                    fprintf(stderr, "WARN: GPU upload incomplete (%d/%d tensors) -- unsupported quant type, disabling GPU\n", uploaded, attempted);
+                } else {
+                    fprintf(stderr, "INFO: GPU weights uploaded (%d/%d tensors)\n", uploaded, attempted);
+                }
                 for (int t = 0; t < 20; t++) {
                     if (tcounts[t]) fprintf(stderr, "  type %d (%s): %d tensors\n", t, gguf_type_name(t), tcounts[t]);
                 }
