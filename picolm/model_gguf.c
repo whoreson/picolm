@@ -1467,7 +1467,11 @@ int parse_gguf(model_t *m, int max_seq_len) {
                 /* SSM tensors (Qwen3.5) / GPT-2 fused QKV */
                 else if (strcmp(suffix, "attn_qkv.weight") == 0) {
                     lw->attn_qkv = ptr; lw->type_attn_qkv = qtype;
-                    lw->is_attn_layer = 1;
+                    /* Only set is_attn_layer for GPT-2 models. SSM models with
+                     * attn_qkv (Qwen3.6 hybrid) should not be marked as attention
+                     * layers here -- the separate attn_k/attn_v loaders set it for
+                     * mixed-arch layers that have those tensors. */
+                    if (m->config.is_gpt2) lw->is_attn_layer = 1;
                 } else if (strcmp(suffix, "attn_gate.weight") == 0) {
                     lw->attn_gate_ssm = ptr; lw->type_attn_gate_ssm = qtype;
                 } else if (strcmp(suffix, "ssm_a") == 0) {

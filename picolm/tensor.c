@@ -900,6 +900,14 @@ static int pool_total_threads(int requested) {
 }
 
 void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t qtype) {
+    if (!W) {
+        static int null_warn;
+        if (!null_warn) {
+            fprintf(stderr, "WARN: matmul NULL weight (n=%d d=%d qtype=%d) -> zero output\n", n, d, qtype);
+            null_warn = 1;
+        }
+        if (out) memset(out, 0, (size_t)d * sizeof(float)); return;
+    }
 #ifdef PICOLM_GPU
     if (gpu_tensor && d > 0 && n > 0 && !getenv("PICOLM_PREFILL_CPU") && !getenv("PICOLM_SSM_PREFILL_CPU")) {
         gpu_assert_orchestrator("matmul GPU dispatch");
@@ -2570,6 +2578,23 @@ void matmul_batch(float *out, const float *x, int n_batch,
     static int init;
     if (!init && getenv("PICOLM_PROFILE")) { init = 1; prof_active = 1; atexit(prof_print); }
     double t0 = prof_active ? picolm_now() : 0;
+
+    /* Defensive: if weight pointer is NULL (e.g. model loading issue,
+     * GPU tensor not yet uploaded), zero-fill output and return.
+     * Prevents segfault in all downstream paths (GEMM, vec_dot, etc.). */
+    if (!W) {
+        static int null_warn;
+        if (!null_warn) {
+            const char *qname = qtype == GGUF_TYPE_F32 ? "F32" : qtype == GGUF_TYPE_F16 ? "F16" :
+                                qtype == GGUF_TYPE_Q8_0 ? "Q8_0" : qtype == GGUF_TYPE_Q4_0 ? "Q4_0" :
+                                qtype == GGUF_TYPE_Q4_K ? "Q4_K" : "OTHER";
+            fprintf(stderr, "WARN: matmul_batch NULL weight (n=%d d=%d batch=%d qtype=%s) -> zero output\n",
+                    n, d, n_batch, qname);
+            null_warn = 1;
+        }
+        if (out) memset(out, 0, (size_t)n_batch * d * sizeof(float));
+        return;
+    }
 #ifdef PICOLM_GPU
         if (gpu_tensor && n_batch > 0 && d > 0 && n > 0 && !getenv("PICOLM_PREFILL_CPU") && !getenv("PICOLM_SSM_PREFILL_CPU")) {
         gpu_assert_orchestrator("matmul_batch GPU dispatch");
@@ -3311,6 +3336,9 @@ static void qgemm_q4x8_fallback(const float *x, int n_batch, int d, int n,
 void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                         const void *W1, const void *W2,
                         int n, int d, gguf_type_t qtype1, gguf_type_t qtype2) {
+    if (!W1 && out1) memset(out1, 0, (size_t)n_batch * d * sizeof(float));
+    if (!W2 && out2) memset(out2, 0, (size_t)n_batch * d * sizeof(float));
+    if (!W1 && !W2) return;
 #ifdef PICOLM_GPU
     if (getenv("PICOLM_GPU")) {
         fprintf(stderr, "WARN: matmul_dual_batch (CPU only, no GPU path) n=%d d=%d batch=%d qtype=%d/%d\n",
