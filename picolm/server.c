@@ -2167,6 +2167,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
 
         /* ---- Generation phase ---- */
         int gen_count = 0;
+        int sw_match_idx = -1; /* matched stop word index (for final chunk) */
 
         /* Cumulative output buffer for stop word matching */
         char *generated_stream = (char *)malloc(max_tokens * 100 + 1);
@@ -2214,8 +2215,9 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
                 stop_words, n_stop_words, &sw_stop_idx, &sw_stop_pos);
             int stopped = (sw_result == 1);
             int partial = (sw_result == -1);
-            if (stopped && sw_stop_pos >= 0) {
+                        if (stopped && sw_stop_pos >= 0) {
                 generated_stream[sw_stop_pos] = '\0';
+                if (sw_match_idx < 0) sw_match_idx = sw_stop_idx; /* save first match */
             }
 
             /* Build chunk with optional timing */
@@ -2232,9 +2234,17 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
                         withheld = (char *)realloc(withheld, (size_t)withheld_cap);
                     }
                     memcpy(withheld + w_len, piece, (size_t)(p_len + 1));
+                    cJSON_AddStringToObject(delta, "content", "");
+                    cJSON_AddStringToObject(choice, "finish_reason", "");
+                } else {
+                    /* Full stop: flush any withheld content before stopping */
+                    if (withheld[0] != '\0') {
+                        cJSON_AddStringToObject(delta, "content", withheld);
+                        if (!is_chat) cJSON_AddStringToObject(choice, "text", withheld);
+                        withheld[0] = '\0';
+                    }
+                    cJSON_AddStringToObject(choice, "finish_reason", "stop");
                 }
-                cJSON_AddStringToObject(delta, "content", "");
-                cJSON_AddStringToObject(choice, "finish_reason", stopped ? "stop" : "");
             } else {
                 const char *send_piece = piece;
                 if (withheld[0] != '\0') {
@@ -2246,11 +2256,11 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
                     }
                     memcpy(withheld + w_len, piece, (size_t)(p_len + 1));
                     send_piece = withheld;
-                    withheld[0] = '\0';
                 }
                 cJSON_AddStringToObject(delta, "content", send_piece);
                 cJSON_AddStringToObject(choice, "finish_reason", "");
                 if (!is_chat) cJSON_AddStringToObject(choice, "text", send_piece);
+                withheld[0] = '\0';
             }
             cJSON *choices = cJSON_CreateArray();
             cJSON_AddItemToArray(choices, choice);
@@ -2309,6 +2319,11 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         cJSON_AddItemToObject(done_choice, "delta", done_delta);
         cJSON_AddNumberToObject(done_choice, "index", 0);
         cJSON_AddStringToObject(done_choice, "finish_reason", "stop");
+        if (sw_match_idx >= 0 && sw_match_idx < n_stop_words) {
+            cJSON_AddStringToObject(done_choice, "stopping_word", stop_words[sw_match_idx]);
+        } else {
+            cJSON_AddStringToObject(done_choice, "stopping_word", "");
+        }
         cJSON *done_choices = cJSON_CreateArray();
         cJSON_AddItemToArray(done_choices, done_choice);
         cJSON_AddItemToObject(done_chunk, "choices", done_choices);
@@ -2329,12 +2344,14 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         cJSON_AddNumberToObject(timings, "predicted_per_second", total_generation_tokens > 0 ? total_generation_tokens / (t_gen_ms / 1000.0) : 0);
         cJSON_AddItemToObject(done_chunk, "timings", timings);
 
-        char *dcj = cJSON_PrintUnformatted(done_chunk);
-        sse_send(sock, dcj, NULL);
-        free(dcj);
+        if (client_alive(sock)) {
+            char *dcj = cJSON_PrintUnformatted(done_chunk);
+            sse_send(sock, dcj, NULL);
+            free(dcj);
+            send_chunked(sock, "data: [DONE]\r\n\r\n", 16);
+            send_chunked(sock, "", 0);
+        }
         cJSON_Delete(done_chunk);
-        send_chunked(sock, "data: [DONE]\r\n\r\n", 16);
-        send_chunked(sock, "", 0);
 
         /* Save prompt + generated tokens for next request */
         int total_ctx = n_prompt + total_generation_tokens;
@@ -2352,7 +2369,6 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
                 total_generation_tokens, t_gen_ms,
                 total_generation_tokens > 0 ? total_generation_tokens / (t_gen_ms / 1000.0) : 0);
 
-        for (int _si = 0; _si < n_stop_words; _si++) free(stop_words[_si]);
     } else {
         /* Non-streaming */
         fprintf(stderr, "[server] %.1fms: sending HTTP headers (non-streaming, n=%d)\n", get_time_ms() - t0, n_choices);
@@ -2375,6 +2391,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             }
             generated[0] = '\0';
             int gen_count = 0;
+            int sw_match_idx_ns = -1;
             const char *finish_reason = "length";
 
             /* Prefill phase */
@@ -2453,6 +2470,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
                     if (sw_result == 1 && sw_stop_idx >= 0) {
                         finish_reason = "stop";
                         if (sw_stop_pos >= 0) generated[sw_stop_pos] = '\0';
+                        if (sw_match_idx_ns < 0) sw_match_idx_ns = sw_stop_idx;
                         gen_count--;
                     }
                 }
@@ -2477,6 +2495,11 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
                 cJSON_AddStringToObject(choice, "text", generated);
             }
             cJSON_AddStringToObject(choice, "finish_reason", finish_reason);
+            if (sw_match_idx_ns >= 0 && sw_match_idx_ns < n_stop_words) {
+                cJSON_AddStringToObject(choice, "stopping_word", stop_words[sw_match_idx_ns]);
+            } else {
+                cJSON_AddStringToObject(choice, "stopping_word", "");
+            }
             cJSON_AddItemToArray(choices, choice);
             free(generated);
         }
@@ -2939,8 +2962,16 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
                         withheld = (char *)realloc(withheld, (size_t)withheld_cap);
                     }
                     memcpy(withheld + w_len, piece, (size_t)(p_len + 1));
+                    cJSON_AddStringToObject(resp, "content", "");
+                } else {
+                    /* Full stop: flush any withheld content before stopping */
+                    if (withheld[0] != '\0') {
+                        cJSON_AddStringToObject(resp, "content", withheld);
+                        withheld[0] = '\0';
+                    } else {
+                        cJSON_AddStringToObject(resp, "content", "");
+                    }
                 }
-                cJSON_AddStringToObject(resp, "content", "");
             } else {
                 /* Flush withheld + current piece */
                 if (withheld[0] != '\0') {
@@ -2952,10 +2983,10 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
                     }
                     memcpy(withheld + w_len, piece, (size_t)(p_len + 1));
                     cJSON_AddStringToObject(resp, "content", withheld);
-                    withheld[0] = '\0';
                 } else {
                     cJSON_AddStringToObject(resp, "content", piece);
                 }
+                withheld[0] = '\0';
             }
 
             if (return_tokens || do_stream) {
@@ -3024,10 +3055,14 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         cJSON_AddNumberToObject(timings_c, "predicted_per_token_ms", gen_count > 0 ? gen_ms / gen_count : 0);
         cJSON_AddNumberToObject(timings_c, "predicted_per_second", gen_count > 0 ? gen_count / (gen_ms / 1000.0) : 0);
         cJSON_AddItemToObject(final, "timings", timings_c);
-        sse_send(sock, cJSON_PrintUnformatted(final), NULL);
-        free(cJSON_PrintUnformatted(final));
+        if (client_alive(sock)) {
+            sse_send(sock, cJSON_PrintUnformatted(final), NULL);
+            free(cJSON_PrintUnformatted(final));
+            send_chunked(sock, "", 0);
+        } else {
+            /* Client disconnected during generation, don't try to send final chunk */
+        }
         cJSON_Delete(final);
-        send_chunked(sock, "", 0);
 
         /* Save prompt + generated tokens for next request */
         int total_ctx_c = n_prompt + gen_count;
