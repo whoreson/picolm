@@ -900,6 +900,14 @@ static int pool_total_threads(int requested) {
 }
 
 void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t qtype) {
+    if (!W) {
+        static int null_warn;
+        if (!null_warn) {
+            fprintf(stderr, "WARN: matmul NULL weight (n=%d d=%d qtype=%d) -> zero output\n", n, d, qtype);
+            null_warn = 1;
+        }
+        if (out) memset(out, 0, (size_t)d * sizeof(float)); return;
+    }
 #ifdef PICOLM_GPU
     if (gpu_tensor && d > 0 && n > 0 && !getenv("PICOLM_PREFILL_CPU") && !getenv("PICOLM_SSM_PREFILL_CPU")) {
         gpu_assert_orchestrator("matmul GPU dispatch");
@@ -2570,6 +2578,23 @@ void matmul_batch(float *out, const float *x, int n_batch,
     static int init;
     if (!init && getenv("PICOLM_PROFILE")) { init = 1; prof_active = 1; atexit(prof_print); }
     double t0 = prof_active ? picolm_now() : 0;
+
+    /* Defensive: if weight pointer is NULL (e.g. model loading issue,
+     * GPU tensor not yet uploaded), zero-fill output and return.
+     * Prevents segfault in all downstream paths (GEMM, vec_dot, etc.). */
+    if (!W) {
+        static int null_warn;
+        if (!null_warn) {
+            const char *qname = qtype == GGUF_TYPE_F32 ? "F32" : qtype == GGUF_TYPE_F16 ? "F16" :
+                                qtype == GGUF_TYPE_Q8_0 ? "Q8_0" : qtype == GGUF_TYPE_Q4_0 ? "Q4_0" :
+                                qtype == GGUF_TYPE_Q4_K ? "Q4_K" : "OTHER";
+            fprintf(stderr, "WARN: matmul_batch NULL weight (n=%d d=%d batch=%d qtype=%s) -> zero output\n",
+                    n, d, n_batch, qname);
+            null_warn = 1;
+        }
+        if (out) memset(out, 0, (size_t)n_batch * d * sizeof(float));
+        return;
+    }
 #ifdef PICOLM_GPU
         if (gpu_tensor && n_batch > 0 && d > 0 && n > 0 && !getenv("PICOLM_PREFILL_CPU") && !getenv("PICOLM_SSM_PREFILL_CPU")) {
         gpu_assert_orchestrator("matmul_batch GPU dispatch");
@@ -2694,7 +2719,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
 #if defined(PICOLM_AVX2)
     /* Q4I_0_8_8 tiled GEMM (pre-dequantized int8, AVX-512 only, 16-row tiles).
      * Same structure as Q4_0_8_8 but weights are int8 instead of nibbles. */
-    if (qtype == GGUF_TYPE_Q4I_0_8_8 && n_batch > 0 && n > 0 &&
+    if (!picolm_sgemm_disabled_tensor() && qtype == GGUF_TYPE_Q4I_0_8_8 && n_batch > 0 && n > 0 &&
         d % 8 == 0 && n_batch >= 4 && n % 32 == 0) {
         int n_batch_padded = (n_batch + 15) & ~15;
         int n_act_rg = (n_batch_padded + 3) / 4;
@@ -2735,7 +2760,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
 
     /* Q4_0_8_8 tiled GEMM (AVX-512 only, 16-row tiles).
      * Padding: round n_batch up to multiple of 16, use zero-padded activations. */
-    if (qtype == GGUF_TYPE_Q4_0_8_8 && n_batch > 0 && n > 0 &&
+    if (!picolm_sgemm_disabled_tensor() && qtype == GGUF_TYPE_Q4_0_8_8 && n_batch > 0 && n > 0 &&
         d % 8 == 0 && n_batch >= 4 && n % 32 == 0) {
         int n_batch_padded = (n_batch + 15) & ~15;  /* round up to 16 */
         int n_act_rg = (n_batch_padded + 3) / 4;
@@ -2952,7 +2977,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
      * ARM NEON: uses picolm_sgemm (Q8_0xQ8_0 path, no delta optimization).
      * Threshold: n_batch >= 8 for all quant types. */
 #if defined(__AVX2__) && defined(__F16C__)
-    if (have_qx && qx_d_buf && d >= 4 &&
+    if (!picolm_sgemm_disabled_tensor() && have_qx && qx_d_buf && d >= 4 &&
         (qtype == GGUF_TYPE_Q8_0 || qtype == GGUF_TYPE_Q4_0 || qtype == GGUF_TYPE_Q5_0)) {
         int min_batch = 8;
         if (n_batch >= min_batch) {
@@ -2983,7 +3008,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
     static int neon_q4_traced_delta = 0;
     if (!neon_q4_mode2) neon_q4_mode2 = getenv("PICOLM_NEON_Q4");
     int neon_q4_scalar = (neon_q4_mode2 && strcmp(neon_q4_mode2, "scalar") == 0);
-    if (!neon_q4_scalar && have_qx && qx_d_buf && d >= 4 &&
+    if (!neon_q4_scalar && !picolm_sgemm_disabled_tensor() && have_qx && qx_d_buf && d >= 4 &&
         (qtype == GGUF_TYPE_Q8_0 || qtype == GGUF_TYPE_Q4_0 || qtype == GGUF_TYPE_Q5_0)) {
         if (getenv("PICOLM_DISPATCH") && !neon_q4_traced_delta) { neon_q4_traced_delta = 1; fprintf(stderr, "TRACE tensor.c: EXISTING _d path taken (mode=%s)\n", neon_q4_mode2); }
         int min_batch = (qtype == GGUF_TYPE_Q8_0) ? 16 : 4;
@@ -3015,7 +3040,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
      * n must be a multiple of 256 (block_q4_K granularity).
      * Threshold: n_batch >= 8 (consistent with Q8_0 GEMM). */
 #if (defined(__AVX2__) && defined(__F16C__)) || defined(__AVX__) || defined(__ARM_NEON)
-    if (have_qx && qtype == GGUF_TYPE_Q4_K && d >= 4 && n % 256 == 0) {
+    if (!picolm_sgemm_disabled_tensor() && have_qx && qtype == GGUF_TYPE_Q4_K && d >= 4 && n % 256 == 0) {
         int min_batch = 8;
         if (n_batch >= min_batch) {
             int k_blocks_q4k = n / 256;
@@ -3311,6 +3336,9 @@ static void qgemm_q4x8_fallback(const float *x, int n_batch, int d, int n,
 void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                         const void *W1, const void *W2,
                         int n, int d, gguf_type_t qtype1, gguf_type_t qtype2) {
+    if (!W1 && out1) memset(out1, 0, (size_t)n_batch * d * sizeof(float));
+    if (!W2 && out2) memset(out2, 0, (size_t)n_batch * d * sizeof(float));
+    if (!W1 && !W2) return;
 #ifdef PICOLM_GPU
     if (getenv("PICOLM_GPU")) {
         fprintf(stderr, "WARN: matmul_dual_batch (CPU only, no GPU path) n=%d d=%d batch=%d qtype=%d/%d\n",
@@ -3430,7 +3458,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
      * -- gate/up almost always share a quant type) still gets a correct
      * result for whichever side isn't Q4_0_8_8, just without the fast
      * path on that side. */
-    if ((qtype1 == GGUF_TYPE_Q4_0_8_8 || qtype1 == GGUF_TYPE_Q4I_0_8_8 ||
+    if (!picolm_sgemm_disabled_tensor() && (qtype1 == GGUF_TYPE_Q4_0_8_8 || qtype1 == GGUF_TYPE_Q4I_0_8_8 ||
          qtype2 == GGUF_TYPE_Q4_0_8_8 || qtype2 == GGUF_TYPE_Q4I_0_8_8) &&
         n_batch > 0 && n > 0 && d % 16 == 0 && n % 32 == 0)
     {

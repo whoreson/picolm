@@ -2774,6 +2774,7 @@ int picolm_sgemm(int m, int n, int k,
                  int Atype, int Btype,
                  int ith, int nth) {
     if (picolm_sgemm_disabled()) return 0;
+    if (!A || !B || !C) return 0;
     if (m < 4 || n < 2 || k < 1)
         return 0;
 
@@ -2905,6 +2906,7 @@ int picolm_sgemm_d(int m, int n, int k_blocks,
                    int Atype,
                    int ith, int nth) {
     if (picolm_sgemm_disabled()) return 0;
+    if (!A || !B || !B_d || !C) return 0;
     static int traced;
     if (getenv("PICOLM_DISPATCH") && !traced && ith == 0) {
         traced = 1;
@@ -2970,6 +2972,7 @@ int picolm_sgemm_d_q4k(int m, int n, int k_blocks_q4k,
                        float *C, int ldc,
                        int ith, int nth) {
     if (picolm_sgemm_disabled()) return 0;
+    if (!A || !B || !C) return 0;
 #if defined(__AVX2__) && defined(__F16C__)
     if (m < 1 || n < 1 || k_blocks_q4k < 1)
         return 0;
