@@ -2694,7 +2694,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
 #if defined(PICOLM_AVX2)
     /* Q4I_0_8_8 tiled GEMM (pre-dequantized int8, AVX-512 only, 16-row tiles).
      * Same structure as Q4_0_8_8 but weights are int8 instead of nibbles. */
-    if (qtype == GGUF_TYPE_Q4I_0_8_8 && n_batch > 0 && n > 0 &&
+    if (!picolm_sgemm_disabled_tensor() && qtype == GGUF_TYPE_Q4I_0_8_8 && n_batch > 0 && n > 0 &&
         d % 8 == 0 && n_batch >= 4 && n % 32 == 0) {
         int n_batch_padded = (n_batch + 15) & ~15;
         int n_act_rg = (n_batch_padded + 3) / 4;
@@ -2735,7 +2735,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
 
     /* Q4_0_8_8 tiled GEMM (AVX-512 only, 16-row tiles).
      * Padding: round n_batch up to multiple of 16, use zero-padded activations. */
-    if (qtype == GGUF_TYPE_Q4_0_8_8 && n_batch > 0 && n > 0 &&
+    if (!picolm_sgemm_disabled_tensor() && qtype == GGUF_TYPE_Q4_0_8_8 && n_batch > 0 && n > 0 &&
         d % 8 == 0 && n_batch >= 4 && n % 32 == 0) {
         int n_batch_padded = (n_batch + 15) & ~15;  /* round up to 16 */
         int n_act_rg = (n_batch_padded + 3) / 4;
@@ -2952,7 +2952,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
      * ARM NEON: uses picolm_sgemm (Q8_0xQ8_0 path, no delta optimization).
      * Threshold: n_batch >= 8 for all quant types. */
 #if defined(__AVX2__) && defined(__F16C__)
-    if (have_qx && qx_d_buf && d >= 4 &&
+    if (!picolm_sgemm_disabled_tensor() && have_qx && qx_d_buf && d >= 4 &&
         (qtype == GGUF_TYPE_Q8_0 || qtype == GGUF_TYPE_Q4_0 || qtype == GGUF_TYPE_Q5_0)) {
         int min_batch = 8;
         if (n_batch >= min_batch) {
@@ -2983,7 +2983,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
     static int neon_q4_traced_delta = 0;
     if (!neon_q4_mode2) neon_q4_mode2 = getenv("PICOLM_NEON_Q4");
     int neon_q4_scalar = (neon_q4_mode2 && strcmp(neon_q4_mode2, "scalar") == 0);
-    if (!neon_q4_scalar && have_qx && qx_d_buf && d >= 4 &&
+    if (!neon_q4_scalar && !picolm_sgemm_disabled_tensor() && have_qx && qx_d_buf && d >= 4 &&
         (qtype == GGUF_TYPE_Q8_0 || qtype == GGUF_TYPE_Q4_0 || qtype == GGUF_TYPE_Q5_0)) {
         if (getenv("PICOLM_DISPATCH") && !neon_q4_traced_delta) { neon_q4_traced_delta = 1; fprintf(stderr, "TRACE tensor.c: EXISTING _d path taken (mode=%s)\n", neon_q4_mode2); }
         int min_batch = (qtype == GGUF_TYPE_Q8_0) ? 16 : 4;
@@ -3015,7 +3015,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
      * n must be a multiple of 256 (block_q4_K granularity).
      * Threshold: n_batch >= 8 (consistent with Q8_0 GEMM). */
 #if (defined(__AVX2__) && defined(__F16C__)) || defined(__AVX__) || defined(__ARM_NEON)
-    if (have_qx && qtype == GGUF_TYPE_Q4_K && d >= 4 && n % 256 == 0) {
+    if (!picolm_sgemm_disabled_tensor() && have_qx && qtype == GGUF_TYPE_Q4_K && d >= 4 && n % 256 == 0) {
         int min_batch = 8;
         if (n_batch >= min_batch) {
             int k_blocks_q4k = n / 256;
@@ -3430,7 +3430,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
      * -- gate/up almost always share a quant type) still gets a correct
      * result for whichever side isn't Q4_0_8_8, just without the fast
      * path on that side. */
-    if ((qtype1 == GGUF_TYPE_Q4_0_8_8 || qtype1 == GGUF_TYPE_Q4I_0_8_8 ||
+    if (!picolm_sgemm_disabled_tensor() && (qtype1 == GGUF_TYPE_Q4_0_8_8 || qtype1 == GGUF_TYPE_Q4I_0_8_8 ||
          qtype2 == GGUF_TYPE_Q4_0_8_8 || qtype2 == GGUF_TYPE_Q4I_0_8_8) &&
         n_batch > 0 && n > 0 && d % 16 == 0 && n % 32 == 0)
     {
