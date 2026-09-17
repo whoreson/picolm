@@ -3502,15 +3502,22 @@ picolm_gpu_attention_prefill_warpgrp_kernel(
                 int global_kv = t0 + ti;
                 if (global_kv > global_pos) continue;
 
-                /* TODO: replace scalar fmaf+gpu_fp16_to_fp32 per-element with
+                /* TODO(perf): replace scalar fmaf+gpu_fp16_to_fp32 per-element with
                  * v_dot2_f32_f16 (1 instruction = 2 FP16 FMAs, FP32 accumulate).
-                 * Available on gfx906, CDNA, RDNA2+. Would halve instruction count
-                 * here and is the single biggest remaining win vs llama.cpp's
-                 * fattn-tile kernel on MI50. Requires keeping K tile as half2
-                 * in shared memory (not uint16_t) and Q as float2 pairs.
+                 * Available on gfx906, CDNA, RDNA2+ (HIP), and NVIDIA sm_80+ (__hfma2).
+                 * Would halve instruction count here and is the single biggest remaining
+                 * win vs llama.cpp's fattn-tile kernel on MI50. Requires keeping K tile
+                 * as half2 in shared memory (not uint16_t) and Q as float2 pairs.
                  * Bit-exactness needs careful verification since the FMAs are
                  * paired differently (d[2k]*q[2k] + d[2k+1]*q[2k+1] in one
-                 * instruction vs sequential fmaf). */
+                 * instruction vs sequential fmaf).
+                 *
+                 * TODO(perf, head_dim=256): On NVIDIA GPUs with IMMA, this warpgrp
+                 * kernel is used as fallback when FA2 kernel exceeds 96 KB shared memory
+                 * (head_dim=256 needs 136.5 KB). The warpgrp path does NOT use tensor
+                 * cores, leaving them idle. For Qwen3.5/3.6 (head_dim=256), prefer a
+                 * FA2 variant with 32 Q rows per block instead of 64.
+                 * See /data4/work/notes/picolm/fa2_headdim256.md */
                 float local_chunk = 0.0f;
                 if (lane < n_chunks) {
                     for (int d = lane * 16; d < (lane + 1) * 16; d++) {

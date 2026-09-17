@@ -817,6 +817,10 @@ picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
         }
     }
 
+    /* TODO(perf, head_dim=256): on NVIDIA IMMA GPUs, the warpgrp path below
+     * is pure scalar F32 and does not use tensor cores. For Qwen3.5/3.6
+     * (head_dim=256), FA2 falls through here because its shared memory
+     * exceeds 96 KB. See /data4/work/notes/picolm/fa2_headdim256.md */
     if (!use_fa2) {
         int tile_q = ATTN_TILE_Q;
         size_t smem_max = get_device_shared_mem_per_block(device);
@@ -914,7 +918,12 @@ picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
             + 64 * head_dim * sizeof(float)
             + 128 * sizeof(float);
         if (fa2_shared > 98304) {
-            /* Too large, fall through to scalar */
+            /* TODO: head_dim=256 (Qwen3.5/3.6) exceeds 96 KB shared memory limit.
+             * acc_sh[64][head_dim] alone is 64 KB. FA2 processes 64 Q rows per block.
+             * Fix: add FA2 variant with 32 Q rows per block (halves acc_sh to 32 KB,
+             * total ~104 KB with TILE_K=32, or ~66 KB with TILE_K=16).
+             * See /data4/work/notes/picolm/fa2_headdim256.md for full analysis.
+             * Falls through to warpgrp (scalar F32, no tensor cores) below. */
         } else {
             if (!ensure_attn_fa2_shared_mem(fa2_shared)) return 0;
             gpu_dispatch_print("attn_prefill_fa2_dev");
