@@ -2612,7 +2612,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
             return;
         }
         if ((n == 6144 || d == 6144) && getenv("PICOLM_GPU")) fprintf(stderr, "WARN: GPU batch matmul failed (n=%d d=%d batch=%d qtype=%d gpu_tensor=%p) -> CPU\n",
-            n, d, n_batch, qtype, gpu_tensor);
+            n, d, n_batch, qtype, (void *)gpu_tensor);
     }
 #endif
     size_t row_bytes = gguf_type_row_size(qtype, n);

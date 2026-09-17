@@ -581,11 +581,6 @@ static size_t gguf_row_bytes(gguf_type_t q, int I) {
     }
 }
 
-static int gguf_row_words(gguf_type_t q, int I) {
-    size_t rb = gguf_row_bytes(q, I);
-    return (int)((rb + 3) / 4);
-}
-
 // ---------------------------------------------------------------------------
 // Weight arena suballocator
 // ---------------------------------------------------------------------------
@@ -2192,7 +2187,7 @@ int picolm_gpu_sync(int device) {
 static void _kv_d2h_copy(VkBuffer src_buf, VkDeviceSize src_off, size_t total_f32);
 // buf = device pointer to sync (the buffer being READ by the next dispatch).
 // sz = byte size of the region to sync (0 = full buffer).
-static void _batch_barrier_buf(void *buf, size_t sz) {
+static void _batch_barrier_buf(const void *buf, size_t sz) {
     VkBuffer b;
     VkDeviceSize off;
     unwrap_buf_offset(buf, &off);
@@ -2219,7 +2214,7 @@ static void _batch_barrier_buf(void *buf, size_t sz) {
 }
 
 // Scoped barrier: sync 2 buffers in a single vkCmdPipelineBarrier call.
-static void _batch_barrier_buf2(void *buf1, size_t sz1, void *buf2, size_t sz2) {
+static void _batch_barrier_buf2(const void *buf1, size_t sz1, const void *buf2, size_t sz2) {
     VkBufferMemoryBarrier bm[2];
     VkBuffer b1 = unwrap_buf_offset(buf1, &bm[0].offset);
     VkBuffer b2 = unwrap_buf_offset(buf2, &bm[1].offset);
@@ -2588,7 +2583,6 @@ static int _q8q8_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, int S, int y_s
     if (!G.shader_q8q8) return 0;
     int n_blocks = t->I / 32;
     if (n_blocks < 1 || t->I % 32 != 0) return 0;
-    uint32_t total = (uint32_t)t->O * (uint32_t)S;
     VkDescriptorBufferInfo bi[4] = {
         desc_buf_info(G.q8_xq_d),   // xq (uint32-packed int8)
         desc_buf_info(G.q8_xd_d),   // xd (float deltas)

@@ -2397,7 +2397,7 @@ ssm_ffn_done:
 static int
 ssm_forward_gpu(model_t *m, run_state_t *s, float *x, float *residual,
                 layer_weights_t *lw, int il, int pos, void *gpu_lw, int device) {
-    (void)x; (void)residual;
+    (void)x; (void)residual; (void)s;
     gpu_layer_weights_t *gl = (gpu_layer_weights_t *)gpu_lw;
     model_config_t *c = &m->config;
     gpu_weights_t *gw = &m->gpu;
@@ -2437,9 +2437,6 @@ ssm_forward_gpu(model_t *m, run_state_t *s, float *x, float *residual,
     /* Pipeline buffers */
     float *pipe_x = picolm_gpu_pipe_x(device);
     float *pipe_xb = picolm_gpu_pipe_xb(device);
-    float *pipe_ffn_norm = picolm_gpu_pipe_ffn_norm(device);
-    float *pipe_gate = picolm_gpu_pipe_gate(device);
-    float *pipe_up = picolm_gpu_pipe_up(device);
     float *ssm_qkv_raw = picolm_gpu_ssm_qkv_raw(device);
     float *ssm_conv_out = picolm_gpu_ssm_conv_out(device);
     float *ssm_xb2 = picolm_gpu_ssm_xb2(device);
@@ -2666,7 +2663,6 @@ ssm_forward_gpu(model_t *m, run_state_t *s, float *x, float *residual,
 
         /* Compare with CPU: run CPU ssm_forward on a copy of pipe_x */
         float *cpu_x = alloca(dim * sizeof(float));
-        float *cpu_res = alloca(dim * sizeof(float));
         memcpy(cpu_x, gpu_pipe_x, dim * sizeof(float));
         /* We can't easily call ssm_forward here because it modifies shared state.
          * Instead, compare the ssm_out matmul input (ssm_final_output) manually. */
@@ -2695,8 +2691,7 @@ int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
     float *bx, float *bxb, float *bq, float *battn_out, float *bffn_norm,
     float *bgate, float *bup, layer_weights_t *lw, int l,
     int n_tokens, int start_pos, int dev) {
-#ifdef PICOLM_GPU
-    (void)start_pos;
+    (void)s; (void)start_pos;
     model_config_t *c = &m->config;
     gpu_weights_t *gw = &m->gpu;
     int dim=c->n_embd, d_state=c->ssm_d_state;
@@ -3233,11 +3228,6 @@ int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
             l, bx_v[0],bx_v[1],bx_v[2],bx_v[3],bx_v[4],bx_v[5],bx_v[6],bx_v[7], bx_rms);
     }
     return ok;
-#else
-    (void)m;(void)s;(void)bx;(void)bxb;(void)bq;(void)battn_out;(void)bffn_norm;
-    (void)bgate;(void)bup;(void)lw;(void)l;(void)n_tokens;(void)start_pos;(void)dev;
-    return 0;
-#endif
 }
 #endif /* PICOLM_GPU */
 
@@ -4006,7 +3996,7 @@ size_t model_ssm_state_save(const model_t *m, uint8_t *buf, size_t buf_size) {
     /* Sync GPU SSM state to CPU before saving.
      * When GPU decode is active, the device state is the only up-to-date copy. */
     if (m->gpu.device >= 0 && m->gpu.ssm_state_dev[0]) {
-        picolm_ssm_state_sync_to_host(m, m->gpu.device);
+        picolm_ssm_state_sync_to_host((model_t *)m, m->gpu.device);
     }
 #endif
 
@@ -4130,7 +4120,6 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
     int n_kv_heads = c->n_kv_heads;
     int head_dim = c->head_dim;
     int q_dim = n_heads * head_dim;
-    int kv_dim = n_kv_heads * head_dim;
     int seq_len = c->max_seq_len;
     int rope_dim = (c->rope_dim > 0) ? c->rope_dim : head_dim;
     int rope_half = rope_dim / 2;
@@ -4274,7 +4263,7 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
                       !picolm_gpu_memcpy_async(pipe_k, pipe_gate + dim, row_bytes, 0, gpu_dev) ||
                       !picolm_gpu_memcpy_async(pipe_v, pipe_gate + 2*dim, row_bytes, 0, gpu_dev)) {
                       fprintf(stderr, "ERROR: GPT-2 decode fused QKV split failed\n");
-                      return -1;
+                      return (float *)-1;
                   }
                 }
 
@@ -4960,17 +4949,19 @@ after_qkv:
 
         /* Diagnostic: dump Q/K/V for last token, head 0, layer 0 */
         if (l == 0 && getenv("PICOLM_DBG")) {
-            float _q[64], _k[256], _v[256]; picolm_gpu_sync(gpu_dev);
+            float _q[64], _k0[256], _k3[256], _v[256]; picolm_gpu_sync(gpu_dev);
             float *qbuf = (gl->attn_qkv && !gl->attn_q) ? bffn_norm : bq;
             void *q_last = (void*)((uintptr_t)qbuf + (size_t)(n_ubatch-1) * (size_t)dim * sizeof(float));
-            void *k_tok0 = bk;  /* contiguous kv_dim per token */
+            void *k_tok0 = bk;
             void *k_tok3 = (void*)((uintptr_t)bk + (size_t)(n_ubatch-1) * (size_t)(n_kv_heads*head_dim) * sizeof(float));
+            void *v_tok0 = bv;
             picolm_gpu_memcpy(_q, q_last, 64, -1, gpu_dev);
-            picolm_gpu_memcpy(_k, k_tok0, 256, -1, gpu_dev);
-            picolm_gpu_memcpy(_v, k_tok0, 256, -1, gpu_dev);
+            picolm_gpu_memcpy(_k0, k_tok0, 256, -1, gpu_dev);
+            picolm_gpu_memcpy(_k3, k_tok3, 256, -1, gpu_dev);
+            picolm_gpu_memcpy(_v, v_tok0, 256, -1, gpu_dev);
             fprintf(stderr, "[GPUT L0 Q_t3_h0][:4]={%.6f,%.6f,%.6f,%.6f}\n", _q[0],_q[1],_q[2],_q[3]);
-            fprintf(stderr, "[GPUT L0 K_t0_h0][:4]={%.6f,%.6f,%.6f,%.6f}\n", _k[0],_k[1],_k[2],_k[3]);
-            fprintf(stderr, "[GPUT L0 K_t3_h0][:4]={%.6f,%.6f,%.6f,%.6f}\n", _k[1600],_k[1601],_k[1602],_k[1603]);
+            fprintf(stderr, "[GPUT L0 K_t0_h0][:4]={%.6f,%.6f,%.6f,%.6f}\n", _k0[0],_k0[1],_k0[2],_k0[3]);
+            fprintf(stderr, "[GPUT L0 K_t3_h0][:4]={%.6f,%.6f,%.6f,%.6f}\n", _k3[0],_k3[1],_k3[2],_k3[3]);
         }
         /* Attention: default to F16 KV cache path (FA2/warpgrp) for all
          * models. SSM-hybrid models can optionally use F32 K/V directly
@@ -5623,14 +5614,14 @@ void _kv_compare_prefills(model_t *m, int *tokens, int n_tokens, int device) {
             const uint16_t *gk = (const uint16_t *)(gpu_k_full + (size_t)attn_l * layer_k + (size_t)p * s->kv_row_size_k);
             const uint16_t *cv = (const uint16_t *)(s->val_cache + (size_t)layer * layer_v + (size_t)p * s->kv_row_size_v);
             const uint16_t *gv = (const uint16_t *)(gpu_v_full + (size_t)attn_l * layer_v + (size_t)p * s->kv_row_size_v);
-            for (int e = 0; e < s->kv_row_size_k / sizeof(uint16_t); e++) {
+            for (size_t e = 0; e < s->kv_row_size_k / sizeof(uint16_t); e++) {
                 float cpu_val = fp16_to_fp32(ck[e]);
                 float gpu_val = fp16_to_fp32(gk[e]);
                 float diff = fabsf(cpu_val - gpu_val);
                 if (diff > layer_max_k) layer_max_k = diff;
                 if (diff > 1e-5f) layer_diff_k++;
             }
-            for (int e = 0; e < s->kv_row_size_v / sizeof(uint16_t); e++) {
+            for (size_t e = 0; e < s->kv_row_size_v / sizeof(uint16_t); e++) {
                 float cpu_val = fp16_to_fp32(cv[e]);
                 float gpu_val = fp16_to_fp32(gv[e]);
                 float diff = fabsf(cpu_val - gpu_val);
@@ -5646,11 +5637,11 @@ void _kv_compare_prefills(model_t *m, int *tokens, int n_tokens, int device) {
                 for (int p = 0; p < n_tokens && !first_report; p++) {
                     const uint16_t *ck = (const uint16_t *)(s->key_cache + (size_t)layer * layer_k + (size_t)p * s->kv_row_size_k);
                     const uint16_t *gk = (const uint16_t *)(gpu_k_full + (size_t)attn_l * layer_k + (size_t)p * s->kv_row_size_k);
-                    for (int e = 0; e < 8 && e < s->kv_row_size_k / sizeof(uint16_t); e++) {
+                    for (size_t e = 0; e < 8 && e < s->kv_row_size_k / sizeof(uint16_t); e++) {
                         float cpu_val = fp16_to_fp32(ck[e]);
                         float gpu_val = fp16_to_fp32(gk[e]);
                         if (fabsf(cpu_val - gpu_val) > 1e-5f) {
-                            fprintf(stderr, "    K[%d][%d] CPU=%.6f GPU=%.6f diff=%.6f\n",
+                            fprintf(stderr, "    K[%d][%zu] CPU=%.6f GPU=%.6f diff=%.6f\n",
                                     p, e, cpu_val, gpu_val, fabsf(cpu_val - gpu_val));
                         }
                     }

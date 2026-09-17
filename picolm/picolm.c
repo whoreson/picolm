@@ -1033,7 +1033,7 @@ int main(int argc, char **argv) {
     int    mem_mb = 0;      /* --mem budget in megabytes (0=disabled) */
     int    do_prefault = 0; /* --prefault (touch all mmap pages at load time) */
     int    gpu_diff = 0;    /* --gpu-diff S I O */
-#ifdef PICOLM_GPU
+#ifdef PICOLM_CUDA
     int    gpu_diff_S = 32, gpu_diff_I = 512, gpu_diff_O = 1024;
 #endif
     int    do_attn_diff = 0;  /* --gpu-attn-diff n_tok n_heads n_kv_heads head_dim */
@@ -1157,7 +1157,7 @@ int main(int argc, char **argv) {
             checkpoint_tail_offset = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--slot-save-path") == 0 && i + 1 < argc) {
             slot_save_path = argv[++i];
-#ifdef PICOLM_GPU
+#ifdef PICOLM_CUDA
         } else if (strcmp(argv[i], "--gpu-diff") == 0 && i + 3 < argc) {
             gpu_diff = 1;
             gpu_diff_S = atoi(argv[++i]);
