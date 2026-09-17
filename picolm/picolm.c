@@ -1183,7 +1183,6 @@ int main(int argc, char **argv) {
             list_kv = 1;
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
-            usage(argv[0]);
             return 1;
         }
     }
