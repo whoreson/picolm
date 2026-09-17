@@ -106,10 +106,12 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
         fprintf(g_plumbing_fp,"EMB token=%d rms=%.6f first5=%.6f,%.6f,%.6f,%.6f,%.6f\n",token,
           0.0,s->x[0],s->x[1],s->x[2],s->x[3],s->x[4]);
         double sm=0; for(int i=0;i<dim;i++){double v=s->x[i];sm+=v*v;}
+        (void)sm;
         fprintf(g_plumbing_fp,"EMB rms=%.6f\n",sqrt(sm/dim));
       }}
     if (pos == 0 && getenv("PICOLM_DBG")) {
         double em = 0; for(int i=0;i<dim;i++){double v=s->x[i]; em+=v*v;}
+        (void)em;
     }
 
     /* 2. Build per-layer inputs: [n_embd_altup, n_layer]
@@ -153,7 +155,9 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
     }
     if (pos == 0 && getenv("PICOLM_DBG")) {
         double pm = 0; for(int i=0;i<n_embd_altup;i++){double v=s->gemma3n_per_layer_inp[i]; pm+=v*v;}
+        (void)pm;
         double pm2 = 0; for(int i=0;i<n_embd_altup;i++){double v=s->gemma3n_per_layer_inp[c->n_layers*n_embd_altup-i-1]; pm2+=v*v;}
+        (void)pm2;
     }
 
     /* 3. ALTUP expand: create n_altup copies
@@ -187,6 +191,7 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
         if (pos == 0 && getenv("PICOLM_DBG")) {
             for(int a=0;a<n_altup;a++){
                 double m=0; for(int i=0;i<dim;i++){double v=s->gemma3n_altup_state[a*dim+i]; m+=v*v;}
+                (void)m;
                 fprintf(stderr,"%.1f%s",sqrt(m/dim),a<n_altup-1?",":"");
             }
             fprintf(stderr, "}\n");
@@ -198,6 +203,7 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
         fprintf(g_plumbing_fp,"ALTUP_EXPAND rms=");
         for(int a=0;a<n_altup;a++){
           double sm=0;for(int i=0;i<dim;i++){double v=s->gemma3n_altup_state[a*dim+i];sm+=v*v;}
+          (void)sm;
           fprintf(g_plumbing_fp,"%.6f",sqrt(sm/dim));if(a<n_altup-1)fputc(',',g_plumbing_fp);}
         fputc('\n',g_plumbing_fp);}
     }
@@ -212,6 +218,7 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
             if (pos == 0 && getenv("PICOLM_DBG")) {
                 for(int a=0;a<n_altup;a++){
                     double m=0; for(int i=0;i<dim;i++){double v=s->gemma3n_altup_state[a*dim+i]; m+=v*v;}
+                    (void)m;
                     fprintf(stderr,"%.2f%s",sqrt(m/dim),a<n_altup-1?",":"");
                 }
                 fprintf(stderr, "}\n");
@@ -277,8 +284,10 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
             active_pred = predictions + i_altup_act * dim;
             if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
                 double apm=0; for(int i=0;i<dim;i++){double v=active_pred[i]; apm+=v*v;}
+                (void)apm;
                 for(int a=0;a<n_altup;a++){
                     double pm=0; for(int i=0;i<dim;i++){double v=predictions[a*dim+i]; pm+=v*v;}
+                    (void)pm;
                 }
                 for(int i=0;i<5;i++) fprintf(stderr,"%.4f%s",active_pred[i],i<4?",":"");
                 fprintf(stderr, "}\n");
@@ -314,16 +323,20 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
                 rmsnorm(s->gemma3n_laurel_out, s->gemma3n_laurel_out, s->laurel_post_norm_w[l], dim, rms_norm_eps);
                 if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
                     double wm = 0; for(int i=0;i<dim;i++){double v=s->laurel_post_norm_w[l][i]; wm+=v*v;}
+                    (void)wm;
                     double am = 0; for(int i=0;i<dim;i++){double v=s->gemma3n_laurel_out[i]; am+=v*v;}
+                    (void)am;
                 }
                 /* Residual: laurel_out + x_normed (not active_pred!) */
                 for (int i = 0; i < dim; i++) s->gemma3n_laurel_out[i] += s->xb[i];
             }
             if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
                 double am = 0; for(int i=0;i<dim;i++){double v=s->xb[i]; am+=v*v;}
+                (void)am;
                 int skip_laurel = getenv("PICOLM_SKIP_LAUREL") ? 1 : 0;
                 if (!skip_laurel) {
                     double lm = 0; for(int i=0;i<dim;i++){double v=s->gemma3n_laurel_out[i]; lm+=v*v;}
+                    (void)lm;
                 }
             }
         }
@@ -465,16 +478,19 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
 
         if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
             double am = 0; for(int i=0;i<dim;i++){double v=s->xb2[i]; am+=v*v;}
+            (void)am;
             for(int i=0;i<5;i++) fprintf(stderr,"%.4f%s",s->xb2[i],i<4?",":"");
             fprintf(stderr, "}\n");
         }
         /* attn_post_norm(attn_result) */
         if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
             double wm = 0; for(int i=0;i<dim;i++){double v=s->attn_post_norm_w[l][i]; wm+=v*v;}
+            (void)wm;
         }
         rmsnorm(s->xb, s->xb2, s->attn_post_norm_w[l], dim, rms_norm_eps);
         if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
             double am = 0; for(int i=0;i<dim;i++){double v=s->xb[i]; am+=v*v;}
+            (void)am;
         }
 
         /* Add active prediction (residual) */
@@ -488,6 +504,7 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
             }
             if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
                 double am = 0; for(int i=0;i<dim;i++){double v=s->x[i]; am+=v*v;}
+                (void)am;
             }
         }
 
@@ -495,12 +512,14 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
         {
             if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
                 double wm = 0; for(int i=0;i<dim;i++){double v=s->post_attn_norm_w[l][i]; wm+=v*v;}
+                (void)wm;
                 for(int i=0;i<5;i++) fprintf(stderr,"%.4f%s",s->post_attn_norm_w[l][i],i<4?",":"");
                 fprintf(stderr, "}\n");
             }
             rmsnorm(s->xb, s->x, s->post_attn_norm_w[l], dim, rms_norm_eps);
             if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
                 double am = 0; for(int i=0;i<dim;i++){double v=s->xb[i]; am+=v*v;}
+                (void)am;
             }
             matmul(s->hb, s->xb, lw->ffn_gate, dim, n_ffn, lw->type_ffn_gate);
             /* Activation sparsity (gaussian_topk) for first n_layer_sparsity layers */
@@ -529,16 +548,19 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
             matmul(s->xb, s->hb, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
             if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
                 double am = 0; for(int i=0;i<dim;i++){double v=s->xb[i]; am+=v*v;}
+                (void)am;
             }
             /* post_ffw_norm */
             if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
                 double wm = 0; for(int i=0;i<dim;i++){double v=s->post_ffw_norm_w[l][i]; wm+=v*v;}
+                (void)wm;
                 for(int i=0;i<3;i++) fprintf(stderr,"%.4f%s",s->post_ffw_norm_w[l][i],i<2?",":"");
                 fprintf(stderr, "}\n");
             }
             rmsnorm(s->xb, s->xb, s->post_ffw_norm_w[l], dim, rms_norm_eps);
             if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
                 double am = 0; for(int i=0;i<dim;i++){double v=s->xb[i]; am+=v*v;}
+                (void)am;
             }
             /* Add residual (attn_laurel combined) */
             for (int i = 0; i < dim; i++) s->xb[i] += s->x[i];
@@ -553,6 +575,7 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
          */
         if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
             double am = 0; for(int i=0;i<dim;i++){double v=s->xb[i]; am+=v*v;}
+            (void)am;
         }
         {
             /* Router on activated state */
@@ -587,6 +610,7 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
 
             if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
                 double im = 0; for(int i=0;i<dim;i++){double v=s->hb[i]; im+=v*v;}
+                (void)im;
             }
 
             /* corrected[a] = predictions[a] + innovation * correct_coefs[a] */
@@ -601,6 +625,7 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
             if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
                 for (int a = 0; a < n_altup; a++) {
                     double am = 0; for(int i=0;i<dim;i++){double v=s->gemma3n_altup_state[a*dim+i]; am+=v*v;}
+                    (void)am;
                 }
             }
         }
@@ -618,6 +643,7 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
             /* Scale by altup_correct_scale */
             if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
                 double sc_rms = 0; for(int i=0;i<dim;i++){double v=s->altup_correct_scale_w[l][i]; sc_rms+=v*v;}
+                (void)sc_rms;
                 for(int i=0;i<5;i++) fprintf(stderr,"%.4f%s",s->altup_correct_scale_w[l][i],i<4?",":"");
                 fprintf(stderr, "}\n");
             }
@@ -627,12 +653,14 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
             matmul(s->gemma3n_inp_gate_out, first_pred, lw->per_layer_inp_gate, dim, n_embd_altup, lw->type_per_layer_inp_gate);
             if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
                 double am = 0; for(int i=0;i<n_embd_altup;i++){double v=s->gemma3n_inp_gate_out[i]; am+=v*v;}
+                (void)am;
                 for(int i=0;i<5;i++) fprintf(stderr,"%.4f%s",s->gemma3n_inp_gate_out[i],i<4?",":"");
                 fprintf(stderr, "}\n");
             }
             gelu(s->gemma3n_inp_gate_out, n_embd_altup);  /* Gemma-3n uses GELU */
             if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
                 double am = 0; for(int i=0;i<n_embd_altup;i++){double v=s->gemma3n_inp_gate_out[i]; am+=v*v;}
+                (void)am;
                 for(int i=0;i<5;i++) fprintf(stderr,"%.4f%s",s->gemma3n_inp_gate_out[i],i<4?",":"");
                 fprintf(stderr, "}\n");
             }
@@ -642,6 +670,7 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
             for (int i = 0; i < n_embd_altup; i++) s->gemma3n_inp_gate_out[i] *= layer_inp[i];
             if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
                 double am = 0; for(int i=0;i<n_embd_altup;i++){double v=s->gemma3n_inp_gate_out[i]; am+=v*v;}
+                (void)am;
             }
 
             /* per_layer_proj: [n_embd_altup, n_embd] */
@@ -657,6 +686,7 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
             matmul(s->hb, s->gemma3n_inp_gate_out, lw->per_layer_proj, n_embd_altup, dim, lw->type_per_layer_proj);
             if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
                 double am = 0; for(int i=0;i<dim;i++){double v=s->hb[i]; am+=v*v;}
+                (void)am;
                 float maxx = 0, maxw = 0; int maxx_i = 0, maxw_i = 0;
                 double x2w2 = 0;
                 for(int i=0;i<dim;i++) {
@@ -670,7 +700,9 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
 
             if (l == 0 && pos == 0 && getenv("PICOLM_DBG")) {
                 double am = 0; for(int i=0;i<dim;i++){double v=s->hb[i]; am+=v*v;}
+                (void)am;
                 double wn = 0; for(int i=0;i<dim;i++){double v=s->per_layer_post_norm_w[l][i]; wn+=v*v;}
+                (void)wn;
             }
             /* Add to altup indices 1..n_altup-1 (reference: corrected[1:] += first_prediction)
              * Note: this is NOT the active altup. The reference always skips index 0,
@@ -695,6 +727,7 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
         fprintf(g_plumbing_fp,"POST_LAYERS rms=");
         for(int a=0;a<n_altup;a++){
           double sm=0;for(int i=0;i<dim;i++){double v=s->gemma3n_altup_state[a*dim+i];sm+=v*v;}
+          (void)sm;
           fprintf(g_plumbing_fp,"%.6f",sqrt(sm/dim));if(a<n_altup-1)fputc(',',g_plumbing_fp);}
         fputc('\n',g_plumbing_fp);}
     }
@@ -739,22 +772,26 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
     /* 6. Final RMSNorm */
     if (pos <= 1 && getenv("PICOLM_DBG")) {
         double om = 0; for(int i=0;i<dim;i++){double v=s->x[i]; om+=v*v;}
+        (void)om;
         for(int i=0;i<5;i++) fprintf(stderr,"%.4f%s",s->x[i],i<4?",":"");
         fprintf(stderr, "}\n");
     }
     /* Plumbing check: dump hidden state before and after final norm */
     { if(g_plumbing_fp && pos==18 && token==496){
         double sm=0;for(int i=0;i<dim;i++){double v=s->x[i];sm+=v*v;}
+        (void)sm;
         fprintf(g_plumbing_fp,"PRE_NORM rms=%.6f first5=%.6f,%.6f,%.6f,%.6f,%.6f\n",sqrt(sm/dim),s->x[0],s->x[1],s->x[2],s->x[3],s->x[4]);}
     }
     rmsnorm(s->x, s->x, s->output_norm_w, dim, rms_norm_eps);
     { if(g_plumbing_fp && pos==18 && token==496){
         double sm=0;for(int i=0;i<dim;i++){double v=s->x[i];sm+=v*v;}
+        (void)sm;
         fprintf(g_plumbing_fp,"POST_NORM rms=%.6f first5=%.6f,%.6f,%.6f,%.6f,%.6f\n",sqrt(sm/dim),s->x[0],s->x[1],s->x[2],s->x[3],s->x[4]);}
     }
 
     if (pos <= 1 && getenv("PICOLM_DBG")) {
         double om = 0; for(int i=0;i<dim;i++){double v=s->x[i]; om+=v*v;}
+        (void)om;
         for(int i=0;i<5;i++) fprintf(stderr,"%.4f%s",s->x[i],i<4?",":"");
         fprintf(stderr, "}\n");
     }

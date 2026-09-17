@@ -29,10 +29,6 @@
 #include <riscv_vector.h>
 #endif
 
-static inline int64_t bloc_pos(int64_t ib, int64_t ibN, int64_t bloc_size) {
-    return ib < ibN ? ib * bloc_size : ibN * bloc_size + (ib - ibN) * (bloc_size - 1);
-}
-
 #define JSTART(nb,ith,nth) ((nb)*(ith)/(nth))
 #define JEND(nb,ith,nth)   ((nb)*((ith)+1)/(nth))
 
@@ -57,6 +53,7 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
                            const float *B, int ldb, float *C, int ldc,
                            int ith, int nth) {
     const int64_t KN=F32_KN, RM=F32_RM, RN=F32_RN, BN=F32_BN;
+    (void)BN;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
@@ -192,6 +189,7 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
                            const float *B, int ldb, float *C, int ldc,
                            int ith, int nth) {
     const int64_t KN=F32_KN, RM=F32_RM, RN=F32_RN, BN=F32_BN;
+    (void)BN;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
@@ -251,6 +249,7 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
                            const float *B, int ldb, float *C, int ldc,
                            int ith, int nth) {
     const int64_t KN=F32_KN, RM=F32_RM, RN=F32_RN, BN=F32_BN;
+    (void)BN;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
@@ -317,6 +316,7 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
                            const float *B, int ldb, float *C, int ldc,
                            int ith, int nth) {
     const int64_t KN=F32_KN, RM=F32_RM, RN=F32_RN, BN=F32_BN;
+    (void)BN;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
@@ -371,6 +371,7 @@ static void sgemm_f16_f32_altivec(int m, int n, int k, const uint16_t *A, int ld
 #define F16F32_RN 3
 #define F16F32_BN 24
     const int64_t KN=F16F32_KN, RM=F16F32_RM, RN=F16F32_RN, BN=F16F32_BN;
+    (void)BN;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
@@ -439,6 +440,7 @@ static void sgemm_f16_f16_altivec(int m, int n, int k, const uint16_t *A, int ld
 #define F16F16_RN 3
 #define F16F16_BN 24
     const int64_t KN=F16F16_KN, RM=F16F16_RM, RN=F16F16_RN, BN=F16F16_BN;
+    (void)BN;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
@@ -520,6 +522,7 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
                            const float *B, int ldb, float *C, int ldc,
                            int ith, int nth) {
     const int64_t RM=F32_RM, RN=F32_RN, BN=F32_BN;
+    (void)BN;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
@@ -579,6 +582,7 @@ static void sgemm_f16_f32(int m, int n, int k, const uint16_t *A, int lda,
 #define SGEMM_RN 6
 #define SGEMM_BN 12
     const int64_t KN=16, RM=4, RN=6, BN=12;
+    (void)BN;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
@@ -677,6 +681,7 @@ static void sgemm_f16_f32(int m, int n, int k, const uint16_t *A, int lda,
 #define SGEMM_RN 6
 #define SGEMM_BN 12
     const int64_t KN=4, RM=4, RN=6, BN=12;
+    (void)BN;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
@@ -722,6 +727,7 @@ static void sgemm_f16_f16(int m, int n, int k, const uint16_t *A, int lda,
 #define SGEMM_RN 6
 #define SGEMM_BN 12
     const int64_t KN=16, RM=4, RN=6, BN=12;
+    (void)BN;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
@@ -819,6 +825,7 @@ static void sgemm_f16_f16(int m, int n, int k, const uint16_t *A, int lda,
 #define SGEMM_RN 6
 #define SGEMM_BN 12
     const int64_t KN=8, RM=4, RN=6, BN=12;
+    (void)BN;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
@@ -880,6 +887,7 @@ static void sgemm_bf16_f32(int m, int n, int k, const uint16_t *A, int lda,
 #define SGEMM_RN 6
 #define SGEMM_BN 12
     const int64_t KN=16, RM=4, RN=6, BN=12;
+    (void)BN;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
@@ -930,6 +938,7 @@ static void sgemm_bf16_bf16(int m, int n, int k, const uint16_t *A, int lda,
 #define SGEMM_RN 6
 #define SGEMM_BN 12
     const int64_t KN=16, RM=4, RN=6, BN=12;
+    (void)BN;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
@@ -992,6 +1001,7 @@ static void sgemm_bf16_f32(int m, int n, int k, const uint16_t *A, int lda,
 #define SGEMM_RN 3
 #define SGEMM_BN 24
     const int64_t KN=8, RM=4, RN=3, BN=24;
+    (void)BN;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
@@ -1052,6 +1062,7 @@ static void sgemm_bf16_bf16(int m, int n, int k, const uint16_t *A, int lda,
 #define SGEMM_RN 3
 #define SGEMM_BN 24
     const int64_t KN=8, RM=4, RN=3, BN=24;
+    (void)BN;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
@@ -1351,6 +1362,7 @@ static void sgemm_q8_q8_neon(int m, int n, int k_blocks,
                               float *C, int ldc,
                               int ith, int nth) {
     const int64_t RM=4, RN=3, BN=12;
+    (void)BN;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
@@ -1716,6 +1728,7 @@ static void sgemm_q4_q8_neon(int m, int n, int k_blocks,
                               const block_q8_0 *B, int ldb,
                               float *C, int ldc, int ith, int nth) {
     const int64_t RM=4, RN=3, BN=12;
+    (void)BN;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
@@ -1784,13 +1797,8 @@ static void sgemm_q4_q8_neon(int m, int n, int k_blocks,
  * extracted from Q8_0 blocks by the caller, avoiding fp16->fp32 conversion
  * in the inner loop. This is the optimization target for basic NEON.
  * On I8MM devices, vmmlaq_s32 path is used instead of widen.
- *
- * TODO: DEAD CODE. This function is never called by any dispatch path.
- * picolm_sgemm dispatches sgemm_q4_q8_neon (non-delta, 3x4 tiles), not this.
- * picolm_sgemm_d dispatches sgemm_neon_q4_qs_d4 (4x4 tiles, delta macro), not this.
- * tensor.c routes through picolm_sgemm_d (delta path), never reaching picolm_sgemm's
- * Q8_0 Btype dispatch. Was intended as an optimization target but has no caller.
- * Consider: wire into picolm_sgemm_d as replacement for sgemm_neon_q4_qs_d4, or remove. */
+ */
+#if 0 /* dead code: never called by any dispatch path */
 static void sgemm_q4_q8_d4_neon(int m, int n, int k_blocks,
                                  const block_q4_0 *A, int lda,
                                  const block_q8_0 *B, int ldb,
@@ -1905,6 +1913,7 @@ static void sgemm_q4_q8_d4_neon(int m, int n, int k_blocks,
         }
     }
 }
+#endif /* dead code */
 
 /* ARM NEON Q5_0 x Q8_0 GEMM.
  *
@@ -1916,6 +1925,7 @@ static void sgemm_q5_q8_neon(int m, int n, int k_blocks,
                               const block_q8_0 *B, int ldb,
                               float *C, int ldc, int ith, int nth) {
     const int64_t RM=4, RN=3, BN=12;
+    (void)BN;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);

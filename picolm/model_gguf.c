@@ -580,6 +580,10 @@ int model_list_tensors(const char *path) {
 
       size_t pos = 0;
       /* Safe append macro: clamps on truncation. Supports zero or more variadic args. */
+      #ifdef __clang__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wgnu-zero-variadic-macro-arguments"
+#endif
       #define APPEND(fmt, ...) do {                                          \
           int _r = snprintf(buf + pos, buf_size - pos, fmt, ##__VA_ARGS__);  \
           if (_r > 0) pos += (size_t)_r < (buf_size - pos) ? (size_t)_r : 0; \
@@ -652,6 +656,9 @@ int model_list_tensors(const char *path) {
 
           APPEND("%-52s %14s %-12s %u\n", nbuf, dstr, gguf_type_name(type), type);
       }
+#ifdef __clang__
+#pragma clang diagnostic pop
+#endif
       #undef APPEND
 
       fwrite(buf, 1, pos, stdout);

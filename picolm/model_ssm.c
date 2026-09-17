@@ -3334,6 +3334,7 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
             if (ax > amax) amax = ax;
             if (ax < amin) amin = ax;
         }
+        (void)isnan_cnt; (void)amax; (void)amin;
         }
     matmul_batch(qkv_batch, ssm_xb, n_tokens, lw->attn_qkv, dim, conv_dim, lw->type_attn_qkv);
     tensor_set_repacked(NULL);
