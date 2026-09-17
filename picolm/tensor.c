@@ -606,6 +606,21 @@ static void matmul_worker_f(matmul_task_t *t) {
                     t->out[b * out_stride + i] = vec_dot_q5_K_q8_K(wrow, xb, t->n);
                 }
             }
+        } else if (t->qtype == GGUF_TYPE_Q5_1 && t->x) {
+            /* Q5_1 batched: pre-quantized Q8_0 activations, direct vec_dot.
+             * TODO: The shadow-strategy (q5_1_row_to_q8_0_shadow + vec_dot_q8_0_q8_0_deltas)
+             * used by Q4_0/IQ4_NL introduces too much re-quantization error for Q5_1.
+             * The direct vec_dot_q5_1_q8_0 path is correct but not necessarily faster than
+             * the scalar F32 fallback for short prefills due to activation quant overhead. */
+            size_t q8_row_bytes = gguf_type_row_size(GGUF_TYPE_Q8_0, t->n);
+            const char *qx_base = (const char *)t->x;
+            for (int i = t->start; i < t->end; i++) {
+                const char *wrow = t->W + (size_t)i * t->row_bytes;
+                for (int b = 0; b < nb; b++) {
+                    const char *xb = qx_base + (size_t)b * q8_row_bytes;
+                    t->out[b * out_stride + i] = vec_dot_q5_1_q8_0(wrow, xb, t->n);
+                }
+            }
         } else if (t->qtype == GGUF_TYPE_Q2_K && t->x) {
             /* Pre-quantized Q8_K activations: int8 MAC with per-subblock scales + bsums */
             size_t q8k_row_bytes = gguf_type_row_size(GGUF_TYPE_Q8_K, t->n);
@@ -742,6 +757,12 @@ static void matmul_worker_f(matmul_task_t *t) {
         const block_q8_K *qx = (const block_q8_K *)t->x;
         for (int i = t->start; i < t->end; i++) {
             t->out[i] = vec_dot_q5_K_q8_K(
+                t->W + (size_t)i * t->row_bytes, qx, t->n);
+        }
+    } else if (t->qtype == GGUF_TYPE_Q5_1 && t->x) {
+        const block_q8_0 *qx = (const block_q8_0 *)t->x;
+        for (int i = t->start; i < t->end; i++) {
+            t->out[i] = vec_dot_q5_1_q8_0(
                 t->W + (size_t)i * t->row_bytes, qx, t->n);
         }
     } else if (t->qtype == GGUF_TYPE_Q1_0 && t->x) {
@@ -1087,6 +1108,55 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
                     pool_tasks[t].x_d = NULL; pool_tasks[t].W = wptr;
                     pool_tasks[t].row_bytes = row_bytes; pool_tasks[t].n = n;
                     pool_tasks[t].qtype = GGUF_TYPE_IQ4_NL;
+                    pool_tasks[t].n_batch = 0;
+                }
+                pool_clear_unused(active, nt);
+                pool_init(nt);
+                pool_wake(nt);
+                matmul_worker_f(&pool_tasks[0]);
+                pool_wait(nt);
+            }
+
+            if (qx_owned) free(qx);
+            return;
+        }
+        /* If allocation failed, fall through to generic path */
+    } else if (qtype == GGUF_TYPE_Q5_1) {
+        /* Q5_1 fast path: quantize x to Q8_0 once, then vec_dot_q5_1_q8_0.
+         * TODO: Not necessarily faster than scalar F32 fallback for tiny workloads
+         * (single-token decode, short prefill) due to activation quant overhead.
+         * Q5_1: unsigned 5-bit + min offset. Dequant: val = 5bit * d + m.
+         * Dot = d * sum(5bit * x) + m * sum(x). SIMD via NEON. */
+        size_t qx_size = (n / 32) * sizeof(block_q8_0);
+        block_q8_0 *qx = NULL;
+        int qx_owned = 0;
+        if (n_threads <= 1 && scratch_buf != NULL && qx_size <= (size_t)scratch_size) {
+            qx = (block_q8_0 *)scratch_buf;
+        } else {
+            qx = (block_q8_0 *)malloc(qx_size);
+            qx_owned = 1;
+        }
+        if (qx != NULL) {
+            quantize_row_q8_0(x, qx, n);
+
+            if (n_threads <= 1 || d < 4 || d < matmul_min_rows) {
+                for (int i = 0; i < d; i++) {
+                    out[i] = vec_dot_q5_1_q8_0(wptr + (size_t)i * row_bytes, qx, n);
+                }
+                if (qx_owned) free(qx);
+                return;
+            }
+
+            int nt = pool_total_threads(n_threads);
+            int want = n_threads < nt ? n_threads : nt;
+
+            {
+                int active = pool_assign_rows(0, want, d);
+                for (int t = 0; t < active; t++) {
+                    pool_tasks[t].out = out; pool_tasks[t].x = (const float *)qx;
+                    pool_tasks[t].x_d = NULL; pool_tasks[t].W = wptr;
+                    pool_tasks[t].row_bytes = row_bytes; pool_tasks[t].n = n;
+                    pool_tasks[t].qtype = GGUF_TYPE_Q5_1;
                     pool_tasks[t].n_batch = 0;
                 }
                 pool_clear_unused(active, nt);
@@ -2961,6 +3031,20 @@ void matmul_batch(float *out, const float *x, int n_batch,
             qx_buf = qbuf; qx_d_buf = dbuf;
             qx_stride = q8_rb; have_qx = 1;
         } else { free(qbuf); free(dbuf); }
+    } else if (qtype == GGUF_TYPE_Q5_1 && n_batch > 0 && n > 0) {
+        size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
+        int nb = n / 32;
+        void *qbuf = malloc((size_t)n_batch * q8_rb);
+        float *dbuf = (float *)malloc((size_t)n_batch * nb * sizeof(float));
+        if (qbuf && dbuf) {
+            for (int b = 0; b < n_batch; b++) {
+                quantize_row_q8_0(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
+                const block_q8_0 *blk = (const block_q8_0 *)((char *)qbuf + (size_t)b * q8_rb);
+                for (int k = 0; k < nb; k++) dbuf[(size_t)b * nb + k] = fp16_to_fp32(blk[k].d);
+            }
+            qx_buf = qbuf; qx_d_buf = dbuf;
+            qx_stride = q8_rb; have_qx = 1;
+        } else { free(qbuf); free(dbuf); }
     } else if (qtype == GGUF_TYPE_Q2_K && n_batch > 0 && n > 0) {
         size_t q8k_rb = gguf_type_row_size(GGUF_TYPE_Q8_K, n);
         void *qbuf = malloc((size_t)n_batch * q8k_rb);
@@ -3106,6 +3190,8 @@ void matmul_batch(float *out, const float *x, int n_batch,
                         out[b * d + i] = vec_dot_q3_K_q8_K(wrow, xb, n);
                     } else if (qtype == GGUF_TYPE_Q5_K) {
                         out[b * d + i] = vec_dot_q5_K_q8_K(wrow, xb, n);
+                    } else if (qtype == GGUF_TYPE_Q5_1) {
+                        out[b * d + i] = vec_dot_q5_1_q8_0(wrow, xb, n);
                     } else if (qtype == GGUF_TYPE_Q1_0) {
                         out[b * d + i] = vec_dot_q1_0_q8_0(wrow, xb, n);
                     } else if (qtype == GGUF_TYPE_Q2_0) {

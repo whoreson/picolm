@@ -5098,6 +5098,156 @@ float vec_dot_q5_1_f32(const void *src, const float *x, int n) {
     return sumf;
 }
 
+/* vec_dot_q5_1_q8_0: Q5_1 weights x Q8_0 input (int8 MAC)
+ * Q5_1: unsigned 5-bit (0..31) + FP16 scale d + FP16 min m, 24 bytes/block.
+ * Dequant: val = (5bit) * d + m
+ * Dot product: sum(val_i * x_i) = d * sum(5bit_i * x_i) + m * sum(x_i)
+ *
+ * 5-bit values (0..31) fit in signed int8 as positive values.
+ * Activation sum is computed from Q8_0 qs directly.
+ *
+ * TODO: The activation quant overhead means this is not necessarily faster
+ * than the scalar F32 fallback for tiny workloads. The benefit comes from
+ * avoiding per-element F32 dequant of 5-bit values on each invocation.
+ */
+float vec_dot_q5_1_q8_0(const void *vx, const void *wy, int n) {
+    const block_q5_1 *x = (const block_q5_1 *)vx;
+    const block_q8_0 *y = (const block_q8_0 *)wy;
+    int nb = n / 32;
+    int ib = 0;
+    float sumf = 0.0f;
+
+#if defined(PICOLM_I8MM_TODO) || defined(PICOLM_NEON)
+    {
+        const uint8x16_t mask4 = vdupq_n_u8(0x0F);
+        static const uint8_t bitidx[8] __attribute__((aligned(16))) = {0,1,2,3,4,5,6,7};
+
+        for (ib = 0; ib < nb; ib++) {
+            const float dw = fp16_to_fp32_lookup(x[ib].d);
+            const float mw = fp16_to_fp32_lookup(x[ib].m);
+            const float da = fp16_to_fp32_lookup(y[ib].d);
+            const uint8x16_t qx4 = vld1q_u8(x[ib].qs);
+            const int8x16_t qy0 = vld1q_s8(y[ib].qs);
+            const int8x16_t qy1 = vld1q_s8(y[ib].qs + 16);
+
+            /* Extract 5th bits from qh[4], same pattern as sgemm.c neon_q5_qs */
+            uint8x8_t qh = vld1_u8(x[ib].qh);
+            uint8x8_t qh0 = vdup_n_u8(vget_lane_u8(qh, 0));
+            uint8x8_t qh1 = vdup_n_u8(vget_lane_u8(qh, 1));
+            uint8x8_t qh2 = vdup_n_u8(vget_lane_u8(qh, 2));
+            uint8x8_t qh3 = vdup_n_u8(vget_lane_u8(qh, 3));
+            uint8x8_t sh = vld1_u8(bitidx);
+            int8x8_t shs = vreinterpret_s8_u8(sh);
+
+            /* Low nibbles: 5th bit from qh bytes 0..1 (qh bits 0..15) */
+            uint8x8_t b0 = vand_u8(vshl_u8(qh0, vneg_s8(shs)), vdup_n_u8(1));
+            uint8x8_t b1 = vand_u8(vshl_u8(qh1, vneg_s8(shs)), vdup_n_u8(1));
+            b0 = vshl_n_u8(b0, 4); b1 = vshl_n_u8(b1, 4);
+            uint8x16_t bit_lo = vcombine_u8(b0, b1);
+
+            /* High nibbles: 5th bit from qh bytes 2..3 (qh bits 16..31) */
+            uint8x8_t b2 = vand_u8(vshl_u8(qh2, vneg_s8(shs)), vdup_n_u8(1));
+            uint8x8_t b3 = vand_u8(vshl_u8(qh3, vneg_s8(shs)), vdup_n_u8(1));
+            b2 = vshl_n_u8(b2, 4); b3 = vshl_n_u8(b3, 4);
+            uint8x16_t bit_hi = vcombine_u8(b2, b3);
+
+            int8x16_t qx_lo = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(qx4, mask4), bit_lo));
+            int8x16_t qx_hi = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(qx4, 4), bit_hi));
+
+#if defined(PICOLM_I8MM_TODO)
+            /* I8MM path (TODO: vmmlaq_s32 on I8MM hardware) */
+            int32x4_t s = vaddq_s32(vmmlaq_s32(vdupq_n_s32(0), qx_lo, qy0),
+                                     vmmlaq_s32(vdupq_n_s32(0), qx_hi, qy1));
+            int32_t dot_i = vgetq_lane_s32(s, 0) + vgetq_lane_s32(s, 3);
+#else
+            /* Plain NEON: vmull_s8 + vpaddlq_s16 */
+            int16x8_t p0 = vmull_s8(vget_low_s8(qx_lo), vget_low_s8(qy0));
+            int16x8_t p1 = vmull_s8(vget_high_s8(qx_lo), vget_high_s8(qy0));
+            int16x8_t p2 = vmull_s8(vget_low_s8(qx_hi), vget_low_s8(qy1));
+            int16x8_t p3 = vmull_s8(vget_high_s8(qx_hi), vget_high_s8(qy1));
+            int32x4_t s = vaddq_s32(vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)),
+                                    vaddq_s32(vpaddlq_s16(p2), vpaddlq_s16(p3)));
+            int32_t dot_i = vaddvq_s32(s);
+#endif
+            sumf += dw * da * (float)dot_i;
+
+            /* m * sum(x_i) = m * d_act * sum(qs)
+             * Sum all 32 int8 values: vpaddlq_s8 (int8->int16 pairwise add)
+             * then widen to int32 and reduce */
+            int16x8_t qs0 = vpaddlq_s8(qy0);
+            int16x8_t qs1 = vpaddlq_s8(qy1);
+            int32_t qs_sum = vaddvq_s32(vaddl_s16(vget_low_s16(qs0), vget_low_s16(qs1)))
+                           + vaddvq_s32(vaddl_high_s16(qs0, qs1));
+            sumf += mw * da * (float)qs_sum;
+        }
+    }
+
+#else
+    /* Scalar fallback */
+    for (ib = 0; ib < nb; ib++) {
+        const float dw = fp16_to_fp32_lookup(x[ib].d);
+        const float mw = fp16_to_fp32_lookup(x[ib].m);
+        const float da = fp16_to_fp32_lookup(y[ib].d);
+        uint32_t qh;
+        memcpy(&qh, x[ib].qh, sizeof(uint32_t));
+        const uint8_t *qs = x[ib].qs;
+        const int8_t *qy = y[ib].qs;
+        int dot_sum = 0;
+        int qs_sum = 0;
+        for (int j = 0; j < 16; j++) {
+            int w0 = (qs[j] & 0x0F) | (((qh >> j) & 1) << 4);
+            int w1 = (qs[j] >> 4)     | (((qh >> (j + 16)) & 1) << 4);
+            dot_sum += w0 * qy[j] + w1 * qy[j + 16];
+            qs_sum += qy[j] + qy[j + 16];
+        }
+        sumf += dw * da * (float)dot_sum + mw * da * (float)qs_sum;
+    }
+#endif
+
+    return sumf;
+}
+
+/* q5_1_row_to_q8_0_shadow: dequant Q5_1 row to Q8_0 shadow for weight-stationary batching.
+ * Dequantizes to exact F32, then re-quantizes to int8 with optimal per-block scale. */
+void q5_1_row_to_q8_0_shadow(const void *src, void *dst, int n) {
+    const block_q5_1 *blocks = (const block_q5_1 *)src;
+    block_q8_0 *shadow = (block_q8_0 *)dst;
+    int nb = n / 32;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = fp16_to_fp32_lookup(blocks[i].d);
+        const float m = fp16_to_fp32_lookup(blocks[i].m);
+        uint32_t qh;
+        memcpy(&qh, blocks[i].qh, sizeof(qh));
+        const uint8_t *qs = blocks[i].qs;
+        int8_t *sq = shadow[i].qs;
+
+        float f32vals[32];
+        for (int j = 0; j < 16; j++) {
+            int w0 = (qs[j] & 0x0F) | (((qh >> j) & 1) << 4);
+            int w1 = (qs[j] >> 4)     | (((qh >> (j + 16)) & 1) << 4);
+            f32vals[j] = (float)w0 * d + m;
+            f32vals[j + 16] = (float)w1 * d + m;
+        }
+
+        float absmax = 127.0f;
+        for (int j = 0; j < 32; j++) {
+            float av = f32vals[j] < 0 ? -f32vals[j] : f32vals[j];
+            if (av > absmax) absmax = av;
+        }
+        if (absmax < 1e-6f) absmax = 1e-6f;
+        float scale = absmax / 127.0f;
+
+        for (int j = 0; j < 32; j++) {
+            int v = (int)((f32vals[j] / scale) + (f32vals[j] >= 0 ? 0.5f : -0.5f));
+            if (v > 127) v = 127;
+            if (v < -128) v = -128;
+            sq[j] = (int8_t)v;
+        }
+        shadow[i].d = fp32_to_fp16(scale);
+    }
+}
+
 /* vec_dot_q1_0_f32: fused dequant + dot for Q1_0 x float32
  * Q1_0 block: 16 bytes qs (128 bits) + 2 bytes d(FP16) = 18 bytes per 128 values.
  * Dequant: val[j] = (bit[j] ? +d : -d) */

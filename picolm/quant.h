@@ -694,6 +694,10 @@ float vec_dot_iq4_nl_f32(const void *src_iq4, const float *x, int n);
 float vec_dot_q4_K_q8_K(const void *src_q4, const void *src_q8, int n);
 /* Q5_K * Q8_K dot product: Q5_K weights with pre-quantized Q8_K input */
 float vec_dot_q5_K_q8_K(const void *src_q5, const void *src_q8, int n);
+/* Q5_1 * Q8_0 dot product: Q5_1 weights with pre-quantized Q8_0 input */
+float vec_dot_q5_1_q8_0(const void *src_q5, const void *src_q8, int n);
+/* Q5_1 row to Q8_0 shadow: for weight-stationary batching */
+void q5_1_row_to_q8_0_shadow(const void *src, void *dst, int n);
 /* Q3_K * Q8_K dot product: Q3_K weights with pre-quantized Q8_K input */
 float vec_dot_q3_K_q8_K(const void *src_q3, const void *src_q8, int n);
 /* Q2_K * Q8_K dot product: Q2_K weights with pre-quantized Q8_K input */
