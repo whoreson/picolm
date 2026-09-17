@@ -3178,7 +3178,12 @@ int picolm_gpu_kv_store_rows(int is_k, int lo, int sp, int np,
     if (!G.ready || !hr || device != 0) return 0;
     VkBuffer dst_buf = is_k ? G.kv_k_buf : G.kv_v_buf;
     if (!dst_buf) return 0;
-    size_t row_bytes = (size_t)nkh * hd * sizeof(uint16_t);
+    /* Use the caller-provided row_bytes. For F16 this equals nkh*hd*sizeof(uint16_t),
+     * for quantized KV it equals the quantized row size.
+     * TODO(quant_kv): Vulkan attention shaders only support F16 KV cache reads.
+     * Quantized KV cache on Vulkan will require new shaders with per-block dequant.
+     * Until then, this store_rows accepts the bytes but attention will misread. */
+    size_t row_bytes = rb;
     size_t off = (size_t)lo * msl * row_bytes + (size_t)sp * row_bytes;
     size_t bytes = (size_t)np * row_bytes;
     /* Ensure any prior xfer is done before reusing cmd_xfer/fence_xfer */
@@ -3662,7 +3667,19 @@ int picolm_gpu_w4a16_matmul(picolm_gpu_tensor_t *t, float *y, const float *x,
     (void)t; (void)y; (void)x; (void)S; (void)device; return 0;
 }
 // ---------------------------------------------------------------------------
-// ATTENTION (stubs - shaders not yet written)
+// ATTENTION
+//
+// Current state:
+// - prefill (F16 KV): attn_prefill_f16vk.spv (active)
+// - prefill (F32 pipe): attn_prefill_vk.spv (fallback, KAVERI)
+// - decode: attn_decode_vk.spv (disabled, returns 0)
+//
+// TODO(quant_kv): Vulkan attention shaders only support F16 KV cache reads.
+// All shaders (attn_prefill_f16vk, attn_prefill_vk, attn_decode_vk) treat
+// the KV cache as raw uint16_t std430 buffers with one F16 value per element.
+// Quantized KV cache (Q8_0, Q4_0, TQ3, TQ4) requires new shaders with
+// per-block dequant in the K scoring and V accumulation phases.
+// See /data4/work/notes/picolm/gpu_quantized_kv_plan.md
 // ---------------------------------------------------------------------------
 
 int picolm_gpu_attention_decode(float *xb_out, const float *q,

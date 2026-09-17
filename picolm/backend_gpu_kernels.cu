@@ -3392,7 +3392,12 @@ __global__ void
 picolm_gpu_attention_prefill_warpgrp_kernel(
         float *xb_out,        /* [n_tokens][n_heads][head_dim] */
         const float *q_dev,   /* [n_tokens][n_heads][head_dim] */
-        const uint16_t *kv_k, /* [layer][pos][kv_head][head_dim] FP16 */
+        const uint16_t *kv_k, /* [layer][pos][kv_head][head_dim] FP16
+                               * TODO(quant_kv): currently F16-only. For
+                               * quantized KV cache, kv_pos_stride_bytes and
+                               * kv_head_stride_bytes will change, and the
+                               * dequant step in the scoring loop must handle
+                               * per-block Q8_0/Q4_0/TQ3/TQ4 formats. */
         const uint16_t *kv_v, /* [layer][pos][kv_head][head_dim] FP16 */
         int layer_ordinal,
         int start_pos, int n_tokens,

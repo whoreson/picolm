@@ -460,7 +460,11 @@ picolm_gpu_kv_store_rows(int is_k, int layer_ordinal, int start_pos, int n_posit
 
     /* Sanity: row_bytes must match the F16 GQA row size this cache was
      * sized for. If a caller passes a quantized row_bytes here, refuse
-     * rather than silently corrupting the cache. */
+     * rather than silently corrupting the cache.
+     * TODO(quant_kv): Remove this check once quantized KV cache is supported.
+     * For quantized KV, row_bytes will be smaller than the F16 row size and
+     * the H2D memcpy will still work correctly (quantized CPU layout is
+     * byte-identical to GPU layout). */
     size_t expect_row_bytes = (size_t)n_kv_heads * head_dim * sizeof(uint16_t);
     if (row_bytes != expect_row_bytes) return 0;
 
