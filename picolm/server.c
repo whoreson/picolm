@@ -2237,12 +2237,10 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
                     cJSON_AddStringToObject(delta, "content", "");
                     cJSON_AddStringToObject(choice, "finish_reason", "");
                 } else {
-                    /* Full stop: flush any withheld content before stopping */
-                    if (withheld[0] != '\0') {
-                        cJSON_AddStringToObject(delta, "content", withheld);
-                        if (!is_chat) cJSON_AddStringToObject(choice, "text", withheld);
-                        withheld[0] = '\0';
-                    }
+                    /* Full stop: discard withheld content -- it contains prefixes
+                     * of stop words that would leak into the output. The
+                     * generated_stream was already truncated at sw_stop_pos. */
+                    withheld[0] = '\0';
                     cJSON_AddStringToObject(choice, "finish_reason", "stop");
                 }
             } else {
@@ -2964,13 +2962,9 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
                     memcpy(withheld + w_len, piece, (size_t)(p_len + 1));
                     cJSON_AddStringToObject(resp, "content", "");
                 } else {
-                    /* Full stop: flush any withheld content before stopping */
-                    if (withheld[0] != '\0') {
-                        cJSON_AddStringToObject(resp, "content", withheld);
-                        withheld[0] = '\0';
-                    } else {
-                        cJSON_AddStringToObject(resp, "content", "");
-                    }
+                    /* Full stop: discard withheld content (prefix of stop word) */
+                    withheld[0] = '\0';
+                    cJSON_AddStringToObject(resp, "content", "");
                 }
             } else {
                 /* Flush withheld + current piece */
