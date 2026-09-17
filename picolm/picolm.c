@@ -514,6 +514,15 @@ static void benchmark_context_scaling(const char *model_path, const char *base_p
         uint64_t seed, int num_threads, int do_prefault) {
 
     fprintf(stderr, "Loading model '%s'...\n", model_path);
+
+    /* Resolve thread count: if not specified, auto-detect physical cores */
+    if (num_threads <= 0) {
+        num_threads = tensor_default_threads();
+    }
+
+    /* Enable prefaulting before model load (affects mmap_file in model_load) */
+    model_set_prefault(do_prefault);
+
     model_t model;
     if (model_load(&model, model_path, ctx_size_limit,
             KV_CACHE_F16, KV_CACHE_F16, 0, 0, num_threads) != 0) {
@@ -523,6 +532,11 @@ static void benchmark_context_scaling(const char *model_path, const char *base_p
 
     /* Use the model's GGUF context length if -c was not specified */
     int ctx = ctx_size_limit > 0 ? ctx_size_limit : model.config.max_seq_len;
+
+    /* Initialize threading infrastructure (was missing, causing 1-thread fallback) */
+    tensor_set_threads(num_threads);
+    tensor_threadpool_init(num_threads);
+    fprintf(stderr, "Benchmark: using %d threads\n", num_threads);
 
     fprintf(stderr, "Loading tokenizer...\n");
     tokenizer_t tokenizer;
@@ -555,6 +569,13 @@ static void benchmark_context_scaling(const char *model_path, const char *base_p
     /* Init sampler */
     sampler_t sampler;
     sampler_init(&sampler, temperature, 0.95f, top_k, 0.05f, seed);
+
+    /* Truncate base prompt if it exceeds context size */
+    if (n_base > ctx) {
+        fprintf(stderr, "Truncating base prompt from %d to %d tokens to fit context %d\n",
+                n_base, ctx, ctx);
+        n_base = ctx;
+    }
 
     /* Allocate prompt buffer (grows as context grows) */
     int *prompt_tokens = malloc(ctx * sizeof(int));
