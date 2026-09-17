@@ -4708,7 +4708,7 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
                   free(buf);
                 }
             }
-            if(1){
+            if(_SSM_DBG){
                 picolm_gpu_sync(gpu_dev);
                 float lt8[8];picolm_gpu_memcpy(lt8,bx+(size_t)(n_ubatch-1)*xb_stride,32,-1,gpu_dev);
                 fprintf(stderr,"[DBG GPU l=%d] bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n",l,lt8[0],lt8[1],lt8[2],lt8[3]);}

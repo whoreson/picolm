@@ -1366,41 +1366,47 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
     if (picolm_gpu_tensor_upload(&gl->name, lw->name, lw->type ## _ ## name, (I), (O), device)) uploaded++; \
 } while(0)
 
-                /* Attention Q: [q_dim, n_embd] for dense, [q_full_dim, n_embd] for SSM attn */
-                attempted++;
-                { int qo = (c->has_ssm && lw->is_attn_layer) ? q_dim * 2 : q_dim;
-                  if (picolm_gpu_tensor_upload(&gl->attn_q,
-                          lw->attn_q, lw->type_attn_q, c->n_embd, qo, device)) uploaded++; }
-                /* Attention K: [kv_dim, n_embd] */
-                attempted++;
-                if (picolm_gpu_tensor_upload(&gl->attn_k,
-                        lw->attn_k, lw->type_attn_k, c->n_embd, kv_dim, device)) uploaded++;
-                /* Attention V: [kv_dim, n_embd] */
-                attempted++;
-                if (picolm_gpu_tensor_upload(&gl->attn_v,
-                        lw->attn_v, lw->type_attn_v, c->n_embd, kv_dim, device)) uploaded++;
-                /* Attention O: [n_embd, q_dim] */
-                attempted++;
-                if (picolm_gpu_tensor_upload(&gl->attn_output,
-                        lw->attn_output, lw->type_attn_output, q_dim, c->n_embd, device)) uploaded++;
+                /* Attention Q/K/V/O: only exist for attention layers.
+                 * SSM layers (!is_attn_layer) have attn_qkv fused instead. */
+                if (lw->is_attn_layer || !c->has_ssm) {
+                    /* Attention Q: [q_dim, n_embd] for dense, [q_full_dim, n_embd] for SSM attn */
+                    attempted++;
+                    { int qo = (c->has_ssm && lw->is_attn_layer) ? q_dim * 2 : q_dim;
+                      if (picolm_gpu_tensor_upload(&gl->attn_q,
+                              lw->attn_q, lw->type_attn_q, c->n_embd, qo, device)) uploaded++; }
+                    /* Attention K: [kv_dim, n_embd] */
+                    attempted++;
+                    if (picolm_gpu_tensor_upload(&gl->attn_k,
+                            lw->attn_k, lw->type_attn_k, c->n_embd, kv_dim, device)) uploaded++;
+                    /* Attention V: [kv_dim, n_embd] */
+                    attempted++;
+                    if (picolm_gpu_tensor_upload(&gl->attn_v,
+                            lw->attn_v, lw->type_attn_v, c->n_embd, kv_dim, device)) uploaded++;
+                    /* Attention O: [n_embd, q_dim] */
+                    attempted++;
+                    if (picolm_gpu_tensor_upload(&gl->attn_output,
+                            lw->attn_output, lw->type_attn_output, q_dim, c->n_embd, device)) uploaded++;
+                }
                 /* GPT-2 fused QKV: [3*dim, dim] */
                 if (c->is_gpt2 && lw->attn_qkv) {
                     attempted++;
                     if (picolm_gpu_tensor_upload(&gl->attn_qkv,
                             lw->attn_qkv, lw->type_attn_qkv, c->n_embd, 3*c->n_embd, device)) uploaded++;
                 }
-                /* FFN gate: [n_ffn, n_embd] */
-                attempted++;
-                if (picolm_gpu_tensor_upload(&gl->ffn_gate,
-                        lw->ffn_gate, lw->type_ffn_gate, c->n_embd, c->n_ffn, device)) uploaded++;
-                /* FFN up: [n_ffn, n_embd] */
-                attempted++;
-                if (picolm_gpu_tensor_upload(&gl->ffn_up,
-                        lw->ffn_up, lw->type_ffn_up, c->n_embd, c->n_ffn, device)) uploaded++;
-                /* FFN down: [n_embd, n_ffn] */
-                attempted++;
-                if (picolm_gpu_tensor_upload(&gl->ffn_down,
-                        lw->ffn_down, lw->type_ffn_down, c->n_ffn, c->n_embd, device)) uploaded++;
+                /* FFN gate/up/down: only upload if weight pointer exists.
+                 * SSM layers may or may not have FFN. */
+                if (lw->ffn_gate) {
+                    attempted++;
+                    if (picolm_gpu_tensor_upload(&gl->ffn_gate,
+                            lw->ffn_gate, lw->type_ffn_gate, c->n_embd, c->n_ffn, device)) uploaded++; }
+                if (lw->ffn_up) {
+                    attempted++;
+                    if (picolm_gpu_tensor_upload(&gl->ffn_up,
+                            lw->ffn_up, lw->type_ffn_up, c->n_embd, c->n_ffn, device)) uploaded++; }
+                if (lw->ffn_down) {
+                    attempted++;
+                    if (picolm_gpu_tensor_upload(&gl->ffn_down,
+                            lw->ffn_down, lw->type_ffn_down, c->n_ffn, c->n_embd, device)) uploaded++; }
                 /* SSM layer tensors (Qwen3.5) */
                 if (!lw->is_attn_layer && c->has_ssm) {
                     int conv_dim = 2 * c->ssm_d_state * c->ssm_n_group + c->ssm_d_inner;
@@ -1472,22 +1478,23 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                  * QK-norm layers in attention-only layers are handled by GPU RMSNorm (no veto). */
                 {
                     int eligible = 1;
+                    int el_reason = 0;
                     /* rope_type 0 (Llama pairwise) and 1 (Qwen2 interleaved)
                      * are both supported now (b67b1df) -- this used to be
                      * a hard veto on anything but 0, stale since that fix. */
-                    if (c->rope_type != 0 && c->rope_type != 1 && c->rope_type != -1) eligible = 0;
-                    /* F16 KV cache only */
-                    if (kv_type_k != KV_CACHE_F16 || kv_type_v != KV_CACHE_F16) eligible = 0;
+                    if (c->rope_type != 0 && c->rope_type != 1 && c->rope_type != -1) { eligible = 0; el_reason = 1; }
+                    /* F16 KV cache only -- GPU attention kernels read std430 F16 from KV cache */
+                    if (kv_type_k != KV_CACHE_F16 || kv_type_v != KV_CACHE_F16) { eligible = 0; el_reason = 2; }
                     /* SSM models: enable GPU pipeline.
                      * Q+gate de-interleave race condition is fixed.
                      * Recurrence kernel matches NEON order. */
                     if (c->has_ssm) {
-                        if (c->ssm_d_state <= 0 || c->ssm_d_state > 256) eligible = 0;
-                        if (c->ssm_dt_rank <= 0) eligible = 0;
-                        if (c->ssm_n_group <= 0) eligible = 0;
-                        if (c->ssm_d_inner <= 0) eligible = 0;
-                        if (c->ssm_d_conv <= 1) eligible = 0;
-                        if (eligible && c->ssm_d_inner % c->ssm_dt_rank != 0) eligible = 0;
+                        if (c->ssm_d_state <= 0 || c->ssm_d_state > 256) { eligible = 0; el_reason = 3; }
+                        if (c->ssm_dt_rank <= 0) { eligible = 0; el_reason = 4; }
+                        if (c->ssm_n_group <= 0) { eligible = 0; el_reason = 5; }
+                        if (c->ssm_d_inner <= 0) { eligible = 0; el_reason = 6; }
+                        if (c->ssm_d_conv <= 1) { eligible = 0; el_reason = 7; }
+                        if (eligible && c->ssm_d_inner % c->ssm_dt_rank != 0) { eligible = 0; el_reason = 8; }
                     }
 
                     if (eligible) {
@@ -1703,8 +1710,13 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                             fprintf(stderr, "WARN: GPU KV cache allocation failed, falling back to CPU\n");
                         }
                     } else {
-                        fprintf(stderr, "INFO: GPU KV cache disabled (model not eligible: SSM=%d rope=%d)\n",
-                                c->has_ssm, c->rope_type);
+                        const char *reason = "unknown";
+                        if (el_reason == 1) reason = "unsupported rope_type";
+                        else if (el_reason == 2) reason = "KV cache not F16 (GPU attention requires F16 std430)";
+                        else if (el_reason >= 3) reason = "SSM config incompatible with GPU pipeline";
+                        else if (!c->has_ssm) reason = "non-SSM model ineligible";
+                        fprintf(stderr, "INFO: GPU KV cache disabled (%s; SSM=%d rope=%d kv_k=%d kv_v=%d)\n",
+                                reason, c->has_ssm, c->rope_type, kv_type_k, kv_type_v);
                         /* SSM model: upload small SSM F32 weights to device for the GPU kernels
                          * that are already called from ssm_forward().
                          * These are: ssm_a [dt_rank], ssm_dt [dt_rank], ssm_norm [head_v_dim] per layer.
