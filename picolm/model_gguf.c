@@ -589,9 +589,9 @@ int model_list_tensors(const char *path) {
              version, n_metadata, n_tensors);
       APPEND("%-52s %14s %-12s %s\n", "Name", "Shape (rows x cols)", "Type", "Type ID");
       APPEND("%-52s %14s %-12s %s\n", "----", "(outer x inner)", "----", "-------");
-      APPEND("NOTE: GGUF stores dims innermost-first. 2D shapes shown as [num_rows x row_len].\n");
-      APPEND("  For weight tensors: [output_dim x input_dim]. The stored row is contiguous.\n");
-      APPEND("\n");
+      APPEND("%s", "NOTE: GGUF stores dims innermost-first. 2D shapes shown as [num_rows x row_len].\n");
+      APPEND("%s", "  For weight tensors: [output_dim x input_dim]. The stored row is contiguous.\n");
+      APPEND("%s", "\n");
 
       for (uint64_t i = 0; i < n_tensors; i++) {
           gguf_str_t name = read_gguf_string(&r);
@@ -1370,7 +1370,7 @@ int parse_gguf(model_t *m, int max_seq_len) {
         /* Check tensor data is within file bounds */
         size_t row_sz = gguf_type_row_size(qtype, (int)tinfos[i].dims[tinfos[i].n_dims - 1]);
             size_t rows = 1;
-            for (int _d = 0; _d < tinfos[i].n_dims - 1; _d++) rows *= tinfos[i].dims[_d];
+            for (uint32_t _d = 0; _d < tinfos[i].n_dims - 1; _d++) rows *= tinfos[i].dims[_d];
             size_t sz = rows * row_sz;
             if (off + sz > m->splits[si].mmap_size) {
                 fprintf(stderr, "ERROR: tensor '%.*s' data extends beyond file bounds (offset=%lu, size=%lu, file=%lu). Model is corrupted or incomplete.\n",

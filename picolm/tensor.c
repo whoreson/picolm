@@ -906,7 +906,8 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
             fprintf(stderr, "WARN: matmul NULL weight (n=%d d=%d qtype=%d) -> zero output\n", n, d, qtype);
             null_warn = 1;
         }
-        if (out) memset(out, 0, (size_t)d * sizeof(float)); return;
+        if (out) memset(out, 0, (size_t)d * sizeof(float));
+        return;
     }
 #ifdef PICOLM_GPU
     if (gpu_tensor && d > 0 && n > 0 && !getenv("PICOLM_PREFILL_CPU") && !getenv("PICOLM_SSM_PREFILL_CPU")) {
@@ -2487,15 +2488,6 @@ static void q4k_gemm_task(int idx, void *ctxp) {
 }
 #endif /* AVX2+F16C || AVX1 || ARM_NEON for q4k_gemm_ctx_t */
 
-/* Q4_0_8_8 GEMM threading context (not tied to AVX2+F16C/NEON, used under PICOLM_AVX2) */
-typedef struct {
-    int nr, nc, k;
-    const void *w;
-    const void *abuf;
-    float *out;
-    size_t bs;
-} qgemm_q4x8_ctx_t;
-
 static int picolm_sgemm_disabled_tensor(void) {
     static int checked = 0, disabled = 0;
     if (!checked) {
@@ -2505,6 +2497,23 @@ static int picolm_sgemm_disabled_tensor(void) {
     }
     return disabled;
 }
+
+#if defined(PICOLM_AVX2)
+typedef struct {
+    int nr, nc, k;
+    const void *w;
+    const void *abuf;
+    float *out;
+    size_t bs;
+} qgemm_q4x8_ctx_t;
+
+typedef struct {
+    int nr, nc, k;
+    const void *w;
+    const void *abuf;
+    float *out;
+    size_t bs;
+} qgemm_q4ix8_ctx_t;
 
 static void qgemm_q4x8_task(int idx, void *ctxp) {
     qgemm_q4x8_ctx_t *c = (qgemm_q4x8_ctx_t *)ctxp;
@@ -2517,15 +2526,7 @@ static void qgemm_q4x8_task(int idx, void *ctxp) {
      * not be reached when PICOLM_SGEMM=0 (guarded at entry). */
 }
 
-/* Q4I_0_8_8 GEMM threading context (pre-dequantized int8, AVX-512 only) */
-typedef struct {
-    int nr, nc, k;
-    const void *w;
-    const void *abuf;
-    float *out;
-    size_t bs;
-} qgemm_q4ix8_ctx_t;
-
+/* Q4I_0_8_8 task (struct now in PICOLM_AVX2 block above) */
 static void qgemm_q4ix8_task(int idx, void *ctxp) {
     qgemm_q4ix8_ctx_t *c = (qgemm_q4ix8_ctx_t *)ctxp;
     if (!picolm_sgemm_disabled_tensor()) {
@@ -2533,6 +2534,7 @@ static void qgemm_q4ix8_task(int idx, void *ctxp) {
         sgemm_q4i_0x8_q8_0x4(c->nr, c->nc, c->k, c->w, c->abuf, c->out, c->bs, idx, nth);
     }
 }
+#endif /* PICOLM_AVX2 */
 
 /* Profiling: per-path timing for matmul_batch (PICOLM_PROFILE=1) */
 #ifdef _MSC_VER
@@ -3251,6 +3253,7 @@ static void dual_q8_row_task(int i, void *ctxp) {
 }
 
 /* Q4_0_8_8 GEMM helpers for dual-batch (used under PICOLM_AVX2, not tied to GCC intrinsics) */
+#if defined(PICOLM_AVX2)
 static void qgemm_q4x8_dual_single(const float *x, int n_batch, int d, int n,
                                     const void *W, float *out)
 {
@@ -3332,6 +3335,7 @@ static void qgemm_q4x8_fallback(const float *x, int n_batch, int d, int n,
             out[b * d + i] = vec_dot(wr, x + b * n, n, qtype);
     }
 }
+#endif /* PICOLM_AVX2 */
 
 void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                         const void *W1, const void *W2,

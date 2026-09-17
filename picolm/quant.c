@@ -3571,31 +3571,6 @@ float vec_dot_iq4_nl_q8_0(const void *vx, const void *wy, int n) {
         const __m128i iq4lut = _mm_loadu_si128((const __m128i *)kvalues_iq4nl);
 
         for (; ib + 1 < nb; ib += 2) {
-            /* Block ib */
-            {
-                const __m128i qs = _mm_loadu_si128((const __m128i *)x[ib].qs);
-                const __m128i q4lo = _mm_and_si128(mask4, qs);
-                const __m128i q4hi = _mm_and_si128(mask4, _mm_srli_epi16(qs, 4));
-                const __m128i qx_lo = _mm_shuffle_epi8(iq4lut, q4lo);
-                const __m128i qx_hi = _mm_shuffle_epi8(iq4lut, q4hi);
-                const __m128i q8b_0 = _mm_loadu_si128((const __m128i *)y[ib].qs);
-                const __m128i q8b_1 = _mm_loadu_si128((const __m128i *)y[ib].qs + 1);
-                const __m128i p16_0 = mul_add_epi8_sse(qx_lo, q8b_0);
-                const __m128i p16_1 = mul_add_epi8_sse(qx_hi, q8b_1);
-            }
-            /* Block ib+1 */
-            {
-                const __m128i qs = _mm_loadu_si128((const __m128i *)x[ib + 1].qs);
-                const __m128i q4lo = _mm_and_si128(mask4, qs);
-                const __m128i q4hi = _mm_and_si128(mask4, _mm_srli_epi16(qs, 4));
-                const __m128i qx_lo = _mm_shuffle_epi8(iq4lut, q4lo);
-                const __m128i qx_hi = _mm_shuffle_epi8(iq4lut, q4hi);
-                const __m128i q8b_0 = _mm_loadu_si128((const __m128i *)y[ib + 1].qs);
-                const __m128i q8b_1 = _mm_loadu_si128((const __m128i *)y[ib + 1].qs + 1);
-                const __m128i p16_0 = mul_add_epi8_sse(qx_lo, q8b_0);
-                const __m128i p16_1 = mul_add_epi8_sse(qx_hi, q8b_1);
-                const __m128i p = _mm_add_epi16(p16_0, p16_1);
-            }
             /* AVX: process 2 blocks at once with 4 accumulators */
             {
                 const __m128i qs1 = _mm_loadu_si128((const __m128i *)x[ib].qs);
@@ -6950,7 +6925,8 @@ void quantize_row_iq4_nl(const float *x, void *dst, int n) {
                     if (al < (float)lut[mid]) hi = mid; else lo = mid + 1;
                 }
                 if (lo > 0 && al - (float)lut[lo-1] < (float)lut[lo] - al) lo--;
-                if (lo < 0) lo = 0; if (lo > 15) lo = 15;
+                if (lo < 0) lo = 0;
+                if (lo > 15) lo = 15;
                 float w = xb[j] * xb[j];
                 float qv = (float)lut[lo] * dtry;
                 err += w * (xb[j] - qv) * (xb[j] - qv);

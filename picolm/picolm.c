@@ -1033,10 +1033,14 @@ int main(int argc, char **argv) {
     int    mem_mb = 0;      /* --mem budget in megabytes (0=disabled) */
     int    do_prefault = 0; /* --prefault (touch all mmap pages at load time) */
     int    gpu_diff = 0;    /* --gpu-diff S I O */
+#ifdef PICOLM_GPU
     int    gpu_diff_S = 32, gpu_diff_I = 512, gpu_diff_O = 1024;
+#endif
     int    do_attn_diff = 0;  /* --gpu-attn-diff n_tok n_heads n_kv_heads head_dim */
     int    do_attn_scalar_diff = 0;  /* --gpu-attn-scalar-diff */
+#ifdef PICOLM_GPU
     int    attn_n_tok = 64, attn_n_heads = 40, attn_n_kv = 8, attn_head_dim = 128;
+#endif
     int    do_benchmark_ctx = 0;  /* --benchmark-ctx */
     int    benchmark_iters = 0;   /* 0=infinite, N=run N times */
     #if !defined(_WIN32) && !defined(PICOLM_DOS)
@@ -1153,12 +1157,14 @@ int main(int argc, char **argv) {
             checkpoint_tail_offset = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--slot-save-path") == 0 && i + 1 < argc) {
             slot_save_path = argv[++i];
+#ifdef PICOLM_GPU
         } else if (strcmp(argv[i], "--gpu-diff") == 0 && i + 3 < argc) {
             gpu_diff = 1;
             gpu_diff_S = atoi(argv[++i]);
             gpu_diff_I = atoi(argv[++i]);
             gpu_diff_O = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--gpu-attn-diff") == 0 && i + 4 < argc) {
+        }
+        else if (strcmp(argv[i], "--gpu-attn-diff") == 0 && i + 4 < argc) {
             do_attn_diff = 1;
             attn_n_tok = atoi(argv[++i]);
             attn_n_heads = atoi(argv[++i]);
@@ -1170,6 +1176,7 @@ int main(int argc, char **argv) {
             attn_n_heads = atoi(argv[++i]);
             attn_n_kv = atoi(argv[++i]);
             attn_head_dim = atoi(argv[++i]);
+#endif
         } else if (strcmp(argv[i], "--benchmark-ctx") == 0) {
             do_benchmark_ctx = 1;
         } else if (strcmp(argv[i], "--ssm-batched") == 0) {

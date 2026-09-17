@@ -104,7 +104,7 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
       if(!g_plumbing_fp){const char *p=getenv("PICOLM_PLUMBING");if(p)g_plumbing_fp=fopen(p,"w");}
       if(g_plumbing_fp && pos==18 && token==496){ /* pos=18, token=" a" (496) */
         fprintf(g_plumbing_fp,"EMB token=%d rms=%.6f first5=%.6f,%.6f,%.6f,%.6f,%.6f\n",token,
-          0,s->x[0],s->x[1],s->x[2],s->x[3],s->x[4]);
+          0.0,s->x[0],s->x[1],s->x[2],s->x[3],s->x[4]);
         double sm=0; for(int i=0;i<dim;i++){double v=s->x[i];sm+=v*v;}
         fprintf(g_plumbing_fp,"EMB rms=%.6f\n",sqrt(sm/dim));
       }}
@@ -664,6 +664,7 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
                     if(fabsf(s->per_layer_post_norm_w[l][i])>maxw){maxw=fabsf(s->per_layer_post_norm_w[l][i]);maxw_i=i;}
                     x2w2 += (double)s->hb[i]*s->hb[i] * s->per_layer_post_norm_w[l][i]*s->per_layer_post_norm_w[l][i];
                 }
+                (void)maxx; (void)maxw; (void)maxx_i; (void)maxw_i; (void)x2w2;
             }
             rmsnorm(s->hb, s->hb, s->per_layer_post_norm_w[l], dim, rms_norm_eps);
 

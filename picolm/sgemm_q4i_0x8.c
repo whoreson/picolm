@@ -288,6 +288,7 @@ int sgemm_q4i_0x8_q8_0x4(int nr, int nc, int k,
 #else
     (void)nr; (void)nc; (void)k; (void)vx; (void)vy;
     (void)s; (void)bs; (void)ith; (void)nth;
+    (void)bp; (void)ap;
     return 0;
 #endif
 }

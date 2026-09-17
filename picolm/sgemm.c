@@ -125,6 +125,7 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
                            const float *B, int ldb, float *C, int ldc,
                            int ith, int nth) {
     const int64_t KN=F32_KN, RM=F32_RM, RN=F32_RN, BN=F32_BN;
+    (void)BN;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
@@ -624,6 +625,7 @@ static void sgemm_f16_f32(int m, int n, int k, const uint16_t *A, int lda,
 #define SGEMM_RN 3
 #define SGEMM_BN 24
     const int64_t KN=8, RM=4, RN=3, BN=24;
+    (void)BN;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
@@ -765,6 +767,7 @@ static void sgemm_f16_f16(int m, int n, int k, const uint16_t *A, int lda,
 #define SGEMM_RN 3
 #define SGEMM_BN 24
     const int64_t KN=8, RM=4, RN=3, BN=24;
+    (void)BN;
     int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
@@ -2905,6 +2908,7 @@ int picolm_sgemm_d(int m, int n, int k_blocks,
                    float *C, int ldc,
                    int Atype,
                    int ith, int nth) {
+    (void)lda; (void)ldb; (void)ldb_d; (void)ldc;
     if (picolm_sgemm_disabled()) return 0;
     if (!A || !B || !B_d || !C) return 0;
     static int traced;

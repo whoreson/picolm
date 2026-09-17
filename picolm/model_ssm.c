@@ -39,10 +39,12 @@ extern bench_layer_cb_t g_bench_cb;
 extern void *g_bench_user_data;
 double get_time_ms(void);
 
+#ifdef PICOLM_GPU
 static void _gpu_bench_emit(int l, int is_prefill, double elapsed_ms, long minflt, long majflt) {
     if (!g_bench_cb) return;
     g_bench_cb(l, is_prefill, elapsed_ms, minflt, majflt, g_bench_user_data);
 }
+#endif
 
 /* SSM verification debug: guarded by compile-time PICOLM_SSM_VERIFY define or runtime env var.
  * When undefined, checks getenv for runtime toggle. */
@@ -3257,6 +3259,11 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
     int bi;
     (void)xb_batch; /* not used: SSM layer uses local ssm_xb buffer */
     (void)start_pos;
+#ifdef PICOLM_GPU
+    /* gpu_lw is used by GPU dispatch blocks below */
+#else
+    (void)gpu_lw;
+#endif
     /* PICOLM_PREFILL_CPU / PICOLM_SSM_PREFILL_CPU: suppress all GPU dispatches.
      * Setting gpu_lw to NULL causes every #ifdef PICOLM_GPU block
      * below to skip GPU kernels and use CPU fallbacks. */

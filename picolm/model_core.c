@@ -3200,6 +3200,7 @@ int model_unlock_layers(model_t *m) {
  * Batched GPT-2 prefill
  * ================================================================ */
 static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt) {
+    (void)interrupt;
     model_config_t *c = &m->config;
     model_weights_t *w = &m->weights;
     run_state_t *s = &m->state;
@@ -3775,10 +3776,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
               int lt=n_tokens-1; double qr=0;for(int _i=0;_i<q_dim;_i++)qr+=q_batch[lt*q_full_dim+_i]*q_batch[lt*q_full_dim+_i];
               fprintf(stderr,"[DBG CPU attn_Q l=%d] last_token_rms=%.6f\n",l,sqrt(qr/q_dim));}
         }
-        /* NGL debug: dump Q projection output for first 3 GPU layers */
-        {
-            const char *ngl_env = getenv("PICOLM_NGL");
-        }
+        /* NGL debug: dump Q projection output for first 3 GPU layers (stub) */
         tensor_set_repacked(NULL);
 
         /* For Qwen3.5: de-interleave per-head Q+gate into block layout.
