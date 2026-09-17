@@ -19,3 +19,4 @@ probes/metal_matmul_bench
 .nfs*
 real
 *.spv
+*.o.dos

@@ -20,7 +20,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
+#endif
 #include "quant.h"
 
 /* ============================================================
@@ -57,9 +59,11 @@ static inline __m512i dpbusd_512(const __m512i acc, const __m512i x, const __m51
 }
 #endif
 
+#if defined(__AVX2__)
 static inline __m256 fp16x8_to_fp32(const uint16_t *d) {
     return _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)d));
 }
+#endif
 
 #if defined(__AVX512F__)
 static inline __m512 fp16x16_to_fp32(const uint16_t *d0, const uint16_t *d1) {
