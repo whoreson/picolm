@@ -37,10 +37,13 @@ void fp16_table_init(void) {
 
 /* Fast lookup-based FP16->FP32 conversion */
 float fp16_to_fp32_lookup(uint16_t h) {
-#ifdef PICOLM_NEON
+#ifdef PICOLM_NEON_AARCH64
     __fp16 tmp;
     memcpy(&tmp, &h, 2);
     return (float)tmp;
+#elif defined(PICOLM_NEON)
+    /* 32-bit ARM: no __fp16 type, use lookup table */
+    return fp16_to_fp32_table[h];
 #else
     return fp16_to_fp32_table[h];
 #endif
@@ -180,12 +183,13 @@ void dequantize_row_bf16(const void *src, float *dst, int n) {
 }
 
 uint16_t fp32_to_fp16(float f) {
-#ifdef PICOLM_NEON
+#ifdef PICOLM_NEON_AARCH64
     __fp16 tmp = f;
     uint16_t res;
     memcpy(&res, &tmp, 2);
     return res;
 #else
+    /* 32-bit ARM and non-NEON: software conversion */
     uint32_t bits;
     memcpy(&bits, &f, sizeof(float));
 
@@ -681,11 +685,17 @@ void dequantize_row_f16(const void *src, float *dst, int n) {
         float32x4_t xf = vcvt_f32_f16(hf);
         vst1q_f32(dst + i, xf);
     }
+#ifdef PICOLM_NEON_AARCH64
     __fp16 tmp;
     for (; i < n; i++) {
         memcpy(&tmp, &fp16[i], 2);
         dst[i] = (float)tmp;
     }
+#else
+    for (; i < n; i++) {
+        dst[i] = fp16_to_fp32_lookup(fp16[i]);
+    }
+#endif
 #else
     for (int i = 0; i < n; i++) {
         dst[i] = fp16_to_fp32_lookup(fp16[i]);

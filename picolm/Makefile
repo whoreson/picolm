@@ -193,9 +193,15 @@ grammar.o: grammar.c grammar.h
 static:
 	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -msse2 -DPICOLM_SSE2" LDFLAGS="$(LDFLAGS) -static"
 
-# --- Pi 3/4/5 (64-bit ARM with NEON SIMD) ---
+# --- Pi 3/4/5 (ARM with NEON SIMD) ---
+# -mfpu=neon-vfpv4 needed on 32-bit ARM (Pi 3). 64-bit ARM ignores it, so
+# we detect the target arch at build time.
 pi:
-	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=armv8-a+simd -DPICOLM_NEON"
+	@pi_arch=$$($(CC) -dumpmachine); \
+	neon_flags="-march=armv8-a+simd -DPICOLM_NEON"; \
+	case "$$pi_arch" in *armv7*) neon_flags="$$neon_flags -mfpu=neon-vfpv4";; esac; \
+	echo "  PI_ARCH $$pi_arch"; \
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) $$neon_flags"
 
 # --- Pi Zero / Pi 1 (32-bit ARM) ---
 pi-arm32: CC = arm-linux-gnueabihf-gcc

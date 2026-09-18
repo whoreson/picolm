@@ -62,30 +62,123 @@ void fp16_table_init(void);
 #endif
 
 /* --- ARM NEON --- */
-/* Guard against CUDA device compilation: nvcc cannot handle arm_neon.h */
-#if (defined(__ARM_NEON) || defined(__ARM_NEON__)) && !defined(__CUDACC__)
+/* Guard against CUDA device compilation: nvcc cannot handle arm_neon.h.
+ * __ARM_NEON/__ARM_NEON__ is auto-defined by the compiler when NEON is
+ * enabled (64-bit ARM always, 32-bit ARM requires -mfpu=neon or
+ * -march=armv8-a+simd).  PICOLM_NEON may also be manually defined via
+ * -DPICOLM_NEON (e.g. make pi), in which case we still need the header.
+ *
+ * On aarch64, all NEON intrinsics are available (including FP16 vector
+ * load/store/convert via the base ISA).  On 32-bit ARM (armv7), NEON is
+ * available but lacks __fp16 type, float16x4_t, vld1_f16, vcvt_f32_f16,
+ * vaddvq_f32, vaddvq_s32, vmaxvq_f32, vcvtnq_s32_f32, vmull_high_s8.
+ * PICOLM_NEON_AARCH64 is defined when we have the full aarch64 NEON set. */
+#if (defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(PICOLM_NEON)) && !defined(__CUDACC__)
 #  define PICOLM_NEON 1
 #  include <arm_neon.h>
+#  ifdef __aarch64__
+#    define PICOLM_NEON_AARCH64 1
+#  endif
 static inline float vaddvq_f32_compat(float32x4_t v) {
-#  if defined(__aarch64__)
+#  ifdef PICOLM_NEON_AARCH64
     return vaddvq_f32(v);
 #  else
     float32x2_t r = vadd_f32(vget_low_f32(v), vget_high_f32(v));
     return vget_lane_f32(vpadd_f32(r, r), 0);
 #  endif
 }
-#endif
 
-/* --- ARM NEON detection --- */
-#if (defined(__ARM_NEON) || defined(__ARM_NEON__)) && !defined(__CUDACC__)
-#  define PICOLM_NEON 1
+/* --- 32-bit ARM NEON compatibility shims --- */
+/* On armv7 (32-bit), several aarch64 NEON intrinsics are missing.
+ * Provide compat wrappers so existing PICOLM_NEON code compiles. */
+#if defined(PICOLM_NEON) && !defined(PICOLM_NEON_AARCH64)
+
+/* Horizontal sum/reduction intrinsics */
+static inline float vaddvq_f32(float32x4_t v) {
+    float32x2_t r = vadd_f32(vget_low_f32(v), vget_high_f32(v));
+    return vget_lane_f32(vpadd_f32(r, r), 0);
+}
+
+static inline int32_t vaddvq_s32(int32x4_t v) {
+    int32x2_t r = vpadd_s32(vget_low_s32(v), vget_high_s32(v));
+    return vget_lane_s32(vpadd_s32(r, r), 0);
+}
+
+static inline float vmaxvq_f32(float32x4_t v) {
+    float32x2_t r = vmax_f32(vget_low_f32(v), vget_high_f32(v));
+    float32x2_t r2 = vpmax_f32(r, r);
+    return vget_lane_f32(r2, 0);
+}
+
+/* FP16 vector types and intrinsics (aarch64-only, shim for 32-bit) */
+typedef uint16x4_t float16x4_t;
+typedef uint16_t float16_t;
+
+static inline float16x4_t vld1_f16(const float16_t *p) {
+    return vld1_u16(p);
+}
+
+/* Forward decl: fp16x4_to_fp32_inline defined later in this header */
+static inline float32x4_t fp16x4_to_fp32_inline(const uint16_t *p);
+
+static inline float32x4_t vcvt_f32_f16(float16x4_t v) {
+    uint16_t buf[4]; vst1_u16(buf, v);
+    return fp16x4_to_fp32_inline(buf);
+}
+
+/* vcvtnq_s32_f32: float32x4 -> int32x4 (round-to-nearest, saturate)
+ * On aarch64 this is a single instruction. On 32-bit ARM, emulate using
+ * bit manipulation to avoid FP comparison intrinsics. */
+static inline int32x4_t vcvtnq_s32_f32(float32x4_t v) {
+    /* Extract sign bits, work with absolute values */
+    int32x4_t sign_bits = vreinterpretq_s32_f32(v);
+    int32x4_t abs_bits = vbicq_s32(sign_bits, vdupq_n_s32(0x80000000));
+    float32x4_t absv = vreinterpretq_f32_s32(abs_bits);
+    float32x4_t rounded = vaddq_f32(absv, vdupq_n_f32(0.5f));
+    int32x4_t result = vcvtq_s32_f32(rounded);
+    /* Restore sign: if sign bit was set, negate */
+    int32x4_t negated = vnegq_s32(result);
+    uint32x4_t sign_mask = vreinterpretq_u32_s32(vshrq_n_s32(sign_bits, 31));
+    return vbslq_s32(sign_mask, negated, result);
+}
+
+/* vmull_high_s8: multiply high 8 lanes of two int8x16, return int16x8 */
+static inline int16x8_t vmull_high_s8(int8x16_t a, int8x16_t b) {
+    return vmull_s8(vget_high_s8(a), vget_high_s8(b));
+}
+
+/* vaddl_high_s16: widen-add high 4 lanes of two int16x8, return int32x4 */
+static inline int32x4_t vaddl_high_s16(int16x8_t a, int16x8_t b) {
+    int16x4_t ah = vget_high_s16(a);
+    int16x4_t bh = vget_high_s16(b);
+    int32x4_t sa = vmovl_s16(ah);
+    int32x4_t sb = vmovl_s16(bh);
+    return vaddq_s32(sa, sb);
+}
+
+/* vqtbl1q_u8: 16-wide LUT table lookup
+ * 32-bit ARM has no 16-wide table lookup; use vtbl2_u8 (two 8-byte tables
+ * forming a 16-byte contiguous table) with 8 indices at a time. */
+static inline uint8x16_t vqtbl1q_u8(uint8x16_t lut, uint8x16_t idx) {
+    uint8x8x2_t tbl; tbl.val[0] = vget_low_u8(lut); tbl.val[1] = vget_high_u8(lut);
+    uint8x8_t lo = vtbl2_u8(tbl, vget_low_u8(idx));
+    uint8x8_t hi = vtbl2_u8(tbl, vget_high_u8(idx));
+    return vcombine_u8(lo, hi);
+}
+
+/* Note: __fp16 is NOT shimmed on 32-bit ARM. Code using __fp16 must
+ * guard with #ifdef PICOLM_NEON_AARCH64 or use fp16_to_fp32_lookup(). */
+
+#endif  /* PICOLM_NEON && !PICOLM_NEON_AARCH64 */
+#endif  /* main PICOLM_NEON block */
+
+/* --- ARM NEON feature detection (compiler-only) --- */
 /* Hardware FP16 vector conversion (ARMv8.2-A asimdhp).
  * On older NEON hardware (ARMv8.0/8.1), this path is not available and
  * the scalar fp16_to_fp32 lookup table is used instead. */
-#  if defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
-#    define PICOLM_FP16_HW 1
-#    include <arm_acle.h>
-#  endif
+#if (defined(__ARM_NEON) || defined(__ARM_NEON__)) && defined(__aarch64__) && defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC) && !defined(__CUDACC__)
+#  define PICOLM_FP16_HW 1
+#  include <arm_acle.h>
 #endif
 
 /* FP16 hardware conversion helpers (ARMv8.2-A only) */
@@ -254,6 +347,7 @@ static inline float hsum_neon(float32x4_t v) {
 }
 
 static inline float32x4_t fp16x4_to_fp32_inline(const uint16_t *p) {
+#if defined(__fp16)
     __fp16 h0, h1, h2, h3;
     memcpy(&h0, &p[0], 2); memcpy(&h1, &p[1], 2);
     memcpy(&h2, &p[2], 2); memcpy(&h3, &p[3], 2);
@@ -261,6 +355,13 @@ static inline float32x4_t fp16x4_to_fp32_inline(const uint16_t *p) {
            vsetq_lane_f32((float)h2,
            vsetq_lane_f32((float)h1,
            vdupq_n_f32((float)h0), 1), 2), 3);
+#else
+    /* 32-bit ARM lacks __fp16 type; use scalar lookup table. */
+    return vsetq_lane_f32(fp16_to_fp32_lookup(p[3]),
+           vsetq_lane_f32(fp16_to_fp32_lookup(p[2]),
+           vsetq_lane_f32(fp16_to_fp32_lookup(p[1]),
+           vdupq_n_f32(fp16_to_fp32_lookup(p[0])), 1), 2), 3);
+#endif
 }
 #endif
 
