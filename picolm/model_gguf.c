@@ -362,11 +362,36 @@ static int mmap_one_file(split_mmap_t *s, const char *path) {
      * st_size is a 7.6-exabyte nonsense value that truncates to 0 on 32-bit). */
     struct stat st;
     fstat(fd, &st);
-    s->mmap_size = (size_t)st.st_size;
+    off_t fsize = st.st_size;
+    if (fsize < 0) {
+        fprintf(stderr, "ERROR: cannot stat model file '%s': %s\n", path, strerror(errno));
+        close(fd);
+        return -1;
+    }
+#if defined(__SIZEOF_SIZE_T__) && __SIZEOF_SIZE_T__ < 8
+    /* On 32-bit platforms, size_t is 32-bit. Files larger than ~4 GB
+     * cannot be mmap'd and will silently truncate, causing misleading
+     * "corruption" errors later. Reject them early. */
+    if (fsize > (off_t)0xFFFFFFFF) {
+        fprintf(stderr, "ERROR: model file '%s' is %lld bytes, which exceeds the 32-bit address space limit (~4 GB). "
+                "Use a smaller quantization or a 64-bit OS.\n", path, (long long)fsize);
+        close(fd);
+        return -1;
+    }
+#endif
+    s->mmap_size = (size_t)fsize;
     if (s->mmap_size == 0) {
         off_t off = lseek(fd, 0, SEEK_END);
         if (off > 0) {
             lseek(fd, 0, SEEK_SET);
+#if defined(__SIZEOF_SIZE_T__) && __SIZEOF_SIZE_T__ < 8
+            if (off > (off_t)0xFFFFFFFF) {
+                fprintf(stderr, "ERROR: model file '%s' is %lld bytes (lseek), exceeds 32-bit limit.\n",
+                        path, (long long)off);
+                close(fd);
+                return -1;
+            }
+#endif
             s->mmap_size = (size_t)off;
         }
     }
