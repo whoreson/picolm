@@ -216,6 +216,19 @@ static void skip_meta_value_warn(reader_t *r, uint32_t vtype, const char *key_na
     skip_meta_value(r, vtype, &dummy);
 }
 
+/* RoPE scaling type string -> enum (matches llama.cpp's LLAMA_ROPE_SCALING_TYPE_*).
+ * 0=none, 1=linear, 2=yarn, 3=longrope. Unrecognized strings default to
+ * linear, matching llama.cpp's behavior for forward-compatibility. */
+static int parse_rope_scaling_type(reader_t *r, uint32_t vtype) {
+    if (vtype != GGUF_META_STRING) { int dummy; skip_meta_value(r, vtype, &dummy); return 1; }
+    gguf_str_t s = read_gguf_string(r);
+    if (s.len == 4 && memcmp(s.str, "none", 4) == 0) return 0;
+    if (s.len == 6 && memcmp(s.str, "linear", 6) == 0) return 1;
+    if (s.len == 4 && memcmp(s.str, "yarn", 4) == 0) return 2;
+    if (s.len == 8 && memcmp(s.str, "longrope", 8) == 0) return 3;
+    return 1;
+}
+
 /* Forward declarations for split mmap helpers */
 static int mmap_one_file(split_mmap_t *s, const char *path);
 static int split_path_prefix(char *prefix, size_t maxlen, const char *split_path);
@@ -900,6 +913,19 @@ int parse_gguf(model_t *m, int max_seq_len) {
     cfg->rms_norm_eps = 1e-5f;
     cfg->rope_type = 0;  /* llama pairwise */
     cfg->rope_dim = 0;   /* 0 = use head_dim (default) */
+    /* RoPE scaling defaults (llama.cpp: absent scaling.type => "linear" with
+     * freq_scale=1.0, which is a pure no-op -- identical to vanilla RoPE). */
+    cfg->rope_scaling_type = 1;      /* linear */
+    cfg->rope_freq_scale = 1.0f;
+    cfg->rope_attn_factor = 1.0f;
+    cfg->rope_beta_fast = 32.0f;
+    cfg->rope_beta_slow = 1.0f;
+    cfg->rope_ctx_orig = 0;          /* 0 = resolve to max_seq_len once context_length is known */
+    cfg->rope_yarn_log_mul = 0.0f;
+    cfg->rope_ext_factor = -1.0f;    /* unset; resolved after parsing (1.0 for yarn, 0.0 otherwise) */
+    cfg->rope_yarn_attn_factor = 1.0f;
+    cfg->rope_scaling_alpha = 0.0f;
+    cfg->rope_finetuned = 0;
     cfg->max_seq_len = 2048;
     cfg->weight_type = GGUF_TYPE_F16;
     cfg->n_layer_sparsity = 0;
@@ -1030,6 +1056,97 @@ int parse_gguf(model_t *m, int max_seq_len) {
                  * use head_dim for RoPE in model_forward(). Reset to 0 so the
                  * (c->rope_dim > 0) ? c->rope_dim : head_dim fallback gives head_dim. */
                 cfg->rope_dim = 0;
+            } else {
+                skip_meta_value_warn(&r, vtype, key.str);
+            }
+        /* ---- RoPE scaling metadata (linear / YaRN / LongRoPE) ----
+         * %s is one of: llama, qwen2, qwen3, qwen35, qwen35moe, gemma3n. */
+        } else if (str_eq(key, "llama.rope.scaling.type")
+            || str_eq(key, "qwen2.rope.scaling.type") || str_eq(key, "qwen3.rope.scaling.type")
+            || str_eq(key, "qwen35.rope.scaling.type") || str_eq(key, "qwen35moe.rope.scaling.type")
+            || str_eq(key, "gemma3n.rope.scaling.type")) {
+            cfg->rope_scaling_type = parse_rope_scaling_type(&r, vtype);
+        } else if (str_eq(key, "llama.rope.scaling.factor")
+            || str_eq(key, "qwen2.rope.scaling.factor") || str_eq(key, "qwen3.rope.scaling.factor")
+            || str_eq(key, "qwen35.rope.scaling.factor") || str_eq(key, "qwen35moe.rope.scaling.factor")
+            || str_eq(key, "gemma3n.rope.scaling.factor")) {
+            /* GGUF stores the INVERSE of freq_scale: factor=0.5 => freq_scale=2.0 */
+            if (vtype == GGUF_META_FLOAT32) {
+                float factor = read_f32(&r);
+                cfg->rope_freq_scale = (factor == 0.0f) ? 1.0f : 1.0f / factor;
+            } else {
+                skip_meta_value_warn(&r, vtype, key.str);
+            }
+        } else if (str_eq(key, "llama.rope.scale_linear") || str_eq(key, "qwen2.rope.scale_linear")) {
+            /* Legacy key, only honored if scaling.factor hasn't already set it */
+            if (vtype == GGUF_META_FLOAT32) {
+                float factor = read_f32(&r);
+                if (cfg->rope_freq_scale == 1.0f) {
+                    cfg->rope_freq_scale = (factor == 0.0f) ? 1.0f : 1.0f / factor;
+                }
+            } else {
+                skip_meta_value_warn(&r, vtype, key.str);
+            }
+        } else if (str_eq(key, "llama.rope.scaling.original_context_length")
+            || str_eq(key, "qwen2.rope.scaling.original_context_length")
+            || str_eq(key, "qwen3.rope.scaling.original_context_length")
+            || str_eq(key, "qwen35.rope.scaling.original_context_length")
+            || str_eq(key, "qwen35moe.rope.scaling.original_context_length")
+            || str_eq(key, "gemma3n.rope.scaling.original_context_length")) {
+            int dummy; cfg->rope_ctx_orig = (uint32_t)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "llama.rope.scaling.attn_factor")
+            || str_eq(key, "qwen2.rope.scaling.attn_factor") || str_eq(key, "qwen3.rope.scaling.attn_factor")) {
+            if (vtype == GGUF_META_FLOAT32) {
+                cfg->rope_attn_factor = read_f32(&r);
+            } else {
+                skip_meta_value_warn(&r, vtype, key.str);
+            }
+        } else if (str_eq(key, "llama.rope.scaling.yarn_ext_factor")
+            || str_eq(key, "qwen2.rope.scaling.yarn_ext_factor") || str_eq(key, "qwen3.rope.scaling.yarn_ext_factor")) {
+            if (vtype == GGUF_META_FLOAT32) {
+                cfg->rope_ext_factor = read_f32(&r);
+            } else {
+                skip_meta_value_warn(&r, vtype, key.str);
+            }
+        } else if (str_eq(key, "llama.rope.scaling.yarn_attn_factor")
+            || str_eq(key, "qwen2.rope.scaling.yarn_attn_factor") || str_eq(key, "qwen3.rope.scaling.yarn_attn_factor")) {
+            if (vtype == GGUF_META_FLOAT32) {
+                cfg->rope_yarn_attn_factor = read_f32(&r);
+            } else {
+                skip_meta_value_warn(&r, vtype, key.str);
+            }
+        } else if (str_eq(key, "llama.rope.scaling.yarn_beta_fast")
+            || str_eq(key, "qwen2.rope.scaling.yarn_beta_fast") || str_eq(key, "qwen3.rope.scaling.yarn_beta_fast")) {
+            if (vtype == GGUF_META_FLOAT32) {
+                cfg->rope_beta_fast = read_f32(&r);
+            } else {
+                skip_meta_value_warn(&r, vtype, key.str);
+            }
+        } else if (str_eq(key, "llama.rope.scaling.yarn_beta_slow")
+            || str_eq(key, "qwen2.rope.scaling.yarn_beta_slow") || str_eq(key, "qwen3.rope.scaling.yarn_beta_slow")) {
+            if (vtype == GGUF_META_FLOAT32) {
+                cfg->rope_beta_slow = read_f32(&r);
+            } else {
+                skip_meta_value_warn(&r, vtype, key.str);
+            }
+        } else if (str_eq(key, "llama.rope.scaling.yarn_log_multiplier")
+            || str_eq(key, "qwen3.rope.scaling.yarn_log_multiplier")) {
+            /* DeepSeek-V2-style mscale special case */
+            if (vtype == GGUF_META_FLOAT32) {
+                cfg->rope_yarn_log_mul = read_f32(&r);
+            } else {
+                skip_meta_value_warn(&r, vtype, key.str);
+            }
+        } else if (str_eq(key, "llama.rope.scaling.alpha")) {
+            /* NTK-aware alpha (XDRoPE); parsed but currently unused */
+            if (vtype == GGUF_META_FLOAT32) {
+                cfg->rope_scaling_alpha = read_f32(&r);
+            } else {
+                skip_meta_value_warn(&r, vtype, key.str);
+            }
+        } else if (str_eq(key, "llama.rope.scaling.finetuned")) {
+            if (vtype == GGUF_META_BOOL) {
+                cfg->rope_finetuned = read_u8(&r) ? 1 : 0;
             } else {
                 skip_meta_value_warn(&r, vtype, key.str);
             }
@@ -1251,6 +1368,16 @@ int parse_gguf(model_t *m, int max_seq_len) {
         } else {
             int dummy; skip_meta_value(&r, vtype, &dummy);
         }
+    }
+
+    /* Resolve YaRN original context length: if the GGUF didn't give an
+     * explicit "*.rope.scaling.original_context_length", default to the
+     * model's own trained context length (n_ctx_train), matching
+     * llama-hparams.h. This must happen BEFORE the -c/--ctx-size override
+     * below, since that overrides max_seq_len to whatever the user wants
+     * to run at (often larger, when the whole point is context extension). */
+    if (cfg->rope_ctx_orig == 0) {
+        cfg->rope_ctx_orig = (uint32_t)cfg->max_seq_len;
     }
 
     /* Apply user-specified context length override (-c option) */
@@ -1548,6 +1675,14 @@ int parse_gguf(model_t *m, int max_seq_len) {
                     lw->ffn_down = ptr; lw->type_ffn_down = qtype;
                 } else if (strcmp(suffix, "ffn_up.weight") == 0) {
                     lw->ffn_up = ptr; lw->type_ffn_up = qtype;
+                }
+                /* LongRoPE per-dimension frequency factors, F32 [n_rot/2] */
+                else if (strcmp(suffix, "rope_factors_long.weight") == 0) {
+                    lw->rope_factors_long = ptr;
+                } else if (strcmp(suffix, "rope_factors_short.weight") == 0) {
+                    lw->rope_factors_short = ptr;
+                } else if (strcmp(suffix, "rope_freqs.weight") == 0) {
+                    lw->rope_freqs = ptr;
                 }
                 /* MoE tensors (qwen35moe) */
                 else if (strcmp(suffix, "ffn_gate_exps.weight") == 0) {

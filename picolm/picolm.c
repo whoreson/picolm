@@ -262,6 +262,15 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -j <int>       Number of threads (default: auto-detect physical cores)\n");
     fprintf(stderr, "  --mem <MB>      Pin this many MB of layers in RAM (mlock)\n");
     fprintf(stderr, "  --prefault      Prefault all model pages into RAM at load time\n");
+    fprintf(stderr, "\nRoPE scaling options (context extension, matches llama.cpp flags):\n");
+    fprintf(stderr, "  --rope-scaling <type> RoPE type: none, linear, yarn (default: from model)\n");
+    fprintf(stderr, "  --rope-freq-scale N   RoPE freq scale (0=auto; 0.5 = 2x context)\n");
+    fprintf(stderr, "  --rope-freq-base N    RoPE base frequency (0=from model)\n");
+    fprintf(stderr, "  --yarn-ext-factor N   YaRN extrapolation mix factor (default: from model)\n");
+    fprintf(stderr, "  --yarn-attn-factor N  YaRN attention magnitude (default: from model)\n");
+    fprintf(stderr, "  --yarn-beta-fast N    YaRN low correction dim (default: from model)\n");
+    fprintf(stderr, "  --yarn-beta-slow N    YaRN high correction dim (default: from model)\n");
+    fprintf(stderr, "  --yarn-orig-ctx N     YaRN original context size (default: from model)\n");
     fprintf(stderr, "\nServer options:\n");
     fprintf(stderr, "  --server <model> Start HTTP server (OpenAI-compatible)\n");
     fprintf(stderr, "  --port <int>     Server port (default: 8080)\n");
@@ -1032,6 +1041,8 @@ int main(int argc, char **argv) {
     int    v_cache_hadamard = 0;  /* -vhad: Walsh-Hadamard rotation for V cache */
     int    mem_mb = 0;      /* --mem budget in megabytes (0=disabled) */
     int    do_prefault = 0; /* --prefault (touch all mmap pages at load time) */
+    rope_cli_overrides_t rope_ov;
+    memset(&rope_ov, 0, sizeof(rope_ov));
     int    gpu_diff = 0;    /* --gpu-diff S I O */
 #ifdef PICOLM_CUDA
     int    gpu_diff_S = 32, gpu_diff_I = 512, gpu_diff_O = 1024;
@@ -1134,6 +1145,34 @@ int main(int argc, char **argv) {
             mem_mb = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--prefault") == 0) {
             do_prefault = 1;
+        } else if (strcmp(argv[i], "--rope-scaling") == 0 && i + 1 < argc) {
+            const char *t = argv[++i];
+            rope_ov.set_type = 1;
+            if (strcmp(t, "none") == 0) rope_ov.type = 0;
+            else if (strcmp(t, "linear") == 0) rope_ov.type = 1;
+            else if (strcmp(t, "yarn") == 0) rope_ov.type = 2;
+            else { fprintf(stderr, "Unknown --rope-scaling: %s (use none, linear, yarn)\n", t); return 1; }
+        } else if (strcmp(argv[i], "--rope-freq-scale") == 0 && i + 1 < argc) {
+            rope_ov.set_scale = 1;
+            rope_ov.scale = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--rope-freq-base") == 0 && i + 1 < argc) {
+            rope_ov.set_base = 1;
+            rope_ov.base = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--yarn-ext-factor") == 0 && i + 1 < argc) {
+            rope_ov.set_ext_factor = 1;
+            rope_ov.ext_factor = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--yarn-attn-factor") == 0 && i + 1 < argc) {
+            rope_ov.set_attn_factor = 1;
+            rope_ov.attn_factor = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--yarn-beta-fast") == 0 && i + 1 < argc) {
+            rope_ov.set_beta_fast = 1;
+            rope_ov.beta_fast = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--yarn-beta-slow") == 0 && i + 1 < argc) {
+            rope_ov.set_beta_slow = 1;
+            rope_ov.beta_slow = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--yarn-orig-ctx") == 0 && i + 1 < argc) {
+            rope_ov.set_orig_ctx = 1;
+            rope_ov.orig_ctx = (uint32_t)atoi(argv[++i]);
         } else if ((strcmp(argv[i], "-ctk") == 0 || strcmp(argv[i], "-ctv") == 0) && i + 1 < argc) {
             const char *typestr = argv[++i];
             kv_cache_type_t *tgt = (strcmp(argv[i-1], "-ctk") == 0) ? &kv_type_k : &kv_type_v;
@@ -1214,6 +1253,11 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
+
+    /* Register RoPE scaling CLI overrides (if any were given) before any
+     * code path that calls model_load()/model_load_safetensors() below,
+     * including --benchmark-ctx's own separate model_load() call. */
+    model_set_rope_overrides(&rope_ov);
 
     /* --gpu-attn-diff: attention kernel diff test (FA2 vs scalar) */
 #ifdef PICOLM_GPU

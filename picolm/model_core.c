@@ -320,36 +320,202 @@ void model_prefault(model_t *m) {
 }
 
 
-/* ---- Pre-compute RoPE cos/sin lookup tables ---- */
+/* ---- RoPE scaling: CLI override plumbing ----
+ * picolm.c (and any other frontend) calls model_set_rope_overrides() with
+ * whatever the user gave on the command line before calling model_load().
+ * model_load() applies these on top of the GGUF-derived config before the
+ * RoPE tables are built. Kept as a small global (like g_do_prefault above)
+ * rather than threading extra params through model_load()'s signature,
+ * which every caller (server.c, benchmark harnesses, safetensors loader)
+ * would otherwise need to be updated for. */
+static rope_cli_overrides_t g_rope_overrides;
+static int g_rope_overrides_set = 0;
 
-static void init_rope_tables(run_state_t *s, const model_config_t *c) {
+void model_set_rope_overrides(const rope_cli_overrides_t *ov) {
+    g_rope_overrides = *ov;
+    g_rope_overrides_set = 1;
+}
+
+/* Apply CLI overrides on top of whatever parse_gguf() (or the safetensors
+ * config loader) already populated. Must run before init_rope_tables().
+ * Not static: also called from safetensors.c's model_load_safetensors(). */
+void apply_rope_cli_overrides(model_config_t *cfg) {
+    if (!g_rope_overrides_set) return;
+    const rope_cli_overrides_t *ov = &g_rope_overrides;
+
+    if (ov->set_type) {
+        cfg->rope_scaling_type = ov->type;
+        /* --rope-type none: force pure vanilla RoPE regardless of what the
+         * model's own metadata (or --rope-scale) says. */
+        if (ov->type == 0) cfg->rope_freq_scale = 1.0f;
+    }
+    if (ov->set_base && ov->base != 0.0f)   cfg->rope_freq_base = ov->base;
+    /* --rope-scale 0 means "auto from model" (i.e. leave GGUF value alone). */
+    if (ov->set_scale && ov->scale != 0.0f) cfg->rope_freq_scale = ov->scale;
+    if (ov->set_ext_factor)   cfg->rope_ext_factor = ov->ext_factor;
+    if (ov->set_attn_factor)  cfg->rope_yarn_attn_factor = ov->attn_factor;
+    if (ov->set_beta_fast)    cfg->rope_beta_fast = ov->beta_fast;
+    if (ov->set_beta_slow)    cfg->rope_beta_slow = ov->beta_slow;
+    if (ov->set_orig_ctx)     cfg->rope_ctx_orig = ov->orig_ctx;
+}
+
+/* ---- Pre-compute RoPE cos/sin lookup tables (linear / YaRN / LongRoPE) ----
+ *
+ * Reference: llama.cpp's rope_yarn() (ggml-cpu/ops.cpp) + the context-level
+ * ext_factor/mscale resolution in llama-context.cpp. See rope_scaling_plan.md
+ * sections 2 and 4 for the full derivation.
+ *
+ * scaling_type: 0=none (vanilla RoPE, freq_scale forced to 1.0 by the
+ * resolve step below), 1=linear (freq_scale interpolation only, no ramp),
+ * 2=yarn (interpolation/extrapolation ramp + magnitude scaling),
+ * 3=longrope (same math as yarn, but with per-dimension freq_factors from
+ * GGUF tensors dividing theta before the ramp is applied). */
+
+/* YaRN interpolation ramp: ~1.0 for i0 < 2*low (interpolation zone),
+ * ~0.0 for i0 > 2*high (extrapolation zone), linear in between. */
+static float rope_yarn_ramp(float low, float high, float i0) {
+    float y = (i0 / 2.0f - low) / fmaxf(0.001f, high - low);
+    return 1.0f - fminf(1.0f, fmaxf(0.0f, y));
+}
+
+/* YaRN correction-dimension boundaries: which rotary dimensions are treated
+ * as "low frequency" (interpolated) vs "high frequency" (extrapolated). */
+static void rope_yarn_corr_dims(int n_dims, int n_ctx_orig, float freq_base,
+                                 float beta_fast, float beta_slow, float dims[2]) {
+    const float pi = 3.14159265358979f;
+    float start = floorf((float)n_dims * logf((float)n_ctx_orig / (beta_fast * 2.0f * pi)) / (2.0f * logf(freq_base)));
+    float end   = ceilf((float)n_dims * logf((float)n_ctx_orig / (beta_slow * 2.0f * pi)) / (2.0f * logf(freq_base)));
+    dims[0] = fmaxf(0.0f, start);
+    dims[1] = fminf((float)(n_dims - 1), end);
+}
+
+/* Resolve the effective YaRN ext_factor: user/model value if given (>= 0),
+ * else 1.0 for YaRN, 0.0 for everything else. Type "none" always forces 0. */
+static float resolve_rope_ext_factor(const model_config_t *c) {
+    if (c->rope_scaling_type == 0) return 0.0f;
+    float ext_factor = c->rope_ext_factor;
+    if (ext_factor < 0.0f) ext_factor = (c->rope_scaling_type == 2 || c->rope_scaling_type == 3) ? 1.0f : 0.0f;
+    return ext_factor;
+}
+
+/* Resolve the effective YaRN magnitude scale ("mscale"). This bakes in the
+ * DeepSeek-V2-style yarn_log_multiplier special case and cancels the log
+ * term that rope_yarn() would otherwise apply a second time per-dimension,
+ * so the per-position loop below can just multiply by this single value. */
+static float resolve_rope_mscale(const model_config_t *c, float ext_factor) {
+    float mscale = 1.0f;
+    if (ext_factor != 0.0f && c->rope_freq_scale > 0.0f) {
+        float factor = 1.0f / c->rope_freq_scale;
+        if (factor > 1.0f) {
+            if (c->rope_yarn_log_mul != 0.0f) {
+                /* DeepSeek V2 path: ratio of two get_mscale() evaluations */
+                float m1 = 0.1f * 1.0f * logf(factor) + 1.0f;
+                float m2 = 0.1f * c->rope_yarn_log_mul * logf(factor) + 1.0f;
+                mscale = m1 / m2;
+            } else {
+                mscale = 0.1f * logf(factor) + 1.0f;
+            }
+            /* Cancel the "mscale *= 1 + 0.1*log(1/freq_scale)" that
+             * rope_yarn() applies inline whenever ext_factor != 0. */
+            mscale *= 1.0f / (1.0f + 0.1f * logf(factor));
+        }
+    }
+    mscale *= (c->rope_yarn_attn_factor != 0.0f ? c->rope_yarn_attn_factor : 1.0f);
+    mscale *= (c->rope_attn_factor != 0.0f ? c->rope_attn_factor : 1.0f);
+    return mscale;
+}
+
+/* Shared table builder for both the global and SWA tables. freq_base and
+ * freq_factors are passed explicitly since SWA layers use a different base
+ * (and, in principle, could have their own factors, though no known model
+ * combines SWA with LongRoPE today). */
+static void build_rope_table(float *cos_tbl, float *sin_tbl, const model_config_t *c,
+                              float freq_base, const float *freq_factors,
+                              float ext_factor, float mscale) {
     int rope_dim = (c->rope_dim > 0) ? c->rope_dim : c->head_dim;
     int half_dim = rope_dim / 2;
+    float freq_scale = c->rope_freq_scale;
+
+    float corr_dims[2] = { 0.0f, (float)(rope_dim - 1) };
+    if (ext_factor != 0.0f) {
+        uint32_t n_ctx_orig = c->rope_ctx_orig > 0 ? c->rope_ctx_orig : (uint32_t)c->max_seq_len;
+        rope_yarn_corr_dims(rope_dim, (int)n_ctx_orig, freq_base, c->rope_beta_fast, c->rope_beta_slow, corr_dims);
+    }
+
     for (int pos = 0; pos < c->max_seq_len; pos++) {
-        float *cos_row = s->rope_cos + (size_t)pos * half_dim;
-        float *sin_row = s->rope_sin + (size_t)pos * half_dim;
+        float *cos_row = cos_tbl + (size_t)pos * half_dim;
+        float *sin_row = sin_tbl + (size_t)pos * half_dim;
+
         for (int i = 0; i < half_dim; i++) {
-            float theta = (float)pos / powf(c->rope_freq_base, (float)(2 * i) / (float)rope_dim);
-            cos_row[i] = cosf(theta);
-            sin_row[i] = sinf(theta);
+            /* Computed directly per (pos, i) via powf(), NOT via repeated
+             * multiplication by theta_scale. This is deliberate: with
+             * freq_scale=1.0, ext_factor=0.0, freq_factors=NULL (the
+             * defaults for every model that predates this feature), this
+             * must produce output BIT-IDENTICAL to the original
+             * init_rope_tables(), since existing users may depend on exact
+             * reproducibility for already-deployed models. Incremental
+             * theta accumulation (theta *= theta_scale across i) drifts by
+             * up to ~1e-4 from the direct powf() value by the time i
+             * reaches half_dim -- harmless for model quality, but an
+             * unnecessary and easily avoidable regression since this is a
+             * one-time load-time cost, not a hot loop. */
+            float theta = (float)pos / powf(freq_base, (float)(2 * i) / (float)rope_dim);
+            float ff = freq_factors ? freq_factors[i] : 1.0f;
+            float theta_extrap = (ff != 0.0f) ? theta / ff : theta;
+            float theta_interp = freq_scale * theta_extrap;
+            float theta_final = theta_interp;
+
+            if (ext_factor != 0.0f) {
+                float ramp = rope_yarn_ramp(corr_dims[0], corr_dims[1], (float)(i * 2)) * ext_factor;
+                theta_final = theta_interp * (1.0f - ramp) + theta_extrap * ramp;
+            }
+
+            cos_row[i] = cosf(theta_final) * mscale;
+            sin_row[i] = sinf(theta_final) * mscale;
         }
     }
 }
 
-/* Initialize SWA RoPE tables (Gemma-3n uses freq_base=10000 for SWA layers) */
-static void init_swa_rope_tables(run_state_t *s, const model_config_t *c) {
-    int rope_dim = (c->rope_dim > 0) ? c->rope_dim : c->head_dim;
-    int half_dim = rope_dim / 2;
-    float freq_base_swa = 10000.0f; /* Gemma-3n SWA freq_base */
-    for (int pos = 0; pos < c->max_seq_len; pos++) {
-        float *cos_row = s->rope_cos_swa + (size_t)pos * half_dim;
-        float *sin_row = s->rope_sin_swa + (size_t)pos * half_dim;
-        for (int i = 0; i < half_dim; i++) {
-            float theta = (float)pos / powf(freq_base_swa, (float)(2 * i) / (float)rope_dim);
-            cos_row[i] = cosf(theta);
-            sin_row[i] = sinf(theta);
-        }
+/* Select which per-dimension LongRoPE freq_factors tensor applies, if any.
+ * llama.cpp's rule (llama-model.cpp): the explicit rope_freqs tensor always
+ * wins if present; otherwise pick "long" or "short" factors depending on
+ * whether we're running past the model's original training context.
+ * Factors are duplicated identically across layers in GGUF, so layer 0's
+ * copy is representative. Returns NULL (i.e. "use factor 1.0 everywhere",
+ * a graceful no-op) if the model has no LongRoPE tensors at all. */
+static const float *select_rope_freq_factors(const model_t *m) {
+    const model_config_t *c = &m->config;
+    if (c->rope_scaling_type != 3 /* LONGROPE */ || c->n_layers <= 0) return NULL;
+    const layer_weights_t *lw0 = &m->weights.layers[0];
+    if (lw0->rope_freqs) return (const float *)lw0->rope_freqs;
+    uint32_t n_ctx_orig = c->rope_ctx_orig > 0 ? c->rope_ctx_orig : (uint32_t)c->max_seq_len;
+    if ((uint32_t)c->max_seq_len > n_ctx_orig && lw0->rope_factors_long) {
+        return (const float *)lw0->rope_factors_long;
     }
+    if (lw0->rope_factors_short) return (const float *)lw0->rope_factors_short;
+    if (lw0->rope_factors_long) return (const float *)lw0->rope_factors_long; /* only one provided */
+    fprintf(stderr, "WARN: rope.scaling.type=longrope but model has no rope_freqs/"
+                     "rope_factors_long/rope_factors_short tensors; falling back to plain YaRN\n");
+    return NULL;
+}
+
+static void init_rope_tables(model_t *m, run_state_t *s, const model_config_t *c) {
+    float ext_factor = resolve_rope_ext_factor(c);
+    s->rope_mscale = resolve_rope_mscale(c, ext_factor);
+    s->rope_freq_factors = select_rope_freq_factors(m);
+    build_rope_table(s->rope_cos, s->rope_sin, c, c->rope_freq_base,
+                      s->rope_freq_factors, ext_factor, s->rope_mscale);
+}
+
+/* Initialize SWA RoPE tables (Gemma-3n uses freq_base=10000 for SWA layers).
+ * Scaling parameters (freq_scale, ext_factor, mscale) are shared with the
+ * global tables -- only freq_base differs -- per rope_scaling_plan.md's
+ * "SWA layers" edge case note. */
+static void init_swa_rope_tables(run_state_t *s, const model_config_t *c) {
+    float ext_factor = resolve_rope_ext_factor(c);
+    float freq_base_swa = (c->rope_freq_base_swa > 0.0f) ? c->rope_freq_base_swa : 10000.0f;
+    build_rope_table(s->rope_cos_swa, s->rope_sin_swa, c, freq_base_swa,
+                      s->rope_freq_factors, ext_factor, s->rope_mscale);
 }
 
 /* ---- Buffer allocation ---- */
@@ -1216,8 +1382,11 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
     /* Init tensor scratch */
     tensor_init_scratch(s->dequant_scratch, scratch_dim);
 
-    /* Pre-compute RoPE tables (eliminates powf/cosf/sinf from hot path) */
-    init_rope_tables(s, c);
+    /* Pre-compute RoPE tables (eliminates powf/cosf/sinf from hot path).
+     * init_rope_tables() also resolves YaRN ext_factor/mscale and selects
+     * LongRoPE freq_factors (s->rope_freq_factors), so it must run before
+     * init_swa_rope_tables(), which reuses those resolved values. */
+    init_rope_tables(m, s, c);
     if (c->is_gemma3n) {
         init_swa_rope_tables(s, c);
     }
@@ -1253,6 +1422,12 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
 
     if (mmap_file(m, path) != 0) return -1;
     if (parse_gguf(m, max_seq_len) != 0) return -1;
+
+    /* Apply any --rope-scale/--rope-type/--rope-base/--yarn-* CLI overrides
+     * on top of whatever parse_gguf() read from the model's own metadata,
+     * before anything (allocate_run_state -> init_rope_tables) consumes
+     * these fields. */
+    apply_rope_cli_overrides(&m->config);
 
     if (m->config.n_layers > MAX_LAYERS) {
         fprintf(stderr, "ERROR: model has %d layers, exceeds limit %d\n", m->config.n_layers, MAX_LAYERS);

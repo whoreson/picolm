@@ -50,6 +50,19 @@ typedef struct {
     float rms_norm_eps;   /* RMS norm epsilon (e.g. 1e-5) */
     int rope_type;        /* 0=llama pairwise, 1=qwen2 interleaved */
     int rope_dim;         /* RoPE dimension (default=head_dim) */
+    /* RoPE scaling parameters (from GGUF + optional CLI overrides).
+     * See init_rope_tables() in model_core.c for how these combine. */
+    int rope_scaling_type;      /* 0=none, 1=linear, 2=yarn, 3=longrope */
+    float rope_freq_scale;      /* freq_scale for linear/YaRN (default 1.0) */
+    float rope_attn_factor;     /* Model-level attn magnitude factor (default 1.0) */
+    float rope_beta_fast;       /* YaRN beta_fast (default 32.0) */
+    float rope_beta_slow;       /* YaRN beta_slow (default 1.0) */
+    uint32_t rope_ctx_orig;     /* YaRN original context length (default=n_ctx_train, i.e. max_seq_len as parsed from GGUF) */
+    float rope_yarn_log_mul;    /* YaRN log multiplier (default 0.0; DeepSeek-V2-style mscale) */
+    float rope_ext_factor;      /* YaRN ext_factor (-1.0=unset, resolved to 1.0 for yarn / 0.0 otherwise) */
+    float rope_yarn_attn_factor;/* YaRN attn factor from GGUF/CLI (default 1.0) */
+    float rope_scaling_alpha;   /* NTK-aware alpha (unused; kept for completeness/XDRoPE) */
+    int rope_finetuned;         /* 1 if model was fine-tuned for extended context */
     int alignment;      /* GGUF data alignment */
     gguf_type_t weight_type; /* default weight quantization type */
     /* SSM parameters (Qwen3.5) */
@@ -288,6 +301,12 @@ typedef struct {
     const void *laurel_r;            /* [laurel_rank, n_embd] */
     gguf_type_t type_laurel_r;
     const void *laurel_post_norm;    /* [n_embd] F32 */
+    /* LongRoPE per-dimension frequency factors, F32 [n_rot/2] elements.
+     * rope_freqs takes priority if present; otherwise rope_factors_long is
+     * used when max_seq_len > rope_ctx_orig, else rope_factors_short. */
+    const void *rope_factors_long;
+    const void *rope_factors_short;
+    const void *rope_freqs;
 } layer_weights_t;
 
 typedef struct {
@@ -359,6 +378,12 @@ typedef struct {
     /* SWA-specific RoPE tables (for Gemma-3n, freq_base=10000 vs 1000000) */
     float *rope_cos_swa;
     float *rope_sin_swa;
+    /* LongRoPE: per-dimension freq_factors selected for this run (NULL or
+     * points into layers[0]'s rope_freqs/rope_factors_long/rope_factors_short
+     * tensor data -- these are duplicated identically across layers in GGUF). */
+    const float *rope_freq_factors;
+    /* Final resolved YaRN magnitude scale, applied to cos/sin tables (default 1.0). */
+    float rope_mscale;
 
     /* Pre-dequantized norm weights (small, keep in RAM) */
     float *norm_weights;
@@ -573,6 +598,26 @@ typedef struct {
 #endif
     int _wdbg_done; /* debug flag */
 } model_t;
+
+/* --- RoPE scaling CLI overrides ---
+ * picolm.c populates this from --rope-scale/--rope-type/--rope-base/--yarn-*
+ * and calls model_set_rope_overrides() before model_load(). model_load()
+ * applies the overrides on top of whatever parse_gguf() read from the
+ * model's metadata, before the RoPE tables are built. Each "set_*" flag
+ * says whether the corresponding field was actually given on the command
+ * line (0.0/unset values are otherwise indistinguishable from "not given"). */
+typedef struct {
+    int set_type;         int type;          /* rope_scaling_type: 0=none,1=linear,2=yarn,3=longrope */
+    int set_scale;        float scale;       /* rope_freq_scale (0=auto from model, per usage text) */
+    int set_base;         float base;        /* rope_freq_base override (0=from model) */
+    int set_ext_factor;   float ext_factor;  /* --yarn-ext */
+    int set_attn_factor;  float attn_factor; /* --yarn-attn */
+    int set_beta_fast;    float beta_fast;   /* --yarn-beta-fast */
+    int set_beta_slow;    float beta_slow;   /* --yarn-beta-slow */
+    int set_orig_ctx;     uint32_t orig_ctx; /* --yarn-orig-ctx */
+} rope_cli_overrides_t;
+void model_set_rope_overrides(const rope_cli_overrides_t *ov);
+extern void apply_rope_cli_overrides(model_config_t *cfg);
 
 /* Load a GGUF model file. Returns 0 on success. */
 int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v,

@@ -491,8 +491,26 @@ int model_load_safetensors(model_t *m, const char *model_dir, int max_seq_len, k
     memset(m, 0, sizeof(*m));
     st_state_t st;
 
+    /* memset() above zeroes rope_freq_scale, which would otherwise multiply
+     * every RoPE angle by 0.0 and silently zero out all positional info.
+     * Safetensors configs don't carry YaRN/LongRoPE metadata today, so set
+     * the same "vanilla RoPE, no-op scaling" defaults parse_gguf() uses;
+     * load_config_safetensors() may still override rope_freq_base/rope_dim. */
+    m->config.rope_scaling_type = 1;      /* linear (no-op at scale=1.0) */
+    m->config.rope_freq_scale = 1.0f;
+    m->config.rope_attn_factor = 1.0f;
+    m->config.rope_beta_fast = 32.0f;
+    m->config.rope_beta_slow = 1.0f;
+    m->config.rope_ext_factor = -1.0f;    /* unset */
+    m->config.rope_yarn_attn_factor = 1.0f;
+
     if (load_config_safetensors(model_dir, &m->config) != 0) return -1;
     m->config.max_seq_len = max_seq_len > 0 ? max_seq_len : 4096;
+    if (m->config.rope_ctx_orig == 0) m->config.rope_ctx_orig = (uint32_t)m->config.max_seq_len;
+
+    /* CLI rope-scaling overrides apply here too, same as the GGUF path. */
+    apply_rope_cli_overrides(&m->config);
+
 
     if (load_safetensors_files(model_dir, &st) != 0) return -1;
     if (map_tensors_safetensors(&st, m) != 0) return -1;
