@@ -66,6 +66,38 @@ __device__ static inline float dequant_q2_0(const void *blk, int i) {
     return (float)(v - 1) * d;
 }
 
+/* Q6_0: 32 values in 26 bytes.
+ * Layout: d (fp16), qh[8] (2 high bits per value, packed 4/byte),
+ *         qs[16] (4 low bits per value, 2 per byte).
+ * 6-bit value = (low4 | (high2 << 4)) - 32, then scale by d.
+ * qh[j%8] stores: nibble 0 = high bits for j=0..3, nibble 1 = high bits for j=4..7.
+ * qs[j] stores: low nibble = value j, high nibble = value j+16. */
+__device__ static inline float dequant_q6_0(const void *blk, int i) {
+    const uint8_t *b = (const uint8_t *)blk;
+    uint16_t d_raw = b[0] | ((uint16_t)b[1] << 8);
+    float d = gpu_fp16_to_fp32(d_raw);
+    const uint8_t *qh = b + 2;
+    const uint8_t *qs = b + 10;
+
+    int half;   /* 0 = first half (j=0..15), 1 = second half (j=16..31) */
+    int j;      /* 0..15 within half */
+    if (i < 16) { half = 0; j = i; }
+    else         { half = 1; j = i - 16; }
+
+    /* Extract high 2 bits from qh */
+    int qh_byte = j % 8;
+    int qh_nibble = j / 8;  /* 0 or 1 */
+    uint8_t h = qh[qh_byte] >> (4 * qh_nibble);
+
+    /* Extract low 4 bits from qs */
+    uint8_t v;
+    if (half == 0) v = qs[j] & 0x0F;      /* low nibble */
+    else           v = qs[j] >> 4;         /* high nibble */
+
+    int q = (v | (h << 4)) - 32;
+    return (float)q * d;
+}
+
 /* F16: raw array of uint16_t, each value is an individual FP16 element.
  * No block structure: dequant(i) = gpu_fp16_to_fp32(weights[i]) */
 __device__ static inline float dequant_f16(const void *weights, int i) {

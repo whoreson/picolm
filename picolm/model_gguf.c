@@ -473,6 +473,7 @@ const char *gguf_type_name(uint32_t type) {
         case 41: return "nvfp4";
         case 42: return "q1_0";
         case 43: return "q2_0";
+        case 133: return "q6_0";
         /* ik_llama repacked types */
         case 202: return "q4_0_r8";
         case 208: return "q8_0_r8";

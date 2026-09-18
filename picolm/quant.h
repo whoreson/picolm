@@ -341,6 +341,7 @@ typedef enum {
     GGUF_TYPE_IQ4_NL    = 20,  /* Non-linear 4-bit quant (LUT-based, same layout as Q4_0) */
     GGUF_TYPE_Q1_0       = 41,  /* 1-bit sign + scale, 128 values/block */
     GGUF_TYPE_Q2_0       = 42,  /* 2-bit values + scale, 128 values/block */
+    GGUF_TYPE_Q6_0       = 133, /* 6-bit values + FP16 scale, 32 values/block (legacy GGML) */
 } gguf_type_t;
 
 /* Packed struct attribute: empty on mainstream compilers where #pragma pack works,
@@ -628,6 +629,22 @@ typedef struct PICOLM_PACKED_ATTR {
     uint8_t  qs[32];     /* 128 values * 2 bits each */
 } block_q2_0;            /* 34 bytes */
 
+/* Q6_0 block: 32 weights (6-bit values + FP16 scale, 26 bytes)
+ * Legacy GGML format (GGUF type 133). No SIMD vec_dot exists in upstream.
+ * Layout: half d (scale, F16), uchar qh[8] (5th+6th bits), uchar qs[16] (low 4 bits)
+ * Dequant: each value j (0..31) stored as two halves:
+ *   j0 = j (first half), j1 = j + 16 (second half)
+ *   low4 = qs[j] & 0x0F  |  ((qh[j%8] >> (4*(j/8))) & 0x30)
+ *   low4 = (qs[j] >> 4)  |  ((qh[j%8] >> (4*(j/8)-4)) & 0x30)
+ *   val = (low4 - 32) * d
+ * qh stores the 5th and 6th bits packed: 2 bits per value, 4 values per byte.
+ * d uses LLMAMA-style optimal scale correction (sum(qw*x*q)/sum(qw*q)). */
+typedef struct PICOLM_PACKED_ATTR {
+    uint16_t d;          /* scale (FP16) */
+    uint8_t  qh[8];      /* 5th+6th bits of 32 quants (2 bits each, packed) */
+    uint8_t  qs[16];     /* low 4 bits of 32 quants (nibbles) */
+} block_q6_0;            /* 26 bytes */
+
 #pragma pack(pop)
 
 /* ---- FP16 conversion ---- */
@@ -639,6 +656,7 @@ void dequantize_row_q3_K(const void *src, float *dst, int n);
 void dequantize_row_q2_K(const void *src, float *dst, int n);
 void dequantize_row_q8_0(const void *src, float *dst, int n);
 void dequantize_row_q6_K(const void *src, float *dst, int n);
+void dequantize_row_q6_0(const void *src, float *dst, int n);
 void dequantize_row_q5_K(const void *src, float *dst, int n);
 void dequantize_row_q4_0(const void *src, float *dst, int n);
 void dequantize_row_iq4_nl(const void *src, float *dst, int n);
@@ -660,6 +678,8 @@ size_t gguf_type_row_size(gguf_type_t type, int n);
 /* ---- Fused dot products (dequant + dot in one pass, no scratch buffer) ---- */
 float vec_dot_q4_K_f32(const void *src, const float *x, int n);
 float vec_dot_q6_K_f32(const void *src, const float *x, int n);
+float vec_dot_q6_0_f32(const void *src, const float *x, int n);
+float vec_dot_q6_0_q8_0(const void *src_q6, const void *src_q8, int n);
 float vec_dot_q6_K_q8_K(const void *src_q6, const void *src_q8, int n);
 float vec_dot_f32_f32(const void *src, const float *x, int n);
 float vec_dot_q8_0_f32(const void *src, const float *x, int n);

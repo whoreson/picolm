@@ -325,6 +325,7 @@ static int gguf_block_size(gguf_type_t qtype) {
     case 20: return 18;   /* IQ4_NL: 18 bytes per 32 values (LUT-based, same layout as Q4_0) */
     case 41: return 18;   /* Q1_0: 18 bytes per 128 values */
     case 42: return 34;   /* Q2_0: 34 bytes per 128 values */
+    case 133: return 26;  /* Q6_0: 26 bytes per 32 values (F16 d + 8 qh + 16 qs) */
     default: return 0;
     }
 }

@@ -3,7 +3,7 @@
 // Grid: [ceil(O/32), S, 1], block: [32, 1, 1]
 // Supports: F32(0), F16(1), Q4_0(2), Q5_0(6), Q8_0(8),
 //           Q2_K(10), Q3_K(11), Q4_K(12), Q5_K(13), Q6_K(14),
-//           IQ4_NL(20), Q1_0(41), Q2_0(42)
+//           IQ4_NL(20), Q1_0(41), Q2_0(42), Q6_0(133)
 //
 // STRIDE SAFETY: x_stride/y_stride may differ from I/O (e.g. GPT-2 fused QKV
 // has xb_stride=4800 but dim=1600). If x_stride==0, defaults to I (contiguous).
@@ -419,6 +419,32 @@ void main() {
                     shift += 2;
                     hm <<= 1u;
                 }
+            }
+        }
+    }
+    // ---- Q6_0 (fmt==133): 32 weights, 26 bytes = [d:F16][qh:8xU8][qs:16xU8]
+    //   Legacy GGML format. 6-bit values [0..63], actual = quant - 32.
+    //   qs[j]: low 4 bits of value j (low nibble) and value j+16 (high nibble)
+    //   qh: 5th+6th bits packed: qh[j%8] >> (4*(j/8)) gives h for value j
+    //     h bits 0-1 = high2 of value j, h bits 2-3 = high2 of value j+16
+    else if (p.fmt == 133) {
+        int nblocks = (p.I + 31) / 32;
+        for (int bi = 0; bi < nblocks; bi++) {
+            uint bo = uint(bi) * 26u;
+            float d = f16tof32(read_byte(rowBase, bo) | (read_byte(rowBase, bo+1u) << 8u));
+            uint qh_bo = bo + 2u;
+            uint qs_bo = bo + 10u;
+            for (int j = 0; j < 16; j++) {
+                int jmod = j % 8;
+                int jdiv = j / 8;
+                uint h = read_byte(rowBase, qh_bo + uint(jmod)) >> uint(4 * jdiv);
+                uint bv = read_byte(rowBase, qs_bo + uint(j));
+                int x0 = int((bv & 0x0Fu) | ((h << 4u) & 0x30u)) - 32;
+                int x1 = int((bv >> 4u) | ((h << 2u) & 0x30u)) - 32;
+                int vi0 = bi * 32 + j;
+                int vi1 = bi * 32 + j + 16;
+                if (vi0 < p.I) sum += x[xoff + vi0] * float(x0) * d;
+                if (vi1 < p.I) sum += x[xoff + vi1] * float(x1) * d;
             }
         }
     }

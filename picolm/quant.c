@@ -390,6 +390,38 @@ void dequantize_row_q6_K(const void *src, float *dst, int n) {
     }
 }
 
+/* Q6_0 dequantize: 32 values per block, 6-bit signed [-32..31] + FP16 scale.
+ * Ported from llama.cpp ggml-quants.c dequantize_row_q6_0.
+ *
+ * Each block has 32 values stored as:
+ *   qs[j] (j=0..15): low 4 bits of value j (low nibble) and value j+16 (high nibble)
+ *   qh[j%8]: 5th+6th bits packed 2 bits per value, 4 values per byte
+ *     byte j/4 holds bits for values j, j+1, j+2, j+3 within the 0..7 or 8..15 or 16..23 or 24..31 range
+ *
+ * Dequant formula: val[j] = (full_6bit[j] - 32) * d
+ *   where full_6bit = (low4 | (high2 << 4))
+ */
+void dequantize_row_q6_0(const void *src, float *dst, int n) {
+    const block_q6_0 *blocks = (const block_q6_0 *)src;
+    const int qk = 32;
+    int nb = n / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = fp16_to_fp32_lookup(blocks[i].d);
+        const uint8_t *qs = blocks[i].qs;
+        const uint8_t *qh = blocks[i].qh;
+        float *y = dst + i * qk;
+
+        for (int j = 0; j < qk / 2; ++j) {
+            const uint8_t h = qh[j % (qk / 4)] >> (4 * (j / (qk / 4)));
+            const int32_t x0 = ((qs[j] & 0x0F) | ((h << 4) & 0x30)) - 32;
+            const int32_t x1 = ((qs[j] >> 4)  | ((h << 2) & 0x30)) - 32;
+            y[j]       = x0 * d;
+            y[j + qk / 2] = x1 * d;
+        }
+    }
+}
+
 void dequantize_row_q8_0(const void *src, float *dst, int n) {
     const block_q8_0 *blocks = (const block_q8_0 *)src;
     int nb = n / 32;
@@ -711,6 +743,7 @@ void dequantize_row(const void *src, float *dst, int n, gguf_type_t type) {
         case GGUF_TYPE_Q4I_0_8_8: dequantize_row_q4i_0_8_8(src, dst, n); break;
         case GGUF_TYPE_Q1_0:     dequantize_row_q1_0(src, dst, n); break;
         case GGUF_TYPE_Q2_0:     dequantize_row_q2_0(src, dst, n); break;
+        case GGUF_TYPE_Q6_0:     dequantize_row_q6_0(src, dst, n); break;
         case GGUF_TYPE_IQ4_NL:   dequantize_row_iq4_nl(src, dst, n); break;
         default:
             fprintf(stderr, "dequantize_row: unsupported type %d\n", type);
@@ -744,6 +777,7 @@ int gguf_type_block_size(gguf_type_t type) {
         case GGUF_TYPE_BF16:     return 1;  /* BF16: 1 element per block, 2 bytes each */
         case GGUF_TYPE_Q1_0:     return 128;
         case GGUF_TYPE_Q2_0:     return 128;
+        case GGUF_TYPE_Q6_0:     return 32;
         default: return 0;
     }
 }
@@ -772,6 +806,7 @@ int gguf_type_quant_size(gguf_type_t type) {
         case GGUF_TYPE_BF16:     return 2;  /* BF16: 2 bytes per element */
         case GGUF_TYPE_Q1_0:     return 18;
         case GGUF_TYPE_Q2_0:     return 34;
+        case GGUF_TYPE_Q6_0:     return 26;
         default: return 0;
     }
 }
@@ -1644,6 +1679,56 @@ float vec_dot_q6_K_q8_K(const void *src_q6, const void *src_q8, int n) {
     }
     return sumf;
 #endif
+}
+
+/* ---- vec_dot_q6_0_f32: Q6_0 weights * F32 activations (scalar) ---- */
+float vec_dot_q6_0_f32(const void *src, const float *x, int n) {
+    const block_q6_0 *blocks = (const block_q6_0 *)src;
+    const int qk = 32;
+    int nb = n / qk;
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = fp16_to_fp32_lookup(blocks[i].d);
+        const uint8_t *qs = blocks[i].qs;
+        const uint8_t *qh = blocks[i].qh;
+        const float *xp = x + i * qk;
+
+        for (int j = 0; j < qk / 2; ++j) {
+            const uint8_t h = qh[j % (qk / 4)] >> (4 * (j / (qk / 4)));
+            const int32_t x0 = ((qs[j] & 0x0F) | ((h << 4) & 0x30)) - 32;
+            const int32_t x1 = ((qs[j] >> 4)  | ((h << 2) & 0x30)) - 32;
+            sumf += xp[j] * x0 * d + xp[j + qk / 2] * x1 * d;
+        }
+    }
+    return sumf;
+}
+
+/* ---- vec_dot_q6_0_q8_0: Q6_0 weights * Q8_0 activations ---- */
+float vec_dot_q6_0_q8_0(const void *src_q6, const void *src_q8, int n) {
+    const block_q6_0 *x = (const block_q6_0 *)src_q6;
+    const block_q8_0 *y = (const block_q8_0 *)src_q8;
+    const int qk = 32;
+    int nb = n / qk;
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = fp16_to_fp32_lookup(x[i].d) * fp16_to_fp32_lookup(y[i].d);
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *qh = x[i].qh;
+        const int8_t *q8 = y[i].qs;
+        float block_sum = 0.0f;
+
+        for (int j = 0; j < qk / 2; ++j) {
+            const uint8_t h = qh[j % (qk / 4)] >> (4 * (j / (qk / 4)));
+            const int32_t v0 = (qs[j] & 0x0F) | ((h << 4) & 0x30);
+            const int32_t v1 = (qs[j] >> 4)  | ((h << 2) & 0x30);
+            block_sum += (float)((int32_t)q8[j]       * (int32_t)(v0 - 32)) +
+                         (float)((int32_t)q8[j + qk / 2] * (int32_t)(v1 - 32));
+        }
+        sumf += block_sum * d;
+    }
+    return sumf;
 }
 
 /* ================================================================
@@ -6445,6 +6530,7 @@ float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
             return vec_dot_f32_f32(q5_tmp, x, n5);
         }
         case GGUF_TYPE_Q6_K: return vec_dot_q6_K_f32(src, x, n);
+        case GGUF_TYPE_Q6_0: return vec_dot_q6_0_f32(src, x, n);
         case GGUF_TYPE_F32:  return vec_dot_f32_f32(src, x, n);
         case GGUF_TYPE_Q8_0: return vec_dot_q8_0_f32(src, x, n);
         case GGUF_TYPE_Q4_0: return vec_dot_q4_0_f32(src, x, n);

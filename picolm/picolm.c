@@ -1363,7 +1363,12 @@ int main(int argc, char **argv) {
         sc.viz_port = srv_viz_port;
         sc.viz_width = srv_viz_width;
         sc.viz_height = srv_viz_height;
+        #ifdef PICOLM_SERVER
         return server_main(&sc);
+#else
+        fprintf(stderr, "Server support not compiled in.\n");
+        return 1;
+#endif
     }
 
     if (!prompt) {

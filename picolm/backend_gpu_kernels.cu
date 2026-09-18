@@ -24,6 +24,7 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
         case 41:             bytes_per_block = 18; break;      /* Q1_0 */
         case 42:             bytes_per_block = 34; break;      /* Q2_0 */
         case GGUF_TYPE_IQ4_NL: bytes_per_block = GPU_BLOCK_Q4_0_SIZE; break;  /* IQ4_NL: 18 */
+        case 133:              bytes_per_block = 26; break;                      /* Q6_0: 26 */
         default: bytes_per_block = 18; break;
     }
     int o = gpuBlockIdx_x;
@@ -206,6 +207,20 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
                 for (int j = 0; j < 128; j++) {
                     int i = bi * 128 + j;
                     sum += x[rs*s+i] * dequant_q2_0(blk, j);
+                }
+            }
+        }
+        break;
+
+    case 133: /* GGUF_TYPE_Q6_0 */
+        /* 32 values per block, 26 bytes */
+        {
+            int n_blocks = I / 32;
+            for (int bi = gpuThreadIdx_x; bi < n_blocks; bi += gpuBlockDim_x) {
+                const void *blk = wrow + (size_t)bi * bytes_per_block;
+                for (int j = 0; j < 32; j++) {
+                    int i = bi * 32 + j;
+                    sum += x[rs*s+i] * dequant_q6_0(blk, j);
                 }
             }
         }

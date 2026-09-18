@@ -572,6 +572,7 @@ static size_t gguf_row_bytes(gguf_type_t q, int I) {
         case GGUF_TYPE_Q4_K:   return (size_t)((I + 255) / 256) * 144;
         case GGUF_TYPE_Q5_K:   return (size_t)((I + 255) / 256) * 176;
         case GGUF_TYPE_Q6_K:   return (size_t)((I + 255) / 256) * 210;
+        case GGUF_TYPE_Q6_0:   return (size_t)((I + 31) / 32) * 26;
         case GGUF_TYPE_Q2_K:   return (size_t)((I + 255) / 256) * 84;
         case GGUF_TYPE_Q3_K:   return (size_t)((I + 255) / 256) * 110;
         case GGUF_TYPE_BF16:   return (size_t)I * 2;
