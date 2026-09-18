@@ -20,7 +20,7 @@ endif
 # for ad-hoc audits: make native WARN=1
 CFLAGS_STRICT = -Wshadow -Wdouble-promotion -Wimplicit-fallthrough -Wconversion -Wmisleading-indentation $(WARN_GCC_ONLY) -Wfloat-conversion -Wsign-conversion -Wcast-qual -Wformat-nonliteral
 
-CFLAGS  ?= -O3 -g -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic -fno-common -fopenmp
+CFLAGS  ?= -O3 -g -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic -fno-common -fopenmp -DPICOLM_SERVER
 LDFLAGS = -lm -lpthread -fopenmp
 
 # Windows needs ws2_32 for server mode
