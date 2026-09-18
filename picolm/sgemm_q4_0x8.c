@@ -93,7 +93,7 @@ static inline __m512 fp16x16_to_fp32(const uint16_t *d0, const uint16_t *d1) {
  * 4-bit LUT dequant helpers
  * ============================================================ */
 static inline __m256i build_lut256(void) {
-    __m128i l = _mm_set_epi8(-1,-2,-3,-4,-5,-6,-7,-8,7,6,5,4,3,2,1,0);
+    __m128i l = _mm_set_epi8(0,1,2,3,4,5,6,7,-8,-7,-6,-5,-4,-3,-2,-1);
     return _mm256_permute2f128_si256(_mm256_castsi128_si256(l),
                                      _mm256_castsi128_si256(l), 0);
 }

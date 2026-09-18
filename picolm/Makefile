@@ -715,3 +715,6 @@ test_swa: tests/test_swa.c model_attention.c tensor.c quant.c sgemm.c sgemm_q4_0
 
 gguf_be_swap: util/gguf_be_swap.c
 	$(CC) -O2 -std=c99 -o $@ util/gguf_be_swap.c -lm
+
+gguf_q40_i8_convert: util/gguf_q40_i8_convert.c
+	$(CC) -O2 -std=c99 -o $@ util/gguf_q40_i8_convert.c -lm

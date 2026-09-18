@@ -725,24 +725,6 @@ static void matmul_worker_f(matmul_task_t *t) {
     } else if (t->qtype == GGUF_TYPE_Q4I_0_8_8 && t->x) {
         /* Q4I_0_8_8: process 8 rows at a time from interleaved layout.
          * Same group-boundary arithmetic as Q4_0_8_8: 8 * row_bytes == group size. */
-        static int dbg_count = 0;
-        if (dbg_count < 2 && getenv("PICOLM_Q4I_DBG")) {
-            fprintf(stderr, "[Q4I_VEC_DOT] W=%p x=%p n=%d row_bytes=%zu start=%d end=%d out=%p\n",
-                    (const void*)t->W, (const void*)t->x, t->n, t->row_bytes,
-                    t->start, t->end, (void*)t->out);
-            /* Dump first block's weight data and activation for inspection */
-            const block_q4i_0x8 *dbg_bp = (const block_q4i_0x8 *)(t->W + (size_t)((t->start/8)*8) * t->row_bytes);
-            const block_q8_0 *dbg_ap = (const block_q8_0 *)t->x;
-            fprintf(stderr, "  block0.d[0..3] = %04x %04x %04x %04x\n",
-                    dbg_bp[0].d[0], dbg_bp[0].d[1], dbg_bp[0].d[2], dbg_bp[0].d[3]);
-            fprintf(stderr, "  block0.qs[0..7] = %d %d %d %d %d %d %d %d\n",
-                    dbg_bp[0].qs[0], dbg_bp[0].qs[1], dbg_bp[0].qs[2], dbg_bp[0].qs[3],
-                    dbg_bp[0].qs[4], dbg_bp[0].qs[5], dbg_bp[0].qs[6], dbg_bp[0].qs[7]);
-            fprintf(stderr, "  act.d = %04x, act.qs[0..7] = %d %d %d %d %d %d %d %d\n",
-                    dbg_ap[0].d, dbg_ap[0].qs[0], dbg_ap[0].qs[1], dbg_ap[0].qs[2], dbg_ap[0].qs[3],
-                    dbg_ap[0].qs[4], dbg_ap[0].qs[5], dbg_ap[0].qs[6], dbg_ap[0].qs[7]);
-            dbg_count++;
-        }
         const block_q8_0 *qx = (const block_q8_0 *)t->x;
         int start8 = (t->start / 8) * 8;
         int end8 = (t->end + 7) / 8 * 8;
@@ -1333,7 +1315,19 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
         }
         }
 #endif
-        /* Non-AVX2: fall through to generic vec_dot path */
+        /* Non-AVX2: dedicated Q4_0_8_8 scalar fallback (generic vec_dot path
+         * would compute wrong row pointers since rows share blocks). */
+        {
+        size_t qx_size = (n / 32) * sizeof(block_q8_0);
+        block_q8_0 *qx = (block_q8_0 *)malloc(qx_size);
+        if (qx != NULL) {
+            quantize_row_q8_0(x, qx, n);
+            vec_dot_q4_0x8_q8_0_avx2(wptr, qx, n, out, d);
+            free(qx);
+            return;
+        }
+        }
+        /* If allocation failed, fall through to generic path */
     } else if (qtype == GGUF_TYPE_Q4I_0_8_8) {
         /* Q4I_0_8_8 fast path: pre-dequantized int8 interleaved format.
          * Uses vec_dot_q4i_0x8_q8_0 for 8-row group throughput (portable C). */
@@ -2948,6 +2942,33 @@ void matmul_batch(float *out, const float *x, int n_batch,
         }
     }
 #endif /* PICOLM_AVX2 */
+
+    /* Q4_0_8_8 / Q4I_0_8_8: non-AVX2 fallback (generic path can't handle
+     * interleaved 8-row blocks). Process all rows via the dedicated function. */
+    if ((qtype == GGUF_TYPE_Q4_0_8_8 || qtype == GGUF_TYPE_Q4I_0_8_8) && n_batch > 0 && n > 0) {
+        size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
+        void *qbuf = malloc((size_t)n_batch * q8_rb);
+        if (qbuf) {
+            for (int b = 0; b < n_batch; b++)
+                quantize_row_q8_0(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
+            for (int b = 0; b < n_batch; b++) {
+                const block_q8_0 *qx = (const block_q8_0 *)((char *)qbuf + (size_t)b * q8_rb);
+                if (qtype == GGUF_TYPE_Q4I_0_8_8) {
+                    int d8 = (d / 8) * 8;
+                    size_t rb = gguf_type_row_size(qtype, n);
+                    for (int i = 0; i < d8; i += 8)
+                        vec_dot_q4i_0x8_q8_0((const char *)W + i * rb, qx, n, out + b * d + i, 8);
+                    for (int i = d8; i < d; i++)
+                        out[b * d + i] = vec_dot((const char *)W + i * rb, x + b * n, n, qtype);
+                } else {
+                    vec_dot_q4_0x8_q8_0_avx2(W, qx, n, out + b * d, d);
+                }
+            }
+            free(qbuf);
+            return;
+        }
+    }
+
     /* Same idea, 4-row groups -- this is the format ARM NEON dotprod/SDOT
      * hardware wants. vec_dot_q4_0x4_q8_0 is a plain scalar reference (no
      * SIMD acceleration wired in yet), so unlike the AVX2 kernel above it
@@ -3843,6 +3864,58 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
             }
         }
 
+    /* Q4_0_8_8 / Q4I_0_8_8 require group-of-8 row processing; handle before generic path */
+    int is_q4x8_1 = (qtype1 == GGUF_TYPE_Q4_0_8_8 || qtype1 == GGUF_TYPE_Q4I_0_8_8);
+    int is_q4x8_2 = (qtype2 == GGUF_TYPE_Q4_0_8_8 || qtype2 == GGUF_TYPE_Q4I_0_8_8);
+    if (is_q4x8_1 || is_q4x8_2) {
+        size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
+        void *qx_buf = malloc((size_t)n_batch * q8_rb);
+        if (qx_buf) {
+            for (int b = 0; b < n_batch; b++)
+                quantize_row_q8_0(x + (size_t)b * n, (char *)qx_buf + (size_t)b * q8_rb, n);
+            for (int b = 0; b < n_batch; b++) {
+                const block_q8_0 *qx = (const block_q8_0 *)((char *)qx_buf + (size_t)b * q8_rb);
+                if (is_q4x8_1) {
+                    if (qtype1 == GGUF_TYPE_Q4I_0_8_8) {
+                        int d8 = (d / 8) * 8;
+                        size_t rb1 = gguf_type_row_size(qtype1, n);
+                        for (int i = 0; i < d8; i += 8)
+                            vec_dot_q4i_0x8_q8_0((const char *)W1 + i * rb1,
+                                                 qx, n, out1 + b * d + i, 8);
+                        for (int i = d8; i < d; i++)
+                            out1[b * d + i] = vec_dot((const char *)W1 + i * rb1,
+                                                      x + b * n, n, qtype1);
+                    } else {
+                        vec_dot_q4_0x8_q8_0_avx2(W1, qx, n, out1 + b * d, d);
+                    }
+                } else {
+                    for (int i = 0; i < d; i++)
+                        out1[b * d + i] = vec_dot((const char *)W1 + i * gguf_type_row_size(qtype1, n),
+                                                  x + b * n, n, qtype1);
+                }
+                if (is_q4x8_2) {
+                    if (qtype2 == GGUF_TYPE_Q4I_0_8_8) {
+                        int d8 = (d / 8) * 8;
+                        size_t rb2 = gguf_type_row_size(qtype2, n);
+                        for (int i = 0; i < d8; i += 8)
+                            vec_dot_q4i_0x8_q8_0((const char *)W2 + i * rb2,
+                                                 qx, n, out2 + b * d + i, 8);
+                        for (int i = d8; i < d; i++)
+                            out2[b * d + i] = vec_dot((const char *)W2 + i * rb2,
+                                                      x + b * n, n, qtype2);
+                    } else {
+                        vec_dot_q4_0x8_q8_0_avx2(W2, qx, n, out2 + b * d, d);
+                    }
+                } else {
+                    for (int i = 0; i < d; i++)
+                        out2[b * d + i] = vec_dot((const char *)W2 + i * gguf_type_row_size(qtype2, n),
+                                                  x + b * n, n, qtype2);
+                }
+            }
+            free(qx_buf);
+            return;
+        }
+    }
     /* Q4_0_4_4 and Q4_0_4_8 require group-of-4 row processing; handle before threading check */
     int is_q4x4_1 = (qtype1 == GGUF_TYPE_Q4_0_4_4 || qtype1 == GGUF_TYPE_Q4_0_4_8);
     int is_q4x4_2 = (qtype2 == GGUF_TYPE_Q4_0_4_4 || qtype2 == GGUF_TYPE_Q4_0_4_8);

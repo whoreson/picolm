@@ -622,13 +622,14 @@ void dequantize_row_q4_0_8_8(const void *src, float *dst, int n) {
 
     for (int i = 0; i < nb; i++) {
         float d = fp16_to_fp32_lookup(blocks[i].d[row_in_group]);
-        for (int k = 0; k < 4; k++) {
+        /* Row 0 data: first half in chunk 0 (qs[0..7]), second half in chunk 8 (qs[64..71]) */
+        for (int k = 0; k < 2; k++) {
             for (int j = 0; j < 8; j++) {
-                uint8_t byte = blocks[i].qs[k * 128 + row_in_group * 8 + j];
+                uint8_t byte = blocks[i].qs[k * 64 + row_in_group * 8 + j];
                 int v0 = (int8_t)(byte << 4);
                 int v1 = (int8_t)(byte & 0xF0);
-                dst[i * 32 + k * 8 + j * 2]     = d * (float)(v0 >> 4);
-                dst[i * 32 + k * 8 + j * 2 + 1] = d * (float)(v1 >> 4);
+                dst[i * 32 + k * 16 + j * 2]     = d * (float)(v0 >> 4);
+                dst[i * 32 + k * 16 + j * 2 + 1] = d * (float)(v1 >> 4);
             }
         }
     }
@@ -5997,13 +5998,14 @@ float vec_dot_q4_0_8_8_f32(const void *src, const float *x, int n) {
         float d = fp16_to_fp32_lookup(blocks[i].d[0]);
         const float *xp = x + i * 32;
         float block_sum = 0.0f;
-        for (int k = 0; k < 4; k++) {
+        /* Row 0 data: first 16 vals in chunk 0 (qs[0..7]), second 16 in chunk 8 (qs[64..71]) */
+        for (int k = 0; k < 2; k++) {
             for (int j = 0; j < 8; j++) {
-                uint8_t byte = blocks[i].qs[k * 128 + j * 8];
+                uint8_t byte = blocks[i].qs[k * 64 + j];
                 int v0 = (int8_t)(byte << 4) >> 4;
                 int v1 = (int8_t)(byte & 0xF0) >> 4;
-                block_sum += (float)v0 * xp[k * 8 + j];
-                block_sum += (float)v1 * xp[k * 8 + j + 4];
+                block_sum += (float)v0 * xp[k * 16 + j * 2];
+                block_sum += (float)v1 * xp[k * 16 + j * 2 + 1];
             }
         }
         sumf += d * block_sum;
@@ -6662,7 +6664,7 @@ void vec_dot_q4_0x8_q8_0_avx2(const void *vx, const void *wy, int n, float *out,
 
     /* Lookup table: maps 4-bit nibble to signed byte [-8..7] */
     __m256i signextendlut = _mm256_castsi128_si256(
-        _mm_set_epi8(-1, -2, -3, -4, -5, -6, -7, -8, 7, 6, 5, 4, 3, 2, 1, 0));
+        _mm_set_epi8(0, 1, 2, 3, 4, 5, 6, 7, -8, -7, -6, -5, -4, -3, -2, -1));
     signextendlut = _mm256_permute2f128_si256(signextendlut, signextendlut, 0);
 
     /* Final permute to reorder output lanes to correct row order */
@@ -6817,6 +6819,12 @@ void vec_dot_q4_0x8_q8_0_avx2(const void *vx, const void *wy, int n, float *out,
         const block_q4_0x8 *b_ptr = (const block_q4_0x8 *)vx;
         const block_q8_0 *a_ptr = (const block_q8_0 *)wy;
         int nb = n / 32;
+        if (getenv("PICOLM_Q4088_DBG")) {
+            fprintf(stderr, "[Q4088] nb=%d nrows=%d d[0]=%04x a[0].d=%04x qs[0..3]=%02x %02x %02x %02x\n",
+                    nb, nrows, b_ptr[0].d[0], a_ptr[0].d,
+                    (unsigned)b_ptr[0].qs[0], (unsigned)b_ptr[0].qs[1],
+                    (unsigned)b_ptr[0].qs[2], (unsigned)b_ptr[0].qs[3]);
+        }
         for (int row = 0; row < nrows; row++) {
             int group = row / 8;
             int r = row % 8;
@@ -6841,7 +6849,7 @@ void vec_dot_q4_0x8_q8_0_avx2(const void *vx, const void *wy, int n, float *out,
             }
             out[row] = sumf;
         }
-    }
+        }
 #endif
 }
 

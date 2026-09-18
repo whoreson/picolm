@@ -1447,10 +1447,10 @@ static void sgemm_q5_q8_neon(int m, int n, int k_blocks,
  * vmmlaq_s32 (I8MM) if available.
  * Tile structure mirrors the AVX2 QGEMM_D_IMPL/D4_IMPL exactly.
  * ============================================================ */
-#if defined(__ARM_NEON)
-
 /* Helper to get fp16 delta pointer from any block type */
 #define QG_D_PTR(b) ((const uint16_t*)&(b)->d)
+
+#if defined(__ARM_NEON)
 
 static inline float neon_hsum_f32(float32x4_t v) {
     return vaddvq_f32(v);
@@ -2012,9 +2012,6 @@ static __m256 qg_updot(__m256i u, __m256i s) {
 
 /* Horizontal sum __m256 -> float (reuse q8_hsum_f32) */
 /* q8_hsum_f32 already defined above */
-
-/* Helper to get fp16 delta pointer from any block type */
-#define QG_D_PTR(b) ((const uint16_t*)&(b)->d)
 
 /* Pack 4x uint16 deltas into uint64 for _mm_cvtph_ps (little-endian) */
 static inline uint64_t qg_pack4_d(uint16_t d0, uint16_t d1, uint16_t d2, uint16_t d3) {
