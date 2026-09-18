@@ -23,7 +23,10 @@ layout(push_constant) uniform PC {
     int hd;            // head_dim
     int msl;           // max_seq_len (for stride calculation)
     float inv_sqrt_hd; // 1/sqrt(head_dim)
-    int pad;
+    int n_swa;         // 0 = full causal attention; >0 = sliding-window
+                        // size, restricting attention to the last n_swa
+                        // positions (see model.h's n_swa_layer[]). Was an
+                        // unused `pad` field.
 } p;
 
 // fp16 to fp32 conversion (matches attn_prefill_f16vk.comp exactly)
@@ -73,14 +76,18 @@ void main() {
     int q_off = h * hd;
     int out_off = h * hd;
 
-    // Causal: attend to positions 0..pos
-    int n_kv = p.pos + 1;
+    // Causal + sliding-window: attend to positions [win_start .. pos].
+    // win_start is 0 for every non-SWA layer/model (n_swa == 0), which is
+    // exactly the old, pre-SWA behavior -- strict no-op for those.
+    int win_start = (p.n_swa > 0) ? max(0, p.pos - p.n_swa + 1) : 0;
+    int n_kv = p.pos - win_start + 1;
 
     float max_sc = -1e20f;
     float scores[512];
 
     // Q @ K^T pass
-    for (int ti = 0; ti < n_kv; ti++) {
+    for (int ti = win_start; ti <= p.pos; ti++) {
+        int si = ti - win_start; // scores[]/acc index, always 0-based
         float s = 0.0f;
         for (int d = 0; d < hd; d++) {
             int f16_idx = kv_base + ti * kv_row + kvh * hd + d;
@@ -89,15 +96,15 @@ void main() {
             s += q_data[q_off + d] * u16tof32(f16val);
         }
         s *= p.inv_sqrt_hd;
-        scores[ti] = s;
+        scores[si] = s;
         if (s > max_sc) max_sc = s;
     }
 
     // Softmax (two-pass: max-then-exp)
     float sum_exp = 0.0f;
-    for (int ti = 0; ti < n_kv; ti++) {
-        scores[ti] = exp(scores[ti] - max_sc);
-        sum_exp += scores[ti];
+    for (int si = 0; si < n_kv; si++) {
+        scores[si] = exp(scores[si] - max_sc);
+        sum_exp += scores[si];
     }
     if (sum_exp < 1e-10f) sum_exp = 1e-10f;
     float inv_sum = 1.0f / sum_exp;
@@ -106,8 +113,9 @@ void main() {
     float acc[128];
     for (int d = 0; d < hd; d++) acc[d] = 0.0f;
 
-    for (int ti = 0; ti < n_kv; ti++) {
-        float e = scores[ti];
+    for (int ti = win_start; ti <= p.pos; ti++) {
+        int si = ti - win_start;
+        float e = scores[si];
         for (int d = 0; d < hd; d++) {
             int f16_idx = kv_base + ti * kv_row + kvh * hd + d;
             uint packed = kv_v_data[f16_idx >> 1];

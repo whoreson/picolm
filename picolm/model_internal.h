@@ -54,7 +54,7 @@ extern void attn_core(
         int kv_type_k, int kv_type_v,
         size_t kv_row_size_k, size_t kv_row_size_v,
         size_t kv_head_stride_k, size_t kv_head_stride_v,
-        int head_dim, float attn_scale);
+        int head_dim, float attn_scale, int n_swa);
 extern void attention_group(int kv_head_idx, void *ctx_ptr);
 extern void batch_attention_layer(
         float *xb_batch, const float *q_batch,
@@ -65,7 +65,7 @@ extern void batch_attention_layer(
         int kv_type_k, int kv_type_v,
         size_t kv_row_size_k, size_t kv_row_size_v,
         size_t kv_head_stride_k, size_t kv_head_stride_v,
-        float attn_scale);
+        float attn_scale, int n_swa);
 
 /* Shared attention context struct */
 typedef struct {
@@ -79,6 +79,11 @@ typedef struct {
     int kv_hadamard_k, kv_hadamard_v;
     int kv_hadamard_size;
     float attn_scale;
+    /* Sliding-window attention: 0 = full causal attention (default for
+     * every non-SWA layer/model); >0 = only the last n_swa cache
+     * positions (relative to `pos`) are attended to. See model.h's
+     * n_swa_layer[] for how this is resolved per layer/model. */
+    int n_swa;
 } attn_group_ctx_t;
 
 /* Prefill attention context */
@@ -94,6 +99,7 @@ typedef struct {
     int kv_hadamard_k, kv_hadamard_v;
     int kv_hadamard_size;
     float attn_scale;
+    int n_swa;   /* see attn_group_ctx_t.n_swa */
 } prefill_attn_ctx_t;
 
 /* --- MoE --- */

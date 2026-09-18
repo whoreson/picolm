@@ -6,6 +6,8 @@ layout(set = 0, binding = 2, std430) readonly buffer B_KV { uint kv_v_data[]; };
 layout(set = 0, binding = 3, std430) writeonly buffer B_OUT { float xb_out[]; };
 layout(push_constant) uniform PC {
     int lo, sp, nt, nh, nkh, hd, msl; float inv_sqrt_hd;
+    int n_swa; // 0 = full causal attention; >0 = sliding-window size
+               // (see model.h's n_swa_layer[]).
 } p;
 
 // fp16 to fp32 conversion (bit manipulation)
@@ -60,7 +62,10 @@ void main() {
 
     float scores[256]; int valid = 0;
     float max_sc = -1e20f;
-    for (int ti = 0; ti < nt; ti++) {
+    // Sliding window: see attn_prefill_vk.comp for the identical rationale
+    // (win_start == 0, i.e. this is a no-op, whenever n_swa == 0).
+    int win_start = (p.n_swa > 0) ? max(0, qi - p.n_swa + 1) : 0;
+    for (int ti = win_start; ti < nt; ti++) {
         if (ti > qi) break;
         float s = 0.0f;
         for (int d = 0; d < hd; d++) {
@@ -77,7 +82,7 @@ void main() {
     float acc[64];
     for (int d = 0; d < hd; d++) acc[d] = 0.0f;
     float sum_exp = 0.0f;
-    for (int ti = 0; ti < valid; ti++) {
+    for (int ti = win_start; ti < valid; ti++) {
         float e = exp(scores[ti] - max_sc);
         sum_exp += e;
         for (int d = 0; d < hd; d++) {

@@ -3678,13 +3678,13 @@ int picolm_gpu_w4a16_matmul(picolm_gpu_tensor_t *t, float *y, const float *x,
 
 int picolm_gpu_attention_decode(float *xb_out, const float *q,
                                  int lo, int pos, int nh, int nkh,
-                                 int hd, int msl, int device) {
+                                 int hd, int msl, int device, int n_swa) {
     (void)xb_out; (void)q; (void)lo; (void)pos; (void)nh; (void)nkh;
-    (void)hd; (void)msl; (void)device; return 0;
+    (void)hd; (void)msl; (void)device; (void)n_swa; return 0;
 }
 int picolm_gpu_attention_decode_dev(float *xb_out_dev, const float *q_dev,
                                      int lo, int pos, int nh, int nkh,
-                                     int hd, int msl, int device) {
+                                     int hd, int msl, int device, int n_swa) {
     if (device != 0 || !G.pipe_attn_dec) return 0;
     if (nh % nkh != 0) return 0;  // must be uniform GQA
     if (hd > 128) return 0;       // scores[] array limit
@@ -3732,9 +3732,12 @@ int picolm_gpu_attention_decode_dev(float *xb_out_dev, const float *q_dev,
     typedef struct {
         int lo, pos, nh, nkh, hd, msl;
         float inv_sqrt_hd;
-        int pad;
+        int n_swa; /* 0 = full causal attention; >0 = sliding-window size.
+                    * See attn_decode_vk.comp for the mask logic; matches
+                    * the CPU/CUDA n_swa convention exactly (model.h's
+                    * n_swa_layer[]). Was an unused `pad` field. */
     } PC_AttnD;
-    PC_AttnD pc = {lo, pos, nh, nkh, hd, msl, 1.0f / sqrtf((float)hd), 0};
+    PC_AttnD pc = {lo, pos, nh, nkh, hd, msl, 1.0f / sqrtf((float)hd), n_swa};
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(pc), &pc);
     uint32_t nwg = (nh + 255) / 256;
@@ -3750,14 +3753,14 @@ int picolm_gpu_attention_decode_dev(float *xb_out_dev, const float *q_dev,
 int picolm_gpu_attention_prefill(float *xb_out, const float *q,
                                   int lo, int sp, int nt,
                                   int nh, int nkh, int hd,
-                                  int msl, int device) {
+                                  int msl, int device, int n_swa) {
     (void)xb_out; (void)q; (void)lo; (void)sp; (void)nt;
-    (void)nh; (void)nkh; (void)hd; (void)msl; (void)device; return 0;
+    (void)nh; (void)nkh; (void)hd; (void)msl; (void)device; (void)n_swa; return 0;
 }
 int picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
                                       int lo, int sp, int nt,
                                       int nh, int nkh, int hd,
-                                      int msl, int device) {
+                                      int msl, int device, int n_swa) {
     if (device != 0 || nt < 1) return 0;
 
     // Try F16 KV-cache path first (reads from KV cache, not F32 pipe buffers)
@@ -3797,8 +3800,9 @@ int picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
 
         typedef struct {
             int lo, sp, nt, nh, nkh, hd, msl; float inv_sqrt_hd;
+            int n_swa; /* see PC_AttnD in picolm_gpu_attention_decode_dev() */
         } PC_AttnF16;
-        PC_AttnF16 pc = {lo, sp, nt, nh, nkh, hd, msl, 1.0f / sqrtf(hd)};
+        PC_AttnF16 pc = {lo, sp, nt, nh, nkh, hd, msl, 1.0f / sqrtf(hd), n_swa};
         vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
                            0, sizeof(pc), &pc);
         vkCmdDispatch(G.cmd_dev, (uint32_t)((total + 63) / 64), 1, 1);
@@ -3862,9 +3866,9 @@ int picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
         int layer_ordinal, start_pos, n_tokens;
         int n_heads, n_kv_heads, head_dim;
         float inv_sqrt_hd;  // 1/sqrt(head_dim)
-        int pad;
+        int n_swa; // see PC_AttnD in picolm_gpu_attention_decode_dev()
     } PC_Attn;
-    PC_Attn pc = {lo, sp, nt, nh, nkh, hd, 1.0f / sqrtf(hd), 0};
+    PC_Attn pc = {lo, sp, nt, nh, nkh, hd, 1.0f / sqrtf(hd), n_swa};
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd_dev, (uint32_t)((total + 63) / 64), 1, 1);
@@ -3875,7 +3879,7 @@ int picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
 int picolm_gpu_attention_prefill_f32kv(float *xb_out_dev, const float *q_dev,
                                         const float *k_dev, const float *v_dev,
                                         int sp, int nt, int nh, int nkh,
-                                        int hd, int device) {
+                                        int hd, int device, int n_swa) {
     if (!G.ready || !G.shader_attn_prefill || device != 0 || nt < 1) return 0;
 
     VkDescriptorBufferInfo qbi = desc_buf_info(q_dev);
@@ -3926,9 +3930,9 @@ int picolm_gpu_attention_prefill_f32kv(float *xb_out_dev, const float *q_dev,
         int layer_ordinal, start_pos, n_tokens;
         int n_heads, n_kv_heads, head_dim;
         float inv_sqrt_hd;
-        int pad;
+        int n_swa; /* see PC_AttnD in picolm_gpu_attention_decode_dev() */
     } PC_Attn;
-    PC_Attn pc = {0, sp, nt, nh, nkh, hd, 1.0f / sqrtf((float)hd), 0};
+    PC_Attn pc = {0, sp, nt, nh, nkh, hd, 1.0f / sqrtf((float)hd), n_swa};
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd_dev, (uint32_t)((total + 63) / 64), 1, 1);

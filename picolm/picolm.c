@@ -867,12 +867,12 @@ static void gpu_attn_diff_test(int n_tokens, int n_heads, int n_kv_heads, int he
     unsetenv("PICOLM_FORCE_SCALAR_ATTN");
     for (int iter = 0; iter < n_iters; iter++) {
         if (!picolm_gpu_attention_prefill(y_fa2, q_h, 0, 0, n_tokens,
-                n_heads, n_kv_heads, head_dim, max_seq_len, 0)) {
+                n_heads, n_kv_heads, head_dim, max_seq_len, 0, 0)) {
             fprintf(stderr, "FA2 attention failed iter %d\n", iter); exit(1);
         }
         setenv("PICOLM_FORCE_SCALAR_ATTN", "1", 1);
         if (!picolm_gpu_attention_prefill(y_scalar, q_h, 0, 0, n_tokens,
-                n_heads, n_kv_heads, head_dim, max_seq_len, 0)) {
+                n_heads, n_kv_heads, head_dim, max_seq_len, 0, 0)) {
             fprintf(stderr, "Scalar attention failed iter %d\n", iter); exit(1);
         }
         unsetenv("PICOLM_FORCE_SCALAR_ATTN");
@@ -962,12 +962,12 @@ static void gpu_attn_scalar_diff_test(int n_tokens, int n_heads, int n_kv_heads,
         unsetenv("PICOLM_ATTN_SLOW_SCALAR");
         setenv("PICOLM_FORCE_SCALAR_ATTN", "1", 1);
         if (!picolm_gpu_attention_prefill(y_warpgrp, q_h, 0, 0, n_tokens,
-                n_heads, n_kv_heads, head_dim, max_seq_len, 0)) {
+                n_heads, n_kv_heads, head_dim, max_seq_len, 0, 0)) {
             fprintf(stderr, "Warpgrp attention failed iter %d\n", iter); exit(1);
         }
         setenv("PICOLM_ATTN_SLOW_SCALAR", "1", 1);
         if (!picolm_gpu_attention_prefill(y_slow, q_h, 0, 0, n_tokens,
-                n_heads, n_kv_heads, head_dim, max_seq_len, 0)) {
+                n_heads, n_kv_heads, head_dim, max_seq_len, 0, 0)) {
             fprintf(stderr, "Slow scalar attention failed iter %d\n", iter); exit(1);
         }
         unsetenv("PICOLM_FORCE_SCALAR_ATTN");

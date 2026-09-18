@@ -268,6 +268,7 @@ clean:
 	-$(RM) $(TARGET) $(TARGET).exe $(OBJS) $(VIZ_OBJS) backend_metal.o backend_vulkan.o
 	-$(RM) $(GPU_SRCS:%.cu=%-hip.o) $(GPU_SRCS:%.cu=%-cuda.o) backend_gpu.dlink.o
 	-$(RM) shaders/*.spv
+	-$(RM) test_swa test_swa.exe test_quant
 
 .PHONY: asan
 asan:
@@ -687,11 +688,24 @@ dos: dos_stubs.o.dos $(DJGPP_OBJS)
 	$(DJGPP_CC) -nostartfiles -o picolm.exe $< $(DJGPP_RUNTIME)/lib/crt0.o \
 	 $(DJGPP_OBJS) -L$(DJGPP_RUNTIME)/lib -lc -lm -lgcc
 
+# DOS test for SWA correctness. Reuses the already-built .o.dos objects from 'make dos'.
+# Single-threaded on DOS (no OpenMP), so batch_attention_layer takes the
+# tensor_parallel_for -> n_threads<=1 scalar loop path. Still exercises both
+# attn_core (decode) and batch_attention_tiled (prefill, forced by n_tokens>=128).
+TEST_SWA_OBJS_DOS = model_attention.o.dos tensor.o.dos quant.o.dos sgemm.o.dos sgemm_q4_0x8.o.dos sgemm_q4i_0x8.o.dos
+test_swa_dos: tests/test_swa.c $(TEST_SWA_OBJS_DOS) dos_stubs.o.dos
+	$(DJGPP_CC) $(DJGPP_CFLAGS) -I. -c -o tests/test_swa.o.dos tests/test_swa.c
+	$(DJGPP_CC) -nostartfiles -o test_swa.exe dos_stubs.o.dos tests/test_swa.o.dos $(DJGPP_RUNTIME)/lib/crt0.o \
+	 $(TEST_SWA_OBJS_DOS) -L$(DJGPP_RUNTIME)/lib -lc -lm -lgcc
+
 dos-clean:
-	-rm -f $(DJGPP_OBJS) dos_stubs.o.dos picolm.exe
+	-rm -f $(DJGPP_OBJS) dos_stubs.o.dos picolm.exe tests/test_swa.o.dos test_swa.exe
 
 test_quant: util/test_quant.c quant.c sgemm.c
 	$(CC) $(CFLAGS) -o $@ util/test_quant.c quant.c sgemm.c -lm
+
+test_swa: tests/test_swa.c model_attention.c tensor.c quant.c sgemm.c sgemm_q4_0x8.c sgemm_q4i_0x8.c
+	$(CC) $(CFLAGS) -I. -O2 -o $@ tests/test_swa.c model_attention.c tensor.c quant.c sgemm.c sgemm_q4_0x8.c sgemm_q4i_0x8.c -lm -lpthread -fopenmp -lstdc++
 
 gguf_be_swap: util/gguf_be_swap.c
 	$(CC) -O2 -std=c99 -o $@ util/gguf_be_swap.c -lm

@@ -2744,7 +2744,8 @@ picolm_gpu_attention_decode_kernel(
         int pos,
         int n_heads, int n_kv_heads, int head_dim, int max_seq_len,
         size_t kv_pos_stride_bytes,
-        size_t kv_head_stride_bytes)
+        size_t kv_head_stride_bytes,
+        int n_swa)
 {
     int kv_h = (int)gpuBlockIdx_x;
     if (kv_h >= n_kv_heads) return;
@@ -2778,7 +2779,14 @@ picolm_gpu_attention_decode_kernel(
 
     float attn_scale = 1.0f / sqrtf((float)head_dim);
 
-    for (int t = 0; t <= pos; t++) {
+    /* Sliding window: restrict the scan to [max(0,pos-n_swa+1), pos] when
+     * this layer is SWA (n_swa > 0). n_swa == 0 is the pre-SWA, full
+     * causal attention behavior (t_start stays 0). Mirrors attn_core()
+     * in model_attention.c exactly, so CPU and GPU decode agree. */
+    int t_start = (n_swa > 0) ? (pos - n_swa + 1) : 0;
+    if (t_start < 0) t_start = 0;
+
+    for (int t = t_start; t <= pos; t++) {
         size_t k_off = layer_base + (size_t)t * kv_pos_stride_bytes / 2 + kv_h * kv_head_stride_bytes / 2;
         size_t v_off = k_off;
         for (int d = tid; d < head_dim; d += n_threads) {
@@ -2861,7 +2869,7 @@ picolm_gpu_attention_decode_split_kernel(
         int layer_ordinal, int pos,
         int n_heads, int n_kv_heads, int head_dim, int max_seq_len,
         size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes,
-        int n_splits, int chunk_size)
+        int n_splits, int chunk_size, int n_swa)
 {
     int kv_h = (int)gpuBlockIdx_x;
     int split = (int)gpuBlockIdx_y;
@@ -2875,6 +2883,18 @@ picolm_gpu_attention_decode_split_kernel(
 
     int t0 = split * chunk_size;
     int t1 = min(t0 + chunk_size, pos + 1);
+
+    /* Sliding window: raise this split's floor to the window start. A
+     * split entirely below the window ends up with t0 >= t1 and simply
+     * contributes an empty (max=-1e30, sum=0) partial result, which
+     * picolm_gpu_attention_decode_merge_kernel already treats as
+     * zero-weight -- exp(partial_max - global_max) underflows to 0.0f
+     * when partial_max is left at its -1e30 sentinel. */
+    if (n_swa > 0) {
+        int win_start = pos - n_swa + 1;
+        if (win_start < 0) win_start = 0;
+        if (t0 < win_start) t0 = win_start;
+    }
 
     extern __shared__ uint8_t smem[];
     uint16_t *k_sh = (uint16_t *)smem;
@@ -3030,7 +3050,7 @@ picolm_gpu_attention_prefill_f32kv_kernel(
         const float *kv_v,   /* [pos][kv_head][head_dim] FP32 */
         int start_pos, int n_tokens,
         int n_heads, int n_kv_heads, int head_dim,
-        int tile_q)
+        int tile_q, int n_swa)
 {
     int h = (int)gpuBlockIdx_x;
     int tile_q_idx = (int)gpuBlockIdx_y;
@@ -3094,6 +3114,10 @@ picolm_gpu_attention_prefill_f32kv_kernel(
             for (int ti = 0; ti < tile_k_size; ti++) {
                 int global_kv = t0 + ti;
                 if (global_kv > global_pos) continue;
+                /* Sliding window: KV positions older than the window are
+                 * skipped exactly like future positions above -- same
+                 * per-row check, other side of the causal boundary. */
+                if (n_swa > 0 && global_kv < global_pos - n_swa + 1) continue;
 
                 float score;
                 if (tid == 0) {
@@ -3176,7 +3200,7 @@ picolm_gpu_attention_prefill_kernel(
         int n_heads, int n_kv_heads, int head_dim, int max_seq_len,
         size_t kv_pos_stride_bytes,
         size_t kv_head_stride_bytes,
-        int tile_q)
+        int tile_q, int n_swa)
 {
     int h = (int)gpuBlockIdx_x;       /* query head */
     int tile_q_idx = (int)gpuBlockIdx_y; /* tile of query tokens */
@@ -3260,6 +3284,8 @@ picolm_gpu_attention_prefill_kernel(
             for (int ti = 0; ti < tile_k_size; ti++) {
                 int global_kv = t0 + ti;
                 if (global_kv > global_pos) continue;
+                /* Sliding window: see picolm_gpu_attention_prefill_f32kv_kernel. */
+                if (n_swa > 0 && global_kv < global_pos - n_swa + 1) continue;
 
                 /* Compute score: parallel across threads, same 16-element chunk
                  * accumulation order as the CPU AVX-512 reference. Each thread
@@ -3404,7 +3430,7 @@ picolm_gpu_attention_prefill_warpgrp_kernel(
         int n_heads, int n_kv_heads, int head_dim, int max_seq_len,
         size_t kv_pos_stride_bytes,
         size_t kv_head_stride_bytes,
-        int tile_q)
+        int tile_q, int n_swa)
 {
     const int GRP = ATTN_WARPGRP_SIZE;
     int h = (int)gpuBlockIdx_x;
@@ -3506,6 +3532,8 @@ picolm_gpu_attention_prefill_warpgrp_kernel(
             for (int ti = 0; ti < tile_k_size; ti++) {
                 int global_kv = t0 + ti;
                 if (global_kv > global_pos) continue;
+                /* Sliding window: see picolm_gpu_attention_prefill_f32kv_kernel. */
+                if (n_swa > 0 && global_kv < global_pos - n_swa + 1) continue;
 
                 /* TODO(perf): replace scalar fmaf+gpu_fp16_to_fp32 per-element with
                  * v_dot2_f32_f16 (1 instruction = 2 FP16 FMAs, FP32 accumulate).
@@ -3615,7 +3643,7 @@ picolm_gpu_attention_prefill_warpgrp_dot2_kernel(
         int n_heads, int n_kv_heads, int head_dim, int max_seq_len,
         size_t kv_pos_stride_bytes,
         size_t kv_head_stride_bytes,
-        int tile_q)
+        int tile_q, int n_swa)
 {
     const int GRP = ATTN_WARPGRP_SIZE;
     int h = (int)gpuBlockIdx_x;
@@ -3710,6 +3738,8 @@ picolm_gpu_attention_prefill_warpgrp_dot2_kernel(
             for (int ti = 0; ti < tile_k_size; ti++) {
                 int global_kv = t0 + ti;
                 if (global_kv > global_pos) continue;
+                /* Sliding window: see picolm_gpu_attention_prefill_f32kv_kernel. */
+                if (n_swa > 0 && global_kv < global_pos - n_swa + 1) continue;
 
                 /* 8 packed FMAs instead of 16 scalar ones. Both Q and K
                  * are read as half2 directly from shared memory FP16.
@@ -4252,7 +4282,7 @@ picolm_gpu_attention_prefill_fa2_kernel(
     const uint16_t *kv_k, const uint16_t *kv_v,
     int layer_ordinal, int start_pos, int n_tokens,
     int n_heads, int n_kv_heads, int head_dim, int max_seq_len,
-    size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes)
+    size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, int n_swa)
 {
     int q_h = gpuBlockIdx_x;        /* query head 0..n_heads-1 */
     int q_tile_idx = gpuBlockIdx_y;
@@ -4389,6 +4419,8 @@ picolm_gpu_attention_prefill_fa2_kernel(
                     for (int ti = 0; ti < tk_size; ti++) {
                         int gk = t0 + ti;
                         if (gk > start_pos + gq) continue;
+                        /* Sliding window: see picolm_gpu_attention_prefill_f32kv_kernel. */
+                        if (n_swa > 0 && gk < start_pos + gq - n_swa + 1) continue;
                         float sc = score_sh[(warp*FA2_TILE_Q + srow) * FA2_TILE_K + ti] * attn_scale;
                         if (sc > rm) {
                             float re = expf(rm - sc);

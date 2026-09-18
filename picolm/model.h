@@ -83,10 +83,50 @@ typedef struct {
     float f_final_logit_softcapping; /* final logit soft-capping (0=disabled) */
     int n_layer_sparsity;     /* number of layers using activation sparsity (Gemma-3n) */
     float f_sparsity_std_mul; /* sparsity std multiplier (Gemma-3n) */
-    int n_swa;                /* sliding window attention size (0=disabled) */
-    int swa_period;           /* SWA pattern period (e.g. 5 for Gemma-3n) */
+    int n_swa;                /* default/global sliding window attention size (0=disabled) */
+    int swa_period;           /* SWA pattern period (e.g. 5 for Gemma-3n, derived fallback) */
     float rope_freq_base_swa; /* RoPE freq base for SWA layers */
     float f_attention_scale;  /* attention scale factor (1.0 for Gemma-3n, 0=default) */
+    /* ---- Generic per-layer SWA resolution ----
+     * n_swa_layer[l] is the single source of truth consulted by every
+     * attention code path (CPU decode/prefill, GPU decode/prefill, all
+     * backends). 0 means layer l uses full (unbounded) causal attention;
+     * a positive value N means layer l only attends to the last N cache
+     * positions (see docs: SWA STANDARD masking, p0 > p1 - N).
+     *
+     * This array is resolved once at load time (parse_gguf / model_gguf.c)
+     * from whatever the GGUF file actually provides, in priority order:
+     *   1. An explicit per-layer boolean pattern
+     *      ("<arch>.attention.sliding_window_pattern", array<bool>), which
+     *      is exactly what llama.cpp/GGUF exports for Gemma-3 family
+     *      models -- each true/false entry says whether layer l is SWA.
+     *   2. A derived period, when the GGUF only gives a period count
+     *      instead of a full per-layer array (swa_period > 0): layer l is
+     *      SWA iff (l % swa_period) < (swa_period - 1), matching
+     *      llama.cpp's is_swa() convention (last layer of every period is
+     *      the "global" layer).
+     *   3. If neither is present but n_swa > 0 was given, every layer is
+     *      treated as SWA (covers "all layers use one fixed window"
+     *      models such as Gemma-3's simple case).
+     *   4. Otherwise every entry is 0 (no SWA at all; the no-op case for
+     *      every model family that predates SWA -- Llama, Mistral, Qwen,
+     *      GPT-2, ...).
+     *
+     * Because every attention call site reads n_swa_layer[l] instead of
+     * re-deriving is_swa from architecture-specific flags, adding a brand
+     * new SWA model family in the future only requires populating this
+     * array during GGUF parsing -- no attention-kernel changes needed. */
+    int n_swa_layer[MAX_LAYERS];
+
+    /* ---- GGUF parse-time scratch for the resolution above ----
+     * Populated while scanning metadata (model_gguf.c), consumed once
+     * right after n_layers is finalized, then not touched again. Not
+     * meaningful outside of load time. */
+    uint8_t swa_layer_bool[MAX_LAYERS]; /* raw per-layer bools from an explicit
+                                          * "*.attention.sliding_window_pattern"
+                                          * GGUF array, if one was present */
+    int has_swa_pattern;                /* 1 if the array above was populated */
+    int n_swa_pattern_len;              /* how many entries of swa_layer_bool are valid */
 } model_config_t;
 
 /* ---- GPU-resident weight handles (compiled in only with PICOLM_GPU) ---- */

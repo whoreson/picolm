@@ -451,11 +451,14 @@ int picolm_gpu_kv_debug_dump(int is_k, int layer_ordinal, int pos,
  * Output xb_out [n_heads][head_dim] in F32.
  * layer_ordinal: which KV cache layer (0..kv_layers-1).
  * pos: current position (0-indexed), attention attends to positions 0..pos.
+ * n_swa: 0 = full causal attention; >0 = sliding-window size, restricting
+ * the attended range to [max(0,pos-n_swa+1), pos]. See model.h's
+ * n_swa_layer[] for how the caller resolves this per layer.
  * Returns 1 on success, 0 -> caller falls back to attention_group(). */
 int picolm_gpu_attention_decode(float *xb_out, const float *q,
                                  int layer_ordinal, int pos,
                                  int n_heads, int n_kv_heads, int head_dim,
-                                 int max_seq_len, int device);
+                                 int max_seq_len, int device, int n_swa);
 
 /* Device-native variant: q_dev/xb_out_dev are already device pointers,
  * no H2D/D2H, no internal sync. Caller must have already issued the KV
@@ -465,17 +468,18 @@ int picolm_gpu_attention_decode(float *xb_out, const float *q,
 int picolm_gpu_attention_decode_dev(float *xb_out_dev, const float *q_dev,
                                      int layer_ordinal, int pos,
                                      int n_heads, int n_kv_heads, int head_dim,
-                                     int max_seq_len, int device);
+                                     int max_seq_len, int device, int n_swa);
 
 /* Prefill-path attention: S queries, causal mask, tiled online-softmax merge.
  * q: host [n_tokens][n_heads][head_dim] in F32.
  * xb_out: host [n_tokens][n_heads][head_dim] in F32 (pre-zeroed by caller).
  * start_pos: KV position of q[0] (for context continuation).
+ * n_swa: see picolm_gpu_attention_decode().
  * Returns 1 on success, 0 -> caller falls back to batch_attention_layer(). */
 int picolm_gpu_attention_prefill(float *xb_out, const float *q,
                                   int layer_ordinal, int start_pos, int n_tokens,
                                   int n_heads, int n_kv_heads, int head_dim,
-                                  int max_seq_len, int device);
+                                  int max_seq_len, int device, int n_swa);
 
 /* Device-native prefill attention: q_dev and xb_out_dev are device pointers.
  * No H2D, no D2H, no sync. S=n_tokens queries, causal mask, tiled over KV
@@ -483,7 +487,7 @@ int picolm_gpu_attention_prefill(float *xb_out, const float *q,
 int picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
                                       int layer_ordinal, int start_pos, int n_tokens,
                                       int n_heads, int n_kv_heads, int head_dim,
-                                      int max_seq_len, int device);
+                                      int max_seq_len, int device, int n_swa);
 
 /* Device-native prefill attention with FP32 K/V (no KV cache read).
  * K/V are FP32 buffers with layout [pos][kv_head][head_dim]. */
@@ -491,7 +495,7 @@ int picolm_gpu_attention_prefill_f32kv(float *xb_out_dev, const float *q_dev,
                                         const float *k_dev, const float *v_dev,
                                         int start_pos, int n_tokens,
                                         int n_heads, int n_kv_heads, int head_dim,
-                                        int device);
+                                        int device, int n_swa);
 
 /* Free GPU KV cache allocations. */
 void picolm_gpu_kv_cache_clear(int device);

@@ -4356,7 +4356,7 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
             if (!picolm_gpu_attention_decode_dev(pipe_attn_out, pipe_q,
                                                   this_attn_ordinal - 1, pos,
                                                   n_heads, n_kv_heads, head_dim,
-                                                  seq_len, gpu_dev)) {
+                                                  seq_len, gpu_dev, c->n_swa_layer[l])) {
                 return model_forward(m, token, pos);
             }
 
@@ -4979,12 +4979,12 @@ after_qkv:
             picolm_gpu_attention_prefill_f32kv(battn_out, bq, bk, bv,
                                                 start_pos, n_ubatch,
                                                 n_heads, n_kv_heads, head_dim,
-                                                gpu_dev);
+                                                gpu_dev, c->n_swa_layer[l]);
 #else
             picolm_gpu_attention_prefill_dev(battn_out, q_buf,
                                               attn_ord, start_pos, n_ubatch,
                                               n_heads, n_kv_heads, head_dim,
-                                              seq_len, gpu_dev);
+                                              seq_len, gpu_dev, c->n_swa_layer[l]);
 #endif
         } else if (c->is_gpt2) {
             /* GPT-2: use F32KV attention to avoid F16 KV cache quantization error.
@@ -4996,22 +4996,22 @@ after_qkv:
                 picolm_gpu_attention_prefill_dev(battn_out, q_buf,
                                                   attn_ord, start_pos, n_ubatch,
                                                   n_heads, n_kv_heads, head_dim,
-                                                  seq_len, gpu_dev);
+                                                  seq_len, gpu_dev, 0 /* GPT-2 has no SWA */);
             } else if (!picolm_gpu_attention_prefill_f32kv(battn_out, q_buf, bk, bv,
                                                 start_pos, n_ubatch,
                                                 n_heads, n_kv_heads, head_dim,
-                                                gpu_dev)) {
+                                                gpu_dev, 0 /* GPT-2 has no SWA */)) {
                 /* Fallback if F32KV unavailable: use F16 KV cache path */
                 picolm_gpu_attention_prefill_dev(battn_out, q_buf,
                                                   attn_ord, start_pos, n_ubatch,
                                                   n_heads, n_kv_heads, head_dim,
-                                                  seq_len, gpu_dev);
+                                                  seq_len, gpu_dev, 0 /* GPT-2 has no SWA */);
             }
         } else {
             picolm_gpu_attention_prefill_dev(battn_out, q_buf,
                                               attn_ord, start_pos, n_ubatch,
                                               n_heads, n_kv_heads, head_dim,
-                                              seq_len, gpu_dev);
+                                              seq_len, gpu_dev, c->n_swa_layer[l]);
         }
         /* Debug: dump attention output for layer 0 */
         if (l == 0 && getenv("ATTNDBG")) {

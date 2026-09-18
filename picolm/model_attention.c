@@ -46,12 +46,20 @@ void attn_core(
         int kv_type_k, int kv_type_v,
         size_t kv_row_size_k, size_t kv_row_size_v,
         size_t kv_head_stride_k, size_t kv_head_stride_v,
-        int head_dim, float attn_scale) {
+        int head_dim, float attn_scale, int n_swa) {
     float max_score = -1e30f, sum_exp = 0.0f;
     float acc[256];
     memset(acc, 0, (size_t)head_dim * sizeof(float));
 
-    for (int t = 0; t <= pos; t++) {
+    /* Sliding window: restrict the causal scan [0..pos] down to
+     * [max(0, pos - n_swa + 1) .. pos] when this layer is SWA (n_swa > 0).
+     * n_swa == 0 means full attention -- start stays at 0, identical to
+     * the pre-SWA behavior, so this is a strict no-op for every other
+     * model family. */
+    int t_start = (n_swa > 0) ? (pos - n_swa + 1) : 0;
+    if (t_start < 0) t_start = 0;
+
+    for (int t = t_start; t <= pos; t++) {
         /* GQA layout: [pos] * kv_row_size + head * kv_head_stride */
         const uint8_t *kt = kcache + (size_t)t * kv_row_size_k + kv_h * kv_head_stride_k;
         float score;
@@ -196,7 +204,11 @@ void attention_group(int kv_head_idx, void *ctx_ptr) {
     for (int g = 0; g < kv_mul; g++)
         for (int d = 0; d < head_dim; d++) acc[g][d] = 0.0f;
 
-    for (int t = 0; t <= pos; t++) {
+    /* Sliding window: see attn_core() above for the identical rationale. */
+    int t_start = (ctx->n_swa > 0) ? (pos - ctx->n_swa + 1) : 0;
+    if (t_start < 0) t_start = 0;
+
+    for (int t = t_start; t <= pos; t++) {
         /* GQA layout: [pos] * kv_row_size_k + head * kv_head_stride_k */
         const uint8_t *kt = ctx->kcache + (size_t)t * ctx->kv_row_size_k + kv_h * kv_head_stride_k;
         const uint8_t *vt = ctx->vcache + (size_t)t * ctx->kv_row_size_v + kv_h * kv_head_stride_v;
@@ -463,7 +475,7 @@ static void prefill_attn_task(int flat_idx, void *ctx_ptr) {
               ctx->kv_type_k, ctx->kv_type_v,
               ctx->kv_row_size_k, ctx->kv_row_size_v,
               ctx->kv_head_stride_k, ctx->kv_head_stride_v,
-              ctx->head_dim, ctx->attn_scale);
+              ctx->head_dim, ctx->attn_scale, ctx->n_swa);
 }
 
 /* Tiled attention: tile size in KV positions */
@@ -479,7 +491,7 @@ static void batch_attention_tiled(
         kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v,
         size_t kv_row_size_k, size_t kv_row_size_v,
         size_t kv_head_stride_k, size_t kv_head_stride_v,
-        float attn_scale);
+        float attn_scale, int n_swa);
 
 /* Forward declaration for callback to tensor_parallel_for */
 static void prefill_attn_task(int flat_idx, void *ctx_ptr);
@@ -493,7 +505,7 @@ void batch_attention_layer(
         int kv_type_k, int kv_type_v,
         size_t kv_row_size_k, size_t kv_row_size_v,
         size_t kv_head_stride_k, size_t kv_head_stride_v,
-        float attn_scale)
+        float attn_scale, int n_swa)
 {
     /* Build the prefill_attn_ctx for both the original path and the test */
     prefill_attn_ctx_t ctx;
@@ -506,6 +518,7 @@ void batch_attention_layer(
     ctx.kcache = kcache; ctx.vcache = vcache;
     ctx.q_batch = q_batch; ctx.xb_batch = xb_batch; ctx.xb_stride = xb_stride;
     ctx.attn_scale = attn_scale;
+    ctx.n_swa = n_swa;
 
     /* For large enough batches, use the tiled/batched attention path which
      * amortizes KV cache load/dequant across multiple query tokens via the
@@ -523,7 +536,7 @@ void batch_attention_layer(
                               (kv_cache_type_t)kv_type_k, (kv_cache_type_t)kv_type_v,
                               kv_row_size_k, kv_row_size_v,
                               kv_head_stride_k, kv_head_stride_v,
-                              attn_scale);
+                              attn_scale, n_swa);
         return;
     }
 
@@ -604,6 +617,7 @@ typedef struct {
     float *out;             /* [n_q_rows x head_dim] final output (written only after all tiles) */
     int last_tile;          /* 1 if this is the last tile to process */
     float attn_scale;       /* attention score scale factor */
+    int n_swa;               /* 0 = full attention; >0 = sliding window size */
 } attn_tile_task_t;
 
 /* Process one tile within a (kv_head, token_group) task.
@@ -646,10 +660,11 @@ static void attn_process_tile(attn_tile_task_t *t) {
     /* Causal masking for diagonal tile: for each query row i,
      * only positions [0, i_within_group] are valid.
      * Within the diagonal tile, query row i (0..n_q-1) corresponds to
-     * token (group_token_start + i/kv_mul), and the valid KV positions
-     * within this tile are [0, row_offset_within_tile].
+     * absolute position (group_token_start + i/kv_mul) -- group_token_start
+     * is set by the caller as start_pos + q_group_start, i.e. already
+     * absolute (see batch_attention_tiled()).
      * The diagonal tile starts at kv_tile_start. The query's causal limit
-     * is pos = start_pos + group_token_start + i/kv_mul.
+     * is pos = group_token_start + i/kv_mul.
      * Within this tile, valid columns are [0, pos - kv_tile_start]. */
 
     if (is_diag) {
@@ -662,6 +677,29 @@ static void attn_process_tile(attn_tile_task_t *t) {
             float *row = t->scores + i * ts;
             for (int j = valid_cols; j < ts; j++)
                 row[j] = -1e30f;
+        }
+    }
+
+    /* Sliding-window masking: applies to EVERY tile, not just the
+     * diagonal one -- a tile fully in the causal past can still contain
+     * KV positions older than a row's SWA window and must be masked
+     * there too. For row i (absolute position `pos`), valid columns are
+     * those with absolute KV position >= max(0, pos - n_swa + 1); columns
+     * before that (relative to this tile's start) are masked to -inf,
+     * exactly like the causal mask above, just on the other side. */
+    if (t->n_swa > 0) {
+        for (int i = 0; i < n_q; i++) {
+            int token_idx = i / t->kv_mul;
+            int pos = group_token_start + token_idx;
+            int win_start = pos - t->n_swa + 1;
+            if (win_start < 0) win_start = 0;
+            int mask_upto = win_start - kv_tile_start; /* columns [0, mask_upto) predate the window */
+            if (mask_upto > 0) {
+                if (mask_upto > ts) mask_upto = ts;
+                float *row = t->scores + i * ts;
+                for (int j = 0; j < mask_upto; j++)
+                    row[j] = -1e30f;
+            }
         }
     }
 
@@ -740,7 +778,7 @@ static void batch_attention_tiled(
         kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v,
         size_t kv_row_size_k, size_t kv_row_size_v,
         size_t kv_head_stride_k, size_t kv_head_stride_v,
-        float attn_scale)
+        float attn_scale, int n_swa)
 {
     /* kv_head_stride_v is used below in V-tile extraction */
     int kv_mul = n_heads / n_kv_heads;
@@ -852,11 +890,30 @@ static void batch_attention_tiled(
                     int first_pos = start_pos + q_group_start;
                     if (kv_t0 > first_pos) continue;
 
+                    /* Skip tiles entirely BEFORE every row's SWA window.
+                     * window_start(pos) = max(0, pos - n_swa + 1) is
+                     * non-decreasing in pos, so the smallest window_start
+                     * in this group belongs to its first (smallest-pos)
+                     * row. If the tile ends before even that row's window
+                     * starts, it is before every row's window and can be
+                     * skipped outright -- this is the SWA analogue of the
+                     * causal future-skip right above. */
+                    if (n_swa > 0) {
+                        int win_start_first = first_pos - n_swa + 1;
+                        if (win_start_first < 0) win_start_first = 0;
+                        if (kv_t1 <= win_start_first) continue;
+                    }
+
                     int this_tile_size = kv_t1 - kv_t0;
                     if (this_tile_size <= 0) continue;
 
-                    /* Is this the diagonal tile? */
-                    int is_diag = (kv_t0 <= q_group_start) && (kv_t1 > q_group_start);
+                    /* Is this the diagonal tile? (uses the absolute
+                     * position of the first row in the group, matching
+                     * the absolute group_token_start passed to the task
+                     * below and used inside attn_process_tile(), both
+                     * of which expect group_token_start to already
+                     * include start_pos. */
+                    int is_diag = (kv_t0 <= first_pos) && (kv_t1 > first_pos);
 
                     /* Extract V-tile and dequantize to F32 */
                     {
@@ -879,7 +936,12 @@ static void batch_attention_tiled(
                     task.head_dim = head_dim;
                     task.tile_size = this_tile_size;
                     task.n_q_rows = n_q_padded;
-                    task.group_token_start = q_group_start;
+                    /* Absolute position of the group's first token -- see
+                     * the fixed is_diag computation above and the
+                     * SWA/causal masking inside attn_process_tile(), both
+                     * of which expect group_token_start to already
+                     * include start_pos. */
+                    task.group_token_start = first_pos;
                     task.kv_tile_start = kv_t0;
                     task.kv_tile_end = kv_t1;
                     task.is_diagonal = is_diag;
@@ -895,6 +957,7 @@ static void batch_attention_tiled(
                     task.S = S;
                     task.acc = acc;
                     task.attn_scale = attn_scale;
+                    task.n_swa = n_swa;
 
                     attn_process_tile(&task);
                 }

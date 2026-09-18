@@ -89,8 +89,8 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
     float sqrt_2 = sqrtf(2.0f);
     float sqrt_embd = sqrtf((float)dim);
 
-    /* Per-layer RoPE table selection for SWA (done inside layer loop) */
-    int swa_period = c->swa_period;
+    /* Per-layer RoPE table selection for SWA (done inside layer loop, via
+     * c->n_swa_layer[l] resolved generically at GGUF-load time). */
 
     /* 1. Token embedding lookup, scaled by sqrt(n_embd) */
     {
@@ -345,7 +345,7 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
          * of the same type (SWA vs global). Matching llama.cpp reuse callback:
          *   is_swa(il) ? n_layer_kv_from_start - 2 : n_layer_kv_from_start - 1
          * i.e. last SWA layer (n_layer_kv-2) or last global layer (n_layer_kv-1) */
-        int is_swa = (swa_period > 0) && ((l % swa_period) < (swa_period - 1));
+        int is_swa = c->n_swa_layer[l] > 0; /* resolved generically at GGUF-load time, see model.h's n_swa_layer[] */
         int kv_ordinal = (l < n_layer_kv) ? l : (is_swa ? n_layer_kv - 2 : n_layer_kv - 1);
         uint8_t *kcache_layer = s->key_cache + (size_t)kv_ordinal * seq_len * s->kv_row_size_k;
         uint8_t *vcache_layer = s->val_cache + (size_t)kv_ordinal * seq_len * s->kv_row_size_v;
@@ -383,7 +383,7 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
              * llama.cpp: is_swa(il) = il % swa_period < (swa_period - 1)
              * SWA layers use freq_base=10000, global uses freq_base=1000000 */
             {
-                int is_swa = (swa_period > 0) && ((l % swa_period) < (swa_period - 1));
+                int is_swa = c->n_swa_layer[l] > 0; /* resolved generically at GGUF-load time, see model.h's n_swa_layer[] */
                 float *lcos = (is_swa ? s->rope_cos_swa : s->rope_cos) + (size_t)pos * half_dim;
                 float *lsin = (is_swa ? s->rope_sin_swa : s->rope_sin) + (size_t)pos * half_dim;
                 rope(s->q, s->xb2, head_dim, n_heads, n_kv_heads, lcos, lsin, c->rope_type, half_dim);
@@ -433,6 +433,7 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
                 gctx.kv_hadamard_v = s->kv_hadamard_v;
                 gctx.kv_hadamard_size = s->kv_hadamard_size;
                 gctx.attn_scale = (c->f_attention_scale > 0) ? c->f_attention_scale : (1.0f / sqrtf((float)head_dim));
+                gctx.n_swa = c->n_swa_layer[l];
                 tensor_parallel_for(c->n_kv_heads, attention_group, &gctx);
             }
         } else {
@@ -449,7 +450,7 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
 
             /* RoPE on Q only (same SWA/global selection as KV layer above) */
             {
-                int is_swa = (swa_period > 0) && ((l % swa_period) < (swa_period - 1));
+                int is_swa = c->n_swa_layer[l] > 0; /* resolved generically at GGUF-load time, see model.h's n_swa_layer[] */
                 float *lcos = (is_swa ? s->rope_cos_swa : s->rope_cos) + (size_t)pos * half_dim;
                 float *lsin = (is_swa ? s->rope_sin_swa : s->rope_sin) + (size_t)pos * half_dim;
                 rope(s->q, s->xb2, head_dim, n_heads, n_kv_heads, lcos, lsin, c->rope_type, half_dim);
@@ -469,6 +470,7 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
                 gctx.kv_hadamard_v = s->kv_hadamard_v;
                 gctx.kv_hadamard_size = s->kv_hadamard_size;
                 gctx.attn_scale = (c->f_attention_scale > 0) ? c->f_attention_scale : (1.0f / sqrtf((float)head_dim));
+                gctx.n_swa = c->n_swa_layer[l];
                 tensor_parallel_for(c->n_kv_heads, attention_group, &gctx);
             }
         }

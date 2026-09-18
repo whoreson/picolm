@@ -5,7 +5,9 @@ layout(set = 0, binding = 1, std430) readonly buffer B_KK { float kv_k_data[]; }
 layout(set = 0, binding = 2, std430) readonly buffer B_KV { float kv_v_data[]; };
 layout(set = 0, binding = 3, std430) writeonly buffer B_OUT { float xb_out[]; };
 layout(push_constant) uniform PC {
-    int lo, sp, nt, nh, nkh, hd; float inv_sqrt_hd; int pad;
+    int lo, sp, nt, nh, nkh, hd; float inv_sqrt_hd;
+    int n_swa; // 0 = full causal attention; >0 = sliding-window size
+               // (see model.h's n_swa_layer[]). Was an unused `pad` field.
 } p;
 void main() {
     uint gid = gl_GlobalInvocationID.x;
@@ -19,9 +21,13 @@ void main() {
     int kvh = h / kv_mul;
     int q_stride = p.nh * hd, kv_stride = nkh * hd;
     int q_off = qi * q_stride + h * hd;
+    // Sliding window: only KV positions in [win_start, qi] are attended.
+    // win_start == 0 for every non-SWA layer/model (n_swa == 0), which is
+    // the pre-SWA, full causal behavior -- strict no-op for those.
+    int win_start = (p.n_swa > 0) ? max(0, qi - p.n_swa + 1) : 0;
     float scores[256]; int valid = 0;
     float max_sc = -1e20f;
-    for (int ti = 0; ti < nt; ti++) {
+    for (int ti = win_start; ti < nt; ti++) {
         // Causal mask: only attend to tokens <= qi
         if (ti > qi) break;
         float s = 0.0f;
@@ -35,7 +41,7 @@ void main() {
     float acc[64];
     for (int d = 0; d < hd; d++) acc[d] = 0.0f;
     float sum_exp = 0.0f;
-    for (int ti = 0; ti < valid; ti++) {
+    for (int ti = win_start; ti < valid; ti++) {
         float e = exp(scores[ti] - max_sc);
         sum_exp += e;
         int v_off = ti * kv_stride + kvh * hd;

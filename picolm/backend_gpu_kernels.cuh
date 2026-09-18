@@ -185,7 +185,7 @@ __global__ void picolm_silu_mul(float *gate, const float *up, size_t n);
  *   acc[d] = acc[d]*rescale + weight*v[d]
  * covers both softmax-update branches without duplicating the loop. */
 
-__global__ void picolm_gpu_attention_decode_kernel( float *xb_out, const float *q_dev, const uint16_t *kv_k, const uint16_t *kv_v, int layer_ordinal, int pos, int n_heads, int n_kv_heads, int head_dim, int max_seq_len, size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes);
+__global__ void picolm_gpu_attention_decode_kernel( float *xb_out, const float *q_dev, const uint16_t *kv_k, const uint16_t *kv_v, int layer_ordinal, int pos, int n_heads, int n_kv_heads, int head_dim, int max_seq_len, size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, int n_swa);
 
 /* ---- Split-K decode attention ----
  * The shared-memory rewrite above fixed the accumulator bug, but grid =
@@ -214,7 +214,7 @@ __global__ void picolm_gpu_attention_decode_kernel( float *xb_out, const float *
  *   partial_acc: [n_heads][n_splits][head_dim]
  * index(kv_h, split, g) = (kv_h * n_splits + split) * kv_mul + g */
 
-__global__ void picolm_gpu_attention_decode_split_kernel( float *partial_max, float *partial_sum, float *partial_acc, const float *q_dev, const uint16_t *kv_k, const uint16_t *kv_v, int layer_ordinal, int pos, int n_heads, int n_kv_heads, int head_dim, int max_seq_len, size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, int n_splits, int chunk_size);
+__global__ void picolm_gpu_attention_decode_split_kernel( float *partial_max, float *partial_sum, float *partial_acc, const float *q_dev, const uint16_t *kv_k, const uint16_t *kv_v, int layer_ordinal, int pos, int n_heads, int n_kv_heads, int head_dim, int max_seq_len, size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, int n_splits, int chunk_size, int n_swa);
 
 /* Merges n_splits partial states per KV head via the standard online-
  * softmax merge rule, writes final normalized output. Grid = n_kv_heads. */
@@ -235,10 +235,10 @@ __global__ void picolm_gpu_attention_decode_merge_kernel( float *xb_out, const f
  * Identical algorithm to picolm_gpu_attention_prefill_kernel but takes
  * FP32 K/V buffers with layout [pos][kv_head][head_dim]. */
 
-__global__ void picolm_gpu_attention_prefill_f32kv_kernel( float *xb_out,  const float *q_dev,  const float *kv_k,  const float *kv_v,  int start_pos, int n_tokens, int n_heads, int n_kv_heads, int head_dim, int tile_q);
+__global__ void picolm_gpu_attention_prefill_f32kv_kernel( float *xb_out,  const float *q_dev,  const float *kv_k,  const float *kv_v,  int start_pos, int n_tokens, int n_heads, int n_kv_heads, int head_dim, int tile_q, int n_swa);
 
 
-__global__ void picolm_gpu_attention_prefill_kernel( float *xb_out,  const float *q_dev,  const uint16_t *kv_k,  const uint16_t *kv_v,  int layer_ordinal, int start_pos, int n_tokens, int n_heads, int n_kv_heads, int head_dim, int max_seq_len, size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, int tile_q);
+__global__ void picolm_gpu_attention_prefill_kernel( float *xb_out,  const float *q_dev,  const uint16_t *kv_k,  const uint16_t *kv_v,  int layer_ordinal, int start_pos, int n_tokens, int n_heads, int n_kv_heads, int head_dim, int max_seq_len, size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, int tile_q, int n_swa);
 
 /* Warp/wavefront-group scalar attention prefill: default scalar path on
  * both HIP and CUDA. Same algorithm and same bit-exact CPU-matching
@@ -248,7 +248,7 @@ __global__ void picolm_gpu_attention_prefill_kernel( float *xb_out,  const float
  * for the correctness argument (why the two reductions are bit-identical).
  * Legacy block-wide-reduce kernel available via PICOLM_ATTN_SLOW_SCALAR=1. */
 #define ATTN_WARPGRP_SIZE 32
-__global__ void picolm_gpu_attention_prefill_warpgrp_kernel( float *xb_out,  const float *q_dev,  const uint16_t *kv_k,  const uint16_t *kv_v,  int layer_ordinal, int start_pos, int n_tokens, int n_heads, int n_kv_heads, int head_dim, int max_seq_len, size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, int tile_q);
+__global__ void picolm_gpu_attention_prefill_warpgrp_kernel( float *xb_out,  const float *q_dev,  const uint16_t *kv_k,  const uint16_t *kv_v,  int layer_ordinal, int start_pos, int n_tokens, int n_heads, int n_kv_heads, int head_dim, int max_seq_len, size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, int tile_q, int n_swa);
 
 /* dot2 variant: same signature, only defined when FAST_FP16_AVAILABLE
  * (see backend_gpu_common.cuh). Not bit-exact -- see kernel comment in
@@ -256,7 +256,7 @@ __global__ void picolm_gpu_attention_prefill_warpgrp_kernel( float *xb_out,  con
  * code compiles on all platforms; guard the *call site*, not this
  * declaration, with #ifdef GPU_FP16_DOT2_AVAILABLE. */
 /* Always declare for cudafe stub generation (body is conditional). */
-extern __global__ void picolm_gpu_attention_prefill_warpgrp_dot2_kernel( float *xb_out,  const float *q_dev,  const uint16_t *kv_k,  const uint16_t *kv_v,  int layer_ordinal, int start_pos, int n_tokens, int n_heads, int n_kv_heads, int head_dim, int max_seq_len, size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, int tile_q);
+extern __global__ void picolm_gpu_attention_prefill_warpgrp_dot2_kernel( float *xb_out,  const float *q_dev,  const uint16_t *kv_k,  const uint16_t *kv_v,  int layer_ordinal, int start_pos, int n_tokens, int n_heads, int n_kv_heads, int head_dim, int max_seq_len, size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, int tile_q, int n_swa);
 
 /* FP16 Tensor Core Flash Attention 2 Prefill kernel.
  * Uses mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 for Q@K scoring.
@@ -273,7 +273,7 @@ __global__ void picolm_gpu_attention_prefill_fa2_kernel(
     const uint16_t *kv_k, const uint16_t *kv_v,
     int layer_ordinal, int start_pos, int n_tokens,
     int n_heads, int n_kv_heads, int head_dim, int max_seq_len,
-    size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes);
+    size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, int n_swa);
 
 /* ---- SSM alpha/beta batched vec_dot kernel ----
  * Each thread block handles one head. Weights: column-major

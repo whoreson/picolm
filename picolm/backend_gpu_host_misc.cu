@@ -515,12 +515,13 @@ static int
 attn_decode_dispatch(float *xb_dev, const float *q_dev,
                       int layer_ordinal, int pos,
                       int n_heads, int n_kv_heads, int head_dim, int max_seq_len,
-                      gpu_device_ctx_t *ctx, int device) {
+                      gpu_device_ctx_t *ctx, int device, int n_swa) {
     int kv_mul = n_heads / n_kv_heads;
     size_t kv_pos_stride_bytes = (size_t)n_kv_heads * head_dim * sizeof(uint16_t);
     size_t kv_head_stride_bytes = head_dim * sizeof(uint16_t);
 
     int total_kv = pos + 1;
+    if (n_swa > 0 && n_swa < total_kv) total_kv = n_swa; /* SWA shrinks the split-K work estimate */
     int n_splits = (total_kv + ATTN_DECODE_MIN_CHUNK - 1) / ATTN_DECODE_MIN_CHUNK;
     if (n_splits > ATTN_DECODE_MAX_SPLITS) n_splits = ATTN_DECODE_MAX_SPLITS;
     if (n_splits < 1) n_splits = 1;
@@ -537,12 +538,16 @@ attn_decode_dispatch(float *xb_dev, const float *q_dev,
         picolm_gpu_attention_decode_kernel<<<grid, 256, (unsigned)shared_bytes, ctx->stream>>>(
             xb_dev, q_dev, g_kv_k_dev[device], g_kv_v_dev[device],
             layer_ordinal, pos, n_heads, n_kv_heads, head_dim, max_seq_len,
-            kv_pos_stride_bytes, kv_head_stride_bytes);
+            kv_pos_stride_bytes, kv_head_stride_bytes, n_swa);
         if (!gpu_ok(gpuGetLastError(), "attn decode kernel")) return 0;
         return 1;
     }
 
-    int chunk_size = (total_kv + n_splits - 1) / n_splits;
+    /* Split-K still splits over the FULL [0,pos] range below (chunk_size
+     * is computed from pos+1, not the shrunk total_kv, so split
+     * boundaries stay simple); each split kernel clamps its own [t0,t1)
+     * to the SWA window internally (see picolm_gpu_attention_decode_split_kernel). */
+    int chunk_size = (pos + 1 + n_splits - 1) / n_splits;
     size_t need = (size_t)n_heads * n_splits * (head_dim + 2) * sizeof(float);
     if (!reserve(&ctx->attn_partial, &ctx->attn_partial_cap, need)) return 0;
     float *partial_max = ctx->attn_partial;
@@ -555,7 +560,7 @@ attn_decode_dispatch(float *xb_dev, const float *q_dev,
         partial_max, partial_sum, partial_acc,
         q_dev, g_kv_k_dev[device], g_kv_v_dev[device],
         layer_ordinal, pos, n_heads, n_kv_heads, head_dim, max_seq_len,
-        kv_pos_stride_bytes, kv_head_stride_bytes, n_splits, chunk_size);
+        kv_pos_stride_bytes, kv_head_stride_bytes, n_splits, chunk_size, n_swa);
     if (!gpu_ok(gpuGetLastError(), "attn decode split kernel")) return 0;
 
     size_t merge_shared = (size_t)kv_mul * 2 * sizeof(float);
@@ -572,7 +577,7 @@ extern "C" int
 picolm_gpu_attention_decode(float *xb_out, const float *q_host,
                              int layer_ordinal, int pos,
                              int n_heads, int n_kv_heads, int head_dim,
-                             int max_seq_len, int device) {
+                             int max_seq_len, int device, int n_swa) {
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
     if (!g_kv_k_dev[device] || !g_kv_v_dev[device]) return 0;
@@ -591,7 +596,7 @@ picolm_gpu_attention_decode(float *xb_out, const float *q_host,
 
     if (!attn_decode_dispatch(ctx->y, ctx->x, layer_ordinal, pos,
                               n_heads, n_kv_heads, head_dim, max_seq_len,
-                              ctx, device)) return 0;
+                              ctx, device, n_swa)) return 0;
 
     if (!gpu_ok(gpuDeviceSynchronize(), "attn decode sync")) return 0;
 
@@ -614,7 +619,7 @@ extern "C" int
 picolm_gpu_attention_decode_dev(float *xb_out_dev, const float *q_dev,
                                  int layer_ordinal, int pos,
                                  int n_heads, int n_kv_heads, int head_dim,
-                                 int max_seq_len, int device) {
+                                 int max_seq_len, int device, int n_swa) {
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
     if (!g_kv_k_dev[device] || !g_kv_v_dev[device]) return 0;
@@ -625,7 +630,7 @@ picolm_gpu_attention_decode_dev(float *xb_out_dev, const float *q_dev,
 
     return attn_decode_dispatch(xb_out_dev, q_dev, layer_ordinal, pos,
                                  n_heads, n_kv_heads, head_dim, max_seq_len,
-                                 ctx, device);
+                                 ctx, device, n_swa);
 }
 
 /* Total dynamic shared memory picolm_gpu_attention_prefill_kernel needs:
@@ -777,7 +782,7 @@ extern "C" int
 picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
                               int layer_ordinal, int start_pos, int n_tokens,
                               int n_heads, int n_kv_heads, int head_dim,
-                              int max_seq_len, int device) {
+                              int max_seq_len, int device, int n_swa) {
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
     if (!g_kv_k_dev[device] || !g_kv_v_dev[device]) return 0;
@@ -814,7 +819,7 @@ picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
                 ctx->y, ctx->x,
                 g_kv_k_dev[device], g_kv_v_dev[device],
                 layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim, max_seq_len,
-                kv_pos_stride_bytes, kv_head_stride_bytes);
+                kv_pos_stride_bytes, kv_head_stride_bytes, n_swa);
             if (!gpu_ok(gpuGetLastError(), "attn prefill fa2 (host)")) return 0;
         } else {
             use_fa2 = 0;
@@ -850,7 +855,7 @@ picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
                     ctx->y, ctx->x,
                     g_kv_k_dev[device], g_kv_v_dev[device],
                     layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim, max_seq_len,
-                    kv_pos_stride_bytes, kv_head_stride_bytes, tile_q);
+                    kv_pos_stride_bytes, kv_head_stride_bytes, tile_q, n_swa);
             } else
 #endif
             {
@@ -860,7 +865,7 @@ picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
                     ctx->y, ctx->x,
                     g_kv_k_dev[device], g_kv_v_dev[device],
                     layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim, max_seq_len,
-                    kv_pos_stride_bytes, kv_head_stride_bytes, tile_q);
+                    kv_pos_stride_bytes, kv_head_stride_bytes, tile_q, n_swa);
             }
         } else {
             gpu_dispatch_print("attn_prefill_scalar_host");
@@ -877,7 +882,7 @@ picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
                 ctx->y, ctx->x,
                 g_kv_k_dev[device], g_kv_v_dev[device],
                 layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim, max_seq_len,
-                kv_pos_stride_bytes, kv_head_stride_bytes, tile_q);
+                kv_pos_stride_bytes, kv_head_stride_bytes, tile_q, n_swa);
         }
     }
 
@@ -898,7 +903,7 @@ extern "C" int
 picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
                                   int layer_ordinal, int start_pos, int n_tokens,
                                   int n_heads, int n_kv_heads, int head_dim,
-                                  int max_seq_len, int device) {
+                                  int max_seq_len, int device, int n_swa) {
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
     if (!g_kv_k_dev[device] || !g_kv_v_dev[device]) return 0;
@@ -936,7 +941,7 @@ picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
                 xb_out_dev, q_dev,
                 g_kv_k_dev[device], g_kv_v_dev[device],
                 layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim, max_seq_len,
-                kv_pos_stride_bytes, kv_head_stride_bytes);
+                kv_pos_stride_bytes, kv_head_stride_bytes, n_swa);
             if (!gpu_ok(gpuGetLastError(), "attn prefill fa2 (dev)")) return 0;
             return 1;
         }
@@ -962,7 +967,7 @@ picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
                 xb_out_dev, q_dev,
                 g_kv_k_dev[device], g_kv_v_dev[device],
                 layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim, max_seq_len,
-                kv_pos_stride_bytes, kv_head_stride_bytes, tile_q);
+                kv_pos_stride_bytes, kv_head_stride_bytes, tile_q, n_swa);
             if (!gpu_ok(gpuGetLastError(), "attn prefill warpgrp dot2 (dev)")) return 0;
             return 1;
         }
@@ -973,7 +978,7 @@ picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
             xb_out_dev, q_dev,
             g_kv_k_dev[device], g_kv_v_dev[device],
             layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim, max_seq_len,
-            kv_pos_stride_bytes, kv_head_stride_bytes, tile_q);
+            kv_pos_stride_bytes, kv_head_stride_bytes, tile_q, n_swa);
         if (!gpu_ok(gpuGetLastError(), "attn prefill warpgrp (dev)")) return 0;
         return 1;
     }
@@ -993,7 +998,7 @@ picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
         xb_out_dev, q_dev,
         g_kv_k_dev[device], g_kv_v_dev[device],
         layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim, max_seq_len,
-        kv_pos_stride_bytes, kv_head_stride_bytes, tile_q);
+        kv_pos_stride_bytes, kv_head_stride_bytes, tile_q, n_swa);
     if (!gpu_ok(gpuGetLastError(), "attn prefill (dev)")) return 0;
     return 1;
 }
@@ -1007,7 +1012,7 @@ picolm_gpu_attention_prefill_f32kv(float *xb_out_dev, const float *q_dev,
                                     const float *k_dev, const float *v_dev,
                                     int start_pos, int n_tokens,
                                     int n_heads, int n_kv_heads, int head_dim,
-                                    int device) {
+                                    int device, int n_swa) {
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
     if (head_dim > 256) return 0;
@@ -1044,7 +1049,7 @@ picolm_gpu_attention_prefill_f32kv(float *xb_out_dev, const float *q_dev,
     dim3 grid((unsigned)n_heads, (unsigned)n_tiles_q, 1);
     picolm_gpu_attention_prefill_f32kv_kernel<<<grid, block_threads, (unsigned)shared_bytes, ctx->stream>>>(
         xb_out_dev, q_dev, k_dev, v_dev,
-        start_pos, n_tokens, n_heads, n_kv_heads, head_dim, tile_q);
+        start_pos, n_tokens, n_heads, n_kv_heads, head_dim, tile_q, n_swa);
     if (!gpu_ok(gpuGetLastError(), "attn prefill f32kv (dev)")) return 0;
     return 1;
 }

@@ -2058,6 +2058,7 @@ static float *model_forward_gpt2(model_t *m, int token, int pos) {
         gctx.n_kv_heads = n_heads;
         gctx.kv_hadamard_k = 0; gctx.kv_hadamard_v = 0; gctx.kv_hadamard_size = 0;
         gctx.attn_scale = 1.0f / sqrtf((float)head_dim);
+        gctx.n_swa = 0; /* GPT-2 has no SWA layers */
         tensor_parallel_for(n_heads, attention_group, &gctx);
 
         /* DEBUG: dump attention output for layer 0 */
@@ -2590,6 +2591,7 @@ float *model_forward(model_t *m, int token, int pos) {
         gctx.kv_hadamard_v = s->kv_hadamard_v;
         gctx.kv_hadamard_size = s->kv_hadamard_size;
         gctx.attn_scale = 1.0f / sqrtf((float)head_dim);
+        gctx.n_swa = c->n_swa_layer[l];
 
 #ifdef PICOLM_GPU
         /* Phase 1: GPU attention decode path */
@@ -2599,7 +2601,7 @@ float *model_forward(model_t *m, int token, int pos) {
             if (picolm_gpu_attention_decode(s->xb, s->q,
                                              this_attn_ordinal, pos,
                                              n_heads, n_kv_heads, head_dim,
-                                             seq_len, gpu_dev)) {
+                                             seq_len, gpu_dev, c->n_swa_layer[l])) {
                 /* GPU attention succeeded */
             } else {
                 tensor_parallel_for(c->n_kv_heads, attention_group, &gctx);
@@ -3393,7 +3395,8 @@ static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_to
                                   dim, s->kv_type_k, s->kv_type_v,
                                   s->kv_row_size_k, s->kv_row_size_v,
                                   s->kv_head_stride_k, s->kv_head_stride_v,
-                                  1.0f / sqrtf((float)head_dim));
+                                  1.0f / sqrtf((float)head_dim),
+                                  0 /* GPT-2 has no SWA layers */);
         }
         /* Debug: dump Q for last token, head 0, layer 0 */
         if (l == 0 && getenv("PICOLM_DBG")) {
@@ -3979,7 +3982,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                 if (picolm_gpu_attention_prefill(xb_batch, q_batch,
                                                   this_attn_ord, start_pos, n_tokens,
                                                   n_heads, c->n_kv_heads, head_dim,
-                                                  seq_len, gpu_dev)) {
+                                                  seq_len, gpu_dev, c->n_swa_layer[l])) {
                     /* GPU attention succeeded */
                 } else {
                     batch_attention_layer(xb_batch, q_batch, kcl, vcl,
@@ -3988,7 +3991,8 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                                           max_dim, (int)s->kv_type_k, (int)s->kv_type_v,
                                           s->kv_row_size_k, s->kv_row_size_v,
                                           s->kv_head_stride_k, s->kv_head_stride_v,
-                                          1.0f / sqrtf((float)head_dim));
+                                          1.0f / sqrtf((float)head_dim),
+                                          c->n_swa_layer[l]);
                 }
             } else
 #endif
@@ -4000,7 +4004,8 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                                       max_dim, (int)s->kv_type_k, (int)s->kv_type_v,
                                       s->kv_row_size_k, s->kv_row_size_v,
                                       s->kv_head_stride_k, s->kv_head_stride_v,
-                                      1.0f / sqrtf((float)head_dim));
+                                      1.0f / sqrtf((float)head_dim),
+                                      c->n_swa_layer[l]);
             }
         }
         /* Dump attn_raw (pre-gate) for comparison */

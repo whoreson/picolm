@@ -90,6 +90,16 @@ static int str_eq(gguf_str_t s, const char *lit) {
     return s.len == n && memcmp(s.str, lit, n) == 0;
 }
 
+/* True if key ends with `suffix` (e.g. key="gemma3.attention.sliding_window",
+ * suffix=".attention.sliding_window"). Architecture-agnostic on purpose: it
+ * lets SWA-related keys (see below) be picked up for ANY architecture
+ * string the GGUF file declares -- current ones (gemma3, gemma3n) and any
+ * future one -- without hardcoding each family's name here. */
+static int key_has_suffix(gguf_str_t s, const char *suffix) {
+    size_t n = strlen(suffix);
+    return s.len >= n && memcmp(s.str + (s.len - n), suffix, n) == 0;
+}
+
 /* Forward declarations */
 static uint64_t skip_meta_value(reader_t *r, uint32_t vtype, int *is_numeric);
 static int gguf_format_value(char *buf, int buflen, reader_t *r, uint32_t vtype);
@@ -870,6 +880,9 @@ int parse_gguf(model_t *m, int max_seq_len) {
     cfg->f_sparsity_std_mul = 0.0f;
     cfg->n_swa = 0;
     cfg->swa_period = 0;
+    memset(cfg->swa_layer_bool, 0, sizeof(cfg->swa_layer_bool));
+    cfg->has_swa_pattern = 0;
+    cfg->n_swa_pattern_len = 0;
     cfg->rope_freq_base_swa = 10000.0f;
     cfg->f_attention_scale = 0.0f;  /* 0 = use 1/sqrt(head_dim) default */
     cfg->n_altup = 0;
@@ -1040,16 +1053,36 @@ int parse_gguf(model_t *m, int max_seq_len) {
                 shared_kv = (int)skip_meta_value(&r, vtype, NULL);
             }
             cfg->n_layer_kv_from_start = cfg->n_layers - shared_kv;
-        } else if (str_eq(key, "gemma3n.attention.sliding_window")) {
-            int dummy; cfg->n_swa = (int)skip_meta_value(&r, vtype, &dummy);
-        } else if (str_eq(key, "gemma3n.attention.sliding_window_pattern")) {
-            /* ARRAY of bool (elem_type=8): [true, true, true, true, false, ...]
-             * We read the pattern period from the array length.
-             * The pattern repeats with period = array_length / (count of true+false).
-             * Actually, the pattern is just a per-layer boolean array.
-             * We store it in a bitfield in layer_type or a separate array.
-             * For now, just skip it - we'll derive swa_pattern from swa_period. */
-            int dummy; skip_meta_value(&r, vtype, &dummy);
+        } else if (key_has_suffix(key, ".attention.sliding_window")
+                   || str_eq(key, "attention.sliding_window")) {
+            /* Generic across architectures on purpose -- see key_has_suffix().
+             * May legitimately be a scalar or (rarely) a per-layer array of
+             * window sizes; read_ffn_length() already handles both (max of
+             * the array, or the scalar) and is not actually FFN-specific. */
+            cfg->n_swa = (int)read_ffn_length(&r, vtype);
+        } else if (key_has_suffix(key, ".attention.sliding_window_pattern")
+                   || str_eq(key, "attention.sliding_window_pattern")) {
+            /* ARRAY of bool: one entry per transformer layer, true = SWA,
+             * false = full/"global" attention -- exactly what llama.cpp
+             * exports for the Gemma-3 family (and, going forward, any
+             * other architecture using the same convention). Read it in
+             * full into swa_layer_bool[]; n_swa_layer[] itself is resolved
+             * from this once n_layers is known, right after this parse
+             * loop finishes (see "Resolve per-layer SWA window sizes"
+             * below). */
+            if (vtype == GGUF_META_ARRAY) {
+                uint32_t arr_type = read_u32(&r);
+                uint64_t arr_len  = read_u64(&r);
+                cfg->has_swa_pattern = 1;
+                cfg->n_swa_pattern_len = (int)(arr_len > (uint64_t)MAX_LAYERS ? (uint64_t)MAX_LAYERS : arr_len);
+                for (uint64_t k = 0; k < arr_len; k++) {
+                    int dummy;
+                    uint64_t v = skip_meta_value(&r, arr_type, &dummy);
+                    if (k < (uint64_t)MAX_LAYERS) cfg->swa_layer_bool[k] = (uint8_t)(v != 0);
+                }
+            } else {
+                int dummy; skip_meta_value(&r, vtype, &dummy);
+            }
         }
         /* MoE specific config (qwen35moe) */
         else if (str_eq(key, "qwen35moe.expert_count")) {
@@ -1268,6 +1301,43 @@ int parse_gguf(model_t *m, int max_seq_len) {
         cfg->rope_freq_base_swa = 10000.0f;
     }
 
+    /* ---- Resolve per-layer SWA window sizes (n_swa_layer[]) ----
+     * This is the single step that turns whatever the GGUF file (or the
+     * family defaults just above) provided into the per-layer array every
+     * attention code path actually consults -- CPU decode/prefill, every
+     * GPU backend's decode/prefill kernels, all of it (see model.h's
+     * n_swa_layer[] doc comment). Runs once n_layers is final, in
+     * priority order:
+     *   1. an explicit per-layer boolean pattern read from the GGUF file
+     *      itself (has_swa_pattern, from any "*.attention.sliding_window_
+     *      pattern" key -- architecture-agnostic, see key_has_suffix());
+     *   2. a period, either read directly from the GGUF or defaulted for
+     *      a known family above (e.g. Gemma-3n's swa_period=5);
+     *   3. if only a window size was given with no pattern/period at all,
+     *      every layer is SWA (covers "one fixed window for the whole
+     *      model" architectures, e.g. Gemma-3's simple case);
+     *   4. otherwise every entry is 0 (full attention) -- the no-op case
+     *      for every model family that predates SWA (Llama, Mistral, Qwen,
+     *      GPT-2, ...) and the only case those families ever hit.
+     * A brand new SWA architecture in the future needs nothing beyond
+     * whichever of the above its GGUF export already matches -- no
+     * attention-kernel changes, on any backend, ever again. */
+    memset(cfg->n_swa_layer, 0, sizeof(cfg->n_swa_layer));
+    if (cfg->n_swa > 0) {
+        if (cfg->has_swa_pattern) {
+            for (int l = 0; l < cfg->n_layers && l < MAX_LAYERS; l++) {
+                int is_swa = (l < cfg->n_swa_pattern_len) ? cfg->swa_layer_bool[l] : 0;
+                cfg->n_swa_layer[l] = is_swa ? cfg->n_swa : 0;
+            }
+        } else if (cfg->swa_period > 0) {
+            for (int l = 0; l < cfg->n_layers && l < MAX_LAYERS; l++) {
+                int is_swa = (l % cfg->swa_period) < (cfg->swa_period - 1);
+                cfg->n_swa_layer[l] = is_swa ? cfg->n_swa : 0;
+            }
+        } else {
+            for (int l = 0; l < cfg->n_layers && l < MAX_LAYERS; l++) cfg->n_swa_layer[l] = cfg->n_swa;
+        }
+    }
     /* ---- Parse tensor info entries (split-aware) ---- */
     /* tensor_info_t with split_idx */
     typedef struct {
