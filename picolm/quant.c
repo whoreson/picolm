@@ -7041,6 +7041,48 @@ void vec_dot_q4i_0x8_q8_0(const void *vx, const void *wy, int n, float *out, int
         out[row] = row_acc[row];
     return;
 
+#elif defined(PICOLM_NEON)
+    /* NEON int8 MAC: vmlal_s8 for 8x8 -> 4x2 int32 accumulate.
+     * Process one row at a time. Each row: 4 chunks of 8 values per block.
+     * Two vmlal_s8 per chunk (split 8 into 4+4). */
+    {
+    const block_q4i_0x8 *bp = (const block_q4i_0x8 *)vx;
+    const block_q8_0 *ap = (const block_q8_0 *)wy;
+    int nb = n / 32;
+    static const int group_rows[2][4] = {{0, 1, 4, 5}, {2, 3, 6, 7}};
+
+    for (int row = 0; row < nrows && row < 8; row++) {
+        int is_even = (row == 0 || row == 1 || row == 4 || row == 5);
+        const int *rows = group_rows[is_even ? 0 : 1];
+        int ri = -1;
+        for (int r = 0; r < 4; r++) if (rows[r] == row) { ri = r; break; }
+        int group_off = is_even ? 0 : 128;
+        float sumf = 0.0f;
+        for (int b = 0; b < nb; b++) {
+            float wd = fp16_to_fp32_lookup(bp[b].d[row]);
+            float ad = fp16_to_fp32_lookup(ap[b].d);
+            const int8_t *wp = bp[b].qs + group_off;
+            const int8_t *aq = ap[b].qs;
+            int16x8_t acc16 = vdupq_n_s16(0);
+            for (int k = 0; k < 4; k++) {
+                const int8_t *wv = wp + k * 32 + ri * 8;
+                const int8_t *av = aq + k * 8;
+                int8x8_t w0 = vld1_s8(wv);
+                int8x8_t a0 = vld1_s8(av);
+                acc16 = vmlal_s8(acc16, w0, a0);
+            }
+            /* Horizontal sum: widen to int32 first to avoid int16 overflow */
+            int32x4_t lo32 = vmovl_s16(vget_low_s16(acc16));
+            int32x4_t hi32 = vmovl_s16(vget_high_s16(acc16));
+            int32x4_t sum32 = vaddq_s32(lo32, hi32);
+            int32x2_t h16 = vpadd_s32(vget_low_s32(sum32), vget_high_s32(sum32));
+            int32_t sumi = vget_lane_s32(vpadd_s32(h16, h16), 0);
+            sumf += wd * ad * (float)sumi;
+        }
+        out[row] = sumf;
+    }
+    }
+
 #else
     /* Scalar fallback */
     const block_q4i_0x8 *bp = (const block_q4i_0x8 *)vx;
