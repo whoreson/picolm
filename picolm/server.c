@@ -2209,6 +2209,8 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
 
     /* Reject if prompt exceeds context size */
     if (n_prompt > model->config.max_seq_len) {
+        fprintf(stderr, "[server] ERROR: prompt too large: %d tokens exceeds context size %d, rejecting\n",
+                n_prompt, model->config.max_seq_len);
         char errmsg[512];
         snprintf(errmsg, sizeof(errmsg),
             "{\"error\":{\"message\":\"Prompt too large: %d tokens exceeds model context size %d\"}}",
@@ -2809,6 +2811,8 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
 
     /* Reject if prompt exceeds context size */
     if (n_prompt > model->config.max_seq_len) {
+        fprintf(stderr, "[server] ERROR: prompt too large: %d tokens exceeds context size %d, rejecting\n",
+                n_prompt, model->config.max_seq_len);
         char errmsg[512];
         snprintf(errmsg, sizeof(errmsg),
             "{\"error\":{\"message\":\"Prompt too large: %d tokens exceeds model context size %d\"}}",
