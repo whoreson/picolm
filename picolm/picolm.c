@@ -1601,6 +1601,20 @@ int main(int argc, char **argv) {
         n_prompt = tokenizer_encode(&tokenizer, prompt, prompt_tokens, max_prompt_tokens, model.tok_add_bos);
     }
     fprintf(stderr, "%0.1fms: tokenized %d tokens\n", (double)(clock() - t_start_token) / CLOCKS_PER_SEC * 1000.0, n_prompt);
+
+    /* Defensive: n_prompt == 0 with non-empty input usually means stale .o files
+     * (e.g. after a clean was missed). Catch this early with a clear message. */
+    if (n_prompt == 0 && strlen(prompt) > 0) {
+        fprintf(stderr, "ERROR: tokenizer produced 0 tokens for non-empty prompt.\n");
+        fprintf(stderr, "       This usually means some .o files are stale (e.g. after\n");
+        fprintf(stderr, "       editing tokenizer.c, model_gguf.c, or quant.h without\n");
+        fprintf(stderr, "       running 'make clean'). Fix: run 'make clean && make'.\n");
+        model_free(&model); free(prompt_tokens); free(gen_buf);
+        if (!use_qwen_tok) tokenizer_free(&tokenizer);
+        qwen_tokenize_free(&qwen_enc);
+        exit(1);
+    }
+
     fprintf(stderr, "Prompt tokens (%d):", n_prompt);
     for (int i = 0; i < n_prompt; i++) fprintf(stderr, " %d", prompt_tokens[i]);
     fprintf(stderr, "\n");
