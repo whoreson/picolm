@@ -126,15 +126,123 @@ static int client_alive(SOCKET sock) {
 #endif
 }
 
-/* llama.cpp-style partial stop check: does the end of 'text' match a
- * prefix of 'stop'? Returns the position where the partial match begins,
- * or -1 if no partial match. */
-static int string_find_partial_stop(const char *text, int text_len, const char *stop) {
+/* ---- Stop word matcher ----
+ *
+ * Consolidates stop-word parsing, matching, and streaming output gating
+ * into one type. Replaces the previously duplicated logic across 4
+ * generation call sites (streaming/non-streaming x OpenAI/llama).
+ *
+ * Streaming mode withholds partial matches: if the generated text ends
+ * with a prefix of a stop word (e.g. "the st" when stop is "the stop"),
+ * the ambiguous tail is not sent until more text disambiguates it.
+ * Non-streaming mode skips withholding: partial matches pass through,
+ * and the final text is truncated on full stop.
+ *
+ * Usage (streaming, per token):
+ *     stop_action_t action;
+ *     const char *send = stop_matcher_feed(&sm, piece, 1, &action);
+ *     // send: piece, or withheld+piece, or "" on withhold/stop
+ *     if (action == STOP_FULL) { sm.text is truncated, sm.match_idx set }
+ *
+ * Usage (non-streaming, per token):
+ *     stop_action_t action;
+ *     stop_matcher_feed(&sm, piece, 0, &action);
+ *     if (action == STOP_FULL) { sm.text is truncated }
+ *     // final output: sm.text
+ */
+
+#define STOP_MAX_WORDS 256
+
+typedef enum {
+    STOP_NONE = 0,     /* no match: send the piece */
+    STOP_PARTIAL,      /* partial match: withhold (streaming only) */
+    STOP_FULL,         /* full stop: truncate text, stop generation */
+} stop_action_t;
+
+typedef struct {
+    /* word list (owned) */
+    char *words[STOP_MAX_WORDS];
+    int   n_words;
+    int   max_word_len;
+    /* accumulated text for matching and output */
+    char *text;
+    int   text_len;
+    int   text_cap;
+    /* streaming: withheld output pending flush */
+    char *pending;         /* content withheld from client */
+    int   pending_len;
+    int   pending_cap;
+    /* assembled send buffer (pending + piece on flush) */
+    char *send_buf;
+    int   send_cap;
+    /* match state */
+    int   match_idx;       /* stop word index on STOP_FULL, -1 otherwise */
+    int   match_pos;       /* position in text where stop word starts */
+} stop_matcher_t;
+
+/* Parse the "stop" field from a cJSON request object.
+ * Accepts array ["stop1","stop2"] or single string "stop". */
+static void stop_matcher_init(stop_matcher_t *sm, cJSON *stop_item) {
+    memset(sm, 0, sizeof(*sm));
+    sm->match_idx = -1;
+    if (stop_item && cJSON_IsArray(stop_item)) {
+        int n = cJSON_GetArraySize(stop_item);
+        if (n > STOP_MAX_WORDS) n = STOP_MAX_WORDS;
+        for (int i = 0; i < n; i++) {
+            cJSON *sw = cJSON_GetArrayItem(stop_item, i);
+            if (cJSON_IsString(sw)) {
+                const char *s = cJSON_GetStringValue(sw);
+                if (s && strlen(s) > 0) {
+                    sm->words[sm->n_words++] = strdup(s);
+                }
+            }
+        }
+    } else if (stop_item && cJSON_IsString(stop_item)) {
+        const char *s = cJSON_GetStringValue(stop_item);
+        if (s && strlen(s) > 0) {
+            sm->words[sm->n_words++] = strdup(s);
+        }
+    }
+    for (int i = 0; i < sm->n_words; i++) {
+        int l = (int)strlen(sm->words[i]);
+        if (l > sm->max_word_len) sm->max_word_len = l;
+    }
+}
+
+/* Reset per-generation state (text, pending, match) while keeping the word
+ * list. Call before starting a new generation loop. */
+static void stop_matcher_reset(stop_matcher_t *sm) {
+    sm->text_len = 0;
+    if (sm->text) sm->text[0] = '\0';
+    if (sm->pending) sm->pending[0] = '\0';
+    if (sm->send_buf) sm->send_buf[0] = '\0';
+    sm->pending_len = 0;
+    sm->match_idx = -1;
+    sm->match_pos = -1;
+}
+
+/* Ensure sm->text is valid (non-NULL, NUL-terminated). Call before using
+ * sm->text as an output string if no tokens have been fed yet. */
+static const char *stop_matcher_text(const stop_matcher_t *sm) {
+    return sm->text ? sm->text : "";
+}
+
+static void stop_matcher_free(stop_matcher_t *sm) {
+    for (int i = 0; i < sm->n_words; i++) free(sm->words[i]);
+    free(sm->text);
+    free(sm->pending);
+    free(sm->send_buf);
+    memset(sm, 0, sizeof(*sm));
+}
+
+/* Does the end of 'text' match a prefix of 'stop'?
+ * Returns the position where the partial match begins, or -1.
+ * Checks decreasing prefix lengths so the longest match wins. */
+static int stop_partial_match(const char *text, int text_len, const char *stop) {
     int stop_len = (int)strlen(stop);
     if (text_len == 0 || stop_len == 0) return -1;
     int max_len = text_len < stop_len ? text_len : stop_len;
     char last_char = text[text_len - 1];
-    /* Check decreasing prefix lengths of stop word */
     for (int len = max_len; len > 0; len--) {
         if (stop[len - 1] == last_char) {
             if (strncmp(text + text_len - len, stop, (size_t)len) == 0) {
@@ -145,49 +253,136 @@ static int string_find_partial_stop(const char *text, int text_len, const char *
     return -1;
 }
 
-/* Check stop words against generated text.
- * Returns: 1 = full stop found, *stop_pos set to match position,
- *         0 = no match,
- *        -1 = partial match (withhold sending this token).
- * *stop_idx set to matched stop word index (or -1). */
-static int check_stop_words(const char *text, int text_len, const char *last_piece,
-                             char **stop_words, int n_stop_words,
-                             int *stop_idx, int *stop_pos) {
-    *stop_idx = -1;
-    *stop_pos = -1;
-    if (n_stop_words <= 0 || !text || text_len <= 0) return 0;
-
-    /* Determine search range: only the last token's region + longest stop word */
-    int last_piece_len = last_piece ? (int)strlen(last_piece) : 0;
-    int max_sw_len = 0;
-    for (int i = 0; i < n_stop_words; i++) {
-        int l = (int)strlen(stop_words[i]);
-        if (l > max_sw_len) max_sw_len = l;
+/* Ensure the text buffer can hold text_len + addition + 1 bytes. */
+static void stop_matcher_reserve(stop_matcher_t *sm, int addition) {
+    int needed = sm->text_len + addition + 1;
+    if (needed > sm->text_cap) {
+        sm->text_cap = needed * 2;
+        sm->text = (char *)realloc(sm->text, (size_t)sm->text_cap);
     }
-    int search_from = text_len - last_piece_len - max_sw_len;
-    if (search_from < 0) search_from = 0;
+}
 
-    /* Phase 1: Full stop word match in the search region */
-    for (int i = 0; i < n_stop_words; i++) {
-        const char *sw = stop_words[i];
+/* Ensure a buffer can hold len + addition + 1 bytes. */
+static char *stop_buf_reserve(char *buf, int *cap, int len, int addition) {
+    int needed = len + addition + 1;
+    if (needed > *cap) {
+        *cap = needed * 2;
+        buf = (char *)realloc(buf, (size_t)*cap);
+    }
+    return buf;
+}
+
+/* Append piece to the internal text buffer. */
+static void stop_matcher_append(stop_matcher_t *sm, const char *piece) {
+    int p_len = piece ? (int)strlen(piece) : 0;
+    stop_matcher_reserve(sm, p_len);
+    if (piece) memcpy(sm->text + sm->text_len, piece, (size_t)(p_len + 1));
+    sm->text_len += p_len;
+}
+
+/* Feed one piece of generated text.
+ * Appends the piece to the internal text buffer, checks for stop word
+ * matches, and returns the text that should be sent to the client.
+ *
+ * Returns a pointer valid until the next call to stop_matcher_feed().
+ * For streaming (streaming != 0):
+ *   STOP_NONE:    the piece (or previously withheld content + piece)
+ *   STOP_PARTIAL: "" (content withheld; will be sent on a later flush)
+ *   STOP_FULL:    "" (withheld content is discarded)
+ * For non-streaming (streaming == 0):
+ *   The return value is not meaningful; use sm->text for the final output.
+ *   Partial matches pass through without withholding.
+ *
+ * On STOP_FULL, sm->text is truncated at the stop word position and
+ * sm->match_idx / sm->match_pos are set. On other actions they are reset.
+ */
+static const char *stop_matcher_feed(stop_matcher_t *sm, const char *piece,
+                                     int streaming, stop_action_t *action) {
+    if (!piece) piece = "";
+    *action = STOP_NONE;
+
+    /* Append the piece to the accumulated text. */
+    stop_matcher_append(sm, piece);
+
+    if (sm->n_words <= 0 || sm->text_len == 0) {
+        return piece;
+    }
+
+    /* Phase 1: full stop word match in the recent text region.
+     * Search from the earliest position where the newly appended piece
+     * could complete a stop word, clamped to 0. */
+    int search_from = sm->text_len - (int)strlen(piece) - sm->max_word_len;
+    if (search_from < 0) search_from = 0;
+    for (int i = 0; i < sm->n_words; i++) {
+        const char *sw = sm->words[i];
         int sw_len = (int)strlen(sw);
-        for (int pos = search_from; pos <= text_len - sw_len; pos++) {
-            if (strncmp(text + pos, sw, (size_t)sw_len) == 0) {
-                *stop_idx = i;
-                *stop_pos = pos;
-                return 1;
+        for (int pos = search_from; pos <= sm->text_len - sw_len; pos++) {
+            if (strncmp(sm->text + pos, sw, (size_t)sw_len) == 0) {
+                sm->match_idx = i;
+                sm->match_pos = pos;
+                *action = STOP_FULL;
+                /* Truncate the text at the stop word position. */
+                sm->text[sm->match_pos] = '\0';
+                sm->text_len = sm->match_pos;
+                /* Discard any pending (withheld) content -- it contains
+                 * prefixes of stop words that would leak into the output. */
+                if (sm->pending) sm->pending[0] = '\0';
+                return "";
             }
         }
     }
 
-    /* Phase 2: Partial match - does text end with a prefix of any stop word? */
-    for (int i = 0; i < n_stop_words; i++) {
-        if (string_find_partial_stop(text, text_len, stop_words[i]) >= 0) {
-            *stop_idx = i;
-            return -1; /* Partial match - withhold sending */
-        }
+    /* Phase 2: partial match -- does the text end with a prefix of any stop
+     * word? If so, the ambiguous tail must not be sent to the client yet.
+     * Find the longest partial match across all stop words. */
+    int best_partial = -1;
+    for (int i = 0; i < sm->n_words; i++) {
+        int pos = stop_partial_match(sm->text, sm->text_len, sm->words[i]);
+        if (pos >= 0 && (best_partial < 0 || pos > best_partial))
+            best_partial = pos;
     }
-    return 0;
+
+    if (best_partial >= 0) {
+        if (!streaming) {
+            /* Non-streaming: no withholding, just pass through. */
+            return piece;
+        }
+        /* Streaming: withhold the entire piece. Previously-sent content
+         * cannot be unsent, so we can only hold back what hasn't been
+         * sent yet. If a previous piece was also withheld, accumulate. */
+        int p_len = (int)strlen(piece);
+        sm->pending = stop_buf_reserve(sm->pending, &sm->pending_cap, sm->pending_len, p_len);
+        memcpy(sm->pending + sm->pending_len, piece, (size_t)(p_len + 1));
+        sm->pending_len += p_len;
+        *action = STOP_PARTIAL;
+        return "";
+    }
+
+    /* No match at all. */
+    sm->match_idx = -1;
+    sm->match_pos = -1;
+
+    /* If there is withheld content, flush it together with the piece. */
+    if (sm->pending_len > 0) {
+        int p_len = sm->pending_len;
+        int piece_len = (int)strlen(piece);
+        sm->send_buf = stop_buf_reserve(sm->send_buf, &sm->send_cap, p_len + piece_len, 0);
+        memcpy(sm->send_buf, sm->pending, (size_t)p_len);
+        memcpy(sm->send_buf + p_len, piece, (size_t)(piece_len + 1));
+        sm->send_buf[p_len + piece_len] = '\0';
+        sm->pending[0] = '\0';
+        sm->pending_len = 0;
+        return sm->send_buf;
+    }
+
+    return piece;
+}
+
+/* Accessor for the matched stop word (valid after STOP_FULL). */
+static const char *stop_matcher_word(const stop_matcher_t *sm) {
+    if (sm->match_idx >= 0 && sm->match_idx < sm->n_words)
+        return sm->words[sm->match_idx];
+    return NULL;
 }
 
 /* GPU decode path selector for server. */
@@ -344,8 +539,6 @@ typedef struct {
     int do_stream;
     int ignore_eos;
     int return_tokens;       /* llama.cpp: return token IDs in stream */
-    char *stop_words[256];
-    int n_stop_words;
     char *model_name;
     int is_chat;             /* OpenAI chat mode */
     int llama_mode;          /* llama.cpp response format */
@@ -1977,27 +2170,9 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
     if (n_choices > 4) n_choices = 4;
     /* Parse stop words - MUST copy before cJSON_Delete.
      * Accept both array ["stop1","stop2"] and single string "stop". */
-    char *stop_words[256];
-    int n_stop_words = 0;
+    stop_matcher_t sm;
     cJSON *stop_item = cJSON_GetObjectItem(req, "stop");
-    if (stop_item && cJSON_IsArray(stop_item)) {
-        int n = cJSON_GetArraySize(stop_item);
-        if (n > 256) { fprintf(stderr, "[server] WARNING: stop words capped from %d to 256\n", n); n = 256; }
-        for (int i = 0; i < n; i++) {
-            cJSON *sw = cJSON_GetArrayItem(stop_item, i);
-            if (cJSON_IsString(sw)) {
-                const char *s = cJSON_GetStringValue(sw);
-                if (s && strlen(s) > 0) {
-                    stop_words[n_stop_words++] = strdup(s);
-                }
-            }
-        }
-    } else if (stop_item && cJSON_IsString(stop_item)) {
-        const char *s = cJSON_GetStringValue(stop_item);
-        if (s && strlen(s) > 0) {
-            stop_words[n_stop_words++] = strdup(s);
-        }
-    }
+    stop_matcher_init(&sm, stop_item);
 
     /* llama.cpp: return_progress - report prefill progress via SSE */
     int return_progress = 0;
@@ -2040,6 +2215,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             n_prompt, model->config.max_seq_len);
         http_send(sock, 413, "application/json", errmsg);
         free(ptokens); free(model_name); free((void *)(uintptr_t)prompt);
+        stop_matcher_free(&sm);
         return;
     }
 
@@ -2123,10 +2299,6 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         sampler_t sampler;
         sampler_init(&sampler, temperature, top_p, top_k, 0.05f, seed);
 
-        /* Withheld buffer for partial stop word matches */
-        char *withheld = (char *)calloc(1, 1024);
-        int withheld_cap = 1024;
-
         double t_start = get_time_ms();
 
         /* ---- Prefill phase ---- */
@@ -2155,9 +2327,8 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         if (n_processed < n_prompt) {
             /* Client disconnected during prefill */
             fprintf(stderr, "[server] prefill cancelled at token %d/%d\n", n_processed, n_prompt);
-            free(withheld);
+            stop_matcher_free(&sm);
             free(chat_prompt); free(raw_prompt_copy); free(model_name); free(ptokens);
-            for (int _si = 0; _si < n_stop_words; _si++) free(stop_words[_si]);
             return;
         }
 
@@ -2167,12 +2338,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
 
         /* ---- Generation phase ---- */
         int gen_count = 0;
-        int sw_match_idx = -1; /* matched stop word index (for final chunk) */
-
-        /* Cumulative output buffer for stop word matching */
-        char *generated_stream = (char *)malloc(max_tokens * 100 + 1);
-        generated_stream[0] = '\0';
-        int generated_stream_cap = max_tokens * 100 + 1;
+        stop_matcher_reset(&sm);
 
         if (n_prefill <= 0) {
             /* Fully cached: need logits for first gen token */
@@ -2197,68 +2363,24 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             }
             if (!piece) piece = "";
 
-            /* Append to cumulative output for stop word matching */
-            {
-                int g_len = (int)strlen(generated_stream);
-                int p_len = (int)strlen(piece);
-                if (g_len + p_len + 1 > generated_stream_cap) {
-                    generated_stream_cap = (g_len + p_len + 1) * 2;
-                    generated_stream = (char *)realloc(generated_stream, generated_stream_cap);
-                }
-                memcpy(generated_stream + g_len, piece, (size_t)(p_len + 1));
-            }
-
-            /* Check stop words (full + partial match, llama.cpp style) */
-            int sw_stop_idx, sw_stop_pos;
-            int sw_result = check_stop_words(generated_stream,
-                (int)strlen(generated_stream), piece,
-                stop_words, n_stop_words, &sw_stop_idx, &sw_stop_pos);
-            int stopped = (sw_result == 1);
-            int partial = (sw_result == -1);
-                        if (stopped && sw_stop_pos >= 0) {
-                generated_stream[sw_stop_pos] = '\0';
-                if (sw_match_idx < 0) sw_match_idx = sw_stop_idx; /* save first match */
-            }
+            /* Check stop words and get the text to send */
+            stop_action_t action;
+            const char *send_piece = stop_matcher_feed(&sm, piece, 1, &action);
+            int stopped = (action == STOP_FULL);
 
             /* Build chunk with optional timing */
             cJSON *chunk = cJSON_CreateObject();
             cJSON *choice = cJSON_CreateObject();
             cJSON *delta = cJSON_CreateObject();
             if (gen_count == 0) cJSON_AddStringToObject(delta, "role", is_chat ? "assistant" : "");
-            if (stopped || partial) {
-                if (partial) {
-                    int w_len = (int)strlen(withheld);
-                    int p_len = (int)strlen(piece);
-                    if (w_len + p_len + 1 > withheld_cap) {
-                        withheld_cap = (w_len + p_len + 1) * 2;
-                        withheld = (char *)realloc(withheld, (size_t)withheld_cap);
-                    }
-                    memcpy(withheld + w_len, piece, (size_t)(p_len + 1));
-                    cJSON_AddStringToObject(delta, "content", "");
-                    cJSON_AddStringToObject(choice, "finish_reason", "");
-                } else {
-                    /* Full stop: discard withheld content -- it contains prefixes
-                     * of stop words that would leak into the output. The
-                     * generated_stream was already truncated at sw_stop_pos. */
-                    withheld[0] = '\0';
-                    cJSON_AddStringToObject(choice, "finish_reason", "stop");
-                }
+            if (stopped) {
+                cJSON_AddStringToObject(delta, "content", "");
+                cJSON_AddStringToObject(choice, "finish_reason", "stop");
             } else {
-                const char *send_piece = piece;
-                if (withheld[0] != '\0') {
-                    int w_len = (int)strlen(withheld);
-                    int p_len = (int)strlen(piece);
-                    if (w_len + p_len + 1 > withheld_cap) {
-                        withheld_cap = (w_len + p_len + 1) * 2;
-                        withheld = (char *)realloc(withheld, (size_t)withheld_cap);
-                    }
-                    memcpy(withheld + w_len, piece, (size_t)(p_len + 1));
-                    send_piece = withheld;
-                }
+                /* partial: send_piece is "", normal: send_piece is piece or withheld+piece */
                 cJSON_AddStringToObject(delta, "content", send_piece);
                 cJSON_AddStringToObject(choice, "finish_reason", "");
                 if (!is_chat) cJSON_AddStringToObject(choice, "text", send_piece);
-                withheld[0] = '\0';
             }
             cJSON *choices = cJSON_CreateArray();
             cJSON_AddItemToArray(choices, choice);
@@ -2302,8 +2424,6 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             logits = server_model_forward(model, token, pos);
         }
 
-        free(generated_stream);
-        free(withheld);
         double t_end = get_time_ms();
         double t_prefill_ms = t_prefill_end > 0 ? t_prefill_end - t_start : t_end - t_start;
         double t_gen_ms = t_prefill_end > 0 ? t_end - t_prefill_end : 0;
@@ -2317,10 +2437,9 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         cJSON_AddItemToObject(done_choice, "delta", done_delta);
         cJSON_AddNumberToObject(done_choice, "index", 0);
         cJSON_AddStringToObject(done_choice, "finish_reason", "stop");
-        if (sw_match_idx >= 0 && sw_match_idx < n_stop_words) {
-            cJSON_AddStringToObject(done_choice, "stopping_word", stop_words[sw_match_idx]);
-        } else {
-            cJSON_AddStringToObject(done_choice, "stopping_word", "");
+        {
+            const char *sw_word = stop_matcher_word(&sm);
+            cJSON_AddStringToObject(done_choice, "stopping_word", sw_word ? sw_word : "");
         }
         cJSON *done_choices = cJSON_CreateArray();
         cJSON_AddItemToArray(done_choices, done_choice);
@@ -2380,16 +2499,8 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             sampler_t sampler;
             sampler_init(&sampler, temperature, top_p, top_k, 0.05f, seed + (uint64_t)c);
 
-            char *generated = (char *)malloc((size_t)max_tokens * 100 + 1);
-            if (!generated) {
-                free(chat_prompt); free(raw_prompt_copy); free(model_name); free(ptokens);
-                for (int _si = 0; _si < n_stop_words; _si++) free(stop_words[_si]);
-                http_send(sock, 500, "application/json", "{\"error\":{\"message\":\"OOM\"}}");
-                return;
-            }
-            generated[0] = '\0';
             int gen_count = 0;
-            int sw_match_idx_ns = -1;
+            stop_matcher_reset(&sm);
             const char *finish_reason = "length";
 
             /* Prefill phase */
@@ -2417,7 +2528,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             if (n_processed_ns < n_prompt) {
                 fprintf(stderr, "[server] prefill cancelled at token %d/%d\n", n_processed_ns, n_prompt);
                 free(chat_prompt); free(raw_prompt_copy); free(model_name); free(ptokens);
-                for (int _si = 0; _si < n_stop_words; _si++) free(stop_words[_si]);
+                stop_matcher_free(&sm);
                 return;
             }
 
@@ -2436,7 +2547,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             int token = ptokens[n_prompt - 1];
             for (int pos = n_prompt; pos < n_prompt + max_tokens && logits_ns; pos++) {
                 if (!client_alive(sock)) {
-                    free(generated); break;
+                    break;
                 }
 
                 int next = sampler_sample(&sampler, logits_ns, model->config.vocab_size);
@@ -2451,7 +2562,6 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
                     piece = tokenizer_decode(tokenizer, token, next);
                 }
                 if (!piece) piece = "";
-                strncat(generated, piece, max_tokens * 100 - strlen(generated) - 1);
                 gen_count++;
 
                 /* Generation checkpoint */
@@ -2459,16 +2569,12 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
                     checkpoint_save(n_prompt + gen_count);
                 }
 
-                /* Check stop words (full + partial match, llama.cpp style) */
+                /* Check stop words (full match only, no withholding) */
                 {
-                    int sw_stop_idx, sw_stop_pos;
-                    int sw_result = check_stop_words(generated,
-                        (int)strlen(generated), piece,
-                        stop_words, n_stop_words, &sw_stop_idx, &sw_stop_pos);
-                    if (sw_result == 1 && sw_stop_idx >= 0) {
+                    stop_action_t action;
+                    stop_matcher_feed(&sm, piece, 0, &action);
+                    if (action == STOP_FULL) {
                         finish_reason = "stop";
-                        if (sw_stop_pos >= 0) generated[sw_stop_pos] = '\0';
-                        if (sw_match_idx_ns < 0) sw_match_idx_ns = sw_stop_idx;
                         gen_count--;
                     }
                 }
@@ -2487,19 +2593,17 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             if (is_chat) {
                 cJSON *msg = cJSON_CreateObject();
                 cJSON_AddStringToObject(msg, "role", "assistant");
-                cJSON_AddStringToObject(msg, "content", generated);
+                cJSON_AddStringToObject(msg, "content", stop_matcher_text(&sm));
                 cJSON_AddItemToObject(choice, "message", msg);
             } else {
-                cJSON_AddStringToObject(choice, "text", generated);
+                cJSON_AddStringToObject(choice, "text", stop_matcher_text(&sm));
             }
             cJSON_AddStringToObject(choice, "finish_reason", finish_reason);
-            if (sw_match_idx_ns >= 0 && sw_match_idx_ns < n_stop_words) {
-                cJSON_AddStringToObject(choice, "stopping_word", stop_words[sw_match_idx_ns]);
-            } else {
-                cJSON_AddStringToObject(choice, "stopping_word", "");
+            {
+                const char *sw_word = stop_matcher_word(&sm);
+                cJSON_AddStringToObject(choice, "stopping_word", sw_word ? sw_word : "");
             }
             cJSON_AddItemToArray(choices, choice);
-            free(generated);
         }
 
         cJSON_AddItemToObject(root, "choices", choices);
@@ -2559,7 +2663,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
     free(chat_prompt);
     free(model_name);
     free(ptokens);
-    for (int _si = 0; _si < n_stop_words; _si++) free(stop_words[_si]);
+    stop_matcher_free(&sm);
 }
 
 /* ---- Endpoint: POST /completion (llama.cpp-style) ---- */
@@ -2652,29 +2756,9 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
     if ((item = cJSON_GetObjectItem(req, "model")) && cJSON_IsString(item))
         model_name = strdup(item->valuestring);
 
-    /* Parse stop words - MUST copy before cJSON_Delete.
-     * Accept both array ["stop1","stop2"] and single string "stop". */
-    char *stop_words[256];
-    int n_stop_words = 0;
+    stop_matcher_t sm;
     cJSON *stop_item = cJSON_GetObjectItem(req, "stop");
-    if (stop_item && cJSON_IsArray(stop_item)) {
-        int n = cJSON_GetArraySize(stop_item);
-        if (n > 256) { fprintf(stderr, "[server] WARNING: stop words capped from %d to 256\n", n); n = 256; }
-        for (int i = 0; i < n; i++) {
-            cJSON *sw = cJSON_GetArrayItem(stop_item, i);
-            if (cJSON_IsString(sw)) {
-                const char *s = cJSON_GetStringValue(sw);
-                if (s && strlen(s) > 0) {
-                    stop_words[n_stop_words++] = strdup(s);
-                }
-            }
-        }
-    } else if (stop_item && cJSON_IsString(stop_item)) {
-        const char *s = cJSON_GetStringValue(stop_item);
-        if (s && strlen(s) > 0) {
-            stop_words[n_stop_words++] = strdup(s);
-        }
-    }
+    stop_matcher_init(&sm, stop_item);
 
     /* return_progress - report prefill progress via SSE */
     int return_progress_llama = 0;
@@ -2731,6 +2815,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             n_prompt, model->config.max_seq_len);
         http_send(sock, 413, "application/json", errmsg);
         free(ptokens); free(model_name); free((void *)(uintptr_t)prompt);
+        stop_matcher_free(&sm);
         return;
     }
 
@@ -2837,10 +2922,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         /* gen_count declared below after prefill section */
         const char *stop_type = "none";
         const char *stopping_word = "";
-        char *generated_stream = (char *)calloc(1, 1024);
-        int generated_stream_cap = 1024;
-        char *withheld = (char *)calloc(1, 1024);
-        int withheld_cap = 1024;
+        stop_matcher_reset(&sm);
 
         /* If the entire prompt is cached (start_pos >= n_prompt), step back
          * to position n_prompt - 1 so model_forward produces correct logits
@@ -2887,6 +2969,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             /* Client disconnected during prefill */
             fprintf(stderr, "[server] prefill cancelled at token %d/%d\n", n_processed, n_prompt);
             free(model_name); free((void *)(uintptr_t)prompt); free(ptokens);
+            stop_matcher_free(&sm);
             return;
         }
 
@@ -2919,69 +3002,19 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             }
             if (!piece) piece = "";
 
-            /* Append to cumulative output for stop word matching */
-            int gen_len = (int)strlen(generated_stream);
-            int piece_len = (int)strlen(piece);
-            if (gen_len + piece_len + 1 > generated_stream_cap) {
-                generated_stream_cap = (gen_len + piece_len + 1) * 2;
-                generated_stream = (char *)realloc(generated_stream, generated_stream_cap);
-            }
-            memcpy(generated_stream + gen_len, piece, (size_t)(piece_len + 1));
-
-            /* Check stop words (full + partial match, llama.cpp style) */
-            int stopped = 0;
-            int partial = 0;
-            {
-                int sw_stop_idx, sw_stop_pos;
-                int sw_result = check_stop_words(generated_stream,
-                    (int)strlen(generated_stream), piece,
-                    stop_words, n_stop_words, &sw_stop_idx, &sw_stop_pos);
-                if (sw_result == 1 && sw_stop_idx >= 0) {
-                    stopped = 1;
-                    stop_type = "word";
-                    stopping_word = stop_words[sw_stop_idx];
-                    if (sw_stop_pos >= 0) generated_stream[sw_stop_pos] = '\0';
-                } else if (sw_result == -1) {
-                    partial = 1; /* withhold this token, keep generating */
-                }
+            /* Check stop words and get the text to send */
+            stop_action_t action;
+            const char *send_piece = stop_matcher_feed(&sm, piece, 1, &action);
+            int stopped = (action == STOP_FULL);
+            if (stopped) {
+                stop_type = "word";
+                stopping_word = stop_matcher_word(&sm);
+                if (!stopping_word) stopping_word = "";
             }
 
             /* Build streaming response: {content, tokens, stop} */
             cJSON *resp = cJSON_CreateObject();
-            /* If stopped or partial match, suppress the piece;
-             * if partial resolves, flush previously withheld content */
-            if (stopped || partial) {
-                if (partial) {
-                    /* Accumulate in withheld buffer */
-                    int w_len = (int)strlen(withheld);
-                    int p_len = (int)strlen(piece);
-                    if (w_len + p_len + 1 > withheld_cap) {
-                        withheld_cap = (w_len + p_len + 1) * 2;
-                        withheld = (char *)realloc(withheld, (size_t)withheld_cap);
-                    }
-                    memcpy(withheld + w_len, piece, (size_t)(p_len + 1));
-                    cJSON_AddStringToObject(resp, "content", "");
-                } else {
-                    /* Full stop: discard withheld content (prefix of stop word) */
-                    withheld[0] = '\0';
-                    cJSON_AddStringToObject(resp, "content", "");
-                }
-            } else {
-                /* Flush withheld + current piece */
-                if (withheld[0] != '\0') {
-                    int w_len = (int)strlen(withheld);
-                    int p_len = (int)strlen(piece);
-                    if (w_len + p_len + 1 > withheld_cap) {
-                        withheld_cap = (w_len + p_len + 1) * 2;
-                        withheld = (char *)realloc(withheld, (size_t)withheld_cap);
-                    }
-                    memcpy(withheld + w_len, piece, (size_t)(p_len + 1));
-                    cJSON_AddStringToObject(resp, "content", withheld);
-                } else {
-                    cJSON_AddStringToObject(resp, "content", piece);
-                }
-                withheld[0] = '\0';
-            }
+            cJSON_AddStringToObject(resp, "content", send_piece);
 
             if (return_tokens || do_stream) {
                 cJSON *tok_arr = cJSON_CreateArray();
@@ -3024,8 +3057,6 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             logits = server_model_forward(model, token, pos);
         }
 
-        free(generated_stream);
-        free(withheld);
         double t_end = get_time_ms();
         double t_prefill_ms = t_prefill_end > 0 ? t_prefill_end - t_start : t_end - t_start;
         double gen_ms = t_prefill_end > 0 ? t_end - t_prefill_end : t_end - t_start;
@@ -3086,8 +3117,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         int gen_count = 0;
         const char *stop_type = "none";
         const char *stopping_word = "";
-        char *generated = (char *)malloc(n_predict * 100 + 1);
-        generated[0] = '\0';
+        stop_matcher_reset(&sm);
         int *gen_token_ids = (int *)malloc((size_t)n_predict * sizeof(int));
 
         /* ---- Prefill phase ---- */
@@ -3118,9 +3148,9 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         if (n_processed_ns2 < n_prompt) {
             /* Client disconnected during prefill */
             fprintf(stderr, "[server] prefill cancelled at token %d/%d\n", n_processed_ns2, n_prompt);
-            free(generated); free(gen_token_ids);
+            free(gen_token_ids);
             free(model_name); free((void *)(uintptr_t)prompt); free(token_prompt); free(ptokens);
-            for (int i = 0; i < n_stop_words; i++) free(stop_words[i]);
+            stop_matcher_free(&sm);
             return;
         }
 
@@ -3157,7 +3187,6 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             }
             if (!piece) piece = "";
 
-            strncat(generated, piece, n_predict * 100 - strlen(generated) - 1);
             gen_token_ids[gen_count] = next;
             gen_count++;
 
@@ -3166,16 +3195,14 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
                 checkpoint_save(n_prompt + gen_count);
             }
 
-            /* Check stop words (full + partial match, llama.cpp style) */
+            /* Check stop words (full match, no withholding) */
             {
-                int sw_stop_idx, sw_stop_pos;
-                int sw_result = check_stop_words(generated,
-                    (int)strlen(generated), piece,
-                    stop_words, n_stop_words, &sw_stop_idx, &sw_stop_pos);
-                if (sw_result == 1 && sw_stop_idx >= 0) {
+                stop_action_t action;
+                stop_matcher_feed(&sm, piece, 0, &action);
+                if (action == STOP_FULL) {
                     stop_type = "word";
-                    stopping_word = stop_words[sw_stop_idx];
-                    if (sw_stop_pos >= 0) generated[sw_stop_pos] = '\0';
+                    stopping_word = stop_matcher_word(&sm);
+                    if (!stopping_word) stopping_word = "";
                     gen_count--;
                 }
             }
@@ -3198,7 +3225,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
 
         /* Build response */
         cJSON *resp = cJSON_CreateObject();
-        cJSON_AddStringToObject(resp, "content", generated);
+        cJSON_AddStringToObject(resp, "content", stop_matcher_text(&sm));
 
         if (return_tokens) {
             cJSON *tok_arr = cJSON_CreateArray();
@@ -3254,7 +3281,6 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
                 (n_prompt - start_pos) > 0 ? (n_prompt - start_pos) / (t_prefill_ms_ns / 1000.0) : 0,
                 gen_count, gen_ms, gen_count > 0 ? gen_count / (gen_ms / 1000.0) : 0);
 
-        free(generated);
         free(gen_token_ids);
     }
 
@@ -3262,7 +3288,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
     free(token_prompt);
     free(model_name);
     free(ptokens);
-    for (int i = 0; i < n_stop_words; i++) free(stop_words[i]);
+    stop_matcher_free(&sm);
 }
 
 /* ---- Endpoint: POST /tokenize ---- */
