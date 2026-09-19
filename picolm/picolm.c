@@ -284,7 +284,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -khad          Apply Walsh-Hadamard rotation to K cache before quantization\n");
     fprintf(stderr, "  -vhad          Apply Walsh-Hadamard rotation to V cache before quantization\n");
     fprintf(stderr, "\nSSM checkpoint options (Qwen3.5/3.6 only, no-op for other models):\n");
-    fprintf(stderr, "  --checkpoint-max <N>        Max checkpoints to keep (default: 0=disabled)\n");
+    fprintf(stderr, "  --checkpoint-max <N>        Max checkpoints to keep (default: 3 in --server, 0 otherwise)\n");
     fprintf(stderr, "  --checkpoint-every-nt <N>   Checkpoint every N tokens during prefill (default: 256)\n");
     fprintf(stderr, "  --checkpoint-every-nt-gen <N> Checkpoint every N tokens during generation (default: 64)\n");
     fprintf(stderr, "  --checkpoint-tail-offset <N> Checkpoint N tokens before end of prompt (default: 5)\n");
@@ -1064,11 +1064,11 @@ int main(int argc, char **argv) {
     int    ssm_batched_prefill = 1;     /* 1=batched (default), 0=per-token */
     int    ssm_chunk_size = 0;          /* 0=default(64), 1=serial-equivalent */
     /* SSM checkpoint options */
-    int    checkpoint_max = 0;          /* 0=disabled */
+    int    checkpoint_max = 3;          /* default 3 in --server mode, overridden to 0 otherwise */
     int    checkpoint_interval = 256;
     int    checkpoint_interval_gen = 64;
     int    checkpoint_tail_offset = 1;  /* 1: ensures checkpoint at n_prompt-1 for stepback */
-    char  *slot_save_path = NULL;  /* --slot-save-path */
+    char  *slot_save_path = ".";    /* --slot-save-path (default: current dir) */
 #ifdef PICOLM_VIZ
     /* Visualization options */
     int    viz_mode = 0;
@@ -1355,6 +1355,9 @@ int main(int argc, char **argv) {
     if (num_threads <= 0) {
         num_threads = tensor_default_threads();
     }
+
+    /* Default checkpoint_max is 3 for --server mode; disable for non-server */
+    if (!server_mode) checkpoint_max = 0;
 
     /* Server mode: start HTTP server (no prompt needed) */
     if (server_mode) {
