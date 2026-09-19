@@ -12,33 +12,55 @@
 
 ## What's New
 
-<table><tr><td><b>v1.0-rc1</b> ("Yura Kana")</td><td align="right"><img src="yura_kana.jpg" width="80" alt="Yura Kana"></td></tr></table>
+<table><tr><td><b>v1.0-rc2</b> ("Yura Kana")</td><td align="right"><img src="yura_kana.jpg" width="80" alt="Yura Kana"></td></tr></table>
 
-- GPU architecture rewrite: device-native pipeline replacing the old D2H/H2D matmul crutch
-- **Note: MoE model GPU tensor upload is not yet supported on HIP/ROCm** (CUDA works fine).
-  MoE models on HIP fall back to CPU SSM matmul; full GPU upload path planned for next release.
-- IMMA Tensor Core kernels for all quant types: Q8_0, Q6_K, Q4_0, Q4_1, Q1_0(don't work yet: Q5_K, Q4_K, Q3_K, Q2_K, use the PICOLM_NO_IMMA flag to disable them)
-- FlashAttention-2 tensor core prefill kernel, warp-group scalar attention (new default), shared-memory staged IMMA W16
-- Split-K decode attention (flash-decoding pattern), GPU-resident output projection
-- GPU-resident KV cache, device-native RMSNorm, RoPE, elementwise ops
-- Device-native SSM batched kernels: conv1d, l2norm, vecdot, gated_norm, head_permute, expert_mlp
-- GPU-pipelined prefill path (`model_forward_prefill_gpu`), fused RMSNorm+Quantize+QKV IMMA, two-tier batching
-- FFN rewrite: Q8_0 tiled matmul
-- rudimentary Vulkan attempt
-
-- GPT-2 architecture support with batched prefill and native tokenizer
-- MS-DOS (DJGPP) build target
-- GGUF split-file loader
-- Gemma-3n architecture support (works, but no SWE yet)
-- TurboQuant TQ3/TQ4 KV cache
-- Deterministic sign randomization for Walsh-Hadamard transform
-- `sgemm` tiled GEMM engine for F16/F32 matmuls
-- NEON acceleration for Q4_0, Q4_K, Q5_K, Q6_K, Q3_K, Q2_0, Q1_0 vec_dot paths
-- AVX2/AVX/SSSE3 SIMD paths for Q2_K and Q4_K (Q4_K SSE3: 3.3x vs scalar)
-- `--benchmark-ctx` context scaling benchmark, `--gpu-diff` kernel diff test
-- `-pf` option (auto-apply chat template), Big.LITTLE awareness, `--list-kv`, `PICOLM_GPU_PATH` env var
-- MSYS2 CUDA build target: `hunger-msys-direct` Makefile target for MSYS2 SSH builds with nvcc+cl.exe
-- DJGPP optimizations: `-O2` and `-ffast-math` for fastest build on K6/2-450, DPMI memory diagnostic restored
+- RoPE scaling: linear, YaRN, and LongRoPE methods. Pre-computed cos/sin tables modified per GGUF rope.scaling metadata (freq_scale, ext_factor, attn_factor, beta_fast/slow), enabling extended context beyond model defaults
+- Sliding window attention (SWA), model-independent with unit tests
+- Tokenizer rewritten: O(n^2) -> O(n log n) SPM via priority queue + hash table, UTF-8 fallback always splits on failed lookup
+- IQ4_NL (GGUF type 20) full support: LUT-based non-linear 4-bit quantization with AVX512 VPERMD, AVX2 VPSHUFB, NEON vqtbl1q_u8 dequant, I8MM/AVX2/NEON int8 MAC matmul, Lloyd-Max 4-bit quantize
+- Quantized tiled GEMM engine (C port of llama.cpp's TinyBLAS Q0): Q8_0/Q4_0/Q5_0 x Q8_0, AVX2 sign-trick+maddubs/dpbusd, AVX-512 VNNI, NEON I8MM/SDOT, dispatched from tensor.c matmul_batch at n_batch>=32
+- NEON tiled GEMM for ARM Pi 4 (Cortex-A72, basic NEON only)
+- AVX2/AVX1/SSSE3 SIMD paths for Q4_K tiled GEMM kernel
+- NEON acceleration expanded: Q4_K, Q5_K, Q6_K, Q3_K, Q2_0, Q1_0 vec_dot and sgemm paths
+- I8MM (ARM64) vec_dot for Q4_0, Q8_0, Q4_K using vmmlaq_s32; DotProd gemv for Q4_0_4_4/Q4_0_4_8 (1.3x vs Q4_0 on DGX Spark)
+- Q4_0_4_4 (GGUF type 31, 4-row interleaved) and Q4_0_4_8 (type 32) full support with DotProd gemv and I8MM gemm
+- Q6_0 (GGUF type 133) quantization support
+- Q5_1 fast path via vec_dot_q5_1_q8_0 (NEON int8 MAC)
+- Q4_K tiled GEMM kernel (AVX2, 1x4 tiles)
+- BF16 GEMM kernels (bf16_f32 + bf16_bf16)
+- Vulkan compute backend (preliminary, barely tested): push descriptors replacing descriptor rings, fused QKV/GU shaders with auto GCN1 detection, F16 KV-cache attention for prefill, batched RoPE, scoped barriers, KAVERI (PS4) compatibility
+- GPT-2 GPU fully working on CUDA/HIP/Vulkan: fused QKV split, LayerNorm, GELU, activation quantization, KV cache fixes
+- IQ4_NL GPU support: converted to Q8_0 at upload time for HIP compatibility
+- Server: /slots/0 path for llama.cpp compatibility, return_progress for prefill progress, consolidated stop-word matching into stop_matcher_t, SIGPIPE guard, double-free fixes
+- MSYS2 CUDA: hunger-msys-direct Makefile target for SSH builds with nvcc+cl.exe
+- OSF/1 Tru64 UNIX (DEC Alpha) compilation support
+- iPhoneOS 1 (ARMv6, LLVM-GCC 4.0.1) build and runtime support
+- Big-endian BE swap: IQ4_NL support added, warning for unsupported tensor types
+- Cross-platform packed struct macros (__PICO_PACKED) for MSVC/LLVM-GCC compatibility
+- PICOLM_SGEMM=0 env var to disable tiled GEMM
+- GPU: PICOLM_NO_IMMA flag to disable IMMA kernels, PICOLM_F32KV env var to guard F32KV attention
+- CUDA/HIP: Q6_K native IMMA fully working (qh byte extraction, offset, high-nibble masking all fixed)
+- CUDA/HIP: Q4_K IMMA dispatched but BROKEN for S>=16 (use PICOLM_NO_IMMA=1)
+- Gemma-3n: KV cache reuse fixed for non-KV layers, SWA RoPE tables wired into layer loop
+- gaussian_topk std: reverted to ddof=1 matching llama.cpp
+- Server default --checkpoint-max to 3 in --server mode, --slot-save-path to .
+- --benchmark-ctx honors thread count and truncates prompt
+- Fix: stale .o files causing 0-token prompt, log warning on oversized prompt rejection in server
+- Fix: HIP decode broken since GPU merge for O<256 or head_dim<16
+- Fix: Q5_0 GEMM on AVX2/AVX-512 (wrong qh bit position + missing offset)
+- Fix: Q4_0_8_8 LUT byte order + disabled broken GEMM with vec_dot fallback
+- Fix: GPU tensor upload for SSM models (Qwen3.6)
+- Fix: Vulkan RMSNorm push constant bug on RADV, descriptor set aliasing, quantize shader shared memory race
+- Fix: PICOLM_NGL partial GPU offload correctness on Windows WDDM
+- Fix: GPT-2 GPU prefill segfault, fused QKV split, LayerNorm Vulkan support
+- Fix: Vulkan KAVERI multi-ubatch prefill corruption workaround, D2H/H2D hang
+- Fix: Vulkan fused QKV/GU shader local_size_x and Q8 block stride bugs
+- Fix: Vulkan KV cache D2H sync, coherent GPU inference, fence checks, ring wraparound
+- Fix: Vulkan KV cache flush via backend-agnostic picolm_gpu_kv_flush_to_cpu()
+- Fix: Vulkan activation quantization rounding matches CPU/CUDA/HIP
+- Fix: Vulkan gracefully rejects unsupported quantization types on GPU
+- Remove dead matmul_dual_batch path and orphaned tensor_prof.c
+- Don't dump full help on unknown option
 
 ## What all this is
 
@@ -73,7 +95,7 @@ This was someone's Claude vibeslop originally, but I started to tinker with it a
 | **Scale** | Tested up to 70B parameters (miqu-70b) |
 | **HTTP server** | OpenAI API (`/v1/completions`, `/v1/chat/completions`, `/v1/models`), llama.cpp-compatible (`/completion`, `/props`), `/tokenize`, `/detokenize`, `/health`, streaming, persistent model/KV cache |
 | **Threading** | Persistent thread pool (gen-counter barrier), physical core auto-detect, big.LITTLE awareness, GQA grouped attention, tiled/blocked attention for prefill, batched GEMV |
-| **Platform** | Linux (AVX-512/VNNI, ARM NEON, RISC-V), Windows 7-11 (SRWLOCK, MinGW, VirtualLock, `--mem`), Mac OS/X 10.4-10.6, MS-DOS, PPC/Altivec, Android, FreeBSD |
+| **Platform** | Linux (AVX-512/VNNI, ARM NEON, RISC-V), Windows 7-11 (SRWLOCK, MinGW, VirtualLock, `--mem`), Mac OS/X 10.4-10.6, MS-DOS, PPC/Altivec, Android, FreeBSD, OSF/1 Tru64, iPhoneOS |
 | **KV cache** | F16, Q8_0, Q4_0, TQ4, TQ3, Walsh-Hadamard rotation (`-khad`/`-vhad`), persistent with prefix matching |
 | **Misc** | 64KB FP16 lookup table, `--mem` mlock, `--prefault`, `--daemon`, `-pf` chat template, `--json` grammar, VNC visualization server, GGUF split-file loader, `sgemm` tiled GEMM |
 
@@ -98,6 +120,7 @@ This was someone's Claude vibeslop originally, but I started to tinker with it a
                     |  +-----------+ +------------+ +---------------+  |
                     +--------------------------------------------------+
 
+
                     +--------------------------------------------------+
    What stays       |             Model on Disk                        |
    on disk          |       (mmap - OS pages in layers                 |
@@ -106,6 +129,105 @@ This was someone's Claude vibeslop originally, but I started to tinker with it a
 ```
 
 ## Past Releases
+
+### v1.0-rc1 ("Yura Kana")
+
+    GPU architecture rewrite: device-native pipeline replacing the old D2H/H2D
+    matmul crutch. IMMA Tensor Core kernels for all quant types, FlashAttention-2
+    tensor core prefill, warp-group scalar attention, Split-K decode attention,
+    GPU-resident KV cache and output projection, device-native SSM batched kernels,
+    FFN rewrite with 2.6x GPU speedup. GPT-2 and Gemma-3n model support completed.
+    Cross-platform: MS-DOS (DJGPP), MSYS2 CUDA, Vulkan (pre-alpha).
+
+    358 commits since beta2.
+
+    GPU: Device-Native Pipeline Rewrite
+      IMMA Tensor Core kernels: Q8_0, Q6_K, Q4_0, Q4_1, Q1_0 fully working
+      IMMA K-quants (Q5_K, Q4_K, Q3_K, Q2_K): kernels implemented but buggy
+        for S=64 prompts; use PICOLM_NO_IMMA=1 to fall back to Q8_0
+      FlashAttention-2 tensor core prefill kernel (FA2_TILE_K=16)
+      Warp-group scalar attention (new default, shared-memory staged IMMA W16
+        gives +17% on small context)
+      Split-K decode attention (flash-decoding pattern)
+      GPU-resident KV cache (F32->F16 pack on store, F16 read on attention)
+      GPU-resident output projection (no D2H for decode logits)
+      Device-native RMSNorm, RoPE, elementwise ops (silu_mul, sigmoid_mul)
+      Device-native SSM batched kernels: conv1d, l2norm, vecdot, gated_norm,
+        head_permute, expert_mlp, recurrence (chunked), output projection
+      GPU-pipelined prefill path (model_forward_prefill_gpu): fused
+        RMSNorm+Quantize+QKV IMMA, two-tier batching
+      FFN rewrite: Q8_0 tiled matmul, 2.6x faster on GPU
+      MoE models: GPU tensor upload works on CUDA; HIP/ROCm falls back to
+        CPU SSM matmul (not yet supported on HIP)
+      Metal: SSM kernels and FFN fused into single command buffer
+
+    Quantization: IMMA K-Quant Kernels and Fixes
+      Q6_K IMMA: native upload + IMMA working (qh byte extraction, offset,
+        high-nibble masking all fixed)
+      Q3_K IMMA: native upload + IMMA working (hmask bit cycling 1<<(chunk*4+group),
+        hmask pointer wb+sub*16 shared across chunks, dequant scale unpack fix)
+      Q5_K IMMA: qh bit position fix (2*group+sub, not 2+2*group)
+      Q2_K IMMA: min-correction separate sq0a/sq0b sums per activation half,
+        dequant shift formula (group/2)*2
+      Q4_K IMMA: dispatched but BROKEN for S>=16 (garbage output, per-tile
+        values look correct but systematic error compounds across layers)
+      Shfl broadcast fix: added gpuShflSync after gpuShflDownSync reduce for
+        all K-quant IMMA kernels (threads 1-3 had partial sums)
+      PICOLM_NO_IMMA env var: disables all IMMA kernels, falls back to Q8_0
+      PICOLM_FORCE_F32_MATMUL: forces scalar path for all quant types
+      Q4_0_4_4/Q4_0_4_8: ARM DotProd gemv (1.3x vs Q4_0 on DGX Spark)
+      Q4_0_4_8 I8MM gemm: correct but 2x slower than DotProd (not used)
+
+    Model Architecture: GPT-2 and Gemma-3n
+      GPT-2: full architecture support with batched prefill and native tokenizer
+        (3 bugs fixed: wrong output on x86 due to layout/sign issues)
+      Gemma-3n: AltUp (alternate embeddings) and Laurel (low-rank attention
+        enrichment) completed. SWA RoPE tables (freq_base=10000), per-layer
+        SWA/global frequency selection. F32 GELU option (PICOLM_GELU_F32).
+        KV cache reuse fixed for non-KV layers (SWA reuses last SWA, global
+        reuses last global). Tokenization matches llama.cpp (16 tokens verified).
+        No SWA support in GPU path yet.
+      Qwen3.5/3.6: SSM hybrid fully working on GPU (8 attn + 24 SSM layers)
+      MoE: expert_mlp GPU kernel, tensor upload works on CUDA only
+
+    SIMD & CPU Performance
+      NEON acceleration for Q4_0, Q4_K, Q5_K, Q6_K, Q3_K, Q2_0, Q1_0 vec_dot
+      AVX2/AVX/SSSE3 SIMD paths for Q2_K and Q4_K
+        Q4_K SSE3: 3.3x vs scalar
+      AVX-512/VNNI: Q8_0 vec_dot, rmsnorm, softmax, rope, elemwise_mul,
+        vec_add, attention V accumulation, quantize_row_q8_0
+      sgemm tiled GEMM engine for F16/F32 matmuls
+      Big.LITTLE thread awareness
+      gaussian_topk std: reverted to ddof=1 (1/(n-1)) matching llama.cpp
+
+    Platform & Build
+      MS-DOS (DJGPP): -O2 on K6/2-450 (fastest), -ffast-math, DPMI memory diag
+      MSYS2 CUDA: hunger-msys-direct Makefile target for SSH builds with
+        nvcc+cl.exe (no .bat files, direct compilation from bash)
+      Vulkan: K-quant support, elementwise shader, Q2_K/Q3_K dequant
+      FreeBSD: full support
+      Android, Raspberry Pi, PPC/Altivec: full support
+      Auto-detect SIMD level, enable AVX2/AVX512 by default
+      Makefile SIMD detection fixed for mingw
+
+    KV Cache
+      TurboQuant TQ4 KV cache (TQ3 does not work yet)
+      Deterministic sign randomization for Walsh-Hadamard transform
+      GQA full-row KV cache layout for quantized types
+      Persistent KV cache with prefix matching
+
+    Server & CLI
+      --benchmark-ctx context scaling benchmark
+      --gpu-diff kernel diff test
+      --benchmark outputs to stdout, accepts optional iteration count
+      --list-tensors works before model path
+      --list-kv multiline output fix
+      -pf option: auto-apply chat Gemma/ChatML/Alpaca template
+      --prefault preload all weights for deterministic timing
+      --mem mlock most important weights (MoE-aware)
+      PICOLM_GPU_PATH env var for CUDA device selection
+      VNC visualization server: live activation heatmap, layer skip/reorder
+      GGUF split-file loader
 
 ### v1.0-beta2
 
