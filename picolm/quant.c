@@ -1979,20 +1979,9 @@ void quantize_mat_q8_0x4(const float *x, void *dst, int n, int row_stride) {
                 if (a > amax) amax = a;
             }
             id[r] = amax == 0 ? 1e-30f : 127.0f / amax;
-        }
-        /* Interleave 4 rows in 8-byte chunks (llama.cpp block<8,4> layout).
-         * qs[j] = srcv[src_id][src_offset] where:
-         *   src_offset = (j / 32) * 8 + (j % 8)
-         *   src_id     = (j % 32) / 8
-         * So: qs[0..7]=row0[0..7], qs[8..15]=row1[0..7], qs[16..23]=row2[0..7], qs[24..31]=row3[0..7],
-         *     qs[32..39]=row0[8..15], qs[40..47]=row1[8..15], ...
-         *
-         * GEMM expects d = scale = amax/127 (dequant: value = qs * d).
-         * Quantization uses inverse scale: qs = roundf(x * id) where id = 127/amax. */
-        for (int j = 0; j < 128; j++) {
-            int src_offset = (j / 32) * 8 + (j % 8);
-            int src_id = (j % 32) / 8;
-            y[b].qs[j] = roundf(srcv[src_id][src_offset] * id[src_id]);
+            int8_t *q = y[b].qs + r * 32;
+            for (int j = 0; j < 32; j++)
+                q[j] = roundf(srcv[r][j] * id[r]);
         }
         /* Store scales as FP16 */
         for (int r = 0; r < 4; r++)
@@ -6664,7 +6653,7 @@ void vec_dot_q4_0x8_q8_0_avx2(const void *vx, const void *wy, int n, float *out,
 
     /* Lookup table: maps 4-bit nibble to signed byte [-8..7] */
     __m256i signextendlut = _mm256_castsi128_si256(
-        _mm_set_epi8(0, 1, 2, 3, 4, 5, 6, 7, -8, -7, -6, -5, -4, -3, -2, -1));
+        _mm_set_epi8(-1, -2, -3, -4, -5, -6, -7, -8, 7, 6, 5, 4, 3, 2, 1, 0));
     signextendlut = _mm256_permute2f128_si256(signextendlut, signextendlut, 0);
 
     /* Final permute to reorder output lanes to correct row order */

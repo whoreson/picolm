@@ -2705,6 +2705,12 @@ void matmul_batch(float *out, const float *x, int n_batch,
     static int init;
     if (!init && getenv("PICOLM_PROFILE")) { init = 1; prof_active = 1; atexit(prof_print); }
     double t0 = prof_active ? picolm_now() : 0;
+    /* Cached dispatch flag (avoids repeated getenv calls) */
+    static const char *_dispatch_env = NULL;
+    if (!_dispatch_env) _dispatch_env = getenv("PICOLM_DISPATCH");
+    #define __DISPATCH_UNIQ_N(x, y) x##y
+    #define __DISPATCH_UNIQ(x, y) __DISPATCH_UNIQ_N(x, y)
+    #define DISPATCH(fmt) do { static int __DISPATCH_UNIQ(_d, __LINE__); if (_dispatch_env && !__DISPATCH_UNIQ(_d, __LINE__)) { __DISPATCH_UNIQ(_d, __LINE__)=1; fprintf(stderr, "DISPATCH matmul_batch: d=%d n=%d batch=%d qtype=%d -> " fmt "\n", d, n, n_batch, qtype); } } while(0)
 
     /* Defensive: if weight pointer is NULL (e.g. model loading issue,
      * GPU tensor not yet uploaded), zero-fill output and return.
@@ -2720,6 +2726,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
             null_warn = 1;
         }
         if (out) memset(out, 0, (size_t)n_batch * d * sizeof(float));
+        DISPATCH("NULL (zero-filled)");
         return;
     }
 #ifdef PICOLM_GPU
@@ -2731,9 +2738,11 @@ void matmul_batch(float *out, const float *x, int n_batch,
             if (gpu_batch_count++ == 0) {
                 fprintf(stderr, "INFO: GPU WMMA batch matmul active\n");
             }
+        DISPATCH("GPU_WMMA");
             return;
         }
         if (picolm_gpu_matmul(gpu_tensor, out, x, n_batch, gpu_device)) {
+        DISPATCH("GPU_host");
             return;
         }
         if ((n == 6144 || d == 6144) && getenv("PICOLM_GPU")) fprintf(stderr, "WARN: GPU batch matmul failed (n=%d d=%d batch=%d qtype=%d gpu_tensor=%p) -> CPU\n",
@@ -2749,6 +2758,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
      * picolm_sgemm handles: F32xF32, F16xF32, F16xF16, Q8_0xQ8_0 (ARM NEON too). */
     if (picolm_sgemm(d, n_batch, n, wptr, n, x, n, out, d, qtype, GGUF_TYPE_F32, 0, 1)) {
         if (prof_active) { double dt = picolm_now()-t0; prof_f32_gemm+=dt; cnt_f32_gemm++; }
+        DISPATCH("SGEMM");
         return;
     }
 
@@ -2809,6 +2819,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
                     }
                     free(qbuf);
                     if (prof_active) { double dt = picolm_now()-t0; prof_f32_gemm+=dt; cnt_f32_gemm++; }
+        DISPATCH("SGEMM (nondelta)");
                     return;
                 }
 
@@ -2835,6 +2846,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
                     free(qd_buf);
                     free(qbuf);
                     if (prof_active) { double dt = picolm_now()-t0; prof_f32_gemm+=dt; cnt_f32_gemm++; }
+        DISPATCH("SGEMM_d");
                     return;
                 }
                 free(qbuf);
@@ -2881,13 +2893,17 @@ void matmul_batch(float *out, const float *x, int n_batch,
                 free(tmp_out);
             }
             free(abuf);
+        DISPATCH("Q4I_0_8_8_GEMM");
             return;
         }
     }
 
-    /* Q4_0_8_8 tiled GEMM (AVX-512 only, 16-row tiles).
-     * Padding: round n_batch up to multiple of 16, use zero-padded activations. */
-    if (!picolm_sgemm_disabled_tensor() && qtype == GGUF_TYPE_Q4_0_8_8 && n_batch > 0 && n > 0 &&
+    /* TODO:Q4_0_8_8_GEMM -- Q4_0_8_8 tiled GEMM: DISABLED.
+     * The sgemm_q4_0x8_q8_0x4 kernel has known dpbusd shuffle bugs that
+     * produce garbage output. See sgemm_q4_0x8.c header and prefill_code_paths.md
+     * for details (Bug #6a/6b/6c, shuffle overhead kills IPC).
+     * Falls through to the vec_dot path below, which is correct. */
+    if (0 && qtype == GGUF_TYPE_Q4_0_8_8 && n_batch > 0 && n > 0 &&
         d % 8 == 0 && n_batch >= 4 && n % 32 == 0) {
         int n_batch_padded = (n_batch + 15) & ~15;  /* round up to 16 */
         int n_act_rg = (n_batch_padded + 3) / 4;
@@ -2923,6 +2939,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
                 free(tmp_out);
             }
             free(abuf);
+        DISPATCH("Q4_0_8_8_GEMM (DISABLED, should not reach)");
             return;
         }
     }
@@ -2938,6 +2955,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
             q4_0_8_8_batch_ctx_t ctx = { wptr, row_bytes, qbuf, q8_rb, out, n, d, n_batch, 0 };
             tensor_parallel_for(n_batch * total_groups, q4_0_8_8_batch_task, &ctx);
             free(qbuf);
+        DISPATCH("Q4_0_8_8_vec_dot");
             return;
         }
     }
@@ -2965,6 +2983,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
                 }
             }
             free(qbuf);
+        DISPATCH("Q4_0_8_8_nonAVX2_vec_dot");
             return;
         }
     }
@@ -2986,6 +3005,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
             q4_0_4_4_batch_ctx_t ctx = { wptr, qbuf, q8_rb, out, n, d };
             tensor_parallel_for(n_batch, q4_0_4_4_batch_task, &ctx);
             free(qbuf);
+        DISPATCH("Q4_0_4_4_vec_dot");
             return;
         }
     }
@@ -2998,6 +3018,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
                 quantize_row_q8_0(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
             gemm_q4_0_4x8_q8_0(wptr, qbuf, n, out, d, n_batch);
             free(qbuf);
+        DISPATCH("Q4_0_4_8_DOTPROD/I8MM");
             return;
         }
     }
@@ -3170,7 +3191,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
                 .Atype = qtype, .nth = nth,
             };
             tensor_parallel_for(nth, qgemm_d_task, &ctx);
-            if (getenv("PICOLM_DISPATCH")) fprintf(stderr, "DISPATCH matmul_batch: d=%d n=%d batch=%d qtype=%d -> GEMM_d\n", d, n, n_batch, qtype);
+            DISPATCH("GEMM_d");
             if (qx_buf) { free(qx_buf); if (qx_d_buf) free(qx_d_buf); }
             return;
         }
@@ -3208,6 +3229,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
                 else { prof_q8_d+=dt; cnt_q8_d++; }
             }
             if (qx_buf) { free(qx_buf); if (qx_d_buf) free(qx_d_buf); }
+        DISPATCH("NEON_GEMM_d");
             return;
         }
     }
@@ -3231,7 +3253,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
                 .nth = nth,
             };
             tensor_parallel_for(nth, q4k_gemm_task, &ctx4k);
-            if (getenv("PICOLM_DISPATCH")) fprintf(stderr, "DISPATCH matmul_batch: d=%d n=%d batch=%d qtype=Q4_K -> GEMM_d_q4k\n", d, n, n_batch);
+            DISPATCH("Q4_K_GEMM_d");
             free(qx_buf);
             return;
         }
@@ -3258,6 +3280,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
                     out[b * d + i] = vec_dot((const char *)W + (size_t)i * gguf_type_row_size(qtype, n), x + b * n, n, qtype);
             }
             free(q4q_qx_buf);
+        DISPATCH("Q4_K_vec_dot_tail");
             return;
         }
     }
@@ -3306,6 +3329,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
         }
         if (prof_active) { double dt = picolm_now()-t0; prof_scalar_seq+=dt; cnt_scalar_seq++; }
         if (qx_buf) { free(qx_buf); if (qx_d_buf) free(qx_d_buf); }
+        DISPATCH("scalar_vec_dot");
         return;
     }
 
@@ -3329,6 +3353,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
     pool_wake(nt);
     matmul_worker_f(&pool_tasks[0]);
     pool_wait(nt);
+    DISPATCH("scalar_vec_dot_threaded");
     if (prof_active) { double dt = picolm_now()-t0; prof_scalar_par+=dt; cnt_scalar_par++; }
     if (qx_buf) { free(qx_buf); if (qx_d_buf) free(qx_d_buf); }
 }
@@ -3518,8 +3543,13 @@ static void qgemm_q4x8_fallback(const float *x, int n_batch, int d, int n,
 void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                         const void *W1, const void *W2,
                         int n, int d, gguf_type_t qtype1, gguf_type_t qtype2) {
-    if (!W1 && out1) memset(out1, 0, (size_t)n_batch * d * sizeof(float));
-    if (!W2 && out2) memset(out2, 0, (size_t)n_batch * d * sizeof(float));
+    static const char *_dispatch_env2 = NULL;
+    if (!_dispatch_env2) _dispatch_env2 = getenv("PICOLM_DISPATCH");
+    #define __DISPATCH2_UNIQ_N(x, y) x##y
+    #define __DISPATCH2_UNIQ(x, y) __DISPATCH2_UNIQ_N(x, y)
+    #define DISPATCH2(fmt) do { static int __DISPATCH2_UNIQ(_d, __LINE__); if (_dispatch_env2 && !__DISPATCH2_UNIQ(_d, __LINE__)) { __DISPATCH2_UNIQ(_d, __LINE__)=1; fprintf(stderr, "DISPATCH matmul_dual_batch: d=%d n=%d batch=%d qtype1=%d qtype2=%d -> " fmt "\n", d, n, n_batch, qtype1, qtype2); } } while(0)
+    if (!W1 && out1) { memset(out1, 0, (size_t)n_batch * d * sizeof(float)); DISPATCH2("NULL (W1 zero-filled)"); }
+    if (!W2 && out2) { memset(out2, 0, (size_t)n_batch * d * sizeof(float)); DISPATCH2("NULL (W2 zero-filled)"); }
     if (!W1 && !W2) return;
 #ifdef PICOLM_GPU
     if (getenv("PICOLM_GPU")) {
@@ -3572,6 +3602,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
             };
             tensor_parallel_for(nth, qgemm_d_task, &ctx2);
             free(qbuf); free(dbuf);
+        DISPATCH2("GEMM_d (single qtype)");
             return;
         }
     }
@@ -3627,6 +3658,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
             };
             tensor_parallel_for(nth, qgemm_d_task, &ctx2);
             free(qbuf); free(dbuf);
+        DISPATCH2("GEMM_d (dual qtype)");
             return;
         }
     }
@@ -3640,8 +3672,11 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
      * -- gate/up almost always share a quant type) still gets a correct
      * result for whichever side isn't Q4_0_8_8, just without the fast
      * path on that side. */
-    if (!picolm_sgemm_disabled_tensor() && (qtype1 == GGUF_TYPE_Q4_0_8_8 || qtype1 == GGUF_TYPE_Q4I_0_8_8 ||
-         qtype2 == GGUF_TYPE_Q4_0_8_8 || qtype2 == GGUF_TYPE_Q4I_0_8_8) &&
+    /* Q4_0_8_8 dual-batch GEMM: DISABLED for Q4_0_8_8 side.
+     * sgemm_q4_0x8_q8_0x4 produces garbage. Q4I_0_8_8 path kept (claims WORKING).
+     * Falls through to vec_dot path for Q4_0_8_8. */
+    if (!picolm_sgemm_disabled_tensor() && (qtype1 == GGUF_TYPE_Q4I_0_8_8 ||
+         qtype2 == GGUF_TYPE_Q4I_0_8_8) &&
         n_batch > 0 && n > 0 && d % 16 == 0 && n % 32 == 0)
     {
         if (qtype1 == GGUF_TYPE_Q4_0_8_8) {
@@ -3658,7 +3693,50 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
         } else {
             qgemm_q4x8_fallback(x, n_batch, d, n, W2, out2, qtype2);
         }
+        DISPATCH2("Q4I_0_8_8_GEMM_dual");
         return;
+    }
+#endif
+
+    /* Q4_0_8_8 vec_dot fallback for dual-batch (GEMM disabled due to bugs).
+     * Uses the same q4_0_8_8_batch_task as matmul_batch's vec_dot path. */
+#if defined(PICOLM_AVX2)
+    if ((qtype1 == GGUF_TYPE_Q4_0_8_8 || qtype2 == GGUF_TYPE_Q4_0_8_8) && n_batch > 0 && n > 0) {
+        size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
+        void *qbuf = malloc((size_t)n_batch * q8_rb);
+        if (qbuf) {
+            for (int b = 0; b < n_batch; b++)
+                quantize_row_q8_0(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
+
+            int total_groups = (d + 7) / 8;
+            if (qtype1 == GGUF_TYPE_Q4_0_8_8) {
+                size_t rb1 = gguf_type_row_size(GGUF_TYPE_Q4_0_8_8, n);
+                q4_0_8_8_batch_ctx_t ctx1 = { (const char *)W1, rb1, qbuf, q8_rb, out1, n, d, n_batch, 0 };
+                tensor_parallel_for(n_batch * total_groups, q4_0_8_8_batch_task, &ctx1);
+            } else {
+                size_t rb1 = gguf_type_row_size(qtype1, n);
+                for (int i = 0; i < d; i++) {
+                    const char *wr = (const char *)W1 + (size_t)i * rb1;
+                    for (int b = 0; b < n_batch; b++)
+                        out1[b * d + i] = vec_dot(wr, x + b * n, n, qtype1);
+                }
+            }
+            if (qtype2 == GGUF_TYPE_Q4_0_8_8) {
+                size_t rb2 = gguf_type_row_size(GGUF_TYPE_Q4_0_8_8, n);
+                q4_0_8_8_batch_ctx_t ctx2 = { (const char *)W2, rb2, qbuf, q8_rb, out2, n, d, n_batch, 0 };
+                tensor_parallel_for(n_batch * total_groups, q4_0_8_8_batch_task, &ctx2);
+            } else {
+                size_t rb2 = gguf_type_row_size(qtype2, n);
+                for (int i = 0; i < d; i++) {
+                    const char *wr = (const char *)W2 + (size_t)i * rb2;
+                    for (int b = 0; b < n_batch; b++)
+                        out2[b * d + i] = vec_dot(wr, x + b * n, n, qtype2);
+                }
+            }
+            free(qbuf);
+        DISPATCH2("Q4_0_8_8_vec_dot_dual");
+            return;
+        }
     }
 #endif
 
@@ -3913,6 +3991,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                 }
             }
             free(qx_buf);
+        DISPATCH2("Q4_K/GEMM_d_single_thread");
             return;
         }
     }
@@ -3960,6 +4039,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                     }
                 }
                 free(qx_buf);
+        DISPATCH2("Q4_0_4x4_dual_single_thread");
                 return;
             }
         }
@@ -4038,6 +4118,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
         }
         if (qx1_buf) { free(qx1_buf); if (qx1_d_buf) free(qx1_d_buf); }
         if (qx2_buf && qx2_buf != qx1_buf) { free(qx2_buf); if (qx2_d_buf) free(qx2_d_buf); }
+        DISPATCH2("scalar_vec_dot_single_thread");
         return;
     }
 
@@ -4080,6 +4161,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
     pool_wake(nt);
     matmul_worker_f(&pool_tasks[0]);
     pool_wait(nt);
+    DISPATCH2("scalar_vec_dot_threaded");
     if (qx1_buf) { free(qx1_buf); if (qx1_d_buf) free(qx1_d_buf); }
     if (qx2_buf && qx2_buf != qx1_buf) { free(qx2_buf); if (qx2_d_buf) free(qx2_d_buf); }
 }
