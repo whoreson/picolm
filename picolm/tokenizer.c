@@ -59,10 +59,7 @@ static int tok_hash_lookup(const tokenizer_t *t, const char *s, int len) {
 
 /* Legacy binary-search lookup -- kept for tokenizer_decode path (token_to_string
  * reverse lookup is not needed; decode uses vocab[] array directly by index).
- * Currently unused but kept as a safety net for edge cases.
- * Marked __attribute__((unused)) to suppress warning. */
-static int vocab_lookup(const tokenizer_t *t, const char *str, int len)
-    __attribute__((unused));
+ * Currently unused but kept as a safety net for edge cases. */
 static int vocab_lookup(const tokenizer_t *t, const char *str, int len) {
     int lo = 0, hi = t->vocab_size - 1;
     while (lo <= hi) {
