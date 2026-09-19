@@ -1192,15 +1192,16 @@ static __m256i q5_load_qs(const block_q5_0 *b) {
     __m256i pat = _mm256_set1_epi64x(0x7fbfdfeff7fbfdfeULL);
     __m256i r0 = _mm256_andnot_si256(
         _mm256_cmpeq_epi8(pat, _mm256_or_si256(pat, _mm256_shuffle_epi8(qh256, idx0))),
-        _mm256_set1_epi8((char)0xF0));
+        _mm256_set1_epi8(0x10));
     __m256i r1 = _mm256_andnot_si256(
         _mm256_cmpeq_epi8(pat, _mm256_or_si256(pat, _mm256_shuffle_epi8(qh256, idx1))),
-        _mm256_set1_epi8((char)0xF0));
+        _mm256_set1_epi8(0x10));
     __m128i bits0 = _mm256_castsi256_si128(r0);
     __m128i bits1 = _mm256_extracti128_si256(r1, 1);
     __m256i qhbits = _mm256_insertf128_si256(
         _mm256_castsi128_si256(bits0), bits1, 1);
-    return _mm256_or_si256(xs, qhbits);
+    /* OR nibbles with 5th bit, then subtract 16 for signed -16..15 range */
+    return _mm256_sub_epi8(_mm256_or_si256(xs, qhbits), _mm256_set1_epi8(16));
 }
 
 /* Generic quantized GEMM for AVX2/AVX. RM=4 weight rows, RN=2 act rows. */
@@ -2058,14 +2059,15 @@ static __m256i qg_q5_qs(const block_q5_0 *b) {
     __m256i pat = _mm256_set1_epi64x(0x7fbfdfeff7fbfdfeULL);
     __m256i r0 = _mm256_andnot_si256(
         _mm256_cmpeq_epi8(pat, _mm256_or_si256(pat, _mm256_shuffle_epi8(qh256, idx0))),
-        _mm256_set1_epi8((char)0xF0));
+        _mm256_set1_epi8(0x10));
     __m256i r1 = _mm256_andnot_si256(
         _mm256_cmpeq_epi8(pat, _mm256_or_si256(pat, _mm256_shuffle_epi8(qh256, idx1))),
-        _mm256_set1_epi8((char)0xF0));
+        _mm256_set1_epi8(0x10));
     __m256i qhbits = _mm256_insertf128_si256(
         _mm256_castsi128_si256(_mm256_castsi256_si128(r0)),
         _mm256_extracti128_si256(r1, 1), 1);
-    return _mm256_or_si256(xs, qhbits);
+    /* OR nibbles with 5th bit, then subtract 16 for signed -16..15 range */
+    return _mm256_sub_epi8(_mm256_or_si256(xs, qhbits), _mm256_set1_epi8(16));
 }
 
 /* Compute one 4(weight rows) x 2(activation rows) tile at (ii,jj).
