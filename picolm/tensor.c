@@ -4118,52 +4118,9 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
         }
         if (qx1_buf) { free(qx1_buf); if (qx1_d_buf) free(qx1_d_buf); }
         if (qx2_buf && qx2_buf != qx1_buf) { free(qx2_buf); if (qx2_d_buf) free(qx2_d_buf); }
-        DISPATCH2("scalar_vec_dot_single_thread");
+        DISPATCH2("scalar_vec_dot");
         return;
     }
-
-    /* Threaded: run both matmuls with half threads each */
-    int nt = pool_total_threads(n_threads);
-    int want = n_threads < nt ? n_threads : nt;
-    int active_total = want > d ? d : want;
-    int nt1 = (active_total + 1) / 2, nt2 = active_total - nt1;
-
-    /* Set up tasks for W1 -> out1 */
-    int a1 = pool_assign_rows(0, nt1, d);
-    for (int t = 0; t < a1; t++) {
-        pool_tasks[t].out = out1;
-        pool_tasks[t].x = have_qx1 ? (const float *)qx1_buf : x;
-        pool_tasks[t].x_d = have_qx1 ? qx1_d_buf : NULL;
-        pool_tasks[t].W = (const char *)W1;
-        pool_tasks[t].row_bytes = gguf_type_row_size(qtype1, n);
-        pool_tasks[t].n = n;
-        pool_tasks[t].d = d;
-        pool_tasks[t].qtype = qtype1;
-        pool_tasks[t].n_batch = n_batch;
-    }
-
-    /* Set up tasks for W2 -> out2 */
-    int a2 = pool_assign_rows(nt1, nt2, d);
-    for (int t = 0; t < a2; t++) {
-        pool_tasks[nt1 + t].out = out2;
-        pool_tasks[nt1 + t].x = have_qx2 ? (const float *)qx2_buf : x;
-        pool_tasks[nt1 + t].x_d = have_qx2 ? qx2_d_buf : NULL;
-        pool_tasks[nt1 + t].W = (const char *)W2;
-        pool_tasks[nt1 + t].row_bytes = gguf_type_row_size(qtype2, n);
-        pool_tasks[nt1 + t].n = n;
-        pool_tasks[nt1 + t].d = d;
-        pool_tasks[nt1 + t].qtype = qtype2;
-        pool_tasks[nt1 + t].n_batch = n_batch;
-    }
-    pool_clear_unused(nt1 + a2, nt);
-
-    pool_init(nt);
-    pool_wake(nt);
-    matmul_worker_f(&pool_tasks[0]);
-    pool_wait(nt);
-    DISPATCH2("scalar_vec_dot_threaded");
-    if (qx1_buf) { free(qx1_buf); if (qx1_d_buf) free(qx1_d_buf); }
-    if (qx2_buf && qx2_buf != qx1_buf) { free(qx2_buf); if (qx2_d_buf) free(qx2_d_buf); }
 }
 
 /* ================================================================
