@@ -420,16 +420,12 @@ static int spm_tokenize_fragment(const tokenizer_t *t, const char *frag, int fra
         /* Try to match the whole UTF-8 sequence as a token */
         int tok = tok_hash_lookup(t, norm + i, clen);
         if (tok < 0) {
-            /* Fallback: try <0xHH> byte token for first byte */
-            char byte_tok[8];
-            int blen = snprintf(byte_tok, sizeof(byte_tok), "<0x%02X>",
-                                (unsigned char)norm[i]);
-            tok = tok_hash_lookup(t, byte_tok, blen);
-            if (tok < 0) {
-                /* Unrecognized byte -- create 1-byte symbol, will get
-                 * byte fallback during output */
-                clen = 1;
-            }
+            /* Multi-byte char not in vocab. Split into individual bytes so each
+             * byte gets its own symbol. This matches the old O(n^2) behavior:
+             * when a full UTF-8 sequence fails, advance by 1 byte, allowing
+             * <0xHH> byte tokens to be created and participate in merges with
+             * neighboring real tokens. */
+            clen = 1;
         }
 
         syms[nsyms].prev = nsyms - 1;
