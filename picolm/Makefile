@@ -519,9 +519,9 @@ HUNGER_CUOBS = backend_gpu_kernels_win.obj backend_gpu_host_core_win.obj backend
 # them explicitly here. Cascade: AVX512 implies AVX2 implies AVX etc.
 HUNGER_SIMD = /D PICOLM_AVX512=1 /D PICOLM_AVX2=1 /D PICOLM_AVX=1 /D PICOLM_SSE3=1 /D PICOLM_SSE2=1 /D PICOLM_FMA=1
 HUNGER_WD = /wd4996 /wd4244 /wd4267 /wd4101 /wd4102 /wd4090 /wd4018 /wd4477
-HUNGER_CF = /O2 /W3 $(HUNGER_WD) /arch:AVX512 /D PICOLM_GPU=1 /D PICOLM_CUDA=1 /D _CRT_SECURE_NO_WARNINGS /I. /I"$(HUNGER_CUDA_ROOT)/include" /openmp /c $(HUNGER_SIMD)
+HUNGER_CF = /O2 /W3 $(HUNGER_WD) /arch:AVX512 /D PICOLM_GPU=1 /D PICOLM_CUDA=1 /D PICOLM_SERVER=1 /D _CRT_SECURE_NO_WARNINGS /I. /I"$(HUNGER_CUDA_ROOT)/include" /openmp /c $(HUNGER_SIMD)
 # hunger-nogpu: same as hunger but without GPU backend (pure MSVC, no nvcc, no cudart)
-HUNGER_CF_NOGPU = /O2 /W3 $(HUNGER_WD) /arch:AVX512 /D _CRT_SECURE_NO_WARNINGS /I. /openmp /c $(HUNGER_SIMD)
+HUNGER_CF_NOGPU = /O2 /W3 $(HUNGER_WD) /arch:AVX512 /D PICOLM_SERVER=1 /D _CRT_SECURE_NO_WARNINGS /I. /openmp /c $(HUNGER_SIMD)
 
 hunger:
 	echo @echo off > .hunger_build.bat
@@ -601,7 +601,7 @@ HUNGER_CL_WIN = D:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools
 HUNGER_LINK_WIN = D:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/$(HUNGER_MSVC_VER)/bin/Hostx64/x64/link.exe
 HUNGER_CUDA_WIN = C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4
 HUNGER_NVCC_FLAGS = -O3 --fmad=false -std=c++14 -DPICOLM_GPU=1 -DPICOLM_CUDA=1 -DPICOLM_SSM_WARP_KERNEL_VALIDATED -DPICOLM_SSM_CHUNKED_GPU_VALIDATED -ccbin "$(HUNGER_CL_WIN)" -Xcompiler "/EHsc /O2 /W3 /std:c++14 /arch:AVX2 /wd4244 /wd4267 /wd4101 /wd4102 /DPICOLM_AVX2=1 /DPICOLM_AVX=1 /DPICOLM_SSE3=1 /DPICOLM_SSE2=1 /DPICOLM_FMA=1" -gencode arch=compute_89,code=$(HUNGER_CUDA_ARCH) -c -o
-HUNGER_CL_FLAGS = /O2 /W3 /wd4996 /wd4244 /wd4267 /wd4101 /wd4102 /wd4090 /wd4018 /wd4477 /arch:AVX2 /D PICOLM_GPU=1 /D PICOLM_CUDA=1 /D _CRT_SECURE_NO_WARNINGS /D _CRT_AMD64 /I. /openmp /c /D PICOLM_AVX2=1 /D PICOLM_AVX=1 /D PICOLM_SSE3=1 /D PICOLM_SSE2=1 /D PICOLM_FMA=1
+HUNGER_CL_FLAGS = /O2 /W3 /wd4996 /wd4244 /wd4267 /wd4101 /wd4102 /wd4090 /wd4018 /wd4477 /arch:AVX2 /D PICOLM_GPU=1 /D PICOLM_CUDA=1 /D PICOLM_SERVER=1 /D _CRT_SECURE_NO_WARNINGS /D _CRT_AMD64 /I. /openmp /c /D PICOLM_AVX2=1 /D PICOLM_AVX=1 /D PICOLM_SSE3=1 /D PICOLM_SSE2=1 /D PICOLM_FMA=1
 
 .PHONY: hunger-msys-direct
 hunger-msys-direct: gpu-clean-objs
