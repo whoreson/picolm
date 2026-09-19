@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include "model.h"
 
 /* ---- GGUF string reader (reused from model.c logic) ---- */
@@ -13,7 +14,18 @@ static uint64_t read_u64_at(const uint8_t **p) {
     return GGUF_LE64(v);
 }
 
-/* ---- Sorted index for binary search ---- */
+/* ---- FNV-1a hash (same as qwen_tokenize.c) ---- */
+
+static uint32_t fnv1a(const char *s, int n) {
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < n; i++) {
+        h ^= (uint8_t)s[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+/* ---- Sorted index for binary search (kept for backward compat / decode) ---- */
 
 static char **g_vocab_for_sort; /* global for qsort comparison */
 
@@ -23,15 +35,41 @@ static int cmp_sorted(const void *a, const void *b) {
     return strcmp(g_vocab_for_sort[ia], g_vocab_for_sort[ib]);
 }
 
+/* ---- Hash table: string -> token_id (open addressing, FNV-1a) ----
+ *
+ * This replaces the O(log V) binary search with O(1) lookup for the
+ * SPM merge loop. Built at load time from the vocab strings.
+ *
+ * Size: 2x vocab_size to keep load factor at 0.5 (good for open addressing).
+ * Power of 2 for fast modulo via bitmask. */
+
+#define TOK_HASH_BITS 16   /* 65536 entries -- enough for 32K vocab at 0.5 load */
+
+static int tok_hash_lookup(const tokenizer_t *t, const char *s, int len) {
+    uint32_t mask = (uint32_t)t->tok_hash_cap - 1;
+    uint32_t h = fnv1a(s, len) & mask;
+    for (;;) {
+        int id = t->tok_hash[h];
+        if (id < 0) return -1;  /* empty slot = not found */
+        if (t->tok_len[id] == len && memcmp(t->vocab[id], s, (size_t)len) == 0)
+            return id;
+        h = (h + 1) & mask;  /* linear probing */
+    }
+}
+
+/* Legacy binary-search lookup -- kept for tokenizer_decode path (token_to_string
+ * reverse lookup is not needed; decode uses vocab[] array directly by index).
+ * Currently unused but kept as a safety net for edge cases.
+ * Marked __attribute__((unused)) to suppress warning. */
+static int vocab_lookup(const tokenizer_t *t, const char *str, int len)
+    __attribute__((unused));
 static int vocab_lookup(const tokenizer_t *t, const char *str, int len) {
-    /* Binary search in sorted vocabulary */
     int lo = 0, hi = t->vocab_size - 1;
     while (lo <= hi) {
         int mid = (lo + hi) / 2;
         int idx = t->sorted_idx[mid];
         int cmp = strncmp(t->vocab[idx], str, (size_t)len);
         if (cmp == 0) {
-            /* Check exact length match */
             if (t->vocab[idx][len] == '\0') return idx;
             if (t->vocab[idx][len] > '\0') { hi = mid - 1; }
             else { lo = mid + 1; }
@@ -41,7 +79,7 @@ static int vocab_lookup(const tokenizer_t *t, const char *str, int len) {
             hi = mid - 1;
         }
     }
-    return -1; /* not found */
+    return -1;
 }
 
 /* ---- Public API ---- */
@@ -55,14 +93,35 @@ int tokenizer_load(tokenizer_t *t, const model_t *m) {
     t->add_space_prefix = m->tok_add_space_prefix;
     t->token_type = NULL;
     t->n_token_type = 0;
+    t->tok_hash = NULL;
+    t->tok_hash_cap = 0;
+    t->tok_len = NULL;
 
-    /* Allocate vocab and scores arrays */
+    /* Allocate vocab, scores, sorted index, tok_len, hash table */
     t->vocab = (char **)calloc((size_t)vs, sizeof(char *));
     t->scores = (float *)calloc((size_t)vs, sizeof(float));
     t->sorted_idx = (int *)malloc((size_t)vs * sizeof(int));
-    if (!t->vocab || !t->scores || !t->sorted_idx) {
+    t->tok_len = (int *)malloc((size_t)vs * sizeof(int));
+    if (!t->vocab || !t->scores || !t->sorted_idx || !t->tok_len) {
         fprintf(stderr, "OOM allocating tokenizer\n");
         return -1;
+    }
+
+    /* Hash table: 2x vocab_size, rounded up to power of 2, minimum 65536 */
+    {
+        uint32_t cap = (uint32_t)vs * 2;
+        if (cap < (1u << TOK_HASH_BITS)) cap = 1u << TOK_HASH_BITS;
+        /* Round up to power of 2 */
+        uint32_t bits = 0;
+        while ((1u << bits) < cap) bits++;
+        cap = 1u << bits;
+        t->tok_hash_cap = (int)cap;
+        t->tok_hash = (int *)calloc((size_t)cap, sizeof(int));
+        if (!t->tok_hash) {
+            fprintf(stderr, "OOM allocating tokenizer hash table\n");
+            return -1;
+        }
+        memset(t->tok_hash, -1, (size_t)cap * sizeof(int));
     }
 
     /* Read vocab strings from GGUF metadata array */
@@ -83,10 +142,25 @@ int tokenizer_load(tokenizer_t *t, const model_t *m) {
         }
     }
 
-    /* Fill any remaining entries with empty strings */
-    for (int i = 0; i < vs; i++) {
-        if (!t->vocab[i]) {
-            t->vocab[i] = (char *)calloc(1, 1);
+    /* Fill any remaining entries with empty strings, cache lengths, populate hash table */
+    {
+        uint32_t mask = (uint32_t)t->tok_hash_cap - 1;
+        for (int i = 0; i < vs; i++) {
+            if (!t->vocab[i]) {
+                t->vocab[i] = (char *)calloc(1, 1);
+            }
+            t->tok_len[i] = (int)strlen(t->vocab[i]);
+            /* Insert into hash table (skip empty strings) */
+            if (t->tok_len[i] > 0) {
+                uint32_t h = fnv1a(t->vocab[i], t->tok_len[i]) & mask;
+                for (;;) {
+                    if (t->tok_hash[h] < 0) {
+                        t->tok_hash[h] = i;
+                        break;
+                    }
+                    h = (h + 1) & mask;
+                }
+            }
         }
     }
 
@@ -164,9 +238,137 @@ int tokenizer_load(tokenizer_t *t, const model_t *m) {
     return 0;
 }
 
-/* ---- SPM helpers ---- */
+/* ---- SPM helpers ----
 
-/* Tokenize a single raw text fragment using SPM merge.
+ * Priority-queue based SPM tokenizer (O(n log n) instead of O(n^2)).
+ * Ported from llama.cpp's llm_tokenizer_spm_session.
+ *
+ * Algorithm:
+ *   1. Split normalized text into UTF-8 character symbols (linked list)
+ *   2. Seed max-heap with all adjacent pairs that form valid vocab tokens
+ *   3. Pop highest-score bigram, merge symbols, check new neighbors
+ *   4. Walk surviving symbols, emit token IDs via hash lookup
+ *
+ * Key insight: merges only happen when the concatenated string exists in
+ * the vocab (tok_hash_lookup succeeds). Therefore every surviving symbol
+ * (n > 0) always represents a valid vocab token. No rev_merge map needed.
+ * The only exception: bytes that failed both char and <0xHH> lookup during
+ * Step 1 -- these survive as single-byte symbols with no vocab match.
+ * They get byte-level fallback during output.
+ */
+
+/* Symbol in the doubly-linked list of character tokens */
+typedef struct {
+    int prev;         /* index in syms[], or -1 */
+    int next;         /* index in syms[], or -1 */
+    const char *text; /* pointer into norm buffer (stable) */
+    int n;            /* byte length (extended during merge, zeroed when consumed) */
+} spm_sym;
+
+/* Bigram for the max-heap */
+typedef struct {
+    float score;
+    int left;
+    int right;
+    int size;   /* left.n + right.n at time of creation (for stale detection) */
+} spm_bigram;
+
+/* Max-heap: higher score = higher priority = merged first.
+ * Tie-break: lower left index wins (deterministic, matches SPM spec). */
+static void heap_push(spm_bigram *heap, int *hsize, spm_bigram bg) {
+    int i = (*hsize)++;
+    heap[i] = bg;
+    while (i > 0) {
+        int p = (i - 1) / 2;
+        if (heap[p].score > bg.score) break;
+        if (heap[p].score == bg.score && heap[p].left <= bg.left) break;
+        heap[i] = heap[p];
+        i = p;
+    }
+    heap[i] = bg;
+}
+
+static spm_bigram heap_pop(spm_bigram *heap, int *hsize) {
+    spm_bigram top = heap[0];
+    int last = --*hsize;
+    if (*hsize > 0) {
+        spm_bigram bg = heap[last];
+        int i = 0;
+        for (;;) {
+            int c = 2 * i + 1;
+            if (c >= *hsize) break;
+            int c2 = c + 1;
+            if (c2 < *hsize && (heap[c2].score > heap[c].score ||
+                (heap[c2].score == heap[c].score && heap[c2].left < heap[c].left)))
+                c = c2;
+            if (bg.score > heap[c].score) break;
+            if (bg.score == heap[c].score && bg.left <= heap[c].left) break;
+            heap[i] = heap[c];
+            i = c;
+        }
+        heap[i] = bg;
+    }
+    return top;
+}
+
+/* Try to add a bigram for adjacent symbols (left, right) to the heap.
+ * Returns 1 if added, 0 if not a valid merge. */
+static int try_add_bigram(const tokenizer_t *t, spm_sym *syms,
+                          int left, int right, spm_bigram *heap, int *hsize) {
+    if (left < 0 || right < 0) return 0;
+    if (syms[left].n <= 0 || syms[right].n <= 0) return 0;
+
+    int llen = syms[left].n;
+    int rlen = syms[right].n;
+    int tlen = llen + rlen;
+    if (tlen > 256) return 0; /* safety limit */
+
+    /* Inline concatenation into stack buffer */
+    char merged[256];
+    memcpy(merged, syms[left].text, (size_t)llen);
+    memcpy(merged + llen, syms[right].text, (size_t)rlen);
+    merged[tlen] = '\0';
+
+    int tok = tok_hash_lookup(t, merged, tlen);
+    if (tok < 0) return 0;
+
+    spm_bigram bg;
+    bg.left = left;
+    bg.right = right;
+    bg.score = t->scores[tok];
+    bg.size = tlen;
+    heap_push(heap, hsize, bg);
+    return 1;
+}
+
+/* Emit tokens for a single surviving symbol.
+ * For merged symbols: always a valid vocab token (proven above).
+ * For unmatched bytes: fallback to <0xHH> per byte or skip. */
+static int emit_symbol(const tokenizer_t *t, const char *text, int n,
+                       int *tokens, int max_tokens, int *out_pos) {
+    /* Try as a whole token first */
+    int tok = tok_hash_lookup(t, text, n);
+    if (tok >= 0) {
+        if (*out_pos < max_tokens) tokens[(*out_pos)++] = tok;
+        return 1;
+    }
+
+    /* Fallback: emit each byte as <0xHH> or skip */
+    int emitted = 0;
+    for (int j = 0; j < n && *out_pos < max_tokens; j++) {
+        char byte_tok[8];
+        int blen = snprintf(byte_tok, sizeof(byte_tok), "<0x%02X>",
+                            (unsigned char)text[j]);
+        int bt = tok_hash_lookup(t, byte_tok, blen);
+        if (bt >= 0) {
+            tokens[(*out_pos)++] = bt;
+            emitted++;
+        }
+    }
+    return emitted;
+}
+
+/* Tokenize a single raw text fragment using priority-queue SPM merge.
  * Writes tokens starting at tokens[out_pos], increments *out_pos.
  * Returns the number of new tokens appended. */
 static int spm_tokenize_fragment(const tokenizer_t *t, const char *frag, int frag_len,
@@ -202,9 +404,10 @@ static int spm_tokenize_fragment(const tokenizer_t *t, const char *frag, int fra
     }
     norm[norm_len] = '\0';
 
-    /* Step 1: Split into character tokens */
-    int *merge_buf = (int *)malloc((size_t)(norm_len + 1) * sizeof(int));
-    int merge_len = 0;
+    /* Step 1: Split into UTF-8 character symbols (linked list) */
+    int max_syms = norm_len + 1;
+    spm_sym *syms = (spm_sym *)calloc((size_t)max_syms, sizeof(spm_sym));
+    int nsyms = 0;
 
     for (int i = 0; i < norm_len; ) {
         int clen = 1;
@@ -214,69 +417,94 @@ static int spm_tokenize_fragment(const tokenizer_t *t, const char *frag, int fra
         else if (c >= 0xC0) clen = 2;
         if (i + clen > norm_len) clen = norm_len - i;
 
-        int tok = vocab_lookup(t, norm + i, clen);
-        if (tok >= 0) {
-            merge_buf[merge_len++] = tok;
-            i += clen;
-        } else {
+        /* Try to match the whole UTF-8 sequence as a token */
+        int tok = tok_hash_lookup(t, norm + i, clen);
+        if (tok < 0) {
+            /* Fallback: try <0xHH> byte token for first byte */
             char byte_tok[8];
-            snprintf(byte_tok, sizeof(byte_tok), "<0x%02X>", (unsigned char)norm[i]);
-            tok = vocab_lookup(t, byte_tok, (int)strlen(byte_tok));
-            if (tok >= 0) {
-                merge_buf[merge_len++] = tok;
-            }
-            i++;
-        }
-    }
-    free(norm);
-
-    /* Step 2: SPM merge loop */
-    while (merge_len >= 2) {
-        float best_score = -1e30f;
-        int best_idx = -1;
-        int best_tok = -1;
-
-        for (int i = 0; i < merge_len - 1; i++) {
-            const char *s1 = t->vocab[merge_buf[i]];
-            const char *s2 = t->vocab[merge_buf[i + 1]];
-            int l1 = (int)strlen(s1);
-            int l2 = (int)strlen(s2);
-
-            char merged[256];
-            if (l1 + l2 >= (int)sizeof(merged)) continue;
-            memcpy(merged, s1, (size_t)l1);
-            memcpy(merged + l1, s2, (size_t)l2);
-            merged[l1 + l2] = '\0';
-
-            int merged_tok = vocab_lookup(t, merged, l1 + l2);
-            if (merged_tok >= 0 && t->scores[merged_tok] > best_score) {
-                best_score = t->scores[merged_tok];
-                best_idx = i;
-                best_tok = merged_tok;
+            int blen = snprintf(byte_tok, sizeof(byte_tok), "<0x%02X>",
+                                (unsigned char)norm[i]);
+            tok = tok_hash_lookup(t, byte_tok, blen);
+            if (tok < 0) {
+                /* Unrecognized byte -- create 1-byte symbol, will get
+                 * byte fallback during output */
+                clen = 1;
             }
         }
 
-        if (best_idx < 0) break;
+        syms[nsyms].prev = nsyms - 1;
+        syms[nsyms].next = nsyms + 1; /* will be corrected for last element */
+        syms[nsyms].text = norm + i;
+        syms[nsyms].n = clen;
+        nsyms++;
+        i += clen;
+    }
+    if (nsyms > 0) syms[nsyms - 1].next = -1;
 
-        merge_buf[best_idx] = best_tok;
-        for (int i = best_idx + 1; i < merge_len - 1; i++) {
-            merge_buf[i] = merge_buf[i + 1];
-        }
-        merge_len--;
+    if (nsyms == 0) {
+        free(norm);
+        free(syms);
+        return 0;
     }
 
-    /* Copy to output */
+    /* Step 2: Seed max-heap with all adjacent pairs that form valid tokens */
+    /* Each merge adds at most 2 new bigrams, worst case: (nsyms-1) initial + 2*(nsyms-1) pushes */
+    int max_heap = 3 * nsyms;
+    spm_bigram *heap = (spm_bigram *)malloc((size_t)max_heap * sizeof(spm_bigram));
+    int hsize = 0;
+
+    for (int i = 1; i < nsyms; i++) {
+        try_add_bigram(t, syms, i - 1, i, heap, &hsize);
+    }
+
+    /* Step 3: Process merges via priority queue (O(n log n) total) */
+    while (hsize > 0) {
+        spm_bigram bg = heap_pop(heap, &hsize);
+
+        int li = bg.left;
+        int ri = bg.right;
+
+        /* Bounds check */
+        if (li < 0 || li >= nsyms || ri < 0 || ri >= nsyms) continue;
+
+        /* Stale checks: both alive, sizes match, right is immediate successor */
+        if (syms[li].n == 0 || syms[ri].n == 0) continue;
+        if (syms[li].n + syms[ri].n != bg.size) continue;
+        if (syms[li].next != ri) continue;
+
+        /* Merge right into left */
+        syms[li].n += syms[ri].n;
+        syms[ri].n = 0; /* mark consumed */
+
+        /* Update linked list: remove right from chain */
+        int rnext = syms[ri].next;
+        syms[li].next = rnext;
+        if (rnext >= 0) syms[rnext].prev = li;
+
+        /* Check new neighbors */
+        if (syms[li].prev >= 0)
+            try_add_bigram(t, syms, syms[li].prev, li, heap, &hsize);
+        if (syms[li].next >= 0)
+            try_add_bigram(t, syms, li, syms[li].next, heap, &hsize);
+    }
+
+    /* Step 4: Output surviving symbols (n > 0) */
+    /* Traverse linked list forward, emit each surviving symbol */
     int count = 0;
-    for (int i = 0; i < merge_len && *out_pos < max_tokens; i++) {
-        tokens[(*out_pos)++] = merge_buf[i];
-        count++;
+    for (int i = 0; i < nsyms; i++) {
+        if (syms[i].n == 0) continue;
+        if (*out_pos >= max_tokens) break;
+        int emitted = emit_symbol(t, syms[i].text, syms[i].n,
+                                  tokens, max_tokens, out_pos);
+        count += emitted;
     }
 
-    free(merge_buf);
+    free(heap);
+    free(syms);
+    free(norm);
     return count;
 }
-
-/* Fragment types for partitioning */
+   /* Fragment types for partitioning */
 #define FRAG_TYPE_RAW   0
 #define FRAG_TYPE_TOKEN 1
 
@@ -495,6 +723,11 @@ void tokenizer_free(tokenizer_t *t) {
     t->scores = NULL;
     free(t->sorted_idx);
     t->sorted_idx = NULL;
+    free(t->tok_hash);
+    t->tok_hash = NULL;
+    t->tok_hash_cap = 0;
+    free(t->tok_len);
+    t->tok_len = NULL;
     free(t->special_tokens);
     t->special_tokens = NULL;
     t->n_special_tokens = 0;

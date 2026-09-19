@@ -18,6 +18,10 @@ typedef struct {
     /* Special tokens cache (for SPM partitioning) */
     int    *special_tokens;   /* token IDs of special tokens (type 3/4/5), sorted by string length desc */
     int     n_special_tokens; /* number of special tokens */
+    /* Hash table for O(1) SPM bigram lookup (replaces binary search) */
+    int    *tok_hash;         /* open-addressing hash table: string -> token_id */
+    int     tok_hash_cap;     /* hash table capacity (power of 2) */
+    int    *tok_len;          /* cached strlen per vocab entry */
 } tokenizer_t;
 
 /* Load tokenizer data from GGUF metadata pointers in model.
