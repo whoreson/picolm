@@ -57,28 +57,6 @@ static int tok_hash_lookup(const tokenizer_t *t, const char *s, int len) {
     }
 }
 
-/* Legacy binary-search lookup -- kept for tokenizer_decode path (token_to_string
- * reverse lookup is not needed; decode uses vocab[] array directly by index).
- * Currently unused but kept as a safety net for edge cases. */
-static int vocab_lookup(const tokenizer_t *t, const char *str, int len) {
-    int lo = 0, hi = t->vocab_size - 1;
-    while (lo <= hi) {
-        int mid = (lo + hi) / 2;
-        int idx = t->sorted_idx[mid];
-        int cmp = strncmp(t->vocab[idx], str, (size_t)len);
-        if (cmp == 0) {
-            if (t->vocab[idx][len] == '\0') return idx;
-            if (t->vocab[idx][len] > '\0') { hi = mid - 1; }
-            else { lo = mid + 1; }
-        } else if (cmp < 0) {
-            lo = mid + 1;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    return -1;
-}
-
 /* ---- Public API ---- */
 
 int tokenizer_load(tokenizer_t *t, const model_t *m) {
