@@ -3444,6 +3444,15 @@ static void handle_detokenize(SOCKET sock, const char *request_body) {
 
 static void handle_slots(SOCKET sock);  /* fwd decl */
 
+/* Match /slots, /v1/slots, /slots/0, /v1/slots/0 (llama.cpp compat) */
+static int is_slots_path(const char *path) {
+    if (strcmp(path, "/slots") == 0) return 1;
+    if (strcmp(path, "/v1/slots") == 0) return 1;
+    if (strcmp(path, "/slots/0") == 0) return 1;
+    if (strcmp(path, "/v1/slots/0") == 0) return 1;
+    return 0;
+}
+
 static void handle_request(SOCKET sock) {
     char method[16], path[512];
     srv.sock_in_buf = sock;
@@ -3474,7 +3483,7 @@ static void handle_request(SOCKET sock) {
             handle_list_models(sock, srv.model_path);
         } else if (strcmp(path, "/props") == 0 || strcmp(path, "/v1/props") == 0) {
             handle_props(sock);
-        } else if (strcmp(path, "/slots") == 0 || strcmp(path, "/v1/slots") == 0) {
+        } else if (is_slots_path(path)) {
             handle_slots(sock);
         } else if (strcmp(path, "/") == 0) {
             http_send(sock, 200, "text/plain", "PicoLM server running\n");
@@ -3504,7 +3513,7 @@ static void handle_request(SOCKET sock) {
             handle_tokenize(sock, body_start);
         } else if (strcmp(path, "/detokenize") == 0) {
             handle_detokenize(sock, body_start);
-        } else if (strcmp(path, "/slots") == 0 || strcmp(path, "/v1/slots") == 0) {
+        } else if (is_slots_path(path)) {
             handle_slots_post(sock, body_start);
         } else {
             http_send(sock, 404, "application/json", "{\"error\":{\"message\":\"Not found\"}}");
