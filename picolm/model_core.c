@@ -1153,11 +1153,6 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
     float *nw = s->norm_weights;
     for (int l = 0; l < c->n_layers; l++) {
         layer_weights_t *lw = &m->weights.layers[l];
-        if (l == 0) {
-            fprintf(stderr, "[GW_DBG] l=0 attn_norm=%p post_attn_norm=%p type_attn=%d type_post=%d\n",
-                (void*)lw->attn_norm, (void*)lw->post_attn_norm,
-                lw->type_attn_norm, lw->type_post_attn_norm);
-        }
         s->attn_norm_w[l] = nw;
         if (lw->attn_norm) {
             dequantize_row(lw->attn_norm, nw, c->n_embd, lw->type_attn_norm);
