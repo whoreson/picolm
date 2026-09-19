@@ -82,11 +82,11 @@ _have_i8mm   = $(shell echo | $(CC) -E -dM $(1) - 2>/dev/null | grep -c '__ARM_F
 # Cascading if/elif/else: only the first (highest) matching level is emitted.
 simd_defines_for = $(strip \
   $(if $(filter 1,$(call _have_avx512,$(1))),\
-    -DPICOLM_AVX512 -DPICOLM_AVX2 -DPICOLM_AVX -DPICOLM_SSE3 -DPICOLM_SSE2 -DPICOLM_FMA,\
+    -DPICOLM_AVX512 -DPICOLM_AVX2 -DPICOLM_AVX -DPICOLM_SSSE3 -DPICOLM_SSE3 -DPICOLM_SSE2 -DPICOLM_FMA,\
     $(if $(filter 1,$(call _have_avx2,$(1))),\
-      -DPICOLM_AVX2 -DPICOLM_AVX -DPICOLM_SSE3 -DPICOLM_SSE2 -DPICOLM_FMA,\
+      -DPICOLM_AVX2 -DPICOLM_AVX -DPICOLM_SSSE3 -DPICOLM_SSE3 -DPICOLM_SSE2 -DPICOLM_FMA,\
       $(if $(filter 1,$(call _have_avx,$(1))),\
-        -DPICOLM_AVX -DPICOLM_SSE3 -DPICOLM_SSE2,\
+        -DPICOLM_AVX -DPICOLM_SSSE3 -DPICOLM_SSE3 -DPICOLM_SSE2,\
         $(if $(filter 1,$(call _have_sse3,$(1))),\
           -DPICOLM_SSE3 -DPICOLM_SSE2,\
           $(if $(filter 1,$(call _have_sse2,$(1))),\
@@ -153,7 +153,7 @@ avx:
 
 # --- x86-64 with AVX2 (Haswell and newer Intel; Excavator and newer AMD) ---
 avx2:
-	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -mavx2 -mfma -mpopcnt -mf16c -DPICOLM_AVX2 -DPICOLM_FMA -DPICOLM_AVX -DPICOLM_SSE2"
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -mavx2 -mfma -mpopcnt -mf16c -DPICOLM_AVX2 -DPICOLM_FMA -DPICOLM_AVX -DPICOLM_SSSE3 -DPICOLM_SSE3 -DPICOLM_SSE2"
 
 # --- Persistent thread pool (WIP, for development) ---
 threadpool:
