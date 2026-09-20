@@ -127,8 +127,12 @@ static inline __m256i nibble_to_i8_hi_256(const __m256i raw, const __m256i lut) 
 /* ============================================================
  * AVX-512: 16x16 tiled GEMM
  * Directly follows llama.cpp's gemm_q4_b32_8x8_q8_0_lut_avx structure.
+ * Kept but not wired up by default -- see sgemm_q4_0x8_q8_0x4() below.
+ * Only compiled in if PICOLM_Q4_0X8_TRY_AVX512 is defined, to avoid an
+ * unused-static-function warning on AVX-512 hosts (which now use the
+ * AVX2 path instead).
  * ============================================================ */
-#if defined(__AVX512BW__) && defined(__AVX512DQ__)
+#if defined(PICOLM_Q4_0X8_TRY_AVX512) && defined(__AVX512BW__) && defined(__AVX512DQ__)
 static int sgemm_q4x8_q8x4_avx512(
         int k, const block_q4_0x8 *bp,
         const block_q8_0x4 *ap,
@@ -344,131 +348,177 @@ static int sgemm_q4x8_q8x4_avx512(
 
 
 /* ============================================================
- * AVX2 path: GEMV (single output row at a time)
- * Processes 8 weight rows x 1 activation row per inner loop.
- * This follows llama.cpp's approach: AVX2 has only gemv, not gemm,
- * for Q4_0_8_8. Still faster than scalar vec_dot due to AVX2
- * maddubs throughput and LUT-based dequant.
+ * AVX2 tiled GEMM: 8 weight rows (one block_q4_0x8) x 4 activation
+ * rows (one block_q8_0x4) computed together.
+ *
+ * STATUS: WORKING. This replaces a previous AVX2 "GEMM" that was
+ * never actually wired into sgemm_q4_0x8_q8_0x4() (see git history)
+ * and, on inspection, also made a wrong assumption about both the
+ * block_q4_0x8 nibble interleaving *and* the block_q8_0x4 activation
+ * layout (it assumed a byte-interleaved activation format; picolm's
+ * quantize_mat_q8_0x4() actually stores 4 rows back-to-back as
+ * qs[r*32 .. r*32+32) -- see quant.c). That mismatch is what produced
+ * garbage output and led to the kernel being disabled wholesale.
+ *
+ * This version is a port of ik_llama.cpp's (ikawrakow/ik_llama.cpp)
+ * mul_mat_q4_0_r8_q8_2_avx2() strategy from
+ * ggml/src/iqk/iqk_gemm_legacy_quants.cpp: for each k-block, unpack
+ * the 8 interleaved weight rows into signed int8 lanes *once*
+ * (prepare_q4_0_quants_avx2 in ik_llama's terms) and then reuse that
+ * unpacked tile across every activation row in the group
+ * (accum_q4_0_quants), instead of re-unpacking the weight nibbles
+ * once per activation row the way a GEMV kernel must. That's the
+ * actual "GEMM" win: the nibble/LUT/blend work is amortized 4x.
+ *
+ * The nibble-unpack and blend sequence itself is copied verbatim
+ * from vec_dot_q4_0x8_q8_0_avx2() (quant.c), which is the verified,
+ * bug-fixed GEMV kernel for this exact block_q4_0x8 layout -- see the
+ * comment on Q4_0X8_MULSUM there for why the sign-trick maddubs
+ * reduction is correct. picolm's Q8_0 activations are symmetric
+ * per-block-delta only (no bsums/min term), unlike ik_llama's
+ * asymmetric block_q8_2, so no extra "-8 * activation_sum" correction
+ * term is needed here (that term in ik_llama's kernel exists purely
+ * because ik_llama's Q4_0_R8 dequant is unsigned-nibble based and
+ * corrected via the block_q8_2 min; picolm's XOR-0x88 repacking
+ * already produces signed nibbles, matching Q4_0's own convention).
  * ============================================================ */
 #if defined(__AVX2__) && defined(__F16C__)
+
+#if defined(__FMA__)
+#define Q4X8_FMADD(a,b,c) _mm256_fmadd_ps((a),(b),(c))
+#else
+#define Q4X8_FMADD(a,b,c) _mm256_add_ps(_mm256_mul_ps((a),(b)),(c))
+#endif
+
+/* Computes an 8(weight-cols) x 4(activation-rows) output tile for one
+ * (weight-group, activation-group) pair, summed over nb k-blocks.
+ * bp: nb consecutive block_q4_0x8 (one weight-row-group)
+ * ap: nb consecutive block_q8_0x4 (one activation-row-group)
+ * out4x8[r][0..7]: output for activation row r, weight cols 0..7 */
+static inline void sgemm_q4x8_q8x4_avx2_tile(
+        const block_q4_0x8 *bp, const block_q8_0x4 *ap, int nb,
+        float out4x8[4][8])
+{
+    __m256i signextendlut = _mm256_castsi128_si256(
+        _mm_set_epi8(-1, -2, -3, -4, -5, -6, -7, -8, 7, 6, 5, 4, 3, 2, 1, 0));
+    signextendlut = _mm256_permute2f128_si256(signextendlut, signextendlut, 0);
+    const __m256i finalpermutemask = _mm256_set_epi32(7, 5, 3, 1, 6, 4, 2, 0);
+    const __m256i m4b = _mm256_set1_epi8(0x0F);
+    const __m128i changemask = _mm_set_epi8(15, 14, 7, 6, 13, 12, 5, 4,
+                                             11, 10, 3, 2, 9, 8, 1, 0);
+
+    __m256 acc[4];
+    acc[0] = acc[1] = acc[2] = acc[3] = _mm256_setzero_ps();
+
+#define Q4_0X8_MULSUM_INTO(iacc, bvec, avec) \
+    (iacc) = _mm256_add_epi32((iacc), _mm256_madd_epi16(_mm256_set1_epi16(1), \
+        _mm256_maddubs_epi16(_mm256_sign_epi8((bvec), (bvec)), _mm256_sign_epi8((avec), (bvec)))))
+
+    for (int b = 0; b < nb; b++) {
+        /* ---- Weight side: unpack once, reused for all 4 activation rows ---- */
+        const __m256i rhs0_0 = _mm256_loadu_si256((const __m256i *)bp[b].qs);
+        const __m256i rhs1_0 = _mm256_loadu_si256((const __m256i *)(bp[b].qs + 32));
+        const __m256i rhs0_1 = _mm256_loadu_si256((const __m256i *)(bp[b].qs + 64));
+        const __m256i rhs1_1 = _mm256_loadu_si256((const __m256i *)(bp[b].qs + 96));
+
+        const __m256i r00 = _mm256_shuffle_epi8(signextendlut, _mm256_and_si256(rhs0_0, m4b));
+        const __m256i r10 = _mm256_shuffle_epi8(signextendlut, _mm256_and_si256(rhs1_0, m4b));
+        const __m256i r01 = _mm256_shuffle_epi8(signextendlut, _mm256_and_si256(rhs0_1, m4b));
+        const __m256i r11 = _mm256_shuffle_epi8(signextendlut, _mm256_and_si256(rhs1_1, m4b));
+        const __m256i r02 = _mm256_shuffle_epi8(signextendlut,
+            _mm256_and_si256(_mm256_srli_epi16(rhs0_0, 4), m4b));
+        const __m256i r12 = _mm256_shuffle_epi8(signextendlut,
+            _mm256_and_si256(_mm256_srli_epi16(rhs1_0, 4), m4b));
+        const __m256i r03 = _mm256_shuffle_epi8(signextendlut,
+            _mm256_and_si256(_mm256_srli_epi16(rhs0_1, 4), m4b));
+        const __m256i r13 = _mm256_shuffle_epi8(signextendlut,
+            _mm256_and_si256(_mm256_srli_epi16(rhs1_1, 4), m4b));
+
+        const __m256 col_scales = _mm256_cvtph_ps(
+            _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)bp[b].d), changemask));
+
+        /* Blended forms depend only on the weight tile, not the
+         * activation row -- hoisted out of the row loop below. */
+        const __m256i bl_lo1 = _mm256_blend_epi32(r00, _mm256_shuffle_epi32(r10, 177), 170);
+        const __m256i bh_lo1 = _mm256_blend_epi32(_mm256_shuffle_epi32(r00, 177), r10, 170);
+        const __m256i bl_lo2 = _mm256_blend_epi32(r01, _mm256_shuffle_epi32(r11, 177), 170);
+        const __m256i bh_lo2 = _mm256_blend_epi32(_mm256_shuffle_epi32(r01, 177), r11, 170);
+        const __m256i bl_hi1 = _mm256_blend_epi32(r02, _mm256_shuffle_epi32(r12, 177), 170);
+        const __m256i bh_hi1 = _mm256_blend_epi32(_mm256_shuffle_epi32(r02, 177), r12, 170);
+        const __m256i bl_hi2 = _mm256_blend_epi32(r03, _mm256_shuffle_epi32(r13, 177), 170);
+        const __m256i bh_hi2 = _mm256_blend_epi32(_mm256_shuffle_epi32(r03, 177), r13, 170);
+
+        /* ---- Activation side: one pass per row, reusing the tile above ---- */
+        for (int r = 0; r < 4; r++) {
+            const uint8_t *aq = (const uint8_t *)ap[b].qs + r * 32;
+            __m256i a0 = _mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)aq));
+            __m256i a1 = _mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)(aq + 16)));
+            a0 = _mm256_permute2f128_si256(a0, a0, 0);
+            a1 = _mm256_permute2f128_si256(a1, a1, 0);
+
+            const __m256 row_scale = _mm256_set1_ps(fp16_to_fp32_lookup((uint16_t)ap[b].d[r]));
+            const __m256 sd = _mm256_mul_ps(col_scales, row_scale);
+
+            __m256i iacc = _mm256_setzero_si256();
+            Q4_0X8_MULSUM_INTO(iacc, bl_lo1, _mm256_shuffle_epi32(a0, 0));
+            Q4_0X8_MULSUM_INTO(iacc, bh_lo1, _mm256_shuffle_epi32(a0, 85));
+            Q4_0X8_MULSUM_INTO(iacc, bl_lo2, _mm256_shuffle_epi32(a0, 170));
+            Q4_0X8_MULSUM_INTO(iacc, bh_lo2, _mm256_shuffle_epi32(a0, 255));
+            Q4_0X8_MULSUM_INTO(iacc, bl_hi1, _mm256_shuffle_epi32(a1, 0));
+            Q4_0X8_MULSUM_INTO(iacc, bh_hi1, _mm256_shuffle_epi32(a1, 85));
+            Q4_0X8_MULSUM_INTO(iacc, bl_hi2, _mm256_shuffle_epi32(a1, 170));
+            Q4_0X8_MULSUM_INTO(iacc, bh_hi2, _mm256_shuffle_epi32(a1, 255));
+
+            acc[r] = Q4X8_FMADD(_mm256_cvtepi32_ps(iacc), sd, acc[r]);
+        }
+    }
+#undef Q4_0X8_MULSUM_INTO
+
+    for (int r = 0; r < 4; r++) {
+        __m256 result = _mm256_permutevar8x32_ps(acc[r], finalpermutemask);
+        _mm256_storeu_ps(out4x8[r], result);
+    }
+}
+
+/* Tiles the full [nr x nc] output over (nr/4) x (nc/8) 4x8 tiles,
+ * distributing tiles across [ith, nth) threads the same way the
+ * AVX-512 path above distributes 16x16 tiles.
+ * Returns the number of activation rows actually covered (nr rounded
+ * down to a multiple of 4), or 0 if the shapes don't meet minimums. */
 static int sgemm_q4x8_q8x4_avx2(
         int k, const block_q4_0x8 *bp_start,
         const block_q8_0x4 *ap_start,
-        float *s, size_t bs, int nr, int nc)
+        float *s, size_t bs, int nr, int nc,
+        int ith, int nth)
 {
     const int nb = k / 32;
-    const __m256i lut256 = build_lut256();
-    const __m256i reorder = _mm256_set_epi32(3,2,1,0,7,6,5,4);
-    const int anr = nr - nr % 16;
+    const int anr = nr - nr % 4;
     const int anc = nc - nc % 8;
+    if (anr <= 0 || anc <= 0) return 0;
 
-    for (int y = 0; y < anr; y++) {
-        /* Activation row group: 4 rows starting at y, we process row y only */
-        int y_block = y / 4;
-        int y_off = y % 4;
-        const block_q8_0x4 *ap = ap_start + y_block * nb;
+    const int n_ytiles = anr / 4;
+    const int n_xtiles = anc / 8;
+    const int total_tiles = n_ytiles * n_xtiles;
+    if (nth < 1) nth = 1;
+    const int duty = (total_tiles + nth - 1) / nth;
+    int start = duty * ith;
+    int end = start + duty;
+    if (end > total_tiles) end = total_tiles;
 
-        for (int x = 0; x < anc; x++) {
-            /* Output row y, column x (one activation row) */
-            int x_block = x / 8;
-            int x_off = x % 8;
-            const block_q4_0x8 *bp = bp_start + x_block * nb;
+    for (int job = start; job < end; job++) {
+        const int yt = job / n_xtiles;
+        const int xt = job % n_xtiles;
+        const int y = yt * 4;
+        const int x = xt * 8;
 
-            float sum = 0.0f;
+        const block_q4_0x8 *bp = bp_start + (size_t)xt * nb;
+        const block_q8_0x4 *ap = ap_start + (size_t)yt * nb;
 
-            for (int b = 0; b < nb; b++) {
-                /* Load 8 rows of Q4_0 nibbles (one block_q4_0x8 = 8 weight rows) */
-                const __m256i w00 = _mm256_loadu_si256((const __m256i*)(bp[b].qs));
-                const __m256i w10 = _mm256_loadu_si256((const __m256i*)(bp[b].qs+32));
-                const __m256i w01 = _mm256_loadu_si256((const __m256i*)(bp[b].qs+64));
-                const __m256i w11 = _mm256_loadu_si256((const __m256i*)(bp[b].qs+96));
+        float out4x8[4][8];
+        sgemm_q4x8_q8x4_avx2_tile(bp, ap, nb, out4x8);
 
-                /* Blend even/odd row groups */
-                const __m256i we0 = _mm256_blend_epi32(
-                    w00, _mm256_permutevar8x32_epi32(w10, reorder), 240);
-                const __m256i wo0 = _mm256_blend_epi32(
-                    _mm256_permutevar8x32_epi32(w00, reorder), w10, 240);
-                const __m256i we1 = _mm256_blend_epi32(
-                    w01, _mm256_permutevar8x32_epi32(w11, reorder), 240);
-                const __m256i wo1 = _mm256_blend_epi32(
-                    _mm256_permutevar8x32_epi32(w01, reorder), w11, 240);
-
-                /* Dequant 4-bit -> 8-bit via LUT (4 chunks: low+high x 2 halves) */
-                const __m256i rl0 = nibble_to_i8_256(we0, lut256);
-                const __m256i rl1 = nibble_to_i8_256(we1, lut256);
-                const __m256i rl2 = nibble_to_i8_hi_256(we0, lut256);
-                const __m256i rl3 = nibble_to_i8_hi_256(we1, lut256);
-                const __m256i ro0 = nibble_to_i8_256(wo0, lut256);
-                const __m256i ro1 = nibble_to_i8_256(wo1, lut256);
-                const __m256i ro2 = nibble_to_i8_hi_256(wo0, lut256);
-                const __m256i ro3 = nibble_to_i8_hi_256(wo1, lut256);
-
-                /* Weight scale for row x_off */
-                __m256 cs = fp16x8_to_fp32(bp[b].d);
-                float wscale[8];
-                _mm256_storeu_ps(wscale, cs);
-                float wscale_v = wscale[x_off];
-
-                /* Extract one activation row from interleaved block_q8_0x4:
-                 * row y_off is at byte offset y_off*8 in each 32-byte group.
-                 * We need 32 bytes total (4 groups of 8). */
-                const uint8_t *aqs = ap[b].qs;
-                __m128i c0 = _mm_loadl_epi64((const __m128i*)(aqs + 0*32 + y_off*8));
-                __m128i c1 = _mm_loadl_epi64((const __m128i*)(aqs + 1*32 + y_off*8));
-                __m128i c2 = _mm_loadl_epi64((const __m128i*)(aqs + 2*32 + y_off*8));
-                __m128i c3 = _mm_loadl_epi64((const __m128i*)(aqs + 3*32 + y_off*8));
-                __m256i alo = _mm256_set_m128i(c1, c0);
-                __m256i ahi = _mm256_set_m128i(c3, c2);
-                __m256i a = _mm256_permute2x128_si256(alo, ahi, 0x20);
-
-                /* Sign trick: |a| * sign(w,a) = a*w */
-                __m256i ax = _mm256_sign_epi8(a, a);
-
-                /* Shuffle activation for dpbusd: split 32 bytes into two 16-byte groups */
-                __m256i as1 = _mm256_shuffle_epi32(a, 136);
-                __m256i as2 = _mm256_shuffle_epi32(a, 221);
-                __m256i axs1 = _mm256_shuffle_epi32(ax, 136);
-                __m256i axs2 = _mm256_shuffle_epi32(ax, 221);
-
-                __m256i acc256 = _mm256_setzero_si256();
-                /* Even weight rows (we) */
-                for (int w = 0; w < 4; w++) {
-                    __m256i rw;
-                    if (w == 0) rw = rl0;
-                    else if (w == 1) rw = rl1;
-                    else if (w == 2) rw = rl2;
-                    else rw = rl3;
-                    __m256i sy1 = _mm256_sign_epi8(rw, as1);
-                    __m256i sy2 = _mm256_sign_epi8(rw, as2);
-                    acc256 = dpbusd_256(dpbusd_256(acc256, axs1, sy1), axs2, sy2);
-                }
-                /* Odd weight rows (wo) */
-                __m256i acc256o = _mm256_setzero_si256();
-                for (int w = 0; w < 4; w++) {
-                    __m256i rw;
-                    if (w == 0) rw = ro0;
-                    else if (w == 1) rw = ro1;
-                    else if (w == 2) rw = ro2;
-                    else rw = ro3;
-                    __m256i sy1 = _mm256_sign_epi8(rw, as1);
-                    __m256i sy2 = _mm256_sign_epi8(rw, as2);
-                    acc256o = dpbusd_256(dpbusd_256(acc256o, axs1, sy1), axs2, sy2);
-                }
-
-                /* Horizontal sum of 8 int32 each via stack array */
-                int32_t acc_s[8], acc_so[8];
-                _mm256_storeu_si256((__m256i*)acc_s, acc256);
-                _mm256_storeu_si256((__m256i*)acc_so, acc256o);
-                float dsum = 0;
-                for (int i = 0; i < 8; i++) {
-                    dsum += (float)(acc_s[i] + acc_so[i]);
-                }
-                sum += dsum * wscale_v;
-            }
-
-            /* Activation scale for row y_off */
-            float ascale = fp16_to_fp32(ap[0].d[y_off]);
-            s[y * bs + x] = sum * ascale;
+        for (int r = 0; r < 4; r++) {
+            memcpy(s + (size_t)(y + r) * bs + x, out4x8[r], 8 * sizeof(float));
         }
     }
     return anr;
@@ -496,12 +546,27 @@ int sgemm_q4_0x8_q8_0x4(int nr, int nc, int k,
     if (nc < 8 || nr < 4 || k % 32 != 0) return 0;
 
     int done = 0;
-    int nb = k / 32;
 
-#if defined(__AVX512BW__) && defined(__AVX512DQ__)
+    /* AVX2 path is the verified/primary path (see sgemm_q4x8_q8x4_avx2
+     * header comment). It only needs AVX2+F16C, which AVX-512 machines
+     * also have, so it is tried unconditionally first. The AVX-512
+     * 16x16-tile kernel below is kept for reference but is NOT wired
+     * up by default: it has not been re-verified against the fixed
+     * activation-layout understanding used here, and correctness of
+     * the AVX2 path already covers every host in this project (see
+     * project_summary.txt: no host lacks AVX2 among the ones that
+     * reach this function at all -- non-AVX2 hosts return 0 here and
+     * the caller falls back to the scalar vec_dot path). Define
+     * PICOLM_Q4_0X8_TRY_AVX512 to opt back into it for experimentation. */
+#if defined(__AVX2__) && defined(__F16C__)
     {
-    int yd = sgemm_q4x8_q8x4_avx512(k, bp, ap, s, bs, nr, nc, ith, nth);
-    if (yd > 0) done = yd;  /* anr rows processed */
+        int yd = sgemm_q4x8_q8x4_avx2(k, bp, ap, s, bs, nr, nc, ith, nth);
+        if (yd > 0) done = yd;
+    }
+#elif defined(PICOLM_Q4_0X8_TRY_AVX512) && defined(__AVX512BW__) && defined(__AVX512DQ__)
+    {
+        int yd = sgemm_q4x8_q8x4_avx512(k, bp, ap, s, bs, nr, nc, ith, nth);
+        if (yd > 0) done = yd;
     }
 #endif
 

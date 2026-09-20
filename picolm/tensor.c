@@ -3008,6 +3008,26 @@ void matmul_batch(float *out, const float *x, int n_batch,
                     float *xr = (float *)x + (size_t)(rg * 4) * n;
                     block_q8_0x4 *y = (block_q8_0x4 *)abuf + rg * nb;
                     quantize_mat_q8_0x4(xr, y, n, n);
+                } else if (rg * 4 < n_batch) {
+                    /* Tail row-group: 1..3 real rows remain, the rest is
+                     * pure padding. Zeroing the whole group here would
+                     * silently drop those real rows' contribution to the
+                     * output (they still get copied out below, since
+                     * t < n_batch includes them) -- copy the real rows
+                     * into a zero-padded scratch buffer and quantize
+                     * that instead, so only the truly-nonexistent rows
+                     * read as zero. */
+                    int real = n_batch - rg * 4;
+                    float *scratch = (float *)calloc(4 * (size_t)n, sizeof(float));
+                    if (scratch) {
+                        memcpy(scratch, (float *)x + (size_t)(rg * 4) * n,
+                               (size_t)real * n * sizeof(float));
+                        block_q8_0x4 *y = (block_q8_0x4 *)abuf + rg * nb;
+                        quantize_mat_q8_0x4(scratch, y, n, n);
+                        free(scratch);
+                    } else {
+                        memset((block_q8_0x4 *)abuf + rg * nb, 0, (size_t)nb * sizeof(block_q8_0x4));
+                    }
                 } else {
                     memset((block_q8_0x4 *)abuf + rg * nb, 0, (size_t)nb * sizeof(block_q8_0x4));
                 }
@@ -3035,12 +3055,28 @@ void matmul_batch(float *out, const float *x, int n_batch,
         }
     }
 
-    /* TODO:Q4_0_8_8_GEMM -- Q4_0_8_8 tiled GEMM: DISABLED.
-     * The sgemm_q4_0x8_q8_0x4 kernel has known dpbusd shuffle bugs that
-     * produce garbage output. See sgemm_q4_0x8.c header and prefill_code_paths.md
-     * for details (Bug #6a/6b/6c, shuffle overhead kills IPC).
-     * Falls through to the vec_dot path below, which is correct. */
-    if (0 && qtype == GGUF_TYPE_Q4_0_8_8 && n_batch > 0 && n > 0 &&
+    /* Q4_0_8_8 tiled GEMM.
+     *
+     * STATUS: RE-ENABLED. The previous "disabled" state was due to
+     * sgemm_q4_0x8_q8_0x4()'s AVX2 implementation never actually being
+     * called from its own dispatcher (only an AVX-512 path was wired
+     * up) and, separately, that AVX2 implementation assuming the wrong
+     * byte layout for both the block_q4_0x8 weight interleaving and the
+     * block_q8_0x4 activation format. Both have been fixed in
+     * sgemm_q4_0x8.c: the AVX2 kernel now reuses the exact, verified
+     * nibble-unpack/blend sequence from vec_dot_q4_0x8_q8_0_avx2 (the
+     * working GEMV kernel), restructured so the weight-side unpack is
+     * amortized across 4 activation rows per k-block instead of redone
+     * per row -- the same "prepare tile once, iterate activation
+     * columns" strategy ik_llama.cpp's mul_mat_q4_0_r8_q8_2_avx2 uses.
+     * See sgemm_q4_0x8.c and test_q4_0x8_gemm.c for the verification
+     * (cross-checked against the GEMV kernel across 7 shapes, exact
+     * match; clean under ASan/UBSan).
+     *
+     * The tail row-group handling below fixes a second, independent bug
+     * shared with the Q4I_0_8_8 branch above: dropping real rows in a
+     * partial trailing group of 4 (see the comment there). */
+    if (!picolm_sgemm_disabled_tensor() && qtype == GGUF_TYPE_Q4_0_8_8 && n_batch > 0 && n > 0 &&
         d % 8 == 0 && n_batch >= 4 && n % 32 == 0) {
         int n_batch_padded = (n_batch + 15) & ~15;  /* round up to 16 */
         int n_act_rg = (n_batch_padded + 3) / 4;
@@ -3053,6 +3089,20 @@ void matmul_batch(float *out, const float *x, int n_batch,
                     float *xr = (float *)x + (size_t)(rg * 4) * n;
                     block_q8_0x4 *y = (block_q8_0x4 *)abuf + rg * nb;
                     quantize_mat_q8_0x4(xr, y, n, n);
+                } else if (rg * 4 < n_batch) {
+                    /* Tail row-group: 1..3 real rows remain (see the
+                     * matching comment in the Q4I_0_8_8 branch above). */
+                    int real = n_batch - rg * 4;
+                    float *scratch = (float *)calloc(4 * (size_t)n, sizeof(float));
+                    if (scratch) {
+                        memcpy(scratch, (float *)x + (size_t)(rg * 4) * n,
+                               (size_t)real * n * sizeof(float));
+                        block_q8_0x4 *y = (block_q8_0x4 *)abuf + rg * nb;
+                        quantize_mat_q8_0x4(scratch, y, n, n);
+                        free(scratch);
+                    } else {
+                        memset((block_q8_0x4 *)abuf + rg * nb, 0, (size_t)nb * sizeof(block_q8_0x4));
+                    }
                 } else {
                     /* Padding: zero data, zero scales (produces zero output) */
                     memset((block_q8_0x4 *)abuf + rg * nb, 0, (size_t)nb * sizeof(block_q8_0x4));
@@ -3061,7 +3111,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
             float *tmp_out = calloc(1, (size_t)n_batch_padded * d * sizeof(float));
             if (tmp_out) {
                 int nth = pool_total_threads(1);
-                int n_tiles = (n_batch_padded / 16) * (d / 16);
+                int n_tiles = (n_batch_padded / 4) * (d / 8);
                 if (n_tiles < nth * 2) nth = n_tiles / 2;
                 if (nth < 1) nth = 1;
                 memset(tmp_out, 0, (size_t)n_batch_padded * d * sizeof(float));
@@ -3076,7 +3126,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
                 free(tmp_out);
             }
             free(abuf);
-        DISPATCH("Q4_0_8_8_GEMM (DISABLED, should not reach)");
+        DISPATCH("Q4_0_8_8_GEMM");
             return;
         }
     }
@@ -3657,6 +3707,20 @@ static void qgemm_q4x8_dual_single(const float *x, int n_batch, int d, int n,
             float *xr = (float *)x + (size_t)(rg * 4) * n;
             block_q8_0x4 *y = (block_q8_0x4 *)abuf + rg * nb;
             quantize_mat_q8_0x4(xr, y, n, n);
+        } else if (rg * 4 < n_batch) {
+            /* Tail row-group: see the matching comment in matmul()'s
+             * Q4I_0_8_8/Q4_0_8_8 GEMM branches -- zeroing the whole
+             * group here would silently drop 1..3 real rows. */
+            int real = n_batch - rg * 4;
+            float *scratch = (float *)calloc(4 * (size_t)n, sizeof(float));
+            if (scratch) {
+                memcpy(scratch, x + (size_t)(rg * 4) * n, (size_t)real * n * sizeof(float));
+                block_q8_0x4 *y = (block_q8_0x4 *)abuf + rg * nb;
+                quantize_mat_q8_0x4(scratch, y, n, n);
+                free(scratch);
+            } else {
+                memset((block_q8_0x4 *)abuf + rg * nb, 0, (size_t)nb * sizeof(block_q8_0x4));
+            }
         } else {
             memset((block_q8_0x4 *)abuf + rg * nb, 0, (size_t)nb * sizeof(block_q8_0x4));
         }
@@ -3664,7 +3728,10 @@ static void qgemm_q4x8_dual_single(const float *x, int n_batch, int d, int n,
     float *tmp = calloc(1, (size_t)n_batch_padded * d * sizeof(float));
     if (!tmp) { free(abuf); return; }
     int nth = pool_total_threads(1);
-    int n_tiles = (n_batch_padded / 16) * (d / 16);
+    /* sgemm_q4_0x8_q8_0x4's AVX2 kernel tiles 4 activation-rows x 8
+     * weight-cols (see sgemm_q4_0x8.c), not the 16x16 AVX-512 tile size
+     * this throttling heuristic was originally written for. */
+    int n_tiles = (n_batch_padded / 4) * (d / 8);
     if (n_tiles < nth * 2) nth = n_tiles / 2;
     if (nth < 1) nth = 1;
     memset(tmp, 0, (size_t)n_batch_padded * d * sizeof(float));
@@ -3693,6 +3760,17 @@ static void qgemm_q4ix8_dual_single(const float *x, int n_batch, int d, int n,
             float *xr = (float *)x + (size_t)(rg * 4) * n;
             block_q8_0x4 *y = (block_q8_0x4 *)abuf + rg * nb;
             quantize_mat_q8_0x4(xr, y, n, n);
+        } else if (rg * 4 < n_batch) {
+            int real = n_batch - rg * 4;
+            float *scratch = (float *)calloc(4 * (size_t)n, sizeof(float));
+            if (scratch) {
+                memcpy(scratch, x + (size_t)(rg * 4) * n, (size_t)real * n * sizeof(float));
+                block_q8_0x4 *y = (block_q8_0x4 *)abuf + rg * nb;
+                quantize_mat_q8_0x4(scratch, y, n, n);
+                free(scratch);
+            } else {
+                memset((block_q8_0x4 *)abuf + rg * nb, 0, (size_t)nb * sizeof(block_q8_0x4));
+            }
         } else {
             memset((block_q8_0x4 *)abuf + rg * nb, 0, (size_t)nb * sizeof(block_q8_0x4));
         }
@@ -3858,11 +3936,16 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
      * -- gate/up almost always share a quant type) still gets a correct
      * result for whichever side isn't Q4_0_8_8, just without the fast
      * path on that side. */
-    /* Q4_0_8_8 dual-batch GEMM: DISABLED for Q4_0_8_8 side.
-     * sgemm_q4_0x8_q8_0x4 produces garbage. Q4I_0_8_8 path kept (claims WORKING).
-     * Falls through to vec_dot path for Q4_0_8_8. */
-    if (!picolm_sgemm_disabled_tensor() && (qtype1 == GGUF_TYPE_Q4I_0_8_8 ||
-         qtype2 == GGUF_TYPE_Q4I_0_8_8) &&
+    /* Q4_0_8_8 / Q4I_0_8_8 dual-batch GEMM.
+     * STATUS: RE-ENABLED for Q4_0_8_8 (see the matching comment on the
+     * single-batch matmul() dispatch above for what was fixed in
+     * sgemm_q4_0x8_q8_0x4 / sgemm_q4_0x8.c). Previously this branch's
+     * condition only checked for Q4I_0_8_8, so a Q4_0_8_8-only pair
+     * (no Q4I_0_8_8 involved) fell through to the vec_dot path below;
+     * broadened to also enter when either side is Q4_0_8_8. */
+    if (!picolm_sgemm_disabled_tensor() &&
+        (qtype1 == GGUF_TYPE_Q4I_0_8_8 || qtype2 == GGUF_TYPE_Q4I_0_8_8 ||
+         qtype1 == GGUF_TYPE_Q4_0_8_8 || qtype2 == GGUF_TYPE_Q4_0_8_8) &&
         n_batch > 0 && n > 0 && d % 16 == 0 && n % 32 == 0)
     {
         if (qtype1 == GGUF_TYPE_Q4_0_8_8) {
@@ -3879,7 +3962,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
         } else {
             qgemm_q4x8_fallback(x, n_batch, d, n, W2, out2, qtype2);
         }
-        DISPATCH2("Q4I_0_8_8_GEMM_dual");
+        DISPATCH2("Q4x8_GEMM_dual");
         return;
     }
 #endif

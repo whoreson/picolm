@@ -1976,6 +1976,7 @@ void quantize_mat_q8_0x4(const float *x, void *dst, int n, int row_stride) {
     for (int b = 0; b < nb; b++) {
         float srcv[4][32];
         float id[4];
+        int is_zero[4];
         for (int r = 0; r < 4; r++) {
             const float *xr = x + r * row_stride + b * 32;
             float amax = 0.0f;
@@ -1984,14 +1985,31 @@ void quantize_mat_q8_0x4(const float *x, void *dst, int n, int row_stride) {
                 float a = xr[j] < 0 ? -xr[j] : xr[j];
                 if (a > amax) amax = a;
             }
-            id[r] = amax == 0 ? 1e-30f : 127.0f / amax;
+            /* An all-zero row (e.g. a batch-padding row) must produce an
+             * exact zero delta and zero qs. The previous `id = 1e-30f`
+             * fallback instead produced d = 1/id = 1e30, which overflows
+             * FP16 to +Infinity; a later Infinity * 0 dequant/dot-product
+             * multiply then yields NaN even though every real input was
+             * zero. Handle it explicitly instead, matching the safe
+             * pattern already used by quantize_row_q8_K() below. */
+            is_zero[r] = (amax == 0.0f);
+            id[r] = is_zero[r] ? 0.0f : 127.0f / amax;
             int8_t *q = y[b].qs + r * 32;
             for (int j = 0; j < 32; j++)
-                q[j] = roundf(srcv[r][j] * id[r]);
+                /* nearbyintf (round-half-to-even under the default FP
+                 * environment) matches the rounding used by the SIMD
+                 * quantize_row_q8_0() paths (_MM_ROUND_NEAREST / NEON
+                 * vcvtnq). Using roundf() here (round-half-away-from-zero)
+                 * would occasionally quantize the exact same activation
+                 * row to a different int8 value depending on whether it
+                 * went through quantize_row_q8_0() or this function --
+                 * a real, if rare, source of divergence between the
+                 * GEMV and GEMM code paths for identical inputs. */
+                q[j] = is_zero[r] ? 0 : (int8_t)nearbyintf(srcv[r][j] * id[r]);
         }
         /* Store scales as FP16 */
         for (int r = 0; r < 4; r++)
-            y[b].d[r] = fp32_to_fp16(1.0f / id[r]);
+            y[b].d[r] = is_zero[r] ? 0 : fp32_to_fp16(1.0f / id[r]);
     }
 }
 
