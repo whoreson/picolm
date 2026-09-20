@@ -783,15 +783,13 @@ static void matmul_worker_f(matmul_task_t *t) {
         }
     } else if (t->qtype == GGUF_TYPE_Q4_0_R8 && t->x) {
         /* Q4_0_R8: process 8 rows at a time with Q8_2 activations (AVX2).
-         * Port of llama.cpp ik branch mul_mat_q4_0_r8_q8_2_avx2.
-         * Weights in block_q4_0_r8 (= block_q4_0x8 layout).
-         * Activations pre-quantized to block_q8_0 format. */
+         * Activations pre-quantized to block_q8_2 (with precomputed sum). */
 #if defined(PICOLM_AVX2)
-        const block_q8_0 *qy = (const block_q8_0 *)t->x;
+        const block_q8_2 *qy = (const block_q8_2 *)t->x;
         int start8 = (t->start / 8) * 8;
         int end8 = (t->end + 7) / 8 * 8;
         for (int i = start8; i < end8; i += 8) {
-            vec_dot_q4_0_r8_q8_0_avx2(
+            vec_dot_q4_0_r8_q8_2_avx2(
                 t->W + (size_t)i * t->row_bytes, qy, t->n,
                 t->out + i, 8);
         }
@@ -1445,29 +1443,30 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
         }
     } else if (qtype == GGUF_TYPE_Q4_0_R8) {
         /* Q4_0_R8 fast path: weights in block_q4_0_r8 (= block_q4_0x8) layout.
-         * Uses Q8_0 activation format with AVX2 kernel (port of ik_llama).
-         * Single-row path: uses vec_dot_q4_0_r8_q8_0_avx2 via matmul_worker_f.
-         * Batched path handled in matmul_batch via sgemm_q4_0_r8_q8_0_avx2. */
+         * Uses Q8_2 activation format with precomputed activation sum,
+         * avoiding the scalar bias-correction loop in the kernel.
+         * Single-row: vec_dot_q4_0_r8_q8_2_avx2 via matmul_worker_f.
+         * Batched: sgemm_q4_0_r8_q8_2_avx2 in matmul_batch. */
 #if defined(PICOLM_AVX2)
         {
-        size_t qx_size = (n / 32) * sizeof(block_q8_0);
+        size_t qx_size = (n / 32) * sizeof(block_q8_2);
         int d8 = (d / 8) * 8;
 
         if (d8 >= 8) {
-            block_q8_0 *qx = NULL;
+            block_q8_2 *qx = NULL;
             int qx_owned = 0;
             if (n_threads <= 1 && scratch_buf != NULL && qx_size <= (size_t)scratch_size) {
-                qx = (block_q8_0 *)scratch_buf;
+                qx = (block_q8_2 *)scratch_buf;
             } else {
-                qx = (block_q8_0 *)malloc(qx_size);
+                qx = (block_q8_2 *)malloc(qx_size);
                 qx_owned = 1;
             }
             if (qx != NULL) {
-                quantize_row_q8_0(x, qx, n);
+                quantize_row_q8_2(x, qx, n);
 
                 if (n_threads <= 1) {
                     for (int i = 0; i < d8; i += 8)
-                        vec_dot_q4_0_r8_q8_0_avx2(wptr + (size_t)i * row_bytes, qx, n, out + i, 8);
+                        vec_dot_q4_0_r8_q8_2_avx2(wptr + (size_t)i * row_bytes, qx, n, out + i, 8);
                     for (int i = d8; i < d; i++)
                         out[i] = vec_dot(wptr + (size_t)i * row_bytes, x, n, qtype);
                     if (qx_owned) free(qx);
@@ -2790,11 +2789,11 @@ static void qgemm_q4ix8_task(int idx, void *ctxp) {
     }
 }
 
-/* Q4_0_R8 tiled GEMM task */
+/* Q4_0_R8 tiled GEMM task (Q8_2 activations with precomputed sum) */
 static void qgemm_q4r8_task(int idx, void *ctxp) {
     qgemm_q4r8_ctx_t *c = (qgemm_q4r8_ctx_t *)ctxp;
     int nth = pool_total_threads(1);
-    sgemm_q4_0_r8_q8_0_avx2(c->nr, c->nc, c->k, c->w, c->abuf, c->out, c->bs, idx, nth);
+    sgemm_q4_0_r8_q8_2_avx2(c->nr, c->nc, c->k, c->w, c->abuf, c->out, c->bs, idx, nth);
 }
 #endif /* PICOLM_AVX2 */
 
@@ -3175,19 +3174,17 @@ void matmul_batch(float *out, const float *x, int n_batch,
         }
     }
 
-    /* Q4_0_R8 batch: tiled GEMM path with AVX2 kernel.
-     * Uses sgemm_q4_0_r8_q8_0_avx2 with thread parallelism. */
+    /* Q4_0_R8 batch: tiled GEMM path with AVX2 kernel (Q8_2 activations).
+     * Q8_2 stores a precomputed int16 sum of qs, eliminating the scalar
+     * bias-correction loop in the kernel. */
 #if defined(PICOLM_AVX2)
     if (!picolm_sgemm_disabled_tensor() && qtype == GGUF_TYPE_Q4_0_R8 && n_batch > 0 && n > 0 && d % 8 == 0 && n % 32 == 0) {
-        size_t q8_rb = (size_t)(n / 32) * sizeof(block_q8_0);
+        size_t q8_rb = (size_t)(n / 32) * sizeof(block_q8_2);
         void *qbuf = malloc((size_t)n_batch * q8_rb);
         if (qbuf) {
             for (int b = 0; b < n_batch; b++)
-                quantize_row_q8_0(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
+                quantize_row_q8_2(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
 
-            /* Call tiled GEMM via tensor_parallel_for: each thread processes
-             * a slice of the column (batch) dimension. The sgemm function
-             * handles all rows for its assigned columns. */
             int nth = pool_total_threads(1);
             qgemm_q4r8_ctx_t ctx = {
                 .nr = d, .nc = n_batch, .k = n,
@@ -3195,13 +3192,14 @@ void matmul_batch(float *out, const float *x, int n_batch,
             };
             tensor_parallel_for(nth, qgemm_q4r8_task, &ctx);
             free(qbuf);
-        DISPATCH("Q4_0_R8_sgemm");
+        DISPATCH("Q4_0_R8_sgemm_Q82");
             return;
         }
     }
 #endif
 
-    /* Q4_0_R8 vec_dot fallback for batched matmul (used when PICOLM_SGEMM=0). */
+    /* Q4_0_R8 vec_dot fallback for batched matmul (used when PICOLM_SGEMM=0).
+     * Uses Q8_0 activations (scalar sum computation). */
 #if defined(PICOLM_AVX2)
     if (qtype == GGUF_TYPE_Q4_0_R8 && n_batch > 0 && n > 0) {
         size_t q8_rb = (size_t)(n / 32) * sizeof(block_q8_0);
@@ -4012,11 +4010,11 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
     /* Q4_0_R8 tiled GEMM for dual-batch (AVX2). */
 #if defined(PICOLM_AVX2)
     if (!picolm_sgemm_disabled_tensor() && (qtype1 == GGUF_TYPE_Q4_0_R8 || qtype2 == GGUF_TYPE_Q4_0_R8) && n_batch > 0 && n > 0 && d % 8 == 0 && n % 32 == 0) {
-        size_t q8_rb = (size_t)(n / 32) * sizeof(block_q8_0);
+        size_t q8_rb = (size_t)(n / 32) * sizeof(block_q8_2);
         void *qbuf = malloc((size_t)n_batch * q8_rb);
         if (qbuf) {
             for (int b = 0; b < n_batch; b++)
-                quantize_row_q8_0(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
+                quantize_row_q8_2(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
 
             int nth = pool_total_threads(1);
             if (qtype1 == GGUF_TYPE_Q4_0_R8) {
@@ -4038,7 +4036,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                         out2[b * d + i] = vec_dot((const char *)W2 + i * rb2, x + b * n, n, qtype2);
             }
             free(qbuf);
-        DISPATCH2("Q4_0_R8_sgemm_dual");
+        DISPATCH2("Q4_0_R8_sgemm_dual_Q82");
             return;
         }
     }

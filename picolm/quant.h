@@ -837,17 +837,21 @@ void gemm_q4_0_4x8_q8_0(const void *W, const void *X, int n, float *out, int d, 
 void vec_dot_q4_0x8_q8_0_avx2(const void *vx, const void *wy, int n, float *out, int nrows);
 /* Q4I_0_8_8 pre-dequantized int8 x Q8_0: AVX-512 VNNI (dpbusd) / maddubs / scalar fallback */
 void vec_dot_q4i_0x8_q8_0(const void *vx, const void *wy, int n, float *out, int nrows);
-/* Q4_0_R8 x Q8_2 GEMV (AVX2): 8 weight rows x 1 activation row.
- * Port of llama.cpp ik_llama mul_mat_q4_0_r8_q8_2_avx2<1>.
- * vx = block_q4_0_r8 weights (8 rows interleaved), wy = block_q8_2 activation row.
- * n = inner dim (multiple of 32), out = 8 floats written. */
+/* Q4_0_R8 x Q8_0 GEMV (AVX2): 8 weight rows x 1 activation row.
+ * Uses block_q8_0 activations, computes activation sum in scalar loop. */
 void vec_dot_q4_0_r8_q8_0_avx2(const void *vx, const void *wy, int n,
                                  float *out, int nrows);
-/* Q4_0_R8 x Q8_2 batched GEMM (AVX2): 8 weight rows x multiple activation rows.
- * nrows = weight rows (multiple of 8), ncols = activation rows (multiple of 8).
- * k = inner dim (multiple of 32).
- * Returns number of weight rows processed (aligned to 8), or 0 if unsupported. */
+/* Q4_0_R8 x Q8_0 batched GEMM (AVX2). */
 int sgemm_q4_0_r8_q8_0_avx2(int nrows, int ncols, int k,
+                             const void *vx, const void *vy,
+                             float *out, size_t bs,
+                             int ith, int nth);
+/* Q4_0_R8 x Q8_2 GEMV (AVX2): 8 weight rows x 1 activation row.
+ * Uses block_q8_2 activations with precomputed int16 sum (no scalar loop). */
+void vec_dot_q4_0_r8_q8_2_avx2(const void *vx, const void *wy, int n,
+                                 float *out, int nrows);
+/* Q4_0_R8 x Q8_2 batched GEMM (AVX2). */
+int sgemm_q4_0_r8_q8_2_avx2(int nrows, int ncols, int k,
                              const void *vx, const void *vy,
                              float *out, size_t bs,
                              int ith, int nth);
@@ -875,6 +879,7 @@ void repack_q4_0_to_q4_0x4(const void *src, void *dst, int nrows, int ncols);
 /* Quantize a float32 vector to Q8_0 blocks in-place or to a separate buffer.
  * dst must have space for (n / 32) * sizeof(block_q8_0) bytes. */
 void quantize_row_q8_0(const float *x, void *dst, int n);
+void quantize_row_q8_2(const float *x, void *dst, int n);
 
 /* Q8_0x4 interleaved block: 4 rows of Q8_0 packed for AVX2/AVX-512 GEMM.
  * 4 FP16 deltas + 128 interleaved int8 values. */

@@ -173,5 +173,76 @@ int sgemm_q4_0_r8_q8_0_avx2(int nrows, int ncols, int k,
 #endif
 }
 
-/* No duplicate stubs needed: the #else branches inside the functions above
- * already provide no-op behavior when AVX2/F16C are unavailable. */
+/* ================================================================
+ * Q4_0_R8 x Q8_2 AVX2 kernel
+ * Same as Q8_0 version but reads the precomputed activation sum
+ * (block_q8_2.s) instead of computing it in a scalar loop.
+ * This saves a 32-iteration scalar loop per block.
+ * ================================================================ */
+void vec_dot_q4_0_r8_q8_2_avx2(const void *vx, const void *wy, int n,
+                                 float *out, int nrows) {
+#if defined(__AVX2__) && defined(__F16C__)
+    assert(nrows == 8);
+    assert(n % 32 == 0);
+
+    const block_q4_0x8 *iq4 = (const block_q4_0x8 *)vx;
+    const block_q8_2 *qy = (const block_q8_2 *)wy;
+    const __m256i m4 = _mm256_set1_epi8(0xf);
+    const int nb = n / 32;
+    __m256i v[8];
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int ib = 0; ib < nb; ib++) {
+        __m256 w_scales = _mm256_cvtph_ps(
+            _mm_loadu_si128((const __m128i *)iq4[ib].d));
+
+        float as = fp16_to_fp32_lookup(qy[ib].d);
+        int asum = (int)qy[ib].s;  /* precomputed sum of qs */
+
+        prepare_q4_0_quants_avx2(iq4[ib].qs, v, m4);
+        __m256i sumi = accum_q4_0_quants_avx2(v, qy[ib].qs);
+        __m256 sumf = _mm256_cvtepi32_ps(sumi);
+
+        __m256 scaled = _mm256_mul_ps(w_scales, _mm256_set1_ps(as));
+        __m256 corrected = _mm256_sub_ps(sumf, _mm256_set1_ps(8.f * asum));
+        acc = _mm256_fmadd_ps(scaled, corrected, acc);
+    }
+
+    _mm256_storeu_ps(out, acc);
+#else
+    (void)vx; (void)wy; (void)n; (void)out; (void)nrows;
+    memset(out, 0, nrows * sizeof(float));
+#endif
+}
+
+int sgemm_q4_0_r8_q8_2_avx2(int nrows, int ncols, int k,
+                             const void *vx, const void *vy,
+                             float *out, size_t bs,
+                             int ith, int nth) {
+#if defined(__AVX2__) && defined(__F16C__)
+    if (nrows < 8 || ncols < 1 || k % 32 != 0 || nrows % 8 != 0)
+        return 0;
+
+    size_t a_row_bytes = (size_t)(k / 32) * sizeof(block_q8_2);
+    int start_col = (ncols * ith) / nth;
+    int end_col = (ncols * (ith + 1)) / nth;
+    if (end_col <= start_col) return 0;
+
+    size_t w_stride = (size_t)(k / 32) * sizeof(block_q4_0x8);
+    for (int w8 = 0; w8 < nrows / 8; w8++) {
+        const block_q4_0x8 *iq4_base = (const block_q4_0x8 *)
+            ((const char *)vx + w8 * w_stride);
+        for (int c = start_col; c < end_col; c++) {
+            const block_q8_2 *qy = (const block_q8_2 *)
+                ((const char *)vy + c * a_row_bytes);
+            float *out_base = out + w8 * 8 + c * bs;
+            vec_dot_q4_0_r8_q8_2_avx2(iq4_base, qy, k, out_base, 8);
+        }
+    }
+    return (nrows / 8) * 8;
+#else
+    (void)nrows; (void)ncols; (void)k; (void)vx; (void)vy;
+    (void)out; (void)bs; (void)ith; (void)nth;
+    return 0;
+#endif
+}

@@ -1969,6 +1969,103 @@ void quantize_row_q8_0(const float *x, void *dst, int n) {
 #endif
 }
 
+/* Quantize one F32 row to Q8_2 blocks (Q8_0 + precomputed int16 sum).
+ * The sum is used by Q4_0_R8 kernels to avoid a scalar loop over
+ * activation bytes for the bias-correction term 8*sum(qs). */
+void quantize_row_q8_2(const float *x, void *dst, int n) {
+    block_q8_2 *y = (block_q8_2 *)dst;
+    int nb = n / 32;
+
+#ifdef PICOLM_AVX2
+    for (int i = 0; i < nb; i++) {
+        const __m256 signBit = _mm256_set1_ps(-0.0f);
+        __m256 v0 = _mm256_loadu_ps(x);
+        __m256 v1 = _mm256_loadu_ps(x + 8);
+        __m256 v2 = _mm256_loadu_ps(x + 16);
+        __m256 v3 = _mm256_loadu_ps(x + 24);
+        x += 32;
+
+        __m256 maxAbs = _mm256_andnot_ps(signBit, v0);
+        maxAbs = _mm256_max_ps(maxAbs, _mm256_andnot_ps(signBit, v1));
+        maxAbs = _mm256_max_ps(maxAbs, _mm256_andnot_ps(signBit, v2));
+        maxAbs = _mm256_max_ps(maxAbs, _mm256_andnot_ps(signBit, v3));
+        __m128 max4 = _mm_max_ps(_mm256_extractf128_ps(maxAbs, 1), _mm256_castps256_ps128(maxAbs));
+        max4 = _mm_max_ps(max4, _mm_movehl_ps(max4, max4));
+        max4 = _mm_max_ss(max4, _mm_movehdup_ps(max4));
+        float maxScalar = _mm_cvtss_f32(max4);
+
+        float d = maxScalar / 127.0f;
+        y[i].d = fp32_to_fp16(d);
+        float id = (maxScalar != 0.0f) ? 127.0f / maxScalar : 0.0f;
+        __m256 mul = _mm256_set1_ps(id);
+
+        v0 = _mm256_mul_ps(v0, mul);
+        v1 = _mm256_mul_ps(v1, mul);
+        v2 = _mm256_mul_ps(v2, mul);
+        v3 = _mm256_mul_ps(v3, mul);
+
+        v0 = _mm256_round_ps(v0, _MM_ROUND_NEAREST);
+        v1 = _mm256_round_ps(v1, _MM_ROUND_NEAREST);
+        v2 = _mm256_round_ps(v2, _MM_ROUND_NEAREST);
+        v3 = _mm256_round_ps(v3, _MM_ROUND_NEAREST);
+
+        __m256i i0 = _mm256_cvtps_epi32(v0);
+        __m256i i1 = _mm256_cvtps_epi32(v1);
+        __m256i i2 = _mm256_cvtps_epi32(v2);
+        __m256i i3 = _mm256_cvtps_epi32(v3);
+
+        i0 = _mm256_packs_epi32(i0, i1);
+        i2 = _mm256_packs_epi32(i2, i3);
+        i0 = _mm256_packs_epi16(i0, i2);
+        const __m256i perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+        i0 = _mm256_permutevar8x32_epi32(i0, perm);
+        _mm256_storeu_si256((__m256i *)y[i].qs, i0);
+
+        /* Compute signed sum of 32 int8 values using AVX2.
+         * Split each 128-bit lane into even/odd bytes via shuffle,
+         * sign-extend to int16, add pairs, reduce via madd_epi16+hadd. */
+        {
+            __m128i t0 = _mm_loadu_si128((const __m128i *)y[i].qs + 0);
+            __m128i t1 = _mm_loadu_si128((const __m128i *)y[i].qs + 1);
+            /* Interleave even and odd bytes: {0,2,4,6,1,3,5,7,...} ->
+             * low 8 = bytes 0,2,4,6,8,10,12,14 (even positions)
+             * high 8 = bytes 1,3,5,7,9,11,13,15 (odd positions) */
+            __m128i even = _mm_shuffle_epi8(t0, _mm_set_epi8(15,13,11,9,7,5,3,1,14,12,10,8,6,4,2,0));
+            __m128i odd  = _mm_shuffle_epi8(t0, _mm_set_epi8(14,12,10,8,6,4,2,0,15,13,11,9,7,5,3,1));
+            __m128i s0 = _mm_madd_epi16(_mm_add_epi16(
+                _mm_cvtepi8_epi16(even), _mm_cvtepi8_epi16(odd)), _mm_set1_epi16(1));
+            even = _mm_shuffle_epi8(t1, _mm_set_epi8(15,13,11,9,7,5,3,1,14,12,10,8,6,4,2,0));
+            odd  = _mm_shuffle_epi8(t1, _mm_set_epi8(14,12,10,8,6,4,2,0,15,13,11,9,7,5,3,1));
+            __m128i s1 = _mm_madd_epi16(_mm_add_epi16(
+                _mm_cvtepi8_epi16(even), _mm_cvtepi8_epi16(odd)), _mm_set1_epi16(1));
+            __m128i s = _mm_add_epi32(s0, s1);
+            s = _mm_hadd_epi32(s, s);
+            s = _mm_hadd_epi32(s, s);
+            y[i].s = (int16_t)_mm_cvtsi128_si32(s);
+        }
+    }
+#else
+    /* Scalar fallback */
+    for (int i = 0; i < nb; i++) {
+        float maxAbs = 0.0f;
+        for (int j = 0; j < 32; j++) {
+            float a = x[j] < 0 ? -x[j] : x[j];
+            if (a > maxAbs) maxAbs = a;
+        }
+        float d = maxAbs / 127.0f;
+        y[i].d = fp32_to_fp16(d);
+        float id = (maxAbs != 0.0f) ? 127.0f / maxAbs : 0.0f;
+        int asum = 0;
+        for (int j = 0; j < 32; j++) {
+            y[i].qs[j] = (int8_t)((int)(x[j] * id + (x[j] >= 0 ? 0.5f : -0.5f)));
+            asum += (int)y[i].qs[j];
+        }
+        y[i].s = asum;
+        x += 32;
+    }
+#endif
+}
+
 /* Quantize 4 rows of F32 activations into interleaved block_q8_0x4. */
 void quantize_mat_q8_0x4(const float *x, void *dst, int n, int row_stride) {
     block_q8_0x4 *y = (block_q8_0x4 *)dst;
@@ -7930,35 +8027,6 @@ void picolm_gelu_table_f32(float *x, int size) {
 /* ================================================================
  * Q8_2 block: Q8_0 with int16 row sum for delta-based GEMM.
  * ================================================================ */
-
-/* Quantize one row of F32 to Q8_2 blocks.
- * Same as Q8_0 quantization but also computes int16 row sum. */
-void quantize_row_q8_2(const float *x, void *dst, int n) {
-    int nb = n / 32;
-    block_q8_2 *b = (block_q8_2 *)dst;
-    for (int i = 0; i < nb; i++) {
-        float am = 0;
-        const float *x0 = x + i * 32;
-        for (int j = 0; j < 32; j++) {
-            float v = x0[j];
-            if (v > am) am = v;
-            else if (-v > am) am = -v;
-        }
-        float d = am / 127.f;
-        if (d == 0.f) d = 1e-30f;
-        float id = 1.f / d;
-        b[i].d = fp32_to_fp16(d);
-        int16_t s = 0;
-        for (int j = 0; j < 32; j++) {
-            int vi = (int)(x0[j] * id);
-            if (vi > 127) vi = 127;
-            else if (vi < -128) vi = -128;
-            b[i].qs[j] = (int8_t)vi;
-            s += vi;
-        }
-        b[i].s = s;
-    }
-}
 
 /* Quantize 4 rows of F32 to Q8_2_x4 interleaved format.
  * x is row-major with row_stride floats per row.
