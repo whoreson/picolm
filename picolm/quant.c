@@ -756,6 +756,8 @@ void dequantize_row(const void *src, float *dst, int n, gguf_type_t type) {
         case GGUF_TYPE_Q2_0:     dequantize_row_q2_0(src, dst, n); break;
         case GGUF_TYPE_Q6_0:     dequantize_row_q6_0(src, dst, n); break;
         case GGUF_TYPE_IQ4_NL:   dequantize_row_iq4_nl(src, dst, n); break;
+        case GGUF_TYPE_Q4_0_R8:  dequantize_row_q4_0_r8(src, dst, n); break;
+        case GGUF_TYPE_Q8_0_R8:  dequantize_row_q8_0_r8(src, dst, n); break;
         default:
             fprintf(stderr, "dequantize_row: unsupported type %d\n", type);
             exit(1);
@@ -789,6 +791,8 @@ int gguf_type_block_size(gguf_type_t type) {
         case GGUF_TYPE_Q1_0:     return 128;
         case GGUF_TYPE_Q2_0:     return 128;
         case GGUF_TYPE_Q6_0:     return 32;
+        case GGUF_TYPE_Q4_0_R8:  return 32;  /* same as Q4_0_8_8: 32 values per row */
+        case GGUF_TYPE_Q8_0_R8:  return 32;  /* 32 values per row */
         default: return 0;
     }
 }
@@ -818,6 +822,8 @@ int gguf_type_quant_size(gguf_type_t type) {
         case GGUF_TYPE_Q1_0:     return 18;
         case GGUF_TYPE_Q2_0:     return 34;
         case GGUF_TYPE_Q6_0:     return 26;
+        case GGUF_TYPE_Q4_0_R8:  return (int)sizeof(block_q4_0);  /* 18: per-row block size */
+        case GGUF_TYPE_Q8_0_R8:  return (int)sizeof(block_q8_0);   /* 34: same per-row stride as Q8_0 */
         default: return 0;
     }
 }
@@ -6552,6 +6558,13 @@ float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
             dequantize_row_q4i_0_8_8(src, q4i_tmp, n > 256 ? 256 : n);
             return vec_dot_f32_f32(q4i_tmp, x, n > 256 ? 256 : n);
         }
+        case GGUF_TYPE_Q4_0_R8: {
+            /* Q4_0_R8: dequantize row 0 of the 8-row group, then f32 dot.
+             * For rows 1-7, the caller must use the 8-row group path. */
+            float q4r_tmp[256];
+            dequantize_row_q4_0_r8(src, q4r_tmp, n);
+            return vec_dot_f32_f32(q4r_tmp, x, n);
+        }
         case GGUF_TYPE_F16:  return vec_dot_f16_f32(src, x, n);
         case GGUF_TYPE_BF16: return vec_dot_bf16_f32(src, x, n);
         default: {
@@ -7894,4 +7907,191 @@ void picolm_gelu_table_f32(float *x, int size) {
         x[i] = fp16_to_fp32_lookup(picolm_gelu_table[t]);
     }
 #endif
+}
+
+/* ================================================================
+ * Q8_2 block: Q8_0 with int16 row sum for delta-based GEMM.
+ * ================================================================ */
+
+/* Quantize one row of F32 to Q8_2 blocks.
+ * Same as Q8_0 quantization but also computes int16 row sum. */
+void quantize_row_q8_2(const float *x, void *dst, int n) {
+    int nb = n / 32;
+    block_q8_2 *b = (block_q8_2 *)dst;
+    for (int i = 0; i < nb; i++) {
+        float am = 0;
+        const float *x0 = x + i * 32;
+        for (int j = 0; j < 32; j++) {
+            float v = x0[j];
+            if (v > am) am = v;
+            else if (-v > am) am = -v;
+        }
+        float d = am / 127.f;
+        if (d == 0.f) d = 1e-30f;
+        float id = 1.f / d;
+        b[i].d = fp32_to_fp16(d);
+        int16_t s = 0;
+        for (int j = 0; j < 32; j++) {
+            int vi = (int)(x0[j] * id);
+            if (vi > 127) vi = 127;
+            else if (vi < -128) vi = -128;
+            b[i].qs[j] = (int8_t)vi;
+            s += vi;
+        }
+        b[i].s = s;
+    }
+}
+
+/* Quantize 4 rows of F32 to Q8_2_x4 interleaved format.
+ * x is row-major with row_stride floats per row.
+ * dst has (n/32) block_q8_2_x4 blocks. */
+void quantize_mat_q8_2_x4(const float *x, void *dst, int n, int row_stride) {
+    int nb = n / 32;
+    block_q8_2_x4 *b = (block_q8_2_x4 *)dst;
+    const int qk = 32;
+    for (int i = 0; i < nb; i++) {
+        for (int r = 0; r < 4; r++) {
+            const float *x0 = x + r * row_stride + i * qk;
+            float am = 0;
+            for (int j = 0; j < qk; j++) {
+                float v = x0[j];
+                if (v > am) am = v;
+                else if (-v > am) am = -v;
+            }
+            float d = am / 127.f;
+            if (d == 0.f) d = 1e-30f;
+            float id = 1.f / d;
+            b[i].d[r] = fp32_to_fp16(d);
+            for (int j = 0; j < qk; j++) {
+                int vi = (int)(x0[j] * id);
+                if (vi > 127) vi = 127;
+                else if (vi < -128) vi = -128;
+                b[i].qs[r * qk + j] = (int8_t)vi;
+            }
+        }
+    }
+}
+
+/* ================================================================
+ * Q4_0_R8 (GGUF type 202): 8-row interleaved Q4_0.
+ * Layout is identical to block_q4_0x8 (already defined).
+ * ================================================================ */
+
+/* Quantize 8 rows of F32 to Q4_0_R8 interleaved format.
+ * x is row-major with row_stride = n floats per row.
+ * dst has (n/32) block_q4_0x8 blocks (8 scales + 128 interleaved qs per block).
+ * n must be a multiple of 32. */
+void quantize_row_q4_0_r8(const float *x, void *dst, int n) {
+    /* Q4_0_R8: 8-row interleaved Q4_0.
+     * Layout matches ik_llama's block_iq4_nl_r8 / block_q4_0x8.
+     * 4 chunks of 32 bytes. Each chunk: rows interleaved by 4 bytes.
+     * qs[32*l + 4*r + j] = row r, byte j (lo=first val, hi=second val)
+     * Nibbles stored as unsigned [0..15] (no XOR, unlike Q4_0_8_8). */
+    int nb = n / 32;
+    block_q4_0x8 *b = (block_q4_0x8 *)dst;
+    for (int ib = 0; ib < nb; ib++) {
+        for (int r = 0; r < 8; r++) {
+            const float *x0 = x + r * n + ib * 32;
+            float am = 0;
+            for (int j = 0; j < 32; j++) {
+                float v = x0[j];
+                if (v > am) am = v;
+                else if (-v > am) am = -v;
+            }
+            float d = am / 8.f;
+            if (d == 0.f) d = 1e-30f;
+            float id = 1.f / d;
+            b[ib].d[r] = fp32_to_fp16(d);
+            for (int l = 0; l < 4; l++) {
+                for (int j = 0; j < 4; j++) {
+                    uint8_t lo = (int)(x0[l * 8 + j * 2] * id + 8.f);
+                    uint8_t hi = (int)(x0[l * 8 + j * 2 + 1] * id + 8.f);
+                    if (lo > 15) lo = 15;
+                    if (hi > 15) hi = 15;
+                    b[ib].qs[32 * l + 4 * r + j] = lo | (hi << 4);
+                }
+            }
+        }
+    }
+}
+
+/* Dequantize 8 rows of Q4_0_R8 to F32.
+ * src has (n/32) block_q4_0x8 blocks.
+ * dst must hold 8*n floats, row-major. */
+void dequantize_row_q4_0_r8(const void *src, float *dst, int n) {
+    /* Q4_0_R8 layout matches ik_llama's block_iq4_nl_r8 / block_q4_0x8:
+     *
+     * Each block covers 8 rows x 32 values.
+     * qs[128] is organized as 4 chunks of 32 bytes each.
+     * Within each chunk l (0..3): qs[32*l + 4*r + j] for row r (0..7), byte j (0..7).
+     * Each byte has 2 nibbles: lo = first value, hi = second value.
+     * So row r, value v = nibble from qs[32*l + 4*r + j]:
+     *   v_even  = qs[32*l + 4*r + j] & 0xf
+     *   v_odd   = qs[32*l + 4*r + j] >> 4
+     * where j = v/2 within chunk, l = v/16, j_chunk = (v/2)%8.
+     *
+     * Nibbles are unsigned [0..15], represent [-8..7] via subtraction.
+     * Scales are FP16 in d[8], one per row. */
+    int nb = n / 32;
+    const block_q4_0x8 *b = (const block_q4_0x8 *)src;
+    for (int ib = 0; ib < nb; ib++) {
+        for (int r = 0; r < 8; r++) {
+            float d = fp16_to_fp32(b[ib].d[r]);
+            float *d0 = dst + r * n + ib * 32;
+            for (int l = 0; l < 4; l++) {
+                for (int j = 0; j < 4; j++) {
+                    uint8_t v = b[ib].qs[32 * l + 4 * r + j];
+                    d0[l * 8 + j * 2]     = ((int)(v & 0xf) - 8) * d;
+                    d0[l * 8 + j * 2 + 1] = ((int)(v >> 4) - 8) * d;
+                }
+            }
+        }
+    }
+}
+
+/* ================================================================
+ * Q8_0_R8 (GGUF type 203): 8-row interleaved Q8_0.
+ * ================================================================ */
+
+/* Quantize 8 rows of F32 to Q8_0_R8 interleaved format.
+ * x is row-major with row_stride = n floats per row.
+ * dst has (n/32) block_q8_0_r8 blocks. */
+void quantize_row_q8_0_r8(const float *x, void *dst, int n) {
+    int nb = n / 32;
+    block_q8_0_r8 *b = (block_q8_0_r8 *)dst;
+    for (int ib = 0; ib < nb; ib++) {
+        for (int r = 0; r < 8; r++) {
+            const float *x0 = x + r * n + ib * 32;
+            float am = 0;
+            for (int j = 0; j < 32; j++) {
+                float v = x0[j];
+                if (v > am) am = v;
+                else if (-v > am) am = -v;
+            }
+            float d = am / 127.f;
+            if (d == 0.f) d = 1e-30f;
+            float id = 1.f / d;
+            b[ib].d[r] = fp32_to_fp16(d);
+            for (int j = 0; j < 32; j++) {
+                int vi = (int)(x0[j] * id);
+                if (vi > 127) vi = 127;
+                else if (vi < -128) vi = -128;
+                b[ib].qs[r * 32 + j] = (int8_t)vi;
+            }
+        }
+    }
+}
+
+/* Dequantize 8 rows of Q8_0_R8 to F32. */
+void dequantize_row_q8_0_r8(const void *src, float *dst, int n) {
+    int nb = n / 32;
+    const block_q8_0_r8 *b = (const block_q8_0_r8 *)src;
+    for (int ib = 0; ib < nb; ib++) {
+        for (int r = 0; r < 8; r++) {
+            float d = fp16_to_fp32(b[ib].d[r]);
+            const int8_t *qs = b[ib].qs + r * 32;
+            float *d0 = dst + r * n + ib * 32;
+            for (int j = 0; j < 32; j++) d0[j] = qs[j] * d;
+        }
+    }
 }

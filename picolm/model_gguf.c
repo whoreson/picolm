@@ -1936,16 +1936,30 @@ int parse_gguf(model_t *m, int max_seq_len) {
         } else if (qt == GGUF_TYPE_Q4_0 || qt == GGUF_TYPE_Q4_1 ||
                    qt == GGUF_TYPE_IQ4_NL ||
                    qt == GGUF_TYPE_Q4_0_4_4 || qt == GGUF_TYPE_Q4_0_8_8 ||
-                   qt == GGUF_TYPE_Q4I_0_8_8) {
+                   qt == GGUF_TYPE_Q4I_0_8_8 || qt == GGUF_TYPE_Q4_0_R8) {
             size_t bs = (qt == GGUF_TYPE_Q4_0_4_4) ? sizeof(block_q4_0x4)
-                       : (qt == GGUF_TYPE_Q4_0_8_8) ? sizeof(block_q4_0x8)
+                       : (qt == GGUF_TYPE_Q4_0_8_8 || qt == GGUF_TYPE_Q4_0_R8) ? sizeof(block_q4_0x8)
                        : (qt == GGUF_TYPE_Q4I_0_8_8) ? sizeof(block_q4i_0x8)
                        : (qt == GGUF_TYPE_Q4_1) ? sizeof(block_q4_1)
                        : sizeof(block_q4_0);
             size_t nblocks = nrows / 32;
-            for (size_t b = 0; b < nblocks; b++) {
-                block_q4_0 *blk = (block_q4_0 *)((uint8_t *)ptr + b * bs);
-                blk->d = GGUF_LE16(blk->d);
+            if (qt == GGUF_TYPE_Q4_0_R8) {
+                /* Q4_0_R8: 8 FP16 deltas per block, need to swap each */
+                for (size_t b = 0; b < nblocks; b++) {
+                    block_q4_0x8 *blk = (block_q4_0x8 *)((uint8_t *)ptr + b * bs);
+                    for (int r = 0; r < 8; r++) blk->d[r] = GGUF_LE16(blk->d[r]);
+                }
+            } else if (qt == GGUF_TYPE_Q4_0_8_8) {
+                /* Q4_0_8_8: 8 FP16 deltas per block */
+                for (size_t b = 0; b < nblocks; b++) {
+                    block_q4_0x8 *blk = (block_q4_0x8 *)((uint8_t *)ptr + b * bs);
+                    for (int r = 0; r < 8; r++) blk->d[r] = GGUF_LE16(blk->d[r]);
+                }
+            } else {
+                for (size_t b = 0; b < nblocks; b++) {
+                    block_q4_0 *blk = (block_q4_0 *)((uint8_t *)ptr + b * bs);
+                    blk->d = GGUF_LE16(blk->d);
+                }
             }
         } else if (qt == GGUF_TYPE_Q2_0) {
             size_t nblocks = nrows / 128;
