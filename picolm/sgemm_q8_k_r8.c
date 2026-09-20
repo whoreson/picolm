@@ -54,6 +54,8 @@ void vec_dot_q8_k_r8_q8_k_avx2(const void *vx, const void *wy, int n,
     const block_q8_K *qk = (const block_q8_K *)wy;
     const int nb = n / QK_K;
 
+    const __m256i m1 = _mm256_set1_epi16(1);
+
     __m256 acc[8] = {0};
     __m256i isum[8] = {0};
 
@@ -140,23 +142,115 @@ int sgemm_q8_k_r8_q8_k_avx2(int nrows, int ncols, int k,
     if (nrows < 8 || ncols < 1 || k % QK_K != 0 || nrows % 8 != 0)
         return 0;
 
-    size_t a_row_bytes = (size_t)(k / QK_K) * sizeof(block_q8_K);
-    int start_col = (ncols * ith) / nth;
-    int end_col = (ncols * (ith + 1)) / nth;
-    if (end_col <= start_col) return 0;
+    const int nb = k / QK_K;  /* number of K blocks per row */
 
-    size_t w_stride = (size_t)(k / QK_K) * sizeof(block_q8_k_r8);
-    for (int w8 = 0; w8 < nrows / 8; w8++) {
-        const block_q8_k_r8 *iq8_base = (const block_q8_k_r8 *)
-            ((const char *)vx + w8 * w_stride);
-        for (int c = start_col; c < end_col; c++) {
-            const block_q8_K *qk = (const block_q8_K *)
-                ((const char *)vy + c * a_row_bytes);
-            float *out_base = out + w8 * 8 + c * bs;
-            vec_dot_q8_k_r8_q8_k_avx2(iq8_base, qk, k, out_base, 8);
+    /* Tiled GEMM: 8-row x 2-col tiles with K-dimension tiling.
+     * Each tile processes 8 weight rows x 2 activation columns,
+     * iterating over K blocks to accumulate in FP32 registers.
+     * Thread partitioning uses mnpack-style flat tiling. */
+    {
+        int64_t ytiles = nrows / 8;
+        int64_t xtiles = ncols / 2;
+        int64_t n_tail = ncols - xtiles * 2;
+        int64_t xtiles_ext = xtiles + (n_tail > 0 ? 1 : 0);
+        int64_t tiles = ytiles * xtiles_ext;
+        if (tiles <= 0) return 0;
+
+        int64_t duty = (tiles + nth - 1) / nth;
+        int64_t start = duty * ith;
+        int64_t end = start + duty;
+        if (end > tiles) end = tiles;
+
+        /* Precompute strides */
+        size_t w_group_bytes = nb * sizeof(block_q8_k_r8); /* per 8-row group */
+        size_t a_row_bytes = nb * sizeof(block_q8_K);        /* per activation row */
+
+        for (int64_t job = start; job < end; job++) {
+            int64_t ii = (job / xtiles_ext) * 8;  /* weight row start */
+            int64_t xt = job % xtiles_ext;
+            int64_t jj = xt * 2;
+            int64_t ncols_tile = (xt < xtiles) ? 2 : n_tail;
+            if (ncols_tile < 1) ncols_tile = 1;
+
+            /* Pointers into weight data for this row group (ii/8 groups of 8 rows each) */
+            const block_q8_k_r8 *iq8 = (const block_q8_k_r8 *)
+                ((const char *)vx + (ii / 8) * w_group_bytes);
+
+            /* 8-row FP32 accumulators, one __m256 per activation column.
+             * Each __m256 holds 8 floats (one per weight row). */
+            __m256 acc[2] = { _mm256_setzero_ps(), _mm256_setzero_ps() };
+
+            /* Precompute per-column activation pointers */
+            const block_q8_K *qk_ptr[2];
+            __m256 d4y[2];
+
+            for (int ibl = 0; ibl < nb; ibl++) {
+                /* Load 8 FP16 weight scales -> 8 FP32 */
+                __m256 d4 = _mm256_cvtph_ps(
+                    _mm_loadu_si128((const __m128i *)iq8[ibl].d));
+
+                const uint8_t *qs = (const uint8_t *)iq8[ibl].qs;
+
+                /* Set up per-column pointers and scales */
+                for (int c = 0; c < ncols_tile; c++) {
+                    qk_ptr[c] = (const block_q8_K *)
+                        ((const char *)vy + (jj + c) * a_row_bytes);
+                    float scale_y = qk_ptr[c][ibl].d;
+                    d4y[c] = _mm256_mul_ps(d4, _mm256_set1_ps(scale_y));
+                }
+
+                for (int ib2 = 0; ib2 < QK_K / 16; ib2++) {
+                    __m256i qx[4];
+                    qx[0] = _mm256_loadu_si256((const __m256i *)(qs + 32 * (4 * ib2 + 0)));
+                    qx[1] = _mm256_loadu_si256((const __m256i *)(qs + 32 * (4 * ib2 + 1)));
+                    qx[2] = _mm256_loadu_si256((const __m256i *)(qs + 32 * (4 * ib2 + 2)));
+                    qx[3] = _mm256_loadu_si256((const __m256i *)(qs + 32 * (4 * ib2 + 3)));
+
+                    __m256i s0 = _mm256_sign_epi8(qx[0], qx[0]);
+                    __m256i s1 = _mm256_sign_epi8(qx[1], qx[1]);
+                    __m256i s2 = _mm256_sign_epi8(qx[2], qx[2]);
+                    __m256i s3 = _mm256_sign_epi8(qx[3], qx[3]);
+
+                    for (int c = 0; c < ncols_tile; c++) {
+                        __m128i y128 = _mm_loadu_si128(
+                            (const __m128i *)qk_ptr[c][ibl].qs + ib2);
+                        __m256i y = _mm256_broadcastsi128_si256(y128);
+
+#ifdef __AVX512VNNI__
+#ifdef __AVX512VL__
+                        __m256i isum = _mm256_dpbusd_epi32(_mm256_setzero_si256(), s0, _mm256_sign_epi8(_mm256_shuffle_epi32(y, 0x00), qx[0]));
+                        isum = _mm256_dpbusd_epi32(isum, s1, _mm256_sign_epi8(_mm256_shuffle_epi32(y, 0x55), qx[1]));
+                        isum = _mm256_dpbusd_epi32(isum, s2, _mm256_sign_epi8(_mm256_shuffle_epi32(y, 0xaa), qx[2]));
+                        isum = _mm256_dpbusd_epi32(isum, s3, _mm256_sign_epi8(_mm256_shuffle_epi32(y, 0xff), qx[3]));
+#else
+                        __m256i isum = _mm256_add_epi32(_mm256_madd_epi16(_mm256_set1_epi16(1), _mm256_maddubs_epi16(s0, _mm256_sign_epi8(_mm256_shuffle_epi32(y, 0x00), qx[0]))),
+                                                       _mm256_madd_epi16(_mm256_set1_epi16(1), _mm256_maddubs_epi16(s1, _mm256_sign_epi8(_mm256_shuffle_epi32(y, 0x55), qx[1]))));
+                        isum = _mm256_add_epi32(isum, _mm256_add_epi32(
+                            _mm256_madd_epi16(_mm256_set1_epi16(1), _mm256_maddubs_epi16(s2, _mm256_sign_epi8(_mm256_shuffle_epi32(y, 0xaa), qx[2]))),
+                            _mm256_madd_epi16(_mm256_set1_epi16(1), _mm256_maddubs_epi16(s3, _mm256_sign_epi8(_mm256_shuffle_epi32(y, 0xff), qx[3])))));
+#endif
+#else
+                        __m256i isum = _mm256_add_epi32(_mm256_madd_epi16(_mm256_set1_epi16(1), _mm256_maddubs_epi16(s0, _mm256_sign_epi8(_mm256_shuffle_epi32(y, 0x00), qx[0]))),
+                                                       _mm256_madd_epi16(_mm256_set1_epi16(1), _mm256_maddubs_epi16(s1, _mm256_sign_epi8(_mm256_shuffle_epi32(y, 0x55), qx[1]))));
+                        isum = _mm256_add_epi32(isum, _mm256_add_epi32(
+                            _mm256_madd_epi16(_mm256_set1_epi16(1), _mm256_maddubs_epi16(s2, _mm256_sign_epi8(_mm256_shuffle_epi32(y, 0xaa), qx[2]))),
+                            _mm256_madd_epi16(_mm256_set1_epi16(1), _mm256_maddubs_epi16(s3, _mm256_sign_epi8(_mm256_shuffle_epi32(y, 0xff), qx[3])))));
+#endif
+                        acc[c] = _mm256_fmadd_ps(d4y[c], _mm256_cvtepi32_ps(isum), acc[c]);
+                    }
+                }
+            }
+
+            /* Store results to output buffer */
+            for (int c = 0; c < ncols_tile; c++) {
+                float *out_c = out + ii + (jj + c) * bs;
+                _mm256_storeu_ps(out_c, acc[c]);
+            }
         }
+
+        /* m-tail: nrows is always a multiple of 8 for Q8_K_R8, no tail needed */
     }
-    return (nrows / 8) * 8;
+    return nrows;
 #else
     (void)nrows; (void)ncols; (void)k; (void)vx; (void)vy;
     (void)out; (void)bs; (void)ith; (void)nth;
