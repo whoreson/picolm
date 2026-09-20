@@ -445,6 +445,7 @@ typedef enum {
     GGUF_TYPE_Q6_0       = 133, /* 6-bit values + FP16 scale, 32 values/block (legacy GGML) */
     GGUF_TYPE_Q4_0_R8    = 202, /* 8-row interleaved Q4_0 (GGUF type 202, llama.cpp ik branch) */
     GGUF_TYPE_Q8_0_R8    = 203, /* 8-row interleaved Q8_0 (GGUF type 203) */
+    GGUF_TYPE_Q8_K_R8    = 399, /* 8-row interleaved Q8_K (GGUF type 399, llama.cpp ik branch) */
 } gguf_type_t;
 
 /* Packed struct attribute: empty on mainstream compilers where #pragma pack works,
@@ -469,11 +470,26 @@ typedef struct PICOLM_PACKED_ATTR {
 
 /* Q8_K block: 256 weights, used for intermediate quantization in Q4_K/Q6_K matmul */
 /* d: float, qs: 256 int8, bsums: 16 int16 (sum of quants in groups of 16) */
+#ifndef QK_K
+#define QK_K 256  /* Q8_K block length */
+#endif
 typedef struct PICOLM_PACKED_ATTR {
     float   d;
     int8_t  qs[256];
     int16_t bsums[16];
 } block_q8_K;            /* 4 + 256 + 32 = 292 bytes */
+
+/* Q8_K_R8: 8-row interleaved Q8_K (GGUF type 399, llama.cpp ik branch)
+ * Used for high-precision intermediate quantization in matmul.
+ * Layout: 8 FP16 scales + 8x256 int8 values, interleaved per 32-byte chunks.
+ * Each 32-byte chunk interleaves 4 consecutive bytes from each of 8 rows:
+ *   qs[32*ib + 4*k + i]  ib=0..63, k=0..7 (rows), i=0..3 (values)
+ *   bytes 0-3: row 0, bytes 4-7: row 1, ..., bytes 28-31: row 7
+ * Total: 16 + 2048 = 2064 bytes per block. */
+typedef struct {
+    uint16_t  d[8];        // 8 FP16 scales = 16 bytes
+    int8_t    qs[2048];    // 8 rows x 256 values, interleaved = 2048 bytes
+} block_q8_k_r8;          // Total: 2064 bytes per block
 
 /* Q4_0_4_4 interleaved block: 4 rows of Q4_0 packed together for SIMD efficiency.
  * Layout: 4 FP16 deltas, then interleaved nibble-bytes from 4 standard Q4_0 blocks.
@@ -864,6 +880,20 @@ void dequantize_row_q4_0_r8(const void *src, float *dst, int n);
 void quantize_row_q8_0_r8(const float *x, void *dst, int n);
 /* Dequantize 8 rows of Q8_0_R8 to F32. dst must hold 8*n floats. */
 void dequantize_row_q8_0_r8(const void *src, float *dst, int n);
+/* Q8_K_R8 x Q8_K GEMV (AVX2): 8 weight rows x 1 activation row.
+ * Uses block_q8_k_r8 weights (sign trick, no bias correction).
+ * Activations in block_q8_K format. */
+void vec_dot_q8_k_r8_q8_k_avx2(const void *vx, const void *wy, int n,
+                                 float *out, int nrows);
+/* Q8_K_R8 x Q8_K batched GEMM (AVX2). */
+int sgemm_q8_k_r8_q8_k_avx2(int nrows, int ncols, int k,
+                             const void *vx, const void *vy,
+                             float *out, size_t bs,
+                             int ith, int nth);
+/* Quantize 8 rows of F32 to Q8_K_R8 interleaved format. */
+void quantize_row_q8_k_r8(const float *x, void *dst, int n);
+/* Dequantize 8 rows of Q8_K_R8 to F32. dst must hold 8*n floats. */
+void dequantize_row_q8_k_r8(const void *src, float *dst, int n);
 /* Convert F32 activations to Q8_2 blocks (with row sum).
  * dst must have space for (n/32) * sizeof(block_q8_2) bytes. */
 void quantize_row_q8_2(const float *x, void *dst, int n);

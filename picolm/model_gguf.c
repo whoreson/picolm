@@ -514,10 +514,12 @@ const char *gguf_type_name(uint32_t type) {
         case 133: return "q6_0";
         /* ik_llama repacked types */
         case 202: return "q4_0_r8";
-        case 208: return "q8_0_r8";
+        case 203: return "q8_0_r8";
+        case 208: return "q8_0_r8";  /* also 208 in some GGUFs */
         case 212: return "q4_k_r4";
         case 213: return "q5_k_r4";
         case 214: return "q6_k_r4";
+        case 399: return "q8_k_r8";
         default: return "unknown";
     }
 }
@@ -1947,6 +1949,13 @@ int parse_gguf(model_t *m, int max_seq_len) {
                 /* Q4_0_R8: 8 FP16 deltas per block, need to swap each */
                 for (size_t b = 0; b < nblocks; b++) {
                     block_q4_0x8 *blk = (block_q4_0x8 *)((uint8_t *)ptr + b * bs);
+                    for (int r = 0; r < 8; r++) blk->d[r] = GGUF_LE16(blk->d[r]);
+                }
+            } else if (qt == GGUF_TYPE_Q8_K_R8) {
+                /* Q8_K_R8: 8 FP16 deltas per block, need to swap each */
+                size_t nb = nrows / 256;
+                for (size_t b = 0; b < nb; b++) {
+                    block_q8_k_r8 *blk = (block_q8_k_r8 *)((uint8_t *)ptr + b * sizeof(block_q8_k_r8));
                     for (int r = 0; r < 8; r++) blk->d[r] = GGUF_LE16(blk->d[r]);
                 }
             } else if (qt == GGUF_TYPE_Q4_0_8_8) {

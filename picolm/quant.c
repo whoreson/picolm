@@ -758,6 +758,7 @@ void dequantize_row(const void *src, float *dst, int n, gguf_type_t type) {
         case GGUF_TYPE_IQ4_NL:   dequantize_row_iq4_nl(src, dst, n); break;
         case GGUF_TYPE_Q4_0_R8:  dequantize_row_q4_0_r8(src, dst, n); break;
         case GGUF_TYPE_Q8_0_R8:  dequantize_row_q8_0_r8(src, dst, n); break;
+        case GGUF_TYPE_Q8_K_R8:  dequantize_row_q8_k_r8(src, dst, n); break;
         default:
             fprintf(stderr, "dequantize_row: unsupported type %d\n", type);
             exit(1);
@@ -793,6 +794,7 @@ int gguf_type_block_size(gguf_type_t type) {
         case GGUF_TYPE_Q6_0:     return 32;
         case GGUF_TYPE_Q4_0_R8:  return 32;  /* same as Q4_0_8_8: 32 values per row */
         case GGUF_TYPE_Q8_0_R8:  return 32;  /* 32 values per row */
+        case GGUF_TYPE_Q8_K_R8:  return 256; /* same as Q8_K: 256 values per row */
         default: return 0;
     }
 }
@@ -824,6 +826,7 @@ int gguf_type_quant_size(gguf_type_t type) {
         case GGUF_TYPE_Q6_0:     return 26;
         case GGUF_TYPE_Q4_0_R8:  return (int)sizeof(block_q4_0);  /* 18: per-row block size */
         case GGUF_TYPE_Q8_0_R8:  return (int)sizeof(block_q8_0);   /* 34: same per-row stride as Q8_0 */
+        case GGUF_TYPE_Q8_K_R8:  return (int)(sizeof(block_q8_k_r8) / 8); /* 258: per-row block size */
         default: return 0;
     }
 }
@@ -6680,6 +6683,12 @@ float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
             dequantize_row_q4_0_r8(src, q4r_tmp, n);
             return vec_dot_f32_f32(q4r_tmp, x, n);
         }
+        case GGUF_TYPE_Q8_K_R8: {
+            /* Q8_K_R8: dequantize row 0 of the 8-row group, then f32 dot. */
+            float q8r_tmp[256];
+            dequantize_row_q8_k_r8(src, q8r_tmp, n);
+            return vec_dot_f32_f32(q8r_tmp, x, n);
+        }
         case GGUF_TYPE_F16:  return vec_dot_f16_f32(src, x, n);
         case GGUF_TYPE_BF16: return vec_dot_bf16_f32(src, x, n);
         default: {
@@ -8178,6 +8187,76 @@ void dequantize_row_q8_0_r8(const void *src, float *dst, int n) {
             const int8_t *qs = b[ib].qs + r * 32;
             float *d0 = dst + r * n + ib * 32;
             for (int j = 0; j < 32; j++) d0[j] = qs[j] * d;
+        }
+    }
+}
+
+/* ================================================================
+ * Q8_K_R8 quantization and dequantization
+ * ================================================================ */
+
+/* Quantize 8 rows of F32 to Q8_K_R8 interleaved format.
+ * x is 8 row-major rows, each n floats (n must be multiple of 256).
+ * dst: block_q8_k_r8 pointer, (n/256) blocks per row group.
+ *
+ * Layout: d[8] FP16 scales + qs[2048] interleaved int8.
+ * qs[32*ib + 4*k + j] = row k, value 4*ib+j (ib=0..63, k=0..7, j=0..3)
+ */
+void quantize_row_q8_k_r8(const float *x, void *dst, int n) {
+    assert(n % QK_K == 0);
+    const int nb = n / QK_K;
+
+    /* First quantize each of 8 rows to Q8_K individually (in a temp buffer) */
+    size_t qk_row_size = (size_t)nb * sizeof(block_q8_K);
+    size_t qk_buf_size = 8 * qk_row_size;
+    void *qk_buf = malloc(qk_buf_size);
+    if (!qk_buf) return;
+
+    for (int r = 0; r < 8; r++) {
+        quantize_row_q8_K(x + r * n, (char *)qk_buf + r * qk_row_size, n);
+    }
+
+    /* Repack: extract scales and interleaved qs from 8 consecutive Q8_K rows */
+    block_q8_k_r8 *y = (block_q8_k_r8 *)dst;
+    const block_q8_K *x8[8];
+    for (int r = 0; r < 8; r++) {
+        x8[r] = (const block_q8_K *)((const char *)qk_buf + r * qk_row_size);
+    }
+    for (int ibl = 0; ibl < nb; ibl++) {
+        /* Store 8 FP16 scales */
+        for (int r = 0; r < 8; r++) {
+            y[ibl].d[r] = fp32_to_fp16(x8[r][ibl].d);
+        }
+        /* Interleave qs: 64 chunks of 32 bytes each */
+        for (int ib = 0; ib < QK_K / 4; ib++) {
+            for (int r = 0; r < 8; r++) {
+                for (int j = 0; j < 4; j++) {
+                    y[ibl].qs[32 * ib + 4 * r + j] = x8[r][ibl].qs[4 * ib + j];
+                }
+            }
+        }
+    }
+
+    free(qk_buf);
+}
+
+/* Dequantize 8 rows of Q8_K_R8 to F32.
+ * src: block_q8_k_r8 pointer (n/256 blocks).
+ * dst: 8*n floats, row-major. */
+void dequantize_row_q8_k_r8(const void *src, float *dst, int n) {
+    assert(n % QK_K == 0);
+    const int nb = n / QK_K;
+    const block_q8_k_r8 *b = (const block_q8_k_r8 *)src;
+
+    for (int ibl = 0; ibl < nb; ibl++) {
+        for (int r = 0; r < 8; r++) {
+            float d = fp16_to_fp32(b[ibl].d[r]);
+            float *d0 = dst + r * n + ibl * QK_K;
+            for (int ib = 0; ib < QK_K / 4; ib++) {
+                for (int j = 0; j < 4; j++) {
+                    d0[4 * ib + j] = b[ibl].qs[32 * ib + 4 * r + j] * d;
+                }
+            }
         }
     }
 }

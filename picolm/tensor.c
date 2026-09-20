@@ -679,6 +679,47 @@ static void matmul_worker_f(matmul_task_t *t) {
                     t->out[b * out_stride + i] = vec_dot(wrow, t->x + b * t->n, t->n, t->qtype);
             }
 #endif
+        } else if (t->qtype == GGUF_TYPE_Q8_K_R8 && t->x) {
+            /* Q8_K_R8 batched: use tiled sgemm or per-row-group vec_dot */
+#if defined(PICOLM_AVX2)
+            int start8 = (t->start / 8) * 8;
+            int end8 = (t->end + 7) / 8 * 8;
+            int nrows = end8 - start8;
+            if (nrows >= 8 && nb >= 2) {
+                const char *qx_base = (const char *)t->x;
+                size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_K, t->n);
+                int done = sgemm_q8_k_r8_q8_k_avx2(nrows, nb, t->n,
+                            t->W + (size_t)start8 * t->row_bytes, qx_base,
+                            t->out + start8, out_stride, 0, 1);
+                if (done < nrows) {
+                    for (int i = start8 + done; i < end8; i += 8) {
+                        const char *wrow = t->W + (size_t)i * t->row_bytes;
+                        for (int b = 0; b < nb; b++) {
+                            const block_q8_K *xq = (const block_q8_K *)(qx_base + (size_t)b * q8_rb);
+                            float *ob = t->out + b * out_stride + i;
+                            vec_dot_q8_k_r8_q8_k_avx2(wrow, xq, t->n, ob, 8);
+                        }
+                    }
+                }
+            } else {
+                const char *qx_base = (const char *)t->x;
+                size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_K, t->n);
+                for (int i = start8; i < end8; i += 8) {
+                    const char *wrow = t->W + (size_t)i * t->row_bytes;
+                    for (int b = 0; b < nb; b++) {
+                        const block_q8_K *xq = (const block_q8_K *)(qx_base + (size_t)b * q8_rb);
+                        float *ob = t->out + b * out_stride + i;
+                        vec_dot_q8_k_r8_q8_k_avx2(wrow, xq, t->n, ob, 8);
+                    }
+                }
+            }
+#else
+            for (int i = t->start; i < t->end; i++) {
+                const char *wrow = t->W + (size_t)i * t->row_bytes;
+                for (int b = 0; b < nb; b++)
+                    t->out[b * out_stride + i] = vec_dot(wrow, t->x + b * t->n, t->n, t->qtype);
+            }
+#endif
         } else if (t->qtype == GGUF_TYPE_Q2_K && t->x) {
             /* Pre-quantized Q8_K activations: int8 MAC with per-subblock scales + bsums */
             size_t q8k_row_bytes = gguf_type_row_size(GGUF_TYPE_Q8_K, t->n);
@@ -791,6 +832,23 @@ static void matmul_worker_f(matmul_task_t *t) {
         for (int i = start8; i < end8; i += 8) {
             vec_dot_q4_0_r8_q8_2_avx2(
                 t->W + (size_t)i * t->row_bytes, qy, t->n,
+                t->out + i, 8);
+        }
+#else
+        for (int i = t->start; i < t->end; i++) {
+            t->out[i] = vec_dot(t->W + (size_t)i * t->row_bytes,
+                                t->x, t->n, t->qtype);
+        }
+#endif
+    } else if (t->qtype == GGUF_TYPE_Q8_K_R8 && t->x) {
+        /* Q8_K_R8: process 8 rows at a time with Q8_K activations (AVX2). */
+#if defined(PICOLM_AVX2)
+        const block_q8_K *qk = (const block_q8_K *)t->x;
+        int start8 = (t->start / 8) * 8;
+        int end8 = (t->end + 7) / 8 * 8;
+        for (int i = start8; i < end8; i += 8) {
+            vec_dot_q8_k_r8_q8_k_avx2(
+                t->W + (size_t)i * t->row_bytes, qk, t->n,
                 t->out + i, 8);
         }
 #else
@@ -1482,6 +1540,59 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
                         pool_tasks[t].x_d = NULL; pool_tasks[t].W = wptr;
                         pool_tasks[t].row_bytes = row_bytes; pool_tasks[t].n = n;
                         pool_tasks[t].qtype = GGUF_TYPE_Q4_0_R8;
+                        pool_tasks[t].n_batch = 0;
+                    }
+                    pool_clear_unused(active, nt);
+                    pool_init(nt);
+                    pool_wake(nt);
+                    matmul_worker_f(&pool_tasks[0]);
+                    pool_wait(nt);
+                }
+                if (qx_owned) free(qx);
+                return;
+            }
+        }
+        }
+#endif
+        /* Non-AVX2 or small-d or OOM: fall through to generic vec_dot path */
+    } else if (qtype == GGUF_TYPE_Q8_K_R8) {
+        /* Q8_K_R8 fast path: weights in block_q8_k_r8 layout.
+         * Uses Q8_K activations (sign trick, no bias correction). */
+#if defined(PICOLM_AVX2)
+        {
+        size_t qx_size = (n / 256) * sizeof(block_q8_K);
+        int d8 = (d / 8) * 8;
+
+        if (d8 >= 8) {
+            block_q8_K *qx = NULL;
+            int qx_owned = 0;
+            if (n_threads <= 1 && scratch_buf != NULL && qx_size <= (size_t)scratch_size) {
+                qx = (block_q8_K *)scratch_buf;
+            } else {
+                qx = (block_q8_K *)malloc(qx_size);
+                qx_owned = 1;
+            }
+            if (qx != NULL) {
+                quantize_row_q8_K(x, qx, n);
+
+                if (n_threads <= 1) {
+                    for (int i = 0; i < d8; i += 8)
+                        vec_dot_q8_k_r8_q8_k_avx2(wptr + (size_t)i * row_bytes, qx, n, out + i, 8);
+                    for (int i = d8; i < d; i++)
+                        out[i] = vec_dot(wptr + (size_t)i * row_bytes, x, n, qtype);
+                    if (qx_owned) free(qx);
+                    return;
+                }
+
+                int nt = pool_total_threads(n_threads);
+                int want = n_threads < nt ? n_threads : nt;
+                {
+                    int active = pool_assign_rows(0, want, d);
+                    for (int t = 0; t < active; t++) {
+                        pool_tasks[t].out = out; pool_tasks[t].x = (const float *)qx;
+                        pool_tasks[t].x_d = NULL; pool_tasks[t].W = wptr;
+                        pool_tasks[t].row_bytes = row_bytes; pool_tasks[t].n = n;
+                        pool_tasks[t].qtype = GGUF_TYPE_Q8_K_R8;
                         pool_tasks[t].n_batch = 0;
                     }
                     pool_clear_unused(active, nt);
@@ -2795,6 +2906,13 @@ static void qgemm_q4r8_task(int idx, void *ctxp) {
     int nth = pool_total_threads(1);
     sgemm_q4_0_r8_q8_2_avx2(c->nr, c->nc, c->k, c->w, c->abuf, c->out, c->bs, idx, nth);
 }
+
+/* Q8_K_R8 tiled GEMM task (Q8_K activations, sign trick) */
+static void qgemm_q8kr8_task(int idx, void *ctxp) {
+    qgemm_q4r8_ctx_t *c = (qgemm_q4r8_ctx_t *)ctxp;
+    int nth = pool_total_threads(1);
+    sgemm_q8_k_r8_q8_k_avx2(c->nr, c->nc, c->k, c->w, c->abuf, c->out, c->bs, idx, nth);
+}
 #endif /* PICOLM_AVX2 */
 
 /* Profiling: per-path timing for matmul_batch (PICOLM_PROFILE=1) */
@@ -3217,6 +3335,52 @@ void matmul_batch(float *out, const float *x, int n_batch,
             }
             free(qbuf);
         DISPATCH("Q4_0_R8_vec_dot");
+            return;
+        }
+    }
+#endif
+
+    /* Q8_K_R8 batch: tiled GEMM path with AVX2 kernel (Q8_K activations).
+     * Uses sign trick for signed multiplication, no bias correction needed. */
+#if defined(PICOLM_AVX2)
+    if (!picolm_sgemm_disabled_tensor() && qtype == GGUF_TYPE_Q8_K_R8 && n_batch > 0 && n > 0 && d % 8 == 0 && n % 256 == 0) {
+        size_t q8_rb = (size_t)(n / 256) * sizeof(block_q8_K);
+        void *qbuf = malloc((size_t)n_batch * q8_rb);
+        if (qbuf) {
+            for (int b = 0; b < n_batch; b++)
+                quantize_row_q8_K(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
+
+            int nth = pool_total_threads(1);
+            qgemm_q4r8_ctx_t ctx = {
+                .nr = d, .nc = n_batch, .k = n,
+                .w = W, .abuf = qbuf, .out = out, .bs = d,
+            };
+            tensor_parallel_for(nth, qgemm_q8kr8_task, &ctx);
+            free(qbuf);
+        DISPATCH("Q8_K_R8_sgemm");
+            return;
+        }
+    }
+#endif
+
+    /* Q8_K_R8 vec_dot fallback for batched matmul (used when PICOLM_SGEMM=0). */
+#if defined(PICOLM_AVX2)
+    if (qtype == GGUF_TYPE_Q8_K_R8 && n_batch > 0 && n > 0) {
+        size_t q8_rb = (size_t)(n / 256) * sizeof(block_q8_K);
+        void *qbuf = malloc((size_t)n_batch * q8_rb);
+        if (qbuf) {
+            for (int b = 0; b < n_batch; b++)
+                quantize_row_q8_K(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
+            for (int b = 0; b < n_batch; b++) {
+                const block_q8_K *qk = (const block_q8_K *)((char *)qbuf + (size_t)b * q8_rb);
+                int d8 = (d / 8) * 8;
+                for (int i = 0; i < d8; i += 8)
+                    vec_dot_q8_k_r8_q8_k_avx2((const char *)W + i * row_bytes, qk, n, out + b * d + i, 8);
+                for (int i = d8; i < d; i++)
+                    out[b * d + i] = vec_dot((const char *)W + i * row_bytes, x + b * n, n, qtype);
+            }
+            free(qbuf);
+        DISPATCH("Q8_K_R8_vec_dot");
             return;
         }
     }
@@ -4074,6 +4238,37 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
             }
             free(qbuf);
         DISPATCH2("Q4_0_R8_vec_dot_dual");
+            return;
+        }
+    }
+#endif
+
+    /* Q8_K_R8 tiled GEMM for dual-batch (AVX2). */
+#if defined(PICOLM_AVX2)
+    if (!picolm_sgemm_disabled_tensor() && (qtype1 == GGUF_TYPE_Q8_K_R8 || qtype2 == GGUF_TYPE_Q8_K_R8) && n_batch > 0 && n > 0 && d % 8 == 0 && n % 256 == 0) {
+        size_t q8_rb = (size_t)(n / 256) * sizeof(block_q8_K);
+        void *qbuf = malloc((size_t)n_batch * q8_rb);
+        if (qbuf) {
+            for (int b = 0; b < n_batch; b++)
+                quantize_row_q8_K(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
+
+            int nth = pool_total_threads(1);
+            if (qtype1 == GGUF_TYPE_Q8_K_R8) {
+                qgemm_q4r8_ctx_t ctx = {
+                    .nr = d, .nc = n_batch, .k = n,
+                    .w = W1, .abuf = qbuf, .out = out1, .bs = d,
+                };
+                tensor_parallel_for(nth, qgemm_q8kr8_task, &ctx);
+            }
+            if (qtype2 == GGUF_TYPE_Q8_K_R8) {
+                qgemm_q4r8_ctx_t ctx = {
+                    .nr = d, .nc = n_batch, .k = n,
+                    .w = W2, .abuf = qbuf, .out = out2, .bs = d,
+                };
+                tensor_parallel_for(nth, qgemm_q8kr8_task, &ctx);
+            }
+            free(qbuf);
+        DISPATCH2("Q8_K_R8_sgemm_dual");
             return;
         }
     }
