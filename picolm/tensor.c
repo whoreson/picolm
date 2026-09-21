@@ -2172,7 +2172,41 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
         return;
     }
 
-    if (n_threads <= 1 || d < 4 || d < matmul_min_rows) {
+    /* Safety check: the generic worker fallback passes F32 activations to
+     * matmul_worker_f, which casts t->x to block_q8_0/block_q8_K for many
+     * quant types. If we reach here, the fast path above was not taken
+     * (e.g., alignment guard failed). For types that need pre-quantized
+     * activations, the worker would read F32 as quantized blocks -> garbage.
+     *
+     * Types needing pre-quantized activations in the worker:
+     *   Q8_0, Q4_0, Q4_K, Q6_K, Q3_K, Q5_K, Q2_K, Q6_K_R4, IQ2_K_R4, IQ3_K_R4
+     *   Q6_0, Q1_0, Q2_0, IQ4_NL, Q5_1, Q4_0_R8, Q8_K_R8, Q4_0_4_4, Q4_0_4_8, Q4_0_8_8
+     *
+     * Safe types (worker uses vec_dot with F32 input): F32, F16, BF16, Q4I_0_8_8
+     *
+     * If the type needs pre-quantized activations, fall back to scalar vec_dot. */
+    int needs_qx = (qtype == GGUF_TYPE_Q8_0 || qtype == GGUF_TYPE_Q4_0 ||
+                    qtype == GGUF_TYPE_Q4_K || qtype == GGUF_TYPE_Q6_K ||
+                    qtype == GGUF_TYPE_Q3_K || qtype == GGUF_TYPE_Q5_K ||
+                    qtype == GGUF_TYPE_Q2_K || qtype == GGUF_TYPE_Q6_K_R4 ||
+                    qtype == GGUF_TYPE_IQ2_K_R4 || qtype == GGUF_TYPE_IQ3_K_R4 ||
+                    qtype == GGUF_TYPE_Q6_0 || qtype == GGUF_TYPE_Q1_0 ||
+                    qtype == GGUF_TYPE_Q2_0 || qtype == GGUF_TYPE_IQ4_NL ||
+                    qtype == GGUF_TYPE_Q5_1 || qtype == GGUF_TYPE_Q4_0_R8 ||
+                    qtype == GGUF_TYPE_Q8_K_R8 || qtype == GGUF_TYPE_Q4_0_4_4 ||
+                    qtype == GGUF_TYPE_Q4_0_4_8 || qtype == GGUF_TYPE_Q4_0_8_8);
+
+    if (needs_qx) {
+        static int warned = 0;
+        if (!warned) {
+            fprintf(stderr, "WARN: matmul() fallback for qtype=%d (%d x %d): "
+                    "fast path unavailable, using scalar vec_dot\n",
+                    qtype, n, d);
+            warned = 1;
+        }
+    }
+
+    if (n_threads <= 1 || d < 4 || d < matmul_min_rows || needs_qx) {
         for (int i = 0; i < d; i++) {
             out[i] = vec_dot(wptr + (size_t)i * row_bytes, x, n, qtype);
         }
