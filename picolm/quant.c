@@ -823,6 +823,8 @@ void dequantize_row(const void *src, float *dst, int n, gguf_type_t type) {
 case GGUF_TYPE_Q4_0_R8:  dequantize_row_q4_0_r8(src, dst, n); break;
         case GGUF_TYPE_Q8_0_R8:  dequantize_row_q8_0_r8(src, dst, n); break;
         case GGUF_TYPE_Q8_K_R8:  dequantize_row_q8_k_r8(src, dst, n); break;
+        case GGUF_TYPE_IQ2_K:    dequantize_row_iq2_k(src, dst, n); break;
+        case GGUF_TYPE_IQ3_K:    dequantize_row_iq3_k(src, dst, n); break;
         case GGUF_TYPE_IQ2_K_R4: dequantize_row_iq2_k_r4(src, dst, n); break;
         case GGUF_TYPE_IQ3_K_R4: dequantize_row_iq3_k_r4(src, dst, n); break;
         case GGUF_TYPE_Q6_K_R4:  dequantize_row_q6_K_R4(src, dst, n); break;
@@ -841,6 +843,8 @@ int gguf_type_block_size(gguf_type_t type) {
         case GGUF_TYPE_Q4_0:  return 32;
         case GGUF_TYPE_Q4_1:  return 32;
         case GGUF_TYPE_IQ4_NL: return 32;
+        case GGUF_TYPE_IQ2_K:    return 256;  /* QK_K values per row */
+        case GGUF_TYPE_IQ3_K:    return 256;  /* QK_K values per row */
         case GGUF_TYPE_IQ2_K_R4: return 256;  /* QK_K values per row */
         case GGUF_TYPE_IQ3_K_R4: return 256;  /* QK_K values per row */
         case GGUF_TYPE_Q5_0:  return 32;
@@ -876,6 +880,8 @@ int gguf_type_quant_size(gguf_type_t type) {
         case GGUF_TYPE_Q4_0:  return 18;
         case GGUF_TYPE_Q4_1:  return 20;
         case GGUF_TYPE_IQ4_NL: return 18;  /* same layout as Q4_0 */
+        case GGUF_TYPE_IQ2_K:    return (int)sizeof(block_iq2_k);  /* 76: single row */
+        case GGUF_TYPE_IQ3_K:    return (int)sizeof(block_iq3_k);  /* 110: single row */
         case GGUF_TYPE_IQ2_K_R4: return (int)sizeof(block_iq2_k_r4);  /* 304: 4 rows interleaved */
         case GGUF_TYPE_IQ3_K_R4: return (int)sizeof(block_iq3_k_r4);  /* 440: 4 rows interleaved */
         case GGUF_TYPE_Q5_0:  return 22;
@@ -8344,6 +8350,169 @@ void quantize_mat_q8_2_x4(const float *x, void *dst, int n, int row_stride) {
             }
         }
     }
+}
+
+/* ================================================================
+ * IQ2_K plain: single-row 2-bit non-linear quantization
+ * GGUF type 137. Ported from llama.cpp iqk_quantize.cpp
+ * ================================================================ */
+
+/* Scalar reference dequantize for IQ2_K plain (single row). */
+void dequantize_row_iq2_k(const void *src, float *dst, int n) {
+    const block_iq2_k *x = (const block_iq2_k *)src;
+    const int nb = n / QK_K;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = fp16_to_fp32_lookup(x[i].d);
+        const uint8_t *qs = x[i].qs;
+        uint16_t extra = x[i].extra;
+
+        int shift = 0;
+        for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+            float dl1 = d * ((x[i].scales[ib32] & 0xf) - 8);
+            float dl2 = d * ((x[i].scales[ib32] >> 4) - 8);
+            const int8_t *values1 = extra & 1 ? iq2nl_values + 4 : iq2nl_values;
+            const int8_t *values2 = extra & 2 ? iq2nl_values + 4 : iq2nl_values;
+            extra >>= 2;
+            for (int j = 0; j < 16; ++j) {
+                dst[j + 0]  = dl1 * values1[(qs[j + 0] >> shift) & 3];
+                dst[j + 16] = dl2 * values2[(qs[j + 16] >> shift) & 3];
+            }
+            dst += 32;
+            shift += 2;
+            if (shift == 8) { qs += 32; shift = 0; }
+        }
+    }
+}
+
+/* IQ2_K plain x Q8_K AVX2 GEMV (declared in sgemm_iq2_k.c) */
+extern void vec_dot_iq2_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out);
+
+float vec_dot_iq2_k_q8_k(const void *vx, const void *wy, int n) {
+#if defined(PICOLM_AVX2)
+    float result;
+    vec_dot_iq2_k_q8_k_avx2(vx, wy, n, &result);
+    return result;
+#else
+    /* Scalar fallback */
+    const block_iq2_k *x = (const block_iq2_k *)vx;
+    const block_q8_K *y = (const block_q8_K *)wy;
+    const int nb = n / QK_K;
+
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        const float d = fp16_to_fp32_lookup(x[i].d);
+        const uint8_t *qs = x[i].qs;
+        const int8_t *q8 = y[i].qs;
+        uint16_t extra = x[i].extra;
+        float q8_scale = y[i].d;
+        float sumi = 0.0f;
+
+        int shift = 0;
+        for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+            float dl1 = d * ((x[i].scales[ib32] & 0xf) - 8);
+            float dl2 = d * ((x[i].scales[ib32] >> 4) - 8);
+            const int8_t *values1 = extra & 1 ? iq2nl_values + 4 : iq2nl_values;
+            const int8_t *values2 = extra & 2 ? iq2nl_values + 4 : iq2nl_values;
+            extra >>= 2;
+            for (int j = 0; j < 16; ++j) {
+                sumi += dl1 * values1[(qs[j + 0] >> shift) & 3] * q8[j + 0];
+                sumi += dl2 * values2[(qs[j + 16] >> shift) & 3] * q8[j + 16];
+            }
+            q8 += 32;
+            shift += 2;
+            if (shift == 8) { qs += 32; shift = 0; }
+        }
+        sumf += sumi * q8_scale;
+    }
+    return sumf;
+#endif
+}
+
+/* ================================================================
+ * IQ3_K plain: single-row 3-bit non-linear quantization
+ * GGUF type 138. Ported from llama.cpp iqk_quantize.cpp
+ * ================================================================ */
+
+/* Scalar reference dequantize for IQ3_K plain (single row). */
+void dequantize_row_iq3_k(const void *src, float *dst, int n) {
+    const block_iq3_k *x = (const block_iq3_k *)src;
+    const int nb = n / QK_K;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = fp16_to_fp32_lookup(x[i].d);
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *qh = x[i].qh;
+
+        uint16_t sh = x[i].scales_h;
+        uint16_t extra = x[i].extra;
+
+        for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+            float dl1 = d * ((2 * (x[i].scales_l[ib32] & 0xf) + 1) * ((sh & 1) ? -1 : 1));
+            float dl2 = d * ((2 * (x[i].scales_l[ib32] >> 4) + 1) * ((sh & 2) ? -1 : 1));
+            sh >>= 2;
+            const int8_t *values1 = extra & 1 ? iq3nl_values + 8 : iq3nl_values;
+            const int8_t *values2 = extra & 2 ? iq3nl_values + 8 : iq3nl_values;
+            extra >>= 2;
+            int shift_l = 2 * (ib32 % 4);
+            int shift_h = ib32 % 8;
+            for (int j = 0; j < 16; ++j) {
+                dst[j + 0]  = dl1 * values1[((qs[j + 0] >> shift_l) & 3) | (((qh[j + 0] >> shift_h) & 1) << 2)];
+                dst[j + 16] = dl2 * values2[((qs[j + 16] >> shift_l) & 3) | (((qh[j + 16] >> shift_h) & 1) << 2)];
+            }
+            dst += 32;
+            if (shift_l == 6) qs += 32;
+        }
+    }
+}
+
+/* IQ3_K plain x Q8_K AVX2 GEMV (declared in sgemm_iq3_k.c) */
+extern void vec_dot_iq3_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out);
+
+float vec_dot_iq3_k_q8_k(const void *vx, const void *wy, int n) {
+#if defined(PICOLM_AVX2)
+    float result;
+    vec_dot_iq3_k_q8_k_avx2(vx, wy, n, &result);
+    return result;
+#else
+    /* Scalar fallback */
+    const block_iq3_k *x = (const block_iq3_k *)vx;
+    const block_q8_K *y = (const block_q8_K *)wy;
+    const int nb = n / QK_K;
+
+    float sumf = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        const float d = fp16_to_fp32_lookup(x[i].d);
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *qh = x[i].qh;
+        const int8_t *q8 = y[i].qs;
+        uint16_t sh = x[i].scales_h;
+        uint16_t extra = x[i].extra;
+        float q8_scale = y[i].d;
+        float sumi = 0.0f;
+
+        for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+            float dl1 = d * ((2 * (x[i].scales_l[ib32] & 0xf) + 1) * ((sh & 1) ? -1 : 1));
+            float dl2 = d * ((2 * (x[i].scales_l[ib32] >> 4) + 1) * ((sh & 2) ? -1 : 1));
+            sh >>= 2;
+            const int8_t *values1 = extra & 1 ? iq3nl_values + 8 : iq3nl_values;
+            const int8_t *values2 = extra & 2 ? iq3nl_values + 8 : iq3nl_values;
+            extra >>= 2;
+            int shift_l = 2 * (ib32 % 4);
+            int shift_h = ib32 % 8;
+            for (int j = 0; j < 16; ++j) {
+                int idx1 = ((qs[j + 0] >> shift_l) & 3) | (((qh[j + 0] >> shift_h) & 1) << 2);
+                int idx2 = ((qs[j + 16] >> shift_l) & 3) | (((qh[j + 16] >> shift_h) & 1) << 2);
+                sumi += dl1 * values1[idx1] * q8[j + 0];
+                sumi += dl2 * values2[idx2] * q8[j + 16];
+            }
+            q8 += 32;
+            if (shift_l == 6) qs += 32;
+        }
+        sumf += sumi * q8_scale;
+    }
+    return sumf;
+#endif
 }
 
 /* ================================================================

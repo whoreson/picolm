@@ -987,6 +987,24 @@ static void matmul_worker_f(matmul_task_t *t) {
             t->out[i] = vec_dot_q2_K_q8_K(
                 t->W + (size_t)i * t->row_bytes, qx, t->n);
         }
+    } else if (t->qtype == GGUF_TYPE_IQ2_K || t->qtype == GGUF_TYPE_IQ3_K) {
+        /* IQ2_K/IQ3_K plain: single-row blocks. Handle both batched and
+         * non-batched (decode) modes. */
+        if (nb > 0) {
+            for (int i = t->start; i < t->end; i++) {
+                const char *wrow = t->W + (size_t)i * t->row_bytes;
+                for (int b = 0; b < nb; b++) {
+                    t->out[b * out_stride + i] = vec_dot(wrow,
+                        (const float *)t->x + (size_t)b * t->n,
+                        t->n, t->qtype);
+                }
+            }
+        } else {
+            for (int i = t->start; i < t->end; i++) {
+                t->out[i] = vec_dot(t->W + (size_t)i * t->row_bytes,
+                                    t->x, t->n, t->qtype);
+            }
+        }
     } else {
         for (int i = t->start; i < t->end; i++) {
             t->out[i] = vec_dot(t->W + (size_t)i * t->row_bytes,

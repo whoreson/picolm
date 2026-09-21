@@ -440,6 +440,8 @@ typedef enum {
     GGUF_TYPE_Q4I_0_8_8  = 34,  /* 8-row pre-dequantized int8 Q4_0 (dpbusd lane order, AVX-512) */
     GGUF_TYPE_BF16      = 30,  /* Brain Float 16 (GGUF type 30) */
     GGUF_TYPE_IQ4_NL    = 20,  /* Non-linear 4-bit quant (LUT-based, same layout as Q4_0) */
+    GGUF_TYPE_IQ2_K     = 137, /* Plain IQ2_K (non-interleaved, GGUF type 137) */
+    GGUF_TYPE_IQ3_K     = 138, /* Plain IQ3_K (non-interleaved, GGUF type 138) */
     GGUF_TYPE_IQ2_K_R4  = 337, /* 4-row interleaved IQ2_K (repacked, AVX-512/AVX2 target) */
     GGUF_TYPE_IQ3_K_R4  = 338, /* 4-row interleaved IQ3_K (repacked, AVX-512/AVX2 target) */
     GGUF_TYPE_Q1_0       = 41,  /* 1-bit sign + scale, 128 values/block */
@@ -723,6 +725,44 @@ typedef char __compiletime_assert_iq4_nl_size[(sizeof(block_iq4_nl) == sizeof(bl
 /* IQ4_NL dequantization lookup table (16 entries, int8) */
 /* Derived from llama.cpp ggml-common.h GGML_TABLE_BEGIN(int8_t, kvalues_iq4nl, 16) */
 extern const int8_t kvalues_iq4nl[16];
+
+/* IQ2_K plain block (GGUF type 137): single-row 2-bit non-linear quant.
+ * Size: 76 bytes per block (QK_K=256 values).
+ *
+ * Layout (from ik_llama.cpp ggml-common.h):
+ *   d:      FP16 global scale (2 bytes)
+ *   extra:  16 bits, 2 bits per 32-value subblock (LUT table select) (2 bytes)
+ *   scales: 8 bytes, 4-bit signed scales (2 per byte, offset by -8)
+ *   qs:     64 bytes, 2-bit values (4 per byte)
+ */
+#pragma pack(push, 1)
+typedef struct PICOLM_PACKED_ATTR {
+    uint16_t d;              /* FP16 global scale */
+    uint16_t extra;          /* LUT table selection (2 bits per subblock) */
+    uint8_t  scales[8];      /* 16 packed 4-bit signed scales (2 per byte) */
+    uint8_t  qs[64];         /* 256 packed 2-bit values (4 per byte) */
+} block_iq2_k;              /* 76 bytes */
+
+/* IQ3_K plain block (GGUF type 138): single-row 3-bit non-linear quant.
+ * Size: 110 bytes per block (QK_K=256 values).
+ *
+ * Layout (from ik_llama.cpp ggml-common.h):
+ *   d:        FP16 global scale (2 bytes)
+ *   extra:    16 bits, 2 bits per 32-value subblock (LUT table select) (2 bytes)
+ *   scales_h: 16 bits, sign bits for 8 scale pairs (1=pos, 0=neg) (2 bytes)
+ *   scales_l: 8 bytes, 4-bit magnitude per scale (2 per byte)
+ *   qs:       64 bytes, 2-bit low values (4 per byte)
+ *   qh:       32 bytes, 1 high bit per value (8 per byte)
+ */
+#pragma pack(push, 1)
+typedef struct PICOLM_PACKED_ATTR {
+    uint16_t d;              /* FP16 global scale */
+    uint16_t extra;          /* LUT table selection (2 bits per subblock) */
+    uint16_t scales_h;       /* Sign bits (16 bits, 1 per scale) */
+    uint8_t  scales_l[8];    /* 4-bit magnitude scales (2 per byte) */
+    uint8_t  qs[64];         /* 2-bit low values (4 per byte) */
+    uint8_t  qh[32];         /* 1 high bit per value (8 per byte) */
+} block_iq3_k;              /* 110 bytes */
 
 /* IQ2_K_R4 block: 4 rows of IQ2_K repacked together for SIMD efficiency.
  * GGUF type 337. Size = 4 * sizeof(block_iq2_k) = 304 bytes.
@@ -1010,6 +1050,32 @@ void quantize_row_q8_2(const float *x, void *dst, int n);
 /* Convert F32 activations to Q8_2_x4 interleaved format (4 rows).
  * dst must have space for (n/32) * sizeof(block_q8_2_x4) bytes per group. */
 void quantize_mat_q8_2_x4(const float *x, void *dst, int n, int row_stride);
+
+/* IQ2_K plain * Q8_K dot product: single-row IQ2_K weights with pre-quantized Q8_K input.
+ * n must be a multiple of 256 (QK_K). */
+float vec_dot_iq2_k_q8_k(const void *vx, const void *wy, int n);
+/* IQ2_K plain dequantize: scalar reference. dst must have space for n floats. */
+void dequantize_row_iq2_k(const void *src, float *dst, int n);
+/* IQ2_K plain x Q8_K AVX2 GEMV. out: 1 float. n must be multiple of 256. */
+void vec_dot_iq2_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out);
+/* IQ2_K plain x Q8_K batched GEMM (AVX2). */
+int sgemm_iq2_k_q8_k_avx2(int nrows, int ncols, int k,
+                            const void *vx, const void *vy,
+                            float *out, size_t bs,
+                            int ith, int nth);
+
+/* IQ3_K plain * Q8_K dot product: single-row IQ3_K weights with pre-quantized Q8_K input.
+ * n must be a multiple of 256 (QK_K). */
+float vec_dot_iq3_k_q8_k(const void *vx, const void *wy, int n);
+/* IQ3_K plain dequantize: scalar reference. dst must have space for n floats. */
+void dequantize_row_iq3_k(const void *src, float *dst, int n);
+/* IQ3_K plain x Q8_K AVX2 GEMV. out: 1 float. n must be multiple of 256. */
+void vec_dot_iq3_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out);
+/* IQ3_K plain x Q8_K batched GEMM (AVX2). */
+int sgemm_iq3_k_q8_k_avx2(int nrows, int ncols, int k,
+                            const void *vx, const void *vy,
+                            float *out, size_t bs,
+                            int ith, int nth);
 
 /* IQ2_K_R4 * Q8_K dot product: IQ2_K_R4 weights (4-row interleaved) with pre-quantized Q8_K input
  * Returns dot product for a single row. Use vec_dot_iq2_k_r4_q8_k_batch4() for 4 rows.
