@@ -17,6 +17,20 @@ const int8_t kvalues_iq4nl[16] = {
 };
 
 /* ================================================================
+ * IQ2_K non-linear values table (8 entries, int8)
+ * Derived from llama.cpp ggml-common.h GGML_TABLE_BEGIN(int8_t, iq2nl_values, 8)
+ * Normal table (indices 0-3): {-31, -13, 1, 17}
+ * Shifted table (indices 4-7): {-26, -8, 6, 22}
+ * ================================================================ */
+const int8_t iq2nl_values[8] = { -31, -13, 1, 17,  -26, -8, 6, 22 };
+
+/* IQ2_K_R4 constant: QK_K = 256 (standard K-quant block size) */
+#define QK_K 256
+
+/* Forward decl for vec_dot path */
+static void dequantize_row_iq2_k_r4_single(const block_iq2_k_r4 *x, float *dst, int n, int row);
+
+/* ================================================================
  * FP16 <-> FP32 lookup table (mirrors llama.cpp's ggml_table_f32_f16)
  *
  * 64KB table initialized once at startup. Each entry maps a uint16_t
@@ -394,6 +408,44 @@ void dequantize_row_q6_K(const void *src, float *dst, int n) {
     }
 }
 
+/* Q6_K_R4 dequantize: 4 interleaved rows of 256 values, 840 bytes/block group.
+ * Ported bit-for-bit from ik_llama.cpp's dequantize_row_q6_k_r4()
+ * (ggml/src/iqk/iqk_quantize.cpp). n = elements per logical row (multiple
+ * of 256); dst must hold 4*n floats, row k at dst + k*n. */
+void dequantize_row_q6_K_R4(const void *src, float *dst, int n) {
+    const block_q6_K_R4 *x = (const block_q6_K_R4 *)src;
+    const int nb = n / 256;
+
+    for (int k = 0; k < 4; k++) {
+        float *yk = dst + k * n;
+        for (int ibl = 0; ibl < nb; ibl++) {
+            const float d = fp16_to_fp32_lookup(x[ibl].d[k]);
+            const uint8_t *ql = x[ibl].ql;
+            const uint8_t *qh = x[ibl].qh;
+            float *y = yk + ibl * 256;
+
+            for (int ib = 0; ib < 8; ib++) {
+                const float dl1 = d * (float)x[ibl].scales[8 * ib + k + 0];
+                const float dl2 = d * (float)x[ibl].scales[8 * ib + k + 4];
+                float *yp = y + ib * 32;
+
+                for (int i = 0; i < 4; i++) {
+                    yp[i +  0] = dl1 * (float)(((ql[4 * k + i +  0] & 0xf) | ((qh[4 * k + i +  0] << 4) & 0x30)) - 32);
+                    yp[i +  8] = dl1 * (float)(((ql[4 * k + i +  0] >> 4)  | ((qh[4 * k + i +  0] << 2) & 0x30)) - 32);
+                    yp[i + 16] = dl2 * (float)(((ql[4 * k + i + 16] & 0xf) | ((qh[4 * k + i + 16] << 4) & 0x30)) - 32);
+                    yp[i + 24] = dl2 * (float)(((ql[4 * k + i + 16] >> 4)  | ((qh[4 * k + i + 16] << 2) & 0x30)) - 32);
+                    yp[i +  4] = dl1 * (float)(((ql[4 * k + i + 32] & 0xf) | ((qh[4 * k + i +  0] >> 0) & 0x30)) - 32);
+                    yp[i + 12] = dl1 * (float)(((ql[4 * k + i + 32] >> 4)  | ((qh[4 * k + i +  0] >> 2) & 0x30)) - 32);
+                    yp[i + 20] = dl2 * (float)(((ql[4 * k + i + 48] & 0xf) | ((qh[4 * k + i + 16] >> 0) & 0x30)) - 32);
+                    yp[i + 28] = dl2 * (float)(((ql[4 * k + i + 48] >> 4)  | ((qh[4 * k + i + 16] >> 2) & 0x30)) - 32);
+                }
+                ql += 64;
+                qh += 32;
+            }
+        }
+    }
+}
+
 /* Q6_0 dequantize: 32 values per block, 6-bit signed [-32..31] + FP16 scale.
  * Ported from llama.cpp ggml-quants.c dequantize_row_q6_0.
  *
@@ -756,9 +808,11 @@ void dequantize_row(const void *src, float *dst, int n, gguf_type_t type) {
         case GGUF_TYPE_Q2_0:     dequantize_row_q2_0(src, dst, n); break;
         case GGUF_TYPE_Q6_0:     dequantize_row_q6_0(src, dst, n); break;
         case GGUF_TYPE_IQ4_NL:   dequantize_row_iq4_nl(src, dst, n); break;
-        case GGUF_TYPE_Q4_0_R8:  dequantize_row_q4_0_r8(src, dst, n); break;
+case GGUF_TYPE_Q4_0_R8:  dequantize_row_q4_0_r8(src, dst, n); break;
         case GGUF_TYPE_Q8_0_R8:  dequantize_row_q8_0_r8(src, dst, n); break;
         case GGUF_TYPE_Q8_K_R8:  dequantize_row_q8_k_r8(src, dst, n); break;
+        case GGUF_TYPE_IQ2_K_R4: dequantize_row_iq2_k_r4(src, dst, n); break;
+        case GGUF_TYPE_Q6_K_R4:  dequantize_row_q6_K_R4(src, dst, n); break;
         default:
             fprintf(stderr, "dequantize_row: unsupported type %d\n", type);
             exit(1);
@@ -774,6 +828,7 @@ int gguf_type_block_size(gguf_type_t type) {
         case GGUF_TYPE_Q4_0:  return 32;
         case GGUF_TYPE_Q4_1:  return 32;
         case GGUF_TYPE_IQ4_NL: return 32;
+        case GGUF_TYPE_IQ2_K_R4: return 256;  /* QK_K values per row */
         case GGUF_TYPE_Q5_0:  return 32;
         case GGUF_TYPE_Q5_1:  return 32;
         case GGUF_TYPE_Q8_0:  return 32;
@@ -795,6 +850,7 @@ int gguf_type_block_size(gguf_type_t type) {
         case GGUF_TYPE_Q4_0_R8:  return 32;  /* same as Q4_0_8_8: 32 values per row */
         case GGUF_TYPE_Q8_0_R8:  return 32;  /* 32 values per row */
         case GGUF_TYPE_Q8_K_R8:  return 256; /* same as Q8_K: 256 values per row */
+        case GGUF_TYPE_Q6_K_R4:  return 256; /* same as Q6_K: 256 values per row */
         default: return 0;
     }
 }
@@ -806,6 +862,7 @@ int gguf_type_quant_size(gguf_type_t type) {
         case GGUF_TYPE_Q4_0:  return 18;
         case GGUF_TYPE_Q4_1:  return 20;
         case GGUF_TYPE_IQ4_NL: return 18;  /* same layout as Q4_0 */
+        case GGUF_TYPE_IQ2_K_R4: return (int)sizeof(block_iq2_k_r4);  /* 304: 4 rows interleaved */
         case GGUF_TYPE_Q5_0:  return 22;
         case GGUF_TYPE_Q5_1:  return 24;
         case GGUF_TYPE_Q8_0:  return 34;
@@ -827,6 +884,7 @@ int gguf_type_quant_size(gguf_type_t type) {
         case GGUF_TYPE_Q4_0_R8:  return (int)sizeof(block_q4_0);  /* 18: per-row block size */
         case GGUF_TYPE_Q8_0_R8:  return (int)sizeof(block_q8_0);   /* 34: same per-row stride as Q8_0 */
         case GGUF_TYPE_Q8_K_R8:  return (int)(sizeof(block_q8_k_r8) / 8); /* 258: per-row block size */
+        case GGUF_TYPE_Q6_K_R4:  return (int)sizeof(block_q6_K);  /* 210: per-row block size (840/4) */
         default: return 0;
     }
 }
@@ -835,6 +893,12 @@ size_t gguf_type_row_size(gguf_type_t type, int n) {
     int bs = gguf_type_block_size(type);
     int qs = gguf_type_quant_size(type);
     if (bs == 0 || qs == 0) return 0;
+    /* IQ2_K_R4: 4 rows per block. Each block = 304 bytes, covers 4 rows x 256 values.
+     * Row stride = block_size * (n / QK_K) / 4 = 304 * (n/256) / 4.
+     * This is the number of bytes from row i to row i+1. */
+    if (type == GGUF_TYPE_IQ2_K_R4) {
+        return (size_t)sizeof(block_iq2_k_r4) * (size_t)(n / QK_K) / 4;
+    }
     /* Compute full row size including partial blocks: qs * n / bs.
      * The GGUF stores tensors as flat block arrays. For non-block-aligned
      * dimensions (e.g. n=960 with bs=256), the row stride includes the
@@ -1698,6 +1762,169 @@ float vec_dot_q6_K_q8_K(const void *src_q6, const void *src_q8, int n) {
         sumf += d * (float)block_sum;
     }
     return sumf;
+#endif
+}
+
+/* ================================================================
+ * vec_dot_q6_K_R4_q8_K: Q6_K_R4 (4-row interleaved) GEMV against Q8_K.
+ *
+ * Processes one block group (4 interleaved weight rows) against one
+ * Q8_K-quantized activation row, writing 4 output floats (one per row).
+ * This mirrors ik_llama.cpp's mul_mat_q6_k_r4_q8_k (nrc_y==1 case),
+ * ggml/src/iqk/iqk_gemm_kquants.cpp, using the portable AVX2 maddubs/madd
+ * path (no VNNI/AVX-512 dependency). The bias correction trick is the same
+ * one used by vec_dot_q6_K_q8_K above: unsigned MAC on the [0..63]-range
+ * dequantized 6-bit codes, then subtract 32 * bsums * scale (computed via
+ * the block's precomputed per-16-element bsums).
+ * ================================================================ */
+
+#if defined(PICOLM_AVX2)
+/* Reorders 16 int8 scale bytes (widened to int16) from Q6_K_R4's natural
+ * row-interleaved order (index % 4 == row) into per-row-pair groups, so
+ * that after extracting the two 128-bit lanes we get 2 rows' worth of
+ * 8 consecutive per-sub-block scales in the low lane and the other 2 rows'
+ * in the high lane. Ported from ik_llama.cpp's k_shuff table
+ * (iqk_gemm_kquants.cpp, mul_mat_q6_k_r4_q8_k). */
+static const uint8_t q6_k_r4_scale_shuffle[32] = {
+    0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15,
+    0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15,
+};
+#endif
+
+void vec_dot_q6_K_R4_q8_K(const void *vx, const void *vy, int n, float *out) {
+    const block_q6_K_R4 *x = (const block_q6_K_R4 *)vx;
+    const block_q8_K *y = (const block_q8_K *)vy;
+    const int nbl = n / 256;
+
+#if defined(PICOLM_AVX2)
+    const __m256i m4  = _mm256_set1_epi8(0x0f);
+    const __m256i m30 = _mm256_set1_epi8(0x30);
+    const __m256i m1  = _mm256_set1_epi16(1);
+    const __m256i shuff = _mm256_loadu_si256((const __m256i *)q6_k_r4_scale_shuffle);
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int ibl = 0; ibl < nbl; ibl++) {
+        /* 4 per-row weight deltas, broadcast into both 128-bit lanes, then
+         * pre-multiplied by this activation row's Q8_K delta (nrc_y==1
+         * specialization: fold q8 scale into d4 up front). */
+        const __m128 dl = _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *)x[ibl].d));
+        __m256 d4 = _mm256_set_m128(dl, dl);
+        d4 = _mm256_mul_ps(d4, _mm256_set1_ps(y[ibl].d));
+
+        /* ---- bias correction: -32 * bsums * scale, one term per 16-elem
+         * sub-block, summed via madd against the shuffled per-row scales ---- */
+        const __m256 dmin = _mm256_mul_ps(d4, _mm256_set1_ps(-32.0f));
+
+        __m256i t1 = _mm256_shuffle_epi8(_mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(x[ibl].scales +  0))), shuff);
+        __m256i t2 = _mm256_shuffle_epi8(_mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(x[ibl].scales + 16))), shuff);
+        __m256i t3 = _mm256_shuffle_epi8(_mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(x[ibl].scales + 32))), shuff);
+        __m256i t4 = _mm256_shuffle_epi8(_mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(x[ibl].scales + 48))), shuff);
+
+        __m256i s1 = _mm256_set_m128i(_mm256_extracti128_si256(t3, 0), _mm256_extracti128_si256(t1, 0));
+        __m256i s2 = _mm256_set_m128i(_mm256_extracti128_si256(t3, 1), _mm256_extracti128_si256(t1, 1));
+        __m256i s3 = _mm256_set_m128i(_mm256_extracti128_si256(t4, 0), _mm256_extracti128_si256(t2, 0));
+        __m256i s4 = _mm256_set_m128i(_mm256_extracti128_si256(t4, 1), _mm256_extracti128_si256(t2, 1));
+
+        const __m256i bsums = _mm256_loadu_si256((const __m256i *)y[ibl].bsums);
+        __m256i sumi = _mm256_setzero_si256();
+        sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(s1, _mm256_shuffle_epi32(bsums, 0x00)));
+        sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(s2, _mm256_shuffle_epi32(bsums, 0x55)));
+        sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(s3, _mm256_shuffle_epi32(bsums, 0xaa)));
+        sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(s4, _mm256_shuffle_epi32(bsums, 0xff)));
+        acc = _mm256_fmadd_ps(dmin, _mm256_cvtepi32_ps(sumi), acc);
+
+        /* ---- main MAC: unsigned 6-bit codes (0..63) times signed Q8_K,
+         * scaled per sub-block (8 groups of 32 values) ---- */
+        const uint32_t *scales_u32 = (const uint32_t *)x[ibl].scales;
+        const uint8_t *ql = x[ibl].ql;
+        const uint8_t *qh = x[ibl].qh;
+        const int8_t  *q8 = y[ibl].qs;
+
+        for (int ib = 0; ib < 8; ib++) {
+            /* 8 consecutive scale bytes = [row0..3 dl1, row0..3 dl2] for
+             * this sub-block pair (matches the "scales[8*ib+k+{0,4}]"
+             * packing used by dequantize_row_q6_K_R4 / repack_q6_k). */
+            __m256i iscales = _mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)(scales_u32 + 2 * ib)));
+            __m256 scales_f = _mm256_mul_ps(d4, _mm256_cvtepi32_ps(iscales));
+
+            __m256i lbits1 = _mm256_loadu_si256((const __m256i *)(ql + 0));
+            __m256i lbits2 = _mm256_loadu_si256((const __m256i *)(ql + 32));
+            __m256i hbits  = _mm256_loadu_si256((const __m256i *)qh);
+
+            __m256i qx0 = _mm256_or_si256(_mm256_and_si256(lbits1, m4), _mm256_and_si256(m30, _mm256_slli_epi16(hbits, 4)));
+            __m256i qx1 = _mm256_or_si256(_mm256_and_si256(lbits2, m4), _mm256_and_si256(m30, hbits));
+            __m256i qx2 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(lbits1, 4), m4), _mm256_and_si256(m30, _mm256_slli_epi16(hbits, 2)));
+            __m256i qx3 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(lbits2, 4), m4), _mm256_and_si256(m30, _mm256_srli_epi16(hbits, 2)));
+
+            __m256i yv = _mm256_loadu_si256((const __m256i *)q8);
+
+            __m256i sumi1 = _mm256_add_epi16(_mm256_maddubs_epi16(qx0, _mm256_shuffle_epi32(yv, 0x00)),
+                                              _mm256_maddubs_epi16(qx1, _mm256_shuffle_epi32(yv, 0x55)));
+            __m256i sumi2 = _mm256_add_epi16(_mm256_maddubs_epi16(qx2, _mm256_shuffle_epi32(yv, 0xaa)),
+                                              _mm256_maddubs_epi16(qx3, _mm256_shuffle_epi32(yv, 0xff)));
+            __m256i sumi_ib = _mm256_add_epi32(_mm256_madd_epi16(m1, sumi1), _mm256_madd_epi16(m1, sumi2));
+            acc = _mm256_fmadd_ps(scales_f, _mm256_cvtepi32_ps(sumi_ib), acc);
+
+            ql += 64;
+            qh += 32;
+            q8 += 32;
+        }
+    }
+
+    /* acc holds 8 lanes = [row0..3, row0..3] (both halves accumulated the
+     * same 4 logical rows across different sub-block groups); fold down
+     * to 4 floats. */
+    const __m128 lo = _mm256_castps256_ps128(acc);
+    const __m128 hi = _mm256_extractf128_ps(acc, 1);
+    _mm_storeu_ps(out, _mm_add_ps(lo, hi));
+
+#else
+    /* Portable scalar fallback: direct per-element dequantize + multiply,
+     * matching dequantize_row_q6_K_R4 exactly, computed once for all 4
+     * rows in a single pass over each block group. */
+    for (int k = 0; k < 4; k++) out[k] = 0.0f;
+
+    for (int ibl = 0; ibl < nbl; ibl++) {
+        const uint8_t *ql = x[ibl].ql;
+        const uint8_t *qh = x[ibl].qh;
+        const int8_t  *q8 = y[ibl].qs;
+        const float q8d = y[ibl].d;
+
+        for (int k = 0; k < 4; k++) {
+            const float d = q8d * fp16_to_fp32_lookup(x[ibl].d[k]);
+            const uint8_t *qlk = ql;
+            const uint8_t *qhk = qh;
+            const int8_t  *q8c = q8;
+            int block_sum = 0;
+
+            for (int ib = 0; ib < 8; ib++) {
+                const int s0 = x[ibl].scales[8 * ib + k + 0];
+                const int s1 = x[ibl].scales[8 * ib + k + 4];
+
+                for (int i = 0; i < 4; i++) {
+                    const uint8_t ql0 = qlk[4 * k + i +  0];
+                    const uint8_t ql1 = qlk[4 * k + i + 16];
+                    const uint8_t ql2 = qlk[4 * k + i + 32];
+                    const uint8_t ql3 = qlk[4 * k + i + 48];
+                    const uint8_t qh0 = qhk[4 * k + i +  0];
+                    const uint8_t qh1 = qhk[4 * k + i + 16];
+
+                    block_sum += s0 * (int)(((ql0 & 0xf) | ((qh0 << 4) & 0x30)) - 32) * q8c[i +  0];
+                    block_sum += s0 * (int)(((ql0 >> 4)  | ((qh0 << 2) & 0x30)) - 32) * q8c[i +  8];
+                    block_sum += s1 * (int)(((ql1 & 0xf) | ((qh1 << 4) & 0x30)) - 32) * q8c[i + 16];
+                    block_sum += s1 * (int)(((ql1 >> 4)  | ((qh1 << 2) & 0x30)) - 32) * q8c[i + 24];
+                    block_sum += s0 * (int)(((ql2 & 0xf) | ((qh0 >> 0) & 0x30)) - 32) * q8c[i +  4];
+                    block_sum += s0 * (int)(((ql2 >> 4)  | ((qh0 >> 2) & 0x30)) - 32) * q8c[i + 12];
+                    block_sum += s1 * (int)(((ql3 & 0xf) | ((qh1 >> 0) & 0x30)) - 32) * q8c[i + 20];
+                    block_sum += s1 * (int)(((ql3 >> 4)  | ((qh1 >> 2) & 0x30)) - 32) * q8c[i + 28];
+                }
+                qlk += 64;
+                qhk += 32;
+                q8c += 32;
+            }
+            out[k] += d * (float)block_sum;
+        }
+    }
 #endif
 }
 
@@ -6676,7 +6903,7 @@ float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
             dequantize_row_q4i_0_8_8(src, q4i_tmp, n > 256 ? 256 : n);
             return vec_dot_f32_f32(q4i_tmp, x, n > 256 ? 256 : n);
         }
-        case GGUF_TYPE_Q4_0_R8: {
+case GGUF_TYPE_Q4_0_R8: {
             /* Q4_0_R8: dequantize row 0 of the 8-row group, then f32 dot.
              * For rows 1-7, the caller must use the 8-row group path. */
             float q4r_tmp[256];
@@ -6688,6 +6915,32 @@ float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
             float q8r_tmp[256];
             dequantize_row_q8_k_r8(src, q8r_tmp, n);
             return vec_dot_f32_f32(q8r_tmp, x, n);
+        }
+        case GGUF_TYPE_IQ2_K_R4: {
+            /* IQ2_K_R4: 4-row interleaved. This vec_dot path is for single-row
+             * decode (matmul). The weight pointer is already at the right block
+             * (the caller uses i/4 * row_bytes). We dequantize row (i%4).
+             * But vec_dot() doesn't know i%4. The matmul() caller handles this
+             * by using the batch4 path below. For fallback, dequantize row 0. */
+            float iq2_tmp[1024];
+            dequantize_row_iq2_k_r4_single((const block_iq2_k_r4 *)src, iq2_tmp, n, 0);
+            return vec_dot_f32_f32(iq2_tmp, x, n);
+        }
+        case GGUF_TYPE_Q6_K_R4: {
+            /* Q6_K_R4: dequantize row 0 of the 4-row group, then f32 dot.
+             * For rows 1-3, the caller must use the 4-row group path
+             * (vec_dot_q6_K_R4_q8_K / sgemm_q6_k_r4_q8_k) -- this generic
+             * entry only exists as a safe fallback for row 0 / F32
+             * activations, same convention as Q4_0_R8 and Q8_K_R8 above.
+             * dequantize_row_q6_K_R4 writes all 4 interleaved rows
+             * (4*n floats, row k at buf+k*n); only row 0 (buf[0..n-1])
+             * is used here. */
+            float q6r_tmp[1024];
+            float *buf = ((size_t)4 * n <= 1024) ? q6r_tmp : (float *)malloc((size_t)4 * n * sizeof(float));
+            dequantize_row_q6_K_R4(src, buf, n);
+            float r = vec_dot_f32_f32(buf, x, n);
+            if (buf != q6r_tmp) free(buf);
+            return r;
         }
         case GGUF_TYPE_F16:  return vec_dot_f16_f32(src, x, n);
         case GGUF_TYPE_BF16: return vec_dot_bf16_f32(src, x, n);
@@ -8068,6 +8321,39 @@ void quantize_mat_q8_2_x4(const float *x, void *dst, int n, int row_stride) {
 }
 
 /* ================================================================
+ * IQ2_K_R4: 4-row interleaved 2-bit non-linear quantization
+ * GGUF type 337. Ported from llama.cpp iqk_gemm_iqk_quants.cpp
+ * ================================================================ */
+
+/* Scalar reference dequantize for a single row from IQ2_K_R4 block. */
+static void dequantize_row_iq2_k_r4_single(const block_iq2_k_r4 *x, float *dst, int n, int row) {
+    const int nblocks = n / QK_K;
+    for (int ibl = 0; ibl < nblocks; ibl++) {
+        const float d = fp16_to_fp32_lookup(x[ibl].d[row]);
+        const uint8_t *ql = x[ibl].qs;
+        for (int ib = 0; ib < QK_K / 32; ib++) {
+            int is = 8 * ib + row;
+            const float dl1 = d * (((x[ibl].scales[is % 32] >> (4 * (is / 32))) & 0xf) - 8);
+            int is2 = is + 4;
+            const float dl2 = d * (((x[ibl].scales[is2 % 32] >> (4 * (is2 / 32))) & 0xf) - 8);
+            const int8_t *values1 = iq2nl_values + (x[ibl].extra[row + 0] & (1 << ib) ? 4 : 0);
+            const int8_t *values2 = iq2nl_values + (x[ibl].extra[row + 4] & (1 << ib) ? 4 : 0);
+            for (int i = 0; i < 4; i++) {
+                dst[QK_K * ibl + 32 * ib + i + 0]  = dl1 * values1[(ql[4 * row + i + 0] >> 0) & 3];
+                dst[QK_K * ibl + 32 * ib + i + 4]  = dl1 * values1[(ql[4 * row + i + 0] >> 2) & 3];
+                dst[QK_K * ibl + 32 * ib + i + 8]  = dl1 * values1[(ql[4 * row + i + 0] >> 4) & 3];
+                dst[QK_K * ibl + 32 * ib + i + 12] = dl1 * values1[(ql[4 * row + i + 0] >> 6) & 3];
+                dst[QK_K * ibl + 32 * ib + i + 16] = dl2 * values2[(ql[4 * row + i + 16] >> 0) & 3];
+                dst[QK_K * ibl + 32 * ib + i + 20] = dl2 * values2[(ql[4 * row + i + 16] >> 2) & 3];
+                dst[QK_K * ibl + 32 * ib + i + 24] = dl2 * values2[(ql[4 * row + i + 16] >> 4) & 3];
+                dst[QK_K * ibl + 32 * ib + i + 28] = dl2 * values2[(ql[4 * row + i + 16] >> 6) & 3];
+            }
+            ql += 32;
+        }
+    }
+}
+
+/* ================================================================
  * Q4_0_R8 (GGUF type 202): 8-row interleaved Q4_0.
  * Layout is identical to block_q4_0x8 (already defined).
  * ================================================================ */
@@ -8259,4 +8545,64 @@ void dequantize_row_q8_k_r8(const void *src, float *dst, int n) {
             }
         }
     }
+}
+
+void dequantize_row_iq2_k_r4(const void *src, float *dst, int n) {
+    dequantize_row_iq2_k_r4_single((const block_iq2_k_r4 *)src, dst, n, 0);
+}
+
+float vec_dot_iq2_k_r4_q8_k(const void *vx, const void *vy, int n) {
+    float result;
+    vec_dot_iq2_k_r4_q8_k_batch4(vx, vy, n, &result);
+    return result;
+}
+
+void vec_dot_iq2_k_r4_q8_k_batch4(const void *vx, const void *vy, int n, float *out) {
+#if defined(PICOLM_AVX2)
+    /* AVX2 path: call the optimized kernel from sgemm_iq2_k_r4.c */
+    vec_dot_iq2_k_r4_q8_k_avx2(vx, vy, n, out, 4);
+#else
+    /* Scalar fallback: each row processes independently. */
+    const block_iq2_k_r4 *iq2 = (const block_iq2_k_r4 *)vx;
+    const block_q8_K *y = (const block_q8_K *)vy;
+    const int nblocks = n / QK_K;
+
+    for (int iy = 0; iy < 4; iy++) {
+        float sumf = 0.0f;
+        for (int ibl = 0; ibl < nblocks; ibl++) {
+            float d = fp16_to_fp32_lookup(iq2[ibl].d[iy]);
+            float q8_scale = y[ibl].d;
+            const uint8_t *ql = iq2[ibl].qs;
+            const int8_t *q8 = y[ibl].qs;
+            float sumi = 0.0f;
+            for (int ib = 0; ib < QK_K / 32; ib++) {
+                int is1 = 8 * ib + iy;
+                int is2 = is1 + 4;
+                int8_t s1 = (int8_t)((iq2[ibl].scales[is1 % 32] >> (4 * (is1 / 32))) & 0xf) - 8;
+                int8_t s2 = (int8_t)((iq2[ibl].scales[is2 % 32] >> (4 * (is2 / 32))) & 0xf) - 8;
+                float dl1 = d * s1;
+                float dl2 = d * s2;
+                const int8_t *values1 = iq2nl_values + (iq2[ibl].extra[iy + 0] & (1 << ib) ? 4 : 0);
+                const int8_t *values2 = iq2nl_values + (iq2[ibl].extra[iy + 4] & (1 << ib) ? 4 : 0);
+
+                for (int i = 0; i < 4; i++) {
+                    uint8_t byte_lo = ql[4 * iy + i + 0];
+                    uint8_t byte_hi = ql[4 * iy + i + 16];
+                    int base = 32 * ib + i;
+                    sumi += dl1 * values1[(byte_lo >> 0) & 3] * q8[base + 0];
+                    sumi += dl1 * values1[(byte_lo >> 2) & 3] * q8[base + 4];
+                    sumi += dl1 * values1[(byte_lo >> 4) & 3] * q8[base + 8];
+                    sumi += dl1 * values1[(byte_lo >> 6) & 3] * q8[base + 12];
+                    sumi += dl2 * values2[(byte_hi >> 0) & 3] * q8[base + 16];
+                    sumi += dl2 * values2[(byte_hi >> 2) & 3] * q8[base + 20];
+                    sumi += dl2 * values2[(byte_hi >> 4) & 3] * q8[base + 24];
+                    sumi += dl2 * values2[(byte_hi >> 6) & 3] * q8[base + 28];
+                }
+                ql += 32;
+            }
+            sumf += sumi * q8_scale;
+        }
+        out[iy] += sumf;
+    }
+#endif
 }
