@@ -446,6 +446,7 @@ typedef enum {
     GGUF_TYPE_Q6_0       = 133, /* 6-bit values + FP16 scale, 32 values/block (legacy GGML) */
     GGUF_TYPE_Q4_0_R8    = 202, /* 8-row interleaved Q4_0 (GGUF type 202, llama.cpp ik branch) */
     GGUF_TYPE_Q8_0_R8    = 203, /* 8-row interleaved Q8_0 (GGUF type 203) */
+    GGUF_TYPE_Q6_K_R4    = 214, /* 4-row interleaved Q6_K (GGUF type 214, llama.cpp ik branch) */
     GGUF_TYPE_Q8_K_R8    = 399, /* 8-row interleaved Q8_K (GGUF type 399, llama.cpp ik branch) */
 } gguf_type_t;
 
@@ -677,6 +678,22 @@ typedef struct PICOLM_PACKED_ATTR {
 } block_q6_K;            /* 210 bytes */
 #pragma pack(pop)
 
+/* Q6_K_R4 block: 4 interleaved Q6_K rows of 256 weights each, 840 bytes.
+ * Matches llama.cpp ik branch's block_q6_k_r4 (ggml-common.h) field order
+ * and byte layout exactly (see repack_q6_k()/dequantize_row_q6_k_r4()).
+ * quant_size for this type is defined as sizeof(block_q6_K) (210, the
+ * per-row-equivalent byte count), matching the GGUF_TYPE_Q4_0_R8 convention:
+ * gguf_type_row_size() then naturally lines up row i's byte offset with the
+ * base of block group i/4 whenever i is a multiple of 4. */
+#pragma pack(push, 1)
+typedef struct PICOLM_PACKED_ATTR {
+    uint16_t d[4];       /* super-block scale (FP16), one per row */
+    int8_t   scales[64]; /* 8-bit scales, interleaved: scales[8*ib+k+{0,4}] */
+    uint8_t  qh[256];    /* high 2 bits of quants, interleaved across rows */
+    uint8_t  ql[512];    /* low 4 bits of quants, interleaved across rows */
+} block_q6_K_R4;         /* 840 bytes */
+#pragma pack(pop)
+
 /* Q4_0 block: 32 weights */
 #pragma pack(push, 1)
 typedef struct PICOLM_PACKED_ATTR {
@@ -808,6 +825,11 @@ void dequantize_row_q3_K(const void *src, float *dst, int n);
 void dequantize_row_q2_K(const void *src, float *dst, int n);
 void dequantize_row_q8_0(const void *src, float *dst, int n);
 void dequantize_row_q6_K(const void *src, float *dst, int n);
+/* Dequantize one Q6_K_R4 block group (4 interleaved rows) to F32.
+ * src has (n/256) block_q6_K_R4 blocks. n = elements per logical row
+ * (must be a multiple of 256). dst must hold 4*n floats, row-major
+ * (row k at dst + k*n), matching the dequantize_row_q4_0_r8 convention. */
+void dequantize_row_q6_K_R4(const void *src, float *dst, int n);
 void dequantize_row_q6_0(const void *src, float *dst, int n);
 void dequantize_row_q5_K(const void *src, float *dst, int n);
 void dequantize_row_q4_0(const void *src, float *dst, int n);
@@ -833,6 +855,25 @@ float vec_dot_q6_K_f32(const void *src, const float *x, int n);
 float vec_dot_q6_0_f32(const void *src, const float *x, int n);
 float vec_dot_q6_0_q8_0(const void *src_q6, const void *src_q8, int n);
 float vec_dot_q6_K_q8_K(const void *src_q6, const void *src_q8, int n);
+/* Q6_K_R4 GEMV: dot 4 interleaved weight rows (one block group) against one
+ * Q8_K-quantized activation row. vx points at (n/256) block_q6_K_R4 blocks
+ * (the start of a row group; group index = row_idx/4). vy points at (n/256)
+ * block_q8_K blocks for the activation. Writes 4 floats (one per row,
+ * row-major) to out[0..3]. AVX2-accelerated when available, portable scalar
+ * fallback otherwise. Ported from ik_llama.cpp's mul_mat_q6_k_r4_q8_k. */
+void vec_dot_q6_K_R4_q8_K(const void *vx, const void *vy, int n, float *out);
+/* Q6_K_R4 x Q8_K GEMM: nrows (multiple of 4) weight rows x ncols activation
+ * columns. vx: nrows/4 row groups of (k/256) block_q6_K_R4 each, row-major
+ * by group (stride = gguf_type_row_size(GGUF_TYPE_Q6_K_R4,k)*4 bytes per
+ * group -- i.e. plain per-row striding with row_bytes computed the usual
+ * way). vy: ncols activation rows of (k/256) block_q8_K each, contiguous.
+ * out[w*4 + r + c*bs] receives row (w*4+r), column c. Returns the number of
+ * rows actually processed (a multiple of 4), or 0 if unsupported (k not a
+ * multiple of 256, or nrows < 4). */
+int sgemm_q6_k_r4_q8_k(int nrows, int ncols, int k,
+                        const void *vx, const void *vy,
+                        float *out, size_t bs,
+                        int ith, int nth);
 float vec_dot_f32_f32(const void *src, const float *x, int n);
 float vec_dot_q8_0_f32(const void *src, const float *x, int n);
 void vec_dot_q8_0_f32_batch4(const void *qx0, const void *qx1, const void *qx2, const void *qx3,

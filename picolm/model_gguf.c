@@ -1996,6 +1996,14 @@ int parse_gguf(model_t *m, int max_seq_len) {
                 block_q6_K *blk = (block_q6_K *)((uint8_t *)ptr + b * sizeof(block_q6_K));
                 blk->d = GGUF_LE16(blk->d);
             }
+        } else if (qt == GGUF_TYPE_Q6_K_R4) {
+            /* Q6_K_R4: 840-byte block group covers 4 rows x 256 = 1024
+             * elements (not 256 like plain Q6_K), 4 FP16 deltas per group. */
+            size_t nblocks = nrows / 1024;
+            for (size_t b = 0; b < nblocks; b++) {
+                block_q6_K_R4 *blk = (block_q6_K_R4 *)((uint8_t *)ptr + b * sizeof(block_q6_K_R4));
+                for (int r = 0; r < 4; r++) blk->d[r] = GGUF_LE16(blk->d[r]);
+            }
         } else if (qt == GGUF_TYPE_Q3_K) {
             size_t nblocks = nrows / 256;
             for (size_t b = 0; b < nblocks; b++) {
