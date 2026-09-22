@@ -442,8 +442,10 @@ typedef enum {
     GGUF_TYPE_IQ4_NL    = 20,  /* Non-linear 4-bit quant (LUT-based, same layout as Q4_0) */
     GGUF_TYPE_IQ2_K     = 137, /* Plain IQ2_K (non-interleaved, GGUF type 137) */
     GGUF_TYPE_IQ3_K     = 138, /* Plain IQ3_K (non-interleaved, GGUF type 138) */
+    GGUF_TYPE_IQ4_K     = 139, /* Plain IQ4_K (non-interleaved, GGUF type 139) */
     GGUF_TYPE_IQ2_K_R4  = 337, /* 4-row interleaved IQ2_K (repacked, AVX-512/AVX2 target) */
     GGUF_TYPE_IQ3_K_R4  = 338, /* 4-row interleaved IQ3_K (repacked, AVX-512/AVX2 target) */
+    GGUF_TYPE_IQ4_K_R4  = 339, /* 4-row interleaved IQ4_K (repacked, AVX-512/AVX2 target) */
     GGUF_TYPE_Q1_0       = 41,  /* 1-bit sign + scale, 128 values/block */
     GGUF_TYPE_Q2_0       = 42,  /* 2-bit values + scale, 128 values/block */
     GGUF_TYPE_Q6_0       = 133, /* 6-bit values + FP16 scale, 32 values/block (legacy GGML) */
@@ -815,6 +817,56 @@ typedef struct PICOLM_PACKED_ATTR {
     uint8_t  qs[256];     /* 1024 packed 3-bit values */
     uint8_t  qh[128];     /* 1024 high bits (1 per value, 8 values per byte) */
 } block_iq3_k_r4;         /* 440 bytes = 4 * 110 */
+
+/* IQ4_K plain block (GGUF type 139): single-row 4-bit non-linear quant.
+ * Size: 144 bytes per block (QK_K=256 values).
+ *
+ * Layout (from ik_llama.cpp ggml-common.h):
+ *   d:        FP16 global scale (2 bytes)
+ *   extra:    16 bits, 2 bits per 32-value subblock (LUT table select) (2 bytes)
+ *   scales_h: 4 bytes, 2 bits per scale (16 scales total, 2 per subblock)
+ *   scales_l: 8 bytes, 4-bit magnitude per scale (2 per byte, 16 total)
+ *   qs:       128 bytes, 4-bit values (2 per byte, 256 values)
+ *
+ * Scale encoding: 6-bit signed = (scales_l 4-bit | scales_h 2-bit) - 32
+ * LUT: 32 entries (2 tables of 16), selected by extra bits
+ * No qh field (unlike IQ3_K) -- all 4 bits in qs.
+ */
+#pragma pack(push, 1)
+typedef struct PICOLM_PACKED_ATTR {
+    uint16_t d;              /* FP16 global scale */
+    uint16_t extra;          /* LUT table selection (2 bits per subblock) */
+    uint8_t  scales_h[4];    /* 2 bits per scale (16 scales) */
+    uint8_t  scales_l[8];    /* 4-bit magnitude scales (16 total) */
+    uint8_t  qs[128];        /* 256 packed 4-bit values (2 per byte) */
+} block_iq4_k;              /* 144 bytes */
+
+/* IQ4_K_R4 block: 4 rows of IQ4_K repacked together for SIMD efficiency.
+ * GGUF type 339. Size = 4 * sizeof(block_iq4_k) = 576 bytes.
+ * Each row covers QK_K=256 values. Total = 1024 values per block.
+ *
+ * Layout:
+ *   d[4]:       FP16 global scales, one per row (8 bytes)
+ *   extra[8]:   uint8_t LUT selection flags (8 bytes)
+ *     extra[0..3] = low-half flags for rows 0..3 (1 bit per sub-block)
+ *     extra[4..7] = high-half flags for rows 0..3 (1 bit per sub-block)
+ *   scales_h[8]:  2 bits per scale (8 bytes, covers 32 scale entries)
+ *     16 scales per row x 4 rows = 64 scales, but packed as 32 entries
+ *     (2 scales per subblock per row, 8 subblocks)
+ *   scales_l[32]: 4-bit magnitude scales interleaved (32 bytes)
+ *     64 scales total (16 per row x 4 rows)
+ *   qs[512]:     4-bit quantized values interleaved across 4 rows (512 bytes)
+ *     128 bytes per row * 4 rows = 512 bytes
+ */
+#pragma pack(push, 1)
+typedef struct PICOLM_PACKED_ATTR {
+    uint16_t d[4];         /* 4 FP16 global scales */
+    uint8_t  extra[8];     /* LUT selection: extra[0..3]=low-half, extra[4..7]=high-half */
+    uint8_t  scales_h[16]; /* 64 packed 2-bit scale extensions (16 per row x 4 rows) */
+    uint8_t  scales_l[32]; /* 64 packed 4-bit magnitude scales (16 per row x 4 rows) */
+    uint8_t  qs[512];      /* 1024 packed 4-bit values (256 per row x 4 rows) */
+} block_iq4_k_r4;         /* 576 bytes = 4 * 144 */
+#pragma pack(pop)
 #pragma pack(pop)
 
 /* IQ2_K non-linear values table (8 entries, int8)
@@ -830,6 +882,13 @@ extern const int8_t iq2nl_values[8];
  * Shifted table (indices 8-15): {-59, -36, -19, -6, 5, 17, 32, 51}
  * The extra bits select which table per sub-block half. */
 extern const int8_t iq3nl_values[16];
+
+/* IQ4_K non-linear values table (32 entries, int8)
+ * Derived from llama.cpp ggml-common.h GGML_TABLE_BEGIN(int8_t, iq4k_values, 32)
+ * Table 0 (indices 0-15):  {-127,-104,-83,-65,-49,-35,-22,-10, 1,13,25,38,53,69,89,113}
+ * Table 1 (indices 16-31): {-123,-100,-79,-61,-45,-31,-18, -6, 5,17,29,42,57,73,93,117}
+ * The extra bits select which table per sub-block half. */
+extern const int8_t iq4k_values[32];
 
 /* Q4_1 block: 32 weights (old GGML format, used by some GGUF models)
  * Layout: half d (scale), half m (min), uchar qs[16] (nibbles)
@@ -1120,6 +1179,17 @@ int sgemm_iq3_k_r4_q8_k_avx2(int nrows, int ncols, int k,
                                const void *vx, const void *vy,
                                float *out, size_t bs,
                                int ith, int nth);
+
+/* IQ4_K plain x Q8_K AVX2 GEMV. */
+void vec_dot_iq4_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out);
+/* IQ4_K plain x Q8_K scalar vec_dot. */
+float vec_dot_iq4_k_q8_k(const void *vx, const void *wy, int n);
+/* IQ4_K_R4 x Q8_K scalar vec_dot (row 0 only). */
+float vec_dot_iq4_k_r4_q8_k(const void *vx, const void *wy, int n);
+/* IQ4_K_R4 x Q8_K AVX2 GEMV: 4 weight rows x 1 activation row.
+ * out: 4 output floats. nrows must be 4. n must be multiple of 256. */
+void vec_dot_iq4_k_r4_q8_k_avx2(const void *vx, const void *wy, int n,
+                                  float *out, int nrows);
 
 /* Repack standard Q4_0 weights to Q4_0_8x8 interleaved format (for AVX2).
  * dst must have the same size as src (1:1 byte mapping, just reordered). */
