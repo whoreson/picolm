@@ -233,9 +233,9 @@ void vec_dot_iq4_k_r4_q8_k_avx2(const void *vx, const void *wy, int n,
                 dequantize_row_iq4_k_r4_single((const block_iq4_k_r4 *)vx, w_tmp, n, r);
                 /* wy is block_q8_K -- dequantize to F32 */
                 for (int i = 0; i < n; i++) {
-                    int ib = i / 32;
-                    int io = i % 32;
-                    a_tmp[i] = ((const block_q8_K *)wy)[ib].qs[io] *
+                    int ib = i / 256;
+                    int io = i % 256;
+                    a_tmp[i] = (float)((const block_q8_K *)wy)[ib].qs[io] *
                                ((const block_q8_K *)wy)[ib].d / 127.0f;
                 }
                 out[r] = vec_dot_f32_f32(w_tmp, a_tmp, n);

@@ -51,7 +51,7 @@ const int8_t iq4k_values[32] = {
 
 /* Forward decl for vec_dot path */
 void dequantize_row_iq2_k_r4_single(const block_iq2_k_r4 *x, float *dst, int n, int row);
-static void dequantize_row_iq3_k_r4_single(const block_iq3_k_r4 *x, float *dst, int n, int row);
+void dequantize_row_iq3_k_r4_single(const block_iq3_k_r4 *x, float *dst, int n, int row);
 void dequantize_row_iq4_k_r4_single(const block_iq4_k_r4 *x, float *dst, int n, int row);
 void dequantize_row_iq4_k(const void *src, float *dst, int n);
 void dequantize_row_iq4_k_r4(const void *src, float *dst, int n);
@@ -8592,7 +8592,7 @@ void dequantize_row_iq2_k_r4_single(const block_iq2_k_r4 *x, float *dst, int n, 
 /* Scalar reference dequantize for a single row from IQ3_K_R4 block.
  * n = total values per row (must be multiple of QK_K=256).
  * row = which of the 4 interleaved rows (0..3) to dequantize. */
-static void dequantize_row_iq3_k_r4_single(const block_iq3_k_r4 *x, float *dst, int n, int row) {
+void dequantize_row_iq3_k_r4_single(const block_iq3_k_r4 *x, float *dst, int n, int row) {
     const int nblocks = n / QK_K;
     for (int ibl = 0; ibl < nblocks; ibl++) {
         const float d = fp16_to_fp32_lookup(x[ibl].d[row]);
@@ -8634,8 +8634,33 @@ float vec_dot_iq3_k_r4_q8_k(const void *vx, const void *vy, int n) {
 }
 
 void vec_dot_iq3_k_r4_q8_k_batch4(const void *vx, const void *vy, int n, float *out) {
+#if defined(PICOLM_AVX2)
     /* AVX2 path: call the optimized kernel from sgemm_iq3_k_r4.c */
     vec_dot_iq3_k_r4_q8_k_avx2(vx, vy, n, out, 4);
+#else
+    /* Scalar fallback: dequantize each row, F32 dot with dequantized Q8_K activations */
+    {
+        float *w_tmp = (float *)malloc((size_t)n * sizeof(float));
+        float *a_tmp = (float *)malloc((size_t)n * sizeof(float));
+        if (w_tmp && a_tmp) {
+            /* Dequantize Q8_K activations once */
+            for (int i = 0; i < n; i++) {
+                int ib = i / 256;
+                int io = i % 256;
+                const block_q8_K *blk = ((const block_q8_K *)vy) + ib;
+                a_tmp[i] = (float)blk->qs[io] * blk->d / 127.0f;
+            }
+            for (int r = 0; r < 4; r++) {
+                dequantize_row_iq3_k_r4_single((const block_iq3_k_r4 *)vx, w_tmp, n, r);
+                out[r] = vec_dot_f32_f32(w_tmp, a_tmp, n);
+            }
+        } else {
+            memset(out, 0, 4 * sizeof(float));
+        }
+        free(w_tmp);
+        free(a_tmp);
+    }
+#endif
 }
 
 /* ================================================================
