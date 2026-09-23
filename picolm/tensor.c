@@ -3932,8 +3932,10 @@ void matmul_batch(float *out, const float *x, int n_batch,
                 }
             }
             free(iq2_tmp);
-        DISPATCH("IQ2_K_R4_scalar_vec_dot");
+        DISPATCH("IQ2_K_R4_scalar");
             return;
+        } else {
+            fprintf(stderr, "[IQ2_K_R4 SCALAR] OOM: cannot allocate %zu bytes for dequant buffer\n", (size_t)n * sizeof(float));
         }
     }
 
@@ -5159,6 +5161,20 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                         vec_dot_iq2_k_r4_q8_k_avx2((const char *)W1 + (i / 4) * block_stride, qx, n, results, 4);
                         out1[b * d + i] = results[i % 4];
                     }
+                } else if (qtype1 == GGUF_TYPE_IQ4_K_R4) {
+                    size_t rb_iq4 = gguf_type_row_size(GGUF_TYPE_IQ4_K_R4, n);
+                    size_t block_stride_iq4 = rb_iq4 * 4;
+                    int d4_iq4 = (d / 4) * 4;
+                    for (int i = 0; i < d4_iq4; i += 4) {
+                        float results[4] = {0};
+                        vec_dot_iq4_k_r4_q8_k_avx2((const char *)W1 + (i / 4) * block_stride_iq4, qx, n, results, 4);
+                        for (int r = 0; r < 4; r++) out1[b * d + i + r] = results[r];
+                    }
+                    for (int i = d4_iq4; i < d; i++) {
+                        float results[4] = {0};
+                        vec_dot_iq4_k_r4_q8_k_avx2((const char *)W1 + (i / 4) * block_stride_iq4, qx, n, results, 4);
+                        out1[b * d + i] = results[i % 4];
+                    }
                 } else {
                     size_t rb1 = gguf_type_row_size(qtype1, n);
                     for (int i = 0; i < d; i++)
@@ -5173,6 +5189,20 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                     for (int i = d4; i < d; i++) {
                         float results[4] = {0};
                         vec_dot_iq2_k_r4_q8_k_avx2((const char *)W2 + (i / 4) * block_stride, qx, n, results, 4);
+                        out2[b * d + i] = results[i % 4];
+                    }
+                } else if (qtype2 == GGUF_TYPE_IQ4_K_R4) {
+                    size_t rb_iq4 = gguf_type_row_size(GGUF_TYPE_IQ4_K_R4, n);
+                    size_t block_stride_iq4 = rb_iq4 * 4;
+                    int d4_iq4 = (d / 4) * 4;
+                    for (int i = 0; i < d4_iq4; i += 4) {
+                        float results[4] = {0};
+                        vec_dot_iq4_k_r4_q8_k_avx2((const char *)W2 + (i / 4) * block_stride_iq4, qx, n, results, 4);
+                        for (int r = 0; r < 4; r++) out2[b * d + i + r] = results[r];
+                    }
+                    for (int i = d4_iq4; i < d; i++) {
+                        float results[4] = {0};
+                        vec_dot_iq4_k_r4_q8_k_avx2((const char *)W2 + (i / 4) * block_stride_iq4, qx, n, results, 4);
                         out2[b * d + i] = results[i % 4];
                     }
                 } else {
@@ -5209,6 +5239,26 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                         dequantize_row_iq2_k_r4_single((const block_iq2_k_r4 *)wblock, iq2_tmp, n, i % 4);
                         out1[b * d + i] = vec_dot_f32_f32(iq2_tmp, x + b * n, n);
                     }
+                } else if (qtype1 == GGUF_TYPE_IQ4_K_R4) {
+                    size_t rb_iq4 = gguf_type_row_size(GGUF_TYPE_IQ4_K_R4, n);
+                    size_t block_stride_iq4 = rb_iq4 * 4;
+                    int d4_iq4 = (d / 4) * 4;
+                    float *iq4_tmp = (float *)malloc((size_t)n * sizeof(float));
+                    if (iq4_tmp) {
+                        for (int i = 0; i < d4_iq4; i += 4) {
+                            const char *wblock = (const char *)W1 + (i / 4) * block_stride_iq4;
+                            for (int r = 0; r < 4; r++) {
+                                dequantize_row_iq4_k_r4_single((const block_iq4_k_r4 *)wblock, iq4_tmp, n, r);
+                                out1[b * d + i + r] = vec_dot_f32_f32(iq4_tmp, x + b * n, n);
+                            }
+                        }
+                        for (int i = d4_iq4; i < d; i++) {
+                            const char *wblock = (const char *)W1 + (i / 4) * block_stride_iq4;
+                            dequantize_row_iq4_k_r4_single((const block_iq4_k_r4 *)wblock, iq4_tmp, n, i % 4);
+                            out1[b * d + i] = vec_dot_f32_f32(iq4_tmp, x + b * n, n);
+                        }
+                        free(iq4_tmp);
+                    }
                 } else {
                     size_t rb1 = gguf_type_row_size(qtype1, n);
                     for (int i = 0; i < d; i++)
@@ -5228,9 +5278,32 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                         out2[b * d + i] = vec_dot_f32_f32(iq2_tmp, x + b * n, n);
                     }
                 } else {
-                    size_t rb2 = gguf_type_row_size(qtype2, n);
-                    for (int i = 0; i < d; i++)
-                        out2[b * d + i] = vec_dot((const char *)W2 + i * rb2, x + b * n, n, qtype2);
+                    if (qtype2 == GGUF_TYPE_IQ4_K_R4) {
+                        /* IQ4_K_R4: 4-row interleaved, need dedicated dequant path */
+                        size_t rb_iq4 = gguf_type_row_size(GGUF_TYPE_IQ4_K_R4, n);
+                        size_t block_stride_iq4 = rb_iq4 * 4;
+                        int d4_iq4 = (d / 4) * 4;
+                        float *iq4_tmp = (float *)malloc((size_t)n * sizeof(float));
+                        if (iq4_tmp) {
+                            for (int i = 0; i < d4_iq4; i += 4) {
+                                const char *wblock = (const char *)W2 + (i / 4) * block_stride_iq4;
+                                for (int r = 0; r < 4; r++) {
+                                    dequantize_row_iq4_k_r4_single((const block_iq4_k_r4 *)wblock, iq4_tmp, n, r);
+                                    out2[b * d + i + r] = vec_dot_f32_f32(iq4_tmp, x + b * n, n);
+                                }
+                            }
+                            for (int i = d4_iq4; i < d; i++) {
+                                const char *wblock = (const char *)W2 + (i / 4) * block_stride_iq4;
+                                dequantize_row_iq4_k_r4_single((const block_iq4_k_r4 *)wblock, iq4_tmp, n, i % 4);
+                                out2[b * d + i] = vec_dot_f32_f32(iq4_tmp, x + b * n, n);
+                            }
+                            free(iq4_tmp);
+                        }
+                    } else {
+                        size_t rb2 = gguf_type_row_size(qtype2, n);
+                        for (int i = 0; i < d; i++)
+                            out2[b * d + i] = vec_dot((const char *)W2 + i * rb2, x + b * n, n, qtype2);
+                    }
                 }
             }
             free(iq2_tmp);

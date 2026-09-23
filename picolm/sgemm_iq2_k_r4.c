@@ -80,7 +80,8 @@ void vec_dot_iq2_k_r4_q8_k_avx2(const void *vx, const void *wy, int n,
         _mm256_storeu_si256((__m256i *)stored_scales + 0, i8scales1);
         _mm256_storeu_si256((__m256i *)stored_scales + 1, i8scales2);
 
-        __m256i isum = _mm256_setzero_si256();
+        /* Bias correction for sign trick: scale * bsum * min_value */
+        __m256i isum = _mm256_setzero_si256(); /* DISABLED: iq234_k_accum_mins_vecdot(i8scales1, i8scales2, qk + ibl, &isum, -32); */
 
         for (int ib = 0; ib < QK_K / 32; ib++) {
             __m256i scales = load_scales_avx2(stored_scales, ib);
@@ -209,6 +210,7 @@ int sgemm_iq2_k_r4_q8_k_avx2(int nrows, int ncols, int k,
                 for (int c = 0; c < ncols_tile; c++) {
                     float q8_scale = qk_ptr[c][ibl].d;
                     __m256 d4y = _mm256_mul_ps(d4, _mm256_set1_ps(q8_scale));
+                    /* Bias correction for sign trick: DISABLED */
                     __m256i isum = _mm256_setzero_si256();
 
                     /* Reload extra for each column (weights are shared, extra is per-block) */

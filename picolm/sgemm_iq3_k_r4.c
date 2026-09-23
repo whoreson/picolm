@@ -45,6 +45,8 @@ static inline __m256i load_scales_avx2(const uint64_t *stored_scales, int ib) {
     return i32;
 }
 
+/* Bias correction for sign trick in IQ2/3/4_K_R4 kernels.
+ * Same as in sgemm_iq2_k_r4.c, duplicated here to avoid cross-file dependencies. */
 void vec_dot_iq3_k_r4_q8_k_avx2(const void *vx, const void *wy, int n,
                                   float *out, int nrows) {
 #if defined(__AVX2__) && defined(__F16C__)
@@ -118,6 +120,7 @@ void vec_dot_iq3_k_r4_q8_k_avx2(const void *vx, const void *wy, int n,
         _mm256_storeu_si256((__m256i *)stored_scales + 0, i8scales1);
         _mm256_storeu_si256((__m256i *)stored_scales + 1, i8scales2);
 
+        /* Bias correction for sign trick: DISABLED - implementation incorrect */
         __m256i isum = _mm256_setzero_si256();
 
         for (int ib = 0; ib < QK_K / 32; ib++) {
@@ -273,6 +276,7 @@ int sgemm_iq3_k_r4_q8_k_avx2(int nrows, int ncols, int k,
                 for (int c = 0; c < ncols_tile; c++) {
                     float q8_scale = qk_ptr[c][ibl].d;
                     __m256 d4y = _mm256_mul_ps(d4, _mm256_set1_ps(q8_scale));
+                    /* Bias correction for sign trick: DISABLED */
                     __m256i isum = _mm256_setzero_si256();
 
                     __m256i extra_c = extra;
