@@ -2467,6 +2467,12 @@ float *model_forward(model_t *m, int token, int pos) {
         }
     }
 
+    /* DEBUG: dump input embedding */
+    if (getenv("PICOLM_DBG_LAYER")) {
+        fprintf(stderr, "[LNDBG] LLM decode EMB pos=%d s->x[0:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                pos, s->x[0],s->x[1],s->x[2],s->x[3],s->x[4],s->x[5],s->x[6],s->x[7]);
+    }
+
     /* 2. Transformer layers
      * Skip MTP (Multi-Token Prediction) layers at the end.
      * MTP layers have "nextn." tensors and are used for speculative
@@ -2522,8 +2528,6 @@ float *model_forward(model_t *m, int token, int pos) {
         rmsnorm(s->xb, s->x, s->attn_norm_w[l], dim, c->rms_norm_eps);
         /* Debug: dump RMSNorm output for layer 0 at pos=1 */
 
-        /* DEBUG: dump first 4 weight values of Q projection for layer 0 */
-
         /* Q projection (Q+gate joint for Qwen3.5 full attention) */
         tensor_set_repacked(m->repack_used[ri] ? m->repack_buffers[ri] : NULL);
 #ifdef PICOLM_GPU
@@ -2532,6 +2536,11 @@ float *model_forward(model_t *m, int token, int pos) {
         int this_q_dim = (c->has_ssm && lw->is_attn_layer) ? q_full_dim : q_dim;
         matmul(s->q, s->xb, lw->attn_q, dim, this_q_dim, lw->type_attn_q);
         tensor_set_repacked(NULL);
+        /* DEBUG: dump Q projection for layer 0 */
+        if (getenv("PICOLM_DBG_LAYER") && l == 0) {
+            fprintf(stderr, "[LNDBG] LLM decode l=%d Q[0:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                    l, s->q[0],s->q[1],s->q[2],s->q[3],s->q[4],s->q[5],s->q[6],s->q[7]);
+        }
 
         /* For Qwen3.5: de-interleave per-head Q+gate into block layout
          * GGUF stores [Q_0, Gate_0, Q_1, Gate_1, ...] (per-head interleaved)
@@ -2891,7 +2900,11 @@ ffn_done:
 #endif
             vec_add(s->x, s->xb, dim);
         }
-        /* Debug: dump hidden state after each of first 3 layers at pos=1 */
+        /* DEBUG: dump post-layer residual for first few layers */
+        if (getenv("PICOLM_DBG_LAYER") && pos <= 4 && l < 3) {
+            fprintf(stderr, "[LNDBG] LLM decode l=%d pos=%d s->x[0:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                    l, pos, s->x[0],s->x[1],s->x[2],s->x[3],s->x[4],s->x[5],s->x[6],s->x[7]);
+        }
 #ifdef PICOLM_VIZ
         viz_push_layer(l, s->x, dim);
 #endif

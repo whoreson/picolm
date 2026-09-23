@@ -958,6 +958,21 @@ static void matmul_worker_f(matmul_task_t *t) {
             vec_dot_q6_K_R4_q8_K(t->W + (size_t)i * t->row_bytes, qx, t->n,
                                   t->out + i);
         }
+    } else if (t->qtype == GGUF_TYPE_IQ2_K_R4 && t->x) {
+        /* IQ2_K_R4: 4-row interleaved. Non-batched decode path.
+         * Block stride = 4 * row_bytes. Each block covers 4 rows. */
+        const block_q8_K *qx = (const block_q8_K *)t->x;
+        size_t rb = gguf_type_row_size(t->qtype, t->n);
+        size_t block_stride = rb * 4;
+        int start4 = (t->start / 4) * 4;
+        int end4 = (t->end + 3) / 4 * 4;
+        for (int i = start4; i < end4; i += 4) {
+            float results[4] = {0};
+            vec_dot_iq2_k_r4_q8_k_batch4(
+                (const char *)t->W + (i / 4) * block_stride, qx, t->n, results);
+            for (int r = 0; r < 4 && i + r < t->end; r++)
+                t->out[i + r] = results[r];
+        }
     } else if (t->qtype == GGUF_TYPE_IQ3_K_R4 && t->x) {
         /* IQ3_K_R4: 4-row interleaved. Non-batched decode path.
          * Block stride = 4 * row_bytes. Each block covers 4 rows. */
