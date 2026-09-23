@@ -8559,6 +8559,7 @@ float vec_dot_iq3_k_q8_k(const void *vx, const void *wy, int n) {
 /* Scalar reference dequantize for a single row from IQ2_K_R4 block. */
 void dequantize_row_iq2_k_r4_single(const block_iq2_k_r4 *x, float *dst, int n, int row) {
     const int nblocks = n / QK_K;
+    const int shift = 2 * row;  /* bits 0-1=row0, 2-3=row1, 4-5=row2, 6-7=row3 */
     for (int ibl = 0; ibl < nblocks; ibl++) {
         const float d = fp16_to_fp32_lookup(x[ibl].d[row]);
         const uint8_t *ql = x[ibl].qs;
@@ -8569,15 +8570,12 @@ void dequantize_row_iq2_k_r4_single(const block_iq2_k_r4 *x, float *dst, int n, 
             const float dl2 = d * (((x[ibl].scales[is2 % 32] >> (4 * (is2 / 32))) & 0xf) - 8);
             const int8_t *values1 = iq2nl_values + (x[ibl].extra[row + 0] & (1 << ib) ? 4 : 0);
             const int8_t *values2 = iq2nl_values + (x[ibl].extra[row + 4] & (1 << ib) ? 4 : 0);
-            for (int i = 0; i < 4; i++) {
-                dst[QK_K * ibl + 32 * ib + i + 0]  = dl1 * values1[(ql[4 * row + i + 0] >> 0) & 3];
-                dst[QK_K * ibl + 32 * ib + i + 4]  = dl1 * values1[(ql[4 * row + i + 0] >> 2) & 3];
-                dst[QK_K * ibl + 32 * ib + i + 8]  = dl1 * values1[(ql[4 * row + i + 0] >> 4) & 3];
-                dst[QK_K * ibl + 32 * ib + i + 12] = dl1 * values1[(ql[4 * row + i + 0] >> 6) & 3];
-                dst[QK_K * ibl + 32 * ib + i + 16] = dl2 * values2[(ql[4 * row + i + 16] >> 0) & 3];
-                dst[QK_K * ibl + 32 * ib + i + 20] = dl2 * values2[(ql[4 * row + i + 16] >> 2) & 3];
-                dst[QK_K * ibl + 32 * ib + i + 24] = dl2 * values2[(ql[4 * row + i + 16] >> 4) & 3];
-                dst[QK_K * ibl + 32 * ib + i + 28] = dl2 * values2[(ql[4 * row + i + 16] >> 6) & 3];
+            /* Each byte packs 4 rows' 2-bit values: bits 0-1=row0, 2-3=row1, 4-5=row2, 6-7=row3.
+             * 32 bytes per sub-block = 32 values per row. 8 sub-blocks = 256 values per row. */
+            for (int i = 0; i < 32; i++) {
+                dst[QK_K * ibl + 32 * ib + i] = (i < 16)
+                    ? dl1 * values1[(ql[i] >> shift) & 3]
+                    : dl2 * values2[(ql[i] >> shift) & 3];
             }
             ql += 32;
         }
@@ -9025,6 +9023,7 @@ void vec_dot_iq2_k_r4_q8_k_batch4(const void *vx, const void *vy, int n, float *
 
     for (int iy = 0; iy < 4; iy++) {
         float sumf = 0.0f;
+        const int shift = 2 * iy;  /* bits 0-1=row0, 2-3=row1, 4-5=row2, 6-7=row3 */
         for (int ibl = 0; ibl < nblocks; ibl++) {
             float d = fp16_to_fp32_lookup(iq2[ibl].d[iy]);
             float q8_scale = y[ibl].d;
@@ -9041,18 +9040,16 @@ void vec_dot_iq2_k_r4_q8_k_batch4(const void *vx, const void *vy, int n, float *
                 const int8_t *values1 = iq2nl_values + (iq2[ibl].extra[iy + 0] & (1 << ib) ? 4 : 0);
                 const int8_t *values2 = iq2nl_values + (iq2[ibl].extra[iy + 4] & (1 << ib) ? 4 : 0);
 
-                for (int i = 0; i < 4; i++) {
-                    uint8_t byte_lo = ql[4 * iy + i + 0];
-                    uint8_t byte_hi = ql[4 * iy + i + 16];
+                /* Each byte packs 4 rows' 2-bit values. 32 bytes per sub-block.
+                 * First 16 bytes use scale1 (dl1), last 16 bytes use scale2 (dl2). */
+                for (int i = 0; i < 32; i++) {
                     int base = 32 * ib + i;
-                    sumi += dl1 * values1[(byte_lo >> 0) & 3] * q8[base + 0];
-                    sumi += dl1 * values1[(byte_lo >> 2) & 3] * q8[base + 4];
-                    sumi += dl1 * values1[(byte_lo >> 4) & 3] * q8[base + 8];
-                    sumi += dl1 * values1[(byte_lo >> 6) & 3] * q8[base + 12];
-                    sumi += dl2 * values2[(byte_hi >> 0) & 3] * q8[base + 16];
-                    sumi += dl2 * values2[(byte_hi >> 2) & 3] * q8[base + 20];
-                    sumi += dl2 * values2[(byte_hi >> 4) & 3] * q8[base + 24];
-                    sumi += dl2 * values2[(byte_hi >> 6) & 3] * q8[base + 28];
+                    uint8_t byte = ql[i];
+                    int8_t val = (i < 16)
+                        ? values1[(byte >> shift) & 3]
+                        : values2[(byte >> shift) & 3];
+                    float dl = (i < 16) ? dl1 : dl2;
+                    sumi += dl * val * q8[base];
                 }
                 ql += 32;
             }
