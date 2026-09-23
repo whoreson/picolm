@@ -1170,6 +1170,8 @@ void vec_dot_iq3_k_r4_q8_k_batch4(const void *vx, const void *wy, int n, float *
  * Dequantizes a single row (k/4 values) from the 4-row interleaved block.
  * dst must have space for k/4 floats. */
 void dequantize_row_iq3_k_r4(const void *src, float *dst, int n);
+void dequantize_row_iq2_k_r4_single(const block_iq2_k_r4 *x, float *dst, int n, int row);
+void dequantize_row_iq4_k_r4_single(const block_iq4_k_r4 *x, float *dst, int n, int row);
 /* IQ3_K_R4 x Q8_K AVX2 GEMV: 4 weight rows x 1 activation row.
  * out: 4 output floats. nrows must be 4. n must be multiple of 256. */
 void vec_dot_iq3_k_r4_q8_k_avx2(const void *vx, const void *wy, int n,

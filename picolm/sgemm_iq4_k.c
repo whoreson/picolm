@@ -223,13 +223,26 @@ void vec_dot_iq4_k_r4_q8_k_avx2(const void *vx, const void *wy, int n,
 
     for (int r = 0; r < nrows; r++) out[r] = result[r];
 #else
-    /* Scalar fallback: compute each row separately */
-    for (int r = 0; r < nrows; r++) {
-        /* Dequantize row r to temp buffer, then dot with F32 activations */
-        float tmp[1024];
-        dequantize_row_iq4_k_r4_single((const block_iq4_k_r4 *)vx, tmp, n, r);
-        /* Need Q8_K activations -> use scalar vec_dot path */
-        out[r] = vec_dot_iq4_k_r4_q8_k(vx, wy, n);
+    /* Scalar fallback: dequantize each weight row, dequantize Q8_K activations,
+     * then F32 dot product. */
+    {
+        float *w_tmp = (float *)malloc((size_t)n * sizeof(float));
+        float *a_tmp = (float *)malloc((size_t)n * sizeof(float));
+        for (int r = 0; r < nrows; r++) {
+            if (w_tmp && a_tmp) {
+                dequantize_row_iq4_k_r4_single((const block_iq4_k_r4 *)vx, w_tmp, n, r);
+                /* wy is block_q8_K -- dequantize to F32 */
+                for (int i = 0; i < n; i++) {
+                    int ib = i / 32;
+                    int io = i % 32;
+                    a_tmp[i] = ((const block_q8_K *)wy)[ib].qs[io] *
+                               ((const block_q8_K *)wy)[ib].d / 127.0f;
+                }
+                out[r] = vec_dot_f32_f32(w_tmp, a_tmp, n);
+            }
+        }
+        free(w_tmp);
+        free(a_tmp);
     }
 #endif
 }

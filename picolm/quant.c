@@ -50,9 +50,9 @@ const int8_t iq4k_values[32] = {
 #define QK_K 256
 
 /* Forward decl for vec_dot path */
-static void dequantize_row_iq2_k_r4_single(const block_iq2_k_r4 *x, float *dst, int n, int row);
+void dequantize_row_iq2_k_r4_single(const block_iq2_k_r4 *x, float *dst, int n, int row);
 static void dequantize_row_iq3_k_r4_single(const block_iq3_k_r4 *x, float *dst, int n, int row);
-static void dequantize_row_iq4_k_r4_single(const block_iq4_k_r4 *x, float *dst, int n, int row);
+void dequantize_row_iq4_k_r4_single(const block_iq4_k_r4 *x, float *dst, int n, int row);
 void dequantize_row_iq4_k(const void *src, float *dst, int n);
 void dequantize_row_iq4_k_r4(const void *src, float *dst, int n);
 
@@ -8557,7 +8557,7 @@ float vec_dot_iq3_k_q8_k(const void *vx, const void *wy, int n) {
  * ================================================================ */
 
 /* Scalar reference dequantize for a single row from IQ2_K_R4 block. */
-static void dequantize_row_iq2_k_r4_single(const block_iq2_k_r4 *x, float *dst, int n, int row) {
+void dequantize_row_iq2_k_r4_single(const block_iq2_k_r4 *x, float *dst, int n, int row) {
     const int nblocks = n / QK_K;
     for (int ibl = 0; ibl < nblocks; ibl++) {
         const float d = fp16_to_fp32_lookup(x[ibl].d[row]);
@@ -8709,7 +8709,7 @@ float vec_dot_iq4_k_q8_k(const void *vx, const void *wy, int n) {
  * GGUF type 339. Ported from llama.cpp iqk_quantize.cpp
  * ================================================================ */
 
-static void dequantize_row_iq4_k_r4_single(const block_iq4_k_r4 *x, float *dst, int n, int row) {
+void dequantize_row_iq4_k_r4_single(const block_iq4_k_r4 *x, float *dst, int n, int row) {
     const int n_per_row = n;  /* n is already per-row for R4 types */
     const int nblock = n_per_row / QK_K;
 
