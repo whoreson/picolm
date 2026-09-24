@@ -4838,6 +4838,68 @@ static void r4_dual_side_avx2(float *out_col, const void *W, gguf_type_t qtype,
     }
 }
 
+/* Threaded R4 dual-batch: process one 4-row output group for ALL batch
+ * tokens per task invocation. tensor_parallel_for distributes the d/4
+ * row groups across threads; each thread streams its weight slice once
+ * and reuses it across all n_batch activation rows (cache-friendly).
+ * This replaces the serial per-token loop that made the R4 dual path
+ * single-threaded (56% of prefill time on 1 core for K+V projections). */
+typedef struct {
+    const void *W;         /* weight matrix (R4 interleaved) */
+    float *out;            /* output column (d floats per token) */
+    const char *qbuf;      /* quantized activations, n_batch rows */
+    int n;                 /* input dim (per token) */
+    int d;                 /* output dim (per token) */
+    int n_batch;           /* number of token rows */
+    size_t q8_rb;          /* Q8_K row size in bytes */
+    size_t block_stride;   /* R4 block-group stride (row_size * 4) */
+    r4_vecdot4_fn vd;      /* 4-row vec_dot kernel */
+} r4_dual_thread_task_t;
+
+static void r4_dual_thread_task(int idx, void *ctxp) {
+    r4_dual_thread_task_t *c = (r4_dual_thread_task_t *)ctxp;
+    int i = idx * 4;  /* row group start (d is guaranteed % 4 == 0 here) */
+    const char *wgrp = (const char *)c->W + (size_t)idx * c->block_stride;
+    for (int b = 0; b < c->n_batch; b++) {
+        const block_q8_K *qx = (const block_q8_K *)(c->qbuf + (size_t)b * c->q8_rb);
+        float results[4] = {0, 0, 0, 0};
+        c->vd(wgrp, qx, c->n, results, 4);
+        for (int r = 0; r < 4; r++)
+            c->out[(size_t)b * c->d + i + r] = results[r];
+    }
+}
+
+/* Threaded one-side R4 matmul: parallelize over d/4 row groups.
+ * Returns 1 if dispatched, 0 if the type has no R4 vecdot or d % 4 != 0
+ * (R4 weight layout guarantees d % 4 == 0, so the latter shouldn't happen).
+ * NOTE: d % 4 must be 0 -- there is no tail handling. The R4 block layout
+ * stores 4 rows per block group, so d % 4 != 0 is impossible for valid R4
+ * weights; if it somehow happens, the caller falls back to the serial path. */
+static int r4_dual_side_threaded(float *out_col, const void *W, gguf_type_t qtype,
+                                  const char *qbuf, int n, int d, int n_batch) {
+    r4_vecdot4_fn vd; r4_dequant_row_fn dq;
+    if (!r4_dual_lookup(qtype, &vd, &dq)) return 0;
+    size_t q8_rb = (size_t)(n / 256) * sizeof(block_q8_K);
+    size_t block_stride = gguf_type_row_size(qtype, n) * 4;
+    if (d < 4 || d % 4 != 0) return 0;  /* no tail handling: R4 guarantees d%4==0 */
+
+    r4_dual_thread_task_t ctx = {
+        .W = W, .out = out_col, .qbuf = qbuf,
+        .n = n, .d = d, .n_batch = n_batch,
+        .q8_rb = q8_rb, .block_stride = block_stride, .vd = vd,
+    };
+    int ngroups = d / 4;
+    int nth = pool_total_threads(1);
+    int want = n_threads < nth ? n_threads : nth;
+    int active = want > ngroups ? ngroups : want;
+    if (active < 2) {
+        for (int g = 0; g < ngroups; g++) r4_dual_thread_task(g, &ctx);
+    } else {
+        tensor_parallel_for(ngroups, r4_dual_thread_task, &ctx);
+    }
+    return 1;
+}
+
 /* Portable scalar fallback: dequantize each row, plain F32 dot product. */
 static void r4_dual_side_scalar(float *out_col, const void *W, gguf_type_t qtype,
                                  const float *xrow, int n, int d) {
@@ -5239,25 +5301,41 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
         if (qbuf) {
             for (int b = 0; b < n_batch; b++)
                 quantize_row_q8_K(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
-            for (int b = 0; b < n_batch; b++) {
-                const block_q8_K *qx = (const block_q8_K *)((char *)qbuf + (size_t)b * q8_rb);
-                if (is_r4_dual_type(qtype1)) {
-                    r4_dual_side_avx2(out1 + (size_t)b * d, W1, qtype1, qx, n, d);
-                } else {
-                    size_t rb1 = gguf_type_row_size(qtype1, n);
-                    for (int i = 0; i < d; i++)
-                        out1[b * d + i] = vec_dot((const char *)W1 + (size_t)i * rb1, x + (size_t)b * n, n, qtype1);
-                }
-                if (is_r4_dual_type(qtype2)) {
-                    r4_dual_side_avx2(out2 + (size_t)b * d, W2, qtype2, qx, n, d);
-                } else {
-                    size_t rb2 = gguf_type_row_size(qtype2, n);
-                    for (int i = 0; i < d; i++)
-                        out2[b * d + i] = vec_dot((const char *)W2 + (size_t)i * rb2, x + (size_t)b * n, n, qtype2);
+            /* Threaded: parallelize over output row groups (d/4 groups),
+             * each group processing all n_batch tokens. This keeps the
+             * weight blocks hot in cache across batch tokens (same access
+             * pattern as the tiled GEMM paths). Falls back to the serial
+             * per-token loop if threading is unavailable (d < 4, etc.). */
+            int done1 = 0, done2 = 0;
+            if (n_threads > 1 && n_batch > 1) {
+                if (!done1 && is_r4_dual_type(qtype1))
+                    done1 = r4_dual_side_threaded(out1, W1, qtype1, qbuf, n, d, n_batch);
+                if (!done2 && is_r4_dual_type(qtype2))
+                    done2 = r4_dual_side_threaded(out2, W2, qtype2, qbuf, n, d, n_batch);
+            }
+            /* Serial fallback for non-R4 sides, threaded-failure sides,
+             * or single-token/single-thread cases. */
+            if (!done1 || !done2) {
+                for (int b = 0; b < n_batch; b++) {
+                    const block_q8_K *qx = (const block_q8_K *)((char *)qbuf + (size_t)b * q8_rb);
+                    if (is_r4_dual_type(qtype1) && !done1) {
+                        r4_dual_side_avx2(out1 + (size_t)b * d, W1, qtype1, qx, n, d);
+                    } else if (!done1) {
+                        size_t rb1 = gguf_type_row_size(qtype1, n);
+                        for (int i = 0; i < d; i++)
+                            out1[b * d + i] = vec_dot((const char *)W1 + (size_t)i * rb1, x + (size_t)b * n, n, qtype1);
+                    }
+                    if (is_r4_dual_type(qtype2) && !done2) {
+                        r4_dual_side_avx2(out2 + (size_t)b * d, W2, qtype2, qx, n, d);
+                    } else if (!done2) {
+                        size_t rb2 = gguf_type_row_size(qtype2, n);
+                        for (int i = 0; i < d; i++)
+                            out2[b * d + i] = vec_dot((const char *)W2 + (size_t)i * rb2, x + (size_t)b * n, n, qtype2);
+                    }
                 }
             }
             free(qbuf);
-        DISPATCH2("R4_generic_dual_vec_dot");
+        DISPATCH2("R4_generic_dual_threaded");
             return;
         }
     }
