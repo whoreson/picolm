@@ -769,14 +769,22 @@ static void matmul_worker_f(matmul_task_t *t) {
             size_t rb = gguf_type_row_size(t->qtype, t->n);
             size_t block_stride = rb * 4;
             const char *qx_base = (const char *)t->x;
-            for (int i = t->start; i < t->end; i++) {
-                const char *wrow = (const char *)t->W + (i / 4) * block_stride;
-                int row_in_block = i % 4;
+            /* Group-of-4 loop: one kernel call per (group, token) pair.
+             * Avoids 4x redundant computation (kernel computes all 4 rows
+             * per call). Thread boundaries may split a group: both threads
+             * compute it, each writes only its own rows (no race). */
+            int start_g = t->start / 4, end_g = (t->end + 3) / 4;
+            for (int g = start_g; g < end_g; g++) {
+                const char *wrow = (const char *)t->W + g * block_stride;
                 for (int b = 0; b < nb; b++) {
                     const char *xb = qx_base + (size_t)b * q8k_row_bytes;
                     float results[4] = {0};
                     vec_dot_iq2_k_r4_q8_k_batch4(wrow, xb, t->n, results);
-                    t->out[b * out_stride + i] = results[row_in_block];
+                    for (int r = 0; r < 4; r++) {
+                        int i = g * 4 + r;
+                        if (i >= t->start && i < t->end)
+                            t->out[b * out_stride + i] = results[r];
+                    }
                 }
             }
         } else if (t->qtype == GGUF_TYPE_IQ3_K_R4 && t->x) {
@@ -786,14 +794,22 @@ static void matmul_worker_f(matmul_task_t *t) {
             size_t rb = gguf_type_row_size(t->qtype, t->n);
             size_t block_stride = rb * 4;
             const char *qx_base = (const char *)t->x;
-            for (int i = t->start; i < t->end; i++) {
-                const char *wrow = (const char *)t->W + (i / 4) * block_stride;
-                int row_in_block = i % 4;
+            /* Group-of-4 loop: one kernel call per (group, token) pair.
+             * Avoids 4x redundant computation (kernel computes all 4 rows
+             * per call). Thread boundaries may split a group: both threads
+             * compute it, each writes only its own rows (no race). */
+            int start_g = t->start / 4, end_g = (t->end + 3) / 4;
+            for (int g = start_g; g < end_g; g++) {
+                const char *wrow = (const char *)t->W + g * block_stride;
                 for (int b = 0; b < nb; b++) {
                     const char *xb = qx_base + (size_t)b * q8k_row_bytes;
                     float results[4] = {0};
                     vec_dot_iq3_k_r4_q8_k_batch4(wrow, xb, t->n, results);
-                    t->out[b * out_stride + i] = results[row_in_block];
+                    for (int r = 0; r < 4; r++) {
+                        int i = g * 4 + r;
+                        if (i >= t->start && i < t->end)
+                            t->out[b * out_stride + i] = results[r];
+                    }
                 }
             }
         } else if (t->qtype == GGUF_TYPE_IQ4_K && t->x) {
@@ -814,14 +830,18 @@ static void matmul_worker_f(matmul_task_t *t) {
             size_t rb = gguf_type_row_size(t->qtype, t->n);
             size_t block_stride = rb * 4;
             const char *qx_base = (const char *)t->x;
-            for (int i = t->start; i < t->end; i++) {
-                const char *wrow = (const char *)t->W + (i / 4) * block_stride;
-                int row_in_block = i % 4;
+            int start_g = t->start / 4, end_g = (t->end + 3) / 4;
+            for (int g = start_g; g < end_g; g++) {
+                const char *wrow = (const char *)t->W + g * block_stride;
                 for (int b = 0; b < nb; b++) {
                     const char *xb = qx_base + (size_t)b * q8k_row_bytes;
                     float results[4] = {0};
                     vec_dot_iq4_k_r4_q8_k_avx2(wrow, xb, t->n, results, 4);
-                    t->out[b * out_stride + i] = results[row_in_block];
+                    for (int r = 0; r < 4; r++) {
+                        int i = g * 4 + r;
+                        if (i >= t->start && i < t->end)
+                            t->out[b * out_stride + i] = results[r];
+                    }
                 }
             }
         } else {
