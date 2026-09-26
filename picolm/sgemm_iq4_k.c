@@ -27,6 +27,7 @@
 #include <immintrin.h>
 #endif
 #include "quant.h"
+#if defined(__AVX2__)
 
 #define QK_K 256
 
@@ -257,3 +258,8 @@ void vec_dot_iq4_k_r4_q8_k_avx2(const void *vx, const void *wy, int n,
     }
 #endif
 }
+#else
+/* Non-AVX2 stubs for cross-compilation compatibility */
+void vec_dot_iq4_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out) { (void)vx; (void)wy; (void)n; (void)out; }
+void vec_dot_iq4_k_r4_q8_k_avx2(const void *vx, const void *wy, int n, float *out, int nrows) { (void)vx; (void)wy; (void)n; (void)out; (void)nrows; }
+#endif

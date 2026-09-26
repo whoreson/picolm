@@ -27,6 +27,7 @@
 #include <immintrin.h>
 #endif
 #include "quant.h"
+#if defined(__AVX2__)
 
 /* External: fp16 lookup table for fast conversion */
 /* fp16_to_fp32_lookup declared in quant.h */
@@ -246,3 +247,10 @@ int sgemm_q4_0_r8_q8_2_avx2(int nrows, int ncols, int k,
     return 0;
 #endif
 }
+#else
+/* Non-AVX2 stubs for cross-compilation compatibility */
+void vec_dot_q4_0_r8_q8_0_avx2(const void *vx, const void *wy, int n, float *out, int nrows) { (void)vx; (void)wy; (void)n; (void)out; (void)nrows; }
+int sgemm_q4_0_r8_q8_0_avx2(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) { (void)vx; (void)vy; (void)nrows; (void)ncols; (void)k; (void)out; (void)bs; (void)ith; (void)nth; return 0; }
+void vec_dot_q4_0_r8_q8_2_avx2(const void *vx, const void *wy, int n, float *out, int nrows) { (void)vx; (void)wy; (void)n; (void)out; (void)nrows; }
+int sgemm_q4_0_r8_q8_2_avx2(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) { (void)vx; (void)vy; (void)nrows; (void)ncols; (void)k; (void)out; (void)bs; (void)ith; (void)nth; return 0; }
+#endif

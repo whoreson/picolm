@@ -27,6 +27,7 @@
 #include <immintrin.h>
 #endif
 #include "quant.h"
+#if defined(__AVX2__)
 
 #define QK_K 256
 
@@ -276,3 +277,8 @@ int sgemm_iq2_k_r4_q8_k_avx2(int nrows, int ncols, int k,
     return 0;
 #endif
 }
+#else
+/* Non-AVX2 stubs for cross-compilation compatibility */
+void vec_dot_iq2_k_r4_q8_k_avx2(const void *vx, const void *wy, int n, float *out, int nrows) { (void)vx; (void)wy; (void)n; (void)out; (void)nrows; }
+int sgemm_iq2_k_r4_q8_k_avx2(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) { (void)vx; (void)vy; (void)nrows; (void)ncols; (void)k; (void)out; (void)bs; (void)ith; (void)nth; return 0; }
+#endif
