@@ -148,80 +148,91 @@ void vec_dot_iq4_k_r4_q8_k_avx2(const void *vx, const void *wy, int n,
     const block_q8_K *qk = (const block_q8_K *)wy;
     const int nb = n / QK_K;
 
-    float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    /* iq4k_values LUT: 32 entries (2 tables of 16), broadcast to both lanes */
+    static const int8_t kvalues_iq4k[32] = {
+        -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+        -123, -100, -79, -61, -45, -31, -18,  -6, 5, 17, 29, 42, 57, 73, 93, 117,
+    };
+    const __m256i values = _mm256_loadu_si256((const __m256i *)kvalues_iq4k);
+
+    const __m256i m4  = _mm256_set1_epi8(0xf);
+    const __m256i m30 = _mm256_set1_epi8(0x30);
+    const __m256i m32 = _mm256_set1_epi8(32);
+    const __m256i ms  = _mm256_set1_epi8(4);
+    const __m256i shift_shuffle = _mm256_set_epi64x(
+        0x0707070706060606ULL, 0x0505050504040404ULL,
+        0x0303030302020202ULL, 0x0101010100000000ULL);
+    const __m256i m16 = _mm256_set1_epi16(1);
+
+    __m256 acc = _mm256_setzero_ps();
+    uint64_t stored_scales[8];
 
     for (int ibl = 0; ibl < nb; ibl++) {
         const block_iq4_k_r4 *b = &iq4[ibl];
         const block_q8_K *q = &qk[ibl];
 
+        __m128 dl = _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *)b->d));
+        __m256 d4 = _mm256_set_m128(dl, dl);
         float q8_scale = q->d;
+        __m256 d4y = _mm256_mul_ps(d4, _mm256_set1_ps(q8_scale));
 
-        /* Process each row */
-        for (int row = 0; row < 4; row++) {
-            float d = fp16_to_fp32_lookup(b->d[row]);
-            float dy = d * q8_scale;
+        /* Scale extraction: same as ik_llama's mul_mat_iq4_k_r4_q8_k */
+        __m256i slbits = _mm256_loadu_si256((const __m256i *)b->scales_l);
+        __m256i sl1 = _mm256_and_si256(slbits, m4);
+        __m256i sl2 = _mm256_and_si256(_mm256_srli_epi16(slbits, 4), m4);
+        __m128i shbits = _mm_loadu_si128((const __m128i*)b->scales_h);
+        __m256i sh = _mm256_set_m128i(_mm_srli_epi16(shbits, 2), shbits);
+        __m256i i8scales1 = _mm256_sub_epi8(
+            _mm256_or_si256(sl1, _mm256_and_si256(m30, _mm256_slli_epi16(sh, 4))), m32);
+        __m256i i8scales2 = _mm256_sub_epi8(
+            _mm256_or_si256(sl2, _mm256_and_si256(m30, sh)), m32);
+        _mm256_storeu_si256((__m256i *)stored_scales + 0, i8scales1);
+        _mm256_storeu_si256((__m256i *)stored_scales + 1, i8scales2);
 
-            const int8_t *q8 = q->qs;  /* Reset q8 pointer for each row */
+        __m256i extra = _mm256_set1_epi64x(*(const uint64_t *)b->extra);
+        __m256i isum = _mm256_setzero_si256();
 
-            for (int ib = 0; ib < QK_K / 32; ++ib) {
-                /* Scale extraction for this row/subblock */
-                int is = 8 * ib + row;
-                int scale_lo = (int)((((b->scales_l[is % 32] >> (4 * (is / 32))) & 0xf) |
-                                      (((b->scales_h[is % 16] >> (2 * (is / 16))) & 3) << 4)) - 32);
-                is += 4;
-                int scale_hi = (int)((((b->scales_l[is % 32] >> (4 * (is / 32))) & 0xf) |
-                                      (((b->scales_h[is % 16] >> (2 * (is / 16))) & 3) << 4)) - 32);
+        for (int ib = 0; ib < QK_K / 32; ib++) {
+            /* Load scales for this subblock: same pattern as IQ2_K_R4/IQ3_K_R4 */
+            __m128i s128 = _mm_loadl_epi64((const __m128i *)(stored_scales + ib));
+            __m128i s16 = _mm_cvtepi8_epi16(s128);
+            __m256i scales = _mm256_cvtepi16_epi32(s16);
 
-                /* LUT table selection */
-                int use_table1_lo = b->extra[row] & (1 << ib);
-                int use_table1_hi = b->extra[row + 4] & (1 << ib);
+            /* Dequantize via LUT: two 32-byte loads (bits1 + bits2) */
+            __m256i bits1 = _mm256_loadu_si256((const __m256i *)b->qs + 2 * ib + 0);
+            __m256i bits2 = _mm256_loadu_si256((const __m256i *)b->qs + 2 * ib + 1);
+            __m256i shift = _mm256_and_si256(ms, _mm256_slli_epi16(extra, 2));
+            extra = _mm256_srli_epi16(extra, 1);
+            shift = _mm256_shuffle_epi8(shift, shift_shuffle);
 
-                /* Load qs for this row/subblock: 16 bytes per row per subblock
-                 * Layout: qs[64*ib + 4*row + i + offset] for i=0..3 */
-                /* We need 16 bytes (32 nibbles) for this row's subblock.
-                 * The bytes are interleaved: 4 rows, each contributing 4 bytes per i-group.
-                 * For row k, subblock ib: bytes at qs[64*ib + 4*k + 0..3] (4 bytes = 8 nibbles)
-                 * plus qs[64*ib + 4*k + 16..19] (for hi-nibbles of second 16)
-                 * plus qs[64*ib + 4*k + 32..35] (for lo-nibbles of second group)
-                 * plus qs[64*ib + 4*k + 48..51] (for hi-nibbles of second group)
-                 *
-                 * This is non-contiguous in memory. Scalar dequant is simpler here. */
+            __m256i qx[4];
+            qx[0] = _mm256_add_epi8(shift, _mm256_shuffle_epi8(values, _mm256_and_si256(bits1, m4)));
+            qx[1] = _mm256_add_epi8(shift, _mm256_shuffle_epi8(values, _mm256_and_si256(bits2, m4)));
+            qx[2] = _mm256_add_epi8(shift, _mm256_shuffle_epi8(values, _mm256_and_si256(_mm256_srli_epi16(bits1, 4), m4)));
+            qx[3] = _mm256_add_epi8(shift, _mm256_shuffle_epi8(values, _mm256_and_si256(_mm256_srli_epi16(bits2, 4), m4)));
 
-                /* Fall back to scalar for this subblock due to interleaved layout */
-                float sumi = 0.0f;
-                const int8_t *vals1 = use_table1_lo ? iq4k_values + 16 : iq4k_values;
-                const int8_t *vals2 = use_table1_hi ? iq4k_values + 16 : iq4k_values;
+            /* Sign trick: |qx| for unsigned multiply, sign applied to y */
+            __m256i s0 = _mm256_sign_epi8(qx[0], qx[0]);
+            __m256i s1 = _mm256_sign_epi8(qx[1], qx[1]);
+            __m256i s2 = _mm256_sign_epi8(qx[2], qx[2]);
+            __m256i s3 = _mm256_sign_epi8(qx[3], qx[3]);
 
-                for (int i = 0; i < 4; ++i) {
-                    /* dl1 values: qs offsets 0 and 0 (lo/hi nibble) */
-                    uint8_t qbyte0 = b->qs[64 * ib + 4 * row + i + 0];
-                    sumi += scale_lo * vals1[qbyte0 & 0xf] * q8[i + 0];
-                    sumi += scale_lo * vals1[qbyte0 >> 4] * q8[i + 8];
+            __m256i y_reg = _mm256_loadu_si256((const __m256i *)q->qs + ib);
 
-                    /* dl2 values: qs offsets 16 and 16 */
-                    uint8_t qbyte1 = b->qs[64 * ib + 4 * row + i + 16];
-                    sumi += scale_hi * vals2[qbyte1 & 0xf] * q8[i + 16];
-                    sumi += scale_hi * vals2[qbyte1 >> 4] * q8[i + 24];
+            __m256i t1 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s0, _mm256_sign_epi8(_mm256_shuffle_epi32(y_reg, 0x00), qx[0])));
+            __m256i t2 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s1, _mm256_sign_epi8(_mm256_shuffle_epi32(y_reg, 0x55), qx[1])));
+            __m256i t3 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s2, _mm256_sign_epi8(_mm256_shuffle_epi32(y_reg, 0xaa), qx[2])));
+            __m256i t4 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s3, _mm256_sign_epi8(_mm256_shuffle_epi32(y_reg, 0xff), qx[3])));
+            __m256i sumi = _mm256_add_epi32(_mm256_add_epi32(t1, t2), _mm256_add_epi32(t3, t4));
 
-                    /* dl1 second group: qs offsets 32 */
-                    uint8_t qbyte2 = b->qs[64 * ib + 4 * row + i + 32];
-                    sumi += scale_lo * vals1[qbyte2 & 0xf] * q8[i + 4];
-                    sumi += scale_lo * vals1[qbyte2 >> 4] * q8[i + 12];
-
-                    /* dl2 second group: qs offsets 48 */
-                    uint8_t qbyte3 = b->qs[64 * ib + 4 * row + i + 48];
-                    sumi += scale_hi * vals2[qbyte3 & 0xf] * q8[i + 20];
-                    sumi += scale_hi * vals2[qbyte3 >> 4] * q8[i + 28];
-                }
-                q8 += 32;
-
-                /* Accumulate into FP32 result directly */
-                result[row] += sumi * dy;
-            }
+            isum = _mm256_add_epi32(isum, _mm256_mullo_epi32(scales, sumi));
         }
+
+        acc = _mm256_fmadd_ps(d4y, _mm256_cvtepi32_ps(isum), acc);
     }
 
-    for (int r = 0; r < nrows; r++) out[r] = result[r];
+    __m128 sum = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
+    _mm_storeu_ps(out, sum);
 #else
     /* Scalar fallback: dequantize each weight row, dequantize Q8_K activations,
      * then F32 dot product. */
