@@ -595,6 +595,9 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
     if (c->is_gpt2) {
         n_norm += (size_t)(c->n_layers * 2 + 1) * c->n_embd; /* LayerNorm biases */
     }
+    if (c->is_stablelm) {
+        n_norm += (size_t)(c->n_layers * 1 + 1) * c->n_embd; /* LayerNorm (attn_norm + output) */
+    }
     size_t sz_norm = n_norm * sizeof(float);
 
     /* SSM state buffers (Qwen3.5) */
@@ -1162,8 +1165,8 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         }
         nw += c->n_embd;
 
-        /* GPT-2 LayerNorm bias for attn_norm */
-        if (c->is_gpt2) {
+        /* GPT-2/StableLM LayerNorm bias for attn_norm */
+        if (c->is_gpt2 || c->is_stablelm) {
             s->attn_norm_b[l] = nw;
             if (lw->attn_norm_bias) {
                 memcpy(nw, lw->attn_norm_bias, c->n_embd * sizeof(float));
@@ -1222,8 +1225,8 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
     }
     nw += c->n_embd;
 
-    /* GPT-2 output norm bias */
-    if (c->is_gpt2) {
+    /* GPT-2/StableLM output norm bias */
+    if (c->is_gpt2 || c->is_stablelm) {
         s->output_norm_b = nw;
         if (m->weights.output_norm_bias) {
             memcpy(nw, m->weights.output_norm_bias, c->n_embd * sizeof(float));
@@ -2524,9 +2527,15 @@ float *model_forward(model_t *m, int token, int pos) {
             continue;
         }
         /* ---- Attention ---- */
-        /* Debug: dump pipe_x input to RMSNorm for layer 0 at pos=0,1 */
-        rmsnorm(s->xb, s->x, s->attn_norm_w[l], dim, c->rms_norm_eps);
-        /* Debug: dump RMSNorm output for layer 0 at pos=1 */
+        if (c->is_gpt2 || c->is_stablelm) {
+            layernorm(s->xb, s->x, s->attn_norm_w[l], s->attn_norm_b[l], dim, c->rms_norm_eps);
+        } else {
+            rmsnorm(s->xb, s->x, s->attn_norm_w[l], dim, c->rms_norm_eps);
+        }
+        /* Save normalized input for parallel residual FFN */
+        if (c->use_parallel_residual) {
+            memcpy(s->hb2, s->xb, dim * sizeof(float));
+        }
 
         /* Q projection (Q+gate joint for Qwen3.5 full attention) */
         tensor_set_repacked(m->repack_used[ri] ? m->repack_buffers[ri] : NULL);
@@ -2566,7 +2575,7 @@ float *model_forward(model_t *m, int token, int pos) {
 #ifdef PICOLM_GPU
         if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->attn_k, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
 #endif
-        float *k_tmp = s->xb2; /* reuse xb2 as temp for K (kv_dim <= dim) */
+        float *k_tmp = c->use_parallel_residual ? s->hb : s->xb2;
         matmul(k_tmp, s->xb, lw->attn_k, dim, kv_dim, lw->type_attn_k);
         tensor_set_repacked(NULL);
 
@@ -2845,7 +2854,9 @@ float *model_forward(model_t *m, int token, int pos) {
 #endif
         matmul(s->xb2, s->xb, lw->attn_output, q_dim, dim, lw->type_attn_output);
         tensor_set_repacked(NULL);
-        vec_add(s->x, s->xb2, dim);
+        if (!c->use_parallel_residual) {
+            vec_add(s->x, s->xb2, dim);
+        }
 
         /* ---- FFN (SwiGLU or MoE) - only if MLP weights exist for this layer ---- */
         if (c->has_moe) {
@@ -2854,7 +2865,9 @@ float *model_forward(model_t *m, int token, int pos) {
             moe_forward(m, s, s->xb, s->xb, lw);
             vec_add(s->x, s->xb, dim);
         } else if (lw->ffn_gate && lw->ffn_up && lw->ffn_down) {
-            rmsnorm(s->xb, s->x, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
+            if (!c->use_parallel_residual) {
+                rmsnorm(s->xb, s->x, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
+            }
 
 #ifdef PICOLM_GPU
             /* Fused FFN on GPU: y = down(silu(gate(x)) * up(x)) in ONE command
@@ -2876,29 +2889,56 @@ float *model_forward(model_t *m, int token, int pos) {
 #ifdef PICOLM_GPU
             if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->ffn_gate, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
 #endif
-            matmul(s->hb,  s->xb, lw->ffn_gate, dim, n_ffn, lw->type_ffn_gate);
+            if (c->use_parallel_residual) {
+                /* FFN input is the saved attn_norm output in s->hb2.
+                 * Copy it to s->xb (dim-sized, fits) so s->hb2 can be
+                 * reused as the up-projection output buffer (n_ffn-sized).
+                 * s->xb is free here: the attention output it held was
+                 * consumed by the o_proj matmul into s->xb2. */
+                memcpy(s->xb, s->hb2, dim * sizeof(float));
+                matmul(s->hb,  s->xb, lw->ffn_gate, dim, n_ffn, lw->type_ffn_gate);
+            } else {
+                matmul(s->hb,  s->xb, lw->ffn_gate, dim, n_ffn, lw->type_ffn_gate);
+            }
             tensor_set_repacked(NULL);
 
             tensor_set_repacked(m->repack_used[ri+6] ? m->repack_buffers[ri+6] : NULL);
 #ifdef PICOLM_GPU
             if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->ffn_up, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
 #endif
-            matmul(s->hb2, s->xb, lw->ffn_up,   dim, n_ffn, lw->type_ffn_up);
+            if (c->use_parallel_residual) {
+                /* Up output to s->hb2 (n_ffn-sized, saved input already copied to s->xb) */
+                matmul(s->hb2, s->xb, lw->ffn_up, dim, n_ffn, lw->type_ffn_up);
+            } else {
+                matmul(s->hb2, s->xb, lw->ffn_up, dim, n_ffn, lw->type_ffn_up);
+            }
             tensor_set_repacked(NULL);
 
             silu(s->hb, n_ffn);
-            elemwise_mul(s->hb, s->hb, s->hb2, n_ffn);
+            if (c->use_parallel_residual) {
+                elemwise_mul(s->hb, s->hb, s->hb2, n_ffn);
+            } else {
+                elemwise_mul(s->hb, s->hb, s->hb2, n_ffn);
+            }
 
             tensor_set_repacked(m->repack_used[ri+5] ? m->repack_buffers[ri+5] : NULL);
 #ifdef PICOLM_GPU
             if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->ffn_down, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
 #endif
-            matmul(s->xb, s->hb, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
-            tensor_set_repacked(NULL);
+            if (c->use_parallel_residual) {
+                /* FFN down writes to s->xb, then add both attn and ffn to residual */
+                matmul(s->xb, s->hb, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
+                tensor_set_repacked(NULL);
+                vec_add(s->x, s->xb2, dim); /* attn output */
+                vec_add(s->x, s->xb, dim);  /* ffn output */
+            } else {
+                matmul(s->xb, s->hb, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
+                tensor_set_repacked(NULL);
+                vec_add(s->x, s->xb, dim);
+            }
 #ifdef PICOLM_GPU
 ffn_done:
 #endif
-            vec_add(s->x, s->xb, dim);
         }
         /* DEBUG: dump post-layer residual for first few layers */
         if (getenv("PICOLM_DBG_LAYER") && pos <= 4 && l < 3) {
@@ -2912,7 +2952,11 @@ ffn_done:
     }
 
     /* 3. Final RMSNorm */
-    rmsnorm(s->x, s->x, s->output_norm_w, dim, c->rms_norm_eps);
+    if (s->output_norm_b) {
+        layernorm(s->x, s->x, s->output_norm_w, s->output_norm_b, dim, c->rms_norm_eps);
+    } else {
+        rmsnorm(s->x, s->x, s->output_norm_w, dim, c->rms_norm_eps);
+    }
 
     /* 4. Output projection -> logits */
     tensor_set_repacked(m->repack_used[1] ? m->repack_buffers[1] : NULL);
@@ -3933,9 +3977,21 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
             continue;
         }
 
-        /* RMSNorm */
-        for (bi = 0; bi < n_tokens; bi++)
-            rmsnorm(xb_batch + bi * dim, x_batch + bi * dim, s->attn_norm_w[l], dim, c->rms_norm_eps);
+        /* LayerNorm for GPT-2/StableLM, RMSNorm for others */
+        for (bi = 0; bi < n_tokens; bi++) {
+            if (c->is_gpt2 || c->is_stablelm) {
+                layernorm(xb_batch + bi * dim, x_batch + bi * dim,
+                          s->attn_norm_w[l], s->attn_norm_b[l], dim, c->rms_norm_eps);
+            } else {
+                rmsnorm(xb_batch + bi * dim, x_batch + bi * dim,
+                        s->attn_norm_w[l], dim, c->rms_norm_eps);
+            }
+        }
+        /* Save normalized input for parallel residual FFN */
+        if (c->use_parallel_residual) {
+            for (bi = 0; bi < n_tokens; bi++)
+                memcpy(hb2_batch + bi * ffn_buf_size, xb_batch + bi * dim, dim * sizeof(float));
+        }
 
         /* Diagnostic: dump pre-RMSNorm input to first attention layer */
 
@@ -3998,14 +4054,21 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
             /* GQA layout: [layer][pos] * kv_row_size_gqa */
             uint8_t *kcl = s->key_cache + (size_t)this_attn_ord * seq_len * s->kv_row_size_k;
             uint8_t *vcl = s->val_cache + (size_t)this_attn_ord * seq_len * s->kv_row_size_v;
-                        for (bi = 0; bi < n_tokens; bi++) {
-                int pos = start_pos + bi;
-                float *q_pos = q_batch + bi * q_dim;
-                float *k_pos = k_batch + bi * kv_dim;
-                float *v_pos = v_batch + bi * kv_dim;
+                        /* rope_dim_pf / rope_half_pf: loop-invariant, computed once.
+                 * rope_half_pf is the table row stride (rope_dim/2), NOT head_dim/2.
+                 * For most models rope_dim == head_dim so both are equal, but for
+                 * partial-RoPE models (StableLM/Clio: rope_dim=32, head_dim=128)
+                 * using head_dim/2 reads past the correct table row. */
+                int rope_dim_pf = (c->rope_dim > 0) ? c->rope_dim : head_dim;
+                int rope_half_pf = rope_dim_pf / 2;
+                for (bi = 0; bi < n_tokens; bi++) {
+                    int pos = start_pos + bi;
+                    float *q_pos = q_batch + bi * q_dim;
+                    float *k_pos = k_batch + bi * kv_dim;
+                    float *v_pos = v_batch + bi * kv_dim;
 
-                const float *cos_pos = s->rope_cos + (size_t)pos * (head_dim / 2);
-                const float *sin_pos = s->rope_sin + (size_t)pos * (head_dim / 2);
+                const float *cos_pos = s->rope_cos + (size_t)pos * rope_half_pf;
+                const float *sin_pos = s->rope_sin + (size_t)pos * rope_half_pf;
 
                 /* QK-norm (Qwen3) */
                 if (lw->attn_q_norm) {
@@ -4028,8 +4091,6 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                     }
                 }
 
-                int rope_dim_pf = (c->rope_dim > 0) ? c->rope_dim : head_dim;
-                int rope_half_pf = rope_dim_pf / 2;
                 rope(q_pos, k_pos, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos, c->rope_type, rope_half_pf);
                 /* Debug: compute score for first Q token, KV pos 0, head 0 */
                 if (l == 3 && pos == 0 && _SSM_DBG) {
@@ -4282,10 +4343,12 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         }
                 tensor_set_repacked(NULL);
 
-        /* Residual: x += attn_out */
-        for (bi = 0; bi < n_tokens; bi++) {
-            float *a = x_batch + bi * dim, *b = xb2_batch + bi * dim;
-            for (int d2 = 0; d2 < dim; d2++) a[d2] += b[d2];
+        /* Residual: x += attn_out (deferred for parallel residual) */
+        if (!c->use_parallel_residual) {
+            for (bi = 0; bi < n_tokens; bi++) {
+                float *a = x_batch + bi * dim, *b = xb2_batch + bi * dim;
+                for (int d2 = 0; d2 < dim; d2++) a[d2] += b[d2];
+            }
         }
         if (getenv("PICOLM_L0DBG") && l == 0) {
             int lt = n_tokens - 1;
@@ -4304,20 +4367,39 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                 for (int d2 = 0; d2 < dim; d2++) a[d2] += b[d2];
             }
         } else {
-            /* FFN RMSNorm */
-            for (bi = 0; bi < n_tokens; bi++)
-                rmsnorm(xb_batch + bi * dim, x_batch + bi * dim, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
+            /* FFN RMSNorm (skip for parallel residual: uses saved normalized input) */
+            if (!c->use_parallel_residual) {
+                for (bi = 0; bi < n_tokens; bi++)
+                    rmsnorm(xb_batch + bi * dim, x_batch + bi * dim, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
+            }
 
             /* FFN gate+up (batched dual) */
             tensor_set_repacked(m->repack_used[7+l*9] ? m->repack_buffers[7+l*9] : NULL);
-            matmul_dual_batch(hb_batch, hb2_batch, xb_batch, n_tokens,
-                              lw->ffn_gate, lw->ffn_up, dim, n_ffn,
-                              lw->type_ffn_gate, lw->type_ffn_up);
+            if (c->use_parallel_residual) {
+                /* Parallel residual: FFN input is the saved attn_norm output in
+                 * hb2_batch (saved before attention). The up output needs n_ffn
+                 * space but xb_batch is only max_dim wide -- writing there
+                 * overflows into q/k/v/hb/hb2 batch buffers.
+                 * Fix: copy the saved input from hb2_batch back to xb_batch
+                 * (dim-sized, fits), then use hb2_batch as the up output.
+                 * xb_batch is free at this point: the attention output was
+                 * consumed by the o_proj matmul and written to xb2_batch. */
+                for (bi = 0; bi < n_tokens; bi++)
+                    memcpy(xb_batch + bi * max_dim, hb2_batch + bi * ffn_buf_size, dim * sizeof(float));
+                matmul_dual_batch(hb_batch, hb2_batch, xb_batch, n_tokens,
+                                  lw->ffn_gate, lw->ffn_up, dim, n_ffn,
+                                  lw->type_ffn_gate, lw->type_ffn_up);
+            } else {
+                matmul_dual_batch(hb_batch, hb2_batch, xb_batch, n_tokens,
+                                  lw->ffn_gate, lw->ffn_up, dim, n_ffn,
+                                  lw->type_ffn_gate, lw->type_ffn_up);
+            }
             tensor_set_repacked(NULL);
 
             /* SiLU + mul */
             for (bi = 0; bi < n_tokens; bi++) {
                 silu(hb_batch + bi * n_ffn, n_ffn);
+                /* Both paths: gate in hb_batch, up in hb2_batch, result in hb_batch */
                 elemwise_mul(hb_batch + bi * n_ffn, hb_batch + bi * n_ffn, hb2_batch + bi * n_ffn, n_ffn);
             }
 
@@ -4326,12 +4408,24 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #ifdef PICOLM_GPU
             if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)m->gpu.layers[l].ffn_down, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
 #endif
-            matmul_batch(xb2_batch, hb_batch, n_tokens, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
-            tensor_set_repacked(NULL);
-            /* Residual: x += ffn_out */
-            for (bi = 0; bi < n_tokens; bi++) {
-                float *a = x_batch + bi * dim, *b = xb2_batch + bi * dim;
-                for (int d2 = 0; d2 < dim; d2++) a[d2] += b[d2];
+            if (c->use_parallel_residual) {
+                matmul_batch(xb_batch, hb_batch, n_tokens, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
+                tensor_set_repacked(NULL);
+                /* Parallel residual: add both attn_out (in xb2_batch) and ffn_out (in xb_batch) */
+                for (bi = 0; bi < n_tokens; bi++) {
+                    float *x = x_batch + bi * dim;
+                    float *a = xb2_batch + bi * dim;
+                    float *f = xb_batch + bi * dim;
+                    for (int d2 = 0; d2 < dim; d2++) x[d2] += a[d2] + f[d2];
+                }
+            } else {
+                matmul_batch(xb2_batch, hb_batch, n_tokens, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
+                tensor_set_repacked(NULL);
+                /* Residual: x += ffn_out */
+                for (bi = 0; bi < n_tokens; bi++) {
+                    float *a = x_batch + bi * dim, *b = xb2_batch + bi * dim;
+                    for (int d2 = 0; d2 < dim; d2++) a[d2] += b[d2];
+                }
             }
         }
         /* Per-layer RMS tracking (CPU) */
@@ -4349,7 +4443,11 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 
     /* Final norm + output (last token only) */
     float *last_x = x_batch + (n_tokens - 1) * dim;
+    if (s->output_norm_b) {
+        layernorm(s->x, last_x, s->output_norm_w, s->output_norm_b, dim, c->rms_norm_eps);
+    } else {
         rmsnorm(s->x, last_x, s->output_norm_w, dim, c->rms_norm_eps);
+    }
     tensor_set_repacked(m->repack_used[1] ? m->repack_buffers[1] : NULL);
     /* Diagnostic: dump CPU prefill hidden state before output projection */
     if (getenv("PICOLM_DBG")) {

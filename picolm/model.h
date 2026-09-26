@@ -41,6 +41,8 @@ typedef struct {
     int is_qwen;        /* 1 if model architecture is qwen3/qwen35 */
     int is_gemma3n;     /* 1 if model architecture is gemma3n */
     int is_gpt2;        /* 1 if model architecture is gpt2 */
+    int is_stablelm;    /* 1 if model architecture is stablelm (Clio) */
+    int use_parallel_residual; /* 1 if attention and FFN use parallel residuals (StableLM) */
     int is_tekken;      /* 1 if tokenizer.ggml.pre == "tekken" (Mistral Tekken tokenizer,
                             e.g. Mistral-Nemo-2407). GPT-2-style BPE vocab/merges but with
                             Tekken's own pretokenizer regex; see qwen_tokenize.c. */
