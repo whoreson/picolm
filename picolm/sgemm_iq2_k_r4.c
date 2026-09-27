@@ -282,3 +282,173 @@ int sgemm_iq2_k_r4_q8_k_avx2(int nrows, int ncols, int k,
 void vec_dot_iq2_k_r4_q8_k_avx2(const void *vx, const void *wy, int n, float *out, int nrows) { (void)vx; (void)wy; (void)n; (void)out; (void)nrows; }
 int sgemm_iq2_k_r4_q8_k_avx2(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) { (void)vx; (void)vy; (void)nrows; (void)ncols; (void)k; (void)out; (void)bs; (void)ith; (void)nth; return 0; }
 #endif
+
+/* ================================================================
+ * IQ2_K_R4 x Q8_K ARM NEON GEMV and GEMM kernels
+ * ================================================================
+ * Scalar inner loop with NEON LUT lookup. Correct but not
+ * highly vectorized -- the R4 layout makes SIMD difficult.
+ * ================================================================ */
+#if defined(PICOLM_NEON)
+#include <arm_neon.h>
+
+static inline int8_t iq2_k_r4_scale(const uint8_t *scales, int idx) {
+    return (int8_t)((scales[idx % 32] >> (4 * (idx / 32))) & 0xf) - 8;
+}
+
+void vec_dot_iq2_k_r4_q8_k_neon(const void *vx, const void *vy, int n,
+                                  float *out, int nrows) {
+    assert(nrows == 4);
+    assert(n % QK_K == 0);
+
+    const block_iq2_k_r4 *iq2 = (const block_iq2_k_r4 *)vx;
+    const block_q8_K *qk = (const block_q8_K *)vy;
+    const int nb = n / QK_K;
+
+    float accf[4] = {0, 0, 0, 0};
+    float d_arr[4];
+
+    for (int ibl = 0; ibl < nb; ibl++) {
+        for (int r = 0; r < 4; r++)
+            d_arr[r] = fp16_to_fp32_lookup(iq2[ibl].d[r]);
+        float q8_scale = qk[ibl].d;
+        const int8_t *q8_base = qk[ibl].qs;
+        const uint8_t *scales = iq2[ibl].scales;
+        const uint8_t *extra = iq2[ibl].extra;
+        const uint8_t *qs_base = iq2[ibl].qs;
+
+        for (int ib = 0; ib < QK_K / 32; ib++) {
+            const uint8_t *qs = qs_base + ib * 32;
+
+            for (int iy = 0; iy < 4; iy++) {
+                int8_t s1 = iq2_k_r4_scale(scales, 8 * ib + iy);
+                int8_t s2 = iq2_k_r4_scale(scales, 8 * ib + iy + 4);
+
+                const int8_t *values1 = iq2nl_values + (extra[iy + 0] & (1 << ib) ? 4 : 0);
+                const int8_t *values2 = iq2nl_values + (extra[iy + 4] & (1 << ib) ? 4 : 0);
+
+                int32_t row_sum = 0;
+
+                for (int i = 0; i < 4; i++) {
+                    uint8_t b0 = qs[4 * iy + i];
+                    int base = 32 * ib + i;
+                    for (int s = 0; s < 4; s++) {
+                        int idx = (b0 >> (s * 2)) & 3;
+                        row_sum += s1 * values1[idx] * q8_base[base + s * 4];
+                    }
+                }
+                for (int i = 0; i < 4; i++) {
+                    uint8_t b1 = qs[4 * iy + i + 16];
+                    int base = 32 * ib + i;
+                    for (int s = 0; s < 4; s++) {
+                        int idx = (b1 >> (s * 2)) & 3;
+                        row_sum += s2 * values2[idx] * q8_base[base + 16 + s * 4];
+                    }
+                }
+
+                accf[iy] += (float)row_sum * d_arr[iy] * q8_scale;
+            }
+        }
+    }
+
+    for (int r = 0; r < 4; r++) out[r] = accf[r];
+}
+
+int sgemm_iq2_k_r4_q8_k_neon(int nrows, int ncols, int k,
+                               const void *vx, const void *vy,
+                               float *out, size_t bs,
+                               int ith, int nth) {
+    if (nrows < 4 || ncols < 1 || k % QK_K != 0 || nrows % 4 != 0)
+        return 0;
+
+    const int nb = k / QK_K;
+
+    int64_t ytiles = nrows / 4;
+    int64_t xtiles = ncols / 2;
+    int64_t n_tail = ncols - xtiles * 2;
+    int64_t xtiles_ext = xtiles + (n_tail > 0 ? 1 : 0);
+    int64_t tiles = ytiles * xtiles_ext;
+    if (tiles <= 0) return 0;
+
+    int64_t duty = (tiles + nth - 1) / nth;
+    int64_t start = duty * ith;
+    int64_t end = start + duty;
+    if (end > tiles) end = tiles;
+
+    size_t w_block_bytes = nb * sizeof(block_iq2_k_r4);
+    size_t a_row_bytes = nb * sizeof(block_q8_K);
+
+    for (int64_t job = start; job < end; job++) {
+        int64_t ii = (job / xtiles_ext) * 4;
+        int64_t xt = job % xtiles_ext;
+        int64_t jj = xt * 2;
+        int64_t ncols_tile = (xt < xtiles) ? 2 : n_tail;
+        if (ncols_tile < 1) ncols_tile = 1;
+
+        const block_iq2_k_r4 *iq2 = (const block_iq2_k_r4 *)
+            ((const char *)vx + (ii / 4) * w_block_bytes);
+
+        float acc[4][2] = { {{0,0}},{{0,0}},{{0,0}},{{0,0}} };
+
+        const block_q8_K *qk_ptr[2];
+        for (int c = 0; c < ncols_tile; c++) {
+            qk_ptr[c] = (const block_q8_K *)
+                ((const char *)vy + (jj + c) * a_row_bytes);
+        }
+
+        for (int ibl = 0; ibl < nb; ibl++) {
+            float d_arr[4];
+            for (int r = 0; r < 4; r++)
+                d_arr[r] = fp16_to_fp32_lookup(iq2[ibl].d[r]);
+            const uint8_t *scales = iq2[ibl].scales;
+            const uint8_t *extra = iq2[ibl].extra;
+            const uint8_t *qs_base = iq2[ibl].qs;
+
+            for (int c = 0; c < ncols_tile; c++) {
+                float q8_scale = qk_ptr[c][ibl].d;
+                const int8_t *q8_base = qk_ptr[c][ibl].qs;
+
+                for (int iy = 0; iy < 4; iy++) {
+                    for (int ib = 0; ib < QK_K / 32; ib++) {
+                        const uint8_t *qs = qs_base + ib * 32;
+
+                        int8_t s1 = iq2_k_r4_scale(scales, 8 * ib + iy);
+                        int8_t s2 = iq2_k_r4_scale(scales, 8 * ib + iy + 4);
+
+                        const int8_t *values1 = iq2nl_values + (extra[iy + 0] & (1 << ib) ? 4 : 0);
+                        const int8_t *values2 = iq2nl_values + (extra[iy + 4] & (1 << ib) ? 4 : 0);
+
+                        int32_t row_sum = 0;
+
+                        for (int i = 0; i < 4; i++) {
+                            uint8_t b0 = qs[4 * iy + i];
+                            int base = 32 * ib + i;
+                            for (int s = 0; s < 4; s++) {
+                                int idx = (b0 >> (s * 2)) & 3;
+                                row_sum += s1 * values1[idx] * q8_base[base + s * 4];
+                            }
+                        }
+                        for (int i = 0; i < 4; i++) {
+                            uint8_t b1 = qs[4 * iy + i + 16];
+                            int base = 32 * ib + i;
+                            for (int s = 0; s < 4; s++) {
+                                int idx = (b1 >> (s * 2)) & 3;
+                                row_sum += s2 * values2[idx] * q8_base[base + 16 + s * 4];
+                            }
+                        }
+
+                        acc[iy][c] += (float)row_sum * d_arr[iy] * q8_scale;
+                    }
+                }
+            }
+        }
+
+        for (int r = 0; r < 4; r++) {
+            for (int c = 0; c < ncols_tile; c++) {
+                out[ii + r + (jj + c) * bs] = acc[r][c];
+            }
+        }
+    }
+    return nrows;
+}
+#endif /* PICOLM_NEON */
