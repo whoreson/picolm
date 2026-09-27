@@ -8431,10 +8431,6 @@ float vec_dot_iq2_k_q8_k(const void *vx, const void *wy, int n) {
     float result;
     vec_dot_iq2_k_q8_k_avx2(vx, wy, n, &result);
     return result;
-#elif defined(PICOLM_NEON)
-    float result;
-    vec_dot_iq2_k_q8_k_neon(vx, wy, n, &result);
-    return result;
 #else
     /* Scalar fallback */
     const block_iq2_k *x = (const block_iq2_k *)vx;
@@ -9029,9 +9025,6 @@ void vec_dot_iq2_k_r4_q8_k_batch4(const void *vx, const void *vy, int n, float *
 #if defined(PICOLM_AVX2)
     /* AVX2 path: call the optimized kernel from sgemm_iq2_k_r4.c */
     vec_dot_iq2_k_r4_q8_k_avx2(vx, vy, n, out, 4);
-#elif defined(PICOLM_NEON)
-    /* NEON path: call the optimized kernel from sgemm_iq2_k_r4.c */
-    vec_dot_iq2_k_r4_q8_k_neon(vx, vy, n, out, 4);
 #else
     /* Scalar fallback: each row processes independently. */
     const block_iq2_k_r4 *iq2 = (const block_iq2_k_r4 *)vx;

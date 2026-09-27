@@ -1087,40 +1087,22 @@ static void matmul_worker_f(matmul_task_t *t) {
             t->out[i] = vec_dot_q2_K_q8_K(
                 t->W + (size_t)i * t->row_bytes, qx, t->n);
         }
-    } else if (t->qtype == GGUF_TYPE_IQ2_K) {
-        /* IQ2_K plain: fast path with Q8_K activations (set by matmul()). */
-        const block_q8_K *qx = (const block_q8_K *)t->x;
+    } else if (t->qtype == GGUF_TYPE_IQ2_K || t->qtype == GGUF_TYPE_IQ3_K) {
+        /* IQ2_K/IQ3_K plain: single-row blocks. Handle both batched and
+         * non-batched (decode) modes. */
         if (nb > 0) {
-            size_t q8k_row_bytes = gguf_type_row_size(GGUF_TYPE_Q8_K, t->n);
             for (int i = t->start; i < t->end; i++) {
                 const char *wrow = t->W + (size_t)i * t->row_bytes;
                 for (int b = 0; b < nb; b++) {
-                    const char *xb = (const char *)qx + (size_t)b * q8k_row_bytes;
-                    t->out[b * out_stride + i] = vec_dot_iq2_k_q8_k(wrow, xb, t->n);
+                    t->out[b * out_stride + i] = vec_dot(wrow,
+                        (const float *)t->x + (size_t)b * t->n,
+                        t->n, t->qtype);
                 }
             }
         } else {
             for (int i = t->start; i < t->end; i++) {
-                t->out[i] = vec_dot_iq2_k_q8_k(t->W + (size_t)i * t->row_bytes,
-                                                qx, t->n);
-            }
-        }
-    } else if (t->qtype == GGUF_TYPE_IQ3_K) {
-        /* IQ3_K plain: fast path with Q8_K activations (set by matmul()). */
-        const block_q8_K *qx = (const block_q8_K *)t->x;
-        if (nb > 0) {
-            size_t q8k_row_bytes = gguf_type_row_size(GGUF_TYPE_Q8_K, t->n);
-            for (int i = t->start; i < t->end; i++) {
-                const char *wrow = t->W + (size_t)i * t->row_bytes;
-                for (int b = 0; b < nb; b++) {
-                    const char *xb = (const char *)qx + (size_t)b * q8k_row_bytes;
-                    t->out[b * out_stride + i] = vec_dot_iq3_k_q8_k(wrow, xb, t->n);
-                }
-            }
-        } else {
-            for (int i = t->start; i < t->end; i++) {
-                t->out[i] = vec_dot_iq3_k_q8_k(t->W + (size_t)i * t->row_bytes,
-                                                qx, t->n);
+                t->out[i] = vec_dot(t->W + (size_t)i * t->row_bytes,
+                                    t->x, t->n, t->qtype);
             }
         }
     } else {
@@ -2316,50 +2298,6 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
                     pool_tasks[t].x_d = NULL; pool_tasks[t].W = wptr;
                     pool_tasks[t].row_bytes = row_bytes; pool_tasks[t].n = n;
                     pool_tasks[t].qtype = GGUF_TYPE_Q2_K;
-                    pool_tasks[t].n_batch = 0;
-                }
-                pool_clear_unused(active, nt);
-                pool_init(nt);
-                pool_wake(nt);
-                matmul_worker_f(&pool_tasks[0]);
-                pool_wait(nt);
-            }
-
-            if (qx_owned) free(qx);
-            return;
-        }
-        /* If allocation failed, fall through to generic path */
-    } else if ((qtype == GGUF_TYPE_IQ2_K || qtype == GGUF_TYPE_IQ3_K) && n >= 256 && n % 256 == 0) {
-        /* IQ2_K/IQ3_K plain fast path: quantize x to Q8_K once, then vec_dot_*_q8_K */
-        size_t qx_size = (n / 256) * sizeof(block_q8_K);
-        block_q8_K *qx = NULL;
-        int qx_owned = 0;
-        if (n_threads <= 1 && scratch_buf != NULL && qx_size <= (size_t)scratch_size) {
-            qx = (block_q8_K *)scratch_buf;
-        } else {
-            qx = (block_q8_K *)malloc(qx_size);
-            qx_owned = 1;
-        }
-        if (qx != NULL) {
-            quantize_row_q8_K(x, qx, n);
-
-            if (n_threads <= 1 || d < 4 || d < matmul_min_rows) {
-                for (int i = 0; i < d; i++) {
-                    out[i] = vec_dot_iq2_k_q8_k(wptr + (size_t)i * row_bytes, qx, n);
-                }
-                if (qx_owned) free(qx);
-                return;
-            }
-
-            int nt = pool_total_threads(n_threads);
-            int want = n_threads < nt ? n_threads : nt;
-            {
-                int active = pool_assign_rows(0, want, d);
-                for (int t = 0; t < active; t++) {
-                    pool_tasks[t].out = out; pool_tasks[t].x = (const float *)qx;
-                    pool_tasks[t].x_d = NULL; pool_tasks[t].W = wptr;
-                    pool_tasks[t].row_bytes = row_bytes; pool_tasks[t].n = n;
-                    pool_tasks[t].qtype = qtype;
                     pool_tasks[t].n_batch = 0;
                 }
                 pool_clear_unused(active, nt);
