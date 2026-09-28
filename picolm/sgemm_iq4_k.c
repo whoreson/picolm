@@ -479,3 +479,195 @@ extern int sgemm_iq4_k_q8_k_neon(int nrows, int ncols, int k,
                                   const void *vx, const void *vy,
                                   float *out, size_t bs, int ith, int nth);
 #endif /* ARM_NEON */
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+
+/* ================================================================
+ * IQ4_K_R4 x Q8_K ARM NEON GEMV kernel
+ *
+ * 4-row interleaved 4-bit non-linear quantization.
+ * Scalar inner loop with scalar LUT lookup (R4 layout makes SIMD
+ * difficult due to complex interleaving of qs/scales/extra).
+ * ================================================================ */
+static inline int iq4_k_r4_scale(const uint8_t *scales_l, const uint8_t *scales_h, int idx) {
+    int sl = (scales_l[idx % 32] >> (4 * (idx / 32))) & 0xf;
+    int sh = (scales_h[idx % 16] >> (2 * (idx / 16))) & 3;
+    return (sl | (sh << 4)) - 32;
+}
+
+void vec_dot_iq4_k_r4_q8_k_neon(const void *vx, const void *wy, int n,
+                                  float *out, int nrows) {
+    assert(nrows == 4);
+    assert(n % QK_K == 0);
+
+    const block_iq4_k_r4 *iq4 = (const block_iq4_k_r4 *)vx;
+    const block_q8_K *qk = (const block_q8_K *)wy;
+    const int nb = n / QK_K;
+
+    /* Two LUT tables for scalar lookup */
+    const int8_t lut0[16] = {
+        -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+    };
+    const int8_t lut1[16] = {
+        -123, -100, -79, -61, -45, -31, -18,  -6, 5, 17, 29, 42, 57, 73, 93, 117,
+    };
+
+    float accf[4] = {0, 0, 0, 0};
+    float d_arr[4];
+
+    for (int ibl = 0; ibl < nb; ibl++) {
+        for (int r = 0; r < 4; r++)
+            d_arr[r] = fp16_to_fp32_lookup(iq4[ibl].d[r]);
+        float q8_scale = qk[ibl].d;
+        const int8_t *q8_base = qk[ibl].qs;
+        const uint8_t *scales_l = iq4[ibl].scales_l;
+        const uint8_t *scales_h = iq4[ibl].scales_h;
+        const uint8_t *extra = iq4[ibl].extra;
+        const uint8_t *qs_base = iq4[ibl].qs;
+
+        for (int ib = 0; ib < QK_K / 32; ib++) {
+            const uint8_t *qs = qs_base + ib * 64;  /* 64 bytes per subblock for 4 rows */
+
+            for (int iy = 0; iy < 4; iy++) {
+                int s1 = iq4_k_r4_scale(scales_l, scales_h, 8 * ib + iy);
+                int s2 = iq4_k_r4_scale(scales_l, scales_h, 8 * ib + iy + 4);
+
+                const int8_t *values1 = (extra[0] & (1 << ib)) ? lut1 : lut0;
+                const int8_t *values2 = (extra[4] & (1 << ib)) ? lut1 : lut0;
+
+                int32_t row_sum = 0;
+                int base_qs = 64 * ib + 4 * iy;
+                int base_q8 = 32 * ib;
+
+                /* Process 32 values: 4 groups of 8 (i=0..3, each producing 2 values) */
+                for (int i = 0; i < 4; i++) {
+                    /* Low nibble of qs[base_qs + i] -> q8[base_q8 + i] */
+                    row_sum += s1 * values1[qs[base_qs + i] & 0xf] * q8_base[base_q8 + i + 0];
+                    /* High nibble of qs[base_qs + i] -> q8[base_q8 + i + 8] */
+                    row_sum += s1 * values1[qs[base_qs + i] >> 4] * q8_base[base_q8 + i + 8];
+                    /* Low nibble of qs[base_qs + i + 16] -> q8[base_q8 + i + 16] */
+                    row_sum += s2 * values2[qs[base_qs + i + 16] & 0xf] * q8_base[base_q8 + i + 16];
+                    /* High nibble of qs[base_qs + i + 16] -> q8[base_q8 + i + 24] */
+                    row_sum += s2 * values2[qs[base_qs + i + 16] >> 4] * q8_base[base_q8 + i + 24];
+                    /* Low nibble of qs[base_qs + i + 32] -> q8[base_q8 + i + 4] */
+                    row_sum += s1 * values1[qs[base_qs + i + 32] & 0xf] * q8_base[base_q8 + i + 4];
+                    /* High nibble of qs[base_qs + i + 32] -> q8[base_q8 + i + 12] */
+                    row_sum += s1 * values1[qs[base_qs + i + 32] >> 4] * q8_base[base_q8 + i + 12];
+                    /* Low nibble of qs[base_qs + i + 48] -> q8[base_q8 + i + 20] */
+                    row_sum += s2 * values2[qs[base_qs + i + 48] & 0xf] * q8_base[base_q8 + i + 20];
+                    /* High nibble of qs[base_qs + i + 48] -> q8[base_q8 + i + 28] */
+                    row_sum += s2 * values2[qs[base_qs + i + 48] >> 4] * q8_base[base_q8 + i + 28];
+                }
+
+                accf[iy] += (float)row_sum * d_arr[iy] * q8_scale;
+            }
+        }
+    }
+
+    for (int r = 0; r < 4; r++) out[r] = accf[r];
+}
+
+/* IQ4_K_R4 x Q8_K ARM NEON GEMM kernel.
+ * Tiled: 4 weight rows x 2 activation rows per tile.
+ * Uses scalar inner loop (R4 layout makes SIMD difficult). */
+int sgemm_iq4_k_r4_q8_k_neon(int nrows, int ncols, int k,
+                               const void *vx, const void *vy,
+                               float *out, size_t bs,
+                               int ith, int nth) {
+    int row_stride = 4;
+    int col_stride = 2;
+    int nrows_tile = (nrows + row_stride - 1) / row_stride;
+    int ncols_tile = (ncols + col_stride - 1) / col_stride;
+
+    int rows_per_thread = (nrows_tile + nth - 1) / nth;
+    int row_start = ith * rows_per_thread;
+    int row_end = row_start + rows_per_thread;
+    if (row_end > nrows_tile) row_end = nrows_tile;
+    if (row_start >= row_end) return row_start;
+
+    const int8_t lut0[16] = {
+        -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+    };
+    const int8_t lut1[16] = {
+        -123, -100, -79, -61, -45, -31, -18,  -6, 5, 17, 29, 42, 57, 73, 93, 117,
+    };
+
+    for (int ii = row_start; ii < row_end; ii++) {
+        int actual_nrows = ii * row_stride;
+        if (actual_nrows + row_stride > nrows) {
+            row_stride = nrows - actual_nrows;
+            if (row_stride <= 0) break;
+        }
+
+        for (int jj = 0; jj < ncols_tile; jj++) {
+            int actual_ncols = jj * col_stride;
+            if (actual_ncols + col_stride > ncols) {
+                col_stride = ncols - actual_ncols;
+                if (col_stride <= 0) break;
+            }
+
+            float acc[4] = {0};
+
+            for (int col = 0; col < col_stride; col++) {
+                const int8_t *q8_row = ((const int8_t *)vy) + (actual_ncols + col) * k;
+
+                for (int ibl = 0; ibl < k / QK_K; ibl++) {
+                    const block_iq4_k_r4 *blk = (const block_iq4_k_r4 *)vx + ibl * row_stride;
+                    float q8_scale = ((const block_q8_K *)q8_row)[ibl].d;
+                    const int8_t *q8_base = ((const block_q8_K *)q8_row)[ibl].qs;
+
+                    for (int r = 0; r < row_stride; r++) {
+                        float d = fp16_to_fp32_lookup(blk[ibl].d[r]);
+                        float dy = d * q8_scale;
+                        const uint8_t *scales_l = blk[ibl].scales_l;
+                        const uint8_t *scales_h = blk[ibl].scales_h;
+                        const uint8_t *extra = blk[ibl].extra;
+                        const uint8_t *qs_base = blk[ibl].qs;
+
+                        int32_t sumi = 0;
+
+                        for (int ib = 0; ib < QK_K / 32; ib++) {
+                            int s1 = iq4_k_r4_scale(scales_l, scales_h, 8 * ib + r);
+                            int s2 = iq4_k_r4_scale(scales_l, scales_h, 8 * ib + r + 4);
+
+                            const int8_t *values1 = (extra[0] & (1 << ib)) ? lut1 : lut0;
+                            const int8_t *values2 = (extra[4] & (1 << ib)) ? lut1 : lut0;
+
+                            int base_qs = 64 * ib + 4 * r;
+                            int base_q8 = 32 * ib;
+                            const uint8_t *qs = qs_base;
+                            const int8_t *q8 = q8_base + base_q8;
+
+                            for (int i = 0; i < 4; i++) {
+                                sumi += s1 * values1[qs[base_qs + i] & 0xf] * q8[i + 0];
+                                sumi += s1 * values1[qs[base_qs + i] >> 4] * q8[i + 8];
+                                sumi += s2 * values2[qs[base_qs + i + 16] & 0xf] * q8[i + 16];
+                                sumi += s2 * values2[qs[base_qs + i + 16] >> 4] * q8[i + 24];
+                                sumi += s1 * values1[qs[base_qs + i + 32] & 0xf] * q8[i + 4];
+                                sumi += s1 * values1[qs[base_qs + i + 32] >> 4] * q8[i + 12];
+                                sumi += s2 * values2[qs[base_qs + i + 48] & 0xf] * q8[i + 20];
+                                sumi += s2 * values2[qs[base_qs + i + 48] >> 4] * q8[i + 28];
+                            }
+                        }
+
+                        acc[r] += (float)sumi * dy;
+                    }
+                }
+            }
+
+            for (int r = 0; r < row_stride; r++) {
+                out[actual_nrows + r + (jj * col_stride) * bs] = acc[r];
+            }
+        }
+    }
+
+    return row_end;
+}
+
+/* NEON R4 function declarations for quant.c dispatcher */
+extern void vec_dot_iq4_k_r4_q8_k_neon(const void *vx, const void *wy, int n, float *out, int nrows);
+extern int sgemm_iq4_k_r4_q8_k_neon(int nrows, int ncols, int k,
+                                     const void *vx, const void *vy,
+                                     float *out, size_t bs, int ith, int nth);
+#endif /* ARM_NEON */

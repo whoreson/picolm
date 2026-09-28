@@ -6960,10 +6960,28 @@ case GGUF_TYPE_Q4_0_R8: {
             return vec_dot_f32_f32(q4r_tmp, x, n);
         }
         case GGUF_TYPE_Q8_K_R8: {
-            /* Q8_K_R8: dequantize row 0 of the 8-row group, then f32 dot. */
-            float q8r_tmp[256];
-            dequantize_row_q8_k_r8(src, q8r_tmp, n);
-            return vec_dot_f32_f32(q8r_tmp, x, n);
+            /* Q8_K_R8: dequantize row 0 of the 8-row group, then f32 dot.
+             * dequantize_row_q8_k_r8 writes 8*n floats (all 8 rows).
+             * We only need row 0, which starts at offset 0 in dst.
+             * Use malloc since n can be large. */
+            float *q8r_tmp = malloc(n * sizeof(float));
+            if (q8r_tmp) {
+                const block_q8_k_r8 *b = (const block_q8_k_r8 *)src;
+                int nb = n / QK_K;
+                for (int ibl = 0; ibl < nb; ibl++) {
+                    float d = fp16_to_fp32(b[ibl].d[0]);
+                    for (int ib = 0; ib < QK_K / 4; ib++) {
+                        for (int j = 0; j < 4; j++) {
+                            q8r_tmp[ibl * QK_K + 4 * ib + j] = b[ibl].qs[32 * ib + 0 + j] * d;
+                        }
+                    }
+                }
+                float result = vec_dot_f32_f32(q8r_tmp, x, n);
+                free(q8r_tmp);
+                return result;
+            }
+            free(q8r_tmp);
+            return 0.0f;
         }
         case GGUF_TYPE_IQ2_K_R4: {
             /* IQ2_K_R4: 4-row interleaved. This vec_dot path is for single-row
@@ -8432,21 +8450,14 @@ extern void vec_dot_iq2_k_q8_k_avx2(const void *vx, const void *wy, int n, float
 extern void vec_dot_iq2_k_q8_k_neon(const void *vx, const void *wy, int n, float *out);
 
 float vec_dot_iq2_k_q8_k(const void *vx, const void *wy, int n) {
-    /* Force scalar path for debugging: PICOLM_IQ2K_SCALAR=1 */
-    static const char *_iq2k_scalar = NULL;
-    if (!_iq2k_scalar) _iq2k_scalar = getenv("PICOLM_IQ2K_SCALAR");
 #if defined(PICOLM_AVX2)
-    if (!(_iq2k_scalar && (_iq2k_scalar[0] == '1' || _iq2k_scalar[0] == 'y'))) {
-        float result;
-        vec_dot_iq2_k_q8_k_avx2(vx, wy, n, &result);
-        return result;
-    }
+    float result;
+    vec_dot_iq2_k_q8_k_avx2(vx, wy, n, &result);
+    return result;
 #elif defined(PICOLM_NEON)
-    if (!(_iq2k_scalar && (_iq2k_scalar[0] == '1' || _iq2k_scalar[0] == 'y'))) {
-        float result;
-        vec_dot_iq2_k_q8_k_neon(vx, wy, n, &result);
-        return result;
-    }
+    float result;
+    vec_dot_iq2_k_q8_k_neon(vx, wy, n, &result);
+    return result;
 #endif
     /* Scalar fallback */
     const block_iq2_k *x = (const block_iq2_k *)vx;
