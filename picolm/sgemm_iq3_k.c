@@ -345,3 +345,293 @@ int sgemm_iq3_k_q8_k_avx2(int nrows, int ncols, int k,
 void vec_dot_iq3_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out) { (void)vx; (void)wy; (void)n; (void)out; }
 int sgemm_iq3_k_q8_k_avx2(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) { (void)vx; (void)vy; (void)nrows; (void)ncols; (void)k; (void)out; (void)bs; (void)ith; (void)nth; return 0; }
 #endif
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+
+/* IQ3_K NEON LUT: shared between GEMV and GEMM */
+static const int8_t iq3nl_values_neon[32] = {
+    -63, -40, -23, -10, 1, 13, 28, 47,
+    -59, -36, -19, -6, 5, 17, 32, 51,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+};
+
+/* ================================================================
+ * IQ3_K plain x Q8_K ARM NEON GEMV kernel
+ *
+ * 3-bit non-linear quantization:
+ *   qs[64] = 2 low bits per value (4 values per byte)
+ *   qh[32] = 1 high bit per value (8 values per byte)
+ *   Combined index = (qs_bits | (qh_bit << 2)) -> 3-bit LUT lookup (0-7)
+ *
+ * Scale: d * (2*magnitude+1) * sign, per 32-value subblock
+ *   scales_l[ib32] = two 4-bit magnitudes (lo/hi)
+ *   scales_h = 16 sign bits (2 bits per subblock: bit0=lo, bit1=hi)
+ *
+ * LUT: 8 normal values (indices 0-7) + 8 shifted values (indices 8-15)
+ *   extra bits select normal (0) or shifted (+8) LUT per subblock
+ * ================================================================ */
+void vec_dot_iq3_k_q8_k_neon(const void *vx, const void *wy, int n, float *out) {
+    assert(n % QK_K == 0);
+
+    const block_iq3_k *iq3 = (const block_iq3_k *)vx;
+    const block_q8_K *qk = (const block_q8_K *)wy;
+    const int nb = n / QK_K;
+
+    const uint8x16_t lut = vld1q_u8((const uint8_t *)iq3nl_values_neon);
+
+    float result = 0.0f;
+
+    for (int ibl = 0; ibl < nb; ibl++) {
+        float d = fp16_to_fp32_lookup(iq3[ibl].d);
+        float q8_scale = qk[ibl].d;
+        float dy = d * q8_scale;
+
+        uint16_t extra = iq3[ibl].extra;
+        uint16_t sh = iq3[ibl].scales_h;
+        const uint8_t *qs = iq3[ibl].qs;   /* 64 bytes */
+        const uint8_t *qh = iq3[ibl].qh;   /* 32 bytes */
+        const int8_t *q8_base = qk[ibl].qs;
+
+        int32x4_t isum = vdupq_n_s32(0);
+
+        for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+            /* Scale: (2*magnitude+1) * sign */
+            int mag_lo = iq3[ibl].scales_l[ib32] & 0xf;
+            int mag_hi = iq3[ibl].scales_l[ib32] >> 4;
+            int sign_lo = (sh & 1) ? -1 : 1;
+            int sign_hi = (sh & 2) ? -1 : 1;
+            sh >>= 2;
+            int scale_lo = (2 * mag_lo + 1) * sign_lo;
+            int scale_hi = (2 * mag_hi + 1) * sign_hi;
+
+            /* LUT table selection: normal (0) or shifted (+8) */
+            int shift_idx  = ((extra >> 0) & 1) * 8;
+            int shift_idx2 = ((extra >> 1) & 1) * 8;
+            extra >>= 2;
+
+            /* Bit extraction shifts */
+            int shift_l = 2 * (ib32 % 4);
+            int shift_h = ib32 % 8;
+
+            /* qs offset: advance every 4 subblocks (when shift_l wraps from 6) */
+            int qs_off = (ib32 / 4) * 32;
+            /* qh offset: advance every 8 subblocks */
+            int qh_off = (ib32 / 8) * 16;
+
+            /* Load 32 activations */
+            int8x16_t y_lo = vld1q_s8(q8_base + ib32 * 32);
+            int8x16_t y_hi = vld1q_s8(q8_base + ib32 * 32 + 16);
+
+            /* Extract 2 low bits from qs */
+            uint8x16_t lb_lo = vld1q_u8(qs + qs_off + 0);
+            uint8x16_t lb_hi = vld1q_u8(qs + qs_off + 16);
+
+            /* Right-shift by shift_l (0,2,4,6) */
+            uint8x16_t ql_lo, ql_hi;
+            if (shift_l == 0) {
+                ql_lo = lb_lo; ql_hi = lb_hi;
+            } else if (shift_l == 2) {
+                ql_lo = vshrq_n_u8(lb_lo, 2); ql_hi = vshrq_n_u8(lb_hi, 2);
+            } else if (shift_l == 4) {
+                ql_lo = vshrq_n_u8(lb_lo, 4); ql_hi = vshrq_n_u8(lb_hi, 4);
+            } else {
+                ql_lo = vshrq_n_u8(lb_lo, 6); ql_hi = vshrq_n_u8(lb_hi, 6);
+            }
+            ql_lo = vandq_u8(ql_lo, vdupq_n_u8(0x03));
+            ql_hi = vandq_u8(ql_hi, vdupq_n_u8(0x03));
+
+            /* Extract 1 high bit from qh: each byte has 8 bits, shift_h selects which */
+            uint8x16_t hb_lo = vld1q_u8(qh + qh_off + 0);
+            uint8x16_t hb_hi = vld1q_u8(qh + qh_off + 16);
+
+            uint8x16_t qh_lo, qh_hi;
+            if (shift_h == 0) { qh_lo = hb_lo; qh_hi = hb_hi; }
+            else if (shift_h == 1) { qh_lo = vshrq_n_u8(hb_lo, 1); qh_hi = vshrq_n_u8(hb_hi, 1); }
+            else if (shift_h == 2) { qh_lo = vshrq_n_u8(hb_lo, 2); qh_hi = vshrq_n_u8(hb_hi, 2); }
+            else if (shift_h == 3) { qh_lo = vshrq_n_u8(hb_lo, 3); qh_hi = vshrq_n_u8(hb_hi, 3); }
+            else if (shift_h == 4) { qh_lo = vshrq_n_u8(hb_lo, 4); qh_hi = vshrq_n_u8(hb_hi, 4); }
+            else if (shift_h == 5) { qh_lo = vshrq_n_u8(hb_lo, 5); qh_hi = vshrq_n_u8(hb_hi, 5); }
+            else if (shift_h == 6) { qh_lo = vshrq_n_u8(hb_lo, 6); qh_hi = vshrq_n_u8(hb_hi, 6); }
+            else { qh_lo = vshrq_n_u8(hb_lo, 7); qh_hi = vshrq_n_u8(hb_hi, 7); }
+            qh_lo = vandq_u8(qh_lo, vdupq_n_u8(0x01));
+            qh_hi = vandq_u8(qh_hi, vdupq_n_u8(0x01));
+
+            /* Combine: 3-bit index = ql | (qh << 2) */
+            uint8x16_t idx_lo = vorrq_u8(ql_lo, vshlq_n_u8(qh_lo, 2));
+            uint8x16_t idx_hi = vorrq_u8(ql_hi, vshlq_n_u8(qh_hi, 2));
+
+            /* LUT lookup: add shift_idx (0 or 8) then table lookup */
+            int8x16_t qx_lo = vreinterpretq_s8_u8(vqtbl1q_u8(lut,
+                vaddq_u8(idx_lo, vdupq_n_u8(shift_idx))));
+            int8x16_t qx_hi = vreinterpretq_s8_u8(vqtbl1q_u8(lut,
+                vaddq_u8(idx_hi, vdupq_n_u8(shift_idx2))));
+
+            /* int8 MAC via widening multiply */
+            int32x4_t s_lo = vaddq_s32(
+                vpaddlq_s16(vmull_s8(vget_low_s8(qx_lo), vget_low_s8(y_lo))),
+                vpaddlq_s16(vmull_high_s8(qx_lo, y_lo)));
+            int32x4_t s_hi = vaddq_s32(
+                vpaddlq_s16(vmull_s8(vget_low_s8(qx_hi), vget_low_s8(y_hi))),
+                vpaddlq_s16(vmull_high_s8(qx_hi, y_hi)));
+
+            /* Apply per-subblock scales */
+            isum = vaddq_s32(isum, vaddq_s32(
+                vmulq_n_s32(s_lo, scale_lo),
+                vmulq_n_s32(s_hi, scale_hi)));
+        }
+
+        int total = vaddlvq_s32(isum);
+        result += (float)total * dy;
+    }
+
+    *out = result;
+}
+
+/* IQ3_K plain x Q8_K ARM NEON GEMM kernel.
+ * Tiled: 4 weight rows x 2 activation rows per tile. */
+int sgemm_iq3_k_q8_k_neon(int nrows, int ncols, int k,
+                           const void *vx, const void *vy,
+                           float *out, size_t bs,
+                           int ith, int nth) {
+    int row_stride = 4;
+    int col_stride = 2;
+    int nrows_tile = (nrows + row_stride - 1) / row_stride;
+    int ncols_tile = (ncols + col_stride - 1) / col_stride;
+    int row_bs = row_stride * bs;
+
+    /* Split work between threads by rows */
+    int rows_per_thread = (nrows_tile + nth - 1) / nth;
+    int row_start = ith * rows_per_thread;
+    int row_end = row_start + rows_per_thread;
+    if (row_end > nrows_tile) row_end = nrows_tile;
+    if (row_start >= row_end) return row_start;
+
+    /* Temporary buffer for 4 dequantized weight rows per block group */
+    float *w_tmp = (float *)malloc(k * sizeof(float) * row_stride);
+    if (!w_tmp) return row_start;
+
+    for (int ii = row_start; ii < row_end; ii++) {
+        int actual_nrows = ii * row_stride;
+        if (actual_nrows + row_stride > nrows) {
+            row_stride = nrows - actual_nrows;
+            if (row_stride <= 0) break;
+        }
+
+        for (int jj = 0; jj < ncols_tile; jj++) {
+            int actual_ncols = jj * col_stride;
+            if (actual_ncols + col_stride > ncols) {
+                col_stride = ncols - actual_ncols;
+                if (col_stride <= 0) break;
+            }
+
+            float acc[4] = {0};
+
+            for (int col = 0; col < col_stride; col++) {
+                const int8_t *q8_row = ((const int8_t *)vy) + (actual_ncols + col) * k;
+
+                for (int ibl = 0; ibl < k / QK_K; ibl++) {
+                    const block_iq3_k *blk = (const block_iq3_k *)vx + ibl * row_stride;
+                    float q8_scale = ((const block_q8_K *)q8_row)[ibl].d;
+                    const int8_t *q8_base = ((const block_q8_K *)q8_row)[ibl].qs;
+
+                    for (int r = 0; r < row_stride; r++) {
+                        float d = fp16_to_fp32_lookup(blk[r].d);
+                        float dy = d * q8_scale;
+                        uint16_t extra = blk[r].extra;
+                        uint16_t sh = blk[r].scales_h;
+                        const uint8_t *qs = blk[r].qs;
+                        const uint8_t *qh = blk[r].qh;
+
+                        int32x4_t isum = vdupq_n_s32(0);
+
+                        for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+                            int mag_lo = blk[r].scales_l[ib32] & 0xf;
+                            int mag_hi = blk[r].scales_l[ib32] >> 4;
+                            int sign_lo = (sh & 1) ? -1 : 1;
+                            int sign_hi = (sh & 2) ? -1 : 1;
+                            sh >>= 2;
+                            int scale_lo = (2 * mag_lo + 1) * sign_lo;
+                            int scale_hi = (2 * mag_hi + 1) * sign_hi;
+
+                            int shift_idx  = ((extra >> 0) & 1) * 8;
+                            int shift_idx2 = ((extra >> 1) & 1) * 8;
+                            extra >>= 2;
+
+                            int shift_l = 2 * (ib32 % 4);
+                            int shift_h = ib32 % 8;
+                            int qs_off = (ib32 / 4) * 32;
+                            int qh_off = (ib32 / 8) * 16;
+
+                            int8x16_t y_lo = vld1q_s8(q8_base + ib32 * 32);
+                            int8x16_t y_hi = vld1q_s8(q8_base + ib32 * 32 + 16);
+
+                            uint8x16_t lb_lo = vld1q_u8(qs + qs_off + 0);
+                            uint8x16_t lb_hi = vld1q_u8(qs + qs_off + 16);
+
+                            uint8x16_t ql_lo, ql_hi;
+                            if (shift_l == 0) { ql_lo = lb_lo; ql_hi = lb_hi; }
+                            else if (shift_l == 2) { ql_lo = vshrq_n_u8(lb_lo, 2); ql_hi = vshrq_n_u8(lb_hi, 2); }
+                            else if (shift_l == 4) { ql_lo = vshrq_n_u8(lb_lo, 4); ql_hi = vshrq_n_u8(lb_hi, 4); }
+                            else { ql_lo = vshrq_n_u8(lb_lo, 6); ql_hi = vshrq_n_u8(lb_hi, 6); }
+                            ql_lo = vandq_u8(ql_lo, vdupq_n_u8(0x03));
+                            ql_hi = vandq_u8(ql_hi, vdupq_n_u8(0x03));
+
+                            uint8x16_t hb_lo = vld1q_u8(qh + qh_off + 0);
+                            uint8x16_t hb_hi = vld1q_u8(qh + qh_off + 16);
+
+                            uint8x16_t qh_lo, qh_hi;
+                            if (shift_h == 0) { qh_lo = hb_lo; qh_hi = hb_hi; }
+                            else if (shift_h == 1) { qh_lo = vshrq_n_u8(hb_lo, 1); qh_hi = vshrq_n_u8(hb_hi, 1); }
+                            else if (shift_h == 2) { qh_lo = vshrq_n_u8(hb_lo, 2); qh_hi = vshrq_n_u8(hb_hi, 2); }
+                            else if (shift_h == 3) { qh_lo = vshrq_n_u8(hb_lo, 3); qh_hi = vshrq_n_u8(hb_hi, 3); }
+                            else if (shift_h == 4) { qh_lo = vshrq_n_u8(hb_lo, 4); qh_hi = vshrq_n_u8(hb_hi, 4); }
+                            else if (shift_h == 5) { qh_lo = vshrq_n_u8(hb_lo, 5); qh_hi = vshrq_n_u8(hb_hi, 5); }
+                            else if (shift_h == 6) { qh_lo = vshrq_n_u8(hb_lo, 6); qh_hi = vshrq_n_u8(hb_hi, 6); }
+                            else { qh_lo = vshrq_n_u8(hb_lo, 7); qh_hi = vshrq_n_u8(hb_hi, 7); }
+                            qh_lo = vandq_u8(qh_lo, vdupq_n_u8(0x01));
+                            qh_hi = vandq_u8(qh_hi, vdupq_n_u8(0x01));
+
+                            uint8x16_t idx_lo = vorrq_u8(ql_lo, vshlq_n_u8(qh_lo, 2));
+                            uint8x16_t idx_hi = vorrq_u8(ql_hi, vshlq_n_u8(qh_hi, 2));
+
+                            const uint8x16_t lut = vld1q_u8((const uint8_t *)iq3nl_values_neon);
+                            int8x16_t qx_lo = vreinterpretq_s8_u8(vqtbl1q_u8(lut,
+                                vaddq_u8(idx_lo, vdupq_n_u8(shift_idx))));
+                            int8x16_t qx_hi = vreinterpretq_s8_u8(vqtbl1q_u8(lut,
+                                vaddq_u8(idx_hi, vdupq_n_u8(shift_idx2))));
+
+                            int32x4_t s_lo = vaddq_s32(
+                                vpaddlq_s16(vmull_s8(vget_low_s8(qx_lo), vget_low_s8(y_lo))),
+                                vpaddlq_s16(vmull_high_s8(qx_lo, y_lo)));
+                            int32x4_t s_hi = vaddq_s32(
+                                vpaddlq_s16(vmull_s8(vget_low_s8(qx_hi), vget_low_s8(y_hi))),
+                                vpaddlq_s16(vmull_high_s8(qx_hi, y_hi)));
+
+                            isum = vaddq_s32(isum, vaddq_s32(
+                                vmulq_n_s32(s_lo, scale_lo),
+                                vmulq_n_s32(s_hi, scale_hi)));
+                        }
+
+                        acc[r] += (float)vaddlvq_s32(isum) * dy;
+                    }
+                }
+            }
+
+            for (int r = 0; r < row_stride; r++) {
+                out[actual_nrows + r + (jj * col_stride) * bs] = acc[r];
+            }
+        }
+    }
+
+    free(w_tmp);
+    return row_end;
+}
+
+/* NEON function declarations for quant.c dispatcher */
+extern void vec_dot_iq3_k_q8_k_neon(const void *vx, const void *wy, int n, float *out);
+extern int sgemm_iq3_k_q8_k_neon(int nrows, int ncols, int k,
+                                  const void *vx, const void *vy,
+                                  float *out, size_t bs, int ith, int nth);
+#endif /* ARM_NEON */

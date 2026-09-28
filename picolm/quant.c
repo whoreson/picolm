@@ -8517,11 +8517,16 @@ void dequantize_row_iq3_k(const void *src, float *dst, int n) {
 
 /* IQ3_K plain x Q8_K AVX2 GEMV (declared in sgemm_iq3_k.c) */
 extern void vec_dot_iq3_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out);
+extern void vec_dot_iq3_k_q8_k_neon(const void *vx, const void *wy, int n, float *out);
 
 float vec_dot_iq3_k_q8_k(const void *vx, const void *wy, int n) {
 #if defined(PICOLM_AVX2)
     float result;
     vec_dot_iq3_k_q8_k_avx2(vx, wy, n, &result);
+    return result;
+#elif defined(PICOLM_NEON)
+    float result;
+    vec_dot_iq3_k_q8_k_neon(vx, wy, n, &result);
     return result;
 #else
     /* Scalar fallback */

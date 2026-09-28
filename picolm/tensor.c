@@ -3,6 +3,7 @@
 /* Forward decl for NEON GEMM task wrapper */
 #if defined(PICOLM_NEON)
 extern int sgemm_iq2_k_q8_k_neon(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+extern int sgemm_iq3_k_q8_k_neon(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
 #endif
 #include <stdlib.h>
 #include <math.h>
@@ -3492,6 +3493,13 @@ static void qgemm_iq2k_task_neon(int idx, void *ctxp) {
     int nth = pool_total_threads(1);
     sgemm_iq2_k_q8_k_neon(c->nr, c->nc, c->k, c->w, c->abuf, c->out, c->bs, idx, nth);
 }
+
+/* Plain IQ3_K NEON GEMM task wrapper */
+static void qgemm_iq3k_task_neon(int idx, void *ctxp) {
+    qgemm_q4r8_ctx_t *c = (qgemm_q4r8_ctx_t *)ctxp;
+    int nth = pool_total_threads(1);
+    sgemm_iq3_k_q8_k_neon(c->nr, c->nc, c->k, c->w, c->abuf, c->out, c->bs, idx, nth);
+}
 #endif /* PICOLM_NEON */
 
 /* Profiling: per-path timing for matmul_batch (PICOLM_PROFILE=1) */
@@ -4563,8 +4571,13 @@ void matmul_batch(float *out, const float *x, int n_batch,
             .nr = d, .nc = n_batch, .k = n,
             .w = W, .abuf = qx_buf, .out = out, .bs = d,
         };
-        tensor_parallel_for(nth, qgemm_iq2k_task_neon, &ctx);
-        DISPATCH("IQ2_K_sgemm_neon");
+        if (qtype == GGUF_TYPE_IQ2_K) {
+            tensor_parallel_for(nth, qgemm_iq2k_task_neon, &ctx);
+            DISPATCH("IQ2_K_sgemm_neon");
+        } else {
+            tensor_parallel_for(nth, qgemm_iq3k_task_neon, &ctx);
+            DISPATCH("IQ3_K_sgemm_neon");
+        }
         if (qx_buf) { free(qx_buf); if (qx_d_buf) free(qx_d_buf); }
         return;
     }
