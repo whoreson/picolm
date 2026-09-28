@@ -991,6 +991,14 @@ int parse_gguf(model_t *m, int max_seq_len) {
                         cfg->is_stablelm = 1; break;
                     }
                 }
+                /* Check for gptneox (Krake v2) */
+                for (uint64_t k = 0; k + 7 <= arch.len; k++) {
+                    if (arch.str[k] == 'g' && arch.str[k+1] == 'p' && arch.str[k+2] == 't' &&
+                        arch.str[k+3] == 'n' && arch.str[k+4] == 'e' && arch.str[k+5] == 'o' &&
+                        arch.str[k+6] == 'x') {
+                        cfg->is_gptneox = 1; break;
+                    }
+                }
             } else {
                 skip_meta_value(&r, vtype, &dummy);
             }
@@ -999,7 +1007,8 @@ int parse_gguf(model_t *m, int max_seq_len) {
 
         if (str_eq(key, "llama.embedding_length") || str_eq(key, "general.embedding_length")
             || str_eq(key, "qwen2.embedding_length") || str_eq(key, "qwen3.embedding_length") || str_eq(key, "qwen35.embedding_length") || str_eq(key, "qwen35moe.embedding_length")
-            || str_eq(key, "gemma3n.embedding_length") || str_eq(key, "gpt2.embedding_length") || str_eq(key, "stablelm.embedding_length")) {
+            || str_eq(key, "gemma3n.embedding_length") || str_eq(key, "gpt2.embedding_length") || str_eq(key, "stablelm.embedding_length")
+            || str_eq(key, "gptneox.embedding_length")) {
             int dummy; cfg->n_embd = (int)skip_meta_value(&r, vtype, &dummy);
             /* NOTE: Qwen2 uses interleaved RoPE. Qwen3 and Qwen3.5 use pairwise RoPE
              * (same as Llama). Only set rope_type=1 for qwen2, not qwen3/qwen35.
@@ -1007,15 +1016,18 @@ int parse_gguf(model_t *m, int max_seq_len) {
             if (key.str[0] == 'q' && key.len > 6 && key.str[5] == '2') cfg->rope_type = 1;
         } else if (str_eq(key, "llama.feed_forward_length") || str_eq(key, "general.feed_forward_length")
             || str_eq(key, "qwen2.feed_forward_length") || str_eq(key, "qwen3.feed_forward_length") || str_eq(key, "qwen35.feed_forward_length")
-            || str_eq(key, "gemma3n.feed_forward_length") || str_eq(key, "gpt2.feed_forward_length") || str_eq(key, "stablelm.feed_forward_length")) {
+            || str_eq(key, "gemma3n.feed_forward_length") || str_eq(key, "gpt2.feed_forward_length") || str_eq(key, "stablelm.feed_forward_length")
+            || str_eq(key, "gptneox.feed_forward_length")) {
             cfg->n_ffn = (int)read_ffn_length(&r, vtype);
         } else if (str_eq(key, "llama.attention.head_count")
             || str_eq(key, "qwen2.attention.head_count") || str_eq(key, "qwen3.attention.head_count") || str_eq(key, "qwen35.attention.head_count") || str_eq(key, "qwen35moe.attention.head_count")
-            || str_eq(key, "gemma3n.attention.head_count") || str_eq(key, "gpt2.attention.head_count") || str_eq(key, "stablelm.attention.head_count")) {
+            || str_eq(key, "gemma3n.attention.head_count") || str_eq(key, "gpt2.attention.head_count") || str_eq(key, "stablelm.attention.head_count")
+            || str_eq(key, "gptneox.attention.head_count")) {
             int dummy; cfg->n_heads = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "llama.attention.head_count_kv")
             || str_eq(key, "qwen2.attention.head_count_kv") || str_eq(key, "qwen3.attention.head_count_kv") || str_eq(key, "qwen35.attention.head_count_kv") || str_eq(key, "qwen35moe.attention.head_count_kv")
-            || str_eq(key, "gemma3n.attention.head_count_kv") || str_eq(key, "gpt2.attention.head_count_kv") || str_eq(key, "stablelm.attention.head_count_kv")) {
+            || str_eq(key, "gemma3n.attention.head_count_kv") || str_eq(key, "gpt2.attention.head_count_kv") || str_eq(key, "stablelm.attention.head_count_kv")
+            || str_eq(key, "gptneox.attention.head_count_kv")) {
             int dummy; cfg->n_kv_heads = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "attention.key_length")
             || str_eq(key, "llama.attention.key_length")
@@ -1027,15 +1039,17 @@ int parse_gguf(model_t *m, int max_seq_len) {
             int dummy; cfg->head_dim = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "llama.block_count")
             || str_eq(key, "qwen2.block_count") || str_eq(key, "qwen3.block_count") || str_eq(key, "qwen35.block_count") || str_eq(key, "qwen35moe.block_count")
-            || str_eq(key, "gemma3n.block_count") || str_eq(key, "gpt2.block_count") || str_eq(key, "stablelm.block_count")) {
+            || str_eq(key, "gemma3n.block_count") || str_eq(key, "gpt2.block_count") || str_eq(key, "stablelm.block_count")
+            || str_eq(key, "gptneox.block_count")) {
             int dummy; cfg->n_layers = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "llama.context_length")
             || str_eq(key, "qwen2.context_length") || str_eq(key, "qwen3.context_length") || str_eq(key, "qwen35.context_length") || str_eq(key, "qwen35moe.context_length")
-            || str_eq(key, "gemma3n.context_length") || str_eq(key, "gpt2.context_length") || str_eq(key, "stablelm.context_length")) {
+            || str_eq(key, "gemma3n.context_length") || str_eq(key, "gpt2.context_length") || str_eq(key, "stablelm.context_length")
+            || str_eq(key, "gptneox.context_length")) {
             int dummy; cfg->max_seq_len = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "llama.rope.freq_base")
             || str_eq(key, "qwen2.rope.freq_base") || str_eq(key, "qwen3.rope.freq_base") || str_eq(key, "qwen35.rope.freq_base") || str_eq(key, "qwen35moe.rope.freq_base")
-            || str_eq(key, "gemma3n.rope.freq_base")) {
+            || str_eq(key, "gemma3n.rope.freq_base") || str_eq(key, "gptneox.rope.freq_base")) {
             if (vtype == GGUF_META_FLOAT32) {
                 cfg->rope_freq_base = read_f32(&r);
             } else {
@@ -1043,7 +1057,8 @@ int parse_gguf(model_t *m, int max_seq_len) {
             }
         } else if (str_eq(key, "qwen35.rope.dimension_count")
             || str_eq(key, "qwen35moe.rope.dimension_count")
-            || str_eq(key, "llama.rope.dimension_count") || str_eq(key, "stablelm.rope.dimension_count")) {
+            || str_eq(key, "llama.rope.dimension_count") || str_eq(key, "stablelm.rope.dimension_count")
+            || str_eq(key, "gptneox.rope.dimension_count")) {
             int dummy; cfg->rope_dim = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "rope.dimension_sections")
             || str_eq(key, "qwen35.rope.dimension_sections")
@@ -1170,7 +1185,8 @@ int parse_gguf(model_t *m, int max_seq_len) {
             || str_eq(key, "qwen2.attention.layer_norm_rms_epsilon")
             || str_eq(key, "qwen3.attention.layer_norm_rms_epsilon") || str_eq(key, "qwen35.attention.layer_norm_rms_epsilon") || str_eq(key, "qwen35moe.attention.layer_norm_rms_epsilon")
             || str_eq(key, "gemma3n.attention.layer_norm_rms_epsilon")
-            || str_eq(key, "gpt2.attention.layer_norm_epsilon") || str_eq(key, "stablelm.attention.layer_norm_epsilon")) {
+            || str_eq(key, "gpt2.attention.layer_norm_epsilon") || str_eq(key, "stablelm.attention.layer_norm_epsilon")
+            || str_eq(key, "gptneox.attention.layer_norm_epsilon")) {
             /* Read epsilon from GGUF (F32 type=6 or F64 type=11 in metadata) */
             if (vtype == GGUF_META_FLOAT32) { /* F32 */
                 cfg->rms_norm_eps = read_f32(&r);
@@ -1257,13 +1273,14 @@ int parse_gguf(model_t *m, int max_seq_len) {
         /* Gemma-3n: laurel_rank is derived from tensor shapes, not from KV */
         /* Gemma-3n: final_logit_softcapping default */
         /* StableLM: parallel residual */
-        else if (str_eq(key, "stablelm.use_parallel_residual")) {
+        else if (str_eq(key, "stablelm.use_parallel_residual")
+            || str_eq(key, "gptneox.use_parallel_residual")) {
             cfg->use_parallel_residual = read_u8(&r) ? 1 : 0;
         } else if (str_eq(key, "general.alignment")) {
             int dummy; cfg->alignment = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "llama.vocab_size")
             || str_eq(key, "qwen2.vocab_size") || str_eq(key, "qwen3.vocab_size") || str_eq(key, "qwen35.vocab_size") || str_eq(key, "qwen35moe.vocab_size")
-            || str_eq(key, "gemma3n.vocab_size") || str_eq(key, "gpt2.vocab_size")) {
+            || str_eq(key, "gemma3n.vocab_size") || str_eq(key, "gpt2.vocab_size") || str_eq(key, "gptneox.vocab_size")) {
             int dummy; cfg->vocab_size = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "tokenizer.ggml.bos_token_id")) {
             int dummy; m->tok_bos_id = (uint32_t)skip_meta_value(&r, vtype, &dummy);
@@ -1465,6 +1482,17 @@ int parse_gguf(model_t *m, int max_seq_len) {
          * pair (q[i], q[i+half]) instead of (q[2i], q[2i+1]).
          * Verified: PicoLM bq[:4] matches HF q_proj[:4] unpermuted. */
         cfg->rope_type = 1;
+    }
+
+    /* GPTNeoX (Krake v2) defaults */
+    if (cfg->is_gptneox) {
+        if (cfg->n_kv_heads <= 0) cfg->n_kv_heads = cfg->n_heads; /* MHA, no GQA */
+        if (cfg->rope_freq_base <= 0) cfg->rope_freq_base = 10000.0f;
+        if (cfg->rope_dim <= 0) cfg->rope_dim = cfg->head_dim;
+        /* GPTNeoX uses standard pairwise RoPE (rope_type=0), same as Llama */
+        cfg->rope_type = 0;
+        /* GPTNeoX uses parallel residual */
+        if (!cfg->use_parallel_residual) cfg->use_parallel_residual = 1;
     }
 
     /* Gemma-3n defaults */
@@ -1737,11 +1765,11 @@ int parse_gguf(model_t *m, int max_seq_len) {
                 /* SSM tensors (Qwen3.5) / GPT-2 fused QKV */
                 else if (strcmp(suffix, "attn_qkv.weight") == 0) {
                     lw->attn_qkv = ptr; lw->type_attn_qkv = qtype;
-                    /* Only set is_attn_layer for GPT-2 models. SSM models with
+                    /* Only set is_attn_layer for GPT-2/GPTNeoX models. SSM models with
                      * attn_qkv (Qwen3.6 hybrid) should not be marked as attention
                      * layers here -- the separate attn_k/attn_v loaders set it for
                      * mixed-arch layers that have those tensors. */
-                    if (m->config.is_gpt2) lw->is_attn_layer = 1;
+                    if (m->config.is_gpt2 || m->config.is_gptneox) lw->is_attn_layer = 1;
                 } else if (strcmp(suffix, "attn_gate.weight") == 0) {
                     lw->attn_gate_ssm = ptr; lw->type_attn_gate_ssm = qtype;
                 } else if (strcmp(suffix, "ssm_a") == 0) {
@@ -1864,7 +1892,7 @@ int parse_gguf(model_t *m, int max_seq_len) {
     // For SSM models, the first layer may not have attn_q
     if (cfg->has_ssm && w->layers[0].type_attn_q == 0) {
         cfg->weight_type = w->layers[0].type_attn_qkv;
-    } else if (cfg->is_gpt2) {
+    } else if (cfg->is_gpt2 || cfg->is_gptneox) {
         cfg->weight_type = w->layers[0].type_attn_qkv;
     } else {
         cfg->weight_type = w->layers[0].type_attn_q;
@@ -1877,6 +1905,18 @@ int parse_gguf(model_t *m, int max_seq_len) {
             if (!lw->attn_q || !lw->attn_k || !lw->attn_v || !lw->attn_output ||
                 !lw->ffn_gate || !lw->ffn_up || !lw->ffn_down) {
                 fprintf(stderr, "ERROR: StableLM model missing required tensors at layer %d\n", l);
+                return -1;
+            }
+        }
+    }
+
+    /* Verify required tensors for GPTNeoX */
+    if (cfg->is_gptneox) {
+        for (int l = 0; l < cfg->n_layers; l++) {
+            layer_weights_t *lw = &w->layers[l];
+            if (!lw->attn_qkv || !lw->attn_output ||
+                !lw->ffn_up || !lw->ffn_down) {
+                fprintf(stderr, "ERROR: GPTNeoX model missing required tensors at layer %d\n", l);
                 return -1;
             }
         }

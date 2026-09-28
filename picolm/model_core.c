@@ -186,11 +186,11 @@ size_t layer_weight_size(model_t *m, int l) {
         sz += gguf_type_row_size(lw->type_ssm_a, 1) * dt_rank;
         sz += gguf_type_row_size(lw->type_ssm_dt, 1) * dt_rank;
         sz += gguf_type_row_size(GGUF_TYPE_F32, 1) * head_v_dim; /* ssm_norm is always F32 */
-    } else if (m->config.is_gpt2 && lw->attn_qkv) {
-        /* GPT-2: fused QKV [dim, 3*dim], output [dim, dim] */
+    } else if ((m->config.is_gpt2 || m->config.is_gptneox) && lw->attn_qkv) {
+        /* GPT-2/GPTNeoX: fused QKV [dim, 3*dim], output [dim, dim] */
         sz += gguf_type_row_size(lw->type_attn_qkv, 3 * dim) * dim;
         sz += gguf_type_row_size(lw->type_attn_output, dim) * dim;
-        /* GPT-2 biases (F32) */
+        /* Biases (F32) */
         sz += 3 * dim * sizeof(float); /* attn_qkv.bias */
         sz += dim * sizeof(float);      /* attn_output.bias */
     } else if (lw->attn_q) {
@@ -560,8 +560,8 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
     int q_dim = c->n_heads * c->head_dim;
     /* Qwen3.5 full attention: Q+gate joint = 2x q_dim */
     int q_full_dim = c->has_ssm ? (q_dim * 2) : q_dim;
-    /* GPT-2: fused QKV needs 3*dim */
-    int gpt2_qkv_dim = c->is_gpt2 ? (3 * c->n_embd) : 0;
+    /* GPT-2/GPTNeoX: fused QKV needs 3*dim */
+    int gpt2_qkv_dim = (c->is_gpt2 || c->is_gptneox) ? (3 * c->n_embd) : 0;
     /* SSM conv_dim may be larger */
     int ssm_conv_dim = c->has_ssm ? (2 * c->ssm_d_state * c->ssm_n_group + c->ssm_d_inner) : 0;
     int max_proj_dim = q_full_dim;
@@ -592,7 +592,7 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
      * + GPT-2: n_layers * 2 (attn_norm_b + post_attn_norm_b) + 1 (output_norm_b) */
     size_t n_norm = (size_t)(c->n_layers * 2 + 1) * c->n_embd
                   + (size_t)c->n_layers * c->head_dim * 2 + c->n_embd;
-    if (c->is_gpt2) {
+    if (c->is_gpt2 || c->is_gptneox) {
         n_norm += (size_t)(c->n_layers * 2 + 1) * c->n_embd; /* LayerNorm biases */
     }
     if (c->is_stablelm) {
@@ -1165,8 +1165,8 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         }
         nw += c->n_embd;
 
-        /* GPT-2/StableLM LayerNorm bias for attn_norm */
-        if (c->is_gpt2 || c->is_stablelm) {
+        /* GPT-2/GPTNeoX/StableLM LayerNorm bias for attn_norm */
+        if (c->is_gpt2 || c->is_gptneox || c->is_stablelm) {
             s->attn_norm_b[l] = nw;
             if (lw->attn_norm_bias) {
                 memcpy(nw, lw->attn_norm_bias, c->n_embd * sizeof(float));
@@ -1185,8 +1185,8 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         }
         nw += c->n_embd;
 
-        /* GPT-2 LayerNorm bias for post_attn_norm (ffn_norm) */
-        if (c->is_gpt2) {
+        /* GPT-2/GPTNeoX LayerNorm bias for post_attn_norm (ffn_norm) */
+        if (c->is_gpt2 || c->is_gptneox) {
             s->post_attn_norm_b[l] = nw;
             if (lw->post_attn_norm_bias) {
                 memcpy(nw, lw->post_attn_norm_bias, c->n_embd * sizeof(float));
@@ -1225,8 +1225,8 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
     }
     nw += c->n_embd;
 
-    /* GPT-2/StableLM output norm bias */
-    if (c->is_gpt2 || c->is_stablelm) {
+    /* GPT-2/GPTNeoX/StableLM output norm bias */
+    if (c->is_gpt2 || c->is_gptneox || c->is_stablelm) {
         s->output_norm_b = nw;
         if (m->weights.output_norm_bias) {
             memcpy(nw, m->weights.output_norm_bias, c->n_embd * sizeof(float));
@@ -1467,6 +1467,13 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                 fprintf(stderr, "ERROR: GPT-2 model is missing required tensors\n");
                 return -1;
             }
+        } else if (m->config.is_gptneox) {
+            /* GPTNeoX: fused QKV, no gate, parallel residual, RoPE, has biases */
+            if (!lw->attn_qkv || !lw->attn_output ||
+                !lw->ffn_up || !lw->ffn_down) {
+                fprintf(stderr, "ERROR: GPTNeoX model is missing required tensors\n");
+                return -1;
+            }
         } else {
             /* Standard transformer: check attention tensors */
             if (!lw->attn_q || !lw->attn_k || !lw->attn_v || !lw->attn_output ||
@@ -1496,10 +1503,11 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
             model_config_t *c = &m->config;
 
             /* Capability check: GPU backend requires RMSNorm (no bias).
-             * GPT-2/CodeGen use LayerNorm (weight + bias). Detect by checking
+             * GPT-2/GPTNeoX use LayerNorm (weight + bias). Detect by checking
              * if the first layer has a norm bias tensor. */
-            if (c->is_gpt2 && !picolm_gpu_has_layernorm(device)) {
-                fprintf(stderr, "WARN: GPT-2 model uses LayerNorm (bias), GPU backend lacks LayerNorm shader\n");
+            if ((c->is_gpt2 || c->is_gptneox) && !picolm_gpu_has_layernorm(device)) {
+                fprintf(stderr, "WARN: %s model uses LayerNorm (bias), GPU backend lacks LayerNorm shader\n",
+                        c->is_gpt2 ? "GPT-2" : "GPTNeoX");
                 fprintf(stderr, "WARN: Falling back to CPU inference\n");
                 goto gpu_skip;
             }
@@ -1560,8 +1568,8 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                     if (picolm_gpu_tensor_upload(&gl->attn_output,
                             lw->attn_output, lw->type_attn_output, q_dim, c->n_embd, device)) uploaded++;
                 }
-                /* GPT-2 fused QKV: [3*dim, dim] */
-                if (c->is_gpt2 && lw->attn_qkv) {
+                /* GPT-2/GPTNeoX fused QKV: [3*dim, dim] */
+                if ((c->is_gpt2 || c->is_gptneox) && lw->attn_qkv) {
                     attempted++;
                     if (picolm_gpu_tensor_upload(&gl->attn_qkv,
                             lw->attn_qkv, lw->type_attn_qkv, c->n_embd, 3*c->n_embd, device)) uploaded++;
@@ -2348,9 +2356,224 @@ static float *model_forward_gpt2(model_t *m, int token, int pos) {
     return s->logits;
 }
 
+/* ---- GPTNeoX (Krake v2) forward pass ----
+ * Similar to GPT-2 but:
+ * - Has RoPE (partial rotary, rope_dim < head_dim) instead of learned pos embd
+ * - Uses parallel residual (both attn and FFN from same input)
+ * - No positional embedding tensor
+ * - Same: LayerNorm+bias, fused QKV, GELU, no gate, biases everywhere
+ */
+static float *model_forward_gptneox(model_t *m, int token, int pos) {
+    model_config_t *c = &m->config;
+    model_weights_t *w = &m->weights;
+    run_state_t *s = &m->state;
+
+    /* Bounds check */
+    if (pos >= c->max_seq_len) {
+        fprintf(stderr, "WARN: model_forward_gptneox pos=%d >= max_seq_len=%d, returning last logits\n",
+                pos, c->max_seq_len);
+        return s->logits;
+    }
+
+    int dim = c->n_embd;
+    int n_ffn = c->n_ffn;
+    int n_heads = c->n_heads;
+    int n_kv_heads = c->n_kv_heads;
+    int head_dim = c->head_dim;
+    int q_dim = n_heads * head_dim;
+    int kv_dim = n_kv_heads * head_dim;
+    int kv_mul = n_heads / n_kv_heads;
+    int seq_len = c->max_seq_len;
+    int rope_dim = (c->rope_dim > 0) ? c->rope_dim : head_dim;
+    int half_dim = rope_dim / 2;
+
+    const float *cos_pos = s->rope_cos + (size_t)pos * half_dim;
+    const float *sin_pos = s->rope_sin + (size_t)pos * half_dim;
+
+    /* 1. Embedding lookup (NO positional embedding) */
+    {
+        size_t row_bytes = gguf_type_row_size(w->type_token_embd, dim);
+        const void *embd_row = (const uint8_t *)w->token_embd + (size_t)token * row_bytes;
+        dequantize_row(embd_row, s->x, dim, w->type_token_embd);
+    }
+
+    /* 2. Transformer layers */
+    int n_active_layers = c->n_layers;
+    for (int slot = 0; slot < n_active_layers; slot++) {
+        int l = slot;
+        layer_weights_t *lw = &w->layers[l];
+        BENCH_LAYER_START();
+        int ri = 2 + l * 9;
+
+        /* ---- Parallel residual: both branches from same LayerNorm'd input ---- */
+
+        /* Attention branch: LayerNorm */
+        layernorm(s->xb, s->x, s->attn_norm_w[l], s->attn_norm_b[l], dim, c->rms_norm_eps);
+
+        /* Fused QKV projection: [dim, 3*dim] -> s->q [3*dim] */
+        tensor_set_repacked(m->repack_used[ri] ? m->repack_buffers[ri] : NULL);
+        matmul(s->q, s->xb, lw->attn_qkv, dim, 3 * dim, lw->type_attn_qkv);
+        tensor_set_repacked(NULL);
+        /* Add bias */
+        if (lw->attn_qkv_bias) {
+            const float *bias = (const float *)lw->attn_qkv_bias;
+            for (int i = 0; i < 3 * dim; i++) s->q[i] += bias[i];
+        }
+
+        /* Split Q, K, V from fused output */
+        float *q_ptr = s->q;           /* [dim] */
+        float *k_ptr = s->q + dim;     /* [dim] */
+        float *v_ptr = s->q + 2 * dim; /* [dim] */
+
+        /* Apply RoPE (partial rotary: only first rope_dim of each head) */
+        rope(q_ptr, k_ptr, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos, c->rope_type, half_dim);
+
+        /* Store K in KV cache */
+        {
+            uint8_t *kcache_layer = s->key_cache + (size_t)l * seq_len * s->kv_row_size_k;
+            uint8_t *key_pos = kcache_layer + (size_t)pos * s->kv_row_size_k;
+            if (s->kv_type_k == KV_CACHE_Q8_0) {
+                quantize_row_q8_0(k_ptr, key_pos, kv_dim);
+            } else if (s->kv_type_k == KV_CACHE_Q4_0) {
+                quantize_row_q4_0(k_ptr, key_pos, kv_dim);
+            } else if (s->kv_type_k == KV_CACHE_TQ3) {
+                for (int h = 0; h < n_kv_heads; h++) {
+                    quantize_row_tq3(k_ptr + h * head_dim,
+                        key_pos + h * s->kv_head_stride_k, head_dim);
+                }
+            } else if (s->kv_type_k == KV_CACHE_TQ4) {
+                for (int h = 0; h < n_kv_heads; h++) {
+                    quantize_row_tq4(k_ptr + h * head_dim,
+                        key_pos + h * s->kv_head_stride_k, head_dim);
+                }
+            } else {
+                uint16_t *kf = (uint16_t *)key_pos;
+#ifdef PICOLM_FP16_HW
+                { int d = 0;
+                  for (; d + 3 < kv_dim; d += 4)
+                      f32x4_to_fp16_hw(kf + d, vld1q_f32(k_ptr + d));
+                  for (; d < kv_dim; d++) kf[d] = fp32_to_fp16(k_ptr[d]);
+                }
+#else
+                for (int d = 0; d < kv_dim; d++) kf[d] = fp32_to_fp16(k_ptr[d]);
+#endif
+            }
+        }
+
+        /* Store V in KV cache */
+        {
+            uint8_t *vcache_layer = s->val_cache + (size_t)l * seq_len * s->kv_row_size_v;
+            uint8_t *val_pos = vcache_layer + (size_t)pos * s->kv_row_size_v;
+            if (s->kv_type_v == KV_CACHE_Q8_0) {
+                quantize_row_q8_0(v_ptr, val_pos, kv_dim);
+            } else if (s->kv_type_v == KV_CACHE_Q4_0) {
+                quantize_row_q4_0(v_ptr, val_pos, kv_dim);
+            } else if (s->kv_type_v == KV_CACHE_TQ3) {
+                for (int h = 0; h < n_kv_heads; h++) {
+                    quantize_row_tq3(v_ptr + h * head_dim,
+                        val_pos + h * s->kv_head_stride_v, head_dim);
+                }
+            } else if (s->kv_type_v == KV_CACHE_TQ4) {
+                for (int h = 0; h < n_kv_heads; h++) {
+                    quantize_row_tq4(v_ptr + h * head_dim,
+                        val_pos + h * s->kv_head_stride_v, head_dim);
+                }
+            } else {
+                uint16_t *vf = (uint16_t *)val_pos;
+#ifdef PICOLM_FP16_HW
+                { int d = 0;
+                  for (; d + 3 < kv_dim; d += 4)
+                      f32x4_to_fp16_hw(vf + d, vld1q_f32(v_ptr + d));
+                  for (; d < kv_dim; d++) vf[d] = fp32_to_fp16(v_ptr[d]);
+                }
+#else
+                for (int d = 0; d < kv_dim; d++) vf[d] = fp32_to_fp16(v_ptr[d]);
+#endif
+            }
+        }
+
+        /* Rotate Q for TQ4 KV cache */
+        if (s->kv_type_k == KV_CACHE_TQ4) {
+            for (int h = 0; h < n_heads; h++) {
+                picolm_hadamard_transform(q_ptr + h * head_dim, head_dim, TQ4_BLOCK_SIZE);
+            }
+        }
+
+        /* Attention */
+        attn_group_ctx_t gctx;
+        gctx.kv_mul = kv_mul; gctx.head_dim = head_dim; gctx.pos = pos;
+        gctx.kv_type_k = s->kv_type_k; gctx.kv_type_v = s->kv_type_v;
+        gctx.kv_row_size_k = s->kv_row_size_k; gctx.kv_row_size_v = s->kv_row_size_v;
+        gctx.kv_head_stride_k = s->kv_head_stride_k; gctx.kv_head_stride_v = s->kv_head_stride_v;
+        gctx.kcache = s->key_cache + (size_t)l * seq_len * s->kv_row_size_k;
+        gctx.vcache = s->val_cache + (size_t)l * seq_len * s->kv_row_size_v;
+        gctx.q = q_ptr; gctx.xb = s->xb;
+        gctx.n_kv_heads = n_kv_heads;
+        gctx.kv_hadamard_k = 0; gctx.kv_hadamard_v = 0; gctx.kv_hadamard_size = 0;
+        gctx.attn_scale = 1.0f / sqrtf((float)head_dim);
+        gctx.n_swa = 0;
+        tensor_parallel_for(n_heads, attention_group, &gctx);
+
+        /* Output projection */
+        tensor_set_repacked(m->repack_used[ri+3] ? m->repack_buffers[ri+3] : NULL);
+        matmul(s->xb2, s->xb, lw->attn_output, q_dim, dim, lw->type_attn_output);
+        tensor_set_repacked(NULL);
+        if (lw->attn_output_bias) {
+            const float *bias = (const float *)lw->attn_output_bias;
+            for (int i = 0; i < dim; i++) s->xb2[i] += bias[i];
+        }
+
+        /* FFN branch (in parallel): LayerNorm on original x */
+        layernorm(s->xb, s->x, s->post_attn_norm_w[l], s->post_attn_norm_b[l], dim, c->rms_norm_eps);
+
+        /* FFN up: [dim, n_ffn] */
+        tensor_set_repacked(m->repack_used[ri+6] ? m->repack_buffers[ri+6] : NULL);
+        matmul(s->hb, s->xb, lw->ffn_up, dim, n_ffn, lw->type_ffn_up);
+        tensor_set_repacked(NULL);
+        if (lw->ffn_up_bias) {
+            const float *bias = (const float *)lw->ffn_up_bias;
+            for (int i = 0; i < n_ffn; i++) s->hb[i] += bias[i];
+        }
+
+        /* GELU activation */
+        gelu(s->hb, n_ffn);
+
+        /* FFN down: [n_ffn, dim] */
+        tensor_set_repacked(m->repack_used[ri+5] ? m->repack_buffers[ri+5] : NULL);
+        matmul(s->xb, s->hb, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
+        tensor_set_repacked(NULL);
+        if (lw->ffn_down_bias) {
+            const float *bias = (const float *)lw->ffn_down_bias;
+            for (int i = 0; i < dim; i++) s->xb[i] += bias[i];
+        }
+
+        /* Parallel residual: x += attn_out + ffn_out */
+        for (int i = 0; i < dim; i++) {
+            s->x[i] = s->x[i] + s->xb2[i] + s->xb[i];
+        }
+
+#ifdef PICOLM_VIZ
+        viz_push_layer(l, s->x, dim);
+#endif
+        BENCH_LAYER_END(l, 0);
+    }
+
+    /* 3. Final LayerNorm */
+    layernorm(s->x, s->x, s->output_norm_w, s->output_norm_b, dim, c->rms_norm_eps);
+
+    /* 4. Output projection -> logits */
+    tensor_set_repacked(m->repack_used[1] ? m->repack_buffers[1] : NULL);
+    matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
+    tensor_set_repacked(NULL);
+
+    return s->logits;
+}
+
 /* ---- GPT-2 forward pass (specialized) ---- */
 static float *model_forward_gpt2(model_t *m, int token, int pos);
 static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt);
+static float *model_forward_gptneox(model_t *m, int token, int pos);
+static float *model_forward_prefill_gptneox(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt);
 
 float *model_forward(model_t *m, int token, int pos) {
     /* Bounds check: pos must be within KV cache allocation */
@@ -2366,6 +2589,10 @@ float *model_forward(model_t *m, int token, int pos) {
     /* GPT-2 has a fundamentally different architecture (LayerNorm, fused QKV, learned pos embd) */
     if (m->config.is_gpt2) {
         return model_forward_gpt2(m, token, pos);
+    }
+    /* GPTNeoX (Krake v2): LayerNorm+bias, fused QKV, partial RoPE, parallel residual, GELU, no gate */
+    if (m->config.is_gptneox) {
+        return model_forward_gptneox(m, token, pos);
     }
     model_config_t *c = &m->config;
     model_weights_t *w = &m->weights;
@@ -3774,6 +4001,258 @@ static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_to
     return s->logits;
 }
 
+/* ---- GPTNeoX (Krake v2) batched prefill ----
+ * Same as GPT-2 prefill but:
+ * - Has RoPE (partial rotary) instead of learned pos embd
+ * - Uses parallel residual
+ * - No positional embedding tensor
+ */
+static float *model_forward_prefill_gptneox(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt) {
+    (void)interrupt;
+    model_config_t *c = &m->config;
+    model_weights_t *w = &m->weights;
+    run_state_t *s = &m->state;
+
+    /* Bounds check */
+    if (start_pos + n_tokens > c->max_seq_len) {
+        int orig = n_tokens;
+        n_tokens = c->max_seq_len - start_pos;
+        if (n_tokens <= 0) {
+            fprintf(stderr, "WARN: prefill_gptneox start_pos=%d >= max_seq_len=%d, skipping\n",
+                    start_pos, c->max_seq_len);
+            return s->logits;
+        }
+        fprintf(stderr, "WARN: prefill_gptneox truncating %d->%d tokens\n", orig, n_tokens);
+    }
+
+    int dim = c->n_embd;
+    int n_ffn = c->n_ffn;
+    int n_heads = c->n_heads;
+    int n_kv_heads = c->n_kv_heads;
+    int head_dim = c->head_dim;
+    int q_dim = n_heads * head_dim;
+    int kv_dim = n_kv_heads * head_dim;
+    int seq_len = c->max_seq_len;
+    int rope_dim = (c->rope_dim > 0) ? c->rope_dim : head_dim;
+    int half_dim = rope_dim / 2;
+    int max_dim = (3 * dim > dim) ? 3 * dim : dim;
+
+    /* Allocate batch buffers: x, xb, xb2, q(3*dim), k, v, hb */
+    size_t bs = (size_t)n_tokens;
+    size_t sz = bs * (dim + max_dim + dim + 3 * dim + 2 * kv_dim + n_ffn);
+    float *buf = (float *)malloc(sz * sizeof(float));
+    if (!buf) { fprintf(stderr, "OOM: GPTNeoX prefill batch\n"); exit(1); }
+    float *p = buf;
+    float *x_batch = p;    p += bs * dim;
+    float *xb_batch = p;   p += bs * max_dim;
+    float *xb2_batch = p;  p += bs * dim;
+    float *q_batch = p;    p += bs * 3 * dim;
+    float *k_batch = p;    p += bs * kv_dim;
+    float *v_batch = p;    p += bs * kv_dim;
+    float *hb_batch = p;   p += bs * n_ffn;
+
+    /* Embedding lookup (NO positional embedding) */
+    {
+        size_t row_bytes = gguf_type_row_size(w->type_token_embd, dim);
+        for (int bi = 0; bi < n_tokens; bi++) {
+            const void *embd_row = (const uint8_t *)w->token_embd + (size_t)tokens[bi] * row_bytes;
+            dequantize_row(embd_row, x_batch + bi * dim, dim, w->type_token_embd);
+        }
+    }
+
+    int n_active_layers = c->n_layers;
+    for (int slot = 0; slot < n_active_layers; slot++) {
+        int l = slot;
+        layer_weights_t *lw = &w->layers[l];
+        BENCH_LAYER_START();
+
+        /* ---- Attention branch: LayerNorm ---- */
+        for (int bi = 0; bi < n_tokens; bi++)
+            layernorm(xb_batch + bi * dim, x_batch + bi * dim,
+                      s->attn_norm_w[l], s->attn_norm_b[l], dim, c->rms_norm_eps);
+
+        /* Fused QKV projection (batched): [dim, 3*dim] */
+        tensor_set_repacked(m->repack_used[2 + l * 9] ? m->repack_buffers[2 + l * 9] : NULL);
+        matmul_batch(q_batch, xb_batch, n_tokens, lw->attn_qkv, dim, 3 * dim, lw->type_attn_qkv);
+        tensor_set_repacked(NULL);
+        /* Add bias */
+        if (lw->attn_qkv_bias) {
+            const float *bias = (const float *)lw->attn_qkv_bias;
+            for (int bi = 0; bi < n_tokens; bi++) {
+                float *q = q_batch + bi * 3 * dim;
+                for (int i = 0; i < 3 * dim; i++) q[i] += bias[i];
+            }
+        }
+
+        /* Split Q, K, V from fused output */
+        {
+            for (int bi = 0; bi < n_tokens; bi++) {
+                float *qf = q_batch + bi * 3 * dim;
+                memcpy(xb2_batch + bi * dim, qf, dim * sizeof(float));
+                memcpy(k_batch + bi * kv_dim, qf + dim, kv_dim * sizeof(float));
+                memcpy(v_batch + bi * kv_dim, qf + 2 * dim, kv_dim * sizeof(float));
+            }
+        }
+
+        /* Per-position RoPE and KV cache store */
+        {
+            uint8_t *kcl = s->key_cache + (size_t)l * seq_len * s->kv_row_size_k;
+            uint8_t *vcl = s->val_cache + (size_t)l * seq_len * s->kv_row_size_v;
+            for (int bi = 0; bi < n_tokens; bi++) {
+                int pos = start_pos + bi;
+                float *q_pos = xb2_batch + bi * dim;
+                float *k_pos = k_batch + bi * kv_dim;
+                float *v_pos = v_batch + bi * kv_dim;
+
+                /* Apply RoPE */
+                rope(q_pos, k_pos, head_dim, n_heads, n_kv_heads,
+                     s->rope_cos + (size_t)pos * half_dim,
+                     s->rope_sin + (size_t)pos * half_dim,
+                     c->rope_type, half_dim);
+
+                /* Store K */
+                uint8_t *kp = kcl + (size_t)pos * s->kv_row_size_k;
+                if (s->kv_type_k == KV_CACHE_Q8_0) {
+                    quantize_row_q8_0(k_pos, kp, kv_dim);
+                } else if (s->kv_type_k == KV_CACHE_Q4_0) {
+                    quantize_row_q4_0(k_pos, kp, kv_dim);
+                } else if (s->kv_type_k == KV_CACHE_TQ3) {
+                    for (int hkv = 0; hkv < n_kv_heads; hkv++) {
+                        quantize_row_tq3(k_pos + hkv * head_dim,
+                            kp + hkv * s->kv_head_stride_k, head_dim);
+                    }
+                } else if (s->kv_type_k == KV_CACHE_TQ4) {
+                    for (int hkv = 0; hkv < n_kv_heads; hkv++) {
+                        quantize_row_tq4(k_pos + hkv * head_dim,
+                            kp + hkv * s->kv_head_stride_k, head_dim);
+                    }
+                } else {
+                    uint16_t *kf = (uint16_t *)kp;
+                    for (int d2 = 0; d2 < kv_dim; d2++) kf[d2] = fp32_to_fp16(k_pos[d2]);
+                }
+
+                /* Store V */
+                uint8_t *vp = vcl + (size_t)pos * s->kv_row_size_v;
+                if (s->kv_type_v == KV_CACHE_Q8_0) {
+                    quantize_row_q8_0(v_pos, vp, kv_dim);
+                } else if (s->kv_type_v == KV_CACHE_Q4_0) {
+                    quantize_row_q4_0(v_pos, vp, kv_dim);
+                } else if (s->kv_type_v == KV_CACHE_TQ3) {
+                    for (int hkv = 0; hkv < n_kv_heads; hkv++) {
+                        quantize_row_tq3(v_pos + hkv * head_dim,
+                            vp + hkv * s->kv_head_stride_v, head_dim);
+                    }
+                } else if (s->kv_type_v == KV_CACHE_TQ4) {
+                    for (int hkv = 0; hkv < n_kv_heads; hkv++) {
+                        quantize_row_tq4(v_pos + hkv * head_dim,
+                            vp + hkv * s->kv_head_stride_v, head_dim);
+                    }
+                } else {
+                    uint16_t *vf = (uint16_t *)vp;
+                    for (int d2 = 0; d2 < kv_dim; d2++) vf[d2] = fp32_to_fp16(v_pos[d2]);
+                }
+            }
+        }
+
+        /* Rotate Q for TQ4 */
+        if (s->kv_type_k == KV_CACHE_TQ4) {
+            for (int bi = 0; bi < n_tokens; bi++) {
+                float *q_pos = xb2_batch + bi * dim;
+                for (int h = 0; h < n_heads; h++) {
+                    picolm_hadamard_transform(q_pos + h * head_dim, head_dim, TQ4_BLOCK_SIZE);
+                }
+            }
+        }
+
+        /* Attention (batched) - Q is in xb2_batch (compact), output to xb_batch */
+        memset(xb_batch, 0, (size_t)n_tokens * max_dim * sizeof(float));
+        {
+            batch_attention_layer(xb_batch, xb2_batch,
+                                  s->key_cache + (size_t)l * seq_len * s->kv_row_size_k,
+                                  s->val_cache + (size_t)l * seq_len * s->kv_row_size_v,
+                                  n_tokens, start_pos,
+                                  n_heads, n_kv_heads, head_dim,
+                                  dim, s->kv_type_k, s->kv_type_v,
+                                  s->kv_row_size_k, s->kv_row_size_v,
+                                  s->kv_head_stride_k, s->kv_head_stride_v,
+                                  1.0f / sqrtf((float)head_dim),
+                                  0 /* GPTNeoX has no SWA */);
+        }
+
+        /* Output projection (batched) */
+        tensor_set_repacked(m->repack_used[5 + l * 9] ? m->repack_buffers[5 + l * 9] : NULL);
+        matmul_batch(xb2_batch, xb_batch, n_tokens, lw->attn_output, q_dim, dim, lw->type_attn_output);
+        tensor_set_repacked(NULL);
+        if (lw->attn_output_bias) {
+            const float *bias = (const float *)lw->attn_output_bias;
+            for (int bi = 0; bi < n_tokens; bi++) {
+                float *xb = xb2_batch + bi * dim;
+                for (int i = 0; i < dim; i++) xb[i] += bias[i];
+            }
+        }
+
+        /* ---- FFN branch (in parallel): LayerNorm on original x ---- */
+        for (int bi = 0; bi < n_tokens; bi++)
+            layernorm(xb_batch + bi * dim, x_batch + bi * dim,
+                      s->post_attn_norm_w[l], s->post_attn_norm_b[l], dim, c->rms_norm_eps);
+
+        /* FFN up (batched): [dim, n_ffn] */
+        tensor_set_repacked(m->repack_used[8 + l * 9] ? m->repack_buffers[8 + l * 9] : NULL);
+        matmul_batch(hb_batch, xb_batch, n_tokens, lw->ffn_up, dim, n_ffn, lw->type_ffn_up);
+        tensor_set_repacked(NULL);
+        if (lw->ffn_up_bias) {
+            const float *bias = (const float *)lw->ffn_up_bias;
+            for (int bi = 0; bi < n_tokens; bi++) {
+                float *hb = hb_batch + bi * n_ffn;
+                for (int i = 0; i < n_ffn; i++) hb[i] += bias[i];
+            }
+        }
+
+        /* GELU activation (batched) */
+        for (int bi = 0; bi < n_tokens; bi++)
+            gelu(hb_batch + bi * n_ffn, n_ffn);
+
+        /* FFN down (batched): [n_ffn, dim] */
+        tensor_set_repacked(m->repack_used[7 + l * 9] ? m->repack_buffers[7 + l * 9] : NULL);
+        matmul_batch(xb_batch, hb_batch, n_tokens, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
+        tensor_set_repacked(NULL);
+        if (lw->ffn_down_bias) {
+            const float *bias = (const float *)lw->ffn_down_bias;
+            for (int bi = 0; bi < n_tokens; bi++) {
+                float *xb = xb_batch + bi * dim;
+                for (int i = 0; i < dim; i++) xb[i] += bias[i];
+            }
+        }
+
+        /* Parallel residual: x += attn_out + ffn_out */
+        for (int bi = 0; bi < n_tokens; bi++) {
+            float *x = x_batch + bi * dim;
+            float *attn = xb2_batch + bi * dim;
+            float *ffn = xb_batch + bi * dim;
+            for (int i = 0; i < dim; i++) {
+                x[i] = x[i] + attn[i] + ffn[i];
+            }
+        }
+
+#ifdef PICOLM_VIZ
+        viz_push_layer(l, x_batch + (n_tokens - 1) * dim, dim);
+#endif
+        BENCH_LAYER_END(l, 1);
+    }
+
+    /* Final LayerNorm (last token) */
+    layernorm(s->x, x_batch + (n_tokens - 1) * dim,
+              s->output_norm_w, s->output_norm_b, dim, c->rms_norm_eps);
+
+    /* Output projection -> logits */
+    tensor_set_repacked(m->repack_used[1] ? m->repack_buffers[1] : NULL);
+    matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
+    tensor_set_repacked(NULL);
+
+    free(buf);
+    return s->logits;
+}
+
 /* ================================================================
  * Batched attention for prefill: computes attention for all tokens
  * and all heads in a single batched operation per layer.
@@ -3815,6 +4294,10 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
     /* GPT-2 batched prefill */
     if (m->config.is_gpt2) {
         return model_forward_prefill_gpt2(m, tokens, n_tokens, start_pos, interrupt);
+    }
+    /* GPTNeoX (Krake v2) batched prefill */
+    if (m->config.is_gptneox) {
+        return model_forward_prefill_gptneox(m, tokens, n_tokens, start_pos, interrupt);
     }
 
     model_config_t *c = &m->config;
