@@ -1100,8 +1100,12 @@ static void matmul_worker_f(matmul_task_t *t) {
         if (t->x) {
             const block_q8_K *qx = (const block_q8_K *)t->x;
             for (int i = t->start; i < t->end; i++) {
-                t->out[i] = vec_dot_iq2_k_q8_k(
-                    t->W + (size_t)i * t->row_bytes, qx, t->n);
+                const char *wrow = t->W + (size_t)i * t->row_bytes;
+                if (t->qtype == GGUF_TYPE_IQ3_K) {
+                    t->out[i] = vec_dot_iq3_k_q8_k(wrow, qx, t->n);
+                } else {
+                    t->out[i] = vec_dot_iq2_k_q8_k(wrow, qx, t->n);
+                }
             }
         } else {
             for (int i = t->start; i < t->end; i++) {
@@ -2383,7 +2387,12 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
 
             if (n_threads <= 1 || d < 4 || d < matmul_min_rows) {
                 for (int i = 0; i < d; i++) {
-                    out[i] = vec_dot_iq2_k_q8_k(wptr + (size_t)i * row_bytes, qx, n);
+                    const char *wrow = wptr + (size_t)i * row_bytes;
+                    if (qtype == GGUF_TYPE_IQ3_K) {
+                        out[i] = vec_dot_iq3_k_q8_k(wrow, qx, n);
+                    } else {
+                        out[i] = vec_dot_iq2_k_q8_k(wrow, qx, n);
+                    }
                 }
                 if (qx_owned) free(qx);
                 return;
