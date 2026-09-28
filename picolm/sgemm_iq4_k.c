@@ -533,8 +533,8 @@ void vec_dot_iq4_k_r4_q8_k_neon(const void *vx, const void *wy, int n,
                 int s1 = iq4_k_r4_scale(scales_l, scales_h, 8 * ib + iy);
                 int s2 = iq4_k_r4_scale(scales_l, scales_h, 8 * ib + iy + 4);
 
-                const int8_t *values1 = (extra[0] & (1 << ib)) ? lut1 : lut0;
-                const int8_t *values2 = (extra[4] & (1 << ib)) ? lut1 : lut0;
+                const int8_t *values1 = (extra[iy] & (1 << ib)) ? lut1 : lut0;
+                const int8_t *values2 = (extra[iy + 4] & (1 << ib)) ? lut1 : lut0;
 
                 int32_t row_sum = 0;
                 int base_qs = 64 * ib + 4 * iy;
@@ -575,17 +575,27 @@ int sgemm_iq4_k_r4_q8_k_neon(int nrows, int ncols, int k,
                                const void *vx, const void *vy,
                                float *out, size_t bs,
                                int ith, int nth) {
-    int row_stride = 4;
-    int col_stride = 2;
-    int nrows_tile = (nrows + row_stride - 1) / row_stride;
-    int ncols_tile = (ncols + col_stride - 1) / col_stride;
+    if (nrows < 4 || ncols < 1 || k % QK_K != 0 || nrows % 4 != 0)
+        return 0;
 
-    int rows_per_thread = (nrows_tile + nth - 1) / nth;
-    int row_start = ith * rows_per_thread;
-    int row_end = row_start + rows_per_thread;
-    if (row_end > nrows_tile) row_end = nrows_tile;
-    if (row_start >= row_end) return row_start;
+    const int nb = k / QK_K;
 
+    int64_t ytiles = nrows / 4;
+    int64_t xtiles = ncols / 2;
+    int64_t n_tail = ncols - xtiles * 2;
+    int64_t xtiles_ext = xtiles + (n_tail > 0 ? 1 : 0);
+    int64_t tiles = ytiles * xtiles_ext;
+    if (tiles <= 0) return 0;
+
+    int64_t duty = (tiles + nth - 1) / nth;
+    int64_t start = duty * ith;
+    int64_t end = start + duty;
+    if (end > tiles) end = tiles;
+
+    size_t w_block_bytes = nb * sizeof(block_iq4_k_r4);
+    size_t a_row_bytes = nb * sizeof(block_q8_K);
+
+    /* LUT tables */
     const int8_t lut0[16] = {
         -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
     };
@@ -593,76 +603,73 @@ int sgemm_iq4_k_r4_q8_k_neon(int nrows, int ncols, int k,
         -123, -100, -79, -61, -45, -31, -18,  -6, 5, 17, 29, 42, 57, 73, 93, 117,
     };
 
-    for (int ii = row_start; ii < row_end; ii++) {
-        int actual_nrows = ii * row_stride;
-        if (actual_nrows + row_stride > nrows) {
-            row_stride = nrows - actual_nrows;
-            if (row_stride <= 0) break;
+    for (int64_t job = start; job < end; job++) {
+        int64_t ii = (job / xtiles_ext) * 4;
+        int64_t xt = job % xtiles_ext;
+        int64_t jj = xt * 2;
+        int64_t ncols_tile = (xt < xtiles) ? 2 : n_tail;
+        if (ncols_tile < 1) ncols_tile = 1;
+
+        const block_iq4_k_r4 *iq4 = (const block_iq4_k_r4 *)
+            ((const char *)vx + (ii / 4) * w_block_bytes);
+
+        float acc[4][2] = { {{0}} };
+
+        const block_q8_K *qk_ptr[2];
+        for (int c = 0; c < ncols_tile; c++) {
+            qk_ptr[c] = (const block_q8_K *)
+                ((const char *)vy + (jj + c) * a_row_bytes);
         }
 
-        for (int jj = 0; jj < ncols_tile; jj++) {
-            int actual_ncols = jj * col_stride;
-            if (actual_ncols + col_stride > ncols) {
-                col_stride = ncols - actual_ncols;
-                if (col_stride <= 0) break;
-            }
+        for (int ibl = 0; ibl < nb; ibl++) {
+            float d_arr[4];
+            for (int r = 0; r < 4; r++)
+                d_arr[r] = fp16_to_fp32_lookup(iq4[ibl].d[r]);
+            const uint8_t *scales_l = iq4[ibl].scales_l;
+            const uint8_t *scales_h = iq4[ibl].scales_h;
+            const uint8_t *extra = iq4[ibl].extra;
+            const uint8_t *qs_base = iq4[ibl].qs;
 
-            float acc[4] = {0};
+            for (int c = 0; c < ncols_tile; c++) {
+                float q8_scale = qk_ptr[c][ibl].d;
+                const int8_t *q8_base = qk_ptr[c][ibl].qs;
 
-            for (int col = 0; col < col_stride; col++) {
-                const int8_t *q8_row = ((const int8_t *)vy) + (actual_ncols + col) * k;
+                for (int iy = 0; iy < 4; iy++) {
+                    int32_t sumi = 0;
+                    for (int ib = 0; ib < QK_K / 32; ib++) {
+                        int s1 = iq4_k_r4_scale(scales_l, scales_h, 8 * ib + iy);
+                        int s2 = iq4_k_r4_scale(scales_l, scales_h, 8 * ib + iy + 4);
 
-                for (int ibl = 0; ibl < k / QK_K; ibl++) {
-                    const block_iq4_k_r4 *blk = (const block_iq4_k_r4 *)vx + ibl * row_stride;
-                    float q8_scale = ((const block_q8_K *)q8_row)[ibl].d;
-                    const int8_t *q8_base = ((const block_q8_K *)q8_row)[ibl].qs;
+                        const int8_t *values1 = (extra[iy] & (1 << ib)) ? lut1 : lut0;
+                        const int8_t *values2 = (extra[iy + 4] & (1 << ib)) ? lut1 : lut0;
 
-                    for (int r = 0; r < row_stride; r++) {
-                        float d = fp16_to_fp32_lookup(blk[ibl].d[r]);
-                        float dy = d * q8_scale;
-                        const uint8_t *scales_l = blk[ibl].scales_l;
-                        const uint8_t *scales_h = blk[ibl].scales_h;
-                        const uint8_t *extra = blk[ibl].extra;
-                        const uint8_t *qs_base = blk[ibl].qs;
-
-                        int32_t sumi = 0;
-
-                        for (int ib = 0; ib < QK_K / 32; ib++) {
-                            int s1 = iq4_k_r4_scale(scales_l, scales_h, 8 * ib + r);
-                            int s2 = iq4_k_r4_scale(scales_l, scales_h, 8 * ib + r + 4);
-
-                            const int8_t *values1 = (extra[0] & (1 << ib)) ? lut1 : lut0;
-                            const int8_t *values2 = (extra[4] & (1 << ib)) ? lut1 : lut0;
-
-                            int base_qs = 64 * ib + 4 * r;
-                            int base_q8 = 32 * ib;
-                            const uint8_t *qs = qs_base;
-                            const int8_t *q8 = q8_base + base_q8;
-
-                            for (int i = 0; i < 4; i++) {
-                                sumi += s1 * values1[qs[base_qs + i] & 0xf] * q8[i + 0];
-                                sumi += s1 * values1[qs[base_qs + i] >> 4] * q8[i + 8];
-                                sumi += s2 * values2[qs[base_qs + i + 16] & 0xf] * q8[i + 16];
-                                sumi += s2 * values2[qs[base_qs + i + 16] >> 4] * q8[i + 24];
-                                sumi += s1 * values1[qs[base_qs + i + 32] & 0xf] * q8[i + 4];
-                                sumi += s1 * values1[qs[base_qs + i + 32] >> 4] * q8[i + 12];
-                                sumi += s2 * values2[qs[base_qs + i + 48] & 0xf] * q8[i + 20];
-                                sumi += s2 * values2[qs[base_qs + i + 48] >> 4] * q8[i + 28];
-                            }
+                        int base_qs = 64 * ib + 4 * iy;
+                        int base_q8 = 32 * ib;
+                        for (int i = 0; i < 4; i++) {
+                            sumi += s1 * values1[qs_base[base_qs + i] & 0xf] * q8_base[base_q8 + i + 0];
+                            sumi += s1 * values1[qs_base[base_qs + i] >> 4] * q8_base[base_q8 + i + 8];
+                            sumi += s2 * values2[qs_base[base_qs + i + 16] & 0xf] * q8_base[base_q8 + i + 16];
+                            sumi += s2 * values2[qs_base[base_qs + i + 16] >> 4] * q8_base[base_q8 + i + 24];
+                            sumi += s1 * values1[qs_base[base_qs + i + 32] & 0xf] * q8_base[base_q8 + i + 4];
+                            sumi += s1 * values1[qs_base[base_qs + i + 32] >> 4] * q8_base[base_q8 + i + 12];
+                            sumi += s2 * values2[qs_base[base_qs + i + 48] & 0xf] * q8_base[base_q8 + i + 20];
+                            sumi += s2 * values2[qs_base[base_qs + i + 48] >> 4] * q8_base[base_q8 + i + 28];
                         }
-
-                        acc[r] += (float)sumi * dy;
                     }
+                    acc[iy][c] += (float)sumi * d_arr[iy] * q8_scale;
                 }
             }
+        }
 
-            for (int r = 0; r < row_stride; r++) {
-                out[actual_nrows + r + (jj * col_stride) * bs] = acc[r];
+        /* Store results */
+        for (int c = 0; c < ncols_tile; c++) {
+            for (int r = 0; r < 4; r++) {
+                out[ii + r + (jj + c) * bs] = acc[r][c];
             }
         }
     }
 
-    return row_end;
+    return nrows;
 }
 
 /* NEON R4 function declarations for quant.c dispatcher */

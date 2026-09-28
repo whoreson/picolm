@@ -6980,7 +6980,7 @@ case GGUF_TYPE_Q4_0_R8: {
                 free(q8r_tmp);
                 return result;
             }
-            free(q8r_tmp);
+            /* malloc failed */
             return 0.0f;
         }
         case GGUF_TYPE_IQ2_K_R4: {
