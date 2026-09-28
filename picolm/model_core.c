@@ -2297,6 +2297,10 @@ static float *model_forward_gpt2(model_t *m, int token, int pos) {
         tensor_set_repacked(m->repack_used[ri+5] ? m->repack_buffers[ri+5] : NULL);
         matmul(s->xb, s->hb, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
         tensor_set_repacked(NULL);
+        if (getenv("PICOLM_DBG_LAYER") && l == 0) {
+            fprintf(stderr, "[LNDBG] CPU decode l=%d FFN_down[0:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                    l, s->xb[0],s->xb[1],s->xb[2],s->xb[3],s->xb[4],s->xb[5],s->xb[6],s->xb[7]);
+        }
         /* Add bias */
         if (lw->ffn_down_bias) {
             const float *bias = (const float *)lw->ffn_down_bias;
@@ -3161,6 +3165,10 @@ float *model_forward(model_t *m, int token, int pos) {
             } else {
                 matmul(s->xb, s->hb, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
                 tensor_set_repacked(NULL);
+                if (getenv("PICOLM_DBG_LAYER") && l == 0) {
+                    fprintf(stderr, "[LNDBG] CPU decode l=%d FFN_down_SwiGLU[0:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                            l, s->xb[0],s->xb[1],s->xb[2],s->xb[3],s->xb[4],s->xb[5],s->xb[6],s->xb[7]);
+                }
                 vec_add(s->x, s->xb, dim);
             }
 #ifdef PICOLM_GPU
@@ -4944,6 +4952,24 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #endif
     matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
     tensor_set_repacked(NULL);
+
+    /* DEBUG: dump top-5 logits for last prefill token */
+    if (getenv("PICOLM_DBG_PREFILL")) {
+        float *logits = s->logits;
+        int vocab = c->vocab_size;
+        int top_n = 5;
+        /* Find top-N logits */
+        for (int k = 0; k < top_n; k++) {
+            float best = -1e30f; int best_i = -1;
+            for (int v = 0; v < vocab; v++) {
+                if (logits[v] > best) { best = logits[v]; best_i = v; }
+            }
+            fprintf(stderr, "[PREFILL_LOGIT] top[%d]: token=%d val=%.4f\n", k, best_i, best);
+            logits[best_i] = -1e30f; /* mask for next iteration */
+        }
+        /* Restore */
+        matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
+    }
 
     /* Clear GPU tensor handle so generation path doesn't inherit stale handle */
 #ifdef PICOLM_GPU

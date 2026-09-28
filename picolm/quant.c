@@ -7022,6 +7022,7 @@ case GGUF_TYPE_Q4_0_R8: {
             float tmp[8192];
             float *buf = (n <= 8192) ? tmp : (float *)malloc((size_t)n * sizeof(float));
             dequantize_row(src, buf, n, type);
+
             float sum = vec_dot_f32_f32(buf, x, n_aligned);
             if (buf != tmp) free(buf);
             return sum;
@@ -8393,7 +8394,7 @@ void quantize_mat_q8_2_x4(const float *x, void *dst, int n, int row_stride) {
  * GGUF type 137. Ported from llama.cpp iqk_quantize.cpp
  * ================================================================ */
 
-/* Scalar reference dequantize for IQ2_K plain (single row). */
+/* Scalar dequantize for IQ2_K plain (single row). */
 void dequantize_row_iq2_k(const void *src, float *dst, int n) {
     const block_iq2_k *x = (const block_iq2_k *)src;
     const int nb = n / QK_K;
@@ -8427,11 +8428,22 @@ extern void vec_dot_iq2_k_q8_k_avx2(const void *vx, const void *wy, int n, float
 extern void vec_dot_iq2_k_q8_k_neon(const void *vx, const void *wy, int n, float *out);
 
 float vec_dot_iq2_k_q8_k(const void *vx, const void *wy, int n) {
+    /* Force scalar path for debugging: PICOLM_IQ2K_SCALAR=1 */
+    static const char *_iq2k_scalar = NULL;
+    if (!_iq2k_scalar) _iq2k_scalar = getenv("PICOLM_IQ2K_SCALAR");
 #if defined(PICOLM_AVX2)
-    float result;
-    vec_dot_iq2_k_q8_k_avx2(vx, wy, n, &result);
-    return result;
-#else
+    if (!(_iq2k_scalar && (_iq2k_scalar[0] == '1' || _iq2k_scalar[0] == 'y'))) {
+        float result;
+        vec_dot_iq2_k_q8_k_avx2(vx, wy, n, &result);
+        return result;
+    }
+#elif defined(PICOLM_NEON)
+    if (!(_iq2k_scalar && (_iq2k_scalar[0] == '1' || _iq2k_scalar[0] == 'y'))) {
+        float result;
+        vec_dot_iq2_k_q8_k_neon(vx, wy, n, &result);
+        return result;
+    }
+#endif
     /* Scalar fallback */
     const block_iq2_k *x = (const block_iq2_k *)vx;
     const block_q8_K *y = (const block_q8_K *)wy;
@@ -8464,7 +8476,6 @@ float vec_dot_iq2_k_q8_k(const void *vx, const void *wy, int n) {
         sumf += sumi * q8_scale;
     }
     return sumf;
-#endif
 }
 
 /* ================================================================
