@@ -6983,16 +6983,20 @@ case GGUF_TYPE_Q4_0_R8: {
             return vec_dot_f32_f32(iq3_tmp, x, n);
         }
         case GGUF_TYPE_IQ4_K: {
-            /* IQ4_K plain: fallback dequantize row 0, then f32 dot. */
-            float iq4_tmp[1024];
+            /* IQ4_K plain: fallback dequantize, then f32 dot. */
+            float *iq4_tmp = (float *)malloc((size_t)n * sizeof(float));
             dequantize_row_iq4_k(src, iq4_tmp, n);
-            return vec_dot_f32_f32(iq4_tmp, x, n);
+            float result = vec_dot_f32_f32(iq4_tmp, x, n);
+            free(iq4_tmp);
+            return result;
         }
         case GGUF_TYPE_IQ4_K_R4: {
             /* IQ4_K_R4: 4-row interleaved. Fallback: dequantize row 0, then f32 dot. */
-            float iq4_tmp[1024];
+            float *iq4_tmp = (float *)malloc((size_t)n * sizeof(float));
             dequantize_row_iq4_k_r4_single((const block_iq4_k_r4 *)src, iq4_tmp, n, 0);
-            return vec_dot_f32_f32(iq4_tmp, x, n);
+            float result = vec_dot_f32_f32(iq4_tmp, x, n);
+            free(iq4_tmp);
+            return result;
         }
         case GGUF_TYPE_Q6_K_R4: {
             /* Q6_K_R4: dequantize row 0 of the 4-row group, then f32 dot.
@@ -8719,8 +8723,21 @@ void dequantize_row_iq4_k(const void *src, float *dst, int n) {
     }
 }
 
-/* IQ4_K plain x Q8_K scalar vec_dot */
+extern void vec_dot_iq4_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out);
+extern void vec_dot_iq4_k_q8_k_neon(const void *vx, const void *wy, int n, float *out);
+
+/* IQ4_K plain x Q8_K dispatcher */
 float vec_dot_iq4_k_q8_k(const void *vx, const void *wy, int n) {
+#if defined(PICOLM_AVX2)
+    float result;
+    vec_dot_iq4_k_q8_k_avx2(vx, wy, n, &result);
+    return result;
+#elif defined(PICOLM_NEON)
+    float result;
+    vec_dot_iq4_k_q8_k_neon(vx, wy, n, &result);
+    return result;
+#else
+    /* Scalar fallback */
     const block_iq4_k *x = (const block_iq4_k *)vx;
     const block_q8_K *y = (const block_q8_K *)wy;
     const int nb = n / QK_K;
@@ -8751,6 +8768,7 @@ float vec_dot_iq4_k_q8_k(const void *vx, const void *wy, int n) {
         sumf += sumi * q8_scale;
     }
     return sumf;
+#endif
 }
 
 /* ================================================================

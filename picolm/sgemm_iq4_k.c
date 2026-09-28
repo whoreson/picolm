@@ -263,3 +263,219 @@ void vec_dot_iq4_k_r4_q8_k_avx2(const void *vx, const void *wy, int n,
 void vec_dot_iq4_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out) { (void)vx; (void)wy; (void)n; (void)out; }
 void vec_dot_iq4_k_r4_q8_k_avx2(const void *vx, const void *wy, int n, float *out, int nrows) { (void)vx; (void)wy; (void)n; (void)out; (void)nrows; }
 #endif
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+
+/* IQ4_K NEON LUT: 32 entries (16 normal + 16 shifted), padded to 32 bytes.
+ * Table 0 (indices 0-15):  {-127,-104,-83,-65,-49,-35,-22,-10, 1,13,25,38,53,69,89,113}
+ * Table 1 (indices 16-31): {-123,-100,-79,-61,-45,-31,-18, -6, 5,17,29,42,57,73,93,117} */
+static const int8_t iq4k_values_neon[32] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+    -123, -100, -79, -61, -45, -31, -18,  -6, 5, 17, 29, 42, 57, 73, 93, 117,
+};
+
+/* ================================================================
+ * IQ4_K plain x Q8_K ARM NEON GEMV kernel
+ *
+ * 4-bit non-linear quantization:
+ *   qs[128] = 4-bit values (2 per byte, 256 values total)
+ *   scales_h[4] = 2 bits per scale (16 scales total)
+ *   scales_l[8] = 4-bit magnitude per scale (16 total)
+ *   Scale = (scales_l_4bit | (scales_h_2bit << 4)) - 32  (6-bit signed, offset 32)
+ *   LUT: 32 entries, 4-bit index (0-15), extra bits select table (+16)
+ * ================================================================ */
+void vec_dot_iq4_k_q8_k_neon(const void *vx, const void *wy, int n, float *out) {
+    assert(n % QK_K == 0);
+
+    const block_iq4_k *iq4 = (const block_iq4_k *)vx;
+    const block_q8_K *qk = (const block_q8_K *)wy;
+    const int nb = n / QK_K;
+
+    /* Two separate LUTs: normal (0-15) and shifted (16-31).
+     * vqtbl1q_u8 only uses low 4 bits of index (0-15), so we can't
+     * use a single 32-entry LUT with offset. Instead, load both tables
+     * and select per-element. */
+    const uint8x16_t lut0 = vld1q_u8((const uint8_t *)iq4k_values_neon);       /* indices 0-15 */
+    const uint8x16_t lut1 = vld1q_u8((const uint8_t *)iq4k_values_neon + 16); /* indices 16-31 */
+    const uint8x16_t m0f = vdupq_n_u8(0x0f);
+
+    float result = 0.0f;
+
+    for (int ibl = 0; ibl < nb; ibl++) {
+        float d = fp16_to_fp32_lookup(iq4[ibl].d);
+        float q8_scale = qk[ibl].d;
+        float dy = d * q8_scale;
+
+        uint16_t extra = iq4[ibl].extra;
+        const uint8_t *qs = iq4[ibl].qs;
+        const int8_t *q8_base = qk[ibl].qs;
+
+        int32x4_t isum = vdupq_n_s32(0);
+
+        for (int ib = 0; ib < QK_K / 32; ++ib) {
+            /* Scale extraction: 6-bit signed = (scales_l 4-bit | scales_h 2-bit) - 32 */
+            const uint8_t sh = iq4[ibl].scales_h[ib / 2] >> (4 * (ib % 2));
+            int scale_lo = (int)(((iq4[ibl].scales_l[ib] & 0xf) | ((sh << 4) & 0x30)) - 32);
+            int scale_hi = (int)(((iq4[ibl].scales_l[ib] >> 4) | ((sh << 2) & 0x30)) - 32);
+
+            /* LUT table selection per subblock-half: 0=normal, 1=shifted */
+            int use_shifted_lo = extra & 1;
+            int use_shifted_hi = (extra >> 1) & 1;
+            extra >>= 2;
+
+            /* Load 32 activations */
+            int8x16_t y_lo = vld1q_s8(q8_base + ib * 32);
+            int8x16_t y_hi = vld1q_s8(q8_base + ib * 32 + 16);
+
+            /* Load 16 qs bytes (32 4-bit values) */
+            uint8x16_t qs_vec = vld1q_u8(qs);
+
+            /* Low nibbles: values 0..15 */
+            uint8x16_t ql = vandq_u8(qs_vec, m0f);
+            /* High nibbles: values 0..15 */
+            uint8x16_t qh = vandq_u8(vshrq_n_u8(qs_vec, 4), m0f);
+
+            /* LUT lookup: select between lut0 and lut1 based on extra bit */
+            uint8x16_t qx_lo_u8, qx_hi_u8;
+            if (use_shifted_lo) qx_lo_u8 = vqtbl1q_u8(lut1, ql);
+            else qx_lo_u8 = vqtbl1q_u8(lut0, ql);
+            if (use_shifted_hi) qx_hi_u8 = vqtbl1q_u8(lut1, qh);
+            else qx_hi_u8 = vqtbl1q_u8(lut0, qh);
+            int8x16_t qx_lo = vreinterpretq_s8_u8(qx_lo_u8);
+            int8x16_t qx_hi = vreinterpretq_s8_u8(qx_hi_u8);
+
+            /* int8 MAC via widening multiply */
+            int32x4_t s_lo = vaddq_s32(
+                vpaddlq_s16(vmull_s8(vget_low_s8(qx_lo), vget_low_s8(y_lo))),
+                vpaddlq_s16(vmull_high_s8(qx_lo, y_lo)));
+            int32x4_t s_hi = vaddq_s32(
+                vpaddlq_s16(vmull_s8(vget_low_s8(qx_hi), vget_low_s8(y_hi))),
+                vpaddlq_s16(vmull_high_s8(qx_hi, y_hi)));
+
+            /* Apply per-subblock scales */
+            isum = vaddq_s32(isum, vaddq_s32(
+                vmulq_n_s32(s_lo, scale_lo),
+                vmulq_n_s32(s_hi, scale_hi)));
+
+            qs += 16;
+        }
+
+        int total = vaddlvq_s32(isum);
+        result += (float)total * dy;
+    }
+
+    *out = result;
+}
+
+/* IQ4_K plain x Q8_K ARM NEON GEMM kernel.
+ * Tiled: 4 weight rows x 2 activation rows per tile. */
+int sgemm_iq4_k_q8_k_neon(int nrows, int ncols, int k,
+                           const void *vx, const void *vy,
+                           float *out, size_t bs,
+                           int ith, int nth) {
+    int row_stride = 4;
+    int col_stride = 2;
+    int nrows_tile = (nrows + row_stride - 1) / row_stride;
+    int ncols_tile = (ncols + col_stride - 1) / col_stride;
+
+    int rows_per_thread = (nrows_tile + nth - 1) / nth;
+    int row_start = ith * rows_per_thread;
+    int row_end = row_start + rows_per_thread;
+    if (row_end > nrows_tile) row_end = nrows_tile;
+    if (row_start >= row_end) return row_start;
+
+    const uint8x16_t lut0 = vld1q_u8((const uint8_t *)iq4k_values_neon);
+    const uint8x16_t lut1 = vld1q_u8((const uint8_t *)iq4k_values_neon + 16);
+    const uint8x16_t m0f = vdupq_n_u8(0x0f);
+
+    for (int ii = row_start; ii < row_end; ii++) {
+        int actual_nrows = ii * row_stride;
+        if (actual_nrows + row_stride > nrows) {
+            row_stride = nrows - actual_nrows;
+            if (row_stride <= 0) break;
+        }
+
+        for (int jj = 0; jj < ncols_tile; jj++) {
+            int actual_ncols = jj * col_stride;
+            if (actual_ncols + col_stride > ncols) {
+                col_stride = ncols - actual_ncols;
+                if (col_stride <= 0) break;
+            }
+
+            float acc[4] = {0};
+
+            for (int col = 0; col < col_stride; col++) {
+                const int8_t *q8_row = ((const int8_t *)vy) + (actual_ncols + col) * k;
+
+                for (int ibl = 0; ibl < k / QK_K; ibl++) {
+                    const block_iq4_k *blk = (const block_iq4_k *)vx + ibl * row_stride;
+                    float q8_scale = ((const block_q8_K *)q8_row)[ibl].d;
+                    const int8_t *q8_base = ((const block_q8_K *)q8_row)[ibl].qs;
+
+                    for (int r = 0; r < row_stride; r++) {
+                        float d = fp16_to_fp32_lookup(blk[r].d);
+                        float dy = d * q8_scale;
+                        uint16_t extra = blk[r].extra;
+                        const uint8_t *qs = blk[r].qs;
+
+                        int32x4_t isum = vdupq_n_s32(0);
+
+                        for (int ib = 0; ib < QK_K / 32; ++ib) {
+                            const uint8_t sh = blk[r].scales_h[ib / 2] >> (4 * (ib % 2));
+                            int scale_lo = (int)(((blk[r].scales_l[ib] & 0xf) | ((sh << 4) & 0x30)) - 32);
+                            int scale_hi = (int)(((blk[r].scales_l[ib] >> 4) | ((sh << 2) & 0x30)) - 32);
+
+                            int use_shifted_lo = extra & 1;
+                            int use_shifted_hi = (extra >> 1) & 1;
+                            extra >>= 2;
+
+                            int8x16_t y_lo = vld1q_s8(q8_base + ib * 32);
+                            int8x16_t y_hi = vld1q_s8(q8_base + ib * 32 + 16);
+
+                            uint8x16_t qs_vec = vld1q_u8(qs);
+                            uint8x16_t ql = vandq_u8(qs_vec, m0f);
+                            uint8x16_t qh = vandq_u8(vshrq_n_u8(qs_vec, 4), m0f);
+
+                            uint8x16_t qx_lo_u8, qx_hi_u8;
+                            if (use_shifted_lo) qx_lo_u8 = vqtbl1q_u8(lut1, ql);
+                            else qx_lo_u8 = vqtbl1q_u8(lut0, ql);
+                            if (use_shifted_hi) qx_hi_u8 = vqtbl1q_u8(lut1, qh);
+                            else qx_hi_u8 = vqtbl1q_u8(lut0, qh);
+                            int8x16_t qx_lo = vreinterpretq_s8_u8(qx_lo_u8);
+                            int8x16_t qx_hi = vreinterpretq_s8_u8(qx_hi_u8);
+
+                            int32x4_t s_lo = vaddq_s32(
+                                vpaddlq_s16(vmull_s8(vget_low_s8(qx_lo), vget_low_s8(y_lo))),
+                                vpaddlq_s16(vmull_high_s8(qx_lo, y_lo)));
+                            int32x4_t s_hi = vaddq_s32(
+                                vpaddlq_s16(vmull_s8(vget_low_s8(qx_hi), vget_low_s8(y_hi))),
+                                vpaddlq_s16(vmull_high_s8(qx_hi, y_hi)));
+
+                            isum = vaddq_s32(isum, vaddq_s32(
+                                vmulq_n_s32(s_lo, scale_lo),
+                                vmulq_n_s32(s_hi, scale_hi)));
+
+                            qs += 16;
+                        }
+
+                        acc[r] += (float)vaddlvq_s32(isum) * dy;
+                    }
+                }
+            }
+
+            for (int r = 0; r < row_stride; r++) {
+                out[actual_nrows + r + (jj * col_stride) * bs] = acc[r];
+            }
+        }
+    }
+
+    return row_end;
+}
+
+/* NEON function declarations for quant.c dispatcher */
+extern void vec_dot_iq4_k_q8_k_neon(const void *vx, const void *wy, int n, float *out);
+extern int sgemm_iq4_k_q8_k_neon(int nrows, int ncols, int k,
+                                  const void *vx, const void *vy,
+                                  float *out, size_t bs, int ith, int nth);
+#endif /* ARM_NEON */
