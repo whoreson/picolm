@@ -438,13 +438,14 @@ static int bpe_piece(qwen_enc_t *enc, const char *s, int n, int *out, int cap) {
 /* Check if a model should use the native GPT-2 BPE tokenizer (this file). */
 int qwen_tokenize_should_use(const model_t *m) {
     /* Use the native BPE tokenizer for Qwen3/Qwen3.5 architectures, GPT-2
-     * models, and Mistral Tekken models (tokenizer.ggml.pre == "tekken",
+     * models, GPTNeoX (tokenizer.ggml.model == "gpt2", pre == "olmo"),
+     * and Mistral Tekken models (tokenizer.ggml.pre == "tekken",
      * e.g. Mistral-Nemo-2407). All of these ship a GPT-2-style byte-level
      * BPE vocab/merges in GGUF, just with different pretokenizer regexes
      * (see qwen_enc_t.pretok_type / pretok_next vs pretok_next_tekken).
      * Llama SPM and other architectures should use the old tokenizer.
      * Safetensors Qwen models also use this tokenizer (from_safetensors path). */
-    return m->config.is_qwen || m->config.is_gpt2 || m->config.is_tekken || m->from_safetensors;
+    return m->config.is_qwen || m->config.is_gpt2 || m->config.is_tekken || m->config.is_gptneox || m->from_safetensors;
 }
 
 /* Initialize the Qwen tokenizer from model data */

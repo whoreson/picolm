@@ -1327,6 +1327,11 @@ int parse_gguf(model_t *m, int max_seq_len) {
                     /* gpt-2: standard GPT-2 BPE preprocessing */
                     m->tok_space_marker = 0; /* uses literal space, handled by Qwen tokenizer */
                     m->tok_unknown_model = 0;
+                } else if (pre.len == 4 && strncmp(pre.str, "olmo", 4) == 0) {
+                    /* OLMo/GPTNeoX: GPT-2 BPE with ByteLevel pretokenizer.
+                     * Uses literal spaces, handled by qwen_tokenize.c BPE path.
+                     * tok_space_marker is unused for this path. */
+                    m->tok_unknown_model = 0;
                 } else {
                     m->tok_space_marker = 0; /* U+2581 (default, SPM models) */
                 }
