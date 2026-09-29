@@ -1424,6 +1424,12 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    if (!model_path) {
+        fprintf(stderr, "No model file specified\n");
+        usage(argv[0]);
+        return 1;
+    }
+
     /* Load model */
     fprintf(stderr, "PicoLM v1.0-rc2 \"Yura Kana\"\n");
 #ifdef PICOLM_DOS
