@@ -69,23 +69,7 @@ int sgemm_q8_k_r8_q8_k_neon(int nrows, int ncols, int k,
 
     const int nb = k / QK_K;
 
-    static int dbg_sgemm;
-    if (!dbg_sgemm && ith == 0) {
-        dbg_sgemm = 1;
-        fprintf(stderr, "DBG Q8_K_R8 NEON GEMM: nrows=%d ncols=%d k=%d nb=%d bs=%zu\n",
-                nrows, ncols, k, nb, bs);
-        const block_q8_k_r8 *iq8 = (const block_q8_k_r8 *)vx;
-        for (int r = 0; r < 8; r++)
-            fprintf(stderr, "  w d[%d]=%f\n", r, fp16_to_fp32_lookup(iq8[0].d[r]));
-        fprintf(stderr, "  w qs[0..7]=%d %d %d %d %d %d %d %d\n",
-                iq8[0].qs[0],iq8[0].qs[1],iq8[0].qs[2],iq8[0].qs[3],
-                iq8[0].qs[4],iq8[0].qs[5],iq8[0].qs[6],iq8[0].qs[7]);
-        const block_q8_K *qk = (const block_q8_K *)vy;
-        fprintf(stderr, "  a d=%f qs[0..3]=%d %d %d %d\n",
-                qk[0].d, qk[0].qs[0], qk[0].qs[1], qk[0].qs[2], qk[0].qs[3]);
-    }
-
-    int64_t ytiles = nrows / 8;
+        int64_t ytiles = nrows / 8;
     int64_t xtiles = ncols / 2;
     int64_t n_tail = ncols - xtiles * 2;
     int64_t xtiles_ext = xtiles + (n_tail > 0 ? 1 : 0);
@@ -114,6 +98,10 @@ int sgemm_q8_k_r8_q8_k_neon(int nrows, int ncols, int k,
         for (int c = 0; c < ncols_tile; c++)
             out_c[c] = out + ii + (jj + c) * bs;
 
+        /* Local accumulators (zeroed, like AVX2 path).
+         * 8 rows x 2 activation columns. */
+        float acc[8][2] = {{0}};
+
         const block_q8_K *qk_ptr[2];
 
         for (int ibl = 0; ibl < nb; ibl++) {
@@ -133,6 +121,8 @@ int sgemm_q8_k_r8_q8_k_neon(int nrows, int ncols, int k,
 
                 for (int rk = 0; rk < 8; rk++) {
                     float sum = 0.0f;
+                    /* Q8_K_R8 layout: qs[32*ib + 4*rk + i] where ib=0..63, rk=0..7, i=0..3.
+                     * Each 32-byte chunk: 8 rows x 4 values, each row's 4 bytes contiguous. */
                     for (int ib2 = 0; ib2 < QK_K / 16; ib2++) {
                         for (int chunk = 0; chunk < 4; chunk++) {
                             const int8_t *w = qs + 32 * (4 * ib2 + chunk);
@@ -149,11 +139,20 @@ int sgemm_q8_k_r8_q8_k_neon(int nrows, int ncols, int k,
             for (int c = 0; c < ncols_tile; c++) {
                 float scale_y = qk_ptr[c][ibl].d;
                 for (int rk = 0; rk < 8; rk++) {
-                    out_c[c][rk] += row_sums[rk][c] * d_vals[rk] * scale_y;
+                    acc[rk][c] += row_sums[rk][c] * d_vals[rk] * scale_y;
                 }
             }
         }
-    }
+
+        /* Store results to output buffer (not +=, to avoid stale data) */
+        for (int c = 0; c < ncols_tile; c++) {
+            for (int rk = 0; rk < 8; rk++) {
+                out_c[c][rk] = acc[rk][c];
+            }
+        }
+
+            }
+
     return nrows;
 }
 
