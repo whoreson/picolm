@@ -69,7 +69,7 @@ int sgemm_q8_k_r8_q8_k_neon(int nrows, int ncols, int k,
 
     const int nb = k / QK_K;
 
-        int64_t ytiles = nrows / 8;
+    int64_t ytiles = nrows / 8;
     int64_t xtiles = ncols / 2;
     int64_t n_tail = ncols - xtiles * 2;
     int64_t xtiles_ext = xtiles + (n_tail > 0 ? 1 : 0);
@@ -150,8 +150,7 @@ int sgemm_q8_k_r8_q8_k_neon(int nrows, int ncols, int k,
                 out_c[c][rk] = acc[rk][c];
             }
         }
-
-            }
+    }
 
     return nrows;
 }

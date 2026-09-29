@@ -1933,7 +1933,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
                         pool_tasks[t].x_d = NULL; pool_tasks[t].W = wptr;
                         pool_tasks[t].row_bytes = row_bytes; pool_tasks[t].n = n;
                         pool_tasks[t].qtype = GGUF_TYPE_Q8_K_R8;
-                        pool_tasks[t].n_batch = 0; pool_tasks[t].x_is_q8k = 0;
+                        pool_tasks[t].n_batch = 0; pool_tasks[t].x_is_q8k = 1;
                     }
                     pool_clear_unused(active, nt);
                     pool_init(nt);

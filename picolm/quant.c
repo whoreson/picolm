@@ -9047,6 +9047,7 @@ void dequantize_row_q8_k_r8(const void *src, float *dst, int n) {
         for (int r = 0; r < 8; r++) {
             float d = fp16_to_fp32(b[ibl].d[r]);
             float *d0 = dst + r * n + ibl * QK_K;
+            /* Layout: qs[32*ib + 4*r + j] = row r's value at position ib*4+j */
             for (int ib = 0; ib < QK_K / 4; ib++) {
                 for (int j = 0; j < 4; j++) {
                     d0[4 * ib + j] = b[ibl].qs[32 * ib + 4 * r + j] * d;
