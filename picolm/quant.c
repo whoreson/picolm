@@ -8682,12 +8682,12 @@ void vec_dot_iq3_k_r4_q8_k_batch4(const void *vx, const void *vy, int n, float *
         float *w_tmp = (float *)malloc((size_t)n * sizeof(float));
         float *a_tmp = (float *)malloc((size_t)n * sizeof(float));
         if (w_tmp && a_tmp) {
-            /* Dequantize Q8_K activations once */
+            /* Dequantize Q8_K activations once: x = qs * d */
             for (int i = 0; i < n; i++) {
                 int ib = i / 256;
                 int io = i % 256;
                 const block_q8_K *blk = ((const block_q8_K *)vy) + ib;
-                a_tmp[i] = (float)blk->qs[io] * blk->d / 127.0f;
+                a_tmp[i] = (float)blk->qs[io] * blk->d;
             }
             for (int r = 0; r < 4; r++) {
                 dequantize_row_iq3_k_r4_single((const block_iq3_k_r4 *)vx, w_tmp, n, r);
@@ -8861,6 +8861,58 @@ float vec_dot_iq4_k_r4_q8_k(const void *vx, const void *vy, int n) {
 
 /* vec_dot_iq4_k_r4_q8_k_avx2 declared in sgemm_iq4_k.c */
 extern void vec_dot_iq4_k_r4_q8_k_avx2(const void *vx, const void *wy, int n, float *out, int nrows);
+#if defined(PICOLM_NEON)
+extern void vec_dot_iq4_k_r4_q8_k_neon(const void *vx, const void *wy, int n, float *out, int nrows);
+#endif
+
+/* IQ4_K_R4 x Q8_K batched GEMV: 4 weight rows x 1 activation row.
+ * out: 4 output floats. n must be multiple of 256. */
+void vec_dot_iq4_k_r4_q8_k_batch4(const void *vx, const void *vy, int n, float *out) {
+    static int dbg_dispatch;
+    if (!dbg_dispatch) {
+        dbg_dispatch = 1;
+        fprintf(stderr, "DBG IQ4_K_R4 batch4 dispatch: AVX2=%d NEON=%d\n",
+#if defined(PICOLM_AVX2)
+                1,
+#else
+                0,
+#endif
+#if defined(PICOLM_NEON)
+                1
+#else
+                0
+#endif
+                );
+    }
+#if defined(PICOLM_AVX2) && !defined(PICOLM_FORCE_SCALAR)
+    vec_dot_iq4_k_r4_q8_k_avx2(vx, vy, n, out, 4);
+#elif defined(PICOLM_NEON) && !defined(PICOLM_FORCE_SCALAR)
+    vec_dot_iq4_k_r4_q8_k_neon(vx, vy, n, out, 4);
+#else
+    /* Scalar fallback: dequantize each row, F32 dot with dequantized Q8_K activations */
+    {
+        float *w_tmp = (float *)malloc((size_t)n * sizeof(float));
+        float *a_tmp = (float *)malloc((size_t)n * sizeof(float));
+        if (w_tmp && a_tmp) {
+            /* Dequantize Q8_K activations once: x = qs * d */
+            for (int i = 0; i < n; i++) {
+                int ib = i / 256;
+                int io = i % 256;
+                const block_q8_K *blk = ((const block_q8_K *)vy) + ib;
+                a_tmp[i] = (float)blk->qs[io] * blk->d;
+            }
+            for (int r = 0; r < 4; r++) {
+                dequantize_row_iq4_k_r4_single((const block_iq4_k_r4 *)vx, w_tmp, n, r);
+                out[r] = vec_dot_f32_f32(w_tmp, a_tmp, n);
+            }
+        } else {
+            memset(out, 0, 4 * sizeof(float));
+        }
+        free(w_tmp);
+        free(a_tmp);
+    }
+#endif
+}
 
 /* ================================================================
  * Q4_0_R8 (GGUF type 202): 8-row interleaved Q4_0.
