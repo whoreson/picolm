@@ -69,6 +69,22 @@ int sgemm_q8_k_r8_q8_k_neon(int nrows, int ncols, int k,
 
     const int nb = k / QK_K;
 
+    static int dbg_sgemm;
+    if (!dbg_sgemm && ith == 0) {
+        dbg_sgemm = 1;
+        fprintf(stderr, "DBG Q8_K_R8 NEON GEMM: nrows=%d ncols=%d k=%d nb=%d bs=%zu\n",
+                nrows, ncols, k, nb, bs);
+        const block_q8_k_r8 *iq8 = (const block_q8_k_r8 *)vx;
+        for (int r = 0; r < 8; r++)
+            fprintf(stderr, "  w d[%d]=%f\n", r, fp16_to_fp32_lookup(iq8[0].d[r]));
+        fprintf(stderr, "  w qs[0..7]=%d %d %d %d %d %d %d %d\n",
+                iq8[0].qs[0],iq8[0].qs[1],iq8[0].qs[2],iq8[0].qs[3],
+                iq8[0].qs[4],iq8[0].qs[5],iq8[0].qs[6],iq8[0].qs[7]);
+        const block_q8_K *qk = (const block_q8_K *)vy;
+        fprintf(stderr, "  a d=%f qs[0..3]=%d %d %d %d\n",
+                qk[0].d, qk[0].qs[0], qk[0].qs[1], qk[0].qs[2], qk[0].qs[3]);
+    }
+
     int64_t ytiles = nrows / 8;
     int64_t xtiles = ncols / 2;
     int64_t n_tail = ncols - xtiles * 2;

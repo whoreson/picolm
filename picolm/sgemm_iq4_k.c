@@ -1,3 +1,4 @@
+#include <math.h>
 /* ================================================================
  * IQ4_K (plain, GGUF type 139) x Q8_K AVX2 GEMV kernel
  * ================================================================
@@ -516,6 +517,22 @@ void vec_dot_iq4_k_r4_q8_k_neon(const void *vx, const void *wy, int n,
     float accf[4] = {0, 0, 0, 0};
     float d_arr[4];
 
+    static int dbg_once;
+    if (!dbg_once) {
+        dbg_once = 1;
+        fprintf(stderr, "DBG IQ4_K_R4 NEON GEMV: n=%d nb=%d\n", n, nb);
+        for (int r = 0; r < 4; r++)
+            fprintf(stderr, "  d[%d]=%f\n", r, fp16_to_fp32_lookup(iq4[0].d[r]));
+        fprintf(stderr, "  extra=%02x%02x%02x%02x %02x%02x%02x%02x\n",
+                iq4[0].extra[0],iq4[0].extra[1],iq4[0].extra[2],iq4[0].extra[3],
+                iq4[0].extra[4],iq4[0].extra[5],iq4[0].extra[6],iq4[0].extra[7]);
+        fprintf(stderr, "  scales_l[0..3]=%02x%02x%02x%02x\n",
+                iq4[0].scales_l[0],iq4[0].scales_l[1],iq4[0].scales_l[2],iq4[0].scales_l[3]);
+        fprintf(stderr, "  qs[0..7]=%02x%02x%02x%02x %02x%02x%02x%02x\n",
+                iq4[0].qs[0],iq4[0].qs[1],iq4[0].qs[2],iq4[0].qs[3],
+                iq4[0].qs[4],iq4[0].qs[5],iq4[0].qs[6],iq4[0].qs[7]);
+    }
+
     for (int ibl = 0; ibl < nb; ibl++) {
         for (int r = 0; r < 4; r++)
             d_arr[r] = fp16_to_fp32_lookup(iq4[ibl].d[r]);
@@ -563,6 +580,23 @@ void vec_dot_iq4_k_r4_q8_k_neon(const void *vx, const void *wy, int n,
                 accf[iy] += (float)row_sum * d_arr[iy] * q8_scale;
             }
         }
+    }
+
+    /* Scalar reference comparison for first block */
+    static int ref_once;
+    if (!ref_once) {
+        ref_once = 1;
+        float *w_tmp = malloc(n * sizeof(float));
+        float *a_tmp = malloc(n * sizeof(float));
+        for (int j = 0; j < n; j++) a_tmp[j] = qk[0].qs[j] * qk[0].d;
+        for (int r = 0; r < 4; r++) {
+            dequantize_row_iq4_k_r4_single(iq4, w_tmp, n, r);
+            float s = 0;
+            for (int j = 0; j < n; j++) s += w_tmp[j] * a_tmp[j];
+            fprintf(stderr, "REF row %d: scalar=%12.3f neon=%12.3f diff=%10.3e\n",
+                    r, s, accf[r], fabsf(s - accf[r]));
+        }
+        free(w_tmp); free(a_tmp);
     }
 
     for (int r = 0; r < 4; r++) out[r] = accf[r];

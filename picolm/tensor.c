@@ -5406,6 +5406,27 @@ static void r4_dual_side_scalar(float *out_col, const void *W, gguf_type_t qtype
     int d4 = (d / 4) * 4;
     float *tmp = (float *)malloc((size_t)n * sizeof(float));
     if (!tmp) return;
+    static int dbg_scalar;
+    if (!dbg_scalar && qtype == 339) {
+        dbg_scalar = 1;
+        const char *wblock = W;
+        dq(wblock, tmp, n, 0);
+        float s = vec_dot_f32_f32(tmp, xrow, n);
+        fprintf(stderr, "DBG r4_scalar: qtype=%d n=%d d=%d first_out=%f\n", qtype, n, d, s);
+        float maxval = 0, minval = 999999, sum = 0;
+        for (int i = 0; i < n; i++) {
+            if (tmp[i] > maxval) maxval = tmp[i];
+            if (tmp[i] < minval) minval = tmp[i];
+            sum += tmp[i];
+        }
+        fprintf(stderr, "  dequant: min=%f max=%f mean=%f\n", minval, maxval, sum/n);
+        float axmax = 0, axmin = 999999;
+        for (int i = 0; i < n; i++) {
+            if (xrow[i] > axmax) axmax = xrow[i];
+            if (xrow[i] < axmin) axmin = xrow[i];
+        }
+        fprintf(stderr, "  xrow: min=%f max=%f\n", axmin, axmax);
+    }
     for (int i = 0; i < d4; i += 4) {
         const char *wblock = (const char *)W + (i / 4) * block_stride;
         for (int r = 0; r < 4; r++) {
