@@ -1494,8 +1494,10 @@ int parse_gguf(model_t *m, int max_seq_len) {
         if (cfg->n_kv_heads <= 0) cfg->n_kv_heads = cfg->n_heads; /* MHA, no GQA */
         if (cfg->rope_freq_base <= 0) cfg->rope_freq_base = 10000.0f;
         if (cfg->rope_dim <= 0) cfg->rope_dim = cfg->head_dim;
-        /* GPTNeoX uses standard pairwise RoPE (rope_type=0), same as Llama */
-        cfg->rope_type = 0;
+        /* GPTNeoX uses NeoX split-halves RoPE (rope_type=1), NOT pairwise (0).
+         * Verified: llama.cpp uses GGML_ROPE_TYPE_NEOX for GPTNeoX.
+         * Pairs (q[i], q[i+half_rot]) instead of (q[2i], q[2i+1]). */
+        cfg->rope_type = 1;
         /* GPTNeoX uses parallel residual */
         if (!cfg->use_parallel_residual) cfg->use_parallel_residual = 1;
     }
