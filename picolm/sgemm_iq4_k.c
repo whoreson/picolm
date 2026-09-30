@@ -65,6 +65,9 @@ void vec_dot_iq4_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out) 
         -123, -100, -79, -61, -45, -31, -18,  -6, 5, 17, 29, 42, 57, 73, 93, 117,
     };
 
+    const __m128i m16 = _mm_set1_epi8(0x0f);
+    const __m128i one16 = _mm_set1_epi16(1);
+
     float result = 0.0f;
 
     for (int ibl = 0; ibl < nb; ibl++) {
@@ -89,22 +92,30 @@ void vec_dot_iq4_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out) 
 
             __m128i qs_vec = _mm_loadu_si128((const __m128i *)qs);
 
-            __m128i qx_lo = _mm_and_si128(qs_vec, _mm_set1_epi8(0x0f));
-            __m128i y_lo = _mm_shuffle_epi8(
+            __m128i qx_lo = _mm_and_si128(qs_vec, m16);
+            __m128i w_lo = _mm_shuffle_epi8(
                 _mm_loadu_si128((const __m128i *)(use_table1_lo ? iq4k_values_l + 16 : iq4k_values_l)),
                 qx_lo);
-            __m128i qx_hi = _mm_and_si128(_mm_srli_epi16(qs_vec, 4), _mm_set1_epi8(0x0f));
-            __m128i y_hi = _mm_shuffle_epi8(
+            __m128i qx_hi = _mm_and_si128(_mm_srli_epi16(qs_vec, 4), m16);
+            __m128i w_hi = _mm_shuffle_epi8(
                 _mm_loadu_si128((const __m128i *)(use_table1_hi ? iq4k_values_l + 16 : iq4k_values_l)),
                 qx_hi);
 
-            __m128i abs_qx_lo = _mm_sign_epi8(qx_lo, qx_lo);
-            __m128i abs_qx_hi = _mm_sign_epi8(qx_hi, qx_hi);
-            __m128i sy_lo = _mm_sign_epi8(y_lo, qx_lo);
-            __m128i sy_hi = _mm_sign_epi8(y_hi, qx_hi);
+            /* Load Q8_K activations (32 bytes = 2x16 bytes) */
+            __m128i q8_lo = _mm_loadu_si128((const __m128i *)(q8 + 0));
+            __m128i q8_hi = _mm_loadu_si128((const __m128i *)(q8 + 16));
 
-            __m128i sum16_lo = _mm_maddubs_epi16(abs_qx_lo, sy_lo);
-            __m128i sum16_hi = _mm_maddubs_epi16(abs_qx_hi, sy_hi);
+            /* Signed-signed multiply via sign trick:
+             * maddubs(abs(a), sign(a)*b) = a*b  (unsigned * signed -> int16) */
+            __m128i abs_w_lo = _mm_abs_epi8(w_lo);
+            __m128i abs_w_hi = _mm_abs_epi8(w_hi);
+            __m128i sign_w_lo = _mm_sign_epi8(_mm_set1_epi8(1), w_lo);
+            __m128i sign_w_hi = _mm_sign_epi8(_mm_set1_epi8(1), w_hi);
+            __m128i q8s_lo = _mm_sign_epi8(q8_lo, sign_w_lo);
+            __m128i q8s_hi = _mm_sign_epi8(q8_hi, sign_w_hi);
+
+            __m128i sum16_lo = _mm_maddubs_epi16(abs_w_lo, q8s_lo);
+            __m128i sum16_hi = _mm_maddubs_epi16(abs_w_hi, q8s_hi);
 
             __m128i scale_lo_v = _mm_set1_epi16(scale_lo);
             __m128i scale_hi_v = _mm_set1_epi16(scale_hi);
