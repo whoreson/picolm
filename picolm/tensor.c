@@ -893,7 +893,7 @@ static void matmul_worker_f(matmul_task_t *t) {
                 }
             }
         } else if (t->qtype == GGUF_TYPE_IQ4_K_R4 && t->x) {
-            /* IQ4_K_R4: interleaved 4-row blocks. Each row uses vec_dot_iq4_k_r4_q8_k_avx2.
+            /* IQ4_K_R4: interleaved 4-row blocks. Uses batch4 dispatcher.
              * Activations are Q8_K pre-quantized. Block stride = 4 * row_stride. */
             size_t q8k_row_bytes = gguf_type_row_size(GGUF_TYPE_Q8_K, t->n);
             size_t rb = gguf_type_row_size(t->qtype, t->n);
@@ -905,7 +905,7 @@ static void matmul_worker_f(matmul_task_t *t) {
                 for (int b = 0; b < nb; b++) {
                     const char *xb = qx_base + (size_t)b * q8k_row_bytes;
                     float results[4] = {0};
-                    vec_dot_iq4_k_r4_q8_k_avx2(wrow, xb, t->n, results, 4);
+                    vec_dot_iq4_k_r4_q8_k_batch4(wrow, xb, t->n, results);
                     for (int r = 0; r < 4; r++) {
                         int i = g * 4 + r;
                         if (i >= t->start && i < t->end)
@@ -1008,50 +1008,37 @@ static void matmul_worker_f(matmul_task_t *t) {
                 t->W + (size_t)i * t->row_bytes, qx, t->n,
                 t->out + i, nrows);
         }
-#elif defined(PICOLM_NEON)
-        if (t->qtype == GGUF_TYPE_IQ2_K_R4 && t->x) {
-            const block_q8_K *qx = (const block_q8_K *)t->x;
-            size_t rb = gguf_type_row_size(t->qtype, t->n);
-            size_t block_stride = rb * 4;
-            int start4 = (t->start / 4) * 4;
-            int end4 = (t->end + 3) / 4 * 4;
-            for (int i = start4; i < end4; i += 4) {
-                float results[4] = {0};
-                vec_dot_iq2_k_r4_q8_k_neon((const char *)t->W + (i / 4) * block_stride, qx, t->n, results, 4);
-                for (int r = 0; r < 4 && i + r < t->end; r++) t->out[i + r] = results[r];
-            }
-        } else if (t->qtype == GGUF_TYPE_IQ3_K_R4 && t->x) {
-            const block_q8_K *qx = (const block_q8_K *)t->x;
-            size_t rb = gguf_type_row_size(t->qtype, t->n);
-            size_t block_stride = rb * 4;
-            int start4 = (t->start / 4) * 4;
-            int end4 = (t->end + 3) / 4 * 4;
-            for (int i = start4; i < end4; i += 4) {
-                float results[4] = {0};
-                vec_dot_iq3_k_r4_q8_k_neon((const char *)t->W + (i / 4) * block_stride, qx, t->n, results, 4);
-                for (int r = 0; r < 4 && i + r < t->end; r++) t->out[i + r] = results[r];
-            }
-        } else if (t->qtype == GGUF_TYPE_IQ4_K_R4 && t->x) {
-            const block_q8_K *qx = (const block_q8_K *)t->x;
-            size_t rb = gguf_type_row_size(t->qtype, t->n);
-            size_t block_stride = rb * 4;
-            int start4 = (t->start / 4) * 4;
-            int end4 = (t->end + 3) / 4 * 4;
-            for (int i = start4; i < end4; i += 4) {
-                float results[4] = {0};
-                vec_dot_iq4_k_r4_q8_k_neon((const char *)t->W + (i / 4) * block_stride, qx, t->n, results, 4);
-                for (int r = 0; r < 4 && i + r < t->end; r++) t->out[i + r] = results[r];
-            }
-        } else {
-            for (int i = t->start; i < t->end; i++)
-                t->out[i] = vec_dot(t->W + (size_t)i * t->row_bytes, t->x, t->n, t->qtype);
-        }
 #else
         for (int i = t->start; i < t->end; i++) {
             t->out[i] = vec_dot(t->W + (size_t)i * t->row_bytes,
                                 t->x, t->n, t->qtype);
         }
 #endif
+    } else if ((t->qtype == GGUF_TYPE_IQ2_K_R4 || t->qtype == GGUF_TYPE_IQ3_K_R4 || t->qtype == GGUF_TYPE_IQ4_K_R4) && t->x) {
+        /* IQ2_K_R4/IQ3_K_R4/IQ4_K_R4: 4-row interleaved. Non-batched decode path.
+         * Block stride = 4 * row_bytes. Each block covers 4 rows. */
+        const block_q8_K *qx = (const block_q8_K *)t->x;
+        size_t rb = gguf_type_row_size(t->qtype, t->n);
+        size_t block_stride = rb * 4;
+        int start4 = (t->start / 4) * 4;
+        int end4 = (t->end + 3) / 4 * 4;
+        static int dbg_worker;
+        if (!dbg_worker) {
+            dbg_worker = 1;
+            fprintf(stderr, "DBG worker IQ2/3/4_K_R4: qtype=%d start=%d end=%d n=%d\n",
+                    t->qtype, t->start, t->end, t->n);
+        }
+        for (int i = start4; i < end4; i += 4) {
+            float results[4] = {0};
+            if (t->qtype == GGUF_TYPE_IQ2_K_R4)
+                vec_dot_iq2_k_r4_q8_k_batch4((const char *)t->W + (i / 4) * block_stride, qx, t->n, results);
+            else if (t->qtype == GGUF_TYPE_IQ3_K_R4)
+                vec_dot_iq3_k_r4_q8_k_batch4((const char *)t->W + (i / 4) * block_stride, qx, t->n, results);
+            else
+                vec_dot_iq4_k_r4_q8_k_batch4((const char *)t->W + (i / 4) * block_stride, qx, t->n, results);
+            for (int r = 0; r < 4 && i + r < t->end; r++)
+                t->out[i + r] = results[r];
+        }
     } else if (t->qtype == GGUF_TYPE_Q4I_0_8_8 && t->x) {
         /* Q4I_0_8_8: process 8 rows at a time from interleaved layout.
          * Same group-boundary arithmetic as Q4_0_8_8: 8 * row_bytes == group size. */
@@ -2315,7 +2302,13 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
     } else if (qtype == GGUF_TYPE_IQ4_K_R4 && n >= 256 && n % 256 == 0 && d % 4 == 0) {
         /* IQ4_K_R4 fast path (decode / single activation row): quantize x
          * to Q8_K once, then dispatch group-of-4 GEMV via
-         * vec_dot_iq4_k_r4_q8_k_avx2. Requires d % 4 == 0. */
+         * vec_dot_iq4_k_r4_q8_k_batch4. Requires d % 4 == 0. */
+        static int dbg_iq4kr4;
+        if (!dbg_iq4kr4) {
+            dbg_iq4kr4 = 1;
+            fprintf(stderr, "DBG matmul IQ4_K_R4 decode: n=%d d=%d n_threads=%d\n",
+                    n, d, n_threads);
+        }
         size_t qx_size = (n / 256) * sizeof(block_q8_K);
         block_q8_K *qx = NULL;
         int qx_owned = 0;
@@ -2334,15 +2327,15 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
                 int d4 = (d / 4) * 4;
                 for (int i = 0; i < d4; i += 4) {
                     float results[4] = {0};
-                    vec_dot_iq4_k_r4_q8_k_avx2(
-                        (const char *)wptr + (i / 4) * block_stride, qx, n, results, 4);
+                    vec_dot_iq4_k_r4_q8_k_batch4(
+                        (const char *)wptr + (i / 4) * block_stride, qx, n, results);
                     for (int r = 0; r < 4; r++) out[i + r] = results[r];
                 }
                 /* Tail rows (should not happen since d%4==0) */
                 for (int i = d4; i < d; i++) {
                     float results[4] = {0};
-                    vec_dot_iq4_k_r4_q8_k_avx2(
-                        (const char *)wptr + (i / 4) * block_stride, qx, n, results, 4);
+                    vec_dot_iq4_k_r4_q8_k_batch4(
+                        (const char *)wptr + (i / 4) * block_stride, qx, n, results);
                     out[i] = results[i % 4];
                 }
                 if (qx_owned) free(qx);
