@@ -1,5 +1,5 @@
 /* ================================================================
- * Q4I_0_8_8 (pre-dequantized int8) x Q8_0_4x8 Tiled GEMM (AVX-512)
+ * Q4I_0_8_8 (pre-dequantized int8) x Q8_0_4x8 Tiled GEMM
  * ================================================================
  * Optimized kernel for Q4I_0_8_8 (GGUF type 34) where weights are
  * pre-dequantized to signed int8 and pre-arranged in dpbusd lane order.
@@ -12,8 +12,8 @@
  * Weights: block_q4i_0x8[nc/8][k/32]
  * Activations: block_q8_0x4[nr/4][k/32]
  *
- * 16x16 output tiles. AVX-512 only.
- * STATUS: WORKING
+ * AVX2: 4x8 tiles (primary, verified correct)
+ * AVX-512: 16x16 tiles (secondary, disabled due to activation bug)
  * ================================================================ */
 
 #include <stdio.h>
@@ -76,7 +76,156 @@ static inline __m512 fp16x16_to_fp32(const uint16_t *d0, const uint16_t *d1) {
 #endif
 
 /* ============================================================
+ * AVX2: 4x8 tiled GEMM for Q4I_0_8_8 (pre-dequantized int8)
+ *
+ * Same strategy as sgemm_q4x8_q8x4_avx2 (sgemm_q4_0x8.c) but
+ * skips the LUT dequant step since Q4I data is already int8.
+ * The weight reordering from even/odd chunks to the interleaved
+ * {0,4,1,5,2,6,3,7} lane pattern is done with permutevar8x32.
+ * ============================================================ */
+#if defined(__AVX2__) && defined(__F16C__)
+
+#if defined(__FMA__)
+#define Q4IX8_FMADD(a,b,c) _mm256_fmadd_ps((a),(b),(c))
+#else
+#define Q4IX8_FMADD(a,b,c) _mm256_add_ps(_mm256_mul_ps((a),(b)),(c))
+#endif
+
+/* Computes an 8(weight-cols) x 4(activation-rows) output tile for one
+ * (weight-group, activation-group) pair, summed over nb k-blocks.
+ * bp: nb consecutive block_q4i_0x8 (one weight-row-group)
+ * ap: nb consecutive block_q8_0x4 (one activation-row-group)
+ * out4x8[r][0..7]: output for activation row r, weight cols 0..7 */
+static inline void sgemm_q4ix8_q8x4_avx2_tile(
+        const block_q4i_0x8 *bp, const block_q8_0x4 *ap, int nb,
+        float out4x8[4][8])
+{
+    const __m256i perm_row = _mm256_set_epi32(7,3,5,1,6,2,4,0);
+    const __m256i finalpermutemask = _mm256_set_epi32(7, 5, 3, 1, 6, 4, 2, 0);
+    const __m128i changemask = _mm_set_epi8(15, 14, 7, 6, 13, 12, 5, 4,
+                                             11, 10, 3, 2, 9, 8, 1, 0);
+
+    __m256 acc[4];
+    acc[0] = acc[1] = acc[2] = acc[3] = _mm256_setzero_ps();
+
+#define Q4IX8_MULSUM_INTO(iacc, bvec, avec) \
+    (iacc) = _mm256_add_epi32((iacc), _mm256_madd_epi16(_mm256_set1_epi16(1), \
+        _mm256_maddubs_epi16(_mm256_sign_epi8((bvec), (bvec)), _mm256_sign_epi8((avec), (bvec)))))
+
+    for (int b = 0; b < nb; b++) {
+        /* ---- Weight side: load pre-dequantized int8, reorder once ---- */
+        /* Even group chunks 0-3 (rows {0,1,4,5}) */
+        const __m256i ev0 = _mm256_loadu_si256((const __m256i *)(bp[b].qs));
+        const __m256i ev1 = _mm256_loadu_si256((const __m256i *)(bp[b].qs + 32));
+        const __m256i ev2 = _mm256_loadu_si256((const __m256i *)(bp[b].qs + 64));
+        const __m256i ev3 = _mm256_loadu_si256((const __m256i *)(bp[b].qs + 96));
+        /* Odd group chunks 4-7 (rows {2,3,6,7}) */
+        const __m256i od0 = _mm256_loadu_si256((const __m256i *)(bp[b].qs + 128));
+        const __m256i od1 = _mm256_loadu_si256((const __m256i *)(bp[b].qs + 160));
+        const __m256i od2 = _mm256_loadu_si256((const __m256i *)(bp[b].qs + 192));
+        const __m256i od3 = _mm256_loadu_si256((const __m256i *)(bp[b].qs + 224));
+
+        /* Reorder lanes: [r0,r1,r4,r5] -> [r0,r4,r1,r5] for even,
+         *                [r2,r3,r6,r7] -> [r2,r6,r3,r7] for odd. */
+        const __m256i ev0p = _mm256_permutevar8x32_epi32(ev0, perm_row);
+        const __m256i od0p = _mm256_permutevar8x32_epi32(od0, perm_row);
+        const __m256i ev1p = _mm256_permutevar8x32_epi32(ev1, perm_row);
+        const __m256i od1p = _mm256_permutevar8x32_epi32(od1, perm_row);
+        const __m256i ev2p = _mm256_permutevar8x32_epi32(ev2, perm_row);
+        const __m256i od2p = _mm256_permutevar8x32_epi32(od2, perm_row);
+        const __m256i ev3p = _mm256_permutevar8x32_epi32(ev3, perm_row);
+        const __m256i od3p = _mm256_permutevar8x32_epi32(od3, perm_row);
+
+        /* Merge even+odd: bl = vals 0-3, bh = vals 4-7 per chunk */
+        const __m256i bl_lo1 = _mm256_permute2x128_si256(ev0p, od0p, 0x20);
+        const __m256i bh_lo1 = _mm256_permute2x128_si256(ev0p, od0p, 0x31);
+        const __m256i bl_lo2 = _mm256_permute2x128_si256(ev1p, od1p, 0x20);
+        const __m256i bh_lo2 = _mm256_permute2x128_si256(ev1p, od1p, 0x31);
+        const __m256i bl_hi1 = _mm256_permute2x128_si256(ev2p, od2p, 0x20);
+        const __m256i bh_hi1 = _mm256_permute2x128_si256(ev2p, od2p, 0x31);
+        const __m256i bl_hi2 = _mm256_permute2x128_si256(ev3p, od3p, 0x20);
+        const __m256i bh_hi2 = _mm256_permute2x128_si256(ev3p, od3p, 0x31);
+
+        const __m256 col_scales = _mm256_cvtph_ps(
+            _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)bp[b].d), changemask));
+
+        /* ---- Activation side: one pass per row, reusing the tile above ---- */
+        for (int r = 0; r < 4; r++) {
+            const uint8_t *aq = (const uint8_t *)ap[b].qs + r * 32;
+            __m256i a0 = _mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)aq));
+            __m256i a1 = _mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)(aq + 16)));
+            a0 = _mm256_permute2f128_si256(a0, a0, 0);
+            a1 = _mm256_permute2f128_si256(a1, a1, 0);
+
+            const __m256 row_scale = _mm256_set1_ps(fp16_to_fp32_lookup((uint16_t)ap[b].d[r]));
+            const __m256 sd = _mm256_mul_ps(col_scales, row_scale);
+
+            __m256i iacc = _mm256_setzero_si256();
+            Q4IX8_MULSUM_INTO(iacc, bl_lo1, _mm256_shuffle_epi32(a0, 0));
+            Q4IX8_MULSUM_INTO(iacc, bh_lo1, _mm256_shuffle_epi32(a0, 85));
+            Q4IX8_MULSUM_INTO(iacc, bl_lo2, _mm256_shuffle_epi32(a0, 170));
+            Q4IX8_MULSUM_INTO(iacc, bh_lo2, _mm256_shuffle_epi32(a0, 255));
+            Q4IX8_MULSUM_INTO(iacc, bl_hi1, _mm256_shuffle_epi32(a1, 0));
+            Q4IX8_MULSUM_INTO(iacc, bh_hi1, _mm256_shuffle_epi32(a1, 85));
+            Q4IX8_MULSUM_INTO(iacc, bl_hi2, _mm256_shuffle_epi32(a1, 170));
+            Q4IX8_MULSUM_INTO(iacc, bh_hi2, _mm256_shuffle_epi32(a1, 255));
+
+            acc[r] = Q4IX8_FMADD(_mm256_cvtepi32_ps(iacc), sd, acc[r]);
+        }
+    }
+#undef Q4IX8_MULSUM_INTO
+
+    for (int r = 0; r < 4; r++) {
+        __m256 result = _mm256_permutevar8x32_ps(acc[r], finalpermutemask);
+        _mm256_storeu_ps(out4x8[r], result);
+    }
+}
+
+/* Tiles the full [nr x nc] output over (nr/4) x (nc/8) 4x8 tiles */
+static int sgemm_q4ix8_q8x4_avx2(
+        int k, const block_q4i_0x8 *bp_start,
+        const block_q8_0x4 *ap_start,
+        float *s, size_t bs, int nr, int nc,
+        int ith, int nth)
+{
+    const int nb = k / 32;
+    const int anr = nr - nr % 4;
+    const int anc = nc - nc % 8;
+    if (anr <= 0 || anc <= 0) return 0;
+
+    const int n_ytiles = anr / 4;
+    const int n_xtiles = anc / 8;
+    const int total_tiles = n_ytiles * n_xtiles;
+    if (nth < 1) nth = 1;
+    const int duty = (total_tiles + nth - 1) / nth;
+    int start = duty * ith;
+    int end = start + duty;
+    if (end > total_tiles) end = total_tiles;
+
+    for (int job = start; job < end; job++) {
+        const int yt = job / n_xtiles;
+        const int xt = job % n_xtiles;
+        const int y = yt * 4;
+        const int x = xt * 8;
+
+        const block_q4i_0x8 *bp = bp_start + (size_t)xt * nb;
+        const block_q8_0x4 *ap = ap_start + (size_t)yt * nb;
+
+        float out4x8[4][8];
+        sgemm_q4ix8_q8x4_avx2_tile(bp, ap, nb, out4x8);
+
+        for (int r = 0; r < 4; r++) {
+            memcpy(s + (size_t)(y + r) * bs + x, out4x8[r], 8 * sizeof(float));
+        }
+    }
+    return anr;
+}
+#endif /* AVX2 + F16C */
+
+/* ============================================================
  * AVX-512: 16x16 tiled GEMM for Q4I_0_8_8 (pre-dequantized int8)
+ * NOTE: Disabled -- has activation-layout bug (assumes byte-interleaved
+ * activations instead of contiguous rows). See Q4_0_8_8 AVX-512 note.
  * ============================================================ */
 #if defined(__AVX512BW__) && defined(__AVX512DQ__)
 static int sgemm_q4ix8_q8x4_avx512(
@@ -283,8 +432,12 @@ int sgemm_q4i_0x8_q8_0x4(int nr, int nc, int k,
 
     if (nc < 8 || nr < 4 || k % 32 != 0) return 0;
 
-#if defined(__AVX512BW__) && defined(__AVX512DQ__)
-    return sgemm_q4ix8_q8x4_avx512(k, bp, ap, s, bs, nr, nc, ith, nth);
+    /* AVX2 path is the verified/primary path (same strategy as
+     * sgemm_q4_0x8_q8_0x4 which uses AVX2 on AVX-512 hosts too).
+     * The AVX-512 16x16 kernel below has the same activation-layout
+     * bug as the Q4_0_8_8 AVX-512 kernel and is kept for reference. */
+#if defined(__AVX2__) && defined(__F16C__)
+    return sgemm_q4ix8_q8x4_avx2(k, bp, ap, s, bs, nr, nc, ith, nth);
 #else
     (void)nr; (void)nc; (void)k; (void)vx; (void)vy;
     (void)s; (void)bs; (void)ith; (void)nth;
