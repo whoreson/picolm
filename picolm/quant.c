@@ -8868,22 +8868,6 @@ extern void vec_dot_iq4_k_r4_q8_k_neon(const void *vx, const void *wy, int n, fl
 /* IQ4_K_R4 x Q8_K batched GEMV: 4 weight rows x 1 activation row.
  * out: 4 output floats. n must be multiple of 256. */
 void vec_dot_iq4_k_r4_q8_k_batch4(const void *vx, const void *vy, int n, float *out) {
-    static int dbg_dispatch;
-    if (!dbg_dispatch) {
-        dbg_dispatch = 1;
-        fprintf(stderr, "DBG IQ4_K_R4 batch4 dispatch: AVX2=%d NEON=%d\n",
-#if defined(PICOLM_AVX2)
-                1,
-#else
-                0,
-#endif
-#if defined(PICOLM_NEON)
-                1
-#else
-                0
-#endif
-                );
-    }
 #if defined(PICOLM_AVX2) && !defined(PICOLM_FORCE_SCALAR)
     vec_dot_iq4_k_r4_q8_k_avx2(vx, vy, n, out, 4);
 #elif defined(PICOLM_NEON) && !defined(PICOLM_FORCE_SCALAR)

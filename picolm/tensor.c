@@ -1022,12 +1022,6 @@ static void matmul_worker_f(matmul_task_t *t) {
         size_t block_stride = rb * 4;
         int start4 = (t->start / 4) * 4;
         int end4 = (t->end + 3) / 4 * 4;
-        static int dbg_worker;
-        if (!dbg_worker) {
-            dbg_worker = 1;
-            fprintf(stderr, "DBG worker IQ2/3/4_K_R4: qtype=%d start=%d end=%d n=%d\n",
-                    t->qtype, t->start, t->end, t->n);
-        }
         for (int i = start4; i < end4; i += 4) {
             float results[4] = {0};
             if (t->qtype == GGUF_TYPE_IQ2_K_R4)
@@ -2303,12 +2297,6 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
         /* IQ4_K_R4 fast path (decode / single activation row): quantize x
          * to Q8_K once, then dispatch group-of-4 GEMV via
          * vec_dot_iq4_k_r4_q8_k_batch4. Requires d % 4 == 0. */
-        static int dbg_iq4kr4;
-        if (!dbg_iq4kr4) {
-            dbg_iq4kr4 = 1;
-            fprintf(stderr, "DBG matmul IQ4_K_R4 decode: n=%d d=%d n_threads=%d\n",
-                    n, d, n_threads);
-        }
         size_t qx_size = (n / 256) * sizeof(block_q8_K);
         block_q8_K *qx = NULL;
         int qx_owned = 0;
@@ -5429,27 +5417,6 @@ static void r4_dual_side_scalar(float *out_col, const void *W, gguf_type_t qtype
     int d4 = (d / 4) * 4;
     float *tmp = (float *)malloc((size_t)n * sizeof(float));
     if (!tmp) return;
-    static int dbg_scalar;
-    if (!dbg_scalar && qtype == 339) {
-        dbg_scalar = 1;
-        const char *wblock = W;
-        dq(wblock, tmp, n, 0);
-        float s = vec_dot_f32_f32(tmp, xrow, n);
-        fprintf(stderr, "DBG r4_scalar: qtype=%d n=%d d=%d first_out=%f\n", qtype, n, d, s);
-        float maxval = 0, minval = 999999, sum = 0;
-        for (int i = 0; i < n; i++) {
-            if (tmp[i] > maxval) maxval = tmp[i];
-            if (tmp[i] < minval) minval = tmp[i];
-            sum += tmp[i];
-        }
-        fprintf(stderr, "  dequant: min=%f max=%f mean=%f\n", minval, maxval, sum/n);
-        float axmax = 0, axmin = 999999;
-        for (int i = 0; i < n; i++) {
-            if (xrow[i] > axmax) axmax = xrow[i];
-            if (xrow[i] < axmin) axmin = xrow[i];
-        }
-        fprintf(stderr, "  xrow: min=%f max=%f\n", axmin, axmax);
-    }
     for (int i = 0; i < d4; i += 4) {
         const char *wblock = (const char *)W + (i / 4) * block_stride;
         for (int r = 0; r < 4; r++) {
