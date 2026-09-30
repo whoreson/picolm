@@ -711,11 +711,25 @@ static void matmul_worker_f(matmul_task_t *t) {
                 }
             }
 #else
-            for (int i = t->start; i < t->end; i++) {
-                const char *wrow = t->W + (size_t)i * t->row_bytes;
-                for (int b = 0; b < nb; b++)
-                    t->out[b * out_stride + i] = vec_dot(wrow, t->x + b * t->n, t->n, t->qtype);
+            /* Scalar fallback: dequantize each row individually.
+             * Cannot use generic vec_dot() because Q4_0_R8 is 8-row interleaved. */
+            size_t rb = gguf_type_row_size(t->qtype, t->n);
+            size_t block_stride = rb * 8;
+            int start8 = (t->start / 8) * 8;
+            int end8 = (t->end + 7) / 8 * 8;
+            float *tmp = (float *)malloc((size_t)t->n * sizeof(float));
+            for (int i = start8; i < end8; i += 8) {
+                const char *wblock = (const char *)t->W + (i / 8) * block_stride;
+                for (int b = 0; b < nb; b++) {
+                    for (int r = 0; r < 8; r++) {
+                        if (i + r >= t->start && i + r < t->end) {
+                            dequantize_row_q4_0_r8_single(wblock, tmp, t->n, r);
+                            t->out[b * out_stride + i + r] = vec_dot_f32_f32(tmp, (const float *)t->x + b * t->n, t->n);
+                        }
+                    }
+                }
             }
+            free(tmp);
 #endif
         } else if (t->qtype == GGUF_TYPE_Q8_K_R8 && t->x) {
             /* Q8_K_R8 batched: use tiled sgemm or per-row-group vec_dot */
@@ -1079,10 +1093,23 @@ static void matmul_worker_f(matmul_task_t *t) {
                 t->out + i, 8);
         }
 #else
-        for (int i = t->start; i < t->end; i++) {
-            t->out[i] = vec_dot(t->W + (size_t)i * t->row_bytes,
-                                t->x, t->n, t->qtype);
+        /* Scalar fallback: dequantize each row individually.
+         * Cannot use generic vec_dot() because Q4_0_R8 is 8-row interleaved. */
+        size_t rb = gguf_type_row_size(t->qtype, t->n);
+        size_t block_stride = rb * 8;
+        int start8 = (t->start / 8) * 8;
+        int end8 = (t->end + 7) / 8 * 8;
+        float *tmp = (float *)malloc((size_t)t->n * sizeof(float));
+        for (int i = start8; i < end8; i += 8) {
+            const char *wblock = (const char *)t->W + (i / 8) * block_stride;
+            for (int r = 0; r < 8; r++) {
+                if (i + r >= t->start && i + r < t->end) {
+                    dequantize_row_q4_0_r8_single(wblock, tmp, t->n, r);
+                    t->out[i + r] = vec_dot_f32_f32(tmp, (const float *)t->x, t->n);
+                }
+            }
         }
+        free(tmp);
 #endif
     } else if (t->qtype == GGUF_TYPE_Q8_K_R8 && t->x) {
         /* Q8_K_R8: process 8 rows at a time with Q8_K activations (AVX2). */
@@ -1910,8 +1937,32 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
             }
         }
         }
+#else
+        /* Non-AVX2: scalar fallback using dequantize_row_q4_0_r8_single.
+         * Cannot fall through to generic vec_dot because Q4_0_R8 is 8-row interleaved. */
+        {
+        size_t rb = gguf_type_row_size(qtype, n);
+        size_t block_stride = rb * 8;  /* 8 rows per block */
+        int d8 = (d / 8) * 8;
+        float *tmp = (float *)malloc((size_t)n * sizeof(float));
+        if (tmp) {
+            for (int i = 0; i < d8; i += 8) {
+                const char *wblock = (const char *)wptr + (i / 8) * block_stride;
+                for (int r = 0; r < 8; r++) {
+                    dequantize_row_q4_0_r8_single(wblock, tmp, n, r);
+                    out[i + r] = vec_dot_f32_f32(tmp, x, n);
+                }
+            }
+            for (int i = d8; i < d; i++) {
+                const char *wblock = (const char *)wptr + (i / 8) * block_stride;
+                dequantize_row_q4_0_r8_single(wblock, tmp, n, i % 8);
+                out[i] = vec_dot_f32_f32(tmp, x, n);
+            }
+            free(tmp);
+            return;
+        }
+        }
 #endif
-        /* Non-AVX2 or small-d or OOM: fall through to generic vec_dot path */
     } else if (qtype == GGUF_TYPE_Q8_K_R8) {
         /* Q8_K_R8 fast path: weights in block_q8_k_r8 layout.
          * Uses Q8_K activations (sign trick, no bias correction). */
@@ -4220,6 +4271,34 @@ void matmul_batch(float *out, const float *x, int n_batch,
     }
 #endif
 
+    /* Q4_0_R8 scalar fallback (non-AVX2): dequantize each row, F32 dot.
+     * Cannot use generic vec_dot() because Q4_0_R8 is 8-row interleaved. */
+    if (qtype == GGUF_TYPE_Q4_0_R8 && n_batch > 0 && n > 0) {
+        size_t rb = gguf_type_row_size(qtype, n);
+        size_t block_stride = rb * 8;
+        int d8 = (d / 8) * 8;
+        float *tmp = (float *)malloc((size_t)n * sizeof(float));
+        if (tmp) {
+            for (int b = 0; b < n_batch; b++) {
+                for (int i = 0; i < d8; i += 8) {
+                    const char *wblock = (const char *)W + (i / 8) * block_stride;
+                    for (int r = 0; r < 8; r++) {
+                        dequantize_row_q4_0_r8_single(wblock, tmp, n, r);
+                        out[b * d + i + r] = vec_dot_f32_f32(tmp, x + b * n, n);
+                    }
+                }
+                for (int i = d8; i < d; i++) {
+                    const char *wblock = (const char *)W + (i / 8) * block_stride;
+                    dequantize_row_q4_0_r8_single(wblock, tmp, n, i % 8);
+                    out[b * d + i] = vec_dot_f32_f32(tmp, x + b * n, n);
+                }
+            }
+            free(tmp);
+        DISPATCH("Q4_0_R8_scalar_vec_dot");
+            return;
+        }
+    }
+
     /* Q8_K_R8 batch: tiled GEMM path with AVX2 kernel (Q8_K activations).
      * Uses sign trick for signed multiplication, no bias correction needed. */
 #if defined(PICOLM_AVX2)
@@ -5828,8 +5907,11 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
             return;
         }
     }
+#endif
 
-    /* Q4_0_R8 vec_dot fallback for dual-batch (PICOLM_SGEMM=0 or non-tiled). */
+    /* Q4_0_R8 vec_dot fallback for dual-batch (PICOLM_SGEMM=0 or non-tiled).
+     * Uses Q8_0 activations with AVX2 kernel. */
+#if defined(PICOLM_AVX2)
     if ((qtype1 == GGUF_TYPE_Q4_0_R8 || qtype2 == GGUF_TYPE_Q4_0_R8) && n_batch > 0 && n > 0) {
         size_t q8_rb = (size_t)(n / 32) * sizeof(block_q8_0);
         void *qbuf = malloc((size_t)n_batch * q8_rb);
@@ -5866,6 +5948,60 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
         }
     }
 #endif
+
+    /* Q4_0_R8 scalar fallback for dual-batch (non-AVX2).
+     * Cannot use generic vec_dot() because Q4_0_R8 is 8-row interleaved. */
+    if ((qtype1 == GGUF_TYPE_Q4_0_R8 || qtype2 == GGUF_TYPE_Q4_0_R8) && n_batch > 0 && n > 0) {
+        size_t rb1 = qtype1 == GGUF_TYPE_Q4_0_R8 ? gguf_type_row_size(GGUF_TYPE_Q4_0_R8, n) : 0;
+        size_t rb2 = qtype2 == GGUF_TYPE_Q4_0_R8 ? gguf_type_row_size(GGUF_TYPE_Q4_0_R8, n) : 0;
+        size_t block_stride1 = rb1 ? rb1 * 8 : 0;
+        size_t block_stride2 = rb2 ? rb2 * 8 : 0;
+        int d8 = (d / 8) * 8;
+        float *tmp = (float *)malloc((size_t)n * sizeof(float));
+        if (tmp) {
+            for (int b = 0; b < n_batch; b++) {
+                if (qtype1 == GGUF_TYPE_Q4_0_R8) {
+                    for (int i = 0; i < d8; i += 8) {
+                        const char *wblock = (const char *)W1 + (i / 8) * block_stride1;
+                        for (int r = 0; r < 8; r++) {
+                            dequantize_row_q4_0_r8_single(wblock, tmp, n, r);
+                            out1[b * d + i + r] = vec_dot_f32_f32(tmp, x + b * n, n);
+                        }
+                    }
+                    for (int i = d8; i < d; i++) {
+                        const char *wblock = (const char *)W1 + (i / 8) * block_stride1;
+                        dequantize_row_q4_0_r8_single(wblock, tmp, n, i % 8);
+                        out1[b * d + i] = vec_dot_f32_f32(tmp, x + b * n, n);
+                    }
+                } else {
+                    size_t rb = gguf_type_row_size(qtype1, n);
+                    for (int i = 0; i < d; i++)
+                        out1[b * d + i] = vec_dot((const char *)W1 + i * rb, x + b * n, n, qtype1);
+                }
+                if (qtype2 == GGUF_TYPE_Q4_0_R8) {
+                    for (int i = 0; i < d8; i += 8) {
+                        const char *wblock = (const char *)W2 + (i / 8) * block_stride2;
+                        for (int r = 0; r < 8; r++) {
+                            dequantize_row_q4_0_r8_single(wblock, tmp, n, r);
+                            out2[b * d + i + r] = vec_dot_f32_f32(tmp, x + b * n, n);
+                        }
+                    }
+                    for (int i = d8; i < d; i++) {
+                        const char *wblock = (const char *)W2 + (i / 8) * block_stride2;
+                        dequantize_row_q4_0_r8_single(wblock, tmp, n, i % 8);
+                        out2[b * d + i] = vec_dot_f32_f32(tmp, x + b * n, n);
+                    }
+                } else {
+                    size_t rb = gguf_type_row_size(qtype2, n);
+                    for (int i = 0; i < d; i++)
+                        out2[b * d + i] = vec_dot((const char *)W2 + i * rb, x + b * n, n, qtype2);
+                }
+            }
+            free(tmp);
+        DISPATCH2("Q4_0_R8_scalar_vec_dot_dual");
+            return;
+        }
+    }
 
     /* Q6_K_R4 tiled GEMM for dual-batch. Portable (scalar fallback inside
      * vec_dot_q6_K_R4_q8_K/sgemm_q6_k_r4_q8_k), so not gated on PICOLM_AVX2. */

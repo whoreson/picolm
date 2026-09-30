@@ -6963,10 +6963,16 @@ float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
         }
 case GGUF_TYPE_Q4_0_R8: {
             /* Q4_0_R8: dequantize row 0 of the 8-row group, then f32 dot.
-             * For rows 1-7, the caller must use the 8-row group path. */
-            float q4r_tmp[256];
-            dequantize_row_q4_0_r8(src, q4r_tmp, n);
-            return vec_dot_f32_f32(q4r_tmp, x, n);
+             * For rows 1-7, the caller must use the 8-row group path.
+             * Use malloc since dequantize_row_q4_0_r8_single writes n floats. */
+            float *q4r_tmp = malloc(n * sizeof(float));
+            if (q4r_tmp) {
+                dequantize_row_q4_0_r8_single(src, q4r_tmp, n, 0);
+                float result = vec_dot_f32_f32(q4r_tmp, x, n);
+                free(q4r_tmp);
+                return result;
+            }
+            return 0.0f;
         }
         case GGUF_TYPE_Q8_K_R8: {
             /* Q8_K_R8: dequantize row 0 of the 8-row group, then f32 dot.
@@ -8943,10 +8949,11 @@ void quantize_row_q4_0_r8(const float *x, void *dst, int n) {
             if (d == 0.f) d = 1e-30f;
             float id = 1.f / d;
             b[ib].d[r] = fp32_to_fp16(d);
+            /* ik_llama layout: lo nibbles at positions 0..15, hi at 16..31 */
             for (int l = 0; l < 4; l++) {
                 for (int j = 0; j < 4; j++) {
-                    uint8_t lo = (int)(x0[l * 8 + j * 2] * id + 8.f);
-                    uint8_t hi = (int)(x0[l * 8 + j * 2 + 1] * id + 8.f);
+                    uint8_t lo = (int)(x0[4 * l + j] * id + 8.f);
+                    uint8_t hi = (int)(x0[4 * l + j + 16] * id + 8.f);
                     if (lo > 15) lo = 15;
                     if (hi > 15) hi = 15;
                     b[ib].qs[32 * l + 4 * r + j] = lo | (hi << 4);
@@ -8956,23 +8963,33 @@ void quantize_row_q4_0_r8(const float *x, void *dst, int n) {
     }
 }
 
+/* Q4_0_R8: dequantize a single row from the 8-row interleaved group.
+ * Used by scalar fallback paths in matmul() and matmul_worker_f() where
+ * the caller needs one specific row from an interleaved block.
+ * Layout matches ik_llama's dequantize_row_q4_0_r8:
+ *   lo nibbles at positions 0..15, hi nibbles at positions 16..31. */
+void dequantize_row_q4_0_r8_single(const void *src, float *dst, int n, int row) {
+    int nb = n / 32;
+    const block_q4_0x8 *b = (const block_q4_0x8 *)src;
+    for (int ib = 0; ib < nb; ib++) {
+        float d = fp16_to_fp32(b[ib].d[row]);
+        float *d0 = dst + ib * 32;
+        for (int l = 0; l < 4; l++) {
+            for (int j = 0; j < 4; j++) {
+                uint8_t v = b[ib].qs[32 * l + 4 * row + j];
+                d0[4 * l + j]      = ((int)(v & 0xf) - 8) * d;
+                d0[4 * l + j + 16] = ((int)(v >> 4) - 8) * d;
+            }
+        }
+    }
+}
+
 /* Dequantize 8 rows of Q4_0_R8 to F32.
  * src has (n/32) block_q4_0x8 blocks.
- * dst must hold 8*n floats, row-major. */
+ * dst must hold 8*n floats, row-major.
+ * Layout matches ik_llama's dequantize_row_q4_0_r8:
+ *   lo nibbles at positions 0..15, hi nibbles at positions 16..31. */
 void dequantize_row_q4_0_r8(const void *src, float *dst, int n) {
-    /* Q4_0_R8 layout matches ik_llama's block_iq4_nl_r8 / block_q4_0x8:
-     *
-     * Each block covers 8 rows x 32 values.
-     * qs[128] is organized as 4 chunks of 32 bytes each.
-     * Within each chunk l (0..3): qs[32*l + 4*r + j] for row r (0..7), byte j (0..7).
-     * Each byte has 2 nibbles: lo = first value, hi = second value.
-     * So row r, value v = nibble from qs[32*l + 4*r + j]:
-     *   v_even  = qs[32*l + 4*r + j] & 0xf
-     *   v_odd   = qs[32*l + 4*r + j] >> 4
-     * where j = v/2 within chunk, l = v/16, j_chunk = (v/2)%8.
-     *
-     * Nibbles are unsigned [0..15], represent [-8..7] via subtraction.
-     * Scales are FP16 in d[8], one per row. */
     int nb = n / 32;
     const block_q4_0x8 *b = (const block_q4_0x8 *)src;
     for (int ib = 0; ib < nb; ib++) {
@@ -8982,8 +8999,8 @@ void dequantize_row_q4_0_r8(const void *src, float *dst, int n) {
             for (int l = 0; l < 4; l++) {
                 for (int j = 0; j < 4; j++) {
                     uint8_t v = b[ib].qs[32 * l + 4 * r + j];
-                    d0[l * 8 + j * 2]     = ((int)(v & 0xf) - 8) * d;
-                    d0[l * 8 + j * 2 + 1] = ((int)(v >> 4) - 8) * d;
+                    d0[4 * l + j]      = ((int)(v & 0xf) - 8) * d;
+                    d0[4 * l + j + 16] = ((int)(v >> 4) - 8) * d;
                 }
             }
         }

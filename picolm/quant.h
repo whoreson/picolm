@@ -1109,6 +1109,8 @@ int sgemm_q4_0_r8_q8_2_avx2(int nrows, int ncols, int k,
 void quantize_row_q4_0_r8(const float *x, void *dst, int n);
 /* Dequantize 8 rows of Q4_0_R8 to F32. dst must hold 8*n floats. */
 void dequantize_row_q4_0_r8(const void *src, float *dst, int n);
+/* Dequantize a single row from the 8-row interleaved Q4_0_R8 group. */
+void dequantize_row_q4_0_r8_single(const void *src, float *dst, int n, int row);
 /* Quantize 8 rows of F32 to Q8_0_R8 interleaved format. */
 void quantize_row_q8_0_r8(const float *x, void *dst, int n);
 /* Dequantize 8 rows of Q8_0_R8 to F32. dst must hold 8*n floats. */
