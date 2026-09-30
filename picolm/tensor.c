@@ -4807,7 +4807,6 @@ void matmul_batch(float *out, const float *x, int n_batch,
 #endif
 
     /* IQ6_K plain batch: quantize activations to Q8_K, dispatch vec_dot. */
-#if defined(PICOLM_AVX2)
     if (qtype == GGUF_TYPE_IQ6_K && n_batch > 0 && n > 0) {
         size_t q8_rb = (size_t)(n / 256) * sizeof(block_q8_K);
         void *qbuf = malloc((size_t)n_batch * q8_rb);
@@ -4825,7 +4824,6 @@ void matmul_batch(float *out, const float *x, int n_batch,
             return;
         }
     }
-#endif
 
     /* IQ4_K_R4 batch: quantize activations to Q8_K, dispatch group-of-4 vec_dot. */
 #if defined(PICOLM_AVX2)

@@ -496,7 +496,7 @@ int sgemm_iq4_k_r4_q8_k_avx2(int nrows, int ncols, int k,
     }
     return nrows;
 #else
-    (void)nrows; (void)ncols; (void)k; (void)vx; (void)wy;
+    (void)nrows; (void)ncols; (void)k; (void)vx; (void)vy;
     (void)out; (void)bs; (void)ith; (void)nth;
     return 0;
 #endif
