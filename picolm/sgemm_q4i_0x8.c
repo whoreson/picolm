@@ -223,197 +223,177 @@ static int sgemm_q4ix8_q8x4_avx2(
 #endif /* AVX2 + F16C */
 
 /* ============================================================
- * AVX-512: 16x16 tiled GEMM for Q4I_0_8_8 (pre-dequantized int8)
- * NOTE: Disabled -- has activation-layout bug (assumes byte-interleaved
- * activations instead of contiguous rows). See Q4_0_8_8 AVX-512 note.
+ * AVX-512: 4x16 tiled GEMM for Q4I_0_8_8 (pre-dequantized int8)
+ *
+ * Same activation-layout strategy as the AVX2 kernel: per-row loads
+ * from block_q8_0x4.qs[r*32..r*32+31], broadcast to 512-bit.
+ * Weight side: permutevar8x32 + permute2x128 to reorder even/odd
+ * chunks into the interleaved {0,4,1,5,2,6,3,7} pattern, then
+ * merge bp0+bp1 to 512-bit (16 weight rows per register).
+ *
+ * Each tile: 4 activation rows x 16 weight columns.
  * ============================================================ */
-#if defined(__AVX512BW__) && defined(__AVX512DQ__)
+#if defined(__AVX512BW__) && defined(__AVX512DQ__) && defined(__AVX512VNNI__)
 static int sgemm_q4ix8_q8x4_avx512(
-        int k, const block_q4i_0x8 *bp,
-        const block_q8_0x4 *ap,
+        int k, const block_q4i_0x8 *bp_start,
+        const block_q8_0x4 *ap_start,
         float *s, size_t bs, int nr, int nc,
         int ith, int nth)
 {
     const int nb = k / 32;
-    const int anr = nr - nr % 16;
+    const int anr = nr - nr % 4;
     const int anc = nc - nc % 16;
+    if (anr <= 0 || anc <= 0) return 0;
 
-    int n_ytiles = anr / 16;
-    int n_xtiles = anc / 16;
-    int total_tiles = n_ytiles * n_xtiles;
-    int duty = (total_tiles + nth - 1) / nth;
+    const int n_ytiles = anr / 4;
+    const int n_xtiles = anc / 16;
+    const int total_tiles = n_ytiles * n_xtiles;
+    if (nth < 1) nth = 1;
+    const int duty = (total_tiles + nth - 1) / nth;
     int start = duty * ith;
     int end = start + duty;
     if (end > total_tiles) end = total_tiles;
 
+    /* Lane reorder: [r0,r1,r4,r5] -> [r0,r4,r1,r5] within each half */
+    const __m256i perm_row = _mm256_set_epi32(7,3,5,1,6,2,4,0);
+
+    /* Final output permute: from interleaved lane order to sequential rows.
+     * Lanes {0..7} = bp0 rows {0,4,1,5,2,6,3,7}
+     * Lanes {8..15} = bp1 rows {8,12,9,13,10,14,11,15}
+     * Sequential: row0=lane0, row1=lane2, row2=lane4, row3=lane6,
+     *             row4=lane1, row5=lane3, row6=lane5, row7=lane7,
+     *             row8=lane8, row9=lane10, row10=lane12, row11=lane14,
+     *             row12=lane9, row13=lane11, row14=lane13, row15=lane15 */
+    const __m512i out_perm = _mm512_set_epi32(15,13,11,9,14,12,10,8,7,5,3,1,6,4,2,0);
+
     for (int job = start; job < end; job++) {
-        int yt = job / n_xtiles;
-        int xt = job % n_xtiles;
-        int y = yt * 4;
-        int xg = xt * 2;
+        const int yt = job / n_xtiles;
+        const int xt = job % n_xtiles;
+        const int y = yt * 4;
+        const int x = xt * 16;
 
-        const block_q8_0x4 *ap4[4];
-        ap4[0] = ap + (y * nb);
-        for (int i = 0; i < 3; i++) ap4[i+1] = ap4[i] + nb;
+        const block_q4i_0x8 *bp0 = bp_start + (size_t)(xt * 2) * nb;
+        const block_q4i_0x8 *bp1 = bp_start + (size_t)(xt * 2 + 1) * nb;
+        const block_q8_0x4 *ap = ap_start + (size_t)yt * nb;
 
-        const block_q4i_0x8 *bp0 = bp + (xg * nb);
-        const block_q4i_0x8 *bp1 = bp + ((xg+1) * nb);
-
-        __m512 acc[16];
-        for (int i = 0; i < 16; i++) acc[i] = _mm512_setzero_ps();
+        __m512 acc[4];
+        acc[0] = acc[1] = acc[2] = acc[3] = _mm512_setzero_ps();
 
         for (int b = 0; b < nb; b++) {
-            /* Load pre-dequantized int8 weights directly.
-             * Each block_q4i_0x8.qs[256] has 8 chunks of 32 bytes:
-             *   chunks 0-3: even rows {0,1,4,5} vals 0-7,8-15,16-23,24-31
-             *   chunks 4-7: odd  rows {2,3,6,7} vals 0-7,8-15,16-23,24-31
-             *
-             * We load 256-bit chunks from bp0 and bp1, merge to 512-bit,
-             * then shuffle for dpbusd.
-             */
+            /* ---- Weight side: load + reorder, reused for all 4 act rows ---- */
+            /* Even chunks: rows {0,1,4,5} from bp0, {8,9,12,13} from bp1 */
+            const __m256i ev0_lo = _mm256_loadu_si256((const __m256i *)(bp0[b].qs));
+            const __m256i ev0_hi = _mm256_loadu_si256((const __m256i *)(bp1[b].qs));
+            const __m256i ev1_lo = _mm256_loadu_si256((const __m256i *)(bp0[b].qs + 32));
+            const __m256i ev1_hi = _mm256_loadu_si256((const __m256i *)(bp1[b].qs + 32));
+            const __m256i ev2_lo = _mm256_loadu_si256((const __m256i *)(bp0[b].qs + 64));
+            const __m256i ev2_hi = _mm256_loadu_si256((const __m256i *)(bp1[b].qs + 64));
+            const __m256i ev3_lo = _mm256_loadu_si256((const __m256i *)(bp0[b].qs + 96));
+            const __m256i ev3_hi = _mm256_loadu_si256((const __m256i *)(bp1[b].qs + 96));
 
-            /* Even group: chunks 0-3 from bp0 and bp1 */
-            const __m256i we00 = _mm256_loadu_si256((const __m256i*)(bp0[b].qs + 0));
-            const __m256i we01 = _mm256_loadu_si256((const __m256i*)(bp0[b].qs + 32));
-            const __m256i we02 = _mm256_loadu_si256((const __m256i*)(bp0[b].qs + 64));
-            const __m256i we03 = _mm256_loadu_si256((const __m256i*)(bp0[b].qs + 96));
-            const __m256i we10 = _mm256_loadu_si256((const __m256i*)(bp1[b].qs + 0));
-            const __m256i we11 = _mm256_loadu_si256((const __m256i*)(bp1[b].qs + 32));
-            const __m256i we12 = _mm256_loadu_si256((const __m256i*)(bp1[b].qs + 64));
-            const __m256i we13 = _mm256_loadu_si256((const __m256i*)(bp1[b].qs + 96));
+            /* Odd chunks: rows {2,3,6,7} from bp0, {10,11,14,15} from bp1 */
+            const __m256i od0_lo = _mm256_loadu_si256((const __m256i *)(bp0[b].qs + 128));
+            const __m256i od0_hi = _mm256_loadu_si256((const __m256i *)(bp1[b].qs + 128));
+            const __m256i od1_lo = _mm256_loadu_si256((const __m256i *)(bp0[b].qs + 160));
+            const __m256i od1_hi = _mm256_loadu_si256((const __m256i *)(bp1[b].qs + 160));
+            const __m256i od2_lo = _mm256_loadu_si256((const __m256i *)(bp0[b].qs + 192));
+            const __m256i od2_hi = _mm256_loadu_si256((const __m256i *)(bp1[b].qs + 192));
+            const __m256i od3_lo = _mm256_loadu_si256((const __m256i *)(bp0[b].qs + 224));
+            const __m256i od3_hi = _mm256_loadu_si256((const __m256i *)(bp1[b].qs + 224));
 
-            /* Odd group: chunks 4-7 (offset 128) from bp0 and bp1 */
-            const __m256i wo00 = _mm256_loadu_si256((const __m256i*)(bp0[b].qs + 128));
-            const __m256i wo01 = _mm256_loadu_si256((const __m256i*)(bp0[b].qs + 160));
-            const __m256i wo02 = _mm256_loadu_si256((const __m256i*)(bp0[b].qs + 192));
-            const __m256i wo03 = _mm256_loadu_si256((const __m256i*)(bp0[b].qs + 224));
-            const __m256i wo10 = _mm256_loadu_si256((const __m256i*)(bp1[b].qs + 128));
-            const __m256i wo11 = _mm256_loadu_si256((const __m256i*)(bp1[b].qs + 160));
-            const __m256i wo12 = _mm256_loadu_si256((const __m256i*)(bp1[b].qs + 192));
-            const __m256i wo13 = _mm256_loadu_si256((const __m256i*)(bp1[b].qs + 224));
+            /* Permute lanes: reorder rows within each 256-bit chunk */
+            const __m256i ev0p_lo = _mm256_permutevar8x32_epi32(ev0_lo, perm_row);
+            const __m256i ev0p_hi = _mm256_permutevar8x32_epi32(ev0_hi, perm_row);
+            const __m256i od0p_lo = _mm256_permutevar8x32_epi32(od0_lo, perm_row);
+            const __m256i od0p_hi = _mm256_permutevar8x32_epi32(od0_hi, perm_row);
+            const __m256i ev1p_lo = _mm256_permutevar8x32_epi32(ev1_lo, perm_row);
+            const __m256i ev1p_hi = _mm256_permutevar8x32_epi32(ev1_hi, perm_row);
+            const __m256i od1p_lo = _mm256_permutevar8x32_epi32(od1_lo, perm_row);
+            const __m256i od1p_hi = _mm256_permutevar8x32_epi32(od1_hi, perm_row);
+            const __m256i ev2p_lo = _mm256_permutevar8x32_epi32(ev2_lo, perm_row);
+            const __m256i ev2p_hi = _mm256_permutevar8x32_epi32(ev2_hi, perm_row);
+            const __m256i od2p_lo = _mm256_permutevar8x32_epi32(od2_lo, perm_row);
+            const __m256i od2p_hi = _mm256_permutevar8x32_epi32(od2_hi, perm_row);
+            const __m256i ev3p_lo = _mm256_permutevar8x32_epi32(ev3_lo, perm_row);
+            const __m256i ev3p_hi = _mm256_permutevar8x32_epi32(ev3_hi, perm_row);
+            const __m256i od3p_lo = _mm256_permutevar8x32_epi32(od3_lo, perm_row);
+            const __m256i od3p_hi = _mm256_permutevar8x32_epi32(od3_hi, perm_row);
 
-            /* Merge to 512-bit: even and odd groups */
-            const __m512i re0 = _mm512_inserti32x8(_mm512_castsi256_si512(we00), we10, 1);
-            const __m512i re1 = _mm512_inserti32x8(_mm512_castsi256_si512(we01), we11, 1);
-            const __m512i re2 = _mm512_inserti32x8(_mm512_castsi256_si512(we02), we12, 1);
-            const __m512i re3 = _mm512_inserti32x8(_mm512_castsi256_si512(we03), we13, 1);
-            const __m512i ro0 = _mm512_inserti32x8(_mm512_castsi256_si512(wo00), wo10, 1);
-            const __m512i ro1 = _mm512_inserti32x8(_mm512_castsi256_si512(wo01), wo11, 1);
-            const __m512i ro2 = _mm512_inserti32x8(_mm512_castsi256_si512(wo02), wo12, 1);
-            const __m512i ro3 = _mm512_inserti32x8(_mm512_castsi256_si512(wo03), wo13, 1);
+            /* Merge even+odd halves within each block, then merge bp0+bp1 to 512-bit.
+             * bl_k = vals k*8..k*8+3 for all 16 rows
+             * bh_k = vals k*8+4..k*8+7 for all 16 rows
+             * Lane order: bp0 rows {0,4,1,5,2,6,3,7}, bp1 rows {8,12,9,13,10,14,11,15} */
+            const __m512i bl_0 = _mm512_inserti32x8(_mm512_castsi256_si512(
+                _mm256_permute2x128_si256(ev0p_lo, od0p_lo, 0x20)),
+                _mm256_permute2x128_si256(ev0p_hi, od0p_hi, 0x20), 1);
+            const __m512i bh_0 = _mm512_inserti32x8(_mm512_castsi256_si512(
+                _mm256_permute2x128_si256(ev0p_lo, od0p_lo, 0x31)),
+                _mm256_permute2x128_si256(ev0p_hi, od0p_hi, 0x31), 1);
+            const __m512i bl_1 = _mm512_inserti32x8(_mm512_castsi256_si512(
+                _mm256_permute2x128_si256(ev1p_lo, od1p_lo, 0x20)),
+                _mm256_permute2x128_si256(ev1p_hi, od1p_hi, 0x20), 1);
+            const __m512i bh_1 = _mm512_inserti32x8(_mm512_castsi256_si512(
+                _mm256_permute2x128_si256(ev1p_lo, od1p_lo, 0x31)),
+                _mm256_permute2x128_si256(ev1p_hi, od1p_hi, 0x31), 1);
+            const __m512i bl_2 = _mm512_inserti32x8(_mm512_castsi256_si512(
+                _mm256_permute2x128_si256(ev2p_lo, od2p_lo, 0x20)),
+                _mm256_permute2x128_si256(ev2p_hi, od2p_hi, 0x20), 1);
+            const __m512i bh_2 = _mm512_inserti32x8(_mm512_castsi256_si512(
+                _mm256_permute2x128_si256(ev2p_lo, od2p_lo, 0x31)),
+                _mm256_permute2x128_si256(ev2p_hi, od2p_hi, 0x31), 1);
+            const __m512i bl_3 = _mm512_inserti32x8(_mm512_castsi256_si512(
+                _mm256_permute2x128_si256(ev3p_lo, od3p_lo, 0x20)),
+                _mm256_permute2x128_si256(ev3p_hi, od3p_hi, 0x20), 1);
+            const __m512i bh_3 = _mm512_inserti32x8(_mm512_castsi256_si512(
+                _mm256_permute2x128_si256(ev3p_lo, od3p_lo, 0x31)),
+                _mm256_permute2x128_si256(ev3p_hi, od3p_hi, 0x31), 1);
 
-            /* Shuffle weights for dpbusd (broadcast within quad)
-             * 136 = 0x88: broadcast lane 0 of each row-pair
-             * 221 = 0xDD: broadcast lane 1 of each row-pair */
-            const __m512i re0s1 = _mm512_shuffle_epi32(re0, 136);
-            const __m512i re1s1 = _mm512_shuffle_epi32(re1, 136);
-            const __m512i re2s1 = _mm512_shuffle_epi32(re2, 136);
-            const __m512i re3s1 = _mm512_shuffle_epi32(re3, 136);
-            const __m512i ro0s1 = _mm512_shuffle_epi32(ro0, 136);
-            const __m512i ro1s1 = _mm512_shuffle_epi32(ro1, 136);
-            const __m512i ro2s1 = _mm512_shuffle_epi32(ro2, 136);
-            const __m512i ro3s1 = _mm512_shuffle_epi32(ro3, 136);
-            const __m512i re0s2 = _mm512_shuffle_epi32(re0, 221);
-            const __m512i re1s2 = _mm512_shuffle_epi32(re1, 221);
-            const __m512i re2s2 = _mm512_shuffle_epi32(re2, 221);
-            const __m512i re3s2 = _mm512_shuffle_epi32(re3, 221);
-            const __m512i ro0s2 = _mm512_shuffle_epi32(ro0, 221);
-            const __m512i ro1s2 = _mm512_shuffle_epi32(ro1, 221);
-            const __m512i ro2s2 = _mm512_shuffle_epi32(ro2, 221);
-            const __m512i ro3s2 = _mm512_shuffle_epi32(ro3, 221);
+            /* Weight column scales: 16 FP16 -> 16 FP32.
+             * Reorder from sequential {d[0],d[1],..,d[7]} to interleaved
+             * {d[0],d[4],d[1],d[5],d[2],d[6],d[3],d[7]} to match the
+             * permuted weight lane order. */
+            const __m128i changemask = _mm_set_epi8(15, 14, 7, 6, 13, 12, 5, 4,
+                                                     11, 10, 3, 2, 9, 8, 1, 0);
+            const __m128i d0_shuf = _mm_shuffle_epi8(
+                _mm_loadu_si128((const __m128i *)bp0[b].d), changemask);
+            const __m128i d1_shuf = _mm_shuffle_epi8(
+                _mm_loadu_si128((const __m128i *)bp1[b].d), changemask);
+            const __m512 cs = _mm512_cvtph_ps(_mm256_set_m128i(d1_shuf, d0_shuf));
 
-            /* Weight column scales: 16 FP16 -> 16 FP32 */
-            __m512 cs = fp16x16_to_fp32(bp0[b].d, bp1[b].d);
+            /* ---- Activation side: per-row loads (correct layout) ---- */
+            for (int r = 0; r < 4; r++) {
+                const uint8_t *aq = (const uint8_t *)ap[b].qs + r * 32;
+                __m256i a0 = _mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)aq));
+                __m256i a1 = _mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)(aq + 16)));
+                a0 = _mm256_permute2f128_si256(a0, a0, 0);
+                a1 = _mm256_permute2f128_si256(a1, a1, 0);
 
-            /* Process activation row groups (4 groups of 4 rows = 16 rows) */
-            for (int rp = 0; rp < 4; rp++) {
-                const block_q8_0x4 *a = ap4[rp];
+                /* Expand to 512-bit: duplicate 256-bit halves */
+                const __m512i a0_512 = _mm512_inserti32x8(_mm512_castsi256_si512(a0), a0, 1);
+                const __m512i a1_512 = _mm512_inserti32x8(_mm512_castsi256_si512(a1), a1, 1);
 
-                /* Load 4 x 32-byte interleaved activation chunks */
-                __m256i a0 = _mm256_loadu_si256((const __m256i*)(a[b].qs));
-                __m256i a1 = _mm256_loadu_si256((const __m256i*)(a[b].qs+32));
-                __m256i a2 = _mm256_loadu_si256((const __m256i*)(a[b].qs+64));
-                __m256i a3 = _mm256_loadu_si256((const __m256i*)(a[b].qs+96));
+                const __m512 row_scale = _mm512_set1_ps(fp16_to_fp32_lookup((uint16_t)ap[b].d[r]));
+                const __m512 sd = _mm512_mul_ps(cs, row_scale);
 
-                /* Split: low 16 bytes = A0/A1, high 16 = A2/A3 */
-                __m256i a0l = _mm256_permute2f128_si256(a0, a0, 0);
-                __m256i a0h = _mm256_permute2f128_si256(a0, a0, 17);
-                __m256i a1l = _mm256_permute2f128_si256(a1, a1, 0);
-                __m256i a1h = _mm256_permute2f128_si256(a1, a1, 17);
-                __m256i a2l = _mm256_permute2f128_si256(a2, a2, 0);
-                __m256i a2h = _mm256_permute2f128_si256(a2, a2, 17);
-                __m256i a3l = _mm256_permute2f128_si256(a3, a3, 0);
-                __m256i a3h = _mm256_permute2f128_si256(a3, a3, 17);
+                /* dpbusd MAC: 8 chunks x 2 halves = 8 dpbusd per row */
+                __m512i iacc = _mm512_setzero_epi32();
+                iacc = dpbusd_512(iacc, bl_0, _mm512_shuffle_epi32(a0_512, 0));
+                iacc = dpbusd_512(iacc, bh_0, _mm512_shuffle_epi32(a0_512, 85));
+                iacc = dpbusd_512(iacc, bl_1, _mm512_shuffle_epi32(a0_512, 170));
+                iacc = dpbusd_512(iacc, bh_1, _mm512_shuffle_epi32(a0_512, 255));
+                iacc = dpbusd_512(iacc, bl_2, _mm512_shuffle_epi32(a1_512, 0));
+                iacc = dpbusd_512(iacc, bh_2, _mm512_shuffle_epi32(a1_512, 85));
+                iacc = dpbusd_512(iacc, bl_3, _mm512_shuffle_epi32(a1_512, 170));
+                iacc = dpbusd_512(iacc, bh_3, _mm512_shuffle_epi32(a1_512, 255));
 
-                /* Expand to 512-bit */
-                const __m512i l01_0 = _mm512_inserti32x8(_mm512_castsi256_si512(a0l), a0l, 1);
-                const __m512i l23_0 = _mm512_inserti32x8(_mm512_castsi256_si512(a0h), a0h, 1);
-                const __m512i l01_1 = _mm512_inserti32x8(_mm512_castsi256_si512(a1l), a1l, 1);
-                const __m512i l23_1 = _mm512_inserti32x8(_mm512_castsi256_si512(a1h), a1h, 1);
-                const __m512i l01_2 = _mm512_inserti32x8(_mm512_castsi256_si512(a2l), a2l, 1);
-                const __m512i l23_2 = _mm512_inserti32x8(_mm512_castsi256_si512(a2h), a2h, 1);
-                const __m512i l01_3 = _mm512_inserti32x8(_mm512_castsi256_si512(a3l), a3l, 1);
-                const __m512i l23_3 = _mm512_inserti32x8(_mm512_castsi256_si512(a3h), a3h, 1);
-
-                /* Shuffle activations: interleave A0/A1 pairs */
-                const __m512i l01_0s1 = _mm512_shuffle_epi32(l01_0, 160);
-                const __m512i l01_1s1 = _mm512_shuffle_epi32(l01_1, 160);
-                const __m512i l01_2s1 = _mm512_shuffle_epi32(l01_2, 160);
-                const __m512i l01_3s1 = _mm512_shuffle_epi32(l01_3, 160);
-                const __m512i l23_0s1 = _mm512_shuffle_epi32(l23_0, 160);
-                const __m512i l23_1s1 = _mm512_shuffle_epi32(l23_1, 160);
-                const __m512i l23_2s1 = _mm512_shuffle_epi32(l23_2, 160);
-                const __m512i l23_3s1 = _mm512_shuffle_epi32(l23_3, 160);
-                const __m512i l01_0s2 = _mm512_shuffle_epi32(l01_0, 245);
-                const __m512i l01_1s2 = _mm512_shuffle_epi32(l01_1, 245);
-                const __m512i l01_2s2 = _mm512_shuffle_epi32(l01_2, 245);
-                const __m512i l01_3s2 = _mm512_shuffle_epi32(l01_3, 245);
-                const __m512i l23_0s2 = _mm512_shuffle_epi32(l23_0, 245);
-                const __m512i l23_1s2 = _mm512_shuffle_epi32(l23_1, 245);
-                const __m512i l23_2s2 = _mm512_shuffle_epi32(l23_2, 245);
-                const __m512i l23_3s2 = _mm512_shuffle_epi32(l23_3, 245);
-
-                /* dpbusd MAC */
-                __m512i i00 = _mm512_add_epi32(
-                    dpbusd_512(dpbusd_512(dpbusd_512(dpbusd_512(_mm512_setzero_epi32(),l01_3s1,re3s1),l01_2s1,re2s1),l01_1s1,re1s1),l01_0s1,re0s1),
-                    dpbusd_512(dpbusd_512(dpbusd_512(dpbusd_512(_mm512_setzero_epi32(),l01_3s2,re3s2),l01_2s2,re2s2),l01_1s2,re1s2),l01_0s2,re0s2));
-                __m512i i01 = _mm512_add_epi32(
-                    dpbusd_512(dpbusd_512(dpbusd_512(dpbusd_512(_mm512_setzero_epi32(),l01_3s1,ro3s1),l01_2s1,ro2s1),l01_1s1,ro1s1),l01_0s1,ro0s1),
-                    dpbusd_512(dpbusd_512(dpbusd_512(dpbusd_512(_mm512_setzero_epi32(),l01_3s2,ro3s2),l01_2s2,ro2s2),l01_1s2,ro1s2),l01_0s2,ro0s2));
-                __m512i i10 = _mm512_add_epi32(
-                    dpbusd_512(dpbusd_512(dpbusd_512(dpbusd_512(_mm512_setzero_epi32(),l23_3s1,re3s1),l23_2s1,re2s1),l23_1s1,re1s1),l23_0s1,re0s1),
-                    dpbusd_512(dpbusd_512(dpbusd_512(dpbusd_512(_mm512_setzero_epi32(),l23_3s2,re3s2),l23_2s2,re2s2),l23_1s2,re1s2),l23_0s2,re0s2));
-                __m512i i11 = _mm512_add_epi32(
-                    dpbusd_512(dpbusd_512(dpbusd_512(dpbusd_512(_mm512_setzero_epi32(),l23_3s1,ro3s1),l23_2s1,ro2s1),l23_1s1,ro1s1),l23_0s1,ro0s1),
-                    dpbusd_512(dpbusd_512(dpbusd_512(dpbusd_512(_mm512_setzero_epi32(),l23_3s2,ro3s2),l23_2s2,ro2s2),l23_1s2,ro1s2),l23_0s2,ro0s2));
-
-                /* Straighten */
-                __m512i row0 = _mm512_mask_blend_epi32(0xCCCC, i00, _mm512_shuffle_epi32(i01, 78));
-                __m512i row1 = _mm512_mask_blend_epi32(0xCCCC, _mm512_shuffle_epi32(i00, 78), i01);
-                __m512i row2 = _mm512_mask_blend_epi32(0xCCCC, i10, _mm512_shuffle_epi32(i11, 78));
-                __m512i row3 = _mm512_mask_blend_epi32(0xCCCC, _mm512_shuffle_epi32(i10, 78), i11);
-
-                /* Activation scales */
-                __m128i rs_f16 = _mm_loadl_epi64((const __m128i*)a[b].d);
-                rs_f16 = _mm_shuffle_epi32(rs_f16, 68);
-                __m512 rs = PICOLM_F32Cx16_REPEAT_LOAD(rs_f16);
-
-                __m512 rs0 = _mm512_shuffle_ps(rs, rs, 0);
-                __m512 rs1 = _mm512_shuffle_ps(rs, rs, 85);
-                __m512 rs2 = _mm512_shuffle_ps(rs, rs, 170);
-                __m512 rs3 = _mm512_shuffle_ps(rs, rs, 255);
-
-                /* Scale and accumulate */
-                acc[rp*4]     = _mm512_fmadd_ps(_mm512_cvtepi32_ps(row0), _mm512_mul_ps(cs, rs0), acc[rp*4]);
-                acc[rp*4 + 1] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(row1), _mm512_mul_ps(cs, rs1), acc[rp*4+1]);
-                acc[rp*4 + 2] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(row2), _mm512_mul_ps(cs, rs2), acc[rp*4+2]);
-                acc[rp*4 + 3] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(row3), _mm512_mul_ps(cs, rs3), acc[rp*4+3]);
+                acc[r] = _mm512_fmadd_ps(_mm512_cvtepi32_ps(iacc), sd, acc[r]);
             }
         }
 
-        /* Store output */
-        for (int i = 0; i < 16; i++) {
-            _mm512_storeu_ps((float*)(s + ((y*4+i)*bs + xg*8)), acc[i]);
+        /* Store: permute from interleaved lane order to sequential rows */
+        for (int r = 0; r < 4; r++) {
+            __m512 result = _mm512_permutexvar_ps(out_perm, acc[r]);
+            _mm512_storeu_ps((float*)(s + ((y + r) * bs + x)), result);
         }
     }
     return anr;
@@ -432,16 +412,33 @@ int sgemm_q4i_0x8_q8_0x4(int nr, int nc, int k,
 
     if (nc < 8 || nr < 4 || k % 32 != 0) return 0;
 
-    /* AVX2 path is the verified/primary path (same strategy as
-     * sgemm_q4_0x8_q8_0x4 which uses AVX2 on AVX-512 hosts too).
-     * The AVX-512 16x16 kernel below has the same activation-layout
-     * bug as the Q4_0_8_8 AVX-512 kernel and is kept for reference. */
-#if defined(__AVX2__) && defined(__F16C__)
-    return sgemm_q4ix8_q8x4_avx2(k, bp, ap, s, bs, nr, nc, ith, nth);
-#else
-    (void)nr; (void)nc; (void)k; (void)vx; (void)vy;
-    (void)s; (void)bs; (void)ith; (void)nth;
-    (void)bp; (void)ap;
-    return 0;
+    int done = 0;
+
+    /* AVX-512 path: 4x16 tiles, VNNI dpbusd, per-row activation loads.
+     * Set PICOLM_Q4I_AVX512=0 to disable and use AVX2 instead. */
+#if defined(__AVX512BW__) && defined(__AVX512DQ__) && defined(__AVX512VNNI__)
+    {
+        static int use_avx512 = -1;
+        if (use_avx512 < 0) {
+            const char *env = getenv("PICOLM_Q4I_AVX512");
+            use_avx512 = (!env || env[0] != '0');
+        }
+        if (use_avx512)
+            done = sgemm_q4ix8_q8x4_avx512(k, bp, ap, s, bs, nr, nc, ith, nth);
+    }
 #endif
+
+    /* AVX2 path: 4x8 tiles, maddubs+madd, per-row activation loads.
+     * Verified correct (same strategy as Q4_0_8_8 AVX2 kernel). */
+#if defined(__AVX2__) && defined(__F16C__)
+    if (!done)
+        done = sgemm_q4ix8_q8x4_avx2(k, bp, ap, s, bs, nr, nc, ith, nth);
+#endif
+
+    if (!done) {
+        (void)nr; (void)nc; (void)k; (void)vx; (void)vy;
+        (void)s; (void)bs; (void)ith; (void)nth;
+        (void)bp; (void)ap;
+    }
+    return done;
 }
