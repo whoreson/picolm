@@ -166,6 +166,7 @@ int sgemm_q8_k_r8_q8_k_avx2(int nrows, int ncols, int k,
         size_t w_group_bytes = nb * sizeof(block_q8_k_r8); /* per 8-row group */
         size_t a_row_bytes = nb * sizeof(block_q8_K);        /* per activation row */
 
+/*
         static int dbg_avx2;
         if (!dbg_avx2 && ith == 0) {
             dbg_avx2 = 1;
@@ -181,6 +182,7 @@ int sgemm_q8_k_r8_q8_k_avx2(int nrows, int ncols, int k,
             fprintf(stderr, "  a d=%f qs[0..3]=%d %d %d %d\n",
                     qk[0].d, qk[0].qs[0], qk[0].qs[1], qk[0].qs[2], qk[0].qs[3]);
         }
+*/
 
         for (int64_t job = start; job < end; job++) {
             int64_t ii = (job / xtiles_ext) * 8;  /* weight row start */
