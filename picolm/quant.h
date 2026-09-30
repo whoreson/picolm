@@ -1129,6 +1129,8 @@ int sgemm_q8_k_r8_q8_k_avx2(int nrows, int ncols, int k,
 void quantize_row_q8_k_r8(const float *x, void *dst, int n);
 /* Dequantize 8 rows of Q8_K_R8 to F32. dst must hold 8*n floats. */
 void dequantize_row_q8_k_r8(const void *src, float *dst, int n);
+/* Dequantize a single row from the 8-row interleaved Q8_K_R8 group. */
+void dequantize_row_q8_k_r8_single(const void *src, float *dst, int n, int row);
 /* Convert F32 activations to Q8_2 blocks (with row sum).
  * dst must have space for (n/32) * sizeof(block_q8_2) bytes. */
 void quantize_row_q8_2(const float *x, void *dst, int n);

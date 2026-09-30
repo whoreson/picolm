@@ -9106,6 +9106,23 @@ void quantize_row_q8_k_r8(const float *x, void *dst, int n) {
 /* Dequantize 8 rows of Q8_K_R8 to F32.
  * src: block_q8_k_r8 pointer (n/256 blocks).
  * dst: 8*n floats, row-major. */
+/* Q8_K_R8: dequantize a single row from the 8-row interleaved group.
+ * Used by scalar fallback paths in matmul() and matmul_worker_f(). */
+void dequantize_row_q8_k_r8_single(const void *src, float *dst, int n, int row) {
+    assert(n % QK_K == 0);
+    const int nb = n / QK_K;
+    const block_q8_k_r8 *b = (const block_q8_k_r8 *)src;
+    for (int ibl = 0; ibl < nb; ibl++) {
+        float d = fp16_to_fp32(b[ibl].d[row]);
+        float *d0 = dst + ibl * QK_K;
+        for (int ib = 0; ib < QK_K / 4; ib++) {
+            for (int j = 0; j < 4; j++) {
+                d0[4 * ib + j] = b[ibl].qs[32 * ib + 4 * row + j] * d;
+            }
+        }
+    }
+}
+
 void dequantize_row_q8_k_r8(const void *src, float *dst, int n) {
     assert(n % QK_K == 0);
     const int nb = n / QK_K;

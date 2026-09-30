@@ -799,11 +799,25 @@ static void matmul_worker_f(matmul_task_t *t) {
                 }
             }
 #else
-            for (int i = t->start; i < t->end; i++) {
-                const char *wrow = t->W + (size_t)i * t->row_bytes;
-                for (int b = 0; b < nb; b++)
-                    t->out[b * out_stride + i] = vec_dot(wrow, t->x + b * t->n, t->n, t->qtype);
+            /* Scalar fallback: dequantize each row individually.
+             * Cannot use generic vec_dot() because Q8_K_R8 is 8-row interleaved. */
+            size_t rb = gguf_type_row_size(t->qtype, t->n);
+            size_t block_stride = rb * 8;
+            int start8 = (t->start / 8) * 8;
+            int end8 = (t->end + 7) / 8 * 8;
+            float *tmp = (float *)malloc((size_t)t->n * sizeof(float));
+            for (int i = start8; i < end8; i += 8) {
+                const char *wblock = (const char *)t->W + (i / 8) * block_stride;
+                for (int b = 0; b < nb; b++) {
+                    for (int r = 0; r < 8; r++) {
+                        if (i + r >= t->start && i + r < t->end) {
+                            dequantize_row_q8_k_r8_single(wblock, tmp, t->n, r);
+                            t->out[b * out_stride + i + r] = vec_dot_f32_f32(tmp, (const float *)t->x + b * t->n, t->n);
+                        }
+                    }
+                }
             }
+            free(tmp);
 #endif
 #endif
         } else if (t->qtype == GGUF_TYPE_Q2_K && t->x) {
@@ -1133,10 +1147,23 @@ static void matmul_worker_f(matmul_task_t *t) {
                 t->out + i, 8);
         }
 #else
-        for (int i = t->start; i < t->end; i++) {
-            t->out[i] = vec_dot(t->W + (size_t)i * t->row_bytes,
-                                t->x, t->n, t->qtype);
+        /* Scalar fallback: dequantize each row individually.
+         * Cannot use generic vec_dot() because Q8_K_R8 is 8-row interleaved. */
+        size_t rb = gguf_type_row_size(t->qtype, t->n);
+        size_t block_stride = rb * 8;
+        int start8 = (t->start / 8) * 8;
+        int end8 = (t->end + 7) / 8 * 8;
+        float *tmp = (float *)malloc((size_t)t->n * sizeof(float));
+        for (int i = start8; i < end8; i += 8) {
+            const char *wblock = (const char *)t->W + (i / 8) * block_stride;
+            for (int r = 0; r < 8; r++) {
+                if (i + r >= t->start && i + r < t->end) {
+                    dequantize_row_q8_k_r8_single(wblock, tmp, t->n, r);
+                    t->out[i + r] = vec_dot_f32_f32(tmp, (const float *)t->x, t->n);
+                }
+            }
         }
+        free(tmp);
 #endif
 #endif
     } else if (t->qtype == GGUF_TYPE_Q6_K && t->x) {
@@ -2032,8 +2059,32 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
             }
         }
         }
+#else
+        /* Non-AVX2/non-NEON: scalar fallback using dequantize_row_q8_k_r8_single.
+         * Cannot fall through to generic vec_dot because Q8_K_R8 is 8-row interleaved. */
+        {
+        size_t rb = gguf_type_row_size(qtype, n);
+        size_t block_stride = rb * 8;  /* 8 rows per block */
+        int d8 = (d / 8) * 8;
+        float *tmp = (float *)malloc((size_t)n * sizeof(float));
+        if (tmp) {
+            for (int i = 0; i < d8; i += 8) {
+                const char *wblock = (const char *)wptr + (i / 8) * block_stride;
+                for (int r = 0; r < 8; r++) {
+                    dequantize_row_q8_k_r8_single(wblock, tmp, n, r);
+                    out[i + r] = vec_dot_f32_f32(tmp, x, n);
+                }
+            }
+            for (int i = d8; i < d; i++) {
+                const char *wblock = (const char *)wptr + (i / 8) * block_stride;
+                dequantize_row_q8_k_r8_single(wblock, tmp, n, i % 8);
+                out[i] = vec_dot_f32_f32(tmp, x, n);
+            }
+            free(tmp);
+            return;
+        }
+        }
 #endif
-        /* Non-AVX2 or small-d or OOM: fall through to generic vec_dot path */
     } else if (qtype == GGUF_TYPE_Q4_K && n >= 256 && n % 256 == 0) {
         /* Q4_K fast path: quantize x to Q8_K once, then vec_dot_q4_K_q8_K */
         /* vec_dot_q4_K_q8_K has scalar fallback for NEON/non-AVX platforms */
@@ -4385,6 +4436,34 @@ void matmul_batch(float *out, const float *x, int n_batch,
     }
 #endif
 
+    /* Q8_K_R8 scalar fallback (non-AVX2/non-NEON): dequantize each row, F32 dot.
+     * Cannot use generic vec_dot() because Q8_K_R8 is 8-row interleaved. */
+    if (qtype == GGUF_TYPE_Q8_K_R8 && n_batch > 0 && n > 0) {
+        size_t rb = gguf_type_row_size(qtype, n);
+        size_t block_stride = rb * 8;
+        int d8 = (d / 8) * 8;
+        float *tmp = (float *)malloc((size_t)n * sizeof(float));
+        if (tmp) {
+            for (int b = 0; b < n_batch; b++) {
+                for (int i = 0; i < d8; i += 8) {
+                    const char *wblock = (const char *)W + (i / 8) * block_stride;
+                    for (int r = 0; r < 8; r++) {
+                        dequantize_row_q8_k_r8_single(wblock, tmp, n, r);
+                        out[b * d + i + r] = vec_dot_f32_f32(tmp, x + b * n, n);
+                    }
+                }
+                for (int i = d8; i < d; i++) {
+                    const char *wblock = (const char *)W + (i / 8) * block_stride;
+                    dequantize_row_q8_k_r8_single(wblock, tmp, n, i % 8);
+                    out[b * d + i] = vec_dot_f32_f32(tmp, x + b * n, n);
+                }
+            }
+            free(tmp);
+        DISPATCH("Q8_K_R8_scalar_vec_dot");
+            return;
+        }
+    }
+
     /* IQ2_K_R4 batch: tiled GEMM path (Q8_K activations).
      * 4-row interleaved blocks, LUT-based dequantization via iq2nl_values. */
 #if defined(PICOLM_AVX2)
@@ -6312,6 +6391,60 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
         }
     }
 #endif
+
+    /* Q8_K_R8 scalar fallback for dual-batch (non-AVX2/non-NEON).
+     * Cannot use generic vec_dot() because Q8_K_R8 is 8-row interleaved. */
+    if ((qtype1 == GGUF_TYPE_Q8_K_R8 || qtype2 == GGUF_TYPE_Q8_K_R8) && n_batch > 0 && n > 0) {
+        size_t rb1 = qtype1 == GGUF_TYPE_Q8_K_R8 ? gguf_type_row_size(GGUF_TYPE_Q8_K_R8, n) : 0;
+        size_t rb2 = qtype2 == GGUF_TYPE_Q8_K_R8 ? gguf_type_row_size(GGUF_TYPE_Q8_K_R8, n) : 0;
+        size_t block_stride1 = rb1 ? rb1 * 8 : 0;
+        size_t block_stride2 = rb2 ? rb2 * 8 : 0;
+        int d8 = (d / 8) * 8;
+        float *tmp = (float *)malloc((size_t)n * sizeof(float));
+        if (tmp) {
+            for (int b = 0; b < n_batch; b++) {
+                if (qtype1 == GGUF_TYPE_Q8_K_R8) {
+                    for (int i = 0; i < d8; i += 8) {
+                        const char *wblock = (const char *)W1 + (i / 8) * block_stride1;
+                        for (int r = 0; r < 8; r++) {
+                            dequantize_row_q8_k_r8_single(wblock, tmp, n, r);
+                            out1[b * d + i + r] = vec_dot_f32_f32(tmp, x + b * n, n);
+                        }
+                    }
+                    for (int i = d8; i < d; i++) {
+                        const char *wblock = (const char *)W1 + (i / 8) * block_stride1;
+                        dequantize_row_q8_k_r8_single(wblock, tmp, n, i % 8);
+                        out1[b * d + i] = vec_dot_f32_f32(tmp, x + b * n, n);
+                    }
+                } else {
+                    size_t rb = gguf_type_row_size(qtype1, n);
+                    for (int i = 0; i < d; i++)
+                        out1[b * d + i] = vec_dot((const char *)W1 + i * rb, x + b * n, n, qtype1);
+                }
+                if (qtype2 == GGUF_TYPE_Q8_K_R8) {
+                    for (int i = 0; i < d8; i += 8) {
+                        const char *wblock = (const char *)W2 + (i / 8) * block_stride2;
+                        for (int r = 0; r < 8; r++) {
+                            dequantize_row_q8_k_r8_single(wblock, tmp, n, r);
+                            out2[b * d + i + r] = vec_dot_f32_f32(tmp, x + b * n, n);
+                        }
+                    }
+                    for (int i = d8; i < d; i++) {
+                        const char *wblock = (const char *)W2 + (i / 8) * block_stride2;
+                        dequantize_row_q8_k_r8_single(wblock, tmp, n, i % 8);
+                        out2[b * d + i] = vec_dot_f32_f32(tmp, x + b * n, n);
+                    }
+                } else {
+                    size_t rb = gguf_type_row_size(qtype2, n);
+                    for (int i = 0; i < d; i++)
+                        out2[b * d + i] = vec_dot((const char *)W2 + i * rb, x + b * n, n, qtype2);
+                }
+            }
+            free(tmp);
+        DISPATCH2("Q8_K_R8_scalar_vec_dot_dual");
+            return;
+        }
+    }
 
     /* Safety check: R4/R8 types (interleaved) cannot use the generic
      * per-row iteration below because gguf_type_row_size returns the
