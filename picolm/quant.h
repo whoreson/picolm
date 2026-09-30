@@ -453,6 +453,7 @@ typedef enum {
     GGUF_TYPE_Q8_0_R8    = 203, /* 8-row interleaved Q8_0 (GGUF type 203) */
     GGUF_TYPE_Q6_K_R4    = 214, /* 4-row interleaved Q6_K (GGUF type 214, llama.cpp ik branch) */
     GGUF_TYPE_Q8_K_R8    = 399, /* 8-row interleaved Q8_K (GGUF type 399, llama.cpp ik branch) */
+    GGUF_TYPE_Q4_K_R4    = 212, /* 4-row interleaved Q4_K (GGUF type 212, llama.cpp ik branch) */
 } gguf_type_t;
 
 /* Packed struct attribute: empty on mainstream compilers where #pragma pack works,
@@ -497,6 +498,29 @@ typedef struct {
     uint16_t  d[8];        // 8 FP16 scales = 16 bytes
     int8_t    qs[2048];    // 8 rows x 256 values, interleaved = 2048 bytes
 } block_q8_k_r8;          // Total: 2064 bytes per block
+
+/* Q4_K_R4 block: 4 rows of Q4_K repacked together for SIMD efficiency.
+ * GGUF type 212. Size = 576 bytes = 4 * 144.
+ * Each row covers QK_K=256 values. Total = 1024 values per block.
+ *
+ * Layout:
+ *   d[8]:       FP16: d[0..3] = scales per row, d[4..7] = mins per row (16 bytes)
+ *   scales_h[16]: 2 bits per scale (16 bytes, covers 64 scale entries)
+ *   scales_l[32]: 4-bit magnitude scales (32 bytes, covers 64 scale entries)
+ *   qs[512]:     4-bit quantized values interleaved across 4 rows (512 bytes)
+ *
+ * Scale encoding: 6-bit unsigned = (scales_l low nibble | scales_h 2-bit << 4)
+ * Dequant: val = d[k] * scale * q - m[k] * min  (where k = row 0..3)
+ * No LUT (unlike IQ4_K) -- raw 4-bit values 0..15.
+ */
+#pragma pack(push, 1)
+typedef struct PICOLM_PACKED_ATTR {
+    uint16_t d[8];         /* 8 FP16: d[0..3]=scales, d[4..7]=mins */
+    uint8_t  scales_h[16]; /* 64 packed 2-bit scale extensions (16 bytes) */
+    uint8_t  scales_l[32]; /* 64 packed 4-bit magnitude scales (32 bytes) */
+    uint8_t  qs[512];      /* 1024 packed 4-bit values (512 bytes) */
+} block_q4_k_r4;           /* 576 bytes = 4 * 144 */
+#pragma pack(pop)
 
 /* Q4_0_4_4 interleaved block: 4 rows of Q4_0 packed together for SIMD efficiency.
  * Layout: 4 FP16 deltas, then interleaved nibble-bytes from 4 standard Q4_0 blocks.
@@ -1212,6 +1236,19 @@ void vec_dot_iq4_k_r4_q8_k_avx2(const void *vx, const void *wy, int n,
 /* IQ4_K_R4 x Q8_K batched GEMV dispatcher: 4 weight rows x 1 activation row.
  * out: 4 output floats. n must be multiple of 256. */
 void vec_dot_iq4_k_r4_q8_k_batch4(const void *vx, const void *vy, int n, float *out);
+
+/* Q4_K_R4 dequantize: scalar reference for a single row from the 4-row interleaved block.
+ * dst must have space for n floats. row must be 0..3. */
+void dequantize_row_q4_k_r4_single(const block_q4_k_r4 *x, float *dst, int n, int row);
+/* Q4_K_R4 x Q8_K scalar vec_dot (single row). */
+float vec_dot_q4_k_r4_q8_k(const void *vx, const void *wy, int n);
+/* Q4_K_R4 x Q8_K batch4 vec_dot: computes 4 row dot products at once.
+ * out[0..3] = dot products for rows 0..3 of the interleaved block. */
+void vec_dot_q4_k_r4_q8_k_batch4(const void *vx, const void *wy, int n, float *out);
+/* Q4_K_R4 x Q8_K AVX2 GEMV: 4 weight rows x 1 activation row.
+ * out: 4 output floats. nrows must be 4. n must be multiple of 256. */
+void vec_dot_q4_k_r4_q8_k_avx2(const void *vx, const void *wy, int n,
+                                  float *out, int nrows);
 
 /* Repack standard Q4_0 weights to Q4_0_8x8 interleaved format (for AVX2).
  * dst must have the same size as src (1:1 byte mapping, just reordered). */

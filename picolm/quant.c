@@ -55,6 +55,8 @@ void dequantize_row_iq3_k_r4_single(const block_iq3_k_r4 *x, float *dst, int n, 
 void dequantize_row_iq4_k_r4_single(const block_iq4_k_r4 *x, float *dst, int n, int row);
 void dequantize_row_iq4_k(const void *src, float *dst, int n);
 void dequantize_row_iq4_k_r4(const void *src, float *dst, int n);
+void dequantize_row_q4_k_r4(const void *src, float *dst, int n);
+void dequantize_row_q4_k_r4_single(const block_q4_k_r4 *x, float *dst, int n, int row);
 
 /* ================================================================
  * FP16 <-> FP32 lookup table (mirrors llama.cpp's ggml_table_f32_f16)
@@ -844,6 +846,7 @@ case GGUF_TYPE_Q4_0_R8:  dequantize_row_q4_0_r8(src, dst, n); break;
         case GGUF_TYPE_IQ4_K:    dequantize_row_iq4_k(src, dst, n); break;
         case GGUF_TYPE_IQ4_K_R4: dequantize_row_iq4_k_r4(src, dst, n); break;
         case GGUF_TYPE_Q6_K_R4:  dequantize_row_q6_K_R4(src, dst, n); break;
+        case GGUF_TYPE_Q4_K_R4:  dequantize_row_q4_k_r4(src, dst, n); break;
         default:
             fprintf(stderr, "dequantize_row: unsupported type %d\n", type);
             exit(1);
@@ -887,6 +890,7 @@ int gguf_type_block_size(gguf_type_t type) {
         case GGUF_TYPE_Q8_0_R8:  return 32;  /* 32 values per row */
         case GGUF_TYPE_Q8_K_R8:  return 256; /* same as Q8_K: 256 values per row */
         case GGUF_TYPE_Q6_K_R4:  return 256; /* same as Q6_K: 256 values per row */
+        case GGUF_TYPE_Q4_K_R4:  return 256; /* same as Q4_K: 256 values per row */
         default: return 0;
     }
 }
@@ -926,6 +930,7 @@ int gguf_type_quant_size(gguf_type_t type) {
         case GGUF_TYPE_Q8_0_R8:  return (int)sizeof(block_q8_0);   /* 34: same per-row stride as Q8_0 */
         case GGUF_TYPE_Q8_K_R8:  return (int)(sizeof(block_q8_k_r8) / 8); /* 258: per-row block size */
         case GGUF_TYPE_Q6_K_R4:  return (int)sizeof(block_q6_K);  /* 210: per-row block size (840/4) */
+        case GGUF_TYPE_Q4_K_R4:  return (int)sizeof(block_q4_k_r4);  /* 576: 4 rows interleaved */
         default: return 0;
     }
 }
@@ -947,6 +952,10 @@ size_t gguf_type_row_size(gguf_type_t type, int n) {
     /* IQ4_K_R4: 4 rows per block. Each block = 568 bytes, covers 4 rows x 256 values. */
     if (type == GGUF_TYPE_IQ4_K_R4) {
         return (size_t)sizeof(block_iq4_k_r4) * (size_t)(n / QK_K) / 4;
+    }
+    /* Q4_K_R4: 4 rows per block. Each block = 576 bytes, covers 4 rows x 256 values. */
+    if (type == GGUF_TYPE_Q4_K_R4) {
+        return (size_t)sizeof(block_q4_k_r4) * (size_t)(n / QK_K) / 4;
     }
     /* Compute full row size including partial blocks: qs * n / bs.
      * The GGUF stores tensors as flat block arrays. For non-block-aligned
@@ -7016,6 +7025,12 @@ case GGUF_TYPE_Q4_0_R8: {
             free(iq4_tmp);
             return result;
         }
+        case GGUF_TYPE_Q4_K_R4: {
+            /* Q4_K_R4: 4-row interleaved. Fallback: dequantize row 0, then f32 dot. */
+            float q4k_tmp[1024];
+            dequantize_row_q4_k_r4_single((const block_q4_k_r4 *)src, q4k_tmp, n, 0);
+            return vec_dot_f32_f32(q4k_tmp, x, n);
+        }
         case GGUF_TYPE_Q6_K_R4: {
             /* Q6_K_R4: dequantize row 0 of the 4-row group, then f32 dot.
              * For rows 1-3, the caller must use the 4-row group path
@@ -9154,4 +9169,143 @@ void vec_dot_iq2_k_r4_q8_k_batch4(const void *vx, const void *vy, int n, float *
         out[iy] += sumf;
     }
 #endif
+}
+
+/* ================================================================
+ * Q4_K_R4: 4-row interleaved Q4_K (GGUF type 212, 576 bytes per block)
+ * ================================================================
+ *
+ * Scale encoding: 6-bit unsigned
+ *   scale = (scales_l[is] & 0xf) | ((scales_h[is%16] >> 4*(is/16)) & 0x03) << 4
+ *   min   = (scales_l[is] >> 4)  | ((scales_h[is%16] >> 4*(is/16)) & 0x0c) << 2
+ *   where is = 4*ib + row (ib=0..7 subblocks, row=0..3)
+ *   Each subblock (32 values) has ONE scale and ONE min per row.
+ *
+ * Dequant: val = d[row] * scale * q - m[row] * min
+ * No LUT (raw 4-bit values 0..15).
+ */
+
+/* Scalar dequantize: one row from the 4-row interleaved block */
+void dequantize_row_q4_k_r4_single(const block_q4_k_r4 *x, float *dst, int n, int row) {
+    const int nblock = n / QK_K;
+
+    for (int ibl = 0; ibl < nblock; ++ibl) {
+        const float d = fp16_to_fp32_lookup(x[ibl].d[row]);
+        const float m = fp16_to_fp32_lookup(x[ibl].d[row + 4]);
+        for (int ib = 0; ib < QK_K / 32; ++ib) {
+            int is = 4 * ib + row;
+            float dl = d * ((x[ibl].scales_l[is] & 0xf) |
+                            ((x[ibl].scales_h[is % 16] >> (4 * (is / 16))) & 0x03) << 4);
+            float ml = m * ((x[ibl].scales_l[is] >> 4) |
+                            ((x[ibl].scales_h[is % 16] >> (4 * (is / 16))) & 0x0c) << 2);
+            for (int i = 0; i < 4; ++i) {
+                dst[QK_K * ibl + 32 * ib + i +  0] = dl * x[ibl].qs[64 * ib + 4 * row + i +  0] - ml;
+                dst[QK_K * ibl + 32 * ib + i +  8] = dl * (x[ibl].qs[64 * ib + 4 * row + i +  0] >> 4) - ml;
+                dst[QK_K * ibl + 32 * ib + i + 16] = dl * x[ibl].qs[64 * ib + 4 * row + i + 16] - ml;
+                dst[QK_K * ibl + 32 * ib + i + 24] = dl * (x[ibl].qs[64 * ib + 4 * row + i + 16] >> 4) - ml;
+                dst[QK_K * ibl + 32 * ib + i +  4] = dl * x[ibl].qs[64 * ib + 4 * row + i + 32] - ml;
+                dst[QK_K * ibl + 32 * ib + i + 12] = dl * (x[ibl].qs[64 * ib + 4 * row + i + 32] >> 4) - ml;
+                dst[QK_K * ibl + 32 * ib + i + 20] = dl * x[ibl].qs[64 * ib + 4 * row + i + 48] - ml;
+                dst[QK_K * ibl + 32 * ib + i + 28] = dl * (x[ibl].qs[64 * ib + 4 * row + i + 48] >> 4) - ml;
+            }
+        }
+    }
+}
+
+/* Generic dequantize: dequantize row 0 */
+void dequantize_row_q4_k_r4(const void *src, float *dst, int n) {
+    dequantize_row_q4_k_r4_single((const block_q4_k_r4 *)src, dst, n, 0);
+}
+
+/* Scalar vec_dot: Q4_K_R4 weight (row 0) x Q8_K activation.
+ * Uses process_min_r4_b32 pattern: -ml * bsums for bias correction.
+ * Each subblock (32 values) has ONE scale and ONE min. */
+float vec_dot_q4_k_r4_q8_k(const void *vx, const void *vy, int n) {
+    const block_q4_k_r4 *x = (const block_q4_k_r4 *)vx;
+    const block_q8_K *y = (const block_q8_K *)vy;
+    const int nblock = n / QK_K;
+
+    float sumf = 0.0f;
+    for (int ibl = 0; ibl < nblock; ++ibl) {
+        const float d = fp16_to_fp32_lookup(x[ibl].d[0]);
+        const float m = fp16_to_fp32_lookup(x[ibl].d[4]);
+        const int8_t *q8 = y[ibl].qs;
+        const float q8_scale = y[ibl].d;
+        float sumi = 0.0f;
+        float bsum = 0.0f;
+
+        for (int ib = 0; ib < QK_K / 32; ++ib) {
+            int is = 4 * ib;  /* row 0 */
+            float dl = d * ((x[ibl].scales_l[is] & 0xf) |
+                            ((x[ibl].scales_h[is % 16] >> (4 * (is / 16))) & 0x03) << 4);
+            float ml = m * ((x[ibl].scales_l[is] >> 4) |
+                            ((x[ibl].scales_h[is % 16] >> (4 * (is / 16))) & 0x0c) << 2);
+
+            /* Bias correction: ml * bsums for this subblock's two 16-value halves */
+            bsum += ml * (y[ibl].bsums[ib * 2 + 0] + y[ibl].bsums[ib * 2 + 1]);
+
+            for (int i = 0; i < 4; ++i) {
+                sumi += dl * x[ibl].qs[64 * ib + i +  0] * q8[i +  0];
+                sumi += dl * (x[ibl].qs[64 * ib + i +  0] >> 4) * q8[i +  8];
+                sumi += dl * x[ibl].qs[64 * ib + i + 16] * q8[i + 16];
+                sumi += dl * (x[ibl].qs[64 * ib + i + 16] >> 4) * q8[i + 24];
+                sumi += dl * x[ibl].qs[64 * ib + i + 32] * q8[i +  4];
+                sumi += dl * (x[ibl].qs[64 * ib + i + 32] >> 4) * q8[i + 12];
+                sumi += dl * x[ibl].qs[64 * ib + i + 48] * q8[i + 20];
+                sumi += dl * (x[ibl].qs[64 * ib + i + 48] >> 4) * q8[i + 28];
+            }
+            q8 += 32;
+        }
+        sumf += (sumi - bsum) * q8_scale;
+    }
+    return sumf;
+}
+
+/* Scalar batch4 vec_dot: Q4_K_R4 (4 rows) x Q8_K activation.
+ * Each subblock (32 values) has ONE scale and ONE min per row. */
+void vec_dot_q4_k_r4_q8_k_batch4(const void *vx, const void *vy, int n, float *out) {
+    const block_q4_k_r4 *x = (const block_q4_k_r4 *)vx;
+    const block_q8_K *y = (const block_q8_K *)vy;
+    const int nblock = n / QK_K;
+
+    out[0] = out[1] = out[2] = out[3] = 0.0f;
+
+    for (int ibl = 0; ibl < nblock; ++ibl) {
+        const block_q4_k_r4 *b = &x[ibl];
+        const block_q8_K *q = &y[ibl];
+        const float q8_scale = q->d;
+        const int8_t *q8 = q->qs;
+        float sumi[4] = {0, 0, 0, 0};
+        float bsum[4] = {0, 0, 0, 0};
+
+        for (int ib = 0; ib < QK_K / 32; ++ib) {
+            for (int k = 0; k < 4; k++) {
+                const float d = fp16_to_fp32_lookup(b->d[k]);
+                const float m = fp16_to_fp32_lookup(b->d[k + 4]);
+
+                int is = 4 * ib + k;
+                float dl = d * ((b->scales_l[is] & 0xf) |
+                                ((b->scales_h[is % 16] >> (4 * (is / 16))) & 0x03) << 4);
+                float ml = m * ((b->scales_l[is] >> 4) |
+                                ((b->scales_h[is % 16] >> (4 * (is / 16))) & 0x0c) << 2);
+
+                /* Bias correction */
+                bsum[k] += ml * (q->bsums[ib * 2 + 0] + q->bsums[ib * 2 + 1]);
+
+                for (int i = 0; i < 4; ++i) {
+                    sumi[k] += dl * b->qs[64 * ib + 4 * k + i +  0] * q8[i +  0];
+                    sumi[k] += dl * (b->qs[64 * ib + 4 * k + i +  0] >> 4) * q8[i +  8];
+                    sumi[k] += dl * b->qs[64 * ib + 4 * k + i + 16] * q8[i + 16];
+                    sumi[k] += dl * (b->qs[64 * ib + 4 * k + i + 16] >> 4) * q8[i + 24];
+                    sumi[k] += dl * b->qs[64 * ib + 4 * k + i + 32] * q8[i +  4];
+                    sumi[k] += dl * (b->qs[64 * ib + 4 * k + i + 32] >> 4) * q8[i + 12];
+                    sumi[k] += dl * b->qs[64 * ib + 4 * k + i + 48] * q8[i + 20];
+                    sumi[k] += dl * (b->qs[64 * ib + 4 * k + i + 48] >> 4) * q8[i + 28];
+                }
+            }
+            q8 += 32;
+        }
+        for (int k = 0; k < 4; k++)
+            out[k] += (sumi[k] - bsum[k]) * q8_scale;
+    }
 }
