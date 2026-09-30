@@ -443,6 +443,7 @@ typedef enum {
     GGUF_TYPE_IQ2_K     = 137, /* Plain IQ2_K (non-interleaved, GGUF type 137) */
     GGUF_TYPE_IQ3_K     = 138, /* Plain IQ3_K (non-interleaved, GGUF type 138) */
     GGUF_TYPE_IQ4_K     = 139, /* Plain IQ4_K (non-interleaved, GGUF type 139) */
+    GGUF_TYPE_IQ6_K     = 141, /* Plain IQ6_K (non-interleaved, GGUF type 141) */
     GGUF_TYPE_IQ2_K_R4  = 337, /* 4-row interleaved IQ2_K (repacked, AVX-512/AVX2 target) */
     GGUF_TYPE_IQ3_K_R4  = 338, /* 4-row interleaved IQ3_K (repacked, AVX-512/AVX2 target) */
     GGUF_TYPE_IQ4_K_R4  = 339, /* 4-row interleaved IQ4_K (repacked, AVX-512/AVX2 target) */
@@ -865,6 +866,18 @@ typedef struct PICOLM_PACKED_ATTR {
     uint8_t  qs[128];        /* 256 packed 4-bit values (2 per byte) */
 } block_iq4_k;              /* 144 bytes */
 
+/* IQ6_K block (GGUF type 141): single-row 6-bit non-linear quant.
+ * Size: 212 bytes per block (QK_K=256 values). */
+#pragma pack(push, 1)
+typedef struct PICOLM_PACKED_ATTR {
+    uint16_t d;              /* FP16 global scale */
+    uint16_t extra;          /* Sign bits: 1 bit per 64-value subblock */
+    int8_t   scales[16];     /* Signed per-subblock scales (4 per subblock) */
+    uint8_t  qs[128];        /* 256 packed 4-bit low values (2 per byte) */
+    uint8_t  qh[64];         /* 256 packed 2-bit high values (4 per byte) */
+} block_iq6_k;              /* 212 bytes */
+#pragma pack(pop)
+
 /* IQ4_K_R4 block: 4 rows of IQ4_K repacked together for SIMD efficiency.
  * GGUF type 339. Size = 4 * sizeof(block_iq4_k) = 576 bytes.
  * Each row covers QK_K=256 values. Total = 1024 values per block.
@@ -1231,6 +1244,10 @@ int sgemm_iq3_k_r4_q8_k_avx2(int nrows, int ncols, int k,
 void vec_dot_iq4_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out);
 /* IQ4_K plain x Q8_K scalar vec_dot. */
 float vec_dot_iq4_k_q8_k(const void *vx, const void *wy, int n);
+/* IQ6_K plain (GGUF type 141): 6-bit non-linear quant, 212-byte blocks. */
+void dequantize_row_iq6_k(const void *src, float *dst, int n);
+void vec_dot_iq6_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out);
+float vec_dot_iq6_k_q8_k(const void *vx, const void *wy, int n);
 /* IQ4_K_R4 x Q8_K scalar vec_dot (row 0 only). */
 float vec_dot_iq4_k_r4_q8_k(const void *vx, const void *wy, int n);
 /* IQ4_K_R4 x Q8_K AVX2 GEMV: 4 weight rows x 1 activation row.

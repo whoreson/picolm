@@ -525,6 +525,7 @@ const char *gguf_type_name(uint32_t type) {
         case 338: return "iq3_k_r4";
         case 139: return "iq4_k";
         case 339: return "iq4_k_r4";
+        case 141: return "iq6_k";
         case 399: return "q8_k_r8";
         default: return "unknown";
     }

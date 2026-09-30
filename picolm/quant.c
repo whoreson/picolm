@@ -55,6 +55,7 @@ void dequantize_row_iq3_k_r4_single(const block_iq3_k_r4 *x, float *dst, int n, 
 void dequantize_row_iq4_k_r4_single(const block_iq4_k_r4 *x, float *dst, int n, int row);
 void dequantize_row_iq4_k(const void *src, float *dst, int n);
 void dequantize_row_iq4_k_r4(const void *src, float *dst, int n);
+void dequantize_row_iq6_k(const void *src, float *dst, int n);
 void dequantize_row_q4_k_r4(const void *src, float *dst, int n);
 void dequantize_row_q4_k_r4_single(const block_q4_k_r4 *x, float *dst, int n, int row);
 
@@ -845,6 +846,7 @@ case GGUF_TYPE_Q4_0_R8:  dequantize_row_q4_0_r8(src, dst, n); break;
         case GGUF_TYPE_IQ3_K_R4: dequantize_row_iq3_k_r4(src, dst, n); break;
         case GGUF_TYPE_IQ4_K:    dequantize_row_iq4_k(src, dst, n); break;
         case GGUF_TYPE_IQ4_K_R4: dequantize_row_iq4_k_r4(src, dst, n); break;
+        case GGUF_TYPE_IQ6_K:    dequantize_row_iq6_k(src, dst, n); break;
         case GGUF_TYPE_Q6_K_R4:  dequantize_row_q6_K_R4(src, dst, n); break;
         case GGUF_TYPE_Q4_K_R4:  dequantize_row_q4_k_r4(src, dst, n); break;
         default:
@@ -868,6 +870,7 @@ int gguf_type_block_size(gguf_type_t type) {
         case GGUF_TYPE_IQ3_K_R4: return 256;  /* QK_K values per row */
         case GGUF_TYPE_IQ4_K:    return 256;  /* QK_K values per row */
         case GGUF_TYPE_IQ4_K_R4: return 256;  /* QK_K values per row */
+        case GGUF_TYPE_IQ6_K:    return 256;  /* QK_K values per row */
         case GGUF_TYPE_Q5_0:  return 32;
         case GGUF_TYPE_Q5_1:  return 32;
         case GGUF_TYPE_Q8_0:  return 32;
@@ -907,7 +910,8 @@ int gguf_type_quant_size(gguf_type_t type) {
         case GGUF_TYPE_IQ2_K_R4: return (int)sizeof(block_iq2_k_r4);  /* 304: 4 rows interleaved */
         case GGUF_TYPE_IQ3_K_R4: return (int)sizeof(block_iq3_k_r4);  /* 440: 4 rows interleaved */
         case GGUF_TYPE_IQ4_K:    return (int)sizeof(block_iq4_k);     /* 144: single row */
-        case GGUF_TYPE_IQ4_K_R4: return (int)sizeof(block_iq4_k_r4);  /* 568: 4 rows interleaved */
+        case GGUF_TYPE_IQ4_K_R4: return (int)sizeof(block_iq4_k_r4);  /* 576: 4 rows interleaved */
+        case GGUF_TYPE_IQ6_K:    return (int)sizeof(block_iq6_k);     /* 212: single row */
         case GGUF_TYPE_Q5_0:  return 22;
         case GGUF_TYPE_Q5_1:  return 24;
         case GGUF_TYPE_Q8_0:  return 34;
@@ -7023,6 +7027,15 @@ case GGUF_TYPE_Q4_0_R8: {
             free(iq4_tmp);
             return result;
         }
+        case GGUF_TYPE_IQ6_K: {
+            /* IQ6_K plain: fallback dequantize, then f32 dot. */
+            float *iq6_tmp = (float *)malloc((size_t)n * sizeof(float));
+            if (!iq6_tmp) return 0.0f;
+            dequantize_row_iq6_k(src, iq6_tmp, n);
+            float r = vec_dot_f32_f32(iq6_tmp, x, n);
+            free(iq6_tmp);
+            return r;
+        }
         case GGUF_TYPE_IQ4_K_R4: {
             /* IQ4_K_R4: 4-row interleaved. Fallback: dequantize row 0, then f32 dot. */
             float *iq4_tmp = (float *)malloc((size_t)n * sizeof(float));
@@ -8882,6 +8895,122 @@ float vec_dot_iq4_k_r4_q8_k(const void *vx, const void *vy, int n) {
 
 /* vec_dot_iq4_k_r4_q8_k_avx2 declared in sgemm_iq4_k.c */
 extern void vec_dot_iq4_k_r4_q8_k_avx2(const void *vx, const void *wy, int n, float *out, int nrows);
+
+/* ================================================================
+ * IQ6_K (GGUF type 141): 6-bit non-linear quant, 212-byte blocks.
+ *
+ * Layout per block (256 values):
+ *   d:       FP16 global scale
+ *   extra:   uint16_t, 1 sign bit per 64-value subblock (4 subblocks)
+ *   scales:  int8_t[16], signed per-subblock scales (4 per subblock)
+ *   qs:      128 bytes, 4-bit low values (2 per byte)
+ *   qh:      64 bytes, 2-bit high values (4 per byte)
+ *
+ * Dequantized value = d * scales[4*ib64+j] * (lut[q6] - 128 + m)
+ * where lut[] is the 64-entry iq6nl table (uint8, offset by 128),
+ * q6 = 4-bit low | 2-bit high << 4, and m is the subblock sign bit.
+ * ================================================================ */
+
+static const uint8_t iq6nl_lut[64] = {
+       1,    7,   13,   19,   24,   30,   35,   40,   44,   49,   54,   58,   62,   66,   70,   74,
+      77,   81,   84,   88,   91,   94,   97,  100,  103,  106,  109,  112,  115,  117,  120,  123,
+     126,  128,  131,  134,  137,  140,  142,  145,  148,  151,  155,  158,  161,  164,  168,  172,
+     175,  179,  183,  187,  191,  196,  200,  205,  210,  215,  220,  226,  231,  237,  243,  249,
+};
+
+void dequantize_row_iq6_k(const void *src, float *dst, int n) {
+    const block_iq6_k *x = (const block_iq6_k *)src;
+    const int nb = n / QK_K;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = fp16_to_fp32_lookup(x[i].d);
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *qh = x[i].qh;
+        const int8_t *sl = x[i].scales;
+        uint16_t extra = x[i].extra;
+
+        int shift = 0;
+        for (int ib64 = 0; ib64 < QK_K / 64; ++ib64) {
+            float dl[4];
+            float m[4];
+            for (int j = 0; j < 4; j++) {
+                dl[j] = d * sl[4*ib64 + j];
+                m[j] = (extra >> j) & 1;
+            }
+            for (int j = 0; j < 16; ++j) {
+                int q1 = ((qs[j+ 0] & 0xf) | (((qh[j+ 0] >> shift) & 0x03) << 4));
+                int q2 = ((qs[j+16] & 0xf) | (((qh[j+16] >> shift) & 0x03) << 4));
+                int q3 = ((qs[j+ 0] >>  4) | (((qh[j+ 0] >> shift) & 0x0c) << 2));
+                int q4 = ((qs[j+16] >>  4) | (((qh[j+16] >> shift) & 0x0c) << 2));
+                dst[j+ 0] = dl[0] * (iq6nl_lut[q1] - 128 + m[0]);
+                dst[j+16] = dl[1] * (iq6nl_lut[q2] - 128 + m[1]);
+                dst[j+32] = dl[2] * (iq6nl_lut[q3] - 128 + m[2]);
+                dst[j+48] = dl[3] * (iq6nl_lut[q4] - 128 + m[3]);
+            }
+            dst += 64;
+            qs += 32;
+            extra >>= 4;
+            shift += 4;
+            if (shift == 8) { qh += 32; shift = 0; }
+        }
+    }
+}
+
+/* IQ6_K x Q8_K AVX2 GEMV (implemented in sgemm_iq6_k.c). */
+extern void vec_dot_iq6_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out);
+
+/* IQ6_K x Q8_K scalar vec_dot (reference implementation). */
+float vec_dot_iq6_k_q8_k(const void *vx, const void *wy, int n) {
+#if 0 // defined(PICOLM_AVX2) -- AVX2 kernel has bug, scalar path for now
+    float result;
+    vec_dot_iq6_k_q8_k_avx2(vx, wy, n, &result);
+    return result;
+#else
+    const block_iq6_k *x = (const block_iq6_k *)vx;
+    const block_q8_K *y = (const block_q8_K *)wy;
+    const int nb = n / QK_K;
+
+    float sumf = 0.0f;
+    for (int ibl = 0; ibl < nb; ++ibl) {
+        const float d = fp16_to_fp32_lookup(x[ibl].d);
+        const uint8_t *qs = x[ibl].qs;
+        const uint8_t *qh = x[ibl].qh;
+        const int8_t *sl = x[ibl].scales;
+        uint16_t extra = x[ibl].extra;
+        const int8_t *q8 = y[ibl].qs;
+        float q8_scale = y[ibl].d;
+        float sumi = 0.0f;
+
+        int shift = 0;
+        for (int ib64 = 0; ib64 < QK_K / 64; ++ib64) {
+            float dl[4];
+            float m[4];
+            for (int j = 0; j < 4; j++) {
+                dl[j] = d * sl[4*ib64 + j];
+                m[j] = (extra >> j) & 1;
+            }
+            for (int j = 0; j < 16; ++j) {
+                int q1 = ((qs[j+ 0] & 0xf) | (((qh[j+ 0] >> shift) & 0x03) << 4));
+                int q2 = ((qs[j+16] & 0xf) | (((qh[j+16] >> shift) & 0x03) << 4));
+                int q3 = ((qs[j+ 0] >>  4) | (((qh[j+ 0] >> shift) & 0x0c) << 2));
+                int q4 = ((qs[j+16] >>  4) | (((qh[j+16] >> shift) & 0x0c) << 2));
+                sumi += dl[0] * (iq6nl_lut[q1] - 128 + m[0]) * q8[j+ 0];
+                sumi += dl[1] * (iq6nl_lut[q2] - 128 + m[1]) * q8[j+16];
+                sumi += dl[2] * (iq6nl_lut[q3] - 128 + m[2]) * q8[j+32];
+                sumi += dl[3] * (iq6nl_lut[q4] - 128 + m[3]) * q8[j+48];
+            }
+            q8 += 64;
+            qs += 32;
+            extra >>= 4;
+            shift += 4;
+            if (shift == 8) { qh += 32; shift = 0; }
+        }
+        sumf += sumi * q8_scale;
+    }
+    return sumf;
+#endif
+}
+
 #if defined(PICOLM_NEON)
 extern void vec_dot_iq4_k_r4_q8_k_neon(const void *vx, const void *wy, int n, float *out, int nrows);
 #endif
