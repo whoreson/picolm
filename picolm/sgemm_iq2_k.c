@@ -126,11 +126,18 @@ void vec_dot_iq2_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out) 
 
             __m256i sumi;
 #ifdef __AVX512VNNI__
-            /* VNNI path: dpbusd does unsigned*signed with accumulation */
+            /* VNNI path: dpbusd processes all 32 bytes of each operand.
+             * qx_lo/qx_hi are broadcast (16 values repeated to 32).
+             * For y_lo: 32 distinct activations [y[0..15], y[16..31]].
+             *   dpbusd: low lane = ql_lo[0..15]*y[0..15], high lane = ql_lo[0..15]*y[16..31].
+             * For y_hi: extracted high 128 bits of y_reg, but high 128 of the 256-bit
+             *   register is garbage. Fix: broadcast to both lanes. */
+            __m256i y_hi_bc = _mm256_broadcastsi128_si256(
+                _mm256_castsi256_si128(_mm256_extracti128_si256(y_reg, 1)));
             __m256i acc_lo = _mm256_dpbusd_epi32(_mm256_setzero_si256(),
                 s_lo, _mm256_sign_epi8(y_lo, qx_lo));
             __m256i acc_hi = _mm256_dpbusd_epi32(_mm256_setzero_si256(),
-                s_hi, _mm256_sign_epi8(y_hi, qx_hi));
+                s_hi, _mm256_sign_epi8(y_hi_bc, qx_hi));
             sumi = _mm256_add_epi32(acc_lo, acc_hi);
 #else
             /* AVX2 path: maddubs + madd_epi16 */

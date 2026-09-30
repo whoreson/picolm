@@ -148,10 +148,14 @@ void vec_dot_iq3_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out) 
 
             __m256i sumi;
 #ifdef __AVX512VNNI__
+            /* VNNI: dpbusd processes all 32 bytes. y_hi has garbage in high
+             * 128 bits from castsi128. Fix: broadcast to both lanes. */
+            __m256i y_hi_bc = _mm256_broadcastsi128_si256(
+                _mm256_castsi256_si128(_mm256_extracti128_si256(y_reg, 1)));
             __m256i acc_lo = _mm256_dpbusd_epi32(_mm256_setzero_si256(),
                 s_lo, _mm256_sign_epi8(y_lo, qx_lo));
             __m256i acc_hi = _mm256_dpbusd_epi32(_mm256_setzero_si256(),
-                s_hi, _mm256_sign_epi8(y_hi, qx_hi));
+                s_hi, _mm256_sign_epi8(y_hi_bc, qx_hi));
             sumi = _mm256_add_epi32(acc_lo, acc_hi);
 #else
             __m128i mad_lo = _mm256_castsi256_si128(
@@ -306,10 +310,14 @@ int sgemm_iq3_k_q8_k_avx2(int nrows, int ncols, int k,
 
                     __m256i sumi;
 #ifdef __AVX512VNNI__
+            /* VNNI: dpbusd processes all 32 bytes. y_hi has garbage in high
+             * 128 bits from castsi128. Fix: broadcast to both lanes. */
+            __m256i y_hi_bc = _mm256_broadcastsi128_si256(
+                _mm256_castsi256_si128(_mm256_extracti128_si256(y_reg, 1)));
                     __m256i acc_lo = _mm256_dpbusd_epi32(_mm256_setzero_si256(),
                         s_lo, _mm256_sign_epi8(y_lo, qx_lo));
                     __m256i acc_hi = _mm256_dpbusd_epi32(_mm256_setzero_si256(),
-                        s_hi, _mm256_sign_epi8(y_hi, qx_hi));
+                        s_hi, _mm256_sign_epi8(y_hi_bc, qx_hi));
                     sumi = _mm256_add_epi32(acc_lo, acc_hi);
 #else
                     __m128i mad_lo = _mm256_castsi256_si128(
