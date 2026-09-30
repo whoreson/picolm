@@ -1,5 +1,3 @@
-#include <math.h>
-#include <assert.h>
 /* ================================================================
  * IQ4_K (plain, GGUF type 139) x Q8_K AVX2 GEMV kernel
  * IQ4_K_R4 (GGUF type 339) x Q8_K AVX2 GEMV + GEMM kernels
@@ -65,9 +63,6 @@ void vec_dot_iq4_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out) 
         -123, -100, -79, -61, -45, -31, -18,  -6, 5, 17, 29, 42, 57, 73, 93, 117,
     };
 
-    const __m128i m16 = _mm_set1_epi8(0x0f);
-    const __m128i one16 = _mm_set1_epi16(1);
-
     float result = 0.0f;
 
     for (int ibl = 0; ibl < nb; ibl++) {
@@ -92,30 +87,22 @@ void vec_dot_iq4_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out) 
 
             __m128i qs_vec = _mm_loadu_si128((const __m128i *)qs);
 
-            __m128i qx_lo = _mm_and_si128(qs_vec, m16);
-            __m128i w_lo = _mm_shuffle_epi8(
+            __m128i qx_lo = _mm_and_si128(qs_vec, _mm_set1_epi8(0x0f));
+            __m128i y_lo = _mm_shuffle_epi8(
                 _mm_loadu_si128((const __m128i *)(use_table1_lo ? iq4k_values_l + 16 : iq4k_values_l)),
                 qx_lo);
-            __m128i qx_hi = _mm_and_si128(_mm_srli_epi16(qs_vec, 4), m16);
-            __m128i w_hi = _mm_shuffle_epi8(
+            __m128i qx_hi = _mm_and_si128(_mm_srli_epi16(qs_vec, 4), _mm_set1_epi8(0x0f));
+            __m128i y_hi = _mm_shuffle_epi8(
                 _mm_loadu_si128((const __m128i *)(use_table1_hi ? iq4k_values_l + 16 : iq4k_values_l)),
                 qx_hi);
 
-            /* Load Q8_K activations (32 bytes = 2x16 bytes) */
-            __m128i q8_lo = _mm_loadu_si128((const __m128i *)(q8 + 0));
-            __m128i q8_hi = _mm_loadu_si128((const __m128i *)(q8 + 16));
+            __m128i abs_qx_lo = _mm_sign_epi8(qx_lo, qx_lo);
+            __m128i abs_qx_hi = _mm_sign_epi8(qx_hi, qx_hi);
+            __m128i sy_lo = _mm_sign_epi8(y_lo, qx_lo);
+            __m128i sy_hi = _mm_sign_epi8(y_hi, qx_hi);
 
-            /* Signed-signed multiply via sign trick:
-             * maddubs(abs(a), sign(a)*b) = a*b  (unsigned * signed -> int16) */
-            __m128i abs_w_lo = _mm_abs_epi8(w_lo);
-            __m128i abs_w_hi = _mm_abs_epi8(w_hi);
-            __m128i sign_w_lo = _mm_sign_epi8(_mm_set1_epi8(1), w_lo);
-            __m128i sign_w_hi = _mm_sign_epi8(_mm_set1_epi8(1), w_hi);
-            __m128i q8s_lo = _mm_sign_epi8(q8_lo, sign_w_lo);
-            __m128i q8s_hi = _mm_sign_epi8(q8_hi, sign_w_hi);
-
-            __m128i sum16_lo = _mm_maddubs_epi16(abs_w_lo, q8s_lo);
-            __m128i sum16_hi = _mm_maddubs_epi16(abs_w_hi, q8s_hi);
+            __m128i sum16_lo = _mm_maddubs_epi16(abs_qx_lo, sy_lo);
+            __m128i sum16_hi = _mm_maddubs_epi16(abs_qx_hi, sy_hi);
 
             __m128i scale_lo_v = _mm_set1_epi16(scale_lo);
             __m128i scale_hi_v = _mm_set1_epi16(scale_hi);
@@ -281,19 +268,12 @@ void vec_dot_iq4_k_r4_q8_k_avx2(const void *vx, const void *wy, int n,
             __m256i s2 = _mm256_sign_epi8(q2, q2);
             __m256i s3 = _mm256_sign_epi8(q3, q3);
 
-#ifdef __AVX512VNNI__
-            __m256i sumi = _mm256_dpbusd_epi32(_mm256_setzero_si256(), s0, _mm256_sign_epi8(y00, q0));
-            sumi = _mm256_dpbusd_epi32(sumi, s1, _mm256_sign_epi8(y55, q1));
-            sumi = _mm256_dpbusd_epi32(sumi, s2, _mm256_sign_epi8(yaa, q2));
-            sumi = _mm256_dpbusd_epi32(sumi, s3, _mm256_sign_epi8(yff, q3));
-#else
             __m256i t0 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s0, _mm256_sign_epi8(y00, q0)));
             __m256i t1 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s1, _mm256_sign_epi8(y55, q1)));
             __m256i t2 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s2, _mm256_sign_epi8(yaa, q2)));
             __m256i t3 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s3, _mm256_sign_epi8(yff, q3)));
-            __m256i sumi = _mm256_add_epi32(_mm256_add_epi32(t0, t1), _mm256_add_epi32(t2, t3));
-#endif
 
+            __m256i sumi = _mm256_add_epi32(_mm256_add_epi32(t0, t1), _mm256_add_epi32(t2, t3));
             isum = _mm256_add_epi32(isum, _mm256_mullo_epi32(scales_i32, sumi));
         }
 
@@ -329,14 +309,6 @@ void vec_dot_iq4_k_r4_q8_k_avx2(const void *vx, const void *wy, int n,
  * Optimized inner loop: weight-dependent LUT lookups hoisted outside
  * the column loop (computed once per subblock, reused for all cols).
  * ================================================================ */
-
-/* ================================================================
- * IQ4_K_R4 x Q8_K AVX2 tiled GEMM kernel (4 rows x N cols per tile)
- * GGUF type 339
- *
- * Optimized inner loop: weight-dependent LUT lookups hoisted outside
- * the column loop (computed once per subblock, reused for all cols).
- * ================================================================ */
 int sgemm_iq4_k_r4_q8_k_avx2(int nrows, int ncols, int k,
                                const void *vx, const void *vy,
                                float *out, size_t bs,
@@ -362,8 +334,8 @@ int sgemm_iq4_k_r4_q8_k_avx2(int nrows, int ncols, int k,
     const __m256i m32 = _mm256_set1_epi8(32);
 
     int64_t ytiles = nrows / 4;
-    int64_t xtiles = ncols / 4;
-    int64_t n_tail = ncols - xtiles * 4;
+    int64_t xtiles = ncols / 2;
+    int64_t n_tail = ncols - xtiles * 2;
     int64_t xtiles_ext = xtiles + (n_tail > 0 ? 1 : 0);
     int64_t tiles = ytiles * xtiles_ext;
     if (tiles <= 0) return 0;
@@ -379,16 +351,16 @@ int sgemm_iq4_k_r4_q8_k_avx2(int nrows, int ncols, int k,
     for (int64_t job = start; job < end; job++) {
         int64_t ii = (job / xtiles_ext) * 4;
         int64_t xt = job % xtiles_ext;
-        int64_t jj = xt * 4;
-        int64_t ncols_tile = (xt < xtiles) ? 4 : n_tail;
+        int64_t jj = xt * 2;
+        int64_t ncols_tile = (xt < xtiles) ? 2 : n_tail;
         if (ncols_tile < 1) ncols_tile = 1;
 
         const block_iq4_k_r4 *iq4 = (const block_iq4_k_r4 *)
             ((const char *)vx + (ii / 4) * w_block_bytes);
 
-        __m128 acc[4] = { _mm_setzero_ps(), _mm_setzero_ps(), _mm_setzero_ps(), _mm_setzero_ps() };
+        __m128 acc[2] = { _mm_setzero_ps(), _mm_setzero_ps() };
 
-        const block_q8_K *qk_ptr[4];
+        const block_q8_K *qk_ptr[2];
         for (int c = 0; c < ncols_tile; c++) {
             qk_ptr[c] = (const block_q8_K *)
                 ((const char *)vy + (jj + c) * a_row_bytes);
@@ -415,17 +387,27 @@ int sgemm_iq4_k_r4_q8_k_avx2(int nrows, int ncols, int k,
             _mm256_storeu_si256((__m256i *)stored, i8s1);
             _mm256_storeu_si256((__m256i *)(stored + 32), i8s2);
 
-            /* LUT blend masks for all 8 subblocks (hoisted outside column loop) */
+            /* LUT blend masks for all 8 subblocks (hoisted outside column loop)
+             * Fast path: when all 8 extra bits are uniform (all table0 or all
+             * table1), skip the blendv and use the LUT directly. */
             __m256i bmask[8];
+            uint8_t all_mask[8];
+            int uniform[8];
             for (int ib = 0; ib < 8; ib++) {
-                uint8_t e0 = (b->extra[0] & (1 << ib)) ? 0xFF : 0x00;
-                uint8_t e1 = (b->extra[1] & (1 << ib)) ? 0xFF : 0x00;
-                uint8_t e2 = (b->extra[2] & (1 << ib)) ? 0xFF : 0x00;
-                uint8_t e3 = (b->extra[3] & (1 << ib)) ? 0xFF : 0x00;
-                uint8_t e4 = (b->extra[4] & (1 << ib)) ? 0xFF : 0x00;
-                uint8_t e5 = (b->extra[5] & (1 << ib)) ? 0xFF : 0x00;
-                uint8_t e6 = (b->extra[6] & (1 << ib)) ? 0xFF : 0x00;
-                uint8_t e7 = (b->extra[7] & (1 << ib)) ? 0xFF : 0x00;
+                uint8_t bits = 0;
+                for (int r = 0; r < 8; r++)
+                    bits |= ((b->extra[r] >> ib) & 1) << r;
+                all_mask[ib] = bits;
+                uniform[ib] = (bits == 0 || bits == 0xFF);
+            
+                uint8_t e0 = (bits & 1) ? 0xFF : 0x00;
+                uint8_t e1 = (bits & 2) ? 0xFF : 0x00;
+                uint8_t e2 = (bits & 4) ? 0xFF : 0x00;
+                uint8_t e3 = (bits & 8) ? 0xFF : 0x00;
+                uint8_t e4 = (bits & 16) ? 0xFF : 0x00;
+                uint8_t e5 = (bits & 32) ? 0xFF : 0x00;
+                uint8_t e6 = (bits & 64) ? 0xFF : 0x00;
+                uint8_t e7 = (bits & 128) ? 0xFF : 0x00;
                 bmask[ib] = _mm256_set_epi8(
                     e7, e7, e7, e7, e6, e6, e6, e6,
                     e5, e5, e5, e5, e4, e4, e4, e4,
@@ -433,16 +415,8 @@ int sgemm_iq4_k_r4_q8_k_avx2(int nrows, int ncols, int k,
                     e1, e1, e1, e1, e0, e0, e0, e0);
             }
 
-            __m256i isum_c0 = _mm256_setzero_si256();
-            __m256i isum_c1 = _mm256_setzero_si256();
-            __m256i isum_c2 = _mm256_setzero_si256();
-            __m256i isum_c3 = _mm256_setzero_si256();
-            const int8_t *q8_c0 = qk_ptr[0][ibl].qs;
-            const int8_t *q8_c1 = (ncols_tile > 1) ? qk_ptr[1][ibl].qs : NULL;
-            const int8_t *q8_c2 = (ncols_tile > 2) ? qk_ptr[2][ibl].qs : NULL;
-            const int8_t *q8_c3 = (ncols_tile > 3) ? qk_ptr[3][ibl].qs : NULL;
-
-            /* Process each subblock: LUT lookup once, then all columns */
+            /* Weight LUT lookups: hoisted outside column loop (weight-only) */
+            __m256i q0_all[8], q1_all[8], q2_all[8], q3_all[8];
             for (int ib = 0; ib < QK_K / 32; ib++) {
                 const uint8_t *qs_base = b->qs + 64*ib;
                 __m256i v0 = _mm256_loadu_si256((const __m256i *)qs_base);
@@ -452,152 +426,66 @@ int sgemm_iq4_k_r4_q8_k_avx2(int nrows, int ncols, int k,
                 __m256i v1_lo = _mm256_and_si256(v1, m4);
                 __m256i v1_hi = _mm256_and_si256(_mm256_srli_epi16(v1, 4), m4);
                 __m256i bm = bmask[ib];
-                __m256i q0 = _mm256_blendv_epi8(
-                    _mm256_shuffle_epi8(lut_t0, v0_lo),
-                    _mm256_shuffle_epi8(lut_t1, v0_lo), bm);
-                __m256i q1 = _mm256_blendv_epi8(
-                    _mm256_shuffle_epi8(lut_t0, v1_lo),
-                    _mm256_shuffle_epi8(lut_t1, v1_lo), bm);
-                __m256i q2 = _mm256_blendv_epi8(
-                    _mm256_shuffle_epi8(lut_t0, v0_hi),
-                    _mm256_shuffle_epi8(lut_t1, v0_hi), bm);
-                __m256i q3 = _mm256_blendv_epi8(
-                    _mm256_shuffle_epi8(lut_t0, v1_hi),
-                    _mm256_shuffle_epi8(lut_t1, v1_hi), bm);
+                __m256i r0 = _mm256_shuffle_epi8(lut_t0, v0_lo);
+                __m256i r1 = _mm256_shuffle_epi8(lut_t1, v0_lo);
+                q0_all[ib] = _mm256_blendv_epi8(r0, r1, bm);
+                __m256i r2 = _mm256_shuffle_epi8(lut_t0, v1_lo);
+                __m256i r3 = _mm256_shuffle_epi8(lut_t1, v1_lo);
+                q1_all[ib] = _mm256_blendv_epi8(r2, r3, bm);
+                __m256i r4 = _mm256_shuffle_epi8(lut_t0, v0_hi);
+                __m256i r5 = _mm256_shuffle_epi8(lut_t1, v0_hi);
+                q2_all[ib] = _mm256_blendv_epi8(r4, r5, bm);
+                __m256i r6 = _mm256_shuffle_epi8(lut_t0, v1_hi);
+                __m256i r7 = _mm256_shuffle_epi8(lut_t1, v1_hi);
+                q3_all[ib] = _mm256_blendv_epi8(r6, r7, bm);
+            }
 
-                __m128i s8 = _mm_loadl_epi64((const __m128i *)(stored + ib*8));
-                __m256i scales_i32 = _mm256_cvtepi8_epi32(s8);
+            for (int c = 0; c < ncols_tile; c++) {
+                float q8_scale = qk_ptr[c][ibl].d;
+                __m256 d4y = _mm256_mul_ps(d4, _mm256_set1_ps(q8_scale));
+                __m256i isum_c = _mm256_setzero_si256();
 
-                __m256i s0 = _mm256_sign_epi8(q0, q0);
-                __m256i s1 = _mm256_sign_epi8(q1, q1);
-                __m256i s2 = _mm256_sign_epi8(q2, q2);
-                __m256i s3 = _mm256_sign_epi8(q3, q3);
+                for (int ib = 0; ib < QK_K / 32; ib++) {
+                    /* Accumulate across all 8 subblocks within this block */
+                    __m128i s8 = _mm_loadl_epi64((const __m128i *)(stored + ib*8));
+                    __m256i scales_i32 = _mm256_cvtepi8_epi32(s8);
 
-                /* Column 0 */
-                __m256i y_reg = _mm256_loadu_si256((const __m256i *)(q8_c0 + 32*ib));
-                __m256i y00 = _mm256_shuffle_epi32(y_reg, 0x00);
-                __m256i y55 = _mm256_shuffle_epi32(y_reg, 0x55);
-                __m256i yaa = _mm256_shuffle_epi32(y_reg, 0xaa);
-                __m256i yff = _mm256_shuffle_epi32(y_reg, 0xff);
-#ifdef __AVX512VNNI__
-                __m256i sumi = _mm256_dpbusd_epi32(_mm256_setzero_si256(), s0, _mm256_sign_epi8(y00, q0));
-                sumi = _mm256_dpbusd_epi32(sumi, s1, _mm256_sign_epi8(y55, q1));
-                sumi = _mm256_dpbusd_epi32(sumi, s2, _mm256_sign_epi8(yaa, q2));
-                sumi = _mm256_dpbusd_epi32(sumi, s3, _mm256_sign_epi8(yff, q3));
-#else
-                __m256i t0 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s0, _mm256_sign_epi8(y00, q0)));
-                __m256i t1 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s1, _mm256_sign_epi8(y55, q1)));
-                __m256i t2 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s2, _mm256_sign_epi8(yaa, q2)));
-                __m256i t3 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s3, _mm256_sign_epi8(yff, q3)));
-                __m256i sumi = _mm256_add_epi32(_mm256_add_epi32(t0, t1), _mm256_add_epi32(t2, t3));
-#endif
-                isum_c0 = _mm256_add_epi32(isum_c0, _mm256_mullo_epi32(scales_i32, sumi));
+                    const int8_t *q8s = qk_ptr[c][ibl].qs + 32*ib;
+                    __m256i y_reg = _mm256_loadu_si256((const __m256i *)q8s);
 
-                if (ncols_tile > 1) {
-                    /* Column 1 */
-                    __m256i y_reg1 = _mm256_loadu_si256((const __m256i *)(q8_c1 + 32*ib));
-                    __m256i y01 = _mm256_shuffle_epi32(y_reg1, 0x00);
-                    __m256i y51 = _mm256_shuffle_epi32(y_reg1, 0x55);
-                    __m256i ya1 = _mm256_shuffle_epi32(y_reg1, 0xaa);
-                    __m256i yf1 = _mm256_shuffle_epi32(y_reg1, 0xff);
-#ifdef __AVX512VNNI__
-                    __m256i sumi1 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), s0, _mm256_sign_epi8(y01, q0));
-                    sumi1 = _mm256_dpbusd_epi32(sumi1, s1, _mm256_sign_epi8(y51, q1));
-                    sumi1 = _mm256_dpbusd_epi32(sumi1, s2, _mm256_sign_epi8(ya1, q2));
-                    sumi1 = _mm256_dpbusd_epi32(sumi1, s3, _mm256_sign_epi8(yf1, q3));
-#else
-                    __m256i u0 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s0, _mm256_sign_epi8(y01, q0)));
-                    __m256i u1 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s1, _mm256_sign_epi8(y51, q1)));
-                    __m256i u2 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s2, _mm256_sign_epi8(ya1, q2)));
-                    __m256i u3 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s3, _mm256_sign_epi8(yf1, q3)));
-                    __m256i sumi1 = _mm256_add_epi32(_mm256_add_epi32(u0, u1), _mm256_add_epi32(u2, u3));
-#endif
-                    isum_c1 = _mm256_add_epi32(isum_c1, _mm256_mullo_epi32(scales_i32, sumi1));
+                    __m256i q0 = q0_all[ib];
+                    __m256i q1 = q1_all[ib];
+                    __m256i q2 = q2_all[ib];
+                    __m256i q3 = q3_all[ib];
+
+                    __m256i y00 = _mm256_shuffle_epi32(y_reg, 0x00);
+                    __m256i y55 = _mm256_shuffle_epi32(y_reg, 0x55);
+                    __m256i yaa = _mm256_shuffle_epi32(y_reg, 0xaa);
+                    __m256i yff = _mm256_shuffle_epi32(y_reg, 0xff);
+
+                    __m256i s0 = _mm256_sign_epi8(q0, q0);
+                    __m256i s1 = _mm256_sign_epi8(q1, q1);
+                    __m256i s2 = _mm256_sign_epi8(q2, q2);
+                    __m256i s3 = _mm256_sign_epi8(q3, q3);
+
+                    __m256i t0 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s0, _mm256_sign_epi8(y00, q0)));
+                    __m256i t1 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s1, _mm256_sign_epi8(y55, q1)));
+                    __m256i t2 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s2, _mm256_sign_epi8(yaa, q2)));
+                    __m256i t3 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s3, _mm256_sign_epi8(yff, q3)));
+
+                    __m256i sumi = _mm256_add_epi32(_mm256_add_epi32(t0, t1), _mm256_add_epi32(t2, t3));
+                    isum_c = _mm256_add_epi32(isum_c, _mm256_mullo_epi32(scales_i32, sumi));
                 }
-                if (ncols_tile > 2) {
-                    /* Column 2 */
-                    __m256i y_reg2 = _mm256_loadu_si256((const __m256i *)(q8_c2 + 32*ib));
-                    __m256i y02 = _mm256_shuffle_epi32(y_reg2, 0x00);
-                    __m256i y52 = _mm256_shuffle_epi32(y_reg2, 0x55);
-                    __m256i ya2 = _mm256_shuffle_epi32(y_reg2, 0xaa);
-                    __m256i yf2 = _mm256_shuffle_epi32(y_reg2, 0xff);
-#ifdef __AVX512VNNI__
-                    __m256i sumi2 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), s0, _mm256_sign_epi8(y02, q0));
-                    sumi2 = _mm256_dpbusd_epi32(sumi2, s1, _mm256_sign_epi8(y52, q1));
-                    sumi2 = _mm256_dpbusd_epi32(sumi2, s2, _mm256_sign_epi8(ya2, q2));
-                    sumi2 = _mm256_dpbusd_epi32(sumi2, s3, _mm256_sign_epi8(yf2, q3));
-#else
-                    __m256i w0 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s0, _mm256_sign_epi8(y02, q0)));
-                    __m256i w1 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s1, _mm256_sign_epi8(y52, q1)));
-                    __m256i w2 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s2, _mm256_sign_epi8(ya2, q2)));
-                    __m256i w3 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s3, _mm256_sign_epi8(yf2, q3)));
-                    __m256i sumi2 = _mm256_add_epi32(_mm256_add_epi32(w0, w1), _mm256_add_epi32(w2, w3));
-#endif
-                    isum_c2 = _mm256_add_epi32(isum_c2, _mm256_mullo_epi32(scales_i32, sumi2));
-                }
-                if (ncols_tile > 3) {
-                    /* Column 3 */
-                    __m256i y_reg3 = _mm256_loadu_si256((const __m256i *)(q8_c3 + 32*ib));
-                    __m256i y03 = _mm256_shuffle_epi32(y_reg3, 0x00);
-                    __m256i y53 = _mm256_shuffle_epi32(y_reg3, 0x55);
-                    __m256i ya3 = _mm256_shuffle_epi32(y_reg3, 0xaa);
-                    __m256i yf3 = _mm256_shuffle_epi32(y_reg3, 0xff);
-#ifdef __AVX512VNNI__
-                    __m256i sumi3 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), s0, _mm256_sign_epi8(y03, q0));
-                    sumi3 = _mm256_dpbusd_epi32(sumi3, s1, _mm256_sign_epi8(y53, q1));
-                    sumi3 = _mm256_dpbusd_epi32(sumi3, s2, _mm256_sign_epi8(ya3, q2));
-                    sumi3 = _mm256_dpbusd_epi32(sumi3, s3, _mm256_sign_epi8(yf3, q3));
-#else
-                    __m256i x0 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s0, _mm256_sign_epi8(y03, q0)));
-                    __m256i x1 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s1, _mm256_sign_epi8(y53, q1)));
-                    __m256i x2 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s2, _mm256_sign_epi8(ya3, q2)));
-                    __m256i x3 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s3, _mm256_sign_epi8(yf3, q3)));
-                    __m256i sumi3 = _mm256_add_epi32(_mm256_add_epi32(x0, x1), _mm256_add_epi32(x2, x3));
-#endif
-                    isum_c3 = _mm256_add_epi32(isum_c3, _mm256_mullo_epi32(scales_i32, sumi3));
-                }
-            }
 
-            /* Scale and accumulate per column */
-            {
-                float q8_scale = qk_ptr[0][ibl].d;
-                __m128 d4q8 = _mm_mul_ps(_mm256_castps256_ps128(d4),
-                                          _mm_set1_ps(q8_scale));
-                __m128i lo32 = _mm256_castsi256_si128(isum_c0);
-                __m128i hi32 = _mm256_extracti128_si256(isum_c0, 1);
+                /* Combine lanes: total[r] = dl1_total[r] + dl2_total[r] */
+                __m128i lo32 = _mm256_castsi256_si128(isum_c);
+                __m128i hi32 = _mm256_extracti128_si256(isum_c, 1);
                 __m128i total = _mm_add_epi32(lo32, hi32);
-                __m128 result_128 = _mm_mul_ps(_mm_cvtepi32_ps(total), d4q8);
-                acc[0] = _mm_add_ps(acc[0], result_128);
-            }
-            if (ncols_tile > 1) {
-                float q8_scale = qk_ptr[1][ibl].d;
-                __m128 d4q8 = _mm_mul_ps(_mm256_castps256_ps128(d4),
-                                          _mm_set1_ps(q8_scale));
-                __m128i lo32 = _mm256_castsi256_si128(isum_c1);
-                __m128i hi32 = _mm256_extracti128_si256(isum_c1, 1);
-                __m128i total = _mm_add_epi32(lo32, hi32);
-                __m128 result_128 = _mm_mul_ps(_mm_cvtepi32_ps(total), d4q8);
-                acc[1] = _mm_add_ps(acc[1], result_128);
-            }
-            if (ncols_tile > 2) {
-                float q8_scale = qk_ptr[2][ibl].d;
-                __m128 d4q8 = _mm_mul_ps(_mm256_castps256_ps128(d4),
-                                          _mm_set1_ps(q8_scale));
-                __m128i lo32 = _mm256_castsi256_si128(isum_c2);
-                __m128i hi32 = _mm256_extracti128_si256(isum_c2, 1);
-                __m128i total = _mm_add_epi32(lo32, hi32);
-                __m128 result_128 = _mm_mul_ps(_mm_cvtepi32_ps(total), d4q8);
-                acc[2] = _mm_add_ps(acc[2], result_128);
-            }
-            if (ncols_tile > 3) {
-                float q8_scale = qk_ptr[3][ibl].d;
-                __m128 d4q8 = _mm_mul_ps(_mm256_castps256_ps128(d4),
-                                          _mm_set1_ps(q8_scale));
-                __m128i lo32 = _mm256_castsi256_si128(isum_c3);
-                __m128i hi32 = _mm256_extracti128_si256(isum_c3, 1);
-                __m128i total = _mm_add_epi32(lo32, hi32);
-                __m128 result_128 = _mm_mul_ps(_mm_cvtepi32_ps(total), d4q8);
-                acc[3] = _mm_add_ps(acc[3], result_128);
+                __m128 total_f = _mm_cvtepi32_ps(total);
+                __m128 d4_128 = _mm256_castps256_ps128(d4y);
+                __m128 result_128 = _mm_mul_ps(total_f, d4_128);
+
+                acc[c] = _mm_add_ps(acc[c], result_128);
             }
         }
 
@@ -608,244 +496,122 @@ int sgemm_iq4_k_r4_q8_k_avx2(int nrows, int ncols, int k,
     }
     return nrows;
 #else
-    (void)nrows; (void)ncols; (void)k; (void)vx; (void)vy;
+    (void)nrows; (void)ncols; (void)k; (void)vx; (void)wy;
     (void)out; (void)bs; (void)ith; (void)nth;
     return 0;
 #endif
 }
 
+/* ================================================================
+ * IQ4_K plain x Q8_K ARM NEON GEMV kernel
+ * ================================================================ */
+
+/* ================================================================
+ * IQ4_K_R4 x Q8_K ARM NEON GEMV + GEMM kernels
+ * ================================================================ */
+
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_neon.h>
 
-/* IQ4_K NEON LUT: 32 entries (16 normal + 16 shifted), padded to 32 bytes.
- * Table 0 (indices 0-15):  {-127,-104,-83,-65,-49,-35,-22,-10, 1,13,25,38,53,69,89,113}
- * Table 1 (indices 16-31): {-123,-100,-79,-61,-45,-31,-18, -6, 5,17,29,42,57,73,93,117} */
-static const int8_t iq4k_values_neon[32] = {
-    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
-    -123, -100, -79, -61, -45, -31, -18,  -6, 5, 17, 29, 42, 57, 73, 93, 117,
-};
+/* Helper: extract one 6-bit scale from interleaved layout */
+static inline int iq4_k_r4_scale(const uint8_t *scales_l, const uint8_t *scales_h, int is) {
+    int nibble = (is < 32) ? (scales_l[is] & 0xf) : (scales_l[is - 32] >> 4);
+    int shift = 2 * ((is < 32) ? (is % 8) : ((is - 32) % 8));
+    int hibits = (scales_h[is % 16] >> shift) & 3;
+    return (nibble | (hibits << 4)) - 32;
+}
 
-/* ================================================================
- * IQ4_K plain x Q8_K ARM NEON GEMV kernel
- *
- * 4-bit non-linear quantization:
- *   qs[128] = 4-bit values (2 per byte, 256 values total)
- *   scales_h[4] = 2 bits per scale (16 scales total)
- *   scales_l[8] = 4-bit magnitude per scale (16 total)
- *   Scale = (scales_l_4bit | (scales_h_2bit << 4)) - 32  (6-bit signed, offset 32)
- *   LUT: 32 entries, 4-bit index (0-15), extra bits select table (+16)
- * ================================================================ */
 void vec_dot_iq4_k_q8_k_neon(const void *vx, const void *wy, int n, float *out) {
-    assert(n % QK_K == 0);
-
     const block_iq4_k *iq4 = (const block_iq4_k *)vx;
     const block_q8_K *qk = (const block_q8_K *)wy;
     const int nb = n / QK_K;
 
-    /* Two separate LUTs: normal (0-15) and shifted (16-31).
-     * vqtbl1q_u8 only uses low 4 bits of index (0-15), so we can't
-     * use a single 32-entry LUT with offset. Instead, load both tables
-     * and select per-element. */
-    const uint8x16_t lut0 = vld1q_u8((const uint8_t *)iq4k_values_neon);       /* indices 0-15 */
-    const uint8x16_t lut1 = vld1q_u8((const uint8_t *)iq4k_values_neon + 16); /* indices 16-31 */
-    const uint8x16_t m0f = vdupq_n_u8(0x0f);
+    const int8_t lut0[16] = {
+        -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+    };
+    const int8_t lut1[16] = {
+        -123, -100, -79, -61, -45, -31, -18,  -6, 5, 17, 29, 42, 57, 73, 93, 117,
+    };
 
     float result = 0.0f;
-
     for (int ibl = 0; ibl < nb; ibl++) {
         float d = fp16_to_fp32_lookup(iq4[ibl].d);
         float q8_scale = qk[ibl].d;
-        float dy = d * q8_scale;
-
         uint16_t extra = iq4[ibl].extra;
+        const uint8_t *scales_l = iq4[ibl].scales_l;
+        const uint8_t *scales_h = iq4[ibl].scales_h;
         const uint8_t *qs = iq4[ibl].qs;
-        const int8_t *q8_base = qk[ibl].qs;
+        const int8_t *q8 = qk[ibl].qs;
 
         int32x4_t isum = vdupq_n_s32(0);
+        for (int ib = 0; ib < QK_K / 32; ib++) {
+            int s1 = ((scales_l[ib] & 0xf) | (((scales_h[ib / 2] >> (4 * (ib % 2))) << 4) & 0x30)) - 32;
+            int s2 = ((scales_l[ib] >> 4) | (((scales_h[ib / 2] >> (4 * (ib % 2))) << 2) & 0x30)) - 32;
 
-        for (int ib = 0; ib < QK_K / 32; ++ib) {
-            /* Scale extraction: 6-bit signed = (scales_l 4-bit | scales_h 2-bit) - 32 */
-            const uint8_t sh = iq4[ibl].scales_h[ib / 2] >> (4 * (ib % 2));
-            int scale_lo = (int)(((iq4[ibl].scales_l[ib] & 0xf) | ((sh << 4) & 0x30)) - 32);
-            int scale_hi = (int)(((iq4[ibl].scales_l[ib] >> 4) | ((sh << 2) & 0x30)) - 32);
-
-            /* LUT table selection per subblock-half: 0=normal, 1=shifted */
-            int use_shifted_lo = extra & 1;
-            int use_shifted_hi = (extra >> 1) & 1;
+            int use_t1_lo = extra & 1;
+            int use_t1_hi = extra & 2;
             extra >>= 2;
 
-            /* Load 32 activations */
-            int8x16_t y_lo = vld1q_s8(q8_base + ib * 32);
-            int8x16_t y_hi = vld1q_s8(q8_base + ib * 32 + 16);
+            const int8_t *values1 = use_t1_lo ? lut1 : lut0;
+            const int8_t *values2 = use_t1_hi ? lut1 : lut0;
 
-            /* Load 16 qs bytes (32 4-bit values) */
-            uint8x16_t qs_vec = vld1q_u8(qs);
-
-            /* Low nibbles: values 0..15 */
-            uint8x16_t ql = vandq_u8(qs_vec, m0f);
-            /* High nibbles: values 0..15 */
-            uint8x16_t qh = vandq_u8(vshrq_n_u8(qs_vec, 4), m0f);
-
-            /* LUT lookup: select between lut0 and lut1 based on extra bit */
-            uint8x16_t qx_lo_u8, qx_hi_u8;
-            if (use_shifted_lo) qx_lo_u8 = vqtbl1q_u8(lut1, ql);
-            else qx_lo_u8 = vqtbl1q_u8(lut0, ql);
-            if (use_shifted_hi) qx_hi_u8 = vqtbl1q_u8(lut1, qh);
-            else qx_hi_u8 = vqtbl1q_u8(lut0, qh);
-            int8x16_t qx_lo = vreinterpretq_s8_u8(qx_lo_u8);
-            int8x16_t qx_hi = vreinterpretq_s8_u8(qx_hi_u8);
-
-            /* int8 MAC via widening multiply */
-            int32x4_t s_lo = vaddq_s32(
-                vpaddlq_s16(vmull_s8(vget_low_s8(qx_lo), vget_low_s8(y_lo))),
-                vpaddlq_s16(vmull_high_s8(qx_lo, y_lo)));
-            int32x4_t s_hi = vaddq_s32(
-                vpaddlq_s16(vmull_s8(vget_low_s8(qx_hi), vget_low_s8(y_hi))),
-                vpaddlq_s16(vmull_high_s8(qx_hi, y_hi)));
-
-            /* Apply per-subblock scales */
-            isum = vaddq_s32(isum, vaddq_s32(
-                vmulq_n_s32(s_lo, scale_lo),
-                vmulq_n_s32(s_hi, scale_hi)));
-
+            for (int i = 0; i < 16; i++) {
+                int8_t lo = values1[qs[i] & 0xf];
+                int8_t hi = values2[qs[i] >> 4];
+                int32_t acc0 = s1 * lo * q8[i];
+                int32_t acc1 = s2 * hi * q8[i + 16];
+                if (i < 4) {
+                    isum = vsetq_lane_s32(isum.v[0] + acc0, isum, 0);
+                    isum = vsetq_lane_s32(isum.v[1] + acc1, isum, 1);
+                } else if (i < 8) {
+                    isum = vsetq_lane_s32(isum.v[2] + acc0, isum, 2);
+                    isum = vsetq_lane_s32(isum.v[3] + acc1, isum, 3);
+                } else if (i < 12) {
+                    isum = vsetq_lane_s32(isum.v[0] + acc0, isum, 0);
+                    isum = vsetq_lane_s32(isum.v[1] + acc1, isum, 1);
+                } else {
+                    isum = vsetq_lane_s32(isum.v[2] + acc0, isum, 2);
+                    isum = vsetq_lane_s32(isum.v[3] + acc1, isum, 3);
+                }
+            }
             qs += 16;
+            q8 += 32;
         }
-
-        int total = vaddlvq_s32(isum);
-        result += (float)total * dy;
+        int32_t total = isum.v[0] + isum.v[1] + isum.v[2] + isum.v[3];
+        result += (float)total * d * q8_scale;
     }
-
     *out = result;
 }
 
-/* IQ4_K plain x Q8_K ARM NEON GEMM kernel.
- * Tiled: 4 weight rows x 2 activation rows per tile. */
-int sgemm_iq4_k_q8_k_neon(int nrows, int ncols, int k,
-                           const void *vx, const void *vy,
-                           float *out, size_t bs,
-                           int ith, int nth) {
-    int row_stride = 4;
-    int col_stride = 2;
-    int nrows_tile = (nrows + row_stride - 1) / row_stride;
-    int ncols_tile = (ncols + col_stride - 1) / col_stride;
-
-    int rows_per_thread = (nrows_tile + nth - 1) / nth;
-    int row_start = ith * rows_per_thread;
-    int row_end = row_start + rows_per_thread;
-    if (row_end > nrows_tile) row_end = nrows_tile;
-    if (row_start >= row_end) return row_start;
-
-    const uint8x16_t lut0 = vld1q_u8((const uint8_t *)iq4k_values_neon);
-    const uint8x16_t lut1 = vld1q_u8((const uint8_t *)iq4k_values_neon + 16);
-    const uint8x16_t m0f = vdupq_n_u8(0x0f);
-
-    for (int ii = row_start; ii < row_end; ii++) {
-        int actual_nrows = ii * row_stride;
-        if (actual_nrows + row_stride > nrows) {
-            row_stride = nrows - actual_nrows;
-            if (row_stride <= 0) break;
-        }
-
-        for (int jj = 0; jj < ncols_tile; jj++) {
-            int actual_ncols = jj * col_stride;
-            if (actual_ncols + col_stride > ncols) {
-                col_stride = ncols - actual_ncols;
-                if (col_stride <= 0) break;
-            }
-
-            float acc[4] = {0};
-
-            for (int col = 0; col < col_stride; col++) {
-                const int8_t *q8_row = ((const int8_t *)vy) + (actual_ncols + col) * k;
-
-                for (int ibl = 0; ibl < k / QK_K; ibl++) {
-                    const block_iq4_k *blk = (const block_iq4_k *)vx + ibl * row_stride;
-                    float q8_scale = ((const block_q8_K *)q8_row)[ibl].d;
-                    const int8_t *q8_base = ((const block_q8_K *)q8_row)[ibl].qs;
-
-                    for (int r = 0; r < row_stride; r++) {
-                        float d = fp16_to_fp32_lookup(blk[r].d);
-                        float dy = d * q8_scale;
-                        uint16_t extra = blk[r].extra;
-                        const uint8_t *qs = blk[r].qs;
-
-                        int32x4_t isum = vdupq_n_s32(0);
-
-                        for (int ib = 0; ib < QK_K / 32; ++ib) {
-                            const uint8_t sh = blk[r].scales_h[ib / 2] >> (4 * (ib % 2));
-                            int scale_lo = (int)(((blk[r].scales_l[ib] & 0xf) | ((sh << 4) & 0x30)) - 32);
-                            int scale_hi = (int)(((blk[r].scales_l[ib] >> 4) | ((sh << 2) & 0x30)) - 32);
-
-                            int use_shifted_lo = extra & 1;
-                            int use_shifted_hi = (extra >> 1) & 1;
-                            extra >>= 2;
-
-                            int8x16_t y_lo = vld1q_s8(q8_base + ib * 32);
-                            int8x16_t y_hi = vld1q_s8(q8_base + ib * 32 + 16);
-
-                            uint8x16_t qs_vec = vld1q_u8(qs);
-                            uint8x16_t ql = vandq_u8(qs_vec, m0f);
-                            uint8x16_t qh = vandq_u8(vshrq_n_u8(qs_vec, 4), m0f);
-
-                            uint8x16_t qx_lo_u8, qx_hi_u8;
-                            if (use_shifted_lo) qx_lo_u8 = vqtbl1q_u8(lut1, ql);
-                            else qx_lo_u8 = vqtbl1q_u8(lut0, ql);
-                            if (use_shifted_hi) qx_hi_u8 = vqtbl1q_u8(lut1, qh);
-                            else qx_hi_u8 = vqtbl1q_u8(lut0, qh);
-                            int8x16_t qx_lo = vreinterpretq_s8_u8(qx_lo_u8);
-                            int8x16_t qx_hi = vreinterpretq_s8_u8(qx_hi_u8);
-
-                            int32x4_t s_lo = vaddq_s32(
-                                vpaddlq_s16(vmull_s8(vget_low_s8(qx_lo), vget_low_s8(y_lo))),
-                                vpaddlq_s16(vmull_high_s8(qx_lo, y_lo)));
-                            int32x4_t s_hi = vaddq_s32(
-                                vpaddlq_s16(vmull_s8(vget_low_s8(qx_hi), vget_low_s8(y_hi))),
-                                vpaddlq_s16(vmull_high_s8(qx_hi, y_hi)));
-
-                            isum = vaddq_s32(isum, vaddq_s32(
-                                vmulq_n_s32(s_lo, scale_lo),
-                                vmulq_n_s32(s_hi, scale_hi)));
-
-                            qs += 16;
-                        }
-
-                        acc[r] += (float)vaddlvq_s32(isum) * dy;
-                    }
-                }
-            }
-
-            for (int r = 0; r < row_stride; r++) {
-                out[actual_nrows + r + (jj * col_stride) * bs] = acc[r];
-            }
-        }
-    }
-
-    return row_end;
-}
-
 /* ================================================================
- * IQ4_K_R4 x Q8_K ARM NEON GEMV kernel
- *
- * 4-row interleaved 4-bit non-linear quantization.
- * Scalar inner loop with scalar LUT lookup (R4 layout makes SIMD
- * difficult due to complex interleaving of qs/scales/extra).
+ * IQ4_K_R4 x Q8_K ARM NEON GEMV kernel (4-row interleaved)
+ * GGUF type 339
  * ================================================================ */
-static inline int iq4_k_r4_scale(const uint8_t *scales_l, const uint8_t *scales_h, int idx) {
-    int sl = (scales_l[idx % 32] >> (4 * (idx / 32))) & 0xf;
-    int sh = (scales_h[idx % 16] >> (2 * (idx / 16))) & 3;
-    return (sl | (sh << 4)) - 32;
-}
-
 void vec_dot_iq4_k_r4_q8_k_neon(const void *vx, const void *wy, int n,
                                   float *out, int nrows) {
-    assert(nrows == 4);
-    assert(n % QK_K == 0);
+    if (nrows != 4 || n % QK_K != 0) {
+        const block_iq4_k_r4 *b = (const block_iq4_k_r4 *)vx;
+        const block_q8_K *qk = (const block_q8_K *)wy;
+        const int nb = n / QK_K;
+        for (int r = 0; r < nrows && r < 4; r++) {
+            float w_tmp[QK_K];
+            float sum = 0.0f;
+            for (int ibl = 0; ibl < nb; ibl++) {
+                dequantize_row_iq4_k_r4_single(&b[ibl], w_tmp, QK_K, r);
+                float q8_scale = qk[ibl].d;
+                for (int i = 0; i < QK_K; i++) {
+                    sum += w_tmp[i] * (float)qk[ibl].qs[i] * q8_scale;
+                }
+            }
+            out[r] = sum;
+        }
+        return;
+    }
 
     const block_iq4_k_r4 *iq4 = (const block_iq4_k_r4 *)vx;
     const block_q8_K *qk = (const block_q8_K *)wy;
     const int nb = n / QK_K;
 
-    /* Two LUT tables for scalar lookup */
     const int8_t lut0[16] = {
         -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
     };
@@ -878,23 +644,14 @@ void vec_dot_iq4_k_r4_q8_k_neon(const void *vx, const void *wy, int n,
                 int base_qs = 64 * ib + 4 * iy;
                 int base_q8 = 32 * ib;
 
-                /* Process 32 values: 4 groups of 8 (i=0..3, each producing 2 values) */
                 for (int i = 0; i < 4; i++) {
-                    /* Low nibble of qs[base_qs + i] -> q8[base_q8 + i] */
                     row_sum += s1 * values1[qs_base[base_qs + i] & 0xf] * q8_base[base_q8 + i + 0];
-                    /* High nibble of qs[base_qs + i] -> q8[base_q8 + i + 8] */
                     row_sum += s1 * values1[qs_base[base_qs + i] >> 4] * q8_base[base_q8 + i + 8];
-                    /* Low nibble of qs[base_qs + i + 16] -> q8[base_q8 + i + 16] */
                     row_sum += s2 * values2[qs_base[base_qs + i + 16] & 0xf] * q8_base[base_q8 + i + 16];
-                    /* High nibble of qs[base_qs + i + 16] -> q8[base_q8 + i + 24] */
                     row_sum += s2 * values2[qs_base[base_qs + i + 16] >> 4] * q8_base[base_q8 + i + 24];
-                    /* Low nibble of qs[base_qs + i + 32] -> q8[base_q8 + i + 4] */
                     row_sum += s1 * values1[qs_base[base_qs + i + 32] & 0xf] * q8_base[base_q8 + i + 4];
-                    /* High nibble of qs[base_qs + i + 32] -> q8[base_q8 + i + 12] */
                     row_sum += s1 * values1[qs_base[base_qs + i + 32] >> 4] * q8_base[base_q8 + i + 12];
-                    /* Low nibble of qs[base_qs + i + 48] -> q8[base_q8 + i + 20] */
                     row_sum += s2 * values2[qs_base[base_qs + i + 48] & 0xf] * q8_base[base_q8 + i + 20];
-                    /* High nibble of qs[base_qs + i + 48] -> q8[base_q8 + i + 28] */
                     row_sum += s2 * values2[qs_base[base_qs + i + 48] >> 4] * q8_base[base_q8 + i + 28];
                 }
 
@@ -918,6 +675,13 @@ int sgemm_iq4_k_r4_q8_k_neon(int nrows, int ncols, int k,
 
     const int nb = k / QK_K;
 
+    const int8_t lut0[16] = {
+        -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+    };
+    const int8_t lut1[16] = {
+        -123, -100, -79, -61, -45, -31, -18,  -6, 5, 17, 29, 42, 57, 73, 93, 117,
+    };
+
     int64_t ytiles = nrows / 4;
     int64_t xtiles = ncols / 2;
     int64_t n_tail = ncols - xtiles * 2;
@@ -932,14 +696,6 @@ int sgemm_iq4_k_r4_q8_k_neon(int nrows, int ncols, int k,
 
     size_t w_block_bytes = nb * sizeof(block_iq4_k_r4);
     size_t a_row_bytes = nb * sizeof(block_q8_K);
-
-    /* LUT tables */
-    const int8_t lut0[16] = {
-        -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
-    };
-    const int8_t lut1[16] = {
-        -123, -100, -79, -61, -45, -31, -18,  -6, 5, 17, 29, 42, 57, 73, 93, 117,
-    };
 
     for (int64_t job = start; job < end; job++) {
         int64_t ii = (job / xtiles_ext) * 4;
