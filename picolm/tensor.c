@@ -2246,6 +2246,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
             return;
         }
     } else if (qtype == GGUF_TYPE_IQ4_K && n >= 256 && n % 256 == 0) {
+        fprintf(stderr, "DISPATCH matmul: d=%d n=%d qtype=139 -> IQ4_K_fast\n", d, n);
         /* IQ4_K plain fast path (decode / single activation row): quantize x
          * to Q8_K once, then dispatch GEMV via vec_dot_iq4_k_q8_k_avx2. */
         size_t qx_size = (n / 256) * sizeof(block_q8_K);
