@@ -3936,6 +3936,17 @@ static void prof_print(void) {
     #undef P
 }
 
+/* Forward decls for R8/R4 scalar worker tasks (defined after matmul_dual_batch). */
+typedef struct { const void *W; float *out; const float *x; int n; int d; int d8; int ng; int n_batch; size_t rb; size_t block_stride; } q8kr8_batch_ctx_t;
+typedef struct { const void *W; float *out; const float *x; int n; int d; int d8; int ng; int n_batch; size_t rb; size_t block_stride; } q4r8_batch_ctx_t;
+typedef struct { float *out1; const void *W1; gguf_type_t qtype1; size_t rb1; float *out2; const void *W2; gguf_type_t qtype2; size_t rb2; const float *x; int n; int d; int d8; int ng; int n_batch; } r8_dual_ctx_t;
+typedef struct { float *out1; const void *W1; gguf_type_t qtype1; int is_r4_1; float *out2; const void *W2; gguf_type_t qtype2; int is_r4_2; const float *x; int n; int d; int n_batch; size_t rb1; size_t rb2; } r4_scalar_dual_ctx_t;
+static void q8kr8_batch_task(int idx, void *cp);
+static void q4r8_batch_task(int idx, void *cp);
+static void r8_dual_task(int idx, void *cp);
+static void r4_scalar_dual_task(int idx, void *cp);
+static void matmul_batch_scalar_threaded(float *out, const float *x, int n_batch, const void *W, int n, int d, gguf_type_t qtype, size_t rb);
+
 void matmul_batch(float *out, const float *x, int n_batch,
                    const void *W, int n, int d, gguf_type_t qtype) {
     static int init;
@@ -4322,32 +4333,27 @@ void matmul_batch(float *out, const float *x, int n_batch,
     }
 #endif
 
-    /* Q4_0_R8 scalar fallback (non-AVX2): dequantize each row, F32 dot.
-     * Cannot use generic vec_dot() because Q4_0_R8 is 8-row interleaved. */
+    /* Q4_0_R8 scalar fallback (non-AVX2): threaded dequantize+F32 dot.
+     * Cannot use generic vec_dot() because Q4_0_R8 is 8-row interleaved.
+     * One task per (batch, 8-row-group) for thread-level parallelism. */
     if (qtype == GGUF_TYPE_Q4_0_R8 && n_batch > 0 && n > 0) {
         size_t rb = gguf_type_row_size(qtype, n);
         size_t block_stride = rb * 8;
         int d8 = (d / 8) * 8;
-        float *tmp = (float *)malloc((size_t)n * sizeof(float));
-        if (tmp) {
-            for (int b = 0; b < n_batch; b++) {
-                for (int i = 0; i < d8; i += 8) {
-                    const char *wblock = (const char *)W + (i / 8) * block_stride;
-                    for (int r = 0; r < 8; r++) {
-                        dequantize_row_q4_0_r8_single(wblock, tmp, n, r);
-                        out[b * d + i + r] = vec_dot_f32_f32(tmp, x + b * n, n);
-                    }
-                }
-                for (int i = d8; i < d; i++) {
-                    const char *wblock = (const char *)W + (i / 8) * block_stride;
-                    dequantize_row_q4_0_r8_single(wblock, tmp, n, i % 8);
-                    out[b * d + i] = vec_dot_f32_f32(tmp, x + b * n, n);
-                }
-            }
-            free(tmp);
+        int ng = (d8 / 8) + (d - d8 > 0 ? 1 : 0);
+        int total_tasks = n_batch * ng;
+
+        q4r8_batch_ctx_t ctx = {
+            .W = W, .out = out, .x = x,
+            .n = n, .d = d, .d8 = d8, .ng = ng, .n_batch = n_batch,
+            .rb = rb, .block_stride = block_stride,
+        };
+
+        tensor_parallel_for(total_tasks,
+            q4r8_batch_task, &ctx);
+
         DISPATCH("Q4_0_R8_scalar_vec_dot");
-            return;
-        }
+        return;
     }
 
     /* Q8_K_R8 batch: tiled GEMM path with AVX2 kernel (Q8_K activations).
@@ -4436,32 +4442,27 @@ void matmul_batch(float *out, const float *x, int n_batch,
     }
 #endif
 
-    /* Q8_K_R8 scalar fallback (non-AVX2/non-NEON): dequantize each row, F32 dot.
-     * Cannot use generic vec_dot() because Q8_K_R8 is 8-row interleaved. */
+    /* Q8_K_R8 scalar fallback (non-AVX2/non-NEON): threaded dequantize+F32 dot.
+     * Cannot use generic vec_dot() because Q8_K_R8 is 8-row interleaved.
+     * One task per (batch, 8-row-group) for thread-level parallelism. */
     if (qtype == GGUF_TYPE_Q8_K_R8 && n_batch > 0 && n > 0) {
         size_t rb = gguf_type_row_size(qtype, n);
         size_t block_stride = rb * 8;
         int d8 = (d / 8) * 8;
-        float *tmp = (float *)malloc((size_t)n * sizeof(float));
-        if (tmp) {
-            for (int b = 0; b < n_batch; b++) {
-                for (int i = 0; i < d8; i += 8) {
-                    const char *wblock = (const char *)W + (i / 8) * block_stride;
-                    for (int r = 0; r < 8; r++) {
-                        dequantize_row_q8_k_r8_single(wblock, tmp, n, r);
-                        out[b * d + i + r] = vec_dot_f32_f32(tmp, x + b * n, n);
-                    }
-                }
-                for (int i = d8; i < d; i++) {
-                    const char *wblock = (const char *)W + (i / 8) * block_stride;
-                    dequantize_row_q8_k_r8_single(wblock, tmp, n, i % 8);
-                    out[b * d + i] = vec_dot_f32_f32(tmp, x + b * n, n);
-                }
-            }
-            free(tmp);
+        int ng = (d8 / 8) + (d - d8 > 0 ? 1 : 0);
+        int total_tasks = n_batch * ng;
+
+        q8kr8_batch_ctx_t ctx = {
+            .W = W, .out = out, .x = x,
+            .n = n, .d = d, .d8 = d8, .ng = ng, .n_batch = n_batch,
+            .rb = rb, .block_stride = block_stride,
+        };
+
+        tensor_parallel_for(total_tasks,
+            q8kr8_batch_task, &ctx);
+
         DISPATCH("Q8_K_R8_scalar_vec_dot");
-            return;
-        }
+        return;
     }
 
     /* IQ2_K_R4 batch: tiled GEMM path (Q8_K activations).
@@ -5748,6 +5749,174 @@ static void r4_dual_side_scalar(float *out_col, const void *W, gguf_type_t qtype
     free(tmp);
 }
 
+/* Q8_K_R8 threaded batch worker: one task = one 8-row group for one batch
+ * token. Dequantizes to F32, then vec_dot_f32_f32 (AVX-optimized). */
+static void q8kr8_batch_task(int idx, void *cp) {
+    q8kr8_batch_ctx_t *c = (q8kr8_batch_ctx_t *)cp;
+    int b = idx / c->ng;
+    int g = idx % c->ng;
+    const float *xb = c->x + (size_t)b * c->n;
+    int i = g * 8;
+    float *o = c->out + (size_t)b * c->d + i;
+    const char *wblock = (const char *)c->W + (size_t)g * c->block_stride;
+    float *tmp = (float *)malloc((size_t)c->n * sizeof(float));
+    if (g * 8 < c->d8) {
+        for (int r = 0; r < 8; r++) {
+            dequantize_row_q8_k_r8_single(wblock, tmp, c->n, r);
+            o[r] = vec_dot_f32_f32(tmp, xb, c->n);
+        }
+    } else {
+        for (int r = 0; i + r < c->d; r++) {
+            dequantize_row_q8_k_r8_single(wblock, tmp, c->n, r);
+            o[r] = vec_dot_f32_f32(tmp, xb, c->n);
+        }
+    }
+    free(tmp);
+}
+
+/* Q4_0_R8 threaded batch worker: one task = one 8-row group for one batch
+ * token. Dequantizes to F32, then vec_dot_f32_f32 (AVX-optimized). */
+static void q4r8_batch_task(int idx, void *cp) {
+    q4r8_batch_ctx_t *c = (q4r8_batch_ctx_t *)cp;
+    int b = idx / c->ng;
+    int g = idx % c->ng;
+    const float *xb = c->x + (size_t)b * c->n;
+    int i = g * 8;
+    float *o = c->out + (size_t)b * c->d + i;
+    const char *wblock = (const char *)c->W + (size_t)g * c->block_stride;
+    float *tmp = (float *)malloc((size_t)c->n * sizeof(float));
+    if (g * 8 < c->d8) {
+        for (int r = 0; r < 8; r++) {
+            dequantize_row_q4_0_r8_single(wblock, tmp, c->n, r);
+            o[r] = vec_dot_f32_f32(tmp, xb, c->n);
+        }
+    } else {
+        for (int r = 0; i + r < c->d; r++) {
+            dequantize_row_q4_0_r8_single(wblock, tmp, c->n, r);
+            o[r] = vec_dot_f32_f32(tmp, xb, c->n);
+        }
+    }
+    free(tmp);
+}
+
+/* Q8_K_R8 / Q4_0_R8 threaded dual-batch worker: one task = one 8-row group
+ * for one batch token. Handles both W1 and W2, supports mixed R8/non-R8. */
+static void r8_dual_task(int idx, void *cp) {
+    r8_dual_ctx_t *c = (r8_dual_ctx_t *)cp;
+    int b = idx / c->ng;
+    int g = idx % c->ng;
+    const float *xb = c->x + (size_t)b * c->n;
+    int i = g * 8;
+    float *o1 = c->out1 + (size_t)b * c->d + i;
+    float *o2 = c->out2 + (size_t)b * c->d + i;
+    float *tmp = (float *)malloc((size_t)c->n * sizeof(float));
+
+    if (c->qtype1 == GGUF_TYPE_Q8_K_R8) {
+        size_t bs = c->rb1 * 8;
+        const char *wb = (const char *)c->W1 + (size_t)g * bs;
+        int rows = (g * 8 < c->d8) ? 8 : (c->d - i);
+        for (int r = 0; r < rows; r++) {
+            dequantize_row_q8_k_r8_single(wb, tmp, c->n, r);
+            o1[r] = vec_dot_f32_f32(tmp, xb, c->n);
+        }
+    } else if (c->qtype1 == GGUF_TYPE_Q4_0_R8) {
+        size_t bs = c->rb1 * 8;
+        const char *wb = (const char *)c->W1 + (size_t)g * bs;
+        int rows = (g * 8 < c->d8) ? 8 : (c->d - i);
+        for (int r = 0; r < rows; r++) {
+            dequantize_row_q4_0_r8_single(wb, tmp, c->n, r);
+            o1[r] = vec_dot_f32_f32(tmp, xb, c->n);
+        }
+    } else {
+        for (int ri = 0; i + ri < c->d; ri++)
+            o1[ri] = vec_dot((const char *)c->W1 + (i + ri) * c->rb1, xb, c->n, c->qtype1);
+    }
+
+    if (c->qtype2 == GGUF_TYPE_Q8_K_R8) {
+        size_t bs = c->rb2 * 8;
+        const char *wb = (const char *)c->W2 + (size_t)g * bs;
+        int rows = (g * 8 < c->d8) ? 8 : (c->d - i);
+        for (int r = 0; r < rows; r++) {
+            dequantize_row_q8_k_r8_single(wb, tmp, c->n, r);
+            o2[r] = vec_dot_f32_f32(tmp, xb, c->n);
+        }
+    } else if (c->qtype2 == GGUF_TYPE_Q4_0_R8) {
+        size_t bs = c->rb2 * 8;
+        const char *wb = (const char *)c->W2 + (size_t)g * bs;
+        int rows = (g * 8 < c->d8) ? 8 : (c->d - i);
+        for (int r = 0; r < rows; r++) {
+            dequantize_row_q4_0_r8_single(wb, tmp, c->n, r);
+            o2[r] = vec_dot_f32_f32(tmp, xb, c->n);
+        }
+    } else {
+        for (int ri = 0; i + ri < c->d; ri++)
+            o2[ri] = vec_dot((const char *)c->W2 + (i + ri) * c->rb2, xb, c->n, c->qtype2);
+    }
+
+    free(tmp);
+}
+
+/* Threaded scalar R4 dual-batch worker: one task = one 4-row group for one
+ * batch token. Processes both W1 and W2 sides. */
+static void r4_scalar_dual_task(int idx, void *cp) {
+    r4_scalar_dual_ctx_t *c = (r4_scalar_dual_ctx_t *)cp;
+    int d4 = c->d / 4;
+    int b = idx / d4;
+    int gr = idx % d4;
+    const float *xb = c->x + (size_t)b * c->n;
+    int i = gr * 4;
+    float *o1 = c->out1 + (size_t)b * c->d + i;
+    float *o2 = c->out2 + (size_t)b * c->d + i;
+
+    if (c->is_r4_1) {
+        r4_dequant_row_fn dq; r4_vecdot4_fn vd;
+        r4_dual_lookup(c->qtype1, &vd, &dq);
+        size_t block_stride = c->rb1 * 4;
+        const char *wblock = (const char *)c->W1 + (size_t)gr * block_stride;
+        float *tmp = (float *)malloc((size_t)c->n * sizeof(float));
+        for (int r = 0; r < 4; r++) {
+            dq(wblock, tmp, c->n, r);
+            o1[r] = vec_dot_f32_f32(tmp, xb, c->n);
+        }
+        free(tmp);
+    } else {
+        for (int ri = 0; ri < 4; ri++)
+            o1[ri] = vec_dot((const char *)c->W1 + (i + ri) * c->rb1, xb, c->n, c->qtype1);
+    }
+
+    if (c->is_r4_2) {
+        r4_dequant_row_fn dq; r4_vecdot4_fn vd;
+        r4_dual_lookup(c->qtype2, &vd, &dq);
+        size_t block_stride = c->rb2 * 4;
+        const char *wblock = (const char *)c->W2 + (size_t)gr * block_stride;
+        float *tmp = (float *)malloc((size_t)c->n * sizeof(float));
+        for (int r = 0; r < 4; r++) {
+            dq(wblock, tmp, c->n, r);
+            o2[r] = vec_dot_f32_f32(tmp, xb, c->n);
+        }
+        free(tmp);
+    } else {
+        for (int ri = 0; ri < 4; ri++)
+            o2[ri] = vec_dot((const char *)c->W2 + (i + ri) * c->rb2, xb, c->n, c->qtype2);
+    }
+}
+
+/* Threaded scalar vec_dot for non-interleaved types in dual-batch.
+ * One task per (batch, row) pair. */
+typedef struct { const void *W; float *out; const float *x; int n; int d; int n_batch; size_t rb; gguf_type_t qt; } nr8_batch_ctx_t;
+
+static void nr8_batch_task(int idx, void *cp) {
+    nr8_batch_ctx_t *c = (nr8_batch_ctx_t *)cp;
+    int b = idx / c->d;
+    int i = idx % c->d;
+    c->out[b * c->d + i] = vec_dot((const char *)c->W + (size_t)i * c->rb, c->x + (size_t)b * c->n, c->n, c->qt);
+}
+
+static void matmul_batch_scalar_threaded(float *out, const float *x, int n_batch, const void *W, int n, int d, gguf_type_t qtype, size_t rb) {
+    nr8_batch_ctx_t ctx = { .W = W, .out = out, .x = x, .n = n, .d = d, .n_batch = n_batch, .rb = rb, .qt = qtype };
+    tensor_parallel_for(n_batch * d, nr8_batch_task, &ctx);
+}
+
 void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                         const void *W1, const void *W2,
                         int n, int d, gguf_type_t qtype1, gguf_type_t qtype2) {
@@ -6028,60 +6197,6 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
     }
 #endif
 
-    /* Q4_0_R8 scalar fallback for dual-batch (non-AVX2).
-     * Cannot use generic vec_dot() because Q4_0_R8 is 8-row interleaved. */
-    if ((qtype1 == GGUF_TYPE_Q4_0_R8 || qtype2 == GGUF_TYPE_Q4_0_R8) && n_batch > 0 && n > 0) {
-        size_t rb1 = qtype1 == GGUF_TYPE_Q4_0_R8 ? gguf_type_row_size(GGUF_TYPE_Q4_0_R8, n) : 0;
-        size_t rb2 = qtype2 == GGUF_TYPE_Q4_0_R8 ? gguf_type_row_size(GGUF_TYPE_Q4_0_R8, n) : 0;
-        size_t block_stride1 = rb1 ? rb1 * 8 : 0;
-        size_t block_stride2 = rb2 ? rb2 * 8 : 0;
-        int d8 = (d / 8) * 8;
-        float *tmp = (float *)malloc((size_t)n * sizeof(float));
-        if (tmp) {
-            for (int b = 0; b < n_batch; b++) {
-                if (qtype1 == GGUF_TYPE_Q4_0_R8) {
-                    for (int i = 0; i < d8; i += 8) {
-                        const char *wblock = (const char *)W1 + (i / 8) * block_stride1;
-                        for (int r = 0; r < 8; r++) {
-                            dequantize_row_q4_0_r8_single(wblock, tmp, n, r);
-                            out1[b * d + i + r] = vec_dot_f32_f32(tmp, x + b * n, n);
-                        }
-                    }
-                    for (int i = d8; i < d; i++) {
-                        const char *wblock = (const char *)W1 + (i / 8) * block_stride1;
-                        dequantize_row_q4_0_r8_single(wblock, tmp, n, i % 8);
-                        out1[b * d + i] = vec_dot_f32_f32(tmp, x + b * n, n);
-                    }
-                } else {
-                    size_t rb = gguf_type_row_size(qtype1, n);
-                    for (int i = 0; i < d; i++)
-                        out1[b * d + i] = vec_dot((const char *)W1 + i * rb, x + b * n, n, qtype1);
-                }
-                if (qtype2 == GGUF_TYPE_Q4_0_R8) {
-                    for (int i = 0; i < d8; i += 8) {
-                        const char *wblock = (const char *)W2 + (i / 8) * block_stride2;
-                        for (int r = 0; r < 8; r++) {
-                            dequantize_row_q4_0_r8_single(wblock, tmp, n, r);
-                            out2[b * d + i + r] = vec_dot_f32_f32(tmp, x + b * n, n);
-                        }
-                    }
-                    for (int i = d8; i < d; i++) {
-                        const char *wblock = (const char *)W2 + (i / 8) * block_stride2;
-                        dequantize_row_q4_0_r8_single(wblock, tmp, n, i % 8);
-                        out2[b * d + i] = vec_dot_f32_f32(tmp, x + b * n, n);
-                    }
-                } else {
-                    size_t rb = gguf_type_row_size(qtype2, n);
-                    for (int i = 0; i < d; i++)
-                        out2[b * d + i] = vec_dot((const char *)W2 + i * rb, x + b * n, n, qtype2);
-                }
-            }
-            free(tmp);
-        DISPATCH2("Q4_0_R8_scalar_vec_dot_dual");
-            return;
-        }
-    }
-
     /* Q6_K_R4 tiled GEMM for dual-batch. Portable (scalar fallback inside
      * vec_dot_q6_K_R4_q8_K/sgemm_q6_k_r4_q8_k), so not gated on PICOLM_AVX2. */
     if (!picolm_sgemm_disabled_tensor() && (qtype1 == GGUF_TYPE_Q6_K_R4 || qtype2 == GGUF_TYPE_Q6_K_R4) && n_batch > 0 && n > 0 && d % 4 == 0 && n % 256 == 0) {
@@ -6301,27 +6416,24 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
     }
 #endif
 
-    /* Portable scalar fallback (no AVX2/F16C): dequantize-then-dot for
-     * whichever side(s) are R4-interleaved. */
-    if ((is_r4_dual_type(qtype1) || is_r4_dual_type(qtype2)) && n_batch > 0 && n > 0) {
-        for (int b = 0; b < n_batch; b++) {
-            const float *xb = x + (size_t)b * n;
-            if (is_r4_dual_type(qtype1)) {
-                r4_dual_side_scalar(out1 + (size_t)b * d, W1, qtype1, xb, n, d);
-            } else {
-                size_t rb1 = gguf_type_row_size(qtype1, n);
-                for (int i = 0; i < d; i++)
-                    out1[b * d + i] = vec_dot((const char *)W1 + (size_t)i * rb1, xb, n, qtype1);
-            }
-            if (is_r4_dual_type(qtype2)) {
-                r4_dual_side_scalar(out2 + (size_t)b * d, W2, qtype2, xb, n, d);
-            } else {
-                size_t rb2 = gguf_type_row_size(qtype2, n);
-                for (int i = 0; i < d; i++)
-                    out2[b * d + i] = vec_dot((const char *)W2 + (size_t)i * rb2, xb, n, qtype2);
-            }
-        }
-        DISPATCH2("R4_generic_dual_scalar");
+    /* Threaded scalar fallback for R4 dual-batch (non-AVX2): dequantize-then-dot
+     * with AVX vec_dot_f32_f32. Distributes (n_batch * d/4) work items across
+     * threads for parallelism on all SIMD levels. */
+    if ((is_r4_dual_type(qtype1) || is_r4_dual_type(qtype2)) && n_batch > 0 && n > 0 && d % 4 == 0) {
+        int total_groups = n_batch * (d / 4);
+
+        r4_scalar_dual_ctx_t ctx = {
+            .out1 = out1, .W1 = W1, .qtype1 = qtype1, .is_r4_1 = is_r4_dual_type(qtype1),
+            .out2 = out2, .W2 = W2, .qtype2 = qtype2, .is_r4_2 = is_r4_dual_type(qtype2),
+            .x = x, .n = n, .d = d, .n_batch = n_batch,
+            .rb1 = gguf_type_row_size(qtype1, n),
+            .rb2 = gguf_type_row_size(qtype2, n),
+        };
+
+        tensor_parallel_for(total_groups,
+            r4_scalar_dual_task, &ctx);
+
+        DISPATCH2("R4_generic_dual_threaded_scalar");
         return;
     }
 
@@ -6392,58 +6504,37 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
     }
 #endif
 
-    /* Q8_K_R8 scalar fallback for dual-batch (non-AVX2/non-NEON).
-     * Cannot use generic vec_dot() because Q8_K_R8 is 8-row interleaved. */
-    if ((qtype1 == GGUF_TYPE_Q8_K_R8 || qtype2 == GGUF_TYPE_Q8_K_R8) && n_batch > 0 && n > 0) {
-        size_t rb1 = qtype1 == GGUF_TYPE_Q8_K_R8 ? gguf_type_row_size(GGUF_TYPE_Q8_K_R8, n) : 0;
-        size_t rb2 = qtype2 == GGUF_TYPE_Q8_K_R8 ? gguf_type_row_size(GGUF_TYPE_Q8_K_R8, n) : 0;
-        size_t block_stride1 = rb1 ? rb1 * 8 : 0;
-        size_t block_stride2 = rb2 ? rb2 * 8 : 0;
+    /* Q8_K_R8 / Q4_0_R8 scalar fallback for dual-batch (non-AVX2/non-NEON).
+     * Handles each side independently: R8 sides use threaded dequantize+F32 dot,
+     * non-R8 sides use threaded vec_dot. */
+    if ((qtype1 == GGUF_TYPE_Q8_K_R8 || qtype2 == GGUF_TYPE_Q8_K_R8 ||
+         qtype1 == GGUF_TYPE_Q4_0_R8 || qtype2 == GGUF_TYPE_Q4_0_R8) && n_batch > 0 && n > 0) {
         int d8 = (d / 8) * 8;
-        float *tmp = (float *)malloc((size_t)n * sizeof(float));
-        if (tmp) {
-            for (int b = 0; b < n_batch; b++) {
-                if (qtype1 == GGUF_TYPE_Q8_K_R8) {
-                    for (int i = 0; i < d8; i += 8) {
-                        const char *wblock = (const char *)W1 + (i / 8) * block_stride1;
-                        for (int r = 0; r < 8; r++) {
-                            dequantize_row_q8_k_r8_single(wblock, tmp, n, r);
-                            out1[b * d + i + r] = vec_dot_f32_f32(tmp, x + b * n, n);
-                        }
-                    }
-                    for (int i = d8; i < d; i++) {
-                        const char *wblock = (const char *)W1 + (i / 8) * block_stride1;
-                        dequantize_row_q8_k_r8_single(wblock, tmp, n, i % 8);
-                        out1[b * d + i] = vec_dot_f32_f32(tmp, x + b * n, n);
-                    }
-                } else {
-                    size_t rb = gguf_type_row_size(qtype1, n);
-                    for (int i = 0; i < d; i++)
-                        out1[b * d + i] = vec_dot((const char *)W1 + i * rb, x + b * n, n, qtype1);
-                }
-                if (qtype2 == GGUF_TYPE_Q8_K_R8) {
-                    for (int i = 0; i < d8; i += 8) {
-                        const char *wblock = (const char *)W2 + (i / 8) * block_stride2;
-                        for (int r = 0; r < 8; r++) {
-                            dequantize_row_q8_k_r8_single(wblock, tmp, n, r);
-                            out2[b * d + i + r] = vec_dot_f32_f32(tmp, x + b * n, n);
-                        }
-                    }
-                    for (int i = d8; i < d; i++) {
-                        const char *wblock = (const char *)W2 + (i / 8) * block_stride2;
-                        dequantize_row_q8_k_r8_single(wblock, tmp, n, i % 8);
-                        out2[b * d + i] = vec_dot_f32_f32(tmp, x + b * n, n);
-                    }
-                } else {
-                    size_t rb = gguf_type_row_size(qtype2, n);
-                    for (int i = 0; i < d; i++)
-                        out2[b * d + i] = vec_dot((const char *)W2 + i * rb, x + b * n, n, qtype2);
-                }
-            }
-            free(tmp);
-        DISPATCH2("Q8_K_R8_scalar_vec_dot_dual");
-            return;
+        int ng = (d8 / 8) + (d - d8 > 0 ? 1 : 0);
+
+        if (qtype1 == GGUF_TYPE_Q8_K_R8 || qtype1 == GGUF_TYPE_Q4_0_R8) {
+            size_t rb1 = gguf_type_row_size(qtype1, n);
+            size_t bs1 = rb1 * 8;
+            q8kr8_batch_ctx_t ctx1 = { .W = W1, .out = out1, .x = x, .n = n, .d = d, .d8 = d8, .ng = ng, .n_batch = n_batch, .rb = rb1, .block_stride = bs1 };
+            tensor_parallel_for(n_batch * ng, qtype1 == GGUF_TYPE_Q8_K_R8 ? q8kr8_batch_task : q4r8_batch_task, &ctx1);
+        } else if (W1) {
+            /* Non-R8 side: threaded vec_dot */
+            size_t rb1 = gguf_type_row_size(qtype1, n);
+            matmul_batch_scalar_threaded(out1, x, n_batch, W1, n, d, qtype1, rb1);
         }
+
+        if (qtype2 == GGUF_TYPE_Q8_K_R8 || qtype2 == GGUF_TYPE_Q4_0_R8) {
+            size_t rb2 = gguf_type_row_size(qtype2, n);
+            size_t bs2 = rb2 * 8;
+            q8kr8_batch_ctx_t ctx2 = { .W = W2, .out = out2, .x = x, .n = n, .d = d, .d8 = d8, .ng = ng, .n_batch = n_batch, .rb = rb2, .block_stride = bs2 };
+            tensor_parallel_for(n_batch * ng, qtype2 == GGUF_TYPE_Q8_K_R8 ? q8kr8_batch_task : q4r8_batch_task, &ctx2);
+        } else if (W2) {
+            size_t rb2 = gguf_type_row_size(qtype2, n);
+            matmul_batch_scalar_threaded(out2, x, n_batch, W2, n, d, qtype2, rb2);
+        }
+
+        DISPATCH2("R8_scalar_vec_dot_dual");
+        return;
     }
 
     /* Safety check: R4/R8 types (interleaved) cannot use the generic
