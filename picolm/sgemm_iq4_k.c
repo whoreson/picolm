@@ -281,12 +281,19 @@ void vec_dot_iq4_k_r4_q8_k_avx2(const void *vx, const void *wy, int n,
             __m256i s2 = _mm256_sign_epi8(q2, q2);
             __m256i s3 = _mm256_sign_epi8(q3, q3);
 
+#ifdef __AVX512VNNI__
+            __m256i sumi = _mm256_dpbusd_epi32(_mm256_setzero_si256(), s0, _mm256_sign_epi8(y00, q0));
+            sumi = _mm256_dpbusd_epi32(sumi, s1, _mm256_sign_epi8(y55, q1));
+            sumi = _mm256_dpbusd_epi32(sumi, s2, _mm256_sign_epi8(yaa, q2));
+            sumi = _mm256_dpbusd_epi32(sumi, s3, _mm256_sign_epi8(yff, q3));
+#else
             __m256i t0 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s0, _mm256_sign_epi8(y00, q0)));
             __m256i t1 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s1, _mm256_sign_epi8(y55, q1)));
             __m256i t2 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s2, _mm256_sign_epi8(yaa, q2)));
             __m256i t3 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s3, _mm256_sign_epi8(yff, q3)));
-
             __m256i sumi = _mm256_add_epi32(_mm256_add_epi32(t0, t1), _mm256_add_epi32(t2, t3));
+#endif
+
             isum = _mm256_add_epi32(isum, _mm256_mullo_epi32(scales_i32, sumi));
         }
 
@@ -472,11 +479,18 @@ int sgemm_iq4_k_r4_q8_k_avx2(int nrows, int ncols, int k,
                 __m256i y55 = _mm256_shuffle_epi32(y_reg, 0x55);
                 __m256i yaa = _mm256_shuffle_epi32(y_reg, 0xaa);
                 __m256i yff = _mm256_shuffle_epi32(y_reg, 0xff);
+#ifdef __AVX512VNNI__
+                __m256i sumi = _mm256_dpbusd_epi32(_mm256_setzero_si256(), s0, _mm256_sign_epi8(y00, q0));
+                sumi = _mm256_dpbusd_epi32(sumi, s1, _mm256_sign_epi8(y55, q1));
+                sumi = _mm256_dpbusd_epi32(sumi, s2, _mm256_sign_epi8(yaa, q2));
+                sumi = _mm256_dpbusd_epi32(sumi, s3, _mm256_sign_epi8(yff, q3));
+#else
                 __m256i t0 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s0, _mm256_sign_epi8(y00, q0)));
                 __m256i t1 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s1, _mm256_sign_epi8(y55, q1)));
                 __m256i t2 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s2, _mm256_sign_epi8(yaa, q2)));
                 __m256i t3 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s3, _mm256_sign_epi8(yff, q3)));
                 __m256i sumi = _mm256_add_epi32(_mm256_add_epi32(t0, t1), _mm256_add_epi32(t2, t3));
+#endif
                 isum_c0 = _mm256_add_epi32(isum_c0, _mm256_mullo_epi32(scales_i32, sumi));
 
                 if (ncols_tile > 1) {
@@ -486,11 +500,18 @@ int sgemm_iq4_k_r4_q8_k_avx2(int nrows, int ncols, int k,
                     __m256i y51 = _mm256_shuffle_epi32(y_reg1, 0x55);
                     __m256i ya1 = _mm256_shuffle_epi32(y_reg1, 0xaa);
                     __m256i yf1 = _mm256_shuffle_epi32(y_reg1, 0xff);
+#ifdef __AVX512VNNI__
+                    __m256i sumi1 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), s0, _mm256_sign_epi8(y01, q0));
+                    sumi1 = _mm256_dpbusd_epi32(sumi1, s1, _mm256_sign_epi8(y51, q1));
+                    sumi1 = _mm256_dpbusd_epi32(sumi1, s2, _mm256_sign_epi8(ya1, q2));
+                    sumi1 = _mm256_dpbusd_epi32(sumi1, s3, _mm256_sign_epi8(yf1, q3));
+#else
                     __m256i u0 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s0, _mm256_sign_epi8(y01, q0)));
                     __m256i u1 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s1, _mm256_sign_epi8(y51, q1)));
                     __m256i u2 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s2, _mm256_sign_epi8(ya1, q2)));
                     __m256i u3 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s3, _mm256_sign_epi8(yf1, q3)));
                     __m256i sumi1 = _mm256_add_epi32(_mm256_add_epi32(u0, u1), _mm256_add_epi32(u2, u3));
+#endif
                     isum_c1 = _mm256_add_epi32(isum_c1, _mm256_mullo_epi32(scales_i32, sumi1));
                 }
                 if (ncols_tile > 2) {
@@ -500,11 +521,18 @@ int sgemm_iq4_k_r4_q8_k_avx2(int nrows, int ncols, int k,
                     __m256i y52 = _mm256_shuffle_epi32(y_reg2, 0x55);
                     __m256i ya2 = _mm256_shuffle_epi32(y_reg2, 0xaa);
                     __m256i yf2 = _mm256_shuffle_epi32(y_reg2, 0xff);
+#ifdef __AVX512VNNI__
+                    __m256i sumi2 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), s0, _mm256_sign_epi8(y02, q0));
+                    sumi2 = _mm256_dpbusd_epi32(sumi2, s1, _mm256_sign_epi8(y52, q1));
+                    sumi2 = _mm256_dpbusd_epi32(sumi2, s2, _mm256_sign_epi8(ya2, q2));
+                    sumi2 = _mm256_dpbusd_epi32(sumi2, s3, _mm256_sign_epi8(yf2, q3));
+#else
                     __m256i w0 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s0, _mm256_sign_epi8(y02, q0)));
                     __m256i w1 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s1, _mm256_sign_epi8(y52, q1)));
                     __m256i w2 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s2, _mm256_sign_epi8(ya2, q2)));
                     __m256i w3 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s3, _mm256_sign_epi8(yf2, q3)));
                     __m256i sumi2 = _mm256_add_epi32(_mm256_add_epi32(w0, w1), _mm256_add_epi32(w2, w3));
+#endif
                     isum_c2 = _mm256_add_epi32(isum_c2, _mm256_mullo_epi32(scales_i32, sumi2));
                 }
                 if (ncols_tile > 3) {
@@ -514,11 +542,18 @@ int sgemm_iq4_k_r4_q8_k_avx2(int nrows, int ncols, int k,
                     __m256i y53 = _mm256_shuffle_epi32(y_reg3, 0x55);
                     __m256i ya3 = _mm256_shuffle_epi32(y_reg3, 0xaa);
                     __m256i yf3 = _mm256_shuffle_epi32(y_reg3, 0xff);
+#ifdef __AVX512VNNI__
+                    __m256i sumi3 = _mm256_dpbusd_epi32(_mm256_setzero_si256(), s0, _mm256_sign_epi8(y03, q0));
+                    sumi3 = _mm256_dpbusd_epi32(sumi3, s1, _mm256_sign_epi8(y53, q1));
+                    sumi3 = _mm256_dpbusd_epi32(sumi3, s2, _mm256_sign_epi8(ya3, q2));
+                    sumi3 = _mm256_dpbusd_epi32(sumi3, s3, _mm256_sign_epi8(yf3, q3));
+#else
                     __m256i x0 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s0, _mm256_sign_epi8(y03, q0)));
                     __m256i x1 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s1, _mm256_sign_epi8(y53, q1)));
                     __m256i x2 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s2, _mm256_sign_epi8(ya3, q2)));
                     __m256i x3 = _mm256_madd_epi16(m16, _mm256_maddubs_epi16(s3, _mm256_sign_epi8(yf3, q3)));
                     __m256i sumi3 = _mm256_add_epi32(_mm256_add_epi32(x0, x1), _mm256_add_epi32(x2, x3));
+#endif
                     isum_c3 = _mm256_add_epi32(isum_c3, _mm256_mullo_epi32(scales_i32, sumi3));
                 }
             }

@@ -5964,9 +5964,37 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
     if ((is_r4_dual_type(qtype1) || is_r4_dual_type(qtype2)) && n_batch > 0 && n > 0) {
         size_t q8_rb = (size_t)(n / 256) * sizeof(block_q8_K);
         void *qbuf = malloc((size_t)n_batch * q8_rb);
+        /* Non-R4 side may benefit from Q8_0 quantized activations + tiled GEMM
+         * (picolm_sgemm_d). Allocate those buffers when at least one side is
+         * a supported non-R4 type (Q8_0, Q4_0, Q5_0, IQ4_NL). */
+        int need_q8_0 = 0;
+        gguf_type_t nonr4_type = 0;
+        {
+            gguf_type_t t1 = is_r4_dual_type(qtype1) ? qtype2 : qtype1;
+            if (t1 == GGUF_TYPE_Q8_0 || t1 == GGUF_TYPE_Q4_0 ||
+                t1 == GGUF_TYPE_Q5_0 || t1 == GGUF_TYPE_IQ4_NL) {
+                need_q8_0 = 1;
+                nonr4_type = t1;
+            }
+        }
+        size_t q8_0_rb = need_q8_0 ? gguf_type_row_size(GGUF_TYPE_Q8_0, n) : 0;
+        int q8_0_nb = need_q8_0 ? (n / 32) : 0;
+        void *qbuf0 = NULL;
+        float *dbuf0 = NULL;
+        if (qbuf && need_q8_0) {
+            qbuf0 = malloc((size_t)n_batch * q8_0_rb);
+            dbuf0 = (float *)malloc((size_t)n_batch * q8_0_nb * sizeof(float));
+            if (!qbuf0 || !dbuf0) { free(qbuf0); free(dbuf0); qbuf0 = NULL; dbuf0 = NULL; need_q8_0 = 0; }
+        }
         if (qbuf) {
-            for (int b = 0; b < n_batch; b++)
+            for (int b = 0; b < n_batch; b++) {
                 quantize_row_q8_K(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
+                if (need_q8_0) {
+                    quantize_row_q8_0(x + (size_t)b * n, (char *)qbuf0 + (size_t)b * q8_0_rb, n);
+                    const block_q8_0 *blk = (const block_q8_0 *)((char *)qbuf0 + (size_t)b * q8_0_rb);
+                    for (int k = 0; k < q8_0_nb; k++) dbuf0[(size_t)b * q8_0_nb + k] = fp16_to_fp32(blk[k].d);
+                }
+            }
             /* Threaded: parallelize over output row groups (d/4 groups),
              * each group processing all n_batch tokens. This keeps the
              * weight blocks hot in cache across batch tokens (same access
@@ -5979,8 +6007,41 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                 if (!done2 && is_r4_dual_type(qtype2))
                     done2 = r4_dual_side_threaded(out2, W2, qtype2, qbuf, n, d, n_batch);
             }
-            /* Serial fallback for non-R4 sides, threaded-failure sides,
-             * or single-token/single-thread cases. */
+            /* Non-R4 side: use picolm_sgemm_d (tiled GEMM with Q8_0 activations)
+             * when supported. This avoids the scalar vec_dot fallback which
+             * is extremely slow for large matrices (e.g. IQ4_NL x F32). */
+            if (need_q8_0 && !picolm_sgemm_disabled_tensor()) {
+                if (!done1 && !is_r4_dual_type(qtype1) && qtype1 == nonr4_type) {
+                    int k_blocks = n / 32;
+                    int nth = pool_total_threads(1);
+                    qgemm_d_ctx_t ctx = {
+                        .m = d, .n = n_batch, .k_blocks = k_blocks,
+                        .A = W1, .lda = k_blocks,
+                        .B = (const block_q8_0*)qbuf0, .ldb = k_blocks,
+                        .B_d = dbuf0, .ldb_d = k_blocks,
+                        .C = out1, .ldc = d,
+                        .Atype = qtype1, .nth = nth,
+                    };
+                    tensor_parallel_for(nth, qgemm_d_task, &ctx);
+                    done1 = 1;
+                }
+                if (!done2 && !is_r4_dual_type(qtype2) && qtype2 == nonr4_type) {
+                    int k_blocks = n / 32;
+                    int nth = pool_total_threads(1);
+                    qgemm_d_ctx_t ctx = {
+                        .m = d, .n = n_batch, .k_blocks = k_blocks,
+                        .A = W2, .lda = k_blocks,
+                        .B = (const block_q8_0*)qbuf0, .ldb = k_blocks,
+                        .B_d = dbuf0, .ldb_d = k_blocks,
+                        .C = out2, .ldc = d,
+                        .Atype = qtype2, .nth = nth,
+                    };
+                    tensor_parallel_for(nth, qgemm_d_task, &ctx);
+                    done2 = 1;
+                }
+            }
+            /* Serial fallback for non-R4 sides that didn't get the GEMM path,
+             * threaded-failure sides, or single-token/single-thread cases. */
             if (!done1 || !done2) {
                 for (int b = 0; b < n_batch; b++) {
                     const block_q8_K *qx = (const block_q8_K *)((char *)qbuf + (size_t)b * q8_rb);
@@ -6001,9 +6062,13 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                 }
             }
             free(qbuf);
+            free(qbuf0);
+            free(dbuf0);
         DISPATCH2("R4_generic_dual_threaded");
             return;
         }
+        free(qbuf0);
+        free(dbuf0);
     }
 #endif
 
