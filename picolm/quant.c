@@ -9199,13 +9199,13 @@ void dequantize_row_q4_k_r4_single(const block_q4_k_r4 *x, float *dst, int n, in
             float ml = m * ((x[ibl].scales_l[is] >> 4) |
                             ((x[ibl].scales_h[is % 16] >> (4 * (is / 16))) & 0x0c) << 2);
             for (int i = 0; i < 4; ++i) {
-                dst[QK_K * ibl + 32 * ib + i +  0] = dl * x[ibl].qs[64 * ib + 4 * row + i +  0] - ml;
+                dst[QK_K * ibl + 32 * ib + i +  0] = dl * (x[ibl].qs[64 * ib + 4 * row + i +  0] & 0xf) - ml;
                 dst[QK_K * ibl + 32 * ib + i +  8] = dl * (x[ibl].qs[64 * ib + 4 * row + i +  0] >> 4) - ml;
-                dst[QK_K * ibl + 32 * ib + i + 16] = dl * x[ibl].qs[64 * ib + 4 * row + i + 16] - ml;
+                dst[QK_K * ibl + 32 * ib + i + 16] = dl * (x[ibl].qs[64 * ib + 4 * row + i + 16] & 0xf) - ml;
                 dst[QK_K * ibl + 32 * ib + i + 24] = dl * (x[ibl].qs[64 * ib + 4 * row + i + 16] >> 4) - ml;
-                dst[QK_K * ibl + 32 * ib + i +  4] = dl * x[ibl].qs[64 * ib + 4 * row + i + 32] - ml;
+                dst[QK_K * ibl + 32 * ib + i +  4] = dl * (x[ibl].qs[64 * ib + 4 * row + i + 32] & 0xf) - ml;
                 dst[QK_K * ibl + 32 * ib + i + 12] = dl * (x[ibl].qs[64 * ib + 4 * row + i + 32] >> 4) - ml;
-                dst[QK_K * ibl + 32 * ib + i + 20] = dl * x[ibl].qs[64 * ib + 4 * row + i + 48] - ml;
+                dst[QK_K * ibl + 32 * ib + i + 20] = dl * (x[ibl].qs[64 * ib + 4 * row + i + 48] & 0xf) - ml;
                 dst[QK_K * ibl + 32 * ib + i + 28] = dl * (x[ibl].qs[64 * ib + 4 * row + i + 48] >> 4) - ml;
             }
         }
@@ -9245,13 +9245,13 @@ float vec_dot_q4_k_r4_q8_k(const void *vx, const void *vy, int n) {
             bsum += ml * (y[ibl].bsums[ib * 2 + 0] + y[ibl].bsums[ib * 2 + 1]);
 
             for (int i = 0; i < 4; ++i) {
-                sumi += dl * x[ibl].qs[64 * ib + i +  0] * q8[i +  0];
+                sumi += dl * (x[ibl].qs[64 * ib + i +  0] & 0xf) * q8[i +  0];
                 sumi += dl * (x[ibl].qs[64 * ib + i +  0] >> 4) * q8[i +  8];
-                sumi += dl * x[ibl].qs[64 * ib + i + 16] * q8[i + 16];
+                sumi += dl * (x[ibl].qs[64 * ib + i + 16] & 0xf) * q8[i + 16];
                 sumi += dl * (x[ibl].qs[64 * ib + i + 16] >> 4) * q8[i + 24];
-                sumi += dl * x[ibl].qs[64 * ib + i + 32] * q8[i +  4];
+                sumi += dl * (x[ibl].qs[64 * ib + i + 32] & 0xf) * q8[i +  4];
                 sumi += dl * (x[ibl].qs[64 * ib + i + 32] >> 4) * q8[i + 12];
-                sumi += dl * x[ibl].qs[64 * ib + i + 48] * q8[i + 20];
+                sumi += dl * (x[ibl].qs[64 * ib + i + 48] & 0xf) * q8[i + 20];
                 sumi += dl * (x[ibl].qs[64 * ib + i + 48] >> 4) * q8[i + 28];
             }
             q8 += 32;
@@ -9293,13 +9293,13 @@ void vec_dot_q4_k_r4_q8_k_batch4(const void *vx, const void *vy, int n, float *o
                 bsum[k] += ml * (q->bsums[ib * 2 + 0] + q->bsums[ib * 2 + 1]);
 
                 for (int i = 0; i < 4; ++i) {
-                    sumi[k] += dl * b->qs[64 * ib + 4 * k + i +  0] * q8[i +  0];
+                    sumi[k] += dl * (b->qs[64 * ib + 4 * k + i +  0] & 0xf) * q8[i +  0];
                     sumi[k] += dl * (b->qs[64 * ib + 4 * k + i +  0] >> 4) * q8[i +  8];
-                    sumi[k] += dl * b->qs[64 * ib + 4 * k + i + 16] * q8[i + 16];
+                    sumi[k] += dl * (b->qs[64 * ib + 4 * k + i + 16] & 0xf) * q8[i + 16];
                     sumi[k] += dl * (b->qs[64 * ib + 4 * k + i + 16] >> 4) * q8[i + 24];
-                    sumi[k] += dl * b->qs[64 * ib + 4 * k + i + 32] * q8[i +  4];
+                    sumi[k] += dl * (b->qs[64 * ib + 4 * k + i + 32] & 0xf) * q8[i +  4];
                     sumi[k] += dl * (b->qs[64 * ib + 4 * k + i + 32] >> 4) * q8[i + 12];
-                    sumi[k] += dl * b->qs[64 * ib + 4 * k + i + 48] * q8[i + 20];
+                    sumi[k] += dl * (b->qs[64 * ib + 4 * k + i + 48] & 0xf) * q8[i + 20];
                     sumi[k] += dl * (b->qs[64 * ib + 4 * k + i + 48] >> 4) * q8[i + 28];
                 }
             }
