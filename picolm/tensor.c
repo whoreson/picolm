@@ -6043,6 +6043,20 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
             /* Serial fallback for non-R4 sides that didn't get the GEMM path,
              * threaded-failure sides, or single-token/single-thread cases. */
             if (!done1 || !done2) {
+                /* Warn once per non-R4 type that falls through to scalar vec_dot
+                 * in the R4 dual-batch path. This is slow because it uses F32
+                 * activations and no SIMD GEMM. If you see this, add the type to
+                 * the need_q8_0 check above and ensure picolm_sgemm_d() supports it. */
+                if (!done1 && !is_r4_dual_type(qtype1)) {
+                    static int warned1;
+                    if (!warned1) { warned1 = 1;
+                        fprintf(stderr, "WARN: matmul_dual_batch non-R4 side1 qtype=%d uses scalar vec_dot (slow). "
+                                "Add to picolm_sgemm_d + R4 dual GEMM path.\n", qtype1); } }
+                if (!done2 && !is_r4_dual_type(qtype2)) {
+                    static int warned2;
+                    if (!warned2) { warned2 = 1;
+                        fprintf(stderr, "WARN: matmul_dual_batch non-R4 side2 qtype=%d uses scalar vec_dot (slow). "
+                                "Add to picolm_sgemm_d + R4 dual GEMM path.\n", qtype2); } }
                 for (int b = 0; b < n_batch; b++) {
                     const block_q8_K *qx = (const block_q8_K *)((char *)qbuf + (size_t)b * q8_rb);
                     if (is_r4_dual_type(qtype1) && !done1) {
