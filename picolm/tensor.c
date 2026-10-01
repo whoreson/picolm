@@ -921,12 +921,19 @@ static void matmul_worker_f(matmul_task_t *t) {
                 }
             }
         } else if (t->qtype == GGUF_TYPE_IQ6_K && t->x) {
-            /* IQ6_K plain: single-row blocks with Q8_K activations. */
+            /* IQ6_K plain: single-row blocks with Q8_K activations.
+             * Weight row outer, activation rows in tiles: each weight block
+             * is decoded once per tile instead of once per activation row. */
+            const size_t q8k_rb = gguf_type_row_size(GGUF_TYPE_Q8_K, t->n);
             for (int i = t->start; i < t->end; i++) {
                 const char *wrow = (const char *)t->W + (size_t)i * t->row_bytes;
-                for (int b = 0; b < nb; b++) {
-                    const char *xb = (const char *)t->x + (size_t)b * gguf_type_row_size(GGUF_TYPE_Q8_K, t->n);
-                    t->out[b * out_stride + i] = vec_dot_iq6_k_q8_k(wrow, xb, t->n);
+                for (int b = 0; b < nb; b += IQ6K_BATCH_TILE) {
+                    const int nc = (nb - b) < IQ6K_BATCH_TILE ? (nb - b) : IQ6K_BATCH_TILE;
+                    float r[IQ6K_BATCH_TILE];
+                    vec_dot_iq6_k_q8_k_batch(wrow, (const char *)t->x + (size_t)b * q8k_rb,
+                                             q8k_rb, t->n, nc, r);
+                    for (int c = 0; c < nc; c++)
+                        t->out[(size_t)(b + c) * out_stride + i] = r[c];
                 }
             }
         } else if (t->qtype == GGUF_TYPE_IQ4_K_R4 && t->x) {
@@ -4806,21 +4813,27 @@ void matmul_batch(float *out, const float *x, int n_batch,
     }
 #endif
 
-    /* IQ6_K plain batch: quantize activations to Q8_K, dispatch vec_dot. */
+    /* IQ6_K plain batch: quantize activations to Q8_K, dispatch batch vec_dot.
+     * Weight-row outer loop: decode each weight block once per tile of activations. */
     if (qtype == GGUF_TYPE_IQ6_K && n_batch > 0 && n > 0) {
         size_t q8_rb = (size_t)(n / 256) * sizeof(block_q8_K);
         void *qbuf = malloc((size_t)n_batch * q8_rb);
         if (qbuf) {
             for (int b = 0; b < n_batch; b++)
                 quantize_row_q8_K(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
-            for (int b = 0; b < n_batch; b++) {
-                const block_q8_K *qx = (const block_q8_K *)((char *)qbuf + (size_t)b * q8_rb);
-                for (int i = 0; i < d; i++) {
-                    out[b * d + i] = vec_dot_iq6_k_q8_k((const char *)W + i * row_bytes, qx, n);
+            for (int i = 0; i < d; i++) {
+                const char *wrow = (const char *)W + (size_t)i * row_bytes;
+                for (int b = 0; b < n_batch; b += IQ6K_BATCH_TILE) {
+                    const int nc = (n_batch - b) < IQ6K_BATCH_TILE ? (n_batch - b) : IQ6K_BATCH_TILE;
+                    float r[IQ6K_BATCH_TILE];
+                    vec_dot_iq6_k_q8_k_batch(wrow, (char *)qbuf + (size_t)b * q8_rb,
+                                             q8_rb, n, nc, r);
+                    for (int c = 0; c < nc; c++)
+                        out[(size_t)(b + c) * d + i] = r[c];
                 }
             }
             free(qbuf);
-        DISPATCH("IQ6_K_vec_dot");
+        DISPATCH("IQ6_K_vec_dot_batch");
             return;
         }
     }

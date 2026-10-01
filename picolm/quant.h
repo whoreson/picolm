@@ -1250,9 +1250,17 @@ void vec_dot_iq4_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out);
 float vec_dot_iq4_k_q8_k(const void *vx, const void *wy, int n);
 /* IQ6_K plain (GGUF type 141): 6-bit non-linear quant, 212-byte blocks. */
 void dequantize_row_iq6_k(const void *src, float *dst, int n);
+/* Max activation rows decoded-weight reuse covers per kernel call. */
+#define IQ6K_BATCH_TILE 4
+/* One IQ6_K weight row x ncols Q8_K activation rows (row c at wy + c*y_stride bytes).
+ * Decodes each weight block once. ncols may exceed IQ6K_BATCH_TILE. */
 void vec_dot_iq6_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out);
+void vec_dot_iq6_k_q8_k_avx2_batch(const void *vx, const void *wy, size_t y_stride,
+                                   int n, int ncols, float *out);
 void vec_dot_iq6_k_q8_k_vnni(const void *vx, const void *wy, int n, float *out);
 float vec_dot_iq6_k_q8_k(const void *vx, const void *wy, int n);
+void vec_dot_iq6_k_q8_k_batch(const void *vx, const void *wy, size_t y_stride,
+                              int n, int ncols, float *out);
 /* IQ4_K_R4 x Q8_K scalar vec_dot (row 0 only). */
 float vec_dot_iq4_k_r4_q8_k(const void *vx, const void *wy, int n);
 /* IQ4_K_R4 x Q8_K AVX2 GEMV: 4 weight rows x 1 activation row.

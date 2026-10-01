@@ -7028,12 +7028,14 @@ case GGUF_TYPE_Q4_0_R8: {
             return result;
         }
         case GGUF_TYPE_IQ6_K: {
-            /* IQ6_K plain: fallback dequantize, then f32 dot. */
-            float *iq6_tmp = (float *)malloc((size_t)n * sizeof(float));
-            if (!iq6_tmp) return 0.0f;
-            dequantize_row_iq6_k(src, iq6_tmp, n);
-            float r = vec_dot_f32_f32(iq6_tmp, x, n);
-            free(iq6_tmp);
+            /* IQ6_K plain: fallback dequantize per block on the stack, then f32 dot. */
+            float iq6_tmp[QK_K];
+            float r = 0.0f;
+            for (int off = 0; off + QK_K <= n; off += QK_K) {
+                dequantize_row_iq6_k((const char *)src + (size_t)(off / QK_K) * sizeof(block_iq6_k),
+                                     iq6_tmp, QK_K);
+                r += vec_dot_f32_f32(iq6_tmp, x + off, QK_K);
+            }
             return r;
         }
         case GGUF_TYPE_IQ4_K_R4: {
@@ -8965,7 +8967,7 @@ float vec_dot_iq6_k_q8_k(const void *vx, const void *wy, int n) {
     float result;
     vec_dot_iq6_k_q8_k_vnni(vx, wy, n, &result);
     return result;
-#elif defined(PICOLM_AVX2) && !defined(PICOLM_FORCE_SCALAR)
+#elif defined(PICOLM_AVX2) && defined(__AVX2__) && !defined(PICOLM_FORCE_SCALAR)
     float result;
     vec_dot_iq6_k_q8_k_avx2(vx, wy, n, &result);
     return result;
@@ -9016,6 +9018,18 @@ float vec_dot_iq6_k_q8_k(const void *vx, const void *wy, int n) {
         }
     }
     return sumf;
+#endif
+}
+
+/* IQ6_K x Q8_K, one weight row against ncols activation rows.
+ * Activation row c starts at (const char *)wy + c * y_stride bytes. */
+void vec_dot_iq6_k_q8_k_batch(const void *vx, const void *wy, size_t y_stride,
+                              int n, int ncols, float *out) {
+#if defined(PICOLM_AVX2) && defined(__AVX2__) && !defined(PICOLM_FORCE_SCALAR)
+    vec_dot_iq6_k_q8_k_avx2_batch(vx, wy, y_stride, n, ncols, out);
+#else
+    for (int c = 0; c < ncols; c++)
+        out[c] = vec_dot_iq6_k_q8_k(vx, (const char *)wy + (size_t)c * y_stride, n);
 #endif
 }
 
