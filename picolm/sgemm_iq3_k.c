@@ -74,89 +74,55 @@ static inline __m256i iq3_lut(void) {
 static inline void iq3_decode_block(const block_iq3_k *x, __m256i lut,
                                     __m256i w[8], __m256i sp[8]) {
     const __m256i m3    = _mm256_set1_epi8(3);
+    const __m256i four  = _mm256_set1_epi8(4);
     const __m256i eight = _mm256_set1_epi8(8);
     const __m256i ex    = _mm256_set1_epi16((short)x->extra);
     const __m256i ctrl  = _mm256_setr_epi8(
         0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,
         2,3,2,3,2,3,2,3,2,3,2,3,2,3,2,3);
 
-    /* scales: magnitude (2*mag+1) * sign from scales_h.
-     * scales_l: 8 bytes, 2 nibbles per byte (16 nibbles total).
-     * scales_h: 16 bits, 2 bits per subblock pair (sign for lo/hi). */
-    const __m128i s8  = _mm_loadl_epi64((const __m128i *)x->scales_l);
-    const __m128i lo4 = _mm_and_si128(s8, _mm_set1_epi8(0x0f));
-    const __m128i hi4 = _mm_and_si128(_mm_srli_epi16(s8, 4), _mm_set1_epi8(0x0f));
-    const __m128i mag  = _mm_add_epi8(_mm_unpacklo_epi8(lo4, hi4), _mm_set1_epi8(1));
-    /* mag is now 2*mag+1 for each of the 16 scale groups. */
+    /* Scales: group g (16 values) = (2*nibble_g + 1) * (bit g of scales_h ? -1 : 1).
+     * scales_l byte i: low nibble = group 2i, high nibble = group 2i+1. */
+    const __m128i s8   = _mm_loadl_epi64((const __m128i *)x->scales_l);
+    const __m128i lo4  = _mm_and_si128(s8, _mm_set1_epi8(0x0f));
+    const __m128i hi4  = _mm_and_si128(_mm_srli_epi16(s8, 4), _mm_set1_epi8(0x0f));
+    const __m128i nib  = _mm_unpacklo_epi8(lo4, hi4);                              /* nibble per group */
+    const __m128i mag8 = _mm_add_epi8(_mm_add_epi8(nib, nib), _mm_set1_epi8(1));   /* 2*nibble+1 (<= 31) */
+    const __m256i bits = _mm256_setr_epi16(1, 2, 4, 8, 16, 32, 64, 128,
+                                           256, 512, 1024, 2048, 4096, 8192, 16384, (short)0x8000);
+    const __m256i shv  = _mm256_set1_epi16((short)x->scales_h);
+    const __m256i neg  = _mm256_cmpeq_epi16(_mm256_and_si256(shv, bits), bits);   /* -1 where negative */
+    const __m256i sc16 = _mm256_sign_epi16(_mm256_cvtepu8_epi16(mag8),
+                                           _mm256_or_si256(neg, _mm256_set1_epi16(1)));
 
-    /* Extract sign bits from scales_h (16 bits, 2 per subblock pair).
-     * Bit 0 = sign for group 0, bit 1 = sign for group 1, etc.
-     * sign = 1 when bit set (meaning negative), so we want -1 or +1.
-     * Build int8 vector with sign values, then multiply with magnitude. */
-    const uint16_t sh = x->scales_h;
-    int8_t sg[16];
-    uint16_t sh_tmp = sh;
-    for (int i = 0; i < 8; i++) {
-        sg[2 * i]     = (sh_tmp & 1) ? -1 : 1;
-        sg[2 * i + 1] = (sh_tmp & 2) ? -1 : 1;
-        sh_tmp >>= 2;
-    }
-    const __m128i sg_vec = _mm_loadu_si128((const __m128i *)sg);
-    /* sc16 = mag * sign, as int16. Each entry: (2*nibble+1) * (sign from scales_h). */
-    /* Element-wise multiply: mag[k] * sign[k] for each of the 16 scale groups.
-     * Store mag to array, multiply by sign, load as int16 vector. */
-    int8_t mag_arr[16];
-    _mm_store_si128((__m128i *)mag_arr, mag);
-    int16_t sc_arr[16];
-    for (int k = 0; k < 16; k++)
-        sc_arr[k] = (int16_t)mag_arr[k] * sg[k];
-    const __m256i sc16 = _mm256_loadu_si256((const __m256i *)sc_arr);
-
-    /* qh: 32 bytes total. First 16 bytes for values 0..15, next 16 for 16..31.
-     * Each byte has 8 high bits, one per subblock.
-     * qh[j] -> bit ib32 for value j in subblock ib32. */
-    const __m128i qh0 = _mm_loadu_si128((const __m128i *)x->qh);
-    const __m128i qh1 = _mm_loadu_si128((const __m128i *)(x->qh + 16));
-    const __m256i qh_lo = _mm256_broadcastsi128_si256(qh0); /* lane0=qh0, lane1=qh0 */
-    const __m256i qh_hi = _mm256_broadcastsi128_si256(qh1); /* lane0=qh1, lane1=qh1 */
+    /* qh: byte j holds the high bit of value j for each of the 8 sub-blocks
+     * (bit i = sub-block i). One 32-byte load: lane 0 = qh[0..15] (values 0..15),
+     * lane 1 = qh[16..31] (values 16..31), the same layout as qs. */
+    const __m256i qh = _mm256_loadu_si256((const __m256i *)x->qh);
 
     for (int i = 0; i < 8; ++i) {
-        /* Load 32 qs bytes as one 256-bit register.
-         * qs layout: 64 bytes total, 32 bytes per 32-value chunk.
-         * ib32 0-3 use qs[0..31], ib32 4-7 use qs[32..63].
-         * Within the 32 bytes: first 16 = values 0..15, next 16 = values 16..31.
-         * shift_l = 2*(i&3) extracts the 2-bit index. */
         const __m256i qs = _mm256_loadu_si256((const __m256i *)(x->qs + 32 * (i >> 2)));
         const __m256i ql = _mm256_and_si256(
             _mm256_srl_epi16(qs, _mm_cvtsi32_si128(2 * (i & 3))), m3);
 
-        /* Extract high bit from qh. qh_lo for values 0..15, qh_hi for 16..31.
-         * Blend: lane 0 = qh_lo (values 0..15), lane 1 = qh_hi (values 16..31).
-         * _mm256_blend_epi16(a, b, mask): bits=0 -> a, bits=1 -> b.
-         * mask=0xFF takes lane1 from qh_hi, lane0 from qh_lo. */
-        const __m256i qh = _mm256_blend_epi16(qh_lo, qh_hi, 0xFF);
-        const __m256i qh_bit = _mm256_and_si256(
-            _mm256_srl_epi16(qh, _mm_cvtsi32_si128(i)), m3);
-        const __m256i qh_shifted = _mm256_slli_epi16(qh_bit, 2);
+        /* qh bit i -> bit 2 of the index; one shift, then keep only bit 2.
+         * (shift distance <= 5, so nothing crosses a byte boundary into bit 2) */
+        const __m256i qhs = (i <= 2) ? _mm256_sll_epi16(qh, _mm_cvtsi32_si128(2 - i))
+                                     : _mm256_srl_epi16(qh, _mm_cvtsi32_si128(i - 2));
+        const __m256i qh4 = _mm256_and_si256(qhs, four);
 
-        /* 3-bit index = ql[0..1] | qh_bit[2] */
-        const __m256i idx = _mm256_or_si256(ql, qh_shifted);
-
-        /* extra bit selection: bit 2i for lane 0 (values 0..15),
-         * bit 2i+1 for lane 1 (values 16..31).
-         * If the extra bit is set, add 8 to the index (select shifted LUT). */
+        /* extra: bit 2i selects the shifted table (+8) for values 0..15,
+         * bit 2i+1 for values 16..31. */
         const __m256i bm  = _mm256_inserti128_si256(
             _mm256_set1_epi16((short)(1u << (2 * i))),
             _mm_set1_epi16((short)(1u << (2 * i + 1))), 1);
-        const __m256i sel = _mm256_cmpeq_epi16(
-            _mm256_and_si256(ex, bm), bm);
-        w[i] = _mm256_shuffle_epi8(lut,
-                _mm256_add_epi8(idx, _mm256_and_si256(sel, eight)));
+        const __m256i sel = _mm256_cmpeq_epi16(_mm256_and_si256(ex, bm), bm);
 
-        /* sp: scale vector. sc16 has 16 int16 values (one per scale group).
-         * sp[i] needs scale[2i] repeated 8 times, then scale[2i+1] repeated 8 times.
-         * ctrl = {0,1,0,1,...,2,3,2,3,...}: picks from int32[i] which contains
-         * (scale[2i], scale[2i+1]). */
+        /* index bits are disjoint: 0-1 ql, 2 qh, 3 table select */
+        const __m256i idx = _mm256_or_si256(_mm256_or_si256(ql, qh4), _mm256_and_si256(sel, eight));
+        w[i] = _mm256_shuffle_epi8(lut, idx);
+
+        /* element i of sc16 viewed as int32 = (scale[2i], scale[2i+1]) */
         sp[i] = _mm256_shuffle_epi8(
             _mm256_permutevar8x32_epi32(sc16, _mm256_set1_epi32(i)), ctrl);
     }

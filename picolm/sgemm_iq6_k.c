@@ -283,174 +283,143 @@ void vec_dot_iq6_k_q8_k_avx2_batch(const void *vx, const void *wy, size_t y_stri
  * dpbusd is unsigned-signed: lut (uint8, 1..249) * y (int8, -128..127).
  * This is exactly what we need since lut values are positive.
  * ================================================================ */
-#if defined(PICOLM_IQ6K_VNNI)
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
 
-typedef struct {
-    __m512i l0, l1, l2, l3;                 /* unsigned LUT quarters, in all 4 lanes */
-    __m512i m0f;
-    __m512i cnt0e, cnt1e, cnt0o, cnt1o;     /* sllv counts: words 0-15 (lo nibbles) | 16-31 (hi nibbles) */
-    __m512i sidx[4];                        /* permutexvar indices: lane l <- group 4k + l/4 */
-    __m256i bit16;                          /* 1 << g, g = 0..15 */
-} iq6v_ctx_t;
+typedef struct { __m256i l0, l1, l2, l3; } iq6_luts_vnni_t;
 
-typedef struct {
-    __m512i uw[4];      /* unsigned weights, values 64k .. 64k+63 */
-    __m512  scf[4];     /* float scale per dpbusd lane */
-    __m256i scc;        /* int16[16]: scale_g * (128 - m_g) */
-} iq6v_blk_t;
-
-static inline __m512i iq6v_pair(int a, int b) {
-    return _mm512_inserti64x4(_mm512_castsi256_si512(_mm256_set1_epi16((short)a)),
-                              _mm256_set1_epi16((short)b), 1);
+static inline iq6_luts_vnni_t iq6_luts_vnni_init(void) {
+    iq6_luts_vnni_t L;
+    L.l0 = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(iq6nl_lut +  0)));
+    L.l1 = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(iq6nl_lut + 16)));
+    L.l2 = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(iq6nl_lut + 32)));
+    L.l3 = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)(iq6nl_lut + 48)));
+    return L;
 }
 
-static inline iq6v_ctx_t iq6v_ctx_init(void) {
-    iq6v_ctx_t C;
-    C.l0 = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *)(iq6nl_lut +  0)));
-    C.l1 = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *)(iq6nl_lut + 16)));
-    C.l2 = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *)(iq6nl_lut + 32)));
-    C.l3 = _mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i *)(iq6nl_lut + 48)));
-    C.m0f = _mm512_set1_epi8(0x0f);
-    /* even 64-block (qh bit offset 0): lo uses bits 0,1 ; hi uses bits 2,3
-     * odd  64-block (qh bit offset 4): lo uses bits 4,5 ; hi uses bits 6,7
-     * count = 7 - bit  moves that bit to bit 7 of its byte */
-    C.cnt0e = iq6v_pair(7, 5);
-    C.cnt1e = iq6v_pair(6, 4);
-    C.cnt0o = iq6v_pair(3, 1);
-    C.cnt1o = iq6v_pair(2, 0);
-    const __m512i base = _mm512_setr_epi32(0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3);
-    for (int k = 0; k < 4; ++k) C.sidx[k] = _mm512_add_epi32(base, _mm512_set1_epi32(4 * k));
-    C.bit16 = _mm256_setr_epi16(1, 2, 4, 8, 16, 32, 64, 128,
-                                256, 512, 1024, 2048, 4096, 8192, 16384, (short)0x8000);
-    return C;
+static inline __m256i iq6_lookup_vnni(__m256i low4, __m256i qh, __m128i c0, __m128i c1,
+                                      const iq6_luts_vnni_t *L) {
+    const __m256i v0 = _mm256_shuffle_epi8(L->l0, low4);
+    const __m256i v1 = _mm256_shuffle_epi8(L->l1, low4);
+    const __m256i v2 = _mm256_shuffle_epi8(L->l2, low4);
+    const __m256i v3 = _mm256_shuffle_epi8(L->l3, low4);
+    const __m256i m0 = _mm256_sll_epi16(qh, c0);
+    const __m256i m1 = _mm256_sll_epi16(qh, c1);
+    const __m256i lo = _mm256_blendv_epi8(v0, v1, m0);
+    const __m256i hi = _mm256_blendv_epi8(v2, v3, m0);
+    return _mm256_blendv_epi8(lo, hi, m1);
 }
 
-/* low4: nibbles (0..15) in value order; qh: qh bytes duplicated in both
- * 256-bit halves; cnt0/cnt1: shift counts moving q6 bit 4 / bit 5 to bit 7. */
-static inline __m512i iq6v_lookup(__m512i low4, __m512i qh, __m512i cnt0, __m512i cnt1,
-                                  const iq6v_ctx_t *C) {
-    const __m512i v0 = _mm512_shuffle_epi8(C->l0, low4);
-    const __m512i v1 = _mm512_shuffle_epi8(C->l1, low4);
-    const __m512i v2 = _mm512_shuffle_epi8(C->l2, low4);
-    const __m512i v3 = _mm512_shuffle_epi8(C->l3, low4);
-    const __mmask64 k0 = _mm512_movepi8_mask(_mm512_sllv_epi16(qh, cnt0));
-    const __mmask64 k1 = _mm512_movepi8_mask(_mm512_sllv_epi16(qh, cnt1));
-    const __m512i lo = _mm512_mask_blend_epi8(k0, v0, v1);
-    const __m512i hi = _mm512_mask_blend_epi8(k0, v2, v3);
-    return _mm512_mask_blend_epi8(k1, lo, hi);
-}
+/* Decode one block: 8 x __m256i unsigned weights. */
+static inline void iq6_decode_block_vnni(const block_iq6_k *x, const iq6_luts_vnni_t *L,
+                                          __m256i w[8]) {
+    const __m256i m0f = _mm256_set1_epi8(0x0f);
 
-static inline void iq6v_decode(const block_iq6_k *x, const iq6v_ctx_t *C, iq6v_blk_t *B) {
     for (int ih = 0; ih < 2; ++ih) {
-        const __m256i Q  = _mm256_loadu_si256((const __m256i *)(x->qh + 32 * ih));
-        const __m512i Qz = _mm512_inserti64x4(_mm512_castsi256_si512(Q), Q, 1);
-        /* X = [qs of 64-block 2ih (32 B) | qs of 64-block 2ih+1 (32 B)] */
-        const __m512i X  = _mm512_loadu_si512((const void *)(x->qs + 64 * ih));
-        const __m512i lo = _mm512_and_si512(X, C->m0f);
-        const __m512i hi = _mm512_and_si512(_mm512_srli_epi16(X, 4), C->m0f);
-        /* natural value order = [lo nibbles (32) | hi nibbles (32)] per 64-block */
-        const __m512i i0 = _mm512_shuffle_i64x2(lo, hi, 0x44);   /* lanes lo0 lo1 hi0 hi1 */
-        const __m512i i1 = _mm512_shuffle_i64x2(lo, hi, 0xEE);   /* lanes lo2 lo3 hi2 hi3 */
-        B->uw[2 * ih + 0] = iq6v_lookup(i0, Qz, C->cnt0e, C->cnt1e, C);
-        B->uw[2 * ih + 1] = iq6v_lookup(i1, Qz, C->cnt0o, C->cnt1o, C);
+        const __m256i qh = _mm256_loadu_si256((const __m256i *)(x->qh + 32 * ih));
+        for (int sh = 0; sh < 2; ++sh) {
+            const int ib = 2 * ih + sh;
+            const int s0 = 4 * sh;
+            const __m256i qs = _mm256_loadu_si256((const __m256i *)(x->qs + 32 * ib));
+            const __m256i lo = _mm256_and_si256(qs, m0f);
+            const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(qs, 4), m0f);
+
+            w[2 * ib + 0] = iq6_lookup_vnni(lo, qh, _mm_cvtsi32_si128(7 - s0), _mm_cvtsi32_si128(6 - s0), L);
+            w[2 * ib + 1] = iq6_lookup_vnni(hi, qh, _mm_cvtsi32_si128(5 - s0), _mm_cvtsi32_si128(4 - s0), L);
+        }
+    }
+}
+
+/* VNNI dot: one decoded block against one Q8_K block.
+ * Writes 16 int32 to grp (one per 16-value group), including correction. */
+static inline void iq6_block_dot_vnni(const __m256i w[8], uint16_t extra,
+                                       const block_q8_K *yb, int32_t grp[16]) {
+    const int16_t *bsums16 = yb->bsums;
+    const int8_t *q8 = yb->qs;
+
+    /* Each w[k] covers 32 values = 2 groups of 16.
+     * w[k] is 32 bytes: low 16 bytes = group 2k, high 16 bytes = group 2k+1.
+     * dpbusd on 128-bit: 16 uint8 * 16 int8 -> 4 int32.
+     * hsum of 4 int32 -> 1 int32 per group. */
+    for (int k = 0; k < 8; ++k) {
+        const __m128i w_lo = _mm256_castsi256_si128(w[k]);
+        const __m128i w_hi = _mm256_extracti128_si256(w[k], 1);
+        const __m128i y_lo = _mm_loadu_si128((const __m128i *)(q8 + 32 * k));
+        const __m128i y_hi = _mm_loadu_si128((const __m128i *)(q8 + 32 * k + 16));
+
+        __m128i dp_lo = _mm_dpbusd_epi32(_mm_setzero_si128(), w_lo, y_lo);
+        __m128i dp_hi = _mm_dpbusd_epi32(_mm_setzero_si128(), w_hi, y_hi);
+
+        /* hsum of 4 int32 -> 1 int32 */
+        __m128i h_lo = _mm_add_epi32(dp_lo, _mm_shuffle_epi32(dp_lo, 0x1B));
+        h_lo = _mm_add_epi32(h_lo, _mm_shuffle_epi32(h_lo, 0x4E));
+        __m128i h_hi = _mm_add_epi32(dp_hi, _mm_shuffle_epi32(dp_hi, 0x1B));
+        h_hi = _mm_add_epi32(h_hi, _mm_shuffle_epi32(h_hi, 0x4E));
+
+        grp[2 * k]     = _mm_cvtsi128_si32(h_lo);
+        grp[2 * k + 1] = _mm_cvtsi128_si32(h_hi);
     }
 
-    const __m128i sc8 = _mm_loadu_si128((const __m128i *)x->scales);
-    const __m512 sf = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(sc8));
-    for (int k = 0; k < 4; ++k) B->scf[k] = _mm512_permutexvar_ps(C->sidx[k], sf);
-
-    const __m256i sc16 = _mm256_cvtepi8_epi16(sc8);
-    const __m256i ex   = _mm256_set1_epi16((short)x->extra);
-    const __m256i sel  = _mm256_cmpeq_epi16(_mm256_and_si256(ex, C->bit16), C->bit16);  /* -1 if m_g */
-    B->scc = _mm256_mullo_epi16(sc16, _mm256_add_epi16(_mm256_set1_epi16(128), sel));   /* s*(128-m) */
-}
-
-/* One decoded weight block against one Q8_K block. d = weight block scale. */
-static inline void iq6v_col(const iq6v_blk_t *B, const block_q8_K *yb, float d,
-                            __m512 *facc, __m256 *fcorr) {
-    const __m512i z = _mm512_setzero_si512();
-    const __m512 f0 = _mm512_cvtepi32_ps(_mm512_dpbusd_epi32(z, B->uw[0], _mm512_loadu_si512((const void *)(yb->qs +   0))));
-    const __m512 f1 = _mm512_cvtepi32_ps(_mm512_dpbusd_epi32(z, B->uw[1], _mm512_loadu_si512((const void *)(yb->qs +  64))));
-    const __m512 f2 = _mm512_cvtepi32_ps(_mm512_dpbusd_epi32(z, B->uw[2], _mm512_loadu_si512((const void *)(yb->qs + 128))));
-    const __m512 f3 = _mm512_cvtepi32_ps(_mm512_dpbusd_epi32(z, B->uw[3], _mm512_loadu_si512((const void *)(yb->qs + 192))));
-    const __m512 t01 = _mm512_fmadd_ps(f1, B->scf[1], _mm512_mul_ps(f0, B->scf[0]));
-    const __m512 t23 = _mm512_fmadd_ps(f3, B->scf[3], _mm512_mul_ps(f2, B->scf[2]));
-    const float dd = d * yb->d;
-    *facc = _mm512_fmadd_ps(_mm512_add_ps(t01, t23), _mm512_set1_ps(dd), *facc);
-
-    const __m256i cb = _mm256_madd_epi16(B->scc, _mm256_loadu_si256((const __m256i *)yb->bsums));
-    *fcorr = _mm256_fnmadd_ps(_mm256_cvtepi32_ps(cb), _mm256_set1_ps(dd), *fcorr);
-}
-
-static inline float iq6v_finish(__m512 facc, __m256 fcorr) {
-    return _mm512_reduce_add_ps(facc) + iq6_hsum_ps(fcorr);
+    /* Apply correction: (mn[g] - 128) * bsums[g] */
+    for (int g = 0; g < 16; g++) {
+        int mn = (extra >> g) & 1;
+        grp[g] += (mn - 128) * bsums16[g];
+    }
 }
 
 void vec_dot_iq6_k_q8_k_vnni(const void *vx, const void *wy, int n, float *out) {
     const block_iq6_k *x = (const block_iq6_k *)vx;
     const block_q8_K *y = (const block_q8_K *)wy;
     const int nb = n / QK_K;
-    const iq6v_ctx_t C = iq6v_ctx_init();
+    const iq6_luts_vnni_t L = iq6_luts_vnni_init();
 
-    __m512 facc = _mm512_setzero_ps();
-    __m256 fcorr = _mm256_setzero_ps();
+    float sumf = 0.0f;
     for (int ibl = 0; ibl < nb; ++ibl) {
-        iq6v_blk_t B;
-        iq6v_decode(&x[ibl], &C, &B);
-        iq6v_col(&B, &y[ibl], iq6_f16(x[ibl].d), &facc, &fcorr);
-    }
-    *out = iq6v_finish(facc, fcorr);
-}
+        __m256i w[8];
+        iq6_decode_block_vnni(&x[ibl], &L, w);
+        int32_t grp[16];
+        iq6_block_dot_vnni(w, x[ibl].extra, &y[ibl], grp);
 
-/* NC is a compile-time constant at every call site (switch below), so the
- * column loops unroll and facc/fcorr stay in registers. */
-static inline __attribute__((always_inline))
-void iq6v_batch_n(const void *vx, const void *wy, size_t y_stride, int n, float *out, const int NC) {
-    const block_iq6_k *x = (const block_iq6_k *)vx;
-    const int nb = n / QK_K;
-    const iq6v_ctx_t C = iq6v_ctx_init();
-
-    __m512 fa[IQ6K_BATCH_TILE];
-    __m256 fc[IQ6K_BATCH_TILE];
-    for (int c = 0; c < NC; ++c) { fa[c] = _mm512_setzero_ps(); fc[c] = _mm256_setzero_ps(); }
-
-    for (int ibl = 0; ibl < nb; ++ibl) {
-        iq6v_blk_t B;
-        iq6v_decode(&x[ibl], &C, &B);
-        const float d = iq6_f16(x[ibl].d);
-        for (int c = 0; c < NC; ++c) {
-            const block_q8_K *yb = (const block_q8_K *)((const char *)wy + (size_t)c * y_stride) + ibl;
-            iq6v_col(&B, yb, d, &fa[c], &fc[c]);
+        const float dd = fp16_to_fp32(x[ibl].d) * y[ibl].d;
+        const int8_t *sl = x[ibl].scales;
+        for (int g = 0; g < 16; g++) {
+            sumf += dd * sl[g] * grp[g];
         }
     }
-    for (int c = 0; c < NC; ++c) out[c] = iq6v_finish(fa[c], fc[c]);
+    *out = sumf;
 }
 
 void vec_dot_iq6_k_q8_k_vnni_batch(const void *vx, const void *wy, size_t y_stride,
-                                   int n, int ncols, float *out) {
+                                    int n, int ncols, float *out) {
     while (ncols > IQ6K_BATCH_TILE) {
         vec_dot_iq6_k_q8_k_vnni_batch(vx, wy, y_stride, n, IQ6K_BATCH_TILE, out);
         wy = (const char *)wy + (size_t)IQ6K_BATCH_TILE * y_stride;
         out += IQ6K_BATCH_TILE;
         ncols -= IQ6K_BATCH_TILE;
     }
-    switch (ncols) {
-        case 1: iq6v_batch_n(vx, wy, y_stride, n, out, 1); break;
-        case 2: iq6v_batch_n(vx, wy, y_stride, n, out, 2); break;
-        case 3: iq6v_batch_n(vx, wy, y_stride, n, out, 3); break;
-#if IQ6K_BATCH_TILE >= 4
-        case 4: iq6v_batch_n(vx, wy, y_stride, n, out, 4); break;
-#endif
-#if IQ6K_BATCH_TILE >= 5
-        case 5: iq6v_batch_n(vx, wy, y_stride, n, out, 5); break;
-        case 6: iq6v_batch_n(vx, wy, y_stride, n, out, 6); break;
-        case 7: iq6v_batch_n(vx, wy, y_stride, n, out, 7); break;
-#endif
-#if IQ6K_BATCH_TILE >= 8
-        case 8: iq6v_batch_n(vx, wy, y_stride, n, out, 8); break;
-#endif
-        default: break;
+    if (ncols <= 0) return;
+
+    const block_iq6_k *x = (const block_iq6_k *)vx;
+    const int nb = n / QK_K;
+    const iq6_luts_vnni_t L = iq6_luts_vnni_init();
+
+    float fs[IQ6K_BATCH_TILE] = {0};
+
+    for (int ibl = 0; ibl < nb; ++ibl) {
+        __m256i w[8];
+        iq6_decode_block_vnni(&x[ibl], &L, w);
+        const float d = fp16_to_fp32(x[ibl].d);
+        const int8_t *sl = x[ibl].scales;
+        for (int c = 0; c < ncols; ++c) {
+            const block_q8_K *yb = (const block_q8_K *)((const char *)wy + (size_t)c * y_stride) + ibl;
+            int32_t grp[16];
+            iq6_block_dot_vnni(w, x[ibl].extra, yb, grp);
+            const float dd = d * yb->d;
+            for (int g = 0; g < 16; g++) {
+                fs[c] += dd * sl[g] * grp[g];
+            }
+        }
     }
+    for (int c = 0; c < ncols; ++c) out[c] = fs[c];
 }
 #endif
 
