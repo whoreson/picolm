@@ -543,7 +543,7 @@ void vec_dot_iq4_k_q8_k_neon(const void *vx, const void *wy, int n, float *out) 
         const uint8_t *qs = iq4[ibl].qs;
         const int8_t *q8 = qk[ibl].qs;
 
-        int32x4_t isum = vdupq_n_s32(0);
+        int32_t sum = 0;
         for (int ib = 0; ib < QK_K / 32; ib++) {
             int s1 = ((scales_l[ib] & 0xf) | (((scales_h[ib / 2] >> (4 * (ib % 2))) << 4) & 0x30)) - 32;
             int s2 = ((scales_l[ib] >> 4) | (((scales_h[ib / 2] >> (4 * (ib % 2))) << 2) & 0x30)) - 32;
@@ -558,29 +558,45 @@ void vec_dot_iq4_k_q8_k_neon(const void *vx, const void *wy, int n, float *out) 
             for (int i = 0; i < 16; i++) {
                 int8_t lo = values1[qs[i] & 0xf];
                 int8_t hi = values2[qs[i] >> 4];
-                int32_t acc0 = s1 * lo * q8[i];
-                int32_t acc1 = s2 * hi * q8[i + 16];
-                if (i < 4) {
-                    isum = vsetq_lane_s32(isum.v[0] + acc0, isum, 0);
-                    isum = vsetq_lane_s32(isum.v[1] + acc1, isum, 1);
-                } else if (i < 8) {
-                    isum = vsetq_lane_s32(isum.v[2] + acc0, isum, 2);
-                    isum = vsetq_lane_s32(isum.v[3] + acc1, isum, 3);
-                } else if (i < 12) {
-                    isum = vsetq_lane_s32(isum.v[0] + acc0, isum, 0);
-                    isum = vsetq_lane_s32(isum.v[1] + acc1, isum, 1);
-                } else {
-                    isum = vsetq_lane_s32(isum.v[2] + acc0, isum, 2);
-                    isum = vsetq_lane_s32(isum.v[3] + acc1, isum, 3);
-                }
+                sum += s1 * lo * q8[i];
+                sum += s2 * hi * q8[i + 16];
             }
             qs += 16;
             q8 += 32;
         }
-        int32_t total = isum.v[0] + isum.v[1] + isum.v[2] + isum.v[3];
-        result += (float)total * d * q8_scale;
+        result += (float)sum * d * q8_scale;
     }
     *out = result;
+}
+
+/* IQ4_K plain x Q8_K ARM NEON GEMM kernel.
+ * Parallel GEMM using vec_dot_iq4_k_q8_k_neon per tile. */
+int sgemm_iq4_k_q8_k_neon(int nrows, int ncols, int k,
+                           const void *vx, const void *vy,
+                           float *out, size_t bs,
+                           int ith, int nth) {
+    if (nrows < 1 || ncols < 1 || k % QK_K != 0)
+        return 0;
+
+    const size_t w_row_bytes = (size_t)(k / QK_K) * sizeof(block_iq4_k);
+    const size_t a_row_bytes = (size_t)(k / QK_K) * sizeof(block_q8_K);
+
+    int64_t tiles = (int64_t)nrows * ncols;
+    int64_t duty = (tiles + nth - 1) / nth;
+    int64_t start = duty * ith;
+    int64_t end = start + duty;
+    if (end > tiles) end = tiles;
+
+    for (int64_t t = start; t < end; t++) {
+        int i = (int)(t / ncols);
+        int j = (int)(t % ncols);
+        const void *wrow = (const char *)vx + (size_t)i * w_row_bytes;
+        const void *acol = (const char *)vy + (size_t)j * a_row_bytes;
+        float result;
+        vec_dot_iq4_k_q8_k_neon(wrow, acol, k, &result);
+        out[i + (size_t)j * bs] = result;
+    }
+    return nrows;
 }
 
 /* ================================================================

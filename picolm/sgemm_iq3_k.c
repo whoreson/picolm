@@ -258,14 +258,5 @@ int sgemm_iq3_k_q8_k_neon(int nrows, int ncols, int k,
     return sgemm_iq3_k_q8_k_avx2(nrows, ncols, k, vx, vy, out, bs, ith, nth);
 }
 
-/* R4 NEON stubs: delegate to sgemm_iq3_k_r4.c's implementation. */
-void vec_dot_iq3_k_r4_q8_k_neon(const void *vx, const void *vy, int n, float *out, int nrows) {
-    vec_dot_iq3_k_r4_q8_k_avx2(vx, vy, n, out, nrows);
-}
-
-int sgemm_iq3_k_r4_q8_k_neon(int nrows, int ncols, int k,
-                              const void *vx, const void *vy,
-                              float *out, size_t bs,
-                              int ith, int nth) {
-    return sgemm_iq3_k_r4_q8_k_avx2(nrows, ncols, k, vx, vy, out, bs, ith, nth);
-}
+/* R4 NEON stubs: sgemm_iq3_k_r4.c provides the real implementation.
+ * Avoid duplicate symbols by not defining them here. */

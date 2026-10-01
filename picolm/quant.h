@@ -1238,6 +1238,10 @@ void dequantize_row_iq4_k_r4_single(const block_iq4_k_r4 *x, float *dst, int n, 
  * out: 4 output floats. nrows must be 4. n must be multiple of 256. */
 void vec_dot_iq3_k_r4_q8_k_avx2(const void *vx, const void *wy, int n,
                                   float *out, int nrows);
+/* IQ3_K_R4 x Q8_K NEON GEMV: 4 weight rows x 1 activation row.
+ * out: 4 output floats. nrows must be 4. n must be multiple of 256. */
+void vec_dot_iq3_k_r4_q8_k_neon(const void *vx, const void *wy, int n,
+                                  float *out, int nrows);
 /* IQ3_K_R4 x Q8_K batched GEMM (AVX2). */
 int sgemm_iq3_k_r4_q8_k_avx2(int nrows, int ncols, int k,
                                const void *vx, const void *vy,
@@ -1270,6 +1274,10 @@ float vec_dot_iq4_k_r4_q8_k(const void *vx, const void *wy, int n);
 /* IQ4_K_R4 x Q8_K AVX2 GEMV: 4 weight rows x 1 activation row.
  * out: 4 output floats. nrows must be 4. n must be multiple of 256. */
 void vec_dot_iq4_k_r4_q8_k_avx2(const void *vx, const void *wy, int n,
+                                  float *out, int nrows);
+/* IQ4_K_R4 x Q8_K NEON GEMV: 4 weight rows x 1 activation row.
+ * out: 4 output floats. nrows must be 4. n must be multiple of 256. */
+void vec_dot_iq4_k_r4_q8_k_neon(const void *vx, const void *wy, int n,
                                   float *out, int nrows);
 /* IQ4_K_R4 x Q8_K batched GEMV dispatcher: 4 weight rows x 1 activation row.
  * out: 4 output floats. n must be multiple of 256. */

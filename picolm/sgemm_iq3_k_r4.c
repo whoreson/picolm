@@ -352,3 +352,97 @@ int sgemm_iq3_k_r4_q8_k_avx2(int nrows, int ncols, int k,
 void vec_dot_iq3_k_r4_q8_k_avx2(const void *vx, const void *wy, int n, float *out, int nrows) { (void)vx; (void)wy; (void)n; (void)out; (void)nrows; }
 int sgemm_iq3_k_r4_q8_k_avx2(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) { (void)vx; (void)vy; (void)nrows; (void)ncols; (void)k; (void)out; (void)bs; (void)ith; (void)nth; return 0; }
 #endif
+
+#if defined(PICOLM_NEON)
+#include <arm_neon.h>
+
+static inline int8_t iq3_k_r4_scale_l(const uint8_t *scales_l, int idx) {
+    return (int8_t)((scales_l[idx % 32] >> (4 * (idx / 32))) & 0xf);
+}
+
+static inline int iq3_k_r4_scale_sign(const uint8_t *scales_h, int idx) {
+    return ((scales_h[idx % 8] >> (idx / 8)) & 1) ? 1 : -1;
+}
+
+void vec_dot_iq3_k_r4_q8_k_neon(const void *vx, const void *vy, int n,
+                                  float *out, int nrows) {
+    if (nrows != 4 || n % QK_K != 0) {
+        const block_iq3_k_r4 *b = (const block_iq3_k_r4 *)vx;
+        const block_q8_K *qk = (const block_q8_K *)vy;
+        const int nb = n / QK_K;
+        for (int r = 0; r < nrows && r < 4; r++) {
+            float w_tmp[QK_K];
+            float sum = 0.0f;
+            for (int ibl = 0; ibl < nb; ibl++) {
+                dequantize_row_iq3_k_r4_single(&b[ibl], w_tmp, QK_K, r);
+                float q8_scale = qk[ibl].d;
+                for (int i = 0; i < QK_K; i++)
+                    sum += w_tmp[i] * (float)qk[ibl].qs[i] * q8_scale;
+            }
+            out[r] = sum;
+        }
+        return;
+    }
+
+    const block_iq3_k_r4 *iq3 = (const block_iq3_k_r4 *)vx;
+    const block_q8_K *qk = (const block_q8_K *)vy;
+    const int nb = n / QK_K;
+
+    float accf[4] = {0, 0, 0, 0};
+    float d_arr[4];
+
+    for (int ibl = 0; ibl < nb; ibl++) {
+        for (int r = 0; r < 4; r++)
+            d_arr[r] = fp16_to_fp32_lookup(iq3[ibl].d[r]);
+        float q8_scale = qk[ibl].d;
+        const int8_t *q8_base = qk[ibl].qs;
+        const uint8_t *scales_l = iq3[ibl].scales_l;
+        const uint8_t *scales_h = iq3[ibl].scales_h;
+        const uint8_t *extra = iq3[ibl].extra;
+        const uint8_t *ql_base = iq3[ibl].qs;
+        const uint8_t *qh_base = iq3[ibl].qh;
+
+        for (int ib = 0; ib < QK_K / 32; ib++) {
+            const uint8_t *ql = ql_base + ib * 32;
+            const uint8_t *qh = qh_base + ib * 16;
+
+            for (int iy = 0; iy < 4; iy++) {
+                int is1 = 8 * ib + iy;
+                int is2 = is1 + 4;
+                int8_t mag1 = iq3_k_r4_scale_l(scales_l, is1);
+                int8_t mag2 = iq3_k_r4_scale_l(scales_l, is2);
+                int sign1 = iq3_k_r4_scale_sign(scales_h, is1);
+                int sign2 = iq3_k_r4_scale_sign(scales_h, is2);
+                int s1 = (2 * mag1 + 1) * sign1;
+                int s2 = (2 * mag2 + 1) * sign2;
+
+                const int8_t *values1 = iq3nl_values + (extra[iy + 0] & (1 << ib) ? 8 : 0);
+                const int8_t *values2 = iq3nl_values + (extra[iy + 4] & (1 << ib) ? 8 : 0);
+
+                int32_t row_sum = 0;
+
+                for (int i = 0; i < 4; i++) {
+                    uint8_t b0 = ql[4 * iy + i];
+                    uint8_t h = qh[4 * iy + i];
+                    int base = 32 * ib + i;
+
+                    row_sum += s1 * values1[((b0 >> 0) & 0x03) | ((h << 2) & 4)] * q8_base[base +  0];
+                    row_sum += s1 * values1[((b0 >> 2) & 0x03) | ((h << 1) & 4)] * q8_base[base +  4];
+                    row_sum += s1 * values1[((b0 >> 4) & 0x03) | ((h << 0) & 4)] * q8_base[base +  8];
+                    row_sum += s1 * values1[((b0 >> 6) & 0x03) | ((h >> 1) & 4)] * q8_base[base + 12];
+
+                    uint8_t b1 = ql[4 * iy + i + 16];
+                    row_sum += s2 * values2[((b1 >> 0) & 0x03) | ((h >> 2) & 4)] * q8_base[base + 16];
+                    row_sum += s2 * values2[((b1 >> 2) & 0x03) | ((h >> 3) & 4)] * q8_base[base + 20];
+                    row_sum += s2 * values2[((b1 >> 4) & 0x03) | ((h >> 4) & 4)] * q8_base[base + 24];
+                    row_sum += s2 * values2[((b1 >> 6) & 0x03) | ((h >> 5) & 4)] * q8_base[base + 28];
+                }
+
+                accf[iy] += (float)row_sum * d_arr[iy] * q8_scale;
+            }
+        }
+    }
+
+    for (int r = 0; r < 4; r++) out[r] = accf[r];
+}
+#endif /* PICOLM_NEON */

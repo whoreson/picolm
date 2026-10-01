@@ -8712,6 +8712,9 @@ void vec_dot_iq3_k_r4_q8_k_batch4(const void *vx, const void *vy, int n, float *
 #if defined(PICOLM_AVX2)
     /* AVX2 path: call the optimized kernel from sgemm_iq3_k_r4.c */
     vec_dot_iq3_k_r4_q8_k_avx2(vx, vy, n, out, 4);
+#elif defined(PICOLM_NEON) && !defined(PICOLM_FORCE_SCALAR)
+    /* NEON path: call the optimized kernel from sgemm_iq3_k_r4.c */
+    vec_dot_iq3_k_r4_q8_k_neon(vx, vy, n, out, 4);
 #else
     /* Scalar fallback: dequantize each row, F32 dot with dequantized Q8_K activations */
     {
@@ -9307,6 +9310,9 @@ void vec_dot_iq2_k_r4_q8_k_batch4(const void *vx, const void *vy, int n, float *
 #if defined(PICOLM_AVX2)
     /* AVX2 path: call the optimized kernel from sgemm_iq2_k_r4.c */
     vec_dot_iq2_k_r4_q8_k_avx2(vx, vy, n, out, 4);
+#elif defined(PICOLM_NEON) && !defined(PICOLM_FORCE_SCALAR)
+    /* NEON path: call the optimized kernel from sgemm_iq2_k_r4.c */
+    vec_dot_iq2_k_r4_q8_k_neon(vx, vy, n, out, 4);
 #else
     /* Scalar fallback: each row processes independently. */
     const block_iq2_k_r4 *iq2 = (const block_iq2_k_r4 *)vx;
