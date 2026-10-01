@@ -12,6 +12,7 @@ extern void vec_dot_q8_k_r8_q8_k_neon(const void *vx, const void *wy, int n, flo
 /* AVX2 GEMM declarations */
 #if defined(PICOLM_AVX2)
 extern int sgemm_iq6_k_q8_k_avx2(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+extern int sgemm_q4_k_r4_q8_k_avx2(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
 extern void vec_dot_iq2_k_r4_q8_k_neon(const void *vx, const void *wy, int n, float *out, int nrows);
 extern void vec_dot_iq3_k_r4_q8_k_neon(const void *vx, const void *wy, int n, float *out, int nrows);
 extern void vec_dot_iq4_k_r4_q8_k_neon(const void *vx, const void *wy, int n, float *out, int nrows);
@@ -3926,6 +3927,13 @@ static void qgemm_iq4kr4_task(int idx, void *ctxp) {
     sgemm_iq4_k_r4_q8_k_avx2(c->nr, c->nc, c->k, c->w, c->abuf, c->out, c->bs, idx, nth);
 }
 
+/* Q4_K_R4 tiled GEMM task (Q8_K activations, raw 4-bit + bias correction) */
+static void qgemm_q4kr4_task(int idx, void *ctxp) {
+    qgemm_q4r8_ctx_t *c = (qgemm_q4r8_ctx_t *)ctxp;
+    int nth = pool_total_threads(1);
+    sgemm_q4_k_r4_q8_k_avx2(c->nr, c->nc, c->k, c->w, c->abuf, c->out, c->bs, idx, nth);
+}
+
 /* Q6_K_R4 tiled GEMM task (Q8_K activations, bsums bias correction) */
 static void qgemm_q6kr4_task(int idx, void *ctxp) {
     qgemm_q4r8_ctx_t *c = (qgemm_q4r8_ctx_t *)ctxp;
@@ -4819,6 +4827,29 @@ void matmul_batch(float *out, const float *x, int n_batch,
             tensor_parallel_for(nth, qgemm_iq4kr4_task, &ctx);
             free(qbuf);
         DISPATCH("IQ4_K_R4_sgemm");
+            return;
+        }
+    }
+#endif
+
+    /* Q4_K_R4 batch: tiled GEMM path with AVX2 kernel (Q8_K activations).
+     * 4-row interleaved blocks, raw 4-bit + bias correction. */
+#if defined(PICOLM_AVX2)
+    if (!picolm_sgemm_disabled_tensor() && qtype == GGUF_TYPE_Q4_K_R4 && n_batch > 0 && n > 0 && d % 4 == 0 && n % 256 == 0) {
+        size_t q8_rb = (size_t)(n / 256) * sizeof(block_q8_K);
+        void *qbuf = malloc((size_t)n_batch * q8_rb);
+        if (qbuf) {
+            for (int b = 0; b < n_batch; b++)
+                quantize_row_q8_K(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
+
+            int nth = pool_total_threads(1);
+            qgemm_q4r8_ctx_t ctx = {
+                .nr = d, .nc = n_batch, .k = n,
+                .w = W, .abuf = qbuf, .out = out, .bs = d,
+            };
+            tensor_parallel_for(nth, qgemm_q4kr4_task, &ctx);
+            free(qbuf);
+        DISPATCH("Q4_K_R4_sgemm");
             return;
         }
     }

@@ -24,6 +24,7 @@
 extern float fp16_to_fp32_lookup(uint16_t h);
 extern float vec_dot_f32_f32(const void *a, const float *b, int n);
 extern void dequantize_row_q4_k_r4_single(const block_q4_k_r4 *x, float *dst, int n, int row);
+extern void vec_dot_q4_k_r4_q8_k_batch4(const void *vx, const void *vy, int n, float *out);
 
 #ifdef PICOLM_AVX2
 #include <immintrin.h>
@@ -177,3 +178,48 @@ void vec_dot_q4_k_r4_q8_k_avx2(const void *vx, const void *wy, int n,
     (void)vx; (void)wy; (void)n; (void)out; (void)nrows;
 }
 #endif
+
+/* ================================================================
+ * Q4_K_R4 x Q8_K GEMM wrapper
+ * ================================================================
+ * Port of llama.cpp ik branch iqk_gemm_kquants.cpp:
+ *   mul_mat_q4_k_r4_q8_k
+ *
+ * Weights: block_q4_k_r4 (4-row interleaved Q4_K, 576 bytes/group)
+ * Activations: block_q8_K (plain, one per activation row)
+ *
+ * Calls vec_dot_q4_k_r4_q8_k_batch4 from quant.c (scalar, correct
+ * stride-4 interleaved qs layout). The AVX2 GEMV in this file has
+ * a known bug with the qs layout and is not used here.
+ * ================================================================ */
+int sgemm_q4_k_r4_q8_k_avx2(int nrows, int ncols, int k,
+                              const void *vx, const void *vy,
+                              float *out, size_t bs,
+                              int ith, int nth) {
+    if (nrows < 4 || ncols < 1 || k <= 0 || k % QK_K != 0 || nrows % 4 != 0) {
+        return 0;
+    }
+
+    /* Per-row-equivalent byte stride: gguf_type_row_size(GGUF_TYPE_Q4_K_R4, k)
+     * == sizeof(block_q4_k_r4) * (k/QK_K) / 4. Multiplying by 4 gives the
+     * real byte size of one interleaved block_q4_k_r4 group. */
+    const size_t row_bytes = gguf_type_row_size(GGUF_TYPE_Q4_K_R4, k);
+    const size_t group_bytes = row_bytes * 4;
+    const size_t q8k_row_bytes = gguf_type_row_size(GGUF_TYPE_Q8_K, k);
+
+    int start_col = (ncols * ith) / nth;
+    int end_col = (ncols * (ith + 1)) / nth;
+    if (end_col <= start_col) return 0;
+
+    for (int w4 = 0; w4 < nrows / 4; w4++) {
+        const char *group_base = (const char *)vx + (size_t)w4 * group_bytes;
+        for (int c = start_col; c < end_col; c++) {
+            const char *qy = (const char *)vy + (size_t)c * q8k_row_bytes;
+            float out4[4];
+            vec_dot_q4_k_r4_q8_k_batch4(group_base, qy, k, out4);
+            for (int r = 0; r < 4; r++)
+                out[w4 * 4 + r + c * bs] = out4[r];
+        }
+    }
+    return (nrows / 4) * 4;
+}
