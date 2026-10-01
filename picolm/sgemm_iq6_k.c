@@ -174,6 +174,84 @@ void vec_dot_iq6_k_q8_k_avx2_batch(const void *vx, const void *wy, size_t y_stri
     for (int c = 0; c < ncols; ++c) out[c] = iq6_hsum_ps(fs[c]);
 }
 
+/* ================================================================
+ * IQ6_K x Q8_K tiled GEMM (AVX2)
+ * ================================================================
+ * C[nrows x ncols] = W[nrows x k] * A[ncols x k]^T
+ * W = IQ6_K weights, A = Q8_K activations (pre-quantized).
+ *
+ * Tiling: 1 weight row x 2 activation columns per tile.
+ * Thread distribution: tiles = nrows * (ncols/2), work = tiles/nth.
+ *
+ * Each tile: decode weight row once per block, dot against 2 activations.
+ * ================================================================ */
+int sgemm_iq6_k_q8_k_avx2(int nrows, int ncols, int k,
+                           const void *vx, const void *vy,
+                           float *out, size_t bs,
+                           int ith, int nth) {
+    if (nrows < 1 || ncols < 1 || k % QK_K != 0)
+        return 0;
+
+    const int nb = k / QK_K;
+    const iq6_luts_t L = iq6_luts_init();
+
+    int64_t ytiles = nrows;
+    int64_t xtiles = ncols / 2;
+    int64_t n_tail = ncols - xtiles * 2;
+    int64_t xtiles_ext = xtiles + (n_tail > 0 ? 1 : 0);
+    int64_t tiles = ytiles * xtiles_ext;
+    if (tiles <= 0) return 0;
+
+    int64_t duty = (tiles + nth - 1) / nth;
+    int64_t start = duty * ith;
+    int64_t end = start + duty;
+    if (end > tiles) end = tiles;
+
+    size_t w_row_bytes = nb * sizeof(block_iq6_k);
+    size_t a_row_bytes = nb * sizeof(block_q8_K);
+
+    for (int64_t job = start; job < end; job++) {
+        int64_t ii = job / xtiles_ext;
+        int64_t xt = job % xtiles_ext;
+        int64_t jj = xt * 2;
+        int64_t ncols_tile = (xt < xtiles) ? 2 : n_tail;
+        if (ncols_tile < 1) ncols_tile = 1;
+
+        const block_iq6_k *w = (const block_iq6_k *)
+            ((const char *)vx + ii * w_row_bytes);
+
+        float acc[2] = { 0.0f, 0.0f };
+
+        const block_q8_K *qk_ptr[2];
+        for (int c = 0; c < ncols_tile; c++) {
+            qk_ptr[c] = (const block_q8_K *)
+                ((const char *)vy + (jj + c) * a_row_bytes);
+        }
+
+        __m256 fsum[2];
+        fsum[0] = _mm256_setzero_ps();
+        fsum[1] = _mm256_setzero_ps();
+
+        for (int ibl = 0; ibl < nb; ++ibl) {
+            __m256i wv[8], sp[8], smin;
+            iq6_decode_block(&w[ibl], &L, wv, sp, &smin);
+            const float d = iq6_f16(w[ibl].d);
+
+            for (int c = 0; c < ncols_tile; c++) {
+                const __m256i acc_vec = iq6_block_dot(wv, sp, smin, &qk_ptr[c][ibl]);
+                const float dd = d * qk_ptr[c][ibl].d;
+                fsum[c] = _mm256_add_ps(fsum[c],
+                        _mm256_mul_ps(_mm256_cvtepi32_ps(acc_vec), _mm256_set1_ps(dd)));
+            }
+        }
+
+        for (int c = 0; c < ncols_tile; c++) {
+            out[ii + (jj + c) * bs] = iq6_hsum_ps(fsum[c]);
+        }
+    }
+    return nrows;
+}
+
 #else
 
 void vec_dot_iq6_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out) {
