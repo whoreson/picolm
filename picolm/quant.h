@@ -1250,8 +1250,19 @@ void vec_dot_iq4_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out);
 float vec_dot_iq4_k_q8_k(const void *vx, const void *wy, int n);
 /* IQ6_K plain (GGUF type 141): 6-bit non-linear quant, 212-byte blocks. */
 void dequantize_row_iq6_k(const void *src, float *dst, int n);
+/* AVX-512 BW + VNNI IQ6_K kernels (sgemm_iq6_k.c). When absent, the AVX2 kernels are used. */
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__AVX512VNNI__) && \
+    !defined(__CUDACC__) && !defined(__HIP_DEVICE_COMPILE__)
+#  define PICOLM_IQ6K_VNNI 1
+#endif
 /* Max activation rows decoded-weight reuse covers per kernel call. */
-#define IQ6K_BATCH_TILE 4
+#ifndef IQ6K_BATCH_TILE
+#  if defined(PICOLM_IQ6K_VNNI)
+#    define IQ6K_BATCH_TILE 8
+#  else
+#    define IQ6K_BATCH_TILE 4
+#  endif
+#endif
 /* One IQ6_K weight row x ncols Q8_K activation rows (row c at wy + c*y_stride bytes).
  * Decodes each weight block once. ncols may exceed IQ6K_BATCH_TILE. */
 void vec_dot_iq6_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out);
