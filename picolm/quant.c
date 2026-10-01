@@ -8911,7 +8911,7 @@ extern void vec_dot_iq4_k_r4_q8_k_avx2(const void *vx, const void *wy, int n, fl
  * q6 = 4-bit low | 2-bit high << 4, and m is the subblock sign bit.
  * ================================================================ */
 
-static const uint8_t iq6nl_lut[64] = {
+const uint8_t iq6nl_lut[64] = {
        1,    7,   13,   19,   24,   30,   35,   40,   44,   49,   54,   58,   62,   66,   70,   74,
       77,   81,   84,   88,   91,   94,   97,  100,  103,  106,  109,  112,  115,  117,  120,  123,
      126,  128,  131,  134,  137,  140,  142,  145,  148,  151,  155,  158,  161,  164,  168,  172,
@@ -8961,7 +8961,7 @@ extern void vec_dot_iq6_k_q8_k_avx2(const void *vx, const void *wy, int n, float
 
 /* IQ6_K x Q8_K scalar vec_dot (reference implementation). */
 float vec_dot_iq6_k_q8_k(const void *vx, const void *wy, int n) {
-#if 0 // defined(PICOLM_AVX2) -- AVX2 kernel has bug, scalar path for now
+#if defined(PICOLM_AVX2) && !defined(PICOLM_FORCE_SCALAR)
     float result;
     vec_dot_iq6_k_q8_k_avx2(vx, wy, n, &result);
     return result;
@@ -8972,40 +8972,44 @@ float vec_dot_iq6_k_q8_k(const void *vx, const void *wy, int n) {
 
     float sumf = 0.0f;
     for (int ibl = 0; ibl < nb; ++ibl) {
-        const float d = fp16_to_fp32_lookup(x[ibl].d);
+        const float d = fp16_to_fp32(x[ibl].d);
         const uint8_t *qs = x[ibl].qs;
         const uint8_t *qh = x[ibl].qh;
         const int8_t *sl = x[ibl].scales;
         uint16_t extra = x[ibl].extra;
         const int8_t *q8 = y[ibl].qs;
-        float q8_scale = y[ibl].d;
-        float sumi = 0.0f;
+        const float q8_scale = y[ibl].d;
 
         int shift = 0;
         for (int ib64 = 0; ib64 < QK_K / 64; ++ib64) {
-            float dl[4];
-            float m[4];
+            int32_t s[4] = {0, 0, 0, 0};
+            int8_t mn[4];
             for (int j = 0; j < 4; j++) {
-                dl[j] = d * sl[4*ib64 + j];
-                m[j] = (extra >> j) & 1;
+                mn[j] = (extra >> j) & 1;
             }
             for (int j = 0; j < 16; ++j) {
                 int q1 = ((qs[j+ 0] & 0xf) | (((qh[j+ 0] >> shift) & 0x03) << 4));
                 int q2 = ((qs[j+16] & 0xf) | (((qh[j+16] >> shift) & 0x03) << 4));
                 int q3 = ((qs[j+ 0] >>  4) | (((qh[j+ 0] >> shift) & 0x0c) << 2));
                 int q4 = ((qs[j+16] >>  4) | (((qh[j+16] >> shift) & 0x0c) << 2));
-                sumi += dl[0] * (iq6nl_lut[q1] - 128 + m[0]) * q8[j+ 0];
-                sumi += dl[1] * (iq6nl_lut[q2] - 128 + m[1]) * q8[j+16];
-                sumi += dl[2] * (iq6nl_lut[q3] - 128 + m[2]) * q8[j+32];
-                sumi += dl[3] * (iq6nl_lut[q4] - 128 + m[3]) * q8[j+48];
+                s[0] += (iq6nl_lut[q1] - 128 + mn[0]) * q8[j+ 0];
+                s[1] += (iq6nl_lut[q2] - 128 + mn[1]) * q8[j+16];
+                s[2] += (iq6nl_lut[q3] - 128 + mn[2]) * q8[j+32];
+                s[3] += (iq6nl_lut[q4] - 128 + mn[3]) * q8[j+48];
             }
+            /* Apply per-group scale: d * sl[g], then accumulate.
+             * q8_scale applied once per block at the end. */
+            sumf += (float)s[0] * d * sl[4*ib64] * q8_scale;
+            sumf += (float)s[1] * d * sl[4*ib64+1] * q8_scale;
+            sumf += (float)s[2] * d * sl[4*ib64+2] * q8_scale;
+            sumf += (float)s[3] * d * sl[4*ib64+3] * q8_scale;
+
             q8 += 64;
             qs += 32;
             extra >>= 4;
             shift += 4;
             if (shift == 8) { qh += 32; shift = 0; }
         }
-        sumf += sumi * q8_scale;
     }
     return sumf;
 #endif

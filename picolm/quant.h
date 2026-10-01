@@ -871,12 +871,16 @@ typedef struct PICOLM_PACKED_ATTR {
 #pragma pack(push, 1)
 typedef struct PICOLM_PACKED_ATTR {
     uint16_t d;              /* FP16 global scale */
-    uint16_t extra;          /* Sign bits: 1 bit per 64-value subblock */
+    uint16_t extra;          /* LUT table select: 1 bit per 16-value group (4 per 64-value subblock, 4 subblocks = 16 bits) */
     int8_t   scales[16];     /* Signed per-subblock scales (4 per subblock) */
     uint8_t  qs[128];        /* 256 packed 4-bit low values (2 per byte) */
     uint8_t  qh[64];         /* 256 packed 2-bit high values (4 per byte) */
 } block_iq6_k;              /* 212 bytes */
 #pragma pack(pop)
+
+/* IQ6_K non-linear LUT: 64 entries, uint8 offset by +128.
+ * iq6nl_lut[q] - 128 gives the signed dequantized value for index q (0..63). */
+extern const uint8_t iq6nl_lut[64];
 
 /* IQ4_K_R4 block: 4 rows of IQ4_K repacked together for SIMD efficiency.
  * GGUF type 339. Size = 4 * sizeof(block_iq4_k) = 576 bytes.

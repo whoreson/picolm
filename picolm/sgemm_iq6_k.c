@@ -13,31 +13,45 @@
 
 #define QK_K 256
 
-static const uint8_t iq6nl_lut[64] = {
-       1,    7,   13,   19,   24,   30,   35,   40,   44,   49,   54,   58,   62,   66,   70,   74,
-      77,   81,   84,   88,   91,   94,   97,  100,  103,  106,  109,  112,  115,  117,  120,  123,
-     126,  128,  131,  134,  137,  140,  142,  145,  148,  151,  155,  158,  161,  164,  168,  172,
-     175,  179,  183,  187,  191,  196,  200,  205,  210,  215,  220,  226,  231,  237,  243,  249,
-};
+/* iq6nl_lut defined in quant.c, declared extern in quant.h */
 
-#if defined(__AVX2__) && defined(__F16C__)
+#if defined(__AVX2__)
 
 static inline __m128i iq6_lut_select(__m128i q6, __m128i lut0, __m128i lut1, __m128i lut2, __m128i lut3) {
+    /* Select 16-byte LUT quarter based on bits 5-4 of q6 (values 0..3).
+     * hi2==0 -> lut0, hi2==1 -> lut1, hi2==2 -> lut2, hi2==3 -> lut3.
+     * blendv_epi8 uses bit 7 of each byte as selector.
+     * Strategy: two-level mux. First select within pairs using bit 0 of hi2,
+     * then select between pairs using bit 1 of hi2. */
     const __m128i m0f = _mm_set1_epi8(0x0f);
-    const __m128i m03 = _mm_set1_epi8(0x03);
+    const __m128i m80 = _mm_set1_epi8((char)0x80);
     __m128i low4 = _mm_and_si128(q6, m0f);
-    __m128i high2 = _mm_and_si128(_mm_srli_epi16(q6, 4), m03);
 
     __m128i v0 = _mm_shuffle_epi8(lut0, low4);
     __m128i v1 = _mm_shuffle_epi8(lut1, low4);
     __m128i v2 = _mm_shuffle_epi8(lut2, low4);
     __m128i v3 = _mm_shuffle_epi8(lut3, low4);
 
-    __m128i m0 = _mm_cmpeq_epi8(high2, _mm_setzero_si128());
-    __m128i m1 = _mm_cmpeq_epi8(high2, _mm_set1_epi8(1));
-    __m128i m2 = _mm_cmpeq_epi8(high2, _mm_set1_epi8(2));
+    /* Extract hi2 = (q6 >> 4) & 3, as bytes.
+     * bit 0 of hi2 = bit 4 of q6 -> move to bit 7: srl by 4, srl by 3...
+     * Actually: (q6 >> 4) & 0x03 gives 0..3 in each byte.
+     * bit 0 of that = ((q6 >> 4) & 1) -> need to move to bit 7: << 7
+     * bit 1 of that = ((q6 >> 4) & 2) -> need to move to bit 7: << 6
+     * But << 7 on a value that's 0 or 1 gives 0 or 0x80. Correct.
+     * << 6 on a value that's 0 or 2 gives 0 or 0xC0 -> 0x80 in byte. Correct.
+     * However, slli_epi16 shifts 16-bit ints, so 1<<7=0x80 fits, 2<<6=0xC0 fits. */
+    __m128i hi2 = _mm_and_si128(_mm_srli_epi16(q6, 4), _mm_set1_epi8(0x03));
 
-    return _mm_blendv_epi8(_mm_blendv_epi8(v3, v2, m2), _mm_blendv_epi8(v1, v0, m0), m1);
+    /* mask0: bit 0 of hi2 moved to bit 7. And with 0x80 to ensure byte clean. */
+    __m128i mask0 = _mm_and_si128(_mm_slli_epi16(hi2, 7), m80);
+    /* mask1: bit 1 of hi2 moved to bit 7. And with 0x80. */
+    __m128i mask1 = _mm_and_si128(_mm_slli_epi16(hi2, 6), m80);
+
+    /* Within-pair select: hi2 bit 0 */
+    __m128i v_lo = _mm_blendv_epi8(v0, v1, mask0);  /* bit0=0: v0, bit0=1: v1 */
+    __m128i v_hi = _mm_blendv_epi8(v2, v3, mask0);  /* bit0=0: v2, bit0=1: v3 */
+    /* Between-pair select: hi2 bit 1 */
+    return _mm_blendv_epi8(v_lo, v_hi, mask1);      /* bit1=0: v_lo, bit1=1: v_hi */
 }
 
 static inline int iq6_signed_mac(__m128i val, __m128i y_vec) {
@@ -45,15 +59,21 @@ static inline int iq6_signed_mac(__m128i val, __m128i y_vec) {
     __m128i sy = _mm_sign_epi8(y_vec, val);
     __m128i p16 = _mm_maddubs_epi16(abs_val, sy);
 
-    __m128i hi16 = _mm_unpackhi_epi64(p16, p16);
-    __m128i lo16 = _mm_unpacklo_epi64(p16, p16);
-    __m128i one16 = _mm_set1_epi16(1);
-    __m128i s0 = _mm_madd_epi16(lo16, one16);
-    __m128i s1 = _mm_madd_epi16(hi16, one16);
-    __m128i s = _mm_add_epi32(s0, s1);
-    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x1b));
-    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x33));
-    return _mm_cvtsi128_si32(s);
+    /* Horizontal sum of 8 int16 -> single int32.
+     * madd_epi16 with ones: 8 int16 -> 4 int32 (pairwise sums).
+     * Then reduce 4 int32 to 1 via two shuffle-adds. */
+    const __m128i one16 = _mm_set1_epi16(1);
+    __m128i s = _mm_madd_epi16(p16, one16);  /* {p0+p1, p2+p3, p4+p5, p6+p7} */
+    s = _mm_hadd_epi32(s, s);                 /* {p0+p1+p2+p3, p2+p3+p4+p5, p4+p5+p6+p7, junk} */
+    s = _mm_shuffle_epi32(s, 0x33);           /* broadcast lane 2 = p4+p5+p6+p7? NO */
+    /* Actually hadd_epi32: {a,b,c,d} -> {a+b, b+c, c+d, d+c} -- wait no */
+    /* hadd_epi32(s, s): horizontal add of adjacent pairs within and across 128-bit lanes */
+    /* For 128-bit register {a,b,c,d}: hadd gives {a+b, c+d, c+d, c+d} -- NO */
+    /* Let me just use the straightforward approach */
+    (void)s;
+    int32_t tmp[4];
+    _mm_storeu_si128((__m128i*)tmp, _mm_madd_epi16(p16, one16));
+    return tmp[0] + tmp[1] + tmp[2] + tmp[3];
 }
 
 void vec_dot_iq6_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out) {
@@ -164,7 +184,8 @@ void vec_dot_iq6_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out) 
 #else
 
 void vec_dot_iq6_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out) {
-    (void)vx; (void)wy; (void)n; (void)out;
+    (void)vx; (void)wy; (void)n;
+    *out = 0.0f;
 }
 
 #endif
