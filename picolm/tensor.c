@@ -5484,6 +5484,32 @@ void matmul_batch(float *out, const float *x, int n_batch,
     pool_wake(nt);
     matmul_worker_f(&pool_tasks[0]);
     pool_wait(nt);
+    /* WARN: scalar_vec_dot_threaded fallback - no specialized GEMM/vec_dot for this type.
+     * If you see this for a quantized model, the type likely lacks a matmul_batch
+     * handler. The worker may still dispatch to a per-type vec_dot if registered,
+     * but tiled GEMM would be significantly faster.
+     * To silence: implement a GEMM kernel for this type, or set PICOLM_SILENT=1. */
+    if (qtype != GGUF_TYPE_F32 && qtype != GGUF_TYPE_F16 && !getenv("PICOLM_SILENT")) {
+        static int warn_count;
+        if (++warn_count <= 3) {
+            const char *qname = qtype == GGUF_TYPE_IQ4_NL ? "IQ4_NL" :
+                                qtype == GGUF_TYPE_Q5_0 ? "Q5_0" :
+                                qtype == GGUF_TYPE_Q5_1 ? "Q5_1" :
+                                qtype == GGUF_TYPE_Q2_0 ? "Q2_0" :
+                                qtype == GGUF_TYPE_Q1_0 ? "Q1_0" :
+                                qtype == GGUF_TYPE_Q6_K ? "Q6_K" :
+                                qtype == GGUF_TYPE_Q4_0 ? "Q4_0" :
+                                qtype == GGUF_TYPE_Q4_K ? "Q4_K" :
+                                qtype == GGUF_TYPE_Q3_K ? "Q3_K" :
+                                qtype == GGUF_TYPE_Q2_K ? "Q2_K" :
+                                qtype == GGUF_TYPE_Q5_K ? "Q5_K" :
+                                qtype == GGUF_TYPE_Q3_K ? "Q3_K" :
+                                qtype == GGUF_TYPE_Q8_K ? "Q8_K" : "UNKNOWN";
+            fprintf(stderr, "WARN: matmul_batch fallback to scalar_vec_dot_threaded "
+                    "(qtype=%d/%s d=%d n=%d batch=%d) -- no tiled GEMM path\n",
+                    qtype, qname, d, n, n_batch);
+        }
+    }
     DISPATCH("scalar_vec_dot_threaded");
     if (prof_active) { double dt = picolm_now()-t0; prof_scalar_par+=dt; cnt_scalar_par++; }
     if (qx_buf) { free(qx_buf); if (qx_d_buf) free(qx_d_buf); }
