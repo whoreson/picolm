@@ -1251,6 +1251,7 @@ float vec_dot_iq4_k_q8_k(const void *vx, const void *wy, int n);
 /* IQ6_K plain (GGUF type 141): 6-bit non-linear quant, 212-byte blocks. */
 void dequantize_row_iq6_k(const void *src, float *dst, int n);
 void vec_dot_iq6_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out);
+void vec_dot_iq6_k_q8_k_vnni(const void *vx, const void *wy, int n, float *out);
 float vec_dot_iq6_k_q8_k(const void *vx, const void *wy, int n);
 /* IQ4_K_R4 x Q8_K scalar vec_dot (row 0 only). */
 float vec_dot_iq4_k_r4_q8_k(const void *vx, const void *wy, int n);
