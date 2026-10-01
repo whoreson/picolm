@@ -92,9 +92,9 @@ static inline void iq3_decode_block(const block_iq3_k *x, __m256i lut,
     /* Extract sign bits from scales_h (16 bits, 2 per subblock pair).
      * Bit 0 = sign for group 0, bit 1 = sign for group 1, etc.
      * sign = 1 when bit set (meaning negative), so we want -1 or +1.
-     * Build int16 vector with sign values. */
+     * Build int8 vector with sign values, then multiply with magnitude. */
     const uint16_t sh = x->scales_h;
-    int16_t sg[16];
+    int8_t sg[16];
     uint16_t sh_tmp = sh;
     for (int i = 0; i < 8; i++) {
         sg[2 * i]     = (sh_tmp & 1) ? -1 : 1;
@@ -102,7 +102,15 @@ static inline void iq3_decode_block(const block_iq3_k *x, __m256i lut,
         sh_tmp >>= 2;
     }
     const __m128i sg_vec = _mm_loadu_si128((const __m128i *)sg);
-    const __m256i sc16 = _mm256_cvtepi8_epi16(sg_vec);
+    /* sc16 = mag * sign, as int16. Each entry: (2*nibble+1) * (sign from scales_h). */
+    /* Element-wise multiply: mag[k] * sign[k] for each of the 16 scale groups.
+     * Store mag to array, multiply by sign, load as int16 vector. */
+    int8_t mag_arr[16];
+    _mm_store_si128((__m128i *)mag_arr, mag);
+    int16_t sc_arr[16];
+    for (int k = 0; k < 16; k++)
+        sc_arr[k] = (int16_t)mag_arr[k] * sg[k];
+    const __m256i sc16 = _mm256_loadu_si256((const __m256i *)sc_arr);
 
     /* qh: 32 bytes total. First 16 bytes for values 0..15, next 16 for 16..31.
      * Each byte has 8 high bits, one per subblock.
@@ -123,8 +131,10 @@ static inline void iq3_decode_block(const block_iq3_k *x, __m256i lut,
             _mm256_srl_epi16(qs, _mm_cvtsi32_si128(2 * (i & 3))), m3);
 
         /* Extract high bit from qh. qh_lo for values 0..15, qh_hi for 16..31.
-         * Blend: lane 0 = qh_lo (values 0..15), lane 1 = qh_hi (values 16..31). */
-        const __m256i qh = _mm256_blend_epi16(qh_hi, qh_lo, 0x00);
+         * Blend: lane 0 = qh_lo (values 0..15), lane 1 = qh_hi (values 16..31).
+         * _mm256_blend_epi16(a, b, mask): bits=0 -> a, bits=1 -> b.
+         * mask=0xFF takes lane1 from qh_hi, lane0 from qh_lo. */
+        const __m256i qh = _mm256_blend_epi16(qh_lo, qh_hi, 0xFF);
         const __m256i qh_bit = _mm256_and_si256(
             _mm256_srl_epi16(qh, _mm_cvtsi32_si128(i)), m3);
         const __m256i qh_shifted = _mm256_slli_epi16(qh_bit, 2);
