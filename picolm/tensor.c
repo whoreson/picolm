@@ -6089,9 +6089,14 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
     #define __DISPATCH2_UNIQ_N(x, y) x##y
     #define __DISPATCH2_UNIQ(x, y) __DISPATCH2_UNIQ_N(x, y)
     #define DISPATCH2(fmt) do { static int __DISPATCH2_UNIQ(_d, __LINE__); if (_dispatch_env2 && !__DISPATCH2_UNIQ(_d, __LINE__)) { __DISPATCH2_UNIQ(_d, __LINE__)=1; fprintf(stderr, "DISPATCH matmul_dual_batch: d=%d n=%d batch=%d qtype1=%d qtype2=%d -> " fmt "\n", d, n, n_batch, qtype1, qtype2); } } while(0)
-    if (!W1 && out1) { memset(out1, 0, (size_t)n_batch * d * sizeof(float)); DISPATCH2("NULL (W1 zero-filled)"); }
-    if (!W2 && out2) { memset(out2, 0, (size_t)n_batch * d * sizeof(float)); DISPATCH2("NULL (W2 zero-filled)"); }
+    /* Dispatch accounting: track which output buffers have been computed.
+     * Every code path that writes out1/out2 must set the corresponding flag. */
+    int out1_done = 0, out2_done = 0;
+
+    if (!W1 && out1) { memset(out1, 0, (size_t)n_batch * d * sizeof(float)); out1_done = 1; DISPATCH2("NULL (W1 zero-filled)"); }
+    if (!W2 && out2) { memset(out2, 0, (size_t)n_batch * d * sizeof(float)); out2_done = 1; DISPATCH2("NULL (W2 zero-filled)"); }
     if (!W1 && !W2) return;
+
 #ifdef PICOLM_GPU
     if (getenv("PICOLM_GPU")) {
         fprintf(stderr, "WARN: matmul_dual_batch (CPU only, no GPU path) n=%d d=%d batch=%d qtype=%d/%d\n",
@@ -6143,6 +6148,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
             };
             tensor_parallel_for(nth, qgemm_d_task, &ctx2);
             free(qbuf); free(dbuf);
+            out1_done = 1; out2_done = 1;
         DISPATCH2("GEMM_d (single qtype)");
             return;
         }
@@ -6199,6 +6205,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
             };
             tensor_parallel_for(nth, qgemm_d_task, &ctx2);
             free(qbuf); free(dbuf);
+            out1_done = 1; out2_done = 1;
         DISPATCH2("GEMM_d (dual qtype)");
             return;
         }
@@ -6239,6 +6246,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
         } else {
             qgemm_q4x8_fallback(x, n_batch, d, n, W2, out2, qtype2);
         }
+        out1_done = 1; out2_done = 1;
         DISPATCH2("Q4x8_GEMM_dual");
         return;
     }
@@ -6280,6 +6288,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                 }
             }
             free(qbuf);
+            out1_done = 1; out2_done = 1;
         DISPATCH2("Q4_0_8_8_vec_dot_dual");
             return;
         }
@@ -6315,6 +6324,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                         out2[b * d + i] = vec_dot((const char *)W2 + i * rb2, x + b * n, n, qtype2);
             }
             free(qbuf);
+            out1_done = 1; out2_done = 1;
         DISPATCH2("Q4_0_R8_sgemm_dual_Q82");
             return;
         }
@@ -6355,6 +6365,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                 }
             }
             free(qbuf);
+            out1_done = 1; out2_done = 1;
         DISPATCH2("Q4_0_R8_vec_dot_dual");
             return;
         }
@@ -6407,6 +6418,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                         out2[b * d + i] = vec_dot((const char *)W2 + (size_t)i * rb2, x + b * n, n, qtype2);
             }
             free(qbuf);
+            out1_done = 1; out2_done = 1;
         DISPATCH2("Q6_K_R4_sgemm_dual");
             return;
         }
@@ -6444,6 +6456,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                 }
             }
             free(qbuf);
+            out1_done = 1; out2_done = 1;
         DISPATCH2("Q6_K_R4_vec_dot_dual");
             return;
         }
@@ -6572,6 +6585,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
             free(qbuf);
             free(qbuf0);
             free(dbuf0);
+            out1_done = 1; out2_done = 1;
         DISPATCH2("R4_generic_dual_threaded");
             return;
         }
@@ -6597,6 +6611,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
         tensor_parallel_for(total_groups,
             r4_scalar_dual_task, &ctx);
 
+        out1_done = 1; out2_done = 1;
         DISPATCH2("R4_generic_dual_threaded_scalar");
         return;
     }
@@ -6605,7 +6620,6 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
      * If both qtype1 and qtype2 are Q8_K_R8, handle both and return.
      * If only one is Q8_K_R8, handle it here, set skip flags, and
      * fall through for the non-Q8_K_R8 type. */
-    int out1_done = 0, out2_done = 0;
 #if defined(PICOLM_AVX2)
     if (!picolm_sgemm_disabled_tensor() && (qtype1 == GGUF_TYPE_Q8_K_R8 || qtype2 == GGUF_TYPE_Q8_K_R8) && n_batch > 0 && n > 0 && d % 8 == 0 && n % 256 == 0) {
         size_t q8_rb = (size_t)(n / 256) * sizeof(block_q8_K);
@@ -6668,33 +6682,98 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
     }
 #endif
 
-    /* Q8_K_R8 / Q4_0_R8 scalar fallback for dual-batch (non-AVX2/non-NEON).
+    /* Q8_K_R8 / Q4_0_R8 fallback for dual-batch.
      * Handles each side independently: R8 sides use threaded dequantize+F32 dot,
-     * non-R8 sides use threaded vec_dot. */
+     * non-R8 sides use tiled GEMM when supported (Q8_0/Q4_0/Q5_0/IQ4_NL),
+     * falling back to threaded vec_dot for other types.
+     * Skips sides already computed by the SIMD GEMM path above (out1_done/out2_done). */
     if ((qtype1 == GGUF_TYPE_Q8_K_R8 || qtype2 == GGUF_TYPE_Q8_K_R8 ||
          qtype1 == GGUF_TYPE_Q4_0_R8 || qtype2 == GGUF_TYPE_Q4_0_R8) && n_batch > 0 && n > 0) {
         int d8 = (d / 8) * 8;
         int ng = (d8 / 8) + (d - d8 > 0 ? 1 : 0);
 
-        if (qtype1 == GGUF_TYPE_Q8_K_R8 || qtype1 == GGUF_TYPE_Q4_0_R8) {
-            size_t rb1 = gguf_type_row_size(qtype1, n);
-            size_t bs1 = rb1 * 8;
-            q8kr8_batch_ctx_t ctx1 = { .W = W1, .out = out1, .x = x, .n = n, .d = d, .d8 = d8, .ng = ng, .n_batch = n_batch, .rb = rb1, .block_stride = bs1 };
-            tensor_parallel_for(n_batch * ng, qtype1 == GGUF_TYPE_Q8_K_R8 ? q8kr8_batch_task : q4r8_batch_task, &ctx1);
-        } else if (W1) {
-            /* Non-R8 side: threaded vec_dot */
-            size_t rb1 = gguf_type_row_size(qtype1, n);
-            matmul_batch_scalar_threaded(out1, x, n_batch, W1, n, d, qtype1, rb1);
+/* Side 1 */
+        if (!out1_done) {
+            out1_done = 1;  /* Mark as done; all branches below write out1 */
+            if (qtype1 == GGUF_TYPE_Q8_K_R8 || qtype1 == GGUF_TYPE_Q4_0_R8) {
+                size_t rb1 = gguf_type_row_size(qtype1, n);
+                size_t bs1 = rb1 * 8;
+                q8kr8_batch_ctx_t ctx1 = { .W = W1, .out = out1, .x = x, .n = n, .d = d, .d8 = d8,
+                                           .ng = ng, .n_batch = n_batch, .rb = rb1, .block_stride = bs1 };
+                tensor_parallel_for(n_batch * ng, qtype1 == GGUF_TYPE_Q8_K_R8
+                                    ? q8kr8_batch_task : q4r8_batch_task, &ctx1);
+            } else if (W1 && !picolm_sgemm_disabled_tensor() && n % 32 == 0 &&
+                       (qtype1 == GGUF_TYPE_Q8_0 || qtype1 == GGUF_TYPE_Q4_0 ||
+                        qtype1 == GGUF_TYPE_Q5_0 || qtype1 == GGUF_TYPE_IQ4_NL)) {
+                size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
+                int nb = n / 32;
+                void *qbuf = malloc((size_t)n_batch * q8_rb);
+                float *dbuf = (float *)malloc((size_t)n_batch * nb * sizeof(float));
+                if (qbuf && dbuf) {
+                    for (int b = 0; b < n_batch; b++) {
+                        quantize_row_q8_0(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
+                        const block_q8_0 *blk = (const block_q8_0 *)((char *)qbuf + (size_t)b * q8_rb);
+                        for (int k = 0; k < nb; k++)
+                            dbuf[(size_t)b * nb + k] = fp16_to_fp32(blk[k].d);
+                    }
+                    int nth = pool_total_threads(1);
+                    qgemm_d_ctx_t gctx = {
+                        .m = d, .n = n_batch, .k_blocks = nb,
+                        .A = W1, .lda = nb,
+                        .B = (const block_q8_0*)qbuf, .ldb = nb,
+                        .B_d = dbuf, .ldb_d = nb,
+                        .C = out1, .ldc = d,
+                        .Atype = qtype1, .nth = nth,
+                    };
+                    tensor_parallel_for(nth, qgemm_d_task, &gctx);
+                    free(dbuf); free(qbuf);
+                } else { free(dbuf); free(qbuf); }
+            } else if (W1) {
+                size_t rb1 = gguf_type_row_size(qtype1, n);
+                matmul_batch_scalar_threaded(out1, x, n_batch, W1, n, d, qtype1, rb1);
+            }
         }
 
-        if (qtype2 == GGUF_TYPE_Q8_K_R8 || qtype2 == GGUF_TYPE_Q4_0_R8) {
-            size_t rb2 = gguf_type_row_size(qtype2, n);
-            size_t bs2 = rb2 * 8;
-            q8kr8_batch_ctx_t ctx2 = { .W = W2, .out = out2, .x = x, .n = n, .d = d, .d8 = d8, .ng = ng, .n_batch = n_batch, .rb = rb2, .block_stride = bs2 };
-            tensor_parallel_for(n_batch * ng, qtype2 == GGUF_TYPE_Q8_K_R8 ? q8kr8_batch_task : q4r8_batch_task, &ctx2);
-        } else if (W2) {
-            size_t rb2 = gguf_type_row_size(qtype2, n);
-            matmul_batch_scalar_threaded(out2, x, n_batch, W2, n, d, qtype2, rb2);
+        /* Side 2 */
+        if (!out2_done) {
+            out2_done = 1;  /* Mark as done; all branches below write out2 */
+            if (qtype2 == GGUF_TYPE_Q8_K_R8 || qtype2 == GGUF_TYPE_Q4_0_R8) {
+                size_t rb2 = gguf_type_row_size(qtype2, n);
+                size_t bs2 = rb2 * 8;
+                q8kr8_batch_ctx_t ctx2 = { .W = W2, .out = out2, .x = x, .n = n, .d = d, .d8 = d8,
+                                           .ng = ng, .n_batch = n_batch, .rb = rb2, .block_stride = bs2 };
+                tensor_parallel_for(n_batch * ng, qtype2 == GGUF_TYPE_Q8_K_R8
+                                    ? q8kr8_batch_task : q4r8_batch_task, &ctx2);
+            } else if (W2 && !picolm_sgemm_disabled_tensor() && n % 32 == 0 &&
+                       (qtype2 == GGUF_TYPE_Q8_0 || qtype2 == GGUF_TYPE_Q4_0 ||
+                        qtype2 == GGUF_TYPE_Q5_0 || qtype2 == GGUF_TYPE_IQ4_NL)) {
+                size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
+                int nb = n / 32;
+                void *qbuf = malloc((size_t)n_batch * q8_rb);
+                float *dbuf = (float *)malloc((size_t)n_batch * nb * sizeof(float));
+                if (qbuf && dbuf) {
+                    for (int b = 0; b < n_batch; b++) {
+                        quantize_row_q8_0(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
+                        const block_q8_0 *blk = (const block_q8_0 *)((char *)qbuf + (size_t)b * q8_rb);
+                        for (int k = 0; k < nb; k++)
+                            dbuf[(size_t)b * nb + k] = fp16_to_fp32(blk[k].d);
+                    }
+                    int nth = pool_total_threads(1);
+                    qgemm_d_ctx_t gctx = {
+                        .m = d, .n = n_batch, .k_blocks = nb,
+                        .A = W2, .lda = nb,
+                        .B = (const block_q8_0*)qbuf, .ldb = nb,
+                        .B_d = dbuf, .ldb_d = nb,
+                        .C = out2, .ldc = d,
+                        .Atype = qtype2, .nth = nth,
+                    };
+                    tensor_parallel_for(nth, qgemm_d_task, &gctx);
+                    free(dbuf); free(qbuf);
+                } else { free(dbuf); free(qbuf); }
+            } else if (W2) {
+                size_t rb2 = gguf_type_row_size(qtype2, n);
+                matmul_batch_scalar_threaded(out2, x, n_batch, W2, n, d, qtype2, rb2);
+            }
         }
 
         DISPATCH2("R8_scalar_vec_dot_dual");
@@ -7045,6 +7124,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                 }
             }
             free(qx_buf);
+            out1_done = 1; out2_done = 1;
         DISPATCH2("Q4_K/GEMM_d_single_thread");
             return;
         }
@@ -7093,6 +7173,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                     }
                 }
                 free(qx_buf);
+                out1_done = 1; out2_done = 1;
         DISPATCH2("Q4_0_4x4_dual_single_thread");
                 return;
             }
@@ -7173,8 +7254,43 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
         }
         if (qx1_buf) { free(qx1_buf); if (qx1_d_buf) free(qx1_d_buf); }
         if (qx2_buf && qx2_buf != qx1_buf) { free(qx2_buf); if (qx2_d_buf) free(qx2_d_buf); }
+
+        /* Double-work warning: if a side was already computed by an earlier
+         * dispatch section, we should NOT be reaching here for that side.
+         * This indicates a dispatch bug where a later section re-processes
+         * output that was already written, causing wasted computation. */
+        { static int _dw_warn = 0;
+          if (out1_done && !_dw_warn) {
+              _dw_warn = 1;
+              fprintf(stderr, "WARN: matmul_dual_batch double-work detected on out1 "
+                      "(qtype1=%d, d=%d, n=%d, batch=%d) -- an earlier dispatch "
+                      "section already computed this output. Check dispatch logic.\n",
+                      qtype1, d, n, n_batch);
+          }
+          if (out2_done && !_dw_warn) {
+              _dw_warn = 1;
+              fprintf(stderr, "WARN: matmul_dual_batch double-work detected on out2 "
+                      "(qtype2=%d, d=%d, n=%d, batch=%d) -- an earlier dispatch "
+                      "section already computed this output. Check dispatch logic.\n",
+                      qtype2, d, n, n_batch);
+          }
+        }
+
+        out1_done = 1; out2_done = 1;
         DISPATCH2("scalar_vec_dot");
         return;
+    }
+
+    /* Unreachable: safety net. If we fall through all dispatch sections
+     * without hitting a return, something is wrong in the dispatch logic. */
+    { static int _warn_once = 0;
+      if (!_warn_once) {
+          _warn_once = 1;
+          fprintf(stderr, "WARN: matmul_dual_batch fell through all dispatch sections "
+                  "without returning! d=%d n=%d batch=%d qtype1=%d qtype2=%d "
+                  "out1_done=%d out2_done=%d\n",
+                  d, n, n_batch, qtype1, qtype2, out1_done, out2_done);
+      }
     }
 }
 
