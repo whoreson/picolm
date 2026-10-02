@@ -8,6 +8,8 @@ extern int sgemm_iq4_k_q8_k_neon(int nrows, int ncols, int k, const void *vx, co
 extern int sgemm_q8_k_r8_q8_k_neon(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
 extern void vec_dot_q8_k_r8_q8_k_neon(const void *vx, const void *wy, int n, float *out, int nrows);
 /* NEON R4 GEMV declarations */
+extern int sgemm_iq6_k_q8_k_neon(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+extern void vec_dot_iq6_k_q8_k_neon(const void *vx, const void *wy, int n, float *out);
 #endif
 /* AVX2 GEMM declarations */
 #if defined(PICOLM_AVX2)
@@ -3984,6 +3986,13 @@ static void qgemm_q8kr8_task_neon(int idx, void *ctxp) {
     int nth = pool_total_threads(1);
     sgemm_q8_k_r8_q8_k_neon(c->nr, c->nc, c->k, c->w, c->abuf, c->out, c->bs, idx, nth);
 }
+
+/* IQ6_K plain NEON GEMM task wrapper */
+static void qgemm_iq6k_task_neon(int idx, void *ctxp) {
+    qgemm_q4r8_ctx_t *c = (qgemm_q4r8_ctx_t *)ctxp;
+    int nth = pool_total_threads(1);
+    sgemm_iq6_k_q8_k_neon(c->nr, c->nc, c->k, c->w, c->abuf, c->out, c->bs, idx, nth);
+}
 #endif /* PICOLM_NEON */
 
 /* Profiling: per-path timing for matmul_batch (PICOLM_PROFILE=1) */
@@ -4871,6 +4880,24 @@ void matmul_batch(float *out, const float *x, int n_batch,
             tensor_parallel_for(nth, qgemm_iq6k_task, &ctx);
             free(qbuf);
         DISPATCH("IQ6_K_sgemm");
+            return;
+        }
+    }
+#elif defined(PICOLM_NEON)
+    if (!picolm_sgemm_disabled_tensor() && qtype == GGUF_TYPE_IQ6_K && n_batch > 0 && n > 0 && n % 256 == 0) {
+        size_t q8_rb = (size_t)(n / 256) * sizeof(block_q8_K);
+        void *qbuf = malloc((size_t)n_batch * q8_rb);
+        if (qbuf) {
+            for (int b = 0; b < n_batch; b++)
+                quantize_row_q8_K(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
+            int nth = pool_total_threads(1);
+            qgemm_q4r8_ctx_t ctx = {
+                .nr = d, .nc = n_batch, .k = n,
+                .w = W, .abuf = qbuf, .out = out, .bs = d,
+            };
+            tensor_parallel_for(nth, qgemm_iq6k_task_neon, &ctx);
+            free(qbuf);
+        DISPATCH("IQ6_K_sgemm_neon");
             return;
         }
     }
