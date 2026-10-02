@@ -458,6 +458,47 @@ typedef enum {
     GGUF_TYPE_Q4_K_R4    = 212, /* 4-row interleaved Q4_K (GGUF type 212, llama.cpp ik branch) */
 } gguf_type_t;
 
+/* Activation format for a given weight quantization type.
+ * Single source of truth: every matmul dispatch path uses this to decide
+ * which quantization function to call on the activation buffer.
+ *
+ * ACT_FMT_F32   - no quantization, activation stays float32 (vec_dot fallback)
+ * ACT_FMT_Q8_0  - quantize to block_q8_0 (32 values/block, uint16_t d)
+ * ACT_FMT_Q8_K  - quantize to block_q8_K (256 values/block, float d)
+ */
+typedef enum {
+    ACT_FMT_F32  = 0,
+    ACT_FMT_Q8_0 = 1,
+    ACT_FMT_Q8_K = 2,
+} act_fmt_t;
+
+/* Return the activation format for a weight type.
+ * Default is Q8_K (K-quant family uses per-subblock scales).
+ * Q8_0 family uses the simpler block_q8_0 format. */
+static inline act_fmt_t qtype_act_format(gguf_type_t qtype) {
+    switch (qtype) {
+    /* Q8_0 activation family: simple block_q8_0 (32 values, uint16_t d) */
+    case GGUF_TYPE_Q8_0:
+    case GGUF_TYPE_Q4_0:
+    case GGUF_TYPE_IQ4_NL:
+    case GGUF_TYPE_IQ4_NL_R4:
+    case GGUF_TYPE_Q4_0_4_4:
+    case GGUF_TYPE_Q4_0_4_8:
+    case GGUF_TYPE_Q4_0_8_8:
+    case GGUF_TYPE_Q4_0_R8:
+    case GGUF_TYPE_Q8_0_R8:
+        return ACT_FMT_Q8_0;
+    /* F32 activation family: no quantization (vec_dot fallback only) */
+    case GGUF_TYPE_F32:
+    case GGUF_TYPE_F16:
+    case GGUF_TYPE_BF16:
+        return ACT_FMT_F32;
+    /* Everything else (K-quant family, IQ*, Q4I*, Q5*, Q6*, etc.) uses Q8_K */
+    default:
+        return ACT_FMT_Q8_K;
+    }
+}
+
 /* Packed struct attribute: empty on mainstream compilers where #pragma pack works,
  * but adds __attribute__((packed)) for LLVM-GCC 4.0.1 (iPhoneOS 1) which ignores
  * #pragma pack and pads structs to 4-byte boundaries.

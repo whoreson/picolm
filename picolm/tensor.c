@@ -1,3 +1,4 @@
+#include <assert.h>
 #include "tensor.h"
 #include "sgemm.h"
 /* Forward decl for NEON GEMM task wrapper */
@@ -3014,6 +3015,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
                     qtype == GGUF_TYPE_Q4_K_R4 ||
                     qtype == GGUF_TYPE_Q6_0 || qtype == GGUF_TYPE_Q1_0 ||
                     qtype == GGUF_TYPE_Q2_0 || qtype == GGUF_TYPE_IQ4_NL ||
+                    qtype == GGUF_TYPE_IQ4_NL_R4 ||
                     qtype == GGUF_TYPE_Q5_1 || qtype == GGUF_TYPE_Q4_0_R8 ||
                     qtype == GGUF_TYPE_Q8_K_R8 || qtype == GGUF_TYPE_Q4_0_4_4 ||
                     qtype == GGUF_TYPE_Q4_0_4_8 || qtype == GGUF_TYPE_Q4_0_8_8 ||
@@ -5911,27 +5913,36 @@ static void qgemm_q4x8_fallback(const float *x, int n_batch, int d, int n,
 typedef void (*r4_vecdot4_fn)(const void *, const void *, int, float *, int);
 typedef void (*r4_dequant_row_fn)(const void *, float *, int, int);
 
-static int r4_dual_lookup(gguf_type_t qtype, r4_vecdot4_fn *vd, r4_dequant_row_fn *dq) {
+/* R4 dual-batch lookup: returns vecdot kernel, dequant function, and activation format.
+ * The activation format is authoritative for choosing which buffer to pass.
+ * Adding a new R4 type requires exactly one entry here. */
+static int r4_dual_lookup(gguf_type_t qtype, r4_vecdot4_fn *vd, r4_dequant_row_fn *dq,
+                           act_fmt_t *act_fmt) {
     switch (qtype) {
     case GGUF_TYPE_IQ2_K_R4:
         *vd = vec_dot_iq2_k_r4_q8_k_avx2;
         *dq = (r4_dequant_row_fn)dequantize_row_iq2_k_r4_single;
+        *act_fmt = ACT_FMT_Q8_K;
         return 1;
     case GGUF_TYPE_IQ3_K_R4:
         *vd = vec_dot_iq3_k_r4_q8_k_avx2;
         *dq = (r4_dequant_row_fn)dequantize_row_iq3_k_r4_single;
+        *act_fmt = ACT_FMT_Q8_K;
         return 1;
     case GGUF_TYPE_IQ4_K_R4:
         *vd = vec_dot_iq4_k_r4_q8_k_avx2;
         *dq = (r4_dequant_row_fn)dequantize_row_iq4_k_r4_single;
+        *act_fmt = ACT_FMT_Q8_K;
         return 1;
     case GGUF_TYPE_IQ4_NL_R4:
         *vd = vec_dot_iq4_nl_r4_q8_0_avx2;
         *dq = (r4_dequant_row_fn)dequantize_row_iq4_nl_r4_single;
+        *act_fmt = ACT_FMT_Q8_0;
         return 1;
     case GGUF_TYPE_Q4_K_R4:
         *vd = vec_dot_q4_k_r4_q8_k_avx2;
         *dq = (r4_dequant_row_fn)dequantize_row_q4_k_r4_single;
+        *act_fmt = ACT_FMT_Q8_K;
         return 1;
     default:
         return 0;
@@ -5939,15 +5950,19 @@ static int r4_dual_lookup(gguf_type_t qtype, r4_vecdot4_fn *vd, r4_dequant_row_f
 }
 
 static int is_r4_dual_type(gguf_type_t qtype) {
-    r4_vecdot4_fn vd; r4_dequant_row_fn dq;
-    return r4_dual_lookup(qtype, &vd, &dq);
+    r4_vecdot4_fn vd; r4_dequant_row_fn dq; act_fmt_t af;
+    return r4_dual_lookup(qtype, &vd, &dq, &af);
 }
 
-/* AVX2/F16C path: qx is a pre-quantized Q8_K row shared by both sides. */
+/* Generic R4 serial helper: dispatches to the correct vecdot kernel based on
+ * activation format. The act_fmt parameter tells us whether to cast qx as
+ * Q8_K or Q8_0. This eliminates the need for separate r4_dual_side_avx2 and
+ * r4_dual_side_q8_0_avx2 functions. */
 static void r4_dual_side_avx2(float *out_col, const void *W, gguf_type_t qtype,
-                               const block_q8_K *qx, int n, int d) {
-    r4_vecdot4_fn vd; r4_dequant_row_fn dq;
-    r4_dual_lookup(qtype, &vd, &dq);
+                               const void *qx, int n, int d, act_fmt_t act_fmt) {
+    r4_vecdot4_fn vd; r4_dequant_row_fn dq; act_fmt_t af;
+    r4_dual_lookup(qtype, &vd, &dq, &af);
+    assert(af == act_fmt);  /* Caller must pass the right buffer type */
     size_t block_stride = gguf_type_row_size(qtype, n) * 4;
     int d4 = (d / 4) * 4;
     for (int i = 0; i < d4; i += 4) {
@@ -5966,28 +5981,11 @@ static void r4_dual_side_avx2(float *out_col, const void *W, gguf_type_t qtype,
  * IQ4_NL_R4 falls in this category (32-value Q8_0 blocks, not 256-value Q8_K). */
 static void r4_dual_side_q8_0_avx2(float *out_col, const void *W, gguf_type_t qtype,
                                     const block_q8_0 *qx, int n, int d) {
-    r4_vecdot4_fn vd; r4_dequant_row_fn dq;
-    r4_dual_lookup(qtype, &vd, &dq);
-    size_t block_stride = gguf_type_row_size(qtype, n) * 4;
-    int d4 = (d / 4) * 4;
-    for (int i = 0; i < d4; i += 4) {
-        float results[4] = {0, 0, 0, 0};
-        vd((const char *)W + (i / 4) * block_stride, qx, n, results, 4);
-        for (int r = 0; r < 4; r++) out_col[i + r] = results[r];
-    }
-    for (int i = d4; i < d; i++) {
-        float results[4] = {0, 0, 0, 0};
-        vd((const char *)W + (i / 4) * block_stride, qx, n, results, 4);
-        out_col[i] = results[i % 4];
-    }
+    r4_dual_side_avx2(out_col, W, qtype, qx, n, d, ACT_FMT_Q8_0);
 }
 
-/* Threaded R4 dual-batch: process one 4-row output group for ALL batch
- * tokens per task invocation. tensor_parallel_for distributes the d/4
- * row groups across threads; each thread streams its weight slice once
- * and reuses it across all n_batch activation rows (cache-friendly).
- * This replaces the serial per-token loop that made the R4 dual path
- * single-threaded (56% of prefill time on 1 core for K+V projections). */
+/* Generic R4 threaded task: activation buffer type is opaque, row bytes
+ * are pre-computed by the dispatcher. One struct type for both Q8_K and Q8_0. */
 typedef struct {
     const void *W;         /* weight matrix (R4 interleaved) */
     float *out;            /* output column (d floats per token) */
@@ -5995,17 +5993,17 @@ typedef struct {
     int n;                 /* input dim (per token) */
     int d;                 /* output dim (per token) */
     int n_batch;           /* number of token rows */
-    size_t q8_rb;          /* Q8_K row size in bytes */
+    size_t q8_rb;          /* activation row size in bytes (Q8_K or Q8_0) */
     size_t block_stride;   /* R4 block-group stride (row_size * 4) */
     r4_vecdot4_fn vd;      /* 4-row vec_dot kernel */
 } r4_dual_thread_task_t;
 
 static void r4_dual_thread_task(int idx, void *ctxp) {
     r4_dual_thread_task_t *c = (r4_dual_thread_task_t *)ctxp;
-    int i = idx * 4;  /* row group start (d is guaranteed % 4 == 0 here) */
+    int i = idx * 4;
     const char *wgrp = (const char *)c->W + (size_t)idx * c->block_stride;
     for (int b = 0; b < c->n_batch; b++) {
-        const block_q8_K *qx = (const block_q8_K *)(c->qbuf + (size_t)b * c->q8_rb);
+        const void *qx = (const void *)(c->qbuf + (size_t)b * c->q8_rb);
         float results[4] = {0, 0, 0, 0};
         c->vd(wgrp, qx, c->n, results, 4);
         for (int r = 0; r < 4; r++)
@@ -6014,18 +6012,17 @@ static void r4_dual_thread_task(int idx, void *ctxp) {
 }
 
 /* Threaded one-side R4 matmul: parallelize over d/4 row groups.
- * Returns 1 if dispatched, 0 if the type has no R4 vecdot or d % 4 != 0
- * (R4 weight layout guarantees d % 4 == 0, so the latter shouldn't happen).
- * NOTE: d % 4 must be 0 -- there is no tail handling. The R4 block layout
- * stores 4 rows per block group, so d % 4 != 0 is impossible for valid R4
- * weights; if it somehow happens, the caller falls back to the serial path. */
+ * The activation format is looked up from the type table, so the right
+ * buffer (Q8_K or Q8_0) is passed automatically. */
 static int r4_dual_side_threaded(float *out_col, const void *W, gguf_type_t qtype,
                                   const char *qbuf, int n, int d, int n_batch) {
-    r4_vecdot4_fn vd; r4_dequant_row_fn dq;
-    if (!r4_dual_lookup(qtype, &vd, &dq)) return 0;
-    size_t q8_rb = (size_t)(n / 256) * sizeof(block_q8_K);
+    r4_vecdot4_fn vd; r4_dequant_row_fn dq; act_fmt_t af;
+    if (!r4_dual_lookup(qtype, &vd, &dq, &af)) return 0;
+    size_t q8_rb = af == ACT_FMT_Q8_0 ?
+        gguf_type_row_size(GGUF_TYPE_Q8_0, n) :
+        (size_t)(n / 256) * sizeof(block_q8_K);
     size_t block_stride = gguf_type_row_size(qtype, n) * 4;
-    if (d < 4 || d % 4 != 0) return 0;  /* no tail handling: R4 guarantees d%4==0 */
+    if (d < 4 || d % 4 != 0) return 0;
 
     r4_dual_thread_task_t ctx = {
         .W = W, .out = out_col, .qbuf = qbuf,
@@ -6044,61 +6041,17 @@ static int r4_dual_side_threaded(float *out_col, const void *W, gguf_type_t qtyp
     return 1;
 }
 
-/* Q8_0 variant of r4_dual_thread_task for R4 types using Q8_0 activations. */
-typedef struct {
-    const void *W;
-    float *out;
-    const char *qbuf;      /* Q8_0 quantized activations */
-    int n, d, n_batch;
-    size_t q8_0_rb;        /* Q8_0 row size in bytes */
-    size_t block_stride;
-    r4_vecdot4_fn vd;
-} r4_dual_q8_0_thread_task_t;
-
-static void r4_dual_q8_0_thread_task(int idx, void *ctxp) {
-    r4_dual_q8_0_thread_task_t *c = (r4_dual_q8_0_thread_task_t *)ctxp;
-    int i = idx * 4;
-    const char *wgrp = (const char *)c->W + (size_t)idx * c->block_stride;
-    for (int b = 0; b < c->n_batch; b++) {
-        const block_q8_0 *qx = (const block_q8_0 *)(c->qbuf + (size_t)b * c->q8_0_rb);
-        float results[4] = {0, 0, 0, 0};
-        c->vd(wgrp, qx, c->n, results, 4);
-        for (int r = 0; r < 4; r++)
-            c->out[(size_t)b * c->d + i + r] = results[r];
-    }
-}
-
-/* Threaded one-side R4 matmul with Q8_0 activations (IQ4_NL_R4). */
+/* Q8_0 variant: thin wrapper for backward compat with existing callers. */
 static int r4_dual_side_q8_0_threaded(float *out_col, const void *W, gguf_type_t qtype,
                                        const char *qbuf, int n, int d, int n_batch) {
-    r4_vecdot4_fn vd; r4_dequant_row_fn dq;
-    if (!r4_dual_lookup(qtype, &vd, &dq)) return 0;
-    size_t q8_0_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
-    size_t block_stride = gguf_type_row_size(qtype, n) * 4;
-    if (d < 4 || d % 4 != 0) return 0;
-
-    r4_dual_q8_0_thread_task_t ctx = {
-        .W = W, .out = out_col, .qbuf = qbuf,
-        .n = n, .d = d, .n_batch = n_batch,
-        .q8_0_rb = q8_0_rb, .block_stride = block_stride, .vd = vd,
-    };
-    int ngroups = d / 4;
-    int nth = pool_total_threads(1);
-    int want = n_threads < nth ? n_threads : nth;
-    int active = want > ngroups ? ngroups : want;
-    if (active < 2) {
-        for (int g = 0; g < ngroups; g++) r4_dual_q8_0_thread_task(g, &ctx);
-    } else {
-        tensor_parallel_for(ngroups, r4_dual_q8_0_thread_task, &ctx);
-    }
-    return 1;
+    return r4_dual_side_threaded(out_col, W, qtype, qbuf, n, d, n_batch);
 }
 
 /* Portable scalar fallback: dequantize each row, plain F32 dot product. */
 static void r4_dual_side_scalar(float *out_col, const void *W, gguf_type_t qtype,
                                  const float *xrow, int n, int d) {
-    r4_vecdot4_fn vd; r4_dequant_row_fn dq;
-    r4_dual_lookup(qtype, &vd, &dq);
+    r4_vecdot4_fn vd; r4_dequant_row_fn dq; act_fmt_t af;
+    r4_dual_lookup(qtype, &vd, &dq, &af);
     size_t block_stride = gguf_type_row_size(qtype, n) * 4;
     int d4 = (d / 4) * 4;
     float *tmp = (float *)malloc((size_t)n * sizeof(float));
@@ -6238,8 +6191,8 @@ static void r4_scalar_dual_task(int idx, void *cp) {
     float *o2 = c->out2 + (size_t)b * c->d + i;
 
     if (c->is_r4_1) {
-        r4_dequant_row_fn dq; r4_vecdot4_fn vd;
-        r4_dual_lookup(c->qtype1, &vd, &dq);
+        r4_dequant_row_fn dq; r4_vecdot4_fn vd; act_fmt_t af;
+        r4_dual_lookup(c->qtype1, &vd, &dq, &af);
         size_t block_stride = c->rb1 * 4;
         const char *wblock = (const char *)c->W1 + (size_t)gr * block_stride;
         float *tmp = (float *)malloc((size_t)c->n * sizeof(float));
@@ -6254,8 +6207,8 @@ static void r4_scalar_dual_task(int idx, void *cp) {
     }
 
     if (c->is_r4_2) {
-        r4_dequant_row_fn dq; r4_vecdot4_fn vd;
-        r4_dual_lookup(c->qtype2, &vd, &dq);
+        r4_dequant_row_fn dq; r4_vecdot4_fn vd; act_fmt_t af;
+        r4_dual_lookup(c->qtype2, &vd, &dq, &af);
         size_t block_stride = c->rb2 * 4;
         const char *wblock = (const char *)c->W2 + (size_t)gr * block_stride;
         float *tmp = (float *)malloc((size_t)c->n * sizeof(float));
@@ -6668,33 +6621,35 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
     }
 
     /* R4-interleaved dual-batch dispatch: generalized over IQ2_K_R4,
-     * IQ3_K_R4, IQ4_K_R4 (and any future R4 type), replacing the six
-     * near-duplicated per-(type1,type2) blocks that used to live here.
-     * See r4_dual_lookup()/r4_dual_side_avx2()/r4_dual_side_scalar()
-     * above matmul_dual_batch() for rationale. */
+     * IQ3_K_R4, IQ4_K_R4, IQ4_NL_R4 (and any future R4 type).
+     * Activation format is looked up per-type via qtype_act_format().
+     * See r4_dual_lookup()/r4_dual_side_threaded() above for rationale. */
 #if defined(PICOLM_AVX2)
     if ((is_r4_dual_type(qtype1) || is_r4_dual_type(qtype2)) && n_batch > 0 && n > 0) {
         size_t q8_rb = (size_t)(n / 256) * sizeof(block_q8_K);
         void *qbuf = malloc((size_t)n_batch * q8_rb);
-        /* Non-R4 side may benefit from Q8_0 quantized activations + tiled GEMM
-         * (picolm_sgemm_d). Allocate those buffers when at least one side is
-         * a supported non-R4 type (Q8_0, Q4_0, Q5_0, IQ4_NL). */
-        int need_q8_0 = 0;
+
+        /* Determine per-side activation formats. R4 types use their format from
+         * r4_dual_lookup; non-R4 types use qtype_act_format(). */
+        act_fmt_t act1 = is_r4_dual_type(qtype1) ? (act_fmt_t)0 : qtype_act_format(qtype1);
+        act_fmt_t act2 = is_r4_dual_type(qtype2) ? (act_fmt_t)0 : qtype_act_format(qtype2);
+        /* For R4 types, the format comes from r4_dual_lookup. Look it up now. */
+        if (is_r4_dual_type(qtype1)) { r4_vecdot4_fn vd; r4_dequant_row_fn dq; act_fmt_t af;
+            r4_dual_lookup(qtype1, &vd, &dq, &af); act1 = af; }
+        if (is_r4_dual_type(qtype2)) { r4_vecdot4_fn vd; r4_dequant_row_fn dq; act_fmt_t af;
+            r4_dual_lookup(qtype2, &vd, &dq, &af); act2 = af; }
+
+        /* Do we need a Q8_0 buffer? When any side (R4 or non-R4) needs Q8_0. */
+        int need_q8_0 = (act1 == ACT_FMT_Q8_0 || act2 == ACT_FMT_Q8_0);
         gguf_type_t nonr4_type = (gguf_type_t)-1;   /* -1: no non-R4 side uses the Q8_0 GEMM */
         {
+            /* Find the non-R4 type for GEMM dispatch (if any). */
             gguf_type_t t1 = is_r4_dual_type(qtype1) ? qtype2 : qtype1;
             if (t1 == GGUF_TYPE_Q8_0 || t1 == GGUF_TYPE_Q4_0 ||
                 t1 == GGUF_TYPE_Q5_0 || t1 == GGUF_TYPE_IQ4_NL) {
-                need_q8_0 = 1;
                 nonr4_type = t1;
             }
         }
-        /* IQ4_NL_R4 consumes Q8_0 activations itself. Without this, when BOTH sides
-         * are R4 (K and V), need_q8_0 stayed 0, qbuf0 was NULL, and the R4 side fell
-         * through to r4_dual_side_threaded() with the Q8_K buffer -> the Q8_0 kernel
-         * read Q8_K bytes as Q8_0 blocks (garbage / NaN scales). */
-        if (qtype1 == GGUF_TYPE_IQ4_NL_R4 || qtype2 == GGUF_TYPE_IQ4_NL_R4)
-            need_q8_0 = 1;
         size_t q8_0_rb = need_q8_0 ? gguf_type_row_size(GGUF_TYPE_Q8_0, n) : 0;
         int q8_0_nb = need_q8_0 ? (n / 32) : 0;
         void *qbuf0 = NULL;
@@ -6714,27 +6669,16 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                         dbuf0[(size_t)b * q8_0_nb + k] = fp16_to_fp32(blk[k].d);
                 }
             }
-            /* Threaded: parallelize over output row groups (d/4 groups),
-             * each group processing all n_batch tokens. This keeps the
-             * weight blocks hot in cache across batch tokens (same access
-             * pattern as the tiled GEMM paths). Falls back to the serial
-             * per-token loop if threading is unavailable (d < 4, etc.). */
             int done1 = 0, done2 = 0;
             if (n_threads > 1 && n_batch > 1) {
                 if (!done1 && is_r4_dual_type(qtype1)) {
-                    /* IQ4_NL_R4 uses Q8_0 activations, not Q8_K. */
-                    if (qtype1 == GGUF_TYPE_IQ4_NL_R4 && qbuf0) {
-                        done1 = r4_dual_side_q8_0_threaded(out1, W1, qtype1, qbuf0, n, d, n_batch);
-                    } else {
-                        done1 = r4_dual_side_threaded(out1, W1, qtype1, qbuf, n, d, n_batch);
-                    }
+                    /* r4_dual_side_threaded looks up the format itself. */
+                    const char *buf1 = act1 == ACT_FMT_Q8_0 ? (const char *)qbuf0 : (const char *)qbuf;
+                    if (buf1) done1 = r4_dual_side_threaded(out1, W1, qtype1, buf1, n, d, n_batch);
                 }
                 if (!done2 && is_r4_dual_type(qtype2)) {
-                    if (qtype2 == GGUF_TYPE_IQ4_NL_R4 && qbuf0) {
-                        done2 = r4_dual_side_q8_0_threaded(out2, W2, qtype2, qbuf0, n, d, n_batch);
-                    } else {
-                        done2 = r4_dual_side_threaded(out2, W2, qtype2, qbuf, n, d, n_batch);
-                    }
+                    const char *buf2 = act2 == ACT_FMT_Q8_0 ? (const char *)qbuf0 : (const char *)qbuf;
+                    if (buf2) done2 = r4_dual_side_threaded(out2, W2, qtype2, buf2, n, d, n_batch);
                 }
             }
             /* Non-R4 side: use picolm_sgemm_d (tiled GEMM with Q8_0 activations)
@@ -6776,7 +6720,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                 /* Warn once per non-R4 type that falls through to scalar vec_dot
                  * in the R4 dual-batch path. This is slow because it uses F32
                  * activations and no SIMD GEMM. If you see this, add the type to
-                 * the need_q8_0 check above and ensure picolm_sgemm_d() supports it. */
+                 * picolm_sgemm_d(). */
                 if (!done1 && !is_r4_dual_type(qtype1)) {
                     static int warned1;
                     if (!warned1) { warned1 = 1;
@@ -6788,23 +6732,19 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                         fprintf(stderr, "WARN: matmul_dual_batch non-R4 side2 qtype=%d uses scalar vec_dot (slow). "
                                 "Add to picolm_sgemm_d + R4 dual GEMM path.\n", qtype2); } }
                 for (int b = 0; b < n_batch; b++) {
-                    const block_q8_K *qx = (const block_q8_K *)((char *)qbuf + (size_t)b * q8_rb);
-                    const block_q8_0 *qx0 = qbuf0 ? (const block_q8_0 *)((char *)qbuf0 + (size_t)b * gguf_type_row_size(GGUF_TYPE_Q8_0, n)) : NULL;
+                    const void *qx_k = (const void *)((const char *)qbuf + (size_t)b * q8_rb);
+                    const void *qx_0 = qbuf0 ? (const void *)((const char *)qbuf0 + (size_t)b * q8_0_rb) : NULL;
                     if (is_r4_dual_type(qtype1) && !done1) {
-                        if (qtype1 == GGUF_TYPE_IQ4_NL_R4 && qx0)
-                            r4_dual_side_q8_0_avx2(out1 + (size_t)b * d, W1, qtype1, qx0, n, d);
-                        else
-                            r4_dual_side_avx2(out1 + (size_t)b * d, W1, qtype1, qx, n, d);
+                        const void *qx = act1 == ACT_FMT_Q8_0 ? qx_0 : qx_k;
+                        if (qx) r4_dual_side_avx2(out1 + (size_t)b * d, W1, qtype1, qx, n, d, act1);
                     } else if (!done1) {
                         size_t rb1 = gguf_type_row_size(qtype1, n);
                         for (int i = 0; i < d; i++)
                             out1[b * d + i] = vec_dot((const char *)W1 + (size_t)i * rb1, x + (size_t)b * n, n, qtype1);
                     }
                     if (is_r4_dual_type(qtype2) && !done2) {
-                        if (qtype2 == GGUF_TYPE_IQ4_NL_R4 && qx0)
-                            r4_dual_side_q8_0_avx2(out2 + (size_t)b * d, W2, qtype2, qx0, n, d);
-                        else
-                            r4_dual_side_avx2(out2 + (size_t)b * d, W2, qtype2, qx, n, d);
+                        const void *qx = act2 == ACT_FMT_Q8_0 ? qx_0 : qx_k;
+                        if (qx) r4_dual_side_avx2(out2 + (size_t)b * d, W2, qtype2, qx, n, d, act2);
                     } else if (!done2) {
                         size_t rb2 = gguf_type_row_size(qtype2, n);
                         for (int i = 0; i < d; i++)
