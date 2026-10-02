@@ -96,13 +96,16 @@ void vec_dot_iq4_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out) 
                 _mm_loadu_si128((const __m128i *)(use_table1_hi ? iq4k_values_l + 16 : iq4k_values_l)),
                 qx_hi);
 
-            __m128i abs_qx_lo = _mm_sign_epi8(qx_lo, qx_lo);
-            __m128i abs_qx_hi = _mm_sign_epi8(qx_hi, qx_hi);
-            __m128i sy_lo = _mm_sign_epi8(y_lo, qx_lo);
-            __m128i sy_hi = _mm_sign_epi8(y_hi, qx_hi);
+            /* Sign trick on DEQUANTIZED LUT values, not raw nibbles.
+             * maddubs(|y|, sign(q8, y)) = |y| * q8 * sign(y) = y * q8
+             * Reference: iqk_common.h multiply_add_avx2() */
+            __m128i q8_lo = _mm_loadu_si128((const __m128i *)q8);
+            __m128i q8_hi = _mm_loadu_si128((const __m128i *)(q8 + 16));
 
-            __m128i sum16_lo = _mm_maddubs_epi16(abs_qx_lo, sy_lo);
-            __m128i sum16_hi = _mm_maddubs_epi16(abs_qx_hi, sy_hi);
+            __m128i abs_y_lo = _mm_sign_epi8(y_lo, y_lo);
+            __m128i abs_y_hi = _mm_sign_epi8(y_hi, y_hi);
+            __m128i sum16_lo = _mm_maddubs_epi16(abs_y_lo, _mm_sign_epi8(q8_lo, y_lo));
+            __m128i sum16_hi = _mm_maddubs_epi16(abs_y_hi, _mm_sign_epi8(q8_hi, y_hi));
 
             __m128i scale_lo_v = _mm_set1_epi16(scale_lo);
             __m128i scale_hi_v = _mm_set1_epi16(scale_hi);
