@@ -22,6 +22,9 @@
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 #endif
+#if defined(PICOLM_NEON)
+#include <arm_neon.h>
+#endif
 #include "quant.h"
 
 #define QK_K 256
@@ -422,4 +425,127 @@ void vec_dot_iq6_k_q8_k_vnni_batch(const void *vx, const void *wy, size_t y_stri
     for (int c = 0; c < ncols; ++c) out[c] = fs[c];
 }
 #endif
+
+/* ================================================================
+ * ARM NEON path: decode-once + per-group int8 MAC
+ * ================================================================ */
+#if defined(PICOLM_NEON)
+
+static inline void iq6_decode_block_neon(const block_iq6_k *x, int8_t w[256]) {
+    const uint8_t *qs = x->qs;
+    const uint8_t *qh = x->qh;
+    uint16_t extra = x->extra;
+    for (int v = 0; v < 256; v++) {
+        int chunk64 = v / 64;
+        int chunk2  = v / 128;
+        int shift   = ((v / 64) % 2 == 0) ? 0 : 4;
+
+        int byte_qs = chunk64 * 32 + (v % 32);
+        int nibble  = (v / 32) & 1;
+        int low4    = (qs[byte_qs] >> (4 * nibble)) & 0xf;
+
+        int byte_qh  = chunk2 * 32 + (v % 32);
+        int bit_pair = shift + ((v / 32) & 1) * 2;
+        int high2    = (qh[byte_qh] >> bit_pair) & 0x3;
+
+        int q6 = low4 | (high2 << 4);
+        int g  = v / 16;
+        int mn = (extra >> g) & 1;
+        w[v] = (int8_t)((int)iq6nl_lut[q6] - 128 + mn);
+    }
+}
+
+static inline int32_t iq6_dot_group_neon(const int8_t w[16], const int8_t a[16]) {
+#if defined(__ARM_FEATURE_MATMUL_INT8) || defined(__ARM_FEATURE_SVE_MATMUL_INT8)
+    const int8x16_t wv = vld1q_s8(w);
+    const int8x16_t av = vld1q_s8(a);
+    int32x4_t s = vmmlaq_s32(vdupq_n_s32(0), wv, av);
+    return vaddvq_s32(s);
+#else
+    const int8x16_t wv = vld1q_s8(w);
+    const int8x16_t av = vld1q_s8(a);
+    int16x8_t p0 = vmull_s8(vget_low_s8(wv), vget_low_s8(av));
+    int16x8_t p1 = vmull_s8(vget_high_s8(wv), vget_high_s8(av));
+    int32x4_t s = vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1));
+    return vaddvq_s32(s);
+#endif
+}
+
+void vec_dot_iq6_k_q8_k_neon(const void *vx, const void *wy, int n, float *out) {
+    const block_iq6_k *x = (const block_iq6_k *)vx;
+    const block_q8_K *y = (const block_q8_K *)wy;
+    const int nb = n / QK_K;
+
+    float sumf = 0.0f;
+    for (int ibl = 0; ibl < nb; ++ibl) {
+        int8_t w[256];
+        iq6_decode_block_neon(&x[ibl], w);
+        const float dd = fp16_to_fp32_lookup(x[ibl].d) * y[ibl].d;
+        const int8_t *q8 = y[ibl].qs;
+        const int8_t *sl = x[ibl].scales;
+
+        int32_t block_sum = 0;
+        for (int g = 0; g < 16; g++) {
+            block_sum += sl[g] * iq6_dot_group_neon(w + g * 16, q8 + g * 16);
+        }
+        sumf += dd * (float)block_sum;
+    }
+    *out = sumf;
+}
+
+void vec_dot_iq6_k_q8_k_neon_batch(const void *vx, const void *wy, size_t y_stride,
+                                   int n, int ncols, float *out) {
+    const block_iq6_k *x = (const block_iq6_k *)vx;
+    const int nb = n / QK_K;
+
+    for (int c = 0; c < ncols; c++) out[c] = 0.0f;
+
+    for (int ibl = 0; ibl < nb; ++ibl) {
+        int8_t w[256];
+        iq6_decode_block_neon(&x[ibl], w);
+        const float d = fp16_to_fp32_lookup(x[ibl].d);
+        const int8_t *sl = x[ibl].scales;
+        for (int c = 0; c < ncols; c++) {
+            const block_q8_K *yb = (const block_q8_K *)((const char *)wy + (size_t)c * y_stride) + ibl;
+            const float dd = d * yb->d;
+            const int8_t *q8 = yb->qs;
+            int32_t block_sum = 0;
+            for (int g = 0; g < 16; g++) {
+                block_sum += sl[g] * iq6_dot_group_neon(w + g * 16, q8 + g * 16);
+            }
+            out[c] += dd * (float)block_sum;
+        }
+    }
+}
+
+int sgemm_iq6_k_q8_k_neon(int nrows, int ncols, int k,
+                          const void *vx, const void *vy,
+                          float *out, size_t bs,
+                          int ith, int nth) {
+    if (nrows < 1 || ncols < 1 || k % QK_K != 0)
+        return 0;
+
+    const int nb = k / QK_K;
+    const size_t w_row_bytes = (size_t)nb * sizeof(block_iq6_k);
+    const size_t a_row_bytes = (size_t)nb * sizeof(block_q8_K);
+
+    int64_t tiles = (int64_t)nrows * ncols;
+    int64_t duty = (tiles + nth - 1) / nth;
+    int64_t start = duty * ith;
+    int64_t end = start + duty;
+    if (end > tiles) end = tiles;
+
+    for (int64_t t = start; t < end; t++) {
+        int i = (int)(t / ncols);
+        int j = (int)(t % ncols);
+        const void *wrow = (const char *)vx + (size_t)i * w_row_bytes;
+        const void *acol = (const char *)vy + (size_t)j * a_row_bytes;
+        float result;
+        vec_dot_iq6_k_q8_k_neon(wrow, acol, k, &result);
+        out[i + (size_t)j * bs] = result;
+    }
+    return nrows;
+}
+
+#endif /* PICOLM_NEON */
 

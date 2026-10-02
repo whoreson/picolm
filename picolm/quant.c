@@ -8974,6 +8974,10 @@ float vec_dot_iq6_k_q8_k(const void *vx, const void *wy, int n) {
     float result;
     vec_dot_iq6_k_q8_k_avx2(vx, wy, n, &result);
     return result;
+#elif defined(PICOLM_NEON) && !defined(PICOLM_FORCE_SCALAR)
+    float result;
+    vec_dot_iq6_k_q8_k_neon(vx, wy, n, &result);
+    return result;
 #else
     const block_iq6_k *x = (const block_iq6_k *)vx;
     const block_q8_K *y = (const block_q8_K *)wy;
@@ -9030,6 +9034,8 @@ void vec_dot_iq6_k_q8_k_batch(const void *vx, const void *wy, size_t y_stride,
                               int n, int ncols, float *out) {
 #if defined(PICOLM_AVX2) && defined(__AVX2__) && !defined(PICOLM_FORCE_SCALAR)
     vec_dot_iq6_k_q8_k_avx2_batch(vx, wy, y_stride, n, ncols, out);
+#elif defined(PICOLM_NEON) && !defined(PICOLM_FORCE_SCALAR)
+    vec_dot_iq6_k_q8_k_neon_batch(vx, wy, y_stride, n, ncols, out);
 #else
     for (int c = 0; c < ncols; c++)
         out[c] = vec_dot_iq6_k_q8_k(vx, (const char *)wy + (size_t)c * y_stride, n);

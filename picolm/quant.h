@@ -1269,6 +1269,12 @@ void vec_dot_iq6_k_q8_k_batch(const void *vx, const void *wy, size_t y_stride,
                               int n, int ncols, float *out);
 int sgemm_iq6_k_q8_k_avx2(int nrows, int ncols, int k, const void *vx, const void *vy,
                            float *out, size_t bs, int ith, int nth);
+/* IQ6_K plain x Q8_K ARM NEON GEMV/GEMM. */
+void vec_dot_iq6_k_q8_k_neon(const void *vx, const void *wy, int n, float *out);
+void vec_dot_iq6_k_q8_k_neon_batch(const void *vx, const void *wy, size_t y_stride,
+                                   int n, int ncols, float *out);
+int sgemm_iq6_k_q8_k_neon(int nrows, int ncols, int k, const void *vx, const void *vy,
+                          float *out, size_t bs, int ith, int nth);
 /* IQ4_K_R4 x Q8_K scalar vec_dot (row 0 only). */
 float vec_dot_iq4_k_r4_q8_k(const void *vx, const void *wy, int n);
 /* IQ4_K_R4 x Q8_K AVX2 GEMV: 4 weight rows x 1 activation row.
