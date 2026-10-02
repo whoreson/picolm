@@ -552,6 +552,42 @@ void dequantize_row_iq4_nl(const void *src, float *dst, int n) {
     }
 }
 
+/* Dequantize IQ4_NL_R4: 4-row interleaved, single row.
+ * Same interleaving pattern as Q4_0_4_4 (blocklen=4), but uses non-linear
+ * LUT instead of signed nibble extraction. No XOR with 0x88.
+ *
+ * Interleaving (blocklen=4): for each k=0..3:
+ *   qs[k*16 + 0..3]   = row0 nibble-bytes at offset k*4..k*4+3
+ *   qs[k*16 + 4..7]   = row1 nibble-bytes at offset k*4..k*4+3
+ *   qs[k*16 + 8..11]  = row2 nibble-bytes at offset k*4..k*4+3
+ *   qs[k*16 + 12..15] = row3 nibble-bytes at offset k*4..k*4+3
+ * Output: 32 values per block, laid out as 4 groups of 8 values each
+ * (matching the repack pattern: 0..3, 8..11, 16..19, 24..27, 4..7, 12..15, 20..23, 28..31). */
+void dequantize_row_iq4_nl_r4_single(const block_iq4_nl_r4 *x, float *dst, int n, int row) {
+    int nb = n / 32;  /* blocks per row */
+
+    for (int ib = 0; ib < nb; ib++) {
+        float d = fp16_to_fp32_lookup(x[ib].d[row]);
+        float *dp = dst + ib * 32;
+        const uint8_t *qs = x[ib].qs;
+        for (int i = 0; i < 4; ++i) {
+            dp[i+ 0] = d * (float)kvalues_iq4nl[qs[4*row+i+ 0] & 0xf];
+            dp[i+ 8] = d * (float)kvalues_iq4nl[qs[4*row+i+ 0] >>  4];
+            dp[i+16] = d * (float)kvalues_iq4nl[qs[4*row+i+16] & 0xf];
+            dp[i+24] = d * (float)kvalues_iq4nl[qs[4*row+i+16] >>  4];
+            dp[i+ 4] = d * (float)kvalues_iq4nl[qs[4*row+i+32] & 0xf];
+            dp[i+12] = d * (float)kvalues_iq4nl[qs[4*row+i+32] >>  4];
+            dp[i+20] = d * (float)kvalues_iq4nl[qs[4*row+i+48] & 0xf];
+            dp[i+28] = d * (float)kvalues_iq4nl[qs[4*row+i+48] >>  4];
+        }
+    }
+}
+
+/* Dequantize IQ4_NL_R4: all 4 rows at once (called by generic dispatcher) */
+void dequantize_row_iq4_nl_r4(const void *src, float *dst, int n) {
+    dequantize_row_iq4_nl_r4_single((const block_iq4_nl_r4 *)src, dst, n, 0);
+}
+
 /* Dequantize Q4_1: val = qs[j] * d + m (unsigned nibble) */
 void dequantize_row_q4_1(const void *src, float *dst, int n) {
     const block_q4_1 *blocks = (const block_q4_1 *)src;
@@ -837,6 +873,7 @@ void dequantize_row(const void *src, float *dst, int n, gguf_type_t type) {
         case GGUF_TYPE_Q2_0:     dequantize_row_q2_0(src, dst, n); break;
         case GGUF_TYPE_Q6_0:     dequantize_row_q6_0(src, dst, n); break;
         case GGUF_TYPE_IQ4_NL:   dequantize_row_iq4_nl(src, dst, n); break;
+        case GGUF_TYPE_IQ4_NL_R4: dequantize_row_iq4_nl_r4(src, dst, n); break;
 case GGUF_TYPE_Q4_0_R8:  dequantize_row_q4_0_r8(src, dst, n); break;
         case GGUF_TYPE_Q8_0_R8:  dequantize_row_q8_0_r8(src, dst, n); break;
         case GGUF_TYPE_Q8_K_R8:  dequantize_row_q8_k_r8(src, dst, n); break;
@@ -864,6 +901,7 @@ int gguf_type_block_size(gguf_type_t type) {
         case GGUF_TYPE_Q4_0:  return 32;
         case GGUF_TYPE_Q4_1:  return 32;
         case GGUF_TYPE_IQ4_NL: return 32;
+        case GGUF_TYPE_IQ4_NL_R4: return 32;  /* same as IQ4_NL: 32 values per row per block */
         case GGUF_TYPE_IQ2_K:    return 256;  /* QK_K values per row */
         case GGUF_TYPE_IQ3_K:    return 256;  /* QK_K values per row */
         case GGUF_TYPE_IQ2_K_R4: return 256;  /* QK_K values per row */
@@ -905,6 +943,7 @@ int gguf_type_quant_size(gguf_type_t type) {
         case GGUF_TYPE_Q4_0:  return 18;
         case GGUF_TYPE_Q4_1:  return 20;
         case GGUF_TYPE_IQ4_NL: return 18;  /* same layout as Q4_0 */
+        case GGUF_TYPE_IQ4_NL_R4: return (int)sizeof(block_iq4_nl_r4);  /* 72: 4 rows interleaved */
         case GGUF_TYPE_IQ2_K:    return (int)sizeof(block_iq2_k);  /* 76: single row */
         case GGUF_TYPE_IQ3_K:    return (int)sizeof(block_iq3_k);  /* 110: single row */
         case GGUF_TYPE_IQ2_K_R4: return (int)sizeof(block_iq2_k_r4);  /* 304: 4 rows interleaved */
@@ -960,6 +999,10 @@ size_t gguf_type_row_size(gguf_type_t type, int n) {
     /* Q4_K_R4: 4 rows per block. Each block = 576 bytes, covers 4 rows x 256 values. */
     if (type == GGUF_TYPE_Q4_K_R4) {
         return (size_t)sizeof(block_q4_k_r4) * (size_t)(n / QK_K) / 4;
+    }
+    /* IQ4_NL_R4: 4 rows per block. Each block = 72 bytes, covers 4 rows x 32 values. */
+    if (type == GGUF_TYPE_IQ4_NL_R4) {
+        return (size_t)sizeof(block_iq4_nl_r4) * (size_t)(n / 32) / 4;
     }
     /* Compute full row size including partial blocks: qs * n / bs.
      * The GGUF stores tensors as flat block arrays. For non-block-aligned
@@ -4207,6 +4250,84 @@ void iq4_nl_row_to_q8_0_shadow(const void *iq4_row, void *q8_row_out, int n) {
     }
 }
 
+/* IQ4_NL_R4 x Q8_0 scalar vec_dot (single row, row 0).
+ * Interleaving: 4 groups of 4 bytes per row, at offsets 0,16,32,48.
+ * Each byte produces 2 dequant values at non-contiguous output positions:
+ *   qs[4*r+i+ 0]: low->out[i+0], high->out[i+8]
+ *   qs[4*r+i+16]: low->out[i+16], high->out[i+24]
+ *   qs[4*r+i+32]: low->out[i+4], high->out[i+12]
+ *   qs[4*r+i+48]: low->out[i+20], high->out[i+28]
+ * Match each dequant value with the corresponding activation index. */
+float vec_dot_iq4_nl_r4_q8_0(const void *vx, const void *wy, int n) {
+    const block_iq4_nl_r4 *xb = (const block_iq4_nl_r4 *)vx;
+    const block_q8_0 *y = (const block_q8_0 *)wy;
+    int nb = n / 32;
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ib++) {
+        float dd = fp16_to_fp32_lookup(xb[ib].d[0]) * fp16_to_fp32_lookup(y[ib].d);
+        const uint8_t *qs = xb[ib].qs;
+        const int8_t *ya = y[ib].qs;
+        int sumi = 0;
+        for (int i = 0; i < 4; i++) {
+            uint8_t b0 = qs[0 + i];
+            uint8_t b1 = qs[16 + i];
+            uint8_t b2 = qs[32 + i];
+            uint8_t b3 = qs[48 + i];
+            sumi += kvalues_iq4nl[b0 & 0xf] * ya[i + 0];
+            sumi += kvalues_iq4nl[b0 >> 4] * ya[i + 8];
+            sumi += kvalues_iq4nl[b1 & 0xf] * ya[i + 16];
+            sumi += kvalues_iq4nl[b1 >> 4] * ya[i + 24];
+            sumi += kvalues_iq4nl[b2 & 0xf] * ya[i + 4];
+            sumi += kvalues_iq4nl[b2 >> 4] * ya[i + 12];
+            sumi += kvalues_iq4nl[b3 & 0xf] * ya[i + 20];
+            sumi += kvalues_iq4nl[b3 >> 4] * ya[i + 28];
+        }
+        sumf += (float)sumi * dd;
+    }
+    return sumf;
+}
+
+/* IQ4_NL_R4 x Q8_0 batched vec_dot: 4 rows at once. */
+void vec_dot_iq4_nl_r4_q8_0_batch4(const void *vx, const void *wy, int n, float *out) {
+    const block_iq4_nl_r4 *xb = (const block_iq4_nl_r4 *)vx;
+    const block_q8_0 *y = (const block_q8_0 *)wy;
+    int nb = n / 32;
+
+#if defined(PICOLM_AVX2)
+    vec_dot_iq4_nl_r4_q8_0_avx2(vx, wy, n, out, 4);
+#else
+    /* Scalar: process each of 4 rows individually from interleaved data.
+     * Row r: qs[4*r+i+offset] for offset = 0,16,32,48 and i=0..3.
+     * Each byte produces 2 values at non-contiguous positions. */
+    for (int r = 0; r < 4; r++) {
+        float sumf = 0.0f;
+        for (int ib = 0; ib < nb; ib++) {
+            float dd = fp16_to_fp32_lookup(xb[ib].d[r]) * fp16_to_fp32_lookup(y[ib].d);
+            const uint8_t *qs = xb[ib].qs;
+            const int8_t *ya = y[ib].qs;
+            int sumi = 0;
+            for (int i = 0; i < 4; i++) {
+                uint8_t b0 = qs[4*r+i+ 0];
+                uint8_t b1 = qs[4*r+i+16];
+                uint8_t b2 = qs[4*r+i+32];
+                uint8_t b3 = qs[4*r+i+48];
+                sumi += kvalues_iq4nl[b0 & 0xf] * ya[i + 0];
+                sumi += kvalues_iq4nl[b0 >> 4] * ya[i + 8];
+                sumi += kvalues_iq4nl[b1 & 0xf] * ya[i + 16];
+                sumi += kvalues_iq4nl[b1 >> 4] * ya[i + 24];
+                sumi += kvalues_iq4nl[b2 & 0xf] * ya[i + 4];
+                sumi += kvalues_iq4nl[b2 >> 4] * ya[i + 12];
+                sumi += kvalues_iq4nl[b3 & 0xf] * ya[i + 20];
+                sumi += kvalues_iq4nl[b3 >> 4] * ya[i + 28];
+            }
+            sumf += (float)sumi * dd;
+        }
+        out[r] = sumf;
+    }
+#endif
+}
+
 void q4_0_row_to_q8_0_shadow(const void *q4_row, void *q8_row_out, int n) {
     const block_q4_0 *q4 = (const block_q4_0 *)q4_row;
     block_q8_0 *q8 = (block_q8_0 *)q8_row_out;
@@ -6949,6 +7070,14 @@ float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
         case GGUF_TYPE_Q8_0: return vec_dot_q8_0_f32(src, x, n);
         case GGUF_TYPE_Q4_0: return vec_dot_q4_0_f32(src, x, n);
         case GGUF_TYPE_IQ4_NL: return vec_dot_iq4_nl_f32(src, x, n);
+        case GGUF_TYPE_IQ4_NL_R4: {
+            float *tmp = (float *)malloc((size_t)n * sizeof(float));
+            if (!tmp) return 0.0f;
+            dequantize_row_iq4_nl_r4_single((const block_iq4_nl_r4 *)src, tmp, n, 0);
+            float result = vec_dot_f32_f32(tmp, x, n);
+            free(tmp);
+            return result;
+        }
         case GGUF_TYPE_Q4_1: return vec_dot_q4_1_f32(src, x, n);
         case GGUF_TYPE_Q5_0: return vec_dot_q5_0_f32(src, x, n);
         case GGUF_TYPE_Q5_1: return vec_dot_q5_1_f32(src, x, n);

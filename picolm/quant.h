@@ -440,6 +440,7 @@ typedef enum {
     GGUF_TYPE_Q4I_0_8_8  = 34,  /* 8-row pre-dequantized int8 Q4_0 (dpbusd lane order, AVX-512) */
     GGUF_TYPE_BF16      = 30,  /* Brain Float 16 (GGUF type 30) */
     GGUF_TYPE_IQ4_NL    = 20,  /* Non-linear 4-bit quant (LUT-based, same layout as Q4_0) */
+    GGUF_TYPE_IQ4_NL_R4 = 220, /* 4-row interleaved IQ4_NL (repacked, AVX-512/AVX2 target) */
     GGUF_TYPE_IQ2_K     = 137, /* Plain IQ2_K (non-interleaved, GGUF type 137) */
     GGUF_TYPE_IQ3_K     = 138, /* Plain IQ3_K (non-interleaved, GGUF type 138) */
     GGUF_TYPE_IQ4_K     = 139, /* Plain IQ4_K (non-interleaved, GGUF type 139) */
@@ -752,6 +753,29 @@ typedef char __compiletime_assert_iq4_nl_size[(sizeof(block_iq4_nl) == sizeof(bl
 /* IQ4_NL dequantization lookup table (16 entries, int8) */
 /* Derived from llama.cpp ggml-common.h GGML_TABLE_BEGIN(int8_t, kvalues_iq4nl, 16) */
 extern const int8_t kvalues_iq4nl[16];
+
+/* IQ4_NL_R4 block (GGUF type 220): 4-row interleaved IQ4_NL.
+ * Identical layout to block_q4_0x4 (72 bytes = 4*18), but dequant uses
+ * the non-linear IQ4_NL LUT instead of signed nibble subtraction.
+ *
+ * Layout:
+ *   d[4]:  4 FP16 global scales, one per row
+ *   qs[64]: 4 rows x 16 bytes, interleaved with stride 4:
+ *     For block group ib, row r, byte offset j:
+ *       qs[ib*64 + r*16 + j]  (r=0..3, j=0..15)
+ *   Each row: 32 values per block group (QK4_NL=32)
+ *   Dequant: val = kvalues_iq4nl[nibble] * d[row]
+ *   No XOR with 0x88 (unlike Q4_0_4_4).
+ */
+#pragma pack(push, 1)
+typedef struct PICOLM_PACKED_ATTR {
+    uint16_t d[4];      /* 4 FP16 deltas, one per row */
+    uint8_t  qs[64];    /* interleaved nibble-bytes (4 rows x 16 bytes) */
+} block_iq4_nl_r4;      /* 72 bytes = 4 * 18 */
+#pragma pack(pop)
+#if !defined(_MSC_VER)
+typedef char __compiletime_assert_iq4_nl_r4_size[(sizeof(block_iq4_nl_r4) == 72) ? 1 : -1] __attribute__((unused));
+#endif
 
 /* IQ2_K plain block (GGUF type 137): single-row 2-bit non-linear quant.
  * Size: 76 bytes per block (QK_K=256 values).
@@ -1234,6 +1258,32 @@ void dequantize_row_iq3_k_r4(const void *src, float *dst, int n);
 void dequantize_row_iq2_k_r4_single(const block_iq2_k_r4 *x, float *dst, int n, int row);
 void dequantize_row_iq3_k_r4_single(const block_iq3_k_r4 *x, float *dst, int n, int row);
 void dequantize_row_iq4_k_r4_single(const block_iq4_k_r4 *x, float *dst, int n, int row);
+
+/* IQ4_NL_R4 dequantize: single row from 4-row interleaved block.
+ * dst must have space for n floats. n is per-row (total = n*4 in GGUF). */
+void dequantize_row_iq4_nl_r4(const void *src, float *dst, int n);
+void dequantize_row_iq4_nl_r4_single(const block_iq4_nl_r4 *x, float *dst, int n, int row);
+/* IQ4_NL_R4 x Q8_0 scalar vec_dot (single row). */
+float vec_dot_iq4_nl_r4_q8_0(const void *vx, const void *wy, int n);
+/* IQ4_NL_R4 x Q8_0 batched vec_dot: 4 rows at once. */
+void vec_dot_iq4_nl_r4_q8_0_batch4(const void *vx, const void *wy, int n, float *out);
+/* IQ4_NL_R4 x Q8_0 AVX2 GEMV: 4 weight rows x 1 activation row. */
+void vec_dot_iq4_nl_r4_q8_0_avx2(const void *vx, const void *wy, int n,
+                                  float *out, int nrows);
+/* IQ4_NL_R4 x Q8_0 NEON GEMV: 4 weight rows x 1 activation row. */
+void vec_dot_iq4_nl_r4_q8_0_neon(const void *vx, const void *wy, int n,
+                                  float *out, int nrows);
+/* IQ4_NL_R4 x Q8_0 batched GEMM (AVX2). */
+int sgemm_iq4_nl_r4_q8_0_avx2(int nrows, int ncols, int k,
+                               const void *vx, const void *vy,
+                               float *out, size_t bs,
+                               int ith, int nth);
+/* IQ4_NL_R4 x Q8_0 batched GEMM (NEON). */
+int sgemm_iq4_nl_r4_q8_0_neon(int nrows, int ncols, int k,
+                               const void *vx, const void *vy,
+                               float *out, size_t bs,
+                               int ith, int nth);
+
 /* IQ3_K_R4 x Q8_K AVX2 GEMV: 4 weight rows x 1 activation row.
  * out: 4 output floats. nrows must be 4. n must be multiple of 256. */
 void vec_dot_iq3_k_r4_q8_k_avx2(const void *vx, const void *wy, int n,
