@@ -2107,6 +2107,12 @@ int parse_gguf(model_t *m, int max_seq_len) {
                 blk->d = GGUF_LE16(blk->d);
                 blk->dmin = GGUF_LE16(blk->dmin);
             }
+        } else if (qt == GGUF_TYPE_IQ4_XS) {
+            size_t nblocks = nrows / 256;
+            for (size_t b = 0; b < nblocks; b++) {
+                block_iq4_xs *blk = (block_iq4_xs *)((uint8_t *)ptr + b * sizeof(block_iq4_xs));
+                blk->d = GGUF_LE16(blk->d);
+            }
         } else {
             fprintf(stderr, "WARNING: big-endian BE swap: unsupported tensor type %u (%s) for tensor '%.*s' -- data will be corrupted\n",
                     (unsigned)qt, gguf_type_name(qt), (int)tinfos[i].name.len, tinfos[i].name.str);

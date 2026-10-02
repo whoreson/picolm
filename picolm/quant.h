@@ -441,6 +441,7 @@ typedef enum {
     GGUF_TYPE_BF16      = 30,  /* Brain Float 16 (GGUF type 30) */
     GGUF_TYPE_IQ4_NL    = 20,  /* Non-linear 4-bit quant (LUT-based, same layout as Q4_0) */
     GGUF_TYPE_IQ4_NL_R4 = 220, /* 4-row interleaved IQ4_NL (repacked, AVX-512/AVX2 target) */
+    GGUF_TYPE_IQ4_XS    = 23,  /* Non-linear 4-bit quant with per-subblock scales (K-style, GGUF type 23) */
     GGUF_TYPE_IQ2_K     = 137, /* Plain IQ2_K (non-interleaved, GGUF type 137) */
     GGUF_TYPE_IQ3_K     = 138, /* Plain IQ3_K (non-interleaved, GGUF type 138) */
     GGUF_TYPE_IQ4_K     = 139, /* Plain IQ4_K (non-interleaved, GGUF type 139) */
@@ -818,6 +819,31 @@ typedef struct PICOLM_PACKED_ATTR {
 typedef char __compiletime_assert_iq4_nl_r4_size[(sizeof(block_iq4_nl_r4) == 72) ? 1 : -1] __attribute__((unused));
 #endif
 
+/* IQ4_XS block (GGUF type 23): 256 weights (non-linear 4-bit quant with per-subblock scales).
+ * Layout (from ik_llama.cpp ggml-common.h):
+ *   d:         FP16 global scale
+ *   scales_h:  16-bit: high 2 bits for each of 8 sub-scales (bits 0-1, 2-3, ..., 14-15)
+ *   scales_l[4]: low 4 bits for each of 8 sub-scales (packed 2 per byte)
+ *   qs[128]:   4-bit quantized values (indices into kvalues_iq4nl LUT)
+ *
+ * Each sub-scale = (scales_l_nib | ((scales_h_nib) << 4)) - 32, where:
+ *   scales_l_nib = (scales_l[ib/2] >> (4*(ib%2))) & 0xf
+ *   scales_h_nib = (scales_h >> (2*ib)) & 3
+ *
+ * Dequant: val = d * scale[subblock] * kvalues_iq4nl[nibble]
+ * Size: 2 + 2 + 4 + 128 = 136 bytes per block (QK_K=256 values). */
+#pragma pack(push, 1)
+typedef struct PICOLM_PACKED_ATTR {
+    uint16_t d;             /* global scale (FP16) */
+    uint16_t scales_h;      /* high 2 bits x 8 sub-scales (16 bits) */
+    uint8_t  scales_l[4];   /* low 4 bits x 8 sub-scales (8 nibbles = 4 bytes) */
+    uint8_t  qs[128];       /* 4-bit quantized values (256 nibbles = 128 bytes) */
+} block_iq4_xs;            /* 136 bytes */
+#pragma pack(pop)
+#if !defined(_MSC_VER)
+typedef char __compiletime_assert_iq4_xs_size[(sizeof(block_iq4_xs) == 136) ? 1 : -1] __attribute__((unused));
+#endif
+
 /* IQ2_K plain block (GGUF type 137): single-row 2-bit non-linear quant.
  * Size: 76 bytes per block (QK_K=256 values).
  *
@@ -1144,6 +1170,12 @@ float vec_dot_q4_0_q8_0(const void *src_q4, const void *src_q8, int n);
 float vec_dot_iq4_nl_q8_0(const void *src_iq4, const void *src_q8, int n);
 /* IQ4_NL * F32 dot product: fused dequant + dot (scalar fallback) */
 float vec_dot_iq4_nl_f32(const void *src_iq4, const float *x, int n);
+/* IQ4_XS dequantize: convert IQ4_XS bytes to float32 */
+void dequantize_row_iq4_xs(const void *src, float *dst, int n);
+/* IQ4_XS * Q8_K dot product: IQ4_XS weights with pre-quantized Q8_K input */
+float vec_dot_iq4_xs_q8_k(const void *src_iq4, const void *src_q8, int n);
+/* IQ4_XS * F32 dot product: fused dequant + dot (scalar fallback) */
+float vec_dot_iq4_xs_f32(const void *src_iq4, const float *x, int n);
 /* Q4_K * Q8_K dot product: Q4_K weights with pre-quantized Q8_K input */
 float vec_dot_q4_K_q8_K(const void *src_q4, const void *src_q8, int n);
 /* Q5_K * Q8_K dot product: Q5_K weights with pre-quantized Q8_K input */
