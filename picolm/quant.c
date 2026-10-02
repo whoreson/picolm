@@ -8571,7 +8571,7 @@ extern void vec_dot_iq3_k_q8_k_avx2(const void *vx, const void *wy, int n, float
 extern void vec_dot_iq3_k_q8_k_neon(const void *vx, const void *wy, int n, float *out);
 
 float vec_dot_iq3_k_q8_k(const void *vx, const void *wy, int n) {
-#if defined(PICOLM_AVX2)
+#if defined(PICOLM_AVX2) && defined(__AVX2__) && !defined(PICOLM_FORCE_SCALAR)
     float result;
     vec_dot_iq3_k_q8_k_avx2(vx, wy, n, &result);
     return result;
