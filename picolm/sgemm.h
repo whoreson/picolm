@@ -59,6 +59,11 @@ int sgemm_q4i_0x8_q8_0x4(int nr, int nc, int k,
         const void *vx, const void *vy, float *s, size_t bs,
         int ith, int nth);
 
+/* IQ4_K plain x Q8_K tiled GEMM (AVX2) */
+int sgemm_iq4_k_q8_k_avx2(int nrows, int ncols, int k,
+        const void *vx, const void *vy, float *out, size_t bs,
+        int ith, int nth);
+
 /* IQ4_K_R4 x Q8_K tiled GEMM (AVX2): 4 weight rows x N activation cols */
 int sgemm_iq4_k_r4_q8_k_avx2(int nrows, int ncols, int k,
         const void *vx, const void *vy, float *out, size_t bs,

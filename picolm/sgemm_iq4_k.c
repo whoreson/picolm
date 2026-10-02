@@ -513,6 +513,39 @@ int sgemm_iq4_k_r4_q8_k_avx2(int nrows, int ncols, int k,
  * IQ4_K_R4 x Q8_K ARM NEON GEMV + GEMM kernels
  * ================================================================ */
 
+/* ================================================================
+ * IQ4_K plain x Q8_K AVX2 GEMM kernel (tiled)
+ * ================================================================ */
+#if defined(__AVX2__) && defined(__F16C__)
+int sgemm_iq4_k_q8_k_avx2(int nrows, int ncols, int k,
+                           const void *vx, const void *vy,
+                           float *out, size_t bs,
+                           int ith, int nth) {
+    if (nrows < 1 || ncols < 1 || k % QK_K != 0)
+        return 0;
+
+    const size_t w_row_bytes = (size_t)(k / QK_K) * sizeof(block_iq4_k);
+    const size_t a_row_bytes = (size_t)(k / QK_K) * sizeof(block_q8_K);
+
+    int64_t tiles = (int64_t)nrows * ncols;
+    int64_t duty = (tiles + nth - 1) / nth;
+    int64_t start = duty * ith;
+    int64_t end = start + duty;
+    if (end > tiles) end = tiles;
+
+    for (int64_t t = start; t < end; t++) {
+        int i = (int)(t / ncols);
+        int j = (int)(t % ncols);
+        const void *wrow = (const char *)vx + (size_t)i * w_row_bytes;
+        const void *acol = (const char *)vy + (size_t)j * a_row_bytes;
+        float result;
+        vec_dot_iq4_k_q8_k_avx2(wrow, acol, k, &result);
+        out[i + (size_t)j * bs] = result;
+    }
+    return nrows;
+}
+#endif
+
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_neon.h>
 

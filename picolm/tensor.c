@@ -5,6 +5,7 @@
 #if defined(PICOLM_NEON)
 extern int sgemm_iq2_k_q8_k_neon(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
 extern int sgemm_iq3_k_q8_k_neon(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+extern int sgemm_iq4_k_q8_k_avx2(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
 extern int sgemm_iq4_k_q8_k_neon(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
 extern int sgemm_q8_k_r8_q8_k_neon(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
 extern void vec_dot_q8_k_r8_q8_k_neon(const void *vx, const void *wy, int n, float *out, int nrows);
@@ -4086,6 +4087,15 @@ static void qgemm_iq6k_task_neon(int idx, void *ctxp) {
 }
 #endif /* PICOLM_NEON */
 
+/* Plain IQ4_K AVX2 GEMM task wrapper (outside NEON block) */
+#if defined(PICOLM_AVX2)
+static void qgemm_iq4k_task_avx2(int idx, void *ctxp) {
+    qgemm_q4r8_ctx_t *c = (qgemm_q4r8_ctx_t *)ctxp;
+    int nth = pool_total_threads(1);
+    sgemm_iq4_k_q8_k_avx2(c->nr, c->nc, c->k, c->w, c->abuf, c->out, c->bs, idx, nth);
+}
+#endif
+
 /* Profiling: per-path timing for matmul_batch (PICOLM_PROFILE=1) */
 #ifdef _MSC_VER
 #include <windows.h>
@@ -4886,7 +4896,28 @@ void matmul_batch(float *out, const float *x, int n_batch,
         }
     }
 
-    /* IQ4_K plain batch: quantize activations to Q8_K, dispatch vec_dot. */
+    /* IQ4_K plain batch: GEMM path (AVX2, tiled) */
+#if defined(PICOLM_AVX2)
+    if (!picolm_sgemm_disabled_tensor() && qtype == GGUF_TYPE_IQ4_K && n_batch > 0 && n > 0 && n % 256 == 0) {
+        size_t q8_rb = (size_t)(n / 256) * sizeof(block_q8_K);
+        void *qbuf = malloc((size_t)n_batch * q8_rb);
+        if (qbuf) {
+            for (int b = 0; b < n_batch; b++)
+                quantize_row_q8_K(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
+            int nth = pool_total_threads(1);
+            qgemm_q4r8_ctx_t ctx = {
+                .nr = d, .nc = n_batch, .k = n,
+                .w = W, .abuf = qbuf, .out = out, .bs = d,
+            };
+            tensor_parallel_for(nth, qgemm_iq4k_task_avx2, &ctx);
+            free(qbuf);
+        DISPATCH("IQ4_K_GEMM");
+            return;
+        }
+    }
+#endif
+
+    /* IQ4_K plain batch: quantize activations to Q8_K, dispatch vec_dot (fallback). */
 #if defined(PICOLM_AVX2)
     if (qtype == GGUF_TYPE_IQ4_K && n_batch > 0 && n > 0) {
         size_t q8_rb = (size_t)(n / 256) * sizeof(block_q8_K);
@@ -7403,6 +7434,20 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                             out1[b * d + i] = vec_dot_q2_0_q8_0(wr1, xb1, n);
                         } else if (qtype1 == GGUF_TYPE_Q2_K) {
                             out1[b * d + i] = vec_dot_q2_K_q8_K(wr1, xb1, n);
+                        } else if (qtype1 == GGUF_TYPE_IQ4_K) {
+#if defined(PICOLM_AVX2)
+                            float r1;
+                            vec_dot_iq4_k_q8_k_avx2(wr1, xb1, n, &r1);
+                            out1[b * d + i] = r1;
+#else
+                            out1[b * d + i] = vec_dot_iq4_k_q8_k(wr1, xb1, n);
+#endif
+                        } else if (qtype1 == GGUF_TYPE_IQ6_K) {
+                            out1[b * d + i] = vec_dot_iq6_k_q8_k(wr1, xb1, n);
+                        } else if (qtype1 == GGUF_TYPE_IQ2_K) {
+                            out1[b * d + i] = vec_dot_iq2_k_q8_k(wr1, xb1, n);
+                        } else if (qtype1 == GGUF_TYPE_IQ3_K) {
+                            out1[b * d + i] = vec_dot_iq3_k_q8_k(wr1, xb1, n);
                         } else {
                             out1[b * d + i] = vec_dot(wr1, x + b * n, n, qtype1);
                         }
@@ -7425,6 +7470,20 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                             out2[b * d + i] = vec_dot_q2_0_q8_0(wr2, xb2, n);
                         } else if (qtype2 == GGUF_TYPE_Q2_K) {
                             out2[b * d + i] = vec_dot_q2_K_q8_K(wr2, xb2, n);
+                        } else if (qtype2 == GGUF_TYPE_IQ4_K) {
+#if defined(PICOLM_AVX2)
+                            float r2;
+                            vec_dot_iq4_k_q8_k_avx2(wr2, xb2, n, &r2);
+                            out2[b * d + i] = r2;
+#else
+                            out2[b * d + i] = vec_dot_iq4_k_q8_k(wr2, xb2, n);
+#endif
+                        } else if (qtype2 == GGUF_TYPE_IQ6_K) {
+                            out2[b * d + i] = vec_dot_iq6_k_q8_k(wr2, xb2, n);
+                        } else if (qtype2 == GGUF_TYPE_IQ2_K) {
+                            out2[b * d + i] = vec_dot_iq2_k_q8_k(wr2, xb2, n);
+                        } else if (qtype2 == GGUF_TYPE_IQ3_K) {
+                            out2[b * d + i] = vec_dot_iq3_k_q8_k(wr2, xb2, n);
                         } else {
                             out2[b * d + i] = vec_dot(wr2, x + b * n, n, qtype2);
                         }
