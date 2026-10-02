@@ -6875,6 +6875,8 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
             } else if (W1 && !picolm_sgemm_disabled_tensor() && n % 32 == 0 &&
                        (qtype1 == GGUF_TYPE_Q8_0 || qtype1 == GGUF_TYPE_Q4_0 ||
                         qtype1 == GGUF_TYPE_Q5_0 || qtype1 == GGUF_TYPE_IQ4_NL)) {
+#if defined(PICOLM_AVX2)
+                {
                 size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
                 int nb = n / 32;
                 void *qbuf = malloc((size_t)n_batch * q8_rb);
@@ -6898,6 +6900,10 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                     tensor_parallel_for(nth, qgemm_d_task, &gctx);
                     free(dbuf); free(qbuf);
                 } else { free(dbuf); free(qbuf); }
+                }
+#else
+                /* Scalar fallback: qgemm_d is AVX2-only */
+#endif
             } else if (W1) {
                 size_t rb1 = gguf_type_row_size(qtype1, n);
                 matmul_batch_scalar_threaded(out1, x, n_batch, W1, n, d, qtype1, rb1);
@@ -6917,6 +6923,8 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
             } else if (W2 && !picolm_sgemm_disabled_tensor() && n % 32 == 0 &&
                        (qtype2 == GGUF_TYPE_Q8_0 || qtype2 == GGUF_TYPE_Q4_0 ||
                         qtype2 == GGUF_TYPE_Q5_0 || qtype2 == GGUF_TYPE_IQ4_NL)) {
+#if defined(PICOLM_AVX2)
+                {
                 size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
                 int nb = n / 32;
                 void *qbuf = malloc((size_t)n_batch * q8_rb);
@@ -6940,6 +6948,10 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                     tensor_parallel_for(nth, qgemm_d_task, &gctx);
                     free(dbuf); free(qbuf);
                 } else { free(dbuf); free(qbuf); }
+                }
+#else
+                /* Scalar fallback: qgemm_d is AVX2-only */
+#endif
             } else if (W2) {
                 size_t rb2 = gguf_type_row_size(qtype2, n);
                 matmul_batch_scalar_threaded(out2, x, n_batch, W2, n, d, qtype2, rb2);
