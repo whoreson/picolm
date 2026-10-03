@@ -481,6 +481,9 @@ static inline act_fmt_t qtype_act_format(gguf_type_t qtype) {
     /* Q8_0 activation family: simple block_q8_0 (32 values, uint16_t d) */
     case GGUF_TYPE_Q8_0:
     case GGUF_TYPE_Q4_0:
+    case GGUF_TYPE_Q5_0:
+    case GGUF_TYPE_Q5_1:
+    case GGUF_TYPE_Q1_0:
     case GGUF_TYPE_IQ4_NL:
     case GGUF_TYPE_IQ4_NL_R4:
     case GGUF_TYPE_Q4_0_4_4:

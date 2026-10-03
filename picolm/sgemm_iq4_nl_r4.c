@@ -340,3 +340,22 @@ int sgemm_iq4_nl_r4_q8_0_neon(int nrows, int ncols, int k,
 }
 
 #endif /* __ARM_NEON */
+
+/* ================================================================
+ * Non-AVX2 builds (ARM, plain x86-64): tensor.c's r4_dual_lookup() table refers to the
+ * _avx2-named symbols unconditionally, so they must exist at link time. They are only
+ * ever called from PICOLM_AVX2 code paths. Abort loudly if that ever stops being true.
+ * ================================================================ */
+#if !defined(__AVX2__)
+void vec_dot_iq4_nl_r4_q8_0_avx2(const void *vx, const void *wy, int n,
+                                  float *out, int nrows) {
+    (void)vx; (void)wy; (void)n; (void)out; (void)nrows;
+    fprintf(stderr, "FATAL: vec_dot_iq4_nl_r4_q8_0_avx2 called in a build without AVX2\n");
+    abort();
+}
+int sgemm_iq4_nl_r4_q8_0_avx2(int nrows, int ncols, int k, const void *vx, const void *vy,
+                               float *out, size_t bs, int ith, int nth) {
+    (void)nrows; (void)ncols; (void)k; (void)vx; (void)vy; (void)out; (void)bs; (void)ith; (void)nth;
+    return 0;   /* "not handled" */
+}
+#endif
