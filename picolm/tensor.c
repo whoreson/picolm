@@ -12,6 +12,7 @@ extern void vec_dot_q8_k_r8_q8_k_neon(const void *vx, const void *wy, int n, flo
 /* NEON R4 GEMV declarations */
 extern int sgemm_iq6_k_q8_k_neon(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
 extern void vec_dot_iq6_k_q8_k_neon(const void *vx, const void *wy, int n, float *out);
+extern void vec_dot_q4_k_r4_q8_k_neon(const void *vx, const void *wy, int n, float *out, int nrows);
 #endif
 /* AVX2 GEMM declarations */
 #if defined(PICOLM_AVX2)
@@ -997,8 +998,7 @@ static void matmul_worker_f(matmul_task_t *t) {
                 }
             }
         } else if (t->qtype == GGUF_TYPE_Q4_K_R4 && t->x) {
-            /* Q4_K_R4: interleaved 4-row blocks. Uses batch4 dispatcher.
-             * Activations are Q8_K pre-quantized. Block stride = 4 * row_stride. */
+            /* Q4_K_R4: interleaved 4-row blocks. Activations are Q8_K pre-quantized. */
             size_t q8k_row_bytes = gguf_type_row_size(GGUF_TYPE_Q8_K, t->n);
             size_t rb = gguf_type_row_size(t->qtype, t->n);
             size_t block_stride = rb * 4;
@@ -1009,7 +1009,11 @@ static void matmul_worker_f(matmul_task_t *t) {
                 for (int b = 0; b < nb; b++) {
                     const char *xb = qx_base + (size_t)b * q8k_row_bytes;
                     float results[4] = {0};
+#if defined(PICOLM_NEON)
+                    vec_dot_q4_k_r4_q8_k_neon(wrow, xb, t->n, results, 4);
+#else
                     vec_dot_q4_k_r4_q8_k_batch4(wrow, xb, t->n, results);
+#endif
                     for (int r = 0; r < 4; r++) {
                         int i = g * 4 + r;
                         if (i >= t->start && i < t->end)
@@ -1318,8 +1322,13 @@ static void matmul_worker_f(matmul_task_t *t) {
         int end4 = (t->end + 3) / 4 * 4;
         for (int i = start4; i < end4; i += 4) {
             float results[4] = {0};
+#if defined(PICOLM_NEON)
+            vec_dot_q4_k_r4_q8_k_neon(
+                (const char *)t->W + (i / 4) * block_stride, qx, t->n, results, 4);
+#else
             vec_dot_q4_k_r4_q8_k_batch4(
                 (const char *)t->W + (i / 4) * block_stride, qx, t->n, results);
+#endif
             for (int r = 0; r < 4 && i + r < t->end; r++)
                 t->out[i + r] = results[r];
         }
@@ -2743,15 +2752,25 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
                 int d4 = (d / 4) * 4;
                 for (int i = 0; i < d4; i += 4) {
                     float results[4] = {0};
+#if defined(PICOLM_NEON)
+                    vec_dot_q4_k_r4_q8_k_neon(
+                        (const char *)wptr + (i / 4) * block_stride, qx, n, results, 4);
+#else
                     vec_dot_q4_k_r4_q8_k_batch4(
                         (const char *)wptr + (i / 4) * block_stride, qx, n, results);
+#endif
                     for (int r = 0; r < 4; r++) out[i + r] = results[r];
                 }
                 /* Tail rows */
                 for (int i = d4; i < d; i++) {
                     float results[4] = {0};
+#if defined(PICOLM_NEON)
+                    vec_dot_q4_k_r4_q8_k_neon(
+                        (const char *)wptr + (i / 4) * block_stride, qx, n, results, 4);
+#else
                     vec_dot_q4_k_r4_q8_k_batch4(
                         (const char *)wptr + (i / 4) * block_stride, qx, n, results);
+#endif
                     out[i] = results[i % 4];
                 }
                 if (qx_owned) free(qx);
@@ -5180,14 +5199,24 @@ void matmul_batch(float *out, const float *x, int n_batch,
                 const block_q8_K *qx = (const block_q8_K *)((char *)qbuf + (size_t)b * q8_rb);
                 for (int i = 0; i < d4; i += 4) {
                     float results[4] = {0};
+#if defined(PICOLM_NEON)
+                    vec_dot_q4_k_r4_q8_k_neon(
+                        (const char *)W + (i / 4) * block_stride, qx, n, results, 4);
+#else
                     vec_dot_q4_k_r4_q8_k_batch4(
                         (const char *)W + (i / 4) * block_stride, qx, n, results);
+#endif
                     for (int r = 0; r < 4; r++) out[b * d + i + r] = results[r];
                 }
                 for (int i = d4; i < d; i++) {
                     float results[4] = {0};
+#if defined(PICOLM_NEON)
+                    vec_dot_q4_k_r4_q8_k_neon(
+                        (const char *)W + (i / 4) * block_stride, qx, n, results, 4);
+#else
                     vec_dot_q4_k_r4_q8_k_batch4(
                         (const char *)W + (i / 4) * block_stride, qx, n, results);
+#endif
                     out[b * d + i] = results[i % 4];
                 }
             }

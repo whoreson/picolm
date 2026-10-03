@@ -36,7 +36,7 @@ extern float vec_dot_f32_f32(const void *a, const float *b, int n);
 extern void dequantize_row_q4_k_r4_single(const block_q4_k_r4 *x, float *dst, int n, int row);
 extern void vec_dot_q4_k_r4_q8_k_batch4(const void *vx, const void *vy, int n, float *out);
 
-#ifdef PICOLM_AVX2
+#if defined(PICOLM_AVX2)
 #include <immintrin.h>
 
 void vec_dot_q4_k_r4_q8_k_avx2(const void *vx, const void *wy, int n,
@@ -201,6 +201,102 @@ void vec_dot_q4_k_r4_q8_k_avx2(const void *vx, const void *wy, int n,
 
     __m128 sum = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
     _mm_storeu_ps(out, sum);
+}
+#elif defined(PICOLM_NEON)
+#include <arm_neon.h>
+
+/* NEON GEMV for Q4_K_R4 x Q8_K.
+ * Processes 4 interleaved rows against one Q8_K activation row.
+ * Uses scalar extraction (R4 layout is not SIMD-friendly on basic NEON)
+ * but vectorizes the int8 MAC across 16 values per row with vpadalq_s16. */
+void vec_dot_q4_k_r4_q8_k_neon(const void *vx, const void *wy, int n,
+                                float *out, int nrows) {
+    if (nrows != 4 || n % QK_K != 0) {
+        vec_dot_q4_k_r4_q8_k_batch4(vx, wy, n, out);
+        return;
+    }
+
+    const block_q4_k_r4 *x = (const block_q4_k_r4 *)vx;
+    const block_q8_K *qk = (const block_q8_K *)wy;
+    const int nb = n / QK_K;
+
+    float acc[4] = {0, 0, 0, 0};
+
+    for (int ibl = 0; ibl < nb; ibl++) {
+        const block_q4_k_r4 *b = &x[ibl];
+        const block_q8_K *q = &qk[ibl];
+        float q8_scale = q->d;
+
+        /* Bias correction: m * min * sum(q8) per row */
+        float bias[4] = {0, 0, 0, 0};
+        for (int ib = 0; ib < QK_K / 32; ib++) {
+            for (int k = 0; k < 4; k++) {
+                int is = 4 * ib + k;
+                float ml = fp16_to_fp32_lookup(b->d[k + 4]) *
+                    ((b->scales_l[is] >> 4) |
+                     (((b->scales_h[is % 16] >> (4 * (is / 16))) & 0x0c) << 2));
+                bias[k] += ml * (q->bsums[ib * 2 + 0] + q->bsums[ib * 2 + 1]);
+            }
+        }
+
+        for (int ib = 0; ib < QK_K / 32; ib++) {
+            float scales[4];
+            for (int k = 0; k < 4; k++) {
+                int is = 4 * ib + k;
+                scales[k] = fp16_to_fp32_lookup(b->d[k]) *
+                    ((b->scales_l[is] & 0xf) |
+                     (((b->scales_h[is % 16] >> (4 * (is / 16))) & 0x03) << 4));
+            }
+
+            /* Reorder Q8_K activations to match the Q4_K_R4 weight order. */
+            int8_t a_reordered[32];
+            const int8_t *q8 = q->qs + 32 * ib;
+            for (int i = 0; i < 4; i++) {
+                a_reordered[8 * i + 0] = q8[i + 0];
+                a_reordered[8 * i + 1] = q8[i + 8];
+                a_reordered[8 * i + 2] = q8[i + 16];
+                a_reordered[8 * i + 3] = q8[i + 24];
+                a_reordered[8 * i + 4] = q8[i + 4];
+                a_reordered[8 * i + 5] = q8[i + 12];
+                a_reordered[8 * i + 6] = q8[i + 20];
+                a_reordered[8 * i + 7] = q8[i + 28];
+            }
+
+            /* Extract weight nibbles for each row in the same order. */
+            int8_t w_reordered[4][32];
+            for (int k = 0; k < 4; k++) {
+                const uint8_t *qs = b->qs + 64 * ib + 4 * k;
+                for (int i = 0; i < 4; i++) {
+                    w_reordered[k][8 * i + 0] = (int8_t)(qs[i + 0] & 0xf);
+                    w_reordered[k][8 * i + 1] = (int8_t)(qs[i + 0] >> 4);
+                    w_reordered[k][8 * i + 2] = (int8_t)(qs[i + 16] & 0xf);
+                    w_reordered[k][8 * i + 3] = (int8_t)(qs[i + 16] >> 4);
+                    w_reordered[k][8 * i + 4] = (int8_t)(qs[i + 32] & 0xf);
+                    w_reordered[k][8 * i + 5] = (int8_t)(qs[i + 32] >> 4);
+                    w_reordered[k][8 * i + 6] = (int8_t)(qs[i + 48] & 0xf);
+                    w_reordered[k][8 * i + 7] = (int8_t)(qs[i + 48] >> 4);
+                }
+            }
+
+            int32x4_t sums[4] = { vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0), vdupq_n_s32(0) };
+            for (int j = 0; j < 32; j += 8) {
+                int8x8_t a8 = vld1_s8(a_reordered + j);
+                for (int k = 0; k < 4; k++) {
+                    int8x8_t w8 = vld1_s8(w_reordered[k] + j);
+                    int16x8_t p = vmull_s8(w8, a8);
+                    sums[k] = vpadalq_s16(sums[k], p);
+                }
+            }
+            for (int k = 0; k < 4; k++)
+                acc[k] += (float)vaddvq_s32(sums[k]) * scales[k] * q8_scale;
+        }
+
+        for (int k = 0; k < 4; k++)
+            acc[k] -= bias[k] * q8_scale;
+    }
+
+    for (int k = 0; k < 4; k++)
+        out[k] = acc[k];
 }
 #else
 void vec_dot_q4_k_r4_q8_k_avx2(const void *vx, const void *wy, int n,

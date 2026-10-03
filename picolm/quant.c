@@ -9686,9 +9686,17 @@ float vec_dot_q4_k_r4_q8_k(const void *vx, const void *vy, int n) {
     return sumf;
 }
 
-/* Scalar batch4 vec_dot: Q4_K_R4 (4 rows) x Q8_K activation.
- * Each subblock (32 values) has ONE scale and ONE min per row. */
+/* Q4_K_R4 x Q8_K batch4 vec_dot: computes 4 row dot products at once.
+ * Dispatches to AVX2 or NEON when available, otherwise uses portable C. */
 void vec_dot_q4_k_r4_q8_k_batch4(const void *vx, const void *vy, int n, float *out) {
+#if defined(PICOLM_AVX2)
+    vec_dot_q4_k_r4_q8_k_avx2(vx, vy, n, out, 4);
+    return;
+#elif defined(PICOLM_NEON)
+    vec_dot_q4_k_r4_q8_k_neon(vx, vy, n, out, 4);
+    return;
+#endif
+
     const block_q4_k_r4 *x = (const block_q4_k_r4 *)vx;
     const block_q8_K *y = (const block_q8_K *)vy;
     const int nblock = n / QK_K;

@@ -1430,6 +1430,10 @@ void vec_dot_q4_k_r4_q8_k_batch4(const void *vx, const void *wy, int n, float *o
  * out: 4 output floats. nrows must be 4. n must be multiple of 256. */
 void vec_dot_q4_k_r4_q8_k_avx2(const void *vx, const void *wy, int n,
                                   float *out, int nrows);
+/* Q4_K_R4 x Q8_K ARM NEON GEMV: 4 weight rows x 1 activation row.
+ * out: 4 output floats. nrows must be 4. n must be multiple of 256. */
+void vec_dot_q4_k_r4_q8_k_neon(const void *vx, const void *wy, int n,
+                                float *out, int nrows);
 
 /* Repack standard Q4_0 weights to Q4_0_8x8 interleaved format (for AVX2).
  * dst must have the same size as src (1:1 byte mapping, just reordered). */
