@@ -69,6 +69,14 @@ int sgemm_iq4_k_r4_q8_k_avx2(int nrows, int ncols, int k,
         const void *vx, const void *vy, float *out, size_t bs,
         int ith, int nth);
 
+/* IQ4_XS x Q8_K tiled GEMM (AVX2): C[n][m] = B[n][k] @ A^T[m][k]
+ * m = weight rows (d), n = activation rows (n_batch)
+ * k_blocks_q4xs = k / 256 (number of block_iq4_xs per row) */
+int picolm_sgemm_d_iq4xs(int m, int n, int k_blocks_q4xs,
+                         const void *A, int lda_q4xs,
+                         const void *B, int ldb_q8k,
+                         float *C, int ldc, int ith, int nth);
+
 #ifdef __cplusplus
 }
 #endif

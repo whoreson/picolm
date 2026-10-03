@@ -3993,6 +3993,22 @@ static void q4k_gemm_task(int idx, void *ctxp) {
 }
 #endif /* AVX2+F16C || AVX1 || ARM_NEON for q4k_gemm_ctx_t */
 
+#if defined(__AVX2__)
+typedef struct {
+    int m, n, k_blocks_q4xs;
+    const void *A; int lda_q4xs;
+    const void *B; int ldb_q8k;
+    float *C; int ldc;
+    int nth;
+} iq4xs_gemm_ctx_t;
+
+static void iq4xs_gemm_task(int idx, void *ctxp) {
+    iq4xs_gemm_ctx_t *c = (iq4xs_gemm_ctx_t *)ctxp;
+    picolm_sgemm_d_iq4xs(c->m, c->n, c->k_blocks_q4xs, c->A, c->lda_q4xs,
+                         c->B, c->ldb_q8k, c->C, c->ldc, idx, c->nth);
+}
+#endif /* AVX2 for iq4xs_gemm_ctx_t */
+
 static int picolm_sgemm_disabled_tensor(void) {
     static int checked = 0, disabled = 0;
     if (!checked) {
@@ -5656,6 +5672,30 @@ void matmul_batch(float *out, const float *x, int n_batch,
     }
 #endif /* AVX2+F16C or AVX1 or ARM_NEON for Q4_K GEMM */
 
+    /* IQ4_XS tiled GEMM fast path (AVX2).
+     * Uses picolm_sgemm_d_iq4xs with block_iq4_xs weights and block_q8_K activations.
+     * n must be a multiple of 256 (block_iq4_xs granularity).
+     * Threshold: n_batch >= 8 (consistent with Q8_0 GEMM). */
+#if defined(__AVX2__)
+    if (!picolm_sgemm_disabled_tensor() && have_qx && qtype == GGUF_TYPE_IQ4_XS && d >= 4 && n % 256 == 0) {
+        if (n_batch >= 8) {
+            int k_blocks_q4xs = n / 256;
+            int nth = pool_total_threads(1);
+            iq4xs_gemm_ctx_t ctx4xs = {
+                .m = d, .n = n_batch, .k_blocks_q4xs = k_blocks_q4xs,
+                .A = W, .lda_q4xs = k_blocks_q4xs,
+                .B = qx_buf, .ldb_q8k = k_blocks_q4xs,
+                .C = out, .ldc = d,
+                .nth = nth,
+            };
+            tensor_parallel_for(nth, iq4xs_gemm_task, &ctx4xs);
+            DISPATCH("IQ4_XS_GEMM_d");
+            free(qx_buf); if (qx_d_buf) free(qx_d_buf);
+            return;
+        }
+    }
+#endif /* AVX2 for IQ4_XS GEMM */
+
     /* Q4_0_4_4 fast path for batched matmul */
     if (qtype == GGUF_TYPE_Q4_0_4_4 && n_batch > 0 && n > 0) {
         size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
@@ -6963,6 +7003,48 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
             }
             free(qbuf);
             DISPATCH2("Q8_K_R8_sgemm_dual_neon");
+            if (out1_done && out2_done) return;
+        }
+    }
+#endif
+
+    /* IQ4_XS tiled GEMM for dual-batch (AVX2).
+     * If both qtype1 and qtype2 are IQ4_XS, handle both and return.
+     * If only one is IQ4_XS, handle it here, set skip flags, and
+     * fall through for the non-IQ4_XS type. */
+#if defined(__AVX2__)
+    if (!picolm_sgemm_disabled_tensor() && (qtype1 == GGUF_TYPE_IQ4_XS || qtype2 == GGUF_TYPE_IQ4_XS) && n_batch > 0 && n > 0 && n % 256 == 0) {
+        size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_K, n);
+        void *qbuf = malloc((size_t)n_batch * q8_rb);
+        if (qbuf) {
+            for (int b = 0; b < n_batch; b++)
+                quantize_row_q8_K(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
+            int k_blocks = n / 256;
+            int nth = pool_total_threads(1);
+            if (qtype1 == GGUF_TYPE_IQ4_XS && !out1_done) {
+                iq4xs_gemm_ctx_t ctx = {
+                    .m = d, .n = n_batch, .k_blocks_q4xs = k_blocks,
+                    .A = W1, .lda_q4xs = k_blocks,
+                    .B = qbuf, .ldb_q8k = k_blocks,
+                    .C = out1, .ldc = d,
+                    .nth = nth,
+                };
+                tensor_parallel_for(nth, iq4xs_gemm_task, &ctx);
+                out1_done = 1;
+            }
+            if (qtype2 == GGUF_TYPE_IQ4_XS && !out2_done) {
+                iq4xs_gemm_ctx_t ctx = {
+                    .m = d, .n = n_batch, .k_blocks_q4xs = k_blocks,
+                    .A = W2, .lda_q4xs = k_blocks,
+                    .B = qbuf, .ldb_q8k = k_blocks,
+                    .C = out2, .ldc = d,
+                    .nth = nth,
+                };
+                tensor_parallel_for(nth, iq4xs_gemm_task, &ctx);
+                out2_done = 1;
+            }
+            free(qbuf);
+            DISPATCH2("IQ4_XS_GEMM_d (dual)");
             if (out1_done && out2_done) return;
         }
     }
