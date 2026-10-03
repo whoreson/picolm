@@ -5675,10 +5675,12 @@ void matmul_batch(float *out, const float *x, int n_batch,
     /* IQ4_XS tiled GEMM fast path (AVX2).
      * Uses picolm_sgemm_d_iq4xs with block_iq4_xs weights and block_q8_K activations.
      * n must be a multiple of 256 (block_iq4_xs granularity).
-     * Threshold: n_batch >= 8 (consistent with Q8_0 GEMM). */
+     * Threshold: n_batch >= 2. The kernel decodes each weight block once per tile of up to
+     * 8 activation rows; measured per block-column: n=1 12.5 ns (= GEMV), n=2 9.4, n=3 7.5,
+     * n=4 6.6, n=8 5.9 ns, against 12.4 ns for the GEMV. */
 #if defined(__AVX2__)
     if (!picolm_sgemm_disabled_tensor() && have_qx && qtype == GGUF_TYPE_IQ4_XS && d >= 4 && n % 256 == 0) {
-        if (n_batch >= 8) {
+        if (n_batch >= 2) {
             int k_blocks_q4xs = n / 256;
             int nth = pool_total_threads(1);
             iq4xs_gemm_ctx_t ctx4xs = {
@@ -5757,6 +5759,11 @@ void matmul_batch(float *out, const float *x, int n_batch,
                         out[b * d + i] = vec_dot_iq3_k_q8_k(wrow, xb, n);
                     } else if (qtype == GGUF_TYPE_IQ4_K) {
                         out[b * d + i] = vec_dot_iq4_k_q8_k(wrow, xb, n);
+                    } else if (qtype == GGUF_TYPE_IQ4_XS) {
+                        /* Missing here, IQ4_XS fell into the Q4_0 catch-all below and read a
+                         * Q8_K activation buffer as Q8_0 blocks: NaN output for n_batch < 8
+                         * whenever this single-thread / small-d branch was taken. */
+                        out[b * d + i] = vec_dot_iq4_xs_q8_k(wrow, xb, n);
                     } else {
                         out[b * d + i] = vec_dot_q4_0_q8_0(wrow, xb, n);
                     }

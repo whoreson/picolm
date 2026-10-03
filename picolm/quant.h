@@ -1172,6 +1172,9 @@ float vec_dot_iq4_nl_q8_0(const void *src_iq4, const void *src_q8, int n);
 float vec_dot_iq4_nl_f32(const void *src_iq4, const float *x, int n);
 /* IQ4_XS dequantize: convert IQ4_XS bytes to float32 */
 void dequantize_row_iq4_xs(const void *src, float *dst, int n);
+/* IQ4_XS x Q8_K SIMD GEMV kernels (sgemm_iq4_xs.c) */
+void vec_dot_iq4_xs_q8_k_avx2(const void *vx, const void *wy, int n, float *out);
+void vec_dot_iq4_xs_q8_k_neon(const void *vx, const void *wy, int n, float *out);
 /* IQ4_XS * Q8_K dot product: IQ4_XS weights with pre-quantized Q8_K input */
 float vec_dot_iq4_xs_q8_k(const void *src_iq4, const void *src_q8, int n);
 /* IQ4_XS * F32 dot product: fused dequant + dot (scalar fallback) */

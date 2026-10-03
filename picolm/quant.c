@@ -4298,62 +4298,10 @@ float vec_dot_iq4_xs_q8_k(const void *vx, const void *wy, int n) {
     int nb = n / QK_K;
     float sumf = 0.0f;
 
-#if defined(PICOLM_AVX2)
-    const __m128i iq4lut = _mm_loadu_si128((const __m128i *)kvalues_iq4nl);
-    const __m128i m4b = _mm_set1_epi8(0x0f);
-    __m256 accum = _mm256_setzero_ps();
-    for (int ibl = 0; ibl < nb; ++ibl) {
-        const uint8_t *qs = x[ibl].qs;
-        const int8_t *q8 = y[ibl].qs;
-        float dd = fp16_to_fp32_lookup(x[ibl].d) * y[ibl].d;
-        __m256i sumi = _mm256_setzero_si256();
-        for (int ib = 0; ib < QK_K / 32; ++ib) {
-            const __m128i q4b = _mm_loadu_si128((const __m128i *)qs); qs += 16;
-            const __m256i q8b = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
-            const __m256i q4d = _mm256_insertf128_si256(
-                _mm256_castsi128_si256(_mm_shuffle_epi8(iq4lut, _mm_and_si128(q4b, m4b))),
-                _mm_shuffle_epi8(iq4lut, _mm_and_si128(_mm_srli_epi16(q4b, 4), m4b)), 1);
-            /* Sign trick: signed-signed int8 MAC via unsigned-signed maddubs */
-            const __m256i ax = _mm256_sign_epi8(q4d, q4d);
-            const __m256i sy = _mm256_sign_epi8(q8b, q4d);
-            const __m256i p16 = _mm256_maddubs_epi16(ax, sy);
-            int16_t ls = (int16_t)(((x[ibl].scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf) | (((x[ibl].scales_h >> (2 * ib)) & 3) << 4)) - 32;
-            const __m256i p32 = _mm256_madd_epi16(p16, _mm256_set1_epi16(ls));
-            sumi = _mm256_add_epi32(sumi, p32);
-        }
-        accum = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sumi), _mm256_set1_ps(dd), accum);
-    }
-    sumf = hsum_avx(accum);
-#elif defined(PICOLM_NEON)
-    const int8x16_t iq4lut_s = vld1q_s8(kvalues_iq4nl);
-    const uint8x16_t m4b = vdupq_n_u8(0x0f);
-    float sumi = 0.0f;
-    for (int ibl = 0; ibl < nb; ++ibl) {
-        const uint8_t *qs = x[ibl].qs;
-        const int8_t *q8 = y[ibl].qs;
-        float dd = fp16_to_fp32_lookup(x[ibl].d) * y[ibl].d;
-        int32x4_t s0 = vdupq_n_s32(0), s1 = vdupq_n_s32(0), s2 = vdupq_n_s32(0), s3 = vdupq_n_s32(0);
-        for (int ib = 0; ib < QK_K / 32; ++ib) {
-            uint8x16_t q4b = vld1q_u8(qs); qs += 16;
-            int8x16_t q8b = vld1q_s8(q8); q8 += 16;
-            int8x16_t q4d_lo = vreinterpretq_s8_u8(vqtbl1q_u8(vreinterpretq_u8_s8(iq4lut_s), vandq_u8(q4b, m4b)));
-            int8x16_t q4d_hi = vreinterpretq_s8_u8(vqtbl1q_u8(vreinterpretq_u8_s8(iq4lut_s), vshrq_n_u8(q4b, 4)));
-            int16x8_t p0 = vmull_s8(vget_low_s8(q4d_lo), vget_low_s8(q8b));
-            int16x8_t p1 = vmull_s8(vget_high_s8(q4d_lo), vget_high_s8(q8b));
-            int32x4_t p_lo = vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1));
-            q8b = vld1q_s8(q8); q8 += 16;
-            int16x8_t p2 = vmull_s8(vget_low_s8(q4d_hi), vget_low_s8(q8b));
-            int16x8_t p3 = vmull_s8(vget_high_s8(q4d_hi), vget_high_s8(q8b));
-            int32x4_t p_hi = vaddq_s32(vpaddlq_s16(p2), vpaddlq_s16(p3));
-            int ls = ((x[ibl].scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf) | (((x[ibl].scales_h >> (2 * ib)) & 3) << 4);
-            ls -= 32;
-            s0 = vmlaq_n_s32(s0, p_lo, ls);
-            s1 = vmlaq_n_s32(s1, vget_high_s32(p_lo), ls);
-            s2 = vmlaq_n_s32(s2, p_hi, ls);
-            s3 = vmlaq_n_s32(s3, vget_high_s32(p_hi), ls);
-        }
-        sumf += dd * (float)(vaddvq_s32(s0) + vaddvq_s32(s1) + vaddvq_s32(s2) + vaddvq_s32(s3));
-    }
+#if defined(PICOLM_AVX2) && defined(__AVX2__) && !defined(PICOLM_FORCE_SCALAR)
+    vec_dot_iq4_xs_q8_k_avx2(vx, wy, n, &sumf);
+#elif defined(PICOLM_NEON) && !defined(PICOLM_FORCE_SCALAR)
+    vec_dot_iq4_xs_q8_k_neon(vx, wy, n, &sumf);
 #else
     /* Scalar fallback */
     for (int ibl = 0; ibl < nb; ++ibl) {
