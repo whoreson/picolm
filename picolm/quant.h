@@ -459,6 +459,9 @@ typedef enum {
     GGUF_TYPE_Q4_K_R4    = 212, /* 4-row interleaved Q4_K (GGUF type 212, llama.cpp ik branch) */
 } gguf_type_t;
 
+/* One past the highest type ID, for table sizing */
+#define GGUF_TYPE_COUNT 400
+
 /* Activation format for a given weight quantization type.
  * Single source of truth: every matmul dispatch path uses this to decide
  * which quantization function to call on the activation buffer.
@@ -471,6 +474,7 @@ typedef enum {
     ACT_FMT_F32  = 0,
     ACT_FMT_Q8_0 = 1,
     ACT_FMT_Q8_K = 2,
+    ACT_FMT_Q8_2 = 3,  /* block_q8_2: Q8_0 + int16 sum (Q4_0_R8) */
 } act_fmt_t;
 
 /* Return the activation format for a weight type.

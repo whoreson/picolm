@@ -77,6 +77,64 @@ int picolm_sgemm_d_iq4xs(int m, int n, int k_blocks_q4xs,
                          const void *B, int ldb_q8k,
                          float *C, int ldc, int ith, int nth);
 
+/* Standard GEMM signature: nrows weight rows x ncols activation columns.
+ * Returns rows processed (multiple of rows_per_block), or 0 if unsupported. */
+
+/* IQ2_K x Q8_K tiled GEMM */
+int sgemm_iq2_k_q8_k_avx2(int nrows, int ncols, int k,
+        const void *vx, const void *vy, float *out, size_t bs,
+        int ith, int nth);
+
+/* IQ2_K_R4 x Q8_K tiled GEMM (4-row interleaved) */
+int sgemm_iq2_k_r4_q8_k_avx2(int nrows, int ncols, int k,
+        const void *vx, const void *vy, float *out, size_t bs,
+        int ith, int nth);
+
+/* IQ3_K x Q8_K tiled GEMM */
+int sgemm_iq3_k_q8_k_avx2(int nrows, int ncols, int k,
+        const void *vx, const void *vy, float *out, size_t bs,
+        int ith, int nth);
+
+/* IQ3_K_R4 x Q8_K tiled GEMM (4-row interleaved) */
+int sgemm_iq3_k_r4_q8_k_avx2(int nrows, int ncols, int k,
+        const void *vx, const void *vy, float *out, size_t bs,
+        int ith, int nth);
+
+/* IQ6_K x Q8_K tiled GEMM */
+int sgemm_iq6_k_q8_k_avx2(int nrows, int ncols, int k,
+        const void *vx, const void *vy, float *out, size_t bs,
+        int ith, int nth);
+
+/* IQ4_K x Q8_K tiled GEMM (plain) */
+int sgemm_iq4_k_q8_k_avx2(int nrows, int ncols, int k,
+        const void *vx, const void *vy, float *out, size_t bs,
+        int ith, int nth);
+
+/* Q4_K_R4 x Q8_K tiled GEMM (4-row interleaved) */
+int sgemm_q4_k_r4_q8_k_avx2(int nrows, int ncols, int k,
+        const void *vx, const void *vy, float *out, size_t bs,
+        int ith, int nth);
+
+/* Q6_K_R4 x Q8_K tiled GEMM (4-row interleaved) */
+int sgemm_q6_k_r4_q8_k(int nrows, int ncols, int k,
+        const void *vx, const void *vy, float *out, size_t bs,
+        int ith, int nth);
+
+/* IQ4_NL_R4 x Q8_0 tiled GEMM (4-row interleaved) */
+int sgemm_iq4_nl_r4_q8_0_avx2(int nrows, int ncols, int k,
+        const void *vx, const void *vy, float *out, size_t bs,
+        int ith, int nth);
+
+/* Q4_0_R8 x Q8_2 tiled GEMM (8-row interleaved) */
+int sgemm_q4_0_r8_q8_2_avx2(int nrows, int ncols, int k,
+        const void *vx, const void *vy, float *out, size_t bs,
+        int ith, int nth);
+
+/* Q8_K_R8 x Q8_K tiled GEMM (8-row interleaved) */
+int sgemm_q8_k_r8_q8_k_avx2(int nrows, int ncols, int k,
+        const void *vx, const void *vy, float *out, size_t bs,
+        int ith, int nth);
+
 #ifdef __cplusplus
 }
 #endif

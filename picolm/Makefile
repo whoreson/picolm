@@ -43,7 +43,7 @@ endif
 # Source files and corresponding .o files
 # model.c has been split into modular files
 MODEL_SRCS = model_core.c model_attention.c model_moe.c model_gemma3n.c model_ssm.c model_kv_cache.c model_gguf.c
-SRCS    = picolm.c $(MODEL_SRCS) tensor.c quant.c sgemm.c sgemm_q4_0x8.c sgemm_q4i_0x8.c sgemm_q4_0_r8.c sgemm_q8_k_r8.c sgemm_q8_k_r8_neon.c sgemm_iq2_k.c sgemm_iq2_k_r4.c sgemm_iq3_k.c sgemm_iq3_k_r4.c sgemm_iq4_k.c sgemm_iq4_nl_r4.c sgemm_q4_k_r4.c sgemm_q6_k_r4.c sgemm_iq6_k.c sgemm_iq4_xs.c tokenizer.c qwen_tokenize.c sampler.c grammar.c cJSON.c server.c csafetensors.c json.c safetensors.c
+SRCS    = picolm.c $(MODEL_SRCS) tensor.c type_dispatch.c quant.c sgemm.c sgemm_q4_0x8.c sgemm_q4i_0x8.c sgemm_q4_0_r8.c sgemm_q8_k_r8.c sgemm_q8_k_r8_neon.c sgemm_iq2_k.c sgemm_iq2_k_r4.c sgemm_iq3_k.c sgemm_iq3_k_r4.c sgemm_iq4_k.c sgemm_iq4_nl_r4.c sgemm_q4_k_r4.c sgemm_q6_k_r4.c sgemm_iq6_k.c sgemm_iq4_xs.c tokenizer.c qwen_tokenize.c sampler.c grammar.c cJSON.c server.c csafetensors.c json.c safetensors.c
 OBJS    = $(SRCS:.c=.o)
 TARGET  = picolm
 
@@ -713,8 +713,8 @@ test_quant: util/test_quant.c quant.c sgemm.c
 test_q6_k_r4: tests/test_q6_k_r4.c quant.c sgemm_q6_k_r4.c
 	$(CC) $(CFLAGS) -o $@ tests/test_q6_k_r4.c quant.c sgemm_q6_k_r4.c -lm -lpthread -fopenmp
 
-test_swa: tests/test_swa.c model_attention.c tensor.c quant.c sgemm.c sgemm_q4_0x8.c sgemm_q4i_0x8.c
-	$(CC) $(CFLAGS) -I. -O2 -o $@ tests/test_swa.c model_attention.c tensor.c quant.c sgemm.c sgemm_q4_0x8.c sgemm_q4i_0x8.c -lm -lpthread -fopenmp -lstdc++
+test_swa: tests/test_swa.c model_attention.c tensor.c type_dispatch.c quant.c sgemm.c sgemm_q4_0x8.c sgemm_q4i_0x8.c
+	$(CC) $(CFLAGS) -I. -O2 -o $@ tests/test_swa.c model_attention.c tensor.c type_dispatch.c quant.c sgemm.c sgemm_q4_0x8.c sgemm_q4i_0x8.c -lm -lpthread -fopenmp -lstdc++
 
 gguf_be_swap: util/gguf_be_swap.c
 	$(CC) -O2 -std=c99 -o $@ util/gguf_be_swap.c -lm
