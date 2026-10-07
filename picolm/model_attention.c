@@ -500,8 +500,210 @@ static void prefill_attn_task(int flat_idx, void *ctx_ptr) {
 
 /* Tiled attention: tile size in KV positions */
 #define ATTN_TILE 64
+typedef struct {
+    int kv_h;
+    int kv_mul;
+    int n_kv_heads;
+    int head_dim;
+    int tile_size;
+    int n_q_rows;
+    int group_token_start;  /* first token index in this group */
+    int kv_tile_start;      /* first KV position in this tile */
+    int kv_tile_end;        /* one past last KV position */
+    int is_diagonal;        /* 1 if this tile needs causal masking */
+
+    gguf_type_t kv_gguf_k;  /* gguf_type for this kv cache type */
+    size_t kv_row_size_k;   /* bytes per GQA row in cache */
+    size_t kv_head_stride_k;/* bytes per head within GQA row */
+    const uint8_t *kcache;  /* layer K cache base */
+    const float *q_rows;    /* [n_q_rows x head_dim] query vectors */
+    float *scores;          /* [n_q_rows x tile_size] score buffer */
+    uint8_t *tile_k;        /* contiguous K-tile scratch [tile_size x head_dim] in kv format */
+    float *tile_v_f32;      /* contiguous V-tile in F32 [tile_size x head_dim] */
+    float *M;               /* [n_q_rows] running max */
+    float *S;               /* [n_q_rows] running sum_exp */
+    float *acc;             /* [n_q_rows x head_dim] running accumulator */
+    float *out;             /* [n_q_rows x head_dim] final output (written only after all tiles) */
+    int last_tile;          /* 1 if this is the last tile to process */
+    float attn_scale;       /* attention score scale factor */
+    int n_swa;               /* 0 = full attention; >0 = sliding window size */
+} attn_tile_task_t;
 
 /* Forward declaration for batch_attention_layer gating */
+static void attn_process_tile(attn_tile_task_t *t);
+
+/* Context for the parallel tiled attention: one instance shared by all
+ * concurrent tasks. Each task gets its own scratch slice from scratch_pool. */
+typedef struct {
+    float *xb_batch;
+    const float *q_batch;
+    const uint8_t *kcache;
+    const uint8_t *vcache;
+    int n_tokens, start_pos;
+    int n_heads, n_kv_heads, kv_mul, head_dim;
+    int xb_stride;
+    int kv_type_k, kv_type_v;
+    size_t kv_row_size_k, kv_row_size_v;
+    size_t kv_head_stride_k, kv_head_stride_v;
+    float attn_scale;
+    int n_swa;
+    int tile, n_token_groups, n_kv_tiles;
+    gguf_type_t gguf_k;
+    gguf_type_t gguf_v;
+    size_t k_rb_gguf;
+    /* Scratch pool: pre-allocated, sliced per concurrent task */
+    uint8_t *scratch_pool;
+    size_t scratch_per_task, scores_per, ms_per, acc_per, qr_per, tk_per, tv_per;
+    int max_concurrent;
+} batch_tiled_ctx_t;
+
+/* Worker for tensor_parallel_for: task_idx maps to (kv_head, token_group).
+ * kv_head = task_idx / n_token_groups, token_group = task_idx % n_token_groups.
+ * This grouping ensures that tasks sharing the same KV head (and thus the
+ * same K/V cache locality) run on the same thread when possible. */
+static void batch_tiled_task(int task_idx, void *ctx_ptr) {
+    batch_tiled_ctx_t *bc = (batch_tiled_ctx_t *)ctx_ptr;
+
+    /* Get our scratch slice. tensor_parallel_for runs at most
+     * bc->max_concurrent tasks concurrently, but to be safe we use
+     * a slot per task index modulo max_concurrent. Since
+     * tensor_parallel_for dispatches tasks in order and waits for
+     * completion, tasks with non-overlapping indices never overlap
+     * in time IF max_concurrent >= n_threads. We use task_idx
+     * directly when n_tasks <= max_concurrent, otherwise modulo. */
+    int slot = task_idx % bc->max_concurrent;
+    uint8_t *scratch = bc->scratch_pool + (size_t)slot * bc->scratch_per_task;
+
+    /* Layout the scratch slice */
+    float *scores = (float *)scratch;            scratch += bc->scores_per;
+    float *M       = (float *)scratch;           scratch += bc->ms_per;
+    float *S       = (float *)scratch;           scratch += bc->ms_per;
+    float *acc     = (float *)scratch;           scratch += bc->acc_per;
+    float *q_rows  = (float *)scratch;           scratch += bc->qr_per;
+    uint8_t *tile_k = scratch;                   scratch += bc->tk_per;
+    float *tile_v_f32 = (float *)scratch;
+
+    int kv_h = task_idx / bc->n_token_groups;
+    int tg = task_idx % bc->n_token_groups;
+    int kv_mul = bc->kv_mul;
+    int head_dim = bc->head_dim;
+    int tile = bc->tile;
+    int start_pos = bc->start_pos;
+    int n_tokens = bc->n_tokens;
+    int n_kv_tiles = bc->n_kv_tiles;
+
+    int q_group_start = tg * tile;
+    int q_group_end = q_group_start + tile;
+    if (q_group_end > n_tokens) q_group_end = n_tokens;
+    int n_q = q_group_end - q_group_start;
+    int n_q_padded = n_q * kv_mul;
+
+    /* Gather query rows for this (kv_head, token_group) */
+    for (int ti = 0; ti < n_q; ti++) {
+        const float *q_tok = bc->q_batch + (size_t)(q_group_start + ti) * bc->n_heads * head_dim;
+        for (int g = 0; g < kv_mul; g++) {
+            const float *qh = q_tok + (kv_h * kv_mul + g) * head_dim;
+            float *qr = q_rows + ((size_t)ti * kv_mul + g) * head_dim;
+            memcpy(qr, qh, (size_t)head_dim * sizeof(float));
+        }
+    }
+
+    /* Initialize M, S, acc */
+    for (int i = 0; i < n_q_padded; i++) {
+        M[i] = -1e30f;
+        S[i] = 0.0f;
+    }
+    memset(acc, 0, (size_t)n_q_padded * head_dim * sizeof(float));
+
+    /* Tile loop over KV positions */
+    for (int tk = 0; tk < n_kv_tiles; tk++) {
+        int kv_t0 = tk * tile;
+        int kv_t1 = kv_t0 + tile;
+        if (kv_t1 > start_pos + n_tokens) kv_t1 = start_pos + n_tokens;
+        int first_pos = start_pos + q_group_start;
+        if (kv_t0 > first_pos) continue;
+        if (kv_t0 >= start_pos + q_group_end) break;
+
+        /* Skip tiles entirely BEFORE every row's SWA window */
+        if (bc->n_swa > 0) {
+            int win_start_first = first_pos - bc->n_swa + 1;
+            if (win_start_first < 0) win_start_first = 0;
+            if (kv_t1 <= win_start_first) continue;
+        }
+
+        int this_tile_size = kv_t1 - kv_t0;
+        if (this_tile_size <= 0) continue;
+
+        int is_diag = (kv_t0 <= first_pos) && (kv_t1 > first_pos);
+
+        /* Extract K-tile into contiguous scratch */
+        {
+            size_t rb = bc->kv_head_stride_k;
+            size_t row_stride = bc->kv_row_size_k;
+            for (int p = 0; p < this_tile_size; p++) {
+                const uint8_t *src = bc->kcache + (size_t)(kv_t0 + p) * row_stride
+                                   + kv_h * rb;
+                uint8_t *dst = tile_k + (size_t)p * bc->k_rb_gguf;
+                memcpy(dst, src, bc->k_rb_gguf);
+            }
+        }
+
+        /* Extract V-tile and dequantize to F32 */
+        {
+            size_t rb = bc->kv_row_size_v;
+            size_t v_head_stride = bc->kv_head_stride_v;
+            for (int p = 0; p < this_tile_size; p++) {
+                const uint8_t *src = bc->vcache + (size_t)(kv_t0 + p) * rb
+                                   + kv_h * v_head_stride;
+                dequantize_row(src, tile_v_f32 + (size_t)p * head_dim,
+                              head_dim, bc->gguf_v);
+            }
+        }
+
+        /* Build task context and process */
+        attn_tile_task_t task;
+        memset(&task, 0, sizeof(task));
+        task.kv_h = kv_h;
+        task.kv_mul = kv_mul;
+        task.n_kv_heads = bc->n_kv_heads;
+        task.head_dim = head_dim;
+        task.tile_size = this_tile_size;
+        task.n_q_rows = n_q_padded;
+        task.group_token_start = first_pos;
+        task.kv_tile_start = kv_t0;
+        task.kv_tile_end = kv_t1;
+        task.is_diagonal = is_diag;
+        task.kv_gguf_k = bc->gguf_k;
+        task.kv_row_size_k = bc->kv_row_size_k;
+        task.kv_head_stride_k = bc->kv_head_stride_k;
+        task.kcache = bc->kcache;
+        task.q_rows = q_rows;
+        task.scores = scores;
+        task.tile_k = tile_k;
+        task.tile_v_f32 = tile_v_f32;
+        task.M = M;
+        task.S = S;
+        task.acc = acc;
+        task.attn_scale = bc->attn_scale;
+        task.n_swa = bc->n_swa;
+
+        attn_process_tile(&task);
+    }
+
+    /* Normalize and write output */
+    for (int ti = 0; ti < n_q; ti++) {
+        for (int g = 0; g < kv_mul; g++) {
+            int ri = ti * kv_mul + g;
+            float inv_sum = 1.0f / S[ri];
+            float *acc_row = acc + ri * head_dim;
+            float *out = bc->xb_batch + (size_t)(q_group_start + ti) * bc->xb_stride
+                       + (kv_h * kv_mul + g) * head_dim;
+            for (int d = 0; d < head_dim; d++)
+                out[d] = acc_row[d] * inv_sum;
+        }
+    }
+}
+
 static void batch_attention_tiled(
         float *xb_batch, const float *q_batch,
         const uint8_t *kcache, const uint8_t *vcache,
@@ -611,34 +813,6 @@ static gguf_type_t kv_cache_to_gguf_type(kv_cache_type_t kv_type) {
  * tile_size: actual KV positions in this tile (may be < ATTN_TILE for tail)
  * M, S, acc: running softmax state to update in-place
  * out: final output to write [n_q_rows x head_dim] (only after last tile) */
-typedef struct {
-    int kv_h;
-    int kv_mul;
-    int n_kv_heads;
-    int head_dim;
-    int tile_size;
-    int n_q_rows;
-    int group_token_start;  /* first token index in this group */
-    int kv_tile_start;      /* first KV position in this tile */
-    int kv_tile_end;        /* one past last KV position */
-    int is_diagonal;        /* 1 if this tile needs causal masking */
-
-    gguf_type_t kv_gguf_k;  /* gguf_type for this kv cache type */
-    size_t kv_row_size_k;   /* bytes per GQA row in cache */
-    size_t kv_head_stride_k;/* bytes per head within GQA row */
-    const uint8_t *kcache;  /* layer K cache base */
-    const float *q_rows;    /* [n_q_rows x head_dim] query vectors */
-    float *scores;          /* [n_q_rows x tile_size] score buffer */
-    uint8_t *tile_k;        /* contiguous K-tile scratch [tile_size x head_dim] in kv format */
-    float *tile_v_f32;      /* contiguous V-tile in F32 [tile_size x head_dim] */
-    float *M;               /* [n_q_rows] running max */
-    float *S;               /* [n_q_rows] running sum_exp */
-    float *acc;             /* [n_q_rows x head_dim] running accumulator */
-    float *out;             /* [n_q_rows x head_dim] final output (written only after all tiles) */
-    int last_tile;          /* 1 if this is the last tile to process */
-    float attn_scale;       /* attention score scale factor */
-    int n_swa;               /* 0 = full attention; >0 = sliding window size */
-} attn_tile_task_t;
 
 /* Process one tile within a (kv_head, token_group) task.
  * Called inline from the task loop. */
@@ -778,13 +952,49 @@ static void attn_process_tile(attn_tile_task_t *t) {
         }
         t->S[i] += rsum;
 
-        /* acc_row += sum_j tile_exp[j] * V[j, d] */
-        for (int d = 0; d < hd; d++) {
-            float add = 0.0f;
-            for (int j = 0; j < ts; j++) {
-                add += tile_exp_buf[j] * t->tile_v_f32[j * hd + d];
+        /* acc_row += sum_j tile_exp[j] * V[j, d]
+         * Transposed loop: j outer, d inner for contiguous access.
+         * Auto-vectorizes to FMA on AVX-512/AVX2/NEON. */
+        float *v_tile = t->tile_v_f32;
+        for (int j = 0; j < ts; j++) {
+            float w = tile_exp_buf[j];
+            const float *v_row = v_tile + (size_t)j * hd;
+#ifdef PICOLM_AVX512
+            {
+            __m512 wv = _mm512_set1_ps(w);
+            int d = 0;
+            for (; d + 15 < hd; d += 16) {
+                __m512 av = _mm512_loadu_ps(acc_row + d);
+                __m512 vv = _mm512_loadu_ps(v_row + d);
+                _mm512_storeu_ps(acc_row + d, _mm512_fmadd_ps(vv, wv, av));
             }
-            acc_row[d] += add;
+            for (; d < hd; d++) acc_row[d] += w * v_row[d];
+            }
+#elif defined(PICOLM_AVX)
+            {
+            __m256 wv = _mm256_set1_ps(w);
+            int d = 0;
+            for (; d + 7 < hd; d += 8) {
+                __m256 av = _mm256_loadu_ps(acc_row + d);
+                __m256 vv = _mm256_loadu_ps(v_row + d);
+                _mm256_storeu_ps(acc_row + d, _mm256_fmadd_ps(vv, wv, av));
+            }
+            for (; d < hd; d++) acc_row[d] += w * v_row[d];
+            }
+#elif defined(PICOLM_NEON_AARCH64)
+            {
+            float32x4_t wv = vdupq_n_f32(w);
+            int d = 0;
+            for (; d + 3 < hd; d += 4) {
+                float32x4_t av = vld1q_f32(acc_row + d);
+                float32x4_t vv = vld1q_f32(v_row + d);
+                vst1q_f32(acc_row + d, vfmaq_f32(av, vv, wv));
+            }
+            for (; d < hd; d++) acc_row[d] += w * v_row[d];
+            }
+#else
+            for (int d = 0; d < hd; d++) acc_row[d] += w * v_row[d];
+#endif
         }
     }
 }
@@ -811,194 +1021,90 @@ static void batch_attention_tiled(
     int n_token_groups = (n_tokens + tile - 1) / tile;
     int n_kv_tiles = (start_pos + n_tokens + tile - 1) / tile;
 
-    /* For each (kv_head, token_group), we need:
-     * - scores: [kv_mul * tile x tile] floats
-     * - M, S: [kv_mul * tile] floats each
-     * - acc: [kv_mul * tile x head_dim] floats
-     * - tile_k: tile x head_dim in kv format (reuse k_rb * tile)
-     * - tile_v_f32: tile x head_dim floats
-     * - tile_exp_buf: already in stack in attn_process_tile
-     *
-     * Total per task: ~kv_mul * tile * (tile + head_dim) + tile * head_dim * 3
-     * For kv_mul=8, tile=64, head_dim=128:
-     *   8*64*(64+128) = 8*64*192 = 98304 floats = 393KB
-     *   tile*head_dim*3 = 64*128*3 = 24576 floats = 98KB
-     *   ~491KB per task, manageable with malloc. */
-
     gguf_type_t gguf_k = kv_cache_to_gguf_type((kv_cache_type_t)kv_type_k);
     gguf_type_t gguf_v = kv_cache_to_gguf_type((kv_cache_type_t)kv_type_v);
     size_t k_rb_gguf = gguf_type_row_size(gguf_k, head_dim);
 
     if (n_kv_heads < 1 || n_token_groups < 1) return;
 
-    /* Run all (kv_head, token_group) tasks serially. The inner matmul_batch
-     * calls are already threaded via the global thread pool, so adding an
-     * outer parallel_for would deadlock from nested pool_wake/pool_wait. */
-        for (int kv_h = 0; kv_h < n_kv_heads; kv_h++) {
-            for (int tg = 0; tg < n_token_groups; tg++) {
-                int q_group_start = tg * tile;
-                int q_group_end = q_group_start + tile;
-                if (q_group_end > n_tokens) q_group_end = n_tokens;
-                int n_q = q_group_end - q_group_start;
-                int n_q_padded = n_q * kv_mul;
+    /* Run all (kv_head, token_group) tasks in parallel via tensor_parallel_for.
+     * Each task processes one (kv_head, token_group) pair across ALL KV tiles,
+     * with its own pre-allocated scratch buffers (no malloc inside the task). */
+    batch_tiled_ctx_t bctx;
+    memset(&bctx, 0, sizeof(bctx));
+    bctx.xb_batch = xb_batch;
+    bctx.q_batch = q_batch;
+    bctx.kcache = kcache;
+    bctx.vcache = vcache;
+    bctx.n_tokens = n_tokens;
+    bctx.start_pos = start_pos;
+    bctx.n_heads = n_heads;
+    bctx.n_kv_heads = n_kv_heads;
+    bctx.kv_mul = kv_mul;
+    bctx.head_dim = head_dim;
+    bctx.xb_stride = xb_stride;
+    bctx.kv_type_k = (int)kv_type_k;
+    bctx.kv_type_v = (int)kv_type_v;
+    bctx.kv_row_size_k = kv_row_size_k;
+    bctx.kv_row_size_v = kv_row_size_v;
+    bctx.kv_head_stride_k = kv_head_stride_k;
+    bctx.kv_head_stride_v = kv_head_stride_v;
+    bctx.attn_scale = attn_scale;
+    bctx.n_swa = n_swa;
+    bctx.tile = tile;
+    bctx.n_token_groups = n_token_groups;
+    bctx.n_kv_tiles = n_kv_tiles;
+    bctx.gguf_k = gguf_k;
+    bctx.gguf_v = gguf_v;
+    bctx.k_rb_gguf = k_rb_gguf;
 
-                /* Scratch allocation */
-                size_t scores_sz = (size_t)(n_q_padded * tile) * sizeof(float);
-                size_t ms_sz = (size_t)n_q_padded * sizeof(float);
-                size_t acc_sz = (size_t)n_q_padded * head_dim * sizeof(float);
-                size_t tk_sz = (size_t)tile * k_rb_gguf;
-                size_t tv_sz = (size_t)tile * head_dim * sizeof(float);
+    /* Pre-allocate scratch for all tasks. Each task needs:
+     *   scores: kv_mul*tile * tile floats
+     *   M,S:    kv_mul*tile floats each
+     *   acc:    kv_mul*tile * head_dim floats
+     *   q_rows: kv_mul*tile * head_dim floats
+     *   tile_k: tile * k_rb_gguf bytes
+     *   tile_v: tile * head_dim floats
+     * We allocate a pool of scratch spaces, one per possible concurrent task.
+     * The maximum concurrent tasks equals the thread count. */
+    int n_tasks = n_kv_heads * n_token_groups;
+    int max_concurrent = n_tasks < 16 ? n_tasks : 16;
+    size_t scores_per = (size_t)kv_mul * tile * tile * sizeof(float);
+    size_t ms_per     = (size_t)kv_mul * tile * sizeof(float);
+    size_t acc_per    = (size_t)kv_mul * tile * head_dim * sizeof(float);
+    size_t qr_per     = (size_t)kv_mul * tile * head_dim * sizeof(float);
+    size_t tk_per     = (size_t)tile * k_rb_gguf;
+    size_t tv_per     = (size_t)tile * head_dim * sizeof(float);
+    size_t scratch_per_task = scores_per + 2*ms_per + acc_per + qr_per + tk_per + tv_per;
+    size_t total_scratch = (size_t)max_concurrent * scratch_per_task;
+    uint8_t *scratch_pool = malloc(total_scratch);
+    if (!scratch_pool) {
+        /* OOM: fall back to the per-(token,head) non-tiled path */
+        prefill_attn_ctx_t ctx;
+        memset(&ctx, 0, sizeof(ctx));
+        ctx.n_heads = n_heads; ctx.n_kv_heads = n_kv_heads; ctx.kv_mul = kv_mul;
+        ctx.head_dim = head_dim; ctx.start_pos = start_pos;
+        ctx.kv_type_k = (int)kv_type_k; ctx.kv_type_v = (int)kv_type_v;
+        ctx.kv_row_size_k = kv_row_size_k; ctx.kv_row_size_v = kv_row_size_v;
+        ctx.kv_head_stride_k = kv_head_stride_k; ctx.kv_head_stride_v = kv_head_stride_v;
+        ctx.kcache = kcache; ctx.vcache = vcache;
+        ctx.q_batch = q_batch; ctx.xb_batch = xb_batch; ctx.xb_stride = xb_stride;
+        ctx.attn_scale = attn_scale;
+        ctx.n_swa = n_swa;
+        tensor_parallel_for(n_tokens * n_heads, prefill_attn_task, &ctx);
+        return;
+    }
+    bctx.scratch_pool = scratch_pool;
+    bctx.scratch_per_task = scratch_per_task;
+    bctx.scores_per = scores_per;
+    bctx.ms_per = ms_per;
+    bctx.acc_per = acc_per;
+    bctx.qr_per = qr_per;
+    bctx.tk_per = tk_per;
+    bctx.tv_per = tv_per;
+    bctx.max_concurrent = max_concurrent;
 
-                float *scores = malloc(scores_sz);
-                float *M = malloc(ms_sz);
-                float *S = malloc(ms_sz);
-                float *acc = malloc(acc_sz);
-                uint8_t *tile_k_buf = malloc(tk_sz);
-                float *tile_v_f32 = malloc(tv_sz);
-                if (!scores || !M || !S || !acc || !tile_k_buf || !tile_v_f32) {
-                    free(scores); free(M); free(S); free(acc); free(tile_k_buf); free(tile_v_f32);
-                    /* Fallback to original path on OOM */
-                    return;
-                }
-
-                /* Gather query rows for this (kv_head, token_group).
-                 * q_batch layout: [n_tokens][n_heads * head_dim]
-                 * For kv_head kv_h, the query heads are [kv_h*kv_mul .. kv_h*kv_mul+kv_mul).
-                 * For token_group tg, tokens are [q_group_start .. q_group_end).
-                 * We interleave: q_rows[i*head_dim] where i = token_offset * kv_mul + qh_offset.
-                 * Actually: q_rows[row_idx] = q for token (q_group_start + row_idx/kv_mul),
-                 * head (kv_h * kv_mul + row_idx % kv_mul). */
-                float *q_rows = malloc((size_t)n_q_padded * head_dim * sizeof(float));
-                if (!q_rows) {
-                    free(scores); free(M); free(S); free(acc); free(tile_k_buf); free(tile_v_f32);
-                    return;
-                }
-                for (int ti = 0; ti < n_q; ti++) {
-                    const float *q_tok = q_batch + (size_t)(q_group_start + ti) * n_heads * head_dim;
-                    for (int g = 0; g < kv_mul; g++) {
-                        const float *qh = q_tok + (kv_h * kv_mul + g) * head_dim;
-                        float *qr = q_rows + ((size_t)ti * kv_mul + g) * head_dim;
-                        memcpy(qr, qh, head_dim * sizeof(float));
-                    }
-                }
-
-                /* Initialize M, S, acc */
-                for (int i = 0; i < n_q_padded; i++) {
-                    M[i] = -1e30f;
-                    S[i] = 0.0f;
-                }
-                memset(acc, 0, acc_sz);
-
-                /* Tile loop over KV positions */
-                for (int tk = 0; tk < n_kv_tiles; tk++) {
-                    int kv_t0 = tk * tile;
-                    int kv_t1 = kv_t0 + tile;
-                    if (kv_t1 > start_pos + n_tokens) kv_t1 = start_pos + n_tokens;
-                    if (kv_t1 > q_group_start + start_pos + 1) {
-                        /* This tile and all future tiles are fully in the future
-                         * for ALL query rows in this group. Stop. */
-                        /* Actually need per-row check: the last query row's pos is
-                         * start_pos + q_group_end - 1. If kv_t0 >= that, skip. */
-                        /* But we need to be more careful: some rows may have
-                         * earlier causal limits. Let's just check if kv_t0 is
-                         * past the causal limit of the FIRST query row. */
-                        int first_pos = start_pos + q_group_start;
-                        if (kv_t0 > first_pos) continue;
-                        if (kv_t0 >= start_pos + q_group_end) break;
-                    }
-                    /* Skip tiles entirely in the future */
-                    int first_pos = start_pos + q_group_start;
-                    if (kv_t0 > first_pos) continue;
-
-                    /* Skip tiles entirely BEFORE every row's SWA window.
-                     * window_start(pos) = max(0, pos - n_swa + 1) is
-                     * non-decreasing in pos, so the smallest window_start
-                     * in this group belongs to its first (smallest-pos)
-                     * row. If the tile ends before even that row's window
-                     * starts, it is before every row's window and can be
-                     * skipped outright -- this is the SWA analogue of the
-                     * causal future-skip right above. */
-                    if (n_swa > 0) {
-                        int win_start_first = first_pos - n_swa + 1;
-                        if (win_start_first < 0) win_start_first = 0;
-                        if (kv_t1 <= win_start_first) continue;
-                    }
-
-                    int this_tile_size = kv_t1 - kv_t0;
-                    if (this_tile_size <= 0) continue;
-
-                    /* Is this the diagonal tile? (uses the absolute
-                     * position of the first row in the group, matching
-                     * the absolute group_token_start passed to the task
-                     * below and used inside attn_process_tile(), both
-                     * of which expect group_token_start to already
-                     * include start_pos. */
-                    int is_diag = (kv_t0 <= first_pos) && (kv_t1 > first_pos);
-
-                    /* Extract V-tile and dequantize to F32 */
-                    {
-                        size_t rb = kv_row_size_v;
-                        size_t v_head_stride = kv_head_stride_v;
-                        for (int p = 0; p < this_tile_size; p++) {
-                            const uint8_t *src = vcache + (size_t)(kv_t0 + p) * rb
-                                               + kv_h * v_head_stride;
-                            dequantize_row(src, tile_v_f32 + (size_t)p * head_dim,
-                                          head_dim, gguf_v);
-                        }
-                    }
-
-                    /* Build task context and process */
-                    attn_tile_task_t task;
-                    memset(&task, 0, sizeof(task));
-                    task.kv_h = kv_h;
-                    task.kv_mul = kv_mul;
-                    task.n_kv_heads = n_kv_heads;
-                    task.head_dim = head_dim;
-                    task.tile_size = this_tile_size;
-                    task.n_q_rows = n_q_padded;
-                    /* Absolute position of the group's first token -- see
-                     * the fixed is_diag computation above and the
-                     * SWA/causal masking inside attn_process_tile(), both
-                     * of which expect group_token_start to already
-                     * include start_pos. */
-                    task.group_token_start = first_pos;
-                    task.kv_tile_start = kv_t0;
-                    task.kv_tile_end = kv_t1;
-                    task.is_diagonal = is_diag;
-                    task.kv_gguf_k = gguf_k;
-                    task.kv_row_size_k = kv_row_size_k;
-                    task.kv_head_stride_k = kv_head_stride_k;
-                    task.kcache = kcache;
-                    task.q_rows = q_rows;
-                    task.scores = scores;
-                    task.tile_k = tile_k_buf;
-                    task.tile_v_f32 = tile_v_f32;
-                    task.M = M;
-                    task.S = S;
-                    task.acc = acc;
-                    task.attn_scale = attn_scale;
-                    task.n_swa = n_swa;
-
-                    attn_process_tile(&task);
-                }
-
-                /* Normalize and write output */
-                for (int ti = 0; ti < n_q; ti++) {
-                    for (int g = 0; g < kv_mul; g++) {
-                        int ri = ti * kv_mul + g;
-                        float inv_sum = 1.0f / S[ri];
-                        float *acc_row = acc + ri * head_dim;
-                        /* Write to xb_batch: token (q_group_start+ti), head (kv_h*kv_mul+g) */
-                        float *out = xb_batch + (size_t)(q_group_start + ti) * xb_stride
-                                   + (kv_h * kv_mul + g) * head_dim;
-                        for (int d = 0; d < head_dim; d++)
-                            out[d] = acc_row[d] * inv_sum;
-                    }
-                }
-
-                free(scores); free(M); free(S); free(acc);
-                free(tile_k_buf); free(tile_v_f32); free(q_rows);
-            }
-        }
+    tensor_parallel_for(n_tasks, batch_tiled_task, &bctx);
+    free(scratch_pool);
 }
 
