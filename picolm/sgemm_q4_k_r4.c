@@ -1,4 +1,10 @@
-/* sgemm_q4_k_r4.c -- AVX2 kernels for Q4_K_R4 (GGUF type 212) */
+/* sgemm_q4_k_r4.c -- AVX2 kernels for Q4_K_R4 (GGUF type 212)
+ *
+ * Q4_K_R4: 4-row interleaved Q4_K, 576 bytes per block.
+ * Scale layout: 32 scales = 8 subblocks * 4 rows.
+ *   scale index: is = 4*ib + row
+ *   low nibble of scales_l[is] = d scale, high nibble = m scale.
+ */
 
 #include "quant.h"
 #include <stdlib.h>
@@ -6,6 +12,18 @@
 
 #if defined(PICOLM_AVX2)
 #include <immintrin.h>
+
+static inline float get_d_scale(const block_q4_k_r4 *b, int is) {
+    uint8_t sl = b->scales_l[is] & 0xf;
+    uint8_t sh = (b->scales_h[is % 16] >> (4 * (is / 16))) & 0x03;
+    return (float)(sl | (sh << 4));
+}
+
+static inline float get_m_scale(const block_q4_k_r4 *b, int is) {
+    uint8_t sl = (b->scales_l[is] >> 4) & 0xf;
+    uint8_t sh = (b->scales_h[is % 16] >> (4 * (is / 16))) & 0x0c;
+    return (float)(sl | (sh << 2));
+}
 
 void vec_dot_q4_k_r4_q8_k_avx2(const void *vx, const void *wy, int n,
                                   float *out, int nrows) {
@@ -18,17 +36,18 @@ void vec_dot_q4_k_r4_q8_k_avx2(const void *vx, const void *wy, int n,
 
     const __m128i mf  = _mm_set1_epi8(0xf);
 
-    /* Extract row k's 4 unique bytes from a 16-byte chunk.
-     * Layout: chunk bytes 0..3 = row0, 4..7 = row1, 8..11 = row2, 12..15 = row3. */
-    const __m128i pick_row[4] = {
-        _mm_set_epi8(0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
-                     0x80,0x80,0x80,0x80, 3,2,1,0),
-        _mm_set_epi8(0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
-                     0x80,0x80,0x80,0x80, 7,6,5,4),
-        _mm_set_epi8(0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
-                     0x80,0x80,0x80,0x80, 11,10,9,8),
-        _mm_set_epi8(0x80,0x80,0x80,0x80, 0x80,0x80,0x80,0x80,
-                     0x80,0x80,0x80,0x80, 15,14,13,12),
+    /* Extract row k's 4 unique bytes from a 16-byte chunk into low positions.
+     * Layout: chunk bytes 0..3 = row0, 4..7 = row1, 8..11 = row2, 12..15 = row3.
+     * Use -128 (0x80 as signed char) to zero the upper bytes. */
+    const __m128i pick_src[4] = {
+        _mm_set_epi8(-128,-128,-128,-128, -128,-128,-128,-128,
+                     -128,-128,-128,-128, 3,2,1,0),
+        _mm_set_epi8(-128,-128,-128,-128, -128,-128,-128,-128,
+                     -128,-128,-128,-128, 7,6,5,4),
+        _mm_set_epi8(-128,-128,-128,-128, -128,-128,-128,-128,
+                     -128,-128,-128,-128, 11,10,9,8),
+        _mm_set_epi8(-128,-128,-128,-128, -128,-128,-128,-128,
+                     -128,-128,-128,-128, 15,14,13,12),
     };
 
     float outv[4] = {0, 0, 0, 0};
@@ -39,31 +58,15 @@ void vec_dot_q4_k_r4_q8_k_avx2(const void *vx, const void *wy, int n,
 
         float q8_scale = q->d;
 
-        /* Per-row bias correction: -m * min * sum(q8) */
+        /* Per-row bias correction: -m[k] * min * sum(q8) */
         float bias[4] = {0, 0, 0, 0};
         for (int ib = 0; ib < QK_K / 32; ib++) {
             for (int k = 0; k < 4; k++) {
                 int is = 4 * ib + k;
-                float ml = fp16_to_fp32_lookup(b->d[k + 4]) *
-                    ((b->scales_l[is] >> 4) |
-                     ((b->scales_h[is % 16] >> (4 * (is / 16))) & 0x0c) << 2);
+                float ml = fp16_to_fp32_lookup(b->d[k + 4]) * get_m_scale(b, is);
                 bias[k] += ml * (q->bsums[ib * 2 + 0] + q->bsums[ib * 2 + 1]);
             }
         }
-
-        /* Extract 6-bit scales as 4 bytes per subblock */
-        uint32_t sc_val[8];
-        for (int ib = 0; ib < QK_K / 32; ib++) {
-            uint32_t tmp = 0;
-            for (int k = 0; k < 4; k++) {
-                int is = 4 * ib + k;
-                tmp |= (((b->scales_l[is] & 0xf) |
-                         (((b->scales_h[is % 16] >> (4 * (is / 16))) & 0x03) << 4)) << (8 * k));
-            }
-            sc_val[ib] = tmp;
-        }
-
-        int32_t row_sum[4] = {0, 0, 0, 0};
 
         for (int ib = 0; ib < QK_K / 32; ib++) {
             const uint8_t *qs = b->qs + 64 * ib;
@@ -76,18 +79,19 @@ void vec_dot_q4_k_r4_q8_k_avx2(const void *vx, const void *wy, int n,
             c[3] = _mm_loadu_si128((const __m128i *)(qs + 48));
 
             for (int k = 0; k < 4; k++) {
-                __m128i row_dots = _mm_setzero_si128();
+                __m128i dots1 = _mm_setzero_si128();  /* chunks 0,1 */
+                __m128i dots2 = _mm_setzero_si128();  /* chunks 2,3 */
 
                 for (int cc = 0; cc < 4; cc++) {
                     /* Extract row k's 4 unique bytes from chunk cc into low positions */
-                    __m128i r = _mm_shuffle_epi8(c[cc], pick_row[k]);
+                    __m128i r = _mm_shuffle_epi8(c[cc], pick_src[k]);
                     /* r = [b0,b1,b2,b3, 0,...,0] */
 
-                    /* Split into 8 unique nibbles */
+                    /* Split into lo/hi nibbles and interleave */
                     __m128i lo = _mm_and_si128(r, mf);
                     __m128i hi = _mm_and_si128(_mm_srli_epi16(r, 4), mf);
-                    __m128i w = _mm_unpacklo_epi64(lo, hi);
-                    /* w = [lo0,lo1,lo2,lo3, hi0,hi1,hi2,hi3, 0,...,0] */
+                    __m128i w8 = _mm_unpacklo_epi8(lo, hi);
+                    /* w8 = [lo0,hi0,lo1,hi1,lo2,hi2,lo3,hi3, 0,...,0] */
 
                     /* Activation indices for this chunk */
                     int act_lo_base, act_hi_base;
@@ -97,31 +101,39 @@ void vec_dot_q4_k_r4_q8_k_avx2(const void *vx, const void *wy, int n,
                     else { act_lo_base = 20; act_hi_base = 28; }
 
                     /* Load 4 int8 activations for lo and hi, sign-extend to 4 int16s each */
-                    __m128i act_lo = _mm_cvtepi8_epi16(_mm_cvtsi32_si128(*(const int32_t *)(q8 + act_lo_base)));
-                    __m128i act_hi = _mm_cvtepi8_epi16(_mm_cvtsi32_si128(*(const int32_t *)(q8 + act_hi_base)));
-                    __m128i a = _mm_unpacklo_epi64(act_lo, act_hi);
-                    /* a = [a_lo0,a_lo1,a_lo2,a_lo3, a_hi0,a_hi1,a_hi2,a_hi3] as 8 int16s */
+                    int32_t act_lo32, act_hi32;
+                    memcpy(&act_lo32, q8 + act_lo_base, sizeof(act_lo32));
+                    memcpy(&act_hi32, q8 + act_hi_base, sizeof(act_hi32));
+                    __m128i act_lo = _mm_cvtepi8_epi16(_mm_cvtsi32_si128(act_lo32));
+                    __m128i act_hi = _mm_cvtepi8_epi16(_mm_cvtsi32_si128(act_hi32));
+                    __m128i a16 = _mm_unpacklo_epi16(act_lo, act_hi);
+                    /* a16 = [a_lo0,a_hi0,a_lo1,a_hi1,a_lo2,a_hi2,a_lo3,a_hi3] as 8 int16s */
 
                     /* Convert weights to int16s and multiply-accumulate */
-                    __m128i w16 = _mm_cvtepu8_epi16(w);
-                    __m128i prod = _mm_madd_epi16(w16, a);
+                    __m128i w16 = _mm_cvtepu8_epi16(w8);
+                    __m128i prod = _mm_madd_epi16(w16, a16);
                     /* prod = 4 int32s */
-                    row_dots = _mm_add_epi32(row_dots, prod);
+
+                    if (cc < 2) dots1 = _mm_add_epi32(dots1, prod);
+                    else        dots2 = _mm_add_epi32(dots2, prod);
                 }
 
                 /* Reduce 4 int32s to 1 */
-                __m128i rd = _mm_add_epi32(row_dots, _mm_shuffle_epi32(row_dots, 0x4e));
-                rd = _mm_add_epi32(rd, _mm_shuffle_epi32(rd, 0xb1));
+                __m128i rd1 = _mm_add_epi32(dots1, _mm_shuffle_epi32(dots1, 0x4e));
+                rd1 = _mm_add_epi32(rd1, _mm_shuffle_epi32(rd1, 0xb1));
+                __m128i rd2 = _mm_add_epi32(dots2, _mm_shuffle_epi32(dots2, 0x4e));
+                rd2 = _mm_add_epi32(rd2, _mm_shuffle_epi32(rd2, 0xb1));
 
-                /* Scale: sc_val[ib] byte k */
-                uint8_t sc = (sc_val[ib] >> (8 * k)) & 0xff;
-                row_sum[k] += (int32_t)_mm_cvtsi128_si32(rd) * (int32_t)(int8_t)sc;
+                /* Apply scale */
+                int is = 4 * ib + k;
+                float d = fp16_to_fp32_lookup(b->d[k]);
+                float s = get_d_scale(b, is);
+                outv[k] += (d * s * (float)(_mm_cvtsi128_si32(rd1) + _mm_cvtsi128_si32(rd2))) * q8_scale;
             }
         }
 
         for (int k = 0; k < 4; k++) {
-            float d = fp16_to_fp32_lookup(b->d[k]);
-            outv[k] += (d * (float)row_sum[k] - bias[k]) * q8_scale;
+            outv[k] -= bias[k] * q8_scale;
         }
     }
 
