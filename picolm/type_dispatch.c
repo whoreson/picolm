@@ -185,11 +185,11 @@ const type_info_t type_info_table[] = {
         .rows_per_block = 1,
         .fn_gemv = gemv_iq4_nl,
         .fn_gemm = NULL,
-        .has_qgemm_d = 0,
+        .has_qgemm_d = 1,
         .fn_dequant_single = NULL,
         .needs_qx = 1,
         .use_repacked = 0,
-        .has_dual_scalar_path = 1,
+        .has_dual_scalar_path = 0,
     },
     /* Q5_1: plain, Q8_0 activations */
     [GGUF_TYPE_Q5_1] = {
@@ -249,7 +249,7 @@ const type_info_t type_info_table[] = {
         .fn_dequant_single = NULL,
         .needs_qx = 1,
         .use_repacked = 0,
-        .has_dual_scalar_path = 1,
+        .has_dual_scalar_path = 0,
     },
     /* Q5_K: plain, Q8_K activations */
     [GGUF_TYPE_Q5_K] = {
@@ -309,7 +309,7 @@ const type_info_t type_info_table[] = {
         .fn_dequant_single = NULL,
         .needs_qx = 1,
         .use_repacked = 0,
-        .has_dual_scalar_path = 1,
+        .has_dual_scalar_path = 0,
     },
     /* IQ2_K: plain, Q8_K activations */
     [GGUF_TYPE_IQ2_K] = {
@@ -321,7 +321,7 @@ const type_info_t type_info_table[] = {
         .fn_dequant_single = NULL,
         .needs_qx = 1,
         .use_repacked = 0,
-        .has_dual_scalar_path = 1,
+        .has_dual_scalar_path = 0,
     },
     /* IQ3_K: plain, Q8_K activations */
     [GGUF_TYPE_IQ3_K] = {
@@ -333,7 +333,7 @@ const type_info_t type_info_table[] = {
         .fn_dequant_single = NULL,
         .needs_qx = 1,
         .use_repacked = 0,
-        .has_dual_scalar_path = 1,
+        .has_dual_scalar_path = 0,
     },
     /* IQ4_K: plain, Q8_K activations */
     [GGUF_TYPE_IQ4_K] = {
@@ -345,7 +345,7 @@ const type_info_t type_info_table[] = {
         .fn_dequant_single = NULL,
         .needs_qx = 1,
         .use_repacked = 0,
-        .has_dual_scalar_path = 1,
+        .has_dual_scalar_path = 0,
     },
     /* IQ6_K: plain, Q8_K activations */
     [GGUF_TYPE_IQ6_K] = {
@@ -357,7 +357,7 @@ const type_info_t type_info_table[] = {
         .fn_dequant_single = NULL,
         .needs_qx = 1,
         .use_repacked = 0,
-        .has_dual_scalar_path = 1,
+        .has_dual_scalar_path = 0,
     },
     /* ---- R4 interleaved types ---- */
     [GGUF_TYPE_IQ2_K_R4] = {
