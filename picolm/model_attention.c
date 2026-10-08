@@ -6,6 +6,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <assert.h>
 
 #ifdef _OPENMP
@@ -844,6 +845,35 @@ static void batch_attention_tiled(
 /* Forward declaration for callback to tensor_parallel_for */
 static void prefill_attn_task(int flat_idx, void *ctx_ptr);
 
+#include <time.h>
+
+/* ---- Attention timing instrumentation (PICOLM_ATTN_TIMING=1) ---- */
+static double attn_timing_total = 0.0;
+static long long attn_timing_calls = 0;
+static long long attn_timing_tokens = 0;
+static long long attn_timing_ctx_sum = 0;   /* sum of start_pos*n_tokens */
+static int attn_timing_enabled = -1;
+
+static double attn_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
+}
+
+static void attn_timing_report(void) {
+    if (attn_timing_calls == 0) return;
+    fprintf(stderr, "[ATTN-TIMING] calls=%lld tokens=%lld avg_ctx=%lld total_ms=%.1f ms_per_token_ctx=%.6f\n",
+            attn_timing_calls, attn_timing_tokens,
+            attn_timing_tokens ? attn_timing_ctx_sum / attn_timing_tokens : 0,
+            attn_timing_total,
+            attn_timing_tokens ? attn_timing_total / attn_timing_tokens : 0);
+}
+
+static void attn_timing_register(void) __attribute__((constructor));
+static void attn_timing_register(void) {
+    atexit(attn_timing_report);
+}
+
 void batch_attention_layer(
         float *xb_batch, const float *q_batch,
         const uint8_t *kcache, const uint8_t *vcache,
@@ -855,6 +885,11 @@ void batch_attention_layer(
         size_t kv_head_stride_k, size_t kv_head_stride_v,
         float attn_scale, int n_swa)
 {
+    double _attn_t0 = 0;
+    if (attn_timing_enabled < 0)
+        attn_timing_enabled = getenv("PICOLM_ATTN_TIMING") ? 1 : 0;
+    if (attn_timing_enabled) _attn_t0 = attn_now_ms();
+
     /* Build the prefill_attn_ctx for both the original path and the test */
     prefill_attn_ctx_t ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -884,16 +919,23 @@ void batch_attention_layer(
                               kv_row_size_k, kv_row_size_v,
                               kv_head_stride_k, kv_head_stride_v,
                               attn_scale, n_swa);
-        return;
+    } else {
+        /* One dispatch per layer for the whole batch: n_tokens * n_kv_heads
+         * independent (token, kv_head) tasks with GQA grouping. Each task
+         * scans the causal range once for all kv_mul Q heads sharing this
+         * KV head, reducing KV cache reads by kv_mul vs per-Q-head dispatch.
+         * Still provides n_tokens * n_kv_heads tasks for thread parallelism
+         * (e.g., 13 tokens * 8 kv_heads = 104 tasks on 16 threads). */
+        tensor_parallel_for(n_tokens * n_kv_heads, prefill_attn_task_grouped, &ctx);
     }
 
-    /* One dispatch per layer for the whole batch: n_tokens * n_kv_heads
-     * independent (token, kv_head) tasks with GQA grouping. Each task
-     * scans the causal range once for all kv_mul Q heads sharing this
-     * KV head, reducing KV cache reads by kv_mul vs per-Q-head dispatch.
-     * Still provides n_tokens * n_kv_heads tasks for thread parallelism
-     * (e.g., 13 tokens * 8 kv_heads = 104 tasks on 16 threads). */
-    tensor_parallel_for(n_tokens * n_kv_heads, prefill_attn_task_grouped, &ctx);
+    if (attn_timing_enabled) {
+        double _attn_t1 = attn_now_ms();
+        attn_timing_total += _attn_t1 - _attn_t0;
+        attn_timing_calls++;
+        attn_timing_tokens += n_tokens;
+        attn_timing_ctx_sum += (long long)start_pos * n_tokens;
+    }
 }
 
 /* ================================================================
