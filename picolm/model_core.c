@@ -4009,6 +4009,45 @@ static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_to
     return s->logits;
 }
 
+/* ---- Parallel element-wise helpers for batched prefill ---- */
+
+typedef struct {
+    float *hb, *hb2;
+    int n_ffn;
+} silu_mul_ctx_t;
+
+static void silu_mul_task(int idx, void *ctxp) {
+    silu_mul_ctx_t *ctx = (silu_mul_ctx_t *)ctxp;
+    silu(ctx->hb + (size_t)idx * ctx->n_ffn, ctx->n_ffn);
+    elemwise_mul(ctx->hb + (size_t)idx * ctx->n_ffn, ctx->hb + (size_t)idx * ctx->n_ffn,
+                 ctx->hb2 + (size_t)idx * ctx->n_ffn, ctx->n_ffn);
+}
+
+typedef struct {
+    float *out, *x;
+    const float *w;
+    int dim;
+    float eps;
+} batch_rmsnorm_ctx_t;
+
+static void batch_rmsnorm_task(int idx, void *ctxp) {
+    batch_rmsnorm_ctx_t *ctx = (batch_rmsnorm_ctx_t *)ctxp;
+    rmsnorm(ctx->out + (size_t)idx * ctx->dim, ctx->x + (size_t)idx * ctx->dim,
+            ctx->w, ctx->dim, ctx->eps);
+}
+
+typedef struct {
+    float *a, *b;
+    int dim;
+} batch_add_ctx_t;
+
+static void batch_add_task(int idx, void *ctxp) {
+    batch_add_ctx_t *ctx = (batch_add_ctx_t *)ctxp;
+    float *a = ctx->a + (size_t)idx * ctx->dim;
+    float *b = ctx->b + (size_t)idx * ctx->dim;
+    for (int d2 = 0; d2 < ctx->dim; d2++) a[d2] += b[d2];
+}
+
 /* ---- GPTNeoX (Krake v2) batched prefill ----
  * Same as GPT-2 prefill but:
  * - Has RoPE (partial rotary) instead of learned pos embd
@@ -4468,15 +4507,15 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
             continue;
         }
 
-        /* LayerNorm for GPT-2/StableLM, RMSNorm for others */
-        for (bi = 0; bi < n_tokens; bi++) {
-            if (c->is_gpt2 || c->is_stablelm) {
+        /* LayerNorm for GPT-2/StableLM, RMSNorm for others (parallelized over tokens) */
+        if (c->is_gpt2 || c->is_stablelm) {
+            for (bi = 0; bi < n_tokens; bi++) {
                 layernorm(xb_batch + bi * dim, x_batch + bi * dim,
                           s->attn_norm_w[l], s->attn_norm_b[l], dim, c->rms_norm_eps);
-            } else {
-                rmsnorm(xb_batch + bi * dim, x_batch + bi * dim,
-                        s->attn_norm_w[l], dim, c->rms_norm_eps);
             }
+        } else {
+            batch_rmsnorm_ctx_t rctx = { xb_batch, x_batch, s->attn_norm_w[l], dim, c->rms_norm_eps };
+            tensor_parallel_for(n_tokens, batch_rmsnorm_task, &rctx);
         }
         /* Save normalized input for parallel residual FFN */
         if (c->use_parallel_residual) {
@@ -4887,11 +4926,10 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
             }
             tensor_set_repacked(NULL);
 
-            /* SiLU + mul */
-            for (bi = 0; bi < n_tokens; bi++) {
-                silu(hb_batch + bi * n_ffn, n_ffn);
-                /* Both paths: gate in hb_batch, up in hb2_batch, result in hb_batch */
-                elemwise_mul(hb_batch + bi * n_ffn, hb_batch + bi * n_ffn, hb2_batch + bi * n_ffn, n_ffn);
+            /* SiLU + mul (parallelized over tokens) */
+            {
+                silu_mul_ctx_t sctx = { hb_batch, hb2_batch, n_ffn };
+                tensor_parallel_for(n_tokens, silu_mul_task, &sctx);
             }
 
             /* FFN down (batched) */
@@ -4903,11 +4941,15 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                 matmul_batch(xb_batch, hb_batch, n_tokens, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
                 tensor_set_repacked(NULL);
                 /* Parallel residual: add both attn_out (in xb2_batch) and ffn_out (in xb_batch) */
-                for (bi = 0; bi < n_tokens; bi++) {
-                    float *x = x_batch + bi * dim;
-                    float *a = xb2_batch + bi * dim;
-                    float *f = xb_batch + bi * dim;
-                    for (int d2 = 0; d2 < dim; d2++) x[d2] += a[d2] + f[d2];
+                {
+                    batch_add_ctx_t actx = { x_batch, xb2_batch, dim };
+                    /* x += attn_out + ffn_out (fused, uses hb_batch as temp) */
+                    for (bi = 0; bi < n_tokens; bi++) {
+                        float *x = x_batch + bi * dim;
+                        float *a = xb2_batch + bi * dim;
+                        float *f = xb_batch + bi * dim;
+                        for (int d2 = 0; d2 < dim; d2++) x[d2] += a[d2] + f[d2];
+                    }
                 }
             } else {
                 matmul_batch(xb2_batch, hb_batch, n_tokens, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);

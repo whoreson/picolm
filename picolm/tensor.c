@@ -26,6 +26,7 @@ extern void vec_dot_iq4_k_r4_q8_k_neon(const void *vx, const void *wy, int n, fl
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -2115,8 +2116,20 @@ void matmul_batch(float *out, const float *x, int n_batch,
         return;
     }
 
-    /* Quantized path: try GEMM first, then fall back to threaded worker */
-    quant_buf_t qb = quant_activations(qtype, x, n_batch, n, NULL, 0);
+    /* Quantized path: try GEMM first, then fall back to threaded worker.
+     * Use a persistent scratch buffer to avoid malloc/free per call. */
+    static void *act_scratch = NULL;
+    static size_t act_scratch_size = 0;
+    /* Over-allocate for any activation format: Q8_0 is 34 bytes/32 vals, Q8_K is 260 bytes/256 vals.
+     * Q8_K is the largest common format: 256 * (sizeof(block_q8_K)) / 256 + delta = ~264 bytes per 256 values.
+     * Use a generous upper bound: n_batch * n * 2 bytes (covers all quant formats). */
+    size_t act_need = (size_t)n_batch * (size_t)n * 2 + 4096;
+    if (act_need > act_scratch_size) {
+        free(act_scratch);
+        act_scratch = malloc(act_need);
+        act_scratch_size = act_need ? act_need : 1;
+    }
+    quant_buf_t qb = quant_activations(qtype, x, n_batch, n, act_scratch, act_scratch_size);
     if (!qb.qbuf) {
         /* Allocation failed: generic vec_dot fallback */
         for (int b = 0; b < n_batch; b++)
@@ -2849,8 +2862,25 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
           if (!_sgemm_off) {
             size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
             int nb = n / 32;
-            void *qbuf = malloc((size_t)n_batch * q8_rb);
-            float *dbuf = (float *)malloc((size_t)n_batch * nb * sizeof(float));
+            /* Scratch buffer cache: avoid repeated malloc/free for activation quantization */
+            static void *qbuf_cache = NULL;
+            static size_t qbuf_cache_size = 0;
+            static float *dbuf_cache = NULL;
+            static size_t dbuf_cache_size = 0;
+            size_t qbuf_need = (size_t)n_batch * q8_rb;
+            size_t dbuf_need = (size_t)n_batch * nb * sizeof(float);
+            if (qbuf_need > qbuf_cache_size) {
+                free(qbuf_cache);
+                qbuf_cache = malloc(qbuf_need);
+                qbuf_cache_size = qbuf_need ? qbuf_need : 1;
+            }
+            if (dbuf_need > dbuf_cache_size) {
+                free(dbuf_cache);
+                dbuf_cache = malloc(dbuf_need);
+                dbuf_cache_size = dbuf_need ? dbuf_need : 1;
+            }
+            void *qbuf = qbuf_cache;
+            float *dbuf = dbuf_cache;
             if (qbuf && dbuf) {
                 for (int b = 0; b < n_batch; b++) {
                     quantize_row_q8_0(x + (size_t)b * n, (char *)qbuf + (size_t)b * q8_rb, n);
@@ -2876,7 +2906,7 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                     .Atype = qtype2, .nth = nth,
                 };
                 tensor_parallel_for(nth, qgemm_d_task, &ctx2);
-                free(qbuf); free(dbuf);
+                /* Buffers kept in cache for reuse */
                 DISPATCH2("GEMM_d_dual_table");
                 return;
             }
@@ -3625,11 +3655,24 @@ void vec_add(float *a, const float *b, int size) {
  * Fix: always refresh every slot in [0, n_threads), giving unused slots
  * an empty (start == end) range so they safely no-op instead of running
  * leftover data. */
+/* Barrier profiling (enabled by PICOLM_BARRIER_PROF env var) */
+static inline double barrier_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+static int barrier_prof_on = -1;
+static long barrier_dispatch_count;
+static double barrier_ns_total;
+
 void tensor_parallel_for(int count, void (*fn)(int idx, void *ctx), void *ctx) {
     if (n_threads <= 1 || count < 2) {
         for (int i = 0; i < count; i++) fn(i, ctx);
         return;
     }
+    if (barrier_prof_on < 0) barrier_prof_on = getenv("PICOLM_BARRIER_PROF") ? 1 : 0;
+    int prof = barrier_prof_on;
+    double t0 = prof ? barrier_now() : 0;
     int nt = pool_total_threads(n_threads);
     int want = n_threads < nt ? n_threads : nt;
     int active = want > count ? count : want;
@@ -3651,4 +3694,12 @@ void tensor_parallel_for(int count, void (*fn)(int idx, void *ctx), void *ctx) {
     generic_worker_f(&generic_tasks[0]);
     pool_wait(nt);
     pool_mode = 0;
+    if (prof) {
+        barrier_dispatch_count++;
+        barrier_ns_total += (barrier_now() - t0) * 1e9;
+        if (barrier_dispatch_count == 48*8) {
+            fprintf(stderr, "[BARRIER] %ld dispatches, total %.1f ms\n",
+                    barrier_dispatch_count, barrier_ns_total / 1e6);
+        }
+    }
 }
