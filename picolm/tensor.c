@@ -294,35 +294,43 @@ static int count_physical_cores(void) {
 #else /* Linux / POSIX */
     {
         /* Count physical cores from /sys topology files.
-         * Each /sys/devices/system/cpu/cpuN/topology/core_id gives the core
-         * number for that logical CPU. Unique count = physical cores. */
+         * Use unique (physical_package_id, core_id) pairs: on multi-socket
+         * systems, core_id is per-socket and resets to 0 on each socket.
+         * Counting only core_id would halve the count on 2-socket systems. */
         {
-            int max_cpus = 256;
-            int *core_ids = (int *)calloc(max_cpus, sizeof(int));
-            if (!core_ids) return (int)sysconf(_SC_NPROCESSORS_ONLN);
+            int max_cpus = 1024;
             int n_cpus = 0;
+            int *pkg_ids = (int *)calloc(max_cpus, sizeof(int));
+            int *core_ids = (int *)calloc(max_cpus, sizeof(int));
+            if (!pkg_ids || !core_ids) { free(pkg_ids); free(core_ids); return (int)sysconf(_SC_NPROCESSORS_ONLN); }
             for (int i = 0; i < max_cpus; i++) {
                 char path[128];
-                snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/core_id", i);
+                snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", i);
                 FILE *cf = fopen(path, "r");
                 if (!cf) break;
-                int cid;
-                if (fscanf(cf, "%d", &cid) == 1) {
-                    core_ids[n_cpus++] = cid;
-                }
+                int pid = 0;
+                if (fscanf(cf, "%d", &pid) != 1) { fclose(cf); break; }
                 fclose(cf);
+                snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/core_id", i);
+                cf = fopen(path, "r");
+                if (!cf) break;
+                int cid = 0;
+                if (fscanf(cf, "%d", &cid) != 1) { fclose(cf); break; }
+                fclose(cf);
+                pkg_ids[n_cpus] = pid;
+                core_ids[n_cpus] = cid;
+                n_cpus++;
             }
-            /* Count unique core_ids */
+            /* Count unique (pkg, core) pairs = physical cores across all sockets */
             int unique = 0;
             for (int i = 0; i < n_cpus; i++) {
                 int found = 0;
-                for (int j = 0; j < unique; j++) {
-                    if (core_ids[i] == core_ids[j]) { found = 1; break; }
+                for (int j = 0; j < i; j++) {
+                    if (pkg_ids[i] == pkg_ids[j] && core_ids[i] == core_ids[j]) { found = 1; break; }
                 }
-                if (!found) {
-                    core_ids[unique++] = core_ids[i];
-                }
+                if (!found) unique++;
             }
+            free(pkg_ids);
             free(core_ids);
             if (unique > 0) return unique;
         }
