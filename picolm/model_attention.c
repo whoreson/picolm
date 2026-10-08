@@ -498,6 +498,132 @@ static void prefill_attn_task(int flat_idx, void *ctx_ptr) {
               ctx->head_dim, ctx->attn_scale, ctx->n_swa);
 }
 
+/* GQA-grouped prefill attention task: processes all kv_mul Q heads for one
+ * (token, kv_head) pair. This reduces KV cache reads by kv_mul compared to
+ * dispatching per-Q-head tasks (prefill_attn_task), since the KV cache scan
+ * is done once per KV head instead of once per Q head.
+ *
+ * Task index = bi * n_kv_heads + kv_h (token-major for L2 locality of Q rows). */
+static void prefill_attn_task_grouped(int flat_idx, void *ctx_ptr) {
+    prefill_attn_ctx_t *ctx = (prefill_attn_ctx_t *)ctx_ptr;
+    int bi = flat_idx / ctx->n_kv_heads;
+    int kv_h = flat_idx % ctx->n_kv_heads;
+    int pos = ctx->start_pos + bi;
+    int kv_mul = ctx->kv_mul;
+    int head_dim = ctx->head_dim;
+    const float *q_base = ctx->q_batch + (size_t)bi * ctx->n_heads * head_dim
+                        + kv_h * kv_mul * head_dim;
+    float *xb_base = ctx->xb_batch + (size_t)bi * ctx->xb_stride
+                   + kv_h * kv_mul * head_dim;
+
+    /* Per-Q-head online-softmax state */
+    assert(kv_mul <= 8 && head_dim <= 256);
+    float max_score[8], sum_exp[8];
+    for (int g = 0; g < kv_mul; g++) { max_score[g] = -1e30f; sum_exp[g] = 0.0f; }
+    float acc[8][256];
+    memset(acc, 0, sizeof(acc));
+
+    /* Sliding window */
+    int t_start = (ctx->n_swa > 0) ? (pos - ctx->n_swa + 1) : 0;
+    if (t_start < 0) t_start = 0;
+
+    for (int t = t_start; t <= pos; t++) {
+        const uint8_t *kt = ctx->kcache + (size_t)t * ctx->kv_row_size_k
+                          + kv_h * ctx->kv_head_stride_k;
+        const uint8_t *vt = ctx->vcache + (size_t)t * ctx->kv_row_size_v
+                          + kv_h * ctx->kv_head_stride_v;
+
+        /* Compute scores for all kv_mul Q heads against this K position */
+        float score[8];
+        for (int g = 0; g < kv_mul; g++) {
+            const float *qh = q_base + g * head_dim;
+            if (ctx->kv_type_k == KV_CACHE_Q8_0)
+                score[g] = vec_dot_q8_0_f32(kt, qh, head_dim);
+            else if (ctx->kv_type_k == KV_CACHE_Q4_0)
+                score[g] = vec_dot_q4_0_f32(kt, qh, head_dim);
+            else
+                score[g] = vec_dot_f16_f32(kt, qh, head_dim);
+            score[g] *= ctx->attn_scale;
+        }
+
+        /* Online softmax update for all kv_mul heads */
+        for (int g = 0; g < kv_mul; g++) {
+            float *accg = acc[g];
+            const float *qh = q_base + g * head_dim;
+            if (score[g] > max_score[g]) {
+                float correction = expf(max_score[g] - score[g]);
+                sum_exp[g] = sum_exp[g] * correction + 1.0f;
+                /* Rescale acc and add V */
+                if (ctx->kv_type_v == KV_CACHE_F16) {
+                    const uint16_t *vt16 = (const uint16_t *)vt;
+#ifdef PICOLM_AVX512
+                    { __m512 cv = _mm512_set1_ps(correction); int d = 0;
+                      for (; d + 15 < head_dim; d += 16) {
+                          __m512 vf = fp16x16_to_fp32_inline(vt16 + d);
+                          __m512 af = _mm512_loadu_ps(accg + d);
+                          _mm512_storeu_ps(accg + d, _mm512_fmadd_ps(af, cv, vf));
+                      }
+                      for (; d < head_dim; d++) accg[d] = fmaf(accg[d], correction, fp16_to_fp32(vt16[d])); }
+#else
+                    for (int d = 0; d < head_dim; d++) accg[d] = fmaf(accg[d], correction, fp16_to_fp32(((const uint16_t *)vt)[d]));
+#endif
+                } else {
+                    /* Quantized V: use scale_add with correction */
+                    for (int d = 0; d < head_dim; d++) accg[d] *= correction;
+                    /* Add V contribution */
+                    if (ctx->kv_type_v == KV_CACHE_Q8_0) {
+                        fma_scale_q8_0_f32(accg, 1.0f, vt, head_dim);
+                    } else if (ctx->kv_type_v == KV_CACHE_Q4_0) {
+                        fma_scale_q4_0_f32(accg, 1.0f, vt, head_dim);
+                    } else {
+                        for (int d = 0; d < head_dim; d++) accg[d] += fp16_to_fp32(((const uint16_t *)vt)[d]);
+                    }
+                }
+                max_score[g] = score[g];
+            } else {
+                float w = expf(score[g] - max_score[g]);
+                sum_exp[g] += w;
+                if (ctx->kv_type_v == KV_CACHE_F16) {
+                    const uint16_t *vt16 = (const uint16_t *)vt;
+#ifdef PICOLM_AVX512
+                    { __m512 wv = _mm512_set1_ps(w); int d = 0;
+                      for (; d + 15 < head_dim; d += 16) {
+                          __m512 vf = fp16x16_to_fp32_inline(vt16 + d);
+                          __m512 af = _mm512_loadu_ps(accg + d);
+                          _mm512_storeu_ps(accg + d, _mm512_fmadd_ps(vf, wv, af));
+                      }
+                      for (; d < head_dim; d++) accg[d] = fmaf(w, fp16_to_fp32(vt16[d]), accg[d]); }
+#else
+                    for (int d = 0; d < head_dim; d++) accg[d] = fmaf(w, fp16_to_fp32(((const uint16_t *)vt)[d]), accg[d]);
+#endif
+                } else {
+                    if (ctx->kv_type_v == KV_CACHE_Q8_0) {
+                        scale_add_q8_0_f32(accg, w, vt, head_dim);
+                    } else if (ctx->kv_type_v == KV_CACHE_Q4_0) {
+                        scale_add_q4_0_f32(accg, w, vt, head_dim);
+                    } else {
+                        for (int d = 0; d < head_dim; d++) accg[d] += w * fp16_to_fp32(((const uint16_t *)vt)[d]);
+                    }
+                }
+            }
+        }
+    }
+
+    /* Normalize and write output for all kv_mul Q heads */
+    for (int g = 0; g < kv_mul; g++) {
+        float inv_sum = 1.0f / sum_exp[g];
+        float *accg = acc[g];
+        float *out = xb_base + g * head_dim;
+#ifdef PICOLM_AVX512
+        { __m512 inv = _mm512_set1_ps(inv_sum); int d = 0;
+          for (; d + 15 < head_dim; d += 16) { __m512 af = _mm512_loadu_ps(accg + d); _mm512_storeu_ps(out + d, _mm512_mul_ps(af, inv)); }
+          for (; d < head_dim; d++) out[d] = accg[d] * inv_sum; }
+#else
+        for (int d = 0; d < head_dim; d++) out[d] = accg[d] * inv_sum;
+#endif
+    }
+}
+
 /* Tiled attention: tile size in KV positions */
 #define ATTN_TILE 64
 typedef struct {
@@ -743,13 +869,12 @@ void batch_attention_layer(
     ctx.n_swa = n_swa;
 
     /* For large enough batches, use the tiled/batched attention path which
-     * amortizes KV cache load/dequant across multiple query tokens via the
-     * existing matmul_batch infrastructure. For small batches, the original
-     * per-(token,head) path is simpler and avoids malloc overhead.
+     * amortizes KV cache load/dequant across multiple query tokens.
+     * For small batches, the per-(token,head) path has better parallelism
+     * (n_tokens * n_heads tasks vs n_kv_heads * ceil(n_tokens/tile) tasks).
      *
-     * The tiled path currently only supports F16 KV cache (which is what
-     * the store loop always writes). Q8_0/Q4_0 cache types are a planned
-     * enhancement. */
+     * The tiled path requires F16 KV cache (which is what the store loop
+     * always writes). Q8_0/Q4_0 cache types are a planned enhancement. */
     if (n_tokens >= 2 * ATTN_TILE && (int)kv_type_k == (int)KV_CACHE_F16 && (int)kv_type_v == (int)KV_CACHE_F16) {
         batch_attention_tiled(xb_batch, q_batch, kcache, vcache,
                               n_tokens, start_pos,
@@ -762,10 +887,13 @@ void batch_attention_layer(
         return;
     }
 
-    /* One dispatch per layer for the whole batch: n_tokens * n_heads
-     * independent (token, head) tasks, each O(head_dim) memory, each
-     * scanning only its own causal range t=0..pos. */
-    tensor_parallel_for(n_tokens * n_heads, prefill_attn_task, &ctx);
+    /* One dispatch per layer for the whole batch: n_tokens * n_kv_heads
+     * independent (token, kv_head) tasks with GQA grouping. Each task
+     * scans the causal range once for all kv_mul Q heads sharing this
+     * KV head, reducing KV cache reads by kv_mul vs per-Q-head dispatch.
+     * Still provides n_tokens * n_kv_heads tasks for thread parallelism
+     * (e.g., 13 tokens * 8 kv_heads = 104 tasks on 16 threads). */
+    tensor_parallel_for(n_tokens * n_kv_heads, prefill_attn_task_grouped, &ctx);
 }
 
 /* ================================================================
@@ -824,17 +952,14 @@ static void attn_process_tile(attn_tile_task_t *t) {
     int kv_tile_start = t->kv_tile_start;
     int group_token_start = t->group_token_start;
 
+    size_t k_rb_gguf = gguf_type_row_size(t->kv_gguf_k, hd);
+
     /* Extract K-tile from GQA KV cache into contiguous scratch.
      * KV cache layout: [pos][kv_row_size_gqa] with head offset = kv_h * kv_head_stride_k
      * For positions [kv_tile_start, kv_tile_start+ts), head kv_h: */
     {
         size_t rb = t->kv_head_stride_k;
         size_t row_stride = t->kv_row_size_k;
-        int gguf_k = t->kv_gguf_k;
-        size_t k_rb_gguf = gguf_type_row_size(gguf_k, hd);
-        /* K tile: ts positions, each rb bytes from cache, copied to
-         * contiguous buffer with stride k_rb_gguf. For F16 this is
-         * the same size and just a memcpy; for Q8_0/Q4_0 also same. */
         for (int p = 0; p < ts; p++) {
             const uint8_t *src = t->kcache + (size_t)(kv_tile_start + p) * row_stride
                                + t->kv_h * rb;
@@ -844,7 +969,16 @@ static void attn_process_tile(attn_tile_task_t *t) {
     }
 
     /* QK^T: matmul_batch(scores, q_rows, n_q, tile_k, hd, ts, kv_gguf_k)
-     * out layout: [n_q][ts], scores[b*ts + i] = row b, col i */
+     * out layout: [n_q][ts], scores[b*ts + i] = row b, col i
+     *
+     * NOTE: This is called from inside tensor_parallel_for workers.
+     * matmul_batch for F16/F32 dispatches to picolm_sgemm with nth=1
+     * (serial), which does NOT use the thread pool. However, for
+     * quantized KV types, matmul_batch may fall through to the threaded
+     * worker path, which WOULD deadlock. Since the tiled path currently
+     * only activates for F16 KV cache, this is safe in practice. If
+     * quantized KV types are added, replace with a serial dot-product
+     * loop or a non-pool dispatch mechanism. */
     matmul_batch(t->scores, t->q_rows, n_q, t->tile_k, hd, ts, t->kv_gguf_k);
 
     /* Scale scores */
@@ -1091,7 +1225,7 @@ static void batch_attention_tiled(
         ctx.q_batch = q_batch; ctx.xb_batch = xb_batch; ctx.xb_stride = xb_stride;
         ctx.attn_scale = attn_scale;
         ctx.n_swa = n_swa;
-        tensor_parallel_for(n_tokens * n_heads, prefill_attn_task, &ctx);
+        tensor_parallel_for(n_tokens * n_kv_heads, prefill_attn_task_grouped, &ctx);
         return;
     }
     bctx.scratch_pool = scratch_pool;
