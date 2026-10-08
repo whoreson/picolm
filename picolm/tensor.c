@@ -1755,6 +1755,33 @@ static void qgemm_d_task(int idx, void *ctxp) {
     }
 }
 
+/* Dual-matrix GEMM task: fuses two same-shape GEMMs (e.g. FFN gate + up)
+ * into one tensor_parallel_for dispatch to halve barrier overhead.
+ * Thread idx in [0, nth) -> matrix A1/C1, idx in [nth, 2*nth) -> A2/C2. */
+typedef struct {
+    int m, n, k_blocks;
+    const void *A1, *A2; int lda;
+    const block_q8_0 *B; int ldb;
+    const float *B_d; int ldb_d;
+    float *C1, *C2; int ldc;
+    int Atype1, Atype2, nth;
+} qgemm_d_dual_ctx_t;
+
+static void qgemm_d_dual_task(int idx, void *ctxp) {
+    qgemm_d_dual_ctx_t *c = (qgemm_d_dual_ctx_t *)ctxp;
+    /* Each thread processes the same row range [idx*m/nth, (idx+1)*m/nth)
+     * for BOTH matrices sequentially. This ensures both GEMMs complete
+     * before the barrier, using all threads for both halves. */
+    int ok1 = picolm_sgemm_d(c->m, c->n, c->k_blocks, c->A1, c->lda,
+                   c->B, c->ldb, c->B_d, c->ldb_d,
+                   c->C1, c->ldc, c->Atype1, idx, c->nth);
+    int ok2 = picolm_sgemm_d(c->m, c->n, c->k_blocks, c->A2, c->lda,
+                   c->B, c->ldb, c->B_d, c->ldb_d,
+                   c->C2, c->ldc, c->Atype2, idx, c->nth);
+    if ((!ok1 || !ok2) && idx == 0)
+        fprintf(stderr, "WARN: qgemm_d_dual_task returned 0\n");
+}
+
 /* Non-delta GEMM worker: dispatches picolm_sgemm with Btype=Q8_0.
  *
  * TODO: This worker routes to sgemm_q4_q8_neon/sgemm_q5_q8_neon which are SLOWER
@@ -2888,24 +2915,18 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                     for (int k = 0; k < nb; k++) dbuf[(size_t)b * nb + k] = fp16_to_fp32(blk[k].d);
                 }
                 int nth = pool_total_threads(1);
-                qgemm_d_ctx_t ctx1 = {
+                /* Fused dual dispatch: treat W1[0..d) and W2[0..d) as a single
+                 * 2*d-row GEMM. Rows [0,d) write to out1, rows [d,2d) to out2.
+                 * This halves the number of barrier dispatches per FFN layer. */
+                qgemm_d_dual_ctx_t dctx = {
                     .m = d, .n = n_batch, .k_blocks = nb,
-                    .A = W1, .lda = nb,
+                    .A1 = W1, .A2 = W2, .lda = nb,
                     .B = (const block_q8_0*)qbuf, .ldb = nb,
                     .B_d = dbuf, .ldb_d = nb,
-                    .C = out1, .ldc = d,
-                    .Atype = qtype1, .nth = nth,
+                    .C1 = out1, .C2 = out2, .ldc = d,
+                    .Atype1 = qtype1, .Atype2 = qtype2, .nth = nth,
                 };
-                tensor_parallel_for(nth, qgemm_d_task, &ctx1);
-                qgemm_d_ctx_t ctx2 = {
-                    .m = d, .n = n_batch, .k_blocks = nb,
-                    .A = W2, .lda = nb,
-                    .B = (const block_q8_0*)qbuf, .ldb = nb,
-                    .B_d = dbuf, .ldb_d = nb,
-                    .C = out2, .ldc = d,
-                    .Atype = qtype2, .nth = nth,
-                };
-                tensor_parallel_for(nth, qgemm_d_task, &ctx2);
+                tensor_parallel_for(nth, qgemm_d_dual_task, &dctx);
                 /* Buffers kept in cache for reuse */
                 DISPATCH2("GEMM_d_dual_table");
                 return;
