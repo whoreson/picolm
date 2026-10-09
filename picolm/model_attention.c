@@ -1129,49 +1129,85 @@ static void attn_process_tile(attn_tile_task_t *t) {
         t->S[i] += rsum;
 
         /* acc_row += sum_j tile_exp[j] * V[j, d]
-         * Transposed loop: j outer, d inner for contiguous access.
-         * Auto-vectorizes to FMA on AVX-512/AVX2/NEON. */
+         * Register-blocked: hoist accumulator into zmm registers across the
+         * full j loop to eliminate redundant load/store of acc_row per j.
+         * For AVX-512: hd=128 floats = 8 zmm accumulators, all kept in regs.
+         * For each d-block: 1 load + ts FMAs + 1 store (vs ts loads + ts stores). */
         float *v_tile = t->tile_v_f32;
-        for (int j = 0; j < ts; j++) {
-            float w = tile_exp_buf[j];
-            const float *v_row = v_tile + (size_t)j * hd;
-#ifdef PICOLM_AVX512
-            {
-            __m512 wv = _mm512_set1_ps(w);
-            int d = 0;
-            for (; d + 15 < hd; d += 16) {
-                __m512 av = _mm512_loadu_ps(acc_row + d);
-                __m512 vv = _mm512_loadu_ps(v_row + d);
-                _mm512_storeu_ps(acc_row + d, _mm512_fmadd_ps(vv, wv, av));
+#if defined(PICOLM_AVX512)
+        {
+            const int D_BLK = 16; /* floats per zmm */
+            int n_blks = hd / D_BLK;
+            for (int db = 0; db < n_blks; db++) {
+                int d = db * D_BLK;
+                __m512 acc0 = _mm512_loadu_ps(acc_row + d);
+                const float *vr = v_tile + d;
+                for (int j = 0; j < ts; j++) {
+                    __m512 wv = _mm512_set1_ps(tile_exp_buf[j]);
+                    __m512 vv = _mm512_loadu_ps(vr + (size_t)j * hd);
+                    acc0 = _mm512_fmadd_ps(vv, wv, acc0);
+                }
+                _mm512_storeu_ps(acc_row + d, acc0);
             }
-            for (; d < hd; d++) acc_row[d] += w * v_row[d];
+            for (int d = n_blks * D_BLK; d < hd; d++) {
+                float a = acc_row[d];
+                for (int j = 0; j < ts; j++)
+                    a += tile_exp_buf[j] * v_tile[(size_t)j * hd + d];
+                acc_row[d] = a;
             }
-#elif defined(PICOLM_AVX)
-            {
-            __m256 wv = _mm256_set1_ps(w);
-            int d = 0;
-            for (; d + 7 < hd; d += 8) {
-                __m256 av = _mm256_loadu_ps(acc_row + d);
-                __m256 vv = _mm256_loadu_ps(v_row + d);
-                _mm256_storeu_ps(acc_row + d, _mm256_fmadd_ps(vv, wv, av));
-            }
-            for (; d < hd; d++) acc_row[d] += w * v_row[d];
-            }
-#elif defined(PICOLM_NEON_AARCH64)
-            {
-            float32x4_t wv = vdupq_n_f32(w);
-            int d = 0;
-            for (; d + 3 < hd; d += 4) {
-                float32x4_t av = vld1q_f32(acc_row + d);
-                float32x4_t vv = vld1q_f32(v_row + d);
-                vst1q_f32(acc_row + d, vfmaq_f32(av, vv, wv));
-            }
-            for (; d < hd; d++) acc_row[d] += w * v_row[d];
-            }
-#else
-            for (int d = 0; d < hd; d++) acc_row[d] += w * v_row[d];
-#endif
         }
+#elif defined(PICOLM_AVX)
+        {
+            const int D_BLK = 8; /* floats per ymm */
+            int n_blks = hd / D_BLK;
+            for (int db = 0; db < n_blks; db++) {
+                int d = db * D_BLK;
+                __m256 acc0 = _mm256_loadu_ps(acc_row + d);
+                const float *vr = v_tile + d;
+                for (int j = 0; j < ts; j++) {
+                    __m256 wv = _mm256_set1_ps(tile_exp_buf[j]);
+                    __m256 vv = _mm256_loadu_ps(vr + (size_t)j * hd);
+                    acc0 = _mm256_fmadd_ps(vv, wv, acc0);
+                }
+                _mm256_storeu_ps(acc_row + d, acc0);
+            }
+            for (int d = n_blks * D_BLK; d < hd; d++) {
+                float a = acc_row[d];
+                for (int j = 0; j < ts; j++)
+                    a += tile_exp_buf[j] * v_tile[(size_t)j * hd + d];
+                acc_row[d] = a;
+            }
+        }
+#elif defined(PICOLM_NEON_AARCH64)
+        {
+            const int D_BLK = 4;
+            int n_blks = hd / D_BLK;
+            for (int db = 0; db < n_blks; db++) {
+                int d = db * D_BLK;
+                float32x4_t acc0 = vld1q_f32(acc_row + d);
+                const float *vr = v_tile + d;
+                for (int j = 0; j < ts; j++) {
+                    float32x4_t wv = vdupq_n_f32(tile_exp_buf[j]);
+                    float32x4_t vv = vld1q_f32(vr + (size_t)j * hd);
+                    acc0 = vfmaq_f32(acc0, vv, wv);
+                }
+                vst1q_f32(acc_row + d, acc0);
+            }
+            for (int d = n_blks * D_BLK; d < hd; d++) {
+                float a = acc_row[d];
+                for (int j = 0; j < ts; j++)
+                    a += tile_exp_buf[j] * v_tile[(size_t)j * hd + d];
+                acc_row[d] = a;
+            }
+        }
+#else
+        for (int d = 0; d < hd; d++) {
+            float a = acc_row[d];
+            for (int j = 0; j < ts; j++)
+                a += tile_exp_buf[j] * v_tile[(size_t)j * hd + d];
+            acc_row[d] = a;
+        }
+#endif
     }
 }
 
