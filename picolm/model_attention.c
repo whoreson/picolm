@@ -1118,11 +1118,23 @@ static void attn_process_tile(attn_tile_task_t *t) {
     for (int i = 0; i < n_q; i++) {
         float *srow = t->scores + i * ts;
 
-        /* Row max */
+        /* Row max (vectorized with scalar tail) */
+#if defined(PICOLM_AVX512)
+        __m512 vmax = _mm512_set1_ps(srow[0]);
+        int j = 1;
+        for (; j + 15 < ts; j += 16)
+            vmax = _mm512_max_ps(vmax, _mm512_loadu_ps(srow + j));
+        float marr[16];
+        _mm512_storeu_ps(marr, vmax);
+        float rmax = marr[0];
+        for (int c = 1; c < 16; c++) if (marr[c] > rmax) rmax = marr[c];
+        for (; j < ts; j++) if (srow[j] > rmax) rmax = srow[j];
+#else
         float rmax = srow[0];
         for (int j = 1; j < ts; j++) {
             if (srow[j] > rmax) rmax = srow[j];
         }
+#endif
 
         /* Update running M and compute correction */
         float old_M = t->M[i];
@@ -1133,15 +1145,73 @@ static void attn_process_tile(attn_tile_task_t *t) {
         /* Scale old S and acc by correction */
         t->S[i] *= corr;
         float *acc_row = t->acc + i * hd;
+#if defined(PICOLM_AVX512)
+        {
+            __m512 vc = _mm512_set1_ps(corr);
+            for (int d = 0; d + 15 < hd; d += 16)
+                _mm512_storeu_ps(acc_row + d, _mm512_mul_ps(_mm512_loadu_ps(acc_row + d), vc));
+            for (int d = (hd / 16) * 16; d < hd; d++)
+                acc_row[d] *= corr;
+        }
+#else
         for (int d = 0; d < hd; d++)
             acc_row[d] *= corr;
+#endif
 
-        /* Compute exp(s[j] - new_M) for this row and accumulate */
+        /* Compute exp(s[j] - new_M) for this row and accumulate.
+         * Vectorized: all arguments are <= 0 (since new_M >= rmax >= srow[j]),
+         * so a fast polynomial approximation suffices (no overflow check). */
         float rsum = 0.0f;
+#if defined(PICOLM_AVX512)
+        {
+            __m512 vm = _mm512_set1_ps(new_M);
+            __m512 vsum = _mm512_setzero_ps();
+            int j = 0;
+            for (; j + 15 < ts; j += 16) {
+                __m512 x = _mm512_sub_ps(_mm512_loadu_ps(srow + j), vm);
+                /* exp(x) = 2^(x * log2(e)):
+                 *   n = round(x * log2e)
+                 *   r = x - n * ln2  (in [-ln2/2, ln2/2])
+                 *   2^n via bit manipulation of the exponent field
+                 *   exp(r) via degree-5 minimax polynomial */
+                __m512 t = _mm512_mul_ps(x, _mm512_set1_ps(1.4426950408889634f));
+                __m512 rn = _mm512_roundscale_ps(t, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                __m512 r = _mm512_fnmadd_ps(rn, _mm512_set1_ps(0.6931471805599453f), x);
+                /* 2^(rn): rn * 2^23 + 1023*2^23 bit-trick, as float */
+                __m512 p2 = _mm512_add_ps(_mm512_mul_ps(rn, _mm512_set1_ps(12582912.0f)),
+                                          _mm512_set1_ps(127.0f * 12582912.0f));
+                __m512 e2 = _mm512_castsi512_ps(_mm512_cvtps_epi32(p2));
+                /* Degree-7 Taylor/minimax polynomial for exp(r), |r| <= ln2/2
+                 * Horner form: 1 + r*(1 + r/2*(1 + r/3*(...)))
+                 * Coefficients: 1/0!, 1/1!, 1/2!, ..., 1/7! */
+                __m512 p = _mm512_set1_ps(1.0f/5040.0f);        /* 1/7! */
+                p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f/720.0f));   /* 1/6! */
+                p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f/120.0f));   /* 1/5! */
+                p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f/24.0f));    /* 1/4! */
+                p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f/6.0f));     /* 1/3! */
+                p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(0.5f));          /* 1/2! */
+                p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f));          /* 1/1! */
+                __m512 er = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f));  /* + 1/0! */
+                __m512 result = _mm512_mul_ps(er, e2);
+                _mm512_storeu_ps(tile_exp_buf + j, result);
+                vsum = _mm512_add_ps(vsum, result);
+            }
+            /* Horizontal sum + scalar tail */
+            float sarr[16];
+            _mm512_storeu_ps(sarr, vsum);
+            rsum = sarr[0] + sarr[1] + sarr[2] + sarr[3] + sarr[4] + sarr[5] + sarr[6] + sarr[7]
+                 + sarr[8] + sarr[9] + sarr[10] + sarr[11] + sarr[12] + sarr[13] + sarr[14] + sarr[15];
+            for (; j < ts; j++) {
+                tile_exp_buf[j] = expf(srow[j] - new_M);
+                rsum += tile_exp_buf[j];
+            }
+        }
+#else
         for (int j = 0; j < ts; j++) {
             tile_exp_buf[j] = expf(srow[j] - new_M);
             rsum += tile_exp_buf[j];
         }
+#endif
         t->S[i] += rsum;
 
         /* acc_row += sum_j tile_exp[j] * V[j, d]
