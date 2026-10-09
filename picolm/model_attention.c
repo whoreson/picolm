@@ -1228,26 +1228,64 @@ static void attn_process_tile(attn_tile_task_t *t) {
              * FMA latency bottleneck. The CPU pipelines 8 FMAs per j
              * iteration at 2/cycle throughput instead of waiting 4 cycles
              * per sequential FMA. */
-            const int D_BLK = 16; /* floats per zmm */
-            int n_blks = hd / D_BLK; /* 8 for hd=128 */
-            __m512 accv[8]; /* supports up to head_dim=128 */
-            if (n_blks > 8) n_blks = 8; /* safety: fall through to scalar for hd>128 */
+            /* Fully unrolled: 8 named accumulators stay in zmm registers
+             * (no stack spills). hd=128 -> 8 blocks of 16 floats. */
             const float *vr = v_tile;
-            for (int db = 0; db < n_blks; db++)
-                accv[db] = _mm512_loadu_ps(acc_row + db * D_BLK);
-            for (int j = 0; j < ts; j++) {
-                __m512 wv = _mm512_set1_ps(tile_exp_buf[j]);
+            if (hd == 128) {
+                __m512 a0 = _mm512_loadu_ps(acc_row + 0);
+                __m512 a1 = _mm512_loadu_ps(acc_row + 16);
+                __m512 a2 = _mm512_loadu_ps(acc_row + 32);
+                __m512 a3 = _mm512_loadu_ps(acc_row + 48);
+                __m512 a4 = _mm512_loadu_ps(acc_row + 64);
+                __m512 a5 = _mm512_loadu_ps(acc_row + 80);
+                __m512 a6 = _mm512_loadu_ps(acc_row + 96);
+                __m512 a7 = _mm512_loadu_ps(acc_row + 112);
+                for (int j = 0; j < ts; j++) {
+                    __m512 wv = _mm512_set1_ps(tile_exp_buf[j]);
+                    const float *vj = v_tile + (size_t)j * hd;
+                    a0 = _mm512_fmadd_ps(_mm512_loadu_ps(vj + 0), wv, a0);
+                    a1 = _mm512_fmadd_ps(_mm512_loadu_ps(vj + 16), wv, a1);
+                    a2 = _mm512_fmadd_ps(_mm512_loadu_ps(vj + 32), wv, a2);
+                    a3 = _mm512_fmadd_ps(_mm512_loadu_ps(vj + 48), wv, a3);
+                    a4 = _mm512_fmadd_ps(_mm512_loadu_ps(vj + 64), wv, a4);
+                    a5 = _mm512_fmadd_ps(_mm512_loadu_ps(vj + 80), wv, a5);
+                    a6 = _mm512_fmadd_ps(_mm512_loadu_ps(vj + 96), wv, a6);
+                    a7 = _mm512_fmadd_ps(_mm512_loadu_ps(vj + 112), wv, a7);
+                }
+                _mm512_storeu_ps(acc_row + 0, a0);
+                _mm512_storeu_ps(acc_row + 16, a1);
+                _mm512_storeu_ps(acc_row + 32, a2);
+                _mm512_storeu_ps(acc_row + 48, a3);
+                _mm512_storeu_ps(acc_row + 64, a4);
+                _mm512_storeu_ps(acc_row + 80, a5);
+                _mm512_storeu_ps(acc_row + 96, a6);
+                _mm512_storeu_ps(acc_row + 112, a7);
+            } else {
+                /* Generic path for hd != 128 (e.g. hd=64, 96) */
+                const int D_BLK = 16;
+                int n_blks = hd / D_BLK;
+                if (n_blks > 8) n_blks = 8;
+                __m512 accv[8];
                 for (int db = 0; db < n_blks; db++)
-                    accv[db] = _mm512_fmadd_ps(_mm512_loadu_ps(vr + db * D_BLK), wv, accv[db]);
-                vr += hd;
+                    accv[db] = _mm512_loadu_ps(acc_row + db * D_BLK);
+                for (int j = 0; j < ts; j++) {
+                    __m512 wv = _mm512_set1_ps(tile_exp_buf[j]);
+                    const float *vj = v_tile + (size_t)j * hd;
+                    for (int db = 0; db < n_blks; db++)
+                        accv[db] = _mm512_fmadd_ps(_mm512_loadu_ps(vj + db * D_BLK), wv, accv[db]);
+                }
+                for (int db = 0; db < n_blks; db++)
+                    _mm512_storeu_ps(acc_row + db * D_BLK, accv[db]);
             }
-            for (int db = 0; db < n_blks; db++)
-                _mm512_storeu_ps(acc_row + db * D_BLK, accv[db]);
-            for (int d = n_blks * D_BLK; d < hd; d++) {
-                float a = acc_row[d];
-                for (int j = 0; j < ts; j++)
-                    a += tile_exp_buf[j] * v_tile[(size_t)j * hd + d];
-                acc_row[d] = a;
+            /* Scalar tail for hd % 16 != 0 */
+            {
+                int d = (hd / 16) * 16;
+                for (; d < hd; d++) {
+                    float a = acc_row[d];
+                    for (int j = 0; j < ts; j++)
+                        a += tile_exp_buf[j] * v_tile[(size_t)j * hd + d];
+                    acc_row[d] = a;
+                }
             }
         }
 #elif defined(PICOLM_AVX)
