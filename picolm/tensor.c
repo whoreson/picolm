@@ -8,6 +8,8 @@ extern int sgemm_iq3_k_q8_k_neon(int nrows, int ncols, int k, const void *vx, co
 extern int sgemm_iq4_k_q8_k_avx2(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
 extern int sgemm_iq4_k_q8_k_neon(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
 extern int sgemm_q8_k_r8_q8_k_neon(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+extern int sgemm_q8_k_r8_q8_k_avx2(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+extern void convert_iq2_k_to_q8_k_r8(int n, const void *vx, size_t bx, void *vy, int nrc_x);
 extern void vec_dot_q8_k_r8_q8_k_neon(const void *vx, const void *wy, int n, float *out, int nrows);
 /* NEON R4 GEMV declarations */
 extern int sgemm_iq6_k_q8_k_neon(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
@@ -1747,6 +1749,48 @@ static void gemm_table_task(int idx, void *ctxp) {
     c->fn(c->nrows, c->ncols, c->k, c->w, c->a, c->out, c->bs, idx, nth);
 }
 
+/* Convert+GEMM task for quant types that benefit from on-the-fly repacking
+ * into a faster GEMM format (e.g., IQ2_K -> Q8_K_R8). Each invocation handles
+ * a contiguous chunk of output rows: convert to scratch, then GEMM against
+ * all activation columns. Called via tensor_parallel_for with idx = chunk. */
+typedef void (*type_convert_fn)(int n, const void *vx, size_t bx, void *vy, int nrc_x);
+typedef struct {
+    int nrows, ncols, k;         /* GEMM dimensions (same as gemm_table_ctx_t) */
+    const void *w;               /* original quantized weight matrix */
+    const void *a;               /* quantized activations (Q8_K) */
+    float *out;                  /* output [ncols x nrows], row-major per col */
+    size_t bs;                   /* output stride (= nrows) */
+    size_t row_bytes_src;        /* bytes per source weight row */
+    int rows_per_chunk;          /* rows per convert+GEMM chunk (multiple of 8) */
+    type_convert_fn convert_fn;  /* conversion function */
+} gemm_convert_ctx_t;
+
+static void gemm_convert_task(int idx, void *ctxp) {
+    gemm_convert_ctx_t *c = (gemm_convert_ctx_t *)ctxp;
+    int first = idx * c->rows_per_chunk;
+    if (first >= c->nrows) return;
+    int this_rows = c->rows_per_chunk;
+    if (first + this_rows > c->nrows) this_rows = c->nrows - first;
+    this_rows &= ~7;   /* round down to multiple of 8 (Q8_K_R8 interleave) */
+    if (this_rows <= 0) return;
+    /* Per-thread scratch buffer, grown on demand */
+    static __thread void *tl_scratch = NULL;
+    static __thread size_t tl_scratch_size = 0;
+    size_t needed = (size_t)(this_rows / 8) * (c->k / 256) * sizeof(block_q8_k_r8);
+    if (tl_scratch_size < needed) {
+        free(tl_scratch);
+        tl_scratch = malloc(needed);
+        tl_scratch_size = needed;
+    }
+    if (!tl_scratch) return;
+    /* Convert this chunk of rows from IQ2_K to Q8_K_R8 */
+    const char *w_src = (const char *)c->w + (size_t)first * c->row_bytes_src;
+    c->convert_fn(c->k, w_src, c->row_bytes_src, tl_scratch, this_rows);
+    /* GEMM: this_rows x ncols x k into out[first..first+this_rows) */
+    sgemm_q8_k_r8_q8_k_avx2(this_rows, c->ncols, c->k, tl_scratch, c->a,
+                            c->out + first, c->bs, 0, 1);
+}
+
 static void qgemm_d_task(int idx, void *ctxp) {
     qgemm_d_ctx_t *c = (qgemm_d_ctx_t *)ctxp;
     int ok = picolm_sgemm_d(c->m, c->n, c->k_blocks, c->A, c->lda,
@@ -2173,6 +2217,32 @@ void matmul_batch(float *out, const float *x, int n_batch,
         DISPATCH("vec_dot_fallback");
         return;
     }
+
+    /* IQ2_K -> Q8_K_R8 conversion GEMM for large batches (prefill).
+     * ik_llama.cpp-style: each thread converts a chunk of IQ2_K rows into a
+     * thread-local scratch buffer (Q8_K_R8 interleaved), then immediately GEMMs
+     * those rows against all n_batch activation columns. The scratch is reused
+     * for the next chunk, so memory overhead is bounded by chunk_size * row_size.
+     * The expensive IQ2_K LUT decode is amortized over n_batch columns. */
+#if defined(__AVX2__) && defined(__F16C__)
+    static int iq2k_r8_minbatch = -1;
+    if (iq2k_r8_minbatch < 0)
+        iq2k_r8_minbatch = getenv("PICOLM_IQ2K_R8_MINBATCH") ? atoi(getenv("PICOLM_IQ2K_R8_MINBATCH")) : 128;
+    if (qtype == GGUF_TYPE_IQ2_K && n_batch >= iq2k_r8_minbatch && n % 256 == 0 && d % 8 == 0) {
+        int nth = pool_total_threads(1);
+        /* Split rows across threads; each chunk must be a multiple of 8 */
+        int rows_per_chunk = ((d / nth) & ~7);
+        if (rows_per_chunk < 8) rows_per_chunk = 8;
+        int nchunks = (d + rows_per_chunk - 1) / rows_per_chunk;
+        gemm_convert_ctx_t ctx = { d, n_batch, n, W, qb.qbuf, out, (size_t)d,
+                                   (size_t)row_bytes, rows_per_chunk,
+                                   (type_convert_fn)convert_iq2_k_to_q8_k_r8 };
+        tensor_parallel_for(nchunks, gemm_convert_task, &ctx);
+        DISPATCH("IQ2K_R8_convert_gemm");
+        free_quant_buf(&qb, NULL);
+        return;
+    }
+#endif
 
     /* Try tiled GEMM if available for this type.
      * Must use tensor_parallel_for to dispatch with correct ith/nth per thread. */
