@@ -214,32 +214,31 @@ void convert_iq2_k_to_q8_k_r8(int n, const void *vx, size_t bx,
                  * qs pointer advances 32 bytes every 4 subblocks (shift wraps).
                  * extra bit 2*ib32 -> LUT+4 for values 0-15,
                  * extra bit 2*ib32+1 -> LUT+4 for values 16-31. */
-                int16_t prod[256];
+                int16_t prod[256] __attribute__((aligned(32)));
                 uint16_t extra = blk->extra;
                 const uint8_t *qsrc = blk->qs;
                 int shift = 0;
                 for (int s = 0; s < 8; s++) {
-                    float dl1 = (float)((blk->scales[s] & 0xf) - 8);
-                    float dl2 = (float)((blk->scales[s] >> 4) - 8);
                     const int8_t *values1 = (extra & 1) ? iq2nl_values + 4 : iq2nl_values;
                     const int8_t *values2 = (extra & 2) ? iq2nl_values + 4 : iq2nl_values;
                     extra >>= 2;
+                    int16_t sc_lo = sc[2*s], sc_hi = sc[2*s+1];
                     for (int j = 0; j < 16; ++j) {
-                        prod[s*32 + j]      = (int16_t)(values1[(qsrc[j]      >> shift) & 3] * sc[2*s]);
-                        prod[s*32 + j + 16] = (int16_t)(values2[(qsrc[j + 16] >> shift) & 3] * sc[2*s+1]);
+                        prod[s*32 + j]      = (int16_t)(values1[(qsrc[j]      >> shift) & 3] * sc_lo);
+                        prod[s*32 + j + 16] = (int16_t)(values2[(qsrc[j + 16] >> shift) & 3] * sc_hi);
                     }
                     shift += 2;
                     if (shift == 8) { qsrc += 32; shift = 0; }
                 }
 
-                /* Find max abs of int16 products (no d factored in) */
-                float max_abs = 0;
+/* Find max abs of int16 products (no d factored in) */
+                int max_abs = 0;
                 for (int j = 0; j < 256; j++) {
-                    float a = fabsf((float)prod[j]);
+                    int a = prod[j] < 0 ? -prod[j] : prod[j];
                     if (a > max_abs) max_abs = a;
                 }
                 /* dnew: scale that maps max_abs to ~120 (safety margin vs 127) */
-                float dnew = max_abs / 120.0f;
+                float dnew = (float)max_abs / 120.0f;
                 if (dnew < 1.0f) dnew = 1.0f;
                 float inv = 1.0f / dnew;
 
@@ -249,7 +248,10 @@ void convert_iq2_k_to_q8_k_r8(int n, const void *vx, size_t bx,
                 /* Requantize to int8 and interleave into R8 layout
                  * R8 layout: qs[32*ib + 4*k + idx] where ib = j/4, k = row, idx = j%4 */
                 for (int j = 0; j < 256; j++) {
-                    int v = (int)lrintf((float)prod[j] * inv);
+                /* Fixed-point requantize: 12-bit precision (avoids lrintf) */
+                int inv_fp = (int)(inv * 4096.0f + 0.5f);
+
+                    int v = (prod[j] * inv_fp + 2048) >> 12;
                     if (v > 127) v = 127;
                     if (v < -128) v = -128;
                     int ib = j / 4;

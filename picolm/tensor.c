@@ -2227,7 +2227,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
 #if defined(__AVX2__) && defined(__F16C__)
     static int iq2k_r8_minbatch = -1;
     if (iq2k_r8_minbatch < 0)
-        iq2k_r8_minbatch = getenv("PICOLM_IQ2K_R8_MINBATCH") ? atoi(getenv("PICOLM_IQ2K_R8_MINBATCH")) : 128;
+        iq2k_r8_minbatch = getenv("PICOLM_IQ2K_R8_MINBATCH") ? atoi(getenv("PICOLM_IQ2K_R8_MINBATCH")) : 64;
     if (qtype == GGUF_TYPE_IQ2_K && n_batch >= iq2k_r8_minbatch && n % 256 == 0 && d % 8 == 0) {
         int nth = pool_total_threads(1);
         /* Split rows across threads; each chunk must be a multiple of 8 */
