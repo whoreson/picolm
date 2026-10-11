@@ -1269,6 +1269,7 @@ float vec_dot_iq2_k_q8_k(const void *vx, const void *wy, int n);
 void dequantize_row_iq2_k(const void *src, float *dst, int n);
 /* IQ2_K plain x Q8_K AVX2 GEMV. out: 1 float. n must be multiple of 256. */
 void vec_dot_iq2_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out);
+void convert_iq2_k_to_q8_k_r8(int n, const void *vx, size_t bx, void *vy, int nrc_x);
 /* IQ2_K plain x Q8_K NEON GEMV. out: 1 float. n must be multiple of 256. */
 void vec_dot_iq2_k_q8_k_neon(const void *vx, const void *wy, int n, float *out);
 /* IQ2_K plain x Q8_K batched GEMM (AVX2). */

@@ -13,6 +13,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <assert.h>
+#include <math.h>
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 #endif
@@ -165,10 +166,106 @@ int sgemm_iq2_k_q8_k_avx2(int nrows, int ncols, int k,
     }
     return nrows;
 }
+
+/* ================================================================
+ * IQ2_K -> Q8_K_R8 conversion for prefill GEMM acceleration.
+ *
+ * Decodes IQ2_K quantized weights to int8 (Q8_K style) and interleaves
+ * 8 rows into block_q8_k_r8 layout. The expensive LUT decode + scale
+ * extraction happens ONCE per weight row group, then the cheap
+ * sgemm_q8_k_r8_q8_k_avx2 int8 GEMM runs for all activation columns.
+ *
+ * For nrc_x rows (multiple of 8), nb blocks per row.
+ * Output: nrc_x/8 groups of block_q8_k_r8, each nb blocks.
+ *
+ * Reference: ik_llama.cpp iqk_convert_iq2_k_q8_k_r8 (iqk_gemm_iqk_quants.cpp)
+ * ================================================================ */
+void convert_iq2_k_to_q8_k_r8(int n, const void *vx, size_t bx,
+                               void *vy, int nrc_x) {
+    const int nb = n / QK_K;
+    const block_iq2_k *x = (const block_iq2_k *)vx;
+    (void)bx; /* rows are contiguous in IQ2_K (bx == nb * sizeof(block_iq2_k)) */
+    block_q8_k_r8 *y = (block_q8_k_r8 *)vy;
+
+    for (int ix = 0; ix < nrc_x; ix += 8) {
+        const block_iq2_k *x8[8];
+        for (int k = 0; k < 8; k++)
+            x8[k] = x + (ix + k) * nb;
+
+        block_q8_k_r8 *yb = y + (ix / 8) * nb;
+
+        for (int i = 0; i < nb; ++i) {
+            /* For each row, decode IQ2_K block -> int16 products -> int8.
+             * Store combined scale d * dnew as FP16 in yb[i].d[k]. */
+            for (int k = 0; k < 8; k++) {
+                const block_iq2_k *blk = &x8[k][i];
+                float d = fp16_to_fp32_lookup(blk->d);
+
+                /* Extract 16 subblock scales: nibble - 8 */
+                int16_t sc[16];
+                for (int g = 0; g < 8; g++) {
+                    sc[2*g+0] = (int16_t)((blk->scales[g] & 0x0f) - 8);
+                    sc[2*g+1] = (int16_t)((blk->scales[g] >> 4) - 8);
+                }
+
+                /* Decode 256 values: 8 subblocks of 32 values each.
+                 * Subblock ib32: dl1 = scales[ib32]&0xf (values 0-15),
+                 *                dl2 = scales[ib32]>>4 (values 16-31).
+                 * qs pointer advances 32 bytes every 4 subblocks (shift wraps).
+                 * extra bit 2*ib32 -> LUT+4 for values 0-15,
+                 * extra bit 2*ib32+1 -> LUT+4 for values 16-31. */
+                int16_t prod[256];
+                uint16_t extra = blk->extra;
+                const uint8_t *qsrc = blk->qs;
+                int shift = 0;
+                for (int s = 0; s < 8; s++) {
+                    float dl1 = (float)((blk->scales[s] & 0xf) - 8);
+                    float dl2 = (float)((blk->scales[s] >> 4) - 8);
+                    const int8_t *values1 = (extra & 1) ? iq2nl_values + 4 : iq2nl_values;
+                    const int8_t *values2 = (extra & 2) ? iq2nl_values + 4 : iq2nl_values;
+                    extra >>= 2;
+                    for (int j = 0; j < 16; ++j) {
+                        prod[s*32 + j]      = (int16_t)(values1[(qsrc[j]      >> shift) & 3] * sc[2*s]);
+                        prod[s*32 + j + 16] = (int16_t)(values2[(qsrc[j + 16] >> shift) & 3] * sc[2*s+1]);
+                    }
+                    shift += 2;
+                    if (shift == 8) { qsrc += 32; shift = 0; }
+                }
+
+                /* Find max abs of int16 products (no d factored in) */
+                float max_abs = 0;
+                for (int j = 0; j < 256; j++) {
+                    float a = fabsf((float)prod[j]);
+                    if (a > max_abs) max_abs = a;
+                }
+                /* dnew: scale that maps max_abs to ~120 (safety margin vs 127) */
+                float dnew = max_abs / 120.0f;
+                if (dnew < 1.0f) dnew = 1.0f;
+                float inv = 1.0f / dnew;
+
+                /* Store combined scale: original d * dnew */
+                yb[i].d[k] = fp32_to_fp16(d * dnew);
+
+                /* Requantize to int8 and interleave into R8 layout
+                 * R8 layout: qs[32*ib + 4*k + idx] where ib = j/4, k = row, idx = j%4 */
+                for (int j = 0; j < 256; j++) {
+                    int v = (int)lrintf((float)prod[j] * inv);
+                    if (v > 127) v = 127;
+                    if (v < -128) v = -128;
+                    int ib = j / 4;
+                    int idx = j % 4;
+                    yb[i].qs[32*ib + 4*k + idx] = (int8_t)v;
+                }
+            }
+        }
+    }
+}
+
 #else
 /* Non-AVX2 stubs for cross-compilation compatibility. Callers must guard on __AVX2__. */
 void vec_dot_iq2_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out) { (void)vx; (void)wy; (void)n; if (out) *out = 0.0f; }
 int sgemm_iq2_k_q8_k_avx2(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) { (void)vx; (void)vy; (void)nrows; (void)ncols; (void)k; (void)out; (void)bs; (void)ith; (void)nth; return 0; }
+void convert_iq2_k_to_q8_k_r8(int n, const void *vx, size_t bx, void *vy, int nrc_x) { (void)vx; (void)vy; (void)n; (void)nrc_x; }
 #endif
 
 /* ================================================================
