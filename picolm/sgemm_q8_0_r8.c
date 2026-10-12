@@ -47,19 +47,55 @@ static inline __m256i gemv_r8_block(const block_q8_0_r8 *w, const block_q8_0 *q)
     const __m256i yh = _mm256_set_m128i(y4h, y4h);
     __m256i sumi = _mm256_setzero_si256();
     const __m256i *wq = (const __m256i *)w->qs;
-    for (int l = 0; l < 4; l++) {
-        const __m256i wv = _mm256_loadu_si256(wq + l);
-        const __m256i yb = _mm256_shuffle_epi32(yl, _MM_SHUFFLE(l,l,l,l));
-        const __m256i aw = _mm256_sign_epi8(wv, wv);
-        const __m256i sy = _mm256_sign_epi8(yb, wv);
-        sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(m1, _mm256_maddubs_epi16(aw, sy)));
+    /* First half: chunks 0-3, activation dwords 0-3 from yl */
+    {
+        const __m256i wv = _mm256_loadu_si256(wq + 0);
+        const __m256i yb = _mm256_shuffle_epi32(yl, _MM_SHUFFLE(0,0,0,0));
+        sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(m1,
+            _mm256_maddubs_epi16(_mm256_sign_epi8(wv, wv), _mm256_sign_epi8(yb, wv))));
     }
-    for (int l = 0; l < 4; l++) {
-        const __m256i wv = _mm256_loadu_si256(wq + 4 + l);
-        const __m256i yb = _mm256_shuffle_epi32(yh, _MM_SHUFFLE(l,l,l,l));
-        const __m256i aw = _mm256_sign_epi8(wv, wv);
-        const __m256i sy = _mm256_sign_epi8(yb, wv);
-        sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(m1, _mm256_maddubs_epi16(aw, sy)));
+    {
+        const __m256i wv = _mm256_loadu_si256(wq + 1);
+        const __m256i yb = _mm256_shuffle_epi32(yl, _MM_SHUFFLE(1,1,1,1));
+        sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(m1,
+            _mm256_maddubs_epi16(_mm256_sign_epi8(wv, wv), _mm256_sign_epi8(yb, wv))));
+    }
+    {
+        const __m256i wv = _mm256_loadu_si256(wq + 2);
+        const __m256i yb = _mm256_shuffle_epi32(yl, _MM_SHUFFLE(2,2,2,2));
+        sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(m1,
+            _mm256_maddubs_epi16(_mm256_sign_epi8(wv, wv), _mm256_sign_epi8(yb, wv))));
+    }
+    {
+        const __m256i wv = _mm256_loadu_si256(wq + 3);
+        const __m256i yb = _mm256_shuffle_epi32(yl, _MM_SHUFFLE(3,3,3,3));
+        sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(m1,
+            _mm256_maddubs_epi16(_mm256_sign_epi8(wv, wv), _mm256_sign_epi8(yb, wv))));
+    }
+    /* Second half: chunks 4-7, activation dwords 0-3 from yh */
+    {
+        const __m256i wv = _mm256_loadu_si256(wq + 4);
+        const __m256i yb = _mm256_shuffle_epi32(yh, _MM_SHUFFLE(0,0,0,0));
+        sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(m1,
+            _mm256_maddubs_epi16(_mm256_sign_epi8(wv, wv), _mm256_sign_epi8(yb, wv))));
+    }
+    {
+        const __m256i wv = _mm256_loadu_si256(wq + 5);
+        const __m256i yb = _mm256_shuffle_epi32(yh, _MM_SHUFFLE(1,1,1,1));
+        sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(m1,
+            _mm256_maddubs_epi16(_mm256_sign_epi8(wv, wv), _mm256_sign_epi8(yb, wv))));
+    }
+    {
+        const __m256i wv = _mm256_loadu_si256(wq + 6);
+        const __m256i yb = _mm256_shuffle_epi32(yh, _MM_SHUFFLE(2,2,2,2));
+        sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(m1,
+            _mm256_maddubs_epi16(_mm256_sign_epi8(wv, wv), _mm256_sign_epi8(yb, wv))));
+    }
+    {
+        const __m256i wv = _mm256_loadu_si256(wq + 7);
+        const __m256i yb = _mm256_shuffle_epi32(yh, _MM_SHUFFLE(3,3,3,3));
+        sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(m1,
+            _mm256_maddubs_epi16(_mm256_sign_epi8(wv, wv), _mm256_sign_epi8(yb, wv))));
     }
     return sumi;
 }
