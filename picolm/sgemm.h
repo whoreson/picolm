@@ -130,6 +130,11 @@ int sgemm_q4_0_r8_q8_2_avx2(int nrows, int ncols, int k,
         const void *vx, const void *vy, float *out, size_t bs,
         int ith, int nth);
 
+/* Q8_0_R8 x Q8_0 tiled GEMM (8-row interleaved) */
+int sgemm_q8_0_r8_q8_0_avx2(int nrows, int ncols, int k,
+        const void *vx, const void *vy, float *out, size_t bs,
+        int ith, int nth);
+
 /* Q8_K_R8 x Q8_K tiled GEMM (8-row interleaved) */
 int sgemm_q8_k_r8_q8_k_avx2(int nrows, int ncols, int k,
         const void *vx, const void *vy, float *out, size_t bs,

@@ -9399,12 +9399,22 @@ void dequantize_row_q4_0_r8(const void *src, float *dst, int n) {
  * Q8_0_R8 (GGUF type 203): 8-row interleaved Q8_0.
  * ================================================================ */
 
-/* Quantize 8 rows of F32 to Q8_0_R8 interleaved format.
+/* Quantize 8 rows of F32 to Q8_0_R8 interleaved format (ik_llama layout).
  * x is row-major with row_stride = n floats per row.
- * dst has (n/32) block_q8_0_r8 blocks. */
+ * dst has (n/32) block_q8_0_r8 blocks.
+ *
+ * Layout (matches ik_llama repack_q8_0):
+ *   d[8]: one FP16 scale per row.
+ *   qs[256]: for l=0..3, k=0..7, i=0..3:
+ *     qs[32*l + 4*k + i     ] = row k, value 4*l + i      (values 0-15)
+ *     qs[32*l + 4*k + i +128] = row k, value 16 + 4*l + i  (values 16-31)
+ * I.e. within each 32-byte chunk l, row k occupies bytes [4*k, 4*k+3]
+ * holding values 4*l .. 4*l+3 of that row. */
 void quantize_row_q8_0_r8(const float *x, void *dst, int n) {
     int nb = n / 32;
     block_q8_0_r8 *b = (block_q8_0_r8 *)dst;
+    /* First quantize each row to temporary plain Q8_0 blocks */
+    int8_t tmp_qs[8 * 32];
     for (int ib = 0; ib < nb; ib++) {
         for (int r = 0; r < 8; r++) {
             const float *x0 = x + r * n + ib * 32;
@@ -9422,22 +9432,56 @@ void quantize_row_q8_0_r8(const float *x, void *dst, int n) {
                 int vi = (int)(x0[j] * id);
                 if (vi > 127) vi = 127;
                 else if (vi < -128) vi = -128;
-                b[ib].qs[r * 32 + j] = (int8_t)vi;
+                tmp_qs[r * 32 + j] = (int8_t)vi;
+            }
+        }
+        /* Transpose: plain qs[r*32+j] -> R8 qs[32*l + 4*k + i (+128)] */
+        for (int l = 0; l < 4; l++) {
+            for (int k = 0; k < 8; k++) {
+                for (int i = 0; i < 4; i++) {
+                    b[ib].qs[32*l + 4*k + i     ] = tmp_qs[k*32 + 4*l + i     ];
+                    b[ib].qs[32*l + 4*k + i +128] = tmp_qs[k*32 + 4*l + i + 16];
+                }
             }
         }
     }
 }
 
-/* Dequantize 8 rows of Q8_0_R8 to F32. */
+/* Dequantize 8 rows of Q8_0_R8 to F32 (ik_llama transposed layout). */
 void dequantize_row_q8_0_r8(const void *src, float *dst, int n) {
     int nb = n / 32;
     const block_q8_0_r8 *b = (const block_q8_0_r8 *)src;
     for (int ib = 0; ib < nb; ib++) {
         for (int r = 0; r < 8; r++) {
             float d = fp16_to_fp32(b[ib].d[r]);
-            const int8_t *qs = b[ib].qs + r * 32;
             float *d0 = dst + r * n + ib * 32;
-            for (int j = 0; j < 32; j++) d0[j] = qs[j] * d;
+            for (int l = 0; l < 4; l++) {
+                const int8_t *qs = b[ib].qs + 32*l + 4*r;
+                for (int i = 0; i < 4; i++) {
+                    d0[4*l + i     ] = qs[i     ] * d;
+                    d0[4*l + i + 16] = qs[i +128] * d;
+                }
+            }
+        }
+    }
+}
+
+/* Dequantize a single row from a Q8_0_R8 block group.
+ * src: pointer to one block_q8_0_r8 group (n/32 blocks for 8 rows).
+ * dst: n floats for the requested row.
+ * row: row index 0-7 within the interleaved group. */
+void dequantize_row_q8_0_r8_single(const void *src, float *dst, int n, int row) {
+    int nb = n / 32;
+    const block_q8_0_r8 *b = (const block_q8_0_r8 *)src;
+    for (int ib = 0; ib < nb; ib++) {
+        float d = fp16_to_fp32(b[ib].d[row]);
+        float *d0 = dst + ib * 32;
+        for (int l = 0; l < 4; l++) {
+            const int8_t *qs = b[ib].qs + 32*l + 4*row;
+            for (int i = 0; i < 4; i++) {
+                d0[4*l + i     ] = qs[i     ] * d;
+                d0[4*l + i + 16] = qs[i +128] * d;
+            }
         }
     }
 }

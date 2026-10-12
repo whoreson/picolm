@@ -1666,6 +1666,10 @@ int parse_gguf(model_t *m, int max_seq_len) {
         int si = tinfos[i].split_idx;
         size_t off = m->tensor_data_base[si] + tinfos[i].offset;
         gguf_type_t qtype = (gguf_type_t)tinfos[i].type;
+        /* Normalize ik_llama GGUF type aliases: 208 is Q8_0_R8 in some GGUFs
+         * (same layout as 203, just a different type ID assignment). */
+        if (qtype == (gguf_type_t)208)
+            qtype = GGUF_TYPE_Q8_0_R8;
         /* Check tensor data is within file bounds */
         size_t row_sz = gguf_type_row_size(qtype, (int)tinfos[i].dims[tinfos[i].n_dims - 1]);
             size_t rows = 1;

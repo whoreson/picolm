@@ -1239,6 +1239,9 @@ void dequantize_row_q4_0_r8_single(const void *src, float *dst, int n, int row);
 void quantize_row_q8_0_r8(const float *x, void *dst, int n);
 /* Dequantize 8 rows of Q8_0_R8 to F32. dst must hold 8*n floats. */
 void dequantize_row_q8_0_r8(const void *src, float *dst, int n);
+void dequantize_row_q8_0_r8_single(const void *src, float *dst, int n, int row);
+void vec_dot_q8_0_r8_q8_0_avx2(const void *vx, const void *wy, int n, float *out, int nrows);
+int sgemm_q8_0_r8_q8_0_avx2(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
 /* Q8_K_R8 x Q8_K GEMV (AVX2): 8 weight rows x 1 activation row.
  * Uses block_q8_k_r8 weights (sign trick, no bias correction).
  * Activations in block_q8_K format. */
