@@ -16,6 +16,7 @@ extern int sgemm_iq6_k_q8_k_neon(int nrows, int ncols, int k, const void *vx, co
 extern void vec_dot_iq6_k_q8_k_neon(const void *vx, const void *wy, int n, float *out);
 extern void vec_dot_q4_k_r4_q8_k_neon(const void *vx, const void *wy, int n, float *out, int nrows);
 #endif
+
 /* AVX2 GEMM declarations */
 #if defined(PICOLM_AVX2)
 extern int sgemm_iq6_k_q8_k_avx2(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
@@ -2083,6 +2084,20 @@ static inline double picolm_now(void) {
 static double prof_f32_gemm, prof_q8_d, prof_q4_d, prof_q5_d, prof_scalar_par, prof_scalar_seq, prof_other;
 static int    cnt_f32_gemm, cnt_q8_d, cnt_q4_d, cnt_q5_d, cnt_scalar_par, cnt_scalar_seq, cnt_other;
 static int    prof_active;
+/* Shape histogram for f32_gemm calls (debug: find hot shapes) */
+static struct { int d, n, nb; double t; } f32_shapes[64];
+static int f32_shapes_n;
+static void prof_shape_add(int d, int n, int n_batch, double dt) {
+    for (int i = 0; i < f32_shapes_n; i++)
+        if (f32_shapes[i].d == d && f32_shapes[i].n == n && f32_shapes[i].nb == n_batch) {
+            f32_shapes[i].t += dt; return;
+        }
+    if (f32_shapes_n < 64) {
+        f32_shapes[f32_shapes_n].d = d; f32_shapes[f32_shapes_n].n = n;
+        f32_shapes[f32_shapes_n].nb = n_batch; f32_shapes[f32_shapes_n].t = dt;
+        f32_shapes_n++;
+    }
+}
 static void prof_print(void) {
     double total = prof_f32_gemm + prof_q8_d + prof_q4_d + prof_q5_d + prof_scalar_par + prof_scalar_seq + prof_other;
     if (total < 0.001) return;
@@ -2097,6 +2112,10 @@ static void prof_print(void) {
     P("other", prof_other, cnt_other);
     fprintf(stderr, "===========================================\n");
     #undef P
+    fprintf(stderr, "=== f32_gemm shape histogram ===\n");
+    for (int i = 0; i < f32_shapes_n; i++)
+        fprintf(stderr, "  d=%5d n=%5d batch=%5d: %8.1fms\n",
+                f32_shapes[i].d, f32_shapes[i].n, f32_shapes[i].nb, f32_shapes[i].t*1000);
 }
 
 /* Forward decls for R8/R4 scalar worker tasks (defined after matmul_dual_batch). */
@@ -2164,7 +2183,8 @@ void matmul_batch(float *out, const float *x, int n_batch,
     /* F32/F16: tiled GEMM */
     if (!ti || ti->act_fmt == ACT_FMT_F32) {
         if (picolm_sgemm(d, n_batch, n, wptr, n, x, n, out, d, qtype, GGUF_TYPE_F32, 0, 1)) {
-            if (prof_active) { double dt = picolm_now()-t0; prof_f32_gemm+=dt; cnt_f32_gemm++; }
+            if (prof_active) { double dt = picolm_now()-t0; prof_f32_gemm+=dt; cnt_f32_gemm++;
+                prof_shape_add(d, n, n_batch, dt); }
             DISPATCH("SGEMM_F32");
             return;
         }
