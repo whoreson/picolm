@@ -487,16 +487,16 @@ const char *gguf_type_name(uint32_t type) {
         case 17: return "iq2_xs";
         case 18: return "iq3_xxs";
         case 19: return "iq1_s";
-        case 20: return "iq4_xxs";
+        case 20: return "iq4_nl";   /* GGML_TYPE_IQ4_NL (was mislabeled iq4_xxs) */
         case 21: return "iq3_s";
         case 22: return "iq2_s";
         case 23: return "iq4_xs";
-        case 24: return "iq1_m";
-        case 25: return "iq6_xxs";
-        case 26: return "iq4_nl";
-        case 27: return "i8";
-        case 28: return "u8";
-        case 29: return "i4";
+        case 24: return "i8";       /* GGML_TYPE_I8 */
+        case 25: return "i16";      /* GGML_TYPE_I16 */
+        case 26: return "i32";      /* GGML_TYPE_I32 */
+        case 27: return "i64";      /* GGML_TYPE_I64 */
+        case 28: return "f64";      /* GGML_TYPE_F64 */
+        case 29: return "iq1_m";    /* GGML_TYPE_IQ1_M */
         case 30: return "bf16";
         case 31: return "q4_0_4_4";
         case 32: return "q4_0_4_8";
