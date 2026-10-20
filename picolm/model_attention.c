@@ -1410,9 +1410,21 @@ static void batch_attention_tiled(
      *   tile_k: tile * k_rb_gguf bytes
      *   tile_v: tile * head_dim floats
      * We allocate a pool of scratch spaces, one per possible concurrent task.
-     * The maximum concurrent tasks equals the thread count. */
+ * The maximum concurrent tasks equals the thread count. */
     int n_tasks = n_kv_heads * n_token_groups;
-    int max_concurrent = n_tasks < 16 ? n_tasks : 16;
+    /* Scratch slots must cover the maximum number of concurrently running
+     * tasks. tensor_parallel_for runs up to pool_total_threads(n_threads)
+     * tasks at once (one per pool thread), so cap at the THREAD COUNT, not
+     * an arbitrary 16. The old cap of 16 made slot = task_idx % 16 alias
+     * between concurrently running tasks whenever active > 16 (e.g. 24
+     * threads: thread 0 on idx 0 and thread 8 on idx 112 both use slot 0),
+     * silently corrupting attention scratch (scores/acc) for prompts long
+     * enough to spawn > 16 tasks. Cost: ~370KB per slot x n_threads. */
+    int max_concurrent;
+    {
+        int nth = tensor_get_n_threads();
+        max_concurrent = n_tasks < nth ? n_tasks : nth;
+    }
     size_t scores_per = (size_t)kv_mul * tile * tile * sizeof(float);
     size_t ms_per     = (size_t)kv_mul * tile * sizeof(float);
     size_t acc_per    = (size_t)kv_mul * tile * head_dim * sizeof(float);
@@ -1448,7 +1460,15 @@ static void batch_attention_tiled(
     bctx.tv_per = tv_per;
     bctx.max_concurrent = max_concurrent;
 
-    tensor_parallel_for(n_tasks, batch_tiled_task, &bctx);
+    /* Strided dispatch: task index -> (kv_head, token_group) with work growing
+     * linearly with the group index (causal: group g sees g+1 KV tiles).
+     * Contiguous chunking hands the last thread ~4x the work of the first
+     * (measured: 226ms avg wall per layer vs 57ms perfectly-balanced).
+     * Striding interleaves heavy and light tasks across threads so every
+     * thread's total converges to the mean. Scratch slots stay safe: with
+     * stride = active, in-flight indices are t + w*active, so idx % active
+     * is unique per in-flight task (given max_concurrent >= active). */
+    tensor_parallel_for_strided(n_tasks, batch_tiled_task, &bctx);
     free(scratch_pool);
 }
 

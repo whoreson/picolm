@@ -43,6 +43,11 @@ void matmul_batch(float *out, const float *x, int n_batch,
  * Used to parallelize per-head attention (independent across heads) the
  * same way matmul_batch parallelizes per-row projections. */
 void tensor_parallel_for(int count, void (*fn)(int idx, void *ctx), void *ctx);
+/* Strided variant: thread t gets indices t, t+active, t+2*active, ...
+ * Use for workloads whose per-index cost grows monotonically with the
+ * index (e.g. causal attention tiles) - interleaves heavy and light
+ * tasks for near-perfect static balance. See tensor.c for details. */
+void tensor_parallel_for_strided(int count, void (*fn)(int idx, void *ctx), void *ctx);
 void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
                         const void *W1, const void *W2,
                         int n, int d, gguf_type_t qtype1, gguf_type_t qtype2);

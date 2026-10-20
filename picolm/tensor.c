@@ -28,6 +28,7 @@ extern void vec_dot_iq4_k_r4_q8_k_neon(const void *vx, const void *wy, int n, fl
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
+#include <dlfcn.h>
 #include <stdio.h>
 #include <time.h>
 
@@ -456,6 +457,7 @@ typedef struct {
     void (*fn)(int idx, void *ctx);
     void *ctx;
     int   start, end;
+    int   stride;  /* 1 = contiguous chunk [start,end); >1 = strided start,start+stride,... < end */
 } generic_task_t;
 
 static generic_task_t  generic_tasks[MAX_THREADS];
@@ -474,7 +476,11 @@ int tensor_get_thread_id(void) {
 }
 
 static void generic_worker_f(generic_task_t *t) {
-    for (int i = t->start; i < t->end; i++) t->fn(i, t->ctx);
+    if (t->stride > 1) {
+        for (int i = t->start; i < t->end; i += t->stride) t->fn(i, t->ctx);
+    } else {
+        for (int i = t->start; i < t->end; i++) t->fn(i, t->ctx);
+    }
 }
 
 /* Cross-platform mutex/cond helpers */
@@ -3784,14 +3790,50 @@ static int barrier_prof_on = -1;
 static long barrier_dispatch_count;
 static double barrier_ns_total;
 
+/* Per-dispatch-site wall-time profile (PICOLM_REGION_PROF=1) */
+static void (*region_prof_fn[32])(int, void *);
+static const char *region_prof_name[32];
+static double region_prof_d[32];
+static double region_prof_max[32];
+static long   region_prof_cnt[32];
+static int    region_prof_n = 0;
+static int    region_prof_on = -1;
+
+static void region_prof_print(void) {
+    double total = 0;
+    fprintf(stderr, "\n=== tensor_parallel_for region profile (wall time per fn) ===\n");
+    for (int i = 0; i < region_prof_n; i++) {
+        if (!region_prof_cnt[i]) continue;
+        total += region_prof_d[i];
+        fprintf(stderr, "  %-24s %8ld calls %10.1f ms  avg %8.3f ms  max %8.3f ms\n",
+                region_prof_name[i] ? region_prof_name[i] : "?",
+                region_prof_cnt[i], region_prof_d[i] * 1e3,
+                region_prof_d[i] * 1e3 / region_prof_cnt[i],
+                region_prof_max[i] * 1e3);
+    }
+    fprintf(stderr, "  TOTAL wall-in-regions: %.1f ms\n", total * 1e3);
+}
+static const char *fn_name_hint(void (*fn)(int, void *)) {
+    /* Best-effort naming via dladdr */
+#ifdef __GNUC__
+    Dl_info info;
+    if (dladdr((void *)fn, &info) && info.dli_sname) return info.dli_sname;
+#endif
+    return NULL;
+}
+
 void tensor_parallel_for(int count, void (*fn)(int idx, void *ctx), void *ctx) {
     if (n_threads <= 1 || count < 2) {
         for (int i = 0; i < count; i++) fn(i, ctx);
         return;
     }
-    if (barrier_prof_on < 0) barrier_prof_on = getenv("PICOLM_BARRIER_PROF") ? 1 : 0;
+    if (barrier_prof_on < 0) {
+        barrier_prof_on = getenv("PICOLM_BARRIER_PROF") ? 1 : 0;
+        region_prof_on = getenv("PICOLM_REGION_PROF") ? 1 : 0;
+        if (region_prof_on) atexit(region_prof_print);
+    }
     int prof = barrier_prof_on;
-    double t0 = prof ? barrier_now() : 0;
+    double t0 = (prof || region_prof_on) ? barrier_now() : 0;
     int nt = pool_total_threads(n_threads);
     int want = n_threads < nt ? n_threads : nt;
     int active = want > count ? count : want;
@@ -3819,6 +3861,112 @@ void tensor_parallel_for(int count, void (*fn)(int idx, void *ctx), void *ctx) {
         if (barrier_dispatch_count == 48*8) {
             fprintf(stderr, "[BARRIER] %ld dispatches, total %.1f ms\n",
                     barrier_dispatch_count, barrier_ns_total / 1e6);
+        }
+    }
+    /* Per-dispatch-site wall-time profile (PICOLM_REGION_PROF=1).
+     * Keyed by task fn pointer + dispatch size, to attribute parallel-region
+     * wall time to the caller (attention tiles vs FFN qgemm vs dual etc). */
+    if (region_prof_on) {
+        int slot = -1;
+        for (int i = 0; i < region_prof_n; i++) {
+            if (region_prof_fn[i] == fn) { slot = i; break; }
+        }
+        if (slot < 0 && region_prof_n < 32) {
+            slot = region_prof_n++;
+            region_prof_fn[slot] = fn;
+            region_prof_name[slot] = fn_name_hint(fn);
+            region_prof_d[slot] = 0;
+            region_prof_cnt[slot] = 0;
+            region_prof_max[slot] = 0;
+        }
+        if (slot >= 0) {
+            double dt = barrier_now() - t0;
+            region_prof_d[slot] += dt;
+            region_prof_cnt[slot]++;
+            if (dt > region_prof_max[slot]) region_prof_max[slot] = dt;
+        }
+    }
+}
+
+/* Strided variant of tensor_parallel_for: thread t processes indices
+ * t, t+active, t+2*active, ... instead of a contiguous chunk.
+ *
+ * Use when per-index work grows (or shrinks) monotonically with the index -
+ * e.g. causal attention tiling, where task index maps to (kv_head, token
+ * group) and the number of visible KV tiles grows linearly with the group
+ * index. Contiguous chunking then hands the last thread ~count/active
+ * consecutive heavy tasks while the first thread gets only light ones
+ * (max/min load ratio ~ chunk for triangular workloads); striding
+ * interleaves heavy and light tasks so every thread's total converges to
+ * the mean (max/min ~1.05 for the triangular case at 24 threads).
+ *
+ * For uniform-cost workloads both schedules are equivalent; stride > 1
+ * only costs a tiny bit of cache locality (consecutive indices tend to
+ * share source data).
+ *
+ * Scratch-safety: callers that allocate per-task scratch slots indexed by
+ * "task_idx % max_concurrent" stay safe, since striding preserves the
+ * invariant that concurrently running tasks (one per active thread, the
+ * first `active` indices in wave w are t=w*active+t for t<active) touch
+ * distinct slots. Wave 0 runs indices 0..active-1 = slot per thread;
+ * wave w runs indices w*active + t, all distinct modulo max_concurrent
+ * as long as max_concurrent >= active (guaranteed by the caller). */
+void tensor_parallel_for_strided(int count, void (*fn)(int idx, void *ctx), void *ctx) {
+    if (n_threads <= 1 || count < 2) {
+        for (int i = 0; i < count; i++) fn(i, ctx);
+        return;
+    }
+    if (barrier_prof_on < 0) {
+        barrier_prof_on = getenv("PICOLM_BARRIER_PROF") ? 1 : 0;
+        region_prof_on = getenv("PICOLM_REGION_PROF") ? 1 : 0;
+        if (region_prof_on) atexit(region_prof_print);
+    }
+    int prof = barrier_prof_on;
+    double t0 = (prof || region_prof_on) ? barrier_now() : 0;
+    int nt = pool_total_threads(n_threads);
+    int want = n_threads < nt ? n_threads : nt;
+    int active = want > count ? count : want;
+    int i;
+    for (i = 0; i < nt; i++) {
+        generic_tasks[i].fn = fn;
+        generic_tasks[i].ctx = ctx;
+        if (i < active) {
+            generic_tasks[i].start = i;
+            generic_tasks[i].end = count;
+            generic_tasks[i].stride = active;
+        } else {
+            generic_tasks[i].start = 0;
+            generic_tasks[i].end = 0;
+            generic_tasks[i].stride = 1;
+        }
+    }
+    pool_mode = 1;
+    pool_wake(nt);
+    /* main thread does task 0 */
+    generic_worker_f(&generic_tasks[0]);
+    pool_wait(nt);
+    pool_mode = 0;
+    if (prof) {
+        barrier_dispatch_count++;
+        barrier_ns_total += (barrier_now() - t0) * 1e9;
+    }
+    if (region_prof_on) {
+        int slot = -1;
+        for (int s = 0; s < region_prof_n; s++)
+            if (region_prof_fn[s] == fn) { slot = s; break; }
+        if (slot < 0 && region_prof_n < 32) {
+            slot = region_prof_n++;
+            region_prof_fn[slot] = fn;
+            region_prof_name[slot] = fn_name_hint(fn);
+            region_prof_d[slot] = 0;
+            region_prof_cnt[slot] = 0;
+            region_prof_max[slot] = 0;
+        }
+        if (slot >= 0) {
+            double dt = barrier_now() - t0;
+            region_prof_d[slot] += dt;
+            region_prof_cnt[slot]++;
+            if (dt > region_prof_max[slot]) region_prof_max[slot] = dt;
         }
     }
 }
