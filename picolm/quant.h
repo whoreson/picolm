@@ -793,6 +793,7 @@ typedef struct PICOLM_PACKED_ATTR {
     uint16_t d;          /* scale (FP16) */
     uint8_t  qs[16];     /* 4-bit quantized values (indices into LUT) */
 } block_iq4_nl;           /* 18 bytes, identical to block_q4_0 */
+#pragma pack(pop)
 /* Compile-time check: block_iq4_nl must match block_q4_0 layout (18 bytes) */
 #if !defined(_MSC_VER)
 typedef char __compiletime_assert_iq4_nl_size[(sizeof(block_iq4_nl) == sizeof(block_q4_0)) ? 1 : -1] __attribute__((unused));
@@ -867,6 +868,7 @@ typedef struct PICOLM_PACKED_ATTR {
     uint8_t  scales[8];      /* 16 packed 4-bit signed scales (2 per byte) */
     uint8_t  qs[64];         /* 256 packed 2-bit values (4 per byte) */
 } block_iq2_k;              /* 76 bytes */
+#pragma pack(pop)
 
 /* IQ3_K plain block (GGUF type 138): single-row 3-bit non-linear quant.
  * Size: 110 bytes per block (QK_K=256 values).
@@ -888,6 +890,7 @@ typedef struct PICOLM_PACKED_ATTR {
     uint8_t  qs[64];         /* 2-bit low values (4 per byte) */
     uint8_t  qh[32];         /* 1 high bit per value (8 per byte) */
 } block_iq3_k;              /* 110 bytes */
+#pragma pack(pop)
 
 /* IQ2_K_R4 block: 4 rows of IQ2_K repacked together for SIMD efficiency.
  * GGUF type 337. Size = 4 * sizeof(block_iq2_k) = 304 bytes.
@@ -912,6 +915,7 @@ typedef struct PICOLM_PACKED_ATTR {
     uint8_t  scales[32];  /* 64 packed 4-bit scales (16 per row x 4 rows) */
     uint8_t  qs[256];     /* 1024 packed 2-bit values (256 per row x 4 rows) */
 } block_iq2_k_r4;         /* 304 bytes = 4 * 76 */
+#pragma pack(pop)
 
 /* IQ3_K_R4 block: 4 rows of IQ3_K repacked together for SIMD efficiency.
  * GGUF type 338. Size = 4 * sizeof(block_iq3_k) = 440 bytes.

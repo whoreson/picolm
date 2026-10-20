@@ -265,6 +265,11 @@ void vec_dot_iq6_k_q8_k_avx2_batch(const void *vx, const void *wy, size_t y_stri
     (void)vx; (void)wy; (void)y_stride; (void)n;
     for (int c = 0; c < ncols; ++c) out[c] = 0.0f;
 }
+int sgemm_iq6_k_q8_k_avx2(int nrows, int ncols, int k, const void *vx, const void *vy,
+                          float *out, size_t bs, int ith, int nth) {
+    (void)vx; (void)vy; (void)nrows; (void)ncols; (void)k; (void)out; (void)bs; (void)ith; (void)nth;
+    return 0;
+}
 
 #endif
 

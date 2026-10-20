@@ -14,7 +14,6 @@ extern void vec_dot_q8_k_r8_q8_k_neon(const void *vx, const void *wy, int n, flo
 /* NEON R4 GEMV declarations */
 extern int sgemm_iq6_k_q8_k_neon(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
 extern void vec_dot_iq6_k_q8_k_neon(const void *vx, const void *wy, int n, float *out);
-extern void vec_dot_q4_k_r4_q8_k_neon(const void *vx, const void *wy, int n, float *out, int nrows);
 #endif
 
 /* AVX2 GEMM declarations */
@@ -28,7 +27,9 @@ extern void vec_dot_iq4_k_r4_q8_k_neon(const void *vx, const void *wy, int n, fl
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
+#ifndef _WIN32
 #include <dlfcn.h>
+#endif
 #include <stdio.h>
 #include <time.h>
 
@@ -3815,7 +3816,7 @@ static void region_prof_print(void) {
 }
 static const char *fn_name_hint(void (*fn)(int, void *)) {
     /* Best-effort naming via dladdr */
-#ifdef __GNUC__
+#if defined(__GNUC__) && !defined(_WIN32)
     Dl_info info;
     if (dladdr((void *)fn, &info) && info.dli_sname) return info.dli_sname;
 #endif

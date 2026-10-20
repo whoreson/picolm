@@ -20,8 +20,19 @@ endif
 # for ad-hoc audits: make native WARN=1
 CFLAGS_STRICT = -Wshadow -Wdouble-promotion -Wimplicit-fallthrough -Wconversion -Wmisleading-indentation $(WARN_GCC_ONLY) -Wfloat-conversion -Wsign-conversion -Wcast-qual -Wformat-nonliteral
 
-CFLAGS  ?= -O3 -g -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic -fno-common -fopenmp -DPICOLM_SERVER
-LDFLAGS = -lm -lpthread -fopenmp
+# Apple Clang doesn't support -fopenmp. Detect Darwin and strip it.
+# Also: _GNU_SOURCE alone doesn't enable POSIX symbols on macOS;
+# _DARWIN_C_SOURCE is needed (e.g. for signal(), fork(), etc.).
+ifeq ($(shell uname -s 2>/dev/null),Darwin)
+OPENMP_FLAGS =
+DARWIN_FLAGS = -D_DARWIN_C_SOURCE
+else
+OPENMP_FLAGS = -fopenmp
+DARWIN_FLAGS =
+endif
+
+CFLAGS  ?= -O3 -g -std=c11 -D_GNU_SOURCE $(DARWIN_FLAGS) -Wall -Wextra -Wpedantic -fno-common $(OPENMP_FLAGS) -DPICOLM_SERVER
+LDFLAGS = -lm -lpthread $(OPENMP_FLAGS)
 
 # Windows needs ws2_32 for server mode
 ifeq ($(OS),Windows_NT)
@@ -43,7 +54,8 @@ endif
 # Source files and corresponding .o files
 # model.c has been split into modular files
 MODEL_SRCS = model_core.c model_attention.c model_moe.c model_gemma3n.c model_ssm.c model_kv_cache.c model_gguf.c
-SRCS    = picolm.c $(MODEL_SRCS) tensor.c type_dispatch.c quant.c sgemm.c sgemm_q4_0x8.c sgemm_q4i_0x8.c sgemm_q4_0_r8.c sgemm_q8_0_r8.c sgemm_q8_k_r8.c sgemm_q8_k_r8_neon.c sgemm_iq2_k.c sgemm_iq2_k_r4.c sgemm_iq3_k.c sgemm_iq3_k_r4.c sgemm_iq4_k.c sgemm_iq4_nl_r4.c sgemm_q4_k_r4.c sgemm_q6_k_r4.c sgemm_iq6_k.c sgemm_iq4_xs.c tokenizer.c qwen_tokenize.c sampler.c grammar.c cJSON.c server.c csafetensors.c json.c safetensors.c
+SGEMM_SRCS = sgemm.c sgemm_q4_0x8.c sgemm_q4i_0x8.c sgemm_q4_0_r8.c sgemm_q8_0_r8.c sgemm_q8_k_r8.c sgemm_q8_k_r8_neon.c sgemm_iq2_k.c sgemm_iq2_k_r4.c sgemm_iq3_k.c sgemm_iq3_k_r4.c sgemm_iq4_k.c sgemm_iq4_nl_r4.c sgemm_q4_k_r4.c sgemm_q6_k_r4.c sgemm_iq6_k.c sgemm_iq4_xs.c
+SRCS    = picolm.c $(MODEL_SRCS) tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) tokenizer.c qwen_tokenize.c sampler.c grammar.c cJSON.c server.c csafetensors.c json.c safetensors.c
 OBJS    = $(SRCS:.c=.o)
 TARGET  = picolm
 
@@ -713,8 +725,8 @@ test_quant: util/test_quant.c quant.c sgemm.c
 test_q6_k_r4: tests/test_q6_k_r4.c quant.c sgemm_q6_k_r4.c
 	$(CC) $(CFLAGS) -o $@ tests/test_q6_k_r4.c quant.c sgemm_q6_k_r4.c -lm -lpthread -fopenmp
 
-test_swa: tests/test_swa.c model_attention.c tensor.c type_dispatch.c quant.c sgemm.c sgemm_q4_0x8.c sgemm_q4i_0x8.c
-	$(CC) $(CFLAGS) -I. -O2 -o $@ tests/test_swa.c model_attention.c tensor.c type_dispatch.c quant.c sgemm.c sgemm_q4_0x8.c sgemm_q4i_0x8.c -lm -lpthread -fopenmp -lstdc++
+test_swa: tests/test_swa.c model_attention.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS)
+	$(CC) $(CFLAGS) -I. -O2 -o $@ tests/test_swa.c model_attention.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
 
 gguf_be_swap: util/gguf_be_swap.c
 	$(CC) -O2 -std=c99 -o $@ util/gguf_be_swap.c -lm

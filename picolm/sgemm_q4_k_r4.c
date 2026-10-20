@@ -170,3 +170,137 @@ int sgemm_q4_k_r4_q8_k_avx2(int nrows, int ncols, int k,
 void vec_dot_q4_k_r4_q8_k_avx2(const void *vx, const void *wy, int n, float *out, int nrows) { (void)vx; (void)wy; (void)n; (void)out; (void)nrows; }
 int sgemm_q4_k_r4_q8_k_avx2(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) { (void)vx; (void)vy; (void)nrows; (void)ncols; (void)k; (void)out; (void)bs; (void)ith; (void)nth; return 0; }
 #endif
+
+/* ================================================================
+ * Q4_K_R4 x Q8_K ARM NEON GEMV kernel (4-row interleaved)
+ * GGUF type 212
+ * ================================================================ */
+#if defined(PICOLM_NEON)
+
+static inline float q4_k_r4_get_d_scale(const block_q4_k_r4 *b, int is) {
+    uint8_t sl = b->scales_l[is] & 0xf;
+    uint8_t sh = (b->scales_h[is % 16] >> (4 * (is / 16))) & 0x03;
+    return (float)(sl | (sh << 4));
+}
+
+static inline float q4_k_r4_get_m_scale(const block_q4_k_r4 *b, int is) {
+    uint8_t sl = (b->scales_l[is] >> 4) & 0xf;
+    uint8_t sh = (b->scales_h[is % 16] >> (4 * (is / 16))) & 0x0c;
+    return (float)(sl | (sh << 2));
+}
+
+void vec_dot_q4_k_r4_q8_k_neon(const void *vx, const void *wy, int n,
+                                  float *out, int nrows) {
+    if (nrows != 4 || n % QK_K != 0) {
+        const block_q4_k_r4 *b = (const block_q4_k_r4 *)vx;
+        const block_q8_K *qk = (const block_q8_K *)wy;
+        const int nb = n / QK_K;
+        for (int r = 0; r < nrows && r < 4; r++) {
+            float w_tmp[QK_K];
+            float sum = 0.0f;
+            for (int ibl = 0; ibl < nb; ibl++) {
+                dequantize_row_q4_k_r4_single(&b[ibl], w_tmp, QK_K, r);
+                float q8_scale = qk[ibl].d;
+                for (int i = 0; i < QK_K; i++) {
+                    sum += w_tmp[i] * (float)qk[ibl].qs[i] * q8_scale;
+                }
+            }
+            out[r] = sum;
+        }
+        return;
+    }
+
+    const block_q4_k_r4 *x = (const block_q4_k_r4 *)vx;
+    const block_q8_K *qk = (const block_q8_K *)wy;
+    const int nb = n / QK_K;
+
+    float outv[4] = {0, 0, 0, 0};
+
+    for (int ibl = 0; ibl < nb; ibl++) {
+        const block_q4_k_r4 *b = &x[ibl];
+        const block_q8_K *q = &qk[ibl];
+
+        float q8_scale = q->d;
+
+        /* Per-row bias correction: -m[k] * min * sum(q8) */
+        float bias[4] = {0, 0, 0, 0};
+        for (int ib = 0; ib < QK_K / 32; ib++) {
+            for (int k = 0; k < 4; k++) {
+                int is = 4 * ib + k;
+                float ml = fp16_to_fp32_lookup(b->d[k + 4]) * q4_k_r4_get_m_scale(b, is);
+                bias[k] += ml * (q->bsums[ib * 2 + 0] + q->bsums[ib * 2 + 1]);
+            }
+        }
+
+        for (int ib = 0; ib < QK_K / 32; ib++) {
+            const uint8_t *qs = b->qs + 64 * ib;
+            const int8_t *q8 = q->qs + 32 * ib;
+
+            for (int k = 0; k < 4; k++) {
+                int is = 4 * ib + k;
+                float d = fp16_to_fp32_lookup(b->d[k]);
+                float s = q4_k_r4_get_d_scale(b, is);
+
+                float sum = 0.0f;
+                /* 4 chunks of 4 bytes each, interleaved across rows */
+                for (int cc = 0; cc < 4; cc++) {
+                    int qs_off = 4 * k + cc;
+                    const uint8_t *qs_chunk = qs + qs_off;
+                    int q8_lo_base, q8_hi_base;
+                    if (cc == 0) { q8_lo_base = 0; q8_hi_base = 8; }
+                    else if (cc == 1) { q8_lo_base = 16; q8_hi_base = 24; }
+                    else if (cc == 2) { q8_lo_base = 4; q8_hi_base = 12; }
+                    else { q8_lo_base = 20; q8_hi_base = 28; }
+
+                    for (int i = 0; i < 4; i++) {
+                        uint8_t v = qs_chunk[i];
+                        sum += (float)(v & 0xf) * q8[q8_lo_base + i * 2 + 0];
+                        sum += (float)(v >> 4) * q8[q8_hi_base + i * 2 + 0];
+                        sum += (float)(v & 0xf) * q8[q8_lo_base + i * 2 + 1];
+                        sum += (float)(v >> 4) * q8[q8_hi_base + i * 2 + 1];
+                    }
+                }
+                outv[k] += d * s * sum * q8_scale;
+            }
+        }
+
+        for (int k = 0; k < 4; k++) {
+            outv[k] -= bias[k] * q8_scale;
+        }
+    }
+
+    for (int k = 0; k < 4; k++) out[k] = outv[k];
+}
+
+int sgemm_q4_k_r4_q8_k_neon(int nrows, int ncols, int k,
+                             const void *vx, const void *vy,
+                             float *out, size_t bs,
+                             int ith, int nth) {
+    if (nrows < 4 || ncols < 1 || k % QK_K != 0 || nrows % 4 != 0)
+        return 0;
+
+    size_t a_row_bytes = (size_t)(k / QK_K) * sizeof(block_q8_K);
+    int start_col = (ncols * ith) / nth;
+    int end_col = (ncols * (ith + 1)) / nth;
+    if (end_col <= start_col) return 0;
+
+    size_t w_stride = (size_t)(k / QK_K) * sizeof(block_q4_k_r4);
+    for (int w4 = 0; w4 < nrows / 4; w4++) {
+        const block_q4_k_r4 *q4_base = (const block_q4_k_r4 *)
+            ((const char *)vx + w4 * w_stride);
+        for (int c = start_col; c < end_col; c++) {
+            const block_q8_K *qy = (const block_q8_K *)
+                ((const char *)vy + c * a_row_bytes);
+            float *out_base = out + w4 * 4 + c * bs;
+            vec_dot_q4_k_r4_q8_k_neon(q4_base, qy, k, out_base, 4);
+        }
+    }
+    return (nrows / 4) * 4;
+}
+
+/* NEON R4 function declarations for quant.c dispatcher */
+extern void vec_dot_q4_k_r4_q8_k_neon(const void *vx, const void *wy, int n, float *out, int nrows);
+extern int sgemm_q4_k_r4_q8_k_neon(int nrows, int ncols, int k,
+                                    const void *vx, const void *vy,
+                                    float *out, size_t bs, int ith, int nth);
+#endif /* PICOLM_NEON */

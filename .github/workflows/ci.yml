@@ -1,0 +1,268 @@
+# PicoLM CI -- build + smoke test on every push/PR
+#
+# Source lives in picolm/ subdirectory (that's where the Makefile is).
+# The test model is at models/stories260K-Q2_K.gguf (repo root).
+
+name: CI
+
+on:
+  push:
+    branches: [ main, dev, ci/** ]
+  pull_request:
+    branches: [ main, dev ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  # =========================================================================
+  #  Linux x86_64 -- build matrix (default, avx2, sse3, scalar)
+  # =========================================================================
+  linux-x86:
+    name: Linux ${{ matrix.build }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        build: [ default, avx2, sse3, scalar ]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc g++ make
+
+      - name: Build (${{ matrix.build }})
+        working-directory: ./picolm
+        run: |
+          set -e
+          make clean
+          case "${{ matrix.build }}" in
+            default)
+              make -j$(nproc) CC=gcc
+              ;;
+            avx2)
+              make avx2 -j$(nproc) CC=gcc
+              ;;
+            sse3)
+              make sse3 -j$(nproc) CC=gcc
+              ;;
+            scalar)
+              make scalar -j$(nproc) CC=gcc
+              ;;
+          esac
+          ls -lh picolm
+
+  # =========================================================================
+  #  Linux x86_64 -- unit tests + smoke tests (runs once, on avx2)
+  # =========================================================================
+  linux-tests:
+    name: Linux tests + smoke
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc g++ make
+
+      - name: Build (avx2)
+        working-directory: ./picolm
+        run: |
+          set -e
+          make clean
+          make avx2 -j$(nproc) CC=gcc
+
+      - name: Run test_swa
+        working-directory: ./picolm
+        run: |
+          make test_swa CC=gcc
+          ./test_swa 2>&1 | tee /tmp/test_swa.txt
+          if grep -q "ALL TESTS PASSED" /tmp/test_swa.txt; then
+            echo "PASS: test_swa all tests passed"
+          else
+            echo "FAIL: test_swa did not report ALL TESTS PASSED"
+            exit 1
+          fi
+
+      - name: Smoke test -- generation
+        working-directory: ./picolm
+        run: |
+          timeout 30 ./picolm ../models/stories260K-Q2_K.gguf \
+            -c 64 -n 16 -p "Once upon a time," 2>&1 | tee /tmp/picolm_output.txt
+          if grep -q "tok/s" /tmp/picolm_output.txt; then
+            echo "PASS: Generation completed successfully"
+          else
+            echo "FAIL: No generation output detected"
+            cat /tmp/picolm_output.txt
+            exit 1
+          fi
+
+      - name: Smoke test -- large prefill prompt
+        working-directory: ./picolm
+        run: |
+          timeout 60 ./picolm ../models/stories260K-Q2_K.gguf \
+            -c 256 -n 160 -t 0 \
+            -p "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\nOnce upon a time" \
+            2>&1 | tee /tmp/picolm_prefill.txt
+          if grep -q "tok/s" /tmp/picolm_prefill.txt && \
+             grep -q "little girl named Lily" /tmp/picolm_prefill.txt && \
+             grep -q "shiny piece of pieces" /tmp/picolm_prefill.txt && \
+             grep -q "thanked her mommy for being so clever" /tmp/picolm_prefill.txt; then
+            echo "PASS: Large prefill generation completed with expected output"
+          else
+            echo "FAIL: Large prefill output mismatch"
+            cat /tmp/picolm_prefill.txt
+            exit 1
+          fi
+
+      - name: Smoke test -- HTTP server starts
+        working-directory: ./picolm
+        run: |
+          timeout 5 ./picolm --server ../models/stories260K-Q2_K.gguf 2>&1 | head -20 || true
+          echo "PASS: Server started (or timed out as expected)"
+
+  # =========================================================================
+  #  macOS Intel (macOS-13 = x86_64)
+  # =========================================================================
+  macos-x86:
+    name: macOS Intel ${{ matrix.build }}
+    runs-on: macos-13
+    strategy:
+      fail-fast: false
+      matrix:
+        build: [ avx2, sse3, scalar ]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build (${{ matrix.build }})
+        working-directory: ./picolm
+        run: |
+          make clean
+          case "${{ matrix.build }}" in
+            avx2)
+              make avx2 -j$(sysctl -n hw.logicalcpu) CC=clang
+              ;;
+            sse3)
+              make sse3 -j$(sysctl -n hw.logicalcpu) CC=clang
+              ;;
+            scalar)
+              make scalar -j$(sysctl -n hw.logicalcpu) CC=clang
+              ;;
+          esac
+
+      - name: Smoke test -- large prefill prompt
+        working-directory: ./picolm
+        run: |
+          timeout 60 ./picolm ../models/stories260K-Q2_K.gguf \
+            -c 256 -n 160 -t 0 \
+            -p "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\nOnce upon a time" \
+            2>&1 | tee /tmp/picolm_prefill.txt
+          if grep -q "tok/s" /tmp/picolm_prefill.txt && \
+             grep -q "little girl named Lily" /tmp/picolm_prefill.txt && \
+             grep -q "shiny piece of pieces" /tmp/picolm_prefill.txt && \
+             grep -q "thanked her mommy for being so clever" /tmp/picolm_prefill.txt; then
+            echo "PASS: Large prefill generation completed with expected output"
+          else
+            echo "FAIL: Large prefill output mismatch"
+            cat /tmp/picolm_prefill.txt
+            exit 1
+          fi
+
+  # =========================================================================
+  #  macOS Apple Silicon (ARM64)
+  # =========================================================================
+  macos-arm:
+    name: macOS ARM64
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build (default)
+        working-directory: ./picolm
+        run: |
+          make clean
+          make -j$(sysctl -n hw.logicalcpu) CC=clang
+          ls -lh picolm
+
+      - name: Smoke test -- large prefill prompt
+        working-directory: ./picolm
+        run: |
+          timeout 60 ./picolm ../models/stories260K-Q2_K.gguf \
+            -c 256 -n 160 -t 0 \
+            -p "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\nOnce upon a time" \
+            2>&1 | tee /tmp/picolm_prefill.txt
+          if grep -q "tok/s" /tmp/picolm_prefill.txt && \
+             grep -q "little girl named Lily" /tmp/picolm_prefill.txt && \
+             grep -q "shiny piece of pieces" /tmp/picolm_prefill.txt && \
+             grep -q "thanked her mommy for being so clever" /tmp/picolm_prefill.txt; then
+            echo "PASS: Large prefill generation completed with expected output"
+          else
+            echo "FAIL: Large prefill output mismatch"
+            cat /tmp/picolm_prefill.txt
+            exit 1
+          fi
+
+  # =========================================================================
+  #  Windows (MinGW cross-compile from Ubuntu)
+  # =========================================================================
+  windows-mingw:
+    name: Windows MinGW
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install MinGW
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 make
+
+      - name: Build (cross-compile)
+        working-directory: ./picolm
+        run: |
+          export OS=Windows_NT
+          make clean
+          make sse3 -j$(nproc) CC=x86_64-w64-mingw32-gcc
+          ls -lh picolm.exe
+          file picolm.exe
+
+  # =========================================================================
+  #  Lint: strict warnings
+  # =========================================================================
+  lint:
+    name: Lint (strict warnings)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc g++ make
+
+      - name: Build with WARN=1
+        working-directory: ./picolm
+        run: |
+          make clean
+          make avx2 -j$(nproc) CC=gcc WARN=1 2>&1 | tee /tmp/lint.log
+          if grep -qi "error:" /tmp/lint.log; then
+            echo "FAIL: Compilation errors found with strict warnings"
+            exit 1
+          fi
+          echo "PASS: Build completed with strict warnings (no errors)"

@@ -154,7 +154,13 @@ static void gemv_q6_k_r4(const void *w, const void *a, int n, float *out, int nr
 
 /* ---- The table ---- */
 
-const type_info_t type_info_table[] = {
+#ifndef _MSC_VER
+#define PICOLM_ALIGNED8 __attribute__((aligned(8)))
+#else
+#define PICOLM_ALIGNED8 __declspec(align(8))
+#endif
+
+PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
     /* Q8_0: plain, Q8_0 activations with FP32 deltas */
     [GGUF_TYPE_Q8_0] = {
         .act_fmt = ACT_FMT_Q8_0,

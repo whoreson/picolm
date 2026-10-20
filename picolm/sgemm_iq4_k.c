@@ -544,6 +544,12 @@ int sgemm_iq4_k_q8_k_avx2(int nrows, int ncols, int k,
     }
     return nrows;
 }
+#else
+int sgemm_iq4_k_q8_k_avx2(int nrows, int ncols, int k, const void *vx, const void *vy,
+                          float *out, size_t bs, int ith, int nth) {
+    (void)vx; (void)vy; (void)nrows; (void)ncols; (void)k; (void)out; (void)bs; (void)ith; (void)nth;
+    return 0;
+}
 #endif
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
