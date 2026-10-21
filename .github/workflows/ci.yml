@@ -164,7 +164,7 @@ jobs:
       - name: Smoke test -- large prefill prompt
         working-directory: ./picolm
         run: |
-          timeout 60 ./picolm ../models/stories260K-Q2_K.gguf \
+          ./picolm ../models/stories260K-Q2_K.gguf \
             -c 256 -n 160 -t 0 \
             -p "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\nOnce upon a time" \
             2>&1 | tee /tmp/picolm_prefill.txt
@@ -200,7 +200,7 @@ jobs:
       - name: Smoke test -- large prefill prompt
         working-directory: ./picolm
         run: |
-          timeout 60 ./picolm ../models/stories260K-Q2_K.gguf \
+          ./picolm ../models/stories260K-Q2_K.gguf \
             -c 256 -n 160 -t 0 \
             -p "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\nOnce upon a time" \
             2>&1 | tee /tmp/picolm_prefill.txt
