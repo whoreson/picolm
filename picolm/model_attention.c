@@ -915,8 +915,12 @@ void batch_attention_layer(
      * (n_tokens * n_heads tasks vs n_kv_heads * ceil(n_tokens/tile) tasks).
      *
      * The tiled path requires F16 KV cache (which is what the store loop
-     * always writes). Q8_0/Q4_0 cache types are a planned enhancement. */
-    if (n_tokens >= 2 * ATTN_TILE && (int)kv_type_k == (int)KV_CACHE_F16 && (int)kv_type_v == (int)KV_CACHE_F16) {
+     * always writes). Q8_0/Q4_0 cache types are a planned enhancement.
+     *
+     * XXX: Tiled prefill attention is broken since commit 540d68a.
+     * Disabled until the regression is fixed. See:
+     * /data4/work/notes/picolm/tiled_attn_regression.md */
+    if (0 && n_tokens >= 2 * ATTN_TILE && (int)kv_type_k == (int)KV_CACHE_F16 && (int)kv_type_v == (int)KV_CACHE_F16) {
         batch_attention_tiled(xb_batch, q_batch, kcache, vcache,
                               n_tokens, start_pos,
                               n_heads, n_kv_heads, head_dim,
