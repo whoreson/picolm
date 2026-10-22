@@ -623,6 +623,7 @@ void model_set_rope_overrides(const rope_cli_overrides_t *ov);
 extern void apply_rope_cli_overrides(model_config_t *cfg);
 
 /* Load a GGUF model file. Returns 0 on success. */
+int model_scan_neg128(const char *path);
 int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v,
                int k_cache_hadamard, int v_cache_hadamard, int n_threads);
 /* List all tensors in a GGUF file (name, dims, type) and exit. Returns 0 on success. */

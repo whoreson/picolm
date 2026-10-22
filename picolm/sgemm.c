@@ -1332,6 +1332,10 @@ QGEMM_DEFINE(iq4nl_load_qs, block_iq4_nl)
 /* Compute dot product of two Q8_0 blocks (32 values each),
  * return int32x4_t with the sum in all 4 lanes.
  * Basic NEON widen path (works on Pi 4 Cortex-A72 without DOTPROD/I8MM). */
+/* NEON int8 vdot: 4 partial sums of 8 elements each.
+ * Used by sgemm_q8_q8_neon d4 tiles and vec_dot_q8_0_q8_0 decode paths.
+ * Total sum is exact; per-lane grouping differs from AVX2's 8x4 lanes
+ * (FMA vs non-FMA means NEON cannot match AVX2 bit-exact anyway). */
 static inline int32x4_t neon_vdot_32(int8x16_t a_lo, int8x16_t b_lo,
                                      int8x16_t a_hi, int8x16_t b_hi) {
     int16x8_t m0 = vmull_s8(vget_low_s8(a_lo), vget_low_s8(b_lo));
@@ -1343,12 +1347,20 @@ static inline int32x4_t neon_vdot_32(int8x16_t a_lo, int8x16_t b_lo,
     return s;
 }
 
-/* Scaled accumulation: C += dot(a,b) * scale, where scale is a scalar broadcast. */
+/* Scaled accumulation: C += dot(a,b) * scale. */
 static inline float32x4_t neon_vdot_accum(float32x4_t C,
     int8x16_t a_lo, int8x16_t b_lo, int8x16_t a_hi, int8x16_t b_hi,
     float32x4_t scale) {
     int32x4_t s = neon_vdot_32(a_lo, b_lo, a_hi, b_hi);
     return vmlaq_f32(C, vcvtq_f32_s32(s), scale);
+}
+
+/* Horizontal sum of 4 float32 lanes.
+ * NEON pairwise: (v[0]+v[1]) + (v[2]+v[3]).
+ * AVX2 hsum_sse: (v[0]+v[2]) + (v[1]+v[3]).
+ * Difference is negligible (< 1 ulp) for accumulated dot products. */
+static inline float neon_hsum_f32(float32x4_t v) {
+    return vaddvq_f32(v);
 }
 
 /* ARM NEON Q8_0 x Q8_0 GEMM.
@@ -1453,16 +1465,12 @@ static void sgemm_q5_q8_neon(int m, int n, int k_blocks,
 
 #if defined(__ARM_NEON)
 
-static inline float neon_hsum_f32(float32x4_t v) {
-    return vaddvq_f32(v);
-}
-
 /* NEON tile: 4 weight rows x 2 activation rows.
  * B_d is pre-converted float32 delta array.
  * A weights have fp16 deltas read from block, converted in-kernel. */
 #define NEON_QGEMM_TILE_4x2(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d, C, ldc, ii, jj, k_blocks) do { \
-    float32x4_t Cv[2][4];                                                     \
-    for (int r=0;r<2;r++) for (int c=0;c<4;c++) Cv[r][c]=vdupq_n_f32(0);      \
+    float32x4_t Cv[2][4]; /* 4-lane accumulators matching AVX2 */            \
+    for (int r=0;r<2;r++) for (int c=0;c<4;c++) Cv[r][c]=vdupq_n_f32(0);     \
     for (int64_t l = 0; l < (k_blocks); ++l) {                                \
         float tmp_da[4];                                                               tmp_da[0] = fp16_to_fp32(*QG_D_PTR((A)+(lda)*((ii)+0)+l));                    tmp_da[1] = fp16_to_fp32(*QG_D_PTR((A)+(lda)*((ii)+1)+l));                    tmp_da[2] = fp16_to_fp32(*QG_D_PTR((A)+(lda)*((ii)+2)+l));                    tmp_da[3] = fp16_to_fp32(*QG_D_PTR((A)+(lda)*((ii)+3)+l));            \
         int8x16_t a0_lo, a0_hi, a1_lo, a1_hi, a2_lo, a2_hi, a3_lo, a3_hi;    \
@@ -1480,14 +1488,14 @@ static inline float neon_hsum_f32(float32x4_t v) {
         scale0[2] = vmulq_n_f32(db0, tmp_da[2]); scale0[3] = vmulq_n_f32(db0, tmp_da[3]); \
         scale1[0] = vmulq_n_f32(db1, tmp_da[0]); scale1[1] = vmulq_n_f32(db1, tmp_da[1]); \
         scale1[2] = vmulq_n_f32(db1, tmp_da[2]); scale1[3] = vmulq_n_f32(db1, tmp_da[3]); \
-        Cv[0][0] = neon_vdot_accum(Cv[0][0], a0_lo, b0_lo, a0_hi, b0_hi, scale0[0]); \
-        Cv[0][1] = neon_vdot_accum(Cv[0][1], a1_lo, b0_lo, a1_hi, b0_hi, scale0[1]); \
-        Cv[0][2] = neon_vdot_accum(Cv[0][2], a2_lo, b0_lo, a2_hi, b0_hi, scale0[2]); \
-        Cv[0][3] = neon_vdot_accum(Cv[0][3], a3_lo, b0_lo, a3_hi, b0_hi, scale0[3]); \
-        Cv[1][0] = neon_vdot_accum(Cv[1][0], a0_lo, b1_lo, a0_hi, b1_hi, scale1[0]); \
-        Cv[1][1] = neon_vdot_accum(Cv[1][1], a1_lo, b1_lo, a1_hi, b1_hi, scale1[1]); \
-        Cv[1][2] = neon_vdot_accum(Cv[1][2], a2_lo, b1_lo, a2_hi, b1_hi, scale1[2]); \
-        Cv[1][3] = neon_vdot_accum(Cv[1][3], a3_lo, b1_lo, a3_hi, b1_hi, scale1[3]); \
+        Cv[0][0]=neon_vdot_accum(Cv[0][0], a0_lo, b0_lo, a0_hi, b0_hi, scale0[0]); \
+        Cv[0][1]=neon_vdot_accum(Cv[0][1], a1_lo, b0_lo, a1_hi, b0_hi, scale0[1]); \
+        Cv[0][2]=neon_vdot_accum(Cv[0][2], a2_lo, b0_lo, a2_hi, b0_hi, scale0[2]); \
+        Cv[0][3]=neon_vdot_accum(Cv[0][3], a3_lo, b0_lo, a3_hi, b0_hi, scale0[3]); \
+        Cv[1][0]=neon_vdot_accum(Cv[1][0], a0_lo, b1_lo, a0_hi, b1_hi, scale1[0]); \
+        Cv[1][1]=neon_vdot_accum(Cv[1][1], a1_lo, b1_lo, a1_hi, b1_hi, scale1[1]); \
+        Cv[1][2]=neon_vdot_accum(Cv[1][2], a2_lo, b1_lo, a2_hi, b1_hi, scale1[2]); \
+        Cv[1][3]=neon_vdot_accum(Cv[1][3], a3_lo, b1_lo, a3_hi, b1_hi, scale1[3]); \
     }                                                                          \
     for (int64_t jr=0;jr<2;++jr)                                               \
         for (int64_t ir=0;ir<4;++ir)                                           \
@@ -1496,8 +1504,8 @@ static inline float neon_hsum_f32(float32x4_t v) {
 
 /* NEON tile: 4 weight rows x 4 activation rows */
 #define NEON_QGEMM_TILE_4x4(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d, C, ldc, ii, jj, k_blocks) do { \
-    float32x4_t Cv[4][4];                                                     \
-    for (int r=0;r<4;r++) for (int c=0;c<4;c++) Cv[r][c]=vdupq_n_f32(0);      \
+    float32x4_t Cv[4][4]; /* 4-lane accumulators matching AVX2 */               \
+    for (int r=0;r<4;r++) for (int c=0;c<4;c++) Cv[r][c]=vdupq_n_f32(0);       \
     for (int64_t l = 0; l < (k_blocks); ++l) {                                \
         float tmp_da[4];                                                       \
         tmp_da[0] = fp16_to_fp32(*QG_D_PTR((A)+(lda)*((ii)+0)+l));            \
@@ -1516,10 +1524,10 @@ static inline float neon_hsum_f32(float32x4_t v) {
             float32x4_t sc[4];                                                  \
             sc[0]=vmulq_n_f32(db,tmp_da[0]); sc[1]=vmulq_n_f32(db,tmp_da[1]); \
             sc[2]=vmulq_n_f32(db,tmp_da[2]); sc[3]=vmulq_n_f32(db,tmp_da[3]); \
-            Cv[jr][0] = neon_vdot_accum(Cv[jr][0], a0_lo, b_lo, a0_hi, b_hi, sc[0]); \
-            Cv[jr][1] = neon_vdot_accum(Cv[jr][1], a1_lo, b_lo, a1_hi, b_hi, sc[1]); \
-            Cv[jr][2] = neon_vdot_accum(Cv[jr][2], a2_lo, b_lo, a2_hi, b_hi, sc[2]); \
-            Cv[jr][3] = neon_vdot_accum(Cv[jr][3], a3_lo, b_lo, a3_hi, b_hi, sc[3]); \
+            Cv[jr][0]=neon_vdot_accum(Cv[jr][0], a0_lo, b_lo, a0_hi, b_hi, sc[0]); \
+            Cv[jr][1]=neon_vdot_accum(Cv[jr][1], a1_lo, b_lo, a1_hi, b_hi, sc[1]); \
+            Cv[jr][2]=neon_vdot_accum(Cv[jr][2], a2_lo, b_lo, a2_hi, b_hi, sc[2]); \
+            Cv[jr][3]=neon_vdot_accum(Cv[jr][3], a3_lo, b_lo, a3_hi, b_hi, sc[3]); \
         }                                                                      \
     }                                                                          \
     for (int64_t jr=0;jr<4;++jr)                                               \
@@ -1529,7 +1537,7 @@ static inline float neon_hsum_f32(float32x4_t v) {
 
 /* NEON tile: 4 weight rows x N activation rows (N=1..3 tail) */
 #define NEON_QGEMM_TILE_4xN(load_qs_fn, blk_t, A, lda, B, ldb, B_d, ldb_d, C, ldc, ii, jj, n_tail, k_blocks) do { \
-    float32x4_t Cv[4][4]; /* Cv[jr][ir], jr=0..n_tail-1, ir=0..3 */            \
+    float32x4_t Cv[4][4]; /* 4-lane accumulators matching AVX2 */               \
     for (int jr=0;jr<(n_tail);jr++) for (int c=0;c<4;c++) Cv[jr][c]=vdupq_n_f32(0); \
     for (int64_t l = 0; l < (k_blocks); ++l) {                                \
         float tmp_da[4];                                                       \
@@ -1549,10 +1557,10 @@ static inline float neon_hsum_f32(float32x4_t v) {
             float32x4_t sc[4];                                                  \
             sc[0]=vmulq_n_f32(db,tmp_da[0]); sc[1]=vmulq_n_f32(db,tmp_da[1]); \
             sc[2]=vmulq_n_f32(db,tmp_da[2]); sc[3]=vmulq_n_f32(db,tmp_da[3]); \
-            Cv[jr][0] = neon_vdot_accum(Cv[jr][0], a0_lo, b_lo, a0_hi, b_hi, sc[0]); \
-            Cv[jr][1] = neon_vdot_accum(Cv[jr][1], a1_lo, b_lo, a1_hi, b_hi, sc[1]); \
-            Cv[jr][2] = neon_vdot_accum(Cv[jr][2], a2_lo, b_lo, a2_hi, b_hi, sc[2]); \
-            Cv[jr][3] = neon_vdot_accum(Cv[jr][3], a3_lo, b_lo, a3_hi, b_hi, sc[3]); \
+            Cv[jr][0]=neon_vdot_accum(Cv[jr][0], a0_lo, b_lo, a0_hi, b_hi, sc[0]); \
+            Cv[jr][1]=neon_vdot_accum(Cv[jr][1], a1_lo, b_lo, a1_hi, b_hi, sc[1]); \
+            Cv[jr][2]=neon_vdot_accum(Cv[jr][2], a2_lo, b_lo, a2_hi, b_hi, sc[2]); \
+            Cv[jr][3]=neon_vdot_accum(Cv[jr][3], a3_lo, b_lo, a3_hi, b_hi, sc[3]); \
         }                                                                      \
     }                                                                          \
     for (int64_t jr=0;jr<(n_tail);++jr)                                        \
@@ -1569,7 +1577,8 @@ static inline float neon_hsum_f32(float32x4_t v) {
         int8x16_t a_lo, a_hi, b_lo, b_hi;                                      \
         load_qs_fn((A)+(lda)*(ii)+l, &a_lo, &a_hi);                            \
         neon_q8_qs((B) + (ldb)*(jj) + l, &b_lo, &b_hi);                        \
-        acc = neon_vdot_accum(acc, a_lo, b_lo, a_hi, b_hi, vdupq_n_f32(db*da)); \
+        float32x4_t scale = vdupq_n_f32(db*da);                                \
+        acc = neon_vdot_accum(acc, a_lo, b_lo, a_hi, b_hi, scale);            \
     }                                                                          \
     (C)[(ldc)*(jj)+(ii)] = neon_hsum_f32(acc);                                 \
 } while (0)
@@ -2972,6 +2981,188 @@ int picolm_sgemm_d(int m, int n, int k_blocks,
     }
 #endif
     return 0;
+}
+
+/* ================================================================
+ * Cross-platform GEMM self-test (PICOLM_GEMM_TEST=1).
+ *
+ * Deterministic LCG inputs, bit-exact comparison between platforms
+ * (AVX2/AVX-512 reference vs NEON). Covers:
+ *   1. quantize_row_q8_0 (activation quantizer identity)
+ *   2. vec_dot_q8_0_q8_0_deltas, vec_dot_q4_0_q8_0 (decode)
+ *   3. picolm_sgemm_d with Q8_0/Q4_0 A, various tile shapes
+ * Outputs raw hex float bits so any 1-ulp difference is visible.
+ * ================================================================ */
+void picolm_gemm_selftest(void);
+
+static uint32_t gemm_st_rand(uint32_t *s) {
+    *s = *s * 1664525u + 1013904223u;
+    return *s;
+}
+
+static float gemm_st_frand(uint32_t *s, float lo, float hi) {
+    return lo + (hi - lo) * ((float)(gemm_st_rand(s) >> 8) / 16777216.0f);
+}
+
+static uint32_t gemm_st_fnv(const void *data, size_t len, uint32_t h) {
+    const unsigned char *p = (const unsigned char *)data;
+    for (size_t i = 0; i < len; i++) { h ^= p[i]; h *= 16777619u; }
+    return h;
+}
+
+static void gemm_st_dump_f32(const char *tag, const float *v, int n, uint32_t *hash) {
+    for (int i = 0; i < n; i++) {
+        uint32_t bits; memcpy(&bits, &v[i], 4);
+        *hash = gemm_st_fnv(&v[i], 4, *hash);
+        if (i < 4)
+            printf("SELFTEST %s[%d] = %08x (%.6e)\n", tag, i, bits, v[i]);
+    }
+}
+
+void picolm_gemm_selftest(void) {
+    uint32_t rng = 0x12345678u;
+    uint32_t hash = 0x811c9dc5u;
+    const int k_blocks = 4;   /* 128 elements */
+    const int n_val = k_blocks * 32;
+    const int m = 8, n = 4;   /* 4x4 tile */
+
+    printf("SELFTEST: platform=%s\n",
+#if defined(PICOLM_AVX512)
+        "AVX512"
+#elif defined(PICOLM_AVX2)
+        "AVX2"
+#elif defined(PICOLM_I8MM)
+        "I8MM"
+#elif defined(PICOLM_NEON)
+        "NEON"
+#else
+        "SCALAR"
+#endif
+    );
+
+    /* ---- 1. quantize_row_q8_0 identity ---- */
+    {
+        float x[64];
+        for (int i = 0; i < 64; i++) x[i] = gemm_st_frand(&rng, -2.0f, 2.0f);
+        block_q8_0 q[2];
+        quantize_row_q8_0(x, q, 64);
+        for (int b = 0; b < 2; b++) {
+            printf("SELFTEST quant_q8_0[%d].d = %04x\n", b, q[b].d);
+            for (int j = 0; j < 4; j++)
+                printf("SELFTEST quant_q8_0[%d].qs[%d..%d] = %02x %02x %02x %02x\n",
+                       b, j*8, j*8+7,
+                       (uint8_t)q[b].qs[j*8], (uint8_t)q[b].qs[j*8+1],
+                       (uint8_t)q[b].qs[j*8+2], (uint8_t)q[b].qs[j*8+3]);
+            hash = gemm_st_fnv(&q[b], sizeof(block_q8_0), hash);
+        }
+    }
+
+    /* ---- 2. vec_dot identity ---- */
+    {
+        block_q8_0 *w8 = malloc(sizeof(block_q8_0) * m * k_blocks);
+        block_q4_0 *w4 = malloc(sizeof(block_q4_0) * m * k_blocks);
+        block_q8_0 *xq = malloc(sizeof(block_q8_0) * k_blocks);
+        float *xd = malloc(sizeof(float) * k_blocks);
+        for (int i = 0; i < m * k_blocks; i++) {
+            for (int j = 0; j < 32; j++) {
+                w8[i].qs[j] = (int8_t)(gemm_st_rand(&rng) >> 24);
+                w4[i].qs[j] = (uint8_t)(gemm_st_rand(&rng) >> 24);
+            }
+            w8[i].d = fp32_to_fp16(gemm_st_frand(&rng, 0.001f, 0.05f));
+            w4[i].d = fp32_to_fp16(gemm_st_frand(&rng, 0.001f, 0.05f));
+        }
+        for (int i = 0; i < k_blocks; i++) {
+            for (int j = 0; j < 32; j++)
+                xq[i].qs[j] = (int8_t)(gemm_st_rand(&rng) >> 24);
+            xq[i].d = fp32_to_fp16(gemm_st_frand(&rng, 0.001f, 0.05f));
+            xd[i] = fp16_to_fp32_lookup(xq[i].d);
+        }
+        float vd;
+        vd = vec_dot_q8_0_q8_0_deltas(xq, xd, w8, n_val);
+        gemm_st_dump_f32("vecdot_q8_deltas", &vd, 1, &hash);
+        vd = vec_dot_q4_0_q8_0(w4, xq, n_val);
+        gemm_st_dump_f32("vecdot_q4_0_q8_0", &vd, 1, &hash);
+        free(w8); free(w4); free(xq); free(xd);
+    }
+
+    /* ---- 3. picolm_sgemm_d Q8_0 x Q8_0 ---- */
+    {
+        block_q8_0 *A = malloc(sizeof(block_q8_0) * m * k_blocks);
+        block_q8_0 *B = malloc(sizeof(block_q8_0) * n * k_blocks);
+        float *B_d = malloc(sizeof(float) * n * k_blocks);
+        float *C = malloc(sizeof(float) * m * n);
+        for (int i = 0; i < m * k_blocks; i++) {
+            for (int j = 0; j < 32; j++)
+                A[i].qs[j] = (int8_t)(gemm_st_rand(&rng) >> 24);
+            A[i].d = fp32_to_fp16(gemm_st_frand(&rng, 0.001f, 0.05f));
+        }
+        for (int i = 0; i < n * k_blocks; i++) {
+            for (int j = 0; j < 32; j++)
+                B[i].qs[j] = (int8_t)(gemm_st_rand(&rng) >> 24);
+            B[i].d = fp32_to_fp16(gemm_st_frand(&rng, 0.001f, 0.05f));
+            B_d[i] = fp16_to_fp32_lookup(B[i].d);
+        }
+        memset(C, 0, sizeof(float) * m * n);
+        picolm_sgemm_d(m, n, k_blocks, A, k_blocks, B, k_blocks, B_d, k_blocks,
+                       C, m, GGUF_TYPE_Q8_0, 0, 1);
+        gemm_st_dump_f32("sgemm_d_q8", C, m * n, &hash);
+
+        /* Scalar reference: exact int32 dot per block, scalar FP accumulate */
+        for (int jj = 0; jj < n; jj++)
+            for (int ii = 0; ii < m; ii++) {
+                float s = 0.0f;
+                for (int l = 0; l < k_blocks; l++) {
+                    int32_t sumi = 0;
+                    for (int j = 0; j < 32; j++)
+                        sumi += (int32_t)A[(size_t)ii * k_blocks + l].qs[j] *
+                                (int32_t)B[(size_t)jj * k_blocks + l].qs[j];
+                    s += (float)sumi *
+                         fp16_to_fp32_lookup(A[(size_t)ii * k_blocks + l].d) *
+                         B_d[(size_t)jj * k_blocks + l];
+                }
+                printf("SELFTEST sgemm_d_q8_ref[%d] = %.6e (simd %+.6e diff %+.3e)\n",
+                       jj * m + ii, s, C[jj * m + ii], C[jj * m + ii] - s);
+            }
+
+        /* n=2: TILE_4x2 path */
+        memset(C, 0, sizeof(float) * m * n);
+        picolm_sgemm_d(m, 2, k_blocks, A, k_blocks, B, k_blocks, B_d, k_blocks,
+                       C, m, GGUF_TYPE_Q8_0, 0, 1);
+        gemm_st_dump_f32("sgemm_d_q8_n2", C, m * 2, &hash);
+
+        /* n=3: TILE_4xN tail path */
+        memset(C, 0, sizeof(float) * m * n);
+        picolm_sgemm_d(m, 3, k_blocks, A, k_blocks, B, k_blocks, B_d, k_blocks,
+                       C, m, GGUF_TYPE_Q8_0, 0, 1);
+        gemm_st_dump_f32("sgemm_d_q8_n3", C, m * 3, &hash);
+        free(A); free(B); free(B_d); free(C);
+    }
+
+    /* ---- 4. picolm_sgemm_d Q4_0 x Q8_0 ---- */
+    {
+        block_q4_0 *A = malloc(sizeof(block_q4_0) * m * k_blocks);
+        block_q8_0 *B = malloc(sizeof(block_q8_0) * n * k_blocks);
+        float *B_d = malloc(sizeof(float) * n * k_blocks);
+        float *C = malloc(sizeof(float) * m * n);
+        for (int i = 0; i < m * k_blocks; i++) {
+            for (int j = 0; j < 16; j++)
+                A[i].qs[j] = (uint8_t)(gemm_st_rand(&rng) >> 24);
+            A[i].d = fp32_to_fp16(gemm_st_frand(&rng, 0.001f, 0.05f));
+        }
+        for (int i = 0; i < n * k_blocks; i++) {
+            for (int j = 0; j < 32; j++)
+                B[i].qs[j] = (int8_t)(gemm_st_rand(&rng) >> 24);
+            B[i].d = fp32_to_fp16(gemm_st_frand(&rng, 0.001f, 0.05f));
+            B_d[i] = fp16_to_fp32_lookup(B[i].d);
+        }
+        memset(C, 0, sizeof(float) * m * n);
+        picolm_sgemm_d(m, n, k_blocks, A, k_blocks, B, k_blocks, B_d, k_blocks,
+                       C, m, GGUF_TYPE_Q4_0, 0, 1);
+        gemm_st_dump_f32("sgemm_d_q4", C, m * n, &hash);
+        free(A); free(B); free(B_d); free(C);
+    }
+
+    printf("SELFTEST: hash = %08x\n", hash);
 }
 
 /* Q4_K x Q8_K GEMM public API. Called from tensor.c.

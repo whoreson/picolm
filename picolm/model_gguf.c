@@ -532,6 +532,82 @@ const char *gguf_type_name(uint32_t type) {
     }
 }
 
+/* Scan Q8_0 tensor data for -128 bytes (PICOLM_SCAN_NEG128=1).
+ * Returns total number of -128 bytes found, -1 on error.
+ * Scans the GGUF file directly using the tensor metadata. */
+int model_scan_neg128(const char *path) {
+    uint8_t *addr = NULL;
+    size_t fsize = 0;
+    int rc = -1;
+    int neg128_count = 0;
+    int q8_element_count = 0;
+#ifndef _WIN32
+    int fd = -1;
+#endif
+    const int q8block = 34; /* sizeof(block_q8_0) */
+    const int q8vals = 32;
+
+#ifndef _WIN32
+    fd = open(path, O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "ERROR: cannot open '%s': %s\n", path, strerror(errno)); return -1; }
+    { struct stat st;
+      if (fstat(fd, &st) >= 0) fsize = (size_t)st.st_size;
+    }
+    addr = mmap(NULL, fsize, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (!addr || addr == (void*)-1) { fprintf(stderr, "ERROR: cannot map '%s'\n", path); goto out; }
+#endif
+
+    reader_t r = { .data = addr, .pos = 0, .size = fsize };
+    uint32_t magic = read_u32(&r);
+    if (magic != GGUF_MAGIC) { fprintf(stderr, "Not a GGUF\n"); goto out; }
+    uint32_t version = read_u32(&r);
+    uint64_t n_tensors = read_u64(&r);
+    uint64_t n_metadata = read_u64(&r);
+    for (uint64_t i = 0; i < n_metadata; i++) {
+        read_gguf_string(&r); /* key */
+        uint32_t t = read_u32(&r);
+        int dummy;
+        skip_meta_value(&r, t, &dummy);
+    }
+    for (uint64_t i = 0; i < n_tensors; i++) {
+        gguf_str_t name = read_gguf_string(&r);
+        uint32_t n_dims = read_u32(&r);
+        uint64_t dims[4] = {0};
+        for (uint32_t d = 0; d < n_dims; d++) dims[d] = read_u64(&r);
+        uint32_t type = read_u32(&r);
+        uint64_t offset = read_u64(&r);
+        if (version == 1) offset *= 4;
+
+        if (type == GGUF_TYPE_Q8_0) {
+            uint64_t total_elements = 1;
+            for (uint32_t d = 0; d < n_dims; d++) total_elements *= dims[d];
+            uint64_t n_blocks = total_elements / q8vals;
+            uint8_t *tensor_base = addr + offset;
+            size_t tensor_end = (size_t)tensor_base + (size_t)n_blocks * q8block;
+            if (tensor_base < addr || tensor_end > addr + fsize) {
+                fprintf(stderr, "SCAN: tensor out of bounds (offset=%lu, blocks=%lu, fsize=%zu)\n",
+                        (unsigned long)offset, (unsigned long)n_blocks, fsize);
+                continue;
+            }
+            for (uint64_t b = 0; b < n_blocks; b++) {
+                int8_t *qs = (int8_t *)(tensor_base + (size_t)b * q8block + 2);
+                for (int j = 0; j < q8vals; j++) {
+                    if (qs[j] == -128) neg128_count++;
+                    q8_element_count++;
+                }
+            }
+        }
+    }
+
+    rc = neg128_count;
+out:
+#ifndef _WIN32
+    if (addr && addr != MAP_FAILED) munmap(addr, fsize);
+    if (fd >= 0) close(fd);
+#endif
+    return rc;
+}
+
 int model_list_tensors(const char *path) {
     uint8_t *addr = NULL;
     size_t fsize = 0;

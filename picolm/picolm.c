@@ -1015,6 +1015,13 @@ done:
 
 int main(int argc, char **argv) {
     fp16_table_init();
+
+    /* Cross-platform GEMM self-test */
+    if (getenv("PICOLM_GEMM_TEST")) {
+        extern void picolm_gemm_selftest(void);
+        picolm_gemm_selftest();
+        return 0;
+    }
     picolm_init_gelu_table();
     if (argc < 2) {
         usage(argv[0]);
@@ -1532,6 +1539,13 @@ int main(int argc, char **argv) {
     if (!load_ok) {
         fprintf(stderr, "ERROR: failed to load model '%s' (see error above)\n", model_path);
         return 1;
+    }
+
+    /* Scan Q8_0 tensors for -128 bytes (PICOLM_SCAN_NEG128=1) */
+    if (getenv("PICOLM_SCAN_NEG128")) {
+        int cnt = model_scan_neg128(model_path);
+        if (cnt >= 0)
+            fprintf(stderr, "SCAN: found %d bytes of value -128 in Q8_0 tensors\n", cnt);
     }
 
     model.ssm_batched_prefill = ssm_batched_prefill;
