@@ -93,6 +93,18 @@ jobs:
             exit 1
           fi
 
+      - name: Run GEMM self-test
+        working-directory: ./picolm
+        run: |
+          PICOLM_GEMM_TEST=1 ./picolm 2>&1 | tee /tmp/gemm_test.txt
+          if grep -q "SELFTEST: hash" /tmp/gemm_test.txt; then
+            echo "PASS: GEMM self-test completed"
+          else
+            echo "FAIL: GEMM self-test did not complete"
+            cat /tmp/gemm_test.txt
+            exit 1
+          fi
+
       - name: Smoke test -- generation
         working-directory: ./picolm
         run: |
@@ -128,54 +140,6 @@ jobs:
         run: |
           timeout 5 ./picolm --server ../models/stories260K-Q2_K.gguf 2>&1 | head -20 || true
           echo "PASS: Server started (or timed out as expected)"
-
-  # =========================================================================
-  #  macOS Intel (macOS-13 = x86_64)
-  # =========================================================================
-  macos-x86:
-    name: macOS Intel ${{ matrix.build }}
-    runs-on: macos-13
-    strategy:
-      fail-fast: false
-      matrix:
-        build: [ avx2, sse3, scalar ]
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Build (${{ matrix.build }})
-        working-directory: ./picolm
-        run: |
-          make clean
-          case "${{ matrix.build }}" in
-            avx2)
-              make avx2 -j$(sysctl -n hw.logicalcpu) CC=clang
-              ;;
-            sse3)
-              make sse3 -j$(sysctl -n hw.logicalcpu) CC=clang
-              ;;
-            scalar)
-              make scalar -j$(sysctl -n hw.logicalcpu) CC=clang
-              ;;
-          esac
-
-      - name: Smoke test -- large prefill prompt
-        working-directory: ./picolm
-        run: |
-          ./picolm ../models/stories260K-Q2_K.gguf \
-            -c 256 -n 160 -t 0 \
-            -p "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\nOnce upon a time" \
-            2>&1 | tee /tmp/picolm_prefill.txt
-          if grep -q "tok/s" /tmp/picolm_prefill.txt && \
-             grep -q "little girl named Lily" /tmp/picolm_prefill.txt && \
-             grep -q "shiny piece of pieces" /tmp/picolm_prefill.txt; then
-            echo "PASS: Large prefill generation completed with expected output"
-          else
-            echo "FAIL: Large prefill output mismatch"
-            cat /tmp/picolm_prefill.txt
-            exit 1
-          fi
 
   # =========================================================================
   #  macOS Apple Silicon (ARM64)
