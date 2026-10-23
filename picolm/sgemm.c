@@ -1363,6 +1363,13 @@ static inline float neon_hsum_f32(float32x4_t v) {
     return vaddvq_f32(v);
 }
 
+/* Horizontal sum for I8MM smmla accumulators: only lanes 0+3 are valid dot products.
+ * vmmlaq_s32 (smmla) is a 2x2 matrix multiply: [dot_lo, cross, cross, dot_hi].
+ * Lanes 1 and 2 are cross terms and must be excluded. */
+static inline float neon_hsum_i8mm_f32(float32x4_t v) {
+    return vgetq_lane_f32(v, 0) + vgetq_lane_f32(v, 3);
+}
+
 /* ARM NEON Q8_0 x Q8_0 GEMM.
  *
  * TODO: UNTESTED IN PRACTICE. Wired in picolm_sgemm (Btype=Q8_0, Atype=Q8_0) but
@@ -1411,7 +1418,7 @@ static void sgemm_q8_q8_neon(int m, int n, int k_blocks,
                     }
                 }
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++)
-                    C[ldc*(jj+r)+(ii+c)]=vaddvq_f32(Cv[r][c]);
+                    C[ldc*(jj+r)+(ii+c)]=neon_hsum_i8mm_f32(Cv[r][c]);
             }
             for (int64_t jj=jj1; jj<jj2; ++jj) {
                 float32x4_t Cv[RM];
@@ -1436,7 +1443,7 @@ static void sgemm_q8_q8_neon(int m, int n, int k_blocks,
                         Cv[ir]=vaddq_f32(Cv[ir],s);
                     }
                 }
-                for(int c=0;c<RM;c++) C[ldc*jj+(ii+c)]=vaddvq_f32(Cv[c]);
+                for(int c=0;c<RM;c++) C[ldc*jj+(ii+c)]=neon_hsum_i8mm_f32(Cv[c]);
             }
         }
     }
@@ -1772,7 +1779,7 @@ static void sgemm_q4_q8_neon(int m, int n, int k_blocks,
                     }
                 }
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++)
-                    C[ldc*(jj+r)+(ii+c)]=vaddvq_f32(Cv[r][c]);
+                    C[ldc*(jj+r)+(ii+c)]=neon_hsum_i8mm_f32(Cv[r][c]);
             }
             for (int64_t jj=jj1; jj<jj2; ++jj) {
                 float32x4_t Cv[RM];
@@ -1795,7 +1802,7 @@ static void sgemm_q4_q8_neon(int m, int n, int k_blocks,
                         Cv[ir]=vaddq_f32(Cv[ir],s);
                     }
                 }
-                for(int c=0;c<RM;c++) C[ldc*jj+(ii+c)]=vaddvq_f32(Cv[c]);
+                for(int c=0;c<RM;c++) C[ldc*jj+(ii+c)]=neon_hsum_i8mm_f32(Cv[c]);
             }
         }
     }
@@ -1969,7 +1976,7 @@ static void sgemm_q5_q8_neon(int m, int n, int k_blocks,
                     }
                 }
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++)
-                    C[ldc*(jj+r)+(ii+c)]=vaddvq_f32(Cv[r][c]);
+                    C[ldc*(jj+r)+(ii+c)]=neon_hsum_i8mm_f32(Cv[r][c]);
             }
             for (int64_t jj=jj1; jj<jj2; ++jj) {
                 float32x4_t Cv[RM];
@@ -1992,7 +1999,7 @@ static void sgemm_q5_q8_neon(int m, int n, int k_blocks,
                         Cv[ir]=vaddq_f32(Cv[ir],s);
                     }
                 }
-                for(int c=0;c<RM;c++) C[ldc*jj+(ii+c)]=vaddvq_f32(Cv[c]);
+                for(int c=0;c<RM;c++) C[ldc*jj+(ii+c)]=neon_hsum_i8mm_f32(Cv[c]);
             }
         }
     }
