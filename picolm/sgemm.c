@@ -36,6 +36,12 @@
  * F32 x F32 tiled GEMM
  * ============================================================ */
 
+/* Row-block multiplier: only pick BM>1 when m is evenly divisible by RM*BM,
+ * otherwise yt=m/(RM*BM) silently drops the tail rows. */
+#define SGEMM_PICK_BM(m, RM, nth) \
+    ( (((m) % ((RM) * 4) == 0) && ((m) >= (RM) * 4 * (int64_t)(nth))) ? 4 \
+    : (((m) % ((RM) * 2) == 0) ? 2 : 1) )
+
 #if defined(__AVX512F__)
 
 #define F32_KN 16
@@ -54,7 +60,7 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
                            int ith, int nth) {
     const int64_t KN=F32_KN, RM=F32_RM, RN=F32_RN, BN=F32_BN;
     (void)BN;
-    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t BM=SGEMM_PICK_BM(m,RM,nth);
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js;j<je;j++) {
@@ -123,7 +129,7 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
                            int ith, int nth) {
     const int64_t KN=F32_KN, RM=F32_RM, RN=F32_RN, BN=F32_BN;
     (void)BN;
-    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t BM=SGEMM_PICK_BM(m,RM,nth);
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js;j<je;j++) {
@@ -190,7 +196,7 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
                            int ith, int nth) {
     const int64_t KN=F32_KN, RM=F32_RM, RN=F32_RN, BN=F32_BN;
     (void)BN;
-    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t BM=SGEMM_PICK_BM(m,RM,nth);
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js;j<je;j++) {
@@ -250,7 +256,7 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
                            int ith, int nth) {
     const int64_t KN=F32_KN, RM=F32_RM, RN=F32_RN, BN=F32_BN;
     (void)BN;
-    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t BM=SGEMM_PICK_BM(m,RM,nth);
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js;j<je;j++) {
@@ -317,7 +323,7 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
                            int ith, int nth) {
     const int64_t KN=F32_KN, RM=F32_RM, RN=F32_RN, BN=F32_BN;
     (void)BN;
-    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t BM=SGEMM_PICK_BM(m,RM,nth);
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     v4sf z; z=vec_ctf(vec_splat_u32(0),0);
@@ -372,7 +378,7 @@ static void sgemm_f16_f32_altivec(int m, int n, int k, const uint16_t *A, int ld
 #define F16F32_BN 24
     const int64_t KN=F16F32_KN, RM=F16F32_RM, RN=F16F32_RN, BN=F16F32_BN;
     (void)BN;
-    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t BM=SGEMM_PICK_BM(m,RM,nth);
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     v4sf z; z=vec_ctf(vec_splat_u32(0),0);
@@ -441,7 +447,7 @@ static void sgemm_f16_f16_altivec(int m, int n, int k, const uint16_t *A, int ld
 #define F16F16_BN 24
     const int64_t KN=F16F16_KN, RM=F16F16_RM, RN=F16F16_RN, BN=F16F16_BN;
     (void)BN;
-    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t BM=SGEMM_PICK_BM(m,RM,nth);
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     v4sf z; z=vec_ctf(vec_splat_u32(0),0);
@@ -523,7 +529,7 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
                            int ith, int nth) {
     const int64_t RM=F32_RM, RN=F32_RN, BN=F32_BN;
     (void)BN;
-    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t BM=SGEMM_PICK_BM(m,RM,nth);
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     const vlen_t vlmax=__riscv_vsetvlmax_e32m4();
@@ -583,7 +589,7 @@ static void sgemm_f16_f32(int m, int n, int k, const uint16_t *A, int lda,
 #define SGEMM_BN 12
     const int64_t KN=16, RM=4, RN=6, BN=12;
     (void)BN;
-    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t BM=SGEMM_PICK_BM(m,RM,nth);
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js;j<je;j++) {
@@ -630,7 +636,7 @@ static void sgemm_f16_f32(int m, int n, int k, const uint16_t *A, int lda,
 #define SGEMM_BN 24
     const int64_t KN=8, RM=4, RN=3, BN=24;
     (void)BN;
-    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t BM=SGEMM_PICK_BM(m,RM,nth);
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js;j<je;j++) {
@@ -682,7 +688,7 @@ static void sgemm_f16_f32(int m, int n, int k, const uint16_t *A, int lda,
 #define SGEMM_BN 12
     const int64_t KN=4, RM=4, RN=6, BN=12;
     (void)BN;
-    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t BM=SGEMM_PICK_BM(m,RM,nth);
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js;j<je;j++) {
@@ -728,7 +734,7 @@ static void sgemm_f16_f16(int m, int n, int k, const uint16_t *A, int lda,
 #define SGEMM_BN 12
     const int64_t KN=16, RM=4, RN=6, BN=12;
     (void)BN;
-    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t BM=SGEMM_PICK_BM(m,RM,nth);
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js;j<je;j++) {
@@ -774,7 +780,7 @@ static void sgemm_f16_f16(int m, int n, int k, const uint16_t *A, int lda,
 #define SGEMM_BN 24
     const int64_t KN=8, RM=4, RN=3, BN=24;
     (void)BN;
-    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t BM=SGEMM_PICK_BM(m,RM,nth);
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js;j<je;j++) {
@@ -826,7 +832,7 @@ static void sgemm_f16_f16(int m, int n, int k, const uint16_t *A, int lda,
 #define SGEMM_BN 12
     const int64_t KN=8, RM=4, RN=6, BN=12;
     (void)BN;
-    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t BM=SGEMM_PICK_BM(m,RM,nth);
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js;j<je;j++) {
@@ -888,7 +894,7 @@ static void sgemm_bf16_f32(int m, int n, int k, const uint16_t *A, int lda,
 #define SGEMM_BN 12
     const int64_t KN=16, RM=4, RN=6, BN=12;
     (void)BN;
-    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t BM=SGEMM_PICK_BM(m,RM,nth);
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js;j<je;j++) {
@@ -939,7 +945,7 @@ static void sgemm_bf16_bf16(int m, int n, int k, const uint16_t *A, int lda,
 #define SGEMM_BN 12
     const int64_t KN=16, RM=4, RN=6, BN=12;
     (void)BN;
-    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t BM=SGEMM_PICK_BM(m,RM,nth);
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js;j<je;j++) {
@@ -1002,7 +1008,7 @@ static void sgemm_bf16_f32(int m, int n, int k, const uint16_t *A, int lda,
 #define SGEMM_BN 24
     const int64_t KN=8, RM=4, RN=3, BN=24;
     (void)BN;
-    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t BM=SGEMM_PICK_BM(m,RM,nth);
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js;j<je;j++) {
@@ -1063,7 +1069,7 @@ static void sgemm_bf16_bf16(int m, int n, int k, const uint16_t *A, int lda,
 #define SGEMM_BN 24
     const int64_t KN=8, RM=4, RN=3, BN=24;
     (void)BN;
-    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t BM=SGEMM_PICK_BM(m,RM,nth);
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js;j<je;j++) {
@@ -1383,7 +1389,7 @@ static void sgemm_q8_q8_neon(int m, int n, int k_blocks,
                               int ith, int nth) {
     const int64_t RM=4, RN=3, BN=12;
     (void)BN;
-    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t BM=SGEMM_PICK_BM(m,RM,nth);
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js; j<je; j++) {
@@ -1746,7 +1752,7 @@ static void sgemm_q4_q8_neon(int m, int n, int k_blocks,
                               float *C, int ldc, int ith, int nth) {
     const int64_t RM=4, RN=3, BN=12;
     (void)BN;
-    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t BM=SGEMM_PICK_BM(m,RM,nth);
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js; j<je; j++) {
@@ -1943,7 +1949,7 @@ static void sgemm_q5_q8_neon(int m, int n, int k_blocks,
                               float *C, int ldc, int ith, int nth) {
     const int64_t RM=4, RN=3, BN=12;
     (void)BN;
-    int64_t BM=(m>=RM*4*(int64_t)nth)?4:(m%8==0)?2:1;
+    int64_t BM=SGEMM_PICK_BM(m,RM,nth);
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
     for (int64_t j=js; j<je; j++) {

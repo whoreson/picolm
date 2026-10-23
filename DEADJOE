@@ -1,0 +1,55 @@
+
+*** These modified files were found in JOE when it aborted on Fri Oct 23 12:49:49 2026
+*** JOE was aborted by UNIX signal 15
+
+*** File '(Unnamed)'
+overwrite
+overwrite
+
+*** File '(Unnamed)'
+root
+root
+root
+
+*** File '(Unnamed)'
+\\\n
+ \\
+ve": false
+ve": true
+--threads 32
+--threads 32 
+ve": true
+/kv
+ve": false
+
+
+*** File '(Unnamed)'
+alright
+xtts_spk_dbg
+pop
+input=
+input" =
+"xttsv
+outside the
+outside the
+dml
+dsml
+
+*** File '(Unnamed)'
+/home/jani/llm-agent.py
+/home/jani/llm-agent.py
+/home/jani/llm-agent.py
+/home/jani/llm-agent.py
+model_attention.c
+/home/jani/whis.sh
+/home/jani/whis.sh
+a.txt
+clean_transcript.sh
+a_clean.txt
+/home/jani/picolm/.git/COMMIT_EDITMSG
+
+*** File '* Startup Log *'
+Processing '/etc/joe/editorrc'...
+Processing '/etc/joe/ftyperc'...
+Finished processing /etc/joe/ftyperc
+Finished processing /etc/joe/editorrc

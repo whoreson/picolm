@@ -3845,10 +3845,16 @@ void tensor_parallel_for(int count, void (*fn)(int idx, void *ctx), void *ctx) {
         generic_tasks[t].start = t * chunk;
         generic_tasks[t].end = (t + 1) * chunk;
         if (generic_tasks[t].end > count) generic_tasks[t].end = count;
+        /* Contiguous chunk: MUST reset stride. tensor_parallel_for_strided()
+         * leaves stride = active in these (static) slots; generic_worker_f()
+         * would otherwise walk the chunk with that stale stride and silently
+         * skip every index but the first whenever count > active. */
+        generic_tasks[t].stride = 1;
     }
     for (int t = active; t < nt; t++) {
         generic_tasks[t].start = 0;
         generic_tasks[t].end = 0;
+        generic_tasks[t].stride = 1;
     }
     pool_mode = 1;
     pool_wake(nt);

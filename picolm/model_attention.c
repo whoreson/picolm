@@ -2,6 +2,10 @@
 #include "tensor.h"
 #include "quant.h"
 #include "model_internal.h"
+#ifndef _WIN32
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 #include <string.h>
 #include <math.h>
@@ -824,15 +828,25 @@ static void batch_tiled_task(int task_idx, void *ctx_ptr) {
     }
 
     /* Normalize and write output */
-    for (int ti = 0; ti < n_q; ti++) {
-        for (int g = 0; g < kv_mul; g++) {
-            int ri = ti * kv_mul + g;
-            float inv_sum = 1.0f / S[ri];
-            float *acc_row = acc + ri * head_dim;
-            float *out = bc->xb_batch + (size_t)(q_group_start + ti) * bc->xb_stride
-                       + (kv_h * kv_mul + g) * head_dim;
-            for (int d = 0; d < head_dim; d++)
-                out[d] = acc_row[d] * inv_sum;
+    {
+        static int _dbg_task = 0;
+        const char *_dbg = getenv("PICOLM_ATTN_TASK_DBG");
+        int _do_dbg = _dbg && _dbg_task < atoi(_dbg);
+        if (_do_dbg) _dbg_task++;
+        for (int ti = 0; ti < n_q; ti++) {
+            for (int g = 0; g < kv_mul; g++) {
+                int ri = ti * kv_mul + g;
+                float inv_sum = 1.0f / S[ri];
+                float *acc_row = acc + ri * head_dim;
+                float *out = bc->xb_batch + (size_t)(q_group_start + ti) * bc->xb_stride
+                           + (kv_h * kv_mul + g) * head_dim;
+                for (int d = 0; d < head_dim; d++)
+                    out[d] = acc_row[d] * inv_sum;
+                if (_do_dbg && kv_h == 0 && ti < 3) {
+                    fprintf(stderr, "[TASK kv_h=0 tg=%d ti=%d ri=%d] M=%g S=%g inv=%g out.sum=%g acc0=%g\n",
+                            tg, ti, ri, M[ri], S[ri], inv_sum, out[0] + out[1] + out[2] + out[3], acc_row[0]);
+                }
+            }
         }
     }
 }
@@ -920,7 +934,36 @@ void batch_attention_layer(
      * XXX: Tiled prefill attention is broken since commit 540d68a.
      * Disabled until the regression is fixed. See:
      * /data4/work/notes/picolm/tiled_attn_regression.md */
-    if (0 && n_tokens >= 2 * ATTN_TILE && (int)kv_type_k == (int)KV_CACHE_F16 && (int)kv_type_v == (int)KV_CACHE_F16) {
+    static int _layer_call = 0;
+    int _layer_idx = _layer_call++;
+    int _use_tiled = n_tokens >= 2 * ATTN_TILE &&
+                     (int)kv_type_k == (int)KV_CACHE_F16 &&
+                     (int)kv_type_v == (int)KV_CACHE_F16;
+    {
+        /* TEST HOOK: PICOLM_TEST_FORCE_TILED=0 -> grouped path,
+         *            =1 -> tiled path regardless of size gate
+         * PICOLM_ATTN_TILED_LAYERS=bitmask -> per-layer control (bit l) */
+        const char *_ft = getenv("PICOLM_TEST_FORCE_TILED");
+        if (_ft) _use_tiled = atoi(_ft);
+        const char *_lm = getenv("PICOLM_ATTN_TILED_LAYERS");
+        if (_lm) {
+            int mask = (int)strtoul(_lm, NULL, 0);
+            _use_tiled = (mask >> _layer_idx) & 1;
+        }
+    }
+    {
+        static int _dbg_once = 0;
+        if (!_dbg_once) {
+            _dbg_once = 1;
+            fprintf(stderr, "[BATCH-ATTN] n_tokens=%d start_pos=%d n_heads=%d n_kv_heads=%d "
+                    "head_dim=%d xb_stride=%d kv_type=%d/%d kv_row=%zu/%zu kv_hstride=%zu/%zu "
+                    "scale=%g n_swa=%d tiled=%d\n",
+                    n_tokens, start_pos, n_heads, n_kv_heads, head_dim, xb_stride,
+                    kv_type_k, kv_type_v, kv_row_size_k, kv_row_size_v,
+                    kv_head_stride_k, kv_head_stride_v, attn_scale, n_swa, _use_tiled);
+        }
+    }
+    if (_use_tiled) {
         batch_attention_tiled(xb_batch, q_batch, kcache, vcache,
                               n_tokens, start_pos,
                               n_heads, n_kv_heads, head_dim,
@@ -945,6 +988,78 @@ void batch_attention_layer(
         attn_timing_calls++;
         attn_timing_tokens += n_tokens;
         attn_timing_ctx_sum += (long long)start_pos * n_tokens;
+    }
+    {
+        static int _dbg_call = 0;
+        const char *_dump = getenv("PICOLM_ATTN_DUMP_CHECKSUM");
+        if (_dump && _dbg_call < atoi(_dump)) {
+            _dbg_call++;
+            double qsum_in = 0, ksum_in = 0, vsum_in = 0;
+            for (int i = 0; i < n_tokens * n_heads * head_dim; i++) qsum_in += q_batch[i];
+            for (int p = 0; p < n_tokens + start_pos; p++) {
+                const uint16_t *kp = (const uint16_t *)(kcache + (size_t)p * kv_row_size_k);
+                const uint16_t *vp = (const uint16_t *)(vcache + (size_t)p * kv_row_size_v);
+                for (int d = 0; d < 8; d++) {
+                    ksum_in += fp16_to_fp32_lookup(kp[d]);
+                    vsum_in += fp16_to_fp32_lookup(vp[d]);
+                }
+            }
+            fprintf(stderr, "[IN %d] qsum=%.4f ksum=%.4f vsum=%.4f\n", _dbg_call, qsum_in, ksum_in, vsum_in);
+            {
+                const char *df = getenv("PICOLM_ATTN_DUMP_IN");
+                if (df && _dbg_call == 2) {
+                    FILE *f = fopen(df, "wb");
+                    if (f) {
+                        size_t w1 = fwrite(q_batch, sizeof(float), (size_t)n_tokens * n_heads * head_dim, f);
+                        size_t w2 = fwrite(kcache, 1, (size_t)(n_tokens + start_pos) * kv_row_size_k, f);
+                        size_t w3 = fwrite(vcache, 1, (size_t)(n_tokens + start_pos) * kv_row_size_v, f);
+                        fprintf(stderr, "[DUMP] w1=%zu w2=%zu w3=%zu (expect %d, %zu, %zu)\n",
+                                w1, w2, w3, (size_t)n_tokens * n_heads * head_dim,
+                                (size_t)(n_tokens + start_pos) * kv_row_size_k,
+                                (size_t)(n_tokens + start_pos) * kv_row_size_v);
+                        fclose(f);
+                    }
+                }
+            }
+            double sum = 0, sum2 = 0; int nan_cnt = 0;
+            double qsum = 0, ksum = 0, vsum = 0;
+            for (int i = 0; i < n_tokens * n_heads * head_dim; i++) {
+                float v = xb_batch[i];
+                if (isnan(v)) nan_cnt++;
+                sum += v; sum2 += (double)v * v;
+            }
+            /* checksum Q input and first 64 K/V rows of kv head 0 */
+            for (int i = 0; i < n_tokens * n_heads * head_dim; i++) {
+                float v = q_batch[i];
+                qsum += v; 
+            }
+            for (int p = 0; p < n_tokens + start_pos; p++) {
+                const uint16_t *kp = (const uint16_t *)(kcache + (size_t)p * kv_row_size_k);
+                const uint16_t *vp = (const uint16_t *)(vcache + (size_t)p * kv_row_size_v);
+                for (int d = 0; d < head_dim; d++) {
+                    ksum += fp16_to_fp32_lookup(kp[d]);
+                    vsum += fp16_to_fp32_lookup(vp[d]);
+                }
+            }
+            {
+                int ntok_dbg = n_tokens < 129 ? n_tokens : 129;
+                fprintf(stderr, "[ATTN-CALL %d] nt=%d sp=%d out.sum=%.4f out.sum2=%.4f nan=%d q.sum=%.4f k0.sum=%.4f v0.sum=%.4f tiled=%d per_tok=[",
+                    _dbg_call, n_tokens, start_pos, sum, sum2, nan_cnt, qsum, ksum, vsum, _use_tiled);
+                for (int t = 0; t < ntok_dbg; t++) {
+                    double ts_ = 0;
+                    for (int h = 0; h < n_heads * head_dim; h++) ts_ += xb_batch[(size_t)t * xb_stride + h];
+                    fprintf(stderr, "%s%.6f", t ? "," : "", ts_);
+                }
+                fprintf(stderr, "]\n");
+                const char *dumpf = getenv("PICOLM_ATTN_DUMP_FILE");
+                if (dumpf && (_dbg_call == 1 || _dbg_call == 2)) {
+                    char p2[512];
+                    snprintf(p2, sizeof(p2), "%s.call%d", dumpf, _dbg_call);
+                    FILE *df = fopen(p2, "wb");
+                    if (df) { fwrite(xb_batch, sizeof(float), (size_t)n_tokens * xb_stride, df); fclose(df); }
+                }
+            }
+        }
     }
 }
 
@@ -1448,7 +1563,31 @@ static void batch_attention_tiled(
     size_t tv_per     = (size_t)tile * head_dim * sizeof(float);
     size_t scratch_per_task = scores_per + 2*ms_per + acc_per + qr_per + tk_per + tv_per;
     size_t total_scratch = (size_t)max_concurrent * scratch_per_task;
-    uint8_t *scratch_pool = malloc(total_scratch);
+
+    /* Scratch pool: pre-allocated, sliced per concurrent task.
+     * Uses mmap + guard page on UNIX to catch overflows; malloc on WIN32.
+     * Guard page requires page-aligned boundary -- if mprotect fails we
+     * fall back to malloc so cleanup can't mix free() and munmap(). */
+    uint8_t *scratch_pool;
+    int scratch_is_mmap = 0;
+#ifndef _WIN32
+    {
+        size_t pg = (size_t)getpagesize();
+        size_t aligned = (total_scratch + pg - 1) & ~(pg - 1);
+        uint8_t *pool = mmap(NULL, aligned + pg,
+                             PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (pool != MAP_FAILED &&
+            mprotect(pool + aligned, pg, PROT_NONE) == 0) {
+            scratch_pool = pool;
+            scratch_is_mmap = 1;
+        } else {
+            scratch_pool = malloc(total_scratch);
+        }
+        (void)pg;
+    }
+#else
+    scratch_pool = malloc(total_scratch);
+#endif
     if (!scratch_pool) {
         /* OOM: fall back to the per-(token,head) non-tiled path */
         prefill_attn_ctx_t ctx;
@@ -1484,6 +1623,12 @@ static void batch_attention_tiled(
      * stride = active, in-flight indices are t + w*active, so idx % active
      * is unique per in-flight task (given max_concurrent >= active). */
     tensor_parallel_for_strided(n_tasks, batch_tiled_task, &bctx);
-    free(scratch_pool);
+    /* Release the pool */
+    if (scratch_is_mmap) {
+        size_t pg = (size_t)getpagesize();
+        size_t aligned = (total_scratch + pg - 1) & ~(pg - 1);
+        munmap(scratch_pool, aligned + pg);
+    } else {
+        free(scratch_pool);
+    }
 }
-
