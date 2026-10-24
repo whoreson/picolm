@@ -3077,16 +3077,19 @@ void picolm_gemm_selftest(void) {
         block_q8_0 *xq = malloc(sizeof(block_q8_0) * k_blocks);
         float *xd = malloc(sizeof(float) * k_blocks);
         for (int i = 0; i < m * k_blocks; i++) {
-            for (int j = 0; j < 32; j++) {
+            for (int j = 0; j < 32; j++)
                 w8[i].qs[j] = (int8_t)(gemm_st_rand(&rng) >> 24);
+            for (int j = 0; j < 16; j++)
                 w4[i].qs[j] = (uint8_t)(gemm_st_rand(&rng) >> 24);
-            }
             w8[i].d = fp32_to_fp16(gemm_st_frand(&rng, 0.001f, 0.05f));
             w4[i].d = fp32_to_fp16(gemm_st_frand(&rng, 0.001f, 0.05f));
         }
         for (int i = 0; i < k_blocks; i++) {
-            for (int j = 0; j < 32; j++)
-                xq[i].qs[j] = (int8_t)(gemm_st_rand(&rng) >> 24);
+            for (int j = 0; j < 32; j++) {
+                int8_t v = (int8_t)(gemm_st_rand(&rng) >> 24);
+                if (v == -128) v = -127; /* quantizer saturates to [-127,127] */
+                xq[i].qs[j] = v;
+            }
             xq[i].d = fp32_to_fp16(gemm_st_frand(&rng, 0.001f, 0.05f));
             xd[i] = fp16_to_fp32_lookup(xq[i].d);
         }
@@ -3110,8 +3113,11 @@ void picolm_gemm_selftest(void) {
             A[i].d = fp32_to_fp16(gemm_st_frand(&rng, 0.001f, 0.05f));
         }
         for (int i = 0; i < n * k_blocks; i++) {
-            for (int j = 0; j < 32; j++)
-                B[i].qs[j] = (int8_t)(gemm_st_rand(&rng) >> 24);
+            for (int j = 0; j < 32; j++) {
+                int8_t v = (int8_t)(gemm_st_rand(&rng) >> 24);
+                if (v == -128) v = -127; /* quantizer saturates to [-127,127] */
+                B[i].qs[j] = v;
+            }
             B[i].d = fp32_to_fp16(gemm_st_frand(&rng, 0.001f, 0.05f));
             B_d[i] = fp16_to_fp32_lookup(B[i].d);
         }
@@ -3163,8 +3169,11 @@ void picolm_gemm_selftest(void) {
             A[i].d = fp32_to_fp16(gemm_st_frand(&rng, 0.001f, 0.05f));
         }
         for (int i = 0; i < n * k_blocks; i++) {
-            for (int j = 0; j < 32; j++)
-                B[i].qs[j] = (int8_t)(gemm_st_rand(&rng) >> 24);
+            for (int j = 0; j < 32; j++) {
+                int8_t v = (int8_t)(gemm_st_rand(&rng) >> 24);
+                if (v == -128) v = -127; /* quantizer saturates to [-127,127] */
+                B[i].qs[j] = v;
+            }
             B[i].d = fp32_to_fp16(gemm_st_frand(&rng, 0.001f, 0.05f));
             B_d[i] = fp16_to_fp32_lookup(B[i].d);
         }
