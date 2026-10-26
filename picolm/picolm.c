@@ -1,6 +1,7 @@
 #include "model.h"
 #include "tensor.h"
 #include "tokenizer.h"
+#include "steer.h"
 #include "sampler.h"
 #include "grammar.h"
 #include "qwen_tokenize.h"
@@ -1146,6 +1147,10 @@ int main(int argc, char **argv) {
             server_host[sizeof(server_host) - 1] = '\0';
         } else if (strcmp(argv[i], "--json") == 0) {
             json_mode = 1;
+        } else if (strcmp(argv[i], "--steer") == 0 && i + 1 < argc) {
+            if (steer_add(argv[++i])) { fprintf(stderr, "ERROR: bad --steer spec '%s' (want LAYER:NEURON:DOSE, e.g. 14:8949:+1)\n", argv[i]); return 1; }
+        } else if (strcmp(argv[i], "--steer-norm") == 0 && i + 1 < argc) {
+            if (steer_set_norm(argv[++i])) { fprintf(stderr, "ERROR: bad --steer-norm spec '%s' (want LAYER:NORM)\n", argv[i]); return 1; }
         } else if (strcmp(argv[i], "--cache") == 0 && i + 1 < argc) {
             cache_file = argv[++i];
         } else if (strcmp(argv[i], "--mem") == 0 && i + 1 < argc) {
@@ -1522,6 +1527,12 @@ int main(int argc, char **argv) {
         }
     }
 #endif
+    /* Steering hooks live in the CPU forward passes only: keep the residual on the host. */
+    if (steer_active() && getenv("PICOLM_GPU")) {
+        fprintf(stderr, "steer: --steer is CPU-only, ignoring PICOLM_GPU\n");
+        unsetenv("PICOLM_GPU");
+    }
+
     /* Guard: TQ3 is too lossy for mixed-mode. Require TQ3/TQ3 pairing. */
     if ((kv_type_k == KV_CACHE_TQ3 && kv_type_v != KV_CACHE_TQ3) ||
         (kv_type_v == KV_CACHE_TQ3 && kv_type_k != KV_CACHE_TQ3)) {
@@ -1625,6 +1636,22 @@ int main(int argc, char **argv) {
     grammar_init(&grammar, json_mode ? GRAMMAR_JSON : GRAMMAR_NONE, &tokenizer);
     if (json_mode) {
         fprintf(stderr, "JSON grammar mode enabled\n");
+    }
+
+    /* Neuron steering: extract W_down columns, calibrate median residual norms on a clean
+     * CPU pass, build per-layer vectors. Must run before the KV cache is loaded (the
+     * calibration pass overwrites KV/SSM state), and a cache made with steering on/off
+     * would not be interchangeable anyway, so the cache is disabled while steering. */
+    if (steer_active()) {
+        if (cache_file) { fprintf(stderr, "steer: --cache disabled while steering\n"); cache_file = NULL; }
+        const char *ct = steer_calib_text();
+        int cmax = (int)strlen(ct) + 16;
+        int *ctoks = (int *)malloc((size_t)cmax * sizeof(int));
+        int cn = use_qwen_tok ? qwen_tokenize_encode(&qwen_enc, ct, ctoks, cmax)
+                              : tokenizer_encode(&tokenizer, ct, ctoks, cmax, model.tok_add_bos);
+        int sr = steer_init(&model) || steer_calibrate(&model, ctoks, cn);
+        free(ctoks);
+        if (sr) { fprintf(stderr, "ERROR: steering setup failed\n"); model_free(&model); return 1; }
     }
 
     /* Try to load KV cache (skip prefill for cached prompt) */

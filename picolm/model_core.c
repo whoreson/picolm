@@ -2,6 +2,7 @@
 #include "model_internal.h"
 #include "tensor.h"
 #include "quant.h"
+#include "steer.h"
 
 /* SSM verification debug: guarded by compile-time PICOLM_SSM_VERIFY define.
  * When undefined, the macro expands to 0, eliminating all debug code at compile time.
@@ -2751,6 +2752,7 @@ float *model_forward(model_t *m, int token, int pos) {
             float *ssm_residual = s->xb2;
             ssm_forward(m, s, s->x, ssm_residual, lw, l, pos, NULL);
 #endif
+            steer_hook(l, s->x, 1, dim, pos);
 #ifdef PICOLM_VIZ
             viz_push_layer(l, s->x, dim);
 #endif
@@ -3175,6 +3177,7 @@ float *model_forward(model_t *m, int token, int pos) {
 ffn_done:
 #endif
         }
+        steer_hook(l, s->x, 1, dim, pos);
         /* DEBUG: dump post-layer residual for first few layers */
         if (getenv("PICOLM_DBG_LAYER") && pos <= 4 && l < 3) {
             fprintf(stderr, "[LNDBG] LLM decode l=%d pos=%d s->x[0:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
@@ -4499,6 +4502,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                     memcpy(x_batch + bi * dim, s->x, dim * sizeof(float));
                 }
             }
+            steer_hook(l, x_batch, n_tokens, dim, start_pos);
 #ifdef PICOLM_VIZ
             /* Push the last token in the batch for visualization */
             viz_push_layer(l, x_batch + (n_tokens - 1) * dim, dim);
@@ -4961,6 +4965,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                 }
             }
         }
+        steer_hook(l, x_batch, n_tokens, dim, start_pos);
         /* Per-layer RMS tracking (CPU) */
         /* Per-layer RMS tracking (debug only, disabled) */
         /* if ((l % 5 == 0 || l >= c->n_layers - 3) && n_tokens == 1) { ... } */

@@ -55,7 +55,7 @@ endif
 # model.c has been split into modular files
 MODEL_SRCS = model_core.c model_attention.c model_moe.c model_gemma3n.c model_ssm.c model_kv_cache.c model_gguf.c
 SGEMM_SRCS = sgemm.c sgemm_q4_0x8.c sgemm_q4i_0x8.c sgemm_q4_0_r8.c sgemm_q8_0_r8.c sgemm_q8_k_r8.c sgemm_q8_k_r8_neon.c sgemm_iq2_k.c sgemm_iq2_k_r4.c sgemm_iq3_k.c sgemm_iq3_k_r4.c sgemm_iq4_k.c sgemm_iq4_nl_r4.c sgemm_q4_k_r4.c sgemm_q6_k_r4.c sgemm_iq6_k.c sgemm_iq4_xs.c
-SRCS    = picolm.c $(MODEL_SRCS) tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) tokenizer.c qwen_tokenize.c sampler.c grammar.c cJSON.c server.c csafetensors.c json.c safetensors.c
+SRCS    = picolm.c $(MODEL_SRCS) steer.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) tokenizer.c qwen_tokenize.c sampler.c grammar.c cJSON.c server.c csafetensors.c json.c safetensors.c
 OBJS    = $(SRCS:.c=.o)
 TARGET  = picolm
 
@@ -184,9 +184,10 @@ endif
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # Header dependencies
-picolm.o: picolm.c quant.h tensor.h model.h tokenizer.h sampler.h grammar.h
+picolm.o: picolm.c quant.h tensor.h model.h tokenizer.h sampler.h grammar.h steer.h
+steer.o: steer.c steer.h model.h quant.h
 viz.o:  viz.c  viz.h
-model_core.o:   model_core.c  model.h quant.h tensor.h model_internal.h
+model_core.o:   model_core.c  model.h quant.h tensor.h model_internal.h steer.h
 model_gguf.o:   model_gguf.c  model.h quant.h tensor.h model_internal.h
 model_attention.o: model_attention.c  model.h quant.h tensor.h model_internal.h
 model_moe.o:    model_moe.c  model.h quant.h tensor.h model_internal.h

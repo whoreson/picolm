@@ -1624,11 +1624,14 @@ static void batch_attention_tiled(
      * is unique per in-flight task (given max_concurrent >= active). */
     tensor_parallel_for_strided(n_tasks, batch_tiled_task, &bctx);
     /* Release the pool */
+#ifndef _WIN32
     if (scratch_is_mmap) {
         size_t pg = (size_t)getpagesize();
         size_t aligned = (total_scratch + pg - 1) & ~(pg - 1);
         munmap(scratch_pool, aligned + pg);
-    } else {
+    } else
+#endif
+    {
         free(scratch_pool);
     }
 }
