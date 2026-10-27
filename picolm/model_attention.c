@@ -758,7 +758,9 @@ static void batch_tiled_task(int task_idx, void *ctx_ptr) {
         int kv_t1 = kv_t0 + tile;
         if (kv_t1 > start_pos + n_tokens) kv_t1 = start_pos + n_tokens;
         int first_pos = start_pos + q_group_start;
-        if (kv_t0 > first_pos) continue;
+        /* Stop once the tile starts past the last row of this group.
+         * (Do NOT also skip tiles past first_pos: when start_pos is not a
+         * multiple of the tile size, the group's rows straddle KV tiles.) */
         if (kv_t0 >= start_pos + q_group_end) break;
 
         /* Skip tiles entirely BEFORE every row's SWA window */
@@ -771,7 +773,10 @@ static void batch_tiled_task(int task_idx, void *ctx_ptr) {
         int this_tile_size = kv_t1 - kv_t0;
         if (this_tile_size <= 0) continue;
 
-        int is_diag = (kv_t0 <= first_pos) && (kv_t1 > first_pos);
+        /* Causal masking is needed whenever the tile has a column beyond the
+         * FIRST row's position. Equals the old diagonal test when start_pos is
+         * tile-aligned, but also covers unaligned starts. */
+        int is_diag = (kv_t1 - 1 > first_pos);
 
         /* Extract K-tile into contiguous scratch */
         {
@@ -931,9 +936,8 @@ void batch_attention_layer(
      * The tiled path requires F16 KV cache (which is what the store loop
      * always writes). Q8_0/Q4_0 cache types are a planned enhancement.
      *
-     * XXX: Tiled prefill attention is broken since commit 540d68a.
-     * Disabled until the regression is fixed. See:
-     * /data4/work/notes/picolm/tiled_attn_regression.md */
+     * Verified against the grouped path by test_attn_diff (see
+     * test_attn_diff_sweep.sh), including unaligned start_pos. */
     static int _layer_call = 0;
     int _layer_idx = _layer_call++;
     int _use_tiled = n_tokens >= 2 * ATTN_TILE &&

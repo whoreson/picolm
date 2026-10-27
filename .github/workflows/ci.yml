@@ -93,6 +93,18 @@ jobs:
             exit 1
           fi
 
+      - name: Run test_attn_tiled
+        working-directory: ./picolm
+        run: |
+          make test_attn_tiled CC=gcc
+          ./test_attn_tiled 2>&1 | tee /tmp/test_attn_tiled.txt
+          if grep -q "ALL TESTS PASSED" /tmp/test_attn_tiled.txt; then
+            echo "PASS: test_attn_tiled all tests passed"
+          else
+            echo "FAIL: test_attn_tiled did not report ALL TESTS PASSED"
+            exit 1
+          fi
+
       - name: Run GEMM self-test
         working-directory: ./picolm
         run: |

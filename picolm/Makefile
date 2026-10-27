@@ -287,7 +287,7 @@ clean:
 	-$(RM) $(TARGET) $(TARGET).exe $(OBJS) $(VIZ_OBJS) backend_metal.o backend_vulkan.o
 	-$(RM) $(GPU_SRCS:%.cu=%-hip.o) $(GPU_SRCS:%.cu=%-cuda.o) backend_gpu.dlink.o
 	-$(RM) shaders/*.spv
-	-$(RM) test_swa test_swa.exe test_quant
+	-$(RM) test_swa test_swa.exe test_quant test_attn_tiled test_attn_tiled.exe
 
 .PHONY: asan
 asan:
@@ -728,6 +728,9 @@ test_q6_k_r4: tests/test_q6_k_r4.c quant.c sgemm_q6_k_r4.c
 
 test_swa: tests/test_swa.c model_attention.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS)
 	$(CC) $(CFLAGS) -I. -O2 -o $@ tests/test_swa.c model_attention.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
+
+test_attn_tiled: tests/test_attn_tiled.c model_attention.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS)
+	$(CC) $(CFLAGS) -I. -O2 -o $@ tests/test_attn_tiled.c model_attention.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
 
 gguf_be_swap: util/gguf_be_swap.c
 	$(CC) -O2 -std=c99 -o $@ util/gguf_be_swap.c -lm
