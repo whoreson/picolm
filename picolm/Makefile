@@ -287,7 +287,7 @@ clean:
 	-$(RM) $(TARGET) $(TARGET).exe $(OBJS) $(VIZ_OBJS) backend_metal.o backend_vulkan.o
 	-$(RM) $(GPU_SRCS:%.cu=%-hip.o) $(GPU_SRCS:%.cu=%-cuda.o) backend_gpu.dlink.o
 	-$(RM) shaders/*.spv
-	-$(RM) test_swa test_swa.exe test_quant test_attn_tiled test_attn_tiled.exe
+	-$(RM) test_swa test_swa.exe test_quant test_attn_tiled test_attn_tiled.exe test_attn_diff test_attn_diff.exe
 
 .PHONY: asan
 asan:
@@ -731,6 +731,19 @@ test_swa: tests/test_swa.c model_attention.c tensor.c type_dispatch.c quant.c $(
 
 test_attn_tiled: tests/test_attn_tiled.c model_attention.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS)
 	$(CC) $(CFLAGS) -I. -O2 -o $@ tests/test_attn_tiled.c model_attention.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
+
+# Same flag construction as 'make native', so the test exercises the production
+# SIMD kernels (AVX-512/AVX2/NEON) instead of the scalar fallback.
+TEST_NATIVE_CFLAGS = $(CFLAGS) -march=native $(call simd_flags_for,-march=native) $(call simd_defines_for,-march=native) $(if $(filter 1,$(call _have_neon,-march=native)),-DPICOLM_NEON,) $(if $(filter 1,$(call _have_i8mm,-march=native)),-DPICOLM_I8MM,)
+
+# Depends on the real sources (like test_swa) so it can never be stale.
+test_attn_diff: test_attn_diff.c model_attention.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) model.h model_internal.h
+	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O2 -o $@ test_attn_diff.c model_attention.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
+
+# Tiled-vs-grouped attention regression sweep (rebuilds the test first).
+.PHONY: check-attn
+check-attn: test_attn_diff
+	./tests/test_attn_diff_sweep.sh ./test_attn_diff
 
 gguf_be_swap: util/gguf_be_swap.c
 	$(CC) -O2 -std=c99 -o $@ util/gguf_be_swap.c -lm

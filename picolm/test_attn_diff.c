@@ -80,8 +80,11 @@ static void fill_cache(test_ctx_t *tc) {
     for (int p = 0; p < total; p++) {
         uint16_t *krow = (uint16_t *)(tc->kcache + (size_t)p * tc->kv_row_size_k);
         uint16_t *vrow = (uint16_t *)(tc->vcache + (size_t)p * tc->kv_row_size_v);
+        const char *kr = getenv("PICOLM_TEST_KRAMP");   /* K scale grows with position */
+        float kramp = kr ? (float)atof(kr) : 0.0f;
+        float kscale = 1.0f + kramp * (float)p / (float)total;
         for (int i = 0; i < n_kv * hd; i++) {
-            krow[i] = fp32_to_fp16(frand());
+            krow[i] = fp32_to_fp16(frand() * kscale);
             vrow[i] = fp32_to_fp16(frand());
         }
     }
@@ -91,8 +94,10 @@ static void fill_queries(test_ctx_t *tc) {
     int nh = tc->n_heads, hd = tc->head_dim;
     if (g_dump_file) return; /* loaded from dump */
     tc->q_batch = malloc((size_t)tc->n_tokens * nh * hd * sizeof(float));
+    const char *qs = getenv("PICOLM_TEST_QSCALE");  /* >1 => peaky softmax, large scores */
+    float qscale = qs ? (float)atof(qs) : 1.0f;
     for (int i = 0; i < tc->n_tokens * nh * hd; i++)
-        tc->q_batch[i] = frand() * 2.0f;
+        tc->q_batch[i] = frand() * 2.0f * qscale;
 }
 
 static void run_path(test_ctx_t *tc, float *out, int use_tiled) {
@@ -113,6 +118,8 @@ static double max_abs_diff(float *a, float *b, size_t n, size_t *at) {
     double md = 0; *at = 0;
     for (size_t i = 0; i < n; i++) {
         double d = fabs((double)a[i] - (double)b[i]);
+        /* NaN/Inf must fail: 'd > md' is false for NaN and would hide it. */
+        if (!isfinite(d)) d = INFINITY;
         if (d > md) { md = d; *at = i; }
     }
     return md;
@@ -163,7 +170,25 @@ int main(int argc, char **argv) {
         }
     }
     fprintf(stderr, "[dbg] call1 sum=%.6f  call2 sum=%.6f\n", s1, s2);
+    {   /* Optional timing: PICOLM_TEST_REPS=N -> median ms/call of the tiled path */
+        const char *rp = getenv("PICOLM_TEST_REPS");
+        int reps = rp ? atoi(rp) : 0;
+        if (reps > 0) {
+            double *tm = malloc((size_t)reps * sizeof(double));
+            for (int r = 0; r < reps; r++) {
+                double t0 = get_time_ms();
+                run_path(&tc, tc.xb_tiled, 1);
+                tm[r] = get_time_ms() - t0;
+            }
+            for (int i = 1; i < reps; i++) { double v = tm[i]; int j = i - 1;
+                while (j >= 0 && tm[j] > v) { tm[j+1] = tm[j]; j--; } tm[j+1] = v; }
+            printf("TIMING: tiled median=%.3f ms  min=%.3f ms  (reps=%d)\n", tm[reps/2], tm[0], reps);
+            free(tm);
+        }
+    }
     double md = max_abs_diff(tc.xb_ref, tc.xb_tiled, n, &at);
+    const char *tl = getenv("PICOLM_TEST_TOL");
+    double tol = tl ? atof(tl) : 1e-4;   /* baseline f32 noise is ~1e-7 */
     double rms_ref = 0, rms_tiled = 0;
     for (size_t i = 0; i < n; i++) {
         rms_ref += (double)tc.xb_ref[i] * tc.xb_ref[i];
@@ -173,6 +198,6 @@ int main(int argc, char **argv) {
     printf("RESULT: max_abs_diff=%.6g at [%zu] (tok %zu head %zu dim %zu)\n"
            "        rms_ref=%.6g rms_tiled=%.6g  %s\n",
            md, at, at / tc.xb_stride, (at % tc.xb_stride) / head_dim, at % head_dim,
-           rms_ref, rms_tiled, md < 1e-3 ? "MATCH" : "*** MISMATCH ***");
-    return md < 1e-3 ? 0 : 1;
+           rms_ref, rms_tiled, md < tol ? "MATCH" : "*** MISMATCH ***");
+    return md < tol ? 0 : 1;
 }

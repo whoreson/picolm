@@ -631,6 +631,12 @@ static void prefill_attn_task_grouped(int flat_idx, void *ctx_ptr) {
 
 /* Tiled attention: tile size in KV positions */
 #define ATTN_TILE 64
+
+/* Lazy online-softmax rescale threshold (ln units, ~e^8 = 2981x headroom).
+ * 0 = only skip when the running max did not change. */
+#ifndef ATTN_LAZY_RESCALE_THRESH
+#define ATTN_LAZY_RESCALE_THRESH 8.0f
+#endif
 typedef struct {
     int kv_h;
     int kv_mul;
@@ -1259,27 +1265,37 @@ static void attn_process_tile(attn_tile_task_t *t) {
         }
 #endif
 
-        /* Update running M and compute correction */
+        /* Update running M. Rescale S/acc only when the max grows by more than
+         * ATTN_LAZY_RESCALE_THRESH (natural-log units). Otherwise keep the
+         * stale M: the exp arguments may then be slightly positive (<= THRESH,
+         * far from float32 overflow) but acc/S stay mutually consistent, so
+         * the final acc/S is mathematically unchanged. THRESH = 0 gives the
+         * exact "skip when the max did not move" behaviour. This removes a
+         * scalar expf plus an acc/S pass for most (row, tile) pairs. */
         float old_M = t->M[i];
-        float new_M = (rmax > old_M) ? rmax : old_M;
-        t->M[i] = new_M;
-        float corr = expf(old_M - new_M);
+        float new_M = old_M;
+        if (rmax > old_M + ATTN_LAZY_RESCALE_THRESH) {
+            new_M = rmax;
+            t->M[i] = new_M;
+            float corr = expf(old_M - new_M);
 
-        /* Scale old S and acc by correction */
-        t->S[i] *= corr;
-        float *acc_row = t->acc + i * hd;
+            /* Scale old S and acc by correction */
+            t->S[i] *= corr;
+            float *acc_row = t->acc + i * hd;
 #if defined(PICOLM_AVX512)
-        {
-            __m512 vc = _mm512_set1_ps(corr);
-            for (int d = 0; d + 15 < hd; d += 16)
-                _mm512_storeu_ps(acc_row + d, _mm512_mul_ps(_mm512_loadu_ps(acc_row + d), vc));
-            for (int d = (hd / 16) * 16; d < hd; d++)
-                acc_row[d] *= corr;
-        }
+            {
+                __m512 vc = _mm512_set1_ps(corr);
+                for (int d = 0; d + 15 < hd; d += 16)
+                    _mm512_storeu_ps(acc_row + d, _mm512_mul_ps(_mm512_loadu_ps(acc_row + d), vc));
+                for (int d = (hd / 16) * 16; d < hd; d++)
+                    acc_row[d] *= corr;
+            }
 #else
-        for (int d = 0; d < hd; d++)
-            acc_row[d] *= corr;
+            for (int d = 0; d < hd; d++)
+                acc_row[d] *= corr;
 #endif
+        }
+        float *acc_row = t->acc + i * hd;
 
         /* Compute exp(s[j] - new_M) for this row and accumulate.
          * Vectorized: all arguments are <= 0 (since new_M >= rmax >= srow[j]),

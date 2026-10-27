@@ -20,3 +20,4 @@ probes/metal_matmul_bench
 real
 *.spv
 *.o.dos
+test_attn_diff
