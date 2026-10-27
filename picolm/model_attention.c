@@ -632,7 +632,13 @@ static void prefill_attn_task_grouped(int flat_idx, void *ctx_ptr) {
 /* Tiled attention: tile size in KV positions */
 #define ATTN_TILE 64
 
-/* Lazy online-softmax rescale threshold (ln units, ~e^8 = 2981x headroom).
+/* The tiled path keeps scores in the log2 domain (Q is pre-scaled by
+ * attn_scale * log2(e)), so softmax weights are 2^(s - M): this removes the
+ * x*log2(e) multiply and the ln2 range-reduction step from the exp kernel.
+ * M, S and acc are internally consistent in that domain; acc/S is unchanged. */
+#define ATTN_LOG2E 1.4426950408889634f
+
+/* Lazy online-softmax rescale threshold (log2 units, 2^8 = 256x headroom).
  * 0 = only skip when the running max did not change. */
 #ifndef ATTN_LAZY_RESCALE_THRESH
 #define ATTN_LAZY_RESCALE_THRESH 8.0f
@@ -741,13 +747,14 @@ static void batch_tiled_task(int task_idx, void *ctx_ptr) {
      * tile visit, ~884K total for a 3037-token prefill). The scale is
      * applied once per Q row (n_q*hd multiplies) instead of once per
      * score element (n_q*ts multiplies per tile). */
+    const float q_scale_log2 = bc->attn_scale * ATTN_LOG2E;  /* scores come out in log2 units */
     for (int ti = 0; ti < n_q; ti++) {
         const float *q_tok = bc->q_batch + (size_t)(q_group_start + ti) * bc->n_heads * head_dim;
         for (int g = 0; g < kv_mul; g++) {
             const float *qh = q_tok + (kv_h * kv_mul + g) * head_dim;
             float *qr = q_rows + ((size_t)ti * kv_mul + g) * head_dim;
             for (int d = 0; d < head_dim; d++)
-                qr[d] = qh[d] * bc->attn_scale;
+                qr[d] = qh[d] * q_scale_log2;
         }
     }
 
@@ -1169,8 +1176,8 @@ static void attn_process_tile(attn_tile_task_t *t) {
      * loop or a non-pool dispatch mechanism. */
     matmul_batch(t->scores, t->q_rows, n_q, t->tile_k, hd, ts, t->kv_gguf_k);
 
-    /* NOTE: attn_scale is pre-applied to q_rows during gather, so no
-     * per-tile score scaling needed here. */
+    /* NOTE: attn_scale * log2(e) is pre-applied to q_rows during gather, so
+     * scores are in the log2 domain and no per-tile scaling is needed here. */
 
     /* Causal masking for diagonal tile: for each query row i,
      * only positions [0, i_within_group] are valid.
@@ -1253,10 +1260,7 @@ static void attn_process_tile(attn_tile_task_t *t) {
         int j = 1;
         for (; j + 15 < ts; j += 16)
             vmax = _mm512_max_ps(vmax, _mm512_loadu_ps(srow + j));
-        float marr[16];
-        _mm512_storeu_ps(marr, vmax);
-        float rmax = marr[0];
-        for (int c = 1; c < 16; c++) if (marr[c] > rmax) rmax = marr[c];
+        float rmax = _mm512_reduce_max_ps(vmax);
         for (; j < ts; j++) if (srow[j] > rmax) rmax = srow[j];
 #else
         float rmax = srow[0];
@@ -1266,18 +1270,17 @@ static void attn_process_tile(attn_tile_task_t *t) {
 #endif
 
         /* Update running M. Rescale S/acc only when the max grows by more than
-         * ATTN_LAZY_RESCALE_THRESH (natural-log units). Otherwise keep the
-         * stale M: the exp arguments may then be slightly positive (<= THRESH,
+         * ATTN_LAZY_RESCALE_THRESH (log2 units). Otherwise keep the
+         * stale M: the 2^x arguments may then be slightly positive (<= THRESH,
          * far from float32 overflow) but acc/S stay mutually consistent, so
          * the final acc/S is mathematically unchanged. THRESH = 0 gives the
-         * exact "skip when the max did not move" behaviour. This removes a
-         * scalar expf plus an acc/S pass for most (row, tile) pairs. */
+         * exact "skip when the max did not move" behaviour. */
         float old_M = t->M[i];
         float new_M = old_M;
         if (rmax > old_M + ATTN_LAZY_RESCALE_THRESH) {
             new_M = rmax;
             t->M[i] = new_M;
-            float corr = expf(old_M - new_M);
+            float corr = exp2f(old_M - new_M);
 
             /* Scale old S and acc by correction */
             t->S[i] *= corr;
@@ -1297,68 +1300,57 @@ static void attn_process_tile(attn_tile_task_t *t) {
         }
         float *acc_row = t->acc + i * hd;
 
-        /* Compute exp(s[j] - new_M) for this row and accumulate.
-         * Vectorized: all arguments are <= 0 (since new_M >= rmax >= srow[j]),
-         * so a fast polynomial approximation suffices (no overflow check). */
+        /* Compute 2^(s[j] - new_M) for this row and accumulate. Scores are in
+         * the log2 domain (see ATTN_LOG2E). With the lazy rescale above the
+         * argument can be slightly positive (<= ATTN_LAZY_RESCALE_THRESH). */
         float rsum = 0.0f;
 #if defined(PICOLM_AVX512)
         {
             __m512 vm = _mm512_set1_ps(new_M);
             __m512 vsum = _mm512_setzero_ps();
-            __m512 vzero = _mm512_setzero_ps();
+            const __m512 vlo = _mm512_set1_ps(-125.0f);
             int j = 0;
             for (; j + 15 < ts; j += 16) {
                 __m512 x = _mm512_sub_ps(_mm512_loadu_ps(srow + j), vm);
-                /* Clamp: if x < -88, exp(x) underflows to 0 in float32.
-                 * For masked scores (-1e30), x is huge negative and the
-                 * range-reduction (rn * ln2) loses precision, producing
-                 * garbage r that overflows the Taylor polynomial to inf,
-                 * then inf * -0.0 = NaN. Clamp to -88 to avoid this. */
-                __mmask16 valid_mask = _mm512_cmp_ps_mask(x, _mm512_set1_ps(-88.0f), _CMP_GE_OQ);
-                __m512 x_clamped = _mm512_mask_blend_ps(~valid_mask, x, vzero);
-                /* exp(x) = 2^(x * log2(e)):
-                 *   n = round(x * log2e)
-                 *   r = x - n * ln2  (in [-ln2/2, ln2/2])
-                 *   2^n via bit manipulation of the exponent field
-                 *   exp(r) via degree-7 Taylor polynomial */
-                __m512 t = _mm512_mul_ps(x_clamped, _mm512_set1_ps(1.4426950408889634f));
-                __m512 rn = _mm512_roundscale_ps(t, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-                __m512 r = _mm512_fnmadd_ps(rn, _mm512_set1_ps(0.6931471805599453f), x_clamped);
-                /* 2^(rn): rn * 2^23 + 127*2^23 bit-trick, as float
-                 * 2^23 = 8388608.0f, 127*2^23 = 1065353216.0f (= 0x3F800000 = bits of 1.0f) */
-                __m512 p2 = _mm512_add_ps(_mm512_mul_ps(rn, _mm512_set1_ps(8388608.0f)),
-                                          _mm512_set1_ps(1065353216.0f));
-                __m512 e2 = _mm512_castsi512_ps(_mm512_cvtps_epi32(p2));
-                /* Degree-7 Taylor/minimax polynomial for exp(r), |r| <= ln2/2
-                 * Horner form: 1 + r*(1 + r/2*(1 + r/3*(...)))
-                 * Coefficients: 1/0!, 1/1!, 1/2!, ..., 1/7! */
-                __m512 p = _mm512_set1_ps(1.0f/5040.0f);        /* 1/7! */
-                p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f/720.0f));   /* 1/6! */
-                p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f/120.0f));   /* 1/5! */
-                p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f/24.0f));    /* 1/4! */
-                p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f/6.0f));     /* 1/3! */
-                p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(0.5f));          /* 1/2! */
-                p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f));          /* 1/1! */
-                __m512 er = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f));  /* + 1/0! */
-                __m512 result = _mm512_mul_ps(er, e2);
-                /* Zero out lanes that were clamped (x < -88) */
-                result = _mm512_mask_blend_ps(valid_mask, vzero, result);
+                /* Lanes below -125 (incl. masked -1e30) are forced to exactly 0.
+                 * The clamp is REQUIRED, not cosmetic: vscalefps on a denormal
+                 * result triggers a microcode assist (~29x slower measured), and
+                 * 2^-125 * p(r) >= 2^-125.5 stays a normal float. */
+                __mmask16 valid = _mm512_cmp_ps_mask(x, vlo, _CMP_GE_OQ);
+                x = _mm512_max_ps(x, vlo);
+                /* 2^x = 2^n * 2^r, n = round(x), r in [-0.5, 0.5] */
+                __m512 rn = _mm512_roundscale_ps(x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                __m512 r  = _mm512_sub_ps(x, rn);
+                /* Degree-6 minimax for 2^r on [-0.5, 0.5] with c0 == 1 exactly
+                 * (so the row max, x == 0, gets weight exactly 1.0).
+                 * Max rel error 7.9e-8 (1.3 ulp) with FMA Horner evaluation. */
+                __m512 p = _mm512_set1_ps(1.535336196e-04f);
+                p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.339887502e-03f));
+                p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(9.618436918e-03f));
+                p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(5.550332367e-02f));
+                p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(2.402264774e-01f));
+                p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(6.931471825e-01f));
+                p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f));
+                /* 2^rn via bit-trick, then multiply by polynomial.
+                 * scalef_ps (vscalefps) is fast on SKL+ but slow on Cascade Lake
+                 * (microcode assist). The bit-trick is fast everywhere. */
+                __m512 e2 = _mm512_castsi512_ps(
+                    _mm512_cvtps_epi32(_mm512_add_ps(
+                        _mm512_mul_ps(rn, _mm512_set1_ps(8388608.0f)),
+                        _mm512_set1_ps(1065353216.0f))));
+                __m512 result = _mm512_maskz_mov_ps(valid, _mm512_mul_ps(p, e2));
                 _mm512_storeu_ps(tile_exp_buf + j, result);
                 vsum = _mm512_add_ps(vsum, result);
             }
-            /* Horizontal sum + scalar tail */
-            float sarr[16];
-            _mm512_storeu_ps(sarr, vsum);
-            rsum = sarr[0] + sarr[1] + sarr[2] + sarr[3] + sarr[4] + sarr[5] + sarr[6] + sarr[7]
-                 + sarr[8] + sarr[9] + sarr[10] + sarr[11] + sarr[12] + sarr[13] + sarr[14] + sarr[15];
+            rsum = _mm512_reduce_add_ps(vsum);
             for (; j < ts; j++) {
-                tile_exp_buf[j] = expf(srow[j] - new_M);
+                tile_exp_buf[j] = exp2f(srow[j] - new_M);
                 rsum += tile_exp_buf[j];
             }
         }
 #else
         for (int j = 0; j < ts; j++) {
-            tile_exp_buf[j] = expf(srow[j] - new_M);
+            tile_exp_buf[j] = exp2f(srow[j] - new_M);
             rsum += tile_exp_buf[j];
         }
 #endif
