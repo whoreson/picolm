@@ -638,6 +638,35 @@ static void prefill_attn_task_grouped(int flat_idx, void *ctx_ptr) {
  * M, S and acc are internally consistent in that domain; acc/S is unchanged. */
 #define ATTN_LOG2E 1.4426950408889634f
 
+/* Degree-6 minimax for 2^r on [-0.5, 0.5] with c0 == 1 exactly (so the row
+ * max, x == 0, gets weight exactly 1.0). Max rel error 7.9e-8 (1.3 ulp) with
+ * FMA Horner evaluation. Shared by the AVX-512 / AVX2 / NEON kernels. */
+#define ATTN_EXP2_C6 1.535336196e-04f
+#define ATTN_EXP2_C5 1.339887502e-03f
+#define ATTN_EXP2_C4 9.618436918e-03f
+#define ATTN_EXP2_C3 5.550332367e-02f
+#define ATTN_EXP2_C2 2.402264774e-01f
+#define ATTN_EXP2_C1 6.931471825e-01f
+/* Below this the weight is forced to exactly 0. The clamp is REQUIRED: 2^x for
+ * x < -126 is denormal, which is ~29x slower on vscalefps (measured) and is
+ * not representable by the integer-exponent construction used on AVX2/NEON. */
+#define ATTN_EXP2_LO (-125.0f)
+
+#if defined(PICOLM_AVX) && !defined(PICOLM_AVX512)
+static inline float attn_hmax256(__m256 v) {
+    __m128 m = _mm_max_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    m = _mm_max_ps(m, _mm_movehl_ps(m, m));
+    m = _mm_max_ss(m, _mm_shuffle_ps(m, m, 1));
+    return _mm_cvtss_f32(m);
+}
+static inline float attn_hsum256(__m256 v) {
+    __m128 m = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    m = _mm_add_ps(m, _mm_movehl_ps(m, m));
+    m = _mm_add_ss(m, _mm_shuffle_ps(m, m, 1));
+    return _mm_cvtss_f32(m);
+}
+#endif
+
 /* Lazy online-softmax rescale threshold (log2 units, 2^8 = 256x headroom).
  * 0 = only skip when the running max did not change. */
 #ifndef ATTN_LAZY_RESCALE_THRESH
@@ -1262,6 +1291,20 @@ static void attn_process_tile(attn_tile_task_t *t) {
             vmax = _mm512_max_ps(vmax, _mm512_loadu_ps(srow + j));
         float rmax = _mm512_reduce_max_ps(vmax);
         for (; j < ts; j++) if (srow[j] > rmax) rmax = srow[j];
+#elif defined(PICOLM_AVX)
+        __m256 vmax = _mm256_set1_ps(srow[0]);
+        int j = 1;
+        for (; j + 7 < ts; j += 8)
+            vmax = _mm256_max_ps(vmax, _mm256_loadu_ps(srow + j));
+        float rmax = attn_hmax256(vmax);
+        for (; j < ts; j++) if (srow[j] > rmax) rmax = srow[j];
+#elif defined(PICOLM_NEON_AARCH64)
+        float32x4_t vmax = vdupq_n_f32(srow[0]);
+        int j = 1;
+        for (; j + 3 < ts; j += 4)
+            vmax = vmaxq_f32(vmax, vld1q_f32(srow + j));
+        float rmax = vmaxvq_f32(vmax);
+        for (; j < ts; j++) if (srow[j] > rmax) rmax = srow[j];
 #else
         float rmax = srow[0];
         for (int j = 1; j < ts; j++) {
@@ -1308,32 +1351,25 @@ static void attn_process_tile(attn_tile_task_t *t) {
         {
             __m512 vm = _mm512_set1_ps(new_M);
             __m512 vsum = _mm512_setzero_ps();
-            const __m512 vlo = _mm512_set1_ps(-125.0f);
+            const __m512 vlo = _mm512_set1_ps(ATTN_EXP2_LO);
             int j = 0;
             for (; j + 15 < ts; j += 16) {
                 __m512 x = _mm512_sub_ps(_mm512_loadu_ps(srow + j), vm);
-                /* Lanes below -125 (incl. masked -1e30) are forced to exactly 0.
-                 * The clamp is REQUIRED, not cosmetic: vscalefps on a denormal
-                 * result triggers a microcode assist (~29x slower measured), and
-                 * 2^-125 * p(r) >= 2^-125.5 stays a normal float. */
+                /* Lanes below ATTN_EXP2_LO (incl. masked -1e30) are forced to 0. */
                 __mmask16 valid = _mm512_cmp_ps_mask(x, vlo, _CMP_GE_OQ);
                 x = _mm512_max_ps(x, vlo);
                 /* 2^x = 2^n * 2^r, n = round(x), r in [-0.5, 0.5] */
                 __m512 rn = _mm512_roundscale_ps(x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
                 __m512 r  = _mm512_sub_ps(x, rn);
-                /* Degree-6 minimax for 2^r on [-0.5, 0.5] with c0 == 1 exactly
-                 * (so the row max, x == 0, gets weight exactly 1.0).
-                 * Max rel error 7.9e-8 (1.3 ulp) with FMA Horner evaluation. */
-                __m512 p = _mm512_set1_ps(1.535336196e-04f);
-                p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.339887502e-03f));
-                p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(9.618436918e-03f));
-                p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(5.550332367e-02f));
-                p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(2.402264774e-01f));
-                p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(6.931471825e-01f));
+                /* Degree-6 minimax polynomial (ATTN_EXP2_C*) */
+                __m512 p = _mm512_set1_ps(ATTN_EXP2_C6);
+                p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(ATTN_EXP2_C5));
+                p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(ATTN_EXP2_C4));
+                p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(ATTN_EXP2_C3));
+                p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(ATTN_EXP2_C2));
+                p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(ATTN_EXP2_C1));
                 p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f));
-                /* 2^rn via bit-trick, then multiply by polynomial.
-                 * scalef_ps (vscalefps) is fast on SKL+ but slow on Cascade Lake
-                 * (microcode assist). The bit-trick is fast everywhere. */
+                /* 2^rn via bit-trick (vscalefps is slow on Cascade Lake). */
                 __m512 e2 = _mm512_castsi512_ps(
                     _mm512_cvtps_epi32(_mm512_add_ps(
                         _mm512_mul_ps(rn, _mm512_set1_ps(8388608.0f)),
@@ -1343,6 +1379,74 @@ static void attn_process_tile(attn_tile_task_t *t) {
                 vsum = _mm512_add_ps(vsum, result);
             }
             rsum = _mm512_reduce_add_ps(vsum);
+            for (; j < ts; j++) {
+                tile_exp_buf[j] = exp2f(srow[j] - new_M);
+                rsum += tile_exp_buf[j];
+            }
+        }
+#elif defined(PICOLM_AVX2) && defined(__FMA__)
+        {
+            __m256 vm = _mm256_set1_ps(new_M);
+            __m256 vsum = _mm256_setzero_ps();
+            const __m256 vlo = _mm256_set1_ps(ATTN_EXP2_LO);
+            const __m256i v127 = _mm256_set1_epi32(127);
+            int j = 0;
+            for (; j + 7 < ts; j += 8) {
+                __m256 x = _mm256_sub_ps(_mm256_loadu_ps(srow + j), vm);
+                __m256 valid = _mm256_cmp_ps(x, vlo, _CMP_GE_OQ);
+                x = _mm256_max_ps(x, vlo);
+                __m256 rn = _mm256_round_ps(x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                __m256 r  = _mm256_sub_ps(x, rn);
+                __m256 p = _mm256_set1_ps(ATTN_EXP2_C6);
+                p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(ATTN_EXP2_C5));
+                p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(ATTN_EXP2_C4));
+                p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(ATTN_EXP2_C3));
+                p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(ATTN_EXP2_C2));
+                p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(ATTN_EXP2_C1));
+                p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f));
+                /* 2^n by exponent-field construction: n in [-125, ~8+], so
+                 * n + 127 is in [2, 255) and the result is a normal float. */
+                __m256i ni = _mm256_cvtps_epi32(rn);
+                __m256 pow2 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_add_epi32(ni, v127), 23));
+                __m256 result = _mm256_and_ps(_mm256_mul_ps(p, pow2), valid);
+                _mm256_storeu_ps(tile_exp_buf + j, result);
+                vsum = _mm256_add_ps(vsum, result);
+            }
+            rsum = attn_hsum256(vsum);
+            for (; j < ts; j++) {
+                tile_exp_buf[j] = exp2f(srow[j] - new_M);
+                rsum += tile_exp_buf[j];
+            }
+        }
+#elif defined(PICOLM_NEON_AARCH64)
+        {
+            float32x4_t vm = vdupq_n_f32(new_M);
+            float32x4_t vsum = vdupq_n_f32(0.0f);
+            const float32x4_t vlo = vdupq_n_f32(ATTN_EXP2_LO);
+            const int32x4_t v127 = vdupq_n_s32(127);
+            int j = 0;
+            for (; j + 3 < ts; j += 4) {
+                float32x4_t x = vsubq_f32(vld1q_f32(srow + j), vm);
+                uint32x4_t valid = vcgeq_f32(x, vlo);
+                x = vmaxq_f32(x, vlo);
+                float32x4_t rn = vrndnq_f32(x);
+                float32x4_t r  = vsubq_f32(x, rn);
+                /* vfmaq_f32(a, b, c) = a + b*c (Horner: ci + p*r) */
+                float32x4_t p = vdupq_n_f32(ATTN_EXP2_C6);
+                p = vfmaq_f32(vdupq_n_f32(ATTN_EXP2_C5), p, r);
+                p = vfmaq_f32(vdupq_n_f32(ATTN_EXP2_C4), p, r);
+                p = vfmaq_f32(vdupq_n_f32(ATTN_EXP2_C3), p, r);
+                p = vfmaq_f32(vdupq_n_f32(ATTN_EXP2_C2), p, r);
+                p = vfmaq_f32(vdupq_n_f32(ATTN_EXP2_C1), p, r);
+                p = vfmaq_f32(vdupq_n_f32(1.0f), p, r);
+                int32x4_t ni = vcvtnq_s32_f32(rn);
+                float32x4_t pow2 = vreinterpretq_f32_s32(vshlq_n_s32(vaddq_s32(ni, v127), 23));
+                float32x4_t result = vreinterpretq_f32_u32(
+                    vandq_u32(vreinterpretq_u32_f32(vmulq_f32(p, pow2)), valid));
+                vst1q_f32(tile_exp_buf + j, result);
+                vsum = vaddq_f32(vsum, result);
+            }
+            rsum = vaddvq_f32(vsum);
             for (; j < ts; j++) {
                 tile_exp_buf[j] = exp2f(srow[j] - new_M);
                 rsum += tile_exp_buf[j];
