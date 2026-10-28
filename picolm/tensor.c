@@ -3042,36 +3042,32 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
 #endif
 
     /* Fall back: per-row dispatch matching the old dual-batch's scalar_vec_dot path.
-     * The old code had an explicit if-else handler for specific types (quantizing
-     * activations to Q8_0/Q8_K), and fell through to vec_dot() with F32 activations
-     * for unhandled types. We replicate this by checking has_dual_scalar_path. */
+     * The old code quantized activations to Q8_0/Q8_K and dispatched across
+     * output rows using tensor_parallel_for(d, dual_q8_row_task, &ctx).
+     * This was ~4x faster than single-threaded fn_gemv loops for large d.
+     * We restore that behavior here. */
     if (ti1 && ti2 && ti1->fn_gemv && ti2->fn_gemv && ti1->has_dual_scalar_path && ti2->has_dual_scalar_path) {
-        /* Both sides have fn_gemv: quantize activations and dispatch per-row.
-         * For Q8_0: quantize to Q8_0 + compute FP16 round-trip deltas.
-         * For Q8_K types: quantize to Q8_K. */
         act_fmt_t af1 = ti1->act_fmt;
         act_fmt_t af2 = ti2->act_fmt;
 
-        /* Quantize side1 */
+        /* Quantize side1: separate qs + delta buffers (matching dual_q8_row_task layout) */
         size_t qstride1 = 0;
         void *qbuf1 = NULL;
         float *dbuf1 = NULL;
         if (af1 == ACT_FMT_Q8_0) {
-            /* Q8_0: buffer = qs + deltas appended */
             size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
             int nb = n / 32;
-            qstride1 = q8_rb + (size_t)nb * sizeof(float);
-            qbuf1 = malloc((size_t)n_batch * qstride1);
-            if (qbuf1) {
+            qstride1 = q8_rb;
+            qbuf1 = malloc((size_t)n_batch * q8_rb);
+            dbuf1 = (float *)malloc((size_t)n_batch * nb * sizeof(float));
+            if (qbuf1 && dbuf1) {
                 for (int b = 0; b < n_batch; b++) {
-                    char *qb = (char *)qbuf1 + b * qstride1;
-                    quantize_row_q8_0(x + b * n, qb, n);
-                    /* Compute FP16 round-trip deltas (matching old dual-batch) */
-                    const block_q8_0 *blk = (const block_q8_0 *)qb;
-                    float *db = (float *)(qb + q8_rb);
-                    for (int k = 0; k < nb; k++) db[k] = fp16_to_fp32(blk[k].d);
+                    quantize_row_q8_0(x + b * n, (char *)qbuf1 + b * q8_rb, n);
+                    const block_q8_0 *blk = (const block_q8_0 *)((char *)qbuf1 + b * q8_rb);
+                    for (int k = 0; k < nb; k++)
+                        dbuf1[(size_t)b * nb + k] = fp16_to_fp32(blk[k].d);
                 }
-            }
+            } else { free(qbuf1); free(dbuf1); qbuf1 = NULL; dbuf1 = NULL; }
         } else if (af1 == ACT_FMT_Q8_K) {
             qstride1 = gguf_type_row_size(GGUF_TYPE_Q8_K, n);
             qbuf1 = malloc((size_t)n_batch * qstride1);
@@ -3090,17 +3086,17 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
         } else if (af2 == ACT_FMT_Q8_0) {
             size_t q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, n);
             int nb = n / 32;
-            qstride2 = q8_rb + (size_t)nb * sizeof(float);
-            qbuf2 = malloc((size_t)n_batch * qstride2);
-            if (qbuf2) {
+            qstride2 = q8_rb;
+            qbuf2 = malloc((size_t)n_batch * q8_rb);
+            dbuf2 = (float *)malloc((size_t)n_batch * nb * sizeof(float));
+            if (qbuf2 && dbuf2) {
                 for (int b = 0; b < n_batch; b++) {
-                    char *qb = (char *)qbuf2 + b * qstride2;
-                    quantize_row_q8_0(x + b * n, qb, n);
-                    const block_q8_0 *blk = (const block_q8_0 *)qb;
-                    float *db = (float *)(qb + q8_rb);
-                    for (int k = 0; k < nb; k++) db[k] = fp16_to_fp32(blk[k].d);
+                    quantize_row_q8_0(x + b * n, (char *)qbuf2 + b * q8_rb, n);
+                    const block_q8_0 *blk = (const block_q8_0 *)((char *)qbuf2 + b * q8_rb);
+                    for (int k = 0; k < nb; k++)
+                        dbuf2[(size_t)b * nb + k] = fp16_to_fp32(blk[k].d);
                 }
-            }
+            } else { free(qbuf2); free(dbuf2); qbuf2 = NULL; dbuf2 = NULL; }
         } else if (af2 == ACT_FMT_Q8_K) {
             qstride2 = gguf_type_row_size(GGUF_TYPE_Q8_K, n);
             qbuf2 = malloc((size_t)n_batch * qstride2);
@@ -3110,48 +3106,33 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
             }
         }
 
-        /* Dispatch per-row using fn_gemv */
-        size_t rb1 = gguf_type_row_size(qtype1, n);
-        size_t rb2 = gguf_type_row_size(qtype2, n);
-        int rpb1 = ti1->rows_per_block;
-        int rpb2 = ti2->rows_per_block;
-        size_t bs1 = rpb1 > 1 ? rb1 * rpb1 : rb1;
-        size_t bs2 = rpb2 > 1 ? rb2 * rpb2 : rb2;
+        /* Threaded dispatch across output rows using dual_q8_row_task.
+         * Each thread processes a chunk of rows, calling vec_dot per-type
+         * for all n_batch activation columns. This restores the rc2 behavior
+         * which was ~4x faster than the single-threaded fn_gemv loop. */
+        {
+            size_t rb1 = gguf_type_row_size(qtype1, n);
+            size_t rb2 = gguf_type_row_size(qtype2, n);
 
-        for (int b = 0; b < n_batch; b++) {
-            const char *xb1 = qbuf1 ? (const char *)qbuf1 + b * qstride1 : NULL;
-            const char *xb2 = qbuf2 ? (const char *)qbuf2 + b * qstride2 : NULL;
-            if (rpb1 == 1 && rpb2 == 1) {
-                for (int i = 0; i < d; i++) {
-                    if (ti1->fn_gemv && xb1) { float r; ti1->fn_gemv((const char *)W1 + i * rb1, xb1, n, &r, 1); out1[b * d + i] = r; }
-                    else { out1[b * d + i] = vec_dot((const char *)W1 + i * rb1, x + b * n, n, qtype1); }
-                    if (ti2->fn_gemv && xb2) { float r; ti2->fn_gemv((const char *)W2 + i * rb2, xb2, n, &r, 1); out2[b * d + i] = r; }
-                    else { out2[b * d + i] = vec_dot((const char *)W2 + i * rb2, x + b * n, n, qtype2); }
-                }
-            } else {
-                /* Interleaved: process in groups */
-                int d1g = (d + rpb1 - 1) / rpb1 * rpb1;
-                int d2g = (d + rpb2 - 1) / rpb2 * rpb2;
-                int dg = d1g > d2g ? d1g : d2g;
-                for (int g = 0; g < dg; g++) {
-                    int i1 = (rpb1 == 1) ? g : (g / rpb1) * rpb1;
-                    int i2 = (rpb2 == 1) ? g : (g / rpb2) * rpb2;
-                    if (i1 >= d && i2 >= d) break;
-                    float res1[TYPE_INFO_MAX_RPB], res2[TYPE_INFO_MAX_RPB];
-                    if (ti1->fn_gemv && xb1 && i1 < d) {
-                        ti1->fn_gemv((const char *)W1 + (i1 / rpb1) * bs1, xb1, n, res1, rpb1);
-                        for (int r = 0; r < rpb1 && i1 + r < d; r++) out1[b * d + i1 + r] = res1[r];
-                    }
-                    if (ti2->fn_gemv && xb2 && i2 < d) {
-                        ti2->fn_gemv((const char *)W2 + (i2 / rpb2) * bs2, xb2, n, res2, rpb2);
-                        for (int r = 0; r < rpb2 && i2 + r < d; r++) out2[b * d + i2 + r] = res2[r];
-                    }
-                }
-            }
+            dual_q8_row_ctx_t ctx;
+            ctx.out1 = out1; ctx.out2 = out2;
+            ctx.W1 = W1; ctx.W2 = W2;
+            ctx.x = x;
+            ctx.qx1_buf = qbuf1; ctx.qx2_buf = qbuf2;
+            ctx.qx1_d = dbuf1; ctx.qx2_d = dbuf2;
+            ctx.row_bytes1 = rb1; ctx.row_bytes2 = rb2;
+            ctx.qx_stride1 = qstride1; ctx.qx_stride2 = qstride2;
+            ctx.n = n; ctx.d = d; ctx.n_batch = n_batch;
+            ctx.have_qx1 = qbuf1 != NULL; ctx.have_qx2 = qbuf2 != NULL;
+            ctx.qtype1 = qtype1; ctx.qtype2 = qtype2;
+            ctx.out1_done = 0; ctx.out2_done = 0;
+
+            tensor_parallel_for(d, dual_q8_row_task, &ctx);
         }
 
-        free(qbuf1);
+        free(qbuf1); free(dbuf1);
         if (qbuf2 && qbuf2 != qbuf1) free(qbuf2);
+        if (dbuf2 && dbuf2 != dbuf1) free(dbuf2);
         DISPATCH2("dual_fallback_gemv");
     } else {
         /* Fall back: dispatch each side independently via matmul_batch. */
