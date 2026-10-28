@@ -667,6 +667,18 @@ static inline float attn_hsum256(__m256 v) {
 }
 #endif
 
+/* Tiled-path size gate below 2*ATTN_TILE tokens. Measured single-thread
+ * speedup of tiled over grouped at 32/8 heads, hd=128, AVX2: 3.2-5.8x for
+ * 32..116 tokens. The tiled path has only n_kv_heads * ceil(n/ATTN_TILE) tasks
+ * (grouped has n_tokens * n_heads), so for small batches it is chosen only
+ * when that still keeps threads busy, assuming a conservative
+ * ATTN_TILED_EFF_FACTOR efficiency advantage. Override at run time with
+ * PICOLM_ATTN_TILED_MIN_TOKENS (>= 2*ATTN_TILE restores the old behaviour). */
+#ifndef ATTN_TILED_MIN_TOKENS
+#define ATTN_TILED_MIN_TOKENS 32
+#endif
+#define ATTN_TILED_EFF_FACTOR 3
+
 /* Lazy online-softmax rescale threshold (log2 units, 2^8 = 256x headroom).
  * 0 = only skip when the running max did not change. */
 #ifndef ATTN_LAZY_RESCALE_THRESH
@@ -982,7 +994,17 @@ void batch_attention_layer(
      * test_attn_diff_sweep.sh), including unaligned start_pos. */
     static int _layer_call = 0;
     int _layer_idx = _layer_call++;
-    int _use_tiled = n_tokens >= 2 * ATTN_TILE &&
+    static int _tiled_min_tokens = -1;
+    if (_tiled_min_tokens < 0) {
+        const char *_mt = getenv("PICOLM_ATTN_TILED_MIN_TOKENS");
+        _tiled_min_tokens = _mt ? atoi(_mt) : ATTN_TILED_MIN_TOKENS;
+        if (_tiled_min_tokens < 1) _tiled_min_tokens = 1;
+    }
+    int _n_tiled_tasks = n_kv_heads * ((n_tokens + ATTN_TILE - 1) / ATTN_TILE);
+    int _size_ok = n_tokens >= 2 * ATTN_TILE ||
+                   (n_tokens >= _tiled_min_tokens &&
+                    ATTN_TILED_EFF_FACTOR * _n_tiled_tasks >= tensor_get_n_threads());
+    int _use_tiled = _size_ok &&
                      (int)kv_type_k == (int)KV_CACHE_F16 &&
                      (int)kv_type_v == (int)KV_CACHE_F16;
     {
