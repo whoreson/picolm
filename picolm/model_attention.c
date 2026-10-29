@@ -629,6 +629,29 @@ static void prefill_attn_task_grouped(int flat_idx, void *ctx_ptr) {
     }
 }
 
+/* TODO: The grouped path above is the fallback when the tiled gate rejects
+ * (high thread count + small batch, or non-F16 KV cache). Its V-accumulation
+ * loops (acc += w * V) and fp16 dequant are scalar on everything except
+ * AVX-512, making it 8-13x slower than the tiled path on AVX2/AVX/NEON.
+ *
+ * The tiled gate (ATTN_TILED_MIN_TOKENS + ATTN_TILED_EFF_FACTOR) is designed
+ * to avoid the grouped path at realistic thread counts. On a 24-core machine
+ * with Fimbulvetr2 (8 kv_heads), 44-token prompts still hit tiled because
+ * 3 * 8 = 24 >= 24 threads. At 48+ physical cores the gate falls back.
+ *
+ * Future optimization opportunities (only impactful for 48+ core machines or
+ * non-F16 KV cache):
+ *   1. Add AVX2/NEON V-accumulation to prefill_attn_task_grouped, matching
+ *      the existing simd paths in attn_core() (lines ~100-190). The F16
+ *      case needs fp16x8_to_fp32_inline (AVX2) or vcvt_f32_f16 (NEON).
+ *   2. Vectorize the normalization loop at the end (currently scalar on
+ *      non-AVX512, unlike attn_core which has AVX/NEON/SSE2 paths).
+ *   3. Consider a batched grouped variant that processes multiple KV
+ *      positions at once, amortizing the fp16 dequant across a tile.
+ *   4. At very long context (4k+ tokens) the tiled path dominates anyway,
+ *      so these optimizations primarily benefit short-prompt, many-core
+ *      decode workloads. */
+
 /* Tiled attention: tile size in KV positions */
 #define ATTN_TILE 64
 
@@ -672,12 +695,17 @@ static inline float attn_hsum256(__m256 v) {
  * 32..116 tokens. The tiled path has only n_kv_heads * ceil(n/ATTN_TILE) tasks
  * (grouped has n_tokens * n_heads), so for small batches it is chosen only
  * when that still keeps threads busy, assuming a conservative
- * ATTN_TILED_EFF_FACTOR efficiency advantage. Override at run time with
- * PICOLM_ATTN_TILED_MIN_TOKENS (>= 2*ATTN_TILE restores the old behaviour). */
+ * ATTN_TILED_EFF_FACTOR efficiency advantage (the least-validated constant
+ * here: it comes from a single-thread measurement). Override at run time with
+ * PICOLM_ATTN_TILED_MIN_TOKENS (>= 2*ATTN_TILE restores the old behaviour)
+ * and PICOLM_ATTN_TILED_EFF (larger = tiled is chosen at higher thread counts;
+ * a huge value means "always tiled above MIN_TOKENS"). */
 #ifndef ATTN_TILED_MIN_TOKENS
 #define ATTN_TILED_MIN_TOKENS 32
 #endif
-#define ATTN_TILED_EFF_FACTOR 3
+#ifndef ATTN_TILED_EFF_FACTOR
+#define ATTN_TILED_EFF_FACTOR 3   /* override: PICOLM_ATTN_TILED_EFF */
+#endif
 
 /* Lazy online-softmax rescale threshold (log2 units, 2^8 = 256x headroom).
  * 0 = only skip when the running max did not change. */
@@ -994,16 +1022,19 @@ void batch_attention_layer(
      * test_attn_diff_sweep.sh), including unaligned start_pos. */
     static int _layer_call = 0;
     int _layer_idx = _layer_call++;
-    static int _tiled_min_tokens = -1;
+    static int _tiled_min_tokens = -1, _tiled_eff = 1;
     if (_tiled_min_tokens < 0) {
         const char *_mt = getenv("PICOLM_ATTN_TILED_MIN_TOKENS");
         _tiled_min_tokens = _mt ? atoi(_mt) : ATTN_TILED_MIN_TOKENS;
         if (_tiled_min_tokens < 1) _tiled_min_tokens = 1;
+        const char *_ef = getenv("PICOLM_ATTN_TILED_EFF");
+        _tiled_eff = _ef ? atoi(_ef) : ATTN_TILED_EFF_FACTOR;
+        if (_tiled_eff < 1) _tiled_eff = 1;
     }
     int _n_tiled_tasks = n_kv_heads * ((n_tokens + ATTN_TILE - 1) / ATTN_TILE);
     int _size_ok = n_tokens >= 2 * ATTN_TILE ||
                    (n_tokens >= _tiled_min_tokens &&
-                    ATTN_TILED_EFF_FACTOR * _n_tiled_tasks >= tensor_get_n_threads());
+                    (long)_tiled_eff * _n_tiled_tasks >= tensor_get_n_threads());
     int _use_tiled = _size_ok &&
                      (int)kv_type_k == (int)KV_CACHE_F16 &&
                      (int)kv_type_v == (int)KV_CACHE_F16;
