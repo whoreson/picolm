@@ -56,6 +56,7 @@ extern void attn_core(
         size_t kv_head_stride_k, size_t kv_head_stride_v,
         int head_dim, float attn_scale, int n_swa);
 extern void attention_group(int kv_head_idx, void *ctx_ptr);
+extern void attention_group_ref(int kv_head_idx, void *ctx_ptr);
 extern void batch_attention_layer(
         float *xb_batch, const float *q_batch,
         const uint8_t *kcache, const uint8_t *vcache,
@@ -85,6 +86,10 @@ typedef struct {
      * n_swa_layer[] for how this is resolved per layer/model. */
     int n_swa;
 } attn_group_ctx_t;
+
+/* Decode attention over all KV heads of one layer (blocked softmax, split-KV
+ * across threads when n_threads > n_kv_heads). */
+extern void attention_decode(attn_group_ctx_t *ctx);
 
 /* Prefill attention context */
 typedef struct {

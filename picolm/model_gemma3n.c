@@ -434,7 +434,7 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
                 gctx.kv_hadamard_size = s->kv_hadamard_size;
                 gctx.attn_scale = (c->f_attention_scale > 0) ? c->f_attention_scale : (1.0f / sqrtf((float)head_dim));
                 gctx.n_swa = c->n_swa_layer[l];
-                tensor_parallel_for(c->n_kv_heads, attention_group, &gctx);
+                attention_decode(&gctx);
             }
         } else {
             /* Non-KV layer: only compute Q, reuse KV cache from last KV layer */
@@ -471,7 +471,7 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
                 gctx.kv_hadamard_size = s->kv_hadamard_size;
                 gctx.attn_scale = (c->f_attention_scale > 0) ? c->f_attention_scale : (1.0f / sqrtf((float)head_dim));
                 gctx.n_swa = c->n_swa_layer[l];
-                tensor_parallel_for(c->n_kv_heads, attention_group, &gctx);
+                attention_decode(&gctx);
             }
         }
 

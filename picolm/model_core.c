@@ -3025,12 +3025,12 @@ float *model_forward(model_t *m, int token, int pos) {
                                              seq_len, gpu_dev, c->n_swa_layer[l])) {
                 /* GPU attention succeeded */
             } else {
-                tensor_parallel_for(c->n_kv_heads, attention_group, &gctx);
+                attention_decode(&gctx);
             }
         } else
 #endif
         {
-            tensor_parallel_for(c->n_kv_heads, attention_group, &gctx);
+            attention_decode(&gctx);
         }
         /* Debug: dump CPU decode attention output at pos=1, layer 0 */
 
@@ -3042,7 +3042,7 @@ float *model_forward(model_t *m, int token, int pos) {
                 size_t xb_cpu_sz = (size_t)n_heads * 256 * sizeof(float);
                 float *xb_cpu = (float *)malloc(xb_cpu_sz);
                 memcpy(xb_cpu, s->xb, n_heads * head_dim * sizeof(float));
-                tensor_parallel_for(c->n_kv_heads, attention_group, &gctx);
+                attention_decode(&gctx);
                 float max_diff = 0.0f;
                 for (int i = 0; i < n_heads * head_dim; i++) {
                     float d = xb_cpu[i] - s->xb[i];

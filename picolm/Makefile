@@ -745,6 +745,14 @@ test_attn_diff: test_attn_diff.c model_attention.c tensor.c type_dispatch.c quan
 check-attn: test_attn_diff
 	./tests/test_attn_diff_sweep.sh ./test_attn_diff
 
+# Decode attention (blocked softmax + split-KV) vs reference: correctness + timing.
+test_attn_decode: test_attn_decode.c model_attention.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) model.h model_internal.h
+	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O3 -o $@ test_attn_decode.c model_attention.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
+
+.PHONY: check-attn-decode
+check-attn-decode: test_attn_decode
+	./tests/test_attn_decode_sweep.sh ./test_attn_decode
+
 gguf_be_swap: util/gguf_be_swap.c
 	$(CC) -O2 -std=c99 -o $@ util/gguf_be_swap.c -lm
 

@@ -208,7 +208,7 @@ void attn_core(
  * loaded once and accumulated into kv_mul output vectors.
  * ================================================================ */
 
-void attention_group(int kv_head_idx, void *ctx_ptr) {
+void attention_group_ref(int kv_head_idx, void *ctx_ptr) {
     attn_group_ctx_t *ctx = (attn_group_ctx_t *)ctx_ptr;
     int kv_h = kv_head_idx;
     int kv_mul = ctx->kv_mul;
@@ -689,6 +689,433 @@ static inline float attn_hsum256(__m256 v) {
     return _mm_cvtss_f32(m);
 }
 #endif
+
+/* ================================================================
+ * Blocked decode attention + CPU split-KV (flash-decoding)
+ *
+ * Replaces the per-position scalar online softmax of attention_group_ref():
+ *   1. Score AD_B positions for all kv_mul Q heads of one KV head
+ *      (K row converted once, FMA'd against every Q head; two positions
+ *      in flight to hide FMA latency).
+ *   2. One block max + one rescale per head per block (instead of a
+ *      branch + scalar expf + possible accumulator rescale per position);
+ *      weights come from the vector exp2 polynomial used by the tiled
+ *      prefill path. Q is pre-scaled by attn_scale*log2(e).
+ *   3. V accumulation with the accumulators held in registers across the
+ *      whole block (no acc load/store per position), V row converted once
+ *      and used by all kv_mul heads.
+ * Positions can be split across threads (attention_decode) when there are
+ * more threads than KV heads; partial (m, l, acc) are merged exactly.
+ *
+ * Supported: AVX-512, or AVX2+FMA+F16C, head_dim % lane-width == 0,
+ * head_dim <= 256, kv_mul <= 8. Anything else uses attention_group_ref().
+ * All KV cache types are supported (non-F16 rows are dequantized to F32
+ * with the same routines as the reference AVX-512 path).
+ * ================================================================ */
+#if defined(PICOLM_AVX512) || (defined(PICOLM_AVX2) && defined(__FMA__) && defined(__F16C__))
+#define AD_SIMD 1
+#define AD_B 32                     /* positions per block (multiple of lane width) */
+#ifdef PICOLM_AVX512
+#define AD_W 16
+typedef __m512 adv;
+#define AD_LOAD(p)      _mm512_loadu_ps(p)
+#define AD_STORE(p, v)  _mm512_storeu_ps((p), (v))
+#define AD_SET1(x)      _mm512_set1_ps(x)
+#define AD_ZERO()       _mm512_setzero_ps()
+#define AD_FMA(a, b, c) _mm512_fmadd_ps((a), (b), (c))
+#define AD_MUL(a, b)    _mm512_mul_ps((a), (b))
+#define AD_ADD(a, b)    _mm512_add_ps((a), (b))
+#define AD_RSUM(v)      _mm512_reduce_add_ps(v)
+#define AD_CVT16(p)     _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(p)))
+#else
+#define AD_W 8
+typedef __m256 adv;
+#define AD_LOAD(p)      _mm256_loadu_ps(p)
+#define AD_STORE(p, v)  _mm256_storeu_ps((p), (v))
+#define AD_SET1(x)      _mm256_set1_ps(x)
+#define AD_ZERO()       _mm256_setzero_ps()
+#define AD_FMA(a, b, c) _mm256_fmadd_ps((a), (b), (c))
+#define AD_MUL(a, b)    _mm256_mul_ps((a), (b))
+#define AD_ADD(a, b)    _mm256_add_ps((a), (b))
+#define AD_RSUM(v)      attn_hsum256(v)
+#define AD_CVT16(p)     _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(p)))
+#endif
+
+#define AD_LOG2E 1.44269504088896341f
+#define AD_MIN_SPLIT_CHUNK 256      /* min positions per split-KV chunk */
+
+static int ad_use_ref = 0;          /* PICOLM_ATTN_DECODE=ref */
+static int ad_split_on = 1;         /* PICOLM_ATTN_SPLIT=0 disables split-KV */
+static int ad_min_chunk = AD_MIN_SPLIT_CHUNK;
+static int ad_prefetch = 1;         /* PICOLM_ATTN_PF=0 disables sw prefetch */
+static void ad_env_register(void) __attribute__((constructor));
+static void ad_env_register(void) {
+    const char *e;
+    if ((e = getenv("PICOLM_ATTN_DECODE")) && !strcmp(e, "ref")) ad_use_ref = 1;
+    if ((e = getenv("PICOLM_ATTN_SPLIT"))) ad_split_on = atoi(e) != 0;
+    if ((e = getenv("PICOLM_ATTN_SPLIT_MIN")) && atoi(e) > 0) ad_min_chunk = atoi(e);
+    if ((e = getenv("PICOLM_ATTN_PF"))) ad_prefetch = atoi(e) != 0;
+}
+
+/* Dequantize one K / V row of a head into F32. Semantics are copied from the
+ * reference AVX-512 path (TQ3 K: inverse WHT; TQ4 K: stays in the rotated
+ * domain, Q is pre-rotated by the caller; TQ3/TQ4 V: inverse WHT). */
+static void ad_deq_tq_row(const uint8_t *src, float *dst, int hd, int bits4, int inv_wht) {
+    const int bsz = bits4 ? (int)sizeof(block_tq4) : (int)sizeof(block_tq3);
+    for (int b0 = 0; b0 < hd; b0 += 32) {
+        const uint8_t *blk = src + (size_t)(b0 / 32) * bsz;
+        float sc, rot[32];
+        if (bits4) {
+            const block_tq4 *bl = (const block_tq4 *)blk; sc = fp16_to_fp32(bl->d);
+            for (int gg = 0; gg < 4; gg++) { uint8_t ix[8]; tq4_unpack_4bit_8(ix, bl->qs + gg * 4);
+                for (int kk = 0; kk < 8; kk++) rot[gg * 8 + kk] = tq4_codebook[ix[kk]]; }
+        } else {
+            const block_tq3 *bl = (const block_tq3 *)blk; sc = fp16_to_fp32(bl->d);
+            for (int gg = 0; gg < 4; gg++) { uint8_t ix[8]; tq3_unpack_3bit_8(ix, bl->qs + gg * 3);
+                for (int kk = 0; kk < 8; kk++) rot[gg * 8 + kk] = tq3_codebook[ix[kk]]; }
+        }
+        if (!inv_wht) { for (int ii = 0; ii < 32; ii++) dst[b0 + ii] = rot[ii] * sc; continue; }
+        for (int step = 1; step < 32; step <<= 1)
+            for (int ii = 0; ii < 32; ii += step << 1)
+                for (int jj = ii; jj < ii + step; jj++) {
+                    float aa = rot[jj], bb = rot[jj + step];
+                    rot[jj] = aa + bb; rot[jj + step] = aa - bb;
+                }
+        const float norm = 1.0f / 5.656854f;
+        for (int ii = 0; ii < 32; ii++) dst[b0 + ii] = rot[ii] * norm * tq3_signs[ii] * sc;
+    }
+}
+static void ad_deq_row(int type, int is_k, const uint8_t *src, float *dst, int hd) {
+    switch (type) {
+    case KV_CACHE_Q8_0: dequantize_row_q8_0(src, dst, hd); break;
+    case KV_CACHE_Q4_0: dequantize_row_q4_0(src, dst, hd); break;
+    case KV_CACHE_TQ3:  ad_deq_tq_row(src, dst, hd, 0, 1); break;
+    case KV_CACHE_TQ4:  ad_deq_tq_row(src, dst, hd, 1, is_k ? 0 : 1); break;
+    default: {
+        const uint16_t *p = (const uint16_t *)src; int d = 0;
+        for (; d + AD_W <= hd; d += AD_W) AD_STORE(dst + d, AD_CVT16(p + d));
+        for (; d < hd; d++) dst[d] = fp16_to_fp32(p[d]);
+    }
+    }
+}
+
+/* Vector exp2 over one padded score row (AD_B entries): s[i] = 2^(s[i]-m),
+ * lanes below ATTN_EXP2_LO (incl. the -1e30 padding) become exactly 0.
+ * Returns the row sum. Same polynomial as the tiled prefill kernel. */
+static inline float ad_exp2_row(float *s, float m) {
+#ifdef PICOLM_AVX512
+    __m512 vm = _mm512_set1_ps(m), vsum = _mm512_setzero_ps();
+    const __m512 vlo = _mm512_set1_ps(ATTN_EXP2_LO);
+    for (int j = 0; j < AD_B; j += 16) {
+        __m512 x = _mm512_sub_ps(_mm512_loadu_ps(s + j), vm);
+        __mmask16 valid = _mm512_cmp_ps_mask(x, vlo, _CMP_GE_OQ);
+        x = _mm512_max_ps(x, vlo);
+        __m512 rn = _mm512_roundscale_ps(x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+        __m512 r = _mm512_sub_ps(x, rn);
+        __m512 p = _mm512_set1_ps(ATTN_EXP2_C6);
+        p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(ATTN_EXP2_C5));
+        p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(ATTN_EXP2_C4));
+        p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(ATTN_EXP2_C3));
+        p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(ATTN_EXP2_C2));
+        p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(ATTN_EXP2_C1));
+        p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f));
+        __m512 pow2 = _mm512_castsi512_ps(_mm512_slli_epi32(
+            _mm512_add_epi32(_mm512_cvtps_epi32(rn), _mm512_set1_epi32(127)), 23));
+        __m512 res = _mm512_maskz_mul_ps(valid, p, pow2);
+        _mm512_storeu_ps(s + j, res);
+        vsum = _mm512_add_ps(vsum, res);
+    }
+    return _mm512_reduce_add_ps(vsum);
+#else
+    __m256 vm = _mm256_set1_ps(m), vsum = _mm256_setzero_ps();
+    const __m256 vlo = _mm256_set1_ps(ATTN_EXP2_LO);
+    const __m256i v127 = _mm256_set1_epi32(127);
+    for (int j = 0; j < AD_B; j += 8) {
+        __m256 x = _mm256_sub_ps(_mm256_loadu_ps(s + j), vm);
+        __m256 valid = _mm256_cmp_ps(x, vlo, _CMP_GE_OQ);
+        x = _mm256_max_ps(x, vlo);
+        __m256 rn = _mm256_round_ps(x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+        __m256 r = _mm256_sub_ps(x, rn);
+        __m256 p = _mm256_set1_ps(ATTN_EXP2_C6);
+        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(ATTN_EXP2_C5));
+        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(ATTN_EXP2_C4));
+        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(ATTN_EXP2_C3));
+        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(ATTN_EXP2_C2));
+        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(ATTN_EXP2_C1));
+        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f));
+        __m256 pow2 = _mm256_castsi256_ps(_mm256_slli_epi32(
+            _mm256_add_epi32(_mm256_cvtps_epi32(rn), v127), 23));
+        __m256 res = _mm256_and_ps(_mm256_mul_ps(p, pow2), valid);
+        _mm256_storeu_ps(s + j, res);
+        vsum = _mm256_add_ps(vsum, res);
+    }
+    return attn_hsum256(vsum);
+#endif
+}
+static inline float ad_max_row(const float *s) {
+#ifdef PICOLM_AVX512
+    __m512 v = _mm512_loadu_ps(s);
+    for (int j = 16; j < AD_B; j += 16) v = _mm512_max_ps(v, _mm512_loadu_ps(s + j));
+    return _mm512_reduce_max_ps(v);
+#else
+    __m256 v = _mm256_loadu_ps(s);
+    for (int j = 8; j < AD_B; j += 8) v = _mm256_max_ps(v, _mm256_loadu_ps(s + j));
+    return attn_hmax256(v);
+#endif
+}
+
+static inline void ad_prefetch_row(const uint8_t *p, size_t bytes) {
+    for (size_t o = 0; o < bytes; o += 64) __builtin_prefetch(p + o, 0, 3);
+}
+/* Into L2 only (hint T1): uses the L2 queue instead of the ~10-12 L1 fill buffers,
+ * so it can run much further ahead without stalling demand loads. */
+static inline void ad_prefetch_row_l2(const uint8_t *p, size_t bytes) {
+    for (size_t o = 0; o < bytes; o += 64) __builtin_prefetch(p + o, 0, 2);
+}
+
+/* One KV head, positions [t0, t1). Writes the UNNORMALIZED result:
+ * m_out[g] (log2-domain running max), l_out[g] (sum of weights relative to m),
+ * acc_out[g*hd + d]. KVM / FAST are compile-time constants at the specialized
+ * call sites (FAST = both caches F16, no dequant scratch needed). */
+static inline __attribute__((always_inline))
+void ad_chunk_impl(const attn_group_ctx_t *ctx, int kv_h, int t0, int t1,
+                   float *m_out, float *l_out, float *acc_out,
+                   const int KVM, const int FAST) {
+    const int hd = ctx->head_dim;
+    const size_t row_k = ctx->kv_row_size_k, row_v = ctx->kv_row_size_v;
+    const size_t hs_k = ctx->kv_head_stride_k, hs_v = ctx->kv_head_stride_v;
+    const uint8_t *kbase = ctx->kcache + (size_t)kv_h * hs_k;
+    const uint8_t *vbase = ctx->vcache + (size_t)kv_h * hs_v;
+    const int first_qh = kv_h * ctx->kv_mul;
+    const int pf = ad_prefetch;
+
+    float qs[8 * 256];
+    float s[8][AD_B] __attribute__((aligned(64)));
+    float kbuf[FAST ? 1 : 2 * 256];
+    float vbuf[FAST ? 1 : AD_B * 256];
+    float corr[8], m[8], l[8];
+
+    const float qscale = ctx->attn_scale * AD_LOG2E;
+    _Pragma("GCC unroll 8") for (int g = 0; g < KVM; g++) {
+        const float *q = ctx->q + (size_t)(first_qh + g) * hd;
+        for (int d = 0; d < hd; d++) qs[g * hd + d] = q[d] * qscale;
+        m[g] = -1e30f; l[g] = 0.0f;
+    }
+    memset(acc_out, 0, (size_t)KVM * hd * sizeof(float));
+
+    for (int t = t0; t < t1; t += AD_B) {
+        const int n = (t1 - t < AD_B) ? (t1 - t) : AD_B;
+        const uint8_t *kb = kbase + (size_t)t * row_k;
+        const uint8_t *vb = vbase + (size_t)t * row_v;
+        _Pragma("GCC unroll 8") for (int g = 0; g < KVM; g++)
+            for (int j = n; j < AD_B; j++) s[g][j] = -1e30f;
+
+        /* ---- pass 1: scores s[g][i] (log2 domain) ---- */
+        int i = 0;
+        for (; i < n; i += 2) {
+            const int two = (i + 1 < n);
+            if (pf) {
+                /* V row of this block is needed in pass 2; K row of next block soon. */
+                ad_prefetch_row(vb + (size_t)i * row_v, hs_v);
+                if (two) ad_prefetch_row(vb + (size_t)(i + 1) * row_v, hs_v);
+                ad_prefetch_row(kb + (size_t)(i + AD_B) * row_k, hs_k);
+                if (two) ad_prefetch_row(kb + (size_t)(i + 1 + AD_B) * row_k, hs_k);
+            }
+            const uint8_t *k0 = kb + (size_t)i * row_k;
+            const uint8_t *k1 = two ? kb + (size_t)(i + 1) * row_k : k0;
+            const float *kf0 = NULL, *kf1 = NULL;
+            if (!FAST) {
+                ad_deq_row(ctx->kv_type_k, 1, k0, kbuf, hd); kf0 = kbuf;
+                if (two) { ad_deq_row(ctx->kv_type_k, 1, k1, kbuf + 256, hd); kf1 = kbuf + 256; }
+                else kf1 = kf0;
+            }
+            adv a0[8], a1[8];
+            _Pragma("GCC unroll 8") for (int g = 0; g < KVM; g++) { a0[g] = AD_ZERO(); a1[g] = AD_ZERO(); }
+            for (int d = 0; d < hd; d += AD_W) {
+                adv x0, x1;
+                if (FAST) { x0 = AD_CVT16((const uint16_t *)k0 + d); x1 = AD_CVT16((const uint16_t *)k1 + d); }
+                else      { x0 = AD_LOAD(kf0 + d);                   x1 = AD_LOAD(kf1 + d); }
+                _Pragma("GCC unroll 8") for (int g = 0; g < KVM; g++) {
+                    adv q = AD_LOAD(qs + g * hd + d);
+                    a0[g] = AD_FMA(x0, q, a0[g]);
+                    a1[g] = AD_FMA(x1, q, a1[g]);
+                }
+            }
+            _Pragma("GCC unroll 8") for (int g = 0; g < KVM; g++) {
+                s[g][i] = AD_RSUM(a0[g]);
+                if (two) s[g][i + 1] = AD_RSUM(a1[g]);
+            }
+        }
+
+        /* ---- block softmax: one max / one rescale factor per head ---- */
+        _Pragma("GCC unroll 8") for (int g = 0; g < KVM; g++) {
+            float bm = ad_max_row(s[g]);
+            float c = 1.0f, nm = m[g];
+            if (bm > m[g]) { c = (m[g] < -1e29f) ? 0.0f : exp2f(m[g] - bm); nm = bm; }
+            corr[g] = c; m[g] = nm;
+            l[g] = l[g] * c + ad_exp2_row(s[g], nm);
+        }
+
+        /* ---- pass 2: acc[g] = corr[g]*acc[g] + sum_i w[g][i] * V[i] ---- */
+        if (!FAST)
+            for (int j = 0; j < n; j++)
+                ad_deq_row(ctx->kv_type_v, 0, vb + (size_t)j * row_v, vbuf + (size_t)j * hd, hd);
+        for (int d = 0; d < hd; d += AD_W) {
+            adv a0[8], a1[8];
+            _Pragma("GCC unroll 8") for (int g = 0; g < KVM; g++) {
+                a0[g] = AD_MUL(AD_LOAD(acc_out + g * hd + d), AD_SET1(corr[g]));
+                a1[g] = AD_ZERO();
+            }
+            int j = 0;
+            for (; j + 1 < n; j += 2) {
+                adv v0, v1;
+                if (FAST) {
+                    v0 = AD_CVT16((const uint16_t *)(vb + (size_t)j * row_v) + d);
+                    v1 = AD_CVT16((const uint16_t *)(vb + (size_t)(j + 1) * row_v) + d);
+                } else {
+                    v0 = AD_LOAD(vbuf + (size_t)j * hd + d);
+                    v1 = AD_LOAD(vbuf + (size_t)(j + 1) * hd + d);
+                }
+                _Pragma("GCC unroll 8") for (int g = 0; g < KVM; g++) {
+                    a0[g] = AD_FMA(AD_SET1(s[g][j]),     v0, a0[g]);
+                    a1[g] = AD_FMA(AD_SET1(s[g][j + 1]), v1, a1[g]);
+                }
+            }
+            if (j < n) {
+                adv v0 = FAST ? AD_CVT16((const uint16_t *)(vb + (size_t)j * row_v) + d)
+                              : AD_LOAD(vbuf + (size_t)j * hd + d);
+                _Pragma("GCC unroll 8") for (int g = 0; g < KVM; g++) a0[g] = AD_FMA(AD_SET1(s[g][j]), v0, a0[g]);
+            }
+            _Pragma("GCC unroll 8") for (int g = 0; g < KVM; g++) AD_STORE(acc_out + g * hd + d, AD_ADD(a0[g], a1[g]));
+        }
+    }
+    _Pragma("GCC unroll 8") for (int g = 0; g < KVM; g++) { m_out[g] = m[g]; l_out[g] = l[g]; }
+}
+
+static void ad_chunk(const attn_group_ctx_t *ctx, int kv_h, int t0, int t1,
+                     float *m, float *l, float *acc) {
+    const int fast = (ctx->kv_type_k == KV_CACHE_F16 && ctx->kv_type_v == KV_CACHE_F16);
+#define AD_CASE(K) case K: { \
+        if (fast) { ad_chunk_impl(ctx, kv_h, t0, t1, m, l, acc, K, 1); } \
+        else      { ad_chunk_impl(ctx, kv_h, t0, t1, m, l, acc, K, 0); } \
+        return; }
+    switch (ctx->kv_mul) {
+        AD_CASE(1) AD_CASE(2) AD_CASE(4) AD_CASE(8)
+        default:
+            if (fast) { ad_chunk_impl(ctx, kv_h, t0, t1, m, l, acc, ctx->kv_mul, 1); }
+            else      { ad_chunk_impl(ctx, kv_h, t0, t1, m, l, acc, ctx->kv_mul, 0); }
+    }
+#undef AD_CASE
+}
+
+static inline int ad_supported(const attn_group_ctx_t *ctx) {
+    return !ad_use_ref && ctx->head_dim % AD_W == 0 && ctx->head_dim <= 256 &&
+           ctx->kv_mul >= 1 && ctx->kv_mul <= 8;
+}
+
+static inline int ad_t_start(const attn_group_ctx_t *ctx) {
+    int t = (ctx->n_swa > 0) ? (ctx->pos - ctx->n_swa + 1) : 0;
+    return t < 0 ? 0 : t;
+}
+
+/* Single-chunk path for one KV head (no split): normalize and write xb. */
+static void ad_group_full(int kv_h, const attn_group_ctx_t *ctx) {
+    float m[8], l[8], acc[8 * 256];
+    ad_chunk(ctx, kv_h, ad_t_start(ctx), ctx->pos + 1, m, l, acc);
+    const int hd = ctx->head_dim;
+    for (int g = 0; g < ctx->kv_mul; g++) {
+        float inv = 1.0f / l[g];
+        float *o = ctx->xb + (size_t)(kv_h * ctx->kv_mul + g) * hd;
+        for (int d = 0; d < hd; d++) o[d] = acc[g * hd + d] * inv;
+    }
+}
+
+typedef struct {
+    const attn_group_ctx_t *g;
+    int S, t_start, chunk_len;
+    float *scratch; size_t stride;    /* per-task: m[8] l[8] acc[kv_mul*hd] */
+} ad_split_ctx_t;
+
+static void ad_split_task(int idx, void *p) {
+    ad_split_ctx_t *sc = (ad_split_ctx_t *)p;
+    const attn_group_ctx_t *ctx = sc->g;
+    int kv_h = idx / sc->S, c = idx % sc->S;
+    int t0 = sc->t_start + c * sc->chunk_len;
+    int t1 = t0 + sc->chunk_len; if (t1 > ctx->pos + 1) t1 = ctx->pos + 1;
+    float *base = sc->scratch + (size_t)idx * sc->stride;
+    if (t0 >= t1) { for (int g = 0; g < 8; g++) { base[g] = -1e30f; base[8 + g] = 0.0f; } return; }
+    ad_chunk(ctx, kv_h, t0, t1, base, base + 8, base + 16);
+}
+
+static __thread float *ad_scratch = NULL;
+static __thread size_t ad_scratch_cap = 0;
+#endif /* AD_SIMD */
+
+/* Entry used by tensor_parallel_for over KV heads (also the GPT-2 path). */
+void attention_group(int kv_head_idx, void *ctx_ptr) {
+#ifdef AD_SIMD
+    const attn_group_ctx_t *ctx = (const attn_group_ctx_t *)ctx_ptr;
+    if (ad_supported(ctx)) { ad_group_full(kv_head_idx, ctx); return; }
+#endif
+    attention_group_ref(kv_head_idx, ctx_ptr);
+}
+
+/* Decode attention for all KV heads of one layer. Splits the position range
+ * across threads when n_threads > n_kv_heads (long contexts), merging the
+ * partial softmax states exactly (flash-decoding). */
+void attention_decode(attn_group_ctx_t *ctx) {
+#ifdef AD_SIMD
+    if (ad_supported(ctx) && ad_split_on) {
+        const int nk = ctx->n_kv_heads, nt = tensor_get_n_threads();
+        const int t_start = ad_t_start(ctx), len = ctx->pos + 1 - t_start;
+        int S = (nk > 0 && nt > nk) ? nt / nk : 1;
+        if (S > len / ad_min_chunk) S = len / ad_min_chunk;
+        if (S >= 2) {
+            const int hd = ctx->head_dim, kvm = ctx->kv_mul;
+            int chunk = (len + S - 1) / S;
+            chunk = (chunk + AD_B - 1) / AD_B * AD_B;
+            S = (len + chunk - 1) / chunk;      /* drop empty trailing chunks */
+            if (S >= 2) {
+                size_t stride = 16 + (size_t)kvm * hd;
+                size_t need = stride * (size_t)nk * S;
+                if (need > ad_scratch_cap) {
+                    free(ad_scratch);
+                    ad_scratch = (float *)malloc(need * sizeof(float));
+                    ad_scratch_cap = ad_scratch ? need : 0;
+                }
+                if (ad_scratch) {
+                    ad_split_ctx_t sc = { ctx, S, t_start, chunk, ad_scratch, stride };
+                    tensor_parallel_for(nk * S, ad_split_task, &sc);
+                    for (int kv_h = 0; kv_h < nk; kv_h++)
+                        for (int g = 0; g < kvm; g++) {
+                            float M = -1e30f;
+                            for (int c = 0; c < S; c++) {
+                                float mc = ad_scratch[(size_t)(kv_h * S + c) * stride + g];
+                                if (mc > M) M = mc;
+                            }
+                            float L = 0.0f;
+                            float *o = ctx->xb + (size_t)(kv_h * kvm + g) * hd;
+                            memset(o, 0, (size_t)hd * sizeof(float));
+                            for (int c = 0; c < S; c++) {
+                                const float *b = ad_scratch + (size_t)(kv_h * S + c) * stride;
+                                if (b[8 + g] == 0.0f) continue;      /* empty chunk */
+                                float w = exp2f(b[g] - M);
+                                L += w * b[8 + g];
+                                const float *a = b + 16 + (size_t)g * hd;
+                                for (int d = 0; d < hd; d++) o[d] += w * a[d];
+                            }
+                            float inv = 1.0f / L;
+                            for (int d = 0; d < hd; d++) o[d] *= inv;
+                        }
+                    return;
+                }
+            }
+        }
+    }
+#endif
+    tensor_parallel_for(ctx->n_kv_heads, attention_group, ctx);
+}
+
 
 /* Tiled-path size gate below 2*ATTN_TILE tokens. Measured single-thread
  * speedup of tiled over grouped at 32/8 heads, hd=128, AVX2: 3.2-5.8x for
