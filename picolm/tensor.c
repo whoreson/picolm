@@ -449,6 +449,63 @@ static volatile int    pool_gen   = 0;
 static volatile int    pool_done  = 0;
 static volatile int    pool_shutdown = 0;
 static volatile int    pool_nworkers = 0;
+
+/* ---- Spin-then-sleep synchronization (replaces broadcast-per-completion) ----
+ *
+ * The original pool slept every worker in pthread_cond_wait between dispatches
+ * and made every finishing worker broadcast the shared condvar: ~23 futex wakeups
+ * to start a dispatch plus ~23*23 spurious ones to finish it, all serialized on
+ * one mutex. A 48-layer decode token has ~400 dispatches, which measured at
+ * ~92,000 voluntary context switches per token (ik_llama.cpp: ~86) and CPU use
+ * oscillating between 900% and 2400% on 24 threads.
+ *
+ * Now: dispatch = one atomic increment of pool_gen (workers poll it), completion =
+ * one atomic increment of pool_done (main polls it). A thread that finds nothing to
+ * do for pool_spin_ns falls back to the condvar so idle processes use no CPU; the
+ * wake side only touches the mutex when someone is actually asleep (Dekker-style
+ * seq_cst handshake via pool_nsleep / pool_main_wait, so no wakeup is ever lost).
+ *
+ * Env PICOLM_POOL_SPIN_US=N sets the worker spin budget in microseconds (default
+ * 500; the main thread waits up to 4x that for stragglers; 0 = never spin, sleep
+ * immediately). Spinning is disabled automatically when the pool has more threads
+ * than online CPUs, unless the env var is set explicitly. Build with
+ * -DPICOLM_NO_SPIN_POOL for the previous behaviour (also used on non-GNU compilers). */
+#if defined(__GNUC__) && !defined(PICOLM_DOS) && !defined(PICOLM_NO_SPIN_POOL)
+#define PICOLM_SPIN_POOL 1
+#endif
+#ifdef PICOLM_SPIN_POOL
+static win_cond_t      pool_done_cond;      /* main thread sleeps here waiting for workers */
+static int             pool_nsleep = 0;     /* workers blocked in pool_cond (written under pool_mutex) */
+static int             pool_main_wait = 0;  /* main thread blocked in pool_done_cond */
+static long long       pool_spin_ns = 500000;
+#define POOL_LD(p)  __atomic_load_n((p), __ATOMIC_ACQUIRE)
+#if defined(__x86_64__) || defined(__i386__)
+#define POOL_RELAX() __builtin_ia32_pause()
+#elif defined(__aarch64__) || (defined(__ARM_ARCH) && __ARM_ARCH >= 7)
+#define POOL_RELAX() __asm__ __volatile__("yield" ::: "memory")
+#else
+#define POOL_RELAX() __asm__ __volatile__("" ::: "memory")
+#endif
+static long long pool_now_ns(void) {
+#ifdef _WIN32
+    LARGE_INTEGER f, t; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t);
+    return (t.QuadPart / f.QuadPart) * 1000000000LL + (t.QuadPart % f.QuadPart) * 1000000000LL / f.QuadPart;
+#else
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+#endif
+}
+static void pool_spin_setup(int nt) {
+    const char *e = getenv("PICOLM_POOL_SPIN_US");
+    if (e && *e) { long v = atol(e); pool_spin_ns = v > 0 ? (long long)v * 1000LL : 0; return; }
+#ifndef _WIN32
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu > 0 && nt > ncpu) pool_spin_ns = 0;   /* oversubscribed: spinners would starve workers */
+#else
+    (void)nt;
+#endif
+}
+#endif /* PICOLM_SPIN_POOL */
 static matmul_task_t   pool_tasks[MAX_THREADS];
 
 /* Generic task type: lets the same worker threads run an arbitrary
@@ -674,6 +731,57 @@ static void matmul_worker_f(matmul_task_t *t) {
 }
 
 
+#ifdef PICOLM_SPIN_POOL
+#ifdef _WIN32
+static DWORD WINAPI pool_worker(void *arg) {
+#else
+static void *pool_worker(void *arg) {
+#endif
+    int tid = (int)(size_t)arg;
+    pool_my_tid = tid;
+    int last_gen = 0;
+    for (;;) {
+        int g = POOL_LD(&pool_gen);
+        if (g == last_gen && !POOL_LD(&pool_shutdown)) {
+            /* 1. spin for up to pool_spin_ns */
+            long long t0 = pool_spin_ns > 0 ? pool_now_ns() : 0;
+            unsigned it = 0;
+            int sleep_now = (pool_spin_ns <= 0);
+            while (!sleep_now) {
+                POOL_RELAX();
+                g = POOL_LD(&pool_gen);
+                if (g != last_gen || POOL_LD(&pool_shutdown)) break;
+                if ((++it & 127) == 0 && pool_now_ns() - t0 >= pool_spin_ns) sleep_now = 1;
+            }
+            /* 2. nothing arrived: block on the condvar */
+            if (sleep_now) {
+                win_mutex_lock(&pool_mutex);
+                __atomic_add_fetch(&pool_nsleep, 1, __ATOMIC_SEQ_CST);
+                while (POOL_LD(&pool_gen) == last_gen && !POOL_LD(&pool_shutdown))
+                    win_cond_wait(&pool_cond, &pool_mutex);
+                __atomic_sub_fetch(&pool_nsleep, 1, __ATOMIC_SEQ_CST);
+                win_mutex_unlock(&pool_mutex);
+                g = POOL_LD(&pool_gen);
+            }
+        }
+        if (POOL_LD(&pool_shutdown)) break;
+        last_gen = g;
+        if (pool_mode) generic_worker_f(&generic_tasks[tid]);
+        else matmul_worker_f(&pool_tasks[tid]);
+        __atomic_add_fetch(&pool_done, 1, __ATOMIC_SEQ_CST);
+        if (__atomic_load_n(&pool_main_wait, __ATOMIC_SEQ_CST)) {
+            win_mutex_lock(&pool_mutex);
+            win_cond_broadcast(&pool_done_cond);
+            win_mutex_unlock(&pool_mutex);
+        }
+    }
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
+#endif
+}
+#else /* !PICOLM_SPIN_POOL: original mutex + broadcast implementation */
 #ifdef _WIN32
 static DWORD WINAPI pool_worker(void *arg) {
 #else
@@ -704,6 +812,8 @@ static void *pool_worker(void *arg) {
 #endif
 }
 
+#endif /* PICOLM_SPIN_POOL */
+
 static void pool_init(int nt) {
     if (pool_nworkers > 0) return;
     if (nt <= 1) return;
@@ -712,12 +822,57 @@ static void pool_init(int nt) {
     pool_gen = 0;
     pool_done = 0;
     pool_shutdown = 0;
+#ifdef PICOLM_SPIN_POOL
+    win_cond_init(&pool_done_cond);
+    pool_nsleep = 0;
+    pool_main_wait = 0;
+    pool_spin_setup(nt);
+#endif
     pool_nworkers = nt - 1;
     for (int i = 1; i < nt; i++) {
         win_thread_create(&pool_threads[i], pool_worker, (void *)(size_t)i);
     }
 }
 
+#ifdef PICOLM_SPIN_POOL
+static void pool_wake(int nt) {
+    (void)nt;
+    /* seq_cst: publishes the task arrays / pool_mode written by the caller, and orders
+     * this increment before the pool_nsleep read below (see handshake note above). */
+    __atomic_add_fetch(&pool_gen, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&pool_nsleep, __ATOMIC_SEQ_CST) > 0) {
+        win_mutex_lock(&pool_mutex);
+        win_cond_broadcast(&pool_cond);
+        win_mutex_unlock(&pool_mutex);
+    }
+}
+
+static void pool_wait(int nt) {
+    const int want = nt - 1;
+    if (POOL_LD(&pool_done) < want) {
+        const long long budget = pool_spin_ns * 4;   /* stragglers: dispatches take ~1ms at 24 threads */
+        long long t0 = budget > 0 ? pool_now_ns() : 0;
+        unsigned it = 0;
+        int sleep_now = (budget <= 0);
+        while (!sleep_now) {
+            POOL_RELAX();
+            if (POOL_LD(&pool_done) >= want) break;
+            if ((++it & 127) == 0 && pool_now_ns() - t0 >= budget) sleep_now = 1;
+        }
+        if (sleep_now) {
+            win_mutex_lock(&pool_mutex);
+            __atomic_store_n(&pool_main_wait, 1, __ATOMIC_SEQ_CST);
+            while (POOL_LD(&pool_done) < want)
+                win_cond_wait(&pool_done_cond, &pool_mutex);
+            __atomic_store_n(&pool_main_wait, 0, __ATOMIC_SEQ_CST);
+            win_mutex_unlock(&pool_mutex);
+        }
+    }
+    /* All workers have finished their increment; reset for the next dispatch. Workers only
+     * touch pool_done again after observing the next pool_gen increment (seq_cst). */
+    __atomic_store_n(&pool_done, 0, __ATOMIC_RELAXED);
+}
+#else
 static void pool_wake(int nt) {
     (void)nt;
     win_mutex_lock(&pool_mutex);
@@ -734,6 +889,8 @@ static void pool_wait(int nt) {
     pool_done = 0;
     win_mutex_unlock(&pool_mutex);
 }
+#endif /* PICOLM_SPIN_POOL */
+
 /* ---- Public API ---- */
 
 void tensor_threadpool_init(int n_req_threads) {
@@ -744,7 +901,11 @@ void tensor_threadpool_init(int n_req_threads) {
 void tensor_threadpool_free(void) {
     if (pool_nworkers <= 0) return;
     win_mutex_lock(&pool_mutex);
+#ifdef PICOLM_SPIN_POOL
+    __atomic_store_n(&pool_shutdown, 1, __ATOMIC_SEQ_CST);
+#else
     pool_shutdown = 1;
+#endif
     win_cond_broadcast(&pool_cond);
     win_mutex_unlock(&pool_mutex);
     for (int i = 1; i <= pool_nworkers; i++) {
@@ -752,6 +913,9 @@ void tensor_threadpool_free(void) {
     }
     pool_nworkers = 0;
     win_cond_destroy(&pool_cond);
+#ifdef PICOLM_SPIN_POOL
+    win_cond_destroy(&pool_done_cond);
+#endif
 #ifdef _WIN32
     /* SRWLOCK has no destroy */
 #else

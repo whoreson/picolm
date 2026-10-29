@@ -753,6 +753,19 @@ test_attn_decode: test_attn_decode.c model_attention.c tensor.c type_dispatch.c 
 check-attn-decode: test_attn_decode
 	./tests/test_attn_decode_sweep.sh ./test_attn_decode
 
+# Thread-pool stress test (spin-then-sleep barrier): thread counts x spin budgets,
+# verifies every dispatch; TSAN=1 additionally builds/runs it under ThreadSanitizer.
+test_pool_stress: test_pool_stress.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) tensor.h
+	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O2 -o $@ test_pool_stress.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
+
+.PHONY: check-pool
+check-pool: test_pool_stress
+	./tests/test_pool_stress_sweep.sh ./test_pool_stress
+ifdef TSAN
+	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O2 -fsanitize=thread -o test_pool_stress_tsan test_pool_stress.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
+	for c in "3 5" "4 0" "8 50" "24 500"; do set -- $$c; PICOLM_POOL_SPIN_US=$$2 ./test_pool_stress_tsan $$1 600 7 2>&1 | grep -q "WARNING: ThreadSanitizer" && { echo "TSAN warning nt=$$1 spin=$$2"; exit 1; }; done; echo "tsan clean"
+endif
+
 gguf_be_swap: util/gguf_be_swap.c
 	$(CC) -O2 -std=c99 -o $@ util/gguf_be_swap.c -lm
 
