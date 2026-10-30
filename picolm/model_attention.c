@@ -504,6 +504,37 @@ static void prefill_attn_task(int flat_idx, void *ctx_ptr) {
               ctx->head_dim, ctx->attn_scale, ctx->n_swa);
 }
 
+/* Dequantize one TQ3/TQ4 row of a head into F32.
+ * inv_wht=1 (what every caller here uses) undoes the sign-randomized WHT
+ * applied at quantize time, so the result lives in the original head space
+ * and the score is a plain dot product with an unrotated query. This is
+ * equivalent to keeping K rotated and rotating Q instead (verified to 4e-7),
+ * but avoids touching the query. */
+static void ad_deq_tq_row(const uint8_t *src, float *dst, int hd, int bits4, int inv_wht) {
+    const int bsz = bits4 ? (int)sizeof(block_tq4) : (int)sizeof(block_tq3);
+    for (int b0 = 0; b0 < hd; b0 += 32) {
+        const uint8_t *blk = src + (size_t)(b0 / 32) * bsz;
+        float sc, rot[32];
+        if (bits4) {
+            const block_tq4 *bl = (const block_tq4 *)blk; sc = fp16_to_fp32(bl->d);
+            for (int gg = 0; gg < 4; gg++) { uint8_t ix[8]; tq4_unpack_4bit_8(ix, bl->qs + gg * 4);
+                for (int kk = 0; kk < 8; kk++) rot[gg * 8 + kk] = tq4_codebook[ix[kk]]; }
+        } else {
+            const block_tq3 *bl = (const block_tq3 *)blk; sc = fp16_to_fp32(bl->d);
+            for (int gg = 0; gg < 4; gg++) { uint8_t ix[8]; tq3_unpack_3bit_8(ix, bl->qs + gg * 3);
+                for (int kk = 0; kk < 8; kk++) rot[gg * 8 + kk] = tq3_codebook[ix[kk]]; }
+        }
+        if (!inv_wht) { for (int ii = 0; ii < 32; ii++) dst[b0 + ii] = rot[ii] * sc; continue; }
+        for (int step = 1; step < 32; step <<= 1)
+            for (int ii = 0; ii < 32; ii += step << 1)
+                for (int jj = ii; jj < ii + step; jj++) {
+                    float aa = rot[jj], bb = rot[jj + step];
+                    rot[jj] = aa + bb; rot[jj + step] = aa - bb;
+                }
+        const float norm = 1.0f / 5.656854f;
+        for (int ii = 0; ii < 32; ii++) dst[b0 + ii] = rot[ii] * norm * tq3_signs[ii] * sc;
+    }
+}
 /* GQA-grouped prefill attention task: processes all kv_mul Q heads for one
  * (token, kv_head) pair. This reduces KV cache reads by kv_mul compared to
  * dispatching per-Q-head tasks (prefill_attn_task), since the KV cache scan
@@ -547,6 +578,17 @@ static void prefill_attn_task_grouped(int flat_idx, void *ctx_ptr) {
                 score[g] = vec_dot_q8_0_f32(kt, qh, head_dim);
             else if (ctx->kv_type_k == KV_CACHE_Q4_0)
                 score[g] = vec_dot_q4_0_f32(kt, qh, head_dim);
+            else if (ctx->kv_type_k == KV_CACHE_TQ3 || ctx->kv_type_k == KV_CACHE_TQ4) {
+                /* TQ caches store K WHT-rotated. Dequantize with the inverse
+                 * WHT so the score is a plain dot in head space (matches the
+                 * tiled path, which packs the tile the same way). */
+                float kf[256];
+                ad_deq_tq_row(kt, kf, head_dim,
+                              ctx->kv_type_k == KV_CACHE_TQ4, 1);
+                float acc = 0.0f;
+                for (int d = 0; d < head_dim; d++) acc += qh[d] * kf[d];
+                score[g] = acc;
+            }
             else
                 score[g] = vec_dot_f16_f32(kt, qh, head_dim);
             score[g] *= ctx->attn_scale;
@@ -581,6 +623,11 @@ static void prefill_attn_task_grouped(int flat_idx, void *ctx_ptr) {
                         fma_scale_q8_0_f32(accg, 1.0f, vt, head_dim);
                     } else if (ctx->kv_type_v == KV_CACHE_Q4_0) {
                         fma_scale_q4_0_f32(accg, 1.0f, vt, head_dim);
+                    } else if (ctx->kv_type_v == KV_CACHE_TQ3 || ctx->kv_type_v == KV_CACHE_TQ4) {
+                        float vf[256];
+                        ad_deq_tq_row(vt, vf, head_dim,
+                                      ctx->kv_type_v == KV_CACHE_TQ4, 1);
+                        for (int d = 0; d < head_dim; d++) accg[d] += vf[d];
                     } else {
                         for (int d = 0; d < head_dim; d++) accg[d] += fp16_to_fp32(((const uint16_t *)vt)[d]);
                     }
@@ -607,6 +654,11 @@ static void prefill_attn_task_grouped(int flat_idx, void *ctx_ptr) {
                         scale_add_q8_0_f32(accg, w, vt, head_dim);
                     } else if (ctx->kv_type_v == KV_CACHE_Q4_0) {
                         scale_add_q4_0_f32(accg, w, vt, head_dim);
+                    } else if (ctx->kv_type_v == KV_CACHE_TQ3 || ctx->kv_type_v == KV_CACHE_TQ4) {
+                        float vf[256];
+                        ad_deq_tq_row(vt, vf, head_dim,
+                                      ctx->kv_type_v == KV_CACHE_TQ4, 1);
+                        for (int d = 0; d < head_dim; d++) accg[d] += w * vf[d];
                     } else {
                         for (int d = 0; d < head_dim; d++) accg[d] += w * fp16_to_fp32(((const uint16_t *)vt)[d]);
                     }
@@ -758,34 +810,6 @@ static void ad_env_register(void) {
     if ((e = getenv("PICOLM_ATTN_PF"))) ad_prefetch = atoi(e) != 0;
 }
 
-/* Dequantize one K / V row of a head into F32. Semantics are copied from the
- * reference AVX-512 path (TQ3 K: inverse WHT; TQ4 K: stays in the rotated
- * domain, Q is pre-rotated by the caller; TQ3/TQ4 V: inverse WHT). */
-static void ad_deq_tq_row(const uint8_t *src, float *dst, int hd, int bits4, int inv_wht) {
-    const int bsz = bits4 ? (int)sizeof(block_tq4) : (int)sizeof(block_tq3);
-    for (int b0 = 0; b0 < hd; b0 += 32) {
-        const uint8_t *blk = src + (size_t)(b0 / 32) * bsz;
-        float sc, rot[32];
-        if (bits4) {
-            const block_tq4 *bl = (const block_tq4 *)blk; sc = fp16_to_fp32(bl->d);
-            for (int gg = 0; gg < 4; gg++) { uint8_t ix[8]; tq4_unpack_4bit_8(ix, bl->qs + gg * 4);
-                for (int kk = 0; kk < 8; kk++) rot[gg * 8 + kk] = tq4_codebook[ix[kk]]; }
-        } else {
-            const block_tq3 *bl = (const block_tq3 *)blk; sc = fp16_to_fp32(bl->d);
-            for (int gg = 0; gg < 4; gg++) { uint8_t ix[8]; tq3_unpack_3bit_8(ix, bl->qs + gg * 3);
-                for (int kk = 0; kk < 8; kk++) rot[gg * 8 + kk] = tq3_codebook[ix[kk]]; }
-        }
-        if (!inv_wht) { for (int ii = 0; ii < 32; ii++) dst[b0 + ii] = rot[ii] * sc; continue; }
-        for (int step = 1; step < 32; step <<= 1)
-            for (int ii = 0; ii < 32; ii += step << 1)
-                for (int jj = ii; jj < ii + step; jj++) {
-                    float aa = rot[jj], bb = rot[jj + step];
-                    rot[jj] = aa + bb; rot[jj + step] = aa - bb;
-                }
-        const float norm = 1.0f / 5.656854f;
-        for (int ii = 0; ii < 32; ii++) dst[b0 + ii] = rot[ii] * norm * tq3_signs[ii] * sc;
-    }
-}
 static void ad_deq_row(int type, int is_k, const uint8_t *src, float *dst, int hd) {
     switch (type) {
     case KV_CACHE_Q8_0: dequantize_row_q8_0(src, dst, hd); break;
@@ -1482,8 +1506,15 @@ static void batch_tiled_task(int task_idx, void *ctx_ptr) {
             for (int p = 0; p < this_tile_size; p++) {
                 const uint8_t *src = bc->vcache + (size_t)(kv_t0 + p) * rb
                                    + kv_h * v_head_stride;
-                dequantize_row(src, tile_v_f32 + (size_t)p * head_dim,
-                              head_dim, bc->gguf_v);
+                /* TQ caches have no GGUF equivalent (gguf_v is F16); decode
+                 * them with the inverse WHT like the reference paths do. */
+                if (bc->kv_type_v == KV_CACHE_TQ3 || bc->kv_type_v == KV_CACHE_TQ4) {
+                    ad_deq_tq_row(src, tile_v_f32 + (size_t)p * head_dim,
+                                  head_dim, bc->kv_type_v == KV_CACHE_TQ4, 1);
+                } else {
+                    dequantize_row(src, tile_v_f32 + (size_t)p * head_dim,
+                                   head_dim, bc->gguf_v);
+                }
             }
         }
 

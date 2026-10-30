@@ -50,6 +50,15 @@ for kt in q8_0 q4_0; do
   run 24 4 256 128 30 0 1 $kt 8e-3
   run 24 4 256 256 0 0 8 $kt 8e-3
 done
+# TQ3/TQ4: coarser quantization, but tiled and grouped must still agree.
+for kt in tq3 tq4; do
+  for sp in 0 30 65; do
+    for nt in 64 65 127 128 200; do run 24 4 256 $nt $sp 0 1 $kt 2e-2; done
+  done
+  run 24 4 256 128 0 0 8 $kt 2e-2
+  run 8 4 64 200 30 0 1 $kt 2e-2
+  run 8 4 128 200 30 0 1 $kt 2e-2
+done
 # head_dim not a multiple of 32 -> the QK path must fall back to F32 (exact).
 for hd in 48 96 160; do
   for kt in q8_0 q4_0; do
