@@ -662,6 +662,11 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         sz_glm5 += (size_t)n_kda * c->glm5_n_kda_heads * kda_dim * kda_dim * sizeof(float);
         /* MLA latent cache: n_mla_layers * max_seq * kv_lora */
         sz_glm5 += (size_t)n_mla * c->max_seq_len * c->glm5_kv_lora * sizeof(float);
+        /* DSA indexer key+gate cache: n_mla_layers * max_seq * 2*idx_dim.
+         * Row holds the LayerNorm'd indexer key and the pool gate concatenated
+         * (the gate depends on the hidden state so it cannot be recomputed). */
+        if (c->glm5_use_dsa && c->glm5_idx_dim > 0)
+            sz_glm5 += (size_t)n_mla * c->max_seq_len * 2 * c->glm5_idx_dim * sizeof(float);
         /* hc streams: hc_x + hc_res [S*D each] */
         sz_glm5 += (size_t)2 * c->glm5_hc * c->n_embd * sizeof(float);
         /* hc_pre scratch: flat normed [S*D] + m vector [M=(2+S)*S] */
@@ -1105,6 +1110,13 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         s->glm5.mla_kv = gp5;
         gp5 += (size_t)n_mla * c->max_seq_len * c->glm5_kv_lora;
         s->glm5.mla_kv_layer_stride = c->max_seq_len * c->glm5_kv_lora;
+        /* DSA indexer key+gate cache (one row of 2*idx_dim per position) */
+        if (c->glm5_use_dsa && c->glm5_idx_dim > 0) {
+            s->glm5.idx_kg = gp5;
+            gp5 += (size_t)n_mla * c->max_seq_len * 2 * c->glm5_idx_dim;
+        } else {
+            s->glm5.idx_kg = NULL;
+        }
         /* hc scratch (shared across layers) */
         s->glm5.hc_x = gp5;        gp5 += (size_t)c->glm5_hc * c->n_embd;   /* S streams */
         s->glm5.hc_res = gp5;      gp5 += (size_t)c->glm5_hc * c->n_embd;   /* S residual streams */

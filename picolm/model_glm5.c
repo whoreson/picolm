@@ -26,6 +26,20 @@
 
 #define GLM5_KD_MAX 128   /* max KDA head dim for stack buffers */
 
+/* Static bound for the indexer's stack/static scratch. Sized for the shipped
+ * GLM-5.3 geometry (idx_nh=32, idx_dim=128, kpool=4, top_k=2048) with margin;
+ * glm5_dsa_select() bails out to dense attention if a model exceeds them. */
+#define GLM5_MAX_IDX_DIM  256
+#define GLM5_MAX_IDX_NH   64
+#define GLM5_MAX_KPOOL    16
+#define GLM5_DSA_MAX_POOL 1024     /* max_seq / kpool */
+#define GLM5_DSA_MAX_SEL  4096     /* <= indexer.top_k */
+
+#ifndef INFINITY
+#define INFINITY (1.0f/0.0f)
+#endif
+
+
 /* Per-layer debugging: PICOLM_DBG_GLM5=1 prints one line per block with the
  * residual-stream RMS and the first few values of cur/post/comb, which is what
  * localises numerical drift against the ik oracle. */
@@ -679,6 +693,13 @@ static void glm5_kda_forward(
  *             o[h] = Wv_b[h] (mla_hd x kv_lora) @ ctx[h]  -> [mla_hd]
  *   out = attn_output @ concat(o[h])         [D]
  */
+/* DSA k-pool indexer helpers (defined below). */
+static void glm5_dsa_store_kg(const model_config_t *c, const glm5_layer_weights_t *gw,
+                              run_state_t *s, const float *cur, int pos, int mla_ord);
+int glm5_dsa_select(const model_config_t *c, const glm5_layer_weights_t *gw,
+                    run_state_t *s, const float *cur, const float *qr,
+                    int pos, int mla_ord, int *sel_out);
+
 static void glm5_mla_forward(
     const model_t *m, const glm5_layer_weights_t *gw, const layer_weights_t *lw,
     run_state_t *s, const float *cur, int pos, int n_ctx, int layer_idx,
@@ -698,6 +719,11 @@ static void glm5_mla_forward(
     float *ctx = sc; sc += KVL * NH;    /* attention output per head */
     float *scores = sc;                 /* [max_seq] */
     (void)gw;
+
+    /* DSA k-pool selection for this token (empty -> dense attention). */
+    int *sel = NULL;
+    int n_sel = 0;
+    static int dsa_sel_buf[GLM5_DSA_MAX_SEL];
     (void)n_ctx; (void)layer_idx;
     /* NOTE: `cur` is ALREADY RMSNorm(cur, attn_norm) — the caller applies it
      * once for both KDA and MLA. Do not norm again here. */
@@ -754,38 +780,86 @@ static void glm5_mla_forward(
         memcpy(cache + (size_t)pos * KVL, kv, KVL * sizeof(float));
     }
 
-    /* Attention: per head, scores over all cached latents */
+    /* DSA indexer: cache this token's (key ; gate) pair and pick the pools
+     * attention may look at. Runs after the latent store so that the current
+     * position is visible to the selector exactly as in the reference (which
+     * writes kv_cmpr and kr_l in the same graph step).
+     *
+     * Note this must happen even for a single-token step: the cache has to be
+     * filled at every position or later positions would pool over stale rows. */
+    if (c->glm5_use_dsa && s->glm5.idx_kg && gw->idx_attn_k) {
+        glm5_dsa_store_kg(c, gw, s, cur, pos, mla_ord);
+        /* Selection is only meaningful once there is at least one complete
+         * pool plus the tail; below that the dense path is equivalent. */
+        if (pos >= c->glm5_idx_kpool) {
+            n_sel = glm5_dsa_select(c, gw, s, cur, qr, pos, mla_ord, dsa_sel_buf);
+            if (n_sel > 0) sel = dsa_sel_buf;
+        }
+    }
+
+    /* Attention over the cached latents.
+     *
+     * With DSA active, `sel` holds the cell indices chosen by the k-pool
+     * indexer (ascending, deduplicated) and attention is restricted to them.
+     * `n_sel == 0` means dense attention over all n_kv positions, which is
+     * also what the reference does whenever the cache is too small to pool.
+     * The selection is causal by construction: the indexer only ever scores
+     * pools whose last member has already been seen. */
     {
         const float scale = 1.0f / sqrtf((float)MHD);
         float *cache = s->glm5.mla_kv + (size_t)mla_ord * c->max_seq_len * KVL;
-        int n_kv = pos + 1;
+        const int n_kv = pos + 1;
+        const int dense = (n_sel == 0);
 
         for (int h = 0; h < NH; h++) {
             const float *qh = qabs + h * KVL;
-            /* scores */
-            for (int t = 0; t < n_kv; t++) {
-                const float *kt = cache + (size_t)t * KVL;
-                float dot = 0.f;
-                for (int i = 0; i < KVL; i++) dot += qh[i] * kt[i];
-                scores[t] = dot * scale;
+            float mx = -INFINITY, sum = 0.f;
+
+            /* scores over the selected cells (or every cell when dense) */
+            if (dense) {
+                for (int t = 0; t < n_kv; t++) {
+                    const float *kt = cache + (size_t)t * KVL;
+                    float dot = 0.f;
+                    for (int i = 0; i < KVL; i++) dot += qh[i] * kt[i];
+                    scores[t] = dot * scale;
+                    if (scores[t] > mx) mx = scores[t];
+                }
+            } else {
+                for (int k = 0; k < n_sel; k++) {
+                    const int t = sel[k];
+                    const float *kt = cache + (size_t)t * KVL;
+                    float dot = 0.f;
+                    for (int i = 0; i < KVL; i++) dot += qh[i] * kt[i];
+                    scores[k] = dot * scale;
+                    if (scores[k] > mx) mx = scores[k];
+                }
             }
+
             /* softmax */
-            {
-                float mx = scores[0];
-                for (int t = 1; t < n_kv; t++) if (scores[t] > mx) mx = scores[t];
-                float sum = 0.f;
+            if (dense) {
                 for (int t = 0; t < n_kv; t++) { scores[t] = expf(scores[t] - mx); sum += scores[t]; }
-                float inv = 1.0f / sum;
-                for (int t = 0; t < n_kv; t++) scores[t] *= inv;
+            } else {
+                for (int k = 0; k < n_sel; k++) { scores[k] = expf(scores[k] - mx); sum += scores[k]; }
             }
-            /* ctx[h] = sum_t p[t] * cache[t] */
+            const float inv = 1.0f / sum;
+
+            /* ctx[h] = sum p[t] * cache[t] */
             float *ch = ctx + h * KVL;
             memset(ch, 0, KVL * sizeof(float));
-            for (int t = 0; t < n_kv; t++) {
-                float p = scores[t];
-                if (p < 1e-10f) continue;
-                const float *kt = cache + (size_t)t * KVL;
-                for (int i = 0; i < KVL; i++) ch[i] += p * kt[i];
+            if (dense) {
+                for (int t = 0; t < n_kv; t++) {
+                    const float p = scores[t] * inv;
+                    if (p < 1e-10f) continue;
+                    const float *kt = cache + (size_t)t * KVL;
+                    for (int i = 0; i < KVL; i++) ch[i] += p * kt[i];
+                }
+            } else {
+                for (int k = 0; k < n_sel; k++) {
+                    const float p = scores[k] * inv;
+                    if (p < 1e-10f) continue;
+                    const float *kt = cache + (size_t)sel[k] * KVL;
+                    for (int i = 0; i < KVL; i++) ch[i] += p * kt[i];
+                }
             }
         }
     }
@@ -805,6 +879,191 @@ static void glm5_mla_forward(
         }
         matmul(out, o_concat, lw->attn_output, NH*MHD, D, lw->type_attn_output);
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* DSA k-pool indexer (sparse attention on MLA layers)                 */
+/*                                                                     */
+/* Compresses the latent KV cache into pools of `kpool` positions. Each */
+/* pool key is a learned convex mix of its member keys (softmax over a  */
+/* per-member gate + intra-pool position bias APE). Pools are scored    */
+/* against the query, the top-k POOLS are selected, and those pools are */
+/* expanded back into the individual cache positions that attention is  */
+/* then restricted to. Reference: build_glm5next_dsa_top_k() in         */
+/* ik_llama.cpp, and notes/picolm/glm53_architecture_reference.md §5.   */
+/*                                                                     */
+/* Without this, attention is dense over the whole cache. GLM-5.3 was   */
+/* trained with the indexer active, so dense attention matches the      */
+/* reference only while the whole context fits in top_k cells            */
+/* (indexer.top_k = 2048): beyond that the reference silently drops the */
+/* least-relevant pools and PicoLM's output diverges.                   */
+/*                                                                     */
+/* Returns the number of selected cell indices written to `sel_out`, or */
+/* 0 to request the dense fallback (cache too small to pool).           */
+/* ------------------------------------------------------------------ */
+
+
+/* Per-token key+gate pair into the kr_l cache, row layout [k ; g].
+ * k = LayerNorm(idx_attn_k @ cur) with weight+bias, g = idx_gate @ cur. */
+static void glm5_dsa_store_kg(const model_config_t *c, const glm5_layer_weights_t *gw,
+                              run_state_t *s, const float *cur, int pos, int mla_ord)
+{
+    const int D = c->n_embd;
+    const int ID = c->glm5_idx_dim;
+    float k[GLM5_MAX_IDX_DIM], g[GLM5_MAX_IDX_DIM];
+    /* The indexer norm of the keys is a LayerNorm (weight AND bias) with its
+     * own epsilon (attention.layer_norm_epsilon = 1e-6), deliberately not the
+     * RMSNorm one used everywhere else. */
+    matmul(k, cur, gw->idx_attn_k, D, ID, gw->type_idx_attn_k);
+    layernorm(k, k, (const float *)gw->idx_k_norm_w, (const float *)gw->idx_k_norm_b,
+              ID, c->glm5_ln_eps);
+    matmul(g, cur, gw->idx_gate, D, ID, gw->type_idx_gate);
+    float *row = s->glm5.idx_kg + (size_t)mla_ord * c->max_seq_len * 2 * ID
+               + (size_t)pos * 2 * ID;
+    memcpy(row, k, (size_t)ID * sizeof(float));
+    memcpy(row + ID, g, (size_t)ID * sizeof(float));
+}
+
+/* Score pools and select the top-k. `qr` is the q_lora latent of this token.
+ * Writes cell indices (ascending, deduplicated) into sel_out. */
+int glm5_dsa_select(const model_config_t *c, const glm5_layer_weights_t *gw,
+                    run_state_t *s, const float *cur, const float *qr,
+                    int pos, int mla_ord, int *sel_out)
+{
+    const int D  = c->n_embd;
+    const int ID = c->glm5_idx_dim;
+    const int NH = c->glm5_idx_nh;
+    const int R  = c->glm5_idx_kpool;
+    /* Defensive: a model without the full indexer tensor set must fall back
+     * to dense attention rather than dereference a NULL weight. */
+    if (!gw->idx_ape || !gw->idx_q_b || !gw->idx_proj) return 0;
+    const int n_kv = pos + 1;
+    const int n_pool = n_kv / R;
+    if (n_pool == 0) return 0;
+
+    /* Only complete pools are selectable, and the trailing partial pool is
+     * always appended so the most recent tokens are never lost. */
+    const int tail_cnt = R - 1;
+    const int n_sel = (int)((c->glm5_idx_topk / R));
+    int n_sel_ok = n_sel < n_pool ? n_sel : n_pool;
+    if (((n_kv - tail_cnt) / R) < n_sel_ok) n_sel_ok = (n_kv - tail_cnt) / R;
+    if (n_sel_ok < 1) return 0;
+
+    const float *base = s->glm5.idx_kg + (size_t)mla_ord * c->max_seq_len * 2 * ID;
+
+    /* ---- pool keys: pooled[p][i] = sum_j w[p][j] * k[member j][i] ---- */
+    if (n_pool > GLM5_DSA_MAX_POOL) return 0;
+    if (ID > GLM5_MAX_IDX_DIM || NH > GLM5_MAX_IDX_NH || R > GLM5_MAX_KPOOL) return 0;
+    static float pooled[GLM5_DSA_MAX_POOL * GLM5_MAX_IDX_DIM];
+    static float score[GLM5_DSA_MAX_POOL];
+
+    for (int p = 0; p < n_pool; p++) {
+        /* Pool key for pool p (members are positions p*R .. p*R+R-1): a
+         * per-CHANNEL softmax over members of (gate + APE), then a convex
+         * combination of the member keys. The reference permutes the member
+         * axis to ne[0] before ggml_soft_max precisely so that each channel
+         * normalises independently -- it is not a single weight per member. */
+        float w[GLM5_MAX_KPOOL];
+        float *pk = pooled + (size_t)p * ID;
+        memset(pk, 0, (size_t)ID * sizeof(float));
+        for (int i = 0; i < ID; i++) {
+            float m = -INFINITY;
+            for (int j = 0; j < R; j++) {
+                const float *gr = base + (size_t)(p * R + j) * 2 * ID + ID;
+                float v = gr[i] + ((const float *)gw->idx_ape)[(size_t)j * ID + i];
+                w[j] = v;
+                if (v > m) m = v;
+            }
+            float sum = 0.f;
+            for (int j = 0; j < R; j++) { w[j] = expf(w[j] - m); sum += w[j]; }
+            float inv = 1.f / sum;
+            float acc = 0.f;
+            for (int j = 0; j < R; j++) {
+                const float *kr = base + (size_t)(p * R + j) * 2 * ID;
+                acc += w[j] * inv * kr[i];
+            }
+            pk[i] = acc;
+        }
+    }
+
+    /* ---- indexer query and weights ---- */
+    static float qidx[GLM5_MAX_IDX_NH * GLM5_MAX_IDX_DIM];
+    float wts[GLM5_MAX_IDX_NH];
+    if (R > GLM5_MAX_KPOOL) return 0;
+    if (NH * ID > GLM5_MAX_IDX_NH * GLM5_MAX_IDX_DIM) return 0;
+    matmul(qidx, qr, gw->idx_q_b, c->glm5_q_lora, NH * ID, gw->type_idx_q_b);
+    /* proj is F32 in the reference and is multiplied by 1/sqrt(d*nh); a
+     * quantized proj would perturb the discrete top-k and cannot be
+     * corrected for downstream. */
+    matmul(wts, cur, gw->idx_proj, D, NH, gw->type_idx_proj);
+    {
+        const float scl = 1.0f / sqrtf((float)(ID * NH));
+        for (int h = 0; h < NH; h++) wts[h] *= scl;
+    }
+
+    /* ---- score[p] = sum_h wts[h] * relu(pooled[p] . q_idx[h]) ---- */
+    for (int p = 0; p < n_pool; p++) {
+        const float *pk = pooled + (size_t)p * ID;
+        float acc = 0.f;
+        for (int h = 0; h < NH; h++) {
+            const float *qh = qidx + (size_t)h * ID;
+            float dot = 0.f;
+            for (int i = 0; i < ID; i++) dot += pk[i] * qh[i];
+            if (dot < 0.f) dot = 0.f;          /* relu */
+            acc += wts[h] * dot;
+        }
+        score[p] = acc;
+    }
+
+    /* Mask pools that are not fully visible to this query: a pool is visible
+     * once its last member position (p*R + R - 1) has been seen. */
+    const int n_pool_visible = (n_kv / R);
+    for (int p = 0; p < n_pool; p++)
+        if (p >= n_pool_visible || (p * R + R - 1) > pos) score[p] = -INFINITY;
+
+    /* ---- top-k pools (selection sort; n_pool <= 2048 here) ---- */
+    int picked[GLM5_DSA_MAX_SEL];
+    int n_picked = 0;
+    {
+        /* Simple partial selection: repeatedly take the max remaining. */
+        static unsigned char used[GLM5_DSA_MAX_POOL];
+        memset(used, 0, (size_t)n_pool);
+        for (int k = 0; k < n_sel_ok; k++) {
+            int best = -1; float bv = -INFINITY;
+            for (int p = 0; p < n_pool; p++) {
+                if (used[p]) continue;
+                if (score[p] > bv) { bv = score[p]; best = p; }
+            }
+            if (best < 0 || bv == -INFINITY) break;
+            used[best] = 1;
+            picked[n_picked++] = best;
+        }
+    }
+
+    /* ---- expand pools to cell indices, then append the tail ---- */
+    int n_out = 0;
+    for (int k = 0; k < n_picked; k++)
+        for (int j = 0; j < R; j++)
+            if (n_out < GLM5_DSA_MAX_SEL) sel_out[n_out++] = picked[k] * R + j;
+    {
+        /* Trailing incomplete pool: positions (n_pool*R) .. pos inclusive. */
+        for (int t = n_pool * R; t <= pos && n_out < GLM5_DSA_MAX_SEL; t++)
+            sel_out[n_out++] = t;
+    }
+    /* Sort ascending and dedup so the caller can walk the cache linearly
+     * (keeps the attention loop's memory access pattern sequential). */
+    for (int i = 1; i < n_out; i++) {
+        int v = sel_out[i], j = i - 1;
+        while (j >= 0 && sel_out[j] > v) { sel_out[j + 1] = sel_out[j]; j--; }
+        sel_out[j + 1] = v;
+    }
+    {
+        int w = 0;
+        for (int i = 0; i < n_out; i++)
+            if (i == 0 || sel_out[i] != sel_out[w - 1]) sel_out[w++] = sel_out[i];
+        n_out = w;
+    }
+    return n_out;
 }
 
 /* ------------------------------------------------------------------ */

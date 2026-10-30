@@ -289,7 +289,7 @@ clean:
 	-$(RM) $(GPU_SRCS:%.cu=%-hip.o) $(GPU_SRCS:%.cu=%-cuda.o) backend_gpu.dlink.o
 	-$(RM) shaders/*.spv
 	-$(RM) test_swa test_swa.exe test_quant test_attn_tiled test_attn_tiled.exe test_attn_diff test_attn_diff.exe
-	-$(RM) tests/test_glm5_ops tests/test_glm5_ops.exe
+	-$(RM) tests/test_glm5_ops tests/test_glm5_ops.exe test_glm5_dsa test_glm5_snapshot
 
 # --- GLM-5 operator unit tests (standalone, no model file needed) ---
 # Re-derives hc_pre / KDA / conv1d / MoE-router with plain scalar code and
@@ -758,6 +758,14 @@ test_attn_diff: test_attn_diff.c model_attention.c tensor.c type_dispatch.c quan
 # GLM-5 hybrid checkpoint round-trip (MLA latent caches + KDA states).
 test_glm5_snapshot: tests/test_glm5_snapshot.c model_glm5.c model_moe.c model_kv_cache.c model_ssm.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) model.h
 	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O2 -o $@ tests/test_glm5_snapshot.c model_glm5.c model_moe.c model_kv_cache.c model_ssm.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
+
+# DSA k-pool selector invariants (causal, bounded, sorted, deduped).
+test_glm5_dsa: tests/test_glm5_dsa.c model_glm5.c model_moe.c model_ssm.c model_kv_cache.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) model.h
+	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O2 -o $@ tests/test_glm5_dsa.c model_glm5.c model_moe.c model_ssm.c model_kv_cache.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
+
+.PHONY: check-glm5-dsa
+check-glm5-dsa: test_glm5_dsa
+	./test_glm5_dsa
 
 .PHONY: check-glm5-snapshot
 check-glm5-snapshot: test_glm5_snapshot

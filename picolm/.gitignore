@@ -26,3 +26,4 @@ test_attn_diff
 tests/test_glm5_ops
 tests/test_glm5_ops.exe
 test_glm5_snapshot
+test_glm5_dsa

@@ -2367,12 +2367,47 @@ int parse_gguf(model_t *m, int max_seq_len) {
                         w->glm5 ? w->glm5[l].hc_attn_base : NULL,
                         w->layers[l].attn_q);
         }
-        fprintf(stderr, "glm5: %d layers (%d MLA, %d KDA), hc=%d, q_lora=%d, kv_lora=%d, "
-                "mla_hd=%d, kda_dim=%d, idx=%d/%d/%d, moe=%d/%d scale=%.2f\n",
-                cfg->n_layers, n_mla, n_kda, cfg->glm5_hc, cfg->glm5_q_lora,
-                cfg->glm5_kv_lora, cfg->glm5_mla_head_dim, cfg->glm5_kda_dim,
-                cfg->glm5_idx_nh, cfg->glm5_idx_topk, cfg->glm5_idx_kpool,
-                cfg->n_expert, cfg->n_expert_used, cfg->glm5_moe_scale);
+        /* Enable the DSA k-pool indexer only when the model actually carries
+         * indexer weights on an MLA layer and the kpool geometry is sane.
+         * Indexer proj must be F32: the reference multiplies it by
+         * 1/sqrt(d*nh) before use, and re-quantizing would change the top-k
+         * ordering (which is discrete -- errors do not degrade gracefully). */
+        cfg->glm5_use_dsa = 0;
+        if (cfg->glm5_idx_nh > 0 && cfg->glm5_idx_dim > 0 &&
+            cfg->glm5_idx_kpool > 0 && cfg->glm5_idx_topk > 0) {
+            int with_weights = 0, missing = 0;
+            for (int l = 0; l < cfg->n_layers; l++) {
+                if (!cfg->glm5_layer_is_mla[l] || cfg->glm5_layer_mla_ord[l] < 0) continue;
+                const glm5_layer_weights_t *g = &w->glm5[l];
+                if (g->idx_attn_k && g->idx_gate && g->idx_q_b && g->idx_proj &&
+                    g->idx_ape && g->idx_k_norm_w && g->idx_k_norm_b) with_weights++;
+                else missing++;
+            }
+            cfg->glm5_use_dsa = (with_weights > 0);
+            if (getenv("PICOLM_DBG_GLM5") || getenv("PICOLM_GLM5_STATS"))
+                fprintf(stderr, "glm5: DSA indexer %s (%d MLA layers with weights, %d without)\n",
+                        cfg->glm5_use_dsa ? "ENABLED" : "disabled", with_weights, missing);
+        }
+        /* OFF by default, matching the reference build: ik_llama.cpp declares
+         * cparams.dsa but never assigns it or exposes a CLI flag, so the
+         * shipped implementation always runs DENSE MLA. Verified on the tiny
+         * oracle model: with a 17-token prompt (> kpool=4, so the indexer does
+         * activate) ik's greedy tokens match PicoLM's dense path exactly and
+         * differ from PicoLM's DSA path.
+         *
+         * PICOLM_GLM5_DSA=1 turns the indexer on. It is implemented and
+         * exercised, but it is not bit-comparable against this reference; only
+         * enable it for long-context work where sparse attention is wanted. */
+        if (!getenv("PICOLM_GLM5_DSA")) cfg->glm5_use_dsa = 0;
+        if (getenv("PICOLM_DBG_GLM5") || cfg->glm5_use_dsa) {
+            fprintf(stderr, "glm5: %d layers (%d MLA, %d KDA), hc=%d, q_lora=%d, kv_lora=%d, "
+                    "mla_hd=%d, kda_dim=%d, idx=%d/%d/%d, dsa=%d, moe=%d/%d scale=%.2f\n",
+                    cfg->n_layers, n_mla, n_kda, cfg->glm5_hc, cfg->glm5_q_lora,
+                    cfg->glm5_kv_lora, cfg->glm5_mla_head_dim, cfg->glm5_kda_dim,
+                    cfg->glm5_idx_nh, cfg->glm5_idx_topk, cfg->glm5_idx_kpool,
+                    cfg->glm5_use_dsa,
+                    cfg->n_expert, cfg->n_expert_used, cfg->glm5_moe_scale);
+        }
     }
 
     /* Verify required tensors for StableLM */
