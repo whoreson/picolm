@@ -1275,7 +1275,14 @@ static int server_init(const char *model_path, int num_threads, int do_prefault,
             fprintf(stderr, "[server] Failed to start visualization server on port %d\n", viz_port);
         } else {
             fprintf(stderr, "[server] Visualization server started on port %d (%dx%d)\n", viz_port, viz_width, viz_height);
-            viz_set_model_info(srv.model.config.n_layers, srv.model.config.n_embd, model_short);
+            /* Report the effective number of layers that produce viz entries. */
+            int viz_layers = srv.model.config.n_layers - srv.model.config.n_mtp_layers;
+            if (srv.model.config.is_glm5 && srv.model.config.n_layer_kv_from_start > 0
+                    && srv.model.config.n_layer_kv_from_start <= srv.model.config.n_layers) {
+                viz_layers = srv.model.config.n_layer_kv_from_start;
+            }
+            if (viz_layers < 1) viz_layers = 1;
+            viz_set_model_info(viz_layers, srv.model.config.n_embd, model_short);
             srv.viz_initialized = 1;
         }
     }

@@ -904,7 +904,9 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
     {
         int kv_ord = 0;
         for (int l = 0; l < c->n_layers; l++) {
-            if (c->has_ssm && !m->weights.layers[l].is_attn_layer) {
+            if ((c->has_ssm && !m->weights.layers[l].is_attn_layer) || c->is_glm5) {
+                /* SSM-hybrid non-attention layers and GLM-5 (KDA/MLA keep
+                 * their own state, not the standard KV cache) */
                 s->kv_layer_map[l] = 0;
                 s->kv_layer_ordinal[l] = -1;
             } else {

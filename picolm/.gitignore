@@ -25,3 +25,4 @@ test_attn_diff
 # unit-test binaries built by `make test-*` (keep the .c sources)
 tests/test_glm5_ops
 tests/test_glm5_ops.exe
+test_glm5_snapshot

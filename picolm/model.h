@@ -849,4 +849,11 @@ void model_ssm_state_reset(model_t *m);
 void model_ssm_state_reset_gpu(model_t *m);
 void picolm_gpu_kv_cache_clear(int device);
 
+/* GLM-5 (glm5next) state snapshot: MLA latent caches + KDA states.
+ * Snapshot covers n_pos positions of each MLA latent cache plus all KDA
+ * conv/recurrent states. Returns 0 for non-GLM5 models. */
+size_t model_glm5_snapshot_size(const model_t *m, int n_pos);
+size_t model_glm5_state_save(const model_t *m, uint8_t *buf, size_t buf_size, int n_pos);
+size_t model_glm5_state_restore(model_t *m, const uint8_t *buf, size_t buf_size, int n_pos);
+
 #endif /* MODEL_H */

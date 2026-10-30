@@ -20,6 +20,10 @@
 #include <stdio.h>
 #include <assert.h>
 
+#ifdef PICOLM_VIZ
+#include "viz.h"
+#endif
+
 #define GLM5_KD_MAX 128   /* max KDA head dim for stack buffers */
 
 /* Per-layer debugging: PICOLM_DBG_GLM5=1 prints one line per block with the
@@ -1069,6 +1073,20 @@ float *model_forward_glm5(model_t *m, int token, int pos)
                 fprintf(stderr, "GLM5: stopping after layer %d (PICOLM_STOP_LAYER)\n", il);
             break;
         }
+
+#ifdef PICOLM_VIZ
+        /* Push mean-reduced activation for visualization.
+         * GLM has S residual streams; viz expects a single dim-sized vector. */
+        {
+            float inv_s = 1.0f / (float)S;
+            for (int d = 0; d < D; d++) {
+                float acc = 0.f;
+                for (int i = 0; i < S; i++) acc += s->glm5.hc_x[i*D + d];
+                s->glm5.cur[d] = acc * inv_s;
+            }
+            viz_push_layer(il, s->glm5.cur, D);
+        }
+#endif
     }
 
     /* Final: mean over S streams -> RMSNorm(output_norm) -> output head */
@@ -1122,3 +1140,121 @@ float *model_forward_glm5(model_t *m, int token, int pos)
     return s->logits;
 }
 
+
+/* ------------------------------------------------------------------ */
+/* KV-cache state snapshot (v5): MLA latent caches + KDA states        */
+/* ------------------------------------------------------------------ */
+
+/* Blob layout (all little-endian float32):
+ *   [MLA latent caches, one per MLA trunk layer, in MLA-ordinal order]
+ *       each: n_pos rows of kv_lora floats (stride in memory: max_seq_len)
+ *   [KDA conv states, ascending layer index]
+ *       each: (d_conv-1) * conv_dim floats
+ *   [KDA recurrent states, ascending layer index]
+ *       each: n_kda_heads * kda_dim * kda_dim floats
+ *
+ * Note the two different orderings: MLA caches are addressed by their
+ * compact ordinal (glm5_layer_mla_ord), while KDA state pointers are indexed
+ * by raw layer number, matching how each is allocated in model_core.c.
+ * Layers with no MLA ordinal (-1: the NextN/MTP tail) and layers with no KDA
+ * state are skipped, which is what keeps the blob size in sync with
+ * model_glm5_snapshot_size().
+ *
+ * Only n_pos rows of each MLA latent are saved; positions >= n_pos still hold
+ * whatever was there before the restore and must not be read, so the caller
+ * must resume at n_pos. That is exactly the rewind contract used by the SSM
+ * snapshot path. */
+size_t model_glm5_snapshot_size(const model_t *m, int n_pos) {
+    const model_config_t *c = &m->config;
+    if (!c->is_glm5) return 0;
+    int kda_dim = c->glm5_kda_dim;
+    int d_inner = c->glm5_n_kda_heads * kda_dim;
+    int conv_dim = 3 * d_inner;
+    size_t sz = 0;
+    sz += (size_t)c->glm5_n_mla * n_pos * c->glm5_kv_lora * sizeof(float);
+    sz += (size_t)c->glm5_n_kda * (c->ssm_d_conv - 1) * conv_dim * sizeof(float);
+    sz += (size_t)c->glm5_n_kda * c->glm5_n_kda_heads * kda_dim * kda_dim * sizeof(float);
+    return sz;
+}
+
+size_t model_glm5_state_save(const model_t *m, uint8_t *buf, size_t buf_size, int n_pos) {
+    const model_config_t *c = &m->config;
+    const run_state_t *s = &m->state;
+    if (!c->is_glm5) return 0;
+    size_t needed = model_glm5_snapshot_size(m, n_pos);
+    if (buf_size < needed) {
+        fprintf(stderr, "kvcache_save: glm5 state buffer too small (%zu < %zu)\n", buf_size, needed);
+        return 0;
+    }
+    size_t off = 0;
+    int kda_dim = c->glm5_kda_dim;
+    int d_inner = c->glm5_n_kda_heads * kda_dim;
+    int conv_dim = 3 * d_inner;
+    /* MLA latent caches (n_pos rows of each). Gate on the ordinal, not just
+     * is_mla: the NextN/MTP tail layer is MLA-shaped but deliberately has
+     * ord -1 and no cache slot (see the ordinal assignment in model_gguf.c),
+     * so including it would read out of bounds and desync the blob layout
+     * from model_glm5_snapshot_size(), which counts only n_mla. */
+    for (int l = 0; l < c->n_layers; l++) {
+        int ord = c->glm5_layer_mla_ord[l];
+        if (ord < 0) continue;
+        const float *cache = s->glm5.mla_kv + (size_t)ord * c->max_seq_len * c->glm5_kv_lora;
+        size_t sz = (size_t)n_pos * c->glm5_kv_lora * sizeof(float);
+        memcpy(buf + off, cache, sz);
+        off += sz;
+    }
+    /* KDA conv + recurrent states. The NULL-state checks cover both the MLA
+     * trunk layers and the NextN tail, which own no KDA state. */
+    for (int l = 0; l < c->n_layers; l++) {
+        if (!s->glm5.kda_conv_state[l] || !s->glm5.kda_state[l]) continue;
+        size_t csz = (size_t)(c->ssm_d_conv - 1) * conv_dim * sizeof(float);
+        memcpy(buf + off, s->glm5.kda_conv_state[l], csz);
+        off += csz;
+    }
+    for (int l = 0; l < c->n_layers; l++) {
+        if (c->glm5_layer_is_mla[l]) continue;
+        if (!s->glm5.kda_state[l]) continue;
+        size_t ssz = (size_t)c->glm5_n_kda_heads * kda_dim * kda_dim * sizeof(float);
+        memcpy(buf + off, s->glm5.kda_state[l], ssz);
+        off += ssz;
+    }
+    return off;
+}
+
+size_t model_glm5_state_restore(model_t *m, const uint8_t *buf, size_t buf_size, int n_pos) {
+    const model_config_t *c = &m->config;
+    run_state_t *s = &m->state;
+    if (!c->is_glm5) return 0;
+    size_t needed = model_glm5_snapshot_size(m, n_pos);
+    if (buf_size < needed) {
+        fprintf(stderr, "kvcache_load: glm5 state buffer too small (%zu < %zu)\n", buf_size, needed);
+        return 0;
+    }
+    size_t off = 0;
+    int kda_dim = c->glm5_kda_dim;
+    int d_inner = c->glm5_n_kda_heads * kda_dim;
+    int conv_dim = 3 * d_inner;
+    for (int l = 0; l < c->n_layers; l++) {
+        int ord = c->glm5_layer_mla_ord[l];
+        if (ord < 0) continue;
+        float *cache = s->glm5.mla_kv + (size_t)ord * c->max_seq_len * c->glm5_kv_lora;
+        size_t sz = (size_t)n_pos * c->glm5_kv_lora * sizeof(float);
+        memcpy(cache, buf + off, sz);
+        off += sz;
+    }
+    for (int l = 0; l < c->n_layers; l++) {
+        if (c->glm5_layer_is_mla[l]) continue;
+        if (!s->glm5.kda_conv_state[l] || !s->glm5.kda_state[l]) continue;
+        size_t csz = (size_t)(c->ssm_d_conv - 1) * conv_dim * sizeof(float);
+        memcpy(s->glm5.kda_conv_state[l], buf + off, csz);
+        off += csz;
+    }
+    for (int l = 0; l < c->n_layers; l++) {
+        if (c->glm5_layer_is_mla[l]) continue;
+        if (!s->glm5.kda_state[l]) continue;
+        size_t ssz = (size_t)c->glm5_n_kda_heads * kda_dim * kda_dim * sizeof(float);
+        memcpy(s->glm5.kda_state[l], buf + off, ssz);
+        off += ssz;
+    }
+    return off;
+}

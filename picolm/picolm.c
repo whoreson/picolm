@@ -1596,7 +1596,16 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Failed to start visualization server\n");
             /* Non-fatal: continue without viz */
         } else {
-            viz_set_model_info(model.config.n_layers, model.config.n_embd, model_short);
+            /* Report the effective number of layers that produce viz entries.
+             * Standard models: n_layers - n_mtp_layers.
+             * GLM-5: n_layer_kv_from_start (trunk only, NextN/MTP excluded). */
+            int viz_layers = model.config.n_layers - model.config.n_mtp_layers;
+            if (model.config.is_glm5 && model.config.n_layer_kv_from_start > 0
+                    && model.config.n_layer_kv_from_start <= model.config.n_layers) {
+                viz_layers = model.config.n_layer_kv_from_start;
+            }
+            if (viz_layers < 1) viz_layers = 1;
+            viz_set_model_info(viz_layers, model.config.n_embd, model_short);
         }
     }
 #endif

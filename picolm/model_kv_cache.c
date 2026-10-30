@@ -144,10 +144,14 @@ int kvcache_save(const model_t *m, const char *path, int n_pos, const int *token
     size_t buf_off = 0;
 
     size_t ssm_sz = model_ssm_snapshot_size(m);
+    size_t glm5_sz = model_glm5_snapshot_size(m, n_pos);
+    int version = glm5_sz > 0 ? 5 : 4;
 
-    /* Version 4 header: 13 uint32_t entries */
-    uint32_t header[13] = {
-        KVCACHE_MAGIC | 0x00000004,
+    /* Version 4: 13 uint32_t entries. Version 5 appends [13] = glm5 state
+     * size. Keep v4 at 13 words so files written for non-GLM5 models stay
+     * byte-compatible with readers that only know v4. */
+    uint32_t header[14] = {
+        KVCACHE_MAGIC | (uint32_t)version,
         (uint32_t)n_pos,
         (uint32_t)c->n_layers,
         (uint32_t)c->n_kv_heads,
@@ -160,9 +164,11 @@ int kvcache_save(const model_t *m, const char *path, int n_pos, const int *token
         (uint32_t)ssm_sz,
         (uint32_t)s->kv_layer_count,
         (uint32_t)n_pos,
+        (uint32_t)glm5_sz,
     };
-    memcpy(buf + buf_off, header, sizeof(header));
-    buf_off += sizeof(header);
+    size_t header_words = (version >= 5) ? 14 : 13;
+    memcpy(buf + buf_off, header, header_words * sizeof(uint32_t));
+    buf_off += header_words * sizeof(uint32_t);
 
     /* Token sequence */
     if (tokens && n_pos > 0) {
@@ -242,6 +248,35 @@ int kvcache_save(const model_t *m, const char *path, int n_pos, const int *token
         }
     }
 
+    /* GLM-5 state blob (v5): MLA latent caches + KDA states, streamed.
+     * model_glm5_state_save needs a buffer; reuse the I/O buffer in chunks
+     * by saving in one go (the blob is at most ~200 MB for 128K ctx, and
+     * callers that save typically have the RAM; for large n_pos the caller
+     * should stream, but the API is buffer-based). */
+    if (glm5_sz > 0) {
+        uint8_t *glm5_buf = malloc(glm5_sz);
+        if (!glm5_buf) {
+            fprintf(stderr, "kvcache_save: glm5 state OOM (%zu bytes)\n", glm5_sz);
+            _kv_close(fd); return -1;
+        }
+        size_t written = model_glm5_state_save(m, glm5_buf, glm5_sz, n_pos);
+        if (written != glm5_sz) {
+            fprintf(stderr, "kvcache_save: glm5 state short write (%zu/%zu)\n", written, glm5_sz);
+            free(glm5_buf); _kv_close(fd); return -1;
+        }
+        const uint8_t *src = glm5_buf;
+        size_t sz = glm5_sz;
+        while (sz > 0) {
+            size_t chunk = sz < buf_size ? sz : buf_size;
+            if (buf_off + chunk > buf_size) { if (_kv_flush(fd, buf, &buf_off)) { free(glm5_buf); return -1; } }
+            memcpy(buf + buf_off, src, chunk);
+            buf_off += chunk;
+            src += chunk;
+            sz -= chunk;
+        }
+        free(glm5_buf);
+    }
+
     if (_kv_flush(fd, buf, &buf_off)) return -1;
     _kv_close(fd);
     fprintf(stderr, "\nKV cache saved: %d positions to %s\n", n_pos, path);
@@ -269,17 +304,21 @@ int kvcache_load(model_t *m, const char *path, int **tokens_out) {
     size_t buf_pos = 0;
     size_t file_offset = 0;  /* tracks file offset of the start of current buffer load */
 
-    uint32_t header[13];
+    uint32_t header[14];
     int version = 4;
 
-    /* Try v4: read 13 entries */
-    if (_kv_ensure(fd, buf, buf_size, sizeof(header), &buf_avail, &buf_pos, &file_offset)) {
+    /* Try v5/v4: both start with 13 common words; v5 appends glm5_sz as the
+     * 14th. Read only the 13 common ones first, then consume the extra word
+     * if (and only if) this is a v5 file. */
+    if (_kv_ensure(fd, buf, buf_size, sizeof(uint32_t) * 13, &buf_avail, &buf_pos, &file_offset)) {
         return 0;
     }
-    memcpy(header, buf + buf_pos, sizeof(header));
-    buf_pos += sizeof(header);
+    memcpy(header, buf + buf_pos, sizeof(uint32_t) * 13);
+    buf_pos += sizeof(uint32_t) * 13;
+    header[13] = 0;
 
-    if ((header[0] & 0xFFFFFFF0) != KVCACHE_MAGIC || (header[0] & 0xF) != 4) {
+    if ((header[0] & 0xFFFFFFF0) != KVCACHE_MAGIC ||
+        ((header[0] & 0xF) != 4 && (header[0] & 0xF) != 5)) {
         /* Fall back to v3 (9 entries) */
         #ifdef _WIN32
         if (_lseeki64(fd, 0, SEEK_SET) < 0) { _kv_close(fd); return 0; }
@@ -330,12 +369,24 @@ int kvcache_load(model_t *m, const char *path, int **tokens_out) {
         fprintf(stderr, "kvcache_load: invalid magic\n");
         _kv_close(fd); return 0;
     }
+    if (version == 4) version = (int)(header[0] & 0xF);   /* 4 or 5 */
 
     int n_pos = (int)header[1];
     int file_layers = (int)header[2];
     int file_n_kv_heads = (int)header[3];
     int file_head_dim = (int)header[4];
     int has_ssm = (version >= 4) ? (int)header[9] : 0;
+
+    /* v5: the 14th header word is the GLM-5 state blob size; consume it. */
+    unsigned has_glm5 = 0;
+    if (version >= 5) {
+        if (_kv_ensure(fd, buf, buf_size, sizeof(uint32_t), &buf_avail, &buf_pos, &file_offset)) {
+            free(*tokens_out); _kv_close(fd); return 0;
+        }
+        memcpy(&header[13], buf + buf_pos, sizeof(uint32_t));
+        buf_pos += sizeof(uint32_t);
+        has_glm5 = 1;
+    }
 
     if (file_layers != c->n_layers || file_n_kv_heads != c->n_kv_heads ||
         file_head_dim != c->head_dim) {
@@ -471,10 +522,52 @@ int kvcache_load(model_t *m, const char *path, int **tokens_out) {
         }
     }
 
+    /* GLM-5 state blob (v5): MLA latent caches + KDA states. Same layout as
+     * model_glm5_state_save. Streamed like the SSM blob so we never hold a
+     * second full-size copy. */
+    if (has_glm5 && header[13] > 0) {
+        size_t glm5_sz = header[13];
+        size_t expect = model_glm5_snapshot_size(m, n_pos);
+        if (glm5_sz != expect) {
+            fprintf(stderr, "kvcache_load: glm5 state size mismatch "
+                    "(file %zu vs expected %zu for %d positions)\n",
+                    glm5_sz, expect, n_pos);
+            free(*tokens_out); _kv_close(fd); return 0;
+        }
+        uint8_t *glm5_buf = malloc(glm5_sz);
+        if (!glm5_buf) {
+            fprintf(stderr, "kvcache_load: glm5 state OOM (%zu bytes)\n", glm5_sz);
+            free(*tokens_out); _kv_close(fd); return 0;
+        }
+        uint8_t *dst = glm5_buf;
+        size_t remain = glm5_sz;
+        while (remain > 0) {
+            size_t need = remain < buf_size ? remain : buf_size;
+            if (_kv_ensure(fd, buf, buf_size, need, &buf_avail, &buf_pos, &file_offset)) {
+                free(glm5_buf); free(*tokens_out); _kv_close(fd); return 0;
+            }
+            size_t copy = need < remain ? need : remain;
+            memcpy(dst, buf + buf_pos, copy);
+            dst += copy;
+            buf_pos += copy;
+            remain -= copy;
+        }
+        size_t got = model_glm5_state_restore(m, glm5_buf, glm5_sz, n_pos);
+        free(glm5_buf);
+        if (got != glm5_sz) {
+            fprintf(stderr, "kvcache_load: glm5 state restore incomplete (%zu/%zu)\n",
+                    got, glm5_sz);
+            free(*tokens_out); _kv_close(fd); return 0;
+        }
+    }
+
     _kv_close(fd);
     fprintf(stderr, "\nKV cache loaded: %d positions from %s", n_pos, path);
     if (has_ssm && header[10] > 0) {
         fprintf(stderr, " + SSM state (%.1f MB)", (double)(size_t)header[10] / (1024.0 * 1024.0));
+    }
+    if (has_glm5 && header[13] > 0) {
+        fprintf(stderr, " + GLM5 state (%.1f MB)", (double)(size_t)header[13] / (1024.0 * 1024.0));
     }
     fprintf(stderr, "\n");
     return n_pos;

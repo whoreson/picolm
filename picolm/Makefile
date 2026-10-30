@@ -755,6 +755,14 @@ TEST_NATIVE_CFLAGS = $(CFLAGS) -march=native $(call simd_flags_for,-march=native
 test_attn_diff: test_attn_diff.c model_attention.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) model.h model_internal.h
 	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O2 -o $@ test_attn_diff.c model_attention.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
 
+# GLM-5 hybrid checkpoint round-trip (MLA latent caches + KDA states).
+test_glm5_snapshot: tests/test_glm5_snapshot.c model_glm5.c model_moe.c model_kv_cache.c model_ssm.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) model.h
+	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O2 -o $@ tests/test_glm5_snapshot.c model_glm5.c model_moe.c model_kv_cache.c model_ssm.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
+
+.PHONY: check-glm5-snapshot
+check-glm5-snapshot: test_glm5_snapshot
+	./test_glm5_snapshot
+
 # Tiled-vs-grouped attention regression sweep (rebuilds the test first).
 .PHONY: check-attn
 check-attn: test_attn_diff
