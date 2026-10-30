@@ -649,6 +649,37 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         sz_gemma3n += (size_t)c->n_layers * n_embd * n_altup * sizeof(float); /* altup_router dequantized */
     }
 
+    /* GLM-5 state: KDA recurrent state, MLA latent cache, hc scratch */
+    size_t sz_glm5 = 0;
+    if (c->is_glm5) {
+        int kda_dim = c->glm5_kda_dim;
+        int d_inner = c->glm5_n_kda_heads * kda_dim;
+        int conv_dim = 3 * d_inner;
+        int n_kda = c->glm5_n_kda;
+        int n_mla = c->glm5_n_mla;
+        sz_glm5 += (size_t)n_kda * (c->ssm_d_conv - 1) * conv_dim * sizeof(float);
+        /* KDA recurrent state: n_heads * kda_dim * kda_dim per KDA layer */
+        sz_glm5 += (size_t)n_kda * c->glm5_n_kda_heads * kda_dim * kda_dim * sizeof(float);
+        /* MLA latent cache: n_mla_layers * max_seq * kv_lora */
+        sz_glm5 += (size_t)n_mla * c->max_seq_len * c->glm5_kv_lora * sizeof(float);
+        /* hc streams: hc_x + hc_res [S*D each] */
+        sz_glm5 += (size_t)2 * c->glm5_hc * c->n_embd * sizeof(float);
+        /* hc_pre scratch: flat normed [S*D] + m vector [M=(2+S)*S] */
+        sz_glm5 += (size_t)(c->glm5_hc * c->n_embd
+                  + (2*c->glm5_hc + c->glm5_hc*c->glm5_hc)) * sizeof(float);
+        /* hc_m: m[M] + post[S] + comb[S*S] */
+        sz_glm5 += (size_t)((2*c->glm5_hc + c->glm5_hc*c->glm5_hc)
+                  + c->glm5_hc + c->glm5_hc*c->glm5_hc) * sizeof(float);
+        /* KDA per-token scratch: q,k,v,z,raw,conv_out,g,head_out [10*DI total]
+         * + beta[H] + fa_out[KD]. (Layout must match glm5_kda_forward().) */
+        sz_glm5 += (size_t)(10*d_inner + c->glm5_n_kda_heads + kda_dim) * sizeof(float);
+        /* MLA scratch: qr[QL] + qabs[KVL*NH] + kv[KVL] + ctx[KVL*NH] + scores[max_seq] */
+        sz_glm5 += (size_t)(2*c->glm5_kv_lora * c->n_heads + c->glm5_q_lora
+                  + c->glm5_kv_lora + c->max_seq_len) * sizeof(float);
+        /* MoE routed-expert down-projection staging [n_embd] */
+        sz_glm5 += (size_t)c->n_embd * sizeof(float);
+    }
+
     /* MoE buffers */
     size_t sz_moe = 0;
     if (c->has_moe) {
@@ -749,7 +780,7 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
                    sz_hb + sz_hb2 + sz_logits +
                    sz_scratch + sz_rope + sz_norm +
                    sz_ssm_conv + sz_ssm_state + sz_ssm_small + sz_ssm_tmp +
-                   sz_gemma3n + sz_moe;
+                   sz_gemma3n + sz_moe + sz_glm5;
 
     /* Quantized KV cache: separate allocation (only for attention layers)
      * Full-row GQA layout: [layer][pos] -> GQA row of n_kv_heads*head_dim */
@@ -1045,6 +1076,56 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         { size_t carved = (size_t)((char *)p - (char *)s->mem_block) / sizeof(float);
           (void)carved;
         }
+    }
+
+    /* GLM-5 state carving: KDA recurrent/conv state, MLA latent cache, hc scratch */
+    if (c->is_glm5) {
+        int kda_dim = c->glm5_kda_dim;
+        int d_inner = c->glm5_n_kda_heads * kda_dim;
+        int conv_dim = 3 * d_inner;
+        int n_kda = c->glm5_n_kda;
+        int n_mla = c->glm5_n_mla;
+        float *gp5 = p;
+        memset(s->glm5.kda_state, 0, sizeof(s->glm5.kda_state));
+        memset(s->glm5.kda_conv_state, 0, sizeof(s->glm5.kda_conv_state));
+        for (int l = 0; l < c->n_layers; l++) {
+            if (l >= c->n_layer_kv_from_start || c->glm5_layer_is_mla[l]) {
+                /* MLA trunk layer or the NextN block: no KDA state */
+                s->glm5.kda_state[l] = NULL;
+                s->glm5.kda_conv_state[l] = NULL;
+                continue;
+            }
+            s->glm5.kda_conv_state[l] = gp5;
+            gp5 += (size_t)(c->ssm_d_conv - 1) * conv_dim;
+            s->glm5.kda_state[l] = gp5;
+            gp5 += (size_t)c->glm5_n_kda_heads * kda_dim * kda_dim;
+        }
+        s->glm5.mla_kv = gp5;
+        gp5 += (size_t)n_mla * c->max_seq_len * c->glm5_kv_lora;
+        s->glm5.mla_kv_layer_stride = c->max_seq_len * c->glm5_kv_lora;
+        /* hc scratch (shared across layers) */
+        s->glm5.hc_x = gp5;        gp5 += (size_t)c->glm5_hc * c->n_embd;   /* S streams */
+        s->glm5.hc_res = gp5;      gp5 += (size_t)c->glm5_hc * c->n_embd;   /* S residual streams */
+        /* hc_pre scratch: flat normed [S*D] + m vector [M] */
+        s->glm5.hc_scratch = gp5;
+        gp5 += (size_t)c->glm5_hc * c->n_embd + (size_t)(2*c->glm5_hc + c->glm5_hc*c->glm5_hc);
+        /* hc_pre outputs: m[M], post[S], comb[S*S] (laid out contiguously) */
+        s->glm5.hc_m = gp5;
+        gp5 += (size_t)(2*c->glm5_hc + c->glm5_hc*c->glm5_hc)
+             + (size_t)c->glm5_hc + (size_t)c->glm5_hc*c->glm5_hc;
+        /* KDA per-token scratch (layout must match glm5_kda_forward):
+         * q,k,v,z,raw,conv_out,g,head_out [7*DI + 3*DI = 10*DI] + beta[H] + fa_out[KD] */
+        s->glm5.kda_scratch = gp5;
+        gp5 += (size_t)(10*d_inner + c->glm5_n_kda_heads + kda_dim);
+        /* MLA per-token scratch */
+        s->glm5.mla_q = gp5;       gp5 += (size_t)c->glm5_mla_head_dim * c->n_heads;
+        s->glm5.mla_q_abs = gp5;   gp5 += (size_t)c->glm5_kv_lora * c->n_heads;
+        s->glm5.mla_scratch = gp5; gp5 += (size_t)(2*c->glm5_kv_lora * c->n_heads + c->glm5_q_lora
+                                            + c->glm5_kv_lora + c->max_seq_len);
+        s->glm5.cur = gp5;      gp5 += (size_t)c->n_embd;
+        s->glm5.attn_out = gp5; gp5 += (size_t)c->n_embd;
+        s->glm5.moe_down = gp5; gp5 += (size_t)c->n_embd;
+        p = gp5;
     }
 
     /* MoE buffer carving */
@@ -1436,7 +1517,10 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
     /* Validate that all required tensors are present */
     {
         layer_weights_t *lw = &m->weights.layers[0];
-        if (m->config.has_moe) {
+        if (m->config.is_glm5) {
+            /* GLM-5: validated in the glm5-specific block below (dense lead
+             * layers have no MoE tensors; shared expert has no gate input). */
+        } else if (m->config.has_moe) {
             /* MoE model: check MoE tensors */
             if (!lw->ffn_gate_exps || !lw->ffn_up_exps || !lw->ffn_down_exps ||
                 !lw->ffn_gate_inp || !lw->ffn_gate_inp_shexp ||
@@ -2072,6 +2156,7 @@ static void repack_model_weights_q4_0x8(model_t *m) {
 
 /* ---- Gemma-3n forward pass (specialized) ---- */
 float *model_forward_gemma3n(model_t *m, int token, int pos);
+float *model_forward_glm5(model_t *m, int token, int pos);
 
 /* ---- GPT-2 forward pass (specialized) ---- */
 static float *model_forward_gpt2(model_t *m, int token, int pos) {
@@ -2591,6 +2676,10 @@ float *model_forward(model_t *m, int token, int pos) {
     if (m->config.is_gemma3n) {
         return model_forward_gemma3n(m, token, pos);
     }
+    /* GLM-5.3-Flash: mHC + KDA/MLA hybrid */
+    if (m->config.is_glm5) {
+        return model_forward_glm5(m, token, pos);
+    }
     /* GPT-2 has a fundamentally different architecture (LayerNorm, fused QKV, learned pos embd) */
     if (m->config.is_gpt2) {
         return model_forward_gpt2(m, token, pos);
@@ -3092,7 +3181,7 @@ float *model_forward(model_t *m, int token, int pos) {
         }
 
         /* ---- FFN (SwiGLU or MoE) - only if MLP weights exist for this layer ---- */
-        if (c->has_moe) {
+        if (c->has_moe && lw->ffn_gate_exps) {
             /* MoE forward pass */
             rmsnorm(s->xb, s->x, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
             moe_forward(m, s, s->xb, s->xb, lw);
@@ -4341,6 +4430,16 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         g_is_prefill = 0;
         return m->state.logits;
     }
+    /* GLM-5: per-token prefill fallback (batched hc/KDA/MLA prefill later) */
+    if (m->config.is_glm5) {
+        g_is_prefill = 1;
+        for (int i = 0; i < n_tokens; i++) {
+            if (interrupt && *interrupt) break;
+            (void)model_forward(m, tokens[i], start_pos + i);
+        }
+        g_is_prefill = 0;
+        return m->state.logits;
+    }
     /* GPT-2 batched prefill */
     if (m->config.is_gpt2) {
         return model_forward_prefill_gpt2(m, tokens, n_tokens, start_pos, interrupt);
@@ -4891,7 +4990,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         }
 
         /* FFN (MoE or dense) */
-        if (c->has_moe) {
+        if (c->has_moe && lw->ffn_gate_exps) {
             for (bi = 0; bi < n_tokens; bi++) {
                 rmsnorm(xb_batch + bi * dim, x_batch + bi * dim, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
             }

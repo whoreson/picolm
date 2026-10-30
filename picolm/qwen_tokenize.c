@@ -130,8 +130,23 @@ static int merge_rank(const qwen_merge_t *merges, int *mrg_tab,
     }
 }
 
-/* ---- Preetokenizer ---- */
+/* ---- Pretokenizer ---- */
+static int pretok_next_common(const char *s, int n, int glm4_digits);
+
 static int pretok_next(const char *s, int n) {
+    return pretok_next_common(s, n, 0);
+}
+
+/* GLM-4 / GLM-5.3-Flash pretokenizer.
+ * Identical to the Qwen/GPT-2 DEFAULT pattern except the digit rule is
+ * \p{N}{1,3} rather than a single \p{N}: runs of up to three digits group into
+ * one pretoken ("000" -> one token, "1234" -> "123" + "4").
+ * Reference: llama.cpp LLAMA_VOCAB_PRE_TYPE_GLM4 (llama-vocab.cpp). */
+static int pretok_next_glm4(const char *s, int n) {
+    return pretok_next_common(s, n, 1);
+}
+
+static int pretok_next_common(const char *s, int n, int glm4_digits) {
     int cp, adv;
 
     /* 1: contractions (case-insensitive) */
@@ -163,8 +178,21 @@ static int pretok_next(const char *s, int n) {
         }
     }
 
-    /* 3: single number */
-    if (is_N(cp)) return adv;
+    /* 3: number.
+     *   DEFAULT: a single digit.
+     *   GLM4:    1-3 digits grouped (\p{N}{1,3}). */
+    if (is_N(cp)) {
+        if (!glm4_digits) return adv;
+        {
+            int j = adv, cnt = 1;
+            while (j < n && cnt < 3) {
+                int c3, a3 = utf8_next(s + j, n - j, &c3);
+                if (!is_N(c3)) break;
+                j += a3; cnt++;
+            }
+            return j;
+        }
+    }
 
     /* 4: optional space + punct run + newlines */
     {
@@ -445,14 +473,17 @@ int qwen_tokenize_should_use(const model_t *m) {
      * (see qwen_enc_t.pretok_type / pretok_next vs pretok_next_tekken).
      * Llama SPM and other architectures should use the old tokenizer.
      * Safetensors Qwen models also use this tokenizer (from_safetensors path). */
-    return m->config.is_qwen || m->config.is_gpt2 || m->config.is_tekken || m->config.is_gptneox || m->from_safetensors;
+    return m->config.is_qwen || m->config.is_gpt2 || m->config.is_tekken ||
+           m->config.is_gptneox || m->config.is_glm4_tok || m->from_safetensors;
 }
 
 /* Initialize the Qwen tokenizer from model data */
 int qwen_tokenize_init(qwen_enc_t *enc, const model_t *m) {
     if (!g_maps_ready) build_maps();
 
-    enc->pretok_type = m->config.is_tekken ? QWEN_PRETOK_TEKKEN : QWEN_PRETOK_DEFAULT;
+    enc->pretok_type = m->config.is_tekken ? QWEN_PRETOK_TEKKEN
+                     : m->config.is_glm4_tok ? QWEN_PRETOK_GLM4
+                     : QWEN_PRETOK_DEFAULT;
 
     /* Guard: Qwen tokenizer requires tok_tokens_data from GGUF */
     if (!m->tok_tokens_data || !m->tok_n_tokens) {
@@ -614,6 +645,8 @@ int qwen_tokenize_encode(qwen_enc_t *enc, const char *text, int *out, int cap) {
         while (q < end && m2 < cap) {
             int pl = (enc->pretok_type == QWEN_PRETOK_TEKKEN)
                       ? pretok_next_tekken(text + q, end - q)
+                      : (enc->pretok_type == QWEN_PRETOK_GLM4)
+                      ? pretok_next_glm4(text + q, end - q)
                       : pretok_next(text + q, end - q);
             if (pl <= 0) pl = 1;
             m2 += bpe_piece(enc, text + q, pl, out + m2, cap - m2);

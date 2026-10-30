@@ -100,6 +100,28 @@ static int key_has_suffix(gguf_str_t s, const char *suffix) {
     return s.len >= n && memcmp(s.str + (s.len - n), suffix, n) == 0;
 }
 
+/* GLM-5.3-Flash arch prefix normalization.
+ * The GGUF spec puts general.architecture first, so by the time any
+ * arch-prefixed key arrives we know cfg->is_glm5. Both spellings
+ * ("glm5next" and "glm5-next") are canonicalised to "glm5next" so the
+ * existing str_eq chains only need one spelling. Returns a pointer to
+ * a static buffer when rewriting is needed, else the original. */
+static char glm5_keybuf[256];
+static gguf_str_t glm5_normalize_key(gguf_str_t key, int is_glm5) {
+    if (!is_glm5) return key;
+    if (key.len >= 10 && memcmp(key.str, "glm5-next.", 10) == 0) {
+        size_t rest = key.len - 9; /* "glm5-next." -> "glm5next." loses 1 char */
+        if (rest < sizeof(glm5_keybuf) - 1) {
+            memcpy(glm5_keybuf, "glm5next.", 9);
+            memcpy(glm5_keybuf + 9, key.str + 10, key.len - 10);
+            glm5_keybuf[9 + key.len - 10] = 0;
+            gguf_str_t out; out.str = glm5_keybuf; out.len = 9 + key.len - 10;
+            return out;
+        }
+    }
+    return key;
+}
+
 /* Forward declarations */
 static uint64_t skip_meta_value(reader_t *r, uint32_t vtype, int *is_numeric);
 static int gguf_format_value(char *buf, int buflen, reader_t *r, uint32_t vtype);
@@ -191,7 +213,7 @@ static uint64_t skip_meta_value(reader_t *r, uint32_t vtype, int *is_numeric) {
         case GGUF_META_BOOL:    return read_u8(r);
         case GGUF_META_STRING:  { read_gguf_string(r); *is_numeric = 0; return 0; }
         case GGUF_META_ARRAY: {
-            *is_numeric = 0;
+            if (is_numeric) *is_numeric = 0;
             uint32_t arr_type = read_u32(r);
             uint64_t arr_len  = read_u64(r);
             int dummy;
@@ -726,10 +748,20 @@ int model_list_tensors(const char *path) {
 
       APPEND("GGUF v%u: %" PRIu64 " metadata entries, %" PRIu64 " tensors\n\n",
              version, n_metadata, n_tensors);
-      APPEND("%-52s %14s %-12s %s\n", "Name", "Shape (rows x cols)", "Type", "Type ID");
-      APPEND("%-52s %14s %-12s %s\n", "----", "(outer x inner)", "----", "-------");
-      APPEND("%s", "NOTE: GGUF stores dims innermost-first. 2D shapes shown as [num_rows x row_len].\n");
-      APPEND("%s", "  For weight tensors: [output_dim x input_dim]. The stored row is contiguous.\n");
+      APPEND("%-52s %-20s %-16s %-12s %s\n",
+             "Name", "ne[] (raw GGUF order)", "matmul(n,d)", "Type", "Type ID");
+      APPEND("%-52s %-20s %-16s %-12s %s\n",
+             "----", "-------------------", "------------", "----", "-------");
+      APPEND("%s", "NOTE: ne[] is printed in RAW GGUF order (dims innermost-first, exactly as\n");
+      APPEND("%s", "  stored). ne[0] is the contiguous row length; ne[1] is the row count.\n");
+      APPEND("%s", "  This is the SAME order as --list-tensors' output for every rank, and the\n");
+      APPEND("%s", "  same order ggml prints. It is NOT the [out x in] math convention.\n");
+      APPEND("%s", "\n");
+      APPEND("%s", "matmul(out, x, W, n, d, type) reads d rows of n elements, so for a 2-D\n");
+      APPEND("%s", "  weight  n = ne[0] (input length),  d = ne[1] (output length).\n");
+      APPEND("%s", "  Passing them the other way round silently produces a wrong-shaped result:\n");
+      APPEND("%s", "  always cross-check against the matmul(n,d) column below.\n");
+      APPEND("%s", "  Tensors with rank != 2 have no single n,d and show '-' (slice them first).\n");
       APPEND("%s", "\n");
 
       for (uint64_t i = 0; i < n_tensors; i++) {
@@ -748,48 +780,45 @@ int model_list_tensors(const char *path) {
               nbuf[nlen-4] = '.'; nbuf[nlen-3] = '.'; nbuf[nlen-2] = '.';
           }
 
-          /* IMPORTANT: GGUF stores dims INNERMOST-FIRST (little-endian order):
-           *   dims[0] = innermost dimension (contiguous in memory, = row length for 2D)
-           *   dims[1] = next dimension up
-           *   dims[n-1] = outermost dimension (number of rows/blocks for 2D)
+          /* GGUF stores dims INNERMOST-FIRST, which is exactly ggml's ne[] order:
+           *   dims[0] = innermost (contiguous, = row length for a 2-D weight)
+           *   dims[1] = next up          (= row count for a 2-D weight)
+           * We print ne[] verbatim, for EVERY rank, so the listing matches ggml
+           * and the GGUF spec. The previous code printed 2-D tensors transposed
+           * as [out x in] while printing 3-D tensors in raw order, which made the
+           * table self-inconsistent and led directly to a matmul(n,d) mix-up.
            *
-           * For a weight tensor attn_q.weight with GGUF dims [5120, 4096]:
-           *   dims[0]=5120 -> each row has 5120 elements (inner, contiguous)
-           *   dims[1]=4096 -> there are 4096 such rows
-           *   Storage: 4096 rows of 5120 elements = 4096 * row_size(qtype, 5120) bytes
-           *
-           * This is the TRANSPOSE of the neural net convention where
-           * W is [in_features x out_features] = [5120 x 4096].
-           * The GGUF stores it as [4096 rows x 5120 cols] which is W^T.
-           *
-           * PicoLM's matmul(out, x, W, n, d) reads d rows of n elements.
-           * n must match the GGUF row length (dims[0]), d matches dims[1].
-           * This naturally computes W_gguf @ x = W_math^T @ x = correct.
-           *
-           * Print shapes in [rows x cols] = [outer x inner] format to match
-           * neural net convention and avoid confusion. This is NOT the
-           * raw GGUF dimension order. */
-          char dstr[32];
-          char *dp = dstr;
-          int drem = (int)(sizeof(dstr) - 1);
-          if (n_dims == 2) {
-              /* Print as [rows x cols] = [dims[1] x dims[0]] */
-              int n = snprintf(dp, drem + 1, "[%" PRIu64 ",%" PRIu64 "]",
-                               dims[1], dims[0]);
-              if (n > 0 && n < drem) { dp += n; drem -= n; } else dp += (int)sizeof(dstr) - 2;
-          } else {
-              /* For non-2D tensors: print raw GGUF order with annotation */
-              int n = snprintf(dp, drem + 1, "[%" PRIu64, dims[0]);
-              if (n > 0 && n < drem) { dp += n; drem -= n; }
+           * The matmul column spells out the argument order for 2-D weights:
+           *   matmul(out, x, W, n, d) reads d rows of n elements =>
+           *   n = ne[0] (input length), d = ne[1] (output length).
+           * For attn_q with ne = {4096, 8192}: n=4096, d=8192.
+           * Note this is the REVERSE of the "[out x in]" math convention. */
+          char dstr[40];
+          {
+              char *dp = dstr;
+              int drem = (int)(sizeof(dstr) - 1);
+              int n = snprintf(dp, (size_t)drem + 1, "%" PRIu64, dims[0]);
+              if (n > 0 && n < drem) { dp += n; drem -= n; } else drem = 0;
               for (uint32_t d = 1; d < n_dims && drem > 1; d++) {
-                  n = snprintf(dp, drem + 1, ",%" PRIu64, dims[d]);
-                  if (n > 0 && n < drem) { dp += n; drem -= n; } else break;
+                  n = snprintf(dp, (size_t)drem + 1, ",%" PRIu64, dims[d]);
+                  if (n > 0 && n < drem) { dp += n; drem -= n; } else { drem = 0; break; }
               }
-              if (drem > 0) { *dp = ']'; dp++; }
+              if (drem > 0) *dp = '\0';
+              else dstr[sizeof(dstr) - 1] = '\0';
           }
-          *dp = '\0';
 
-          APPEND("%-52s %14s %-12s %u\n", nbuf, dstr, gguf_type_name(type), type);
+          /* matmul(n,d) is only meaningful for a single 2-D weight matrix. */
+          char mstr[32];
+          if (n_dims == 2) {
+              snprintf(mstr, sizeof(mstr), "n=%" PRIu64 ",d=%" PRIu64, dims[0], dims[1]);
+          } else if (n_dims == 1) {
+              snprintf(mstr, sizeof(mstr), "%s", "vector");
+          } else {
+              snprintf(mstr, sizeof(mstr), "%s", "-");
+          }
+
+          APPEND("%-52s %-20s %-16s %-12s %u\n",
+                 nbuf, dstr, mstr, gguf_type_name(type), type);
       }
 #ifdef __clang__
 #pragma clang diagnostic pop
@@ -887,8 +916,11 @@ int model_list_kv(const char *path) {
     uint64_t n_tensors = read_u64(&r);
     uint64_t n_metadata = read_u64(&r);
 
-    /* Buffer: key + value per entry, plus header */
-    { size_t buf_size = 1024 + n_metadata * 128;
+    /* Buffer: key + value per entry, plus header. A single metadata value can be
+     * large (tokenizer.chat_template is several KB), so allow a generous fixed
+     * slab per entry instead of 128 bytes; otherwise long values are silently
+     * truncated. The APPEND macro already guards against overruns. */
+    { size_t buf_size = 4096 + (size_t)n_metadata * 8192;
       buf = malloc(buf_size);
       if (!buf) {
           fprintf(stderr, "ERROR: out of memory\n");
@@ -1038,6 +1070,11 @@ int parse_gguf(model_t *m, int max_seq_len) {
         gguf_str_t key = read_gguf_string(&r);
         uint32_t vtype = read_u32(&r);
 
+        /* Canonicalise "glm5-next." prefix to "glm5next." so the str_eq
+         * chains below only need one spelling. No-op for other arches and
+         * for the already-canonical "glm5next." spelling. */
+        key = glm5_normalize_key(key, cfg->is_glm5);
+
         if (str_eq(key, "general.architecture")) {
             int dummy;
             gguf_str_t arch;
@@ -1077,13 +1114,18 @@ int parse_gguf(model_t *m, int max_seq_len) {
                         cfg->is_gptneox = 1; break;
                     }
                 }
+                /* Check for GLM-5.3-Flash: "glm5next" or "glm5-next" */
+                if ((arch.len == 8 && memcmp(arch.str, "glm5next", 8) == 0) ||
+                    (arch.len == 9 && memcmp(arch.str, "glm5-next", 9) == 0)) {
+                    cfg->is_glm5 = 1;
+                }
             } else {
                 skip_meta_value(&r, vtype, &dummy);
             }
         } else
 
 
-        if (str_eq(key, "llama.embedding_length") || str_eq(key, "general.embedding_length")
+        if (str_eq(key, "glm5next.embedding_length") || str_eq(key, "llama.embedding_length") || str_eq(key, "general.embedding_length")
             || str_eq(key, "qwen2.embedding_length") || str_eq(key, "qwen3.embedding_length") || str_eq(key, "qwen35.embedding_length") || str_eq(key, "qwen35moe.embedding_length")
             || str_eq(key, "gemma3n.embedding_length") || str_eq(key, "gpt2.embedding_length") || str_eq(key, "stablelm.embedding_length")
             || str_eq(key, "gptneox.embedding_length")) {
@@ -1092,12 +1134,12 @@ int parse_gguf(model_t *m, int max_seq_len) {
              * (same as Llama). Only set rope_type=1 for qwen2, not qwen3/qwen35.
              * Gemma-3n uses standard pairwise RoPE (rope_type=0). */
             if (key.str[0] == 'q' && key.len > 6 && key.str[5] == '2') cfg->rope_type = 1;
-        } else if (str_eq(key, "llama.feed_forward_length") || str_eq(key, "general.feed_forward_length")
+        } else if (str_eq(key, "glm5next.feed_forward_length") || str_eq(key, "llama.feed_forward_length") || str_eq(key, "general.feed_forward_length")
             || str_eq(key, "qwen2.feed_forward_length") || str_eq(key, "qwen3.feed_forward_length") || str_eq(key, "qwen35.feed_forward_length")
             || str_eq(key, "gemma3n.feed_forward_length") || str_eq(key, "gpt2.feed_forward_length") || str_eq(key, "stablelm.feed_forward_length")
             || str_eq(key, "gptneox.feed_forward_length")) {
             cfg->n_ffn = (int)read_ffn_length(&r, vtype);
-        } else if (str_eq(key, "llama.attention.head_count")
+        } else if (str_eq(key, "glm5next.attention.head_count") || str_eq(key, "llama.attention.head_count")
             || str_eq(key, "qwen2.attention.head_count") || str_eq(key, "qwen3.attention.head_count") || str_eq(key, "qwen35.attention.head_count") || str_eq(key, "qwen35moe.attention.head_count")
             || str_eq(key, "gemma3n.attention.head_count") || str_eq(key, "gpt2.attention.head_count") || str_eq(key, "stablelm.attention.head_count")
             || str_eq(key, "gptneox.attention.head_count")) {
@@ -1113,14 +1155,22 @@ int parse_gguf(model_t *m, int max_seq_len) {
             || str_eq(key, "qwen3.attention.key_length") || str_eq(key, "qwen35.attention.key_length")
             || str_eq(key, "qwen35moe.attention.key_length")
             || str_eq(key, "gemma3n.attention.key_length")) {
-            /* Explicit head_dim (Qwen3/3.5/Gemma-3n/Mistral-Nemo may differ from n_embd/n_heads) */
-            int dummy; cfg->head_dim = (int)skip_meta_value(&r, vtype, &dummy);
-        } else if (str_eq(key, "llama.block_count")
+            /* Explicit head_dim (Qwen3/3.5/Gemma-3n/Mistral-Nemo may differ from n_embd/n_heads).
+             * GLM-5: attention.key_length is the KDA qkv output dim (d_inner), NOT
+             * head_dim. head_dim for MLA comes from attention.key_length_mla. We
+             * keep it only as a fallback; the authoritative value comes from the
+             * attn_q tensor shape (see the tensor mapping loop), because some
+             * GGUFs put the latent dim here instead. */
+            int dummy;
+            if (!cfg->is_glm5) cfg->head_dim = (int)skip_meta_value(&r, vtype, &dummy);
+            else { int v = (int)skip_meta_value(&r, vtype, &dummy);
+                   if (cfg->glm5_kda_d_inner <= 0) cfg->glm5_kda_d_inner = v; }
+        } else if (str_eq(key, "glm5next.block_count") || str_eq(key, "llama.block_count")
             || str_eq(key, "qwen2.block_count") || str_eq(key, "qwen3.block_count") || str_eq(key, "qwen35.block_count") || str_eq(key, "qwen35moe.block_count")
             || str_eq(key, "gemma3n.block_count") || str_eq(key, "gpt2.block_count") || str_eq(key, "stablelm.block_count")
             || str_eq(key, "gptneox.block_count")) {
             int dummy; cfg->n_layers = (int)skip_meta_value(&r, vtype, &dummy);
-        } else if (str_eq(key, "llama.context_length")
+        } else if (str_eq(key, "glm5next.context_length") || str_eq(key, "llama.context_length")
             || str_eq(key, "qwen2.context_length") || str_eq(key, "qwen3.context_length") || str_eq(key, "qwen35.context_length") || str_eq(key, "qwen35moe.context_length")
             || str_eq(key, "gemma3n.context_length") || str_eq(key, "gpt2.context_length") || str_eq(key, "stablelm.context_length")
             || str_eq(key, "gptneox.context_length")) {
@@ -1264,6 +1314,7 @@ int parse_gguf(model_t *m, int max_seq_len) {
             || str_eq(key, "qwen3.attention.layer_norm_rms_epsilon") || str_eq(key, "qwen35.attention.layer_norm_rms_epsilon") || str_eq(key, "qwen35moe.attention.layer_norm_rms_epsilon")
             || str_eq(key, "gemma3n.attention.layer_norm_rms_epsilon")
             || str_eq(key, "gpt2.attention.layer_norm_epsilon") || str_eq(key, "stablelm.attention.layer_norm_epsilon")
+            || str_eq(key, "glm5next.attention.layer_norm_rms_epsilon")
             || str_eq(key, "gptneox.attention.layer_norm_epsilon")) {
             /* Read epsilon from GGUF (F32 type=6 or F64 type=11 in metadata) */
             if (vtype == GGUF_META_FLOAT32) { /* F32 */
@@ -1338,14 +1389,19 @@ int parse_gguf(model_t *m, int max_seq_len) {
             }
         }
         /* MoE specific config (qwen35moe) */
-        else if (str_eq(key, "qwen35moe.expert_count")) {
+        else if (str_eq(key, "glm5next.expert_count") || str_eq(key, "qwen35moe.expert_count")) {
             int dummy; cfg->n_expert = (int)skip_meta_value(&r, vtype, &dummy); cfg->has_moe = 1;
-        } else if (str_eq(key, "qwen35moe.expert_used_count")) {
+        } else if (str_eq(key, "glm5next.expert_used_count") || str_eq(key, "qwen35moe.expert_used_count")) {
             int dummy; cfg->n_expert_used = (int)skip_meta_value(&r, vtype, &dummy);
-        } else if (str_eq(key, "qwen35moe.expert_feed_forward_length")) {
+        } else if (str_eq(key, "glm5next.expert_feed_forward_length") || str_eq(key, "qwen35moe.expert_feed_forward_length")) {
             int dummy; cfg->n_ff_exp = (int)skip_meta_value(&r, vtype, &dummy);
-            cfg->n_ffn = cfg->n_ff_exp; /* reuse n_ffn for buffer sizing */
-        } else if (str_eq(key, "qwen35moe.expert_shared_feed_forward_length")) {
+            /* NOTE: GLM-5 keeps n_ffn = the *dense* feed_forward_length (12288)
+             * because n_ffn also sizes s->hb/hb2 which the MoE path reuses as
+             * a [n_embd] output buffer. Clobbering it to n_ff_exp (2048) makes
+             * that buffer too small. Qwen35moe has no dense FFN, so it keeps
+             * the old reuse. */
+            if (!cfg->is_glm5) cfg->n_ffn = cfg->n_ff_exp;
+        } else if (str_eq(key, "glm5next.expert_shared_feed_forward_length") || str_eq(key, "qwen35moe.expert_shared_feed_forward_length")) {
             int dummy; cfg->n_ff_shexp = (int)skip_meta_value(&r, vtype, &dummy);
         }
         /* Gemma-3n: laurel_rank is derived from tensor shapes, not from KV */
@@ -1358,7 +1414,8 @@ int parse_gguf(model_t *m, int max_seq_len) {
             int dummy; cfg->alignment = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "llama.vocab_size")
             || str_eq(key, "qwen2.vocab_size") || str_eq(key, "qwen3.vocab_size") || str_eq(key, "qwen35.vocab_size") || str_eq(key, "qwen35moe.vocab_size")
-            || str_eq(key, "gemma3n.vocab_size") || str_eq(key, "gpt2.vocab_size") || str_eq(key, "gptneox.vocab_size")) {
+            || str_eq(key, "gemma3n.vocab_size") || str_eq(key, "gpt2.vocab_size") || str_eq(key, "gptneox.vocab_size")
+            || str_eq(key, "glm5next.vocab_size")) {
             int dummy; cfg->vocab_size = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "tokenizer.ggml.bos_token_id")) {
             int dummy; m->tok_bos_id = (uint32_t)skip_meta_value(&r, vtype, &dummy);
@@ -1379,6 +1436,108 @@ int parse_gguf(model_t *m, int max_seq_len) {
             }
         } else if (str_eq(key, "tokenizer.ggml.eos_token_id")) {
             int dummy; m->tok_eos_id = (uint32_t)skip_meta_value(&r, vtype, &dummy);
+        /* ---- GLM-5.3-Flash (glm5next / glm5-next) ----
+         * Prefix-agnostic suffix match: the GGUF arch string may be either
+         * spelling, and the KV keys carry it verbatim. */
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".attention.head_count_kv")) {
+            /* Per-layer array: 0 = KDA layer, 1 = MLA layer (n_kv_heads=1).
+             * Also sets n_kv_heads to the max (1) for generic code paths. */
+            if (vtype == GGUF_META_ARRAY) {
+                uint32_t etype = read_u32(&r);
+                uint64_t n = read_u64(&r);
+                if (etype == GGUF_META_INT32 || etype == GGUF_META_UINT32) {
+                    int mla_seen = 0;
+                    for (uint64_t i = 0; i < n; i++) {
+                        int64_t v = read_i32(&r);
+                        if (i < (uint64_t)MAX_LAYERS) {
+                            cfg->glm5_layer_is_mla[i] = (v > 0) ? 1 : 0;
+                            if (v > 0) mla_seen = 1;
+                        }
+                    }
+                    cfg->glm5_mla_pattern_len = (int)n;
+                    if (n < (uint64_t)MAX_LAYERS)
+                        memset(cfg->glm5_layer_is_mla + n, 0, MAX_LAYERS - n);
+                    (void)mla_seen;
+                    cfg->n_kv_heads = 1;  /* MLA layers have 1 KV head */
+                } else {
+                    skip_meta_value(&r, vtype, NULL);
+                }
+            } else {
+                skip_meta_value(&r, vtype, NULL);
+            }
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".attention.layer_norm_epsilon")) {
+            /* GLM-5 carries TWO normalisation epsilons:
+             *   attention.layer_norm_rms_epsilon (1e-5) -> every RMSNorm
+             *   attention.layer_norm_epsilon     (1e-6) -> the DSA indexer's
+             *                                              LayerNorm (with bias)
+             * They must not share a field: whichever KV was parsed last used to
+             * win, which silently set the RMS eps to 1e-6 and scaled every
+             * hc_pre/adam norm by ~0.5%. */
+            if (vtype == GGUF_META_FLOAT32) { cfg->glm5_ln_eps = read_f32(&r); }
+            else { skip_meta_value(&r, vtype, NULL); }
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".attention.q_lora_rank")) {
+            int dummy; cfg->glm5_q_lora = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".attention.kv_lora_rank")) {
+            int dummy; cfg->glm5_kv_lora = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".attention.key_length_mla")) {
+            int dummy; cfg->glm5_mla_head_dim = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".attention.value_length_mla")) {
+            int dummy; cfg->glm5_mla_head_dim = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".kda.head_dim")) {
+            int dummy; cfg->glm5_kda_dim = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".kda.gate_lower_bound")) {
+            if (vtype == GGUF_META_FLOAT32) { cfg->glm5_kda_lower_bound = read_f32(&r); }
+            else { skip_meta_value(&r, vtype, NULL); }
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".ssm.conv_kernel")) {
+            int dummy; cfg->ssm_d_conv = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".attention.indexer.head_count")) {
+            int dummy; cfg->glm5_idx_nh = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".attention.indexer.key_length")) {
+            int dummy; cfg->glm5_idx_dim = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".attention.indexer.top_k")) {
+            int dummy; cfg->glm5_idx_topk = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".attention.indexer.kpool")) {
+            int dummy; cfg->glm5_idx_kpool = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".hyper_connection.count")) {
+            int dummy; cfg->glm5_hc = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".hyper_connection.sinkhorn_iterations")) {
+            int dummy; cfg->glm5_sinkhorn_iters = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".hyper_connection.epsilon")) {
+            if (vtype == GGUF_META_FLOAT32) { cfg->glm5_hc_eps = read_f32(&r); }
+            else { skip_meta_value(&r, vtype, NULL); }
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".expert_weights_scale")) {
+            if (vtype == GGUF_META_FLOAT32) { cfg->glm5_moe_scale = read_f32(&r); cfg->glm5_moe_scale_set = 1; }
+            else { skip_meta_value(&r, vtype, NULL); }
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".expert_weights_norm")) {
+            if (vtype == GGUF_META_BOOL) { cfg->glm5_moe_norm = (int)read_u8(&r); }
+            else { skip_meta_value(&r, vtype, NULL); }
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".leading_dense_block_count")) {
+            int dummy; cfg->n_layer_dense_lead = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".nextn_predict_layers")) {
+            int dummy; cfg->n_mtp_layers = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".swiglu_clamp_exp")) {
+            /* Per-layer array of f32; we take the first value (all 10.0 in practice). */
+            if (vtype == GGUF_META_ARRAY) {
+                uint32_t etype = read_u32(&r);
+                uint64_t n = read_u64(&r);
+                if (etype == GGUF_META_FLOAT32) {
+                    for (uint64_t i = 0; i < n; i++) {
+                        float v = read_f32(&r);
+                        if (i == 0) cfg->glm5_clamp_exp = v;
+                    }
+                } else { skip_meta_value(&r, vtype, NULL); }
+            } else { skip_meta_value(&r, vtype, NULL); }
+        } else if (cfg->is_glm5 && key_has_suffix(key, ".swiglu_clamp_shexp")) {
+            if (vtype == GGUF_META_ARRAY) {
+                uint32_t etype = read_u32(&r);
+                uint64_t n = read_u64(&r);
+                if (etype == GGUF_META_FLOAT32) {
+                    for (uint64_t i = 0; i < n; i++) {
+                        float v = read_f32(&r);
+                        if (i == 0) cfg->glm5_clamp_shexp = v;
+                    }
+                } else { skip_meta_value(&r, vtype, NULL); }
+            } else { skip_meta_value(&r, vtype, NULL); }
         } else if (str_eq(key, "tokenizer.ggml.pre")) {
             /* Detect space marker type for tokenization.
              * GPT-2 BPE tokenizers use literal spaces, not U+2581. */
@@ -1390,6 +1549,17 @@ int parse_gguf(model_t *m, int max_seq_len) {
                 } else if (pre.len >= 6 && strncmp(pre.str, "qwen35", 6) == 0) {
                     m->tok_space_marker = 3; /* qwen35: U+0100, no prefix on first token */
                     m->tok_unknown_model = 0;
+                } else if (pre.len == 4 && strncmp(pre.str, "glm4", 4) == 0) {
+                    /* GLM-4/GLM-5: GPT-2 byte-level BPE, \p{N}{1,3} digit grouping.
+                     * Handled by qwen_tokenize.c with QWEN_PRETOK_GLM4. */
+                    m->tok_space_marker = 0; /* literal space */
+                    m->tok_unknown_model = 0;
+                    cfg->is_glm4_tok = 1;
+                    /* GLM-4/GLM-5 use add_bos=false: the chat template itself
+                     * starts with [gMASK]<sop>, so prepending BOS would emit
+                     * <sop> twice. GGUFs from this family omit the KV, hence the
+                     * explicit default here (an explicit KV still wins). */
+                    m->tok_add_bos = 0;
                 } else if (pre.len == 6 && strncmp(pre.str, "tekken", 6) == 0) {
                     /* Mistral Tekken tokenizer (Mistral-Nemo-2407 and later).
                      * Same GPT-2-style byte-level BPE vocab/merges representation as
@@ -1418,6 +1588,7 @@ int parse_gguf(model_t *m, int max_seq_len) {
             }
         } else if (str_eq(key, "tokenizer.ggml.add_bos_token")) {
             int dummy; m->tok_add_bos = (int)skip_meta_value(&r, vtype, &dummy);
+            m->tok_add_bos_set = 1;
         } else if (str_eq(key, "tokenizer.ggml.add_space_prefix")) {
             int dummy; m->tok_add_space_prefix = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "tokenizer.ggml.tokens")) {
@@ -1737,6 +1908,12 @@ int parse_gguf(model_t *m, int max_seq_len) {
     model_weights_t *w = &m->weights;
     memset(w, 0, sizeof(*w));
 
+    /* GLM-5: allocate the per-layer extension array (zeroed). */
+    if (cfg->is_glm5) {
+        w->glm5 = (glm5_layer_weights_t *)calloc(MAX_LAYERS, sizeof(glm5_layer_weights_t));
+        if (!w->glm5) { fprintf(stderr, "OOM: glm5 layer weights\n"); return -1; }
+    }
+
     for (uint64_t i = 0; i < total_tensor_count; i++) {
         /* Resolve tensor pointer from the correct split's mmap region */
         int si = tinfos[i].split_idx;
@@ -1793,10 +1970,18 @@ int parse_gguf(model_t *m, int max_seq_len) {
 
             if (layer >= 0 && layer < MAX_LAYERS) {
                 layer_weights_t *lw = &w->layers[layer];
+                glm5_layer_weights_t *gw = w->glm5 ? &w->glm5[layer] : NULL;
                 if (strcmp(suffix, "attn_norm.weight") == 0) {
                     lw->attn_norm = ptr; lw->type_attn_norm = qtype;
                 } else if (strcmp(suffix, "attn_q.weight") == 0) {
                     lw->attn_q = ptr; lw->type_attn_q = qtype;
+                    if (cfg->is_glm5 && tinfos[i].n_dims >= 2) {
+                        /* attn_q only exists on KDA layers: [n_embd, d_inner].
+                         * d_inner = dims[1] (output rows). This is authoritative:
+                         * attention.key_length is unreliable across GGUF versions. */
+                        cfg->glm5_kda_d_inner = (int)tinfos[i].dims[1];
+                        cfg->glm5_kda_d_inner_set = 1;
+                    }
                 } else if (strcmp(suffix, "attn_k.weight") == 0) {
                     lw->attn_k = ptr; lw->type_attn_k = qtype; lw->is_attn_layer = 1;
                 } else if (strcmp(suffix, "attn_v.weight") == 0) {
@@ -1861,20 +2046,111 @@ int parse_gguf(model_t *m, int max_seq_len) {
                     if (m->config.is_gpt2 || m->config.is_gptneox) lw->is_attn_layer = 1;
                 } else if (strcmp(suffix, "attn_gate.weight") == 0) {
                     lw->attn_gate_ssm = ptr; lw->type_attn_gate_ssm = qtype;
-                } else if (strcmp(suffix, "ssm_a") == 0) {
+                } else if (!cfg->is_glm5 && strcmp(suffix, "ssm_a") == 0) {
                     lw->ssm_a = ptr; lw->type_ssm_a = qtype;
                 } else if (strcmp(suffix, "ssm_alpha.weight") == 0) {
                     lw->ssm_alpha = ptr; lw->type_ssm_alpha = qtype;
-                } else if (strcmp(suffix, "ssm_beta.weight") == 0) {
+                } else if (!cfg->is_glm5 && strcmp(suffix, "ssm_beta.weight") == 0) {
                     lw->ssm_beta = ptr; lw->type_ssm_beta = qtype;
-                } else if (strcmp(suffix, "ssm_conv1d.weight") == 0) {
+                } else if (!cfg->is_glm5 && strcmp(suffix, "ssm_conv1d.weight") == 0) {
                     lw->ssm_conv1d = ptr; lw->type_ssm_conv1d = qtype;
-                } else if (strcmp(suffix, "ssm_dt.bias") == 0) {
+                } else if (!cfg->is_glm5 && strcmp(suffix, "ssm_dt.bias") == 0) {
                     lw->ssm_dt = ptr; lw->type_ssm_dt = qtype;
-                } else if (strcmp(suffix, "ssm_norm.weight") == 0) {
+                } else if (!cfg->is_glm5 && strcmp(suffix, "ssm_norm.weight") == 0) {
                     lw->ssm_norm = ptr;
-                } else if (strcmp(suffix, "ssm_out.weight") == 0) {
+                } else if (!cfg->is_glm5 && strcmp(suffix, "ssm_out.weight") == 0) {
                     lw->ssm_out = ptr; lw->type_ssm_out = qtype;
+                }
+                /* ---- GLM-5.3-Flash (glm5next) per-layer tensors ----
+                 * KDA conv/gate tensors use ssm_* names that clash with the
+                 * Qwen SSM fields, so intercept them into the glm5 slots.
+                 * attn_q/k/v and attn_output are shared with MLA (a layer is
+                 * either KDA or MLA, never both); they land in the generic
+                 * lw-> fields and the forward pass disambiguates via
+                 * cfg->glm5_layer_is_mla[]. */
+                else if (cfg->is_glm5 && strcmp(suffix, "ssm_conv1d_q.weight") == 0) {
+                    gw->kda_conv_q = ptr;
+                } else if (cfg->is_glm5 && strcmp(suffix, "ssm_conv1d_k.weight") == 0) {
+                    gw->kda_conv_k = ptr;
+                } else if (cfg->is_glm5 && strcmp(suffix, "ssm_conv1d_v.weight") == 0) {
+                    gw->kda_conv_v = ptr;
+                } else if (cfg->is_glm5 && strcmp(suffix, "ssm_f_a.weight") == 0) {
+                    gw->kda_f_a = ptr; gw->type_kda_f_a = qtype;
+                } else if (cfg->is_glm5 && strcmp(suffix, "ssm_f_b.weight") == 0) {
+                    gw->kda_f_b = ptr; gw->type_kda_f_b = qtype;
+                } else if (cfg->is_glm5 && strcmp(suffix, "ssm_g_a.weight") == 0) {
+                    gw->kda_g_a = ptr; gw->type_kda_g_a = qtype;
+                } else if (cfg->is_glm5 && strcmp(suffix, "ssm_g_b.weight") == 0) {
+                    gw->kda_g_b = ptr; gw->type_kda_g_b = qtype;
+                } else if (cfg->is_glm5 && strcmp(suffix, "ssm_beta.weight") == 0) {
+                    gw->kda_beta = ptr; gw->type_kda_beta = qtype;
+                } else if (cfg->is_glm5 && strcmp(suffix, "ssm_a") == 0) {
+                    gw->kda_a = ptr;
+                } else if (cfg->is_glm5 && strcmp(suffix, "exp_probs_b.bias") == 0) {
+                    gw->exp_probs_b = ptr;
+                } else if (cfg->is_glm5 && strcmp(suffix, "ssm_dt.bias") == 0) {
+                    gw->kda_dt_bias = ptr;
+                } else if (cfg->is_glm5 && strcmp(suffix, "ssm_norm.weight") == 0) {
+                    gw->kda_norm = ptr;
+                }
+                else if (cfg->is_glm5 && strcmp(suffix, "hc_attn_fn.weight") == 0) {
+                    gw->hc_attn_fn = ptr; gw->type_hc_attn_fn = qtype;
+                } else if (cfg->is_glm5 && strcmp(suffix, "hc_attn_base.weight") == 0) {
+                    gw->hc_attn_base = ptr;
+                } else if (cfg->is_glm5 && strcmp(suffix, "hc_attn_scale.weight") == 0) {
+                    gw->hc_attn_scale = ptr;
+                } else if (cfg->is_glm5 && strcmp(suffix, "hc_ffn_fn.weight") == 0) {
+                    gw->hc_ffn_fn = ptr; gw->type_hc_ffn_fn = qtype;
+                } else if (cfg->is_glm5 && strcmp(suffix, "hc_ffn_base.weight") == 0) {
+                    gw->hc_ffn_base = ptr;
+                } else if (cfg->is_glm5 && strcmp(suffix, "hc_ffn_scale.weight") == 0) {
+                    gw->hc_ffn_scale = ptr;
+                }
+                /* GLM-5 MLA (absorbed, NoPE): attn_q_a/q_a_norm/q_b/kv_a_mqa/
+                 * kv_a_norm/k_b/v_b + attn_output (shared name with KDA). */
+                else if (cfg->is_glm5 && strcmp(suffix, "attn_q_a.weight") == 0) {
+                    gw->mla_q_a = ptr; gw->type_mla_q_a = qtype;
+                } else if (cfg->is_glm5 && strcmp(suffix, "attn_q_a_norm.weight") == 0) {
+                    gw->mla_q_a_norm = ptr;
+                } else if (cfg->is_glm5 && strcmp(suffix, "attn_q_b.weight") == 0) {
+                    gw->mla_q_b = ptr; gw->type_mla_q_b = qtype;
+                } else if (cfg->is_glm5 && strcmp(suffix, "attn_kv_a_mqa.weight") == 0) {
+                    gw->mla_kv_a_mqa = ptr; gw->type_mla_kv_a_mqa = qtype;
+                } else if (cfg->is_glm5 && strcmp(suffix, "attn_kv_a_norm.weight") == 0) {
+                    gw->mla_kv_a_norm = ptr;
+                } else if (cfg->is_glm5 && strcmp(suffix, "attn_k_b.weight") == 0) {
+                    gw->mla_k_b = ptr; gw->type_mla_k_b = qtype;
+                } else if (cfg->is_glm5 && strcmp(suffix, "attn_v_b.weight") == 0) {
+                    gw->mla_v_b = ptr; gw->type_mla_v_b = qtype;
+                }
+                /* GLM-5 DSA indexer (MLA layers only) */
+                else if (cfg->is_glm5 && strcmp(suffix, "indexer.k_norm.weight") == 0) {
+                    gw->idx_k_norm_w = ptr;
+                } else if (cfg->is_glm5 && strcmp(suffix, "indexer.k_norm.bias") == 0) {
+                    gw->idx_k_norm_b = ptr;
+                } else if (cfg->is_glm5 && strcmp(suffix, "indexer.proj.weight") == 0) {
+                    gw->idx_proj = ptr; gw->type_idx_proj = qtype;
+                } else if (cfg->is_glm5 && strcmp(suffix, "indexer.attn_k.weight") == 0) {
+                    gw->idx_attn_k = ptr; gw->type_idx_attn_k = qtype;
+                } else if (cfg->is_glm5 && strcmp(suffix, "indexer.attn_q_b.weight") == 0) {
+                    gw->idx_q_b = ptr; gw->type_idx_q_b = qtype;
+                } else if (cfg->is_glm5 && strcmp(suffix, "indexer_compressor_gate.weight") == 0) {
+                    gw->idx_gate = ptr; gw->type_idx_gate = qtype;
+                } else if (cfg->is_glm5 && strcmp(suffix, "indexer_compressor_ape.weight") == 0) {
+                    gw->idx_ape = ptr; gw->type_idx_ape = qtype;
+                }
+                /* GLM-5 NextN (MTP) block, layer n_layers-1 */
+                else if (cfg->is_glm5 && strncmp(suffix, "nextn.", 6) == 0) {
+                    const char *ns = suffix + 6;
+                    if (strcmp(ns, "eh_proj.weight") == 0) {
+                        m->weights.glm5g.nextn_eh_proj = ptr; m->weights.glm5g.type_nextn_eh_proj = qtype;
+                    } else if (strcmp(ns, "enorm.weight") == 0) {
+                        m->weights.glm5g.nextn_enorm = ptr;
+                    } else if (strcmp(ns, "hnorm.weight") == 0) {
+                        m->weights.glm5g.nextn_hnorm = ptr;
+                    } else if (strcmp(ns, "shared_head_norm.weight") == 0) {
+                        m->weights.glm5g.nextn_shared_head_norm = ptr;
+                    }
                 }
                 /* GPT-2 bias tensors (all F32) */
                 else if (strcmp(suffix, "attn_qkv.bias") == 0) {
@@ -1987,6 +2263,118 @@ int parse_gguf(model_t *m, int max_seq_len) {
         cfg->weight_type = w->layers[0].type_attn_q;
     }
 
+    /* GLM-5.3-Flash (glm5next): derive config, validate, classify layers. */
+    if (cfg->is_glm5) {
+        if (cfg->glm5_hc <= 0) cfg->glm5_hc = 4;
+        if (cfg->glm5_sinkhorn_iters <= 0) cfg->glm5_sinkhorn_iters = 20;
+        if (cfg->glm5_hc_eps <= 0.0f) cfg->glm5_hc_eps = 1e-6f;
+        if (cfg->glm5_kda_dim <= 0) cfg->glm5_kda_dim = 128;
+        if (cfg->ssm_d_conv <= 0) cfg->ssm_d_conv = 4;
+        /* d_inner (KDA qkv output dim) is derived from the attn_q tensor shape
+         * (dims[1] = output rows = n_kda_heads * kda_dim) during tensor mapping.
+         * attention.key_length is only a fallback (some GGUF revisions store the
+         * MLA latent dim there instead of d_inner). */
+        if (!cfg->glm5_kda_d_inner_set || cfg->glm5_kda_d_inner <= 0) {
+            fprintf(stderr, "ERROR: glm5: no KDA layers (attn_q) found to derive d_inner\n");
+            return -1;
+        }
+        if (cfg->glm5_kda_d_inner % cfg->glm5_kda_dim != 0) {
+            fprintf(stderr, "ERROR: glm5: d_inner=%d not a multiple of kda.head_dim=%d\n",
+                    cfg->glm5_kda_d_inner, cfg->glm5_kda_dim);
+            return -1;
+        }
+        cfg->glm5_n_kda_heads = cfg->glm5_kda_d_inner / cfg->glm5_kda_dim;
+        if (cfg->glm5_kda_d_inner != cfg->n_heads * cfg->glm5_kda_dim)
+            fprintf(stderr, "glm5: NOTE d_inner=%d but n_heads(%d)*kda_dim(%d)=%d\n",
+                    cfg->glm5_kda_d_inner, cfg->n_heads, cfg->glm5_kda_dim,
+                    cfg->n_heads * cfg->glm5_kda_dim);
+        if (cfg->glm5_idx_kpool <= 0) cfg->glm5_idx_kpool = 4;
+        /* MLA head dim: key_length_mla (256), not key_length (512 = kv_lora+rot) */
+        if (cfg->glm5_mla_head_dim <= 0) cfg->glm5_mla_head_dim = 256;
+        /* head_dim for the generic code: MLA absorbs K into the latent, so the
+         * "head dim" that matters for RoPE etc. is 0 (NoPE, no rotary). */
+        cfg->head_dim = cfg->glm5_mla_head_dim;
+        cfg->has_moe = 1;             /* MoE from layer n_dense_lead onward */
+        cfg->has_ssm = 0;             /* KDA is not the Qwen SSM path */
+        cfg->rope_dim = 0;            /* NoPE */
+        cfg->rope_type = 0;
+        /* Classify layers: head_count_kv[l] > 0 => MLA, else KDA. The array
+         * was stored into glm5_layer_is_mla during KV parse. */
+        if (cfg->glm5_mla_pattern_len > 0 && cfg->glm5_mla_pattern_len < cfg->n_layers)
+            fprintf(stderr, "WARN: glm5: head_count_kv has %d entries for %d layers\n",
+                    cfg->glm5_mla_pattern_len, cfg->n_layers);
+        /* Trunk layers = n_layers - n_mtp_layers. nextn_predict_layers was
+         * parsed from the KV metadata; also count trailing blocks that carry
+         * "nextn." tensors (belt and braces, and the authoritative source when
+         * the KV is absent). NOTE: this must happen BEFORE the layer
+         * classification below, which uses n_layer_kv_from_start. */
+        {
+            int mtp = 0;
+            for (int i = cfg->n_layers - 1; i >= 0; i--) {
+                int has_nextn = 0;
+                for (uint64_t ti = 0; ti < total_tensor_count; ti++) {
+                    const char *nm = tinfos[ti].name.str;
+                    if (!nm || strncmp(nm, "blk.", 4) != 0) continue;
+                    const char *q = nm + 4;
+                    int bl = 0;
+                    while (*q >= '0' && *q <= '9') { bl = bl * 10 + (*q - '0'); q++; }
+                    if (*q != '.') continue;
+                    if (bl == i && strstr(nm, "nextn.")) { has_nextn = 1; break; }
+                }
+                if (has_nextn) mtp++;
+                else break;   /* MTP layers are contiguous at the end */
+            }
+            if (mtp > 0) cfg->n_mtp_layers = mtp;
+        }
+        cfg->n_layer_kv_from_start = cfg->n_layers - cfg->n_mtp_layers;
+        if (cfg->n_layer_kv_from_start <= 0 || cfg->n_layer_kv_from_start > cfg->n_layers)
+            cfg->n_layer_kv_from_start = cfg->n_layers;
+        int n_mla = 0, n_kda = 0;
+        for (int l = 0; l < cfg->n_layers && l < MAX_LAYERS; l++) {
+            if (l >= cfg->n_layer_kv_from_start) {
+                /* NextN layer: MLA-shaped but not a trunk layer. Exclude it from
+                 * the MLA ordinals so the latent cache stays trunk-sized. */
+                cfg->glm5_layer_mla_ord[l] = -1;
+                continue;
+            }
+            if (cfg->glm5_layer_is_mla[l]) {
+                cfg->glm5_layer_mla_ord[l] = n_mla++;
+            } else {
+                cfg->glm5_layer_mla_ord[l] = -1;
+                n_kda++;
+            }
+        }
+        if (n_mla == 0) {
+            fprintf(stderr, "ERROR: glm5: no MLA layers found (head_count_kv array all zero?)\n");
+            return -1;
+        }
+        cfg->glm5_n_mla = n_mla;
+        /* GLM-4/5 templates begin with [gMASK]<sop>, so BOS must not be
+         * prepended (it would emit <sop> twice). Honour an explicit
+         * tokenizer.ggml.add_bos_token if the GGUF has one. */
+        if (!m->tok_add_bos_set && cfg->is_glm4_tok) m->tok_add_bos = 0;
+        cfg->glm5_n_kda = n_kda;
+        if (getenv("PICOLM_DBG_GLM5")) {
+            int mapped = 0;
+            for (int l = 0; l < cfg->n_layers; l++)
+                if (w->glm5 && w->glm5[l].hc_attn_fn) mapped++;
+            fprintf(stderr, "GLM5 map check: w->glm5=%p, layers with hc_attn_fn=%d/%d\n",
+                    (void*)w->glm5, mapped, cfg->n_layers);
+            for (int l = 0; l < cfg->n_layers && l < 8; l++)
+                fprintf(stderr, "  l=%d is_mla=%d hc_attn_fn=%p base=%p attn_q=%p\n",
+                        l, cfg->glm5_layer_is_mla[l],
+                        w->glm5 ? w->glm5[l].hc_attn_fn : NULL,
+                        w->glm5 ? w->glm5[l].hc_attn_base : NULL,
+                        w->layers[l].attn_q);
+        }
+        fprintf(stderr, "glm5: %d layers (%d MLA, %d KDA), hc=%d, q_lora=%d, kv_lora=%d, "
+                "mla_hd=%d, kda_dim=%d, idx=%d/%d/%d, moe=%d/%d scale=%.2f\n",
+                cfg->n_layers, n_mla, n_kda, cfg->glm5_hc, cfg->glm5_q_lora,
+                cfg->glm5_kv_lora, cfg->glm5_mla_head_dim, cfg->glm5_kda_dim,
+                cfg->glm5_idx_nh, cfg->glm5_idx_topk, cfg->glm5_idx_kpool,
+                cfg->n_expert, cfg->n_expert_used, cfg->glm5_moe_scale);
+    }
+
     /* Verify required tensors for StableLM */
     if (cfg->is_stablelm) {
         for (int l = 0; l < cfg->n_layers; l++) {
@@ -2011,8 +2399,10 @@ int parse_gguf(model_t *m, int max_seq_len) {
         }
     }
 
-    /* Count MTP layers from the end: layers with "nextn" tensors */
-    if (cfg->has_mtp) {
+    /* Count MTP layers from the end: layers with "nextn" tensors.
+     * GLM-5 already did this inside its derive block (before layer
+     * classification); skip here so n_mtp_layers is not double-counted. */
+    if (cfg->has_mtp && !cfg->is_glm5) {
         for (int i = cfg->n_layers - 1; i >= 0; i--) {
             int has_nextn = 0;
             for (uint64_t ti = 0; ti < total_tensor_count; ti++) {

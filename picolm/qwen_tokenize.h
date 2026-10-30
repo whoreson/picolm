@@ -13,6 +13,7 @@ typedef struct {
 enum {
     QWEN_PRETOK_DEFAULT = 0, /* Qwen3.5/3.6 / GPT-2 style pretokenizer */
     QWEN_PRETOK_TEKKEN  = 1, /* Mistral Tekken pretokenizer (Mistral-Nemo-2407+) */
+    QWEN_PRETOK_GLM4    = 2, /* GLM-4 / GLM-5.3-Flash: DEFAULT with \p{N}{1,3} digits */
 };
 
 typedef struct {
@@ -25,7 +26,7 @@ typedef struct {
     int vocab_size;
     int bos_id;
     int eos_id;
-    int pretok_type; /* QWEN_PRETOK_DEFAULT or QWEN_PRETOK_TEKKEN */
+    int pretok_type; /* QWEN_PRETOK_DEFAULT / _TEKKEN / _GLM4 */
 } qwen_enc_t;
 
 /* Check if a model should use the Qwen tokenizer */

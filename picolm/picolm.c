@@ -198,6 +198,19 @@ static const char *tmpl_chatml_suffix =
 static const char *tmpl_tekken_prefix = "[INST]";
 static const char *tmpl_tekken_suffix = "[/INST]";
 
+/* GLM-4/GLM-5.3-Flash chat template.
+ *
+ * Renders a single-turn chat as:
+ *
+ *     [gMASK]<sop><|user|>\n<PROMPT><|assistant|>\n</think>\n
+ *
+ * <|user|> and <|assistant|> are GGUF special tokens. GLM-5.3 thinks by
+ * default; emitting an immediately-closed </think> requests a direct answer.
+ * NOTE: only EOS is implemented as a stop condition (no EOG set), so
+ * generation stops solely on <|endoftext|>. */
+static const char *tmpl_glm_prefix = "[gMASK]<sop><|user|>\n";
+static const char *tmpl_glm_suffix = "<|assistant|>\n</think>\n";
+
 static const char *tmpl_alpaca_prefix =
     "Below is an instruction that describes a task. Write a response that appropriately completes the request.\r\n\r\n"
     "### Instruction:\r\n";
@@ -223,7 +236,10 @@ static char *apply_chat_template(const char *model_path, const model_t *model, c
     }
     lower[blen] = '\0';
 
-    if (model && model->config.is_tekken) {
+    if (model && model->config.is_glm5) {
+        prefix = tmpl_glm_prefix;
+        suffix = tmpl_glm_suffix;
+    } else if (model && model->config.is_tekken) {
         prefix = tmpl_tekken_prefix;
         suffix = tmpl_tekken_suffix;
     } else if (strstr(lower, "gemma")) {
@@ -2033,8 +2049,32 @@ int main(int argc, char **argv) {
         }
 
                 grammar_apply(&grammar, logits, model.config.vocab_size);
-        if (getenv("PICOLM_LOGITS_DUMP"))
+        if (getenv("PICOLM_LOGITS_DUMP")) {
             dump_top_logits(logits, model.config.vocab_size, pos, 5);
+            /* Also show what the top candidates decode to: a sane model should
+             * prefer meaningful pieces, not raw byte tokens. */
+            if (use_qwen_tok) {
+                static char dbuf[8][64];
+                int ids[8]; float vals[8];
+                int n_top = 0;
+                for (int k = 0; k < 5; k++) {
+                    int bi = -1; float bv = -1e30f;
+                    for (int i = 0; i < model.config.vocab_size; i++) {
+                        int seen = 0;
+                        for (int j = 0; j < k; j++) if (ids[j] == i) { seen = 1; break; }
+                        if (!seen && logits[i] > bv) { bv = logits[i]; bi = i; }
+                    }
+                    if (bi < 0) break;
+                    ids[k] = bi; vals[k] = bv;
+                    qwen_tokenize_decode2(&qwen_enc, bi, dbuf[k], 64, 1);
+                    n_top = k + 1;
+                }
+                fprintf(stderr, "[TOPDEC pos=%d]", pos);
+                for (int k = 0; k < n_top; k++)
+                    fprintf(stderr, " %d='%s'(%.3f)", ids[k], dbuf[k], vals[k]);
+                fprintf(stderr, "\n");
+            }
+        }
         dump_logits_to_file(logits, model.config.vocab_size, pos);
         next = sampler_sample(&sampler, logits, model.config.vocab_size);
         if (getenv("PICOLM_DBG"))

@@ -53,7 +53,7 @@ endif
 
 # Source files and corresponding .o files
 # model.c has been split into modular files
-MODEL_SRCS = model_core.c model_attention.c model_moe.c model_gemma3n.c model_ssm.c model_kv_cache.c model_gguf.c
+MODEL_SRCS = model_core.c model_attention.c model_moe.c model_gemma3n.c model_glm5.c model_ssm.c model_kv_cache.c model_gguf.c
 SGEMM_SRCS = sgemm.c sgemm_q4_0x8.c sgemm_q4i_0x8.c sgemm_q4_0_r8.c sgemm_q8_0_r8.c sgemm_q8_k_r8.c sgemm_q8_k_r8_neon.c sgemm_iq2_k.c sgemm_iq2_k_r4.c sgemm_iq3_k.c sgemm_iq3_k_r4.c sgemm_iq4_k.c sgemm_iq4_nl_r4.c sgemm_q4_k_r4.c sgemm_q6_k_r4.c sgemm_iq6_k.c sgemm_iq4_xs.c
 SRCS    = picolm.c $(MODEL_SRCS) steer.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) tokenizer.c qwen_tokenize.c sampler.c grammar.c cJSON.c server.c csafetensors.c json.c safetensors.c
 OBJS    = $(SRCS:.c=.o)
@@ -192,6 +192,7 @@ model_gguf.o:   model_gguf.c  model.h quant.h tensor.h model_internal.h
 model_attention.o: model_attention.c  model.h quant.h tensor.h model_internal.h
 model_moe.o:    model_moe.c  model.h quant.h tensor.h model_internal.h
 model_gemma3n.o: model_gemma3n.c  model.h quant.h tensor.h model_internal.h
+model_glm5.o: model_glm5.c  model.h quant.h tensor.h model_internal.h
 model_ssm.o:    model_ssm.c  model.h quant.h tensor.h model_internal.h
 model_kv_cache.o: model_kv_cache.c  model.h quant.h tensor.h model_internal.h
 tensor.o: tensor.c tensor.h quant.h model.h
@@ -288,6 +289,18 @@ clean:
 	-$(RM) $(GPU_SRCS:%.cu=%-hip.o) $(GPU_SRCS:%.cu=%-cuda.o) backend_gpu.dlink.o
 	-$(RM) shaders/*.spv
 	-$(RM) test_swa test_swa.exe test_quant test_attn_tiled test_attn_tiled.exe test_attn_diff test_attn_diff.exe
+	-$(RM) tests/test_glm5_ops tests/test_glm5_ops.exe
+
+# --- GLM-5 operator unit tests (standalone, no model file needed) ---
+# Re-derives hc_pre / KDA / conv1d / MoE-router with plain scalar code and
+# checks the algebraic invariants. Catches formula and indexing bugs without
+# needing the oracle.
+.PHONY: test-glm5-ops
+test-glm5-ops: tests/test_glm5_ops
+	./tests/test_glm5_ops
+
+tests/test_glm5_ops: tests/test_glm5_ops.c
+	$(CC) -std=c11 -O2 -g -D_GNU_SOURCE -Wall -Wextra -o $@ $< -lm
 
 .PHONY: asan
 asan:
@@ -301,7 +314,7 @@ asan:
 .PHONY: gpu-clean-objs
 gpu-clean-objs:
 	-$(RM) model.o tensor.o quant.o picolm.o
-	-$(RM) model_core.o model_attention.o model_moe.o model_gemma3n.o model_ssm.o model_kv_cache.o model_gguf.o
+	-$(RM) model_core.o model_attention.o model_moe.o model_gemma3n.o model_glm5.o model_ssm.o model_kv_cache.o model_gguf.o
 
 # --- ROCm/HIP GPU backend ---
 
@@ -557,6 +570,8 @@ hunger:
 	echo $(HUNGER_CL) $(HUNGER_CF) model_moe.c >> .hunger_build.bat
 	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
 	echo $(HUNGER_CL) $(HUNGER_CF) model_gemma3n.c >> .hunger_build.bat
+	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
+	echo $(HUNGER_CL) $(HUNGER_CF) model_glm5.c >> .hunger_build.bat
 	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
 	echo $(HUNGER_CL) $(HUNGER_CF) model_ssm.c >> .hunger_build.bat
 	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat

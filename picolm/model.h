@@ -47,6 +47,9 @@ typedef struct {
     int is_tekken;      /* 1 if tokenizer.ggml.pre == "tekken" (Mistral Tekken tokenizer,
                             e.g. Mistral-Nemo-2407). GPT-2-style BPE vocab/merges but with
                             Tekken's own pretokenizer regex; see qwen_tokenize.c. */
+    int is_glm4_tok;    /* 1 if tokenizer.ggml.pre == "glm4" (GLM-4/5 BPE with \p{N}{1,3}
+                            digit grouping; see qwen_tokenize.c QWEN_PRETOK_GLM4). */
+    int is_glm5;        /* 1 if model architecture is glm5next / glm5-next */
     int max_seq_len;    /* maximum sequence length (e.g. 2048) */
     int head_dim;       /* = n_embd / n_heads */
     float rope_freq_base; /* RoPE theta base (e.g. 10000.0) */
@@ -90,6 +93,7 @@ typedef struct {
     int n_expert_used;        /* top-K experts per token (8) */
     int n_ff_exp;             /* per-expert FFN hidden dim (512) */
     int n_ff_shexp;           /* shared expert FFN hidden dim (512) */
+    int n_layer_dense_lead;   /* GLM-5: first N layers use dense FFN (3) */
     /* Gemma-3n specific */
     int n_altup;              /* number of altup copies (default 4) */
     int i_altup_act;          /* active altup index (default 0) */
@@ -143,6 +147,40 @@ typedef struct {
                                           * GGUF array, if one was present */
     int has_swa_pattern;                /* 1 if the array above was populated */
     int n_swa_pattern_len;              /* how many entries of swa_layer_bool are valid */
+
+    /* ---- GLM-5.3-Flash (glm5next / glm5-next) ----
+     * Hybrid: KDA linear attention (34 layers) + absorbed NoPE MLA with DSA
+     * k-pool indexer (11 layers), all wrapped in mHC hyper-connections.
+     * MoE (288 experts, top-8, sigmoid+bias router, 1 ungated shared expert)
+     * everywhere except the first n_dense_lead layers. Layer kind is derived
+     * from the head_count_kv array: 0 = KDA, 1 = MLA. */
+    int glm5_hc;                /* hyper-connection stream count (4) */
+    int glm5_sinkhorn_iters;    /* Sinkhorn iterations (20) */
+    float glm5_hc_eps;          /* Sinkhorn epsilon (1e-6) */
+    int glm5_q_lora;            /* q_lora_rank (1536) */
+    int glm5_kv_lora;           /* kv_lora_rank = latent dim (512) */
+    int glm5_mla_head_dim;      /* key_length_mla / value_length_mla (256) */
+    int glm5_kda_dim;           /* kda.head_dim (128) */
+    int glm5_kda_d_inner;       /* attention.key_length = n_kda_heads * kda_dim (8192) */
+    int glm5_kda_d_inner_set;   /* 1 if d_inner came from the attn_q tensor shape */
+    int glm5_n_kda_heads;       /* derived: d_inner / kda_dim (64) */
+    float glm5_kda_lower_bound; /* kda.gate_lower_bound (-5.0) */
+    int glm5_idx_nh;            /* indexer head count (32) */
+    int glm5_idx_dim;           /* indexer key_length (128) */
+    int glm5_idx_topk;          /* indexer top_k in POOLS (2048) */
+    int glm5_idx_kpool;         /* indexer pool size (4) */
+    int glm5_use_dsa;           /* runtime: DSA indexer active (else dense MLA) */
+    float glm5_clamp_exp;       /* swiglu clamp for routed experts (0=off) */
+    float glm5_clamp_shexp;     /* swiglu clamp for shared expert (0=off) */
+    int glm5_moe_scale_set;     /* expert_weights_scale present */
+    float glm5_moe_scale;       /* 2.5 */
+    int glm5_moe_norm;          /* expert_weights_norm (renormalise after bias) */
+    uint8_t glm5_layer_is_mla[MAX_LAYERS]; /* per trunk layer: 1=MLA, 0=KDA */
+    int glm5_mla_pattern_len;   /* entries present in the head_count_kv array */
+    int16_t glm5_layer_mla_ord[MAX_LAYERS]; /* per trunk layer: MLA ordinal (0..n_mla-1) or -1 */
+    float glm5_ln_eps;          /* attention.layer_norm_epsilon (1e-6), DSA indexer LayerNorm */
+    int glm5_n_mla;             /* derived: count of MLA trunk layers (11) */
+    int glm5_n_kda;             /* derived: count of KDA trunk layers (34) */
 } model_config_t;
 
 /* ---- GPU-resident weight handles (compiled in only with PICOLM_GPU) ---- */
@@ -312,6 +350,107 @@ typedef struct {
     const void *rope_freqs;
 } layer_weights_t;
 
+/* ---- GLM-5.3-Flash (glm5next) per-layer weights ----
+ * Kept separate from layer_weights_t to avoid bloating every other arch.
+ * Raw GGUF pointers; F32 tensors are predequanted at load where small. */
+typedef struct {
+    /* mHC hyper-connections (attn + ffn blocks; absent on the NextN layer) */
+    const void *hc_attn_fn;      /* [n_embd*hc, (2+hc)*hc] */
+    gguf_type_t type_hc_attn_fn;
+    const void *hc_attn_base;    /* [(2+hc)*hc] F32 */
+    const void *hc_attn_scale;   /* [3] F32 */
+    const void *hc_ffn_fn;
+    gguf_type_t type_hc_ffn_fn;
+    const void *hc_ffn_base;
+    const void *hc_ffn_scale;
+    /* KDA (head_count_kv == 0) */
+    const void *kda_q, *kda_k, *kda_v;        /* [n_embd, n_head*kda_dim] */
+    gguf_type_t type_kda_q, type_kda_k, type_kda_v;
+    const void *kda_conv_q, *kda_conv_k, *kda_conv_v; /* [d_conv, 1, d_inner] F32 */
+    const void *kda_f_a;         /* [kda_dim, n_embd] */
+    gguf_type_t type_kda_f_a;
+    const void *kda_f_b;         /* [d_inner, kda_dim] */
+    gguf_type_t type_kda_f_b;
+    const void *kda_g_a;         /* [kda_dim, n_embd] */
+    gguf_type_t type_kda_g_a;
+    const void *kda_g_b;         /* [d_inner, kda_dim] */
+    gguf_type_t type_kda_g_b;
+    const void *kda_beta;        /* [n_head, n_embd] */
+    gguf_type_t type_kda_beta;
+    const void *kda_a;           /* [n_head] F32 (ssm_a, no .weight suffix) */
+    const void *kda_dt_bias;     /* [d_inner] F32 (ssm_dt.bias) */
+    const void *kda_norm;        /* [kda_dim] F32 (ssm_norm) */
+    const void *kda_out;         /* [n_embd, d_inner] (attn_output) */
+    gguf_type_t type_kda_out;
+    const void *exp_probs_b;     /* [n_expert] F32 (exp_probs_b.bias) */
+    /* MLA (head_count_kv == 1) */
+    const void *mla_q_a;         /* [q_lora, n_embd] */
+    gguf_type_t type_mla_q_a;
+    const void *mla_q_a_norm;    /* [q_lora] F32 */
+    const void *mla_q_b;         /* [n_head*mla_hd, q_lora] */
+    gguf_type_t type_mla_q_b;
+    const void *mla_kv_a_mqa;    /* [kv_lora, n_embd] */
+    gguf_type_t type_mla_kv_a_mqa;
+    const void *mla_kv_a_norm;   /* [kv_lora] F32 */
+    const void *mla_k_b;         /* 3D [mla_hd, kv_lora, n_head] */
+    gguf_type_t type_mla_k_b;
+    const void *mla_v_b;         /* 3D [kv_lora, mla_hd, n_head] */
+    gguf_type_t type_mla_v_b;
+    const void *mla_o;           /* [n_embd, n_head*mla_hd] (attn_output) */
+    gguf_type_t type_mla_o;
+    /* DSA k-pool indexer (MLA layers only; optional) */
+    const void *idx_k_norm_w;    /* [idx_dim] F32 */
+    const void *idx_k_norm_b;    /* [idx_dim] F32 */
+    const void *idx_proj;        /* [n_head_idx, n_embd] */
+    gguf_type_t type_idx_proj;
+    const void *idx_attn_k;      /* [idx_dim, n_embd] */
+    gguf_type_t type_idx_attn_k;
+    const void *idx_q_b;         /* [n_embd, q_lora] (attn_q_b of the indexer) */
+    gguf_type_t type_idx_q_b;
+    const void *idx_gate;        /* [idx_dim, n_embd] (indexer_compressor_gate) */
+    gguf_type_t type_idx_gate;
+    const void *idx_ape;         /* [kpool, idx_dim] (indexer_compressor_ape) */
+    gguf_type_t type_idx_ape;
+    /* GLM-5 reuses the generic attn_q/k/v, attn_output, ffn_* and ssm_*
+     * slots of layer_weights_t (same tensor names), so no duplicates here. */
+} glm5_layer_weights_t;
+
+/* GLM-5 global weights (NextN/MTP block lives in layers[n_layers-1]) */
+typedef struct {
+    const void *nextn_eh_proj;   /* [n_embd, 2*n_embd] */
+    gguf_type_t type_nextn_eh_proj;
+    const void *nextn_enorm;     /* [n_embd] F32 */
+    const void *nextn_hnorm;     /* [n_embd] F32 */
+    const void *nextn_shared_head_norm; /* [n_embd] F32, optional */
+} glm5_global_weights_t;
+
+/* GLM-5 per-layer runtime state (KDA recurrent state + caches) */
+typedef struct {
+    /* KDA recurrent state S[head][row][col] = [n_head][kda_dim][kda_dim],
+     * layout state[row + col*kda_dim + head*kda_dim*kda_dim] (matches ik).
+     * One per KDA layer, indexed by the KDA ordinal (0..n_kda-1). */
+    float *kda_state[MAX_LAYERS];            /* [n_head*kda_dim*kda_dim] per KDA layer */
+    float *kda_conv_state[MAX_LAYERS];       /* [(d_conv-1)*conv_dim] per KDA layer */
+    /* MLA latent cache: one entry per MLA layer, [max_seq][kv_lora] */
+    float *mla_kv;               /* concatenated per-layer latent caches */
+    int    mla_kv_layer_stride;  /* floats per layer (max_seq*kv_lora) */
+    int    mla_kv_pos;           /* current fill per layer is implicit (shared seq len) */
+    /* DSA indexer cache: [max_seq][2*idx_dim] (k;g packed), one per MLA layer */
+    float *idx_kg;               /* concatenated; NULL when DSA off */
+    /* Per-token scratch (shared across layers, carved from the arena) */
+    float *hc_x;                 /* [hc * n_embd] 4 residual streams (current) */
+    float *hc_res;               /* [hc * n_embd] 4 residual streams (saved) */
+    float *hc_scratch;           /* [hc * n_embd] flat normed input for hc_pre matmul */
+    float *hc_m;                 /* [(2+hc)*hc + hc + hc*hc] m vector + pre + comb */
+    float *kda_scratch;          /* [conv_dim + 4*d_inner + 3*kda_dim] */
+    float *mla_q;                /* [mla_head_dim * n_heads] */
+    float *mla_q_abs;            /* [kv_lora * n_heads] absorbed Q per head */
+    float *mla_scratch;          /* [2*kv_lora*n_heads + kv_lora + max_seq] QR/qabs/kv/ctx/scores */
+    float *cur;                  /* [n_embd] current hc_pre output */
+    float *attn_out;             /* [n_embd] attention/FFN block output */
+    float *moe_down;             /* [n_embd] routed-expert down-proj staging */
+} glm5_state_t;
+
 typedef struct {
     const void *token_embd;
     gguf_type_t type_token_embd;
@@ -333,6 +472,9 @@ typedef struct {
     gguf_type_t type_position_embd;
     const void *output_norm_bias;      /* GPT-2: [n_embd] F32 */
     layer_weights_t layers[MAX_LAYERS];
+    /* GLM-5 per-layer weights, parallel to layers[] (NULL when not glm5) */
+    glm5_layer_weights_t *glm5;   /* [MAX_LAYERS] */
+    glm5_global_weights_t glm5g;
 } model_weights_t;
 
 /* KV cache quantization type */
@@ -519,6 +661,9 @@ typedef struct {
     int kv_layer_count;
     uint8_t kv_layer_map[MAX_LAYERS];
     int kv_layer_ordinal[MAX_LAYERS];
+
+    /* GLM-5 KDA recurrent state + MLA latent cache (allocated in model_core.c) */
+    glm5_state_t glm5;
 } run_state_t;
 
 /* ---- Split GGUF mmap entries ---- */
@@ -582,6 +727,7 @@ typedef struct {
     int         tok_unknown_model; /* non-zero if tokenizer.ggml.model is unsupported (e.g. gpt2) */
     /* GGUF tokenizer flags */
     int         tok_add_bos;          /* tokenizer.ggml.add_bos_token (default: 1) */
+    int         tok_add_bos_set;      /* 1 if the GGUF explicitly set add_bos_token */
     int         tok_add_space_prefix; /* tokenizer.ggml.add_space_prefix (default: 1) */
     char        *tok_eos_str;
 
