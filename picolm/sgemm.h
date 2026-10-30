@@ -135,6 +135,17 @@ int sgemm_q8_0_r8_q8_0_avx2(int nrows, int ncols, int k,
         const void *vx, const void *vy, float *out, size_t bs,
         int ith, int nth);
 
+/* Q8_0_R8 x Q8_0 tiled GEMM with caller-supplied activation deltas.
+ * vy_d may be NULL (use the fp16 block scales). vy_d[c*vy_d_stride + block]
+ * matches picolm_sgemm_d's B_d convention. Serial when ith=0, nth=1. */
+int sgemm_q8_0_r8_q8_0_d_avx2(int nrows, int ncols, int k,
+        const void *vx, const void *vy,
+        const float *vy_d, int vy_d_stride,
+        float *out, size_t bs, int ith, int nth);
+/* 8 weight rows x 1 activation row, with optional deltas (q_d may be NULL). */
+void vec_dot_q8_0_r8_q8_0_d_avx2(const void *vx, const void *wy, const float *q_d,
+        int n, float *out, int nrows);
+
 /* Q8_K_R8 x Q8_K tiled GEMM (8-row interleaved) */
 int sgemm_q8_k_r8_q8_k_avx2(int nrows, int ncols, int k,
         const void *vx, const void *vy, float *out, size_t bs,

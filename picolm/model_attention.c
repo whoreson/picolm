@@ -1,6 +1,7 @@
 #include "model.h"
 #include "tensor.h"
 #include "quant.h"
+#include "sgemm.h"
 #include "model_internal.h"
 #ifndef _WIN32
 #include <sys/mman.h>
@@ -1139,6 +1140,134 @@ void attention_decode(attn_group_ctx_t *ctx) {
 #ifndef ATTN_LAZY_RESCALE_THRESH
 #define ATTN_LAZY_RESCALE_THRESH 8.0f
 #endif
+/* ================================================================
+ * Tiled prefill attention: KV cache type support.
+ *
+ * The tiled path extracts K rows into a contiguous scratch tile and
+ * dequantizes V rows to F32 (under every lane below).
+ *
+ *   F16 / Q8_0 / Q4_0  -- K rows are block layouts whose contiguous head
+ *                         slice is exactly a per-row tile -> plain memcpy.
+ *   TQ3 / TQ4          -- no GGUF equivalent; K tile is *dequantized*
+ *                         (incl. inverse WHT, so scores use the plain dot
+ *                         product), and V is dequantized the same way.
+ *
+ * QK^T (scores = q_rows @ K_tile^T) has three implementations:
+ *   ATTN_QK_SGEMM_F32 -- K tile dequantized to F32, picolm_sgemm(F32,F32)
+ *                        with nth=1 (serial, safe inside a pool worker)
+ *   ATTN_QK_Q8R8      -- K tile packed to Q8_0_R8 and Q rows to Q8_0 once
+ *                        per task, then sgemm_q8_0_r8_q8_0_avx2 with
+ *                        nth=1 (integer SIMD; AVX2 only)
+ *   ATTN_QK_GEMM      -- matmul_batch() on the packed K tile. Only safe for
+ *                        F16/F32 (which dispatch to a *serial* picolm_sgemm);
+ *                        the quantized activation formats dispatch back into
+ *                        the thread pool and would deadlock here.
+ *
+ * IMPORTANT: every QK path must stay serial. This code runs inside a
+ * tensor_parallel_for worker; a nested tensor_parallel_for on the same
+ * pool deadlocks.
+ * ================================================================ */
+enum { ATTN_QK_GEMM = 0, ATTN_QK_SGEMM_F32 = 1, ATTN_QK_Q8R8 = 2 };
+
+/* Map kv_cache_type_t to gguf_type_t for matmul_batch */
+static gguf_type_t kv_cache_to_gguf_type(kv_cache_type_t kv_type) {
+    switch (kv_type) {
+        case KV_CACHE_F16:  return GGUF_TYPE_F16;
+        case KV_CACHE_Q8_0: return GGUF_TYPE_Q8_0;
+        case KV_CACHE_Q4_0: return GGUF_TYPE_Q4_0;
+        case KV_CACHE_TQ3:  return GGUF_TYPE_F16; /* TQ3 doesn't have a GGUF equivalent */
+        case KV_CACHE_TQ4:  return GGUF_TYPE_F16; /* TQ4 doesn't have a GGUF equivalent */
+    }
+    return GGUF_TYPE_F16;
+}
+
+/* Extract one KV head's row out of the GQA-interleaved cache row `src`
+ * into the contiguous K-tile row `dst`, in `tile_gguf` format. */
+static inline void attn_pack_k_row(const uint8_t *src, uint8_t *dst,
+                                   int kv_type, gguf_type_t tile_gguf, int head_dim) {
+    switch (tile_gguf) {
+    case GGUF_TYPE_F32: {
+        /* TQ caches: dequantize with the inverse WHT so the score is a
+         * plain dot product in the original head space. */
+        if (kv_type == KV_CACHE_TQ3) { ad_deq_tq_row(src, (float *)dst, head_dim, 0, 1); return; }
+        if (kv_type == KV_CACHE_TQ4) { ad_deq_tq_row(src, (float *)dst, head_dim, 1, 1); return; }
+        dequantize_row(src, (float *)dst, head_dim, (gguf_type_t)kv_type);
+        return;
+    }
+    case GGUF_TYPE_F16:
+        memcpy(dst, src, (size_t)head_dim * sizeof(uint16_t));
+        return;
+    default:
+        /* Q8_0 / Q4_0: head slices are whole blocks, byte-identical. */
+        memcpy(dst, src, gguf_type_row_size(tile_gguf, head_dim));
+        return;
+    }
+}
+
+/* Row present in the contiguous K tile, in `gguf` format. */
+static size_t attn_ktile_row_bytes(gguf_type_t gguf, int head_dim) {
+    if (gguf == GGUF_TYPE_F16) return (size_t)head_dim * sizeof(uint16_t);
+    return gguf_type_row_size(gguf, head_dim);
+}
+
+/* Can the tiled path handle this pair of cache types? */
+static int attn_tiled_kv_ok(int kv_type_k, int kv_type_v) {
+    switch (kv_type_k) {
+        case KV_CACHE_F16: case KV_CACHE_Q8_0: case KV_CACHE_Q4_0:
+        case KV_CACHE_TQ3: case KV_CACHE_TQ4: break;
+        default: return 0;
+    }
+    switch (kv_type_v) {
+        case KV_CACHE_F16: case KV_CACHE_Q8_0: case KV_CACHE_Q4_0:
+        case KV_CACHE_TQ3: case KV_CACHE_TQ4: break;
+        default: return 0;
+    }
+    return 1;
+}
+
+/* The ATTN_QK_Q8R8 fast path needs 32-value blocks in the head dimension
+ * and an AVX2 integer GEMM; everything else lives in this file portably. */
+static int attn_q8r8_ok(int head_dim) {
+#if defined(__AVX2__) && defined(__F16C__)
+    return head_dim > 0 && (head_dim % 32) == 0;
+#else
+    (void)head_dim;
+    return 0;
+#endif
+}
+
+/* Pick the QK implementation + the K-tile scratch format.
+ * `*tile_gguf` is what the K-tile rows are stored as after extraction.
+ *
+ * PRECISION: the int8 path (ATTN_QK_Q8R8) quantizes the query rows to Q8_0
+ * once per task before scoring. Measured (test/prec): quantizing Q costs up
+ * to ~9 absolute score error on synthetic data with |q|,|k| <= 1, versus
+ * ~0.03 for requantizing K -- i.e. Q quantization dominates the error
+ * budget by ~300x. The resulting attention-output error is bounded and
+ * proportional to that (measured 7e-3 worst case, 1e-3 typical, and it does
+ * NOT grow with context length). PICOLM_ATTN_QK=f32 selects the exact F32
+ * GEMM instead (bit-identical to the grouped reference, ~2-4x slower QK).
+ * Default: int8 when available. */
+static int attn_choose_qk_mode(int kv_type_k, int head_dim, gguf_type_t *tile_gguf) {
+    const char *e = getenv("PICOLM_ATTN_QK");
+    if (kv_type_k == KV_CACHE_F16) {
+        *tile_gguf = GGUF_TYPE_F16;
+        return ATTN_QK_GEMM;
+    }
+    /* Quantized caches: scored through integers or F32, never matmul_batch. */
+    int want = attn_q8r8_ok(head_dim) ? ATTN_QK_Q8R8 : ATTN_QK_SGEMM_F32;
+    if (e) {
+        if (!strcmp(e, "f32")) want = ATTN_QK_SGEMM_F32;
+        else if (!strcmp(e, "q8r8") && attn_q8r8_ok(head_dim)) want = ATTN_QK_Q8R8;
+    }
+    if (kv_type_k == KV_CACHE_TQ3 || kv_type_k == KV_CACHE_TQ4) {
+        *tile_gguf = GGUF_TYPE_F32;   /* dequantized, WHT-inverted */
+    } else {
+        *tile_gguf = kv_cache_to_gguf_type((kv_cache_type_t)kv_type_k);
+    }
+    return want;
+}
+
 typedef struct {
     int kv_h;
     int kv_mul;
@@ -1151,14 +1280,19 @@ typedef struct {
     int kv_tile_end;        /* one past last KV position */
     int is_diagonal;        /* 1 if this tile needs causal masking */
 
-    gguf_type_t kv_gguf_k;  /* gguf_type for this kv cache type */
+    gguf_type_t kv_gguf_k;  /* gguf_type of the K-tile scratch rows */
     size_t kv_row_size_k;   /* bytes per GQA row in cache */
     size_t kv_head_stride_k;/* bytes per head within GQA row */
     const uint8_t *kcache;  /* layer K cache base */
-    const float *q_rows;    /* [n_q_rows x head_dim] query vectors */
+    const float *q_rows;    /* [n_q_rows x head_dim] query vectors (scaled, maybe WHT-rotated) */
     float *scores;          /* [n_q_rows x tile_size] score buffer */
-    uint8_t *tile_k;        /* contiguous K-tile scratch [tile_size x head_dim] in kv format */
+    uint8_t *tile_k;        /* K-tile scratch [tile_size x head_dim] in kv_gguf_k format */
     float *tile_v_f32;      /* contiguous V-tile in F32 [tile_size x head_dim] */
+    int qk_mode;            /* ATTN_QK_* : how scores = q_rows @ tile_k^T is computed */
+    const block_q8_0 *q8_rows;  /* [n_q_rows x head_dim/32] Q8_0 of q_rows (QK_Q8R8) */
+    const float *q8_delta;      /* [n_q_rows x head_dim/32] fp16 round-trip deltas (QK_Q8R8) */
+    block_q8_0 *k8_rows;        /* [tile_size x head_dim/32] plain Q8_0 K rows (QK_Q8R8) */
+    block_q8_0_r8 *k8r8;        /* [head_dim/32] Q8_0_R8 group of k8_rows (QK_Q8R8) */
     float *M;               /* [n_q_rows] running max */
     float *S;               /* [n_q_rows] running sum_exp */
     float *acc;             /* [n_q_rows x head_dim] running accumulator */
@@ -1168,8 +1302,8 @@ typedef struct {
     int n_swa;               /* 0 = full attention; >0 = sliding window size */
 } attn_tile_task_t;
 
-/* Forward declaration for batch_attention_layer gating */
-static void attn_process_tile(attn_tile_task_t *t);
+/* Defined after attn_process_tile (the F16/Q8R8/F32 K-tile builder). */
+static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32);
 
 /* Context for the parallel tiled attention: one instance shared by all
  * concurrent tasks. Each task gets its own scratch slice from scratch_pool. */
@@ -1190,9 +1324,12 @@ typedef struct {
     gguf_type_t gguf_k;
     gguf_type_t gguf_v;
     size_t k_rb_gguf;
+    int qk_mode;            /* ATTN_QK_* selected by batch_attention_tiled() */
+    int q_rot;              /* 1 = TQ3-sign WHT-rotate query rows (TQ K caches) */
     /* Scratch pool: pre-allocated, sliced per concurrent task */
     uint8_t *scratch_pool;
     size_t scratch_per_task, scores_per, ms_per, acc_per, qr_per, tk_per, tv_per;
+    size_t q8_per, q8_half, k8_per, k8_half, f32t_per;
     int max_concurrent;
 } batch_tiled_ctx_t;
 
@@ -1213,14 +1350,24 @@ static void batch_tiled_task(int task_idx, void *ctx_ptr) {
     int slot = task_idx % bc->max_concurrent;
     uint8_t *scratch = bc->scratch_pool + (size_t)slot * bc->scratch_per_task;
 
-    /* Layout the scratch slice */
+    /* Layout the scratch slice (all offsets precomputed by the caller) */
     float *scores = (float *)scratch;            scratch += bc->scores_per;
     float *M       = (float *)scratch;           scratch += bc->ms_per;
     float *S       = (float *)scratch;           scratch += bc->ms_per;
     float *acc     = (float *)scratch;           scratch += bc->acc_per;
     float *q_rows  = (float *)scratch;           scratch += bc->qr_per;
     uint8_t *tile_k = scratch;                   scratch += bc->tk_per;
-    float *tile_v_f32 = (float *)scratch;
+    float *tile_v_f32 = (float *)scratch;        scratch += bc->tv_per;
+    /* Non-F16 QK scratch (sized 1 byte when unused; never dereferenced then) */
+    /* q8_per covers both halves: [q8_rows blocks][q8_delta floats] */
+    block_q8_0 *q8_rows = (block_q8_0 *)scratch;
+    float *q8_delta = (float *)(scratch + bc->q8_half);
+    scratch += bc->q8_per;
+    /* k8_per covers both halves: [k8_rows plain Q8_0][k8r8 Q8_0_R8 groups] */
+    block_q8_0 *k8_rows = (block_q8_0 *)scratch;
+    block_q8_0_r8 *k8r8 = (block_q8_0_r8 *)(scratch + bc->k8_half);
+    scratch += bc->k8_per;
+    float *k_tmp_f32 = (float *)scratch;          scratch += bc->f32t_per;
 
     int kv_h = task_idx / bc->n_token_groups;
     int tg = task_idx % bc->n_token_groups;
@@ -1242,7 +1389,11 @@ static void batch_tiled_task(int task_idx, void *ctx_ptr) {
      * eliminating the per-tile score-scaling loop (n_q*ts multiplies per
      * tile visit, ~884K total for a 3037-token prefill). The scale is
      * applied once per Q row (n_q*hd multiplies) instead of once per
-     * score element (n_q*ts multiplies per tile). */
+     * score element (n_q*ts multiplies per tile).
+     *
+     * TQ caches store K WHT-rotated; this path inverts that rotation when
+     * it dequantizes the K tile (see attn_pack_k_row), so the query is used
+     * as-is and scores are a plain dot product in head space. */
     const float q_scale_log2 = bc->attn_scale * ATTN_LOG2E;  /* scores come out in log2 units */
     for (int ti = 0; ti < n_q; ti++) {
         const float *q_tok = bc->q_batch + (size_t)(q_group_start + ti) * bc->n_heads * head_dim;
@@ -1251,6 +1402,29 @@ static void batch_tiled_task(int task_idx, void *ctx_ptr) {
             float *qr = q_rows + ((size_t)ti * kv_mul + g) * head_dim;
             for (int d = 0; d < head_dim; d++)
                 qr[d] = qh[d] * q_scale_log2;
+        }
+    }
+
+    /* Q8_0_R8 QK path: quantize the query rows once per task (they are
+     * reused by every KV tile, so this is O(n_q*hd) per task instead of
+     * per tile). Deltas use the same fp16 round-trip convention as the
+     * batched matmul_batch activation quantizer. */
+    if (bc->qk_mode == ATTN_QK_Q8R8) {
+        const int nb = head_dim / 32;
+        for (int i = 0; i < n_q_padded; i++) {
+            const float *qr = q_rows + (size_t)i * head_dim;
+            block_q8_0 *dst = q8_rows + (size_t)i * nb;
+            quantize_row_q8_0(qr, dst, head_dim);
+            for (int b = 0; b < nb; b++) {
+                float d = fp16_to_fp32(dst[b].d);
+                int8_t mn = 127, mx = -128;
+                for (int j = 0; j < 32; j++) {
+                    if (dst[b].qs[j] < mn) mn = dst[b].qs[j];
+                    if (dst[b].qs[j] > mx) mx = dst[b].qs[j];
+                }
+                float dmx = mx > -mn ? (float)mx : (float)(-mn);
+                q8_delta[(size_t)i * nb + b] = (dmx != 0.0f) ? (d * dmx / 127.0f) : d;
+            }
         }
     }
 
@@ -1287,7 +1461,9 @@ static void batch_tiled_task(int task_idx, void *ctx_ptr) {
          * tile-aligned, but also covers unaligned starts. */
         int is_diag = (kv_t1 - 1 > first_pos);
 
-        /* Extract K-tile into contiguous scratch */
+        /* Extract K-tile into contiguous scratch, in the layout the selected
+         * QK path wants: byte copy for F16/Q8_0/Q4_0, dequantized (inverse
+         * WHT) F32 rows for TQ caches. */
         {
             size_t rb = bc->kv_head_stride_k;
             size_t row_stride = bc->kv_row_size_k;
@@ -1295,7 +1471,7 @@ static void batch_tiled_task(int task_idx, void *ctx_ptr) {
                 const uint8_t *src = bc->kcache + (size_t)(kv_t0 + p) * row_stride
                                    + kv_h * rb;
                 uint8_t *dst = tile_k + (size_t)p * bc->k_rb_gguf;
-                memcpy(dst, src, bc->k_rb_gguf);
+                attn_pack_k_row(src, dst, bc->kv_type_k, bc->gguf_k, head_dim);
             }
         }
 
@@ -1332,13 +1508,18 @@ static void batch_tiled_task(int task_idx, void *ctx_ptr) {
         task.scores = scores;
         task.tile_k = tile_k;
         task.tile_v_f32 = tile_v_f32;
+        task.qk_mode = bc->qk_mode;
+        task.q8_rows = q8_rows;
+        task.q8_delta = q8_delta;
+        task.k8_rows = k8_rows;
+        task.k8r8 = k8r8;
         task.M = M;
         task.S = S;
         task.acc = acc;
         task.attn_scale = bc->attn_scale;
         task.n_swa = bc->n_swa;
 
-        attn_process_tile(&task);
+        attn_process_tile(&task, k_tmp_f32);
     }
 
     /* Normalize and write output */
@@ -1442,8 +1623,13 @@ void batch_attention_layer(
      * For small batches, the per-(token,head) path has better parallelism
      * (n_tokens * n_heads tasks vs n_kv_heads * ceil(n_tokens/tile) tasks).
      *
-     * The tiled path requires F16 KV cache (which is what the store loop
-     * always writes). Q8_0/Q4_0 cache types are a planned enhancement.
+     * Every KV cache type is supported (see attn_tiled_kv_ok): F16 reuses
+     * the compact rows, Q8_0/Q4_0 are scored through an integer GEMM on a
+     * requantized K tile, and TQ3/TQ4 dequantize the tile once (single-row
+     * dequant, amortized over kv_mul*tile query rows). PICOLM_ATTN_TILED_KV
+     * restricts the set at runtime: e.g. PICOLM_ATTN_TILED_KV=q8_0 only
+     * tiles Q8_0 K+V caches and leaves everything else on the grouped path.
+     * PICOLM_ATTN_TILED_KV=none disables tiling for all non-F16 caches.
      *
      * Verified against the grouped path by test_attn_diff (see
      * test_attn_diff_sweep.sh), including unaligned start_pos. */
@@ -1462,9 +1648,24 @@ void batch_attention_layer(
     int _size_ok = n_tokens >= 2 * ATTN_TILE ||
                    (n_tokens >= _tiled_min_tokens &&
                     (long)_tiled_eff * _n_tiled_tasks >= tensor_get_n_threads());
-    int _use_tiled = _size_ok &&
-                     (int)kv_type_k == (int)KV_CACHE_F16 &&
-                     (int)kv_type_v == (int)KV_CACHE_F16;
+    int _use_tiled = _size_ok && attn_tiled_kv_ok(kv_type_k, kv_type_v);
+    if (_use_tiled && !(kv_type_k == KV_CACHE_F16 && kv_type_v == KV_CACHE_F16)) {
+        /* Opt-out for quantized caches (unchanged default: tiled). */
+        static int _kv_quant_ok = -1;
+        if (_kv_quant_ok < 0) {
+            const char *_kv = getenv("PICOLM_ATTN_TILED_KV");
+            _kv_quant_ok = 1;
+            if (_kv && !strcmp(_kv, "none")) _kv_quant_ok = 0;
+            else if (_kv && strcmp(_kv, "all") != 0) {
+                const char *nm = (kv_type_k == KV_CACHE_Q8_0 && kv_type_v == KV_CACHE_Q8_0) ? "q8_0"
+                               : (kv_type_k == KV_CACHE_Q4_0 && kv_type_v == KV_CACHE_Q4_0) ? "q4_0"
+                               : (kv_type_k == KV_CACHE_TQ3  && kv_type_v == KV_CACHE_TQ3)  ? "tq3"
+                               : (kv_type_k == KV_CACHE_TQ4  && kv_type_v == KV_CACHE_TQ4)  ? "tq4" : "";
+                _kv_quant_ok = (nm[0] && strstr(_kv, nm)) ? 1 : 0;
+            }
+        }
+        if (!_kv_quant_ok) _use_tiled = 0;
+    }
     {
         /* TEST HOOK: PICOLM_TEST_FORCE_TILED=0 -> grouped path,
          *            =1 -> tiled path regardless of size gate
@@ -1483,10 +1684,11 @@ void batch_attention_layer(
             _dbg_once = 1;
             fprintf(stderr, "[BATCH-ATTN] n_tokens=%d start_pos=%d n_heads=%d n_kv_heads=%d "
                     "head_dim=%d xb_stride=%d kv_type=%d/%d kv_row=%zu/%zu kv_hstride=%zu/%zu "
-                    "scale=%g n_swa=%d tiled=%d\n",
+                    "scale=%g n_swa=%d tiled=%d qk=%s\n",
                     n_tokens, start_pos, n_heads, n_kv_heads, head_dim, xb_stride,
                     kv_type_k, kv_type_v, kv_row_size_k, kv_row_size_v,
-                    kv_head_stride_k, kv_head_stride_v, attn_scale, n_swa, _use_tiled);
+                    kv_head_stride_k, kv_head_stride_v, attn_scale, n_swa, _use_tiled,
+                    _use_tiled ? (attn_q8r8_ok(head_dim) ? "int8" : "f32") : "-");
         }
     }
     if (_use_tiled) {
@@ -1613,27 +1815,51 @@ void batch_attention_layer(
  * and tiles after are skipped.
  * ================================================================ */
 
-/* Map kv_cache_type_t to gguf_type_t for matmul_batch */
-static gguf_type_t kv_cache_to_gguf_type(kv_cache_type_t kv_type) {
-    switch (kv_type) {
-        case KV_CACHE_F16:  return GGUF_TYPE_F16;
-        case KV_CACHE_Q8_0: return GGUF_TYPE_Q8_0;
-        case KV_CACHE_Q4_0: return GGUF_TYPE_Q4_0;
-        case KV_CACHE_TQ3:  return GGUF_TYPE_F16; /* TQ3 doesn't have a GGUF equivalent */
-        case KV_CACHE_TQ4:  return GGUF_TYPE_F16; /* TQ4 doesn't have a GGUF equivalent */
+/* Build the GEMM weights for one K tile, in place of the old matmul_batch
+ * (which cannot take a quantized K tile from inside a pool worker).
+ *
+ * Returns a pointer to the weights to use with the task's qk_mode; the
+ * number of weight rows is always ts (the Q8R8 path pads to ts8 internally).
+ *   ATTN_QK_SGEMM_F32 -> F32 rows (tile_k, dequantized if needed)
+ *   ATTN_QK_Q8R8      -> Q8_0_R8 groups in t->k8r8, plain rows in t->k8_rows
+ *   ATTN_QK_GEMM      -> the tile as-is (F16 only)
+ * `tmp_f32` must hold ts*head_dim floats (Q8R8/F32 modes only).
+ */
+static const void *attn_build_k_tile(attn_tile_task_t *t, int ts, float *tmp_f32) {
+    const int hd = t->head_dim;
+    switch (t->qk_mode) {
+    case ATTN_QK_Q8R8: {
+        /* Source rows are Q8_0 (memcpy'd from cache) or F32 (TQ caches). */
+        for (int p = 0; p < ts; p++) {
+            if (t->kv_gguf_k == GGUF_TYPE_Q8_0) {
+                dequantize_row_q8_0(t->tile_k + (size_t)p * gguf_type_row_size(GGUF_TYPE_Q8_0, hd),
+                                    tmp_f32 + (size_t)p * hd, hd);
+            } else if (t->kv_gguf_k == GGUF_TYPE_Q4_0) {
+                dequantize_row_q4_0(t->tile_k + (size_t)p * gguf_type_row_size(GGUF_TYPE_Q4_0, hd),
+                                    tmp_f32 + (size_t)p * hd, hd);
+            } else { /* F32 rows already */
+                memcpy(tmp_f32 + (size_t)p * hd, t->tile_k + (size_t)p * hd * sizeof(float),
+                       (size_t)hd * sizeof(float));
+            }
+            quantize_row_q8_0(tmp_f32 + (size_t)p * hd, t->k8_rows + (size_t)p * (hd / 32), hd);
+        }
+        repack_q8_0_to_q8_0_r8(t->k8_rows, t->k8r8, ts, hd);
+        return t->k8r8;
     }
-    return GGUF_TYPE_F16;
+    case ATTN_QK_SGEMM_F32:
+        if (t->kv_gguf_k == GGUF_TYPE_F32) return t->tile_k;
+        for (int p = 0; p < ts; p++) {
+            const size_t rb = (t->kv_gguf_k == GGUF_TYPE_F16)
+                            ? (size_t)hd * sizeof(uint16_t)
+                            : gguf_type_row_size(t->kv_gguf_k, hd);
+            dequantize_row(t->tile_k + (size_t)p * rb, tmp_f32 + (size_t)p * hd,
+                           hd, t->kv_gguf_k);
+        }
+        return tmp_f32;
+    default:
+        return t->tile_k;
+    }
 }
-
-/* Tiled attention task: process one (kv_head, token_group) pair.
- * tile_k: contiguous K-tile [tile_size x head_dim] in kv_type_k format
- * tile_v_f32: contiguous V-tile [tile_size x head_dim] in F32
- * scores: scores for this tile [n_q_rows x tile_size] in F32
- * q_rows: query rows [n_q_rows x head_dim] in F32 (kv_mul * GROUP_SIZE)
- * n_q_rows: number of query rows in this group (kv_mul * tokens_in_group)
- * tile_size: actual KV positions in this tile (may be < ATTN_TILE for tail)
- * M, S, acc: running softmax state to update in-place
- * out: final output to write [n_q_rows x head_dim] (only after last tile) */
 
 /* Specialized attention QK^T kernel for F16 KV cache tiles.
  * Computes scores[n_q][ts] = q_rows[n_q][hd] @ K[ts][hd]^T * scale.
@@ -1647,8 +1873,10 @@ static gguf_type_t kv_cache_to_gguf_type(kv_cache_type_t kv_type) {
  * Called once per (kv_head, token_group, kv_tile) visit.
  * Only compiled for AVX-512 (the generic path is used elsewhere). */
 /* Process one tile within a (kv_head, token_group) task.
- * Called inline from the task loop. */
-static void attn_process_tile(attn_tile_task_t *t) {
+ * Called inline from the task loop.
+ * `tmp_f32` is a per-task scratch of ts*head_dim floats used to
+ * dequantize/requantize the K tile for the non-F16 QK paths. */
+static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
     int n_q = t->n_q_rows;
     int ts = t->tile_size;
     int hd = t->head_dim;
@@ -1656,37 +1884,65 @@ static void attn_process_tile(attn_tile_task_t *t) {
     int kv_tile_start = t->kv_tile_start;
     int group_token_start = t->group_token_start;
 
-    size_t k_rb_gguf = gguf_type_row_size(t->kv_gguf_k, hd);
+    /* NOTE: the K tile has ALREADY been extracted from the GQA KV cache into
+     * t->tile_k by batch_tiled_task(). It used to be extracted here as well,
+     * doubling the K-cache read traffic per tile visit. */
 
-    /* Extract K-tile from GQA KV cache into contiguous scratch.
-     * KV cache layout: [pos][kv_row_size_gqa] with head offset = kv_h * kv_head_stride_k
-     * For positions [kv_tile_start, kv_tile_start+ts), head kv_h: */
-    {
-        size_t rb = t->kv_head_stride_k;
-        size_t row_stride = t->kv_row_size_k;
-        for (int p = 0; p < ts; p++) {
-            const uint8_t *src = t->kcache + (size_t)(kv_tile_start + p) * row_stride
-                               + t->kv_h * rb;
-            uint8_t *dst = (uint8_t *)t->tile_k + (size_t)p * k_rb_gguf;
-            memcpy(dst, src, rb);
-        }
-    }
-
-    /* QK^T: matmul_batch(scores, q_rows, n_q, tile_k, hd, ts, kv_gguf_k)
-     * out layout: [n_q][ts], scores[b*ts + i] = row b, col i
+    /* QK^T -> scores[n_q][ts], scores[b*ts + i] = q_rows[b] . K_tile[i].
+     * attn_scale * log2(e) is pre-applied to q_rows during gather, so the
+     * scores come out in the log2 domain and need no per-tile scaling.
      *
-     * NOTE: This is called from inside tensor_parallel_for workers.
-     * matmul_batch for F16/F32 dispatches to picolm_sgemm with nth=1
-     * (serial), which does NOT use the thread pool. However, for
-     * quantized KV types, matmul_batch may fall through to the threaded
-     * worker path, which WOULD deadlock. Since the tiled path currently
-     * only activates for F16 KV cache, this is safe in practice. If
-     * quantized KV types are added, replace with a serial dot-product
-     * loop or a non-pool dispatch mechanism. */
-    matmul_batch(t->scores, t->q_rows, n_q, t->tile_k, hd, ts, t->kv_gguf_k);
-
-    /* NOTE: attn_scale * log2(e) is pre-applied to q_rows during gather, so
-     * scores are in the log2 domain and no per-tile scaling is needed here. */
+     * Every path here is SERIAL: we are inside a tensor_parallel_for worker,
+     * and a nested dispatch on the same pool would deadlock. */
+    switch (t->qk_mode) {
+    case ATTN_QK_Q8R8: {
+        const void *w = attn_build_k_tile(t, ts, tmp_f32);
+        /* m = ts rows (K positions, padded to a multiple of 8 below),
+         * n = n_q columns (query rows), k = hd values. */
+        int ts8 = (ts + 7) & ~7;
+        if (ts8 > ATTN_TILE) ts8 = ATTN_TILE;      /* ts <= ATTN_TILE always */
+        if (ts8 != ts) {
+            /* Zero-pad the weight groups so the row grid is complete: the
+             * extra rows score 0 for every query and are masked out below.
+             * k8_rows row ts..(ts8-1) still holds the previous tile's data,
+             * so it must be cleared explicitly. */
+            memset(t->k8_rows + (size_t)ts * (hd / 32), 0,
+                   (size_t)(ts8 - ts) * (hd / 32) * sizeof(block_q8_0));
+            repack_q8_0_to_q8_0_r8(t->k8_rows, t->k8r8, ts8, hd);
+        }
+        /* ith=0, nth=1 -> fully serial single pass (we are already inside a
+         * pool worker). Activation deltas are the fp16 round-trip ones so the
+         * scores match matmul_batch's batched-activation numerics. */
+        const int nb = hd / 32;
+        sgemm_q8_0_r8_q8_0_d_avx2(ts8, n_q, hd, w, t->q8_rows,
+                                  t->q8_delta, nb,
+                                  t->scores, (size_t)ts, 0, 1);
+        break;
+    }
+    case ATTN_QK_SGEMM_F32: {
+        const float *w = (const float *)attn_build_k_tile(t, ts, tmp_f32);
+        /* C[m=ts][n=n_q] = A[m][n_k=hd] * B[n_k][n=n_q], column-major rows of
+         * length ldc=ts. picolm_sgemm requires m%4==0 && k%16==0; anything
+         * else returns 0 and we fall back to plain dot products. */
+        if (!picolm_sgemm(ts, n_q, hd, w, hd, t->q_rows, hd, t->scores, ts,
+                          GGUF_TYPE_F32, GGUF_TYPE_F32, 0, 1)) {
+            for (int i = 0; i < n_q; i++)
+                for (int p = 0; p < ts; p++) {
+                    const float *kr = w + (size_t)p * hd;
+                    const float *qr = t->q_rows + (size_t)i * hd;
+                    float acc = 0.0f;
+                    for (int d = 0; d < hd; d++) acc += qr[d] * kr[d];
+                    t->scores[(size_t)i * ts + p] = acc;
+                }
+        }
+        break;
+    }
+    default: {
+        /* F16 K tile: matmul_batch -> picolm_sgemm(F16/F32) with nth=1. */
+        matmul_batch(t->scores, t->q_rows, n_q, t->tile_k, hd, ts, t->kv_gguf_k);
+        break;
+    }
+    }
 
     /* Causal masking for diagonal tile: for each query row i,
      * only positions [0, i_within_group] are valid.
@@ -1987,11 +2243,15 @@ static void attn_process_tile(attn_tile_task_t *t) {
                 _mm512_storeu_ps(acc_row + 96, a6);
                 _mm512_storeu_ps(acc_row + 112, a7);
             } else {
-                /* Generic path for hd != 128 (e.g. hd=64, 96) */
+                /* Generic path for hd != 128 (e.g. hd=64, 96, 128, 256).
+                 * n_blks can be up to 16 (hd=256), so the accumulator array
+                 * must be sized for that -- capping it at 8 silently skipped
+                 * dims 128..255 for hd > 128 (hd=256 scored only half of
+                 * every V row). */
                 const int D_BLK = 16;
-                int n_blks = hd / D_BLK;
-                if (n_blks > 8) n_blks = 8;
-                __m512 accv[8];
+                int n_blks = (hd + D_BLK - 1) / D_BLK;
+                if (n_blks > 16) n_blks = 16;
+                __m512 accv[16];
                 for (int db = 0; db < n_blks; db++)
                     accv[db] = _mm512_loadu_ps(acc_row + db * D_BLK);
                 for (int j = 0; j < ts; j++) {
@@ -2091,9 +2351,13 @@ static void batch_attention_tiled(
     int n_token_groups = (n_tokens + tile - 1) / tile;
     int n_kv_tiles = (start_pos + n_tokens + tile - 1) / tile;
 
-    gguf_type_t gguf_k = kv_cache_to_gguf_type((kv_cache_type_t)kv_type_k);
+    /* gguf_k is the format of the K *tile*: for TQ caches the tile holds
+     * dequantized F32 rows (inverse WHT applied), so it can go straight into
+     * an F32 or an int8 GEMM. gguf_v is the on-disk V format for dequantize_row. */
+    gguf_type_t gguf_k = GGUF_TYPE_F16;
+    int qk_mode = attn_choose_qk_mode((int)kv_type_k, head_dim, &gguf_k);
     gguf_type_t gguf_v = kv_cache_to_gguf_type((kv_cache_type_t)kv_type_v);
-    size_t k_rb_gguf = gguf_type_row_size(gguf_k, head_dim);
+    size_t k_rb_gguf = attn_ktile_row_bytes(gguf_k, head_dim);
 
     if (n_kv_heads < 1 || n_token_groups < 1) return;
 
@@ -2127,6 +2391,8 @@ static void batch_attention_tiled(
     bctx.gguf_k = gguf_k;
     bctx.gguf_v = gguf_v;
     bctx.k_rb_gguf = k_rb_gguf;
+    bctx.qk_mode = qk_mode;
+    bctx.q_rot = 0;
 
     /* Pre-allocate scratch for all tasks. Each task needs:
      *   scores: kv_mul*tile * tile floats
@@ -2135,6 +2401,7 @@ static void batch_attention_tiled(
      *   q_rows: kv_mul*tile * head_dim floats
      *   tile_k: tile * k_rb_gguf bytes
      *   tile_v: tile * head_dim floats
+     *   q8/k8:  per-QK-mode scratch (see q8_per/k8_per below)
      * We allocate a pool of scratch spaces, one per possible concurrent task.
  * The maximum concurrent tasks equals the thread count. */
     int n_tasks = n_kv_heads * n_token_groups;
@@ -2157,7 +2424,23 @@ static void batch_attention_tiled(
     size_t qr_per     = (size_t)kv_mul * tile * head_dim * sizeof(float);
     size_t tk_per     = (size_t)tile * k_rb_gguf;
     size_t tv_per     = (size_t)tile * head_dim * sizeof(float);
-    size_t scratch_per_task = scores_per + 2*ms_per + acc_per + qr_per + tk_per + tv_per;
+    /* Extra scratch for the non-F16 QK paths. Kept at 1 byte when unused so
+     * the slot layout always has the same number of regions. */
+    size_t q8_per = 1, q8_half = 0, k8_per = 1, k8_half = 0, f32t_per = 1;
+    if (qk_mode == ATTN_QK_Q8R8) {
+        const int nb = head_dim / 32;
+        size_t qrows = (size_t)kv_mul * tile;
+        size_t krows = (size_t)ATTN_TILE;   /* padded tile rows */
+        q8_half = qrows * nb * sizeof(block_q8_0);
+        q8_per = q8_half + qrows * nb * sizeof(float);
+        k8_half = krows * nb * sizeof(block_q8_0);
+        k8_per = k8_half + krows * nb * sizeof(block_q8_0_r8);
+        f32t_per = (size_t)tile * head_dim * sizeof(float);  /* dequant staging */
+    } else if (qk_mode == ATTN_QK_SGEMM_F32 && gguf_k != GGUF_TYPE_F32) {
+        f32t_per = (size_t)tile * head_dim * sizeof(float);  /* F32 dequant tile */
+    }
+    size_t scratch_per_task = scores_per + 2*ms_per + acc_per + qr_per + tk_per + tv_per
+                            + q8_per + k8_per + f32t_per;
     size_t total_scratch = (size_t)max_concurrent * scratch_per_task;
 
     /* Scratch pool: pre-allocated, sliced per concurrent task.
@@ -2208,6 +2491,11 @@ static void batch_attention_tiled(
     bctx.qr_per = qr_per;
     bctx.tk_per = tk_per;
     bctx.tv_per = tv_per;
+    bctx.q8_per = q8_per;
+    bctx.q8_half = q8_half;
+    bctx.k8_per = k8_per;
+    bctx.k8_half = k8_half;
+    bctx.f32t_per = f32t_per;
     bctx.max_concurrent = max_concurrent;
 
     /* Strided dispatch: task index -> (kv_head, token_group) with work growing

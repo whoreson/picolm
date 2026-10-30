@@ -51,16 +51,40 @@ typedef struct {
     float *q_batch, *xb_ref, *xb_tiled;
     uint8_t *kcache, *vcache;
     size_t kv_row_size_k, kv_row_size_v, kv_head_stride_k, kv_head_stride_v;
+    int kv_type_k, kv_type_v;   /* kv_cache_type_t values */
 } test_ctx_t;
+
+/* KV row/head stride for a cache type, mirroring model_core.c's
+ * kv_row_size_gqa()/kv_head_stride() so the harness exercises the real
+ * GQA-interleaved layout (blocks are contiguous across heads). */
+static size_t t_kv_head_stride(int kv_type, int head_dim) {
+    switch (kv_type) {
+        case KV_CACHE_F16:  return (size_t)head_dim * sizeof(uint16_t);
+        case KV_CACHE_Q8_0: return (size_t)(head_dim / 32) * sizeof(block_q8_0);
+        case KV_CACHE_Q4_0: return (size_t)(head_dim / 32) * sizeof(block_q4_0);
+        case KV_CACHE_TQ3:  return (size_t)(head_dim / TQ3_BLOCK_SIZE) * sizeof(block_tq3);
+        case KV_CACHE_TQ4:  return (size_t)(head_dim / TQ4_BLOCK_SIZE) * sizeof(block_tq4);
+    }
+    return 0;
+}
+static int t_kv_type_from_name(const char *n) {
+    if (!n) return KV_CACHE_F16;
+    if (!strcmp(n, "f16")) return KV_CACHE_F16;
+    if (!strcmp(n, "q8_0")) return KV_CACHE_Q8_0;
+    if (!strcmp(n, "q4_0")) return KV_CACHE_Q4_0;
+    if (!strcmp(n, "tq3")) return KV_CACHE_TQ3;
+    if (!strcmp(n, "tq4")) return KV_CACHE_TQ4;
+    return KV_CACHE_F16;
+}
 
 static const char *g_dump_file = NULL;
 
 static void fill_cache(test_ctx_t *tc) {
     int n_kv = tc->n_kv_heads, hd = tc->head_dim;
-    tc->kv_head_stride_k = (size_t)hd * 2;
-    tc->kv_head_stride_v = (size_t)hd * 2;
-    tc->kv_row_size_k = (size_t)n_kv * hd * 2;
-    tc->kv_row_size_v = (size_t)n_kv * hd * 2;
+    tc->kv_head_stride_k = t_kv_head_stride(tc->kv_type_k, hd);
+    tc->kv_head_stride_v = t_kv_head_stride(tc->kv_type_v, hd);
+    tc->kv_row_size_k = tc->kv_head_stride_k * (size_t)n_kv;
+    tc->kv_row_size_v = tc->kv_head_stride_v * (size_t)n_kv;
     int total = tc->start_pos + tc->n_tokens;
     tc->kcache = malloc((size_t)total * tc->kv_row_size_k);
     tc->vcache = malloc((size_t)total * tc->kv_row_size_v);
@@ -77,17 +101,46 @@ static void fill_cache(test_ctx_t *tc) {
         fprintf(stderr, "[harness] loaded real model data from %s\n", g_dump_file);
         return;
     }
+    float *kf = malloc((size_t)n_kv * hd * sizeof(float));
+    float *vf = malloc((size_t)n_kv * hd * sizeof(float));
     for (int p = 0; p < total; p++) {
-        uint16_t *krow = (uint16_t *)(tc->kcache + (size_t)p * tc->kv_row_size_k);
-        uint16_t *vrow = (uint16_t *)(tc->vcache + (size_t)p * tc->kv_row_size_v);
         const char *kr = getenv("PICOLM_TEST_KRAMP");   /* K scale grows with position */
         float kramp = kr ? (float)atof(kr) : 0.0f;
         float kscale = 1.0f + kramp * (float)p / (float)total;
         for (int i = 0; i < n_kv * hd; i++) {
-            krow[i] = fp32_to_fp16(frand() * kscale);
-            vrow[i] = fp32_to_fp16(frand());
+            kf[i] = frand() * kscale;
+            vf[i] = frand();
+        }
+        /* Quantize head by head: the head slice is block aligned in every
+         * supported type, exactly like the real KV store loop. */
+        for (int h = 0; h < n_kv; h++) {
+            uint8_t *kd = tc->kcache + (size_t)p * tc->kv_row_size_k
+                        + (size_t)h * tc->kv_head_stride_k;
+            uint8_t *vd = tc->vcache + (size_t)p * tc->kv_row_size_v
+                        + (size_t)h * tc->kv_head_stride_v;
+            const float *ks = kf + (size_t)h * hd;
+            const float *vs = vf + (size_t)h * hd;
+            switch (tc->kv_type_k) {
+                case KV_CACHE_F16:
+                    for (int d = 0; d < hd; d++) ((uint16_t *)kd)[d] = fp32_to_fp16(ks[d]);
+                    break;
+                case KV_CACHE_Q8_0: quantize_row_q8_0(ks, kd, hd); break;
+                case KV_CACHE_Q4_0: quantize_row_q4_0(ks, kd, hd); break;
+                case KV_CACHE_TQ3:  quantize_row_tq3(ks, kd, hd); break;
+                default:            quantize_row_tq4(ks, kd, hd); break;
+            }
+            switch (tc->kv_type_v) {
+                case KV_CACHE_F16:
+                    for (int d = 0; d < hd; d++) ((uint16_t *)vd)[d] = fp32_to_fp16(vs[d]);
+                    break;
+                case KV_CACHE_Q8_0: quantize_row_q8_0(vs, vd, hd); break;
+                case KV_CACHE_Q4_0: quantize_row_q4_0(vs, vd, hd); break;
+                case KV_CACHE_TQ3:  quantize_row_tq3(vs, vd, hd); break;
+                default:            quantize_row_tq4(vs, vd, hd); break;
+            }
         }
     }
+    free(kf); free(vf);
 }
 
 static void fill_queries(test_ctx_t *tc) {
@@ -107,7 +160,7 @@ static void run_path(test_ctx_t *tc, float *out, int use_tiled) {
                           tc->n_tokens, tc->start_pos,
                           tc->n_heads, tc->n_kv_heads, tc->head_dim,
                           tc->xb_stride,
-                          KV_CACHE_F16, KV_CACHE_F16,
+                          tc->kv_type_k, tc->kv_type_v,
                           tc->kv_row_size_k, tc->kv_row_size_v,
                           tc->kv_head_stride_k, tc->kv_head_stride_v,
                           1.0f / sqrtf((float)tc->head_dim), 0 /* n_swa */);
@@ -134,7 +187,12 @@ int main(int argc, char **argv) {
     int n_swa      = argc > 6 ? atoi(argv[6]) : 0;
     int seed       = argc > 7 ? atoi(argv[7]) : 1;
     int n_threads  = argc > 8 ? atoi(argv[8]) : 1;
-    g_dump_file = argc > 9 ? argv[9] : NULL;
+    g_dump_file = (argc > 9 && argv[9][0] && strcmp(argv[9], "-") != 0) ? argv[9] : NULL;
+    /* KV cache type: argv[10], or PICOLM_TEST_KV (argv[9] "-" = default f16). */
+    const char *kv_tk = argc > 10 ? argv[10]
+                      : (argc > 9 && !g_dump_file ? argv[9] : getenv("PICOLM_TEST_KV"));
+    int kv_type_k = t_kv_type_from_name(kv_tk);
+    int kv_type_v = kv_type_k;
 
     tensor_set_n_threads(n_threads);
     fp16_table_init();
@@ -144,14 +202,15 @@ int main(int argc, char **argv) {
     tc.n_tokens = n_tokens; tc.start_pos = start_pos;
     tc.n_heads = n_heads; tc.n_kv_heads = n_kv_heads;
     tc.head_dim = head_dim; tc.xb_stride = n_heads * head_dim;
+    tc.kv_type_k = kv_type_k; tc.kv_type_v = kv_type_v;
     fill_cache(&tc);
     fill_queries(&tc);
 
     tc.xb_ref   = calloc((size_t)n_tokens * tc.xb_stride, sizeof(float));
     tc.xb_tiled = calloc((size_t)n_tokens * tc.xb_stride, sizeof(float));
 
-    printf("CONFIG: heads=%d kv=%d hd=%d tokens=%d start=%d swa=%d threads=%d\n",
-           n_heads, n_kv_heads, head_dim, n_tokens, start_pos, n_swa, n_threads);
+    printf("CONFIG: heads=%d kv=%d hd=%d tokens=%d start=%d swa=%d threads=%d kvtype=%s\n",
+           n_heads, n_kv_heads, head_dim, n_tokens, start_pos, n_swa, n_threads, kv_tk ? kv_tk : "f16");
     printf("  tiled path: n_token_groups=%d, tasks=%d\n",
            (n_tokens + ATTN_TILE - 1) / ATTN_TILE,
            n_kv_heads * ((n_tokens + ATTN_TILE - 1) / ATTN_TILE));

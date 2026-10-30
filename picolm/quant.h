@@ -1241,6 +1241,9 @@ void dequantize_row_q4_0_r8(const void *src, float *dst, int n);
 void dequantize_row_q4_0_r8_single(const void *src, float *dst, int n, int row);
 /* Quantize 8 rows of F32 to Q8_0_R8 interleaved format. */
 void quantize_row_q8_0_r8(const float *x, void *dst, int n);
+/* Repack 8-row groups of plain Q8_0 rows (row stride n/32 blocks) into
+ * block_q8_0_r8 interleaved groups (dst = nrows/8 groups). Portable. */
+void repack_q8_0_to_q8_0_r8(const void *src, void *dst, int nrows, int n);
 /* Dequantize 8 rows of Q8_0_R8 to F32. dst must hold 8*n floats. */
 void dequantize_row_q8_0_r8(const void *src, float *dst, int n);
 void dequantize_row_q8_0_r8_single(const void *src, float *dst, int n, int row);
