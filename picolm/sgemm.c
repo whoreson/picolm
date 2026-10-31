@@ -2951,6 +2951,24 @@ int picolm_sgemm_d(int m, int n, int k_blocks,
     if (m < 4 || n < 2 || k_blocks < 1)
         return 0;
 #if defined(__AVX2__) && defined(__F16C__)
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+    /* AVX-512VL VNNI Q8_0 GEMM (8-row R8 repack on the fly, 12-column register tile). The d4
+     * kernel below is plain AVX2 maddubs even in AVX-512 builds. PICOLM_Q8_VNNI=0 disables;
+     * PICOLM_Q8_VNNI_MIN_N (default 32) = smallest batch worth the per-group repack. */
+    if (Atype == GGUF_TYPE_Q8_0) {
+        static int vnni_en = -1, vnni_min_n = 32;
+        if (vnni_en < 0) {
+            const char *e = getenv("PICOLM_Q8_VNNI"), *mn = getenv("PICOLM_Q8_VNNI_MIN_N");
+            if (mn && atoi(mn) > 0) vnni_min_n = atoi(mn);
+            vnni_en = !(e && e[0] == '0');
+        }
+        if (vnni_en && n >= vnni_min_n && (m % 8) == 0 &&
+            picolm_sgemm_q8_0_vnni(m, n, k_blocks, A, lda, B, ldb, C, ldc, ith, nth)) {
+            static int t_vnni; if (getenv("PICOLM_DISPATCH") && !t_vnni) { t_vnni = 1; fprintf(stderr, "TRACE kernel: picolm_sgemm_q8_0_vnni\n"); }
+            return 1;
+        }
+    }
+#endif
     /* Prefer 4x4 tiles (RN=4) when n >= 4: better activation cache reuse */
     if (Atype == GGUF_TYPE_Q8_0) {
         if (n >= 4) { sgemm_qg_q8_qs_d4(m, n, k_blocks, (const block_q8_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth); return 1; }

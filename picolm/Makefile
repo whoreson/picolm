@@ -831,3 +831,8 @@ gguf_be_swap: util/gguf_be_swap.c
 
 gguf_q40_i8_convert: util/gguf_q40_i8_convert.c
 	$(CC) -O2 -std=c99 -o $@ util/gguf_q40_i8_convert.c -lm
+
+# Q8_0 prefill GEMM benchmark: current picolm_sgemm_d vs the Q8_0_R8 AVX2 kernel vs raw VNNI peak.
+# usage: ./bench_q8_gemm [m n k reps threads]   e.g.  ./bench_q8_gemm 14336 512 4096 3 24
+bench_q8_gemm: bench_q8_gemm.c quant.c type_dispatch.c tensor.c $(SGEMM_SRCS) quant.h sgemm.h
+	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O3 -o $@ bench_q8_gemm.c quant.c type_dispatch.c tensor.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++

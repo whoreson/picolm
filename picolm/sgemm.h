@@ -151,6 +151,12 @@ int sgemm_q8_k_r8_q8_k_avx2(int nrows, int ncols, int k,
         const void *vx, const void *vy, float *out, size_t bs,
         int ith, int nth);
 
+/* AVX-512VL VNNI Q8_0 GEMM (returns 0 when unavailable/unsupported so callers fall back).
+ * Plain Q8_0 weights: repacks each 8-row group into an L2 scratch on the fly (no model-format
+ * change); C[c*ldc + r] like picolm_sgemm_d; m % 8 == 0. See sgemm_q8_0_r8.c. */
+int picolm_sgemm_q8_0_vnni(int m, int n, int k_blocks, const void *A, int lda,
+                           const void *B, int ldb, float *C, int ldc, int ith, int nth);
+
 #ifdef __cplusplus
 }
 #endif
