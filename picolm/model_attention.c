@@ -1215,7 +1215,16 @@ static inline void attn_pack_k_row(const uint8_t *src, uint8_t *dst,
          * plain dot product in the original head space. */
         if (kv_type == KV_CACHE_TQ3) { ad_deq_tq_row(src, (float *)dst, head_dim, 0, 1); return; }
         if (kv_type == KV_CACHE_TQ4) { ad_deq_tq_row(src, (float *)dst, head_dim, 1, 1); return; }
-        dequantize_row(src, (float *)dst, head_dim, (gguf_type_t)kv_type);
+        /* kv_type is a kv_cache_type_t, NOT a gguf_type_t -- the two enums have
+         * different values (KV_CACHE_F16=0/Q8_0=1/Q4_0=2 vs
+         * GGUF_TYPE_F16=1/Q4_0=2/Q8_0=8), so casting directly silently
+         * dequantized a Q8_0 cache as F16 (producing NaNs) and a Q4_0 cache as
+         * Q4_0 only by coincidence. This branch was previously reachable only
+         * for TQ caches, which return above, so the confusion was latent until
+         * the F32 QK path started dequantizing quantized caches too.
+         * Use the dedicated mapping helper instead of a cast. */
+        dequantize_row(src, (float *)dst, head_dim,
+                       kv_cache_to_gguf_type((kv_cache_type_t)kv_type));
         return;
     }
     case GGUF_TYPE_F16:
@@ -1286,6 +1295,18 @@ static int attn_choose_qk_mode(int kv_type_k, int head_dim, gguf_type_t *tile_gg
     }
     if (kv_type_k == KV_CACHE_TQ3 || kv_type_k == KV_CACHE_TQ4) {
         *tile_gguf = GGUF_TYPE_F32;   /* dequantized, WHT-inverted */
+    } else if (want == ATTN_QK_SGEMM_F32) {
+        /* The F32 QK path needs the K tile dequantized too: attn_pack_k_row()
+         * switches on *tile_gguf* to decide how many bytes to write, and the
+         * SGEMM_F32 consumer reads floats. Leaving tile_gguf as the raw cache
+         * format here sized the tile row with gguf_type_row_size(Q4_0, hd)
+         * while attn_pack_k_row wrote head_dim * sizeof(float) into it -- a
+         * heap-buffer-overflow for any quantized K cache whose head_dim is not
+         * a multiple of 32 (e.g. head_dim=48: row sized 27 bytes, 192 written;
+         * caught by ASan as "heap-buffer-overflow ... in __interceptor_memcpy
+         * <- attn_pack_k_row"). Reached whenever attn_q8r8_ok() rejects the
+         * head_dim, i.e. exactly the models with an odd head_dim. */
+        *tile_gguf = GGUF_TYPE_F32;
     } else {
         *tile_gguf = kv_cache_to_gguf_type((kv_cache_type_t)kv_type_k);
     }
@@ -1374,24 +1395,36 @@ static void batch_tiled_task(int task_idx, void *ctx_ptr) {
     int slot = task_idx % bc->max_concurrent;
     uint8_t *scratch = bc->scratch_pool + (size_t)slot * bc->scratch_per_task;
 
-    /* Layout the scratch slice (all offsets precomputed by the caller) */
+    /* Layout the scratch slice (all offsets precomputed by the caller).
+     *
+     * Every float/block region is rounded up to 4 bytes before the next one
+     * starts. tile_k is a uint8_t region of size tile * k_rb_gguf, which is
+     * not a multiple of 4 in general (e.g. a Q4_0 row of 48 elements is 28
+     * bytes); without the padding, tile_v_f32 and every region after it were
+     * misaligned, and `qr[d] = ...` / other float stores there were undefined
+     * behaviour (reported by UBSan as "store to misaligned address ... requires
+     * 4 byte alignment"). x86 tolerates unaligned scalar stores so nothing
+     * visibly broke, but the compiler is entitled to assume alignment, and
+     * NEON/other targets may fault on the paired loads/stores used here. */
+    #define ATTN_ALIGN4(n) (((n) + 3u) & ~(size_t)3u)
     float *scores = (float *)scratch;            scratch += bc->scores_per;
     float *M       = (float *)scratch;           scratch += bc->ms_per;
     float *S       = (float *)scratch;           scratch += bc->ms_per;
     float *acc     = (float *)scratch;           scratch += bc->acc_per;
     float *q_rows  = (float *)scratch;           scratch += bc->qr_per;
-    uint8_t *tile_k = scratch;                   scratch += bc->tk_per;
+    uint8_t *tile_k = scratch;                   scratch += ATTN_ALIGN4(bc->tk_per);
     float *tile_v_f32 = (float *)scratch;        scratch += bc->tv_per;
     /* Non-F16 QK scratch (sized 1 byte when unused; never dereferenced then) */
     /* q8_per covers both halves: [q8_rows blocks][q8_delta floats] */
     block_q8_0 *q8_rows = (block_q8_0 *)scratch;
     float *q8_delta = (float *)(scratch + bc->q8_half);
-    scratch += bc->q8_per;
+    scratch += ATTN_ALIGN4(bc->q8_per);
     /* k8_per covers both halves: [k8_rows plain Q8_0][k8r8 Q8_0_R8 groups] */
     block_q8_0 *k8_rows = (block_q8_0 *)scratch;
     block_q8_0_r8 *k8r8 = (block_q8_0_r8 *)(scratch + bc->k8_half);
-    scratch += bc->k8_per;
+    scratch += ATTN_ALIGN4(bc->k8_per);
     float *k_tmp_f32 = (float *)scratch;          scratch += bc->f32t_per;
+    #undef ATTN_ALIGN4
 
     int kv_h = task_idx / bc->n_token_groups;
     int tg = task_idx % bc->n_token_groups;
@@ -2470,8 +2503,20 @@ static void batch_attention_tiled(
     } else if (qk_mode == ATTN_QK_SGEMM_F32 && gguf_k != GGUF_TYPE_F32) {
         f32t_per = (size_t)tile * head_dim * sizeof(float);  /* F32 dequant tile */
     }
-    size_t scratch_per_task = scores_per + 2*ms_per + acc_per + qr_per + tk_per + tv_per
-                            + q8_per + k8_per + f32t_per;
+    /* Must match the ATTN_ALIGN4() rounding in batch_tiled_task's layout, or
+     * slot N+1 starts at a different offset than the task believes and every
+     * region after tile_k is misaligned again. */
+    #define ATTN_ALIGN4(n) (((n) + 3u) & ~(size_t)3u)
+    /* The final ATTN_ALIGN4 is essential: the per-task stride itself must be a
+     * multiple of 4 or slot N+1 begins at a misaligned address and every float
+     * region in it is misaligned again, however carefully each region inside
+     * one slot is laid out. (Measured: with unaligned tk_per/q8_per/k8_per the
+     * stride came out 96393, so slot 1 started at ...803 and UBSan flagged the
+     * very first float store in the slot.) */
+    size_t scratch_per_task = ATTN_ALIGN4(scores_per + 2*ms_per + acc_per + qr_per
+                            + ATTN_ALIGN4(tk_per) + tv_per
+                            + ATTN_ALIGN4(q8_per) + ATTN_ALIGN4(k8_per) + f32t_per);
+    #undef ATTN_ALIGN4
     size_t total_scratch = (size_t)max_concurrent * scratch_per_task;
 
     /* Scratch pool: pre-allocated, sliced per concurrent task.

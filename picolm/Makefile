@@ -335,6 +335,26 @@ tests/test_glm5_ops: tests/test_glm5_ops.c
 asan:
 	$(MAKE) $(TARGET) CFLAGS="-fsanitize=address -g -O2 $(NATIVE_MARCH) $(call simd_defines_for,$(NATIVE_MARCH)) -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic -fopenmp" LDFLAGS="-lm -lpthread -fopenmp -fsanitize=address"
 
+# check-all under ASan+UBSan. The bug classes seen most often in this codebase
+# are out-of-bounds writes into scratch buffers carved from one malloc and
+# signed-overflow / misaligned-store UB in the quantisation paths -- note that a
+# plain heap overflow IS caught here but an overrun into a *sibling* region of
+# the same allocation is not (see TODO(stride-invariants) in model_core.c); this
+# target still catches the first kind and all the UB.
+# ASAN_OPTIONS/UBSAN_OPTIONS are exported so the sub-make's children inherit
+# them. detect_leaks=0 because the daemon paths (server, mmap'd model) leak by
+# design at exit and would mask a real failure.
+SAN_FLAGS = -fsanitize=address,undefined -fno-omit-frame-pointer -g -O1
+.PHONY: check-all-san
+check-all-san:
+	$(MAKE) clean
+	ASAN_OPTIONS=detect_leaks=0 \
+	UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+	$(MAKE) check-all -j1 CC=$(CC) \
+	  TEST_NATIVE_CFLAGS="$(CFLAGS) $(NATIVE_MARCH) $(call simd_flags_for,$(NATIVE_MARCH)) $(call simd_defines_for,$(NATIVE_MARCH)) -std=c11 -D_GNU_SOURCE -fopenmp $(SAN_FLAGS)"
+	@echo ""
+	@echo "=== check-all-san: clean under ASan+UBSan (leaks not checked) ===" 
+
 # --- Force recompile of GPU-dependent C objects ---
 # These objects contain #ifdef PICOLM_GPU code; when building GPU targets
 # alongside a prior native build, Make won't recompile them because
@@ -764,8 +784,11 @@ test_swa_dos: tests/test_swa.c $(TEST_SWA_OBJS_DOS) dos_stubs.o.dos
 dos-clean:
 	-rm -f $(DJGPP_OBJS) dos_stubs.o.dos picolm.exe tests/test_swa.o.dos test_swa.exe
 
+# test_quant lives in util/ now but still includes "quant.h" etc. from the repo
+# root, so it needs -I. (the implicit search of the source file's own directory
+# no longer covers it).
 test_quant: util/test_quant.c quant.c sgemm.c
-	$(CC) $(CFLAGS) -o $@ util/test_quant.c quant.c sgemm.c -lm
+	$(CC) $(CFLAGS) -I. -o $@ util/test_quant.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp
 
 test_q6_k_r4: tests/test_q6_k_r4.c quant.c sgemm_q6_k_r4.c
 	$(CC) $(CFLAGS) -o $@ tests/test_q6_k_r4.c quant.c sgemm_q6_k_r4.c -lm -lpthread -fopenmp
@@ -847,6 +870,30 @@ ifdef TSAN
 	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O2 -fsanitize=thread -o test_pool_stress_tsan test_pool_stress.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
 	for c in "3 5" "4 0" "8 50" "24 500"; do set -- $$c; PICOLM_POOL_SPIN_US=$$2 ./test_pool_stress_tsan $$1 600 7 2>&1 | grep -q "WARNING: ThreadSanitizer" && { echo "TSAN warning nt=$$1 spin=$$2"; exit 1; }; done; echo "tsan clean"
 endif
+
+# ---------------------------------------------------------------------------
+# check-all: every self-contained regression suite that needs no model file.
+#
+# This is the list CI runs (see .github/workflows/ci.yml), so local and CI stay
+# in sync -- add new suites here rather than in the workflow.
+#
+# Deliberately excluded:
+#   - anything needing a GGUF (model-dependent; see tests/README-model-matrix.md)
+#   - GPU backends (need nvcc / Vulkan SDK / Apple toolchain; see TODO(backend-ci))
+# ---------------------------------------------------------------------------
+.PHONY: check-q6-k-r4
+check-q6-k-r4: test_q6_k_r4
+	./test_q6_k_r4
+
+.PHONY: check-quant
+check-quant: test_quant
+	./test_quant
+
+.PHONY: check-all
+check-all: check-hreduce check-kvcache-tokwrite check-quant check-q6-k-r4 \
+           check-glm5-dsa check-glm5-snapshot check-attn check-attn-decode check-pool
+	@echo ""
+	@echo "=== check-all: all self-contained suites passed ==="
 
 gguf_be_swap: util/gguf_be_swap.c
 	$(CC) -O2 -std=c99 -o $@ util/gguf_be_swap.c -lm

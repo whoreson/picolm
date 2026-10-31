@@ -81,6 +81,29 @@ jobs:
           make clean
           make avx2 -j$(nproc) CC=gcc
 
+      # --------------------------------------------------------------------
+      # check-all: every self-contained regression suite that needs no model.
+      # Kept as a single Makefile target so local and CI cannot drift -- add
+      # new suites to the Makefile's check-all, not to this workflow.
+      #
+      # Covers the bugs fixed during the Qwen3.6 divergence work:
+      #   hreduce256_ps      -- AVX2 8-lane sum returned 0.75x (lanes 3,7 lost)
+      #   kvcache_tokwrite   -- /slots save overran a 128 KiB buffer past 32K tokens
+      #   test_quant         -- quant/dequant round-trip + block-size invariants
+      #   test_q6_k_r4       -- vec_dot + sgemm vs reference
+      #   glm5_dsa/snapshot  -- MLA/KDA round-trips, KV snapshot back-compat
+      #   attn(267 configs), attn_decode(394), pool_stress(25)
+      # --------------------------------------------------------------------
+      - name: Run check-all (self-contained regression suites)
+        working-directory: ./picolm
+        run: |
+          set -o pipefail
+          make check-all -j1 CC=gcc 2>&1 | tee /tmp/check_all.txt
+          if ! grep -q "=== check-all: all self-contained suites passed ===" /tmp/check_all.txt; then
+            echo "FAIL: check-all did not complete"
+            exit 1
+          fi
+
       - name: Run test_swa
         working-directory: ./picolm
         run: |
