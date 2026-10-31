@@ -1130,10 +1130,40 @@ int parse_gguf(model_t *m, int max_seq_len) {
             || str_eq(key, "gemma3n.embedding_length") || str_eq(key, "gpt2.embedding_length") || str_eq(key, "stablelm.embedding_length")
             || str_eq(key, "gptneox.embedding_length")) {
             int dummy; cfg->n_embd = (int)skip_meta_value(&r, vtype, &dummy);
-            /* NOTE: Qwen2 uses interleaved RoPE. Qwen3 and Qwen3.5 use pairwise RoPE
-             * (same as Llama). Only set rope_type=1 for qwen2, not qwen3/qwen35.
-             * Gemma-3n uses standard pairwise RoPE (rope_type=0). */
-            if (key.str[0] == 'q' && key.len > 6 && key.str[5] == '2') cfg->rope_type = 1;
+            /* RoPE convention per family.
+             *
+             * This used to claim "Qwen3 and Qwen3.5 use pairwise RoPE (same as
+             * Llama); only set rope_type=1 for qwen2". That is WRONG. ik_llama
+             * (the implementation these GGUFs were quantised for) classifies
+             * LLM_ARCH_QWEN, QWEN2, QWEN2MOE, QWEN3, QWEN3MOE, QWEN3NEXT,
+             * QWEN35 and QWEN35MOE all as LLAMA_ROPE_TYPE_NEOX -- see
+             * llama_rope_type() in llama.cpp, where those cases share the NEOX
+             * group with PHI2/GEMMA/STARCODER2. Only LLAMA/BAICHUAN and friends
+             * are LLAMA_ROPE_TYPE_NORM (pairwise).
+             *
+             * Measured on Qwen3.6-27B vs the ik oracle (5-token prompt, greedy,
+             * identical token ids), switching this on fixes the full-attention
+             * layers and the near-tie divergence at pos 8:
+             *
+             *            cos(pos4)  cos(pos8)  rmsdiff(pos8)  top-5 at pos8
+             *   pairwise  0.99994    0.99355      0.2139      top-3/4 swapped
+             *   NEOX      0.99995    0.99783      0.1247      exact match
+             *
+             * Every position improves. Note the rotation is genuinely
+             * different, not a reordering: with rope_dim=64 and head_dim=256,
+             * NEOX pairs q[i] with q[i+32] while pairwise pairs q[2i] with
+             * q[2i+1].
+             *
+             * Gemma-3n stays pairwise if its key does not look like qwen/qwen2
+             * below -- it has its own branch. */
+            if (key.str[0] == 'q' && key.len > 5) {
+                /* qwen2*, qwen3*, qwen35*, qwen35moe* -> half-split RoPE.
+                 * This used to be a fixed-offset check for "qwen2" only, which
+                 * missed qwen3/qwen35 entirely -- see the note above. */
+                if (key.str[1] == 'w' && key.str[2] == 'e' && key.str[3] == 'n') {
+                    cfg->rope_type = 1;
+                }
+            }
         } else if (str_eq(key, "glm5next.feed_forward_length") || str_eq(key, "llama.feed_forward_length") || str_eq(key, "general.feed_forward_length")
             || str_eq(key, "qwen2.feed_forward_length") || str_eq(key, "qwen3.feed_forward_length") || str_eq(key, "qwen35.feed_forward_length")
             || str_eq(key, "gemma3n.feed_forward_length") || str_eq(key, "gpt2.feed_forward_length") || str_eq(key, "stablelm.feed_forward_length")
