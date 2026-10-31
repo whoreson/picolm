@@ -552,7 +552,8 @@ static struct _server_state {
     char host[256];
     const char *model_path;
     int running;
-    char recv_buf[65536];
+    char *recv_buf;               /* heap-allocated, grown on demand */
+    int recv_buf_cap;             /* allocated size of recv_buf */
     char recv_path[2048];         /* last request path, for query param parsing */
     SOCKET sock_in_buf;
 
@@ -592,17 +593,38 @@ static struct _server_state {
 } srv;
 
 /* Parse HTTP request line: "METHOD /path HTTP/1.1" */
-static int http_parse_request(char *buf, int len, char *method, int mlen, char *path, int plen) {
+/* Ensure recv_buf has at least 'need' bytes allocated. Returns 0 on success. */
+static int recv_buf_ensure(int need) {
+    if (srv.recv_buf && need <= srv.recv_buf_cap) return 0;
+    int newcap = srv.recv_buf_cap ? srv.recv_buf_cap : 65536;
+    while (newcap < need) newcap *= 2;
+    char *nb = (char *)realloc(srv.recv_buf, newcap);
+    if (!nb) return -1;
+    srv.recv_buf = nb;
+    srv.recv_buf_cap = newcap;
+    return 0;
+}
+
+static int http_parse_request(char *method, int mlen, char *path, int plen) {
     method[0] = path[0] = '\0';
-    /* Read until \r\n\r\n (end of headers) */
+    if (recv_buf_ensure(65536) != 0) return -1;
+    /* Read until \r\n\r\n (end of headers), growing buffer as needed */
     int have = 0;
-    while (have < len - 1) {
+    char *buf = srv.recv_buf;
+    int len = srv.recv_buf_cap;
+    while (1) {
+        /* Check if headers are complete in what we have so far */
+        buf[have] = '\0';
+        if (have >= 4 && strstr(buf, "\r\n\r\n")) break;
+        if (recv_buf_ensure(have + 2) != 0) return -1;
+        buf = srv.recv_buf;
+        len = srv.recv_buf_cap;
+        if (have >= len - 1) return -1; /* buffer full without complete headers */
         int n = (int)recv(srv.sock_in_buf, buf + have, len - have - 1, 0);
         if (n <= 0) return -1;
         have += n;
-        buf[have] = '\0';
-        if (strstr(buf, "\r\n\r\n")) break;
     }
+    buf[have] = '\0';
     /* Extract method and path */
     char *sp1 = strchr(buf, ' ');
     if (!sp1) return -1;
@@ -622,8 +644,11 @@ static int http_parse_request(char *buf, int len, char *method, int mlen, char *
 }
 
 /* Read the full request body after headers. The body starts right after \r\n\r\n
- * in buf. Returns the body length (bytes available after \r\n\r\n). */
-static int http_read_body(char *buf, int buf_len, int header_len) {
+ * in srv.recv_buf. Grows the buffer as needed. Returns the body length. */
+static int http_read_body(int header_len) {
+    char *buf = srv.recv_buf;
+    if (!buf) return -1;
+
     /* Find Content-Length header */
     char *cl = strstr(buf, "Content-Length:");
     int content_length = -1;
@@ -642,9 +667,11 @@ static int http_read_body(char *buf, int buf_len, int header_len) {
             /* Body fully in buffer already - common case (curl, small POSTs) */
             return content_length;
         }
-        /* Need to read more body bytes */
+        /* Grow buffer to fit headers + full body + NUL terminator */
+        if (recv_buf_ensure(body_off + content_length + 1) != 0) return -1;
+        buf = srv.recv_buf;
         int remaining = content_length - have;
-        while (remaining > 0 && body_off + content_length < buf_len) {
+        while (remaining > 0) {
             int n = (int)recv(srv.sock_in_buf, buf + body_off + have, remaining, 0);
             if (n <= 0) return -1;
             have += n;
@@ -1333,6 +1360,9 @@ static void server_free(void) {
     free(srv.last_prompt_tokens);
     srv.last_prompt_tokens = NULL;
     srv.max_last_prompt = 0;
+    free(srv.recv_buf);
+    srv.recv_buf = NULL;
+    srv.recv_buf_cap = 0;
 }
 
 /* ---- Debug: print token ID + text (env var gated) ---- */
@@ -3463,7 +3493,7 @@ static int is_slots_path(const char *path) {
 static void handle_request(SOCKET sock) {
     char method[16], path[512];
     srv.sock_in_buf = sock;
-    int header_len = http_parse_request(srv.recv_buf, sizeof(srv.recv_buf), method, sizeof(method), path, sizeof(path));
+    int header_len = http_parse_request(method, sizeof(method), path, sizeof(path));
     if (header_len >= 0) {
         strncpy(srv.recv_path, path, sizeof(srv.recv_path) - 1);
         srv.recv_path[sizeof(srv.recv_path) - 1] = '\0';
@@ -3478,7 +3508,7 @@ static void handle_request(SOCKET sock) {
 
     /* Read body if this is a POST */
     if (strcmp(method, "POST") == 0) {
-        http_read_body(srv.recv_buf, sizeof(srv.recv_buf), header_len);
+        http_read_body(header_len);
     }
 
     char *body_start = strstr(srv.recv_buf, "\r\n\r\n");
