@@ -3309,6 +3309,7 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
     int bi;
     (void)xb_batch; /* not used: SSM layer uses local ssm_xb buffer */
     (void)start_pos;
+    (void)xb2_stride;
 #ifdef PICOLM_GPU
     /* gpu_lw is used by GPU dispatch blocks below */
 #else
@@ -3338,6 +3339,28 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
     int half_vpk = n_vpk / 2;
     int do_remap = !m->from_safetensors && n_k > 0 && n_k < n_v_heads && half_vpk > 0;
     int value_dim = c->ssm_d_inner;
+    /* vd_buf is a value_dim-strided scratch for the recurrence + gated-norm
+     * output.
+     *
+     * xb2_batch (the caller's buffer) is only n_tokens * xb2_stride floats, and
+     * xb2_stride == n_embd (5120) for Qwen3.5/3.6, while the gated-norm output
+     * is n_v_heads * head_v_dim == ssm_d_inner (6144). The old code wrote the
+     * gated norm straight into xb2_batch at stride value_dim, i.e. n_tokens *
+     * 6144 floats into a n_tokens * 5120 region -- a 5120-float (20 KB)
+     * overflow for a 5-token prompt, running past the end of xb2_batch into
+     * q_batch (the buffers are slices of one allocation) and corrupting the
+     * next layer's Q for the trailing tokens. ASan does not flag it because it
+     * stays inside the enclosing allocation.
+     *
+     * The narrowed n_embd result is copied back into xb2_batch at xb2_stride
+     * after the ssm_out projection (step 9). */
+    float *vd_buf = NULL;
+    if ((size_t)n_tokens * (size_t)value_dim > (size_t)n_tokens * (size_t)xb2_stride) {
+        vd_buf = (float *)malloc((size_t)n_tokens * (size_t)value_dim * sizeof(float));
+        if (!vd_buf) { fprintf(stderr, "OOM: ssm gated-norm scratch\n"); exit(1); }
+    }
+    /* Output target for the chunked recurrence + gated normalisation. */
+    float *xb2_vd = vd_buf ? vd_buf : xb2_batch;
     int qk_dim = d_state * n_k_heads;
     int repeat = n_v_heads / n_k_heads;
 
@@ -3633,14 +3656,14 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
             size_t st_sz = (size_t)n_v_heads * d_state * d_state * sizeof(float);
             float *xb2_pre = malloc(xb2_sz);
             float *st_pre = malloc(st_sz);
-            if (xb2_pre) memcpy(xb2_pre, xb2_batch, xb2_sz);
+            if (xb2_pre) memcpy(xb2_pre, xb2_vd, xb2_sz);
             if (st_pre) memcpy(st_pre, state, st_sz);
 #endif
 #ifdef PICOLM_GPU
             if (gpu_lw) {
                 chunked_gpu_done = picolm_gpu_ssm_chunked_recurrence(
                     conv_batch, alpha_batch, beta_batch,
-                    state, xb2_batch,
+                    state, xb2_vd,
                     n_tokens, value_dim,
                     d_state, n_k_heads, n_v_heads, head_v_dim, repeat,
                     conv_dim, m->ssm_chunk_size, m->gpu.device);
@@ -3649,7 +3672,7 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
             if (!chunked_gpu_done) {
                 ssm_chunked_recurrence(
                     conv_batch, alpha_batch, beta_batch,
-                    state, xb2_batch,
+                    state, xb2_vd,
                     n_tokens, value_dim,
                     d_state, n_k_heads, n_v_heads, head_v_dim, repeat,
                     conv_dim, m->ssm_chunk_size);
@@ -3671,7 +3694,7 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
                             conv_dim, m->ssm_chunk_size);
                         float max_diff = 0;
                         for (int i = 0; i < n_tokens * value_dim; i++) {
-                            float d = fabsf(xb2_batch[i] - xb2_cpu[i]);
+                            float d = fabsf(xb2_vd[i] - xb2_cpu[i]);
                             if (d > max_diff) max_diff = d;
                         }
                         fprintf(stderr, "SSM_VERIFY l=%d xb2_max_diff=%.6e\n", l, max_diff);
@@ -3680,10 +3703,10 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
                             for (int i = 0; i < 8; i++) fprintf(stderr, "%s%.6f", i ? ", " : "", xb2_cpu[i]);
                             fprintf(stderr, "}\n");
                             fprintf(stderr, "SSM_VERIFY l=0 gpu_xb2[:8]={");
-                            for (int i = 0; i < 8; i++) fprintf(stderr, "%s%.6f", i ? ", " : "", xb2_batch[i]);
+                            for (int i = 0; i < 8; i++) fprintf(stderr, "%s%.6f", i ? ", " : "", xb2_vd[i]);
                             fprintf(stderr, "}\n");
                             /* Dump post-ssm_out bx (residual target) from CPU path */
-                            fprintf(stderr, "SSM_VERIFY l=0 cpu_post_out xb2_batch_last[:8]={");
+                            fprintf(stderr, "SSM_VERIFY l=0 cpu_post_out xb2_vd_last[:8]={");
                             int lt = n_tokens - 1;
                             for (int i = 0; i < 8; i++) fprintf(stderr, "%s%.6f", i ? ", " : "", xb2_batch[lt * xb2_stride + i]);
                             fprintf(stderr, "}\n");
@@ -3722,7 +3745,7 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
             tensor_parallel_for(n_v_heads, ssm_head_task, &ssm_ctx);
             for (int d = 0; d < d_state; d++)
                 for (int h = 0; h < n_v_heads; h++)
-                    xb2_batch[h * head_v_dim + d] = ssm_output[d * n_v_heads + h];
+                    xb2_vd[h * head_v_dim + d] = ssm_output[d * n_v_heads + h];
             free(ssm_output);
         }
     }
@@ -3735,12 +3758,12 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
 #ifdef PICOLM_GPU
     if (gpu_lw) {
         gated_norm_gpu_done = picolm_gpu_ssm_prefill_gated_norm(
-            xb2_batch, z_batch, s->ssm_norm_w[l], head_v_dim, n_v_heads, n_tokens, eps, m->gpu.device);
+            xb2_vd, z_batch, s->ssm_norm_w[l], head_v_dim, n_v_heads, n_tokens, eps, m->gpu.device);
     }
 #endif
     if (!gated_norm_gpu_done) {
         for (bi = 0; bi < n_tokens; bi++) {
-            float *ssm_out = xb2_batch + bi * value_dim;
+            float *ssm_out = xb2_vd + bi * value_dim;
             float *z = z_batch + bi * value_dim;
             float *norm_w = s->ssm_norm_w[l];
             for (int h = 0; h < n_v_heads; h++) {
@@ -3761,11 +3784,11 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
     }
     if (l == 0 && _SSM_DBG) {
         float gn_rms=0; float gn_v[4];
-        for (int i=0;i<4;i++) { gn_v[i]=xb2_batch[(n_tokens-1)*value_dim+i]; gn_rms+=gn_v[i]*gn_v[i]; }
+        for (int i=0;i<4;i++) { gn_v[i]=xb2_vd[(n_tokens-1)*value_dim+i]; gn_rms+=gn_v[i]*gn_v[i]; }
         gn_rms = sqrtf(gn_rms/4);
         fprintf(stderr, "[CPU l%d] gated_norm rms_last=%.6f {%.6f %.6f %.6f %.6f}\n", l, gn_rms, gn_v[0],gn_v[1],gn_v[2],gn_v[3]);
         /* Per-head dump after gated_norm */
-        { int lt=n_tokens-1; const float *xb2l=xb2_batch+lt*value_dim;
+        { int lt=n_tokens-1; const float *xb2l=xb2_vd+lt*value_dim;
           const float *nwm=s->ssm_norm_w[l];
           double nw_rms=0;for(int i=0;i<head_v_dim;i++)nw_rms+=nwm[i]*nwm[i];
           fprintf(stderr,"[CPU l0] ssm_norm_w rms=%.6f first8={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
@@ -3782,7 +3805,7 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
 
     /* Per-head gated_norm dump for CPU (guarded by _SSM_DBG) */
     if (l == 0 && _SSM_DBG) {
-        int lt=n_tokens-1; const float *xb2l=xb2_batch+lt*value_dim;
+        int lt=n_tokens-1; const float *xb2l=xb2_vd+lt*value_dim;
         const float *nwm=s->ssm_norm_w[l];
         double nw_rms=0;for(int i=0;i<head_v_dim;i++)nw_rms+=nwm[i]*nwm[i];
         fprintf(stderr,"[CPU l0] ssm_norm_w rms=%.6f first8={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
@@ -3800,17 +3823,17 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
     if (l <= 4 && _SSM_DBG) {
         { int lt2 = n_tokens - 1;
           for (int hh = 0; hh < n_v_heads; hh++) {
-              float hr = 0; for (int dd = 0; dd < head_v_dim; dd++) { float v = xb2_batch[lt2 * value_dim + hh * head_v_dim + dd]; hr += v * v; }
+              float hr = 0; for (int dd = 0; dd < head_v_dim; dd++) { float v = xb2_vd[lt2 * value_dim + hh * head_v_dim + dd]; hr += v * v; }
               float hrms = sqrtf(hr / head_v_dim);
               if (hh < 4 || hh >= n_v_heads - 2 || hrms > 0.01) {
                   fprintf(stderr, "[CPU l%d] xb2_h%d rms=%.6f first4={%.6f,%.6f,%.6f,%.6f}\n",
-                      l, hh, hrms, xb2_batch[lt2*value_dim+hh*head_v_dim],
-                      xb2_batch[lt2*value_dim+hh*head_v_dim+1],
-                      xb2_batch[lt2*value_dim+hh*head_v_dim+2],
-                      xb2_batch[lt2*value_dim+hh*head_v_dim+3]);
+                      l, hh, hrms, xb2_vd[lt2*value_dim+hh*head_v_dim],
+                      xb2_vd[lt2*value_dim+hh*head_v_dim+1],
+                      xb2_vd[lt2*value_dim+hh*head_v_dim+2],
+                      xb2_vd[lt2*value_dim+hh*head_v_dim+3]);
               }
           }
-          float mx = 0; for (int i = 0; i < value_dim; i++) { float a = xb2_batch[lt2 * value_dim + i]; if (a < 0) a = -a; if (a > mx) mx = a; }
+          float mx = 0; for (int i = 0; i < value_dim; i++) { float a = xb2_vd[lt2 * value_dim + i]; if (a < 0) a = -a; if (a > mx) mx = a; }
           fprintf(stderr, "[CPU l%d] xb2_maxabs=%.6f\n", l, mx);
         }
     }
@@ -3827,7 +3850,7 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
          * fixed per-call overhead 36 times per layer instead of once. */
         float *fo_gguf_batch = (float *)malloc((size_t)n_tokens * value_dim * sizeof(float));
         for (bi = 0; bi < n_tokens; bi++) {
-            float *fo = xb2_batch + bi * value_dim;
+            float *fo = xb2_vd + bi * value_dim;
             float *dst = fo_gguf_batch + bi * value_dim;
             for (int h = 0; h < n_v_heads; h++) {
                 int gh = qwen35_vhead_gguf(h, n_vpk, n_k);
@@ -4024,6 +4047,7 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
         fprintf(stderr, "[CPU PFX l=%d] bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n", l, x_batch[lt*dim], x_batch[lt*dim+1], x_batch[lt*dim+2], x_batch[lt*dim+3]);
     }
     free(ssm_buf);
+    free(vd_buf);
 }
 
 size_t model_ssm_snapshot_size(const model_t *m) {

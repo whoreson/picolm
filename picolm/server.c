@@ -1548,9 +1548,22 @@ static const char *query_param(const char *path, const char *key) {
     return NULL;
 }
 
-/* ---- Helper: build full path for slot file ---- */
-static void build_slot_path(char *out, int out_len, const char *filename) {
-    snprintf(out, out_len, "%s/%s", srv.slot_save_path, filename);
+/* ---- Helper: build full path for slot file ----
+ * `filename` comes straight from the JSON request body, so it must not be
+ * allowed to escape the configured slot directory. Without this check a
+ * request with filename "../../etc/x" (or an absolute "/etc/x") would make
+ * /slots write or erase arbitrary files. Reject any path separator,
+ * ".." component, drive letter, or empty name.
+ * Returns 0 on success, -1 if the name is not a plain filename. */
+static int build_slot_path(char *out, int out_len, const char *filename) {
+    if (!filename || !filename[0]) return -1;
+    if (strchr(filename, '/') || strchr(filename, '\\')) return -1;
+    if (strstr(filename, "..")) return -1;
+    if (filename[0] == '.' || filename[0] == '~') return -1;
+    if (strchr(filename, ':')) return -1;              /* Windows drive/ADS */
+    int n = snprintf(out, out_len, "%s/%s", srv.slot_save_path, filename);
+    if (n < 0 || n >= out_len) return -1;              /* would truncate */
+    return 0;
 }
 
 /* ---- Endpoint: POST /slots?action=save|restore|erase ---- */
@@ -1588,7 +1601,11 @@ static void handle_slots_post(SOCKET sock, const char *body) {
             snprintf(filename, sizeof(filename), "slot_0.bin");
         }
         char full_path[2048];
-        build_slot_path(full_path, sizeof(full_path), filename);
+        if (build_slot_path(full_path, sizeof(full_path), filename) != 0) {
+            http_send(sock, 400, "application/json",
+                "{\"error\":{\"message\":\"Invalid filename: must be a plain file name inside the slot directory\"}}");
+            return;
+        }
 
         /* Download GPU KV cache to CPU mirror before saving.
          * GPU generation bypasses CPU s->key_cache/s->val_cache entirely,
@@ -1697,7 +1714,11 @@ static void handle_slots_post(SOCKET sock, const char *body) {
             snprintf(filename, sizeof(filename), "slot_0.bin");
         }
         char full_path[2048];
-        build_slot_path(full_path, sizeof(full_path), filename);
+        if (build_slot_path(full_path, sizeof(full_path), filename) != 0) {
+            http_send(sock, 400, "application/json",
+                "{\"error\":{\"message\":\"Invalid filename: must be a plain file name inside the slot directory\"}}");
+            return;
+        }
 
         double t0 = get_time_ms();
         int *restored_tokens = NULL;

@@ -2894,6 +2894,19 @@ float *model_forward(model_t *m, int token, int pos) {
          */
         float *qwen35_attn_gate = NULL;
         if (c->has_ssm && lw->is_attn_layer) {
+            /* INVARIANT: the gate is parked in s->hb across the K/V projection
+             * below, so s->hb must not be used as the K scratch buffer. That is
+             * exactly what k_tmp (= c->use_parallel_residual ? s->hb : s->xb2)
+             * does when use_parallel_residual is set -- i.e. enabling
+             * parallel residual on an SSM+attention hybrid would silently
+             * destroy the attention gate for every SSM model layer.
+             * Only GPTNeoX forces use_parallel_residual today and it has no
+             * SSM layers, so this is currently unreachable; assert it stays so. */
+            if (c->use_parallel_residual) {
+                fprintf(stderr, "FATAL: use_parallel_residual with SSM attention gate "
+                        "would alias the gate buffer (s->hb). Model unsupported.\n");
+                exit(1);
+            }
             float *qg_raw = s->q; /* [q_full_dim] = interleaved Q+gate */
             float *q_block = s->q; /* compact Q heads here (in-place) */
             float *gate_block = s->hb; /* gate survives K/V projection */
@@ -4480,18 +4493,47 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
     /* hb/hb2 buffers need to be large enough for FFN (n_ffn) OR gate storage (q_dim) on SSM+attn layers */
     int ffn_buf_size = n_ffn;
     if (q_dim > ffn_buf_size) ffn_buf_size = q_dim;
-    size_t sz = bs * (dim + max_dim + dim + q_full_dim + 2 * kv_dim + 2 * ffn_buf_size);
+    /* qg_batch holds the de-interleaved per-head Q+gate blocks. It must be a
+     * SEPARATE buffer from q_batch: the de-interleave reads q_batch at stride
+     * q_full_dim and previously wrote back into the same allocation at stride
+     * q_dim, so token bi's destination overlapped token bi-1's source window.
+     * That only worked because the loop runs in increasing bi and each source
+     * is consumed before it can be clobbered -- any reordering, threading or
+     * vectorisation of that loop would silently corrupt Q and the gate. */
+    size_t sz = bs * (dim + max_dim + dim + q_full_dim + 2 * kv_dim +
+                      2 * ffn_buf_size + q_full_dim + q_dim);
     float *buf = (float *)malloc(sz * sizeof(float));
     if (!buf) { fprintf(stderr, "OOM: prefill batch\n"); exit(1); }
     float *p = buf;
     float *x_batch = p;  p += bs * dim;
-    float *xb_batch = p; p += bs * max_dim; /* stride = max_dim (attention needs q_full_dim) */
+    /* xb_batch is allocated at stride max_dim because the attention block
+     * writes the q_dim-wide attention output into it. That stride is NOT used
+     * consistently, and each region must be read back with the stride it was
+     * written with:
+     *   - attention block:  stride max_dim  (see the attn_out_batch copy below)
+     *   - FFN block:        stride dim      (matmul_dual_batch / matmul_batch
+     *                                        take a contiguous, dim-strided
+     *                                        activation matrix)
+     * These two never overlap in time, so the mixed use is safe today, but a
+     * single block switching conventions corrupts every token except the first
+     * -- which is exactly the class of bug that produced the Q de-interleave
+     * aliasing fixed above. If you add code here, state which stride it uses. */
+    float *xb_batch = p; p += bs * max_dim; /* attention: stride max_dim; FFN: stride dim */
     float *xb2_batch = p; p += bs * dim;
     float *q_batch = p;  p += bs * q_full_dim;
     float *k_batch = p;  p += bs * kv_dim;
     float *v_batch = p;  p += bs * kv_dim;
     float *hb_batch = p; p += bs * ffn_buf_size;
     float *hb2_batch = p; p += bs * ffn_buf_size;
+    float *qg_batch = p;  p += bs * q_full_dim; /* de-interleaved Q + gate */
+    /* gate_batch holds the per-head attention gate (Qwen3.5 SSM-attention
+     * layers). It used to live inside hb2_batch, which is otherwise used at
+     * stride ffn_buf_size (= n_ffn = 17408), while the gate was written and
+     * read at stride q_dim (= 6144) -- two different strides into one buffer.
+     * That happened to work because the gate is consumed before the FFN
+     * touches hb2_batch, but it made the stride of hb2_batch impossible to
+     * reason about. Give the gate its own allocation. */
+    float *gate_batch = p; p += bs * q_dim;
 
     /* Embedding lookup */
     {
@@ -4670,21 +4712,26 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 
         /* For Qwen3.5: de-interleave per-head Q+gate into block layout.
          * GGUF stores [Q_0, Gate_0, Q_1, Gate_1, ...] (per-head interleaved).
-         * Gate stored in hb2_batch to survive K/V projection writes. */
+         * Gate stored in gate_batch (its own buffer) to survive K/V writes. */
         { float *qwen35_gate_batch = NULL;
           if (c->has_ssm && lw->is_attn_layer) {
-              qwen35_gate_batch = hb2_batch; /* reuse as gate storage */
-                            for (bi = 0; bi < n_tokens; bi++) {
+              qwen35_gate_batch = gate_batch;
+              /* Read from q_batch (stride q_full_dim), write to the separate
+               * qg_batch buffer at stride q_dim, then publish. No aliasing. */
+              for (bi = 0; bi < n_tokens; bi++) {
                   float *qg_raw = q_batch + bi * q_full_dim;
-                  float *q_block = q_batch + bi * q_dim;
+                  float *q_block = qg_batch + bi * q_dim;
                   float *gate_block = qwen35_gate_batch + bi * q_dim;
                   for (int h = 0; h < n_heads; h++) {
-                      memmove(q_block + h * head_dim, qg_raw + h * 2 * head_dim,
-                              head_dim * sizeof(float));
-                      memmove(gate_block + h * head_dim, qg_raw + h * 2 * head_dim + head_dim,
-                              head_dim * sizeof(float));
+                      memcpy(q_block + h * head_dim, qg_raw + h * 2 * head_dim,
+                             head_dim * sizeof(float));
+                      memcpy(gate_block + h * head_dim, qg_raw + h * 2 * head_dim + head_dim,
+                             head_dim * sizeof(float));
                   }
               }
+              for (bi = 0; bi < n_tokens; bi++)
+                  memcpy(q_batch + bi * q_dim, qg_batch + bi * q_dim,
+                         (size_t)q_dim * sizeof(float));
           }
         }
 
@@ -4937,7 +4984,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         /* Dump gate values for comparison */
         if (_SSM_DBG && l == 3) {
             int lt = n_tokens - 1;
-            fprintf(stderr, "[DBG CPU attn_gate l=%d] last[:4]={%.6f,%.6f,%.6f,%.6f}\n", l, hb2_batch[lt*q_dim], hb2_batch[lt*q_dim+1], hb2_batch[lt*q_dim+2], hb2_batch[lt*q_dim+3]);
+            fprintf(stderr, "[DBG CPU attn_gate l=%d] last[:4]={%.6f,%.6f,%.6f,%.6f}\n", l, gate_batch[lt*q_dim], gate_batch[lt*q_dim+1], gate_batch[lt*q_dim+2], gate_batch[lt*q_dim+3]);
         }
         /* Dump attention output for comparison - BEFORE gate sigmoid */
         if (_SSM_DBG && l == 3) {
@@ -4950,7 +4997,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         if (c->has_ssm && lw->is_attn_layer) {
                         for (bi = 0; bi < n_tokens; bi++) {
                 float *xb = xb_batch + bi * max_dim;
-                float *gate = hb2_batch + bi * q_dim;
+                float *gate = gate_batch + bi * q_dim;
                 for (int i = 0; i < q_dim; i++) {
                     float g = 1.0f / (1.0f + expf(-gate[i]));
                     xb[i] *= g;
