@@ -90,6 +90,35 @@ _have_f16c   = $(shell echo | $(CC) -E -dM $(1) - 2>/dev/null | grep -c '__F16C_
 _have_neon   = $(shell echo | $(CC) -E -dM $(1) - 2>/dev/null | grep -c 'define __ARM_NEON ')
 _have_i8mm   = $(shell echo | $(CC) -E -dM $(1) - 2>/dev/null | grep -c '__ARM_FEATURE_MATMUL_INT8')
 
+# --- AArch64 native-CPU workaround -----------------------------------------
+# Termux/Android clang 21 maps -march=native for these ARMv9.2 phone SoCs to
+# "generic +v9.2a", which enables SVE/SVE2 even though Cortex-A520/A720 do not
+# implement SVE.  The resulting binary SIGILLs on its very first vector loop.
+# If the compiler claims SVE but the host CPU does not advertise it, fall back
+# to the NEON/DOTPROD/I8MM feature set that PicoLM's ARM kernels actually use.
+# Keep this Linux-only: the probe relies on /proc/cpuinfo.
+_host_os     := $(shell uname -s 2>/dev/null)
+_native_sve  := $(shell echo | $(CC) -E -dM -march=native - 2>/dev/null | grep -c '__ARM_FEATURE_SVE ')
+ifeq ($(_host_os),Linux)
+  _host_sve    := $(shell grep -qwi sve /proc/cpuinfo 2>/dev/null && echo 1)
+  _arm_i8mm    := $(shell grep -qwi i8mm /proc/cpuinfo 2>/dev/null && echo 1)
+  _arm_bf16    := $(shell grep -qwi bf16 /proc/cpuinfo 2>/dev/null && echo 1)
+  _arm_dotprod := $(shell grep -Eqwi 'dotprod|asimddp' /proc/cpuinfo 2>/dev/null && echo 1)
+else
+  _host_sve    := native
+endif
+ifeq ($(filter 1,$(_native_sve)),1)
+  ifeq ($(_host_sve),)
+    _arm_base := $(if $(_arm_i8mm),armv8.6-a,$(if $(_arm_dotprod),armv8.2-a,armv8-a))
+    NATIVE_MARCH := -march=$(_arm_base)$(if $(_arm_dotprod),+dotprod,)$(if $(_arm_i8mm),+i8mm,)$(if $(_arm_bf16),+bf16,)
+    $(info NOTE: -march=native requested SVE on a CPU without SVE; using $(NATIVE_MARCH))
+  else
+    NATIVE_MARCH := -march=native
+  endif
+else
+  NATIVE_MARCH := -march=native
+endif
+
 # Pick the highest SIMD level and emit the right -DPICOLM_* preprocessor defines.
 # Cascading if/elif/else: only the first (highest) matching level is emitted.
 simd_defines_for = $(strip \
@@ -123,14 +152,14 @@ simd_flags_for = $(strip \
           -mssse3 -mpopcnt,\
           )))))
 
-# --- Default target: build with -march=native + auto-detected SIMD ---
+# --- Default target: build with NATIVE_MARCH + auto-detected SIMD ---
 .PHONY: all
 all:
-	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_flags_for,-march=native) $(call simd_defines_for,-march=native) $(if $(filter 1,$(call _have_neon,-march=native)),-DPICOLM_NEON,) $(if $(filter 1,$(call _have_i8mm,-march=native)),-DPICOLM_I8MM,)"
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) $(NATIVE_MARCH) $(call simd_flags_for,$(NATIVE_MARCH)) $(call simd_defines_for,$(NATIVE_MARCH)) $(if $(filter 1,$(call _have_neon,$(NATIVE_MARCH))),-DPICOLM_NEON,) $(if $(filter 1,$(call _have_i8mm,$(NATIVE_MARCH))),-DPICOLM_I8MM,)"
 
-# --- Native build: -march=native with auto-detected SIMD defines ---
+# --- Native build: NATIVE_MARCH with auto-detected SIMD defines ---
 native:
-	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_flags_for,-march=native) $(call simd_defines_for,-march=native) $(if $(filter 1,$(call _have_neon,-march=native)),-DPICOLM_NEON,) $(if $(filter 1,$(call _have_i8mm,-march=native)),-DPICOLM_I8MM,)"
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) $(NATIVE_MARCH) $(call simd_flags_for,$(NATIVE_MARCH)) $(call simd_defines_for,$(NATIVE_MARCH)) $(if $(filter 1,$(call _have_neon,$(NATIVE_MARCH))),-DPICOLM_NEON,) $(if $(filter 1,$(call _have_i8mm,$(NATIVE_MARCH))),-DPICOLM_I8MM,)"
 
 # --- VIZ build: native with embedded VNC visualization server ---
 # Remove affected .o files so the sub-make recompiles with -DPICOLM_VIZ.
@@ -142,7 +171,7 @@ viz-clean-objs:
 	-$(RM) model.o picolm.o server.o model_core.o model_ssm.o model_attention.o model_gemma3n.o
 
 viz: viz-clean-objs
-	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_flags_for,-march=native) $(call simd_defines_for,-march=native) $(if $(filter 1,$(call _have_neon,-march=native)),-DPICOLM_NEON,) $(if $(filter 1,$(call _have_i8mm,-march=native)),-DPICOLM_I8MM,) -DPICOLM_VIZ=1 -DPICOLM_SERVER" OBJS="$(OBJS) viz.o"
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) $(NATIVE_MARCH) $(call simd_flags_for,$(NATIVE_MARCH)) $(call simd_defines_for,$(NATIVE_MARCH)) $(if $(filter 1,$(call _have_neon,$(NATIVE_MARCH))),-DPICOLM_NEON,) $(if $(filter 1,$(call _have_i8mm,$(NATIVE_MARCH))),-DPICOLM_I8MM,) -DPICOLM_VIZ=1 -DPICOLM_SERVER" OBJS="$(OBJS) viz.o"
 
 # --- x86-64 default: -march=native + GPU disabled, safe fallback ---
 x86: sse2
@@ -169,7 +198,7 @@ avx2:
 
 # --- Persistent thread pool (WIP, for development) ---
 threadpool:
-	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_defines_for,-march=native) -DPICOLM_USE_PER_MATMUL_THREAD=0"
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) $(NATIVE_MARCH) $(call simd_defines_for,$(NATIVE_MARCH)) -DPICOLM_USE_PER_MATMUL_THREAD=0"
 
 # --- Link ---
 $(TARGET): $(OBJS) $(GPU_OBJS)
@@ -304,7 +333,7 @@ tests/test_glm5_ops: tests/test_glm5_ops.c
 
 .PHONY: asan
 asan:
-	$(MAKE) $(TARGET) CFLAGS="-fsanitize=address -g -O2 -march=native $(call simd_defines_for,-march=native) -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic -fopenmp" LDFLAGS="-lm -lpthread -fopenmp -fsanitize=address"
+	$(MAKE) $(TARGET) CFLAGS="-fsanitize=address -g -O2 $(NATIVE_MARCH) $(call simd_defines_for,$(NATIVE_MARCH)) -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic -fopenmp" LDFLAGS="-lm -lpthread -fopenmp -fsanitize=address"
 
 # --- Force recompile of GPU-dependent C objects ---
 # These objects contain #ifdef PICOLM_GPU code; when building GPU targets
@@ -353,7 +382,7 @@ HIP_OBJS := $(GPU_SRCS:%.cu=%-hip.o)
 
 .PHONY: hip
 hip: $(HIP_OBJS) gpu-clean-objs
-	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_defines_for,-march=native) -DPICOLM_GPU=1 -DPICOLM_HIP=1" GPU_OBJS="$(HIP_OBJS)" GPU_LIBS="-L$(ROCM_LIB) -lamdhip64 -lstdc++ -Wl,-rpath,$(ROCM_LIB)"
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) $(NATIVE_MARCH) $(call simd_defines_for,$(NATIVE_MARCH)) -DPICOLM_GPU=1 -DPICOLM_HIP=1" GPU_OBJS="$(HIP_OBJS)" GPU_LIBS="-L$(ROCM_LIB) -lamdhip64 -lstdc++ -Wl,-rpath,$(ROCM_LIB)"
 
 $(HIP_OBJS): %-hip.o: %.cu $(GPU_CUH) backend_gpu.h quant.h
 	$(HIPCC) $(HIPFLAGS) --offload-arch=$(HIP_ARCH) -DPICOLM_GPU=1 -DPICOLM_SSM_WARP_KERNEL_VALIDATED -DPICOLM_SSM_CHUNKED_GPU_VALIDATED -c -o $@ $< -I.
@@ -383,7 +412,7 @@ CUDA_OBJS := $(GPU_SRCS:%.cu=%-cuda.o)
 
 .PHONY: cuda
 cuda: $(CUDA_OBJS) gpu-clean-objs
-	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -march=native $(call simd_defines_for,-march=native) -DPICOLM_GPU=1 -DPICOLM_CUDA=1 -I$(CUDA_INC)" GPU_OBJS="$(CUDA_OBJS)" GPU_LIBS="-L$(CUDA_LIB) -lcudart -lstdc++ -Wl,-rpath,$(CUDA_LIB)"
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) $(NATIVE_MARCH) $(call simd_defines_for,$(NATIVE_MARCH)) -DPICOLM_GPU=1 -DPICOLM_CUDA=1 -I$(CUDA_INC)" GPU_OBJS="$(CUDA_OBJS)" GPU_LIBS="-L$(CUDA_LIB) -lcudart -lstdc++ -Wl,-rpath,$(CUDA_LIB)"
 
 $(CUDA_OBJS): %-cuda.o: %.cu $(GPU_CUH) backend_gpu.h quant.h
 	$(NVCC) $(CUDAFLAGS) $(CUDA_GENCODE) -DPICOLM_GPU=1 -DPICOLM_SSM_WARP_KERNEL_VALIDATED -DPICOLM_SSM_CHUNKED_GPU_VALIDATED -c -o $@ $< -I.
@@ -506,7 +535,7 @@ shaders/%.spv: shaders/%.comp
 .PHONY: vulkan
 vulkan: backend_vulkan.o shaders/qmatmul_vk.spv shaders/elementwise_vk.spv shaders/rmsnorm_vk.spv shaders/layernorm_vk.spv shaders/quantize_q8_vk.spv shaders/q8_q8_matmul_vk.spv shaders/attn_prefill_vk.spv shaders/attn_prefill_f16vk.spv shaders/attn_decode_vk.spv shaders/kv_store_vk.spv shaders/q8_q8_qkv3_vk.spv shaders/q8_q8_gu3_vk.spv shaders/q2k_matmul_vk.spv shaders/q3k_matmul_vk.spv shaders/q4k_matmul_vk.spv shaders/q6k_matmul_vk.spv shaders/iq4nl_matmul_vk.spv
 	$(MAKE) $(TARGET) \
-	  CFLAGS="$(filter-out -fopenmp,$(CFLAGS)) -march=native -DPICOLM_GPU=1 -DPICOLM_VULKAN=1 $(call simd_flags_for,-march=native) $(call simd_defines_for,-march=native) $(VK_EXTRA_INC)" \
+	  CFLAGS="$(filter-out -fopenmp,$(CFLAGS)) $(NATIVE_MARCH) -DPICOLM_GPU=1 -DPICOLM_VULKAN=1 $(call simd_flags_for,$(NATIVE_MARCH)) $(call simd_defines_for,$(NATIVE_MARCH)) $(VK_EXTRA_INC)" \
 	  LDFLAGS="$(LDFLAGS) $(VK_EXTRA_LIB)" \
 	  GPU_OBJS="backend_vulkan.o"
 
@@ -749,7 +778,7 @@ test_attn_tiled: tests/test_attn_tiled.c model_attention.c tensor.c type_dispatc
 
 # Same flag construction as 'make native', so the test exercises the production
 # SIMD kernels (AVX-512/AVX2/NEON) instead of the scalar fallback.
-TEST_NATIVE_CFLAGS = $(CFLAGS) -march=native $(call simd_flags_for,-march=native) $(call simd_defines_for,-march=native) $(if $(filter 1,$(call _have_neon,-march=native)),-DPICOLM_NEON,) $(if $(filter 1,$(call _have_i8mm,-march=native)),-DPICOLM_I8MM,)
+TEST_NATIVE_CFLAGS = $(CFLAGS) $(NATIVE_MARCH) $(call simd_flags_for,$(NATIVE_MARCH)) $(call simd_defines_for,$(NATIVE_MARCH)) $(if $(filter 1,$(call _have_neon,$(NATIVE_MARCH))),-DPICOLM_NEON,) $(if $(filter 1,$(call _have_i8mm,$(NATIVE_MARCH))),-DPICOLM_I8MM,)
 
 # Depends on the real sources (like test_swa) so it can never be stale.
 test_attn_diff: test_attn_diff.c model_attention.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) model.h model_internal.h
