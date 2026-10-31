@@ -802,6 +802,18 @@ test_kvcache_tokwrite: tests/test_kvcache_tokwrite.c
 check-kvcache-tokwrite: test_kvcache_tokwrite
 	./test_kvcache_tokwrite
 
+# Horizontal SIMD reduction regression. Catches the hreduce256_ps bug that made
+# AVX2 builds compute 0.75x SSM dot products (lanes 3 and 7 dropped, lane 0
+# double-counted). Built for AVX2 specifically -- the AVX-512 build never used
+# this helper.
+test_hreduce: tests/test_hreduce.c model.h model_internal.h
+	$(CC) -O2 -I. -DPICOLM_AVX2=1 -DPICOLM_AVX=1 -DPICOLM_SSSE3=1 \
+	      -DPICOLM_SSE3=1 -DPICOLM_SSE2=1 -mavx2 -mf16c -o $@ $< -lm
+
+.PHONY: check-hreduce
+check-hreduce: test_hreduce
+	./test_hreduce
+
 .PHONY: check-glm5-dsa
 check-glm5-dsa: test_glm5_dsa
 	./test_glm5_dsa

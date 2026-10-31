@@ -117,7 +117,12 @@ static void ssm_head_task(int h, void *ctxp) {
      * overflowed (head_v_dim > d_state) the state block. */
     const int n_rows = ctx->head_v_dim;
 
-    float *st = ctx->state + (size_t)h * d_state * d_state;
+    /* State block stride is head_v_dim * d_state, matching ssm_chunk_head_task
+     * (which uses `ctx->state + h * hv * d`). Writing h * d_state * d_state
+     * instead is only equivalent while head_v_dim == d_state, which holds for
+     * every shipped Qwen (both 128) but would mis-address the state block for
+     * any model where they differ. */
+    float *st = ctx->state + (size_t)h * (size_t)n_rows * d_state;
     float ge = ctx->gate_exp[h];
     /* v-head -> k-head pairing. Grouped (GQA-style), which is what the
      * reference does: heads [r*g, r*g+g) all read k-head r.
@@ -2281,12 +2286,12 @@ void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
             if (picolm_gpu_ssm_recurrence_dev(m->gpu.ssm_state_dev[il],
                                                q_conv, k_conv, v_conv,
                                                gate_exp, beta, ssm_output,
-                                               n_v_heads, d_state, repeat, m->gpu.device)) {
+                                               n_v_heads, d_state, head_v_dim, repeat, m->gpu.device)) {
                 rec_done = 1;
             } else if (picolm_gpu_ssm_recurrence_dev(m->gpu.ssm_state_dev[il],
                                                q_conv, k_conv, v_conv,
                                                gate_exp, beta, ssm_output,
-                                               n_v_heads, d_state, repeat, m->gpu.device)) {
+                                               n_v_heads, d_state, head_v_dim, repeat, m->gpu.device)) {
                 fprintf(stderr, "WARN: GPU SSM recurrence retry succeeded "
                         "(layer %d, pos %d) after an initial failure -- "
                         "investigate transient GPU errors.\n", il, pos);
@@ -2308,7 +2313,7 @@ void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
              * authoritative copy in this case, so these paths are safe. */
             if (!picolm_gpu_ssm_recurrence(state, q_conv, k_conv, v_conv,
                                             gate_exp, beta, ssm_output,
-                                            n_v_heads, d_state, repeat, m->gpu.device)) {
+                                            n_v_heads, d_state, head_v_dim, repeat, m->gpu.device)) {
                 tensor_parallel_for(n_v_heads, ssm_head_task, &ssm_ctx);
             }
         }
@@ -2666,7 +2671,7 @@ ssm_forward_gpu(model_t *m, run_state_t *s, float *x, float *residual,
     if (!picolm_gpu_ssm_recurrence_pipeline_dev(gw->ssm_state_dev[il],
             q_dev, k_dev, v_dev,
             ssm_gate_exp, ssm_beta_d,
-            ssm_output, n_v_heads, d_state, repeat, device)) {
+            ssm_output, n_v_heads, d_state, head_v_dim, repeat, device)) {
         fprintf(stderr, "FATAL: GPU SSM recurrence failed for layer %d, pos %d "
                 "with device-resident state already mutated -- "
                 "aborting rather than risk corrupting generation.\n", il, pos);

@@ -3997,18 +3997,18 @@ int picolm_gpu_ssm_head_permute_batch_dev(float *d, const float *s, const int *h
 }
 int picolm_gpu_ssm_recurrence(float *st, const float *q, const float *k, const float *v,
                                const float *ge, const float *b, float *so,
-                               int nv, int ds, int rep, int device) {
-    (void)st;(void)q;(void)k;(void)v;(void)ge;(void)b;(void)so;(void)nv;(void)ds;(void)rep;(void)device; return 0;
+                               int nv, int ds, int hvd, int rep, int device) {
+    (void)st;(void)q;(void)k;(void)v;(void)ge;(void)b;(void)so;(void)nv;(void)ds;(void)hvd;(void)rep;(void)device; return 0;
 }
 int picolm_gpu_ssm_recurrence_dev(void *st, const float *q, const float *k, const float *v,
                                    const float *ge, const float *b, float *so,
-                                   int nv, int ds, int rep, int device) {
-    (void)st;(void)q;(void)k;(void)v;(void)ge;(void)b;(void)so;(void)nv;(void)ds;(void)rep;(void)device; return 0;
+                                   int nv, int ds, int hvd, int rep, int device) {
+    (void)st;(void)q;(void)k;(void)v;(void)ge;(void)b;(void)so;(void)nv;(void)ds;(void)hvd;(void)rep;(void)device; return 0;
 }
 int picolm_gpu_ssm_recurrence_pipeline_dev(void *st, const float *q, const float *k,
                                             const float *v, const float *ge, const float *b,
-                                            float *so, int nv, int ds, int rep, int device) {
-    (void)st;(void)q;(void)k;(void)v;(void)ge;(void)b;(void)so;(void)nv;(void)ds;(void)rep;(void)device; return 0;
+                                            float *so, int nv, int ds, int hvd, int rep, int device) {
+    (void)st;(void)q;(void)k;(void)v;(void)ge;(void)b;(void)so;(void)nv;(void)ds;(void)hvd;(void)rep;(void)device; return 0;
 }
 int picolm_gpu_ssm_chunked_recurrence_dev(const float *c, const float *a, const float *b,
                                            float *st, float *x, int nt, int vd, int xs,

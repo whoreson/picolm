@@ -499,7 +499,7 @@ picolm_ssm_recurrence_warp_kernel(float *state,
  * One thread block per head, 256 threads per block.
  */
 
-__global__ void picolm_ssm_recurrence_kernel(float *state, const float *q_conv, const float *k_conv, const float *v_conv, const float *gate_exp, const float *beta, float *ssm_output, int n_v_heads, int d_state, int repeat);
+__global__ void picolm_ssm_recurrence_kernel(float *state, const float *q_conv, const float *k_conv, const float *v_conv, const float *gate_exp, const float *beta, float *ssm_output, int n_v_heads, int d_state, int head_v_dim, int repeat);
 
 /* ---- w4a16_matmul kernel (Tensor Core path) ----
  *

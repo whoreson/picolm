@@ -202,7 +202,7 @@ int picolm_gpu_ssm_recurrence(float *state,
                                const float *gate_exp,
                                const float *beta,
                                float *ssm_output,
-                               int n_v_heads, int d_state,
+                               int n_v_heads, int d_state, int head_v_dim,
                                int repeat, int device);
 
 /* Device-native SSM recurrence: persistent state on device, no per-call
@@ -215,7 +215,7 @@ int picolm_gpu_ssm_recurrence_dev(void *ssm_state_dev,
                                const float *gate_exp,
                                const float *beta,
                                float *ssm_output,
-                               int n_v_heads, int d_state,
+                               int n_v_heads, int d_state, int head_v_dim,
                                int repeat, int device);
 
 /* Fully device-native SSM recurrence: q_conv/k_conv/v_conv/gate_exp/beta/
@@ -232,7 +232,7 @@ int picolm_gpu_ssm_recurrence_pipeline_dev(void *ssm_state_dev,
                                             const float *gate_exp_dev,
                                             const float *beta_dev,
                                             float *ssm_output_dev,
-                                            int n_v_heads, int d_state,
+                                            int n_v_heads, int d_state, int head_v_dim,
                                             int repeat, int device);
 
 /* SSM causal conv1d + state shift, fused, device-native (all pointers

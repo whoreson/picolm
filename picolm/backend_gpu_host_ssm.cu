@@ -9,9 +9,10 @@ picolm_gpu_ssm_recurrence(float *state,
                            const float *gate_exp,
                            const float *beta,
                            float *ssm_output,
-                           int n_v_heads, int d_state,
+                           int n_v_heads, int d_state, int head_v_dim,
                            int repeat, int device) {
     if (n_v_heads <= 0 || d_state <= 0) return 0;
+    if (head_v_dim != d_state) return 0; /* kernel assumes head_v_dim == d_state */
     if (d_state > 256) return 0;
 
     if (!gpu_ok(gpuSetDevice(device), "ssm device")) return 0;
@@ -112,7 +113,7 @@ picolm_gpu_ssm_recurrence(float *state,
         picolm_ssm_recurrence_kernel<<<grid, 256, 0, ctx->stream>>>(
             (float *)ds, (const float *)dq, (const float *)dk,
             (const float *)dv, (const float *)dg, (const float *)db,
-            (float *)do_, n_v_heads, d_state, repeat);
+            (float *)do_, n_v_heads, d_state, head_v_dim, repeat);
     }
 
     if (!gpu_ok(gpuGetLastError(), "ssm recurrence") ||
@@ -138,10 +139,11 @@ picolm_gpu_ssm_recurrence_dev(void *ssm_state_dev,  /* in/out, device [n_v_heads
                                const float *v_conv,  /* host [n_v_heads][head_v_dim==d_state] */
                                const float *gate_exp, /* host [n_v_heads] */
                                const float *beta,    /* host [n_v_heads] */
-                               float *ssm_output,    /* out, host [d_state * n_v_heads] */
-                               int n_v_heads, int d_state,
+                               float *ssm_output,    /* out, host [head_v_dim * n_v_heads] */
+                               int n_v_heads, int d_state, int head_v_dim,
                                int repeat, int device) {
     if (n_v_heads <= 0 || d_state <= 0) return 0;
+    if (head_v_dim != d_state) return 0; /* kernel assumes head_v_dim == d_state */
     if (d_state > 256) return 0;
     if (!ssm_state_dev) return 0;
 
@@ -236,7 +238,7 @@ picolm_gpu_ssm_recurrence_dev(void *ssm_state_dev,  /* in/out, device [n_v_heads
         picolm_ssm_recurrence_kernel<<<grid, 256, 0, ctx->stream>>>(
             (float *)ssm_state_dev, (const float *)dq, (const float *)dk,
             (const float *)dv, (const float *)dg, (const float *)db,
-            (float *)do_, n_v_heads, d_state, repeat);
+            (float *)do_, n_v_heads, d_state, head_v_dim, repeat);
     }
 
     if (!gpu_ok(gpuGetLastError(), "ssm recurrence") ||
@@ -265,9 +267,10 @@ picolm_gpu_ssm_recurrence_pipeline_dev(void *ssm_state_dev,
                                         const float *gate_exp_dev,
                                         const float *beta_dev,
                                         float *ssm_output_dev,
-                                        int n_v_heads, int d_state,
+                                        int n_v_heads, int d_state, int head_v_dim,
                                         int repeat, int device) {
     if (n_v_heads <= 0 || d_state <= 0) return 0;
+    if (head_v_dim != d_state) return 0; /* kernel assumes head_v_dim == d_state */
     if (d_state > 256) return 0;
     if (!ssm_state_dev) return 0;
 
@@ -335,7 +338,7 @@ picolm_gpu_ssm_recurrence_pipeline_dev(void *ssm_state_dev,
         picolm_ssm_recurrence_kernel<<<grid, 256, 0, ctx->stream>>>(
             (float *)ssm_state_dev, q_conv_dev, k_conv_dev,
             v_conv_dev, gate_exp_dev, beta_dev,
-            ssm_output_dev, n_v_heads, d_state, repeat);
+            ssm_output_dev, n_v_heads, d_state, head_v_dim, repeat);
     }
     if (!gpu_ok(gpuGetLastError(), "ssm recurrence (pipeline dev)")) return 0;
     return 1;

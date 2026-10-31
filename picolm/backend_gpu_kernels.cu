@@ -4222,7 +4222,7 @@ picolm_ssm_recurrence_kernel(float *state,
                               const float *gate_exp,
                               const float *beta,
                               float *ssm_output,
-                              int n_v_heads, int d_state,
+                              int n_v_heads, int d_state, int head_v_dim,
                               int repeat) {
     int h = gpuBlockIdx_x;
     if (h >= n_v_heads) return;
@@ -4239,20 +4239,27 @@ picolm_ssm_recurrence_kernel(float *state,
      * accumulators, combined with pairwise (lo+hi) reduction.
      * Decay is applied per-element BEFORE the sk dot product,
      * matching NEON which decays each loaded element before fma. */
+    /* The recurrence runs one independent slot per *value* dimension: the
+     * state is [head_v_dim][d_state], with one rank-1 update per slot. So the
+     * row count and the per-head stride of state and v_conv are head_v_dim,
+     * NOT d_state. They are equal for every shipped Qwen (both 128), which is
+     * why using d_state here went unnoticed, but it would read past v_conv and
+     * mis-address the state block as soon as the two differ. This mirrors the
+     * CPU fix in ssm_head_task(). */
     int kh = h / repeat;
     const float *qh = q_conv + (size_t)kh * d_state;
     const float *khv = k_conv + (size_t)kh * d_state;
-    const float *vh = v_conv + (size_t)h * d_state;
+    const float *vh = v_conv + (size_t)h * head_v_dim;
     float ge = gate_exp[h];
     float bh = beta[h];
-    float *st = state + (size_t)h * d_state * d_state;
+    float *st = state + (size_t)h * head_v_dim * d_state;
 
     int d4 = d_state / 4; /* d_state always 16/32/64/128 */
     float sk_local[256];
     float d_local[256];
 
     /* Decay + sk: 4-lane strided fmaf per row, matching NEON */
-    for (int row = 0; row < d_state; row++) {
+    for (int row = 0; row < head_v_dim; row++) {
         float *sr = st + (size_t)row * d_state;
         float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
         for (int vv = 0; vv < d4; vv++) {
@@ -4271,7 +4278,7 @@ picolm_ssm_recurrence_kernel(float *state,
     }
 
     /* Rank-1 update + output: 4-lane strided fmaf per row */
-    for (int row = 0; row < d_state; row++) {
+    for (int row = 0; row < head_v_dim; row++) {
         float dv = d_local[row];
         float *sr = st + (size_t)row * d_state;
         float o0 = 0, o1 = 0, o2 = 0, o3 = 0;
