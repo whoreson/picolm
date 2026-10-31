@@ -550,3 +550,26 @@ int picolm_sgemm_q8_0_vnni(int m, int n, int k_blocks, const void *vA, int lda,
 }
 
 #endif
+
+/* fn_gemm for Q8_0_R8 in the type table: the VNNI kernel when it is compiled in (no repack
+ * needed, the weights are already R8 on disk) and the batch is large enough to pay for the
+ * activation panel staging, otherwise the AVX2 kernel. Always produces the full result:
+ * gemm_table_task() ignores the return value. PICOLM_Q8_VNNI=0 forces the AVX2 kernel;
+ * PICOLM_Q8_VNNI_MIN_N sets the smallest batch (default 8). */
+int sgemm_q8_0_r8_q8_0_best(int nrows, int ncols, int k, const void *vx, const void *vy,
+                            float *out, size_t bs, int ith, int nth) {
+    static int en = -1, min_n = 8;
+    if (en < 0) {
+        const char *e = getenv("PICOLM_Q8_VNNI"), *mn = getenv("PICOLM_Q8_VNNI_MIN_N");
+        if (mn && atoi(mn) > 0) min_n = atoi(mn);
+        en = !(e && e[0] == '0');
+    }
+    if (en && ncols >= min_n) {
+        int r = sgemm_q8_0_r8_vnni_q8_0(nrows, ncols, k, vx, vy, out, bs, ith, nth);
+        if (r) {
+            static int traced; if (!traced && getenv("PICOLM_DISPATCH")) { traced = 1; fprintf(stderr, "TRACE kernel: sgemm_q8_0_r8_vnni_q8_0 (Q8_0_R8)\n"); }
+            return r;
+        }
+    }
+    return sgemm_q8_0_r8_q8_0_avx2(nrows, ncols, k, vx, vy, out, bs, ith, nth);
+}

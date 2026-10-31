@@ -75,6 +75,18 @@ static int check_mode(void){
         else { /* sgemm_d needs n>=2: build reference by scalar math */
             for(int cc=0;cc<n;cc++)for(int r=0;r<m;r++){double acc=0;for(int q=0;q<nb;q++){int is=0;for(int i=0;i<32;i++)is+=W[(size_t)r*lda+q].qs[i]*B[(size_t)cc*ldb+q].qs[i];acc+=(double)is*fp16_to_fp32(W[(size_t)r*lda+q].d)*Bd[(size_t)cc*ldb+q];}C1[(size_t)cc*m+r]=(float)acc;} }
         int ok=1; for(int th=0;th<nth;th++) ok&=picolm_sgemm_q8_0_vnni(m,n,nb,W,lda,B,ldb,C2,m,th,nth);
+        /* R8 wrapper (fn_gemm for Q8_0_R8): repack the same bytes, activations must be contiguous (ldb==nb) */
+        if(ldb==nb){
+            block_q8_0_r8 *R8=malloc((size_t)(m/8)*nb*sizeof(block_q8_0_r8));
+            for(int g=0;g<m/8;g++)for(int ib=0;ib<nb;ib++){block_q8_0_r8*bb=&R8[(size_t)g*nb+ib];
+                for(int r=0;r<8;r++){const block_q8_0*sq=W+(size_t)(g*8+r)*lda+ib;bb->d[r]=sq->d;
+                    for(int l=0;l<4;l++)for(int i=0;i<4;i++){bb->qs[32*l+4*r+i]=sq->qs[4*l+i];bb->qs[32*l+4*r+i+128]=sq->qs[16+4*l+i];}}}
+            float *C3=calloc((size_t)n*m,sizeof(float));
+            for(int th=0;th<nth;th++) sgemm_q8_0_r8_q8_0_best(m,n,k,R8,B,C3,m,th,nth);
+            double m3=0,rr=0; for(size_t i=0;i<(size_t)n*m;i++){double d=fabs(C1[i]-C3[i]);if(d>m3)m3=d;rr+=C1[i]*C1[i];} rr=sqrt(rr/((size_t)n*m)+1e-30);
+            if(m3>1e-4*rr+1e-3){ok=0;printf("FAIL r8-best m=%d n=%d k=%d nth=%d maxdiff=%.3g\n",m,n,k,nth,m3);}
+            free(R8);free(C3);
+        }
         double md=0,rm=0; for(size_t i=0;i<(size_t)n*m;i++){double d=fabs(C1[i]-C2[i]);if(d>md)md=d;rm+=C1[i]*C1[i];} rm=sqrt(rm/((size_t)n*m)+1e-30);
         total++; if(!ok||md>1e-4*rm+1e-3){bad++;printf("FAIL m=%d n=%d k=%d nth=%d ok=%d maxdiff=%.3g rms=%.3g\n",m,n,k,nth,ok,md,rm);}
         free(W);free(B);free(Bd);free(tmp);free(C1);free(C2);

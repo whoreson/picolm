@@ -562,12 +562,13 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
         .use_repacked = 0,
         .has_dual_scalar_path = 0,
     },
-    /* Q8_0_R8: not yet implemented in tensor.c, but table entry for completeness */
+    /* Q8_0_R8: batch GEMM goes through GEMM_table; fn_gemm picks the AVX-512 VNNI kernel when
+     * compiled in (else AVX2). Decode uses the AVX2 GEMV. */
     [GGUF_TYPE_Q8_0_R8] = {
         .act_fmt = ACT_FMT_Q8_0,
         .rows_per_block = 8,
         .fn_gemv = vec_dot_q8_0_r8_q8_0_avx2,
-        .fn_gemm = sgemm_q8_0_r8_q8_0_avx2,
+        .fn_gemm = sgemm_q8_0_r8_q8_0_best,
         .has_qgemm_d = 0,
         .fn_dequant_single = dequantize_row_q8_0_r8_single,
         .needs_qx = 1,
