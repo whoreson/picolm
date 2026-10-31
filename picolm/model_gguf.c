@@ -1156,13 +1156,12 @@ int parse_gguf(model_t *m, int max_seq_len) {
              *
              * Gemma-3n stays pairwise if its key does not look like qwen/qwen2
              * below -- it has its own branch. */
-            if (key.str[0] == 'q' && key.len > 5) {
-                /* qwen2*, qwen3*, qwen35*, qwen35moe* -> half-split RoPE.
-                 * This used to be a fixed-offset check for "qwen2" only, which
-                 * missed qwen3/qwen35 entirely -- see the note above. */
-                if (key.str[1] == 'w' && key.str[2] == 'e' && key.str[3] == 'n') {
-                    cfg->rope_type = 1;
-                }
+            if (key.len >= 4 && key.str[0] == 'q' && key.str[1] == 'w'
+                && key.str[2] == 'e' && key.str[3] == 'n') {
+                /* qwen, qwen2*, qwen3*, qwen35*, qwen35moe* -> half-split RoPE.
+                 * Prefix match rather than a fixed offset, so plain QWEN
+                 * ("qwen.embedding_length") is covered as well. */
+                cfg->rope_type = 1;
             }
         } else if (str_eq(key, "glm5next.feed_forward_length") || str_eq(key, "llama.feed_forward_length") || str_eq(key, "general.feed_forward_length")
             || str_eq(key, "qwen2.feed_forward_length") || str_eq(key, "qwen3.feed_forward_length") || str_eq(key, "qwen35.feed_forward_length")
