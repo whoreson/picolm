@@ -170,14 +170,40 @@ int kvcache_save(const model_t *m, const char *path, int n_pos, const int *token
     memcpy(buf + buf_off, header, header_words * sizeof(uint32_t));
     buf_off += header_words * sizeof(uint32_t);
 
-    /* Token sequence */
+    /* Token sequence: streamed, because n_pos * 4 bytes exceeds buf_size for
+     * any prompt longer than 32K tokens.
+     *
+     * The previous code did
+     *     if (buf_off + tk_sz > buf_size) flush();
+     *     uint32_t *tk = (uint32_t *)(buf + buf_off);
+     *     for (i < n_pos) tk[i] = tokens[i];
+     * which (a) only flushed *once*, so a block larger than the buffer still
+     * overflowed it, and (b) wrote straight past the flush. With a 70K-token
+     * agentic session tk_sz is 282 KB against a 128 KB alloca, so this wrote
+     * 154 KB beyond `buf` -- over the guard page, hence the SIGSEGV at
+     * model_kv_cache.c:179. Chunk it like every other section does. */
     if (tokens && n_pos > 0) {
-        size_t tk_sz = (size_t)n_pos * sizeof(uint32_t);
-        if (buf_off + tk_sz > buf_size) { if (_kv_flush(fd, buf, &buf_off)) return -1; }
-        /* Convert int tokens to uint32_t in buffer */
-        uint32_t *tk_buf = (uint32_t *)(buf + buf_off);
-        for (int i = 0; i < n_pos; i++) tk_buf[i] = (uint32_t)tokens[i];
-        buf_off += tk_sz;
+        /* NB: the destination is written with memcpy, not a uint32_t store.
+         * buf_off is 4-aligned in practice (header + n_layers bytes), but the
+         * correctness of this loop must not depend on that: a misaligned
+         * uint32_t store is undefined behaviour and is flagged by UBSan. An
+         * earlier revision of this fix used one and the standalone harness in
+         * the commit message caught it. */
+        size_t tk_i = 0;                         /* index into tokens[] */
+        while (tk_i < (size_t)n_pos) {
+            if (buf_off + 4 > buf_size) { if (_kv_flush(fd, buf, &buf_off)) return -1; }
+            size_t room = buf_size - buf_off;
+            size_t nfit = room / 4;              /* whole entries that fit */
+            size_t left = (size_t)n_pos - tk_i;
+            if (nfit > left) nfit = left;
+            if (nfit == 0) { if (_kv_flush(fd, buf, &buf_off)) return -1; continue; }
+            for (size_t j = 0; j < nfit; j++) {
+                uint32_t v = (uint32_t)tokens[tk_i + j];
+                memcpy(buf + buf_off + j * 4, &v, 4);
+            }
+            buf_off += nfit * 4;
+            tk_i += nfit;
+        }
     }
 
     /* Layer type bitmap */

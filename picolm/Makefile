@@ -792,6 +792,16 @@ test_glm5_snapshot: tests/test_glm5_snapshot.c model_glm5.c model_moe.c model_kv
 test_glm5_dsa: tests/test_glm5_dsa.c model_glm5.c model_moe.c model_ssm.c model_kv_cache.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) model.h
 	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O2 -o $@ tests/test_glm5_dsa.c model_glm5.c model_moe.c model_ssm.c model_kv_cache.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
 
+# kvcache_save() token-writer chunking (standalone; no model needed).
+# Built with ASan+UBSan because the bug it guards was an overrun of a
+# fixed alloca buffer and a misaligned store.
+test_kvcache_tokwrite: tests/test_kvcache_tokwrite.c
+	$(CC) -O2 -g -fsanitize=address,undefined -o $@ tests/test_kvcache_tokwrite.c
+
+.PHONY: check-kvcache-tokwrite
+check-kvcache-tokwrite: test_kvcache_tokwrite
+	./test_kvcache_tokwrite
+
 .PHONY: check-glm5-dsa
 check-glm5-dsa: test_glm5_dsa
 	./test_glm5_dsa

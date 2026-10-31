@@ -179,11 +179,27 @@ static inline int qwen35_vhead_natural(int g, int n_vpk, int n_k) {
 #if defined(PICOLM_AVX2) || defined(PICOLM_AVX)
 #include <immintrin.h>
 static inline float hreduce256_ps(__m256 a) {
-    __m256 t1 = _mm256_permute2f128_ps(a, a, 1);
-    __m256 t2 = _mm256_add_ps(a, t1);
-    __m128 t3 = _mm256_castps256_ps128(t2);
-    t3 = _mm_add_ss(t3, _mm_movehl_ps(t3, t3));
-    t3 = _mm_add_ss(t3, _mm_shuffle_ps(t3, t3, 0x1));
+    /* Sum all 8 lanes.
+     *
+     * _mm_movehl_ps(dst, src) returns {dst[2], dst[3], src[2], src[3]} --
+     * it writes lanes 2..3 and only *reads* lanes 2..3 of `src`. The previous
+     * form `t3 = _mm_add_ss(t3, _mm_movehl_ps(t3, t3))` therefore added
+     * t3[0] to itself and left t3[0..1] as {2*t3[0], t3[1]}, so the following
+     * _mm_shuffle_ps(t3, t3, 0x1) + add re-added t3[0] once more. The result
+     * was 2*lane0 + lane1 + lane2 (the high 128-bit lane is already folded
+     * in by t1), i.e. lanes 3 and 7 were dropped and lane 0 counted twice --
+     * 0.75x of the true sum for uniform data, and up to ~2x for payload in
+     * lane 0. Every SSM kernel that reduces an __m256 through this helper
+     * (ssm_kernel_interaction / _veff / _sq / _output_cross / _state_update)
+     * was silently computing wrong dot products.
+     *
+     * Correct order: fold the two halves, then add the high and low pairs of
+     * the resulting 128-bit lane onto lane 0. */
+    __m256 t1 = _mm256_permute2f128_ps(a, a, 1);   /* swap 128-bit halves */
+    __m256 t2 = _mm256_add_ps(a, t1);              /* lane i += lane i+4 */
+    __m128 t3 = _mm256_castps256_ps128(t2);        /* {l0, l1, l2, l3} */
+    t3 = _mm_add_ps(t3, _mm_movehl_ps(t3, t3));    /* lane0 += lane2, lane1 += lane3 */
+    t3 = _mm_add_ss(t3, _mm_shuffle_ps(t3, t3, 0x55)); /* lane0 += lane1 */
     return _mm_cvtss_f32(t3);
 }
 #endif
