@@ -2890,7 +2890,23 @@ int picolm_gpu_matmul_dev_gu(picolm_gpu_tensor_t *tg, picolm_gpu_tensor_t *tu,
  *   { int op; int n; float fp; int pad; int pad2; int pad3; int pad4; }
  * (32 bytes). pad carries start_pos for op==6, pad2 carries rope_type for both
  * RoPE ops -- the shader used to ignore rope_type entirely and always applied
- * the pairwise form. */
+ * the pairwise form.
+ *
+ * TODO(vulkan-push-constants): this struct is shared by every elementwise op
+ * and the field meanings are per-op, so a mismatch between the C side and the
+ * GLSL side fails *silently* -- the pipeline layout allows 48 bytes, the
+ * shader reads whatever it expects, and nothing validates field names or
+ * count at runtime. That is exactly how rope_type came to be pushed into a
+ * slot the shader never read. Two concrete hazards while this stays a
+ * nameless positional struct:
+ *   1. Adding a field here without adding it to elementwise_vk.comp (or vice
+ *      versa) shifts every subsequent field for every op at once.
+ *   2. The compiler cannot check the GLSL side at all -- these shaders are
+ *      compiled at runtime (or bundled), not by the C build, so a typo in one
+ *      is invisible until a dispatch happens on a Vulkan machine.
+ * If Vulkan gets more investment, prefer one push-constant struct per op (or a
+ * single struct with explicitly named, op-prefixed fields) and add a
+ * compile-time assert on sizeof against the layout's expected size. */
 typedef struct { int op; int n; float fp; int pad; int pad2; int pad3; int pad4; } PC_Elem;
 
 int picolm_gpu_rmsnorm_dev(float *out, const float *x, const float *weight,
@@ -4000,6 +4016,11 @@ int picolm_gpu_ssm_head_permute_batch_dev(float *d, const float *s, const int *h
                                            int hd, int nh, int nt, int ss, int ds, int device) {
     (void)d;(void)s;(void)h;(void)hd;(void)nh;(void)nt;(void)ss;(void)ds;(void)device; return 0;
 }
+/* TODO(backend-ci): these SSM stubs exist only so the Vulkan build links; each
+ * must be kept in sync with backend_gpu.h by hand. They went stale when the
+ * CUDA versions gained head_v_dim, and nothing detected it -- no target
+ * compiles more than one backend. See the longer note in backend_metal.mm at
+ * picolm_gpu_ssm_recurrence(). */
 int picolm_gpu_ssm_recurrence(float *st, const float *q, const float *k, const float *v,
                                const float *ge, const float *b, float *so,
                                int nv, int ds, int hvd, int rep, int device) {

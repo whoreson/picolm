@@ -138,7 +138,20 @@ static void ssm_head_task(int h, void *ctxp) {
      * SSM head counts are n_k_heads = ssm.group_count = 16 and
      * n_v_heads = ssm.time_step_rank = 48, so repeat = 3 and `h / repeat`
      * stays in range (max k-head 15). (attention.head_count = 24 /
-     * head_count_kv = 4 are the *full-attention* heads -- not these.) */
+     * head_count_kv = 4 are the *full-attention* heads -- not these.)
+     *
+     * TODO(ssm-vhead-pairing-coverage): that measurement was made on
+     * Qwen3.6-27B only (repeat = 3). The pairing rule has NOT been verified on
+     * a model with a different repeat ratio -- in particular repeat == 1
+     * (n_v_heads == n_k_heads, where grouped and tiled are indistinguishable)
+     * and repeat > 3. Since the two formulas disagree exactly when repeat > 1,
+     * and Qwen3.5-4B has n_v_heads = 48 / n_k_heads = 16 as well, every model
+     * on hand may share the same coincidence. Check against the ik oracle on a
+     * Qwen variant with a different group_count before trusting `h / repeat`
+     * universally. The related v-head *weight* permutation
+     * (qwen35_vhead_gguf, `(h%n_vpk)*n_k + h/n_vpk`) is a separate concern and
+     * is applied twice in prefill, composing to the identity -- see the note
+     * in ssm_prefill_layer step 9. */
     int kh = h / ctx->repeat;
     const float *qh = ctx->q_conv + (size_t)kh * d_state;
     const float *khv = ctx->k_conv + (size_t)kh * d_state;

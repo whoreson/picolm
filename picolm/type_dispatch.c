@@ -596,6 +596,31 @@ quant_buf_t quant_activations(gguf_type_t wtype, const float *x, int n_batch, in
     return quant_activations_ex(wtype, x, n_batch, n, scratch, scratch_size, 0);
 }
 
+/* TODO(activation-quant-precision): this is the dominant source of PicoLM's
+ * remaining logit difference from ik_llama on Qwen3.6-27B, and it is *not a
+ * bug* -- do not "fix" it by changing the rounding.
+ *
+ * Measured on Qwen3.6-27B-Q8_0_R8, 5-token prompt:
+ *   - int8 round-trip of one activation vector: 9.06e-03 relative
+ *   - the same measured against a scalar dequantise-and-dot of the SAME
+ *     weights: 4.68e-03, versus the theoretical uniform-int8 floor of
+ *     4.81e-03 for a 32-element block. So the quantiser is at the optimum.
+ *   - projected into logits: 5.92e-03 relative rms error (max abs 0.078),
+ *     about half of PicoLM's total ~1.17e-02 gap from ik at that position.
+ *   - replacing int8 activations with exact f32 moves the end-to-end rmsdiff
+ *     from 1.012e-02 to 9.10e-03, i.e. only ~10% of the gap.
+ *
+ * The scale stored in each block is an fp16 round-trip of amax/127 while the
+ * quantiser divides by the *unrounded* amax (`id = 127/amax`, PicoLM) or by the
+ * rounded value (`id = 1/d`, ik). Both were measured: 4.7705e-03 vs 4.7679e-03
+ * mean error, so matching ik's exact convention is worth ~0.05% and is not the
+ * difference. The residual gap is inherent to 8-bit activations.
+ *
+ * If this ever needs to be smaller, the answer is a richer activation format
+ * (ik uses GGML_TYPE_Q8_2_X4 for Q8_0 weights: unsigned 8-bit + per-block
+ * offset term, rather than signed Q8_0), not tuning this function. Benchmark
+ * carefully: Q8_2 needs matching kernels and its extra `s` term costs an
+ * FMA per block. */
 quant_buf_t quant_activations_ex(gguf_type_t wtype, const float *x, int n_batch, int n,
                                   void *scratch, size_t scratch_size, int use_amax_deltas) {
     quant_buf_t qb = {0};

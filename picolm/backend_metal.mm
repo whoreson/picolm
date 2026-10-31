@@ -1059,7 +1059,23 @@ int picolm_gpu_ssm_vecdot(float *out,
  * One threadgroup per v-head. State is copied H2D into g_ssm, mutated by the
  * kernel, then copied D2H back (the state is persistent host memory owned by
  * the model). Small per-head inputs (q/k/v/gate_exp/beta) are packed into g_x;
- * ssm_output lands in g_y. d_state<=256 (else CPU fallback). */
+ * ssm_output lands in g_y. d_state<=256 (else CPU fallback).
+ *
+ * TODO(backend-ci): this declaration must match backend_gpu.h exactly, and
+ * nothing checks that. It fell out of sync when the CUDA/Vulkan versions gained
+ * a head_v_dim argument -- on an Apple build that is a hard link error, but
+ * because Metal is not compiled on Linux (and CUDA/Vulkan are not compiled on
+ * this box either, for the opposite reason) the drift is only discovered when
+ * someone builds that backend. There is no target that compiles all four
+ * backends, so signature changes to the picolm_gpu_* API are unverified by
+ * default. Options, cheapest first:
+ *   1. A `make check-gpu-api` that compiles just the backend translation units
+ *      with -fsyntax-only against a stub of the platform SDK where a real one
+ *      is unavailable. Catches signature drift, which is the common case.
+ *   2. Keep per-backend shims declaring the shared prototypes in a single
+ *      header and define them once, so a mismatch is one edit rather than four.
+ * The same hazard applies to backend_vulkan.c's stubs, which are easy to forget
+ * when adding an argument. */
 int picolm_gpu_ssm_recurrence(float *state,
                                const float *q_conv,
                                const float *k_conv,

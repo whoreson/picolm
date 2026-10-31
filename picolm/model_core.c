@@ -4519,6 +4519,32 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
      * That only worked because the loop runs in increasing bi and each source
      * is consumed before it can be clobbered -- any reordering, threading or
      * vectorisation of that loop would silently corrupt Q and the gate. */
+    /* TODO(stride-invariants): the nine buffers below are carved out of ONE
+     * malloc and addressed as raw float*, each with its own implicit per-token
+     * stride. Every bug of this class found so far was invisible to the
+     * compiler, to ASan (an overflow inside the enclosing allocation is not a
+     * heap overflow) and to the type system -- it only showed up as wrong
+     * numbers:
+     *   - xb_batch is max_dim-strided for the attention block but dim-strided
+     *     for the FFN block (documented at its declaration);
+     *   - xb2_batch is dim-strided, but ssm_prefill_layer wrote the
+     *     value_dim-wide gated norm into it, overrunning 16 KB into q_batch
+     *     (fixed in d8741d8 by giving the gated norm its own vd_buf);
+     *   - hb2_batch is ffn_buf_size-strided, but the attention gate was
+     *     written into it at q_dim stride (fixed by adding gate_batch);
+     *   - q_batch was de-interleaved in place at a different stride from the
+     *     one it was read at (fixed by adding qg_batch).
+     * Four separate instances of the same mistake in one function is a
+     * structural problem, not four unlucky edits.
+     *
+     * Suggested fix, roughly 200 lines and debug-build only: wrap each buffer
+     * in a {float *p; int stride; size_t cap;} record and route every access
+     * through a checked accessor that asserts the caller's assumed stride
+     * matches the declared one, plus a bounds check. This would have caught all
+     * four above at the first execution. Doing it as a plain debug build (no
+     * release-mode cost) is enough -- the bugs are deterministic, not racy.
+     * The multi-float region comment at each declaration should stay either
+     * way; it is currently the only record of the intended stride. */
     size_t sz = bs * (dim + max_dim + dim + q_full_dim + 2 * kv_dim +
                       2 * ffn_buf_size + q_full_dim + q_dim);
     float *buf = (float *)malloc(sz * sizeof(float));

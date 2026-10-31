@@ -204,6 +204,42 @@ static inline float hreduce256_ps(__m256 a) {
 }
 #endif
 
+/* ---- Determinism of GEMM reductions ------------------------------------
+ *
+ * TODO(prefill-decode-equivalence): PicoLM's output depends on the prefill
+ * batch size. Same tokens, same weights, same code -- prefilling 10 tokens in
+ * one call and prefilling 5 then 5 (or 9 then 1) differ by ~4e-2 relative in
+ * the residual stream by layer 55, and by enough to reorder near-tie logits.
+ * ik_llama is bit-identical across the same split (relerr 0.0), so this is a
+ * real divergence, not a numerics floor.
+ *
+ * Attribution measured so far (Qwen3.6-27B, 10-token prefix):
+ *   - Q projection output after QK-norm differs by 1.35e-07 relative between
+ *     the two batch sizes, which is exactly fp32 epsilon (1.19e-07). The
+ *     remaining batch dependence is GEMM accumulation order: the per-thread
+ *     column split in matmul_batch (nth = pool_total_threads) and the
+ *     n_batch-dependent loop structure inside the Q8_0_R8 / Q8_K_R8 kernels
+ *     both change the summation tree with ncols.
+ *   - batch_attention_layer itself is NOT the cause: called with identical
+ *     inputs at n_tokens=10 vs 5 it is bit-identical (max abs diff 0.0).
+ *
+ * This matters because an agentic session re-prefills a growing context and
+ * then decodes: every re-prefill lands on a different rounding of the same
+ * prefix, so the model can drift between turns on identical input. Chunked
+ * prefill (prompt split across several model_forward_prefill calls) has the
+ * same effect.
+ *
+ * The fix, if it is worth doing, is a batch-invariant GEMM: a fixed
+ * accumulation order independent of ncols (e.g. always reduce k in a fixed
+ * chunk sequence per output element, splitting work by OUTPUT rows rather than
+ * by batch columns, or a deterministic tree reduce). Not attempted here
+ * because it is a performance-sensitive hot path and the effect is ~eps per
+ * GEMM; measure the residual-stream impact per layer before and after.
+ *
+ * Reproduce: dump logits for `-p "<10 tokens>" -n 0` vs the same prompt split
+ * across two PICOLM_DUMP_H runs, or compare PICOLM_H_DUMP at n=10 vs two
+ * n=5 calls. See notes/picolm/qwen36_divergence_findings.md "Batch-size
+ * sensitivity". */
 /* ---- aligned_alloc polyfill for C99 / old macOS PPC / FreeBSD 8.4 ---- */
 /* Android (API 28+) and modern glibc provide aligned_alloc natively. */
 #if !defined(__ANDROID__) && (!defined(__STDC_VERSION__) || __STDC_VERSION__ < 201112L || defined(__FreeBSD__))

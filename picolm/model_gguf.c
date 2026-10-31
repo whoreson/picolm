@@ -1163,6 +1163,34 @@ int parse_gguf(model_t *m, int max_seq_len) {
                  * ("qwen.embedding_length") is covered as well. */
                 cfg->rope_type = 1;
             }
+            /* TODO(rope-type-by-arch): decide rope_type from the parsed
+             * general.architecture string, not from a key-name prefix.
+             *
+             * As written, ANY architecture not listed above silently keeps the
+             * default rope_type = 0 (pairwise). That default is only correct
+             * for the llama/baichuan family. The half-split (NEOX-style) set
+             * per ik_llama's llama_rope_type() also includes PHI2, PHI3,
+             * GEMMA/GEMMA2/GEMMA3/GEMMA4, STARCODER2, OPENELM, GPTNEOX,
+             * CODESHELL, DOTS1, HUNYUAN_MOE, OPENAI_MOE, BAILINGMOE2,
+             * MINIMAX_M2, MIMO2, SEED_OSS and STEP35 -- every one of those
+             * would be rotated pairwise here and produce plausibly-fluent but
+             * wrong output, exactly as Qwen3.5/3.6 did before 7dc3bf4.
+             *
+             * Note gemma3n already sets rope_type=1 in its own branch below,
+             * and gptneox sets it = 1 in its branch -- but those are set from
+             * *flag* detection, not from this key, so the ordering matters and
+             * is fragile. An explicit arch -> rope_type := {PAIRWISE, NEOX,
+             * MROPE, IMROPE, NONE} table, applied once right after
+             * general.architecture is parsed, would remove the guesswork.
+             *
+             * Before changing this, note QWEN35/QWEN35MOE are IMROPE in
+             * ik_llama, which is NOT the same enum as NEOX (40 vs 2) -- they
+             * only coincide because ggml runs the same half-split loop for
+             * `is_neox || is_mrope` and text-only inference supplies the same
+             * scalar for all four mrope position components. If PicoLM ever
+             * supports multimodal Qwen3-VL/Qwen3.5-VL, plain half-split will
+             * no longer be sufficient and the mrope section layout will have to
+             * be implemented. See notes/picolm/qwen36_divergence_findings.md. */
         } else if (str_eq(key, "glm5next.feed_forward_length") || str_eq(key, "llama.feed_forward_length") || str_eq(key, "general.feed_forward_length")
             || str_eq(key, "qwen2.feed_forward_length") || str_eq(key, "qwen3.feed_forward_length") || str_eq(key, "qwen35.feed_forward_length")
             || str_eq(key, "gemma3n.feed_forward_length") || str_eq(key, "gpt2.feed_forward_length") || str_eq(key, "stablelm.feed_forward_length")
