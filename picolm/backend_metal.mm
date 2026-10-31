@@ -510,26 +510,27 @@ kernel void ssm_recurrence(device float*       state    [[buffer(0)]],\n\
                            constant int* dims          [[buffer(7)]],\n\
                            uint tid [[thread_index_in_threadgroup]],\n\
                            uint  h  [[threadgroup_position_in_grid]]) {\n\
-    int n_v_heads = dims[0];\n\
-    int d_state   = dims[1];\n\
-    int repeat    = dims[2];\n\
+    int n_v_heads  = dims[0];\n\
+    int d_state    = dims[1];\n\
+    int repeat     = dims[2];\n\
+    int head_v_dim = dims[3];   /* NOT necessarily d_state -- see host guard */\n\
     if ((int)h >= n_v_heads) return;\n\
     threadgroup float sk[256];\n\
     threadgroup float d_local[256];\n\
     int kh = (int)h / repeat;\n\
     device const float* qh  = q_conv + (unsigned long)kh * (unsigned long)d_state;\n\
     device const float* khv = k_conv + (unsigned long)kh * (unsigned long)d_state;\n\
-    device const float* vh  = v_conv + (unsigned long)h  * (unsigned long)d_state;\n\
+    device const float* vh  = v_conv + (unsigned long)h  * (unsigned long)head_v_dim;\n\
     float ge = gate_exp[h];\n\
     float bh = beta[h];\n\
-    device float* st       = state   + (unsigned long)h * (unsigned long)d_state * (unsigned long)d_state;\n\
+    device float* st       = state   + (unsigned long)h * (unsigned long)head_v_dim * (unsigned long)d_state;\n\
     device float* out_base = ssm_out + (unsigned long)h;       /* dim-major */\n\
-    int N = d_state * d_state;\n\
+    int N = head_v_dim * d_state;\n\
     /* 1. decay */\n\
     for (int i = (int)tid; i < N; i += TPB) st[i] *= ge;\n\
     threadgroup_barrier(mem_flags::mem_threadgroup);\n\
     /* 2. sk[row] = state[row] . k */\n\
-    for (int row = (int)tid; row < d_state; row += TPB) {\n\
+    for (int row = (int)tid; row < head_v_dim; row += TPB) {\n\
         device const float* st_row = st + (unsigned long)row * (unsigned long)d_state;\n\
         float sum = 0.0f;\n\
         for (int col = 0; col < d_state; col++) sum += st_row[col] * khv[col];\n\
@@ -537,7 +538,7 @@ kernel void ssm_recurrence(device float*       state    [[buffer(0)]],\n\
     }\n\
     threadgroup_barrier(mem_flags::mem_threadgroup);\n\
     /* 3. d[row] = (v[row] - sk[row]) * beta */\n\
-    for (int row = (int)tid; row < d_state; row += TPB)\n\
+    for (int row = (int)tid; row < head_v_dim; row += TPB)\n\
         d_local[row] = (vh[row] - sk[row]) * bh;\n\
     threadgroup_barrier(mem_flags::mem_threadgroup);\n\
     /* 4. state[row][col] += k[col] * d[row]  (rank-1 update) */\n\
@@ -547,7 +548,7 @@ kernel void ssm_recurrence(device float*       state    [[buffer(0)]],\n\
     }\n\
     threadgroup_barrier(mem_flags::mem_threadgroup);\n\
     /* 5. out[row*n_v_heads+h] = state[row] . q */\n\
-    for (int row = (int)tid; row < d_state; row += TPB) {\n\
+    for (int row = (int)tid; row < head_v_dim; row += TPB) {\n\
         device const float* st_row = st + (unsigned long)row * (unsigned long)d_state;\n\
         float sum = 0.0f;\n\
         for (int col = 0; col < d_state; col++) sum += st_row[col] * qh[col];\n\
@@ -1066,12 +1067,18 @@ int picolm_gpu_ssm_recurrence(float *state,
                                const float *gate_exp,
                                const float *beta,
                                float *ssm_output,
-                               int n_v_heads, int d_state,
+                               int n_v_heads, int d_state, int head_v_dim,
                                int repeat, int device) {
     if (!state || !q_conv || !k_conv || !v_conv || !gate_exp || !beta || !ssm_output)
         return 0;
+    /* The kernel indexes state and v_conv by head_v_dim (one recurrence slot
+     * per value dimension), while the threadgroup scratch and the d_state^2
+     * dot range are sized by d_state. It handles the two differing, but the
+     * scratch arrays below are declared [256] in the shader source, so keep the
+     * existing d_state<=256 bound and also bound head_v_dim by it. */
     if (n_v_heads <= 0 || d_state <= 0 || d_state > 256 || repeat < 1)
         return 0;
+    if (head_v_dim <= 0 || head_v_dim > 256) return 0;
     if (device != 0 || !g_device || !g_ps_ssm_recurrence) return 0;
 
     int n_k_heads = n_v_heads / repeat;          /* k_head = h/repeat shares q/k */
@@ -1079,7 +1086,7 @@ int picolm_gpu_ssm_recurrence(float *state,
     /* Pack [q_conv | k_conv | v_conv | gate_exp | beta] into g_x. */
     size_t q_bytes = (size_t)n_k_heads * (size_t)d_state * sizeof(float);
     size_t k_bytes = q_bytes;
-    size_t v_bytes = (size_t)n_v_heads * (size_t)d_state * sizeof(float);
+    size_t v_bytes = (size_t)n_v_heads * (size_t)head_v_dim * sizeof(float);
     size_t gb_bytes = (size_t)n_v_heads * sizeof(float);
     size_t q_off = 0;
     size_t k_off = q_off + q_bytes;
@@ -1088,8 +1095,8 @@ int picolm_gpu_ssm_recurrence(float *state,
     size_t b_off = g_off + gb_bytes;
     size_t total_in = b_off + gb_bytes;
 
-    size_t state_bytes = (size_t)n_v_heads * (size_t)d_state * (size_t)d_state * sizeof(float);
-    size_t out_bytes   = (size_t)d_state * (size_t)n_v_heads * sizeof(float);
+    size_t state_bytes = (size_t)n_v_heads * (size_t)head_v_dim * (size_t)d_state * sizeof(float);
+    size_t out_bytes   = (size_t)head_v_dim * (size_t)n_v_heads * sizeof(float);
 
     if (!reserve_buf(&g_ssm, &g_ssmcap, &g_ssmptr, state_bytes,
                      MTLResourceStorageModeShared | MTLResourceCPUCacheModeDefaultCache)) return 0;
@@ -1116,7 +1123,7 @@ int picolm_gpu_ssm_recurrence(float *state,
     [enc setBuffer:g_x   offset:g_off atIndex:4];          /* gate_exp   */
     [enc setBuffer:g_x   offset:b_off atIndex:5];          /* beta       */
     [enc setBuffer:g_y   offset:0   atIndex:6];            /* ssm_output */
-    int32_t dims[3] = { n_v_heads, d_state, repeat };
+    int32_t dims[4] = { n_v_heads, d_state, repeat, head_v_dim };
     [enc setBytes:dims length:sizeof(dims) atIndex:7];
     [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_v_heads, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(TPB, 1, 1)];

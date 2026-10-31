@@ -516,6 +516,16 @@ attn_decode_dispatch(float *xb_dev, const float *q_dev,
                       int layer_ordinal, int pos,
                       int n_heads, int n_kv_heads, int head_dim, int max_seq_len,
                       gpu_device_ctx_t *ctx, int device, int n_swa) {
+    /* The decode kernels score Q@K in head_dim/16 chunks with no tail loop
+     * (unlike the single-pass kernel at picolm_gpu_attention_decode_kernel,
+     * which does handle a remainder). A head_dim that is not a multiple of 16
+     * would silently drop the trailing elements from every score, so refuse
+     * the GPU path and let the caller fall back to the CPU. Matches the check
+     * already present in picolm_gpu_attention_prefill_dev below. */
+    if (head_dim <= 0 || (head_dim % 16) != 0) return 0;
+    if (head_dim > 256) return 0;
+    if (n_kv_heads <= 0 || n_heads <= 0 || n_heads % n_kv_heads != 0) return 0;
+
     int kv_mul = n_heads / n_kv_heads;
     size_t kv_pos_stride_bytes = (size_t)n_kv_heads * head_dim * sizeof(uint16_t);
     size_t kv_head_stride_bytes = head_dim * sizeof(uint16_t);
@@ -787,6 +797,13 @@ picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
     if (!ctx || !select_ctx(ctx)) return 0;
     if (!g_kv_k_dev[device] || !g_kv_v_dev[device]) return 0;
     if (head_dim > 256) return 0;
+    /* Same reasoning as attn_decode_dispatch: the prefill kernels reduce over
+     * head_dim/16 chunks and the warpgroup variants have no tail loop, so a
+     * head_dim that is not a multiple of 16 would silently truncate every Q@K
+     * score. Refuse the GPU path (caller falls back to batch_attention_layer).
+     * This mirrors picolm_gpu_attention_prefill_dev's existing check. */
+    if (head_dim <= 0 || (head_dim % 16) != 0) return 0;
+    if (n_kv_heads <= 0 || n_heads <= 0 || n_heads % n_kv_heads != 0) return 0;
 
     size_t x_bytes = (size_t)n_tokens * n_heads * head_dim * sizeof(float);
     size_t y_bytes = x_bytes;

@@ -2886,7 +2886,12 @@ int picolm_gpu_matmul_dev_gu(picolm_gpu_tensor_t *tg, picolm_gpu_tensor_t *tu,
 // ELEMENTWISE (device-native)
 // ---------------------------------------------------------------------------
 
-typedef struct { int op; int n; float fp; int pad; } PC_Elem;
+/* Must match the push_constant block in shaders/elementwise_vk.comp:
+ *   { int op; int n; float fp; int pad; int pad2; int pad3; int pad4; }
+ * (32 bytes). pad carries start_pos for op==6, pad2 carries rope_type for both
+ * RoPE ops -- the shader used to ignore rope_type entirely and always applied
+ * the pairwise form. */
+typedef struct { int op; int n; float fp; int pad; int pad2; int pad3; int pad4; } PC_Elem;
 
 int picolm_gpu_rmsnorm_dev(float *out, const float *x, const float *weight,
                             int dim, float eps, int device) {
@@ -2977,7 +2982,7 @@ int picolm_gpu_residual_add(float *out, const float *a, const float *b,
         VK_BATCH_BIND(G.pipe_elem);
         push_desc(G.cmd_dev, 4, bi);
         int total = n * dim;
-        PC_Elem pc = {0, total, 0.0f, 0};
+        PC_Elem pc = {.op = 0, .n = total, .fp = 0.0f};
         vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         vkCmdDispatch(G.cmd_dev, (uint32_t)((total + 255) / 256), 1, 1);
         _g_dispatch_cnt++;
@@ -2998,7 +3003,7 @@ int picolm_gpu_residual_add(float *out, const float *a, const float *b,
                             b_i, (VkDeviceSize)dim * sizeof(float));
         VK_BATCH_BIND(G.pipe_elem);
         push_desc(G.cmd_dev, 4, bi);
-        PC_Elem pc = {0, dim, 0.0f, 0};
+        PC_Elem pc = {.op = 0, .n = dim, .fp = 0.0f};
         vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         vkCmdDispatch(G.cmd_dev, (uint32_t)((dim + 255) / 256), 1, 1);
         _g_dispatch_cnt++;
@@ -3034,7 +3039,7 @@ int picolm_gpu_silu_mul_dev(float *g, const float *u, size_t n, int device) {
       _g_barrier_cnt++; }
     VK_BATCH_BIND(G.pipe_elem);
     push_desc(G.cmd_dev, 4, bi);
-    PC_Elem pc = {1, (int)n, 0.0f, 0};
+    PC_Elem pc = {.op = 1, .n = (int)n, .fp = 0.0f};
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd_dev, (uint32_t)((n + 255) / 256), 1, 1);
     _g_dispatch_cnt++;
@@ -3053,7 +3058,7 @@ int picolm_gpu_gelu_mul_dev(float *g, const float *u, size_t n, int device) {
     _batch_barrier_buf2(g, n * sizeof(float), u, n * sizeof(float));
     VK_BATCH_BIND(G.pipe_elem);
     push_desc(G.cmd_dev, 4, bi);
-    PC_Elem pc = {5, (int)n, 0.0f, 0};
+    PC_Elem pc = {.op = 5, .n = (int)n, .fp = 0.0f};
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd_dev, (uint32_t)((n + 255) / 256), 1, 1);
     _g_dispatch_cnt++;
@@ -3071,7 +3076,7 @@ int picolm_gpu_gelu_dev(float *x, size_t n, int device) {
     _batch_barrier_buf(x, n * sizeof(float));
     VK_BATCH_BIND(G.pipe_elem);
     push_desc(G.cmd_dev, 4, bi);
-    PC_Elem pc = {7, (int)n, 0.0f, 0};
+    PC_Elem pc = {.op = 7, .n = (int)n, .fp = 0.0f};
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd_dev, (uint32_t)((n + 255) / 256), 1, 1);
     _g_dispatch_cnt++;
@@ -3096,7 +3101,7 @@ int picolm_gpu_rope_apply(float *x, int n_heads, int head_dim,
     VK_BATCH_DISPATCH_PRE();
     VK_BATCH_BIND(G.pipe_elem);
     push_desc(G.cmd_dev, 4, bi);
-    PC_Elem pc = {2, half_dim, (float)n_heads, rope_type};
+    PC_Elem pc = {.op = 2, .n = half_dim, .fp = (float)n_heads, .pad = 0, .pad2 = rope_type};
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd_dev, (uint32_t)((half_dim * n_heads + 255) / 256), 1, 1);
     _g_dispatch_cnt++;
@@ -3125,7 +3130,7 @@ int picolm_gpu_rope_apply_batched(float *x, int n_heads, int head_dim,
     _batch_barrier_buf(x, (size_t)S * (size_t)half_dim * sizeof(float));
     VK_BATCH_BIND(G.pipe_elem);
     push_desc(G.cmd_dev, 3, bi);
-    PC_Elem pc = {6, half_dim, (float)n_heads, start_pos};
+    PC_Elem pc = {.op = 6, .n = half_dim, .fp = (float)n_heads, .pad = start_pos, .pad2 = rope_type};
     vkCmdPushConstants(G.cmd_dev, G.plyt_unified, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(pc), &pc);
     vkCmdDispatch(G.cmd_dev, (uint32_t)((half_dim * n_heads + 255u) / 256u), (uint32_t)S, 1);

@@ -616,14 +616,33 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         sz_ssm_conv = sz_ssm_state = sz_ssm_small = 0;
         sz_ssm_small = (size_t)c->n_layers * ssm_per_layer * sizeof(float);
     }
-    /* SSM scratch buffer (shared across SSM layers) */
+    /* SSM scratch buffer (shared across SSM layers).
+     *
+     * This MUST match the carve in model_init_state() exactly. The two used to
+     * be computed by different formulas: this one reserved
+     *     conv_dim*3 + d_state*n_group*2 + d_inner*3 + dt_rank*4
+     * while the carve consumed
+     *     conv_dim + d_state*n_group*2 + d_inner + dt_rank*4
+     *     + d_state*dt_rank*2 + d_state*dt_rank*4
+     * which for Qwen3.6-27B is 57536 vs 53440 floats -- the carve ran 4096
+     * floats (16 KB) past the end of the region reserved for it. It happened
+     * to land in unused padding for that model, but it is a genuine
+     * under-allocation: any model whose following region is tighter would have
+     * its SSM scratch scribbled over by MoE/Gemma-3n/GLM-5 buffers.
+     *
+     * Keep the incremental form (repeated `+=`) so the two stay visually
+     * comparable to the carve. */
     size_t sz_ssm_tmp = 0;
     if (c->has_ssm) {
         int conv_dim = 2 * c->ssm_d_state * c->ssm_n_group + c->ssm_d_inner;
-        sz_ssm_tmp = ((size_t)conv_dim * 3 +
-                      (size_t)c->ssm_d_state * c->ssm_n_group * 2 +
-                      (size_t)c->ssm_d_inner * 3 +
-                      (size_t)c->ssm_dt_rank * 4) * sizeof(float);
+        size_t n = 0;
+        n += (size_t)conv_dim;                          /* conv_output        */
+        n += (size_t)c->ssm_d_state * c->ssm_n_group * 2; /* q_conv + k_conv  */
+        n += (size_t)c->ssm_d_inner;                    /* v_conv             */
+        n += (size_t)c->ssm_dt_rank * 4;                /* alpha/gate/beta/ge */
+        n += (size_t)c->ssm_d_state * c->ssm_dt_rank * 2; /* q_rep + k_rep    */
+        n += (size_t)c->ssm_d_state * c->ssm_dt_rank * 4; /* sk/d_vals/ssm_out/final_output */
+        sz_ssm_tmp = n * sizeof(float);
     }
     /* Gemma-3n buffers */
     size_t sz_gemma3n = 0;

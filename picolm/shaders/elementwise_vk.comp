@@ -23,7 +23,10 @@ layout(push_constant) uniform PC {
     int op;
     int n;
     float fp;
-    int pad;
+    int pad;       /* op==6: start_pos; op==2: rope_type (legacy) */
+    int pad2;      /* op==6: rope_type */
+    int pad3;
+    int pad4;
 } pc;
 
 uint f32tof16_bits(float v) {
@@ -57,20 +60,36 @@ void main() {
         }
     } else if (pc.op == 2) {
         // RoPE decode: flattened over heads. gid covers half_dim * n_heads.
+        // pc.pad carries rope_type, matching the CPU/GPU-CUDA convention:
+        //   rope_type != 0  -> half-split (NEOX): pairs (x[g], x[g+half])
+        //   rope_type == 0  -> pairwise (llama):  pairs (x[2g], x[2g+1])
+        // The shader previously ignored rope_type and always applied the
+        // pairwise form, so Qwen3.5/3.6 (which need half-split) were rotated
+        // wrongly on the Vulkan backend even after the CPU/CUDA fix.
         uint hd2 = uint(pc.n);
         int n_heads = int(pc.fp);
+        int rope_type = pc.pad2;
         int total = int(hd2) * n_heads;
         if (gid < total) {
             int h = int(gid) / int(hd2);
             int g = int(gid) % int(hd2);
             int stride = 2 * int(hd2);
-            int base = h * stride + 2 * g;
-            float x0 = d0[base];
-            float x1 = d0[base + 1];
+            int base, i0, i1;
+            if (rope_type != 0) {
+                base = h * stride;
+                i0 = base + g;
+                i1 = base + g + int(hd2);
+            } else {
+                base = h * stride;
+                i0 = base + 2 * g;
+                i1 = base + 2 * g + 1;
+            }
+            float x0 = d0[i0];
+            float x1 = d0[i1];
             float c = d1[g];
             float s = d2[g];
-            d0[base]     = x0 * c - x1 * s;
-            d0[base + 1] = x0 * s + x1 * c;
+            d0[i0] = x0 * c - x1 * s;
+            d0[i1] = x0 * s + x1 * c;
         }
     } else if (pc.op == 3) {
         // F32->F16 pack: each thread handles one output word (2 F16 values)
@@ -102,6 +121,7 @@ void main() {
         uint hd2 = uint(pc.n);
         int n_heads = int(pc.fp);
         int start_pos = pc.pad;
+        int rope_type = pc.pad2;   /* 0 = pairwise, non-zero = half-split */
         int tok = int(gl_GlobalInvocationID.y);
         int hdim = int(hd2) * 2;
         int total = int(hd2) * n_heads;
@@ -109,13 +129,23 @@ void main() {
             int h = int(gid) / int(hd2);
             int g = int(gid) % int(hd2);
             int cs_row = (start_pos + tok) * int(hd2);
-            int tbase = tok * n_heads * hdim + h * hdim + 2 * g;
-            float x0 = d0[tbase];
-            float x1 = d0[tbase + 1];
+            int hbase = tok * n_heads * hdim + h * hdim;
+            int i0, i1;
+            if (rope_type != 0) {
+                /* NEOX / half-split: x[g] pairs with x[g + half] */
+                i0 = hbase + g;
+                i1 = hbase + g + int(hd2);
+            } else {
+                /* llama pairwise: x[2g] pairs with x[2g+1] */
+                i0 = hbase + 2 * g;
+                i1 = hbase + 2 * g + 1;
+            }
+            float x0 = d0[i0];
+            float x1 = d0[i1];
             float c = d1[cs_row + g];
             float s = d2[cs_row + g];
-            d0[tbase]     = x0 * c - x1 * s;
-            d0[tbase + 1] = x0 * s + x1 * c;
+            d0[i0] = x0 * c - x1 * s;
+            d0[i1] = x0 * s + x1 * c;
         }
     }
 }
