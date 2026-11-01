@@ -432,6 +432,156 @@ int sgemm_iq6_k_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void
     return nrows;
 }
 
+
+/* ================================================================
+ * VNNI variant of the decode-once GEMM: sgemm_iq6_k_q8_k_r8v  (AVX-512 VNNI + VL)
+ *
+ * Same scratch idea, but the inner product uses dpbusd (1 uop per 32 MACs instead of
+ * sign + maddubs + madd) with the shift on the WEIGHTS, so Q8_K activations are read in
+ * place and no activation copy is staged:
+ *   wu = w ^ 0x80 (= w + 128, u8) is the unsigned operand, y (int8) the signed one, so
+ *   sum(wu*y) = sum(w*y) + 128*sum(y). Each 16-value group's accumulator is SEEDED with
+ *   -128*bsum_g (bsums are already in every Q8_K block), which cancels the bias exactly.
+ *   Per group: t = seed; 4x dpbusd; isum += mullo(t, sl32_g)  (per-row int32 group scales).
+ * 8 rows x IQ6V_NC columns per tile; the int32 seeds (-128*bsum) are staged once per column
+ * panel (64B per block and column).
+ * ================================================================ */
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
+#define IQ6V_NC 8
+
+typedef struct { uint8_t *w; int32_t *sl; float *d; int32_t *cr; size_t w_cap, sl_cap, d_cap, cr_cap; } iq6v_scratch_t;
+static __thread iq6v_scratch_t iq6v_tl;
+
+static int iq6v_reserve(int nb, int pc) {
+    const size_t w = (size_t)nb * 2048, sl = (size_t)nb * 512, d = (size_t)nb * 32, cr = (size_t)pc * nb * 64;
+    if (iq6v_tl.w_cap < w)   { _mm_free(iq6v_tl.w);  iq6v_tl.w  = (uint8_t *)_mm_malloc(w, 64);  iq6v_tl.w_cap  = iq6v_tl.w  ? w  : 0; }
+    if (iq6v_tl.sl_cap < sl) { _mm_free(iq6v_tl.sl); iq6v_tl.sl = (int32_t *)_mm_malloc(sl, 64); iq6v_tl.sl_cap = iq6v_tl.sl ? sl : 0; }
+    if (iq6v_tl.d_cap < d)   { _mm_free(iq6v_tl.d);  iq6v_tl.d  = (float *)_mm_malloc(d, 64);   iq6v_tl.d_cap  = iq6v_tl.d  ? d  : 0; }
+    if (iq6v_tl.cr_cap < cr) { _mm_free(iq6v_tl.cr); iq6v_tl.cr = (int32_t *)_mm_malloc(cr, 64); iq6v_tl.cr_cap = iq6v_tl.cr ? cr : 0; }
+    return iq6v_tl.w && iq6v_tl.sl && iq6v_tl.d && iq6v_tl.cr;
+}
+
+static void iq6v_decode_group(const char *wbase, size_t w_row_bytes, int nb, const iq6_luts_t *L) {
+    const __m256i x80 = _mm256_set1_epi8((char)0x80);
+    for (int ib = 0; ib < nb; ++ib) {
+        __m256i wv[8][8];
+        float dd[8];
+        int32_t *slb = iq6v_tl.sl + (size_t)ib * 128;
+        for (int r = 0; r < 8; ++r) {
+            const block_iq6_k *x = (const block_iq6_k *)(wbase + (size_t)r * w_row_bytes) + ib;
+            iq6t_decode_w(x, L, wv[r]);
+            for (int k = 0; k < 8; ++k) wv[r][k] = _mm256_xor_si256(wv[r][k], x80);   /* w + 128 as u8 */
+            dd[r] = iq6_f16(x->d);
+            for (int g = 0; g < 16; ++g) slb[g * 8 + r] = (int32_t)x->scales[g];
+        }
+        uint8_t *wb = iq6v_tl.w + (size_t)ib * 2048;
+        for (int k = 0; k < 8; ++k) {
+            __m256i rr[8], o[8];
+            for (int r = 0; r < 8; ++r) rr[r] = wv[r][k];
+            iq6t_transpose8(rr, o);
+            for (int j = 0; j < 8; ++j) _mm256_storeu_si256((__m256i *)(wb + (size_t)(8 * k + j) * 32), o[j]);
+        }
+        _mm256_storeu_ps(iq6v_tl.d + (size_t)ib * 8, _mm256_loadu_ps(dd));
+    }
+}
+
+/* seeds[c][ib][g] = -128 * bsum_g of column c, block ib */
+static void iq6v_stage_seeds(const char *vy, size_t y_row_bytes, int c0, int pc, int nb) {
+    for (int c = 0; c < pc; ++c) {
+        const block_q8_K *yb = (const block_q8_K *)(vy + (size_t)(c0 + c) * y_row_bytes);
+        int32_t *dst = iq6v_tl.cr + (size_t)c * nb * 16;
+        for (int ib = 0; ib < nb; ++ib) {
+            const __m256i b16 = _mm256_loadu_si256((const __m256i *)yb[ib].bsums);
+            const __m256i lo = _mm256_slli_epi32(_mm256_cvtepi16_epi32(_mm256_castsi256_si128(b16)), 7);
+            const __m256i hi = _mm256_slli_epi32(_mm256_cvtepi16_epi32(_mm256_extracti128_si256(b16, 1)), 7);
+            _mm256_storeu_si256((__m256i *)(dst + (size_t)ib * 16),     _mm256_sub_epi32(_mm256_setzero_si256(), lo));
+            _mm256_storeu_si256((__m256i *)(dst + (size_t)ib * 16 + 8), _mm256_sub_epi32(_mm256_setzero_si256(), hi));
+        }
+    }
+}
+
+static inline __attribute__((always_inline))
+void iq6v_tile(int nb, const char *y0, size_t y_row_bytes, const int32_t *cr0, float *out, size_t bs, const int NC) {
+    __m256 facc[IQ6V_NC];
+#pragma GCC unroll 8
+    for (int c = 0; c < NC; c++) facc[c] = _mm256_setzero_ps();
+    for (int ib = 0; ib < nb; ++ib) {
+        const uint8_t *wb = iq6v_tl.w + (size_t)ib * 2048;
+        const int32_t *slb = iq6v_tl.sl + (size_t)ib * 128;
+        const block_q8_K *yb[IQ6V_NC];
+        const int32_t *crb[IQ6V_NC];
+#pragma GCC unroll 8
+        for (int c = 0; c < NC; c++) {
+            yb[c] = (const block_q8_K *)(y0 + (size_t)c * y_row_bytes) + ib;
+            crb[c] = cr0 + ((size_t)c * nb + ib) * 16;
+        }
+        __m256i isum[IQ6V_NC];
+#pragma GCC unroll 8
+        for (int c = 0; c < NC; c++) isum[c] = _mm256_setzero_si256();
+        for (int g = 0; g < 16; ++g) {
+            const __m256i w0 = _mm256_loadu_si256((const __m256i *)(wb + (size_t)(4 * g + 0) * 32));
+            const __m256i w1 = _mm256_loadu_si256((const __m256i *)(wb + (size_t)(4 * g + 1) * 32));
+            const __m256i w2 = _mm256_loadu_si256((const __m256i *)(wb + (size_t)(4 * g + 2) * 32));
+            const __m256i w3 = _mm256_loadu_si256((const __m256i *)(wb + (size_t)(4 * g + 3) * 32));
+            const __m256i s32 = _mm256_loadu_si256((const __m256i *)(slb + g * 8));
+#pragma GCC unroll 8
+            for (int c = 0; c < NC; c++) {
+                const int8_t *q = yb[c]->qs + 16 * g;
+                int d0, d1, d2, d3;
+                memcpy(&d0, q, 4); memcpy(&d1, q + 4, 4); memcpy(&d2, q + 8, 4); memcpy(&d3, q + 12, 4);
+                __m256i t = _mm256_set1_epi32(crb[c][g]);
+                t = _mm256_dpbusd_epi32(t, w0, _mm256_set1_epi32(d0));
+                t = _mm256_dpbusd_epi32(t, w1, _mm256_set1_epi32(d1));
+                t = _mm256_dpbusd_epi32(t, w2, _mm256_set1_epi32(d2));
+                t = _mm256_dpbusd_epi32(t, w3, _mm256_set1_epi32(d3));
+                isum[c] = _mm256_add_epi32(isum[c], _mm256_mullo_epi32(t, s32));
+            }
+        }
+        const __m256 wsc = _mm256_loadu_ps(iq6v_tl.d + (size_t)ib * 8);
+#pragma GCC unroll 8
+        for (int c = 0; c < NC; c++)
+            facc[c] = IQ6T_FMA(_mm256_cvtepi32_ps(isum[c]), _mm256_mul_ps(wsc, _mm256_set1_ps(yb[c]->d)), facc[c]);
+    }
+#pragma GCC unroll 8
+    for (int c = 0; c < NC; c++) _mm256_storeu_ps(out + (size_t)c * bs, facc[c]);
+}
+
+int sgemm_iq6_k_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy,
+                         float *out, size_t bs, int ith, int nth) {
+    if (nrows < 8 || (nrows % 8) != 0 || ncols < 1 || k < QK_K || (k % QK_K) != 0 || nth < 1) return 0;
+    const int nb = k / QK_K, groups = nrows / 8;
+    const int gpt = (groups + nth - 1) / nth;
+    const int g_start = ith * gpt, g_end = (ith + 1) * gpt < groups ? (ith + 1) * gpt : groups;
+    if (g_start >= g_end) return nrows;
+    if (!iq6v_reserve(nb, ncols < IQ6T_PC ? ncols : IQ6T_PC)) return 0;
+    const iq6_luts_t L = iq6_luts_init();
+    const size_t w_row_bytes = (size_t)nb * sizeof(block_iq6_k), y_row_bytes = (size_t)nb * sizeof(block_q8_K);
+    for (int c0 = 0; c0 < ncols; c0 += IQ6T_PC) {
+        const int pc = (ncols - c0 < IQ6T_PC) ? (ncols - c0) : IQ6T_PC;
+        iq6v_stage_seeds((const char *)vy, y_row_bytes, c0, pc, nb);
+        for (int g = g_start; g < g_end; ++g) {
+            iq6v_decode_group((const char *)vx + (size_t)g * 8 * w_row_bytes, w_row_bytes, nb, &L);
+            float *og = out + (size_t)c0 * bs + (size_t)g * 8;
+            int cc = 0;
+#define IQ6V_RUN(NCV) iq6v_tile(nb, (const char *)vy + (size_t)(c0 + cc) * y_row_bytes, y_row_bytes, \
+                                iq6v_tl.cr + (size_t)cc * nb * 16, og + (size_t)cc * bs, bs, NCV)
+            for (; cc + 8 <= pc; cc += 8) IQ6V_RUN(8);
+            if (cc + 4 <= pc) { IQ6V_RUN(4); cc += 4; }
+            if (cc + 2 <= pc) { IQ6V_RUN(2); cc += 2; }
+            if (cc + 1 <= pc) { IQ6V_RUN(1); cc += 1; }
+#undef IQ6V_RUN
+        }
+    }
+    return nrows;
+}
+#else
+int sgemm_iq6_k_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy,
+                         float *out, size_t bs, int ith, int nth) {
+    (void)nrows; (void)ncols; (void)k; (void)vx; (void)vy; (void)out; (void)bs; (void)ith; (void)nth;
+    return 0;   /* no AVX-512 VNNI+VL: caller falls back to r8t */
+}
+#endif /* VNNI variant */
+
 #else
 
 void vec_dot_iq6_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out) {
@@ -454,6 +604,12 @@ int sgemm_iq6_k_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void
     return 0;
 }
 
+int sgemm_iq6_k_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy,
+                         float *out, size_t bs, int ith, int nth) {
+    (void)nrows; (void)ncols; (void)k; (void)vx; (void)vy; (void)out; (void)bs; (void)ith; (void)nth;
+    return 0;
+}
+
 #endif
 
 /* fn_gemm for IQ6_K: the decode-once R8 kernel for real prefill batches, the tile kernel otherwise.
@@ -467,10 +623,14 @@ int sgemm_iq6_k_q8_k_best(int nrows, int ncols, int k, const void *vx, const voi
         if (mn && atoi(mn) > 0) min_n = atoi(mn);
         en = !(e && e[0] == '0');
     }
+    static int vnni_en = -1;
+    if (vnni_en < 0) { const char *e = getenv("PICOLM_IQ6K_VNNI"); vnni_en = !(e && e[0] == '0'); }
     if (en && ncols >= min_n) {
-        int r = sgemm_iq6_k_q8_k_r8t(nrows, ncols, k, vx, vy, out, bs, ith, nth);
+        int r = vnni_en ? sgemm_iq6_k_q8_k_r8v(nrows, ncols, k, vx, vy, out, bs, ith, nth) : 0;
+        const char *which = "sgemm_iq6_k_q8_k_r8v (decode-once R8, VNNI)";
+        if (!r) { r = sgemm_iq6_k_q8_k_r8t(nrows, ncols, k, vx, vy, out, bs, ith, nth); which = "sgemm_iq6_k_q8_k_r8t (decode-once R8, AVX2)"; }
         if (r) {
-            static int traced; if (!traced && getenv("PICOLM_DISPATCH")) { traced = 1; fprintf(stderr, "TRACE kernel: sgemm_iq6_k_q8_k_r8t (decode-once R8)\n"); }
+            static int traced; if (!traced && getenv("PICOLM_DISPATCH")) { traced = 1; fprintf(stderr, "TRACE kernel: %s\n", which); }
             return r;
         }
     }

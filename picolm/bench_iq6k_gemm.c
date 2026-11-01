@@ -15,7 +15,8 @@ static unsigned rs=5; static unsigned rnd(void){rs=rs*1664525u+1013904223u;retur
 typedef struct{int which,m,n,k,nth;const void*W,*Y;float*C;}ctx_t;
 static void task(int idx,void*p){ctx_t*c=p;
     if(c->which==0) sgemm_iq6_k_q8_k_avx2(c->m,c->n,c->k,c->W,c->Y,c->C,c->m,idx,c->nth);
-    else sgemm_iq6_k_q8_k_r8t(c->m,c->n,c->k,c->W,c->Y,c->C,c->m,idx,c->nth);}
+    else if(c->which==1) sgemm_iq6_k_q8_k_r8t(c->m,c->n,c->k,c->W,c->Y,c->C,c->m,idx,c->nth);
+    else sgemm_iq6_k_q8_k_r8v(c->m,c->n,c->k,c->W,c->Y,c->C,c->m,idx,c->nth);}
 static block_iq6_k *mkW(int m,int nb){block_iq6_k*W=malloc((size_t)m*nb*sizeof(block_iq6_k));
     for(size_t i=0;i<(size_t)m*nb;i++){uint8_t*b=(uint8_t*)&W[i];for(size_t j=0;j<sizeof(block_iq6_k);j++)b[j]=rnd();W[i].d=0x2C00+(rnd()&0xFF);
         for(int g=0;g<16;g++)W[i].scales[g]=(int8_t)((int)(rnd()%64)-32);}   /* realistic scale range */
@@ -29,6 +30,11 @@ static int check(void){
         float*C1=calloc((size_t)n*m,4),*C2=calloc((size_t)n*m,4);
         sgemm_iq6_k_q8_k_avx2(m,n,k,W,Y,C1,m,0,1);
         int ok=1; for(int th=0;th<nth;th++) ok&=(sgemm_iq6_k_q8_k_r8t(m,n,k,W,Y,C2,m,th,nth)!=0);
+        float*C3=calloc((size_t)n*m,4); int okv=1,havev=sgemm_iq6_k_q8_k_r8v(m,n,k,W,Y,C3,m,0,1)!=0;
+        if(havev){memset(C3,0,(size_t)n*m*4);for(int th=0;th<nth;th++)okv&=(sgemm_iq6_k_q8_k_r8v(m,n,k,W,Y,C3,m,th,nth)!=0);
+            double m3=0,r3=0;for(size_t i=0;i<(size_t)n*m;i++){double d=fabs(C1[i]-C3[i]);if(d>m3)m3=d;r3+=(double)C1[i]*C1[i];}r3=sqrt(r3/((size_t)n*m)+1e-30);
+            if(!okv||m3>2e-5*r3+1e-3){ok=0;printf("FAIL r8v m=%d n=%d k=%d nth=%d maxdiff=%.3g rms=%.3g\n",m,n,k,nth,m3,r3);}}
+        free(C3);
         double md=0,rm=0;for(size_t i=0;i<(size_t)n*m;i++){double d=fabs(C1[i]-C2[i]);if(d>md)md=d;rm+=(double)C1[i]*C1[i];}rm=sqrt(rm/((size_t)n*m)+1e-30);
         total++; if(!ok||md>2e-5*rm+1e-3){bad++;printf("FAIL m=%d n=%d k=%d nth=%d ok=%d maxdiff=%.3g rms=%.3g\n",m,n,k,nth,ok,md,rm);}
         free(W);free(Y);free(C1);free(C2);}
@@ -42,5 +48,8 @@ int main(int argc,char**argv){
     for(int which=0;which<2;which++){ float*C=which?C1:C0; ctx_t cx={which,m,n,k,nth,W,Y,C}; double best=1e9;
         for(int r=-1;r<reps;r++){double t=now(); if(nth>1)tensor_parallel_for(nth,task,&cx); else task(0,&cx); t=now()-t; if(r>=0&&t<best)best=t;}
         gt[which]=ops/best/1e9; printf("  %-34s: %8.1f GOPS total = %6.1f per thread  (%d thread%s)\n",which?"decode-once R8 (new)":"1x2 tile kernel (old)",gt[which],gt[which]/nth,nth,nth>1?"s":""); }
+    float*C2=calloc((size_t)n*m,4); double g2=0; int havev=sgemm_iq6_k_q8_k_r8v(m,n,k,W,Y,C2,m,0,1)!=0;
+    if(havev){ctx_t cx={2,m,n,k,nth,W,Y,C2};double best=1e9;for(int r=-1;r<reps;r++){double t=now();if(nth>1)tensor_parallel_for(nth,task,&cx);else task(0,&cx);t=now()-t;if(r>=0&&t<best)best=t;}
+        g2=ops/best/1e9;printf("  %-34s: %8.1f GOPS total = %6.1f per thread  (%d thread%s)\n","decode-once R8 VNNI (new)",g2,g2/nth,nth,nth>1?"s":"");}
     double md=0,rm=0;for(size_t i=0;i<(size_t)n*m;i++){double d=fabs(C0[i]-C1[i]);if(d>md)md=d;rm+=(double)C0[i]*C0[i];}rm=sqrt(rm/((size_t)n*m));
-    printf("  speedup %.2fx   max|old-new|=%.2e (rms %.3g)\n",gt[1]/gt[0],md,rm); return 0;}
+    printf("  speedup vs old: AVX2 decode-once %.2fx%s   max|old-new|=%.2e (rms %.3g)\n",gt[1]/gt[0],"",md,rm); if(havev)printf("  speedup vs old: VNNI decode-once %.2fx  (%.2fx over the AVX2 decode-once kernel)\n",g2/gt[0],g2/gt[1]); return 0;}
