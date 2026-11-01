@@ -1415,6 +1415,10 @@ void vec_dot_iq6_k_q8_k_batch(const void *vx, const void *wy, size_t y_stride,
                               int n, int ncols, float *out);
 int sgemm_iq6_k_q8_k_avx2(int nrows, int ncols, int k, const void *vx, const void *vy,
                            float *out, size_t bs, int ith, int nth);
+int sgemm_iq6_k_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void *vy,
+                         float *out, size_t bs, int ith, int nth);   /* decode-once R8 GEMM; returns 0 if unsupported */
+int sgemm_iq6_k_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy,
+                          float *out, size_t bs, int ith, int nth);   /* r8t when worthwhile, else tile kernel; always computes */
 /* IQ6_K plain x Q8_K ARM NEON GEMV/GEMM. */
 void vec_dot_iq6_k_q8_k_neon(const void *vx, const void *wy, int n, float *out);
 void vec_dot_iq6_k_q8_k_neon_batch(const void *vx, const void *wy, size_t y_stride,

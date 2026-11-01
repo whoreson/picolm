@@ -9223,7 +9223,10 @@ extern void vec_dot_iq6_k_q8_k_avx2(const void *vx, const void *wy, int n, float
 
 /* IQ6_K x Q8_K scalar vec_dot (reference implementation). */
 float vec_dot_iq6_k_q8_k(const void *vx, const void *wy, int n) {
-#if defined(PICOLM_VNNI) && !defined(PICOLM_FORCE_SCALAR)
+    /* The VNNI variant does 16 scalar float fixups per block and measured ~2x slower than the
+     * AVX2 dot (L2-resident, k=4096), which showed up as slower decode in AVX-512 builds.
+     * Opt back in with -DPICOLM_IQ6K_PREFER_VNNI. */
+#if defined(PICOLM_VNNI) && defined(PICOLM_IQ6K_PREFER_VNNI) && !defined(PICOLM_FORCE_SCALAR)
     float result;
     vec_dot_iq6_k_q8_k_vnni(vx, wy, n, &result);
     return result;

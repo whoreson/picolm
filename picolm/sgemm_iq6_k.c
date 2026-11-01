@@ -18,6 +18,9 @@
  * ================================================================ */
 
 #include <stdint.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
 #include <stddef.h>
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
@@ -255,6 +258,180 @@ int sgemm_iq6_k_q8_k_avx2(int nrows, int ncols, int k,
     return nrows;
 }
 
+
+/* ================================================================
+ * Decode-once R8 GEMM (prefill): sgemm_iq6_k_q8_k_r8t
+ *
+ * The tile kernel above handles 1 weight row x 2 activation columns and re-decodes every
+ * IQ6_K block (the 64-entry LUT lookups) for each tile: with 500+ prompt columns each block
+ * is decoded ~250 times, and the decode costs more than the dot products. Here a group of 8
+ * weight rows is decoded ONCE per column panel into an int8 R8 scratch:
+ *   - exact signed weights w = iq6nl_lut[q6] - 128 + m_g (always fits int8, |w| <= 127),
+ *     laid out like Q8_K_R8: vector v (0..63 per 256-value block) = dword v of each of the
+ *     8 rows, so one 32-byte vector carries 4 consecutive values of 8 rows;
+ *   - the per-16-value-group int8 scales as int16 pairs [s_r, s_r] per row, so ONE
+ *     madd_epi16 applies them while summing the maddubs pairs (no correction terms, no
+ *     bsums: the +m_g offset is folded into the weights);
+ *   - 8 fp32 row scales per block.
+ * A tile of NC columns then streams the whole scratch: per 32 MACs sign + maddubs + madd +
+ * add, abs(w) shared by the NC columns, one cvt/mul/fma fixup per 256-value block and
+ * column. Q8_K activations are read in place (no staging); column panels of IQ6T_PC columns
+ * keep them in L2 while a thread sweeps its weight groups. Results match the tile kernel
+ * (identical integer sums; only fp32 accumulation order differs).
+ * ================================================================ */
+#if defined(__AVX512VL__)
+#define IQ6T_NCMAX 8
+#else
+#define IQ6T_NCMAX 4
+#endif
+#define IQ6T_PC 96
+#if defined(__FMA__)
+#define IQ6T_FMA(a, b, c) _mm256_fmadd_ps((a), (b), (c))
+#else
+#define IQ6T_FMA(a, b, c) _mm256_add_ps(_mm256_mul_ps((a), (b)), (c))
+#endif
+
+typedef struct { int8_t *w; int16_t *sc; float *d; size_t w_cap, sc_cap, d_cap; } iq6t_scratch_t;
+static __thread iq6t_scratch_t iq6t_tl;
+
+static int iq6t_reserve(int nb) {
+    const size_t w = (size_t)nb * 2048, sc = (size_t)nb * 512, d = (size_t)nb * 32;
+    if (iq6t_tl.w_cap < w)   { _mm_free(iq6t_tl.w);  iq6t_tl.w  = (int8_t *)_mm_malloc(w, 64);  iq6t_tl.w_cap  = iq6t_tl.w  ? w  : 0; }
+    if (iq6t_tl.sc_cap < sc) { _mm_free(iq6t_tl.sc); iq6t_tl.sc = (int16_t *)_mm_malloc(sc, 64); iq6t_tl.sc_cap = iq6t_tl.sc ? sc : 0; }
+    if (iq6t_tl.d_cap < d)   { _mm_free(iq6t_tl.d);  iq6t_tl.d  = (float *)_mm_malloc(d, 64);   iq6t_tl.d_cap  = iq6t_tl.d  ? d  : 0; }
+    return iq6t_tl.w && iq6t_tl.sc && iq6t_tl.d;
+}
+
+/* 8x8 transpose of 32-bit words: o[j] = dword j of each of r[0..7] */
+static inline void iq6t_transpose8(const __m256i r[8], __m256i o[8]) {
+    const __m256i t0 = _mm256_unpacklo_epi32(r[0], r[1]), t1 = _mm256_unpackhi_epi32(r[0], r[1]);
+    const __m256i t2 = _mm256_unpacklo_epi32(r[2], r[3]), t3 = _mm256_unpackhi_epi32(r[2], r[3]);
+    const __m256i t4 = _mm256_unpacklo_epi32(r[4], r[5]), t5 = _mm256_unpackhi_epi32(r[4], r[5]);
+    const __m256i t6 = _mm256_unpacklo_epi32(r[6], r[7]), t7 = _mm256_unpackhi_epi32(r[6], r[7]);
+    const __m256i u0 = _mm256_unpacklo_epi64(t0, t2), u1 = _mm256_unpackhi_epi64(t0, t2);
+    const __m256i u2 = _mm256_unpacklo_epi64(t1, t3), u3 = _mm256_unpackhi_epi64(t1, t3);
+    const __m256i u4 = _mm256_unpacklo_epi64(t4, t6), u5 = _mm256_unpackhi_epi64(t4, t6);
+    const __m256i u6 = _mm256_unpacklo_epi64(t5, t7), u7 = _mm256_unpackhi_epi64(t5, t7);
+    o[0] = _mm256_permute2x128_si256(u0, u4, 0x20); o[1] = _mm256_permute2x128_si256(u1, u5, 0x20);
+    o[2] = _mm256_permute2x128_si256(u2, u6, 0x20); o[3] = _mm256_permute2x128_si256(u3, u7, 0x20);
+    o[4] = _mm256_permute2x128_si256(u0, u4, 0x31); o[5] = _mm256_permute2x128_si256(u1, u5, 0x31);
+    o[6] = _mm256_permute2x128_si256(u2, u6, 0x31); o[7] = _mm256_permute2x128_si256(u3, u7, 0x31);
+}
+
+/* One block's 256 weights as 8 vectors of 32 values in natural order, m_g folded in. */
+static inline void iq6t_decode_w(const block_iq6_k *x, const iq6_luts_t *L, __m256i w[8]) {
+    const __m256i m0f = _mm256_set1_epi8(0x0f);
+    for (int ih = 0; ih < 2; ++ih) {
+        const __m256i qh = _mm256_loadu_si256((const __m256i *)(x->qh + 32 * ih));
+        for (int sh = 0; sh < 2; ++sh) {
+            const int ib = 2 * ih + sh, s0 = 4 * sh;
+            const __m256i qs = _mm256_loadu_si256((const __m256i *)(x->qs + 32 * ib));
+            const __m256i lo = _mm256_and_si256(qs, m0f);
+            const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(qs, 4), m0f);
+            w[2 * ib + 0] = iq6_lookup(lo, qh, _mm_cvtsi32_si128(7 - s0), _mm_cvtsi32_si128(6 - s0), L);
+            w[2 * ib + 1] = iq6_lookup(hi, qh, _mm_cvtsi32_si128(5 - s0), _mm_cvtsi32_si128(4 - s0), L);
+        }
+    }
+    const unsigned ex = x->extra;
+    for (int k = 0; k < 8; ++k) {   /* vector k = groups 2k (low lane) and 2k+1 (high lane) */
+        const __m256i mn = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_set1_epi8((char)((ex >> (2 * k)) & 1))),
+                                                   _mm_set1_epi8((char)((ex >> (2 * k + 1)) & 1)), 1);
+        w[k] = _mm256_add_epi8(w[k], mn);
+    }
+}
+
+static void iq6t_decode_group(const char *wbase, size_t w_row_bytes, int nb, const iq6_luts_t *L) {
+    for (int ib = 0; ib < nb; ++ib) {
+        __m256i wv[8][8];
+        float dd[8];
+        int16_t *scb = iq6t_tl.sc + (size_t)ib * 256;
+        for (int r = 0; r < 8; ++r) {
+            const block_iq6_k *x = (const block_iq6_k *)(wbase + (size_t)r * w_row_bytes) + ib;
+            iq6t_decode_w(x, L, wv[r]);
+            dd[r] = iq6_f16(x->d);
+            for (int g = 0; g < 16; ++g) {
+                const int16_t sl = (int16_t)x->scales[g];
+                scb[g * 16 + 2 * r] = sl;
+                scb[g * 16 + 2 * r + 1] = sl;
+            }
+        }
+        int8_t *wb = iq6t_tl.w + (size_t)ib * 2048;
+        for (int k = 0; k < 8; ++k) {
+            __m256i rr[8], o[8];
+            for (int r = 0; r < 8; ++r) rr[r] = wv[r][k];
+            iq6t_transpose8(rr, o);
+            for (int j = 0; j < 8; ++j) _mm256_storeu_si256((__m256i *)(wb + (size_t)(8 * k + j) * 32), o[j]);
+        }
+        _mm256_storeu_ps(iq6t_tl.d + (size_t)ib * 8, _mm256_loadu_ps(dd));
+    }
+}
+
+static inline __attribute__((always_inline))
+void iq6t_tile(int nb, const char *y0, size_t y_row_bytes, float *out, size_t bs, const int NC) {
+    __m256 facc[IQ6T_NCMAX];
+#pragma GCC unroll 8
+    for (int c = 0; c < NC; c++) facc[c] = _mm256_setzero_ps();
+    for (int ib = 0; ib < nb; ++ib) {
+        const int8_t *wb = iq6t_tl.w + (size_t)ib * 2048;
+        const int16_t *sb = iq6t_tl.sc + (size_t)ib * 256;
+        const block_q8_K *yb[IQ6T_NCMAX];
+#pragma GCC unroll 8
+        for (int c = 0; c < NC; c++) yb[c] = (const block_q8_K *)(y0 + (size_t)c * y_row_bytes) + ib;
+        __m256i acc[IQ6T_NCMAX];
+#pragma GCC unroll 8
+        for (int c = 0; c < NC; c++) acc[c] = _mm256_setzero_si256();
+        for (int g = 0; g < 16; ++g) {
+            const __m256i s16 = _mm256_loadu_si256((const __m256i *)(sb + g * 16));
+            for (int jj = 0; jj < 4; ++jj) {
+                const int v = 4 * g + jj;
+                const __m256i w = _mm256_loadu_si256((const __m256i *)(wb + (size_t)v * 32));
+                const __m256i aw = _mm256_sign_epi8(w, w);
+#pragma GCC unroll 8
+                for (int c = 0; c < NC; c++) {
+                    int yd; memcpy(&yd, yb[c]->qs + 4 * v, 4);
+                    const __m256i sy = _mm256_sign_epi8(_mm256_set1_epi32(yd), w);
+                    acc[c] = _mm256_add_epi32(acc[c], _mm256_madd_epi16(_mm256_maddubs_epi16(aw, sy), s16));
+                }
+            }
+        }
+        const __m256 wsc = _mm256_loadu_ps(iq6t_tl.d + (size_t)ib * 8);
+#pragma GCC unroll 8
+        for (int c = 0; c < NC; c++)
+            facc[c] = IQ6T_FMA(_mm256_cvtepi32_ps(acc[c]), _mm256_mul_ps(wsc, _mm256_set1_ps(yb[c]->d)), facc[c]);
+    }
+#pragma GCC unroll 8
+    for (int c = 0; c < NC; c++) _mm256_storeu_ps(out + (size_t)c * bs, facc[c]);
+}
+
+int sgemm_iq6_k_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void *vy,
+                         float *out, size_t bs, int ith, int nth) {
+    if (nrows < 8 || (nrows % 8) != 0 || ncols < 1 || k < QK_K || (k % QK_K) != 0 || nth < 1) return 0;
+    const int nb = k / QK_K, groups = nrows / 8;
+    const int gpt = (groups + nth - 1) / nth;
+    const int g_start = ith * gpt, g_end = (ith + 1) * gpt < groups ? (ith + 1) * gpt : groups;
+    if (g_start >= g_end) return nrows;
+    if (!iq6t_reserve(nb)) return 0;
+    const iq6_luts_t L = iq6_luts_init();
+    const size_t w_row_bytes = (size_t)nb * sizeof(block_iq6_k), y_row_bytes = (size_t)nb * sizeof(block_q8_K);
+    for (int c0 = 0; c0 < ncols; c0 += IQ6T_PC) {
+        const int pc = (ncols - c0 < IQ6T_PC) ? (ncols - c0) : IQ6T_PC;
+        for (int g = g_start; g < g_end; ++g) {
+            iq6t_decode_group((const char *)vx + (size_t)g * 8 * w_row_bytes, w_row_bytes, nb, &L);
+            float *og = out + (size_t)c0 * bs + (size_t)g * 8;
+            int cc = 0;
+#define IQ6T_RUN(NCV) iq6t_tile(nb, (const char *)vy + (size_t)(c0 + cc) * y_row_bytes, y_row_bytes, og + (size_t)cc * bs, bs, NCV)
+#if IQ6T_NCMAX >= 8
+            for (; cc + 8 <= pc; cc += 8) IQ6T_RUN(8);
+#endif
+            for (; cc + 4 <= pc; cc += 4) IQ6T_RUN(4);
+            if (cc + 2 <= pc) { IQ6T_RUN(2); cc += 2; }
+            if (cc + 1 <= pc) { IQ6T_RUN(1); cc += 1; }
+#undef IQ6T_RUN
+        }
+    }
+    return nrows;
+}
+
 #else
 
 void vec_dot_iq6_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out) {
@@ -271,7 +448,34 @@ int sgemm_iq6_k_q8_k_avx2(int nrows, int ncols, int k, const void *vx, const voi
     return 0;
 }
 
+int sgemm_iq6_k_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void *vy,
+                         float *out, size_t bs, int ith, int nth) {
+    (void)nrows; (void)ncols; (void)k; (void)vx; (void)vy; (void)out; (void)bs; (void)ith; (void)nth;
+    return 0;
+}
+
 #endif
+
+/* fn_gemm for IQ6_K: the decode-once R8 kernel for real prefill batches, the tile kernel otherwise.
+ * Always computes the full result (gemm_table_task ignores the return value).
+ * PICOLM_IQ6K_R8=0 forces the tile kernel; PICOLM_IQ6K_R8_MIN_N sets the smallest batch (default 16). */
+int sgemm_iq6_k_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy,
+                          float *out, size_t bs, int ith, int nth) {
+    static int en = -1, min_n = 16;
+    if (en < 0) {
+        const char *e = getenv("PICOLM_IQ6K_R8"), *mn = getenv("PICOLM_IQ6K_R8_MIN_N");
+        if (mn && atoi(mn) > 0) min_n = atoi(mn);
+        en = !(e && e[0] == '0');
+    }
+    if (en && ncols >= min_n) {
+        int r = sgemm_iq6_k_q8_k_r8t(nrows, ncols, k, vx, vy, out, bs, ith, nth);
+        if (r) {
+            static int traced; if (!traced && getenv("PICOLM_DISPATCH")) { traced = 1; fprintf(stderr, "TRACE kernel: sgemm_iq6_k_q8_k_r8t (decode-once R8)\n"); }
+            return r;
+        }
+    }
+    return sgemm_iq6_k_q8_k_avx2(nrows, ncols, k, vx, vy, out, bs, ith, nth);
+}
 
 /* ================================================================
  * AVX-512 VNNI path: decode-once + dpbusd, per-group scalar scale
