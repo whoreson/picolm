@@ -1684,6 +1684,34 @@ int main(int argc, char **argv) {
     int *cache_tokens = NULL;
     if (cache_file) {
         cache_pos = kvcache_load(&model, cache_file, &cache_tokens);
+        /* Sync restored CPU state to GPU: KV cache + SSM state.
+         * kvcache_load writes into the CPU key_cache/val_cache and SSM state
+         * buffers, but the GPU side is unaware.  Without this upload the GPU
+         * kernels would see whatever garbage was left from model init. */
+#ifdef PICOLM_GPU
+        if (cache_pos > 0 && model.gpu.kv_active && model.gpu.device >= 0) {
+            if (model.state.kv_type_k == KV_CACHE_F16 &&
+                model.state.kv_type_v == KV_CACHE_F16) {
+                for (int l = 0; l < model.config.n_layers; l++) {
+                    if (!model.weights.layers[l].is_attn_layer) continue;
+                    int ao = model.state.kv_layer_ordinal[l];
+                    const uint16_t *k_rows = (const uint16_t *)(model.state.key_cache +
+                        (size_t)ao * model.config.max_seq_len * model.state.kv_row_size_k);
+                    const uint16_t *v_rows = (const uint16_t *)(model.state.val_cache +
+                        (size_t)ao * model.config.max_seq_len * model.state.kv_row_size_v);
+                    picolm_gpu_kv_upload_layer(1, ao, cache_pos,
+                        k_rows, model.config.n_kv_heads, model.config.head_dim,
+                        model.config.max_seq_len, model.gpu.device);
+                    picolm_gpu_kv_upload_layer(0, ao, cache_pos,
+                        v_rows, model.config.n_kv_heads, model.config.head_dim,
+                        model.config.max_seq_len, model.gpu.device);
+                }
+                picolm_gpu_sync(model.gpu.device);
+            }
+            if (model.config.has_ssm)
+                picolm_ssm_state_sync_to_device(&model, model.gpu.device);
+        }
+#endif
     }
 
     /* Apply chat template for -pf */
