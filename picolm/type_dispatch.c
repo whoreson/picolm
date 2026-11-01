@@ -621,6 +621,49 @@ quant_buf_t quant_activations(gguf_type_t wtype, const float *x, int n_batch, in
  * offset term, rather than signed Q8_0), not tuning this function. Benchmark
  * carefully: Q8_2 needs matching kernels and its extra `s` term costs an
  * FMA per block. */
+
+/* ---- Batched activation quantization: rows are independent, so spread them over the pool. ----
+ * This used to be a serial loop on the calling thread: for a 547-token prefill the Q8_K quantizer
+ * alone cost ~40 ms per layer (IQ6_K weights) while 23 workers idled. tensor_parallel_for runs
+ * serially when nested (inside a worker) or single-threaded, so this is safe from any caller. */
+int tensor_get_n_threads(void);
+void tensor_parallel_for(int count, void (*fn)(int idx, void *ctx), void *ctx);
+#define QROWS_PAR_MIN 16
+
+typedef struct { const float *x; int n; char *qbuf; size_t qstride; float *dbuf; int use_amax; } q8_0_rows_t;
+static void q8_0_row_task(int b, void *p) {
+    const q8_0_rows_t *c = (const q8_0_rows_t *)p;
+    const float *xb = c->x + (size_t)b * c->n;
+    block_q8_0 *dst = (block_q8_0 *)(c->qbuf + (size_t)b * c->qstride);
+    quantize_row_q8_0(xb, dst, c->n);
+    float *deltas = c->dbuf + (size_t)b * (c->n / 32);
+    if (c->use_amax) {
+        /* Decode path: compute from amax (matches old matmul() behavior) */
+        int nb = c->n / 32;
+        for (int bi = 0; bi < nb; bi++) {
+            float amax = 0.0f;
+            for (int j = 0; j < 32; j++) {
+                float v = xb[bi * 32 + j];
+                if (v < 0) v = -v;
+                if (v > amax) amax = v;
+            }
+            deltas[bi] = amax / 127.0f;
+        }
+    } else {
+        /* Batched path: use fp16 round-trip (matches old matmul_batch behavior) */
+        compute_q8_0_deltas(dst, c->n, deltas);
+    }
+}
+typedef struct { const float *x; int n; char *qbuf; size_t qstride; } q8_k_rows_t;
+static void q8_k_row_task(int b, void *p) {
+    const q8_k_rows_t *c = (const q8_k_rows_t *)p;
+    quantize_row_q8_K(c->x + (size_t)b * c->n, c->qbuf + (size_t)b * c->qstride, c->n);
+}
+static void quant_rows(int n_batch, void (*task)(int, void *), void *ctx) {
+    if (n_batch >= QROWS_PAR_MIN && tensor_get_n_threads() > 1) tensor_parallel_for(n_batch, task, ctx);
+    else for (int b = 0; b < n_batch; b++) task(b, ctx);
+}
+
 quant_buf_t quant_activations_ex(gguf_type_t wtype, const float *x, int n_batch, int n,
                                   void *scratch, size_t scratch_size, int use_amax_deltas) {
     quant_buf_t qb = {0};
@@ -652,27 +695,9 @@ quant_buf_t quant_activations_ex(gguf_type_t wtype, const float *x, int n_batch,
         if (!qb.qbuf) return qb;
 
         qb.dbuf = (float *)((char *)qb.qbuf + blocks_size);
-        for (int b = 0; b < n_batch; b++) {
-            const float *xb = x + (size_t)b * n;
-            block_q8_0 *dst = (block_q8_0 *)((char *)qb.qbuf + (size_t)b * qb.qstride);
-            quantize_row_q8_0(xb, dst, n);
-            float *deltas = qb.dbuf + (size_t)b * (n / 32);
-            if (use_amax_deltas) {
-                /* Decode path: compute from amax (matches old matmul() behavior) */
-                int nb = n / 32;
-                for (int bi = 0; bi < nb; bi++) {
-                    float amax = 0.0f;
-                    for (int j = 0; j < 32; j++) {
-                        float v = xb[bi * 32 + j];
-                        if (v < 0) v = -v;
-                        if (v > amax) amax = v;
-                    }
-                    deltas[bi] = amax / 127.0f;
-                }
-            } else {
-                /* Batched path: use fp16 round-trip (matches old matmul_batch behavior) */
-                compute_q8_0_deltas(dst, n, deltas);
-            }
+        {
+            q8_0_rows_t rc = { x, n, (char *)qb.qbuf, qb.qstride, qb.dbuf, use_amax_deltas };
+            quant_rows(n_batch, q8_0_row_task, &rc);
         }
         break;
     }
@@ -691,10 +716,9 @@ quant_buf_t quant_activations_ex(gguf_type_t wtype, const float *x, int n_batch,
         }
         if (!qb.qbuf) return qb;
 
-        for (int b = 0; b < n_batch; b++) {
-            const float *xb = x + (size_t)b * n;
-            block_q8_K *dst = (block_q8_K *)((char *)qb.qbuf + (size_t)b * qb.qstride);
-            quantize_row_q8_K(xb, dst, n);
+        {
+            q8_k_rows_t rc = { x, n, (char *)qb.qbuf, qb.qstride };
+            quant_rows(n_batch, q8_k_row_task, &rc);
         }
         break;
     }

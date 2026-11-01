@@ -449,6 +449,11 @@ static volatile int    pool_gen   = 0;
 static volatile int    pool_done  = 0;
 static volatile int    pool_shutdown = 0;
 static volatile int    pool_nworkers = 0;
+/* Nesting guard: set on pool workers (permanently) and on the main thread while it runs task 0 of a
+ * generic dispatch. tensor_parallel_for* use ONE global task table, so a nested call (e.g. an attention
+ * worker calling matmul_batch -> batched activation quantization) would corrupt the outer dispatch.
+ * A nested call now just runs serially on the calling thread. */
+static __thread int tl_in_parallel = 0;
 
 /* ---- Spin-then-sleep synchronization (replaces broadcast-per-completion) ----
  *
@@ -739,6 +744,7 @@ static void *pool_worker(void *arg) {
 #endif
     int tid = (int)(size_t)arg;
     pool_my_tid = tid;
+    tl_in_parallel = 1;
     int last_gen = 0;
     for (;;) {
         int g = POOL_LD(&pool_gen);
@@ -789,6 +795,7 @@ static void *pool_worker(void *arg) {
 #endif
     int tid = (int)(size_t)arg;
     pool_my_tid = tid;
+    tl_in_parallel = 1;
     int last_gen = 0;
     win_mutex_lock(&pool_mutex);
     while (1) {
@@ -3969,7 +3976,7 @@ static const char *fn_name_hint(void (*fn)(int, void *)) {
 }
 
 void tensor_parallel_for(int count, void (*fn)(int idx, void *ctx), void *ctx) {
-    if (n_threads <= 1 || count < 2) {
+    if (n_threads <= 1 || count < 2 || tl_in_parallel) {
         for (int i = 0; i < count; i++) fn(i, ctx);
         return;
     }
@@ -4004,7 +4011,9 @@ void tensor_parallel_for(int count, void (*fn)(int idx, void *ctx), void *ctx) {
     pool_mode = 1;
     pool_wake(nt);
     /* main thread does task 0 */
+    tl_in_parallel = 1;
     generic_worker_f(&generic_tasks[0]);
+    tl_in_parallel = 0;
     pool_wait(nt);
     pool_mode = 0;
     if (prof) {
@@ -4064,7 +4073,7 @@ void tensor_parallel_for(int count, void (*fn)(int idx, void *ctx), void *ctx) {
  * wave w runs indices w*active + t, all distinct modulo max_concurrent
  * as long as max_concurrent >= active (guaranteed by the caller). */
 void tensor_parallel_for_strided(int count, void (*fn)(int idx, void *ctx), void *ctx) {
-    if (n_threads <= 1 || count < 2) {
+    if (n_threads <= 1 || count < 2 || tl_in_parallel) {
         for (int i = 0; i < count; i++) fn(i, ctx);
         return;
     }
@@ -4095,7 +4104,9 @@ void tensor_parallel_for_strided(int count, void (*fn)(int idx, void *ctx), void
     pool_mode = 1;
     pool_wake(nt);
     /* main thread does task 0 */
+    tl_in_parallel = 1;
     generic_worker_f(&generic_tasks[0]);
+    tl_in_parallel = 0;
     pool_wait(nt);
     pool_mode = 0;
     if (prof) {

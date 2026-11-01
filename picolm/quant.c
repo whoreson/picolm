@@ -2485,10 +2485,23 @@ void quantize_row_q8_K(const float *x, void *dst, int n) {
     for (int i = 0; i < nb; i++) {
         const float *xb = x + i * 256;
         float amax = 0.0f;
+#if defined(PICOLM_AVX)
+        {   /* branchless max |x|: same value as the scalar scan (NaN lanes are ignored by max_ps(ax, vm)) */
+            const __m256 sgn = _mm256_set1_ps(-0.0f);
+            __m256 vm = _mm256_setzero_ps();
+            for (int j = 0; j < 256; j += 8)
+                vm = _mm256_max_ps(_mm256_andnot_ps(sgn, _mm256_loadu_ps(xb + j)), vm);
+            __m128 h = _mm_max_ps(_mm256_castps256_ps128(vm), _mm256_extractf128_ps(vm, 1));
+            h = _mm_max_ps(h, _mm_movehl_ps(h, h));
+            h = _mm_max_ss(h, _mm_shuffle_ps(h, h, 1));
+            amax = _mm_cvtss_f32(h);
+        }
+#else
         for (int j = 0; j < 256; ++j) {
             float ax = xb[j] < 0 ? -xb[j] : xb[j];
             if (ax > amax) amax = ax;
         }
+#endif
         if (amax == 0.0f) {
             /* All activations zero: set zero scale/qs/bsums to avoid inf/NaN */
             y[i].d = 0.0f;
