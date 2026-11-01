@@ -854,9 +854,56 @@ static void checkpoint_save(int n_tokens) {
     checkpoint_print_list("after creation");
 }
 
+/* Drop every checkpoint positioned strictly after 'pos' (the trailing part of
+ * the list, which is sorted by n_tokens ascending).
+ * Called right after rewinding to an earlier checkpoint: those snapshots
+ * describe a state trajectory that no longer exists, and any new checkpoint
+ * created while the context regrows past 'pos' supersedes them.
+ * Returns the number of checkpoints freed. */
+static int checkpoint_prune_after(int pos) {
+    picolm_checkpoint_t *prev = NULL;
+    picolm_checkpoint_t *cur = srv.checkpoints;
+    while (cur && cur->n_tokens <= pos) {
+        prev = cur;
+        cur = cur->next;
+    }
+    if (!cur) return 0; /* nothing after 'pos' */
+
+    if (prev) prev->next = NULL;
+    else srv.checkpoints = NULL;
+
+    int n_dropped = 0;
+    while (cur) {
+        picolm_checkpoint_t *next = cur->next;
+        free(cur->data);
+        free(cur);
+        cur = next;
+        n_dropped++;
+    }
+
+    fprintf(stderr, "  [ssm checkpoint] pruned %d stale checkpoint(s) after n_tokens=%d, %d remaining",
+            n_dropped, pos, checkpoint_count());
+    if (srv.checkpoints) {
+        fprintf(stderr, " (");
+        int idx = 0;
+        for (picolm_checkpoint_t *cp = srv.checkpoints; cp; cp = cp->next) {
+            if (idx++ > 0) fprintf(stderr, ", ");
+            fprintf(stderr, "%d", cp->n_tokens);
+        }
+        fprintf(stderr, ")");
+    }
+    fprintf(stderr, "\n");
+    return n_dropped;
+}
+
 /* Restore checkpoint at or before the given n_tokens.
  * Returns 0 on success (checkpoint restored), -1 if no suitable checkpoint found.
- * On success, *actual_n_tokens is set to the checkpoint's n_tokens. */
+ * On success, *actual_n_tokens is set to the checkpoint's n_tokens.
+ *
+ * Position-wise "future" checkpoints (n_tokens > the restored one) are erased
+ * immediately: they belong to a state trajectory that has just been abandoned,
+ * and keeping them around until the context regrows past them would only waste
+ * memory (and let checkpoint_save() evict a *live* checkpoint instead). */
 static int checkpoint_restore(int n_tokens, int *actual_n_tokens) {
     /* Allow restore even when checkpoint-max=0, as long as checkpoints
      * were loaded from a slot save file. Saving is gated by max_checkpoints. */
@@ -874,6 +921,9 @@ static int checkpoint_restore(int n_tokens, int *actual_n_tokens) {
     }
 
     if (!best) return -1;
+
+    /* Drop the now-useless checkpoints beyond the rewind point */
+    checkpoint_prune_after(best->n_tokens);
 
     /* Restore SSM state from checkpoint */
     size_t read = model_ssm_state_restore(&srv.model, best->data, srv.checkpoint_snapshot_size);
@@ -1134,6 +1184,14 @@ static float *prefill_with_checkpoints(SOCKET sock, model_t *model,
     int tail_pos = start_pos + n_prefill - srv.checkpoint_tail_offset;
     if (tail_pos < start_pos) tail_pos = start_pos; /* clamp */
 
+    /* If the KV cache was rewound to an earlier position without going through
+     * checkpoint_restore() (e.g. stepback on a fully cached prompt), any
+     * checkpoint past 'start_pos' describes an abandoned trajectory. Erase it
+     * now instead of keeping it in memory until the context regrows past it. */
+    if (model->config.has_ssm && srv.max_checkpoints > 0 && srv.checkpoints) {
+        checkpoint_prune_after(start_pos);
+    }
+
     int offset = 0;
     while (offset < n_prefill) {
         int cur_pos = start_pos + offset;
@@ -1154,7 +1212,11 @@ static float *prefill_with_checkpoints(SOCKET sock, model_t *model,
             if (chunk_size <= 0) chunk_size = 1;
 
             /* Save checkpoint before processing this chunk */
-            if (offset > 0) checkpoint_save(cur_pos);
+            if (offset > 0) {
+                /* Belt and braces: never let a stale future checkpoint survive */
+                checkpoint_prune_after(cur_pos);
+                checkpoint_save(cur_pos);
+            }
         } else {
             /* Progress-driven chunking: use ubatch_size */
             chunk_size = (remaining < ubatch_size) ? remaining : ubatch_size;
@@ -2573,7 +2635,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             if (n_prefill_ns > 0) {
                 /* Checkpoint-aware prefill */
                 logits_ns = prefill_with_checkpoints(sock, model, ptokens + start_pos, n_prefill_ns, start_pos, &n_processed_ns, 1,
-                                                     0, n_prompt, start_pos, t_start_ns);
+                                                     0, n_prompt, cache_start, t_start_ns);
             }
 
             /* Save cache: only the tokens actually processed */
@@ -3192,7 +3254,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         if (n_prefill_ns2 > 0) {
             /* Checkpoint-aware prefill */
             logits_ns2 = prefill_with_checkpoints(sock, model, ptokens + start_pos, n_prefill_ns2, start_pos, &n_processed_ns2, 1,
-                                                  0, n_prompt, start_pos, t_start);
+                                                  0, n_prompt, cache_start, t_start);
         }
 
         t_prefill_end_ns = get_time_ms();
