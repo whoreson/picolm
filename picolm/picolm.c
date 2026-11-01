@@ -69,6 +69,7 @@ double get_time_ms(void) {
 #include <time.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <fcntl.h>
 #endif
 double get_time_ms(void) {
 #ifdef _WIN32
@@ -1384,8 +1385,9 @@ int main(int argc, char **argv) {
         num_threads = tensor_default_threads();
     }
 
-    /* Default checkpoint_max is 3 for --server mode; disable for non-server */
-    if (!server_mode) checkpoint_max = 0;
+    /* Default checkpoint_max is 3 for --server mode.  For CLI, enable when
+     * --cache is used (SSM checkpoints are appended to the cache file). */
+    if (!server_mode && !cache_file) checkpoint_max = 0;
 
     /* Server mode: start HTTP server (no prompt needed) */
     if (server_mode) {
@@ -1679,6 +1681,17 @@ int main(int argc, char **argv) {
         if (sr) { fprintf(stderr, "ERROR: steering setup failed\n"); model_free(&model); return 1; }
     }
 
+    /* SSM checkpoint support for CLI (used with --cache for hybrid models).
+     * Lightweight linked-list of snapshots; appended to the cache file on save. */
+    typedef struct cli_checkpoint {
+        int n_tokens;
+        uint8_t *data;
+        struct cli_checkpoint *next;
+    } cli_checkpoint_t;
+    static cli_checkpoint_t *cli_checkpoints = NULL;
+    static size_t cli_checkpoint_snapshot_size = 0;
+    static uint8_t *cli_checkpoint_scratch = NULL;
+
     /* Try to load KV cache (skip prefill for cached prompt) */
     int cache_pos = 0;
     int *cache_tokens = NULL;
@@ -1712,6 +1725,96 @@ int main(int argc, char **argv) {
                 picolm_ssm_state_sync_to_device(&model, model.gpu.device);
         }
 #endif
+        /* Initialize SSM checkpoint system for CLI */
+        if (model.config.has_ssm && checkpoint_max > 0) {
+            cli_checkpoint_snapshot_size = model_ssm_snapshot_size(&model);
+            if (cli_checkpoint_snapshot_size > 0) {
+                cli_checkpoint_scratch = (uint8_t *)malloc(cli_checkpoint_snapshot_size);
+                fprintf(stderr, "[cli] SSM checkpointing: max=%d, gen_interval=%d, snapshot=%.1fMB\n",
+                        checkpoint_max, checkpoint_interval_gen,
+                        (double)cli_checkpoint_snapshot_size / (1024.0 * 1024.0));
+                /* Load checkpoints appended to the cache file (after main KV+SSM data).
+                 * Same format as the server's slot save: 0x43505350 magic + count + entries. */
+                {
+                    /* Calculate where KV data ends in the file by re-reading the header */
+#ifdef _WIN32
+                    int fd = _open(cache_file, _O_RDONLY | _O_BINARY);
+#else
+                    int fd = open(cache_file, O_RDONLY);
+#endif
+                    if (fd >= 0) {
+                        uint32_t header[14];
+                        ssize_t hr = read(fd, header, sizeof(uint32_t) * 13);
+                        if (hr == (ssize_t)sizeof(uint32_t) * 13) {
+                            int ver = header[0] & 0xF;
+                            int file_n_pos = (int)header[1];
+                            int file_layers = (int)header[2];
+                            int file_n_kv_heads = (int)header[3];
+                            int file_head_dim = (int)header[4];
+                            int kv_type_k = (int)header[5];
+                            int kv_type_v = (int)header[6];
+                            uint32_t ssm_sz = header[10];
+                            off_t kv_end = (off_t)sizeof(uint32_t) * (ver >= 5 ? 14 : 13);
+                            if (ver >= 4) {
+                                kv_end += (off_t)file_n_pos * (off_t)sizeof(uint32_t); /* tokens */
+                                /* Layer bitmap */
+                                uint8_t *layer_map = (uint8_t *)alloca(file_layers);
+                                lseek(fd, kv_end, SEEK_SET);
+                                read(fd, layer_map, file_layers);
+                                kv_end += file_layers;
+                                int attn_layers = 0;
+                                for (int l = 0; l < file_layers; l++) if (layer_map[l]) attn_layers++;
+                                size_t ps_k = kv_type_k == 0 ? (size_t)file_n_kv_heads * file_head_dim * sizeof(uint16_t)
+                                               : kv_type_k == 1 ? ((size_t)file_n_kv_heads * file_head_dim / 32) * sizeof(block_q8_0)
+                                               : kv_type_k == 2 ? ((size_t)file_n_kv_heads * file_head_dim / 32) * sizeof(block_q4_0)
+                                               : (size_t)file_n_kv_heads * file_head_dim * sizeof(float);
+                                size_t ps_v = kv_type_v == 0 ? (size_t)file_n_kv_heads * file_head_dim * sizeof(uint16_t)
+                                               : kv_type_v == 1 ? ((size_t)file_n_kv_heads * file_head_dim / 32) * sizeof(block_q8_0)
+                                               : kv_type_v == 2 ? ((size_t)file_n_kv_heads * file_head_dim / 32) * sizeof(block_q4_0)
+                                               : (size_t)file_n_kv_heads * file_head_dim * sizeof(float);
+                                kv_end += (off_t)attn_layers * file_n_pos * (off_t)(ps_k + ps_v);
+                            }
+                            if (ver >= 4 && ssm_sz > 0) kv_end += (off_t)ssm_sz;
+                            /* GLM-5 blob (v5) */
+                            if (ver >= 5 && header[13] > 0) kv_end += (off_t)header[13];
+
+                            lseek(fd, kv_end, SEEK_SET);
+                            uint32_t cp_magic;
+                            if (read(fd, &cp_magic, sizeof(cp_magic)) == sizeof(cp_magic) && cp_magic == 0x43505350) {
+                                uint32_t cp_count;
+                                if (read(fd, &cp_count, sizeof(cp_count)) == sizeof(cp_count) && cp_count > 0 && cp_count <= 128) {
+                                    for (uint32_t i = 0; i < cp_count; i++) {
+                                        uint32_t cp_n;
+                                        if (read(fd, &cp_n, sizeof(cp_n)) != sizeof(cp_n)) break;
+                                        cli_checkpoint_t *cp = (cli_checkpoint_t *)calloc(1, sizeof(*cp));
+                                        if (cp) {
+                                            cp->n_tokens = (int)cp_n;
+                                            cp->data = (uint8_t *)malloc(cli_checkpoint_snapshot_size);
+                                            if (cp->data) {
+                                                if ((ssize_t)read(fd, cp->data, cli_checkpoint_snapshot_size) == (ssize_t)cli_checkpoint_snapshot_size) {
+                                                    /* Insert in sorted order */
+                                                    cli_checkpoint_t *prev = NULL, *cur = cli_checkpoints;
+                                                    while (cur && cur->n_tokens < cp->n_tokens) { prev = cur; cur = cur->next; }
+                                                    if (prev) prev->next = cp; else cli_checkpoints = cp;
+                                                    cp->next = cur;
+                                                } else { free(cp->data); free(cp); }
+                                            } else free(cp);
+                                        }
+                                    }
+                                    { int nc = 0; for (cli_checkpoint_t *c = cli_checkpoints; c; c = c->next) nc++;
+                                      fprintf(stderr, "[cli] Loaded %d SSM checkpoints from cache file\n", nc); }
+                                }
+                            }
+                        }
+#ifdef _WIN32
+                        _close(fd);
+#else
+                        close(fd);
+#endif
+                    }
+                }
+            }
+        }
     }
 
     /* Apply chat template for -pf */
@@ -1777,11 +1880,53 @@ int main(int argc, char **argv) {
         exit(0);
     }
 
-    /* If cache covers part of the prompt, skip those positions */
+    /* Find how many prompt tokens match the cached prefix (same as server path).
+     * cache_tokens holds the token sequence from the saved file; compare against
+     * the new prompt to find the longest matching prefix. */
     int start_pos = 0;
-    if (cache_pos > 0 && cache_pos <= n_prompt) {
-        start_pos = cache_pos;
-        fprintf(stderr, "Skipping %d cached prompt tokens\n", start_pos);
+    if (cache_tokens && cache_pos > 0) {
+        int min_len = n_prompt < cache_pos ? n_prompt : cache_pos;
+        for (start_pos = 0; start_pos < min_len; start_pos++) {
+            if (prompt_tokens[start_pos] != cache_tokens[start_pos]) break;
+        }
+        /* For SSM models: the cached SSM state corresponds to position cache_pos.
+         * If cache_pos > start_pos, the SSM state is from a point beyond where the
+         * matching prefix ends, so we can't trust it.  Only use the cache when the
+         * SSM state aligns (cache_pos == start_pos, i.e. the cache ends exactly at
+         * the prompt boundary or matches the full prompt).  Otherwise reset SSM
+         * and re-prefill; the attention KV cache is still valid. */
+        if (model.config.has_ssm && cache_pos > start_pos) {
+            /* SSM state in the file is from position cache_pos, but we need it at start_pos.
+             * Try to restore a checkpoint at or before start_pos. */
+            int cp_found = 0;
+            cli_checkpoint_t *best = NULL;
+            for (cli_checkpoint_t *cp = cli_checkpoints; cp; cp = cp->next) {
+                if (cp->n_tokens <= start_pos) best = cp;
+                else break; /* sorted list */
+            }
+            if (best && best->data) {
+                size_t rd = model_ssm_state_restore(&model, best->data, cli_checkpoint_snapshot_size);
+                if (rd == cli_checkpoint_snapshot_size) {
+                    start_pos = best->n_tokens;
+                    cp_found = 1;
+                    fprintf(stderr, "KV cache: %d/%d tokens match, restored SSM checkpoint at pos %d (%d new to prefill)\n",
+                            n_prompt, n_prompt, start_pos, n_prompt - start_pos);
+                }
+            }
+            if (!cp_found) {
+                fprintf(stderr, "KV cache: %d/%d tokens match but SSM state is at pos %d (need %d), no checkpoint available, resetting SSM and re-prefilling\n",
+                        n_prompt, n_prompt, cache_pos, n_prompt);
+                model_ssm_state_reset(&model);
+#ifdef PICOLM_GPU
+                if (model.gpu.kv_active && model.gpu.device >= 0)
+                    model_ssm_state_reset_gpu(&model, model.gpu.device);
+#endif
+                start_pos = 0;
+            }
+        } else {
+            fprintf(stderr, "KV cache reuse: %d/%d prompt tokens match (%d new to prefill)\n",
+                    start_pos, n_prompt, n_prompt - start_pos);
+        }
     }
 
     fprintf(stderr, "Prompt: %d tokens, generating up to %d (temp=%.2f, top_p=%.2f, threads=%d)\n",
@@ -2010,60 +2155,54 @@ int main(int argc, char **argv) {
     double t_first_token = 0;
     double t_end = 0;
 
-    int pos = start_pos;
+    int pos = 0;
 
     /* Truncate prompt if it exceeds context size */
-    if (start_pos + n_prompt > model.config.max_seq_len) {
+    if (n_prompt > model.config.max_seq_len) {
         int orig_n_prompt = n_prompt;
-        n_prompt = model.config.max_seq_len - start_pos;
-        fprintf(stderr, "Truncating prompt from %d to %d tokens to fit context %d (start_pos=%d)\n",
-                orig_n_prompt, n_prompt, model.config.max_seq_len, start_pos);
+        n_prompt = model.config.max_seq_len;
+        fprintf(stderr, "Truncating prompt from %d to %d tokens to fit context %d\n",
+                orig_n_prompt, n_prompt, model.config.max_seq_len);
     }
 
     /* Cap max_tokens so total context doesn't exceed model limit */
-    if (start_pos + n_prompt + max_tokens > model.config.max_seq_len) {
+    if (n_prompt + max_tokens > model.config.max_seq_len) {
         int orig_max_tokens = max_tokens;
-        max_tokens = model.config.max_seq_len - start_pos - n_prompt;
+        max_tokens = model.config.max_seq_len - n_prompt;
         if (max_tokens < 0) max_tokens = 0;
         if (orig_max_tokens != max_tokens) {
-            fprintf(stderr, "Capping max_tokens from %d to %d to fit context %d (start_pos=%d, prompt=%d)\n",
-                    orig_max_tokens, max_tokens, model.config.max_seq_len, start_pos, n_prompt);
+            fprintf(stderr, "Capping max_tokens from %d to %d to fit context %d (prompt=%d)\n",
+                    orig_max_tokens, max_tokens, model.config.max_seq_len, n_prompt);
         }
     }
 
-    int total_steps = start_pos + n_prompt + max_tokens;
-    if (total_steps > model.config.max_seq_len) {
+    int total_steps = n_prompt + max_tokens;    if (total_steps > model.config.max_seq_len) {
         total_steps = model.config.max_seq_len;
     }
 
-    /* Batch prefill: process all prompt tokens at once */
+    /* Batch prefill: process only the NEW prompt tokens (the first start_pos are cached) */
     float *logits = NULL;
-    if (n_prompt > 0) {
-        /* All models use model_forward_prefill.
-         * SSM models: batched by default, use --ssm-serial for per-token path. */
+    if (n_prompt - start_pos > 0) {
+        /* Only prefill the NEW tokens (the first start_pos are already cached). */
+        int n_new = n_prompt - start_pos;
+        const int *prefill_tokens = prompt_tokens + start_pos;
         #ifdef PICOLM_GPU
         int gpu_prefill_used = 0;
 #endif
 #ifdef PICOLM_GPU
         if (model.gpu.kv_active) {
-            /* KV cache comparison: run both CPU and GPU prefills, compare */
-            if (getenv("PICOLM_KV_COMPARE")) {
-                fprintf(stderr, "[PICOLM] KV_COMPARE triggered, calling _kv_compare_prefills\n");
-                extern void _kv_compare_prefills(model_t *m, int *tokens, int n_tokens, int device);
-                _kv_compare_prefills(&model, prompt_tokens, n_prompt, 0);
-            }
-            logits = model_forward_prefill_gpu(&model, prompt_tokens, n_prompt, start_pos, NULL);
+            logits = model_forward_prefill_gpu(&model, prefill_tokens, n_new, start_pos, NULL);
             if (logits) {
                 gpu_prefill_used = 1;
             } else {
-                logits = model_forward_prefill(&model, prompt_tokens, n_prompt, start_pos, NULL);
+                logits = model_forward_prefill(&model, prefill_tokens, n_new, start_pos, NULL);
             }
         } else
 #endif
         {
-            logits = model_forward_prefill(&model, prompt_tokens, n_prompt, start_pos, NULL);
+            logits = model_forward_prefill(&model, prefill_tokens, n_new, start_pos, NULL);
         }
-        pos = start_pos + n_prompt - 1;
+        pos = start_pos + n_new - 1;  /* = n_prompt - 1 */
         /* Sync SSM state from host to device after CPU prefill only.
          * After GPU prefill, the device already has correct state and
          * syncing stale CPU state would overwrite it. */
@@ -2072,6 +2211,19 @@ int main(int argc, char **argv) {
             picolm_ssm_state_sync_to_device(&model, model.gpu.device);
         }
 #endif
+    } else if (n_prompt > 0) {
+        /* Prompt fully cached: skip prefill, start generating from the last cached position */
+        pos = n_prompt - 1;
+        /* Need logits for the first decode step */
+#ifdef PICOLM_GPU
+        if (model.gpu.kv_active) {
+            logits = model_forward_gpu(&model, prompt_tokens[n_prompt - 1], pos + 1);
+            if (!logits) logits = model_forward(&model, prompt_tokens[n_prompt - 1], pos + 1);
+        } else
+#endif
+        {
+            logits = model_forward(&model, prompt_tokens[n_prompt - 1], pos + 1);
+        }
     } else {
         /* No prompt: just generate from BOS */
         logits = model_forward(&model, tokenizer.bos_id, pos);
@@ -2079,6 +2231,7 @@ int main(int argc, char **argv) {
 
     int token = 0;
     int next = 0;
+
     for (; pos < total_steps; pos++) {
         /* Generation: apply grammar constraints, then sample */
         if (t_first_token == 0) {
@@ -2142,6 +2295,26 @@ int main(int argc, char **argv) {
 
         total_gen++;
 
+        /* Generation checkpoint: every checkpoint_interval_gen tokens */
+        if (checkpoint_max > 0 && model.config.has_ssm && cli_checkpoint_snapshot_size > 0
+            && total_gen % checkpoint_interval_gen == 0) {
+            /* Evict if at capacity */
+            { int n_cp = 0; for (cli_checkpoint_t *c = cli_checkpoints; c; c = c->next) n_cp++;
+              while (n_cp >= checkpoint_max && cli_checkpoints) {
+                  cli_checkpoint_t *old = cli_checkpoints; cli_checkpoints = old->next;
+                  free(old->data); free(old); n_cp--; } }
+            cli_checkpoint_t *cp = (cli_checkpoint_t *)calloc(1, sizeof(*cp));
+            cp->n_tokens = start_pos + n_prompt + total_gen;
+            cp->data = (uint8_t *)malloc(cli_checkpoint_snapshot_size);
+            size_t written = model_ssm_state_save(&model, cp->data, cli_checkpoint_snapshot_size);
+            if (written == 0) { free(cp->data); free(cp); cp = NULL; }
+            if (cp) { /* Insert in sorted order */
+                cli_checkpoint_t *prev = NULL, *cur = cli_checkpoints;
+                while (cur && cur->n_tokens < cp->n_tokens) { prev = cur; cur = cur->next; }
+                if (prev) prev->next = cp; else cli_checkpoints = cp;
+                cp->next = cur; }
+        }
+
         /* Stop on EOS or grammar completion */
         if (next == (int)tokenizer.eos_id) break;
         if (grammar_is_complete(&grammar)) break;
@@ -2184,11 +2357,70 @@ int main(int argc, char **argv) {
     printf("\n");
     t_end = get_time_ms();
 
-    /* Save KV cache if requested */
+    /* Save KV cache if requested: save the FULL conversation (prompt + generated tokens),
+     * then append SSM checkpoints to the same file.  This way the next --cache load
+     * restores the complete state and can continue generating from where we left off. */
     if (cache_file && n_prompt > 0) {
-        kvcache_save(&model, cache_file, n_prompt, prompt_tokens);
+        int total_tokens = n_prompt + total_gen;
+        /* Build full token array: prompt + generated tokens */
+        int *all_tokens = (int *)malloc((size_t)total_tokens * sizeof(int));
+        memcpy(all_tokens, prompt_tokens, (size_t)n_prompt * sizeof(int));
+        /* Append generated tokens by re-tokenizing the output buffer. */
+        { int gen_so_far = n_prompt;
+          gen_buf[gen_buf_len] = '\0';
+          if (use_qwen_tok)
+              gen_so_far += qwen_tokenize_encode(&qwen_enc, gen_buf, all_tokens + gen_so_far, total_tokens - gen_so_far);
+          else
+              gen_so_far += tokenizer_encode(&tokenizer, gen_buf, all_tokens + gen_so_far, total_tokens - gen_so_far, 0);
+          total_tokens = gen_so_far; }
+
+        kvcache_save(&model, cache_file, total_tokens, all_tokens);
+
+        /* Append checkpoints to the file (after main KV+SSM data) */
+        { int n_cps = 0; for (cli_checkpoint_t *c = cli_checkpoints; c; c = c->next) n_cps++;
+          if (n_cps > 0 && cli_checkpoint_snapshot_size > 0) {
+#ifdef _WIN32
+              int fd = _open(cache_file, _O_WRONLY | _O_APPEND | _O_BINARY);
+#else
+              int fd = open(cache_file, O_WRONLY | O_APPEND);
+#endif
+              if (fd >= 0) {
+                  uint32_t cp_magic = 0x43505350; /* "CSPS" backwards */
+                  uint32_t cp_count = (uint32_t)n_cps;
+#ifdef _WIN32
+                  _write(fd, (char *)&cp_magic, sizeof(cp_magic));
+                  _write(fd, (char *)&cp_count, sizeof(cp_count));
+#else
+                  write(fd, &cp_magic, sizeof(cp_magic));
+                  write(fd, &cp_count, sizeof(cp_count));
+#endif
+                  cli_checkpoint_t *cp = cli_checkpoints;
+                  while (cp) {
+                      uint32_t cp_n = (uint32_t)cp->n_tokens;
+#ifdef _WIN32
+                      _write(fd, (char *)&cp_n, sizeof(cp_n));
+                      _write(fd, (char *)cp->data, (unsigned)cli_checkpoint_snapshot_size);
+#else
+                      write(fd, &cp_n, sizeof(cp_n));
+                      write(fd, cp->data, (unsigned)cli_checkpoint_snapshot_size);
+#endif
+                      cp = cp->next;
+                  }
+#ifdef _WIN32
+                  _close(fd);
+#else
+                  close(fd);
+#endif
+                  fprintf(stderr, "\n[cli] Saved %d SSM checkpoints (%.1f MB total)\n",
+                          n_cps, (double)n_cps * (double)cli_checkpoint_snapshot_size / (1024*1024));
+              }
+          } }
+        free(all_tokens);
     }
     free(cache_tokens);
+    /* Free checkpoints */
+    { for (cli_checkpoint_t *c = cli_checkpoints; c; ) { cli_checkpoint_t *n = c->next; free(c->data); free(c); c = n; } cli_checkpoints = NULL; }
+    free(cli_checkpoint_scratch); cli_checkpoint_scratch = NULL;
 
     double total_time = (t_end - t_start) / 1000.0;
     if (t_first_token == 0) t_first_token = t_end;
