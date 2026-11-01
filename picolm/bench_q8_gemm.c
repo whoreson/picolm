@@ -13,6 +13,7 @@ void fp16_table_init(void);
 static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec*1e-9;}
 static unsigned rs=1; static float fr(void){rs=rs*1664525u+1013904223u;return ((rs>>8)&0xFFFF)/32768.0f-1.0f;}
 
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512VL__)
 static double peak_vnni512(void){
     __m512i a0=_mm512_set1_epi32(1),a1=a0,a2=a0,a3=a0,a4=a0,a5=a0,a6=a0,a7=a0,a8=a0,a9=a0,a10=a0,a11=a0;
     __m512i x=_mm512_set1_epi8(3), y=_mm512_set1_epi8(5);
@@ -25,6 +26,9 @@ static double peak_vnni512(void){
     }
     double dt=now()-t0; return (double)N*12*128/dt/1e9;   /* 64 MACs = 128 ops per instr */
 }
+#else
+static double peak_vnni512(void){return 0.0;}
+#endif
 static double peak_avx2_madd(void){
     __m256i a0=_mm256_set1_epi32(1),a1=a0,a2=a0,a3=a0,a4=a0,a5=a0,a6=a0,a7=a0; __m256i x=_mm256_set1_epi8(3),y=_mm256_set1_epi8(5),m1=_mm256_set1_epi16(1);
     long N=20000000; double t0=now();
@@ -39,6 +43,7 @@ static double peak_avx2_madd(void){
     }
     double dt=now()-t0; return (double)N*8*64/dt/1e9;
 }
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512VL__)
 static double peak_vnni256(void){
     __m256i a0=_mm256_set1_epi32(1),a1=a0,a2=a0,a3=a0,a4=a0,a5=a0,a6=a0,a7=a0,a8=a0,a9=a0,a10=a0,a11=a0;
     __m256i x=_mm256_set1_epi8(3), y=_mm256_set1_epi8(5);
@@ -51,6 +56,9 @@ static double peak_vnni256(void){
     }
     double dt=now()-t0; return (double)N*12*64/dt/1e9;   /* 32 MACs = 64 ops per ymm dpbusd */
 }
+#else
+static double peak_vnni256(void){return 0.0;}
+#endif
 typedef struct {int which,m,n,k,nb,nth; const void *W,*R,*B; const float *Bd; float *C;} gctx_t;
 static void gtask(int idx, void *p){
     gctx_t *g=(gctx_t*)p;
@@ -59,7 +67,13 @@ static void gtask(int idx, void *p){
     else if(g->which==2) sgemm_q8_0_r8_vnni_q8_0(g->m,g->n,g->k,g->R,g->B,g->C,g->m,idx,g->nth);
     else picolm_sgemm_q8_0_vnni(g->m,g->n,g->nb,g->W,g->nb,g->B,g->nb,g->C,g->m,idx,g->nth);
 }
+static int vnni_available(void){   /* the plain-Q8_0 VNNI entry is a stub returning 0 in builds without AVX-512 VNNI+VL */
+    static block_q8_0 w[8], y[1]; static float c[8]; memset(w,0,sizeof w); memset(y,0,sizeof y);
+    return picolm_sgemm_q8_0_vnni(8,1,1,w,1,y,1,c,8,0,1)!=0;
+}
 static int check_mode(void){
+    const int have_vnni=vnni_available();
+    if(!have_vnni) printf("note: no AVX-512 VNNI+VL in this build: checking the R8 wrapper (AVX2 fallback) only\n");
     /* edge shapes: remainder column tiles (n%12), odd group counts per thread, tiny k, strided ld */
     int ms[]={8,16,24,40,200}, ns[]={1,2,3,5,7,11,12,13,25,95,96,97,200}, ks[]={32,64,1056}, ths[]={1,2,3,7};
     int bad=0,total=0; unsigned s=7;
@@ -74,7 +88,7 @@ static int check_mode(void){
         if(n>=2) picolm_sgemm_d(m,n,nb,W,lda,B,ldb,Bd,ldb,C1,m,GGUF_TYPE_Q8_0,0,1);
         else { /* sgemm_d needs n>=2: build reference by scalar math */
             for(int cc=0;cc<n;cc++)for(int r=0;r<m;r++){double acc=0;for(int q=0;q<nb;q++){int is=0;for(int i=0;i<32;i++)is+=W[(size_t)r*lda+q].qs[i]*B[(size_t)cc*ldb+q].qs[i];acc+=(double)is*fp16_to_fp32(W[(size_t)r*lda+q].d)*Bd[(size_t)cc*ldb+q];}C1[(size_t)cc*m+r]=(float)acc;} }
-        int ok=1; for(int th=0;th<nth;th++) ok&=picolm_sgemm_q8_0_vnni(m,n,nb,W,lda,B,ldb,C2,m,th,nth);
+        int ok=1; if(have_vnni) for(int th=0;th<nth;th++) ok&=picolm_sgemm_q8_0_vnni(m,n,nb,W,lda,B,ldb,C2,m,th,nth);
         /* R8 wrapper (fn_gemm for Q8_0_R8): repack the same bytes, activations must be contiguous (ldb==nb) */
         if(ldb==nb){
             block_q8_0_r8 *R8=malloc((size_t)(m/8)*nb*sizeof(block_q8_0_r8));
@@ -87,7 +101,7 @@ static int check_mode(void){
             if(m3>1e-4*rr+1e-3){ok=0;printf("FAIL r8-best m=%d n=%d k=%d nth=%d maxdiff=%.3g\n",m,n,k,nth,m3);}
             free(R8);free(C3);
         }
-        double md=0,rm=0; for(size_t i=0;i<(size_t)n*m;i++){double d=fabs(C1[i]-C2[i]);if(d>md)md=d;rm+=C1[i]*C1[i];} rm=sqrt(rm/((size_t)n*m)+1e-30);
+        double md=0,rm=0; for(size_t i=0;i<(size_t)n*m;i++){double d=have_vnni?fabs(C1[i]-C2[i]):0.0;if(d>md)md=d;rm+=C1[i]*C1[i];} rm=sqrt(rm/((size_t)n*m)+1e-30);
         total++; if(!ok||md>1e-4*rm+1e-3){bad++;printf("FAIL m=%d n=%d k=%d nth=%d ok=%d maxdiff=%.3g rms=%.3g\n",m,n,k,nth,ok,md,rm);}
         free(W);free(B);free(Bd);free(tmp);free(C1);free(C2);
     }
@@ -135,7 +149,8 @@ int main(int argc,char**argv){
     printf("  sgemm_q8_0_r8_vnni (new, 12-col)  : %7.1f GOPS   max|A-V|=%.2e%s\n",gV,mdV,okV?"":"   (unavailable: needs AVX-512 VNNI+VL build)");
     printf("  picolm_sgemm_q8_0_vnni (plain Q8_0 weights, on-the-fly repack): %7.1f GOPS   max|A-P|=%.2e   speedup vs current: %.2fx%s\n",gP,mdP,gA>0?gP/gA:0,okP?"":"   (unavailable)");
     printf("  per-core peaks: VNNI zmm %.1f | VNNI ymm %.1f | AVX2 maddubs chain %.1f GOPS\n",pv,pv2,pa);
-    printf("  efficiency vs ymm-VNNI peak: current %.1f%%  r8-avx2 %.1f%%  r8-vnni %.1f%%   (speedup of r8-vnni over current: %.2fx)\n",gA/pv2*100,gB/pv2*100,gV/pv2*100,gA>0?gV/gA:0);
+    if(pv2>0) printf("  efficiency vs ymm-VNNI peak: current %.1f%%  r8-avx2 %.1f%%  r8-vnni %.1f%%   (speedup of r8-vnni over current: %.2fx)\n",gA/pv2*100,gB/pv2*100,gV/pv2*100,gA>0?gV/gA:0);
+    else printf("  (no AVX-512 VNNI in this build: VNNI peaks/kernels not available)\n");
     if(nth>1){
         float *CT=calloc((size_t)n*m,sizeof(float));
         for(int which=0;which<4;which++){ if((which==2&&!okV)||(which==3&&!okP))continue;
