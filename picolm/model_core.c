@@ -94,6 +94,26 @@ extern int cudaProfilerStop(void);
 #include <pthread.h>
 #endif
 
+/* ---- Prefill phase timer: PICOLM_PREFILL_PROF=1 prints wall time per phase of the batched
+ * forward (summed over layers) after every batched call. Marks sit at the END of a phase and
+ * attribute the time since the previous mark; everything is a no-op when the env var is unset. ---- */
+#include <time.h>
+static int pp_on = -1;
+static double pp_acc[8], pp_t;
+static const char *const pp_names[8] = {
+    "rmsnorm (input)", "Q projection", "K+V projection", "RoPE + KV-cache store (+Q/KV prep)",
+    "attention", "output proj + gate + residual", "FFN (norm, gate/up, silu, down, residual)", "other" };
+static double pp_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1e3 + ts.tv_nsec * 1e-6; }
+#define PP_BEGIN() do { if (pp_on < 0) pp_on = getenv("PICOLM_PREFILL_PROF") != NULL; if (pp_on) pp_t = pp_now(); } while (0)
+#define PP_MARK(i) do { if (pp_on) { double _t = pp_now(); pp_acc[i] += _t - pp_t; pp_t = _t; } } while (0)
+static void pp_report(int n_tokens, int n_layers) {
+    if (pp_on != 1 || n_tokens < 2) return;
+    double sum = 0; for (int i = 0; i < 8; i++) sum += pp_acc[i];
+    fprintf(stderr, "[PREFILL-PROF] n_tokens=%d layers=%d  timed=%.0f ms (%.1f ms/token)\n", n_tokens, n_layers, sum, sum / n_tokens);
+    for (int i = 0; i < 7; i++) fprintf(stderr, "  %-44s %9.1f ms  %5.1f%%\n", pp_names[i], pp_acc[i], sum > 0 ? 100.0 * pp_acc[i] / sum : 0.0);
+    memset(pp_acc, 0, sizeof pp_acc);
+}
+
 /* Forward declarations from backend_gpu.cu (avoids nvcc extern "C" overload
  * confusion when backend_gpu.h is included from the .cu compilation unit). */
 extern int picolm_gpu_pipeline_batch_alloc(int dim, int q_dim, int kv_dim, int ffn_hidden,
@@ -286,6 +306,7 @@ static void repack_model_weights_q4_0x8(model_t *m);
 #define WIN32_LEAN_AND_MEAN
 #ifndef HAVE_WINDOWS_H
 #include <windows.h>
+
 #endif
 #endif
 /* Prefault: touch one byte per 4KB page of the mmap region to bring the
@@ -4711,6 +4732,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
             continue;
         }
 
+        PP_BEGIN();
         /* LayerNorm for GPT-2/StableLM, RMSNorm for others (parallelized over tokens) */
         if (c->is_gpt2 || c->is_stablelm) {
             for (bi = 0; bi < n_tokens; bi++) {
@@ -4736,6 +4758,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                 xb_batch[lt*dim], xb_batch[lt*dim+1], xb_batch[lt*dim+2], xb_batch[lt*dim+3]);
         }
 
+        PP_MARK(0);
         /* Q projection (batched) */
         tensor_set_repacked(m->repack_used[2+l*9] ? m->repack_buffers[2+l*9] : NULL);
 #ifdef PICOLM_GPU
@@ -4780,6 +4803,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
           }
         }
 
+        PP_MARK(1);
         /* K+V projection (batched dual) */
         tensor_set_repacked(m->repack_used[3+l*9] ? m->repack_buffers[3+l*9] : NULL);
         matmul_dual_batch(k_batch, v_batch, xb_batch, n_tokens,
@@ -4787,6 +4811,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                           lw->type_attn_k, lw->type_attn_v);
         tensor_set_repacked(NULL);
 
+        PP_MARK(2);
         /* Per-position: RoPE, KV store */
         {
             int this_attn_ord = c->has_ssm ? attn_ordinal++ : l;
@@ -4980,6 +5005,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
             } else
 #endif
             {
+                PP_MARK(3);
                 /* Batched attention: all tokens, all heads, one thread dispatch */
                 batch_attention_layer(xb_batch, q_batch, kcl, vcl,
                                       n_tokens, start_pos,
@@ -4991,6 +5017,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                                       c->n_swa_layer[l]);
             }
         }
+        PP_MARK(4);
         /* Dump attn_raw (pre-gate) for comparison */
         if (_SSM_DBG && l == 3) {
             int lt = n_tokens - 1;
@@ -5095,6 +5122,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                 x_batch[lt*dim], x_batch[lt*dim+1], x_batch[lt*dim+2], x_batch[lt*dim+3]);
         }
 
+        PP_MARK(5);
         /* FFN (MoE or dense) */
         if (c->has_moe && lw->ffn_gate_exps) {
             for (bi = 0; bi < n_tokens; bi++) {
@@ -5171,6 +5199,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
             }
         }
         steer_hook(l, x_batch, n_tokens, dim, start_pos);
+        PP_MARK(6);
         /* Per-layer RMS tracking (CPU) */
         /* Per-layer RMS tracking (debug only, disabled) */
         /* if ((l % 5 == 0 || l >= c->n_layers - 3) && n_tokens == 1) { ... } */
@@ -5184,6 +5213,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         BENCH_LAYER_END(l, 1);
     }
 
+    pp_report(n_tokens, c->n_layers);
     /* Final norm + output (last token only) */
     float *last_x = x_batch + (n_tokens - 1) * dim;
     if (s->output_norm_b) {
