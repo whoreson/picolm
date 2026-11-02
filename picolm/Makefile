@@ -153,6 +153,7 @@ simd_flags_for = $(strip \
           )))))
 
 # --- Default target: build with NATIVE_MARCH + auto-detected SIMD ---
+.DEFAULT_GOAL := all
 .PHONY: all
 all:
 	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) $(NATIVE_MARCH) $(call simd_flags_for,$(NATIVE_MARCH)) $(call simd_defines_for,$(NATIVE_MARCH)) $(if $(filter 1,$(call _have_neon,$(NATIVE_MARCH))),-DPICOLM_NEON,) $(if $(filter 1,$(call _have_i8mm,$(NATIVE_MARCH))),-DPICOLM_I8MM,)"
