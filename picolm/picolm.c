@@ -36,6 +36,10 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <io.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #include <time.h>
 #ifndef strdup
 #define strdup _strdup
