@@ -2955,32 +2955,34 @@ int picolm_sgemm_d(int m, int n, int k_blocks,
     /* AVX-512VL VNNI Q8_0 GEMM (8-row R8 repack on the fly, 12-column register tile). The d4
      * kernel below is plain AVX2 maddubs even in AVX-512 builds. PICOLM_Q8_VNNI=0 disables;
      * PICOLM_Q8_VNNI_MIN_N (default 32) = smallest batch worth the per-group repack. */
-    if (Atype == GGUF_TYPE_Q8_0) {
-        static int vnni_en = -1, vnni_min_n = 32;
+    if (Atype == GGUF_TYPE_Q8_0 || Atype == GGUF_TYPE_Q4_0 || Atype == GGUF_TYPE_IQ4_NL) {
+        static int vnni_en = -1, q4_en = 1, vnni_min_n = 32;
         if (vnni_en < 0) {
-            const char *e = getenv("PICOLM_Q8_VNNI"), *mn = getenv("PICOLM_Q8_VNNI_MIN_N");
+            const char *e = getenv("PICOLM_Q8_VNNI"), *mn = getenv("PICOLM_Q8_VNNI_MIN_N"), *q4 = getenv("PICOLM_Q4_R8");
             if (mn && atoi(mn) > 0) vnni_min_n = atoi(mn);
+            if (q4 && q4[0] == '0') q4_en = 0;
             vnni_en = !(e && e[0] == '0');
         }
-        if (vnni_en && n >= vnni_min_n && (m % 8) == 0 &&
-            picolm_sgemm_q8_0_vnni(m, n, k_blocks, A, lda, B, ldb, C, ldc, ith, nth)) {
-            static int t_vnni; if (getenv("PICOLM_DISPATCH") && !t_vnni) { t_vnni = 1; fprintf(stderr, "TRACE kernel: picolm_sgemm_q8_0_vnni\n"); }
+        if (vnni_en && (Atype == GGUF_TYPE_Q8_0 || q4_en) && n >= vnni_min_n && (m % 8) == 0 &&
+            picolm_sgemm_r8dec_vnni(Atype, m, n, k_blocks, A, lda, B, ldb, C, ldc, ith, nth)) {
+            static int t_vnni[32]; if (getenv("PICOLM_DISPATCH") && !t_vnni[Atype & 31]) { t_vnni[Atype & 31] = 1; fprintf(stderr, "TRACE kernel: picolm_sgemm_r8dec_vnni (type %d)\n", (int)Atype); }
             return 1;
         }
     }
 #else
     /* Plain AVX2 (no VNNI): repack to R8 per group + panel-blocked tile. PICOLM_Q8_AVX2T=0 disables;
      * PICOLM_Q8_VNNI_MIN_N (default 32) = smallest batch. */
-    if (Atype == GGUF_TYPE_Q8_0) {
-        static int t_en = -1, t_min_n = 32;
+    if (Atype == GGUF_TYPE_Q8_0 || Atype == GGUF_TYPE_Q4_0 || Atype == GGUF_TYPE_IQ4_NL) {
+        static int t_en = -1, q4_en = 1, t_min_n = 32;
         if (t_en < 0) {
-            const char *e = getenv("PICOLM_Q8_AVX2T"), *mn = getenv("PICOLM_Q8_VNNI_MIN_N");
+            const char *e = getenv("PICOLM_Q8_AVX2T"), *mn = getenv("PICOLM_Q8_VNNI_MIN_N"), *q4 = getenv("PICOLM_Q4_R8");
             if (mn && atoi(mn) > 0) t_min_n = atoi(mn);
+            if (q4 && q4[0] == '0') q4_en = 0;
             t_en = !(e && e[0] == '0');
         }
-        if (t_en && n >= t_min_n && (m % 8) == 0 &&
-            picolm_sgemm_q8_0_avx2t(m, n, k_blocks, A, lda, B, ldb, C, ldc, ith, nth)) {
-            static int t_tr; if (getenv("PICOLM_DISPATCH") && !t_tr) { t_tr = 1; fprintf(stderr, "TRACE kernel: picolm_sgemm_q8_0_avx2t\n"); }
+        if (t_en && (Atype == GGUF_TYPE_Q8_0 || q4_en) && n >= t_min_n && (m % 8) == 0 &&
+            picolm_sgemm_r8dec_avx2t(Atype, m, n, k_blocks, A, lda, B, ldb, C, ldc, ith, nth)) {
+            static int t_tr[32]; if (getenv("PICOLM_DISPATCH") && !t_tr[Atype & 31]) { t_tr[Atype & 31] = 1; fprintf(stderr, "TRACE kernel: picolm_sgemm_r8dec_avx2t (type %d)\n", (int)Atype); }
             return 1;
         }
     }

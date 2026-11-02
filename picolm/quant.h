@@ -1252,6 +1252,8 @@ int sgemm_q8_0_r8_q8_0_avx2(int nrows, int ncols, int k, const void *vx, const v
 int sgemm_q8_0_r8_vnni_q8_0(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);  /* AVX-512VL VNNI; returns 0 if unavailable */
 int sgemm_q8_0_r8_avx2t_q8_0(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);  /* panel-blocked AVX2; returns 0 if unavailable */
 int picolm_sgemm_q8_0_avx2t(int m, int n, int k_blocks, const void *vA, int lda, const void *vB, int ldb, float *C, int ldc, int ith, int nth);
+int picolm_sgemm_r8dec_avx2t(int atype, int m, int n, int k_blocks, const void *vA, int lda, const void *vB, int ldb, float *C, int ldc, int ith, int nth);  /* atype: Q8_0 / Q4_0 / IQ4_NL */
+int picolm_sgemm_r8dec_vnni(int atype, int m, int n, int k_blocks, const void *vA, int lda, const void *vB, int ldb, float *C, int ldc, int ith, int nth);
 int sgemm_q8_0_r8_q8_0_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);  /* VNNI when available, else AVX2; always computes */
 /* Q8_K_R8 x Q8_K GEMV (AVX2): 8 weight rows x 1 activation row.
  * Uses block_q8_k_r8 weights (sign trick, no bias correction).

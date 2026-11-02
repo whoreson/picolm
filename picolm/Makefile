@@ -907,6 +907,11 @@ gguf_q40_i8_convert: util/gguf_q40_i8_convert.c
 bench_q8_gemm: bench_q8_gemm.c quant.c type_dispatch.c tensor.c $(SGEMM_SRCS) quant.h sgemm.h
 	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O3 -o $@ bench_q8_gemm.c quant.c type_dispatch.c tensor.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
 
+# Legacy-quant (Q8_0/Q4_0/IQ4_NL/Q5_0) prefill GEMM + decode dot bench and check.
+# usage: ./bench_qgemm check ;  ./bench_qgemm iq4_nl 4096 512 4096 3 1 ;  ./bench_qgemm all
+bench_qgemm: bench_qgemm.c quant.c type_dispatch.c tensor.c $(SGEMM_SRCS) quant.h sgemm.h
+	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O3 -o $@ bench_qgemm.c quant.c type_dispatch.c tensor.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
+
 # IQ6_K prefill GEMM: decode-once R8 kernel vs the 1x2 tile kernel (correctness + GOPS).
 # usage: ./bench_iq6k_gemm check ;  ./bench_iq6k_gemm 14336 512 4096 3 24
 bench_iq6k_gemm: bench_iq6k_gemm.c quant.c type_dispatch.c tensor.c $(SGEMM_SRCS) quant.h
