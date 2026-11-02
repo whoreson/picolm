@@ -4207,6 +4207,102 @@ static void batch_add_task(int idx, void *ctxp) {
     for (int d2 = 0; d2 < ctx->dim; d2++) a[d2] += b[d2];
 }
 
+/* Per-token RoPE + KV-cache store for batched prefill (CPU path). Mirrors the serial loop in
+ * model_forward_prefill token for token: tokens are independent here (each writes its own Q/K/V
+ * rows and its own KV cache row), so the loop runs on the thread pool instead of the main thread.
+ * rope(), the Hadamard transform and the row quantizers keep no shared state. */
+typedef struct {
+    run_state_t *s;
+    const model_config_t *c;
+    const float *qnw, *knw;           /* Qwen3 Q/K norm weights or NULL */
+    float *q_batch, *k_batch, *v_batch;
+    uint8_t *kcl, *vcl;
+    int start_pos, q_dim, kv_dim, head_dim, n_heads, n_kv_heads, rope_half;
+} batch_rope_kv_ctx_t;
+
+static void batch_rope_kv_task(int bi, void *ctxp) {
+    const batch_rope_kv_ctx_t *x = (const batch_rope_kv_ctx_t *)ctxp;
+    run_state_t *s = x->s;
+    const model_config_t *c = x->c;
+    const int head_dim = x->head_dim, n_heads = x->n_heads, n_kv_heads = x->n_kv_heads, kv_dim = x->kv_dim;
+    const int pos = x->start_pos + bi;
+    float *q_pos = x->q_batch + (size_t)bi * x->q_dim;
+    float *k_pos = x->k_batch + (size_t)bi * kv_dim;
+    float *v_pos = x->v_batch + (size_t)bi * kv_dim;
+    const float *cos_pos = s->rope_cos + (size_t)pos * x->rope_half;
+    const float *sin_pos = s->rope_sin + (size_t)pos * x->rope_half;
+
+    if (x->qnw) {
+        for (int h = 0; h < n_heads; h++)
+            rmsnorm(q_pos + h * head_dim, q_pos + h * head_dim, x->qnw, head_dim, c->rms_norm_eps);
+        for (int h = 0; h < n_kv_heads; h++)
+            rmsnorm(k_pos + h * head_dim, k_pos + h * head_dim, x->knw, head_dim, c->rms_norm_eps);
+    }
+    rope(q_pos, k_pos, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos, c->rope_type, x->rope_half);
+
+    uint8_t *kp = x->kcl + (size_t)pos * s->kv_row_size_k;
+    uint8_t *vp = x->vcl + (size_t)pos * s->kv_row_size_v;
+    if (s->kv_hadamard_k && s->kv_type_k != KV_CACHE_F16)
+        for (int hkv = 0; hkv < n_kv_heads; hkv++)
+            picolm_hadamard_transform(k_pos + hkv * head_dim, head_dim, s->kv_hadamard_size);
+    if (s->kv_type_k == KV_CACHE_Q8_0) quantize_row_q8_0(k_pos, kp, kv_dim);
+    else if (s->kv_type_k == KV_CACHE_Q4_0) quantize_row_q4_0(k_pos, kp, kv_dim);
+    else if (s->kv_type_k == KV_CACHE_TQ3)
+        for (int hkv = 0; hkv < n_kv_heads; hkv++)
+            quantize_row_tq3(k_pos + hkv * head_dim, kp + hkv * s->kv_head_stride_k, head_dim);
+    else if (s->kv_type_k == KV_CACHE_TQ4)
+        for (int hkv = 0; hkv < n_kv_heads; hkv++)
+            quantize_row_tq4(k_pos + hkv * head_dim, kp + hkv * s->kv_head_stride_k, head_dim);
+    else
+        for (int hkv = 0; hkv < n_kv_heads; hkv++) {
+            const float *k_head = k_pos + hkv * head_dim;
+            uint16_t *kf = (uint16_t *)(kp + hkv * s->kv_head_stride_k);
+            for (int d2 = 0; d2 < head_dim; d2++) kf[d2] = fp32_to_fp16(k_head[d2]);
+        }
+    if (s->kv_hadamard_v && s->kv_type_v != KV_CACHE_F16)
+        for (int hkv = 0; hkv < n_kv_heads; hkv++)
+            picolm_hadamard_transform(v_pos + hkv * head_dim, head_dim, s->kv_hadamard_size);
+    if (s->kv_type_v == KV_CACHE_Q8_0) quantize_row_q8_0(v_pos, vp, kv_dim);
+    else if (s->kv_type_v == KV_CACHE_Q4_0) quantize_row_q4_0(v_pos, vp, kv_dim);
+    else if (s->kv_type_v == KV_CACHE_TQ3)
+        for (int hkv = 0; hkv < n_kv_heads; hkv++)
+            quantize_row_tq3(v_pos + hkv * head_dim, vp + hkv * s->kv_head_stride_v, head_dim);
+    else if (s->kv_type_v == KV_CACHE_TQ4)
+        for (int hkv = 0; hkv < n_kv_heads; hkv++)
+            quantize_row_tq4(v_pos + hkv * head_dim, vp + hkv * s->kv_head_stride_v, head_dim);
+    else
+        for (int hkv = 0; hkv < n_kv_heads; hkv++) {
+            const float *v_head = v_pos + hkv * head_dim;
+            uint16_t *vf = (uint16_t *)(vp + hkv * s->kv_head_stride_v);
+            for (int d2 = 0; d2 < head_dim; d2++) vf[d2] = fp32_to_fp16(v_head[d2]);
+        }
+}
+
+/* Row-parallel helpers for the rest of the per-layer serial work in batched prefill. */
+typedef struct { float *dst; const float *src; size_t dst_stride, src_stride, n; } batch_rowcopy_ctx_t;
+static void batch_rowcopy_task(int idx, void *p) {
+    const batch_rowcopy_ctx_t *x = (const batch_rowcopy_ctx_t *)p;
+    memcpy(x->dst + (size_t)idx * x->dst_stride, x->src + (size_t)idx * x->src_stride, x->n * sizeof(float));
+}
+typedef struct { float *dst; size_t stride; } batch_rowzero_ctx_t;
+static void batch_rowzero_task(int idx, void *p) {
+    const batch_rowzero_ctx_t *x = (const batch_rowzero_ctx_t *)p;
+    memset(x->dst + (size_t)idx * x->stride, 0, x->stride * sizeof(float));
+}
+typedef struct { float *x, *a, *f; int dim; } batch_add2_ctx_t;
+static void batch_add2_task(int idx, void *p) {
+    const batch_add2_ctx_t *c = (const batch_add2_ctx_t *)p;
+    float *x = c->x + (size_t)idx * c->dim; const float *a = c->a + (size_t)idx * c->dim, *f = c->f + (size_t)idx * c->dim;
+    for (int d2 = 0; d2 < c->dim; d2++) x[d2] += a[d2] + f[d2];
+}
+/* Reusable compact copy buffer for the attention output (was a malloc/free of n_tokens*q_dim
+ * floats per layer: fresh mmap pages faulted in serially on every layer). */
+static float *prefill_attn_out_buf(size_t floats) {
+    static __thread float *buf; static __thread size_t cap;
+    if (cap < floats) { free(buf); buf = (float *)malloc(floats * sizeof(float)); cap = buf ? floats : 0; }
+    return buf;
+}
+
 /* ---- GPTNeoX (Krake v2) batched prefill ----
  * Same as GPT-2 prefill but:
  * - Has RoPE (partial rotary) instead of learned pos embd
@@ -4825,6 +4921,19 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                  * using head_dim/2 reads past the correct table row. */
                 int rope_dim_pf = (c->rope_dim > 0) ? c->rope_dim : head_dim;
                 int rope_half_pf = rope_dim_pf / 2;
+                /* Parallel over tokens unless the GPU Q/K-norm path (per-token device calls) is active. */
+                int rk_par = n_tokens >= 8 && !(lw->attn_q_norm
+#ifdef PICOLM_GPU
+                                                && gpu_ok && m->gpu.active
+#endif
+                                                ) && !getenv("PICOLM_PREFILL_SERIAL_ROPE");
+                if (rk_par) {
+                    batch_rope_kv_ctx_t rkc = { s, c, lw->attn_q_norm ? s->attn_q_norm_w[l] : NULL,
+                                                lw->attn_q_norm ? s->attn_k_norm_w[l] : NULL,
+                                                q_batch, k_batch, v_batch, kcl, vcl, start_pos,
+                                                q_dim, kv_dim, head_dim, n_heads, n_kv_heads, rope_half_pf };
+                    tensor_parallel_for(n_tokens, batch_rope_kv_task, &rkc);
+                } else
                 for (bi = 0; bi < n_tokens; bi++) {
                     int pos = start_pos + bi;
                     float *q_pos = q_batch + bi * q_dim;
@@ -4953,7 +5062,8 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #endif
 
             /* Zero init xb_batch for attention accumulation */
-            memset(xb_batch, 0, (size_t)n_tokens * max_dim * sizeof(float));
+            if (n_tokens >= 8) { batch_rowzero_ctx_t zc = { xb_batch, (size_t)max_dim }; tensor_parallel_for(n_tokens, batch_rowzero_task, &zc); }
+            else memset(xb_batch, 0, (size_t)n_tokens * max_dim * sizeof(float));
 
             /* Hadamard rotation of Q before attention (prefill) */
             if (s->kv_hadamard_k) {
@@ -5087,16 +5197,17 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
          * matmul_batch requires stride == n, so we copy to compact buffer. */
         { float *attn_out_batch = NULL;
           if (max_dim > q_dim) {
-              attn_out_batch = (float *)malloc((size_t)n_tokens * q_dim * sizeof(float));
-              for (bi = 0; bi < n_tokens; bi++)
-                  memcpy(attn_out_batch + bi * q_dim, xb_batch + bi * max_dim, q_dim * sizeof(float));
+              attn_out_batch = prefill_attn_out_buf((size_t)n_tokens * q_dim);
+              if (attn_out_batch) {
+                  batch_rowcopy_ctx_t cc = { attn_out_batch, xb_batch, (size_t)q_dim, (size_t)max_dim, (size_t)q_dim };
+                  tensor_parallel_for(n_tokens, batch_rowcopy_task, &cc);
+              }
           }
           tensor_set_repacked(m->repack_used[6+l*9] ? m->repack_buffers[6+l*9] : NULL);
 #ifdef PICOLM_GPU
           if (gpu_ok) tensor_set_gpu_tensor((picolm_gpu_tensor_t *)m->gpu.layers[l].attn_output, gpu_dev); else tensor_set_gpu_tensor(NULL, 0);
 #endif
           matmul_batch(xb2_batch, attn_out_batch ? attn_out_batch : xb_batch, n_tokens, lw->attn_output, q_dim, dim, lw->type_attn_output);
-          if (attn_out_batch) free(attn_out_batch);
           if (getenv("PICOLM_L0DBG") && l == 0) {
               int lt = n_tokens - 1;
               fprintf(stderr, "[L0DBG CPU outproj][:4]={%.6f,%.6f,%.6f,%.6f}\n",
@@ -5111,10 +5222,8 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 
         /* Residual: x += attn_out (deferred for parallel residual) */
         if (!c->use_parallel_residual) {
-            for (bi = 0; bi < n_tokens; bi++) {
-                float *a = x_batch + bi * dim, *b = xb2_batch + bi * dim;
-                for (int d2 = 0; d2 < dim; d2++) a[d2] += b[d2];
-            }
+            batch_add_ctx_t ac = { x_batch, xb2_batch, dim };
+            tensor_parallel_for(n_tokens, batch_add_task, &ac);
         }
         if (getenv("PICOLM_L0DBG") && l == 0) {
             int lt = n_tokens - 1;
@@ -5136,8 +5245,8 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         } else {
             /* FFN RMSNorm (skip for parallel residual: uses saved normalized input) */
             if (!c->use_parallel_residual) {
-                for (bi = 0; bi < n_tokens; bi++)
-                    rmsnorm(xb_batch + bi * dim, x_batch + bi * dim, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
+                batch_rmsnorm_ctx_t fc = { xb_batch, x_batch, s->post_attn_norm_w[l], dim, c->rms_norm_eps };
+                tensor_parallel_for(n_tokens, batch_rmsnorm_task, &fc);
             }
 
             /* FFN gate+up (batched dual) */
@@ -5179,23 +5288,14 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                 tensor_set_repacked(NULL);
                 /* Parallel residual: add both attn_out (in xb2_batch) and ffn_out (in xb_batch) */
                 {
-                    batch_add_ctx_t actx = { x_batch, xb2_batch, dim };
-                    /* x += attn_out + ffn_out (fused, uses hb_batch as temp) */
-                    for (bi = 0; bi < n_tokens; bi++) {
-                        float *x = x_batch + bi * dim;
-                        float *a = xb2_batch + bi * dim;
-                        float *f = xb_batch + bi * dim;
-                        for (int d2 = 0; d2 < dim; d2++) x[d2] += a[d2] + f[d2];
-                    }
+                    batch_add2_ctx_t a2 = { x_batch, xb2_batch, xb_batch, dim };
+                    tensor_parallel_for(n_tokens, batch_add2_task, &a2);
                 }
             } else {
                 matmul_batch(xb2_batch, hb_batch, n_tokens, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
                 tensor_set_repacked(NULL);
                 /* Residual: x += ffn_out */
-                for (bi = 0; bi < n_tokens; bi++) {
-                    float *a = x_batch + bi * dim, *b = xb2_batch + bi * dim;
-                    for (int d2 = 0; d2 < dim; d2++) a[d2] += b[d2];
-                }
+                { batch_add_ctx_t fa = { x_batch, xb2_batch, dim }; tensor_parallel_for(n_tokens, batch_add_task, &fa); }
             }
         }
         steer_hook(l, x_batch, n_tokens, dim, start_pos);
