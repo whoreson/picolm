@@ -321,13 +321,34 @@ static const char *stop_matcher_feed(stop_matcher_t *sm, const char *piece,
                 sm->match_idx = i;
                 sm->match_pos = pos;
                 *action = STOP_FULL;
+                /* Salvage withheld content that precedes the stop word.
+                 * Pending can contain real text when a single piece held
+                 * both text and a stop-word prefix (e.g. piece "abc</val"
+                 * withheld whole, then "ue>" completed the stop word): the
+                 * old code discarded it all, losing "abc" from the output.
+                 * Pending maps to text positions
+                 *   [text_len_before - pending_len, text_len_before)
+                 * (it is always a suffix of the pre-piece text). Everything
+                 * in pending before match_pos precedes the stop word and is
+                 * safe to emit with this final chunk. */
+                int text_len_before = sm->text_len - (int)strlen(piece);
+                int pend_start = text_len_before - sm->pending_len;
+                int keep = sm->pending_len > 0 ? sm->match_pos - pend_start : 0;
+                if (keep > sm->pending_len) keep = sm->pending_len;
+                if (keep < 0) keep = 0;
                 /* Truncate the text at the stop word position. */
                 sm->text[sm->match_pos] = '\0';
                 sm->text_len = sm->match_pos;
-                /* Discard any pending (withheld) content -- it contains
-                 * prefixes of stop words that would leak into the output. */
+                const char *salvage = "";
+                if (keep > 0) {
+                    sm->send_buf = stop_buf_reserve(sm->send_buf, &sm->send_cap, keep, 0);
+                    memcpy(sm->send_buf, sm->pending, (size_t)keep);
+                    sm->send_buf[keep] = '\0';
+                    salvage = sm->send_buf;
+                }
                 if (sm->pending) sm->pending[0] = '\0';
-                return "";
+                sm->pending_len = 0;
+                return salvage;
             }
         }
     }
@@ -2496,7 +2517,9 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             cJSON *delta = cJSON_CreateObject();
             if (gen_count == 0) cJSON_AddStringToObject(delta, "role", is_chat ? "assistant" : "");
             if (stopped) {
-                cJSON_AddStringToObject(delta, "content", "");
+                /* Normally "" -- may contain salvaged withheld text that
+                 * preceded the stop word (see stop_matcher_feed STOP_FULL). */
+                cJSON_AddStringToObject(delta, "content", send_piece);
                 cJSON_AddStringToObject(choice, "finish_reason", "stop");
             } else {
                 /* partial: send_piece is "", normal: send_piece is piece or withheld+piece */
