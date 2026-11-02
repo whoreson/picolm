@@ -471,9 +471,10 @@ static __thread int tl_in_parallel = 0;
  * seq_cst handshake via pool_nsleep / pool_main_wait, so no wakeup is ever lost).
  *
  * Env PICOLM_POOL_SPIN_US=N sets the worker spin budget in microseconds (default
- * 500; the main thread waits up to 4x that for stragglers; 0 = never spin, sleep
+ * 10000; the main thread waits up to 4x that for stragglers; 0 = never spin, sleep
  * immediately). Spinning is disabled automatically when the pool has more threads
- * than online CPUs, unless the env var is set explicitly. Build with
+ * than online CPUs, than the taskset/cpuset allows, or than a cgroup CPU quota
+ * grants, unless the env var is set explicitly. PICOLM_PIN=1 pins pool workers. Build with
  * -DPICOLM_NO_SPIN_POOL for the previous behaviour (also used on non-GNU compilers). */
 #if defined(__GNUC__) && !defined(PICOLM_DOS) && !defined(PICOLM_NO_SPIN_POOL)
 #define PICOLM_SPIN_POOL 1
@@ -482,7 +483,7 @@ static __thread int tl_in_parallel = 0;
 static win_cond_t      pool_done_cond;      /* main thread sleeps here waiting for workers */
 static int             pool_nsleep = 0;     /* workers blocked in pool_cond (written under pool_mutex) */
 static int             pool_main_wait = 0;  /* main thread blocked in pool_done_cond */
-static long long       pool_spin_ns = 500000;
+static long long       pool_spin_ns = 10000000;   /* 10 ms: see PICOLM_POOL_SPIN_US */
 #define POOL_LD(p)  __atomic_load_n((p), __ATOMIC_ACQUIRE)
 #if defined(__x86_64__) || defined(__i386__)
 #define POOL_RELAX() __builtin_ia32_pause()
@@ -500,12 +501,113 @@ static long long pool_now_ns(void) {
     return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 #endif
 }
+#if defined(__linux__)
+#include <sched.h>
+/* CPUs this process may actually use: online CPUs narrowed by taskset/cpuset, and by a cgroup
+ * CPU quota (docker --cpus, k8s limits). Spinning more threads than that burns the quota. */
+static double pool_usable_cpus(void) {
+    double n = (double)sysconf(_SC_NPROCESSORS_ONLN);
+    cpu_set_t set;
+    if (sched_getaffinity(0, sizeof set, &set) == 0) { int a = CPU_COUNT(&set); if (a > 0 && a < n) n = a; }
+    FILE *f = fopen("/sys/fs/cgroup/cpu.max", "r");          /* cgroup v2: "<quota|max> <period>" */
+    if (f) {
+        char q[32] = ""; long per = 0;
+        if (fscanf(f, "%31s %ld", q, &per) == 2 && strcmp(q, "max") != 0 && per > 0) { double c = atof(q) / per; if (c > 0 && c < n) n = c; }
+        fclose(f);
+    } else if ((f = fopen("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "r"))) {   /* cgroup v1 */
+        long q = -1, per = 0; FILE *g = fopen("/sys/fs/cgroup/cpu/cpu.cfs_period_us", "r");
+        if (g) { if (fscanf(g, "%ld", &per) != 1) per = 0; fclose(g); }
+        if (fscanf(f, "%ld", &q) == 1 && q > 0 && per > 0) { double c = (double)q / per; if (c < n) n = c; }
+        fclose(f);
+    }
+    return n;
+}
+
+/* Optional pinning (PICOLM_PIN=1): worker i -> i-th CPU of the allowed set, one logical CPU per
+ * physical core first (lowest sibling id), hyperthread siblings last. Keeps -j N threads off each
+ * other's cores on SMT machines and stops the scheduler migrating them mid-GEMM.
+ * The calling (main) thread is worker 0: it is confined to that slot's physical core (CPU + SMT
+ * siblings), created AFTER the workers so they never inherit its mask. */
+static cpu_set_t pool_orig_set;
+static int pool_orig_have;
+static int pool_pin_cpus[1024], pool_pin_n;
+static void pool_pin_setup(int nt) {
+    const char *e = getenv("PICOLM_PIN");
+    pool_pin_n = 0;
+    if (!e || !*e || e[0] == '0') return;
+    if (!pool_orig_have) { if (sched_getaffinity(0, sizeof pool_orig_set, &pool_orig_set) != 0) return; pool_orig_have = 1; }
+    static int prim[1024], sec[1024]; int np = 0, ns = 0;
+    for (int cpu = 0; cpu < 1024 && cpu < CPU_SETSIZE; cpu++) {
+        if (!CPU_ISSET(cpu, &pool_orig_set)) continue;
+        char path[96]; snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cpu);
+        int first = cpu; FILE *f = fopen(path, "r");
+        if (f) { if (fscanf(f, "%d", &first) != 1) first = cpu; fclose(f); }
+        if (first == cpu) prim[np++] = cpu; else sec[ns++] = cpu;
+    }
+    if (nt > np + ns) { fprintf(stderr, "pool: PICOLM_PIN ignored (%d threads > %d allowed CPUs)\n", nt, np + ns); return; }
+    for (int i = 0; i < np; i++) pool_pin_cpus[pool_pin_n++] = prim[i];
+    for (int i = 0; i < ns; i++) pool_pin_cpus[pool_pin_n++] = sec[i];
+}
+static int pool_pin_actual[1024];  /* sched_getcpu() result per worker, filled after pin */
+static void pool_pin_self(int idx) {       /* workers (idx >= 1) */
+    if (!pool_pin_n) return;
+    cpu_set_t s;
+    if (idx >= 1 && idx < pool_pin_n) { CPU_ZERO(&s); CPU_SET(pool_pin_cpus[idx], &s); }
+    else s = pool_orig_set;
+    int r = pthread_setaffinity_np(pthread_self(), sizeof s, &s);
+    if (r != 0) fprintf(stderr, "pool: PICOLM_PIN: thread %d setaffinity failed (errno %d)\n", idx, r);
+    pool_pin_actual[idx] = sched_getcpu();
+}
+/* Parse a sysfs CPU list such as "0,24" or "0-1,24-25" into a mask. */
+static void pool_parse_cpulist(const char *str, cpu_set_t *out) {
+    CPU_ZERO(out);
+    const char *p = str;
+    while (*p) {
+        char *end; long a = strtol(p, &end, 10);
+        if (end == p) break;
+        long b = a;
+        if (*end == '-') { p = end + 1; b = strtol(p, &end, 10); }
+        for (long c = a; c <= b && c < CPU_SETSIZE; c++) CPU_SET((int)c, out);
+        p = end; while (*p == ',' || *p == ' ' || *p == '\n') p++;
+    }
+}
+static void pool_pin_main(int nt) {        /* after the workers exist */
+    if (!pool_pin_n) return;
+    /* Main thread = worker slot 0. Confine it to that slot's physical core (the CPU and its SMT
+     * siblings). A wider mask lets it settle on an SMT sibling of a pinned worker's core, where
+     * both run at roughly half speed and the static row split makes everyone wait for them. */
+    cpu_set_t m; CPU_ZERO(&m);
+    char path[96], buf[256] = "";
+    snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", pool_pin_cpus[0]);
+    FILE *f = fopen(path, "r");
+    if (f) { if (!fgets(buf, sizeof buf, f)) buf[0] = 0; fclose(f); }
+    if (buf[0]) pool_parse_cpulist(buf, &m);
+    CPU_AND(&m, &m, &pool_orig_set);
+    for (int i = 1; i < nt && i < pool_pin_n; i++) CPU_CLR(pool_pin_cpus[i], &m);   /* never a worker's CPU */
+    if (CPU_COUNT(&m) == 0) { CPU_ZERO(&m); CPU_SET(pool_pin_cpus[0], &m); }
+    int r = pthread_setaffinity_np(pthread_self(), sizeof m, &m);
+    if (r != 0) fprintf(stderr, "pool: PICOLM_PIN: main thread setaffinity failed (errno %d)\n", r);
+    /* Single summary line for all threads (main + workers), only when PICOLM_DISPATCH is set. */
+    if (getenv("PICOLM_DISPATCH")) {
+        fprintf(stderr, "pool: pin %d threads: main=%d workers=", nt, sched_getcpu());
+        for (int i = 1; i < nt && i < pool_pin_n; i++) fprintf(stderr, "%s%d", i == 1 ? "" : " ", pool_pin_actual[i]);
+        fprintf(stderr, "\n");
+    }
+}
+#else
+static void pool_pin_setup(int nt) { (void)nt; }
+static void pool_pin_self(int idx) { (void)idx; }
+static void pool_pin_main(int nt) { (void)nt; }
+static double pool_usable_cpus(void) { return 1e9; }
+#endif
+
 static void pool_spin_setup(int nt) {
     const char *e = getenv("PICOLM_POOL_SPIN_US");
     if (e && *e) { long v = atol(e); pool_spin_ns = v > 0 ? (long long)v * 1000LL : 0; return; }
 #ifndef _WIN32
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     if (ncpu > 0 && nt > ncpu) pool_spin_ns = 0;   /* oversubscribed: spinners would starve workers */
+    if (nt > pool_usable_cpus() + 0.01) pool_spin_ns = 0;   /* taskset / cgroup quota smaller than the pool */
 #else
     (void)nt;
 #endif
@@ -744,6 +846,7 @@ static void *pool_worker(void *arg) {
 #endif
     int tid = (int)(size_t)arg;
     pool_my_tid = tid;
+    pool_pin_self(tid);
     tl_in_parallel = 1;
     int last_gen = 0;
     for (;;) {
@@ -834,11 +937,15 @@ static void pool_init(int nt) {
     pool_nsleep = 0;
     pool_main_wait = 0;
     pool_spin_setup(nt);
+    pool_pin_setup(nt);
 #endif
     pool_nworkers = nt - 1;
     for (int i = 1; i < nt; i++) {
         win_thread_create(&pool_threads[i], pool_worker, (void *)(size_t)i);
     }
+#ifdef PICOLM_SPIN_POOL
+    pool_pin_main(nt);
+#endif
 }
 
 #ifdef PICOLM_SPIN_POOL
