@@ -2968,6 +2968,22 @@ int picolm_sgemm_d(int m, int n, int k_blocks,
             return 1;
         }
     }
+#else
+    /* Plain AVX2 (no VNNI): repack to R8 per group + panel-blocked tile. PICOLM_Q8_AVX2T=0 disables;
+     * PICOLM_Q8_VNNI_MIN_N (default 32) = smallest batch. */
+    if (Atype == GGUF_TYPE_Q8_0) {
+        static int t_en = -1, t_min_n = 32;
+        if (t_en < 0) {
+            const char *e = getenv("PICOLM_Q8_AVX2T"), *mn = getenv("PICOLM_Q8_VNNI_MIN_N");
+            if (mn && atoi(mn) > 0) t_min_n = atoi(mn);
+            t_en = !(e && e[0] == '0');
+        }
+        if (t_en && n >= t_min_n && (m % 8) == 0 &&
+            picolm_sgemm_q8_0_avx2t(m, n, k_blocks, A, lda, B, ldb, C, ldc, ith, nth)) {
+            static int t_tr; if (getenv("PICOLM_DISPATCH") && !t_tr) { t_tr = 1; fprintf(stderr, "TRACE kernel: picolm_sgemm_q8_0_avx2t\n"); }
+            return 1;
+        }
+    }
 #endif
     /* Prefer 4x4 tiles (RN=4) when n >= 4: better activation cache reuse */
     if (Atype == GGUF_TYPE_Q8_0) {

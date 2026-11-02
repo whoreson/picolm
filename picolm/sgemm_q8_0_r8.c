@@ -356,6 +356,181 @@ void repack_q8_0_to_q8_0_r8(const void *src, void *dst, int nrows, int n) {
 
 #endif
 
+#if defined(__AVX2__) && defined(__F16C__)
+/* ================================================================
+ * sgemm_q8_0_r8_avx2t_q8_0: panel-blocked AVX2 GEMM for Q8_0_R8 weights (no VNNI needed).
+ *
+ * The older AVX2 kernel above sweeps ALL activation columns for every 8-row weight group, so on
+ * a CPU with a 256 KB L2 the whole activation matrix (n*k bytes, MBs) streams from L3 once per
+ * group. Here a thread stages a panel of PC columns (int8 + fp32 scales, sized to fit in L2) and
+ * sweeps all its weight groups against it, so activations are read from L3 once per panel.
+ * Tile: 8 rows x 4 columns. abs(w) is computed once per weight vector and shared by the 4
+ * columns; per (vector, column): broadcast + sign + maddubs + madd + add. One cvt/mul/fma
+ * fixup per block and column. Integer sums are identical to the older kernel.
+ * ================================================================ */
+#if defined(__FMA__)
+#define R8A_FMA(a, b, c) _mm256_fmadd_ps((a), (b), (c))
+#else
+#define R8A_FMA(a, b, c) _mm256_add_ps(_mm256_mul_ps((a), (b)), (c))
+#endif
+
+static inline __attribute__((always_inline))
+void r8a_tile(const block_q8_0_r8 *w, const int8_t *yq, const float *ys, int nb,
+              float *out, size_t bs, const int NC) {
+    __m256 facc[4];
+#pragma GCC unroll 4
+    for (int c = 0; c < NC; c++) facc[c] = _mm256_setzero_ps();
+    const __m256i ones = _mm256_set1_epi16(1);
+    for (int ib = 0; ib < nb; ib++) {
+        const __m256i *wq = (const __m256i *)w[ib].qs;
+        const __m256 wsc = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)w[ib].d));
+        __m256i isum[4];
+#pragma GCC unroll 4
+        for (int c = 0; c < NC; c++) isum[c] = _mm256_setzero_si256();
+#pragma GCC unroll 8
+        for (int j = 0; j < 8; j++) {
+            const __m256i wj = _mm256_loadu_si256(wq + j);
+            const __m256i aw = _mm256_sign_epi8(wj, wj);          /* abs(w), unsigned operand */
+#pragma GCC unroll 4
+            for (int c = 0; c < NC; c++) {
+                int d; memcpy(&d, yq + ((size_t)c * nb + ib) * 32 + 4 * j, 4);
+                const __m256i sy = _mm256_sign_epi8(_mm256_set1_epi32(d), wj);
+                isum[c] = _mm256_add_epi32(isum[c], _mm256_madd_epi16(_mm256_maddubs_epi16(aw, sy), ones));
+            }
+        }
+#pragma GCC unroll 4
+        for (int c = 0; c < NC; c++) {
+            const __m256 sc = _mm256_mul_ps(wsc, _mm256_set1_ps(ys[(size_t)c * nb + ib]));
+            facc[c] = R8A_FMA(_mm256_cvtepi32_ps(isum[c]), sc, facc[c]);
+        }
+    }
+#pragma GCC unroll 4
+    for (int c = 0; c < NC; c++) _mm256_storeu_ps(out + (size_t)c * bs, facc[c]);
+}
+
+typedef struct { int8_t *yq; float *ys; block_q8_0_r8 *wr; size_t yq_cap, ys_cap, wr_cap; } r8a_scratch_t;
+static __thread r8a_scratch_t r8a_tl;
+
+static int r8a_reserve(int pc, int nb, int need_wr) {
+    const size_t yq = (size_t)pc * nb * 32, ys = (size_t)pc * nb * sizeof(float), wr = need_wr ? (size_t)nb * sizeof(block_q8_0_r8) : 0;
+    if (r8a_tl.yq_cap < yq) { _mm_free(r8a_tl.yq); r8a_tl.yq = (int8_t *)_mm_malloc((yq + 63) & ~(size_t)63, 64); r8a_tl.yq_cap = r8a_tl.yq ? yq : 0; }
+    if (r8a_tl.ys_cap < ys) { _mm_free(r8a_tl.ys); r8a_tl.ys = (float *)_mm_malloc((ys + 63) & ~(size_t)63, 64); r8a_tl.ys_cap = r8a_tl.ys ? ys : 0; }
+    if (r8a_tl.wr_cap < wr) { _mm_free(r8a_tl.wr); r8a_tl.wr = (block_q8_0_r8 *)_mm_malloc((wr + 63) & ~(size_t)63, 64); r8a_tl.wr_cap = r8a_tl.wr ? wr : 0; }
+    return r8a_tl.yq && r8a_tl.ys && (!need_wr || r8a_tl.wr);
+}
+
+/* Panel width: ~R8A_PANEL_BYTES of staged activations (int8 + fp32 scale per block), multiple of 4.
+ * Default 160 KB suits a 256 KB L2; PICOLM_Q8_AVX2_PANEL_KB overrides. */
+static int r8a_panel_cols(int nb) {
+    static int kb = 0;
+    if (!kb) { const char *e = getenv("PICOLM_Q8_AVX2_PANEL_KB"); kb = (e && atoi(e) > 0) ? atoi(e) : 160; }
+    int pc = (int)(((size_t)kb * 1024) / ((size_t)nb * 36)) & ~3;
+    return pc < 4 ? 4 : pc;
+}
+
+static void r8a_stage_panel(const void *vy, size_t ldb_blocks, int c0, int pc, int nb) {
+    for (int c = 0; c < pc; c++) {
+        const block_q8_0 *qy = (const block_q8_0 *)vy + (size_t)(c0 + c) * ldb_blocks;
+        int8_t *dst = r8a_tl.yq + (size_t)c * nb * 32;
+        float *sd = r8a_tl.ys + (size_t)c * nb;
+        for (int ib = 0; ib < nb; ib++) {
+            _mm256_storeu_si256((__m256i *)(dst + (size_t)ib * 32), _mm256_loadu_si256((const __m256i *)qy[ib].qs));
+            sd[ib] = _cvtsh_ss(qy[ib].d);
+        }
+    }
+}
+
+static inline void r8a_tiles(const block_q8_0_r8 *wg, int pc, int nb, float *og, size_t bs) {
+    int cc = 0;
+#define R8A_RUN(NCV) r8a_tile(wg, r8a_tl.yq + (size_t)cc * nb * 32, r8a_tl.ys + (size_t)cc * nb, nb, og + (size_t)cc * bs, bs, NCV)
+    for (; cc + 4 <= pc; cc += 4) R8A_RUN(4);
+    if (cc + 2 <= pc) { R8A_RUN(2); cc += 2; }
+    if (cc + 1 <= pc) { R8A_RUN(1); cc += 1; }
+#undef R8A_RUN
+}
+
+int sgemm_q8_0_r8_avx2t_q8_0(int nrows, int ncols, int k, const void *vx, const void *vy,
+                             float *out, size_t bs, int ith, int nth) {
+    if (nrows < 8 || ncols < 1 || k % 32 != 0 || nrows % 8 != 0) return 0;
+    const int nb = k / 32;
+    const size_t w_stride = (size_t)nb * sizeof(block_q8_0_r8);
+    const int total_groups = nrows / 8, gpt = (total_groups + nth - 1) / nth;
+    const int g_start = ith * gpt, g_end = (ith + 1) * gpt < total_groups ? (ith + 1) * gpt : total_groups;
+    if (g_start >= g_end) return (nrows / 8) * 8;
+    const int PC = r8a_panel_cols(nb);
+    if (!r8a_reserve(ncols < PC ? ncols : PC, nb, 0)) return 0;
+    for (int c0 = 0; c0 < ncols; c0 += PC) {
+        const int pc = (ncols - c0 < PC) ? (ncols - c0) : PC;
+        r8a_stage_panel(vy, (size_t)nb, c0, pc, nb);
+        for (int g = g_start; g < g_end; g++)
+            r8a_tiles((const block_q8_0_r8 *)((const char *)vx + (size_t)g * w_stride), pc, nb,
+                      out + (size_t)c0 * bs + (size_t)g * 8, bs);
+    }
+    return (nrows / 8) * 8;
+}
+
+/* Repack one group of 8 plain Q8_0 rows into R8 blocks. An R8 block is byte-for-byte the size of
+ * 8 Q8_0 blocks (272B), so this needs only an L2-sized scratch (nb*272B) and no model-format
+ * change. The qs part is an 8x8 transpose of 32-bit words: R8 vector j = dword j of each row. */
+static void r8a_repack_group(const block_q8_0 *A, size_t lda, int g, int nb, block_q8_0_r8 *dst) {
+    const block_q8_0 *row[8];
+    for (int r = 0; r < 8; r++) row[r] = A + (size_t)(g * 8 + r) * lda;
+    for (int ib = 0; ib < nb; ib++) {
+        __m256i r0 = _mm256_loadu_si256((const __m256i *)row[0][ib].qs), r1 = _mm256_loadu_si256((const __m256i *)row[1][ib].qs);
+        __m256i r2 = _mm256_loadu_si256((const __m256i *)row[2][ib].qs), r3 = _mm256_loadu_si256((const __m256i *)row[3][ib].qs);
+        __m256i r4 = _mm256_loadu_si256((const __m256i *)row[4][ib].qs), r5 = _mm256_loadu_si256((const __m256i *)row[5][ib].qs);
+        __m256i r6 = _mm256_loadu_si256((const __m256i *)row[6][ib].qs), r7 = _mm256_loadu_si256((const __m256i *)row[7][ib].qs);
+        __m256i t0 = _mm256_unpacklo_epi32(r0, r1), t1 = _mm256_unpackhi_epi32(r0, r1);
+        __m256i t2 = _mm256_unpacklo_epi32(r2, r3), t3 = _mm256_unpackhi_epi32(r2, r3);
+        __m256i t4 = _mm256_unpacklo_epi32(r4, r5), t5 = _mm256_unpackhi_epi32(r4, r5);
+        __m256i t6 = _mm256_unpacklo_epi32(r6, r7), t7 = _mm256_unpackhi_epi32(r6, r7);
+        __m256i u0 = _mm256_unpacklo_epi64(t0, t2), u1 = _mm256_unpackhi_epi64(t0, t2);
+        __m256i u2 = _mm256_unpacklo_epi64(t1, t3), u3 = _mm256_unpackhi_epi64(t1, t3);
+        __m256i u4 = _mm256_unpacklo_epi64(t4, t6), u5 = _mm256_unpackhi_epi64(t4, t6);
+        __m256i u6 = _mm256_unpacklo_epi64(t5, t7), u7 = _mm256_unpackhi_epi64(t5, t7);
+        __m256i *q = (__m256i *)dst[ib].qs;
+        _mm256_storeu_si256(q + 0, _mm256_permute2x128_si256(u0, u4, 0x20));
+        _mm256_storeu_si256(q + 1, _mm256_permute2x128_si256(u1, u5, 0x20));
+        _mm256_storeu_si256(q + 2, _mm256_permute2x128_si256(u2, u6, 0x20));
+        _mm256_storeu_si256(q + 3, _mm256_permute2x128_si256(u3, u7, 0x20));
+        _mm256_storeu_si256(q + 4, _mm256_permute2x128_si256(u0, u4, 0x31));
+        _mm256_storeu_si256(q + 5, _mm256_permute2x128_si256(u1, u5, 0x31));
+        _mm256_storeu_si256(q + 6, _mm256_permute2x128_si256(u2, u6, 0x31));
+        _mm256_storeu_si256(q + 7, _mm256_permute2x128_si256(u3, u7, 0x31));
+        for (int r = 0; r < 8; r++) dst[ib].d[r] = row[r][ib].d;
+    }
+}
+
+/* Plain Q8_0 weights, AVX2 (no VNNI): repack each 8-row group once per panel, then the same tile. */
+int picolm_sgemm_q8_0_avx2t(int m, int n, int k_blocks, const void *vA, int lda,
+                            const void *vB, int ldb, float *C, int ldc, int ith, int nth) {
+    if (m < 8 || (m % 8) != 0 || n < 1 || k_blocks < 1 || nth < 1) return 0;
+    const int nb = k_blocks, total_groups = m / 8, gpt = (total_groups + nth - 1) / nth;
+    const int g_start = ith * gpt, g_end = (ith + 1) * gpt < total_groups ? (ith + 1) * gpt : total_groups;
+    if (g_start >= g_end) return 1;
+    const int PC = r8a_panel_cols(nb);
+    if (!r8a_reserve(n < PC ? n : PC, nb, 1)) return 0;
+    for (int c0 = 0; c0 < n; c0 += PC) {
+        const int pc = (n - c0 < PC) ? (n - c0) : PC;
+        r8a_stage_panel(vB, (size_t)ldb, c0, pc, nb);
+        for (int g = g_start; g < g_end; g++) {
+            r8a_repack_group((const block_q8_0 *)vA, (size_t)lda, g, nb, r8a_tl.wr);
+            r8a_tiles(r8a_tl.wr, pc, nb, C + (size_t)c0 * ldc + (size_t)g * 8, (size_t)ldc);
+        }
+    }
+    return 1;
+}
+#else
+int sgemm_q8_0_r8_avx2t_q8_0(int nrows, int ncols, int k, const void *vx, const void *vy,
+                             float *out, size_t bs, int ith, int nth) {
+    (void)nrows; (void)ncols; (void)k; (void)vx; (void)vy; (void)out; (void)bs; (void)ith; (void)nth; return 0;
+}
+int picolm_sgemm_q8_0_avx2t(int m, int n, int k_blocks, const void *vA, int lda,
+                            const void *vB, int ldb, float *C, int ldc, int ith, int nth) {
+    (void)m; (void)n; (void)k_blocks; (void)vA; (void)lda; (void)vB; (void)ldb; (void)C; (void)ldc; (void)ith; (void)nth; return 0;
+}
+#endif
+
 /* ================================================================
  * sgemm_q8_0_r8_vnni_q8_0: AVX-512VL VNNI (256-bit dpbusd) GEMM for Q8_0_R8 weights.
  *
@@ -481,38 +656,6 @@ int sgemm_q8_0_r8_vnni_q8_0(int nrows, int ncols, int k,
     return (nrows / 8) * 8;
 }
 
-/* Repack one group of 8 plain Q8_0 rows into R8 blocks. An R8 block is byte-for-byte the size of
- * 8 Q8_0 blocks (272B), so this needs only an L2-sized scratch (nb*272B) and no model-format
- * change. The qs part is an 8x8 transpose of 32-bit words: R8 vector j = dword j of each row. */
-static void r8v_repack_group(const block_q8_0 *A, size_t lda, int g, int nb, block_q8_0_r8 *dst) {
-    const block_q8_0 *row[8];
-    for (int r = 0; r < 8; r++) row[r] = A + (size_t)(g * 8 + r) * lda;
-    for (int ib = 0; ib < nb; ib++) {
-        __m256i r0 = _mm256_loadu_si256((const __m256i *)row[0][ib].qs), r1 = _mm256_loadu_si256((const __m256i *)row[1][ib].qs);
-        __m256i r2 = _mm256_loadu_si256((const __m256i *)row[2][ib].qs), r3 = _mm256_loadu_si256((const __m256i *)row[3][ib].qs);
-        __m256i r4 = _mm256_loadu_si256((const __m256i *)row[4][ib].qs), r5 = _mm256_loadu_si256((const __m256i *)row[5][ib].qs);
-        __m256i r6 = _mm256_loadu_si256((const __m256i *)row[6][ib].qs), r7 = _mm256_loadu_si256((const __m256i *)row[7][ib].qs);
-        __m256i t0 = _mm256_unpacklo_epi32(r0, r1), t1 = _mm256_unpackhi_epi32(r0, r1);
-        __m256i t2 = _mm256_unpacklo_epi32(r2, r3), t3 = _mm256_unpackhi_epi32(r2, r3);
-        __m256i t4 = _mm256_unpacklo_epi32(r4, r5), t5 = _mm256_unpackhi_epi32(r4, r5);
-        __m256i t6 = _mm256_unpacklo_epi32(r6, r7), t7 = _mm256_unpackhi_epi32(r6, r7);
-        __m256i u0 = _mm256_unpacklo_epi64(t0, t2), u1 = _mm256_unpackhi_epi64(t0, t2);
-        __m256i u2 = _mm256_unpacklo_epi64(t1, t3), u3 = _mm256_unpackhi_epi64(t1, t3);
-        __m256i u4 = _mm256_unpacklo_epi64(t4, t6), u5 = _mm256_unpackhi_epi64(t4, t6);
-        __m256i u6 = _mm256_unpacklo_epi64(t5, t7), u7 = _mm256_unpackhi_epi64(t5, t7);
-        __m256i *q = (__m256i *)dst[ib].qs;
-        _mm256_storeu_si256(q + 0, _mm256_permute2x128_si256(u0, u4, 0x20));
-        _mm256_storeu_si256(q + 1, _mm256_permute2x128_si256(u1, u5, 0x20));
-        _mm256_storeu_si256(q + 2, _mm256_permute2x128_si256(u2, u6, 0x20));
-        _mm256_storeu_si256(q + 3, _mm256_permute2x128_si256(u3, u7, 0x20));
-        _mm256_storeu_si256(q + 4, _mm256_permute2x128_si256(u0, u4, 0x31));
-        _mm256_storeu_si256(q + 5, _mm256_permute2x128_si256(u1, u5, 0x31));
-        _mm256_storeu_si256(q + 6, _mm256_permute2x128_si256(u2, u6, 0x31));
-        _mm256_storeu_si256(q + 7, _mm256_permute2x128_si256(u3, u7, 0x31));
-        for (int r = 0; r < 8; r++) dst[ib].d[r] = row[r][ib].d;
-    }
-}
-
 /* Plain Q8_0 weights (rows of lda blocks) x Q8_0 activations (columns of ldb blocks),
  * same output convention as picolm_sgemm_d: C[c*ldc + r]. Returns 0 if unsupported. */
 int picolm_sgemm_q8_0_vnni(int m, int n, int k_blocks, const void *vA, int lda,
@@ -528,7 +671,7 @@ int picolm_sgemm_q8_0_vnni(int m, int n, int k_blocks, const void *vA, int lda,
         const int pc = (n - c0 < R8V_PC) ? (n - c0) : R8V_PC;
         r8v_stage_panel(vB, (size_t)ldb, c0, pc, nb);
         for (int g = g_start; g < g_end; g++) {
-            r8v_repack_group((const block_q8_0 *)vA, (size_t)lda, g, nb, r8v_tl.wr);
+            r8a_repack_group((const block_q8_0 *)vA, (size_t)lda, g, nb, r8v_tl.wr);
             r8v_tiles(r8v_tl.wr, pc, nb, C + (size_t)c0 * ldc + (size_t)g * 8, (size_t)ldc);
         }
     }
@@ -569,6 +712,17 @@ int sgemm_q8_0_r8_q8_0_best(int nrows, int ncols, int k, const void *vx, const v
         if (r) {
             static int traced; if (!traced && getenv("PICOLM_DISPATCH")) { traced = 1; fprintf(stderr, "TRACE kernel: sgemm_q8_0_r8_vnni_q8_0 (Q8_0_R8)\n"); }
             return r;
+        }
+    }
+    {
+        static int en2 = -1;
+        if (en2 < 0) { const char *e = getenv("PICOLM_Q8_AVX2T"); en2 = !(e && e[0] == '0'); }
+        if (en2 && ncols >= 8) {
+            int r = sgemm_q8_0_r8_avx2t_q8_0(nrows, ncols, k, vx, vy, out, bs, ith, nth);
+            if (r) {
+                static int traced; if (!traced && getenv("PICOLM_DISPATCH")) { traced = 1; fprintf(stderr, "TRACE kernel: sgemm_q8_0_r8_avx2t_q8_0 (Q8_0_R8, panel-blocked AVX2)\n"); }
+                return r;
+            }
         }
     }
     return sgemm_q8_0_r8_q8_0_avx2(nrows, ncols, k, vx, vy, out, bs, ith, nth);

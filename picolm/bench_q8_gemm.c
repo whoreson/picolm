@@ -85,10 +85,12 @@ static int check_mode(void){
         for(int cc=0;cc<n;cc++){for(int i=0;i<k;i++){s=s*1664525u+1013904223u;tmp[i]=((s>>8)&0xFFFF)/32768.0f-1.0f;}quantize_row_q8_0(tmp,B+(size_t)cc*ldb,k);
             for(int q=0;q<nb;q++)Bd[(size_t)cc*ldb+q]=fp16_to_fp32(B[(size_t)cc*ldb+q].d);}
         float *C1=calloc((size_t)n*m,sizeof(float)),*C2=calloc((size_t)n*m,sizeof(float));
-        if(n>=2) picolm_sgemm_d(m,n,nb,W,lda,B,ldb,Bd,ldb,C1,m,GGUF_TYPE_Q8_0,0,1);
-        else { /* sgemm_d needs n>=2: build reference by scalar math */
-            for(int cc=0;cc<n;cc++)for(int r=0;r<m;r++){double acc=0;for(int q=0;q<nb;q++){int is=0;for(int i=0;i<32;i++)is+=W[(size_t)r*lda+q].qs[i]*B[(size_t)cc*ldb+q].qs[i];acc+=(double)is*fp16_to_fp32(W[(size_t)r*lda+q].d)*Bd[(size_t)cc*ldb+q];}C1[(size_t)cc*m+r]=(float)acc;} }
+        /* independent scalar reference (the production sgemm_d path now also routes to the new kernels) */
+        for(int cc=0;cc<n;cc++)for(int r=0;r<m;r++){double acc=0;for(int q=0;q<nb;q++){int is=0;for(int i=0;i<32;i++)is+=W[(size_t)r*lda+q].qs[i]*B[(size_t)cc*ldb+q].qs[i];acc+=(double)is*fp16_to_fp32(W[(size_t)r*lda+q].d)*Bd[(size_t)cc*ldb+q];}C1[(size_t)cc*m+r]=(float)acc;}
         int ok=1; if(have_vnni) for(int th=0;th<nth;th++) ok&=picolm_sgemm_q8_0_vnni(m,n,nb,W,lda,B,ldb,C2,m,th,nth);
+        else { int a=1; for(int th=0;th<nth;th++) a&=picolm_sgemm_q8_0_avx2t(m,n,nb,W,lda,B,ldb,C2,m,th,nth);
+               if(a){ double m4=0,r4=0; for(size_t i=0;i<(size_t)n*m;i++){double d=fabs(C1[i]-C2[i]);if(d>m4)m4=d;r4+=C1[i]*C1[i];} r4=sqrt(r4/((size_t)n*m)+1e-30);
+                      if(m4>1e-4*r4+1e-3){ok=0;printf("FAIL avx2t-plain m=%d n=%d k=%d nth=%d maxdiff=%.3g\n",m,n,k,nth,m4);} } }
         /* R8 wrapper (fn_gemm for Q8_0_R8): repack the same bytes, activations must be contiguous (ldb==nb) */
         if(ldb==nb){
             block_q8_0_r8 *R8=malloc((size_t)(m/8)*nb*sizeof(block_q8_0_r8));
@@ -97,6 +99,9 @@ static int check_mode(void){
                     for(int l=0;l<4;l++)for(int i=0;i<4;i++){bb->qs[32*l+4*r+i]=sq->qs[4*l+i];bb->qs[32*l+4*r+i+128]=sq->qs[16+4*l+i];}}}
             float *C3=calloc((size_t)n*m,sizeof(float));
             for(int th=0;th<nth;th++) sgemm_q8_0_r8_q8_0_best(m,n,k,R8,B,C3,m,th,nth);
+            { float *C4=calloc((size_t)n*m,sizeof(float)); int a=1; for(int th=0;th<nth;th++) a&=sgemm_q8_0_r8_avx2t_q8_0(m,n,k,R8,B,C4,m,th,nth)!=0;
+              if(a){ double m4=0,r4=0; for(size_t i=0;i<(size_t)n*m;i++){double d=fabs(C1[i]-C4[i]);if(d>m4)m4=d;r4+=C1[i]*C1[i];} r4=sqrt(r4/((size_t)n*m)+1e-30);
+                     if(m4>1e-4*r4+1e-3){ok=0;printf("FAIL r8-avx2t m=%d n=%d k=%d nth=%d maxdiff=%.3g\n",m,n,k,nth,m4);} } free(C4); }
             double m3=0,rr=0; for(size_t i=0;i<(size_t)n*m;i++){double d=fabs(C1[i]-C3[i]);if(d>m3)m3=d;rr+=C1[i]*C1[i];} rr=sqrt(rr/((size_t)n*m)+1e-30);
             if(m3>1e-4*rr+1e-3){ok=0;printf("FAIL r8-best m=%d n=%d k=%d nth=%d maxdiff=%.3g\n",m,n,k,nth,m3);}
             free(R8);free(C3);
@@ -142,12 +147,17 @@ int main(int argc,char**argv){
     best=1e9;for(int r=0;r<reps&&okP;r++){double t=now();picolm_sgemm_q8_0_vnni(m,n,nb,W,nb,B,nb,CP,m,0,1);t=now()-t;if(t<best)best=t;}
     double gP=okP?ops/best/1e9:0, mdP=0; if(okP)for(size_t i=0;i<(size_t)n*m;i++){double d=fabs(CA[i]-CP[i]);if(d>mdP)mdP=d;}
     double md=0,rms=0;for(size_t i=0;i<(size_t)n*m;i++){double d=fabs(CA[i]-CB[i]);if(d>md)md=d;rms+=CA[i]*CA[i];}rms=sqrt(rms/((size_t)n*m));
+    float *CQ=calloc((size_t)n*m,sizeof(float));
+    int okQ=sgemm_q8_0_r8_avx2t_q8_0(m,n,k,R,B,CQ,m,0,1);
+    best=1e9;for(int r=0;r<reps&&okQ;r++){double t=now();sgemm_q8_0_r8_avx2t_q8_0(m,n,k,R,B,CQ,m,0,1);t=now()-t;if(t<best)best=t;}
+    double gQ=okQ?ops/best/1e9:0, mdQ=0; if(okQ)for(size_t i=0;i<(size_t)n*m;i++){double d=fabs(CB[i]-CQ[i]);if(d>mdQ)mdQ=d;}
     double pv=peak_vnni512(), pv2=peak_vnni256(), pa=peak_avx2_madd();
     printf("shape m=%d n=%d k=%d  (1 thread)\n",m,n,k);
     printf("  sgemm_d Q8_0 (current prefill)   : %7.1f GOPS   (ok=%d)\n",gA,okA);
     printf("  sgemm_q8_0_r8 AVX2 (R8 kernel)   : %7.1f GOPS   max|A-B|=%.2e (rms %.3g)\n",gB,md,rms);
     printf("  sgemm_q8_0_r8_vnni (new, 12-col)  : %7.1f GOPS   max|A-V|=%.2e%s\n",gV,mdV,okV?"":"   (unavailable: needs AVX-512 VNNI+VL build)");
     printf("  picolm_sgemm_q8_0_vnni (plain Q8_0 weights, on-the-fly repack): %7.1f GOPS   max|A-P|=%.2e   speedup vs current: %.2fx%s\n",gP,mdP,gA>0?gP/gA:0,okP?"":"   (unavailable)");
+    printf("  sgemm_q8_0_r8 AVX2 panel-blocked  : %7.1f GOPS   max|B-Q|=%.2e   speedup vs old r8-avx2: %.2fx%s\n",gQ,mdQ,gB>0?gQ/gB:0,okQ?"":"   (unavailable)");
     printf("  per-core peaks: VNNI zmm %.1f | VNNI ymm %.1f | AVX2 maddubs chain %.1f GOPS\n",pv,pv2,pa);
     if(pv2>0) printf("  efficiency vs ymm-VNNI peak: current %.1f%%  r8-avx2 %.1f%%  r8-vnni %.1f%%   (speedup of r8-vnni over current: %.2fx)\n",gA/pv2*100,gB/pv2*100,gV/pv2*100,gA>0?gV/gA:0);
     else printf("  (no AVX-512 VNNI in this build: VNNI peaks/kernels not available)\n");
