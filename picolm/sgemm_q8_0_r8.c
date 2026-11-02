@@ -523,10 +523,45 @@ void r8a_repack_impl(const char *A, size_t lda, int g, int nb, block_q8_0_r8 *ds
     }
 }
 
+/* IQ4_NL_R4 source: row group q = nb consecutive 72-byte blocks {d[4], qs[64]}. In qs, the 16-byte
+ * slice W_k = qs[16k..16k+15] holds dword k of rows 0..3, and per the layout (see
+ * dequantize_row_iq4_nl_r4_single) the nibbles land on natural values
+ *     lo(W0)=4j+i, j=0   hi(W0): j=2   lo(W2): j=1   hi(W2): j=3
+ *     lo(W1): j=4        hi(W1): j=6   lo(W3): j=5   hi(W3): j=7        (value index = 4*j + i)
+ * and R8 vector j wants dword j of each row, so no transpose is needed: an R8 group of 8 rows is two
+ * R4 groups, one per 128-bit half, and each R8 vector is one nibble-extract + VPSHUFB LUT. */
+static void r8a_repack_r4_iq4nl(const block_iq4_nl_r4 *A, int g, int nb, block_q8_0_r8 *dst) {
+    const __m256i lut = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)kvalues_iq4nl));
+    const __m256i m15 = _mm256_set1_epi8(15);
+    const block_iq4_nl_r4 *pa = A + (size_t)(2 * g) * nb, *pb = A + (size_t)(2 * g + 1) * nb;
+    for (int ib = 0; ib < nb; ib++) {
+        uint8_t *q = (uint8_t *)dst[ib].qs;
+        __m256i w[4];
+        for (int k = 0; k < 4; k++)
+            w[k] = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)(pa[ib].qs + 16 * k))),
+                                            _mm_loadu_si128((const __m128i *)(pb[ib].qs + 16 * k)), 1);
+#define R4_LO(k) _mm256_shuffle_epi8(lut, _mm256_and_si256(w[k], m15))
+#define R4_HI(k) _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(w[k], 4), m15))
+        _mm256_storeu_si256((__m256i *)(q +   0), R4_LO(0));
+        _mm256_storeu_si256((__m256i *)(q +  32), R4_LO(2));
+        _mm256_storeu_si256((__m256i *)(q +  64), R4_HI(0));
+        _mm256_storeu_si256((__m256i *)(q +  96), R4_HI(2));
+        _mm256_storeu_si256((__m256i *)(q + 128), R4_LO(1));
+        _mm256_storeu_si256((__m256i *)(q + 160), R4_LO(3));
+        _mm256_storeu_si256((__m256i *)(q + 192), R4_HI(1));
+        _mm256_storeu_si256((__m256i *)(q + 224), R4_HI(3));
+#undef R4_LO
+#undef R4_HI
+        memcpy(&dst[ib].d[0], pa[ib].d, 4 * sizeof(uint16_t));
+        memcpy(&dst[ib].d[4], pb[ib].d, 4 * sizeof(uint16_t));
+    }
+}
+
 static void r8a_repack_group(int atype, const void *A, size_t lda, int g, int nb, block_q8_0_r8 *dst) {
     switch (atype) {
     case GGUF_TYPE_Q4_0:   r8a_repack_impl((const char *)A, lda, g, nb, dst, R8A_T_Q4_0); break;
     case GGUF_TYPE_IQ4_NL: r8a_repack_impl((const char *)A, lda, g, nb, dst, R8A_T_IQ4_NL); break;
+    case GGUF_TYPE_IQ4_NL_R4: (void)lda; r8a_repack_r4_iq4nl((const block_iq4_nl_r4 *)A, g, nb, dst); break;
     default:               r8a_repack_impl((const char *)A, lda, g, nb, dst, R8A_T_Q8_0); break;
     }
 }
@@ -534,7 +569,7 @@ static void r8a_repack_group(int atype, const void *A, size_t lda, int g, int nb
 /* Plain Q8_0 weights, AVX2 (no VNNI): repack each 8-row group once per panel, then the same tile. */
 int picolm_sgemm_r8dec_avx2t(int atype, int m, int n, int k_blocks, const void *vA, int lda,
                              const void *vB, int ldb, float *C, int ldc, int ith, int nth) {
-    if (atype != GGUF_TYPE_Q8_0 && atype != GGUF_TYPE_Q4_0 && atype != GGUF_TYPE_IQ4_NL) return 0;
+    if (atype != GGUF_TYPE_Q8_0 && atype != GGUF_TYPE_Q4_0 && atype != GGUF_TYPE_IQ4_NL && atype != GGUF_TYPE_IQ4_NL_R4) return 0;
     if (m < 8 || (m % 8) != 0 || n < 1 || k_blocks < 1 || nth < 1) return 0;
     const int nb = k_blocks, total_groups = m / 8, gpt = (total_groups + nth - 1) / nth;
     const int g_start = ith * gpt, g_end = (ith + 1) * gpt < total_groups ? (ith + 1) * gpt : total_groups;
@@ -700,7 +735,7 @@ int sgemm_q8_0_r8_vnni_q8_0(int nrows, int ncols, int k,
  * same output convention as picolm_sgemm_d: C[c*ldc + r]. Returns 0 if unsupported. */
 int picolm_sgemm_r8dec_vnni(int atype, int m, int n, int k_blocks, const void *vA, int lda,
                             const void *vB, int ldb, float *C, int ldc, int ith, int nth) {
-    if (atype != GGUF_TYPE_Q8_0 && atype != GGUF_TYPE_Q4_0 && atype != GGUF_TYPE_IQ4_NL) return 0;
+    if (atype != GGUF_TYPE_Q8_0 && atype != GGUF_TYPE_Q4_0 && atype != GGUF_TYPE_IQ4_NL && atype != GGUF_TYPE_IQ4_NL_R4) return 0;
     if (m < 8 || (m % 8) != 0 || n < 1 || k_blocks < 1 || nth < 1) return 0;
     const int nb = k_blocks, total_groups = m / 8;
     const int gpt = (total_groups + nth - 1) / nth;
@@ -776,4 +811,36 @@ int sgemm_q8_0_r8_q8_0_best(int nrows, int ncols, int k, const void *vx, const v
         }
     }
     return sgemm_q8_0_r8_q8_0_avx2(nrows, ncols, k, vx, vy, out, bs, ith, nth);
+}
+
+/* ================================================================
+ * sgemm_iq4_nl_r4_q8_0_best: table fn_gemm for IQ4_NL_R4. Same decode-once structure as plain
+ * IQ4_NL: each 8-row group (two R4 groups) is expanded once per column panel to an int8 R8 scratch
+ * and fed to the tiled VNNI (AVX-512 VNNI+VL builds) or AVX2 kernel. Falls back to the original
+ * 1x4-tile kernel for small batches, row counts not divisible by 8, or builds without AVX2.
+ * PICOLM_Q4_R8=0 disables; PICOLM_Q4_R8_MIN_N (default 16) sets the smallest batch.
+ * ================================================================ */
+int sgemm_iq4_nl_r4_q8_0_best(int nrows, int ncols, int k, const void *vx, const void *vy,
+                              float *out, size_t bs, int ith, int nth) {
+    static int en = -1, min_n = 16, vnni_en = 1, avx2_en = 1;
+    if (en < 0) {
+        const char *e = getenv("PICOLM_Q4_R8"), *mn = getenv("PICOLM_Q4_R8_MIN_N");
+        const char *ve = getenv("PICOLM_Q8_VNNI"), *ae = getenv("PICOLM_Q8_AVX2T");
+        if (mn && atoi(mn) > 0) min_n = atoi(mn);
+        if (ve && ve[0] == '0') vnni_en = 0;
+        if (ae && ae[0] == '0') avx2_en = 0;
+        en = !(e && e[0] == '0');
+    }
+    if (en && ncols >= min_n && k % 32 == 0 && nrows % 8 == 0) {
+        const int nb = k / 32;
+        if (vnni_en && picolm_sgemm_r8dec_vnni(GGUF_TYPE_IQ4_NL_R4, nrows, ncols, nb, vx, nb, vy, nb, out, (int)bs, ith, nth)) {
+            static int tr; if (!tr && getenv("PICOLM_DISPATCH")) { tr = 1; fprintf(stderr, "TRACE kernel: picolm_sgemm_r8dec_vnni (IQ4_NL_R4)\n"); }
+            return 1;
+        }
+        if (avx2_en && picolm_sgemm_r8dec_avx2t(GGUF_TYPE_IQ4_NL_R4, nrows, ncols, nb, vx, nb, vy, nb, out, (int)bs, ith, nth)) {
+            static int tr; if (!tr && getenv("PICOLM_DISPATCH")) { tr = 1; fprintf(stderr, "TRACE kernel: picolm_sgemm_r8dec_avx2t (IQ4_NL_R4)\n"); }
+            return 1;
+        }
+    }
+    return sgemm_iq4_nl_r4_q8_0_avx2(nrows, ncols, k, vx, vy, out, bs, ith, nth);
 }

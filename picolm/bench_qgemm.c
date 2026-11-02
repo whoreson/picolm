@@ -9,13 +9,17 @@
 #include "quant.h"
 #include "sgemm.h"
 #include "tensor.h"
+#include "type_dispatch.h"
 void fp16_table_init(void);
 static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec*1e-9;}
 static unsigned rs=12345; static unsigned rnd(void){rs=rs*1664525u+1013904223u;return rs>>8;}
 static float fr(void){return (rnd()&0xFFFF)/32768.0f-1.0f;}
 typedef struct { const char *name; int type; size_t bsz; } qt_t;
 static const qt_t QT[] = {{"q8_0",GGUF_TYPE_Q8_0,sizeof(block_q8_0)},{"q4_0",GGUF_TYPE_Q4_0,sizeof(block_q4_0)},
-                          {"iq4_nl",GGUF_TYPE_IQ4_NL,sizeof(block_iq4_nl)},{"q5_0",GGUF_TYPE_Q5_0,sizeof(block_q5_0)}};
+                          {"iq4_nl",GGUF_TYPE_IQ4_NL,sizeof(block_iq4_nl)},{"iq4_nl_r4",GGUF_TYPE_IQ4_NL_R4,sizeof(block_iq4_nl)},{"q5_0",GGUF_TYPE_Q5_0,sizeof(block_q5_0)}};
+static void fill_r4(unsigned char *p, size_t n){                      /* 72-byte blocks: d[4] + qs[64] */
+    for(size_t i=0;i+72<=n;i+=72){ for(int j=0;j<72;j++) p[i+j]=(unsigned char)rnd(); for(int r=0;r<4;r++){uint16_t d=fp32_to_fp16(0.01f+(rnd()&255)*1e-4f); memcpy(p+i+2*r,&d,2);} }
+}
 static void fill_w(unsigned char *p, size_t n, size_t bsz){          /* random payload + sane fp16 scale in first 2 bytes */
     for(size_t i=0;i<n;i+=bsz){ for(size_t j=0;j<bsz;j++) p[i+j]=(unsigned char)rnd(); uint16_t d=fp32_to_fp16(0.01f+(rnd()&255)*1e-4f); memcpy(p+i,&d,2); }
 }
@@ -29,31 +33,43 @@ static int wval(int type,const unsigned char*b,int i){
 }
 static int run(const qt_t*t,int m,int n,int k,int reps,int nth,int check){
     int nb=k/32; size_t wrow=(size_t)nb*t->bsz, qrow=(size_t)nb*sizeof(block_q8_0);
-    unsigned char *W=malloc((size_t)m*wrow); fill_w(W,(size_t)m*wrow,t->bsz);
+    int isr4=(t->type==GGUF_TYPE_IQ4_NL_R4); if(isr4 && (m%4)) return 0;
+    unsigned char *W=malloc((size_t)m*wrow); if(isr4) fill_r4(W,(size_t)m*wrow); else fill_w(W,(size_t)m*wrow,t->bsz);
     block_q8_0 *B=malloc((size_t)n*qrow); float *Bd=malloc(sizeof(float)*(size_t)n*nb), *tmp=malloc(sizeof(float)*k);
     for(int c=0;c<n;c++){for(int i=0;i<k;i++)tmp[i]=fr();quantize_row_q8_0(tmp,(char*)B+c*qrow,k);
         const block_q8_0*bl=(const block_q8_0*)((char*)B+c*qrow);for(int b=0;b<nb;b++)Bd[(size_t)c*nb+b]=fp16_to_fp32(bl[b].d);}
     float *C=calloc((size_t)n*m,sizeof(float));
     int ok=1;
-    if(nth<=1) ok=picolm_sgemm_d(m,n,nb,W,nb,B,nb,Bd,nb,C,m,t->type,0,1);
-    else { for(int i=0;i<nth;i++) ok&=picolm_sgemm_d(m,n,nb,W,nb,B,nb,Bd,nb,C,m,t->type,i,nth); }  /* serial emulation of split */
+    const type_info_t *ti = isr4 ? typeinfo((gguf_type_t)t->type) : NULL;
+#define GEMM_CALL(ith,nthv) (isr4 ? ti->fn_gemm(m,n,k,W,B,C,(size_t)m,ith,nthv) : picolm_sgemm_d(m,n,nb,W,nb,B,nb,Bd,nb,C,m,t->type,ith,nthv))
+    if(nth<=1) ok=GEMM_CALL(0,1);
+    else { for(int i=0;i<nth;i++) ok&=GEMM_CALL(i,nth); }  /* serial emulation of split */
     double gops=0; 
     if(!ok){ printf("%-7s prefill: picolm_sgemm_d unsupported for this type/build (falls to per-column vec_dot)\n",t->name); }
     else {
-        double best=1e9; for(int r=0;r<reps;r++){double t0=now();picolm_sgemm_d(m,n,nb,W,nb,B,nb,Bd,nb,C,m,t->type,0,1);double dt=now()-t0;if(dt<best)best=dt;}
+        double best=1e9; for(int r=0;r<reps;r++){double t0=now();GEMM_CALL(0,1);double dt=now()-t0;if(dt<best)best=dt;}
         gops=2.0*m*n*k/best/1e9; printf("%-7s prefill m=%d n=%d k=%d : %7.1f GOPS (1 thread)\n",t->name,m,n,k,gops);
     }
-    if(check){
+    if(check && ok){
         double maxd=0,rms=0; int bad=0;
+        float *rowf=malloc(sizeof(float)*k);
+        if(isr4){ for(int r=0;r<m&&r<64;r++){ const block_iq4_nl_r4*gb=(const block_iq4_nl_r4*)(W+(size_t)(r/4)*nb*72); dequantize_row_iq4_nl_r4_single(gb,rowf,k,r%4);
+                for(int c=0;c<n&&c<8;c++){ double acc=0; const block_q8_0*yb=(const block_q8_0*)((char*)B+c*qrow);
+                    for(int q=0;q<nb;q++) for(int i=0;i<32;i++) acc+=(double)rowf[q*32+i]*yb[q].qs[i]*Bd[(size_t)c*nb+q];
+                    double dd=fabs(acc-C[(size_t)c*m+r]); if(dd>maxd)maxd=dd; rms+=acc*acc; } } }
+        else
         for(int c=0;c<n&&c<8;c++)for(int r=0;r<m&&r<64;r++){ double acc=0;
             for(int q=0;q<nb;q++){ const unsigned char*wb=W+(size_t)r*wrow+(size_t)q*t->bsz; int is=0;
                 for(int i=0;i<32;i++) is+=wval(t->type,wb,i)*((const block_q8_0*)((char*)B+c*qrow))[q].qs[i];
                 uint16_t d; memcpy(&d,wb,2); acc+=(double)is*fp16_to_fp32(d)*Bd[(size_t)c*nb+q]; }
             double dd=fabs(acc-C[(size_t)c*m+r]); if(dd>maxd)maxd=dd; rms+=acc*acc; }
-        rms=sqrt(rms/(8.0*64)); if(maxd>1e-3*rms+1e-3){bad=1;} printf("%-7s check: maxdiff=%.3g (rms %.3g) %s\n",t->name,maxd,rms,bad?"FAIL":"ok"); if(bad) return 1;
+        free(rowf); rms=sqrt(rms/(8.0*64)); if(maxd>1e-3*rms+1e-3){bad=1;} printf("%-7s check: maxdiff=%.3g (rms %.3g) %s\n",t->name,maxd,rms,bad?"FAIL":"ok"); if(bad) return 1;
     }
     /* decode: dot of every weight row against one activation, weights >> cache (no exported Q5_0 dot) */
-    if(t->type!=GGUF_TYPE_Q5_0){ size_t rows=(size_t)m; double best=1e9; float sink=0; const block_q8_0*y=B;
+    if(isr4){ size_t groups=(size_t)m/4; double best=1e9; float o4[4]; float sink=0; const block_q8_0*y=B;
+      for(int r=0;r<reps;r++){ double t0=now(); for(size_t g=0;g<groups;g++){ ti->fn_gemv(W+g*(size_t)nb*72,y,k,o4,4); sink+=o4[0]; } double dt=now()-t0; if(dt<best)best=dt; }
+      printf("%-9s decode gemv: %6.1f ns/row (k=%d)  %5.2f GB/s weights  [%g]\n",t->name,best*1e9/m,k,(double)m*wrow/best/1e9,sink); }
+    else if(t->type!=GGUF_TYPE_Q5_0){ size_t rows=(size_t)m; double best=1e9; float sink=0; const block_q8_0*y=B;
       for(int r=0;r<reps;r++){ double t0=now();
         for(size_t i=0;i<rows;i++){ const void*w=W+i*wrow;
             sink+= t->type==GGUF_TYPE_Q8_0?vec_dot_q8_0_q8_0(w,y,k): t->type==GGUF_TYPE_Q4_0?vec_dot_q4_0_q8_0(w,y,k): t->type==GGUF_TYPE_IQ4_NL?vec_dot_iq4_nl_q8_0(w,y,k): 0.0f; }
