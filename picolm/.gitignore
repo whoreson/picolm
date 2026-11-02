@@ -27,3 +27,26 @@ tests/test_glm5_ops
 tests/test_glm5_ops.exe
 test_glm5_snapshot
 test_glm5_dsa
+
+# bench binaries
+bench_q8_gemm
+bench_iq6k_gemm
+bench_qgemm
+
+# stale binaries from old builds
+picolm.avx2.pre
+picolm.avx2.post
+picolm.best
+picolm09
+
+# test binaries
+test_attn_decode
+test_hreduce
+test_kvcache_tokwrite
+test_pool_stress
+test_q6_k_r4
+
+# misc
+main.log
+*.orig
+*.rej
