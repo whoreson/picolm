@@ -539,29 +539,50 @@ void r8a_repack_impl(const char *A, size_t lda, int g, int nb, block_q8_0_r8 *ds
     }
 }
 
-/* IQ4_NL_R4 source: each R4 block = 4 rows of {fp16 d, 16 qs bytes}.
- * Decode each row's 16 bytes to 32 int8 values (LUT), then R8-transpose
- * the 8 rows (two R4 groups) identically to r8a_repack_impl. */
+/* IQ4_NL_R4 source: one 72-byte block = 4 interleaved rows of {fp16 d, qs[64]}.
+ *
+ * Row r's 32 nibble values come from FOUR 4-byte windows spread over the whole
+ * 64-byte qs[]. That is the Q4_0_4_4 "blocklen=4" interleave (see
+ * dequantize_row_iq4_nl_r4_single in quant.c), with the non-linear IQ4_NL LUT
+ * instead of the signed-nibble subtraction:
+ *
+ *     qs[4*r + i +  0] -> low  nibble = value[i +  0], high nibble = value[i +  8]
+ *     qs[4*r + i + 16] -> low  nibble = value[i + 16], high nibble = value[i + 24]
+ *     qs[4*r + i + 32] -> low  nibble = value[i +  4], high nibble = value[i + 12]
+ *     qs[4*r + i + 48] -> low  nibble = value[i + 20], high nibble = value[i + 28]
+ *
+ * (An earlier version read qs[16*r .. 16*r+15] as if each row were 16 contiguous
+ * bytes, which is the Q4_0_4_4 *byte* layout rather than this one: it silently
+ * produced 32 values built from only a quarter of the block, so every prefill
+ * GEMM that went through the R8 path was wrong.)
+ *
+ * Decode each row to its 32 int8 values in NATURAL order, then R8-transpose the
+ * 8 rows (two R4 groups of 4) exactly like r8a_repack_impl(). */
 static void r8a_repack_r4_iq4nl(const block_iq4_nl_r4 *A, int g, int nb, block_q8_0_r8 *dst) {
-    const __m256i lut = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)kvalues_iq4nl));
-    const __m256i m15 = _mm256_set1_epi8(15);
     const block_iq4_nl_r4 *pa = A + (size_t)(2 * g) * nb, *pb = A + (size_t)(2 * g + 1) * nb;
     for (int ib = 0; ib < nb; ib++) {
         /* Decode 8 rows to 8 x 32-byte int8 vectors, then R8-transpose. */
         __m256i r[8];
-        for (int rr = 0; rr < 4; rr++) {
-            const uint8_t *qs = pa[ib].qs + 16 * rr;
-            __m128i v = _mm_loadu_si128((const __m128i *)qs);
-            __m256i x = _mm256_and_si256(
-                _mm256_inserti128_si256(_mm256_castsi128_si256(v), _mm_srli_epi16(v, 4), 1), m15);
-            r[rr] = _mm256_shuffle_epi8(lut, x);
-        }
-        for (int rr = 0; rr < 4; rr++) {
-            const uint8_t *qs = pb[ib].qs + 16 * rr;
-            __m128i v = _mm_loadu_si128((const __m128i *)qs);
-            __m256i x = _mm256_and_si256(
-                _mm256_inserti128_si256(_mm256_castsi128_si256(v), _mm_srli_epi16(v, 4), 1), m15);
-            r[4 + rr] = _mm256_shuffle_epi8(lut, x);
+        for (int rr = 0; rr < 8; ++rr) {
+            const block_iq4_nl_r4 *b = (rr < 4) ? &pa[ib] : &pb[ib];
+            const int row = rr & 3;
+            const uint8_t *qs = b->qs;
+            int8_t v[32];
+            for (int i = 0; i < 4; ++i) {
+                const uint8_t b0 = qs[4 * row + i +  0];
+                const uint8_t b1 = qs[4 * row + i + 16];
+                const uint8_t b2 = qs[4 * row + i + 32];
+                const uint8_t b3 = qs[4 * row + i + 48];
+                v[i +  0] = kvalues_iq4nl[b0 & 0xf];
+                v[i +  8] = kvalues_iq4nl[b0 >> 4];
+                v[i + 16] = kvalues_iq4nl[b1 & 0xf];
+                v[i + 24] = kvalues_iq4nl[b1 >> 4];
+                v[i +  4] = kvalues_iq4nl[b2 & 0xf];
+                v[i + 12] = kvalues_iq4nl[b2 >> 4];
+                v[i + 20] = kvalues_iq4nl[b3 & 0xf];
+                v[i + 28] = kvalues_iq4nl[b3 >> 4];
+            }
+            r[rr] = _mm256_loadu_si256((const __m256i *)v);
         }
         __m256i t0 = _mm256_unpacklo_epi32(r[0], r[1]), t1 = _mm256_unpackhi_epi32(r[0], r[1]);
         __m256i t2 = _mm256_unpacklo_epi32(r[2], r[3]), t3 = _mm256_unpackhi_epi32(r[2], r[3]);
