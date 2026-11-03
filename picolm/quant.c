@@ -7179,6 +7179,30 @@ float vec_dot_q2_K_f32(const void *src, const float *x, int n) {
 
 /* ---- Generic dispatch ---- */
 
+/* Row-aware vec_dot: see quant.h. Only row 0 of a block group is reachable
+ * through plain vec_dot(), so interleaved types are dequantized row-wise. */
+float vec_dot_row(const void *base, const float *x, int n, gguf_type_t type, int row) {
+    const int rpb = gguf_type_rows_per_block(type);
+    if (rpb <= 1) return vec_dot(base, x, n, type);
+    const int rin = row % rpb;
+    const void *blk = gguf_type_row_ptr(base, type, gguf_type_row_size(type, n), row);
+    switch (type) {
+    case GGUF_TYPE_IQ4_NL_R4: {
+        float *tmp = (float *)malloc((size_t)n * sizeof(float));
+        if (!tmp) return 0.0f;
+        dequantize_row_iq4_nl_r4_single((const block_iq4_nl_r4 *)blk, tmp, n, rin);
+        float r = vec_dot_f32_f32(tmp, x, n);
+        free(tmp);
+        return r;
+    }
+    default:
+        /* Other interleaved types have no single-row dequantizer wired into
+         * vec_dot yet; dequantize the whole group and use the plain path. */
+        return vec_dot(gguf_type_row_ptr(base, type, gguf_type_row_size(type, n),
+                                        row - rin), x, n, type);
+    }
+}
+
 float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
     switch (type) {
         case GGUF_TYPE_Q4_K: return vec_dot_q4_K_f32(src, x, n);

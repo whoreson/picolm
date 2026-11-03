@@ -507,6 +507,53 @@ static inline act_fmt_t qtype_act_format(gguf_type_t qtype) {
     }
 }
 
+/* Number of logical rows packed into one physical block group on disk.
+ * 1 for ordinary (row-major) quant types; 4 for the "R4" row-interleaved
+ * types, 8 for the "R8" ones. Interleaved formats store the first 4 (or 8)
+ * logical rows of a tensor side by side inside each block, so the byte
+ * offset of a logical row is NOT row * gguf_type_row_size():
+ * the containing group starts at (row / rpb) * row_size * rpb, and the row
+ * itself is row % rpb inside that group. Any code that walks head/row
+ * pointers by a single row stride must go through
+ * gguf_type_row_ptr() below. */
+static inline int gguf_type_rows_per_block(gguf_type_t type) {
+    switch (type) {
+    case GGUF_TYPE_IQ2_K_R4:
+    case GGUF_TYPE_IQ3_K_R4:
+    case GGUF_TYPE_IQ4_K_R4:
+    case GGUF_TYPE_IQ4_NL_R4:
+    case GGUF_TYPE_Q4_K_R4:
+    case GGUF_TYPE_Q6_K_R4:
+    case GGUF_TYPE_Q4_0_4_4:
+    case GGUF_TYPE_Q4_0_4_8:
+        return 4;
+    case GGUF_TYPE_Q4_0_8_8:
+    case GGUF_TYPE_Q4I_0_8_8:
+    case GGUF_TYPE_Q4_0_R8:
+    case GGUF_TYPE_Q8_0_R8:
+        return 8;
+    default:
+        return 1;
+    }
+}
+
+/* Start of the on-disk block group that contains logical row `row`.
+ * For ordinary types this is just base + row * row_size. For R4/R8 it is the
+ * group base; pair it with gguf_type_row_in_block() to pick the row inside.
+ * `row_size` must be gguf_type_row_size(type, n). */
+static inline const void *gguf_type_row_ptr(const void *base, gguf_type_t type,
+                                            size_t row_size, int row) {
+    int rpb = gguf_type_rows_per_block(type);
+    if (rpb <= 1) return (const char *)base + (size_t)row * row_size;
+    return (const char *)base + (size_t)(row / rpb) * row_size * (size_t)rpb;
+}
+
+/* Index of logical row `row` inside the group returned by gguf_type_row_ptr(). */
+static inline int gguf_type_row_in_block(gguf_type_t type, int row) {
+    int rpb = gguf_type_rows_per_block(type);
+    return rpb <= 1 ? 0 : (row % rpb);
+}
+
 /* Packed struct attribute: empty on mainstream compilers where #pragma pack works,
  * but adds __attribute__((packed)) for LLVM-GCC 4.0.1 (iPhoneOS 1) which ignores
  * #pragma pack and pads structs to 4-byte boundaries.
@@ -1556,6 +1603,17 @@ void quantize_row_q8_K(const float *x, void *dst, int n);
 
 /* Generic fused dot product dispatch. Returns dot(dequant(src), x) for n elements. */
 float vec_dot(const void *src, const float *x, int n, gguf_type_t type);
+/* Row-aware vec_dot for row-interleaved (R4/R8) weight types.
+ *
+ * gguf_type_row_ptr()/gguf_type_row_in_block() resolve WHICH logical row a
+ * caller wants, but plan vec_dot() only ever reads row 0 of the block it is
+ * handed. Handing it (base + row * row_size) from an interleaved tensor
+ * therefore silently computes the wrong row for 3 of every 4 (R4) or 7 of
+ * every 8 (R8) rows -- and reads a misaligned block for the rest, which can
+ * even produce inf/NaN. Use this when walking individual rows of such a type:
+ *   vec_dot_row(w, x, n, type, row)
+ * It is identical to vec_dot() for non-interleaved types. */
+float vec_dot_row(const void *base, const float *x, int n, gguf_type_t type, int row);
 
 /* Scale-and-add: dst[i] += scale * dequant(src[i]).
  * Used for V-cache accumulation in attention with quantized V cache. */
