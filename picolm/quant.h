@@ -440,6 +440,15 @@ typedef enum {
     GGUF_TYPE_Q4I_0_8_8  = 34,  /* 8-row pre-dequantized int8 Q4_0 (dpbusd lane order, AVX-512) */
     GGUF_TYPE_BF16      = 30,  /* Brain Float 16 (GGUF type 30) */
     GGUF_TYPE_IQ4_NL    = 20,  /* Non-linear 4-bit quant (LUT-based, same layout as Q4_0) */
+    /* 4-row interleaved IQ4_NL.
+     *
+     * 220 is the per-tensor type id (GGML_TYPE_IQ4_NL_R4 in ggml.h) and is what
+     * appears in every tensor header. Do not confuse it with the *file-level*
+     * tag `general.file_type`, which for an IQ4_NL_R4 model is a different
+     * number entirely (LLAMA_FTYPE_MOSTLY_IQ4_NL_R4 = 225 in include/llama.h).
+     * We only ever read per-tensor ids, so only 220 matters here. ik_llama's
+     * `llama-quantize --help` prints the file-type number, which is why it
+     * looks like a competing type id; it is not one. */
     GGUF_TYPE_IQ4_NL_R4 = 220, /* 4-row interleaved IQ4_NL (repacked, AVX-512/AVX2 target) */
     GGUF_TYPE_IQ4_XS    = 23,  /* Non-linear 4-bit quant with per-subblock scales (K-style, GGUF type 23) */
     GGUF_TYPE_IQ2_K     = 137, /* Plain IQ2_K (non-interleaved, GGUF type 137) */
@@ -1158,6 +1167,10 @@ void dequantize_row_q6_K_R4(const void *src, float *dst, int n);
 void dequantize_row_q6_0(const void *src, float *dst, int n);
 void dequantize_row_q5_K(const void *src, float *dst, int n);
 void dequantize_row_q4_0(const void *src, float *dst, int n);
+/* Q5_0 dequantize (22-byte blocks). Was defined in quant.c but never declared
+ * here, so any test or tool that called it got an implicit int-returning
+ * declaration -- which silently truncates float results. */
+void dequantize_row_q5_0(const void *src, float *dst, int n);
 void dequantize_row_iq4_nl(const void *src, float *dst, int n);
 void dequantize_row_f16(const void *src, float *dst, int n);
 void dequantize_row_f32(const void *src, float *dst, int n);
@@ -1224,6 +1237,10 @@ float vec_dot_q1_0_q8_0(const void *src_q1, const void *src_q8, int n);
 float vec_dot_q2_0_q8_0(const void *src_q2, const void *src_q8, int n);
 /* Q4_0 * Q8_0 dot product: Q4_0 weights with pre-quantized Q8_0 input */
 float vec_dot_q4_0_q8_0(const void *src_q4, const void *src_q8, int n);
+/* Q5_0 x Q8_0: portable scalar (no SIMD). Q5_0 is the only legacy type that
+ * lacked a fused Q8_0-activation dot, which left it unusable on scalar-only
+ * builds. See the comment on the definition in quant.c. */
+float vec_dot_q5_0_q8_0(const void *src_q5, const void *src_q8, int n);
 /* IQ4_NL * Q8_0 dot product: IQ4_NL weights with pre-quantized Q8_0 input */
 float vec_dot_iq4_nl_q8_0(const void *src_iq4, const void *src_q8, int n);
 /* IQ4_NL * F32 dot product: fused dequant + dot (scalar fallback) */

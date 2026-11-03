@@ -5828,6 +5828,55 @@ float vec_dot_q5_0_f32(const void *src, const float *x, int n) {
     return sumf;
 }
 
+/* vec_dot_q5_0_q8_0: Q5_0 weights x Q8_0 activations (integer MAC + per-block
+ * float scale).
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * Every other 4/5-bit legacy type has a fused "<type> x Q8_0" scalar dot
+ * (vec_dot_q4_0_q8_0, vec_dot_q5_1_q8_0, vec_dot_iq4_nl_q8_0, ...). Q5_0 did
+ * not -- it only had vec_dot_q5_0_f32, which wants FLOAT activations. Because
+ * Q5_0's declared activation format is Q8_0, every generic caller hands it the
+ * QUANTIZED buffer, so there was no way to consume a Q5_0 tensor at all
+ * without a SIMD GEMM:
+ *
+ *   - matmul_worker_f's last-resort branch passed the raw block_q8_0 bytes to
+ *     the F32 path, i.e. reinterpreted Q8_0 blocks as float* -> NaN;
+ *   - with no fn_gemv, that branch is what a scalar-only build (MS-DOS, or any
+ *     target without picolm_sgemm_d) would take for a Q5_0 tensor.
+ *
+ * That made Q5_0 the one legacy type that could not be used on a scalar build,
+ * which is why this function is written to be portable C with no #ifdef: the
+ * point is that it works everywhere, not that it is fast. A single 48-byte
+ * block processed as 32 int8 MACs is trivial for any target.
+ *
+ * Layout: block_q5_0 = {fp16 d; u8 qh[4]; u8 qs[16]}. qh bit j is value j's
+ * 5th bit (j = 0..31); qs[j] low nibble is value j, high nibble value j+16.
+ * Values are signed 5-bit, centred by subtracting 16.
+ */
+float vec_dot_q5_0_q8_0(const void *vx, const void *wy, int n) {
+    const block_q5_0 *x = (const block_q5_0 *)vx;
+    const block_q8_0 *y = (const block_q8_0 *)wy;
+    const int nb = n / 32;
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ib++) {
+        const float d = fp16_to_fp32_lookup(x[ib].d) * fp16_to_fp32_lookup(y[ib].d);
+        uint32_t qh;
+        memcpy(&qh, x[ib].qh, sizeof(qh));
+        const uint8_t *qs = x[ib].qs;
+        const int8_t  *ya = y[ib].qs;
+        int sumi = 0;
+        for (int j = 0; j < 16; j++) {
+            const int q0 = ((qs[j] & 0x0F) | (int)((qh >> j) & 1u) << 4) - 16;         /* value j      */
+            const int q1 = ((qs[j] >> 4)   | (int)((qh >> (j + 16)) & 1u) << 4) - 16;  /* value j + 16 */
+            sumi += q0 * ya[j] + q1 * ya[j + 16];
+        }
+        sumf += (float)sumi * d;
+    }
+    return sumf;
+}
+
 /* vec_dot_q5_1_f32: fused dequant + dot for Q5_1 x float32
  * Q5_1: unsigned 5-bit (0..31) + min offset. qh bits 0..15 for low, 16..31 for high. */
 float vec_dot_q5_1_f32(const void *src, const float *x, int n) {

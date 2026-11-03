@@ -40,6 +40,13 @@ static void gemv_q5_1(const void *w, const void *a, int n, float *out, int nrows
     *out = vec_dot_q5_1_q8_0(w, a, n);
 }
 
+/* Q5_0: takes Q8_0 activations like every other fn_gemv. Portable scalar, so a
+ * DOS / no-SIMD build can read Q5_0 tensors. */
+static void gemv_q5_0(const void *w, const void *a, int n, float *out, int nrows) {
+    (void)nrows;
+    *out = vec_dot_q5_0_q8_0(w, a, n);
+}
+
 static void gemv_q4_K(const void *w, const void *a, int n, float *out, int nrows) {
     (void)nrows;
     *out = vec_dot_q4_K_q8_K(w, a, n);
@@ -542,7 +549,7 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
     [GGUF_TYPE_Q5_0] = {
         .act_fmt = ACT_FMT_Q8_0,
         .rows_per_block = 1,
-        .fn_gemv = NULL, /* no dedicated AVX2 GEMV in tensor.c, uses generic */
+        .fn_gemv = gemv_q5_0, /* portable Q5_0 x Q8_0 scalar dot */
         .fn_gemm = NULL, /* picolm_sgemm handles Q5_0 */
         .has_qgemm_d = 1, /* picolm_sgemm_d supports Q5_0 */
         .fn_dequant_single = NULL,
