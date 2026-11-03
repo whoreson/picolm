@@ -24,7 +24,7 @@ static int verbose = 0;
 static int tests_run, tests_pass, tests_fail;
 /* Floor on how many assertions must run. Bump when adding suites; never lower
  * it. Guards against a test_* function being orphaned from main(). */
-#define MIN_EXPECTED_TESTS 7
+#define MIN_EXPECTED_TESTS 8
 static void pass_t(const char *n) { tests_pass++; if (verbose) printf("  PASS %s\n", n); }
 static void fail_t(const char *n) { tests_fail++; fprintf(stderr, "  FAIL %s\n", n); }
 
@@ -339,6 +339,40 @@ static void test_q5_K_dot(void) {
     else { fail_t("Q5_K vec_dot"); fprintf(stderr, "    SIMD=%.2f REF=%.2f\n", rs, rr); }
 }
 
+/* Q5_0 x Q8_0. Q5_0 was the only legacy type without a fused Q8_0-activation
+ * dot, so a scalar-only build could not consume a Q5_0 tensor at all (it fell
+ * through to the F32 path with a quantized buffer and produced NaN). This
+ * covers the portable replacement across several block counts, since a
+ * one-block test would not catch a per-block scale or stride error. */
+static void test_q5_0_q8_0(void) {
+    tests_run++;
+    int bad = 0;
+    for (int nb = 1; nb <= 5; nb++) {
+        block_q5_0 w[5]; block_q8_0 q[5];
+        float x[160], wf[160], qf[160];
+        for (int k = 0; k < nb; k++) {
+            w[k].d = fp32_to_fp16(0.02f + 0.01f * k);
+            for (int i = 0; i < 16; i++) w[k].qs[i] = (uint8_t)((k * 53 + i * 11 + 7) & 0xFF);
+            uint32_t qh = 0;
+            for (int i = 0; i < 32; i++) if (((i * 13 + k * 7) & 16)) qh |= 1u << i;
+            memcpy(w[k].qh, &qh, 4);
+        }
+        const int n = nb * 32;
+        for (int i = 0; i < n; i++) x[i] = ((i * 17) % 41 - 20) * 0.01f;
+        for (int k = 0; k < nb; k++) quantize_row_q8_0(x + k * 32, &q[k], 32);
+        for (int k = 0; k < nb; k++) {
+            dequantize_row_q5_0(&w[k], wf + k * 32, 32);
+            dequantize_row_q8_0(&q[k], qf + k * 32, 32);
+        }
+        double ref = 0;
+        for (int i = 0; i < n; i++) ref += (double)wf[i] * qf[i];
+        float got = vec_dot_q5_0_q8_0(w, q, n);
+        if (fabs((double)got - ref) > 1e-4 * fabs(ref) + 1e-5) bad++;
+    }
+    if (!bad) pass_t("Q5_0 x Q8_0 vec_dot (nb=1..5)");
+    else fail_t("Q5_0 x Q8_0 vec_dot (nb=1..5)");
+}
+
 static void test_q4_K(void) {
     tests_run++;
     block_q4_K blk; make_q4_K_block(&blk);
@@ -421,6 +455,7 @@ int main(int argc, char **argv) {
     test_q4_K();
     test_q3_K();
     test_q6_K();
+    test_q5_0_q8_0();
     printf("\n%d tests: %d passed, %d failed\n", tests_run, tests_pass, tests_fail);
     /* "tests_run too low" means a suite was skipped or deleted without updating
      * this file -- that is a test bug, not a pass. */
