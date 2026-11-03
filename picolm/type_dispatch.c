@@ -35,6 +35,11 @@ static void gemv_iq4_nl(const void *w, const void *a, int n, float *out, int nro
     *out = vec_dot_iq4_nl_q8_0(w, a, n);
 }
 
+static void gemv_q4_1(const void *w, const void *a, int n, float *out, int nrows) {
+    (void)nrows;
+    *out = vec_dot_q4_1_q8_0(w, a, n);
+}
+
 static void gemv_q5_1(const void *w, const void *a, int n, float *out, int nrows) {
     (void)nrows;
     *out = vec_dot_q5_1_q8_0(w, a, n);
@@ -191,6 +196,19 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
         .needs_qx = 1,
         .use_repacked = 0,
         .has_dual_scalar_path = 1,
+    },
+    /* Q4_1: plain, Q8_0 activations. Was MISSING from this table entirely,
+     * so it fell through to vec_dot() with a quantized buffer. */
+    [GGUF_TYPE_Q4_1] = {
+        .act_fmt = ACT_FMT_Q8_0,
+        .rows_per_block = 1,
+        .fn_gemv = gemv_q4_1,
+        .fn_gemm = NULL,
+        .has_qgemm_d = 0,
+        .fn_dequant_single = NULL,
+        .needs_qx = 1,
+        .use_repacked = 0,
+        .has_dual_scalar_path = 0,
     },
     /* IQ4_NL: plain, Q8_0 activations. Uses threaded_worker with fn_gemv. */
     [GGUF_TYPE_IQ4_NL] = {

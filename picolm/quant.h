@@ -1167,6 +1167,16 @@ void dequantize_row_q6_K_R4(const void *src, float *dst, int n);
 void dequantize_row_q6_0(const void *src, float *dst, int n);
 void dequantize_row_q5_K(const void *src, float *dst, int n);
 void dequantize_row_q4_0(const void *src, float *dst, int n);
+/* Older-generation repacked Q4_0 (NEON 4x4/4x8, AVX2 8x8). Each block holds
+ * N interleaved rows of Q4_0, nibbles pre-XOR'd with 0x88. Superseded by the
+ * _R4/_R8 family but still written by llama-quantize, so they must decode.
+ * The _single variants are row-aware: pass row in [0, N). */
+void dequantize_row_q4_0_4_4(const void *src, float *dst, int n);
+void dequantize_row_q4_0_4_4_single(const block_q4_0x4 *x, float *dst, int n, int row);
+void dequantize_row_q4_0_4_8(const void *src, float *dst, int n);
+void dequantize_row_q4_0_4_8_single(const block_q4_0x4 *x, float *dst, int n, int row);
+void dequantize_row_q4_0_8_8(const void *src, float *dst, int n);
+void dequantize_row_q4_0_8_8_single(const block_q4_0x8 *x, float *dst, int n, int row);
 /* Q5_0 dequantize (22-byte blocks). Was defined in quant.c but never declared
  * here, so any test or tool that called it got an implicit int-returning
  * declaration -- which silently truncates float results. */
@@ -1241,6 +1251,9 @@ float vec_dot_q4_0_q8_0(const void *src_q4, const void *src_q8, int n);
  * lacked a fused Q8_0-activation dot, which left it unusable on scalar-only
  * builds. See the comment on the definition in quant.c. */
 float vec_dot_q5_0_q8_0(const void *src_q5, const void *src_q8, int n);
+/* Q4_1 x Q8_0: portable scalar. Q4_1 had no type-table entry at all, so it
+ * reached the F32 vec_dot with a quantized buffer. See quant.c. */
+float vec_dot_q4_1_q8_0(const void *src_q4, const void *src_q8, int n);
 /* IQ4_NL * Q8_0 dot product: IQ4_NL weights with pre-quantized Q8_0 input */
 float vec_dot_iq4_nl_q8_0(const void *src_iq4, const void *src_q8, int n);
 /* IQ4_NL * F32 dot product: fused dequant + dot (scalar fallback) */

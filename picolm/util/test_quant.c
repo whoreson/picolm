@@ -24,7 +24,7 @@ static int verbose = 0;
 static int tests_run, tests_pass, tests_fail;
 /* Floor on how many assertions must run. Bump when adding suites; never lower
  * it. Guards against a test_* function being orphaned from main(). */
-#define MIN_EXPECTED_TESTS 8
+#define MIN_EXPECTED_TESTS 9
 static void pass_t(const char *n) { tests_pass++; if (verbose) printf("  PASS %s\n", n); }
 static void fail_t(const char *n) { tests_fail++; fprintf(stderr, "  FAIL %s\n", n); }
 
@@ -373,6 +373,78 @@ static void test_q5_0_q8_0(void) {
     else fail_t("Q5_0 x Q8_0 vec_dot (nb=1..5)");
 }
 
+/* Q4_0_4_4 / Q4_0_4_8 / Q4_0_8_8 (older NEON/AVX2 repacks).
+ *
+ * These were wrong in three independent ways and had no test, so a model using
+ * them decoded to <unk> forever while llama-quantize reported success: only
+ * row 0's scale was read, nibbles were extracted with a shift that steps by 16
+ * instead of 1, and values were laid out at k*8+j*2 rather than the documented
+ * k*blocklen+i. Covers EVERY row and several block counts, since both of those
+ * were exactly what the old code got wrong. */
+static void test_q4_0_interleaved(void) {
+    struct { int ncols, blocklen, type; const char *name; } TV[] = {
+        { 4, 4, 0, "Q4_0_4_4" },
+        { 4, 8, 1, "Q4_0_4_8" },
+        { 8, 8, 2, "Q4_0_8_8" },
+    };
+    int bad = 0;
+    for (unsigned t = 0; t < sizeof TV / sizeof TV[0]; t++) {
+        tests_run++;
+        const int ncols = TV[t].ncols, blocklen = TV[t].blocklen, qk = 32;
+        const int nb = 2;                        /* >1 block per row */
+        const size_t blk_bytes = (size_t)ncols * 2 + (size_t)ncols * qk / 2;
+        const int nvals = nb * qk;               /* values per ROW across all blocks */
+        uint8_t *blk = calloc((size_t)nb, blk_bytes);
+        int8_t *v = malloc((size_t)ncols * (size_t)nvals);
+        float x[64], qf[64];
+        for (int j = 0; j < ncols; j++)
+            for (int i = 0; i < nvals; i++) v[j * nvals + i] = (int8_t)(((j * 7 + i * 3) % 16) - 8);
+
+        /* Encode per the layout in ggml-aarch64.c's GEMV:
+         *   qs[k*ncols*blocklen + row*blocklen + i]
+         *     low  nibble -> value k*blocklen + i
+         *     high nibble -> value k*blocklen + i + qk/2            (nibbles ^ 0x88)
+         * and the scales are d[row] INSIDE each block, not a separate array. */
+        for (int b = 0; b < nb; b++) {
+            uint8_t *p = blk + (size_t)b * blk_bytes;
+            uint8_t *qs = p + 2 * ncols;
+            for (int j = 0; j < ncols; j++) {
+                uint16_t h = fp32_to_fp16(0.02f + 0.01f * j + 0.005f * b);
+                memcpy(p + 2 * j, &h, 2);
+            }
+            for (int k = 0; k < qk / (2 * blocklen); k++)
+                for (int j = 0; j < ncols; j++)
+                    for (int i = 0; i < blocklen; i++) {
+                        int lo = v[j * nvals + b * qk + k * blocklen + i];
+                        int hi = v[j * nvals + b * qk + k * blocklen + i + qk / 2];
+                        uint8_t by = (uint8_t)(((lo + 8) & 0xF) | (((hi + 8) & 0xF) << 4));
+                        qs[k * ncols * blocklen + j * blocklen + i] = by ^ 0x88;
+                    }
+        }
+        for (int i = 0; i < 64; i++) x[i] = ((i * 11) % 17 - 8) * 0.1f;
+        block_q8_0 q[2];
+        for (int b = 0; b < nb; b++) quantize_row_q8_0(x + b * 32, &q[b], 32);
+        for (int b = 0; b < nb; b++) dequantize_row_q8_0(&q[b], qf + b * 32, 32);
+
+        for (int row = 0; row < ncols; row++) {
+            float got[64];
+            if (TV[t].type == 0)      dequantize_row_q4_0_4_4_single((const void *)blk, got, 64, row);
+            else if (TV[t].type == 1) dequantize_row_q4_0_4_8_single((const void *)blk, got, 64, row);
+            else                      dequantize_row_q4_0_8_8_single((const void *)blk, got, 64, row);
+            for (int b = 0; b < nb; b++) {
+                float d = fp16_to_fp32(((const uint16_t *)(blk + (size_t)b * blk_bytes))[row]);
+                for (int i = 0; i < 32; i++) {
+                    float want = d * (float)v[row * nvals + b * qk + i];
+                    if (fabsf(got[b * 32 + i] - want) > 1e-5f) bad++;
+                }
+            }
+        }
+        free(blk); free(v);
+    }
+    if (!bad) pass_t("Q4_0_4_4 / 4_8 / 8_8 dequant, all rows, 2 blocks");
+    else fail_t("Q4_0_4_4 / 4_8 / 8_8 dequant, all rows, 2 blocks");
+}
+
 static void test_q4_K(void) {
     tests_run++;
     block_q4_K blk; make_q4_K_block(&blk);
@@ -456,6 +528,7 @@ int main(int argc, char **argv) {
     test_q3_K();
     test_q6_K();
     test_q5_0_q8_0();
+    test_q4_0_interleaved();
     printf("\n%d tests: %d passed, %d failed\n", tests_run, tests_pass, tests_fail);
     /* "tests_run too low" means a suite was skipped or deleted without updating
      * this file -- that is a test bug, not a pass. */

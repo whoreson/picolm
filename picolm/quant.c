@@ -711,69 +711,80 @@ void dequantize_row_q2_0(const void *src, float *dst, int n) {
  * Dequantizes row 0 from a group of 4 interleaved rows.
  * Interleaving: qs[k*16 + r*4 + j] = row_r.qs[k*4 + j] ^ 0x88
  * For row 0: qs[k*16 + j] for k=0..3, j=0..3 */
+/* Q4_0_4_4 / Q4_0_4_8 / Q4_0_8_8 ("q4_0_4x4", "q4_0_4x8", "q4_0_8x8")
+ *
+ * Older generation of weight repacking: N rows of Q4_0 interleaved into one
+ * block so a SIMD kernel can process N rows at once. Superseded by the _R4 /
+ * _R8 family, but llama-quantize still writes them, so they must decode.
+ *
+ * The authoritative indexing comes from ik's own GEMV in ggml-aarch64.c:
+ *
+ *     qs[ k * ncols_interleaved * blocklen + j * blocklen + i ]
+ *        low  nibble -> value k * blocklen + i
+ *        high nibble -> value k * blocklen + i + qk/2      (qk = 32)
+ *
+ * with j = row, blocklen = 4 for *_4_4 / *_4_8 and 8 for *_8_8, and
+ * k = 0 .. (qk / (2*blocklen) - 1). Nibbles are pre-XOR'd with 0x88 during
+ * repacking, which turns Q4_0's biased 0..15 into signed -8..7 in place, so a
+ * decode is just a sign-extending shift of each nibble.
+ *
+ * The previous implementations here were wrong in three independent ways:
+ * hardcoded row 0 (so rows 1..N-1 used the wrong scale), extracted nibbles
+ * with (int8_t)(byte<<4)>>4 which steps by 16 instead of 1, and laid values
+ * out at k*8+j*2 rather than the documented k*blocklen+i. They were never
+ * covered by a test, and PicoLM produced <unk> forever on a model using these
+ * types while llama-quantize reported success.
+ *
+ * All three are row-aware: pass `row` in [0, ncols_interleaved). */
+
+/* Shared decoder: row `row` of an interleaved Q4_0 block group.
+ * qs_block_stride = ncols*blocklen bytes per k-chunk. */
+static void dequant_row_q4_0_interleaved(const void *blocks_, size_t block_bytes,
+                                         float *dst, int nb, int row,
+                                         int ncols, int blocklen) {
+    const int qk = 32;
+    const int chunks = qk / (2 * blocklen);
+    const uint8_t *base = (const uint8_t *)blocks_;
+    for (int ib = 0; ib < nb; ib++) {
+        /* Blocks are individual structs of block_bytes: {fp16 d[ncols]; u8 qs[...]}
+         * -- d[] and qs[] live INSIDE each block, they are not separate arrays
+         * spanning all blocks. Indexing d as [(uint16_t*)base][ib*ncols+row]
+         * silently reads qs bytes of the previous block. */
+        const uint8_t *blk = base + (size_t)ib * block_bytes;
+        const float d = fp16_to_fp32_lookup(((const uint16_t *)blk)[row]);
+        const uint8_t *q = blk + (size_t)ncols * sizeof(uint16_t);
+        float *dp = dst + (size_t)ib * (size_t)qk;
+        for (int k = 0; k < chunks; k++) {
+            for (int i = 0; i < blocklen; i++) {
+                const uint8_t byte = q[k * ncols * blocklen + row * blocklen + i];
+                const int lo = (int8_t)(byte << 4) >> 4;
+                const int hi = (int8_t)(byte & 0xF0) >> 4;
+                dp[k * blocklen + i]          = d * (float)lo;
+                dp[k * blocklen + i + qk / 2] = d * (float)hi;
+            }
+        }
+    }
+}
+
+void dequantize_row_q4_0_4_4_single(const block_q4_0x4 *x, float *dst, int n, int row) {
+    dequant_row_q4_0_interleaved(x, sizeof(block_q4_0x4), dst, n / 32, row, 4, 4);
+}
 void dequantize_row_q4_0_4_4(const void *src, float *dst, int n) {
-    const block_q4_0x4 *blocks = (const block_q4_0x4 *)src;
-    int nb = n / 32;
-
-    for (int i = 0; i < nb; i++) {
-        float d = fp16_to_fp32_lookup(blocks[i].d[0]);
-        for (int k = 0; k < 4; k++) {
-            for (int j = 0; j < 4; j++) {
-                uint8_t byte = blocks[i].qs[k * 16 + j];
-                int v0 = (int8_t)(byte << 4) >> 4;
-                int v1 = (int8_t)(byte & 0xF0) >> 4;
-                dst[i * 32 + k * 8 + j * 2] = d * (float)v0;
-                dst[i * 32 + k * 8 + j * 2 + 1] = d * (float)v1;
-            }
-        }
-    }
+    dequantize_row_q4_0_4_4_single((const block_q4_0x4 *)src, dst, n, 0);
 }
 
-/* Dequantize row 0 from Q4_0_4_8 interleaved format (blocklen=8).
- * Same block_q4_0x4 struct but different interleaving: 8 bytes per row per group. */
+void dequantize_row_q4_0_4_8_single(const block_q4_0x4 *x, float *dst, int n, int row) {
+    dequant_row_q4_0_interleaved(x, sizeof(block_q4_0x4), dst, n / 32, row, 4, 8);
+}
 void dequantize_row_q4_0_4_8(const void *src, float *dst, int n) {
-    const block_q4_0x4 *blocks = (const block_q4_0x4 *)src;
-    int nb = n / 32;
-
-    for (int i = 0; i < nb; i++) {
-        float d = fp16_to_fp32_lookup(blocks[i].d[0]);
-        for (int k = 0; k < 2; k++) {
-            for (int j = 0; j < 8; j++) {
-                uint8_t byte = blocks[i].qs[k * 32 + j];
-                int v0 = (int8_t)(byte << 4) >> 4;
-                int v1 = (int8_t)(byte & 0xF0) >> 4;
-                dst[i * 32 + k * 16 + j * 2] = d * (float)v0;
-                dst[i * 32 + k * 16 + j * 2 + 1] = d * (float)v1;
-            }
-        }
-    }
+    dequantize_row_q4_0_4_8_single((const block_q4_0x4 *)src, dst, n, 0);
 }
 
-/* Dequantize a single row from Q4_0_8_8 interleaved format to float32.
- *
- * The GGUF stores 8 consecutive rows interleaved as block_q4_0x8 structures.
- * src MUST point to the start of an 8-row group (i.e., aligned to nb*144 bytes).
- * This function dequantifies row 0 of the group.
- *
- * For arbitrary row extraction, use the inline code in model.c's embedding lookup. */
+void dequantize_row_q4_0_8_8_single(const block_q4_0x8 *x, float *dst, int n, int row) {
+    dequant_row_q4_0_interleaved(x, sizeof(block_q4_0x8), dst, n / 32, row, 8, 8);
+}
 void dequantize_row_q4_0_8_8(const void *src, float *dst, int n) {
-    const block_q4_0x8 *blocks = (const block_q4_0x8 *)src;
-    int nb = n / 32;
-    int row_in_group = 0;
-
-    for (int i = 0; i < nb; i++) {
-        float d = fp16_to_fp32_lookup(blocks[i].d[row_in_group]);
-        /* Row 0 data: first half in chunk 0 (qs[0..7]), second half in chunk 8 (qs[64..71]) */
-        for (int k = 0; k < 2; k++) {
-            for (int j = 0; j < 8; j++) {
-                uint8_t byte = blocks[i].qs[k * 64 + row_in_group * 8 + j];
-                int v0 = (int8_t)(byte << 4);
-                int v1 = (int8_t)(byte & 0xF0);
-                dst[i * 32 + k * 16 + j * 2]     = d * (float)(v0 >> 4);
-                dst[i * 32 + k * 16 + j * 2 + 1] = d * (float)(v1 >> 4);
-            }
-        }
-    }
+    dequantize_row_q4_0_8_8_single((const block_q4_0x8 *)src, dst, n, 0);
 }
 
 /* Dequantize a single row from Q4I_0_8_8 (pre-dequantized int8) format to float32.
@@ -5828,6 +5839,47 @@ float vec_dot_q5_0_f32(const void *src, const float *x, int n) {
     return sumf;
 }
 
+/* vec_dot_q4_1_q8_0: Q4_1 weights x Q8_0 activations.
+ *
+ * Q4_1 is unsigned 4-bit with an affine min term: value = q*d + m. So the dot
+ * is d*sum(q*y) + m*sum(y), and the second term needs the activation sum that
+ * Q8_0 blocks do not store -- it is recomputed here per block.
+ *
+ * WHY THIS EXISTS
+ * ---------------
+ * Q4_1 had NO entry in the type table at all (type_dispatch.c), so it fell
+ * through matmul_worker_f to the generic vec_dot() -- which for Q4_1 is
+ * vec_dot_q4_1_f32(), i.e. it wants FLOAT activations while every caller hands
+ * it the QUANTIZED buffer. Same class of bug as Q5_0: the model decoded to
+ * garbage while llama-quantize reported success, and ik_llama produced correct
+ * text from the identical file.
+ *
+ * Portable scalar on purpose: works on every target including MS-DOS.
+ */
+float vec_dot_q4_1_q8_0(const void *vx, const void *wy, int n) {
+    const block_q4_1 *x = (const block_q4_1 *)vx;
+    const block_q8_0 *y = (const block_q8_0 *)wy;
+    const int nb = n / 32;
+    float sumf = 0.0f;
+
+    for (int ib = 0; ib < nb; ib++) {
+        const float d = fp16_to_fp32_lookup(x[ib].d);
+        const float m = fp16_to_fp32_lookup(x[ib].m);
+        const float dy = fp16_to_fp32_lookup(y[ib].d);
+        const uint8_t *qs = x[ib].qs;
+        const int8_t *ya = y[ib].qs;
+        int sumi = 0, ysum = 0;
+        for (int j = 0; j < 16; j++) {
+            sumi += (int)(qs[j] & 0x0F) * ya[j];
+            sumi += (int)(qs[j] >> 4)   * ya[j + 16];
+            ysum += ya[j] + ya[j + 16];
+        }
+        /* y is scaled by dy, so the min term is m*dy*ysum. */
+        sumf += (float)sumi * d * dy + m * dy * (float)ysum;
+    }
+    return sumf;
+}
+
 /* vec_dot_q5_0_q8_0: Q5_0 weights x Q8_0 activations (integer MAC + per-block
  * float scale).
  *
@@ -6651,78 +6703,45 @@ float vec_dot_q2_0_q8_0(const void *vx, const void *wy, int n) {
 /* vec_dot for Q4_0_4_4: dequantize row 0 of interleaved block, then dot
  * Interleaving: qs[k*16 + r*4 + j] = row_r.qs[k*4 + j] ^ 0x88
  * For row 0: qs[k*16 + j] for k=0..3, j=0..3 */
+/* Row-0 dot for the generic vec_dot() fallback. Delegates to the dequantizer
+ * rather than re-implementing the nibble walk: the previous hand-written copy
+ * had the same three bugs as the old dequantizer (row 0 only, wrong nibble
+ * extraction, wrong value order), and duplicating the layout twice is what let
+ * them drift apart in the first place. */
 float vec_dot_q4_0_4_4_f32(const void *src, const float *x, int n) {
-    const block_q4_0x4 *blocks = (const block_q4_0x4 *)src;
-    int nb = n / 32;
-    float sumf = 0.0f;
-
-    for (int i = 0; i < nb; i++) {
-        float d = fp16_to_fp32_lookup(blocks[i].d[0]);
-        const float *xp = x + i * 32;
-        float block_sum = 0.0f;
-        for (int k = 0; k < 4; k++) {
-            for (int j = 0; j < 4; j++) {
-                uint8_t byte = blocks[i].qs[k * 16 + j];
-                int v0 = (int8_t)(byte << 4) >> 4;
-                int v1 = (int8_t)(byte & 0xF0) >> 4;
-                block_sum += (float)v0 * xp[k * 8 + j * 2];
-                block_sum += (float)v1 * xp[k * 8 + j * 2 + 1];
-            }
-        }
-        sumf += d * block_sum;
-    }
-    return sumf;
+    float tmp_stack[256];
+    float *tmp = (n <= 256) ? tmp_stack : (float *)malloc((size_t)n * sizeof(float));
+    if (!tmp) return 0.0f;
+    dequantize_row_q4_0_4_4(src, tmp, n);
+    float r = vec_dot_f32_f32(tmp, x, n);
+    if (tmp != tmp_stack) free(tmp);
+    return r;
 }
 
 /* vec_dot for Q4_0_4_8: dequantize row 0 of interleaved block (blocklen=8), then dot
  * Interleaving: qs[k*32 + r*8 + j] = row_r.qs[k*8 + j] ^ 0x88
  * For row 0: qs[k*32 + j] for k=0..1, j=0..7 */
+/* Row-0 dot; delegates to the dequantizer (see vec_dot_q4_0_4_4_f32). */
 float vec_dot_q4_0_4_8_f32(const void *src, const float *x, int n) {
-    const block_q4_0x4 *blocks = (const block_q4_0x4 *)src;
-    int nb = n / 32;
-    float sumf = 0.0f;
-
-    for (int i = 0; i < nb; i++) {
-        float d = fp16_to_fp32_lookup(blocks[i].d[0]);
-        const float *xp = x + i * 32;
-        float block_sum = 0.0f;
-        for (int k = 0; k < 2; k++) {
-            for (int j = 0; j < 8; j++) {
-                uint8_t byte = blocks[i].qs[k * 32 + j];
-                int v0 = (int8_t)(byte << 4) >> 4;
-                int v1 = (int8_t)(byte & 0xF0) >> 4;
-                block_sum += (float)v0 * xp[k * 16 + j * 2];
-                block_sum += (float)v1 * xp[k * 16 + j * 2 + 1];
-            }
-        }
-        sumf += d * block_sum;
-    }
-    return sumf;
+    float tmp_stack[256];
+    float *tmp = (n <= 256) ? tmp_stack : (float *)malloc((size_t)n * sizeof(float));
+    if (!tmp) return 0.0f;
+    dequantize_row_q4_0_4_8(src, tmp, n);
+    float r = vec_dot_f32_f32(tmp, x, n);
+    if (tmp != tmp_stack) free(tmp);
+    return r;
 }
 
 /* vec_dot for Q4_0_8_8: dequantize row 0 of interleaved block, then dot product */
+/* Row-0 dot; delegates to the dequantizer (see vec_dot_q4_0_4_4_f32). */
 float vec_dot_q4_0_8_8_f32(const void *src, const float *x, int n) {
-    const block_q4_0x8 *blocks = (const block_q4_0x8 *)src;
-    int nb = n / 32;
-    float sumf = 0.0f;
-
-    for (int i = 0; i < nb; i++) {
-        float d = fp16_to_fp32_lookup(blocks[i].d[0]);
-        const float *xp = x + i * 32;
-        float block_sum = 0.0f;
-        /* Row 0 data: first 16 vals in chunk 0 (qs[0..7]), second 16 in chunk 8 (qs[64..71]) */
-        for (int k = 0; k < 2; k++) {
-            for (int j = 0; j < 8; j++) {
-                uint8_t byte = blocks[i].qs[k * 64 + j];
-                int v0 = (int8_t)(byte << 4) >> 4;
-                int v1 = (int8_t)(byte & 0xF0) >> 4;
-                block_sum += (float)v0 * xp[k * 16 + j * 2];
-                block_sum += (float)v1 * xp[k * 16 + j * 2 + 1];
-            }
-        }
-        sumf += d * block_sum;
-    }
-    return sumf;
+    float tmp_stack[256];
+    float *tmp = (n <= 256) ? tmp_stack : (float *)malloc((size_t)n * sizeof(float));
+    if (!tmp) return 0.0f;
+    dequantize_row_q4_0_8_8(src, tmp, n);
+    float r = vec_dot_f32_f32(tmp, x, n);
+    if (tmp != tmp_stack) free(tmp);
+    return r;
 }
 
 /* ================================================================
