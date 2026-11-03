@@ -26,7 +26,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        build: [ default, avx2, sse3, scalar ]
+        build: [ default, avx2, avx, sse3, scalar ]
 
     steps:
       - name: Checkout
@@ -48,6 +48,9 @@ jobs:
               ;;
             avx2)
               make avx2 -j$(nproc) CC=gcc
+              ;;
+            avx)
+              make avx -j$(nproc) CC=gcc
               ;;
             sse3)
               make sse3 -j$(nproc) CC=gcc

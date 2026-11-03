@@ -787,7 +787,11 @@ typedef __m256 adv;
 #define AD_STORE(p, v)  _mm256_storeu_ps((p), (v))
 #define AD_SET1(x)      _mm256_set1_ps(x)
 #define AD_ZERO()       _mm256_setzero_ps()
+#if defined(__FMA__)
 #define AD_FMA(a, b, c) _mm256_fmadd_ps((a), (b), (c))
+#else
+#define AD_FMA(a, b, c) _mm256_add_ps(_mm256_mul_ps((a), (b)), (c))
+#endif
 #define AD_MUL(a, b)    _mm256_mul_ps((a), (b))
 #define AD_ADD(a, b)    _mm256_add_ps((a), (b))
 #define AD_RSUM(v)      attn_hsum256(v)
@@ -862,12 +866,12 @@ static inline float ad_exp2_row(float *s, float m) {
         __m256 rn = _mm256_round_ps(x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
         __m256 r = _mm256_sub_ps(x, rn);
         __m256 p = _mm256_set1_ps(ATTN_EXP2_C6);
-        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(ATTN_EXP2_C5));
-        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(ATTN_EXP2_C4));
-        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(ATTN_EXP2_C3));
-        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(ATTN_EXP2_C2));
-        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(ATTN_EXP2_C1));
-        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f));
+        p = AD_FMA(p, r, _mm256_set1_ps(ATTN_EXP2_C5));
+        p = AD_FMA(p, r, _mm256_set1_ps(ATTN_EXP2_C4));
+        p = AD_FMA(p, r, _mm256_set1_ps(ATTN_EXP2_C3));
+        p = AD_FMA(p, r, _mm256_set1_ps(ATTN_EXP2_C2));
+        p = AD_FMA(p, r, _mm256_set1_ps(ATTN_EXP2_C1));
+        p = AD_FMA(p, r, _mm256_set1_ps(1.0f));
         __m256 pow2 = _mm256_castsi256_ps(_mm256_slli_epi32(
             _mm256_add_epi32(_mm256_cvtps_epi32(rn), v127), 23));
         __m256 res = _mm256_and_ps(_mm256_mul_ps(p, pow2), valid);
@@ -2198,12 +2202,12 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
                 __m256 rn = _mm256_round_ps(x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
                 __m256 r  = _mm256_sub_ps(x, rn);
                 __m256 p = _mm256_set1_ps(ATTN_EXP2_C6);
-                p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(ATTN_EXP2_C5));
-                p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(ATTN_EXP2_C4));
-                p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(ATTN_EXP2_C3));
-                p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(ATTN_EXP2_C2));
-                p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(ATTN_EXP2_C1));
-                p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f));
+                p = AD_FMA(p, r, _mm256_set1_ps(ATTN_EXP2_C5));
+                p = AD_FMA(p, r, _mm256_set1_ps(ATTN_EXP2_C4));
+                p = AD_FMA(p, r, _mm256_set1_ps(ATTN_EXP2_C3));
+                p = AD_FMA(p, r, _mm256_set1_ps(ATTN_EXP2_C2));
+                p = AD_FMA(p, r, _mm256_set1_ps(ATTN_EXP2_C1));
+                p = AD_FMA(p, r, _mm256_set1_ps(1.0f));
                 /* 2^n by exponent-field construction: n in [-125, ~8+], so
                  * n + 127 is in [2, 255) and the result is a normal float. */
                 __m256i ni = _mm256_cvtps_epi32(rn);
@@ -2349,7 +2353,11 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
                 for (int j = 0; j < ts; j++) {
                     __m256 wv = _mm256_set1_ps(tile_exp_buf[j]);
                     __m256 vv = _mm256_loadu_ps(vr + (size_t)j * hd);
+                    #if defined(__FMA__)
                     acc0 = _mm256_fmadd_ps(vv, wv, acc0);
+#else
+                    acc0 = _mm256_add_ps(_mm256_mul_ps(vv, wv), acc0);
+#endif
                 }
                 _mm256_storeu_ps(acc_row + d, acc0);
             }

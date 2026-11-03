@@ -539,35 +539,47 @@ void r8a_repack_impl(const char *A, size_t lda, int g, int nb, block_q8_0_r8 *ds
     }
 }
 
-/* IQ4_NL_R4 source: row group q = nb consecutive 72-byte blocks {d[4], qs[64]}. In qs, the 16-byte
- * slice W_k = qs[16k..16k+15] holds dword k of rows 0..3, and per the layout (see
- * dequantize_row_iq4_nl_r4_single) the nibbles land on natural values
- *     lo(W0)=4j+i, j=0   hi(W0): j=2   lo(W2): j=1   hi(W2): j=3
- *     lo(W1): j=4        hi(W1): j=6   lo(W3): j=5   hi(W3): j=7        (value index = 4*j + i)
- * and R8 vector j wants dword j of each row, so no transpose is needed: an R8 group of 8 rows is two
- * R4 groups, one per 128-bit half, and each R8 vector is one nibble-extract + VPSHUFB LUT. */
+/* IQ4_NL_R4 source: each R4 block = 4 rows of {fp16 d, 16 qs bytes}.
+ * Decode each row's 16 bytes to 32 int8 values (LUT), then R8-transpose
+ * the 8 rows (two R4 groups) identically to r8a_repack_impl. */
 static void r8a_repack_r4_iq4nl(const block_iq4_nl_r4 *A, int g, int nb, block_q8_0_r8 *dst) {
     const __m256i lut = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)kvalues_iq4nl));
     const __m256i m15 = _mm256_set1_epi8(15);
     const block_iq4_nl_r4 *pa = A + (size_t)(2 * g) * nb, *pb = A + (size_t)(2 * g + 1) * nb;
     for (int ib = 0; ib < nb; ib++) {
-        uint8_t *q = (uint8_t *)dst[ib].qs;
-        __m256i w[4];
-        for (int k = 0; k < 4; k++)
-            w[k] = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i *)(pa[ib].qs + 16 * k))),
-                                            _mm_loadu_si128((const __m128i *)(pb[ib].qs + 16 * k)), 1);
-#define R4_LO(k) _mm256_shuffle_epi8(lut, _mm256_and_si256(w[k], m15))
-#define R4_HI(k) _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(w[k], 4), m15))
-        _mm256_storeu_si256((__m256i *)(q +   0), R4_LO(0));
-        _mm256_storeu_si256((__m256i *)(q +  32), R4_LO(2));
-        _mm256_storeu_si256((__m256i *)(q +  64), R4_HI(0));
-        _mm256_storeu_si256((__m256i *)(q +  96), R4_HI(2));
-        _mm256_storeu_si256((__m256i *)(q + 128), R4_LO(1));
-        _mm256_storeu_si256((__m256i *)(q + 160), R4_LO(3));
-        _mm256_storeu_si256((__m256i *)(q + 192), R4_HI(1));
-        _mm256_storeu_si256((__m256i *)(q + 224), R4_HI(3));
-#undef R4_LO
-#undef R4_HI
+        /* Decode 8 rows to 8 x 32-byte int8 vectors, then R8-transpose. */
+        __m256i r[8];
+        for (int rr = 0; rr < 4; rr++) {
+            const uint8_t *qs = pa[ib].qs + 16 * rr;
+            __m128i v = _mm_loadu_si128((const __m128i *)qs);
+            __m256i x = _mm256_and_si256(
+                _mm256_inserti128_si256(_mm256_castsi128_si256(v), _mm_srli_epi16(v, 4), 1), m15);
+            r[rr] = _mm256_shuffle_epi8(lut, x);
+        }
+        for (int rr = 0; rr < 4; rr++) {
+            const uint8_t *qs = pb[ib].qs + 16 * rr;
+            __m128i v = _mm_loadu_si128((const __m128i *)qs);
+            __m256i x = _mm256_and_si256(
+                _mm256_inserti128_si256(_mm256_castsi128_si256(v), _mm_srli_epi16(v, 4), 1), m15);
+            r[4 + rr] = _mm256_shuffle_epi8(lut, x);
+        }
+        __m256i t0 = _mm256_unpacklo_epi32(r[0], r[1]), t1 = _mm256_unpackhi_epi32(r[0], r[1]);
+        __m256i t2 = _mm256_unpacklo_epi32(r[2], r[3]), t3 = _mm256_unpackhi_epi32(r[2], r[3]);
+        __m256i t4 = _mm256_unpacklo_epi32(r[4], r[5]), t5 = _mm256_unpackhi_epi32(r[4], r[5]);
+        __m256i t6 = _mm256_unpacklo_epi32(r[6], r[7]), t7 = _mm256_unpackhi_epi32(r[6], r[7]);
+        __m256i u0 = _mm256_unpacklo_epi64(t0, t2), u1 = _mm256_unpackhi_epi64(t0, t2);
+        __m256i u2 = _mm256_unpacklo_epi64(t1, t3), u3 = _mm256_unpackhi_epi64(t1, t3);
+        __m256i u4 = _mm256_unpacklo_epi64(t4, t6), u5 = _mm256_unpackhi_epi64(t4, t6);
+        __m256i u6 = _mm256_unpacklo_epi64(t5, t7), u7 = _mm256_unpackhi_epi64(t5, t7);
+        __m256i *q = (__m256i *)dst[ib].qs;
+        _mm256_storeu_si256(q + 0, _mm256_permute2x128_si256(u0, u4, 0x20));
+        _mm256_storeu_si256(q + 1, _mm256_permute2x128_si256(u1, u5, 0x20));
+        _mm256_storeu_si256(q + 2, _mm256_permute2x128_si256(u2, u6, 0x20));
+        _mm256_storeu_si256(q + 3, _mm256_permute2x128_si256(u3, u7, 0x20));
+        _mm256_storeu_si256(q + 4, _mm256_permute2x128_si256(u0, u4, 0x31));
+        _mm256_storeu_si256(q + 5, _mm256_permute2x128_si256(u1, u5, 0x31));
+        _mm256_storeu_si256(q + 6, _mm256_permute2x128_si256(u2, u6, 0x31));
+        _mm256_storeu_si256(q + 7, _mm256_permute2x128_si256(u3, u7, 0x31));
         memcpy(&dst[ib].d[0], pa[ib].d, 4 * sizeof(uint16_t));
         memcpy(&dst[ib].d[4], pb[ib].d, 4 * sizeof(uint16_t));
     }
