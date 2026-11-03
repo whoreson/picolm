@@ -11,9 +11,16 @@
 /* aligned_alloc fallback for platforms where it's not declared under -std=c11 */
 #ifndef HAVE_ALIGNED_ALLOC
 static inline void *picolm_aligned_alloc(size_t align, size_t size) {
+#ifdef _WIN32
+    return _aligned_malloc(size, align);
+#elif defined(PICOLM_DOS)
+    /* DOS: no aligned alloc, use standard malloc. 64-byte alignment is advisory. */
+    return malloc(size);
+#else
     void *ptr = NULL;
     if (posix_memalign(&ptr, align, size) != 0) return NULL;
     return ptr;
+#endif
 }
 #define aligned_alloc(align, size) picolm_aligned_alloc(align, size)
 #endif
