@@ -8,6 +8,16 @@
 #include <math.h>
 #include <stdio.h>
 
+/* aligned_alloc fallback for platforms where it's not declared under -std=c11 */
+#ifndef HAVE_ALIGNED_ALLOC
+static inline void *picolm_aligned_alloc(size_t align, size_t size) {
+    void *ptr = NULL;
+    if (posix_memalign(&ptr, align, size) != 0) return NULL;
+    return ptr;
+}
+#define aligned_alloc(align, size) picolm_aligned_alloc(align, size)
+#endif
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif

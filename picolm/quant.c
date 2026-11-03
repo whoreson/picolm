@@ -6823,8 +6823,10 @@ float vec_dot_q2_K_q8_K(const void *src_q2, const void *src_q8, int n) {
 
                 int32x4_t s0 = vmmlaq_s32(vdupq_n_s32(0), qa, q8a);
                 int32x4_t s1 = vmmlaq_s32(vdupq_n_s32(0), qb, q8b);
-                int dot_a = vaddvq_s32(s0);
-                int dot_b = vaddvq_s32(s1);
+                /* SMMLA diagonal: lanes 0+3 are the dot products,
+                 * lanes 1+2 are cross-terms. Extract 0+3. */
+                int dot_a = vgetq_lane_s32(s0, 0) + vgetq_lane_s32(s0, 3);
+                int dot_b = vgetq_lane_s32(s1, 0) + vgetq_lane_s32(s1, 3);
 
                 isum += dot_a * (int)scales_s8[is] + dot_b * (int)scales_s8[is + 1];
                 is += 2;

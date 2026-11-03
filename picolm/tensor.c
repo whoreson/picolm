@@ -27,6 +27,7 @@ extern void vec_dot_iq4_k_r4_q8_k_neon(const void *vx, const void *wy, int n, fl
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
+#include <errno.h>
 #ifndef _WIN32
 #include <dlfcn.h>
 #endif
@@ -241,21 +242,31 @@ static int detect_cpu_groups(cpu_group_t groups[], int max_groups) {
         }
     }
 
-    /* Merge groups with same max_freq */
+    /* Merge groups with same max_freq, then merge adjacent groups within
+     * 15% frequency gap. This handles 3-tier big.LITTLE (e.g. 4+3+1 where
+     * medium and big are close in freq) without merging truly dissimilar
+     * little+big clusters. */
     int merged = 0;
     for (int i = 0; i < ng; i++) {
-        if (merged > 0 && groups[merged-1].max_freq == groups[i].max_freq) {
+        if (merged > 0) {
             cpu_group_t *prev = &groups[merged-1];
-            for (int k = 0; k < groups[i].nids; k++) {
-                if (prev->nids < 256) prev->ids[prev->nids++] = groups[i].ids[k];
+            /* Merge if same freq or the gap is <= 15% of the slower group.
+             * groups[] is sorted ascending, so groups[i].max_freq >= prev->max_freq.
+             * Check: (groups[i].max_freq - prev->max_freq) <= prev->max_freq * 15/100
+             * Equivalently: groups[i].max_freq * 20 <= prev->max_freq * 23 */
+            if (prev->max_freq > 0 &&
+                (uint64_t)groups[i].max_freq * 20 <= (uint64_t)prev->max_freq * 23) {
+                for (int k = 0; k < groups[i].nids; k++) {
+                    if (prev->nids < 256) prev->ids[prev->nids++] = groups[i].ids[k];
+                }
+                if (groups[i].min_freq < prev->min_freq) prev->min_freq = groups[i].min_freq;
+                continue;
             }
-            if (groups[i].min_freq < prev->min_freq) prev->min_freq = groups[i].min_freq;
-        } else {
-            if (merged > 0 && merged != i) {
-                groups[merged] = groups[i];
-            }
-            merged++;
         }
+        if (merged != i) {
+            groups[merged] = groups[i];
+        }
+        merged++;
     }
     return merged;
 #else
@@ -554,8 +565,14 @@ static void pool_pin_self(int idx) {       /* workers (idx >= 1) */
     cpu_set_t s;
     if (idx >= 1 && idx < pool_pin_n) { CPU_ZERO(&s); CPU_SET(pool_pin_cpus[idx], &s); }
     else s = pool_orig_set;
+#ifdef HAVE_PTHREAD_SETAFFINITY_NP
     int r = pthread_setaffinity_np(pthread_self(), sizeof s, &s);
     if (r != 0) fprintf(stderr, "pool: PICOLM_PIN: thread %d setaffinity failed (errno %d)\n", idx, r);
+#else
+    /* pthread_setaffinity_np not available (e.g. Bionic/Termux); pin via sched_setaffinity */
+    if (sched_setaffinity(0, sizeof s, &s) != 0)
+        fprintf(stderr, "pool: PICOLM_PIN: thread %d sched_setaffinity failed (errno %d)\n", idx, errno);
+#endif
     pool_pin_actual[idx] = sched_getcpu();
 }
 /* Parse a sysfs CPU list such as "0,24" or "0-1,24-25" into a mask. */
@@ -585,8 +602,13 @@ static void pool_pin_main(int nt) {        /* after the workers exist */
     CPU_AND(&m, &m, &pool_orig_set);
     for (int i = 1; i < nt && i < pool_pin_n; i++) CPU_CLR(pool_pin_cpus[i], &m);   /* never a worker's CPU */
     if (CPU_COUNT(&m) == 0) { CPU_ZERO(&m); CPU_SET(pool_pin_cpus[0], &m); }
+    #ifdef HAVE_PTHREAD_SETAFFINITY_NP
     int r = pthread_setaffinity_np(pthread_self(), sizeof m, &m);
     if (r != 0) fprintf(stderr, "pool: PICOLM_PIN: main thread setaffinity failed (errno %d)\n", r);
+#else
+    if (sched_setaffinity(0, sizeof m, &m) != 0)
+        fprintf(stderr, "pool: PICOLM_PIN: main thread sched_setaffinity failed (errno %d)\n", errno);
+#endif
     /* Single summary line for all threads (main + workers), only when PICOLM_DISPATCH is set. */
     if (getenv("PICOLM_DISPATCH")) {
         fprintf(stderr, "pool: pin %d threads: main=%d workers=", nt, sched_getcpu());
