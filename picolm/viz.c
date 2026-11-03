@@ -203,6 +203,11 @@ typedef struct {
     _Atomic int bucket_mode;     /* 0 = one cell per (layer,pos), 1 = bucket sub-rows */
     _Atomic int recal_request;   /* 'r' key: re-derive the scale on the next frame */
     int   cal_valid;
+    /* Bucket view has its own scale: bucket RMS values span far more than whole-vector RMS. */
+    int   bcal_valid, bcal_sr;
+    float bglo, bghi;                              /* global mode: log10 range over all sub-rows */
+    float blo[VIZ_MAX_LAYERS][VIZ_N_BUCKETS];      /* per-row mode: range per (layer, sub-row)   */
+    float bhi[VIZ_MAX_LAYERS][VIZ_N_BUCKETS];
     int   fixed_scale;           /* PICOLM_VIZ_LO/HI given: never auto-calibrate */
     float glo, ghi;              /* log10 range, global mode */
     float lo[VIZ_MAX_LAYERS], hi[VIZ_MAX_LAYERS]; /* log10 range, per-layer mode */
@@ -760,6 +765,15 @@ static float viz_norm(int layer, float v) {
     return (hi > lo) ? (lv - lo) / (hi - lo) : 0.5f;
 }
 
+/* Bucket-view normalisation: same idea as viz_norm but against bucket-level ranges. */
+static float viz_norm_b(int layer, int sub, float v) {
+    float lv = log10f(v > 1e-12f ? v : 1e-12f), lo, hi;
+    if (viz.fixed_scale) { lo = viz.glo; hi = viz.ghi; }
+    else if (atomic_load_explicit(&viz.norm_mode, memory_order_relaxed)) { lo = viz.blo[layer][sub]; hi = viz.bhi[layer][sub]; }
+    else { lo = viz.bglo; hi = viz.bghi; }
+    return (hi > lo) ? (lv - lo) / (hi - lo) : 0.5f;
+}
+
 static float viz_rms_snap[VIZ_TOKEN_RING][VIZ_MAX_LAYERS]; /* guarded by fb_mutex */
 static float viz_scratch_a[VIZ_TOKEN_RING * VIZ_MAX_LAYERS];
 static float viz_scratch_b[VIZ_TOKEN_RING];
@@ -805,6 +819,40 @@ static void viz_calibrate(int ncols, int n_layers, int first_pos) {
     if (n_out)
         fprintf(stderr, "[VIZ] outlier token (saturated in color): pos=%d in %d layers (%d..%d); "
                 "e.g. layer %d rms=%.4g vs p95=%.4g\n", out_pos, n_out, out_l0, out_l1, out_l0, out_v, out_hi);
+}
+
+static float viz_bscratch[VIZ_TOKEN_RING * VIZ_MAX_LAYERS * VIZ_N_BUCKETS];
+
+/* Calibrate the bucket view from what is on screen: per (layer, sub-row) range
+ * across tokens (5th..95th pct) and one global range over every sub-row value. */
+static void viz_calibrate_buckets(int ncols, int n_layers, int first, int sr) {
+    int ng = 0;
+    for (int l = 0; l < n_layers; l++)
+        for (int sub = 0; sub < sr; sub++) {
+            int m = 0;
+            int b0 = sub * VIZ_N_BUCKETS / sr, b1 = (sub + 1) * VIZ_N_BUCKETS / sr;
+            for (int c = 0; c < ncols; c++) {
+                if (viz_rms_snap[c][l] < 0.0f) continue;               /* absent / non-finite */
+                float b[VIZ_N_BUCKETS]; int cp, p = first + c;
+                if (!viz_cell_read(&viz_ring.cells[p % VIZ_TOKEN_RING][l], &cp, b) || cp != p) continue;
+                float r = viz_rms_range(b, b0, b1);
+                if (!isfinite(r)) continue;
+                float lv = log10f(fmaxf(r, 1e-12f));
+                viz_scratch_b[m++] = lv;
+                viz_bscratch[ng++] = lv;
+            }
+            if (m < 1) { viz.blo[l][sub] = viz.glo; viz.bhi[l][sub] = viz.ghi; continue; }
+            qsort(viz_scratch_b, (size_t)m, sizeof(float), viz_cmp_float);
+            float lo = viz_pctl(viz_scratch_b, m, 0.05f), hi = viz_pctl(viz_scratch_b, m, 0.95f);
+            if (hi - lo < 0.02f) { float mid = 0.5f * (hi + lo); lo = mid - 0.01f; hi = mid + 0.01f; }
+            viz.blo[l][sub] = lo; viz.bhi[l][sub] = hi;
+        }
+    if (ng > 0) {
+        qsort(viz_bscratch, (size_t)ng, sizeof(float), viz_cmp_float);
+        float lo = viz_pctl(viz_bscratch, ng, 0.02f), hi = viz_pctl(viz_bscratch, ng, 0.98f);
+        if (hi - lo < 1.0f) { float mid = 0.5f * (hi + lo); lo = mid - 0.5f; hi = mid + 0.5f; }
+        viz.bglo = lo; viz.bghi = hi;
+    }
 }
 
 static void viz_render_heatmap(void) {
@@ -859,10 +907,20 @@ static void viz_render_heatmap(void) {
 
     /* Scale: fixed by env, or calibrated once and frozen. */
     if (atomic_exchange_explicit(&viz.recal_request, 0, memory_order_relaxed) && !viz.fixed_scale)
-        viz.cal_valid = 0;
+        { viz.cal_valid = 0; viz.bcal_valid = 0; }
     if (!viz.fixed_scale && !viz.cal_valid && ncols > 0) {
         viz_calibrate(ncols, n_layers, first);
         if (full_cols > 0) viz.cal_valid = 1;   /* provisional until a full column exists */
+    }
+
+    int bucket_on = atomic_load_explicit(&viz.bucket_mode, memory_order_relaxed);
+    int ch_pre = (heatmap_h / n_layers) >= 3 ? (heatmap_h / n_layers) - 1 : (heatmap_h / n_layers);
+    int sr = 1;                                   /* sub-rows: pow2 <= min(N, cell height) */
+    while (sr * 2 <= VIZ_N_BUCKETS && sr * 2 <= ch_pre) sr *= 2;
+    if (bucket_on && !viz.fixed_scale && ncols > 0 && (!viz.bcal_valid || viz.bcal_sr != sr)) {
+        viz_calibrate_buckets(ncols, n_layers, first, sr);
+        viz.bcal_sr = sr;
+        if (full_cols > 0) viz.bcal_valid = 1;    /* provisional until a full column exists */
     }
 
     unsigned int txt = 0xFFFFFF, dim = 0xA0A0B0;
@@ -871,9 +929,10 @@ static void viz_render_heatmap(void) {
              viz.model_name, viz.n_layers, viz.n_embd, head, head_filled, n_layers,
              atomic_load_explicit(&viz.client_connected, memory_order_relaxed) ? "VNC" : "");
     viz_draw_string(fb, fb_w, fb_h, 4, 2, buf, txt);
+    int bucket_on_hdr = atomic_load_explicit(&viz.bucket_mode, memory_order_relaxed);
     snprintf(buf, sizeof(buf), "Y=layer X=pos  RMS log-scale %s%s [r]ecal [n]orm [b]uckets",
-             atomic_load_explicit(&viz.norm_mode, memory_order_relaxed) ? "per-layer" : "global",
-             atomic_load_explicit(&viz.bucket_mode, memory_order_relaxed) ? "+buckets" : "");
+             atomic_load_explicit(&viz.norm_mode, memory_order_relaxed) ? (bucket_on_hdr ? "per-row" : "per-layer") : "global",
+             bucket_on_hdr ? "+buckets" : "");
     viz_draw_string(fb, fb_w, fb_h, 4, 9, buf, dim);
 
     /* Position ticks (absolute token index) every 16 columns. */
@@ -903,13 +962,11 @@ static void viz_render_heatmap(void) {
             } else {
                 float b[VIZ_N_BUCKETS]; int cp;
                 if (!viz_cell_read(&viz_ring.cells[p % VIZ_TOKEN_RING][l], &cp, b) || cp != p) continue;
-                int sr = 1;                                   /* sub-rows: pow2 <= min(N, ch) */
-                while (sr * 2 <= VIZ_N_BUCKETS && sr * 2 <= ch) sr *= 2;
                 int sh = ch / sr;
                 for (int sIdx = 0; sIdx < sr; sIdx++) {
                     int b0 = sIdx * VIZ_N_BUCKETS / sr, b1 = (sIdx + 1) * VIZ_N_BUCKETS / sr;
                     viz_draw_rect(fb, fb_w, x0, y0 + sIdx * sh, cw, sh,
-                                  viz_color(viz_norm(l, viz_rms_range(b, b0, b1))));
+                                  viz_color(viz_norm_b(l, sIdx, viz_rms_range(b, b0, b1))));
                 }
             }
         }
