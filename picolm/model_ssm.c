@@ -2172,11 +2172,15 @@ void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
         {
             for (int h = 0; h < n_v_heads; h++) {
                 int gh = alpha_map[h];
-                const uint8_t *head_data = (const uint8_t *)lw->ssm_alpha + (size_t)gh * row_bytes;
+                /* R4/R8 types interleave 4/8 rows per block: row gh lives in
+                 * group gh/rpb at index gh%rpb, so a plain gh*row_bytes walk
+                 * (and vec_dot's hardcoded row 0) is wrong for 3 of every 4
+                 * heads. vec_dot_row() resolves the group and row. */
+                const uint8_t *head_data = (const uint8_t *)gguf_type_row_ptr(lw->ssm_alpha, alpha_type, row_bytes, gh);
                 float sum;
                 if (alpha_type == GGUF_TYPE_Q8_0) sum = vec_dot_q8_0_q8_0_deltas(xb_q8, xb_q8_d, head_data, dim);
                 else if (alpha_type == GGUF_TYPE_Q4_0) sum = vec_dot_q4_0_q8_0(head_data, xb_q8, dim);
-                else sum = vec_dot(head_data, s->xb, dim, alpha_type);
+                else sum = vec_dot_row(lw->ssm_alpha, s->xb, dim, alpha_type, gh);
                 alpha_out[h] = sum + s->ssm_dt_w[il][h];
             }
         }
@@ -2222,11 +2226,11 @@ void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
         {
             for (int h = 0; h < n_v_heads; h++) {
                 int gh = beta_map[h];
-                const uint8_t *head_data = (const uint8_t *)lw->ssm_beta + (size_t)gh * row_bytes;
+                const uint8_t *head_data = (const uint8_t *)gguf_type_row_ptr(lw->ssm_beta, beta_type, row_bytes, gh);
                 float sum;
                 if (beta_type == GGUF_TYPE_Q8_0) sum = vec_dot_q8_0_q8_0_deltas(xb_q8, xb_q8_d, head_data, dim);
                 else if (beta_type == GGUF_TYPE_Q4_0) sum = vec_dot_q4_0_q8_0(head_data, xb_q8, dim);
-                else sum = vec_dot(head_data, s->xb, dim, beta_type);
+                else sum = vec_dot_row(lw->ssm_beta, s->xb, dim, beta_type, gh);
                 beta[h] = 1.0f / (1.0f + expf(-sum));
             }
         }
@@ -3617,11 +3621,12 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
             const uint8_t *alpha_w = (const uint8_t *)lw->ssm_alpha;
             for (int h = 0; h < n_v_heads; h++) {
                 int gh = alpha_map[h];
-                const uint8_t *head_data = alpha_w + (size_t)gh * row_bytes_alpha;
+                /* R4/R8 interleaved types: row gh is group gh/rpb, row gh%rpb. */
+                const uint8_t *head_data = (const uint8_t *)gguf_type_row_ptr(alpha_w, alpha_type, row_bytes_alpha, gh);
                 float sum;
                 if (alpha_type == GGUF_TYPE_Q8_0) sum = vec_dot_q8_0_q8_0_deltas(xb_q8, xb_q8_d, head_data, dim);
                 else if (alpha_type == GGUF_TYPE_Q4_0) sum = vec_dot_q4_0_q8_0(head_data, xb_q8, dim);
-                else sum = vec_dot(head_data, ssm_xb + bi * dim, dim, alpha_type);
+                else sum = vec_dot_row(alpha_w, ssm_xb + bi * dim, dim, alpha_type, gh);
                 al[h] = sum + s->ssm_dt_w[l][h];
             }
             /* Beta */
@@ -3629,11 +3634,11 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
             float *bt = beta_batch + bi * n_v_heads;
             for (int h = 0; h < n_v_heads; h++) {
                 int gh = beta_map[h];
-                const uint8_t *head_data = beta_w + (size_t)gh * row_bytes_beta;
+                const uint8_t *head_data = (const uint8_t *)gguf_type_row_ptr(beta_w, beta_type, row_bytes_beta, gh);
                 float sum;
                 if (beta_type == GGUF_TYPE_Q8_0) sum = vec_dot_q8_0_q8_0_deltas(xb_q8, xb_q8_d, head_data, dim);
                 else if (beta_type == GGUF_TYPE_Q4_0) sum = vec_dot_q4_0_q8_0(head_data, xb_q8, dim);
-                else sum = vec_dot(head_data, ssm_xb + bi * dim, dim, beta_type);
+                else sum = vec_dot_row(beta_w, ssm_xb + bi * dim, dim, beta_type, gh);
                 bt[h] = sum;
             }
         }
