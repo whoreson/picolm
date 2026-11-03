@@ -1,7 +1,11 @@
 # PicoLM CI -- build + smoke test on every push/PR
 #
 # Source lives in picolm/ subdirectory (that's where the Makefile is).
-# The test model is at models/stories260K-Q2_K.gguf (repo root).
+# Test models live in models/ (repo root). Prefer stories260K-stuffed.gguf
+# (12 tensor types) wherever a test is about general correctness; use
+# stories260K-r4.gguf only for the R4-specific check (16 type-220 tensors) and
+# stories260K-Q2_K.gguf only where a scalar/low-SIMD build needs text this
+# small model can still produce coherently (see the macOS/ARM notes).
 
 name: CI
 
@@ -207,7 +211,7 @@ jobs:
       # --------------------------------------------------------------------
       # The prefill smoke test below runs on a model that ACTUALLY CONTAINS
       # interleaved (type 220) tensors, so it reaches the R4 GEMM and the R8
-      # repack. The stock stories260K-Q2_K is f32/f16/q4_0/q8_0 only, so a
+      # repack. The stock Q2_K model is f32/f16/q4_0/q8_0 only, so a
       # green prefill test on it proved nothing about those kernels -- which is
       # how both IQ4_NL_R4 bugs passed CI.
       #
@@ -245,7 +249,7 @@ jobs:
       - name: Smoke test -- generation
         working-directory: ./picolm
         run: |
-          timeout 30 ./picolm ../models/stories260K-Q2_K.gguf \
+          timeout 30 ./picolm ../models/stories260K-stuffed.gguf \
             -c 64 -n 16 -p "Once upon a time," 2>&1 | tee /tmp/picolm_output.txt
           if grep -q "tok/s" /tmp/picolm_output.txt; then
             echo "PASS: Generation completed successfully"
@@ -279,7 +283,7 @@ jobs:
       - name: Smoke test -- HTTP server starts
         working-directory: ./picolm
         run: |
-          timeout 5 ./picolm --server ../models/stories260K-Q2_K.gguf 2>&1 | head -20 || true
+          timeout 5 ./picolm --server ../models/stories260K-stuffed.gguf 2>&1 | head -20 || true
           echo "PASS: Server started (or timed out as expected)"
 
   # =========================================================================
@@ -300,12 +304,19 @@ jobs:
           make -j$(sysctl -n hw.logicalcpu) CC=clang
           ls -lh picolm
 
-      # NOTE: this job keeps stories260K-Q2_K. The R4/stuffed models' long
-      # prefill text differs on some builds (the scalar reference takes a
-      # different -- equally valid -- greedy path at 120 tokens), so pinning
-      # that text cross-toolchain would be a brittle assertion. Quant-kernel
-      # coverage on this platform comes from `make check-r4-model`, which only
-      # asserts the short prefix; add it here if you want it.
+      # NOTE: this job deliberately keeps stories260K-Q2_K.
+      #
+      # The stuffed model does NOT work here, and it is not a matter of text
+      # differing across builds: measured with the scalar reference build, at
+      # 120 prompt tokens the stuffed model degenerates into repetitive
+      # noise (". outshily. outshily. outshie. She was so moon.") whereas Q2_K
+      # still produces "there was a little girl named Lily". Twelve mixed quant
+      # types compound enough error on a 260K model that a low-SIMD toolchain
+      # cannot recover.
+      #
+      # Quant-kernel coverage on this platform therefore comes from
+      # `make check-r4-model` (which asserts only the short prefix, and passes
+      # on scalar) rather than from this long-prefill step.
       - name: Smoke test -- large prefill prompt
         working-directory: ./picolm
         run: |
@@ -358,12 +369,19 @@ jobs:
           make -j$(nproc) CC=gcc
           ls -lh picolm
 
-      # NOTE: this job keeps stories260K-Q2_K. The R4/stuffed models' long
-      # prefill text differs on some builds (the scalar reference takes a
-      # different -- equally valid -- greedy path at 120 tokens), so pinning
-      # that text cross-toolchain would be a brittle assertion. Quant-kernel
-      # coverage on this platform comes from `make check-r4-model`, which only
-      # asserts the short prefix; add it here if you want it.
+      # NOTE: this job deliberately keeps stories260K-Q2_K.
+      #
+      # The stuffed model does NOT work here, and it is not a matter of text
+      # differing across builds: measured with the scalar reference build, at
+      # 120 prompt tokens the stuffed model degenerates into repetitive
+      # noise (". outshily. outshily. outshie. She was so moon.") whereas Q2_K
+      # still produces "there was a little girl named Lily". Twelve mixed quant
+      # types compound enough error on a 260K model that a low-SIMD toolchain
+      # cannot recover.
+      #
+      # Quant-kernel coverage on this platform therefore comes from
+      # `make check-r4-model` (which asserts only the short prefix, and passes
+      # on scalar) rather than from this long-prefill step.
       - name: Smoke test -- large prefill prompt
         working-directory: ./picolm
         run: |
