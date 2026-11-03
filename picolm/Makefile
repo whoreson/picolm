@@ -794,6 +794,35 @@ test_quant: util/test_quant.c quant.c sgemm.c
 test_q6_k_r4: tests/test_q6_k_r4.c quant.c sgemm_q6_k_r4.c
 	$(CC) $(CFLAGS) -o $@ tests/test_q6_k_r4.c quant.c sgemm_q6_k_r4.c -lm -lpthread -fopenmp
 
+# SIMD flags for the standalone test binaries. 'make avx2' etc. re-invoke make
+# with the SIMD flags in CFLAGS, but a later bare 'make check-all' does not
+# inherit them -- so the tests would be compiled scalar while the binary under
+# test is AVX2. Derive the flags from the target the user asked for, falling
+# back to whatever CFLAGS already carries.
+ifeq ($(filter scalar,$(MAKECMDGOALS)),scalar)
+TEST_SIMD_CFLAGS =
+else ifeq ($(filter sse3,$(MAKECMDGOALS)),sse3)
+TEST_SIMD_CFLAGS = -msse2 -msse3 -mssse3 -mpopcnt -DPICOLM_SSE3 -DPICOLM_SSSE3 -DPICOLM_SSE2
+else ifeq ($(filter avx,$(MAKECMDGOALS)),avx)
+TEST_SIMD_CFLAGS = -mavx -mf16c -mpopcnt -DPICOLM_AVX -DPICOLM_SSE2 -DPICOLM_SSE3 -DPICOLM_SSSE3
+else ifeq ($(filter avx2,$(MAKECMDGOALS)),avx2)
+TEST_SIMD_CFLAGS = -mavx2 -mfma -mpopcnt -mf16c -DPICOLM_AVX2 -DPICOLM_FMA -DPICOLM_AVX -DPICOLM_SSSE3 -DPICOLM_SSE3 -DPICOLM_SSE2
+else ifneq ($(NATIVE_MARCH),)
+TEST_SIMD_CFLAGS = $(NATIVE_MARCH) $(call simd_flags_for,$(NATIVE_MARCH)) $(call simd_defines_for,$(NATIVE_MARCH))
+else
+TEST_SIMD_CFLAGS =
+endif
+
+# Row-interleaved (R4/R8) layout regression. Model-free, sub-second. Catches the
+# class of bug where code assumes a row-major layout for an interleaved type:
+# reads only row 0 of a block group, walks rows by a single row stride, or
+# decodes nibbles with the wrong interleave. See the DEBUG_JOURNAL in
+# notes/picolm/ for the two shipped instances (IQ4_NL_R4 ssm_alpha/beta NaN, and
+# the R8 prefill repack). Without SIMD flags the R4 GEMM does not exist and the
+# GEMM half degrades to "skipped", so TEST_SIMD_CFLAGS above matters.
+test_rowinterleave: tests/test_rowinterleave.c quant.c $(SGEMM_SRCS)
+	$(CC) $(CFLAGS) $(TEST_SIMD_CFLAGS) -I. -o $@ tests/test_rowinterleave.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp
+
 test_swa: tests/test_swa.c model_attention.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS)
 	$(CC) $(CFLAGS) -I. -O2 -o $@ tests/test_swa.c model_attention.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
 
@@ -890,11 +919,67 @@ check-q6-k-r4: test_q6_k_r4
 check-quant: test_quant
 	./test_quant
 
+.PHONY: check-rowinterleave
+check-rowinterleave: test_rowinterleave
+	./test_rowinterleave
+
 .PHONY: check-all
 check-all: check-hreduce check-kvcache-tokwrite check-quant check-q6-k-r4 \
+           check-rowinterleave \
            check-glm5-dsa check-glm5-snapshot check-attn check-attn-decode check-pool
 	@echo ""
 	@echo "=== check-all: all self-contained suites passed ==="
+
+# ---------------------------------------------------------------------------
+# check-oracle: differential test on a generated dummy-oracle model.
+#
+# A random-weight model produces gibberish, but the gibberish must be the SAME
+# gibberish on every code path. Compares the fast paths against their own
+# fallbacks, and the SIMD build against a scalar build. Needs gguf-py
+# (pip install gguf) to generate the model; skipped with a note if absent.
+#
+# This is the only test that covers the full model pipeline end to end with
+# interleaved (type 220) weights, including the SSM alpha/beta per-head row
+# walk and the R8 prefill GEMM that the two shipped IQ4_NL_R4 bugs lived in.
+# ---------------------------------------------------------------------------
+ORACLE_MODEL ?= /tmp/qwen35_tiny_r4.gguf
+
+.PHONY: oracle-model
+oracle-model:
+	@python3 -c 'import gguf' 2>/dev/null || { \
+		echo "SKIP: gguf-py not installed (pip install gguf)"; exit 1; }
+	python3 tools/mk_qwen35_tiny_r4.py -o $(ORACLE_MODEL)
+
+.PHONY: check-oracle
+check-oracle:
+	@python3 -c 'import gguf' 2>/dev/null || { \
+		echo "SKIP check-oracle: gguf-py not installed (pip install gguf)"; \
+		exit 0; }
+	@test -f $(ORACLE_MODEL) || $(MAKE) oracle-model
+	@test -x ./picolm || { echo "error: build ./picolm first"; exit 2; }
+	@if [ -x ./picolm_scalar ]; then \
+		PICOLM=./picolm SCALAR=./picolm_scalar tools/oracle_check.sh -m $(ORACLE_MODEL); \
+	else \
+		echo "NOTE: ./picolm_scalar not built -- SIMD-vs-scalar comparison skipped."; \
+		echo "      Run 'make build-scalar-ref' to cover the interleaved-row path."; \
+		PICOLM=./picolm tools/oracle_check.sh -m $(ORACLE_MODEL); \
+	fi
+
+# Scalar reference binary used by check-oracle for the SIMD-vs-scalar diff.
+# Built in its own object directory: the main .o files are compiled with SIMD
+# flags and reusing them would silently produce another SIMD binary.
+.PHONY: build-scalar-ref
+build-scalar-ref:
+	@echo "building scalar reference in build-scalar/ ..."
+	@rm -rf build-scalar && mkdir -p build-scalar
+	@cp $(SRCS) build-scalar/
+	@cp *.h build-scalar/ 2>/dev/null || true
+	@cp -r compat build-scalar/ 2>/dev/null || true
+	@cp Makefile build-scalar/
+	@$(MAKE) -C build-scalar TARGET=picolm_scalar \
+		CFLAGS="$(CFLAGS) -mno-sse2 -mno-avx" picolm_scalar
+	@cp build-scalar/picolm_scalar ./picolm_scalar
+	@echo "built ./picolm_scalar (scalar reference)"
 
 gguf_be_swap: util/gguf_be_swap.c
 	$(CC) -O2 -std=c99 -o $@ util/gguf_be_swap.c -lm
