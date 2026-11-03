@@ -235,6 +235,31 @@ int picolm_sgemm_d_iq4xs(int m, int n, int k_blocks_q4xs,
                          const void *B, int ldb_q8k,
                          float *C, int ldc, int ith, int nth) {
 #if defined(__AVX2__)
+    /* Decode-once R8 path (prefill): 8 weight rows are LUT-decoded once per column panel into the
+     * IQ6_K-style int8 scratch and run through the tiled VNNI / AVX2 kernels, instead of
+     * re-decoding every block for each 1 x NC tile. PICOLM_IQ4XS_R8=0 disables it,
+     * PICOLM_IQ4XS_VNNI=0 forces the AVX2 variant, PICOLM_IQ4XS_R8_MIN_N (default 16) = smallest batch. */
+    {
+        static int en = -1, vnni_en = 1, min_n = 16;
+        if (en < 0) {
+            const char *e = getenv("PICOLM_IQ4XS_R8"), *v = getenv("PICOLM_IQ4XS_VNNI"), *mn = getenv("PICOLM_IQ4XS_R8_MIN_N");
+            if (v && v[0] == '0') vnni_en = 0;
+            if (mn && atoi(mn) > 0) min_n = atoi(mn);
+            en = !(e && e[0] == '0');
+        }
+        if (en && n >= min_n && (m % 8) == 0 && lda_q4xs == k_blocks_q4xs && ldb_q8k == k_blocks_q4xs &&
+            picolm_r8_big_enough(m, k_blocks_q4xs * (QK_K / 32))) {
+            const int k = k_blocks_q4xs * QK_K;
+            if (vnni_en && sgemm_iq4_xs_q8_k_r8v(m, n, k, A, B, C, (size_t)ldc, ith, nth)) {
+                static int tr; if (!tr && getenv("PICOLM_DISPATCH")) { tr = 1; fprintf(stderr, "TRACE kernel: sgemm_iq4_xs_q8_k_r8v (decode-once R8, VNNI)\n"); }
+                return 1;
+            }
+            if (sgemm_iq4_xs_q8_k_r8t(m, n, k, A, B, C, (size_t)ldc, ith, nth)) {
+                static int tr; if (!tr && getenv("PICOLM_DISPATCH")) { tr = 1; fprintf(stderr, "TRACE kernel: sgemm_iq4_xs_q8_k_r8t (decode-once R8, AVX2)\n"); }
+                return 1;
+            }
+        }
+    }
     sgemm_iq4xs_q8k(m, n, k_blocks_q4xs, (const block_iq4_xs *)A, lda_q4xs,
                     (const block_q8_K *)B, ldb_q8k, C, ldc, ith, nth);
     return 1;

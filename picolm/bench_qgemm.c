@@ -50,6 +50,7 @@ static int run(const qt_t*t,int m,int n,int k,int reps,int nth,int check){
         double best=1e9; for(int r=0;r<reps;r++){double t0=now();GEMM_CALL(0,1);double dt=now()-t0;if(dt<best)best=dt;}
         gops=2.0*m*n*k/best/1e9; printf("%-7s prefill m=%d n=%d k=%d : %7.1f GOPS (1 thread)\n",t->name,m,n,k,gops);
     }
+    if(getenv("BENCH_HASH")){ uint64_t h=1469598103934665603ull; for(size_t i=0;i<(size_t)n*m;i++){ uint32_t u; memcpy(&u,&C[i],4); h=(h^u)*1099511628211ull; } printf("%-7s hash m=%d n=%d k=%d: %016llx\n",t->name,m,n,k,(unsigned long long)h); }
     if(check && ok){
         double maxd=0,rms=0; int bad=0;
         float *rowf=malloc(sizeof(float)*k);
@@ -77,11 +78,49 @@ static int run(const qt_t*t,int m,int n,int k,int reps,int nth,int check){
       printf("%-7s decode dot: %6.1f ns/row (k=%d)  %5.2f GB/s weights  [%g]\n",t->name,best*1e9/rows,k,(double)rows*wrow/best/1e9,sink); }
     free(W);free(B);free(Bd);free(tmp);free(C); return 0;
 }
+
+/* ---- IQ4_XS (Q8_K activations, 256-value super-blocks, per-32 6-bit scales) ---- */
+static int run_xs(int m,int n,int k,int reps,int nth,int check){
+    if(k%256) return 0; int nbk=k/256; size_t wrow=(size_t)nbk*sizeof(block_iq4_xs);
+    unsigned char *W=malloc((size_t)m*wrow); for(size_t i=0;i<(size_t)m*nbk;i++){ unsigned char*b=W+i*sizeof(block_iq4_xs); for(size_t j=0;j<sizeof(block_iq4_xs);j++) b[j]=(unsigned char)rnd(); uint16_t d=fp32_to_fp16(0.001f+(rnd()&255)*1e-5f); memcpy(b,&d,2); }
+    block_q8_K *B=malloc((size_t)n*nbk*sizeof(block_q8_K)); float *tmp=malloc(sizeof(float)*k);
+    for(int c=0;c<n;c++){ for(int i=0;i<k;i++) tmp[i]=fr(); quantize_row_q8_K(tmp,B+(size_t)c*nbk,k); }
+    float *C=calloc((size_t)n*m,sizeof(float)); int ok=1;
+    for(int i=0;i<nth;i++) ok&=picolm_sgemm_d_iq4xs(m,n,nbk,W,nbk,B,nbk,C,m,i,nth);
+    double gops=0;
+    if(!ok){ printf("iq4_xs  prefill: unsupported in this build\n"); }
+    else { double best=1e9; for(int r=0;r<reps;r++){ double t0=now(); picolm_sgemm_d_iq4xs(m,n,nbk,W,nbk,B,nbk,C,m,0,1); double dt=now()-t0; if(dt<best)best=dt; }
+           gops=2.0*m*n*k/best/1e9; printf("iq4_xs  prefill m=%d n=%d k=%d : %7.1f GOPS (1 thread)\n",m,n,k,gops); }
+    if(check && ok){ double maxd=0,rms=0; for(int c=0;c<n&&c<8;c++)for(int r=0;r<m&&r<64;r++){ double acc=0;
+            for(int q=0;q<nbk;q++){ const block_iq4_xs*x=(const block_iq4_xs*)(W+(size_t)r*wrow)+q; const block_q8_K*y=B+(size_t)c*nbk+q; double sub=0;
+                for(int sb=0;sb<8;sb++){ int ls=((x->scales_l[sb>>1]>>(4*(sb&1)))&0xf)|(((x->scales_h>>(2*sb))&3)<<4); int is=0;
+                    for(int j=0;j<16;j++){ unsigned char qq=x->qs[16*sb+j]; is+=kvalues_iq4nl[qq&15]*y->qs[32*sb+j]+kvalues_iq4nl[qq>>4]*y->qs[32*sb+16+j]; }
+                    sub+=(double)(ls-32)*is; }
+                acc+=sub*fp16_to_fp32(x->d)*y->d; }
+            double dd=fabs(acc-C[(size_t)c*m+r]); if(dd>maxd)maxd=dd; rms+=acc*acc; }
+        rms=sqrt(rms/(8.0*64)); int bad=maxd>1e-3*rms+1e-3; printf("iq4_xs  check: maxdiff=%.3g (rms %.3g) %s\n",maxd,rms,bad?"FAIL":"ok"); if(bad) return 1; }
+#if defined(__AVX2__) || defined(__ARM_NEON)
+    { double best=1e9; float sink=0, o; for(int r=0;r<reps;r++){ double t0=now(); for(int i=0;i<m;i++){
+#if defined(__AVX2__)
+            vec_dot_iq4_xs_q8_k_avx2(W+(size_t)i*wrow,B,k,&o);
+#else
+            vec_dot_iq4_xs_q8_k_neon(W+(size_t)i*wrow,B,k,&o);
+#endif
+            sink+=o; } double dt=now()-t0; if(dt<best)best=dt; }
+      printf("iq4_xs  decode dot: %6.1f ns/row (k=%d)  %5.2f GB/s weights  [%g]\n",best*1e9/m,k,(double)m*wrow/best/1e9,sink); }
+#endif
+    free(W);free(B);free(tmp);free(C); return 0; }
+
 int main(int argc,char**argv){
     fp16_table_init();
+    if(argc>6&&!strcmp(argv[1],"shape")){ /* ./bench_qgemm shape <type> m n k nth : correctness of one shape */
+        for(unsigned t=0;t<sizeof QT/sizeof*QT;t++) if(!strcmp(QT[t].name,argv[2])) return run(&QT[t],atoi(argv[3]),atoi(argv[4]),atoi(argv[5]),1,atoi(argv[6]),1);
+        return 2; }
     if(argc>1&&!strcmp(argv[1],"check")){ int bad=0; int shapes[][3]={{8,5,64},{16,33,128},{24,64,256},{64,7,96},{40,128,512}};
         for(unsigned t=0;t<sizeof QT/sizeof*QT;t++){for(unsigned s=0;s<sizeof shapes/sizeof*shapes;s++) bad|=run(&QT[t],shapes[s][0],shapes[s][1],shapes[s][2],1,1,1);
-            bad|=run(&QT[t],72,70,320,1,3,1); bad|=run(&QT[t],64,129,224,1,5,1); } return bad; }
-    const char*tn=argc>1?argv[1]:"iq4_nl"; int m=argc>2?atoi(argv[2]):4096,n=argc>3?atoi(argv[3]):512,k=argc>4?atoi(argv[4]):4096,reps=argc>5?atoi(argv[5]):3,nth=argc>6?atoi(argv[6]):1;
+            bad|=run(&QT[t],72,70,320,1,3,1); bad|=run(&QT[t],64,129,224,1,5,1); }
+        { int xs[][3]={{8,5,256},{16,33,512},{24,64,1024},{64,7,768},{40,128,512},{72,70,256}}; for(unsigned s=0;s<sizeof xs/sizeof*xs;s++) bad|=run_xs(xs[s][0],xs[s][1],xs[s][2],1,1,1); bad|=run_xs(72,70,512,1,3,1); bad|=run_xs(64,129,768,1,5,1); }
+        return bad; }
+    const char*tn=argc>1?argv[1]:"iq4_nl"; if(!strcmp(tn,"iq4_xs")||!strcmp(tn,"all")){ int m_=argc>2?atoi(argv[2]):4096,n_=argc>3?atoi(argv[3]):512,k_=argc>4?atoi(argv[4]):4096; run_xs(m_,n_,k_,argc>5?atoi(argv[5]):3,argc>6?atoi(argv[6]):1,0); if(!strcmp(tn,"iq4_xs")) return 0; } int m=argc>2?atoi(argv[2]):4096,n=argc>3?atoi(argv[3]):512,k=argc>4?atoi(argv[4]):4096,reps=argc>5?atoi(argv[5]):3,nth=argc>6?atoi(argv[6]):1;
     for(unsigned t=0;t<sizeof QT/sizeof*QT;t++) if(!strcmp(QT[t].name,tn)||!strcmp(tn,"all")) run(&QT[t],m,n,k,reps,nth,0);
     return 0; }
