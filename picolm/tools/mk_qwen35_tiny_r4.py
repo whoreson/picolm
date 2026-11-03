@@ -4,8 +4,8 @@ row-interleaved (type 220, "IQ4_NL_R4") weights -- a *dummy oracle model*.
 
 WHY THIS EXISTS
 ---------------
-The CI smoke model (stories260K-Q2_K) contains only f32/f16/q4_0/q8_0 tensors,
-so no CI prompt can ever exercise an R4/R8/SSM kernel. Two real bugs shipped
+The CI smoke models used to contain only f32/f16/q4_0/q8_0 tensors, so no CI
+prompt could exercise an R4/R8/SSM kernel. Two real bugs shipped
 through that gap (see notes/picolm/qwen3.6_iq4_nl_r4_garbage_DEBUG_JOURNAL.txt):
 
   BUG A  vec_dot() on an interleaved type only read row 0 of a block group, and

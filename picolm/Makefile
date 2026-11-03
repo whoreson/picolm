@@ -924,11 +924,36 @@ check-rowinterleave: test_rowinterleave
 	./test_rowinterleave
 
 .PHONY: check-all
+# check-simd-diff is deliberately NOT in check-all: it builds a second
+# (scalar) picolm, which would clash with check-all-san's sanitizer build and
+# roughly double check-all's cost. CI runs it as its own step.
 check-all: check-hreduce check-kvcache-tokwrite check-quant check-q6-k-r4 \
            check-rowinterleave \
            check-glm5-dsa check-glm5-snapshot check-attn check-attn-decode check-pool
 	@echo ""
 	@echo "=== check-all: all self-contained suites passed ==="
+
+# ---------------------------------------------------------------------------
+# check-simd-diff: the SIMD build and a scalar build must agree, byte for byte.
+#
+# This is the check that found the zeroed-R8-kernels bug: vec_dot_q4_0_r8_q8_2_avx2
+# and vec_dot_q8_0_r8_q8_0_avx2 returned zeros when AVX2 was absent, so models
+# carrying Q4_0_R8 / Q8_0_R8 decoded to garbage on a scalar build while the SIMD
+# build was fine. Nothing crashed and nothing warned.
+#
+# Unlike check-oracle, the scalar build is REQUIRED here, not optional -- an
+# optional comparison is how that bug survived. Build it with `make
+# build-scalar-ref` (also done automatically by this target).
+# ---------------------------------------------------------------------------
+.PHONY: check-simd-diff
+check-simd-diff:
+	@test -x ./picolm || { echo "error: build ./picolm first"; exit 2; }
+	@# Compare against a freshly built scalar reference. A STALE picolm_scalar is
+	@# the dangerous case, not a missing one: it would test yesterday's code and
+	@# pass while today's is broken. So always rebuild -- it is a single cheap
+	@# target, and correctness here is worth more than the seconds.
+	@$(MAKE) --no-print-directory build-scalar-ref
+	@PICOLM=./picolm SCALAR=./picolm_scalar tools/simd_diff.sh
 
 # ---------------------------------------------------------------------------
 # check-oracle: differential test on a generated dummy-oracle model.

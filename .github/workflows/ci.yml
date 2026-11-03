@@ -1,11 +1,12 @@
 # PicoLM CI -- build + smoke test on every push/PR
 #
 # Source lives in picolm/ subdirectory (that's where the Makefile is).
-# Test models live in models/ (repo root). Prefer stories260K-stuffed.gguf
-# (12 tensor types) wherever a test is about general correctness; use
-# stories260K-r4.gguf only for the R4-specific check (16 type-220 tensors) and
-# stories260K-Q2_K.gguf only where a scalar/low-SIMD build needs text this
-# small model can still produce coherently (see the macOS/ARM notes).
+# Test models live in models/ (repo root), and only two are needed:
+#   stories260K-stuffed.gguf (12 tensor types) for everything.
+#   stories260K-r4.gguf      (16 type-220 tensors) for check-r4-model only.
+# stories260K-Q2_K.gguf has been deleted. It was only ever used because the
+# stuffed model appeared to break on non-AVX2 builds, which turned out to be
+# zeroed R8 kernels rather than the model.
 
 name: CI
 
@@ -134,7 +135,9 @@ jobs:
       - name: Install gguf-py (oracle model generator)
         run: pip install gguf numpy
 
-      - name: Build scalar reference (for SIMD-vs-scalar diff)
+      # check-oracle uses this when present (it degrades to SIMD-only otherwise);
+      # check-simd-diff rebuilds it unconditionally and requires it.
+      - name: Build scalar reference
         working-directory: ./picolm
         run: make build-scalar-ref
 
@@ -147,6 +150,28 @@ jobs:
             echo "PASS: oracle comparisons agreed"
           else
             echo "FAIL: oracle mismatch (a code path disagrees with its fallback)"
+            exit 1
+          fi
+
+      # --------------------------------------------------------------------
+      # Differential: the SIMD build and a scalar build must produce
+      # byte-identical output. This is what found the zeroed-R8-kernels bug --
+      # AVX2-only GEMV stubs returned zeros elsewhere, so Q4_0_R8/Q8_0_R8
+      # tensors silently contributed nothing on a scalar build. Nothing
+      # crashed; the text was just wrong.
+      #
+      # Unlike check-oracle (which merely *skips* the scalar comparison when no
+      # scalar binary exists), this target builds one and requires it.
+      # --------------------------------------------------------------------
+      - name: Run check-simd-diff (SIMD vs scalar must agree)
+        working-directory: ./picolm
+        run: |
+          set -o pipefail
+          make check-simd-diff 2>&1 | tee /tmp/simddiff.txt
+          if grep -q "=== simd_diff: SIMD and scalar builds agree ===" /tmp/simddiff.txt; then
+            echo "PASS: SIMD and scalar builds agree"
+          else
+            echo "FAIL: SIMD and scalar builds disagree"
             exit 1
           fi
 
@@ -192,15 +217,13 @@ jobs:
       # a later reshuffle cannot quietly point a test at a model that does not
       # cover what the test is named after.
       #
-      #   stories260K-Q2_K.gguf     f32/f16/q4_0/q8_0 only -- cannot reach any
-      #                             R4/R8/SSM kernel at any prompt length.
       #   stories260K-r4.gguf       7 types, 16 of them type 220.
-      #   stories260K-stuffed.gguf  12 types; the broadest coverage.
+      #   stories260K-stuffed.gguf  12 types; used by every test.
       # --------------------------------------------------------------------
       - name: Record what each test model covers
         working-directory: ./picolm
         run: |
-          for m in stories260K-Q2_K stories260K-r4 stories260K-stuffed; do
+          for m in stories260K-r4 stories260K-stuffed; do
             echo "--- $m"
             ./picolm --list-tensors "../models/$m.gguf" 2>/dev/null \
               | grep -E "^(blk\.|token_embd|output\.)" \
@@ -211,7 +234,7 @@ jobs:
       # --------------------------------------------------------------------
       # The prefill smoke test below runs on a model that ACTUALLY CONTAINS
       # interleaved (type 220) tensors, so it reaches the R4 GEMM and the R8
-      # repack. The stock Q2_K model is f32/f16/q4_0/q8_0 only, so a
+      # repack. The old Q2_K test model was f32/f16/q4_0/q8_0 only, so a
       # green prefill test on it proved nothing about those kernels -- which is
       # how both IQ4_NL_R4 bugs passed CI.
       #
@@ -304,23 +327,17 @@ jobs:
           make -j$(sysctl -n hw.logicalcpu) CC=clang
           ls -lh picolm
 
-      # NOTE: this job deliberately keeps stories260K-Q2_K.
-      #
-      # The stuffed model does NOT work here, and it is not a matter of text
-      # differing across builds: measured with the scalar reference build, at
-      # 120 prompt tokens the stuffed model degenerates into repetitive
-      # noise (". outshily. outshily. outshie. She was so moon.") whereas Q2_K
-      # still produces "there was a little girl named Lily". Twelve mixed quant
-      # types compound enough error on a 260K model that a low-SIMD toolchain
-      # cannot recover.
-      #
-      # Quant-kernel coverage on this platform therefore comes from
-      # `make check-r4-model` (which asserts only the short prefix, and passes
-      # on scalar) rather than from this long-prefill step.
+      # Runs the stuffed (12-type) model here too. This step previously used
+      # a Q2_K build because the stuffed model appeared to degenerate on
+      # non-AVX2 builds. That was not model fragility: the AVX2-only R8 GEMV
+      # kernels had empty non-AVX2 stubs that returned zeros, so Q4_0_R8 and
+      # Q8_0_R8 tensors contributed nothing. Those stubs now have portable
+      # implementations, and the scalar build produces byte-identical output to
+      # the SIMD build on this model, at both 24 and 120 generated tokens.
       - name: Smoke test -- large prefill prompt
         working-directory: ./picolm
         run: |
-          ./picolm ../models/stories260K-Q2_K.gguf \
+          ./picolm ../models/stories260K-stuffed.gguf \
             -c 256 -n 160 -t 0 \
             -p "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\nOnce upon a time" \
             2>&1 | tee /tmp/picolm_prefill.txt
@@ -369,23 +386,17 @@ jobs:
           make -j$(nproc) CC=gcc
           ls -lh picolm
 
-      # NOTE: this job deliberately keeps stories260K-Q2_K.
-      #
-      # The stuffed model does NOT work here, and it is not a matter of text
-      # differing across builds: measured with the scalar reference build, at
-      # 120 prompt tokens the stuffed model degenerates into repetitive
-      # noise (". outshily. outshily. outshie. She was so moon.") whereas Q2_K
-      # still produces "there was a little girl named Lily". Twelve mixed quant
-      # types compound enough error on a 260K model that a low-SIMD toolchain
-      # cannot recover.
-      #
-      # Quant-kernel coverage on this platform therefore comes from
-      # `make check-r4-model` (which asserts only the short prefix, and passes
-      # on scalar) rather than from this long-prefill step.
+      # Runs the stuffed (12-type) model here too. This step previously used
+      # a Q2_K build because the stuffed model appeared to degenerate on
+      # non-AVX2 builds. That was not model fragility: the AVX2-only R8 GEMV
+      # kernels had empty non-AVX2 stubs that returned zeros, so Q4_0_R8 and
+      # Q8_0_R8 tensors contributed nothing. Those stubs now have portable
+      # implementations, and the scalar build produces byte-identical output to
+      # the SIMD build on this model, at both 24 and 120 generated tokens.
       - name: Smoke test -- large prefill prompt
         working-directory: ./picolm
         run: |
-          timeout 120 ./picolm ../models/stories260K-Q2_K.gguf \
+          timeout 120 ./picolm ../models/stories260K-stuffed.gguf \
             -c 256 -n 160 -t 0 \
             -p "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\nOnce upon a time" \
             2>&1 | tee /tmp/picolm_prefill.txt
