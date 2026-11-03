@@ -183,26 +183,26 @@ jobs:
           fi
 
       # --------------------------------------------------------------------
-      # The smoke model is stories260K-Q2_K: f32/f16/q4_0/q8_0 only. It can
-      # never exercise an R4/R8/SSM kernel no matter what prompt we feed it, so
-      # a green prefill smoke test must not be read as "the quant kernels work".
-      # This step states that explicitly instead of leaving it implicit, and
-      # fails if the model stops being what the comment says it is.
+      # There are three models in models/ and they are NOT interchangeable.
+      # Printing the type histogram for each makes that visible in the log, so
+      # a later reshuffle cannot quietly point a test at a model that does not
+      # cover what the test is named after.
+      #
+      #   stories260K-Q2_K.gguf     f32/f16/q4_0/q8_0 only -- cannot reach any
+      #                             R4/R8/SSM kernel at any prompt length.
+      #   stories260K-r4.gguf       7 types, 16 of them type 220.
+      #   stories260K-stuffed.gguf  12 types; the broadest coverage.
       # --------------------------------------------------------------------
-      - name: Record what the smoke model actually covers
+      - name: Record what each test model covers
         working-directory: ./picolm
         run: |
-          ./picolm --list-tensors ../models/stories260K-Q2_K.gguf 2>/dev/null \
-            | awk '{print $NF}' | sort | uniq -c | sort -rn > /tmp/types.txt || true
-          ./picolm ../models/stories260K-Q2_K.gguf -c 8 -n 1 -p "x" 2>&1 \
-            | grep -i "Tensor types" || true
-          if grep -Eq "iq4_nl_r4|q4_0_4_4|q8_0_r8|q4_k_r4" /tmp/types.txt; then
-            echo "INFO: smoke model contains interleaved (R4/R8) tensors"
-            echo "      -- the prefill smoke test DOES cover their kernels."
-          else
-            echo "NOTE: smoke model has no R4/R8 tensors. Interleaved-type kernel"
-            echo "      coverage comes from 'make check-rowinterleave' only."
-          fi
+          for m in stories260K-Q2_K stories260K-r4 stories260K-stuffed; do
+            echo "--- $m"
+            ./picolm --list-tensors "../models/$m.gguf" 2>/dev/null \
+              | grep -E "^(blk\.|token_embd|output\.)" \
+              | awk '{print $NF}' | sort -n | uniq -c | tr '\n' ' '
+            echo
+          done
 
       # --------------------------------------------------------------------
       # The prefill smoke test below runs on a model that ACTUALLY CONTAINS
@@ -255,12 +255,15 @@ jobs:
             exit 1
           fi
 
-      - name: Smoke test -- large prefill prompt (R4 model, type 220)
+      - name: Smoke test -- large prefill prompt (stuffed model, 12 types)
         working-directory: ./picolm
         run: |
-          # Same prompt and assertions as before, but on a model carrying 16
-          # interleaved tensors, so this actually exercises the R4 kernels.
-          timeout 60 ./picolm ../models/stories260K-r4.gguf \
+          # Runs on the 12-type model so the prefill path is exercised with
+          # q4_0/q4_1/q5_0/q5_1/q6_0/q8_0/iq4_nl/q4_0_r8/q8_0_r8/iq4_nl_r4
+          # rather than a single quant type. The R4-specific coverage (16 type
+          # 220 tensors) comes from check-r4-model just above; this step is
+          # about the prefill code path itself.
+          timeout 60 ./picolm ../models/stories260K-stuffed.gguf \
             -c 256 -n 160 -t 0 \
             -p "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\nOnce upon a time" \
             2>&1 | tee /tmp/picolm_prefill.txt
