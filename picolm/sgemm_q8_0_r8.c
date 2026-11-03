@@ -318,13 +318,41 @@ int sgemm_q8_0_r8_q8_0_avx2(int nrows, int ncols, int k,
 
 #else /* !__AVX2__ */
 
+/* Portable fallback: Q8_0_R8 weights x Q8_0 activations.
+ *
+ * block_q8_0_r8 is {fp16 d[8]; int8 qs[256]} = 8 rows x 32 values, stored as
+ * an 8x8 transpose of 32-bit words: row r's 32 values are
+ *   qs[32*l + 4*r + i] for l = 0..3, i = 0..3  ->  value 4*l + i, and
+ *   qs[32*l + 4*r + i + 128]                   ->  value 4*l + i + 16.
+ * (See dequantize_row_q8_0_r8_single, which this mirrors.)
+ *
+ * Dequantize-then-integer-dot, exactly like vec_dot_q5_0_q8_0: the point is
+ * that it works on every target, not that it is fast. Without it a build
+ * lacking AVX2 silently returned zeros for this type, which produced coherent-
+ * looking-but-wrong text (see the fix that introduced this fallback). */
 void vec_dot_q8_0_r8_q8_0_avx2(const void *vx, const void *wy, int n,
                                float *out, int nrows) {
-    (void)vx; (void)wy; (void)n; (void)out; (void)nrows;
-    fprintf(stderr,
-            "FATAL: vec_dot_q8_0_r8_q8_0_avx2 called in a build without the required SIMD.\n"
-            "       This type has no scalar fallback; refusing to return zeros.\n");
-    abort();
+    const block_q8_0_r8 *xb = (const block_q8_0_r8 *)vx;
+    const block_q8_0 *y = (const block_q8_0 *)wy;
+    const int nb = n / 32;
+    for (int row = 0; row < nrows; row++) {
+        float sumf = 0.0f;
+        for (int ib = 0; ib < nb; ib++) {
+            const float d = fp16_to_fp32(xb[ib].d[row]) * fp16_to_fp32(y[ib].d);
+            const int8_t *qs = xb[ib].qs;
+            const int8_t *ya = y[ib].qs;
+            int sumi = 0;
+            for (int l = 0; l < 4; l++) {
+                const int8_t *q = qs + 32 * l + 4 * row;
+                for (int i = 0; i < 4; i++) {
+                    sumi += (int)q[i]       * (int)ya[4 * l + i];
+                    sumi += (int)q[i + 128] * (int)ya[4 * l + i + 16];
+                }
+            }
+            sumf += (float)sumi * d;
+        }
+        out[row] = sumf;
+    }
 }
 
 int sgemm_q8_0_r8_q8_0_avx2(int nrows, int ncols, int k,
@@ -335,13 +363,31 @@ int sgemm_q8_0_r8_q8_0_avx2(int nrows, int ncols, int k,
     return 0;
 }
 
+/* Portable fallback: as above but with caller-supplied fp32 activation deltas. */
 void vec_dot_q8_0_r8_q8_0_d_avx2(const void *vx, const void *wy, const float *q_d,
                                  int n, float *out, int nrows) {
-    (void)vx; (void)wy; (void)q_d; (void)n;
-    fprintf(stderr,
-            "FATAL: vec_dot_q8_0_r8_q8_0_d_avx2 called in a build without the required SIMD.\n"
-            "       This type has no scalar fallback; refusing to return zeros.\n");
-    abort();
+    const block_q8_0_r8 *xb = (const block_q8_0_r8 *)vx;
+    const block_q8_0 *y = (const block_q8_0 *)wy;
+    const int nb = n / 32;
+    for (int row = 0; row < nrows; row++) {
+        float sumf = 0.0f;
+        for (int ib = 0; ib < nb; ib++) {
+            const float dy = q_d ? q_d[ib] : fp16_to_fp32(y[ib].d);
+            const float d = fp16_to_fp32(xb[ib].d[row]) * dy;
+            const int8_t *qs = xb[ib].qs;
+            const int8_t *ya = y[ib].qs;
+            int sumi = 0;
+            for (int l = 0; l < 4; l++) {
+                const int8_t *q = qs + 32 * l + 4 * row;
+                for (int i = 0; i < 4; i++) {
+                    sumi += (int)q[i]       * (int)ya[4 * l + i];
+                    sumi += (int)q[i + 128] * (int)ya[4 * l + i + 16];
+                }
+            }
+            sumf += (float)sumi * d;
+        }
+        out[row] = sumf;
+    }
 }
 
 int sgemm_q8_0_r8_q8_0_d_avx2(int nrows, int ncols, int k,

@@ -262,9 +262,51 @@ int sgemm_q4_0_r8_q8_2_avx2(int nrows, int ncols, int k,
 #endif
 }
 #else
-/* Non-AVX2 stubs for cross-compilation compatibility */
-void vec_dot_q4_0_r8_q8_0_avx2(const void *vx, const void *wy, int n, float *out, int nrows) { (void)vx; (void)wy; (void)n; (void)out; (void)nrows; }
+/* Non-AVX2: PORTABLE GEMV implementations.
+ *
+ * These used to be empty stubs that returned nothing, leaving `out` untouched.
+ * A model containing a Q4_0_R8 tensor therefore decoded to garbage on any
+ * build without AVX2 -- with no error, no warning, and output that still looks
+ * like text. Found by diffing single-type models between the SIMD and scalar
+ * builds: exactly the two R8 types differed.
+ *
+ * block_q4_0x8 is 8 rows x 32 values: {fp16 d[8]; u8 qs[128]}. Row r's nibble
+ * bytes are qs[32*l + 4*r + j] for l = 0..3, j = 0..3; the low nibble is value
+ * 4*l+j and the high nibble value 4*l+j+16, both biased by 8. Mirrors
+ * dequantize_row_q4_0_r8_single.
+ *
+ * Integer MAC then one float scale, in the style of vec_dot_q5_0_q8_0: the
+ * point is that it is correct everywhere, not fast anywhere.
+ */
+#define Q4R8_PORTABLE(NAME, TYPE_Y)                                              \
+void NAME(const void *vx, const void *wy, int n, float *out, int nrows) {        \
+    const block_q4_0x8 *xb = (const block_q4_0x8 *)vx;                           \
+    const TYPE_Y *y = (const TYPE_Y *)wy;                                        \
+    const int nb = n / 32;                                                       \
+    for (int row = 0; row < nrows; row++) {                                      \
+        float sumf = 0.0f;                                                       \
+        for (int ib = 0; ib < nb; ib++) {                                        \
+            const float d = fp16_to_fp32(xb[ib].d[row]) * fp16_to_fp32(y[ib].d); \
+            const uint8_t *qs = xb[ib].qs;                                       \
+            const int8_t *ya = y[ib].qs;                                         \
+            int sumi = 0;                                                        \
+            for (int l = 0; l < 4; l++) {                                        \
+                const uint8_t *q = qs + 32 * l + 4 * row;                        \
+                for (int j = 0; j < 4; j++) {                                    \
+                    sumi += ((int)(q[j] & 0xF) - 8) * (int)ya[4 * l + j];        \
+                    sumi += ((int)(q[j] >> 4)  - 8) * (int)ya[4 * l + j + 16];   \
+                }                                                                \
+            }                                                                    \
+            sumf += (float)sumi * d;                                             \
+        }                                                                        \
+        out[row] = sumf;                                                         \
+    }                                                                            \
+}
+
+Q4R8_PORTABLE(vec_dot_q4_0_r8_q8_0_avx2, block_q8_0)
+Q4R8_PORTABLE(vec_dot_q4_0_r8_q8_2_avx2, block_q8_2)
+#undef Q4R8_PORTABLE
+
 int sgemm_q4_0_r8_q8_0_avx2(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) { (void)vx; (void)vy; (void)nrows; (void)ncols; (void)k; (void)out; (void)bs; (void)ith; (void)nth; return 0; }
-void vec_dot_q4_0_r8_q8_2_avx2(const void *vx, const void *wy, int n, float *out, int nrows) { (void)vx; (void)wy; (void)n; (void)out; (void)nrows; }
 int sgemm_q4_0_r8_q8_2_avx2(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) { (void)vx; (void)vy; (void)nrows; (void)ncols; (void)k; (void)out; (void)bs; (void)ith; (void)nth; return 0; }
 #endif
