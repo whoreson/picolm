@@ -28,30 +28,28 @@
 #
 # WHAT YOU GET
 # ------------
-# stories260K-stuffed.gguf: 11 distinct tensor types in ~290 KB, verified
+# stories260K-stuffed.gguf: 12 distinct tensor types in ~290 KB, verified
 # coherent by BOTH PicoLM and ik_llama's llama-cli.
 #
-#     attn_k        (x4) : q5_0            type 6
-#     attn_v        (x4) : q5_1            type 7
-#     attn_output   (x4) : q6_0            type 133
-#     ffn_gate      (x4) : q4_0            type 2
-#     ffn_up        (2/2) : q4_1, q4_0     type 3, 2
-#     attn_q        (1 ea) : q4_1, q8_0, q4_0_r8, iq4_nl_r4
-#                                          types 3, 8, 202, 220
-#     ffn_down      (x4) : F16             type 1   (n=172, not block-aligned)
-#     token_embd         : Q4_0            type 2
-#     output             : Q8_0            type 8
-#     *_norm             : F32             type 0
+# The 24 n=64 slots (attn_q/k/v/output, ffn_gate/up across 4 layers) cycle
+# through ten types, giving each 2-3 tensors:
 #
-# Each type appears on at least three tensors where the shape allows. That
-# matters: an earlier 11-type variant had q4_1 on a SINGLE tensor and removing
-# Q4_1's kernel from the dispatch table did not change the output at all, so the
-# model silently stopped testing it. Distributing a type over several tensors is
-# what makes it a regression test rather than a decoration.
+#     q4_0 (2)  q4_1 (3)  q5_0 (3)  q5_1 (2)  q6_0 (2)  q8_0 (3)
+#     iq4_nl (3)  q4_0_r8 (2)  q8_0_r8 (2)  iq4_nl_r4 (2)
 #
-# The four interleaved-ish types (q4_0_r8, iq4_nl_r4) sit on one attn_q each
-# because they are only used at n=64 in this model and each already covers a
-# distinct kernel family.
+# plus ffn_down=F16, token_embd=Q4_0, output=Q8_0, *_norm=F32.
+#
+# ffn_down is F16 and must stay F16: its n is 172, which is not a multiple of
+# 32, so ANY block quantizer covers only 160 of the 172 input channels and
+# drops 12. Measured: ffn_down=q4_0/q4_1/q6_0 all produce garbage in ik AND
+# PicoLM, while F16 produces correct text. This is a shape property of
+# stories260K, not a property of any particular quant type -- it cost a while
+# to realise, because the symptom (garbage) looked type-specific.
+#
+# Each type needs several tensors to be worth testing. An earlier 11-type build
+# had q4_1 on a SINGLE tensor, and deleting Q4_1's kernel from the dispatch
+# table did not change the output by one byte. At 2-3 tensors per type,
+# removing Q4_1, Q4_0_R8 or Q8_0_R8 each changes the output and is caught.
 #
 # COVERAGE NOTE
 # -------------
@@ -107,8 +105,10 @@ echo "R4 type: $TYPE_R4  (attention projections only)"
 
 # The exact mix that both (a) decodes as English and (b) admits R4 on the
 # 32-aligned tensors. See the header comment for why each line is what it is.
+# Ten types over the 24 equally-shaped slots, three per layer rotating so no
+# slot is always the same type.
 exec "$QUANTIZE" \
-    --custom-q "attn_k=q5_0,attn_v=q5_1,attn_output=iq4_nl,ffn_gate=q6_0,ffn_down=F16,blk\.0\.attn_q=q4_1,blk\.1\.attn_q=q8_0,blk\.2\.attn_q=q4_0_r8,blk\.3\.attn_q=iq4_nl_r4,blk\.0\.ffn_up=q4_1,blk\.1\.ffn_up=q4_1,blk\.2\.ffn_up=q4_0,blk\.3\.ffn_up=q4_0" \
+    --custom-q "blk\.0\.attn_q=q4_0,blk\.0\.attn_k=q4_1,blk\.0\.attn_v=q5_0,blk\.0\.attn_output=q5_1,blk\.0\.ffn_gate=q6_0,blk\.0\.ffn_up=q8_0,blk\.1\.attn_q=iq4_nl,blk\.1\.attn_k=q4_0_r8,blk\.1\.attn_v=q8_0_r8,blk\.1\.attn_output=iq4_nl_r4,blk\.1\.ffn_gate=q4_0,blk\.1\.ffn_up=q4_1,blk\.2\.attn_q=q5_0,blk\.2\.attn_v=q5_1,blk\.2\.attn_output=q6_0,blk\.2\.ffn_gate=q8_0,blk\.2\.ffn_up=iq4_nl,blk\.2\.attn_k=q4_0_r8,blk\.3\.attn_q=q8_0_r8,blk\.3\.attn_k=iq4_nl_r4,blk\.3\.attn_v=q4_0,blk\.3\.attn_output=q4_1,blk\.3\.ffn_gate=q5_0,blk\.3\.ffn_up=q5_1,ffn_down=F16" \
     --token-embedding-type Q4_0 \
     --output-tensor-type Q8_0 \
     "$F32" "$OUT" Q4_0 4
