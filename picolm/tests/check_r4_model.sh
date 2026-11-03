@@ -78,10 +78,18 @@ esac
 # was unreadable on a scalar-only build; vec_dot_q5_0_q8_0() now covers that,
 # and a build which regresses it will abort in matmul_worker_f instead of
 # emitting junk.
-for t in 6 220 225; do
-    n=$("$BIN" --list-tensors "$MODEL" 2>/dev/null | awk -v t="$t" '$NF == t' | wc -l | tr -d ' ')
-    [ "$n" -gt 0 ] && echo "type $t: $n tensor(s)"
-done
+# How many distinct quant types the model exercises. A model that is coherent
+# but carries two types tests two kernels; the point of this fixture is breadth.
+ntypes=$("$BIN" --list-tensors "$MODEL" 2>/dev/null |
+         grep -E "^(blk\.|token_embd|output\.)" |
+         awk '{print $NF}' | sort -un | wc -l | tr -d ' ')
+echo "distinct tensor types: $ntypes"
+if [ -n "${MIN_TYPES:-}" ] && [ "$ntypes" -lt "$MIN_TYPES" ]; then
+    echo "FAIL: only $ntypes distinct tensor types, expected >= $MIN_TYPES."
+    echo "      A narrow model silently stops exercising the kernels this fixture"
+    echo "      exists for. See tools/mk_stories_r4.sh."
+    fail=1
+fi
 
 # ---- C. deterministic (cheap, and catches uninitialised buffers) ---------
 h1=$("$BIN" "$MODEL" -p "Once upon a time" -n 8 -t 0 2>/dev/null | md5sum)
