@@ -2530,6 +2530,38 @@ int parse_gguf(model_t *m, int max_seq_len) {
             if (w->layers[i].is_attn_layer) attn_count++; else ssm_count++;
         }
         fprintf(stderr, "  Layers: %d SSM + %d full attention\n", ssm_count, attn_count);
+        /* The recurrence derives head_v_dim = ssm_d_inner / n_v_heads with
+         * integer division (model_ssm.c), and n_v_heads comes from
+         * ssm.time_step_rank. If inner is not a multiple of dt_rank that
+         * division TRUNCATES: the last few value channels of every head are
+         * never addressed, and the gated-norm loop reads one norm_w span past
+         * its end. Both are silent -- no crash, just wrong numbers, and the
+         * error is batch-size independent so it looks like a quantisation
+         * difference. Refuse to load instead. (Found while generating a tiny
+         * oracle model: inner=256 with dt_rank=12 truncated to 21.) */
+        if (cfg->ssm_dt_rank > 0 && cfg->ssm_d_inner > 0 &&
+            cfg->ssm_d_inner % cfg->ssm_dt_rank != 0) {
+            fprintf(stderr,
+                    "ERROR: SSM: inner_size=%d is not a multiple of time_step_rank=%d.\n"
+                    "       head_v_dim = inner / time_step_rank would truncate to %d,\n"
+                    "       dropping %d value channels per head and reading past the\n"
+                    "       gated-norm weights. The model file is inconsistent.\n",
+                    cfg->ssm_d_inner, cfg->ssm_dt_rank,
+                    cfg->ssm_d_inner / cfg->ssm_dt_rank,
+                    cfg->ssm_d_inner - (cfg->ssm_d_inner / cfg->ssm_dt_rank) * cfg->ssm_dt_rank);
+            return -1;
+        }
+        if (cfg->ssm_dt_rank > 0 && cfg->ssm_d_state > 0 &&
+            cfg->ssm_d_inner % cfg->ssm_dt_rank == 0 &&
+            cfg->ssm_d_inner / cfg->ssm_dt_rank % cfg->ssm_d_state != 0) {
+            /* Only a warning: head_v_dim need not be a multiple of d_state for
+             * the recurrence to be well-defined, but a mismatch usually means
+             * the file is describing a different architecture than we assume. */
+            fprintf(stderr,
+                    "WARN: SSM: head_v_dim=%d is not a multiple of state_size=%d;\n"
+                    "      interpretation of this model may be wrong.\n",
+                    cfg->ssm_d_inner / cfg->ssm_dt_rank, cfg->ssm_d_state);
+        }
     }
     fprintf(stderr, "  head_dim=%d, rope_dim=%d, rope_base=%.1f\n", cfg->head_dim, cfg->rope_dim, (double)cfg->rope_freq_base);
     if (cfg->has_moe) {
