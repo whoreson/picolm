@@ -982,20 +982,34 @@ build-scalar-ref:
 	@echo "built ./picolm_scalar (scalar reference)"
 
 # ---------------------------------------------------------------------------
-# check-r4-model: real-text model that contains row-interleaved tensors.
+# check-r4-model: real-text models that exercise the quantization kernels.
 #
-# Uses the COMMITTED models/stories260K-r4.gguf (300 KB, 7 distinct tensor
-# types, 16 of them type 220). It is checked in on purpose: it cannot be
-# rebuilt in CI, because that needs stories260K-f32.gguf plus a working
-# llama-quantize, and reproducing the exact type mix requires ik_llama's
-# `--custom-q`. Committing 300 KB is far cheaper than that dependency.
+# Two COMMITTED models, both ~300 KB and both verified coherent against ik's
+# llama-cli so they are a real differential fixture and not just a
+# self-consistency check:
 #
-# `make stories-r4-model` regenerates it (byte-identical) when ik_llama and the
-# f32 source are available; see tools/mk_stories_r4.sh for why the mix is what
-# it is.
+#   models/stories260K-r4.gguf       7 distinct types, 16 of them type 220.
+#                                    The R4/R8 prefill GEMM gets real coverage.
+#   models/stories260K-stuffed.gguf 11 distinct types spread across the 32
+#                                    quantized slots (q4_1, q5_0, q5_1, q6_0,
+#                                    iq4_nl, q8_0, q4_0, q4_0_r8, iq4_nl_r4,
+#                                    F16, F32).
 #
-# Complements check-oracle (generated, random weights, gibberish is fine) with a
-# model that must actually say plausible English *and* carry type 220.
+# They are checked in on purpose: they cannot be rebuilt in CI, because that
+# needs stories260K-f32.gguf plus a working llama-quantize, and reproducing the
+# exact type mix requires ik_llama's `--custom-q`. Committing 300 KB each is far
+# cheaper than that dependency.
+#
+# `make stories-r4-model` regenerates them (byte-identical) when ik_llama and
+# the f32 source are available; see tools/mk_stories_r4.sh for why the mixes are
+# what they are.
+#
+# MIN_TYPES is enforced, not advisory. A narrowing fixture is a silent coverage
+# loss: an earlier 11-type build had q4_1 on a single tensor, and deleting
+# Q4_1's kernel from the dispatch table did not change the output by one byte.
+#
+# Complements check-oracle (generated, random weights, gibberish is fine) with
+# models that must actually say plausible English *and* carry the expected mix.
 # ---------------------------------------------------------------------------
 STORIES_F32 ?= $(HOME)/llm/stories260K-f32.gguf
 QUANTIZE    ?= $(HOME)/iklcpp-2026-10-28/llama-quantize
@@ -1003,14 +1017,24 @@ QUANTIZE    ?= $(HOME)/iklcpp-2026-10-28/llama-quantize
 # runtime; without this it fails with GLIBCXX/CXXABI version errors.
 QUANTIZE_LIBS ?= $(HOME)/gcc-15/lib64:$(HOME)/ik_llama.cpp/build/src:$(HOME)/ik_llama.cpp/build/ggml/src
 R4_MODEL    ?= ../models/stories260K-r4.gguf
+STUFFED_MODEL ?= ../models/stories260K-stuffed.gguf
+# Distinct tensor-type floor for each fixture. Bump deliberately; never lower.
+R4_MIN_TYPES     ?= 7
+STUFFED_MIN_TYPES ?= 12
 
 .PHONY: check-r4-model
 check-r4-model:
+	@test -x ./picolm || { echo "error: build ./picolm first"; exit 2; }
 	@test -f "$(R4_MODEL)" || { \
 		echo "error: $(R4_MODEL) missing. It is committed; restore it with"; \
 		echo "       git checkout -- models/stories260K-r4.gguf"; exit 2; }
-	@test -x ./picolm || { echo "error: build ./picolm first"; exit 2; }
-	tests/check_r4_model.sh "$(R4_MODEL)" ./picolm
+	@echo "--- $(R4_MODEL) (expect >= $(R4_MIN_TYPES) distinct types)"
+	@MIN_TYPES=$(R4_MIN_TYPES) tests/check_r4_model.sh "$(R4_MODEL)" ./picolm
+	@test -f "$(STUFFED_MODEL)" || { \
+		echo "error: $(STUFFED_MODEL) missing. It is committed; restore it with"; \
+		echo "       git checkout -- models/stories260K-stuffed.gguf"; exit 2; }
+	@echo "--- $(STUFFED_MODEL) (expect >= $(STUFFED_MIN_TYPES) distinct types)"
+	@MIN_TYPES=$(STUFFED_MIN_TYPES) tests/check_r4_model.sh "$(STUFFED_MODEL)" ./picolm
 
 # Regenerate the committed model from source. Needs ik_llama's llama-quantize
 # and stories260K-f32.gguf; skips with a note if either is absent.

@@ -216,12 +216,31 @@ jobs:
       # --custom-q), neither of which belongs in CI. 300 KB is a fair price.
       # `make stories-r4-model` regenerates it byte-identically.
       # --------------------------------------------------------------------
-      - name: Verify R4 model (contains type 220 AND is coherent)
+      # Runs tests/check_r4_model.sh over BOTH committed fixtures. Each asserts
+      # three independent things: the model contains the expected interleaved
+      # (type 220) tensors, it still generates the known-good continuation, and
+      # it carries at least MIN_TYPES distinct tensor types. The last one is the
+      # guard against a fixture narrowing silently -- an earlier 11-type build
+      # had q4_1 on a single tensor and stopped testing it without any output
+      # changing. Floors are enforced by the Makefile (R4_MIN_TYPES=7,
+      # STUFFED_MIN_TYPES=11), so a regression fails the build rather than
+      # quietly reducing coverage.
+      - name: Verify quant fixtures (type mix AND coherent AND type-count floor)
         working-directory: ./picolm
         run: |
           set -o pipefail
+          # Gate on the EXIT CODE, not on a grep for "ok". There are now two
+          # fixtures, so a failing second one still leaves the first one's
+          # "=== check_r4_model: ok ===" in the log -- a grep-only gate would
+          # report success. Count the ok markers too, so an accidental loss of
+          # a fixture is also caught.
           make check-r4-model 2>&1 | tee /tmp/r4model.txt
-          grep -q "=== check_r4_model: ok ===" /tmp/r4model.txt
+          ok=$(grep -c "=== check_r4_model: ok ===" /tmp/r4model.txt || true)
+          if [ "$ok" -ne 2 ]; then
+            echo "FAIL: expected 2 passing quant fixtures, saw $ok"
+            exit 1
+          fi
+          echo "PASS: both quant fixtures verified"
 
       - name: Smoke test -- generation
         working-directory: ./picolm
@@ -278,12 +297,12 @@ jobs:
           make -j$(sysctl -n hw.logicalcpu) CC=clang
           ls -lh picolm
 
-      # NOTE: this job keeps stories260K-Q2_K. The R4 model's long-prefill
-      # text differs on some builds (the scalar reference produces different
-      # -- equally valid -- greedy text at 120 tokens), so pinning it here
-      # would be a brittle cross-toolchain assertion. R4 kernel coverage on
-      # this platform comes from `make check-r4-model`, which only asserts the
-      # short prefix; add it here if you want it.
+      # NOTE: this job keeps stories260K-Q2_K. The R4/stuffed models' long
+      # prefill text differs on some builds (the scalar reference takes a
+      # different -- equally valid -- greedy path at 120 tokens), so pinning
+      # that text cross-toolchain would be a brittle assertion. Quant-kernel
+      # coverage on this platform comes from `make check-r4-model`, which only
+      # asserts the short prefix; add it here if you want it.
       - name: Smoke test -- large prefill prompt
         working-directory: ./picolm
         run: |
@@ -336,12 +355,12 @@ jobs:
           make -j$(nproc) CC=gcc
           ls -lh picolm
 
-      # NOTE: this job keeps stories260K-Q2_K. The R4 model's long-prefill
-      # text differs on some builds (the scalar reference produces different
-      # -- equally valid -- greedy text at 120 tokens), so pinning it here
-      # would be a brittle cross-toolchain assertion. R4 kernel coverage on
-      # this platform comes from `make check-r4-model`, which only asserts the
-      # short prefix; add it here if you want it.
+      # NOTE: this job keeps stories260K-Q2_K. The R4/stuffed models' long
+      # prefill text differs on some builds (the scalar reference takes a
+      # different -- equally valid -- greedy path at 120 tokens), so pinning
+      # that text cross-toolchain would be a brittle assertion. Quant-kernel
+      # coverage on this platform comes from `make check-r4-model`, which only
+      # asserts the short prefix; add it here if you want it.
       - name: Smoke test -- large prefill prompt
         working-directory: ./picolm
         run: |
