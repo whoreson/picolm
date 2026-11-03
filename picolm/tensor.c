@@ -794,13 +794,26 @@ static void matmul_worker_f(matmul_task_t *t) {
                     }
                 }
             }
-            /* Fallback: generic vec_dot with F32 activations */
+            /* No fn_gemv for a quantized type. matmul_batch only reaches the
+             * batched worker path after quant_activations(), so t->x here is a
+             * QUANTIZED buffer (Q8_0 / Q8_K blocks), not float*. Calling the
+             * F32 vec_dot on it reinterprets block_q8_0 as float* -- that
+             * produced NaN for Q5_0, and made the scalar build disagree with
+             * the SIMD one (which routes Q5_0 through picolm_sgemm_d).
+             *
+             * Refuse rather than compute nonsense: a type that wants quantized
+             * activations must provide fn_gemv (a kernel taking that format) or
+             * a qgemm/GEMM path. */
             else {
-                for (int i = t->start; i < t->end; i++) {
-                    const char *wrow = t->W + (size_t)i * t->row_bytes;
-                    for (int b = 0; b < nb; b++)
-                        t->out[b * out_stride + i] = vec_dot(wrow, t->x + b * t->n, t->n, t->qtype);
-                }
+                fprintf(stderr,
+                        "FATAL: matmul_worker_f: qtype %d has no fn_gemv, so its "
+                        "quantized activation buffer cannot be consumed.\n"
+                        "       Add a fn_gemv entry in type_dispatch.c that takes the "
+                        "%s activation format.\n",
+                        (int)t->qtype,
+                        ti->act_fmt == ACT_FMT_Q8_0 ? "Q8_0" :
+                        ti->act_fmt == ACT_FMT_Q8_K ? "Q8_K" : "quantized");
+                abort();
             }
         }
         return;
