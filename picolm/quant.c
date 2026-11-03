@@ -7196,14 +7196,43 @@ float vec_dot_row(const void *base, const float *x, int n, gguf_type_t type, int
         return r;
     }
     default:
-        /* Other interleaved types have no single-row dequantizer wired into
-         * vec_dot yet; dequantize the whole group and use the plain path. */
-        return vec_dot(gguf_type_row_ptr(base, type, gguf_type_row_size(type, n),
-                                        row - rin), x, n, type);
+        /* Only IQ4_NL_R4 has a single-row dequantizer wired up so far. For the
+         * other interleaved types the previous "dequantize the group base and
+         * use the plain path" behaviour returns ROW 0 for every row, which is
+         * exactly BUG A relocated -- silently the wrong answer. Refuse instead:
+         * a loud abort at the call site beats a plausible wrong number. Wire up
+         * a per-row dequantizer here when one of these types is actually used. */
+        fprintf(stderr,
+                "FATAL: vec_dot_row(): row %d of interleaved type %d is not supported.\n"
+                "       Hook a single-row dequantizer into quant.c:vec_dot_row(), or\n"
+                "       use the type's 4/8-row GEMV (ti->fn_gemv) instead.\n",
+                row, (int)type);
+        abort();
     }
 }
 
 float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
+    /* Row-interleaved types hold 4 or 8 logical rows per block, but this
+     * function can only ever return ROW 0 of the block it is handed. Any caller
+     * that walks rows by a single row stride therefore gets the correct answer
+     * only for rows that happen to be 0 mod 4 (or 8), and a misaligned block
+     * for the rest -- which is how a whole model ended up emitting NaN and then
+     * all-zero logits (see notes/picolm/qwen3.6_iq4_nl_r4_garbage_*).
+     *
+     * The contract mismatch is undetectable here, so refuse: use vec_dot_row()
+     * when you know which row you want, or the type's fn_gemv (which returns
+     * all rpb rows at once). Same policy as sgemm_iq4_nl_r4.c, which aborts if
+     * its AVX2 symbol is called from a build without AVX2. */
+    if (gguf_type_rows_per_block(type) > 1) {
+        fprintf(stderr,
+                "FATAL: vec_dot() called for row-interleaved type %d.\n"
+                "       It can only return ROW 0 of a block, which is wrong for %d of every\n"
+                "       %d rows. Use vec_dot_row(base, x, n, type, row) if you know the row\n"
+                "       index, or ti->fn_gemv(base, x, n, out, rpb) for all rows at once.\n",
+                (int)type, gguf_type_rows_per_block(type) - 1,
+                gguf_type_rows_per_block(type));
+        abort();
+    }
     switch (type) {
         case GGUF_TYPE_Q4_K: return vec_dot_q4_K_f32(src, x, n);
         case GGUF_TYPE_Q5_K: {
@@ -7235,14 +7264,6 @@ float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
         case GGUF_TYPE_Q4_0: return vec_dot_q4_0_f32(src, x, n);
         case GGUF_TYPE_IQ4_NL: return vec_dot_iq4_nl_f32(src, x, n);
         case GGUF_TYPE_IQ4_XS: return vec_dot_iq4_xs_f32(src, x, n);
-        case GGUF_TYPE_IQ4_NL_R4: {
-            float *tmp = (float *)malloc((size_t)n * sizeof(float));
-            if (!tmp) return 0.0f;
-            dequantize_row_iq4_nl_r4_single((const block_iq4_nl_r4 *)src, tmp, n, 0);
-            float result = vec_dot_f32_f32(tmp, x, n);
-            free(tmp);
-            return result;
-        }
         case GGUF_TYPE_Q4_1: return vec_dot_q4_1_f32(src, x, n);
         case GGUF_TYPE_Q5_0: return vec_dot_q5_0_f32(src, x, n);
         case GGUF_TYPE_Q5_1: return vec_dot_q5_1_f32(src, x, n);
