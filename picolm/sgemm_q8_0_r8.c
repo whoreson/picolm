@@ -31,6 +31,22 @@
 #endif
 #include "quant.h"
 
+/* Size gate for the decode-once R8 prefill paths (Q8_0 / Q4_0 / IQ4_NL / IQ4_NL_R4 / IQ4_XS).
+ * Those kernels are numerically correct (~1e-7 against an independent reference) but accumulate
+ * floats in a different order than the reference tile kernels (integer sum over the whole block,
+ * one float accumulator per row, vs eight per-lane float accumulators), so their results are not
+ * bit-identical to the reference path or to the NEON kernels. For toy-sized matrices that is all
+ * downside: they gain nothing, and bit-exact output is what tiny test models / CI rely on
+ * (PICOLM_GEMM_TEST, the smoke tests' expected text). So they only engage when
+ * rows * 32-value-blocks-per-row >= PICOLM_R8_MIN_BLOCKS (default 16384, roughly a 512x1024
+ * matrix). Set PICOLM_R8_MIN_BLOCKS=0 to always allow them (the benches do). */
+int picolm_r8_big_enough(int m, int k_blocks) {
+    static long mn = -1;
+    if (mn < 0) { const char *e = getenv("PICOLM_R8_MIN_BLOCKS"); mn = (e && *e) ? atol(e) : 16384; if (mn < 0) mn = 0; }
+    return (long)m * (long)k_blocks >= mn;
+}
+
+
 #if defined(__AVX2__) && defined(__F16C__)
 
 /* ================================================================
@@ -831,7 +847,7 @@ int sgemm_iq4_nl_r4_q8_0_best(int nrows, int ncols, int k, const void *vx, const
         if (ae && ae[0] == '0') avx2_en = 0;
         en = !(e && e[0] == '0');
     }
-    if (en && ncols >= min_n && k % 32 == 0 && nrows % 8 == 0) {
+    if (en && ncols >= min_n && k % 32 == 0 && nrows % 8 == 0 && picolm_r8_big_enough(nrows, k / 32)) {
         const int nb = k / 32;
         if (vnni_en && picolm_sgemm_r8dec_vnni(GGUF_TYPE_IQ4_NL_R4, nrows, ncols, nb, vx, nb, vy, nb, out, (int)bs, ith, nth)) {
             static int tr; if (!tr && getenv("PICOLM_DISPATCH")) { tr = 1; fprintf(stderr, "TRACE kernel: picolm_sgemm_r8dec_vnni (IQ4_NL_R4)\n"); }

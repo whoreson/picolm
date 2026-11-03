@@ -2963,7 +2963,7 @@ int picolm_sgemm_d(int m, int n, int k_blocks,
             if (q4 && q4[0] == '0') q4_en = 0;
             vnni_en = !(e && e[0] == '0');
         }
-        if (vnni_en && (Atype == GGUF_TYPE_Q8_0 || q4_en) && n >= vnni_min_n && (m % 8) == 0 &&
+        if (vnni_en && (Atype == GGUF_TYPE_Q8_0 || q4_en) && n >= vnni_min_n && (m % 8) == 0 && picolm_r8_big_enough(m, k_blocks) &&
             picolm_sgemm_r8dec_vnni(Atype, m, n, k_blocks, A, lda, B, ldb, C, ldc, ith, nth)) {
             static int t_vnni[32]; if (getenv("PICOLM_DISPATCH") && !t_vnni[Atype & 31]) { t_vnni[Atype & 31] = 1; fprintf(stderr, "TRACE kernel: picolm_sgemm_r8dec_vnni (type %d)\n", (int)Atype); }
             return 1;
@@ -2980,7 +2980,7 @@ int picolm_sgemm_d(int m, int n, int k_blocks,
             if (q4 && q4[0] == '0') q4_en = 0;
             t_en = !(e && e[0] == '0');
         }
-        if (t_en && (Atype == GGUF_TYPE_Q8_0 || q4_en) && n >= t_min_n && (m % 8) == 0 &&
+        if (t_en && (Atype == GGUF_TYPE_Q8_0 || q4_en) && n >= t_min_n && (m % 8) == 0 && picolm_r8_big_enough(m, k_blocks) &&
             picolm_sgemm_r8dec_avx2t(Atype, m, n, k_blocks, A, lda, B, ldb, C, ldc, ith, nth)) {
             static int t_tr[32]; if (getenv("PICOLM_DISPATCH") && !t_tr[Atype & 31]) { t_tr[Atype & 31] = 1; fprintf(stderr, "TRACE kernel: picolm_sgemm_r8dec_avx2t (type %d)\n", (int)Atype); }
             return 1;

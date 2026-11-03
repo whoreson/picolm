@@ -112,6 +112,7 @@ static int run_xs(int m,int n,int k,int reps,int nth,int check){
     free(W);free(B);free(tmp);free(C); return 0; }
 
 int main(int argc,char**argv){
+    setenv("PICOLM_R8_MIN_BLOCKS","0",0);   /* benches exercise the fast paths on small shapes too */
     fp16_table_init();
     if(argc>6&&!strcmp(argv[1],"shape")){ /* ./bench_qgemm shape <type> m n k nth : correctness of one shape */
         for(unsigned t=0;t<sizeof QT/sizeof*QT;t++) if(!strcmp(QT[t].name,argv[2])) return run(&QT[t],atoi(argv[3]),atoi(argv[4]),atoi(argv[5]),1,atoi(argv[6]),1);

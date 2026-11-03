@@ -1254,6 +1254,7 @@ int sgemm_q8_0_r8_avx2t_q8_0(int nrows, int ncols, int k, const void *vx, const 
 int picolm_sgemm_q8_0_avx2t(int m, int n, int k_blocks, const void *vA, int lda, const void *vB, int ldb, float *C, int ldc, int ith, int nth);
 int picolm_sgemm_r8dec_avx2t(int atype, int m, int n, int k_blocks, const void *vA, int lda, const void *vB, int ldb, float *C, int ldc, int ith, int nth);  /* atype: Q8_0 / Q4_0 / IQ4_NL */
 int picolm_sgemm_r8dec_vnni(int atype, int m, int n, int k_blocks, const void *vA, int lda, const void *vB, int ldb, float *C, int ldc, int ith, int nth);
+int picolm_r8_big_enough(int m, int k_blocks);   /* size gate for the decode-once R8 prefill paths, see sgemm_q8_0_r8.c */
 int sgemm_iq4_nl_r4_q8_0_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);  /* decode-once R8 path, falls back to the 1x4 tile kernel */
 int sgemm_q8_0_r8_q8_0_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);  /* VNNI when available, else AVX2; always computes */
 /* Q8_K_R8 x Q8_K GEMV (AVX2): 8 weight rows x 1 activation row.
