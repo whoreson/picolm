@@ -93,7 +93,16 @@ jobs:
       #   hreduce256_ps      -- AVX2 8-lane sum returned 0.75x (lanes 3,7 lost)
       #   kvcache_tokwrite   -- /slots save overran a 128 KiB buffer past 32K tokens
       #   test_quant         -- quant/dequant round-trip + block-size invariants
+      #                         (now actually invokes all 7 suites; 4 of them had
+      #                          been defined-but-never-called, i.e. dead, and all
+      #                          4 had wrong fixtures/references on top of that)
       #   test_q6_k_r4       -- vec_dot + sgemm vs reference
+      #   test_rowinterleave -- R4/R8 layout: EVERY row of a block group, the
+      #                         row_ptr/row_in_block helpers, and GEMM across the
+      #                         R8 min-batch threshold. Catches the "assumed
+      #                         row-major layout for an interleaved type" class:
+      #                         reads only row 0, walks rows by a single stride,
+      #                         or decodes nibbles with the wrong interleave.
       #   glm5_dsa/snapshot  -- MLA/KDA round-trips, KV snapshot back-compat
       #   attn(267 configs), attn_decode(394), pool_stress(25)
       # --------------------------------------------------------------------
@@ -104,6 +113,36 @@ jobs:
           make check-all -j1 CC=gcc 2>&1 | tee /tmp/check_all.txt
           if ! grep -q "=== check-all: all self-contained suites passed ===" /tmp/check_all.txt; then
             echo "FAIL: check-all did not complete"
+            exit 1
+          fi
+
+      # --------------------------------------------------------------------
+      # Differential oracle test on a generated tiny SSM model with
+      # interleaved (type 220) weights. The model is random-weight, so its
+      # output is gibberish -- but it must be the SAME gibberish on every code
+      # path. Compares fast paths against their fallbacks and the SIMD build
+      # against a scalar build.
+      #
+      # This is the only end-to-end test that exercises the SSM alpha/beta
+      # per-head row walk and the R8 prefill GEMM, i.e. where both shipped
+      # IQ4_NL_R4 bugs lived. See notes/picolm/...DEBUG_JOURNAL.txt.
+      # --------------------------------------------------------------------
+      - name: Install gguf-py (oracle model generator)
+        run: pip install gguf numpy
+
+      - name: Build scalar reference (for SIMD-vs-scalar diff)
+        working-directory: ./picolm
+        run: make build-scalar-ref
+
+      - name: Run check-oracle (differential, tiny SSM R4 model)
+        working-directory: ./picolm
+        run: |
+          set -o pipefail
+          make check-oracle 2>&1 | tee /tmp/oracle.txt
+          if grep -q "=== oracle_check: all comparisons agreed ===" /tmp/oracle.txt; then
+            echo "PASS: oracle comparisons agreed"
+          else
+            echo "FAIL: oracle mismatch (a code path disagrees with its fallback)"
             exit 1
           fi
 
@@ -141,6 +180,28 @@ jobs:
             echo "FAIL: GEMM self-test did not complete"
             cat /tmp/gemm_test.txt
             exit 1
+          fi
+
+      # --------------------------------------------------------------------
+      # The smoke model is stories260K-Q2_K: f32/f16/q4_0/q8_0 only. It can
+      # never exercise an R4/R8/SSM kernel no matter what prompt we feed it, so
+      # a green prefill smoke test must not be read as "the quant kernels work".
+      # This step states that explicitly instead of leaving it implicit, and
+      # fails if the model stops being what the comment says it is.
+      # --------------------------------------------------------------------
+      - name: Record what the smoke model actually covers
+        working-directory: ./picolm
+        run: |
+          ./picolm --list-tensors ../models/stories260K-Q2_K.gguf 2>/dev/null \
+            | awk '{print $NF}' | sort | uniq -c | sort -rn > /tmp/types.txt || true
+          ./picolm ../models/stories260K-Q2_K.gguf -c 8 -n 1 -p "x" 2>&1 \
+            | grep -i "Tensor types" || true
+          if grep -Eq "iq4_nl_r4|q4_0_4_4|q8_0_r8|q4_k_r4" /tmp/types.txt; then
+            echo "INFO: smoke model contains interleaved (R4/R8) tensors"
+            echo "      -- the prefill smoke test DOES cover their kernels."
+          else
+            echo "NOTE: smoke model has no R4/R8 tensors. Interleaved-type kernel"
+            echo "      coverage comes from 'make check-rowinterleave' only."
           fi
 
       - name: Smoke test -- generation
