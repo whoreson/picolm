@@ -29,11 +29,18 @@
 # WHAT YOU GET
 # ------------
 #   attn_q / attn_k / attn_v / attn_output : IQ4_NL_R4 (type 220)  <- the point
-#   ffn_gate / ffn_up                      : Q4_0
+#   ffn_gate                               : Q6_0
+#   ffn_up                                 : Q5_0
 #   ffn_down                               : F16   (n=172, not 32-aligned)
-#   token_embd                             : Q4_0  (cannot be interleaved)
+#   token_embd                             : Q4_1  (cannot be interleaved)
 #   output                                 : Q8_0
 #   *_norm                                 : F32
+#
+# Seven distinct tensor types in a 300 KB model. The mix is deliberately wider
+# than the minimum: every additional type exercises a different kernel, and
+# Q6_0 / Q5_0 / Q4_1 are cheap to include once the delicate tensors are pinned.
+# ffn_down is the fragile one -- quantising it to anything 32-value-block based
+# fails outright (n=172), and Q8_0 there silently degrades output to <unk>.
 #
 # Output is ~277 KB (same size as models/stories260K-Q2_K.gguf), loads in
 # milliseconds, generates deterministic English, and exercises
@@ -94,7 +101,7 @@ echo "R4 type: $TYPE_R4  (attention projections only)"
 # The exact mix that both (a) decodes as English and (b) admits R4 on the
 # 32-aligned tensors. See the header comment for why each line is what it is.
 exec "$QUANTIZE" \
-    --custom-q "attn_q=${TYPE_R4},attn_k=${TYPE_R4},attn_v=${TYPE_R4},attn_output=${TYPE_R4},ffn_gate=Q4_0,ffn_up=Q4_0,ffn_down=F16" \
-    --token-embedding-type Q4_0 \
+    --custom-q "attn_q=${TYPE_R4},attn_k=${TYPE_R4},attn_v=${TYPE_R4},attn_output=${TYPE_R4},ffn_gate=Q6_0,ffn_up=Q5_0,ffn_down=F16" \
+    --token-embedding-type Q4_1 \
     --output-tensor-type Q8_0 \
     "$F32" "$OUT" Q4_0 4

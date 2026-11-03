@@ -984,20 +984,36 @@ build-scalar-ref:
 # ---------------------------------------------------------------------------
 # check-r4-model: real-text model that contains row-interleaved tensors.
 #
-# Complements check-oracle (generated, random-weight, gibberish-is-fine) with a
-# model that must actually say plausible English *and* carry type 220. Needs
-# stories260K-f32.gguf plus a llama-quantize; skipped with a note if absent.
+# Uses the COMMITTED models/stories260K-r4.gguf (300 KB, 7 distinct tensor
+# types, 16 of them type 220). It is checked in on purpose: it cannot be
+# rebuilt in CI, because that needs stories260K-f32.gguf plus a working
+# llama-quantize, and reproducing the exact type mix requires ik_llama's
+# `--custom-q`. Committing 300 KB is far cheaper than that dependency.
 #
-# This is the fixture that closes the CI blind spot properly: the previous
-# smoke model had no R4/R8/SSM tensor at all, so no prompt could reach those
-# kernels. See tools/mk_stories_r4.sh for why the type mix is so specific.
+# `make stories-r4-model` regenerates it (byte-identical) when ik_llama and the
+# f32 source are available; see tools/mk_stories_r4.sh for why the mix is what
+# it is.
+#
+# Complements check-oracle (generated, random weights, gibberish is fine) with a
+# model that must actually say plausible English *and* carry type 220.
 # ---------------------------------------------------------------------------
 STORIES_F32 ?= $(HOME)/llm/stories260K-f32.gguf
 QUANTIZE    ?= $(HOME)/iklcpp-2026-10-28/llama-quantize
-# Extra shared-lib dirs for llama-quantize (it usually needs a newer libstdc++).
+# llama-quantize is routinely built against a newer libstdc++ than the system
+# runtime; without this it fails with GLIBCXX/CXXABI version errors.
 QUANTIZE_LIBS ?= $(HOME)/gcc-15/lib64:$(HOME)/ik_llama.cpp/build/src:$(HOME)/ik_llama.cpp/build/ggml/src
-R4_MODEL    ?= /tmp/stories260K-r4.gguf
+R4_MODEL    ?= ../models/stories260K-r4.gguf
 
+.PHONY: check-r4-model
+check-r4-model:
+	@test -f "$(R4_MODEL)" || { \
+		echo "error: $(R4_MODEL) missing. It is committed; restore it with"; \
+		echo "       git checkout -- models/stories260K-r4.gguf"; exit 2; }
+	@test -x ./picolm || { echo "error: build ./picolm first"; exit 2; }
+	tests/check_r4_model.sh "$(R4_MODEL)" ./picolm
+
+# Regenerate the committed model from source. Needs ik_llama's llama-quantize
+# and stories260K-f32.gguf; skips with a note if either is absent.
 .PHONY: stories-r4-model
 stories-r4-model:
 	@test -f "$(STORIES_F32)" || { \
@@ -1007,15 +1023,6 @@ stories-r4-model:
 	F32="$(STORIES_F32)" QUANTIZE="$(QUANTIZE)" \
 		QUANTIZE_LIBS="$(QUANTIZE_LIBS)" \
 		tools/mk_stories_r4.sh -o "$(R4_MODEL)"
-
-.PHONY: check-r4-model
-check-r4-model:
-	@test -f "$(STORIES_F32)" && test -x "$(QUANTIZE)" || { \
-		echo "SKIP check-r4-model: needs $(STORIES_F32) and $(QUANTIZE)"; \
-		echo "     (override with STORIES_F32=... QUANTIZE=...)"; exit 0; }
-	@test -f "$(R4_MODEL)" || $(MAKE) stories-r4-model
-	@test -x ./picolm || { echo "error: build ./picolm first"; exit 2; }
-	tests/check_r4_model.sh "$(R4_MODEL)" ./picolm
 
 gguf_be_swap: util/gguf_be_swap.c
 	$(CC) -O2 -std=c99 -o $@ util/gguf_be_swap.c -lm

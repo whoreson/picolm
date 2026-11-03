@@ -71,6 +71,18 @@ case "$out" in
         ;;
 esac
 
+# ---- B2. report the tensor-type mix --------------------------------------
+# Printed because it is the thing CI was previously blind to: a model can be
+# perfectly coherent and still contain no interleaved tensors. Q5_0 is called
+# out separately since it historically had no Q8_0-activation dot at all and so
+# was unreadable on a scalar-only build; vec_dot_q5_0_q8_0() now covers that,
+# and a build which regresses it will abort in matmul_worker_f instead of
+# emitting junk.
+for t in 6 220 225; do
+    n=$("$BIN" --list-tensors "$MODEL" 2>/dev/null | awk -v t="$t" '$NF == t' | wc -l | tr -d ' ')
+    [ "$n" -gt 0 ] && echo "type $t: $n tensor(s)"
+done
+
 # ---- C. deterministic (cheap, and catches uninitialised buffers) ---------
 h1=$("$BIN" "$MODEL" -p "Once upon a time" -n 8 -t 0 2>/dev/null | md5sum)
 h2=$("$BIN" "$MODEL" -p "Once upon a time" -n 8 -t 0 2>/dev/null | md5sum)
