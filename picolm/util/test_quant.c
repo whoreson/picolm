@@ -22,6 +22,9 @@
 
 static int verbose = 0;
 static int tests_run, tests_pass, tests_fail;
+/* Floor on how many assertions must run. Bump when adding suites; never lower
+ * it. Guards against a test_* function being orphaned from main(). */
+#define MIN_EXPECTED_TESTS 7
 static void pass_t(const char *n) { tests_pass++; if (verbose) printf("  PASS %s\n", n); }
 static void fail_t(const char *n) { tests_fail++; fprintf(stderr, "  FAIL %s\n", n); }
 
@@ -115,54 +118,75 @@ static void make_q5_K_block(block_q5_K *b, const int vals[256]) {
  * Each byte of hmask covers 32 values, with 8 bits = 4 groups * 2 chunks.
  */
 static void ref_dequant_q3_K(const block_q3_K *b, float *dst) {
+    /* Written from the Q3_K layout, independently of dequantize_row_q3_K().
+     *
+     * Critical detail that the previous version got wrong: block_q3_K has
+     * qs[64] but hmask[32]. The 2-bit quants advance by 32 bytes per 128-value
+     * chunk, while hmask and its bit cursor m run ACROSS all 8 sub-blocks
+     * (m = 1,2,4,...,128), i.e. hmask is shared by both chunks. Within a chunk
+     * each sub-block is 16+16 values (q[l] and q[l+16], same shift). A CLEAR
+     * hmask bit means "subtract 4". */
     float d = ref_fp16(b->d);
-    const uint8_t *q3 = b->qs, *hm = b->hmask;
     uint32_t aux[4];
     memcpy(aux, b->scales, 12);
     uint32_t tmp = aux[2];
-    aux[2] = ((aux[0]>>4)&0x0F0F0F0F) | (((tmp>>4)&0x03030303)<<4);
-    aux[3] = ((aux[1]>>4)&0x0F0F0F0F) | (((tmp>>6)&0x03030303)<<4);
-    aux[0] = (aux[0]&0x0F0F0F0F) | (((tmp>>0)&0x03030303)<<4);
-    aux[1] = (aux[1]&0x0F0F0F0F) | (((tmp>>2)&0x03030303)<<4);
-    const int8_t *sc = (const int8_t *)aux;
+    aux[2] = ((aux[0] >> 4) & 0x0F0F0F0F) | (((tmp >> 4) & 0x03030303) << 4);
+    aux[3] = ((aux[1] >> 4) & 0x0F0F0F0F) | (((tmp >> 6) & 0x03030303) << 4);
+    aux[0] = (aux[0] & 0x0F0F0F0F) | (((tmp >> 0) & 0x03030303) << 4);
+    aux[1] = (aux[1] & 0x0F0F0F0F) | (((tmp >> 2) & 0x03030303) << 4);
+    const int8_t *scales = (const int8_t *)aux;
+
+    int is = 0;
+    uint8_t m = 1;
+    float *y = dst;
     for (int chunk = 0; chunk < 2; chunk++) {
+        const uint8_t *q  = b->qs + chunk * 32;
+        const uint8_t *hm = b->hmask;          /* NOT advanced per chunk */
+        int shift = 0;
         for (int j = 0; j < 4; j++) {
-            int g = chunk*4+j, scale = sc[g]-32;
-            for (int l = 0; l < 32; l++) {
-                int q3l = (q3[l] >> (j*2)) & 3;
-                int hbit = (hm[l] >> (chunk*4+j)) & 1;
-                *dst++ = d * (hbit ? (q3l-4) : q3l) * scale;
-            }
+            const float dl0 = d * (float)(scales[is++] - 32);
+            for (int l = 0; l < 16; l++)
+                *y++ = dl0 * (float)((int)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4));
+            const float dl1 = d * (float)(scales[is++] - 32);
+            for (int l = 0; l < 16; l++)
+                *y++ = dl1 * (float)((int)((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4));
+            shift += 2;
+            m <<= 1;
         }
-        q3 += 32;
     }
 }
 
 /* Build Q3_K block */
 static void make_q3_K_block(block_q3_K *b, const int8_t vals[256]) {
+    /* Encoder for Q3_K matching the layout dequantize_row_q3_K() consumes:
+     *   - qs advances 32 bytes per 128-value chunk (qs[64])
+     *   - hmask is SHARED across both chunks (hmask[32]); its bit cursor m runs
+     *     1,2,4,...,128 over the 8 sub-blocks in order
+     *   - within a chunk, sub-block 2j is q[l] and 2j+1 is q[l+16], both at
+     *     2-bit shift j*2
+     *   - hmask bit set => stored value is 0..3; bit clear => value is
+     *     (stored - 4)
+     */
     memset(b, 0, sizeof(*b));
     b->d = 0x3C00;
-    /* scales: all sub-blocks = 33 (scale-32=1) */
-    for (int i = 0; i < 4; i++) { b->scales[i] = 0x21; b->scales[i+4] = 0x21; }
-    for (int i = 0; i < 4; i++) { b->scales[i+8] = 0x21; }
-    b->scales[2]=0x22; b->scales[3]=0x22; b->scales[6]=0x22;
-    b->scales[7]=0x22; b->scales[10]=0x22; b->scales[11]=0x22;
-    /* qs: 2 bits per value, 16 values per byte.
-     * hmask: 1 bit per value, 32 values per byte.
-     * Layout: 2 chunks of 4 groups of 32 values.
-     * qs: chunk0 uses qs[0..31], chunk1 uses qs[32..63].
-     * Within each chunk, group j reads qs[l] bits j*2..j*2+1.
-     * hmask: hm[l] bit (chunk*4+j) for value l in group j of chunk. */
+    for (int i = 0; i < 8; i++)  b->scales[i] = 0x11;
+    for (int i = 8; i < 12; i++) b->scales[i] = 0xAA;
+
+    int sb = 0;                     /* sub-block index 0..15 */
     for (int chunk = 0; chunk < 2; chunk++) {
+        uint8_t *q = b->qs + chunk * 32;
         for (int j = 0; j < 4; j++) {
-            for (int l = 0; l < 32; l++) {
-                int idx = chunk*128 + j*32 + l;
-                int8_t v = vals[idx];
-                int byte_idx = chunk*32 + l;
-                int bit_shift = j * 2;
-                int hbit_pos = chunk*4+j;
-                if (v < 0) { b->hmask[l] |= (1 << hbit_pos); v = (v+4) & 3; }
-                b->qs[byte_idx] |= ((v & 3) << bit_shift);
+            const int shift = j * 2;
+            for (int half = 0; half < 2; half++, sb++) {
+                const int off = half * 16;
+                const uint8_t m = (uint8_t)(1u << sb);
+                for (int l = 0; l < 16; l++) {
+                    int v = vals[sb * 16 + l];
+                    uint8_t stored;
+                    if (v < 0) { stored = (uint8_t)((v + 4) & 3); b->hmask[l + off] &= (uint8_t)~m; }
+                    else       { stored = (uint8_t)(v & 3);      b->hmask[l + off] |= m; }
+                    q[l + off] |= (uint8_t)(stored << shift);
+                }
             }
         }
     }
@@ -194,14 +218,29 @@ static void make_q4_K_block(block_q4_K *b) {
 
 /* Reference Q6_K dequant */
 static void ref_dequant_q6_K(const block_q6_K *b, float *dst) {
+    /* Written from the Q6_K layout, independently of dequantize_row_q6_K().
+     * Each 256-value super-block is two 128-value halves. Within a half, the
+     * 32-byte qh window packs FOUR 2-bit high parts per byte (bits 0-1, 2-3,
+     * 4-5, 6-7) for ql[l], ql[l+32], and their high nibbles. The previous
+     * version of this reference indexed ql[j] and qh[j] at the same j for
+     * j in [0,128), which cannot describe that layout -- it never matched the
+     * kernel, so the test was wrong, not the code under test. */
     float d = ref_fp16(b->d);
-    const uint8_t *ql = b->ql, *qh = b->qh;
-    const int8_t *sc = b->scales;
-    for (int i = 0; i < 256; i += 128) {
-        for (int j = i; j < i+64; j++)
-            dst[j] = d * ((int8_t)((ql[j] + ((qh[j]&0x0F)<<4)) >> 4)) * sc[j/32];
-        for (int j = i+64; j < i+128; j++)
-            dst[j] = d * ((int8_t)((ql[j] + ((qh[j]&0xF0)<<0)) >> 4)) * sc[j/32];
+    for (int chunk = 0; chunk < 256; chunk += 128) {
+        const uint8_t *ql = b->ql + chunk / 2;
+        const uint8_t *qh = b->qh + chunk / 4;
+        const int is = chunk / 16;
+        for (int l = 0; l < 32; l++) {
+            int q1 = (int)((ql[l]      & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+            int q2 = (int)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+            int q3 = (int)((ql[l]      >> 4)  | (((qh[l] >> 4) & 3) << 4)) - 32;
+            int q4 = (int)((ql[l + 32] >> 4)  | (((qh[l] >> 6) & 3) << 4)) - 32;
+            const int is_l = is + (l / 16);
+            dst[chunk + l]      = d * (float)b->scales[is_l + 0] * (float)q1;
+            dst[chunk + l + 32] = d * (float)b->scales[is_l + 2] * (float)q2;
+            dst[chunk + l + 64] = d * (float)b->scales[is_l + 4] * (float)q3;
+            dst[chunk + l + 96] = d * (float)b->scales[is_l + 6] * (float)q4;
+        }
     }
 }
 
@@ -220,12 +259,16 @@ static void make_q6_K_block(block_q6_K *b) {
 static void test_fp16(void) {
     tests_run++;
     fp16_table_init();
+    /* Expected values must be exactly representable in fp16. The previous
+     * table claimed 0x3E00==2.0 (it is 1.5), 0x4000==4.0 (it is 2.0) and
+     * 0xBB80==-1.0 (it is -0.9375), so this test could never pass. */
     struct { uint16_t h; float e; } c[] = {
-        {0x0000, 0.0f}, {0x3C00, 1.0f}, {0x3E00, 2.0f},
-        {0x4000, 4.0f}, {0xBB80, -1.0f},
+        {0x0000, 0.0f}, {0x8000, -0.0f}, {0x3C00, 1.0f}, {0xBC00, -1.0f},
+        {0x4000, 2.0f}, {0xC000, -2.0f}, {0x3E00, 1.5f}, {0xBB80, -0.9375f},
+        {0x3555, 0.333251953125f}, {0x7BFF, 65504.0f}, {0x0001, 5.960464477539063e-08f},
     };
     int errs = 0;
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < (int)(sizeof c / sizeof c[0]); i++) {
         if (fabsf(fp16_to_fp32_lookup(c[i].h) - c[i].e) > 1e-6f) errs++;
         if (fabsf(ref_fp16(c[i].h) - c[i].e) > 1e-6f) errs++;
     }
@@ -284,7 +327,12 @@ static void test_q5_K_dot(void) {
     float rs = vec_dot_q5_K_q8_K(&wb, &ab, 256);
     float wf[256], af[256];
     ref_dequant_q5_K(&wb, wf);
-    dequantize_row_q8_0(&ab, af, 256);
+    /* ab is a block_q8_K: 256 int8 values sharing ONE float scale (PicoLM's
+     * simplified Q8_K, see quant.h). The old code called
+     * dequantize_row_q8_0() on it, which walks it as 32-value Q8_0 blocks with
+     * fp16 scales -- nonsense activations, so the test failed against a
+     * perfectly good kernel. */
+    for (int i = 0; i < 256; i++) af[i] = ab.d * (float)ab.qs[i];
     float rr = 0; for (int i = 0; i < 256; i++) rr += wf[i]*af[i];
     float tol = 0.01f * fabsf(rr) + 1.0f;
     if (fabsf(rs - rr) < tol) pass_t("Q5_K vec_dot_q5_K_q8_K");
@@ -361,8 +409,27 @@ int main(int argc, char **argv) {
 #endif
     printf("\n");
     printf("Blocks: Q5_K=%zu Q8_0=%zu\n", sizeof(block_q5_K), sizeof(block_q8_0));
+    /* Every test_* defined above must be called here. Historically test_fp16,
+     * test_q4_K, test_q3_K and test_q6_K were defined but never invoked, so
+     * this program printed "2 tests: 2 passed" and CI went green while four
+     * suites silently did nothing. The minimum-count assertion below turns
+     * that class of rot into a hard failure instead of a quiet pass. */
+    test_fp16();
     test_q8_0();
     test_q5_K_dequant();
+    test_q5_K_dot();
+    test_q4_K();
+    test_q3_K();
+    test_q6_K();
     printf("\n%d tests: %d passed, %d failed\n", tests_run, tests_pass, tests_fail);
+    /* "tests_run too low" means a suite was skipped or deleted without updating
+     * this file -- that is a test bug, not a pass. */
+    if (tests_run < MIN_EXPECTED_TESTS) {
+        fprintf(stderr,
+                "FAIL: only %d tests ran, expected at least %d -- a suite is not "
+                "being called from main() (or was removed).\n",
+                tests_run, MIN_EXPECTED_TESTS);
+        return 1;
+    }
     return tests_fail > 0 ? 1 : 0;
 }
