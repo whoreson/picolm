@@ -137,7 +137,14 @@ void vec_dot_q4_0_r8_q8_0_avx2(const void *vx, const void *wy, int n,
     _mm256_storeu_ps(out, acc);
 #else
     (void)vx; (void)wy; (void)n; (void)out; (void)nrows;
-    memset(out, 0, nrows * sizeof(float));
+    /* Returning zeros here silently produced a model that decodes to
+     * garbage with no error: on a build without the required SIMD the
+     * caller has no way to tell "unsupported" from "all weights zero".
+     * Refuse instead. */
+    fprintf(stderr,
+            "FATAL: vec_dot_q4_0_r8_q8_2_avx2 called in a build without the required SIMD.\n"
+            "       This type has no scalar fallback; refusing to return zeros.\n");
+    abort();
 #endif
 }
 
@@ -212,7 +219,14 @@ void vec_dot_q4_0_r8_q8_2_avx2(const void *vx, const void *wy, int n,
     _mm256_storeu_ps(out, acc);
 #else
     (void)vx; (void)wy; (void)n; (void)out; (void)nrows;
-    memset(out, 0, nrows * sizeof(float));
+    /* Returning zeros here silently produced a model that decodes to
+     * garbage with no error: on a build without the required SIMD the
+     * caller has no way to tell "unsupported" from "all weights zero".
+     * Refuse instead. */
+    fprintf(stderr,
+            "FATAL: vec_dot_q4_0_r8_q8_2_avx2 called in a build without the required SIMD.\n"
+            "       This type has no scalar fallback; refusing to return zeros.\n");
+    abort();
 #endif
 }
 

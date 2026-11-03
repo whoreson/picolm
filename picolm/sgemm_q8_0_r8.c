@@ -321,7 +321,10 @@ int sgemm_q8_0_r8_q8_0_avx2(int nrows, int ncols, int k,
 void vec_dot_q8_0_r8_q8_0_avx2(const void *vx, const void *wy, int n,
                                float *out, int nrows) {
     (void)vx; (void)wy; (void)n; (void)out; (void)nrows;
-    memset(out, 0, nrows * sizeof(float));
+    fprintf(stderr,
+            "FATAL: vec_dot_q8_0_r8_q8_0_avx2 called in a build without the required SIMD.\n"
+            "       This type has no scalar fallback; refusing to return zeros.\n");
+    abort();
 }
 
 int sgemm_q8_0_r8_q8_0_avx2(int nrows, int ncols, int k,
@@ -335,7 +338,10 @@ int sgemm_q8_0_r8_q8_0_avx2(int nrows, int ncols, int k,
 void vec_dot_q8_0_r8_q8_0_d_avx2(const void *vx, const void *wy, const float *q_d,
                                  int n, float *out, int nrows) {
     (void)vx; (void)wy; (void)q_d; (void)n;
-    if (out) memset(out, 0, (size_t)nrows * sizeof(float));
+    fprintf(stderr,
+            "FATAL: vec_dot_q8_0_r8_q8_0_d_avx2 called in a build without the required SIMD.\n"
+            "       This type has no scalar fallback; refusing to return zeros.\n");
+    abort();
 }
 
 int sgemm_q8_0_r8_q8_0_d_avx2(int nrows, int ncols, int k,
