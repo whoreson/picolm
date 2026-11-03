@@ -718,7 +718,7 @@ float *model_forward_gemma3n(model_t *m, int token, int pos) {
 
                 /* cur = corrected predictions (all altups) -> next layer input is the concat */
 #ifdef PICOLM_VIZ
-        viz_push_layer(l, s->gemma3n_altup_state + i_altup_act * dim, dim);
+        viz_push_row(l, pos, s->gemma3n_altup_state + i_altup_act * dim, dim);
 #endif
             BENCH_LAYER_END(l, g_is_prefill);
     }

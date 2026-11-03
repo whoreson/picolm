@@ -56,7 +56,7 @@ typedef int socklen_t;
 /* ------------------------------------------------------------------ */
 
 #define VIZ_FRAME_BUF_SIZE  (VIZ_MAX_LAYERS * VIZ_N_BUCKETS)
-#define VIZ_TOKEN_RING       64   /* keep this many tokens of history */
+#define VIZ_TOKEN_RING       128  /* positions of history kept (= visible columns) */
 #define VIZ_MAX_CLIENTS      1
 #define VNC_BUF_SIZE         65536
 
@@ -101,7 +101,8 @@ static inline unsigned int viz_color(float t) {
         b = (unsigned char)(30.0f  + s * 30.0f);
     }
 
-    return ((unsigned int)b << 16) | ((unsigned int)g << 8) | (unsigned int)r;
+    /* All framebuffer writers take low byte = B, so pack as 0x00RRGGBB. */
+    return ((unsigned int)r << 16) | ((unsigned int)g << 8) | (unsigned int)b;
 }
 
 /* A simpler grayscale colormap for debug */
@@ -113,42 +114,44 @@ static inline unsigned int viz_color_gray(float t) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Ring buffer for layer data                                         */
+/*  Activation grid, indexed by ABSOLUTE token position                */
 /* ------------------------------------------------------------------ */
-
-/* One entry in the ring buffer: one layer's bucket-RMS data for one token. */
+/*
+ * The grid is cells[pos % VIZ_TOKEN_RING][layer].  Every cell remembers the
+ * absolute position it holds, so
+ *   - arrival order does not matter: decode pushes (pos, layer 0..L-1) one
+ *     token at a time, batched prefill pushes (layer 0: pos p..p+n-1), then
+ *     layer 1 for all n tokens, ... (layer-major, because the GEMMs advance
+ *     the whole batch one layer at a time).  Both land in the right cell.
+ *   - stale data is detectable (cell.pos != expected pos).
+ *   - a KV-cache rewind (pos goes backwards) invalidates the newer cells.
+ * Cells are protected by a per-cell seqlock (single writer = inference
+ * thread, reader = VNC/render thread).
+ */
 typedef struct {
-    float buckets[VIZ_N_BUCKETS];
-    unsigned int flags; /* bit 0: valid */
-} viz_layer_entry_t;
+    _Atomic unsigned seq;        /* seqlock: odd = write in progress */
+    _Atomic int      pos;        /* absolute position held, -1 = empty */
+    float            buckets[VIZ_N_BUCKETS];
+} viz_cell_t;
 
-/* The ring buffer: circular, lock-free single-writer multi-reader.
- * The inference thread writes (single producer), the VNC thread reads. */
 typedef struct {
-    /* Ring of per-layer entries for the current token.
-     * Indexed by (write_pos % VIZ_RING_DEPTH).
-     * Each "frame" is VIZ_MAX_LAYERS entries. */
-    viz_layer_entry_t entries[VIZ_RING_DEPTH];
-
-    /* Write position (only written by inference thread).
-     * The VNC thread reads this with atomic load. */
-    _Atomic unsigned int write_pos;
-
-    /* Last successfully rendered position (written by VNC thread). */
-    _Atomic unsigned int render_pos;
-
-    /* Number of layers in the current model. */
-    int n_layers;
-
-    /* Total tokens generated (for column offset). */
-    _Atomic unsigned int token_count;
-
-    /* Number of token boundaries pushed. */
-    _Atomic unsigned int token_boundaries;
-
+    viz_cell_t cells[VIZ_TOKEN_RING][VIZ_MAX_LAYERS];
+    _Atomic int head;            /* newest position pushed, -1 = none yet */
+    _Atomic int active;          /* 1 once viz_init succeeded (gates all work) */
+    _Atomic unsigned gen;        /* bumped on every data change: lets the renderer idle */
+    int n_layers;                /* set by viz_set_model_info */
 } viz_ring_t;
 
 static viz_ring_t viz_ring;
+
+static void viz_ring_reset(void) {
+    for (int c = 0; c < VIZ_TOKEN_RING; c++)
+        for (int l = 0; l < VIZ_MAX_LAYERS; l++) {
+            atomic_store_explicit(&viz_ring.cells[c][l].seq, 0, memory_order_relaxed);
+            atomic_store_explicit(&viz_ring.cells[c][l].pos, -1, memory_order_relaxed);
+        }
+    atomic_store(&viz_ring.head, -1);
+}
 
 /* ------------------------------------------------------------------ */
 /*  Shared state                                                       */
@@ -193,6 +196,31 @@ typedef struct {
     float global_min;
     float global_max;
     int   norm_count;
+
+    /* Color scale.  Colors depend ONLY on a cell's own value and on a scale
+     * that is frozen once calibrated, so scrolling never recolors a column. */
+    _Atomic int norm_mode;       /* 0 = one global log scale, 1 = per-layer log scale */
+    _Atomic int bucket_mode;     /* 0 = one cell per (layer,pos), 1 = bucket sub-rows */
+    _Atomic int recal_request;   /* 'r' key: re-derive the scale on the next frame */
+    int   cal_valid;
+    int   fixed_scale;           /* PICOLM_VIZ_LO/HI given: never auto-calibrate */
+    float glo, ghi;              /* log10 range, global mode */
+    float lo[VIZ_MAX_LAYERS], hi[VIZ_MAX_LAYERS]; /* log10 range, per-layer mode */
+    unsigned dump_frames;        /* PICOLM_VIZ_DUMP frame counter */
+
+    /* VNC transport state (VNC thread only, except where noted) */
+    unsigned char *shadow;       /* BGRA copy of what the client currently shows */
+    unsigned char *dirty;        /* per-tile dirty flags (scratch) */
+    unsigned char *txbuf;        /* one FramebufferUpdate message, sent in one go */
+    size_t txcap;
+    int    fbu_pending;          /* client has an unanswered FramebufferUpdateRequest */
+    int    fbu_full;             /* non-incremental request: resend the region unconditionally */
+    int    req_x, req_y, req_w, req_h;
+    int    enc_hextile;          /* client advertised Hextile */
+    unsigned rendered_gen;       /* viz_ring.gen the framebuffer was last rendered at */
+    unsigned long long net_bytes;
+    unsigned net_updates, net_rects;
+    double net_t0;
 
     /* FPS counter */
     double last_frame_time;
@@ -437,25 +465,93 @@ static void viz_compute_buckets(float *buckets, const float *data, int n_embd, i
 }
 
 /* ------------------------------------------------------------------ */
-/*  Ring buffer operations (lock-free, single writer)                  */
+/*  Producer side (inference thread)                                   */
 /* ------------------------------------------------------------------ */
 
-void viz_push_layer(int layer, const float *data, int n_embd) {
-    if (layer < 0 || layer >= VIZ_MAX_LAYERS) return;
-    if (!data) return;
-
-    unsigned int pos = atomic_load_explicit(&viz_ring.write_pos, memory_order_relaxed);
-    viz_layer_entry_t *entry = &viz_ring.entries[pos % VIZ_RING_DEPTH];
-
-    viz_compute_buckets(entry->buckets, data, n_embd, VIZ_N_BUCKETS);
-    entry->flags = 1; /* valid */
-
-    atomic_store_explicit(&viz_ring.write_pos, pos + 1, memory_order_release);
+static void viz_cell_write(viz_cell_t *c, int pos, const float *data, int n_embd) {
+    unsigned q = atomic_load_explicit(&c->seq, memory_order_relaxed);
+    atomic_store_explicit(&c->seq, q + 1, memory_order_relaxed);
+    atomic_thread_fence(memory_order_release);
+    if (data) viz_compute_buckets(c->buckets, data, n_embd, VIZ_N_BUCKETS);
+    atomic_store_explicit(&c->pos, pos, memory_order_relaxed);
+    atomic_store_explicit(&c->seq, q + 2, memory_order_release);
 }
 
-void viz_new_token(void) {
-    atomic_fetch_add_explicit(&viz_ring.token_count, 1, memory_order_release);
-    atomic_fetch_add_explicit(&viz_ring.token_boundaries, 1, memory_order_release);
+/* Consistent snapshot of one cell. Returns 1 and fills out/pos on success. */
+static int viz_cell_read(const viz_cell_t *c, int *pos, float *out) {
+    for (int tries = 0; tries < 8; tries++) {
+        unsigned q1 = atomic_load_explicit(&c->seq, memory_order_acquire);
+        if (q1 & 1u) continue;
+        *pos = atomic_load_explicit(&c->pos, memory_order_relaxed);
+        memcpy(out, c->buckets, sizeof(float) * VIZ_N_BUCKETS);
+        atomic_thread_fence(memory_order_acquire);
+        if (atomic_load_explicit(&c->seq, memory_order_relaxed) == q1) return 1;
+    }
+    return 0;
+}
+
+/* Positions >= `from` are about to be recomputed (KV rewind / new prompt on a
+ * reused slot): drop everything newer so stale columns don't linger. */
+static void viz_rewind(int from, int head) {
+    int n = head - from + 1;
+    if (n > VIZ_TOKEN_RING) { from = head - VIZ_TOKEN_RING + 1; }
+    for (int p = from; p <= head; p++) {
+        if (p < 0) continue;
+        for (int l = 0; l < VIZ_MAX_LAYERS; l++) {
+            viz_cell_t *c = &viz_ring.cells[p % VIZ_TOKEN_RING][l];
+            if (atomic_load_explicit(&c->pos, memory_order_relaxed) == p)
+                viz_cell_write(c, -1, NULL, 0);
+        }
+    }
+}
+
+static void viz_dump_maybe(int pos);
+
+static void viz_push_one(int layer, int pos, const float *data, int n_embd) {
+    viz_cell_t *c = &viz_ring.cells[pos % VIZ_TOKEN_RING][layer];
+    int head = atomic_load_explicit(&viz_ring.head, memory_order_relaxed);
+    int rewound = 0;
+    /* Same (pos,layer) already present => this position is being recomputed. */
+    if (pos <= head && atomic_load_explicit(&c->pos, memory_order_relaxed) == pos) {
+        viz_rewind(pos, head);
+        rewound = 1;
+    }
+    viz_cell_write(c, pos, data, n_embd);
+    if (pos > head || rewound)
+        atomic_store_explicit(&viz_ring.head, pos, memory_order_release);
+    atomic_fetch_add_explicit(&viz_ring.gen, 1u, memory_order_release);
+}
+
+void viz_push_row(int layer, int pos, const float *data, int n_embd) {
+    if (!atomic_load_explicit(&viz_ring.active, memory_order_relaxed)) return;
+    if (layer < 0 || layer >= VIZ_MAX_LAYERS || pos < 0 || !data) return;
+    viz_push_one(layer, pos, data, n_embd);
+    viz_dump_maybe(pos);
+}
+
+/* Batched prefill: x_batch is [n_tokens][n_embd] row-major (row i = absolute
+ * position start_pos+i), the residual stream AFTER `layer` for the whole
+ * batch.  Only the newest VIZ_TOKEN_RING rows can ever be displayed, so older
+ * rows are skipped (bounds the cost for very long prompts). */
+void viz_push_batch(int layer, int start_pos, const float *x_batch, int n_tokens, int n_embd) {
+    if (!atomic_load_explicit(&viz_ring.active, memory_order_relaxed)) return;
+    if (layer < 0 || layer >= VIZ_MAX_LAYERS || start_pos < 0 || !x_batch || n_tokens < 1) return;
+    int first = n_tokens > VIZ_TOKEN_RING ? n_tokens - VIZ_TOKEN_RING : 0;
+    for (int i = first; i < n_tokens; i++)
+        viz_push_one(layer, start_pos + i, x_batch + (size_t)i * (size_t)n_embd, n_embd);
+    viz_dump_maybe(start_pos + n_tokens - 1);
+}
+
+/* Deprecated: positions are now explicit.  Kept so old callers still link. */
+void viz_new_token(void) {}
+
+/* Debug/test helper: RMS over the whole vector for (layer,pos), or -1. */
+float viz_peek(int layer, int pos) {
+    if (layer < 0 || layer >= VIZ_MAX_LAYERS || pos < 0) return -1.0f;
+    float b[VIZ_N_BUCKETS]; int p;
+    if (!viz_cell_read(&viz_ring.cells[pos % VIZ_TOKEN_RING][layer], &p, b) || p != pos) return -1.0f;
+    double sq = 0; for (int i = 0; i < VIZ_N_BUCKETS; i++) sq += (double)b[i] * b[i];
+    return (float)sqrt(sq / VIZ_N_BUCKETS);
 }
 
 /* ------------------------------------------------------------------ */
@@ -635,312 +731,275 @@ static void __attribute__((unused)) viz_draw_rect(unsigned char *fb, int fb_w, i
 /*  Render the activation heatmap                                      */
 /* ------------------------------------------------------------------ */
 
-static void viz_render_heatmap(void) {
-    int fb_w = viz.width;
-    int fb_h = viz.height;
-    unsigned char *fb = viz.framebuffer;
+/* Layout constants shared with viz_y_to_slot() (mouse -> layer mapping). */
+#define VIZ_TOP_BAR_H 20
 
-    /* Clear framebuffer to dark background. */
+static int viz_cmp_float(const void *a, const void *b) {
+    float x = *(const float *)a, y = *(const float *)b;
+    return (x > y) - (x < y);
+}
+
+static float viz_pctl(float *v, int n, float q) {   /* v sorted ascending */
+    if (n <= 0) return 0.0f;
+    int i = (int)(q * (float)(n - 1) + 0.5f);
+    return v[i < 0 ? 0 : (i >= n ? n - 1 : i)];
+}
+
+/* RMS of buckets [b0,b1) */
+static float viz_rms_range(const float *b, int b0, int b1) {
+    double sq = 0.0;
+    for (int i = b0; i < b1; i++) sq += (double)b[i] * (double)b[i];
+    return (b1 > b0) ? (float)sqrt(sq / (double)(b1 - b0)) : 0.0f;
+}
+
+/* log10(value) -> [0,1] under the current (frozen) scale. */
+static float viz_norm(int layer, float v) {
+    float lv = log10f(v > 1e-12f ? v : 1e-12f);
+    float lo = atomic_load_explicit(&viz.norm_mode, memory_order_relaxed) ? viz.lo[layer] : viz.glo;
+    float hi = atomic_load_explicit(&viz.norm_mode, memory_order_relaxed) ? viz.hi[layer] : viz.ghi;
+    return (hi > lo) ? (lv - lo) / (hi - lo) : 0.5f;
+}
+
+static float viz_rms_snap[VIZ_TOKEN_RING][VIZ_MAX_LAYERS]; /* guarded by fb_mutex */
+static float viz_scratch_a[VIZ_TOKEN_RING * VIZ_MAX_LAYERS];
+static float viz_scratch_b[VIZ_TOKEN_RING];
+
+/* Derive the color scale from what is on screen right now, but only once a
+ * FULL column (all layers) exists, then freeze it.  Uses 1st/99th percentiles
+ * so a single massive-activation outlier (e.g. an attention-sink token)
+ * saturates instead of crushing everything else into one color. */
+static void viz_calibrate(int ncols, int n_layers, int first_pos) {
+    int n = 0;
+    for (int c = 0; c < ncols; c++)
+        for (int l = 0; l < n_layers; l++)
+            if (viz_rms_snap[c][l] >= 0.0f) viz_scratch_a[n++] = log10f(fmaxf(viz_rms_snap[c][l], 1e-12f));
+    if (n < 1) return;
+    qsort(viz_scratch_a, (size_t)n, sizeof(float), viz_cmp_float);
+    float lo = viz_pctl(viz_scratch_a, n, 0.02f) - 0.05f;
+    float hi = viz_pctl(viz_scratch_a, n, 0.98f) + 0.05f;
+    if (hi - lo < 1.0f) { float m = 0.5f * (hi + lo); lo = m - 0.5f; hi = m + 0.5f; }
+    viz.glo = lo; viz.ghi = hi;
+
+    int n_out = 0, out_l0 = 0, out_l1 = 0, out_pos = 0; float out_v = 0, out_hi = 0;
+    for (int l = 0; l < n_layers; l++) {
+        int m = 0, amax = 0; float vmax = -1.0f;
+        for (int c = 0; c < ncols; c++) {
+            float v = viz_rms_snap[c][l];
+            if (v < 0.0f) continue;
+            if (v > vmax) { vmax = v; amax = c; }
+            viz_scratch_b[m++] = log10f(fmaxf(v, 1e-12f));
+        }
+        if (m < 1) { viz.lo[l] = lo; viz.hi[l] = hi; continue; }
+        qsort(viz_scratch_b, (size_t)m, sizeof(float), viz_cmp_float);
+        /* Robust per-layer range: 5th..95th percentile. Outlier tokens saturate
+         * instead of squashing every other token into one color. */
+        float l0 = viz_pctl(viz_scratch_b, m, 0.05f);
+        float h0 = viz_pctl(viz_scratch_b, m, 0.95f);
+        if (h0 - l0 < 0.02f) { float mid = 0.5f * (h0 + l0); l0 = mid - 0.01f; h0 = mid + 0.01f; }
+        viz.lo[l] = l0; viz.hi[l] = h0;
+        if (log10f(fmaxf(vmax, 1e-12f)) > h0 + 0.7f) {  /* >5x above p95 */
+            if (n_out == 0) { out_l0 = l; out_pos = first_pos + amax; out_v = vmax; out_hi = powf(10.0f, h0); }
+            out_l1 = l; n_out++;
+        }
+    }
+    if (n_out)
+        fprintf(stderr, "[VIZ] outlier token (saturated in color): pos=%d in %d layers (%d..%d); "
+                "e.g. layer %d rms=%.4g vs p95=%.4g\n", out_pos, n_out, out_l0, out_l1, out_l0, out_v, out_hi);
+}
+
+static void viz_render_heatmap(void) {
+    int fb_w = viz.width, fb_h = viz.height;
+    unsigned char *fb = viz.framebuffer;
     memset(fb, 0, (size_t)fb_w * fb_h * 4);
 
-    /* Layout:
-     * Top bar (0-20): title, stats
-     * Heatmap area (20-H): layers on Y axis, tokens on X axis
-     * Each cell = 1 layer x 1 token, colored by bucket-RMS magnitude
-     *
-     * The heatmap shows the LAST N tokens that fit on screen.
-     * Y axis: layers (0 at top, n_layers-1 at bottom).
-     * X axis: tokens (oldest on left, newest on right). */
-
-    int top_bar_h = 20;
-    int heatmap_y = top_bar_h + 2;
+    /* Geometry (must match viz_y_to_slot): layers on Y, absolute position on X,
+     * oldest left / newest right.  Until the window is full, position p sits at
+     * a fixed x; after that the window scrolls one column per new position. */
+    int heatmap_y = VIZ_TOP_BAR_H + 2;
     int heatmap_h = fb_h - heatmap_y - 2;
-    int heatmap_w = fb_w - 4;
+    int n_layers = viz.n_layers < 1 ? 1 : viz.n_layers;
+    if (n_layers > VIZ_MAX_LAYERS) n_layers = VIZ_MAX_LAYERS;
+    int layer_h = heatmap_h / n_layers; if (layer_h < 1) layer_h = 1;
 
-    /* Title bar: model name, layer/token stats */
-    unsigned int white = viz_color(1.0f);
-    unsigned int dim = viz_color(0.5f);
+    int avail = fb_w - 4 - 20;                 /* leave room for the color bar */
+    int col_w = avail / VIZ_TOKEN_RING; if (col_w < 1) col_w = 1;
+    int W = avail / col_w; if (W > VIZ_TOKEN_RING) W = VIZ_TOKEN_RING; if (W < 1) W = 1;
 
-    char title_buf[256];
-    unsigned int wpos = atomic_load_explicit(&viz_ring.write_pos, memory_order_acquire);
-    int connected = atomic_load_explicit(&viz.client_connected, memory_order_relaxed);
-    int n_layers_tmp = viz.n_layers;
-    if (n_layers_tmp < 1) n_layers_tmp = 1;
-    int ntok = (int)(wpos / (unsigned int)n_layers_tmp);
+    int head = atomic_load_explicit(&viz_ring.head, memory_order_acquire);
+    int first = (head >= W) ? head - W + 1 : 0;
+    int ncols = head >= 0 ? head - first + 1 : 0;
 
-    snprintf(title_buf, sizeof(title_buf), "PicoLM VIZ: %s [%dL, %dd] tok=%d lay=%d %s",
-             viz.model_name, viz.n_layers, viz.n_embd, ntok,
-             (int)(wpos % (unsigned int)n_layers_tmp),
-             connected ? "VNC" : "  ");
-    viz_draw_string(fb, fb_w, fb_h, 4, 2, title_buf, white);
-
-    /* Subtitle explaining the axes */
-    char subtitle[128];
-    snprintf(subtitle, sizeof(subtitle), "Y=layer X=token per-layer RMS normalized");
-    viz_draw_string(fb, fb_w, fb_h, 4, 9, subtitle, dim);
-
-    /* Compute how many tokens we can display.
-     * Each token = 1 column. We want at least 2px per column. */
-    int max_tokens = heatmap_w / 2;
-    if (max_tokens < 1) max_tokens = 1;
-    if (max_tokens > VIZ_TOKEN_RING) max_tokens = VIZ_TOKEN_RING;
-
-    /* Get the range of tokens to display. */
-    int start_token = ntok - max_tokens;
-    if (start_token < 0) start_token = 0;
-    int num_tokens = ntok - start_token;
-
-    /* Determine the cell height per layer. */
-    int n_layers = viz.n_layers;
-    if (n_layers < 1) n_layers = 1;
-    int layer_h = heatmap_h / n_layers;
-    if (layer_h < 1) layer_h = 1;
-
-    /* Per-layer min/max for normalization.
-     * Each layer has its own activation scale; normalizing per-layer
-     * gives the best visual contrast.
-     *
-     * Only count COMPLETE tokens (all n_layers entries written).
-     * Partial tokens (mid-forward-pass) are skipped to avoid stale data. */
-    float layer_min[VIZ_MAX_LAYERS];
-    float layer_max[VIZ_MAX_LAYERS];
-    for (int l = 0; l < n_layers; l++) {
-        layer_min[l] = 1e10f;
-        layer_max[l] = -1e10f;
-    }
-
-    int valid_count = 0;
-    /* Only use complete tokens: the last token might be mid-forward-pass */
-    int complete_tokens = num_tokens;
-    if (complete_tokens > 0) {
-        /* Check if the last token is complete */
-        unsigned int last_tok = (unsigned int)(start_token + complete_tokens - 1);
-        unsigned int last_entry = (last_tok + 1) * (unsigned int)n_layers;
-        if (last_entry > wpos) {
-            complete_tokens--; /* skip incomplete last token */
-        }
-    }
-
-    for (int t = 0; t < complete_tokens; t++) {
-        int tok = start_token + t;
-        unsigned int base_pos = (unsigned int)tok * (unsigned int)n_layers;
-
+    /* Snapshot pass: RMS per (column,layer), -1 if absent. */
+    int full_cols = 0, head_filled = 0;
+    for (int c = 0; c < ncols; c++) {
+        int p = first + c, filled = 0;
         for (int l = 0; l < n_layers; l++) {
-            unsigned int entry_pos = base_pos + (unsigned int)l;
-            if (entry_pos >= wpos) break;
-
-            viz_layer_entry_t *entry = &viz_ring.entries[entry_pos % VIZ_RING_DEPTH];
-            if (!(entry->flags & 1)) continue;
-
-            float avg = 0.0f;
-            for (int b = 0; b < VIZ_N_BUCKETS; b++) {
-                avg += entry->buckets[b];
+            float b[VIZ_N_BUCKETS]; int cp;
+            viz_rms_snap[c][l] = -1.0f;
+            if (viz_cell_read(&viz_ring.cells[p % VIZ_TOKEN_RING][l], &cp, b) && cp == p) {
+                float r = viz_rms_range(b, 0, VIZ_N_BUCKETS);
+                viz_rms_snap[c][l] = isfinite(r) ? r : -2.0f;   /* -2 = NaN/Inf */
+                filled++;
             }
-            avg /= (float)VIZ_N_BUCKETS;
-
-            if (avg < layer_min[l]) layer_min[l] = avg;
-            if (avg > layer_max[l]) layer_max[l] = avg;
-            valid_count++;
         }
+        if (filled == n_layers) full_cols++;
+        if (p == head) head_filled = filled;
     }
 
-    /* Also track global min/max for the color bar label. */
-    float gmin2 = 1e10f, gmax2 = -1e10f;
-    for (int l = 0; l < n_layers; l++) {
-        if (layer_min[l] < gmin2) gmin2 = layer_min[l];
-        if (layer_max[l] > gmax2) gmax2 = layer_max[l];
-    }
-    if (gmax2 <= gmin2) { gmin2 = 0.0f; gmax2 = 1.0f; }
-
-    /* If no valid data yet, just draw the title bar and return. */
-    if (complete_tokens < 1 || valid_count < 1) {
-        return;
+    {   /* Report non-finite activations once per layer (they are a model/quant problem). */
+        static unsigned char reported[VIZ_MAX_LAYERS];
+        for (int c = 0; c < ncols; c++)
+            for (int l = 0; l < n_layers; l++)
+                if (viz_rms_snap[c][l] < -1.5f && !reported[l]) {
+                    reported[l] = 1;
+                    fprintf(stderr, "[VIZ] WARNING: non-finite (NaN/Inf) activations at layer %d, pos %d "
+                                    "(drawn white)\n", l, first + c);
+                }
     }
 
-    /* Second pass: render the heatmap with per-layer normalization. */
-    int col_w = heatmap_w / complete_tokens;
-    if (col_w < 1) col_w = 1;
+    /* Scale: fixed by env, or calibrated once and frozen. */
+    if (atomic_exchange_explicit(&viz.recal_request, 0, memory_order_relaxed) && !viz.fixed_scale)
+        viz.cal_valid = 0;
+    if (!viz.fixed_scale && !viz.cal_valid && ncols > 0) {
+        viz_calibrate(ncols, n_layers, first);
+        if (full_cols > 0) viz.cal_valid = 1;   /* provisional until a full column exists */
+    }
 
-    for (int t = 0; t < complete_tokens; t++) {
-        int tok = start_token + t;
-        int cx = 2 + t * col_w;
+    unsigned int txt = 0xFFFFFF, dim = 0xA0A0B0;
+    char buf[256];
+    snprintf(buf, sizeof(buf), "PicoLM VIZ: %s [%dL, %dd] pos=%d lay=%d/%d %s",
+             viz.model_name, viz.n_layers, viz.n_embd, head, head_filled, n_layers,
+             atomic_load_explicit(&viz.client_connected, memory_order_relaxed) ? "VNC" : "");
+    viz_draw_string(fb, fb_w, fb_h, 4, 2, buf, txt);
+    snprintf(buf, sizeof(buf), "Y=layer X=pos  RMS log-scale %s%s [r]ecal [n]orm [b]uckets",
+             atomic_load_explicit(&viz.norm_mode, memory_order_relaxed) ? "per-layer" : "global",
+             atomic_load_explicit(&viz.bucket_mode, memory_order_relaxed) ? "+buckets" : "");
+    viz_draw_string(fb, fb_w, fb_h, 4, 9, buf, dim);
 
+    /* Position ticks (absolute token index) every 16 columns. */
+    for (int c = 0; c < ncols; c++) {
+        int p = first + c;
+        if (p % 16) continue;
+        int x = 2 + c * col_w;
+        snprintf(buf, sizeof(buf), "%d", p);
+        viz_draw_string(fb, fb_w, fb_h, x, VIZ_TOP_BAR_H - 6, buf, dim);
+    }
+
+    int bucket_mode = atomic_load_explicit(&viz.bucket_mode, memory_order_relaxed);
+    int ch = layer_h >= 3 ? layer_h - 1 : layer_h;   /* 1px gap between layers */
+    int cw = col_w   >= 3 ? col_w   - 1 : col_w;     /* 1px gap between columns */
+
+    for (int c = 0; c < ncols; c++) {
+        int p = first + c, x0 = 2 + c * col_w;
         for (int l = 0; l < n_layers; l++) {
-            unsigned int entry_pos = (unsigned int)tok * (unsigned int)n_layers + (unsigned int)l;
-            if (entry_pos >= wpos) break;
-
-            viz_layer_entry_t *entry = &viz_ring.entries[entry_pos % VIZ_RING_DEPTH];
-            if (!(entry->flags & 1)) continue;
-
-            /* Compute average bucket-RMS for this layer/token. */
-            float sum = 0.0f;
-            for (int b = 0; b < VIZ_N_BUCKETS; b++) {
-                sum += entry->buckets[b];
+            if (viz_rms_snap[c][l] == -1.0f) continue;    /* not computed (yet) */
+            int y0 = heatmap_y + l * layer_h;
+            if (viz_rms_snap[c][l] < -1.5f) {             /* NaN/Inf: pure white, never a palette color */
+                viz_draw_rect(fb, fb_w, x0, y0, cw, ch, 0xFFFFFF);
+                continue;
             }
-            float avg = sum / (float)VIZ_N_BUCKETS;
-
-            /* Normalize within this layer's range.
-             * Enforce a minimum range relative to global to prevent
-             * wild color swings when a layer has near-uniform activations. */
-            float lrange = layer_max[l] - layer_min[l];
-            float global_range = gmax2 - gmin2;
-            float min_range = global_range * 0.01f; /* 1% of global range */
-            if (min_range < 1e-6f) min_range = 1e-6f;
-
-            float norm;
-            if (lrange < min_range) {
-                /* Layer has very little variation; use global normalization
-                 * so it still shows some color rather than being uniform. */
-                if (global_range < 1e-6f) {
-                    norm = 0.5f;
-                } else {
-                    norm = (avg - gmin2) / global_range;
-                }
+            if (!bucket_mode || ch < 2) {
+                viz_draw_rect(fb, fb_w, x0, y0, cw, ch, viz_color(viz_norm(l, viz_rms_snap[c][l])));
             } else {
-                norm = (avg - layer_min[l]) / lrange;
-            }
-
-            /* Gamma correction: boost mid-range contrast for better visibility.
-             * norm = pow(norm, 0.8) expands the middle, compresses extremes. */
-            if (norm > 0.0f && norm < 1.0f) {
-                norm = (float)pow((double)norm, 0.8);
-            }
-
-            unsigned int col = viz_color(norm);
-
-            int cy = heatmap_y + l * layer_h;
-
-            /* Draw the cell. If layer_h >= 2 and col_w >= 2, draw interior + border.
-             * Otherwise just fill. */
-            if (layer_h >= 2 && col_w >= 2) {
-                /* Fill interior with color */
-                for (int dy = 0; dy < layer_h - 1; dy++) {
-                    for (int dx = 0; dx < col_w - 1; dx++) {
-                        int px = cx + dx;
-                        int py = cy + dy;
-                        int idx = (py * fb_w + px) * 4;
-                        fb[idx]     = (unsigned char)(col & 0xFF);
-                        fb[idx + 1] = (unsigned char)((col >> 8) & 0xFF);
-                        fb[idx + 2] = (unsigned char)((col >> 16) & 0xFF);
-                        fb[idx + 3] = 255;
-                    }
-                }
-                /* Border - dark gray */
-                for (int dx = 0; dx < col_w; dx++) {
-                    int idx = (cy * fb_w + cx + dx) * 4;
-                    fb[idx] = 0x20; fb[idx+1] = 0x20; fb[idx+2] = 0x20;
-                    idx = ((cy + layer_h - 1) * fb_w + cx + dx) * 4;
-                    fb[idx] = 0x20; fb[idx+1] = 0x20; fb[idx+2] = 0x20;
-                }
-                for (int dy = 0; dy < layer_h; dy++) {
-                    int idx = ((cy + dy) * fb_w + cx) * 4;
-                    fb[idx] = 0x20; fb[idx+1] = 0x20; fb[idx+2] = 0x20;
-                    idx = ((cy + dy) * fb_w + cx + col_w - 1) * 4;
-                    fb[idx] = 0x20; fb[idx+1] = 0x20; fb[idx+2] = 0x20;
-                }
-            } else {
-                /* Single pixel per cell */
-                int px = cx;
-                int py = cy;
-                if (py < fb_h && px < fb_w) {
-                    int idx = (py * fb_w + px) * 4;
-                    fb[idx]     = (unsigned char)(col & 0xFF);
-                    fb[idx + 1] = (unsigned char)((col >> 8) & 0xFF);
-                    fb[idx + 2] = (unsigned char)((col >> 16) & 0xFF);
-                    fb[idx + 3] = 255;
+                float b[VIZ_N_BUCKETS]; int cp;
+                if (!viz_cell_read(&viz_ring.cells[p % VIZ_TOKEN_RING][l], &cp, b) || cp != p) continue;
+                int sr = 1;                                   /* sub-rows: pow2 <= min(N, ch) */
+                while (sr * 2 <= VIZ_N_BUCKETS && sr * 2 <= ch) sr *= 2;
+                int sh = ch / sr;
+                for (int sIdx = 0; sIdx < sr; sIdx++) {
+                    int b0 = sIdx * VIZ_N_BUCKETS / sr, b1 = (sIdx + 1) * VIZ_N_BUCKETS / sr;
+                    viz_draw_rect(fb, fb_w, x0, y0 + sIdx * sh, cw, sh,
+                                  viz_color(viz_norm(l, viz_rms_range(b, b0, b1))));
                 }
             }
         }
     }
 
-    /* Color bar on the right edge. */
-    int bar_x = fb_w - 16;
-    int bar_w = 12;
-    int bar_h = heatmap_h;
-    if (bar_x > 4 && bar_h > 0) {
-        for (int y = 0; y < bar_h; y++) {
-            float t = 1.0f - (float)y / (float)bar_h;
-            unsigned int col = viz_color(t);
-            for (int dx = 0; dx < bar_w; dx++) {
-                int px = bar_x + dx;
-                int py = heatmap_y + y;
-                if (px < fb_w && py < fb_h) {
-                    int idx = (py * fb_w + px) * 4;
-                    fb[idx]     = (unsigned char)(col & 0xFF);
-                    fb[idx + 1] = (unsigned char)((col >> 8) & 0xFF);
-                    fb[idx + 2] = (unsigned char)((col >> 16) & 0xFF);
-                    fb[idx + 3] = 255;
-                }
-            }
+    /* Color bar + its labels (real values of the frozen scale). */
+    int bar_x = fb_w - 16, bar_w = 12;
+    if (bar_x > 4 && heatmap_h > 0) {
+        for (int y = 0; y < heatmap_h; y++)
+            viz_draw_rect(fb, fb_w, bar_x, heatmap_y + y, bar_w, 1,
+                          viz_color(1.0f - (float)y / (float)heatmap_h));
+        if (atomic_load_explicit(&viz.norm_mode, memory_order_relaxed)) {
+            viz_draw_string(fb, fb_w, fb_h, bar_x - 14, heatmap_y, "hi", dim);
+            viz_draw_string(fb, fb_w, fb_h, bar_x - 14, heatmap_y + heatmap_h - VIZ_FONT_H, "lo", dim);
+        } else {
+            snprintf(buf, sizeof(buf), "%.3g", powf(10.0f, viz.ghi));
+            viz_draw_string(fb, fb_w, fb_h, bar_x - 6 * (int)strlen(buf) - 2, heatmap_y, buf, dim);
+            snprintf(buf, sizeof(buf), "%.3g", powf(10.0f, viz.glo));
+            viz_draw_string(fb, fb_w, fb_h, bar_x - 6 * (int)strlen(buf) - 2,
+                            heatmap_y + heatmap_h - VIZ_FONT_H, buf, dim);
         }
-
-        /* Labels on the color bar: max at top, min at bottom.
-         * These show the global range; each layer is normalized independently. */
-        char num_buf[16];
-        snprintf(num_buf, sizeof(num_buf), "%.3f", gmax2);
-        viz_draw_string(fb, fb_w, fb_h, bar_x + 1, heatmap_y, num_buf, dim);
-        snprintf(num_buf, sizeof(num_buf), "%.3f", gmin2);
-        viz_draw_string(fb, fb_w, fb_h, bar_x + 1, heatmap_y + bar_h - VIZ_FONT_H, num_buf, dim);
     }
 
-    /* Layer labels on the left (only if enough room for small labels). */
+    /* Layer labels on the left. */
     if (layer_h >= 10 && n_layers <= 64) {
-        char lbl[16];
         for (int l = 0; l < n_layers; l++) {
-            int cy = heatmap_y + l * layer_h + 1;
-            snprintf(lbl, sizeof(lbl), "%d", l);
-            viz_draw_char(fb, fb_w, fb_h, 1, cy, lbl[0], dim);
-            if (l >= 9) {
-                viz_draw_char(fb, fb_w, fb_h, 7, cy, lbl[1], dim);
-            }
+            snprintf(buf, sizeof(buf), "%d", l);
+            viz_draw_string(fb, fb_w, fb_h, 1, heatmap_y + l * layer_h + 1, buf, dim);
         }
     }
 
-    /* Permutation indicators: show "L@S" on the right side for
-     * layers that are not in their natural execution position. */
+    /* Permutation indicators ("L@S") for layers not in their natural slot. */
     {
-        int label_x = fb_w - 32; /* right side, before color bar */
-        if (label_x < 20) label_x = fb_w / 2;
-        char lbl[16];
+        int label_x = fb_w - 52; if (label_x < 20) label_x = fb_w / 2;
         for (int l = 0; l < n_layers; l++) {
             int exec_slot = viz_perm_inv[l];
-            if (exec_slot == l) continue; /* natural position, no indicator */
-            int cy = heatmap_y + l * layer_h + 1;
-            snprintf(lbl, sizeof(lbl), "%d@%d", l, exec_slot);
-            viz_draw_string(fb, fb_w, fb_h, label_x, cy, lbl, 0xFFFFFFAA);
+            if (exec_slot == l) continue;
+            snprintf(buf, sizeof(buf), "%d@%d", l, exec_slot);
+            viz_draw_string(fb, fb_w, fb_h, label_x, heatmap_y + l * layer_h + 1, buf, 0xFFFFAA);
         }
     }
-    /* Post-process: dim skipped layer rows and draw "S" indicators.
-     * Done after all heatmap + label drawing so indicators stay bright. */
-    {
-        int color_bar_x = fb_w - 16; /* matches bar_x below */
-        for (int l = 0; l < n_layers; l++) {
-            if (!atomic_load_explicit(&viz_skip_layer[l], memory_order_relaxed))
-                continue;
 
-            int row_start = heatmap_y + l * layer_h;
-            int row_h = layer_h;
-            /* Dim only the heatmap area (skip labels on left, color bar on right) */
-            for (int py = row_start; py < row_start + row_h && py < fb_h; py++) {
-                size_t row_off = (size_t)py * fb_w * 4;
-                for (int px = 12; px < color_bar_x && px < fb_w; px++) {
-                    size_t idx = row_off + px * 4;
-                    fb[idx]     = (unsigned char)(fb[idx] * 3 / 10);
-                    fb[idx + 1] = (unsigned char)(fb[idx + 1] * 3 / 10);
-                    fb[idx + 2] = (unsigned char)(fb[idx + 2] * 3 / 10);
-                }
+    /* Dim skipped layer rows and mark them. */
+    for (int l = 0; l < n_layers; l++) {
+        if (!atomic_load_explicit(&viz_skip_layer[l], memory_order_relaxed)) continue;
+        int row_start = heatmap_y + l * layer_h;
+        for (int py = row_start; py < row_start + layer_h && py < fb_h; py++)
+            for (int px = 12; px < bar_x && px < fb_w; px++) {
+                size_t idx = ((size_t)py * fb_w + px) * 4;
+                fb[idx] = (unsigned char)(fb[idx] * 3 / 10);
+                fb[idx+1] = (unsigned char)(fb[idx+1] * 3 / 10);
+                fb[idx+2] = (unsigned char)(fb[idx+2] * 3 / 10);
             }
-            /* Draw bright red "S" at center of the row */
-            unsigned int red = 0xFFFFFF00; /* BGRA: bright red */
-            int s_x = heatmap_w / 2 + 2;
-            int s_y = row_start + (row_h - 8) / 2;
-            if (s_y < heatmap_y) s_y = row_start + 1;
-            viz_draw_string(fb, fb_w, fb_h, s_x, s_y, "SKIP", red);
-        }
+        int s_y = row_start + (layer_h - 8) / 2; if (s_y < heatmap_y) s_y = row_start + 1;
+        viz_draw_string(fb, fb_w, fb_h, fb_w / 2, s_y, "SKIP", 0xFF3030);
     }
+}
 
-    /* Y-axis label: "LAYER" */
-    /* Draw vertically... skip for now, too complex for this font. */
+/* Write the current frame as a binary PPM (also usable as a test hook). */
+int viz_snapshot_ppm(const char *path) {
+    if (!viz.framebuffer) return -1;
+    pthread_mutex_lock(&viz.fb_mutex);
+    viz_render_heatmap();
+    FILE *f = fopen(path, "wb");
+    int rc = -1;
+    if (f) {
+        fprintf(f, "P6\n%d %d\n255\n", viz.width, viz.height);
+        for (int i = 0; i < viz.width * viz.height; i++) {
+            const unsigned char *px = viz.framebuffer + (size_t)i * 4;   /* B G R A */
+            fputc(px[2], f); fputc(px[1], f); fputc(px[0], f);
+        }
+        fclose(f); rc = 0;
+    }
+    pthread_mutex_unlock(&viz.fb_mutex);
+    return rc;
+}
+
+/* PICOLM_VIZ_DUMP=prefix: write prefix_NNNN.ppm each time the newest column
+ * becomes complete, i.e. once per forward pass (decode token or prefill batch). */
+static void viz_dump_maybe(int pos) {
+    static const char *pfx; static int init;
+    if (!init) { pfx = getenv("PICOLM_VIZ_DUMP"); init = 1; }
+    if (!pfx || viz.n_layers < 1 || pos != atomic_load_explicit(&viz_ring.head, memory_order_relaxed)) return;
+    int n = 0;
+    for (int l = 0; l < viz.n_layers && l < VIZ_MAX_LAYERS; l++)
+        if (atomic_load_explicit(&viz_ring.cells[pos % VIZ_TOKEN_RING][l].pos, memory_order_relaxed) == pos) n++;
+    if (n != viz.n_layers) return;
+    char fn[512];
+    snprintf(fn, sizeof(fn), "%s_%04u.ppm", pfx, viz.dump_frames++);
+    viz_snapshot_ppm(fn);
 }
 
 /* ------------------------------------------------------------------ */
@@ -954,6 +1013,7 @@ static void viz_vnc_disconnect(void) {
     }
     viz.client_fd = -1;
     viz.state = 0;
+    viz.fbu_pending = 0; viz.fbu_full = 1; viz.enc_hextile = 0;
     atomic_store_explicit(&viz.client_connected, 0, memory_order_release);
 }
 
@@ -1033,8 +1093,7 @@ static int viz_drag_prev_y = -1;  /* y of last event, for debouncing */
 
 /* Map a y-coordinate to a layer slot, or -1 if outside heatmap */
 static int viz_y_to_slot(uint16_t y) {
-    int top_bar_h = 20;
-    int heatmap_y = top_bar_h + 2;
+    int heatmap_y = VIZ_TOP_BAR_H + 2;
     int heatmap_h = viz.height - heatmap_y - 2;
     int n_layers = viz.n_layers;
     if (n_layers > 0 && y >= (uint16_t)heatmap_y && y < (uint16_t)(heatmap_y + heatmap_h)) {
@@ -1087,12 +1146,15 @@ static void viz_vnc_process_messages(void) {
             }
             {
                 uint16_t num_enc = vnc_read_u16_be(buf + 1);
+                int hextile = 0;
                 for (uint16_t i = 0; i < num_enc; i++) {
                     if (viz_recv_full(viz.client_fd, buf, 4) < 0) {
                         viz_vnc_disconnect();
                         return;
                     }
+                    if (vnc_read_u32_be(buf) == 5u) hextile = 1;
                 }
+                viz.enc_hextile = hextile;
             }
             break;
 
@@ -1102,16 +1164,27 @@ static void viz_vnc_process_messages(void) {
                 return;
             }
             {
-                uint8_t incremental = buf[0];
-                if (!incremental) {
+                viz.req_x = vnc_read_u16_be(buf + 1); viz.req_y = vnc_read_u16_be(buf + 3);
+                viz.req_w = vnc_read_u16_be(buf + 5); viz.req_h = vnc_read_u16_be(buf + 7);
+                viz.fbu_pending = 1;
+                if (!buf[0]) {            /* non-incremental: client lost its picture, resend region */
+                    viz.fbu_full = 1;
                     atomic_store_explicit(&viz.update_requested, 1, memory_order_release);
                 }
             }
             break;
 
-        case 4: /* KeyEvent - we ignore but consume */
+        case 4: /* KeyEvent: r = recalibrate scale, n = global/per-layer, b = bucket rows */
             if (viz_recv_full(viz.client_fd, buf, 7) < 0) {
                 viz_vnc_disconnect();
+                break;
+            }
+            if (buf[0]) {
+                uint32_t key = vnc_read_u32_be(buf + 3);
+                if (key == 'r') atomic_store(&viz.recal_request, 1);
+                else if (key == 'n') atomic_store(&viz.norm_mode, !atomic_load(&viz.norm_mode));
+                else if (key == 'b') atomic_store(&viz.bucket_mode, !atomic_load(&viz.bucket_mode));
+                atomic_store_explicit(&viz.update_requested, 1, memory_order_release);
             }
             break;
 
@@ -1192,78 +1265,197 @@ static void viz_vnc_process_messages(void) {
     }
 }
 
-/* Send the current framebuffer to the VNC client as a raw encoding.
- * Converts BGRA (our format) to RGBX (VNC little-endian 32bpp format). */
-static void viz_vnc_send_framebuffer(void) {
-    if (viz.client_fd <= 0 || viz.state != 3) return;
+/* ------------------------------------------------------------------ */
+/*  Framebuffer transport: dirty tiles -> Hextile (or Raw)             */
+/* ------------------------------------------------------------------ */
+/*
+ * Per update we (1) diff the freshly rendered framebuffer against `shadow`
+ * (what the client already has) in 16x16 tiles, (2) merge dirty tiles into
+ * rectangles, (3) encode them into ONE buffer, (4) send it outside the
+ * framebuffer mutex.  Nothing changed => nothing is sent and the client's
+ * request simply stays outstanding (legal RFB).
+ * Pixel format on the wire: 32bpp little-endian, bytes B,G,R,0.
+ */
+#define VIZ_TILE 16
+#define VIZ_MAX_RECTS 2048
+
+static inline uint32_t viz_px(const unsigned char *p) {
+    uint32_t v; memcpy(&v, p, 4); return v & 0x00FFFFFFu;   /* ignore alpha byte */
+}
+
+static inline unsigned char *viz_put_px(unsigned char *o, uint32_t v) {
+    o[0] = (unsigned char)v; o[1] = (unsigned char)(v >> 8); o[2] = (unsigned char)(v >> 16); o[3] = 0;
+    return o + 4;
+}
+
+static unsigned char *viz_enc_raw(unsigned char *o, const unsigned char *fb, int fbw,
+                                  int rx, int ry, int rw, int rh) {
+    for (int y = 0; y < rh; y++) {
+        const unsigned char *src = fb + ((size_t)(ry + y) * fbw + rx) * 4;
+        for (int x = 0; x < rw; x++) o = viz_put_px(o, viz_px(src + x * 4));
+    }
+    return o;
+}
+
+/* Hextile (RFB encoding 5).  We never rely on background/foreground carry-over
+ * between tiles: every non-raw tile states its own background and uses
+ * coloured subrects, so each tile decodes independently. */
+static unsigned char *viz_enc_hextile(unsigned char *o, const unsigned char *fb, int fbw,
+                                      int rx, int ry, int rw, int rh) {
+    uint32_t t[VIZ_TILE * VIZ_TILE];
+    unsigned char skip[VIZ_TILE * VIZ_TILE];
+    for (int ty = 0; ty < rh; ty += VIZ_TILE) {
+        int th = rh - ty < VIZ_TILE ? rh - ty : VIZ_TILE;
+        for (int tx = 0; tx < rw; tx += VIZ_TILE) {
+            int tw = rw - tx < VIZ_TILE ? rw - tx : VIZ_TILE;
+            for (int y = 0; y < th; y++) {
+                const unsigned char *src = fb + ((size_t)(ry + ty + y) * fbw + rx + tx) * 4;
+                for (int x = 0; x < tw; x++) t[y * tw + x] = viz_px(src + x * 4);
+            }
+            int n = tw * th;
+
+            /* most frequent colour = background; bail to raw if too noisy */
+            uint32_t dc[24]; int cnt[24]; int nd = 0, noisy = 0;
+            for (int i = 0; i < n && !noisy; i++) {
+                int k = 0;
+                while (k < nd && dc[k] != t[i]) k++;
+                if (k == nd) { if (nd == 24) { noisy = 1; break; } dc[nd] = t[i]; cnt[nd] = 0; nd++; }
+                cnt[k]++;
+            }
+            size_t raw_sz = 1 + (size_t)n * 4;
+            if (!noisy) {
+                int bi = 0;
+                for (int k = 1; k < nd; k++) if (cnt[k] > cnt[bi]) bi = k;
+                uint32_t bg = dc[bi];
+                if (nd == 1) {                       /* solid tile: flag + bg */
+                    *o++ = 2; o = viz_put_px(o, bg);
+                    continue;
+                }
+                unsigned char sub[255 * 6]; int ns = 0, fits = 1;
+                for (int i = 0; i < n; i++) skip[i] = (t[i] == bg);
+                for (int y = 0; y < th && fits; y++)
+                    for (int x = 0; x < tw; x++) {
+                        if (skip[y * tw + x]) continue;
+                        uint32_t col = t[y * tw + x];
+                        int w = 1, h = 1;
+                        while (x + w < tw && !skip[y * tw + x + w] && t[y * tw + x + w] == col) w++;
+                        for (; y + h < th; h++) {
+                            int ok = 1;
+                            for (int i = 0; i < w; i++)
+                                if (skip[(y + h) * tw + x + i] || t[(y + h) * tw + x + i] != col) { ok = 0; break; }
+                            if (!ok) break;
+                        }
+                        for (int yy = 0; yy < h; yy++) for (int xx = 0; xx < w; xx++) skip[(y + yy) * tw + x + xx] = 1;
+                        if (ns >= 255) { fits = 0; break; }
+                        unsigned char *p = sub + ns * 6; viz_put_px(p, col);
+                        p[4] = (unsigned char)((x << 4) | y);
+                        p[5] = (unsigned char)(((w - 1) << 4) | (h - 1));
+                        ns++;
+                    }
+                size_t enc_sz = 1 + 4 + 1 + (size_t)ns * 6;
+                if (fits && enc_sz < raw_sz) {
+                    *o++ = 2 | 8 | 16;               /* BgSpecified | AnySubrects | SubrectsColoured */
+                    o = viz_put_px(o, bg);
+                    *o++ = (unsigned char)ns;
+                    memcpy(o, sub, (size_t)ns * 6); o += (size_t)ns * 6;
+                    continue;
+                }
+            }
+            *o++ = 1;                                /* Raw tile */
+            for (int i = 0; i < n; i++) o = viz_put_px(o, t[i]);
+        }
+    }
+    return o;
+}
+
+/* Build and send one FramebufferUpdate.  Returns 1 if something was sent. */
+static int viz_vnc_send_update(void) {
+    if (viz.client_fd <= 0 || viz.state != 3 || !viz.fbu_pending) return 0;
+    int W = viz.width, H = viz.height;
+    int rx0 = viz.req_x < 0 ? 0 : viz.req_x, ry0 = viz.req_y < 0 ? 0 : viz.req_y;
+    int rx1 = viz.req_x + viz.req_w, ry1 = viz.req_y + viz.req_h;
+    if (rx1 > W) rx1 = W;
+    if (ry1 > H) ry1 = H;
+    if (rx1 <= rx0 || ry1 <= ry0) { viz.fbu_pending = 0; return 0; }
+
+    int tcx = (W + VIZ_TILE - 1) / VIZ_TILE, tcy = (H + VIZ_TILE - 1) / VIZ_TILE;
+    static int rect_x[VIZ_MAX_RECTS], rect_y[VIZ_MAX_RECTS], rect_w[VIZ_MAX_RECTS], rect_h[VIZ_MAX_RECTS];
+    int nr = 0, ndirty = 0, prev_lo = 0, prev_hi = 0;
+    size_t len = 0;
 
     pthread_mutex_lock(&viz.fb_mutex);
 
-    unsigned char head[4];
-    unsigned char rect[12];
-
-    /* FramebufferUpdate header */
-    vnc_write_u8(head + 0, 0);
-    vnc_write_u8(head + 1, 0);
-    vnc_write_u16_be(head + 2, 1); /* one rectangle */
-
-    if (viz_send_full(viz.client_fd, head, 4) < 0) {
-        pthread_mutex_unlock(&viz.fb_mutex);
-        viz_vnc_disconnect();
-        return;
-    }
-
-    /* Rectangle header */
-    vnc_write_u16_be(rect + 0, 0);
-    vnc_write_u16_be(rect + 2, 0);
-    vnc_write_u16_be(rect + 4, (uint16_t)viz.width);
-    vnc_write_u16_be(rect + 6, (uint16_t)viz.height);
-    vnc_write_u32_be(rect + 8, 0); /* Raw encoding */
-
-    if (viz_send_full(viz.client_fd, rect, 12) < 0) {
-        pthread_mutex_unlock(&viz.fb_mutex);
-        viz_vnc_disconnect();
-        return;
-    }
-
-    /* Send row by row, converting BGRA -> RGBX.
-     * Our framebuffer: BGRA (B at lowest addr, A at highest).
-     * VNC little-endian 32bpp: BGRX (B at lowest addr).
-     * So we need to swap R and B, and zero the alpha. */
-    unsigned char *row_buf = (unsigned char *)malloc((size_t)viz.width * 4);
-    if (!row_buf) {
-        pthread_mutex_unlock(&viz.fb_mutex);
-        return;
-    }
-
-    int ok = 1;
-    for (int y = 0; y < viz.height && ok; y++) {
-        unsigned char *src = viz.framebuffer + (size_t)y * viz.width * 4;
-        for (int x = 0; x < viz.width; x++) {
-            /* Source: B G R A -> Dest: B G R X (but VNC expects RGB in LE = BGRX)
-             * Our BGRA: src[x*4+0]=B, src[x*4+1]=G, src[x*4+2]=R, src[x*4+3]=A
-             * VNC RGBX LE: buf[x*4+0]=B, buf[x*4+1]=G, buf[x*4+2]=R, buf[x*4+3]=0
-             * So it's already in the right order! Just zero the alpha. */
-            row_buf[x * 4 + 0] = src[x * 4 + 0]; /* B */
-            row_buf[x * 4 + 1] = src[x * 4 + 1]; /* G */
-            row_buf[x * 4 + 2] = src[x * 4 + 2]; /* R */
-            row_buf[x * 4 + 3] = 0;              /* X */
+    /* 1. dirty tiles inside the requested region */
+    for (int ty = 0; ty < tcy; ty++)
+        for (int tx = 0; tx < tcx; tx++) {
+            int x0 = tx * VIZ_TILE, y0 = ty * VIZ_TILE;
+            int x1 = x0 + VIZ_TILE < W ? x0 + VIZ_TILE : W, y1 = y0 + VIZ_TILE < H ? y0 + VIZ_TILE : H;
+            unsigned char d = 0;
+            if (x1 > rx0 && x0 < rx1 && y1 > ry0 && y0 < ry1) {
+                if (viz.fbu_full) d = 1;
+                else
+                    for (int y = y0; y < y1 && !d; y++) {
+                        const unsigned char *a = viz.framebuffer + ((size_t)y * W + x0) * 4;
+                        const unsigned char *b = viz.shadow      + ((size_t)y * W + x0) * 4;
+                        for (int x = 0; x < x1 - x0; x++)
+                            if (viz_px(a + x * 4) != viz_px(b + x * 4)) { d = 1; break; }
+                    }
+            }
+            viz.dirty[ty * tcx + tx] = d;
+            ndirty += d;
         }
+    if (!ndirty) { pthread_mutex_unlock(&viz.fb_mutex); return 0; }   /* idle: send nothing */
 
-        if (viz_send_full(viz.client_fd, row_buf, (size_t)viz.width * 4) < 0) {
-            ok = 0;
+    /* 2. merge: horizontal runs per tile row, then extend vertically when the
+     *    previous row had a run with identical x-extent. */
+    for (int ty = 0; ty < tcy; ty++) {
+        int lo = nr;
+        for (int tx = 0; tx < tcx; ) {
+            if (!viz.dirty[ty * tcx + tx]) { tx++; continue; }
+            int tx2 = tx; while (tx2 < tcx && viz.dirty[ty * tcx + tx2]) tx2++;
+            int x0 = tx * VIZ_TILE, x1 = tx2 * VIZ_TILE < W ? tx2 * VIZ_TILE : W;
+            int y0 = ty * VIZ_TILE, y1 = y0 + VIZ_TILE < H ? y0 + VIZ_TILE : H;
+            if (x0 < rx0) x0 = rx0;
+            if (x1 > rx1) x1 = rx1;
+            if (y0 < ry0) y0 = ry0;
+            if (y1 > ry1) y1 = ry1;
+            int merged = 0;
+            for (int k = prev_lo; k < prev_hi; k++)
+                if (rect_x[k] == x0 && rect_w[k] == x1 - x0 && rect_y[k] + rect_h[k] == y0) {
+                    rect_h[k] += y1 - y0; merged = 1; break;
+                }
+            if (!merged && nr < VIZ_MAX_RECTS) {
+                rect_x[nr] = x0; rect_y[nr] = y0; rect_w[nr] = x1 - x0; rect_h[nr] = y1 - y0; nr++;
+            } else if (!merged) {            /* out of slots: fall back to one bounding rect */
+                nr = 1; rect_x[0] = rx0; rect_y[0] = ry0; rect_w[0] = rx1 - rx0; rect_h[0] = ry1 - ry0;
+                ty = tcy; break;
+            }
+            tx = tx2;
         }
+        prev_lo = lo; prev_hi = nr;
     }
 
-    free(row_buf);
-    pthread_mutex_unlock(&viz.fb_mutex);
-
-    if (!ok) {
-        viz_vnc_disconnect();
-        return;
+    /* 3. encode everything into the single tx buffer, update shadow */
+    unsigned char *o = viz.txbuf;
+    *o++ = 0; *o++ = 0; vnc_write_u16_be(o, (uint16_t)nr); o += 2;
+    for (int i = 0; i < nr; i++) {
+        vnc_write_u16_be(o + 0, (uint16_t)rect_x[i]); vnc_write_u16_be(o + 2, (uint16_t)rect_y[i]);
+        vnc_write_u16_be(o + 4, (uint16_t)rect_w[i]); vnc_write_u16_be(o + 6, (uint16_t)rect_h[i]);
+        vnc_write_u32_be(o + 8, viz.enc_hextile ? 5u : 0u);
+        o += 12;
+        o = viz.enc_hextile ? viz_enc_hextile(o, viz.framebuffer, W, rect_x[i], rect_y[i], rect_w[i], rect_h[i])
+                            : viz_enc_raw    (o, viz.framebuffer, W, rect_x[i], rect_y[i], rect_w[i], rect_h[i]);
+        for (int y = rect_y[i]; y < rect_y[i] + rect_h[i]; y++)
+            memcpy(viz.shadow + ((size_t)y * W + rect_x[i]) * 4,
+                   viz.framebuffer + ((size_t)y * W + rect_x[i]) * 4, (size_t)rect_w[i] * 4);
     }
+    len = (size_t)(o - viz.txbuf);
+    pthread_mutex_unlock(&viz.fb_mutex);        /* never block on the socket while holding it */
 
-    atomic_store_explicit(&viz.update_requested, 0, memory_order_release);
+    viz.fbu_pending = 0; viz.fbu_full = 0;
+    if (viz_send_full(viz.client_fd, viz.txbuf, len) < 0) { viz_vnc_disconnect(); return 0; }
+    viz.net_bytes += len; viz.net_updates++; viz.net_rects += (unsigned)nr;
+    return 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1279,7 +1471,8 @@ static void *viz_vnc_thread_func(void *arg) {
     viz_set_nonblocking(viz.listen_fd);
 
     double last_update = 0.0;
-    const double update_interval = 0.2; /* 5 Hz max update rate */
+    const double update_interval = 0.1; /* 10 Hz max; idle => nothing is sent at all */
+    const int viz_netstat_enabled = getenv("PICOLM_VIZ_NETSTAT") != NULL;
 
     last_update = viz_mono_time();
 
@@ -1316,24 +1509,31 @@ static void *viz_vnc_thread_func(void *arg) {
             }
         }
 
-        /* Render and send frame at controlled rate */
+        /* Render only when data changed; send only when the client asked AND
+         * something is different.  Idle => no render, no bytes. */
         double current = viz_mono_time();
 
         if (current - last_update >= update_interval) {
             last_update = current;
-
-            /* Always re-render the framebuffer (even without client, cheap enough) */
-            /* Actually, only render if we have a connected client or need to update */
             int has_client = (viz.client_fd > 0 && viz.state == 3);
 
             if (has_client) {
-                /* Render into framebuffer under mutex */
-                pthread_mutex_lock(&viz.fb_mutex);
-                viz_render_heatmap();
-                pthread_mutex_unlock(&viz.fb_mutex);
+                unsigned g = atomic_load_explicit(&viz_ring.gen, memory_order_acquire);
+                if (g != viz.rendered_gen ||
+                    atomic_exchange_explicit(&viz.update_requested, 0, memory_order_acq_rel)) {
+                    pthread_mutex_lock(&viz.fb_mutex);
+                    viz_render_heatmap();
+                    pthread_mutex_unlock(&viz.fb_mutex);
+                    viz.rendered_gen = g;
+                }
+                viz_vnc_send_update();
 
-                /* Send to client */
-                viz_vnc_send_framebuffer();
+                if (viz_netstat_enabled && current - viz.net_t0 >= 2.0) {
+                    fprintf(stderr, "[VIZ] net: %.1f KB/s  (%u updates, %u rects, %s)\n",
+                            (double)viz.net_bytes / 1024.0 / (current - viz.net_t0),
+                            viz.net_updates, viz.net_rects, viz.enc_hextile ? "hextile" : "raw");
+                    viz.net_bytes = 0; viz.net_updates = viz.net_rects = 0; viz.net_t0 = current;
+                }
             }
         }
 
@@ -1388,6 +1588,7 @@ int viz_init(int width, int height, int port) {
     viz.global_max = 1.0f;
     viz.display_mode = 0;
     viz.scroll_offset = 0;
+    atomic_store(&viz.norm_mode, 1);   /* per-layer contrast by default */
 
     /* Initialize skip flags to 0 (not skipped) */
     for (int i = 0; i < VIZ_MAX_LAYERS; i++)
@@ -1403,13 +1604,27 @@ int viz_init(int width, int height, int port) {
         return -1;
     }
     memset(viz.framebuffer, 0, (size_t)width * height * 4);
+    viz.shadow = (unsigned char *)calloc((size_t)width * height, 4);
+    viz.dirty  = (unsigned char *)malloc((size_t)((width + 15) / 16) * (size_t)((height + 15) / 16));
+    viz.txcap  = (size_t)width * height * 5 + 262144;   /* raw worst case + headers; hextile <= raw+1.5% */
+    viz.txbuf  = (unsigned char *)malloc(viz.txcap);
+    viz.fbu_full = 1;
+    if (!viz.shadow || !viz.dirty || !viz.txbuf) {
+        fprintf(stderr, "[VIZ] Failed to allocate transport buffers\n");
+        return -1;
+    }
 
     /* Initialize ring buffer */
-    atomic_store(&viz_ring.write_pos, 0);
-    atomic_store(&viz_ring.render_pos, 0);
-    atomic_store(&viz_ring.token_count, 0);
-    atomic_store(&viz_ring.token_boundaries, 0);
+    viz_ring_reset();
     viz_ring.n_layers = 0;
+    {   /* optional fixed color scale (disables auto-calibration) */
+        const char *lo = getenv("PICOLM_VIZ_LO"), *hi = getenv("PICOLM_VIZ_HI");
+        if (lo && hi && atof(lo) > 0 && atof(hi) > atof(lo)) {
+            viz.glo = log10f((float)atof(lo)); viz.ghi = log10f((float)atof(hi));
+            for (int l = 0; l < VIZ_MAX_LAYERS; l++) { viz.lo[l] = viz.glo; viz.hi[l] = viz.ghi; }
+            viz.fixed_scale = 1; viz.cal_valid = 1;
+        }
+    }
 
     /* Initialize mutex */
     pthread_mutex_init(&viz.fb_mutex, NULL);
@@ -1484,6 +1699,7 @@ int viz_init(int width, int height, int port) {
     }
 
 
+    atomic_store(&viz_ring.active, 1);
     fprintf(stderr, "[VIZ] Visualization initialized: %dx%d on port %d\n",
             width, height, port);
     fprintf(stderr, "[VIZ] Connect with: vncviewer %s:%d\n",
@@ -1506,6 +1722,7 @@ void viz_set_model_info(int n_layers, int n_embd, const char *name) {
 void viz_free(void) {
     /* 1. Signal the VNC thread to stop. */
     atomic_store_explicit(&viz.running, 0, memory_order_release);
+    atomic_store(&viz_ring.active, 0);
 
     /* 2. Wake the thread if it's blocked in select() by writing a spurious byte
      * to the listen socket. The thread checks `running` each loop iteration. */
@@ -1525,6 +1742,9 @@ void viz_free(void) {
         free(viz.framebuffer);
         viz.framebuffer = NULL;
     }
+    free(viz.shadow); viz.shadow = NULL;
+    free(viz.dirty);  viz.dirty  = NULL;
+    free(viz.txbuf);  viz.txbuf  = NULL;
     pthread_mutex_destroy(&viz.fb_mutex);
 
     if (viz.listen_fd >= 0) {

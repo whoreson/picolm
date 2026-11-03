@@ -2454,7 +2454,7 @@ static float *model_forward_gpt2(model_t *m, int token, int pos) {
         }
         vec_add(s->x, s->xb, dim);
 #ifdef PICOLM_VIZ
-        viz_push_layer(l, s->x, dim);
+        viz_push_row(l, pos, s->x, dim);
 #endif
         BENCH_LAYER_END(l, 0);
 
@@ -2697,7 +2697,7 @@ static float *model_forward_gptneox(model_t *m, int token, int pos) {
         }
 
 #ifdef PICOLM_VIZ
-        viz_push_layer(l, s->x, dim);
+        viz_push_row(l, pos, s->x, dim);
 #endif
         BENCH_LAYER_END(l, 0);
     }
@@ -2878,7 +2878,7 @@ float *model_forward(model_t *m, int token, int pos) {
         if (viz_layer_skip(l)) {
             /* Pass through: residual stays unchanged, no computation */
 #ifdef PICOLM_VIZ
-            viz_push_layer(l, s->x, dim);
+            viz_push_row(l, pos, s->x, dim);
 #endif
             BENCH_LAYER_END(l, 0);
             continue;
@@ -2897,7 +2897,7 @@ float *model_forward(model_t *m, int token, int pos) {
 #endif
             steer_hook(l, s->x, 1, dim, pos);
 #ifdef PICOLM_VIZ
-            viz_push_layer(l, s->x, dim);
+            viz_push_row(l, pos, s->x, dim);
 #endif
             BENCH_LAYER_END(l, 0);
             continue;
@@ -3340,7 +3340,7 @@ ffn_done:
                     l, pos, s->x[0],s->x[1],s->x[2],s->x[3],s->x[4],s->x[5],s->x[6],s->x[7]);
         }
 #ifdef PICOLM_VIZ
-        viz_push_layer(l, s->x, dim);
+        viz_push_row(l, pos, s->x, dim);
 #endif
         BENCH_LAYER_END(l, 0);
     }
@@ -4108,7 +4108,7 @@ static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_to
                     x_batch[(n_tokens-1)*dim+2], x_batch[(n_tokens-1)*dim+3]);
         }
 #ifdef PICOLM_VIZ
-        viz_push_layer(l, x_batch + (n_tokens - 1) * dim, dim);
+        viz_push_batch(l, start_pos, x_batch, n_tokens, dim);
 #endif
         if (_PICOLM_DBG_RUNTIME && (l < 3 || l == c->n_layers - 1)) {
             fprintf(stderr, "[CPU PFX l=%d] bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n",
@@ -4537,7 +4537,7 @@ static float *model_forward_prefill_gptneox(model_t *m, const int *tokens, int n
         }
 
 #ifdef PICOLM_VIZ
-        viz_push_layer(l, x_batch + (n_tokens - 1) * dim, dim);
+        viz_push_batch(l, start_pos, x_batch, n_tokens, dim);
 #endif
         BENCH_LAYER_END(l, 1);
     }
@@ -4785,7 +4785,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         if (viz_layer_skip(l)) {
             /* Pass through: batch stays unchanged, no computation */
 #ifdef PICOLM_VIZ
-            viz_push_layer(l, x_batch + (n_tokens - 1) * dim, dim);
+            viz_push_batch(l, start_pos, x_batch, n_tokens, dim);
 #endif
             BENCH_LAYER_END(l, 1);
             continue;
@@ -4821,8 +4821,8 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
             }
             steer_hook(l, x_batch, n_tokens, dim, start_pos);
 #ifdef PICOLM_VIZ
-            /* Push the last token in the batch for visualization */
-            viz_push_layer(l, x_batch + (n_tokens - 1) * dim, dim);
+            /* Push every token of the batch (rows = absolute positions) */
+            viz_push_batch(l, start_pos, x_batch, n_tokens, dim);
 #endif
             BENCH_LAYER_END(l, 1);
             continue;
@@ -5304,7 +5304,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         /* Per-layer RMS tracking (debug only, disabled) */
         /* if ((l % 5 == 0 || l >= c->n_layers - 3) && n_tokens == 1) { ... } */
 #ifdef PICOLM_VIZ
-        viz_push_layer(l, x_batch + (n_tokens - 1) * dim, dim);
+        viz_push_batch(l, start_pos, x_batch, n_tokens, dim);
 #endif
         if (_PICOLM_DBG_RUNTIME && (l < 3 || l == c->n_layers - 1)) {
             int lt = n_tokens - 1;

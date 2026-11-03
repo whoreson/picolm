@@ -1343,7 +1343,7 @@ float *model_forward_glm5(model_t *m, int token, int pos)
                 for (int i = 0; i < S; i++) acc += s->glm5.hc_x[i*D + d];
                 s->glm5.cur[d] = acc * inv_s;
             }
-            viz_push_layer(il, s->glm5.cur, D);
+            viz_push_row(il, pos, s->glm5.cur, D);
         }
 #endif
     }

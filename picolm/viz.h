@@ -48,18 +48,34 @@ extern "C" {
  * Call once after model loading.                                      */
 int  viz_init(int width, int height, int port);
 
-/* Push per-layer activation data into the ring buffer.
+/* Push one token's residual stream after `layer` (decode path).
+ * `pos` is the ABSOLUTE token position (same index used for the KV cache).
+ * Cheap no-op unless viz_init() succeeded.                            */
+void viz_push_row(int layer, int pos, const float *data, int n_embd);
+
+/* Push a whole prefill batch: `x_batch` is [n_tokens][n_embd] row-major,
+ * row i = absolute position start_pos+i, the residual after `layer`.
+ * Prefill advances the whole batch one layer at a time, so call this once
+ * per layer.  Only the newest VIZ_TOKEN_RING rows are used.           */
+void viz_push_batch(int layer, int start_pos, const float *x_batch, int n_tokens, int n_embd);
+
+/* Write the current frame to a PPM file (debug/test; also PICOLM_VIZ_DUMP). */
+int  viz_snapshot_ppm(const char *path);
+
+/* Debug/test: RMS of the stored (layer,pos) activation, or -1 if absent. */
+float viz_peek(int layer, int pos);
+
+/* [deprecated] Push per-layer activation data into the ring buffer.
  * Called from the inference thread, once per layer per token.
  * `layer` is the layer index (0-based).
  * `data` points to `n_embd` floats (the residual stream after the layer).
  * `n_embd` is the embedding dimension.
  * This function is lock-free and never blocks.                        */
-void viz_push_layer(int layer, const float *data, int n_embd);
 
 /* Mark the start of a new token's forward pass.
  * Signals the renderer that the previous token's columns are complete
  * and a new group begins.                                             */
-void viz_new_token(void);
+void viz_new_token(void); /* deprecated no-op: positions are explicit now */
 
 /* Set global metadata (called once during init).                      */
 void viz_set_model_info(int n_layers, int n_embd, const char *name);
