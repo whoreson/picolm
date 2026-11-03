@@ -204,6 +204,34 @@ jobs:
             echo "      coverage comes from 'make check-rowinterleave' only."
           fi
 
+      # --------------------------------------------------------------------
+      # The prefill smoke test below runs on a model that ACTUALLY CONTAINS
+      # interleaved (type 220) tensors, so it reaches the R4 GEMM and the R8
+      # repack. The stock stories260K-Q2_K is f32/f16/q4_0/q8_0 only, so a
+      # green prefill test on it proves nothing about those kernels -- which is
+      # how both IQ4_NL_R4 bugs passed CI.
+      #
+      # needs stories260K-f32.gguf (not vendored) + llama-quantize, so it is
+      # allowed to skip when they are absent. The type histogram is always
+      # printed, so "skipped" is visible rather than silent.
+      # --------------------------------------------------------------------
+      - name: Build R4 smoke model (stories260K with type 220)
+        id: r4model
+        working-directory: ./picolm
+        run: |
+          if [ ! -f "$HOME/llm/stories260K-f32.gguf" ] ||              [ ! -x "$HOME/iklcpp-2026-10-28/llama-quantize" ]; then
+            echo "SKIP: stories260K-f32.gguf or llama-quantize not available"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          make stories-r4-model
+          echo "available=true" >> "$GITHUB_OUTPUT"
+
+      - name: Verify R4 smoke model (contains R4 AND is coherent)
+        if: steps.r4model.outputs.available == 'true'
+        working-directory: ./picolm
+        run: make check-r4-model
+
       - name: Smoke test -- generation
         working-directory: ./picolm
         run: |
@@ -220,13 +248,31 @@ jobs:
       - name: Smoke test -- large prefill prompt
         working-directory: ./picolm
         run: |
-          timeout 60 ./picolm ../models/stories260K-Q2_K.gguf \
-            -c 256 -n 160 -t 0 \
+          # Prefer the R4 model when it was built: same prompt, same expected
+          # text, but it actually exercises the interleaved kernels.
+          MODEL="../models/stories260K-Q2_K.gguf"
+          if [ "${{ steps.r4model.outputs.available }}" = "true" ] && \
+             [ -f /tmp/stories260K-r4.gguf ]; then
+            MODEL="/tmp/stories260K-r4.gguf"
+          fi
+          echo "prefill model: $MODEL"
+          # Expected text differs per model: a different quantisation of the
+          # same weights takes a different (equally valid) greedy path, so
+          # asserting one model's text against the other's is a false failure.
+          # Keep "where it starts" common and pin the rest per model.
+          if [ "$MODEL" = "/tmp/stories260K-r4.gguf" ]; then
+            NEED1="little girl named Lily"
+            NEED2="play with her toys and her mommy"
+          else
+            NEED1="little girl named Lily"
+            NEED2="shiny piece of pieces"
+          fi
+          timeout 60 ./picolm "$MODEL" -c 256 -n 160 -t 0 \
             -p "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\nOnce upon a time" \
             2>&1 | tee /tmp/picolm_prefill.txt
           if grep -q "tok/s" /tmp/picolm_prefill.txt && \
-             grep -q "little girl named Lily" /tmp/picolm_prefill.txt && \
-             grep -q "shiny piece of pieces" /tmp/picolm_prefill.txt; then
+             grep -q "$NEED1" /tmp/picolm_prefill.txt && \
+             grep -q "$NEED2" /tmp/picolm_prefill.txt; then
             echo "PASS: Large prefill generation completed with expected output"
           else
             echo "FAIL: Large prefill output mismatch"
