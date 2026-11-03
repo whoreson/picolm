@@ -50,3 +50,12 @@ test_q6_k_r4
 main.log
 *.orig
 *.rej
+
+# scalar reference binary + its scratch build dir (make build-scalar-ref)
+picolm_scalar
+build-scalar/
+
+# standalone test binaries
+test_rowinterleave
+test_quant
+test_q6_k_r4
