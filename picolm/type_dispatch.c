@@ -299,7 +299,11 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
         .act_fmt = ACT_FMT_Q8_K,
         .rows_per_block = 1,
         .fn_gemv = gemv_q6_K,
+#if defined(__AVX2__)
+        .fn_gemm = sgemm_q6_k_q8_k_best,   /* decode-once R8 GEMM (VNNI/AVX2) for big shapes, per-column dot otherwise */
+#else
         .fn_gemm = NULL,
+#endif
         .has_qgemm_d = 0,
         .fn_dequant_single = NULL,
         .needs_qx = 1,
@@ -311,7 +315,11 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
         .act_fmt = ACT_FMT_Q8_K,
         .rows_per_block = 1,
         .fn_gemv = gemv_q3_K,
+#if defined(__AVX2__)
+        .fn_gemm = sgemm_q3_k_q8_k_best,   /* decode-once R8 GEMM (VNNI/AVX2) for big shapes, per-column dot otherwise */
+#else
         .fn_gemm = NULL,
+#endif
         .has_qgemm_d = 0,
         .fn_dequant_single = NULL,
         .needs_qx = 1,

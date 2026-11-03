@@ -1504,6 +1504,12 @@ int sgemm_iq6_k_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void
                          float *out, size_t bs, int ith, int nth);   /* VNNI variant; returns 0 if unavailable */
 int sgemm_iq4_xs_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);  /* IQ4_XS decode-once, AVX2 */
 int sgemm_iq4_xs_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);  /* AVX-512 VNNI+VL; 0 if unavailable */
+int sgemm_q6_k_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_q6_k_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_q3_k_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_q3_k_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_q6_k_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);   /* table fn_gemm: always computes the full share */
+int sgemm_q3_k_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
 int sgemm_iq6_k_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy,
                           float *out, size_t bs, int ith, int nth);   /* r8t when worthwhile, else tile kernel; always computes */
 /* IQ6_K plain x Q8_K ARM NEON GEMV/GEMM. */

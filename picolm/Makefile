@@ -1093,3 +1093,7 @@ bench_qgemm: bench_qgemm.c quant.c type_dispatch.c tensor.c $(SGEMM_SRCS) quant.
 # usage: ./bench_iq6k_gemm check ;  ./bench_iq6k_gemm 14336 512 4096 3 24
 bench_iq6k_gemm: bench_iq6k_gemm.c quant.c type_dispatch.c tensor.c $(SGEMM_SRCS) quant.h
 	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O3 -o $@ bench_iq6k_gemm.c quant.c type_dispatch.c tensor.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
+
+# K-quant baseline and Q6_K/Q3_K table-GEMM check: ./bench_kq [m n k reps] ;  ./bench_kq check
+bench_kq: bench_kq.c quant.c type_dispatch.c tensor.c $(SGEMM_SRCS) quant.h sgemm.h
+	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O3 -o $@ bench_kq.c quant.c type_dispatch.c tensor.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
