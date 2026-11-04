@@ -2311,29 +2311,51 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
                 _mm512_storeu_ps(acc_row + 96, a6);
                 _mm512_storeu_ps(acc_row + 112, a7);
             } else {
-                /* Generic path for hd != 128 (e.g. hd=64, 96, 128, 256).
-                 * n_blks can be up to 16 (hd=256), so the accumulator array
-                 * must be sized for that -- capping it at 8 silently skipped
-                 * dims 128..255 for hd > 128 (hd=256 scored only half of
-                 * every V row). */
+                /* Generic path for hd != 128 (e.g. hd=8, 48, 64, 96, 256).
+                 *
+                 * n_full = number of COMPLETE 16-float blocks. It must be
+                 * hd/16, not ceil(hd/16): the old ceil() rounded hd=8 up to
+                 * one block, so this loop loaded and stored 16 floats at
+                 * acc_row[0..15] -- 8 floats past the end of the row. With
+                 * head_dim=8 that overrun is not a stack scratch detail: in
+                 * batch_tiled_task the rows of `acc` (and of `q_rows`, which
+                 * follows it) are packed 8 floats apart, so each row's
+                 * "block" clobbered the NEXT query row's accumulator, and
+                 * the last row of the task walked off the end of the pool
+                 * slot into the adjacent task's scratch. Symptom: every
+                 * AVX-512 build (default `make`) with head_dim < 16 -- or
+                 * any head_dim not a multiple of 16 -- produced wrong
+                 * prefill attention, and the final v_tile scalar tail then
+                 * re-added the (already clobbered) dims, so the damage was
+                 * silent: no crash, no NaN, just a different string.
+                 * AVX2/NEON/scalar never take this branch, which is why
+                 * `make scalar` and CI's avx2 job disagreed with the
+                 * default AVX-512 build only on the tiled (long) prefill. */
                 const int D_BLK = 16;
-                int n_blks = (hd + D_BLK - 1) / D_BLK;
-                if (n_blks > 16) n_blks = 16;
-                __m512 accv[16];
-                for (int db = 0; db < n_blks; db++)
-                    accv[db] = _mm512_loadu_ps(acc_row + db * D_BLK);
-                for (int j = 0; j < ts; j++) {
-                    __m512 wv = _mm512_set1_ps(tile_exp_buf[j]);
-                    const float *vj = v_tile + (size_t)j * hd;
+                const int n_full = hd / D_BLK;      /* complete blocks only */
+                if (n_full > 0) {
+                    /* Cap at 16 blocks = 256 floats; larger head_dims fall
+                     * through to the scalar tail below for the remainder. */
+                    const int n_blks = n_full > 16 ? 16 : n_full;
+                    __m512 accv[16];
                     for (int db = 0; db < n_blks; db++)
-                        accv[db] = _mm512_fmadd_ps(_mm512_loadu_ps(vj + db * D_BLK), wv, accv[db]);
+                        accv[db] = _mm512_loadu_ps(acc_row + db * D_BLK);
+                    for (int j = 0; j < ts; j++) {
+                        __m512 wv = _mm512_set1_ps(tile_exp_buf[j]);
+                        const float *vj = v_tile + (size_t)j * hd;
+                        for (int db = 0; db < n_blks; db++)
+                            accv[db] = _mm512_fmadd_ps(_mm512_loadu_ps(vj + db * D_BLK), wv, accv[db]);
+                    }
+                    for (int db = 0; db < n_blks; db++)
+                        _mm512_storeu_ps(acc_row + db * D_BLK, accv[db]);
                 }
-                for (int db = 0; db < n_blks; db++)
-                    _mm512_storeu_ps(acc_row + db * D_BLK, accv[db]);
             }
-            /* Scalar tail for hd % 16 != 0 */
+            /* Scalar tail for hd % 16 != 0 (and for the part of hd beyond
+             * 256 floats). Must start at the last COMPLETE block boundary,
+             * i.e. min(hd/16,16)*16. */
             {
                 int d = (hd / 16) * 16;
+                if (d > 256) d = 256;
                 for (; d < hd; d++) {
                     float a = acc_row[d];
                     for (int j = 0; j < ts; j++)

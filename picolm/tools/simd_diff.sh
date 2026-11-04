@@ -95,6 +95,14 @@ echo
 compare "short prompt ($NTOK tok)"            "$SHORT" "$NTOK"
 compare "long prompt, small batch (8 tok)"    "$LONG" 8
 compare "long prefill ($NTOK tok)"            "$LONG" "$NTOK"
+# Long prefill again, past the tiled-attention size gate. The gate needs
+# >= 2*ATTN_TILE (128) prefill tokens, so the prompts above (137 tokens with
+# a 24-token budget) always took the TILED path -- but 24 generated tokens is
+# enough for a GENERATION-time divergence to be masked. It is the
+# prefill that decides the first token, but a longer budget is cheaper than
+# debating it -- the AVX-512 head_dim<16 accumulator overrun (see
+# attn_process_tile) kept diverging well past the first token.
+compare "long prefill + long decode (96 tok)"  "$LONG" 96
 
 echo
 if [ "$fail" -eq 0 ]; then

@@ -826,6 +826,20 @@ test_rowinterleave: tests/test_rowinterleave.c quant.c $(SGEMM_SRCS)
 test_swa: tests/test_swa.c model_attention.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS)
 	$(CC) $(CFLAGS) -I. -O2 -o $@ tests/test_swa.c model_attention.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
 
+# Tiled-attention acc-update tail, for every head_dim (model-free, all ISAs).
+# Pins the contract that attn_process_tile()'s acc += exp@V update touches
+# exactly [acc_row, acc_row+head_dim) and nothing else. The AVX-512 branch
+# used ceil(hd/16) blocks, so head_dim=8 wrote 16 floats per 8-float row and
+# clobbered the next query row's accumulator -- silently, and only on the
+# default `make` build. CI builds avx2, so this must not depend on AVX-512
+# being present: the sentinel check fails on any ISA that overruns.
+test_attn_tiled_tail: tests/test_attn_tiled_tail.c
+	$(CC) $(CFLAGS) $(TEST_NATIVE_CFLAGS) -I. -O2 -o $@ $< -lm
+
+.PHONY: check-attn-tail
+check-attn-tail: test_attn_tiled_tail
+	./test_attn_tiled_tail
+
 test_attn_tiled: tests/test_attn_tiled.c model_attention.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS)
 	$(CC) $(CFLAGS) -I. -O2 -o $@ tests/test_attn_tiled.c model_attention.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
 
@@ -932,6 +946,7 @@ check-rowinterleave: test_rowinterleave
 # (scalar) picolm, which would clash with check-all-san's sanitizer build and
 # roughly double check-all's cost. CI runs it as its own step.
 check-all: check-hreduce check-kvcache-tokwrite check-quant check-q6-k-r4 \
+           check-attn-tail \
            check-rowinterleave \
            check-glm5-dsa check-glm5-snapshot check-attn check-attn-decode check-pool
 	@echo ""
