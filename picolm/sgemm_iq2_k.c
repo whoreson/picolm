@@ -214,7 +214,7 @@ void convert_iq2_k_to_q8_k_r8(int n, const void *vx, size_t bx,
                  * qs pointer advances 32 bytes every 4 subblocks (shift wraps).
                  * extra bit 2*ib32 -> LUT+4 for values 0-15,
                  * extra bit 2*ib32+1 -> LUT+4 for values 16-31. */
-                int16_t prod[256] __attribute__((aligned(32)));
+                PICOLM_ALIGNED(32) int16_t prod[256];
                 uint16_t extra = blk->extra;
                 const uint8_t *qsrc = blk->qs;
                 int shift = 0;

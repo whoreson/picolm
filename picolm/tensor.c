@@ -464,7 +464,11 @@ static volatile int    pool_nworkers = 0;
  * generic dispatch. tensor_parallel_for* use ONE global task table, so a nested call (e.g. an attention
  * worker calling matmul_batch -> batched activation quantization) would corrupt the outer dispatch.
  * A nested call now just runs serially on the calling thread. */
+#if !defined(_WIN32)
 static __thread int tl_in_parallel = 0;
+#else
+static int tl_in_parallel = 0;
+#endif
 
 /* ---- Spin-then-sleep synchronization (replaces broadcast-per-completion) ----
  *
@@ -654,7 +658,11 @@ static int pool_total_threads(int requested);
 /* MSVC, old Mac OS X, OSF/1 Alpha (GCC 3.x) don't support __thread */
 static int             pool_my_tid = 0;
 #else
+#if !defined(_WIN32)
 static __thread int    pool_my_tid = 0;
+#else
+static int             pool_my_tid = 0;
+#endif
 #endif /* TLS: current thread's pool index (0 for main) */
 
 /* Return current thread's pool index (0 for main thread, 1..n-1 for workers) */
@@ -791,7 +799,7 @@ static void matmul_worker_f(matmul_task_t *t) {
             /* Special case: IQ4_NL uses shadow Q8_0 conversion */
             else if (t->qtype == GGUF_TYPE_IQ4_NL && t->x_d) {
                 size_t q8_rb = (t->n / 32) * sizeof(block_q8_0);
-                uint8_t shadow_stack[32768] __attribute__((aligned(64)));
+                PICOLM_ALIGNED(64) uint8_t shadow_stack[32768];
                 void *shadow = (q8_rb <= sizeof(shadow_stack)) ? (void *)shadow_stack : malloc(q8_rb);
                 for (int i = t->start; i < t->end; i++) {
                     const char *wrow = t->W + (size_t)i * t->row_bytes;
@@ -2105,8 +2113,13 @@ static void gemm_convert_task(int idx, void *ctxp) {
     this_rows &= ~7;   /* round down to multiple of 8 (Q8_K_R8 interleave) */
     if (this_rows <= 0) return;
     /* Per-thread scratch buffer, grown on demand */
+#if !defined(_WIN32)
     static __thread void *tl_scratch = NULL;
     static __thread size_t tl_scratch_size = 0;
+#else
+    static void *tl_scratch = NULL;
+    static size_t tl_scratch_size = 0;
+#endif
     size_t needed = (size_t)(this_rows / 8) * (c->k / 256) * sizeof(block_q8_k_r8);
     if (tl_scratch_size < needed) {
         free(tl_scratch);
@@ -4087,9 +4100,14 @@ void vec_add(float *a, const float *b, int size) {
  * leftover data. */
 /* Barrier profiling (enabled by PICOLM_BARRIER_PROF env var) */
 static inline double barrier_now(void) {
+#if defined(_WIN32)
+    LARGE_INTEGER f, t; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t);
+    return (double)t.QuadPart / (double)f.QuadPart;
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + ts.tv_nsec * 1e-9;
+#endif
 }
 static int barrier_prof_on = -1;
 static long barrier_dispatch_count;

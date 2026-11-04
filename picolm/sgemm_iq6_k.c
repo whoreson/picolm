@@ -292,7 +292,11 @@ int sgemm_iq6_k_q8_k_avx2(int nrows, int ncols, int k,
 #endif
 
 typedef struct { int8_t *w; int16_t *sc; float *d; size_t w_cap, sc_cap, d_cap; } iq6t_scratch_t;
+#if !defined(_WIN32)
 static __thread iq6t_scratch_t iq6t_tl;
+#else
+static iq6t_scratch_t iq6t_tl;
+#endif
 
 static int iq6t_reserve(int nb) {
     const size_t w = (size_t)nb * 2048, sc = (size_t)nb * 512, d = (size_t)nb * 32;
@@ -372,7 +376,7 @@ static void iq6t_decode_group(const char *wbase, size_t w_row_bytes, int nb, con
  * with ONE 6-bit scale (ls-32) per sub-block. That is two identical 16-value groups in the IQ6_K
  * scratch (int8 weights as R8 vectors, per-16-group scales, 8 fp32 row scales), so only the
  * decode differs and both compute kernels below are reused unchanged. */
-static inline __attribute__((always_inline)) void iq4xs_load_wv(const block_iq4_xs *x, __m256i wv[8]) {
+static inline always_inline void iq4xs_load_wv(const block_iq4_xs *x, __m256i wv[8]) {
     const __m256i lut = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)kvalues_iq4nl));
     const __m128i m15 = _mm_set1_epi8(15);
     for (int k = 0; k < 8; ++k) {
@@ -419,7 +423,7 @@ static void iq4xs_t_decode_group(const char *wbase, size_t w_row_bytes, int nb) 
  *   Q6_K : q = ((ql nibble) | (2 high bits << 4)) - 32, scale = int8 scales[g], natural 16-groups.
  *   Q3_K : q = (2 low bits | (hmask bit << 2)) - 4,     scale = 6-bit packed scale - 32. */
 enum { KQ_Q6K = 2, KQ_Q3K = 3 };
-static inline __attribute__((always_inline)) void kq_load_q6(const block_q6_K *x, __m256i wv[8], int8_t sc[16]) {
+static inline always_inline void kq_load_q6(const block_q6_K *x, __m256i wv[8], int8_t sc[16]) {
     const __m256i m0f = _mm256_set1_epi8(0x0F), m03 = _mm256_set1_epi8(0x03), m32 = _mm256_set1_epi8(32);
     for (int n = 0; n < 2; ++n) {                       /* two 128-value halves */
         const __m256i l0 = _mm256_loadu_si256((const __m256i *)(x->ql + 64 * n));
@@ -434,7 +438,7 @@ static inline __attribute__((always_inline)) void kq_load_q6(const block_q6_K *x
     }
     for (int g = 0; g < 16; ++g) sc[g] = x->scales[g];
 }
-static inline __attribute__((always_inline)) void kq_load_q3(const block_q3_K *x, __m256i wv[8], int8_t sc[16]) {
+static inline always_inline void kq_load_q3(const block_q3_K *x, __m256i wv[8], int8_t sc[16]) {
     const __m256i m03 = _mm256_set1_epi8(0x03), one = _mm256_set1_epi8(1), four = _mm256_set1_epi8(4);
     const __m256i hm = _mm256_loadu_si256((const __m256i *)x->hmask);
     for (int n = 0; n < 2; ++n) {
@@ -482,7 +486,7 @@ static void kq_t_decode_group(int kind, const char *wbase, size_t w_row_bytes, i
     }
 }
 
-static inline __attribute__((always_inline))
+static inline always_inline
 void iq6t_tile(int nb, const char *y0, size_t y_row_bytes, float *out, size_t bs, const int NC) {
     __m256 facc[IQ6T_NCMAX];
 #pragma GCC unroll 8
@@ -582,7 +586,11 @@ int sgemm_q3_k_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void 
 #define IQ6V_NC 8
 
 typedef struct { uint8_t *w; int32_t *sl; float *d; int32_t *cr; size_t w_cap, sl_cap, d_cap, cr_cap; } iq6v_scratch_t;
+#if !defined(_WIN32)
 static __thread iq6v_scratch_t iq6v_tl;
+#else
+static iq6v_scratch_t iq6v_tl;
+#endif
 
 static int iq6v_reserve(int nb, int pc) {
     const size_t w = (size_t)nb * 2048, sl = (size_t)nb * 512, d = (size_t)nb * 32, cr = (size_t)pc * nb * 64;
@@ -684,7 +692,7 @@ static void iq6v_stage_seeds(const char *vy, size_t y_row_bytes, int c0, int pc,
     }
 }
 
-static inline __attribute__((always_inline))
+static inline always_inline
 void iq6v_tile(int nb, const char *y0, size_t y_row_bytes, const int32_t *cr0, float *out, size_t bs, const int NC) {
     __m256 facc[IQ6V_NC];
 #pragma GCC unroll 8

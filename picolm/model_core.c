@@ -103,7 +103,11 @@ static double pp_acc[8], pp_t;
 static const char *const pp_names[8] = {
     "rmsnorm (input)", "Q projection", "K+V projection", "RoPE + KV-cache store (+Q/KV prep)",
     "attention", "output proj + gate + residual", "FFN (norm, gate/up, silu, down, residual)", "other" };
+#if defined(_WIN32)
+static double pp_now(void) { LARGE_INTEGER f, t; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t); return (double)t.QuadPart / (double)f.QuadPart * 1000.0; }
+#else
 static double pp_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1e3 + ts.tv_nsec * 1e-6; }
+#endif
 #define PP_BEGIN() do { if (pp_on < 0) pp_on = getenv("PICOLM_PREFILL_PROF") != NULL; if (pp_on) pp_t = pp_now(); } while (0)
 #define PP_MARK(i) do { if (pp_on) { double _t = pp_now(); pp_acc[i] += _t - pp_t; pp_t = _t; } } while (0)
 static void pp_report(int n_tokens, int n_layers) {
@@ -3329,10 +3333,8 @@ float *model_forward(model_t *m, int token, int pos) {
                 }
                 vec_add(s->x, s->xb, dim);
             }
-#ifdef PICOLM_GPU
-ffn_done:
-#endif
         }
+ffn_done:
         steer_hook(l, s->x, 1, dim, pos);
         /* DEBUG: dump post-layer residual for first few layers */
         if (getenv("PICOLM_DBG_LAYER") && pos <= 4 && l < 3) {
@@ -4297,11 +4299,19 @@ static void batch_add2_task(int idx, void *p) {
 }
 /* Reusable compact copy buffer for the attention output (was a malloc/free of n_tokens*q_dim
  * floats per layer: fresh mmap pages faulted in serially on every layer). */
+#if !defined(_WIN32)
 static float *prefill_attn_out_buf(size_t floats) {
     static __thread float *buf; static __thread size_t cap;
     if (cap < floats) { free(buf); buf = (float *)malloc(floats * sizeof(float)); cap = buf ? floats : 0; }
     return buf;
 }
+#else
+static float *prefill_attn_out_buf(size_t floats) {
+    static float *buf; static size_t cap; // MSVC: no TLS support
+    if (cap < floats) { free(buf); buf = (float *)malloc(floats * sizeof(float)); cap = buf ? floats : 0; }
+    return buf;
+}
+#endif
 
 /* ---- GPTNeoX (Krake v2) batched prefill ----
  * Same as GPT-2 prefill but:

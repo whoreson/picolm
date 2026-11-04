@@ -203,7 +203,7 @@ void vec_dot_iq4_k_r4_q8_k_avx2(const void *vx, const void *wy, int n,
         __m256i i8s2 = _mm256_sub_epi8(
             _mm256_or_si256(sl2, _mm256_and_si256(m30, sh)), m32);
 
-        int8_t stored[64] __attribute__((aligned(32)));
+        PICOLM_ALIGNED(32) int8_t stored[64];
         _mm256_storeu_si256((__m256i *)stored, i8s1);
         _mm256_storeu_si256((__m256i *)(stored + 32), i8s2);
 
@@ -386,7 +386,7 @@ int sgemm_iq4_k_r4_q8_k_avx2(int nrows, int ncols, int k,
             __m256i i8s2 = _mm256_sub_epi8(
                 _mm256_or_si256(sl2, _mm256_and_si256(m30, sh)), m32);
 
-            int8_t stored[64] __attribute__((aligned(32)));
+            PICOLM_ALIGNED(32) int8_t stored[64];
             _mm256_storeu_si256((__m256i *)stored, i8s1);
             _mm256_storeu_si256((__m256i *)(stored + 32), i8s2);
 

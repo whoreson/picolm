@@ -159,7 +159,7 @@ void vec_dot_iq4_xs_q8_k_avx2(const void *vx, const void *wy, int n, float *out)
 /* ---------------------------------------------------------------- GEMM
  * C[ldc * col + row]; A: m rows of k_blocks blocks (row stride lda blocks);
  * B: n rows of k_blocks Q8_K blocks (row stride ldb blocks). */
-static inline __attribute__((always_inline))
+static inline always_inline
 void xs_tile(const block_iq4_xs *arow, const block_q8_K *b0, int ldb, int k_blocks,
              const __m256i lut, const int NC, float *res) {
     __m256 facc[IQ4XS_GEMM_TILE];

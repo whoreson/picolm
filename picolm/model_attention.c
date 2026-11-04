@@ -3,6 +3,9 @@
 #include "quant.h"
 #include "sgemm.h"
 #include "model_internal.h"
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #ifndef _WIN32
 #include <sys/mman.h>
 #include <unistd.h>
@@ -805,7 +808,7 @@ static int ad_use_ref = 0;          /* PICOLM_ATTN_DECODE=ref */
 static int ad_split_on = 1;         /* PICOLM_ATTN_SPLIT=0 disables split-KV */
 static int ad_min_chunk = AD_MIN_SPLIT_CHUNK;
 static int ad_prefetch = 1;         /* PICOLM_ATTN_PF=0 disables sw prefetch */
-static void ad_env_register(void) __attribute__((constructor));
+static void ad_env_register(void) PICOLM_CONSTRUCTOR;
 static void ad_env_register(void) {
     const char *e;
     if ((e = getenv("PICOLM_ATTN_DECODE")) && !strcmp(e, "ref")) ad_use_ref = 1;
@@ -906,7 +909,7 @@ static inline void ad_prefetch_row_l2(const uint8_t *p, size_t bytes) {
  * m_out[g] (log2-domain running max), l_out[g] (sum of weights relative to m),
  * acc_out[g*hd + d]. KVM / FAST are compile-time constants at the specialized
  * call sites (FAST = both caches F16, no dequant scratch needed). */
-static inline __attribute__((always_inline))
+static inline always_inline
 void ad_chunk_impl(const attn_group_ctx_t *ctx, int kv_h, int t0, int t1,
                    float *m_out, float *l_out, float *acc_out,
                    const int KVM, const int FAST) {
@@ -919,7 +922,7 @@ void ad_chunk_impl(const attn_group_ctx_t *ctx, int kv_h, int t0, int t1,
     const int pf = ad_prefetch;
 
     float qs[8 * 256];
-    float s[8][AD_B] __attribute__((aligned(64)));
+    PICOLM_ALIGNED(64) float s[8][AD_B];
     float kbuf[FAST ? 1 : 2 * 256];
     float vbuf[FAST ? 1 : AD_B * 256];
     float corr[8], m[8], l[8];
@@ -1076,8 +1079,13 @@ static void ad_split_task(int idx, void *p) {
     ad_chunk(ctx, kv_h, t0, t1, base, base + 8, base + 16);
 }
 
+#if !defined(_WIN32)
 static __thread float *ad_scratch = NULL;
 static __thread size_t ad_scratch_cap = 0;
+#else
+static float *ad_scratch = NULL;
+static size_t ad_scratch_cap = 0;
+#endif
 #endif /* AD_SIMD */
 
 /* Entry used by tensor_parallel_for over KV heads (also the GPT-2 path). */
@@ -1638,9 +1646,14 @@ static long long attn_timing_ctx_sum = 0;   /* sum of start_pos*n_tokens */
 static int attn_timing_enabled = -1;
 
 static double attn_now_ms(void) {
+#if defined(_WIN32)
+    LARGE_INTEGER f, t; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t);
+    return (double)t.QuadPart / (double)f.QuadPart * 1000.0;
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
+#endif
 }
 
 static void attn_timing_report(void) {
@@ -1652,7 +1665,7 @@ static void attn_timing_report(void) {
             attn_timing_tokens ? attn_timing_total / attn_timing_tokens : 0);
 }
 
-static void attn_timing_register(void) __attribute__((constructor));
+static void attn_timing_register(void) PICOLM_CONSTRUCTOR;
 static void attn_timing_register(void) {
     atexit(attn_timing_report);
 }

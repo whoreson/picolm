@@ -18,6 +18,42 @@
 #define PRId64 "lld"
 #endif
 
+/* MSVC compatibility: GCC-only constructs not available in MSVC's compiler. */
+#ifndef PICOLM_ALIGNED
+#if defined(_MSC_VER)
+#define PICOLM_ALIGNED(N) __declspec(align(N))
+#else
+#define PICOLM_ALIGNED(N) __attribute__((aligned(N)))
+#endif
+#endif
+#ifndef PICOLM_CONSTRUCTOR
+/* GCC: __attribute__((constructor)). MSVC does not support this; empty on
+ * MSVC (register functions are only called explicitly if needed). */
+#if defined(_MSC_VER)
+#define PICOLM_CONSTRUCTOR
+#else
+#define PICOLM_CONSTRUCTOR __attribute__((constructor))
+#endif
+#endif
+/* GCC-only constructs not available in MSVC's compiler. */
+#if defined(_MSC_VER)
+#ifndef ssize_t
+#define ssize_t SSIZE_T
+#endif
+/* off_t is provided by the Windows SDK's sys/types.h on MSVC. */
+#ifndef __thread
+#define __thread
+#endif
+#endif
+/* always_inline: GCC __attribute__((always_inline)) vs MSVC __forceinline. */
+#ifndef always_inline
+#if defined(_MSC_VER)
+#define always_inline __forceinline
+#else
+#define always_inline __attribute__((always_inline))
+#endif
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif

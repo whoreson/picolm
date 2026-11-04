@@ -659,7 +659,7 @@ void repack_q8_0_to_q8_0_r8(const void *src, void *dst, int nrows, int n) {
 #define R8A_FMA(a, b, c) _mm256_add_ps(_mm256_mul_ps((a), (b)), (c))
 #endif
 
-static inline __attribute__((always_inline))
+static inline always_inline
 void r8a_tile(const block_q8_0_r8 *w, const int8_t *yq, const float *ys, int nb,
               float *out, size_t bs, const int NC) {
     __m256 facc[4];
@@ -694,7 +694,11 @@ void r8a_tile(const block_q8_0_r8 *w, const int8_t *yq, const float *ys, int nb,
 }
 
 typedef struct { int8_t *yq; float *ys; block_q8_0_r8 *wr; size_t yq_cap, ys_cap, wr_cap; } r8a_scratch_t;
+#if !defined(_WIN32)
 static __thread r8a_scratch_t r8a_tl;
+#else
+static r8a_scratch_t r8a_tl;
+#endif
 
 static int r8a_reserve(int pc, int nb, int need_wr) {
     const size_t yq = (size_t)pc * nb * 32, ys = (size_t)pc * nb * sizeof(float), wr = need_wr ? (size_t)nb * sizeof(block_q8_0_r8) : 0;
@@ -761,7 +765,7 @@ int sgemm_q8_0_r8_avx2t_q8_0(int nrows, int ncols, int k, const void *vx, const 
  * high nibbles), so after decoding the int8 data is identical to a Q8_0 block's and everything
  * downstream (R8 transpose, tiled VNNI/AVX2 kernels, activation staging) is shared. */
 enum { R8A_T_Q8_0 = 0, R8A_T_Q4_0 = 1, R8A_T_IQ4_NL = 2 };
-static inline __attribute__((always_inline)) __m256i r8a_load_row(const void *blk, const int T) {
+static inline always_inline __m256i r8a_load_row(const void *blk, const int T) {
     if (T == R8A_T_Q8_0) return _mm256_loadu_si256((const __m256i *)((const char *)blk + 2));
     const __m128i v = _mm_loadu_si128((const __m128i *)((const char *)blk + 2));
     const __m128i m = _mm_set1_epi8(15);
@@ -775,7 +779,7 @@ static inline __attribute__((always_inline)) __m256i r8a_load_row(const void *bl
  * byte-for-byte the size of 8 Q8_0 blocks (272B), so this needs only an L2-sized scratch (nb*272B)
  * and no model-format change. The qs part is an 8x8 transpose of 32-bit words: R8 vector j = dword
  * j of each row. */
-static inline __attribute__((always_inline))
+static inline always_inline
 void r8a_repack_impl(const char *A, size_t lda, int g, int nb, block_q8_0_r8 *dst, const int T) {
     const size_t bsz = (T == R8A_T_Q8_0) ? sizeof(block_q8_0) : sizeof(block_q4_0);
     const char *row[8];
@@ -947,7 +951,7 @@ int picolm_sgemm_q8_0_avx2t(int m, int n, int k_blocks, const void *vA, int lda,
 
 #define R8V_PC 96      /* columns per panel: 96*k bytes of u8 activations (384KB at k=4096) */
 
-static inline __attribute__((always_inline))
+static inline always_inline
 void r8v_tile(const block_q8_0_r8 *w, const uint8_t *yu, const float *ys, int nb,
               float *out, size_t bs, const int NC) {
     __m256 facc[12];
@@ -990,7 +994,11 @@ void r8v_tile(const block_q8_0_r8 *w, const uint8_t *yu, const float *ys, int nb
 
 /* per-thread scratch: u8 activation panel, fp32 scales, repacked weight group */
 typedef struct { uint8_t *yu; float *ys; block_q8_0_r8 *wr; size_t yu_cap, ys_cap, wr_cap; } r8v_scratch_t;
+#if !defined(_WIN32)
 static __thread r8v_scratch_t r8v_tl;
+#else
+static r8v_scratch_t r8v_tl;
+#endif
 
 static int r8v_reserve(int pc, int nb, int need_wr) {
     const size_t yu = (size_t)pc * nb * 32, ys = (size_t)pc * nb * sizeof(float), wr = need_wr ? (size_t)nb * sizeof(block_q8_0_r8) : 0;

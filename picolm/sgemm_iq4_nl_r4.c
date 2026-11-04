@@ -157,7 +157,7 @@ void vec_dot_iq4_nl_r4_q8_0_avx2(const void *vx, const void *wy, int n,
 }
 
 /* NC is a compile-time constant at every call site -> accumulators stay in registers. */
-static inline __attribute__((always_inline))
+static inline always_inline
 void iq4r4_gemm_tile(const block_iq4_nl_r4 *wb, const block_q8_0 *a, size_t a_stride_blocks,
                      int nb, const int NC, __m128 res[IQ4R4_GEMM_TILE]) {
     const __m256i lut = iq4r4_lut();

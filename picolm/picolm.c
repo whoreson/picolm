@@ -44,6 +44,12 @@
 #ifndef strdup
 #define strdup _strdup
 #endif
+#ifndef ssize_t
+typedef SSIZE_T ssize_t;
+#endif
+#define read _read
+#define write _write
+#define lseek _lseeki64
 /* POSIX polyfills for Windows */
 #include <stdlib.h>
 #include <stdint.h>
@@ -1923,7 +1929,7 @@ int main(int argc, char **argv) {
                 model_ssm_state_reset(&model);
 #ifdef PICOLM_GPU
                 if (model.gpu.kv_active && model.gpu.device >= 0)
-                    model_ssm_state_reset_gpu(&model, model.gpu.device);
+                    model_ssm_state_reset_gpu(&model);
 #endif
                 start_pos = 0;
             }
