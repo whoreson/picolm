@@ -140,6 +140,7 @@ typedef struct {
     _Atomic int active;          /* 1 once viz_init succeeded (gates all work) */
     _Atomic unsigned gen;        /* bumped on every data change: lets the renderer idle */
     int n_layers;                /* set by viz_set_model_info */
+    int last_end[VIZ_MAX_LAYERS];/* per layer: highest position pushed so far (producer only) */
 } viz_ring_t;
 
 static viz_ring_t viz_ring;
@@ -151,6 +152,7 @@ static void viz_ring_reset(void) {
             atomic_store_explicit(&viz_ring.cells[c][l].pos, -1, memory_order_relaxed);
         }
     atomic_store(&viz_ring.head, -1);
+    for (int l = 0; l < VIZ_MAX_LAYERS; l++) viz_ring.last_end[l] = -1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -495,42 +497,45 @@ static int viz_cell_read(const viz_cell_t *c, int *pos, float *out) {
     return 0;
 }
 
-/* Positions >= `from` are about to be recomputed (KV rewind / new prompt on a
- * reused slot): drop everything newer so stale columns don't linger. */
-static void viz_rewind(int from, int head) {
-    int n = head - from + 1;
-    if (n > VIZ_TOKEN_RING) { from = head - VIZ_TOKEN_RING + 1; }
-    for (int p = from; p <= head; p++) {
-        if (p < 0) continue;
+/* A pass over positions starting at `from` has begun although data at or past
+ * `from` already exists: the KV cache was rewound or a new request started
+ * (server mode).  Invalidate everything >= from in ALL layers right away, so
+ * stale rows never show up next to fresh ones while the new pass fills in.
+ * Detection deliberately does NOT look at cell contents: once the ring has
+ * wrapped, the slot for `from` holds some other position, so a content check
+ * misses the rewind (that was the "all columns black, lay=0/48 forever" bug). */
+static void viz_rewind_all(int from) {
+    for (int c = 0; c < VIZ_TOKEN_RING; c++)
         for (int l = 0; l < VIZ_MAX_LAYERS; l++) {
-            viz_cell_t *c = &viz_ring.cells[p % VIZ_TOKEN_RING][l];
-            if (atomic_load_explicit(&c->pos, memory_order_relaxed) == p)
-                viz_cell_write(c, -1, NULL, 0);
+            viz_cell_t *cell = &viz_ring.cells[c][l];
+            if (atomic_load_explicit(&cell->pos, memory_order_relaxed) >= from)
+                viz_cell_write(cell, -1, NULL, 0);
         }
-    }
+    for (int l = 0; l < VIZ_MAX_LAYERS; l++)
+        if (viz_ring.last_end[l] >= from) viz_ring.last_end[l] = from - 1;
+    if (from == 0)                                   /* new sequence: re-derive the color scale */
+        atomic_store_explicit(&viz.recal_request, 1, memory_order_relaxed);
 }
 
 static void viz_dump_maybe(int pos);
 
-static void viz_push_one(int layer, int pos, const float *data, int n_embd) {
-    viz_cell_t *c = &viz_ring.cells[pos % VIZ_TOKEN_RING][layer];
-    int head = atomic_load_explicit(&viz_ring.head, memory_order_relaxed);
-    int rewound = 0;
-    /* Same (pos,layer) already present => this position is being recomputed. */
-    if (pos <= head && atomic_load_explicit(&c->pos, memory_order_relaxed) == pos) {
-        viz_rewind(pos, head);
-        rewound = 1;
-    }
-    viz_cell_write(c, pos, data, n_embd);
-    if (pos > head || rewound)
-        atomic_store_explicit(&viz_ring.head, pos, memory_order_release);
+/* Common entry for one layer's span of positions [first_pos, last_pos]. */
+static void viz_span_begin(int layer, int first_pos) {
+    if (first_pos <= viz_ring.last_end[layer]) viz_rewind_all(first_pos);
+}
+static void viz_span_end(int layer, int last_pos) {
+    viz_ring.last_end[layer] = last_pos;
+    /* head = end of the most recent push: always the newest position of the pass in progress */
+    atomic_store_explicit(&viz_ring.head, last_pos, memory_order_release);
     atomic_fetch_add_explicit(&viz_ring.gen, 1u, memory_order_release);
 }
 
 void viz_push_row(int layer, int pos, const float *data, int n_embd) {
     if (!atomic_load_explicit(&viz_ring.active, memory_order_relaxed)) return;
     if (layer < 0 || layer >= VIZ_MAX_LAYERS || pos < 0 || !data) return;
-    viz_push_one(layer, pos, data, n_embd);
+    viz_span_begin(layer, pos);
+    viz_cell_write(&viz_ring.cells[pos % VIZ_TOKEN_RING][layer], pos, data, n_embd);
+    viz_span_end(layer, pos);
     viz_dump_maybe(pos);
 }
 
@@ -541,9 +546,12 @@ void viz_push_row(int layer, int pos, const float *data, int n_embd) {
 void viz_push_batch(int layer, int start_pos, const float *x_batch, int n_tokens, int n_embd) {
     if (!atomic_load_explicit(&viz_ring.active, memory_order_relaxed)) return;
     if (layer < 0 || layer >= VIZ_MAX_LAYERS || start_pos < 0 || !x_batch || n_tokens < 1) return;
+    viz_span_begin(layer, start_pos);                /* logical start, not the first stored row */
     int first = n_tokens > VIZ_TOKEN_RING ? n_tokens - VIZ_TOKEN_RING : 0;
     for (int i = first; i < n_tokens; i++)
-        viz_push_one(layer, start_pos + i, x_batch + (size_t)i * (size_t)n_embd, n_embd);
+        viz_cell_write(&viz_ring.cells[(start_pos + i) % VIZ_TOKEN_RING][layer], start_pos + i,
+                       x_batch + (size_t)i * (size_t)n_embd, n_embd);
+    viz_span_end(layer, start_pos + n_tokens - 1);
     viz_dump_maybe(start_pos + n_tokens - 1);
 }
 
@@ -1646,6 +1654,11 @@ int viz_init(int width, int height, int port) {
     viz.display_mode = 0;
     viz.scroll_offset = 0;
     atomic_store(&viz.norm_mode, 1);   /* per-layer contrast by default */
+    {   /* optional initial modes (handy for headless PICOLM_VIZ_DUMP runs) */
+        const char *m = getenv("PICOLM_VIZ_NORM");   /* global | layer */
+        if (m && m[0] == 'g') atomic_store(&viz.norm_mode, 0);
+        if (getenv("PICOLM_VIZ_BUCKETS")) atomic_store(&viz.bucket_mode, 1);
+    }
 
     /* Initialize skip flags to 0 (not skipped) */
     for (int i = 0; i < VIZ_MAX_LAYERS; i++)
