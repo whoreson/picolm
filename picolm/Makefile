@@ -794,6 +794,14 @@ test_quant: util/test_quant.c quant.c sgemm.c
 test_q6_k_r4: tests/test_q6_k_r4.c quant.c $(SGEMM_SRCS)
 	$(CC) $(TEST_NATIVE_CFLAGS) -o $@ tests/test_q6_k_r4.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp
 
+# R8 SIMD vs dequantize reference: Q4_0_R8 and Q8_0_R8 GEMV+GEMM.
+test_r8_simd: tests/test_r8_simd.c quant.c $(SGEMM_SRCS)
+	$(CC) $(TEST_NATIVE_CFLAGS) -I. -o $@ tests/test_r8_simd.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp
+
+.PHONY: check-r8-simd
+check-r8-simd: test_r8_simd
+	./test_r8_simd
+
 # SIMD flags for the standalone test binaries. 'make avx2' etc. re-invoke make
 # with the SIMD flags in CFLAGS, but a later bare 'make check-all' does not
 # inherit them -- so the tests would be compiled scalar while the binary under
@@ -947,7 +955,7 @@ check-rowinterleave: test_rowinterleave
 # roughly double check-all's cost. CI runs it as its own step.
 check-all: check-hreduce check-kvcache-tokwrite check-quant check-q6-k-r4 \
            check-attn-tail \
-           check-rowinterleave \
+           check-rowinterleave check-r8-simd \
            check-glm5-dsa check-glm5-snapshot check-attn check-attn-decode check-pool
 	@echo ""
 	@echo "=== check-all: all self-contained suites passed ==="
