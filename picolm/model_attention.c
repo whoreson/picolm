@@ -3,13 +3,13 @@
 #include "quant.h"
 #include "sgemm.h"
 #include "model_internal.h"
-#ifdef _WIN32
+#if defined(_WIN32)
 #include <windows.h>
-#endif
-#ifndef _WIN32
+#elif !defined(PICOLM_DOS)
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
+#include <time.h>
 
 #include <string.h>
 #include <math.h>
@@ -1645,6 +1645,7 @@ static long long attn_timing_tokens = 0;
 static long long attn_timing_ctx_sum = 0;   /* sum of start_pos*n_tokens */
 static int attn_timing_enabled = -1;
 
+#if !defined(PICOLM_DOS)
 static double attn_now_ms(void) {
 #if defined(_WIN32)
     LARGE_INTEGER f, t; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t);
@@ -1655,6 +1656,9 @@ static double attn_now_ms(void) {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
 #endif
 }
+#else
+double attn_now_ms(void) { return 0.0; }
+#endif
 
 static void attn_timing_report(void) {
     if (attn_timing_calls == 0) return;
@@ -2568,7 +2572,7 @@ static void batch_attention_tiled(
      * fall back to malloc so cleanup can't mix free() and munmap(). */
     uint8_t *scratch_pool;
     int scratch_is_mmap = 0;
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(PICOLM_DOS)
     {
         size_t pg = (size_t)getpagesize();
         size_t aligned = (total_scratch + pg - 1) & ~(pg - 1);

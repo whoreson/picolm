@@ -4098,6 +4098,7 @@ void vec_add(float *a, const float *b, int size) {
  * Fix: always refresh every slot in [0, n_threads), giving unused slots
  * an empty (start == end) range so they safely no-op instead of running
  * leftover data. */
+#if !defined(PICOLM_DOS)
 /* Barrier profiling (enabled by PICOLM_BARRIER_PROF env var) */
 static inline double barrier_now(void) {
 #if defined(_WIN32)
@@ -4109,6 +4110,9 @@ static inline double barrier_now(void) {
     return ts.tv_sec + ts.tv_nsec * 1e-9;
 #endif
 }
+#else
+static inline double barrier_now(void) { return 0.0; }
+#endif
 static int barrier_prof_on = -1;
 static long barrier_dispatch_count;
 static double barrier_ns_total;
@@ -4138,7 +4142,7 @@ static void region_prof_print(void) {
 }
 static const char *fn_name_hint(void (*fn)(int, void *)) {
     /* Best-effort naming via dladdr */
-#if defined(__GNUC__) && !defined(_WIN32)
+#if defined(__GNUC__) && !defined(_WIN32) && !defined(PICOLM_DOS)
     Dl_info info;
     if (dladdr((void *)fn, &info) && info.dli_sname) return info.dli_sname;
 #endif

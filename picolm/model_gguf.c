@@ -557,19 +557,17 @@ const char *gguf_type_name(uint32_t type) {
 /* Scan Q8_0 tensor data for -128 bytes (PICOLM_SCAN_NEG128=1).
  * Returns total number of -128 bytes found, -1 on error.
  * Scans the GGUF file directly using the tensor metadata. */
+#if !defined(_WIN32) && !defined(PICOLM_DOS)
 int model_scan_neg128(const char *path) {
     uint8_t *addr = NULL;
     size_t fsize = 0;
     int rc = -1;
     int neg128_count = 0;
     int q8_element_count = 0;
-#ifndef _WIN32
     int fd = -1;
-#endif
     const int q8block = 34; /* sizeof(block_q8_0) */
     const int q8vals = 32;
 
-#ifndef _WIN32
     fd = open(path, O_RDONLY);
     if (fd < 0) { fprintf(stderr, "ERROR: cannot open '%s': %s\n", path, strerror(errno)); return -1; }
     { struct stat st;
@@ -577,7 +575,6 @@ int model_scan_neg128(const char *path) {
     }
     addr = mmap(NULL, fsize, PROT_READ, MAP_PRIVATE, fd, 0);
     if (!addr || addr == (void*)-1) { fprintf(stderr, "ERROR: cannot map '%s'\n", path); goto out; }
-#endif
 
     reader_t r = { .data = addr, .pos = 0, .size = fsize };
     uint32_t magic = read_u32(&r);
@@ -623,12 +620,14 @@ int model_scan_neg128(const char *path) {
 
     rc = neg128_count;
 out:
-#ifndef _WIN32
     if (addr && addr != MAP_FAILED) munmap(addr, fsize);
     if (fd >= 0) close(fd);
-#endif
     return rc;
 }
+#else
+/* DOS: mmap is not available; scan not supported (debug utility only). */
+int model_scan_neg128(const char *path) { (void)path; return 0; }
+#endif
 
 int model_list_tensors(const char *path) {
     uint8_t *addr = NULL;

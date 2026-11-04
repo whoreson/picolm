@@ -103,6 +103,7 @@ static double pp_acc[8], pp_t;
 static const char *const pp_names[8] = {
     "rmsnorm (input)", "Q projection", "K+V projection", "RoPE + KV-cache store (+Q/KV prep)",
     "attention", "output proj + gate + residual", "FFN (norm, gate/up, silu, down, residual)", "other" };
+#if !defined(PICOLM_DOS)
 #if defined(_WIN32)
 static double pp_now(void) { LARGE_INTEGER f, t; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t); return (double)t.QuadPart / (double)f.QuadPart * 1000.0; }
 #else
@@ -110,6 +111,10 @@ static double pp_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, 
 #endif
 #define PP_BEGIN() do { if (pp_on < 0) pp_on = getenv("PICOLM_PREFILL_PROF") != NULL; if (pp_on) pp_t = pp_now(); } while (0)
 #define PP_MARK(i) do { if (pp_on) { double _t = pp_now(); pp_acc[i] += _t - pp_t; pp_t = _t; } } while (0)
+#else
+#define PP_BEGIN() do {} while (0)
+#define PP_MARK(i) do {} while (0)
+#endif
 static void pp_report(int n_tokens, int n_layers) {
     if (pp_on != 1 || n_tokens < 2) return;
     double sum = 0; for (int i = 0; i < 8; i++) sum += pp_acc[i];
