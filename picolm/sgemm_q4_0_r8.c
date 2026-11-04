@@ -261,8 +261,232 @@ int sgemm_q4_0_r8_q8_2_avx2(int nrows, int ncols, int k,
     return 0;
 #endif
 }
+#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+/* ================================================================
+ * ARM NEON (DOTPROD) implementations for Q4_0_R8.
+ *
+ * Q4_0_R8 layout per block (block_q4_0x8, 144 bytes):
+ *   d[8]     FP16 scales (one per row)
+ *   qs[128]  interleaved nibbles: qs[32*l + 4*r + j] holds row r,
+ *            value 4*l+j in the LOW nibble and value 16+4*l+j in the
+ *            HIGH nibble (both biased by +8).
+ *
+ * NEON DOTPROD GEMV (8 rows at a time):
+ *   vld1q_u8(qs + 32*l) loads rows 0-3's 4 bytes for chunk l.
+ *   After nibble expansion, byte position 4*r+j = row r's value 4*l+j.
+ *   vdotq_s32 lane r = sum(j) w[4r+j]*a[j], so broadcasting the
+ *   4 activation bytes a[4l..4l+3] into all 4 lane groups gives
+ *   lane r = row r's partial dot for this chunk.
+ *   4 chunks x (lo+hi) nibbles x 2 row groups = 8 vdotq_s32 per block.
+ *
+ * Bias correction: stored nibble = value + 8, so the DOTPROD computes
+ *   sum((value+8)*a) = sum(value*a) + 8*sum(a).
+ *   8*sum(a) is row-independent; per-row scale is d[row]*act_scale.
+ *   out[row] = (biased_dot - 8*asum) * d[row] * act_scale.
+ * ================================================================ */
+#include <arm_neon.h>
+
+/* Broadcast 4 consecutive int8 values to all 4 DOTPROD lane groups. */
+static inline int8x16_t q4r8_bcast4_neon(const int8_t *a) {
+    uint32_t u;
+    memcpy(&u, a, 4);
+    return vreinterpretq_s8_u32(vdupq_n_u32(u));
+}
+
+/* GEMV: 8 weight rows x 1 activation row (block_q8_0). */
+static void q4r8_gemv_q8_0_neon(const block_q4_0x8 *xb, const block_q8_0 *y,
+                                int nb, float *out) {
+    float acc[8];
+    for (int r = 0; r < 8; r++) acc[r] = 0.0f;
+
+    for (int ib = 0; ib < nb; ib++) {
+        const uint8_t *qs = xb[ib].qs;
+        const int8_t *ya = y[ib].qs;
+
+        int32x4_t blk_lo03 = vdupq_n_s32(0);
+        int32x4_t blk_hi03 = vdupq_n_s32(0);
+        int32x4_t blk_lo47 = vdupq_n_s32(0);
+        int32x4_t blk_hi47 = vdupq_n_s32(0);
+
+        for (int l = 0; l < 4; l++) {
+            uint8x16_t v03 = vld1q_u8(qs + 32 * l);        /* rows 0-3 */
+            uint8x16_t v47 = vld1q_u8(qs + 32 * l + 16);   /* rows 4-7 */
+
+            int8x16_t lo03 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v03, vdupq_n_u8(0x0F))), vdupq_n_s8(8));
+            int8x16_t hi03 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(v03, 4)), vdupq_n_s8(8));
+            int8x16_t lo47 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v47, vdupq_n_u8(0x0F))), vdupq_n_s8(8));
+            int8x16_t hi47 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(v47, 4)), vdupq_n_s8(8));
+
+            int8x16_t abl = q4r8_bcast4_neon(ya + 4 * l);
+            int8x16_t abh = q4r8_bcast4_neon(ya + 16 + 4 * l);
+
+            blk_lo03 = vdotq_s32(blk_lo03, lo03, abl);
+            blk_hi03 = vdotq_s32(blk_hi03, hi03, abh);
+            blk_lo47 = vdotq_s32(blk_lo47, lo47, abl);
+            blk_hi47 = vdotq_s32(blk_hi47, hi47, abh);
+        }
+
+        /* Nibbles already bias-corrected (-8) during expansion: true dot. */
+        int32x4_t dot03 = vaddq_s32(blk_lo03, blk_hi03);
+        int32x4_t dot47 = vaddq_s32(blk_lo47, blk_hi47);
+
+        float as = fp16_to_fp32_lookup(y[ib].d);
+        float16x8_t d8 = vld1q_f16((const float16_t*)xb[ib].d);
+        float32x4_t sc03 = vmulq_n_f32(vcvt_f32_f16(vget_low_f16(d8)), as);
+        float32x4_t sc47 = vmulq_n_f32(vcvt_f32_f16(vget_high_f16(d8)), as);
+
+        float32x4_t f03 = vmulq_f32(vcvtq_f32_s32(dot03), sc03);
+        float32x4_t f47 = vmulq_f32(vcvtq_f32_s32(dot47), sc47);
+        vst1q_f32(acc + 0, vaddq_f32(vld1q_f32(acc + 0), f03));
+        vst1q_f32(acc + 4, vaddq_f32(vld1q_f32(acc + 4), f47));
+    }
+    memcpy(out, acc, 8 * sizeof(float));
+}
+
+/* GEMV: 8 weight rows x 1 activation row (block_q8_2, int16 precomputed sum). */
+static void q4r8_gemv_q8_2_neon(const block_q4_0x8 *xb, const block_q8_2 *y,
+                                int nb, float *out) {
+    float acc[8];
+    for (int r = 0; r < 8; r++) acc[r] = 0.0f;
+
+    for (int ib = 0; ib < nb; ib++) {
+        const uint8_t *qs = xb[ib].qs;
+        const int8_t *ya = y[ib].qs;
+
+        int32x4_t blk_lo03 = vdupq_n_s32(0);
+        int32x4_t blk_hi03 = vdupq_n_s32(0);
+        int32x4_t blk_lo47 = vdupq_n_s32(0);
+        int32x4_t blk_hi47 = vdupq_n_s32(0);
+
+        for (int l = 0; l < 4; l++) {
+            uint8x16_t v03 = vld1q_u8(qs + 32 * l);
+            uint8x16_t v47 = vld1q_u8(qs + 32 * l + 16);
+
+            int8x16_t lo03 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v03, vdupq_n_u8(0x0F))), vdupq_n_s8(8));
+            int8x16_t hi03 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(v03, 4)), vdupq_n_s8(8));
+            int8x16_t lo47 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v47, vdupq_n_u8(0x0F))), vdupq_n_s8(8));
+            int8x16_t hi47 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(v47, 4)), vdupq_n_s8(8));
+
+            int8x16_t abl = q4r8_bcast4_neon(ya + 4 * l);
+            int8x16_t abh = q4r8_bcast4_neon(ya + 16 + 4 * l);
+
+            blk_lo03 = vdotq_s32(blk_lo03, lo03, abl);
+            blk_hi03 = vdotq_s32(blk_hi03, hi03, abh);
+            blk_lo47 = vdotq_s32(blk_lo47, lo47, abl);
+            blk_hi47 = vdotq_s32(blk_hi47, hi47, abh);
+        }
+
+        /* Nibbles already bias-corrected (-8) during expansion: true dot. */
+        int32x4_t dot03 = vaddq_s32(blk_lo03, blk_hi03);
+        int32x4_t dot47 = vaddq_s32(blk_lo47, blk_hi47);
+        (void)y[ib].s; /* precomputed sum not needed (bias pre-corrected) */
+
+        float as = fp16_to_fp32_lookup(y[ib].d);
+        float16x8_t d8 = vld1q_f16((const float16_t*)xb[ib].d);
+        float32x4_t sc03 = vmulq_n_f32(vcvt_f32_f16(vget_low_f16(d8)), as);
+        float32x4_t sc47 = vmulq_n_f32(vcvt_f32_f16(vget_high_f16(d8)), as);
+
+        float32x4_t f03 = vmulq_f32(vcvtq_f32_s32(dot03), sc03);
+        float32x4_t f47 = vmulq_f32(vcvtq_f32_s32(dot47), sc47);
+        vst1q_f32(acc + 0, vaddq_f32(vld1q_f32(acc + 0), f03));
+        vst1q_f32(acc + 4, vaddq_f32(vld1q_f32(acc + 4), f47));
+    }
+    memcpy(out, acc, 8 * sizeof(float));
+}
+
+void vec_dot_q4_0_r8_q8_0_avx2(const void *vx, const void *wy, int n,
+                                float *out, int nrows) {
+    const block_q4_0x8 *xb = (const block_q4_0x8 *)vx;
+    const block_q8_0 *y = (const block_q8_0 *)wy;
+    int nb = n / 32;
+    int groups = nrows / 8;
+    for (int g = 0; g < groups; g++)
+        q4r8_gemv_q8_0_neon(xb + (size_t)g * nb, y, nb, out + g * 8);
+    for (int r = groups * 8; r < nrows; r++) {
+        float sumf = 0.0f;
+        for (int ib = 0; ib < nb; ib++) {
+            const uint8_t *qs = xb[ib].qs;
+            const float d = fp16_to_fp32_lookup(xb[ib].d[r]) * fp16_to_fp32_lookup(y[ib].d);
+            const int8_t *ya = y[ib].qs;
+            int sumi = 0;
+            for (int l = 0; l < 4; l++) {
+                const uint8_t *q = qs + 32 * l + 4 * r;
+                for (int j = 0; j < 4; j++) {
+                    sumi += ((int)(q[j] & 0xF) - 8) * (int)ya[4 * l + j];
+                    sumi += ((int)(q[j] >> 4) - 8) * (int)ya[4 * l + j + 16];
+                }
+            }
+            sumf += (float)sumi * d;
+        }
+        out[r] = sumf;
+    }
+}
+
+void vec_dot_q4_0_r8_q8_2_avx2(const void *vx, const void *wy, int n,
+                                float *out, int nrows) {
+    const block_q4_0x8 *xb = (const block_q4_0x8 *)vx;
+    const block_q8_2 *y = (const block_q8_2 *)wy;
+    int nb = n / 32;
+    int groups = nrows / 8;
+    for (int g = 0; g < groups; g++)
+        q4r8_gemv_q8_2_neon(xb + (size_t)g * nb, y, nb, out + g * 8);
+    for (int r = groups * 8; r < nrows; r++) {
+        float sumf = 0.0f;
+        for (int ib = 0; ib < nb; ib++) {
+            const uint8_t *qs = xb[ib].qs;
+            const float d = fp16_to_fp32_lookup(xb[ib].d[r]) * fp16_to_fp32_lookup(y[ib].d);
+            const int8_t *ya = y[ib].qs;
+            int sumi = 0;
+            for (int l = 0; l < 4; l++) {
+                const uint8_t *q = qs + 32 * l + 4 * r;
+                for (int j = 0; j < 4; j++) {
+                    sumi += ((int)(q[j] & 0xF) - 8) * (int)ya[4 * l + j];
+                    sumi += ((int)(q[j] >> 4) - 8) * (int)ya[4 * l + j + 16];
+                }
+            }
+            sumf += (float)sumi * d;
+        }
+        out[r] = sumf;
+    }
+}
+
+int sgemm_q4_0_r8_q8_0_avx2(int nrows, int ncols, int k, const void *vx, const void *vy,
+                             float *out, size_t bs, int ith, int nth) {
+    if (nrows < 8 || ncols < 1 || k % 32 != 0 || nrows % 8 != 0) return 0;
+    size_t a_row_bytes = (size_t)(k / 32) * sizeof(block_q8_0);
+    size_t w_stride = (size_t)(k / 32) * sizeof(block_q4_0x8);
+    int start_col = (ncols * ith) / nth;
+    int end_col = (ncols * (ith + 1)) / nth;
+    if (end_col <= start_col) return 0;
+    for (int c = start_col; c < end_col; c++) {
+        const block_q8_0 *qy = (const block_q8_0 *)((const char *)vy + (size_t)c * a_row_bytes);
+        for (int w8 = 0; w8 < nrows / 8; w8++) {
+            const block_q4_0x8 *iq4 = (const block_q4_0x8 *)((const char *)vx + (size_t)w8 * w_stride);
+            vec_dot_q4_0_r8_q8_0_avx2(iq4, qy, k, out + w8 * 8 + (size_t)c * bs, 8);
+        }
+    }
+    return (nrows / 8) * 8;
+}
+
+int sgemm_q4_0_r8_q8_2_avx2(int nrows, int ncols, int k, const void *vx, const void *vy,
+                             float *out, size_t bs, int ith, int nth) {
+    if (nrows < 8 || ncols < 1 || k % 32 != 0 || nrows % 8 != 0) return 0;
+    size_t a_row_bytes = (size_t)(k / 32) * sizeof(block_q8_2);
+    size_t w_stride = (size_t)(k / 32) * sizeof(block_q4_0x8);
+    int start_col = (ncols * ith) / nth;
+    int end_col = (ncols * (ith + 1)) / nth;
+    if (end_col <= start_col) return 0;
+    for (int c = start_col; c < end_col; c++) {
+        const block_q8_2 *qy = (const block_q8_2 *)((const char *)vy + (size_t)c * a_row_bytes);
+        for (int w8 = 0; w8 < nrows / 8; w8++) {
+            const block_q4_0x8 *iq4 = (const block_q4_0x8 *)((const char *)vx + (size_t)w8 * w_stride);
+            vec_dot_q4_0_r8_q8_2_avx2(iq4, qy, k, out + w8 * 8 + (size_t)c * bs, 8);
+        }
+    }
+    return (nrows / 8) * 8;
+}
 #else
-/* Non-AVX2: PORTABLE GEMV implementations.
+/* No AVX2, no NEON DOTPROD: portable scalar GEMV + stub GEMMs.
  *
  * These used to be empty stubs that returned nothing, leaving `out` untouched.
  * A model containing a Q4_0_R8 tensor therefore decoded to garbage on any

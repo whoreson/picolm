@@ -316,7 +316,187 @@ int sgemm_q8_0_r8_q8_0_avx2(int nrows, int ncols, int k,
                                      out, bs, ith, nth);
 }
 
-#else /* !__AVX2__ */
+#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+/* ================================================================
+ * ARM NEON (DOTPROD) for Q8_0_R8: 8-row interleaved Q8_0 x Q8_0.
+ * Same functions as the AVX2 section above, same ABI.
+ * ================================================================ */
+#include <arm_neon.h>
+
+/* Broadcast 4 consecutive int8 values to all 4 DOTPROD lane groups. */
+static inline int8x16_t q8r8_bcast4_neon(const int8_t *a) {
+    uint32_t u;
+    memcpy(&u, a, 4);
+    return vreinterpretq_s8_u32(vdupq_n_u32(u));
+}
+
+/* GEMV: 8 weight rows x 1 activation row (block_q8_0). */
+static void q8r8_gemv_q8_0_neon(const block_q8_0_r8 *xb, const block_q8_0 *y,
+                                int nb, float *out) {
+    float acc[8];
+    for (int r = 0; r < 8; r++) acc[r] = 0.0f;
+
+    for (int ib = 0; ib < nb; ib++) {
+        const int8_t *qs = xb[ib].qs;
+        const int8_t *ya = y[ib].qs;
+
+        int32x4_t blk_lo03 = vdupq_n_s32(0);
+        int32x4_t blk_hi03 = vdupq_n_s32(0);
+        int32x4_t blk_lo47 = vdupq_n_s32(0);
+        int32x4_t blk_hi47 = vdupq_n_s32(0);
+
+        for (int l = 0; l < 4; l++) {
+            int8x16_t lo03 = vld1q_s8(qs + 32 * l);
+            int8x16_t lo47 = vld1q_s8(qs + 32 * l + 16);
+            int8x16_t hi03 = vld1q_s8(qs + 128 + 32 * l);
+            int8x16_t hi47 = vld1q_s8(qs + 128 + 32 * l + 16);
+
+            int8x16_t abl = q8r8_bcast4_neon(ya + 4 * l);
+            int8x16_t abh = q8r8_bcast4_neon(ya + 16 + 4 * l);
+
+            blk_lo03 = vdotq_s32(blk_lo03, lo03, abl);
+            blk_hi03 = vdotq_s32(blk_hi03, hi03, abh);
+            blk_lo47 = vdotq_s32(blk_lo47, lo47, abl);
+            blk_hi47 = vdotq_s32(blk_hi47, hi47, abh);
+        }
+
+        int32x4_t dot03 = vaddq_s32(blk_lo03, blk_hi03);
+        int32x4_t dot47 = vaddq_s32(blk_lo47, blk_hi47);
+
+        float as = fp16_to_fp32_lookup(y[ib].d);
+        float16x8_t d8 = vld1q_f16((const float16_t*)xb[ib].d);
+        float32x4_t sc03 = vmulq_n_f32(vcvt_f32_f16(vget_low_f16(d8)), as);
+        float32x4_t sc47 = vmulq_n_f32(vcvt_f32_f16(vget_high_f16(d8)), as);
+
+        float32x4_t f03 = vmulq_f32(vcvtq_f32_s32(dot03), sc03);
+        float32x4_t f47 = vmulq_f32(vcvtq_f32_s32(dot47), sc47);
+        vst1q_f32(acc + 0, vaddq_f32(vld1q_f32(acc + 0), f03));
+        vst1q_f32(acc + 4, vaddq_f32(vld1q_f32(acc + 4), f47));
+    }
+    memcpy(out, acc, 8 * sizeof(float));
+}
+
+void vec_dot_q8_0_r8_q8_0_avx2(const void *vx, const void *wy, int n,
+                               float *out, int nrows) {
+    const block_q8_0_r8 *xb = (const block_q8_0_r8 *)vx;
+    const block_q8_0 *y = (const block_q8_0 *)wy;
+    const int nb = n / 32;
+    int groups = nrows / 8;
+    for (int g = 0; g < groups; g++)
+        q8r8_gemv_q8_0_neon(xb + (size_t)g * nb, y, nb, out + g * 8);
+    for (int r = groups * 8; r < nrows; r++) {
+        float sumf = 0.0f;
+        for (int ib = 0; ib < nb; ib++) {
+            const float d = fp16_to_fp32(xb[ib].d[r]) * fp16_to_fp32(y[ib].d);
+            const int8_t *qs = xb[ib].qs;
+            const int8_t *ya = y[ib].qs;
+            int sumi = 0;
+            for (int l = 0; l < 4; l++) {
+                const int8_t *q = qs + 32 * l + 4 * r;
+                for (int i = 0; i < 4; i++) {
+                    sumi += (int)q[i]       * (int)ya[4 * l + i];
+                    sumi += (int)q[i + 128] * (int)ya[4 * l + i + 16];
+                }
+            }
+            sumf += (float)sumi * d;
+        }
+        out[r] = sumf;
+    }
+}
+
+int sgemm_q8_0_r8_q8_0_avx2(int nrows, int ncols, int k, const void *vx, const void *vy,
+                             float *out, size_t bs, int ith, int nth) {
+    if (nrows < 8 || ncols < 1 || k % 32 != 0 || nrows % 8 != 0) return 0;
+    size_t a_row_bytes = (size_t)(k / 32) * sizeof(block_q8_0);
+    size_t w_stride = (size_t)(k / 32) * sizeof(block_q8_0_r8);
+    int start_col = (ncols * ith) / nth;
+    int end_col = (ncols * (ith + 1)) / nth;
+    if (end_col <= start_col) return 0;
+    for (int c = start_col; c < end_col; c++) {
+        const block_q8_0 *qy = (const block_q8_0 *)((const char *)vy + (size_t)c * a_row_bytes);
+        for (int w8 = 0; w8 < nrows / 8; w8++) {
+            const block_q8_0_r8 *xb = (const block_q8_0_r8 *)((const char *)vx + (size_t)w8 * w_stride);
+            vec_dot_q8_0_r8_q8_0_avx2(xb, qy, k, out + w8 * 8 + (size_t)c * bs, 8);
+        }
+    }
+    return (nrows / 8) * 8;
+}
+
+void vec_dot_q8_0_r8_q8_0_d_avx2(const void *vx, const void *wy, const float *q_d,
+                                 int n, float *out, int nrows) {
+    /* Activation deltas supplied externally (pre-computed fp32 from fp16). */
+    const block_q8_0_r8 *xb = (const block_q8_0_r8 *)vx;
+    const block_q8_0 *y = (const block_q8_0 *)wy;
+    const int nb = n / 32;
+    int groups = nrows / 8;
+    (void)q_d; /* deltas not used in the per-block fp16 path */
+    for (int g = 0; g < groups; g++)
+        q8r8_gemv_q8_0_neon(xb + (size_t)g * nb, y, nb, out + g * 8);
+    for (int r = groups * 8; r < nrows; r++) {
+        float sumf = 0.0f;
+        for (int ib = 0; ib < nb; ib++) {
+            const float d = fp16_to_fp32(xb[ib].d[r]) * fp16_to_fp32(y[ib].d);
+            const int8_t *qs = xb[ib].qs;
+            const int8_t *ya = y[ib].qs;
+            int sumi = 0;
+            for (int l = 0; l < 4; l++) {
+                const int8_t *q = qs + 32 * l + 4 * r;
+                for (int i = 0; i < 4; i++) {
+                    sumi += (int)q[i]       * (int)ya[4 * l + i];
+                    sumi += (int)q[i + 128] * (int)ya[4 * l + i + 16];
+                }
+            }
+            sumf += (float)sumi * d;
+        }
+        out[r] = sumf;
+    }
+}
+
+int sgemm_q8_0_r8_q8_0_d_avx2(int nrows, int ncols, int k,
+                              const void *vx, const void *vy,
+                              const float *vy_d, int vy_d_stride,
+                              float *out, size_t bs, int ith, int nth) {
+    if (nrows < 8 || ncols < 1 || k % 32 != 0 || nrows % 8 != 0) return 0;
+    size_t a_row_bytes = (size_t)(k / 32) * sizeof(block_q8_0);
+    size_t w_stride = (size_t)(k / 32) * sizeof(block_q8_0_r8);
+    int start_col = (ncols * ith) / nth;
+    int end_col = (ncols * (ith + 1)) / nth;
+    if (end_col <= start_col) return 0;
+    (void)vy_d; (void)vy_d_stride;
+    for (int c = start_col; c < end_col; c++) {
+        const block_q8_0 *qy = (const block_q8_0 *)((const char *)vy + (size_t)c * a_row_bytes);
+        for (int w8 = 0; w8 < nrows / 8; w8++) {
+            const block_q8_0_r8 *xb = (const block_q8_0_r8 *)((const char *)vx + (size_t)w8 * w_stride);
+            vec_dot_q8_0_r8_q8_0_avx2(xb, qy, k, out + w8 * 8 + (size_t)c * bs, 8);
+        }
+    }
+    return (nrows / 8) * 8;
+}
+
+void repack_q8_0_to_q8_0_r8(const void *src, void *dst, int nrows, int n) {
+    if (!src || !dst || nrows <= 0 || n <= 0 || n % 32 != 0 || nrows % 8 != 0) return;
+    const int nb = n / 32;
+    const block_q8_0 *s = (const block_q8_0 *)src;
+    block_q8_0_r8 *d = (block_q8_0_r8 *)dst;
+    for (int g = 0; g < nrows / 8; g++) {
+        const block_q8_0 *sg = s + (size_t)g * 8 * nb;
+        block_q8_0_r8 *dg = d + (size_t)g * nb;
+        for (int ib = 0; ib < nb; ib++) {
+            for (int r = 0; r < 8; r++) dg[ib].d[r] = sg[(size_t)r * nb + ib].d;
+            for (int l = 0; l < 4; l++) {
+                for (int k = 0; k < 8; k++) {
+                    const int8_t *qs = sg[(size_t)k * nb + ib].qs;
+                    for (int i = 0; i < 4; i++) {
+                        dg[ib].qs[32 * l + 4 * k + i]       = qs[4 * l + i];
+                        dg[ib].qs[32 * l + 4 * k + i + 128] = qs[4 * l + i + 16];
+                    }
+                }
+            }
+        }
+    }
+}
+
+#else /* !__AVX2__ && !NEON: portable fallback */
 
 /* Portable fallback: Q8_0_R8 weights x Q8_0 activations.
  *
