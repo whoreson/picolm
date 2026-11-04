@@ -66,8 +66,79 @@ jobs:
           esac
           ls -lh picolm
 
+      - name: Prefill smoke test (${{ matrix.build }})
+        working-directory: ./picolm
+        run: |
+          timeout 60 ./picolm ../models/stories260K-stuffed.gguf \
+            -c 256 -n 160 -t 0 \
+            -p "Once upon a time, there was a little girl named Lily. She loved to play outside in the forest near her house. One day, she saw a fox running in the forest. She thought the fox was cute and wanted to be friends with it.\nLily followed the fox into the forest and saw a group of animals." \
+            2>&1 | tee /tmp/picolm_prefill_${{ matrix.build }}.txt
+          if ! grep -q "tok/s" /tmp/picolm_prefill_${{ matrix.build }}.txt; then
+            echo "FAIL: Large prefill did not complete"
+            exit 1
+          fi
+          echo "PASS: Large prefill completed"
+
+      - name: Save prefill output artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: prefill-output-${{ matrix.build }}
+          path: /tmp/picolm_prefill_${{ matrix.build }}.txt
+          retention-days: 1
+
   # =========================================================================
-  #  Linux x86_64 -- unit tests + smoke tests (runs once, on avx2)
+  #  Linux x86_64 -- prefill cross-build comparison
+  # =========================================================================
+  linux-prefill-compare:
+    name: Linux prefill cross-build comparison
+    runs-on: ubuntu-24.04
+    needs: [ linux-x86 ]
+    if: always() && !cancelled()
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all prefill artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: prefill-output-*
+          path: /tmp/prefill_outputs
+
+      - name: Compare prefill output across builds
+        run: |
+          set -e
+          # Extract the generated text (after the "---" separator) from each build
+          for f in /tmp/prefill_outputs/prefill-output-*/picolm_prefill_*.txt; do
+            build=$(basename "$(dirname "$f")" | sed 's/prefill-output-//')
+            # Extract text after "---" line
+            sed -n '/^---$/,/^Prefill:/p' "$f" | head -n -1 > "/tmp/prefill_gen_${build}.txt"
+            echo "=== $build ==="
+            grep -v -E "Capping|ATTN" "/tmp/prefill_gen_${build}.txt" | head -3
+          done
+
+          # Compare every build against default
+          default="/tmp/prefill_gen_default.txt"
+          if [ ! -f "$default" ]; then
+            echo "FAIL: default build prefill output not found"
+            exit 1
+          fi
+          for build in avx2 avx sse3 scalar; do
+            target="/tmp/prefill_gen_${build}.txt"
+            if [ ! -f "$target" ]; then
+              echo "FAIL: $build prefill output not found (upstream job may have failed)"
+              exit 1
+            fi
+            if ! diff -u "$default" "$target" > /tmp/prefill_diff_${build}.txt 2>&1; then
+              echo "FAIL: prefill output differs between default and $build"
+              diff -u "$default" "$target" | head -20
+              exit 1
+            fi
+            echo "PASS: $build matches default"
+          done
+
+  # =========================================================================
+  #  Linux x86_64 -- unit tests + smoke tests
   # =========================================================================
   linux-tests:
     name: Linux tests + smoke
@@ -82,12 +153,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc g++ make
 
-      - name: Build (avx2)
+      - name: Build
         working-directory: ./picolm
         run: |
           set -e
           make clean
-          make avx2 -j$(nproc) CC=gcc
+          make -j$(nproc) CC=gcc
 
       # --------------------------------------------------------------------
       # check-all: every self-contained regression suite that needs no model.
@@ -292,10 +363,9 @@ jobs:
           # about the prefill code path itself.
           timeout 60 ./picolm ../models/stories260K-stuffed.gguf \
             -c 256 -n 160 -t 0 \
-            -p "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\nOnce upon a time" \
+            -p "Once upon a time, there was a little girl named Lily. She loved to play outside in the forest near her house. One day, she saw a fox running in the forest. She thought the fox was cute and wanted to be friends with it.\\nLily followed the fox into the forest and saw a group of animals." \
             2>&1 | tee /tmp/picolm_prefill.txt
-          if grep -q "tok/s" /tmp/picolm_prefill.txt && \
-             grep -q "little girl named Lily" /tmp/picolm_prefill.txt; then
+          if grep -q "Thank you, little girl." /tmp/picolm_prefill.txt; then
             echo "PASS: Large prefill generation completed with expected output"
           else
             echo "FAIL: Large prefill output mismatch"
@@ -339,11 +409,9 @@ jobs:
         run: |
           ./picolm ../models/stories260K-stuffed.gguf \
             -c 256 -n 160 -t 0 \
-            -p "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\nOnce upon a time" \
+            -p "Once upon a time, there was a little girl named Lily. She loved to play outside in the forest near her house. One day, she saw a fox running in the forest. She thought the fox was cute and wanted to be friends with it.\\nLily followed the fox into the forest and saw a group of animals." \
             2>&1 | tee /tmp/picolm_prefill.txt
-          if grep -q "tok/s" /tmp/picolm_prefill.txt && \
-             grep -q "little girl named Lily" /tmp/picolm_prefill.txt && \
-             grep -q "shiny piece of pieces" /tmp/picolm_prefill.txt; then
+          if grep -q "Thank you, little girl." /tmp/picolm_prefill.txt; then
             echo "PASS: Large prefill generation completed with expected output"
           else
             echo "FAIL: Large prefill output mismatch"
@@ -398,11 +466,9 @@ jobs:
         run: |
           timeout 120 ./picolm ../models/stories260K-stuffed.gguf \
             -c 256 -n 160 -t 0 \
-            -p "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\nOnce upon a time" \
+            -p "Once upon a time, there was a little girl named Lily. She loved to play outside in the forest near her house. One day, she saw a fox running in the forest. She thought the fox was cute and wanted to be friends with it.\\nLily followed the fox into the forest and saw a group of animals." \
             2>&1 | tee /tmp/picolm_prefill.txt
-          if grep -q "tok/s" /tmp/picolm_prefill.txt && \
-             grep -q "little girl named Lily" /tmp/picolm_prefill.txt && \
-             grep -q "shiny piece of pieces" /tmp/picolm_prefill.txt; then
+          if grep -q "Thank you, little girl." /tmp/picolm_prefill.txt; then
             echo "PASS: Large prefill generation completed with expected output"
           else
             echo "FAIL: Large prefill output mismatch"
@@ -435,6 +501,26 @@ jobs:
           ls -lh picolm.exe
           file picolm.exe
 
+      - name: Prefill smoke test (Windows MinGW)
+        working-directory: ./picolm
+        run: |
+          # MinGW cross-compile produces sse3. Run via wine if available,
+          # otherwise we accept that we can't execute on this runner.
+          if command -v wine >/dev/null 2>&1; then
+            timeout 60 wine picolm.exe ../models/stories260K-stuffed.gguf \
+              -c 256 -n 160 -t 0 \
+            -p "Once upon a time, there was a little girl named Lily. She loved to play outside in the forest near her house. One day, she saw a fox running in the forest. She thought the fox was cute and wanted to be friends with it.\\nLily followed the fox into the forest and saw a group of animals." \
+            2>&1 | tee /tmp/picolm_prefill.txt
+          if grep -q "Thank you, little girl." /tmp/picolm_prefill.txt; then
+              echo "PASS: Windows MinGW prefill completed"
+            else
+              echo "FAIL: Windows MinGW prefill did not complete"
+              exit 1
+            fi
+          else
+            echo "SKIP: wine not available, cannot test Windows binary on Linux runner"
+          fi
+
   # =========================================================================
   #  Lint: strict warnings
   # =========================================================================
@@ -455,7 +541,7 @@ jobs:
         working-directory: ./picolm
         run: |
           make clean
-          make avx2 -j$(nproc) CC=gcc WARN=1 2>&1 | tee /tmp/lint.log
+          make -j$(nproc) CC=gcc WARN=1 2>&1 | tee /tmp/lint.log
           if grep -qi "error:" /tmp/lint.log; then
             echo "FAIL: Compilation errors found with strict warnings"
             exit 1
