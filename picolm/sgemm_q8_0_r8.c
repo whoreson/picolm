@@ -535,12 +535,31 @@ void vec_dot_q8_0_r8_q8_0_avx2(const void *vx, const void *wy, int n,
     }
 }
 
+/* Portable scalar GEMM: delegates to vec_dot_q8_0_r8_q8_0_avx2 per column.
+ * R8 layout: rows are grouped in blocks of 8. Row r's weight block is at
+ * group r/8 within the block sequence. */
 int sgemm_q8_0_r8_q8_0_avx2(int nrows, int ncols, int k,
                             const void *vx, const void *vy,
                             float *out, size_t bs, int ith, int nth) {
-    (void)vx; (void)vy; (void)k; (void)out; (void)bs; (void)ith; (void)nth;
-    (void)nrows; (void)ncols;
-    return 0;
+    if (k % 32 != 0) return 0;
+    const size_t a_stride = (k / 32) * sizeof(block_q8_0);
+    const size_t w_block_stride = (k / 32) * sizeof(block_q8_0_r8);
+    const int rows_per_thread = (nrows + nth - 1) / nth;
+    const int r0 = ith * rows_per_thread;
+    const int r1 = r0 + rows_per_thread < nrows ? r0 + rows_per_thread : nrows;
+    float out_buf[8];
+    for (int c = 0; c < ncols; c++) {
+        const block_q8_0 *yc = (const block_q8_0 *)((const char *)vy + (size_t)c * a_stride);
+        for (int r = r0; r < r1; r += 8) {
+            const int nr = r + 8 < r1 ? 8 : r1 - r;
+            vec_dot_q8_0_r8_q8_0_avx2(
+                (const char *)vx + (size_t)(r / 8) * w_block_stride,
+                yc, k, out_buf, nr);
+            for (int rr = 0; rr < nr; rr++)
+                out[(size_t)c * bs + r + rr] = out_buf[rr];
+        }
+    }
+    return nrows * ncols;
 }
 
 /* Portable fallback: as above but with caller-supplied fp32 activation deltas. */
@@ -570,13 +589,31 @@ void vec_dot_q8_0_r8_q8_0_d_avx2(const void *vx, const void *wy, const float *q_
     }
 }
 
+/* Portable scalar GEMM with caller-supplied fp32 activation deltas. */
 int sgemm_q8_0_r8_q8_0_d_avx2(int nrows, int ncols, int k,
                               const void *vx, const void *vy,
                               const float *vy_d, int vy_d_stride,
                               float *out, size_t bs, int ith, int nth) {
-    (void)vx; (void)vy; (void)vy_d; (void)vy_d_stride; (void)k; (void)out;
-    (void)bs; (void)ith; (void)nth; (void)nrows; (void)ncols;
-    return 0;
+    if (k % 32 != 0) return 0;
+    const size_t a_stride = (k / 32) * sizeof(block_q8_0);
+    const size_t w_block_stride = (k / 32) * sizeof(block_q8_0_r8);
+    const int rows_per_thread = (nrows + nth - 1) / nth;
+    const int r0 = ith * rows_per_thread;
+    const int r1 = r0 + rows_per_thread < nrows ? r0 + rows_per_thread : nrows;
+    float out_buf[8];
+    for (int c = 0; c < ncols; c++) {
+        const block_q8_0 *yc = (const block_q8_0 *)((const char *)vy + (size_t)c * a_stride);
+        const float *yd_c = vy_d ? vy_d + (size_t)c * vy_d_stride : NULL;
+        for (int r = r0; r < r1; r += 8) {
+            const int nr = r + 8 < r1 ? 8 : r1 - r;
+            vec_dot_q8_0_r8_q8_0_d_avx2(
+                (const char *)vx + (size_t)(r / 8) * w_block_stride,
+                yc, yd_c, k, out_buf, nr);
+            for (int rr = 0; rr < nr; rr++)
+                out[(size_t)c * bs + r + rr] = out_buf[rr];
+        }
+    }
+    return nrows * ncols;
 }
 
 void repack_q8_0_to_q8_0_r8(const void *src, void *dst, int nrows, int n) {

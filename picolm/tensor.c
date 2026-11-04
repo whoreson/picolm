@@ -2067,7 +2067,17 @@ typedef struct { int nrows, ncols, k; const void *w, *a; float *out; size_t bs;
 static void gemm_table_task(int idx, void *ctxp) {
     gemm_table_ctx_t *c = (gemm_table_ctx_t *)ctxp;
     int nth = pool_total_threads(1);
-    c->fn(c->nrows, c->ncols, c->k, c->w, c->a, c->out, c->bs, idx, nth);
+    int r = c->fn(c->nrows, c->ncols, c->k, c->w, c->a, c->out, c->bs, idx, nth);
+    /* fn_gemm returning 0 means "not implemented for this build".
+     * If we silently continue, the output buffer remains uninitialized or
+     * zeroed, producing plausible-looking garbage text. Refuse instead. */
+    if (r == 0) {
+        fprintf(stderr,
+                "FATAL: fn_gemm returned 0 (no implementation for this SIMD build).\n"
+                "       nrows=%d ncols=%d k=%d. Check the sgemm_*.c source.\n",
+                c->nrows, c->ncols, c->k);
+        abort();
+    }
 }
 
 /* Convert+GEMM task for quant types that benefit from on-the-fly repacking
