@@ -538,15 +538,24 @@ static void init_rope_tables(model_t *m, run_state_t *s, const model_config_t *c
                       s->rope_freq_factors, ext_factor, s->rope_mscale);
 }
 
-/* Initialize SWA RoPE tables (Gemma-3n uses freq_base=10000 for SWA layers).
+/* Initialize SWA RoPE tables (Gemma-3n uses freq_base=10000 for SWA layers,
+ * Spark-X2.5 uses both different freq_base AND different rope_dim).
  * Scaling parameters (freq_scale, ext_factor, mscale) are shared with the
- * global tables -- only freq_base differs -- per rope_scaling_plan.md's
- * "SWA layers" edge case note. */
+ * global tables -- per rope_scaling_plan.md's "SWA layers" edge case note. */
 static void init_swa_rope_tables(run_state_t *s, const model_config_t *c) {
     float ext_factor = resolve_rope_ext_factor(c);
     float freq_base_swa = (c->rope_freq_base_swa > 0.0f) ? c->rope_freq_base_swa : 10000.0f;
-    build_rope_table(s->rope_cos_swa, s->rope_sin_swa, c, freq_base_swa,
-                      s->rope_freq_factors, ext_factor, s->rope_mscale);
+    /* For Spark-X2.5, SWA layers use a different rope_dim (rope_dim_swa).
+     * We temporarily swap rope_dim in a local config copy. */
+    if (c->is_spark25 && c->rope_dim_swa > 0) {
+        model_config_t c_swa = *c;
+        c_swa.rope_dim = c->rope_dim_swa;
+        build_rope_table(s->rope_cos_swa, s->rope_sin_swa, &c_swa, freq_base_swa,
+                          s->rope_freq_factors, ext_factor, s->rope_mscale);
+    } else {
+        build_rope_table(s->rope_cos_swa, s->rope_sin_swa, c, freq_base_swa,
+                          s->rope_freq_factors, ext_factor, s->rope_mscale);
+    }
 }
 
 /* ---- Buffer allocation ---- */
@@ -593,10 +602,13 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
     int q_full_dim = c->has_ssm ? (q_dim * 2) : q_dim;
     /* GPT-2/GPTNeoX: fused QKV needs 3*dim */
     int gpt2_qkv_dim = (c->is_gpt2 || c->is_gptneox) ? (3 * c->n_embd) : 0;
+    /* Spark-X2.5: fused QKV needs q_dim + 2*kv_dim */
+    int spark_qkv_dim = c->is_spark25 ? (c->n_heads * c->head_dim + 2 * c->n_kv_heads * c->head_dim) : 0;
     /* SSM conv_dim may be larger */
     int ssm_conv_dim = c->has_ssm ? (2 * c->ssm_d_state * c->ssm_n_group + c->ssm_d_inner) : 0;
     int max_proj_dim = q_full_dim;
     if (gpt2_qkv_dim > max_proj_dim) max_proj_dim = gpt2_qkv_dim;
+    if (spark_qkv_dim > max_proj_dim) max_proj_dim = spark_qkv_dim;
     if (ssm_conv_dim > max_proj_dim) max_proj_dim = ssm_conv_dim;
     int max_dim = (max_proj_dim > c->n_embd) ? max_proj_dim : c->n_embd;
 
@@ -1009,6 +1021,10 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
     s->xb     = p; p += max_dim;
     s->xb2    = p; p += max_dim;
     s->q      = p; p += max_proj_dim;
+    /* Spark-X2.5: head-wise gate buffer [n_heads] */
+    if (c->is_spark25) {
+        s->spark_gate = p; p += c->n_heads;
+    }
     s->hb     = p; p += c->n_ffn;
     s->hb2    = p; p += c->n_ffn;
     s->logits = p; p += c->vocab_size;
@@ -1017,10 +1033,17 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
     /* RoPE tables */
     s->rope_cos = p; p += (size_t)c->max_seq_len * half_dim;
     s->rope_sin = p; p += (size_t)c->max_seq_len * half_dim;
-    /* SWA RoPE tables (Gemmma-3n: freq_base=10000 for SWA layers) */
-    if (c->is_gemma3n) {
-        s->rope_cos_swa = p; p += (size_t)c->max_seq_len * half_dim;
-        s->rope_sin_swa = p; p += (size_t)c->max_seq_len * half_dim;
+    /* SWA RoPE tables (Gemma-3n: freq_base=10000, Spark-X2.5: different rope_dim_swa) */
+    if (c->is_gemma3n || c->is_spark25) {
+        /* For Spark-X2.5, SWA table may need a wider half_dim (rope_dim_swa vs rope_dim).
+         * Allocate at max(half_dim, half_dim_swa) width for simplicity. */
+        int swa_half_dim = half_dim;
+        if (c->is_spark25 && c->rope_dim_swa > 0) {
+            int swa_hd = c->rope_dim_swa / 2;
+            if (swa_hd > swa_half_dim) swa_half_dim = swa_hd;
+        }
+        s->rope_cos_swa = p; p += (size_t)c->max_seq_len * swa_half_dim;
+        s->rope_sin_swa = p; p += (size_t)c->max_seq_len * swa_half_dim;
     }
 
     /* Norm weights */
@@ -1530,7 +1553,7 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
      * LongRoPE freq_factors (s->rope_freq_factors), so it must run before
      * init_swa_rope_tables(), which reuses those resolved values. */
     init_rope_tables(m, s, c);
-    if (c->is_gemma3n) {
+    if (c->is_gemma3n || c->is_spark25) {
         init_swa_rope_tables(s, c);
     }
 
@@ -1620,6 +1643,13 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
             if (!lw->attn_qkv || !lw->attn_output ||
                 !lw->ffn_up || !lw->ffn_down) {
                 fprintf(stderr, "ERROR: GPTNeoX model is missing required tensors\n");
+                return -1;
+            }
+        } else if (m->config.is_spark25) {
+            /* Spark-X2.5: fused QKV, head-wise gate, GeGLU FFN */
+            if (!lw->attn_qkv || !lw->attn_gate || !lw->attn_output ||
+                !lw->ffn_gate || !lw->ffn_up || !lw->ffn_down) {
+                fprintf(stderr, "ERROR: Spark-X2.5 model is missing required tensors\n");
                 return -1;
             }
         } else {
@@ -2722,11 +2752,251 @@ static float *model_forward_gptneox(model_t *m, int token, int pos) {
     return s->logits;
 }
 
+/* ---- Spark-X2.5 forward pass (specialized) ----
+ * Architecture: fused QKV, head-wise sigmoid attention gate, GeGLU FFN,
+ * SWA with per-layer RoPE dimension (rope_dim vs rope_dim_swa).
+ * Reference: llama.cpp spark2-5.cpp.
+ *
+ * Forward per layer:
+ *   cur = RMSNorm(cur, attn_norm)
+ *   qkv = W_qkv * cur  (fused Q+K+V)
+ *   split qkv -> Q, K, V
+ *   Q = RoPE(Q, pos, n_rot_i)
+ *   K = RoPE(K, pos, n_rot_i)
+ *   store K, V in KV cache
+ *   attn_out = attention(Q, K_cache, V_cache, scale, n_swa)
+ *   gate_raw = W_gate * cur  (cur = post-RMSNorm input, [n_embd] -> [n_head])
+ *   gate = sigmoid(gate_raw)
+ *   attn_out = attn_out * gate  (broadcast: [head_dim, n_heads] * [1, n_heads])
+ *   cur = W_o * attn_out + cur_in  (residual)
+ *   ffn_in = cur
+ *   cur = RMSNorm(cur, ffn_norm)
+ *   gate_out = W_gate_ffn * cur
+ *   up_out = W_up * cur
+ *   cur = W_down * (GELU(gate_out) * up_out)
+ *   cur = cur + ffn_in  (residual) */
+static float *model_forward_spark25(model_t *m, int token, int pos) {
+    model_config_t *c = &m->config;
+    model_weights_t *w = &m->weights;
+    run_state_t *s = &m->state;
+
+    /* Bounds check */
+    if (pos >= c->max_seq_len) {
+        fprintf(stderr, "WARN: model_forward_spark25 pos=%d >= max_seq_len=%d, returning last logits\n",
+                pos, c->max_seq_len);
+        return s->logits;
+    }
+
+    int dim = c->n_embd;
+    int n_ffn = c->n_ffn;
+    int n_heads = c->n_heads;
+    int n_kv_heads = c->n_kv_heads;
+    int head_dim = c->head_dim;
+    int q_dim = n_heads * head_dim;
+    int kv_dim = n_kv_heads * head_dim;
+    int kv_mul = n_heads / n_kv_heads;
+    int seq_len = c->max_seq_len;
+
+    /* 1. Embedding lookup */
+    {
+        size_t row_bytes = gguf_type_row_size(w->type_token_embd, dim);
+        const void *embd_row = (const uint8_t *)w->token_embd + (size_t)token * row_bytes;
+        dequantize_row(embd_row, s->x, dim, w->type_token_embd);
+    }
+
+    /* 2. Transformer layers */
+    int n_active_layers = c->n_layers;
+    for (int slot = 0; slot < n_active_layers; slot++) {
+        int l = slot;
+        layer_weights_t *lw = &w->layers[l];
+        BENCH_LAYER_START();
+        int ri = 2 + l * 9;
+
+        /* ---- Attention block ---- */
+
+        /* RMSNorm */
+        rmsnorm(s->xb, s->x, s->attn_norm_w[l], dim, c->rms_norm_eps);
+
+        /* Save RMSNorm output for head-wise gate (attn_inp = post-RMSNorm per llama.cpp spark2-5.cpp:81) */
+        if (getenv("PICOLM_DBG_SPARK") && l == 0 && pos == 0) {
+            fprintf(stderr, "[SPARK_DBG] after rmsnorm: xb[0:4]=[%.4f %.4f %.4f %.4f], x[0:4]=[%.4f %.4f %.4f %.4f]\n",
+                    s->xb[0], s->xb[1], s->xb[2], s->xb[3],
+                    s->x[0], s->x[1], s->x[2], s->x[3]);
+        }
+        memcpy(s->xb2, s->xb, dim * sizeof(float));
+        if (getenv("PICOLM_DBG_SPARK") && l == 0 && pos == 0) {
+            fprintf(stderr, "[SPARK_DBG] after memcpy: xb2[0:4]=[%.4f %.4f %.4f %.4f]\n",
+                    s->xb2[0], s->xb2[1], s->xb2[2], s->xb2[3]);
+        }
+
+        /* Fused QKV projection: [dim, q_dim + kv_dim + kv_dim] */
+        int qkv_dim = q_dim + kv_dim + kv_dim;
+        if (getenv("PICOLM_DBG_SPARK") && l == 0 && pos == 0) {
+            fprintf(stderr, "[SPARK_DBG] before qkv matmul: xb2[0:4]=[%.4f %.4f %.4f %.4f] xb=%p xb2=%p q=%p\n",
+                    s->xb2[0], s->xb2[1], s->xb2[2], s->xb2[3], (void*)s->xb, (void*)s->xb2, (void*)s->q);
+        }
+        tensor_set_repacked(m->repack_used[ri] ? m->repack_buffers[ri] : NULL);
+        matmul(s->q, s->xb, lw->attn_qkv, dim, qkv_dim, lw->type_attn_qkv);
+        tensor_set_repacked(NULL);
+        if (getenv("PICOLM_DBG_SPARK") && l == 0 && pos == 0) {
+            fprintf(stderr, "[SPARK_DBG] after qkv matmul: xb2[0:4]=[%.4f %.4f %.4f %.4f]\n",
+                    s->xb2[0], s->xb2[1], s->xb2[2], s->xb2[3]);
+        }
+
+        /* Split Q, K, V from fused output */
+        float *q_ptr = s->q;            /* [q_dim] */
+        float *k_ptr = s->q + q_dim;    /* [kv_dim] */
+        float *v_ptr = s->q + q_dim + kv_dim; /* [kv_dim] */
+
+        /* Per-layer RoPE: SWA layers use rope_dim_swa, full layers use rope_dim */
+        int is_swa = c->n_swa_layer[l] > 0;
+        int rope_half_i = is_swa ? (c->rope_dim_swa > 0 ? c->rope_dim_swa : c->rope_dim) / 2
+                                 : ((c->rope_dim > 0) ? c->rope_dim : head_dim) / 2;
+        const float *cos_pos_i = is_swa ? s->rope_cos_swa : s->rope_cos;
+        const float *sin_pos_i = is_swa ? s->rope_sin_swa : s->rope_sin;
+        cos_pos_i += (size_t)pos * rope_half_i;
+        sin_pos_i += (size_t)pos * rope_half_i;
+
+        /* Apply RoPE */
+        rope(q_ptr, k_ptr, head_dim, n_heads, n_kv_heads, cos_pos_i, sin_pos_i, c->rope_type, rope_half_i);
+
+        /* Store K in KV cache */
+        {
+            uint8_t *kcache_layer = s->key_cache + (size_t)l * seq_len * s->kv_row_size_k;
+            uint8_t *key_pos = kcache_layer + (size_t)pos * s->kv_row_size_k;
+            if (s->kv_type_k == KV_CACHE_Q8_0) {
+                quantize_row_q8_0(k_ptr, key_pos, kv_dim);
+            } else if (s->kv_type_k == KV_CACHE_Q4_0) {
+                quantize_row_q4_0(k_ptr, key_pos, kv_dim);
+            } else {
+                uint16_t *kf = (uint16_t *)key_pos;
+                for (int d = 0; d < kv_dim; d++) kf[d] = fp32_to_fp16(k_ptr[d]);
+            }
+        }
+
+        /* Store V in KV cache */
+        {
+            uint8_t *vcache_layer = s->val_cache + (size_t)l * seq_len * s->kv_row_size_v;
+            uint8_t *val_pos = vcache_layer + (size_t)pos * s->kv_row_size_v;
+            if (s->kv_type_v == KV_CACHE_Q8_0) {
+                quantize_row_q8_0(v_ptr, val_pos, kv_dim);
+            } else if (s->kv_type_v == KV_CACHE_Q4_0) {
+                quantize_row_q4_0(v_ptr, val_pos, kv_dim);
+            } else {
+                uint16_t *vf = (uint16_t *)val_pos;
+                for (int d = 0; d < kv_dim; d++) vf[d] = fp32_to_fp16(v_ptr[d]);
+            }
+        }
+
+        /* Attention */
+        attn_group_ctx_t gctx;
+        gctx.kv_mul = kv_mul; gctx.head_dim = head_dim; gctx.pos = pos;
+        gctx.kv_type_k = s->kv_type_k; gctx.kv_type_v = s->kv_type_v;
+        gctx.kv_row_size_k = s->kv_row_size_k; gctx.kv_row_size_v = s->kv_row_size_v;
+        gctx.kv_head_stride_k = s->kv_head_stride_k; gctx.kv_head_stride_v = s->kv_head_stride_v;
+        gctx.kcache = s->key_cache + (size_t)l * seq_len * s->kv_row_size_k;
+        gctx.vcache = s->val_cache + (size_t)l * seq_len * s->kv_row_size_v;
+        gctx.q = q_ptr; gctx.xb = s->xb;
+        gctx.n_kv_heads = n_kv_heads;
+        gctx.kv_hadamard_k = 0; gctx.kv_hadamard_v = 0; gctx.kv_hadamard_size = 0;
+        gctx.attn_scale = 1.0f / sqrtf((float)head_dim);
+        gctx.n_swa = c->n_swa_layer[l];
+        tensor_parallel_for(n_kv_heads, attention_group, &gctx);
+        if (getenv("PICOLM_DBG_SPARK") && l == 0 && pos == 0) {
+            fprintf(stderr, "[SPARK_DBG] after attention: xb[0:4]=[%.4f %.4f %.4f %.4f] xb2[0:4]=[%.4f %.4f %.4f %.4f]\n",
+                    s->xb[0], s->xb[1], s->xb[2], s->xb[3],
+                    s->xb2[0], s->xb2[1], s->xb2[2], s->xb2[3]);
+        }
+
+        /* ---- Head-wise sigmoid gate ----
+         * gate_raw = W_gate * attn_inp, where attn_inp = post-RMSNorm (saved in s->xb2).
+         * Per llama.cpp spark2-5.cpp line 81: attn_inp = cur (the RMSNorm output). */
+        if (getenv("PICOLM_DBG_SPARK") && l == 0 && pos == 0) {
+            fprintf(stderr, "[SPARK_DBG] l=%d attn_gate=%p type_attn_gate=%d dim=%d n_heads=%d xb2[0:4]=[%.4f %.4f %.4f %.4f]\n",
+                    l, (const void*)lw->attn_gate, lw->type_attn_gate, dim, n_heads,
+                    s->xb2[0], s->xb2[1], s->xb2[2], s->xb2[3]);
+        }
+        matmul(s->spark_gate, s->xb2, lw->attn_gate, dim, n_heads, lw->type_attn_gate);
+        /* Sigmoid */
+        for (int h = 0; h < n_heads; h++) {
+            s->spark_gate[h] = 1.0f / (1.0f + expf(-s->spark_gate[h]));
+        }
+
+        /* Debug: dump gate values at first layer, first pos */
+        if (getenv("PICOLM_DBG_SPARK") && l == 0 && pos <= 2) {
+            fprintf(stderr, "[SPARK_DBG] l=%d pos=%d gate_raw=[", l, pos);
+            for (int h = 0; h < n_heads; h++) fprintf(stderr, "%.4f ", s->spark_gate[h]);
+            fprintf(stderr, "] attn_out[0:4]=[%.4f %.4f %.4f %.4f] x[0:4]=[%.4f %.4f %.4f %.4f]\n",
+                    s->xb[0], s->xb[1], s->xb[2], s->xb[3],
+                    s->x[0], s->x[1], s->x[2], s->x[3]);
+        }
+
+        /* Broadcast multiply: attn_output [head_dim, n_heads] *= gate [1, n_heads] */
+        for (int h = 0; h < n_heads; h++) {
+            float g = s->spark_gate[h];
+            float *attn_h = s->xb + h * head_dim;
+            for (int d = 0; d < head_dim; d++) {
+                attn_h[d] *= g;
+            }
+        }
+
+        /* Output projection */
+        tensor_set_repacked(m->repack_used[ri+3] ? m->repack_buffers[ri+3] : NULL);
+        matmul(s->xb2, s->xb, lw->attn_output, q_dim, dim, lw->type_attn_output);
+        tensor_set_repacked(NULL);
+
+        /* Residual: x += attn_out */
+        vec_add(s->x, s->xb2, dim);
+
+        /* ---- FFN block (GeGLU) ---- */
+        /* ffn_in = cur (post-attention residual) */
+        /* RMSNorm */
+        rmsnorm(s->xb, s->x, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
+
+        /* Gate and Up projections */
+        tensor_set_repacked(m->repack_used[ri+4] ? m->repack_buffers[ri+4] : NULL);
+        matmul(s->hb, s->xb, lw->ffn_gate, dim, n_ffn, lw->type_ffn_gate);
+        tensor_set_repacked(NULL);
+
+        tensor_set_repacked(m->repack_used[ri+6] ? m->repack_buffers[ri+6] : NULL);
+        matmul(s->hb2, s->xb, lw->ffn_up, dim, n_ffn, lw->type_ffn_up);
+        tensor_set_repacked(NULL);
+
+        /* GELU(gate) * up */
+        gelu(s->hb, n_ffn);
+        elemwise_mul(s->hb, s->hb, s->hb2, n_ffn);
+
+        /* Down projection */
+        tensor_set_repacked(m->repack_used[ri+5] ? m->repack_buffers[ri+5] : NULL);
+        matmul(s->xb, s->hb, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
+        tensor_set_repacked(NULL);
+
+        /* Residual: x += ffn_out */
+        vec_add(s->x, s->xb, dim);
+
+#ifdef PICOLM_VIZ
+        viz_push_row(l, pos, s->x, dim);
+#endif
+        BENCH_LAYER_END(l, 0);
+    }
+
+    /* 3. Final RMSNorm */
+    rmsnorm(s->x, s->x, s->output_norm_w, dim, c->rms_norm_eps);
+
+    /* 4. Output projection -> logits */
+    tensor_set_repacked(m->repack_used[1] ? m->repack_buffers[1] : NULL);
+    matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
+    tensor_set_repacked(NULL);
+
+    return s->logits;
+}
+
 /* ---- GPT-2 forward pass (specialized) ---- */
 static float *model_forward_gpt2(model_t *m, int token, int pos);
 static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt);
 static float *model_forward_gptneox(model_t *m, int token, int pos);
 static float *model_forward_prefill_gptneox(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt);
+static float *model_forward_spark25(model_t *m, int token, int pos);
 
 float *model_forward(model_t *m, int token, int pos) {
     /* Bounds check: pos must be within KV cache allocation */
@@ -2742,6 +3012,10 @@ float *model_forward(model_t *m, int token, int pos) {
     /* GLM-5.3-Flash: mHC + KDA/MLA hybrid */
     if (m->config.is_glm5) {
         return model_forward_glm5(m, token, pos);
+    }
+    /* Spark-X2.5: fused QKV, head-wise sigmoid gate, GeGLU FFN, SWA */
+    if (m->config.is_spark25) {
+        return model_forward_spark25(m, token, pos);
     }
     /* GPT-2 has a fundamentally different architecture (LayerNorm, fused QKV, learned pos embd) */
     if (m->config.is_gpt2) {
@@ -4625,6 +4899,16 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
     /* GPTNeoX (Krake v2) batched prefill */
     if (m->config.is_gptneox) {
         return model_forward_prefill_gptneox(m, tokens, n_tokens, start_pos, interrupt);
+    }
+    /* Spark-X2.5: per-token prefill fallback (batched prefill later) */
+    if (m->config.is_spark25) {
+        g_is_prefill = 1;
+        for (int i = 0; i < n_tokens; i++) {
+            if (interrupt && *interrupt) break;
+            (void)model_forward(m, tokens[i], start_pos + i);
+        }
+        g_is_prefill = 0;
+        return m->state.logits;
     }
 
     model_config_t *c = &m->config;

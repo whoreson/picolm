@@ -50,6 +50,8 @@ typedef struct {
     int is_glm4_tok;    /* 1 if tokenizer.ggml.pre == "glm4" (GLM-4/5 BPE with \p{N}{1,3}
                             digit grouping; see qwen_tokenize.c QWEN_PRETOK_GLM4). */
     int is_glm5;        /* 1 if model architecture is glm5next / glm5-next */
+    int is_spark25;     /* 1 if model architecture is spark2_5 */
+    int rope_dim_swa;   /* RoPE dim for SWA layers (0=inherit rope_dim) */
     int max_seq_len;    /* maximum sequence length (e.g. 2048) */
     int head_dim;       /* = n_embd / n_heads */
     float rope_freq_base; /* RoPE theta base (e.g. 10000.0) */
@@ -270,6 +272,8 @@ typedef struct {
     const void *attn_norm_bias; /* GPT-2: [n_embd] F32 */
     const void *post_attn_norm_bias; /* GPT-2: [n_embd] F32 */
     const void *attn_gate_ssm;  /* SSM: [n_embd, value_dim] */
+    const void *attn_gate;      /* Spark-X2.5: [n_embd, n_head] head-wise gate */
+    gguf_type_t type_attn_gate; /* Spark-X2.5 attn_gate quant type */
     /* MoE tensors (3D expert weights) */
     const void *ffn_gate_exps;      /* [n_embd, n_ff_exp, n_expert] */
     const void *ffn_up_exps;        /* [n_embd, n_ff_exp, n_expert] */
@@ -492,8 +496,9 @@ typedef struct {
     float *x;            /* current activation [n_embd] */
     float *xb;           /* buffer after norm / attention output [n_embd] */
     float *xb2;          /* second buffer [n_embd] */
-    float *q;            /* query vector [n_embd] */
+    float *q;            /* query vector [n_embd] (also used as qkv for fused QKV) */
     /* att buffer REMOVED - flash attention uses online softmax */
+    float *spark_gate;    /* Spark-X2.5: head-wise gate output [n_heads] */
     float *hb;           /* FFN hidden buffer [n_ffn] */
     float *hb2;          /* FFN hidden buffer 2 [n_ffn] */
     float *logits;       /* output logits [vocab_size] */

@@ -75,6 +75,43 @@ static int in_ranges(uint32_t cp, const urange *r, int n) {
 }
 static int is_L(uint32_t cp) { return in_ranges(cp, UL, (int)(sizeof UL/sizeof*UL)); }
 static int is_N(uint32_t cp) { return in_ranges(cp, UN, (int)(sizeof UN/sizeof*UN)); }
+
+/* Unicode Mark (Mn/Mc/Me) - combining characters, accents */
+static const urange UM[] = {
+    {0x0300,0x036F},{0x1AB0,0x1AFF},{0x1DC0,0x1DFF},
+    {0x20D0,0x20FF},{0x2DE0,0x2DFF},{0xA66F,0xA66F},
+    {0xA670,0xA672},{0xA674,0xA67D},{0xA69E,0xA69F},
+    {0xA6F0,0xA6F1},{0xFB1E,0xFB1E},{0xFE00,0xFE0F},
+    {0xFE20,0xFE2F},{0xFE33,0xFE34},{0xFE4D,0xFE4F},
+    {0xFF9E,0xFF9F},{0x101FD,0x101FD},{0x102E0,0x102E0},
+    {0x1DC00,0x1DC9F},{0x1DF00,0x1DFFF}
+};
+static int is_M(uint32_t cp) { return in_ranges(cp, UM, (int)(sizeof UM/sizeof*UM)); }
+
+/* Unicode Punctuation (Pc/Pd/Ps/Pe/Pi/Pf/Po) */
+static const urange UP[] = {
+    {0x0020,0x0020},{0x0021,0x002F},{0x003A,0x0040},
+    {0x005B,0x0060},{0x007B,0x007E},{0x0085,0x0085},
+    {0x2000,0x200F},{0x2010,0x2027},{0x2030,0x205E},
+    {0x3001,0x3003},{0x3008,0x3020},{0xFE30,0xFE52},
+    {0xFE54, 0xFE66},{0xFF01,0xFF0F},{0xFF1A,0xFF20},
+    {0xFF3B,0xFF40},{0xFF5B,0xFF65}
+};
+static int is_P(uint32_t cp) { return in_ranges(cp, UP, (int)(sizeof UP/sizeof*UP)); }
+
+/* Unicode Symbol (Sm/Sc/Sk/So) */
+static const urange USYM[] = {
+    {0x0024,0x0024},{0x00A2,0x00A5},{0x20A0,0x20CF},
+    {0x2100,0x214F},{0x2190,0x21FF},{0x2200,0x22FF},
+    {0x2300,0x23FF},{0x2400,0x243F},{0x2500,0x257F},
+    {0x2580,0x259F},{0x25A0,0x25FF},{0x2600,0x26FF},
+    {0x2700,0x27BF},{0x27C0,0x27EF},{0x27F0,0x27FF},
+    {0x2900,0x297F},{0x2980,0x29FF},{0x2A00,0x2AFF},
+    {0x2E80,0x2EFF},{0x3000,0x3000},{0x3010,0x301F},
+    {0x3030,0x303F},{0x3200,0x32FF},{0x3300,0x33FF}
+};
+static int is_S(uint32_t cp) { return in_ranges(cp, USYM, (int)(sizeof USYM/sizeof*USYM)); }
+
 static int is_WS(uint32_t cp) {
     return cp==' '||cp=='\t'||cp=='\n'||cp=='\r'||cp==0x0B||cp==0x0C||cp==0xA0||
            (cp>=0x2000&&cp<=0x200A)||cp==0x2028||cp==0x2029||cp==0x202F||cp==0x205F||cp==0x3000;
@@ -144,6 +181,145 @@ static int pretok_next(const char *s, int n) {
  * Reference: llama.cpp LLAMA_VOCAB_PRE_TYPE_GLM4 (llama-vocab.cpp). */
 static int pretok_next_glm4(const char *s, int n) {
     return pretok_next_common(s, n, 1);
+}
+
+/* Spark-X2.5 pretokenizer.
+ * Reference: llama.cpp LLAMA_VOCAB_PRE_TYPE_SPARK2_5 (llama-vocab.cpp:337).
+ * Four patterns:
+ *   1. \p{N}{1,3}        - 1-3 digits grouped
+ *   2. [CJK]+            - CJK ideograph runs
+ *   3. Complex letter/punct/whitespace rule (similar to DEFAULT with CJK)
+ *   4. \p{N}             - single digit fallback
+ *
+ * Implementation follows the regex order: digits first, then CJK, then
+ * the complex ASCII/letter rule, then single digit. */
+static int pretok_next_spark25(const char *s, int n) {
+    int cp, adv;
+    if (n <= 0) return 0;
+    adv = utf8_next(s, n, &cp);
+
+    /* Pattern 1: \p{N}{1,3} - up to 3 digits grouped */
+    if (is_N(cp)) {
+        int j = adv, cnt = 1;
+        while (j < n && cnt < 3) {
+            int c3, a3 = utf8_next(s + j, n - j, &c3);
+            if (!is_N(c3)) break;
+            j += a3; cnt++;
+        }
+        return j;
+    }
+
+    /* Pattern 2: CJK ideograph runs [!-~]+ (simplified: CJK unified + Japanese) */
+    /* Unicode ranges: 4E00-9FFF (CJK Unified), 3040-309F (Hiragana),
+       30A0-30FF (Katakana), 31F0-31FF (Katakana Phonetic),
+       3400-4DBF (CJK Ext A), AC00-D7AF (Hangul Syllables) */
+    if ((cp >= 0x4E00 && cp <= 0x9FFF) || (cp >= 0x3040 && cp <= 0x30FF) ||
+        (cp >= 0x31F0 && cp <= 0x31FF) || (cp >= 0x3400 && cp <= 0x4DBF) ||
+        (cp >= 0xAC00 && cp <= 0xD7AF) || (cp >= 0x20000 && cp <= 0x2A6DF)) {
+        int j = adv;
+        while (j < n) {
+            int c3, a3 = utf8_next(s + j, n - j, &c3);
+            if (!((c3 >= 0x4E00 && c3 <= 0x9FFF) || (c3 >= 0x3040 && c3 <= 0x30FF) ||
+                  (c3 >= 0x31F0 && c3 <= 0x31FF) || (c3 >= 0x3400 && c3 <= 0x4DBF) ||
+                  (c3 >= 0xAC00 && c3 <= 0xD7AF) || (c3 >= 0x20000 && c3 <= 0x2A6DF)))
+                break;
+            j += a3;
+        }
+        return j;
+    }
+
+    /* Pattern 3: complex letter/punct/whitespace rule.
+     * [!-~][A-Za-z]+ - ASCII punct followed by ASCII letters
+     * [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+ - optional non-letter/punct/symbol prefix + letters
+     * ?[\p{P}\p{S}]+ - optional space + punct/symbol run
+     * [\r\n] - newline
+     * \s+(?!\S) - whitespace followed by more whitespace
+     * \s+ - whitespace run
+     *
+     * Simplified: follow the DEFAULT path with CJK awareness. */
+
+    /* Contractions (case-insensitive) */
+    if (s[0] == '\'' && n >= 2) {
+        char c1 = s[1] | 32, c2 = (n >= 3) ? (s[2] | 32) : 0;
+        if (c1 == 's' || c1 == 't' || c1 == 'm' || c1 == 'd') return 2;
+        if ((c1 == 'r' && c2 == 'e') || (c1 == 'v' && c2 == 'e') ||
+            (c1 == 'l' && c2 == 'll')) return 3;
+    }
+
+    /* ASCII punct [!-~] followed by ASCII letters [A-Za-z]+ */
+    if (cp >= 0x21 && cp <= 0x7E && !is_WS(cp) && !is_L(cp) && !is_N(cp)) {
+        if (adv < n) {
+            int c2; utf8_next(s + adv, n - adv, &c2);
+            if (c2 >= 'A' && c2 <= 'Z') {
+                int j = adv;
+                while (j < n) {
+                    int c3; utf8_next(s + j, n - j, &c3);
+                    if (!((c3 >= 'A' && c3 <= 'Z') || (c3 >= 'a' && c3 <= 'z'))) break;
+                    j += 1;
+                }
+                if (j > adv) return j;
+            }
+        }
+    }
+
+    /* Optional prefix + letters [\p{L}\p{M}]+ */
+    {
+        int j = 0, c0 = cp, a0 = adv;
+        if (c0 != '\r' && c0 != '\n' && !is_L(c0) && !is_N(c0) && !is_P(c0) && !is_S(c0)) {
+            if (a0 < n) {
+                int c2, a2 = utf8_next(s + a0, n - a0, &c2);
+                if (is_L(c2) || is_M(c2)) {
+                    j = a0 + a2;
+                    while (j < n) { int c3, a3 = utf8_next(s + j, n - j, &c3); if (!is_L(c3) && !is_M(c3)) break; j += a3; }
+                    return j;
+                }
+            }
+        } else if (is_L(c0) || is_M(c0)) {
+            j = a0;
+            while (j < n) { int c3, a3 = utf8_next(s + j, n - j, &c3); if (!is_L(c3) && !is_M(c3)) break; j += a3; }
+            return j;
+        }
+    }
+
+    /* Optional space + punct/symbol run */
+    {
+        int j = 0;
+        if (cp == ' ' && adv < n) {
+            int c2; utf8_next(s + adv, n - adv, &c2);
+            if (!is_WS(c2) && !is_L(c2) && !is_N(c2)) j = adv;
+        }
+        if (j > 0 || (!is_WS(cp) && !is_L(cp) && !is_N(cp))) {
+            int k = j;
+            while (k < n) {
+                int c3, a3 = utf8_next(s + k, n - k, &c3);
+                if (is_WS(c3) || is_L(c3) || is_N(c3)) break;
+                k += a3;
+            }
+            if (k > j || j > 0) {
+                while (k < n && (s[k] == '\r' || s[k] == '\n')) k++;
+                if (k > 0) return k;
+            }
+        }
+    }
+
+    /* Newline */
+    if (cp == '\r' || cp == '\n') return adv;
+
+    /* Whitespace */
+    if (is_WS(cp)) {
+        int j = 0, last_nl = -1;
+        while (j < n) {
+            int c3, a3 = utf8_next(s + j, n - j, &c3);
+            if (!is_WS(c3)) break;
+            if (c3 == '\r' || c3 == '\n') last_nl = j + a3;
+            j += a3;
+        }
+        if (last_nl > 0) return last_nl;
+        if (j < n && j > adv) return (j - 1 == 0) ? adv : j - 1;
+        return j;
+    }
+
+    return adv; /* fallback: single codepoint */
 }
 
 static int pretok_next_common(const char *s, int n, int glm4_digits) {
@@ -474,7 +650,8 @@ int qwen_tokenize_should_use(const model_t *m) {
      * Llama SPM and other architectures should use the old tokenizer.
      * Safetensors Qwen models also use this tokenizer (from_safetensors path). */
     return m->config.is_qwen || m->config.is_gpt2 || m->config.is_tekken ||
-           m->config.is_gptneox || m->config.is_glm4_tok || m->from_safetensors;
+           m->config.is_gptneox || m->config.is_glm4_tok || m->config.is_spark25 ||
+           m->from_safetensors;
 }
 
 /* Initialize the Qwen tokenizer from model data */
@@ -483,6 +660,7 @@ int qwen_tokenize_init(qwen_enc_t *enc, const model_t *m) {
 
     enc->pretok_type = m->config.is_tekken ? QWEN_PRETOK_TEKKEN
                      : m->config.is_glm4_tok ? QWEN_PRETOK_GLM4
+                     : m->config.is_spark25 ? QWEN_PRETOK_SPARK25
                      : QWEN_PRETOK_DEFAULT;
 
     /* Guard: Qwen tokenizer requires tok_tokens_data from GGUF */
@@ -647,6 +825,8 @@ int qwen_tokenize_encode(qwen_enc_t *enc, const char *text, int *out, int cap) {
                       ? pretok_next_tekken(text + q, end - q)
                       : (enc->pretok_type == QWEN_PRETOK_GLM4)
                       ? pretok_next_glm4(text + q, end - q)
+                      : (enc->pretok_type == QWEN_PRETOK_SPARK25)
+                      ? pretok_next_spark25(text + q, end - q)
                       : pretok_next(text + q, end - q);
             if (pl <= 0) pl = 1;
             m2 += bpe_piece(enc, text + q, pl, out + m2, cap - m2);

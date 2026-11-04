@@ -1118,6 +1118,10 @@ int parse_gguf(model_t *m, int max_seq_len) {
                     (arch.len == 9 && memcmp(arch.str, "glm5-next", 9) == 0)) {
                     cfg->is_glm5 = 1;
                 }
+                /* Check for Spark-X2.5: "spark2_5" */
+                if (arch.len == 8 && memcmp(arch.str, "spark2_5", 8) == 0) {
+                    cfg->is_spark25 = 1;
+                }
             } else {
                 skip_meta_value(&r, vtype, &dummy);
             }
@@ -1127,7 +1131,7 @@ int parse_gguf(model_t *m, int max_seq_len) {
         if (str_eq(key, "glm5next.embedding_length") || str_eq(key, "llama.embedding_length") || str_eq(key, "general.embedding_length")
             || str_eq(key, "qwen2.embedding_length") || str_eq(key, "qwen3.embedding_length") || str_eq(key, "qwen35.embedding_length") || str_eq(key, "qwen35moe.embedding_length")
             || str_eq(key, "gemma3n.embedding_length") || str_eq(key, "gpt2.embedding_length") || str_eq(key, "stablelm.embedding_length")
-            || str_eq(key, "gptneox.embedding_length")) {
+            || str_eq(key, "gptneox.embedding_length") || str_eq(key, "spark2_5.embedding_length")) {
             int dummy; cfg->n_embd = (int)skip_meta_value(&r, vtype, &dummy);
             /* RoPE convention per family.
              *
@@ -1193,24 +1197,25 @@ int parse_gguf(model_t *m, int max_seq_len) {
         } else if (str_eq(key, "glm5next.feed_forward_length") || str_eq(key, "llama.feed_forward_length") || str_eq(key, "general.feed_forward_length")
             || str_eq(key, "qwen2.feed_forward_length") || str_eq(key, "qwen3.feed_forward_length") || str_eq(key, "qwen35.feed_forward_length")
             || str_eq(key, "gemma3n.feed_forward_length") || str_eq(key, "gpt2.feed_forward_length") || str_eq(key, "stablelm.feed_forward_length")
-            || str_eq(key, "gptneox.feed_forward_length")) {
+            || str_eq(key, "gptneox.feed_forward_length") || str_eq(key, "spark2_5.feed_forward_length")) {
             cfg->n_ffn = (int)read_ffn_length(&r, vtype);
         } else if (str_eq(key, "glm5next.attention.head_count") || str_eq(key, "llama.attention.head_count")
             || str_eq(key, "qwen2.attention.head_count") || str_eq(key, "qwen3.attention.head_count") || str_eq(key, "qwen35.attention.head_count") || str_eq(key, "qwen35moe.attention.head_count")
             || str_eq(key, "gemma3n.attention.head_count") || str_eq(key, "gpt2.attention.head_count") || str_eq(key, "stablelm.attention.head_count")
-            || str_eq(key, "gptneox.attention.head_count")) {
+            || str_eq(key, "gptneox.attention.head_count") || str_eq(key, "spark2_5.attention.head_count")) {
             int dummy; cfg->n_heads = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "llama.attention.head_count_kv")
             || str_eq(key, "qwen2.attention.head_count_kv") || str_eq(key, "qwen3.attention.head_count_kv") || str_eq(key, "qwen35.attention.head_count_kv") || str_eq(key, "qwen35moe.attention.head_count_kv")
             || str_eq(key, "gemma3n.attention.head_count_kv") || str_eq(key, "gpt2.attention.head_count_kv") || str_eq(key, "stablelm.attention.head_count_kv")
-            || str_eq(key, "gptneox.attention.head_count_kv")) {
+            || str_eq(key, "gptneox.attention.head_count_kv") || str_eq(key, "spark2_5.attention.head_count_kv")) {
             int dummy; cfg->n_kv_heads = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "attention.key_length")
             || str_eq(key, "llama.attention.key_length")
             || str_eq(key, "qwen2.attention.key_length")
             || str_eq(key, "qwen3.attention.key_length") || str_eq(key, "qwen35.attention.key_length")
             || str_eq(key, "qwen35moe.attention.key_length")
-            || str_eq(key, "gemma3n.attention.key_length")) {
+            || str_eq(key, "gemma3n.attention.key_length")
+            || str_eq(key, "spark2_5.attention.key_length")) {
             /* Explicit head_dim (Qwen3/3.5/Gemma-3n/Mistral-Nemo may differ from n_embd/n_heads).
              * GLM-5: attention.key_length is the KDA qkv output dim (d_inner), NOT
              * head_dim. head_dim for MLA comes from attention.key_length_mla. We
@@ -1224,16 +1229,17 @@ int parse_gguf(model_t *m, int max_seq_len) {
         } else if (str_eq(key, "glm5next.block_count") || str_eq(key, "llama.block_count")
             || str_eq(key, "qwen2.block_count") || str_eq(key, "qwen3.block_count") || str_eq(key, "qwen35.block_count") || str_eq(key, "qwen35moe.block_count")
             || str_eq(key, "gemma3n.block_count") || str_eq(key, "gpt2.block_count") || str_eq(key, "stablelm.block_count")
-            || str_eq(key, "gptneox.block_count")) {
+            || str_eq(key, "gptneox.block_count") || str_eq(key, "spark2_5.block_count")) {
             int dummy; cfg->n_layers = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "glm5next.context_length") || str_eq(key, "llama.context_length")
             || str_eq(key, "qwen2.context_length") || str_eq(key, "qwen3.context_length") || str_eq(key, "qwen35.context_length") || str_eq(key, "qwen35moe.context_length")
             || str_eq(key, "gemma3n.context_length") || str_eq(key, "gpt2.context_length") || str_eq(key, "stablelm.context_length")
-            || str_eq(key, "gptneox.context_length")) {
+            || str_eq(key, "gptneox.context_length") || str_eq(key, "spark2_5.context_length")) {
             int dummy; cfg->max_seq_len = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "llama.rope.freq_base")
             || str_eq(key, "qwen2.rope.freq_base") || str_eq(key, "qwen3.rope.freq_base") || str_eq(key, "qwen35.rope.freq_base") || str_eq(key, "qwen35moe.rope.freq_base")
-            || str_eq(key, "gemma3n.rope.freq_base") || str_eq(key, "gptneox.rope.freq_base")) {
+            || str_eq(key, "gemma3n.rope.freq_base") || str_eq(key, "gptneox.rope.freq_base")
+            || str_eq(key, "spark2_5.rope.freq_base")) {
             if (vtype == GGUF_META_FLOAT32) {
                 cfg->rope_freq_base = read_f32(&r);
             } else {
@@ -1242,8 +1248,17 @@ int parse_gguf(model_t *m, int max_seq_len) {
         } else if (str_eq(key, "qwen35.rope.dimension_count")
             || str_eq(key, "qwen35moe.rope.dimension_count")
             || str_eq(key, "llama.rope.dimension_count") || str_eq(key, "stablelm.rope.dimension_count")
-            || str_eq(key, "gptneox.rope.dimension_count")) {
+            || str_eq(key, "gptneox.rope.dimension_count")
+            || str_eq(key, "spark2_5.rope.dimension_count")) {
             int dummy; cfg->rope_dim = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "spark2_5.rope.dimension_count_swa")) {
+            int dummy; cfg->rope_dim_swa = (int)skip_meta_value(&r, vtype, &dummy);
+        } else if (str_eq(key, "spark2_5.rope.freq_base_swa")) {
+            if (vtype == GGUF_META_FLOAT32) {
+                cfg->rope_freq_base_swa = read_f32(&r);
+            } else {
+                skip_meta_value_warn(&r, vtype, key.str);
+            }
         } else if (str_eq(key, "rope.dimension_sections")
             || str_eq(key, "qwen35.rope.dimension_sections")
             || str_eq(key, "qwen35moe.rope.dimension_sections")) {
@@ -1371,7 +1386,8 @@ int parse_gguf(model_t *m, int max_seq_len) {
             || str_eq(key, "gemma3n.attention.layer_norm_rms_epsilon")
             || str_eq(key, "gpt2.attention.layer_norm_epsilon") || str_eq(key, "stablelm.attention.layer_norm_epsilon")
             || str_eq(key, "glm5next.attention.layer_norm_rms_epsilon")
-            || str_eq(key, "gptneox.attention.layer_norm_epsilon")) {
+            || str_eq(key, "gptneox.attention.layer_norm_epsilon")
+            || str_eq(key, "spark2_5.attention.layer_norm_rms_epsilon")) {
             /* Read epsilon from GGUF (F32 type=6 or F64 type=11 in metadata) */
             if (vtype == GGUF_META_FLOAT32) { /* F32 */
                 cfg->rms_norm_eps = read_f32(&r);
@@ -1471,7 +1487,7 @@ int parse_gguf(model_t *m, int max_seq_len) {
         } else if (str_eq(key, "llama.vocab_size")
             || str_eq(key, "qwen2.vocab_size") || str_eq(key, "qwen3.vocab_size") || str_eq(key, "qwen35.vocab_size") || str_eq(key, "qwen35moe.vocab_size")
             || str_eq(key, "gemma3n.vocab_size") || str_eq(key, "gpt2.vocab_size") || str_eq(key, "gptneox.vocab_size")
-            || str_eq(key, "glm5next.vocab_size")) {
+            || str_eq(key, "glm5next.vocab_size") || str_eq(key, "spark2_5.vocab_size")) {
             int dummy; cfg->vocab_size = (int)skip_meta_value(&r, vtype, &dummy);
         } else if (str_eq(key, "tokenizer.ggml.bos_token_id")) {
             int dummy; m->tok_bos_id = (uint32_t)skip_meta_value(&r, vtype, &dummy);
@@ -1807,6 +1823,17 @@ int parse_gguf(model_t *m, int max_seq_len) {
         if (!cfg->use_parallel_residual) cfg->use_parallel_residual = 1;
     }
 
+    /* Spark-X2.5 defaults */
+    if (cfg->is_spark25) {
+        if (cfg->n_kv_heads <= 0) cfg->n_kv_heads = cfg->n_heads;
+        if (cfg->rope_freq_base <= 0) cfg->rope_freq_base = 5000000.0f;
+        if (cfg->rope_dim <= 0) cfg->rope_dim = cfg->head_dim;
+        if (cfg->rope_dim_swa <= 0) cfg->rope_dim_swa = cfg->head_dim;
+        if (cfg->rope_freq_base_swa <= 0) cfg->rope_freq_base_swa = 10000.0f;
+        /* Spark uses Llama pairwise RoPE (rope_type=0) */
+        cfg->rope_type = 0;
+    }
+
     /* Gemma-3n defaults */
     if (cfg->is_gemma3n) {
         if (cfg->n_altup <= 0) cfg->n_altup = 4;
@@ -2095,13 +2122,19 @@ int parse_gguf(model_t *m, int max_seq_len) {
                 /* SSM tensors (Qwen3.5) / GPT-2 fused QKV */
                 else if (strcmp(suffix, "attn_qkv.weight") == 0) {
                     lw->attn_qkv = ptr; lw->type_attn_qkv = qtype;
-                    /* Only set is_attn_layer for GPT-2/GPTNeoX models. SSM models with
+                    /* Only set is_attn_layer for GPT-2/GPTNeoX/Spark models. SSM models with
                      * attn_qkv (Qwen3.6 hybrid) should not be marked as attention
                      * layers here -- the separate attn_k/attn_v loaders set it for
                      * mixed-arch layers that have those tensors. */
-                    if (m->config.is_gpt2 || m->config.is_gptneox) lw->is_attn_layer = 1;
+                    if (m->config.is_gpt2 || m->config.is_gptneox || m->config.is_spark25) lw->is_attn_layer = 1;
                 } else if (strcmp(suffix, "attn_gate.weight") == 0) {
-                    lw->attn_gate_ssm = ptr; lw->type_attn_gate_ssm = qtype;
+                    if (cfg->is_spark25) {
+                        /* Spark-X2.5: [n_embd, n_head] head-wise gate */
+                        lw->attn_gate = ptr; lw->type_attn_gate = qtype;
+                    } else {
+                        /* SSM (Qwen3.5): [n_embd, value_dim] gate */
+                        lw->attn_gate_ssm = ptr; lw->type_attn_gate_ssm = qtype;
+                    }
                 } else if (!cfg->is_glm5 && strcmp(suffix, "ssm_a") == 0) {
                     lw->ssm_a = ptr; lw->type_ssm_a = qtype;
                 } else if (strcmp(suffix, "ssm_alpha.weight") == 0) {
@@ -2490,6 +2523,34 @@ int parse_gguf(model_t *m, int max_seq_len) {
         }
     }
 
+    /* Verify required tensors for Spark-X2.5 */
+    if (cfg->is_spark25) {
+        for (int l = 0; l < cfg->n_layers; l++) {
+            layer_weights_t *lw = &w->layers[l];
+            if (!lw->attn_qkv || !lw->attn_gate || !lw->attn_output ||
+                !lw->ffn_gate || !lw->ffn_up || !lw->ffn_down) {
+                fprintf(stderr, "ERROR: Spark-X2.5 model missing required tensors at layer %d\n", l);
+                return -1;
+            }
+        }
+        /* Spark GGUFs may be missing output_norm.weight. If so, we create
+         * a dummy F32 all-ones buffer so the forward pass RMSNorm becomes
+         * effectively a no-op (norm by 1.0). This matches the GGUF that
+         * was observed in the wild. */
+        if (!w->output_norm) {
+            w->output_norm = calloc(cfg->n_embd, sizeof(float));
+            if (!w->output_norm) {
+                fprintf(stderr, "ERROR: Spark-X2.5: failed to allocate dummy output_norm\n");
+                return -1;
+            }
+            for (int i = 0; i < cfg->n_embd; i++) {
+                ((float *)w->output_norm)[i] = 1.0f;
+            }
+            w->type_output_norm = GGUF_TYPE_F32;
+            fprintf(stderr, "WARN: Spark-X2.5: output_norm.weight missing, using dummy (all ones)\n");
+        }
+    }
+
     /* Count MTP layers from the end: layers with "nextn" tensors.
      * GLM-5 already did this inside its derive block (before layer
      * classification); skip here so n_mtp_layers is not double-counted. */
@@ -2571,6 +2632,12 @@ int parse_gguf(model_t *m, int max_seq_len) {
         fprintf(stderr, "  Gemma-3n: altup=%d active=%d laurel_rank=%d embd_altup=%d kv_layers=%d softcap=%.1f\n",
                 cfg->n_altup, cfg->i_altup_act, cfg->laurel_rank, cfg->n_embd_altup,
                 cfg->n_layer_kv_from_start, (double)cfg->f_final_logit_softcapping);
+    }
+    if (cfg->is_spark25) {
+        fprintf(stderr, "  Spark-X2.5: rope_dim=%d rope_dim_swa=%d freq_base=%.0f freq_base_swa=%.0f swa=%d\n",
+                cfg->rope_dim, cfg->rope_dim_swa,
+                (double)cfg->rope_freq_base, (double)cfg->rope_freq_base_swa,
+                cfg->n_swa);
     }
     /* On big-endian, GGUF stores all multi-byte values as little-endian.
      * Swap F16 values in-place for all quantized block types that contain FP16 scales.

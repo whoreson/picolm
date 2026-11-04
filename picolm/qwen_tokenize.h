@@ -14,6 +14,7 @@ enum {
     QWEN_PRETOK_DEFAULT = 0, /* Qwen3.5/3.6 / GPT-2 style pretokenizer */
     QWEN_PRETOK_TEKKEN  = 1, /* Mistral Tekken pretokenizer (Mistral-Nemo-2407+) */
     QWEN_PRETOK_GLM4    = 2, /* GLM-4 / GLM-5.3-Flash: DEFAULT with \p{N}{1,3} digits */
+    QWEN_PRETOK_SPARK25 = 3, /* Spark-X2.5 pretokenizer */
 };
 
 typedef struct {

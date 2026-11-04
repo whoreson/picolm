@@ -1,0 +1,45 @@
+candidates->size: 40
+max  = nan
+sump = nan
+r    = 2118439145
+probabilities:
+0  38  nan  nan
+1  22  nan  nan
+2  10  nan  nan
+3  34  nan  nan
+4  26  nan  nan
+5  18  nan  nan
+6  20  nan  nan
+7  4  nan  nan
+8  24  nan  nan
+9  12  nan  nan
+10  32  nan  nan
+11  28  nan  nan
+12  16  nan  nan
+13  36  nan  nan
+14  8  nan  nan
+15  39  nan  nan
+16  9  nan  nan
+17  21  nan  nan
+18  1  nan  nan
+19  23  nan  nan
+20  11  nan  nan
+21  25  nan  nan
+22  5  nan  nan
+23  27  nan  nan
+24  13  nan  nan
+25  31  nan  nan
+26  29  nan  nan
+27  15  nan  nan
+28  33  nan  nan
+29  7  nan  nan
+30  35  nan  nan
+31  17  nan  nan
+32  37  nan  nan
+33  3  nan  nan
+34  19  nan  nan
+35  0  nan  nan
+36  2  nan  nan
+37  6  nan  nan
+38  14  nan  nan
+39  30  nan  nan
