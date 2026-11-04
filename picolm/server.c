@@ -2405,6 +2405,9 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
     /* Step back when fully cached to avoid duplicate KV entry (see cache_adjust_stepback) */
     cache_adjust_stepback(model, n_prompt, &start_pos);
 
+#ifdef PICOLM_VIZ
+    viz_new_request();   /* fresh picture per request; column 0 = first token processed below */
+#endif
     if (start_pos == 0) {
         srv.kv_pos = 0;
         /* Clear checkpoints and reset SSM state on full reprocess */
@@ -3003,6 +3006,9 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
     /* Step back when fully cached to avoid duplicate KV entry (see cache_adjust_stepback) */
     cache_adjust_stepback(model, n_prompt, &start_pos);
 
+#ifdef PICOLM_VIZ
+    viz_new_request();   /* fresh picture per request; column 0 = first token processed below */
+#endif
     if (start_pos == 0) {
         srv.kv_pos = 0;
         /* Clear checkpoints and reset SSM state on full reprocess */

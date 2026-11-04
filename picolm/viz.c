@@ -140,7 +140,9 @@ typedef struct {
     _Atomic int active;          /* 1 once viz_init succeeded (gates all work) */
     _Atomic unsigned gen;        /* bumped on every data change: lets the renderer idle */
     int n_layers;                /* set by viz_set_model_info */
-    int last_end[VIZ_MAX_LAYERS];/* per layer: highest position pushed so far (producer only) */
+    int last_end[VIZ_MAX_LAYERS];/* per layer: highest column pushed so far (producer only) */
+    _Atomic int base;            /* absolute token position shown as column 0 */
+    int base_valid;              /* producer only: base set by the first push of a request */
 } viz_ring_t;
 
 static viz_ring_t viz_ring;
@@ -153,6 +155,8 @@ static void viz_ring_reset(void) {
         }
     atomic_store(&viz_ring.head, -1);
     for (int l = 0; l < VIZ_MAX_LAYERS; l++) viz_ring.last_end[l] = -1;
+    atomic_store(&viz_ring.base, 0);
+    viz_ring.base_valid = 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -519,6 +523,29 @@ static void viz_rewind_all(int from) {
 
 static void viz_dump_maybe(int pos);
 
+/* Call once at the start of every request (server mode).  Wipes the whole grid;
+ * column 0 becomes the FIRST token the following prefill pushes, regardless of
+ * how much KV cache the server reused.  Nothing that is not on screen is kept. */
+void viz_new_request(void) {
+    if (!atomic_load_explicit(&viz_ring.active, memory_order_relaxed)) return;
+    viz_rewind_all(0);                               /* clears all cells, last_end = -1, requests recalibration */
+    viz_ring.base_valid = 0;
+    atomic_store_explicit(&viz_ring.head, -1, memory_order_release);
+    atomic_fetch_add_explicit(&viz_ring.gen, 1u, memory_order_release);
+}
+
+/* Absolute token position -> column index of the current request. */
+static int viz_rel(int pos) {
+    if (!viz_ring.base_valid) {
+        atomic_store_explicit(&viz_ring.base, pos, memory_order_relaxed);
+        viz_ring.base_valid = 1;
+    } else if (pos < atomic_load_explicit(&viz_ring.base, memory_order_relaxed)) {
+        viz_rewind_all(0);                           /* went before column 0: restart the picture here */
+        atomic_store_explicit(&viz_ring.base, pos, memory_order_relaxed);
+    }
+    return pos - atomic_load_explicit(&viz_ring.base, memory_order_relaxed);
+}
+
 /* Common entry for one layer's span of positions [first_pos, last_pos]. */
 static void viz_span_begin(int layer, int first_pos) {
     if (first_pos <= viz_ring.last_end[layer]) viz_rewind_all(first_pos);
@@ -533,10 +560,11 @@ static void viz_span_end(int layer, int last_pos) {
 void viz_push_row(int layer, int pos, const float *data, int n_embd) {
     if (!atomic_load_explicit(&viz_ring.active, memory_order_relaxed)) return;
     if (layer < 0 || layer >= VIZ_MAX_LAYERS || pos < 0 || !data) return;
-    viz_span_begin(layer, pos);
-    viz_cell_write(&viz_ring.cells[pos % VIZ_TOKEN_RING][layer], pos, data, n_embd);
-    viz_span_end(layer, pos);
-    viz_dump_maybe(pos);
+    int col = viz_rel(pos);
+    viz_span_begin(layer, col);
+    viz_cell_write(&viz_ring.cells[col % VIZ_TOKEN_RING][layer], col, data, n_embd);
+    viz_span_end(layer, col);
+    viz_dump_maybe(col);
 }
 
 /* Batched prefill: x_batch is [n_tokens][n_embd] row-major (row i = absolute
@@ -546,13 +574,14 @@ void viz_push_row(int layer, int pos, const float *data, int n_embd) {
 void viz_push_batch(int layer, int start_pos, const float *x_batch, int n_tokens, int n_embd) {
     if (!atomic_load_explicit(&viz_ring.active, memory_order_relaxed)) return;
     if (layer < 0 || layer >= VIZ_MAX_LAYERS || start_pos < 0 || !x_batch || n_tokens < 1) return;
-    viz_span_begin(layer, start_pos);                /* logical start, not the first stored row */
+    int c0 = viz_rel(start_pos);
+    viz_span_begin(layer, c0);                       /* logical start, not the first stored row */
     int first = n_tokens > VIZ_TOKEN_RING ? n_tokens - VIZ_TOKEN_RING : 0;
     for (int i = first; i < n_tokens; i++)
-        viz_cell_write(&viz_ring.cells[(start_pos + i) % VIZ_TOKEN_RING][layer], start_pos + i,
+        viz_cell_write(&viz_ring.cells[(c0 + i) % VIZ_TOKEN_RING][layer], c0 + i,
                        x_batch + (size_t)i * (size_t)n_embd, n_embd);
-    viz_span_end(layer, start_pos + n_tokens - 1);
-    viz_dump_maybe(start_pos + n_tokens - 1);
+    viz_span_end(layer, c0 + n_tokens - 1);
+    viz_dump_maybe(c0 + n_tokens - 1);
 }
 
 /* Deprecated: positions are now explicit.  Kept so old callers still link. */
@@ -562,7 +591,8 @@ void viz_new_token(void) {}
 float viz_peek(int layer, int pos) {
     if (layer < 0 || layer >= VIZ_MAX_LAYERS || pos < 0) return -1.0f;
     float b[VIZ_N_BUCKETS]; int p;
-    if (!viz_cell_read(&viz_ring.cells[pos % VIZ_TOKEN_RING][layer], &p, b) || p != pos) return -1.0f;
+    pos -= atomic_load_explicit(&viz_ring.base, memory_order_relaxed);   /* absolute -> column */
+    if (pos < 0 || !viz_cell_read(&viz_ring.cells[pos % VIZ_TOKEN_RING][layer], &p, b) || p != pos) return -1.0f;
     double sq = 0; for (int i = 0; i < VIZ_N_BUCKETS; i++) sq += (double)b[i] * b[i];
     return (float)sqrt(sq / VIZ_N_BUCKETS);
 }
@@ -933,8 +963,9 @@ static void viz_render_heatmap(void) {
 
     unsigned int txt = 0xFFFFFF, dim = 0xA0A0B0;
     char buf[256];
-    snprintf(buf, sizeof(buf), "PicoLM VIZ: %s [%dL, %dd] pos=%d lay=%d/%d %s",
-             viz.model_name, viz.n_layers, viz.n_embd, head, head_filled, n_layers,
+    snprintf(buf, sizeof(buf), "PicoLM VIZ: %s [%dL, %dd] col=%d (abs %d) lay=%d/%d %s",
+             viz.model_name, viz.n_layers, viz.n_embd, head,
+             head + atomic_load_explicit(&viz_ring.base, memory_order_relaxed), head_filled, n_layers,
              atomic_load_explicit(&viz.client_connected, memory_order_relaxed) ? "VNC" : "");
     viz_draw_string(fb, fb_w, fb_h, 4, 2, buf, txt);
     int bucket_on_hdr = atomic_load_explicit(&viz.bucket_mode, memory_order_relaxed);

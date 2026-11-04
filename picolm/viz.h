@@ -59,6 +59,10 @@ void viz_push_row(int layer, int pos, const float *data, int n_embd);
  * per layer.  Only the newest VIZ_TOKEN_RING rows are used.           */
 void viz_push_batch(int layer, int start_pos, const float *x_batch, int n_tokens, int n_embd);
 
+/* Server mode: call once at the start of EVERY request.  Clears the grid; the
+ * first token the following prefill/decode pushes becomes column 0.  */
+void viz_new_request(void);
+
 /* Write the current frame to a PPM file (debug/test; also PICOLM_VIZ_DUMP). */
 int  viz_snapshot_ppm(const char *path);
 
