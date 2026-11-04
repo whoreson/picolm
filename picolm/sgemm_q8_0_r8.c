@@ -1123,5 +1123,11 @@ int sgemm_iq4_nl_r4_q8_0_best(int nrows, int ncols, int k, const void *vx, const
             return 1;
         }
     }
+#if defined(__AVX2__)
     return sgemm_iq4_nl_r4_q8_0_avx2(nrows, ncols, k, vx, vy, out, bs, ith, nth);
+#elif defined(__ARM_NEON)
+    return sgemm_iq4_nl_r4_q8_0_neon(nrows, ncols, k, vx, vy, out, bs, ith, nth);
+#else
+    return 0;
+#endif
 }

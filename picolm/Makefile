@@ -789,10 +789,10 @@ dos-clean:
 # root, so it needs -I. (the implicit search of the source file's own directory
 # no longer covers it).
 test_quant: util/test_quant.c quant.c sgemm.c
-	$(CC) $(CFLAGS) -I. -o $@ util/test_quant.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp
+	$(CC) $(TEST_NATIVE_CFLAGS) -I. -o $@ util/test_quant.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp
 
-test_q6_k_r4: tests/test_q6_k_r4.c quant.c sgemm_q6_k_r4.c
-	$(CC) $(CFLAGS) -o $@ tests/test_q6_k_r4.c quant.c sgemm_q6_k_r4.c -lm -lpthread -fopenmp
+test_q6_k_r4: tests/test_q6_k_r4.c quant.c $(SGEMM_SRCS)
+	$(CC) $(TEST_NATIVE_CFLAGS) -o $@ tests/test_q6_k_r4.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp
 
 # SIMD flags for the standalone test binaries. 'make avx2' etc. re-invoke make
 # with the SIMD flags in CFLAGS, but a later bare 'make check-all' does not
@@ -860,12 +860,16 @@ check-kvcache-tokwrite: test_kvcache_tokwrite
 # double-counted). Built for AVX2 specifically -- the AVX-512 build never used
 # this helper.
 test_hreduce: tests/test_hreduce.c model.h model_internal.h
-	$(CC) -O2 -I. -DPICOLM_AVX2=1 -DPICOLM_AVX=1 -DPICOLM_SSSE3=1 \
-	      -DPICOLM_SSE3=1 -DPICOLM_SSE2=1 -mavx2 -mf16c -o $@ $< -lm
+	$(CC) $(TEST_NATIVE_CFLAGS) -O2 -I. -o $@ $< -lm
 
 .PHONY: check-hreduce
-check-hreduce: test_hreduce
+check-hreduce:
+ifeq ($(shell uname -m),x86_64)
+	$(MAKE) test_hreduce
 	./test_hreduce
+else
+	@echo "SKIP check-hreduce (x86_64 only)"
+endif
 
 .PHONY: check-glm5-dsa
 check-glm5-dsa: test_glm5_dsa
