@@ -3238,6 +3238,8 @@ int picolm_sgemm_d_q4k(int m, int n, int k_blocks_q4k,
 #if defined(__AVX2__) && defined(__F16C__)
     if (m < 1 || n < 1 || k_blocks_q4k < 1)
         return 0;
+    /* Decode-once R8 path (VNNI / AVX2) for big shapes; falls through to the 4-column tile kernel. */
+    if (sgemm_q4_k_q8_k_fast(m, n, k_blocks_q4k, A, lda_q4k, B, ldb_q8k, C, (size_t)ldc, ith, nth)) return 1;
     sgemm_q4k_q8k_d4(m, n, k_blocks_q4k, (const block_q4_K*)A, lda_q4k,
                      (const block_q8_K*)B, ldb_q8k, C, ldc, ith, nth);
     return 1;

@@ -1258,6 +1258,10 @@ int sgemm_q6_k_r4_q8_k(int nrows, int ncols, int k,
                         const void *vx, const void *vy,
                         float *out, size_t bs,
                         int ith, int nth);
+int sgemm_q4_k_r4_q8_k_avx2(int nrows, int ncols, int k,
+                             const void *vx, const void *vy,
+                             float *out, size_t bs,
+                             int ith, int nth);
 float vec_dot_f32_f32(const void *src, const float *x, int n);
 float vec_dot_q8_0_f32(const void *src, const float *x, int n);
 void vec_dot_q8_0_f32_batch4(const void *qx0, const void *qx1, const void *qx2, const void *qx3,
@@ -1546,6 +1550,21 @@ int sgemm_q3_k_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void 
 int sgemm_q3_k_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
 int sgemm_q6_k_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);   /* table fn_gemm: always computes the full share */
 int sgemm_q3_k_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_q4_k_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_q4_k_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_q5_k_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_q5_k_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_q2_k_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_q2_k_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_q5_k_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_q2_k_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_q4_k_q8_k_fast(int nrows, int ncols, int k_blocks, const void *vx, int lda, const void *vy, int ldb, float *out, size_t bs, int ith, int nth);   /* 1 if handled, else fall through */
+int sgemm_q4_k_r4_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_q4_k_r4_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_q4_k_r4_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);   /* table fn_gemm for Q4_K_R4 */
+int sgemm_q6_k_r4_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_q6_k_r4_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_q6_k_r4_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);   /* table fn_gemm for Q6_K_R4 */
 int sgemm_iq6_k_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy,
                           float *out, size_t bs, int ith, int nth);   /* r8t when worthwhile, else tile kernel; always computes */
 /* IQ6_K plain x Q8_K ARM NEON GEMV/GEMM. */

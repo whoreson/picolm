@@ -1135,3 +1135,7 @@ bench_kq: bench_kq.c quant.c type_dispatch.c tensor.c $(SGEMM_SRCS) quant.h sgem
 probes/gemm_thread_bench: probes/gemm_thread_bench.c quant.c type_dispatch.c tensor.c $(SGEMM_SRCS) quant.h sgemm.h tensor.h
 	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O3 -o $@ probes/gemm_thread_bench.c quant.c type_dispatch.c tensor.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
 gemm_thread_bench: probes/gemm_thread_bench
+
+# ik-style / R4 K-quant table GEMM timing: ./bench_ik [m n k reps]
+bench_ik: bench_ik.c quant.c type_dispatch.c tensor.c $(SGEMM_SRCS) quant.h sgemm.h
+	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O3 -o $@ bench_ik.c quant.c type_dispatch.c tensor.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
