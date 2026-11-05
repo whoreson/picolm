@@ -3008,6 +3008,7 @@ static float *model_forward_prefill_gpt2(model_t *m, const int *tokens, int n_to
 static float *model_forward_gptneox(model_t *m, int token, int pos);
 static float *model_forward_prefill_gptneox(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt);
 static float *model_forward_spark25(model_t *m, int token, int pos);
+static float *model_forward_prefill_spark25(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt);
 
 float *model_forward(model_t *m, int token, int pos) {
     /* Bounds check: pos must be within KV cache allocation */
@@ -4869,6 +4870,253 @@ static float *model_forward_prefill_gptneox(model_t *m, const int *tokens, int n
  * Projection matmuls batched (weights read once). Attention batched.
  * ================================================================ */
 
+/* ================================================================
+ * Spark-X2.5 batched prefill (M4)
+ *
+ * Batched version of model_forward_spark25. Uses matmul_batch for
+ * all projections, batch_attention_layer for attention, and per-token
+ * loops for RMSNorm, RoPE, KV cache store, gate sigmoid, and GeGLU.
+ * ================================================================ */
+static float *model_forward_prefill_spark25(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt) {
+    (void)interrupt;
+    model_config_t *c = &m->config;
+    model_weights_t *w = &m->weights;
+    run_state_t *s = &m->state;
+
+    /* Bounds check */
+    if (start_pos + n_tokens > c->max_seq_len) {
+        int orig = n_tokens;
+        n_tokens = c->max_seq_len - start_pos;
+        if (n_tokens <= 0) {
+            fprintf(stderr, "WARN: prefill_spark25 start_pos=%d >= max_seq_len=%d, skipping\n",
+                    start_pos, c->max_seq_len);
+            return s->logits;
+        }
+        fprintf(stderr, "WARN: prefill_spark25 truncating %d->%d tokens\n", orig, n_tokens);
+    }
+
+    int dim = c->n_embd;
+    int n_ffn = c->n_ffn;
+    int n_heads = c->n_heads;
+    int n_kv_heads = c->n_kv_heads;
+    int head_dim = c->head_dim;
+    int q_dim = n_heads * head_dim;
+    int kv_dim = n_kv_heads * head_dim;
+    int qkv_dim = q_dim + kv_dim + kv_dim;
+    int seq_len = c->max_seq_len;
+    int rope_dim = (c->rope_dim > 0) ? c->rope_dim : c->head_dim;
+    int half_dim = rope_dim / 2;
+    int rope_dim_swa = c->rope_dim_swa > 0 ? c->rope_dim_swa : rope_dim;
+    int swa_half_dim = rope_dim_swa / 2;
+
+    /* Batch buffers: x, xb (Q compact / attn output), xb2 (attn_inp copy / output proj),
+     * q (fused QKV), hb (gate), hb2 (up), spark_gate
+     * xb_batch must be q_dim stride (for Q extraction + attention output),
+     * not dim stride, since q_dim >= dim for GQA models. */
+    size_t bs = (size_t)n_tokens;
+    size_t sz = bs * (dim + q_dim + dim + qkv_dim + n_ffn + n_ffn + n_heads);
+    float *buf = (float *)malloc(sz * sizeof(float));
+    if (!buf) { fprintf(stderr, "OOM: Spark-X2.5 prefill batch\n"); exit(1); }
+    float *p = buf;
+    float *x_batch = p;      p += bs * dim;
+    float *xb_batch = p;     p += bs * q_dim;
+    float *xb2_batch = p;    p += bs * dim;
+    float *q_batch = p;      p += bs * qkv_dim;
+    float *hb_batch = p;     p += bs * n_ffn;
+    float *hb2_batch = p;    p += bs * n_ffn;
+    float *spark_gate_batch = p;  p += bs * n_heads;
+
+    /* Embedding lookup */
+    {
+        size_t row_bytes = gguf_type_row_size(w->type_token_embd, dim);
+        for (int bi = 0; bi < n_tokens; bi++) {
+            const void *embd_row = (const uint8_t *)w->token_embd + (size_t)tokens[bi] * row_bytes;
+            dequantize_row(embd_row, x_batch + bi * dim, dim, w->type_token_embd);
+        }
+    }
+
+    PP_BEGIN();
+    int n_active_layers = c->n_layers;
+    for (int slot = 0; slot < n_active_layers; slot++) {
+        int l = slot;
+        layer_weights_t *lw = &w->layers[l];
+        BENCH_LAYER_START();
+        int ri = 2 + l * 9;
+
+        /* ---- Attention block ---- */
+
+        /* RMSNorm (per-token) */
+        for (int bi = 0; bi < n_tokens; bi++)
+            rmsnorm(xb_batch + bi * dim, x_batch + bi * dim, s->attn_norm_w[l], dim, c->rms_norm_eps);
+        PP_MARK(0);
+
+        /* Save attn_inp for gate (per-token) */
+        for (int bi = 0; bi < n_tokens; bi++)
+            memcpy(xb2_batch + bi * dim, xb_batch + bi * dim, dim * sizeof(float));
+
+        /* Fused QKV projection (batched): [dim, qkv_dim] */
+        tensor_set_repacked(m->repack_used[ri] ? m->repack_buffers[ri] : NULL);
+        matmul_batch(q_batch, xb_batch, n_tokens, lw->attn_qkv, dim, qkv_dim, lw->type_attn_qkv);
+        tensor_set_repacked(NULL);
+        PP_MARK(1);
+
+        /* Per-position RoPE and KV cache store */
+        {
+            int is_swa = c->n_swa_layer[l] > 0;
+            int rhalf = is_swa ? swa_half_dim : half_dim;
+            const float *cos_base = is_swa ? s->rope_cos_swa : s->rope_cos;
+            const float *sin_base = is_swa ? s->rope_sin_swa : s->rope_sin;
+            uint8_t *kcl = s->key_cache + (size_t)l * seq_len * s->kv_row_size_k;
+            uint8_t *vcl = s->val_cache + (size_t)l * seq_len * s->kv_row_size_v;
+
+            for (int bi = 0; bi < n_tokens; bi++) {
+                int pos = start_pos + bi;
+                float *qkv = q_batch + bi * qkv_dim;
+                float *q_ptr = qkv;
+                float *k_ptr = qkv + q_dim;
+                float *v_ptr = qkv + q_dim + kv_dim;
+
+                /* Apply RoPE */
+                rope(q_ptr, k_ptr, head_dim, n_heads, n_kv_heads,
+                     cos_base + (size_t)pos * rhalf,
+                     sin_base + (size_t)pos * rhalf,
+                     c->rope_type, rhalf);
+
+                /* Store K */
+                uint8_t *kp = kcl + (size_t)pos * s->kv_row_size_k;
+                if (s->kv_type_k == KV_CACHE_Q8_0) {
+                    quantize_row_q8_0(k_ptr, kp, kv_dim);
+                } else if (s->kv_type_k == KV_CACHE_Q4_0) {
+                    quantize_row_q4_0(k_ptr, kp, kv_dim);
+                } else {
+                    uint16_t *kf = (uint16_t *)kp;
+                    for (int d2 = 0; d2 < kv_dim; d2++) kf[d2] = fp32_to_fp16(k_ptr[d2]);
+                }
+
+                /* Store V */
+                uint8_t *vp = vcl + (size_t)pos * s->kv_row_size_v;
+                if (s->kv_type_v == KV_CACHE_Q8_0) {
+                    quantize_row_q8_0(v_ptr, vp, kv_dim);
+                } else if (s->kv_type_v == KV_CACHE_Q4_0) {
+                    quantize_row_q4_0(v_ptr, vp, kv_dim);
+                } else {
+                    uint16_t *vf = (uint16_t *)vp;
+                    for (int d2 = 0; d2 < kv_dim; d2++) vf[d2] = fp32_to_fp16(v_ptr[d2]);
+                }
+            }
+        }
+        PP_MARK(3);
+
+        /* Attention (batched) - extract Q from fused QKV into xb_batch (compact layout).
+         * Q is at offset 0 within each QKV row (stride qkv_dim), but batch_attention_layer
+         * expects contiguous Q with stride q_dim, so we compact it.
+         * xb2_batch holds the saved attn_inp (post-RMSNorm) for the head-wise gate. */
+        {
+            for (int bi = 0; bi < n_tokens; bi++) {
+                memcpy(xb_batch + bi * q_dim, q_batch + bi * qkv_dim, q_dim * sizeof(float));
+            }
+        }
+
+        /* Batch attention: Q in xb_batch, output to q_batch (reuse, has enough space) */
+        memset(q_batch, 0, (size_t)n_tokens * q_dim * sizeof(float));
+        {
+            int is_swa = c->n_swa_layer[l] > 0;
+            batch_attention_layer(q_batch, xb_batch,
+                                  s->key_cache + (size_t)l * seq_len * s->kv_row_size_k,
+                                  s->val_cache + (size_t)l * seq_len * s->kv_row_size_v,
+                                  n_tokens, start_pos,
+                                  n_heads, n_kv_heads, head_dim,
+                                  q_dim, s->kv_type_k, s->kv_type_v,
+                                  s->kv_row_size_k, s->kv_row_size_v,
+                                  s->kv_head_stride_k, s->kv_head_stride_v,
+                                  1.0f / sqrtf((float)head_dim),
+                                  is_swa ? c->n_swa : 0);
+        }
+        PP_MARK(4);
+
+        /* Head-wise sigmoid gate (per-token) - use saved attn_inp from xb2_batch */
+        tensor_set_repacked(NULL);
+        for (int bi = 0; bi < n_tokens; bi++) {
+            matmul(spark_gate_batch + bi * n_heads, xb2_batch + bi * dim, lw->attn_gate, dim, n_heads, lw->type_attn_gate);
+            for (int h = 0; h < n_heads; h++) {
+                float g = 1.0f / (1.0f + expf(-(spark_gate_batch + bi * n_heads)[h]));
+                float *attn_h = q_batch + bi * q_dim + h * head_dim;
+                for (int d = 0; d < head_dim; d++) attn_h[d] *= g;
+            }
+        }
+
+        /* Output projection (batched): [q_dim, dim] - attn out in q_batch */
+        tensor_set_repacked(m->repack_used[ri+3] ? m->repack_buffers[ri+3] : NULL);
+        matmul_batch(xb2_batch, q_batch, n_tokens, lw->attn_output, q_dim, dim, lw->type_attn_output);
+        tensor_set_repacked(NULL);
+
+        /* Residual: x += attn_out */
+        for (int bi = 0; bi < n_tokens; bi++) {
+            float *x = x_batch + bi * dim;
+            float *attn = xb2_batch + bi * dim;
+            for (int i = 0; i < dim; i++) x[i] += attn[i];
+        }
+        PP_MARK(5);
+
+        /* ---- FFN block (GeGLU) ---- */
+
+        /* RMSNorm (per-token) */
+        for (int bi = 0; bi < n_tokens; bi++)
+            rmsnorm(xb_batch + bi * dim, x_batch + bi * dim, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
+
+        /* Gate and Up projections (batched) */
+        tensor_set_repacked(m->repack_used[ri+4] ? m->repack_buffers[ri+4] : NULL);
+        matmul_batch(hb_batch, xb_batch, n_tokens, lw->ffn_gate, dim, n_ffn, lw->type_ffn_gate);
+        tensor_set_repacked(NULL);
+
+        tensor_set_repacked(m->repack_used[ri+6] ? m->repack_buffers[ri+6] : NULL);
+        matmul_batch(hb2_batch, xb_batch, n_tokens, lw->ffn_up, dim, n_ffn, lw->type_ffn_up);
+        tensor_set_repacked(NULL);
+
+        /* GELU(gate) * up (per-token) */
+        for (int bi = 0; bi < n_tokens; bi++) {
+            gelu(hb_batch + bi * n_ffn, n_ffn);
+            elemwise_mul(hb_batch + bi * n_ffn, hb_batch + bi * n_ffn, hb2_batch + bi * n_ffn, n_ffn);
+        }
+
+        /* Down projection (batched): [n_ffn, dim] */
+        tensor_set_repacked(m->repack_used[ri+5] ? m->repack_buffers[ri+5] : NULL);
+        matmul_batch(xb_batch, hb_batch, n_tokens, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
+        tensor_set_repacked(NULL);
+
+        /* Residual: x += ffn_out */
+        for (int bi = 0; bi < n_tokens; bi++) {
+            float *x = x_batch + bi * dim;
+            float *ffn = xb_batch + bi * dim;
+            for (int i = 0; i < dim; i++) x[i] += ffn[i];
+        }
+        PP_MARK(6);
+
+#ifdef PICOLM_VIZ
+        viz_push_batch(l, start_pos, x_batch, n_tokens, dim);
+#endif
+        BENCH_LAYER_END(l, 1);
+    }
+    pp_report(n_tokens, n_active_layers);
+
+    /* Final RMSNorm (last token) */
+    rmsnorm(s->x, x_batch + (n_tokens - 1) * dim, s->output_norm_w, dim, c->rms_norm_eps);
+
+    /* Output projection -> logits */
+    tensor_set_repacked(m->repack_used[1] ? m->repack_buffers[1] : NULL);
+    matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
+    tensor_set_repacked(NULL);
+
+    free(buf);
+    return s->logits;
+}
+
+/* ================================================================
+ * model_forward_prefill: CPU batched prefill for standard Llama-family
+ * models (Qwen, SmolLM, Mistral, etc.)
+ *
+ * ================================================================ */
+
 float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt) {
     /* Bounds check: truncate n_tokens if start_pos + n_tokens exceeds max_seq_len */
     if (start_pos + n_tokens > m->config.max_seq_len) {
@@ -4911,15 +5159,9 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
     if (m->config.is_gptneox) {
         return model_forward_prefill_gptneox(m, tokens, n_tokens, start_pos, interrupt);
     }
-    /* Spark-X2.5: per-token prefill fallback (batched prefill later) */
+    /* Spark-X2.5: batched prefill */
     if (m->config.is_spark25) {
-        g_is_prefill = 1;
-        for (int i = 0; i < n_tokens; i++) {
-            if (interrupt && *interrupt) break;
-            (void)model_forward(m, tokens[i], start_pos + i);
-        }
-        g_is_prefill = 0;
-        return m->state.logits;
+        return model_forward_prefill_spark25(m, tokens, n_tokens, start_pos, interrupt);
     }
 
     model_config_t *c = &m->config;
