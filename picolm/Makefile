@@ -1124,3 +1124,14 @@ bench_iq6k_gemm: bench_iq6k_gemm.c quant.c type_dispatch.c tensor.c $(SGEMM_SRCS
 # K-quant baseline and Q6_K/Q3_K table-GEMM check: ./bench_kq [m n k reps] ;  ./bench_kq check
 bench_kq: bench_kq.c quant.c type_dispatch.c tensor.c $(SGEMM_SRCS) quant.h sgemm.h
 	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O3 -o $@ bench_kq.c quant.c type_dispatch.c tensor.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
+
+# Prefill GEMM THREAD-SCALING probe (no model file needed). Runs one picolm_sgemm_d
+# through the real thread pool at several -j values and reports per-thread GOPS,
+# parallel efficiency and the cost of an empty barrier. Use it to tell a slow
+# kernel apart from a thread-scaling problem (the Spark-X2.5 case).
+# usage: ./probes/gemm_thread_bench ;  ./probes/gemm_thread_bench -m 6656 -n 103 -k 2048 -t q8_0 -j 24
+#        ./probes/gemm_thread_bench -c          (correctness across thread counts)
+.PHONY: gemm_thread_bench
+probes/gemm_thread_bench: probes/gemm_thread_bench.c quant.c type_dispatch.c tensor.c $(SGEMM_SRCS) quant.h sgemm.h tensor.h
+	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O3 -o $@ probes/gemm_thread_bench.c quant.c type_dispatch.c tensor.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
+gemm_thread_bench: probes/gemm_thread_bench

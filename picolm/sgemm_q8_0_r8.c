@@ -40,6 +40,28 @@
  * (PICOLM_GEMM_TEST, the smoke tests' expected text). So they only engage when
  * rows * 32-value-blocks-per-row >= PICOLM_R8_MIN_BLOCKS (default 16384, roughly a 512x1024
  * matrix). Set PICOLM_R8_MIN_BLOCKS=0 to always allow them (the benches do). */
+/* Balanced row-group split for a worker: groups [*first, *last).
+ *
+ * The obvious "gpt = ceil(total/nth); rows = ith*gpt .. (ith+1)*gpt" hands the same
+ * number of groups to every thread, so the remainder lands entirely on the LAST
+ * thread (or, as often happens, every thread but the last is full and the last is
+ * short). With 832 groups on 24 threads that is 35,35,...,35,27: the 16 threads
+ * with 35 groups decide how long the whole dispatch takes, and the GEMM runs at
+ * 24/24 * 27/35 = 77% of ideal. Same effect for the small d=2048 layers (256
+ * groups -> 11 groups each, only 16 threads busy at all).
+ *
+ * Splitting the remainder across the FIRST (total % nth) threads instead makes the
+ * imbalance at most one group. Nothing depends on which thread owns which rows (the
+ * output rows are disjoint), so this is a pure scheduling change. */
+static inline void r8_bal_split(long total, int ith, int nth, long *first, long *last) {
+    if (nth < 1) nth = 1;
+    long base = total / nth, rem = total % nth;
+    long lo = (long)ith * base + (ith < rem ? ith : rem);
+    long n  = base + (ith < rem ? 1 : 0);
+    *first = lo;
+    *last  = lo + n;
+}
+
 int picolm_r8_big_enough(int m, int k_blocks) {
     static long mn = -1;
     if (mn < 0) { const char *e = getenv("PICOLM_R8_MIN_BLOCKS"); mn = (e && *e) ? atol(e) : 16384; if (mn < 0) mn = 0; }
@@ -1042,9 +1064,8 @@ int sgemm_q8_0_r8_vnni_q8_0(int nrows, int ncols, int k,
     const int nb = k / 32;
     const size_t w_stride = (size_t)nb * sizeof(block_q8_0_r8);
     const int total_groups = nrows / 8;
-    const int gpt = (total_groups + nth - 1) / nth;
-    const int g_start = ith * gpt;
-    const int g_end = (ith + 1) * gpt < total_groups ? (ith + 1) * gpt : total_groups;
+    long g_start = 0, g_end = 0;
+    r8_bal_split(total_groups, ith, nth, &g_start, &g_end);
     if (g_start >= g_end) return (nrows / 8) * 8;
     if (!r8v_reserve(ncols < R8V_PC ? ncols : R8V_PC, nb, 0)) return 0;
     for (int c0 = 0; c0 < ncols; c0 += R8V_PC) {
@@ -1064,16 +1085,34 @@ int picolm_sgemm_r8dec_vnni(int atype, int m, int n, int k_blocks, const void *v
     if (atype != GGUF_TYPE_Q8_0 && atype != GGUF_TYPE_Q4_0 && atype != GGUF_TYPE_IQ4_NL && atype != GGUF_TYPE_IQ4_NL_R4) return 0;
     if (m < 8 || (m % 8) != 0 || n < 1 || k_blocks < 1 || nth < 1) return 0;
     const int nb = k_blocks, total_groups = m / 8;
-    const int gpt = (total_groups + nth - 1) / nth;
-    const int g_start = ith * gpt;
-    const int g_end = (ith + 1) * gpt < total_groups ? (ith + 1) * gpt : total_groups;
+    long g_start = 0, g_end = 0;
+    r8_bal_split(total_groups, ith, nth, &g_start, &g_end);
     if (g_start >= g_end) return 1;
-    if (!r8v_reserve(n < R8V_PC ? n : R8V_PC, nb, 1)) return 0;
-    for (int c0 = 0; c0 < n; c0 += R8V_PC) {
-        const int pc = (n - c0 < R8V_PC) ? (n - c0) : R8V_PC;
+    /* Panel width: keep the staged activation panel in L2.
+     *
+     * r8v_stage_panel() copies a panel of columns to u8 + fp32 scales, and every
+     * thread then sweeps its weight groups against it, repacking each group into an
+     * R8 scratch block (r8a_repack_group). For that to pay off the panel has to stay
+     * resident while the groups stream past: R8V_PC=96 columns is ~96*k bytes of u8.
+     *
+     * Widening the panel to swallow a whole small batch (tried: n <= 256 in one panel)
+     * does cut the number of repack passes, but it also pushes the panel out of L2 -
+     * measured on Xeon Silver 4214 with Spark-1.7B FFN shapes, a 98-column panel gave
+     * 1666/2457/2466 GOPS over three runs (wildly unstable, cache-thrashing) while
+     * 96-column panels gave 2330/2330/2332. So the panel width is deliberately NOT
+     * stretched to the batch size; PICOLM_GEMM_PANEL_MAX only allows tuning it. */
+    int pc_max = R8V_PC;
+    {
+        static int env_max = -1;
+        if (env_max < 0) { const char *e = getenv("PICOLM_GEMM_PANEL_MAX"); env_max = (e && atoi(e) > 0) ? atoi(e) : 0; }
+        if (env_max > 0) pc_max = env_max;
+    }
+    if (!r8v_reserve(n < pc_max ? n : pc_max, nb, 1)) return 0;
+    for (int c0 = 0; c0 < n; c0 += pc_max) {
+        const int pc = (n - c0 < pc_max) ? (n - c0) : pc_max;
         r8v_stage_panel(vB, (size_t)ldb, c0, pc, nb);
-        for (int g = g_start; g < g_end; g++) {
-            r8a_repack_group(atype, vA, (size_t)lda, g, nb, r8v_tl.wr);
+        for (long g = g_start; g < g_end; g++) {
+            r8a_repack_group(atype, vA, (size_t)lda, (int)g, nb, r8v_tl.wr);
             r8v_tiles(r8v_tl.wr, pc, nb, C + (size_t)c0 * ldc + (size_t)g * 8, (size_t)ldc);
         }
     }

@@ -79,6 +79,7 @@ double get_time_ms(void) {
 #include <time.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <sys/wait.h>
 #include <fcntl.h>
 #endif
 double get_time_ms(void) {
@@ -349,6 +350,13 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --list-tensors   List all tensors (name, shape, type) and exit\n");
     fprintf(stderr, "  --list-kv        List all KV metadata entries and exit\n");
     fprintf(stderr, "  --benchmark [N]  Benchmark loop (N times, omit for continuous)\n");
+    #if defined(__linux__) || defined(__APPLE__)
+    fprintf(stderr, "  --benchmark-threads [LIST]\n");
+    fprintf(stderr, "                  Prefill once per thread count and report prefill ms / tok/s.\n");
+    fprintf(stderr, "                  LIST = comma separated thread counts (default: 1,2,4,8,12,16,24).\n");
+    fprintf(stderr, "                  Each run also prints the per-region busy%% table (same data\n");
+    fprintf(stderr, "                  as PICOLM_THREAD_PROF=1) to stderr, so use 2>&1 to see both.\n");
+#endif
     fprintf(stderr, "  --benchmark-ctx  Benchmark prefill+gen speed at growing context sizes.\n");
     fprintf(stderr, "                  Works with -c to set max context. Starts from a base prompt,\n");
     fprintf(stderr, "                  appends generated tokens, and at each step inserts 2 new tokens\n");
@@ -560,6 +568,175 @@ static void bench_summary(const bench_ctx_t *bc, int iteration, double wall_sec)
     fprintf(stdout, "  Total wall time: %.2fs\n", wall_sec);
     fprintf(stdout, "----------------------------------\n\n");
 }
+
+#if defined(__linux__) || defined(__APPLE__)
+/* Thread-scaling benchmark: --benchmark-threads [LIST]
+ *
+ * Reloads the model once per thread count (the pool is created once per process and
+ * its physical size is fixed, so a sweep has to be separate runs) and prints, per
+ * thread count: prefill tok/s, and for the heaviest parallel regions the wall time,
+ * aggregate CPU time and busy% (= cpu / (wall * threads)).
+ *
+ * busy% is the number that separates the three ways a threaded prefill loses time:
+ *   - ~100% and tok/s still flat:        the kernel itself is memory-bound
+ *   - well below 100%:                   uneven work split, or tasks too small to
+ *                                        amortise the dispatch (barrier-bound)
+ *   - 100% but per-thread throughput
+ *     drops as threads are added:        cache/bandwidth contention
+ * Compare against `-j 1` in the same table: it is the per-thread baseline.
+ *
+ * The model is reloaded via a re-exec so the thread pool of the previous count does
+ * not linger; PICOLM_BENCH_THREADS_CHILD marks the child to avoid an endless loop.
+ */
+static void benchmark_thread_scaling(const char *model_path, const char *prompt,
+        int ctx_size_limit, float temperature, int top_k, int max_tokens,
+        uint64_t seed, int num_threads, int do_prefault, const char *list,
+        int argc, char *argv[]) {
+    (void)temperature; (void)top_k; (void)seed;
+
+    /* Child mode: this process runs exactly one thread count and reports. */
+    const char *child = getenv("PICOLM_BENCH_THREADS_CHILD");
+    if (child && *child) {
+        num_threads = atoi(child);
+        if (num_threads < 1) num_threads = 1;
+        tensor_thread_profile_set(1);
+        model_set_prefault(do_prefault);
+        model_t model;
+        if (model_load(&model, model_path, ctx_size_limit, KV_CACHE_F16, KV_CACHE_F16,
+                       0, 0, num_threads) != 0) {
+            fprintf(stderr, "ERROR: failed to load model (see above)\n");
+            exit(1);
+        }
+        tensor_set_threads(num_threads);
+        tensor_threadpool_init(num_threads);
+
+        tokenizer_t tokenizer;
+        int use_qwen = qwen_tokenize_should_use(&model);
+        qwen_enc_t enc;
+        if (use_qwen) {
+            if (qwen_tokenize_init(&enc, &model) != 0) {
+                fprintf(stderr, "ERROR: qwen tokenizer init failed\n");
+                return;
+            }
+        } else {
+            tokenizer_load(&tokenizer, &model);
+        }
+
+        /* default prompt: ~100 tokens of filler, which is what makes prefill GEMMs
+         * big enough for the thread count to matter (a 5-token prompt is dominated
+         * by weight streaming and measures nothing) */
+        static const char fallback[] =
+            "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000: Write a quicksort in C";
+        const char *p = (prompt && *prompt) ? prompt : fallback;
+        int n = 0;
+        int *toks;
+        if (use_qwen) {
+            /* first call with cap 0 returns the token count (negative if -n was given) */
+            /* encode straight into a generously sized buffer: qwen_tokenize_encode()
+             * returns the number of tokens WRITTEN, so asking with cap 0 returns 0
+             * (it does not probe the length despite what some call sites assume). */
+            toks = malloc(8192 * sizeof(int));
+            n = qwen_tokenize_encode(&enc, p, toks, 8192);
+            if (n < 1) { fprintf(stderr, "ERROR: tokenizer produced no tokens\n"); free(toks); return; }
+        } else {
+            toks = malloc(8192 * sizeof(int));
+            n = tokenizer_encode(&tokenizer, p, toks, 8192, model.tok_add_bos);
+            if (n < 1) { fprintf(stderr, "ERROR: tokenizer returned 0 tokens\n"); free(toks); return; }
+        }
+        if (ctx_size_limit > 0 && n > ctx_size_limit) n = ctx_size_limit;
+
+        /* warm the weights (and the pool) so the timing is not a page-fault measurement */
+        model_forward_prefill(&model, toks, n, 0, NULL);
+        model_ssm_state_reset(&model);
+        if (model.state.kv_block) memset(model.state.kv_block, 0, model.state.kv_size);
+        tensor_thread_profile_reset();   /* profile only the timed run */
+
+        double t0 = get_time_ms();
+        model_forward_prefill(&model, toks, n, 0, NULL);
+        double dt = get_time_ms() - t0;
+
+        /* one machine-readable summary line the parent parses */
+        printf("RESULT %d %.3f %.3f\n", num_threads, dt, n > 0 ? n / (dt / 1000.0) : 0.0);
+        fflush(stdout);
+        /* tensor_thread_profile_print() runs from atexit and prints the region table */
+        free(toks);
+        return;
+    }
+
+    /* Parent: parse the list, re-exec once per thread count. */
+    int counts[64], nc = 0;
+    if (list && *list) {
+        const char *q = list;
+        while (*q && nc < 64) {
+            char *e; long v = strtol(q, &e, 10);
+            if (e == q) break;
+            if (v >= 1) counts[nc++] = (int)v;
+            q = e; while (*q == ',' || *q == ' ') q++;
+        }
+    }
+    if (nc == 0) {
+        int def[] = { 1, 2, 4, 8, 12, 16, 24 };
+        for (int i = 0; i < 7; i++) counts[nc++] = def[i];
+    }
+
+    fprintf(stdout, "\n=== thread scaling (prefill) ===\n");
+    fprintf(stdout, "  model: %s\n", model_path);
+    fprintf(stdout, "  %4s %12s %10s\n", "-j", "prefill ms", "tok/s");
+    for (int i = 0; i < nc; i++) {
+        char jb[16]; snprintf(jb, sizeof jb, "%d", counts[i]);
+        setenv("PICOLM_BENCH_THREADS_CHILD", jb, 1);
+        /* rebuild argv from the original, dropping --benchmark-threads and its arg */
+        char *argv2[64]; int ac = 0;
+        argv2[ac++] = argv[0];
+        for (int a = 1; a < argc && ac < 60; a++) {
+            if (!strcmp(argv[a], "--benchmark-threads")) {
+                /* skip the arg value too if it looks like a number list */
+                if (a + 1 < argc && argv[a+1][0] != '-') a++;
+                continue;
+            }
+            argv2[ac++] = argv[a];
+        }
+        argv2[ac] = NULL;
+        /* append "-j <count>" (ac <= 60, so there is always room for two more) */
+        char *jarg = malloc(8), *jval = malloc(16);
+        snprintf(jarg, 8, "-j");
+        snprintf(jval, 16, "%d", counts[i]);
+        argv2[ac++] = jarg; argv2[ac++] = jval; argv2[ac] = NULL;
+
+        fflush(stdout); fflush(stderr);
+        /* capture the child's stdout so the RESULT line becomes a table row
+         * (the child's region profile goes to stderr and stays visible) */
+        int pipefd[2];
+        if (pipe(pipefd) != 0) { fprintf(stderr, "pipe failed\n"); break; }
+        pid_t pid = fork();
+        if (pid == 0) {
+            close(pipefd[0]);
+            dup2(pipefd[1], STDOUT_FILENO);
+            close(pipefd[1]);
+            execv(argv2[0], argv2);
+            fprintf(stderr, "execv failed: %s\n", strerror(errno));
+            _exit(127);
+        }
+        close(pipefd[1]);
+        FILE *rf = fdopen(pipefd[0], "r");
+        char line[512];
+        double ms = -1, tps = -1;
+        while (rf && fgets(line, sizeof line, rf)) {
+            if (!strncmp(line, "RESULT ", 7)) sscanf(line + 7, "%*d %lf %lf", &ms, &tps);
+        }
+        if (rf) fclose(rf);
+        int status = 0;
+        waitpid(pid, &status, 0);
+        if (ms > 0) fprintf(stdout, "  %4d %12.0f %10.1f\n", counts[i], ms, tps);
+        free(jarg); free(jval);
+        if (status != 0) fprintf(stdout, "  %4d %12s %10s   (failed)\n", counts[i], "-", "-");
+        fflush(stdout);
+    }
+    fprintf(stdout, "\n  Look at 'busy%%' in each region table above: it is per-thread CPU time\n"
+                    "  divided by wall*threads, so 100%% means every thread worked the whole\n"
+                    "  region. Rectangles well below 100%% are unevenly split or too small.\n");
+}
+#endif /* __linux__ || __APPLE__ */
 
 /* Context scaling benchmark: --benchmark-ctx
  * Mirrors bench5.py: starts from a base prompt, generates tokens,
@@ -1114,6 +1291,7 @@ int main(int argc, char **argv) {
     int    attn_n_tok = 64, attn_n_heads = 40, attn_n_kv = 8, attn_head_dim = 128;
 #endif
     int    do_benchmark_ctx = 0;  /* --benchmark-ctx */
+    const char *bench_threads_list = NULL;  /* --benchmark-threads [LIST] */
     int    benchmark_iters = 0;   /* 0=infinite, N=run N times */
     #if !defined(_WIN32) && !defined(PICOLM_DOS)
     int    server_daemon = 0;
@@ -1281,6 +1459,13 @@ int main(int argc, char **argv) {
             attn_n_kv = atoi(argv[++i]);
             attn_head_dim = atoi(argv[++i]);
 #endif
+        } else if (strcmp(argv[i], "--benchmark-threads") == 0) {
+#if defined(__linux__) || defined(__APPLE__)
+            bench_threads_list = "";
+            if (i + 1 < argc && argv[i+1][0] != '-') bench_threads_list = argv[++i];
+#else
+            fprintf(stderr, "WARN: --benchmark-threads is Linux-only, ignoring\n");
+#endif
         } else if (strcmp(argv[i], "--benchmark-ctx") == 0) {
             do_benchmark_ctx = 1;
         } else if (strcmp(argv[i], "--ssm-batched") == 0) {
@@ -1377,6 +1562,17 @@ int main(int argc, char **argv) {
     }
 #endif
 
+    #if defined(__linux__) || defined(__APPLE__)
+    /* --benchmark-threads: thread-scaling sweep for one prefill */
+    if (bench_threads_list) {
+        if (!model_path) { fprintf(stderr, "No model file specified\n"); usage(argv[0]); return 1; }
+        benchmark_thread_scaling(model_path, prompt, context_override, temperature, top_k,
+                                 max_tokens, seed, num_threads, do_prefault, bench_threads_list,
+                                 argc, argv);
+        return 0;
+    }
+#endif
+
     /* --benchmark-ctx: context scaling benchmark */
     if (do_benchmark_ctx) {
         if (!model_path) { fprintf(stderr, "No model file specified\n"); usage(argv[0]); return 1; }
@@ -1397,6 +1593,22 @@ int main(int argc, char **argv) {
         else model_list_kv(model_path);
         return 0;
     }
+
+    #if defined(__linux__) || defined(__APPLE__)
+    /* --benchmark-threads child: run one prefill at the given -j and report.
+     * Handled here, before any normal-path side effects, because the parent
+     * re-execs this binary with PICOLM_BENCH_THREADS_CHILD set. */
+    {
+        const char *child_j = getenv("PICOLM_BENCH_THREADS_CHILD");
+        if (child_j && *child_j) {
+            if (!model_path) { fprintf(stderr, "No model file specified\n"); return 1; }
+            benchmark_thread_scaling(model_path, prompt, context_override, temperature, top_k,
+                                     max_tokens, seed, num_threads, do_prefault, "",
+                                     argc, argv);
+            return 0;
+        }
+    }
+#endif
 
     /* Read prompt from stdin if not provided via -p */
     char *stdin_prompt = NULL;

@@ -1743,6 +1743,16 @@ void picolm_init_gelu_table(void);
 void picolm_gelu_table_f32(float *x, int size);
 void picolm_gelu_f32(float *x, int size);
 
+/* Vectorised exp(x) for 8 floats (AVX/FMA builds only; |x| clamped to ~+-88 so the
+ * result stays a normal float). Returns 0 when the build has no FMA.
+ * Used by the pointwise activations (GELU here, SiLU in tensor.c) that used to call
+ * scalar expf/tanhf once per element on the prefill hot path. */
+#if (defined(PICOLM_AVX512) || defined(PICOLM_AVX2)) && defined(__FMA__)
+#include <immintrin.h>
+__m256 picolm_exp256_ps(__m256 x);
+#define PICOLM_HAVE_EXP256 1
+#endif
+
 #ifdef __cplusplus
 }
 #endif

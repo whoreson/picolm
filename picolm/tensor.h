@@ -34,6 +34,16 @@ int tensor_get_n_threads(void);
 void tensor_set_n_threads(int n);
 int tensor_get_thread_id(void);  /* returns 0 for main, 1..n-1 for pool workers */
 void tensor_threadpool_free(void);
+
+/* Threading-efficiency profile (PICOLM_THREAD_PROF=1, or call set() directly):
+ * per parallel-region wall vs CPU time, so 'busy%' shows how much of the
+ * thread-time was real work instead of idle wait. print() is called at exit
+ * when enabled and can also be called explicitly. */
+void tensor_thread_profile_set(int on);
+void tensor_thread_profile_print(void);
+void tensor_thread_profile_reset(void);   /* drop samples, e.g. after a warm-up run */
+/* Label the parallel regions dispatched next (used by the profile output only). */
+void tensor_set_region_label(const char *label);
 void matmul_batch(float *out, const float *x, int n_batch,
                    const void *W, int n, int d, gguf_type_t qtype);
 

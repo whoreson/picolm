@@ -453,6 +453,278 @@ typedef struct {
  *   - Reset pool_done = 0
  */
 
+/* ---- Threading efficiency profile (PICOLM_THREAD_PROF=1) ----
+ *
+ * Answers the question the Spark-X2.5 investigation kept asking: when a parallel
+ * region takes W wall-clock milliseconds on N threads, how much of W*N is real
+ * work and how much is a thread with nothing to do (uneven split) or one blocked
+ * waiting for the slowest (barrier)?
+ *
+ * Per dispatch, keyed by the task function:
+ *   wall  - wall time of the region (wake .. last worker done)
+ *   cpu   - sum of per-thread CPU time measured by each thread around its own
+ *           task call. A thread that finished early and spins/sleeps in the pool
+ *           adds nothing, so cpu < wall*active shows up as idle/wait time.
+ *   busy% - cpu / (wall * active). ~100% = every thread worked the whole region.
+ *
+ * Cost when enabled: two clock_gettime(CLOCK_THREAD_CPUTIME_ID) calls per thread
+ * per dispatch. Zero when PICOLM_THREAD_PROF is unset.
+ */
+typedef struct {
+    void (*fn)(int, void *);
+    const char *name;       /* explicit label, or the symbol name */
+    double wall_s, cpu_s, wall_max_s, cpu_max_s;
+    long   calls, threads_used, items;
+} thprof_t;
+#define THPROF_MAX 40
+static thprof_t thprof[THPROF_MAX];
+static int      thprof_n;
+static int      thprof_on = -1;
+
+/* Per-dispatch CPU time, indexed by pool thread id (0 = main). */
+static double thprof_tl_s[MAX_THREADS];
+static int    thprof_tl_used[MAX_THREADS];
+
+/* Region naming for the profilers (region + thread). A region is identified by an
+ * explicit label set with tensor_set_region_label() - which is what makes the table
+ * readable, since one task function serves every GEMM shape - and otherwise by the
+ * nearest preceding ELF symbol. dladdr() is tried first but normally fails: PicoLM is
+ * not linked with -rdynamic, so static functions have no dynamic symbol. The fallback
+ * reads our own .symtab once (<elf.h>) and maps the runtime address back through the
+ * executable's load base, so PIE/ASLR does not matter. */
+#if !defined(PICOLM_DOS) && defined(__linux__)
+#include <elf.h>
+#include <link.h>
+typedef struct { char *name; unsigned long addr; } elf_sym_t;
+static elf_sym_t elf_syms[8192];
+static int elf_nsyms;
+static int elf_syms_loaded;
+
+static void elf_load_syms(void) {
+    elf_syms_loaded = 1;
+    FILE *f = fopen("/proc/self/exe", "rb");
+    if (!f) return;
+    Elf64_Ehdr eh;
+    if (fread(&eh, sizeof eh, 1, f) != 1 || memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0 ||
+        eh.e_ident[EI_CLASS] != ELFCLASS64) { fclose(f); return; }
+    if (eh.e_shoff == 0 || eh.e_shentsize != sizeof(Elf64_Shdr)) { fclose(f); return; }
+    for (int si = 0; si < eh.e_shnum && elf_nsyms < 8192; si++) {
+        Elf64_Shdr sh;
+        fseek(f, (long)(eh.e_shoff + (size_t)si * sizeof sh), SEEK_SET);
+        if (fread(&sh, sizeof sh, 1, f) != 1) break;
+        if (sh.sh_type != SHT_SYMTAB || sh.sh_entsize != sizeof(Elf64_Sym)) continue;
+        long nsym = (long)(sh.sh_size / sh.sh_entsize);
+        Elf64_Shdr sth;
+        fseek(f, (long)(eh.e_shoff + (size_t)sh.sh_link * sizeof sth), SEEK_SET);
+        if (fread(&sth, sizeof sth, 1, f) != 1) break;
+        char *strtab = malloc(sth.sh_size ? sth.sh_size : 1);
+        if (!strtab) break;
+        fseek(f, (long)sth.sh_offset, SEEK_SET);
+        if (fread(strtab, 1, sth.sh_size, f) != sth.sh_size) { free(strtab); break; }
+        for (long k = 0; k < nsym && elf_nsyms < 8192; k++) {
+            Elf64_Sym sym;
+            fseek(f, (long)(sh.sh_offset + (size_t)k * sizeof sym), SEEK_SET);
+            if (fread(&sym, sizeof sym, 1, f) != 1) break;
+            if (ELF64_ST_TYPE(sym.st_info) != STT_FUNC || sym.st_value == 0) continue;
+            if (sym.st_shndx == SHN_UNDEF || sym.st_shndx >= SHN_LORESERVE) continue;
+            const char *nm = strtab + sym.st_name;
+            if (!*nm) continue;
+            elf_syms[elf_nsyms].name = strdup(nm);
+            elf_syms[elf_nsyms].addr = (unsigned long)sym.st_value;
+            elf_nsyms++;
+        }
+        free(strtab);
+    }
+    fclose(f);
+    /* sort by address (the symtab is usually sorted already, but aliases and the
+     * multiple symtabs of a linked binary are not guaranteed to be) */
+    for (int i = 1; i < elf_nsyms; i++) {
+        elf_sym_t k = elf_syms[i];
+        int j = i - 1;
+        while (j >= 0 && elf_syms[j].addr > k.addr) { elf_syms[j + 1] = elf_syms[j]; j--; }
+        elf_syms[j + 1] = k;
+    }
+}
+
+/* Symbol of first executable mapping, for PIE address translation. */
+static int elf_exe_probe(struct dl_phdr_info *info, size_t size, void *data) {
+    (void)size;
+    for (int i = 0; info->dlpi_phdr && i < info->dlpi_phnum; i++) {
+        if (info->dlpi_phdr[i].p_type != PT_LOAD) continue;
+        if (!(info->dlpi_phdr[i].p_flags & PF_X)) continue;
+        *(unsigned long *)data = (unsigned long)(info->dlpi_addr + info->dlpi_phdr[i].p_vaddr);
+        return 1;
+    }
+    return 0;
+}
+#endif
+
+static const char *fn_name_hint(void (*fn)(int, void *)) {
+#if defined(__GNUC__) && !defined(_WIN32) && !defined(PICOLM_DOS)
+    /* dladdr needs the executable linked with -rdynamic/-export-dynamic; the Makefile
+     * does not do that, so this usually fails and the ELF scan below answers. */
+    Dl_info info;
+    if (dladdr((void *)fn, &info) && info.dli_sname) return info.dli_sname;
+#endif
+#if !defined(PICOLM_DOS) && defined(__linux__)
+    /* Fallback that always works for a local (unstripped) build: read our own
+     * .symtab once and map the runtime address back by link-time offset. For a PIE
+     * the executable's first PT_LOAD starts at link address 0, so
+     * runtime_addr - dlpi_addr is the st_value to look up. */
+    if (!elf_syms_loaded) elf_load_syms();
+    if (!elf_nsyms) return NULL;
+    unsigned long base = 0;
+    dl_iterate_phdr(elf_exe_probe, &base);
+    unsigned long off = (unsigned long)(size_t)fn - base;
+    /* Preceding symbol; among the (address-sorted) entries pick the nearest one. */
+    long found = -1, lo = 0, hi = elf_nsyms - 1;
+    while (lo <= hi) {
+        long mid = (lo + hi) / 2;
+        if (elf_syms[mid].addr <= off) { found = mid; lo = mid + 1; }
+        else hi = mid - 1;
+    }
+    if (found >= 0) return elf_syms[found].name;
+#endif
+    return NULL;
+}
+
+static double thprof_cpu_now(void) {
+#if defined(_WIN32)
+    FILETIME c, e, k, u;
+    if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)) return 0.0;
+    ULARGE_INTEGER ku, uu;
+    ku.LowPart = k.dwLowDateTime;   ku.HighPart = k.dwHighDateTime;
+    uu.LowPart = u.dwLowDateTime;   uu.HighPart = u.dwHighDateTime;
+    return ((double)ku.QuadPart + (double)uu.QuadPart) * 1e-7;
+#else
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return 0.0;
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+#endif
+}
+
+/* Explicit label for the regions dispatched next (tensor_set_region_label). */
+#if !defined(_WIN32)
+static __thread const char *thprof_label;
+#else
+static const char *thprof_label;
+#endif
+
+void tensor_set_region_label(const char *label) { thprof_label = label; }
+
+/* Copy a label into a static slot so callers can pass stack buffers (matmul_batch
+ * formats its label into a local char[]). The pool is indexed by the region slot, so
+ * it can never be exhausted independently of thprof[] - returning the caller's buffer
+ * would leave a dangling pointer in the table. */
+static const char *thprof_strdup(int slot, const char *label) {
+    static char pool[THPROF_MAX][160];
+    snprintf(pool[slot], sizeof pool[slot], "%s", label);
+    return pool[slot];
+}
+
+static int thprof_slot(void (*fn)(int, void *)) {
+    /* Key on (fn, label): one task function serves several call sites with very
+     * different shapes (qgemm_d_task runs the QKV, o_proj, gate, up and down GEMMs),
+     * so the explicit label is what makes the profile readable. */
+    const char *lbl = thprof_label;
+    for (int i = 0; i < thprof_n; i++)
+        if (thprof[i].fn == fn && ((!lbl && !thprof[i].name) ||
+            (lbl && thprof[i].name && !strcmp(thprof[i].name, lbl)))) return i;
+    if (thprof_n >= THPROF_MAX) return -1;
+    int s = thprof_n++;
+    memset(&thprof[s], 0, sizeof thprof[s]);
+    thprof[s].fn = fn;
+    thprof[s].name = lbl ? thprof_strdup(s, lbl) : fn_name_hint(fn);
+    return s;
+}
+
+/* Called by the workers around each task execution (no-ops unless enabled). */
+static void thprof_task_begin(int tid) {
+    thprof_tl_used[tid] = 1;
+    thprof_tl_s[tid] = thprof_cpu_now();
+}
+static void thprof_task_end(int tid) {
+    if (!thprof_tl_used[tid]) return;
+    thprof_tl_used[tid] = 0;
+    thprof_tl_s[tid] = thprof_cpu_now() - thprof_tl_s[tid];
+}
+
+void tensor_thread_profile_set(int on) {
+    thprof_on = on;
+    if (on) atexit(tensor_thread_profile_print);
+}
+
+/* Discard everything collected so far (used to drop a warm-up pass). */
+void tensor_thread_profile_reset(void) {
+    for (int i = 0; i < thprof_n; i++) {
+        thprof[i].wall_s = thprof[i].cpu_s = 0;
+        thprof[i].wall_max_s = thprof[i].cpu_max_s = 0;
+        thprof[i].calls = thprof[i].threads_used = thprof[i].items = 0;
+    }
+}
+
+void tensor_thread_profile_print(void) {
+    if (thprof_n == 0) return;
+    for (int i = 0; i < thprof_n; i++)
+        if (!thprof[i].name) thprof[i].name = fn_name_hint(thprof[i].fn);
+    /* Print the heaviest regions first: the profile exists to answer "where did the
+     * prefill time go and was every thread busy doing it". */
+    int order[THPROF_MAX];
+    int n = 0;
+    double tw = 0, tc = 0;
+    for (int i = 0; i < thprof_n; i++) {
+        if (!thprof[i].calls) continue;
+        tw += thprof[i].wall_s; tc += thprof[i].cpu_s;
+        order[n++] = i;
+    }
+    for (int i = 1; i < n; i++) {
+        int k = order[i], j = i - 1;
+        while (j >= 0 && thprof[order[j]].wall_s < thprof[k].wall_s) { order[j + 1] = order[j]; j--; }
+        order[j + 1] = k;
+    }
+    fprintf(stderr, "\n=== thread utilisation profile (PICOLM_THREAD_PROF) ===\n");
+    fprintf(stderr, "  %-32s %6s %5s %9s %9s %7s %7s\n",
+            "region", "calls", "thr", "wall ms", "cpu ms", "busy%", "wall%");
+    for (int i = 0; i < n; i++) {
+        thprof_t *p = &thprof[order[i]];
+        double busy = p->wall_s > 0 ? 100.0 * p->cpu_s / (p->wall_s * (double)p->threads_used / (double)p->calls) : 0;
+        fprintf(stderr, "  %-32s %6ld %5.1f %9.1f %9.1f %6.1f%% %6.1f%%\n",
+                p->name ? p->name : "?", p->calls,
+                (double)p->threads_used / (double)p->calls,
+                p->wall_s * 1e3, p->cpu_s * 1e3, busy,
+                tw > 0 ? 100.0 * p->wall_s / tw : 0);
+    }
+    fprintf(stderr, "  %-32s %6s %5s %9.1f %9.1f\n", "TOTAL", "", "", tw * 1e3, tc * 1e3);
+    fprintf(stderr, "  busy%% = region CPU time / (wall * threads): 100%% means every thread\n"
+                    "  worked the whole region. Lower means an uneven split or tasks too\n"
+                    "  small to amortise the dispatch. wall%% is the share of the total.\n");
+}
+
+/* Per-dispatch-site wall-time profile (PICOLM_REGION_PROF=1) */
+static void (*region_prof_fn[32])(int, void *);
+static const char *region_prof_name[32];
+static double region_prof_d[32];
+static double region_prof_max[32];
+static long   region_prof_cnt[32];
+static int    region_prof_n = 0;
+static int    region_prof_on = -1;
+
+static void region_prof_print(void) {
+    double total = 0;
+    fprintf(stderr, "\n=== tensor_parallel_for region profile (wall time per fn) ===\n");
+    for (int i = 0; i < region_prof_n; i++) {
+        if (!region_prof_cnt[i]) continue;
+        total += region_prof_d[i];
+        fprintf(stderr, "  %-24s %8ld calls %10.1f ms  avg %8.3f ms  max %8.3f ms\n",
+                region_prof_name[i] ? region_prof_name[i] : "?",
+                region_prof_cnt[i], region_prof_d[i] * 1e3,
+                region_prof_d[i] * 1e3 / region_prof_cnt[i],
+                region_prof_max[i] * 1e3);
+    }
+    fprintf(stderr, "  TOTAL wall-in-regions: %.1f ms\n", total * 1e3);
+}
+
+
 static win_thread_t    pool_threads[MAX_THREADS];
 static win_mutex_t     pool_mutex;
 static win_cond_t      pool_cond;
@@ -546,22 +818,70 @@ static double pool_usable_cpus(void) {
 static cpu_set_t pool_orig_set;
 static int pool_orig_have;
 static int pool_pin_cpus[1024], pool_pin_n;
+static int pool_pin_node[1024];   /* NUMA node of each slot in pool_pin_cpus */
+
+/* Read the NUMA node of a CPU, -1 if unknown. */
+static int pool_cpu_node(int cpu) {
+    char path[96], buf[32] = "";
+    snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/node%d", cpu, 0);
+    /* nodes are enumerated by probing node0..nodeN; the first that exists wins */
+    for (int n = 0; n < 64; n++) {
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/node%d", cpu, n);
+        FILE *f = fopen(path, "r");
+        if (f) { fclose(f); return n; }
+    }
+    (void)buf;
+    return -1;
+}
+
+/* CPU order for the pool: one logical CPU per physical core first, SMT siblings
+ * last, and every NUMA node's cores kept together.
+ *
+ * The node grouping matters on multi-socket hosts. The old order was simply
+ * "ascending CPU id", which on a 2-socket box interleaves: CPUs 0..11 are node 0
+ * and 12..23 are node 1, so a 24-thread GEMM touched both sockets' memory and
+ * streamed every weight row over the inter-socket link (measured on Xeon Silver
+ * 4214: Spark-1.7B prefill 69 tok/s at 8 threads, 83 at 24, versus 74 -> ~180
+ * tok/s once workers are kept on one node). Filling node by node keeps a pool
+ * that fits on one socket on one socket; a pool larger than a socket spills in
+ * whole nodes rather than splitting every GEMM across the link.
+ * PICOLM_PIN_ORDER=flat restores the old ascending order for A/B numbers. */
 static void pool_pin_setup(int nt) {
     const char *e = getenv("PICOLM_PIN");
     pool_pin_n = 0;
     if (!e || !*e || e[0] == '0') return;
     if (!pool_orig_have) { if (sched_getaffinity(0, sizeof pool_orig_set, &pool_orig_set) != 0) return; pool_orig_have = 1; }
-    static int prim[1024], sec[1024]; int np = 0, ns = 0;
+    static int prim[1024], sec[1024], node_of[1024];
+    int np = 0, ns = 0;
     for (int cpu = 0; cpu < 1024 && cpu < CPU_SETSIZE; cpu++) {
         if (!CPU_ISSET(cpu, &pool_orig_set)) continue;
         char path[96]; snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cpu);
         int first = cpu; FILE *f = fopen(path, "r");
         if (f) { if (fscanf(f, "%d", &first) != 1) first = cpu; fclose(f); }
-        if (first == cpu) prim[np++] = cpu; else sec[ns++] = cpu;
+        if (first == cpu) { node_of[np] = pool_cpu_node(cpu); prim[np++] = cpu; }
+        else              { sec[ns] = cpu; sec[ns + 512] = pool_cpu_node(cpu); ns++; }
     }
     if (nt > np + ns) { fprintf(stderr, "pool: PICOLM_PIN ignored (%d threads > %d allowed CPUs)\n", nt, np + ns); return; }
-    for (int i = 0; i < np; i++) pool_pin_cpus[pool_pin_n++] = prim[i];
-    for (int i = 0; i < ns; i++) pool_pin_cpus[pool_pin_n++] = sec[i];
+    const char *ord = getenv("PICOLM_PIN_ORDER");
+    const int flat = (ord && ord[0] == 'f');
+    if (!flat) {
+        /* stable sort primary cores by node (already ascending within a node) */
+        for (int i = 1; i < np; i++) {
+            int c = prim[i], nd = node_of[i], j = i - 1;
+            while (j >= 0 && node_of[j] > nd) { prim[j + 1] = prim[j]; node_of[j + 1] = node_of[j]; j--; }
+            prim[j + 1] = c; node_of[j + 1] = nd;
+        }
+    }
+    for (int i = 0; i < np; i++) { pool_pin_cpus[pool_pin_n] = prim[i]; pool_pin_node[pool_pin_n++] = node_of[i]; }
+    for (int i = 0; i < ns; i++) {
+        pool_pin_cpus[pool_pin_n] = sec[i];
+        pool_pin_node[pool_pin_n++] = flat ? 0 : sec[i + 512];
+    }
+    if (getenv("PICOLM_PIN_VERBOSE")) {
+        fprintf(stderr, "pool: pin order");
+        for (int i = 0; i < pool_pin_n; i++) fprintf(stderr, " %d(n%d)", pool_pin_cpus[i], pool_pin_node[i]);
+        fprintf(stderr, "\n");
+    }
 }
 static int pool_pin_actual[1024];  /* sched_getcpu() result per worker, filled after pin */
 static void pool_pin_self(int idx) {       /* workers (idx >= 1) */
@@ -918,8 +1238,13 @@ static void *pool_worker(void *arg) {
         }
         if (POOL_LD(&pool_shutdown)) break;
         last_gen = g;
+        /* CPU-time accounting for PICOLM_THREAD_PROF (matmul dispatches are not
+         * region-profiled; they go through pool_tasks and are timed by the caller). */
+        const int tprof = (thprof_on == 1 && tid < MAX_THREADS);
+        if (tprof) thprof_task_begin(tid);
         if (pool_mode) generic_worker_f(&generic_tasks[tid]);
         else matmul_worker_f(&pool_tasks[tid]);
+        if (tprof) { thprof_task_end(tid); thprof_tl_s[tid] = thprof_tl_s[tid]; }
         __atomic_add_fetch(&pool_done, 1, __ATOMIC_SEQ_CST);
         if (__atomic_load_n(&pool_main_wait, __ATOMIC_SEQ_CST)) {
             win_mutex_lock(&pool_mutex);
@@ -951,8 +1276,13 @@ static void *pool_worker(void *arg) {
         if (pool_shutdown) break;
         last_gen = pool_gen;
         win_mutex_unlock(&pool_mutex);
+        /* CPU-time accounting for PICOLM_THREAD_PROF (matmul dispatches are not
+         * region-profiled; they go through pool_tasks and are timed by the caller). */
+        const int tprof = (thprof_on == 1 && tid < MAX_THREADS);
+        if (tprof) thprof_task_begin(tid);
         if (pool_mode) generic_worker_f(&generic_tasks[tid]);
         else matmul_worker_f(&pool_tasks[tid]);
+        if (tprof) { thprof_task_end(tid); thprof_tl_s[tid] = thprof_tl_s[tid]; }
         win_mutex_lock(&pool_mutex);
         pool_done++;
         win_cond_broadcast(&pool_cond);
@@ -1122,6 +1452,23 @@ static void pool_clear_unused(int from, int to) {
 static int pool_total_threads(int requested) {
     pool_init(requested);
     return (pool_nworkers > 0) ? (pool_nworkers + 1) : 1;
+}
+
+/* Short quant name for the thread-profile labels (no model_gguf.c dependency). */
+static const char *qtype_short_name(gguf_type_t t) {
+    switch (t) {
+    case GGUF_TYPE_Q8_0: return "Q8_0";   case GGUF_TYPE_Q4_0: return "Q4_0";
+    case GGUF_TYPE_Q5_0: return "Q5_0";   case GGUF_TYPE_IQ4_NL: return "IQ4_NL";
+    case GGUF_TYPE_Q4_K: return "Q4_K";   case GGUF_TYPE_Q5_K: return "Q5_K";
+    case GGUF_TYPE_Q6_K: return "Q6_K";   case GGUF_TYPE_Q2_K: return "Q2_K";
+    case GGUF_TYPE_Q3_K: return "Q3_K";   case GGUF_TYPE_Q8_K: return "Q8_K";
+    case GGUF_TYPE_IQ2_K: return "IQ2_K"; case GGUF_TYPE_IQ3_K: return "IQ3_K";
+    case GGUF_TYPE_IQ4_K: return "IQ4_K"; case GGUF_TYPE_IQ4_XS: return "IQ4_XS";
+    case GGUF_TYPE_IQ6_K: return "IQ6_K"; case GGUF_TYPE_Q1_0: return "Q1_0";
+    case GGUF_TYPE_Q2_0: return "Q2_0";   case GGUF_TYPE_F16: return "F16";
+    case GGUF_TYPE_F32: return "F32";     case GGUF_TYPE_BF16: return "BF16";
+    default: return "quant";
+    }
 }
 
 /* ---- Table-driven matmul (replaces ~1700 lines of if-else chains) ---- */
@@ -2672,7 +3019,15 @@ void matmul_batch(float *out, const float *x, int n_batch,
             .C = out, .ldc = d,
             .Atype = qtype, .nth = nth, .failed = 0,
         };
+        /* Profile label, e.g. "gemm Q8_0 d=6656 n=103 k=2048": qgemm_d_task is shared
+         * by every projection, so without this the PICOLM_THREAD_PROF table would lump
+         * the QKV, o_proj, gate, up and down GEMMs into one meaningless row.
+         * thprof_strdup() copies it, so a stack buffer is fine here. */
+        char lbl[160];
+        snprintf(lbl, sizeof lbl, "gemm %s d=%d n=%d k=%d", qtype_short_name(qtype), d, n_batch, n);
+        tensor_set_region_label(lbl);
         tensor_parallel_for(nth, qgemm_d_task, &ctx);
+        tensor_set_region_label(NULL);
         if (!ctx.failed) {
             DISPATCH("qgemm_d");
             free_quant_buf(&qb, NULL);
@@ -3998,10 +4353,32 @@ void rope(float *q, float *k, int head_dim, int n_heads, int n_kv_heads,
 
 void silu(float *x, int size) {
     /* swish/silu: x / (1 + exp(-x))
-     * No hardware exp instruction in SSE/AVX, so use scalar expf.
-     * Vectorized expf exists in libsvml (Intel) or libxsmm, but we
-     * avoid those dependencies. The compiler may auto-vectorize
-     * expf with -ffast-math. */
+     *
+     * Pointwise, like GELU, and just as hot: the 48-layer Fimbulvetr prefill evaluates
+     * 48 * 92 * 14336 = 63M SiLUs. Scalar expf made that ~4.8 ns/element (~300 ms);
+     * the shared vector exp brings it to ~1 ns. PICOLM_SILU_F32=0 forces the scalar
+     * path (for bit-exact comparisons).
+     *
+     * There is no hardware exp in SSE/AVX, so picolm_exp256_ps() builds it from a
+     * 2^n split plus a Horner polynomial (see quant.c). */
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("PICOLM_SILU_F32");
+        mode = (e && e[0] == '0') ? 0 : 1;
+    }
+#if defined(PICOLM_HAVE_EXP256)
+    if (mode) {
+        int i = 0;
+        const __m256 one = _mm256_set1_ps(1.0f);
+        for (; i + 7 < size; i += 8) {
+            __m256 v = _mm256_loadu_ps(x + i);
+            __m256 e = picolm_exp256_ps(_mm256_sub_ps(_mm256_setzero_ps(), v));  /* exp(-x) */
+            _mm256_storeu_ps(x + i, _mm256_div_ps(v, _mm256_add_ps(one, e)));
+        }
+        for (; i < size; i++) x[i] = x[i] / (1.0f + expf(-x[i]));
+        return;
+    }
+#endif
     for (int i = 0; i < size; i++) {
         x[i] = x[i] / (1.0f + expf(-x[i]));
     }
@@ -4117,38 +4494,6 @@ static int barrier_prof_on = -1;
 static long barrier_dispatch_count;
 static double barrier_ns_total;
 
-/* Per-dispatch-site wall-time profile (PICOLM_REGION_PROF=1) */
-static void (*region_prof_fn[32])(int, void *);
-static const char *region_prof_name[32];
-static double region_prof_d[32];
-static double region_prof_max[32];
-static long   region_prof_cnt[32];
-static int    region_prof_n = 0;
-static int    region_prof_on = -1;
-
-static void region_prof_print(void) {
-    double total = 0;
-    fprintf(stderr, "\n=== tensor_parallel_for region profile (wall time per fn) ===\n");
-    for (int i = 0; i < region_prof_n; i++) {
-        if (!region_prof_cnt[i]) continue;
-        total += region_prof_d[i];
-        fprintf(stderr, "  %-24s %8ld calls %10.1f ms  avg %8.3f ms  max %8.3f ms\n",
-                region_prof_name[i] ? region_prof_name[i] : "?",
-                region_prof_cnt[i], region_prof_d[i] * 1e3,
-                region_prof_d[i] * 1e3 / region_prof_cnt[i],
-                region_prof_max[i] * 1e3);
-    }
-    fprintf(stderr, "  TOTAL wall-in-regions: %.1f ms\n", total * 1e3);
-}
-static const char *fn_name_hint(void (*fn)(int, void *)) {
-    /* Best-effort naming via dladdr */
-#if defined(__GNUC__) && !defined(_WIN32) && !defined(PICOLM_DOS)
-    Dl_info info;
-    if (dladdr((void *)fn, &info) && info.dli_sname) return info.dli_sname;
-#endif
-    return NULL;
-}
-
 void tensor_parallel_for(int count, void (*fn)(int idx, void *ctx), void *ctx) {
     if (n_threads <= 1 || count < 2 || tl_in_parallel) {
         for (int i = 0; i < count; i++) fn(i, ctx);
@@ -4158,12 +4503,16 @@ void tensor_parallel_for(int count, void (*fn)(int idx, void *ctx), void *ctx) {
         barrier_prof_on = getenv("PICOLM_BARRIER_PROF") ? 1 : 0;
         region_prof_on = getenv("PICOLM_REGION_PROF") ? 1 : 0;
         if (region_prof_on) atexit(region_prof_print);
+        if (getenv("PICOLM_THREAD_PROF")) tensor_thread_profile_set(1);
     }
     int prof = barrier_prof_on;
-    double t0 = (prof || region_prof_on) ? barrier_now() : 0;
+    const int thp_on = (thprof_on == 1);
+    double t0 = (prof || region_prof_on || thp_on) ? barrier_now() : 0;
     int nt = pool_total_threads(n_threads);
     int want = n_threads < nt ? n_threads : nt;
     int active = want > count ? count : want;
+    int thp = thp_on ? thprof_slot(fn) : -1;
+    if (thp >= 0) memset(thprof_tl_used, 0, sizeof thprof_tl_used);
     int chunk = (count + active - 1) / active;
     for (int t = 0; t < active; t++) {
         generic_tasks[t].fn = fn;
@@ -4186,10 +4535,24 @@ void tensor_parallel_for(int count, void (*fn)(int idx, void *ctx), void *ctx) {
     pool_wake(nt);
     /* main thread does task 0 */
     tl_in_parallel = 1;
+    if (thp >= 0) thprof_task_begin(0);
     generic_worker_f(&generic_tasks[0]);
+    if (thp >= 0) thprof_task_end(0);
     tl_in_parallel = 0;
     pool_wait(nt);
     pool_mode = 0;
+    if (thp >= 0) {
+        double wall = barrier_now() - t0, cpu = thprof_tl_s[0], tmax = thprof_tl_s[0];
+        for (int t = 1; t < active; t++) {
+            cpu += thprof_tl_s[t];
+            if (thprof_tl_s[t] > tmax) tmax = thprof_tl_s[t];
+        }
+        thprof_t *p = &thprof[thp];
+        p->wall_s += wall; p->cpu_s += cpu;
+        if (wall > p->wall_max_s) p->wall_max_s = wall;
+        if (tmax > p->cpu_max_s) p->cpu_max_s = tmax;
+        p->calls++; p->threads_used += active; p->items += count;
+    }
     if (prof) {
         barrier_dispatch_count++;
         barrier_ns_total += (barrier_now() - t0) * 1e9;

@@ -8759,10 +8759,115 @@ static float gelu_f32_scalar(float x) {
     return 0.5f * x * (1.0f + tanhf(0.79788456f * (x + 0.044715f * x * x * x)));
 }
 
+/* ---- Vectorised GELU (tanh approximation) ----
+ *
+ * This is on the prefill hot path: a 28-layer 1.7B model at 103 tokens evaluates
+ * 19.2M GELUs per prefill (28 * 103 * 6656), and the scalar tanhf() version costs
+ * ~11 ns/element = ~215 ms, i.e. ~19% of a 1142 ms prefill. It showed up as an
+ * unexplained gap between the FFN block time and the sum of its three GEMMs.
+ *
+ * tanh(z) is evaluated as 1 - 2/(exp(2z)+1), and exp via the usual
+ * "split into 2^n * 2^frac, polynomial for 2^frac" trick, so no libm calls.
+ * Max error vs tanhf() is ~1e-7 relative, which is far below the fp16 GELU table
+ * the slower path used to consult, so outputs are unchanged for all practical
+ * purposes (PICOLM_GELU_F32=0 selects the old scalar path for exact-output tests).
+ *
+ * GELU is pointwise, so SIMD here changes no accumulation order: results are
+ * bit-identical between thread counts and between the SIMD and scalar paths
+ * modulo the polynomial's own rounding. */
+#if (defined(PICOLM_AVX512) || defined(PICOLM_AVX2)) && defined(__FMA__)
+/* exp(x) for 8 floats: x = 2^n * exp(f) with n = round(x/ln2) and |f| <= ln2/2,
+ * exp(f) from a 5th-order Horner polynomial (abs err < 1e-7, well inside fp32) and
+ * 2^n formed by inserting the exponent field.
+ *
+ * The clamp is on the range that keeps n + 127 inside [1, 254], i.e. |x| <= ~88. It
+ * must NOT be a clamp of x to +-126: GELU feeds this 2*z where z reaches ~1e3, and
+ * round(-126/ln2) = -182 gives a negative exponent field, i.e. garbage (that bug made
+ * GELU(-30) return -30 instead of 0). Clamping here also makes exp() saturate instead
+ * of overflowing, which is what tanhf() does in float. */
+__m256 picolm_exp256_ps(__m256 x) {
+    const __m256 ln2 = _mm256_set1_ps(0.6931471805599453f);
+    x = _mm256_min_ps(_mm256_max_ps(x, _mm256_set1_ps(-87.0f)), _mm256_set1_ps(88.0f));
+    __m256 n = _mm256_round_ps(_mm256_div_ps(x, ln2), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    __m256 f = _mm256_fnmadd_ps(n, ln2, x);          /* f = x - n*ln2, |f| <= ln2/2 */
+    __m256 q = _mm256_set1_ps(1.0f / 120.0f);
+    q = _mm256_fmadd_ps(q, f, _mm256_set1_ps(1.0f / 24.0f));
+    q = _mm256_fmadd_ps(q, f, _mm256_set1_ps(1.0f / 6.0f));
+    q = _mm256_fmadd_ps(q, f, _mm256_set1_ps(0.5f));
+    q = _mm256_fmadd_ps(q, f, _mm256_set1_ps(1.0f));
+    __m256 r = _mm256_fmadd_ps(q, f, _mm256_set1_ps(1.0f));
+    __m256i ni = _mm256_cvtps_epi32(n);
+    __m256i e = _mm256_slli_epi32(_mm256_add_epi32(ni, _mm256_set1_epi32(127)), 23);
+    return _mm256_mul_ps(r, _mm256_castsi256_ps(e));
+}
+
+/* tanh(z) = 1 - 2/(exp(2z)+1)  (no overflow: exp clamps, and the result saturates
+ * to +-1 for |z| > ~44 which is exactly what tanhf does in float) */
+static inline __m256 tanh256_ps(__m256 z) {
+    __m256 e = picolm_exp256_ps(_mm256_add_ps(z, z));
+    return _mm256_sub_ps(_mm256_set1_ps(1.0f),
+           _mm256_div_ps(_mm256_set1_ps(2.0f), _mm256_add_ps(e, _mm256_set1_ps(1.0f))));
+}
+
+static inline __m256 gelu256_ps(__m256 x) {
+    /* 0.5*x*(1+tanh(0.79788456*(x + 0.044715*x^3))) */
+    __m256 x2 = _mm256_mul_ps(x, x);
+    __m256 inner = _mm256_fmadd_ps(_mm256_set1_ps(0.044715f), _mm256_mul_ps(x2, x), x);
+    inner = _mm256_mul_ps(_mm256_set1_ps(0.79788456f), inner);
+    __m256 t = tanh256_ps(inner);
+    return _mm256_mul_ps(_mm256_mul_ps(_mm256_set1_ps(0.5f), x),
+                         _mm256_add_ps(_mm256_set1_ps(1.0f), t));
+}
+#endif
+
 void picolm_gelu_f32(float *x, int size) {
-    for (int i = 0; i < size; i++) {
-        x[i] = gelu_f32_scalar(x[i]);
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("PICOLM_GELU_F32");
+        mode = (e && e[0] == '0') ? 0 : 1;   /* 0 = scalar tanhf, 1 = vectorised */
     }
+    if (mode) {
+#if (defined(PICOLM_AVX512) || defined(PICOLM_AVX2)) && defined(__FMA__)
+        int i = 0;
+        for (; i + 7 < size; i += 8) {
+            _mm256_storeu_ps(x + i, gelu256_ps(_mm256_loadu_ps(x + i)));
+        }
+        for (; i < size; i++) x[i] = gelu_f32_scalar(x[i]);
+        return;
+#elif defined(PICOLM_NEON)
+        /* NEON: exp via the same 2^n split, 4 lanes at a time */
+        int i = 0;
+        const float32x4_t one = vdupq_n_f32(1.0f), two = vdupq_n_f32(2.0f);
+        for (; i + 3 < size; i += 4) {
+            float32x4_t xv = vld1q_f32(x + i);
+            float32x4_t x2 = vmulq_f32(xv, xv);
+            float32x4_t inner = vfmaq_f32(xv, vdupq_n_f32(0.044715f), vmulq_f32(x2, xv));
+            inner = vmulq_f32(vdupq_n_f32(0.79788456f), inner);
+            /* exp(2*inner) */
+            float32x4_t z = vmulq_f32(two, inner);
+            /* clamp so the 2^n exponent field stays positive (n+127 in [1,254]) */
+            z = vminq_f32(vmaxq_f32(z, vdupq_n_f32(-87.0f)), vdupq_n_f32(88.0f));
+            float32x4_t nf = vrndnq_f32(z);
+            float32x4_t f = vsubq_f32(z, nf);
+            float32x4_t q = vdupq_n_f32(1.0f / 120.0f);
+            q = vfmaq_f32(vdupq_n_f32(1.0f / 24.0f), q, f);
+            q = vfmaq_f32(vdupq_n_f32(1.0f / 6.0f),  q, f);
+            q = vfmaq_f32(vdupq_n_f32(0.5f),         q, f);
+            q = vfmaq_f32(one,                       q, f);
+            float32x4_t e = vfmaq_f32(one, q, f);
+            int32x4_t ni = vcvtq_s32_f32(nf);
+            int32x4_t ei = vshlq_n_s32(vaddq_s32(ni, vdupq_n_s32(127)), 23);
+            e = vmulq_f32(e, vreinterpretq_f32_s32(ei));
+            float32x4_t t = vsubq_f32(one, vdivq_f32(two, vaddq_f32(e, one)));
+            vst1q_f32(x + i, vmulq_f32(vmulq_f32(vdupq_n_f32(0.5f), xv), vaddq_f32(one, t)));
+        }
+        for (; i < size; i++) x[i] = gelu_f32_scalar(x[i]);
+        return;
+#else
+        (void)0;
+#endif
+    }
+    for (int i = 0; i < size; i++) x[i] = gelu_f32_scalar(x[i]);
 }
 
 void picolm_init_gelu_table(void) {
