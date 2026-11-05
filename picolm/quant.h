@@ -42,7 +42,7 @@
 #endif
 /* off_t is provided by the Windows SDK's sys/types.h on MSVC. */
 #ifndef __thread
-#define __thread
+#define __thread __declspec(thread)
 #endif
 #endif
 /* always_inline: GCC __attribute__((always_inline)) vs MSVC __forceinline. */

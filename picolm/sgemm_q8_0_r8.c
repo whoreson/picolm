@@ -716,7 +716,7 @@ void r8a_tile(const block_q8_0_r8 *w, const int8_t *yq, const float *ys, int nb,
 }
 
 typedef struct { int8_t *yq; float *ys; block_q8_0_r8 *wr; size_t yq_cap, ys_cap, wr_cap; } r8a_scratch_t;
-#if !defined(_WIN32)
+#if !defined(_MSC_VER)
 static __thread r8a_scratch_t r8a_tl;
 #else
 static r8a_scratch_t r8a_tl;
@@ -1016,7 +1016,7 @@ void r8v_tile(const block_q8_0_r8 *w, const uint8_t *yu, const float *ys, int nb
 
 /* per-thread scratch: u8 activation panel, fp32 scales, repacked weight group */
 typedef struct { uint8_t *yu; float *ys; block_q8_0_r8 *wr; size_t yu_cap, ys_cap, wr_cap; } r8v_scratch_t;
-#if !defined(_WIN32)
+#if !defined(_MSC_VER)
 static __thread r8v_scratch_t r8v_tl;
 #else
 static r8v_scratch_t r8v_tl;

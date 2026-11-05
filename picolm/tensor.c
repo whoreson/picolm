@@ -589,7 +589,7 @@ static const char *fn_name_hint(void (*fn)(int, void *)) {
 }
 
 static double thprof_cpu_now(void) {
-#if defined(_WIN32)
+#if defined(_MSC_VER)
     FILETIME c, e, k, u;
     if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)) return 0.0;
     ULARGE_INTEGER ku, uu;
@@ -604,7 +604,7 @@ static double thprof_cpu_now(void) {
 }
 
 /* Explicit label for the regions dispatched next (tensor_set_region_label). */
-#if !defined(_WIN32)
+#if !defined(_MSC_VER)
 static __thread const char *thprof_label;
 #else
 static const char *thprof_label;
@@ -736,7 +736,7 @@ static volatile int    pool_nworkers = 0;
  * generic dispatch. tensor_parallel_for* use ONE global task table, so a nested call (e.g. an attention
  * worker calling matmul_batch -> batched activation quantization) would corrupt the outer dispatch.
  * A nested call now just runs serially on the calling thread. */
-#if !defined(_WIN32)
+#if !defined(_MSC_VER)
 static __thread int tl_in_parallel = 0;
 #else
 static int tl_in_parallel = 0;
@@ -974,11 +974,11 @@ typedef struct {
 static generic_task_t  generic_tasks[MAX_THREADS];
 static volatile int    pool_mode = 0; /* 0 = matmul_task_t, 1 = generic_task_t */
 static int pool_total_threads(int requested);
-#if defined(_WIN32) || defined(__APPLE__) || defined(__osf__)
+#if defined(_MSC_VER) || defined(__APPLE__) || defined(__osf__)
 /* MSVC, old Mac OS X, OSF/1 Alpha (GCC 3.x) don't support __thread */
 static int             pool_my_tid = 0;
 #else
-#if !defined(_WIN32)
+#if !defined(_MSC_VER)
 static __thread int    pool_my_tid = 0;
 #else
 static int             pool_my_tid = 0;
@@ -2460,7 +2460,7 @@ static void gemm_convert_task(int idx, void *ctxp) {
     this_rows &= ~7;   /* round down to multiple of 8 (Q8_K_R8 interleave) */
     if (this_rows <= 0) return;
     /* Per-thread scratch buffer, grown on demand */
-#if !defined(_WIN32)
+#if !defined(_MSC_VER)
     static __thread void *tl_scratch = NULL;
     static __thread size_t tl_scratch_size = 0;
 #else
@@ -4478,7 +4478,7 @@ void vec_add(float *a, const float *b, int size) {
 #if !defined(PICOLM_DOS)
 /* Barrier profiling (enabled by PICOLM_BARRIER_PROF env var) */
 static inline double barrier_now(void) {
-#if defined(_WIN32)
+#if defined(_MSC_VER)
     LARGE_INTEGER f, t; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t);
     return (double)t.QuadPart / (double)f.QuadPart;
 #else

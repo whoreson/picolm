@@ -1079,7 +1079,7 @@ static void ad_split_task(int idx, void *p) {
     ad_chunk(ctx, kv_h, t0, t1, base, base + 8, base + 16);
 }
 
-#if !defined(_WIN32)
+#if !defined(_MSC_VER)
 static __thread float *ad_scratch = NULL;
 static __thread size_t ad_scratch_cap = 0;
 #else
@@ -1647,7 +1647,7 @@ static int attn_timing_enabled = -1;
 
 #if !defined(PICOLM_DOS)
 static double attn_now_ms(void) {
-#if defined(_WIN32)
+#if defined(_MSC_VER)
     LARGE_INTEGER f, t; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t);
     return (double)t.QuadPart / (double)f.QuadPart * 1000.0;
 #else

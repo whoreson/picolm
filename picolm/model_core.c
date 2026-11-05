@@ -4590,7 +4590,7 @@ static void batch_add2_task(int idx, void *p) {
 }
 /* Reusable compact copy buffer for the attention output (was a malloc/free of n_tokens*q_dim
  * floats per layer: fresh mmap pages faulted in serially on every layer). */
-#if !defined(_WIN32)
+#if !defined(_MSC_VER)
 static float *prefill_attn_out_buf(size_t floats) {
     static __thread float *buf; static __thread size_t cap;
     if (cap < floats) { free(buf); buf = (float *)malloc(floats * sizeof(float)); cap = buf ? floats : 0; }
@@ -4598,7 +4598,7 @@ static float *prefill_attn_out_buf(size_t floats) {
 }
 #else
 static float *prefill_attn_out_buf(size_t floats) {
-    static float *buf; static size_t cap; // MSVC: no TLS support
+    static __declspec(thread) float *buf; static __declspec(thread) size_t cap;
     if (cap < floats) { free(buf); buf = (float *)malloc(floats * sizeof(float)); cap = buf ? floats : 0; }
     return buf;
 }
