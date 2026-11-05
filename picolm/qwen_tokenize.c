@@ -262,10 +262,16 @@ static int pretok_next_spark25(const char *s, int n) {
         }
     }
 
-    /* Optional prefix + letters [\p{L}\p{M}]+ */
+    /* Optional prefix + letters [\p{L}\p{M}]+
+     * Regex: [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+
+     * Note: \p{P} in Unicode does NOT include space (space is \p{Z}).
+     * Our is_P() incorrectly includes 0x20 in the P range, so we
+     * explicitly allow space as a valid prefix character. */
     {
         int j = 0, c0 = cp, a0 = adv;
-        if (c0 != '\r' && c0 != '\n' && !is_L(c0) && !is_N(c0) && !is_P(c0) && !is_S(c0)) {
+        int is_bad_prefix = (c0 == '\r' || c0 == '\n' || is_L(c0) || is_N(c0) ||
+                             (is_P(c0) && c0 != ' ') || is_S(c0));
+        if (!is_bad_prefix) {
             if (a0 < n) {
                 int c2, a2 = utf8_next(s + a0, n - a0, &c2);
                 if (is_L(c2) || is_M(c2)) {

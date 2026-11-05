@@ -1656,6 +1656,10 @@ int parse_gguf(model_t *m, int max_seq_len) {
                      * Uses literal spaces, handled by qwen_tokenize.c BPE path.
                      * tok_space_marker is unused for this path. */
                     m->tok_unknown_model = 0;
+                } else if (pre.len == 8 && strncmp(pre.str, "spark2_5", 8) == 0) {
+                    /* Spark-X2.5: GPT-2 BPE with Spark pretokenizer.
+                     * Handled by qwen_tokenize.c (QWEN_PRETOK_SPARK25). */
+                    m->tok_unknown_model = 0;
                 } else {
                     m->tok_space_marker = 0; /* U+2581 (default, SPM models) */
                 }
@@ -1834,8 +1838,8 @@ int parse_gguf(model_t *m, int max_seq_len) {
         if (cfg->rope_dim <= 0) cfg->rope_dim = cfg->head_dim;
         if (cfg->rope_dim_swa <= 0) cfg->rope_dim_swa = cfg->head_dim;
         if (cfg->rope_freq_base_swa <= 0) cfg->rope_freq_base_swa = 10000.0f;
-        /* Spark uses Llama pairwise RoPE (rope_type=0) */
-        cfg->rope_type = 0;
+        /* Spark uses GPT-NeoX RoPE (consecutive pairs, llama.cpp: LLAMA_ROPE_TYPE_NEOX) */
+        cfg->rope_type = 1;
     }
 
     /* Gemma-3n defaults */

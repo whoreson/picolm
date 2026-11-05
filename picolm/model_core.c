@@ -617,6 +617,8 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
     size_t sz_xb     = (size_t)max_dim * sizeof(float);
     size_t sz_xb2    = (size_t)max_dim * sizeof(float);
     size_t sz_q      = (size_t)max_proj_dim * sizeof(float);
+    /* Spark-X2.5: head-wise gate buffer */
+    size_t sz_spark_gate = c->is_spark25 ? (size_t)c->n_heads * sizeof(float) : 0;
     /* att buffer removed (flash attention) */
     size_t sz_hb     = (size_t)c->n_ffn * sizeof(float);
     size_t sz_hb2    = (size_t)c->n_ffn * sizeof(float);
@@ -629,6 +631,15 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
 
     /* RoPE tables: cos and sin for each (position, dim_pair) */
     size_t sz_rope = (size_t)c->max_seq_len * half_dim * sizeof(float) * 2;
+    /* SWA RoPE tables (Gemma-3n, Spark-X2.5) */
+    if (c->is_gemma3n || c->is_spark25) {
+        int swa_half_dim = half_dim;
+        if (c->is_spark25 && c->rope_dim_swa > 0) {
+            int swa_hd = c->rope_dim_swa / 2;
+            if (swa_hd > swa_half_dim) swa_half_dim = swa_hd;
+        }
+        sz_rope += (size_t)c->max_seq_len * swa_half_dim * sizeof(float) * 2;
+    }
 
     /* Norm weights: (n_layers * 2 + 1) * n_embd + n_layers * head_dim * 2 (QK-norm)
      * + n_embd for output_norm_w (the carve skips n_norm + n_embd)
@@ -842,7 +853,7 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         }
     }
 
-    size_t total = sz_x + sz_xb + sz_xb2 + sz_q +
+    size_t total = sz_x + sz_xb + sz_xb2 + sz_q + sz_spark_gate +
                    sz_hb + sz_hb2 + sz_logits +
                    sz_scratch + sz_rope + sz_norm +
                    sz_ssm_conv + sz_ssm_state + sz_ssm_small + sz_ssm_tmp +

@@ -227,6 +227,29 @@ static const char *tmpl_alpaca_prefix =
     "### Instruction:\r\n";
 static const char *tmpl_alpaca_suffix = "\r\n\r\n### Response:\r\n";
 
+/* Spark-X2.5 chat template.
+ *
+ * Renders a single-turn chat as:
+ *
+ *     <|start of sentence|><|System|>\n
+ *     you are a helpful assistant.\n
+ *     <|end of sentence|>\n
+ *     <|start of sentence|><|User|><PROMPT><|end of sentence|>\n
+ *     <|start of sentence|><|Bot|></think>
+ *
+ * The model supports reasoning (<think>/</think>), but closing immediately
+ * requests a direct answer.
+ */
+
+static const char *tmpl_spark_prefix =
+    "<|start of sentence|><|System|>\n"
+    "you are a helpful assistant.\n"
+    "<|end of sentence|>\n"
+    "<|start of sentence|><|User|>";
+static const char *tmpl_spark_suffix =
+    "<|end of sentence|>\n"
+    "<|start of sentence|><|Bot|></think>";
+
 /* Apply model-appropriate chat template to a prompt string.
  * Returns a newly malloc'd string on success, NULL on failure. */
 static char *apply_chat_template(const char *model_path, const model_t *model, const char *raw_prompt) {
@@ -250,6 +273,9 @@ static char *apply_chat_template(const char *model_path, const model_t *model, c
     if (model && model->config.is_glm5) {
         prefix = tmpl_glm_prefix;
         suffix = tmpl_glm_suffix;
+    } else if (model && model->config.is_spark25) {
+        prefix = tmpl_spark_prefix;
+        suffix = tmpl_spark_suffix;
     } else if (model && model->config.is_tekken) {
         prefix = tmpl_tekken_prefix;
         suffix = tmpl_tekken_suffix;
