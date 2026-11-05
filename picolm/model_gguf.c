@@ -727,7 +727,11 @@ int model_list_tensors(const char *path) {
      * one-write-per-line problem when stdout is redirected to a slow
      * destination (e.g. network share).
      */
-    { size_t buf_size = 128 + (n_tensors + 2) * 96;
+    /* Buffer sizing: static header ~1.1KB + n_tensors * 112 bytes/line
+     * (the %-52s %-20s %-16s %-12s %u\n format never exceeds 112 bytes).
+     * The old 96-byte estimate was too small, silently truncating the
+     * tensor list for larger models (APPEND drops lines on overflow). */
+    { size_t buf_size = 1280 + n_tensors * 112 + 256;
       buf = malloc(buf_size);
       if (!buf) {
           fprintf(stderr, "ERROR: out of memory\n");
