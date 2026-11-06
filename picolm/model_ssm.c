@@ -3647,6 +3647,61 @@ static void ssm_alphabeta_f32(float *alpha_out, float *beta_out, const float *x,
     tensor_parallel_for(n_v_heads, ssm_ab_f32_task, &ctx);
 }
 
+/* ---- Parallel SSM conv1d block task ----
+ *
+ * Used by ssm_prefill_layer step 4. The layer builds pbuf = [nsr history rows]
+ * followed by [n_tokens current rows] in chronological order, so output token t
+ * is exactly the (nsr+1)-tap window pbuf[t .. t+nsr] and no output depends on
+ * any other.
+ *
+ * Parallelism is over the co output axis, split into n_tasks contiguous slices.
+ * co (conv_dim = 2*d_state*n_group + d_inner, 10240 for Qwen3.6) is far wider
+ * than the token count and, unlike the token axis, carries no ordering
+ * constraint. Each task keeps its weight reads sequential along
+ * cw[d*conv_dim + co] and its output writes sequential along conv_out.
+ *
+ * Splitting co rather than tokens also avoids a barrier per token: the whole
+ * layer is one parallel_for. */
+typedef struct {
+    const float *cw;      /* [d_conv][conv_dim] transposed weights */
+    const float *pbuf;    /* [(nsr + n_tokens)][conv_dim] chronological rows */
+    float *conv_out;      /* [n_tokens][conv_dim] output */
+    int conv_dim;
+    int n_tokens;
+    int nsr;
+    int n_tasks;
+} conv_block_ctx_t;
+
+static void ssm_conv_block_task(int task, void *ctxp) {
+    const conv_block_ctx_t *c = (const conv_block_ctx_t *)ctxp;
+    const int co_begin = (int)(((long long)c->conv_dim * task) / c->n_tasks);
+    const int co_end   = (int)(((long long)c->conv_dim * (task + 1)) / c->n_tasks);
+    if (co_begin >= co_end) return;
+
+    const int cd = c->conv_dim;
+    const int nsr = c->nsr;
+    const int ntok = c->n_tokens;
+    const int n_taps = nsr + 1;
+
+    for (int t = 0; t < ntok; t++) {
+        const float *restrict p = c->pbuf + (size_t)t * cd;
+        float *restrict out = c->conv_out + (size_t)t * cd;
+
+        /* taps[d] = pbuf row (t + d), pulled out so the co loop below is a
+         * flat contiguous FMA sweep the compiler can vectorise. */
+        const float *restrict taps[8];
+        for (int d = 0; d < n_taps; d++)
+            taps[d] = p + (size_t)d * cd;
+
+        for (int co = co_begin; co < co_end; co++) {
+            float sum = c->cw[co] * taps[0][co];
+            for (int d = 1; d < n_taps; d++)
+                sum += c->cw[(size_t)d * cd + co] * taps[d][co];
+            out[co] = sum;
+        }
+    }
+}
+
 void ssm_prefill_layer(model_t *m, run_state_t *s,
                               float *x_batch, float *xb_batch, float *xb2_batch,
                               float *hb_batch, float *hb2_batch,
@@ -3834,66 +3889,69 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
         const int dc = c->ssm_d_conv;
         const int nsr = n_state_rows;
 
-        /* Rolling history instead of a per-token memmove.
+        if (nsr > 7) { fprintf(stderr, "FATAL: ssm_d_conv %d > 8 unsupported\n", dc); exit(1); }
+
+        /* ---- Parallel block conv ----
          *
-         * The old inner loop shifted conv_state down one row and appended the
-         * new token for EVERY token, i.e. (nsr-1)+1 full conv_dim memcpys per
-         * token. For Qwen3.6 prefill that is 253 tokens x 48 layers x 80 KB =
-         * 1.49 GB of pure memmove, which measured ~37% of all conv1d traffic.
+         * Build ONE contiguous history buffer holding the previous nsr tokens
+         * followed by all n_tokens current tokens, in chronological order:
          *
-         * The conv is just a %d-tap window over the last `nsr` tokens, so keep
-         * the history in a local (nsr+1)-row buffer and rotate a start index:
-         * each token writes ONE row and reads nsr+1 rows via taps[]. No shifting
-         * at all inside the loop. conv_state is written back exactly once at the
-         * end with the state the next call (or a checkpoint) expects.
+         *     pbuf[0 .. nsr-1]        = conv_state rows (oldest first)
+         *     pbuf[nsr + t]           = qkv_batch row t
          *
-         * hist is (nsr+1) rows so that the current token's qkv can be copied in
-         * and then read by the same taps[] sweep as the history rows, keeping the
-         * innermost loop a flat vectorizable FMA over contiguous rows. */
-        float *hist = (float *)malloc((size_t)(nsr + 1) * state_stride * sizeof(float));
-        if (!hist) { fprintf(stderr, "OOM: conv1d hist\n"); exit(1); }
-        /* Seed with the historical state: conv_state holds nsr rows, oldest
-         * first, matching taps [0, nsr). */
+         * Then output token t is simply the nsr+1 tap window
+         * pbuf[t .. t+nsr], so every output is independent of every other and
+         * the whole layer's conv becomes a block operation parallel over the
+         * conv_dim (co) axis. No state is mutated inside the loop at all.
+         *
+         * Previously this was a per-token loop over co: correct, but the outer
+         * token loop was a sequential chain, so the layer ran on one core while
+         * 23 sat idle -- 2.49 GB of conv traffic in 589 ms is only 4.2 GB/s.
+         * (Before that it additionally shifted conv_state per token, 1.49 GB of
+         * pure memmove; the ring-buffer version removed that, and this removes
+         * the serialisation.)
+         *
+         * Each thread takes a contiguous slice of co so its weight accesses
+         * (cw[d*conv_dim + co]) stay sequential, and walks tokens in the inner
+         * loop where the tap pointers are just pbuf + offset. */
+        const size_t nrows = (size_t)nsr + (size_t)n_tokens;
+        float *pbuf = (float *)malloc(nrows * (size_t)conv_dim * sizeof(float));
+        if (!pbuf) { fprintf(stderr, "OOM: conv1d pbuf\n"); exit(1); }
         for (int r = 0; r < nsr; r++)
-            memcpy(hist + (size_t)r * state_stride, conv_state + (size_t)r * state_stride,
-                   (size_t)state_stride * sizeof(float));
-        int hstart = 0;   /* index of the oldest row within hist[0..nsr] window */
+            memcpy(pbuf + (size_t)r * conv_dim, conv_state + (size_t)r * state_stride,
+                   (size_t)conv_dim * sizeof(float));
+        memcpy(pbuf + (size_t)nsr * conv_dim, qkv_batch,
+               (size_t)n_tokens * (size_t)conv_dim * sizeof(float));
 
+        {
+            conv_block_ctx_t cbc;
+            cbc.cw = cw;
+            cbc.pbuf = pbuf;
+            cbc.conv_out = conv_batch;
+            cbc.conv_dim = conv_dim;
+            cbc.n_tokens = n_tokens;
+            cbc.nsr = nsr;
+            /* n_tasks is the number of co slices, and every slice must be
+             * computed. tensor_parallel_for() re-chunks `count` across at most
+             * n_threads workers and may run fewer than `count` of them, so
+             * sizing the slice boundaries off a task count it does not use
+             * would silently skip co ranges -- that is exactly how the first
+             * version of this produced drifted logits (20.2484 vs 20.2670).
+             * Passing n_threads (<= the pool size tensor_parallel_for will
+             * use) keeps one slice per worker and leaves no gap; when
+             * n_threads <= 1 it runs all tasks inline, which still covers every
+             * co exactly once. */
+            cbc.n_tasks = tensor_get_n_threads() > 0 ? tensor_get_n_threads() : 1;
+            tensor_parallel_for(cbc.n_tasks, ssm_conv_block_task, &cbc);
+        }
+
+        /* SiLU over each token's finished conv row, whole-row so the result is
+         * bit-identical to the pre-restructure per-token loop. Applying it
+         * per-task over a co slice instead changes the vectorised tail handling
+         * and perturbs the logits for no gain -- conv_batch is 10 MB and still
+         * hot, so this costs little. */
         for (bi = 0; bi < n_tokens; bi++) {
-            const float *restrict qkv = qkv_batch + (size_t)bi * conv_dim;
             float *restrict conv_out = conv_batch + (size_t)bi * conv_dim;
-
-            /* Append this token at the row just past the current window, then
-             * advance the window. With (nsr+1) rows and a rotate-one-row-per-token
-             * step this is a plain ring: the new row is always (hstart+nsr) mod
-             * (nsr+1), which is the slot the previous vacancy left. */
-            const int newrow = (hstart + nsr) % (nsr + 1);
-            memcpy(hist + (size_t)newrow * state_stride, qkv,
-                   (size_t)state_stride * sizeof(float));
-
-            /* taps[0..nsr] must appear oldest-first. History row r sits at
-             * (hstart + r) mod (nsr + 1) and the new token is the last tap, so
-             * build the pointer array directly rather than memmoving. */
-            const float *restrict taps[8];
-            if (nsr > 7) { fprintf(stderr, "FATAL: ssm_d_conv %d > 8 unsupported\n", dc); exit(1); }
-            for (int d = 0; d < nsr; d++)
-                taps[d] = hist + (size_t)((hstart + d) % (nsr + 1)) * state_stride;
-            taps[nsr] = hist + (size_t)newrow * state_stride;
-
-            for (int co = 0; co < conv_dim; co++) {
-                float sum = cw[co] * taps[0][co];
-                for (int d = 1; d <= nsr; d++)
-                    sum += cw[(size_t)d * conv_dim + co] * taps[d][co];
-                conv_out[co] = sum;
-            }
-
-            /* Advance the window: the oldest row drops out. */
-            hstart = (hstart + 1) % (nsr + 1);
-            /* SiLU over this token's conv_out row: vectorized.
-             * Must stay inside the per-token loop -- every token needs its own
-             * conv + SiLU. When this sat after the loop it ran once on the
-             * past-the-end row for bi == n_tokens, leaving all other tokens
-             * un-activated. */
 #ifdef PICOLM_HAVE_EXP256
             ssm_silu_vec(conv_out, conv_dim);
 #else
@@ -3902,14 +3960,15 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
 #endif
         }
 
-        /* Write the final window back into conv_state once, in the layout the
-         * decode path and the checkpoint code expect: nsr rows, oldest first.
-         * After the loop hstart points at the oldest of the last nsr tokens. */
+        /* Persist the new tail: the last nsr rows we consumed. These are rows
+         * n_tokens .. n_tokens+nsr-1 of pbuf, which are the final nsr tokens (or
+         * a mix of old state and new tokens when n_tokens < nsr -- pbuf is
+         * chronological, so the tail is always exactly right either way). */
         for (int r = 0; r < nsr; r++)
             memcpy(conv_state + (size_t)r * state_stride,
-                   hist + (size_t)((hstart + r) % (nsr + 1)) * state_stride,
-                   (size_t)state_stride * sizeof(float));
-        free(hist);
+                   pbuf + ((size_t)n_tokens + (size_t)r) * conv_dim,
+                   (size_t)conv_dim * sizeof(float));
+        free(pbuf);
         free(conv1d_wt);
     }
     _SSM_STEP_TMR(4);
