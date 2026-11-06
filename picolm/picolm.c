@@ -352,6 +352,10 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --list-tensors   List all tensors (name, shape, type) and exit\n");
     fprintf(stderr, "  --list-kv        List all KV metadata entries and exit\n");
     fprintf(stderr, "  --benchmark [N]  Benchmark loop (N times, omit for continuous)\n");
+    fprintf(stderr, "  --benchmark-live Print --benchmark-style per-layer timing during ordinary\n");
+    fprintf(stderr, "                   generation. Unlike --benchmark it does NOT replace the\n");
+    fprintf(stderr, "                   run, so it works with --cache, --checkpoint-max and a\n");
+    fprintf(stderr, "                   real prompt. Use it to catch long-context latency spikes.\n");
     #if defined(__linux__) || defined(__APPLE__)
     fprintf(stderr, "  --benchmark-threads [LIST]\n");
     fprintf(stderr, "                  Prefill once per thread count and report prefill ms / tok/s.\n");
@@ -542,6 +546,56 @@ static void bench_callback(int layer, int is_prefill, double elapsed_ms, long mi
         fprintf(stderr, " [pf=%lu+%lu]", (unsigned long)minflt, (unsigned long)majflt);
     }
     fprintf(stderr, "\n");
+}
+
+/* ---- --benchmark-live ----------------------------------------------------
+ *
+ * Emits the same per-layer line format as --benchmark, but during ORDINARY
+ * generation instead of replacing it. --benchmark is a separate mode that runs
+ * its own prompt loop, so it cannot be combined with --cache / --checkpoint-max
+ * / a real prompt file -- which is exactly the configuration needed to reproduce
+ * the long-context hiccup (an ~80k-token cached KV plus a ~2k-token append).
+ *
+ * Deliberately does NOT reuse bench_ctx_t/bench_callback: that path computes an
+ * ETA from a 32-layer ring buffer and resets it per iteration, all of which is
+ * meaningless here and would print a misleading ETA column. This just reports
+ * the raw per-layer cost and the numbers needed to interpret a spike.
+ *
+ * What actually finds the hiccup: a ~1 s stall on one layer among 64 otherwise
+ * ~130 ms layers stands out immediately as an outlier in this stream, and the
+ * pf=/io=/cache= columns say whether it was page faults, real I/O, or pure CPU.
+ * The layer index also identifies WHICH layer -- the reported spikes were at or
+ * just before the full-attention layers, which is a strong structural clue. */
+static void live_bench_cb(int layer, int is_prefill, double elapsed_ms, long minflt, long majflt, void *ud) {
+    const bench_ctx_t *bc = (const bench_ctx_t *)ud;
+    int n_active = bc ? bc->n_active_layers : 0;
+
+    size_t wsize = 0;
+    if (bc && layer >= 0 && layer < 128) wsize = bc->layer_weight_sizes[layer];
+    double wt_mbs = (elapsed_ms > 0 && wsize > 0)
+                  ? (double)wsize / (elapsed_ms / 1000.0) / (1024.0 * 1024.0) : 0;
+
+    char bw_str[96];
+    if (wsize > 0 && wt_mbs > 0) {
+        double io_pct = 0, cache_pct = 0;
+        if (majflt > 0) io_pct = ((double)majflt * 4096 / (elapsed_ms / 1000.0) / (1024.0 * 1024.0)) / wt_mbs * 100.0;
+        if (minflt > 0) cache_pct = ((double)minflt * 4096 / (elapsed_ms / 1000.0) / (1024.0 * 1024.0)) / wt_mbs * 100.0;
+        if (wt_mbs >= 100.0)
+            snprintf(bw_str, sizeof(bw_str), "%.0fMB/s io=%.0f%% cache=%.0f%%", wt_mbs, io_pct, cache_pct);
+        else if (wt_mbs >= 1.0)
+            snprintf(bw_str, sizeof(bw_str), "%.1fMB/s io=%.0f%% cache=%.0f%%", wt_mbs, io_pct, cache_pct);
+        else
+            snprintf(bw_str, sizeof(bw_str), "%.0fKB/s io=%.0f%% cache=%.0f%%", wt_mbs * 1024.0, io_pct, cache_pct);
+    } else {
+        snprintf(bw_str, sizeof(bw_str), "?MB/s");
+    }
+
+    fprintf(stderr, "%s [layer %d/%d]: %6.1fms  %-14s",
+            is_prefill ? "Prefill" : "Gen", layer, n_active, elapsed_ms, bw_str);
+    if (minflt > 0 || majflt > 0)
+        fprintf(stderr, " [pf=%lu+%lu]", (unsigned long)minflt, (unsigned long)majflt);
+    fprintf(stderr, "\n");
+    fflush(stderr);
 }
 
 /* Print benchmark summary */
@@ -1274,6 +1328,7 @@ int main(int argc, char **argv) {
     int    num_threads = 0; /* 0 = auto-detect from physical cores */
     int    json_mode = 0;
     int    benchmark_mode = 0;
+    int    benchmark_live = 0;   /* --benchmark-live: per-layer timing during normal generation */
     const char *cache_file = NULL;
     kv_cache_type_t kv_type_k = KV_CACHE_F16;
     kv_cache_type_t kv_type_v = KV_CACHE_F16;
@@ -1480,6 +1535,8 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "ERROR: --ssm-chunk-size must be >= 1\n");
                 return 1;
             }
+        } else if (strcmp(argv[i], "--benchmark-live") == 0) {
+            benchmark_live = 1;
         } else if (strcmp(argv[i], "--benchmark") == 0) {
             benchmark_mode = 1;
             if (i + 1 < argc && argv[i+1][0] != '-') {
@@ -2181,6 +2238,27 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "Prompt: %d tokens, generating up to %d (temp=%.2f, top_p=%.2f, threads=%d)\n",
             n_prompt, max_tokens, (double)temperature, (double)top_p, num_threads);
+
+    /* ---- --benchmark-live ----
+     * Install a per-layer timing callback for the ORDINARY generation path, so
+     * the run can use --cache / --checkpoint-max / a real prompt file. That
+     * combination is what reproduces the long-context hiccup; --benchmark is a
+     * separate mode that replaces generation and cannot do it.
+     *
+     * n_active_layers and the per-layer weight sizes are needed only to compute
+     * the MB/s column and the "layer k/N" label, so they are set up here, once,
+     * after start_pos is known. */
+    static bench_ctx_t live_bench;
+    if (benchmark_live) {
+        live_bench.n_layers = model.config.n_layers;
+        live_bench.n_active_layers = model.config.n_layers - model.config.n_mtp_layers;
+        live_bench.n_prompt_tokens = n_prompt;
+        for (int l = 0; l < live_bench.n_layers && l < 128; l++)
+            live_bench.layer_weight_sizes[l] = layer_weight_size(&model, l);
+        model_set_bench_callback(live_bench_cb, &live_bench);
+        fprintf(stderr, "=== live bench: start_pos=%d n_prompt=%d n_new=%d n_gen=%d ===\n",
+                start_pos, n_prompt, n_prompt - start_pos, max_tokens);
+    }
     fprintf(stderr, "---\n");
 
 #ifdef PICOLM_GPU
