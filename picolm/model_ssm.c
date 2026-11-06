@@ -16,6 +16,7 @@
 #include <string.h>
 #include <math.h>
 #include <assert.h>
+#include <time.h>   /* clock_gettime / CLOCKS_PER_SEC for ssm_now_ms() */
 
 /* Vectorized exp/silu helpers for SSM prefill.
  * Replaces ~600M scalar expf() calls per 771-token prefill on Qwen3.6-27B
@@ -65,7 +66,31 @@ static inline void ssm_exp_neg_vec(float *x, int size) {
  * The callback and user data are defined in model_core.c. */
 extern bench_layer_cb_t g_bench_cb;
 extern void *g_bench_user_data;
-double get_time_ms(void);
+
+/* Monotonic milliseconds, private to this translation unit.
+ *
+ * This used to be `double get_time_ms(void);`, using the definition from
+ * picolm.c. That linked fine for the main binary but broke every test target
+ * that compiles model_ssm.c without picolm.c -- test_glm5_dsa, for instance --
+ * with "undefined reference to get_time_ms". The symbol is only used for the
+ * optional profiling below, so it does not justify a cross-TU dependency:
+ * define a local copy instead. Keep it `static` and differently named from
+ * get_time_ms() so the test files that do define their own get_time_ms() do
+ * not collide with this one. */
+static double ssm_now_ms(void) {
+#if defined(_WIN32)
+    LARGE_INTEGER freq, count;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&count);
+    return (double)count.QuadPart / (double)freq.QuadPart * 1000.0;
+#elif defined(CLOCK_MONOTONIC)
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+#else
+    return (double)clock() / (double)CLOCKS_PER_SEC * 1000.0;
+#endif
+}
 
 #ifdef PICOLM_GPU
 static void _gpu_bench_emit(int l, int is_prefill, double elapsed_ms, long minflt, long majflt) {
@@ -583,7 +608,10 @@ static void ssm_head_task(int h, void *ctxp) {
  *
  * This is a GEMM: sk = state @ K^T   [d x d] @ [d x cs] -> [d x cs]
  * Transposed view: sk[cs][d] where sk[i] is the i-th row.
- */
+ *
+ * Kept as the reference formulation; ssm_kernel_veffsq_n below fuses this
+ * with ssm_kernel_sq_n, so the AVX-512 build does not call it directly. */
+__attribute__((unused))
 static void ssm_kernel_veff_n(
         float *sk,        /* [cs][nr] output */
         const float *state, /* [nr][d] state */
@@ -820,7 +848,9 @@ static void ssm_kernel_state_update_n(
  * sq[i][r] = sum_{c=0}^{d-1} state[r][c] * q[i][c]
  *
  * Same structure as Kernel 1 but with q instead of k.
- */
+ *
+ * Paired with ssm_kernel_veff_n; ssm_kernel_veffsq_n fuses the two. */
+__attribute__((unused))
 static void ssm_kernel_sq_n(
         float *sq,        /* [cs][nr] output */
         const float *state, /* [nr][d] state */
@@ -857,6 +887,72 @@ static void ssm_kernel_sq_n(
             sqi[base+1] = _mm512_reduce_add_ps(acc1);
             sqi[base+2] = _mm512_reduce_add_ps(acc2);
             sqi[base+3] = _mm512_reduce_add_ps(acc3);
+        }
+    }
+}
+
+/* Fused ssm_kernel_veff_n + ssm_kernel_sq_n: sk = S_init @ K^T and
+ * sq = S_init @ Q^T in one pass over the state matrix.
+ *
+ * The two kernels above are byte-identical apart from reading k vs q, and
+ * ssm_chunk_head_task calls them back to back on the same `state` with only
+ * cheap scalar work (the V_eff post-processing) in between. Run separately,
+ * each one re-streams the whole [nr][d] state block: for Qwen3.6 (nr = d = 128)
+ * that is 64 KB read twice per head per chunk. Fusing halves the state
+ * traffic and doubles the arithmetic per loaded cache line.
+ *
+ * sk and sq cannot alias (distinct scratch blocks in ssm_chunk_head_task).
+ * Bit-exact with the unfused pair: same accumulation order per output. */
+static void ssm_kernel_veffsq_n(
+        float *sk,         /* [cs][nr] output, S_init @ K^T */
+        float *sq,         /* [cs][nr] output, S_init @ Q^T */
+        const float *state, /* [nr][d] state */
+        const float *k,    /* [cs][d] */
+        const float *q,    /* [cs][d] */
+        int nr, int d, int cs)
+{
+    int d16 = d / 16;
+
+    for (int i = 0; i < cs; i++) {
+        const float *ki = k + (size_t)i * d;
+        const float *qi = q + (size_t)i * d;
+        float *ski = sk + (size_t)i * nr;
+        float *sqi = sq + (size_t)i * nr;
+
+        for (int g = 0; g < nr / 4; g++) {
+            int base = g * 4;
+            __m512 k0 = _mm512_setzero_ps(), k1 = _mm512_setzero_ps();
+            __m512 k2 = _mm512_setzero_ps(), k3 = _mm512_setzero_ps();
+            __m512 q0 = _mm512_setzero_ps(), q1 = _mm512_setzero_ps();
+            __m512 q2 = _mm512_setzero_ps(), q3 = _mm512_setzero_ps();
+
+            for (int v = 0; v < d16; v++) {
+                int col = v * 16;
+                __m512 kv = _mm512_loadu_ps(ki + col);
+                __m512 qv = _mm512_loadu_ps(qi + col);
+                /* One load of each of the 4 state rows, used by both dots. */
+                __m512 s0 = _mm512_loadu_ps(state + (size_t)(base+0) * d + col);
+                __m512 s1 = _mm512_loadu_ps(state + (size_t)(base+1) * d + col);
+                __m512 s2 = _mm512_loadu_ps(state + (size_t)(base+2) * d + col);
+                __m512 s3 = _mm512_loadu_ps(state + (size_t)(base+3) * d + col);
+                k0 = _mm512_fmadd_ps(s0, kv, k0);
+                k1 = _mm512_fmadd_ps(s1, kv, k1);
+                k2 = _mm512_fmadd_ps(s2, kv, k2);
+                k3 = _mm512_fmadd_ps(s3, kv, k3);
+                q0 = _mm512_fmadd_ps(s0, qv, q0);
+                q1 = _mm512_fmadd_ps(s1, qv, q1);
+                q2 = _mm512_fmadd_ps(s2, qv, q2);
+                q3 = _mm512_fmadd_ps(s3, qv, q3);
+            }
+
+            ski[base+0] = _mm512_reduce_add_ps(k0);
+            ski[base+1] = _mm512_reduce_add_ps(k1);
+            ski[base+2] = _mm512_reduce_add_ps(k2);
+            ski[base+3] = _mm512_reduce_add_ps(k3);
+            sqi[base+0] = _mm512_reduce_add_ps(q0);
+            sqi[base+1] = _mm512_reduce_add_ps(q1);
+            sqi[base+2] = _mm512_reduce_add_ps(q2);
+            sqi[base+3] = _mm512_reduce_add_ps(q3);
         }
     }
 }
@@ -1401,6 +1497,20 @@ static void ssm_kernel_sq_n(
 }
 #endif /* PICOLM_NEON */
 
+#ifndef PICOLM_AVX512
+/* Portable fallback for the fused veff+sq kernel. Only the AVX-512 path has a
+ * real fused implementation (it halves state traffic); on the other ISAs this
+ * just calls the two kernels in sequence so ssm_chunk_head_task has a single
+ * call site to maintain. */
+static void ssm_kernel_veffsq_n(
+        float *sk, float *sq, const float *state,
+        const float *k, const float *q, int nr, int d, int cs)
+{
+    ssm_kernel_veff_n(sk, state, k, nr, d, cs);
+    ssm_kernel_sq_n(sq, state, q, nr, d, cs);
+}
+#endif /* !PICOLM_AVX512 */
+
 /* ================================================================
  * Chunked DeltaNet recurrence.
  *
@@ -1587,8 +1697,11 @@ static void ssm_chunk_head_task(int h, void *ctxp) {
     /* Kernel 2: Interaction matrix M = K @ K^T with decay mask */
     ssm_kernel_interaction(M_mat, k, decay_mask, d, cs);
 
-    /* Kernel 1: sk = S_init @ K^T (for V_eff computation) */
-    ssm_kernel_veff_n(sk, state, k, hv, d, cs);
+    /* Kernel 1 + 1b: sk = S_init @ K^T and sq = S_init @ Q^T, fused so the
+     * state matrix is streamed once instead of twice (see ssm_kernel_veffsq_n).
+     * Both outputs are consumed later -- sk in Step 3, sq in Step 5 -- so it is
+     * safe to compute sq this early. */
+    ssm_kernel_veffsq_n(sk, sq, state, k, q, hv, d, cs);
 
     /* Step 3 (scalar post-processing): V_eff[i] = beta[i] * (v[i] - decay[i] * sk[i]) */
     for (int i = 0; i < cs; i++) {
@@ -1614,8 +1727,7 @@ static void ssm_chunk_head_task(int h, void *ctxp) {
         }
     }
 
-    /* Kernel 1b: sq = S_init @ Q^T (for initial state contribution to output) */
-    ssm_kernel_sq_n(sq, state, q, hv, d, cs);
+    /* Kernel 1b: sq = S_init @ Q^T -- computed above, fused into kernel 1. */
 
     /* Kernel 3: kq = K @ Q^T with decay mask */
     ssm_kernel_output_cross(kq, k, q, decay_mask, d, cs);
@@ -1771,8 +1883,31 @@ static void ssm_chunked_recurrence(
         int d_state, int n_k_heads, int n_v_heads, int head_v_dim, int repeat,
         int conv_dim, int cs)
 {
-    /* cs: chunk size (from model->ssm_chunk_size, default 64, 0=auto) */
-    if (cs <= 0) cs = 64; /* default */
+    /* cs: chunk size (from model->ssm_chunk_size, default 8, 0=auto)
+     *
+     * 8 is a measured optimum, not a guess. The chunked recurrence's cost has
+     * three terms: a chunk-size-INDEPENDENT one (the veff+sq pass, S_init @ K^T
+     * and @ Q^T, ~38 GOP for a 253-token Qwen3.6 prompt), a state-update term
+     * that falls as 1/cs (the state is touched once per chunk, not per token),
+     * and an intra-chunk term that grows as cs^2 (the interaction/forward-
+     * substitution matrices). Measured on Qwen3.6-27B-IQ6_K, 253 tokens:
+     *
+     *     cs=  1  653-685 ms     state updates dominate
+     *     cs=  4  505 ms
+     *     cs=  8  491 ms         <- minimum
+     *     cs= 16  530 ms
+     *     cs= 32  676 ms
+     *     cs= 64  816 ms         intra-chunk work dominates
+     *     cs=128 1326 ms
+     *     cs=256 1872 ms
+     *
+     * The old default was 64, i.e. ~1.7x slower than necessary and (because the
+     * intra-chunk term is an O(cs^2) sum) also the most variance-prone choice.
+     * cs=8 is additionally tighter run to run (26.1-26.5 tok/s vs 23.1-25.7).
+     * Larger chunks are still worth it when the state is FAT relative to the
+     * token count -- for prefill on a model with many v-heads or a big d_state,
+     * re-tune rather than assuming 8. */
+    if (cs <= 0) cs = 8; /* default */
     if (cs > n_tokens) cs = n_tokens;
     int n_chunks = (n_tokens + cs - 1) / cs;
     if (n_chunks < 1) n_chunks = 1;
@@ -3413,11 +3548,19 @@ static void ssm_ab_f32_task(int h, void *ctxp) {
         sa = _mm512_reduce_add_ps(aa);
         sb = _mm512_reduce_add_ps(ab);
 #elif defined(PICOLM_AVX)
+        /* AVX-only (e.g. Sandy Bridge): NO FMA. _mm256_fmadd_ps here is a
+         * target mismatch and fails to compile under `make avx`. Mirror the
+         * FMA256 convention used by the recurrence kernels below. */
         __m256 aa = _mm256_setzero_ps(), ab = _mm256_setzero_ps();
         for (; i + 7 < dim; i += 8) {
             const __m256 xv = _mm256_loadu_ps(x + i);
+#ifdef PICOLM_FMA
             aa = _mm256_fmadd_ps(_mm256_loadu_ps(aw + i), xv, aa);
             ab = _mm256_fmadd_ps(_mm256_loadu_ps(bw + i), xv, ab);
+#else
+            aa = _mm256_add_ps(_mm256_mul_ps(_mm256_loadu_ps(aw + i), xv), aa);
+            ab = _mm256_add_ps(_mm256_mul_ps(_mm256_loadu_ps(bw + i), xv), ab);
+#endif
         }
         sa = hsum_avx(aa);
         sb = hsum_avx(ab);
@@ -3585,9 +3728,9 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
     float *conv_batch = z_batch + (size_t)n_tokens * value_dim;
 
     #define _SSM_STEP_TMR(idx) \
-    do { if (_ssm_step_on > 0) { double _t = get_time_ms(); _ssm_step_ms[(idx)] += _t - _ssm_step_last; _ssm_step_last = _t; } } while(0)
+    do { if (_ssm_step_on > 0) { double _t = ssm_now_ms(); _ssm_step_ms[(idx)] += _t - _ssm_step_last; _ssm_step_last = _t; } } while(0)
     if (_ssm_step_on < 0) _ssm_step_on = getenv("PICOLM_SSM_STEP_PROF") ? 1 : 0;
-    double _ssm_step_last = (_ssm_step_on > 0) ? get_time_ms() : 0;
+    double _ssm_step_last = (_ssm_step_on > 0) ? ssm_now_ms() : 0;
 /* 1. Batched RMSNorm (write to local ssm_xb with stride dim) */
     for (bi = 0; bi < n_tokens; bi++)
         rmsnorm(ssm_xb + bi * dim, x_batch + bi * dim, s->attn_norm_w[l], dim, eps);
@@ -5632,9 +5775,9 @@ after_qkv:
      * then emit synthetic per-layer benchmark callbacks so the --benchmark
      * output has meaningful timing data. GPU prefill records all commands
      * instantly; the actual work happens during the fence wait. */
-    double _gpu_layer_t0 = get_time_ms();
+    double _gpu_layer_t0 = ssm_now_ms();
     picolm_gpu_batch_end(gpu_dev);
-    double _gpu_layer_total = get_time_ms() - _gpu_layer_t0;
+    double _gpu_layer_total = ssm_now_ms() - _gpu_layer_t0;
     /* Debug: dump KV cache for layer 0, token 0 */
     if (getenv("PICOLM_DBG_KV")) {
         int kv_dim = n_kv_heads * head_dim;

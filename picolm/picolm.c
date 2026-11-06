@@ -344,8 +344,10 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --checkpoint-every-nt-gen <N> Checkpoint every N tokens during generation (default: 64)\n");
     fprintf(stderr, "  --checkpoint-tail-offset <N> Checkpoint N tokens before end of prompt (default: 5)\n");
     fprintf(stderr, "  --ssm-serial      Use serial per-token SSM prefill (default is batched)\n");
-    fprintf(stderr, "  --ssm-chunk-size <N> SSM batch chunk size (default 64; note: different sizes may\n");
-    fprintf(stderr, "                       produce slightly different outputs due to float rounding order)\n");
+    fprintf(stderr, "  --ssm-chunk-size <N> SSM batch chunk size (default 8; 8 is the measured\n");
+    fprintf(stderr, "                       optimum for the chunked recurrence -- larger values grow\n");
+    fprintf(stderr, "                       an O(cs^2) intra-chunk term. Different sizes produce slightly\n");
+    fprintf(stderr, "                       different outputs due to float rounding order)\n");
     fprintf(stderr, "\nInfo options:\n");
     fprintf(stderr, "  --list-tensors   List all tensors (name, shape, type) and exit\n");
     fprintf(stderr, "  --list-kv        List all KV metadata entries and exit\n");
@@ -1301,7 +1303,7 @@ int main(int argc, char **argv) {
     char   server_host[256] = "0.0.0.0";
     /* SSM options */
     int    ssm_batched_prefill = 1;     /* 1=batched (default), 0=per-token */
-    int    ssm_chunk_size = 0;          /* 0=default(64), 1=serial-equivalent */
+    int    ssm_chunk_size = 0;          /* 0=default(8 -> see ssm_chunked_recurrence), 1=serial-equivalent */
     /* SSM checkpoint options */
     int    checkpoint_max = 3;          /* default 3 in --server mode, overridden to 0 otherwise */
     int    checkpoint_interval = 256;
