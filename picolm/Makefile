@@ -831,6 +831,12 @@ endif
 test_rowinterleave: tests/test_rowinterleave.c quant.c $(SGEMM_SRCS)
 	$(CC) $(CFLAGS) $(TEST_SIMD_CFLAGS) -I. -o $@ tests/test_rowinterleave.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp
 
+# Isolates picolm_sgemm_r8dec_avx2t against a dequantize-and-dot reference, so a
+# disagreement can be attributed to a specific atype/repack path without a model,
+# the SSM code, or the oracle's text hashing in the way.
+test_r8dec_ref: tests/test_r8dec_ref.c quant.c $(SGEMM_SRCS)
+	$(CC) $(CFLAGS) $(TEST_SIMD_CFLAGS) -I. -o $@ tests/test_r8dec_ref.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp
+
 test_swa: tests/test_swa.c model_attention.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS)
 	$(CC) $(CFLAGS) -I. -O2 -o $@ tests/test_swa.c model_attention.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
 

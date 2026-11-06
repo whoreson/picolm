@@ -62,3 +62,4 @@ test_rowinterleave
 test_quant
 test_q6_k_r4
 test_attn_tiled_tail
+test_r8dec_ref
