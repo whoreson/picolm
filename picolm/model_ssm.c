@@ -792,54 +792,62 @@ static void ssm_kernel_state_update_n(
 {
     int d16 = d / 16;
 
-    /* First: decay the existing state by total_decay */
-    __m512 td = _mm512_set1_ps(total_decay);
-    for (int r = 0; r < nr; r++) {
-        float *sr = state + (size_t)r * d;
-        for (int v = 0; v < d16; v++) {
-            __m512 sv = _mm512_loadu_ps(sr + v * 16);
-            _mm512_storeu_ps(sr + v * 16, _mm512_mul_ps(sv, td));
-        }
-    }
+    /* The separate "decay the whole state by total_decay" pass that used to sit
+     * here is folded into the accumulate loop below: each accumulator is seeded
+     * with (state row * total_decay) as it is loaded. That pass was a full
+     * extra read-modify-write of the state block per chunk for no reason. */
+    const __m512 td = _mm512_set1_ps(total_decay);
 
     /* Second: accumulate weighted outer products.
-     * For each j: decay_to_end[j] * outer(V_hat[j], k[j])
-     * Process 4 rows at a time for better register utilization. */
+     *
+     * S_update[r][c] += sum_j decay_to_end[j] * v_hat[j][r] * k[j][c]
+     *
+     * Loop order is ROW-GROUP OUTER, j INNER. The previous order had j outer and
+     * re-loaded plus re-stored the whole state block once per j, i.e. cs
+     * read-modify-writes of the full [nr][d] matrix per chunk: at d=nr=128 and
+     * cs=8 that is 1 MB of traffic to produce 128 KB of result. Inverting the
+     * loops lets a 4-row slice stay in the 4 zmm accumulators across all cs
+     * terms, so each state row is read once and written once per chunk
+     * (128 KB instead of 1 MB, an 8x cut) while the k[j] streams past.
+     *
+     * This is why the kernel measured 43% of the whole recurrence even though
+     * its arithmetic is trivial: it was bound by state traffic, not FLOPs.
+     *
+     * Floating-point accumulation order per output element is UNCHANGED (still
+     * j ascending), so results stay bit-identical. */
     int ngrp = nr / 4; /* number of 4-row groups */
 
-    for (int j = 0; j < cs; j++) {
-        const float *vj = v_hat + (size_t)j * nr;
-        const float *kj = k + (size_t)j * d;
-        float dj = decay_to_end[j];
+    for (int g = 0; g < ngrp; g++) {
+        const int base = g * 4;
+        float *s0p = state + (size_t)(base + 0) * d;
+        float *s1p = state + (size_t)(base + 1) * d;
+        float *s2p = state + (size_t)(base + 2) * d;
+        float *s3p = state + (size_t)(base + 3) * d;
 
-        if (dj == 0.0f) continue;
+        for (int v = 0; v < d16; v++) {
+            const int col_base = v * 16;
 
-        for (int g = 0; g < ngrp; g++) {
-            int base = g * 4;
-            float vj0 = vj[base];
-            float vj1 = vj[base + 1];
-            float vj2 = vj[base + 2];
-            float vj3 = vj[base + 3];
+            /* Seed the accumulators with the decayed state rows. */
+            __m512 r0 = _mm512_mul_ps(_mm512_loadu_ps(s0p + col_base), td);
+            __m512 r1 = _mm512_mul_ps(_mm512_loadu_ps(s1p + col_base), td);
+            __m512 r2 = _mm512_mul_ps(_mm512_loadu_ps(s2p + col_base), td);
+            __m512 r3 = _mm512_mul_ps(_mm512_loadu_ps(s3p + col_base), td);
 
-            __m512 s0 = _mm512_set1_ps(vj0 * dj);
-            __m512 s1 = _mm512_set1_ps(vj1 * dj);
-            __m512 s2 = _mm512_set1_ps(vj2 * dj);
-            __m512 s3 = _mm512_set1_ps(vj3 * dj);
-
-            for (int v = 0; v < d16; v++) {
-                int col_base = v * 16;
-                __m512 kv = _mm512_loadu_ps(kj + col_base);
-
-                __m512 r0 = _mm512_loadu_ps(state + base * d + col_base);
-                __m512 r1 = _mm512_loadu_ps(state + (base+1) * d + col_base);
-                __m512 r2 = _mm512_loadu_ps(state + (base+2) * d + col_base);
-                __m512 r3 = _mm512_loadu_ps(state + (base+3) * d + col_base);
-
-                _mm512_storeu_ps(state + base * d + col_base, _mm512_fmadd_ps(kv, s0, r0));
-                _mm512_storeu_ps(state + (base+1) * d + col_base, _mm512_fmadd_ps(kv, s1, r1));
-                _mm512_storeu_ps(state + (base+2) * d + col_base, _mm512_fmadd_ps(kv, s2, r2));
-                _mm512_storeu_ps(state + (base+3) * d + col_base, _mm512_fmadd_ps(kv, s3, r3));
+            for (int j = 0; j < cs; j++) {
+                const float dj = decay_to_end[j];
+                if (dj == 0.0f) continue;
+                const float *restrict vj = v_hat + (size_t)j * nr;
+                const __m512 kv = _mm512_loadu_ps(k + (size_t)j * d + col_base);
+                r0 = _mm512_fmadd_ps(kv, _mm512_set1_ps(vj[base + 0] * dj), r0);
+                r1 = _mm512_fmadd_ps(kv, _mm512_set1_ps(vj[base + 1] * dj), r1);
+                r2 = _mm512_fmadd_ps(kv, _mm512_set1_ps(vj[base + 2] * dj), r2);
+                r3 = _mm512_fmadd_ps(kv, _mm512_set1_ps(vj[base + 3] * dj), r3);
             }
+
+            _mm512_storeu_ps(s0p + col_base, r0);
+            _mm512_storeu_ps(s1p + col_base, r1);
+            _mm512_storeu_ps(s2p + col_base, r2);
+            _mm512_storeu_ps(s3p + col_base, r3);
         }
     }
 }
@@ -1596,6 +1604,7 @@ static void ssm_chunk_head_task(int h, void *ctxp) {
     int cs = ctx->cs;
     int kh = h / ctx->repeat;      /* grouped pairing, see ssm_head_task() */
 
+
     /* Point to this head's data within the chunk.
      * v (and its state block / output) is [head_v_dim][d_state]: one
      * independent rank-1 recurrence per *value* dimension. `d` was used for
@@ -1695,7 +1704,7 @@ static void ssm_chunk_head_task(int h, void *ctxp) {
 #if defined(PICOLM_AVX512) || defined(PICOLM_AVX2) || defined(PICOLM_AVX) || defined(PICOLM_NEON)
     /* === AVX-512 / AVX2 / NEON micro-kernel path === */
 
-    /* Kernel 2: Interaction matrix M = K @ K^T with decay mask */
+/* Kernel 2: Interaction matrix M = K @ K^T with decay mask */
     ssm_kernel_interaction(M_mat, k, decay_mask, d, cs);
 
     /* Kernel 1 + 1b: sk = S_init @ K^T and sq = S_init @ Q^T, fused so the
