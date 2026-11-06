@@ -7253,7 +7253,15 @@ float vec_dot_q2_K_f32(const void *src, const float *x, int n) {
  * through plain vec_dot(), so interleaved types are dequantized row-wise. */
 float vec_dot_row(const void *base, const float *x, int n, gguf_type_t type, int row) {
     const int rpb = gguf_type_rows_per_block(type);
-    if (rpb <= 1) return vec_dot(base, x, n, type);
+    /* Non-interleaved types: row `row` starts at base + row * row_size. The old
+     * `if (rpb <= 1) return vec_dot(base, x, n, type);` dropped `row` entirely and
+     * dotted against ROW 0 for every row. That silently returned the same value
+     * for all heads in the SSM alpha/beta path on IQ6_K (measured: six different
+     * heads all gave -0.609824), i.e. every token got head 0's alpha and beta. */
+    if (rpb <= 1) {
+        const char *r = (const char *)base + (size_t)row * gguf_type_row_size(type, n);
+        return vec_dot(r, x, n, type);
+    }
     const int rin = row % rpb;
     const void *blk = gguf_type_row_ptr(base, type, gguf_type_row_size(type, n), row);
     switch (type) {

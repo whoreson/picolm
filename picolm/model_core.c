@@ -5911,6 +5911,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #endif
 
     /* Diagnostic: dump CPU prefill logits top-5 */
+    { extern void ssm_prefill_step_prof_report(void); ssm_prefill_step_prof_report(); }
     free(buf);
     return s->logits;
 }

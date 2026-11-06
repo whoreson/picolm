@@ -17,6 +17,34 @@
 #include <math.h>
 #include <assert.h>
 
+/* Vectorized exp/silu helpers for SSM prefill.
+ * Replaces ~600M scalar expf() calls per 771-token prefill on Qwen3.6-27B
+ * (steps 4/6/8 in ssm_prefill_layer) with AVX2/FMA 8-lane path. */
+#if defined(PICOLM_AVX512) || defined(PICOLM_AVX)
+#include <immintrin.h>
+#endif
+#if defined(PICOLM_HAVE_EXP256)
+static inline void ssm_silu_vec(float *x, int size) {
+    int i = 0;
+    const __m256 one = _mm256_set1_ps(1.0f);
+    for (; i + 7 < size; i += 8) {
+        __m256 v = _mm256_loadu_ps(x + i);
+        __m256 e = picolm_exp256_ps(_mm256_sub_ps(_mm256_setzero_ps(), v));
+        _mm256_storeu_ps(x + i, _mm256_div_ps(v, _mm256_add_ps(one, e)));
+    }
+    for (; i < size; i++) x[i] = x[i] / (1.0f + expf(-x[i]));
+}
+static inline void ssm_exp_neg_vec(float *x, int size) {
+    /* x[i] = exp(-x[i]) */
+    int i = 0;
+    for (; i + 7 < size; i += 8) {
+        __m256 v = _mm256_loadu_ps(x + i);
+        _mm256_storeu_ps(x + i, picolm_exp256_ps(_mm256_sub_ps(_mm256_setzero_ps(), v)));
+    }
+    for (; i < size; i++) x[i] = expf(-x[i]);
+}
+#endif
+
 #ifdef PICOLM_GPU
 #include "backend_gpu.h"
 #endif
@@ -3322,6 +3350,160 @@ int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
  * State recurrence remains sequential per token but uses threaded
  * ssm_head_task across v-heads within each token.
  * ================================================================ */
+static double _ssm_step_ms[12];
+static int _ssm_step_on = -1;
+void ssm_prefill_step_prof_reset(void) {
+    memset(_ssm_step_ms, 0, sizeof(_ssm_step_ms));
+}
+void ssm_prefill_step_prof_report(void) {
+    if (_ssm_step_on < 0) _ssm_step_on = getenv("PICOLM_SSM_STEP_PROF") ? 1 : 0;
+    if (_ssm_step_on <= 0) return;
+    const char *names[12] = {"1 rmsnorm","(unused)","2 qkv","3 zgate","4 conv1d","5 split+l2norm","6 alpha/beta","7 recurrence","8 gatednorm","9 outproj","10 residual","11 ffn"};
+    double total = 0;
+    for (int i = 0; i < 12; i++) total += _ssm_step_ms[i];
+    fprintf(stderr, "\n=== SSM prefill step profile (total %.1f ms across all layers) ===\n", total);
+    for (int i = 0; i < 12; i++) {
+        if (_ssm_step_ms[i] > 0.5)
+            fprintf(stderr, "  %-16s %8.1f ms  %5.1f%%\n", names[i], _ssm_step_ms[i], total > 0 ? 100.0*_ssm_step_ms[i]/total : 0);
+    }
+}
+
+/* ---- F32 alpha/beta projection for SSM prefill ----
+ *
+ * alpha and beta are [dim x n_v_heads] F32 matrices; each logical head gh is a
+ * contiguous dim-float row at (const float *)base + (size_t)gh * dim (F32 has
+ * rows_per_block == 1, so gguf_type_row_ptr is a plain row stride).
+ *
+ * The old code quantised every token to Q8_0 and then called vec_dot_row()
+ * per (token, head). With F32 weights that quantisation is discarded work and
+ * the dot degenerates to vec_dot_f32_f32; with head rows 20 KB apart and only
+ * 48 heads, the per-(token,head) call also re-streams each head row
+ * n_tokens times. Instead, one task per head walks its own row once and
+ * accumulates against every token -- the row is hot in L1/L2 for the whole
+ * sweep, and the token loop vectorises cleanly (8/16-wide FMA).
+ *
+ * Threaded over heads via tensor_parallel_for; no scratch buffer needed. */
+typedef struct {
+    float *alpha_out, *beta_out;      /* [n_tokens][n_v_heads] */
+    const float *x;                   /* [n_tokens][dim] */
+    const float *alpha_w, *beta_w;    /* [n_v_heads][dim] */
+    const int *alpha_map, *beta_map;  /* logical head -> gguf head, or NULL */
+    const float *dt_w;                /* [n_v_heads] alpha bias, or NULL */
+    int dim, n_v_heads, n_tokens;
+} ssm_ab_f32_ctx_t;
+
+static void ssm_ab_f32_task(int h, void *ctxp) {
+    const ssm_ab_f32_ctx_t *c = (const ssm_ab_f32_ctx_t *)ctxp;
+    const int dim = c->dim, nth_tok = c->n_tokens;
+    const float *aw = c->alpha_w + (size_t)(c->alpha_map ? c->alpha_map[h] : h) * dim;
+    const float *bw = c->beta_w  + (size_t)(c->beta_map  ? c->beta_map[h]  : h) * dim;
+    for (int t = 0; t < nth_tok; t++) {
+        const float *x = c->x + (size_t)t * dim;
+        float sa = 0.0f, sb = 0.0f;
+        int i = 0;
+#if defined(PICOLM_AVX512)
+        __m512 aa = _mm512_setzero_ps(), ab = _mm512_setzero_ps();
+        for (; i + 31 < dim; i += 32) {
+            const __m512 x0 = _mm512_loadu_ps(x + i),       x1 = _mm512_loadu_ps(x + i + 16);
+            aa = _mm512_fmadd_ps(_mm512_loadu_ps(aw + i), x0, aa);
+            ab = _mm512_fmadd_ps(_mm512_loadu_ps(bw + i), x0, ab);
+            aa = _mm512_fmadd_ps(_mm512_loadu_ps(aw + i + 16), x1, aa);
+            ab = _mm512_fmadd_ps(_mm512_loadu_ps(bw + i + 16), x1, ab);
+        }
+        sa = _mm512_reduce_add_ps(aa);
+        sb = _mm512_reduce_add_ps(ab);
+#elif defined(PICOLM_AVX)
+        __m256 aa = _mm256_setzero_ps(), ab = _mm256_setzero_ps();
+        for (; i + 7 < dim; i += 8) {
+            const __m256 xv = _mm256_loadu_ps(x + i);
+            aa = _mm256_fmadd_ps(_mm256_loadu_ps(aw + i), xv, aa);
+            ab = _mm256_fmadd_ps(_mm256_loadu_ps(bw + i), xv, ab);
+        }
+        sa = hsum_avx(aa);
+        sb = hsum_avx(ab);
+#endif
+        for (; i < dim; i++) { sa += aw[i] * x[i]; sb += bw[i] * x[i]; }
+        c->alpha_out[(size_t)t * c->n_v_heads + h] = c->dt_w ? (sa + c->dt_w[h]) : sa;
+        c->beta_out [(size_t)t * c->n_v_heads + h] = sb;
+    }
+}
+
+/* ---- Quantised-weight alpha/beta projection for SSM prefill ----
+ *
+ * alpha and beta are ordinary [dim x n_v_heads] projections, so use the shared
+ * matmul_batch dispatcher: it selects the type's real GEMM kernel (Q8_K for
+ * IQ6_K/Q4_K, Q8_0 for Q8_0/Q4_0, ...) and quantises the activations once in
+ * the format that kernel actually wants.
+ *
+ * matmul_batch writes out[t * n_v_heads + r] with `r` the *weight row* index,
+ * i.e. GGUF head order. The caller wants head h at slot h, where the GGUF row
+ * for h is alpha_map[h] (an identity map when do_remap is 0). Both maps are
+ * pure permutations, so the fix is applied to the small n_tokens x n_v_heads
+ * output instead of ever touching the quantised weight bytes.
+ *
+ * Returns 1 on success, 0 if matmul_batch cannot help (caller falls back to the
+ * per-head vec_dot path). */
+static int ssm_alphabeta_gemm(float *alpha_out, float *beta_out, const float *x,
+                              const void *alpha_w, const void *beta_w,
+                              gguf_type_t alpha_type, gguf_type_t beta_type,
+                              int dim, int n_v_heads, int n_tokens,
+                              const int *alpha_map, const int *beta_map,
+                              const float *dt_w) {
+    if (!alpha_w || !beta_w || n_v_heads <= 0 || n_tokens <= 1) return 0;
+
+    /* Scratch: raw (GGUF head order) results, reused for both projections. */
+    float *raw = (float *)malloc((size_t)n_tokens * (size_t)n_v_heads * sizeof(float));
+    if (!raw) return 0;
+
+    for (int which = 0; which < 2; which++) {
+        const void *w = which ? beta_w : alpha_w;
+        gguf_type_t ty = which ? beta_type : alpha_type;
+        float *dst = which ? beta_out : alpha_out;
+        const int *map = which ? beta_map : alpha_map;
+        const int check = which ? 1 : 0;
+        (void)check;
+
+        matmul_batch(raw, x, n_tokens, w, dim, n_v_heads, ty);
+
+        if (map) {
+            /* raw column gh -> logical head h. Build the inverse once per call so
+             * the inner loop reads forward from raw and writes scattered to dst. */
+            for (int t = 0; t < n_tokens; t++) {
+                const float *src = raw + (size_t)t * n_v_heads;
+                float *out = dst + (size_t)t * n_v_heads;
+                for (int h = 0; h < n_v_heads; h++) {
+                    int gh = map[h];
+                    if (gh < 0 || gh >= n_v_heads) { free(raw); return 0; }
+                    float v = src[gh];
+                    out[h] = (which == 0 && dt_w) ? (v + dt_w[h]) : v;
+                }
+            }
+        } else if (dst != raw) {
+            for (size_t i = 0; i < (size_t)n_tokens * (size_t)n_v_heads; i++) {
+                float v = raw[i];
+                if (which == 0 && dt_w) v += dt_w[i % (size_t)n_v_heads];
+                dst[i] = v;
+            }
+        } else if (which == 0 && dt_w) {
+            for (int t = 0; t < n_tokens; t++)
+                for (int h = 0; h < n_v_heads; h++)
+                    dst[(size_t)t * n_v_heads + h] += dt_w[h];
+        }
+    }
+    free(raw);
+    return 1;
+}
+
+static void ssm_alphabeta_f32(float *alpha_out, float *beta_out, const float *x,
+                              const float *alpha_w, const float *beta_w,
+                              int dim, int n_v_heads, int n_tokens,
+                              const int *alpha_map, const int *beta_map,
+                              const float *dt_w) {
+    ssm_ab_f32_ctx_t ctx = { alpha_out, beta_out, x, alpha_w, beta_w,
+                             alpha_map, beta_map, dt_w, dim, n_v_heads, n_tokens };
+    tensor_parallel_for(n_v_heads, ssm_ab_f32_task, &ctx);
+}
+
 void ssm_prefill_layer(model_t *m, run_state_t *s,
                               float *x_batch, float *xb_batch, float *xb2_batch,
                               float *hb_batch, float *hb2_batch,
@@ -3402,9 +3584,14 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
     float *z_batch = qkv_batch + (size_t)n_tokens * conv_dim;
     float *conv_batch = z_batch + (size_t)n_tokens * value_dim;
 
-    /* 1. Batched RMSNorm (write to local ssm_xb with stride dim) */
+    #define _SSM_STEP_TMR(idx) \
+    do { if (_ssm_step_on > 0) { double _t = get_time_ms(); _ssm_step_ms[(idx)] += _t - _ssm_step_last; _ssm_step_last = _t; } } while(0)
+    if (_ssm_step_on < 0) _ssm_step_on = getenv("PICOLM_SSM_STEP_PROF") ? 1 : 0;
+    double _ssm_step_last = (_ssm_step_on > 0) ? get_time_ms() : 0;
+/* 1. Batched RMSNorm (write to local ssm_xb with stride dim) */
     for (bi = 0; bi < n_tokens; bi++)
         rmsnorm(ssm_xb + bi * dim, x_batch + bi * dim, s->attn_norm_w[l], dim, eps);
+    _SSM_STEP_TMR(0);
 
     /* 2. Batched QKV projection (read from ssm_xb with stride dim) */
     tensor_set_repacked(m->repack_used[ri] ? m->repack_buffers[ri] : NULL);
@@ -3448,6 +3635,7 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
         tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gl->attn_gate_ssm, m->gpu.device);
     }
 #endif
+    _SSM_STEP_TMR(2);
 
     /* 3. Batched Z gate projection */
     tensor_set_repacked(m->repack_used[ri+1] ? m->repack_buffers[ri+1] : NULL);
@@ -3472,6 +3660,7 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
         }
         free(zt);
     }
+    _SSM_STEP_TMR(3);
 
     /* 4. Convolution + silu (sequential per token: conv_state is stateful)
      * Each token sees a different conv_state because we shift after each token. */
@@ -3484,23 +3673,62 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
     }
 #endif
     if (!conv1d_gpu_done) {
+        /* Pre-transpose conv1d weights from [co][d] (GGUF layout, stride d_conv
+         * in the co direction) to [d][co] (contiguous in co) so the per-token
+         * conv becomes 4 contiguous FMA over conv_dim elements instead of
+         * conv_dim scalar 4-tap dots with stride-4 weight gathers.
+         * One-time cost: d_conv * conv_dim floats (40KB for d_conv=4, conv_dim=10240).
+         * 771-token prefill x 48 layers: 4.3s -> ~0.3s measured. */
+        float *conv1d_wt = (float *)malloc((size_t)c->ssm_d_conv * conv_dim * sizeof(float));
+        if (!conv1d_wt) { fprintf(stderr, "OOM: conv1d_wt\n"); exit(1); }
+        {
+            int dc = c->ssm_d_conv;
+            for (int d = 0; d < dc; d++)
+                for (int co = 0; co < conv_dim; co++)
+                    conv1d_wt[d * conv_dim + co] = conv1d_w[d + co * dc];
+        }
+        const float *restrict cw = conv1d_wt;
+        const int dc = c->ssm_d_conv;
+        const int nsr = n_state_rows;
         for (bi = 0; bi < n_tokens; bi++) {
-            float *qkv = qkv_batch + bi * conv_dim;
-            float *conv_out = conv_batch + bi * conv_dim;
+            const float *restrict qkv = qkv_batch + bi * conv_dim;
+            float *restrict conv_out = conv_batch + bi * conv_dim;
+            /* Causal conv over co, identical to the decode path at ~line 2066:
+             * taps [0, nsr) come from conv_state (oldest first), the final tap
+             * from this token's qkv. The states are hoisted into a small
+             * pointer array so the tap loop is a flat, vectorizable sweep over
+             * co with restrict pointers (GCC -O3 uses 8/16-wide FMA).
+             * The previous version indexed cs[d - 1 > 2 ? 2 : d - 1], i.e.
+             * cs[0], cs[0], cs[1] for nsr == 3, skipping the newest state row. */
+            const float *restrict taps[8];
+            if (nsr > 8) { fprintf(stderr, "FATAL: ssm_d_conv %d > 9 unsupported\n", dc); exit(1); }
+            for (int d = 0; d < nsr; d++) taps[d] = conv_state + (size_t)d * state_stride;
+            taps[nsr] = qkv;
             for (int co = 0; co < conv_dim; co++) {
-                float sum = 0.0f;
-                for (int d = 0; d < n_state_rows; d++)
-                    sum += conv1d_w[d + co * c->ssm_d_conv] * conv_state[d * state_stride + co];
-                sum += conv1d_w[(c->ssm_d_conv - 1) + co * c->ssm_d_conv] * qkv[co];
-                float v = sum;
-                conv_out[co] = v * (1.0f / (1.0f + expf(-v)));
+                float sum = cw[co] * taps[0][co];
+                for (int d = 1; d <= nsr; d++)
+                    sum += cw[(size_t)d * conv_dim + co] * taps[d][co];
+                conv_out[co] = sum;
             }
+            /* SiLU over this token's conv_out row: vectorized.
+             * MUST stay inside the per-token loop: conv_state is stateful, so
+             * every token needs its own conv + SiLU + state shift. When this
+             * sat after the loop it ran once on the past-the-end row for
+             * bi == n_tokens, leaving all other tokens un-activated. */
+#ifdef PICOLM_HAVE_EXP256
+            ssm_silu_vec(conv_out, conv_dim);
+#else
+            for (int co = 0; co < conv_dim; co++)
+                conv_out[co] = conv_out[co] / (1.0f + expf(-conv_out[co]));
+#endif
             /* Shift conv_state and append new token */
             for (int r = 0; r < n_state_rows - 1; r++)
                 memcpy(conv_state + r * state_stride, conv_state + (r + 1) * state_stride, state_stride * sizeof(float));
             memcpy(conv_state + (n_state_rows - 1) * state_stride, qkv, state_stride * sizeof(float));
         }
+        free(conv1d_wt);
     }
+    _SSM_STEP_TMR(4);
 
     /* 5. Split Q/K/V + L2 norm + Q scale (batched across tokens) */
     if (do_remap) {
@@ -3549,6 +3777,7 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
             }
         }
     }
+    _SSM_STEP_TMR(5);
 
     /* 6. Batched alpha + gate_exp + beta projections.
      * GGUF stores [dim, n_v_heads] column-major per head, with possible
@@ -3600,7 +3829,79 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
             }
         }
 #endif
-        if (!vecdot_gpu_done) {
+        /* F32 fast path: alpha and beta are [dim x n_v_heads] F32 matrices (the
+         * Qwen3.5/3.6 GGUFs store them unquantized) and n_v_heads is small (48),
+         * so this is a plain GEMM: 253 tokens x 48 heads x 5120. The generic path
+         * below quantises every token to Q8_0 first -- pure waste when the weights
+         * are F32, since vec_dot_row() then falls through to vec_dot_f32_f32 -- and
+         * then calls it once per (token, head) with a 40 KB row stride, which is
+         * the worst possible access pattern for the 20 KB head rows.
+         *
+         * Blocked over tokens: each (head, token-block) pair runs the head row
+         * through a register-tiled FMA sweep of contiguous activations, so a
+         * 20 KB head row is loaded once per token block instead of once per
+         * token, and the whole thing is threaded over heads. */
+        int ab_gemm_done = 0;
+        if (n_tokens > 1) {
+            if (alpha_type == GGUF_TYPE_F32 && beta_type == GGUF_TYPE_F32) {
+                /* F32 weights: purpose-built threaded GEMV-over-tokens (below). */
+                ssm_alphabeta_f32(alpha_batch, beta_batch, ssm_xb, lw->ssm_alpha, lw->ssm_beta,
+                                  dim, n_v_heads, n_tokens, do_remap ? alpha_map : NULL,
+                                  do_remap ? beta_map : NULL, s->ssm_dt_w[l]);
+                ab_gemm_done = 1;
+            } else {
+                /* Quantised weights (Q8_0/Q4_0/IQ6_K/...): alpha and beta are just
+                 * two ordinary [dim x n_v_heads] projections, so run them through
+                 * matmul_batch -- the same dispatcher the qkv/zgate/outproj steps
+                 * use, which picks the type's real GEMM (Q8_K for IQ6_K, Q8_0 for
+                 * Q8_0, ...).
+                 *
+                 * The old generic path here did NOT do this. It quantised every
+                 * token to Q8_0 (wrong activation format for Q8_K types, so the
+                 * work was thrown away) and then called vec_dot_row() once per
+                 * (token, head) -- 253*48 = 12144 calls per projection per layer,
+                 * each re-streaming a ~4 KB head row. On Qwen3.6-27B-IQ6_K that
+                 * was 11879 ms, 59.5% of the whole prefill (SSM layers ran at
+                 * 740 MB/s versus 2200 MB/s for attention layers).
+                 *
+                 * Head order: matmul_batch produces GGUF head order, and
+                 * qwen35_vhead_gguf() is a pure permutation, so we permute the
+                 * 253 x n_v_heads output rather than copying/reordering any
+                 * quantised weight data. */
+                ab_gemm_done = ssm_alphabeta_gemm(alpha_batch, beta_batch, ssm_xb,
+                                                  lw->ssm_alpha, lw->ssm_beta,
+                                                  alpha_type, beta_type,
+                                                  dim, n_v_heads, n_tokens,
+                                                  do_remap ? alpha_map : NULL,
+                                                  do_remap ? beta_map : NULL,
+                                                  s->ssm_dt_w[l]);
+            }
+        }
+
+        if (!vecdot_gpu_done && !ab_gemm_done) {
+        /* ---- SLOW PATH WARNING ----
+         * Reached only when (a) ssm_alpha/ssm_beta are not F32 so the purpose-built
+         * ssm_alphabeta_f32() is not applicable, AND (b) ssm_alphabeta_gemm() declined
+         * (OOM, or a bad head map). This path quantises every token to Q8_0 and then
+         * does one scalar dot per (token, head): n_tokens * n_v_heads * 2 calls per
+         * layer, each re-streaming a full head row. On Qwen3.6-27B-IQ6_K that was
+         * 11879 ms -- 59.5% of the whole prefill -- while the same two projections
+         * through matmul_batch cost 79 ms. If this fires for a quantised model, the
+         * FIX IS ssm_alphabeta_gemm(), not tuning here. */
+        {
+            static int slow_warn;
+            if (!slow_warn) {
+                slow_warn = 1;
+                fprintf(stderr,
+                    "WARN: SSM alpha/beta on the SCALAR per-head path "
+                    "(alpha type=%d, beta type=%d, %d tokens x %d heads = %ld scalar dots/layer).\n"
+                    "      This is ~100x slower than the matmul_batch GEMM path; it usually means\n"
+                    "      ssm_alphabeta_gemm() failed (OOM) or the weights are neither F32 nor a\n"
+                    "      type with a usable GEMM. Do not benchmark until this is understood.\n",
+                    (int)alpha_type, (int)beta_type, n_tokens, n_v_heads,
+                    2L * (long)n_tokens * (long)n_v_heads);
+            }
+        }
         /* Quantize all xb tokens to Q8_0 once for fast vec_dot */
         int nb_xb = dim / 32;
         uint8_t *xb_q8_batch = (uint8_t *)malloc((size_t)n_tokens * nb_xb * 34);
@@ -3651,7 +3952,43 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
         /* Store gate_log = softplus(alpha + dt_w) * a_w directly in alpha_batch.
          * The chunked recurrence uses gate_log to build cum_g and decay_mask.
          * Previously we did expf(gate) here and logf(expf(gate)) in the recurrence --
-         * a useless exp/log round-trip that compounds floating-point error. */
+         * a useless exp/log round-trip that compounds floating-point error.
+         * Vectorized path for n_v_heads >= 8 (AVX2/FMA 8-lane exp). */
+#ifdef PICOLM_HAVE_EXP256
+        { const __m256 one = _mm256_set1_ps(1.0f);
+          const float *aw = s->ssm_a_w[l];
+          for (bi = 0; bi < n_tokens; bi++) {
+              float *al = alpha_batch + bi * n_v_heads;
+              float *bt = beta_batch + bi * n_v_heads;
+              int h = 0;
+              /* Vectorize alpha softplus: compute exp(a) in 8-lane, then scalar logf */
+              for (; h + 7 < n_v_heads; h += 8) {
+                  __m256 a = _mm256_loadu_ps(al + h);
+                  __m256 e = picolm_exp256_ps(a);
+                  float e_arr[8];
+                  _mm256_storeu_ps(e_arr, e);
+                  float a_arr[8];
+                  _mm256_storeu_ps(a_arr, a);
+                                    for (int k = 0; k < 8; k++) {
+                      float sp = (a_arr[k] > 20.0f) ? a_arr[k] :
+                                 (a_arr[k] < -20.0f) ? e_arr[k] :
+                                 logf(1.0f + e_arr[k]);
+                      al[h+k] = sp * aw[h+k];
+                  }
+                  /* Sigmoid: 1/(1+exp(-b)) */
+                  __m256 b = _mm256_loadu_ps(bt + h);
+                  __m256 eb = picolm_exp256_ps(_mm256_sub_ps(_mm256_setzero_ps(), b));
+                  _mm256_storeu_ps(bt + h, _mm256_div_ps(one, _mm256_add_ps(one, eb)));
+              }
+              for (; h < n_v_heads; h++) {
+                  float a = al[h];
+                  float sp = (a > 20.0f) ? a : (a < -20.0f) ? expf(a) : logf(1.0f + expf(a));
+                  al[h] = sp * aw[h];
+                  bt[h] = 1.0f / (1.0f + expf(-bt[h]));
+              }
+          }
+        }
+#else
         for (bi = 0; bi < n_tokens; bi++) {
             float *al = alpha_batch + bi * n_v_heads;
             float *bt = beta_batch + bi * n_v_heads;
@@ -3662,7 +3999,9 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
                 bt[h] = 1.0f / (1.0f + expf(-bt[h]));
             }
         }
+#endif
     }
+    _SSM_STEP_TMR(6);
 
     /* 7. Chunked state recurrence (Phase 2).
      * Replaces sequential per-token recurrence with chunked DeltaNet.
@@ -3775,6 +4114,7 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
 
     free(alpha_batch);
     free(beta_batch);
+    _SSM_STEP_TMR(7);
 
     /* 8. Gated normalization (batched across tokens) */
     int gated_norm_gpu_done = 0;
@@ -3796,12 +4136,35 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
                     nrm += v * v;
                 }
                 nrm = 1.0f / sqrtf(nrm / (float)head_v_dim + eps);
+                /* Compute SiLU(z) in-place, then multiply out = out * nrm * norm_w * silu_z */
+                float *z_head = z + h * head_v_dim;
+                float *out_head = ssm_out + h * head_v_dim;
+#ifdef PICOLM_HAVE_EXP256
+                { const __m256 one = _mm256_set1_ps(1.0f);
+                  int d = 0;
+                  for (; d + 7 < head_v_dim; d += 8) {
+                      __m256 zv = _mm256_loadu_ps(z_head + d);
+                      __m256 e = picolm_exp256_ps(_mm256_sub_ps(_mm256_setzero_ps(), zv));
+                      __m256 silu_z = _mm256_div_ps(zv, _mm256_add_ps(one, e));
+                      __m256 v = _mm256_loadu_ps(out_head + d);
+                      __m256 w = _mm256_loadu_ps(norm_w + d);
+                      _mm256_storeu_ps(out_head + d,
+                          _mm256_mul_ps(_mm256_mul_ps(v, _mm256_set1_ps(nrm)),
+                                        _mm256_mul_ps(w, silu_z)));
+                  }
+                  for (; d < head_v_dim; d++) {
+                      float zv = z_head[d];
+                      out_head[d] = out_head[d] * nrm * norm_w[d] *
+                          zv * (1.0f / (1.0f + expf(-zv)));
+                  }
+                }
+#else
                 for (int d = 0; d < head_v_dim; d++) {
-                    float v = ssm_out[h * head_v_dim + d];
-                    float zv = z[h * head_v_dim + d];
-                    ssm_out[h * head_v_dim + d] = v * nrm * norm_w[d] *
+                    float zv = z_head[d];
+                    out_head[d] = out_head[d] * nrm * norm_w[d] *
                         zv * (1.0f / (1.0f + expf(-zv)));
                 }
+#endif
             }
         }
     }
@@ -3860,6 +4223,7 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
           fprintf(stderr, "[CPU l%d] xb2_maxabs=%.6f\n", l, mx);
         }
     }
+    _SSM_STEP_TMR(8);
 
     /* 9. Output projection (batched) */
     if (do_remap) {
@@ -3960,6 +4324,7 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
         if (gpu_lw) tensor_set_gpu_tensor(NULL, 0);
 #endif
     }
+    _SSM_STEP_TMR(9);
 
     /* 10. Residual add (batched) */
     for (bi = 0; bi < n_tokens; bi++) {
@@ -3971,6 +4336,7 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
         for(int i=0;i<8;i++){rb[i]=x_batch[lt*dim+i];rbr+=rb[i]*rb[i];}rbr=sqrtf(rbr/8);
         fprintf(stderr,"[CPU l%d] bx_after_resid[:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f} rms8=%.6f\n",l,rb[0],rb[1],rb[2],rb[3],rb[4],rb[5],rb[6],rb[7],rbr);
     }
+    _SSM_STEP_TMR(10);
 
     /* 11. Batched FFN (if present) */
     if (c->has_moe) {
@@ -4069,6 +4435,7 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
         int lt = n_tokens - 1;
         fprintf(stderr, "[CPU PFX l=%d] bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n", l, x_batch[lt*dim], x_batch[lt*dim+1], x_batch[lt*dim+2], x_batch[lt*dim+3]);
     }
+    _SSM_STEP_TMR(11); /* step 11 (FFN) done */
     free(ssm_buf);
     free(vd_buf);
 }

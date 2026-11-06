@@ -2435,6 +2435,44 @@ static void gemm_table_task(int idx, void *ctxp) {
     }
 }
 
+/* Dual-matrix variant of gemm_table_task: two same-shaped GEMMs against ONE
+ * activation buffer, in ONE tensor_parallel_for dispatch.
+ *
+ * Rationale (this is the FFN gate+up pair, ~50% of SSM prefill):
+ * matmul_dual_batch has two fused paths, but both are unreachable for the
+ * interleaved R4/R8 types (Q8_0_R8, Q4_0_R8, Q6_K_R4, ...) because those have
+ * has_qgemm_d == 0 and has_dual_scalar_path == 0 in type_dispatch.c. Execution
+ * therefore fell through to two independent matmul_batch() calls, which:
+ *   - quantise the same n_batch x n activations TWICE, and
+ *   - take two barrier dispatches instead of one.
+ *
+ * fn_gemm in the type table already implements those types correctly
+ * (sgemm_q8_0_r8_q8_0_best and friends), so the fix is to drive fn_gemm twice
+ * per thread from one dispatch, sharing the activation buffer and the barrier.
+ * This deliberately goes through fn_gemm rather than picolm_sgemm_d, so it
+ * covers any type with a table GEMM, not just R8.
+ *
+ * Both matrices must have identical nrows/ncols/k (true for gate+up).
+ * Contract matches gemm_table_task: fn_gemm is responsible for the per-thread
+ * row slice via (ith, nth); a 0 return is fatal here for the same reason. */
+typedef struct { int nrows, ncols, k; const void *w1, *w2, *a; float *out1, *out2;
+                 size_t bs; type_gemm_fn fn; } gemm_table_dual_ctx_t;
+
+static void gemm_table_dual_task(int idx, void *ctxp) {
+    gemm_table_dual_ctx_t *c = (gemm_table_dual_ctx_t *)ctxp;
+    int nth = pool_total_threads(1);
+    int r1 = c->fn(c->nrows, c->ncols, c->k, c->w1, c->a, c->out1, c->bs, idx, nth);
+    int r2 = c->fn(c->nrows, c->ncols, c->k, c->w2, c->a, c->out2, c->bs, idx, nth);
+    if ((r1 == 0 || r2 == 0) && idx == 0) {
+        fprintf(stderr,
+                "FATAL: fn_gemm returned 0 in the fused dual path "
+                "(no implementation for this SIMD build).\n"
+                "       nrows=%d ncols=%d k=%d r1=%d r2=%d. Check the sgemm_*.c source.\n",
+                c->nrows, c->ncols, c->k, r1, r2);
+        abort();
+    }
+}
+
 /* Convert+GEMM task for quant types that benefit from on-the-fly repacking
  * into a faster GEMM format (e.g., IQ2_K -> Q8_K_R8). Each invocation handles
  * a contiguous chunk of output rows: convert to scratch, then GEMM against
@@ -3732,6 +3770,41 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
     }
 #endif
 
+    /* Fused dual GEMM via the type table's fn_gemm.
+     *
+     * This is the path the interleaved R4/R8 types actually take (Q8_0_R8,
+     * Q4_0_R8, Q6_K_R4, IQ4_NL_R4, ...) as well as any other type that has a
+     * table GEMM but no picolm_sgemm_d support (IQ6_K, IQ5_K, ...). Those types
+     * have has_qgemm_d == 0, so the block above cannot serve them and the code
+     * used to fall through to two separate matmul_batch() calls: the same
+     * activation block quantised twice, plus two barrier dispatches.
+     *
+     * Requirements: both sides present, same shape (they are always called as a
+     * pair for FFN gate+up), same activation format, and a table GEMM.
+     * qb is quantised ONCE here and shared by both GEMMs. */
+#if (defined(__AVX2__) && defined(__F16C__)) || defined(__ARM_NEON)
+    if (W1 && W2 && out1 && out2 && ti1 && ti2 &&
+        ti1->fn_gemm && ti2->fn_gemm &&
+        ti1->act_fmt == ti2->act_fmt &&
+        n_batch >= 4 && d >= 4 && n > 0) {
+        static const char *_sgemm_env3 = NULL;
+        if (!_sgemm_env3) _sgemm_env3 = getenv("PICOLM_SGEMM");
+        int _sgemm_off3 = _sgemm_env3 && (_sgemm_env3[0] == '0' || (_sgemm_env3[0] == 'f' && _sgemm_env3[1] == 'a'));
+        if (!_sgemm_off3) {
+            quant_buf_t qbd = quant_activations(qtype1, x, n_batch, n, NULL, 0);
+            if (qbd.qbuf) {
+                int nth = pool_total_threads(1);
+                gemm_table_dual_ctx_t gd = { d, n_batch, n, W1, W2, qbd.qbuf,
+                                             out1, out2, (size_t)d, ti1->fn_gemm };
+                tensor_parallel_for(nth, gemm_table_dual_task, &gd);
+                free_quant_buf(&qbd, NULL);
+                DISPATCH2("GEMM_table_dual_fused");
+                return;
+            }
+        }
+    }
+#endif
+
     /* Fall back: per-row dispatch matching the old dual-batch's scalar_vec_dot path.
      * The old code quantized activations to Q8_0/Q8_K and dispatched across
      * output rows using tensor_parallel_for(d, dual_q8_row_task, &ctx).
@@ -3826,7 +3899,39 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
         if (dbuf2 && dbuf2 != dbuf1) free(dbuf2);
         DISPATCH2("dual_fallback_gemv");
     } else {
-        /* Fall back: dispatch each side independently via matmul_batch. */
+        /* Fall back: dispatch each side independently via matmul_batch.
+         *
+         * SLOW PATH: two whole GEMM dispatches where the fused path does one, and
+         * each matmul_batch call re-quantises the same n_batch x n activations
+         * from scratch (the fused paths above quantise once and share the result).
+         *
+         * Measured caveat, so nobody chases the wrong thing: the duplicate
+         * quantise is NOT where the time goes. For Qwen3.6-27B FFN gate+up the
+         * activation block is 253x5120 f32 = 4.9 MB (1.3 MB quantised) against
+         * 135 GFLOP of gate+up+down, so sharing it bought only ~6% (FFN 3554 ->
+         * 3357 ms). The real FFN problem is kernel throughput at this shape:
+         * ~1.7 GFLOPS/thread against a VNNI peak near 300 GOPS/thread. Fusing
+         * saves a barrier and a 1.3 MB write; it does not make the GEMM faster.
+         *
+         * This fires when neither fused path is reachable -- historically because
+         * Q8_0_R8 and the other interleaved R4/R8 types have has_qgemm_d == 0 and
+         * has_dual_scalar_path == 0. gemm_table_dual_task now covers any type with
+         * a table GEMM, so reaching here again means a genuine regression. */
+        {
+            static int dual_slow_warn;
+            if (!dual_slow_warn && n_batch >= 32) {
+                dual_slow_warn = 1;
+                fprintf(stderr,
+                    "WARN: matmul_dual_batch fell back to 2x matmul_batch "
+                    "(qtype1=%d qtype2=%d, n=%d d=%d batch=%d) -- 2 dispatch barriers "
+                    "instead of 1, and the activations are quantised twice.\n"
+                    "      The fused path is gemm_table_dual_task(); reaching here means that\n"
+                    "      path declined (no fn_gemm for this type, mismatched act_fmt, or\n"
+                    "      PICOLM_SGEMM disabled). Note the duplicate quantise is NOT a\n"
+                    "      large cost -- measure the GEMM kernel, do not assume this is it.\n",
+                    (int)qtype1, (int)qtype2, n, d, n_batch);
+            }
+        }
         matmul_batch(out1, x, n_batch, W1, n, d, qtype1);
         matmul_batch(out2, x, n_batch, W2, n, d, qtype2);
         DISPATCH2("dual_fallback_matmul_batch");

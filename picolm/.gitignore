@@ -22,6 +22,7 @@ real
 *.spv
 *.o.dos
 test_attn_diff
+test_r8_simd
 
 # unit-test binaries built by `make test-*` (keep the .c sources)
 tests/test_glm5_ops
