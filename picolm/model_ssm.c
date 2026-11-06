@@ -3833,42 +3833,83 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
         const float *restrict cw = conv1d_wt;
         const int dc = c->ssm_d_conv;
         const int nsr = n_state_rows;
+
+        /* Rolling history instead of a per-token memmove.
+         *
+         * The old inner loop shifted conv_state down one row and appended the
+         * new token for EVERY token, i.e. (nsr-1)+1 full conv_dim memcpys per
+         * token. For Qwen3.6 prefill that is 253 tokens x 48 layers x 80 KB =
+         * 1.49 GB of pure memmove, which measured ~37% of all conv1d traffic.
+         *
+         * The conv is just a %d-tap window over the last `nsr` tokens, so keep
+         * the history in a local (nsr+1)-row buffer and rotate a start index:
+         * each token writes ONE row and reads nsr+1 rows via taps[]. No shifting
+         * at all inside the loop. conv_state is written back exactly once at the
+         * end with the state the next call (or a checkpoint) expects.
+         *
+         * hist is (nsr+1) rows so that the current token's qkv can be copied in
+         * and then read by the same taps[] sweep as the history rows, keeping the
+         * innermost loop a flat vectorizable FMA over contiguous rows. */
+        float *hist = (float *)malloc((size_t)(nsr + 1) * state_stride * sizeof(float));
+        if (!hist) { fprintf(stderr, "OOM: conv1d hist\n"); exit(1); }
+        /* Seed with the historical state: conv_state holds nsr rows, oldest
+         * first, matching taps [0, nsr). */
+        for (int r = 0; r < nsr; r++)
+            memcpy(hist + (size_t)r * state_stride, conv_state + (size_t)r * state_stride,
+                   (size_t)state_stride * sizeof(float));
+        int hstart = 0;   /* index of the oldest row within hist[0..nsr] window */
+
         for (bi = 0; bi < n_tokens; bi++) {
-            const float *restrict qkv = qkv_batch + bi * conv_dim;
-            float *restrict conv_out = conv_batch + bi * conv_dim;
-            /* Causal conv over co, identical to the decode path at ~line 2066:
-             * taps [0, nsr) come from conv_state (oldest first), the final tap
-             * from this token's qkv. The states are hoisted into a small
-             * pointer array so the tap loop is a flat, vectorizable sweep over
-             * co with restrict pointers (GCC -O3 uses 8/16-wide FMA).
-             * The previous version indexed cs[d - 1 > 2 ? 2 : d - 1], i.e.
-             * cs[0], cs[0], cs[1] for nsr == 3, skipping the newest state row. */
+            const float *restrict qkv = qkv_batch + (size_t)bi * conv_dim;
+            float *restrict conv_out = conv_batch + (size_t)bi * conv_dim;
+
+            /* Append this token at the row just past the current window, then
+             * advance the window. With (nsr+1) rows and a rotate-one-row-per-token
+             * step this is a plain ring: the new row is always (hstart+nsr) mod
+             * (nsr+1), which is the slot the previous vacancy left. */
+            const int newrow = (hstart + nsr) % (nsr + 1);
+            memcpy(hist + (size_t)newrow * state_stride, qkv,
+                   (size_t)state_stride * sizeof(float));
+
+            /* taps[0..nsr] must appear oldest-first. History row r sits at
+             * (hstart + r) mod (nsr + 1) and the new token is the last tap, so
+             * build the pointer array directly rather than memmoving. */
             const float *restrict taps[8];
-            if (nsr > 8) { fprintf(stderr, "FATAL: ssm_d_conv %d > 9 unsupported\n", dc); exit(1); }
-            for (int d = 0; d < nsr; d++) taps[d] = conv_state + (size_t)d * state_stride;
-            taps[nsr] = qkv;
+            if (nsr > 7) { fprintf(stderr, "FATAL: ssm_d_conv %d > 8 unsupported\n", dc); exit(1); }
+            for (int d = 0; d < nsr; d++)
+                taps[d] = hist + (size_t)((hstart + d) % (nsr + 1)) * state_stride;
+            taps[nsr] = hist + (size_t)newrow * state_stride;
+
             for (int co = 0; co < conv_dim; co++) {
                 float sum = cw[co] * taps[0][co];
                 for (int d = 1; d <= nsr; d++)
                     sum += cw[(size_t)d * conv_dim + co] * taps[d][co];
                 conv_out[co] = sum;
             }
+
+            /* Advance the window: the oldest row drops out. */
+            hstart = (hstart + 1) % (nsr + 1);
             /* SiLU over this token's conv_out row: vectorized.
-             * MUST stay inside the per-token loop: conv_state is stateful, so
-             * every token needs its own conv + SiLU + state shift. When this
-             * sat after the loop it ran once on the past-the-end row for
-             * bi == n_tokens, leaving all other tokens un-activated. */
+             * Must stay inside the per-token loop -- every token needs its own
+             * conv + SiLU. When this sat after the loop it ran once on the
+             * past-the-end row for bi == n_tokens, leaving all other tokens
+             * un-activated. */
 #ifdef PICOLM_HAVE_EXP256
             ssm_silu_vec(conv_out, conv_dim);
 #else
             for (int co = 0; co < conv_dim; co++)
                 conv_out[co] = conv_out[co] / (1.0f + expf(-conv_out[co]));
 #endif
-            /* Shift conv_state and append new token */
-            for (int r = 0; r < n_state_rows - 1; r++)
-                memcpy(conv_state + r * state_stride, conv_state + (r + 1) * state_stride, state_stride * sizeof(float));
-            memcpy(conv_state + (n_state_rows - 1) * state_stride, qkv, state_stride * sizeof(float));
         }
+
+        /* Write the final window back into conv_state once, in the layout the
+         * decode path and the checkpoint code expect: nsr rows, oldest first.
+         * After the loop hstart points at the oldest of the last nsr tokens. */
+        for (int r = 0; r < nsr; r++)
+            memcpy(conv_state + (size_t)r * state_stride,
+                   hist + (size_t)((hstart + r) % (nsr + 1)) * state_stride,
+                   (size_t)state_stride * sizeof(float));
+        free(hist);
         free(conv1d_wt);
     }
     _SSM_STEP_TMR(4);
