@@ -2162,7 +2162,6 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
                 acc_row[d] *= corr;
 #endif
         }
-        float *acc_row = t->acc + i * hd;
 
         /* Compute 2^(s[j] - new_M) for this row and accumulate. Scores are in
          * the log2 domain (see ATTN_LOG2E). With the lazy rescale above the
@@ -2281,163 +2280,89 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
 #endif
         t->S[i] += rsum;
 
-        /* acc_row += sum_j tile_exp[j] * V[j, d]
-         * Register-blocked: hoist accumulator into zmm registers across the
-         * full j loop to eliminate redundant load/store of acc_row per j.
-         * For AVX-512: hd=128 floats = 8 zmm accumulators, all kept in regs.
-         * For each d-block: 1 load + ts FMAs + 1 store (vs ts loads + ts stores). */
-        float *v_tile = t->tile_v_f32;
+        /* Keep every row's exponentiated scores live at once, in place in
+         * t->scores (srow is not read again after this point), so that the
+         * PV accumulation below can be done as a row-blocked pass over all
+         * rows instead of one query row at a time. */
+        memcpy(srow, tile_exp_buf, (size_t)ts * sizeof(float));
+    }
+
+    /* ---- acc += exp(scores) @ V_tile, row-blocked over query rows --------
+     *
+     * The old form put the query-row loop OUTSIDE this multiply, so for each
+     * of n_q rows it re-streamed the whole V tile: n_q * ts * hd * 4 bytes per
+     * KV tile, i.e. 64 redundant reads of the same 32 KB at ts=hd=...  The
+     * broadcast weight also fed one row's accumulators only, so a single
+     * scalar _mm512_set1_ps served 8 FMAs.
+     *
+     * Here the row block is the inner unit and the head-dim block is the outer
+     * unit: one 16-float head slice of V is loaded once and reused across R
+     * rows, with R independent accumulator chains. R is chosen so that
+     * R * (hd/16) accumulators fit in the 32 zmm registers with room to spare.
+     * That cuts V-tile traffic by R and gives R independent FMAs per broadcast.
+     *
+     * hd=256 is covered by the same code: the head-dim loop walks D_BLK=16
+     * chunks, so the working set stays 16 floats per row regardless of hd.
+     *
+     * Numerical note: this reorders the accumulation of the PV product (row
+     * block outer, head-dim block middle, j inner) but keeps the j (KV
+     * position) order strictly ascending within each accumulator, exactly as
+     * before. Each output element is still a single ascending-j FMA chain, so
+     * the result is bit-identical to the per-row kernel. */
+    {
+        const float *v_tile = t->tile_v_f32;
 #if defined(PICOLM_AVX512)
         {
-            /* Register-blocked: keep ALL hd/D_BLK accumulators in zmm regs
-             * across the full j loop. This gives hd/16 independent FMA
-             * chains (8 for hd=128), eliminating the 4-cycle loop-carried
-             * FMA latency bottleneck. The CPU pipelines 8 FMAs per j
-             * iteration at 2/cycle throughput instead of waiting 4 cycles
-             * per sequential FMA. */
-            /* Fully unrolled: 8 named accumulators stay in zmm registers
-             * (no stack spills). hd=128 -> 8 blocks of 16 floats. */
-            const float *vr = v_tile;
-            if (hd == 128) {
-                __m512 a0 = _mm512_loadu_ps(acc_row + 0);
-                __m512 a1 = _mm512_loadu_ps(acc_row + 16);
-                __m512 a2 = _mm512_loadu_ps(acc_row + 32);
-                __m512 a3 = _mm512_loadu_ps(acc_row + 48);
-                __m512 a4 = _mm512_loadu_ps(acc_row + 64);
-                __m512 a5 = _mm512_loadu_ps(acc_row + 80);
-                __m512 a6 = _mm512_loadu_ps(acc_row + 96);
-                __m512 a7 = _mm512_loadu_ps(acc_row + 112);
-                for (int j = 0; j < ts; j++) {
-                    __m512 wv = _mm512_set1_ps(tile_exp_buf[j]);
-                    const float *vj = v_tile + (size_t)j * hd;
-                    a0 = _mm512_fmadd_ps(_mm512_loadu_ps(vj + 0), wv, a0);
-                    a1 = _mm512_fmadd_ps(_mm512_loadu_ps(vj + 16), wv, a1);
-                    a2 = _mm512_fmadd_ps(_mm512_loadu_ps(vj + 32), wv, a2);
-                    a3 = _mm512_fmadd_ps(_mm512_loadu_ps(vj + 48), wv, a3);
-                    a4 = _mm512_fmadd_ps(_mm512_loadu_ps(vj + 64), wv, a4);
-                    a5 = _mm512_fmadd_ps(_mm512_loadu_ps(vj + 80), wv, a5);
-                    a6 = _mm512_fmadd_ps(_mm512_loadu_ps(vj + 96), wv, a6);
-                    a7 = _mm512_fmadd_ps(_mm512_loadu_ps(vj + 112), wv, a7);
-                }
-                _mm512_storeu_ps(acc_row + 0, a0);
-                _mm512_storeu_ps(acc_row + 16, a1);
-                _mm512_storeu_ps(acc_row + 32, a2);
-                _mm512_storeu_ps(acc_row + 48, a3);
-                _mm512_storeu_ps(acc_row + 64, a4);
-                _mm512_storeu_ps(acc_row + 80, a5);
-                _mm512_storeu_ps(acc_row + 96, a6);
-                _mm512_storeu_ps(acc_row + 112, a7);
-            } else {
-                /* Generic path for hd != 128 (e.g. hd=8, 48, 64, 96, 256).
-                 *
-                 * n_full = number of COMPLETE 16-float blocks. It must be
-                 * hd/16, not ceil(hd/16): the old ceil() rounded hd=8 up to
-                 * one block, so this loop loaded and stored 16 floats at
-                 * acc_row[0..15] -- 8 floats past the end of the row. With
-                 * head_dim=8 that overrun is not a stack scratch detail: in
-                 * batch_tiled_task the rows of `acc` (and of `q_rows`, which
-                 * follows it) are packed 8 floats apart, so each row's
-                 * "block" clobbered the NEXT query row's accumulator, and
-                 * the last row of the task walked off the end of the pool
-                 * slot into the adjacent task's scratch. Symptom: every
-                 * AVX-512 build (default `make`) with head_dim < 16 -- or
-                 * any head_dim not a multiple of 16 -- produced wrong
-                 * prefill attention, and the final v_tile scalar tail then
-                 * re-added the (already clobbered) dims, so the damage was
-                 * silent: no crash, no NaN, just a different string.
-                 * AVX2/NEON/scalar never take this branch, which is why
-                 * `make scalar` and CI's avx2 job disagreed with the
-                 * default AVX-512 build only on the tiled (long) prefill. */
-                const int D_BLK = 16;
-                const int n_full = hd / D_BLK;      /* complete blocks only */
-                if (n_full > 0) {
-                    /* Cap at 16 blocks = 256 floats; larger head_dims fall
-                     * through to the scalar tail below for the remainder. */
-                    const int n_blks = n_full > 16 ? 16 : n_full;
-                    __m512 accv[16];
-                    for (int db = 0; db < n_blks; db++)
-                        accv[db] = _mm512_loadu_ps(acc_row + db * D_BLK);
+            const int D_BLK = 16;                 /* floats per zmm */
+            const int n_blk = hd / D_BLK;         /* complete 16-float slices */
+            const int R_MAX = 16;                 /* rows per block */
+            for (int db = 0; db < n_blk; db++) {
+                const int off = db * D_BLK;
+                for (int r0 = 0; r0 < n_q; r0 += R_MAX) {
+                    int rn = n_q - r0;
+                    if (rn > R_MAX) rn = R_MAX;
+                    __m512 acc[R_MAX];
+                    for (int r = 0; r < rn; r++)
+                        acc[r] = _mm512_loadu_ps(t->acc + (size_t)(r0 + r) * hd + off);
                     for (int j = 0; j < ts; j++) {
-                        __m512 wv = _mm512_set1_ps(tile_exp_buf[j]);
-                        const float *vj = v_tile + (size_t)j * hd;
-                        for (int db = 0; db < n_blks; db++)
-                            accv[db] = _mm512_fmadd_ps(_mm512_loadu_ps(vj + db * D_BLK), wv, accv[db]);
+                        __m512 vv = _mm512_loadu_ps(v_tile + (size_t)j * hd + off);
+                        for (int r = 0; r < rn; r++) {
+                            float w = t->scores[(size_t)(r0 + r) * ts + j];
+                            acc[r] = _mm512_fmadd_ps(vv, _mm512_set1_ps(w), acc[r]);
+                        }
                     }
-                    for (int db = 0; db < n_blks; db++)
-                        _mm512_storeu_ps(acc_row + db * D_BLK, accv[db]);
+                    for (int r = 0; r < rn; r++)
+                        _mm512_storeu_ps(t->acc + (size_t)(r0 + r) * hd + off, acc[r]);
                 }
             }
-            /* Scalar tail for hd % 16 != 0 (and for the part of hd beyond
-             * 256 floats). Must start at the last COMPLETE block boundary,
-             * i.e. min(hd/16,16)*16. */
-            {
-                int d = (hd / 16) * 16;
-                if (d > 256) d = 256;
-                for (; d < hd; d++) {
-                    float a = acc_row[d];
+            /* Scalar tail for hd % 16 != 0. */
+            for (int d = n_blk * D_BLK; d < hd; d++) {
+                for (int r = 0; r < n_q; r++) {
+                    const float *srow = t->scores + (size_t)r * ts;
+                    float a = t->acc[(size_t)r * hd + d];
                     for (int j = 0; j < ts; j++)
-                        a += tile_exp_buf[j] * v_tile[(size_t)j * hd + d];
-                    acc_row[d] = a;
+                        a += srow[j] * v_tile[(size_t)j * hd + d];
+                    t->acc[(size_t)r * hd + d] = a;
                 }
-            }
-        }
-#elif defined(PICOLM_AVX)
-        {
-            const int D_BLK = 8; /* floats per ymm */
-            int n_blks = hd / D_BLK;
-            for (int db = 0; db < n_blks; db++) {
-                int d = db * D_BLK;
-                __m256 acc0 = _mm256_loadu_ps(acc_row + d);
-                const float *vr = v_tile + d;
-                for (int j = 0; j < ts; j++) {
-                    __m256 wv = _mm256_set1_ps(tile_exp_buf[j]);
-                    __m256 vv = _mm256_loadu_ps(vr + (size_t)j * hd);
-                    #if defined(__FMA__)
-                    acc0 = _mm256_fmadd_ps(vv, wv, acc0);
-#else
-                    acc0 = _mm256_add_ps(_mm256_mul_ps(vv, wv), acc0);
-#endif
-                }
-                _mm256_storeu_ps(acc_row + d, acc0);
-            }
-            for (int d = n_blks * D_BLK; d < hd; d++) {
-                float a = acc_row[d];
-                for (int j = 0; j < ts; j++)
-                    a += tile_exp_buf[j] * v_tile[(size_t)j * hd + d];
-                acc_row[d] = a;
-            }
-        }
-#elif defined(PICOLM_NEON_AARCH64)
-        {
-            const int D_BLK = 4;
-            int n_blks = hd / D_BLK;
-            for (int db = 0; db < n_blks; db++) {
-                int d = db * D_BLK;
-                float32x4_t acc0 = vld1q_f32(acc_row + d);
-                const float *vr = v_tile + d;
-                for (int j = 0; j < ts; j++) {
-                    float32x4_t wv = vdupq_n_f32(tile_exp_buf[j]);
-                    float32x4_t vv = vld1q_f32(vr + (size_t)j * hd);
-                    acc0 = vfmaq_f32(acc0, vv, wv);
-                }
-                vst1q_f32(acc_row + d, acc0);
-            }
-            for (int d = n_blks * D_BLK; d < hd; d++) {
-                float a = acc_row[d];
-                for (int j = 0; j < ts; j++)
-                    a += tile_exp_buf[j] * v_tile[(size_t)j * hd + d];
-                acc_row[d] = a;
             }
         }
 #else
-        for (int d = 0; d < hd; d++) {
-            float a = acc_row[d];
-            for (int j = 0; j < ts; j++)
-                a += tile_exp_buf[j] * v_tile[(size_t)j * hd + d];
-            acc_row[d] = a;
+        /* The row-blocked AVX-512 form above needs 512-bit registers to be
+         * worth it; on other targets keep the simple per-row loop. V is still
+         * read once per row here, which is what those builds did before. */
+        for (int r = 0; r < n_q; r++) {
+            const float *srow = t->scores + (size_t)r * ts;
+            float *acc_row = t->acc + (size_t)r * hd;
+            for (int d = 0; d < hd; d++) {
+                float a = acc_row[d];
+                for (int j = 0; j < ts; j++)
+                    a += srow[j] * v_tile[(size_t)j * hd + d];
+                acc_row[d] = a;
+            }
         }
 #endif
     }
+
 }
 
 static void batch_attention_tiled(
