@@ -76,14 +76,15 @@ extern void *g_bench_user_data;
  * optional profiling below, so it does not justify a cross-TU dependency:
  * define a local copy instead. Keep it `static` and differently named from
  * get_time_ms() so the test files that do define their own get_time_ms() do
- * not collide with this one. */
+ * not collide with this one.
+ *
+ * Deliberately does NOT use QueryPerformanceCounter on _WIN32: unlike picolm.c,
+ * this translation unit does not include <windows.h>, so LARGE_INTEGER and
+ * friends are undeclared and the MinGW build fails with "unknown type name
+ * 'LARGE_INTEGER'". clock() is monotonic, needs only <time.h>, and is accurate
+ * enough for the optional per-step profiling this feeds. */
 static double ssm_now_ms(void) {
-#if defined(_WIN32)
-    LARGE_INTEGER freq, count;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&count);
-    return (double)count.QuadPart / (double)freq.QuadPart * 1000.0;
-#elif defined(CLOCK_MONOTONIC)
+#if defined(CLOCK_MONOTONIC) && !defined(_WIN32)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
@@ -3779,6 +3780,70 @@ static void ssm_gatednorm_task(int task, void *ctxp) {
 #endif
 }
 
+/* ---- Parallel SSM split/l2norm tasks (step 5) ----
+ *
+ * Two independent parallel passes over the token axis:
+ *   1. V reorder (only when do_remap): a per-token permutation of the v-head
+ *      blocks inside each row. Each token's remap reads the row into a private
+ *      temp and writes back, so tokens do not interact.
+ *   2. L2 norm of Q (scaled by 1/sqrt(d_state)) and K, per k-head.
+ *
+ * Both used to be serial token loops (120.9 ms over 48 layers). The math, and in
+ * particular the SUMMATION ORDER of the norms, is unchanged -- a previous
+ * attempt at this session's kernels showed that vectorising such a reduction
+ * perturbs the top-1 logit, so the reductions stay scalar here deliberately.
+ * Only the loop nesting moves.
+ */
+typedef struct {
+    float *conv_batch;
+    int conv_dim;
+    int qk_dim;
+    int n_v_heads;
+    int n_k_heads;
+    int head_v_dim;
+    int d_state;
+    int n_vpk, n_k;
+    float q_scale;
+} ssm_split_ctx_t;
+
+static void ssm_vremap_task(int bi, void *ctxp) {
+    const ssm_split_ctx_t *c = (const ssm_split_ctx_t *)ctxp;
+    float *conv = c->conv_batch + (size_t)bi * c->conv_dim;
+    /* Private temp so concurrently-running tokens cannot clobber each other's
+     * source data. value_dim is small (6144 floats here). */
+    float *vt = (float *)alloca((size_t)c->n_v_heads * (size_t)c->head_v_dim * sizeof(float));
+    memcpy(vt, conv + 2 * c->qk_dim, (size_t)c->n_v_heads * c->head_v_dim * sizeof(float));
+    for (int h = 0; h < c->n_v_heads; h++) {
+        int gh = qwen35_vhead_gguf(h, c->n_vpk, c->n_k);
+        memcpy(conv + 2 * c->qk_dim + (size_t)h * c->head_v_dim,
+               vt + (size_t)gh * c->head_v_dim,
+               (size_t)c->head_v_dim * sizeof(float));
+    }
+}
+
+static void ssm_l2norm_task(int bi, void *ctxp) {
+    const ssm_split_ctx_t *c = (const ssm_split_ctx_t *)ctxp;
+    float *conv = c->conv_batch + (size_t)bi * c->conv_dim;
+    float *q = conv;
+    float *k = conv + c->qk_dim;
+    const int ds = c->d_state;
+
+    for (int h = 0; h < c->n_k_heads; h++) {
+        float *qh = q + (size_t)h * ds;
+        float nrm = 0.0f;
+        for (int d = 0; d < ds; d++) nrm += qh[d] * qh[d];
+        nrm = 1.0f / sqrtf(nrm + 1e-12f) * c->q_scale;
+        for (int d = 0; d < ds; d++) qh[d] *= nrm;
+    }
+    for (int h = 0; h < c->n_k_heads; h++) {
+        float *kh = k + (size_t)h * ds;
+        float nrm = 0.0f;
+        for (int d = 0; d < ds; d++) nrm += kh[d] * kh[d];
+        nrm = 1.0f / sqrtf(nrm + 1e-12f);
+        for (int d = 0; d < ds; d++) kh[d] *= nrm;
+    }
+}
+
 void ssm_prefill_layer(model_t *m, run_state_t *s,
                               float *x_batch, float *xb_batch, float *xb2_batch,
                               float *hb_batch, float *hb2_batch,
@@ -4051,51 +4116,34 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
     _SSM_STEP_TMR(4);
 
     /* 5. Split Q/K/V + L2 norm + Q scale (batched across tokens) */
+    ssm_split_ctx_t sc;
+    sc.conv_batch = conv_batch;
+    sc.conv_dim = conv_dim;
+    sc.qk_dim = qk_dim;
+    sc.n_v_heads = n_v_heads;
+    sc.n_k_heads = n_k_heads;
+    sc.head_v_dim = head_v_dim;
+    sc.d_state = d_state;
+    sc.n_vpk = n_vpk;
+    sc.n_k = n_k;
+    sc.q_scale = 1.0f / sqrtf((float)d_state);
     if (do_remap) {
-        /* Single temp buffer for V reordering (reused each iteration). */
-        float *vt = malloc(value_dim * sizeof(float));
-        if (!vt) { fprintf(stderr, "OOM: vt remap buffer\n"); exit(1); }
-        for (bi = 0; bi < n_tokens; bi++) {
-            float *conv = conv_batch + bi * conv_dim;
-            memcpy(vt, conv + 2*qk_dim, value_dim * sizeof(float));
-            for (int h = 0; h < n_v_heads; h++) {
-                int gh = qwen35_vhead_gguf(h, n_vpk, n_k);
-                memcpy(conv + 2*qk_dim + h * head_v_dim, vt + gh * head_v_dim, head_v_dim * sizeof(float));
-            }
-        }
-        free(vt);
+        /* Per-token V permutation, parallel over tokens; each task uses its own
+         * alloca temp so concurrent tokens cannot clobber a shared buffer. */
+        tensor_parallel_for(n_tokens, ssm_vremap_task, &sc);
     }
-    float q_scale = 1.0f / sqrtf((float)d_state);
     int l2norm_gpu_done = 0;
 #ifdef PICOLM_GPU
     if (gpu_lw) {
         l2norm_gpu_done =
             picolm_gpu_ssm_l2norm_batch(conv_batch, d_state, n_k_heads, n_tokens,
-                                         conv_dim, 1e-12f, q_scale, m->gpu.device) &&
+                                         conv_dim, 1e-12f, sc.q_scale, m->gpu.device) &&
             picolm_gpu_ssm_l2norm_batch(conv_batch + qk_dim, d_state, n_k_heads, n_tokens,
                                          conv_dim, 1e-12f, 1.0f, m->gpu.device);
     }
 #endif
     if (!l2norm_gpu_done) {
-        for (bi = 0; bi < n_tokens; bi++) {
-            float *conv = conv_batch + bi * conv_dim;
-            float *q = conv;
-            float *k = conv + qk_dim;
-            for (int h = 0; h < n_k_heads; h++) {
-                float *qh = q + h * d_state;
-                float nrm = 0.0f;
-                for (int d = 0; d < d_state; d++) nrm += qh[d] * qh[d];
-                nrm = 1.0f / sqrtf(nrm + 1e-12f) * q_scale;
-                for (int d = 0; d < d_state; d++) qh[d] *= nrm;
-            }
-            for (int h = 0; h < n_k_heads; h++) {
-                float *kh = k + h * d_state;
-                float nrm = 0.0f;
-                for (int d = 0; d < d_state; d++) nrm += kh[d] * kh[d];
-                nrm = 1.0f / sqrtf(nrm + 1e-12f);
-                for (int d = 0; d < d_state; d++) kh[d] *= nrm;
-            }
-        }
+        tensor_parallel_for(n_tokens, ssm_l2norm_task, &sc);
     }
     _SSM_STEP_TMR(5);
 
