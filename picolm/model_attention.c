@@ -2316,25 +2316,57 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
             const int D_BLK = 16;                 /* floats per zmm */
             const int n_blk = hd / D_BLK;         /* complete 16-float slices */
             const int R_MAX = 16;                 /* rows per block */
+#define ATTN_PV_BLOCK(ACC, RN, SBASE, OFF)                                    \
+            do {                                                                 \
+                /* One db slice, RN rows. V[j] is loaded once per j and reused    \
+                 * across all RN rows; the score for row r at position j is        \
+                 * scores[r*ts + j]. SBASE is &scores[r0*ts + j] hoisted by the    \
+                 * caller so the row index is a constant offset (r*ts) from it.    \
+                 * Accumulation stays strictly ascending in j. */                  \
+                const float *__v = v_tile + (size_t)OFF;                          \
+                for (int j = 0; j < ts; j++) {                                   \
+                    __m512 vv = _mm512_loadu_ps(__v + (size_t)j * hd);           \
+                    for (int r = 0; r < (RN); r++)                               \
+                        ACC[r] = _mm512_fmadd_ps(                                 \
+                            vv, _mm512_set1_ps(SBASE[(size_t)r * ts + j]), ACC[r]); \
+                }                                                                 \
+            } while (0)
+
             for (int db = 0; db < n_blk; db++) {
                 const int off = db * D_BLK;
-                for (int r0 = 0; r0 < n_q; r0 += R_MAX) {
+                int r0 = 0;
+                /* Full blocks: RN is the compile-time R_MAX, so GCC emits a
+                 * flat, fully unrolled body with no per-row bound test. The
+                 * runtime `rn` form it replaced spent more cycles on the loop
+                 * bound comparison (cmp $0xN) than on the FMAs themselves
+                 * (perf: 11.3% of the function on one cmp). */
+                for (; r0 + R_MAX <= n_q; r0 += R_MAX) {
+                    __m512 acc[R_MAX];
+                    for (int r = 0; r < R_MAX; r++)
+                        acc[r] = _mm512_loadu_ps(t->acc + (size_t)(r0 + r) * hd + off);
+                    const float *sbase = t->scores + (size_t)r0 * ts;
+                    ATTN_PV_BLOCK(acc, R_MAX, sbase, off);
+                    for (int r = 0; r < R_MAX; r++)
+                        _mm512_storeu_ps(t->acc + (size_t)(r0 + r) * hd + off, acc[r]);
+                }
+                /* Runtime tail (fewer than R_MAX rows left). */
+                if (r0 < n_q) {
                     int rn = n_q - r0;
-                    if (rn > R_MAX) rn = R_MAX;
                     __m512 acc[R_MAX];
                     for (int r = 0; r < rn; r++)
                         acc[r] = _mm512_loadu_ps(t->acc + (size_t)(r0 + r) * hd + off);
+                    const float *sbase = t->scores + (size_t)r0 * ts;
                     for (int j = 0; j < ts; j++) {
                         __m512 vv = _mm512_loadu_ps(v_tile + (size_t)j * hd + off);
-                        for (int r = 0; r < rn; r++) {
-                            float w = t->scores[(size_t)(r0 + r) * ts + j];
-                            acc[r] = _mm512_fmadd_ps(vv, _mm512_set1_ps(w), acc[r]);
-                        }
+                        for (int r = 0; r < rn; r++)
+                            acc[r] = _mm512_fmadd_ps(
+                                vv, _mm512_set1_ps(sbase[(size_t)r * ts + j]), acc[r]);
                     }
                     for (int r = 0; r < rn; r++)
                         _mm512_storeu_ps(t->acc + (size_t)(r0 + r) * hd + off, acc[r]);
                 }
             }
+#undef ATTN_PV_BLOCK
             /* Scalar tail for hd % 16 != 0. */
             for (int d = n_blk * D_BLK; d < hd; d++) {
                 for (int r = 0; r < n_q; r++) {
