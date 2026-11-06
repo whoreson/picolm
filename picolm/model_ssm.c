@@ -3702,6 +3702,83 @@ static void ssm_conv_block_task(int task, void *ctxp) {
     }
 }
 
+/* ---- Parallel SSM gated-norm task ----
+ *
+ * Used by ssm_prefill_layer step 8. Gated RMS norm over the value dimension:
+ *
+ *   nrm      = 1 / sqrt(mean(out[h]^2) + eps)         per v-head
+ *   out[h][d] = out[h][d] * nrm * norm_w[d] * silu(z[h][d])
+ *
+ * Every (token, v-head) pair is completely independent -- nrm is reduced over
+ * one head's head_v_dim elements and touches nothing else -- so this maps to
+ * one task per (token, head): n_tokens * n_v_heads tasks, 12144 for a
+ * 253-token Qwen3.6 prompt. That is coarse enough for the pool to balance and
+ * fine enough that the tail is short.
+ *
+ * The previous code was the same math in a serial token/head loop, measured at
+ * 1.0 GOPS and 5.2 GB/s (1194 MB of traffic in 228 ms) with 23 cores idle. */
+typedef struct {
+    float *xb2;          /* [n_tokens][value_dim] in/out */
+    const float *z;      /* [n_tokens][value_dim] gate */
+    const float *norm_w; /* [head_v_dim] */
+    int value_dim;
+    int n_v_heads;
+    int head_v_dim;
+    float eps;
+} gatednorm_ctx_t;
+
+static void ssm_gatednorm_task(int task, void *ctxp) {
+    const gatednorm_ctx_t *c = (const gatednorm_ctx_t *)ctxp;
+    const int h = task % c->n_v_heads;
+    const int t = task / c->n_v_heads;
+    const int hd = c->head_v_dim;
+
+    float *restrict out_head = c->xb2 + (size_t)t * c->value_dim + (size_t)h * hd;
+    const float *restrict z_head = c->z + (size_t)t * c->value_dim + (size_t)h * hd;
+    const float *restrict nw = c->norm_w;
+
+    /* Reduce this head's sum of squares.
+     * Kept SCALAR on purpose. Vectorising it (fmadd into 8 lanes, then a
+     * horizontal add) changes the summation order and shifted the top-1 logit
+     * from 20.2670 to 20.2964 -- the same class of drift seen when folding
+     * SiLU into the conv loop. The whole point of this change is to go faster
+     * without altering results, and the reduction is only head_v_dim (128)
+     * elements against head_v_dim more for the update below, so the scalar form
+     * is not where the time went. */
+    float nrm = 0.0f;
+    for (int d = 0; d < hd; d++) nrm += out_head[d] * out_head[d];
+    nrm = 1.0f / sqrtf(nrm / (float)hd + c->eps);
+
+    /* out = out * nrm * norm_w * silu(z), fused.
+     * Same operations in the same order as the previous loop body, so the
+     * result stays bit-identical. */
+#ifdef PICOLM_HAVE_EXP256
+    { const __m256 one = _mm256_set1_ps(1.0f);
+      const __m256 nrmv = _mm256_set1_ps(nrm);
+      int d = 0;
+      for (; d + 7 < hd; d += 8) {
+          __m256 zv = _mm256_loadu_ps(z_head + d);
+          __m256 e = picolm_exp256_ps(_mm256_sub_ps(_mm256_setzero_ps(), zv));
+          __m256 silu_z = _mm256_div_ps(zv, _mm256_add_ps(one, e));
+          __m256 v = _mm256_loadu_ps(out_head + d);
+          __m256 w = _mm256_loadu_ps(nw + d);
+          _mm256_storeu_ps(out_head + d,
+              _mm256_mul_ps(_mm256_mul_ps(v, nrmv),
+                            _mm256_mul_ps(w, silu_z)));
+      }
+      for (; d < hd; d++) {
+          float zv = z_head[d];
+          out_head[d] = out_head[d] * nrm * nw[d] * zv * (1.0f / (1.0f + expf(-zv)));
+      }
+    }
+#else
+    for (int d = 0; d < hd; d++) {
+        float zv = z_head[d];
+        out_head[d] = out_head[d] * nrm * nw[d] * zv * (1.0f / (1.0f + expf(-zv)));
+    }
+#endif
+}
+
 void ssm_prefill_layer(model_t *m, run_state_t *s,
                               float *x_batch, float *xb_batch, float *xb2_batch,
                               float *hb_batch, float *hb2_batch,
@@ -4368,48 +4445,15 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
     }
 #endif
     if (!gated_norm_gpu_done) {
-        for (bi = 0; bi < n_tokens; bi++) {
-            float *ssm_out = xb2_vd + bi * value_dim;
-            float *z = z_batch + bi * value_dim;
-            float *norm_w = s->ssm_norm_w[l];
-            for (int h = 0; h < n_v_heads; h++) {
-                float nrm = 0.0f;
-                for (int d = 0; d < head_v_dim; d++) {
-                    float v = ssm_out[h * head_v_dim + d];
-                    nrm += v * v;
-                }
-                nrm = 1.0f / sqrtf(nrm / (float)head_v_dim + eps);
-                /* Compute SiLU(z) in-place, then multiply out = out * nrm * norm_w * silu_z */
-                float *z_head = z + h * head_v_dim;
-                float *out_head = ssm_out + h * head_v_dim;
-#ifdef PICOLM_HAVE_EXP256
-                { const __m256 one = _mm256_set1_ps(1.0f);
-                  int d = 0;
-                  for (; d + 7 < head_v_dim; d += 8) {
-                      __m256 zv = _mm256_loadu_ps(z_head + d);
-                      __m256 e = picolm_exp256_ps(_mm256_sub_ps(_mm256_setzero_ps(), zv));
-                      __m256 silu_z = _mm256_div_ps(zv, _mm256_add_ps(one, e));
-                      __m256 v = _mm256_loadu_ps(out_head + d);
-                      __m256 w = _mm256_loadu_ps(norm_w + d);
-                      _mm256_storeu_ps(out_head + d,
-                          _mm256_mul_ps(_mm256_mul_ps(v, _mm256_set1_ps(nrm)),
-                                        _mm256_mul_ps(w, silu_z)));
-                  }
-                  for (; d < head_v_dim; d++) {
-                      float zv = z_head[d];
-                      out_head[d] = out_head[d] * nrm * norm_w[d] *
-                          zv * (1.0f / (1.0f + expf(-zv)));
-                  }
-                }
-#else
-                for (int d = 0; d < head_v_dim; d++) {
-                    float zv = z_head[d];
-                    out_head[d] = out_head[d] * nrm * norm_w[d] *
-                        zv * (1.0f / (1.0f + expf(-zv)));
-                }
-#endif
-            }
-        }
+        gatednorm_ctx_t gnc;
+        gnc.xb2 = xb2_vd;
+        gnc.z = z_batch;
+        gnc.norm_w = s->ssm_norm_w[l];
+        gnc.value_dim = value_dim;
+        gnc.n_v_heads = n_v_heads;
+        gnc.head_v_dim = head_v_dim;
+        gnc.eps = eps;
+        tensor_parallel_for(n_tokens * n_v_heads, ssm_gatednorm_task, &gnc);
     }
     if (l == 0 && _SSM_DBG) {
         float gn_rms=0; float gn_v[4];
