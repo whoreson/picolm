@@ -142,6 +142,36 @@ static void gemv_iq4_nl_r4(const void *w, const void *a, int n, float *out, int 
     vec_dot_iq4_nl_r4_q8_0_batch4(w, a, n, out);
 }
 
+/* Q2_K_R4: 4 rows per block; fill out[0..3] with the four rows' dots. */
+static void gemv_q2_k_r4(const void *w, const void *a, int n, float *out, int nrows) {
+    (void)nrows;
+    const block_q8_K *y = (const block_q8_K *)a;
+    const int nb = n / QK_K;
+    /* n is the full row length, which can be far larger than any fixed stack
+     * buffer (n_ffn is 14336 in these models), so size the scratch exactly. */
+    float stackbuf[1024];
+    float *tmp = (n <= 1024) ? stackbuf : (float *)malloc((size_t)n * sizeof(float));
+    if (!tmp) { for (int r = 0; r < 4; r++) out[r] = 0.0f; return; }
+    for (int r = 0; r < 4; r++) {
+        dequantize_row_q2_k_r4_single((const block_q2_k_r4 *)w, tmp, n, r);
+        float acc = 0.0f;
+        for (int ib = 0; ib < nb; ib++) {
+            float b = 0.0f;
+            for (int i = 0; i < QK_K; i++)
+                b += tmp[ib * QK_K + i] * (float)y[ib].qs[i];
+            acc += b * y[ib].d;   /* activation delta is per Q8_K block */
+        }
+        out[r] = acc;
+    }
+    if (tmp != stackbuf) free(tmp);
+}
+
+/* IQ3_XXS: single row per block. */
+static void gemv_iq3_xxs(const void *w, const void *a, int n, float *out, int nrows) {
+    (void)nrows;
+    *out = vec_dot_iq3_xxs_q8_k(w, a, n);
+}
+
 static void gemv_q4_k_r4(const void *w, const void *a, int n, float *out, int nrows) {
     (void)nrows;
     vec_dot_q4_k_r4_q8_k_batch4(w, a, n, out);
@@ -305,6 +335,8 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
         .fn_gemv = gemv_q6_K,
 #if defined(__AVX2__)
         .fn_gemm = sgemm_q6_k_q8_k_best,   /* decode-once R8 GEMM (VNNI/AVX2) for big shapes, per-column dot otherwise */
+#elif defined(__ARM_NEON)
+        .fn_gemm = sgemm_q6_k_q8_k_neon,   /* 4x4 NEON/DOTPROD/I8MM batched GEMM (sgemm_k_q8k_neon.c) */
 #else
         .fn_gemm = NULL,
 #endif
@@ -321,6 +353,8 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
         .fn_gemv = gemv_q3_K,
 #if defined(__AVX2__)
         .fn_gemm = sgemm_q3_k_q8_k_best,   /* decode-once R8 GEMM (VNNI/AVX2) for big shapes, per-column dot otherwise */
+#elif defined(__ARM_NEON)
+        .fn_gemm = sgemm_q3_k_q8_k_neon,   /* 4x4 NEON/DOTPROD/I8MM batched GEMM (sgemm_k_q8k_neon.c) */
 #else
         .fn_gemm = NULL,
 #endif
@@ -337,6 +371,8 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
         .fn_gemv = gemv_q2_K,
 #if defined(__AVX2__)
         .fn_gemm = sgemm_q2_k_q8_k_best,   /* decode-once R8 GEMM (VNNI/AVX2) for big shapes, per-column dot otherwise */
+#elif defined(__ARM_NEON)
+        .fn_gemm = sgemm_q2_k_q8_k_neon,   /* 4x4 NEON/DOTPROD/I8MM batched GEMM (sgemm_q2_k_neon.c) */
 #else
         .fn_gemm = NULL,
 #endif
@@ -411,7 +447,14 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
         .act_fmt = ACT_FMT_Q8_K,
         .rows_per_block = 4,
         .fn_gemv = gemv_iq2_k_r4,
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+        /* NULL: the ARM iq2_k_r4_q8_k GEMM kernels disagree with their own
+         * dequantizer (verified at batch=6, error ~1e3), so fall back to the
+         * verified per-row fn_gemv path. Restore when they are fixed. */
+        .fn_gemm = NULL,
+#else
         .fn_gemm = sgemm_iq2_k_r4_q8_k_best,
+#endif
         .has_qgemm_d = 0,
         .fn_dequant_single = (type_dequant_single_fn)dequantize_row_iq2_k_r4_single,
         .needs_qx = 1,
@@ -422,7 +465,14 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
         .act_fmt = ACT_FMT_Q8_K,
         .rows_per_block = 4,
         .fn_gemv = gemv_iq3_k_r4,
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+        /* NULL: the ARM iq3_k_r4_q8_k GEMM kernels disagree with their own
+         * dequantizer (verified at batch=6, error ~1e3), so fall back to the
+         * verified per-row fn_gemv path. Restore when they are fixed. */
+        .fn_gemm = NULL,
+#else
         .fn_gemm = sgemm_iq3_k_r4_q8_k_best,
+#endif
         .has_qgemm_d = 0,
         .fn_dequant_single = (type_dequant_single_fn)dequantize_row_iq3_k_r4_single,
         .needs_qx = 1,
@@ -433,7 +483,14 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
         .act_fmt = ACT_FMT_Q8_K,
         .rows_per_block = 4,
         .fn_gemv = gemv_iq4_k_r4,
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+        /* NULL: the ARM iq4_k_r4_q8_k GEMM kernels disagree with their own
+         * dequantizer (verified at batch=6, error ~1e3), so fall back to the
+         * verified per-row fn_gemv path. Restore when they are fixed. */
+        .fn_gemm = NULL,
+#else
         .fn_gemm = sgemm_iq4_k_r4_q8_k_best,
+#endif
         .has_qgemm_d = 0,
         .fn_dequant_single = (type_dequant_single_fn)dequantize_row_iq4_k_r4_single,
         .needs_qx = 1,
@@ -455,9 +512,41 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
         .act_fmt = ACT_FMT_Q8_K,
         .rows_per_block = 4,
         .fn_gemv = gemv_q4_k_r4,
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+        /* NULL: the ARM q4_k_r4_q8_k GEMM kernels disagree with their own
+         * dequantizer (verified at batch=6, error ~1e3), so fall back to the
+         * verified per-row fn_gemv path. Restore when they are fixed. */
+        .fn_gemm = NULL,
+#else
         .fn_gemm = sgemm_q4_k_r4_q8_k_best,
+#endif
         .has_qgemm_d = 0,
         .fn_dequant_single = (type_dequant_single_fn)dequantize_row_q4_k_r4_single,
+        .needs_qx = 1,
+        .use_repacked = 0,
+        .has_dual_scalar_path = 0,
+    },
+    /* Q2_K_R4: 4-row interleaved Q2_K (GGUF type 210). No batched NEON GEMM yet;
+     * fn_gemm is left NULL so prefill uses the per-row GEMV path. */
+    [GGUF_TYPE_Q2_K_R4] = {
+        .act_fmt = ACT_FMT_Q8_K,
+        .rows_per_block = 4,
+        .fn_gemv = gemv_q2_k_r4,
+        .fn_gemm = NULL,
+        .has_qgemm_d = 0,
+        .fn_dequant_single = (type_dequant_single_fn)dequantize_row_q2_k_r4_single,
+        .needs_qx = 1,
+        .use_repacked = 0,
+        .has_dual_scalar_path = 0,
+    },
+    /* IQ3_XXS: single-row 3-bit grid quant (ggml type 18). */
+    [GGUF_TYPE_IQ3_XXS] = {
+        .act_fmt = ACT_FMT_Q8_K,
+        .rows_per_block = 1,
+        .fn_gemv = gemv_iq3_xxs,
+        .fn_gemm = NULL,
+        .has_qgemm_d = 0,
+        .fn_dequant_single = NULL,
         .needs_qx = 1,
         .use_repacked = 0,
         .has_dual_scalar_path = 0,

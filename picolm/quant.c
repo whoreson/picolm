@@ -946,6 +946,8 @@ case GGUF_TYPE_Q4_0_R8:  dequantize_row_q4_0_r8(src, dst, n); break;
         case GGUF_TYPE_IQ6_K:    dequantize_row_iq6_k(src, dst, n); break;
         case GGUF_TYPE_Q6_K_R4:  dequantize_row_q6_K_R4(src, dst, n); break;
         case GGUF_TYPE_Q4_K_R4:  dequantize_row_q4_k_r4(src, dst, n); break;
+        case GGUF_TYPE_Q2_K_R4:  dequantize_row_q2_k_r4(src, dst, n); break;
+        case GGUF_TYPE_IQ3_XXS:  dequantize_row_iq3_xxs(src, dst, n); break;
         default:
             fprintf(stderr, "dequantize_row: unsupported type %d\n", type);
             exit(1);
@@ -993,6 +995,8 @@ int gguf_type_block_size(gguf_type_t type) {
         case GGUF_TYPE_Q8_K_R8:  return 256; /* same as Q8_K: 256 values per row */
         case GGUF_TYPE_Q6_K_R4:  return 256; /* same as Q6_K: 256 values per row */
         case GGUF_TYPE_Q4_K_R4:  return 256; /* same as Q4_K: 256 values per row */
+        case GGUF_TYPE_Q2_K_R4:  return 256; /* same as Q2_K: 256 values per row */
+        case GGUF_TYPE_IQ3_XXS:  return 256; /* QK_K values per block */
         default: return 0;
     }
 }
@@ -1036,6 +1040,8 @@ int gguf_type_quant_size(gguf_type_t type) {
         case GGUF_TYPE_Q8_K_R8:  return (int)(sizeof(block_q8_k_r8) / 8); /* 258: per-row block size */
         case GGUF_TYPE_Q6_K_R4:  return (int)sizeof(block_q6_K);  /* 210: per-row block size (840/4) */
         case GGUF_TYPE_Q4_K_R4:  return (int)sizeof(block_q4_k_r4);  /* 576: 4 rows interleaved */
+        case GGUF_TYPE_Q2_K_R4:  return (int)sizeof(block_q2_k_r4);  /* 336: 4 rows interleaved */
+        case GGUF_TYPE_IQ3_XXS:  return (int)sizeof(block_iq3_xxs);  /* 98: single row */
         default: return 0;
     }
 }
@@ -1061,6 +1067,10 @@ size_t gguf_type_row_size(gguf_type_t type, int n) {
     /* Q4_K_R4: 4 rows per block. Each block = 576 bytes, covers 4 rows x 256 values. */
     if (type == GGUF_TYPE_Q4_K_R4) {
         return (size_t)sizeof(block_q4_k_r4) * (size_t)(n / QK_K) / 4;
+    }
+    /* Q2_K_R4: 4 rows per block. Each block = 336 bytes, covers 4 rows x 256 values. */
+    if (type == GGUF_TYPE_Q2_K_R4) {
+        return (size_t)sizeof(block_q2_k_r4) * (size_t)(n / QK_K) / 4;
     }
     /* IQ4_NL_R4: 4 rows per block. Each block = 72 bytes, covers 4 rows x 32 values. */
     if (type == GGUF_TYPE_IQ4_NL_R4) {
@@ -7470,6 +7480,29 @@ case GGUF_TYPE_Q4_0_R8: {
             dequantize_row_q4_k_r4_single((const block_q4_k_r4 *)src, q4k_tmp, n, 0);
             return vec_dot_f32_f32(q4k_tmp, x, n);
         }
+        case GGUF_TYPE_Q2_K_R4: {
+            /* Q2_K_R4: 4-row interleaved, same convention as Q4_K_R4.
+             * n is the full row length (up to many thousands), so use the
+             * stack buffer only when it fits and malloc otherwise. */
+            float q2k_stack[1024];
+            float *q2k_tmp = (n <= 1024) ? q2k_stack
+                                         : (float *)malloc((size_t)n * sizeof(float));
+            if (!q2k_tmp) return 0.0f;
+            dequantize_row_q2_k_r4_single((const block_q2_k_r4 *)src, q2k_tmp, n, 0);
+            float r2 = vec_dot_f32_f32(q2k_tmp, x, n);
+            if (q2k_tmp != q2k_stack) free(q2k_tmp);
+            return r2;
+        }
+        case GGUF_TYPE_IQ3_XXS: {
+            float tmp[QK_K];
+            const int nb = n / QK_K;
+            float sumf = 0.0f;
+            for (int ib = 0; ib < nb; ++ib) {
+                dequantize_row_iq3_xxs((const uint8_t *)src + (size_t)ib * sizeof(block_iq3_xxs), tmp, QK_K);
+                sumf += vec_dot_f32_f32(tmp, x + (size_t)ib * QK_K, QK_K);
+            }
+            return sumf;
+        }
         case GGUF_TYPE_Q6_K_R4: {
             /* Q6_K_R4: dequantize row 0 of the 4-row group, then f32 dot.
              * For rows 1-3, the caller must use the 4-row group path
@@ -9236,8 +9269,13 @@ void vec_dot_iq3_k_r4_q8_k_batch4(const void *vx, const void *vy, int n, float *
     /* AVX2 path: call the optimized kernel from sgemm_iq3_k_r4.c */
     vec_dot_iq3_k_r4_q8_k_avx2(vx, vy, n, out, 4);
 #elif defined(PICOLM_NEON) && !defined(PICOLM_FORCE_SCALAR)
-    /* NEON path: call the optimized kernel from sgemm_iq3_k_r4.c */
-    vec_dot_iq3_k_r4_q8_k_neon(vx, vy, n, out, 4);
+    /* The fused *_neon R4 kernel does not agree with its own dequantizer
+     * (measured 1e2-1e3 error on random blocks; dequant+F32 matches vec_dot
+     * on known-good types to ~1e-4). Use the verified dequant path until
+     * that kernel is fixed. */
+    vec_dot_r4_q8_k_dequant_ref(vx, vy, n, out, 4,
+        (void (*)(const void *, float *, int, int))dequantize_row_iq3_k_r4_single,
+        sizeof(block_iq3_k_r4));
 #else
     /* Scalar fallback: dequantize each row, F32 dot with dequantized Q8_K activations */
     {
@@ -9578,7 +9616,13 @@ void vec_dot_iq4_k_r4_q8_k_batch4(const void *vx, const void *vy, int n, float *
 #if defined(PICOLM_AVX2) && !defined(PICOLM_FORCE_SCALAR)
     vec_dot_iq4_k_r4_q8_k_avx2(vx, vy, n, out, 4);
 #elif defined(PICOLM_NEON) && !defined(PICOLM_FORCE_SCALAR)
-    vec_dot_iq4_k_r4_q8_k_neon(vx, vy, n, out, 4);
+    /* The fused *_neon R4 kernel does not agree with its own dequantizer
+     * (measured 1e2-1e3 error on random blocks; dequant+F32 matches vec_dot
+     * on known-good types to ~1e-4). Use the verified dequant path until
+     * that kernel is fixed. */
+    vec_dot_r4_q8_k_dequant_ref(vx, vy, n, out, 4,
+        (void (*)(const void *, float *, int, int))dequantize_row_iq4_k_r4_single,
+        sizeof(block_iq4_k_r4));
 #else
     /* Scalar fallback: dequantize each row, F32 dot with dequantized Q8_K activations */
     {
@@ -10036,6 +10080,16 @@ void vec_dot_q4_k_r4_q8_k_batch4(const void *vx, const void *vy, int n, float *o
     vec_dot_q4_k_r4_q8_k_avx2(vx, vy, n, out, 4);
     return;
 #endif
+#if defined(PICOLM_NEON) && !defined(PICOLM_FORCE_SCALAR)
+    /* The fused *_neon R4 kernel does not agree with its own dequantizer
+     * (measured 1e2-1e3 error on random blocks; dequant+F32 matches vec_dot
+     * on known-good types to ~1e-4). Use the verified dequant path until
+     * that kernel is fixed. */
+    vec_dot_r4_q8_k_dequant_ref(vx, vy, n, out, 4,
+        (void (*)(const void *, float *, int, int))dequantize_row_q4_k_r4_single,
+        sizeof(block_q4_k_r4));
+    return;
+#endif
 
     const block_q4_k_r4 *x = (const block_q4_k_r4 *)vx;
     const block_q8_K *y = (const block_q8_K *)vy;
@@ -10080,5 +10134,226 @@ void vec_dot_q4_k_r4_q8_k_batch4(const void *vx, const void *vy, int n, float *o
         }
         for (int k = 0; k < 4; k++)
             out[k] += (sumi[k] - bsum[k]) * q8_scale;
+    }
+}
+/* Tables for IQ3_XXS (ggml type 18). Values copied verbatim from
+ * ik_llama.cpp ggml/src/ggml-common.h (iq3xxs_grid, ksigns_iq2xs,
+ * kmask_iq2xs), which are in turn the llama.cpp/ggml reference tables. */
+static const uint32_t iq3xxs_grid[256] = {
+    0x04040404, 0x04040414, 0x04040424, 0x04040c0c, 0x04040c1c, 0x04040c3e, 0x04041404, 0x04041414,
+    0x04041c0c, 0x04042414, 0x04043e1c, 0x04043e2c, 0x040c040c, 0x040c041c, 0x040c0c04, 0x040c0c14,
+    0x040c140c, 0x040c142c, 0x040c1c04, 0x040c1c14, 0x040c240c, 0x040c2c24, 0x040c3e04, 0x04140404,
+    0x04140414, 0x04140424, 0x04140c0c, 0x04141404, 0x04141414, 0x04141c0c, 0x04141c1c, 0x04141c3e,
+    0x04142c0c, 0x04142c3e, 0x04143e2c, 0x041c040c, 0x041c043e, 0x041c0c04, 0x041c0c14, 0x041c142c,
+    0x041c3e04, 0x04240c1c, 0x04241c3e, 0x04242424, 0x04242c3e, 0x04243e1c, 0x04243e2c, 0x042c040c,
+    0x042c043e, 0x042c1c14, 0x042c2c14, 0x04341c2c, 0x04343424, 0x043e0c04, 0x043e0c24, 0x043e0c34,
+    0x043e241c, 0x043e340c, 0x0c04040c, 0x0c04041c, 0x0c040c04, 0x0c040c14, 0x0c04140c, 0x0c04141c,
+    0x0c041c04, 0x0c041c14, 0x0c041c24, 0x0c04243e, 0x0c042c04, 0x0c0c0404, 0x0c0c0414, 0x0c0c0c0c,
+    0x0c0c1404, 0x0c0c1414, 0x0c14040c, 0x0c14041c, 0x0c140c04, 0x0c140c14, 0x0c14140c, 0x0c141c04,
+    0x0c143e14, 0x0c1c0404, 0x0c1c0414, 0x0c1c1404, 0x0c1c1c0c, 0x0c1c2434, 0x0c1c3434, 0x0c24040c,
+    0x0c24042c, 0x0c242c04, 0x0c2c1404, 0x0c2c1424, 0x0c2c2434, 0x0c2c3e0c, 0x0c34042c, 0x0c3e1414,
+    0x0c3e2404, 0x14040404, 0x14040414, 0x14040c0c, 0x14040c1c, 0x14041404, 0x14041414, 0x14041434,
+    0x14041c0c, 0x14042414, 0x140c040c, 0x140c041c, 0x140c042c, 0x140c0c04, 0x140c0c14, 0x140c140c,
+    0x140c1c04, 0x140c341c, 0x140c343e, 0x140c3e04, 0x14140404, 0x14140414, 0x14140c0c, 0x14140c3e,
+    0x14141404, 0x14141414, 0x14141c3e, 0x14142404, 0x14142c2c, 0x141c040c, 0x141c0c04, 0x141c0c24,
+    0x141c3e04, 0x141c3e24, 0x14241c2c, 0x14242c1c, 0x142c041c, 0x142c143e, 0x142c240c, 0x142c3e24,
+    0x143e040c, 0x143e041c, 0x143e0c34, 0x143e242c, 0x1c04040c, 0x1c040c04, 0x1c040c14, 0x1c04140c,
+    0x1c04141c, 0x1c042c04, 0x1c04342c, 0x1c043e14, 0x1c0c0404, 0x1c0c0414, 0x1c0c1404, 0x1c0c1c0c,
+    0x1c0c2424, 0x1c0c2434, 0x1c14040c, 0x1c14041c, 0x1c140c04, 0x1c14142c, 0x1c142c14, 0x1c143e14,
+    0x1c1c0c0c, 0x1c1c1c1c, 0x1c241c04, 0x1c24243e, 0x1c243e14, 0x1c2c0404, 0x1c2c0434, 0x1c2c1414,
+    0x1c2c2c2c, 0x1c340c24, 0x1c341c34, 0x1c34341c, 0x1c3e1c1c, 0x1c3e3404, 0x24040424, 0x24040c3e,
+    0x24041c2c, 0x24041c3e, 0x24042c1c, 0x24042c3e, 0x240c3e24, 0x24141404, 0x24141c3e, 0x24142404,
+    0x24143404, 0x24143434, 0x241c043e, 0x241c242c, 0x24240424, 0x24242c0c, 0x24243424, 0x242c142c,
+    0x242c241c, 0x242c3e04, 0x243e042c, 0x243e0c04, 0x243e0c14, 0x243e1c04, 0x2c040c14, 0x2c04240c,
+    0x2c043e04, 0x2c0c0404, 0x2c0c0434, 0x2c0c1434, 0x2c0c2c2c, 0x2c140c24, 0x2c141c14, 0x2c143e14,
+    0x2c1c0414, 0x2c1c2c1c, 0x2c240c04, 0x2c24141c, 0x2c24143e, 0x2c243e14, 0x2c2c0414, 0x2c2c1c0c,
+    0x2c342c04, 0x2c3e1424, 0x2c3e2414, 0x34041424, 0x34042424, 0x34042434, 0x34043424, 0x340c140c,
+    0x340c340c, 0x34140c3e, 0x34143424, 0x341c1c04, 0x341c1c34, 0x34242424, 0x342c042c, 0x342c2c14,
+    0x34341c1c, 0x343e041c, 0x343e140c, 0x3e04041c, 0x3e04042c, 0x3e04043e, 0x3e040c04, 0x3e041c14,
+    0x3e042c14, 0x3e0c1434, 0x3e0c2404, 0x3e140c14, 0x3e14242c, 0x3e142c14, 0x3e1c0404, 0x3e1c0c2c,
+    0x3e1c1c1c, 0x3e1c3404, 0x3e24140c, 0x3e24240c, 0x3e2c0404, 0x3e2c0414, 0x3e2c1424, 0x3e341c04,
+};
+static const uint8_t ksigns_iq2xs[128] = {
+    0, 129, 130, 3, 132, 5, 6, 135, 136, 9, 10, 139, 12, 141, 142, 15,
+    144, 17, 18, 147, 20, 149, 150, 23, 24, 153, 154, 27, 156, 29, 30, 159,
+    160, 33, 34, 163, 36, 165, 166, 39, 40, 169, 170, 43, 172, 45, 46, 175,
+    48, 177, 178, 51, 180, 53, 54, 183, 184, 57, 58, 187, 60, 189, 190, 63,
+    192, 65, 66, 195, 68, 197, 198, 71, 72, 201, 202, 75, 204, 77, 78, 207,
+    80, 209, 210, 83, 212, 85, 86, 215, 216, 89, 90, 219, 92, 221, 222, 95,
+    96, 225, 226, 99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
+    240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
+};
+static const uint8_t kmask_iq2xs[8] = { 1, 2, 4, 8, 16, 32, 64, 128 };
+
+/* ================================================================
+ * Q2_K_R4 (GGUF type 210): 4-row interleaved Q2_K.
+ * ================================================================ */
+
+void dequantize_row_q2_k_r4_single(const block_q2_k_r4 *x, float *dst, int n, int row) {
+    /* Element layout verified against ik_llama.cpp dequantize_row_q2_k_r4():
+     *   scales[8*ib + row + 0] -> first 16 values of sub-block ib
+     *   scales[8*ib + row + 4] -> second 16 values
+     *   qs advances 32 bytes per (ib, row); within it the 4 bytes for this row
+     *   live at 4*row + i, and the four 2-bit fields (shifts 0,2,4,6) are the
+     *   elements i, i+4, i+8, i+12 (then +16 for the second half). */
+    const int nblock = n / QK_K;
+    for (int ibl = 0; ibl < nblock; ++ibl) {
+        const float d    = fp16_to_fp32_lookup(x[ibl].d[row + 0]);
+        const float dmin = fp16_to_fp32_lookup(x[ibl].d[row + 4]);
+        float *y = dst + (size_t)ibl * QK_K;
+        const uint8_t *ql = x[ibl].qs;
+        for (int ib = 0; ib < QK_K / 32; ++ib) {
+            const float dl1 = d    * (float)(x[ibl].scales[8 * ib + row + 0] & 0x0F);
+            const float ml1 = dmin * (float)(x[ibl].scales[8 * ib + row + 0] >> 4);
+            const float dl2 = d    * (float)(x[ibl].scales[8 * ib + row + 4] & 0x0F);
+            const float ml2 = dmin * (float)(x[ibl].scales[8 * ib + row + 4] >> 4);
+            for (int i = 0; i < 4; ++i) {
+                const uint8_t b0 = ql[4 * row + i + 0];
+                const uint8_t b1 = ql[4 * row + i + 16];
+                y[32 * ib + i +  0] = dl1 * (float)((b0 >> 0) & 3) - ml1;
+                y[32 * ib + i +  4] = dl1 * (float)((b0 >> 2) & 3) - ml1;
+                y[32 * ib + i +  8] = dl1 * (float)((b0 >> 4) & 3) - ml1;
+                y[32 * ib + i + 12] = dl1 * (float)((b0 >> 6) & 3) - ml1;
+                y[32 * ib + i + 16] = dl2 * (float)((b1 >> 0) & 3) - ml2;
+                y[32 * ib + i + 20] = dl2 * (float)((b1 >> 2) & 3) - ml2;
+                y[32 * ib + i + 24] = dl2 * (float)((b1 >> 4) & 3) - ml2;
+                y[32 * ib + i + 28] = dl2 * (float)((b1 >> 6) & 3) - ml2;
+            }
+            ql += 32;
+        }
+    }
+}
+
+void dequantize_row_q2_k_r4(const void *src, float *dst, int n) {
+    dequantize_row_q2_k_r4_single((const block_q2_k_r4 *)src, dst, n, 0);
+}
+
+/* Single-row Q2_K_R4 x Q8_K, with the min term folded into bsums. */
+/* 4-row variant matching the r4_vecdot4_fn ABI (out[0..3] = rows 0..3). */
+void vec_dot_q2_k_r4_q8_k_batch4(const void *vx, const void *vy, int n, float *out, int nrows) {
+    const block_q2_k_r4 *x = (const block_q2_k_r4 *)vx;
+    const block_q8_K *y = (const block_q8_K *)vy;
+    const int nblock = n / QK_K;
+    for (int row = 0; row < 4 && row < nrows; ++row) {
+        float sumf = 0.0f;
+        for (int ibl = 0; ibl < nblock; ++ibl) {
+            const float d    = fp16_to_fp32_lookup(x[ibl].d[row + 0]);
+            const float dmin = fp16_to_fp32_lookup(x[ibl].d[row + 4]);
+            const int8_t *q8 = y[ibl].qs;
+            const uint8_t *ql = x[ibl].qs;
+            int isum = 0, summs = 0;
+            for (int ib = 0; ib < QK_K / 32; ++ib) {
+                const int s1 = x[ibl].scales[8 * ib + row + 0];
+                const int s2 = x[ibl].scales[8 * ib + row + 4];
+                int dot1 = 0, dot2 = 0, bs1 = 0, bs2 = 0;
+                for (int i = 0; i < 4; ++i) {
+                    const uint8_t b0 = ql[4 * row + i + 0];
+                    const uint8_t b1 = ql[4 * row + i + 16];
+                    const int base = 32 * ib;
+                    const int a0 = (int)q8[base + i +  0], a1 = (int)q8[base + i +  4];
+                    const int a2 = (int)q8[base + i +  8], a3 = (int)q8[base + i + 12];
+                    dot1 += a0 * ((b0 >> 0) & 3) + a1 * ((b0 >> 2) & 3)
+                          + a2 * ((b0 >> 4) & 3) + a3 * ((b0 >> 6) & 3);
+                    bs1  += a0 + a1 + a2 + a3;
+                    const int c0 = (int)q8[base + i + 16], c1 = (int)q8[base + i + 20];
+                    const int c2 = (int)q8[base + i + 24], c3 = (int)q8[base + i + 28];
+                    dot2 += c0 * ((b1 >> 0) & 3) + c1 * ((b1 >> 2) & 3)
+                          + c2 * ((b1 >> 4) & 3) + c3 * ((b1 >> 6) & 3);
+                    bs2  += c0 + c1 + c2 + c3;
+                }
+                isum  += dot1 * (s1 & 0x0F) + dot2 * (s2 & 0x0F);
+                summs += bs1 * (s1 >> 4)     + bs2 * (s2 >> 4);
+            }
+            sumf += y[ibl].d * (d * (float)isum - dmin * (float)summs);
+            ql += 0;
+        }
+        out[row] = sumf;
+    }
+}
+
+/* Single-row entry (row 0), kept for the generic vec_dot() dispatcher. */
+float vec_dot_q2_k_r4_q8_k(const void *vx, const void *vy, int n) {
+    float o[4] = {0, 0, 0, 0};
+    vec_dot_q2_k_r4_q8_k_batch4(vx, vy, n, o, 4);
+    return o[0];
+}
+
+
+/* ================================================================
+ * IQ3_XXS (ggml type 18)
+ * ================================================================ */
+
+void dequantize_row_iq3_xxs(const void *src, float *dst, int n) {
+    const block_iq3_xxs *x = (const block_iq3_xxs *)src;
+    const int nb = n / QK_K;
+    for (int i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32_lookup(x[i].d);
+        const uint8_t *qs = x[i].qs;                       /* grid indices, 64 bytes */
+        const uint8_t *scales_and_signs = qs + QK_K / 4;   /* 32 bytes */
+        float *y = dst + (size_t)i * QK_K;
+        for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+            uint32_t aux32;
+            memcpy(&aux32, scales_and_signs + 4 * ib32, sizeof(uint32_t));
+            const float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+                const uint8_t *grid1 = (const uint8_t *)(iq3xxs_grid + qs[2 * l + 0]);
+                const uint8_t *grid2 = (const uint8_t *)(iq3xxs_grid + qs[2 * l + 1]);
+                for (int j = 0; j < 4; ++j) {
+                    y[j + 0] = db * (float)grid1[j] * ((signs & kmask_iq2xs[j + 0]) ? -1.0f : 1.0f);
+                    y[j + 4] = db * (float)grid2[j] * ((signs & kmask_iq2xs[j + 4]) ? -1.0f : 1.0f);
+                }
+                y += 8;
+            }
+            qs += 8;
+        }
+    }
+}
+
+/* IQ3_XXS x Q8_K via dequant + f32 dot (the grid/sign layout does not admit a
+ * cheap integer dot; this type is a small fraction of the tensors). */
+float vec_dot_iq3_xxs_q8_k(const void *vx, const void *vy, int n) {
+    const int nb = n / QK_K;
+    const block_q8_K *y = (const block_q8_K *)vy;
+    float sumf = 0.0f;
+    float wbuf[QK_K];
+    for (int ib = 0; ib < nb; ++ib) {
+        dequantize_row_iq3_xxs((const uint8_t *)vx + (size_t)ib * sizeof(block_iq3_xxs), wbuf, QK_K);
+        const int8_t *q8 = y[ib].qs;
+        float blk = 0.0f;
+        for (int i = 0; i < QK_K; ++i) blk += wbuf[i] * (float)q8[i];
+        sumf += blk * y[ib].d;
+    }
+    return sumf;
+}
+
+/* ================================================================
+ * Correct-by-construction 4-row R4 dot: dequantize each row with the
+ * verified *_r4_single() routine, then dot against the Q8_K activations,
+ * folding each block's delta. Used on ARM because the hand-written
+ * vec_dot_*_r4_q8_k_neon() kernels in sgemm_iq{3,4}_k.c / sgemm_q4_k_r4.c
+ * do NOT agree with their own dequantizers (checked against
+ * dequant+F32, which is validated on Q4_K where vec_dot is bit-exact).
+ * Slower than a fused kernel, but correct; replacing it with a fixed
+ * fused kernel is a separate, measurable change.
+ * ================================================================ */
+void vec_dot_r4_q8_k_dequant_ref(const void *vx, const void *vy, int n,
+                                 float *out, int nrows,
+                                 void (*deq_single)(const void *, float *, int, int),
+                                 size_t block_bytes) {
+    const block_q8_K *y = (const block_q8_K *)vy;
+    const int nb = n / QK_K;
+    float wbuf[QK_K];
+    for (int r = 0; r < nrows && r < 4; ++r) {
+        float acc = 0.0f;
+        const char *wp = (const char *)vx;
+        for (int i = 0; i < nb; ++i) {
+            deq_single(wp, wbuf, QK_K, r);
+            float s = 0.0f;
+            for (int j = 0; j < QK_K; ++j) s += wbuf[j] * (float)y[i].qs[j];
+            acc += s * y[i].d;
+            wp += block_bytes;
+        }
+        out[r] = acc;
     }
 }

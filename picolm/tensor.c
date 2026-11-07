@@ -3373,31 +3373,90 @@ typedef void (*r4_dequant_row_fn)(const void *, float *, int, int);
 /* R4 dual-batch lookup: returns vecdot kernel, dequant function, and activation format.
  * The activation format is authoritative for choosing which buffer to pass.
  * Adding a new R4 type requires exactly one entry here. */
+/* ARM trampolines: correct (dequant-based) 4-row R4 dots. See the comment on
+ * vec_dot_r4_q8_k_dequant_ref() in quant.c for why the fused NEON kernels are
+ * not used here. */
+static void r4_dot_iq2_k_deqref(const void *vx, const void *vy, int n, float *o, int nr) {
+    vec_dot_r4_q8_k_dequant_ref(vx, vy, n, o, nr,
+        (void (*)(const void *, float *, int, int))dequantize_row_iq2_k_r4_single,
+        sizeof(block_iq2_k_r4));
+}
+static void r4_dot_iq3_k_deqref(const void *vx, const void *vy, int n, float *o, int nr) {
+    vec_dot_r4_q8_k_dequant_ref(vx, vy, n, o, nr,
+        (void (*)(const void *, float *, int, int))dequantize_row_iq3_k_r4_single,
+        sizeof(block_iq3_k_r4));
+}
+static void r4_dot_iq4_k_deqref(const void *vx, const void *vy, int n, float *o, int nr) {
+    vec_dot_r4_q8_k_dequant_ref(vx, vy, n, o, nr,
+        (void (*)(const void *, float *, int, int))dequantize_row_iq4_k_r4_single,
+        sizeof(block_iq4_k_r4));
+}
+static void r4_dot_q4_k_deqref(const void *vx, const void *vy, int n, float *o, int nr) {
+    vec_dot_r4_q8_k_dequant_ref(vx, vy, n, o, nr,
+        (void (*)(const void *, float *, int, int))dequantize_row_q4_k_r4_single,
+        sizeof(block_q4_k_r4));
+}
+
 static int r4_dual_lookup(gguf_type_t qtype, r4_vecdot4_fn *vd, r4_dequant_row_fn *dq,
                            act_fmt_t *act_fmt) {
+    /* IMPORTANT: the *_avx2 entry points are compiled to EMPTY function bodies
+     * on non-AVX2 builds (their whole body is inside
+     * `#if defined(__AVX2__) && defined(__F16C__)`), so handing them to the R4
+     * dual path on ARM silently leaves the output unwritten and produces
+     * garbage tokens. Select the NEON kernels instead when AVX2 is absent.
+     * Both families share the (vx, wy, n, out, nrows) ABI. */
+#if defined(__AVX2__) && defined(__F16C__)
+#  define R4_VD_IQ2_K    vec_dot_iq2_k_r4_q8_k_avx2
+#  define R4_VD_IQ3_K    vec_dot_iq3_k_r4_q8_k_avx2
+#  define R4_VD_IQ4_K    vec_dot_iq4_k_r4_q8_k_avx2
+#  define R4_VD_IQ4_NL   vec_dot_iq4_nl_r4_q8_0_avx2
+#  define R4_VD_Q4_K     vec_dot_q4_k_r4_q8_k_avx2
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+/* The fused *_neon R4 kernels do not agree with their own dequantizers
+ * (verified: they differ from dequant+F32 by 1e2-1e3 on random blocks, while
+ * dequant+F32 matches vec_dot_q4_K_q8_K to 5e-5). Use the dequant-based path
+ * until those kernels are fixed. */
+#  define R4_VD_IQ2_K    r4_dot_iq2_k_deqref
+#  define R4_VD_IQ3_K    r4_dot_iq3_k_deqref
+#  define R4_VD_IQ4_K    r4_dot_iq4_k_deqref
+#  define R4_VD_IQ4_NL   vec_dot_iq4_nl_r4_q8_0_neon
+#  define R4_VD_Q4_K     r4_dot_q4_k_deqref
+#else
+#  define R4_VD_IQ2_K    vec_dot_iq2_k_r4_q8_k_avx2
+#  define R4_VD_IQ3_K    vec_dot_iq3_k_r4_q8_k_avx2
+#  define R4_VD_IQ4_K    vec_dot_iq4_k_r4_q8_k_avx2
+#  define R4_VD_IQ4_NL   vec_dot_iq4_nl_r4_q8_0_avx2
+#  define R4_VD_Q4_K     vec_dot_q4_k_r4_q8_k_avx2
+#endif
+
     switch (qtype) {
     case GGUF_TYPE_IQ2_K_R4:
-        *vd = vec_dot_iq2_k_r4_q8_k_avx2;
+        *vd = R4_VD_IQ2_K;
         *dq = (r4_dequant_row_fn)dequantize_row_iq2_k_r4_single;
         *act_fmt = ACT_FMT_Q8_K;
         return 1;
     case GGUF_TYPE_IQ3_K_R4:
-        *vd = vec_dot_iq3_k_r4_q8_k_avx2;
+        *vd = R4_VD_IQ3_K;
         *dq = (r4_dequant_row_fn)dequantize_row_iq3_k_r4_single;
         *act_fmt = ACT_FMT_Q8_K;
         return 1;
     case GGUF_TYPE_IQ4_K_R4:
-        *vd = vec_dot_iq4_k_r4_q8_k_avx2;
+        *vd = R4_VD_IQ4_K;
         *dq = (r4_dequant_row_fn)dequantize_row_iq4_k_r4_single;
         *act_fmt = ACT_FMT_Q8_K;
         return 1;
+    case GGUF_TYPE_Q2_K_R4:
+        *vd = vec_dot_q2_k_r4_q8_k_batch4;
+        *dq = (r4_dequant_row_fn)dequantize_row_q2_k_r4_single;
+        *act_fmt = ACT_FMT_Q8_K;
+        return 1;
     case GGUF_TYPE_IQ4_NL_R4:
-        *vd = vec_dot_iq4_nl_r4_q8_0_avx2;
+        *vd = R4_VD_IQ4_NL;
         *dq = (r4_dequant_row_fn)dequantize_row_iq4_nl_r4_single;
         *act_fmt = ACT_FMT_Q8_0;
         return 1;
     case GGUF_TYPE_Q4_K_R4:
-        *vd = vec_dot_q4_k_r4_q8_k_avx2;
+        *vd = R4_VD_Q4_K;
         *dq = (r4_dequant_row_fn)dequantize_row_q4_k_r4_single;
         *act_fmt = ACT_FMT_Q8_K;
         return 1;

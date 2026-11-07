@@ -502,6 +502,8 @@ typedef enum {
     GGUF_TYPE_Q6_K_R4    = 214, /* 4-row interleaved Q6_K (GGUF type 214, llama.cpp ik branch) */
     GGUF_TYPE_Q8_K_R8    = 399, /* 8-row interleaved Q8_K (GGUF type 399, llama.cpp ik branch) */
     GGUF_TYPE_Q4_K_R4    = 212, /* 4-row interleaved Q4_K (GGUF type 212, llama.cpp ik branch) */
+    GGUF_TYPE_Q2_K_R4    = 210, /* 4-row interleaved Q2_K (GGUF type 210, llama.cpp ik branch) */
+    GGUF_TYPE_IQ3_XXS    = 18,  /* 3-bit "almost true" quant, 16-bit block scale (ggml type 18) */
 } gguf_type_t;
 
 /* One past the highest type ID, for table sizing */
@@ -1036,6 +1038,50 @@ typedef struct PICOLM_PACKED_ATTR {
     uint8_t  qs[256];     /* 1024 packed 3-bit values */
     uint8_t  qh[128];     /* 1024 high bits (1 per value, 8 values per byte) */
 } block_iq3_k_r4;         /* 440 bytes = 4 * 110 */
+
+/* Q2_K_R4 block (GGUF type 210): 4 rows of Q2_K repacked together.
+ * Size = 8*2 + QK_K/4 + QK_K = 16 + 64 + 256 = 336 bytes (4 * 84).
+ *
+ * Layout (from ik_llama.cpp ggml-common.h / repack_q2_k()):
+ *   d[8]:         FP16: d[0..3] = the 4 rows' super-block scales,
+ *                        d[4..7] = the 4 rows' dmin values
+ *   scales[64]:   QK_K/16 = 16 sub-block (min<<4 | scale) bytes per row,
+ *                 interleaved as scales[4*ib + row]
+ *   qs[256]:      QK_K = 256 bytes = 1024 packed 2-bit values.
+ *                 Repacked as, per 32-value sub-block ib (0..7):
+ *                   qs[32*ib + 4*row + i +  0] packs L[32*ib + i + 0/4/8/12]
+ *                   qs[32*ib + 4*row + i + 16] packs L[32*ib + i + 16/20/24/28]
+ *                 i.e. the same 4-row-interleaved nibble grouping the other R4
+ *                 K-quants use. NOTE the q2 values are 2-bit in the low two
+ *                 bits of each byte slot (values 0..3), NOT nibbles.
+ * Dequant: val = d[row]*scale*q - dmin[row]*min */
+#pragma pack(push, 1)
+typedef struct PICOLM_PACKED_ATTR {
+    uint16_t d[8];        /* 4 FP16 scales then 4 FP16 mins */
+    uint8_t  scales[64];  /* 16 sub-blocks * 4 rows, (min<<4 | scale) */
+    uint8_t  qs[256];     /* 4 rows x 64 bytes of 2-bit quants, row-interleaved */
+} block_q2_k_r4;          /* 336 bytes = 4 * 84 */
+#pragma pack(pop)
+
+/* IQ3_XXS block (ggml type 18): 3.0625 bpw, QK_K values in 98 bytes.
+ *
+ * Layout (from ik_llama.cpp ggml-common.h / dequantize_row_iq3_xxs):
+ *   d:  FP16 super-block scale
+ *   qs: 3*QK_K/8 = 96 bytes. First QK_K/4 = 64 bytes are grid indices,
+ *       the remaining 32 bytes are scales_and_signs.
+ * Each 32-value sub-block ib32 (0..7) uses:
+ *   aux32 = scales_and_signs[4*ib32 .. +3]
+ *   db    = d * (0.5f + (aux32 >> 28)) * 0.5f
+ *   for l in 0..3: signs = ksigns_iq2xs[(aux32 >> 7*l) & 127]
+ *                  grid1 = iq3xxs_grid[qs[2*l+0]], grid2 = iq3xxs_grid[qs[2*l+1]]
+ *                  8 values from two 4-entry grids, sign-flipped by `signs`
+ *   then qs += 8. */
+#pragma pack(push, 1)
+typedef struct PICOLM_PACKED_ATTR {
+    uint16_t d;
+    uint8_t  qs[3 * 256 / 8];  /* 96 bytes: 64 index bytes + 32 scale/sign bytes */
+} block_iq3_xxs;               /* 98 bytes */
+#pragma pack(pop)
 
 /* IQ4_K plain block (GGUF type 139): single-row 4-bit non-linear quant.
  * Size: 144 bytes per block (QK_K=256 values).
@@ -1608,6 +1654,20 @@ void vec_dot_iq4_k_r4_q8_k_batch4(const void *vx, const void *vy, int n, float *
 /* Q4_K_R4 dequantize: scalar reference for a single row from the 4-row interleaved block.
  * dst must have space for n floats. row must be 0..3. */
 void dequantize_row_q4_k_r4_single(const block_q4_k_r4 *x, float *dst, int n, int row);
+void dequantize_row_q2_k_r4_single(const block_q2_k_r4 *x, float *dst, int n, int row);
+void dequantize_row_q2_k_r4(const void *src, float *dst, int n);
+float vec_dot_q2_k_r4_q8_k(const void *vx, const void *vy, int n);
+void vec_dot_q2_k_r4_q8_k_batch4(const void *vx, const void *vy, int n, float *out, int nrows);
+void dequantize_row_iq3_xxs(const void *src, float *dst, int n);
+float vec_dot_iq3_xxs_q8_k(const void *vx, const void *vy, int n);
+
+/* Correct 4-row R4 vecdot built on a verified per-row dequantizer. `block_bytes`
+ * is the size of one R4 block (e.g. sizeof(block_iq4_k_r4)). */
+void vec_dot_r4_q8_k_dequant_ref(const void *vx, const void *vy, int n,
+                                 float *out, int nrows,
+                                 void (*deq_single)(const void *, float *, int, int),
+                                 size_t block_bytes);
+
 /* Q4_K_R4 x Q8_K scalar vec_dot (single row). */
 float vec_dot_q4_k_r4_q8_k(const void *vx, const void *wy, int n);
 /* Q4_K_R4 x Q8_K batch4 vec_dot: computes 4 row dot products at once.

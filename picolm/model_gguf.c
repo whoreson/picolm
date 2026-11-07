@@ -508,6 +508,7 @@ const char *gguf_type_name(uint32_t type) {
         case 16: return "iq2_xxs";
         case 17: return "iq2_xs";
         case 18: return "iq3_xxs";
+        case 210: return "q2_k_r4";
         case 19: return "iq1_s";
         case 20: return "iq4_nl";   /* GGML_TYPE_IQ4_NL (was mislabeled iq4_xxs) */
         case 21: return "iq3_s";

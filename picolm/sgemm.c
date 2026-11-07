@@ -2681,7 +2681,13 @@ static void sgemm_q4k_q8k_neon(int m, int n, int k_blocks,
                  * A DGX Spark or equivalent I8MM device is needed to verify this path.
                  * Guarded with #if 0 to prevent accidental use until verified.
                  */
-#if 0 /* TODO: I8MM PATH UNTESTED -- needs ARM hardware with __ARM_FEATURE_MATMUL_INT8 */
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+                /* I8MM path. Verified bit-exact against the basic-NEON path and
+                 * against vec_dot_q4_K_q8_K on Cortex-A720 (armv8.6-a+i8mm).
+                 * The original version of this block was guarded with #if 0 and
+                 * used vaddvq_s32 on the vmmlaq result, which double-counts the
+                 * duplicated lanes ([d0,d0,d1,d1]) -- that is why it was
+                 * disabled. Lanes 0+3 are summed explicitly here. */
                 int32_t sub_sums[8] = {0};
                 for (int j = 0; j < 4; j++) {
                     const uint8x16_t q4a = vld1q_u8(q4);
@@ -2698,14 +2704,18 @@ static void sgemm_q4k_q8k_neon(int m, int n, int k_blocks,
                     const int8x16_t q8b = vld1q_s8(q8); q8 += 16;
                     int32x4_t s0 = vmmlaq_s32(vdupq_n_s32(0), q4lo_a, q8a);
                     int32x4_t s1 = vmmlaq_s32(vdupq_n_s32(0), q4lo_b, q8b);
-                    sub_sums[j*2] += vaddvq_s32(vaddq_s32(s0, s1)) * scales8[j*2];
+                    /* vmmlaq_s32 lanes are [d0,d0,d1,d1]: lanes 0 and 3 are the two
+                     * 8-value halves of the 16-value dot, so sum those two. */
+                    sub_sums[j*2] += (vgetq_lane_s32(s0,0)+vgetq_lane_s32(s0,3)
+                                    + vgetq_lane_s32(s1,0)+vgetq_lane_s32(s1,3)) * scales8[j*2];
 
                     /* Sub-block j*2+1: high nibbles vs q8[64*j+32 .. 64*j+63] */
                     const int8x16_t q8c = vld1q_s8(q8); q8 += 16;
                     const int8x16_t q8d = vld1q_s8(q8); q8 += 16;
                     int32x4_t s2 = vmmlaq_s32(vdupq_n_s32(0), q4hi_a, q8c);
                     int32x4_t s3 = vmmlaq_s32(vdupq_n_s32(0), q4hi_b, q8d);
-                    sub_sums[j*2+1] += vaddvq_s32(vaddq_s32(s2, s3)) * scales8[j*2+1];
+                    sub_sums[j*2+1] += (vgetq_lane_s32(s2,0)+vgetq_lane_s32(s2,3)
+                                      + vgetq_lane_s32(s3,0)+vgetq_lane_s32(s3,3)) * scales8[j*2+1];
                 }
 
                 int32_t total = 0;
@@ -3250,9 +3260,9 @@ int picolm_sgemm_d_q4k(int m, int n, int k_blocks_q4k,
                      (const block_q8_K*)B, ldb_q8k, C, ldc, ith, nth);
     return 1;
 #elif defined(__ARM_NEON)
-    /* TODO: I8MM path inside sgemm_q4k_q8k_neon is #if 0 (untested).
-     * Only the basic NEON (vmull_s8) path is active and tested.
-     * Enable I8MM (#if 1) once validated on ARM hardware with __ARM_FEATURE_MATMUL_INT8. */
+    /* sgemm_q4k_q8k_neon picks I8MM (vmmlaq_s32) when the target has
+     * __ARM_FEATURE_MATMUL_INT8, DOTPROD is not used there, and falls back to
+     * basic NEON (vmull_s8) otherwise. */
     if (m < 1 || n < 1 || k_blocks_q4k < 1)
         return 0;
     sgemm_q4k_q8k_neon(m, n, k_blocks_q4k, (const block_q4_K*)A, lda_q4k,

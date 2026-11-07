@@ -69,6 +69,28 @@ int sgemm_iq4_k_r4_q8_k_avx2(int nrows, int ncols, int k,
         const void *vx, const void *vy, float *out, size_t bs,
         int ith, int nth);
 
+/* Q6_K x Q8_K tiled NEON GEMM (ARM): same ABI as the sgemm_*_best() table fns. */
+int sgemm_q6_k_q8_k_neon(int nrows, int ncols, int k,
+        const void *vx, const void *vy, float *out, size_t bs,
+        int ith, int nth);
+
+/* Q3_K x Q8_K tiled NEON GEMM (ARM). */
+int sgemm_q3_k_q8_k_neon(int nrows, int ncols, int k,
+        const void *vx, const void *vy, float *out, size_t bs,
+        int ith, int nth);
+
+/* Q4_K x Q8_K NEON GEMM adapter with the sgemm_*_best() table ABI
+ * (wraps picolm_sgemm_d_q4k so Q4_K can take the fused dual-GEMM path). */
+int sgemm_q4_k_q8_k_best_neon(int nrows, int ncols, int k,
+        const void *vx, const void *vy, float *out, size_t bs,
+        int ith, int nth);
+
+/* Q2_K x Q8_K tiled NEON GEMM (ARM): C[ncols][nrows] = act @ W^T.
+ * Same ABI as the sgemm_*_best() table functions. Returns rows computed. */
+int sgemm_q2_k_q8_k_neon(int nrows, int ncols, int k,
+        const void *vx, const void *vy, float *out, size_t bs,
+        int ith, int nth);
+
 /* IQ4_XS x Q8_K tiled GEMM (AVX2): C[n][m] = B[n][k] @ A^T[m][k]
  * m = weight rows (d), n = activation rows (n_batch)
  * k_blocks_q4xs = k / 256 (number of block_iq4_xs per row) */
