@@ -1380,6 +1380,19 @@ static int attn_k8_ok(void) {
     return ok;
 }
 
+/* Which QK path will really run, for the [BATCH-ATTN] log line. (The old label
+ * reported attn_q8r8_ok(head_dim), i.e. "int8" even for the exact F16 GEMM.) */
+static const char *attn_qk_label(int tiled, int kv_type_k, int head_dim) {
+    if (!tiled) return "-";
+    gguf_type_t g;
+    int m = attn_choose_qk_mode(kv_type_k, head_dim, &g);
+    if (m == ATTN_QK_Q8R8) return "q8r8";
+    if (m == ATTN_QK_SGEMM_F32) return "f32";
+    if (kv_type_k == (int)KV_CACHE_F16 && attn_k8_requested() && attn_k8_ok() &&
+        head_dim % 32 == 0 && head_dim <= ATTN_K8_MAX_HD) return "i8-shadow";
+    return "f16-gemm";
+}
+
 typedef struct {
     const uint8_t *kcache;
     size_t row_stride, head_stride;
@@ -1467,6 +1480,7 @@ typedef struct {
     block_q8_0 *k8_rows;        /* [tile_size x head_dim/32] plain Q8_0 K rows (QK_Q8R8) */
     block_q8_0_r8 *k8r8;        /* [head_dim/32] Q8_0_R8 group of k8_rows (QK_Q8R8) */
     const block_q8_0_r8 *k8_shadow_tile; /* prebuilt Q8_0_R8 K tile (int8 shadow), or NULL */
+    int v_sm;               /* tile_v_f32 is slice-major [hd/16][ts][16] (AVX-512 PV only) */
     float *M;               /* [n_q_rows] running max */
     float *S;               /* [n_q_rows] running sum_exp */
     float *acc;             /* [n_q_rows x head_dim] running accumulator */
@@ -1478,6 +1492,91 @@ typedef struct {
 
 /* Defined after attn_process_tile (the F16/Q8R8/F32 K-tile builder). */
 static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32);
+
+/* Force complete unrolling of the fixed-size accumulator loops in the PV
+ * kernel. attn_process_tile() is inlined into the huge batch_tiled_task(), and
+ * there GCC leaves the 16-row loops rolled, which keeps `__m512 acc[16]` in a
+ * stack array: every FMA then becomes load + FMA + store through memory
+ * (~0.65 FMA/cycle measured vs ~1.5+ when the accumulators live in zmm
+ * registers). Unrolled, SRA scalarizes the array into registers. Arithmetic
+ * and accumulation order are unchanged, so results are bit-identical. */
+#if defined(__clang__)
+#define ATTN_UNROLL16 _Pragma("unroll 16")
+#elif defined(__GNUC__)
+#define ATTN_UNROLL16 _Pragma("GCC unroll 16")
+#else
+#define ATTN_UNROLL16
+#endif
+
+#if defined(PICOLM_AVX512)
+#define ATTN_ALWAYS_INLINE inline always_inline   /* project macro, see quant.h */
+
+/* PV multiply for a slice-major V tile: acc[q][d] += sum_j p[q][j] * V[j][d].
+ *
+ * V is stored [hd/16][ts][16]: each 16-float head-dim slice is one contiguous
+ * ts*64-byte block (4 KB at ts=64). The row-major layout had a 1 KB row
+ * stride, so the 64 lines of a slice mapped onto only 4 L1 sets (32 lines of
+ * capacity) and were refetched from L2 for every row block. Here the loop
+ * order is row-block outer / head-dim slice inner, so the 16-row score block
+ * (4 KB, contiguous) stays in L1 across all hd/16 slices and each slice is a
+ * conflict-free sequential read.
+ *
+ * TS and HD are passed as compile-time constants for the common full-tile
+ * shape (see attn_pv_sm_avx512), which turns every r*TS score offset and the
+ * accumulator row stride into immediates: with runtime values the 16 broadcast
+ * loads need 15 live stride multiples and GCC runs out of GPRs.
+ *
+ * Accumulation per output element is still a single ascending-j FMA chain, so
+ * results are bit-identical to the row-major kernel. */
+static ATTN_ALWAYS_INLINE void attn_pv_sm_body(float *accp, const float *scores,
+                                               const float *v_tile, int n_q,
+                                               const int TS, const int HD) {
+    const int n_blk = HD / 16;
+    int r0 = 0;
+    for (; r0 + 16 <= n_q; r0 += 16) {
+        const float *sb = scores + (size_t)r0 * TS;
+        float *ap = accp + (size_t)r0 * HD;
+        for (int db = 0; db < n_blk; db++) {
+            const float *vb = v_tile + (size_t)db * TS * 16;
+            __m512 a[16];
+            ATTN_UNROLL16
+            for (int r = 0; r < 16; r++) a[r] = _mm512_loadu_ps(ap + (size_t)r * HD + db * 16);
+            for (int j = 0; j < TS; j++) {
+                __m512 vv = _mm512_loadu_ps(vb + (size_t)j * 16);
+                ATTN_UNROLL16
+                for (int r = 0; r < 16; r++)
+                    a[r] = _mm512_fmadd_ps(vv, _mm512_set1_ps(sb[(size_t)r * TS + j]), a[r]);
+            }
+            ATTN_UNROLL16
+            for (int r = 0; r < 16; r++) _mm512_storeu_ps(ap + (size_t)r * HD + db * 16, a[r]);
+        }
+    }
+    if (r0 < n_q) {                         /* fewer than 16 rows left: runtime row count */
+        const int rn = n_q - r0;
+        const float *sb = scores + (size_t)r0 * TS;
+        float *ap = accp + (size_t)r0 * HD;
+        for (int db = 0; db < n_blk; db++) {
+            const float *vb = v_tile + (size_t)db * TS * 16;
+            __m512 a[16];
+            for (int r = 0; r < rn; r++) a[r] = _mm512_loadu_ps(ap + (size_t)r * HD + db * 16);
+            for (int j = 0; j < TS; j++) {
+                __m512 vv = _mm512_loadu_ps(vb + (size_t)j * 16);
+                for (int r = 0; r < rn; r++)
+                    a[r] = _mm512_fmadd_ps(vv, _mm512_set1_ps(sb[(size_t)r * TS + j]), a[r]);
+            }
+            for (int r = 0; r < rn; r++) _mm512_storeu_ps(ap + (size_t)r * HD + db * 16, a[r]);
+        }
+    }
+}
+
+static void attn_pv_sm_avx512(float *accp, const float *scores, const float *v_tile,
+                              int n_q, int ts, int hd) {
+    if (ts == ATTN_TILE && hd == 256)       attn_pv_sm_body(accp, scores, v_tile, n_q, ATTN_TILE, 256);
+    else if (ts == ATTN_TILE && hd == 128)  attn_pv_sm_body(accp, scores, v_tile, n_q, ATTN_TILE, 128);
+    else if (ts == ATTN_TILE && hd == 64)   attn_pv_sm_body(accp, scores, v_tile, n_q, ATTN_TILE, 64);
+    else                                    attn_pv_sm_body(accp, scores, v_tile, n_q, ts, hd);
+}
+#endif
 
 /* Context for the parallel tiled attention: one instance shared by all
  * concurrent tasks. Each task gets its own scratch slice from scratch_pool. */
@@ -1673,6 +1772,11 @@ static void batch_tiled_task(int task_idx, void *ctx_ptr) {
             }
         }
 
+#if defined(PICOLM_AVX512)
+        const int v_sm = (head_dim % 16 == 0 && head_dim <= 512);
+#else
+        const int v_sm = 0;
+#endif
         /* Extract V-tile and dequantize to F32 */
         {
             size_t rb = bc->kv_row_size_v;
@@ -1683,8 +1787,31 @@ static void batch_tiled_task(int task_idx, void *ctx_ptr) {
                 /* TQ caches have no GGUF equivalent (gguf_v is F16); decode
                  * them with the inverse WHT like the reference paths do. */
                 if (bc->kv_type_v == KV_CACHE_TQ3 || bc->kv_type_v == KV_CACHE_TQ4) {
-                    ad_deq_tq_row(src, tile_v_f32 + (size_t)p * head_dim,
-                                  head_dim, bc->kv_type_v == KV_CACHE_TQ4, 1);
+                    if (v_sm) {
+                        /* Dequant to rowbuf, then rearrange into slice-major.
+                         * The TQ dequant is scalar anyway, so the rearrange is free. */
+                        float tq_buf[512];
+                        ad_deq_tq_row(src, tq_buf, head_dim, bc->kv_type_v == KV_CACHE_TQ4, 1);
+                        for (int db = 0; db < head_dim / 16; db++)
+                            memcpy(tile_v_f32 + ((size_t)db * this_tile_size + p) * 16,
+                                   tq_buf + (size_t)db * 16, 16 * sizeof(float));
+                    } else {
+                        ad_deq_tq_row(src, tile_v_f32 + (size_t)p * head_dim,
+                                      head_dim, bc->kv_type_v == KV_CACHE_TQ4, 1);
+                    }
+#if defined(PICOLM_AVX512)
+                } else if (v_sm && bc->gguf_v == GGUF_TYPE_F16) {
+                    /* f16 -> f32 straight into the slice-major layout. */
+                    for (int db = 0; db < head_dim / 16; db++)
+                        _mm512_storeu_ps(tile_v_f32 + ((size_t)db * this_tile_size + p) * 16,
+                            _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(src + (size_t)db * 32))));
+                } else if (v_sm) {
+                    float rowbuf[512];
+                    dequantize_row(src, rowbuf, head_dim, bc->gguf_v);
+                    for (int db = 0; db < head_dim / 16; db++)
+                        memcpy(tile_v_f32 + ((size_t)db * this_tile_size + p) * 16,
+                               rowbuf + (size_t)db * 16, 16 * sizeof(float));
+#endif
                 } else {
                     dequantize_row(src, tile_v_f32 + (size_t)p * head_dim,
                                    head_dim, bc->gguf_v);
@@ -1718,6 +1845,7 @@ static void batch_tiled_task(int task_idx, void *ctx_ptr) {
         task.q8_delta = q8_delta;
         task.k8_rows = k8_rows;
         task.k8r8 = k8r8;
+        task.v_sm = v_sm;
         task.k8_shadow_tile = use_sh
             ? (const block_q8_0_r8 *)(bc->k8_shadow + ((size_t)kv_h * bc->n_full_tiles + tk) * bc->k8_tile_bytes)
             : NULL;
@@ -1905,7 +2033,7 @@ void batch_attention_layer(
                     n_tokens, start_pos, n_heads, n_kv_heads, head_dim, xb_stride,
                     kv_type_k, kv_type_v, kv_row_size_k, kv_row_size_v,
                     kv_head_stride_k, kv_head_stride_v, attn_scale, n_swa, _use_tiled,
-                    _use_tiled ? (attn_q8r8_ok(head_dim) ? "int8" : "f32") : "-");
+                    attn_qk_label(_use_tiled, kv_type_k, head_dim));
         }
     }
     if (_use_tiled) {
@@ -2479,6 +2607,9 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
     {
         const float *v_tile = t->tile_v_f32;
 #if defined(PICOLM_AVX512)
+        if (t->v_sm) {
+            attn_pv_sm_avx512(t->acc, t->scores, v_tile, n_q, ts, hd);
+        } else
         {
             const int D_BLK = 16;                 /* floats per zmm */
             const int n_blk = hd / D_BLK;         /* complete 16-float slices */
@@ -2493,6 +2624,7 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
                 const float *__v = v_tile + (size_t)OFF;                          \
                 for (int j = 0; j < ts; j++) {                                   \
                     __m512 vv = _mm512_loadu_ps(__v + (size_t)j * hd);           \
+                    ATTN_UNROLL16                                                \
                     for (int r = 0; r < (RN); r++)                               \
                         ACC[r] = _mm512_fmadd_ps(                                 \
                             vv, _mm512_set1_ps(SBASE[(size_t)r * ts + j]), ACC[r]); \
@@ -2509,10 +2641,12 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
                  * (perf: 11.3% of the function on one cmp). */
                 for (; r0 + R_MAX <= n_q; r0 += R_MAX) {
                     __m512 acc[R_MAX];
+                    ATTN_UNROLL16
                     for (int r = 0; r < R_MAX; r++)
                         acc[r] = _mm512_loadu_ps(t->acc + (size_t)(r0 + r) * hd + off);
                     const float *sbase = t->scores + (size_t)r0 * ts;
                     ATTN_PV_BLOCK(acc, R_MAX, sbase, off);
+                    ATTN_UNROLL16
                     for (int r = 0; r < R_MAX; r++)
                         _mm512_storeu_ps(t->acc + (size_t)(r0 + r) * hd + off, acc[r]);
                 }
@@ -2547,7 +2681,14 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
         }
 #elif defined(PICOLM_AVX2) && defined(__FMA__)
         /* AVX2 row-blocked PV multiply: 8-wide FMA, up to 4 rows at a time.
-         * V[j] loaded once per j and reused across R rows. */
+         * V[j] loaded once per j and reused across R rows.
+         *
+         * TODO(slice-major): A [hd/8][ts][8] layout with row-block outer /
+         * head-dim slice inner would reduce L1 conflicts (8 floats = 0.5
+         * cache line stride vs 1.0 for row-major hd=256). Also benefits from
+         * the unroll pragma (avoids stack-based __m256 acc[] when inlined into
+         * batch_tiled_task). The AVX-512 version showed 1.4-1.6x speedup.
+         * Extract path would use _mm256_cvtph_ps for F16, rowbuf for others. */
         {
             const int D_BLK = 8;
             const int n_blk = hd / D_BLK;
@@ -2597,7 +2738,9 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
             }
         }
 #elif defined(PICOLM_AVX) && defined(__FMA__)
-        /* AVX FMA row-blocked PV multiply: 8-wide FMA, up to 4 rows. */
+        /* AVX FMA row-blocked PV multiply: 8-wide FMA, up to 4 rows.
+         *
+         * TODO(slice-major): Same prospect as AVX2 above. See that comment. */
         {
             const int D_BLK = 8;
             const int n_blk = hd / D_BLK;
@@ -2649,7 +2792,12 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
 #else
         /* The row-blocked AVX-512 form above needs 512-bit registers to be
          * worth it; on other targets keep the simple per-row loop. V is still
-         * read once per row here, which is what those builds did before. */
+         * read once per row here, which is what those builds did before.
+         *
+         * TODO(slice-major): NEON could use [hd/4][ts][4] layout with vld1q_f32
+         * and vmlaq_f32. Extract path: vcvt_f32_f16 for F16, dequantize_row +
+         * memcpy for others. The scalar loop here would also benefit from a
+         * row-blocked form (4 rows at a time) to reduce the V load count. */
         for (int r = 0; r < n_q; r++) {
             const float *srow = t->scores + (size_t)r * ts;
             float *acc_row = t->acc + (size_t)r * hd;
