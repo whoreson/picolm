@@ -6586,8 +6586,9 @@ float vec_dot_q2_0_q8_0(const void *vx, const void *wy, int n) {
         const __m128i idxhi   = _mm_setr_epi8(4,4,4,4,5,5,5,5,6,6,6,6,7,7,7,7);
         const __m128i ones_16 = _mm_set1_epi16(1);
         const __m128i ones_8  = _mm_set1_epi8(1);
-        const __m128i mul     = _mm_setr_epi16(64,16,4,1, 64,16,4,1, 0,0,0,0, 0,0,0,0);
-        const __m128i mulhi   = _mm_setr_epi16(0,0,0,0, 0,0,0,0, 64,16,4,1, 64,16,4,1);
+        const __m128i mulhi_s = _mm_setr_epi16(64,16,4,1, 64,16,4,1);
+        const __m128i mul   = mulhi_s;  /* [64,16,4,1, 64,16,4,1] in low 8 */
+        const __m128i mulhi = _mm_slli_si128(mulhi_s, 8);  /* [0,0,0,0, 0,0,0,0, 64,16,4,1, 64,16,4,1] */
         const __m128i three   = _mm_set1_epi16(3);
         __m256 acc = _mm256_setzero_ps();
 

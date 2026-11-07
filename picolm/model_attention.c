@@ -2316,6 +2316,14 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
                 for (int d = (hd / 8) * 8; d < hd; d++)
                     acc_row[d] *= corr;
             }
+#elif defined(PICOLM_AVX)
+            {
+                __m256 vc = _mm256_set1_ps(corr);
+                for (int d = 0; d + 7 < hd; d += 8)
+                    _mm256_storeu_ps(acc_row + d, _mm256_mul_ps(_mm256_loadu_ps(acc_row + d), vc));
+                for (int d = (hd / 8) * 8; d < hd; d++)
+                    acc_row[d] *= corr;
+            }
 #else
             for (int d = 0; d < hd; d++)
                 acc_row[d] *= corr;
@@ -2578,6 +2586,56 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
                 }
             }
             /* Scalar tail for hd % 8 != 0 */
+            for (int d = n_blk * D_BLK; d < hd; d++) {
+                for (int r = 0; r < n_q; r++) {
+                    const float *srow = t->scores + (size_t)r * ts;
+                    float a = t->acc[(size_t)r * hd + d];
+                    for (int j = 0; j < ts; j++)
+                        a += srow[j] * v_tile[(size_t)j * hd + d];
+                    t->acc[(size_t)r * hd + d] = a;
+                }
+            }
+        }
+#elif defined(PICOLM_AVX) && defined(__FMA__)
+        /* AVX FMA row-blocked PV multiply: 8-wide FMA, up to 4 rows. */
+        {
+            const int D_BLK = 8;
+            const int n_blk = hd / D_BLK;
+            const int R_MAX = 4;
+            for (int db = 0; db < n_blk; db++) {
+                const int off = db * D_BLK;
+                int r0 = 0;
+                for (; r0 + R_MAX <= n_q; r0 += R_MAX) {
+                    __m256 acc[R_MAX];
+                    for (int r = 0; r < R_MAX; r++)
+                        acc[r] = _mm256_loadu_ps(t->acc + (size_t)(r0 + r) * hd + off);
+                    for (int j = 0; j < ts; j++) {
+                        __m256 vv = _mm256_loadu_ps(v_tile + (size_t)j * hd + off);
+                        for (int r = 0; r < R_MAX; r++) {
+                            float s = t->scores[(size_t)(r0 + r) * ts + j];
+                            acc[r] = _mm256_fmadd_ps(vv, _mm256_set1_ps(s), acc[r]);
+                        }
+                    }
+                    for (int r = 0; r < R_MAX; r++)
+                        _mm256_storeu_ps(t->acc + (size_t)(r0 + r) * hd + off, acc[r]);
+                }
+                if (r0 < n_q) {
+                    int rn = n_q - r0;
+                    __m256 acc[R_MAX];
+                    for (int r = 0; r < rn; r++)
+                        acc[r] = _mm256_loadu_ps(t->acc + (size_t)(r0 + r) * hd + off);
+                    for (int j = 0; j < ts; j++) {
+                        __m256 vv = _mm256_loadu_ps(v_tile + (size_t)j * hd + off);
+                        for (int r = 0; r < rn; r++) {
+                            float s = t->scores[(size_t)(r0 + r) * ts + j];
+                            acc[r] = _mm256_fmadd_ps(vv, _mm256_set1_ps(s), acc[r]);
+                        }
+                    }
+                    for (int r = 0; r < rn; r++)
+                        _mm256_storeu_ps(t->acc + (size_t)(r0 + r) * hd + off, acc[r]);
+                }
+            }
+            /* Scalar tail */
             for (int d = n_blk * D_BLK; d < hd; d++) {
                 for (int r = 0; r < n_q; r++) {
                     const float *srow = t->scores + (size_t)r * ts;
