@@ -1571,6 +1571,18 @@ int sgemm_iq4_k_r4_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const v
 int sgemm_iq4_k_r4_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
 int sgemm_iq4_k_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
 int sgemm_iq4_k_r4_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_iq2_k_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_iq2_k_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_iq3_k_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_iq3_k_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_iq2_k_r4_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_iq2_k_r4_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_iq3_k_r4_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_iq3_k_r4_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_iq2_k_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_iq3_k_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_iq2_k_r4_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_iq3_k_r4_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
 int sgemm_iq6_k_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy,
                           float *out, size_t bs, int ith, int nth);   /* r8t when worthwhile, else tile kernel; always computes */
 /* IQ6_K plain x Q8_K ARM NEON GEMV/GEMM. */

@@ -29,6 +29,10 @@ static void deq_q4_k_r4(const void *x, float *dst, int n, int row){ dequantize_r
 static void deq_q6_k_r4(const void *x, float *dst, int n, int row){ float *tmp=malloc(sizeof(float)*4*n); dequantize_row_q6_K_R4(x,tmp,n); memcpy(dst,tmp+(size_t)row*n,sizeof(float)*n); free(tmp); }
 static void deq_iq4_k(const void *x, float *dst, int n, int row){ (void)row; dequantize_row_iq4_k(x,dst,n); }
 static void deq_iq4_k_r4(const void *x, float *dst, int n, int row){ dequantize_row_iq4_k_r4_single((const block_iq4_k_r4*)x,dst,n,row); }
+static void deq_iq2_k(const void *x, float *dst, int n, int row){ (void)row; dequantize_row_iq2_k(x,dst,n); }
+static void deq_iq3_k(const void *x, float *dst, int n, int row){ (void)row; dequantize_row_iq3_k(x,dst,n); }
+static void deq_iq2_k_r4(const void *x, float *dst, int n, int row){ dequantize_row_iq2_k_r4_single((const block_iq2_k_r4*)x,dst,n,row); }
+static void deq_iq3_k_r4(const void *x, float *dst, int n, int row){ dequantize_row_iq3_k_r4_single((const block_iq3_k_r4*)x,dst,n,row); }
 static int check_one(const it_t*q, deq_fn deq, int m, int n, int k, int nth){
     int nb=k/256; size_t groups=(size_t)m/q->rows, wbytes=groups*nb*q->bsz; unsigned char*W=malloc(wbytes);
     for(size_t i=0;i<wbytes;i++) W[i]=(unsigned char)rnd();
@@ -48,8 +52,9 @@ int main(int argc,char**argv){
     setenv("PICOLM_R8_MIN_BLOCKS","0",0);
     if(argc>1&&!strcmp(argv[1],"check")){ int bad=0,cnt=0; fp16_table_init();
         int ms[]={8,16,24,72,136,12,20}, ns[]={4,15,16,17,33,130}, ks[]={256,512,1280}, nts[]={1,3,5};
-        struct { const char*name; deq_fn deq; } T[]={{"q4_k_r4",deq_q4_k_r4},{"q6_K_r4",deq_q6_k_r4},{"iq4_k",deq_iq4_k},{"iq4_k_r4",deq_iq4_k_r4}};
-        for(unsigned ty=0;ty<sizeof T/sizeof*T;ty++){ const it_t*q=NULL; for(unsigned i=0;i<sizeof IT/sizeof*IT;i++) if(!strcmp(IT[i].name,T[ty].name)) q=&IT[i];
+        struct { const char*name; deq_fn deq; } T[]={{"q4_k_r4",deq_q4_k_r4},{"q6_K_r4",deq_q6_k_r4},{"iq4_k",deq_iq4_k},{"iq4_k_r4",deq_iq4_k_r4},{"iq2_k",deq_iq2_k},{"iq3_k",deq_iq3_k},{"iq2_k_r4",deq_iq2_k_r4},{"iq3_k_r4",deq_iq3_k_r4}};
+        const char*only=getenv("IK_ONLY");   /* optional comma list of type names, e.g. IK_ONLY=iq2_k,iq3_k_r4 */
+        for(unsigned ty=0;ty<sizeof T/sizeof*T;ty++){ if(only){ char pat[64]; snprintf(pat,sizeof pat,",%s,",T[ty].name); char all[512]; snprintf(all,sizeof all,",%s,",only); if(!strstr(all,pat)) continue; } const it_t*q=NULL; for(unsigned i=0;i<sizeof IT/sizeof*IT;i++) if(!strcmp(IT[i].name,T[ty].name)) q=&IT[i];
             for(unsigned a=0;a<7;a++)for(unsigned bb=0;bb<6;bb++)for(unsigned c=0;c<3;c++)for(unsigned d=0;d<3;d++){ bad|=check_one(q,T[ty].deq,ms[a],ns[bb],ks[c],nts[d]); cnt++; } }
         printf("check: %d shapes, %s\n",cnt,bad?"FAIL":"all OK"); return bad; }
     int m=argc>1?atoi(argv[1]):1024, n=argc>2?atoi(argv[2]):256, k=argc>3?atoi(argv[3]):4096, reps=argc>4?atoi(argv[4]):2; int nb=k/256;
