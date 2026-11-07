@@ -1367,13 +1367,13 @@ static int attn_k8_vnni_ok(void) {
     return ok;
 }
 
-/* Probe once: is any R8 kernel available (VNNI or AVX2)? */
+/* Probe once: is any R8 kernel available (VNNI or AVX2 or AVX)? */
 static int attn_k8_ok(void) {
     static int ok = -1;
     if (ok < 0) {
         ok = attn_k8_vnni_ok() ? 1 : 0;
-        /* AVX2 R8 is always available in an AVX2 build */
-#ifdef __AVX2__
+        /* AVX2 and AVX R8 are always available in those builds */
+#if defined(__AVX2__) || defined(__AVX__)
         if (!ok) ok = 1;
 #endif
     }
@@ -2161,8 +2161,8 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
             if (sgemm_q8_0_r8_vnni_q8_0(ts, n_q, hd, t->k8_shadow_tile, t->q8_rows,
                                         t->scores, (size_t)ts, 0, 1))
                 break;
-#ifdef __AVX2__
-            /* VNNI unavailable (e.g. AVX2-only build): fall back to AVX2 R8. */
+#if defined(__AVX2__) || defined(__AVX__)
+            /* VNNI unavailable: fall back to AVX2/AVX R8. */
             if (sgemm_q8_0_r8_q8_0_avx2(ts, n_q, hd, t->k8_shadow_tile, t->q8_rows,
                                         t->scores, (size_t)ts, 0, 1))
                 break;

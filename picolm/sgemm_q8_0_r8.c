@@ -338,6 +338,215 @@ int sgemm_q8_0_r8_q8_0_avx2(int nrows, int ncols, int k,
                                      out, bs, ith, nth);
 }
 
+#elif defined(__AVX__) && defined(__F16C__) && defined(__FMA__)
+/* ================================================================
+ * AVX1 + FMA + F16C R8 kernels.
+ *
+ * Same ABI as the AVX2 version above. The gemv_r8_block uses two
+ * 128-bit maddubs+madd pairs per chunk (AVX1 lacks 256-bit
+ * maddubs_epi16), merged into __m256i with insertf128.
+ * ================================================================ */
+static inline __m256i gemv_r8_block_avx(const block_q8_0_r8 *w, const block_q8_0 *q) {
+    const __m128i m1 = _mm_set1_epi16(1);
+    const __m128i y4l = _mm_loadu_si128((const __m128i *)(q->qs));
+    const __m128i y4h = _mm_loadu_si128((const __m128i *)(q->qs + 16));
+    __m128i sumi_l = _mm_setzero_si128(), sumi_h = _mm_setzero_si128();
+    /* Each of the 8 chunks is 32 bytes = 2 x __m128i.
+     * wq[c] = low 16 bytes of chunk c, wq[c+1] = high 16 bytes. */
+    const int8_t *wq = w->qs;
+#define R8_CHUNK(c, yb) do { \
+        __m128i wv0 = _mm_loadu_si128((const __m128i*)(wq + (c)*32)); \
+        __m128i wv1 = _mm_loadu_si128((const __m128i*)(wq + (c)*32 + 16)); \
+        __m128i p0 = _mm_sign_epi8(wv0, wv0); \
+        __m128i s0 = _mm_sign_epi8(yb, wv0); \
+        sumi_l = _mm_add_epi32(sumi_l, _mm_madd_epi16(m1, _mm_maddubs_epi16(p0, s0))); \
+        __m128i p1 = _mm_sign_epi8(wv1, wv1); \
+        __m128i s1 = _mm_sign_epi8(yb, wv1); \
+        sumi_h = _mm_add_epi32(sumi_h, _mm_madd_epi16(m1, _mm_maddubs_epi16(p1, s1))); \
+    } while(0)
+    /* First half: 4 chunks, broadcast from yl */
+    R8_CHUNK(0, _mm_shuffle_epi32(y4l, _MM_SHUFFLE(0,0,0,0)));
+    R8_CHUNK(1, _mm_shuffle_epi32(y4l, _MM_SHUFFLE(1,1,1,1)));
+    R8_CHUNK(2, _mm_shuffle_epi32(y4l, _MM_SHUFFLE(2,2,2,2)));
+    R8_CHUNK(3, _mm_shuffle_epi32(y4l, _MM_SHUFFLE(3,3,3,3)));
+    /* Second half: 4 chunks, broadcast from yh */
+    R8_CHUNK(4, _mm_shuffle_epi32(y4h, _MM_SHUFFLE(0,0,0,0)));
+    R8_CHUNK(5, _mm_shuffle_epi32(y4h, _MM_SHUFFLE(1,1,1,1)));
+    R8_CHUNK(6, _mm_shuffle_epi32(y4h, _MM_SHUFFLE(2,2,2,2)));
+    R8_CHUNK(7, _mm_shuffle_epi32(y4h, _MM_SHUFFLE(3,3,3,3)));
+#undef R8_CHUNK
+    return _mm256_insertf128_si256(_mm256_castsi128_si256(sumi_l), sumi_h, 1);
+}
+
+void vec_dot_q8_0_r8_q8_0_d_avx2(const void *vx, const void *wy, const float *q_d,
+                                 int n, float *out, int nrows) {
+    assert(nrows == 8);
+    assert(n % 32 == 0);
+    if (!vx || !wy || !out) { for (int r = 0; r < nrows; r++) out[r] = 0; return; }
+
+    const block_q8_0_r8 *w8 = (const block_q8_0_r8 *)vx;
+    const block_q8_0 *qy = (const block_q8_0 *)wy;
+    const int nb = n / 32;
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int ib = 0; ib < nb; ib++) {
+        __m128 w_lo = _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *)w8[ib].d));
+        __m128 w_hi = _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *)(w8[ib].d + 4)));
+        __m256 w_scales = _mm256_insertf128_ps(_mm256_castps128_ps256(w_lo), w_hi, 1);
+        const float y_scale = q_d ? q_d[ib] : fp16_to_fp32_lookup(qy[ib].d);
+        __m256i sumi = gemv_r8_block_avx(w8 + ib, qy + ib);
+        __m256 dot_f = _mm256_cvtepi32_ps(sumi);
+        __m256 scaled = _mm256_mul_ps(dot_f, w_scales);
+        acc = _mm256_fmadd_ps(scaled, _mm256_set1_ps(y_scale), acc);
+    }
+
+    _mm256_storeu_ps(out, acc);
+}
+
+int sgemm_q8_0_r8_q8_0_d_avx2(int nrows, int ncols, int k,
+                              const void *vx, const void *vy,
+                              const float *vy_d, int vy_d_stride,
+                              float *out, size_t bs, int ith, int nth) {
+    if (nrows < 8 || ncols < 1 || k % 32 != 0 || nrows % 8 != 0)
+        return 0;
+
+    const int nb = k / 32;
+    const block_q8_0_r8 *w8 = (const block_q8_0_r8 *)vx;
+    const size_t a_stride = (size_t)nb * sizeof(block_q8_0);
+    const size_t w_stride = (size_t)nb * sizeof(block_q8_0_r8);
+
+    const int ncols_per_thread = (ncols + nth - 1) / nth;
+    const int col_start = ith * ncols_per_thread;
+    const int col_end = (ith + 1) * ncols_per_thread < ncols ? (ith + 1) * ncols_per_thread : ncols;
+
+    {
+        const int total_groups = nrows / 8;
+        const int groups_per_thread = (total_groups + nth - 1) / nth;
+        const int g_start = ith * groups_per_thread;
+        const int g_end = (ith + 1) * groups_per_thread < total_groups ?
+                          (ith + 1) * groups_per_thread : total_groups;
+
+        for (int w8_idx = g_start; w8_idx < g_end; w8_idx++) {
+            const block_q8_0_r8 *w_base = (const block_q8_0_r8 *)
+                ((const char *)vx + (size_t)w8_idx * w_stride);
+            int c = 0;
+            for (; c + 3 < ncols; c += 4) {
+                const block_q8_0 *qy0 = (const block_q8_0 *)((const char *)vy + (size_t)(c+0) * a_stride);
+                const block_q8_0 *qy1 = (const block_q8_0 *)((const char *)vy + (size_t)(c+1) * a_stride);
+                const block_q8_0 *qy2 = (const block_q8_0 *)((const char *)vy + (size_t)(c+2) * a_stride);
+                const block_q8_0 *qy3 = (const block_q8_0 *)((const char *)vy + (size_t)(c+3) * a_stride);
+                __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+                __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
+                for (int ib = 0; ib < nb; ib++) {
+                    __m128 w_lo = _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *)w_base[ib].d));
+                    __m128 w_hi = _mm_cvtph_ps(_mm_loadl_epi64((const __m128i *)(w_base[ib].d + 4)));
+                    __m256 ws = _mm256_insertf128_ps(_mm256_castps128_ps256(w_lo), w_hi, 1);
+                    float ys[4];
+                    if (vy_d) {
+                        ys[0] = vy_d[(size_t)(c+0) * vy_d_stride + ib];
+                        ys[1] = vy_d[(size_t)(c+1) * vy_d_stride + ib];
+                        ys[2] = vy_d[(size_t)(c+2) * vy_d_stride + ib];
+                        ys[3] = vy_d[(size_t)(c+3) * vy_d_stride + ib];
+                    } else {
+                        ys[0] = fp16_to_fp32_lookup(qy0[ib].d);
+                        ys[1] = fp16_to_fp32_lookup(qy1[ib].d);
+                        ys[2] = fp16_to_fp32_lookup(qy2[ib].d);
+                        ys[3] = fp16_to_fp32_lookup(qy3[ib].d);
+                    }
+                    __m256i sumi0 = gemv_r8_block_avx(w_base + ib, qy0 + ib);
+                    __m256i sumi1 = gemv_r8_block_avx(w_base + ib, qy1 + ib);
+                    __m256i sumi2 = gemv_r8_block_avx(w_base + ib, qy2 + ib);
+                    __m256i sumi3 = gemv_r8_block_avx(w_base + ib, qy3 + ib);
+                    __m256 d0 = _mm256_mul_ps(_mm256_cvtepi32_ps(sumi0), _mm256_mul_ps(ws, _mm256_set1_ps(ys[0])));
+                    __m256 d1 = _mm256_mul_ps(_mm256_cvtepi32_ps(sumi1), _mm256_mul_ps(ws, _mm256_set1_ps(ys[1])));
+                    __m256 d2 = _mm256_mul_ps(_mm256_cvtepi32_ps(sumi2), _mm256_mul_ps(ws, _mm256_set1_ps(ys[2])));
+                    __m256 d3 = _mm256_mul_ps(_mm256_cvtepi32_ps(sumi3), _mm256_mul_ps(ws, _mm256_set1_ps(ys[3])));
+                    acc0 = _mm256_add_ps(acc0, d0);
+                    acc1 = _mm256_add_ps(acc1, d1);
+                    acc2 = _mm256_add_ps(acc2, d2);
+                    acc3 = _mm256_add_ps(acc3, d3);
+                }
+                _mm256_storeu_ps(out + (size_t)(c+0) * bs + w8_idx * 8, acc0);
+                _mm256_storeu_ps(out + (size_t)(c+1) * bs + w8_idx * 8, acc1);
+                _mm256_storeu_ps(out + (size_t)(c+2) * bs + w8_idx * 8, acc2);
+                _mm256_storeu_ps(out + (size_t)(c+3) * bs + w8_idx * 8, acc3);
+            }
+            for (; c < ncols; c++) {
+                const block_q8_0 *qy = (const block_q8_0 *)
+                    ((const char *)vy + (size_t)c * a_stride);
+                float *out_base = out + (size_t)c * bs + w8_idx * 8;
+                vec_dot_q8_0_r8_q8_0_d_avx2(w_base, qy,
+                    vy_d ? vy_d + (size_t)c * vy_d_stride : NULL,
+                    k, out_base, 8);
+            }
+        }
+    }
+    return (nrows / 8) * 8;
+}
+
+int sgemm_q8_0_r8_q8_0_avx2(int nrows, int ncols, int k,
+                            const void *vx, const void *vy,
+                            float *out, size_t bs, int ith, int nth) {
+    return sgemm_q8_0_r8_q8_0_d_avx2(nrows, ncols, k, vx, vy, NULL, 0,
+                                     out, bs, ith, nth);
+}
+
+/* repack_q8_0_to_q8_0_r8: identical on all platforms, no intrinsics */
+void repack_q8_0_to_q8_0_r8(const void *src, void *dst, int nrows, int n) {
+    if (!src || !dst || nrows <= 0 || n <= 0 || n % 32 != 0 || nrows % 8 != 0) return;
+    const int nb = n / 32;
+    const block_q8_0 *s = (const block_q8_0 *)src;
+    block_q8_0_r8 *d = (block_q8_0_r8 *)dst;
+    for (int g = 0; g < nrows / 8; g++) {
+        const block_q8_0 *sg = s + (size_t)g * 8 * nb;
+        block_q8_0_r8 *dg = d + (size_t)g * nb;
+        for (int ib = 0; ib < nb; ib++) {
+            for (int r = 0; r < 8; r++) dg[ib].d[r] = sg[(size_t)r * nb + ib].d;
+            for (int l = 0; l < 4; l++) {
+                for (int k = 0; k < 8; k++) {
+                    const int8_t *qs = sg[(size_t)k * nb + ib].qs;
+                    for (int i = 0; i < 4; i++) {
+                        dg[ib].qs[32 * l + 4 * k + i]       = qs[4 * l + i];
+                        dg[ib].qs[32 * l + 4 * k + i + 128] = qs[4 * l + i + 16];
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* vec_dot_q8_0_r8_q8_0_avx2: delegates to the _d variant */
+void vec_dot_q8_0_r8_q8_0_avx2(const void *vx, const void *wy, int n,
+                               float *out, int nrows) {
+    assert(nrows == 8);
+    assert(n % 32 == 0);
+    if (!vx || !wy || !out) { for (int r = 0; r < nrows; r++) out[r] = 0; return; }
+    const block_q8_0_r8 *xb = (const block_q8_0_r8 *)vx;
+    const block_q8_0 *y = (const block_q8_0 *)wy;
+    const int nb = n / 32;
+    int groups = nrows / 8;
+    for (int g = 0; g < groups; g++)
+        vec_dot_q8_0_r8_q8_0_d_avx2(xb + (size_t)g * nb, y, NULL, n, out + g * 8, 8);
+    for (int r = groups * 8; r < nrows; r++) {
+        float sumf = 0.0f;
+        for (int ib = 0; ib < nb; ib++) {
+            const float d = fp16_to_fp32(xb[ib].d[r]) * fp16_to_fp32(y[ib].d);
+            const int8_t *qs = xb[ib].qs;
+            const int8_t *ya = y[ib].qs;
+            int sumi = 0;
+            for (int l = 0; l < 4; l++) {
+                const int8_t *q = qs + 32 * l + 4 * r;
+                for (int i = 0; i < 4; i++) {
+                    sumi += (int)q[i] * (int)ya[4 * l + i];
+                    sumi += (int)q[i + 128] * (int)ya[4 * l + i + 16];
+                }
+            }
+            sumf += (float)sumi * d;
+        }
+        out[r] = sumf;
+    }
+}
+
 #elif defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
 /* ================================================================
  * ARM NEON (DOTPROD) for Q8_0_R8: 8-row interleaved Q8_0 x Q8_0.
