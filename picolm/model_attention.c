@@ -1372,8 +1372,8 @@ static int attn_k8_ok(void) {
     static int ok = -1;
     if (ok < 0) {
         ok = attn_k8_vnni_ok() ? 1 : 0;
-        /* AVX2 and AVX R8 are always available in those builds */
-#if defined(__AVX2__) || defined(__AVX__)
+        /* AVX2, AVX and NEON R8 are always available in those builds */
+#if defined(__AVX2__) || defined(__AVX__) || defined(__ARM_NEON) || defined(__ARM_NEON__)
         if (!ok) ok = 1;
 #endif
     }
@@ -2452,6 +2452,14 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
                 for (int d = (hd / 8) * 8; d < hd; d++)
                     acc_row[d] *= corr;
             }
+#elif defined(PICOLM_NEON) || defined(PICOLM_NEON_AARCH64)
+            {
+                float32x4_t vc = vdupq_n_f32(corr);
+                for (int d = 0; d + 3 < hd; d += 4)
+                    vst1q_f32(acc_row + d, vmulq_f32(vld1q_f32(acc_row + d), vc));
+                for (int d = (hd / 4) * 4; d < hd; d++)
+                    acc_row[d] *= corr;
+            }
 #else
             for (int d = 0; d < hd; d++)
                 acc_row[d] *= corr;
@@ -2789,15 +2797,62 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
                 }
             }
         }
+#elif defined(PICOLM_NEON) || defined(PICOLM_NEON_AARCH64)
+        /* NEON row-blocked PV multiply: 4-wide FMA, up to 4 rows at a time.
+         * V[j] loaded once per j and reused across R rows. */
+        {
+            const int D_BLK = 4;
+            const int n_blk = hd / D_BLK;
+            const int R_MAX = 4;
+            for (int db = 0; db < n_blk; db++) {
+                const int off = db * D_BLK;
+                int r0 = 0;
+                for (; r0 + R_MAX <= n_q; r0 += R_MAX) {
+                    float32x4_t acc[R_MAX];
+                    for (int r = 0; r < R_MAX; r++)
+                        acc[r] = vld1q_f32(t->acc + (size_t)(r0 + r) * hd + off);
+                    for (int j = 0; j < ts; j++) {
+                        float32x4_t vv = vld1q_f32(v_tile + (size_t)j * hd + off);
+                        for (int r = 0; r < R_MAX; r++) {
+                            float32x4_t sv = vdupq_n_f32(t->scores[(size_t)(r0 + r) * ts + j]);
+                            acc[r] = vmlaq_f32(acc[r], vv, sv);
+                        }
+                    }
+                    for (int r = 0; r < R_MAX; r++)
+                        vst1q_f32(t->acc + (size_t)(r0 + r) * hd + off, acc[r]);
+                }
+                /* Runtime tail */
+                if (r0 < n_q) {
+                    int rn = n_q - r0;
+                    float32x4_t acc[R_MAX];
+                    for (int r = 0; r < rn; r++)
+                        acc[r] = vld1q_f32(t->acc + (size_t)(r0 + r) * hd + off);
+                    for (int j = 0; j < ts; j++) {
+                        float32x4_t vv = vld1q_f32(v_tile + (size_t)j * hd + off);
+                        for (int r = 0; r < rn; r++) {
+                            float32x4_t sv = vdupq_n_f32(t->scores[(size_t)(r0 + r) * ts + j]);
+                            acc[r] = vmlaq_f32(acc[r], vv, sv);
+                        }
+                    }
+                    for (int r = 0; r < rn; r++)
+                        vst1q_f32(t->acc + (size_t)(r0 + r) * hd + off, acc[r]);
+                }
+            }
+            /* Scalar tail for hd % 4 != 0 */
+            for (int d = n_blk * D_BLK; d < hd; d++) {
+                for (int r = 0; r < n_q; r++) {
+                    const float *srow = t->scores + (size_t)r * ts;
+                    float a = t->acc[(size_t)r * hd + d];
+                    for (int j = 0; j < ts; j++)
+                        a += srow[j] * v_tile[(size_t)j * hd + d];
+                    t->acc[(size_t)r * hd + d] = a;
+                }
+            }
+        }
 #else
         /* The row-blocked AVX-512 form above needs 512-bit registers to be
          * worth it; on other targets keep the simple per-row loop. V is still
-         * read once per row here, which is what those builds did before.
-         *
-         * TODO(slice-major): NEON could use [hd/4][ts][4] layout with vld1q_f32
-         * and vmlaq_f32. Extract path: vcvt_f32_f16 for F16, dequantize_row +
-         * memcpy for others. The scalar loop here would also benefit from a
-         * row-blocked form (4 rows at a time) to reduce the V load count. */
+         * read once per row here, which is what those builds did before. */
         for (int r = 0; r < n_q; r++) {
             const float *srow = t->scores + (size_t)r * ts;
             float *acc_row = t->acc + (size_t)r * hd;

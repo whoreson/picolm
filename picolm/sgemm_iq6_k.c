@@ -34,6 +34,19 @@
 
 /* iq6nl_lut defined in quant.c, declared extern in quant.h */
 
+/* Forward decls for NEON GEMM fallbacks in _best dispatchers */
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+extern int sgemm_iq4_k_r4_q8_k_neon(int nrows, int ncols, int k,
+                                     const void *vx, const void *vy,
+                                     float *out, size_t bs, int ith, int nth);
+extern int sgemm_iq2_k_r4_q8_k_neon(int nrows, int ncols, int k,
+                                     const void *vx, const void *vy,
+                                     float *out, size_t bs, int ith, int nth);
+extern int sgemm_q4_k_r4_q8_k_neon(int nrows, int ncols, int k,
+                                    const void *vx, const void *vy,
+                                    float *out, size_t bs, int ith, int nth);
+#endif
+
 #if defined(__AVX2__)
 
 typedef struct { __m256i l0, l1, l2, l3; } iq6_luts_t;
@@ -1484,7 +1497,14 @@ int sgemm_q4_k_q8_k_fast(int nrows, int ncols, int k_blocks, const void *vx, int
 int sgemm_q4_k_r4_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) {
     int r = kq_fast("sgemm_q4_k_r4_q8_k", sgemm_q4_k_r4_q8_k_r8v, sgemm_q4_k_r4_q8_k_r8t, nrows, ncols, k, vx, vy, out, bs, ith, nth);
     if (r) return r;
+#if defined(__AVX2__) && defined(__F16C__)
     return sgemm_q4_k_r4_q8_k_avx2(nrows, ncols, k, vx, vy, out, bs, ith, nth);
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+    return sgemm_q4_k_r4_q8_k_neon(nrows, ncols, k, vx, vy, out, bs, ith, nth);
+#else
+    (void)nrows; (void)ncols; (void)k; (void)vx; (void)vy; (void)out; (void)bs; (void)ith; (void)nth;
+    return 0;
+#endif
 }
 /* Q6_K_R4 table fn_gemm: decode-once R8 for big shapes, else the original kernel. */
 int sgemm_q6_k_r4_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) {
@@ -1496,33 +1516,76 @@ int sgemm_q6_k_r4_q8_k_best(int nrows, int ncols, int k, const void *vx, const v
 int sgemm_iq4_k_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) {
     int r = kq_fast("sgemm_iq4_k_q8_k", sgemm_iq4_k_q8_k_r8v, sgemm_iq4_k_q8_k_r8t, nrows, ncols, k, vx, vy, out, bs, ith, nth);
     if (r) return r;
-    return sgemm_iq4_k_q8_k_avx2(nrows, ncols, k, vx, vy, out, bs, ith, nth);
+    const int nb = k / QK_K;
+    const int gpt = (nrows + nth - 1) / nth;
+    const int r0 = ith * gpt, r1 = (ith + 1) * gpt < nrows ? (ith + 1) * gpt : nrows;
+    for (int i = r0; i < r1; ++i)
+        for (int c = 0; c < ncols; ++c)
+            out[(size_t)c * bs + i] = vec_dot_iq4_k_q8_k((const char *)vx + (size_t)i * nb * sizeof(block_iq4_k), (const char *)vy + (size_t)c * nb * sizeof(block_q8_K), k);
+    return 1;
 }
 int sgemm_iq4_k_r4_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) {
     int r = kq_fast("sgemm_iq4_k_r4_q8_k", sgemm_iq4_k_r4_q8_k_r8v, sgemm_iq4_k_r4_q8_k_r8t, nrows, ncols, k, vx, vy, out, bs, ith, nth);
     if (r) return r;
+#if defined(__AVX2__) && defined(__F16C__)
     return sgemm_iq4_k_r4_q8_k_avx2(nrows, ncols, k, vx, vy, out, bs, ith, nth);
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+    return sgemm_iq4_k_r4_q8_k_neon(nrows, ncols, k, vx, vy, out, bs, ith, nth);
+#else
+    (void)nrows; (void)ncols; (void)k; (void)vx; (void)vy; (void)out; (void)bs; (void)ith; (void)nth;
+    return 0;
+#endif
 }
 /* IQ2_K / IQ3_K (+R4) table fn_gemm: decode-once R8 for big shapes, else the original kernels. */
 int sgemm_iq2_k_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) {
     int r = kq_fast("sgemm_iq2_k_q8_k", sgemm_iq2_k_q8_k_r8v, sgemm_iq2_k_q8_k_r8t, nrows, ncols, k, vx, vy, out, bs, ith, nth);
     if (r) return r;
-    return sgemm_iq2_k_q8_k_avx2(nrows, ncols, k, vx, vy, out, bs, ith, nth);
+    const int nb = k / QK_K;
+    const int gpt = (nrows + nth - 1) / nth;
+    const int r0 = ith * gpt, r1 = (ith + 1) * gpt < nrows ? (ith + 1) * gpt : nrows;
+    for (int i = r0; i < r1; ++i)
+        for (int c = 0; c < ncols; ++c)
+            out[(size_t)c * bs + i] = vec_dot_iq2_k_q8_k((const char *)vx + (size_t)i * nb * sizeof(block_iq2_k), (const char *)vy + (size_t)c * nb * sizeof(block_q8_K), k);
+    return 1;
 }
 int sgemm_iq3_k_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) {
     int r = kq_fast("sgemm_iq3_k_q8_k", sgemm_iq3_k_q8_k_r8v, sgemm_iq3_k_q8_k_r8t, nrows, ncols, k, vx, vy, out, bs, ith, nth);
     if (r) return r;
-    return sgemm_iq3_k_q8_k_avx2(nrows, ncols, k, vx, vy, out, bs, ith, nth);
+    const int nb = k / QK_K;
+    const int gpt = (nrows + nth - 1) / nth;
+    const int r0 = ith * gpt, r1 = (ith + 1) * gpt < nrows ? (ith + 1) * gpt : nrows;
+    for (int i = r0; i < r1; ++i)
+        for (int c = 0; c < ncols; ++c)
+            out[(size_t)c * bs + i] = vec_dot_iq3_k_q8_k((const char *)vx + (size_t)i * nb * sizeof(block_iq3_k), (const char *)vy + (size_t)c * nb * sizeof(block_q8_K), k);
+    return 1;
 }
 int sgemm_iq2_k_r4_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) {
     int r = kq_fast("sgemm_iq2_k_r4_q8_k", sgemm_iq2_k_r4_q8_k_r8v, sgemm_iq2_k_r4_q8_k_r8t, nrows, ncols, k, vx, vy, out, bs, ith, nth);
     if (r) return r;
+#if defined(__AVX2__) && defined(__F16C__)
     return sgemm_iq2_k_r4_q8_k_avx2(nrows, ncols, k, vx, vy, out, bs, ith, nth);
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__)
+    return sgemm_iq2_k_r4_q8_k_neon(nrows, ncols, k, vx, vy, out, bs, ith, nth);
+#else
+    (void)nrows; (void)ncols; (void)k; (void)vx; (void)vy; (void)out; (void)bs; (void)ith; (void)nth;
+    return 0;
+#endif
 }
 int sgemm_iq3_k_r4_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) {
     int r = kq_fast("sgemm_iq3_k_r4_q8_k", sgemm_iq3_k_r4_q8_k_r8v, sgemm_iq3_k_r4_q8_k_r8t, nrows, ncols, k, vx, vy, out, bs, ith, nth);
     if (r) return r;
+#if defined(__AVX2__) && defined(__F16C__)
     return sgemm_iq3_k_r4_q8_k_avx2(nrows, ncols, k, vx, vy, out, bs, ith, nth);
+#else
+    /* Portable fallback: vec_dot batch4, 4 output rows per call. */
+    const int nb = k / QK_K;
+    const int gpt = (nrows / 4 + nth - 1) / nth;
+    const int g0 = ith * gpt, g1 = (ith + 1) * gpt < nrows / 4 ? (ith + 1) * gpt : nrows / 4;
+    for (int g = g0; g < g1; ++g)
+        for (int c = 0; c < ncols; ++c)
+            vec_dot_iq3_k_r4_q8_k_batch4((const char *)vx + (size_t)g * nb * sizeof(block_iq3_k_r4), (const char *)vy + (size_t)c * nb * sizeof(block_q8_K), k, out + (size_t)c * bs + g * 4);
+    return (g1 - g0) * 4;
+#endif
 }
 
 /* ================================================================
