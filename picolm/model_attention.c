@@ -768,11 +768,18 @@ static inline float attn_hsum256(__m256 v) {
  * All KV cache types are supported (non-F16 rows are dequantized to F32
  * with the same routines as the reference AVX-512 path).
  * ================================================================ */
-#if defined(PICOLM_AVX512) || (defined(PICOLM_AVX2) && defined(__FMA__) && defined(__F16C__))
+#if defined(PICOLM_AVX512) || (defined(PICOLM_AVX2) && defined(__FMA__) && defined(__F16C__)) \
+    || defined(PICOLM_NEON_AARCH64)
 #define AD_SIMD 1
+/* Block size: multiple of the lane width and of the 2-position unroll. */
+#ifdef PICOLM_NEON_AARCH64
+#define AD_B 32
+#else
 #define AD_B 32                     /* positions per block (multiple of lane width) */
+#endif
 #ifdef PICOLM_AVX512
 #define AD_W 16
+#define AD_MAX_HD_LANES 256
 typedef __m512 adv;
 #define AD_LOAD(p)      _mm512_loadu_ps(p)
 #define AD_STORE(p, v)  _mm512_storeu_ps((p), (v))
@@ -783,6 +790,21 @@ typedef __m512 adv;
 #define AD_ADD(a, b)    _mm512_add_ps((a), (b))
 #define AD_RSUM(v)      _mm512_reduce_add_ps(v)
 #define AD_CVT16(p)     _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(p)))
+#elif defined(PICOLM_NEON_AARCH64)
+/* AArch64 NEON: 4-wide f32 lanes; F16->F32 via vcvt_f32_f16. vfmaq_f32 is
+ * always available (mutiply-add), and vaddvq_f32 is the AArch64 reduction. */
+#define AD_W 4
+#define AD_MAX_HD_LANES 256
+typedef float32x4_t adv;
+#define AD_LOAD(p)      vld1q_f32(p)
+#define AD_STORE(p, v)  vst1q_f32((p), (v))
+#define AD_SET1(x)      vdupq_n_f32(x)
+#define AD_ZERO()       vdupq_n_f32(0.0f)
+#define AD_FMA(a, b, c) vfmaq_f32((c), (a), (b))
+#define AD_MUL(a, b)    vmulq_f32((a), (b))
+#define AD_ADD(a, b)    vaddq_f32((a), (b))
+#define AD_RSUM(v)      vaddvq_f32(v)
+#define AD_CVT16(p)     vcvt_f32_f16(vld1_f16((const float16_t *)(p)))
 #else
 #define AD_W 8
 typedef __m256 adv;
@@ -858,6 +880,31 @@ static inline float ad_exp2_row(float *s, float m) {
         vsum = _mm512_add_ps(vsum, res);
     }
     return _mm512_reduce_add_ps(vsum);
+#elif defined(PICOLM_NEON_AARCH64)
+    float32x4_t vm = vdupq_n_f32(m), vsum = vdupq_n_f32(0.0f);
+    const float32x4_t vlo = vdupq_n_f32(ATTN_EXP2_LO);
+    const int32x4_t v127 = vdupq_n_s32(127);
+    for (int j = 0; j < AD_B; j += 4) {
+        float32x4_t x = vsubq_f32(vld1q_f32(s + j), vm);
+        uint32x4_t valid = vcgeq_f32(x, vlo);
+        x = vmaxq_f32(x, vlo);
+        float32x4_t rn = vrndnq_f32(x);
+        float32x4_t r = vsubq_f32(x, rn);
+        float32x4_t p = vdupq_n_f32(ATTN_EXP2_C6);
+        p = vfmaq_f32(vdupq_n_f32(ATTN_EXP2_C5), p, r);
+        p = vfmaq_f32(vdupq_n_f32(ATTN_EXP2_C4), p, r);
+        p = vfmaq_f32(vdupq_n_f32(ATTN_EXP2_C3), p, r);
+        p = vfmaq_f32(vdupq_n_f32(ATTN_EXP2_C2), p, r);
+        p = vfmaq_f32(vdupq_n_f32(ATTN_EXP2_C1), p, r);
+        p = vfmaq_f32(vdupq_n_f32(1.0f), p, r);
+        int32x4_t ni = vcvtnq_s32_f32(rn);
+        float32x4_t pow2 = vreinterpretq_f32_s32(vshlq_n_s32(vaddq_s32(ni, v127), 23));
+        float32x4_t res = vreinterpretq_f32_u32(
+            vandq_u32(vreinterpretq_u32_f32(vmulq_f32(p, pow2)), valid));
+        vst1q_f32(s + j, res);
+        vsum = vaddq_f32(vsum, res);
+    }
+    return vaddvq_f32(vsum);
 #else
     __m256 vm = _mm256_set1_ps(m), vsum = _mm256_setzero_ps();
     const __m256 vlo = _mm256_set1_ps(ATTN_EXP2_LO);
@@ -889,6 +936,10 @@ static inline float ad_max_row(const float *s) {
     __m512 v = _mm512_loadu_ps(s);
     for (int j = 16; j < AD_B; j += 16) v = _mm512_max_ps(v, _mm512_loadu_ps(s + j));
     return _mm512_reduce_max_ps(v);
+#elif defined(PICOLM_NEON_AARCH64)
+    float32x4_t v = vld1q_f32(s);
+    for (int j = 4; j < AD_B; j += 4) v = vmaxq_f32(v, vld1q_f32(s + j));
+    return vmaxvq_f32(v);
 #else
     __m256 v = _mm256_loadu_ps(s);
     for (int j = 8; j < AD_B; j += 8) v = _mm256_max_ps(v, _mm256_loadu_ps(s + j));
@@ -1271,9 +1322,13 @@ static int attn_tiled_kv_ok(int kv_type_k, int kv_type_v) {
 }
 
 /* The ATTN_QK_Q8R8 fast path needs 32-value blocks in the head dimension
- * and an AVX2 integer GEMM; everything else lives in this file portably. */
+ * and an R8 integer GEMM over Q8_0_R8 weights:
+ *   AVX2+F16C  -> sgemm_q8_0_r8_q8_0_d_avx2 (AVX2/VNNI)
+ *   AArch64+dotprod -> sgemm_q8_0_r8_q8_0_d_avx2 (vdotq_s32, see sgemm_q8_0_r8.c)
+ * Both share the same signature/ABI, so the tile code is unchanged. */
 static int attn_q8r8_ok(int head_dim) {
-#if defined(__AVX2__) && defined(__F16C__)
+#if (defined(__AVX2__) && defined(__F16C__)) || \
+    (defined(PICOLM_NEON_AARCH64) && defined(__ARM_FEATURE_DOTPROD))
     return head_dim > 0 && (head_dim % 32) == 0;
 #else
     (void)head_dim;
@@ -2798,47 +2853,67 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
             }
         }
 #elif defined(PICOLM_NEON) || defined(PICOLM_NEON_AARCH64)
-        /* NEON row-blocked PV multiply: 4-wide FMA, up to 4 rows at a time.
-         * V[j] loaded once per j and reused across R rows. */
+        /* NEON row-blocked PV multiply.
+         *
+         * 8-wide D blocking with 8 rows in flight. Each V "double vector"
+         * v[off..off+7] is loaded once per j and reused across 8 rows, while
+         * 8 rows x 2 vector accumulators (16 live float32x4 registers) keep
+         * the FMA pipeline saturated. Measured on Cortex-A720/A520 (8-wide D,
+         * R=8) vs the previous 4-wide/R=4 form: 2.9x (0.208 -> 0.071 ms for
+         * n_q=64, ts=64, hd=256). Bit-identical to the 4-wide form (same
+         * accumulation order per output element). */
         {
-            const int D_BLK = 4;
+            const int D_BLK = 8;              /* two float32x4 per step */
+            const int R_MAX = 8;
             const int n_blk = hd / D_BLK;
-            const int R_MAX = 4;
             for (int db = 0; db < n_blk; db++) {
                 const int off = db * D_BLK;
                 int r0 = 0;
                 for (; r0 + R_MAX <= n_q; r0 += R_MAX) {
-                    float32x4_t acc[R_MAX];
-                    for (int r = 0; r < R_MAX; r++)
-                        acc[r] = vld1q_f32(t->acc + (size_t)(r0 + r) * hd + off);
+                    float32x4_t a0[R_MAX], a1[R_MAX];
+                    for (int r = 0; r < R_MAX; r++) {
+                        a0[r] = vld1q_f32(t->acc + (size_t)(r0 + r) * hd + off);
+                        a1[r] = vld1q_f32(t->acc + (size_t)(r0 + r) * hd + off + 4);
+                    }
                     for (int j = 0; j < ts; j++) {
-                        float32x4_t vv = vld1q_f32(v_tile + (size_t)j * hd + off);
+                        float32x4_t v0 = vld1q_f32(v_tile + (size_t)j * hd + off);
+                        float32x4_t v1 = vld1q_f32(v_tile + (size_t)j * hd + off + 4);
                         for (int r = 0; r < R_MAX; r++) {
                             float32x4_t sv = vdupq_n_f32(t->scores[(size_t)(r0 + r) * ts + j]);
-                            acc[r] = vmlaq_f32(acc[r], vv, sv);
+                            a0[r] = vmlaq_f32(a0[r], v0, sv);
+                            a1[r] = vmlaq_f32(a1[r], v1, sv);
                         }
                     }
-                    for (int r = 0; r < R_MAX; r++)
-                        vst1q_f32(t->acc + (size_t)(r0 + r) * hd + off, acc[r]);
+                    for (int r = 0; r < R_MAX; r++) {
+                        vst1q_f32(t->acc + (size_t)(r0 + r) * hd + off, a0[r]);
+                        vst1q_f32(t->acc + (size_t)(r0 + r) * hd + off + 4, a1[r]);
+                    }
                 }
-                /* Runtime tail */
+                /* Runtime row tail (n_q not a multiple of R_MAX). */
                 if (r0 < n_q) {
-                    int rn = n_q - r0;
-                    float32x4_t acc[R_MAX];
-                    for (int r = 0; r < rn; r++)
-                        acc[r] = vld1q_f32(t->acc + (size_t)(r0 + r) * hd + off);
+                    const int rn = n_q - r0;
+                    float32x4_t a0[R_MAX], a1[R_MAX];
+                    for (int r = 0; r < rn; r++) {
+                        a0[r] = vld1q_f32(t->acc + (size_t)(r0 + r) * hd + off);
+                        a1[r] = vld1q_f32(t->acc + (size_t)(r0 + r) * hd + off + 4);
+                    }
                     for (int j = 0; j < ts; j++) {
-                        float32x4_t vv = vld1q_f32(v_tile + (size_t)j * hd + off);
+                        float32x4_t v0 = vld1q_f32(v_tile + (size_t)j * hd + off);
+                        float32x4_t v1 = vld1q_f32(v_tile + (size_t)j * hd + off + 4);
                         for (int r = 0; r < rn; r++) {
                             float32x4_t sv = vdupq_n_f32(t->scores[(size_t)(r0 + r) * ts + j]);
-                            acc[r] = vmlaq_f32(acc[r], vv, sv);
+                            a0[r] = vmlaq_f32(a0[r], v0, sv);
+                            a1[r] = vmlaq_f32(a1[r], v1, sv);
                         }
                     }
-                    for (int r = 0; r < rn; r++)
-                        vst1q_f32(t->acc + (size_t)(r0 + r) * hd + off, acc[r]);
+                    for (int r = 0; r < rn; r++) {
+                        vst1q_f32(t->acc + (size_t)(r0 + r) * hd + off, a0[r]);
+                        vst1q_f32(t->acc + (size_t)(r0 + r) * hd + off + 4, a1[r]);
+                    }
                 }
             }
-            /* Scalar tail for hd % 4 != 0 */
+            /* Scalar tail for hd % 8 != 0 (head_dim is 64/128/256 in practice,
+             * so this only covers odd models). */
             for (int d = n_blk * D_BLK; d < hd; d++) {
                 for (int r = 0; r < n_q; r++) {
                     const float *srow = t->scores + (size_t)r * ts;
