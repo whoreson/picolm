@@ -849,6 +849,30 @@ void dequantize_row_f16(const void *src, float *dst, int n) {
         dst[i] = fp16_to_fp32_lookup(fp16[i]);
     }
 #endif
+#elif defined(__AVX2__) && defined(__F16C__)
+    {
+        int i;
+        for (i = 0; i + 7 < n; i += 8) {
+            __m128i h = _mm_loadu_si128((const __m128i *)(fp16 + i));
+            __m256 f = _mm256_cvtph_ps(h);
+            _mm256_storeu_ps(dst + i, f);
+        }
+        for (; i < n; i++) {
+            dst[i] = fp16_to_fp32_lookup(fp16[i]);
+        }
+    }
+#elif defined(__AVX__) && defined(__F16C__)
+    {
+        int i;
+        for (i = 0; i + 3 < n; i += 4) {
+            __m128i h = _mm_loadu_si128((const __m128i *)(fp16 + i));
+            __m128 f = _mm_cvtph_ps(h);
+            _mm_storeu_ps(dst + i, f);
+        }
+        for (; i < n; i++) {
+            dst[i] = fp16_to_fp32_lookup(fp16[i]);
+        }
+    }
 #else
     for (int i = 0; i < n; i++) {
         dst[i] = fp16_to_fp32_lookup(fp16[i]);

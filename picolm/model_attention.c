@@ -1325,6 +1325,122 @@ static int attn_choose_qk_mode(int kv_type_k, int head_dim, gguf_type_t *tile_gg
     return want;
 }
 
+/* ================================================================
+ * Int8 K shadow for F16 K caches (opt-in: PICOLM_ATTN_QK=i8).
+ *
+ * The default F16 QK path (matmul_batch -> F16 sgemm) converts K from f16 on
+ * every tile visit and runs fp32 FMAs. A deep-context prefill visits each K
+ * tile once per token group (41 groups for a 2.6k-token append), so the same
+ * 64x256 tile is re-converted dozens of times per layer.
+ *
+ * With the shadow, K is quantized to Q8_0 and repacked to Q8_0_R8 ONCE per
+ * layer call (parallel over kv_head x tile chunks, ~0.1% of the layer), and
+ * every tile visit scores through the AVX-512 VNNI R8 kernel on the prebuilt
+ * tile. This is a PRECISION TRADE-OFF (Q and K both become Q8_0), which is
+ * why it is off by default. Only full ATTN_TILE tiles are shadowed; the
+ * trailing partial tile and tiny batches keep the exact F16 path.
+ * ================================================================ */
+#define ATTN_K8_MAX_HD 512
+#define ATTN_K8_CHUNK  16            /* tiles per build task */
+
+static int attn_k8_requested(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("PICOLM_ATTN_QK");
+        v = (e && !strcmp(e, "i8")) ? 1 : 0;
+    }
+    return v;
+}
+
+/* Probe once: does the VNNI R8 kernel work? */
+static int attn_k8_vnni_ok(void) {
+    static int ok = -1;
+    if (ok < 0) {
+        const char *e = getenv("PICOLM_Q8_VNNI");
+        if (e && atoi(e) == 0) { ok = 0; return ok; }
+        static block_q8_0_r8 w[1];
+        static block_q8_0 y[1];
+        static float out[8];
+        memset(w, 0, sizeof(w)); memset(y, 0, sizeof(y));
+        ok = sgemm_q8_0_r8_vnni_q8_0(8, 1, 32, w, y, out, 8, 0, 1) != 0;
+    }
+    return ok;
+}
+
+/* Probe once: is any R8 kernel available (VNNI or AVX2)? */
+static int attn_k8_ok(void) {
+    static int ok = -1;
+    if (ok < 0) {
+        ok = attn_k8_vnni_ok() ? 1 : 0;
+        /* AVX2 R8 is always available in an AVX2 build */
+#ifdef __AVX2__
+        if (!ok) ok = 1;
+#endif
+    }
+    return ok;
+}
+
+typedef struct {
+    const uint8_t *kcache;
+    size_t row_stride, head_stride;
+    int head_dim, n_full_tiles, chunks_per_head;
+    uint8_t *dst;
+    size_t tile_bytes;
+} attn_k8_build_ctx_t;
+
+static void attn_k8_build_task(int idx, void *p) {
+    const attn_k8_build_ctx_t *c = (const attn_k8_build_ctx_t *)p;
+    const int hd = c->head_dim, nb = hd / 32;
+    const int h = idx / c->chunks_per_head, ch = idx % c->chunks_per_head;
+    int t0 = ch * ATTN_K8_CHUNK, t1 = t0 + ATTN_K8_CHUNK;
+    if (t1 > c->n_full_tiles) t1 = c->n_full_tiles;
+    block_q8_0 rows[ATTN_TILE * (ATTN_K8_MAX_HD / 32)];
+    float tmp[ATTN_K8_MAX_HD];
+    for (int tl = t0; tl < t1; tl++) {
+        for (int r = 0; r < ATTN_TILE; r++) {
+            const uint8_t *src = c->kcache + (size_t)(tl * ATTN_TILE + r) * c->row_stride
+                               + (size_t)h * c->head_stride;
+            dequantize_row(src, tmp, hd, GGUF_TYPE_F16);
+            quantize_row_q8_0(tmp, rows + (size_t)r * nb, hd);
+        }
+        repack_q8_0_to_q8_0_r8(rows, c->dst + ((size_t)h * c->n_full_tiles + tl) * c->tile_bytes,
+                               ATTN_TILE, hd);
+    }
+}
+
+/* Grow-only shadow buffer (kept between layers/calls; ~96 MB at 88k positions
+ * x 4 KV heads x hd 256). Returns NULL when disabled/unsupported/OOM. */
+static uint8_t *g_k8_shadow = NULL;
+static size_t   g_k8_shadow_cap = 0;
+
+static const uint8_t *attn_k8_shadow_build(const uint8_t *kcache, int total_pos, int n_kv_heads,
+                                           int head_dim, size_t row_stride, size_t head_stride,
+                                           int *n_full_tiles_out, size_t *tile_bytes_out) {
+    if (!attn_k8_requested() || !attn_k8_ok()) return NULL;
+    if (head_dim % 32 != 0 || head_dim > ATTN_K8_MAX_HD) return NULL;
+    const int n_full = total_pos / ATTN_TILE;
+    if (n_full < 1) return NULL;
+    const int nb = head_dim / 32;
+    const size_t tile_bytes = (size_t)(ATTN_TILE / 8) * nb * sizeof(block_q8_0_r8);
+    const size_t need = (size_t)n_kv_heads * n_full * tile_bytes;
+    if (need > g_k8_shadow_cap) {
+        free(g_k8_shadow);
+        size_t sz = (need + 63) & ~(size_t)63;
+        g_k8_shadow = (uint8_t *)malloc(sz);
+        g_k8_shadow_cap = g_k8_shadow ? need : 0;
+        if (!g_k8_shadow) return NULL;
+    }
+    attn_k8_build_ctx_t bc;
+    bc.kcache = kcache; bc.row_stride = row_stride; bc.head_stride = head_stride;
+    bc.head_dim = head_dim; bc.n_full_tiles = n_full;
+    bc.chunks_per_head = (n_full + ATTN_K8_CHUNK - 1) / ATTN_K8_CHUNK;
+    bc.dst = g_k8_shadow; bc.tile_bytes = tile_bytes;
+    tensor_parallel_for(n_kv_heads * bc.chunks_per_head, attn_k8_build_task, &bc);
+    *n_full_tiles_out = n_full;
+    *tile_bytes_out = tile_bytes;
+    return g_k8_shadow;
+}
+
 typedef struct {
     int kv_h;
     int kv_mul;
@@ -1350,6 +1466,7 @@ typedef struct {
     const float *q8_delta;      /* [n_q_rows x head_dim/32] fp16 round-trip deltas (QK_Q8R8) */
     block_q8_0 *k8_rows;        /* [tile_size x head_dim/32] plain Q8_0 K rows (QK_Q8R8) */
     block_q8_0_r8 *k8r8;        /* [head_dim/32] Q8_0_R8 group of k8_rows (QK_Q8R8) */
+    const block_q8_0_r8 *k8_shadow_tile; /* prebuilt Q8_0_R8 K tile (int8 shadow), or NULL */
     float *M;               /* [n_q_rows] running max */
     float *S;               /* [n_q_rows] running sum_exp */
     float *acc;             /* [n_q_rows x head_dim] running accumulator */
@@ -1382,6 +1499,9 @@ typedef struct {
     gguf_type_t gguf_v;
     size_t k_rb_gguf;
     int qk_mode;            /* ATTN_QK_* selected by batch_attention_tiled() */
+    const uint8_t *k8_shadow; /* int8 K shadow (PICOLM_ATTN_QK=i8), or NULL */
+    size_t k8_tile_bytes;
+    int n_full_tiles;
     int q_rot;              /* 1 = TQ3-sign WHT-rotate query rows (TQ K caches) */
     /* Scratch pool: pre-allocated, sliced per concurrent task */
     uint8_t *scratch_pool;
@@ -1478,7 +1598,13 @@ static void batch_tiled_task(int task_idx, void *ctx_ptr) {
      * reused by every KV tile, so this is O(n_q*hd) per task instead of
      * per tile). Deltas use the same fp16 round-trip convention as the
      * batched matmul_batch activation quantizer. */
-    if (bc->qk_mode == ATTN_QK_Q8R8) {
+    if (bc->k8_shadow) {
+        /* Int8 K shadow: the VNNI R8 kernel reads plain Q8_0 columns and
+         * needs no separate deltas. */
+        const int nb = head_dim / 32;
+        for (int i = 0; i < n_q_padded; i++)
+            quantize_row_q8_0(q_rows + (size_t)i * head_dim, q8_rows + (size_t)i * nb, head_dim);
+    } else if (bc->qk_mode == ATTN_QK_Q8R8) {
         const int nb = head_dim / 32;
         for (int i = 0; i < n_q_padded; i++) {
             const float *qr = q_rows + (size_t)i * head_dim;
@@ -1530,10 +1656,13 @@ static void batch_tiled_task(int task_idx, void *ctx_ptr) {
          * tile-aligned, but also covers unaligned starts. */
         int is_diag = (kv_t1 - 1 > first_pos);
 
+        /* Int8 shadow serves full tiles only; the partial tail keeps the F16 path. */
+        const int use_sh = bc->k8_shadow && this_tile_size == tile;
+
         /* Extract K-tile into contiguous scratch, in the layout the selected
          * QK path wants: byte copy for F16/Q8_0/Q4_0, dequantized (inverse
          * WHT) F32 rows for TQ caches. */
-        {
+        if (!use_sh) {
             size_t rb = bc->kv_head_stride_k;
             size_t row_stride = bc->kv_row_size_k;
             for (int p = 0; p < this_tile_size; p++) {
@@ -1589,6 +1718,9 @@ static void batch_tiled_task(int task_idx, void *ctx_ptr) {
         task.q8_delta = q8_delta;
         task.k8_rows = k8_rows;
         task.k8r8 = k8r8;
+        task.k8_shadow_tile = use_sh
+            ? (const block_q8_0_r8 *)(bc->k8_shadow + ((size_t)kv_h * bc->n_full_tiles + tk) * bc->k8_tile_bytes)
+            : NULL;
         task.M = M;
         task.S = S;
         task.acc = acc;
@@ -2023,6 +2155,25 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
         break;
     }
     default: {
+        if (t->k8_shadow_tile) {
+            /* Prebuilt int8 K tile (ts == ATTN_TILE rows, a multiple of 8):
+             * scores[c*ts + r], serial (nth=1), inside a pool worker. */
+            if (sgemm_q8_0_r8_vnni_q8_0(ts, n_q, hd, t->k8_shadow_tile, t->q8_rows,
+                                        t->scores, (size_t)ts, 0, 1))
+                break;
+#ifdef __AVX2__
+            /* VNNI unavailable (e.g. AVX2-only build): fall back to AVX2 R8. */
+            if (sgemm_q8_0_r8_q8_0_avx2(ts, n_q, hd, t->k8_shadow_tile, t->q8_rows,
+                                        t->scores, (size_t)ts, 0, 1))
+                break;
+#endif
+            /* Kernel refused: the K tile was not packed, so build it now. */
+            for (int p = 0; p < ts; p++)
+                memcpy(t->tile_k + (size_t)p * hd * sizeof(uint16_t),
+                       t->kcache + (size_t)(t->kv_tile_start + p) * t->kv_row_size_k
+                                 + (size_t)t->kv_h * t->kv_head_stride_k,
+                       (size_t)hd * sizeof(uint16_t));
+        }
         /* F16 K tile: matmul_batch -> picolm_sgemm(F16/F32) with nth=1. */
         matmul_batch(t->scores, t->q_rows, n_q, t->tile_k, hd, ts, t->kv_gguf_k);
         break;
@@ -2155,6 +2306,14 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
                 for (int d = 0; d + 15 < hd; d += 16)
                     _mm512_storeu_ps(acc_row + d, _mm512_mul_ps(_mm512_loadu_ps(acc_row + d), vc));
                 for (int d = (hd / 16) * 16; d < hd; d++)
+                    acc_row[d] *= corr;
+            }
+#elif defined(PICOLM_AVX2)
+            {
+                __m256 vc = _mm256_set1_ps(corr);
+                for (int d = 0; d + 7 < hd; d += 8)
+                    _mm256_storeu_ps(acc_row + d, _mm256_mul_ps(_mm256_loadu_ps(acc_row + d), vc));
+                for (int d = (hd / 8) * 8; d < hd; d++)
                     acc_row[d] *= corr;
             }
 #else
@@ -2378,6 +2537,57 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
                 }
             }
         }
+#elif defined(PICOLM_AVX2) && defined(__FMA__)
+        /* AVX2 row-blocked PV multiply: 8-wide FMA, up to 4 rows at a time.
+         * V[j] loaded once per j and reused across R rows. */
+        {
+            const int D_BLK = 8;
+            const int n_blk = hd / D_BLK;
+            const int R_MAX = 4;
+            for (int db = 0; db < n_blk; db++) {
+                const int off = db * D_BLK;
+                int r0 = 0;
+                for (; r0 + R_MAX <= n_q; r0 += R_MAX) {
+                    __m256 acc[R_MAX];
+                    for (int r = 0; r < R_MAX; r++)
+                        acc[r] = _mm256_loadu_ps(t->acc + (size_t)(r0 + r) * hd + off);
+                    for (int j = 0; j < ts; j++) {
+                        __m256 vv = _mm256_loadu_ps(v_tile + (size_t)j * hd + off);
+                        for (int r = 0; r < R_MAX; r++) {
+                            float s = t->scores[(size_t)(r0 + r) * ts + j];
+                            acc[r] = _mm256_fmadd_ps(vv, _mm256_set1_ps(s), acc[r]);
+                        }
+                    }
+                    for (int r = 0; r < R_MAX; r++)
+                        _mm256_storeu_ps(t->acc + (size_t)(r0 + r) * hd + off, acc[r]);
+                }
+                if (r0 < n_q) {
+                    int rn = n_q - r0;
+                    __m256 acc[R_MAX];
+                    for (int r = 0; r < rn; r++)
+                        acc[r] = _mm256_loadu_ps(t->acc + (size_t)(r0 + r) * hd + off);
+                    for (int j = 0; j < ts; j++) {
+                        __m256 vv = _mm256_loadu_ps(v_tile + (size_t)j * hd + off);
+                        for (int r = 0; r < rn; r++) {
+                            float s = t->scores[(size_t)(r0 + r) * ts + j];
+                            acc[r] = _mm256_fmadd_ps(vv, _mm256_set1_ps(s), acc[r]);
+                        }
+                    }
+                    for (int r = 0; r < rn; r++)
+                        _mm256_storeu_ps(t->acc + (size_t)(r0 + r) * hd + off, acc[r]);
+                }
+            }
+            /* Scalar tail for hd % 8 != 0 */
+            for (int d = n_blk * D_BLK; d < hd; d++) {
+                for (int r = 0; r < n_q; r++) {
+                    const float *srow = t->scores + (size_t)r * ts;
+                    float a = t->acc[(size_t)r * hd + d];
+                    for (int j = 0; j < ts; j++)
+                        a += srow[j] * v_tile[(size_t)j * hd + d];
+                    t->acc[(size_t)r * hd + d] = a;
+                }
+            }
+        }
 #else
         /* The row-blocked AVX-512 form above needs 512-bit registers to be
          * worth it; on other targets keep the simple per-row loop. V is still
@@ -2462,6 +2672,20 @@ static void batch_attention_tiled(
     bctx.qk_mode = qk_mode;
     bctx.q_rot = 0;
 
+    /* Optional int8 K shadow (F16 K cache + full 64-row tiles only). */
+    int use_k8 = 0;
+    if (kv_type_k == KV_CACHE_F16 && qk_mode == ATTN_QK_GEMM && tile == ATTN_TILE) {
+        int n_full = 0; size_t tb = 0;
+        const uint8_t *sh = attn_k8_shadow_build(kcache, start_pos + n_tokens, n_kv_heads, head_dim,
+                                                 kv_row_size_k, kv_head_stride_k, &n_full, &tb);
+        if (sh) {
+            bctx.k8_shadow = sh; bctx.k8_tile_bytes = tb; bctx.n_full_tiles = n_full;
+            use_k8 = 1;
+            static int _once = 0;
+            if (!_once) { _once = 1; fprintf(stderr, "[BATCH-ATTN] int8 K shadow + VNNI QK enabled (PICOLM_ATTN_QK=i8)\n"); }
+        }
+    }
+
     /* Pre-allocate scratch for all tasks. Each task needs:
      *   scores: kv_mul*tile * tile floats
      *   M,S:    kv_mul*tile floats each
@@ -2495,6 +2719,12 @@ static void batch_attention_tiled(
     /* Extra scratch for the non-F16 QK paths. Kept at 1 byte when unused so
      * the slot layout always has the same number of regions. */
     size_t q8_per = 1, q8_half = 0, k8_per = 1, k8_half = 0, f32t_per = 1;
+    if (use_k8) {
+        const int nb = head_dim / 32;
+        size_t qrows = (size_t)kv_mul * tile;
+        q8_half = qrows * nb * sizeof(block_q8_0);
+        q8_per = q8_half + qrows * nb * sizeof(float);   /* delta half unused by VNNI; keeps layout uniform */
+    }
     if (qk_mode == ATTN_QK_Q8R8) {
         const int nb = head_dim / 32;
         size_t qrows = (size_t)kv_mul * tile;

@@ -216,8 +216,17 @@ int main(int argc, char **argv) {
            n_kv_heads * ((n_tokens + ATTN_TILE - 1) / ATTN_TILE));
 
     size_t n = (size_t)n_tokens * tc.xb_stride, at = 0;
-    run_path(&tc, tc.xb_ref, 0);
-    double s1 = 0; for (size_t i = 0; i < n; i++) s1 += tc.xb_ref[i];
+    /* PICOLM_TEST_NODIFF: skip the reference (grouped) run and the output
+     * comparison entirely, for benchmarking. The grouped call costs roughly
+     * as much as a tiled call and its output is not needed when only timing
+     * is wanted. Uses only getenv/atoi, so it builds unchanged on Windows. */
+    const char *nd = getenv("PICOLM_TEST_NODIFF");
+    int no_diff = nd ? atoi(nd) != 0 : 0;
+    double s1 = 0;
+    if (!no_diff) {
+        run_path(&tc, tc.xb_ref, 0);
+        for (size_t i = 0; i < n; i++) s1 += tc.xb_ref[i];
+    }
     run_path(&tc, tc.xb_tiled, 1);
     double s2 = 0; for (size_t i = 0; i < n; i++) s2 += tc.xb_tiled[i];
     {   /* dump tiled output for cross-binary comparison */
@@ -228,7 +237,10 @@ int main(int argc, char **argv) {
             fclose(f);
         }
     }
-    fprintf(stderr, "[dbg] call1 sum=%.6f  call2 sum=%.6f\n", s1, s2);
+    if (no_diff)
+        fprintf(stderr, "[dbg] call1 sum=(skipped)  call2 sum=%.6f\n", s2);
+    else
+        fprintf(stderr, "[dbg] call1 sum=%.6f  call2 sum=%.6f\n", s1, s2);
     {   /* Optional timing: PICOLM_TEST_REPS=N -> median ms/call of the tiled path */
         const char *rp = getenv("PICOLM_TEST_REPS");
         int reps = rp ? atoi(rp) : 0;
@@ -244,6 +256,10 @@ int main(int argc, char **argv) {
             printf("TIMING: tiled median=%.3f ms  min=%.3f ms  (reps=%d)\n", tm[reps/2], tm[0], reps);
             free(tm);
         }
+    }
+    if (no_diff) {
+        printf("RESULT: diff SKIPPED (PICOLM_TEST_NODIFF)\n");
+        return 0;
     }
     double md = max_abs_diff(tc.xb_ref, tc.xb_tiled, n, &at);
     const char *tl = getenv("PICOLM_TEST_TOL");
