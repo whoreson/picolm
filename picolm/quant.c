@@ -213,6 +213,64 @@ float vec_dot_bf16_f32(const void *src, const float *x, int n) {
     float sum = _mm512_reduce_add_ps(acc);
     for (; i < n; i++) sum += bf16_to_fp32(bf16[i]) * x[i];
     return sum;
+#elif defined(PICOLM_AVX2)
+    /* AVX2: _mm256_cvtepu16_epi32 doesn't exist, so we widen 8 uint16 ->
+     * 8 uint32 via two 4-wide lanes (low 4 from low 64 bits, high 4 from
+     * bits 64..127), then shift-left 16 to produce fp32 bitcasts. */
+    __m256 acc = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+        __m128i h = _mm_loadu_si128((const __m128i *)(bf16 + i));
+        __m128i lo4 = _mm_cvtepu16_epi32(_mm_unpacklo_epi64(h, h)); /* [0,1,2,3] */
+        __m128i hi4 = _mm_cvtepu16_epi32(_mm_unpackhi_epi64(h, h)); /* [4,5,6,7] */
+        __m256i bits = _mm256_set_m128i(hi4, lo4);
+        __m256 bf = _mm256_castsi256_ps(_mm256_slli_epi32(bits, 16));
+        __m256 xf = _mm256_loadu_ps(x + i);
+        acc = _mm256_fmadd_ps(bf, xf, acc);
+    }
+    float sum = hsum_avx(acc);
+    for (; i < n; i++) sum += bf16_to_fp32(bf16[i]) * x[i];
+    return sum;
+#elif defined(PICOLM_AVX)
+    /* AVX without AVX2 integer: convert 8 bf16 -> fp32 scalar, then
+     * vectorized multiply-add. The bottleneck is the conversion, not the
+     * MAC, so a tight scalar inner + 256-bit FMA is still a win over
+     * fully scalar. */
+    __m256 acc = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+        __m256 bf = _mm256_set_ps(bf16_to_fp32(bf16[i+7]), bf16_to_fp32(bf16[i+6]),
+                                   bf16_to_fp32(bf16[i+5]), bf16_to_fp32(bf16[i+4]),
+                                   bf16_to_fp32(bf16[i+3]), bf16_to_fp32(bf16[i+2]),
+                                   bf16_to_fp32(bf16[i+1]), bf16_to_fp32(bf16[i]));
+        __m256 xf = _mm256_loadu_ps(x + i);
+        acc = _mm256_add_ps(_mm256_mul_ps(bf, xf), acc);
+    }
+    float sum = hsum_avx(acc);
+    for (; i < n; i++) sum += bf16_to_fp32(bf16[i]) * x[i];
+    return sum;
+#elif defined(PICOLM_NEON)
+    /* NEON: 4-wide bf16 -> fp32 via shift+reinterpret.
+     * bf16 bitcast: uint16 value << 16 = fp32 with same sign/exp/mantissa. */
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+        uint16x4_t h0 = vld1_u16(bf16 + i);
+        uint16x4_t h1 = vld1_u16(bf16 + i + 4);
+        /* uint16 -> uint32 (zero-extend low/half), shift << 16, reinterpret as fp32 */
+        uint32x4_t bits0 = vshlq_n_u32(vmovl_u16(h0), 16);
+        uint32x4_t bits1 = vshlq_n_u32(vmovl_u16(h1), 16);
+        float32x4_t bf0 = vreinterpretq_f32_u32(bits0);
+        float32x4_t bf1 = vreinterpretq_f32_u32(bits1);
+        float32x4_t xf0 = vld1q_f32(x + i);
+        float32x4_t xf1 = vld1q_f32(x + i + 4);
+        acc0 = vmlaq_f32(acc0, bf0, xf0);
+        acc1 = vmlaq_f32(acc1, bf1, xf1);
+    }
+    float sum = vaddvq_f32_compat(vaddq_f32(acc0, acc1));
+    for (; i < n; i++) sum += bf16_to_fp32(bf16[i]) * x[i];
+    return sum;
 #else
     float sum = 0.0f;
     for (int i = 0; i < n; i++) sum += bf16_to_fp32(bf16[i]) * x[i];
@@ -222,7 +280,49 @@ float vec_dot_bf16_f32(const void *src, const float *x, int n) {
 
 void dequantize_row_bf16(const void *src, float *dst, int n) {
     const uint16_t *bf16 = (const uint16_t *)src;
+#ifdef PICOLM_AVX512
+    int i = 0;
+    for (; i + 15 < n; i += 16) {
+        __m512i bits = _mm512_cvtepu16_epi32(_mm256_loadu_si256((const __m256i *)(bf16 + i)));
+        __m512 bf = _mm512_castsi512_ps(_mm512_slli_epi32(bits, 16));
+        _mm512_storeu_ps(dst + i, bf);
+    }
+    for (; i < n; i++) dst[i] = bf16_to_fp32(bf16[i]);
+#elif defined(PICOLM_AVX2)
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+        __m128i h = _mm_loadu_si128((const __m128i *)(bf16 + i));
+        __m128i lo4 = _mm_cvtepu16_epi32(_mm_unpacklo_epi64(h, h));
+        __m128i hi4 = _mm_cvtepu16_epi32(_mm_unpackhi_epi64(h, h));
+        __m256i bits = _mm256_set_m128i(hi4, lo4);
+        _mm256_storeu_ps(dst + i, _mm256_castsi256_ps(_mm256_slli_epi32(bits, 16)));
+    }
+    for (; i < n; i++) dst[i] = bf16_to_fp32(bf16[i]);
+#elif defined(PICOLM_AVX)
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+        dst[i]     = bf16_to_fp32(bf16[i]);
+        dst[i + 1] = bf16_to_fp32(bf16[i + 1]);
+        dst[i + 2] = bf16_to_fp32(bf16[i + 2]);
+        dst[i + 3] = bf16_to_fp32(bf16[i + 3]);
+        dst[i + 4] = bf16_to_fp32(bf16[i + 4]);
+        dst[i + 5] = bf16_to_fp32(bf16[i + 5]);
+        dst[i + 6] = bf16_to_fp32(bf16[i + 6]);
+        dst[i + 7] = bf16_to_fp32(bf16[i + 7]);
+    }
+    for (; i < n; i++) dst[i] = bf16_to_fp32(bf16[i]);
+#elif defined(PICOLM_NEON)
+    int i = 0;
+    for (; i + 7 < n; i += 8) {
+        uint16x4_t h0 = vld1_u16(bf16 + i);
+        uint16x4_t h1 = vld1_u16(bf16 + i + 4);
+        vst1q_f32(dst + i,     vreinterpretq_f32_u32(vshlq_n_u32(vmovl_u16(h0), 16)));
+        vst1q_f32(dst + i + 4, vreinterpretq_f32_u32(vshlq_n_u32(vmovl_u16(h1), 16)));
+    }
+    for (; i < n; i++) dst[i] = bf16_to_fp32(bf16[i]);
+#else
     for (int i = 0; i < n; i++) dst[i] = bf16_to_fp32(bf16[i]);
+#endif
 }
 
 uint16_t fp32_to_fp16(float f) {

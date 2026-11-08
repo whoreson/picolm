@@ -809,6 +809,10 @@ check-kq-gemm: test_kq_gemm
 test_r8_simd: tests/test_r8_simd.c quant.c $(SGEMM_SRCS)
 	$(CC) $(TEST_NATIVE_CFLAGS) -I. -o $@ tests/test_r8_simd.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp
 
+# BF16 SIMD vs scalar reference: vec_dot_bf16_f32 and dequantize_row_bf16.
+test_bf16_simd: tests/test_bf16_simd.c quant.c $(SGEMM_SRCS)
+	$(CC) $(TEST_NATIVE_CFLAGS) -I. -o $@ tests/test_bf16_simd.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp
+
 .PHONY: check-r8-simd
 check-r8-simd: test_r8_simd
 	./test_r8_simd
