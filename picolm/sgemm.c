@@ -3019,6 +3019,20 @@ int picolm_sgemm_d(int m, int n, int k_blocks,
     /* NEON: use vdotq_s32 (DOTPROD) or vmmlaq_s32 (I8MM) with pre-converted deltas.
      * Pi 4 (Cortex-A72) has DOTPROD but not I8MM.
      * Prefer 4x4 tiles when n >= 4 for better cache reuse. */
+    /* sgemm_q0_neon_fast.c covers Q8_0/Q4_0/Q5_0/Q5_1 with a DOTPROD core, no
+     * per-block int->float conversion, and a hoisted weight delta.
+     * PICOLM_Q0_FAST=0 reverts to the generic NEON_QGEMM macros below. */
+    {
+        static int q0_fast = -1;
+        if (q0_fast < 0) { const char *e = getenv("PICOLM_Q0_FAST");
+                           q0_fast = !(e && e[0] == '0'); }
+        if (q0_fast) {
+            if (Atype == GGUF_TYPE_Q8_0 && sgemm_q8_0_q8_0_neon_fast(m, n, k_blocks * 32, A, B, B_d, C, (size_t)ldc, ith, nth)) return 1;
+            if (Atype == GGUF_TYPE_Q4_0 && sgemm_q4_0_q8_0_neon_fast(m, n, k_blocks * 32, A, B, B_d, C, (size_t)ldc, ith, nth)) return 1;
+            if (Atype == GGUF_TYPE_Q5_0 && sgemm_q5_0_q8_0_neon_fast(m, n, k_blocks * 32, A, B, B_d, C, (size_t)ldc, ith, nth)) return 1;
+            if (Atype == GGUF_TYPE_Q5_1 && sgemm_q5_1_q8_0_neon_fast(m, n, k_blocks * 32, A, B, B_d, C, (size_t)ldc, ith, nth)) return 1;
+        }
+    }
     if (Atype == GGUF_TYPE_Q8_0) {
         if (n >= 4) { sgemm_neon_q8_qs_d4(m, n, k_blocks, (const block_q8_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth); return 1; }
         sgemm_neon_q8_qs_d(m, n, k_blocks, (const block_q8_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth);

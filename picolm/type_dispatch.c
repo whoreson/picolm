@@ -6,6 +6,32 @@
  *
  * Wrapper functions normalize the diverse vec_dot signatures in quant.c
  * to the uniform type_gemv_fn signature: (w, a, n, out, nrows).
+ *
+ * IMPORTANT -- fn_gemm guards and cross-target linking
+ * ----------------------------------------------------
+ * Several sources listed in SGEMM_SRCS are NEON-only and compile to NOTHING on
+ * x86 (they wrap their whole body in #if defined(__ARM_NEON)):
+ *
+ *     sgemm_k_q8k_neon_fast.c   sgemm_q2_k_r4_neon.c
+ *     sgemm_q0_neon_fast.c      sgemm_iq4nl_neon_fast.c
+ *     sgemm_k_q8k_neon.c        sgemm_q2_k_neon.c
+ *
+ * So any fn_gemm that points at a symbol from those files MUST be guarded by
+ * #if defined(__ARM_NEON), not by a combined ARM-or-AVX condition. Getting this
+ * wrong is not a compile error -- it is an undefined reference at link time on
+ * x86 only, which is exactly how the AVX CI broke once (Q4_K pointed at
+ * sgemm_q4_k_q8_k_neon_fast under `__ARM_NEON || (__AVX2__ && __F16C__)`).
+ *
+ * On x86 the K-quants have their own GEMMs (_best, via sgemm_iq6_k.c), and
+ * Q4_K additionally has a dedicated branch in matmul_batch() that calls
+ * picolm_sgemm_d_q4k(). Q4_K therefore keeps fn_gemm = NULL off ARM.
+ *
+ * To check after editing: preprocess this file as x86 and look for _neon
+ * symbols in fn_gemm initialisers:
+ *
+ *   clang --target=x86_64-linux-gnu -E -std=c11 -D_GNU_SOURCE -I. \
+ *         -mavx2 -mf16c -DPICOLM_AVX2 -c type_dispatch.c \
+ *     | grep -oE 'fn_gemm = [a-z0-9_]+' | grep neon    # must print nothing
  */
 #include "type_dispatch.h"
 #include "sgemm.h"
@@ -143,7 +169,22 @@ static void gemv_iq4_nl_r4(const void *w, const void *a, int n, float *out, int 
 }
 
 /* Q2_K_R4: 4 rows per block; fill out[0..3] with the four rows' dots. */
+/* Q2_K_R4 single-column GEMV.
+ *
+ * The scalar dequantise-then-dot body that used to live here is what made
+ * Fimbulvetr-Q2_K_R4 prefill take 186-250 s: it is called once per (4-row
+ * block, activation column) and ran a float dequantise plus a scalar FMA loop
+ * each time. The NEON GEMM in sgemm_q2_k_r4_neon.c handles n=1 directly and
+ * measured 12.2 GFLOPS against 3.3 here, so delegate to it and keep the scalar
+ * body only as a fallback for builds without it.
+ */
 static void gemv_q2_k_r4(const void *w, const void *a, int n, float *out, int nrows) {
+#if defined(__ARM_NEON)
+    if (nrows == 4 && (n % QK_K) == 0 &&
+        sgemm_q2_k_r4_q8_k_neon_fast(4, 1, n, w, a, out, 4, 0, 1)) {
+        return;
+    }
+#endif
     (void)nrows;
     const block_q8_K *y = (const block_q8_K *)a;
     const int nb = n / QK_K;
@@ -309,7 +350,13 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
         .act_fmt = ACT_FMT_Q8_K,
         .rows_per_block = 1,
         .fn_gemv = gemv_q4_K,
-#if defined(__ARM_NEON) || (defined(__AVX2__) && defined(__F16C__))
+#if defined(__ARM_NEON)
+        /* sgemm_k_q8k_neon_fast.c is NEON-only, so this symbol exists only on
+         * ARM. On AVX2/AVX1 builds fn_gemm stays NULL on purpose:
+         * matmul_batch() has a dedicated Q4_K branch that reaches
+         * picolm_sgemm_d_q4k() (sgemm_q4k_q8k_d4 / sgemm_q4_k_q8_k_fast).
+         * Referencing the NEON symbol under an AVX guard is a link error --
+         * it broke the x86 CI. */
         .fn_gemm = sgemm_q4_k_q8_k_neon_fast,
 #else
         .fn_gemm = NULL,
@@ -542,7 +589,11 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
         .act_fmt = ACT_FMT_Q8_K,
         .rows_per_block = 4,
         .fn_gemv = gemv_q2_k_r4,
+#if defined(__ARM_NEON)
+        .fn_gemm = sgemm_q2_k_r4_q8_k_neon_fast, /* 4x8 NEON/DOTPROD, one decode per 4 rows */
+#else
         .fn_gemm = NULL,
+#endif
         .has_qgemm_d = 0,
         .fn_dequant_single = (type_dequant_single_fn)dequantize_row_q2_k_r4_single,
         .needs_qx = 1,

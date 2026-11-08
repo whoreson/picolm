@@ -46,7 +46,7 @@
 #endif
 #include "quant.h"
 
-#define IQ4R4_GEMM_TILE 4
+#define IQ4R4_GEMM_TILE 22
 
 /* ================================================================
  * AVX2
@@ -266,11 +266,20 @@ static inline int32x4_t iq4r4_neon_block(const int8x16_t wlo[4], const int8x16_t
     return acc;
 }
 
-static inline float32x4_t iq4r4_neon_accum(float32x4_t acc4, int32x4_t s, const block_iq4_nl_r4 *b, uint16_t yd) {
-    float d[4];
+/* The four weight deltas are per (row-block, ib) and do NOT depend on the
+ * activation column, so the caller converts them once per ib and passes the
+ * vector in. Converting them here cost four fp16 lookups per (block, column),
+ * which measured ~10% of this kernel. */
+static inline float32x4_t iq4r4_neon_accum(float32x4_t acc4, int32x4_t s,
+                                           float32x4_t wd, uint16_t yd) {
     const float yf = fp16_to_fp32_lookup(yd);
-    for (int r = 0; r < 4; ++r) d[r] = fp16_to_fp32_lookup(b->d[r]) * yf;
-    return vfmaq_f32(acc4, vcvtq_f32_s32(s), vld1q_f32(d));
+    return vfmaq_f32(acc4, vcvtq_f32_s32(s), vmulq_n_f32(wd, yf));
+}
+
+static inline float32x4_t iq4r4_neon_wd(const block_iq4_nl_r4 *b) {
+    return vdupq_n_f32(0.0f)
+         + (float32x4_t){ fp16_to_fp32_lookup(b->d[0]), fp16_to_fp32_lookup(b->d[1]),
+                          fp16_to_fp32_lookup(b->d[2]), fp16_to_fp32_lookup(b->d[3]) };
 }
 
 void vec_dot_iq4_nl_r4_q8_0_neon(const void *vx, const void *wy, int n,
@@ -288,7 +297,7 @@ void vec_dot_iq4_nl_r4_q8_0_neon(const void *vx, const void *wy, int n,
     for (int ib = 0; ib < nb; ++ib) {
         int8x16_t wlo[4], whi[4];
         iq4r4_neon_decode(&xb[ib], lut, wlo, whi);
-        acc4 = iq4r4_neon_accum(acc4, iq4r4_neon_block(wlo, whi, y[ib].qs), &xb[ib], y[ib].d);
+        acc4 = iq4r4_neon_accum(acc4, iq4r4_neon_block(wlo, whi, y[ib].qs), iq4r4_neon_wd(&xb[ib]), y[ib].d);
     }
     vst1q_f32(out, acc4);
 }
@@ -323,9 +332,10 @@ int sgemm_iq4_nl_r4_q8_0_neon(int nrows, int ncols, int k,
             for (int ib = 0; ib < nb; ++ib) {
                 int8x16_t wlo[4], whi[4];
                 iq4r4_neon_decode(&wb[ib], lut, wlo, whi);      /* decoded once per tile */
+                const float32x4_t wd = iq4r4_neon_wd(&wb[ib]);  /* deltas: once per ib */
                 for (int c = 0; c < nc; ++c) {
                     const block_q8_0 *ac = a + (size_t)(c0 + c) * (size_t)nb + ib;
-                    acc4[c] = iq4r4_neon_accum(acc4[c], iq4r4_neon_block(wlo, whi, ac->qs), &wb[ib], ac->d);
+                    acc4[c] = iq4r4_neon_accum(acc4[c], iq4r4_neon_block(wlo, whi, ac->qs), wd, ac->d);
                 }
             }
             for (int c = 0; c < nc; ++c) {

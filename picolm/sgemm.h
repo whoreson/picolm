@@ -99,6 +99,27 @@ int sgemm_q4_k_q8_k_neon_fast(int nrows, int ncols, int k,
         const void *vx, const void *vy, float *out, size_t bs,
         int ith, int nth);
 
+/* Q8_0 / Q4_0 / Q5_0 / Q5_1 x Q8_0 NEON GEMM (sgemm_q0_neon_fast.c).
+ * Same ABI as picolm_sgemm_d. Q5_1 had no NEON path at all before this. */
+int sgemm_q8_0_q8_0_neon_fast(int nrows, int ncols, int k,
+        const void *vx, const void *vy, const float *vy_d,
+        float *out, size_t bs, int ith, int nth);
+int sgemm_q4_0_q8_0_neon_fast(int nrows, int ncols, int k,
+        const void *vx, const void *vy, const float *vy_d,
+        float *out, size_t bs, int ith, int nth);
+int sgemm_q5_0_q8_0_neon_fast(int nrows, int ncols, int k,
+        const void *vx, const void *vy, const float *vy_d,
+        float *out, size_t bs, int ith, int nth);
+int sgemm_q5_1_q8_0_neon_fast(int nrows, int ncols, int k,
+        const void *vx, const void *vy, const float *vy_d,
+        float *out, size_t bs, int ith, int nth);
+
+/* Q2_K_R4 x Q8_K NEON GEMM (sgemm_q2_k_r4_neon.c). 4-row interleaved weights,
+ * so all four rows share one decode. Same ABI as the sgemm_*_best() functions. */
+int sgemm_q2_k_r4_q8_k_neon_fast(int nrows, int ncols, int k,
+        const void *vx, const void *vy, float *out, size_t bs,
+        int ith, int nth);
+
 /* IQ4_NL x Q8_0 NEON GEMM: DOTPROD/I8MM with the per-block int->float
  * conversion hoisted, 12 weight rows x 22 activation rows.
  * Same ABI as picolm_sgemm_d (B_d carries the per-block activation deltas). */

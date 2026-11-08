@@ -3000,7 +3000,12 @@ void matmul_batch(float *out, const float *x, int n_batch,
     /* Try tiled GEMM if available for this type.
      * Must use tensor_parallel_for to dispatch with correct ith/nth per thread. */
 #if (defined(__AVX2__) && defined(__F16C__)) || defined(__ARM_NEON)
-    if (ti->fn_gemm && n_batch >= 4) {
+    /* The n_batch >= 4 gate exists because a tiled GEMM pays off only once it
+     * has columns to amortise its per-tile setup over. That reasoning does not
+     * apply to the interleaved R4 types: q2_k_r4 measured 12.2 GFLOPS at n=1
+     * with its table GEMM against 3.3 GFLOPS on the scalar gemv path, because
+     * the row interleave already gives it 4 rows of work. So allow R4 at n=1. */
+    if (ti->fn_gemm && (n_batch >= 4 || (ti->rows_per_block > 1 && n_batch >= 1))) {
         int nth = pool_total_threads(1);
         /* Use a task wrapper that passes the table's fn_gemm with correct ith */
         gemm_table_ctx_t ctx = { d, n_batch, n, W, qb.qbuf, out, d, ti->fn_gemm };
