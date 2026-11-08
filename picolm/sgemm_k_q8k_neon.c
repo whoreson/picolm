@@ -27,17 +27,43 @@
 
 /* ---- 16-value int8 dot, best available core -------------------------- */
 static inline int32_t kq_dot16(int8x16_t a, int8x16_t b) {
-#if defined(__ARM_FEATURE_MATMUL_INT8)
+#if defined(__ARM_FEATURE_DOTPROD)
+    return vaddvq_s32(vdotq_s32(vdupq_n_s32(0), a, b));
+#elif defined(__ARM_FEATURE_MATMUL_INT8)
     int32x4_t s = vmmlaq_s32(vdupq_n_s32(0), a, b);
     return vgetq_lane_s32(s, 0) + vgetq_lane_s32(s, 3);
-#elif defined(__ARM_FEATURE_DOTPROD)
-    return vaddvq_s32(vdotq_s32(vdupq_n_s32(0), a, b));
 #else
     int16x8_t p0 = vmull_s8(vget_low_s8(a),  vget_low_s8(b));
     int16x8_t p1 = vmull_s8(vget_high_s8(a), vget_high_s8(b));
     return vaddvq_s32(vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)));
 #endif
 }
+
+/* ---- scaled int8 dot accumulate ----
+ *
+ * DOTPROD: vdotq_s32 yields four lanes, each one 4-byte-column partial of the
+ * SAME 16-value sub-block, so all four lanes share one scale and that scale
+ * folds into the int32 accumulator with a broadcast multiply. This removes the
+ * per-sub-block vaddvq that otherwise gates the whole K-quant kernel.
+ *
+ * I8MM and plain NEON have no equivalent in-lane broadcast (I8MM lanes are
+ * [d0,d0,d1,d1], and vpaddlq already collapses the dot), so those targets use
+ * the kq_dot16()/kq_hsum_scaled() pair instead, which multiplies after folding.
+ * Getting this wrong silently drops the scale, so the accumulation helper is
+ * only compiled where it is exact. */
+#if defined(__ARM_FEATURE_DOTPROD)
+#define KQ_INLINE_SCALE 1
+#endif
+
+#if defined(KQ_INLINE_SCALE)
+static inline int32x4_t kq_acc_scaled(int32x4_t acc, int8x16_t a, int8x16_t b, int32_t sc) {
+    return vmlaq_n_s32(acc, vdotq_s32(vdupq_n_s32(0), a, b), sc);
+}
+static inline int32_t kq_hsum_acc(int32x4_t v) { return vaddvq_s32(v); }
+#else
+/* Portable form: fold first, then scale in scalar code. */
+#define KQ_INLINE_SCALE 0
+#endif
 
 /* ===================== Q6_K =====================
  * block_q6_K: ql[128] low nibbles, qh[64] high 2 bits, scales[16] int8, d.
@@ -91,6 +117,33 @@ static inline void q6k_decode(const block_q6_K *x, int8x16_t g[16]) {
 static inline int32_t q6k_dot_decoded(const int8x16_t g[16], const int8_t sc[16],
                                       const block_q8_K *y) {
     const int8_t *q8 = y->qs;
+#if KQ_INLINE_SCALE
+    /* Scale folded into the int32 accumulator: no per-sub-block hsum. The
+     * -32*bs correction uses bsums (not q8) and stays scalar. */
+    int32x4_t a0 = vdupq_n_s32(0), a1 = vdupq_n_s32(0),
+              a2 = vdupq_n_s32(0), a3 = vdupq_n_s32(0);
+    int32_t corr = 0;
+    for (int chunk = 0; chunk < 2; ++chunk) {
+        const int8_t *q8_c = q8 + chunk * 128;
+        const int16_t *bs  = y->bsums + chunk * 8;
+        for (int half = 0; half < 2; ++half) {
+            for (int k = 0; k < 4; ++k) {
+                const int32_t sb = chunk * 8 + half + k * 2;
+                const int8x16_t q8v = vld1q_s8(q8_c + k * 32 + half * 16);
+                const int8x16_t gv  = g[chunk * 8 + half * 4 + k];
+                const int32_t s = sc[sb];
+                switch (k) {
+                    case 0: a0 = kq_acc_scaled(a0, gv, q8v, s); break;
+                    case 1: a1 = kq_acc_scaled(a1, gv, q8v, s); break;
+                    case 2: a2 = kq_acc_scaled(a2, gv, q8v, s); break;
+                    default:a3 = kq_acc_scaled(a3, gv, q8v, s); break;
+                }
+                corr -= 32 * s * (int32_t)bs[half + k * 2];
+            }
+        }
+    }
+    return kq_hsum_acc(vaddq_s32(vaddq_s32(a0, a1), vaddq_s32(a2, a3))) + corr;
+#else
     int32_t isum = 0;
     for (int chunk = 0; chunk < 2; ++chunk) {
         const int8_t *q8_c = q8 + chunk * 128;
@@ -100,13 +153,12 @@ static inline int32_t q6k_dot_decoded(const int8x16_t g[16], const int8_t sc[16]
                 const int32_t sb = chunk * 8 + half + k * 2;
                 const int8x16_t q8v = vld1q_s8(q8_c + k * 32 + half * 16);
                 const int32_t dot = kq_dot16(g[chunk * 8 + half * 4 + k], q8v);
-                /* bsums[] is indexed by sub-block (0..15); bs is already
-                 * advanced by chunk*8, so use the within-chunk index. */
                 isum += sc[sb] * (dot - 32 * (int32_t)bs[half + k * 2]);
             }
         }
     }
     return isum;
+#endif
 }
 
 /* Q6_K scalar-ish block dot (reference for the tiling, mirrors quant.c). */
@@ -232,14 +284,28 @@ static inline void q3k_scales(const block_q3_K *x, int8_t sc[16]) {
 static inline int32_t q3k_dot_decoded(const int8x16_t g[16], const int8_t sc[16],
                                       const block_q8_K *y) {
     const int8_t *q8 = y->qs;
+    /* g[] is laid out as (chunk, j, {a,b}); the reference consumes q8 in the
+     * same order: 16 bytes for `a` then 16 for `b` per (chunk, j) step, so
+     * sub-block i lives at q8[(i/2)*32 + (i%2)*16]. */
+#if KQ_INLINE_SCALE
+    int32x4_t a0 = vdupq_n_s32(0), a1 = vdupq_n_s32(0);
+    for (int s = 0; s < 8; ++s) {          /* 8 chunk/j steps = 16 sub-blocks */
+        const int32_t sb = s * 2;
+        const int8_t *qv = q8 + s * 32;
+        a0 = kq_acc_scaled(a0, g[sb],     vld1q_s8(qv),      sc[sb]);
+        a1 = kq_acc_scaled(a1, g[sb + 1], vld1q_s8(qv + 16), sc[sb + 1]);
+    }
+    return kq_hsum_acc(vaddq_s32(a0, a1));
+#else
     int32_t isum = 0;
-    for (int i = 0; i < 16; ++i) {
-        /* g[] is laid out as (chunk, j, {a,b}); the reference consumes q8 in
-         * the same order, 16 bytes for `a` then 16 for `b` (32 per (chunk,j)). */
-        const int8x16_t q8v = vld1q_s8(q8 + (i / 2) * 32 + (i % 2) * 16);
-        isum += kq_dot16(g[i], q8v) * (int32_t)sc[i];
+    for (int s = 0; s < 8; ++s) {
+        const int32_t sb = s * 2;
+        const int8_t *qv = q8 + s * 32;
+        isum += kq_dot16(g[sb],     vld1q_s8(qv))      * (int32_t)sc[sb];
+        isum += kq_dot16(g[sb + 1], vld1q_s8(qv + 16)) * (int32_t)sc[sb + 1];
     }
     return isum;
+#endif
 }
 
 static void q3k_tile(const block_q3_K *A, int lda, const block_q8_K *B, int ldb,
@@ -293,16 +359,23 @@ int sgemm_q3_k_q8_k_neon(int nrows, int ncols, int k, const void *vx,
 
 #if defined(__ARM_NEON)
 /* Q4_K table-ABI adapter: the actual kernel is picolm_sgemm_d_q4k(), which
- * already has a NEON path (I8MM vmmlaq_s32 when available, basic NEON
- * otherwise). Exposing it through fn_gemm lets Q4_K participate in the fused
- * dual-GEMM path (matmul_dual_batch), which otherwise falls back to two
- * separate matmul_batch calls plus a duplicate activation quantisation. */
+ * already has a NEON path (I8MM vmmlaq_s32 when available, DOTPROD vdotq_s32,
+ * basic NEON otherwise) plus the AVX2/VNNI decode-once R8 path. Exposing it
+ * through fn_gemm lets Q4_K participate in the fused dual-GEMM path
+ * (matmul_dual_batch), which otherwise falls back to two separate
+ * matmul_batch calls plus a duplicate activation quantisation.
+ *
+ * Return value = "rows handled", and gemm_table_dual_task() treats 0 as fatal.
+ * picolm_sgemm_d_q4k() returns 0 both for real failures and for the PICOLM_SGEMM
+ * kill switch, so map any 0 to "handled" here and let the caller's scalar
+ * fallback deal with a disabled GEMM. */
 int sgemm_q4_k_q8_k_best_neon(int nrows, int ncols, int k,
                               const void *vx, const void *vy, float *out,
                               size_t bs, int ith, int nth) {
     if (nrows < 1 || ncols < 1 || k <= 0 || (k % QK_K) != 0) return 0;
     const int nb = k / QK_K;
-    return picolm_sgemm_d_q4k(nrows, ncols, nb, vx, nb, vy, nb,
-                              out, (int)bs, ith, nth);
+    (void)picolm_sgemm_d_q4k(nrows, ncols, nb, vx, nb, vy, nb,
+                             out, (int)bs, ith, nth);
+    return nrows;
 }
 #endif

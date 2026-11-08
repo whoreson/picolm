@@ -87,6 +87,45 @@ int sgemm_q4_k_q8_k_best_neon(int nrows, int ncols, int k,
 
 /* Q2_K x Q8_K tiled NEON GEMM (ARM): C[ncols][nrows] = act @ W^T.
  * Same ABI as the sgemm_*_best() table functions. Returns rows computed. */
+/* Q2_K x Q8_K NEON GEMM, no per-sub-block horizontal sums
+ * (sgemm_k_q8k_neon_fast.c). Same ABI as sgemm_q2_k_q8_k_neon. */
+int sgemm_q2_k_q8_k_neon_fast(int nrows, int ncols, int k,
+        const void *vx, const void *vy, float *out, size_t bs,
+        int ith, int nth);
+
+/* Q4_K x Q8_K NEON GEMM, no per-sub-block horizontal sums, 8x4 tiles
+ * (sgemm_k_q8k_neon_fast.c). Same ABI as the sgemm_*_best() table functions. */
+int sgemm_q4_k_q8_k_neon_fast(int nrows, int ncols, int k,
+        const void *vx, const void *vy, float *out, size_t bs,
+        int ith, int nth);
+
+/* IQ4_NL x Q8_0 NEON GEMM: DOTPROD/I8MM with the per-block int->float
+ * conversion hoisted, 12 weight rows x 22 activation rows.
+ * Same ABI as picolm_sgemm_d (B_d carries the per-block activation deltas). */
+int sgemm_iq4_nl_q8_0_neon_fast(int nrows, int ncols, int k,
+        const void *vx, const void *vy, const float *vy_d,
+        float *out, size_t bs, int ith, int nth);
+
+/* Q5_K x Q8_K NEON GEMM, no per-sub-block horizontal sums, 8x16 tiles.
+ * Only built when the int8 core can apply a scale in-lane (DOTPROD or plain
+ * NEON); the I8MM-only configuration falls back to the per-column dot. */
+#if defined(__ARM_FEATURE_DOTPROD) || !defined(__ARM_FEATURE_MATMUL_INT8)
+int sgemm_q5_k_q8_k_neon_fast(int nrows, int ncols, int k,
+        const void *vx, const void *vy, float *out, size_t bs,
+        int ith, int nth);
+#endif
+
+/* Q6_K x Q8_K NEON GEMM, no per-sub-block horizontal sums, 8x16 tiles. */
+int sgemm_q6_k_q8_k_neon_fast(int nrows, int ncols, int k,
+        const void *vx, const void *vy, float *out, size_t bs,
+        int ith, int nth);
+
+/* Q3_K x Q8_K NEON GEMM, no per-sub-block horizontal sums, 8x16 tiles. */
+int sgemm_q3_k_q8_k_neon_fast(int nrows, int ncols, int k,
+        const void *vx, const void *vy, float *out, size_t bs,
+        int ith, int nth);
+
+/* Q2_K x Q8_K NEON GEMM (previous implementation, kept for A/B testing). */
 int sgemm_q2_k_q8_k_neon(int nrows, int ncols, int k,
         const void *vx, const void *vy, float *out, size_t bs,
         int ith, int nth);

@@ -2454,15 +2454,20 @@ static void gemm_table_task(int idx, void *ctxp) {
  *
  * Both matrices must have identical nrows/ncols/k (true for gate+up).
  * Contract matches gemm_table_task: fn_gemm is responsible for the per-thread
- * row slice via (ith, nth); a 0 return is fatal here for the same reason. */
+ * row slice via (ith, nth); a 0 return is fatal here for the same reason.
+ *
+ * fn1 and fn2 are separate: the only requirement is that the two types share
+ * the same act_fmt (so one quantised activation buffer serves both), NOT that
+ * they resolve to the same kernel. Mixed pairs like Q2_K gate + Q4_K up are
+ * common, and using fn1 for both sides silently runs the wrong dequantiser. */
 typedef struct { int nrows, ncols, k; const void *w1, *w2, *a; float *out1, *out2;
-                 size_t bs; type_gemm_fn fn; } gemm_table_dual_ctx_t;
+                 size_t bs; type_gemm_fn fn1, fn2; } gemm_table_dual_ctx_t;
 
 static void gemm_table_dual_task(int idx, void *ctxp) {
     gemm_table_dual_ctx_t *c = (gemm_table_dual_ctx_t *)ctxp;
     int nth = pool_total_threads(1);
-    int r1 = c->fn(c->nrows, c->ncols, c->k, c->w1, c->a, c->out1, c->bs, idx, nth);
-    int r2 = c->fn(c->nrows, c->ncols, c->k, c->w2, c->a, c->out2, c->bs, idx, nth);
+    int r1 = c->fn1(c->nrows, c->ncols, c->k, c->w1, c->a, c->out1, c->bs, idx, nth);
+    int r2 = c->fn2(c->nrows, c->ncols, c->k, c->w2, c->a, c->out2, c->bs, idx, nth);
     if ((r1 == 0 || r2 == 0) && idx == 0) {
         fprintf(stderr,
                 "FATAL: fn_gemm returned 0 in the fused dual path "
@@ -3854,7 +3859,8 @@ void matmul_dual_batch(float *out1, float *out2, const float *x, int n_batch,
             if (qbd.qbuf) {
                 int nth = pool_total_threads(1);
                 gemm_table_dual_ctx_t gd = { d, n_batch, n, W1, W2, qbd.qbuf,
-                                             out1, out2, (size_t)d, ti1->fn_gemm };
+                                             out1, out2, (size_t)d,
+                                             ti1->fn_gemm, ti2->fn_gemm };
                 tensor_parallel_for(nth, gemm_table_dual_task, &gd);
                 free_quant_buf(&qbd, NULL);
                 DISPATCH2("GEMM_table_dual_fused");

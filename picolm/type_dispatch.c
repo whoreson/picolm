@@ -300,12 +300,20 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
         .use_repacked = 0,
         .has_dual_scalar_path = 0,
     },
-    /* Q4_K: plain, Q8_K activations. GEMM uses picolm_sgemm_d_q4k (different sig). */
+    /* Q4_K: plain, Q8_K activations. GEMM uses picolm_sgemm_d_q4k via the
+     * sgemm_q4_k_q8_k_best_neon adapter (same Q8_K ABI as the table GEMMs).
+     * Leaving fn_gemm NULL made matmul_dual_batch() reject Q4_K from the fused
+     * path, so every Q2_K gate + Q4_K up pair fell back to two matmul_batch()
+     * calls. */
     [GGUF_TYPE_Q4_K] = {
         .act_fmt = ACT_FMT_Q8_K,
         .rows_per_block = 1,
         .fn_gemv = gemv_q4_K,
-        .fn_gemm = NULL, /* handled in matmul_batch via picolm_sgemm_d_q4k */
+#if defined(__ARM_NEON) || (defined(__AVX2__) && defined(__F16C__))
+        .fn_gemm = sgemm_q4_k_q8_k_neon_fast,
+#else
+        .fn_gemm = NULL,
+#endif
         .has_qgemm_d = 0,
         .fn_dequant_single = NULL,
         .needs_qx = 1,
@@ -319,6 +327,8 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
         .fn_gemv = gemv_q5_K,
 #if defined(__AVX2__)
         .fn_gemm = sgemm_q5_k_q8_k_best,   /* decode-once R8 GEMM (VNNI/AVX2) for big shapes, per-column dot otherwise */
+#elif defined(__ARM_NEON) && (defined(__ARM_FEATURE_DOTPROD) || !defined(__ARM_FEATURE_MATMUL_INT8))
+        .fn_gemm = sgemm_q5_k_q8_k_neon_fast, /* 8x16 NEON/DOTPROD, no per-sub-block hsums */
 #else
         .fn_gemm = NULL,
 #endif
@@ -336,7 +346,7 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
 #if defined(__AVX2__)
         .fn_gemm = sgemm_q6_k_q8_k_best,   /* decode-once R8 GEMM (VNNI/AVX2) for big shapes, per-column dot otherwise */
 #elif defined(__ARM_NEON)
-        .fn_gemm = sgemm_q6_k_q8_k_neon,   /* 4x4 NEON/DOTPROD/I8MM batched GEMM (sgemm_k_q8k_neon.c) */
+        .fn_gemm = sgemm_q6_k_q8_k_neon_fast, /* 8x16 NEON/DOTPROD/I8MM, no per-sub-block hsums */
 #else
         .fn_gemm = NULL,
 #endif
@@ -354,7 +364,7 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
 #if defined(__AVX2__)
         .fn_gemm = sgemm_q3_k_q8_k_best,   /* decode-once R8 GEMM (VNNI/AVX2) for big shapes, per-column dot otherwise */
 #elif defined(__ARM_NEON)
-        .fn_gemm = sgemm_q3_k_q8_k_neon,   /* 4x4 NEON/DOTPROD/I8MM batched GEMM (sgemm_k_q8k_neon.c) */
+        .fn_gemm = sgemm_q3_k_q8_k_neon_fast, /* 8x16 NEON/DOTPROD/I8MM, no per-sub-block hsums */
 #else
         .fn_gemm = NULL,
 #endif
@@ -372,7 +382,7 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
 #if defined(__AVX2__)
         .fn_gemm = sgemm_q2_k_q8_k_best,   /* decode-once R8 GEMM (VNNI/AVX2) for big shapes, per-column dot otherwise */
 #elif defined(__ARM_NEON)
-        .fn_gemm = sgemm_q2_k_q8_k_neon,   /* 4x4 NEON/DOTPROD/I8MM batched GEMM (sgemm_q2_k_neon.c) */
+        .fn_gemm = sgemm_q2_k_q8_k_neon_fast, /* 8x4 NEON/DOTPROD/I8MM, no per-sub-block hsums */
 #else
         .fn_gemm = NULL,
 #endif

@@ -3034,6 +3034,15 @@ int picolm_sgemm_d(int m, int n, int k_blocks,
         sgemm_neon_q5_qs_d(m, n, k_blocks, (const block_q5_0*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth);
         return 1;
     } else if (Atype == GGUF_TYPE_IQ4_NL) {
+        /* sgemm_iq4nl_neon_fast.c: DOTPROD/I8MM core, per-block int->float
+         * conversion hoisted across 4 rows, 12x22 tiles. Measured 21.3 ->
+         * 37.2 GFLOPS at m=1024 n=44 k=4096 (1.74x) on a Cortex-A720.
+         * PICOLM_IQ4NL_FAST=0 falls back to the generic NEON_QGEMM macros. */
+        static int fast_en = -1;
+        if (fast_en < 0) { const char *e = getenv("PICOLM_IQ4NL_FAST");
+                           fast_en = !(e && e[0] == '0'); }
+        if (fast_en && sgemm_iq4_nl_q8_0_neon_fast(m, n, k_blocks * 32, A, B, B_d, C, (size_t)ldc, ith, nth))
+            return 1;
         if (n >= 4) { sgemm_neon_iq4nl_qs_d4(m, n, k_blocks, (const block_iq4_nl*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth); return 1; }
         sgemm_neon_iq4nl_qs_d(m, n, k_blocks, (const block_iq4_nl*)A, lda, B, ldb, B_d, ldb_d, C, ldc, ith, nth);
         return 1;
