@@ -46,7 +46,14 @@
 #endif
 #include "quant.h"
 
+/* Column tile. NEON streams 22 columns per decoded weight block; the AVX2 driver's switch(nc) only has
+ * 1..4-column tiles (default = 4), so its tile MUST stay 4: with a larger value nc>4 left res[4..nc-1]
+ * uninitialized and the store loop copied that stack garbage into the output. */
+#if defined(__ARM_NEON)
 #define IQ4R4_GEMM_TILE 22
+#else
+#define IQ4R4_GEMM_TILE 4
+#endif
 
 /* ================================================================
  * AVX2

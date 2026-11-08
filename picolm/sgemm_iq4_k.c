@@ -75,53 +75,41 @@ void vec_dot_iq4_k_q8_k_avx2(const void *vx, const void *wy, int n, float *out) 
         const int8_t *q8 = qk[ibl].qs;
 
         __m256i isum = _mm256_setzero_si256();
+        const __m128i m0f = _mm_set1_epi8(0x0f);
 
+        /* One 256-bit pipeline per 32-value sub-block: low nibbles -> first 16 values, high nibbles ->
+         * second 16, each half through its own 16-entry table.  VPSHUFB is lane-local, so ONE shuffle
+         * with [tableA | tableB] decodes both halves; the table choice is plain address arithmetic from
+         * the `extra` bits (the old ternaries were data-dependent branches that mispredicted on every
+         * sub-block).  Integer sums are unchanged, so results are bit-identical to the old kernel. */
         for (int ib = 0; ib < QK_K / 32; ++ib) {
             const uint8_t sh = iq4[ibl].scales_h[ib / 2] >> (4 * (ib % 2));
-            int scale_lo = (int)(((iq4[ibl].scales_l[ib] & 0xf) | ((sh << 4) & 0x30)) - 32);
-            int scale_hi = (int)(((iq4[ibl].scales_l[ib] >> 4) | ((sh << 2) & 0x30)) - 32);
+            const int scale_lo = (int)(((iq4[ibl].scales_l[ib] & 0xf) | ((sh << 4) & 0x30)) - 32);
+            const int scale_hi = (int)(((iq4[ibl].scales_l[ib] >> 4) | ((sh << 2) & 0x30)) - 32);
 
-            int use_table1_lo = extra & 1;
-            int use_table1_hi = extra & 2;
-            extra >>= 2;
+            const unsigned t_lo = (extra >> (2 * ib)) & 1u, t_hi = (extra >> (2 * ib + 1)) & 1u;
 
-            __m128i qs_vec = _mm_loadu_si128((const __m128i *)qs);
+            const __m128i qs_vec = _mm_loadu_si128((const __m128i *)qs);
+            const __m256i idx = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_and_si128(qs_vec, m0f)),
+                                                         _mm_and_si128(_mm_srli_epi16(qs_vec, 4), m0f), 1);
+            const __m128i ta = _mm_loadu_si128((const __m128i *)(iq4k_values_l + 16 * t_lo));
+            const __m128i tb = _mm_loadu_si128((const __m128i *)(iq4k_values_l + 16 * t_hi));
+            const __m256i w = _mm256_shuffle_epi8(_mm256_inserti128_si256(_mm256_castsi128_si256(ta), tb, 1), idx);
 
-            __m128i qx_lo = _mm_and_si128(qs_vec, _mm_set1_epi8(0x0f));
-            __m128i y_lo = _mm_shuffle_epi8(
-                _mm_loadu_si128((const __m128i *)(use_table1_lo ? iq4k_values_l + 16 : iq4k_values_l)),
-                qx_lo);
-            __m128i qx_hi = _mm_and_si128(_mm_srli_epi16(qs_vec, 4), _mm_set1_epi8(0x0f));
-            __m128i y_hi = _mm_shuffle_epi8(
-                _mm_loadu_si128((const __m128i *)(use_table1_hi ? iq4k_values_l + 16 : iq4k_values_l)),
-                qx_hi);
-
-            /* Sign trick on DEQUANTIZED LUT values, not raw nibbles.
-             * maddubs(|y|, sign(q8, y)) = |y| * q8 * sign(y) = y * q8
-             * Reference: iqk_common.h multiply_add_avx2() */
-            __m128i q8_lo = _mm_loadu_si128((const __m128i *)q8);
-            __m128i q8_hi = _mm_loadu_si128((const __m128i *)(q8 + 16));
-
-            __m128i abs_y_lo = _mm_sign_epi8(y_lo, y_lo);
-            __m128i abs_y_hi = _mm_sign_epi8(y_hi, y_hi);
-            __m128i sum16_lo = _mm_maddubs_epi16(abs_y_lo, _mm_sign_epi8(q8_lo, y_lo));
-            __m128i sum16_hi = _mm_maddubs_epi16(abs_y_hi, _mm_sign_epi8(q8_hi, y_hi));
-
-            __m128i scale_lo_v = _mm_set1_epi16(scale_lo);
-            __m128i scale_hi_v = _mm_set1_epi16(scale_hi);
-            __m128i prod_lo = _mm_madd_epi16(sum16_lo, scale_lo_v);
-            __m128i prod_hi = _mm_madd_epi16(sum16_hi, scale_hi_v);
-
-            isum = _mm256_add_epi32(isum, _mm256_set_m128i(prod_hi, prod_lo));
+            /* sign trick on the dequantized LUT values: maddubs(|w|, sign(q8, w)) = w * q8 */
+            const __m256i y = _mm256_loadu_si256((const __m256i *)q8);
+            const __m256i s16 = _mm256_maddubs_epi16(_mm256_sign_epi8(w, w), _mm256_sign_epi8(y, w));
+            const __m256i sc = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_set1_epi16((short)scale_lo)), _mm_set1_epi16((short)scale_hi), 1);
+            isum = _mm256_add_epi32(isum, _mm256_madd_epi16(s16, sc));
 
             qs += 16;
             q8 += 32;
         }
 
-        int isum_scalar = _mm256_extract_epi32(isum, 0) + _mm256_extract_epi32(isum, 1)
-                        + _mm256_extract_epi32(isum, 2) + _mm256_extract_epi32(isum, 3)
-                        + _mm256_extract_epi32(isum, 4) + _mm256_extract_epi32(isum, 5)
-                        + _mm256_extract_epi32(isum, 6) + _mm256_extract_epi32(isum, 7);
+        __m128i s4 = _mm_add_epi32(_mm256_castsi256_si128(isum), _mm256_extracti128_si256(isum, 1));
+        s4 = _mm_add_epi32(s4, _mm_shuffle_epi32(s4, 0x4e));
+        s4 = _mm_add_epi32(s4, _mm_shuffle_epi32(s4, 0xb1));
+        const int isum_scalar = _mm_cvtsi128_si32(s4);
         result += (float)isum_scalar * dy;
     }
 

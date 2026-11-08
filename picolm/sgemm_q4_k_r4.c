@@ -25,6 +25,18 @@ static inline float get_m_scale(const block_q4_k_r4 *b, int is) {
     return (float)(sl | (sh << 2));
 }
 
+/* Q4_K_R4 x Q8_K, four rows per call (the decode GEMV).
+ *
+ * Layout (see dequantize_row_q4_k_r4_single): per 32-value sub-block ib, qs[64*ib + 16*kk + 4*row + i]
+ * -- a 16-byte slice kk is 4 rows x one dword.  The low nibble of slice kk holds values
+ *   {0, 16, 4, 20}[kk] + i  and the high nibble {8, 24, 12, 28}[kk] + i, so each (slice, nibble) pair
+ * multiplies ONE contiguous group of 4 activations.  Broadcasting that 4-byte activation group across the
+ * four row dwords and running maddubs + madd against the unsigned nibbles gives all four rows' partial
+ * sums at once (lane r = row r); per sub-block the eight partials are added, multiplied by the vector of
+ * the four rows' integer scales, and accumulated over the super-block.  The min term needs only
+ * m * (bsums of the sub-block) per row.  Scales/mins are unpacked as vectors (4 consecutive bytes of
+ * scales_l, 4 of scales_h).  One float update per super-block instead of one per (sub-block, row).
+ * (Accumulation order differs from the previous kernel, ~1e-7 relative.) */
 void vec_dot_q4_k_r4_q8_k_avx2(const void *vx, const void *wy, int n,
                                   float *out, int nrows) {
     assert(nrows == 4);
@@ -34,110 +46,55 @@ void vec_dot_q4_k_r4_q8_k_avx2(const void *vx, const void *wy, int n,
     const block_q8_K *qk = (const block_q8_K *)wy;
     const int nb = n / QK_K;
 
-    const __m128i mf  = _mm_set1_epi8(0xf);
+    const __m128i m0f = _mm_set1_epi8(0x0f), ones16 = _mm_set1_epi16(1);
+    const __m128i m03 = _mm_set1_epi32(0x03), m0c = _mm_set1_epi32(0x0c), mlo4 = _mm_set1_epi32(0x0f);
+    /* activation dword offsets (within a 32-value sub-block) for (lo0,hi0,lo1,hi1,lo2,hi2,lo3,hi3) */
+    static const int yoff[8] = { 0, 8, 16, 24, 4, 12, 20, 28 };
 
-    /* Extract row k's 4 unique bytes from a 16-byte chunk into low positions.
-     * Layout: chunk bytes 0..3 = row0, 4..7 = row1, 8..11 = row2, 12..15 = row3.
-     * Use -128 (0x80 as signed char) to zero the upper bytes. */
-    const __m128i pick_src[4] = {
-        _mm_set_epi8(-128,-128,-128,-128, -128,-128,-128,-128,
-                     -128,-128,-128,-128, 3,2,1,0),
-        _mm_set_epi8(-128,-128,-128,-128, -128,-128,-128,-128,
-                     -128,-128,-128,-128, 7,6,5,4),
-        _mm_set_epi8(-128,-128,-128,-128, -128,-128,-128,-128,
-                     -128,-128,-128,-128, 11,10,9,8),
-        _mm_set_epi8(-128,-128,-128,-128, -128,-128,-128,-128,
-                     -128,-128,-128,-128, 15,14,13,12),
-    };
-
-    float outv[4] = {0, 0, 0, 0};
+    __m128 outv = _mm_setzero_ps();
 
     for (int ibl = 0; ibl < nb; ibl++) {
         const block_q4_k_r4 *b = &x[ibl];
         const block_q8_K *q = &qk[ibl];
 
-        float q8_scale = q->d;
-
-        /* Per-row bias correction: -m[k] * min * sum(q8) */
-        float bias[4] = {0, 0, 0, 0};
-        for (int ib = 0; ib < QK_K / 32; ib++) {
-            for (int k = 0; k < 4; k++) {
-                int is = 4 * ib + k;
-                float ml = fp16_to_fp32_lookup(b->d[k + 4]) * get_m_scale(b, is);
-                bias[k] += ml * (q->bsums[ib * 2 + 0] + q->bsums[ib * 2 + 1]);
-            }
-        }
+        __m128i acc = _mm_setzero_si128();    /* sum_ib scale[ib][row] * isum[ib][row]   */
+        __m128i mns = _mm_setzero_si128();    /* sum_ib min[ib][row]   * bsum32[ib]      */
 
         for (int ib = 0; ib < QK_K / 32; ib++) {
             const uint8_t *qs = b->qs + 64 * ib;
             const int8_t *q8 = q->qs + 32 * ib;
 
-            __m128i c[4];
-            c[0] = _mm_loadu_si128((const __m128i *)(qs + 0));
-            c[1] = _mm_loadu_si128((const __m128i *)(qs + 16));
-            c[2] = _mm_loadu_si128((const __m128i *)(qs + 32));
-            c[3] = _mm_loadu_si128((const __m128i *)(qs + 48));
+            int32_t lw, hw;
+            memcpy(&lw, b->scales_l + 4 * ib, 4);
+            memcpy(&hw, b->scales_h + 4 * (ib & 3), 4);
+            const __m128i l4 = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(lw));
+            const __m128i h4 = _mm_srli_epi32(_mm_cvtepu8_epi32(_mm_cvtsi32_si128(hw)), 4 * (ib >> 2));
+            const __m128i sc4 = _mm_or_si128(_mm_and_si128(l4, mlo4), _mm_slli_epi32(_mm_and_si128(h4, m03), 4));
+            const __m128i mn4 = _mm_or_si128(_mm_srli_epi32(l4, 4), _mm_slli_epi32(_mm_and_si128(h4, m0c), 2));
 
-            for (int k = 0; k < 4; k++) {
-                __m128i dots1 = _mm_setzero_si128();  /* chunks 0,1 */
-                __m128i dots2 = _mm_setzero_si128();  /* chunks 2,3 */
-
-                for (int cc = 0; cc < 4; cc++) {
-                    /* Extract row k's 4 unique bytes from chunk cc into low positions */
-                    __m128i r = _mm_shuffle_epi8(c[cc], pick_src[k]);
-                    /* r = [b0,b1,b2,b3, 0,...,0] */
-
-                    /* Split into lo/hi nibbles and interleave */
-                    __m128i lo = _mm_and_si128(r, mf);
-                    __m128i hi = _mm_and_si128(_mm_srli_epi16(r, 4), mf);
-                    __m128i w8 = _mm_unpacklo_epi8(lo, hi);
-                    /* w8 = [lo0,hi0,lo1,hi1,lo2,hi2,lo3,hi3, 0,...,0] */
-
-                    /* Activation indices for this chunk */
-                    int act_lo_base, act_hi_base;
-                    if (cc == 0) { act_lo_base = 0; act_hi_base = 8; }
-                    else if (cc == 1) { act_lo_base = 16; act_hi_base = 24; }
-                    else if (cc == 2) { act_lo_base = 4; act_hi_base = 12; }
-                    else { act_lo_base = 20; act_hi_base = 28; }
-
-                    /* Load 4 int8 activations for lo and hi, sign-extend to 4 int16s each */
-                    int32_t act_lo32, act_hi32;
-                    memcpy(&act_lo32, q8 + act_lo_base, sizeof(act_lo32));
-                    memcpy(&act_hi32, q8 + act_hi_base, sizeof(act_hi32));
-                    __m128i act_lo = _mm_cvtepi8_epi16(_mm_cvtsi32_si128(act_lo32));
-                    __m128i act_hi = _mm_cvtepi8_epi16(_mm_cvtsi32_si128(act_hi32));
-                    __m128i a16 = _mm_unpacklo_epi16(act_lo, act_hi);
-                    /* a16 = [a_lo0,a_hi0,a_lo1,a_hi1,a_lo2,a_hi2,a_lo3,a_hi3] as 8 int16s */
-
-                    /* Convert weights to int16s and multiply-accumulate */
-                    __m128i w16 = _mm_cvtepu8_epi16(w8);
-                    __m128i prod = _mm_madd_epi16(w16, a16);
-                    /* prod = 4 int32s */
-
-                    if (cc < 2) dots1 = _mm_add_epi32(dots1, prod);
-                    else        dots2 = _mm_add_epi32(dots2, prod);
-                }
-
-                /* Reduce 4 int32s to 1 */
-                __m128i rd1 = _mm_add_epi32(dots1, _mm_shuffle_epi32(dots1, 0x4e));
-                rd1 = _mm_add_epi32(rd1, _mm_shuffle_epi32(rd1, 0xb1));
-                __m128i rd2 = _mm_add_epi32(dots2, _mm_shuffle_epi32(dots2, 0x4e));
-                rd2 = _mm_add_epi32(rd2, _mm_shuffle_epi32(rd2, 0xb1));
-
-                /* Apply scale */
-                int is = 4 * ib + k;
-                float d = fp16_to_fp32_lookup(b->d[k]);
-                float s = get_d_scale(b, is);
-                outv[k] += (d * s * (float)(_mm_cvtsi128_si32(rd1) + _mm_cvtsi128_si32(rd2))) * q8_scale;
+            __m128i isum = _mm_setzero_si128();
+            for (int kk = 0; kk < 4; kk++) {
+                const __m128i c = _mm_loadu_si128((const __m128i *)(qs + 16 * kk));
+                int32_t ylo, yhi;
+                memcpy(&ylo, q8 + yoff[2 * kk], 4);
+                memcpy(&yhi, q8 + yoff[2 * kk + 1], 4);
+                const __m128i plo = _mm_maddubs_epi16(_mm_and_si128(c, m0f), _mm_set1_epi32(ylo));
+                const __m128i phi = _mm_maddubs_epi16(_mm_and_si128(_mm_srli_epi16(c, 4), m0f), _mm_set1_epi32(yhi));
+                isum = _mm_add_epi32(isum, _mm_madd_epi16(_mm_add_epi16(plo, phi), ones16));
             }
+            acc = _mm_add_epi32(acc, _mm_mullo_epi32(isum, sc4));
+            mns = _mm_add_epi32(mns, _mm_mullo_epi32(mn4, _mm_set1_epi32((int)q->bsums[2 * ib] + (int)q->bsums[2 * ib + 1])));
         }
 
-        for (int k = 0; k < 4; k++) {
-            outv[k] -= bias[k] * q8_scale;
-        }
+        const __m128 d4 = _mm_set_ps(fp16_to_fp32_lookup(b->d[3]), fp16_to_fp32_lookup(b->d[2]),
+                                     fp16_to_fp32_lookup(b->d[1]), fp16_to_fp32_lookup(b->d[0]));
+        const __m128 m4 = _mm_set_ps(fp16_to_fp32_lookup(b->d[7]), fp16_to_fp32_lookup(b->d[6]),
+                                     fp16_to_fp32_lookup(b->d[5]), fp16_to_fp32_lookup(b->d[4]));
+        const __m128 vdy = _mm_set1_ps(q->d);
+        outv = _mm_add_ps(outv, _mm_mul_ps(_mm_sub_ps(_mm_mul_ps(d4, _mm_cvtepi32_ps(acc)), _mm_mul_ps(m4, _mm_cvtepi32_ps(mns))), vdy));
     }
 
-    for (int k = 0; k < 4; k++) out[k] = outv[k];
+    _mm_storeu_ps(out, outv);
 }
 
 int sgemm_q4_k_r4_q8_k_avx2(int nrows, int ncols, int k,

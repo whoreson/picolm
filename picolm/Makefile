@@ -1160,3 +1160,7 @@ gemm_thread_bench: probes/gemm_thread_bench
 # ik-style / R4 K-quant table GEMM timing: ./bench_ik [m n k reps]
 bench_ik: bench_ik.c quant.c type_dispatch.c tensor.c $(SGEMM_SRCS) quant.h sgemm.h
 	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O3 -o $@ bench_ik.c quant.c type_dispatch.c tensor.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
+
+# decode (GEMV) cost per row for every quant type with a table fn_gemv: ./bench_gemv [rows k reps]
+bench_gemv: bench_gemv.c quant.c type_dispatch.c tensor.c $(SGEMM_SRCS) quant.h sgemm.h
+	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O3 -o $@ bench_gemv.c quant.c type_dispatch.c tensor.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++

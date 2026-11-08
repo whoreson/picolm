@@ -28,6 +28,14 @@
 #if defined(PICOLM_NEON)
 #include <arm_neon.h>
 #endif
+
+/* Forward declarations for _best dispatchers calling kernels in other files */
+extern int sgemm_iq4_k_r4_q8_k_avx2(int, int, int, const void *, const void *, float *, size_t, int, int);
+extern int sgemm_iq4_k_r4_q8_k_neon(int, int, int, const void *, const void *, float *, size_t, int, int);
+extern int sgemm_iq2_k_r4_q8_k_avx2(int, int, int, const void *, const void *, float *, size_t, int, int);
+extern int sgemm_iq2_k_r4_q8_k_neon(int, int, int, const void *, const void *, float *, size_t, int, int);
+extern int sgemm_q4_k_r4_q8_k_avx2(int, int, int, const void *, const void *, float *, size_t, int, int);
+extern int sgemm_q4_k_r4_q8_k_neon(int, int, int, const void *, const void *, float *, size_t, int, int);
 #include "quant.h"
 
 #define QK_K 256
@@ -1512,6 +1520,9 @@ int sgemm_q6_k_r4_q8_k_best(int nrows, int ncols, int k, const void *vx, const v
     if (r) return r;
     return sgemm_q6_k_r4_q8_k(nrows, ncols, k, vx, vy, out, bs, ith, nth);
 }
+/* original kernels the wrappers below fall back to (declared in sgemm.h, repeated here so this file needs no extra include) */
+int sgemm_iq4_k_r4_q8_k_avx2(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+
 /* IQ4_K / IQ4_K_R4 table fn_gemm: decode-once R8 for big shapes, else the original kernels. */
 int sgemm_iq4_k_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) {
     int r = kq_fast("sgemm_iq4_k_q8_k", sgemm_iq4_k_q8_k_r8v, sgemm_iq4_k_q8_k_r8t, nrows, ncols, k, vx, vy, out, bs, ith, nth);
