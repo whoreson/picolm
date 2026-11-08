@@ -615,6 +615,22 @@ static void prefill_attn_task_grouped(int flat_idx, void *ctx_ptr) {
                           _mm512_storeu_ps(accg + d, _mm512_fmadd_ps(af, cv, vf));
                       }
                       for (; d < head_dim; d++) accg[d] = fmaf(accg[d], correction, fp16_to_fp32(vt16[d])); }
+#elif defined(PICOLM_AVX2) && defined(__F16C__)
+                    { __m256 cv = _mm256_set1_ps(correction); int d = 0;
+                      for (; d + 7 < head_dim; d += 8) {
+                          __m256 vf = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(vt16 + d)));
+                          __m256 af = _mm256_loadu_ps(accg + d);
+                          _mm256_storeu_ps(accg + d, _mm256_fmadd_ps(af, cv, vf));
+                      }
+                      for (; d < head_dim; d++) accg[d] = fmaf(accg[d], correction, fp16_to_fp32(vt16[d])); }
+#elif defined(PICOLM_AVX) && defined(__F16C__)
+                    { __m128 cv = _mm_set1_ps(correction); int d = 0;
+                      for (; d + 7 < head_dim; d += 8) {
+                          __m128 vf = _mm_cvtph_ps(_mm_loadu_si128((const __m128i *)(vt16 + d)));
+                          __m128 af = _mm_loadu_ps(accg + d);
+                          _mm_storeu_ps(accg + d, _mm_fmadd_ps(af, cv, vf));
+                      }
+                      for (; d < head_dim; d++) accg[d] = fmaf(accg[d], correction, fp16_to_fp32(vt16[d])); }
 #else
                     for (int d = 0; d < head_dim; d++) accg[d] = fmaf(accg[d], correction, fp16_to_fp32(((const uint16_t *)vt)[d]));
 #endif
@@ -649,6 +665,22 @@ static void prefill_attn_task_grouped(int flat_idx, void *ctx_ptr) {
                           _mm512_storeu_ps(accg + d, _mm512_fmadd_ps(vf, wv, af));
                       }
                       for (; d < head_dim; d++) accg[d] = fmaf(w, fp16_to_fp32(vt16[d]), accg[d]); }
+#elif defined(PICOLM_AVX2) && defined(__F16C__)
+                    { __m256 wv = _mm256_set1_ps(w); int d = 0;
+                      for (; d + 7 < head_dim; d += 8) {
+                          __m256 vf = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(vt16 + d)));
+                          __m256 af = _mm256_loadu_ps(accg + d);
+                          _mm256_storeu_ps(accg + d, _mm256_fmadd_ps(vf, wv, af));
+                      }
+                      for (; d < head_dim; d++) accg[d] = fmaf(w, fp16_to_fp32(vt16[d]), accg[d]); }
+#elif defined(PICOLM_AVX) && defined(__F16C__)
+                    { __m128 wv = _mm_set1_ps(w); int d = 0;
+                      for (; d + 7 < head_dim; d += 8) {
+                          __m128 vf = _mm_cvtph_ps(_mm_loadu_si128((const __m128i *)(vt16 + d)));
+                          __m128 af = _mm_loadu_ps(accg + d);
+                          _mm_storeu_ps(accg + d, _mm_fmadd_ps(vf, wv, af));
+                      }
+                      for (; d < head_dim; d++) accg[d] = fmaf(w, fp16_to_fp32(vt16[d]), accg[d]); }
 #else
                     for (int d = 0; d < head_dim; d++) accg[d] = fmaf(w, fp16_to_fp32(((const uint16_t *)vt)[d]), accg[d]);
 #endif
@@ -678,6 +710,14 @@ static void prefill_attn_task_grouped(int flat_idx, void *ctx_ptr) {
 #ifdef PICOLM_AVX512
         { __m512 inv = _mm512_set1_ps(inv_sum); int d = 0;
           for (; d + 15 < head_dim; d += 16) { __m512 af = _mm512_loadu_ps(accg + d); _mm512_storeu_ps(out + d, _mm512_mul_ps(af, inv)); }
+          for (; d < head_dim; d++) out[d] = accg[d] * inv_sum; }
+#elif defined(PICOLM_AVX2)
+        { __m256 inv = _mm256_set1_ps(inv_sum); int d = 0;
+          for (; d + 7 < head_dim; d += 8) { __m256 af = _mm256_loadu_ps(accg + d); _mm256_storeu_ps(out + d, _mm256_mul_ps(af, inv)); }
+          for (; d < head_dim; d++) out[d] = accg[d] * inv_sum; }
+#elif defined(PICOLM_AVX)
+        { __m128 inv = _mm_set1_ps(inv_sum); int d = 0;
+          for (; d + 3 < head_dim; d += 4) { __m128 af = _mm_loadu_ps(accg + d); _mm_storeu_ps(out + d, _mm_mul_ps(af, inv)); }
           for (; d < head_dim; d++) out[d] = accg[d] * inv_sum; }
 #else
         for (int d = 0; d < head_dim; d++) out[d] = accg[d] * inv_sum;
@@ -1724,17 +1764,26 @@ static void attn_v_prep_run(void *arg) {
                     }
 #if defined(PICOLM_AVX512)
                 } else if (v_sm && bc->gguf_v == GGUF_TYPE_F16) {
-                    /* f16 -> f32 straight into the slice-major layout. */
                     for (int db = 0; db < head_dim / 16; db++)
                         _mm512_storeu_ps(tile_v_f32 + ((size_t)db * this_tile_size + p) * 16,
                             _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(src + (size_t)db * 32))));
+#elif defined(PICOLM_AVX2)
+                } else if (v_sm && bc->gguf_v == GGUF_TYPE_F16) {
+                    for (int db = 0; db < head_dim / 8; db++)
+                        _mm256_storeu_ps(tile_v_f32 + ((size_t)db * this_tile_size + p) * 8,
+                            _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(src + (size_t)db * 16))));
+#elif defined(PICOLM_AVX)
+                } else if (v_sm && bc->gguf_v == GGUF_TYPE_F16) {
+                    for (int db = 0; db < head_dim / 8; db++)
+                        _mm_storeu_ps(tile_v_f32 + ((size_t)db * this_tile_size + p) * 8,
+                            _mm_cvtph_ps(_mm_loadu_si128((const __m128i *)(src + (size_t)db * 16))));
+#endif
                 } else if (v_sm) {
                     float rowbuf[512];
                     dequantize_row(src, rowbuf, head_dim, bc->gguf_v);
                     for (int db = 0; db < head_dim / 16; db++)
                         memcpy(tile_v_f32 + ((size_t)db * this_tile_size + p) * 16,
                                rowbuf + (size_t)db * 16, 16 * sizeof(float));
-#endif
                 } else {
                     dequantize_row(src, tile_v_f32 + (size_t)p * head_dim,
                                    head_dim, bc->gguf_v);
@@ -1923,6 +1972,8 @@ static void batch_tiled_task(int task_idx, void *ctx_ptr) {
 
 #if defined(PICOLM_AVX512)
         const int v_sm = (head_dim % 16 == 0 && head_dim <= 512);
+#elif defined(PICOLM_AVX2)
+        const int v_sm = (head_dim % 8 == 0 && head_dim <= 512);
 #else
         const int v_sm = 0;
 #endif
