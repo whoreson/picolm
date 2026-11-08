@@ -1134,13 +1134,54 @@ static void matmul_worker_f(matmul_task_t *t) {
             }
             /* Generic table-driven path */
             else if (ti->fn_gemv) {
-                for (int i = t->start; i < t->end; i++) {
-                    const char *wrow = t->W + (size_t)i * t->row_bytes;
-                    for (int b = 0; b < nb; b++) {
-                        const char *xb = qx_base + (size_t)b * qstride;
-                        float result;
-                        ti->fn_gemv(wrow, xb, t->n, &result, 1);
-                        t->out[b * out_stride + i] = result;
+                if (ti->rows_per_block > 1) {
+                    /* Row-interleaved types (R4/R8): process in groups.
+                     * Weights are stored as groups of rpb rows sharing a block.
+                     * fn_gemv takes the group base pointer and processes all rpb rows. */
+                    int rpb = ti->rows_per_block;
+                    int d = t->end - t->start;
+                    int dg = (d / rpb) * rpb;
+                    const char *xb0 = qx_base; /* nb==0: single activation at base */
+                    for (int i = 0; i < dg; i += rpb) {
+                        const char *wgroup = t->W + (size_t)(t->start + i) * t->row_bytes;
+                        float result[rpb];
+                        if (nb > 0) {
+                            for (int b = 0; b < nb; b++) {
+                                const char *xb = qx_base + (size_t)b * qstride;
+                                ti->fn_gemv(wgroup, xb, t->n, result, rpb);
+                                for (int r = 0; r < rpb; r++)
+                                    t->out[b * out_stride + t->start + i + r] = result[r];
+                            }
+                        } else {
+                            ti->fn_gemv(wgroup, xb0, t->n, result, rpb);
+                            for (int r = 0; r < rpb; r++)
+                                t->out[t->start + i + r] = result[r];
+                        }
+                    }
+                    /* Tail rows: dequantize activation back to float, then vec_dot_row */
+                    for (int i = dg; i < d; i++) {
+                        int row = t->start + i;
+                        const void *group_base = t->W + (size_t)(row / rpb) * rpb * t->row_bytes;
+                        if (nb > 0) {
+                            for (int b = 0; b < nb; b++) {
+                                float xbuf[256];
+                                dequantize_row_q8_0(qx_base + (size_t)b * qstride, xbuf, t->n);
+                                t->out[b * out_stride + row] =
+                                    vec_dot_row(group_base, xbuf, t->n, t->qtype, row % rpb);
+                            }
+                        } else {
+                            t->out[row] = vec_dot_row(group_base, t->x, t->n, t->qtype, row % rpb);
+                        }
+                    }
+                } else {
+                    for (int i = t->start; i < t->end; i++) {
+                        const char *wrow = t->W + (size_t)i * t->row_bytes;
+                        for (int b = 0; b < nb; b++) {
+                            const char *xb = qx_base + (size_t)b * qstride;
+                            float result;
+                            ti->fn_gemv(wrow, xb, t->n, &result, 1);
+                            t->out[b * out_stride + i] = result;
+                        }
                     }
                 }
             }
@@ -1556,9 +1597,9 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
             for (int i = 0; i < dg; i += rpb) {
                 ti->fn_gemv(wptr + (i / rpb) * block_stride, qb.qbuf, n, out + i, rpb);
             }
-            /* Tail rows */
+            /* Tail rows: use vec_dot_row for correct row extraction */
             for (int i = dg; i < d; i++) {
-                out[i] = vec_dot(wptr + (size_t)i * row_bytes, x, n, qtype);
+                out[i] = vec_dot_row(wptr, x, n, qtype, i);
             }
         } else if (ti->fn_gemv) {
             /* Plain: use table GEMV kernel */

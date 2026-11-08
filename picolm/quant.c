@@ -8098,6 +8098,45 @@ void vec_dot_q4i_0x8_q8_0(const void *vx, const void *wy, int n, float *out, int
         out[row] = row_acc[row];
     return;
 
+#elif defined(__AVX2__)
+    /* AVX2 int8 MAC: maddubs + madd, sign-trick strategy.
+     * Same layout as AVX-512 path but 256-bit registers.
+     * Process 1 row at a time, 4 chunks of 8 values per block. */
+    {
+    const block_q4i_0x8 *bp = (const block_q4i_0x8 *)vx;
+    const block_q8_0 *ap = (const block_q8_0 *)wy;
+    int nb = n / 32;
+    const __m256i ones = _mm256_set1_epi16(1);
+    static const int group_rows[2][4] = {{0, 1, 4, 5}, {2, 3, 6, 7}};
+
+    for (int row = 0; row < nrows && row < 8; row++) {
+        int is_even = (row == 0 || row == 1 || row == 4 || row == 5);
+        int group_off = is_even ? 0 : 128;
+        int ri = -1;
+        for (int r = 0; r < 4; r++) if (group_rows[is_even ? 0 : 1][r] == row) { ri = r; break; }
+        float wd = fp16_to_fp32_lookup(bp[0].d[row]);
+        float sumf = 0.0f;
+        for (int b = 0; b < nb; b++) {
+            float ad = fp16_to_fp32_lookup(ap[b].d);
+            int64_t a = *(const int64_t *)(ap[b].qs + ri * 8);
+            __m256i act_bc = _mm256_set1_epi64x(a);
+            __m256i act_abs = _mm256_sign_epi8(act_bc, act_bc);
+            __m256i acc_b = _mm256_setzero_si256();
+            for (int k = 0; k < 4; k++) {
+                __m256i wgt = _mm256_loadu_si256((const __m256i *)(bp[b].qs + group_off + k * 32 + ri * 8));
+                __m256i wgt_s = _mm256_sign_epi8(wgt, act_bc);
+                __m256i dot = _mm256_maddubs_epi16(act_abs, wgt_s);
+                acc_b = _mm256_add_epi32(acc_b, _mm256_madd_epi16(ones, dot));
+            }
+            int32_t r2[8];
+            _mm256_storeu_si256((__m256i *)r2, acc_b);
+            int32_t sumi = r2[0] + r2[1] + r2[2] + r2[3];
+            sumf += wd * ad * (float)sumi;
+        }
+        out[row] = sumf;
+    }
+    }
+
 #elif defined(PICOLM_NEON)
     /* NEON int8 MAC: vmlal_s8 for 8x8 -> 4x2 int32 accumulate.
      * Process one row at a time. Each row: 4 chunks of 8 values per block.

@@ -683,7 +683,10 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
         .use_repacked = 1,
         .has_dual_scalar_path = 0,
     },
-    /* Q4I_0_8_8: 8-row pre-dequantized int8. Same GEMM issue as Q4_0_8_8. */
+    /* Q4I_0_8_8: 8-row pre-dequantized int8. Same GEMM issue as Q4_0_8_8.
+     * has_dual_scalar_path = 0: dual_q8_row_task calls vec_dot() directly
+     * which aborts for interleaved types. The matmul_batch sgemm path handles
+     * Q4I_0_8_8 in dual-batch scenarios; single-batch falls back to fn_gemv. */
     [GGUF_TYPE_Q4I_0_8_8] = {
         .act_fmt = ACT_FMT_Q8_0,
         .rows_per_block = 8,
@@ -693,7 +696,7 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
         .fn_dequant_single = NULL,
         .needs_qx = 1,
         .use_repacked = 0,
-        .has_dual_scalar_path = 1,
+        .has_dual_scalar_path = 0,
     },
     /* ---- F32/F16: no quantization, no GEMV wrapper (use generic fallback) ---- */
     [GGUF_TYPE_F32] = {
