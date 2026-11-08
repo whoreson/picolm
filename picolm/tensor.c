@@ -1887,6 +1887,16 @@ typedef struct {
     int q8_per_token; int max_threads;
 } mm_id_down_ctx_t;
 
+/* AVX2 int8 dot-product for MoE kernels: 32 int8 pairs -> 8 int32 lanes. */
+#if defined(PICOLM_AVX2)
+static inline __m256i moe_mul_sum_i8_avx2(const __m256i x, const __m256i y) {
+    __m256i ax = _mm256_sign_epi8(x, x);
+    __m256i sy = _mm256_sign_epi8(y, x);
+    __m256i dot = _mm256_maddubs_epi16(ax, sy);
+    return _mm256_madd_epi16(_mm256_set1_epi16(1), dot);
+}
+#endif
+
 static void mm_id_gate_expert_task(int idx, void *ctxp);
 static void mm_id_down_expert_task(int idx, void *ctxp);
 
@@ -2203,8 +2213,154 @@ static void mm_id_gate_expert_task(int idx, void *ctxp) {
         }
     }
     free(wrow_f);
+#elif defined(PICOLM_AVX2)
+    /* AVX2 block-interleaved kernel: Q8_0 weights, up to 4 tokens in parallel.
+     * Same strategy as AVX-512 but 32 values/iter (1 block) instead of 64 (2 blocks). */
+    if (c->type == GGUF_TYPE_Q8_0) {
+        int nblk = c->dim / 32;
+        const float *tbufs[256];
+        const float *qx_d_ptrs[256];
+        for (int a = 0; a < n_assigned; a++) {
+            tbufs[a] = c->qx_all + assigned[a] * c->q8_buf_per_token;
+            qx_d_ptrs[a] = tbufs[a] + c->qx_d_off;
+        }
+
+        if (n_assigned <= 4) {
+            for (int row = 0; row < c->n_ff; row++) {
+                const block_q8_0 *gw = (const block_q8_0 *)(gate_exp + (size_t)row * c->row_bytes);
+                const block_q8_0 *uw = (const block_q8_0 *)(up_exp + (size_t)row * c->row_bytes);
+
+                __m256 g_acc[4], u_acc[4];
+                for (int a = 0; a < n_assigned; a++) {
+                    g_acc[a] = _mm256_setzero_ps();
+                    u_acc[a] = _mm256_setzero_ps();
+                }
+
+                int bi;
+                for (bi = 0; bi < nblk; bi++) {
+                    __m256i wg = _mm256_loadu_si256((const __m256i *)gw[bi].qs);
+                    __m256i wu = _mm256_loadu_si256((const __m256i *)uw[bi].qs);
+                    float wd_g = fp16_to_fp32_lookup(gw[bi].d);
+                    float wd_u = fp16_to_fp32_lookup(uw[bi].d);
+
+                    for (int a = 0; a < n_assigned; a++) {
+                        const block_q8_0 *xq = (const block_q8_0 *)tbufs[a];
+                        float qx_d = qx_d_ptrs[a][bi];
+                        __m256i xx = _mm256_loadu_si256((const __m256i *)xq[bi].qs);
+
+                        __m256i dot_g = moe_mul_sum_i8_avx2(xx, wg);
+                        __m256 f_g = _mm256_cvtepi32_ps(dot_g);
+                        __m256 dvec_g = _mm256_set1_ps(qx_d * wd_g);
+                        g_acc[a] = _mm256_fmadd_ps(f_g, dvec_g, g_acc[a]);
+
+                        __m256i dot_u = moe_mul_sum_i8_avx2(xx, wu);
+                        __m256 f_u = _mm256_cvtepi32_ps(dot_u);
+                        __m256 dvec_u = _mm256_set1_ps(qx_d * wd_u);
+                        u_acc[a] = _mm256_fmadd_ps(f_u, dvec_u, u_acc[a]);
+                    }
+                }
+
+                for (int a = 0; a < n_assigned; a++) {
+                    float gs = hsum_avx(g_acc[a]);
+                    float us = hsum_avx(u_acc[a]);
+                    int t = assigned[a];
+                    size_t idx = (size_t)t * c->n_used * c->n_ff + (size_t)slots[a] * c->n_ff + row;
+                    c->gate_out[idx] = gs;
+                    c->up_out[idx] = us;
+                }
+            }
+        } else {
+            /* >4 tokens: batch4 + scalar fallback */
+            int n_batch4 = (n_assigned / 4) * 4;
+            for (int row = 0; row < c->n_ff; row++) {
+                const char *gw = gate_exp + row * c->row_bytes;
+                const char *uw = up_exp + row * c->row_bytes;
+                for (int a = 0; a < n_batch4; a += 4) {
+                    const void *qx[4];
+                    const float *qx_d_arr[4];
+                    float fout[4];
+                    for (int k = 0; k < 4; k++) {
+                        qx[k] = (const void *)tbufs[a + k];
+                        qx_d_arr[k] = qx_d_ptrs[a + k];
+                    }
+                    vec_dot_q8_0_q8_0_deltas_batch4(qx[0], qx_d_arr[0], qx[1], qx_d_arr[1],
+                        qx[2], qx_d_arr[2], qx[3], qx_d_arr[3], gw, c->dim,
+                        &fout[0], &fout[1], &fout[2], &fout[3]);
+                    for (int k = 0; k < 4; k++) {
+                        size_t idx = (size_t)assigned[a + k] * c->n_used * c->n_ff
+                                   + (size_t)slots[a + k] * c->n_ff + row;
+                        c->gate_out[idx] = fout[k];
+                    }
+                    vec_dot_q8_0_q8_0_deltas_batch4(qx[0], qx_d_arr[0], qx[1], qx_d_arr[1],
+                        qx[2], qx_d_arr[2], qx[3], qx_d_arr[3], uw, c->dim,
+                        &fout[0], &fout[1], &fout[2], &fout[3]);
+                    for (int k = 0; k < 4; k++) {
+                        size_t idx = (size_t)assigned[a + k] * c->n_used * c->n_ff
+                                   + (size_t)slots[a + k] * c->n_ff + row;
+                        c->up_out[idx] = fout[k];
+                    }
+                }
+                for (int a = n_batch4; a < n_assigned; a++) {
+                    size_t idx = (size_t)assigned[a] * c->n_used * c->n_ff
+                               + (size_t)slots[a] * c->n_ff + row;
+                    c->gate_out[idx] = vec_dot_q8_0_q8_0_deltas(tbufs[a], qx_d_ptrs[a], gw, c->dim);
+                    c->up_out[idx] = vec_dot_q8_0_q8_0_deltas(tbufs[a], qx_d_ptrs[a], uw, c->dim);
+                }
+            }
+        }
+    } else {
+        /* Non-Q8_0: dequantize + vec_dot_q8_0_f32 */
+        float *wrow_f = (float *)malloc(c->dim * sizeof(float));
+        if (!wrow_f) { fprintf(stderr, "OOM: avx2_gateup\n"); exit(1); }
+        int n_batch4 = (n_assigned / 4) * 4;
+        for (int row = 0; row < c->n_ff; row++) {
+            const char *gw = gate_exp + row * c->row_bytes;
+            const char *uw = up_exp + row * c->row_bytes;
+            dequantize_row(gw, wrow_f, c->dim, c->type);
+            for (int a = 0; a < n_batch4; a += 4) {
+                float fout[4];
+                const float *tb[4];
+                for (int k = 0; k < 4; k++)
+                    tb[k] = c->qx_all + assigned[a + k] * c->q8_buf_per_token;
+                vec_dot_q8_0_f32_batch4(tb[0], tb[1], tb[2], tb[3], wrow_f, c->dim,
+                                        &fout[0], &fout[1], &fout[2], &fout[3]);
+                for (int k = 0; k < 4; k++) {
+                    size_t idx = (size_t)assigned[a + k] * c->n_used * c->n_ff
+                               + (size_t)slots[a + k] * c->n_ff + row;
+                    c->gate_out[idx] = fout[k];
+                }
+            }
+            for (int a = n_batch4; a < n_assigned; a++) {
+                int t = assigned[a];
+                const float *tbuf = c->qx_all + t * c->q8_buf_per_token;
+                size_t idx = (size_t)t * c->n_used * c->n_ff + (size_t)slots[a] * c->n_ff + row;
+                c->gate_out[idx] = vec_dot_q8_0_f32(tbuf, wrow_f, c->dim);
+            }
+            dequantize_row(uw, wrow_f, c->dim, c->type);
+            for (int a = 0; a < n_batch4; a += 4) {
+                float fout[4];
+                const float *tb[4];
+                for (int k = 0; k < 4; k++)
+                    tb[k] = c->qx_all + assigned[a + k] * c->q8_buf_per_token;
+                vec_dot_q8_0_f32_batch4(tb[0], tb[1], tb[2], tb[3], wrow_f, c->dim,
+                                        &fout[0], &fout[1], &fout[2], &fout[3]);
+                for (int k = 0; k < 4; k++) {
+                    size_t idx = (size_t)assigned[a + k] * c->n_used * c->n_ff
+                               + (size_t)slots[a + k] * c->n_ff + row;
+                    c->up_out[idx] = fout[k];
+                }
+            }
+            for (int a = n_batch4; a < n_assigned; a++) {
+                int t = assigned[a];
+                const float *tbuf = c->qx_all + t * c->q8_buf_per_token;
+                size_t idx = (size_t)t * c->n_used * c->n_ff + (size_t)slots[a] * c->n_ff + row;
+                c->up_out[idx] = vec_dot_q8_0_f32(tbuf, wrow_f, c->dim);
+            }
+        }
+        free(wrow_f);
+    }
 #else
-    /* Non-AVX512: scalar path for all weight types.
+    /* Non-AVX512/AVX2: scalar path for all weight types.
      * For Q8_0 weights, use vec_dot_q8_0_q8_0_deltas directly.
      * For non-Q8_0 weights, dequantize to float and use vec_dot_q8_0_f32. */
     if (c->type == GGUF_TYPE_Q8_0) {
@@ -2387,8 +2543,50 @@ static void mm_id_down_expert_task(int idx, void *ctxp) {
             matmul_q8_seq(dout, qx_bufs[a], qx_d_arr[a], dw, c->n_ff, c->dim, c->type);
         }
     }
+#elif defined(PICOLM_AVX2)
+    /* AVX2 block-interleaved kernel: Q8_0 weights, up to 4 tokens in parallel. */
+    if (c->type == GGUF_TYPE_Q8_0 && n_assigned <= 4) {
+        int nblk = c->n_ff / 32;
+        for (int row = 0; row < c->dim; row++) {
+            const block_q8_0 *dw_blocks = (const block_q8_0 *)(dw + (size_t)row * c->row_bytes);
+
+            __m256 acc[4];
+            for (int a = 0; a < n_assigned; a++)
+                acc[a] = _mm256_setzero_ps();
+
+            for (int bi = 0; bi < nblk; bi++) {
+                __m256i wd = _mm256_loadu_si256((const __m256i *)dw_blocks[bi].qs);
+                float wd_d = fp16_to_fp32_lookup(dw_blocks[bi].d);
+
+                for (int a = 0; a < n_assigned; a++) {
+                    const block_q8_0 *xq = (const block_q8_0 *)qx_bufs[a];
+                    float qx_d = qx_d_arr[a][bi];
+                    __m256i xx = _mm256_loadu_si256((const __m256i *)xq[bi].qs);
+
+                    __m256i dot = moe_mul_sum_i8_avx2(xx, wd);
+                    __m256 f = _mm256_cvtepi32_ps(dot);
+                    __m256 dvec = _mm256_set1_ps(qx_d * wd_d);
+                    acc[a] = _mm256_fmadd_ps(f, dvec, acc[a]);
+                }
+            }
+
+            for (int a = 0; a < n_assigned; a++) {
+                float result = hsum_avx(acc[a]);
+                int t = assigned[a];
+                size_t idx = (size_t)t * c->n_used * c->dim + (size_t)slots[a] * c->dim + row;
+                c->down_out[idx] = result;
+            }
+        }
+    } else {
+        for (int a = 0; a < n_assigned; a++) {
+            int t = assigned[a];
+            int slot = slots[a];
+            float *dout = c->down_out + (size_t)t * c->n_used * c->dim + (size_t)slot * c->dim;
+            matmul_q8_seq(dout, qx_bufs[a], qx_d_arr[a], dw, c->n_ff, c->dim, c->type);
+        }
+    }
 #else
-    /* Non-AVX512: use matmul_q8_seq for all weight types */
+    /* Non-AVX512/AVX2: use matmul_q8_seq for all weight types */
     for (int a = 0; a < n_assigned; a++) {
         int t = assigned[a];
         int slot = slots[a];
