@@ -1227,6 +1227,22 @@ void attention_decode(attn_group_ctx_t *ctx) {
 #ifndef ATTN_LAZY_RESCALE_THRESH
 #define ATTN_LAZY_RESCALE_THRESH 8.0f
 #endif
+/* Tile/row-block skipping (default T=8, PICOLM_ATTN_SKIP_T=<log2 threshold>, 0=off).
+ * A 16-row block is skipped for a KV tile when EVERY row's tile max is more than
+ * T below that row's running max M. Per skipped element the softmax weight is
+ * < 2^-T relative to the row's max element (S >= 1 in M units), so the error is
+ * bounded per element and the test costs nothing (tile max is computed anyway).
+ * Rows in a partly-skippable block are processed exactly. */
+#ifndef ATTN_SKIP_RECENT
+#define ATTN_SKIP_RECENT 4   /* recent tiles visited right after the sink tile */
+#endif
+static unsigned long g_skip_tiles, g_skip_tiles_all, g_skip_blocks, g_skip_blocks_all;
+#if defined(__GNUC__)
+#define ATTN_STAT_ADD(v, n) __atomic_fetch_add(&(v), (unsigned long)(n), __ATOMIC_RELAXED)
+#else
+#define ATTN_STAT_ADD(v, n) ((v) += (unsigned long)(n))
+#endif
+
 /* ================================================================
  * Tiled prefill attention: KV cache type support.
  *
@@ -1381,30 +1397,29 @@ static int attn_choose_qk_mode(int kv_type_k, int head_dim, gguf_type_t *tile_gg
 }
 
 /* ================================================================
- * Int8 K shadow for F16 K caches (opt-in: PICOLM_ATTN_QK=i8).
+ * Int8 K shadow for F16 K caches (default on, PICOLM_ATTN_QK=f32 to disable).
  *
- * The default F16 QK path (matmul_batch -> F16 sgemm) converts K from f16 on
- * every tile visit and runs fp32 FMAs. A deep-context prefill visits each K
- * tile once per token group (41 groups for a 2.6k-token append), so the same
- * 64x256 tile is re-converted dozens of times per layer.
- *
- * With the shadow, K is quantized to Q8_0 and repacked to Q8_0_R8 ONCE per
+ * The default int8 QK path quantizes K to Q8_0 and repacks to Q8_0_R8 ONCE per
  * layer call (parallel over kv_head x tile chunks, ~0.1% of the layer), and
  * every tile visit scores through the AVX-512 VNNI R8 kernel on the prebuilt
- * tile. This is a PRECISION TRADE-OFF (Q and K both become Q8_0), which is
- * why it is off by default. Only full ATTN_TILE tiles are shadowed; the
- * trailing partial tile and tiny batches keep the exact F16 path.
+ * tile. The old F16 path (matmul_batch -> F16 sgemm) converted K from f16 on
+ * every tile visit and ran fp32 FMAs. A deep-context prefill visits each K
+ * tile once per token group (41 groups for a 2.6k-token append), so the same
+ * 64x256 tile was re-converted dozens of times per layer.
+ *
+ * This is a PRECISION TRADE-OFF (Q and K both become Q8_0, ~1e-3 output error),
+ * but the speedup is large (2-3x QK). Only full ATTN_TILE tiles are shadowed;
+ * the trailing partial tile and tiny batches keep the exact F16 path.
  * ================================================================ */
 #define ATTN_K8_MAX_HD 512
 #define ATTN_K8_CHUNK  16            /* tiles per build task */
 
 static int attn_k8_requested(void) {
-    static int v = -1;
-    if (v < 0) {
-        const char *e = getenv("PICOLM_ATTN_QK");
-        v = (e && !strcmp(e, "i8")) ? 1 : 0;
-    }
-    return v;
+    const char *e = getenv("PICOLM_ATTN_QK");
+    /* Default: int8 K shadow (i8). PICOLM_ATTN_QK=f32 to opt out. */
+    if (e && !strcmp(e, "f32")) return 0;
+    if (e && !strcmp(e, "q8r8")) return 0;
+    return 1;
 }
 
 /* Probe once: does the VNNI R8 kernel work? */
@@ -1543,6 +1558,9 @@ typedef struct {
     int last_tile;          /* 1 if this is the last tile to process */
     float attn_scale;       /* attention score scale factor */
     int n_swa;               /* 0 = full attention; >0 = sliding window size */
+    float skip_T;           /* >0: skip exp+PV for 16-row blocks whose tile max is > skip_T (log2) below M */
+    void (*v_prep)(void *); /* deferred V-tile extraction; called once iff the tile is not fully skipped */
+    void *v_prep_arg;
 } attn_tile_task_t;
 
 /* Defined after attn_process_tile (the F16/Q8R8/F32 K-tile builder). */
@@ -1653,16 +1671,77 @@ typedef struct {
     gguf_type_t gguf_v;
     size_t k_rb_gguf;
     int qk_mode;            /* ATTN_QK_* selected by batch_attention_tiled() */
-    const uint8_t *k8_shadow; /* int8 K shadow (PICOLM_ATTN_QK=i8), or NULL */
+    const uint8_t *k8_shadow; /* int8 K shadow (default on, PICOLM_ATTN_QK=f32 disables), or NULL */
     size_t k8_tile_bytes;
     int n_full_tiles;
     int q_rot;              /* 1 = TQ3-sign WHT-rotate query rows (TQ K caches) */
+    float skip_T;           /* PICOLM_ATTN_SKIP_T: tile/row-block skip threshold (log2), default 8 */
+    int skip_order;         /* visit sink + recent tiles first (only when skip_T > 0) */
     /* Scratch pool: pre-allocated, sliced per concurrent task */
     uint8_t *scratch_pool;
     size_t scratch_per_task, scores_per, ms_per, acc_per, qr_per, tk_per, tv_per;
     size_t q8_per, q8_half, k8_per, k8_half, f32t_per;
     int max_concurrent;
 } batch_tiled_ctx_t;
+
+/* Deferred V-tile extraction: F16/quant/TQ cache rows -> F32 tile (slice-major
+ * when v_sm). Identical to the code that used to sit inline in
+ * batch_tiled_task(). */
+typedef struct {
+    const batch_tiled_ctx_t *bc;
+    int kv_h, kv_t0, this_tile_size, v_sm;
+    float *tile_v_f32;
+} attn_v_prep_t;
+
+static void attn_v_prep_run(void *arg) {
+    const attn_v_prep_t *vp = (const attn_v_prep_t *)arg;
+    const batch_tiled_ctx_t *bc = vp->bc;
+    const int kv_h = vp->kv_h, kv_t0 = vp->kv_t0;
+    const int this_tile_size = vp->this_tile_size, v_sm = vp->v_sm;
+    const int head_dim = bc->head_dim;
+    float *tile_v_f32 = vp->tile_v_f32;
+    (void)v_sm; (void)head_dim;
+        {
+            size_t rb = bc->kv_row_size_v;
+            size_t v_head_stride = bc->kv_head_stride_v;
+            for (int p = 0; p < this_tile_size; p++) {
+                const uint8_t *src = bc->vcache + (size_t)(kv_t0 + p) * rb
+                                   + kv_h * v_head_stride;
+                /* TQ caches have no GGUF equivalent (gguf_v is F16); decode
+                 * them with the inverse WHT like the reference paths do. */
+                if (bc->kv_type_v == KV_CACHE_TQ3 || bc->kv_type_v == KV_CACHE_TQ4) {
+                    if (v_sm) {
+                        /* Dequant to rowbuf, then rearrange into slice-major.
+                         * The TQ dequant is scalar anyway, so the rearrange is free. */
+                        float tq_buf[512];
+                        ad_deq_tq_row(src, tq_buf, head_dim, bc->kv_type_v == KV_CACHE_TQ4, 1);
+                        for (int db = 0; db < head_dim / 16; db++)
+                            memcpy(tile_v_f32 + ((size_t)db * this_tile_size + p) * 16,
+                                   tq_buf + (size_t)db * 16, 16 * sizeof(float));
+                    } else {
+                        ad_deq_tq_row(src, tile_v_f32 + (size_t)p * head_dim,
+                                      head_dim, bc->kv_type_v == KV_CACHE_TQ4, 1);
+                    }
+#if defined(PICOLM_AVX512)
+                } else if (v_sm && bc->gguf_v == GGUF_TYPE_F16) {
+                    /* f16 -> f32 straight into the slice-major layout. */
+                    for (int db = 0; db < head_dim / 16; db++)
+                        _mm512_storeu_ps(tile_v_f32 + ((size_t)db * this_tile_size + p) * 16,
+                            _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(src + (size_t)db * 32))));
+                } else if (v_sm) {
+                    float rowbuf[512];
+                    dequantize_row(src, rowbuf, head_dim, bc->gguf_v);
+                    for (int db = 0; db < head_dim / 16; db++)
+                        memcpy(tile_v_f32 + ((size_t)db * this_tile_size + p) * 16,
+                               rowbuf + (size_t)db * 16, 16 * sizeof(float));
+#endif
+                } else {
+                    dequantize_row(src, tile_v_f32 + (size_t)p * head_dim,
+                                   head_dim, bc->gguf_v);
+                }
+            }
+        }
+}
 
 /* Worker for tensor_parallel_for: task_idx maps to (kv_head, token_group).
  * kv_head = task_idx / n_token_groups, token_group = task_idx % n_token_groups.
@@ -1784,8 +1863,23 @@ static void batch_tiled_task(int task_idx, void *ctx_ptr) {
     }
     memset(acc, 0, (size_t)n_q_padded * head_dim * sizeof(float));
 
-    /* Tile loop over KV positions */
-    for (int tk = 0; tk < n_kv_tiles; tk++) {
+    /* Tile loop over KV positions.
+     *
+     * With skipping on, visit the attention sink (tile 0) and the most recent
+     * tiles first so the running max M is near its final value early and the
+     * skip test (tile max << M) fires on as many middle tiles as possible.
+     * Online softmax is order-independent mathematically; this only changes
+     * fp rounding, so it is used only when skip_T > 0. */
+    const int tk_last = (start_pos + q_group_end - 1) / tile;
+    const int n_visit = (tk_last + 1 < n_kv_tiles) ? tk_last + 1 : n_kv_tiles;
+    const int n_recent = (bc->skip_T > 0.0f && bc->skip_order)
+                       ? (tk_last < ATTN_SKIP_RECENT ? tk_last : ATTN_SKIP_RECENT) : 0;
+    for (int it = 0; it < n_visit; it++) {
+        int tk;
+        if (n_recent == 0)               tk = it;
+        else if (it == 0)                tk = 0;
+        else if (it <= n_recent)         tk = tk_last - (it - 1);
+        else                             tk = it - n_recent;   /* 1 .. tk_last-n_recent */
         int kv_t0 = tk * tile;
         int kv_t1 = kv_t0 + tile;
         if (kv_t1 > start_pos + n_tokens) kv_t1 = start_pos + n_tokens;
@@ -1793,7 +1887,7 @@ static void batch_tiled_task(int task_idx, void *ctx_ptr) {
         /* Stop once the tile starts past the last row of this group.
          * (Do NOT also skip tiles past first_pos: when start_pos is not a
          * multiple of the tile size, the group's rows straddle KV tiles.) */
-        if (kv_t0 >= start_pos + q_group_end) break;
+        if (kv_t0 >= start_pos + q_group_end) continue;
 
         /* Skip tiles entirely BEFORE every row's SWA window */
         if (bc->n_swa > 0) {
@@ -1832,47 +1926,9 @@ static void batch_tiled_task(int task_idx, void *ctx_ptr) {
 #else
         const int v_sm = 0;
 #endif
-        /* Extract V-tile and dequantize to F32 */
-        {
-            size_t rb = bc->kv_row_size_v;
-            size_t v_head_stride = bc->kv_head_stride_v;
-            for (int p = 0; p < this_tile_size; p++) {
-                const uint8_t *src = bc->vcache + (size_t)(kv_t0 + p) * rb
-                                   + kv_h * v_head_stride;
-                /* TQ caches have no GGUF equivalent (gguf_v is F16); decode
-                 * them with the inverse WHT like the reference paths do. */
-                if (bc->kv_type_v == KV_CACHE_TQ3 || bc->kv_type_v == KV_CACHE_TQ4) {
-                    if (v_sm) {
-                        /* Dequant to rowbuf, then rearrange into slice-major.
-                         * The TQ dequant is scalar anyway, so the rearrange is free. */
-                        float tq_buf[512];
-                        ad_deq_tq_row(src, tq_buf, head_dim, bc->kv_type_v == KV_CACHE_TQ4, 1);
-                        for (int db = 0; db < head_dim / 16; db++)
-                            memcpy(tile_v_f32 + ((size_t)db * this_tile_size + p) * 16,
-                                   tq_buf + (size_t)db * 16, 16 * sizeof(float));
-                    } else {
-                        ad_deq_tq_row(src, tile_v_f32 + (size_t)p * head_dim,
-                                      head_dim, bc->kv_type_v == KV_CACHE_TQ4, 1);
-                    }
-#if defined(PICOLM_AVX512)
-                } else if (v_sm && bc->gguf_v == GGUF_TYPE_F16) {
-                    /* f16 -> f32 straight into the slice-major layout. */
-                    for (int db = 0; db < head_dim / 16; db++)
-                        _mm512_storeu_ps(tile_v_f32 + ((size_t)db * this_tile_size + p) * 16,
-                            _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(src + (size_t)db * 32))));
-                } else if (v_sm) {
-                    float rowbuf[512];
-                    dequantize_row(src, rowbuf, head_dim, bc->gguf_v);
-                    for (int db = 0; db < head_dim / 16; db++)
-                        memcpy(tile_v_f32 + ((size_t)db * this_tile_size + p) * 16,
-                               rowbuf + (size_t)db * 16, 16 * sizeof(float));
-#endif
-                } else {
-                    dequantize_row(src, tile_v_f32 + (size_t)p * head_dim,
-                                   head_dim, bc->gguf_v);
-                }
-            }
-        }
+        /* V-tile extraction is deferred into attn_process_tile() (via v_prep) so
+         * a tile whose rows are all skipped never pays for it. */
+        attn_v_prep_t vprep = { bc, kv_h, kv_t0, this_tile_size, v_sm, tile_v_f32 };
 
         /* Build task context and process */
         attn_tile_task_t task;
@@ -1909,6 +1965,9 @@ static void batch_tiled_task(int task_idx, void *ctx_ptr) {
         task.acc = acc;
         task.attn_scale = bc->attn_scale;
         task.n_swa = bc->n_swa;
+        task.skip_T = bc->skip_T;
+        task.v_prep = attn_v_prep_run;
+        task.v_prep_arg = &vprep;
 
         attn_process_tile(&task, k_tmp_f32);
     }
@@ -2434,38 +2493,93 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
     /* Per-row tile_exp buffer (tile_size wide, tile_size <= ATTN_TILE = 64) */
     float tile_exp_buf[ATTN_TILE];
 
-    /* Process each query row independently: compute max, exp, sum, and acc update */
+    /* ---- Compute per-row score max ONCE, shared by skip + softmax ---------
+     * This eliminates the redundant scalar scan that the old skip decision
+     * performed. The softmax merge below needs the same value.
+     * n_q can be up to ATTN_TILE * kv_mul (e.g. 64*6=384 for Qwen3.6). */
+    float row_max[384];  /* max n_q = ATTN_TILE * max_kv_mul */
+#if defined(PICOLM_AVX512)
+    {
+        for (int i = 0; i < n_q; i++) {
+            const float *srow = t->scores + (size_t)i * ts;
+            __m512 vmax = _mm512_set1_ps(srow[0]);
+            int j = 1;
+            for (; j + 15 < ts; j += 16)
+                vmax = _mm512_max_ps(vmax, _mm512_loadu_ps(srow + j));
+            float rmax = _mm512_reduce_max_ps(vmax);
+            for (; j < ts; j++) if (srow[j] > rmax) rmax = srow[j];
+            row_max[i] = rmax;
+        }
+    }
+#elif defined(PICOLM_AVX)
+    {
+        for (int i = 0; i < n_q; i++) {
+            const float *srow = t->scores + (size_t)i * ts;
+            __m256 vmax = _mm256_set1_ps(srow[0]);
+            int j = 1;
+            for (; j + 7 < ts; j += 8)
+                vmax = _mm256_max_ps(vmax, _mm256_loadu_ps(srow + j));
+            row_max[i] = attn_hmax256(vmax);
+            for (; j < ts; j++) if (srow[j] > row_max[i]) row_max[i] = srow[j];
+        }
+    }
+#elif defined(PICOLM_NEON_AARCH64)
+    {
+        for (int i = 0; i < n_q; i++) {
+            const float *srow = t->scores + (size_t)i * ts;
+            float32x4_t vmax = vdupq_n_f32(srow[0]);
+            int j = 1;
+            for (; j + 3 < ts; j += 4)
+                vmax = vmaxq_f32(vmax, vld1q_f32(srow + j));
+            row_max[i] = vmaxvq_f32(vmax);
+            for (; j < ts; j++) if (srow[j] > row_max[i]) row_max[i] = srow[j];
+        }
+    }
+#else
+    {
+        for (int i = 0; i < n_q; i++) {
+            const float *srow = t->scores + (size_t)i * ts;
+            float rmax = srow[0];
+            for (int j = 1; j < ts; j++) if (srow[j] > rmax) rmax = srow[j];
+            row_max[i] = rmax;
+        }
+    }
+#endif
+
+    /* ---- Tile / row-block skip decision (opt-in, using precomputed row_max) */
+#define ATTN_SKIP_MAXBLK 256
+    uint8_t blk_skip[ATTN_SKIP_MAXBLK];
+    const int n_blk_rows = (n_q + 15) / 16;
+    int any_live = 1;
+    if (t->skip_T > 0.0f && n_blk_rows <= ATTN_SKIP_MAXBLK) {
+        any_live = 0;
+        int n_sk = 0;
+        for (int b = 0; b < n_blk_rows; b++) {
+            const int r_lo = b * 16, r_hi = (r_lo + 16 < n_q) ? r_lo + 16 : n_q;
+            int skip = 1;
+            for (int i = r_lo; i < r_hi && skip; i++) {
+                /* M == -1e30 (first tile) never skips. */
+                if (!(t->M[i] > -1e29f && row_max[i] + t->skip_T < t->M[i])) skip = 0;
+            }
+            blk_skip[b] = (uint8_t)skip;
+            if (skip) n_sk++; else any_live = 1;
+        }
+        ATTN_STAT_ADD(g_skip_blocks, n_sk);
+        ATTN_STAT_ADD(g_skip_blocks_all, n_blk_rows);
+        ATTN_STAT_ADD(g_skip_tiles_all, 1);
+        if (!any_live) { ATTN_STAT_ADD(g_skip_tiles, 1); return; }
+    } else {
+        memset(blk_skip, 0, (size_t)(n_blk_rows <= ATTN_SKIP_MAXBLK ? n_blk_rows : ATTN_SKIP_MAXBLK));
+    }
+    const int skip_on = (t->skip_T > 0.0f && n_blk_rows <= ATTN_SKIP_MAXBLK);
+    if (t->v_prep) { t->v_prep(t->v_prep_arg); t->v_prep = NULL; }
+
+    /* Process each query row independently: use precomputed row_max, exp, sum, acc */
     for (int i = 0; i < n_q; i++) {
         float *srow = t->scores + i * ts;
+        if (skip_on && blk_skip[i >> 4]) continue;
 
-        /* Row max (vectorized with scalar tail) */
-#if defined(PICOLM_AVX512)
-        __m512 vmax = _mm512_set1_ps(srow[0]);
-        int j = 1;
-        for (; j + 15 < ts; j += 16)
-            vmax = _mm512_max_ps(vmax, _mm512_loadu_ps(srow + j));
-        float rmax = _mm512_reduce_max_ps(vmax);
-        for (; j < ts; j++) if (srow[j] > rmax) rmax = srow[j];
-#elif defined(PICOLM_AVX)
-        __m256 vmax = _mm256_set1_ps(srow[0]);
-        int j = 1;
-        for (; j + 7 < ts; j += 8)
-            vmax = _mm256_max_ps(vmax, _mm256_loadu_ps(srow + j));
-        float rmax = attn_hmax256(vmax);
-        for (; j < ts; j++) if (srow[j] > rmax) rmax = srow[j];
-#elif defined(PICOLM_NEON_AARCH64)
-        float32x4_t vmax = vdupq_n_f32(srow[0]);
-        int j = 1;
-        for (; j + 3 < ts; j += 4)
-            vmax = vmaxq_f32(vmax, vld1q_f32(srow + j));
-        float rmax = vmaxvq_f32(vmax);
-        for (; j < ts; j++) if (srow[j] > rmax) rmax = srow[j];
-#else
-        float rmax = srow[0];
-        for (int j = 1; j < ts; j++) {
-            if (srow[j] > rmax) rmax = srow[j];
-        }
-#endif
+        float rmax = row_max[i];  /* precomputed above, SIMD */
 
         /* Update running M. Rescale S/acc only when the max grows by more than
          * ATTN_LAZY_RESCALE_THRESH (log2 units). Otherwise keep the
@@ -2668,6 +2782,17 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
      * before. Each output element is still a single ascending-j FMA chain, so
      * the result is bit-identical to the per-row kernel. */
     {
+        float *pv_acc0 = t->acc; float *pv_sc0 = t->scores; const int pv_nq0 = n_q;
+        int pv_rr = 0;
+        while (pv_rr < pv_nq0) {
+        int pv_re;
+        if (skip_on && blk_skip[pv_rr >> 4]) { pv_rr = (pv_rr + 16 < pv_nq0) ? pv_rr + 16 : pv_nq0; continue; }
+        pv_re = pv_rr;
+        while (pv_re < pv_nq0 && !(skip_on && blk_skip[pv_re >> 4])) pv_re = (pv_re + 16 < pv_nq0) ? pv_re + 16 : pv_nq0;
+        /* [pv_rr, pv_re) is a run of live 16-row blocks starting 16-aligned, so
+         * the kernels below block exactly as they did for the whole tile. */
+        t->acc = pv_acc0 + (size_t)pv_rr * hd; t->scores = pv_sc0 + (size_t)pv_rr * ts; n_q = pv_re - pv_rr;
+        {
         const float *v_tile = t->tile_v_f32;
 #if defined(PICOLM_AVX512)
         if (t->v_sm) {
@@ -2939,6 +3064,10 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
             }
         }
 #endif
+        }
+        pv_rr = pv_re;
+        }
+        t->acc = pv_acc0; t->scores = pv_sc0; n_q = pv_nq0;
     }
 
 }
@@ -3002,6 +3131,13 @@ static void batch_attention_tiled(
     bctx.tile = tile;
     bctx.n_token_groups = n_token_groups;
     bctx.n_kv_tiles = n_kv_tiles;
+    {   /* tile/row-block skipping (default T=8) */
+        const char *e = getenv("PICOLM_ATTN_SKIP_T");
+        bctx.skip_T = e ? (float)atof(e) : 8.0f;
+        if (bctx.skip_T < 0.0f) bctx.skip_T = 0.0f;
+        const char *o = getenv("PICOLM_ATTN_SKIP_ORDER");
+        bctx.skip_order = (o && atoi(o) == 0) ? 0 : 1;
+    }
     bctx.gguf_k = gguf_k;
     bctx.gguf_v = gguf_v;
     bctx.k_rb_gguf = k_rb_gguf;
@@ -3018,7 +3154,7 @@ static void batch_attention_tiled(
             bctx.k8_shadow = sh; bctx.k8_tile_bytes = tb; bctx.n_full_tiles = n_full;
             use_k8 = 1;
             static int _once = 0;
-            if (!_once) { _once = 1; fprintf(stderr, "[BATCH-ATTN] int8 K shadow + VNNI QK enabled (PICOLM_ATTN_QK=i8)\n"); }
+            if (!_once) { _once = 1; fprintf(stderr, "[BATCH-ATTN] int8 K shadow + VNNI QK enabled (default)\n"); }
         }
     }
 
@@ -3153,6 +3289,17 @@ static void batch_attention_tiled(
      * stride = active, in-flight indices are t + w*active, so idx % active
      * is unique per in-flight task (given max_concurrent >= active). */
     tensor_parallel_for_strided(n_tasks, batch_tiled_task, &bctx);
+    if (bctx.skip_T > 0.0f) {
+        const char *st = getenv("PICOLM_ATTN_SKIP_STATS");
+        if (st && atoi(st)) {
+            fprintf(stderr, "[ATTN-SKIP] T=%.1f tiles fully skipped %lu/%lu (%.1f%%)  16-row blocks skipped %lu/%lu (%.1f%%)\n",
+                    bctx.skip_T, g_skip_tiles, g_skip_tiles_all,
+                    g_skip_tiles_all ? 100.0 * g_skip_tiles / g_skip_tiles_all : 0.0,
+                    g_skip_blocks, g_skip_blocks_all,
+                    g_skip_blocks_all ? 100.0 * g_skip_blocks / g_skip_blocks_all : 0.0);
+        }
+        g_skip_tiles = g_skip_tiles_all = g_skip_blocks = g_skip_blocks_all = 0;
+    }
     /* Release the pool */
 #ifndef _WIN32
     if (scratch_is_mmap) {

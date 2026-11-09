@@ -78,6 +78,7 @@ static int t_kv_type_from_name(const char *n) {
 }
 
 static const char *g_dump_file = NULL;
+static float *g_topic = NULL;   /* per-kv-head topic direction (PICOLM_TEST_STRUCT) */
 
 static void fill_cache(test_ctx_t *tc) {
     int n_kv = tc->n_kv_heads, hd = tc->head_dim;
@@ -103,6 +104,21 @@ static void fill_cache(test_ctx_t *tc) {
     }
     float *kf = malloc((size_t)n_kv * hd * sizeof(float));
     float *vf = malloc((size_t)n_kv * hd * sizeof(float));
+    /* PICOLM_TEST_STRUCT=1: attention-like sparsity. Each KV head has a shared
+     * "topic" direction u_h. K_p = noise + beta_p*u_h where beta_p is heavy
+     * tailed: huge for the sink (p==0), large for rare "needle" positions
+     * (PICOLM_TEST_NEEDLE per mille, default 5), ~0 elsewhere. Queries carry
+     * +gamma*u_h (see fill_queries). Uniform-random K (the default) yields flat
+     * softmax and nothing is ever skippable, which says nothing about real
+     * models; this gives a controllable, conservative proxy. */
+    const int structd = getenv("PICOLM_TEST_STRUCT") ? atoi(getenv("PICOLM_TEST_STRUCT")) : 0;
+    const float needle = getenv("PICOLM_TEST_NEEDLE") ? (float)atof(getenv("PICOLM_TEST_NEEDLE")) : 5.0f;
+    float *u = NULL;
+    if (structd) {
+        u = malloc((size_t)n_kv * hd * sizeof(float));
+        for (int i = 0; i < n_kv * hd; i++) u[i] = frand() * 2.0f;
+        g_topic = u;
+    }
     for (int p = 0; p < total; p++) {
         const char *kr = getenv("PICOLM_TEST_KRAMP");   /* K scale grows with position */
         float kramp = kr ? (float)atof(kr) : 0.0f;
@@ -110,6 +126,14 @@ static void fill_cache(test_ctx_t *tc) {
         for (int i = 0; i < n_kv * hd; i++) {
             kf[i] = frand() * kscale;
             vf[i] = frand();
+        }
+        if (structd) {
+            float beta;
+            float r = frand() + 0.5f;                  /* uniform [0,1) */
+            if (p == 0)                 beta = 3.0f;   /* attention sink */
+            else if (r * 1000.0f < needle) beta = 1.0f + 2.0f * (frand() + 0.5f); /* needle */
+            else                        beta = 0.05f * frand();
+            for (int i = 0; i < n_kv * hd; i++) kf[i] += beta * u[i];
         }
         /* Quantize head by head: the head slice is block aligned in every
          * supported type, exactly like the real KV store loop. */
@@ -151,11 +175,31 @@ static void fill_queries(test_ctx_t *tc) {
     float qscale = qs ? (float)atof(qs) : 1.0f;
     for (int i = 0; i < tc->n_tokens * nh * hd; i++)
         tc->q_batch[i] = frand() * 2.0f * qscale;
+    if (g_topic) {   /* add the topic direction so q . (beta*u) is large for sink/needles */
+        const int kvm = nh / tc->n_kv_heads;
+        const float gq = getenv("PICOLM_TEST_QTOPIC") ? (float)atof(getenv("PICOLM_TEST_QTOPIC")) : 1.0f;
+        for (int t = 0; t < tc->n_tokens; t++)
+            for (int h = 0; h < nh; h++)
+                for (int d = 0; d < hd; d++)
+                    tc->q_batch[((size_t)t * nh + h) * hd + d] += gq * g_topic[(size_t)(h / kvm) * hd + d];
+    }
 }
 
 static void run_path(test_ctx_t *tc, float *out, int use_tiled) {
     memset(out, 0, (size_t)tc->n_tokens * tc->xb_stride * sizeof(float));
+    /* Save user env vars for these knobs so we can restore them after the call.
+     * The harness controls them internally: grouped ref always runs with skip=0
+     * and qk=f32 (exact), tiled runs with whatever the user sets. */
+    char *oskip = getenv("PICOLM_ATTN_SKIP_T") ? strdup(getenv("PICOLM_ATTN_SKIP_T")) : NULL;
+    char *oqk = getenv("PICOLM_ATTN_QK") ? strdup(getenv("PICOLM_ATTN_QK")) : NULL;
+    int had_skip = oskip != NULL;
+    int had_qk = oqk != NULL;
     setenv("PICOLM_TEST_FORCE_TILED", use_tiled ? "1" : "0", 1);
+    /* Both runs: exact F32, no skip. The harness compares grouped vs tiled
+     * at the same precision level. Users can override with PICOLM_ATTN_SKIP_T
+     * and PICOLM_ATTN_QK but those affect both paths equally. */
+    setenv("PICOLM_ATTN_SKIP_T", "0", 1);
+    setenv("PICOLM_ATTN_QK", "f32", 1);
     batch_attention_layer(out, tc->q_batch, tc->kcache, tc->vcache,
                           tc->n_tokens, tc->start_pos,
                           tc->n_heads, tc->n_kv_heads, tc->head_dim,
@@ -165,6 +209,11 @@ static void run_path(test_ctx_t *tc, float *out, int use_tiled) {
                           tc->kv_head_stride_k, tc->kv_head_stride_v,
                           1.0f / sqrtf((float)tc->head_dim), 0 /* n_swa */);
     unsetenv("PICOLM_TEST_FORCE_TILED");
+    /* Restore user settings. */
+    if (had_skip) { setenv("PICOLM_ATTN_SKIP_T", oskip, 1); free(oskip); }
+    else unsetenv("PICOLM_ATTN_SKIP_T");
+    if (had_qk) { setenv("PICOLM_ATTN_QK", oqk, 1); free(oqk); }
+    else unsetenv("PICOLM_ATTN_QK");
 }
 
 static double max_abs_diff(float *a, float *b, size_t n, size_t *at) {
@@ -270,6 +319,11 @@ int main(int argc, char **argv) {
         rms_tiled += (double)tc.xb_tiled[i] * tc.xb_tiled[i];
     }
     rms_ref = sqrt(rms_ref / n); rms_tiled = sqrt(rms_tiled / n);
+    {   /* rms of the difference, relative to rms_ref: the number that matters for skip/i8 tuning */
+        double sd = 0;
+        for (size_t i = 0; i < n; i++) { double d = (double)tc.xb_ref[i] - tc.xb_tiled[i]; sd += d * d; }
+        printf("        rms_diff=%.3g  rel_rms_diff=%.3g\n", sqrt(sd / n), rms_ref > 0 ? sqrt(sd / n) / rms_ref : 0.0);
+    }
     printf("RESULT: max_abs_diff=%.6g at [%zu] (tok %zu head %zu dim %zu)\n"
            "        rms_ref=%.6g rms_tiled=%.6g  %s\n",
            md, at, at / tc.xb_stride, (at % tc.xb_stride) / head_dim, at % head_dim,
