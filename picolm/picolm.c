@@ -344,6 +344,10 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --checkpoint-every-nt-gen <N> Checkpoint every N tokens during generation (default: 64)\n");
     fprintf(stderr, "  --checkpoint-tail-offset <N> Checkpoint N tokens before end of prompt (default: 5)\n");
     fprintf(stderr, "  --ssm-serial      Use serial per-token SSM prefill (default is batched)\n");
+    fprintf(stderr, "  --prefill-ubatch <N>  Chunk CLI prefill into N-token ubatches (default: whole\n");
+    fprintf(stderr, "                       prompt in one batch). Use this to measure per-layer cost at\n");
+    fprintf(stderr, "                       deep context: a single-batch prefill only ever reports the\n");
+    fprintf(stderr, "                       start_pos=0 case. Env: PICOLM_PREFILL_UBATCH.\n");
     fprintf(stderr, "  --ssm-chunk-size <N> SSM batch chunk size (default 8; 8 is the measured\n");
     fprintf(stderr, "                       optimum for the chunked recurrence -- larger values grow\n");
     fprintf(stderr, "                       an O(cs^2) intra-chunk term. Different sizes produce slightly\n");
@@ -1362,6 +1366,10 @@ int main(int argc, char **argv) {
     int    checkpoint_interval = 256;
     int    checkpoint_interval_gen = 64;
     int    checkpoint_tail_offset = 1;  /* 1: ensures checkpoint at n_prompt-1 for stepback */
+    int    prefill_ubatch = 0;          /* --prefill-ubatch N: chunk CLI prefill into N-token ubatches.
+                                         * 0 = single batch (legacy behaviour). Needed to measure
+                                         * per-layer cost at deep context: a one-shot prefill only
+                                         * ever reports start_pos=0. */
     char  *slot_save_path = ".";    /* --slot-save-path (default: current dir) */
 #ifdef PICOLM_VIZ
     /* Visualization options */
@@ -1492,6 +1500,9 @@ int main(int argc, char **argv) {
             checkpoint_interval_gen = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--checkpoint-tail-offset") == 0 && i + 1 < argc) {
             checkpoint_tail_offset = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--prefill-ubatch") == 0 && i + 1 < argc) {
+            prefill_ubatch = atoi(argv[++i]);
+            if (prefill_ubatch < 0) prefill_ubatch = 0;
         } else if (strcmp(argv[i], "--slot-save-path") == 0 && i + 1 < argc) {
             slot_save_path = argv[++i];
 #ifdef PICOLM_CUDA
@@ -2381,14 +2392,50 @@ int main(int argc, char **argv) {
             /* Prefill phase */
             if (do_prefill) {
                 bench.is_prefill = 1;
+                /* Chunked prefill (--prefill-ubatch N / PICOLM_PREFILL_UBATCH).
+                 * Without this the whole prompt goes through one
+                 * model_forward_prefill() call at start_pos=0, so every
+                 * --benchmark-live per-layer line describes the position-0
+                 * case and says nothing about deep-context behaviour.
+                 * Chunking keeps the KV/SSM state across calls, so layer N of
+                 * ubatch k is measured at start_pos = k*N, which is what we
+                 * actually want to compare against llama.cpp. */
+                int ub = prefill_ubatch;
+                if (ub <= 0) {
+                    const char *ev = getenv("PICOLM_PREFILL_UBATCH");
+                    if (ev) ub = atoi(ev);
+                }
+                if (ub > 0 && ub < bench_n_prompt) {
+                    int off = 0;
+                    logits = NULL;
+                    while (off < bench_n_prompt) {
+                        int n = bench_n_prompt - off;
+                        if (n > ub) n = ub;
 #ifdef PICOLM_GPU
-                if (model.gpu.kv_active) {
-                    logits = model_forward_prefill_gpu(&model, prompt_tokens, bench_n_prompt, 0, NULL);
-                    if (!logits) logits = model_forward_prefill(&model, prompt_tokens, bench_n_prompt, 0, NULL);
-                } else
+                        if (model.gpu.kv_active) {
+                            logits = model_forward_prefill_gpu(&model, prompt_tokens + off, n, off, NULL);
+                        }
+                        if (!logits)
 #endif
-                {
-                    logits = model_forward_prefill(&model, prompt_tokens, bench_n_prompt, 0, NULL);
+                        {
+                            logits = model_forward_prefill(&model, prompt_tokens + off, n, off, NULL);
+                        }
+                        if (!logits) break;
+                        off += n;
+                    }
+                    fprintf(stderr, "[prefill] %d tokens in %d ubatches of %d (last %d)\n",
+                            bench_n_prompt, (bench_n_prompt + ub - 1) / ub, ub,
+                            bench_n_prompt - (bench_n_prompt / ub) * ub);
+                } else {
+#ifdef PICOLM_GPU
+                    if (model.gpu.kv_active) {
+                        logits = model_forward_prefill_gpu(&model, prompt_tokens, bench_n_prompt, 0, NULL);
+                        if (!logits) logits = model_forward_prefill(&model, prompt_tokens, bench_n_prompt, 0, NULL);
+                    } else
+#endif
+                    {
+                        logits = model_forward_prefill(&model, prompt_tokens, bench_n_prompt, 0, NULL);
+                    }
                 }
                 pos = bench_n_prompt - 1;
                 /* Sync SSM state from host to device after CPU prefill */
@@ -2516,17 +2563,47 @@ int main(int argc, char **argv) {
         #ifdef PICOLM_GPU
         int gpu_prefill_used = 0;
 #endif
+        /* Chunked prefill: --prefill-ubatch N / PICOLM_PREFILL_UBATCH.
+         * Without this the whole prompt goes through one prefill call at
+         * start_pos, so --benchmark-live only ever reports shallow-context
+         * layer times. Chunking preserves KV/SSM state across calls, so each
+         * line is measured at its real position. */
+        int ub = prefill_ubatch;
+        if (ub <= 0) { const char *ev = getenv("PICOLM_PREFILL_UBATCH"); if (ev) ub = atoi(ev); }
+        const int chunked = (ub > 0 && ub < n_new);
 #ifdef PICOLM_GPU
         if (model.gpu.kv_active) {
-            logits = model_forward_prefill_gpu(&model, prefill_tokens, n_new, start_pos, NULL);
+            if (chunked) {
+                logits = NULL;
+                for (int off = 0; off < n_new; off += ub) {
+                    int cn = n_new - off; if (cn > ub) cn = ub;
+                    logits = model_forward_prefill_gpu(&model, prefill_tokens + off, cn, start_pos + off, NULL);
+                    if (!logits) break;
+                }
+            } else {
+                logits = model_forward_prefill_gpu(&model, prefill_tokens, n_new, start_pos, NULL);
+            }
             if (logits) {
                 gpu_prefill_used = 1;
+            }
+        }
+        if (!gpu_prefill_used)
+#endif
+        {
+            if (chunked) {
+                logits = NULL;
+                for (int off = 0; off < n_new; off += ub) {
+                    int cn = n_new - off; if (cn > ub) cn = ub;
+                    logits = model_forward_prefill(&model, prefill_tokens + off, cn, start_pos + off, NULL);
+                    if (!logits) break;
+                }
+                fprintf(stderr, "[prefill] %d tokens in %d ubatches of %d\n",
+                        n_new, (n_new + ub - 1) / ub, ub);
             } else {
                 logits = model_forward_prefill(&model, prefill_tokens, n_new, start_pos, NULL);
             }
-        } else
-#endif
-        {
+        }
+        if (!logits) {
             logits = model_forward_prefill(&model, prefill_tokens, n_new, start_pos, NULL);
         }
         pos = start_pos + n_new - 1;  /* = n_prompt - 1 */
