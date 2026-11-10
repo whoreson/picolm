@@ -593,18 +593,32 @@ static void glm5_kda_forward(
             for (int col = 0; col < KD; col++)
                 decay[col] = expf(fminf(g[h*KD + col], 50.0f));
 
-            for (int row = 0; row < KD; row++) {
-                const float *Srow = Sh + row;   /* column-major: stride KD */
-                float v_prime = 0.f;
-                float out_val = 0.f;
+            /* The state is column-major (state[row + col*KD]). The previous
+             * loop had row outermost and read Srow[col*KD], i.e. stride KD
+             * floats = 512 bytes -- one cache line per load, no reuse. Walk
+             * column-major instead (col outer, row inner) so each 128-float
+             * column block is read contiguously and both dot products share
+             * the loaded value. */
+            {
+                float *vp = v_new;          /* reuse v_new as the v' accumulator */
+                float *ov = head_out + h*KD;
+                memset(vp, 0, (size_t)KD * sizeof(float));
+                memset(ov, 0, (size_t)KD * sizeof(float));
                 for (int col = 0; col < KD; col++) {
-                    float st = Srow[col*KD];
-                    v_prime += st * (kh[col] * decay[col]);
-                    out_val += st * (qh[col] * decay[col]);
+                    const float *Scol = Sh + (size_t)col*KD;
+                    const float kd_ = kh[col] * decay[col];
+                    const float qd_ = qh[col] * decay[col];
+                    for (int row = 0; row < KD; row++) {
+                        float st = Scol[row];
+                        vp[row] += st * kd_;
+                        ov[row] += st * qd_;
+                    }
                 }
-                float vn = beta[h] * (vh[row] - v_prime);
-                v_new[row] = vn;
-                head_out[h*KD + row] = out_val * scale + vn * attn_score;
+                for (int row = 0; row < KD; row++) {
+                    float vn = beta[h] * (vh[row] - vp[row]);
+                    v_new[row] = vn;
+                    ov[row] = ov[row] * scale + vn * attn_score;
+                }
             }
             /* Diagnose the three contributions to head_out separately: at pos 0
              * the state is zero so out_val == 0 and the whole head output is
@@ -628,10 +642,41 @@ static void glm5_kda_forward(
             for (int col = 0; col < KD; col++) {
                 float k_col = kh[col];
                 float dec = decay[col];
-                for (int row = 0; row < KD; row++) {
-                    float st = Sh[row + col*KD];
+                float *Sc = Sh + (size_t)col*KD;   /* contiguous column */
+                int row = 0;
+#if defined(PICOLM_AVX512)
+                {
+                    const __m512 vdec = _mm512_set1_ps(dec);
+                    const __m512 vk   = _mm512_set1_ps(k_col);
+                    const __m512 vlo  = _mm512_set1_ps(-1e6f);
+                    const __m512 vhi  = _mm512_set1_ps(1e6f);
+                    for (; row + 15 < KD; row += 16) {
+                        __m512 st = _mm512_loadu_ps(Sc + row);
+                        __m512 vn = _mm512_loadu_ps(v_new + row);
+                        st = _mm512_add_ps(_mm512_mul_ps(vdec, st), _mm512_mul_ps(vn, vk));
+                        st = _mm512_min_ps(_mm512_max_ps(st, vlo), vhi);
+                        _mm512_storeu_ps(Sc + row, st);
+                    }
+                }
+#elif defined(PICOLM_AVX2) || defined(PICOLM_AVX)
+                {
+                    const __m256 vk = _mm256_set1_ps(k_col);
+                    const __m256 vdec = _mm256_set1_ps(dec);
+                    const __m256 vlo = _mm256_set1_ps(-1e6f);
+                    const __m256 vhi = _mm256_set1_ps(1e6f);
+                    for (; row + 7 < KD; row += 8) {
+                        __m256 st = _mm256_loadu_ps(Sc + row);
+                        __m256 vn = _mm256_loadu_ps(v_new + row);
+                        st = _mm256_add_ps(_mm256_mul_ps(vdec, st), _mm256_mul_ps(vn, vk));
+                        st = _mm256_min_ps(_mm256_max_ps(st, vlo), vhi);
+                        _mm256_storeu_ps(Sc + row, st);
+                    }
+                }
+#endif
+                for (; row < KD; row++) {
+                    float st = Sc[row];
                     st = dec * st + v_new[row] * k_col;
-                    Sh[row + col*KD] = fminf(fmaxf(st, -1e6f), 1e6f);
+                    Sc[row] = fminf(fmaxf(st, -1e6f), 1e6f);
                 }
             }
         }
@@ -1279,10 +1324,11 @@ float *model_forward_glm5(model_t *m, int token, int pos)
          * from the attention kernels. NOT a supported inference mode. */
         if (glm5_noattn_enabled()) {
             memset(attn_out, 0, (size_t)D * sizeof(float));
-        } else if (mla_ord >= 0)
+        } else if (mla_ord >= 0) {
             glm5_mla_forward(m, gw, lw, s, s->glm5.cur, pos, c->max_seq_len, il, mla_ord, attn_out);
-        else
+        } else {
             glm5_kda_forward(m, gw, lw, s, s->glm5.cur, pos, il, attn_out);
+        }
 
         snprintf(t, sizeof(t), "%s.attn_out", lt);
         glm5_stats(t, attn_out, D);
