@@ -18,6 +18,94 @@
 #include <assert.h>
 #include <time.h>   /* clock_gettime / CLOCKS_PER_SEC for ssm_now_ms() */
 
+/* ===========================================================================
+ * Persistent SSM prefill scratch pool
+ * ---------------------------------------------------------------------------
+ * ssm_prefill_layer() used to malloc()/free() a set of n_tokens-scaled
+ * work buffers on *every layer of every ubatch* (ssm_buf, vd_buf, pbuf,
+ * xb_q8_batch, ...). Qwen3.6-27B prefill runs 48 SSM layers per ubatch, so
+ * that is ~2 GB of alloc/free churn per 256-token ubatch -- and worse, once
+ * any single request grows past glibc's M_MMAP_THRESHOLD cap (32 MB), glibc
+ * stops serving it from the reusable heap and mmap()/munmap()s the whole
+ * region on every call, refaulting it from zero pages each time.
+ *
+ * That cliff is visible in --benchmark-live: raising the ubatch from 256 to
+ * 512 pushed ssm_buf from 42 MB to 85 MB, and SSM minor faults per layer went
+ * 2,910 -> 34,095 (11.7x for a 2x batch) while SSM layer time went
+ * 137 ms -> 314 ms. The SSM layers are the only place this happens: the
+ * full-attention path faults *down* per token (28.3 -> 24.1) and scales
+ * perfectly linearly (1.98x for 2x tokens).
+ *
+ * This pool keeps one buffer per logical slot and only re-allocates when a
+ * slot needs to grow, so after the first ubatch the pages stay mapped and
+ * touched: zero faults, zero allocator traffic. Contents are never assumed
+ * to be preserved across calls (every user writes before reading), so the
+ * pool is just a size-keyed cache, not a real arena.
+ *
+ * Sizes are exact-fit: a slot whose cached size is already >= the request is
+ * reused as-is. Because n_tokens only takes a handful of distinct values in
+ * practice (prompt chunks + the 1-token gen path), this converges
+ * immediately.
+ * =========================================================================== */
+#define SSM_SCRATCH_SLOTS 10
+
+typedef struct {
+    void  *ptr;
+    size_t cap;   /* bytes currently mapped for this slot */
+} ssm_scratch_slot_t;
+
+/* Indexed by the SSM_SCR_* enum below. Never freed: intentionally lives for
+ * the process lifetime, like the other model-level scratch buffers. */
+static ssm_scratch_slot_t g_ssm_scratch[SSM_SCRATCH_SLOTS];
+
+/* Logical slots. Keep in sync with the uses in ssm_prefill_layer(). */
+enum {
+    SSM_SCR_VD      = 0,  /* gated-norm scratch, n_tokens * value_dim  */
+    SSM_SCR_BUF     = 1,  /* ssm_xb + qkv + z + conv, n_tokens*per_tok */
+    SSM_SCR_PBUF    = 2,  /* conv1d ring, (n_state_rows + n_tokens)*conv_dim */
+    SSM_SCR_ALPHA   = 3,  /* n_tokens * n_v_heads */
+    SSM_SCR_BETA    = 4,  /* n_tokens * n_v_heads */
+    SSM_SCR_Q8      = 5,  /* n_tokens * (dim/32) * 34 (Q8_0 x)  */
+    SSM_SCR_Q8D     = 6,  /* n_tokens * (dim/32) floats (deltas) */
+    SSM_SCR_OUT     = 7,  /* d_state * n_v_heads (per-head ssm output) */
+    SSM_SCR_SMOUT   = 8,  /* n_tokens * dim (ssm_out projection result) */
+    SSM_SCR_FOGGUF  = 9,  /* n_tokens * value_dim (gated-norm -> ssm_out input) */
+};
+
+/* Get a reusable buffer of at least `bytes` for logical slot `slot`.
+ * Returns NULL on OOM (callers keep their existing error handling). The
+ * returned memory is uninitialised -- every user writes before reading. */
+static void *ssm_scratch_get(int slot, size_t bytes) {
+    if (slot < 0 || slot >= SSM_SCRATCH_SLOTS || bytes == 0) return NULL;
+    ssm_scratch_slot_t *s = &g_ssm_scratch[slot];
+    if (s->ptr != NULL && s->cap >= bytes) {
+        return s->ptr;
+    }
+    /* Round up to a 2 MiB granularity so small prompt-length variations
+     * (e.g. 511 vs 512) do not each trigger a fresh mapping, and so the
+     * mapping is eligible for THP backing. */
+    const size_t gran = 2u * 1024u * 1024u;
+    size_t want = (bytes + gran - 1) & ~(gran - 1);
+    /* malloc, not realloc: growth happens only a couple of times per run
+     * (once when the first big ubatch arrives), and realloc would copy the
+     * whole old block for no reason -- the contents are dead anyway. */
+    void *p = malloc(want);
+    if (p == NULL) {
+        /* keep the old block if it still fits the request */
+        return (s->ptr != NULL && s->cap >= bytes) ? s->ptr : NULL;
+    }
+    free(s->ptr);
+    s->ptr = p;
+    s->cap = want;
+    /* Touch the first page of each 2 MiB chunk so the mapping is populated
+     * up-front rather than faulting in the middle of the conv1d/GEMM loop.
+     * This is the whole point of the pool: pay the fault once, not per layer. */
+    for (size_t off = 0; off < want; off += 4096u) {
+        ((volatile char *)p)[off] = 0;
+    }
+    return s->ptr;
+}
+
 /* Vectorized exp/silu helpers for SSM prefill.
  * Replaces ~600M scalar expf() calls per 771-token prefill on Qwen3.6-27B
  * (steps 4/6/8 in ssm_prefill_layer) with AVX2/FMA 8-lane path. */
@@ -3909,7 +3997,8 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
      * after the ssm_out projection (step 9). */
     float *vd_buf = NULL;
     if ((size_t)n_tokens * (size_t)value_dim > (size_t)n_tokens * (size_t)xb2_stride) {
-        vd_buf = (float *)malloc((size_t)n_tokens * (size_t)value_dim * sizeof(float));
+        vd_buf = (float *)ssm_scratch_get(SSM_SCR_VD,
+                         (size_t)n_tokens * (size_t)value_dim * sizeof(float));
         if (!vd_buf) { fprintf(stderr, "OOM: ssm gated-norm scratch\n"); exit(1); }
     }
     /* Output target for the chunked recurrence + gated normalisation. */
@@ -3924,9 +4013,11 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
     int state_stride = conv_dim;
     int ri = 2 + l * 9;
 
-    /* Allocate per-token scratch: xb (RMSNorm'd input) + qkv + z + conv_out */
+    /* Per-token scratch: xb (RMSNorm'd input) + qkv + z + conv_out.
+     * Served from the persistent pool -- see the note at g_ssm_scratch. */
     size_t per_tok = (size_t)(dim + conv_dim + value_dim + conv_dim);
-    float *ssm_buf = (float *)malloc((size_t)n_tokens * per_tok * sizeof(float));
+    float *ssm_buf = (float *)ssm_scratch_get(SSM_SCR_BUF,
+                          (size_t)n_tokens * per_tok * sizeof(float));
     if (!ssm_buf) { fprintf(stderr, "OOM: SSM prefill scratch\n"); exit(1); }
     float *ssm_xb = ssm_buf;              /* [n_tokens][dim] - RMSNorm'd input */
     float *qkv_batch = ssm_xb + (size_t)n_tokens * dim;
@@ -4066,7 +4157,8 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
          * (cw[d*conv_dim + co]) stay sequential, and walks tokens in the inner
          * loop where the tap pointers are just pbuf + offset. */
         const size_t nrows = (size_t)nsr + (size_t)n_tokens;
-        float *pbuf = (float *)malloc(nrows * (size_t)conv_dim * sizeof(float));
+        float *pbuf = (float *)ssm_scratch_get(SSM_SCR_PBUF,
+                            nrows * (size_t)conv_dim * sizeof(float));
         if (!pbuf) { fprintf(stderr, "OOM: conv1d pbuf\n"); exit(1); }
         for (int r = 0; r < nsr; r++)
             memcpy(pbuf + (size_t)r * conv_dim, conv_state + (size_t)r * state_stride,
@@ -4119,7 +4211,7 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
             memcpy(conv_state + (size_t)r * state_stride,
                    pbuf + ((size_t)n_tokens + (size_t)r) * conv_dim,
                    (size_t)conv_dim * sizeof(float));
-        free(pbuf);
+        /* pbuf comes from the persistent scratch pool (see g_ssm_scratch) */
         free(conv1d_wt);
     }
     _SSM_STEP_TMR(4);
@@ -4160,9 +4252,12 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
      * GGUF stores [dim, n_v_heads] column-major per head, with possible
      * v-head reordering. Each head is a vec_dot of dim elements.
      * We process all tokens and all heads in batched fashion. */
-    /* Phase 1.3: alpha/beta stored in pooled ssm_buf instead of separate mallocs */
-    float *alpha_batch = (float *)malloc((size_t)n_tokens * n_v_heads * sizeof(float));
-    float *beta_batch = (float *)malloc((size_t)n_tokens * n_v_heads * sizeof(float));
+    /* Phase 1.3: alpha/beta served from the persistent scratch pool */
+    float *alpha_batch = (float *)ssm_scratch_get(SSM_SCR_ALPHA,
+                              (size_t)n_tokens * n_v_heads * sizeof(float));
+    float *beta_batch  = (float *)ssm_scratch_get(SSM_SCR_BETA,
+                              (size_t)n_tokens * n_v_heads * sizeof(float));
+    if (!alpha_batch || !beta_batch) { fprintf(stderr, "OOM: ssm alpha/beta\n"); exit(1); }
     {
         gguf_type_t alpha_type = lw->type_ssm_alpha;
         gguf_type_t beta_type = lw->type_ssm_beta;
@@ -4281,8 +4376,11 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
         }
         /* Quantize all xb tokens to Q8_0 once for fast vec_dot */
         int nb_xb = dim / 32;
-        uint8_t *xb_q8_batch = (uint8_t *)malloc((size_t)n_tokens * nb_xb * 34);
-        float *xb_q8_d_batch = (float *)malloc((size_t)n_tokens * nb_xb * sizeof(float));
+        uint8_t *xb_q8_batch = (uint8_t *)ssm_scratch_get(SSM_SCR_Q8,
+                                    (size_t)n_tokens * nb_xb * 34);
+        float *xb_q8_d_batch = (float *)ssm_scratch_get(SSM_SCR_Q8D,
+                                    (size_t)n_tokens * nb_xb * sizeof(float));
+        if (!xb_q8_batch || !xb_q8_d_batch) { fprintf(stderr, "OOM: ssm q8 scratch\n"); exit(1); }
         for (bi = 0; bi < n_tokens; bi++) {
             quantize_row_q8_0(ssm_xb + bi * dim, xb_q8_batch + bi * nb_xb * 34, dim);
             const block_q8_0 *xqb = (const block_q8_0 *)(xb_q8_batch + bi * nb_xb * 34);
@@ -4320,8 +4418,7 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
                 bt[h] = sum;
             }
         }
-        free(xb_q8_batch);
-        free(xb_q8_d_batch);
+        /* xb_q8_batch / xb_q8_d_batch are pool-owned, not freed here */
         /* alpha_map and beta_map are stack-allocated */
         }
 
@@ -4462,7 +4559,9 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
              * alpha_batch now stores gate_log (log-space), so we must
              * convert to gate_exp = expf(gate) for the per-token recurrence.
              * Note: bi == n_tokens after the loop above, so use index 0. */
-            float *ssm_output = (float *)malloc((size_t)d_state * n_v_heads * sizeof(float));
+            float *ssm_output = (float *)ssm_scratch_get(SSM_SCR_OUT,
+                                    (size_t)d_state * n_v_heads * sizeof(float));
+            if (!ssm_output) { fprintf(stderr, "OOM: ssm output\n"); exit(1); }
             float *gate_exp_buf = (float *)alloca(n_v_heads * sizeof(float));
             for (int h = 0; h < n_v_heads; h++) {
                 float g = alpha_batch[h];
@@ -4485,12 +4584,11 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
             for (int d = 0; d < d_state; d++)
                 for (int h = 0; h < n_v_heads; h++)
                     xb2_vd[h * head_v_dim + d] = ssm_output[d * n_v_heads + h];
-            free(ssm_output);
+            /* ssm_output is pool-owned, not freed here */
         }
     }
 
-    free(alpha_batch);
-    free(beta_batch);
+    /* alpha_batch / beta_batch are pool-owned, not freed here */
     _SSM_STEP_TMR(7);
 
     /* 8. Gated normalization (batched across tokens) */
@@ -4579,7 +4677,9 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
          * own full H2D+kernel+D2H (and, via matmul()'s own scratch
          * management, malloc) overhead, so a 36-token prompt paid that
          * fixed per-call overhead 36 times per layer instead of once. */
-        float *fo_gguf_batch = (float *)malloc((size_t)n_tokens * value_dim * sizeof(float));
+        float *fo_gguf_batch = (float *)ssm_scratch_get(SSM_SCR_FOGGUF,
+                                   (size_t)n_tokens * value_dim * sizeof(float));
+        if (!fo_gguf_batch) { fprintf(stderr, "OOM: ssm fo_gguf_batch\n"); exit(1); }
         for (bi = 0; bi < n_tokens; bi++) {
             float *fo = xb2_vd + bi * value_dim;
             float *dst = fo_gguf_batch + bi * value_dim;
@@ -4629,12 +4729,14 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
               free(cw);
             }
         }
-        float *ssm_out_buf = (float *)malloc((size_t)n_tokens * dim * sizeof(float));
+        float *ssm_out_buf = (float *)ssm_scratch_get(SSM_SCR_SMOUT,
+                                (size_t)n_tokens * dim * sizeof(float));
+        if (!ssm_out_buf) { fprintf(stderr, "OOM: ssm_out scratch\n"); exit(1); }
         matmul_batch(ssm_out_buf, fo_gguf_batch, n_tokens, lw->ssm_out, value_dim, dim, lw->type_ssm_out);
         for (bi = 0; bi < n_tokens; bi++)
             memcpy(xb2_batch + bi * xb2_stride, ssm_out_buf + bi * dim, dim * sizeof(float));
-        free(ssm_out_buf);
-        free(fo_gguf_batch);
+        /* ssm_out_buf is pool-owned, not freed here */
+        /* fo_gguf_batch is pool-owned, not freed here */
         if (l <= 4 && _SSM_DBG) {
             float so[8], sor=0; int lt=n_tokens-1;
             for(int i=0;i<8;i++){so[i]=xb2_batch[lt*xb2_stride+i];sor+=so[i]*so[i];}sor=sqrtf(sor/8);
@@ -4653,7 +4755,9 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
         }
 #endif
         /* Cannot alias in/out when value_dim != dim (strides differ, cross-token corruption) */
-        float *ssm_out_buf = (float *)malloc((size_t)n_tokens * dim * sizeof(float));
+        float *ssm_out_buf = (float *)ssm_scratch_get(SSM_SCR_SMOUT,
+                                (size_t)n_tokens * dim * sizeof(float));
+        if (!ssm_out_buf) { fprintf(stderr, "OOM: ssm_out scratch\n"); exit(1); }
         matmul_batch(ssm_out_buf, xb2_batch, n_tokens, lw->ssm_out, value_dim, dim, lw->type_ssm_out);
         if (l <= 4 && _SSM_DBG) {
             float so[8], sor=0; int lt=n_tokens-1;
@@ -4662,7 +4766,7 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
         }
         for (bi = 0; bi < n_tokens; bi++)
             memcpy(xb2_batch + bi * xb2_stride, ssm_out_buf + bi * dim, dim * sizeof(float));
-        free(ssm_out_buf);
+        /* ssm_out_buf is pool-owned, not freed here */
         tensor_set_repacked(NULL);
 #ifdef PICOLM_GPU
         if (gpu_lw) tensor_set_gpu_tensor(NULL, 0);
@@ -4766,13 +4870,15 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
           for(int i = 0; i < value_dim; i++) xrms += xb2_batch[lt*xb2_stride+i]*xb2_batch[lt*xb2_stride+i];
           fprintf(stderr, "SSM_VERIFY l=0 cpu xb2_rms=%.6e\n", sqrt(xrms/value_dim)); }
         /* Dump ssm_out matmul output for last token */
-        { float *ssm_out_buf = (float *)malloc((size_t)n_tokens * dim * sizeof(float));
+        { float *ssm_out_buf = (float *)ssm_scratch_get(SSM_SCR_SMOUT,
+                                (size_t)n_tokens * dim * sizeof(float));
+          if (!ssm_out_buf) { fprintf(stderr, "OOM: ssm_out scratch\n"); exit(1); }
           matmul_batch(ssm_out_buf, xb2_batch, n_tokens, lw->ssm_out, value_dim, dim, lw->type_ssm_out);
           double orm = 0; for(int i=0;i<dim;i++) orm+=ssm_out_buf[lt*dim+i]*ssm_out_buf[lt*dim+i];
           fprintf(stderr, "SSM_VERIFY l=0 cpu ssm_out_rms=%.6e\n", sqrt(orm/dim));
           fprintf(stderr, "SSM_VERIFY l=0 cpu ssm_out_last[:4]={%.6f,%.6f,%.6f,%.6f}\n",
               ssm_out_buf[lt*dim],ssm_out_buf[lt*dim+1],ssm_out_buf[lt*dim+2],ssm_out_buf[lt*dim+3]);
-          free(ssm_out_buf); }
+          /* ssm_out_buf is pool-owned */ }
     }
 #endif
     if (n_tokens > 0 && _SSM_DBG && (l < 3 || l == c->n_layers - 1)) {
@@ -4780,8 +4886,9 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
         fprintf(stderr, "[CPU PFX l=%d] bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n", l, x_batch[lt*dim], x_batch[lt*dim+1], x_batch[lt*dim+2], x_batch[lt*dim+3]);
     }
     _SSM_STEP_TMR(11); /* step 11 (FFN) done */
-    free(ssm_buf);
-    free(vd_buf);
+    /* ssm_buf / vd_buf are pool-owned and intentionally not freed here:
+     * keeping them mapped across layers is what avoids the per-layer
+     * mmap/munmap refault storm. See g_ssm_scratch at the top of this file. */
 }
 
 size_t model_ssm_snapshot_size(const model_t *m) {
