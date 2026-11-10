@@ -82,6 +82,48 @@ typedef int SOCKET;
 /* Declared in picolm.c */
 extern double get_time_ms(void);
 
+/* Declared in model_core.c / model_internal.h */
+extern void bench_emit(int l, int is_prefill, double elapsed_ms, long minflt, long majflt);
+
+/* ---- --benchmark-live callback for server --------------------------------- */
+typedef struct {
+    int n_layers;
+    int n_active_layers;
+    size_t layer_weight_sizes[128];
+} server_bench_ctx_t;
+
+static server_bench_ctx_t g_sbench;
+static int g_sbench_active = 0;
+
+static void server_bench_cb(int layer, int is_prefill, double elapsed_ms, long minflt, long majflt, void *ud) {
+    (void)ud;
+    if (!g_sbench_active) return;
+    size_t wsize = 0;
+    if (layer >= 0 && layer < 128) wsize = g_sbench.layer_weight_sizes[layer];
+    double wt_mbs = (elapsed_ms > 0 && wsize > 0)
+                  ? (double)wsize / (elapsed_ms / 1000.0) / (1024.0 * 1024.0) : 0;
+    char bw_str[96];
+    if (wsize > 0 && wt_mbs > 0) {
+        double io_pct = 0, cache_pct = 0;
+        if (majflt > 0) io_pct = ((double)majflt * 4096 / (elapsed_ms / 1000.0) / (1024.0 * 1024.0)) / wt_mbs * 100.0;
+        if (minflt > 0) cache_pct = ((double)minflt * 4096 / (elapsed_ms / 1000.0) / (1024.0 * 1024.0)) / wt_mbs * 100.0;
+        if (wt_mbs >= 100.0)
+            snprintf(bw_str, sizeof(bw_str), "%.0fMB/s io=%.0f%% cache=%.0f%%", wt_mbs, io_pct, cache_pct);
+        else if (wt_mbs >= 1.0)
+            snprintf(bw_str, sizeof(bw_str), "%.1fMB/s io=%.0f%% cache=%.0f%%", wt_mbs, io_pct, cache_pct);
+        else
+            snprintf(bw_str, sizeof(bw_str), "%.0fKB/s io=%.0f%% cache=%.0f%%", wt_mbs * 1024.0, io_pct, cache_pct);
+    } else {
+        snprintf(bw_str, sizeof(bw_str), "?MB/s");
+    }
+    fprintf(stderr, "%s [layer %d/%d]: %6.1fms  %-14s",
+            is_prefill ? "Prefill" : "Gen", layer, g_sbench.n_active_layers, elapsed_ms, bw_str);
+    if (minflt > 0 || majflt > 0)
+        fprintf(stderr, " [pf=%lu+%lu]", (unsigned long)minflt, (unsigned long)majflt);
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
 /* GPU path selection: 0=model_forward (CPU-hybrid), 1=model_forward_gpu (full GPU).
  * Defaults to 0 for server (unchanged behavior), 1 for CLI. */
 #ifndef PICOLM_SERVER_DEFAULT_GPU_PATH
@@ -2246,6 +2288,9 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
     double t0 = get_time_ms();
     fprintf(stderr, "\n[server] === request start (%s) ===\n", is_chat ? "chat" : "completion");
 
+    /* Activate benchmark callback for this request */
+    if (g_sbench.n_layers > 0) g_sbench_active = 1;
+
     cJSON *req = cJSON_ParseWithLength(request_body, strlen(request_body));
     if (!req) {
         http_send(sock, 400, "application/json", "{\"error\":{\"message\":\"Invalid JSON\"}}");
@@ -2812,6 +2857,9 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
     free(model_name);
     free(ptokens);
     stop_matcher_free(&sm);
+
+    /* Deactivate benchmark callback */
+    g_sbench_active = 0;
 }
 
 /* ---- Endpoint: POST /completion (llama.cpp-style) ---- */
@@ -2822,6 +2870,9 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
 static void handle_llama_completion(SOCKET sock, const char *request_body) {
     double t0 = get_time_ms();
     fprintf(stderr, "\n[server] === /completion request start ===\n");
+
+    /* Activate benchmark callback for this request */
+    if (g_sbench.n_layers > 0) g_sbench_active = 1;
 
     cJSON *req = cJSON_ParseWithLength(request_body, strlen(request_body));
     if (!req) {
@@ -3442,6 +3493,9 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
     free(model_name);
     free(ptokens);
     stop_matcher_free(&sm);
+
+    /* Deactivate benchmark callback */
+    g_sbench_active = 0;
 }
 
 /* ---- Endpoint: POST /tokenize ---- */
@@ -3694,6 +3748,16 @@ int server_main(server_config_t *sc) {
                     sc->kv_type_k, sc->kv_type_v, sc->k_cache_hadamard, sc->v_cache_hadamard,
                     sc->viz_port, sc->viz_width, sc->viz_height) != 0) {
         return -1;
+    }
+
+    /* Install benchmark callback if --benchmark-live was specified */
+    if (sc->benchmark_live) {
+        g_sbench.n_layers = srv.model.config.n_layers;
+        g_sbench.n_active_layers = srv.model.config.n_layers - srv.model.config.n_mtp_layers;
+        for (int l = 0; l < g_sbench.n_layers && l < 128; l++)
+            g_sbench.layer_weight_sizes[l] = layer_weight_size(&srv.model, l);
+        model_set_bench_callback(server_bench_cb, &g_sbench);
+        fprintf(stderr, "[server] --benchmark-live enabled\n");
     }
 
 #ifdef _WIN32

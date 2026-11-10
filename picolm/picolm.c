@@ -353,9 +353,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  --list-kv        List all KV metadata entries and exit\n");
     fprintf(stderr, "  --benchmark [N]  Benchmark loop (N times, omit for continuous)\n");
     fprintf(stderr, "  --benchmark-live Print --benchmark-style per-layer timing during ordinary\n");
-    fprintf(stderr, "                   generation. Unlike --benchmark it does NOT replace the\n");
-    fprintf(stderr, "                   run, so it works with --cache, --checkpoint-max and a\n");
-    fprintf(stderr, "                   real prompt. Use it to catch long-context latency spikes.\n");
+    fprintf(stderr, "                   generation. Works with --server and --cache.\n");
     #if defined(__linux__) || defined(__APPLE__)
     fprintf(stderr, "  --benchmark-threads [LIST]\n");
     fprintf(stderr, "                  Prefill once per thread count and report prefill ms / tok/s.\n");
@@ -1747,6 +1745,7 @@ int main(int argc, char **argv) {
         sc.viz_port = srv_viz_port;
         sc.viz_width = srv_viz_width;
         sc.viz_height = srv_viz_height;
+        sc.benchmark_live = benchmark_live;
         #ifdef PICOLM_SERVER
         return server_main(&sc);
 #else

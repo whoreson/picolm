@@ -31,6 +31,7 @@ typedef struct {
     int viz_port;
     int viz_width;
     int viz_height;
+    int benchmark_live;  /* --benchmark-live: per-layer timing during generation */
 } server_config_t;
 
 /* Start the HTTP server. Blocks until interrupted.
