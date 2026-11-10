@@ -1971,6 +1971,9 @@ static void ssm_chunk_head_task(int h, void *ctxp) {
  * state:       [n_v_heads][d_state][d_state] recurrent state (updated in-place)
  * xb2_batch:   [n_tokens][value_dim] head-major output [h*head_v_dim + d]
  */
+/* Defined further down (near the step profiler); forward-declared here because
+ * the expensive helpers below check it for the PICOLM_SSM_SKIP timing probe. */
+static int ssm_step_skipped(int idx);
 static void ssm_chunked_recurrence(
         const float *conv_batch,
         const float *alpha_batch,
@@ -1981,6 +1984,8 @@ static void ssm_chunked_recurrence(
         int d_state, int n_k_heads, int n_v_heads, int head_v_dim, int repeat,
         int conv_dim, int cs)
 {
+    /* Timing probe: PICOLM_SSM_SKIP=7 removes the recurrence entirely. */
+    if (ssm_step_skipped(7)) return;
     /* cs: chunk size (from model->ssm_chunk_size, default 8, 0=auto)
      *
      * 8 is a measured optimum, not a guess. The chunked recurrence's cost has
@@ -3583,19 +3588,43 @@ int ssm_prefill_layer_gpu(model_t *m, run_state_t *s,
  * State recurrence remains sequential per token but uses threaded
  * ssm_head_task across v-heads within each token.
  * ================================================================ */
-static double _ssm_step_ms[12];
+static double _ssm_step_ms[13];
 static int _ssm_step_on = -1;
+
+/* Diagnostic: PICOLM_SSM_SKIP=<csv of step numbers> makes ssm_prefill_layer()
+ * skip those steps entirely. Used to measure what each step actually costs in
+ * situ -- e.g. PICOLM_SSM_SKIP=4,7 skips conv1d and the recurrence. Output is
+ * garbage by construction; this is a timing probe, not a correctness mode. */
+static int _ssm_skip_mask = -2;
+static int ssm_step_skipped(int idx) {
+    if (_ssm_skip_mask == -2) {
+        _ssm_skip_mask = 0;
+        const char *ev = getenv("PICOLM_SSM_SKIP");
+        if (ev && *ev) {
+            const char *p = ev;
+            while (*p) {
+                while (*p == ',' || *p == ' ') p++;
+                if (*p >= '0' && *p <= '9') {
+                    int n = atoi(p);
+                    if (n >= 0 && n < 32) _ssm_skip_mask |= (1 << n);
+                }
+                while (*p && *p != ',') p++;
+            }
+        }
+    }
+    return (_ssm_skip_mask >> idx) & 1;
+}
 void ssm_prefill_step_prof_reset(void) {
     memset(_ssm_step_ms, 0, sizeof(_ssm_step_ms));
 }
 void ssm_prefill_step_prof_report(void) {
     if (_ssm_step_on < 0) _ssm_step_on = getenv("PICOLM_SSM_STEP_PROF") ? 1 : 0;
     if (_ssm_step_on <= 0) return;
-    const char *names[12] = {"1 rmsnorm","(unused)","2 qkv","3 zgate","4 conv1d","5 split+l2norm","6 alpha/beta","7 recurrence","8 gatednorm","9 outproj","10 residual","11 ffn"};
+    const char *names[13] = {"1 rmsnorm","(unused)","2 qkv","3 zgate","4 conv1d","5 split+l2norm","6 alpha/beta","7 recurrence","8 gatednorm","9 outproj","10 residual","11 ffn","12 pre-setup"};
     double total = 0;
-    for (int i = 0; i < 12; i++) total += _ssm_step_ms[i];
+    for (int i = 0; i < 13; i++) total += _ssm_step_ms[i];
     fprintf(stderr, "\n=== SSM prefill step profile (total %.1f ms across all layers) ===\n", total);
-    for (int i = 0; i < 12; i++) {
+    for (int i = 0; i < 13; i++) {
         if (_ssm_step_ms[i] > 0.5)
             fprintf(stderr, "  %-16s %8.1f ms  %5.1f%%\n", names[i], _ssm_step_ms[i], total > 0 ? 100.0*_ssm_step_ms[i]/total : 0);
     }
@@ -3781,23 +3810,76 @@ static void ssm_conv_block_task(int task, void *ctxp) {
     const int ntok = c->n_tokens;
     const int n_taps = nsr + 1;
 
+    /* The old inner loop was over taps (d), so each output channel did
+     * n_taps scalar loads + FMAs with cw strided by conv_dim -- no SIMD at
+     * all, and the compiler could not see through the taps[d][co] gather.
+     * That made this 4-tap depthwise conv run at ~3 GFLOP/s: it touched
+     * 84 MB of traffic for 0.04 GFLOP of work.
+     *
+     * taps[d] and out are both contiguous in co, so vectorise over co
+     * instead: load one vector from each tap row, FMA against the matching
+     * cw row, store. Same arithmetic order per lane, so results are
+     * bit-identical to the scalar version. */
+#if defined(PICOLM_AVX512)
+    #define SSM_CONV_LANES 16
+    #define SSM_CONV_VEC   __m512
+    #define SSM_CONV_LOAD  _mm512_loadu_ps
+    #define SSM_CONV_STORE _mm512_storeu_ps
+    #define SSM_CONV_MUL   _mm512_mul_ps
+    #define SSM_CONV_ADD   _mm512_add_ps
+    #define SSM_CONV_SET1  _mm512_set1_ps
+#elif defined(PICOLM_AVX2) || defined(PICOLM_AVX)
+    #define SSM_CONV_LANES 8
+    #define SSM_CONV_VEC   __m256
+    #define SSM_CONV_LOAD  _mm256_loadu_ps
+    #define SSM_CONV_STORE _mm256_storeu_ps
+    #define SSM_CONV_MUL   _mm256_mul_ps
+    #define SSM_CONV_ADD   _mm256_add_ps
+    #define SSM_CONV_SET1  _mm256_set1_ps
+#endif
+
     for (int t = 0; t < ntok; t++) {
         const float *restrict p = c->pbuf + (size_t)t * cd;
         float *restrict out = c->conv_out + (size_t)t * cd;
 
-        /* taps[d] = pbuf row (t + d), pulled out so the co loop below is a
-         * flat contiguous FMA sweep the compiler can vectorise. */
         const float *restrict taps[8];
         for (int d = 0; d < n_taps; d++)
             taps[d] = p + (size_t)d * cd;
 
+#if defined(SSM_CONV_LANES)
+        int co = co_begin;
+        for (; co + SSM_CONV_LANES - 1 < co_end; co += SSM_CONV_LANES) {
+            SSM_CONV_VEC acc = SSM_CONV_MUL(
+                SSM_CONV_LOAD(c->cw + co), SSM_CONV_LOAD(taps[0] + co));
+            for (int d = 1; d < n_taps; d++)
+                acc = SSM_CONV_ADD(acc, SSM_CONV_MUL(
+                    SSM_CONV_LOAD(c->cw + (size_t)d * cd + co),
+                    SSM_CONV_LOAD(taps[d] + co)));
+            SSM_CONV_STORE(out + co, acc);
+        }
+        /* scalar tail */
+        for (; co < co_end; co++) {
+            float sum = c->cw[co] * taps[0][co];
+            for (int d = 1; d < n_taps; d++)
+                sum += c->cw[(size_t)d * cd + co] * taps[d][co];
+            out[co] = sum;
+        }
+#else
         for (int co = co_begin; co < co_end; co++) {
             float sum = c->cw[co] * taps[0][co];
             for (int d = 1; d < n_taps; d++)
                 sum += c->cw[(size_t)d * cd + co] * taps[d][co];
             out[co] = sum;
         }
+#endif
     }
+#undef SSM_CONV_LANES
+#undef SSM_CONV_VEC
+#undef SSM_CONV_LOAD
+#undef SSM_CONV_STORE
+#undef SSM_CONV_MUL
+#undef SSM_CONV_ADD
+#undef SSM_CONV_SET1
 }
 
 /* ---- Parallel SSM gated-norm task ----
@@ -4028,9 +4110,22 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
     do { if (_ssm_step_on > 0) { double _t = ssm_now_ms(); _ssm_step_ms[(idx)] += _t - _ssm_step_last; _ssm_step_last = _t; } } while(0)
     if (_ssm_step_on < 0) _ssm_step_on = getenv("PICOLM_SSM_STEP_PROF") ? 1 : 0;
     double _ssm_step_last = (_ssm_step_on > 0) ? ssm_now_ms() : 0;
+    /* Everything from function entry to here is untimed by the step profiler:
+     * config reads, scratch_get calls, pointer setup. Bucket it so the
+     * 'skipped every step' residual can be attributed instead of guessed. */
+    _SSM_STEP_TMR(12);
+/* Diagnostic skip of individual steps (PICOLM_SSM_SKIP). Usage:
+ *     _SSM_STEP_GUARD(4) { ...conv1d... }
+ * The guard evaluates the env mask once; skipped steps just do nothing, so the
+ * layer still runs and still gets timed, but that step's cost is removed. The
+ * downstream output is wrong by construction -- timing probe only. */
+#define _SSM_SKIP(idx) ssm_step_skipped(idx)
+#define _SSM_STEP_GUARD(idx) if (!_SSM_SKIP(idx))
 /* 1. Batched RMSNorm (write to local ssm_xb with stride dim) */
+    if (!_SSM_SKIP(1)) {
     for (bi = 0; bi < n_tokens; bi++)
         rmsnorm(ssm_xb + bi * dim, x_batch + bi * dim, s->attn_norm_w[l], dim, eps);
+    }
     _SSM_STEP_TMR(0);
 
     /* 2. Batched QKV projection (read from ssm_xb with stride dim) */
@@ -4058,7 +4153,9 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
         }
         (void)isnan_cnt; (void)amax; (void)amin;
         }
+    if (!_SSM_SKIP(2)) {
     matmul_batch(qkv_batch, ssm_xb, n_tokens, lw->attn_qkv, dim, conv_dim, lw->type_attn_qkv);
+    }
     tensor_set_repacked(NULL);
     if (l == 0 && _SSM_DBG) {
         float qkv_rms=0; float qkv_v[4];
@@ -4079,7 +4176,9 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
 
     /* 3. Batched Z gate projection */
     tensor_set_repacked(m->repack_used[ri+1] ? m->repack_buffers[ri+1] : NULL);
+    if (!_SSM_SKIP(3)) {
     matmul_batch(z_batch, ssm_xb, n_tokens, lw->attn_gate_ssm, dim, value_dim, lw->type_attn_gate_ssm);
+    }
     tensor_set_repacked(NULL);
 #ifdef PICOLM_GPU
     if (gpu_lw) tensor_set_gpu_tensor(NULL, 0);
@@ -4106,13 +4205,13 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
      * Each token sees a different conv_state because we shift after each token. */
     int conv1d_gpu_done = 0;
 #ifdef PICOLM_GPU
-    if (gpu_lw) {
+    if (!_SSM_SKIP(4) && gpu_lw) {
         conv1d_gpu_done = picolm_gpu_ssm_conv1d_batch(conv_batch, conv_state, qkv_batch,
                                                         conv1d_w, conv_dim, c->ssm_d_conv,
                                                         n_tokens, m->gpu.device);
     }
 #endif
-    if (!conv1d_gpu_done) {
+    if (!_SSM_SKIP(4) && !conv1d_gpu_done) {
         /* Pre-transpose conv1d weights from [co][d] (GGUF layout, stride d_conv
          * in the co direction) to [d][co] (contiguous in co) so the per-token
          * conv becomes 4 contiguous FMA over conv_dim elements instead of
@@ -4243,7 +4342,7 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
                                          conv_dim, 1e-12f, 1.0f, m->gpu.device);
     }
 #endif
-    if (!l2norm_gpu_done) {
+    if (!_SSM_SKIP(5) && !l2norm_gpu_done) {
         tensor_parallel_for(n_tokens, ssm_l2norm_task, &sc);
     }
     _SSM_STEP_TMR(5);
@@ -4732,6 +4831,7 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
         float *ssm_out_buf = (float *)ssm_scratch_get(SSM_SCR_SMOUT,
                                 (size_t)n_tokens * dim * sizeof(float));
         if (!ssm_out_buf) { fprintf(stderr, "OOM: ssm_out scratch\n"); exit(1); }
+        if (!_SSM_SKIP(9))
         matmul_batch(ssm_out_buf, fo_gguf_batch, n_tokens, lw->ssm_out, value_dim, dim, lw->type_ssm_out);
         for (bi = 0; bi < n_tokens; bi++)
             memcpy(xb2_batch + bi * xb2_stride, ssm_out_buf + bi * dim, dim * sizeof(float));
@@ -4758,6 +4858,7 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
         float *ssm_out_buf = (float *)ssm_scratch_get(SSM_SCR_SMOUT,
                                 (size_t)n_tokens * dim * sizeof(float));
         if (!ssm_out_buf) { fprintf(stderr, "OOM: ssm_out scratch\n"); exit(1); }
+        if (!_SSM_SKIP(9))
         matmul_batch(ssm_out_buf, xb2_batch, n_tokens, lw->ssm_out, value_dim, dim, lw->type_ssm_out);
         if (l <= 4 && _SSM_DBG) {
             float so[8], sor=0; int lt=n_tokens-1;
@@ -4775,6 +4876,7 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
     _SSM_STEP_TMR(9);
 
     /* 10. Residual add (batched) */
+    if (!_SSM_SKIP(10))
     for (bi = 0; bi < n_tokens; bi++) {
         float *a = x_batch + bi * dim, *b = xb2_batch + bi * xb2_stride;
         for (int d = 0; d < dim; d++) a[d] += b[d];
@@ -4821,6 +4923,7 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
 #endif
         if (!ffn_gpu_done) {
             tensor_set_repacked(m->repack_used[ri+7] ? m->repack_buffers[ri+7] : NULL);
+            if (!_SSM_SKIP(11))
             matmul_dual_batch(hb_batch, hb2_batch, ssm_xb, n_tokens,
                               lw->ffn_gate, lw->ffn_up, dim, c->n_ffn,
                               lw->type_ffn_gate, lw->type_ffn_up);
@@ -4834,13 +4937,15 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
                 fprintf(stderr,"[CPU l0] ffn_norm_in_tok0[:4]={%.6f,%.6f,%.6f,%.6f} rms8=%.6f\n",s0[0],s0[1],s0[2],s0[3],sqrt(sr/8));
             }
 
-            for (bi = 0; bi < n_tokens; bi++) {
-                silu(hb_batch + bi * c->n_ffn, c->n_ffn);
-                elemwise_mul(hb_batch + bi * c->n_ffn, hb_batch + bi * c->n_ffn,
-                             hb2_batch + bi * c->n_ffn, c->n_ffn);
-            }
+            /* Fused swiGLU over the whole batch in one pass. hb/hb2 are each
+             * n_tokens*n_ffn contiguous, so a single call covers every token;
+             * the old per-token silu()+elemwise_mul() pair walked the same
+             * data 5 times instead of 3. */
+            if (!_SSM_SKIP(11))
+            silu_mul(hb_batch, hb_batch, hb2_batch, n_tokens * c->n_ffn);
 
             tensor_set_repacked(m->repack_used[ri+8] ? m->repack_buffers[ri+8] : NULL);
+            if (!_SSM_SKIP(11))
             matmul_batch(xb2_batch, hb_batch, n_tokens, lw->ffn_down, c->n_ffn, dim, lw->type_ffn_down);
             tensor_set_repacked(NULL);
         }
@@ -4855,6 +4960,7 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
                 xb20[0],xb20[1],xb20[2],xb20[3],xb20[4],xb20[5],xb20[6],xb20[7],sqrt(f0/8));
         }
 
+        _SSM_STEP_TMR(11);
         for (bi = 0; bi < n_tokens; bi++) {
             float *a = x_batch + bi * dim, *b = xb2_batch + bi * dim;
             for (int d = 0; d < dim; d++) a[d] += b[d];
@@ -4873,7 +4979,8 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
         { float *ssm_out_buf = (float *)ssm_scratch_get(SSM_SCR_SMOUT,
                                 (size_t)n_tokens * dim * sizeof(float));
           if (!ssm_out_buf) { fprintf(stderr, "OOM: ssm_out scratch\n"); exit(1); }
-          matmul_batch(ssm_out_buf, xb2_batch, n_tokens, lw->ssm_out, value_dim, dim, lw->type_ssm_out);
+          if (!_SSM_SKIP(9))
+        matmul_batch(ssm_out_buf, xb2_batch, n_tokens, lw->ssm_out, value_dim, dim, lw->type_ssm_out);
           double orm = 0; for(int i=0;i<dim;i++) orm+=ssm_out_buf[lt*dim+i]*ssm_out_buf[lt*dim+i];
           fprintf(stderr, "SSM_VERIFY l=0 cpu ssm_out_rms=%.6e\n", sqrt(orm/dim));
           fprintf(stderr, "SSM_VERIFY l=0 cpu ssm_out_last[:4]={%.6f,%.6f,%.6f,%.6f}\n",
@@ -4885,7 +4992,7 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
         int lt = n_tokens - 1;
         fprintf(stderr, "[CPU PFX l=%d] bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n", l, x_batch[lt*dim], x_batch[lt*dim+1], x_batch[lt*dim+2], x_batch[lt*dim+3]);
     }
-    _SSM_STEP_TMR(11); /* step 11 (FFN) done */
+    _SSM_STEP_TMR(12); /* trailing residual add (was untimed) */
     /* ssm_buf / vd_buf are pool-owned and intentionally not freed here:
      * keeping them mapped across layers is what avoids the per-layer
      * mmap/munmap refault storm. See g_ssm_scratch at the top of this file. */
