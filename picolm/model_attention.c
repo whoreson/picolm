@@ -623,7 +623,7 @@ static void prefill_attn_task_grouped(int flat_idx, void *ctx_ptr) {
                           _mm256_storeu_ps(accg + d, _mm256_fmadd_ps(af, cv, vf));
                       }
                       for (; d < head_dim; d++) accg[d] = fmaf(accg[d], correction, fp16_to_fp32(vt16[d])); }
-#elif defined(PICOLM_AVX) && defined(__F16C__)
+#elif defined(PICOLM_AVX) && defined(__F16C__) && defined(PICOLM_FMA)
                     { __m128 cv = _mm_set1_ps(correction); int d = 0;
                       for (; d + 7 < head_dim; d += 8) {
                           __m128 vf = _mm_cvtph_ps(_mm_loadu_si128((const __m128i *)(vt16 + d)));
@@ -673,7 +673,7 @@ static void prefill_attn_task_grouped(int flat_idx, void *ctx_ptr) {
                           _mm256_storeu_ps(accg + d, _mm256_fmadd_ps(vf, wv, af));
                       }
                       for (; d < head_dim; d++) accg[d] = fmaf(w, fp16_to_fp32(vt16[d]), accg[d]); }
-#elif defined(PICOLM_AVX) && defined(__F16C__)
+#elif defined(PICOLM_AVX) && defined(__F16C__) && defined(PICOLM_FMA)
                     { __m128 wv = _mm_set1_ps(w); int d = 0;
                       for (; d + 7 < head_dim; d += 8) {
                           __m128 vf = _mm_cvtph_ps(_mm_loadu_si128((const __m128i *)(vt16 + d)));
@@ -1599,6 +1599,10 @@ typedef struct {
     float attn_scale;       /* attention score scale factor */
     int n_swa;               /* 0 = full attention; >0 = sliding window size */
     float skip_T;           /* >0: skip exp+PV for 16-row blocks whose tile max is > skip_T (log2) below M */
+    int pv_i16;             /* 1: int16 P x int16 V (vpdpwssd) PV kernel */
+    int v16_ready;          /* 1: v16/vscale already point at a prebuilt shadow tile */
+    int16_t *v16;           /* [hd/16][ts/2][16 lanes x 2] int16 V tile (pv_i16) */
+    float *vscale;          /* [hd] V dequant scale per channel (pv_i16) */
     void (*v_prep)(void *); /* deferred V-tile extraction; called once iff the tile is not fully skipped */
     void *v_prep_arg;
 } attn_tile_task_t;
@@ -1689,6 +1693,169 @@ static void attn_pv_sm_avx512(float *accp, const float *scores, const float *v_t
     else if (ts == ATTN_TILE && hd == 64)   attn_pv_sm_body(accp, scores, v_tile, n_q, ATTN_TILE, 64);
     else                                    attn_pv_sm_body(accp, scores, v_tile, n_q, ts, hd);
 }
+
+/* ---- int16 PV (opt-in, PICOLM_ATTN_PV=i16) ---------------------------------
+ * P (softmax numerators, scaled per row so the row's tile max maps to
+ * ATTN_I16_PMAX) and V (per-channel scale, +-ATTN_I16_VMAX) are int16.
+ * vpdpwssd does 2 MACs/lane/uop, i.e. half the uops of the fp32 FMA kernel for
+ * the same work. Bounds: 64 j * 8191 * 2047 = 1.07e9 < 2^31, so the int32
+ * accumulators cannot overflow for ts <= 128. */
+#define ATTN_I16_PMAX 8191
+#define ATTN_I16_VMAX 2047
+
+/* slice-major F32 V tile [hd/16][ts][16] -> int16 pair layout [hd/16][ts/2][16][2] + scales. */
+static void attn_v_to_i16(const float *vsm, int16_t *v16, float *vscale, int ts, int hd) {
+    for (int db = 0; db < hd / 16; db++) {
+        const float *vb = vsm + (size_t)db * ts * 16;
+        __m512 m = _mm512_setzero_ps();
+        const __m512 absmask = _mm512_castsi512_ps(_mm512_set1_epi32(0x7fffffff));
+        for (int j = 0; j < ts; j++) m = _mm512_max_ps(m, _mm512_and_ps(_mm512_loadu_ps(vb + (size_t)j * 16), absmask));
+        /* scale = max/VMAX (1 for an all-zero channel); inv = VMAX/max */
+        __mmask16 z = _mm512_cmp_ps_mask(m, _mm512_setzero_ps(), _CMP_EQ_OQ);
+        __m512 sc  = _mm512_mul_ps(m, _mm512_set1_ps(1.0f / ATTN_I16_VMAX));
+        sc = _mm512_mask_mov_ps(sc, z, _mm512_set1_ps(1.0f));
+        __m512 inv = _mm512_div_ps(_mm512_set1_ps(1.0f), sc);
+        _mm512_storeu_ps(vscale + db * 16, sc);
+        for (int j = 0; j < ts; j += 2) {
+            __m512i q0 = _mm512_cvtps_epi32(_mm512_mul_ps(_mm512_loadu_ps(vb + (size_t)j * 16), inv));
+            __m512i q1 = _mm512_cvtps_epi32(_mm512_mul_ps(_mm512_loadu_ps(vb + (size_t)(j + 1) * 16), inv));
+            __m512i w = _mm512_or_si512(_mm512_and_si512(q0, _mm512_set1_epi32(0xFFFF)),
+                                        _mm512_slli_epi32(q1, 16));
+            _mm512_storeu_si512((void *)(v16 + ((size_t)db * (ts / 2) + j / 2) * 32), w);
+        }
+    }
+}
+
+/* acc[r][d] += rowc[r] * vscale[d] * sum_j pq[r][j] * v16[j][d]   (rows [0,n_q)) */
+static ATTN_ALWAYS_INLINE void attn_pv_i16_body(float *accp, const int16_t *pq, const float *rowc,
+                               const int16_t *v16, const float *vscale,
+                               int n_q, const int ts, int hd) {
+    const int n_blk = hd / 16, hp = ts / 2;
+    int r0 = 0;
+    for (; r0 + 16 <= n_q; r0 += 16) {
+        const int16_t *pb = pq + (size_t)r0 * ts;
+        for (int db = 0; db < n_blk; db++) {
+            const int16_t *vb = v16 + (size_t)db * hp * 32;
+            __m512i a[16];
+            ATTN_UNROLL16
+            for (int r = 0; r < 16; r++) a[r] = _mm512_setzero_si512();
+            for (int jp = 0; jp < hp; jp++) {
+                __m512i vv = _mm512_loadu_si512((const void *)(vb + (size_t)jp * 32));
+                ATTN_UNROLL16
+                for (int r = 0; r < 16; r++) {
+                    /* GCC will not fold the broadcast into the VNNI op and, with 16
+                     * accumulators live, spills/copies them every iteration (seen in
+                     * the disassembly). Inline asm pins the 1-uop memory-broadcast
+                     * form: vpdpwssd mem{1to16}, v, acc. */
+                    __asm__("vpdpwssd %2%{1to16%}, %1, %0"
+                            : "+v"(a[r])
+                            : "v"(vv), "m"(*(const int32_t *)(const void *)(pb + (size_t)r * ts + 2 * jp)));
+                }
+            }
+            const __m512 vs = _mm512_loadu_ps(vscale + db * 16);
+            ATTN_UNROLL16
+            for (int r = 0; r < 16; r++) {
+                float *ap = accp + (size_t)(r0 + r) * hd + db * 16;
+                __m512 sc = _mm512_mul_ps(vs, _mm512_set1_ps(rowc[r0 + r]));
+                _mm512_storeu_ps(ap, _mm512_fmadd_ps(_mm512_cvtepi32_ps(a[r]), sc, _mm512_loadu_ps(ap)));
+            }
+        }
+    }
+    if (r0 < n_q) {                         /* < 16 rows left */
+        const int rn = n_q - r0;
+        const int16_t *pb = pq + (size_t)r0 * ts;
+        for (int db = 0; db < n_blk; db++) {
+            const int16_t *vb = v16 + (size_t)db * hp * 32;
+            __m512i a[16];
+            for (int r = 0; r < rn; r++) a[r] = _mm512_setzero_si512();
+            for (int jp = 0; jp < hp; jp++) {
+                __m512i vv = _mm512_loadu_si512((const void *)(vb + (size_t)jp * 32));
+                for (int r = 0; r < rn; r++) {
+                    int32_t pp; memcpy(&pp, pb + (size_t)r * ts + 2 * jp, 4);
+                    a[r] = _mm512_dpwssd_epi32(a[r], vv, _mm512_set1_epi32(pp));
+                }
+            }
+            const __m512 vs = _mm512_loadu_ps(vscale + db * 16);
+            for (int r = 0; r < rn; r++) {
+                float *ap = accp + (size_t)(r0 + r) * hd + db * 16;
+                __m512 sc = _mm512_mul_ps(vs, _mm512_set1_ps(rowc[r0 + r]));
+                _mm512_storeu_ps(ap, _mm512_fmadd_ps(_mm512_cvtepi32_ps(a[r]), sc, _mm512_loadu_ps(ap)));
+            }
+        }
+    }
+}
+
+static void attn_pv_i16_avx512(float *accp, const int16_t *pq, const float *rowc,
+                               const int16_t *v16, const float *vscale,
+                               int n_q, int ts, int hd) {
+    if (ts == ATTN_TILE) attn_pv_i16_body(accp, pq, rowc, v16, vscale, n_q, ATTN_TILE, hd);
+    else                 attn_pv_i16_body(accp, pq, rowc, v16, vscale, n_q, ts, hd);
+}
+
+/* ---- int16 V shadow (PICOLM_ATTN_PV=i16, F16 V cache) -----------------------
+ * Built once per layer call, parallel over kv_head x tile chunks (like the K
+ * shadow). Each full tile holds [hd/16][ts/2][16x2] int16 + hd float scales, so
+ * a tile visit does no V extraction or int16 conversion at all. Every token
+ * group re-reads the same V tile (41 groups at 2.6k tokens), which is why
+ * doing it once pays. */
+#define ATTN_V16_CHUNK 16
+typedef struct {
+    const uint8_t *vcache; size_t row_stride, head_stride;
+    int head_dim, n_full_tiles, chunks_per_head;
+    uint8_t *dst; size_t tile_bytes;
+} attn_v16_build_ctx_t;
+
+static void attn_v16_build_task(int idx, void *p) {
+    const attn_v16_build_ctx_t *c = (const attn_v16_build_ctx_t *)p;
+    const int hd = c->head_dim;
+    const int h = idx / c->chunks_per_head, ch = idx % c->chunks_per_head;
+    int t0 = ch * ATTN_V16_CHUNK, t1 = t0 + ATTN_V16_CHUNK;
+    if (t1 > c->n_full_tiles) t1 = c->n_full_tiles;
+    float *sm = (float *)malloc((size_t)ATTN_TILE * hd * sizeof(float));
+    float rowbuf[512];
+    if (!sm) return;                      /* shadow stays unbuilt -> caller never sees this (see ok flag) */
+    for (int tl = t0; tl < t1; tl++) {
+        for (int r = 0; r < ATTN_TILE; r++) {
+            const uint8_t *src = c->vcache + (size_t)(tl * ATTN_TILE + r) * c->row_stride
+                               + (size_t)h * c->head_stride;
+            dequantize_row(src, rowbuf, hd, GGUF_TYPE_F16);
+            for (int db = 0; db < hd / 16; db++)
+                memcpy(sm + ((size_t)db * ATTN_TILE + r) * 16, rowbuf + (size_t)db * 16, 16 * sizeof(float));
+        }
+        uint8_t *tile = c->dst + ((size_t)h * c->n_full_tiles + tl) * c->tile_bytes;
+        attn_v_to_i16(sm, (int16_t *)tile, (float *)(tile + (size_t)ATTN_TILE * hd * sizeof(int16_t)),
+                      ATTN_TILE, hd);
+    }
+    free(sm);
+}
+
+static uint8_t *g_v16_shadow = NULL;
+static size_t   g_v16_shadow_cap = 0;
+
+static const uint8_t *attn_v16_shadow_build(const uint8_t *vcache, int total_pos, int n_kv_heads,
+                                            int head_dim, size_t row_stride, size_t head_stride,
+                                            int *n_full_out, size_t *tile_bytes_out) {
+    if (head_dim % 16 != 0 || head_dim > 512) return NULL;
+    const int n_full = total_pos / ATTN_TILE;
+    if (n_full < 1) return NULL;
+    size_t tile_bytes = (size_t)ATTN_TILE * head_dim * sizeof(int16_t) + (size_t)head_dim * sizeof(float);
+    tile_bytes = (tile_bytes + 63) & ~(size_t)63;
+    const size_t need = (size_t)n_kv_heads * n_full * tile_bytes;
+    if (need > g_v16_shadow_cap) {
+        free(g_v16_shadow);
+        g_v16_shadow = (uint8_t *)malloc((need + 63) & ~(size_t)63);
+        g_v16_shadow_cap = g_v16_shadow ? need : 0;
+        if (!g_v16_shadow) return NULL;
+    }
+    attn_v16_build_ctx_t bc;
+    bc.vcache = vcache; bc.row_stride = row_stride; bc.head_stride = head_stride;
+    bc.head_dim = head_dim; bc.n_full_tiles = n_full;
+    bc.chunks_per_head = (n_full + ATTN_V16_CHUNK - 1) / ATTN_V16_CHUNK;
+    bc.dst = g_v16_shadow; bc.tile_bytes = tile_bytes;
+    tensor_parallel_for(n_kv_heads * bc.chunks_per_head, attn_v16_build_task, &bc);
+    *n_full_out = n_full; *tile_bytes_out = tile_bytes;
+    return g_v16_shadow;
+}
 #endif
 
 /* Context for the parallel tiled attention: one instance shared by all
@@ -1716,6 +1883,10 @@ typedef struct {
     int n_full_tiles;
     int q_rot;              /* 1 = TQ3-sign WHT-rotate query rows (TQ K caches) */
     float skip_T;           /* PICOLM_ATTN_SKIP_T: tile/row-block skip threshold (log2), default 8 */
+    int pv_i16;             /* PICOLM_ATTN_PV=i16: int16 P x int16 V (vpdpwssd) PV kernel */
+    const uint8_t *v16_shadow; /* prebuilt int16 V tiles (F16 V cache, full tiles), or NULL */
+    size_t v16_tile_bytes;
+    int n_full_tiles_v;
     int skip_order;         /* visit sink + recent tiles first (only when skip_T > 0) */
     /* Scratch pool: pre-allocated, sliced per concurrent task */
     uint8_t *scratch_pool;
@@ -2017,8 +2188,22 @@ static void batch_tiled_task(int task_idx, void *ctx_ptr) {
         task.attn_scale = bc->attn_scale;
         task.n_swa = bc->n_swa;
         task.skip_T = bc->skip_T;
+        task.pv_i16 = bc->pv_i16 && v_sm && (this_tile_size & 1) == 0;
+        task.v16 = (int16_t *)((uint8_t *)tile_v_f32 + (size_t)tile * head_dim * sizeof(float));
+        task.vscale = (float *)(task.v16 + (size_t)tile * head_dim);
         task.v_prep = attn_v_prep_run;
         task.v_prep_arg = &vprep;
+        task.v16_ready = 0;
+#if defined(PICOLM_AVX512) && defined(__AVX512VNNI__)
+        if (bc->v16_shadow && task.pv_i16 && this_tile_size == tile) {
+            /* Prebuilt int16 V tile: no extraction, no conversion for this visit. */
+            const uint8_t *vb = bc->v16_shadow + ((size_t)kv_h * bc->n_full_tiles_v + tk) * bc->v16_tile_bytes;
+            task.v16 = (int16_t *)(uintptr_t)vb;
+            task.vscale = (float *)(uintptr_t)(vb + (size_t)tile * head_dim * sizeof(int16_t));
+            task.v16_ready = 1;
+            task.v_prep = NULL;
+        }
+#endif
 
         attn_process_tile(&task, k_tmp_f32);
     }
@@ -2192,13 +2377,15 @@ void batch_attention_layer(
         static int _dbg_once = 0;
         if (!_dbg_once) {
             _dbg_once = 1;
+            const char *pv_label = getenv("PICOLM_ATTN_PV");
             fprintf(stderr, "[BATCH-ATTN] n_tokens=%d start_pos=%d n_heads=%d n_kv_heads=%d "
                     "head_dim=%d xb_stride=%d kv_type=%d/%d kv_row=%zu/%zu kv_hstride=%zu/%zu "
-                    "scale=%g n_swa=%d tiled=%d qk=%s\n",
+                    "scale=%g n_swa=%d tiled=%d qk=%s pv=%s\n",
                     n_tokens, start_pos, n_heads, n_kv_heads, head_dim, xb_stride,
                     kv_type_k, kv_type_v, kv_row_size_k, kv_row_size_v,
                     kv_head_stride_k, kv_head_stride_v, attn_scale, n_swa, _use_tiled,
-                    attn_qk_label(_use_tiled, kv_type_k, head_dim));
+                    attn_qk_label(_use_tiled, kv_type_k, head_dim),
+                    pv_label && !strcmp(pv_label, "i16") ? "i16" : "f32");
         }
     }
     if (_use_tiled) {
@@ -2245,7 +2432,37 @@ void batch_attention_layer(
             fprintf(stderr, "[IN %d] qsum=%.4f ksum=%.4f vsum=%.4f\n", _dbg_call, qsum_in, ksum_in, vsum_in);
             {
                 const char *df = getenv("PICOLM_ATTN_DUMP_IN");
-                if (df && _dbg_call == 2) {
+                const char *dc = getenv("PICOLM_ATTN_DUMP_CALL");   /* which call (= layer, 1-based) to dump; default 2 */
+                const char *kvh_s = getenv("PICOLM_ATTN_DUMP_KVH");
+                if (df && kvh_s && _dbg_call == (dc ? atoi(dc) : 2)) {
+                    /* Subset dump for long contexts (a full 80k-pos dump is ~540 MB): ONE kv head
+                     * (its kv_mul q heads), a window of NTOK query tokens ending at TOK0+NTOK, and
+                     * K/V for positions [0, start_pos+TOK0+NTOK) of that head only. Replay with the
+                     * printed test_attn_diff command (n_kv=1, so the dump layout is self-consistent). */
+                    const int kvh = atoi(kvh_s);
+                    const char *nt_s = getenv("PICOLM_ATTN_DUMP_NTOK"), *t0_s = getenv("PICOLM_ATTN_DUMP_TOK0");
+                    int nt = nt_s ? atoi(nt_s) : 128; if (nt > n_tokens) nt = n_tokens; if (nt < 1) nt = 1;
+                    int t0 = t0_s ? atoi(t0_s) : n_tokens - nt; if (t0 < 0) t0 = 0; if (t0 + nt > n_tokens) t0 = n_tokens - nt;
+                    const int kvm = n_heads / n_kv_heads;
+                    FILE *f = fopen(df, "wb");
+                    if (f && kvh >= 0 && kvh < n_kv_heads) {
+                        for (int t = 0; t < nt; t++)
+                            fwrite(q_batch + ((size_t)(t0 + t) * n_heads + (size_t)kvh * kvm) * head_dim,
+                                   sizeof(float), (size_t)kvm * head_dim, f);
+                        const int tot = start_pos + t0 + nt;
+                        for (int c = 0; c < 2; c++) {
+                            const uint8_t *base = c ? vcache : kcache;
+                            const size_t rs = c ? kv_row_size_v : kv_row_size_k, hs = c ? kv_head_stride_v : kv_head_stride_k;
+                            const size_t hb = (c ? kv_head_stride_v : kv_head_stride_k);
+                            for (int pp = 0; pp < tot; pp++) fwrite(base + (size_t)pp * rs + (size_t)kvh * hs, 1, hb, f);
+                        }
+                        fclose(f);
+                        fprintf(stderr, "[DUMP-SUB] kvh=%d window=[%d,%d) pos=%d. Replay:\n"
+                                "  ./test_attn_diff %d 1 %d %d %d 0 1 <threads> %s\n",
+                                kvh, t0, t0 + nt, tot, kvm, head_dim, nt, start_pos + t0, df);
+                    }
+                } else
+                if (df && _dbg_call == (dc ? atoi(dc) : 2)) {
                     FILE *f = fopen(df, "wb");
                     if (f) {
                         size_t w1 = fwrite(q_batch, sizeof(float), (size_t)n_tokens * n_heads * head_dim, f);
@@ -2548,7 +2765,7 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
      * This eliminates the redundant scalar scan that the old skip decision
      * performed. The softmax merge below needs the same value.
      * n_q can be up to ATTN_TILE * kv_mul (e.g. 64*6=384 for Qwen3.6). */
-    float row_max[384];  /* max n_q = ATTN_TILE * max_kv_mul */
+    float row_max[512];  /* max n_q = ATTN_TILE * 8 (kv_mul <= 8, see attention_group) */
 #if defined(PICOLM_AVX512)
     {
         for (int i = 0; i < n_q; i++) {
@@ -2624,6 +2841,14 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
     }
     const int skip_on = (t->skip_T > 0.0f && n_blk_rows <= ATTN_SKIP_MAXBLK);
     if (t->v_prep) { t->v_prep(t->v_prep_arg); t->v_prep = NULL; }
+#if defined(PICOLM_AVX512) && defined(__AVX512VNNI__)
+    const int use_i16 = t->pv_i16 && t->v_sm && n_q <= ATTN_SKIP_MAXBLK * 16;
+    float rowc_buf[ATTN_SKIP_MAXBLK * 16];   /* per-row P dequant factor (int16 PV) */
+    if (use_i16 && !t->v16_ready) attn_v_to_i16(t->tile_v_f32, t->v16, t->vscale, ts, hd);
+#else
+    const int use_i16 = 0;
+    (void)use_i16;
+#endif
 
     /* Process each query row independently: use precomputed row_max, exp, sum, acc */
     for (int i = 0; i < n_q; i++) {
@@ -2801,6 +3026,38 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
             rsum += tile_exp_buf[j];
         }
 #endif
+        #if defined(PICOLM_AVX512) && defined(__AVX512VNNI__)
+        if (use_i16) {
+            /* Quantize this row's numerators to int16 in place (int16 row i lives
+             * inside float row i/2's storage, which is already consumed), with the
+             * row max mapped to ATTN_I16_PMAX. S uses the SAME quantized weights so
+             * the normalisation matches what PV actually multiplies. */
+            __m512 vmx = _mm512_setzero_ps();
+            int j = 0;
+            for (; j + 15 < ts; j += 16) vmx = _mm512_max_ps(vmx, _mm512_loadu_ps(tile_exp_buf + j));
+            float pmax = _mm512_reduce_max_ps(vmx);
+            for (int jj = j; jj < ts; jj++) pmax = tile_exp_buf[jj] > pmax ? tile_exp_buf[jj] : pmax;
+            int16_t *qrow = ((int16_t *)t->scores) + (size_t)i * ts;
+            if (pmax > 0.0f) {
+                const float inv = (float)ATTN_I16_PMAX / pmax;
+                const __m512 vinv = _mm512_set1_ps(inv);
+                __m512i vsum = _mm512_setzero_si512();
+                for (j = 0; j + 15 < ts; j += 16) {
+                    __m512i q = _mm512_cvtps_epi32(_mm512_mul_ps(_mm512_loadu_ps(tile_exp_buf + j), vinv));
+                    _mm256_storeu_si256((__m256i *)(qrow + j), _mm512_cvtepi32_epi16(q));
+                    vsum = _mm512_add_epi32(vsum, q);
+                }
+                int isum = _mm512_reduce_add_epi32(vsum);
+                for (; j < ts; j++) { int q = (int)lrintf(tile_exp_buf[j] * inv); qrow[j] = (int16_t)q; isum += q; }
+                rowc_buf[i] = pmax / (float)ATTN_I16_PMAX;
+                t->S[i] += rowc_buf[i] * (float)isum;
+            } else {
+                for (j = 0; j < ts; j++) qrow[j] = 0;
+                rowc_buf[i] = 0.0f;
+            }
+            continue;
+        }
+#endif
         t->S[i] += rsum;
 
         /* Keep every row's exponentiated scores live at once, in place in
@@ -2847,6 +3104,12 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
         const float *v_tile = t->tile_v_f32;
 #if defined(PICOLM_AVX512)
         if (t->v_sm) {
+#if defined(PICOLM_AVX512) && defined(__AVX512VNNI__)
+            if (use_i16)
+                attn_pv_i16_avx512(t->acc, (const int16_t *)pv_sc0 + (size_t)pv_rr * ts,
+                                   rowc_buf + pv_rr, t->v16, t->vscale, n_q, ts, hd);
+            else
+#endif
             attn_pv_sm_avx512(t->acc, t->scores, v_tile, n_q, ts, hd);
         } else
         {
@@ -3189,6 +3452,14 @@ static void batch_attention_tiled(
         const char *o = getenv("PICOLM_ATTN_SKIP_ORDER");
         bctx.skip_order = (o && atoi(o) == 0) ? 0 : 1;
     }
+    {   /* int16 PV (opt-in, PICOLM_ATTN_PV=i16, needs AVX-512 VNNI) */
+        const char *pvm = getenv("PICOLM_ATTN_PV");
+#if defined(PICOLM_AVX512) && defined(__AVX512VNNI__)
+        bctx.pv_i16 = (pvm && !strcmp(pvm, "i16")) ? 1 : 0;
+#else
+        (void)pvm;
+#endif
+    }
     bctx.gguf_k = gguf_k;
     bctx.gguf_v = gguf_v;
     bctx.k_rb_gguf = k_rb_gguf;
@@ -3208,6 +3479,19 @@ static void batch_attention_tiled(
             if (!_once) { _once = 1; fprintf(stderr, "[BATCH-ATTN] int8 K shadow + VNNI QK enabled (default)\n"); }
         }
     }
+
+#if defined(PICOLM_AVX512) && defined(__AVX512VNNI__)
+    /* int16 V shadow (F16 V cache, full tiles). PICOLM_ATTN_V16SH=0 disables (A/B). */
+    if (bctx.pv_i16 && kv_type_v == KV_CACHE_F16 && tile == ATTN_TILE && head_dim % 16 == 0) {
+        const char *e = getenv("PICOLM_ATTN_V16SH");
+        if (!(e && atoi(e) == 0)) {
+            int n_full = 0; size_t tb = 0;
+            const uint8_t *sh = attn_v16_shadow_build(vcache, start_pos + n_tokens, n_kv_heads, head_dim,
+                                                      kv_row_size_v, kv_head_stride_v, &n_full, &tb);
+            if (sh) { bctx.v16_shadow = sh; bctx.v16_tile_bytes = tb; bctx.n_full_tiles_v = n_full; }
+        }
+    }
+#endif
 
     /* Pre-allocate scratch for all tasks. Each task needs:
      *   scores: kv_mul*tile * tile floats
@@ -3238,7 +3522,9 @@ static void batch_attention_tiled(
     size_t acc_per    = (size_t)kv_mul * tile * head_dim * sizeof(float);
     size_t qr_per     = (size_t)kv_mul * tile * head_dim * sizeof(float);
     size_t tk_per     = (size_t)tile * k_rb_gguf;
-    size_t tv_per     = (size_t)tile * head_dim * sizeof(float);
+    size_t tv_per     = (size_t)tile * head_dim * sizeof(float)
+                      + (size_t)tile * head_dim * sizeof(int16_t)
+                      + (size_t)head_dim * sizeof(float) + 64;
     /* Extra scratch for the non-F16 QK paths. Kept at 1 byte when unused so
      * the slot layout always has the same number of regions. */
     size_t q8_per = 1, q8_half = 0, k8_per = 1, k8_half = 0, f32t_per = 1;

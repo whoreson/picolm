@@ -135,6 +135,22 @@ static void fill_cache(test_ctx_t *tc) {
             else                        beta = 0.05f * frand();
             for (int i = 0; i < n_kv * hd; i++) kf[i] += beta * u[i];
         }
+        if (structd) {
+            float beta;
+            float r = frand() + 0.5f;                  /* uniform [0,1) */
+            if (p == 0)                 beta = 3.0f;   /* attention sink */
+            else if (r * 1000.0f < needle) beta = 1.0f + 2.0f * (frand() + 0.5f); /* needle */
+            else                        beta = 0.05f * frand();
+            for (int i = 0; i < n_kv * hd; i++) kf[i] += beta * u[i];
+        }
+        if (structd) {
+            float beta;
+            float r = frand() + 0.5f;                  /* uniform [0,1) */
+            if (p == 0)                 beta = 3.0f;   /* attention sink */
+            else if (r * 1000.0f < needle) beta = 1.0f + 2.0f * (frand() + 0.5f); /* needle */
+            else                        beta = 0.05f * frand();
+            for (int i = 0; i < n_kv * hd; i++) kf[i] += beta * u[i];
+        }
         /* Quantize head by head: the head slice is block aligned in every
          * supported type, exactly like the real KV store loop. */
         for (int h = 0; h < n_kv; h++) {
@@ -195,11 +211,17 @@ static void run_path(test_ctx_t *tc, float *out, int use_tiled) {
     int had_skip = oskip != NULL;
     int had_qk = oqk != NULL;
     setenv("PICOLM_TEST_FORCE_TILED", use_tiled ? "1" : "0", 1);
-    /* Both runs: exact F32, no skip. The harness compares grouped vs tiled
-     * at the same precision level. Users can override with PICOLM_ATTN_SKIP_T
-     * and PICOLM_ATTN_QK but those affect both paths equally. */
-    setenv("PICOLM_ATTN_SKIP_T", "0", 1);
-    setenv("PICOLM_ATTN_QK", "f32", 1);
+    /* Both runs use the same precision settings. When PICOLM_TEST_EXACT=0,
+     * user env vars (PICOLM_ATTN_SKIP_T, PICOLM_ATTN_QK, PICOLM_ATTN_PV)
+     * are passed through so both grouped and tiled see identical settings.
+     * When PICOLM_TEST_EXACT=1 (default), both runs use exact F32/no-skip. */
+    const char *exact = getenv("PICOLM_TEST_EXACT");
+    int do_exact = exact ? atoi(exact) != 0 : 1;
+    if (do_exact) {
+        setenv("PICOLM_ATTN_SKIP_T", "0", 1);
+        setenv("PICOLM_ATTN_QK", "f32", 1);
+        setenv("PICOLM_ATTN_PV", "f32", 1);   /* an exported PV=i16 used to leak into the "exact" run */
+    }
     batch_attention_layer(out, tc->q_batch, tc->kcache, tc->vcache,
                           tc->n_tokens, tc->start_pos,
                           tc->n_heads, tc->n_kv_heads, tc->head_dim,
