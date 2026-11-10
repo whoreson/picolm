@@ -4806,6 +4806,69 @@ void gelu(float *x, int size) {
      * and CPU produce consistent intermediate values. */
     picolm_gelu_f32(x, size);
 }
+/* Fused swiGLU: out = silu(gate) * up, one pass over the data.
+ *
+ * The unfused sequence in the FFN does:
+ *     silu(gate, n);                  read gate,  write gate
+ *     elemwise_mul(out, gate, up, n); read gate, read up, write out
+ * i.e. 5 array touches for 1 element of useful work. Fusing does
+ *     read gate, read up, write out  = 3 touches.
+ * At the Qwen3.6-27B prefill shape (512 x 17408) that removes ~70 MB of
+ * per-layer traffic, 48 times per ubatch.
+ *
+ * Uses the same picolm_exp256_ps() vector exp as silu(), so the arithmetic
+ * per element is bit-identical to the unfused path. */
+void silu_mul(float *out, const float *gate, const float *up, int size) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("PICOLM_SILU_F32");
+        mode = (e && e[0] == '0') ? 0 : 1;
+    }
+#if defined(PICOLM_HAVE_EXP256)
+    if (mode) {
+        int i = 0;
+        const __m256 one = _mm256_set1_ps(1.0f);
+        for (; i + 7 < size; i += 8) {
+            __m256 g = _mm256_loadu_ps(gate + i);
+            __m256 u = _mm256_loadu_ps(up + i);
+            __m256 e = picolm_exp256_ps(_mm256_sub_ps(_mm256_setzero_ps(), g));
+            __m256 act = _mm256_div_ps(g, _mm256_add_ps(one, e));
+            _mm256_storeu_ps(out + i, _mm256_mul_ps(act, u));
+        }
+        for (; i < size; i++) {
+            float g = gate[i];
+            out[i] = (g / (1.0f + expf(-g))) * up[i];
+        }
+        return;
+    }
+#endif
+#if defined(PICOLM_NEON)
+    /* NEON has no vector exp in this codebase (silu() is scalar on ARM too),
+     * but the gate*up multiply can still be vectorised, which is what the
+     * unfused elemwise_mul() path did. Keeps ARM from regressing. */
+    if (mode) {
+        int i = 0;
+        for (; i + 3 < size; i += 4) {
+            float act[4];
+            for (int k = 0; k < 4; k++) {
+                float g = gate[i + k];
+                act[k] = g / (1.0f + expf(-g));
+            }
+            vst1q_f32(out + i, vmulq_f32(vld1q_f32(act), vld1q_f32(up + i)));
+        }
+        for (; i < size; i++) {
+            float g = gate[i];
+            out[i] = (g / (1.0f + expf(-g))) * up[i];
+        }
+        return;
+    }
+#endif
+    for (int i = 0; i < size; i++) {
+        float g = gate[i];
+        out[i] = (g / (1.0f + expf(-g))) * up[i];
+    }
+}
+
 void elemwise_mul(float *out, const float *a, const float *b, int size) {
 #ifdef PICOLM_AVX512
     int i = 0;

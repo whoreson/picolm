@@ -4470,9 +4470,10 @@ typedef struct {
 
 static void silu_mul_task(int idx, void *ctxp) {
     silu_mul_ctx_t *ctx = (silu_mul_ctx_t *)ctxp;
-    silu(ctx->hb + (size_t)idx * ctx->n_ffn, ctx->n_ffn);
-    elemwise_mul(ctx->hb + (size_t)idx * ctx->n_ffn, ctx->hb + (size_t)idx * ctx->n_ffn,
-                 ctx->hb2 + (size_t)idx * ctx->n_ffn, ctx->n_ffn);
+    /* Fused: out = silu(gate) * up, one pass instead of silu + mul. */
+    silu_mul(ctx->hb + (size_t)idx * ctx->n_ffn,
+             ctx->hb + (size_t)idx * ctx->n_ffn,
+             ctx->hb2 + (size_t)idx * ctx->n_ffn, ctx->n_ffn);
 }
 
 typedef struct {

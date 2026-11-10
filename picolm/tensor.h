@@ -122,6 +122,17 @@ void rope(float *q, float *k, int head_dim, int n_heads, int n_kv_heads,
 void silu(float *x, int size);
 void gelu(float *x, int size);
 
+/* Fused swiGLU: out[i] = silu(gate[i]) * up[i] in a single pass.
+ *
+ * Equivalent to silu(gate, size) followed by
+ * elemwise_mul(out, gate, up, size), but touches each element once instead
+ * of three times. For the FFN gate/up pair that saves two full traversals
+ * of an [n_tokens][n_ffn] buffer per layer -- 512*17408 floats = 35 MB at
+ * the Qwen3.6-27B prefill shape, so ~70 MB of traffic per layer per ubatch.
+ * `out` may alias `gate` or `up`.
+ */
+void silu_mul(float *out, const float *gate, const float *up, int size);
+
 /* Element-wise multiply: out[i] = a[i] * b[i] */
 void elemwise_mul(float *out, const float *a, const float *b, int size);
 
