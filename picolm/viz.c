@@ -209,6 +209,7 @@ typedef struct {
     _Atomic int bucket_mode;     /* 0 = one cell per (layer,pos), 1 = bucket sub-rows */
     _Atomic int recal_request;   /* 'r' key: re-derive the scale on the next frame */
     int   cal_valid;
+    int   last_recal_head;       /* column at which the scale was last (re)derived */
     /* Bucket view has its own scale: bucket RMS values span far more than whole-vector RMS. */
     int   bcal_valid, bcal_sr;
     float bglo, bghi;                              /* global mode: log10 range over all sub-rows */
@@ -776,6 +777,7 @@ static void __attribute__((unused)) viz_draw_rect(unsigned char *fb, int fb_w, i
 
 /* Layout constants shared with viz_y_to_slot() (mouse -> layer mapping). */
 #define VIZ_TOP_BAR_H 20
+#define VIZ_CAL_MIN_COLS 16     /* full columns required before the scale is frozen */
 
 static int viz_cmp_float(const void *a, const void *b) {
     float x = *(const float *)a, y = *(const float *)b;
@@ -943,12 +945,27 @@ static void viz_render_heatmap(void) {
                 }
     }
 
+    /* A frozen scale can go stale (calibrated from a short request, or the
+     * activations drifted).  If most of the newest columns fall outside it,
+     * re-derive it from the current window - at most once per 32 columns. */
+    if (!viz.fixed_scale && viz.cal_valid && ncols >= 8 && head - viz.last_recal_head >= 32) {
+        int sat = 0, tot = 0;
+        for (int c = ncols - 8; c < ncols; c++)
+            for (int l = 0; l < n_layers; l++) {
+                float v = viz_rms_snap[c][l];
+                if (v < 0.0f) continue;
+                float nn = viz_norm(l, v);
+                tot++; if (nn < 0.0f || nn > 1.0f) sat++;
+            }
+        if (tot > 0 && sat * 100 / tot > 35) { viz.cal_valid = 0; viz.bcal_valid = 0; viz.last_recal_head = head; }
+    }
+
     /* Scale: fixed by env, or calibrated once and frozen. */
     if (atomic_exchange_explicit(&viz.recal_request, 0, memory_order_relaxed) && !viz.fixed_scale)
-        { viz.cal_valid = 0; viz.bcal_valid = 0; }
+        { viz.cal_valid = 0; viz.bcal_valid = 0; viz.last_recal_head = head; }
     if (!viz.fixed_scale && !viz.cal_valid && ncols > 0) {
         viz_calibrate(ncols, n_layers, first);
-        if (full_cols > 0) viz.cal_valid = 1;   /* provisional until a full column exists */
+        if (full_cols >= VIZ_CAL_MIN_COLS) viz.cal_valid = 1;   /* provisional (re-fit every frame) until enough columns */
     }
 
     int bucket_on = atomic_load_explicit(&viz.bucket_mode, memory_order_relaxed);
@@ -958,7 +975,7 @@ static void viz_render_heatmap(void) {
     if (bucket_on && !viz.fixed_scale && ncols > 0 && (!viz.bcal_valid || viz.bcal_sr != sr)) {
         viz_calibrate_buckets(ncols, n_layers, first, sr);
         viz.bcal_sr = sr;
-        if (full_cols > 0) viz.bcal_valid = 1;    /* provisional until a full column exists */
+        if (full_cols >= VIZ_CAL_MIN_COLS) viz.bcal_valid = 1;   /* provisional until enough columns */
     }
 
     unsigned int txt = 0xFFFFFF, dim = 0xA0A0B0;
