@@ -829,7 +829,14 @@ static void glm5_mla_project_batch(
  * The MLA ctx accumulation is a weighted sum over cache positions; written as a
  * scalar loop it was half of the 4.6 s the MLA attention spent per 120-token
  * prefill. Kept local because nothing else in the tree needs exactly this
- * signature (tensor.c has vec_add / elemwise_mul, neither with a scale). */
+ * signature (tensor.c has vec_add / elemwise_mul, neither with a scale).
+ *
+ * SIMD tiers match the rest of the tree: AVX-512 (16-wide), AVX2 (8-wide), NEON
+ * (4-wide), then a scalar tail. Note the AVX2 tier uses _mm256_fmadd_ps, which
+ * needs FMA, so it is gated on PICOLM_AVX2 and not on PICOLM_AVX -- an AVX-only
+ * build has no FMA and the Makefile does not define PICOLM_FMA for it. AVX-only
+ * therefore falls through to the scalar loop, which is correct; GLM-5 is not a
+ * sensible target below AVX2 anyway. */
 static void vec_scale_acc_f32(float *dst, const float *src, float s, int n) {
     int i = 0;
 #if defined(PICOLM_AVX512)
@@ -840,7 +847,7 @@ static void vec_scale_acc_f32(float *dst, const float *src, float s, int n) {
                 _mm512_fmadd_ps(vs, _mm512_loadu_ps(src + i),
                                 _mm512_loadu_ps(dst + i)));
     }
-#elif defined(PICOLM_AVX2) || defined(PICOLM_AVX)
+#elif defined(PICOLM_AVX2)
     {
         const __m256 vs = _mm256_set1_ps(s);
         for (; i + 7 < n; i += 8)
