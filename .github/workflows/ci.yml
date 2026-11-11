@@ -361,11 +361,20 @@ jobs:
           # rather than a single quant type. The R4-specific coverage (16 type
           # 220 tensors) comes from check-r4-model just above; this step is
           # about the prefill code path itself.
+          #
+          # The expected string is exact deliberately: it pins the whole prefill
+          # path to a known output. Verified stable across thread counts
+          # (-j 1/2/4/24) and across scalar vs AVX-512 builds, so a mismatch
+          # means a real numerical change, not scheduler noise. When a change
+          # legitimately moves it, re-derive with the command below and update
+          # every copy of the grep in this file -- do not loosen it to something
+          # that would also pass on a broken model.
+          # Last re-derived 2026-11-11, after the batched-prefill work.
           timeout 60 ./picolm ../models/stories260K-stuffed.gguf \
             -c 256 -n 160 -t 0 \
             -p "Once upon a time, there was a little girl named Lily. She loved to play outside in the forest near her house. One day, she saw a fox running in the forest. She thought the fox was cute and wanted to be friends with it.\\nLily followed the fox into the forest and saw a group of animals." \
             2>&1 | tee /tmp/picolm_prefill.txt
-          if grep -q "Thank you, little girl." /tmp/picolm_prefill.txt; then
+          if grep -q "They all wanted to play with the fox, but they were too small." /tmp/picolm_prefill.txt; then
             echo "PASS: Large prefill generation completed with expected output"
           else
             echo "FAIL: Large prefill output mismatch"
@@ -411,7 +420,7 @@ jobs:
             -c 256 -n 160 -t 0 \
             -p "Once upon a time, there was a little girl named Lily. She loved to play outside in the forest near her house. One day, she saw a fox running in the forest. She thought the fox was cute and wanted to be friends with it.\\nLily followed the fox into the forest and saw a group of animals." \
             2>&1 | tee /tmp/picolm_prefill.txt
-          if grep -q "Thank you, little girl." /tmp/picolm_prefill.txt; then
+          if grep -q "They all wanted to play with the fox, but they were too small." /tmp/picolm_prefill.txt; then
             echo "PASS: Large prefill generation completed with expected output"
           else
             echo "FAIL: Large prefill output mismatch"
@@ -468,7 +477,7 @@ jobs:
             -c 256 -n 160 -t 0 \
             -p "Once upon a time, there was a little girl named Lily. She loved to play outside in the forest near her house. One day, she saw a fox running in the forest. She thought the fox was cute and wanted to be friends with it.\\nLily followed the fox into the forest and saw a group of animals." \
             2>&1 | tee /tmp/picolm_prefill.txt
-          if grep -q "Thank you, little girl." /tmp/picolm_prefill.txt; then
+          if grep -q "They all wanted to play with the fox, but they were too small." /tmp/picolm_prefill.txt; then
             echo "PASS: Large prefill generation completed with expected output"
           else
             echo "FAIL: Large prefill output mismatch"
@@ -511,7 +520,7 @@ jobs:
               -c 256 -n 160 -t 0 \
             -p "Once upon a time, there was a little girl named Lily. She loved to play outside in the forest near her house. One day, she saw a fox running in the forest. She thought the fox was cute and wanted to be friends with it.\\nLily followed the fox into the forest and saw a group of animals." \
             2>&1 | tee /tmp/picolm_prefill.txt
-          if grep -q "Thank you, little girl." /tmp/picolm_prefill.txt; then
+          if grep -q "They all wanted to play with the fox, but they were too small." /tmp/picolm_prefill.txt; then
               echo "PASS: Windows MinGW prefill completed"
             else
               echo "FAIL: Windows MinGW prefill did not complete"
