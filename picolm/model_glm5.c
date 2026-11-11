@@ -1476,7 +1476,7 @@ static void glm5_kda_tail(
     const float *z, const float *raw, const float *beta_raw,
     float *conv_out, float *g, float *head_out,
     float *v_new, float *beta,
-    float *out)
+    float *out, int do_out_proj)
 {
     const model_config_t *c = &m->config;
     const int H = c->glm5_n_kda_heads;
@@ -1646,8 +1646,16 @@ static void glm5_kda_tail(
             head_out[i] *= 1.0f / (1.0f + expf(-z[i]));
     }
 
-    /* Output projection */
-    matmul(out, head_out, lw->attn_output, DI, D, lw->type_attn_output);
+    /* Output projection.
+     *
+     * do_out_proj == 0 leaves the gated head_out in place for the caller to
+     * project for the whole token batch at once (attn_output is DI->D, 33.5M
+     * IQ6_K weights, so it is worth streaming once per layer instead of once
+     * per token). The value written to `out` is then the *pre-projection*
+     * gated output, not the block output -- callers relying on `out` must pass
+     * do_out_proj = 1. */
+    if (do_out_proj)
+        matmul(out, head_out, lw->attn_output, DI, D, lw->type_attn_output);
 }
 
 /* Batched GLM-5 prefill. Processes n_tokens (<= GLM5_PREFILL_MAX_TOKENS)
@@ -1799,9 +1807,9 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                 /* beta: [N][H] */
                 matmul_batch(beta_b, cur_b, n_tokens, gw->kda_beta, D, H, gw->type_kda_beta);
 
-                /* Sequential tail: conv -> recurrence -> norm -> gate -> out proj.
-                 * The tail's own attn_output matmul is per-token (DI->D, 33.5M
-                 * params). TODO: batch this too once head_b is complete. */
+                /* Sequential tail: conv -> recurrence -> norm -> gate. The
+                 * tail's output projection is deferred so attn_output can be
+                 * GEMM'd for all tokens at once below. */
                 for (int t = 0; t < n_tokens; t++) {
                     glm5_kda_tail(m, gw, lw, s, il, start_pos + t,
                                   q_b + (size_t)t*DI,
@@ -1814,8 +1822,12 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                                   g_scr,                    /* g [DI] shared */
                                   head_b + (size_t)t*DI,
                                   v_new, beta_sh,
-                                  attn_b + (size_t)t*D);
+                                  attn_b + (size_t)t*D,
+                                  0);                       /* defer out proj */
                 }
+                /* Batched attention output projection: [N][DI] -> [N][D]. */
+                matmul_batch(attn_b, head_b, n_tokens, lw->attn_output, DI, D,
+                             lw->type_attn_output);
             }
 
             /* Phase D: hc_post(attn) per token */
