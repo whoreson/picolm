@@ -1672,6 +1672,11 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
     const int DI = H * KD;
     const int n_trunk = c->n_layer_kv_from_start > 0 && c->n_layer_kv_from_start <= c->n_layers
                       ? c->n_layer_kv_from_start : c->n_layers;
+    /* PICOLM_STOP_LAYER is documented as a bisection aid for the GLM-5 forward
+     * and is honoured by the per-token path. Honour it here too: without this,
+     * a batched-vs-per-token bisection runs all 45 layers on one side and N on
+     * the other, and every comparison looks like a massive divergence. */
+    const int stop_layer = glm5_stop_layer();
     (void)interrupt;
 
     /* Chunk long prompts: the scratch arena is sized for GLM5_PREFILL_MAX_TOKENS
@@ -1685,12 +1690,28 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
     }
     if (n_tokens <= 0) return s->logits;
 
-    /* Per-token planes into the prefill arena. */
+    /* Per-token planes into the prefill arena.
+     *
+     * PICOLM_GLM5_NO_BATCH forces the per-token path unconditionally. That is
+     * the A/B switch for validating the batched prefill: run the same prompt
+     * with and without it and compare the generated tokens (and, if needed,
+     * PICOLM_DUMP_LOGITS output). Keep it: every batching change has to be
+     * re-validated against this path, and the reference implementation is the
+     * only thing that can tell you a new kernel went wrong.
+     *
+     * Note that the two paths are NOT expected to agree bit-for-bit for
+     * n_tokens > 1. matmul_batch() selects different kernels (GEMM_table,
+     * qgemm_d) than matmul() (fn_gemv) and sums in a different order. On this
+     * model a 1e-6 relative perturbation of one projection already moves the
+     * logits by ~8%, because the output distribution is nearly degenerate, so
+     * compare argmax sequences, not logits. */
+    static int no_batch = -1;
+    if (no_batch < 0) no_batch = getenv("PICOLM_GLM5_NO_BATCH") ? 1 : 0;
     float *pf = s->glm5.prefill_buf;
-    if (!pf || n_tokens > s->glm5.prefill_n_tokens) {
-        /* Arena missing or oversized chunk: per-token fallback via the
-         * GLM-5 per-token forward (model_forward_glm5 is in this file,
-         * so the standalone test_glm5_dsa probe can link). */
+    if (no_batch || !pf || n_tokens > s->glm5.prefill_n_tokens) {
+        /* Per-token fallback via the GLM-5 per-token forward
+         * (model_forward_glm5 is in this file, so the standalone
+         * test_glm5_dsa probe can link). */
         for (int i = 0; i < n_tokens; i++) {
             if (interrupt && *interrupt) break;
             (void)model_forward_glm5(m, tokens[i], start_pos + i);
@@ -1859,6 +1880,11 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                 viz_push_batch(il, start_pos, reduced_batch, n_tokens, D);
             }
 #endif
+            if (stop_layer >= 0 && il >= stop_layer) {
+                if (glm5_dbg_enabled())
+                    fprintf(stderr, "GLM5 prefill: stopping after layer %d (PICOLM_STOP_LAYER)\n", il);
+                break;
+            }
         }
 
         /* ---- Final: mean over S streams -> RMSNorm -> output head ---- */

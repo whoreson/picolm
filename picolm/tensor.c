@@ -3200,7 +3200,17 @@ void matmul_batch(float *out, const float *x, int n_batch,
         act_scratch = malloc(act_need);
         act_scratch_size = act_need ? act_need : 1;
     }
-    quant_buf_t qb = quant_activations(qtype, x, n_batch, n, act_scratch, act_scratch_size);
+    /* use_amax_deltas MUST match matmul(), which passes 1. The Q8_0 activation
+     * format carries a per-32-block fp32 delta alongside the int8 quants, and the
+     * two delta flavours are not interchangeable:
+     *   amax    (1): delta = amax/127, exact for the quantizer used here
+     *   fp16 rt (0): delta = value that survived an fp16 round-trip
+     * Passing 0 here made every Q8_0 projection in a batched prefill disagree
+     * with the same row computed by matmul() by ~1.3e-4 relative while IQ6_K
+     * (Q8_K activations, no deltas) matched exactly. That split is what made
+     * GLM-5's batched prefill diverge from the per-token path: layer 0 was
+     * clean for IQ6_K tensors and wrong for Q8_0 ones. */
+    quant_buf_t qb = quant_activations_ex(qtype, x, n_batch, n, act_scratch, act_scratch_size, 1);
     if (!qb.qbuf) {
         /* Allocation failed: generic vec_dot fallback */
         for (int b = 0; b < n_batch; b++)
