@@ -882,6 +882,38 @@ size_t model_ssm_state_save(const model_t *m, uint8_t *buf, size_t buf_size);
  * buf must contain a valid snapshot (matching model config). */
 size_t model_ssm_state_restore(model_t *m, const uint8_t *buf, size_t buf_size);
 
+/* ---- Generic recurrent-state checkpointing (any model with recurrence) ----
+ *
+ * Dispatches to the Qwen SSM blob or the GLM-5 KDA blob, so server-side
+ * rewind/stepback and checkpointing work for both without the caller knowing
+ * which architecture it is holding.
+ *
+ * What is in a checkpoint, and why it is only this:
+ *   - the RECURRENT state (SSM state, or GLM-5's KDA conv + recurrent state).
+ *     This is the only thing that cannot be rebuilt from lower positions.
+ *   - NOT the attention/latent KV cache. That is positional: rewinding to pos N
+ *     leaves rows 0..N-1 untouched, exactly like ordinary KV, so it needs no
+ *     snapshot. Including it would make every checkpoint grow with context
+ *     (GLM-5 MLA latents alone are 46 MB at 2K) for no benefit.
+ *
+ * Consequences worth knowing:
+ *   - the payload size is POSITION-INDEPENDENT for both architectures, so a
+ *     checkpoint is a fixed cost regardless of how far into the sequence it is
+ *   - restore requires the KV cache to be rewound to >= the checkpoint's
+ *     position separately (the server already does), because we do not
+ *     restore past that point
+ *   - GLM-5's payload is ~152 MB (34 layers x 64 heads x 128x128 KDA state,
+ *     dominant). Keep --checkpoint-max small for that model; the server caps
+ *     it by memory, see checkpoint_.*
+ */
+size_t model_recurrent_state_size(const model_t *m);
+size_t model_recurrent_state_save(const model_t *m, uint8_t *buf, size_t buf_size);
+size_t model_recurrent_state_restore(model_t *m, const uint8_t *buf, size_t buf_size);
+void   model_recurrent_state_reset(model_t *m);
+
+/* True when the model has state that must be checkpointed to rewind. */
+int model_has_recurrent_state(const model_t *m);
+
 /* Reset all SSM state to zero (fresh start). No-op for non-SSM models. */
 void model_ssm_state_reset(model_t *m);
 void model_ssm_state_reset_gpu(model_t *m);
@@ -890,6 +922,12 @@ void picolm_gpu_kv_cache_clear(int device);
 /* GLM-5 (glm5next) state snapshot: MLA latent caches + KDA states.
  * Snapshot covers n_pos positions of each MLA latent cache plus all KDA
  * conv/recurrent states. Returns 0 for non-GLM5 models. */
+/* KDA-only recurrent state (no MLA latents) -- what the generic checkpoint
+ * layer uses; see model_recurrent_state_size() above for why. */
+size_t model_glm5_kda_state_size(const model_t *m);
+size_t model_glm5_kda_state_save(const model_t *m, uint8_t *buf, size_t buf_size);
+size_t model_glm5_kda_state_restore(model_t *m, const uint8_t *buf, size_t buf_size);
+
 size_t model_glm5_snapshot_size(const model_t *m, int n_pos);
 size_t model_glm5_state_save(const model_t *m, uint8_t *buf, size_t buf_size, int n_pos);
 size_t model_glm5_state_restore(model_t *m, const uint8_t *buf, size_t buf_size, int n_pos);

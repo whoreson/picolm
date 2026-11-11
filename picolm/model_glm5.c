@@ -2598,6 +2598,75 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
  * whatever was there before the restore and must not be read, so the caller
  * must resume at n_pos. That is exactly the rewind contract used by the SSM
  * snapshot path. */
+/* KDA-only recurrent-state snapshot (used by the generic rewind/checkpoint
+ * layer). Deliberately excludes the MLA latent caches: those are positional
+ * and rewinding leaves rows 0..N-1 valid, so snapshotting them would make
+ * every checkpoint grow with context for no benefit. See model.h.
+ *
+ * Layout: [conv state for each KDA layer][recurrent state for each KDA layer],
+ * both in ascending trunk-layer order, skipping MLA/NextN layers (which own no
+ * KDA state). Size is position-independent. */
+static int glm5_kda_conv_dim(const model_config_t *c) {
+    return 3 * c->glm5_n_kda_heads * c->glm5_kda_dim;
+}
+
+size_t model_glm5_kda_state_size(const model_t *m) {
+    const model_config_t *c = &m->config;
+    if (!c->is_glm5 || c->glm5_n_kda <= 0) return 0;
+    const int conv_dim = glm5_kda_conv_dim(c);
+    const int kda_dim = c->glm5_kda_dim;
+    return (size_t)c->glm5_n_kda * (c->ssm_d_conv - 1) * conv_dim * sizeof(float)
+         + (size_t)c->glm5_n_kda * c->glm5_n_kda_heads * kda_dim * kda_dim * sizeof(float);
+}
+
+size_t model_glm5_kda_state_save(const model_t *m, uint8_t *buf, size_t buf_size) {
+    const model_config_t *c = &m->config;
+    const run_state_t *s = &m->state;
+    if (!c->is_glm5) return 0;
+    size_t needed = model_glm5_kda_state_size(m);
+    if (needed == 0 || buf_size < needed) return 0;
+    const int conv_dim = glm5_kda_conv_dim(c);
+    const int kda_dim = c->glm5_kda_dim;
+    const size_t csz = (size_t)(c->ssm_d_conv - 1) * conv_dim * sizeof(float);
+    const size_t ssz = (size_t)c->glm5_n_kda_heads * kda_dim * kda_dim * sizeof(float);
+    size_t off = 0;
+    for (int l = 0; l < c->n_layers; l++) {
+        if (!s->glm5.kda_conv_state[l]) continue;
+        memcpy(buf + off, s->glm5.kda_conv_state[l], csz);
+        off += csz;
+    }
+    for (int l = 0; l < c->n_layers; l++) {
+        if (!s->glm5.kda_state[l] || c->glm5_layer_is_mla[l]) continue;
+        memcpy(buf + off, s->glm5.kda_state[l], ssz);
+        off += ssz;
+    }
+    return off;
+}
+
+size_t model_glm5_kda_state_restore(model_t *m, const uint8_t *buf, size_t buf_size) {
+    const model_config_t *c = &m->config;
+    run_state_t *s = &m->state;
+    if (!c->is_glm5) return 0;
+    size_t needed = model_glm5_kda_state_size(m);
+    if (needed == 0 || buf_size < needed) return 0;
+    const int conv_dim = glm5_kda_conv_dim(c);
+    const int kda_dim = c->glm5_kda_dim;
+    const size_t csz = (size_t)(c->ssm_d_conv - 1) * conv_dim * sizeof(float);
+    const size_t ssz = (size_t)c->glm5_n_kda_heads * kda_dim * kda_dim * sizeof(float);
+    size_t off = 0;
+    for (int l = 0; l < c->n_layers; l++) {
+        if (!s->glm5.kda_conv_state[l]) continue;
+        memcpy(s->glm5.kda_conv_state[l], buf + off, csz);
+        off += csz;
+    }
+    for (int l = 0; l < c->n_layers; l++) {
+        if (!s->glm5.kda_state[l] || c->glm5_layer_is_mla[l]) continue;
+        memcpy(s->glm5.kda_state[l], buf + off, ssz);
+        off += ssz;
+    }
+    return off;
+}
+
 size_t model_glm5_snapshot_size(const model_t *m, int n_pos) {
     const model_config_t *c = &m->config;
     if (!c->is_glm5) return 0;

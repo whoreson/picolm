@@ -890,7 +890,7 @@ static void checkpoint_save(int n_tokens) {
     if (!cp->data) { free(cp); return; }
 
     /* Save SSM state */
-    size_t written = model_ssm_state_save(&srv.model, cp->data, srv.checkpoint_snapshot_size);
+    size_t written = model_recurrent_state_save(&srv.model, cp->data, srv.checkpoint_snapshot_size);
     if (written == 0) {
         free(cp->data);
         free(cp);
@@ -989,7 +989,7 @@ static int checkpoint_restore(int n_tokens, int *actual_n_tokens) {
     checkpoint_prune_after(best->n_tokens);
 
     /* Restore SSM state from checkpoint */
-    size_t read = model_ssm_state_restore(&srv.model, best->data, srv.checkpoint_snapshot_size);
+    size_t read = model_recurrent_state_restore(&srv.model, best->data, srv.checkpoint_snapshot_size);
     if (read == 0) return -1;
 
     *actual_n_tokens = best->n_tokens;
@@ -1015,7 +1015,7 @@ static void checkpoint_restore_log(int target, int actual, int kv_match, int suc
 static void cache_adjust_stepback(model_t *model, int n_prompt, int *start_pos) {
     if (*start_pos < n_prompt || *start_pos <= 0) return;
 
-    if (model->config.has_ssm && srv.checkpoints) {
+    if (model_has_recurrent_state(model) && srv.checkpoints) {
         int target = n_prompt - 1;
         int actual = 0;
         if (checkpoint_restore(target, &actual) == 0) {
@@ -1216,7 +1216,7 @@ static float *prefill_with_checkpoints(SOCKET sock, model_t *model,
     int do_chunking = 0;
     int ubatch_size = 512; /* matches GPU prefill ubatch */
 
-    if (model->config.has_ssm && srv.max_checkpoints > 0) {
+    if (model_has_recurrent_state(model) && srv.max_checkpoints > 0) {
         do_chunking = 1;
     } else if (return_progress && n_prefill > 1) {
         do_chunking = 1;
@@ -1251,7 +1251,7 @@ static float *prefill_with_checkpoints(SOCKET sock, model_t *model,
      * checkpoint_restore() (e.g. stepback on a fully cached prompt), any
      * checkpoint past 'start_pos' describes an abandoned trajectory. Erase it
      * now instead of keeping it in memory until the context regrows past it. */
-    if (model->config.has_ssm && srv.max_checkpoints > 0 && srv.checkpoints) {
+    if (model_has_recurrent_state(model) && srv.max_checkpoints > 0 && srv.checkpoints) {
         checkpoint_prune_after(start_pos);
     }
 
@@ -1261,7 +1261,7 @@ static float *prefill_with_checkpoints(SOCKET sock, model_t *model,
         int remaining = n_prefill - offset;
         int chunk_size;
 
-        if (model->config.has_ssm && srv.max_checkpoints > 0) {
+        if (model_has_recurrent_state(model) && srv.max_checkpoints > 0) {
             /* SSM checkpoint-driven chunking */
             int mod = cur_pos % srv.checkpoint_interval;
             int interval_dist = (mod == 0) ? srv.checkpoint_interval : (srv.checkpoint_interval - mod);
@@ -1453,7 +1453,7 @@ static int server_init(const char *model_path, int num_threads, int do_prefault,
     srv.slot_has_new_line = 0;
 
     /* Initialize SSM checkpoint system */
-    srv.checkpoint_snapshot_size = model_ssm_snapshot_size(&srv.model);
+    srv.checkpoint_snapshot_size = model_recurrent_state_size(&srv.model);
     srv.checkpoints = NULL;
     srv.checkpoint_scratch = NULL;
     if (srv.max_checkpoints > 0 && srv.checkpoint_snapshot_size > 0) {
@@ -2608,7 +2608,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             gen_count++;
 
             /* Generation checkpoint: every checkpoint_interval_gen tokens */
-            if (srv.max_checkpoints > 0 && model->config.has_ssm && gen_count % srv.checkpoint_interval_gen == 0) {
+            if (srv.max_checkpoints > 0 && model_has_recurrent_state(model) && gen_count % srv.checkpoint_interval_gen == 0) {
                 checkpoint_save(n_prompt + gen_count);
             }
 
@@ -2758,7 +2758,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
                 gen_count++;
 
                 /* Generation checkpoint */
-                if (srv.max_checkpoints > 0 && model->config.has_ssm && gen_count % srv.checkpoint_interval_gen == 0) {
+                if (srv.max_checkpoints > 0 && model_has_recurrent_state(model) && gen_count % srv.checkpoint_interval_gen == 0) {
                     checkpoint_save(n_prompt + gen_count);
                 }
 
@@ -3249,7 +3249,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             gen_count++;
 
             /* Generation checkpoint */
-            if (srv.max_checkpoints > 0 && model->config.has_ssm && gen_count % srv.checkpoint_interval_gen == 0) {
+            if (srv.max_checkpoints > 0 && model_has_recurrent_state(model) && gen_count % srv.checkpoint_interval_gen == 0) {
                 checkpoint_save(n_prompt + gen_count);
             }
 
@@ -3395,7 +3395,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             gen_count++;
 
             /* Generation checkpoint */
-            if (srv.max_checkpoints > 0 && model->config.has_ssm && gen_count % srv.checkpoint_interval_gen == 0) {
+            if (srv.max_checkpoints > 0 && model_has_recurrent_state(model) && gen_count % srv.checkpoint_interval_gen == 0) {
                 checkpoint_save(n_prompt + gen_count);
             }
 

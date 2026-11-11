@@ -2043,8 +2043,8 @@ int main(int argc, char **argv) {
         }
 #endif
         /* Initialize SSM checkpoint system for CLI */
-        if (model.config.has_ssm && checkpoint_max > 0) {
-            cli_checkpoint_snapshot_size = model_ssm_snapshot_size(&model);
+        if (model_has_recurrent_state(&model) && checkpoint_max > 0) {
+            cli_checkpoint_snapshot_size = model_recurrent_state_size(&model);
             if (cli_checkpoint_snapshot_size > 0) {
                 cli_checkpoint_scratch = (uint8_t *)malloc(cli_checkpoint_snapshot_size);
                 fprintf(stderr, "[cli] SSM checkpointing: max=%d, gen_interval=%d, snapshot=%.1fMB\n",
@@ -2060,9 +2060,15 @@ int main(int argc, char **argv) {
                     int fd = open(cache_file, O_RDONLY);
 #endif
                     if (fd >= 0) {
-                        uint32_t header[14];
-                        ssize_t hr = read(fd, header, sizeof(uint32_t) * 13);
-                        if (hr == (ssize_t)sizeof(uint32_t) * 13) {
+                        uint32_t header[14] = {0};
+                        /* v5 headers are 14 words: [13] is the GLM-5 blob size.
+                         * Reading only 13 left header[13] uninitialised, so the
+                         * seek below landed inside the GLM-5 blob and never
+                         * found the checkpoint magic -- silently dropping every
+                         * GLM-5 checkpoint. Accept 13-word (v4) files too. */
+                        ssize_t hr = read(fd, header, sizeof(uint32_t) * 14);
+                        if (hr == (ssize_t)sizeof(uint32_t) * 13 ||
+                            hr == (ssize_t)sizeof(uint32_t) * 14) {
                             int ver = header[0] & 0xF;
                             int file_n_pos = (int)header[1];
                             int file_layers = (int)header[2];
@@ -2212,7 +2218,12 @@ int main(int argc, char **argv) {
          * SSM state aligns (cache_pos == start_pos, i.e. the cache ends exactly at
          * the prompt boundary or matches the full prompt).  Otherwise reset SSM
          * and re-prefill; the attention KV cache is still valid. */
-        if (model.config.has_ssm && cache_pos > start_pos) {
+        /* The gate below used to be `config.has_ssm`, which is false for GLM-5
+         * (its KDA state is a different format). GLM-5 therefore skipped the
+         * rollback entirely and continued from recurrent state that belonged to
+         * a LATER position -- producing plausible but wrong continuations after
+         * a --cache reload. model_has_recurrent_state() covers both families. */
+        if (model_has_recurrent_state(&model) && cache_pos > start_pos) {
             /* SSM state in the file is from position cache_pos, but we need it at start_pos.
              * Try to restore a checkpoint at or before start_pos. */
             int cp_found = 0;
@@ -2222,7 +2233,7 @@ int main(int argc, char **argv) {
                 else break; /* sorted list */
             }
             if (best && best->data) {
-                size_t rd = model_ssm_state_restore(&model, best->data, cli_checkpoint_snapshot_size);
+                size_t rd = model_recurrent_state_restore(&model, best->data, cli_checkpoint_snapshot_size);
                 if (rd == cli_checkpoint_snapshot_size) {
                     start_pos = best->n_tokens;
                     cp_found = 1;
@@ -2233,9 +2244,9 @@ int main(int argc, char **argv) {
             if (!cp_found) {
                 fprintf(stderr, "KV cache: %d/%d tokens match but SSM state is at pos %d (need %d), no checkpoint available, resetting SSM and re-prefilling\n",
                         n_prompt, n_prompt, cache_pos, n_prompt);
-                model_ssm_state_reset(&model);
+                model_recurrent_state_reset(&model);
 #ifdef PICOLM_GPU
-                if (model.gpu.kv_active && model.gpu.device >= 0)
+                if (model.gpu.kv_active && model.gpu.device >= 0 && model.config.has_ssm)
                     model_ssm_state_reset_gpu(&model);
 #endif
                 start_pos = 0;
@@ -2700,7 +2711,7 @@ int main(int argc, char **argv) {
         total_gen++;
 
         /* Generation checkpoint: every checkpoint_interval_gen tokens */
-        if (checkpoint_max > 0 && model.config.has_ssm && cli_checkpoint_snapshot_size > 0
+        if (checkpoint_max > 0 && model_has_recurrent_state(&model) && cli_checkpoint_snapshot_size > 0
             && total_gen % checkpoint_interval_gen == 0) {
             /* Evict if at capacity */
             { int n_cp = 0; for (cli_checkpoint_t *c = cli_checkpoints; c; c = c->next) n_cp++;
@@ -2710,7 +2721,7 @@ int main(int argc, char **argv) {
             cli_checkpoint_t *cp = (cli_checkpoint_t *)calloc(1, sizeof(*cp));
             cp->n_tokens = start_pos + n_prompt + total_gen;
             cp->data = (uint8_t *)malloc(cli_checkpoint_snapshot_size);
-            size_t written = model_ssm_state_save(&model, cp->data, cli_checkpoint_snapshot_size);
+            size_t written = model_recurrent_state_save(&model, cp->data, cli_checkpoint_snapshot_size);
             if (written == 0) { free(cp->data); free(cp); cp = NULL; }
             if (cp) { /* Insert in sorted order */
                 cli_checkpoint_t *prev = NULL, *cur = cli_checkpoints;
