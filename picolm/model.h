@@ -420,6 +420,13 @@ typedef struct {
 } glm5_layer_weights_t;
 
 /* GLM-5 global weights (NextN/MTP block lives in layers[n_layers-1]) */
+
+/* Max tokens per batched-prefill ubatch for GLM-5. The prefill scratch
+ * arena in allocate_run_state() is sized for this many tokens; longer
+ * prompts are chunked by model_forward_prefill_glm5(). 512 covers the
+ * common case; the batching win is already captured at that point. */
+#define GLM5_PREFILL_MAX_TOKENS 512
+
 typedef struct {
     const void *nextn_eh_proj;   /* [n_embd, 2*n_embd] */
     gguf_type_t type_nextn_eh_proj;
@@ -453,6 +460,28 @@ typedef struct {
     float *cur;                  /* [n_embd] current hc_pre output */
     float *attn_out;             /* [n_embd] attention/FFN block output */
     float *moe_down;             /* [n_embd] routed-expert down-proj staging */
+    /* Batched prefill scratch arena (model_forward_prefill_glm5). NULL outside
+     * prefill; carved from the arena in allocate_run_state when is_glm5. */
+    float *prefill_buf;          /* one large arena, carved below */
+    int    prefill_n_tokens;     /* batch size the arena was sized for */
+    /* Offsets into prefill_buf (floats), set by allocate_run_state: */
+    size_t pf_hc_x_off;          /* [N][S*D] residual streams */
+    size_t pf_hc_res_off;        /* [N][S*D] saved hc streams for hc_post */
+    size_t pf_cur_off;           /* [N][D] hc_pre output (normed input) */
+    size_t pf_attn_off;          /* [N][D] attention block output */
+    size_t pf_post_off;          /* [N][S] hc_pre post weights */
+    size_t pf_comb_off;          /* [N][S*S] hc_pre comb matrix */
+    size_t pf_qkv_off;           /* [N][3*DI] batched q/k/v projections */
+    size_t pf_z_off;             /* [N][DI] gate (z) */
+    size_t pf_raw_off;           /* [N][DI] decay raw input */
+    size_t pf_conv_off;          /* [N][3*DI] conv1d+SiLU output */
+    size_t pf_head_off;          /* [N][DI] normed+gated head output */
+    size_t pf_beta_off;          /* [N][H] beta */
+    size_t pf_fa_off;            /* [N][KD] f_a/g_a low-rank staging */
+    size_t pf_gb_off;            /* [N][DI] g_b output (z) */
+    size_t pf_fb_off;            /* [N][DI] f_b output (raw) */
+    size_t pf_hc_m_off;          /* [N][S*D+M] hc_pre scratch (flat + m) */
+    size_t pf_moe_router_off;    /* [N][n_expert] router logits */
 } glm5_state_t;
 
 typedef struct {

@@ -1447,6 +1447,441 @@ float *model_forward_glm5(model_t *m, int token, int pos)
 
 
 /* ------------------------------------------------------------------ */
+/* Batched prefill                                                     */
+/* ------------------------------------------------------------------ */
+
+/* KDA tail: conv1d + SiLU + L2 norm + recurrence + head norm + gate + out
+ * projection. Extracted verbatim from glm5_kda_forward() so that the batched
+ * prefill can call it per-token after batching the projections.
+ *
+ * Inputs (all pre-computed by the caller, per token):
+ *   q, k, v  [DI]  raw projections (NOT convolved)
+ *   z        [DI]  gate pre-activation
+ *   raw      [DI]  decay raw input
+ *   beta_raw [H]   beta pre-activation
+ * Scratch (caller-provided, per-token or shared -- tail is sequential):
+ *   conv_out [3*DI], g [DI], v_new [KD], beta [H]
+ * Output:
+ *   out      [D]   attention output projection
+ *
+ * Bit-identical to glm5_kda_forward() for the same inputs: the conv, state
+ * recurrence, norms and gate are the same code, just moved. The state
+ * (kda_state, conv_state) is read and written exactly once per call, so
+ * calling this per token in sequence order reproduces the per-token path.
+ */
+static void glm5_kda_tail(
+    const model_t *m, const glm5_layer_weights_t *gw, const layer_weights_t *lw,
+    run_state_t *s, int layer_idx, int pos,
+    const float *q, const float *k, const float *v,
+    const float *z, const float *raw, const float *beta_raw,
+    float *conv_out, float *g, float *head_out,
+    float *v_new, float *beta,
+    float *out)
+{
+    const model_config_t *c = &m->config;
+    const int H = c->glm5_n_kda_heads;
+    const int KD = c->glm5_kda_dim;
+    const int DI = H * KD;
+    const int CONV_K = c->ssm_d_conv;
+    const int CONV_DIM = 3 * DI;
+    const int D = c->n_embd;
+    (void)pos; (void)layer_idx;
+
+    float *kda_state = s->glm5.kda_state[layer_idx];
+    float *conv_state = s->glm5.kda_conv_state[layer_idx];
+
+    /* beta = sigmoid(beta_raw) */
+    for (int h = 0; h < H; h++)
+        beta[h] = 1.0f / (1.0f + expf(-beta_raw[h]));
+
+    /* g[h*KD+ch] = lower_bound * sigmoid(-a[h] * (raw[idx] + dt_bias[idx])) */
+    {
+        const float *ssm_a_w = (const float *)gw->kda_a;
+        const float *dt_bias = (const float *)gw->kda_dt_bias;
+        for (int h = 0; h < H; h++) {
+            float a_val = ssm_a_w[h];
+            for (int ch = 0; ch < KD; ch++) {
+                int idx = h*KD + ch;
+                g[idx] = c->glm5_kda_lower_bound *
+                         (1.0f / (1.0f + expf(a_val * (raw[idx] + dt_bias[idx]))));
+            }
+        }
+    }
+
+    /* Causal depthwise conv1d over concatenated [q;k;v] then SiLU. */
+    {
+        const float *wq = (const float *)gw->kda_conv_q;
+        const float *wk = (const float *)gw->kda_conv_k;
+        const float *wv = (const float *)gw->kda_conv_v;
+        for (int ch = 0; ch < CONV_DIM; ch++) {
+            float xs[GLM5_KD_MAX];  /* CONV_K <= 4 */
+            for (int t = 0; t < CONV_K - 1; t++)
+                xs[t] = conv_state[t * CONV_DIM + ch];
+            float x_new;
+            if (ch < DI) x_new = q[ch];
+            else if (ch < 2*DI) x_new = k[ch - DI];
+            else x_new = v[ch - 2*DI];
+            xs[CONV_K - 1] = x_new;
+            const float *w = (ch < DI) ? wq : (ch < 2*DI) ? wk : wv;
+            int ch_off = (ch < DI) ? ch : (ch < 2*DI) ? ch - DI : ch - 2*DI;
+            float acc = 0.f;
+            for (int t = 0; t < CONV_K; t++)
+                acc += xs[t] * w[t + ch_off*CONV_K];
+            conv_out[ch] = acc / (1.0f + expf(-acc));
+            for (int t = 0; t < CONV_K - 2; t++)
+                conv_state[t * CONV_DIM + ch] = conv_state[(t+1) * CONV_DIM + ch];
+            conv_state[(CONV_K - 2) * CONV_DIM + ch] = x_new;
+        }
+    }
+
+    /* Per-head L2 norm of q and k (after conv+SiLU) */
+    for (int h = 0; h < H; h++) {
+        float *qh = conv_out + h*KD;
+        float *kh = conv_out + DI + h*KD;
+        float sq = 0.f, sk = 0.f;
+        for (int ch = 0; ch < KD; ch++) { sq += qh[ch]*qh[ch]; sk += kh[ch]*kh[ch]; }
+        float inv_q = 1.0f / fmaxf(sqrtf(sq), 1e-5f);
+        float inv_k = 1.0f / fmaxf(sqrtf(sk), 1e-5f);
+        for (int ch = 0; ch < KD; ch++) { qh[ch] *= inv_q; kh[ch] *= inv_k; }
+    }
+
+    /* Recurrent state update + output (column-major state walk). */
+    {
+        const float *qq = conv_out;
+        const float *kk = conv_out + DI;
+        const float *vv = conv_out + 2*DI;
+        const float scale = 1.0f / sqrtf((float)KD);
+
+        for (int h = 0; h < H; h++) {
+            const float *qh = qq + h*KD;
+            const float *kh = kk + h*KD;
+            const float *vh = vv + h*KD;
+            float *Sh = kda_state + (size_t)h * KD * KD;
+            float decay[GLM5_KD_MAX];
+
+            float attn_score = 0.f;
+            for (int i = 0; i < KD; i++)
+                attn_score += kh[i] * qh[i];
+            attn_score *= scale;
+
+            for (int col = 0; col < KD; col++)
+                decay[col] = expf(fminf(g[h*KD + col], 50.0f));
+
+            {
+                float *vp = v_new;
+                float *ov = head_out + h*KD;
+                memset(vp, 0, (size_t)KD * sizeof(float));
+                memset(ov, 0, (size_t)KD * sizeof(float));
+                for (int col = 0; col < KD; col++) {
+                    const float *Scol = Sh + (size_t)col*KD;
+                    const float kd_ = kh[col] * decay[col];
+                    const float qd_ = qh[col] * decay[col];
+                    for (int row = 0; row < KD; row++) {
+                        float st = Scol[row];
+                        vp[row] += st * kd_;
+                        ov[row] += st * qd_;
+                    }
+                }
+                for (int row = 0; row < KD; row++) {
+                    float vn = beta[h] * (vh[row] - vp[row]);
+                    v_new[row] = vn;
+                    ov[row] = ov[row] * scale + vn * attn_score;
+                }
+            }
+            /* State update (same SIMD structure as glm5_kda_forward) */
+            for (int col = 0; col < KD; col++) {
+                float k_col = kh[col];
+                float dec = decay[col];
+                float *Sc = Sh + (size_t)col*KD;
+                int row = 0;
+#if defined(PICOLM_AVX512)
+                {
+                    const __m512 vdec = _mm512_set1_ps(dec);
+                    const __m512 vk   = _mm512_set1_ps(k_col);
+                    const __m512 vlo  = _mm512_set1_ps(-1e6f);
+                    const __m512 vhi  = _mm512_set1_ps(1e6f);
+                    for (; row + 15 < KD; row += 16) {
+                        __m512 st = _mm512_loadu_ps(Sc + row);
+                        __m512 vn = _mm512_loadu_ps(v_new + row);
+                        st = _mm512_add_ps(_mm512_mul_ps(vdec, st), _mm512_mul_ps(vn, vk));
+                        st = _mm512_min_ps(_mm512_max_ps(st, vlo), vhi);
+                        _mm512_storeu_ps(Sc + row, st);
+                    }
+                }
+#elif defined(PICOLM_AVX2) || defined(PICOLM_AVX)
+                {
+                    const __m256 vk = _mm256_set1_ps(k_col);
+                    const __m256 vdec = _mm256_set1_ps(dec);
+                    const __m256 vlo  = _mm256_set1_ps(-1e6f);
+                    const __m256 vhi  = _mm256_set1_ps(1e6f);
+                    for (; row + 7 < KD; row += 8) {
+                        __m256 st = _mm256_loadu_ps(Sc + row);
+                        __m256 vn = _mm256_loadu_ps(v_new + row);
+                        st = _mm256_add_ps(_mm256_mul_ps(vdec, st), _mm256_mul_ps(vn, vk));
+                        st = _mm256_min_ps(_mm256_max_ps(st, vlo), vhi);
+                        _mm256_storeu_ps(Sc + row, st);
+                    }
+                }
+#endif
+                for (; row < KD; row++) {
+                    float st = Sc[row];
+                    st = dec * st + v_new[row] * k_col;
+                    Sc[row] = fminf(fmaxf(st, -1e6f), 1e6f);
+                }
+            }
+        }
+    }
+
+    /* Per-head RMSNorm with ssm_norm weight, then sigmoid gate (z) */
+    {
+        const float *norm_w = (const float *)gw->kda_norm;
+        for (int h = 0; h < H; h++) {
+            float *oh = head_out + h*KD;
+            float ss = 0.f;
+            for (int ch = 0; ch < KD; ch++) ss += oh[ch]*oh[ch];
+            float inv = 1.0f / sqrtf(ss / KD + c->rms_norm_eps);
+            for (int ch = 0; ch < KD; ch++) oh[ch] *= inv * norm_w[ch];
+        }
+        for (int i = 0; i < DI; i++)
+            head_out[i] *= 1.0f / (1.0f + expf(-z[i]));
+    }
+
+    /* Output projection */
+    matmul(out, head_out, lw->attn_output, DI, D, lw->type_attn_output);
+}
+
+/* Batched GLM-5 prefill. Processes n_tokens (<= GLM5_PREFILL_MAX_TOKENS)
+ * starting at start_pos. Batches the weight-bound KDA projections and the
+ * attention output projection across tokens; everything else stays per-token.
+ * Returns the logits of the LAST token (caller convention).
+ *
+ * The caller (model_forward_prefill in model_core.c) chunks prompts longer
+ * than GLM5_PREFILL_MAX_TOKENS into multiple calls; the KDA recurrent state
+ * and MLA latent caches live in the run state and carry across chunks. */
+float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
+                                  int start_pos, volatile int *interrupt)
+{
+    model_config_t *c = &m->config;
+    model_weights_t *w = &m->weights;
+    run_state_t *s = &m->state;
+    const int D = c->n_embd;
+    const int S = c->glm5_hc;
+    const int M = (2 + S) * S;
+    const int H = c->glm5_n_kda_heads;
+    const int KD = c->glm5_kda_dim;
+    const int DI = H * KD;
+    const int n_trunk = c->n_layer_kv_from_start > 0 && c->n_layer_kv_from_start <= c->n_layers
+                      ? c->n_layer_kv_from_start : c->n_layers;
+    (void)interrupt;
+
+    /* Chunk long prompts: the scratch arena is sized for GLM5_PREFILL_MAX_TOKENS
+     * and the KDA recurrent state / MLA latent caches live in the run state,
+     * carrying across chunk boundaries automatically. */
+    while (n_tokens > GLM5_PREFILL_MAX_TOKENS) {
+        model_forward_prefill_glm5(m, tokens, GLM5_PREFILL_MAX_TOKENS, start_pos, interrupt);
+        tokens += GLM5_PREFILL_MAX_TOKENS;
+        start_pos += GLM5_PREFILL_MAX_TOKENS;
+        n_tokens -= GLM5_PREFILL_MAX_TOKENS;
+    }
+    if (n_tokens <= 0) return s->logits;
+
+    /* Per-token planes into the prefill arena. */
+    float *pf = s->glm5.prefill_buf;
+    if (!pf || n_tokens > s->glm5.prefill_n_tokens) {
+        /* Arena missing or oversized chunk: per-token fallback.
+         * g_is_prefill is already set by the caller. */
+        for (int i = 0; i < n_tokens; i++) {
+            if (interrupt && *interrupt) break;
+            (void)model_forward(m, tokens[i], start_pos + i);
+        }
+        return s->logits;
+    }
+    {
+        const size_t NT = (size_t)n_tokens;
+        float *hc_x_b   = pf + s->glm5.pf_hc_x_off;    /* [N][S*D] */
+        float *hc_res_b = pf + s->glm5.pf_hc_res_off;  /* [N][S*D] */
+        float *cur_b    = pf + s->glm5.pf_cur_off;     /* [N][D] */
+        float *attn_b   = pf + s->glm5.pf_attn_off;    /* [N][D] */
+        float *post_b   = pf + s->glm5.pf_post_off;    /* [N][S] */
+        float *comb_b   = pf + s->glm5.pf_comb_off;    /* [N][S*S] */
+        float *q_b      = pf + s->glm5.pf_qkv_off;     /* [N][DI] */
+        float *k_b      = q_b  + NT*DI;                /* [N][DI] */
+        float *v_b      = q_b  + NT*2*DI;              /* [N][DI] */
+        float *z_b      = pf + s->glm5.pf_z_off;       /* [N][DI] */
+        float *raw_b    = pf + s->glm5.pf_raw_off;     /* [N][DI] */
+        float *conv_b   = pf + s->glm5.pf_conv_off;    /* [N][3*DI] */
+        float *head_b   = pf + s->glm5.pf_head_off;    /* [N][DI] */
+        float *beta_b   = pf + s->glm5.pf_beta_off;    /* [N][H] */
+        float *fa_b     = pf + s->glm5.pf_fa_off;      /* [N][KD] staging */
+        float *gb_b     = pf + s->glm5.pf_gb_off;      /* [N][DI] = z output */
+        float *fb_b     = pf + s->glm5.pf_fb_off;      /* [N][DI] = raw output */
+        /* Shared per-token scratch for the sequential KDA tail (one token at a
+         * time, so these can overlap the per-token kda_scratch layout):
+         *   g     [DI] at kda_scratch + 8*DI + H   (the `g` slot)
+         *   beta  [H]  at kda_scratch + 8*DI       (the `beta` slot)
+         *   v_new [KD] at kda_scratch + 9*DI + H   (the `fa_out` slot) */
+        float *g_scr   = s->glm5.kda_scratch + (size_t)8*DI + H;
+        float *beta_sh = s->glm5.kda_scratch + (size_t)8*DI;
+        float *v_new   = s->glm5.kda_scratch + (size_t)9*DI + H;
+
+        /* ---- Embed all tokens, broadcast to S streams ---- */
+        for (int t = 0; t < n_tokens; t++) {
+            size_t row_bytes = gguf_type_row_size(w->type_token_embd, D);
+            const void *embd_row = (const uint8_t *)w->token_embd
+                                 + (size_t)tokens[t] * row_bytes;
+            dequantize_row(embd_row, s->x, D, w->type_token_embd);
+            for (int si = 0; si < S; si++)
+                memcpy(hc_x_b + (size_t)t*S*D + si*D, s->x, D * sizeof(float));
+        }
+
+        for (int il = 0; il < n_trunk; il++) {
+            const layer_weights_t *lw = &w->layers[il];
+            const glm5_layer_weights_t *gw = &w->glm5[il];
+            int mla_ord = c->glm5_layer_mla_ord[il];
+            /* ============ Attention block ============ */
+
+            /* Phase A: hc_pre(attn) + RMSNorm, per token. Saves hc_res,
+             * post, comb per token for the hc_post in phase D. */
+            for (int t = 0; t < n_tokens; t++) {
+                float *hc_x_t = hc_x_b + (size_t)t*S*D;
+                float *cur_t  = cur_b + (size_t)t*D;
+                float *res_t  = hc_res_b + (size_t)t*S*D;
+                float *post_t = post_b + (size_t)t*S;
+                float *comb_t = comb_b + (size_t)t*S*S;
+                memcpy(res_t, hc_x_t, (size_t)S*D*sizeof(float));
+                glm5_hc_pre(m, gw, 1, hc_x_t, cur_t, post_t, comb_t, s->glm5.hc_scratch);
+                rmsnorm(cur_t, cur_t, s->attn_norm_w[il], D, c->rms_norm_eps);
+            }
+
+            if (mla_ord >= 0) {
+                /* MLA: per-token (attention over the growing latent cache) */
+                for (int t = 0; t < n_tokens && (!interrupt || !*interrupt); t++) {
+                    glm5_mla_forward(m, gw, lw, s, cur_b + (size_t)t*D,
+                                     start_pos + t, c->max_seq_len, il, mla_ord,
+                                     attn_b + (size_t)t*D);
+                }
+            } else {
+                /* KDA: batch the weight-bound projections, then run the
+                 * sequential tail per token. The projections read cur_b and
+                 * write into per-token planes; the tail reads those planes
+                 * and updates the recurrent state in token order. */
+                matmul_batch(q_b, cur_b, n_tokens, lw->attn_q, D, DI, lw->type_attn_q);
+                matmul_batch(k_b, cur_b, n_tokens, lw->attn_k, D, DI, lw->type_attn_k);
+                matmul_batch(v_b, cur_b, n_tokens, lw->attn_v, D, DI, lw->type_attn_v);
+                /* gate: z = g_b @ (g_a @ cur) */
+                matmul_batch(fa_b, cur_b, n_tokens, gw->kda_g_a, D, KD, gw->type_kda_g_a);
+                matmul_batch(gb_b, fa_b, n_tokens, gw->kda_g_b, KD, DI, gw->type_kda_g_b);
+                /* decay: raw = f_b @ (f_a @ cur) -- fa_b reused after g_b */
+                matmul_batch(fa_b, cur_b, n_tokens, gw->kda_f_a, D, KD, gw->type_kda_f_a);
+                matmul_batch(fb_b, fa_b, n_tokens, gw->kda_f_b, KD, DI, gw->type_kda_f_b);
+                /* beta: [N][H] */
+                matmul_batch(beta_b, cur_b, n_tokens, gw->kda_beta, D, H, gw->type_kda_beta);
+
+                /* Sequential tail: conv -> recurrence -> norm -> gate -> out proj.
+                 * The tail's own attn_output matmul is per-token (DI->D, 33.5M
+                 * params). TODO: batch this too once head_b is complete. */
+                for (int t = 0; t < n_tokens; t++) {
+                    glm5_kda_tail(m, gw, lw, s, il, start_pos + t,
+                                  q_b + (size_t)t*DI,
+                                  k_b + (size_t)t*DI,
+                                  v_b + (size_t)t*DI,
+                                  gb_b + (size_t)t*DI,   /* z */
+                                  fb_b + (size_t)t*DI,   /* raw */
+                                  beta_b + (size_t)t*H,
+                                  conv_b + (size_t)t*3*DI,  /* conv scratch */
+                                  g_scr,                    /* g [DI] shared */
+                                  head_b + (size_t)t*DI,
+                                  v_new, beta_sh,
+                                  attn_b + (size_t)t*D);
+                }
+            }
+
+            /* Phase D: hc_post(attn) per token */
+            for (int t = 0; t < n_tokens; t++) {
+                float *hc_x_t = hc_x_b + (size_t)t*S*D;
+                float *res_t  = hc_res_b + (size_t)t*S*D;
+                float *post_t = post_b + (size_t)t*S;
+                float *comb_t = comb_b + (size_t)t*S*S;
+                float *attn_t = attn_b + (size_t)t*D;
+                glm5_hc_post(m, attn_t, res_t, post_t, comb_t, hc_x_t);
+            }
+
+            /* ============ FFN block ============ */
+
+            /* Phase A': hc_pre(ffn) + RMSNorm per token (reuses post/comb planes) */
+            for (int t = 0; t < n_tokens; t++) {
+                float *hc_x_t = hc_x_b + (size_t)t*S*D;
+                float *cur_t  = cur_b + (size_t)t*D;
+                float *res_t  = hc_res_b + (size_t)t*S*D;
+                float *post_t = post_b + (size_t)t*S;
+                float *comb_t = comb_b + (size_t)t*S*S;
+                memcpy(res_t, hc_x_t, (size_t)S*D*sizeof(float));
+                glm5_hc_pre(m, gw, 0, hc_x_t, cur_t, post_t, comb_t, s->glm5.hc_scratch);
+                rmsnorm(cur_t, cur_t, s->post_attn_norm_w[il], D, c->rms_norm_eps);
+            }
+
+            /* Phase B': FFN / MoE per token (routing is per-token) */
+            for (int t = 0; t < n_tokens; t++) {
+                float *cur_t  = cur_b + (size_t)t*D;
+                float *attn_t = attn_b + (size_t)t*D;
+                if (il < c->n_layer_dense_lead)
+                    glm5_dense_ffn(m, lw, s, cur_t, attn_t);
+                else
+                    glm5_moe_ffn(m, gw, lw, s, cur_t, attn_t);
+            }
+
+            /* Phase D': hc_post(ffn) per token */
+            for (int t = 0; t < n_tokens; t++) {
+                float *hc_x_t = hc_x_b + (size_t)t*S*D;
+                float *res_t  = hc_res_b + (size_t)t*S*D;
+                float *post_t = post_b + (size_t)t*S;
+                float *comb_t = comb_b + (size_t)t*S*S;
+                float *attn_t = attn_b + (size_t)t*D;
+                glm5_hc_post(m, attn_t, res_t, post_t, comb_t, hc_x_t);
+            }
+#ifdef PICOLM_VIZ
+            {
+                /* Mean-reduce S streams -> single vector per token, then push batch. */
+                float *reduced = s->glm5.cur;  /* scratch [D] */
+                /* attn_b is [N*D] and no longer needed after hc_post for this layer */
+                float *reduced_batch = attn_b;
+                float inv_s = 1.0f / (float)S;
+                for (int t = 0; t < n_tokens; t++) {
+                    float *hc_x_t = hc_x_b + (size_t)t*S*D;
+                    float *rb = reduced_batch + (size_t)t*D;
+                    for (int d = 0; d < D; d++) {
+                        float acc = 0.f;
+                        for (int si = 0; si < S; si++) acc += hc_x_t[si*D + d];
+                        rb[d] = acc * inv_s;
+                    }
+                }
+                viz_push_batch(il, start_pos, reduced_batch, n_tokens, D);
+            }
+#endif
+        }
+
+        /* ---- Final: mean over S streams -> RMSNorm -> output head ---- */
+        {
+            float *hc_x_last = hc_x_b + (size_t)(n_tokens-1)*S*D;
+            float inv_s = 1.0f / (float)S;
+            for (int d = 0; d < D; d++) {
+                float acc = 0.f;
+                for (int si = 0; si < S; si++) acc += hc_x_last[si*D + d];
+                s->glm5.cur[d] = acc * inv_s;
+            }
+            float ss = 0.f;
+            for (int i = 0; i < D; i++) ss += s->glm5.cur[i] * s->glm5.cur[i];
+            float inv = 1.0f / sqrtf(ss / D + c->rms_norm_eps);
+            const float *nw = s->output_norm_w;
+            for (int i = 0; i < D; i++) s->glm5.cur[i] *= inv * nw[i];
+            matmul(s->logits, s->glm5.cur, w->output, D, c->vocab_size, w->type_output);
+        }
+        return s->logits;
+    }
+
+}
+
+/* ------------------------------------------------------------------ */
 /* KV-cache state snapshot (v5): MLA latent caches + KDA states        */
 /* ------------------------------------------------------------------ */
 

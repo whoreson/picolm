@@ -755,6 +755,36 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
                   + c->glm5_kv_lora + c->max_seq_len) * sizeof(float);
         /* MoE routed-expert down-projection staging [n_embd] */
         sz_glm5 += (size_t)c->n_embd * sizeof(float);
+
+        /* Batched-prefill arena: sized for GLM5_PREFILL_MAX_TOKENS tokens,
+         * NOT max_seq_len (which is 1M for this model -- see the workplan's
+         * context-length trap). model_forward_prefill_glm5() chunks into
+         * GLM5_PREFILL_MAX_TOKENS-token ubatches, so this is a hard upper
+         * bound regardless of the prompt length. */
+        {
+            int D = c->n_embd, S = c->glm5_hc;
+            int DI = c->glm5_n_kda_heads * c->glm5_kda_dim;
+            int KD = c->glm5_kda_dim, H = c->glm5_n_kda_heads;
+            int M = (2 + S) * S + S + S * S;   /* hc m + pre/post + comb */
+            size_t per_tok = (size_t)S * D      /* pf_hc_x: residual streams */
+                           + (size_t)S * D      /* pf_hc_res: saved for hc_post */
+                           + (size_t)D          /* pf_cur */
+                           + (size_t)D          /* pf_attn */
+                           + (size_t)S          /* pf_post */
+                           + (size_t)S * S      /* pf_comb */
+                           + (size_t)S * D + M  /* pf_hc_m: flat + m scratch */
+                           + (size_t)3 * DI     /* pf_qkv */
+                           + (size_t)DI         /* pf_z */
+                           + (size_t)DI         /* pf_raw */
+                           + (size_t)3 * DI     /* pf_conv */
+                           + (size_t)DI         /* pf_head */
+                           + (size_t)H          /* pf_beta */
+                           + (size_t)KD         /* pf_fa */
+                           + (size_t)DI         /* pf_gb */
+                           + (size_t)DI         /* pf_fb: raw output [DI] */
+                           + (size_t)c->n_expert; /* pf_moe_router */
+            sz_glm5 += (size_t)GLM5_PREFILL_MAX_TOKENS * per_tok * sizeof(float);
+        }
     }
 
     /* MoE buffers */
@@ -1222,6 +1252,53 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         s->glm5.cur = gp5;      gp5 += (size_t)c->n_embd;
         s->glm5.attn_out = gp5; gp5 += (size_t)c->n_embd;
         s->glm5.moe_down = gp5; gp5 += (size_t)c->n_embd;
+
+        /* Batched-prefill arena (see the sizing block above for the layout).
+         * All offsets are in floats from s->glm5.prefill_buf. */
+        {
+            int D = c->n_embd, S = c->glm5_hc;
+            int DI = c->glm5_n_kda_heads * c->glm5_kda_dim;
+            int KD = c->glm5_kda_dim, H = c->glm5_n_kda_heads;
+            int M = (2 + S) * S + S + S * S;
+            float *pf = gp5;
+            s->glm5.prefill_buf = pf;
+            s->glm5.prefill_n_tokens = GLM5_PREFILL_MAX_TOKENS;
+            s->glm5.pf_hc_x_off = 0;
+            pf += (size_t)GLM5_PREFILL_MAX_TOKENS * S * D;
+            s->glm5.pf_cur_off = pf - gp5;
+            pf += (size_t)GLM5_PREFILL_MAX_TOKENS * D;
+            s->glm5.pf_attn_off = pf - gp5;
+            pf += (size_t)GLM5_PREFILL_MAX_TOKENS * D;
+            s->glm5.pf_qkv_off = pf - gp5;
+            pf += (size_t)GLM5_PREFILL_MAX_TOKENS * 3 * DI;
+            s->glm5.pf_z_off = pf - gp5;
+            pf += (size_t)GLM5_PREFILL_MAX_TOKENS * DI;
+            s->glm5.pf_raw_off = pf - gp5;
+            pf += (size_t)GLM5_PREFILL_MAX_TOKENS * DI;
+            s->glm5.pf_conv_off = pf - gp5;
+            pf += (size_t)GLM5_PREFILL_MAX_TOKENS * 3 * DI;
+            s->glm5.pf_head_off = pf - gp5;
+            pf += (size_t)GLM5_PREFILL_MAX_TOKENS * DI;
+            s->glm5.pf_beta_off = pf - gp5;
+            pf += (size_t)GLM5_PREFILL_MAX_TOKENS * H;
+            s->glm5.pf_fa_off = pf - gp5;
+            pf += (size_t)GLM5_PREFILL_MAX_TOKENS * KD;
+            s->glm5.pf_gb_off = pf - gp5;
+            pf += (size_t)GLM5_PREFILL_MAX_TOKENS * DI;
+            s->glm5.pf_fb_off = pf - gp5;
+            pf += (size_t)GLM5_PREFILL_MAX_TOKENS * DI;   /* raw output is [DI] not [KD] */
+            s->glm5.pf_hc_res_off = pf - gp5;
+            pf += (size_t)GLM5_PREFILL_MAX_TOKENS * S * D;
+            s->glm5.pf_post_off = pf - gp5;
+            pf += (size_t)GLM5_PREFILL_MAX_TOKENS * S;
+            s->glm5.pf_comb_off = pf - gp5;
+            pf += (size_t)GLM5_PREFILL_MAX_TOKENS * S * S;
+            s->glm5.pf_hc_m_off = pf - gp5;
+            pf += (size_t)GLM5_PREFILL_MAX_TOKENS * (S * D + M);
+            s->glm5.pf_moe_router_off = pf - gp5;
+            pf += (size_t)GLM5_PREFILL_MAX_TOKENS * c->n_expert;
+            gp5 = pf;
+        }
         p = gp5;
     }
 
@@ -2261,6 +2338,7 @@ static void repack_model_weights_q4_0x8(model_t *m) {
 /* ---- Gemma-3n forward pass (specialized) ---- */
 float *model_forward_gemma3n(model_t *m, int token, int pos);
 float *model_forward_glm5(model_t *m, int token, int pos);
+float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt);
 
 /* ---- GPT-2 forward pass (specialized) ---- */
 static float *model_forward_gpt2(model_t *m, int token, int pos) {
@@ -5142,15 +5220,14 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
         g_is_prefill = 0;
         return m->state.logits;
     }
-    /* GLM-5: per-token prefill fallback (batched hc/KDA/MLA prefill later) */
+    /* GLM-5: batched prefill (KDA projections batched, sequential KDA tail,
+     * per-token MLA). Falls back to the per-token path if the prefill arena
+     * is missing or the chunk size is exceeded. */
     if (m->config.is_glm5) {
         g_is_prefill = 1;
-        for (int i = 0; i < n_tokens; i++) {
-            if (interrupt && *interrupt) break;
-            (void)model_forward(m, tokens[i], start_pos + i);
-        }
+        float *ret = model_forward_prefill_glm5(m, tokens, n_tokens, start_pos, interrupt);
         g_is_prefill = 0;
-        return m->state.logits;
+        return ret;
     }
     /* GPT-2 batched prefill */
     if (m->config.is_gpt2) {
