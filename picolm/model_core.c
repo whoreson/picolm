@@ -782,6 +782,8 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
                            + (size_t)KD         /* pf_fa */
                            + (size_t)DI         /* pf_gb */
                            + (size_t)DI         /* pf_fb: raw output [DI] */
+                           + (size_t)(c->glm5_q_lora + 2*c->n_heads*c->glm5_mla_head_dim
+                                      + c->glm5_kv_lora)  /* pf_mla: qr, q/o_concat, kv (MLA layers) */
                            + (size_t)c->n_expert; /* pf_moe_router */
             sz_glm5 += (size_t)GLM5_PREFILL_MAX_TOKENS * per_tok * sizeof(float);
         }
@@ -1295,6 +1297,14 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
             pf += (size_t)GLM5_PREFILL_MAX_TOKENS * S * S;
             s->glm5.pf_hc_m_off = pf - gp5;
             pf += (size_t)GLM5_PREFILL_MAX_TOKENS * (S * D + M);
+            s->glm5.pf_mla_qr_off = pf - gp5;
+            pf += (size_t)GLM5_PREFILL_MAX_TOKENS * c->glm5_q_lora;
+            s->glm5.pf_mla_q_off = pf - gp5;
+            pf += (size_t)GLM5_PREFILL_MAX_TOKENS * c->n_heads * c->glm5_mla_head_dim;
+            s->glm5.pf_mla_o_off = pf - gp5;
+            pf += (size_t)GLM5_PREFILL_MAX_TOKENS * c->n_heads * c->glm5_mla_head_dim;
+            s->glm5.pf_mla_kv_off = pf - gp5;
+            pf += (size_t)GLM5_PREFILL_MAX_TOKENS * c->glm5_kv_lora;
             s->glm5.pf_moe_router_off = pf - gp5;
             pf += (size_t)GLM5_PREFILL_MAX_TOKENS * c->n_expert;
             gp5 = pf;

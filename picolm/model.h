@@ -481,6 +481,10 @@ typedef struct {
     size_t pf_gb_off;            /* [N][DI] g_b output (z) */
     size_t pf_fb_off;            /* [N][DI] f_b output (raw) */
     size_t pf_hc_m_off;          /* [N][S*D+M] hc_pre scratch (flat + m) */
+    size_t pf_mla_qr_off;        /* [N][QL]   MLA post-norm q latent */
+    size_t pf_mla_q_off;         /* [N][NH*MHD] MLA Wq_b output */
+    size_t pf_mla_o_off;         /* [N][NH*MHD] MLA per-head attn output (o_concat) */
+    size_t pf_mla_kv_off;        /* [N][KVL]  MLA post-norm latent */
     size_t pf_moe_router_off;    /* [N][n_expert] router logits */
 } glm5_state_t;
 

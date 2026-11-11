@@ -745,10 +745,106 @@ int glm5_dsa_select(const model_config_t *c, const glm5_layer_weights_t *gw,
                     run_state_t *s, const float *cur, const float *qr,
                     int pos, int mla_ord, int *sel_out);
 
+/* Batched MLA projections for prefill.
+ *
+ * Runs the three weight-bound stages of an MLA layer for n_tokens at once and
+ * writes per-token planes. The attention itself is NOT here: it walks the
+ * growing latent cache and stays per-token in glm5_mla_forward(), which also
+ * does the cache store and the DSA indexer.
+ *
+ * Why this is worth a separate function: an MLA layer streams 99 MB of weights,
+ * of which attn_q_b (1536x16384) and attn_output (16384x4096) are 76 MB. Doing
+ * those per token re-reads them n_tokens times, and measurement shows MLA
+ * layers cost 1177 ms against 817 ms for a KDA layer that streams MORE weight
+ * bytes -- the per-token projections are the whole difference.
+ *
+ * Layouts written (all [n_tokens][...], row t at offset t*stride):
+ *   qr_b   [QL]      post-norm q latent
+ *   q_b    [NH*MHD]  Wq_b @ qr
+ *   qabs_b [NH*KVL]  absorbed q per head   (stage 2, needs q_b complete)
+ *   kv_b   [KVL]     post-norm latent, NOT yet in the cache
+ *
+ * attn_output is deliberately not here: it consumes the attention result, so
+ * the caller batches it after the per-token attention loop.
+ */
+static void glm5_mla_project_batch(
+    const model_t *m, const glm5_layer_weights_t *gw,
+    const float *cur_b, int n_tokens,
+    float *qr_b, float *q_b, float *kv_b)
+{
+    const model_config_t *c = &m->config;
+    const int D = c->n_embd;
+    const int NH = c->n_heads;
+    const int QL = c->glm5_q_lora;
+    const int KVL = c->glm5_kv_lora;
+    const int MHD = c->glm5_mla_head_dim;
+    const int QD = NH * MHD;
+
+    /* qr = RMSNorm(Wq_a @ c, q_a_norm) */
+    matmul_batch(qr_b, cur_b, n_tokens, gw->mla_q_a, D, QL, gw->type_mla_q_a);
+    {
+        const float *w = (const float *)gw->mla_q_a_norm;
+        for (int t = 0; t < n_tokens; t++) {
+            float *qr = qr_b + (size_t)t*QL;
+            float ss = 0.f;
+            for (int i = 0; i < QL; i++) ss += qr[i] * qr[i];
+            float inv = 1.0f / sqrtf(ss / QL + c->rms_norm_eps);
+            for (int i = 0; i < QL; i++) qr[i] *= inv * w[i];
+        }
+    }
+
+    /* q = Wq_b @ qr  -- 1536x16384 IQ6_K, the single largest MLA weight */
+    matmul_batch(q_b, qr_b, n_tokens, gw->mla_q_b, QL, QD, gw->type_mla_q_b);
+
+    /* kv = RMSNorm(Wkv_a @ c, kv_a_norm). Cached per token by the caller.
+     *
+     * Deliberately per-token despite being batchable: attn_kv_a_mqa is only
+     * 4096x512 (2 MB), so batching it saves nothing measurable, and it is Q8_0
+     * -- where matmul_batch() selects a different kernel than matmul() and the
+     * results differ by ~2e-7. On this model that is enough to flip a near-tied
+     * token (see the workplan's sensitivity table), and measured against the
+     * per-token reference it did exactly that. Not worth the risk for 2 MB. */
+    {
+        const float *w = (const float *)gw->mla_kv_a_norm;
+        for (int t = 0; t < n_tokens; t++) {
+            float *kv = kv_b + (size_t)t*KVL;
+            matmul(kv, cur_b + (size_t)t*D, gw->mla_kv_a_mqa, D, KVL,
+                   gw->type_mla_kv_a_mqa);
+            float ss = 0.f;
+            for (int i = 0; i < KVL; i++) ss += kv[i] * kv[i];
+            float inv = 1.0f / sqrtf(ss / KVL + c->rms_norm_eps);
+            for (int i = 0; i < KVL; i++) kv[i] *= inv * w[i];
+        }
+    }
+
+    /* Qabs is NOT computed here: it is consumed immediately by that token's
+     * attention, so keeping [n_tokens][NH*KVL] (32768 floats/token = 64 MB at
+     * 512 tokens) alive through the batch would cost more arena than it saves.
+     * The per-token loop computes it into one shared [NH*KVL] scratch. */
+}
+
+/* Per-token MLA core.
+ *
+ * `pre` is optional. When non-NULL the caller has already run
+ * glm5_mla_project_batch() for the whole token batch and `pre` points at this
+ * token's slice; the projection stages below are then skipped. When NULL the
+ * function does everything itself, which is the decode path.
+ *
+ * The attention cannot be batched away: it walks the latent cache up to `pos`,
+ * and in a batched prefill every token's latents must already be stored before
+ * any attention runs, so the caller stores the whole batch first (see
+ * glm5_mla_project_batch + the prefill loop). */
+typedef struct {
+    const float *qr;    /* [QL]      post-norm q latent */
+    const float *q;     /* [NH*MHD]  Wq_b @ qr           */
+    const float *qabs;  /* [NH*KVL]  absorbed q per head  */
+    const float *kv;    /* [KVL]     post-norm latent, already stored in cache */
+} glm5_mla_pre_t;
+
 static void glm5_mla_forward(
     const model_t *m, const glm5_layer_weights_t *gw, const layer_weights_t *lw,
     run_state_t *s, const float *cur, int pos, int n_ctx, int layer_idx,
-    int mla_ord, float *out)
+    int mla_ord, float *out, const glm5_mla_pre_t *pre)
 {
     const model_config_t *c = &m->config;
     const int D = c->n_embd;
@@ -765,6 +861,11 @@ static void glm5_mla_forward(
     float *scores = sc;                 /* [max_seq] */
     (void)gw;
 
+    /* Precomputed projections (batched prefill): read straight from the
+     * caller's planes. Nothing is written to qr/qabs/kv in that case. */
+    const float *qr_p   = pre ? pre->qr   : qr;
+    const float *qabs_p = pre ? pre->qabs : qabs;
+
     /* DSA k-pool selection for this token (empty -> dense attention). */
     int *sel = NULL;
     int n_sel = 0;
@@ -774,7 +875,7 @@ static void glm5_mla_forward(
      * once for both KDA and MLA. Do not norm again here. */
 
     /* qr = RMSNorm(Wq_a @ c, q_a_norm) */
-    {
+    if (!pre) {
         float *tmp = s->glm5.mla_q;   /* reuse: [NH*MHD] >= [QL] */
         matmul(tmp, cur, gw->mla_q_a, D, QL, gw->type_mla_q_a);
         float ss = 0.f;
@@ -785,7 +886,7 @@ static void glm5_mla_forward(
     }
 
     /* q = Wq_b @ qr   [NH*MHD] */
-    {
+    if (!pre) {
         float *q = s->glm5.mla_q;   /* [NH * MHD] */
         matmul(q, qr, gw->mla_q_b, QL, NH*MHD, gw->type_mla_q_b);
 
@@ -810,8 +911,10 @@ static void glm5_mla_forward(
         }
     }
 
-    /* kv = RMSNorm(Wkv_a @ c, kv_a_norm) -> latent, store in cache */
-    {
+    /* kv = RMSNorm(Wkv_a @ c, kv_a_norm) -> latent, store in cache.
+     * With `pre` the latent is precomputed AND already stored by the caller
+     * (the whole batch has to be in the cache before any attention runs). */
+    if (!pre) {
         float *tmp = s->glm5.mla_q;   /* reuse */
         matmul(tmp, cur, gw->mla_kv_a_mqa, D, KVL, gw->type_mla_kv_a_mqa);
         float ss = 0.f;
@@ -837,7 +940,7 @@ static void glm5_mla_forward(
         /* Selection is only meaningful once there is at least one complete
          * pool plus the tail; below that the dense path is equivalent. */
         if (pos >= c->glm5_idx_kpool) {
-            n_sel = glm5_dsa_select(c, gw, s, cur, qr, pos, mla_ord, dsa_sel_buf);
+            n_sel = glm5_dsa_select(c, gw, s, cur, qr_p, pos, mla_ord, dsa_sel_buf);
             if (n_sel > 0) sel = dsa_sel_buf;
         }
     }
@@ -857,7 +960,7 @@ static void glm5_mla_forward(
         const int dense = (n_sel == 0);
 
         for (int h = 0; h < NH; h++) {
-            const float *qh = qabs + h * KVL;
+            const float *qh = qabs_p + h * KVL;
             float mx = -INFINITY, sum = 0.f;
 
             /* scores over the selected cells (or every cell when dense) */
@@ -922,7 +1025,11 @@ static void glm5_mla_forward(
             const void *wh = vb + h * v_head_sz;
             matmul(o_concat + h*MHD, ctx + h*KVL, wh, KVL, MHD, gw->type_mla_v_b);
         }
-        matmul(out, o_concat, lw->attn_output, NH*MHD, D, lw->type_attn_output);
+        /* o_concat is in caller-provided scratch when batching; the output
+         * projection is then batched too (attn_output is 16384x4096 IQ6_K,
+         * 55 MB, and would otherwise be re-streamed per token). */
+        if (pre) memcpy(out, o_concat, (size_t)NH*MHD * sizeof(float));
+        else    matmul(out, o_concat, lw->attn_output, NH*MHD, D, lw->type_attn_output);
     }
 }
 
@@ -1326,7 +1433,7 @@ float *model_forward_glm5(model_t *m, int token, int pos)
         if (glm5_noattn_enabled()) {
             memset(attn_out, 0, (size_t)D * sizeof(float));
         } else if (mla_ord >= 0) {
-            glm5_mla_forward(m, gw, lw, s, s->glm5.cur, pos, c->max_seq_len, il, mla_ord, attn_out);
+            glm5_mla_forward(m, gw, lw, s, s->glm5.cur, pos, c->max_seq_len, il, mla_ord, attn_out, NULL);
         } else {
             glm5_kda_forward(m, gw, lw, s, s->glm5.cur, pos, il, attn_out);
         }
@@ -1788,11 +1895,73 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
             }
 
             if (mla_ord >= 0) {
-                /* MLA: per-token (attention over the growing latent cache) */
-                for (int t = 0; t < n_tokens && (!interrupt || !*interrupt); t++) {
-                    glm5_mla_forward(m, gw, lw, s, cur_b + (size_t)t*D,
-                                     start_pos + t, c->max_seq_len, il, mla_ord,
-                                     attn_b + (size_t)t*D);
+                /* MLA: batch the weight-bound projections across the token
+                 * batch, then run the per-token attention core.
+                 *
+                 * Plane reuse: the qkv plane (3*DI = 24576 floats) already
+                 * exists and is unused on MLA layers, so carve q (NH*MHD=16384),
+                 * qr (QL=1536) and kv (KVL=512) out of it -- 18432 floats, fits.
+                 * qabs (NH*KVL=32768) is per-token-only (attention consumes it
+                 * immediately) so it lives in one shared scratch instead of an
+                 * [n_tokens] plane: 64 MB at 512 tokens would dwarf the arena.
+                 *
+                 * The whole batch's latents must be in the cache BEFORE any
+                 * attention runs, which is exactly what this ordering gives:
+                 * glm5_mla_project_batch() fills kv_b, we store all of it, then
+                 * the attention loop reads the cache. */
+                {
+                    const int NH = c->n_heads;
+                    const int QL = c->glm5_q_lora;
+                    const int KVL = c->glm5_kv_lora;
+                    const int MHD = c->glm5_mla_head_dim;
+                    const int QD = NH * MHD;
+                    float *qr_plane = pf + s->glm5.pf_mla_qr_off;   /* [N][QL] */
+                    float *q_plane  = pf + s->glm5.pf_mla_q_off;    /* [N][QD] */
+                    float *o_plane  = pf + s->glm5.pf_mla_o_off;    /* [N][QD] */
+                    float *kv_plane = pf + s->glm5.pf_mla_kv_off;   /* [N][KVL] */
+                    /* qabs is per-token-only, so one shared [NH*KVL] buffer. It
+                     * must be its own allocation: putting it in kda_scratch ran
+                     * past the end of that buffer (8*DI + NH*KVL = 98304 vs the
+                     * 82112 it owns) and into the KDA state. */
+                    static float *qabs_sh = NULL;
+                    if (!qabs_sh) qabs_sh = malloc((size_t)NH*KVL*sizeof(float));
+
+                    glm5_mla_project_batch(m, gw, cur_b, n_tokens,
+                                           qr_plane, q_plane, kv_plane);
+
+                    /* Store the whole batch's latents first (causality: token t
+                     * must not see t+1, but must see 0..t). */
+                    {
+                        float *cache = s->glm5.mla_kv
+                                     + (size_t)mla_ord * c->max_seq_len * KVL;
+                        for (int t = 0; t < n_tokens; t++)
+                            memcpy(cache + (size_t)(start_pos + t) * KVL,
+                                   kv_plane + (size_t)t*KVL, KVL * sizeof(float));
+                    }
+
+                    for (int t = 0; t < n_tokens && (!interrupt || !*interrupt); t++) {
+                        /* qabs[h] = Wk_b[h] @ q_t[h*MHD .. )  -> [KVL] */
+                        const float *q_t = q_plane + (size_t)t*QD;
+                        const uint8_t *kb = (const uint8_t *)gw->mla_k_b;
+                        size_t k_row_sz = gguf_type_row_size(gw->type_mla_k_b, MHD);
+                        size_t k_head_sz = (size_t)KVL * k_row_sz;
+                        for (int h = 0; h < NH; h++)
+                            matmul(qabs_sh + (size_t)h*KVL, q_t + (size_t)h*MHD,
+                                   kb + h*k_head_sz, MHD, KVL, gw->type_mla_k_b);
+
+                        glm5_mla_pre_t pre = {
+                            qr_plane + (size_t)t*QL,
+                            q_t,
+                            qabs_sh,
+                            kv_plane + (size_t)t*KVL,
+                        };
+                        glm5_mla_forward(m, gw, lw, s, cur_b + (size_t)t*D,
+                                         start_pos + t, c->max_seq_len, il, mla_ord,
+                                         o_plane + (size_t)t*QD, &pre);
+                    }
+                    /* Batched attention output projection: [N][NH*MHD] -> [N][D]. */
+                    matmul_batch(attn_b, o_plane, n_tokens, lw->attn_output,
+                                 QD, D, lw->type_attn_output);
                 }
             } else {
                 /* KDA: batch the weight-bound projections, then run the
