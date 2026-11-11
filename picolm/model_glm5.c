@@ -1383,6 +1383,31 @@ static void glm5_dense_ffn(const model_t *m, const layer_weights_t *lw,
     { char t[96]; snprintf(t, sizeof(t), "x.ffn.dense.out"); glm5_stats(t, out, D); }
 }
 
+/* GLM-5 shared expert: ungated SwiGLU, added to `out` (no routing weight).
+ * Split out so the batched MoE can reuse it verbatim. */
+static void glm5_moe_shared_expert(const model_t *m, const layer_weights_t *lw,
+                                   run_state_t *s, const float *cur, float *out,
+                                   int SFF)
+{
+    const model_config_t *c = &m->config;
+    const int D = c->n_embd;
+    const float clamp_v = glm5_clamp_value(c);
+
+    matmul(s->hb_exp, cur, lw->ffn_gate_shexp, D, SFF, lw->type_ffn_gate_shexp);
+    matmul(s->hb2_exp, cur, lw->ffn_up_shexp, D, SFF, lw->type_ffn_up_shexp);
+    for (int i = 0; i < SFF; i++) {
+        float g = s->hb_exp[i];
+        float u = s->hb2_exp[i];
+        if (clamp_v > 0.0f) {
+            g = fminf(g, clamp_v);
+            u = fminf(fmaxf(u, -clamp_v), clamp_v);
+        }
+        s->hb_exp[i] = g / (1.0f + expf(-g)) * u;
+    }
+    matmul(s->glm5.moe_down, s->hb_exp, lw->ffn_down_shexp, SFF, D, lw->type_ffn_down_shexp);
+    for (int i = 0; i < D; i++) out[i] += s->glm5.moe_down[i];
+}
+
 static void glm5_moe_ffn(const model_t *m, const glm5_layer_weights_t *gw,
                          const layer_weights_t *lw, run_state_t *s,
                          const float *cur, float *out)
@@ -1474,24 +1499,220 @@ static void glm5_moe_ffn(const model_t *m, const glm5_layer_weights_t *gw,
 
     /* shared expert (no sigmoid gate for GLM-5) */
     if (lw->ffn_gate_shexp) {
-        matmul(s->hb_exp, cur, lw->ffn_gate_shexp, D, SFF, lw->type_ffn_gate_shexp);
-        matmul(s->hb2_exp, cur, lw->ffn_up_shexp, D, SFF, lw->type_ffn_up_shexp);
-        for (int i = 0; i < SFF; i++) {
-            float g = s->hb_exp[i];
-            float u = s->hb2_exp[i];
-            if (clamp_v > 0.0f) {
-                g = fminf(g, clamp_v);
-                u = fminf(fmaxf(u, -clamp_v), clamp_v);
-            }
-            s->hb_exp[i] = g / (1.0f + expf(-g)) * u;
-        }
-        matmul(s->glm5.moe_down, s->hb_exp, lw->ffn_down_shexp, SFF, D, lw->type_ffn_down_shexp);
+        glm5_moe_shared_expert(m, lw, s, cur, out, SFF);
         snprintf(t, sizeof(t), "x.moe.shexp");
         glm5_stats(t, s->glm5.moe_down, D);
-        for (int i = 0; i < D; i++) out[i] += s->glm5.moe_down[i];
     }
     glm5_stats("x.moe.out", out, D);
     glm5_chk("x.moe.out", out, D, -1e4f, 1e4f);
+}
+
+/* Batched MoE for prefill.
+ *
+ * The per-token glm5_moe_ffn() reads 8 experts (165 MB) per token. With 288
+ * experts and top-8, a 110-token prefill selects essentially ALL of them, so
+ * the same expert weights get streamed ~3x. Sorting tokens by expert lets each
+ * expert's weights be read once and GEMM'd against all its tokens.
+ *
+ * Routing semantics are IDENTICAL to glm5_moe_ffn() and stay per token:
+ * sigmoid for the weight, +bias for selection only, renormalise, * moe_scale,
+ * ungated shared expert. Only the expert loop is restructured.
+ *
+ * Note the sorted group is small -- n_tokens*topk/n_expert is ~3 at 110 tokens
+ * -- so this does NOT become a big GEMM. The win is purely reading each
+ * expert's weights once instead of once per selecting token; matmul_batch at
+ * n_batch=3 still uses the same vec_dot kernels as the per-token path.
+ *
+ * TODO(unexplained long-generation divergence):
+ *   With PICOLM_GLM5_MOE_PERTOKEN as the A/B switch, generated output is
+ *   identical up to ~20 tokens but diverges at >=40 on some prompts, e.g.
+ *
+ *     -pf "Write a C function that reverses a string in place, with a brief
+ *          explanation." -n 120 -c 512 -t 0 -j 24 --prefault
+ *
+ *   The two outputs differ only by one blank line after
+ *   `if (str == NULL) return;` -- i.e. a single token -- and then re-converge.
+ *
+ *   THIS IS NOT (directly) THIS FUNCTION. Measured with the same
+ *   worst_rel-vs-glm5_moe_ffn() instrumentation that proved the batching
+ *   exact: the batched MoE output is BIT-IDENTICAL (worst_rel == 0, every
+ *   layer, prefill AND generation steps). So the divergence is upstream or
+ *   downstream of the MoE, and only becomes visible once generation is long
+ *   enough to reach a near-tied token (see the workplan's sensitivity table:
+ *   a 1e-6 perturbation moves logits ~8% on this model).
+ *
+ *   Prime suspect: the batched MLA attention in glm5_mla_attn_batch(), which
+ *   was vectorised and re-ordered in the same session. It has NOT been checked
+ *   against the per-token core the same way the MoE was.
+ *
+ *   What to do: add the worst_rel instrumentation to glm5_mla_attn_batch() vs
+ *   the per-token attention path (compare ctx_b per token, and qabs_b), at
+ *   prefill positions past ~20 tokens. Then either clear the MLA path or fix
+ *   it. Do NOT "fix" this by loosening the comparison -- first establish
+ *   whether it is a real defect or float reassociation, because the two need
+ *   opposite responses.
+ */
+static void glm5_moe_ffn_batch(const model_t *m, const glm5_layer_weights_t *gw,
+                               const layer_weights_t *lw, run_state_t *s,
+                               const float *cur_b, float *out_b, int n_tokens)
+{
+    const model_config_t *c = &m->config;
+    const int D = c->n_embd;
+    const int NE = c->n_expert;
+    const int AK = c->n_expert_used;
+    const int FF = c->n_ff_exp;
+    const float clamp_v = glm5_clamp_value(c);
+    const int NT = n_tokens;
+
+    /* Per-token routing, exactly as glm5_moe_ffn(). */
+    int   *sel_all = malloc((size_t)NT * AK * sizeof(int));
+    float *wts_all = malloc((size_t)NT * AK * sizeof(float));
+    float *probs   = malloc((size_t)NE * sizeof(float));
+    int   *count   = calloc((size_t)NE + 1, sizeof(int));
+    int   *cursor  = malloc(((size_t)NE + 1) * sizeof(int));
+    int   *bucket  = malloc((size_t)NT * AK * sizeof(int));   /* (t,slot) pairs */
+    float *gu      = malloc((size_t)NT * AK * FF * sizeof(float));  /* gate/up staging */
+    float *gu2     = malloc((size_t)NT * AK * FF * sizeof(float));
+    float *dwn     = malloc((size_t)NT * AK * D * sizeof(float));   /* per-slot down out */
+    float *slot_out= calloc((size_t)NT * AK * D, sizeof(float));    /* [t][slot][D] */
+    float *xbuf    = malloc((size_t)NT * D * sizeof(float));        /* per-expert gather buf */
+    /* All-or-nothing: every buffer is in this one check. xbuf used to be
+     * allocated later and tested with `if (xbuf)`, so an OOM there silently
+     * skipped every routed expert and produced wrong output with no error. */
+    if (!sel_all || !wts_all || !probs || !count || !cursor || !bucket
+        || !gu || !gu2 || !dwn || !slot_out || !xbuf) {
+        free(sel_all); free(wts_all); free(probs); free(count); free(cursor);
+        free(bucket); free(gu); free(gu2); free(dwn); free(slot_out); free(xbuf);
+        /* Fall back to the per-token path rather than producing garbage.
+         * glm5_moe_ffn() zeroes `out` itself, so no pre-clearing is needed. */
+        for (int t = 0; t < NT; t++)
+            glm5_moe_ffn(m, gw, lw, s, cur_b + (size_t)t*D, out_b + (size_t)t*D);
+        return;
+    }
+
+    for (int t = 0; t < NT; t++) {
+        const float *cur = cur_b + (size_t)t*D;
+        float *logits = s->expert_logits;
+        matmul(logits, cur, lw->ffn_gate_inp, D, NE, lw->type_ffn_gate_inp);
+        for (int i = 0; i < NE; i++) logits[i] = 1.0f / (1.0f + expf(-logits[i]));
+        memcpy(probs, logits, (size_t)NE * sizeof(float));
+        if (gw->exp_probs_b) {
+            const float *bias = (const float *)gw->exp_probs_b;
+            for (int i = 0; i < NE; i++) logits[i] += bias[i];
+        }
+        for (int k = 0; k < AK; k++) {
+            int best = -1; float bv = -1e30f;
+            for (int i = 0; i < NE; i++)
+                if (logits[i] > bv) { bv = logits[i]; best = i; }
+            sel_all[t*AK + k] = best;
+            logits[best] = -1e30f;
+        }
+        float sum = 0.f;
+        for (int k = 0; k < AK; k++) { wts_all[t*AK+k] = probs[sel_all[t*AK+k]]; sum += wts_all[t*AK+k]; }
+        float sc2 = (1.0f / sum) * c->glm5_moe_scale;
+        for (int k = 0; k < AK; k++) wts_all[t*AK+k] *= sc2;
+        for (int k = 0; k < AK; k++) count[sel_all[t*AK+k]]++;
+    }
+
+    /* Bucket (t, slot) by expert: counting sort, stable enough (order within a
+     * bucket does not matter -- each entry writes its own output row). */
+    {
+        int acc = 0;
+        for (int e = 0; e < NE; e++) { cursor[e] = acc; acc += count[e]; }
+        memset(count, 0, (size_t)NE * sizeof(int));
+        for (int t = 0; t < NT; t++)
+            for (int k = 0; k < AK; k++) {
+                int e = sel_all[t*AK+k];
+                int pos = cursor[e] + count[e]++;
+                bucket[pos] = t*AK + k;
+            }
+    }
+
+    /* Accumulators start at zero: routed experts and the shared expert both
+     * do out[j] += ... */
+    memset(out_b, 0, (size_t)NT * D * sizeof(float));
+
+    size_t gate_stride = (size_t)FF * gguf_type_row_size(lw->type_ffn_gate_exps, D);
+    size_t down_stride = (size_t)D * gguf_type_row_size(lw->type_ffn_down_exps, FF);
+
+    /* Gather activations for one expert into a contiguous [count][D] block so
+     * the GEMM reads them contiguously too. */
+    {
+        for (int e = 0; e < NE; e++) {
+            int n_e = count[e];
+            if (n_e <= 0) continue;
+            const int *bk = bucket + cursor[e];
+            for (int i = 0; i < n_e; i++)
+                memcpy(xbuf + (size_t)i*D, cur_b + (size_t)(bk[i]/AK)*D,
+                       (size_t)D * sizeof(float));
+
+            const void *gate_w = (const uint8_t *)lw->ffn_gate_exps + (size_t)e * gate_stride;
+            const void *up_w   = (const uint8_t *)lw->ffn_up_exps   + (size_t)e * gate_stride;
+            const void *down_w = (const uint8_t *)lw->ffn_down_exps + (size_t)e * down_stride;
+
+            /* One read of this expert's gate+up, GEMM'd against all its tokens.
+             *
+             * n_e == 1 goes through matmul() rather than matmul_batch(): the
+             * two pick different kernels for a single column (fn_gemv vs
+             * threaded_worker), which was enough to shift the MoE output by
+             * 7e-8 and, after 45 layers of amplification, flip a near-tied
+             * token away from the verified per-token output. Single-token
+             * buckets are also the common case for a small prompt, so this
+             * costs nothing -- the win comes from the n_e >= 2 buckets. */
+            if (n_e == 1) {
+                matmul(gu,  xbuf, gate_w, D, FF, lw->type_ffn_gate_exps);
+                matmul(gu2, xbuf, up_w,   D, FF, lw->type_ffn_up_exps);
+            } else {
+                matmul_batch(gu,  xbuf, n_e, gate_w, D, FF, lw->type_ffn_gate_exps);
+                matmul_batch(gu2, xbuf, n_e, up_w,   D, FF, lw->type_ffn_up_exps);
+            }
+
+            for (int i = 0; i < n_e; i++) {
+                float *g = gu  + (size_t)i*FF;
+                float *u = gu2 + (size_t)i*FF;
+                for (int j = 0; j < FF; j++) {
+                    float gv = g[j], uv = u[j];
+                    if (clamp_v > 0.0f) {
+                        gv = fminf(gv, clamp_v);
+                        uv = fminf(fmaxf(uv, -clamp_v), clamp_v);
+                    }
+                    g[j] = gv / (1.0f + expf(-gv)) * uv;
+                }
+            }
+            if (n_e == 1) matmul(dwn, gu, down_w, FF, D, lw->type_ffn_down_exps);
+            else          matmul_batch(dwn, gu, n_e, down_w, FF, D, lw->type_ffn_down_exps);
+            /* Stash per (token, slot) instead of accumulating now. Expert-sorted
+             * order differs from the reference's slot order, and adding eight
+             * 4096-long vectors in a different order changes the float result
+             * by ~1 ulp -- enough, after 45 layers, to flip near-tied tokens and
+             * (measured) turn "2+2?" into a repetition loop. Summing in slot
+             * order afterwards reproduces the per-token path exactly. */
+            for (int i = 0; i < n_e; i++) {
+                int ts = bk[i];
+                memcpy(slot_out + (size_t)ts*D, dwn + (size_t)i*D,
+                       (size_t)D * sizeof(float));
+            }
+        }
+    }
+
+    /* Reduce slots in order 0..AK-1, exactly like the per-token path. */
+    for (int t = 0; t < NT; t++)
+        for (int k = 0; k < AK; k++) {
+            float w = wts_all[t*AK+k];
+            const float *dd = slot_out + ((size_t)t*AK + k)*D;
+            float *o = out_b + (size_t)t*D;
+            for (int j = 0; j < D; j++) o[j] += w * dd[j];
+        }
+
+    /* Shared expert, still per token (1/8 the flops, 36 ms/layer total). */
+    if (lw->ffn_gate_shexp) {
+        const int SFF = c->n_ff_shexp;
+        for (int t = 0; t < NT; t++)
+            glm5_moe_shared_expert(m, lw, s, cur_b + (size_t)t*D, out_b + (size_t)t*D, SFF);
+    }
+
+    free(sel_all); free(wts_all); free(probs); free(count); free(cursor);
+    free(bucket); free(gu); free(gu2); free(dwn); free(slot_out); free(xbuf);
 }
 
 /* ------------------------------------------------------------------ */
@@ -2275,14 +2496,25 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                 rmsnorm(cur_t, cur_t, s->post_attn_norm_w[il], D, c->rms_norm_eps);
             }
 
-            /* Phase B': FFN / MoE per token (routing is per-token) */
-            for (int t = 0; t < n_tokens; t++) {
-                float *cur_t  = cur_b + (size_t)t*D;
-                float *attn_t = attn_b + (size_t)t*D;
-                if (il < c->n_layer_dense_lead)
-                    glm5_dense_ffn(m, lw, s, cur_t, attn_t);
-                else
-                    glm5_moe_ffn(m, gw, lw, s, cur_t, attn_t);
+            /* Phase B': FFN / MoE.
+             *
+             * Dense layers stay per token (only 3 of them, and n_ffn=12288 is
+             * a single big GEMM per token anyway). MoE prefill goes through
+             * the expert-sorted batched path: at 110 tokens essentially all
+             * 288 experts are selected, so the per-token loop streamed each
+             * expert's weights ~3x. Routing stays per token; only the expert
+             * loop is restructured. */
+            /* NOTE: there is an unexplained long-generation divergence that is
+             * NOT caused by this batching -- see the TODO above
+             * glm5_moe_ffn_batch(). */
+            if (il < c->n_layer_dense_lead) {
+                for (int t = 0; t < n_tokens; t++)
+                    glm5_dense_ffn(m, lw, s, cur_b + (size_t)t*D, attn_b + (size_t)t*D);
+            } else if (n_tokens > 1 && !getenv("PICOLM_GLM5_MOE_PERTOKEN")) {
+                glm5_moe_ffn_batch(m, gw, lw, s, cur_b, attn_b, n_tokens);
+            } else {
+                for (int t = 0; t < n_tokens; t++)
+                    glm5_moe_ffn(m, gw, lw, s, cur_b + (size_t)t*D, attn_b + (size_t)t*D);
             }
 
             /* Phase D': hc_post(ffn) per token */
