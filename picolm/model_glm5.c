@@ -1293,6 +1293,7 @@ float *model_forward_glm5(model_t *m, int token, int pos)
         const layer_weights_t *lw = &w->layers[il];
         const glm5_layer_weights_t *gw = &w->glm5[il];
         int mla_ord = c->glm5_layer_mla_ord[il];  /* -1 for KDA layers */
+        BENCH_LAYER_START();
         snprintf(lt, sizeof(lt), "l%02d", il);
 
         /* ---- attention block ---- */
@@ -1372,6 +1373,8 @@ float *model_forward_glm5(model_t *m, int token, int pos)
             fprintf(stderr, "GLM5 l%02d ffn  %s: f_rms=%.4f x_rms=%.4f\n",
                     il, il < c->n_layer_dense_lead ? "dense" : "moe",
                     glm5_rms(s->glm5.attn_out, D), glm5_rms(s->glm5.hc_x, S*D));
+
+        BENCH_LAYER_END(il, 0);
 
         if (stop_layer >= 0 && il >= stop_layer) {
             if (glm5_dbg_enabled())
@@ -1768,6 +1771,7 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
             const layer_weights_t *lw = &w->layers[il];
             const glm5_layer_weights_t *gw = &w->glm5[il];
             int mla_ord = c->glm5_layer_mla_ord[il];
+            BENCH_LAYER_START();
             /* ============ Attention block ============ */
 
             /* Phase A: hc_pre(attn) + RMSNorm, per token. Saves hc_res,
@@ -1893,10 +1897,12 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
             }
 #endif
             if (stop_layer >= 0 && il >= stop_layer) {
+                BENCH_LAYER_END(il, 1);
                 if (glm5_dbg_enabled())
                     fprintf(stderr, "GLM5 prefill: stopping after layer %d (PICOLM_STOP_LAYER)\n", il);
                 break;
             }
+            BENCH_LAYER_END(il, 1);
         }
 
         /* ---- Final: mean over S streams -> RMSNorm -> output head ---- */
