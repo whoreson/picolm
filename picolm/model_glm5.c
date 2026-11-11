@@ -14,6 +14,7 @@
 #include "model.h"
 #include "model_internal.h"
 #include "tensor.h"
+#include "quant.h"
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
@@ -823,6 +824,139 @@ static void glm5_mla_project_batch(
      * The per-token loop computes it into one shared [NH*KVL] scratch. */
 }
 
+/* dst[i] += s * src[i], vectorised.
+ *
+ * The MLA ctx accumulation is a weighted sum over cache positions; written as a
+ * scalar loop it was half of the 4.6 s the MLA attention spent per 120-token
+ * prefill. Kept local because nothing else in the tree needs exactly this
+ * signature (tensor.c has vec_add / elemwise_mul, neither with a scale). */
+static void vec_scale_acc_f32(float *dst, const float *src, float s, int n) {
+    int i = 0;
+#if defined(PICOLM_AVX512)
+    {
+        const __m512 vs = _mm512_set1_ps(s);
+        for (; i + 15 < n; i += 16)
+            _mm512_storeu_ps(dst + i,
+                _mm512_fmadd_ps(vs, _mm512_loadu_ps(src + i),
+                                _mm512_loadu_ps(dst + i)));
+    }
+#elif defined(PICOLM_AVX2) || defined(PICOLM_AVX)
+    {
+        const __m256 vs = _mm256_set1_ps(s);
+        for (; i + 7 < n; i += 8)
+            _mm256_storeu_ps(dst + i,
+                _mm256_fmadd_ps(vs, _mm256_loadu_ps(src + i),
+                                _mm256_loadu_ps(dst + i)));
+    }
+#elif defined(PICOLM_NEON)
+    {
+        const float32x4_t vs = vdupq_n_f32(s);
+        for (; i + 3 < n; i += 4)
+            vst1q_f32(dst + i, vmlaq_f32(vld1q_f32(dst + i), vs, vld1q_f32(src + i)));
+    }
+#endif
+    for (; i < n; i++) dst[i] += s * src[i];
+}
+
+/* Batched MLA attention over the latent cache (prefill, dense/DSA-free).
+ *
+ * The per-token core does, for one token: for each of NH heads, dot its
+ * absorbed q against every cached position, softmax, then accumulate the
+ * cache into ctx. Written per token that is NH * (pos+1) separate KVL-wide
+ * dots and re-reads the whole cache once per head -- measured at 2.2 GFLOP/s,
+ * 84% of all MLA time.
+ *
+ * Here the token loop is inverted: each (head, token-chunk) pair becomes one
+ * task, so
+ *   - the cache row is read once and used for every token in the chunk,
+ *   - the work is spread over the thread pool instead of one core,
+ *   - the causal mask is just a per-token bound (t <= pos), so no mask tensor.
+ *
+ * Only valid when there is no DSA selection: with `sel` non-empty the sparse
+ * index list is per token and the per-token core is used instead (DSA measured
+ * 0.0% of MLA time at 120 tokens, so this is not a hot path today).
+ *
+ * qabs_b is [n_tokens][NH*KVL]; ctx_b is [n_tokens][NH*KVL].
+ */
+typedef struct {
+    const float *qabs;    /* [n_tokens][NH*KVL] */
+    const float *cache;   /* [max_seq][KVL] for this MLA ordinal */
+    float       *ctx;     /* [n_tokens][NH*KVL] */
+    float       *scores;  /* task scratch [n_tasks][scores_stride] */
+    int n_tokens, start_pos, NH, KVL, n_chunk, n_chunks, scores_stride;
+    float scale;
+} mla_attn_ctx_t;
+
+static void mla_attn_task(int idx, void *vp) {
+    mla_attn_ctx_t *c = (mla_attn_ctx_t *)vp;
+    const int NH = c->NH, KVL = c->KVL;
+    const int h  = idx / c->n_chunks;              /* head */
+    const int t0 = (idx % c->n_chunks) * c->n_chunk;  /* token chunk base */
+    int t1 = t0 + c->n_chunk;
+    if (t1 > c->n_tokens) t1 = c->n_tokens;
+
+    for (int t = t0; t < t1; t++) {
+        const float *qh = c->qabs + (size_t)t*NH*KVL + (size_t)h*KVL;
+        float *ch = c->ctx + (size_t)t*NH*KVL + (size_t)h*KVL;
+        float *sc = c->scores + (size_t)idx * c->scores_stride;
+        const int n_kv = c->start_pos + t + 1;   /* causal bound */
+
+        float mx = -INFINITY;
+        for (int p = 0; p < n_kv; p++) {
+            float d = vec_dot_f32_f32(c->cache + (size_t)p*KVL, qh, KVL) * c->scale;
+            sc[p] = d;
+            if (d > mx) mx = d;
+        }
+        float sum = 0.f;
+        for (int p = 0; p < n_kv; p++) { sc[p] = expf(sc[p] - mx); sum += sc[p]; }
+        const float inv = 1.0f / sum;
+
+        memset(ch, 0, (size_t)KVL * sizeof(float));
+        for (int p = 0; p < n_kv; p++) {
+            const float w = sc[p] * inv;
+            if (w < 1e-10f) continue;
+            vec_scale_acc_f32(ch, c->cache + (size_t)p*KVL, w, KVL);
+        }
+    }
+}
+
+static void glm5_mla_attn_batch(
+    const model_config_t *c, run_state_t *s, int mla_ord,
+    const float *qabs_b, float *ctx_b, int n_tokens, int start_pos)
+{
+    const int NH = c->n_heads;
+    const int KVL = c->glm5_kv_lora;
+    const float scale = 1.0f / sqrtf((float)c->glm5_mla_head_dim);
+    const float *cache = s->glm5.mla_kv + (size_t)mla_ord * c->max_seq_len * KVL;
+
+    /* One scores row per task: the pool runs tasks in parallel and each needs
+     * its own [max_seq] scratch. Aim for ~4x as many tasks as threads so a slow
+     * one does not stall the barrier. */
+    int nth = 24;
+    int n_chunk = (n_tokens > 0) ? (n_tokens * 4 + nth - 1) / nth : 1;
+    if (n_chunk < 1) n_chunk = 1;
+    const int n_chunks = (n_tokens + n_chunk - 1) / n_chunk;
+    const int n_tasks = NH * n_chunks;
+
+    static float *scores_pool = NULL;
+    static size_t scores_pool_n = 0;
+    size_t need = (size_t)n_tasks * (size_t)c->max_seq_len;
+    if (scores_pool_n < need) {
+        free(scores_pool);
+        scores_pool = malloc(need * sizeof(float));
+        scores_pool_n = scores_pool ? need : 0;
+    }
+    if (!scores_pool) return;   /* caller falls back to the per-token core */
+
+    mla_attn_ctx_t ctx = { qabs_b, cache, ctx_b, scores_pool,
+                           n_tokens, start_pos, NH, KVL, n_chunk, n_chunks,
+                           c->max_seq_len, scale };
+    /* tensor_parallel_for passes the task index, so the task itself picks its
+     * scores slice; it must be told where the pool starts. */
+    ctx.scores = scores_pool;
+    tensor_parallel_for(n_tasks, mla_attn_task, &ctx);
+}
+
 /* Per-token MLA core.
  *
  * `pre` is optional. When non-NULL the caller has already run
@@ -963,21 +1097,20 @@ static void glm5_mla_forward(
             const float *qh = qabs_p + h * KVL;
             float mx = -INFINITY, sum = 0.f;
 
-            /* scores over the selected cells (or every cell when dense) */
+            /* scores over the selected cells (or every cell when dense).
+             * vec_dot_f32_f32 is the SIMD f32 dot kernel (AVX-512/AVX2/NEON/
+             * scalar). A hand-rolled `for (i) acc += q[i]*k[i]` here ran at
+             * 2.2 GFLOP/s -- the compiler does not vectorise this loop well
+             * because of the `mx` max-chase next to it. */
             if (dense) {
                 for (int t = 0; t < n_kv; t++) {
-                    const float *kt = cache + (size_t)t * KVL;
-                    float dot = 0.f;
-                    for (int i = 0; i < KVL; i++) dot += qh[i] * kt[i];
+                    float dot = vec_dot_f32_f32(cache + (size_t)t * KVL, qh, KVL);
                     scores[t] = dot * scale;
                     if (scores[t] > mx) mx = scores[t];
                 }
             } else {
                 for (int k = 0; k < n_sel; k++) {
-                    const int t = sel[k];
-                    const float *kt = cache + (size_t)t * KVL;
-                    float dot = 0.f;
-                    for (int i = 0; i < KVL; i++) dot += qh[i] * kt[i];
+                    float dot = vec_dot_f32_f32(cache + (size_t)sel[k] * KVL, qh, KVL);
                     scores[k] = dot * scale;
                     if (scores[k] > mx) mx = scores[k];
                 }
@@ -998,15 +1131,13 @@ static void glm5_mla_forward(
                 for (int t = 0; t < n_kv; t++) {
                     const float p = scores[t] * inv;
                     if (p < 1e-10f) continue;
-                    const float *kt = cache + (size_t)t * KVL;
-                    for (int i = 0; i < KVL; i++) ch[i] += p * kt[i];
+                    vec_scale_acc_f32(ch, cache + (size_t)t * KVL, p, KVL);
                 }
             } else {
                 for (int k = 0; k < n_sel; k++) {
                     const float p = scores[k] * inv;
                     if (p < 1e-10f) continue;
-                    const float *kt = cache + (size_t)sel[k] * KVL;
-                    for (int i = 0; i < KVL; i++) ch[i] += p * kt[i];
+                    vec_scale_acc_f32(ch, cache + (size_t)sel[k] * KVL, p, KVL);
                 }
             }
         }
@@ -1923,9 +2054,6 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                      * must be its own allocation: putting it in kda_scratch ran
                      * past the end of that buffer (8*DI + NH*KVL = 98304 vs the
                      * 82112 it owns) and into the KDA state. */
-                    static float *qabs_sh = NULL;
-                    if (!qabs_sh) qabs_sh = malloc((size_t)NH*KVL*sizeof(float));
-
                     glm5_mla_project_batch(m, gw, cur_b, n_tokens,
                                            qr_plane, q_plane, kv_plane);
 
@@ -1939,25 +2067,138 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                                    kv_plane + (size_t)t*KVL, KVL * sizeof(float));
                     }
 
-                    for (int t = 0; t < n_tokens && (!interrupt || !*interrupt); t++) {
-                        /* qabs[h] = Wk_b[h] @ q_t[h*MHD .. )  -> [KVL] */
-                        const float *q_t = q_plane + (size_t)t*QD;
-                        const uint8_t *kb = (const uint8_t *)gw->mla_k_b;
-                        size_t k_row_sz = gguf_type_row_size(gw->type_mla_k_b, MHD);
-                        size_t k_head_sz = (size_t)KVL * k_row_sz;
-                        for (int h = 0; h < NH; h++)
-                            matmul(qabs_sh + (size_t)h*KVL, q_t + (size_t)h*MHD,
-                                   kb + h*k_head_sz, MHD, KVL, gw->type_mla_k_b);
+                    /* qabs for the whole batch: qabs[t][h] = Wk_b[h] @ q_t[h].
+                     * Not a persistent arena plane -- see the qabs note above;
+                     * it is consumed immediately by the attention below. */
+                    {
+                        static float *qabs_b = NULL;
+                        static size_t qabs_b_n = 0;
+                        size_t need = (size_t)NT * NH * KVL;
+                        if (qabs_b_n < need) {
+                            free(qabs_b);
+                            qabs_b = malloc(need * sizeof(float));
+                            qabs_b_n = qabs_b ? need : 0;
+                        }
+                        if (qabs_b) {
+                            /* Per-head [N][KVL] out of a batched [N][MHD] in:
+                             * matmul_batch writes out[t*d + row], so its output
+                             * stride would interleave heads. Run the 64 per-head
+                             * GEMMs over the batch instead -- Wk_b is 16 MB in
+                             * total and each head's slice is already resident. */
+                            const uint8_t *kb = (const uint8_t *)gw->mla_k_b;
+                            size_t k_row_sz = gguf_type_row_size(gw->type_mla_k_b, MHD);
+                            size_t k_head_sz = (size_t)KVL * k_row_sz;
+                            /* Per head, over ALL tokens: the head's weights
+                             * (104 KB) are read once instead of once per token
+                             * (that re-read was 1.6 GB/layer). matmul_batch
+                             * can't be used directly -- it writes out[t*d+row]
+                             * and we need [t][h] interleaving -- so the token
+                             * loop stays outside and the activation rows for one
+                             * head are gathered contiguously first. */
+                            for (int h = 0; h < NH; h++) {
+                                static float *qh_buf = NULL, *qh_dst = NULL;
+                                static size_t qh_n = 0;
+                                size_t qh_need = (size_t)NT * (MHD > KVL ? MHD : KVL);
+                                if (qh_n < qh_need) {
+                                    free(qh_buf); free(qh_dst);
+                                    qh_buf = malloc(qh_need * sizeof(float));
+                                    qh_dst = malloc(qh_need * sizeof(float));
+                                    qh_n = (qh_buf && qh_dst) ? qh_need : 0;
+                                }
+                                for (int t = 0; t < n_tokens; t++)
+                                    memcpy(qh_buf + (size_t)t*MHD,
+                                           q_plane + (size_t)t*QD + (size_t)h*MHD,
+                                           (size_t)MHD * sizeof(float));
+                                /* One GEMM: [N][MHD] x Wk_b[h] -> [N][KVL],
+                                 * then scatter into the [t][h] layout the
+                                 * attention reads. */
+                                matmul_batch(qh_dst, qh_buf, n_tokens,
+                                             kb + h*k_head_sz, MHD, KVL,
+                                             gw->type_mla_k_b);
+                                for (int t = 0; t < n_tokens; t++)
+                                    memcpy(qabs_b + ((size_t)t*NH + h)*KVL,
+                                           qh_dst + (size_t)t*KVL,
+                                           (size_t)KVL * sizeof(float));
+                            }
 
-                        glm5_mla_pre_t pre = {
-                            qr_plane + (size_t)t*QL,
-                            q_t,
-                            qabs_sh,
-                            kv_plane + (size_t)t*KVL,
-                        };
-                        glm5_mla_forward(m, gw, lw, s, cur_b + (size_t)t*D,
-                                         start_pos + t, c->max_seq_len, il, mla_ord,
-                                         o_plane + (size_t)t*QD, &pre);
+                            /* Attention over the latent cache, all tokens at
+                             * once. Only for the dense case: a DSA selection is
+                             * per token, so it keeps the per-token core. */
+                            int dense = 1;
+                            if (c->glm5_use_dsa && c->glm5_idx_kpool > 0 &&
+                                start_pos + n_tokens - 1 >= c->glm5_idx_kpool)
+                                dense = 0;
+
+                            static float *ctx_b = NULL;
+                            static size_t ctx_b_n = 0;
+                            if (!dense) ctx_b_n = 0;   /* forces per-token path */
+                            if (dense) {
+                                if (ctx_b_n < need) {
+                                    free(ctx_b);
+                                    ctx_b = malloc(need * sizeof(float));
+                                    ctx_b_n = ctx_b ? need : 0;
+                                }
+                                if (ctx_b)
+                                    glm5_mla_attn_batch(c, s, mla_ord, qabs_b, ctx_b,
+                                                        n_tokens, start_pos);
+                            }
+                            if (dense && ctx_b) {
+                                /* o[h] = Wv_b[h] @ ctx[h] per token */
+                                /* Same shape as qabs, same reasoning: per
+                                 * head over all tokens, so Wv_b's 104 KB per
+                                 * head is read once per layer not once per
+                                 * token. Gather ctx rows for the head, GEMM,
+                                 * scatter back to [t][h]. */
+                                const uint8_t *vb = (const uint8_t *)gw->mla_v_b;
+                                size_t v_row_sz = gguf_type_row_size(gw->type_mla_v_b, KVL);
+                                size_t v_head_sz = (size_t)MHD * v_row_sz;
+                                for (int h = 0; h < NH; h++) {
+                                    static float *vh_buf = NULL, *vh_dst = NULL;
+                                    static size_t vh_n = 0;
+                                    size_t vh_need = (size_t)NT * (MHD > KVL ? MHD : KVL);
+                                    if (vh_n < vh_need) {
+                                        free(vh_buf); free(vh_dst);
+                                        vh_buf = malloc(vh_need * sizeof(float));
+                                        vh_dst = malloc(vh_need * sizeof(float));
+                                        vh_n = (vh_buf && vh_dst) ? vh_need : 0;
+                                    }
+                                    if (!vh_buf || !vh_dst) break;
+                                    for (int t = 0; t < n_tokens; t++)
+                                        memcpy(vh_buf + (size_t)t*KVL,
+                                               ctx_b + ((size_t)t*NH + h)*KVL,
+                                               (size_t)KVL * sizeof(float));
+                                    matmul_batch(vh_dst, vh_buf, n_tokens,
+                                                 vb + h*v_head_sz, KVL, MHD,
+                                                 gw->type_mla_v_b);
+                                    for (int t = 0; t < n_tokens; t++)
+                                        memcpy(o_plane + (size_t)t*QD + (size_t)h*MHD,
+                                               vh_dst + (size_t)t*MHD,
+                                               (size_t)MHD * sizeof(float));
+                                }
+                            } else {
+                                /* DSA / allocation failure: per-token core. */
+                                for (int t = 0; t < n_tokens && (!interrupt || !*interrupt); t++) {
+                                    glm5_mla_pre_t pre = {
+                                        qr_plane + (size_t)t*QL,
+                                        q_plane + (size_t)t*QD,
+                                        qabs_b + (size_t)t*NH*KVL,
+                                        kv_plane + (size_t)t*KVL,
+                                    };
+                                    glm5_mla_forward(m, gw, lw, s, cur_b + (size_t)t*D,
+                                                     start_pos + t, c->max_seq_len,
+                                                     il, mla_ord,
+                                                     o_plane + (size_t)t*QD, &pre);
+                                }
+                            }
+                        } else {
+                            /* Could not allocate qabs: fall back to the
+                             * per-token core, which uses its own scratch. */
+                            for (int t = 0; t < n_tokens && (!interrupt || !*interrupt); t++)
+                                glm5_mla_forward(m, gw, lw, s, cur_b + (size_t)t*D,
+                                                 start_pos + t, c->max_seq_len,
+                                                 il, mla_ord,
+                                                 o_plane + (size_t)t*QD, NULL);
+                        }
                     }
                     /* Batched attention output projection: [N][NH*MHD] -> [N][D]. */
                     matmul_batch(attn_b, o_plane, n_tokens, lw->attn_output,
