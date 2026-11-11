@@ -1688,11 +1688,12 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
     /* Per-token planes into the prefill arena. */
     float *pf = s->glm5.prefill_buf;
     if (!pf || n_tokens > s->glm5.prefill_n_tokens) {
-        /* Arena missing or oversized chunk: per-token fallback.
-         * g_is_prefill is already set by the caller. */
+        /* Arena missing or oversized chunk: per-token fallback via the
+         * GLM-5 per-token forward (model_forward_glm5 is in this file,
+         * so the standalone test_glm5_dsa probe can link). */
         for (int i = 0; i < n_tokens; i++) {
             if (interrupt && *interrupt) break;
-            (void)model_forward(m, tokens[i], start_pos + i);
+            (void)model_forward_glm5(m, tokens[i], start_pos + i);
         }
         return s->logits;
     }
