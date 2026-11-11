@@ -153,6 +153,15 @@ simd_flags_for = $(strip \
           )))))
 
 # --- Default target: build with NATIVE_MARCH + auto-detected SIMD ---
+# IMPORTANT: DO NOT run "make picolm" directly. Use "make" or "make all".
+# "make picolm" bypasses the SIMD-enriched CFLAGS and produces a broken binary.
+# Only trap at top-level (MAKELEVEL=0), not in recursive sub-makes.
+ifeq ($(MAKELEVEL),0)
+ifeq (picolm,$(MAKECMDGOALS))
+  $(error Do not run 'make picolm' directly. Use 'make' or 'make all' to build with proper SIMD flags)
+endif
+endif
+
 .DEFAULT_GOAL := all
 .PHONY: all
 all:
