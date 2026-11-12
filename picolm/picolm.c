@@ -1312,6 +1312,9 @@ int main(int argc, char **argv) {
         return 0;
     }
     picolm_init_gelu_table();
+#ifdef PICOLM_PS
+    ps_init_gqr(); /* Set GQR7 to s8 for paired-singles intrinsics */
+#endif
     if (argc < 2) {
         usage(argv[0]);
         return 1;

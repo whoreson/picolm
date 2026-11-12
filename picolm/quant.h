@@ -1850,6 +1850,15 @@ __m256 picolm_exp256_ps(__m256 x);
 #define PICOLM_HAVE_EXP256 1
 #endif
 
+/* PowerPC paired-singles intrinsics (Broadway/WiiLinux).
+ * Requires GQR7 set to s8 type via ps_init_gqr() before first use. */
+#ifdef PICOLM_PS
+void ps_init_gqr(void);
+void ps_q8_row_dot(const int8_t *x, const int8_t *w, int n, float *out);
+void ps_qk4_s8(const float *q, const int8_t *k, int kv_dim, int pairs, float *out);
+void ps_axpy_s8(float *xb, const int8_t *v, float a, int octets);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

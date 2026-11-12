@@ -280,6 +280,10 @@ cross-riscv: $(TARGET)
 ppc:
 	$(MAKE) $(TARGET) CFLAGS="-O2 -g -std=c99 -D_DARWIN_C_SOURCE -D_GNU_SOURCE -Wall -maltivec -DPICOLM_ALTIVEC" LDFLAGS="-lm"
 
+# PowerPC 750-class (Broadway/WiiLinux): paired-singles intrinsics
+wii:
+	$(MAKE) $(TARGET) CFLAGS="-O2 -g -std=c99 -D_GNU_SOURCE -Wall -mcpu=750 -mhard-float -mpaired -DPICOLM_PS" LDFLAGS="-lm"
+
 iphoneos1:
 	$(MAKE) $(TARGET) CC=/usr/local/arm-apple-darwin-ios1/bin/arm-apple-darwin-gcc CFLAGS="-O2 -g -std=c99 -D_DARWIN_C_SOURCE -D_GNU_SOURCE -Wall -arch armv6" LDFLAGS="-lm"
 

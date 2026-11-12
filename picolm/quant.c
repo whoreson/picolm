@@ -4612,7 +4612,21 @@ float vec_dot_q8_0_q8_0(const void *qx, const void *qw, int n) {
     int nb = n / 32;
     float sumf = 0.0f;
     int i = 0;
-#if !defined(PICOLM_VNNI) && !defined(PICOLM_I8MM) && !defined(PICOLM_NEON) && !defined(PICOLM_AVX2) && !defined(PICOLM_AVX) && !defined(PICOLM_SSSE3)
+#if defined(PICOLM_PS)
+    /* PowerPC paired-singles: psq_l (int8->float) + ps_madd (2 FMA per instr).
+     * Processes 4 int8 pairs per loop iteration. Requires GQR7=s8 (ps_init_gqr).
+     * Adapted from iiama2.c (Broadway/Wii paired-singles). */
+    {
+        float block_sum;
+        for (i = 0; i < nb; i++) {
+            ps_q8_row_dot(x[i].qs, w[i].qs, 32, &block_sum);
+            float dx = fp16_to_fp32_lookup(x[i].d);
+            float dw = fp16_to_fp32_lookup(w[i].d);
+            sumf += block_sum * dx * dw;
+        }
+    }
+    return sumf;
+#elif !defined(PICOLM_VNNI) && !defined(PICOLM_I8MM) && !defined(PICOLM_NEON) && !defined(PICOLM_AVX2) && !defined(PICOLM_AVX) && !defined(PICOLM_SSSE3)
     /* Pure scalar path: no SIMD available */
     for (i = 0; i < nb; i++) {
         int sumi = 0;
@@ -5699,6 +5713,40 @@ float vec_dot_q8_0_f32(const void *src, const float *x, int n) {
         }
         sumf += d * hsum_sse(_mm_add_ps(acc0, acc1));
 
+#elif defined(PICOLM_PS)
+        /* PowerPC paired-singles: psq_l (int8->float) + psq_l (float) + ps_madd.
+         * Processes 4 elements per iteration. Requires GQR7=s8. */
+        {
+            float block_sum;
+            /* Process 32 elements = 8 iterations of 4 */
+            const int8_t *qs_aligned = qs;
+            const float *xp_aligned = xp;
+            /* Use ps_q8_row_dot but we need q and x as int8... no, x is float.
+             * We need a different intrinsic: psq_l for int8 (GQR7) + psq_l for float (GQR0). */
+            float s01, s23, qf, xf;
+            __asm__ volatile(
+                "psq_l %0, 0(%[zero]), 0, 0\n\t"
+                "ps_mr %1, %0\n\t"
+                "mtctr %[nq]\n"
+                "1:\n\t"
+                "psq_l %2, 0(%[qs]), 0, 7\n\t"  /* 2 int8 -> 2 float */
+                "psq_l %3, 0(%[xp]), 0, 0\n\t"  /* 2 float from x */
+                "ps_madd %0, %2, %3, %0\n\t"    /* acc += q*x */
+                "psq_l %2, 2(%[qs]), 0, 7\n\t"  /* next 2 int8 */
+                "psq_l %3, 8(%[xp]), 0, 0\n\t"  /* next 2 float */
+                "ps_madd %0, %2, %3, %0\n\t"    /* acc += q*x */
+                "addi %[qs], %[qs], 4\n\t"
+                "addi %[xp], %[xp], 16\n\t"
+                "bdnz 1b\n\t"
+                "ps_mr %2, %0\n\t"
+                "ps_swap %3, %0\n\t"
+                "ps_add %2, %2, %3\n\t"
+                "psq_st %2, 0(%[out]), 0, 0\n\t"
+                : "=&f"(s01), "=&f"(s23), "=&f"(qf), "=&f"(xf), "+b"(qs_aligned), "+b"(xp_aligned)
+                : [nq] "r"(8), [out] "b"(&block_sum)
+                : "ctr", "memory");
+            sumf += d * block_sum;
+        }
 #else
         /* Scalar fallback */
         {
@@ -8439,6 +8487,10 @@ void scale_add_q8_0_f32(float *dst, float scale, const void *src, int n) {
             acc = vld1q_f32(dp + j + 4);
             vst1q_f32(dp + j + 4, vmlaq_f32(acc, qf1, sd_v));
         }
+#elif defined(PICOLM_PS)
+        /* PowerPC paired-singles: psq_l int8->float + ps_madds0 with scale.
+         * dst[i] += sd * qs[i], 8 elements per iteration. */
+        ps_axpy_s8(dp, qs, sd, 4);
 #else
         for (int j = 0; j < 32; j++) {
             dp[j] += qs[j] * sd;
@@ -10527,3 +10579,123 @@ void vec_dot_r4_q8_k_dequant_ref(const void *vx, const void *vy, int n,
         out[r] = acc;
     }
 }
+
+/* ================================================================================
+ * PowerPC paired-singles intrinsics (Broadway/WiiLinux)
+ * ================================================================================
+ * Requires:
+ *   - PowerPC 750-class CPU with paired-singles support
+ *   - GQR7 set to s8 type: mtspr 919, 0x00060006
+ *   - 8-byte aligned pointers for psq_l
+ *
+ * Adapted from iiama2.c (MIT license). Guard: #ifdef PICOLM_PS
+ * ================================================================================ */
+
+#ifdef PICOLM_PS
+
+#define GQR_S8 0x00060006u
+
+void ps_init_gqr(void) {
+    __asm__ volatile("mtspr 919, %0" : : "r"(GQR_S8) : "memory");
+}
+
+void ps_q8_row_dot(const int8_t *x, const int8_t *w, int n, float *out) {
+    /* n must be a multiple of 4. Processes 4 int8 pairs per iteration.
+     * psq_l with GQR7=s8 loads 2 int8 -> 2 float, ps_madd does 2 FMAs. */
+    float s01, s23;
+    __asm__ volatile(
+        "psq_l %0, 0(%[zero]), 0, 0\n\t"
+        "ps_mr %1, %0\n\t"
+        "mtctr %[nq]\n"
+        "1:\n\t"
+        "psq_l %0, 0(%[x]), 0, 7\n\t"
+        "psq_l %1, 0(%[w]), 0, 7\n\t"
+        "ps_madd %2, %1, %0, %2\n\t"
+        "psq_l %0, 2(%[x]), 0, 7\n\t"
+        "psq_l %1, 2(%[w]), 0, 7\n\t"
+        "ps_madd %2, %1, %0, %2\n\t"
+        "addi %[x], %[x], 4\n\t"
+        "addi %[w], %[w], 4\n\t"
+        "bdnz 1b\n\t"
+        "ps_mr %0, %2\n\t"
+        "ps_swap %1, %2\n\t"
+        "ps_add %0, %0, %1\n\t"
+        "psq_st %0, 0(%[out]), 0, 0\n\t"
+        : "=&f"(s01), "=&f"(s23), "+f"(s01)
+        : [x] "b"(x), [w] "b"(w), [nq] "r"(n / 4), [out] "b"(out)
+        : "ctr", "memory");
+}
+
+void ps_qk4_s8(const float *q, const int8_t *k, int kv_dim, int pairs, float *out) {
+    /* Four attention q.k scores at once from int8 key cache.
+     * q: float32 query (head_size elements, 8-byte aligned)
+     * k: int8 key cache, 4 positions, kv_dim apart
+     * pairs: head_size / 2
+     * out: 4 float scores */
+    float s01, s23, qq, k0, k1, k2, k3, m0, m1, m2, m3;
+    int o1 = kv_dim, o2 = 2 * kv_dim, o3 = 3 * kv_dim;
+    __asm__ volatile(
+        "psq_l %0, 0(%[zero]), 0, 0\n\t"
+        "ps_mr %1, %0\n\t"
+        "mtctr %[pairs]\n"
+        "1:\n\t"
+        "psq_l %2, 0(%[q]), 0, 0\n\t"
+        "psq_l %3, 0(%[k]), 0, 7\n\t"
+        "psq_lx %4, %[k], %[o1], 0, 7\n\t"
+        "psq_lx %5, %[k], %[o2], 0, 7\n\t"
+        "psq_lx %6, %[k], %[o3], 0, 7\n\t"
+        "addi %[q], %[q], 8\n\t"
+        "addi %[k], %[k], 2\n\t"
+        "ps_merge00 %7, %3, %4\n\t"
+        "ps_merge00 %8, %5, %6\n\t"
+        "ps_merge11 %9, %3, %4\n\t"
+        "ps_merge11 %10, %5, %6\n\t"
+        "ps_madds0 %0, %7, %2, %0\n\t"
+        "ps_madds0 %1, %8, %2, %1\n\t"
+        "ps_madds1 %0, %9, %2, %0\n\t"
+        "ps_madds1 %1, %10, %2, %1\n\t"
+        "bdnz 1b\n\t"
+        "psq_st %0, 0(%[out]), 0, 0\n\t"
+        "psq_st %1, 8(%[out]), 0, 0\n\t"
+        : "=&f"(s01), "=&f"(s23), "=&f"(qq), "=&f"(k0), "=&f"(k1),
+          "=&f"(k2), "=&f"(k3), "=&f"(m0), "=&f"(m1), "=&f"(m2), "=&f"(m3),
+          "+b"(q), "+b"(k)
+        : [o1] "r"(o1), [o2] "r"(o2), [o3] "r"(o3),
+          [pairs] "r"(pairs), [out] "b"(out)
+        : "ctr", "memory");
+}
+
+void ps_axpy_s8(float *xb, const int8_t *v, float a, int octets) {
+    /* xb[i] += a * v[i] for i = 0..8*octets-1.
+     * v is int8, a is float scale. 8 elements per iteration. */
+    float x0, x1, x2, x3, v0, v1, v2, v3;
+    __asm__ volatile(
+        "mtctr %[octets]\n"
+        "1:\n\t"
+        "psq_l %0, 0(%[xb]), 0, 0\n\t"
+        "psq_l %1, 8(%[xb]), 0, 0\n\t"
+        "psq_l %2, 16(%[xb]), 0, 0\n\t"
+        "psq_l %3, 24(%[xb]), 0, 0\n\t"
+        "psq_l %4, 0(%[v]), 0, 7\n\t"
+        "psq_l %5, 2(%[v]), 0, 7\n\t"
+        "psq_l %6, 4(%[v]), 0, 7\n\t"
+        "psq_l %7, 6(%[v]), 0, 7\n\t"
+        "ps_madds0 %0, %4, %[a], %0\n\t"
+        "ps_madds0 %1, %5, %[a], %1\n\t"
+        "ps_madds0 %2, %6, %[a], %2\n\t"
+        "ps_madds0 %3, %7, %[a], %3\n\t"
+        "psq_st %0, 0(%[xb]), 0, 0\n\t"
+        "psq_st %1, 8(%[xb]), 0, 0\n\t"
+        "psq_st %2, 16(%[xb]), 0, 0\n\t"
+        "psq_st %3, 24(%[xb]), 0, 0\n\t"
+        "addi %[xb], %[xb], 32\n\t"
+        "addi %[v], %[v], 8\n\t"
+        "bdnz 1b\n\t"
+        : "=&f"(x0), "=&f"(x1), "=&f"(x2), "=&f"(x3),
+          "=&f"(v0), "=&f"(v1), "=&f"(v2), "=&f"(v3),
+          "+b"(xb), "+b"(v)
+        : [a] "f"(a), [octets] "r"(octets)
+        : "ctr", "memory");
+}
+
+#endif /* PICOLM_PS */
