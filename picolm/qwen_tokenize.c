@@ -311,17 +311,62 @@ static int pretok_next_spark25(const char *s, int n) {
     /* Newline */
     if (cp == '\r' || cp == '\n') return adv;
 
-    /* Whitespace */
-    if (is_WS(cp)) {
-        int j = 0, last_nl = -1;
+    /* Whitespace.
+     * Replicates the Spark2.5 regex behavior:
+     *   \s+(?!\S) - whitespace followed by more whitespace or end
+     *   \s+        - whitespace run
+     * Due to regex backtracking in std::regex, \s+(?!\S) at a position
+     * like " \nend" will match only " " (1 space) because backtracking
+     * finds that \s+ matching " \n" fails the (?!\S) lookahead ('e' is \S),
+     * so it shrinks to " " and checks (?!\S) against '\n' (whitespace) -> success.
+     * For " \n\nhello", \s+ matches " \n", (?!\S) sees '\n' (whitespace) -> success.
+     *
+     * For pure space runs followed by a letter, split off the last space
+     * so it can serve as prefix for [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+.
+     * For runs followed by digits/punct/symbols, return the full run. */
+    {
+        int j = 0, first_nl = -1;
         while (j < n) {
             int c3, a3 = utf8_next(s + j, n - j, &c3);
             if (!is_WS(c3)) break;
-            if (c3 == '\r' || c3 == '\n') last_nl = j + a3;
+            if (first_nl < 0 && (c3 == '\r' || c3 == '\n')) first_nl = j + a3;
             j += a3;
         }
-        if (last_nl > 0) return last_nl;
-        if (j < n && j > adv) return (j - 1 == 0) ? adv : j - 1;
+        if (first_nl > 0) {
+            /* There's a newline in the run. first_nl points just past the \r or \n.
+             * Check if followed by \n (i.e., \r\n sequence) and skip it too. */
+            int nl_end = first_nl;
+            if (s[nl_end - 1] == '\r' && nl_end < j && s[nl_end] == '\n') {
+                nl_end++; /* skip \n after \r */
+            }
+            /* Now nl_end points just past the \r\n (or \n) boundary.
+             * If there's MORE whitespace after the newline (i.e., nl_end < j and
+             * s[nl_end] is whitespace), include the newline in this pretoken
+             * (like \s+(?!\S) matching " \n" when followed by another \n).
+             * If the newline is at the end of the ws run (nl_end >= j), or if
+             * followed by non-whitespace, return only the part before the newline,
+             * leaving it for the [\r\n] pattern to match separately. */
+            if (nl_end < j && is_WS((uint8_t)s[nl_end])) {
+                return nl_end; /* more whitespace after \n, include it */
+            } else {
+                /* newline at end of run or followed by non-ws.
+                 * Return only the part before the \r\n. */
+                return first_nl - 1;
+            }
+        }
+        /* Pure whitespace run (no newline).
+         * If followed by a letter, mark, punct, or symbol, split off the last space.
+         * The letter/mark case: last space serves as prefix for
+         *   [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+ pattern.
+         * The punct/symbol case: last space serves as prefix for ?[\p{P}\p{S}]+ pattern.
+         * Digits and CJK create their own segment boundaries (patterns 1/2),
+         * so no split needed -- return the full run. */
+        if (j < n && j > adv) {
+            int c_next; utf8_next(s + j, n - j, &c_next);
+            if (is_L(c_next) || is_M(c_next) || is_P(c_next) || is_S(c_next)) {
+                return (j - 1 == 0) ? adv : j - 1;
+            }
+        }
         return j;
     }
 
