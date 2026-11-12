@@ -4908,9 +4908,10 @@ void spark_gate_scale(float *attn, const float *gate, int n_tokens, int n_heads,
             for (int k = 0; k < 8; k++) {
                 __m256 scale = _mm256_set1_ps(sig8[k]);
                 float *ah = arow + (size_t)(h + k) * head_dim;
-                for (int d = 0; d + 7 < head_dim; d += 8)
+                { int d = 0;
+                for (; d + 7 < head_dim; d += 8)
                     _mm256_storeu_ps(ah + d, _mm256_mul_ps(_mm256_loadu_ps(ah + d), scale));
-                for (; d < head_dim; d++) ah[d] *= sig8[k];
+                for (; d < head_dim; d++) ah[d] *= sig8[k]; }
             }
         }
         for (; h < n_heads; h++) {
@@ -4918,9 +4919,10 @@ void spark_gate_scale(float *attn, const float *gate, int n_tokens, int n_heads,
             float sig = 1.0f / (1.0f + expf(-g));
             __m256 scale = _mm256_set1_ps(sig);
             float *ah = arow + (size_t)h * head_dim;
-            for (int d = 0; d + 7 < head_dim; d += 8)
+            { int d = 0;
+            for (; d + 7 < head_dim; d += 8)
                 _mm256_storeu_ps(ah + d, _mm256_mul_ps(_mm256_loadu_ps(ah + d), scale));
-            for (; d < head_dim; d++) ah[d] *= sig;
+            for (; d < head_dim; d++) ah[d] *= sig; }
         }
     }
 #else

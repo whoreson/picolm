@@ -250,7 +250,7 @@ static int pretok_next_spark25(const char *s, int n) {
     if (cp >= 0x21 && cp <= 0x7E && !is_WS(cp) && !is_L(cp) && !is_N(cp)) {
         if (adv < n) {
             int c2; utf8_next(s + adv, n - adv, &c2);
-            if (c2 >= 'A' && c2 <= 'Z') {
+            if ((c2 >= 'A' && c2 <= 'Z') || (c2 >= 'a' && c2 <= 'z')) {
                 int j = adv;
                 while (j < n) {
                     int c3; utf8_next(s + j, n - j, &c3);

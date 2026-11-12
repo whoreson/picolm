@@ -4566,6 +4566,18 @@ static void silu_mul_task(int idx, void *ctxp) {
 }
 
 typedef struct {
+    float *hb, *hb2;
+    int n_ffn;
+} gelu_mul_ctx_t;
+
+static void gelu_mul_task(int idx, void *ctxp) {
+    gelu_mul_ctx_t *ctx = (gelu_mul_ctx_t *)ctxp;
+    float *hb = ctx->hb + (size_t)idx * ctx->n_ffn;
+    gelu(hb, ctx->n_ffn);
+    elemwise_mul(hb, hb, ctx->hb2 + (size_t)idx * ctx->n_ffn, ctx->n_ffn);
+}
+
+typedef struct {
     float *out, *x;
     const float *w;
     int dim;
@@ -5035,14 +5047,22 @@ static float *model_forward_prefill_spark25(model_t *m, const int *tokens, int n
 
         /* ---- Attention block ---- */
 
-        /* RMSNorm (per-token) */
-        for (int bi = 0; bi < n_tokens; bi++)
-            rmsnorm(xb_batch + bi * dim, x_batch + bi * dim, s->attn_norm_w[l], dim, c->rms_norm_eps);
+        /* RMSNorm (batched, threaded across tokens) */
+        {
+            batch_rmsnorm_ctx_t rctx = { xb_batch, x_batch, s->attn_norm_w[l], dim, c->rms_norm_eps };
+            tensor_parallel_for(n_tokens, batch_rmsnorm_task, &rctx);
+        }
         PP_MARK(0);
 
-        /* Save attn_inp for gate (per-token) */
-        for (int bi = 0; bi < n_tokens; bi++)
-            memcpy(xb2_batch + bi * dim, xb_batch + bi * dim, dim * sizeof(float));
+        /* Save attn_inp for gate: strided copy from xb_batch (stride q_dim) to xb2_batch (stride dim) */
+        if (q_dim == dim) {
+            /* Simple case: contiguous copy */
+            memcpy(xb2_batch, xb_batch, (size_t)n_tokens * dim * sizeof(float));
+        } else {
+            /* Strided copy: need per-token copy */
+            for (int bi = 0; bi < n_tokens; bi++)
+                memcpy(xb2_batch + bi * dim, xb_batch + bi * q_dim, dim * sizeof(float));
+        }
 
         /* Fused QKV projection (batched): [dim, qkv_dim] */
         tensor_set_repacked(m->repack_used[ri] ? m->repack_buffers[ri] : NULL);
@@ -5148,9 +5168,11 @@ static float *model_forward_prefill_spark25(model_t *m, const int *tokens, int n
 
         /* ---- FFN block (GeGLU) ---- */
 
-        /* RMSNorm (per-token) */
-        for (int bi = 0; bi < n_tokens; bi++)
-            rmsnorm(xb_batch + bi * dim, x_batch + bi * dim, s->post_attn_norm_w[l], dim, c->rms_norm_eps);
+        /* RMSNorm (batched, threaded across tokens) */
+        {
+            batch_rmsnorm_ctx_t rctx = { xb_batch, x_batch, s->post_attn_norm_w[l], dim, c->rms_norm_eps };
+            tensor_parallel_for(n_tokens, batch_rmsnorm_task, &rctx);
+        }
 
         /* Gate and Up projections (batched) */
         tensor_set_repacked(m->repack_used[ri+4] ? m->repack_buffers[ri+4] : NULL);
@@ -5161,10 +5183,10 @@ static float *model_forward_prefill_spark25(model_t *m, const int *tokens, int n
         matmul_batch(hb2_batch, xb_batch, n_tokens, lw->ffn_up, dim, n_ffn, lw->type_ffn_up);
         tensor_set_repacked(NULL);
 
-        /* GELU(gate) * up (per-token) */
-        for (int bi = 0; bi < n_tokens; bi++) {
-            gelu(hb_batch + bi * n_ffn, n_ffn);
-            elemwise_mul(hb_batch + bi * n_ffn, hb_batch + bi * n_ffn, hb2_batch + bi * n_ffn, n_ffn);
+        /* GELU(gate) * up - threaded across tokens */
+        {
+            gelu_mul_ctx_t gctx = { hb_batch, hb2_batch, n_ffn };
+            tensor_parallel_for(n_tokens, gelu_mul_task, &gctx);
         }
 
         /* Down projection (batched): [n_ffn, dim] */
