@@ -5152,12 +5152,9 @@ static float *model_forward_prefill_spark25(model_t *m, const int *tokens, int n
         matmul_batch(xb2_batch, q_batch, n_tokens, lw->attn_output, q_dim, dim, lw->type_attn_output);
         tensor_set_repacked(NULL);
 
-        /* Residual: x += attn_out */
-        for (int bi = 0; bi < n_tokens; bi++) {
-            float *x = x_batch + bi * dim;
-            float *attn = xb2_batch + bi * dim;
-            for (int i = 0; i < dim; i++) x[i] += attn[i];
-        }
+        /* Residual: x += attn_out (SIMD vec_add) */
+        for (int bi = 0; bi < n_tokens; bi++)
+            vec_add(x_batch + bi * dim, xb2_batch + bi * dim, dim);
         PP_MARK(5);
 
         /* ---- FFN block (GeGLU) ---- */
@@ -5188,12 +5185,9 @@ static float *model_forward_prefill_spark25(model_t *m, const int *tokens, int n
         matmul_batch(xb_batch, hb_batch, n_tokens, lw->ffn_down, n_ffn, dim, lw->type_ffn_down);
         tensor_set_repacked(NULL);
 
-        /* Residual: x += ffn_out */
-        for (int bi = 0; bi < n_tokens; bi++) {
-            float *x = x_batch + bi * dim;
-            float *ffn = xb_batch + bi * dim;
-            for (int i = 0; i < dim; i++) x[i] += ffn[i];
-        }
+        /* Residual: x += ffn_out (SIMD vec_add) */
+        for (int bi = 0; bi < n_tokens; bi++)
+            vec_add(x_batch + bi * dim, xb_batch + bi * dim, dim);
         PP_MARK(6);
 
 #ifdef PICOLM_VIZ

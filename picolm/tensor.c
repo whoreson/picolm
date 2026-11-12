@@ -4925,6 +4925,59 @@ void spark_gate_scale(float *attn, const float *gate, int n_tokens, int n_heads,
             for (; d < head_dim; d++) ah[d] *= sig; }
         }
     }
+#elif defined(PICOLM_NEON)
+    /* NEON: vectorised sigmoid via exp(-g) approximation (4-wide),
+     * using the same 2^n split as picolm_exp256_ps.
+     * Then broadcast-scale head_dim floats per head (4-wide vmulq). */
+    for (int bi = 0; bi < n_tokens; bi++) {
+        const float *grow = gate + (size_t)bi * n_heads;
+        float *arow = attn + (size_t)bi * n_heads * head_dim;
+        int h = 0;
+        for (; h + 3 < n_heads; h += 4) {
+            float32x4_t gv = vld1q_f32(grow + h);
+            /* exp(-g) via 2^n split: z = -g, n = z/ln2, f = z - n*ln2 */
+            float32x4_t z = vnegq_f32(gv);
+            z = vminq_f32(vmaxq_f32(z, vdupq_n_f32(-87.0f)), vdupq_n_f32(88.0f));
+            float32x4_t n = vdivq_f32(z, vdupq_n_f32(0.6931471805599453f));
+            float32x4_t nr = vrndnq_f32(n);
+            float32x4_t f = vsubq_f32(z, vmulq_f32(nr, vdupq_n_f32(0.6931471805599453f)));
+            /* Taylor: e^f = 1 + f + f^2/2 + f^3/6 + f^4/24 + f^5/120 */
+            float32x4_t q = vdupq_n_f32(1.0f / 120.0f);
+            q = vfmaq_f32(vdupq_n_f32(1.0f / 24.0f), q, f);
+            q = vfmaq_f32(vdupq_n_f32(1.0f / 6.0f),  q, f);
+            q = vfmaq_f32(vdupq_n_f32(0.5f),         q, f);
+            q = vfmaq_f32(vdupq_n_f32(1.0f),         q, f);
+            float32x4_t e = vfmaq_f32(vdupq_n_f32(1.0f), q, f);
+            int32x4_t ni = vcvtq_s32_f32(nr);
+            int32x4_t ei = vshlq_n_s32(vaddq_s32(ni, vdupq_n_s32(127)), 23);
+            e = vmulq_f32(e, vreinterpretq_f32_s32(ei));
+            /* sigmoid = 1 / (1 + exp(-g)) */
+            float32x4_t sig = vrecpeq_f32(vaddq_f32(vdupq_n_f32(1.0f), e));
+            sig = vmulq_f32(sig, vsubq_f32(vdupq_n_f32(2.0f), vmulq_f32(vaddq_f32(e, vdupq_n_f32(1.0f)), sig)));
+            float sig4[4];
+            vst1q_f32(sig4, sig);
+            for (int k = 0; k < 4; k++) {
+                float32x4_t scale = vdupq_n_f32(sig4[k]);
+                float *ah = arow + (size_t)(h + k) * head_dim;
+                int d = 0;
+                for (; d + 3 < head_dim; d += 4) {
+                    vst1q_f32(ah + d, vmulq_f32(vld1q_f32(ah + d), scale));
+                }
+                for (; d < head_dim; d++) ah[d] *= sig4[k];
+            }
+        }
+        for (; h < n_heads; h++) {
+            float g = grow[h];
+            float sig = 1.0f / (1.0f + expf(-g));
+            float32x4_t scale = vdupq_n_f32(sig);
+            float *ah = arow + (size_t)h * head_dim;
+            int d = 0;
+            for (; d + 3 < head_dim; d += 4) {
+                vst1q_f32(ah + d, vmulq_f32(vld1q_f32(ah + d), scale));
+            }
+            for (; d < head_dim; d++) ah[d] *= sig;
+        }
+    }
 #else
     for (int bi = 0; bi < n_tokens; bi++) {
         const float *grow = gate + (size_t)bi * n_heads;
