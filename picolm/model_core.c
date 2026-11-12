@@ -5054,15 +5054,9 @@ static float *model_forward_prefill_spark25(model_t *m, const int *tokens, int n
         }
         PP_MARK(0);
 
-        /* Save attn_inp for gate: strided copy from xb_batch (stride q_dim) to xb2_batch (stride dim) */
-        if (q_dim == dim) {
-            /* Simple case: contiguous copy */
-            memcpy(xb2_batch, xb_batch, (size_t)n_tokens * dim * sizeof(float));
-        } else {
-            /* Strided copy: need per-token copy */
-            for (int bi = 0; bi < n_tokens; bi++)
-                memcpy(xb2_batch + bi * dim, xb_batch + bi * q_dim, dim * sizeof(float));
-        }
+        /* Save attn_inp for gate (per-token) */
+        for (int bi = 0; bi < n_tokens; bi++)
+            memcpy(xb2_batch + bi * dim, xb_batch + bi * dim, dim * sizeof(float));
 
         /* Fused QKV projection (batched): [dim, qkv_dim] */
         tensor_set_repacked(m->repack_used[ri] ? m->repack_buffers[ri] : NULL);
