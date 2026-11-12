@@ -132,6 +132,7 @@ void gelu(float *x, int size);
  * `out` may alias `gate` or `up`.
  */
 void silu_mul(float *out, const float *gate, const float *up, int size);
+void spark_gate_scale(float *attn, const float *gate, int n_tokens, int n_heads, int head_dim);
 
 /* Element-wise multiply: out[i] = a[i] * b[i] */
 void elemwise_mul(float *out, const float *a, const float *b, int size);

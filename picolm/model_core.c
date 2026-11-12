@@ -120,6 +120,7 @@ static void pp_report(int n_tokens, int n_layers) {
     double sum = 0; for (int i = 0; i < 8; i++) sum += pp_acc[i];
     fprintf(stderr, "[PREFILL-PROF] n_tokens=%d layers=%d  timed=%.0f ms (%.1f ms/token)\n", n_tokens, n_layers, sum, sum / n_tokens);
     for (int i = 0; i < 7; i++) fprintf(stderr, "  %-44s %9.1f ms  %5.1f%%\n", pp_names[i], pp_acc[i], sum > 0 ? 100.0 * pp_acc[i] / sum : 0.0);
+    fprintf(stderr, "  [sub] %-42s %9.1f ms  (%.1f ms/layer)\n", "spark gate matmul", pp_acc[7], n_layers > 0 ? pp_acc[7] / n_layers : 0.0);
     memset(pp_acc, 0, sizeof pp_acc);
 }
 
@@ -5123,16 +5124,14 @@ static float *model_forward_prefill_spark25(model_t *m, const int *tokens, int n
         }
         PP_MARK(4);
 
-        /* Head-wise sigmoid gate (per-token) - use saved attn_inp from xb2_batch */
+        /* Head-wise sigmoid gate - use saved attn_inp from xb2_batch */
         tensor_set_repacked(NULL);
-        for (int bi = 0; bi < n_tokens; bi++) {
-            matmul(spark_gate_batch + bi * n_heads, xb2_batch + bi * dim, lw->attn_gate, dim, n_heads, lw->type_attn_gate);
-            for (int h = 0; h < n_heads; h++) {
-                float g = 1.0f / (1.0f + expf(-(spark_gate_batch + bi * n_heads)[h]));
-                float *attn_h = q_batch + bi * q_dim + h * head_dim;
-                for (int d = 0; d < head_dim; d++) attn_h[d] *= g;
-            }
-        }
+        if (pp_on == 1) pp_t = pp_now();
+        /* Batched gate matmul: [n_tokens, dim] x [dim, n_heads] -> [n_tokens, n_heads] */
+        matmul_batch(spark_gate_batch, xb2_batch, n_tokens, lw->attn_gate, dim, n_heads, lw->type_attn_gate);
+        /* Batched sigmoid + per-head scale (vectorised) */
+        spark_gate_scale(q_batch, spark_gate_batch, n_tokens, n_heads, head_dim);
+        if (pp_on == 1) pp_acc[7] += pp_now() - pp_t;
 
         /* Output projection (batched): [q_dim, dim] - attn out in q_batch */
         tensor_set_repacked(m->repack_used[ri+3] ? m->repack_buffers[ri+3] : NULL);

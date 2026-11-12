@@ -4879,6 +4879,63 @@ void silu_mul(float *out, const float *gate, const float *up, int size) {
     }
 }
 
+/* spark_gate_scale: batched per-head sigmoid gate for Spark-2.5 attention.
+ *
+ * out[i][h][d] = in[i][h][d] * sigmoid(gate[i][h])
+ *   out:   [n_tokens][n_heads * head_dim]  (attention output, will be modified in-place)
+ *   gate:  [n_tokens][n_heads]             (raw gate matmul output)
+ *   in == out (the attention output is scaled in-place)
+ *
+ * Vectorised with picolm_exp256_ps() where available (8 sigmoids per iter),
+ * scalar expf() fallback otherwise. The per-head multiply is a strided
+ * broadcast scale (head_dim contiguous floats per head).
+ */
+void spark_gate_scale(float *attn, const float *gate, int n_tokens, int n_heads, int head_dim) {
+#ifdef PICOLM_HAVE_EXP256
+    /* Vectorised: process 8 heads at a time for the sigmoid, then
+     * broadcast-scale head_dim floats per head. */
+    const __m256 one = _mm256_set1_ps(1.0f);
+    for (int bi = 0; bi < n_tokens; bi++) {
+        const float *grow = gate + (size_t)bi * n_heads;
+        float *arow = attn + (size_t)bi * n_heads * head_dim;
+        int h = 0;
+        for (; h + 7 < n_heads; h += 8) {
+            __m256 g = _mm256_loadu_ps(grow + h);
+            __m256 e = picolm_exp256_ps(_mm256_sub_ps(_mm256_setzero_ps(), g));
+            __m256 sig = _mm256_div_ps(one, _mm256_add_ps(one, e));
+            float sig8[8];
+            _mm256_storeu_ps(sig8, sig);
+            for (int k = 0; k < 8; k++) {
+                __m256 scale = _mm256_set1_ps(sig8[k]);
+                float *ah = arow + (size_t)(h + k) * head_dim;
+                for (int d = 0; d + 7 < head_dim; d += 8)
+                    _mm256_storeu_ps(ah + d, _mm256_mul_ps(_mm256_loadu_ps(ah + d), scale));
+                for (; d < head_dim; d++) ah[d] *= sig8[k];
+            }
+        }
+        for (; h < n_heads; h++) {
+            float g = grow[h];
+            float sig = 1.0f / (1.0f + expf(-g));
+            __m256 scale = _mm256_set1_ps(sig);
+            float *ah = arow + (size_t)h * head_dim;
+            for (int d = 0; d + 7 < head_dim; d += 8)
+                _mm256_storeu_ps(ah + d, _mm256_mul_ps(_mm256_loadu_ps(ah + d), scale));
+            for (; d < head_dim; d++) ah[d] *= sig;
+        }
+    }
+#else
+    for (int bi = 0; bi < n_tokens; bi++) {
+        const float *grow = gate + (size_t)bi * n_heads;
+        float *arow = attn + (size_t)bi * n_heads * head_dim;
+        for (int h = 0; h < n_heads; h++) {
+            float sig = 1.0f / (1.0f + expf(-grow[h]));
+            float *ah = arow + (size_t)h * head_dim;
+            for (int d = 0; d < head_dim; d++) ah[d] *= sig;
+        }
+    }
+#endif
+}
+
 void elemwise_mul(float *out, const float *a, const float *b, int size) {
 #ifdef PICOLM_AVX512
     int i = 0;
