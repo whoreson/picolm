@@ -5728,17 +5728,26 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                         picolm_hadamard_transform(q_pos + h * head_dim, head_dim, s->kv_hadamard_size);
                     }
                 }
-            } else if (s->kv_type_k == KV_CACHE_TQ3) {
-                /* TQ3 K: Q is NOT rotated (we dequant to F32 in attention path) */
-            } else if (s->kv_type_k == KV_CACHE_TQ4) {
-                /* TQ4 K: rotate Q with WHT forward (block=32) to match
-                 * the codebook-lookup dot product in vec_dot_tq4_f32. */
-                for (bi = 0; bi < n_tokens; bi++) {
-                    float *q_pos = q_batch + bi * q_dim;
-                    for (int h = 0; h < n_heads; h++) {
-                        picolm_hadamard_transform(q_pos + h * head_dim, head_dim, TQ4_BLOCK_SIZE);
-                    }
-                }
+            } else if (s->kv_type_k == KV_CACHE_TQ3 || s->kv_type_k == KV_CACHE_TQ4) {
+                /* TQ3/TQ4 K: Q is NOT rotated in the batched prefill path.
+                 *
+                 * Both TQ cache types store K WHT-rotated, but every reader of
+                 * the K cache in this path inverts that rotation when it
+                 * dequantizes the rows -- attn_pack_k_row() ->
+                 * ad_deq_tq_row(inv_wht=1) for the tiled path, and
+                 * ad_deq_tq_row/scale_add_tq3_f32 in attention_group_ref() for
+                 * the grouped path -- so scores are plain dot products in head
+                 * space and the query must stay in the original domain.
+                 *
+                 * Rotating Q here (as TQ4 used to) computed
+                 * dot(rotated_Q, unrotated_K): garbage scores that collapsed
+                 * the softmax of an otherwise-healthy TQ4 K cache (top logit
+                 * 12.5 -> 3.0 against a -13.9 uniform baseline), so the model
+                 * emitted one repeated token. Only the readers that keep K in
+                 * the rotated domain may rotate Q: attn_core() ->
+                 * vec_dot_tq4_f32 on the single-token decode path, and
+                 * ad_chunk_impl() -> ad_deq_row(is_k=1) ->
+                 * ad_deq_tq_row(inv_wht=0) on the generic decode path. */
             }
 
             /* Clear GPU tensor: batch_attention_layer's internal matmul_batch
