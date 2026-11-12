@@ -117,7 +117,7 @@ static double pp_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, 
 #endif
 static void pp_report(int n_tokens, int n_layers) {
     if (pp_on != 1 || n_tokens < 2) return;
-    double sum = 0; for (int i = 0; i < 8; i++) sum += pp_acc[i];
+    double sum = 0; for (int i = 0; i < 7; i++) sum += pp_acc[i];
     fprintf(stderr, "[PREFILL-PROF] n_tokens=%d layers=%d  timed=%.0f ms (%.1f ms/token)\n", n_tokens, n_layers, sum, sum / n_tokens);
     for (int i = 0; i < 7; i++) fprintf(stderr, "  %-44s %9.1f ms  %5.1f%%\n", pp_names[i], pp_acc[i], sum > 0 ? 100.0 * pp_acc[i] / sum : 0.0);
     fprintf(stderr, "  [sub] %-42s %9.1f ms  (%.1f ms/layer)\n", "spark gate matmul", pp_acc[7], n_layers > 0 ? pp_acc[7] / n_layers : 0.0);
@@ -5011,17 +5011,18 @@ static float *model_forward_prefill_spark25(model_t *m, const int *tokens, int n
     int rope_dim_swa = c->rope_dim_swa > 0 ? c->rope_dim_swa : rope_dim;
     int swa_half_dim = rope_dim_swa / 2;
 
-    /* Batch buffers: x, xb (Q compact / attn output), xb2 (attn_inp copy / output proj),
+    /* Batch buffers: x, xb (RMSNorm output / matmul I/O), xb2 (attn_inp copy / output proj),
      * q (fused QKV), hb (gate), hb2 (up), spark_gate
-     * xb_batch must be q_dim stride (for Q extraction + attention output),
-     * not dim stride, since q_dim >= dim for GQA models. */
+     * xb_batch uses stride dim everywhere: RMSNorm writes dim, matmul_batch reads/writes dim.
+     * Allocate at max(dim, q_dim) to be safe, but dim is the operative stride. */
     size_t bs = (size_t)n_tokens;
-    size_t sz = bs * (dim + q_dim + dim + qkv_dim + n_ffn + n_ffn + n_heads);
+    size_t xb_stride = (size_t)(dim > q_dim ? dim : q_dim);
+    size_t sz = bs * (dim + xb_stride + dim + qkv_dim + n_ffn + n_ffn + n_heads);
     float *buf = (float *)malloc(sz * sizeof(float));
     if (!buf) { fprintf(stderr, "OOM: Spark-X2.5 prefill batch\n"); exit(1); }
     float *p = buf;
     float *x_batch = p;      p += bs * dim;
-    float *xb_batch = p;     p += bs * q_dim;
+    float *xb_batch = p;     p += bs * xb_stride;
     float *xb2_batch = p;    p += bs * dim;
     float *q_batch = p;      p += bs * qkv_dim;
     float *hb_batch = p;     p += bs * n_ffn;
@@ -5054,9 +5055,8 @@ static float *model_forward_prefill_spark25(model_t *m, const int *tokens, int n
         }
         PP_MARK(0);
 
-        /* Save attn_inp for gate (per-token) */
-        for (int bi = 0; bi < n_tokens; bi++)
-            memcpy(xb2_batch + bi * dim, xb_batch + bi * dim, dim * sizeof(float));
+        /* Save attn_inp for gate (contiguous copy, both stride dim) */
+        memcpy(xb2_batch, xb_batch, (size_t)n_tokens * dim * sizeof(float));
 
         /* Fused QKV projection (batched): [dim, qkv_dim] */
         tensor_set_repacked(m->repack_used[ri] ? m->repack_buffers[ri] : NULL);
