@@ -1625,8 +1625,12 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32);
 #define ATTN_UNROLL16
 #endif
 
-#if defined(PICOLM_AVX512)
+/* Needed by both the AVX-512 and the AVX2 slice-major PV kernels. */
+#if !defined(ATTN_ALWAYS_INLINE)
 #define ATTN_ALWAYS_INLINE inline always_inline   /* project macro, see quant.h */
+#endif
+
+#if defined(PICOLM_AVX512)
 
 /* PV multiply for a slice-major V tile: acc[q][d] += sum_j p[q][j] * V[j][d].
  *
@@ -1858,6 +1862,85 @@ static const uint8_t *attn_v16_shadow_build(const uint8_t *vcache, int total_pos
 }
 #endif
 
+#if defined(PICOLM_AVX2) && defined(__FMA__)
+/* ---- slice-major PV multiply, AVX2 -----------------------------------------
+ *
+ * The tiled path hands this code a V tile in ONE of two layouts, chosen by
+ * v_sm in batch_tiled_task():
+ *
+ *   v_sm == 0   row-major     [ts][hd]        (head-dim contiguous per row)
+ *   v_sm == 1   slice-major   [hd/8][ts][8]   (ts contiguous per 8-lane slice)
+ *
+ * attn_v_prep_run() writes whichever one v_sm asks for. A consumer that
+ * assumes the other layout reads a TRANSPOSED tile -- every head-dim value
+ * comes from the wrong KV position. Nothing goes out of bounds and no NaN is
+ * produced, so it is silent: it shows up only as garbled text.
+ *
+ * AVX2 started setting v_sm=1 when the extractor gained an 8-wide slice-major
+ * path (commit 8eca9e4), but the only slice-major *consumer* was the AVX-512
+ * kernel above, which is compiled out on AVX2. The AVX2 PV kernel is
+ * row-major, so it read the transposed tile: a Fimbulvetr2 IQ6_K prefill
+ * degenerated into a repeated token.
+ *
+ * This is that missing consumer. It mirrors the AVX-512 kernel, 8-wide with
+ * half the rows per block (8 rows x 8 lanes = 64 accumulator floats, which
+ * still fits the 16 ymm registers alongside the broadcast). Loop order is
+ * row-block outer / head-dim slice inner, as in the AVX-512 version, so each
+ * 8-float slice of the tile is one contiguous run and the score block stays
+ * in L1 across all hd/8 slices.
+ *
+ * Accumulation per output element is still a single ascending-j FMA chain, so
+ * results are bit-identical to the row-major AVX2 kernel. */
+#define ATTN_PV_R_AVX2 4
+static ATTN_ALWAYS_INLINE void attn_pv_sm_body_avx2(float *accp, const float *scores,
+                                                    const float *v_tile, int n_q,
+                                                    const int TS, const int HD) {
+    const int n_blk = HD / 8;
+    int r0 = 0;
+    for (; r0 + ATTN_PV_R_AVX2 <= n_q; r0 += ATTN_PV_R_AVX2) {
+        const float *sb = scores + (size_t)r0 * TS;
+        float *ap = accp + (size_t)r0 * HD;
+        for (int db = 0; db < n_blk; db++) {
+            const float *vb = v_tile + (size_t)db * TS * 8;
+            __m256 a[ATTN_PV_R_AVX2];
+            for (int r = 0; r < ATTN_PV_R_AVX2; r++)
+                a[r] = _mm256_loadu_ps(ap + (size_t)r * HD + db * 8);
+            for (int j = 0; j < TS; j++) {
+                __m256 vv = _mm256_loadu_ps(vb + (size_t)j * 8);
+                for (int r = 0; r < ATTN_PV_R_AVX2; r++)
+                    a[r] = _mm256_fmadd_ps(vv, _mm256_set1_ps(sb[(size_t)r * TS + j]), a[r]);
+            }
+            for (int r = 0; r < ATTN_PV_R_AVX2; r++)
+                _mm256_storeu_ps(ap + (size_t)r * HD + db * 8, a[r]);
+        }
+    }
+    if (r0 < n_q) {                         /* fewer than R rows left: runtime row count */
+        const int rn = n_q - r0;
+        const float *sb = scores + (size_t)r0 * TS;
+        float *ap = accp + (size_t)r0 * HD;
+        for (int db = 0; db < n_blk; db++) {
+            const float *vb = v_tile + (size_t)db * TS * 8;
+            __m256 a[ATTN_PV_R_AVX2];
+            for (int r = 0; r < rn; r++) a[r] = _mm256_loadu_ps(ap + (size_t)r * HD + db * 8);
+            for (int j = 0; j < TS; j++) {
+                __m256 vv = _mm256_loadu_ps(vb + (size_t)j * 8);
+                for (int r = 0; r < rn; r++)
+                    a[r] = _mm256_fmadd_ps(vv, _mm256_set1_ps(sb[(size_t)r * TS + j]), a[r]);
+            }
+            for (int r = 0; r < rn; r++) _mm256_storeu_ps(ap + (size_t)r * HD + db * 8, a[r]);
+        }
+    }
+}
+
+static void attn_pv_sm_avx2(float *accp, const float *scores, const float *v_tile,
+                            int n_q, int ts, int hd) {
+    if (ts == ATTN_TILE && hd == 256)      attn_pv_sm_body_avx2(accp, scores, v_tile, n_q, ATTN_TILE, 256);
+    else if (ts == ATTN_TILE && hd == 128) attn_pv_sm_body_avx2(accp, scores, v_tile, n_q, ATTN_TILE, 128);
+    else if (ts == ATTN_TILE && hd == 64)  attn_pv_sm_body_avx2(accp, scores, v_tile, n_q, ATTN_TILE, 64);
+    else                                   attn_pv_sm_body_avx2(accp, scores, v_tile, n_q, ts, hd);
+}
+#endif /* PICOLM_AVX2 slice-major PV */
+
 /* Context for the parallel tiled attention: one instance shared by all
  * concurrent tasks. Each task gets its own scratch slice from scratch_pool. */
 typedef struct {
@@ -1911,7 +1994,19 @@ static void attn_v_prep_run(void *arg) {
     const int this_tile_size = vp->this_tile_size, v_sm = vp->v_sm;
     const int head_dim = bc->head_dim;
     float *tile_v_f32 = vp->tile_v_f32;
-    (void)v_sm; (void)head_dim;
+    /* Lane width of the slice-major V-tile layout: 16 floats on AVX-512, 8 on
+     * AVX2/AVX. Every slice-major writer below MUST use this, not a hardcoded
+     * 16: the consumers index the tile as [hd/V_SM_LANES][ts][V_SM_LANES], and
+     * a writer that uses a different stride lays the tile out transposed. That
+     * is silent -- it stayed hidden for TQ3/TQ4 on AVX2 precisely because the
+     * scalar writers hardcoded 16 while the F16 writers were correctly
+     * per-arch. Row-major (v_sm == 0) writers are unaffected. */
+#if defined(PICOLM_AVX512)
+    const int V_SM_LANES = 16;
+#else
+    const int V_SM_LANES = 8;
+#endif
+    (void)head_dim;
         {
             size_t rb = bc->kv_row_size_v;
             size_t v_head_stride = bc->kv_head_stride_v;
@@ -1926,9 +2021,9 @@ static void attn_v_prep_run(void *arg) {
                          * The TQ dequant is scalar anyway, so the rearrange is free. */
                         float tq_buf[512];
                         ad_deq_tq_row(src, tq_buf, head_dim, bc->kv_type_v == KV_CACHE_TQ4, 1);
-                        for (int db = 0; db < head_dim / 16; db++)
-                            memcpy(tile_v_f32 + ((size_t)db * this_tile_size + p) * 16,
-                                   tq_buf + (size_t)db * 16, 16 * sizeof(float));
+                        for (int db = 0; db < head_dim / V_SM_LANES; db++)
+                            memcpy(tile_v_f32 + ((size_t)db * this_tile_size + p) * V_SM_LANES,
+                                   tq_buf + (size_t)db * V_SM_LANES, V_SM_LANES * sizeof(float));
                     } else {
                         ad_deq_tq_row(src, tile_v_f32 + (size_t)p * head_dim,
                                       head_dim, bc->kv_type_v == KV_CACHE_TQ4, 1);
@@ -1952,9 +2047,9 @@ static void attn_v_prep_run(void *arg) {
                 } else if (v_sm) {
                     float rowbuf[512];
                     dequantize_row(src, rowbuf, head_dim, bc->gguf_v);
-                    for (int db = 0; db < head_dim / 16; db++)
-                        memcpy(tile_v_f32 + ((size_t)db * this_tile_size + p) * 16,
-                               rowbuf + (size_t)db * 16, 16 * sizeof(float));
+                    for (int db = 0; db < head_dim / V_SM_LANES; db++)
+                        memcpy(tile_v_f32 + ((size_t)db * this_tile_size + p) * V_SM_LANES,
+                               rowbuf + (size_t)db * V_SM_LANES, V_SM_LANES * sizeof(float));
                 } else {
                     dequantize_row(src, tile_v_f32 + (size_t)p * head_dim,
                                    head_dim, bc->gguf_v);
@@ -3182,15 +3277,11 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
             }
         }
 #elif defined(PICOLM_AVX2) && defined(__FMA__)
-        /* AVX2 row-blocked PV multiply: 8-wide FMA, up to 4 rows at a time.
-         * V[j] loaded once per j and reused across R rows.
-         *
-         * TODO(slice-major): A [hd/8][ts][8] layout with row-block outer /
-         * head-dim slice inner would reduce L1 conflicts (8 floats = 0.5
-         * cache line stride vs 1.0 for row-major hd=256). Also benefits from
-         * the unroll pragma (avoids stack-based __m256 acc[] when inlined into
-         * batch_tiled_task). The AVX-512 version showed 1.4-1.6x speedup.
-         * Extract path would use _mm256_cvtph_ps for F16, rowbuf for others. */
+        /* AVX2 PV multiply. Two layouts, selected by t->v_sm -- see
+         * attn_pv_sm_avx2() for why this dispatch is mandatory. */
+        if (t->v_sm) {
+            attn_pv_sm_avx2(t->acc, t->scores, v_tile, n_q, ts, hd);
+        } else
         {
             const int D_BLK = 8;
             const int n_blk = hd / D_BLK;
