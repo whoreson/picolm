@@ -406,8 +406,9 @@ static int mmap_one_file(split_mmap_t *s, const char *path) {
 #if defined(__SIZEOF_SIZE_T__) && __SIZEOF_SIZE_T__ < 8
     /* On 32-bit platforms, size_t is 32-bit. Files larger than ~4 GB
      * cannot be mmap'd and will silently truncate, causing misleading
-     * "corruption" errors later. Reject them early. */
-    if (fsize > (off_t)0xFFFFFFFF) {
+     * "corruption" errors later. Reject them early.
+     * Use uintmax_t to avoid sign-wrap when off_t is also 32-bit. */
+    if ((uintmax_t)fsize > (uintmax_t)SIZE_MAX) {
         fprintf(stderr, "ERROR: model file '%s' is %lld bytes, which exceeds the 32-bit address space limit (~4 GB). "
                 "Use a smaller quantization or a 64-bit OS.\n", path, (long long)fsize);
         close(fd);
@@ -420,7 +421,7 @@ static int mmap_one_file(split_mmap_t *s, const char *path) {
         if (off > 0) {
             lseek(fd, 0, SEEK_SET);
 #if defined(__SIZEOF_SIZE_T__) && __SIZEOF_SIZE_T__ < 8
-            if (off > (off_t)0xFFFFFFFF) {
+            if ((uintmax_t)off > (uintmax_t)SIZE_MAX) {
                 fprintf(stderr, "ERROR: model file '%s' is %lld bytes (lseek), exceeds 32-bit limit.\n",
                         path, (long long)off);
                 close(fd);
@@ -847,6 +848,187 @@ out:
     if (fd >= 0) close(fd);
 #endif
     return rc;
+}
+
+/* ---- GGUF tensor dump (raw file bytes -> dequantized floats) ---- */
+
+/*
+ * model_dump_tensor(): print the first `n_show` elements of `n_rows` rows of a
+ * named tensor, dequantized from the RAW file bytes with PicoLM's own
+ * dequantize_row().
+ *
+ * This is the big-endian debugging workhorse: unlike the runtime tensors, it
+ * shows exactly what is in the file, with NO big-endian F16-scale swap applied.
+ * Comparing the same tensor between a LE host (correct output) and a BE host
+ * isolates a byte-swap bug from an inference bug immediately.
+ *
+ * CLI: --dump-tensor name[:row[:nrows[:nelem]]]
+ * Env: PICOLM_DUMP_TENSOR=same syntax (dumped right after model load)
+ *
+ * Returns 0 on success.
+ */
+int model_dump_tensor(const char *path, const char *spec) {
+    if (!path || !spec) return -1;
+
+    char tname[256];
+    long row0 = 0, nrows = 1, nelem = 8;
+    {
+        const char *c1 = strchr(spec, ':');
+        size_t tlen = c1 ? (size_t)(c1 - spec) : strlen(spec);
+        if (tlen >= sizeof(tname)) tlen = sizeof(tname) - 1;
+        memcpy(tname, spec, tlen);
+        tname[tlen] = '\0';
+        if (c1) {
+            row0 = strtol(c1 + 1, NULL, 10);
+            const char *c2 = strchr(c1 + 1, ':');
+            if (c2) {
+                nrows = strtol(c2 + 1, NULL, 10);
+                const char *c3 = strchr(c2 + 1, ':');
+                if (c3) nelem = strtol(c3 + 1, NULL, 10);
+            }
+        }
+    }
+    if (nrows <= 0) nrows = 1;
+    if (nelem < 0) nelem = 0;
+
+#ifdef _WIN32
+    fprintf(stderr, "ERROR: --dump-tensor is not supported on Windows builds\n");
+    (void)path;
+    return -1;
+#elif defined(PICOLM_DOS)
+    fprintf(stderr, "ERROR: --dump-tensor is not supported on DOS builds\n");
+    return -1;
+#else
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { fprintf(stderr, "ERROR: cannot open '%s': %s\n", path, strerror(errno)); return -1; }
+
+    size_t fsize = 0;
+    { struct stat st;
+      if (fstat(fd, &st) >= 0) fsize = (size_t)st.st_size; }
+    if (fsize == 0) { close(fd); fprintf(stderr, "ERROR: empty model file\n"); return -1; }
+
+    uint8_t *addr = mmap(NULL, fsize, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (addr == MAP_FAILED) { close(fd); fprintf(stderr, "ERROR: cannot map '%s'\n", path); return -1; }
+
+    reader_t r = { .data = addr, .pos = 0, .size = fsize };
+    int rc = -1;
+    uint8_t *buf = NULL;
+
+    uint32_t magic = read_u32(&r);
+    if (magic != GGUF_MAGIC) { fprintf(stderr, "ERROR: not a GGUF file\n"); goto out; }
+    uint32_t version = read_u32(&r);
+    uint64_t n_tensors = read_u64(&r);
+    uint64_t n_metadata = read_u64(&r);
+
+    uint64_t alignment = 32;
+    for (uint64_t i = 0; i < n_metadata; i++) {
+        gguf_str_t key = read_gguf_string(&r);
+        uint32_t vtype = read_u32(&r);
+        size_t vpos = r.pos;
+        int dummy = 0;
+        skip_meta_value(&r, vtype, &dummy);
+        if (key.len == 22 && !memcmp(key.str, "general.alignment", 17 + 5)) {
+            if (vtype == 4) { uint32_t a = 0; memcpy(&a, addr + vpos, 4);
+                              alignment = GGUF_LE32(a); }
+            else if (vtype == 10) { uint64_t a = 0; memcpy(&a, addr + vpos, 8);
+                                    alignment = GGUF_LE64(a); }
+        }
+    }
+
+    int found = 0;
+    uint64_t t_offset = 0, t_ne0 = 0, t_ne1 = 1;
+    uint32_t t_type = 0, t_ndim = 0;
+
+    for (uint64_t i = 0; i < n_tensors; i++) {
+        gguf_str_t name = read_gguf_string(&r);
+        uint32_t n_dims = read_u32(&r);
+        uint64_t dims[4] = {0, 0, 0, 0};
+        for (uint32_t d = 0; d < n_dims && d < 4; d++) dims[d] = read_u64(&r);
+        uint32_t type = read_u32(&r);
+        uint64_t offset = read_u64(&r);
+        if (version == 1) offset *= 4;
+
+        if (!found && name.len == strlen(tname) && !memcmp(name.str, tname, name.len)) {
+            found = 1;
+            t_offset = offset;
+            t_type = type;
+            t_ndim = n_dims;
+            t_ne0 = dims[0];
+            t_ne1 = (n_dims >= 2) ? dims[1] : 1;
+            for (uint32_t d = 2; d < n_dims && d < 4; d++) t_ne1 *= dims[d];
+        }
+    }
+
+    if (!found) {
+        fprintf(stderr, "ERROR: tensor '%s' not found in '%s'\n", tname, path);
+        goto out;
+    }
+
+    {
+        /* Tensor data begins after the tensor-info table, padded to alignment. */
+        uint64_t base = (r.pos + alignment - 1) & ~(alignment - 1);
+        size_t n = (size_t)t_ne0;
+
+        size_t bpr = 0;
+        switch ((gguf_type_t)t_type) {
+            case GGUF_TYPE_F32:  bpr = n * 4; break;
+            case GGUF_TYPE_F16:  bpr = n * 2; break;
+            case GGUF_TYPE_BF16: bpr = n * 2; break;
+            case GGUF_TYPE_Q8_0: bpr = n / 32 * sizeof(block_q8_0); break;
+            case GGUF_TYPE_Q4_0: bpr = n / 32 * sizeof(block_q4_0); break;
+            case GGUF_TYPE_Q4_1: bpr = n / 32 * sizeof(block_q4_1); break;
+            case GGUF_TYPE_Q5_0: bpr = n / 32 * sizeof(block_q5_0); break;
+            case GGUF_TYPE_Q5_1: bpr = n / 32 * sizeof(block_q5_1); break;
+            case GGUF_TYPE_Q2_K: bpr = n / 256 * sizeof(block_q2_K); break;
+            case GGUF_TYPE_Q3_K: bpr = n / 256 * sizeof(block_q3_K); break;
+            case GGUF_TYPE_Q4_K: bpr = n / 256 * sizeof(block_q4_K); break;
+            case GGUF_TYPE_Q5_K: bpr = n / 256 * sizeof(block_q5_K); break;
+            case GGUF_TYPE_Q6_K: bpr = n / 256 * sizeof(block_q6_K); break;
+            case GGUF_TYPE_Q6_0: bpr = n / 32 * sizeof(block_q6_0); break;
+            case GGUF_TYPE_IQ4_NL: bpr = n / 32 * sizeof(block_iq4_nl); break;
+            case GGUF_TYPE_Q2_0: bpr = n / 128 * sizeof(block_q2_0); break;
+            case GGUF_TYPE_Q1_0: bpr = n / 128 * sizeof(block_q1_0); break;
+            default:
+                fprintf(stderr, "ERROR: --dump-tensor: unsupported type %u (%s)\n",
+                        t_type, gguf_type_name((gguf_type_t)t_type));
+                goto out;
+        }
+
+        uint64_t need = base + t_offset + (uint64_t)bpr * (uint64_t)(row0 + nrows);
+        if ((size_t)need > fsize) {
+            fprintf(stderr, "ERROR: --dump-tensor: tensor exceeds file size\n");
+            goto out;
+        }
+
+        buf = (uint8_t *)malloc(n * sizeof(float));
+        if (!buf) { fprintf(stderr, "ERROR: out of memory\n"); goto out; }
+        float *f = (float *)buf;
+
+        fprintf(stderr, "DUMP tensor '%s' ne0=%" PRIu64 " ne1=%" PRIu64
+                        " type=%s(%u) file_off=%" PRIu64 " (raw, BE-only-HACKED-notes: no swap)\n",
+                tname, t_ne0, t_ne1, gguf_type_name((gguf_type_t)t_type),
+                t_type, base + t_offset);
+
+        for (long rr = 0; rr < nrows; rr++) {
+            long row = row0 + rr;
+            if ((uint64_t)row >= t_ne1) break;
+            const uint8_t *rowp = addr + base + t_offset + (uint64_t)row * bpr;
+            if (t_type == GGUF_TYPE_F32) memcpy(f, rowp, n * sizeof(float));
+            else dequantize_row(rowp, f, (int)n, (gguf_type_t)t_type);
+            printf("DUMP %s[%ld] n=%zu:", tname, row, n);
+            long lim = (nelem < (long)n) ? nelem : (long)n;
+            for (long i = 0; i < lim; i++) printf(" %.6f", f[i]);
+            printf("\n");
+        }
+        fflush(stdout);
+        rc = 0;
+    }
+out:
+    free(buf);
+    munmap(addr, fsize);
+    close(fd);
+    return rc;
+#endif
 }
 
 /* ---- GGUF KV List ---- */
@@ -2016,9 +2198,9 @@ int parse_gguf(model_t *m, int max_seq_len) {
         if (qtype == (gguf_type_t)208)
             qtype = GGUF_TYPE_Q8_0_R8;
         /* Check tensor data is within file bounds */
-        size_t row_sz = gguf_type_row_size(qtype, (int)tinfos[i].dims[tinfos[i].n_dims - 1]);
+        size_t row_sz = gguf_type_row_size(qtype, (int)tinfos[i].dims[0]);
             size_t rows = 1;
-            for (uint32_t _d = 0; _d < tinfos[i].n_dims - 1; _d++) rows *= tinfos[i].dims[_d];
+            for (uint32_t _d = 1; _d < tinfos[i].n_dims; _d++) rows *= tinfos[i].dims[_d];
             size_t sz = rows * row_sz;
             if (off + sz > m->splits[si].mmap_size) {
                 fprintf(stderr, "ERROR: tensor '%.*s' data extends beyond file bounds (offset=%lu, size=%lu, file=%lu). Model is corrupted or incomplete.\n",
@@ -2654,7 +2836,8 @@ int parse_gguf(model_t *m, int max_seq_len) {
      * The mmap is PROT_READ (COW mappings over CIFS fail with PROT_WRITE on
      * low-RAM machines; see 9c1b3a5). We temporarily mprotect each split to
      * PROT_READ|PROT_WRITE for the swap loop, then restore PROT_READ. */
-#if defined(__APPLE__) && defined(__ppc__)
+#if defined(__APPLE__) && defined(__ppc__) || (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__) || defined(__BIG_ENDIAN__)
+#include <time.h>
     if (!m->be_preprocessed) {
         int be_start = clock();
         fprintf(stderr, "Big-endian: swapping F16 values...\n");
@@ -2695,33 +2878,53 @@ int parse_gguf(model_t *m, int max_seq_len) {
                 block_q8_0 *blk = (block_q8_0 *)((uint8_t *)ptr + b * sizeof(block_q8_0));
                 blk->d = GGUF_LE16(blk->d);
             }
-        } else if (qt == GGUF_TYPE_Q4_0 || qt == GGUF_TYPE_Q4_1 ||
+            /* BE swap verified: first block's d field is now in host byte order */
+        } else if (qt == GGUF_TYPE_Q4_0 ||
                    qt == GGUF_TYPE_IQ4_NL ||
                    qt == GGUF_TYPE_Q4_0_4_4 || qt == GGUF_TYPE_Q4_0_8_8 ||
                    qt == GGUF_TYPE_Q4I_0_8_8 || qt == GGUF_TYPE_Q4_0_R8) {
-            size_t bs = (qt == GGUF_TYPE_Q4_0_4_4) ? sizeof(block_q4_0x4)
-                       : (qt == GGUF_TYPE_Q4_0_8_8 || qt == GGUF_TYPE_Q4_0_R8) ? sizeof(block_q4_0x8)
-                       : (qt == GGUF_TYPE_Q4I_0_8_8) ? sizeof(block_q4i_0x8)
-                       : (qt == GGUF_TYPE_Q4_1) ? sizeof(block_q4_1)
-                       : sizeof(block_q4_0);
-            size_t nblocks = nrows / 32;
-            if (qt == GGUF_TYPE_Q4_0_R8) {
-                /* Q4_0_R8: 8 FP16 deltas per block, need to swap each */
+            /* Element count per physical block group. The interleaved formats
+             * pack SEVERAL rows into one block, so dividing the element count
+             * by 32 (as for plain Q4_0) walks past the tensor: nblocks would be
+             * 4x or 8x too large and the loop would byte-swap the `d` fields of
+             * whatever tensor happens to follow in the file.
+             *
+             *   Q4_0 / IQ4_NL   : 32 elements per 18-byte block
+             *   Q4_0_4_4        : 4 rows x 32 = 128 elements per 72-byte block
+             *   Q4_0_8_8 / _R8  : 8 rows x 32 = 256 elements per 144-byte block
+             *   Q4I_0_8_8       : 8 rows x 32 = 256 elements per 272-byte block
+             * (Visible with a mixed-quant GGUF such as
+             *  models/stories260K-stuffed.gguf: layer 1 holds q4_0_r8/q8_0_r8
+             *  tensors and the logits went NaN right after it.) */
+            size_t bs, elems_per_block;
+            switch (qt) {
+                case GGUF_TYPE_Q4_0_4_4:
+                    bs = sizeof(block_q4_0x4); elems_per_block = 4 * 32; break;
+                case GGUF_TYPE_Q4_0_8_8:
+                case GGUF_TYPE_Q4_0_R8:
+                    bs = sizeof(block_q4_0x8); elems_per_block = 8 * 32; break;
+                case GGUF_TYPE_Q4I_0_8_8:
+                    bs = sizeof(block_q4i_0x8); elems_per_block = 8 * 32; break;
+                default: /* Q4_0, IQ4_NL */
+                    bs = sizeof(block_q4_0); elems_per_block = 32; break;
+            }
+            size_t nblocks = nrows / elems_per_block;
+            if (qt == GGUF_TYPE_Q4_0_4_4) {
+                /* Q4_0_4_4: 4 FP16 deltas per block group */
+                for (size_t b = 0; b < nblocks; b++) {
+                    block_q4_0x4 *blk = (block_q4_0x4 *)((uint8_t *)ptr + b * bs);
+                    for (int r = 0; r < 4; r++) blk->d[r] = GGUF_LE16(blk->d[r]);
+                }
+            } else if (qt == GGUF_TYPE_Q4_0_R8 || qt == GGUF_TYPE_Q4_0_8_8) {
+                /* Q4_0_R8 / Q4_0_8_8: 8 FP16 deltas per block group */
                 for (size_t b = 0; b < nblocks; b++) {
                     block_q4_0x8 *blk = (block_q4_0x8 *)((uint8_t *)ptr + b * bs);
                     for (int r = 0; r < 8; r++) blk->d[r] = GGUF_LE16(blk->d[r]);
                 }
-            } else if (qt == GGUF_TYPE_Q8_K_R8) {
-                /* Q8_K_R8: 8 FP16 deltas per block, need to swap each */
-                size_t nb = nrows / 256;
-                for (size_t b = 0; b < nb; b++) {
-                    block_q8_k_r8 *blk = (block_q8_k_r8 *)((uint8_t *)ptr + b * sizeof(block_q8_k_r8));
-                    for (int r = 0; r < 8; r++) blk->d[r] = GGUF_LE16(blk->d[r]);
-                }
-            } else if (qt == GGUF_TYPE_Q4_0_8_8) {
-                /* Q4_0_8_8: 8 FP16 deltas per block */
+            } else if (qt == GGUF_TYPE_Q4I_0_8_8) {
+                /* Q4I_0_8_8: 8 FP16 deltas per block group */
                 for (size_t b = 0; b < nblocks; b++) {
-                    block_q4_0x8 *blk = (block_q4_0x8 *)((uint8_t *)ptr + b * bs);
+                    block_q4i_0x8 *blk = (block_q4i_0x8 *)((uint8_t *)ptr + b * bs);
                     for (int r = 0; r < 8; r++) blk->d[r] = GGUF_LE16(blk->d[r]);
                 }
             } else {
@@ -2729,6 +2932,15 @@ int parse_gguf(model_t *m, int max_seq_len) {
                     block_q4_0 *blk = (block_q4_0 *)((uint8_t *)ptr + b * bs);
                     blk->d = GGUF_LE16(blk->d);
                 }
+            }
+        } else if (qt == GGUF_TYPE_Q8_K_R8) {
+            /* Q8_K_R8: 8 rows x 256 = 2048 elements per block group, with
+             * 8 FP16 deltas at the front. Handled before the Q4_0 family so it
+             * cannot be mistaken for a 32-element 18-byte Q4_0 block. */
+            size_t nb = nrows / (8 * 256);
+            for (size_t b = 0; b < nb; b++) {
+                block_q8_k_r8 *blk = (block_q8_k_r8 *)((uint8_t *)ptr + b * sizeof(block_q8_k_r8));
+                for (int r = 0; r < 8; r++) blk->d[r] = GGUF_LE16(blk->d[r]);
             }
         } else if (qt == GGUF_TYPE_Q2_0) {
             size_t nblocks = nrows / 128;
@@ -2781,6 +2993,45 @@ int parse_gguf(model_t *m, int max_seq_len) {
             for (size_t b = 0; b < nblocks; b++) {
                 block_iq4_xs *blk = (block_iq4_xs *)((uint8_t *)ptr + b * sizeof(block_iq4_xs));
                 blk->d = GGUF_LE16(blk->d);
+            }
+        } else if (qt == GGUF_TYPE_Q5_0) {
+            size_t nblocks = nrows / 32;
+            for (size_t b = 0; b < nblocks; b++) {
+                block_q5_0 *blk = (block_q5_0 *)((uint8_t *)ptr + b * sizeof(block_q5_0));
+                blk->d = GGUF_LE16(blk->d);
+            }
+        } else if (qt == GGUF_TYPE_Q5_1) {
+            size_t nblocks = nrows / 32;
+            for (size_t b = 0; b < nblocks; b++) {
+                block_q5_1 *blk = (block_q5_1 *)((uint8_t *)ptr + b * sizeof(block_q5_1));
+                blk->d = GGUF_LE16(blk->d);
+                blk->m = GGUF_LE16(blk->m);
+            }
+        } else if (qt == GGUF_TYPE_Q6_0) {
+            size_t nblocks = nrows / 32;
+            for (size_t b = 0; b < nblocks; b++) {
+                block_q6_0 *blk = (block_q6_0 *)((uint8_t *)ptr + b * sizeof(block_q6_0));
+                blk->d = GGUF_LE16(blk->d);
+            }
+        } else if (qt == GGUF_TYPE_Q4_1) {
+            /* Q4_1: 1 FP16 delta + 1 FP16 min per block (20 bytes, 32 values) */
+            size_t nblocks = nrows / 32;
+            for (size_t b = 0; b < nblocks; b++) {
+                block_q4_1 *blk = (block_q4_1 *)((uint8_t *)ptr + b * sizeof(block_q4_1));
+                blk->d = GGUF_LE16(blk->d);
+                blk->m = GGUF_LE16(blk->m);
+            }
+        } else if (qt == GGUF_TYPE_Q8_0_R8 || qt == (gguf_type_t)208) {
+            size_t nblocks = nrows / 256;
+            for (size_t b = 0; b < nblocks; b++) {
+                block_q8_0_r8 *blk = (block_q8_0_r8 *)((uint8_t *)ptr + b * sizeof(block_q8_0_r8));
+                for (int r = 0; r < 8; r++) blk->d[r] = GGUF_LE16(blk->d[r]);
+            }
+        } else if (qt == GGUF_TYPE_IQ4_NL_R4) {
+            size_t nblocks = nrows / 128;
+            for (size_t b = 0; b < nblocks; b++) {
+                block_iq4_nl_r4 *blk = (block_iq4_nl_r4 *)((uint8_t *)ptr + b * sizeof(block_iq4_nl_r4));
+                for (int r = 0; r < 4; r++) blk->d[r] = GGUF_LE16(blk->d[r]);
             }
         } else {
             fprintf(stderr, "WARNING: big-endian BE swap: unsupported tensor type %u (%s) for tensor '%.*s' -- data will be corrupted\n",

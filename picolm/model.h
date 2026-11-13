@@ -20,6 +20,13 @@
 #define GGUF_LE32(v) __builtin_bswap32(v)
 #define GGUF_LE64(v) __builtin_bswap64(v)
 #define GGUF_LE16(v) __builtin_bswap16(v)
+#elif defined(__BIG_ENDIAN__)
+/* GCC < 4.6 (e.g. WiiLinux GCC 4.3.2) defines __BIG_ENDIAN__ but not
+ * __BYTE_ORDER__. __builtin_bswap32/64 since GCC 4.3, but __builtin_bswap16
+ * was added in GCC 4.5. Use manual swap for 16-bit. */
+#define GGUF_LE32(v) __builtin_bswap32(v)
+#define GGUF_LE64(v) __builtin_bswap64(v)
+#define GGUF_LE16(v) (((uint16_t)(v) >> 8) | ((uint16_t)(v) << 8))
 #else
 #define GGUF_LE32(v) (v)
 #define GGUF_LE64(v) (v)
@@ -812,6 +819,9 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                int k_cache_hadamard, int v_cache_hadamard, int n_threads);
 /* List all tensors in a GGUF file (name, dims, type) and exit. Returns 0 on success. */
 int model_list_tensors(const char *path);
+/* Dump a tensor dequantized straight from the raw file bytes (no BE swap
+ * applied). spec = "name[:row[:nrows[:nelem]]]". Returns 0 on success. */
+int model_dump_tensor(const char *path, const char *spec);
 /* List all KV metadata entries in a GGUF file and exit. Returns 0 on success. */
 int model_list_kv(const char *path);
 int model_load_safetensors(model_t *m, const char *model_dir, int max_seq_len, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v,

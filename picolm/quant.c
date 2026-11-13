@@ -742,8 +742,7 @@ void dequantize_row_q5_0(const void *src, float *dst, int n) {
 
     for (int i = 0; i < nb; i++) {
         const float d = fp16_to_fp32_lookup(blocks[i].d);
-        uint32_t qh;
-        memcpy(&qh, blocks[i].qh, sizeof(qh));
+        const uint32_t qh = picolm_qh_load(blocks[i].qh);
         float *dp = dst + i * 32;
         for (int j = 0; j < 16; j++) {
             uint8_t byte = blocks[i].qs[j];
@@ -765,8 +764,7 @@ void dequantize_row_q5_1(const void *src, float *dst, int n) {
     for (int i = 0; i < nb; i++) {
         const float d = fp16_to_fp32_lookup(blocks[i].d);
         const float m = fp16_to_fp32_lookup(blocks[i].m);
-        uint32_t qh;
-        memcpy(&qh, blocks[i].qh, sizeof(qh));
+        const uint32_t qh = picolm_qh_load(blocks[i].qh);
         float *dp = dst + i * 32;
         for (int j = 0; j < 16; j++) {
             uint8_t byte = blocks[i].qs[j];
@@ -1179,16 +1177,12 @@ size_t gguf_type_row_size(gguf_type_t type, int n) {
     if (type == GGUF_TYPE_IQ4_NL_R4) {
         return (size_t)sizeof(block_iq4_nl_r4) * (size_t)(n / 32) / 4;
     }
-    /* Compute full row size including partial blocks: qs * n / bs.
-     * The GGUF stores tensors as flat block arrays. For non-block-aligned
-     * dimensions (e.g. n=960 with bs=256), the row stride includes the
-     * fractional block. The vec_dot functions only process n/bs complete
-     * blocks per row, so the partial block's data is present but unused.
-     *
-     * Using qs*(n/bs) would match GGML's nb[1] computation but would cause
-     * our weight pointers to diverge from the actual GGUF data layout when
-     * n is not a multiple of bs (the GGUF stores the full row data). */
-    return (size_t)qs * (size_t)n / (size_t)bs;
+    /* GGUF stores tensors as flat block arrays. Each row contains
+     * ceil(n / bs) blocks, so the row stride in bytes is:
+     *   qs * ceil(n / bs) = qs * ((n + bs - 1) / bs)
+     * The vec_dot functions only process n/bs complete blocks per row,
+     * so the partial block's data is present but unused. */
+    return (size_t)qs * (((size_t)n + (size_t)bs - 1) / (size_t)bs);
 }
 
 /* ================================================================
@@ -5259,11 +5253,13 @@ float vec_dot_q8_0_q8_0_deltas(const void *qx, const float *qx_d, const void *qw
     return sumf;
 #elif !defined(PICOLM_I8MM) && !defined(PICOLM_NEON) && !defined(PICOLM_AVX512) && !defined(PICOLM_AVX2) && !defined(PICOLM_AVX) && !defined(PICOLM_SSSE3)
     /* Pure scalar path: no SIMD available */
-    for (i = 0; i < nb; i++) {
-        int sumi = 0;
-        for (int j = 0; j < 32; j++) sumi += x[i].qs[j] * w[i].qs[j];
-        sumf += (float)sumi * qx_d[i] * fp16_to_fp32_lookup(w[i].d);
-    }
+    {
+        for (i = 0; i < nb; i++) {
+            int sumi = 0;
+            for (int j = 0; j < 32; j++) sumi += x[i].qs[j] * w[i].qs[j];
+            sumf += (float)sumi * qx_d[i] * fp16_to_fp32_lookup(w[i].d);
+        }
+        }
     return sumf;
 #endif
 
@@ -6063,8 +6059,7 @@ float vec_dot_q5_0_f32(const void *src, const float *x, int n) {
 
     for (int i = 0; i < nb; i++) {
         float d = fp16_to_fp32_lookup(blocks[i].d);
-        uint32_t qh;
-        memcpy(&qh, blocks[i].qh, sizeof(qh));
+        const uint32_t qh = picolm_qh_load(blocks[i].qh);
         const uint8_t *qs = blocks[i].qs;
         const float *xp = x + i * 32;
         float block_sum = 0.0f;
@@ -6154,8 +6149,7 @@ float vec_dot_q5_0_q8_0(const void *vx, const void *wy, int n) {
 
     for (int ib = 0; ib < nb; ib++) {
         const float d = fp16_to_fp32_lookup(x[ib].d) * fp16_to_fp32_lookup(y[ib].d);
-        uint32_t qh;
-        memcpy(&qh, x[ib].qh, sizeof(qh));
+        const uint32_t qh = picolm_qh_load(x[ib].qh);
         const uint8_t *qs = x[ib].qs;
         const int8_t  *ya = y[ib].qs;
         int sumi = 0;
@@ -6179,8 +6173,7 @@ float vec_dot_q5_1_f32(const void *src, const float *x, int n) {
     for (int i = 0; i < nb; i++) {
         float d = fp16_to_fp32_lookup(blocks[i].d);
         float m = fp16_to_fp32_lookup(blocks[i].m);
-        uint32_t qh;
-        memcpy(&qh, blocks[i].qh, sizeof(qh));
+        const uint32_t qh = picolm_qh_load(blocks[i].qh);
         const uint8_t *qs = blocks[i].qs;
         const float *xp = x + i * 32;
         float block_sum = 0.0f;
@@ -6288,8 +6281,7 @@ float vec_dot_q5_1_q8_0(const void *vx, const void *wy, int n) {
         const float dw = fp16_to_fp32_lookup(x[ib].d);
         const float mw = fp16_to_fp32_lookup(x[ib].m);
         const float da = fp16_to_fp32_lookup(y[ib].d);
-        uint32_t qh;
-        memcpy(&qh, x[ib].qh, sizeof(uint32_t));
+        const uint32_t qh = picolm_qh_load(x[ib].qh);
         const uint8_t *qs = x[ib].qs;
         const int8_t *qy = y[ib].qs;
         int dot_sum = 0;
@@ -6317,8 +6309,7 @@ void q5_1_row_to_q8_0_shadow(const void *src, void *dst, int n) {
     for (int i = 0; i < nb; i++) {
         const float d = fp16_to_fp32_lookup(blocks[i].d);
         const float m = fp16_to_fp32_lookup(blocks[i].m);
-        uint32_t qh;
-        memcpy(&qh, blocks[i].qh, sizeof(qh));
+        const uint32_t qh = picolm_qh_load(blocks[i].qh);
         const uint8_t *qs = blocks[i].qs;
         int8_t *sq = shadow[i].qs;
 

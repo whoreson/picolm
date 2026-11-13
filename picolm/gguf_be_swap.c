@@ -11,7 +11,7 @@
  * in-place F16 field swapping. Only the quant block scale fields (uint16_t)
  * need swapping -- F32 is handled at dequant time by quant.c.
  *
- * Types handled: F16, BF16, Q8_0, Q4_0, Q4_1, Q2_0, Q1_0,
+ * Types handled: F16, BF16, Q8_0, Q4_0, IQ4_NL, Q4_1, Q2_0, Q1_0,
  *   Q4_0_4_4, Q4_0_8_8, Q4_K, Q5_K, Q6_K, Q3_K, Q2_K, Q5_0, Q5_1
  *
  * Compile: cc -O2 -o gguf_be_swap gguf_be_swap.c -lm
@@ -44,6 +44,12 @@ enum {
     G_BF16=15, G_Q5_0=6, G_Q5_1=7,
     G_Q4_0X4=31, G_Q4_0X8=33,
     G_Q1_0=41, G_Q2_0=42,
+    G_IQ4_NL=20,
+    /* PicoLM/ik_llama.cpp repacked + legacy types that appear in mixed-quant
+     * test GGUFs such as models/stories260K-stuffed.gguf. Without these the
+     * swap silently skipped the tensor (or, worse, mismatched its stride). */
+    G_Q6_0=133,
+    G_Q4_0_R8=202, G_Q8_0_R8=203, G_Q8_0_R8_ALT=208, G_IQ4_NL_R4=220,
 };
 
 #define BS_Q8_0   34
@@ -58,8 +64,10 @@ enum {
 #define BS_Q2K    84
 #define BS_Q5_0   22
 #define BS_Q5_1   24
-#define BS_Q4X4   18
-#define BS_Q4X8   144
+#define BS_Q4X4   72    /* block_q4_0x4: d[4](8) + qs[64](64) = 72 bytes */
+#define BS_Q4X8   144   /* block_q4_0x8: d[8](16) + qs[128](128) = 144 bytes */
+#define BS_Q8X8   272   /* block_q8_0_r8: d[8](16) + qs[256](256) = 272 bytes */
+#define BS_Q6_0   26    /* block_q6_0: d(2) + qh[8] + qs[16] = 26 bytes */
 
 #define MAX_TENSORS 8192
 
@@ -68,6 +76,9 @@ typedef struct {
     uint64_t dims[4];
     uint32_t type;
     uint64_t offset;
+    /* tensor name stored inline in the file at this offset */
+    uint64_t name_off;  /* byte offset of name in original file */
+    uint64_t name_len;
 } ti_t;
 
 static uint64_t skip_value(const uint8_t *d, uint64_t pos, uint32_t vt) {
@@ -169,7 +180,10 @@ int main(int argc, char **argv) {
     if (!tis) { fprintf(stderr, "OOM\n"); return 1; }
 
     for (uint64_t ti = 0; ti < n_tensors; ti++) {
-        uint64_t nlen = r64(data + pos); pos += 8 + nlen;
+        uint64_t nlen = r64(data + pos);
+        tis[ti].name_off = pos + 8;
+        tis[ti].name_len = nlen;
+        pos += 8 + nlen;
         tis[ti].n_dims = r32(data + pos); pos += 4;
         for (uint32_t d = 0; d < tis[ti].n_dims; d++) {
             tis[ti].dims[d] = r64(data + pos); pos += 8;
@@ -214,7 +228,9 @@ int main(int argc, char **argv) {
             case G_F32: case G_F16: case G_BF16: case G_Q8_0: case G_Q4_0: case G_Q4_1:
             case G_Q4_0X4: case G_Q4_0X8: case G_Q2_0: case G_Q1_0:
             case G_Q4_K: case G_Q5_K: case G_Q6_K: case G_Q3_K: case G_Q2_K:
-            case G_Q5_0: case G_Q5_1:
+            case G_Q5_0: case G_Q5_1: case G_IQ4_NL:
+            case G_Q6_0: case G_Q4_0_R8: case G_Q8_0_R8:
+            case G_Q8_0_R8_ALT: case G_IQ4_NL_R4:
                 needs_swap = 1; break;
         }
 
@@ -247,7 +263,8 @@ int main(int argc, char **argv) {
                 nswapped += (int)nb;
                 break;
             }
-            case G_Q4_0: {
+            case G_Q4_0: case G_IQ4_NL: {
+                /* IQ4_NL has identical layout to Q4_0: uint16_t d + uint8_t qs[16] = 18 bytes */
                 size_t nb = nrows * n / 32;
                 for (size_t b = 0; b < nb; b++) {
                     uint8_t *bl = ptr + b * BS_Q4_0;
@@ -257,32 +274,89 @@ int main(int argc, char **argv) {
                 break;
             }
             case G_Q4_1: {
+                /* block_q4_1: uint16_t d + uint16_t m + uint8_t qs[16] = 20 bytes
+                   Both d (offset 0) and m (offset 2) are FP16 and need swapping. */
                 size_t nb = nrows * n / 32;
                 for (size_t b = 0; b < nb; b++) {
                     uint8_t *bl = ptr + b * BS_Q4_1;
                     ((uint16_t *)bl)[0] = swap16(((uint16_t *)bl)[0]);
-                }
-                nswapped += (int)nb;
-                break;
-            }
-            case G_Q4_0X4: {
-                size_t nb = nrows * n / 32;
-                for (size_t b = 0; b < nb; b++) {
-                    uint8_t *bl = ptr + b * BS_Q4X4;
-                    for (int i = 0; i < 2; i++)
-                        ((uint16_t *)bl)[i] = swap16(((uint16_t *)bl)[i]);
+                    ((uint16_t *)bl)[1] = swap16(((uint16_t *)bl)[1]);
                 }
                 nswapped += (int)(nb * 2);
                 break;
             }
+            case G_Q4_0X4: {
+                /* block_q4_0x4: uint16_t d[4] + uint8_t qs[64] = 72 bytes
+                   Each block covers 4 rows x 32 values = 128 values.
+                   All 4 FP16 deltas need swapping. */
+                size_t nb = nrows * n / 128;
+                for (size_t b = 0; b < nb; b++) {
+                    uint8_t *bl = ptr + b * BS_Q4X4;
+                    for (int i = 0; i < 4; i++)
+                        ((uint16_t *)bl)[i] = swap16(((uint16_t *)bl)[i]);
+                }
+                nswapped += (int)(nb * 4);
+                break;
+            }
             case G_Q4_0X8: {
-                size_t nb = nrows * n / 32;
+                /* block_q4_0x8: uint16_t d[8] + uint8_t qs[128] = 144 bytes
+                   Each block covers 8 rows x 32 values = 256 values.
+                   All 8 FP16 deltas need swapping. */
+                size_t nb = nrows * n / 256;
                 for (size_t b = 0; b < nb; b++) {
                     uint8_t *bl = ptr + b * BS_Q4X8;
                     for (int i = 0; i < 8; i++)
                         ((uint16_t *)bl)[i] = swap16(((uint16_t *)bl)[i]);
                 }
                 nswapped += (int)(nb * 8);
+                break;
+            }
+            case G_Q4_0_R8: {
+                /* ik_llama.cpp repacked 8-row Q4_0: 8 rows x 32 = 256 values
+                 * per 144-byte group, 8 FP16 deltas at the front. */
+                size_t nb = nrows * n / 256;
+                for (size_t b = 0; b < nb; b++) {
+                    uint8_t *bl = ptr + b * BS_Q4X8;
+                    for (int i = 0; i < 8; i++)
+                        ((uint16_t *)bl)[i] = swap16(((uint16_t *)bl)[i]);
+                }
+                nswapped += (int)(nb * 8);
+                break;
+            }
+            case G_Q8_0_R8:
+            case G_Q8_0_R8_ALT: {
+                /* Q8_0_R8 (type 203, and 208 in some files): 8 rows x 32 = 256
+                 * values per 272-byte group, 8 FP16 deltas at the front. */
+                size_t nb = nrows * n / 256;
+                for (size_t b = 0; b < nb; b++) {
+                    uint8_t *bl = ptr + b * BS_Q8X8;
+                    for (int i = 0; i < 8; i++)
+                        ((uint16_t *)bl)[i] = swap16(((uint16_t *)bl)[i]);
+                }
+                nswapped += (int)(nb * 8);
+                break;
+            }
+            case G_IQ4_NL_R4: {
+                /* 4 rows x 32 = 128 values per 72-byte group, d[4] FP16. */
+                size_t nb = nrows * n / 128;
+                for (size_t b = 0; b < nb; b++) {
+                    uint8_t *bl = ptr + b * BS_Q4X4;
+                    for (int i = 0; i < 4; i++)
+                        ((uint16_t *)bl)[i] = swap16(((uint16_t *)bl)[i]);
+                }
+                nswapped += (int)(nb * 4);
+                break;
+            }
+            case G_Q6_0: {
+                /* 32 values per 26-byte block; only the leading FP16 d.
+                 * qh[8] is byte-indexed by the dequantizer, so it needs no
+                 * byte swap (unlike Q5_0/Q5_1's uint32 qh bitmask). */
+                size_t nb = nrows * n / 32;
+                for (size_t b = 0; b < nb; b++) {
+                    uint8_t *bl = ptr + b * BS_Q6_0;
+                    ((uint16_t *)bl)[0] = swap16(((uint16_t *)bl)[0]);
+                }
+                nswapped += (int)nb;
                 break;
             }
             case G_Q2_0: {
@@ -363,12 +437,30 @@ int main(int argc, char **argv) {
                 break;
             }
             case G_Q5_1: {
+                /* block_q5_1: uint16_t d + uint16_t m + uint8_t qh[4] + uint8_t qs[16] = 24 bytes
+                   Both d (offset 0) and m (offset 2) are FP16 and need swapping. */
                 size_t nb = nrows * n / 32;
                 for (size_t b = 0; b < nb; b++) {
                     uint8_t *bl = ptr + b * BS_Q5_1;
                     ((uint16_t *)bl)[0] = swap16(((uint16_t *)bl)[0]);
+                    ((uint16_t *)bl)[1] = swap16(((uint16_t *)bl)[1]);
                 }
-                nswapped += (int)nb;
+                nswapped += (int)(nb * 2);
+                break;
+            }
+            default: {
+                char nbuf[128];
+                uint64_t nlen = tis[ti].name_len;
+                const uint8_t *namep = out + ttable_start + tis[ti].name_off - 8; /* name is after length field */
+                /* Re-read name from the original data (still in out since we copied) */
+                /* The name is at ttable_start + name_off, but name_off is offset within the tensor table entry */
+                /* Actually name_off was recorded as absolute offset into the original file */
+                namep = out + tis[ti].name_off;
+                if (nlen > sizeof(nbuf) - 1) nlen = sizeof(nbuf) - 1;
+                memcpy(nbuf, namep, nlen);
+                nbuf[nlen] = '\0';
+                fprintf(stderr, "WARNING: unsupported tensor type %u for tensor '%s' -- F16 scales NOT swapped, data will be corrupted!\n",
+                        (unsigned)qt, nbuf);
                 break;
             }
         }

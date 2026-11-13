@@ -355,6 +355,10 @@ static void usage(const char *prog) {
     fprintf(stderr, "\nInfo options:\n");
     fprintf(stderr, "  --list-tensors   List all tensors (name, shape, type) and exit\n");
     fprintf(stderr, "  --list-kv        List all KV metadata entries and exit\n");
+    fprintf(stderr, "  --dump-tensor spec  Dequantize a tensor from the RAW file bytes and\n");
+    fprintf(stderr, "                   print it, then exit. spec = name[:row[:nrows[:nelem]]].\n");
+    fprintf(stderr, "                   No big-endian F16-scale swap is applied, so this shows\n");
+    fprintf(stderr, "                   exactly what is on disk. Env: PICOLM_DUMP_TENSOR.\n");
     fprintf(stderr, "  --benchmark [N]  Benchmark loop (N times, omit for continuous)\n");
     fprintf(stderr, "  --benchmark-live Print --benchmark-style per-layer timing during ordinary\n");
     fprintf(stderr, "                   generation. Works with --server and --cache.\n");
@@ -1382,6 +1386,7 @@ int main(int argc, char **argv) {
     /* Parse arguments */
     int list_tensors = 0;
     int list_kv = 0;
+    char *dump_tensor_spec = NULL;
     for (int i = 1; i < argc; i++) {
         /* Positional model path: first non-dash arg */
         if (argv[i][0] != '-') {
@@ -1566,6 +1571,11 @@ int main(int argc, char **argv) {
             list_tensors = 1;
         } else if (strcmp(argv[i], "--list-kv") == 0) {
             list_kv = 1;
+        } else if (strcmp(argv[i], "--dump-tensor") == 0 && i + 1 < argc) {
+            /* --dump-tensor name[:row[:nrows[:nelem]]] -- dequantize raw file
+             * bytes and print. Big-endian debugging: shows the FILE contents
+             * with no BE F16-scale swap applied. */
+            dump_tensor_spec = argv[++i];
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             return 1;
@@ -1651,14 +1661,15 @@ int main(int argc, char **argv) {
     }
 
     /* --list-tensors / --list-kv: now that model_path is known regardless of arg order */
-    if (list_tensors || list_kv) {
+    if (list_tensors || list_kv || dump_tensor_spec) {
         if (!model_path) {
             fprintf(stderr, "No model file specified\n");
             usage(argv[0]);
             return 1;
         }
         if (list_tensors) model_list_tensors(model_path);
-        else model_list_kv(model_path);
+        else if (list_kv) model_list_kv(model_path);
+        else model_dump_tensor(model_path, dump_tensor_spec);
         return 0;
     }
 

@@ -1180,6 +1180,25 @@ typedef struct PICOLM_PACKED_ATTR {
     uint8_t  qs[16];     /* 4-bit quantized values */
 } block_q4_1;            /* 20 bytes */
 
+/* ---- Little-endian-safe loaders for multi-byte bitmask fields ----
+ *
+ * Q5_0/Q5_1 store their 5th bits as `uint8_t qh[4]`, which is read as a
+ * uint32_t bitmask: value j's 5th bit is bit j. That bitmask is written
+ * little-endian in the GGUF, so a bare memcpy() of the 4 bytes into a uint32_t
+ * is only correct on a little-endian host. On big-endian (Wii/Broadway, Mac
+ * PPC) the bytes land reversed and every value gets the WRONG 5th bit.
+ *
+ * The runtime BE swap in model_gguf.c only byte-swaps the FP16 d/m scales, and
+ * the offline gguf_be_swap tool likewise touches only d/m, so nothing else
+ * repairs qh. Hence these helpers: assemble the uint32 from the bytes
+ * explicitly, which is correct on every byte order. */
+static inline uint32_t picolm_qh_load(const uint8_t *qh) {
+    return (uint32_t)qh[0]
+         | ((uint32_t)qh[1] << 8)
+         | ((uint32_t)qh[2] << 16)
+         | ((uint32_t)qh[3] << 24);
+}
+
 /* Q5_0 block: 32 weights (5-bit values + FP16 scale, 22 bytes)
  * Layout: half d (scale), uchar qh[4] (5th bits), uchar qs[16] (low 4 bits)
  * Dequant: val = ((qs & 0xF) | (qh_bit << 4)) * d

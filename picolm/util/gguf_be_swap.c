@@ -45,6 +45,11 @@ enum {
     G_Q4_0X4=31, G_Q4_0X8=33,
     G_Q1_0=41, G_Q2_0=42,
     G_IQ4_NL=20,
+    /* PicoLM/ik_llama.cpp repacked + legacy types that appear in mixed-quant
+     * test GGUFs such as models/stories260K-stuffed.gguf. Without these the
+     * swap silently skipped the tensor (or, worse, mismatched its stride). */
+    G_Q6_0=133,
+    G_Q4_0_R8=202, G_Q8_0_R8=203, G_Q8_0_R8_ALT=208, G_IQ4_NL_R4=220,
 };
 
 #define BS_Q8_0   34
@@ -61,6 +66,8 @@ enum {
 #define BS_Q5_1   24
 #define BS_Q4X4   72    /* block_q4_0x4: d[4](8) + qs[64](64) = 72 bytes */
 #define BS_Q4X8   144   /* block_q4_0x8: d[8](16) + qs[128](128) = 144 bytes */
+#define BS_Q8X8   272   /* block_q8_0_r8: d[8](16) + qs[256](256) = 272 bytes */
+#define BS_Q6_0   26    /* block_q6_0: d(2) + qh[8] + qs[16] = 26 bytes */
 
 #define MAX_TENSORS 8192
 
@@ -222,6 +229,8 @@ int main(int argc, char **argv) {
             case G_Q4_0X4: case G_Q4_0X8: case G_Q2_0: case G_Q1_0:
             case G_Q4_K: case G_Q5_K: case G_Q6_K: case G_Q3_K: case G_Q2_K:
             case G_Q5_0: case G_Q5_1: case G_IQ4_NL:
+            case G_Q6_0: case G_Q4_0_R8: case G_Q8_0_R8:
+            case G_Q8_0_R8_ALT: case G_IQ4_NL_R4:
                 needs_swap = 1; break;
         }
 
@@ -300,6 +309,54 @@ int main(int argc, char **argv) {
                         ((uint16_t *)bl)[i] = swap16(((uint16_t *)bl)[i]);
                 }
                 nswapped += (int)(nb * 8);
+                break;
+            }
+            case G_Q4_0_R8: {
+                /* ik_llama.cpp repacked 8-row Q4_0: 8 rows x 32 = 256 values
+                 * per 144-byte group, 8 FP16 deltas at the front. */
+                size_t nb = nrows * n / 256;
+                for (size_t b = 0; b < nb; b++) {
+                    uint8_t *bl = ptr + b * BS_Q4X8;
+                    for (int i = 0; i < 8; i++)
+                        ((uint16_t *)bl)[i] = swap16(((uint16_t *)bl)[i]);
+                }
+                nswapped += (int)(nb * 8);
+                break;
+            }
+            case G_Q8_0_R8:
+            case G_Q8_0_R8_ALT: {
+                /* Q8_0_R8 (type 203, and 208 in some files): 8 rows x 32 = 256
+                 * values per 272-byte group, 8 FP16 deltas at the front. */
+                size_t nb = nrows * n / 256;
+                for (size_t b = 0; b < nb; b++) {
+                    uint8_t *bl = ptr + b * BS_Q8X8;
+                    for (int i = 0; i < 8; i++)
+                        ((uint16_t *)bl)[i] = swap16(((uint16_t *)bl)[i]);
+                }
+                nswapped += (int)(nb * 8);
+                break;
+            }
+            case G_IQ4_NL_R4: {
+                /* 4 rows x 32 = 128 values per 72-byte group, d[4] FP16. */
+                size_t nb = nrows * n / 128;
+                for (size_t b = 0; b < nb; b++) {
+                    uint8_t *bl = ptr + b * BS_Q4X4;
+                    for (int i = 0; i < 4; i++)
+                        ((uint16_t *)bl)[i] = swap16(((uint16_t *)bl)[i]);
+                }
+                nswapped += (int)(nb * 4);
+                break;
+            }
+            case G_Q6_0: {
+                /* 32 values per 26-byte block; only the leading FP16 d.
+                 * qh[8] is byte-indexed by the dequantizer, so it needs no
+                 * byte swap (unlike Q5_0/Q5_1's uint32 qh bitmask). */
+                size_t nb = nrows * n / 32;
+                for (size_t b = 0; b < nb; b++) {
+                    uint8_t *bl = ptr + b * BS_Q6_0;
+                    ((uint16_t *)bl)[0] = swap16(((uint16_t *)bl)[0]);
+                }
+                nswapped += (int)nb;
                 break;
             }
             case G_Q2_0: {

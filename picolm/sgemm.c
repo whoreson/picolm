@@ -1183,8 +1183,7 @@ static __m256i q4_load_qs(const block_q4_0 *b) {
 /* Load 32 signed int8 values from block_q5_0 */
 static __m256i q5_load_qs(const block_q5_0 *b) {
     __m128i x = _mm_loadu_si128((const __m128i *)b->qs);
-    uint32_t qh32;
-    memcpy(&qh32, b->qh, sizeof(uint32_t));
+    const uint32_t qh32 = picolm_qh_load(b->qh);
     __m128i hi_nib = _mm_and_si128(_mm_set1_epi8(15), _mm_srli_epi16(x, 4));
     __m128i lo_nib = _mm_and_si128(_mm_set1_epi8(15), x);
     __m256i lo = _mm256_castsi128_si256(lo_nib);
@@ -2069,7 +2068,7 @@ static __m256i qg_iq4nl_qs(const block_iq4_nl *b) {
 /* Load Q5_0 qs (nibble + 5th bit extraction) */
 static __m256i qg_q5_qs(const block_q5_0 *b) {
     __m128i x = _mm_loadu_si128((const __m128i *)b->qs);
-    uint32_t qh32; memcpy(&qh32, b->qh, sizeof(uint32_t));
+    const uint32_t qh32 = picolm_qh_load(b->qh);
     __m128i lo = _mm_and_si128(_mm_set1_epi8(15), x);
     __m128i hi = _mm_and_si128(_mm_set1_epi8(15), _mm_srli_epi16(x, 4));
     __m256i xs = _mm256_insertf128_si256(_mm256_castsi128_si256(lo), hi, 1);
