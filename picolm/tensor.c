@@ -1541,24 +1541,6 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
     /* F32/F16: use generic vec_dot or tiled GEMM */
     if (!ti || ti->act_fmt == ACT_FMT_F32) {
         if (d < matmul_min_rows || n_threads <= 1) {
-#ifdef PICOLM_PS
-            /* Q8_0: use 2-row vec_dot for paired-singles (activation x shared) */
-            if (qtype == GGUF_TYPE_Q8_0) {
-                {
-                    int ii;
-                    for (ii = 0; ii + 1 < d; ii += 2) {
-                        float out2[2];
-                        vec_dot2_q8_0_f32(wptr + (size_t)ii * row_bytes,
-                                          wptr + (size_t)(ii + 1) * row_bytes,
-                                          x, n, out2);
-                        out[ii] = out2[0];
-                        out[ii + 1] = out2[1];
-                    }
-                    if (ii < d) out[d - 1] = vec_dot(wptr + (size_t)(d - 1) * row_bytes, x, n, qtype);
-                }
-                return;
-            }
-#endif
             for (int i = 0; i < d; i++)
                 out[i] = vec_dot(wptr + (size_t)i * row_bytes, x, n, qtype);
             return;

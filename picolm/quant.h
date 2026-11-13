@@ -1860,7 +1860,7 @@ __m256 picolm_exp256_ps(__m256 x);
 #ifdef PICOLM_PS
 void ps_init_gqr(void);
 void ps_q8_row_dot(const int8_t *x, const int8_t *w, int n, float *out);
-void ps_q8_row_dot2(const int8_t *x, const int8_t *w0, const int8_t *w1, int n, float *out);
+void ps_q8_row_dot2(const float *x, const int8_t *w0, const int8_t *w1, int n, float *out);
 void ps_axpy_s8(float *xb, const int8_t *v, float a, int octets);
 void vec_dot2_q8_0_f32(const void *w0, const void *w1, const float *x, int n, float *out);
 /* ps_qk4_s8: exported but currently dead code -- flat int8 KV cache not used */
