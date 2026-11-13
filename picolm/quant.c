@@ -2458,37 +2458,6 @@ void quantize_row_q8_0(const float *x, void *dst, int n) {
         }
         x += 32;
     }
-#elif defined(PICOLM_NEON)
-    /* NEON: 4-wide abs+max reduction, 4-wide scale+round per block */
-    for (int i = 0; i < nb; i++) {
-        float32x4_t maxv = vdupq_n_f32(0.0f);
-        const float *xp = x;
-        for (int j = 0; j < 8; j++) {
-            float32x4_t v = vld1q_f32(xp); xp += 4;
-            float32x4_t a = vabsq_f32(v);
-            maxv = vmaxq_f32(maxv, a);
-        }
-        float maxAbs = 0;
-        float32x2_t maxh = vmaxnm_f32(vget_low_f32(maxv), vget_high_f32(maxv));
-        maxAbs = max(maxh[0], maxh[1]);
-        float d = maxAbs / 127.0f;
-        y[i].d = fp32_to_fp16(d);
-        float id = (maxAbs != 0.0f) ? 127.0f / maxAbs : 0.0f;
-        float32x4_t mul = vdupq_n_f32(id);
-        int8_t *qs = y[i].qs;
-        xp = x;
-        for (int j = 0; j < 8; j++) {
-            float32x4_t v = vld1q_f32(xp); xp += 4;
-            v = vmulq_f32(v, mul);
-            int32x4_t ri = vcvtnq_s32_f32(v);
-            /* saturate to [-128, 127] */
-            ri = vmaxq_s32(vminq_s32(ri, vdupq_n_s32(127)), vdupq_n_s32(-128));
-            /* narrow to int8 and store */
-            uint8x8_t lo = vmovn_s16(vmovn_s32(ri));
-            vst1_u8((uint8_t *)qs, lo); qs += 8;
-        }
-        x += 32;
-    }
 #else
     for (int i = 0; i < nb; i++) {
         float maxAbs = 0.0f;
