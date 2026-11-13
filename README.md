@@ -10,6 +10,8 @@
 
 <h1 align="center">PicoLM - But It's Actually Useful</h1>
 
+![Almonds activation](almonds.png)
+
 ## What's New
 
 <table><tr><td><b>v1.0-rc2</b> ("Yura Kana")</td><td align="right"><img src="yura_kana.jpg" width="80" alt="Yura Kana"></td></tr></table>
