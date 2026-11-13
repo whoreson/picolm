@@ -1594,6 +1594,58 @@ static void ssm_kernel_sq_n(
 }
 #endif /* PICOLM_NEON */
 
+/* ================================================================
+ * Scalar fallback for ssm_kernel_veff_n / ssm_kernel_sq_n.
+ * Used when no SIMD (AVX/AVX2/AVX512/NEON) is available.
+ * Must appear BEFORE the #ifndef PICOLM_AVX512 block below,
+ * since that block's ssm_kernel_veffsq_n calls these functions.
+ * ================================================================ */
+#if !defined(PICOLM_AVX512) && !defined(PICOLM_AVX2) && !defined(PICOLM_AVX) && !defined(PICOLM_NEON)
+
+static void ssm_kernel_veff_n(
+        float *sk,        /* [cs][nr] output */
+        const float *state, /* [nr][d] state */
+        const float *k,   /* [cs][d] */
+        int nr, int d, int cs)
+{
+    for (int i = 0; i < cs; i++) {
+        const float *ki = k + (size_t)i * d;
+        float *ski = sk + (size_t)i * nr;
+
+        for (int r = 0; r < nr; r++) {
+            const float *sr = state + r * d;
+            float sum = 0.0f;
+            for (int c = 0; c < d; c++) {
+                sum += sr[c] * ki[c];
+            }
+            ski[r] = sum;
+        }
+    }
+}
+
+static void ssm_kernel_sq_n(
+        float *sq,        /* [cs][nr] output */
+        const float *state, /* [nr][d] state */
+        const float *q,   /* [cs][d] */
+        int nr, int d, int cs)
+{
+    for (int i = 0; i < cs; i++) {
+        const float *qi = q + (size_t)i * d;
+        float *sqi = sq + (size_t)i * nr;
+
+        for (int r = 0; r < nr; r++) {
+            const float *sr = state + r * d;
+            float sum = 0.0f;
+            for (int c = 0; c < d; c++) {
+                sum += sr[c] * qi[c];
+            }
+            sqi[r] = sum;
+        }
+    }
+}
+
+#endif /* scalar fallback */
+
 #ifndef PICOLM_AVX512
 /* Portable fallback for the fused veff+sq kernel. Only the AVX-512 path has a
  * real fused implementation (it halves state traffic); on the other ISAs this
