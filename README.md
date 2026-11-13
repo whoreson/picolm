@@ -12,6 +12,11 @@
 
 ![Almonds activation](almonds.png)
 
+## For agentic use:
+
+Check out the companion repo which provides a chat-completion endpoint:
+https://github.com/whoreson/thelastjinja
+
 ## What's New
 
 <table><tr><td><b>v1.0-rc2</b> ("Yura Kana")</td><td align="right"><img src="yura_kana.jpg" width="80" alt="Yura Kana"></td></tr></table>
