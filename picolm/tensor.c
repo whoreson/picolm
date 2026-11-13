@@ -763,7 +763,7 @@ static int tl_in_parallel = 0;
  * than online CPUs, than the taskset/cpuset allows, or than a cgroup CPU quota
  * grants, unless the env var is set explicitly. PICOLM_PIN=1 pins pool workers. Build with
  * -DPICOLM_NO_SPIN_POOL for the previous behaviour (also used on non-GNU compilers). */
-#if defined(__GNUC__) && !defined(PICOLM_DOS) && !defined(PICOLM_NO_SPIN_POOL)
+#if defined(__GNUC__) && (__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 7)) && !defined(PICOLM_DOS) && !defined(PICOLM_NO_SPIN_POOL)
 #define PICOLM_SPIN_POOL 1
 #endif
 #ifdef PICOLM_SPIN_POOL

@@ -1277,7 +1277,7 @@ void attention_decode(attn_group_ctx_t *ctx) {
 #define ATTN_SKIP_RECENT 4   /* recent tiles visited right after the sink tile */
 #endif
 static unsigned long g_skip_tiles, g_skip_tiles_all, g_skip_blocks, g_skip_blocks_all;
-#if defined(__GNUC__)
+#if defined(__GNUC__) && (__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 7))
 #define ATTN_STAT_ADD(v, n) __atomic_fetch_add(&(v), (unsigned long)(n), __ATOMIC_RELAXED)
 #else
 #define ATTN_STAT_ADD(v, n) ((v) += (unsigned long)(n))
