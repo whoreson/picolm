@@ -1877,13 +1877,31 @@ __m256 picolm_exp256_ps(__m256 x);
  *   - Pointers 2-byte aligned (block_q8_0 qs at offset 2 is sufficient for
  *     psq_l's 2-byte int8-pair loads; 8-byte alignment is NOT required) */
 #ifdef PICOLM_PS
+/* These are the paired-singles asm kernels. Every one of them is marked
+ * noinline, which is NOT an optimisation hint but a compiler-workaround:
+ *
+ *   GCC 4.3.2 (WiiLinux) ICEs in reg_overlap_mentioned_p (rtlanal.c:1398)
+ *   when these asm statements are inlined into a caller at -O2, e.g.
+ *   "quant.c: In function 'vec_dot2_q8_0_f32': internal compiler error:
+ *   in reg_overlap_mentioned_p".
+ *
+ * The trigger is register pressure from the paired-singles asm operand list
+ * (10 earlyclobber "=&f" doubles plus pointer operands) meeting the inliner --
+ * it is an inliner/RA bug, not a problem with the asm text itself: the
+ * identical code builds at -O0 and -O1, and builds fine as a non-inlined
+ * function at -O2. These kernels run once per 32-element block, so the call
+ * overhead is noise; correctness on the target compiler wins.
+ *
+ * If you add another paired-singles asm kernel, mark it the same way. */
+#define PICOLM_PS_NOINLINE __attribute__((noinline))
+
 void ps_init_gqr(void);
-void ps_q8_row_dot(const int8_t *x, const int8_t *w, int n, float *out);
-void ps_q8_row_dot2(const float *x, const int8_t *w0, const int8_t *w1, int n, float *out);
-void ps_axpy_s8(float *xb, const int8_t *v, float a, int octets);
+PICOLM_PS_NOINLINE void ps_q8_row_dot(const int8_t *x, const int8_t *w, int n, float *out);
+PICOLM_PS_NOINLINE void ps_q8_row_dot2(const float *x, const int8_t *w0, const int8_t *w1, int n, float *out);
+PICOLM_PS_NOINLINE void ps_axpy_s8(float *xb, const int8_t *v, float a, int octets);
 void vec_dot2_q8_0_f32(const void *w0, const void *w1, const float *x, int n, float *out);
 /* ps_qk4_s8: exported but currently dead code -- flat int8 KV cache not used */
-void ps_qk4_s8(const float *q, const int8_t *k, int kv_dim, int pairs, float *out);
+PICOLM_PS_NOINLINE void ps_qk4_s8(const float *q, const int8_t *k, int kv_dim, int pairs, float *out);
 #endif
 
 #ifdef __cplusplus
