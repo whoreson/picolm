@@ -76,6 +76,9 @@ void fp16_table_init(void) {
         fp16_to_fp32_table[i] = fp16_to_fp32((uint16_t)i);
     }
     fp16_table_initialized = 1;
+#ifdef PICOLM_PS
+    ps_init_gqr(); /* Set GQR7 to s8 type for paired-singles int8 loads */
+#endif
 }
 
 /* Fast lookup-based FP16->FP32 conversion */
@@ -5683,36 +5686,37 @@ float vec_dot_q8_0_f32(const void *src, const float *x, int n) {
         sumf += d * hsum_sse(_mm_add_ps(acc0, acc1));
 
 #elif defined(PICOLM_PS)
-        /* PowerPC paired-singles: psq_l (int8->float) + psq_l (float) + ps_madd.
-         * Processes 4 elements per iteration. Requires GQR7=s8. */
+        /* PowerPC paired-singles: psq_l (int8->float via GQR7=s8) +
+         * psq_l (float via GQR0) + ps_madd. 4 elements per iteration.
+         * This is the inline equivalent of ps_q8_row_dot but with float x. */
         {
+            static const float zero[2] __attribute__((aligned(8))) = {0.0f, 0.0f};
+            double acc, tmp_q, tmp_x;
             float block_sum;
-            /* Process 32 elements = 8 iterations of 4 */
-            const int8_t *qs_aligned = qs;
-            const float *xp_aligned = xp;
-            /* Use ps_q8_row_dot but we need q and x as int8... no, x is float.
-             * We need a different intrinsic: psq_l for int8 (GQR7) + psq_l for float (GQR0). */
-            float s01, s23, qf, xf;
+            const int8_t *qsp = qs;
+            const float *xpp = xp;
+
             __asm__ volatile(
-                "psq_l %0, 0(%[zero]), 0, 0\n\t"
-                "ps_mr %1, %0\n\t"
+                "psq_l %[acc], 0(%[zero]), 0, 0\n\t"
                 "mtctr %[nq]\n"
                 "1:\n\t"
-                "psq_l %2, 0(%[qs]), 0, 7\n\t"  /* 2 int8 -> 2 float */
-                "psq_l %3, 0(%[xp]), 0, 0\n\t"  /* 2 float from x */
-                "ps_madd %0, %2, %3, %0\n\t"    /* acc += q*x */
-                "psq_l %2, 2(%[qs]), 0, 7\n\t"  /* next 2 int8 */
-                "psq_l %3, 8(%[xp]), 0, 0\n\t"  /* next 2 float */
-                "ps_madd %0, %2, %3, %0\n\t"    /* acc += q*x */
-                "addi %[qs], %[qs], 4\n\t"
-                "addi %[xp], %[xp], 16\n\t"
+                "psq_l %[tmp_q], 0(%[qsp]), 0, 7\n\t"   /* 2 int8 -> 2 float */
+                "psq_l %[tmp_x], 0(%[xpp]), 0, 0\n\t"   /* 2 float from x */
+                "ps_madd %[acc], %[tmp_q], %[tmp_x], %[acc]\n\t"
+                "psq_l %[tmp_q], 2(%[qsp]), 0, 7\n\t"   /* next 2 int8 */
+                "psq_l %[tmp_x], 8(%[xpp]), 0, 0\n\t"   /* next 2 float */
+                "ps_madd %[acc], %[tmp_q], %[tmp_x], %[acc]\n\t"
+                "addi %[qsp], %[qsp], 4\n\t"
+                "addi %[xpp], %[xpp], 16\n\t"
                 "bdnz 1b\n\t"
-                "ps_mr %2, %0\n\t"
-                "ps_swap %3, %0\n\t"
-                "ps_add %2, %2, %3\n\t"
-                "psq_st %2, 0(%[out]), 0, 0\n\t"
-                : "=&f"(s01), "=&f"(s23), "=&f"(qf), "=&f"(xf), "+b"(qs_aligned), "+b"(xp_aligned)
-                : [nq] "r"(8), [out] "b"(&block_sum)
+                /* Reduce: swap lanes and add */
+                "ps_mr %[tmp_q], %[acc]\n\t"
+                "ps_swap %[tmp_q], %[tmp_q]\n\t"
+                "ps_add %[acc], %[acc], %[tmp_q]\n\t"
+                "psq_stx %[acc], %[out], %[zero], 1, 0\n\t"  /* W=1: store 1 float */
+                : [acc] "=&f"(acc), [tmp_q] "=&f"(tmp_q), [tmp_x] "=&f"(tmp_x),
+                  [qsp] "+b"(qsp), [xpp] "+b"(xpp)
+                : [zero] "b"(zero), [nq] "r"(8), [out] "b"(&block_sum)
                 : "ctr", "memory");
             sumf += d * block_sum;
         }
@@ -5728,6 +5732,49 @@ float vec_dot_q8_0_f32(const void *src, const float *x, int n) {
 #endif
     }
     return sumf;
+}
+
+/* vec_dot2_q8_0_f32: dot product of 2 Q8_0 weight rows against the same
+ * float32 activation x. Processes 2 output elements at once.
+ *
+ * out[0] = dot(w0, x), out[1] = dot(w1, x)
+ *
+ * Uses ps_q8_row_dot2 on PowerPC paired-singles for 2x throughput
+ * (activation x is loaded once and shared between both rows).
+ * Scalar fallback on other architectures. */
+void vec_dot2_q8_0_f32(const void *w0, const void *w1, const float *x, int n, float *out) {
+    const block_q8_0 *b0 = (const block_q8_0 *)w0;
+    const block_q8_0 *b1 = (const block_q8_0 *)w1;
+    int nb = n / 32;
+    float sum0 = 0.0f, sum1 = 0.0f;
+
+#ifdef PICOLM_PS
+    {
+        float out2[2];
+        for (int i = 0; i < nb; i++) {
+            ps_q8_row_dot2(x + i * 32, b0[i].qs, b1[i].qs, 32, out2);
+            float d0 = fp16_to_fp32_lookup(b0[i].d);
+            float d1 = fp16_to_fp32_lookup(b1[i].d);
+            sum0 += out2[0] * d0;
+            sum1 += out2[1] * d1;
+        }
+    }
+#else
+    for (int i = 0; i < nb; i++) {
+        float block0 = 0.0f, block1 = 0.0f;
+        const int8_t *qs0 = b0[i].qs;
+        const int8_t *qs1 = b1[i].qs;
+        const float *xp = x + i * 32;
+        for (int j = 0; j < 32; j++) {
+            block0 += (float)qs0[j] * xp[j];
+            block1 += (float)qs1[j] * xp[j];
+        }
+        sum0 += block0 * fp16_to_fp32_lookup(b0[i].d);
+        sum1 += block1 * fp16_to_fp32_lookup(b1[i].d);
+    }
+#endif
+    out[0] = sum0;
+    out[1] = sum1;
 }
 
 /* vec_dot_q8_0_f32_batch4: dot product of 4 Q8_0 activations against the same
@@ -10555,114 +10602,208 @@ void vec_dot_r4_q8_k_dequant_ref(const void *vx, const void *vy, int n,
  * Requires:
  *   - PowerPC 750-class CPU with paired-singles support
  *   - GQR7 set to s8 type: mtspr 919, 0x00060006
- *   - 8-byte aligned pointers for psq_l
+ *   - HID2[LSQE] enabled by kernel (supervisor bit for non-float psq_l)
  *
- * Adapted from iiama2.c (MIT license). Guard: #ifdef PICOLM_PS
+ * Faithfully adapted from iiama2.c (MIT license). Guard: #ifdef PICOLM_PS
+ *
+ * Notes:
+ *   - Each paired register holds 2 floats; C type is 'double' to match the
+ *     register width (8 bytes), but we use the "=&f" constraint.
+ *   - Static zero array is used to zero accumulators (not ps_sub, which
+ *     would produce NaN if the register held NaN).
+ *   - psq_st W=0 stores 2 floats (8 bytes); W=1 stores 1 float (4 bytes).
+ *   - block_q8_0 has qs at offset 2 (uint16_t d + int8_t qs[32]), 34-byte
+ *     stride. The qs pointer is only 2-byte aligned, which is fine for
+ *     psq_l's 2-byte int8 loads.
  * ================================================================================ */
 
 #ifdef PICOLM_PS
 
-#define GQR_S8 0x00060006u
+#define GQR_S8 0x00060006u  /* GQR7: load/store type s8, scale 0 */
 
 void ps_init_gqr(void) {
     __asm__ volatile("mtspr 919, %0" : : "r"(GQR_S8) : "memory");
 }
 
+/* ps_q8_row_dot: dot product of two int8 vectors of length n (multiple of 4).
+ *
+ * Processes 4 elements per iteration: 2 psq_l (int8->float via GQR7=s8) +
+ * 2 ps_madd (2 FMA each). Accumulates in a single paired register, then
+ * reduces to scalar.
+ *
+ * Single-row variant used when n is odd (last block). The 2-row variant
+ * ps_q8_row_dot2 is preferred when possible -- it keeps x in registers. */
 void ps_q8_row_dot(const int8_t *x, const int8_t *w, int n, float *out) {
-    /* n must be a multiple of 4. Processes 4 int8 pairs per iteration.
-     * psq_l with GQR7=s8 loads 2 int8 -> 2 float, ps_madd does 2 FMAs. */
-    float s01, s23;
+    static const float zero[2] __attribute__((aligned(8))) = {0.0f, 0.0f};
+    double acc, xf, wf;
+
     __asm__ volatile(
-        "psq_l %0, 0(%[zero]), 0, 0\n\t"
-        "ps_mr %1, %0\n\t"
+        "psq_l %[acc], 0(%[zero]), 0, 0\n\t"
         "mtctr %[nq]\n"
         "1:\n\t"
-        "psq_l %0, 0(%[x]), 0, 7\n\t"
-        "psq_l %1, 0(%[w]), 0, 7\n\t"
-        "ps_madd %2, %1, %0, %2\n\t"
-        "psq_l %0, 2(%[x]), 0, 7\n\t"
-        "psq_l %1, 2(%[w]), 0, 7\n\t"
-        "ps_madd %2, %1, %0, %2\n\t"
+        "psq_l %[xf], 0(%[x]), 0, 7\n\t"    /* x[0..1] as floats */
+        "psq_l %[wf], 0(%[w]), 0, 7\n\t"     /* w[0..1] as floats */
+        "ps_madd %[acc], %[wf], %[xf], %[acc]\n\t"
+        "psq_l %[xf], 2(%[x]), 0, 7\n\t"    /* x[2..3] */
+        "psq_l %[wf], 2(%[w]), 0, 7\n\t"    /* w[2..3] */
+        "ps_madd %[acc], %[wf], %[xf], %[acc]\n\t"
         "addi %[x], %[x], 4\n\t"
         "addi %[w], %[w], 4\n\t"
         "bdnz 1b\n\t"
-        "ps_mr %0, %2\n\t"
-        "ps_swap %1, %2\n\t"
-        "ps_add %0, %0, %1\n\t"
-        "psq_st %0, 0(%[out]), 0, 0\n\t"
-        : "=&f"(s01), "=&f"(s23), "+f"(s01)
-        : [x] "b"(x), [w] "b"(w), [nq] "r"(n / 4), [out] "b"(out)
+        /* Reduce: swap lanes and add to get scalar sum in low lane */
+        "ps_mr %[wf], %[acc]\n\t"
+        "ps_swap %[wf], %[wf]\n\t"
+        "ps_add %[acc], %[acc], %[wf]\n\t"
+        "psq_stx %[acc], %[out], %[zero], 1, 0\n\t"  /* W=1: store 1 float */
+        : [acc] "=&f"(acc), [xf] "=&f"(xf), [wf] "=&f"(wf), [x] "+b"(x), [w] "+b"(w)
+        : [zero] "b"(zero), [nq] "r"(n / 4), [out] "b"(out)
         : "ctr", "memory");
 }
 
-void ps_qk4_s8(const float *q, const int8_t *k, int kv_dim, int pairs, float *out) {
-    /* Four attention q.k scores at once from int8 key cache.
-     * q: float32 query (head_size elements, 8-byte aligned)
-     * k: int8 key cache, 4 positions, kv_dim apart
-     * pairs: head_size / 2
-     * out: 4 float scores */
-    float s01, s23, qq, k0, k1, k2, k3, m0, m1, m2, m3;
-    int o1 = kv_dim, o2 = 2 * kv_dim, o3 = 3 * kv_dim;
+/* ps_q8_row_dot2: dot product of 2 weight rows (w0, w1) against the same
+ * activation x, both of length n (multiple of 4).
+ *
+ * Faithful adaptation of iiama2.c's q8_group2. Processes 4 elements per
+ * iteration for each row: 2 psq_l for x (loaded once, used for both rows),
+ * 2 psq_l for w0, 2 psq_l for w1, 4 ps_madd total.
+ *
+ * out[0] = dot(x, w0), out[1] = dot(x, w1) */
+void ps_q8_row_dot2(const int8_t *x, const int8_t *w0, const int8_t *w1, int n, float *out) {
+    static const float zero[2] __attribute__((aligned(8))) = {0.0f, 0.0f};
+    double a01, a23, b01, b23, xf01, xf23, wf01, wf23, vf01, vf23;
+
     __asm__ volatile(
-        "psq_l %0, 0(%[zero]), 0, 0\n\t"
-        "ps_mr %1, %0\n\t"
+        "psq_l %[a01], 0(%[zero]), 0, 0\n\t"
+        "ps_mr %[a23], %[a01]\n\t"
+        "ps_mr %[b01], %[a01]\n\t"
+        "ps_mr %[b23], %[a01]\n\t"
+        "mtctr %[nq]\n"
+        "1:\n\t"
+        "psq_l %[xf01], 0(%[x]), 0, 0\n\t"    /* x[0..1], x[2..3] as floats */
+        "psq_l %[xf23], 8(%[x]), 0, 0\n\t"
+        "psq_l %[wf01], 0(%[w0]), 0, 7\n\t"    /* w0[0..1] as floats */
+        "psq_l %[wf23], 2(%[w0]), 0, 7\n\t"    /* w0[2..3] as floats */
+        "psq_l %[vf01], 0(%[w1]), 0, 7\n\t"    /* w1[0..1] as floats */
+        "psq_l %[vf23], 2(%[w1]), 0, 7\n\t"    /* w1[2..3] as floats */
+        "addi %[x], %[x], 16\n\t"
+        "addi %[w0], %[w0], 4\n\t"
+        "addi %[w1], %[w1], 4\n\t"
+        "ps_madd %[a01], %[wf01], %[xf01], %[a01]\n\t"
+        "ps_madd %[a23], %[wf23], %[xf23], %[a23]\n\t"
+        "ps_madd %[b01], %[vf01], %[xf01], %[b01]\n\t"
+        "ps_madd %[b23], %[vf23], %[xf23], %[b23]\n\t"
+        "bdnz 1b\n\t"
+        /* Reduce: horizontal sum each accumulator, then add pairs for complete dot.
+         * Matches original grouping: ((a0+a1)+(a2+a3)) for row 0. */
+        "ps_mr %[xf01], %[a01]\n\t"
+        "ps_swap %[xf01], %[xf01]\n\t"
+        "ps_add %[a01], %[a01], %[xf01]\n\t"  /* a01: both lanes = a0+a1 */
+        "ps_mr %[xf01], %[a23]\n\t"
+        "ps_swap %[xf01], %[xf01]\n\t"
+        "ps_add %[a23], %[a23], %[xf01]\n\t"  /* a23: both lanes = a2+a3 */
+        "ps_add %[a01], %[a01], %[a23]\n\t"   /* a01: both lanes = (a0+a1)+(a2+a3) */
+        "ps_mr %[xf01], %[b01]\n\t"
+        "ps_swap %[xf01], %[xf01]\n\t"
+        "ps_add %[b01], %[b01], %[xf01]\n\t"  /* b01: both lanes = b0+b1 */
+        "ps_mr %[xf01], %[b23]\n\t"
+        "ps_swap %[xf01], %[xf01]\n\t"
+        "ps_add %[b23], %[b23], %[xf01]\n\t"  /* b23: both lanes = b2+b3 */
+        "ps_add %[b01], %[b01], %[b23]\n\t"   /* b01: both lanes = (b0+b1)+(b2+b3) */
+        "psq_stx %[a01], %[out], %[zero], 1, 0\n\t"  /* out[0] = dot(x, w0) */
+        "psq_stx %[b01], %[out], %[zero], 1, 4\n\t"  /* out[1] = dot(x, w1) */
+        : [a01] "=&f"(a01), [a23] "=&f"(a23), [b01] "=&f"(b01), [b23] "=&f"(b23),
+          [xf01] "=&f"(xf01), [xf23] "=&f"(xf23), [wf01] "=&f"(wf01), [wf23] "=&f"(wf23),
+          [vf01] "=&f"(vf01), [vf23] "=&f"(vf23),
+          [x] "+b"(x), [w0] "+b"(w0), [w1] "+b"(w1)
+        : [zero] "b"(zero), [nq] "r"(n / 4), [out] "b"(out)
+        : "ctr", "memory");
+}
+
+/* ps_qk4_s8: four attention q.k scores at once from int8 key cache.
+ *
+ * q:      float32 query (head_size elements, 8-byte aligned)
+ * k:      int8 key cache, 4 positions, each kv_dim elements apart
+ * kv_dim: stride between positions in the key cache
+ * pairs:  head_size / 2 (number of paired iterations)
+ * out:    4 float scores (out[0]=q.k0, out[1]=q.k1, out[2]=q.k2, out[3]=q.k3)
+ *
+ * Each iteration processes 2 elements of q against 2 elements of each of
+ * the 4 key positions. ps_merge00/11 interleaves key values from different
+ * positions so ps_madds can accumulate all 4 scores simultaneously.
+ *
+ * NOTE: This is dead code for the current Q8_0 KV cache layout (34-byte
+ * blocks with fp16 scales), but preserved for future flat int8 KV cache. */
+void ps_qk4_s8(const float *q, const int8_t *k, int kv_dim, int pairs, float *out) {
+    static const float zero[2] __attribute__((aligned(8))) = {0.0f, 0.0f};
+    double s01, s23, qq, k0, k1, k2, k3, m0, m1, m2, m3;
+    int o1 = kv_dim, o2 = 2 * kv_dim, o3 = 3 * kv_dim;
+
+    __asm__ volatile(
+        "psq_l %[s01], 0(%[zero]), 0, 0\n\t"
+        "ps_mr %[s23], %[s01]\n\t"
         "mtctr %[pairs]\n"
         "1:\n\t"
-        "psq_l %2, 0(%[q]), 0, 0\n\t"
-        "psq_l %3, 0(%[k]), 0, 7\n\t"
-        "psq_lx %4, %[k], %[o1], 0, 7\n\t"
-        "psq_lx %5, %[k], %[o2], 0, 7\n\t"
-        "psq_lx %6, %[k], %[o3], 0, 7\n\t"
+        "psq_l %[qq], 0(%[q]), 0, 0\n\t"
+        "psq_l %[k0], 0(%[k]), 0, 7\n\t"
+        "psq_lx %[k1], %[k], %[o1], 0, 7\n\t"
+        "psq_lx %[k2], %[k], %[o2], 0, 7\n\t"
+        "psq_lx %[k3], %[k], %[o3], 0, 7\n\t"
         "addi %[q], %[q], 8\n\t"
         "addi %[k], %[k], 2\n\t"
-        "ps_merge00 %7, %3, %4\n\t"
-        "ps_merge00 %8, %5, %6\n\t"
-        "ps_merge11 %9, %3, %4\n\t"
-        "ps_merge11 %10, %5, %6\n\t"
-        "ps_madds0 %0, %7, %2, %0\n\t"
-        "ps_madds0 %1, %8, %2, %1\n\t"
-        "ps_madds1 %0, %9, %2, %0\n\t"
-        "ps_madds1 %1, %10, %2, %1\n\t"
+        "ps_merge00 %[m0], %[k0], %[k1]\n\t"
+        "ps_merge00 %[m2], %[k2], %[k3]\n\t"
+        "ps_merge11 %[m1], %[k0], %[k1]\n\t"
+        "ps_merge11 %[m3], %[k2], %[k3]\n\t"
+        "ps_madds0 %[s01], %[m0], %[qq], %[s01]\n\t"
+        "ps_madds0 %[s23], %[m2], %[qq], %[s23]\n\t"
+        "ps_madds1 %[s01], %[m1], %[qq], %[s01]\n\t"
+        "ps_madds1 %[s23], %[m3], %[qq], %[s23]\n\t"
         "bdnz 1b\n\t"
-        "psq_st %0, 0(%[out]), 0, 0\n\t"
-        "psq_st %1, 8(%[out]), 0, 0\n\t"
-        : "=&f"(s01), "=&f"(s23), "=&f"(qq), "=&f"(k0), "=&f"(k1),
-          "=&f"(k2), "=&f"(k3), "=&f"(m0), "=&f"(m1), "=&f"(m2), "=&f"(m3),
-          "+b"(q), "+b"(k)
-        : [o1] "r"(o1), [o2] "r"(o2), [o3] "r"(o3),
-          [pairs] "r"(pairs), [out] "b"(out)
+        "psq_st %[s01], 0(%[out]), 0, 0\n\t"
+        "psq_st %[s23], 8(%[out]), 0, 0\n\t"
+        : [s01] "=&f"(s01), [s23] "=&f"(s23), [qq] "=&f"(qq),
+          [k0] "=&f"(k0), [k1] "=&f"(k1), [k2] "=&f"(k2), [k3] "=&f"(k3),
+          [m0] "=&f"(m0), [m1] "=&f"(m1), [m2] "=&f"(m2), [m3] "=&f"(m3),
+          [q] "+b"(q), [k] "+b"(k)
+        : [zero] "b"(zero), [pairs] "r"(pairs),
+          [o1] "r"(o1), [o2] "r"(o2), [o3] "r"(o3),
+          [out] "b"(out)
         : "ctr", "memory");
 }
 
+/* ps_axpy_s8: xb[i] += a * v[i] for i = 0..8*octets-1.
+ *
+ * v is int8, a is float scale. Processes 8 elements per iteration:
+ * 4 paired loads of xb (float), 4 paired loads of v (int8->float via GQR7),
+ * 4 ps_madds0, 4 paired stores. */
 void ps_axpy_s8(float *xb, const int8_t *v, float a, int octets) {
-    /* xb[i] += a * v[i] for i = 0..8*octets-1.
-     * v is int8, a is float scale. 8 elements per iteration. */
-    float x0, x1, x2, x3, v0, v1, v2, v3;
+    double x0, x1, x2, x3, v0, v1, v2, v3;
+
     __asm__ volatile(
         "mtctr %[octets]\n"
         "1:\n\t"
-        "psq_l %0, 0(%[xb]), 0, 0\n\t"
-        "psq_l %1, 8(%[xb]), 0, 0\n\t"
-        "psq_l %2, 16(%[xb]), 0, 0\n\t"
-        "psq_l %3, 24(%[xb]), 0, 0\n\t"
-        "psq_l %4, 0(%[v]), 0, 7\n\t"
-        "psq_l %5, 2(%[v]), 0, 7\n\t"
-        "psq_l %6, 4(%[v]), 0, 7\n\t"
-        "psq_l %7, 6(%[v]), 0, 7\n\t"
-        "ps_madds0 %0, %4, %[a], %0\n\t"
-        "ps_madds0 %1, %5, %[a], %1\n\t"
-        "ps_madds0 %2, %6, %[a], %2\n\t"
-        "ps_madds0 %3, %7, %[a], %3\n\t"
-        "psq_st %0, 0(%[xb]), 0, 0\n\t"
-        "psq_st %1, 8(%[xb]), 0, 0\n\t"
-        "psq_st %2, 16(%[xb]), 0, 0\n\t"
-        "psq_st %3, 24(%[xb]), 0, 0\n\t"
+        "psq_l %[x0], 0(%[xb]), 0, 0\n\t"
+        "psq_l %[x1], 8(%[xb]), 0, 0\n\t"
+        "psq_l %[x2], 16(%[xb]), 0, 0\n\t"
+        "psq_l %[x3], 24(%[xb]), 0, 0\n\t"
+        "psq_l %[v0], 0(%[v]), 0, 7\n\t"
+        "psq_l %[v1], 2(%[v]), 0, 7\n\t"
+        "psq_l %[v2], 4(%[v]), 0, 7\n\t"
+        "psq_l %[v3], 6(%[v]), 0, 7\n\t"
+        "ps_madds0 %[x0], %[v0], %[a], %[x0]\n\t"
+        "ps_madds0 %[x1], %[v1], %[a], %[x1]\n\t"
+        "ps_madds0 %[x2], %[v2], %[a], %[x2]\n\t"
+        "ps_madds0 %[x3], %[v3], %[a], %[x3]\n\t"
+        "psq_st %[x0], 0(%[xb]), 0, 0\n\t"
+        "psq_st %[x1], 8(%[xb]), 0, 0\n\t"
+        "psq_st %[x2], 16(%[xb]), 0, 0\n\t"
+        "psq_st %[x3], 24(%[xb]), 0, 0\n\t"
         "addi %[xb], %[xb], 32\n\t"
         "addi %[v], %[v], 8\n\t"
         "bdnz 1b\n\t"
-        : "=&f"(x0), "=&f"(x1), "=&f"(x2), "=&f"(x3),
-          "=&f"(v0), "=&f"(v1), "=&f"(v2), "=&f"(v3),
-          "+b"(xb), "+b"(v)
+        : [x0] "=&f"(x0), [x1] "=&f"(x1), [x2] "=&f"(x2), [x3] "=&f"(x3),
+          [v0] "=&f"(v0), [v1] "=&f"(v1), [v2] "=&f"(v2), [v3] "=&f"(v3),
+          [xb] "+b"(xb), [v] "+b"(v)
         : [a] "f"(a), [octets] "r"(octets)
         : "ctr", "memory");
 }
