@@ -1306,6 +1306,52 @@ done:
 }
 #endif
 
+/* SSM checkpoint support for CLI (used with --cache for hybrid models).
+ * Lightweight linked-list of snapshots; appended to the cache file on save. */
+typedef struct cli_checkpoint {
+    int n_tokens;
+    uint8_t *data;
+    struct cli_checkpoint *next;
+} cli_checkpoint_t;
+static cli_checkpoint_t *cli_checkpoints = NULL;
+static size_t cli_checkpoint_snapshot_size = 0;
+static uint8_t *cli_checkpoint_scratch = NULL;
+
+/* Helper: save a CLI SSM checkpoint at position n_tokens.
+ * Evicts oldest (smallest n_tokens) if at capacity.
+ * Skips if a checkpoint at exactly this position already exists. */
+static int cli_checkpoint_save(model_t *model, int checkpoint_max, int n_tokens) {
+    if (checkpoint_max <= 0) return 0;
+    if (cli_checkpoint_snapshot_size == 0) return 0;
+    /* Skip duplicates */
+    for (cli_checkpoint_t *c = cli_checkpoints; c; c = c->next) {
+        if (c->n_tokens == n_tokens) return 0;
+    }
+    /* Evict oldest if at capacity */
+    { int n_cp = 0; for (cli_checkpoint_t *c = cli_checkpoints; c; c = c->next) n_cp++;
+      while (n_cp >= checkpoint_max && cli_checkpoints) {
+          cli_checkpoint_t *old = cli_checkpoints; cli_checkpoints = old->next;
+          free(old->data); free(old); n_cp--; } }
+    cli_checkpoint_t *cp = (cli_checkpoint_t *)calloc(1, sizeof(*cp));
+    if (!cp) return 0;
+    cp->n_tokens = n_tokens;
+    cp->data = (uint8_t *)malloc(cli_checkpoint_snapshot_size);
+    if (!cp->data) { free(cp); return 0; }
+    size_t written = model_recurrent_state_save(model, cp->data, cli_checkpoint_snapshot_size);
+    if (written == 0) { free(cp->data); free(cp); return 0; }
+    /* Insert in sorted order */
+    cli_checkpoint_t *prev = NULL, *cur = cli_checkpoints;
+    while (cur && cur->n_tokens < cp->n_tokens) { prev = cur; cur = cur->next; }
+    if (prev) prev->next = cp; else cli_checkpoints = cp;
+    cp->next = cur;
+    /* Count current checkpoints for logging */
+    int n_now = 0; for (cli_checkpoint_t *c = cli_checkpoints; c; c = c->next) n_now++;
+    fprintf(stderr, "  [ssm checkpoint] created checkpoint %d of %d (n_tokens=%d, size=%.3f MiB)\n",
+            n_now, checkpoint_max, n_tokens,
+            (double)cli_checkpoint_snapshot_size / (1024.0 * 1024.0));
+    return 1;
+}
+
 int main(int argc, char **argv) {
     fp16_table_init();
 
@@ -2009,17 +2055,6 @@ int main(int argc, char **argv) {
         if (sr) { fprintf(stderr, "ERROR: steering setup failed\n"); model_free(&model); return 1; }
     }
 
-    /* SSM checkpoint support for CLI (used with --cache for hybrid models).
-     * Lightweight linked-list of snapshots; appended to the cache file on save. */
-    typedef struct cli_checkpoint {
-        int n_tokens;
-        uint8_t *data;
-        struct cli_checkpoint *next;
-    } cli_checkpoint_t;
-    static cli_checkpoint_t *cli_checkpoints = NULL;
-    static size_t cli_checkpoint_snapshot_size = 0;
-    static uint8_t *cli_checkpoint_scratch = NULL;
-
     /* Try to load KV cache (skip prefill for cached prompt) */
     int cache_pos = 0;
     int *cache_tokens = NULL;
@@ -2576,41 +2611,6 @@ int main(int argc, char **argv) {
         total_steps = model.config.max_seq_len;
     }
 
-    /* Helper: save a CLI SSM checkpoint at position n_tokens.
-     * Evicts oldest (smallest n_tokens) if at capacity.
-     * Skips if a checkpoint at exactly this position already exists. */
-    int cli_checkpoint_save(int n_tokens) {
-        if (checkpoint_max <= 0) return 0;
-        if (cli_checkpoint_snapshot_size == 0) return 0;
-        /* Skip duplicates */
-        for (cli_checkpoint_t *c = cli_checkpoints; c; c = c->next) {
-            if (c->n_tokens == n_tokens) return 0;
-        }
-        /* Evict oldest if at capacity */
-        { int n_cp = 0; for (cli_checkpoint_t *c = cli_checkpoints; c; c = c->next) n_cp++;
-          while (n_cp >= checkpoint_max && cli_checkpoints) {
-              cli_checkpoint_t *old = cli_checkpoints; cli_checkpoints = old->next;
-              free(old->data); free(old); n_cp--; } }
-        cli_checkpoint_t *cp = (cli_checkpoint_t *)calloc(1, sizeof(*cp));
-        if (!cp) return 0;
-        cp->n_tokens = n_tokens;
-        cp->data = (uint8_t *)malloc(cli_checkpoint_snapshot_size);
-        if (!cp->data) { free(cp); return 0; }
-        size_t written = model_recurrent_state_save(&model, cp->data, cli_checkpoint_snapshot_size);
-        if (written == 0) { free(cp->data); free(cp); return 0; }
-        /* Insert in sorted order */
-        cli_checkpoint_t *prev = NULL, *cur = cli_checkpoints;
-        while (cur && cur->n_tokens < cp->n_tokens) { prev = cur; cur = cur->next; }
-        if (prev) prev->next = cp; else cli_checkpoints = cp;
-        cp->next = cur;
-        /* Count current checkpoints for logging */
-        int n_now = 0; for (cli_checkpoint_t *c = cli_checkpoints; c; c = c->next) n_now++;
-        fprintf(stderr, "  [ssm checkpoint] created checkpoint %d of %d (n_tokens=%d, size=%.3f MiB)\n",
-                n_now, checkpoint_max, n_tokens,
-                (double)cli_checkpoint_snapshot_size / (1024.0 * 1024.0));
-        return 1;
-    }
-
     /* Batch prefill: process only the NEW prompt tokens (the first start_pos are cached) */
     float *logits = NULL;
     if (n_prompt - start_pos > 0) {
@@ -2660,7 +2660,7 @@ int main(int argc, char **argv) {
                 if (chunk_size <= 0) chunk_size = 1;
                 /* Save checkpoint before processing this chunk (not at start_pos itself) */
                 if (off > 0) {
-                    cli_checkpoint_save(cur_pos);
+                    cli_checkpoint_save(&model, checkpoint_max, cur_pos);
                 }
 #ifdef PICOLM_GPU
                 if (model.gpu.kv_active) {
@@ -2813,7 +2813,7 @@ int main(int argc, char **argv) {
         /* Generation checkpoint: every checkpoint_interval_gen tokens */
         if (checkpoint_max > 0 && model_has_recurrent_state(&model) && cli_checkpoint_snapshot_size > 0
             && total_gen % checkpoint_interval_gen == 0) {
-            cli_checkpoint_save(start_pos + n_prompt + total_gen);
+            cli_checkpoint_save(&model, checkpoint_max, start_pos + n_prompt + total_gen);
         }
 
         /* Stop on EOS or grammar completion */
