@@ -2856,20 +2856,55 @@ typedef struct {
 typedef struct { int nrows, ncols, k; const void *w, *a; float *out; size_t bs;
                  type_gemm_fn fn; } gemm_table_ctx_t;
 
+/* Set by any thread whose fn_gemm call did real work. See gemm_table_task. */
+static volatile int gemm_table_any_ok;
+
 static void gemm_table_task(int idx, void *ctxp) {
     gemm_table_ctx_t *c = (gemm_table_ctx_t *)ctxp;
     int nth = pool_total_threads(1);
+    /* Clamp the effective thread count to the work available.
+     *
+     * The kernels split columns as start_col = ncols*ith/nth, so when
+     * nth > ncols an integer division gives *every* thread an empty range --
+     * not just the surplus ones. With ncols=2 and nth=24 all 24 threads get
+     * [0,0) and the whole GEMM silently does nothing.
+     *
+     * Tensor ids past the new `nth` would otherwise still run, so they are
+     * turned into no-ops here rather than relying on the split. */
+    if (nth > c->ncols) nth = c->ncols;
+    if (nth < 1) nth = 1;
+    if (idx >= nth) return;
     int r = c->fn(c->nrows, c->ncols, c->k, c->w, c->a, c->out, c->bs, idx, nth);
-    /* fn_gemm returning 0 means "not implemented for this build".
-     * If we silently continue, the output buffer remains uninitialized or
-     * zeroed, producing plausible-looking garbage text. Refuse instead. */
-    if (r == 0) {
-        fprintf(stderr,
-                "FATAL: fn_gemm returned 0 (no implementation for this SIMD build).\n"
-                "       nrows=%d ncols=%d k=%d. Check the sgemm_*.c source.\n",
-                c->nrows, c->ncols, c->k);
-        abort();
-    }
+    /* fn_gemm returning 0 means one of two things, and they must not be
+     * conflated:
+     *
+     *  a) "not implemented for this build/shape" -- then nothing was computed
+     *     and the output buffer is uninitialised, which produces
+     *     plausible-looking garbage text. That must be fatal.
+     *  b) "this thread has no columns/rows to process" -- the kernels split
+     *     work as start_col = ncols*ith/nth, so with more threads than columns
+     *     most threads legitimately get an empty range and return 0.
+     *
+     * The R4/R8 types reach this path at n_batch >= 1, so decode-shaped calls
+     * like nrows=32 ncols=2 k=64 happen. Clamping above makes nth == ncols there
+     * and all of them do work, but keep this check anyway: it is the guard that
+     * stops a genuinely unimplemented kernel from silently producing garbage,
+     * and it is what caught this bug (a CI case,
+     * `./picolm models/stories260K-stuffed.gguf -p Once`).
+     *
+     * So: record that *someone* succeeded, and only abort at the end if no
+     * thread did. */
+    if (r != 0) gemm_table_any_ok = 1;
+}
+
+/* Called once after the dispatch completes; aborts if nothing was computed. */
+static void gemm_table_check(int nrows, int ncols, int k) {
+    if (gemm_table_any_ok) return;
+    fprintf(stderr,
+            "FATAL: fn_gemm returned 0 (no implementation for this SIMD build).\n"
+            "       nrows=%d ncols=%d k=%d nth=%d. Check the sgemm_*.c source.\n",
+            nrows, ncols, k, pool_total_threads(1));
+    abort();
 }
 
 /* Dual-matrix variant of gemm_table_task: two same-shaped GEMMs against ONE
@@ -3458,9 +3493,17 @@ void matmul_batch(float *out, const float *x, int n_batch,
      * interleave already provides multiple rows per kernel call. */
     if (ti->fn_gemm && (n_batch >= 2 || (ti->rows_per_block > 1 && n_batch >= 1))) {
         int nth = pool_total_threads(1);
+        /* Never wake more threads than there are columns to fill: the kernels
+         * partition ncols across nth with integer division, so nth > ncols
+         * leaves *every* thread with an empty range and the GEMM does nothing.
+         * (gemm_table_task clamps again for callers that arrive with a pool
+         * size rather than a dispatch size.) */
+        if (nth > n_batch) nth = n_batch;
         /* Use a task wrapper that passes the table's fn_gemm with correct ith */
         gemm_table_ctx_t ctx = { d, n_batch, n, W, qb.qbuf, out, d, ti->fn_gemm };
+        gemm_table_any_ok = 0;
         tensor_parallel_for(nth, gemm_table_task, &ctx);
+        gemm_table_check(d, n_batch, n);
         DISPATCH("GEMM_table");
         free_quant_buf(&qb, NULL);
         return;
