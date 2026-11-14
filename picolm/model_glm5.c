@@ -1196,6 +1196,25 @@ static float *glm5_mla_scores_scratch(size_t need) {
  * Not bit-identical: each cached value is rounded to F16 first. Validate with
  * top-1 agreement / logit KL, not max|diff|. PICOLM_GLM5_MLA_F16=0 disables.
  */
+/* Refresh the F16 shadow of the MLA latent cache from the F32 master for rows
+ * [pos0, pos0+n) of MLA ordinal `ord`.
+ *
+ * Decode attention reads ONLY the shadow, so every writer of the F32 master
+ * has to mirror into it: the decode store does that inline, and the batched
+ * prefill store and the snapshot/checkpoint restore must call this. A row that
+ * is never mirrored stays all-zero in the shadow, i.e. a prompt (or restored
+ * context) that attention silently cannot see. */
+static void glm5_mla_shadow_sync(const run_state_t *s, int max_seq, int KVL,
+                                 int ord, int pos0, int n)
+{
+    if (!s->glm5.mla_kv16 || n <= 0) return;
+    const size_t base = ((size_t)ord * max_seq + (size_t)pos0) * KVL;
+    const float *src = s->glm5.mla_kv + base;
+    uint16_t *dst = s->glm5.mla_kv16 + base;
+    const size_t cnt = (size_t)n * KVL;
+    for (size_t i = 0; i < cnt; i++) dst[i] = fp32_to_fp16(src[i]);
+}
+
 #if defined(PICOLM_AVX512)
 /* F16 -> F32 for 16 lanes; cvtsh_ss needs F16C, which AVX-512 implies. */
 static inline __m512 glm5_f16x16_to_ps(const uint16_t *p) {
@@ -3015,6 +3034,8 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                         for (int t = 0; t < n_tokens; t++)
                             memcpy(cache + (size_t)(start_pos + t) * KVL,
                                    kv_plane + (size_t)t*KVL, KVL * sizeof(float));
+                        glm5_mla_shadow_sync(s, c->max_seq_len, KVL, mla_ord,
+                                             start_pos, n_tokens);
                     }
 
                     /* qabs for the whole batch: qabs[t][h] = Wk_b[h] @ q_t[h].
@@ -3466,6 +3487,7 @@ size_t model_glm5_state_restore(model_t *m, const uint8_t *buf, size_t buf_size,
         size_t sz = (size_t)n_pos * c->glm5_kv_lora * sizeof(float);
         memcpy(cache, buf + off, sz);
         off += sz;
+        glm5_mla_shadow_sync(s, c->max_seq_len, c->glm5_kv_lora, ord, 0, n_pos);
     }
     for (int l = 0; l < c->n_layers; l++) {
         if (c->glm5_layer_is_mla[l]) continue;

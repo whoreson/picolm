@@ -811,6 +811,14 @@ test_attn_diff: test_attn_diff.c model_attention.c tensor.c type_dispatch.c quan
 test_glm5_snapshot: tests/test_glm5_snapshot.c model_glm5.c model_moe.c model_kv_cache.c model_ssm.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) model.h
 	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O2 -o $@ tests/test_glm5_snapshot.c model_glm5.c model_moe.c model_kv_cache.c model_ssm.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
 
+# F16 MLA shadow stays in sync with the F32 master across restore and prefill.
+test_glm5_mla_shadow: tests/test_glm5_mla_shadow.c model_glm5.c model_moe.c model_ssm.c model_kv_cache.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) model.h
+	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O2 -o $@ tests/test_glm5_mla_shadow.c model_moe.c model_ssm.c model_kv_cache.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
+
+.PHONY: check-glm5-mla-shadow
+check-glm5-mla-shadow: test_glm5_mla_shadow
+	./test_glm5_mla_shadow
+
 # MLA PV: current block reduce vs a register-tiled variant, as cache footprint grows.
 bench_glm5_mla_pv: tests/bench_glm5_mla_pv.c model_glm5.c model_moe.c model_ssm.c model_kv_cache.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) model.h
 	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O2 -o $@ tests/bench_glm5_mla_pv.c model_moe.c model_ssm.c model_kv_cache.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
