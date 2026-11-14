@@ -700,7 +700,9 @@ static void ssm_head_task(int h, void *ctxp) {
  *
  * Kept as the reference formulation; ssm_kernel_veffsq_n below fuses this
  * with ssm_kernel_sq_n, so the AVX-512 build does not call it directly. */
+#if !defined(_MSC_VER)
 __attribute__((unused))
+#endif
 static void ssm_kernel_veff_n(
         float *sk,        /* [cs][nr] output */
         const float *state, /* [nr][d] state */
@@ -947,7 +949,9 @@ static void ssm_kernel_state_update_n(
  * Same structure as Kernel 1 but with q instead of k.
  *
  * Paired with ssm_kernel_veff_n; ssm_kernel_veffsq_n fuses the two. */
+#if !defined(_MSC_VER)
 __attribute__((unused))
+#endif
 static void ssm_kernel_sq_n(
         float *sq,        /* [cs][nr] output */
         const float *state, /* [nr][d] state */
