@@ -412,7 +412,20 @@ int tensor_get_big_cores(void) {
 /* Threshold: skip threading if output vector is smaller than this.
  * Avoids mutex overhead for tiny matmuls. */
 static double barrier_now(void);   /* monotonic clock, defined below */
-static int matmul_min_rows = 256;  /* lowered from 1024 to cover d=512 (MoE shared expert) */
+static int matmul_min_rows = 16;   /* decode matmuls with d>=16 are worth threading:
+                                    * GLM-5 hc_pre is n=16384 x d=24 and gains ~8 ms/token. */
+
+/* PICOLM_MATMUL_MIN_ROWS overrides the threshold above. Useful because some
+ * decode matmuls are narrow but wide in k (GLM-5's hc_pre is n=16384, d=24),
+ * and whether threading them wins is a measurement, not a principle. */
+static int matmul_min_rows_eff(void) {
+    static int v = 0;
+    if (!v) {
+        const char *e = getenv("PICOLM_MATMUL_MIN_ROWS");
+        v = (e && atoi(e) > 0) ? atoi(e) : matmul_min_rows;
+    }
+    return v;
+}
 
 void tensor_set_matmul_min_rows(int r) {
     if (r < 0) r = 0;
@@ -1689,7 +1702,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
 
     /* F32/F16: use generic vec_dot or tiled GEMM */
     if (!ti || ti->act_fmt == ACT_FMT_F32) {
-        if (d < matmul_min_rows || n_threads <= 1) {
+        if (d < matmul_min_rows_eff() || n_threads <= 1) {
             for (int i = 0; i < d; i++)
                 out[i] = vec_dot(wptr + (size_t)i * row_bytes, x, n, qtype);
             return;
@@ -1762,7 +1775,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
     }
 
     /* Single-threaded or small d: direct GEMV */
-    if (n_threads <= 1 || d < 4 || d < matmul_min_rows) {
+    if (n_threads <= 1 || d < 4 || d < matmul_min_rows_eff()) {
         if (ti->rows_per_block > 1) {
             /* Interleaved: process rows in groups */
             int rpb = ti->rows_per_block;
@@ -1935,7 +1948,7 @@ void matmul_q8(float *out, const void *qx, const float *qx_d,
 
     if (qtype == GGUF_TYPE_Q8_0 && n > 0) {
         /* Use Q8xQ8 dot products with pre-converted deltas */
-        if (n_threads <= 1 || d < 4 || d < matmul_min_rows) {
+        if (n_threads <= 1 || d < 4 || d < matmul_min_rows_eff()) {
             for (int i = 0; i < d; i++) {
                 out[i] = vec_dot_q8_0_q8_0_deltas(qx, qx_d, wptr + (size_t)i * row_bytes, n);
             }
