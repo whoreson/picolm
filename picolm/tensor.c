@@ -3249,12 +3249,16 @@ void matmul_batch(float *out, const float *x, int n_batch,
     /* Try tiled GEMM if available for this type.
      * Must use tensor_parallel_for to dispatch with correct ith/nth per thread. */
 #if (defined(__AVX2__) && defined(__F16C__)) || defined(__ARM_NEON)
-    /* The n_batch >= 4 gate exists because a tiled GEMM pays off only once it
-     * has columns to amortise its per-tile setup over. That reasoning does not
-     * apply to the interleaved R4 types: q2_k_r4 measured 12.2 GFLOPS at n=1
-     * with its table GEMM against 3.3 GFLOPS on the scalar gemv path, because
-     * the row interleave already gives it 4 rows of work. So allow R4 at n=1. */
-    if (ti->fn_gemm && (n_batch >= 4 || (ti->rows_per_block > 1 && n_batch >= 1))) {
+    /* Lowered from n_batch >= 4 to n_batch >= 2: the table fn_gemm kernels
+     * (e.g. sgemm_iq6_k_q8_k_best -> sgemm_iq6_k_q8_k_avx2) tile at 1 row x 2
+     * columns and are still faster than the per-row GEMV threaded_worker path
+     * even at batch=2. The MoE FFN frequently hits n_e in [2..3], and the old
+     * threshold of 4 forced those through threaded_worker which decodes every
+     * weight row independently with no tile amortization.
+     *
+     * R4 types (rows_per_block > 1) are allowed at n=1 as before: their
+     * interleave already provides multiple rows per kernel call. */
+    if (ti->fn_gemm && (n_batch >= 2 || (ti->rows_per_block > 1 && n_batch >= 1))) {
         int nth = pool_total_threads(1);
         /* Use a task wrapper that passes the table's fn_gemm with correct ith */
         gemm_table_ctx_t ctx = { d, n_batch, n, W, qb.qbuf, out, d, ti->fn_gemm };
