@@ -51,6 +51,7 @@ test_attn_decode
 test_hreduce
 test_kvcache_tokwrite
 test_pool_stress
+test_pool_gaps
 test_q6_k_r4
 
 # misc

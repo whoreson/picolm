@@ -129,6 +129,20 @@ static void glm5_prof_print(void) {
         fprintf(stderr, "  %-22s %12.2f %7.1f%%\n", glm5_prof_names[i],
                 g_gp.ms[i] / g_gp.tokens, 100.0 * g_gp.ms[i] / total);
     }
+    {   /* PICOLM_POOL_GAPS=1: where the main thread's time goes around the pool */
+        double gap, mn, wt, wk; long n;
+        const int T = g_gp.tokens - 1;   /* first token was dropped by the reset */
+        if (T > 0 && tensor_pool_gap_take(&gap, &mn, &wt, &wk, &n)) {
+            const double sum = gap + mn + wt;
+            fprintf(stderr, "  --- pool timing (PICOLM_POOL_GAPS), per token over %d tokens ---\n", T);
+            fprintf(stderr, "  dispatches            %10.0f\n", (double)n / T);
+            fprintf(stderr, "  serial gap (workers idle, main busy)  %8.2f ms  %5.1f%%\n", gap / T, 100.0 * gap / sum);
+            fprintf(stderr, "  main's own slot                       %8.2f ms  %5.1f%%\n", mn / T, 100.0 * mn / sum);
+            fprintf(stderr, "  waiting for stragglers (barrier skew) %8.2f ms  %5.1f%%\n", wt / T, 100.0 * wt / sum);
+            fprintf(stderr, "  mean per dispatch: gap %.1f us, skew %.1f us, wake latency %.2f us\n",
+                    gap / n * 1e3, wt / n * 1e3, wk);
+        }
+    }
 }
 
 /* SwiGLU clamp value actually applied.
@@ -2409,7 +2423,10 @@ float *model_forward_glm5(model_t *m, int token, int pos)
         if (_t_head) glm5_prof_add(GP_HEAD, _t_head);
     }
     if (glm5_prof_mode()) {
-        if (g_gp.tokens == 0) atexit(glm5_prof_print);
+        if (g_gp.tokens == 0) {
+            atexit(glm5_prof_print);
+            tensor_pool_gap_reset();   /* drop prefault/prefill dispatches and token 1 */
+        }
         g_gp.tokens++;
     }
 

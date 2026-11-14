@@ -901,6 +901,41 @@ static long long pool_now_ns(void) {
     return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 #endif
 }
+
+/* ---- Pool dispatch timing (PICOLM_POOL_GAPS=1) --------------------------------
+ * Splits wall time as seen by the dispatching (main) thread into:
+ *   gap   : pool_wait() return -> next pool_wake(): serial main-thread work
+ *           between dispatches (norms, routing, setup, anything not in the pool).
+ *           Every worker is idle for all of it.
+ *   main  : pool_wake() -> pool_wait() entry: the main thread's own slot of work.
+ *   wait  : pool_wait() entry -> all workers done: main idle, waiting for the
+ *           slowest worker (barrier skew / stragglers).
+ * plus the latency from pool_wake() to worker 1 observing it (sampled on one
+ * worker only, to keep the probe cheap). Off by default; when off the cost is one
+ * predictable branch per dispatch. Only the dispatching thread touches the
+ * gap/main/wait counters. */
+static int       pg_on = -1;
+static long long pg_t_wake, pg_t_wait0, pg_t_prev_end;
+static double    pg_gap_ns, pg_main_ns, pg_wait_ns;
+static long      pg_n;
+static volatile long long pg_t_wake_pub;
+static long long pg_wake_ns_sum; static long pg_wake_n;
+static inline int pg_enabled(void) {
+    if (pg_on < 0) { const char *e = getenv("PICOLM_POOL_GAPS"); pg_on = (e && *e && *e != '0'); }
+    return pg_on;
+}
+void tensor_pool_gap_reset(void) {
+    pg_gap_ns = pg_main_ns = pg_wait_ns = 0.0; pg_n = 0; pg_t_prev_end = 0;
+    pg_wake_ns_sum = 0; pg_wake_n = 0;
+}
+int tensor_pool_gap_take(double *gap_ms, double *main_ms, double *wait_ms,
+                         double *wake_us_avg, long *n) {
+    if (!pg_enabled() || pg_n == 0) return 0;
+    *gap_ms = pg_gap_ns / 1e6; *main_ms = pg_main_ns / 1e6; *wait_ms = pg_wait_ns / 1e6;
+    *wake_us_avg = pg_wake_n ? (double)pg_wake_ns_sum / pg_wake_n / 1e3 : 0.0;
+    *n = pg_n;
+    return 1;
+}
 #if defined(__linux__)
 #include <sched.h>
 /* CPUs this process may actually use: online CPUs narrowed by taskset/cpuset, and by a cgroup
@@ -1392,6 +1427,10 @@ static void *pool_worker(void *arg) {
         }
         if (POOL_LD(&pool_shutdown)) break;
         last_gen = g;
+        if (pg_on > 0 && tid == 1) {
+            long long d = pool_now_ns() - pg_t_wake_pub;
+            if (d >= 0 && d < 1000000000LL) { pg_wake_ns_sum += d; pg_wake_n++; }
+        }
         /* CPU-time accounting for PICOLM_THREAD_PROF (matmul dispatches are not
          * region-profiled; they go through pool_tasks and are timed by the caller). */
         const int tprof = (thprof_on == 1 && tid < MAX_THREADS);
@@ -1478,6 +1517,11 @@ static void pool_init(int nt) {
 #ifdef PICOLM_SPIN_POOL
 static void pool_wake(int nt) {
     (void)nt;
+    if (pg_enabled()) {
+        long long t = pool_now_ns();
+        if (pg_t_prev_end) pg_gap_ns += (double)(t - pg_t_prev_end);
+        pg_t_wake = t; pg_t_wake_pub = t;
+    }
     /* seq_cst: publishes the task arrays / pool_mode written by the caller, and orders
      * this increment before the pool_nsleep read below (see handshake note above). */
     __atomic_add_fetch(&pool_gen, 1, __ATOMIC_SEQ_CST);
@@ -1490,6 +1534,7 @@ static void pool_wake(int nt) {
 
 static void pool_wait(int nt) {
     const int want = nt - 1;
+    if (pg_on > 0) { pg_t_wait0 = pool_now_ns(); pg_main_ns += (double)(pg_t_wait0 - pg_t_wake); }
     if (POOL_LD(&pool_done) < want) {
         const long long budget = pool_spin_ns * 4;   /* stragglers: dispatches take ~1ms at 24 threads */
         long long t0 = budget > 0 ? pool_now_ns() : 0;
@@ -1512,6 +1557,10 @@ static void pool_wait(int nt) {
     /* All workers have finished their increment; reset for the next dispatch. Workers only
      * touch pool_done again after observing the next pool_gen increment (seq_cst). */
     __atomic_store_n(&pool_done, 0, __ATOMIC_RELAXED);
+    if (pg_on > 0) {
+        long long t = pool_now_ns();
+        pg_wait_ns += (double)(t - pg_t_wait0); pg_t_prev_end = t; pg_n++;
+    }
 }
 #else
 static void pool_wake(int nt) {

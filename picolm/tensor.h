@@ -68,6 +68,13 @@ void matmul_batch(float *out, const float *x, int n_batch,
  * Used to parallelize per-head attention (independent across heads) the
  * same way matmul_batch parallelizes per-row projections. */
 void tensor_parallel_for(int count, void (*fn)(int idx, void *ctx), void *ctx);
+
+/* Pool dispatch timing, enabled with PICOLM_POOL_GAPS=1 (spin-pool builds only).
+ * take() returns 0 when disabled or nothing was recorded. All *_ms are totals
+ * since the last reset; see the comment in tensor.c for what each means. */
+void tensor_pool_gap_reset(void);
+int  tensor_pool_gap_take(double *gap_ms, double *main_ms, double *wait_ms,
+                          double *wake_us_avg, long *n);
 /* Strided variant: thread t gets indices t, t+active, t+2*active, ...
  * Use for workloads whose per-index cost grows monotonically with the
  * index (e.g. causal attention tiles) - interleaves heavy and light

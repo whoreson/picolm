@@ -58,19 +58,47 @@ int sampler_sample(sampler_t *s, float *logits, int vocab_size) {
     /* 1. Softmax on raw logits */
     softmax(logits, vocab_size);
 
-    /* 2. Sort by probability descending */
-    prob_index_t *sorted = (prob_index_t *)malloc((size_t)vocab_size * sizeof(prob_index_t));
-    for (int i = 0; i < vocab_size; i++) {
-        sorted[i].prob  = logits[i];
-        sorted[i].index = i;
-    }
-    qsort(sorted, (size_t)vocab_size, sizeof(prob_index_t), cmp_prob_desc);
-
-    /* 3. Apply top-k: restrict to k most probable */
+    /* 2. Top-k (if requested) by partial selection, else a full sort.
+     *
+     * This used to qsort the whole vocabulary every token: 154880 elements for
+     * GLM-5, i.e. a malloc plus ~2.6M comparisons per token, and profiler showed
+     * cmp_prob_desc + msort_with_tmp at 8.5% of the main thread during decode
+     * (5.74% + 2.79%). Only the first `k_limit` entries are ever read, so a
+     * partial selection is enough -- and it also lets the buffer be sized to
+     * k_limit instead of the vocabulary.
+     *
+     * Selection: repeatedly take the max of the remaining range and swap it into
+     * place. O(vocab * k) copies of a float compare, no function-pointer
+     * indirection per comparison, no cache-hostile full sort. With the default
+     * top_k = 40 that is 40 linear scans instead of a sort. Order among equal
+     * probabilities can differ from qsort's, so outputs are only identical for
+     * distinct probabilities; logits after softmax are effectively never tied. */
     int k_limit = vocab_size;
-    if (s->top_k > 0 && s->top_k < vocab_size) {
-        k_limit = s->top_k;
+    if (s->top_k > 0 && s->top_k < vocab_size) k_limit = s->top_k;
+
+    prob_index_t *sorted = (prob_index_t *)malloc((size_t)k_limit * sizeof(prob_index_t));
+    if (!sorted) return 0;
+    {
+        /* Work on a copy of the probabilities so logits[] keeps its meaning and
+         * the untouched tail can be scanned without re-reading sorted[]. */
+        float *work = (float *)malloc((size_t)vocab_size * sizeof(float));
+        uint8_t *taken = (uint8_t *)calloc((size_t)vocab_size, 1);
+        if (!work || !taken) { free(work); free(taken); free(sorted); return 0; }
+        memcpy(work, logits, (size_t)vocab_size * sizeof(float));
+        for (int i = 0; i < k_limit; i++) {
+            int best = -1; float bv = -INFINITY;
+            for (int j = 0; j < vocab_size; j++) {
+                if (!taken[j] && work[j] > bv) { bv = work[j]; best = j; }
+            }
+            if (best < 0) { k_limit = i; break; }
+            taken[best] = 1;
+            sorted[i].prob = bv;
+            sorted[i].index = best;
+        }
+        free(work); free(taken);
     }
+
+    /* 3. Apply top-k: already restricted above (k_limit entries in sorted[]). */
 
     /* 4. Apply top-p: find cutoff where cumulative >= top_p (within top-k) */
     float cum = 0.0f;
