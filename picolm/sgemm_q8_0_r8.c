@@ -31,6 +31,21 @@
 #endif
 #include "quant.h"
 
+/* GCC/Clang unroll pragmas; empty on MSVC. */
+#if defined(__clang__)
+#define SGEMM_UNROLL4  _Pragma("unroll 4")
+#define SGEMM_UNROLL8  _Pragma("unroll 8")
+#define SGEMM_UNROLL12 _Pragma("unroll 12")
+#elif defined(__GNUC__)
+#define SGEMM_UNROLL4  _Pragma("GCC unroll 4")
+#define SGEMM_UNROLL8  _Pragma("GCC unroll 8")
+#define SGEMM_UNROLL12 _Pragma("GCC unroll 12")
+#else
+#define SGEMM_UNROLL4
+#define SGEMM_UNROLL8
+#define SGEMM_UNROLL12
+#endif
+
 /* Size gate for the decode-once R8 prefill paths (Q8_0 / Q4_0 / IQ4_NL / IQ4_NL_R4 / IQ4_XS).
  * Those kernels are numerically correct (~1e-7 against an independent reference) but accumulate
  * floats in a different order than the reference tile kernels (integer sum over the whole block,
@@ -894,33 +909,33 @@ static inline always_inline
 void r8a_tile(const block_q8_0_r8 *w, const int8_t *yq, const float *ys, int nb,
               float *out, size_t bs, const int NC) {
     __m256 facc[4];
-#pragma GCC unroll 4
+SGEMM_UNROLL4
     for (int c = 0; c < NC; c++) facc[c] = _mm256_setzero_ps();
     const __m256i ones = _mm256_set1_epi16(1);
     for (int ib = 0; ib < nb; ib++) {
         const __m256i *wq = (const __m256i *)w[ib].qs;
         const __m256 wsc = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)w[ib].d));
         __m256i isum[4];
-#pragma GCC unroll 4
+SGEMM_UNROLL4
         for (int c = 0; c < NC; c++) isum[c] = _mm256_setzero_si256();
-#pragma GCC unroll 8
+SGEMM_UNROLL8
         for (int j = 0; j < 8; j++) {
             const __m256i wj = _mm256_loadu_si256(wq + j);
             const __m256i aw = _mm256_sign_epi8(wj, wj);          /* abs(w), unsigned operand */
-#pragma GCC unroll 4
+SGEMM_UNROLL4
             for (int c = 0; c < NC; c++) {
                 int d; memcpy(&d, yq + ((size_t)c * nb + ib) * 32 + 4 * j, 4);
                 const __m256i sy = _mm256_sign_epi8(_mm256_set1_epi32(d), wj);
                 isum[c] = _mm256_add_epi32(isum[c], _mm256_madd_epi16(_mm256_maddubs_epi16(aw, sy), ones));
             }
         }
-#pragma GCC unroll 4
+SGEMM_UNROLL4
         for (int c = 0; c < NC; c++) {
             const __m256 sc = _mm256_mul_ps(wsc, _mm256_set1_ps(ys[(size_t)c * nb + ib]));
             facc[c] = R8A_FMA(_mm256_cvtepi32_ps(isum[c]), sc, facc[c]);
         }
     }
-#pragma GCC unroll 4
+SGEMM_UNROLL4
     for (int c = 0; c < NC; c++) _mm256_storeu_ps(out + (size_t)c * bs, facc[c]);
 }
 
@@ -1186,7 +1201,7 @@ static inline always_inline
 void r8v_tile(const block_q8_0_r8 *w, const uint8_t *yu, const float *ys, int nb,
               float *out, size_t bs, const int NC) {
     __m256 facc[12];
-#pragma GCC unroll 12
+SGEMM_UNROLL12
     for (int c = 0; c < NC; c++) facc[c] = _mm256_setzero_ps();
     const __m256i ones = _mm256_set1_epi8(1);
     for (int ib = 0; ib < nb; ib++) {
@@ -1203,7 +1218,7 @@ void r8v_tile(const block_q8_0_r8 *w, const uint8_t *yu, const float *ys, int nb
         sa = _mm256_dpbusd_epi32(sa, ones, w4); sb = _mm256_dpbusd_epi32(sb, ones, w5);
         sa = _mm256_dpbusd_epi32(sa, ones, w6); sb = _mm256_dpbusd_epi32(sb, ones, w7);
         const __m256i corr = _mm256_slli_epi32(_mm256_add_epi32(sa, sb), 7);
-#pragma GCC unroll 12
+SGEMM_UNROLL12
         for (int c = 0; c < NC; c++) {
             const uint8_t *yb = yu + ((size_t)c * nb + ib) * 32;
             int d0, d1, d2, d3, d4, d5, d6, d7;
@@ -1219,7 +1234,7 @@ void r8v_tile(const block_q8_0_r8 *w, const uint8_t *yu, const float *ys, int nb
             facc[c] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(a), sc, facc[c]);
         }
     }
-#pragma GCC unroll 12
+SGEMM_UNROLL12
     for (int c = 0; c < NC; c++) _mm256_storeu_ps(out + (size_t)c * bs, facc[c]);
 }
 

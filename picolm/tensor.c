@@ -1144,7 +1144,7 @@ static void matmul_worker_f(matmul_task_t *t) {
                     const char *xb0 = qx_base; /* nb==0: single activation at base */
                     for (int i = 0; i < dg; i += rpb) {
                         const char *wgroup = t->W + (size_t)(t->start + i) * t->row_bytes;
-                        float result[rpb];
+                        float result[8]; /* max rows_per_block */
                         if (nb > 0) {
                             for (int b = 0; b < nb; b++) {
                                 const char *xb = qx_base + (size_t)b * qstride;

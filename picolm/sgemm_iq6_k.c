@@ -38,6 +38,15 @@ extern int sgemm_q4_k_r4_q8_k_avx2(int, int, int, const void *, const void *, fl
 extern int sgemm_q4_k_r4_q8_k_neon(int, int, int, const void *, const void *, float *, size_t, int, int);
 #include "quant.h"
 
+/* GCC/Clang unroll pragma; empty on MSVC. */
+#if defined(__clang__)
+#define SGEMM_UNROLL8 _Pragma("unroll 8")
+#elif defined(__GNUC__)
+#define SGEMM_UNROLL8 _Pragma("GCC unroll 8")
+#else
+#define SGEMM_UNROLL8
+#endif
+
 #define QK_K 256
 
 /* iq6nl_lut defined in quant.c, declared extern in quant.h */
@@ -865,8 +874,10 @@ static inline always_inline void kqik4_vecs(int kind, const void *va, const void
     __m256i QH = _mm256_setzero_si256();
     if (is3) QH = IK_SL(((const block_iq3_k_r4 *)va)->qh + 16 * ib, ((const block_iq3_k_r4 *)vb)->qh + 16 * ib);
 #undef IK_SL
-#define IK_IDX(S, f, j) ({ __m256i _l = _mm256_and_si256(_mm256_srli_epi16((S), 2 * (f)), m03); \
-        if (is3) _l = _mm256_or_si256(_l, _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(QH, (j)), one), 2)); _l; })
+#define IK_IDX(S, f, j) _mm256_or_si256( \
+        _mm256_and_si256(_mm256_srli_epi16((S), 2 * (f)), m03), \
+        _mm256_andnot_si256(_mm256_set1_epi8(-is3), \
+            _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(QH, (j)), one), 2)))
 #define IK_LUT(idx, M) _mm256_blendv_epi8(_mm256_shuffle_epi8(T0, (idx)), _mm256_shuffle_epi8(T1, (idx)), (M))
     o[0] = IK_LUT(IK_IDX(SA, 0, 0), M1); o[1] = IK_LUT(IK_IDX(SA, 1, 1), M1); o[2] = IK_LUT(IK_IDX(SA, 2, 2), M1); o[3] = IK_LUT(IK_IDX(SA, 3, 3), M1);
     o[4] = IK_LUT(IK_IDX(SB, 0, 4), M2); o[5] = IK_LUT(IK_IDX(SB, 1, 5), M2); o[6] = IK_LUT(IK_IDX(SB, 2, 6), M2); o[7] = IK_LUT(IK_IDX(SB, 3, 7), M2);
@@ -909,16 +920,16 @@ static void kqik4_t_decode_group(int kind, const char *wbase, size_t w_row_bytes
 static inline always_inline
 void iq6t_tile(int nb, const char *y0, size_t y_row_bytes, float *out, size_t bs, const int NC, const int HASMIN) {
     __m256 facc[IQ6T_NCMAX];
-#pragma GCC unroll 8
+SGEMM_UNROLL8
     for (int c = 0; c < NC; c++) facc[c] = _mm256_setzero_ps();
     for (int ib = 0; ib < nb; ++ib) {
         const int8_t *wb = iq6t_tl.w + (size_t)ib * 2048;
         const int16_t *sb = iq6t_tl.sc + (size_t)ib * 256;
         const block_q8_K *yb[IQ6T_NCMAX];
-#pragma GCC unroll 8
+SGEMM_UNROLL8
         for (int c = 0; c < NC; c++) yb[c] = (const block_q8_K *)(y0 + (size_t)c * y_row_bytes) + ib;
         __m256i acc[IQ6T_NCMAX];
-#pragma GCC unroll 8
+SGEMM_UNROLL8
         for (int c = 0; c < NC; c++) acc[c] = _mm256_setzero_si256();
         for (int g = 0; g < 16; ++g) {
             const __m256i s16 = _mm256_loadu_si256((const __m256i *)(sb + g * 16));
@@ -926,7 +937,7 @@ void iq6t_tile(int nb, const char *y0, size_t y_row_bytes, float *out, size_t bs
                 const int v = 4 * g + jj;
                 const __m256i w = _mm256_loadu_si256((const __m256i *)(wb + (size_t)v * 32));
                 const __m256i aw = _mm256_sign_epi8(w, w);
-#pragma GCC unroll 8
+SGEMM_UNROLL8
                 for (int c = 0; c < NC; c++) {
                     int yd; memcpy(&yd, yb[c]->qs + 4 * v, 4);
                     const __m256i sy = _mm256_sign_epi8(_mm256_set1_epi32(yd), w);
@@ -935,13 +946,13 @@ void iq6t_tile(int nb, const char *y0, size_t y_row_bytes, float *out, size_t bs
             }
         }
         const __m256 wsc = _mm256_loadu_ps(iq6t_tl.d + (size_t)ib * 8);
-#pragma GCC unroll 8
+SGEMM_UNROLL8
         for (int c = 0; c < NC; c++)
             facc[c] = IQ6T_FMA(_mm256_cvtepi32_ps(acc[c]), _mm256_mul_ps(wsc, _mm256_set1_ps(yb[c]->d)), facc[c]);
         if (HASMIN) {   /* - dmin * dy * sum_g m_g * bsum_g */
             const __m256 dmv = _mm256_loadu_ps(kqm_tl.dm + (size_t)ib * 8);
             const int16_t *mnb = kqm_tl.mn + (size_t)ib * 128;
-#pragma GCC unroll 8
+SGEMM_UNROLL8
             for (int c = 0; c < NC; c++) {
                 __m256i ms = _mm256_setzero_si256();
                 for (int pp = 0; pp < 8; ++pp) {
@@ -952,7 +963,7 @@ void iq6t_tile(int nb, const char *y0, size_t y_row_bytes, float *out, size_t bs
             }
         }
     }
-#pragma GCC unroll 8
+SGEMM_UNROLL8
     for (int c = 0; c < NC; c++) _mm256_storeu_ps(out + (size_t)c * bs, facc[c]);
 }
 
@@ -1218,20 +1229,20 @@ static void iq6v_stage_seeds(const char *vy, size_t y_row_bytes, int c0, int pc,
 static inline always_inline
 void iq6v_tile(int nb, const char *y0, size_t y_row_bytes, const int32_t *cr0, float *out, size_t bs, const int NC, const int HASMIN) {
     __m256 facc[IQ6V_NC];
-#pragma GCC unroll 8
+SGEMM_UNROLL8
     for (int c = 0; c < NC; c++) facc[c] = _mm256_setzero_ps();
     for (int ib = 0; ib < nb; ++ib) {
         const uint8_t *wb = iq6v_tl.w + (size_t)ib * 2048;
         const int32_t *slb = iq6v_tl.sl + (size_t)ib * 128;
         const block_q8_K *yb[IQ6V_NC];
         const int32_t *crb[IQ6V_NC];
-#pragma GCC unroll 8
+SGEMM_UNROLL8
         for (int c = 0; c < NC; c++) {
             yb[c] = (const block_q8_K *)(y0 + (size_t)c * y_row_bytes) + ib;
             crb[c] = cr0 + ((size_t)c * nb + ib) * 16;
         }
         __m256i isum[IQ6V_NC];
-#pragma GCC unroll 8
+SGEMM_UNROLL8
         for (int c = 0; c < NC; c++) isum[c] = _mm256_setzero_si256();
         for (int g = 0; g < 16; ++g) {
             const __m256i w0 = _mm256_loadu_si256((const __m256i *)(wb + (size_t)(4 * g + 0) * 32));
@@ -1239,7 +1250,7 @@ void iq6v_tile(int nb, const char *y0, size_t y_row_bytes, const int32_t *cr0, f
             const __m256i w2 = _mm256_loadu_si256((const __m256i *)(wb + (size_t)(4 * g + 2) * 32));
             const __m256i w3 = _mm256_loadu_si256((const __m256i *)(wb + (size_t)(4 * g + 3) * 32));
             const __m256i s32 = _mm256_loadu_si256((const __m256i *)(slb + g * 8));
-#pragma GCC unroll 8
+SGEMM_UNROLL8
             for (int c = 0; c < NC; c++) {
                 const int8_t *q = yb[c]->qs + 16 * g;
                 int d0, d1, d2, d3;
@@ -1253,13 +1264,13 @@ void iq6v_tile(int nb, const char *y0, size_t y_row_bytes, const int32_t *cr0, f
             }
         }
         const __m256 wsc = _mm256_loadu_ps(iq6v_tl.d + (size_t)ib * 8);
-#pragma GCC unroll 8
+SGEMM_UNROLL8
         for (int c = 0; c < NC; c++)
             facc[c] = IQ6T_FMA(_mm256_cvtepi32_ps(isum[c]), _mm256_mul_ps(wsc, _mm256_set1_ps(yb[c]->d)), facc[c]);
         if (HASMIN) {   /* - dmin * dy * sum_g m_g * bsum_g */
             const __m256 dmv = _mm256_loadu_ps(kqm_tl.dm + (size_t)ib * 8);
             const int16_t *mnb = kqm_tl.mn + (size_t)ib * 128;
-#pragma GCC unroll 8
+SGEMM_UNROLL8
             for (int c = 0; c < NC; c++) {
                 __m256i ms = _mm256_setzero_si256();
                 for (int pp = 0; pp < 8; ++pp) {
@@ -1270,7 +1281,7 @@ void iq6v_tile(int nb, const char *y0, size_t y_row_bytes, const int32_t *cr0, f
             }
         }
     }
-#pragma GCC unroll 8
+SGEMM_UNROLL8
     for (int c = 0; c < NC; c++) _mm256_storeu_ps(out + (size_t)c * bs, facc[c]);
 }
 

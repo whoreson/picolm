@@ -624,51 +624,7 @@ hunger:
 	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
 	echo \"$(HUNGER_CUDA_ROOT)/bin/nvcc.exe\" -O3 --fmad=false -std=c++14 -DPICOLM_GPU=1 -DPICOLM_CUDA=1 -DPICOLM_SSM_WARP_KERNEL_VALIDATED -DPICOLM_SSM_CHUNKED_GPU_VALIDATED -ccbin \"$(HUNGER_CL)\" -Xcompiler \"/EHsc /O2 /W3 /std:c++14 /arch:AVX512 /wd4244 /wd4267 /wd4101 /wd4102 /DPICOLM_AVX512=1 /DPICOLM_AVX2=1 /DPICOLM_AVX=1 /DPICOLM_SSE3=1 /DPICOLM_SSE2=1 /DPICOLM_FMA=1\" -gencode arch=compute_89,code=$(HUNGER_CUDA_ARCH) -c -o backend_gpu_host_misc_win.obj backend_gpu_host_misc.cu -I. >> .hunger_build.bat
 	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF) picolm.c >> .hunger_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF) model_core.c >> .hunger_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF) model_attention.c >> .hunger_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF) model_moe.c >> .hunger_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF) model_gemma3n.c >> .hunger_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF) model_glm5.c >> .hunger_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF) model_ssm.c >> .hunger_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF) model_kv_cache.c >> .hunger_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF) model_gguf.c >> .hunger_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF) tensor.c >> .hunger_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF) quant.c >> .hunger_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF) sgemm.c >> .hunger_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF) sgemm_q4_0x8.c >> .hunger_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF) sgemm_q4i_0x8.c >> .hunger_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF) tokenizer.c >> .hunger_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF) qwen_tokenize.c >> .hunger_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF) sampler.c >> .hunger_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF) grammar.c >> .hunger_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF) cJSON.c >> .hunger_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF) server.c >> .hunger_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF) csafetensors.c >> .hunger_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF) json.c >> .hunger_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF) safetensors.c >> .hunger_build.bat
+	echo \"$(HUNGER_CL)\" $(HUNGER_CF) $(HUNGER_CFILES) >> .hunger_build.bat
 	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
 	echo \"$(HUNGER_LNK)\" /OUT:picolm.exe $(HUNGER_COBJS) $(HUNGER_CUOBS) \"$(HUNGER_CUDA_ROOT)/lib/x64/cudart.lib\" ws2_32.lib advapi32.lib >> .hunger_build.bat
 	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
@@ -712,49 +668,7 @@ hunger-nogpu:
 	echo @echo off > .hunger_nogpu_build.bat
 	echo del /q picolm.exe $(HUNGER_NOGPU_OBJS) '2^>nul' >> .hunger_nogpu_build.bat
 	echo call \"$(HUNGER_VS_ROOT)/VC/Auxiliary/Build/vcvars64.bat\" >> .hunger_nogpu_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF_NOGPU) picolm.c >> .hunger_nogpu_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF_NOGPU) model_core.c >> .hunger_nogpu_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF_NOGPU) model_attention.c >> .hunger_nogpu_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF_NOGPU) model_moe.c >> .hunger_nogpu_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF_NOGPU) model_gemma3n.c >> .hunger_nogpu_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF_NOGPU) model_ssm.c >> .hunger_nogpu_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF_NOGPU) model_kv_cache.c >> .hunger_nogpu_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF_NOGPU) model_gguf.c >> .hunger_nogpu_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF_NOGPU) tensor.c >> .hunger_nogpu_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF_NOGPU) quant.c >> .hunger_nogpu_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF_NOGPU) sgemm.c >> .hunger_nogpu_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF_NOGPU) sgemm_q4_0x8.c >> .hunger_nogpu_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF_NOGPU) sgemm_q4i_0x8.c >> .hunger_nogpu_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF_NOGPU) tokenizer.c >> .hunger_nogpu_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF_NOGPU) qwen_tokenize.c >> .hunger_nogpu_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF_NOGPU) sampler.c >> .hunger_nogpu_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF_NOGPU) grammar.c >> .hunger_nogpu_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF_NOGPU) cJSON.c >> .hunger_nogpu_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF_NOGPU) server.c >> .hunger_nogpu_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF_NOGPU) csafetensors.c >> .hunger_nogpu_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF_NOGPU) json.c >> .hunger_nogpu_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF_NOGPU) safetensors.c >> .hunger_nogpu_build.bat
+	echo \"$(HUNGER_CL)\" $(HUNGER_CF_NOGPU) $(HUNGER_CFILES) >> .hunger_nogpu_build.bat
 	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
 	echo \"$(HUNGER_LNK)\" /OUT:picolm.exe $(HUNGER_NOGPU_OBJS) ws2_32.lib advapi32.lib >> .hunger_nogpu_build.bat
 	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
