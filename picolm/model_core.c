@@ -750,7 +750,7 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
                   + c->glm5_hc + c->glm5_hc*c->glm5_hc) * sizeof(float);
         /* KDA per-token scratch: q,k,v,z,raw,conv_out,g,head_out [10*DI total]
          * + beta[H] + fa_out[KD]. (Layout must match glm5_kda_forward().) */
-        sz_glm5 += (size_t)(10*d_inner + c->glm5_n_kda_heads + kda_dim) * sizeof(float);
+        sz_glm5 += (size_t)(10*d_inner + c->glm5_n_kda_heads + 2*kda_dim) * sizeof(float);
         /* MLA scratch: qr[QL] + qabs[KVL*NH] + kv[KVL] + ctx[KVL*NH] + scores[max_seq] */
         sz_glm5 += (size_t)(2*c->glm5_kv_lora * c->n_heads + c->glm5_q_lora
                   + c->glm5_kv_lora + c->max_seq_len) * sizeof(float);
@@ -1247,7 +1247,7 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         /* KDA per-token scratch (layout must match glm5_kda_forward):
          * q,k,v,z,raw,conv_out,g,head_out [7*DI + 3*DI = 10*DI] + beta[H] + fa_out[KD] */
         s->glm5.kda_scratch = gp5;
-        gp5 += (size_t)(10*d_inner + c->glm5_n_kda_heads + kda_dim);
+        gp5 += (size_t)(10*d_inner + c->glm5_n_kda_heads + 2*kda_dim);
         /* MLA per-token scratch */
         s->glm5.mla_q = gp5;       gp5 += (size_t)c->glm5_mla_head_dim * c->n_heads;
         s->glm5.mla_q_abs = gp5;   gp5 += (size_t)c->glm5_kv_lora * c->n_heads;

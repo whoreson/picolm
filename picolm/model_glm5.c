@@ -478,6 +478,10 @@ static void glm5_kda_forward(
     float *beta = sc; sc += H;
     float *g = sc; sc += DI;
     float *fa_out = sc; sc += KD;
+    float *beta_raw_buf = sc; sc += H;  /* ssm_beta @ cur, batched with g_a/f_a */
+    float *fa_out2 = sc; sc += KD;   /* second low-rank scratch: g_a and f_a are
+                                      * issued in one batched dispatch, so each
+                                      * needs its own destination */
     float *head_out = sc;   /* [DI] */
 
     /* Tag prefix shared by every stat/check emitted from this layer. */
@@ -490,10 +494,18 @@ static void glm5_kda_forward(
 
     glm5_stats("x.kda.in", cur, D);
 
-    /* q, k, v projections */
-    matmul(q, cur, lw->attn_q, D, DI, lw->type_attn_q);
-    matmul(k, cur, lw->attn_k, D, DI, lw->type_attn_k);
-    matmul(v, cur, lw->attn_v, D, DI, lw->type_attn_v);
+    /* q, k, v projections — independent, same input, so one dispatch. */
+    {
+        mm_job_t j[3] = {
+            { q, cur, lw->attn_q, D, DI, lw->type_attn_q },
+            { k, cur, lw->attn_k, D, DI, lw->type_attn_k },
+            { v, cur, lw->attn_v, D, DI, lw->type_attn_v },
+        };
+        if (!tensor_matmul_multi(j, 3)) {
+            for (int i = 0; i < 3; i++)
+                matmul(j[i].out, j[i].x, j[i].W, j[i].n, j[i].d, j[i].qtype);
+        }
+    }
     snprintf(t, sizeof(t), "%s.q", tg);   glm5_stats(t, q, DI);   glm5_chk(t, q, DI, -1e4f, 1e4f);
     snprintf(t, sizeof(t), "%s.k", tg);   glm5_stats(t, k, DI);   glm5_chk(t, k, DI, -1e4f, 1e4f);
     snprintf(t, sizeof(t), "%s.v", tg);   glm5_stats(t, v, DI);   glm5_chk(t, v, DI, -1e4f, 1e4f);
@@ -502,22 +514,34 @@ static void glm5_kda_forward(
     snprintf(t, sizeof(t), "%s.ssm_a", tg);
     glm5_stats(t, (const float *)gw->kda_a, H);
 
+    /* Low-rank inputs all read `cur`, so g_a, f_a and beta share one
+     * dispatch; each writes its own destination. */
+    {
+        float *beta_raw_p = beta_raw_buf;
+        mm_job_t j[3] = {
+            { fa_out,  cur, gw->kda_g_a, D, KD, gw->type_kda_g_a },
+            { fa_out2, cur, gw->kda_f_a, D, KD, gw->type_kda_f_a },
+            { beta_raw_p, cur, gw->kda_beta, D, H, gw->type_kda_beta },
+        };
+        if (!tensor_matmul_multi(j, 3)) {
+            for (int i = 0; i < 3; i++)
+                matmul(j[i].out, j[i].x, j[i].W, j[i].n, j[i].d, j[i].qtype);
+        }
+    }
+
     /* z = g_b @ (g_a @ cur): gate, [KD] -> [DI] */
-    matmul(fa_out, cur, gw->kda_g_a, D, KD, gw->type_kda_g_a);
     matmul(z, fa_out, gw->kda_g_b, KD, DI, gw->type_kda_g_b);
 
     /* raw = f_b @ (f_a @ cur): decay raw input, [KD] -> [DI] */
-    matmul(fa_out, cur, gw->kda_f_a, D, KD, gw->type_kda_f_a);
-    matmul(raw, fa_out, gw->kda_f_b, KD, DI, gw->type_kda_f_b);
+    matmul(raw, fa_out2, gw->kda_f_b, KD, DI, gw->type_kda_f_b);
     snprintf(t, sizeof(t), "%s.z", tg);   glm5_stats(t, z, DI);   glm5_chk(t, z, DI, -1e4f, 1e4f);
     snprintf(t, sizeof(t), "%s.raw", tg); glm5_stats(t, raw, DI); glm5_chk(t, raw, DI, -1e4f, 1e4f);
 
-    /* beta_raw = ssm_beta @ cur  [H] */
+    /* beta = sigmoid(beta_raw); beta_raw was computed in the batched dispatch
+     * above (it only depends on `cur`). */
     {
-        float *beta_raw = fa_out;  /* reuse: [H] output */
-        matmul(beta_raw, cur, gw->kda_beta, D, H, gw->type_kda_beta);
         for (int h = 0; h < H; h++)
-            beta[h] = 1.0f / (1.0f + expf(-beta_raw[h]));
+            beta[h] = 1.0f / (1.0f + expf(-beta_raw_buf[h]));
     }
     /* beta = sigmoid(.) is provably in (0,1). */
     snprintf(t, sizeof(t), "%s.beta", tg);
