@@ -411,6 +411,7 @@ int tensor_get_big_cores(void) {
 
 /* Threshold: skip threading if output vector is smaller than this.
  * Avoids mutex overhead for tiny matmuls. */
+static double barrier_now(void);   /* monotonic clock, defined below */
 static int matmul_min_rows = 256;  /* lowered from 1024 to cover d=512 (MoE shared expert) */
 
 void tensor_set_matmul_min_rows(int r) {
@@ -435,7 +436,68 @@ typedef struct {
     int          end;      /* one past last output row */
     gguf_type_t  qtype;
     int          n_batch;  /* batch count (0 = single, >0 = batched) */
+    /* Dynamic chunk claiming (PICOLM_MATMUL_CHUNK).
+     * When `steal` is non-NULL the worker ignores its static start/end and
+     * instead pulls [chunk_base, chunk_base+chunk) ranges from the shared
+     * atomic counter until the rows are exhausted. The static start/end stays
+     * populated so the split degrades to today's behaviour when stealing is
+     * off. See matmul_worker_dyn() below. */
+    int          chunk;
+    int          dyn_total;   /* number of output rows to be claimed (d) */
+    int         *steal;       /* shared atomic next-row cursor, or NULL */
 } matmul_task_t;
+
+/* Forward decl: the dynamic wrapper below calls the real worker. */
+static void matmul_worker_f(matmul_task_t *t);
+
+/* Execute one worker's share with dynamic chunk claiming.
+ *
+ * The static split (pool_assign_rows) gives each thread a contiguous block.
+ * That is the right shape for the memory system -- contiguous streams beat
+ * interleaved ones by ~34% on this box, because the HW prefetcher needs long
+ * runs -- but it makes every barrier wait for the slowest thread. Measured on
+ * GLM decode: 18% of pool wall time is straggler skew.
+ *
+ * So: each thread starts at its own block (t->start) exactly as before, and
+ * when it runs out it atomically claims further 32-row chunks. The chunks are
+ * still contiguous (prefetcher-friendly), the start offsets stay spread out,
+ * and a thread that finishes early picks up the tail instead of spinning.
+ *
+ * Per-row dots do not depend on how the rows are partitioned, so this is
+ * bit-identical to the static split: every output row is written exactly once
+ * with the same arithmetic. */
+static void matmul_worker_dyn(matmul_task_t *t) {
+    if (!t->steal) { matmul_worker_f(t); return; }
+
+    /* ggml-style shared work queue: `steal` starts at `active`, i.e. past the
+     * first block, and every thread (including the main one) claims 32-row
+     * chunks from it after doing its own block. Thread t's own block is
+     * [t*chunk, t*chunk+chunk) so the start is spread across the matrix,
+     * preserving long contiguous streams. */
+    matmul_task_t me = *t;
+    const int chunk = t->chunk > 0 ? t->chunk : 32;
+    const int total = t->dyn_total;
+
+    /* own slice first */
+    int s0 = t->start, e0 = t->end;
+    while (s0 < e0) {
+        int e = s0 + chunk;
+        if (e > e0) e = e0;
+        me.start = s0; me.end = e;
+        matmul_worker_f(&me);
+        s0 = e;
+    }
+
+    /* then steal from the shared cursor until exhausted */
+    for (;;) {
+        int st = __atomic_fetch_add(t->steal, chunk, __ATOMIC_RELAXED);
+        if (st >= total) break;
+        int en = st + chunk;
+        if (en > total) en = total;
+        me.start = st; me.end = en;
+        matmul_worker_f(&me);
+    }
+}
 
 /* ---- Persistent thread pool (port from picolm-evilbinary, simplified) ---- */
 
@@ -649,9 +711,47 @@ static void thprof_task_end(int tid) {
     thprof_tl_s[tid] = thprof_cpu_now() - thprof_tl_s[tid];
 }
 
+/* Per-dispatch skew accounting for matmul(). Answers "is the barrier waiting on
+ * a slow thread, or are the threads all finishing together?".
+ *   work    = sum of per-thread busy time (the useful work in this dispatch)
+ *   straggler = slowest thread's busy time minus the mean
+ *   serial  = dispatch wall time minus the slowest thread (= barrier + gaps)
+ * Reported as a percentage of dispatch wall time. */
+static double mm_work_s, mm_skew_s, mm_serial_s, mm_pre_s, mm_total_s;
+static long   mm_calls;
+static void mm_thprof_record(int active, double wall_s) {
+    double tot = 0.0, tmax = 0.0;
+    for (int t = 0; t < active; t++) {
+        tot += thprof_tl_s[t];
+        if (thprof_tl_s[t] > tmax) tmax = thprof_tl_s[t];
+    }
+    mm_work_s += tot;
+    mm_serial_s += wall_s > tmax ? wall_s - tmax : 0.0;
+    mm_calls++;
+    if (active > 1) {
+        double mean = tot / (double)active;
+        mm_skew_s += tmax - mean;
+    }
+}
+static void mm_thprof_print(void) {
+    if (mm_calls <= 0) return;
+    /* work/total are per-dispatch wall-equivalents already normalised below */
+    double pool_wall = mm_work_s / 24.0 + mm_skew_s + mm_serial_s;
+    fprintf(stderr, "\n=== matmul dispatch breakdown (PICOLM_THREAD_PROF) ===\n");
+    fprintf(stderr, "  %ld dispatches\n", mm_calls);
+    fprintf(stderr, "  pool wall: useful work            %8.1f ms  %5.1f%%\n", mm_work_s/24.0*1e3, 100*(mm_work_s/24.0)/pool_wall);
+    fprintf(stderr, "  pool wall: straggler skew          %8.1f ms  %5.1f%%\n", mm_skew_s*1e3, 100*mm_skew_s/pool_wall);
+    fprintf(stderr, "  pool wall: barrier/handshake       %8.1f ms  %5.1f%%\n", mm_serial_s*1e3, 100*mm_serial_s/pool_wall);
+    fprintf(stderr, "  --- main thread ---\n");
+    fprintf(stderr, "  before dispatch (quantize/setup)  %8.1f ms\n", mm_pre_s*1e3);
+    fprintf(stderr, "  whole matmul() call              %8.1f ms\n", mm_total_s*1e3);
+    fprintf(stderr, "  => main-thread serial time        %8.1f ms  %5.1f%% of matmul()\n",
+            (mm_total_s - pool_wall)*1e3, 100*(mm_total_s - pool_wall)/mm_total_s);
+}
+
 void tensor_thread_profile_set(int on) {
     thprof_on = on;
-    if (on) atexit(tensor_thread_profile_print);
+    if (on) { atexit(tensor_thread_profile_print); atexit(mm_thprof_print); }
 }
 
 /* Discard everything collected so far (used to drop a warm-up pass). */
@@ -1284,7 +1384,7 @@ static void *pool_worker(void *arg) {
         const int tprof = (thprof_on == 1 && tid < MAX_THREADS);
         if (tprof) thprof_task_begin(tid);
         if (pool_mode) generic_worker_f(&generic_tasks[tid]);
-        else matmul_worker_f(&pool_tasks[tid]);
+        else matmul_worker_dyn(&pool_tasks[tid]);
         if (tprof) { thprof_task_end(tid); thprof_tl_s[tid] = thprof_tl_s[tid]; }
         __atomic_add_fetch(&pool_done, 1, __ATOMIC_SEQ_CST);
         if (__atomic_load_n(&pool_main_wait, __ATOMIC_SEQ_CST)) {
@@ -1322,7 +1422,7 @@ static void *pool_worker(void *arg) {
         const int tprof = (thprof_on == 1 && tid < MAX_THREADS);
         if (tprof) thprof_task_begin(tid);
         if (pool_mode) generic_worker_f(&generic_tasks[tid]);
-        else matmul_worker_f(&pool_tasks[tid]);
+        else matmul_worker_dyn(&pool_tasks[tid]);
         if (tprof) { thprof_task_end(tid); thprof_tl_s[tid] = thprof_tl_s[tid]; }
         win_mutex_lock(&pool_mutex);
         pool_done++;
@@ -1514,7 +1614,56 @@ static const char *qtype_short_name(gguf_type_t t) {
 
 /* ---- Table-driven matmul (replaces ~1700 lines of if-else chains) ---- */
 
+/* Arm dynamic chunk claiming for a dispatch.
+ *
+ * `start_cursor` should be `active` when the static block already gives each
+ * thread its own share (pool_assign_rows did that), so the first steal lands
+ * past the last static block. Returns 1 when claiming is on.
+ *
+ * Chunk size: 32 rows. Each row here is `n` values wide (4 KB for n=4096), so
+ * 32 rows is a 128 KB contiguous run -- short enough to balance a straggler,
+ * long enough that the HW prefetcher still sees a stream (the contiguous-vs-
+ * interleaved measurement showed runs matter).
+ * PICOLM_MATMUL_CHUNK=0 disables claiming entirely. */
+static __thread int tl_dyn_cursor;
+static int matmul_chunk_rows(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("PICOLM_MATMUL_CHUNK");
+        v = e ? atoi(e) : 32;
+    }
+    return v;
+}
+static int matmul_arm_dynamic(int active, int nt, int d, int *cursor) {
+    const int c = matmul_chunk_rows();
+    if (c <= 0 || active < 2) return 0;
+    /* Each thread's static block becomes exactly ONE chunk, and the shared
+     * cursor starts right after the last of them, so the rest of the rows are
+     * claimed dynamically. With d <= active*c this degenerates to the old
+     * static behaviour (nothing to steal), which is what we want for the many
+     * small dispatches. */
+    *cursor = active * c;
+    int pad = 0;
+    for (int t = 0; t < active; t++) {
+        pool_tasks[t].start = t * c + pad;
+        int e = pool_tasks[t].start + c;
+        if (e > d) e = d;
+        if (pool_tasks[t].start > d) pool_tasks[t].start = d;
+        pool_tasks[t].end = e;
+    }
+    for (int t = 0; t < nt; t++) {
+        pool_tasks[t].steal = cursor;
+        pool_tasks[t].chunk = c;
+        pool_tasks[t].dyn_total = d;
+    }
+    return 1;
+}
+static void matmul_disarm_dynamic(int nt) {
+    for (int t = 0; t < nt; t++) pool_tasks[t].steal = NULL;
+}
+
 void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t qtype) {
+    double _mm_entry = (thprof_on == 1) ? barrier_now() : 0.0;
     if (!W) {
         static int null_warn;
         if (!null_warn) {
@@ -1557,17 +1706,42 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
             pool_tasks[t].x_is_q8k = 0;
         }
         pool_clear_unused(active, nt);
+        int dyn_cursor;
+        int dyn = matmul_arm_dynamic(active, nt, d, &dyn_cursor);
         pool_init(nt); pool_wake(nt);
-        matmul_worker_f(&pool_tasks[0]);
+        matmul_worker_dyn(&pool_tasks[0]);
         pool_wait(nt);
+        if (dyn) matmul_disarm_dynamic(nt);
         return;
     }
 
     /* Quantized path: quantize activations once, then dispatch.
      * Use amax deltas to match old matmul() decode behavior. */
+    /* Thread-local activation scratch.
+     *
+     * This used to pass NULL when threading, so quant_activations_ex() did a
+     * malloc/free on every matmul. GLM decode issues ~3000 matmuls per token,
+     * so that was 3000 malloc/free pairs per token on the serial path, with
+     * the worker threads idle. A per-thread buffer that only grows fixes it.
+     * (Same pattern as gemm_convert_ctx_t's tl_scratch below.) */
+#if !defined(_MSC_VER)
+    static __thread void  *mm_scratch = NULL;
+    static __thread size_t mm_scratch_sz = 0;
+#else
+    static void  *mm_scratch = NULL;
+    static size_t mm_scratch_sz = 0;
+#endif
+    {
+        /* Q8_0: 34 B/32 values + 4 B delta; Q8_K: 292 B/256 values. The
+         * larger of the two per input value is ~1.2 B, so n*2 is ample. */
+        size_t need = (size_t)n * 2 + 512;
+        if (mm_scratch_sz < need) {
+            void *nb = realloc(mm_scratch, need);
+            if (nb) { mm_scratch = nb; mm_scratch_sz = need; }
+        }
+    }
     quant_buf_t qb = quant_activations_ex(qtype, x, 1, n,
-                                           (n_threads <= 1) ? scratch_buf : NULL,
-                                           (n_threads <= 1) ? (size_t)scratch_size : 0, 1);
+                                           mm_scratch, mm_scratch_sz, 1);
     if (!qb.qbuf) {
         /* Allocation failed: fall back to generic vec_dot */
         for (int i = 0; i < d; i++)
@@ -1634,9 +1808,20 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
             pool_tasks[t].x_is_q8k = (ti->act_fmt == ACT_FMT_Q8_K) ? 1 : 0;
         }
         pool_clear_unused(active, nt);
-        pool_init(nt); pool_wake(nt);
-        matmul_worker_f(&pool_tasks[0]);
+        int dyn_cursor;
+        int dyn = matmul_arm_dynamic(active, nt, d, &dyn_cursor);
+        pool_init(nt);
+        int mm_tp = thprof_on == 1;
+        double mm_t0 = mm_tp ? barrier_now() : 0.0;
+        pool_wake(nt);
+        if (mm_tp) thprof_task_begin(0);
+        matmul_worker_dyn(&pool_tasks[0]);
+        if (mm_tp) thprof_task_end(0);
         pool_wait(nt);
+        if (dyn) matmul_disarm_dynamic(nt);
+        if (mm_tp) { mm_thprof_record(active, barrier_now() - mm_t0);
+                     mm_pre_s += (mm_t0 - _mm_entry);
+                     mm_total_s += (barrier_now() - _mm_entry); }
     }
     free_quant_buf(&qb, scratch_buf);
 }
@@ -1772,7 +1957,7 @@ void matmul_q8(float *out, const void *qx, const float *qx_d,
             pool_clear_unused(active, nt);
             pool_init(nt);
             pool_wake(nt);
-            matmul_worker_f(&pool_tasks[0]);
+            matmul_worker_dyn(&pool_tasks[0]);
             pool_wait(nt);
         }
         return;
@@ -3181,7 +3366,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
         }
         pool_clear_unused(active, nt);
         pool_init(nt); pool_wake(nt);
-        matmul_worker_f(&pool_tasks[0]);
+        matmul_worker_dyn(&pool_tasks[0]);
         pool_wait(nt);
         DISPATCH("threaded_F32");
         return;
@@ -3357,7 +3542,7 @@ void matmul_batch(float *out, const float *x, int n_batch,
         }
         pool_clear_unused(active, nt);
         pool_init(nt); pool_wake(nt);
-        matmul_worker_f(&pool_tasks[0]);
+        matmul_worker_dyn(&pool_tasks[0]);
         pool_wait(nt);
     }
     free_quant_buf(&qb, NULL);
