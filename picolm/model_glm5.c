@@ -1160,7 +1160,14 @@ static int glm5_mla_headblock(void) {
     static int cached = -2;
     if (cached == -2) {
         const char *e = getenv("PICOLM_GLM5_MLA_HB");
-        cached = e ? atoi(e) : 4;
+        /* 2, not 4. The number of head blocks has to fit the pool: NH=64 with
+         * hb=4 gives 16 blocks over 24 threads, so 8 threads idle and the
+         * barrier waits on the 16 that ran. hb=2 gives 32 blocks, which
+         * balances across 24 threads. Measured at pos 7111, MLA attention:
+         *   hb=2  82-86 ms    hb=3  86-89 ms    hb=4  92-94 ms
+         * The block-reduce path needs a low hb to show its benefit at all --
+         * at hb=4 the imbalance hid it completely. */
+        cached = e ? atoi(e) : 2;
     }
     return cached;
 }
@@ -1208,6 +1215,53 @@ static inline void glm5_mla_reduce_head(
     }
 }
 
+/* Softmax + PV for a whole head block with ONE pass over the cache.
+ *
+ * glm5_mla_reduce_head() re-streams the entire latent cache (n_kv x KVL floats,
+ * 14.6 MB at 7k context) for every head, so a block of hb heads read it hb
+ * times and a layer read it 64 times: ~10 GB/token of L3 traffic at 7k, which
+ * is what the MLA attention region was bound by. The score pass already shares
+ * each row across the block; this does the same for the weighted sum: each
+ * cache row is loaded once and accumulated into all hn head accumulators
+ * (hn*KVL floats, L1-resident).
+ *
+ * Bit-identical to calling glm5_mla_reduce_head() per head: for every head the
+ * softmax is computed by the same code and the positions are accumulated in the
+ * same ascending order with the same skip rule; only the interleaving ACROSS
+ * heads changes, and heads share no state.
+ * PICOLM_GLM5_MLA_REDUCE_PERHEAD=1 restores the per-head loop (A/B). */
+#define GLM5_MLA_RB_MAX 16
+static int glm5_mla_reduce_perhead(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("PICOLM_GLM5_MLA_REDUCE_PERHEAD") ? 1 : 0;
+    return cached;
+}
+
+static void glm5_mla_reduce_block(
+        float *ctx0, float *sc0, int n, int hn,
+        const float *cache, const int *sel, int dense, int KVL)
+{
+    float inv[GLM5_MLA_RB_MAX];
+    for (int k = 0; k < hn; k++) {
+        float *sc = sc0 + (size_t)k * n;
+        float mx = -INFINITY;
+        for (int i = 0; i < n; i++) { float v = sc[i]; if (v > mx) mx = v; }
+        float sum = 0.f;
+        for (int i = 0; i < n; i++) { float e = expf(sc[i] - mx); sc[i] = e; sum += e; }
+        inv[k] = 1.0f / sum;
+        memset(ctx0 + (size_t)k * KVL, 0, (size_t)KVL * sizeof(float));
+    }
+    for (int i = 0; i < n; i++) {
+        const int t = dense ? i : sel[i];
+        const float *row = cache + (size_t)t * KVL;
+        for (int k = 0; k < hn; k++) {
+            const float p = sc0[(size_t)k * n + i] * inv[k];
+            if (p < 1e-10f) continue;
+            vec_scale_acc_f32(ctx0 + (size_t)k * KVL, row, p, KVL);
+        }
+    }
+}
+
 /* One head block: score its heads row-by-row (so the row is loaded once and
  * used hb times instead of once per head), then softmax + PV accumulate each
  * head of the block. */
@@ -1227,9 +1281,14 @@ static void glm5_mla_head_block_task(int blk, void *vp) {
             sb[(size_t)k * n + p] =
                 vec_dot_f32_f32(row, t->qabs + (size_t)(h0 + k) * KVL, KVL) * t->scale;
     }
-    for (int k = 0; k < hn; k++)
-        glm5_mla_reduce_head(t->ctx + (size_t)(h0 + k) * KVL, sb + (size_t)k * n,
-                             t->cache, t->sel, n, t->dense, KVL);
+    if (hn <= GLM5_MLA_RB_MAX && !glm5_mla_reduce_perhead()) {
+        glm5_mla_reduce_block(t->ctx + (size_t)h0 * KVL, sb, n, hn,
+                              t->cache, t->sel, t->dense, KVL);
+    } else {
+        for (int k = 0; k < hn; k++)
+            glm5_mla_reduce_head(t->ctx + (size_t)(h0 + k) * KVL, sb + (size_t)k * n,
+                                 t->cache, t->sel, n, t->dense, KVL);
+    }
 }
 
 static void glm5_mla_forward(

@@ -811,6 +811,14 @@ test_attn_diff: test_attn_diff.c model_attention.c tensor.c type_dispatch.c quan
 test_glm5_snapshot: tests/test_glm5_snapshot.c model_glm5.c model_moe.c model_kv_cache.c model_ssm.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) model.h
 	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O2 -o $@ tests/test_glm5_snapshot.c model_glm5.c model_moe.c model_kv_cache.c model_ssm.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
 
+# Single-pass head-block MLA reduce vs the per-head reference: bit-exactness + timing.
+test_glm5_mla_reduce: tests/test_glm5_mla_reduce.c model_glm5.c model_moe.c model_ssm.c model_kv_cache.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) model.h
+	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O2 -o $@ tests/test_glm5_mla_reduce.c model_moe.c model_ssm.c model_kv_cache.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
+
+.PHONY: check-glm5-mla-reduce
+check-glm5-mla-reduce: test_glm5_mla_reduce
+	./test_glm5_mla_reduce
+
 # Head-parallel KDA core vs the serial reference: bit-exactness + timing.
 test_glm5_kda_par: tests/test_glm5_kda_par.c model_glm5.c model_moe.c model_ssm.c model_kv_cache.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) model.h
 	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O2 -o $@ tests/test_glm5_kda_par.c model_moe.c model_ssm.c model_kv_cache.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
