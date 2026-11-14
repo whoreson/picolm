@@ -1433,7 +1433,7 @@ int sgemm_iq4_xs_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const voi
  * PICOLM_IQ6K_R8=0 forces the tile kernel; PICOLM_IQ6K_R8_MIN_N sets the smallest batch (default 16). */
 int sgemm_iq6_k_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy,
                           float *out, size_t bs, int ith, int nth) {
-    static int en = -1, min_n = 16;
+    static int en = -1, min_n = 4;
     if (en < 0) {
         const char *e = getenv("PICOLM_IQ6K_R8"), *mn = getenv("PICOLM_IQ6K_R8_MIN_N");
         if (mn && atoi(mn) > 0) min_n = atoi(mn);

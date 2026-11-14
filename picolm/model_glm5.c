@@ -2896,6 +2896,12 @@ static void glm5_kda_tail_par(
 float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                                   int start_pos, volatile int *interrupt)
 {
+    /* PICOLM_POOL_GAPS also covers prefill: the counters are reset here so the
+     * report describes this prefill call only (the decode path resets its own).
+     * Same accounting as decode: serial gap (workers idle, main busy) vs main's
+     * own slot vs straggler wait. */
+    const int pg_on = tensor_pool_gaps_enabled();
+    if (pg_on) tensor_pool_gap_reset();
     model_config_t *c = &m->config;
     model_weights_t *w = &m->weights;
     run_state_t *s = &m->state;
@@ -3329,6 +3335,23 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
             const float *nw = s->output_norm_w;
             for (int i = 0; i < D; i++) s->glm5.cur[i] *= inv * nw[i];
             matmul(s->logits, s->glm5.cur, w->output, D, c->vocab_size, w->type_output);
+        }
+        if (pg_on) {
+            double gap, mainm, wt, wk; long n;
+            if (tensor_pool_gap_take(&gap, &mainm, &wt, &wk, &n)) {
+                double tot = gap + mainm + wt;
+                fprintf(stderr,
+                        "\n--- pool timing (PICOLM_POOL_GAPS), PREFILL of %d tokens ---\n"
+                        "  dispatches                               %6ld\n"
+                        "  serial gap (workers idle, main busy)     %6.1f ms  %5.1f%%\n"
+                        "  main's own share of dispatches           %6.1f ms  %5.1f%%\n"
+                        "  waiting for stragglers (barrier skew)    %6.1f ms  %5.1f%%\n"
+                        "  mean per dispatch: gap %.1f us, skew %.1f us, wake %.2f us\n",
+                        n_tokens, n, gap, tot > 0 ? 100*gap/tot : 0,
+                        mainm, tot > 0 ? 100*mainm/tot : 0,
+                        wt, tot > 0 ? 100*wt/tot : 0,
+                        n ? gap*1e3/n : 0, n ? wt*1e3/n : 0, wk);
+            }
         }
         return s->logits;
     }

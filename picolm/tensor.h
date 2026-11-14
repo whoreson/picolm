@@ -72,6 +72,7 @@ void tensor_parallel_for(int count, void (*fn)(int idx, void *ctx), void *ctx);
 /* Pool dispatch timing, enabled with PICOLM_POOL_GAPS=1 (spin-pool builds only).
  * take() returns 0 when disabled or nothing was recorded. All *_ms are totals
  * since the last reset; see the comment in tensor.c for what each means. */
+int  tensor_pool_gaps_enabled(void);
 void tensor_pool_gap_reset(void);
 int  tensor_pool_gap_take(double *gap_ms, double *main_ms, double *wait_ms,
                           double *wake_us_avg, long *n);

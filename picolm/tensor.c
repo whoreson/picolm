@@ -924,6 +924,7 @@ static inline int pg_enabled(void) {
     if (pg_on < 0) { const char *e = getenv("PICOLM_POOL_GAPS"); pg_on = (e && *e && *e != '0'); }
     return pg_on;
 }
+int tensor_pool_gaps_enabled(void) { return pg_enabled(); }
 void tensor_pool_gap_reset(void) {
     pg_gap_ns = pg_main_ns = pg_wait_ns = 0.0; pg_n = 0; pg_t_prev_end = 0;
     pg_wake_ns_sum = 0; pg_wake_n = 0;
