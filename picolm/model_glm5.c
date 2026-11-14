@@ -436,6 +436,30 @@ static void glm5_hc_post(const model_t *m, const float *a, const float *res,
 /* KDA linear attention (single token, sequential decode)              */
 /* ------------------------------------------------------------------ */
 
+/* Head-parallel KDA core (defined after glm5_kda_tail). Same contract and
+ * bit-identical results; see the comment there. */
+static void glm5_kda_tail_par(
+    const model_t *m, const glm5_layer_weights_t *gw, const layer_weights_t *lw,
+    run_state_t *s, int layer_idx, int pos,
+    const float *q, const float *k, const float *v,
+    const float *z, const float *raw, const float *beta_raw,
+    float *conv_out, float *g, float *head_out,
+    float *v_new, float *beta,
+    float *out, int do_out_proj);
+
+/* The head-parallel path skips the per-stage stats/range diagnostics, so it is
+ * used only when none of them is requested. PICOLM_GLM5_KDA_SERIAL=1 forces the
+ * original serial code (A/B timing, bisection). */
+static int glm5_kda_par_ok(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *pat;
+        cached = !(getenv("PICOLM_GLM5_KDA_SERIAL") || glm5_dbg2_enabled() ||
+                   glm5_stats_mode(&pat) || glm5_strict_mode());
+    }
+    return cached;
+}
+
 /* GLM-5 KDA layer forward for one token.
  *
  * Weight layout (ne0=input/row_len, ne1=output/rows):
@@ -536,6 +560,19 @@ static void glm5_kda_forward(
     matmul(raw, fa_out2, gw->kda_f_b, KD, DI, gw->type_kda_f_b);
     snprintf(t, sizeof(t), "%s.z", tg);   glm5_stats(t, z, DI);   glm5_chk(t, z, DI, -1e4f, 1e4f);
     snprintf(t, sizeof(t), "%s.raw", tg); glm5_stats(t, raw, DI); glm5_chk(t, raw, DI, -1e4f, 1e4f);
+
+    /* Everything from here to the output projection is head-local (g, conv,
+     * L2 norm, state update, per-head RMSNorm, gate), so it runs one head per
+     * task across the pool instead of serially on the main thread while the
+     * other workers spin. */
+    if (glm5_kda_par_ok()) {
+        glm5_kda_tail_par(m, gw, lw, s, layer_idx, pos, q, k, v, z, raw,
+                          beta_raw_buf, conv_out, g, head_out, NULL, beta,
+                          out, 1);
+        snprintf(t, sizeof(t), "%s.out", tg);
+        glm5_chk(t, out, D, -1e4f, 1e4f);
+        return;
+    }
 
     /* beta = sigmoid(beta_raw); beta_raw was computed in the batched dispatch
      * above (it only depends on `cur`). */
@@ -2437,6 +2474,213 @@ static void glm5_kda_tail(
      * do_out_proj = 1. */
     if (do_out_proj)
         matmul(out, head_out, lw->attn_output, DI, D, lw->type_attn_output);
+}
+
+/* ---- Head-parallel KDA core -------------------------------------------
+ *
+ * glm5_kda_tail() walks all H heads serially on the calling thread. In decode
+ * that leaves the other pool workers spinning for ~2 ms per KDA layer (g/decay
+ * expf, conv1d+SiLU over 3*DI channels, and a 4 MB state read+write at
+ * single-thread bandwidth). Every step is local to one head: head h only
+ * touches its own slices of q/k/v/raw/z, its own conv channels, its own
+ * KD*KD state block and its own head_out slice. So one task per head, with the
+ * per-head arithmetic copied unchanged from glm5_kda_tail(), is bit-identical
+ * (no reduction crosses heads; the build is -std=c11, i.e. -ffp-contract=off).
+ *
+ * Same signature as glm5_kda_tail(); v_new is unused (per-head stack scratch). */
+typedef struct {
+    const model_config_t *c;
+    const glm5_layer_weights_t *gw;
+    int KD, DI, CONV_K, CONV_DIM;
+    const float *q, *k, *v, *z, *raw, *beta_raw;
+    float *conv_state, *kda_state;
+    float *conv_out, *g, *head_out, *beta;
+} glm5_kda_head_ctx_t;
+
+static void glm5_kda_head_task(int h, void *vp)
+{
+    const glm5_kda_head_ctx_t *x = (const glm5_kda_head_ctx_t *)vp;
+    const model_config_t *c = x->c;
+    const glm5_layer_weights_t *gw = x->gw;
+    const int KD = x->KD, DI = x->DI, CONV_K = x->CONV_K, CONV_DIM = x->CONV_DIM;
+    float *conv_out = x->conv_out, *g = x->g, *head_out = x->head_out;
+    float *conv_state = x->conv_state;
+    const float *raw = x->raw;
+
+    /* beta = sigmoid(beta_raw) */
+    x->beta[h] = 1.0f / (1.0f + expf(-x->beta_raw[h]));
+    const float beta_h = x->beta[h];
+
+    /* g[h*KD+ch] = lower_bound * sigmoid(-a[h] * (raw[idx] + dt_bias[idx])) */
+    {
+        const float *dt_bias = (const float *)gw->kda_dt_bias;
+        const float a_val = ((const float *)gw->kda_a)[h];
+        for (int ch = 0; ch < KD; ch++) {
+            int idx = h*KD + ch;
+            g[idx] = c->glm5_kda_lower_bound *
+                     (1.0f / (1.0f + expf(a_val * (raw[idx] + dt_bias[idx]))));
+        }
+    }
+
+    /* Causal depthwise conv1d + SiLU for this head's channels in each of the
+     * q / k / v thirds of [q;k;v]. */
+    {
+        const float *wq = (const float *)gw->kda_conv_q;
+        const float *wk = (const float *)gw->kda_conv_k;
+        const float *wv = (const float *)gw->kda_conv_v;
+        for (int part = 0; part < 3; part++) {
+            const float *src = (part == 0) ? x->q : (part == 1) ? x->k : x->v;
+            const float *w   = (part == 0) ? wq   : (part == 1) ? wk   : wv;
+            for (int i = 0; i < KD; i++) {
+                const int ch_off = h*KD + i;
+                const int ch = part*DI + ch_off;
+                float xs[GLM5_KD_MAX];  /* CONV_K <= 4 */
+                for (int t = 0; t < CONV_K - 1; t++)
+                    xs[t] = conv_state[t * CONV_DIM + ch];
+                const float x_new = src[ch_off];
+                xs[CONV_K - 1] = x_new;
+                float acc = 0.f;
+                for (int t = 0; t < CONV_K; t++)
+                    acc += xs[t] * w[t + ch_off*CONV_K];
+                conv_out[ch] = acc / (1.0f + expf(-acc));
+                for (int t = 0; t < CONV_K - 2; t++)
+                    conv_state[t * CONV_DIM + ch] = conv_state[(t+1) * CONV_DIM + ch];
+                conv_state[(CONV_K - 2) * CONV_DIM + ch] = x_new;
+            }
+        }
+    }
+
+    /* Per-head L2 norm of q and k (after conv+SiLU) */
+    {
+        float *qh = conv_out + h*KD;
+        float *kh = conv_out + DI + h*KD;
+        float sq = 0.f, sk = 0.f;
+        for (int ch = 0; ch < KD; ch++) { sq += qh[ch]*qh[ch]; sk += kh[ch]*kh[ch]; }
+        float inv_q = 1.0f / fmaxf(sqrtf(sq), 1e-5f);
+        float inv_k = 1.0f / fmaxf(sqrtf(sk), 1e-5f);
+        for (int ch = 0; ch < KD; ch++) { qh[ch] *= inv_q; kh[ch] *= inv_k; }
+    }
+
+    /* Recurrent state update + output (verbatim from glm5_kda_tail). */
+    {
+        const float scale = 1.0f / sqrtf((float)KD);
+        const float *qh = conv_out + h*KD;
+        const float *kh = conv_out + DI + h*KD;
+        const float *vh = conv_out + 2*DI + h*KD;
+        float *Sh = x->kda_state + (size_t)h * KD * KD;
+        float decay[GLM5_KD_MAX], v_new[GLM5_KD_MAX];
+
+        float attn_score = 0.f;
+        for (int i = 0; i < KD; i++)
+            attn_score += kh[i] * qh[i];
+        attn_score *= scale;
+
+        for (int col = 0; col < KD; col++)
+            decay[col] = expf(fminf(g[h*KD + col], 50.0f));
+
+        {
+            float *vp = v_new;
+            float *ov = head_out + h*KD;
+            memset(vp, 0, (size_t)KD * sizeof(float));
+            memset(ov, 0, (size_t)KD * sizeof(float));
+            for (int col = 0; col < KD; col++) {
+                const float *Scol = Sh + (size_t)col*KD;
+                const float kd_ = kh[col] * decay[col];
+                const float qd_ = qh[col] * decay[col];
+                for (int row = 0; row < KD; row++) {
+                    float st = Scol[row];
+                    vp[row] += st * kd_;
+                    ov[row] += st * qd_;
+                }
+            }
+            for (int row = 0; row < KD; row++) {
+                float vn = beta_h * (vh[row] - vp[row]);
+                v_new[row] = vn;
+                ov[row] = ov[row] * scale + vn * attn_score;
+            }
+        }
+        for (int col = 0; col < KD; col++) {
+            float k_col = kh[col];
+            float dec = decay[col];
+            float *Sc = Sh + (size_t)col*KD;
+            int row = 0;
+#if defined(PICOLM_AVX512)
+            {
+                const __m512 vdec = _mm512_set1_ps(dec);
+                const __m512 vk   = _mm512_set1_ps(k_col);
+                const __m512 vlo  = _mm512_set1_ps(-1e6f);
+                const __m512 vhi  = _mm512_set1_ps(1e6f);
+                for (; row + 15 < KD; row += 16) {
+                    __m512 st = _mm512_loadu_ps(Sc + row);
+                    __m512 vn = _mm512_loadu_ps(v_new + row);
+                    st = _mm512_add_ps(_mm512_mul_ps(vdec, st), _mm512_mul_ps(vn, vk));
+                    st = _mm512_min_ps(_mm512_max_ps(st, vlo), vhi);
+                    _mm512_storeu_ps(Sc + row, st);
+                }
+            }
+#elif defined(PICOLM_AVX2) || defined(PICOLM_AVX)
+            {
+                const __m256 vk = _mm256_set1_ps(k_col);
+                const __m256 vdec = _mm256_set1_ps(dec);
+                const __m256 vlo  = _mm256_set1_ps(-1e6f);
+                const __m256 vhi  = _mm256_set1_ps(1e6f);
+                for (; row + 7 < KD; row += 8) {
+                    __m256 st = _mm256_loadu_ps(Sc + row);
+                    __m256 vn = _mm256_loadu_ps(v_new + row);
+                    st = _mm256_add_ps(_mm256_mul_ps(vdec, st), _mm256_mul_ps(vn, vk));
+                    st = _mm256_min_ps(_mm256_max_ps(st, vlo), vhi);
+                    _mm256_storeu_ps(Sc + row, st);
+                }
+            }
+#endif
+            for (; row < KD; row++) {
+                float st = Sc[row];
+                st = dec * st + v_new[row] * k_col;
+                Sc[row] = fminf(fmaxf(st, -1e6f), 1e6f);
+            }
+        }
+    }
+
+    /* Per-head RMSNorm with ssm_norm weight, then sigmoid gate (z) */
+    {
+        const float *norm_w = (const float *)gw->kda_norm;
+        float *oh = head_out + h*KD;
+        float ss = 0.f;
+        for (int ch = 0; ch < KD; ch++) ss += oh[ch]*oh[ch];
+        float inv = 1.0f / sqrtf(ss / KD + c->rms_norm_eps);
+        for (int ch = 0; ch < KD; ch++) oh[ch] *= inv * norm_w[ch];
+        for (int ch = 0; ch < KD; ch++) {
+            int i = h*KD + ch;
+            head_out[i] *= 1.0f / (1.0f + expf(-x->z[i]));
+        }
+    }
+}
+
+static void glm5_kda_tail_par(
+    const model_t *m, const glm5_layer_weights_t *gw, const layer_weights_t *lw,
+    run_state_t *s, int layer_idx, int pos,
+    const float *q, const float *k, const float *v,
+    const float *z, const float *raw, const float *beta_raw,
+    float *conv_out, float *g, float *head_out,
+    float *v_new, float *beta,
+    float *out, int do_out_proj)
+{
+    const model_config_t *c = &m->config;
+    const int H = c->glm5_n_kda_heads;
+    const int KD = c->glm5_kda_dim;
+    const int DI = H * KD;
+    (void)pos; (void)v_new;
+
+    glm5_kda_head_ctx_t kc = {
+        c, gw, KD, DI, c->ssm_d_conv, 3 * DI,
+        q, k, v, z, raw, beta_raw,
+        s->glm5.kda_conv_state[layer_idx], s->glm5.kda_state[layer_idx],
+        conv_out, g, head_out, beta
+    };
+    tensor_parallel_for(H, glm5_kda_head_task, &kc);
+
+    if (do_out_proj)
+        matmul(out, head_out, lw->attn_output, DI, c->n_embd, lw->type_attn_output);
 }
 
 /* Batched GLM-5 prefill. Processes n_tokens (<= GLM5_PREFILL_MAX_TOKENS)
