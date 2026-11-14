@@ -3009,7 +3009,7 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                  * tail's output projection is deferred so attn_output can be
                  * GEMM'd for all tokens at once below. */
                 for (int t = 0; t < n_tokens; t++) {
-                    glm5_kda_tail(m, gw, lw, s, il, start_pos + t,
+                    glm5_kda_tail_par(m, gw, lw, s, il, start_pos + t,
                                   q_b + (size_t)t*DI,
                                   k_b + (size_t)t*DI,
                                   v_b + (size_t)t*DI,
