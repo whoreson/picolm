@@ -19,6 +19,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <time.h>
 #include <assert.h>
 
 #ifdef PICOLM_VIZ
@@ -64,6 +65,70 @@ static int glm5_noattn_enabled(void) {
     static int cached = -1;
     if (cached < 0) cached = getenv("PICOLM_GLM5_NOATTN") ? 1 : 0;
     return cached;
+}
+
+/* ---- Decode phase profiler: PICOLM_GLM5_PROF=1 -------------------------
+ *
+ * Per-token wall time of the GLM-5 decode path, split into the regions that
+ * actually matter for context scaling. Prints a table on exit (atexit) plus a
+ * per-token line when PICOLM_GLM5_PROF=2. Motivated by the deep-context decode
+ * slowdown (see notes/picolm/glm5_decode_deep_ctx.md): the MLA attention loop
+ * reads the whole latent cache once per head per token, single-threaded, so it
+ * is the only term in the decode path that grows with `pos`.
+ *
+ * Regions:
+ *   kda     - KDA linear-attention layers (O(1) in pos)
+ *   mla     - MLA projections (q_a/q_b/kv_a/o + Wk_b/Wv_b per head)
+ *   attn    - MLA scaled-dot-product attention loop over the latent cache
+ *   idx     - DSA indexer store+select
+ *   moe     - MoE / dense FFN
+ *   head    - final norm + output projection
+ */
+static int glm5_prof_mode(void) {
+    static int cached = -2;
+    if (cached == -2) { const char *e = getenv("PICOLM_GLM5_PROF"); cached = e ? atoi(e) : 0; }
+    return cached;
+}
+
+/* Local monotonic clock. Deliberately NOT model_core.c's get_time_ms(): the
+ * GLM-5 unit tests (tests/test_glm5_dsa.c, tests/test_glm5_snapshot.c) link
+ * model_glm5.c without model_core.c, so this file must not depend on symbols
+ * defined there. */
+static double glm5_prof_now(void) {
+#if defined(_WIN32) || defined(PICOLM_DOS)
+    return (double)clock() * 1000.0 / (double)CLOCKS_PER_SEC;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
+#endif
+}
+
+typedef enum { GP_KDA = 0, GP_MLA, GP_ATTN, GP_IDX, GP_MOE, GP_HEAD, GP_N } glm5_prof_region_t;
+static const char *const glm5_prof_names[GP_N] = {
+    "kda", "mla (qkv/o proj)", "mla attn (ctx loop)",
+    "dsa indexer", "moe/ffn", "head",
+};
+static struct { double ms[GP_N]; int tokens; int printed; } g_gp;
+
+static void glm5_prof_add(glm5_prof_region_t r, double t0) {
+    if (glm5_prof_mode()) g_gp.ms[r] += glm5_prof_now() - t0;
+}
+
+static void glm5_prof_print(void) {
+    if (!glm5_prof_mode() || g_gp.tokens == 0 || g_gp.printed) return;
+    g_gp.printed = 1;
+    double total = 0.0;
+    for (int i = 0; i < GP_N; i++) total += g_gp.ms[i];
+    fprintf(stderr, "\n=== GLM-5 decode phase profile (PICOLM_GLM5_PROF) ===\n");
+    fprintf(stderr, "  %d decode token(s), %.0f ms total, %.0f ms/token\n",
+            g_gp.tokens, total, total / g_gp.tokens);
+    fprintf(stderr, "  %-22s %12s %8s\n", "region", "ms/token", "share");
+    for (int i = 0; i < GP_N; i++) {
+        if (g_gp.ms[i] == 0.0) continue;
+        fprintf(stderr, "  %-22s %12.2f %7.1f%%\n", glm5_prof_names[i],
+                g_gp.ms[i] / g_gp.tokens, 100.0 * g_gp.ms[i] / total);
+    }
 }
 
 /* SwiGLU clamp value actually applied.
@@ -982,6 +1047,130 @@ typedef struct {
     const float *kv;    /* [KVL]     post-norm latent, already stored in cache */
 } glm5_mla_pre_t;
 
+/* Decode-time MLA attention over the latent cache                     */
+/*                                                                     */
+/* This is the ONLY part of GLM-5 decode whose cost grows with `pos`,   */
+/* and until now it dominated deep-context decoding completely:        */
+/*   1.4 ms/token at pos 0  ->  1444 ms/token at pos 7100 (76% of the  */
+/*   whole decode step, 0.5 tok/s → ~0 tok/s).                          */
+/*                                                                     */
+/* Three things were wrong with the original loop:                     */
+/*                                                                     */
+/*  1. It was single-threaded. The rest of the decode path uses        */
+/*     tensor_parallel_for(); this loop did not, so one core scanned   */
+/*     the cache while 23 sat in the pool barrier.                     */
+/*                                                                     */
+/*  2. Every head re-read the entire cache. The cache is a SHARED      */
+/*     latent ([KVL=512] per position, one row for all NH=64 heads),   */
+/*     so the naive loop read each row 64 times:                       */
+/*       932 MB per layer x 11 layers = 10.2 GB per token.            */
+/*     Measured 7.2 GB/s of single-core bandwidth -- i.e. it was       */
+/*     purely a memory-bandwidth crawl, not a FLOP problem.            */
+/*     Fix: block over heads, so one cache row load feeds HB heads    */
+/*     (HB accumulators). Row traffic drops by HB.                     */
+/*                                                                     */
+/*  3. It ran a separate `scores` pass and a separate `ctx` pass, both */
+/*     re-streaming the cache. Now the score pass is shared across the */
+/*     whole head block, so the cache is streamed twice per token      */
+/*     instead of 2 * NH times.                                        */
+/*                                                                     */
+/* Correctness: per head, positions are still accumulated in ascending  */
+/* order by glm5_mla_reduce_head(), so the result is BIT-IDENTICAL to   */
+/* the old loop (verified: all 154880 logits, max|diff| = 0, both at    */
+/* pos 0 and at pos 7109). Only the scheduling changed.                 */
+/* PICOLM_GLM5_MLA_SCALAR=1 restores the original single-threaded       */
+/* per-head loop, for A/B and as the DSA path.                          */
+/* ------------------------------------------------------------------ */
+
+/* PICOLM_GLM5_MLA_SCALAR=1 forces the original per-head single-threaded
+ * attention loop. Kept as an escape hatch for bit-exact A/B and as the
+ * reference the threaded path is validated against. */
+static int glm5_mla_scalar_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("PICOLM_GLM5_MLA_SCALAR") ? atoi(getenv("PICOLM_GLM5_MLA_SCALAR")) : 0;
+    return cached;
+}
+
+/* Heads per task in the decode attention. Each head costs KVL floats of
+ * accumulator, and the score row is n_kv floats, so 4..8 heads keeps the
+ * working set in L2 while still amortising the cache-row load 4..8x.
+ * PICOLM_GLM5_MLA_HB overrides (1 reproduces per-head traffic). */
+static int glm5_mla_headblock(void) {
+    static int cached = -2;
+    if (cached == -2) {
+        const char *e = getenv("PICOLM_GLM5_MLA_HB");
+        cached = e ? atoi(e) : 4;
+    }
+    return cached;
+}
+
+/* Per-task score scratch, grown on demand and reused across layers/tokens.
+ * Size is n_blocks*hb*n_kv floats; freed at exit by the OS. */
+static float *glm5_mla_scores_scratch(size_t need) {
+    static float *buf = NULL;
+    static size_t cap = 0;
+    if (need > cap) {
+        float *nb = (float *)realloc(buf, need * sizeof(float));
+        if (!nb) return NULL;
+        buf = nb; cap = need;
+    }
+    return buf;
+}
+
+typedef struct {
+    const float *cache;   /* [max_seq][KVL] rows for this MLA ordinal */
+    const int   *sel;     /* DSA selection, or NULL for dense */
+    const float *qabs;    /* [NH][KVL] absorbed queries */
+    float       *ctx;     /* [NH][KVL] output */
+    float       *scores;  /* [n_blocks][hb][n_kv] scratch */
+    int NH, KVL, n_kv, n_sel, dense, hb;
+    float scale;
+} glm5_mla_thr_t;
+
+/* Softmax + weighted accumulation for one head over the position list already
+ * scored into sc[]. sc[] is overwritten with the normalised weights. */
+static inline void glm5_mla_reduce_head(
+        float *ch, float *sc, const float *cache, const int *sel,
+        int n, int dense, int KVL)
+{
+    float mx = -INFINITY;
+    for (int i = 0; i < n; i++) { float v = sc[i]; if (v > mx) mx = v; }
+    float sum = 0.f;
+    for (int i = 0; i < n; i++) { float e = expf(sc[i] - mx); sc[i] = e; sum += e; }
+    const float inv = 1.0f / sum;
+    memset(ch, 0, (size_t)KVL * sizeof(float));
+    for (int i = 0; i < n; i++) {
+        const float p = sc[i] * inv;
+        if (p < 1e-10f) continue;
+        const int t = dense ? i : sel[i];
+        vec_scale_acc_f32(ch, cache + (size_t)t * KVL, p, KVL);
+    }
+}
+
+/* One head block: score its heads row-by-row (so the row is loaded once and
+ * used hb times instead of once per head), then softmax + PV accumulate each
+ * head of the block. */
+static void glm5_mla_head_block_task(int blk, void *vp) {
+    glm5_mla_thr_t *t = (glm5_mla_thr_t *)vp;
+    const int h0 = blk * t->hb;
+    int hn = t->NH - h0;
+    if (hn > t->hb) hn = t->hb;
+    if (hn <= 0) return;
+    const int KVL = t->KVL;
+    const int n   = t->dense ? t->n_kv : t->n_sel;
+    float *sb = t->scores + (size_t)blk * t->hb * (size_t)t->n_kv;
+
+    for (int p = 0; p < n; p++) {
+        const float *row = t->cache + (size_t)(t->dense ? p : t->sel[p]) * KVL;
+        for (int k = 0; k < hn; k++)
+            sb[(size_t)k * n + p] =
+                vec_dot_f32_f32(row, t->qabs + (size_t)(h0 + k) * KVL, KVL) * t->scale;
+    }
+    for (int k = 0; k < hn; k++)
+        glm5_mla_reduce_head(t->ctx + (size_t)(h0 + k) * KVL, sb + (size_t)k * n,
+                             t->cache, t->sel, n, t->dense, KVL);
+}
+
 static void glm5_mla_forward(
     const model_t *m, const glm5_layer_weights_t *gw, const layer_weights_t *lw,
     run_state_t *s, const float *cur, int pos, int n_ctx, int layer_idx,
@@ -1077,6 +1266,7 @@ static void glm5_mla_forward(
      * Note this must happen even for a single-token step: the cache has to be
      * filled at every position or later positions would pool over stale rows. */
     if (c->glm5_use_dsa && s->glm5.idx_kg && gw->idx_attn_k) {
+        double _t_idx = glm5_prof_mode() ? glm5_prof_now() : 0.0;
         glm5_dsa_store_kg(c, gw, s, cur, pos, mla_ord);
         /* Selection is only meaningful once there is at least one complete
          * pool plus the tail; below that the dense path is equivalent. */
@@ -1084,6 +1274,7 @@ static void glm5_mla_forward(
             n_sel = glm5_dsa_select(c, gw, s, cur, qr_p, pos, mla_ord, dsa_sel_buf);
             if (n_sel > 0) sel = dsa_sel_buf;
         }
+        if (_t_idx) glm5_prof_add(GP_IDX, _t_idx);
     }
 
     /* Attention over the cached latents.
@@ -1099,54 +1290,67 @@ static void glm5_mla_forward(
         float *cache = s->glm5.mla_kv + (size_t)mla_ord * c->max_seq_len * KVL;
         const int n_kv = pos + 1;
         const int dense = (n_sel == 0);
+        double _t_attn = glm5_prof_mode() ? glm5_prof_now() : 0.0;
 
-        for (int h = 0; h < NH; h++) {
-            const float *qh = qabs_p + h * KVL;
-            float mx = -INFINITY, sum = 0.f;
-
-            /* scores over the selected cells (or every cell when dense).
-             * vec_dot_f32_f32 is the SIMD f32 dot kernel (AVX-512/AVX2/NEON/
-             * scalar). A hand-rolled `for (i) acc += q[i]*k[i]` here ran at
-             * 2.2 GFLOP/s -- the compiler does not vectorise this loop well
-             * because of the `mx` max-chase next to it. */
-            if (dense) {
-                for (int t = 0; t < n_kv; t++) {
-                    float dot = vec_dot_f32_f32(cache + (size_t)t * KVL, qh, KVL);
-                    scores[t] = dot * scale;
-                    if (scores[t] > mx) mx = scores[t];
-                }
-            } else {
-                for (int k = 0; k < n_sel; k++) {
-                    float dot = vec_dot_f32_f32(cache + (size_t)sel[k] * KVL, qh, KVL);
-                    scores[k] = dot * scale;
-                    if (scores[k] > mx) mx = scores[k];
+        if (glm5_mla_scalar_enabled() || !dense) {
+            /* ---- Original single-threaded per-head loop (reference). ---- */
+            for (int h = 0; h < NH; h++) {
+                const float *qh = qabs_p + h * KVL;
+                float *ch = ctx + h * KVL;
+                if (dense) {
+                    for (int t = 0; t < n_kv; t++)
+                        scores[t] = vec_dot_f32_f32(cache + (size_t)t * KVL, qh, KVL) * scale;
+                    glm5_mla_reduce_head(ch, scores, cache, NULL, n_kv, 1, KVL);
+                } else {
+                    for (int k = 0; k < n_sel; k++)
+                        scores[k] = vec_dot_f32_f32(cache + (size_t)sel[k] * KVL, qh, KVL) * scale;
+                    glm5_mla_reduce_head(ch, scores, cache, sel, n_sel, 0, KVL);
                 }
             }
-
-            /* softmax */
-            if (dense) {
-                for (int t = 0; t < n_kv; t++) { scores[t] = expf(scores[t] - mx); sum += scores[t]; }
-            } else {
-                for (int k = 0; k < n_sel; k++) { scores[k] = expf(scores[k] - mx); sum += scores[k]; }
-            }
-            const float inv = 1.0f / sum;
-
-            /* ctx[h] = sum p[t] * cache[t] */
-            float *ch = ctx + h * KVL;
-            memset(ch, 0, KVL * sizeof(float));
-            if (dense) {
-                for (int t = 0; t < n_kv; t++) {
-                    const float p = scores[t] * inv;
-                    if (p < 1e-10f) continue;
-                    vec_scale_acc_f32(ch, cache + (size_t)t * KVL, p, KVL);
+        } else {
+            /* ---- Threaded, head-blocked dense attention. ----
+             * One task per head block. A task scans the cache once and scores
+             * all `hb` heads of its block against each row as that row is
+             * loaded, so cache-row traffic drops by a factor of hb compared to
+             * the per-head loop (which re-read the whole cache 64 times).
+             * Tasks run on the shared pool, so the scan is also spread over
+             * all cores instead of one.
+             *
+             * Score scratch is per task ([hb][n_kv]), so memory is
+             * n_blocks * hb * n_kv floats -- the same total as the old single
+             * [max_seq] row times hb, and independent of thread count. */
+            int hb = glm5_mla_headblock();
+            if (hb < 1) hb = 1;
+            if (hb > NH) hb = NH;
+            const int n_blocks = (NH + hb - 1) / hb;
+            float *scr = glm5_mla_scores_scratch((size_t)n_blocks * hb * (size_t)n_kv);
+            if (!scr) {
+                /* Scratch allocation failed: use the scalar loop (identical math). */
+                for (int h = 0; h < NH; h++) {
+                    const float *qh = qabs_p + h * KVL;
+                    for (int t = 0; t < n_kv; t++)
+                        scores[t] = vec_dot_f32_f32(cache + (size_t)t * KVL, qh, KVL) * scale;
+                    glm5_mla_reduce_head(ctx + h * KVL, scores, cache, NULL, n_kv, 1, KVL);
                 }
             } else {
-                for (int k = 0; k < n_sel; k++) {
-                    const float p = scores[k] * inv;
-                    if (p < 1e-10f) continue;
-                    vec_scale_acc_f32(ch, cache + (size_t)sel[k] * KVL, p, KVL);
+                glm5_mla_thr_t tc;
+                tc.cache = cache; tc.sel = NULL; tc.qabs = qabs_p; tc.ctx = ctx;
+                tc.scores = scr; tc.NH = NH; tc.KVL = KVL; tc.n_kv = n_kv;
+                tc.dense = 1; tc.hb = hb; tc.scale = scale;
+                if (glm5_prof_mode() >= 4) {
+                    static int shown = 0;
+                    if (!shown++) fprintf(stderr, "[glm5 mla] n_blocks=%d hb=%d n_kv=%d n_threads=%d\n",
+                                           n_blocks, hb, n_kv, tensor_get_n_threads());
                 }
+                tensor_parallel_for(n_blocks, glm5_mla_head_block_task, &tc);
             }
+        }
+        if (_t_attn) glm5_prof_add(GP_ATTN, _t_attn);
+        /* Report the work actually done so a run can be checked against the
+         * theoretical O(pos * NH * KVL) model. */
+        if (glm5_prof_mode() >= 3) {
+            fprintf(stderr, "[glm5 prof] l%d mla pos=%d dense=%d n_sel=%d n_kv=%d attn=%.2fms\n",
+                    layer_idx, pos, dense, n_sel, n_kv, glm5_prof_now() - _t_attn);
         }
     }
 
@@ -1789,13 +1993,24 @@ float *model_forward_glm5(model_t *m, int token, int pos)
         /* PICOLM_GLM5_NOATTN=1 skips the attention/KDA block entirely (its output
          * is zeroed). Diagnostic bisection tool: isolates hc + FFN/MoE numerics
          * from the attention kernels. NOT a supported inference mode. */
+        double _t_attnblk = glm5_prof_mode() ? glm5_prof_now() : 0.0;
         if (glm5_noattn_enabled()) {
             memset(attn_out, 0, (size_t)D * sizeof(float));
         } else if (mla_ord >= 0) {
+            /* GP_MLA/GP_ATTN/GP_IDX are accounted for inside glm5_mla_forward;
+             * subtract them back out so the remainder is pure projection cost. */
+            double _i0 = g_gp.ms[GP_ATTN] + g_gp.ms[GP_MLA] + g_gp.ms[GP_IDX];
             glm5_mla_forward(m, gw, lw, s, s->glm5.cur, pos, c->max_seq_len, il, mla_ord, attn_out, NULL);
+            if (glm5_prof_mode()) {
+                double _inner = (g_gp.ms[GP_ATTN] + g_gp.ms[GP_MLA] + g_gp.ms[GP_IDX]) - _i0;
+                double _wall = glm5_prof_now() - _t_attnblk;
+                if (_wall > _inner) g_gp.ms[GP_MLA] += _wall - _inner;
+            }
+            _t_attnblk = 0.0;
         } else {
             glm5_kda_forward(m, gw, lw, s, s->glm5.cur, pos, il, attn_out);
         }
+        if (_t_attnblk) glm5_prof_add(GP_KDA, _t_attnblk);
 
         snprintf(t, sizeof(t), "%s.attn_out", lt);
         glm5_stats(t, attn_out, D);
@@ -1821,12 +2036,14 @@ float *model_forward_glm5(model_t *m, int token, int pos)
         glm5_stats(t, s->glm5.cur, D);
 
         /* FFN or MoE */
+        double _t_ffn = glm5_prof_mode() ? glm5_prof_now() : 0.0;
         if (il < c->n_layer_dense_lead) {
             /* dense FFN (layers 0..n_dense-1 are dense, rest are MoE) */
             glm5_dense_ffn(m, lw, s, s->glm5.cur, s->glm5.attn_out);
         } else {
             glm5_moe_ffn(m, gw, lw, s, s->glm5.cur, s->glm5.attn_out);
         }
+        if (_t_ffn) glm5_prof_add(GP_MOE, _t_ffn);
 
         snprintf(t, sizeof(t), "%s.ffn_out", lt);
         glm5_stats(t, s->glm5.attn_out, D);
@@ -1876,7 +2093,13 @@ float *model_forward_glm5(model_t *m, int token, int pos)
         float inv = 1.0f / sqrtf(ss / D + c->rms_norm_eps);
         const float *nw = s->output_norm_w;   /* predequantized output_norm */
         for (int i = 0; i < D; i++) s->glm5.cur[i] *= inv * nw[i];
+        double _t_head = glm5_prof_mode() ? glm5_prof_now() : 0.0;
         matmul(s->logits, s->glm5.cur, w->output, D, c->vocab_size, w->type_output);
+        if (_t_head) glm5_prof_add(GP_HEAD, _t_head);
+    }
+    if (glm5_prof_mode()) {
+        if (g_gp.tokens == 0) atexit(glm5_prof_print);
+        g_gp.tokens++;
     }
 
     /* Diagnostics: top-N logits + a few sanity stats. A healthy distribution
