@@ -625,6 +625,11 @@ typedef struct {
     float *hb2_exp;           /* second per-expert hidden buffer [n_ff_exp] */
     float *gate_batch;        /* batched gate outputs [n_ff_exp][n_expert_used] */
     float *up_batch;          /* batched up outputs [n_ff_exp][n_expert_used] */
+    /* Per-expert down-projection outputs [n_embd][n_expert_used].
+     * The routed experts' down GEMMs are independent (same shape, different
+     * weights and activations), so they are issued as one batched dispatch and
+     * each needs its own destination. Only GLM-5's per-token MoE uses this. */
+    float *down_batch;
     block_q8_0 *down_qx;      /* quantized SwiGLU for down projection */
     float *down_qx_d;         /* deltas */
     block_q8_0 *shared_qx;    /* quantized input for shared expert */

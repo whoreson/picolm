@@ -801,6 +801,7 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         /* Pre-allocated quantization buffers — avoid per-expert malloc */
         sz_moe += (size_t)c->n_ff_exp * (size_t)c->n_expert_used * sizeof(float); /* gate_batch */
         sz_moe += (size_t)c->n_ff_exp * (size_t)c->n_expert_used * sizeof(float); /* up_batch */
+        sz_moe += (size_t)c->n_embd * (size_t)c->n_expert_used * sizeof(float);   /* down_batch */
         sz_moe += gguf_type_row_size(GGUF_TYPE_Q8_0, c->n_ff_exp); /* down_qx */
         sz_moe += (c->n_ff_exp / 32) * sizeof(float);         /* down_qx_d */
         sz_moe += gguf_type_row_size(GGUF_TYPE_Q8_0, c->n_embd); /* shared_qx */
@@ -1325,6 +1326,7 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         s->hb2_exp = p; p += c->n_ff_exp;
         s->gate_batch = p; p += (size_t)c->n_ff_exp * c->n_expert_used;
         s->up_batch = p; p += (size_t)c->n_ff_exp * c->n_expert_used;
+        s->down_batch = p; p += (size_t)c->n_embd * c->n_expert_used;
         {
             size_t q8_rb, q8_nb;
             q8_rb = gguf_type_row_size(GGUF_TYPE_Q8_0, c->n_ff_exp);

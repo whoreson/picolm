@@ -5282,6 +5282,96 @@ static int barrier_prof_on = -1;
 static long barrier_dispatch_count;
 static double barrier_ns_total;
 
+/* ---- Multi-matmul dispatch --------------------------------------------- *
+ *
+ * Run N independent matmuls in ONE pool wake.
+ *
+ * GLM decode issues ~3000 matmul() calls per token: a MoE layer does 8 experts
+ * x (gate, up, down) and a KDA layer does q,k,v,f,g,out. Each call is its own
+ * wake/barrier, and each pays the same fixed cost. Batching independent
+ * matmuls removes that cost for all but the first.
+ *
+ * Jobs in one call MUST be independent (different outputs; no job reads what
+ * another writes).
+ *
+ * Distribution: a flat queue of (job, row-block) items claimed atomically, so
+ * a slow job cannot stall the others. Blocks are contiguous and BLOCK rows
+ * long, which keeps DRAM streams long (contiguous beats interleaved by ~34% on
+ * this box) while spreading the threads' starting points across each matrix.
+ *
+ * Bit-identical to sequential matmul(): every output row is written exactly
+ * once, by the same per-row kernel, in the same order. */
+typedef struct {
+    const mm_job_t *jobs;
+    int   n_jobs;
+    int   block;
+    int   nblocks;     /* sum over jobs of ceil(d / block) */
+    int   cursor;
+} mm_multi_t;
+
+static void mm_multi_run(mm_multi_t *c, int item) {
+    int rem = item;
+    for (int j = 0; j < c->n_jobs; j++) {
+        const mm_job_t *jb = &c->jobs[j];
+        const int nb = (jb->d + c->block - 1) / c->block;
+        if (rem >= nb) { rem -= nb; continue; }
+
+        int r0 = rem * c->block;
+        int r1 = r0 + c->block;
+        if (r1 > jb->d) r1 = jb->d;
+
+        const type_info_t *ti = typeinfo(jb->qtype);
+        const size_t row_bytes = gguf_type_row_size(jb->qtype, jb->n);
+        const char *w = (const char *)jb->W;
+        if (!ti || ti->act_fmt == ACT_FMT_F32) {
+            for (int i = r0; i < r1; i++)
+                jb->out[i] = vec_dot(w + (size_t)i * row_bytes, jb->x, jb->n, jb->qtype);
+            return;
+        }
+        quant_buf_t qb = quant_activations_ex(jb->qtype, jb->x, 1, jb->n, NULL, 0, 1);
+        if (!qb.qbuf) {
+            for (int i = r0; i < r1; i++)
+                jb->out[i] = vec_dot(w + (size_t)i * row_bytes, jb->x, jb->n, jb->qtype);
+            return;
+        }
+        matmul_task_t t;
+        memset(&t, 0, sizeof t);
+        t.out = jb->out; t.x = (const float *)qb.qbuf; t.x_d = qb.dbuf;
+        t.W = w; t.row_bytes = row_bytes; t.n = jb->n; t.d = jb->d;
+        t.start = r0; t.end = r1; t.qtype = jb->qtype; t.n_batch = 0;
+        t.x_is_q8k = (ti->act_fmt == ACT_FMT_Q8_K) ? 1 : 0;
+        matmul_worker_f(&t);
+        free_quant_buf(&qb, NULL);
+        return;
+    }
+}
+
+static void mm_multi_task(int tid, void *ctx) {
+    mm_multi_t *c = (mm_multi_t *)ctx;
+    (void)tid;
+    for (;;) {
+        int it = __atomic_fetch_add(&c->cursor, 1, __ATOMIC_RELAXED);
+        if (it >= c->nblocks) break;
+        mm_multi_run(c, it);
+    }
+}
+
+int tensor_matmul_multi(const mm_job_t *jobs, int n_jobs) {
+    if (!jobs || n_jobs <= 0) return 1;
+    if (n_threads <= 1 || tl_in_parallel) return 0;   /* caller runs them */
+    mm_multi_t c;
+    c.jobs = jobs;
+    c.n_jobs = n_jobs;
+    c.block = matmul_chunk_rows() > 0 ? matmul_chunk_rows() : 32;
+    c.nblocks = 0;
+    for (int j = 0; j < n_jobs; j++)
+        c.nblocks += (jobs[j].d + c.block - 1) / c.block;
+    c.cursor = 0;
+    if (c.nblocks < 2) return 0;     /* not worth a dispatch */
+    tensor_parallel_for(n_threads, mm_multi_task, &c);
+    return 1;
+}
+
 void tensor_parallel_for(int count, void (*fn)(int idx, void *ctx), void *ctx) {
     if (n_threads <= 1 || count < 2 || tl_in_parallel) {
         for (int i = 0; i < count; i++) fn(i, ctx);

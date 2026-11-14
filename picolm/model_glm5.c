@@ -1670,33 +1670,98 @@ static void glm5_moe_ffn(const model_t *m, const glm5_layer_weights_t *gw,
         for (int k = 0; k < AK; k++) wts[k] *= sc2;
     }
 
-    /* routed experts */
+    /* routed experts, batched.
+     *
+     * The 8 experts are independent: same shapes, different weight slices, and
+     * all read the same `cur`. Issuing them as individual matmul() calls costs
+     * 24 pool wakes per layer (~1000 per token over 42 layers). Instead:
+     *
+     *   phase 1: all 8 gate and all 8 up GEMMs, in one dispatch
+     *            (16 independent jobs, gate into gate_batch[k], up into
+     *             up_batch[k])
+     *   phase 2: SwiGLU + clamp for each expert, into gate_batch[k]
+     *            (moved out of the per-expert loop so it runs once per k)
+     *   phase 3: all 8 down GEMMs, in one dispatch, into down_batch[k]
+     *   phase 4: accumulate w[k] * down_batch[k] in fixed k order
+     *
+     * ffn_gate_exps / ffn_up_exps ne = {D, FF, NE}: per-expert stride is
+     * FF * row_size(type, D). ffn_down_exps ne = {FF, D, NE}: per-expert
+     * stride is D * row_size(type, FF).
+     *
+     * The accumulation order (k ascending) is unchanged, so this is
+     * bit-identical to the per-expert loop. */
     memset(out, 0, D * sizeof(float));
-    for (int k = 0; k < AK; k++) {
-        int e = sel[k];
-        float w = wts[k];
-        if (w == 0.f) continue;
-        /* expert e: gate/up/down from the 3-D expert tensors.
-         * ffn_gate_exps ne = {D, FF, NE}: per-expert stride = FF * row_size(type, D).
-         * ffn_down_exps ne = {FF, D, NE}: per-expert stride = D * row_size(type, FF). */
-        size_t gate_stride = (size_t)FF * gguf_type_row_size(lw->type_ffn_gate_exps, D);
-        size_t down_stride = (size_t)D * gguf_type_row_size(lw->type_ffn_down_exps, FF);
-        const void *gate_w = (const uint8_t *)lw->ffn_gate_exps + (size_t)e * gate_stride;
-        const void *up_w   = (const uint8_t *)lw->ffn_up_exps   + (size_t)e * gate_stride;
-        const void *down_w = (const uint8_t *)lw->ffn_down_exps + (size_t)e * down_stride;
-        matmul(s->hb_exp, cur, gate_w, D, FF, lw->type_ffn_gate_exps);
-        matmul(s->hb2_exp, cur, up_w, D, FF, lw->type_ffn_up_exps);
-        for (int i = 0; i < FF; i++) {
-            float g = s->hb_exp[i];
-            float u = s->hb2_exp[i];
-            if (clamp_v > 0.0f) {
-                g = fminf(g, clamp_v);
-                u = fminf(fmaxf(u, -clamp_v), clamp_v);
-            }
-            s->hb_exp[i] = g / (1.0f + expf(-g)) * u;
+    {
+        const size_t gate_stride = (size_t)FF * gguf_type_row_size(lw->type_ffn_gate_exps, D);
+        const size_t down_stride = (size_t)D * gguf_type_row_size(lw->type_ffn_down_exps, FF);
+        float *gate_b = s->gate_batch;                  /* [FF][AK] */
+        float *up_b   = s->up_batch;                    /* [FF][AK] */
+        float *down_b = s->down_batch;                  /* [D][AK]  */
+
+        mm_job_t jobs[2 * 16];
+        int nj = 0;
+        for (int k = 0; k < AK; k++) {
+            if (wts[k] == 0.f) continue;
+            const int e = sel[k];
+            jobs[nj].out   = gate_b + (size_t)k * FF;
+            jobs[nj].x     = cur;
+            jobs[nj].W     = (const uint8_t *)lw->ffn_gate_exps + (size_t)e * gate_stride;
+            jobs[nj].n     = D;
+            jobs[nj].d     = FF;
+            jobs[nj].qtype = lw->type_ffn_gate_exps;
+            nj++;
+            jobs[nj].out   = up_b + (size_t)k * FF;
+            jobs[nj].x     = cur;
+            jobs[nj].W     = (const uint8_t *)lw->ffn_up_exps + (size_t)e * gate_stride;
+            jobs[nj].n     = D;
+            jobs[nj].d     = FF;
+            jobs[nj].qtype = lw->type_ffn_up_exps;
+            nj++;
         }
-        matmul(s->glm5.moe_down, s->hb_exp, down_w, FF, D, lw->type_ffn_down_exps);
-        for (int i = 0; i < D; i++) out[i] += w * s->glm5.moe_down[i];
+        if (!tensor_matmul_multi(jobs, nj)) {
+            for (int i = 0; i < nj; i++)
+                matmul(jobs[i].out, jobs[i].x, jobs[i].W, jobs[i].n, jobs[i].d, jobs[i].qtype);
+        }
+
+        /* SwiGLU (+ optional clamp) per expert, in place into gate_b[k]. */
+        for (int k = 0; k < AK; k++) {
+            if (wts[k] == 0.f) continue;
+            float *g_buf = gate_b + (size_t)k * FF;
+            const float *u_buf = up_b + (size_t)k * FF;
+            for (int i = 0; i < FF; i++) {
+                float g = g_buf[i];
+                float u = u_buf[i];
+                if (clamp_v > 0.0f) {
+                    g = fminf(g, clamp_v);
+                    u = fminf(fmaxf(u, -clamp_v), clamp_v);
+                }
+                g_buf[i] = g / (1.0f + expf(-g)) * u;
+            }
+        }
+
+        nj = 0;
+        for (int k = 0; k < AK; k++) {
+            if (wts[k] == 0.f) continue;
+            const int e = sel[k];
+            jobs[nj].out   = down_b + (size_t)k * D;
+            jobs[nj].x     = gate_b + (size_t)k * FF;
+            jobs[nj].W     = (const uint8_t *)lw->ffn_down_exps + (size_t)e * down_stride;
+            jobs[nj].n     = FF;
+            jobs[nj].d     = D;
+            jobs[nj].qtype = lw->type_ffn_down_exps;
+            nj++;
+        }
+        if (!tensor_matmul_multi(jobs, nj)) {
+            for (int i = 0; i < nj; i++)
+                matmul(jobs[i].out, jobs[i].x, jobs[i].W, jobs[i].n, jobs[i].d, jobs[i].qtype);
+        }
+
+        for (int k = 0; k < AK; k++) {
+            if (wts[k] == 0.f) continue;
+            const float w = wts[k];
+            const float *d_buf = down_b + (size_t)k * D;
+            for (int i = 0; i < D; i++) out[i] += w * d_buf[i];
+        }
     }
 
     glm5_stats("x.moe.routed", out, D);

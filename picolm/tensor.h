@@ -44,6 +44,21 @@ void tensor_thread_profile_print(void);
 void tensor_thread_profile_reset(void);   /* drop samples, e.g. after a warm-up run */
 /* Label the parallel regions dispatched next (used by the profile output only). */
 void tensor_set_region_label(const char *label);
+/* One independent matmul inside a tensor_matmul_multi() batch. */
+typedef struct {
+    float       *out;
+    const float *x;
+    const void  *W;
+    int          n, d;
+    gguf_type_t  qtype;
+} mm_job_t;
+
+/* Run n_jobs independent matmuls in ONE pool wake (one barrier instead of n).
+ * The jobs must not depend on each other. Returns 1 if the batch was run,
+ * 0 if the work was too small to batch (caller should fall back to matmul()).
+ * Bit-identical to calling matmul() once per job. */
+int tensor_matmul_multi(const mm_job_t *jobs, int n_jobs);
+
 void matmul_batch(float *out, const float *x, int n_batch,
                    const void *W, int n, int d, gguf_type_t qtype);
 
