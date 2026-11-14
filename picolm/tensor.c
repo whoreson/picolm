@@ -5315,13 +5315,31 @@ static double barrier_ns_total;
  * Bit-identical to sequential matmul(): every output row is written exactly
  * once, by the same per-row kernel, in the same order. */
 typedef struct {
+    const float *xq;      /* quantized activations (job-independent storage) */
+    const float *x_d;     /* fp32 deltas, for the Q8_0 path */
+    int          owned;   /* 1 = malloc'd, free after the dispatch */
+    int          usable;  /* 0 = fall back to per-row vec_dot on the raw x */
+} mm_job_q_t;
+
+typedef struct {
     const mm_job_t *jobs;
+    mm_job_q_t     *q;      /* per-job quantized activations */
     int   n_jobs;
     int   block;
     int   nblocks;     /* sum over jobs of ceil(d / block) */
     int   cursor;
 } mm_multi_t;
 
+/* Per-job pre-quantized activations, computed once before the dispatch.
+ *
+ * Each job used to quantize its own activation inside mm_multi_run(), i.e. once
+ * per (job, row-block) work item. In the MoE batch all 8 gate jobs share the
+ * same `cur`, so that was the same 4096 floats quantized 16 times per layer --
+ * it showed up as ~4% of decode (quantize_row_q8_K + q8_0_row_task).
+ *
+ * Quantizing once per job outside the parallel region removes the duplication
+ * without serialising anything meaningful: `n` per job is small, and the old
+ * code paid for it *inside* the pool anyway. */
 static void mm_multi_run(mm_multi_t *c, int item) {
     int rem = item;
     for (int j = 0; j < c->n_jobs; j++) {
@@ -5336,25 +5354,20 @@ static void mm_multi_run(mm_multi_t *c, int item) {
         const type_info_t *ti = typeinfo(jb->qtype);
         const size_t row_bytes = gguf_type_row_size(jb->qtype, jb->n);
         const char *w = (const char *)jb->W;
-        if (!ti || ti->act_fmt == ACT_FMT_F32) {
-            for (int i = r0; i < r1; i++)
-                jb->out[i] = vec_dot(w + (size_t)i * row_bytes, jb->x, jb->n, jb->qtype);
-            return;
-        }
-        quant_buf_t qb = quant_activations_ex(jb->qtype, jb->x, 1, jb->n, NULL, 0, 1);
-        if (!qb.qbuf) {
+        const mm_job_q_t *q = &c->q[j];
+
+        if (!ti || ti->act_fmt == ACT_FMT_F32 || !q->usable) {
             for (int i = r0; i < r1; i++)
                 jb->out[i] = vec_dot(w + (size_t)i * row_bytes, jb->x, jb->n, jb->qtype);
             return;
         }
         matmul_task_t t;
         memset(&t, 0, sizeof t);
-        t.out = jb->out; t.x = (const float *)qb.qbuf; t.x_d = qb.dbuf;
+        t.out = jb->out; t.x = q->xq; t.x_d = q->x_d;
         t.W = w; t.row_bytes = row_bytes; t.n = jb->n; t.d = jb->d;
         t.start = r0; t.end = r1; t.qtype = jb->qtype; t.n_batch = 0;
         t.x_is_q8k = (ti->act_fmt == ACT_FMT_Q8_K) ? 1 : 0;
         matmul_worker_f(&t);
-        free_quant_buf(&qb, NULL);
         return;
     }
 }
@@ -5381,7 +5394,28 @@ int tensor_matmul_multi(const mm_job_t *jobs, int n_jobs) {
         c.nblocks += (jobs[j].d + c.block - 1) / c.block;
     c.cursor = 0;
     if (c.nblocks < 2) return 0;     /* not worth a dispatch */
+
+    /* Quantize each job's activation once, here, instead of per work item. */
+    mm_job_q_t qbufs[64];
+    mm_job_q_t *q = n_jobs <= 64 ? qbufs : (mm_job_q_t *)malloc((size_t)n_jobs * sizeof *q);
+    if (!q) return 0;
+    for (int j = 0; j < n_jobs; j++) {
+        q[j].xq = NULL; q[j].x_d = NULL; q[j].owned = 0; q[j].usable = 0;
+        const type_info_t *ti = typeinfo(jobs[j].qtype);
+        if (!ti || ti->act_fmt == ACT_FMT_F32) continue;
+        quant_buf_t qb = quant_activations_ex(jobs[j].qtype, jobs[j].x, 1, jobs[j].n,
+                                              NULL, 0, 1);
+        if (!qb.qbuf) continue;
+        /* qb is already heap-owned (we passed no scratch); take it over. */
+        q[j].xq = qb.qbuf; q[j].x_d = qb.dbuf; q[j].owned = 1; q[j].usable = 1;
+    }
+
+    c.q = q;
     tensor_parallel_for(n_threads, mm_multi_task, &c);
+
+    for (int j = 0; j < n_jobs; j++)
+        if (q[j].owned) free((void *)q[j].xq);
+    if (q != qbufs) free(q);
     return 1;
 }
 
