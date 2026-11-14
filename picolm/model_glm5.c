@@ -1355,9 +1355,22 @@ static void glm5_mla_forward(
         const uint8_t *kb = (const uint8_t *)gw->mla_k_b;
         size_t k_row_sz = gguf_type_row_size(gw->type_mla_k_b, MHD);
         size_t k_head_sz = (size_t)KVL * k_row_sz;
-        for (int h = 0; h < NH; h++) {
-            const void *wh = kb + h * k_head_sz;
-            matmul(qabs + h*KVL, q + h*MHD, wh, MHD, KVL, gw->type_mla_k_b);
+        /* 64 independent per-head matmuls: one pool wake instead of 64
+         * (tensor_matmul_multi is bit-identical to per-job matmul()). */
+        {
+            mm_job_t jobs[64];
+            const int nj = NH <= 64 ? NH : 0;
+            for (int h = 0; h < nj; h++) {
+                jobs[h].out = qabs + h*KVL; jobs[h].x = q + h*MHD;
+                jobs[h].W = kb + h * k_head_sz; jobs[h].n = MHD; jobs[h].d = KVL;
+                jobs[h].qtype = gw->type_mla_k_b;
+            }
+            if (!nj || !tensor_matmul_multi(jobs, nj)) {
+                for (int h = 0; h < NH; h++) {
+                    const void *wh = kb + h * k_head_sz;
+                    matmul(qabs + h*KVL, q + h*MHD, wh, MHD, KVL, gw->type_mla_k_b);
+                }
+            }
         }
     }
 
@@ -1483,9 +1496,20 @@ static void glm5_mla_forward(
         /* attn_v_b ne = {KVL, MHD, NH}: per head, matrix MHD x KVL.
          * Wv_b[h][r][d] = data[h*MHD*KVL + r*KVL + d], r in [0,MHD), d in [0,KVL).
          * o[h][r] = sum_d Wv_b[h][r][d] * ctx[h][d]. */
-        for (int h = 0; h < NH; h++) {
-            const void *wh = vb + h * v_head_sz;
-            matmul(o_concat + h*MHD, ctx + h*KVL, wh, KVL, MHD, gw->type_mla_v_b);
+        {
+            mm_job_t jobs[64];
+            const int nj = NH <= 64 ? NH : 0;
+            for (int h = 0; h < nj; h++) {
+                jobs[h].out = o_concat + h*MHD; jobs[h].x = ctx + h*KVL;
+                jobs[h].W = vb + h * v_head_sz; jobs[h].n = KVL; jobs[h].d = MHD;
+                jobs[h].qtype = gw->type_mla_v_b;
+            }
+            if (!nj || !tensor_matmul_multi(jobs, nj)) {
+                for (int h = 0; h < NH; h++) {
+                    const void *wh = vb + h * v_head_sz;
+                    matmul(o_concat + h*MHD, ctx + h*KVL, wh, KVL, MHD, gw->type_mla_v_b);
+                }
+            }
         }
         /* o_concat is in caller-provided scratch when batching; the output
          * projection is then batched too (attn_output is 16384x4096 IQ6_K,

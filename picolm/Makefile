@@ -811,6 +811,23 @@ test_attn_diff: test_attn_diff.c model_attention.c tensor.c type_dispatch.c quan
 test_glm5_snapshot: tests/test_glm5_snapshot.c model_glm5.c model_moe.c model_kv_cache.c model_ssm.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) model.h
 	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O2 -o $@ tests/test_glm5_snapshot.c model_glm5.c model_moe.c model_kv_cache.c model_ssm.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
 
+# MLA PV: current block reduce vs a register-tiled variant, as cache footprint grows.
+bench_glm5_mla_pv: tests/bench_glm5_mla_pv.c model_glm5.c model_moe.c model_ssm.c model_kv_cache.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) model.h
+	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O2 -o $@ tests/bench_glm5_mla_pv.c model_moe.c model_ssm.c model_kv_cache.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
+
+.PHONY: bench-mla-pv
+bench-mla-pv: bench_glm5_mla_pv
+	./bench_glm5_mla_pv
+
+# Batched MLA per-head k_b/v_b projections vs sequential matmul: bit-exactness.
+# Only needs tensor_matmul_multi(), so no model sources at all.
+test_glm5_mla_proj_multi: tests/test_glm5_mla_proj_multi.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) model.h
+	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O2 -o $@ tests/test_glm5_mla_proj_multi.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
+
+.PHONY: check-glm5-mla-proj-multi
+check-glm5-mla-proj-multi: test_glm5_mla_proj_multi
+	./test_glm5_mla_proj_multi 24
+
 # Single-pass head-block MLA reduce vs the per-head reference: bit-exactness + timing.
 test_glm5_mla_reduce: tests/test_glm5_mla_reduce.c model_glm5.c model_moe.c model_ssm.c model_kv_cache.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) model.h
 	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O2 -o $@ tests/test_glm5_mla_reduce.c model_moe.c model_ssm.c model_kv_cache.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++

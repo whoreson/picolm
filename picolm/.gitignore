@@ -31,6 +31,8 @@ test_glm5_snapshot
 test_glm5_dsa
 test_glm5_kda_par
 test_glm5_mla_reduce
+test_glm5_mla_proj_multi
+bench_glm5_mla_pv
 
 # bench binaries
 bench_q8_gemm
