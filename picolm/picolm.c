@@ -2058,8 +2058,8 @@ int main(int argc, char **argv) {
             cli_checkpoint_snapshot_size = model_recurrent_state_size(&model);
             if (cli_checkpoint_snapshot_size > 0) {
                 cli_checkpoint_scratch = (uint8_t *)malloc(cli_checkpoint_snapshot_size);
-                fprintf(stderr, "[cli] SSM checkpointing: max=%d, gen_interval=%d, snapshot=%.1fMB\n",
-                        checkpoint_max, checkpoint_interval_gen,
+                fprintf(stderr, "[cli] SSM checkpointing: max=%d, prefill_interval=%d, gen_interval=%d, snapshot=%.1fMB\n",
+                        checkpoint_max, checkpoint_interval, checkpoint_interval_gen,
                         (double)cli_checkpoint_snapshot_size / (1024.0 * 1024.0));
                 /* Load checkpoints appended to the cache file (after main KV+SSM data).
                  * Same format as the server's slot save: 0x43505350 magic + count + entries. */
@@ -2576,6 +2576,41 @@ int main(int argc, char **argv) {
         total_steps = model.config.max_seq_len;
     }
 
+    /* Helper: save a CLI SSM checkpoint at position n_tokens.
+     * Evicts oldest (smallest n_tokens) if at capacity.
+     * Skips if a checkpoint at exactly this position already exists. */
+    int cli_checkpoint_save(int n_tokens) {
+        if (checkpoint_max <= 0) return 0;
+        if (cli_checkpoint_snapshot_size == 0) return 0;
+        /* Skip duplicates */
+        for (cli_checkpoint_t *c = cli_checkpoints; c; c = c->next) {
+            if (c->n_tokens == n_tokens) return 0;
+        }
+        /* Evict oldest if at capacity */
+        { int n_cp = 0; for (cli_checkpoint_t *c = cli_checkpoints; c; c = c->next) n_cp++;
+          while (n_cp >= checkpoint_max && cli_checkpoints) {
+              cli_checkpoint_t *old = cli_checkpoints; cli_checkpoints = old->next;
+              free(old->data); free(old); n_cp--; } }
+        cli_checkpoint_t *cp = (cli_checkpoint_t *)calloc(1, sizeof(*cp));
+        if (!cp) return 0;
+        cp->n_tokens = n_tokens;
+        cp->data = (uint8_t *)malloc(cli_checkpoint_snapshot_size);
+        if (!cp->data) { free(cp); return 0; }
+        size_t written = model_recurrent_state_save(&model, cp->data, cli_checkpoint_snapshot_size);
+        if (written == 0) { free(cp->data); free(cp); return 0; }
+        /* Insert in sorted order */
+        cli_checkpoint_t *prev = NULL, *cur = cli_checkpoints;
+        while (cur && cur->n_tokens < cp->n_tokens) { prev = cur; cur = cur->next; }
+        if (prev) prev->next = cp; else cli_checkpoints = cp;
+        cp->next = cur;
+        /* Count current checkpoints for logging */
+        int n_now = 0; for (cli_checkpoint_t *c = cli_checkpoints; c; c = c->next) n_now++;
+        fprintf(stderr, "  [ssm checkpoint] created checkpoint %d of %d (n_tokens=%d, size=%.3f MiB)\n",
+                n_now, checkpoint_max, n_tokens,
+                (double)cli_checkpoint_snapshot_size / (1024.0 * 1024.0));
+        return 1;
+    }
+
     /* Batch prefill: process only the NEW prompt tokens (the first start_pos are cached) */
     float *logits = NULL;
     if (n_prompt - start_pos > 0) {
@@ -2585,44 +2620,98 @@ int main(int argc, char **argv) {
         #ifdef PICOLM_GPU
         int gpu_prefill_used = 0;
 #endif
-        /* Chunked prefill: --prefill-ubatch N / PICOLM_PREFILL_UBATCH.
-         * Without this the whole prompt goes through one prefill call at
-         * start_pos, so --benchmark-live only ever reports shallow-context
-         * layer times. Chunking preserves KV/SSM state across calls, so each
-         * line is measured at its real position. */
+        /* SSM checkpoint-driven prefill chunking.
+         * When checkpoint_max > 0 and the model has recurrent state, chunk
+         * prefill at --checkpoint-every-nt boundaries so we can save a snapshot
+         * before each chunk (server.c pattern).  Also saves a tail checkpoint
+         * checkpoint_tail_offset tokens before the end of the prompt.
+         * --prefill-ubatch still controls the non-checkpoint ubatch size;
+         * checkpoint chunks may span multiple ubatches. */
         int ub = prefill_ubatch;
         if (ub <= 0) { const char *ev = getenv("PICOLM_PREFILL_UBATCH"); if (ev) ub = atoi(ev); }
-        const int chunked = (ub > 0 && ub < n_new);
+        const int do_checkpoint_prefill = (checkpoint_max > 0 && model_has_recurrent_state(&model) && cli_checkpoint_snapshot_size > 0);
+        int tail_pos = start_pos + n_new - checkpoint_tail_offset;
+
+        if (do_checkpoint_prefill) {
+            /* Mirror server.c checkpoint-driven prefill chunking.
+             * Walk from start_pos to start_pos+n_new, saving a checkpoint
+             * before each chunk at interval or tail boundaries.
+             * Chunk is processed in one model_forward_prefill call (no ubatch split here). */
+            if (tail_pos < start_pos) tail_pos = start_pos; /* clamp, like server.c */
+            fprintf(stderr, "[prefill] checkpoint mode: interval=%d, tail_offset=%d, tail_pos=%d, n_new=%d, start_pos=%d\n",
+                    checkpoint_interval, checkpoint_tail_offset, tail_pos, n_new, start_pos);
+            /* Prune checkpoints past start_pos (abandoned trajectory from cache load) */
+            { cli_checkpoint_t *prev = NULL, *cur = cli_checkpoints;
+              while (cur && cur->n_tokens <= start_pos) { prev = cur; cur = cur->next; }
+              if (cur) {
+                  if (prev) prev->next = NULL; else cli_checkpoints = NULL;
+                  while (cur) { cli_checkpoint_t *n = cur->next; free(cur->data); free(cur); cur = n; }
+              } }
+            int off = 0;
+            while (off < n_new) {
+                int cur_pos = start_pos + off;
+                int remaining = n_new - off;
+                int mod = cur_pos % checkpoint_interval;
+                int interval_dist = (mod == 0) ? checkpoint_interval : (checkpoint_interval - mod);
+                int tail_dist = tail_pos - cur_pos;
+                int chunk_size = interval_dist;
+                if (tail_dist > 0 && tail_dist < chunk_size) chunk_size = tail_dist;
+                if (chunk_size > remaining) chunk_size = remaining;
+                if (chunk_size <= 0) chunk_size = 1;
+                /* Save checkpoint before processing this chunk (not at start_pos itself) */
+                if (off > 0) {
+                    cli_checkpoint_save(cur_pos);
+                }
 #ifdef PICOLM_GPU
-        if (model.gpu.kv_active) {
-            if (chunked) {
-                logits = NULL;
-                for (int off = 0; off < n_new; off += ub) {
-                    int cn = n_new - off; if (cn > ub) cn = ub;
-                    logits = model_forward_prefill_gpu(&model, prefill_tokens + off, cn, start_pos + off, NULL);
-                    if (!logits) break;
+                if (model.gpu.kv_active) {
+                    logits = model_forward_prefill_gpu(&model, prefill_tokens + off, chunk_size, cur_pos, NULL);
+                    if (logits) gpu_prefill_used = 1;
                 }
-            } else {
-                logits = model_forward_prefill_gpu(&model, prefill_tokens, n_new, start_pos, NULL);
-            }
-            if (logits) {
-                gpu_prefill_used = 1;
-            }
-        }
-        if (!gpu_prefill_used)
+                if (!gpu_prefill_used)
 #endif
-        {
-            if (chunked) {
-                logits = NULL;
-                for (int off = 0; off < n_new; off += ub) {
-                    int cn = n_new - off; if (cn > ub) cn = ub;
-                    logits = model_forward_prefill(&model, prefill_tokens + off, cn, start_pos + off, NULL);
-                    if (!logits) break;
+                {
+                    logits = model_forward_prefill(&model, prefill_tokens + off, chunk_size, cur_pos, NULL);
                 }
-                fprintf(stderr, "[prefill] %d tokens in %d ubatches of %d\n",
-                        n_new, (n_new + ub - 1) / ub, ub);
-            } else {
-                logits = model_forward_prefill(&model, prefill_tokens, n_new, start_pos, NULL);
+                if (!logits) break;
+                off += chunk_size;
+            }
+            if (off == n_new) {
+                fprintf(stderr, "[prefill] %d tokens in checkpoint-driven chunks\n", n_new);
+            }
+        } else {
+            /* Plain chunked prefill (no SSM checkpointing) */
+            const int chunked = (ub > 0 && ub < n_new);
+#ifdef PICOLM_GPU
+            if (model.gpu.kv_active) {
+                if (chunked) {
+                    logits = NULL;
+                    for (int off = 0; off < n_new; off += ub) {
+                        int cn = n_new - off; if (cn > ub) cn = ub;
+                        logits = model_forward_prefill_gpu(&model, prefill_tokens + off, cn, start_pos + off, NULL);
+                        if (!logits) break;
+                    }
+                } else {
+                    logits = model_forward_prefill_gpu(&model, prefill_tokens, n_new, start_pos, NULL);
+                }
+                if (logits) {
+                    gpu_prefill_used = 1;
+                }
+            }
+            if (!gpu_prefill_used)
+#endif
+            {
+                if (chunked) {
+                    logits = NULL;
+                    for (int off = 0; off < n_new; off += ub) {
+                        int cn = n_new - off; if (cn > ub) cn = ub;
+                        logits = model_forward_prefill(&model, prefill_tokens + off, cn, start_pos + off, NULL);
+                        if (!logits) break;
+                    }
+                    fprintf(stderr, "[prefill] %d tokens in %d ubatches of %d\n",
+                            n_new, (n_new + ub - 1) / ub, ub);
+                } else {
+                    logits = model_forward_prefill(&model, prefill_tokens, n_new, start_pos, NULL);
+                }
             }
         }
         if (!logits) {
@@ -2724,21 +2813,7 @@ int main(int argc, char **argv) {
         /* Generation checkpoint: every checkpoint_interval_gen tokens */
         if (checkpoint_max > 0 && model_has_recurrent_state(&model) && cli_checkpoint_snapshot_size > 0
             && total_gen % checkpoint_interval_gen == 0) {
-            /* Evict if at capacity */
-            { int n_cp = 0; for (cli_checkpoint_t *c = cli_checkpoints; c; c = c->next) n_cp++;
-              while (n_cp >= checkpoint_max && cli_checkpoints) {
-                  cli_checkpoint_t *old = cli_checkpoints; cli_checkpoints = old->next;
-                  free(old->data); free(old); n_cp--; } }
-            cli_checkpoint_t *cp = (cli_checkpoint_t *)calloc(1, sizeof(*cp));
-            cp->n_tokens = start_pos + n_prompt + total_gen;
-            cp->data = (uint8_t *)malloc(cli_checkpoint_snapshot_size);
-            size_t written = model_recurrent_state_save(&model, cp->data, cli_checkpoint_snapshot_size);
-            if (written == 0) { free(cp->data); free(cp); cp = NULL; }
-            if (cp) { /* Insert in sorted order */
-                cli_checkpoint_t *prev = NULL, *cur = cli_checkpoints;
-                while (cur && cur->n_tokens < cp->n_tokens) { prev = cur; cur = cur->next; }
-                if (prev) prev->next = cp; else cli_checkpoints = cp;
-                cp->next = cur; }
+            cli_checkpoint_save(start_pos + n_prompt + total_gen);
         }
 
         /* Stop on EOS or grammar completion */
