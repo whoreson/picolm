@@ -2006,7 +2006,7 @@ int main(int argc, char **argv) {
 
     if (use_qwen_tok) {
         if (qwen_tokenize_init(&qwen_enc, &model) != 0) {
-            fprintf(stderr, "ERROR: failed to initialize Qwen tokenizer\n");
+            fprintf(stderr, "ERROR: failed to initialize Qwen tokenizer (run make clean!)\n");
             model_free(&model);
             return 1;
         }
