@@ -12,6 +12,33 @@
 #include <string.h>
 #include <math.h>
 #include "model.h"
+#include <time.h>
+
+/* ------------------------------------------------------------------ */
+/* Benchmark hooks: model_glm5.c is linked here WITHOUT model_core.c,   */
+/* but its layer loop uses BENCH_LAYER_START/END(), which expand to     */
+/* get_time_ms() and bench_emit(). Both live in model_core.c (with the  */
+/* rest of the model loader), which these tests deliberately do not     */
+/* pull in -- that would drag the whole GGUF/tensor stack into a test   */
+/* that only needs the GLM-5 state helpers. Provide the two symbols     */
+/* here instead. They only feed optional per-layer profiling, so a      */
+/* no-op bench_emit is correct for a unit test.                         */
+/* (Same cross-TU reasoning as model_ssm.c's local ssm_now_ms(), which  */
+/* exists for exactly this reason.)                                     */
+/* ------------------------------------------------------------------ */
+double get_time_ms(void) {
+#if defined(CLOCK_MONOTONIC) && !defined(_WIN32)
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+#else
+    return (double)clock() / (double)CLOCKS_PER_SEC * 1000.0;
+#endif
+}
+
+void bench_emit(int l, int is_prefill, double elapsed_ms, long minflt, long majflt) {
+    (void)l; (void)is_prefill; (void)elapsed_ms; (void)minflt; (void)majflt;
+}
 
 static int fails = 0;
 #define CHECK(c, m) do{ if(!(c)){ printf("FAIL %s\n", m); fails++; } \
