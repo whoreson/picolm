@@ -988,13 +988,34 @@ static inline float ad_max_row(const float *s) {
 }
 
 static inline void ad_prefetch_row(const uint8_t *p, size_t bytes) {
-    for (size_t o = 0; o < bytes; o += 64) __builtin_prefetch(p + o, 0, 3);
+    for (size_t o = 0; o < bytes; o += 64) {
+#if defined(_MSC_VER)
+        _mm_prefetch((const char *)(p + o), _MM_HINT_T0);
+#else
+        __builtin_prefetch(p + o, 0, 3);
+#endif
+    }
 }
 /* Into L2 only (hint T1): uses the L2 queue instead of the ~10-12 L1 fill buffers,
  * so it can run much further ahead without stalling demand loads. */
 static inline void ad_prefetch_row_l2(const uint8_t *p, size_t bytes) {
-    for (size_t o = 0; o < bytes; o += 64) __builtin_prefetch(p + o, 0, 2);
+    for (size_t o = 0; o < bytes; o += 64) {
+#if defined(_MSC_VER)
+        _mm_prefetch((const char *)(p + o), _MM_HINT_T1);
+#else
+        __builtin_prefetch(p + o, 0, 2);
+#endif
+    }
 }
+
+/* Unroll hints for fixed-size loops. Empty on MSVC. */
+#if defined(__clang__)
+#define ATTN_UNROLL8 _Pragma("unroll 8")
+#elif defined(__GNUC__)
+#define ATTN_UNROLL8 _Pragma("GCC unroll 8")
+#else
+#define ATTN_UNROLL8
+#endif
 
 /* One KV head, positions [t0, t1). Writes the UNNORMALIZED result:
  * m_out[g] (log2-domain running max), l_out[g] (sum of weights relative to m),
@@ -1014,12 +1035,12 @@ void ad_chunk_impl(const attn_group_ctx_t *ctx, int kv_h, int t0, int t1,
 
     float qs[8 * 256];
     PICOLM_ALIGNED(64) float s[8][AD_B];
-    float kbuf[FAST ? 1 : 2 * 256];
-    float vbuf[FAST ? 1 : AD_B * 256];
+    float kbuf[2 * 256];
+    float vbuf[AD_B * 256];
     float corr[8], m[8], l[8];
 
     const float qscale = ctx->attn_scale * AD_LOG2E;
-    _Pragma("GCC unroll 8") for (int g = 0; g < KVM; g++) {
+    ATTN_UNROLL8 for (int g = 0; g < KVM; g++) {
         const float *q = ctx->q + (size_t)(first_qh + g) * hd;
         for (int d = 0; d < hd; d++) qs[g * hd + d] = q[d] * qscale;
         m[g] = -1e30f; l[g] = 0.0f;
@@ -1030,7 +1051,7 @@ void ad_chunk_impl(const attn_group_ctx_t *ctx, int kv_h, int t0, int t1,
         const int n = (t1 - t < AD_B) ? (t1 - t) : AD_B;
         const uint8_t *kb = kbase + (size_t)t * row_k;
         const uint8_t *vb = vbase + (size_t)t * row_v;
-        _Pragma("GCC unroll 8") for (int g = 0; g < KVM; g++)
+        ATTN_UNROLL8 for (int g = 0; g < KVM; g++)
             for (int j = n; j < AD_B; j++) s[g][j] = -1e30f;
 
         /* ---- pass 1: scores s[g][i] (log2 domain) ---- */
@@ -1053,25 +1074,25 @@ void ad_chunk_impl(const attn_group_ctx_t *ctx, int kv_h, int t0, int t1,
                 else kf1 = kf0;
             }
             adv a0[8], a1[8];
-            _Pragma("GCC unroll 8") for (int g = 0; g < KVM; g++) { a0[g] = AD_ZERO(); a1[g] = AD_ZERO(); }
+            ATTN_UNROLL8 for (int g = 0; g < KVM; g++) { a0[g] = AD_ZERO(); a1[g] = AD_ZERO(); }
             for (int d = 0; d < hd; d += AD_W) {
                 adv x0, x1;
                 if (FAST) { x0 = AD_CVT16((const uint16_t *)k0 + d); x1 = AD_CVT16((const uint16_t *)k1 + d); }
                 else      { x0 = AD_LOAD(kf0 + d);                   x1 = AD_LOAD(kf1 + d); }
-                _Pragma("GCC unroll 8") for (int g = 0; g < KVM; g++) {
+                ATTN_UNROLL8 for (int g = 0; g < KVM; g++) {
                     adv q = AD_LOAD(qs + g * hd + d);
                     a0[g] = AD_FMA(x0, q, a0[g]);
                     a1[g] = AD_FMA(x1, q, a1[g]);
                 }
             }
-            _Pragma("GCC unroll 8") for (int g = 0; g < KVM; g++) {
+            ATTN_UNROLL8 for (int g = 0; g < KVM; g++) {
                 s[g][i] = AD_RSUM(a0[g]);
                 if (two) s[g][i + 1] = AD_RSUM(a1[g]);
             }
         }
 
         /* ---- block softmax: one max / one rescale factor per head ---- */
-        _Pragma("GCC unroll 8") for (int g = 0; g < KVM; g++) {
+        ATTN_UNROLL8 for (int g = 0; g < KVM; g++) {
             float bm = ad_max_row(s[g]);
             float c = 1.0f, nm = m[g];
             if (bm > m[g]) { c = (m[g] < -1e29f) ? 0.0f : exp2f(m[g] - bm); nm = bm; }
@@ -1085,7 +1106,7 @@ void ad_chunk_impl(const attn_group_ctx_t *ctx, int kv_h, int t0, int t1,
                 ad_deq_row(ctx->kv_type_v, 0, vb + (size_t)j * row_v, vbuf + (size_t)j * hd, hd);
         for (int d = 0; d < hd; d += AD_W) {
             adv a0[8], a1[8];
-            _Pragma("GCC unroll 8") for (int g = 0; g < KVM; g++) {
+            ATTN_UNROLL8 for (int g = 0; g < KVM; g++) {
                 a0[g] = AD_MUL(AD_LOAD(acc_out + g * hd + d), AD_SET1(corr[g]));
                 a1[g] = AD_ZERO();
             }
@@ -1099,7 +1120,7 @@ void ad_chunk_impl(const attn_group_ctx_t *ctx, int kv_h, int t0, int t1,
                     v0 = AD_LOAD(vbuf + (size_t)j * hd + d);
                     v1 = AD_LOAD(vbuf + (size_t)(j + 1) * hd + d);
                 }
-                _Pragma("GCC unroll 8") for (int g = 0; g < KVM; g++) {
+                ATTN_UNROLL8 for (int g = 0; g < KVM; g++) {
                     a0[g] = AD_FMA(AD_SET1(s[g][j]),     v0, a0[g]);
                     a1[g] = AD_FMA(AD_SET1(s[g][j + 1]), v1, a1[g]);
                 }
@@ -1107,12 +1128,12 @@ void ad_chunk_impl(const attn_group_ctx_t *ctx, int kv_h, int t0, int t1,
             if (j < n) {
                 adv v0 = FAST ? AD_CVT16((const uint16_t *)(vb + (size_t)j * row_v) + d)
                               : AD_LOAD(vbuf + (size_t)j * hd + d);
-                _Pragma("GCC unroll 8") for (int g = 0; g < KVM; g++) a0[g] = AD_FMA(AD_SET1(s[g][j]), v0, a0[g]);
+                ATTN_UNROLL8 for (int g = 0; g < KVM; g++) a0[g] = AD_FMA(AD_SET1(s[g][j]), v0, a0[g]);
             }
-            _Pragma("GCC unroll 8") for (int g = 0; g < KVM; g++) AD_STORE(acc_out + g * hd + d, AD_ADD(a0[g], a1[g]));
+            ATTN_UNROLL8 for (int g = 0; g < KVM; g++) AD_STORE(acc_out + g * hd + d, AD_ADD(a0[g], a1[g]));
         }
     }
-    _Pragma("GCC unroll 8") for (int g = 0; g < KVM; g++) { m_out[g] = m[g]; l_out[g] = l[g]; }
+    ATTN_UNROLL8 for (int g = 0; g < KVM; g++) { m_out[g] = m[g]; l_out[g] = l[g]; }
 }
 
 static void ad_chunk(const attn_group_ctx_t *ctx, int kv_h, int t0, int t1,
@@ -1624,7 +1645,6 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32);
 #else
 #define ATTN_UNROLL16
 #endif
-
 /* Needed by both the AVX-512 and the AVX2 slice-major PV kernels. */
 #if !defined(ATTN_ALWAYS_INLINE)
 #define ATTN_ALWAYS_INLINE inline always_inline   /* project macro, see quant.h */
@@ -1747,6 +1767,7 @@ static ATTN_ALWAYS_INLINE void attn_pv_i16_body(float *accp, const int16_t *pq, 
                 __m512i vv = _mm512_loadu_si512((const void *)(vb + (size_t)jp * 32));
                 ATTN_UNROLL16
                 for (int r = 0; r < 16; r++) {
+#if defined(__GNUC__)
                     /* GCC will not fold the broadcast into the VNNI op and, with 16
                      * accumulators live, spills/copies them every iteration (seen in
                      * the disassembly). Inline asm pins the 1-uop memory-broadcast
@@ -1754,6 +1775,9 @@ static ATTN_ALWAYS_INLINE void attn_pv_i16_body(float *accp, const int16_t *pq, 
                     __asm__("vpdpwssd %2%{1to16%}, %1, %0"
                             : "+v"(a[r])
                             : "v"(vv), "m"(*(const int32_t *)(const void *)(pb + (size_t)r * ts + 2 * jp)));
+#else
+                    a[r] = _mm512_dpbusd_epi32(a[r], vv, _mm512_set1_epi32(*(const int32_t *)(const void *)(pb + (size_t)r * ts + 2 * jp)));
+#endif
                 }
             }
             const __m512 vs = _mm512_loadu_ps(vscale + db * 16);
@@ -3211,6 +3235,8 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
             const int D_BLK = 16;                 /* floats per zmm */
             const int n_blk = hd / D_BLK;         /* complete 16-float slices */
             const int R_MAX = 16;                 /* rows per block */
+            /* MSVC doesn't accept 'const int' as array bound; use a macro for array sizing */
+            #define ATTN_R_MAX 16
 #define ATTN_PV_BLOCK(ACC, RN, SBASE, OFF)                                    \
             do {                                                                 \
                 /* One db slice, RN rows. V[j] is loaded once per j and reused    \
@@ -3237,7 +3263,7 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
                  * bound comparison (cmp $0xN) than on the FMAs themselves
                  * (perf: 11.3% of the function on one cmp). */
                 for (; r0 + R_MAX <= n_q; r0 += R_MAX) {
-                    __m512 acc[R_MAX];
+                    __m512 acc[ATTN_R_MAX];
                     ATTN_UNROLL16
                     for (int r = 0; r < R_MAX; r++)
                         acc[r] = _mm512_loadu_ps(t->acc + (size_t)(r0 + r) * hd + off);
@@ -3250,7 +3276,7 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
                 /* Runtime tail (fewer than R_MAX rows left). */
                 if (r0 < n_q) {
                     int rn = n_q - r0;
-                    __m512 acc[R_MAX];
+                    __m512 acc[ATTN_R_MAX];
                     for (int r = 0; r < rn; r++)
                         acc[r] = _mm512_loadu_ps(t->acc + (size_t)(r0 + r) * hd + off);
                     const float *sbase = t->scores + (size_t)r0 * ts;
@@ -3265,6 +3291,7 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
                 }
             }
 #undef ATTN_PV_BLOCK
+#undef ATTN_R_MAX
             /* Scalar tail for hd % 16 != 0. */
             for (int d = n_blk * D_BLK; d < hd; d++) {
                 for (int r = 0; r < n_q; r++) {
@@ -3286,11 +3313,12 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
             const int D_BLK = 8;
             const int n_blk = hd / D_BLK;
             const int R_MAX = 4;
+            #define ATTN_R_MAX 4
             for (int db = 0; db < n_blk; db++) {
                 const int off = db * D_BLK;
                 int r0 = 0;
                 for (; r0 + R_MAX <= n_q; r0 += R_MAX) {
-                    __m256 acc[R_MAX];
+                    __m256 acc[ATTN_R_MAX];
                     for (int r = 0; r < R_MAX; r++)
                         acc[r] = _mm256_loadu_ps(t->acc + (size_t)(r0 + r) * hd + off);
                     for (int j = 0; j < ts; j++) {
@@ -3305,7 +3333,7 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
                 }
                 if (r0 < n_q) {
                     int rn = n_q - r0;
-                    __m256 acc[R_MAX];
+                    __m256 acc[ATTN_R_MAX];
                     for (int r = 0; r < rn; r++)
                         acc[r] = _mm256_loadu_ps(t->acc + (size_t)(r0 + r) * hd + off);
                     for (int j = 0; j < ts; j++) {
@@ -3338,11 +3366,12 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
             const int D_BLK = 8;
             const int n_blk = hd / D_BLK;
             const int R_MAX = 4;
+            #define ATTN_R_MAX 4
             for (int db = 0; db < n_blk; db++) {
                 const int off = db * D_BLK;
                 int r0 = 0;
                 for (; r0 + R_MAX <= n_q; r0 += R_MAX) {
-                    __m256 acc[R_MAX];
+                    __m256 acc[ATTN_R_MAX];
                     for (int r = 0; r < R_MAX; r++)
                         acc[r] = _mm256_loadu_ps(t->acc + (size_t)(r0 + r) * hd + off);
                     for (int j = 0; j < ts; j++) {
@@ -3357,7 +3386,7 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
                 }
                 if (r0 < n_q) {
                     int rn = n_q - r0;
-                    __m256 acc[R_MAX];
+                    __m256 acc[ATTN_R_MAX];
                     for (int r = 0; r < rn; r++)
                         acc[r] = _mm256_loadu_ps(t->acc + (size_t)(r0 + r) * hd + off);
                     for (int j = 0; j < ts; j++) {
@@ -3382,6 +3411,7 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
                 }
             }
         }
+#undef ATTN_R_MAX
 #elif defined(PICOLM_NEON) || defined(PICOLM_NEON_AARCH64)
         /* NEON row-blocked PV multiply.
          *
