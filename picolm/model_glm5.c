@@ -1185,8 +1185,58 @@ static float *glm5_mla_scores_scratch(size_t need) {
     return buf;
 }
 
+/* ---- F16 latent cache readers ---------------------------------------- *
+ *
+ * The decode attention pass is pure bandwidth over the latent cache: measured
+ * time tracks cache bytes ~1:1 with depth (14.1 ms at pos 1024, 87.9 ms at pos
+ * 7109). The cache is stored F32 as the master (snapshots and prefill use it),
+ * and mirrored into an F16 shadow (s->glm5.mla_kv16) that these read. Halving
+ * the bytes halves the pass.
+ *
+ * Not bit-identical: each cached value is rounded to F16 first. Validate with
+ * top-1 agreement / logit KL, not max|diff|. PICOLM_GLM5_MLA_F16=0 disables.
+ */
+#if defined(PICOLM_AVX512)
+/* F16 -> F32 for 16 lanes; cvtsh_ss needs F16C, which AVX-512 implies. */
+static inline __m512 glm5_f16x16_to_ps(const uint16_t *p) {
+    return _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)p));
+}
+#endif
+
+/* dot(u16 row, f32 q) for KVL values */
+static inline float glm5_mla_dot_f16(const uint16_t *row16, const float *q, int KVL) {
+#if defined(PICOLM_AVX512)
+    __m512 acc = _mm512_setzero_ps();
+    int i = 0;
+    for (; i + 15 < KVL; i += 16)
+        acc = _mm512_fmadd_ps(glm5_f16x16_to_ps(row16 + i), _mm512_loadu_ps(q + i), acc);
+    float s = _mm512_reduce_add_ps(acc);
+    for (; i < KVL; i++) s += fp16_to_fp32_lookup(row16[i]) * q[i];
+    return s;
+#else
+    float s = 0.f;
+    for (int i = 0; i < KVL; i++) s += fp16_to_fp32_lookup(row16[i]) * q[i];
+    return s;
+#endif
+}
+
+/* dst[i] += p * u16row[i] */
+static inline void glm5_mla_accum_f16(float *dst, const uint16_t *row16, float p, int KVL) {
+#if defined(PICOLM_AVX512)
+    const __m512 vp = _mm512_set1_ps(p);
+    int i = 0;
+    for (; i + 15 < KVL; i += 16)
+        _mm512_storeu_ps(dst + i,
+            _mm512_fmadd_ps(vp, glm5_f16x16_to_ps(row16 + i), _mm512_loadu_ps(dst + i)));
+    for (; i < KVL; i++) dst[i] += p * fp16_to_fp32_lookup(row16[i]);
+#else
+    for (int i = 0; i < KVL; i++) dst[i] += p * fp16_to_fp32_lookup(row16[i]);
+#endif
+}
+
 typedef struct {
     const float *cache;   /* [max_seq][KVL] rows for this MLA ordinal */
+    const uint16_t *cache16; /* F16 shadow of `cache`, or NULL */
     const int   *sel;     /* DSA selection, or NULL for dense */
     const float *qabs;    /* [NH][KVL] absorbed queries */
     float       *ctx;     /* [NH][KVL] output */
@@ -1239,7 +1289,7 @@ static int glm5_mla_reduce_perhead(void) {
 
 static void glm5_mla_reduce_block(
         float *ctx0, float *sc0, int n, int hn,
-        const float *cache, const int *sel, int dense, int KVL)
+        const float *cache, const uint16_t *cache16, const int *sel, int dense, int KVL)
 {
     float inv[GLM5_MLA_RB_MAX];
     for (int k = 0; k < hn; k++) {
@@ -1250,6 +1300,18 @@ static void glm5_mla_reduce_block(
         for (int i = 0; i < n; i++) { float e = expf(sc[i] - mx); sc[i] = e; sum += e; }
         inv[k] = 1.0f / sum;
         memset(ctx0 + (size_t)k * KVL, 0, (size_t)KVL * sizeof(float));
+    }
+    if (cache16) {
+        for (int i = 0; i < n; i++) {
+            const int t = dense ? i : sel[i];
+            const uint16_t *row = cache16 + (size_t)t * KVL;
+            for (int k = 0; k < hn; k++) {
+                const float p = sc0[(size_t)k * n + i] * inv[k];
+                if (p < 1e-10f) continue;
+                glm5_mla_accum_f16(ctx0 + (size_t)k * KVL, row, p, KVL);
+            }
+        }
+        return;
     }
     for (int i = 0; i < n; i++) {
         const int t = dense ? i : sel[i];
@@ -1275,15 +1337,24 @@ static void glm5_mla_head_block_task(int blk, void *vp) {
     const int n   = t->dense ? t->n_kv : t->n_sel;
     float *sb = t->scores + (size_t)blk * t->hb * (size_t)t->n_kv;
 
-    for (int p = 0; p < n; p++) {
-        const float *row = t->cache + (size_t)(t->dense ? p : t->sel[p]) * KVL;
-        for (int k = 0; k < hn; k++)
-            sb[(size_t)k * n + p] =
-                vec_dot_f32_f32(row, t->qabs + (size_t)(h0 + k) * KVL, KVL) * t->scale;
+    if (t->cache16) {
+        for (int p = 0; p < n; p++) {
+            const uint16_t *row = t->cache16 + (size_t)(t->dense ? p : t->sel[p]) * KVL;
+            for (int k = 0; k < hn; k++)
+                sb[(size_t)k * n + p] =
+                    glm5_mla_dot_f16(row, t->qabs + (size_t)(h0 + k) * KVL, KVL) * t->scale;
+        }
+    } else {
+        for (int p = 0; p < n; p++) {
+            const float *row = t->cache + (size_t)(t->dense ? p : t->sel[p]) * KVL;
+            for (int k = 0; k < hn; k++)
+                sb[(size_t)k * n + p] =
+                    vec_dot_f32_f32(row, t->qabs + (size_t)(h0 + k) * KVL, KVL) * t->scale;
+        }
     }
     if (hn <= GLM5_MLA_RB_MAX && !glm5_mla_reduce_perhead()) {
         glm5_mla_reduce_block(t->ctx + (size_t)h0 * KVL, sb, n, hn,
-                              t->cache, t->sel, t->dense, KVL);
+                              t->cache, t->cache16, t->sel, t->dense, KVL);
     } else {
         for (int k = 0; k < hn; k++)
             glm5_mla_reduce_head(t->ctx + (size_t)(h0 + k) * KVL, sb + (size_t)k * n,
@@ -1389,6 +1460,12 @@ static void glm5_mla_forward(
         /* Store in the latent cache (K and V alias the same buffer) */
         float *cache = s->glm5.mla_kv + (size_t)mla_ord * c->max_seq_len * KVL;
         memcpy(cache + (size_t)pos * KVL, kv, KVL * sizeof(float));
+        /* Mirror into the F16 shadow, which is what the attention pass reads. */
+        if (s->glm5.mla_kv16) {
+            uint16_t *c16 = s->glm5.mla_kv16 + (size_t)mla_ord * c->max_seq_len * KVL
+                          + (size_t)pos * KVL;
+            for (int d = 0; d < KVL; d++) c16[d] = fp32_to_fp16(kv[d]);
+        }
     }
 
     /* DSA indexer: cache this token's (key ; gate) pair and pick the pools
@@ -1421,6 +1498,11 @@ static void glm5_mla_forward(
     {
         const float scale = 1.0f / sqrtf((float)MHD);
         float *cache = s->glm5.mla_kv + (size_t)mla_ord * c->max_seq_len * KVL;
+        /* F16 shadow for the dense path only. The DSA branch and the scalar
+         * reference loop keep reading the F32 master: they are not the
+         * bandwidth problem, and staying on F32 keeps them exact. */
+        const uint16_t *cache16 = s->glm5.mla_kv16
+            ? s->glm5.mla_kv16 + (size_t)mla_ord * c->max_seq_len * KVL : NULL;
         const int n_kv = pos + 1;
         const int dense = (n_sel == 0);
         double _t_attn = glm5_prof_mode() ? glm5_prof_now() : 0.0;
@@ -1467,7 +1549,8 @@ static void glm5_mla_forward(
                 }
             } else {
                 glm5_mla_thr_t tc;
-                tc.cache = cache; tc.sel = NULL; tc.qabs = qabs_p; tc.ctx = ctx;
+                tc.cache = cache; tc.cache16 = cache16; tc.sel = NULL;
+                tc.qabs = qabs_p; tc.ctx = ctx;
                 tc.scores = scr; tc.NH = NH; tc.KVL = KVL; tc.n_kv = n_kv;
                 tc.dense = 1; tc.hb = hb; tc.scale = scale;
                 if (glm5_prof_mode() >= 4) {

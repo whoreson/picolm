@@ -1227,6 +1227,19 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
         s->glm5.mla_kv = gp5;
         gp5 += (size_t)n_mla * c->max_seq_len * c->glm5_kv_lora;
         s->glm5.mla_kv_layer_stride = c->max_seq_len * c->glm5_kv_lora;
+        /* F16 shadow of the latent cache. Separate allocation rather than more
+         * arena: the arena is carved in `float` units and this is uint16_t.
+         * Halves the bytes the decode attention pass streams. */
+        s->glm5.mla_kv16 = NULL;
+        {
+            const char *e = getenv("PICOLM_GLM5_MLA_F16");
+            if (!(e && atoi(e) == 0)) {
+                size_t n16 = (size_t)n_mla * c->max_seq_len * c->glm5_kv_lora;
+                s->glm5.mla_kv16 = (uint16_t *)malloc(n16 * sizeof(uint16_t));
+                if (s->glm5.mla_kv16) memset(s->glm5.mla_kv16, 0, n16 * sizeof(uint16_t));
+                else fprintf(stderr, "WARN: glm5 F16 MLA cache alloc failed; using F32 only\n");
+            }
+        }
         /* DSA indexer key+gate cache (one row of 2*idx_dim per position) */
         if (c->glm5_use_dsa && c->glm5_idx_dim > 0) {
             s->glm5.idx_kg = gp5;

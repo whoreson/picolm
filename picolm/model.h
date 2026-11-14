@@ -450,9 +450,17 @@ typedef struct {
     float *kda_state[MAX_LAYERS];            /* [n_head*kda_dim*kda_dim] per KDA layer */
     float *kda_conv_state[MAX_LAYERS];       /* [(d_conv-1)*conv_dim] per KDA layer */
     /* MLA latent cache: one entry per MLA layer, [max_seq][kv_lora] */
-    float *mla_kv;               /* concatenated per-layer latent caches */
+    float *mla_kv;               /* concatenated per-layer latent caches (master, F32) */
     int    mla_kv_layer_stride;  /* floats per layer (max_seq*kv_lora) */
     int    mla_kv_pos;           /* current fill per layer is implicit (shared seq len) */
+    /* F16 shadow of mla_kv, written alongside it and read by the decode
+     * attention pass. The attention loop is pure bandwidth over the latent
+     * cache (measured: time tracks cache bytes ~1:1 with depth, 14.1 ms at
+     * pos 1024 vs 87.9 ms at pos 7109), so halving the bytes halves it.
+     * NULL when PICOLM_GLM5_MLA_F16=0 or the model is not GLM-5.
+     * The F32 master is kept: it is what snapshots/checkpoints and the prefill
+     * paths use, so nothing that has to stay exact is affected. */
+    uint16_t *mla_kv16;          /* concatenated, [max_seq][kv_lora] per MLA layer */
     /* DSA indexer cache: [max_seq][2*idx_dim] (k;g packed), one per MLA layer */
     float *idx_kg;               /* concatenated; NULL when DSA off */
     /* Per-token scratch (shared across layers, carved from the arena) */
