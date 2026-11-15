@@ -1,3 +1,92 @@
+
+# ============================================================================
+# ---- help ------------------------------------------------------------------
+# Hand-maintained on purpose. A generated list (grep for '^target:') picks up
+# .o rules, test binaries and one-off scratch targets, and carries no *intent*
+# -- which target to actually use, and why. If you add a user-facing target,
+# add a line below; if you remove one, remove its line.
+# ============================================================================
+.PHONY: help
+help:
+	@echo "PicoLM -- build targets"
+	@echo ""
+	@echo "  Default:"
+	@echo "    make                Build for this host (gcc/clang, SIMD autodetected)"
+	@echo "    make native         Same, with -march=native (fastest for local use)"
+	@echo "    make clean          Remove build products"
+	@echo ""
+	@echo "  Windows / MSVC (works from a plain CMD prompt, no MSYS2 needed):"
+	@echo "    make msvc           C-only, SIMD autodetected from the CPU (cached)"
+	@echo "    make msvc-gpu       + CUDA backend (nvcc/toolkit autodetected)"
+	@echo "    make msvc-selftest  Check the toolchain/SIMD/CUDA environment only"
+	@echo "    make msvc-selftest-gpu"
+	@echo "    make msvc-clean     Forget the cached CPU probe"
+	@echo "    make msvc SIMD=avx2 Force a tier: avx512 | avx2 | avx | sse2"
+	@echo ""
+	@echo "  Legacy Windows targets (deprecated, delegate to msvc/msvc-gpu):"
+	@echo "    make hunger             -> make msvc-gpu"
+	@echo "    make hunger-nogpu       -> make msvc"
+	@echo "    make hunger-msys-direct -> make msvc"
+	@echo ""
+	@echo "  Other platforms:"
+	@echo "    make dos            MS-DOS / DJGPP (requires the djgpp cross toolchain)"
+	@echo "    make dos-clean      Clean DOS build products"
+	@echo "    make mac106         Intel Mac, OS X 10.6 style flags"
+	@echo "    make ppc            PowerPC G3/G4 (OS X Tiger / WiiLinux), Altivec"
+	@echo "    make wii            PowerPC 750 paired-singles (WiiLinux)"
+	@echo "    make iphoneos1      iOS 1.x, armv6 (legacy ARM)"
+	@echo "    make pi             Raspberry Pi (ARM, NEON)"
+	@echo "    make pi-arm32       32-bit ARM build"
+	@echo "    make osf            Digital Unix / Tru64 (OSF1) on Alpha"
+	@echo "    make riscv          RISC-V (vector extension)"
+	@echo "    make cross-riscv    RISC-V cross-compile"
+	@echo "    make cross-pi       Raspberry Pi cross-compile"
+	@echo ""
+	@echo "  GPU backends:"
+	@echo "    make cuda           NVIDIA CUDA (Linux/macOS; on Windows use msvc-gpu)"
+	@echo "    make hip            AMD HIP"
+	@echo "    make metal          Apple Metal"
+	@echo "    make vulkan         Vulkan compute"
+	@echo "    make vulkan-shaders Rebuild Vulkan SPIR-V shaders only"
+	@echo "    make gpu-clean-objs Remove GPU backend objects"
+	@echo ""
+	@echo "  SIMD-variant builds (isolation/debugging):"
+	@echo "    make scalar         No SIMD at all (portable reference path)"
+	@echo "    make sse2 sse3 avx avx2 x86"
+	@echo "    (no avx512 target here -- use 'make msvc' on Windows, or pass"
+	@echo "     -mavx512f via CFLAGS on gcc/clang)"
+	@echo ""
+	@echo "  Testing and correctness:"
+	@echo "    make check-all          Run the full test suite"
+	@echo "    make check-all-san      Same under sanitizers"
+	@echo "    make check-simd-diff    Cross-SIMD-tier differential comparison"
+	@echo "    make check-oracle       Compare against a reference implementation"
+	@echo "    make check-quant        Quantisation round-trip checks"
+	@echo "    make check-attn check-attn-decode check-attn-tail"
+	@echo "    make check-kq-gemm check-q6-k-r4 check-r8-simd check-rowinterleave"
+	@echo "    make check-pool check-pool-gaps check-hreduce"
+	@echo "    make check-kvcache-tokwrite"
+	@echo "    make check-glm5-dsa check-glm5-kda-par check-glm5-pfa"
+	@echo "    make check-glm5-mla-proj-multi check-glm5-mla-reduce"
+	@echo "    make check-glm5-mla-shadow check-glm5-mla-splitkv check-glm5-snapshot"
+	@echo "    make build-scalar-ref   Build the scalar reference binary"
+	@echo ""
+	@echo "  Benchmarks:"
+	@echo "    make bench_gemv bench_qgemv bench_ik bench_kq"
+	@echo "    make bench_q8_gemm bench_iq6k_gemm"
+	@echo "    make bench-mla-pv bench_glm5_mla_pv gemm_thread_bench threadpool"
+	@echo "    make metal-bench metal-bench-run metal-model-bench"
+	@echo ""
+	@echo "  Misc:"
+	@echo "    make install        Install to PREFIX (default /usr/local)"
+	@echo "    make model          Fetch a model"
+	@echo "    make viz            Build the visualiser"
+	@echo "    make static         Static binary"
+	@echo "    make debug          Debug build (-O0 -g)"
+	@echo "    make asan           AddressSanitizer build"
+	@echo ""
+	@echo "  Common variables: SIMD=, PREFIX=, MODEL_DIR=, CC=, WARN=1"
+
 CC      ?= gcc
 
 # ---- Compiler detection ----
@@ -579,104 +668,38 @@ backend_vulkan.o: backend_vulkan.c backend_gpu.h quant.h
 .PHONY: vulkan-shaders
 vulkan-shaders: shaders/qmatmul_vk.spv shaders/elementwise_vk.spv shaders/rmsnorm_vk.spv shaders/quantize_q8_vk.spv shaders/q8_q8_matmul_vk.spv shaders/attn_prefill_vk.spv shaders/attn_prefill_f16vk.spv shaders/attn_decode_vk.spv shaders/kv_store_vk.spv shaders/q8_q8_qkv3_vk.spv shaders/q8_q8_gu3_vk.spv shaders/q2k_matmul_vk.spv shaders/q3k_matmul_vk.spv shaders/q4k_matmul_vk.spv shaders/q6k_matmul_vk.spv shaders/iq4nl_matmul_vk.spv
 
-# --- hunger: CUDA build for Windows 11 (MSYS2 + MSVC + CUDA 12.4) ---
-# Target box: Windows 11, MSYS2 make, VS2022 Community on D:, CUDA on C:
-# Paths gleaned from /data4/build-lcpp (VCP environment from that box).
+# ============================================================================
+# ---- Deprecated: hunger / hunger-msys-direct / hunger-nogpu ----------------
 #
-#   make hunger
+# These predate `make msvc` and are kept only so existing muscle memory and
+# scripts keep working. They used to be three near-duplicate recipes that
+# hardcoded the VS root, the MSVC toolset version, the CUDA root and a
+# hand-written PICOLM_AVX* cascade. That duplication is exactly how
+# `hunger` (/arch:AVX512) and `hunger-msys-direct` (/arch:AVX2) drifted apart
+# until one of them silently produced garbled output.
 #
-# Produces: picolm.exe with CUDA GPU support.
-# Run with: set PICOLM_GPU=1 & picolm.exe <model.gguf> -p "hello"
-
-HUNGER_CUDA_ROOT  ?= C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4
-HUNGER_CUDA_ARCH  ?= sm_89
-HUNGER_VS_ROOT    ?= D:/Program Files/Microsoft Visual Studio/2022/Community
-HUNGER_MSVC_VER   ?= 14.44.35207
-
-# Compile as C. The /c flag is implicit when no /Fe or /LD is given.
-# All .obj files go to the linker, never to cl.exe.
-HUNGER_CL_DIR = $(HUNGER_VS_ROOT)/VC/Tools/MSVC/$(HUNGER_MSVC_VER)/bin/Hostx64/x64
-HUNGER_CL = "$(HUNGER_CL_DIR)/cl.exe"
-HUNGER_LNK = "$(HUNGER_CL_DIR)/link.exe"
-HUNGER_CFILES = $(SRCS)
-HUNGER_COBJS = $(HUNGER_CFILES:.c=.obj)
-HUNGER_CUOBS = backend_gpu_kernels_win.obj backend_gpu_host_core_win.obj backend_gpu_host_ssm_win.obj backend_gpu_host_misc_win.obj
-# cl.exe flags - all Make vars, NO batch %VAR% references
-# MSVC /arch:AVX512 enables the codegen but the C code relies on PICOLM_*
-# preprocessor macros for SIMD dispatch. These are not auto-derived by
-# quant.h on MSVC (detection chain is GCC/Clang-centric), so we define
-# them explicitly here. Cascade: AVX512 implies AVX2 implies AVX etc.
-HUNGER_SIMD = /D PICOLM_AVX512=1 /D PICOLM_AVX2=1 /D PICOLM_AVX=1 /D PICOLM_SSE3=1 /D PICOLM_SSE2=1 /D PICOLM_FMA=1
-HUNGER_WD = /wd4996 /wd4244 /wd4267 /wd4101 /wd4102 /wd4090 /wd4018 /wd4477
-HUNGER_CF = /O2 /W3 $(HUNGER_WD) /arch:AVX512 /D PICOLM_GPU=1 /D PICOLM_CUDA=1 /D PICOLM_SERVER=1 /D _CRT_SECURE_NO_WARNINGS /I. /I\"$(HUNGER_CUDA_ROOT)/include\" /openmp /c $(HUNGER_SIMD)
-# hunger-nogpu: same as hunger but without GPU backend (pure MSVC, no nvcc, no cudart)
-HUNGER_CF_NOGPU = /O2 /W3 $(HUNGER_WD) /arch:AVX512 /D PICOLM_SERVER=1 /D _CRT_SECURE_NO_WARNINGS /I. /openmp /c $(HUNGER_SIMD)
+# They now all delegate to the single supported path:
+#     hunger, hunger-nogpu  ->  make msvc        (C-only, SIMD autodetected)
+#     hunger-msys-direct    ->  make msvc        (same; the "direct" distinction
+#                                                is gone: msvc_build.bat is
+#                                                driven by cmd, not by a shell)
+#
+# If you genuinely need CUDA, use `make msvc-gpu`; that is the only target
+# that touches nvcc, and it discovers the toolkit itself.
+# ============================================================================
+.PHONY: hunger hunger-msys-direct hunger-nogpu
 
 hunger:
-	echo @echo off > .hunger_build.bat
-	echo del /q picolm.exe $(HUNGER_CUOBS) $(HUNGER_COBJS) '2^>nul' >> .hunger_build.bat
-	echo call \"$(HUNGER_VS_ROOT)/VC/Auxiliary/Build/vcvars64.bat\" >> .hunger_build.bat
-	echo \"$(HUNGER_CUDA_ROOT)/bin/nvcc.exe\" -O3 --fmad=false -std=c++14 -DPICOLM_GPU=1 -DPICOLM_CUDA=1 -DPICOLM_SSM_WARP_KERNEL_VALIDATED -DPICOLM_SSM_CHUNKED_GPU_VALIDATED -ccbin \"$(HUNGER_CL)\" -Xcompiler \"/EHsc /O2 /W3 /std:c++14 /arch:AVX512 /wd4244 /wd4267 /wd4101 /wd4102 /DPICOLM_AVX512=1 /DPICOLM_AVX2=1 /DPICOLM_AVX=1 /DPICOLM_SSE3=1 /DPICOLM_SSE2=1 /DPICOLM_FMA=1\" -gencode arch=compute_89,code=$(HUNGER_CUDA_ARCH) -c -o backend_gpu_kernels_win.obj backend_gpu_kernels.cu -I. >> .hunger_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo \"$(HUNGER_CUDA_ROOT)/bin/nvcc.exe\" -O3 --fmad=false -std=c++14 -DPICOLM_GPU=1 -DPICOLM_CUDA=1 -DPICOLM_SSM_WARP_KERNEL_VALIDATED -DPICOLM_SSM_CHUNKED_GPU_VALIDATED -ccbin \"$(HUNGER_CL)\" -Xcompiler \"/EHsc /O2 /W3 /std:c++14 /arch:AVX512 /wd4244 /wd4267 /wd4101 /wd4102 /DPICOLM_AVX512=1 /DPICOLM_AVX2=1 /DPICOLM_AVX=1 /DPICOLM_SSE3=1 /DPICOLM_SSE2=1 /DPICOLM_FMA=1\" -gencode arch=compute_89,code=$(HUNGER_CUDA_ARCH) -c -o backend_gpu_host_core_win.obj backend_gpu_host_core.cu -I. >> .hunger_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo \"$(HUNGER_CUDA_ROOT)/bin/nvcc.exe\" -O3 --fmad=false -std=c++14 -DPICOLM_GPU=1 -DPICOLM_CUDA=1 -DPICOLM_SSM_WARP_KERNEL_VALIDATED -DPICOLM_SSM_CHUNKED_GPU_VALIDATED -ccbin \"$(HUNGER_CL)\" -Xcompiler \"/EHsc /O2 /W3 /std:c++14 /arch:AVX512 /wd4244 /wd4267 /wd4101 /wd4102 /DPICOLM_AVX512=1 /DPICOLM_AVX2=1 /DPICOLM_AVX=1 /DPICOLM_SSE3=1 /DPICOLM_SSE2=1 /DPICOLM_FMA=1\" -gencode arch=compute_89,code=$(HUNGER_CUDA_ARCH) -c -o backend_gpu_host_ssm_win.obj backend_gpu_host_ssm.cu -I. >> .hunger_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo \"$(HUNGER_CUDA_ROOT)/bin/nvcc.exe\" -O3 --fmad=false -std=c++14 -DPICOLM_GPU=1 -DPICOLM_CUDA=1 -DPICOLM_SSM_WARP_KERNEL_VALIDATED -DPICOLM_SSM_CHUNKED_GPU_VALIDATED -ccbin \"$(HUNGER_CL)\" -Xcompiler \"/EHsc /O2 /W3 /std:c++14 /arch:AVX512 /wd4244 /wd4267 /wd4101 /wd4102 /DPICOLM_AVX512=1 /DPICOLM_AVX2=1 /DPICOLM_AVX=1 /DPICOLM_SSE3=1 /DPICOLM_SSE2=1 /DPICOLM_FMA=1\" -gencode arch=compute_89,code=$(HUNGER_CUDA_ARCH) -c -o backend_gpu_host_misc_win.obj backend_gpu_host_misc.cu -I. >> .hunger_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF) $(HUNGER_CFILES) >> .hunger_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo \"$(HUNGER_LNK)\" /OUT:picolm.exe $(HUNGER_COBJS) $(HUNGER_CUOBS) \"$(HUNGER_CUDA_ROOT)/lib/x64/cudart.lib\" ws2_32.lib advapi32.lib >> .hunger_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_build.bat
-	echo del /q $(HUNGER_CUOBS) '2^>nul' >> .hunger_build.bat
-	echo del .hunger_build.bat >> .hunger_build.bat
-	cmd /c .hunger_build.bat
+	@echo "NOTE: 'make hunger' is deprecated; using 'make msvc-gpu'." >&2
+	@$(MAKE) --no-print-directory msvc-gpu
 
-# --- hunger-nogpu: pure MSVC build, no CUDA, no GPU backend ---
-# Useful for isolating CPU-only bugs on Windows (same compiler as hunger,
-# but without PICOLM_GPU so all GPU code is excluded at compile time).
-# --- hunger-msys-direct: compile directly from MSYS2 bash (no .bat, no cmd.exe) ---
-# Requires env vars set BEFORE make:
-#   MSYSTEM=UCRT64 MINGW_PREFIX=/ucrt64 MINGW_CHOST=x86_64-w64-mingw32
-#   MSYSTEM_CARCH=x86_64 MSYSTEM_CHOST=x86_64-w64-mingw32 MSYSTEM_PREFIX=/ucrt64
-#   PATH must include: CUDA bin + MSVC cl.exe bin + MSYS2 bin (/ucrt64/bin:/usr/bin:/bin)
-#   INCLUDE: MSVC include + Windows SDK (ucrt, um, shared) with backslash paths
-#   LIB: MSVC lib + Windows SDK lib (ucrt, um) with backslash paths
-#   MSYS2_ARG_CONV_EXCL="*" (required for cl.exe /flags)
-# See /data4/work/notes/picolm/msys2-build-notes.md for full setup.
-HUNGER_CL_WIN = D:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/$(HUNGER_MSVC_VER)/bin/Hostx64/x64/cl.exe
-HUNGER_LINK_WIN = D:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/$(HUNGER_MSVC_VER)/bin/Hostx64/x64/link.exe
-HUNGER_CUDA_WIN = C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4
-HUNGER_NVCC_FLAGS = -O3 --fmad=false -std=c++14 -DPICOLM_GPU=1 -DPICOLM_CUDA=1 -DPICOLM_SSM_WARP_KERNEL_VALIDATED -DPICOLM_SSM_CHUNKED_GPU_VALIDATED -ccbin "$(HUNGER_CL_WIN)" -Xcompiler "/EHsc /O2 /W3 /std:c++14 /arch:AVX2 /wd4244 /wd4267 /wd4101 /wd4102 /DPICOLM_AVX2=1 /DPICOLM_AVX=1 /DPICOLM_SSE3=1 /DPICOLM_SSE2=1 /DPICOLM_FMA=1" -gencode arch=compute_89,code=$(HUNGER_CUDA_ARCH) -c -o
-HUNGER_CL_FLAGS = /O2 /W3 /wd4996 /wd4244 /wd4267 /wd4101 /wd4102 /wd4090 /wd4018 /wd4477 /arch:AVX2 /D PICOLM_GPU=1 /D PICOLM_CUDA=1 /D PICOLM_SERVER=1 /D _CRT_SECURE_NO_WARNINGS /D _CRT_AMD64 /I. /openmp /c /D PICOLM_AVX2=1 /D PICOLM_AVX=1 /D PICOLM_SSE3=1 /D PICOLM_SSE2=1 /D PICOLM_FMA=1
-
-.PHONY: hunger-msys-direct
-hunger-msys-direct: gpu-clean-objs
-	TEMP=/tmp TMP=/tmp $(NVCC) $(HUNGER_NVCC_FLAGS) backend_gpu_kernels_win.obj backend_gpu_kernels.cu -I.
-	TEMP=/tmp TMP=/tmp $(NVCC) $(HUNGER_NVCC_FLAGS) backend_gpu_host_core_win.obj backend_gpu_host_core.cu -I.
-	TEMP=/tmp TMP=/tmp $(NVCC) $(HUNGER_NVCC_FLAGS) backend_gpu_host_ssm_win.obj backend_gpu_host_ssm.cu -I.
-	TEMP=/tmp TMP=/tmp $(NVCC) $(HUNGER_NVCC_FLAGS) backend_gpu_host_misc_win.obj backend_gpu_host_misc.cu -I.
-	@export MSYS2_ARG_CONV_EXCL="*" && export INCLUDE="$(INCLUDE);$(HUNGER_CUDA_WIN)/include" && TEMP=/tmp TMP=/tmp "$(HUNGER_CL_WIN)" $(HUNGER_CL_FLAGS) $(HUNGER_CFILES)
-	@export MSYS2_ARG_CONV_EXCL="*" && export LIB="$(LIB);$(HUNGER_CUDA_WIN)/lib/x64" && TEMP=/tmp TMP=/tmp "$(HUNGER_LINK_WIN)" /OUT:picolm.exe $(HUNGER_COBJS) $(HUNGER_CUOBS) "$(HUNGER_CUDA_WIN)/lib/x64/cudart.lib" ws2_32.lib advapi32.lib
-	-$(RM) $(HUNGER_CUOBS)
-
-# --- hunger-nogpu: pure MSVC build, no CUDA, no GPU backend ---
-# Usage: make hunger-nogpu
-HUNGER_NOGPU_OBJS = $(HUNGER_CFILES:.c=.obj)
+hunger-msys-direct:
+	@echo "NOTE: 'make hunger-msys-direct' is deprecated; using 'make msvc'." >&2
+	@$(MAKE) --no-print-directory msvc
 
 hunger-nogpu:
-	echo @echo off > .hunger_nogpu_build.bat
-	echo del /q picolm.exe $(HUNGER_NOGPU_OBJS) '2^>nul' >> .hunger_nogpu_build.bat
-	echo call \"$(HUNGER_VS_ROOT)/VC/Auxiliary/Build/vcvars64.bat\" >> .hunger_nogpu_build.bat
-	echo \"$(HUNGER_CL)\" $(HUNGER_CF_NOGPU) $(HUNGER_CFILES) >> .hunger_nogpu_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
-	echo \"$(HUNGER_LNK)\" /OUT:picolm.exe $(HUNGER_NOGPU_OBJS) ws2_32.lib advapi32.lib >> .hunger_nogpu_build.bat
-	echo if errorlevel 1 exit /b 1 >> .hunger_nogpu_build.bat
-	echo del /q $(HUNGER_NOGPU_OBJS) '2^>nul' >> .hunger_nogpu_build.bat
-	echo del .hunger_nogpu_build.bat >> .hunger_nogpu_build.bat
-	cmd /c .hunger_nogpu_build.bat
-
-.PHONY: hunger-nogpu
+	@echo "NOTE: 'make hunger-nogpu' is deprecated; using 'make msvc'." >&2
+	@$(MAKE) --no-print-directory msvc
 
 # ---- DJGPP (MS-DOS) target ----
 # Build host: Linux with cross-compiler at /data4/work/djgpp-build/djgpp-toolchain/bin/
@@ -1154,3 +1177,93 @@ bench_ik: bench_ik.c quant.c type_dispatch.c tensor.c $(SGEMM_SRCS) quant.h sgem
 # decode (GEMV) cost per row for every quant type with a table fn_gemv: ./bench_gemv [rows k reps]
 bench_gemv: bench_gemv.c quant.c type_dispatch.c tensor.c $(SGEMM_SRCS) quant.h sgemm.h
 	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O3 -o $@ bench_gemv.c quant.c type_dispatch.c tensor.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
+
+# ============================================================================
+# ---- MSVC (Windows, native CMD) --------------------------------------------
+#
+#   make msvc              C-only. SIMD autodetected from the CPU (cached).
+#   make msvc SIMD=avx2    force a tier: avx512 | avx2 | avx | sse2
+#   make msvc-gpu          + CUDA backend (nvcc autodetected)
+#   make msvc-clean        drop the cached CPU probe
+#
+# Works from a plain CMD prompt or FAR Manager. No MSYS2 needed by users --
+# MSYS2 appears only in CI, and only to supply GNU make. All the real work is
+# in tools/msvc_build.bat, which does its own VS/CUDA discovery with vswhere
+# and can also be run by hand for debugging.
+#
+# Why the work is in a .bat and not here: GNU make's $(shell) mangles quotes on
+# Windows ("..." arrives as \"..."), so path discovery cannot live in make.
+# That mangling is what made the old `hunger` target so hard to fix.
+#
+# Requires GNU make. nmake cannot parse this Makefile at all (no $(shell),
+# no $(call), no :=) -- that was already true of every other target; the
+# guard below just turns 40 confusing errors into one readable line.
+# ============================================================================
+
+# SIMD=... on the command line (documented form) wins over MSVC_SIMD=... .
+# Both are accepted so `make msvc SIMD=avx2` and `make msvc MSVC_SIMD=avx2`
+# behave identically; native means "probe the CPU once and cache it".
+ifneq ($(SIMD),)
+MSVC_SIMD := $(SIMD)
+endif
+MSVC_SIMD ?= native
+
+.PHONY: msvc msvc-gpu msvc-selftest msvc-selftest-gpu msvc-clean
+
+# GNU make defines MAKE_VERSION at startup; nmake never gets this far anyway.
+ifeq ($(MAKE_VERSION),)
+msvc msvc-gpu:
+	@echo "ERROR: this Makefile needs GNU make (gmake). nmake cannot parse it." >&2
+	@exit 1
+else
+# The recipe below must work under BOTH shells GNU make might choose:
+#   * MSYS2/Cygwin gmake  -> SHELL=/bin/sh  (needs sh.exe reachable)
+#   * native cmd.exe      -> when sh.exe is not on PATH
+# A POSIX env-prefix ("VAR=x cmd ...") is invalid in cmd, and
+# "set VAR=x&& cmd" is invalid in sh. So the tier/GPU settings are passed as
+# ARGUMENTS to the batch file, which is the only form both shells agree on.
+# The batch file parses them itself (see its argument handling).
+MSVC_CMD ?= cmd.exe
+
+# Three cmd/sh interop details, each learned the hard way. Do not "simplify"
+# these away:
+#   1. "cmd /c tools/x.bat" is parsed as a COMMAND NAMED "tools" -- a bare /c
+#      argument with a forward slash is not a path. Use backslashes + "call".
+#   2. When make runs the recipe through sh.exe (MSYS2 gmake does), sh
+#      word-splits arguments containing "=" at the "=", so "--simd=avx2"
+#      arrives at cmd as two arguments. The separator is ":" instead.
+#   3. No POSIX env-prefix ("VAR=x cmd ...") and no "set VAR=x&&" -- neither is
+#      valid in both shells. Options are passed as plain arguments, which both
+#      shells agree on.
+# Script path notes (each one cost a debugging round):
+#   * Forward slashes: "cmd /c tools/x.bat" is parsed as a COMMAND NAMED
+#     "tools", so a bare /c argument must use backslashes.
+#   * A single backslash in the Makefile recipe is what reaches cmd. Writing
+#     "tools\\msvc_build.bat" in the recipe escapes to a DOUBLE backslash in
+#     the command line, which cmd accepts but which makes %~dp0 resolve
+#     against the wrong directory when the recipe runs via MSYS2 sh.exe --
+#     the script then built in the parent dir and could not find its probe.
+#     A forward-slash path is therefore used and MSYS2_ARG_CONV_EXCL is passed
+#     from the recipe so MSYS2 does not rewrite it into a POSIX path.
+#   * No absolute path: $(CURDIR) is POSIX-style on MSYS2 (/d/...) and cmd
+#     cannot open that, and cygpath is not on a plain Windows PATH.
+MSVC_BAT := tools/msvc_build.bat
+
+msvc:
+	@MSYS2_ARG_CONV_EXCL="*" "$(MSVC_CMD)" /c call $(MSVC_BAT) --simd:$(MSVC_SIMD)
+
+msvc-gpu:
+	@MSYS2_ARG_CONV_EXCL="*" "$(MSVC_CMD)" /c call $(MSVC_BAT) --simd:$(MSVC_SIMD) --gpu
+endif
+
+# Verify the environment the MSVC build assumes, without compiling anything.
+# Every check here corresponds to a failure mode that once produced a SILENT
+# wrong build (wrong cwd -> tier silently SSE2; ignored SIMD=; missing nvcc).
+msvc-selftest:
+	@MSYS2_ARG_CONV_EXCL="*" "$(MSVC_CMD)" /c call $(MSVC_BAT) --selftest --simd:$(MSVC_SIMD)
+
+msvc-selftest-gpu:
+	@MSYS2_ARG_CONV_EXCL="*" "$(MSVC_CMD)" /c call $(MSVC_BAT) --selftest --gpu --simd:$(MSVC_SIMD)
+
+msvc-clean:
+	@-del /q .msvc_cpu 2>NUL || true
