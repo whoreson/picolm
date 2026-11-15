@@ -47,6 +47,10 @@
 #include <math.h>
 #include <sys/types.h>
 #if !defined(_WIN32) && !defined(__DJGPP__) && !defined(__FreeBSD__)
+/* Mac OS X Tiger: resource.h uses struct timeval but doesn't include time.h */
+#if defined(__APPLE__)
+#include <sys/time.h>
+#endif
 #include <sys/resource.h>
 #include <alloca.h>
 #elif defined(__FreeBSD__) && !defined(_WIN32) && !defined(__DJGPP__)
@@ -83,6 +87,10 @@ extern int cudaProfilerStop(void);
 #include <aclapi.h>
 #elif !defined(PICOLM_DOS) && !defined(_WIN32)
 #include <sys/mman.h>
+/* Mac OS X Tiger: resource.h uses struct timeval but doesn't include time.h */
+#if defined(__APPLE__)
+#include <sys/time.h>
+#endif
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -107,7 +115,14 @@ static const char *const pp_names[8] = {
 #if defined(_WIN32)
 static double pp_now(void) { LARGE_INTEGER f, t; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t); return (double)t.QuadPart / (double)f.QuadPart * 1000.0; }
 #else
-static double pp_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1e3 + ts.tv_nsec * 1e-6; }
+static double pp_now(void) {
+#ifdef CLOCK_MONOTONIC
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec * 1e-6;
+#else
+    return (double)clock() / (double)CLOCKS_PER_SEC * 1e3;
+#endif
+}
 #endif
 #define PP_BEGIN() do { if (pp_on < 0) pp_on = getenv("PICOLM_PREFILL_PROF") != NULL; if (pp_on) pp_t = pp_now(); } while (0)
 #define PP_MARK(i) do { if (pp_on) { double _t = pp_now(); pp_acc[i] += _t - pp_t; pp_t = _t; } } while (0)
@@ -163,6 +178,11 @@ void swap_f16_block(uint16_t *dst, size_t n) {
         memcpy(dst + i, _f16swap_buf, 16);
     }
     for (; i < n; i++) dst[i] = GGUF_LE16(dst[i]);
+}
+#elif defined(__APPLE__) && defined(__ppc__)
+/* Scalar fallback for PPC without Altivec (G3). */
+void swap_f16_block(uint16_t *dst, size_t n) {
+    for (size_t i = 0; i < n; i++) dst[i] = GGUF_LE16(dst[i]);
 }
 #else
 /* swap_f16_block not needed on LE; parse_gguf swap loop is PPC-only */
@@ -4711,19 +4731,11 @@ static void batch_add2_task(int idx, void *p) {
 }
 /* Reusable compact copy buffer for the attention output (was a malloc/free of n_tokens*q_dim
  * floats per layer: fresh mmap pages faulted in serially on every layer). */
-#if !defined(_MSC_VER)
 static float *prefill_attn_out_buf(size_t floats) {
-    static __thread float *buf; static __thread size_t cap;
+    static PICOLM_TLS float *buf; static PICOLM_TLS size_t cap;
     if (cap < floats) { free(buf); buf = (float *)malloc(floats * sizeof(float)); cap = buf ? floats : 0; }
     return buf;
 }
-#else
-static float *prefill_attn_out_buf(size_t floats) {
-    static __declspec(thread) float *buf; static __declspec(thread) size_t cap;
-    if (cap < floats) { free(buf); buf = (float *)malloc(floats * sizeof(float)); cap = buf ? floats : 0; }
-    return buf;
-}
-#endif
 
 /* ---- GPTNeoX (Krake v2) batched prefill ----
  * Same as GPT-2 prefill but:

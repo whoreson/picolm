@@ -926,7 +926,7 @@ static void ssm_kernel_state_update_n(
             for (int j = 0; j < cs; j++) {
                 const float dj = decay_to_end[j];
                 if (dj == 0.0f) continue;
-                const float *restrict vj = v_hat + (size_t)j * nr;
+                const float *PICOLM_RESTRICT vj = v_hat + (size_t)j * nr;
                 const __m512 kv = _mm512_loadu_ps(k + (size_t)j * d + col_base);
                 r0 = _mm512_fmadd_ps(kv, _mm512_set1_ps(vj[base + 0] * dj), r0);
                 r1 = _mm512_fmadd_ps(kv, _mm512_set1_ps(vj[base + 1] * dj), r1);
@@ -3895,10 +3895,10 @@ static void ssm_conv_block_task(int task, void *ctxp) {
 #endif
 
     for (int t = 0; t < ntok; t++) {
-        const float *restrict p = c->pbuf + (size_t)t * cd;
-        float *restrict out = c->conv_out + (size_t)t * cd;
+        const float *PICOLM_RESTRICT p = c->pbuf + (size_t)t * cd;
+        float *PICOLM_RESTRICT out = c->conv_out + (size_t)t * cd;
 
-        const float *restrict taps[8];
+        const float *PICOLM_RESTRICT taps[8];
         for (int d = 0; d < n_taps; d++)
             taps[d] = p + (size_t)d * cd;
 
@@ -3969,9 +3969,9 @@ static void ssm_gatednorm_task(int task, void *ctxp) {
     const int t = task / c->n_v_heads;
     const int hd = c->head_v_dim;
 
-    float *restrict out_head = c->xb2 + (size_t)t * c->value_dim + (size_t)h * hd;
-    const float *restrict z_head = c->z + (size_t)t * c->value_dim + (size_t)h * hd;
-    const float *restrict nw = c->norm_w;
+    float *PICOLM_RESTRICT out_head = c->xb2 + (size_t)t * c->value_dim + (size_t)h * hd;
+    const float *PICOLM_RESTRICT z_head = c->z + (size_t)t * c->value_dim + (size_t)h * hd;
+    const float *PICOLM_RESTRICT nw = c->norm_w;
 
     /* Reduce this head's sum of squares.
      * Kept SCALAR on purpose. Vectorising it (fmadd into 8 lanes, then a
@@ -4282,7 +4282,7 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
                 for (int co = 0; co < conv_dim; co++)
                     conv1d_wt[d * conv_dim + co] = conv1d_w[d + co * dc];
         }
-        const float *restrict cw = conv1d_wt;
+        const float *PICOLM_RESTRICT cw = conv1d_wt;
         const int dc = c->ssm_d_conv;
         const int nsr = n_state_rows;
 
@@ -4349,7 +4349,7 @@ void ssm_prefill_layer(model_t *m, run_state_t *s,
          * and perturbs the logits for no gain -- conv_batch is 10 MB and still
          * hot, so this costs little. */
         for (bi = 0; bi < n_tokens; bi++) {
-            float *restrict conv_out = conv_batch + (size_t)bi * conv_dim;
+            float *PICOLM_RESTRICT conv_out = conv_batch + (size_t)bi * conv_dim;
 #ifdef PICOLM_HAVE_EXP256
             ssm_silu_vec(conv_out, conv_dim);
 #else

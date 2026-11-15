@@ -98,9 +98,13 @@ static double glm5_prof_now(void) {
 #if defined(_WIN32) || defined(PICOLM_DOS)
     return (double)clock() * 1000.0 / (double)CLOCKS_PER_SEC;
 #else
+#ifdef CLOCK_MONOTONIC
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
+#else
+    return (double)clock() * 1000.0 / (double)CLOCKS_PER_SEC;
+#endif
 #endif
 }
 

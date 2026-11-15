@@ -16,6 +16,9 @@ static inline void *picolm_aligned_alloc(size_t align, size_t size) {
 #elif defined(PICOLM_DOS)
     /* DOS: no aligned alloc, use standard malloc. 64-byte alignment is advisory. */
     return malloc(size);
+#elif defined(__APPLE__) && (defined(__GNUC__) && __GNUC__ < 4)
+    /* Old Mac OS X (Tiger): no posix_memalign, use valloc (page-aligned) */
+    return valloc((size) + (align) - 1);
 #else
     void *ptr = NULL;
     if (posix_memalign(&ptr, align, size) != 0) return NULL;

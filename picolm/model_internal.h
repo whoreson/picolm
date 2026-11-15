@@ -129,10 +129,19 @@ extern void moe_forward_batch(model_t *m, run_state_t *s,
 extern void bench_emit(int l, int is_prefill, double elapsed_ms, long minflt, long majflt);
 extern int g_is_prefill;
 double get_time_ms(void);
+/* PPC big-endian: swap_f16_block for GGUF tensor endianness correction */
+#if defined(__APPLE__) && defined(__ppc__)
+extern void swap_f16_block(uint16_t *dst, size_t n);
+#endif
 #if defined(_WIN32) || defined(PICOLM_DOS)
 #define BENCH_LAYER_START() double _bench_t0 = get_time_ms()
 #define BENCH_LAYER_END(_l, _pref) bench_emit(_l, _pref, get_time_ms() - (_bench_t0), 0, 0)
 #else
+/* Mac OS X Tiger: resource.h needs sys/types.h (rlim_t, fixpt_t) and sys/time.h (struct timeval) */
+#include <sys/types.h>
+#if defined(__APPLE__)
+#include <sys/time.h>
+#endif
 #include <sys/resource.h>
 #define BENCH_LAYER_START() double _bench_t0 = get_time_ms(); struct rusage _bench_ru0; getrusage(RUSAGE_SELF, &_bench_ru0)
 #define BENCH_LAYER_END(_l, _pref) do { struct rusage _bench_ru1; getrusage(RUSAGE_SELF, &_bench_ru1); \

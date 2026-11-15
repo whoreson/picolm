@@ -672,18 +672,18 @@ static double thprof_cpu_now(void) {
     uu.LowPart = u.dwLowDateTime;   uu.HighPart = u.dwHighDateTime;
     return ((double)ku.QuadPart + (double)uu.QuadPart) * 1e-7;
 #else
+#ifdef CLOCK_THREAD_CPUTIME_ID
     struct timespec ts;
     if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return 0.0;
     return ts.tv_sec + ts.tv_nsec * 1e-9;
+#else
+    return (double)clock() / (double)CLOCKS_PER_SEC;
+#endif
 #endif
 }
 
 /* Explicit label for the regions dispatched next (tensor_set_region_label). */
-#if !defined(_MSC_VER)
-static __thread const char *thprof_label;
-#else
-static const char *thprof_label;
-#endif
+static PICOLM_TLS const char *thprof_label;
 
 void tensor_set_region_label(const char *label) { thprof_label = label; }
 
@@ -850,11 +850,7 @@ static volatile int    pool_nworkers = 0;
  * generic dispatch. tensor_parallel_for* use ONE global task table, so a nested call (e.g. an attention
  * worker calling matmul_batch -> batched activation quantization) would corrupt the outer dispatch.
  * A nested call now just runs serially on the calling thread. */
-#if !defined(_MSC_VER)
-static __thread int tl_in_parallel = 0;
-#else
-static int tl_in_parallel = 0;
-#endif
+static PICOLM_TLS int tl_in_parallel = 0;
 
 /* ---- Spin-then-sleep synchronization (replaces broadcast-per-completion) ----
  *
@@ -1143,16 +1139,7 @@ typedef struct {
 static generic_task_t  generic_tasks[MAX_THREADS];
 static volatile int    pool_mode = 0; /* 0 = matmul_task_t, 1 = generic_task_t */
 static int pool_total_threads(int requested);
-#if defined(_MSC_VER) || defined(__APPLE__) || defined(__osf__)
-/* MSVC, old Mac OS X, OSF/1 Alpha (GCC 3.x) don't support __thread */
-static int             pool_my_tid = 0;
-#else
-#if !defined(_MSC_VER)
-static __thread int    pool_my_tid = 0;
-#else
-static int             pool_my_tid = 0;
-#endif
-#endif /* TLS: current thread's pool index (0 for main) */
+static PICOLM_TLS int pool_my_tid = 0; /* TLS: current thread's pool index (0 for main) */
 
 /* Return current thread's pool index (0 for main thread, 1..n-1 for workers) */
 int tensor_get_thread_id(void) {
@@ -1736,7 +1723,7 @@ static const char *qtype_short_name(gguf_type_t t) {
  * long enough that the HW prefetcher still sees a stream (the contiguous-vs-
  * interleaved measurement showed runs matter).
  * PICOLM_MATMUL_CHUNK=0 disables claiming entirely. */
-static __thread int tl_dyn_cursor;
+static PICOLM_TLS int tl_dyn_cursor;
 static int matmul_chunk_rows(void) {
     static int v = -1;
     if (v < 0) {
@@ -1838,13 +1825,8 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
      * so that was 3000 malloc/free pairs per token on the serial path, with
      * the worker threads idle. A per-thread buffer that only grows fixes it.
      * (Same pattern as gemm_convert_ctx_t's tl_scratch below.) */
-#if !defined(_MSC_VER)
-    static __thread void  *mm_scratch = NULL;
-    static __thread size_t mm_scratch_sz = 0;
-#else
-    static void  *mm_scratch = NULL;
-    static size_t mm_scratch_sz = 0;
-#endif
+static PICOLM_TLS void  *mm_scratch = NULL;
+    static PICOLM_TLS size_t mm_scratch_sz = 0;
     {
         /* Q8_0: 34 B/32 values + 4 B delta; Q8_K: 292 B/256 values. The
          * larger of the two per input value is ~1.2 B, so n*2 is ample. */
@@ -3077,13 +3059,8 @@ static void gemm_convert_task(int idx, void *ctxp) {
     this_rows &= ~7;   /* round down to multiple of 8 (Q8_K_R8 interleave) */
     if (this_rows <= 0) return;
     /* Per-thread scratch buffer, grown on demand */
-#if !defined(_MSC_VER)
-    static __thread void *tl_scratch = NULL;
-    static __thread size_t tl_scratch_size = 0;
-#else
-    static void *tl_scratch = NULL;
-    static size_t tl_scratch_size = 0;
-#endif
+static PICOLM_TLS void *tl_scratch = NULL;
+    static PICOLM_TLS size_t tl_scratch_size = 0;
     size_t needed = (size_t)(this_rows / 8) * (c->k / 256) * sizeof(block_q8_k_r8);
     if (tl_scratch_size < needed) {
         free(tl_scratch);
@@ -5430,9 +5407,13 @@ static inline double barrier_now(void) {
     LARGE_INTEGER f, t; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t);
     return (double)t.QuadPart / (double)f.QuadPart;
 #else
+#ifdef CLOCK_MONOTONIC
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec + ts.tv_nsec * 1e-9;
+#else
+    return (double)clock() / (double)CLOCKS_PER_SEC;
+#endif
 #endif
 }
 #else

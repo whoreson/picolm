@@ -336,11 +336,7 @@ int sgemm_iq6_k_q8_k_avx2(int nrows, int ncols, int k,
 #endif
 
 typedef struct { int8_t *w; int16_t *sc; float *d; size_t w_cap, sc_cap, d_cap; } iq6t_scratch_t;
-#if !defined(_WIN32)
-static __thread iq6t_scratch_t iq6t_tl;
-#else
-static iq6t_scratch_t iq6t_tl;
-#endif
+static PICOLM_TLS iq6t_scratch_t iq6t_tl;
 
 static int iq6t_reserve(int nb) {
     const size_t w = (size_t)nb * 2048, sc = (size_t)nb * 512, d = (size_t)nb * 32;
@@ -629,11 +625,7 @@ static inline always_inline void kq_load_q2(const block_q2_K *x, __m256i wv[8], 
 /* Per-thread scratch for the min term: mn = for each super-block 8 pairs (16-group 2p, 2p+1) of int16
  * mins per row laid out [p][2r + {0,1}] (one 256-bit madd operand per pair); dm = dmin per row. */
 typedef struct { int16_t *mn; float *dm; size_t mn_cap, dm_cap; } kqm_scratch_t;
-#if !defined(_WIN32)
-static __thread kqm_scratch_t kqm_tl;
-#else
-static kqm_scratch_t kqm_tl;
-#endif
+static PICOLM_TLS kqm_scratch_t kqm_tl;
 static int kqm_reserve(int nb) {
     const size_t mn = (size_t)nb * 256, dm = (size_t)nb * 32;
     if (kqm_tl.mn_cap < mn) { _mm_free(kqm_tl.mn); kqm_tl.mn = (int16_t *)_mm_malloc(mn, 64); kqm_tl.mn_cap = kqm_tl.mn ? mn : 0; }
@@ -1059,11 +1051,7 @@ int sgemm_iq3_k_r4_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const v
 #define IQ6V_NC 8
 
 typedef struct { uint8_t *w; int32_t *sl; float *d; int32_t *cr; size_t w_cap, sl_cap, d_cap, cr_cap; } iq6v_scratch_t;
-#if !defined(_WIN32)
-static __thread iq6v_scratch_t iq6v_tl;
-#else
-static iq6v_scratch_t iq6v_tl;
-#endif
+static PICOLM_TLS iq6v_scratch_t iq6v_tl;
 
 static int iq6v_reserve(int nb, int pc) {
     const size_t w = (size_t)nb * 2048, sl = (size_t)nb * 512, d = (size_t)nb * 32, cr = (size_t)pc * nb * 64;

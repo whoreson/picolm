@@ -5,6 +5,29 @@
 #include <stddef.h>
 #include <string.h>
 
+/* Portable thread-local storage.
+ * MSVC uses __declspec(thread), GCC >= 4 uses __thread.
+ * Old Mac OS X (Tiger/Leopard, GCC 3.3) and OSF/1 (GCC 3.x) don't support __thread. */
+#if defined(_MSC_VER)
+#define PICOLM_TLS __declspec(thread)
+#elif defined(__APPLE__) || defined(__osf__) || (defined(__GNUC__) && __GNUC__ < 4)
+#define PICOLM_TLS
+#else
+#define PICOLM_TLS __thread
+#endif
+
+/* restrict: not supported in GCC < 4 (e.g. Mac OS X Tiger GCC 3.3, OSF/1) */
+#if !defined(__GNUC__) || __GNUC__ >= 4
+#define PICOLM_RESTRICT restrict
+#else
+#define PICOLM_RESTRICT
+#endif
+
+/* Mac OS X uses MAP_ANON instead of MAP_ANONYMOUS */
+#if defined(__APPLE__) && !defined(MAP_ANONYMOUS)
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+
 /* OSF/1 compatibility: provides fmaf macro, snprintf, atoll, roundf. */
 #if defined(__osf__)
 #include "compat/osf1_compat.h"

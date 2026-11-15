@@ -952,11 +952,7 @@ SGEMM_UNROLL4
 }
 
 typedef struct { int8_t *yq; float *ys; block_q8_0_r8 *wr; size_t yq_cap, ys_cap, wr_cap; } r8a_scratch_t;
-#if !defined(_MSC_VER)
-static __thread r8a_scratch_t r8a_tl;
-#else
-static r8a_scratch_t r8a_tl;
-#endif
+static PICOLM_TLS r8a_scratch_t r8a_tl;
 
 static int r8a_reserve(int pc, int nb, int need_wr) {
     const size_t yq = (size_t)pc * nb * 32, ys = (size_t)pc * nb * sizeof(float), wr = need_wr ? (size_t)nb * sizeof(block_q8_0_r8) : 0;
@@ -1252,11 +1248,7 @@ SGEMM_UNROLL12
 
 /* per-thread scratch: u8 activation panel, fp32 scales, repacked weight group */
 typedef struct { uint8_t *yu; float *ys; block_q8_0_r8 *wr; size_t yu_cap, ys_cap, wr_cap; } r8v_scratch_t;
-#if !defined(_MSC_VER)
-static __thread r8v_scratch_t r8v_tl;
-#else
-static r8v_scratch_t r8v_tl;
-#endif
+static PICOLM_TLS r8v_scratch_t r8v_tl;
 
 static int r8v_reserve(int pc, int nb, int need_wr) {
     const size_t yu = (size_t)pc * nb * 32, ys = (size_t)pc * nb * sizeof(float), wr = need_wr ? (size_t)nb * sizeof(block_q8_0_r8) : 0;

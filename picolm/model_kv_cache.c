@@ -24,6 +24,7 @@ typedef long long off_t;
 #endif
 #endif
 #elif !defined(PICOLM_DOS)
+#include <sys/types.h>
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>

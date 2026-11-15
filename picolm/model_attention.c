@@ -1191,13 +1191,8 @@ static void ad_split_task(int idx, void *p) {
     ad_chunk(ctx, kv_h, t0, t1, base, base + 8, base + 16);
 }
 
-#if !defined(_MSC_VER)
-static __thread float *ad_scratch = NULL;
-static __thread size_t ad_scratch_cap = 0;
-#else
-static float *ad_scratch = NULL;
-static size_t ad_scratch_cap = 0;
-#endif
+static PICOLM_TLS float *ad_scratch = NULL;
+static PICOLM_TLS size_t ad_scratch_cap = 0;
 #endif /* AD_SIMD */
 
 /* Entry used by tensor_parallel_for over KV heads (also the GPT-2 path). */
@@ -2440,9 +2435,13 @@ static double attn_now_ms(void) {
     LARGE_INTEGER f, t; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t);
     return (double)t.QuadPart / (double)f.QuadPart * 1000.0;
 #else
+#ifdef CLOCK_MONOTONIC
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
+#else
+    return (double)clock() / (double)CLOCKS_PER_SEC * 1000.0;
+#endif
 #endif
 }
 #else

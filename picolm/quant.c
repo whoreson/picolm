@@ -7579,11 +7579,7 @@ float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
              * For non-block-aligned n, pass the aligned count. */
             const int nb5 = n / 256;
             const int n5 = nb5 * 256;
-#if defined(_WIN32) || defined(__APPLE__) || defined(__osf__)
-            static float q5_tmp[4096];
-#else
-            static __thread float q5_tmp[4096];
-#endif
+static PICOLM_TLS float q5_tmp[4096];
             if (n5 > 4096) {
                 float *tmp = (float *)malloc((size_t)n5 * sizeof(float));
                 float r;
