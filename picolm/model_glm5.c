@@ -1067,10 +1067,241 @@ static void mla_attn_task(int idx, void *vp) {
     }
 }
 
+/* ---- Blocked flash-style prefill attention (absorbed MLA, dense) ------------
+ *
+ * mla_attn_task() above is GEMV-shaped: for every (head, token) it streams the
+ * whole F32 latent cache twice with 512-wide dots, so at 10k context a layer
+ * moves ~650 GB of cache through L3 and runs at ~2.5 GFLOP/s per thread (the
+ * "2.2 GFLOP/s" in its header comment). The comment claims the loop inversion
+ * lets a cache row serve every token of a chunk, but the code is
+ * `for t { for p { dot } }`, so the cache is re-read per token.
+ *
+ * This is the same math as a GEMM + online softmax (the structure ik_llama.cpp
+ * uses): a task owns PFA_BQ tokens x PFA_HG heads = up to 64 query rows and walks
+ * the keys in blocks of PFA_BK. Per block
+ *     S[r][j] = scale * dot(q_r, k_j)        4 rows x 4 keys FMA register tile
+ *     online softmax per row (running max m, sum l, rescale of O)
+ *     O[r][:] += P[r][j] * k_j[:]             4 rows x 64 cols kept in zmm
+ * so each key block (64 rows x 2 KB = 128 KB, L2-resident) is loaded once per 64
+ * query rows instead of once per query: ~64x less cache traffic and the inner
+ * loops are FMA-bound instead of load-bound.
+ *
+ * Causal mask: row r (token t) sees keys <= start_pos + t; the diagonal block is
+ * masked per row. Not bit-identical to mla_attn_task (online softmax, no
+ * p < 1e-10 skip); accurate to float rounding. Opt-in: PICOLM_GLM5_PFA=1.
+ * Scratch is on the stack (no TLS: the MSVC build has none). */
+#define PFA_HG    8
+#define PFA_BQ    8
+#define PFA_BK    64
+#define PFA_MAXR  (PFA_HG * PFA_BQ)
+#define PFA_MAXKVL 512
+
+static int glm5_pfa_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) { const char *e = getenv("PICOLM_GLM5_PFA"); cached = (e && atoi(e) > 0) ? 1 : 0; }
+    return cached;
+}
+
+typedef struct {
+    const float *qabs, *cache; float *ctx;
+    int n_tokens, start_pos, NH, KVL, nTB, perm;
+    float scale;
+} glm5_pfa_t;
+
+/* S[r][j] = scale * dot(q[r], kb[j]) for r<R, j<nk. kb rows are KVL floats apart. */
+static void glm5_pfa_scores(const float *const *qp, int R, const float *kb, int nk,
+                            int KVL, float scale, float *S)
+{
+    int r = 0;
+#if defined(PICOLM_AVX512)
+    if ((KVL & 15) == 0) {
+        for (; r + 3 < R; r += 4) {
+            int j = 0;
+            for (; j + 3 < nk; j += 4) {
+                __m512 a00 = _mm512_setzero_ps(), a01 = a00, a02 = a00, a03 = a00,
+                       a10 = a00, a11 = a00, a12 = a00, a13 = a00,
+                       a20 = a00, a21 = a00, a22 = a00, a23 = a00,
+                       a30 = a00, a31 = a00, a32 = a00, a33 = a00;
+                const float *k0 = kb + (size_t)(j + 0) * KVL, *k1 = kb + (size_t)(j + 1) * KVL,
+                            *k2 = kb + (size_t)(j + 2) * KVL, *k3 = kb + (size_t)(j + 3) * KVL;
+                const float *q0 = qp[r], *q1 = qp[r + 1], *q2 = qp[r + 2], *q3 = qp[r + 3];
+                for (int d = 0; d < KVL; d += 16) {
+                    const __m512 v0 = _mm512_loadu_ps(k0 + d), v1 = _mm512_loadu_ps(k1 + d),
+                                 v2 = _mm512_loadu_ps(k2 + d), v3 = _mm512_loadu_ps(k3 + d);
+                    const __m512 w0 = _mm512_loadu_ps(q0 + d), w1 = _mm512_loadu_ps(q1 + d),
+                                 w2 = _mm512_loadu_ps(q2 + d), w3 = _mm512_loadu_ps(q3 + d);
+                    a00 = _mm512_fmadd_ps(v0, w0, a00); a01 = _mm512_fmadd_ps(v1, w0, a01);
+                    a02 = _mm512_fmadd_ps(v2, w0, a02); a03 = _mm512_fmadd_ps(v3, w0, a03);
+                    a10 = _mm512_fmadd_ps(v0, w1, a10); a11 = _mm512_fmadd_ps(v1, w1, a11);
+                    a12 = _mm512_fmadd_ps(v2, w1, a12); a13 = _mm512_fmadd_ps(v3, w1, a13);
+                    a20 = _mm512_fmadd_ps(v0, w2, a20); a21 = _mm512_fmadd_ps(v1, w2, a21);
+                    a22 = _mm512_fmadd_ps(v2, w2, a22); a23 = _mm512_fmadd_ps(v3, w2, a23);
+                    a30 = _mm512_fmadd_ps(v0, w3, a30); a31 = _mm512_fmadd_ps(v1, w3, a31);
+                    a32 = _mm512_fmadd_ps(v2, w3, a32); a33 = _mm512_fmadd_ps(v3, w3, a33);
+                }
+                float *s0 = S + (size_t)(r + 0) * PFA_BK + j, *s1 = S + (size_t)(r + 1) * PFA_BK + j;
+                float *s2 = S + (size_t)(r + 2) * PFA_BK + j, *s3 = S + (size_t)(r + 3) * PFA_BK + j;
+                s0[0] = _mm512_reduce_add_ps(a00) * scale; s0[1] = _mm512_reduce_add_ps(a01) * scale;
+                s0[2] = _mm512_reduce_add_ps(a02) * scale; s0[3] = _mm512_reduce_add_ps(a03) * scale;
+                s1[0] = _mm512_reduce_add_ps(a10) * scale; s1[1] = _mm512_reduce_add_ps(a11) * scale;
+                s1[2] = _mm512_reduce_add_ps(a12) * scale; s1[3] = _mm512_reduce_add_ps(a13) * scale;
+                s2[0] = _mm512_reduce_add_ps(a20) * scale; s2[1] = _mm512_reduce_add_ps(a21) * scale;
+                s2[2] = _mm512_reduce_add_ps(a22) * scale; s2[3] = _mm512_reduce_add_ps(a23) * scale;
+                s3[0] = _mm512_reduce_add_ps(a30) * scale; s3[1] = _mm512_reduce_add_ps(a31) * scale;
+                s3[2] = _mm512_reduce_add_ps(a32) * scale; s3[3] = _mm512_reduce_add_ps(a33) * scale;
+            }
+            for (; j < nk; j++)
+                for (int i = 0; i < 4; i++)
+                    S[(size_t)(r + i) * PFA_BK + j] =
+                        vec_dot_f32_f32(kb + (size_t)j * KVL, qp[r + i], KVL) * scale;
+        }
+    }
+#endif
+    for (; r < R; r++)
+        for (int j = 0; j < nk; j++)
+            S[(size_t)r * PFA_BK + j] = vec_dot_f32_f32(kb + (size_t)j * KVL, qp[r], KVL) * scale;
+}
+
+/* O[r][:] += sum_j P[r][j] * kb[j][:] */
+static void glm5_pfa_pv(float *O, int R, const float *P, int nk, const float *kb, int KVL)
+{
+    int r = 0;
+#if defined(PICOLM_AVX512)
+    if ((KVL & 63) == 0) {
+        for (; r + 3 < R; r += 4) {
+            for (int c0 = 0; c0 < KVL; c0 += 64) {
+                __m512 a[4][4];
+                #pragma GCC unroll 4
+                for (int i = 0; i < 4; i++) {
+                    #pragma GCC unroll 4
+                    for (int u = 0; u < 4; u++) a[i][u] = _mm512_loadu_ps(O + (size_t)(r + i) * KVL + c0 + 16 * u);
+                }
+                for (int j = 0; j < nk; j++) {
+                    const float *kr = kb + (size_t)j * KVL + c0;
+                    const __m512 v0 = _mm512_loadu_ps(kr), v1 = _mm512_loadu_ps(kr + 16),
+                                 v2 = _mm512_loadu_ps(kr + 32), v3 = _mm512_loadu_ps(kr + 48);
+                    #pragma GCC unroll 4
+                    for (int i = 0; i < 4; i++) {
+                        const __m512 pb = _mm512_set1_ps(P[(size_t)(r + i) * PFA_BK + j]);
+                        a[i][0] = _mm512_fmadd_ps(pb, v0, a[i][0]);
+                        a[i][1] = _mm512_fmadd_ps(pb, v1, a[i][1]);
+                        a[i][2] = _mm512_fmadd_ps(pb, v2, a[i][2]);
+                        a[i][3] = _mm512_fmadd_ps(pb, v3, a[i][3]);
+                    }
+                }
+                #pragma GCC unroll 4
+                for (int i = 0; i < 4; i++) {
+                    #pragma GCC unroll 4
+                    for (int u = 0; u < 4; u++) _mm512_storeu_ps(O + (size_t)(r + i) * KVL + c0 + 16 * u, a[i][u]);
+                }
+            }
+        }
+    }
+#endif
+    for (; r < R; r++) {
+        float *o = O + (size_t)r * KVL;
+        for (int j = 0; j < nk; j++) {
+            const float w = P[(size_t)r * PFA_BK + j];
+            const float *kr = kb + (size_t)j * KVL;
+            for (int d = 0; d < KVL; d++) o[d] += w * kr[d];
+        }
+    }
+}
+
+static void glm5_pfa_task(int idx, void *vp)
+{
+    const glm5_pfa_t *x = (const glm5_pfa_t *)vp;
+    const int NH = x->NH, KVL = x->KVL;
+    const int hg = idx / x->nTB;
+    const int tb = (int)(((long long)(idx % x->nTB) * x->perm) % x->nTB);  /* spread cost across threads */
+    const int h0 = hg * PFA_HG, hn = (NH - h0 < PFA_HG) ? NH - h0 : PFA_HG;
+    const int t0 = tb * PFA_BQ,  tn = (x->n_tokens - t0 < PFA_BQ) ? x->n_tokens - t0 : PFA_BQ;
+    const int R = tn * hn;
+    if (R <= 0) return;
+
+    float O[PFA_MAXR * PFA_MAXKVL];
+    float S[PFA_MAXR * PFA_BK];
+    float m[PFA_MAXR], l[PFA_MAXR];
+    const float *qp[PFA_MAXR];
+    int lim[PFA_MAXR];
+    for (int tt = 0; tt < tn; tt++)
+        for (int hh = 0; hh < hn; hh++) {
+            const int r = tt * hn + hh;
+            qp[r]  = x->qabs + ((size_t)(t0 + tt) * NH + h0 + hh) * KVL;
+            lim[r] = x->start_pos + t0 + tt;      /* last visible key, inclusive */
+            m[r] = -INFINITY; l[r] = 0.f;
+        }
+    memset(O, 0, (size_t)R * KVL * sizeof(float));
+    const int nkeys = x->start_pos + t0 + tn;      /* keys any row in this task can see */
+
+    for (int kb = 0; kb < nkeys; kb += PFA_BK) {
+        const int nk = (nkeys - kb < PFA_BK) ? nkeys - kb : PFA_BK;
+        const float *kblk = x->cache + (size_t)kb * KVL;
+        glm5_pfa_scores(qp, R, kblk, nk, KVL, x->scale, S);
+
+        for (int r = 0; r < R; r++) {
+            float *sr = S + (size_t)r * PFA_BK;
+            const int vis = lim[r] - kb + 1;       /* visible keys in this block */
+            int nv = vis < 0 ? 0 : (vis > nk ? nk : vis);
+            for (int j = nv; j < nk; j++) sr[j] = -INFINITY;
+            float bm = -INFINITY;
+            for (int j = 0; j < nv; j++) if (sr[j] > bm) bm = sr[j];
+            if (nv == 0) { for (int j = 0; j < nk; j++) sr[j] = 0.f; continue; }
+            const float mn = bm > m[r] ? bm : m[r];
+            const float alpha = expf(m[r] - mn);   /* m[r] = -inf on the first block -> 0 */
+            float sum = 0.f;
+            for (int j = 0; j < nv; j++) { float e = expf(sr[j] - mn); sr[j] = e; sum += e; }
+            for (int j = nv; j < nk; j++) sr[j] = 0.f;
+            l[r] = l[r] * alpha + sum;
+            if (alpha != 1.0f) {
+                float *o = O + (size_t)r * KVL;
+                for (int d = 0; d < KVL; d++) o[d] *= alpha;
+            }
+            m[r] = mn;
+        }
+        glm5_pfa_pv(O, R, S, nk, kblk, KVL);
+    }
+
+    for (int tt = 0; tt < tn; tt++)
+        for (int hh = 0; hh < hn; hh++) {
+            const int r = tt * hn + hh;
+            const float inv = 1.0f / l[r];
+            const float *o = O + (size_t)r * KVL;
+            float *dst = x->ctx + ((size_t)(t0 + tt) * NH + h0 + hh) * KVL;
+            for (int d = 0; d < KVL; d++) dst[d] = o[d] * inv;
+        }
+}
+
+/* Returns 1 if it ran (caller falls back to the per-(head,token) core otherwise). */
+static int glm5_mla_attn_pfa(const model_config_t *c, run_state_t *s, int mla_ord,
+                             const float *qabs_b, float *ctx_b, int n_tokens, int start_pos)
+{
+    const int NH = c->n_heads, KVL = c->glm5_kv_lora;
+    if (KVL > PFA_MAXKVL || KVL < 16 || n_tokens < 1) return 0;
+    glm5_pfa_t x;
+    x.qabs = qabs_b; x.ctx = ctx_b; x.n_tokens = n_tokens; x.start_pos = start_pos;
+    x.NH = NH; x.KVL = KVL; x.scale = 1.0f / sqrtf((float)c->glm5_mla_head_dim);
+    x.cache = s->glm5.mla_kv + (size_t)mla_ord * c->max_seq_len * KVL;
+    x.nTB = (n_tokens + PFA_BQ - 1) / PFA_BQ;
+    /* Stride permutation, coprime with nTB: causal cost grows with the token block,
+     * and the pool hands each thread a contiguous index range, so spread the blocks. */
+    x.perm = 1;
+    for (int cand = (int)(x.nTB * 0.618) | 1; cand < x.nTB * 4 + 8; cand += 2) {
+        int a = cand, b = x.nTB;
+        while (b) { int t = a % b; a = b; b = t; }
+        if (a == 1) { x.perm = cand; break; }
+    }
+    const int nHG = (NH + PFA_HG - 1) / PFA_HG;
+    tensor_parallel_for(nHG * x.nTB, glm5_pfa_task, &x);
+    return 1;
+}
+
 static void glm5_mla_attn_batch(
     const model_config_t *c, run_state_t *s, int mla_ord,
     const float *qabs_b, float *ctx_b, int n_tokens, int start_pos)
 {
+    if (glm5_pfa_enabled() && glm5_mla_attn_pfa(c, s, mla_ord, qabs_b, ctx_b, n_tokens, start_pos))
+        return;
     const int NH = c->n_heads;
     const int KVL = c->glm5_kv_lora;
     const float scale = 1.0f / sqrtf((float)c->glm5_mla_head_dim);
