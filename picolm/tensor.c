@@ -1825,7 +1825,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
      * so that was 3000 malloc/free pairs per token on the serial path, with
      * the worker threads idle. A per-thread buffer that only grows fixes it.
      * (Same pattern as gemm_convert_ctx_t's tl_scratch below.) */
-static PICOLM_TLS void  *mm_scratch = NULL;
+    static PICOLM_TLS void  *mm_scratch = NULL;
     static PICOLM_TLS size_t mm_scratch_sz = 0;
     {
         /* Q8_0: 34 B/32 values + 4 B delta; Q8_K: 292 B/256 values. The
@@ -3059,7 +3059,7 @@ static void gemm_convert_task(int idx, void *ctxp) {
     this_rows &= ~7;   /* round down to multiple of 8 (Q8_K_R8 interleave) */
     if (this_rows <= 0) return;
     /* Per-thread scratch buffer, grown on demand */
-static PICOLM_TLS void *tl_scratch = NULL;
+    static PICOLM_TLS void *tl_scratch = NULL;
     static PICOLM_TLS size_t tl_scratch_size = 0;
     size_t needed = (size_t)(this_rows / 8) * (c->k / 256) * sizeof(block_q8_k_r8);
     if (tl_scratch_size < needed) {
