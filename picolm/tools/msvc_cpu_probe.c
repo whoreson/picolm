@@ -20,6 +20,7 @@
 
 #if defined(_MSC_VER)
 #include <intrin.h>
+#include <immintrin.h>   /* _xgetbv */
 #define CPUID(info, leaf)        __cpuid((info), (leaf))
 #define CPUIDX(info, leaf, sub)  __cpuidex((info), (leaf), (sub))
 #else
@@ -35,6 +36,8 @@ int main(void) {
     int max_leaf;
     int have_avx = 0, have_avx2 = 0, have_avx512f = 0;
     int have_fma = 0, have_f16c = 0;
+    int osxsave = 0;
+    unsigned long long xcr0 = 0;
 
     info[0] = info[1] = info[2] = info[3] = 0;
     CPUID(info, 0);
@@ -45,11 +48,36 @@ int main(void) {
         have_avx   = (info[2] >> 28) & 1;   /* ECX bit 28: AVX   */
         have_fma   = (info[2] >> 12) & 1;   /* ECX bit 12: FMA3  */
         have_f16c  = (info[2] >> 29) & 1;   /* ECX bit 29: F16C  */
+        osxsave    = (info[2] >> 27) & 1;   /* ECX bit 27: OSXSAVE */
     }
     if (max_leaf >= 7) {
         CPUIDX(info, 7, 0);
         have_avx2    = (info[1] >>  5) & 1; /* EBX bit  5: AVX2  */
         have_avx512f = (info[1] >> 16) & 1; /* EBX bit 16: AVX512F */
+    }
+
+    /* CPUID alone is not sufficient. The OS must also have enabled the vector
+     * state in XCR0, otherwise every AVX/AVX-512 instruction faults with
+     * STATUS_ILLEGAL_INSTRUCTION (0xC000001D) on first use -- which is an
+     * immediate, unexplained process death long before any model loads.
+     * This happens on VMs that advertise AVX512F in CPUID but do not implement
+     * it, and on any system where XCR0 has not been programmed.
+     *
+     *   XCR0 bit 1  SSE state          required for any AVX code
+     *   XCR0 bit 2  AVX (YMM) state    required for AVX/AVX2
+     *   XCR0 bit 5  opmask state       required for AVX-512
+     *   XCR0 bit 6  ZMM_Hi256          required for AVX-512
+     *   XCR0 bit 7  Hi16_ZMM           required for AVX-512
+     */
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    if (osxsave) xcr0 = _xgetbv(0);
+#endif
+    if (!osxsave || (xcr0 & 0x6) != 0x6) {
+        have_avx = have_avx2 = have_avx512f = 0;
+        have_fma = have_f16c = 0;
+    }
+    if ((xcr0 & 0xE0) != 0xE0) {
+        have_avx512f = 0;
     }
 
     if (have_fma)      printf("fma ");

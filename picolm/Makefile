@@ -18,6 +18,8 @@ help:
 	@echo "  Windows / MSVC (works from a plain CMD prompt, no MSYS2 needed):"
 	@echo "    make msvc           C-only, SIMD autodetected from the CPU (cached)"
 	@echo "    make msvc-gpu       + CUDA backend (nvcc/toolkit autodetected)"
+	@echo "    make msvc-viz       + embedded VNC viewer (like 'make viz')"
+	@echo "    make msvc-gpu-viz   + CUDA and VNC together"
 	@echo "    make msvc-selftest  Check the toolchain/SIMD/CUDA environment only"
 	@echo "    make msvc-selftest-gpu"
 	@echo "    make msvc-clean     Forget the cached CPU probe"
@@ -1208,7 +1210,7 @@ MSVC_SIMD := $(SIMD)
 endif
 MSVC_SIMD ?= native
 
-.PHONY: msvc msvc-gpu msvc-selftest msvc-selftest-gpu msvc-clean
+.PHONY: msvc msvc-gpu msvc-viz msvc-gpu-viz msvc-selftest msvc-selftest-gpu msvc-clean
 
 # GNU make defines MAKE_VERSION at startup; nmake never gets this far anyway.
 ifeq ($(MAKE_VERSION),)
@@ -1254,6 +1256,14 @@ msvc:
 
 msvc-gpu:
 	@MSYS2_ARG_CONV_EXCL="*" "$(MSVC_CMD)" /c call $(MSVC_BAT) --simd:$(MSVC_SIMD) --gpu
+
+# Embedded VNC viewer. Mirrors `make viz` on the Unix side; adds viz.c and
+# -DPICOLM_VIZ. Combines with the SIMD and GPU options.
+msvc-viz:
+	@MSYS2_ARG_CONV_EXCL="*" "$(MSVC_CMD)" /c call $(MSVC_BAT) --simd:$(MSVC_SIMD) --viz
+
+msvc-gpu-viz:
+	@MSYS2_ARG_CONV_EXCL="*" "$(MSVC_CMD)" /c call $(MSVC_BAT) --simd:$(MSVC_SIMD) --gpu --viz
 endif
 
 # Verify the environment the MSVC build assumes, without compiling anything.

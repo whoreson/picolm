@@ -49,6 +49,8 @@ set "ARG=%~1"
 if /i "%ARG:~0,7%"=="--simd:" goto arg_simd
 if /i "%ARG%"=="--gpu" goto arg_gpu
 if /i "%ARG%"=="--selftest" goto arg_selftest
+if /i "%ARG%"=="--print-tier" goto arg_print_tier
+if /i "%ARG%"=="--viz" goto arg_viz
 echo WARN: ignoring unknown argument "%ARG%"
 shift
 goto parse_args
@@ -62,6 +64,14 @@ shift
 goto parse_args
 :arg_selftest
 set "MSVC_SELFTEST=1"
+shift
+goto parse_args
+:arg_print_tier
+set "MSVC_PRINT_TIER=1"
+shift
+goto parse_args
+:arg_viz
+set "MSVC_VIZ=1"
 shift
 goto parse_args
 :args_done
@@ -78,8 +88,13 @@ rem the repo root and sent the build one directory too high (its CPU probe was
 rem then not found, it silently fell back to SSE2, and cl.exe failed).
 rem If the caller ran us by path from inside tools\, %~dp0 is trustworthy and
 rem we cd to its parent. Otherwise we are already in the repo root; trust %CD%.
-echo "%~dp0" | find "\tools\" >nul
-if not errorlevel 1 pushd "%~dp0.."
+rem
+rem This test must not shell out. `find` is the Unix find.exe on any machine
+rem that has MSYS2/MinGW on PATH, so `echo ... | find "\tools\"` tries to open
+rem a path called "\tools\" and fails; `findstr` is Windows-only. Comparing the
+rem tail of %~dp0 in pure batch has no external dependency at all.
+set "DP0=%~dp0"
+if /i "!DP0:~-7!"=="\tools\" pushd "!DP0!.."
 if not exist "tools\msvc_cpu_probe.c" goto bad_cwd
 goto cwd_ok
 :bad_cwd
@@ -88,10 +103,14 @@ echo        cwd: %CD%
 exit /b 1
 :cwd_ok
 
+rem In --print-tier mode stdout must carry exactly one line (the tier), because
+rem CI reads it with `for /f`. Everything else goes to stderr.
+if defined MSVC_PRINT_TIER goto banner_done
 echo === PicoLM MSVC build ===
 echo   cwd:  %CD%
 echo   SIMD: %MSVC_SIMD%
 if defined MSVC_GPU (echo   GPU:  yes) else (echo   GPU:  no)
+:banner_done
 
 rem ---- 1. locate Visual Studio --------------------------------------------
 rem vswhere.exe is installed with the VS Installer and is the documented,
@@ -138,8 +157,8 @@ if not exist "%VCVARS%" (
     echo ERROR: vcvars64.bat not found at "%VCVARS%"
     popd 2>nul & exit /b 1
 )
-echo   cl:   %CL_EXE%
-echo   vars: %VCVARS%
+if not defined MSVC_PRINT_TIER echo   cl:   %CL_EXE%
+if not defined MSVC_PRINT_TIER echo   vars: %VCVARS%
 
 rem link.exe and cl.exe need a writable TEMP. If TEMP/TMP are unset or point
 rem somewhere unwritable (link.exe then tries C:\Windows and fails with
@@ -163,9 +182,9 @@ if not defined MSVC_SIMD set "MSVC_SIMD=native"
 if /i "%MSVC_SIMD%"=="native" (
     if exist ".msvc_cpu" (
         set /p MSVC_SIMD=<.msvc_cpu
-        echo   cpu:  cached
+        if not defined MSVC_PRINT_TIER echo   cpu:  cached
     ) else (
-        echo   cpu:  probing...
+        if not defined MSVC_PRINT_TIER echo   cpu:  probing...
         cl /nologo /O2 /Fe:.msvc_probe.exe tools\msvc_cpu_probe.c >nul 2>&1
         if not exist ".msvc_probe.exe" (
             echo WARN: CPU probe failed to compile; assuming SSE2
@@ -179,7 +198,7 @@ if /i "%MSVC_SIMD%"=="native" (
             echo !PROBE! | find "avx2 " >nul && set "MSVC_SIMD=avx2"
             echo !PROBE! | find "avx512f " >nul && set "MSVC_SIMD=avx512"
             echo !MSVC_SIMD!> ".msvc_cpu"
-            echo   cpu:  !MSVC_SIMD!
+            if not defined MSVC_PRINT_TIER echo   cpu:  !MSVC_SIMD!
         )
     )
 )
@@ -227,11 +246,20 @@ goto selftest_only
     ) else (
         set "MSVC_SIMD=sse2" & set "MSVC_ARCH=/arch:SSE2"
     )
-    echo   tier: !MSVC_SIMD! -fallback-
+    if not defined MSVC_PRINT_TIER echo   tier: !MSVC_SIMD! -fallback-
 ) else (
-    echo   tier: %MSVC_SIMD%
+    if not defined MSVC_PRINT_TIER echo   tier: %MSVC_SIMD%
 )
 del /q ".msvc_archtest.c" ".msvc_archtest.obj" 2>nul
+
+rem --print-tier: emit the resolved tier and stop. Used by CI to pick a tier
+rem the runner CPU can actually execute, without duplicating the
+rem vswhere -> vcvars -> probe -> /arch-verify chain in the workflow.
+if not defined MSVC_PRINT_TIER goto pt_skip
+echo !MSVC_SIMD!
+popd 2>nul
+exit /b 0
+:pt_skip
 
 rem ---- 5. compile --------------------------------------------------------
 rem No -D PICOLM_AVX2/AVX512/AVX/FMA/SSE2 here on purpose: quant.h derives them
@@ -245,6 +273,14 @@ set "MSVC_CF=%MSVC_CF% /D PICOLM_SERVER=1"
 set "MSVC_CSRCS="
 for %%f in (picolm.c model_core.c model_recurrent_state.c model_attention.c model_moe.c model_gemma3n.c model_glm5.c model_ssm.c model_kv_cache.c model_gguf.c steer.c tensor.c type_dispatch.c quant.c sgemm.c sgemm_q0_neon_fast.c sgemm_q2_k_r4_neon.c sgemm_iq4nl_neon_fast.c sgemm_k_q8k_neon_fast.c sgemm_q2_k_neon.c sgemm_k_q8k_neon.c sgemm_q4_0x8.c sgemm_q4i_0x8.c sgemm_q4_0_r8.c sgemm_q8_0_r8.c sgemm_q8_k_r8.c sgemm_q8_k_r8_neon.c sgemm_iq2_k.c sgemm_iq2_k_r4.c sgemm_iq3_k.c sgemm_iq3_k_r4.c sgemm_iq4_k.c sgemm_iq4_nl_r4.c sgemm_q4_k_r4.c sgemm_q6_k_r4.c sgemm_iq6_k.c sgemm_iq4_xs.c tokenizer.c qwen_tokenize.c sampler.c grammar.c cJSON.c server.c csafetensors.c json.c safetensors.c) do (
     set "MSVC_CSRCS=!MSVC_CSRCS! %%f"
+)
+
+rem viz.c is opt-in, matching `make viz` on the Unix side: it adds -DPICOLM_VIZ
+rem to every translation unit that has viz_push_layer calls, plus viz.c itself.
+if defined MSVC_VIZ (
+    set "MSVC_CSRCS=!MSVC_CSRCS! viz.c"
+    set "MSVC_CF=!MSVC_CF! /D PICOLM_VIZ=1"
+    if not defined MSVC_PRINT_TIER echo   viz:  enabled ^(embedded VNC viewer^)
 )
 
 set "MSVC_LIBS=ws2_32.lib advapi32.lib"
@@ -272,8 +308,8 @@ if not defined NVCC goto cuda_missing
 
 for %%i in ("!NVCC!") do set "NVCC_DIR=%%~dpi"
 for %%i in ("!NVCC_DIR!..") do set "CUDA_ROOT=%%~fi"
-echo   nvcc: !NVCC!
-echo   cuda: !CUDA_ROOT!
+if not defined MSVC_PRINT_TIER echo   nvcc: !NVCC!
+if not defined MSVC_PRINT_TIER echo   cuda: !CUDA_ROOT!
 
 rem Extend the vcvars environment with CUDA's headers and import libs, and put
 rem the CUDA bin dir first so the runtime DLLs resolve when tests run.

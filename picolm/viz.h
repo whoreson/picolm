@@ -2,7 +2,17 @@
 #define PICOLM_VIZ_H
 
 #include <stdint.h>
+
+/* MSVC ships <stdatomic.h> (vcruntime_c11_stdatomic.h) but it #errors unless
+ * the translation unit is compiled with /std:c11, and the project is not.
+ * This header is included by every file with viz_push_layer calls, so using
+ * the compat shim here keeps them all compiling. MinGW has real headers, so
+ * the test is _MSC_VER, not _WIN32. */
+#if defined(_MSC_VER) && !defined(__cplusplus)
+#include "compat/msvc_c11_compat.h"
+#else
 #include <stdatomic.h>
+#endif
 
 typedef struct viz_thread_handle_t viz_thread_handle_t;
 

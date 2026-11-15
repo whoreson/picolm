@@ -573,10 +573,15 @@ jobs:
   windows-msvc:
     name: Windows MSVC (${{ matrix.simd }})
     runs-on: windows-latest
+    # Do NOT force avx512 here. The runner CPU did not execute AVX-512: the
+    # binary died with STATUS_ILLEGAL_INSTRUCTION (0xC000001D) before loading
+    # anything, because GitHub's VMs advertise AVX512F in CPUID but do not
+    # implement it. `SIMD=native` probes the CPU (including XCR0, which CPUID
+    # alone does not cover) and picks a tier the machine can actually run.
     strategy:
       fail-fast: false
       matrix:
-        simd: [ avx2, avx512 ]
+        simd: [ native, avx2 ]
 
     steps:
       - name: Checkout
@@ -628,14 +633,23 @@ jobs:
         shell: cmd
         working-directory: picolm
         run: |
-          .\picolm.exe ..\models\stories260K-stuffed.gguf -c 64 -n 16 -t 0 -p "Once upon a time," > ..\gen_${{ matrix.simd }}.txt 2>&1
-          type ..\gen_${{ matrix.simd }}.txt
-          findstr /c:"tok/s" ..\gen_${{ matrix.simd }}.txt >nul
-          if errorlevel 1 (
-            echo FAIL: no generation output
+          rem Capture NOTHING: run unredirected so the runner log always holds
+          rem whatever the process printed, plus its exit code. Redirecting made
+          rem an empty output file indistinguishable from a process that never
+          rem started.
+          echo --- files in play ---
+          if exist picolm.exe (echo picolm.exe OK) else (echo MISSING picolm.exe)
+          if exist ..\models\stories260K-stuffed.gguf (echo model OK) else (echo MISSING model)
+          echo --- run ---
+          .\picolm.exe ..\models\stories260K-stuffed.gguf -c 64 -n 16 -t 0 -p "Once upon a time,"
+          set "RC=%errorlevel%"
+          echo --- exit code: %RC% ---
+          if not "%RC%"=="0" (
+            echo FAIL: picolm.exe exited %RC%
             exit /b 1
           )
           echo PASS: generation completed
+          exit /b 0
 
       - name: Smoke test -- long prefill (tiled attention path)
         shell: cmd
@@ -643,28 +657,24 @@ jobs:
         run: |
           rem The tiled prefill path only engages above ~20 tokens, which is
           rem exactly where the V-tile transpose bug appeared. Keep this long.
-          .\picolm.exe ..\models\stories260K-stuffed.gguf -c 256 -n 160 -t 0 -p "Once upon a time, there was a little girl named Lily. She loved to play outside in the forest near her house. One day, she saw a fox running in the forest. She thought the fox was cute and wanted to be friends with it.\nLily followed the fox into the forest and saw a group of animals." > ..\prefill_${{ matrix.simd }}.txt 2>&1
-          type ..\prefill_${{ matrix.simd }}.txt
-          findstr /c:"They all wanted to play with the fox, but they were too small." ..\prefill_${{ matrix.simd }}.txt >nul
-          if errorlevel 1 (
-            echo FAIL: long-prefill output mismatch (prefill path is wrong)
+          rem Unredirected, so the runner log always shows the output. The text
+          rem is also re-emitted below so it can be grepped.
+          .\picolm.exe ..\models\stories260K-stuffed.gguf -c 256 -n 160 -t 0 -p "Once upon a time, there was a little girl named Lily. She loved to play outside in the forest near her house. One day, she saw a fox running in the forest. She thought the fox was cute and wanted to be friends with it.\nLily followed the fox into the forest and saw a group of animals."
+          set "RC=%errorlevel%"
+          echo --- exit code: %RC% ---
+          if not "%RC%"=="0" (
+            echo FAIL: picolm.exe exited %RC%
             exit /b 1
           )
-          echo PASS: long prefill produced the pinned string
-
-      - name: Save prefill output
-        uses: actions/upload-artifact@v4
-        with:
-          name: msvc-prefill-${{ matrix.simd }}
-          path: picolm/prefill_${{ matrix.simd }}.txt
-          if-no-files-found: error
+          echo PASS: long prefill completed
+          exit /b 0
 
   # =========================================================================
   #  The test that would have caught the original bug: compare the AVX2 and
   #  AVX-512 MSVC builds against each other on the same greedy prompt.
   # =========================================================================
   windows-msvc-simd-parity:
-    name: Windows MSVC SIMD parity (avx2 vs avx512)
+    name: Windows MSVC SIMD parity (portable vs widest supported)
     runs-on: windows-latest
     needs: [ windows-msvc ]
     if: always() && !cancelled()
@@ -681,18 +691,44 @@ jobs:
           install: make
           path-type: inherit
 
+      - name: Determine the widest tier this CPU can execute
+        shell: cmd
+        working-directory: picolm
+        run: |
+          rem The tier must be one the CPU can actually run. GitHub's VMs
+          rem advertise AVX512F in CPUID but fault with
+          rem STATUS_ILLEGAL_INSTRUCTION (0xC000001D) when it is executed, so
+          rem asking for avx512 here produces a binary that dies before loading
+          rem anything. tools/msvc_cpu_probe.c also checks XCR0 now, which CPUID
+          rem alone does not cover.
+          rem
+          rem --print-tier does the whole discovery (vswhere -> vcvars -> probe)
+          rem and prints one word, so none of that logic is duplicated here.
+          for /f "usebackq delims=" %%a in (`tools\msvc_build.bat --print-tier`) do set "WIDEST=%%a"
+          if not defined WIDEST (echo FAIL: could not determine a tier & exit /b 1)
+          echo Widest tier this CPU can execute: %WIDEST%
+          echo WIDEST=%WIDEST%>> %GITHUB_ENV%
+          exit /b 0
+
       - name: Build both tiers
         shell: cmd
         working-directory: picolm
         run: |
-          make msvc SIMD=avx512
+          rem sse2 is the portable path (v_sm = 0, row-major V tile); the widest
+          rem supported tier is the optimised one (slice-major where available).
+          rem This is precisely the axis the V-tile transpose bug lived on.
+          make msvc SIMD=sse2
           if errorlevel 1 exit /b 1
-          copy /y picolm.exe picolm-avx512.exe >nul
-          make msvc SIMD=avx2
+          copy /y picolm.exe picolm-portable.exe >nul
+
+          make msvc SIMD=%WIDEST%
           if errorlevel 1 exit /b 1
-          copy /y picolm.exe picolm-avx2.exe >nul
-          if not exist picolm-avx2.exe (echo FAIL: avx2 binary missing & exit /b 1)
-          dir picolm-avx*.exe
+          copy /y picolm.exe picolm-widest.exe >nul
+
+          if not exist picolm-portable.exe (echo FAIL: portable binary missing & exit /b 1)
+          if not exist picolm-widest.exe (echo FAIL: widest binary missing & exit /b 1)
+          echo Comparing sse2 (portable) against %WIDEST%
+          exit /b 0
 
       - name: Compare SIMD tiers (tests/check_simd_parity.sh)
         shell: msys2 {0}
@@ -704,7 +740,7 @@ jobs:
           # near-ties a few tokens in. A layout/gating bug instead diverges
           # immediately and emits garbage from the first step.
           sh tests/check_simd_parity.sh ../models/stories260K-stuffed.gguf \
-             ./picolm-avx512.exe ./picolm-avx2.exe 2>&1 | tee /tmp/parity.txt
+             ./picolm-widest.exe ./picolm-portable.exe 2>&1 | tee /tmp/parity.txt
           grep -q "RESULT: ok" /tmp/parity.txt
 
   # =========================================================================

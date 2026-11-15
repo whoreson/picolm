@@ -40,9 +40,19 @@ typedef int socklen_t;
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
+
+/* MSVC ships <stdatomic.h> but it #errors unless the TU is compiled with
+ * /std:c11 (vcruntime_c11_stdatomic.h: "C atomics require C11 or later"), and
+ * it has no <pthread.h> at all. compat/msvc_c11_compat.h supplies the subset
+ * this file uses, so viz.c stays single-source instead of growing a Windows
+ * dialect. MinGW has real headers, so this is keyed on _MSC_VER, not _WIN32. */
+#if defined(_MSC_VER) && !defined(__cplusplus)
+#include "compat/msvc_c11_compat.h"
+#else
 #include <pthread.h>
 #include <stdatomic.h>
-#include <time.h>
+#endif
 
 /* viz socket close: closesocket on Windows, close on POSIX */
 #ifdef _WIN32
@@ -328,7 +338,11 @@ static void vnc_write_u32_be(unsigned char *buf, uint32_t val) {
     buf[3] = (unsigned char)(val & 0xFF);
 }
 
+#if defined(_MSC_VER)
+static uint8_t  vnc_read_u8(const unsigned char *buf) { return buf[0]; }
+#else
 static uint8_t  __attribute__((unused)) vnc_read_u8(const unsigned char *buf) { return buf[0]; }
+#endif
 
 static uint16_t vnc_read_u16_be(const unsigned char *buf) {
     return ((uint16_t)buf[0] << 8) | (uint16_t)buf[1];
@@ -754,7 +768,11 @@ static int viz_draw_string(unsigned char *fb, int fb_w, int fb_h, int sx, int sy
 }
 
 /* Draw a filled rectangle in BGRA framebuffer. */
+#if defined(_MSC_VER)
+static void viz_draw_rect(unsigned char *fb, int fb_w, int x, int y,
+#else
 static void __attribute__((unused)) viz_draw_rect(unsigned char *fb, int fb_w, int x, int y,
+#endif
                           int w, int h, unsigned int col) {
     for (int dy = 0; dy < h; dy++) {
         for (int dx = 0; dx < w; dx++) {
