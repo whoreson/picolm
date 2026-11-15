@@ -72,3 +72,4 @@ test_r8dec_ref
 bench_ffn
 picolm_avx2
 test_glm5_pfa
+test_glm5_mla_splitkv

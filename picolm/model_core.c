@@ -1232,7 +1232,11 @@ int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv
          * Halves the bytes the decode attention pass streams. */
         s->glm5.mla_kv16 = NULL;
         {
+#ifdef GLM5_FAST_F16
             const char *e = getenv("PICOLM_GLM5_MLA_F16");
+#else
+            const char *e = "0";   /* no fast F16 conversion on this build: keep the F32 path */
+#endif
             if (!(e && atoi(e) == 0)) {
                 size_t n16 = (size_t)n_mla * c->max_seq_len * c->glm5_kv_lora;
                 s->glm5.mla_kv16 = (uint16_t *)malloc(n16 * sizeof(uint16_t));

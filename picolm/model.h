@@ -432,6 +432,14 @@ typedef struct {
  * arena in allocate_run_state() is sized for this many tokens; longer
  * prompts are chunked by model_forward_prefill_glm5(). 512 covers the
  * common case; the batching win is already captured at that point. */
+/* The decode attention reads an F16 shadow of the MLA latent cache. That only pays
+ * where F16 -> F32 is one instruction (AVX-512, or AVX2 + F16C); elsewhere it
+ * would be a scalar table lookup per element, slower than the F32 path it was
+ * meant to replace, so the shadow is not allocated and decode stays on F32. */
+#if defined(PICOLM_AVX512) || (defined(PICOLM_AVX2) && defined(__F16C__))
+#define GLM5_FAST_F16 1
+#endif
+
 #define GLM5_PREFILL_MAX_TOKENS 512
 
 typedef struct {

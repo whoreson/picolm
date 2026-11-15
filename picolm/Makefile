@@ -867,6 +867,13 @@ test_glm5_pfa: tests/test_glm5_pfa.c model_glm5.c model_moe.c model_ssm.c model_
 check-glm5-pfa: test_glm5_pfa
 	./test_glm5_pfa
 
+test_glm5_mla_splitkv: tests/test_glm5_mla_splitkv.c model_glm5.c model_moe.c model_ssm.c model_kv_cache.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) model.h
+	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O3 -o $@ tests/test_glm5_mla_splitkv.c model_moe.c model_ssm.c model_kv_cache.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
+
+.PHONY: check-glm5-mla-splitkv
+check-glm5-mla-splitkv: test_glm5_mla_splitkv
+	./test_glm5_mla_splitkv
+
 # DSA k-pool selector invariants (causal, bounded, sorted, deduped).
 test_glm5_dsa: tests/test_glm5_dsa.c model_glm5.c model_moe.c model_ssm.c model_kv_cache.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) model.h
 	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O2 -o $@ tests/test_glm5_dsa.c model_glm5.c model_moe.c model_ssm.c model_kv_cache.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
