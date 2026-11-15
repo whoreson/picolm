@@ -74,13 +74,15 @@ int sampler_sample(sampler_t *s, float *logits, int vocab_size) {
      * probabilities can differ from qsort's, so outputs are only identical for
      * distinct probabilities; logits after softmax are effectively never tied. */
     int k_limit = vocab_size;
-    if (s->top_k > 0 && s->top_k < vocab_size) k_limit = s->top_k;
+    int use_partial = s->top_k > 0 && s->top_k < vocab_size;
+    if (use_partial) k_limit = s->top_k;
 
     prob_index_t *sorted = (prob_index_t *)malloc((size_t)k_limit * sizeof(prob_index_t));
     if (!sorted) return 0;
-    {
-        /* Work on a copy of the probabilities so logits[] keeps its meaning and
-         * the untouched tail can be scanned without re-reading sorted[]. */
+    if (use_partial) {
+        /* Partial selection: O(vocab * k_limit) -- cheap when k_limit << vocab_size.
+         * When k_limit >= vocab_size this would be O(vocab^2), catastrophically
+         * slower than qsort's O(vocab * log vocab). Guard against it above. */
         float *work = (float *)malloc((size_t)vocab_size * sizeof(float));
         uint8_t *taken = (uint8_t *)calloc((size_t)vocab_size, 1);
         if (!work || !taken) { free(work); free(taken); free(sorted); return 0; }
@@ -96,6 +98,13 @@ int sampler_sample(sampler_t *s, float *logits, int vocab_size) {
             sorted[i].index = best;
         }
         free(work); free(taken);
+    } else {
+        /* Full sort: O(vocab * log vocab), always fast enough. */
+        for (int i = 0; i < vocab_size; i++) {
+            sorted[i].prob  = logits[i];
+            sorted[i].index = i;
+        }
+        qsort(sorted, (size_t)vocab_size, sizeof(prob_index_t), cmp_prob_desc);
     }
 
     /* 3. Apply top-k: already restricted above (k_limit entries in sorted[]). */
