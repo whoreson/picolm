@@ -1887,6 +1887,59 @@ static const uint8_t *attn_v16_shadow_build(const uint8_t *vcache, int total_pos
 #endif
 
 #if defined(PICOLM_AVX2) && defined(__FMA__)
+/* ---- slice-major PV availability: ONE source of truth ----------------------
+ *
+ * The tiled prefill chooses a V-tile LAYOUT (v_sm, in batch_tiled_task) and a
+ * PV CONSUMER kernel (in attn_process_tile) in two separate places. A tile laid
+ * out slice-major but consumed row-major is a silent transpose -- no crash, no
+ * NaN, just wrong numbers. That is exactly what shipped on MSVC/AVX2, where
+ * __FMA__ was undefined so every slice-major consumer compiled out while the
+ * producer still asked for slice-major.
+ *
+ * ATTN_PV_SM_OK is the single switch. It is 1 only if a slice-major consumer is
+ * actually compiled into this build. Both the producer (v_sm) and the consumer
+ * chain read it, so the two cannot drift apart again.
+ *
+ * Consumers, exactly two:
+ *   attn_pv_sm_avx512  -- PICOLM_AVX512            (no FMA needed)
+ *   attn_pv_sm_avx2    -- PICOLM_AVX2 && __FMA__   (uses _mm256_fmadd_ps)
+ *
+ * Nothing here is x86-specific at the top level: on DOS/DJGPP, PPC, Alpha,
+ * ARM etc. none of the terms are defined and ATTN_PV_SM_OK is 0, so v_sm is 0
+ * and the portable row-major path runs -- behaviour identical to before.
+ * ------------------------------------------------------------------------- */
+#if defined(PICOLM_AVX512)
+#  define ATTN_PV_SM_OK 1
+#elif defined(PICOLM_AVX2) && defined(__FMA__)
+#  define ATTN_PV_SM_OK 1
+#else
+#  define ATTN_PV_SM_OK 0
+#endif
+
+/* Compile-time tripwire for the exact misconfiguration that caused this bug.
+ *
+ * An x86 AVX2 build without __FMA__ has PICOLM_AVX2 set (so the tiled prefill
+ * runs) but cannot compile the _mm256_fmadd_ps slice-major consumer. Before
+ * ATTN_PV_SM_OK existed that combination silently fell through to the
+ * row-major kernel and transposed every V tile. Now v_sm is forced to 0, so it
+ * is merely SLOW -- but it is still almost certainly a build-flag mistake
+ * (MSVC /arch:AVX2 defines __AVX2__ but not __FMA__; quant.h has a shim for
+ * that), so refuse to build rather than quietly lose the fast path.
+ *
+ * C89-safe: a negative array size is a hard error in every C compiler we
+ * target (MSVC, gcc 3.x/4.x, DJGPP, Alpha cc) -- no _Static_assert (C11) and
+ * no __builtin_* needed. Zero runtime cost. Not a preprocessor #error so the
+ * file stays one translation unit regardless of how the check evolves. */
+#if defined(PICOLM_AVX2) && !defined(__FMA__)
+typedef char attn_avx2_requires_fma_msvc_arch_avx2_defines_no_FMA_macro[-1];
+#endif
+
+/* And assert ATTN_PV_SM_OK is 1 exactly when a consumer exists, so the two
+ * cannot drift if a third consumer is ever added. */
+#if ATTN_PV_SM_OK != 1 && (defined(PICOLM_AVX512) || (defined(PICOLM_AVX2) && defined(__FMA__)))
+typedef char attn_pv_sm_ok_must_be_1[-1];
+#endif
+
 /* ---- slice-major PV multiply, AVX2 -----------------------------------------
  *
  * The tiled path hands this code a V tile in ONE of two layouts, chosen by
@@ -2260,9 +2313,16 @@ static void batch_tiled_task(int task_idx, void *ctx_ptr) {
             }
         }
 
-#if defined(PICOLM_AVX512)
+        /* v_sm asks attn_v_prep_run() for a slice-major V tile. It must only be
+         * set when THIS build has a slice-major PV consumer, otherwise the
+         * generic row-major fallback in attn_process_tile() reads the tile
+         * transposed -- silent, no NaN, no OOB case, just garbled text. Keep the
+         * two sides structurally linked: ATTN_PV_SM_OK is defined in exactly one
+         * place and consulted by both. Do NOT reintroduce a hand-written
+         * per-tier condition here. */
+#if ATTN_PV_SM_OK && defined(PICOLM_AVX512)
         const int v_sm = (head_dim % 16 == 0 && head_dim <= 512);
-#elif defined(PICOLM_AVX2)
+#elif ATTN_PV_SM_OK && defined(PICOLM_AVX2)
         const int v_sm = (head_dim % 8 == 0 && head_dim <= 512);
 #else
         const int v_sm = 0;
@@ -3303,7 +3363,7 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32) {
                 }
             }
         }
-#elif defined(PICOLM_AVX2) && defined(__FMA__)
+#elif ATTN_PV_SM_OK && defined(PICOLM_AVX2)
         /* AVX2 PV multiply. Two layouts, selected by t->v_sm -- see
          * attn_pv_sm_avx2() for why this dispatch is mandatory. */
         if (t->v_sm) {
