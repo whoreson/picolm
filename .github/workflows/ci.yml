@@ -593,9 +593,20 @@ jobs:
       - name: Show toolchain
         shell: cmd
         run: |
+          rem Informational only: never fail the job from here. In cmd, `where X`
+          rem returns 1 when X is absent and `echo` does NOT reset errorlevel, so
+          rem `where cl || echo ...` still exits 1 and kills the step. `cl` is
+          rem genuinely absent at this point (vcvars64.bat is run inside the
+          rem build script), so this is the expected state, not an error.
           where make
           make --version
-          where cl || echo "cl not on PATH yet (expected; vcvars is run inside the build)"
+          where cl >nul 2>&1
+          if errorlevel 1 (
+            echo cl not on PATH yet ^(expected: vcvars64.bat runs inside the build^)
+          ) else (
+            where cl
+          )
+          exit /b 0
 
       - name: Selftest (toolchain + SIMD + cwd assumptions)
         shell: cmd
@@ -610,6 +621,7 @@ jobs:
         run: |
           make msvc SIMD=${{ matrix.simd }}
           if errorlevel 1 exit /b 1
+          if not exist picolm.exe (echo FAIL: picolm.exe not produced & exit /b 1)
           dir picolm.exe
 
       - name: Smoke test -- generation (greedy, deterministic)
@@ -679,6 +691,7 @@ jobs:
           make msvc SIMD=avx2
           if errorlevel 1 exit /b 1
           copy /y picolm.exe picolm-avx2.exe >nul
+          if not exist picolm-avx2.exe (echo FAIL: avx2 binary missing & exit /b 1)
           dir picolm-avx*.exe
 
       - name: Compare SIMD tiers (tests/check_simd_parity.sh)
