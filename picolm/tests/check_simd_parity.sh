@@ -79,7 +79,18 @@ for mode in $CASES; do
             fail=1
             continue 2
         fi
-        sed -n 's/^OUTPUT: //p' "$TMP/$mode-$bin.log" | tail -1 >"$TMP/$mode-$bin.out"
+        # The generated text starts on the same line as "OUTPUT: " on Linux but
+        # on the NEXT line on Windows, because the first token there is often a
+        # leading newline. Taking the whole tail after the marker (joined into
+        # one line) works on both. Strip CRs first so a Windows build's line
+        # endings do not make an otherwise identical prefix compare unequal.
+        sed -n '/^OUTPUT: /,$p' "$TMP/$mode-$bin.log" \
+            | sed 's/^OUTPUT: //' \
+            | tr -d '\r' \
+            | grep -v '^Memory:' \
+            | tr '\n' ' ' \
+            | sed 's/  */ /g; s/ *$//' >"$TMP/$mode-$bin.out"
+
     done
 
     # Compare a PREFIX, not the whole string. Different SIMD widths legitimately
