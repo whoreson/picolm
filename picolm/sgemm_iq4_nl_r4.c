@@ -45,6 +45,18 @@
 #include <arm_neon.h>
 #endif
 #include "quant.h"
+/* F16C has no scalar f16->f32 convert. _cvtsh_ss() is an AVX512-FP16
+ * intrinsic (__AVX512FP16__) and must not be used under a bare __F16C__
+ * guard: GCC tolerates it when AVX-512 is also on, MSVC with /arch:AVX2
+ * does not (LNK2019 _cvtsh_ss). Convert one lane through the real F16C
+ * instruction instead. */
+static inline float f16c_cvt1(uint16_t h) {
+#if defined(__F16C__)
+    return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int)(unsigned)h)));
+#else
+    return fp16_to_fp32(h);
+#endif
+}
 
 /* Column tile. NEON streams 22 columns per decoded weight block; the AVX2 driver's switch(nc) only has
  * 1..4-column tiles (default = 4), so its tile MUST stay 4: with a larger value nc>4 left res[4..nc-1]
@@ -66,7 +78,7 @@
 
 static inline float iq4r4_f16(uint16_t h) {
 #if defined(__F16C__)
-    return _cvtsh_ss(h);
+    return f16c_cvt1(h);
 #else
     return fp16_to_fp32_lookup(h);
 #endif

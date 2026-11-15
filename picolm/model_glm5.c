@@ -1461,7 +1461,8 @@ static void glm5_mla_shadow_sync(const run_state_t *s, int max_seq, int KVL,
 }
 
 #if defined(PICOLM_AVX512)
-/* F16 -> F32 for 16 lanes; cvtsh_ss needs F16C, which AVX-512 implies. */
+/* F16 -> F32 for 16 lanes via _mm512_cvtph_ps (F16C + AVX-512F).
+ * (Not _cvtsh_ss: that one is AVX512-FP16, a different ISA extension.) */
 static inline __m512 glm5_f16x16_to_ps(const uint16_t *p) {
     return _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)p));
 }

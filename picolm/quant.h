@@ -54,6 +54,56 @@
 #endif
 #endif
 
+/* Atomic compatibility: GCC builtins vs MSVC Interlocked.
+ * GCC 4.7+ has __atomic_fetch_add/__atomic_store_n natively.
+ * MSVC uses InterlockedExchangeAdd/InterlockedExchange.
+ * Older GCC and other compilers fall back to plain operations
+ * (unsafe for multi-threaded, but acceptable on single-core/embedded). */
+#if defined(__GNUC__) && (__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 7))
+#define PICOLM_ATOMIC_FETCH_ADD(p, v) __atomic_fetch_add((p), (v), __ATOMIC_RELAXED)
+#define PICOLM_ATOMIC_ADD_FETCH(p, v) __atomic_add_fetch((p), (v), __ATOMIC_SEQ_CST)
+#define PICOLM_ATOMIC_SUB_FETCH(p, v) __atomic_sub_fetch((p), (v), __ATOMIC_SEQ_CST)
+#define PICOLM_ATOMIC_LOAD(p)         __atomic_load_n((p), __ATOMIC_ACQUIRE)
+#define PICOLM_ATOMIC_LOAD_SEQCST(p)  __atomic_load_n((p), __ATOMIC_SEQ_CST)
+#define PICOLM_ATOMIC_STORE(p, v)     __atomic_store_n((p), (v), __ATOMIC_SEQ_CST)
+#define PICOLM_ATOMIC_STORE_RELAXED(p, v) __atomic_store_n((p), (v), __ATOMIC_RELAXED)
+/* GCC 4.7+ handles any type natively, so 64-bit macros alias the 32-bit ones */
+#define PICOLM_ATOMIC_FETCH_ADD64(p, v) PICOLM_ATOMIC_FETCH_ADD(p, v)
+#define PICOLM_ATOMIC_ADD_FETCH64(p, v) PICOLM_ATOMIC_ADD_FETCH(p, v)
+#define PICOLM_ATOMIC_LOAD64(p)         PICOLM_ATOMIC_LOAD(p)
+#define PICOLM_ATOMIC_LOAD64_SEQCST(p)  PICOLM_ATOMIC_LOAD_SEQCST(p)
+#define PICOLM_ATOMIC_STORE64(p, v)     PICOLM_ATOMIC_STORE(p, v)
+#elif defined(_MSC_VER)
+#include <intrin.h>
+#define PICOLM_ATOMIC_FETCH_ADD(p, v) ((int)_InterlockedExchangeAdd((volatile long *)(p), (long)(v)))
+#define PICOLM_ATOMIC_ADD_FETCH(p, v) ((int)_InterlockedExchangeAdd((volatile long *)(p), (long)(v)) + (int)(v))
+#define PICOLM_ATOMIC_SUB_FETCH(p, v) ((int)_InterlockedExchangeAdd((volatile long *)(p), -(long)(v)) - (int)(v))
+#define PICOLM_ATOMIC_LOAD(p)         (*(const volatile int *)(p))
+#define PICOLM_ATOMIC_LOAD_SEQCST(p)  (*(const volatile int *)(p))
+#define PICOLM_ATOMIC_STORE(p, v)     ((*(volatile int *)(p)) = (int)(v))
+#define PICOLM_ATOMIC_STORE_RELAXED(p, v) ((*(volatile int *)(p)) = (int)(v))
+/* 64-bit atomic operations for pool_done (monotonic counter) */
+#define PICOLM_ATOMIC_FETCH_ADD64(p, v) ((long long)_InterlockedExchangeAdd64((volatile long long *)(p), (long long)(v)))
+#define PICOLM_ATOMIC_ADD_FETCH64(p, v) ((long long)_InterlockedExchangeAdd64((volatile long long *)(p), (long long)(v)) + (long long)(v))
+#define PICOLM_ATOMIC_LOAD64(p)         (*(const volatile long long *)(p))
+#define PICOLM_ATOMIC_LOAD64_SEQCST(p)  (*(const volatile long long *)(p))
+#define PICOLM_ATOMIC_STORE64(p, v)     ((*(volatile long long *)(p)) = (long long)(v))
+#else
+#define PICOLM_ATOMIC_FETCH_ADD(p, v) ((*(p)) += (int)(v), (*(p) - (int)(v)))
+#define PICOLM_ATOMIC_ADD_FETCH(p, v) ((*(p)) += (int)(v))
+#define PICOLM_ATOMIC_SUB_FETCH(p, v) ((*(p)) -= (int)(v))
+#define PICOLM_ATOMIC_LOAD(p)         (*(p))
+#define PICOLM_ATOMIC_LOAD_SEQCST(p)  (*(p))
+#define PICOLM_ATOMIC_STORE(p, v)     ((*(p)) = (int)(v))
+#define PICOLM_ATOMIC_STORE_RELAXED(p, v) ((*(p)) = (int)(v))
+/* Fallback 64-bit macros */
+#define PICOLM_ATOMIC_FETCH_ADD64(p, v) ((*(p)) += (long long)(v), (*(p) - (long long)(v)))
+#define PICOLM_ATOMIC_ADD_FETCH64(p, v) ((*(p)) += (long long)(v))
+#define PICOLM_ATOMIC_LOAD64(p)         (*(p))
+#define PICOLM_ATOMIC_LOAD64_SEQCST(p)  (*(p))
+#define PICOLM_ATOMIC_STORE64(p, v)     ((*(p)) = (long long)(v))
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -227,6 +277,44 @@ static inline void f32x4_to_fp16_hw(uint16_t *p, float32x4_t v) {
 }
 #endif
 
+/* --- MSVC feature-macro shim ------------------------------------------------
+ *
+ * MSVC only predefines __AVX__, __AVX2__ and __AVX512F__ for its /arch switch.
+ * It never defines the GCC-style sub-feature macros, even though the same
+ * /arch level enables those instructions and MSVC's <immintrin.h> exposes the
+ * intrinsics for them:
+ *
+ *   /arch:AVX2   ->  FMA3 (__FMA__)  and  F16C (__F16C__)
+ *
+ * Every `#if defined(__FMA__)` / `defined(__F16C__)` gate in this codebase then
+ * evaluates false on MSVC, silently compiling whole SIMD kernels out. That is
+ * not a performance-only problem: the guards also pick the *layout variant*
+ * a kernel expects. On MSVC/AVX2 the tiled prefill still asked
+ * attn_v_prep_run() for a slice-major V tile (v_sm=1, head_dim % 8 == 0) while
+ * the PV multiply fell through every `&& defined(__FMA__)` branch to the
+ * generic row-major loop -- reading the tile transposed. Result: garbled
+ * output on any prefill batch long enough to engage the tiled path, while the
+ * /arch:AVX512 build was fine. tests/check_simd_parity.sh flags it immediately.
+ *
+ * Defining them here (before any use) makes MSVC builds select the same code
+ * as GCC -mavx2 -mfma -mf16c. Verified: /arch:AVX2 accepts _mm256_fmadd_ps
+ * and _mm256_cvtph_ps and produces correct results.
+ *
+ * Note AVX-512 VNNI is deliberately NOT implied: /arch:AVX512 does not enable
+ * VNNI. MSVC defines __AVX512VNNI__ only for /arch:AVX512(later) targets that
+ * actually have it, and PICOLM_VNNI stays gated on that.
+ * ------------------------------------------------------------------------- */
+#if defined(_MSC_VER) && !defined(__CUDACC__) && !defined(__HIP_DEVICE_COMPILE__)
+#  if defined(__AVX2__) || defined(__AVX512F__)
+#    ifndef __FMA__
+#      define __FMA__ 1
+#    endif
+#    ifndef __F16C__
+#      define __F16C__ 1
+#    endif
+#  endif
+#endif
+
 /* --- x86 SIMD: detect highest level, then propagate downward --- */
 /* Never enable x86 SIMD intrinsics in CUDA/HIP device code */
 #if !defined(__CUDACC__) && !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_VERSION__)
@@ -266,6 +354,55 @@ static inline void f32x4_to_fp16_hw(uint16_t *p, float32x4_t v) {
 #  define PICOLM_SSE2 1
 #endif
 #endif /* !__CUDA__ && !__HIP__ */
+
+/* ---- /arch consistency guard ----------------------------------------------
+ *
+ * PICOLM_* can be set two ways: derived from the compiler's predefined macros
+ * above, or force-defined on the command line (-D PICOLM_AVX2=1). Force-defining
+ * is what the Windows targets do, and if it disagrees with what the compiler was
+ * actually told to generate (/arch:, -march=) the result is NOT a slowdown but
+ * wrong code: kernels gated on the macro get compiled with intrinsics the
+ * compiler will not emit, and others silently drop out, changing which code
+ * path a data layout is paired with. That is how the MSVC/AVX2 V-tile transpose
+ * shipped.
+ *
+ * So: refuse to build on a mismatch. #error is C89 and works on every compiler
+ * we target (MSVC, gcc 3.x/4.x, DJGPP, Alpha cc, PPC gcc 4.0) -- unlike
+ * _Static_assert, which is C11.  These blocks are all no-ops on non-x86 targets
+ * (DOS/DJGPP sets PICOLM_DOS, PPC only sets PICOLM_ALTIVEC, Alpha sets none).
+ *
+ * Only checked when the compiler can tell us: MSVC's predefined macros are the
+ * ones that lie (it defines __AVX2__ but not __FMA__/__F16C__; see the shim at
+ * the top of this file), so a command-line -D PICOLM_AVX2 without a matching
+ * /arch:AVX2 is always a mistake.
+ * ------------------------------------------------------------------------- */
+#if defined(_MSC_VER)
+#  if defined(PICOLM_AVX512) && !defined(__AVX512F__)
+#    error "PICOLM_AVX512 is defined but cl.exe was not given /arch:AVX512"
+#  endif
+#  if defined(PICOLM_AVX2) && !defined(__AVX2__)
+#    error "PICOLM_AVX2 is defined but cl.exe was not given /arch:AVX2 (or /arch:AVX512)"
+#  endif
+#  if defined(PICOLM_AVX) && !defined(__AVX__)
+#    error "PICOLM_AVX is defined but cl.exe was not given /arch:AVX or higher"
+#  endif
+#endif
+/* Same idea for GCC/Clang, but only when the user clearly selected a -march
+ * tier: __AVX2__ absent while PICOLM_AVX2 was force-defined. Guarded on
+ * __GNUC__ so DOS/DJGPP (which defines __GNUC__ but has no AVX at all) is
+ * excluded via PICOLM_DOS. */
+#if defined(__GNUC__) && !defined(PICOLM_DOS) && !defined(__CUDACC__) && \
+    !defined(__HIP_DEVICE_COMPILE__) && !defined(__HIPCC_VERSION__)
+#  if defined(PICOLM_AVX512) && !defined(__AVX512F__)
+#    error "PICOLM_AVX512 is defined but the compiler was not given -mavx512f"
+#  endif
+#  if defined(PICOLM_AVX2) && !defined(__AVX2__)
+#    error "PICOLM_AVX2 is defined but the compiler was not given -mavx2"
+#  endif
+#  if defined(PICOLM_FMA) && !defined(__FMA__)
+#    error "PICOLM_FMA is defined but the compiler was not given -mfma"
+#  endif
+#endif
 
 /* FMA3 (FMA) detection -- independent of AVX level.
  * AMD Piledriver (FX-8350 etc.) has AVX+FMA but no AVX2.
