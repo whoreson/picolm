@@ -556,3 +556,179 @@ jobs:
             exit 1
           fi
           echo "PASS: Build completed with strict warnings (no errors)"
+
+  # =========================================================================
+  #  Windows MSVC (native, driven by tools/msvc_build.bat via `make msvc`)
+  #
+  #  This is the configuration that shipped a silent, deterministic
+  #  wrong-output bug: MSVC does not define __FMA__/__F16C__ for /arch:AVX2, so
+  #  every slice-major PV consumer compiled out while the V-tile producer still
+  #  asked for slice-major. Result was garbled text on long prefills, AVX-512
+  #  fine, no crash and no warning. Only a cross-TIER comparison catches that,
+  #  which is why simd-parity below is not optional.
+  #
+  #  MSYS2 appears here ONLY to provide GNU make. The build itself runs through
+  #  cmd.exe exactly as a user would: no sh.exe, no MSYS2 toolchain on PATH.
+  # =========================================================================
+  windows-msvc:
+    name: Windows MSVC (${{ matrix.simd }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        simd: [ avx2, avx512 ]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install GNU make
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: make
+          path-type: inherit
+
+      - name: Show toolchain
+        shell: cmd
+        run: |
+          where make
+          make --version
+          where cl || echo "cl not on PATH yet (expected; vcvars is run inside the build)"
+
+      - name: Selftest (toolchain + SIMD + cwd assumptions)
+        shell: cmd
+        working-directory: picolm
+        run: |
+          make msvc-selftest SIMD=${{ matrix.simd }}
+          if errorlevel 1 exit /b 1
+
+      - name: Build
+        shell: cmd
+        working-directory: picolm
+        run: |
+          make msvc SIMD=${{ matrix.simd }}
+          if errorlevel 1 exit /b 1
+          dir picolm.exe
+
+      - name: Smoke test -- generation (greedy, deterministic)
+        shell: cmd
+        working-directory: picolm
+        run: |
+          .\picolm.exe ..\models\stories260K-stuffed.gguf -c 64 -n 16 -t 0 -p "Once upon a time," > ..\gen_${{ matrix.simd }}.txt 2>&1
+          type ..\gen_${{ matrix.simd }}.txt
+          findstr /c:"tok/s" ..\gen_${{ matrix.simd }}.txt >nul
+          if errorlevel 1 (
+            echo FAIL: no generation output
+            exit /b 1
+          )
+          echo PASS: generation completed
+
+      - name: Smoke test -- long prefill (tiled attention path)
+        shell: cmd
+        working-directory: picolm
+        run: |
+          rem The tiled prefill path only engages above ~20 tokens, which is
+          rem exactly where the V-tile transpose bug appeared. Keep this long.
+          .\picolm.exe ..\models\stories260K-stuffed.gguf -c 256 -n 160 -t 0 -p "Once upon a time, there was a little girl named Lily. She loved to play outside in the forest near her house. One day, she saw a fox running in the forest. She thought the fox was cute and wanted to be friends with it.\nLily followed the fox into the forest and saw a group of animals." > ..\prefill_${{ matrix.simd }}.txt 2>&1
+          type ..\prefill_${{ matrix.simd }}.txt
+          findstr /c:"They all wanted to play with the fox, but they were too small." ..\prefill_${{ matrix.simd }}.txt >nul
+          if errorlevel 1 (
+            echo FAIL: long-prefill output mismatch (prefill path is wrong)
+            exit /b 1
+          )
+          echo PASS: long prefill produced the pinned string
+
+      - name: Save prefill output
+        uses: actions/upload-artifact@v4
+        with:
+          name: msvc-prefill-${{ matrix.simd }}
+          path: picolm/prefill_${{ matrix.simd }}.txt
+          if-no-files-found: error
+
+  # =========================================================================
+  #  The test that would have caught the original bug: compare the AVX2 and
+  #  AVX-512 MSVC builds against each other on the same greedy prompt.
+  # =========================================================================
+  windows-msvc-simd-parity:
+    name: Windows MSVC SIMD parity (avx2 vs avx512)
+    runs-on: windows-latest
+    needs: [ windows-msvc ]
+    if: always() && !cancelled()
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install GNU make and bash
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: make
+          path-type: inherit
+
+      - name: Build both tiers
+        shell: cmd
+        working-directory: picolm
+        run: |
+          make msvc SIMD=avx512
+          if errorlevel 1 exit /b 1
+          copy /y picolm.exe picolm-avx512.exe >nul
+          make msvc SIMD=avx2
+          if errorlevel 1 exit /b 1
+          copy /y picolm.exe picolm-avx2.exe >nul
+          dir picolm-avx*.exe
+
+      - name: Compare SIMD tiers (tests/check_simd_parity.sh)
+        shell: msys2 {0}
+        working-directory: picolm
+        run: |
+          set -e
+          # Compares a PREFIX, not the whole string: different SIMD widths
+          # legitimately accumulate in a different order, which flips genuine
+          # near-ties a few tokens in. A layout/gating bug instead diverges
+          # immediately and emits garbage from the first step.
+          sh tests/check_simd_parity.sh ../models/stories260K-stuffed.gguf \
+             ./picolm-avx512.exe ./picolm-avx2.exe 2>&1 | tee /tmp/parity.txt
+          grep -q "RESULT: ok" /tmp/parity.txt
+
+  # =========================================================================
+  #  MSVC CPU-only smoke on the second test model, to cover the R4 path.
+  # =========================================================================
+  windows-msvc-r4:
+    name: Windows MSVC (R4 model)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install GNU make
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: make
+          path-type: inherit
+
+      - name: Build
+        shell: cmd
+        working-directory: picolm
+        run: |
+          make msvc
+          if errorlevel 1 exit /b 1
+
+      - name: Smoke test -- R4 model
+        shell: cmd
+        working-directory: picolm
+        run: |
+          .\picolm.exe ..\models\stories260K-r4.gguf -c 64 -n 16 -t 0 -p "Once upon a time," > ..\r4.txt 2>&1
+          type ..\r4.txt
+          findstr /c:"tok/s" ..\r4.txt >nul
+          if errorlevel 1 (
+            echo FAIL: R4 model generation failed
+            exit /b 1
+          )
+          echo PASS: R4 model generation completed
