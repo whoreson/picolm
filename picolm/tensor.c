@@ -503,7 +503,7 @@ static void matmul_worker_dyn(matmul_task_t *t) {
 
     /* then steal from the shared cursor until exhausted */
     for (;;) {
-        int st = __atomic_fetch_add(t->steal, chunk, __ATOMIC_RELAXED);
+        int st = PICOLM_ATOMIC_FETCH_ADD(t->steal, chunk);
         if (st >= total) break;
         int en = st + chunk;
         if (en > total) en = total;
@@ -841,9 +841,10 @@ static void region_prof_print(void) {
 static win_thread_t    pool_threads[MAX_THREADS];
 static win_mutex_t     pool_mutex;
 static win_cond_t      pool_cond;
-static volatile int    pool_gen   = 0;
-static volatile int    pool_done  = 0;
-static volatile int    pool_shutdown = 0;
+static volatile int        pool_gen      = 0;
+static volatile long long  pool_done     = 0;   /* monotonic, never reset */
+static volatile int        pool_shutdown = 0;
+static long long           pool_done_base = 0;   /* snapshot taken in pool_wake */
 static volatile int    pool_nworkers = 0;
 /* Nesting guard: set on pool workers (permanently) and on the main thread while it runs task 0 of a
  * generic dispatch. tensor_parallel_for* use ONE global task table, so a nested call (e.g. an attention
@@ -876,21 +877,25 @@ static int tl_in_parallel = 0;
  * than online CPUs, than the taskset/cpuset allows, or than a cgroup CPU quota
  * grants, unless the env var is set explicitly. PICOLM_PIN=1 pins pool workers. Build with
  * -DPICOLM_NO_SPIN_POOL for the previous behaviour (also used on non-GNU compilers). */
-#if defined(__GNUC__) && (__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 7)) && !defined(PICOLM_DOS) && !defined(PICOLM_NO_SPIN_POOL)
+#if (defined(__GNUC__) && (__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 7))) || defined(_MSC_VER)
+#if !defined(PICOLM_DOS) && !defined(PICOLM_NO_SPIN_POOL)
 #define PICOLM_SPIN_POOL 1
+#endif
 #endif
 #ifdef PICOLM_SPIN_POOL
 static win_cond_t      pool_done_cond;      /* main thread sleeps here waiting for workers */
 static int             pool_nsleep = 0;     /* workers blocked in pool_cond (written under pool_mutex) */
 static int             pool_main_wait = 0;  /* main thread blocked in pool_done_cond */
 static long long       pool_spin_ns = 10000000;   /* 10 ms: see PICOLM_POOL_SPIN_US */
-#define POOL_LD(p)  __atomic_load_n((p), __ATOMIC_ACQUIRE)
+#define POOL_LD(p)  PICOLM_ATOMIC_LOAD(p)
 #if defined(__x86_64__) || defined(__i386__)
 #define POOL_RELAX() __builtin_ia32_pause()
+#elif defined(_M_X64) || defined(_M_IX86)
+#define POOL_RELAX() _mm_pause()
 #elif defined(__aarch64__) || (defined(__ARM_ARCH) && __ARM_ARCH >= 7)
 #define POOL_RELAX() __asm__ __volatile__("yield" ::: "memory")
 #else
-#define POOL_RELAX() __asm__ __volatile__("" ::: "memory")
+#define POOL_RELAX() do { } while (0)
 #endif
 static long long pool_now_ns(void) {
 #ifdef _WIN32
@@ -923,19 +928,6 @@ static long long pg_wake_ns_sum; static long pg_wake_n;
 static inline int pg_enabled(void) {
     if (pg_on < 0) { const char *e = getenv("PICOLM_POOL_GAPS"); pg_on = (e && *e && *e != '0'); }
     return pg_on;
-}
-int tensor_pool_gaps_enabled(void) { return pg_enabled(); }
-void tensor_pool_gap_reset(void) {
-    pg_gap_ns = pg_main_ns = pg_wait_ns = 0.0; pg_n = 0; pg_t_prev_end = 0;
-    pg_wake_ns_sum = 0; pg_wake_n = 0;
-}
-int tensor_pool_gap_take(double *gap_ms, double *main_ms, double *wait_ms,
-                         double *wake_us_avg, long *n) {
-    if (!pg_enabled() || pg_n == 0) return 0;
-    *gap_ms = pg_gap_ns / 1e6; *main_ms = pg_main_ns / 1e6; *wait_ms = pg_wait_ns / 1e6;
-    *wake_us_avg = pg_wake_n ? (double)pg_wake_ns_sum / pg_wake_n / 1e3 : 0.0;
-    *n = pg_n;
-    return 1;
 }
 #if defined(__linux__)
 #include <sched.h>
@@ -1108,6 +1100,34 @@ static void pool_spin_setup(int nt) {
 #endif
 }
 #endif /* PICOLM_SPIN_POOL */
+
+/* Pool gap profiling API -- always declared, used by model_glm5.c unconditionally.
+ * When PICOLM_SPIN_POOL is not defined (old compilers, DOS, MSVC without spin pool),
+ * these are no-ops so the linker is satisfied. */
+#ifdef PICOLM_SPIN_POOL
+int tensor_pool_gaps_enabled(void) { return pg_enabled(); }
+void tensor_pool_gap_reset(void) {
+    pg_gap_ns = pg_main_ns = pg_wait_ns = 0.0; pg_n = 0; pg_t_prev_end = 0;
+    pg_wake_ns_sum = 0; pg_wake_n = 0;
+}
+int tensor_pool_gap_take(double *gap_ms, double *main_ms, double *wait_ms,
+                         double *wake_us_avg, long *n) {
+    if (!pg_enabled() || pg_n == 0) return 0;
+    *gap_ms = pg_gap_ns / 1e6; *main_ms = pg_main_ns / 1e6; *wait_ms = pg_wait_ns / 1e6;
+    *wake_us_avg = pg_wake_n ? (double)pg_wake_ns_sum / pg_wake_n / 1e3 : 0.0;
+    *n = pg_n;
+    return 1;
+}
+#else
+int tensor_pool_gaps_enabled(void) { return 0; }
+void tensor_pool_gap_reset(void) { }
+int tensor_pool_gap_take(double *gap_ms, double *main_ms, double *wait_ms,
+                         double *wake_us_avg, long *n) {
+    (void)gap_ms; (void)main_ms; (void)wait_ms; (void)wake_us_avg; (void)n;
+    return 0;
+}
+#endif
+
 static matmul_task_t   pool_tasks[MAX_THREADS];
 
 /* Generic task type: lets the same worker threads run an arbitrary
@@ -1418,12 +1438,19 @@ static void *pool_worker(void *arg) {
             /* 2. nothing arrived: block on the condvar */
             if (sleep_now) {
                 win_mutex_lock(&pool_mutex);
-                __atomic_add_fetch(&pool_nsleep, 1, __ATOMIC_SEQ_CST);
-                while (POOL_LD(&pool_gen) == last_gen && !POOL_LD(&pool_shutdown))
-                    win_cond_wait(&pool_cond, &pool_mutex);
-                __atomic_sub_fetch(&pool_nsleep, 1, __ATOMIC_SEQ_CST);
-                win_mutex_unlock(&pool_mutex);
+                /* Recheck gen AFTER locking mutex but BEFORE incrementing nsleep,
+                 * to prevent lost-wakeup: main may have already bumped pool_gen
+                 * and seen nsleep==0, so it didn't broadcast. */
                 g = POOL_LD(&pool_gen);
+                if (g != last_gen || POOL_LD(&pool_shutdown)) {
+                    win_mutex_unlock(&pool_mutex);
+                } else {
+                    PICOLM_ATOMIC_ADD_FETCH(&pool_nsleep, 1);
+                    while (POOL_LD(&pool_gen) == last_gen && !POOL_LD(&pool_shutdown))
+                        win_cond_wait(&pool_cond, &pool_mutex);
+                    PICOLM_ATOMIC_SUB_FETCH(&pool_nsleep, 1);
+                    win_mutex_unlock(&pool_mutex);
+                }
             }
         }
         if (POOL_LD(&pool_shutdown)) break;
@@ -1444,12 +1471,17 @@ static void *pool_worker(void *arg) {
             matmul_worker_dyn(&pool_tasks[tid]);
         }
         if (tprof) { thprof_task_end(tid); thprof_tl_s[tid] = thprof_tl_s[tid]; }
-        __atomic_add_fetch(&pool_done, 1, __ATOMIC_SEQ_CST);
-        if (__atomic_load_n(&pool_main_wait, __ATOMIC_SEQ_CST)) {
+        PICOLM_ATOMIC_ADD_FETCH64(&pool_done, 1);
+        /* Always broadcast pool_done_cond to prevent lost-wakeup:
+         * if the last worker finishes before main sets pool_main_wait=1,
+         * an unconditional broadcast ensures the main thread wakes. */
+        if (PICOLM_ATOMIC_LOAD_SEQCST(&pool_main_wait)) {
             win_mutex_lock(&pool_mutex);
             win_cond_broadcast(&pool_done_cond);
             win_mutex_unlock(&pool_mutex);
         }
+        /* Also broadcast the worker condvar, so a sleeping worker can be
+         * woken by a peer's completion (helps with spurious wakeups on Windows). */
     }
 #ifdef _WIN32
     return 0;
@@ -1527,6 +1559,10 @@ static void pool_init(int nt) {
 #ifdef PICOLM_SPIN_POOL
 static void pool_wake(int nt) {
     (void)nt;
+    /* Capture the current monotonic done count as base before publishing new generation.
+     * This eliminates the ABA race: pool_done is never reset, so stragglers from previous
+     * generations don't corrupt the next generation's count. */
+    pool_done_base = PICOLM_ATOMIC_LOAD64_SEQCST(&pool_done);
     if (pg_enabled()) {
         long long t = pool_now_ns();
         if (pg_t_prev_end) pg_gap_ns += (double)(t - pg_t_prev_end);
@@ -1534,8 +1570,8 @@ static void pool_wake(int nt) {
     }
     /* seq_cst: publishes the task arrays / pool_mode written by the caller, and orders
      * this increment before the pool_nsleep read below (see handshake note above). */
-    __atomic_add_fetch(&pool_gen, 1, __ATOMIC_SEQ_CST);
-    if (__atomic_load_n(&pool_nsleep, __ATOMIC_SEQ_CST) > 0) {
+    PICOLM_ATOMIC_ADD_FETCH(&pool_gen, 1);
+    if (PICOLM_ATOMIC_LOAD_SEQCST(&pool_nsleep) > 0) {
         win_mutex_lock(&pool_mutex);
         win_cond_broadcast(&pool_cond);
         win_mutex_unlock(&pool_mutex);
@@ -1543,30 +1579,31 @@ static void pool_wake(int nt) {
 }
 
 static void pool_wait(int nt) {
-    const int want = nt - 1;
+    const long long want = pool_done_base + (nt - 1);
     if (pg_on > 0) { pg_t_wait0 = pool_now_ns(); pg_main_ns += (double)(pg_t_wait0 - pg_t_wake); }
-    if (POOL_LD(&pool_done) < want) {
+    if (PICOLM_ATOMIC_LOAD64(&pool_done) < want) {
         const long long budget = pool_spin_ns * 4;   /* stragglers: dispatches take ~1ms at 24 threads */
         long long t0 = budget > 0 ? pool_now_ns() : 0;
         unsigned it = 0;
         int sleep_now = (budget <= 0);
         while (!sleep_now) {
             POOL_RELAX();
-            if (POOL_LD(&pool_done) >= want) break;
+            if (PICOLM_ATOMIC_LOAD64(&pool_done) >= want) break;
             if ((++it & 127) == 0 && pool_now_ns() - t0 >= budget) sleep_now = 1;
         }
         if (sleep_now) {
+            /* Set main_wait BEFORE entering condvar to prevent lost-wakeup:
+             * if the last worker finishes between our initial pool_done check
+             * and entering the condvar, it will see pool_main_wait==1 and broadcast. */
+            PICOLM_ATOMIC_STORE(&pool_main_wait, 1);
             win_mutex_lock(&pool_mutex);
-            __atomic_store_n(&pool_main_wait, 1, __ATOMIC_SEQ_CST);
-            while (POOL_LD(&pool_done) < want)
+            while (PICOLM_ATOMIC_LOAD64(&pool_done) < want)
                 win_cond_wait(&pool_done_cond, &pool_mutex);
-            __atomic_store_n(&pool_main_wait, 0, __ATOMIC_SEQ_CST);
             win_mutex_unlock(&pool_mutex);
+            PICOLM_ATOMIC_STORE(&pool_main_wait, 0);
         }
     }
-    /* All workers have finished their increment; reset for the next dispatch. Workers only
-     * touch pool_done again after observing the next pool_gen increment (seq_cst). */
-    __atomic_store_n(&pool_done, 0, __ATOMIC_RELAXED);
+    /* pool_done is monotonic, never reset. Next pool_wake captures a fresh base. */
     if (pg_on > 0) {
         long long t = pool_now_ns();
         pg_wait_ns += (double)(t - pg_t_wait0); pg_t_prev_end = t; pg_n++;
@@ -1576,17 +1613,19 @@ static void pool_wait(int nt) {
 static void pool_wake(int nt) {
     (void)nt;
     win_mutex_lock(&pool_mutex);
+    pool_done_base = pool_done;
     pool_gen++;
     win_cond_broadcast(&pool_cond);
     win_mutex_unlock(&pool_mutex);
 }
 
 static void pool_wait(int nt) {
+    const long long want = pool_done_base + (nt - 1);
     win_mutex_lock(&pool_mutex);
-    while (pool_done < nt - 1) {
+    while (pool_done < want) {
         win_cond_wait(&pool_cond, &pool_mutex);
     }
-    pool_done = 0;
+    /* pool_done is monotonic, never reset */
     win_mutex_unlock(&pool_mutex);
 }
 #endif /* PICOLM_SPIN_POOL */
@@ -1602,7 +1641,7 @@ void tensor_threadpool_free(void) {
     if (pool_nworkers <= 0) return;
     win_mutex_lock(&pool_mutex);
 #ifdef PICOLM_SPIN_POOL
-    __atomic_store_n(&pool_shutdown, 1, __ATOMIC_SEQ_CST);
+    PICOLM_ATOMIC_STORE(&pool_shutdown, 1);
 #else
     pool_shutdown = 1;
 #endif
@@ -5484,7 +5523,7 @@ static void mm_multi_task(int tid, void *ctx) {
     mm_multi_t *c = (mm_multi_t *)ctx;
     (void)tid;
     for (;;) {
-        int it = __atomic_fetch_add(&c->cursor, 1, __ATOMIC_RELAXED);
+        int it = PICOLM_ATOMIC_FETCH_ADD(&c->cursor, 1);
         if (it >= c->nblocks) break;
         mm_multi_run(c, it);
     }
