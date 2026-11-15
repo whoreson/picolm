@@ -1436,8 +1436,13 @@ static void *pool_worker(void *arg) {
          * region-profiled; they go through pool_tasks and are timed by the caller). */
         const int tprof = (thprof_on == 1 && tid < MAX_THREADS);
         if (tprof) thprof_task_begin(tid);
-        if (pool_mode) generic_worker_f(&generic_tasks[tid]);
-        else matmul_worker_dyn(&pool_tasks[tid]);
+        if (pool_mode) {
+            tl_in_parallel = 1;
+            generic_worker_f(&generic_tasks[tid]);
+            tl_in_parallel = 0;
+        } else {
+            matmul_worker_dyn(&pool_tasks[tid]);
+        }
         if (tprof) { thprof_task_end(tid); thprof_tl_s[tid] = thprof_tl_s[tid]; }
         __atomic_add_fetch(&pool_done, 1, __ATOMIC_SEQ_CST);
         if (__atomic_load_n(&pool_main_wait, __ATOMIC_SEQ_CST)) {
@@ -1460,7 +1465,6 @@ static void *pool_worker(void *arg) {
 #endif
     int tid = (int)(size_t)arg;
     pool_my_tid = tid;
-    tl_in_parallel = 1;
     int last_gen = 0;
     win_mutex_lock(&pool_mutex);
     while (1) {
@@ -1474,8 +1478,13 @@ static void *pool_worker(void *arg) {
          * region-profiled; they go through pool_tasks and are timed by the caller). */
         const int tprof = (thprof_on == 1 && tid < MAX_THREADS);
         if (tprof) thprof_task_begin(tid);
-        if (pool_mode) generic_worker_f(&generic_tasks[tid]);
-        else matmul_worker_dyn(&pool_tasks[tid]);
+        if (pool_mode) {
+            tl_in_parallel = 1;
+            generic_worker_f(&generic_tasks[tid]);
+            tl_in_parallel = 0;
+        } else {
+            matmul_worker_dyn(&pool_tasks[tid]);
+        }
         if (tprof) { thprof_task_end(tid); thprof_tl_s[tid] = thprof_tl_s[tid]; }
         win_mutex_lock(&pool_mutex);
         pool_done++;
@@ -1727,6 +1736,9 @@ static void matmul_disarm_dynamic(int nt) {
 
 void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t qtype) {
     double _mm_entry = (thprof_on == 1) ? barrier_now() : 0.0;
+    /* Prevent nested pool dispatch: matmul called from inside a
+     * tensor_parallel_for worker would corrupt the pool state. */
+    int ntl = tl_in_parallel ? 1 : n_threads;
     if (!W) {
         static int null_warn;
         if (!null_warn) {
@@ -1752,14 +1764,14 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
 
     /* F32/F16: use generic vec_dot or tiled GEMM */
     if (!ti || ti->act_fmt == ACT_FMT_F32) {
-        if (d < matmul_min_rows_eff() || n_threads <= 1) {
+        if (d < matmul_min_rows_eff() || ntl <= 1) {
             for (int i = 0; i < d; i++)
                 out[i] = vec_dot(wptr + (size_t)i * row_bytes, x, n, qtype);
             return;
         }
         /* Threaded F32/F16 */
-        int nt = pool_total_threads(n_threads);
-        int want = n_threads < nt ? n_threads : nt;
+        int nt = pool_total_threads(ntl);
+        int want = ntl < nt ? ntl : nt;
         int active = pool_assign_rows(0, want, d);
         for (int t = 0; t < active; t++) {
             pool_tasks[t].out = out; pool_tasks[t].x = x;
@@ -1825,7 +1837,7 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
     }
 
     /* Single-threaded or small d: direct GEMV */
-    if (n_threads <= 1 || d < 4 || d < matmul_min_rows_eff()) {
+    if (ntl <= 1 || d < 4 || d < matmul_min_rows_eff()) {
         if (ti->rows_per_block > 1) {
             /* Interleaved: process rows in groups */
             int rpb = ti->rows_per_block;
@@ -1856,8 +1868,8 @@ void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t
 
     /* Threaded dispatch */
     {
-        int nt = pool_total_threads(n_threads);
-        int want = n_threads < nt ? n_threads : nt;
+        int nt = pool_total_threads(ntl);
+        int want = ntl < nt ? ntl : nt;
         int active = pool_assign_rows(0, want, d);
         for (int t = 0; t < active; t++) {
             pool_tasks[t].out = out;
@@ -1993,12 +2005,13 @@ static void qgemm_q4x8_dual_task(int idx, void *ctxp) {
  * d = number of output rows (weight matrix columns) */
 void matmul_q8(float *out, const void *qx, const float *qx_d,
                const void *W, int n, int d, gguf_type_t qtype) {
+    int ntl = tl_in_parallel ? 1 : n_threads;
     size_t row_bytes = gguf_type_row_size(qtype, n);
     const char *wptr = (const char *)W;
 
     if (qtype == GGUF_TYPE_Q8_0 && n > 0) {
         /* Use Q8xQ8 dot products with pre-converted deltas */
-        if (n_threads <= 1 || d < 4 || d < matmul_min_rows_eff()) {
+        if (ntl <= 1 || d < 4 || d < matmul_min_rows_eff()) {
             for (int i = 0; i < d; i++) {
                 out[i] = vec_dot_q8_0_q8_0_deltas(qx, qx_d, wptr + (size_t)i * row_bytes, n);
             }
@@ -2007,8 +2020,8 @@ void matmul_q8(float *out, const void *qx, const float *qx_d,
 
         /* Threaded dispatch: main thread does task 0, workers do tasks 1..nt-1 */
         {
-            int nt = pool_total_threads(n_threads);
-            int want = n_threads < nt ? n_threads : nt;
+            int nt = pool_total_threads(ntl);
+            int want = ntl < nt ? ntl : nt;
             int active = pool_assign_rows(0, want, d);
             for (int t = 0; t < active; t++) {
                 pool_tasks[t].out = out; pool_tasks[t].x = (const float *)qx;
@@ -3388,6 +3401,8 @@ static void matmul_batch_scalar_threaded(float *out, const float *x, int n_batch
 
 void matmul_batch(float *out, const float *x, int n_batch,
                    const void *W, int n, int d, gguf_type_t qtype) {
+    /* Prevent nested pool dispatch: same issue as matmul() above. */
+    int ntl = tl_in_parallel ? 1 : n_threads;
     /* Types without GEMM or qgemm_d support fall through to the threaded
      * worker path below, which uses fn_gemv per-row dispatch. */
     const type_info_t *ti_check = typeinfo(qtype);
@@ -3443,8 +3458,8 @@ void matmul_batch(float *out, const float *x, int n_batch,
             DISPATCH("SGEMM_F32");
             return;
         }
-        /* Fall back to generic vec_dot */
-        if (n_batch <= 4 || d < matmul_min_rows) {
+        /* Fall back to generic vec_dot (also when nested, to avoid pool corruption) */
+        if (ntl <= 1 || n_batch <= 4 || d < matmul_min_rows) {
             for (int b = 0; b < n_batch; b++)
                 for (int i = 0; i < d; i++)
                     out[b * d + i] = vec_dot(wptr + (size_t)i * row_bytes, x + (size_t)b * n, n, qtype);
@@ -3452,8 +3467,8 @@ void matmul_batch(float *out, const float *x, int n_batch,
             return;
         }
         /* Threaded F32 */
-        int nt = pool_total_threads(n_threads);
-        int want = n_threads < nt ? n_threads : nt;
+        int nt = pool_total_threads(ntl);
+        int want = ntl < nt ? ntl : nt;
         int active = pool_assign_rows(0, want, d);
         for (int t = 0; t < active; t++) {
             pool_tasks[t].out = out; pool_tasks[t].x = x;
@@ -3631,8 +3646,8 @@ void matmul_batch(float *out, const float *x, int n_batch,
 
     /* Threaded worker fallback */
     {
-        int nt = pool_total_threads(n_threads);
-        int want = n_threads < nt ? n_threads : nt;
+        int nt = pool_total_threads(ntl);
+        int want = ntl < nt ? ntl : nt;
         int active = pool_assign_rows(0, want, d);
         for (int t = 0; t < active; t++) {
             pool_tasks[t].out = out;
