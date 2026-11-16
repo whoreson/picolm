@@ -59,6 +59,34 @@ typedef struct {
  * Bit-identical to calling matmul() once per job. */
 int tensor_matmul_multi(const mm_job_t *jobs, int n_jobs);
 
+/* Dynamic task claiming: runs fn(0..count-1) across the pool, each thread taking the next
+ * unclaimed index from a shared counter (tensor_parallel_for splits the range statically, which
+ * leaves threads idle when the tasks differ in cost). Runs serially when nested or single-threaded.
+ * Tasks must not depend on each other or on which thread runs them. */
+void tensor_parallel_for_dyn(int count, void (*fn)(int idx, void *ctx), void *ctx);
+
+/* One independent batched matmul inside a tensor_matmul_batch_multi() call:
+ * out[b*d + i] = dot(W row i, x row b) for b < n_batch -- the matmul_batch() layout. */
+typedef struct {
+    float       *out;
+    const float *x;
+    const void  *W;
+    int          n_batch, n, d;
+    gguf_type_t  qtype;
+} mm_bjob_t;
+
+/* 1 if tensor_matmul_batch_multi() can run a job of this type/shape (it is limited to kernels whose
+ * per-row result does not depend on how rows or columns are split across threads). */
+int tensor_matmul_batch_multi_ok(gguf_type_t qtype, int n, int d);
+
+/* Run n_jobs independent batched matmuls (each n_batch >= 2) in a FEW pool dispatches instead of
+ * several per job: activations are quantized once per job in parallel, then (job, row-chunk) tiles
+ * are claimed dynamically, so every thread stays busy regardless of how many columns each job has
+ * (matmul_batch() clamps its thread count to n_batch, which starves the pool for small batches).
+ * Bit-identical to calling matmul_batch() once per job. Returns 1 if it ran, 0 if it declined
+ * (nothing was written; the caller falls back to matmul_batch). */
+int tensor_matmul_batch_multi(const mm_bjob_t *jobs, int n_jobs);
+
 void matmul_batch(float *out, const float *x, int n_batch,
                    const void *W, int n, int d, gguf_type_t qtype);
 

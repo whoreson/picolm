@@ -73,3 +73,5 @@ bench_ffn
 picolm_avx2
 test_glm5_pfa
 test_glm5_mla_splitkv
+test_batch_multi
+test_glm5_moe_ep

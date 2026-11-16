@@ -883,6 +883,21 @@ test_glm5_mla_splitkv: tests/test_glm5_mla_splitkv.c model_glm5.c model_moe.c mo
 check-glm5-mla-splitkv: test_glm5_mla_splitkv
 	./test_glm5_mla_splitkv
 
+test_batch_multi: tests/test_batch_multi.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) model.h
+	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O3 -o $@ tests/test_batch_multi.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
+
+.PHONY: check-batch-multi
+check-batch-multi: test_batch_multi
+	./test_batch_multi
+
+test_glm5_moe_ep: tests/test_glm5_moe_ep.c model_glm5.c model_moe.c model_ssm.c model_kv_cache.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) model.h
+	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O3 -o $@ tests/test_glm5_moe_ep.c model_moe.c model_ssm.c model_kv_cache.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
+
+.PHONY: check-glm5-moe-ep
+check-glm5-moe-ep: test_glm5_moe_ep
+	./test_glm5_moe_ep perttoken
+	./test_glm5_moe_ep
+
 # DSA k-pool selector invariants (causal, bounded, sorted, deduped).
 test_glm5_dsa: tests/test_glm5_dsa.c model_glm5.c model_moe.c model_ssm.c model_kv_cache.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) model.h
 	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O2 -o $@ tests/test_glm5_dsa.c model_glm5.c model_moe.c model_ssm.c model_kv_cache.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++

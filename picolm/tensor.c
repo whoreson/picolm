@@ -5682,6 +5682,171 @@ void tensor_parallel_for(int count, void (*fn)(int idx, void *ctx), void *ctx) {
  * distinct slots. Wave 0 runs indices 0..active-1 = slot per thread;
  * wave w runs indices w*active + t, all distinct modulo max_concurrent
  * as long as max_concurrent >= active (guaranteed by the caller). */
+/* ---- Dynamic claiming over the pool ------------------------------------------------------
+ * Uses PICOLM_ATOMIC_FETCH_ADD for cross-platform portability (GCC builtins,
+ * MSVC Interlocked, or non-atomic fallback). */
+typedef struct { int count; int next; void (*fn)(int, void *); void *ctx; } dyn_claim_t;
+
+static void dyn_claim_worker(int idx, void *p) {
+    (void)idx;
+    dyn_claim_t *d = (dyn_claim_t *)p;
+    for (;;) {
+        const int i = PICOLM_ATOMIC_FETCH_ADD(&d->next, 1);
+        if (i >= d->count) break;
+        d->fn(i, d->ctx);
+    }
+}
+
+void tensor_parallel_for_dyn(int count, void (*fn)(int idx, void *ctx), void *ctx) {
+    if (n_threads <= 1 || count < 2 || tl_in_parallel) {
+        for (int i = 0; i < count; i++) fn(i, ctx);
+        return;
+    }
+    dyn_claim_t d = { count, 0, fn, ctx };
+    const int nt = pool_total_threads(n_threads);
+    int want = n_threads < nt ? n_threads : nt;
+    if (want > count) want = count;
+    tensor_parallel_for(want, dyn_claim_worker, &d);
+}
+
+/* ---- Many batched GEMMs, one pool dispatch ----------------------------------------------- */
+#if (defined(__AVX2__) && defined(__F16C__)) || defined(__ARM_NEON)
+#define PICOLM_BMULTI 1
+#endif
+
+int tensor_matmul_batch_multi_ok(gguf_type_t qtype, int n, int d) {
+#ifdef PICOLM_BMULTI
+    /* IQ6_K only: its table GEMM (sgemm_iq6_k_q8_k_best -> r8v/r8t/avx2) picks its kernel from
+     * ncols alone and computes each row group and each column independently, so splitting the
+     * rows into chunks or the work across any number of threads cannot change a single bit. */
+    const type_info_t *ti = typeinfo(qtype);
+    return ti && ti->fn_gemm && ti->act_fmt == ACT_FMT_Q8_K && qtype == GGUF_TYPE_IQ6_K &&
+           n >= 256 && (n % 256) == 0 && d >= 8 && (d % 8) == 0;
+#else
+    (void)qtype; (void)n; (void)d;
+    return 0;
+#endif
+}
+
+#ifdef PICOLM_BMULTI
+typedef struct {
+    const mm_bjob_t *jobs;
+    int n_jobs;
+    char **qbuf;             /* per job: quantized activations (Q8_K rows) */
+    const type_info_t **ti;
+    size_t *row_bytes;       /* per job: weight row bytes */
+    size_t *q_off;           /* per job: offset into the scratch */
+    char *scratch;           /* malloc'd block (freed/grown here) */
+    char *qbase;             /* 64-byte aligned start of the usable area */
+    size_t scratch_cap;
+    int *t_job, *t_r0, *t_nr; /* chunk task list */
+    int n_tasks;
+    volatile int failed;
+} bmulti_t;
+
+static void bmulti_quant_task(int j, void *p) {
+    bmulti_t *c = (bmulti_t *)p;
+    const mm_bjob_t *J = &c->jobs[j];
+    const size_t sz = (size_t)J->n_batch * (size_t)(J->n / 256) * sizeof(block_q8_K);
+    quant_buf_t qb = quant_activations_ex(J->qtype, J->x, J->n_batch, J->n, c->qbase + c->q_off[j], sz, 1);
+    if (!qb.qbuf || qb.owned) {      /* must have used our slice (it fits exactly) */
+        if (qb.qbuf && qb.owned) free(qb.qbuf);
+        c->failed = 1;
+        return;
+    }
+    c->qbuf[j] = (char *)qb.qbuf;
+}
+
+static void bmulti_gemm_task(int i, void *p) {
+    bmulti_t *c = (bmulti_t *)p;
+    if (c->failed) return;
+    const int j = c->t_job[i], r0 = c->t_r0[i], nr = c->t_nr[i];
+    const mm_bjob_t *J = &c->jobs[j];
+    const int r = c->ti[j]->fn_gemm(nr, J->n_batch, J->n,
+                                    (const char *)J->W + (size_t)r0 * c->row_bytes[j],
+                                    c->qbuf[j], J->out + r0, (size_t)J->d, 0, 1);
+    if (r == 0) c->failed = 1;
+}
+
+static int bmulti_chunk_rows(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("PICOLM_BMULTI_ROWS");
+        v = e ? atoi(e) : 64;
+        if (v < 8) v = 8;
+        v &= ~7;
+    }
+    return v;
+}
+#endif
+
+int tensor_matmul_batch_multi(const mm_bjob_t *jobs, int n_jobs) {
+#ifdef PICOLM_BMULTI
+    if (!jobs || n_jobs <= 0 || tl_in_parallel) return 0;
+    for (int j = 0; j < n_jobs; j++)
+        if (!jobs[j].W || !jobs[j].out || !jobs[j].x || jobs[j].n_batch < 2 ||
+            !tensor_matmul_batch_multi_ok(jobs[j].qtype, jobs[j].n, jobs[j].d)) return 0;
+
+    static bmulti_t c;                       /* main thread only; arrays grown and kept */
+    static size_t cap_jobs, cap_tasks;
+    const int R = bmulti_chunk_rows();
+    size_t n_tasks = 0, q_total = 0;
+    for (int j = 0; j < n_jobs; j++) {
+        n_tasks += (size_t)(jobs[j].d + R - 1) / R;
+        q_total += (((size_t)jobs[j].n_batch * (size_t)(jobs[j].n / 256) * sizeof(block_q8_K)) + 63) & ~(size_t)63;
+    }
+    if ((size_t)n_jobs > cap_jobs) {
+        free(c.qbuf); free(c.ti); free(c.row_bytes); free(c.q_off);
+        c.qbuf = (char **)malloc(n_jobs * sizeof(char *));
+        c.ti = (const type_info_t **)malloc(n_jobs * sizeof(void *));
+        c.row_bytes = (size_t *)malloc(n_jobs * sizeof(size_t));
+        c.q_off = (size_t *)malloc(n_jobs * sizeof(size_t));
+        cap_jobs = (c.qbuf && c.ti && c.row_bytes && c.q_off) ? (size_t)n_jobs : 0;
+    }
+    if (n_tasks > cap_tasks) {
+        free(c.t_job); free(c.t_r0); free(c.t_nr);
+        c.t_job = (int *)malloc(n_tasks * sizeof(int));
+        c.t_r0  = (int *)malloc(n_tasks * sizeof(int));
+        c.t_nr  = (int *)malloc(n_tasks * sizeof(int));
+        cap_tasks = (c.t_job && c.t_r0 && c.t_nr) ? n_tasks : 0;
+    }
+    if (q_total > c.scratch_cap) {
+        free(c.scratch);
+        c.scratch = (char *)malloc(q_total + 64);
+        c.scratch_cap = c.scratch ? q_total + 64 : 0;
+    }
+    if (!cap_jobs || !cap_tasks || !c.scratch_cap || (size_t)n_jobs > cap_jobs || n_tasks > cap_tasks ||
+        q_total > c.scratch_cap) return 0;
+
+    /* 64-byte-align the scratch base, then hand each job a 64-byte-aligned slice */
+    c.qbase = (char *)(((uintptr_t)c.scratch + 63) & ~(uintptr_t)63);
+    c.jobs = jobs; c.n_jobs = n_jobs; c.failed = 0;
+    size_t off = 0; int t = 0;
+    for (int j = 0; j < n_jobs; j++) {
+        c.ti[j] = typeinfo(jobs[j].qtype);
+        c.row_bytes[j] = gguf_type_row_size(jobs[j].qtype, jobs[j].n);
+        c.q_off[j] = off;
+        off += (((size_t)jobs[j].n_batch * (size_t)(jobs[j].n / 256) * sizeof(block_q8_K)) + 63) & ~(size_t)63;
+        for (int r0 = 0; r0 < jobs[j].d; r0 += R) {
+            c.t_job[t] = j; c.t_r0[t] = r0;
+            c.t_nr[t] = (jobs[j].d - r0 < R) ? jobs[j].d - r0 : R;
+            t++;
+        }
+    }
+    c.n_tasks = t;
+    tensor_parallel_for_dyn(n_jobs, bmulti_quant_task, &c);
+    if (!c.failed) tensor_parallel_for_dyn(c.n_tasks, bmulti_gemm_task, &c);
+    if (c.failed) {      /* never expected; recompute through the proven path so the result is right */
+        for (int j = 0; j < n_jobs; j++)
+            matmul_batch(jobs[j].out, jobs[j].x, jobs[j].n_batch, jobs[j].W, jobs[j].n, jobs[j].d, jobs[j].qtype);
+    }
+    return 1;
+#else
+    (void)jobs; (void)n_jobs;
+    return 0;
+#endif
+}
+
 void tensor_parallel_for_strided(int count, void (*fn)(int idx, void *ctx), void *ctx) {
     if (n_threads <= 1 || count < 2 || tl_in_parallel) {
         for (int i = 0; i < count; i++) fn(i, ctx);
