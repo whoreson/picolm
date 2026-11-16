@@ -827,7 +827,17 @@ static void glm5_kda_forward(
         }
     }
 
-    /* Per-head RMSNorm with ssm_norm weight, then sigmoid gate (z) */
+    /* Per-head RMSNorm with ssm_norm weight, then sigmoid gate (z).
+     *
+     * The gate is PLAIN SIGMOID, measured rather than assumed:
+     * llama-delta-net.h declares the KDA output gate_op as SILU and
+     * build_glm5next.cpp does not override it, but fitting ik's own dumped
+     * attn_rms_norm-0 / z-0 / attn_out_norm-0 gives
+     *     attn_out_norm == attn_rms_norm * sigmoid(z)   relrms 0.000000
+     *     attn_out_norm == attn_rms_norm * silu(z)      relrms 1.2138
+     * so sigmoid is what actually runs.  Switching this to SiLU drops the
+     * 21-token "capital of France" prompt from cosine 0.94 to 0.20 against
+     * the ik oracle.  ik's llama-kda.cpp:91 spells it ggml_sigmoid too. */
     {
         snprintf(t, sizeof(t), "%s.head_out", tg);
         glm5_stats(t, head_out, DI);
