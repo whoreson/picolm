@@ -1912,15 +1912,43 @@ static void handle_slots_post(SOCKET sock, const char *body) {
             int fd = open(full_path, O_RDONLY);
 #endif
             if (fd >= 0) {
-                /* Read the main header to determine file size of KV data */
-                uint32_t header[13];
+                /* Read the main header to determine file size of KV data.
+                 *
+                 * v4 writes 13 words, v5 appends a 14th = GLM-5 state blob
+                 * size.  This used to read only 13 words unconditionally, so
+                 * for GLM-5 (v5) files the blob size was never seen and the
+                 * checkpoint section was located 240+ MB too early -- right
+                 * inside the MLA/KDA state blob.  The magic check then failed
+                 * ("No SSM checkpoint section found ... magic=0x3CA01E46"),
+                 * or, worse, could have matched by chance and restored a
+                 * snapshot taken from the middle of the state blob.  Read the
+                 * full 14 words and derive sizeof(header) from the version.
+                 */
+                uint32_t header[14];
+                memset(header, 0, sizeof(header));
 #ifdef _WIN32
-                ssize_t hdr_read = (ssize_t)_read(fd, (char *)header, sizeof(header));
+                ssize_t hdr_read = (ssize_t)_read(fd, (char *)header, 13 * sizeof(uint32_t));
 #else
-                ssize_t hdr_read = read(fd, header, sizeof(header));
+                ssize_t hdr_read = read(fd, header, 13 * sizeof(uint32_t));
 #endif
-                if (hdr_read == (ssize_t)sizeof(header)) {
+                if (hdr_read == (ssize_t)(13 * sizeof(uint32_t)) &&
+                    (header[0] & 0xF) >= 5) {
+                    /* v5 has a 14th word: the GLM-5 state blob size. */
+#ifdef _WIN32
+                    ssize_t extra = (ssize_t)_read(fd, (char *)&header[13], sizeof(uint32_t));
+#else
+                    ssize_t extra = read(fd, &header[13], sizeof(uint32_t));
+#endif
+                    if (extra == (ssize_t)sizeof(uint32_t)) {
+                        hdr_read = 14 * sizeof(uint32_t);
+                    } else {
+                        header[13] = 0;
+                    }
+                }
+                if (hdr_read >= (ssize_t)(13 * sizeof(uint32_t))) {
                     uint32_t ver = header[0] & 0xF;
+                    /* Number of header words actually present on disk. */
+                    off_t hdr_bytes = (off_t)((ver >= 5 ? 14 : 13) * sizeof(uint32_t));
                     int file_n_pos = (int)header[1];
                     int file_layers = (int)header[2];
                     int file_n_kv_heads = (int)header[3];
@@ -1929,7 +1957,7 @@ static void handle_slots_post(SOCKET sock, const char *body) {
                     int kv_type_v = (int)header[6];
 
                     /* Calculate where KV data ends */
-                    off_t kv_end = (off_t)sizeof(header);
+                    off_t kv_end = hdr_bytes;
                     if (ver >= 4) {
                         /* Token sequence */
                         if (file_n_pos > 0) {
@@ -1948,9 +1976,9 @@ static void handle_slots_post(SOCKET sock, const char *body) {
                         /* Read layer bitmap to count attention layers */
                         uint8_t *layer_map = (uint8_t *)alloca(file_layers);
                         #ifdef _WIN32
-                        _lseeki64(fd, (off_t)sizeof(header) + (file_n_pos > 0 ? (off_t)file_n_pos * (off_t)sizeof(uint32_t) : 0), SEEK_SET);
+                        _lseeki64(fd, hdr_bytes + (file_n_pos > 0 ? (off_t)file_n_pos * (off_t)sizeof(uint32_t) : 0), SEEK_SET);
 #else
-                        lseek(fd, (off_t)sizeof(header) + (file_n_pos > 0 ? (off_t)file_n_pos * (off_t)sizeof(uint32_t) : 0), SEEK_SET);
+                        lseek(fd, hdr_bytes + (file_n_pos > 0 ? (off_t)file_n_pos * (off_t)sizeof(uint32_t) : 0), SEEK_SET);
 #endif
 #ifdef _WIN32
                         _read(fd, (char *)layer_map, (unsigned)file_layers);
@@ -1979,6 +2007,18 @@ static void handle_slots_post(SOCKET sock, const char *body) {
                         uint32_t ssm_sz = header[10];
                         if (has_ssm && ssm_sz > 0) {
                             kv_end += (off_t)ssm_sz;
+                        }
+                    }
+                    /* GLM-5 state blob (v5): MLA latent caches + KDA states.
+                     * kvcache_save() streams this after the SSM state and
+                     * before the checkpoint section, so it MUST be included
+                     * here or every checkpoint lookup seeks into the middle of
+                     * the blob.  GLM-5 reports has_ssm=0, so the SSM branch
+                     * above does not cover it. */
+                    if (ver >= 5) {
+                        uint32_t glm5_sz = header[13];
+                        if (glm5_sz > 0) {
+                            kv_end += (off_t)glm5_sz;
                         }
                     }
 
