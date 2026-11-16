@@ -662,8 +662,11 @@ typedef enum {
     GGUF_TYPE_Q6_K_R4    = 214, /* 4-row interleaved Q6_K (GGUF type 214, llama.cpp ik branch) */
     GGUF_TYPE_Q8_K_R8    = 399, /* 8-row interleaved Q8_K (GGUF type 399, llama.cpp ik branch) */
     GGUF_TYPE_Q4_K_R4    = 212, /* 4-row interleaved Q4_K (GGUF type 212, llama.cpp ik branch) */
+    GGUF_TYPE_Q5_K_R4    = 213, /* 4-row interleaved Q5_K (GGUF type 213, llama.cpp ik branch) */
     GGUF_TYPE_Q2_K_R4    = 210, /* 4-row interleaved Q2_K (GGUF type 210, llama.cpp ik branch) */
     GGUF_TYPE_IQ3_XXS    = 18,  /* 3-bit "almost true" quant, 16-bit block scale (ggml type 18) */
+    GGUF_TYPE_IQ3_XXS_R4 = 218, /* 4-row interleaved IQ3_XXS (ik_llama GGML type 218) */
+    GGUF_TYPE_IQ4_XS_R8  = 223, /* 8-row interleaved IQ4_XS (ik_llama GGML type 223) */
 } gguf_type_t;
 
 /* One past the highest type ID, for table sizing */
@@ -729,7 +732,9 @@ static inline int gguf_type_rows_per_block(gguf_type_t type) {
     case GGUF_TYPE_IQ3_K_R4:
     case GGUF_TYPE_IQ4_K_R4:
     case GGUF_TYPE_IQ4_NL_R4:
+    case GGUF_TYPE_IQ3_XXS_R4:
     case GGUF_TYPE_Q4_K_R4:
+    case GGUF_TYPE_Q5_K_R4:
     case GGUF_TYPE_Q6_K_R4:
     case GGUF_TYPE_Q4_0_4_4:
     case GGUF_TYPE_Q4_0_4_8:
@@ -738,6 +743,7 @@ static inline int gguf_type_rows_per_block(gguf_type_t type) {
     case GGUF_TYPE_Q4I_0_8_8:
     case GGUF_TYPE_Q4_0_R8:
     case GGUF_TYPE_Q8_0_R8:
+    case GGUF_TYPE_IQ4_XS_R8:
         return 8;
     default:
         return 1;
@@ -825,6 +831,26 @@ typedef struct PICOLM_PACKED_ATTR {
     uint8_t  scales_l[32]; /* 64 packed 4-bit magnitude scales (32 bytes) */
     uint8_t  qs[512];      /* 1024 packed 4-bit values (512 bytes) */
 } block_q4_k_r4;           /* 576 bytes = 4 * 144 */
+#pragma pack(pop)
+
+/* Q5_K_R4 block: 4 rows of Q5_K repacked together (ik_llama GGML type 213).
+ * Size = 704 bytes = 4 * sizeof(block_q5_K). Layout mirrors block_q4_k_r4 but
+ * with the 5th bit stored separately:
+ *   d[8]:         FP16: d[0..3] = row scales, d[4..7] = row mins
+ *   scales_h[16]: 2 high bits per 6-bit scale/min entry
+ *   scales_l[32]: (scale & 0xf) | ((min & 0xf) << 4) per 32-value sub-block
+ *   qh[128]:      8 high bits per (row, sub-block) byte-group, one per value
+ *   qs[512]:      low 4 bits, 4 rows interleaved
+ * From ik_llama repack_q5_k(); dequant = d[row]*scale*q - dmin[row]*min with
+ * q = low nibble | (high bit << 4). */
+#pragma pack(push, 1)
+typedef struct PICOLM_PACKED_ATTR {
+    uint16_t d[8];         /* 4 row scales, then 4 row mins */
+    uint8_t  scales_h[16];
+    uint8_t  scales_l[32];
+    uint8_t  qh[128];
+    uint8_t  qs[512];
+} block_q5_k_r4;           /* 704 bytes = 4 * 176 */
 #pragma pack(pop)
 
 /* Q4_0_4_4 interleaved block: 4 rows of Q4_0 packed together for SIMD efficiency.
@@ -1241,6 +1267,48 @@ typedef struct PICOLM_PACKED_ATTR {
     uint16_t d;
     uint8_t  qs[3 * 256 / 8];  /* 96 bytes: 64 index bytes + 32 scale/sign bytes */
 } block_iq3_xxs;               /* 98 bytes */
+
+/* IQ3_XXS_R4 block (ik_llama GGML type 218): 4 IQ3_XXS rows interleaved.
+ * Size = 4 * sizeof(block_iq3_xxs) = 392 bytes, i.e. 98 bytes per row of 256.
+ *
+ * Layout (from ik_llama.cpp repack_iq3_xxs()):
+ *   d[4]:     the 4 rows' FP16 super-block scales
+ *   qs[256]:  per 32-value sub-block ib (0..7), qs[32*ib + 8*k + i] holds
+ *             row k's grid indices qs[8*ib + i] -- i.e. 8 index bytes per row
+ *   sas[128]: per 256-value block, the 32-bit word at
+ *             ((uint32_t*)sas)[8*ibl + 4*ib + k] belongs to row k of
+ *             sub-block ib. Bit 0 of each byte is one bit of the 4-bit
+ *             sub-block scale; the other 7 bits are that 8-value run's sign
+ *             mask, stored scrambled and undone at decode time with
+ *             aux &= 0xfefefefe; aux ^= aux >> 1
+ *             See dequantize_row_iq3_xxs_r4_single() in quant.c. */
+#pragma pack(push, 1)
+typedef struct PICOLM_PACKED_ATTR {
+    uint16_t d[4];      /* 4 FP16 row scales */
+    uint8_t  sas[128];  /* 4 rows x 8 sub-blocks x 4 bytes: sign7<<1 | scale bit */
+    uint8_t  qs[256];   /* 4 rows x 64 grid indices, row-interleaved per 8-value run */
+} block_iq3_xxs_r4;     /* 392 bytes = 4 * 98 */
+#pragma pack(pop)
+
+/* IQ4_XS_R8 block (ik_llama GGML type 223): 8 IQ4_XS rows interleaved.
+ * Size = 8 * sizeof(block_iq4_xs) = 1088 bytes, i.e. 136 bytes per row of 256.
+ *
+ * Layout (from ik_llama.cpp repack_iq4_xs()):
+ *   d[8]:          the 8 rows' FP16 super-block scales
+ *   scales_h[16]:  for value-index i = 8*ib + k, scales_h[i % 16] |= sh << 2*(i/16)
+ *   scales_l[32]:  for value-index i = 8*ib + k, scales_l[i % 32] |= sl << 4*(i/32)
+ *   qs[1024]:      per 32-value sub-block ib, 128 bytes =
+ *                    qs[128*ib + 4*k + i + {0,32,64,96}] packs row k's nibbles
+ *                  (low nibbles of qs[16*ib + i + {0,4}] / {8,12} into +0/+32,
+ *                   high nibbles of the same into +64/+96) */
+#pragma pack(push, 1)
+typedef struct PICOLM_PACKED_ATTR {
+    uint16_t d[8];        /* 8 FP16 row scales */
+    uint8_t  scales_h[16];
+    uint8_t  scales_l[32];
+    uint8_t  qs[1024];
+} block_iq4_xs_r8;        /* 1088 bytes = 8 * 136 */
+#pragma pack(pop)
 #pragma pack(pop)
 
 /* IQ4_K plain block (GGUF type 139): single-row 4-bit non-linear quant.
@@ -1842,11 +1910,23 @@ void vec_dot_iq4_k_r4_q8_k_batch4(const void *vx, const void *vy, int n, float *
 /* Q4_K_R4 dequantize: scalar reference for a single row from the 4-row interleaved block.
  * dst must have space for n floats. row must be 0..3. */
 void dequantize_row_q4_k_r4_single(const block_q4_k_r4 *x, float *dst, int n, int row);
+void dequantize_row_q5_k_r4_single(const block_q5_k_r4 *x, float *dst, int n, int row);
+void dequantize_row_q5_k_r4(const void *src, float *dst, int n);
 void dequantize_row_q2_k_r4_single(const block_q2_k_r4 *x, float *dst, int n, int row);
 void dequantize_row_q2_k_r4(const void *src, float *dst, int n);
 float vec_dot_q2_k_r4_q8_k(const void *vx, const void *vy, int n);
 void vec_dot_q2_k_r4_q8_k_batch4(const void *vx, const void *vy, int n, float *out, int nrows);
 void dequantize_row_iq3_xxs(const void *src, float *dst, int n);
+/* IQ3_XXS_R4 / IQ4_XS_R8 (ik_llama GGML types 218 / 223): row-interleaved
+ * formats. The _single variants extract one logical row from a group base and
+ * write exactly n floats; the group variants write rpb rows of n floats each. */
+void dequantize_row_iq3_xxs_r4_single(const void *src, float *dst, int n, int row);
+void dequantize_row_iq3_xxs_r4(const void *src, float *dst, int n);
+void dequantize_row_iq4_xs_r8_single(const void *src, float *dst, int n, int row);
+void dequantize_row_iq4_xs_r8(const void *src, float *dst, int n);
+/* R4/R8 GEMV: 4 (resp. 8) weight rows x 1 Q8_K activation row. */
+void vec_dot_iq3_xxs_r4_q8_k(const void *vx, const void *vy, int n, float *out, int nrows);
+void vec_dot_iq4_xs_r8_q8_k(const void *vx, const void *vy, int n, float *out, int nrows);
 float vec_dot_iq3_xxs_q8_k(const void *vx, const void *vy, int n);
 /* Scalar (integer-exact) reference for vec_dot_iq3_xxs_q8_k, used as the
  * validation oracle by tests/kq_gemm_check.c. */

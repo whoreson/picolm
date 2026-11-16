@@ -227,6 +227,86 @@ static void gemv_q6_k_r4(const void *w, const void *a, int n, float *out, int nr
     vec_dot_q6_K_R4_q8_K(w, a, n, out);
 }
 
+/* Q5_K_R4: 4 rows per block group. No fused GEMM yet, so decode the row and dot. */
+static void gemv_q5_k_r4(const void *w, const void *a, int n, float *out, int nrows) {
+    const block_q8_K *y = (const block_q8_K *)a;
+    const int nb = n / QK_K;
+    /* Byte stride: consecutive interleaved groups are sizeof(block) apart,
+     * which already covers all 4 rows. `blocks + i` would step 4x too far. */
+    const size_t block_stride = sizeof(block_q5_k_r4);
+    const char *wp = (const char *)w;
+    const int nr = (nrows > 0 && nrows < 4) ? nrows : 4;
+    float wbuf[QK_K];
+    for (int r = 0; r < nr; ++r) {
+        float acc = 0.0f;
+        for (int i = 0; i < nb; ++i) {
+            dequantize_row_q5_k_r4_single((const block_q5_k_r4 *)(wp + (size_t)i * block_stride),
+                                          wbuf, QK_K, r);
+            float s = 0.0f;
+            for (int j = 0; j < QK_K; ++j) s += wbuf[j] * (float)y[i].qs[j];
+            acc += s * y[i].d;
+        }
+        out[r] = acc;
+    }
+}
+
+/* ---- Row-interleaved types without a fused GEMM -------------------------
+ *
+ * Q5_K_R4 / IQ3_XXS_R4 / IQ4_XS_R8 have a correct per-row GEMV but no tiled
+ * GEMM. Their fn_gemm used to be NULL, which pushed every batched matmul to
+ * matmul_batch()'s generic "threaded_worker" path and every fused gate+up pair
+ * to dual_fallback (two barrier dispatches, activations quantised twice).
+ *
+ * These wrappers give them a table GEMM that is simply the verified GEMV run
+ * per (row, column) over this thread's share. That is not a fast kernel -- a
+ * real tiled one is the obvious next step -- but it is exact, it removes the
+ * fallback warnings, and it lets the fused dual path (and any future caller of
+ * fn_gemm) work. The work unit is (row-group, column) so a thread always takes
+ * whole 4-row groups, which is what the GEMV decodes at once.
+ */
+typedef void (*r4_gemv_fn)(const void *w, const void *a, int n, float *out, int nrows);
+
+static int r4_gemm_generic(r4_gemv_fn gemv, int rpb, size_t block_bytes,
+                           int nrows, int ncols, int k, const void *w, const void *a,
+                           float *out, size_t bs, int ith, int nth) {
+    if (nrows < 1 || ncols < 1 || k <= 0 || (k % QK_K) != 0 || nth < 1) return 0;
+    const int nb = k / QK_K;
+    const size_t wrow = (size_t)nb * block_bytes;       /* bytes per logical row */
+    const size_t arow = (size_t)nb * sizeof(block_q8_K);
+    const int groups = (nrows + rpb - 1) / rpb;
+    const int gpt = (groups + nth - 1) / nth;
+    const int g0 = ith * gpt;
+    int g1 = (ith + 1) * gpt; if (g1 > groups) g1 = groups;
+    if (g0 >= g1) return nrows;                         /* valid empty share */
+    for (int g = g0; g < g1; ++g) {
+        const int row0 = g * rpb;
+        const int nr = (row0 + rpb <= nrows) ? rpb : (nrows - row0);
+        const void *wg = (const char *)w + (size_t)g * wrow * rpb;
+        for (int c = 0; c < ncols; ++c) {
+            float res[8];
+            /* Ask for exactly nr rows: the GEMVs honour nrows, so a tail group
+             * (nrows not a multiple of rpb) does not write past its lane. */
+            gemv(wg, (const char *)a + (size_t)c * arow, k, res, nr);
+            for (int r = 0; r < nr; ++r)
+                out[(size_t)c * bs + row0 + r] = res[r];
+        }
+    }
+    return nrows;
+}
+
+static int gemm_q5_k_r4(int m, int n, int k, const void *w, const void *a,
+                        float *out, size_t bs, int ith, int nth) {
+    return r4_gemm_generic(gemv_q5_k_r4, 4, sizeof(block_q5_k_r4) / 4, m, n, k, w, a, out, bs, ith, nth);
+}
+static int gemm_iq3_xxs_r4(int m, int n, int k, const void *w, const void *a,
+                           float *out, size_t bs, int ith, int nth) {
+    return r4_gemm_generic(vec_dot_iq3_xxs_r4_q8_k, 4, sizeof(block_iq3_xxs_r4) / 4, m, n, k, w, a, out, bs, ith, nth);
+}
+static int gemm_iq4_xs_r8(int m, int n, int k, const void *w, const void *a,
+                          float *out, size_t bs, int ith, int nth) {
+    return r4_gemm_generic(vec_dot_iq4_xs_r8_q8_k, 8, sizeof(block_iq4_xs_r8) / 8, m, n, k, w, a, out, bs, ith, nth);
+}
+
 /* ---- R8 wrappers: already have matching (vx, wy, n, out, nrows) signature ---- */
 /* vec_dot_q4_0_r8_q8_2_avx2, vec_dot_q8_k_r8_q8_k_avx2, vec_dot_q4_0x8_q8_0_avx2
  * all match type_gemv_fn directly. */
@@ -569,6 +649,17 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
         .use_repacked = 0,
         .has_dual_scalar_path = 0,
     },
+    [GGUF_TYPE_Q5_K_R4] = {
+        .act_fmt = ACT_FMT_Q8_K,
+        .rows_per_block = 4,
+        .fn_gemv = gemv_q5_k_r4,
+        .fn_gemm = gemm_q5_k_r4,  /* per-row GEMV over this thread's share (exact, no tiled kernel yet) */
+        .has_qgemm_d = 0,
+        .fn_dequant_single = (type_dequant_single_fn)dequantize_row_q5_k_r4_single,
+        .needs_qx = 1,
+        .use_repacked = 0,
+        .has_dual_scalar_path = 0,
+    },
     [GGUF_TYPE_Q4_K_R4] = {
         .act_fmt = ACT_FMT_Q8_K,
         .rows_per_block = 4,
@@ -619,6 +710,32 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
         .needs_qx = 1,
         .use_repacked = 0,
         .has_dual_scalar_path = 1,
+    },
+    /* IQ3_XXS_R4 / IQ4_XS_R8: row-interleaved variants of IQ3_XXS / IQ4_XS.
+     * GEMV decodes the row and dots against Q8_K (one decode path, verified
+     * against the F16 source). No fused GEMM yet, so fn_gemm is NULL and the
+     * runtime uses the row-parallel GEMV, which is correct at any batch. */
+    [GGUF_TYPE_IQ3_XXS_R4] = {
+        .act_fmt = ACT_FMT_Q8_K,
+        .rows_per_block = 4,
+        .fn_gemv = vec_dot_iq3_xxs_r4_q8_k,
+        .fn_gemm = gemm_iq3_xxs_r4,
+        .has_qgemm_d = 0,
+        .fn_dequant_single = (type_dequant_single_fn)dequantize_row_iq3_xxs_r4_single,
+        .needs_qx = 1,
+        .use_repacked = 0,
+        .has_dual_scalar_path = 0,
+    },
+    [GGUF_TYPE_IQ4_XS_R8] = {
+        .act_fmt = ACT_FMT_Q8_K,
+        .rows_per_block = 8,
+        .fn_gemv = vec_dot_iq4_xs_r8_q8_k,
+        .fn_gemm = gemm_iq4_xs_r8,
+        .has_qgemm_d = 0,
+        .fn_dequant_single = (type_dequant_single_fn)dequantize_row_iq4_xs_r8_single,
+        .needs_qx = 1,
+        .use_repacked = 0,
+        .has_dual_scalar_path = 0,
     },
     [GGUF_TYPE_Q6_K_R4] = {
         .act_fmt = ACT_FMT_Q8_K,

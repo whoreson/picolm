@@ -64,3 +64,5 @@ picolm/new/
 picolm/0.bat
 picolm/*.bak
 picolm/*.o.tmp
+picolm/check_r4_gemv
+picolm/check_iq3xxs_r4

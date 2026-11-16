@@ -743,7 +743,6 @@ void dequantize_row_iq4_xs(const void *src, float *dst, int n) {
     }
 }
 
-/* Dequantize Q4_1: val = qs[j] * d + m (unsigned nibble) */
 void dequantize_row_q4_1(const void *src, float *dst, int n) {
     const block_q4_1 *blocks = (const block_q4_1 *)src;
     int nb = n / 32;
@@ -1075,8 +1074,12 @@ case GGUF_TYPE_Q4_0_R8:  dequantize_row_q4_0_r8(src, dst, n); break;
         case GGUF_TYPE_IQ6_K:    dequantize_row_iq6_k(src, dst, n); break;
         case GGUF_TYPE_Q6_K_R4:  dequantize_row_q6_K_R4(src, dst, n); break;
         case GGUF_TYPE_Q4_K_R4:  dequantize_row_q4_k_r4(src, dst, n); break;
+        case GGUF_TYPE_Q5_K_R4:  dequantize_row_q5_k_r4(src, dst, n); break;
         case GGUF_TYPE_Q2_K_R4:  dequantize_row_q2_k_r4(src, dst, n); break;
         case GGUF_TYPE_IQ3_XXS:  dequantize_row_iq3_xxs(src, dst, n); break;
+        /* R4/R8 group dequant: emits all rows (4 or 8) stacked. */
+        case GGUF_TYPE_IQ3_XXS_R4: dequantize_row_iq3_xxs_r4(src, dst, n); break;
+        case GGUF_TYPE_IQ4_XS_R8:  dequantize_row_iq4_xs_r8(src, dst, n); break;
         default:
             fprintf(stderr, "dequantize_row: unsupported type %d\n", type);
             exit(1);
@@ -1124,6 +1127,9 @@ int gguf_type_block_size(gguf_type_t type) {
         case GGUF_TYPE_Q8_K_R8:  return 256; /* same as Q8_K: 256 values per row */
         case GGUF_TYPE_Q6_K_R4:  return 256; /* same as Q6_K: 256 values per row */
         case GGUF_TYPE_Q4_K_R4:  return 256; /* same as Q4_K: 256 values per row */
+        case GGUF_TYPE_Q5_K_R4:  return 256;
+        case GGUF_TYPE_IQ3_XXS_R4: return 256;
+        case GGUF_TYPE_IQ4_XS_R8:  return 256;
         case GGUF_TYPE_Q2_K_R4:  return 256; /* same as Q2_K: 256 values per row */
         case GGUF_TYPE_IQ3_XXS:  return 256; /* QK_K values per block */
         default: return 0;
@@ -1169,6 +1175,9 @@ int gguf_type_quant_size(gguf_type_t type) {
         case GGUF_TYPE_Q8_K_R8:  return (int)(sizeof(block_q8_k_r8) / 8); /* 258: per-row block size */
         case GGUF_TYPE_Q6_K_R4:  return (int)sizeof(block_q6_K);  /* 210: per-row block size (840/4) */
         case GGUF_TYPE_Q4_K_R4:  return (int)sizeof(block_q4_k_r4);  /* 576: 4 rows interleaved */
+        case GGUF_TYPE_Q5_K_R4:  return (int)sizeof(block_q5_k_r4);  /* 704: 4 rows interleaved */
+        case GGUF_TYPE_IQ3_XXS_R4: return (int)sizeof(block_iq3_xxs_r4); /* 392: 4 rows */
+        case GGUF_TYPE_IQ4_XS_R8:  return (int)sizeof(block_iq4_xs_r8);  /* 1088: 8 rows */
         case GGUF_TYPE_Q2_K_R4:  return (int)sizeof(block_q2_k_r4);  /* 336: 4 rows interleaved */
         case GGUF_TYPE_IQ3_XXS:  return (int)sizeof(block_iq3_xxs);  /* 98: single row */
         default: return 0;
@@ -1197,6 +1206,10 @@ size_t gguf_type_row_size(gguf_type_t type, int n) {
     if (type == GGUF_TYPE_Q4_K_R4) {
         return (size_t)sizeof(block_q4_k_r4) * (size_t)(n / QK_K) / 4;
     }
+    /* Q5_K_R4: 4 rows per block. Each block = 704 bytes, covers 4 rows x 256 values. */
+    if (type == GGUF_TYPE_Q5_K_R4) {
+        return (size_t)sizeof(block_q5_k_r4) * (size_t)(n / QK_K) / 4;
+    }
     /* Q2_K_R4: 4 rows per block. Each block = 336 bytes, covers 4 rows x 256 values. */
     if (type == GGUF_TYPE_Q2_K_R4) {
         return (size_t)sizeof(block_q2_k_r4) * (size_t)(n / QK_K) / 4;
@@ -1204,6 +1217,14 @@ size_t gguf_type_row_size(gguf_type_t type, int n) {
     /* IQ4_NL_R4: 4 rows per block. Each block = 72 bytes, covers 4 rows x 32 values. */
     if (type == GGUF_TYPE_IQ4_NL_R4) {
         return (size_t)sizeof(block_iq4_nl_r4) * (size_t)(n / 32) / 4;
+    }
+    /* IQ3_XXS_R4: 4 rows per block. Each block = 392 bytes, covers 4 rows x 256 values. */
+    if (type == GGUF_TYPE_IQ3_XXS_R4) {
+        return (size_t)sizeof(block_iq3_xxs_r4) * (size_t)(n / QK_K) / 4;
+    }
+    /* IQ4_XS_R8: 8 rows per block. Each block = 1088 bytes, covers 8 rows x 256 values. */
+    if (type == GGUF_TYPE_IQ4_XS_R8) {
+        return (size_t)sizeof(block_iq4_xs_r8) * (size_t)(n / QK_K) / 8;
     }
     /* GGUF stores tensors as flat block arrays. Each row contains
      * ceil(n / bs) blocks, so the row stride in bytes is:
@@ -7525,6 +7546,30 @@ float vec_dot_row(const void *base, const float *x, int n, gguf_type_t type, int
     const int rin = row % rpb;
     const void *blk = gguf_type_row_ptr(base, type, gguf_type_row_size(type, n), row);
     switch (type) {
+    case GGUF_TYPE_IQ3_XXS_R4: {
+        float *tmp = (float *)malloc((size_t)n * sizeof(float));
+        if (!tmp) return 0.0f;
+        dequantize_row_iq3_xxs_r4_single((const block_iq3_xxs_r4 *)blk, tmp, n, rin);
+        float r = vec_dot_f32_f32(tmp, x, n);
+        free(tmp);
+        return r;
+    }
+    case GGUF_TYPE_IQ4_XS_R8: {
+        float *tmp = (float *)malloc((size_t)n * sizeof(float));
+        if (!tmp) return 0.0f;
+        dequantize_row_iq4_xs_r8_single((const block_iq4_xs_r8 *)blk, tmp, n, rin);
+        float r = vec_dot_f32_f32(tmp, x, n);
+        free(tmp);
+        return r;
+    }
+    case GGUF_TYPE_Q5_K_R4: {
+        float *tmp = (float *)malloc((size_t)n * sizeof(float));
+        if (!tmp) return 0.0f;
+        dequantize_row_q5_k_r4_single((const block_q5_k_r4 *)blk, tmp, n, rin);
+        float r = vec_dot_f32_f32(tmp, x, n);
+        free(tmp);
+        return r;
+    }
     case GGUF_TYPE_IQ4_NL_R4: {
         float *tmp = (float *)malloc((size_t)n * sizeof(float));
         if (!tmp) return 0.0f;
@@ -10292,6 +10337,67 @@ void dequantize_row_q4_k_r4(const void *src, float *dst, int n) {
     dequantize_row_q4_k_r4_single((const block_q4_k_r4 *)src, dst, n, 0);
 }
 
+/* Q5_K_R4 (ik_llama GGML type 213): extract one logical row.
+ * Same 6-bit scale/min packing and row-interleaved nibbles as Q4_K_R4, plus a
+ * 5th bit from qh. From ik_llama repack_q5_k(), the value at sub-block ib,
+ * position p has
+ *   low nibble -> qs[64*ib + 4*row + (byte) + (half)]
+ *   high bit   -> qh[16*ib + 4*row + i], bit ((8*pos_in_32) >> 3)
+ * and q = low | (high << 4). */
+void dequantize_row_q5_k_r4_single(const block_q5_k_r4 *x, float *dst, int n, int row) {
+    const int nblock = n / QK_K;
+
+    for (int ibl = 0; ibl < nblock; ++ibl) {
+        const float d = fp16_to_fp32_lookup(x[ibl].d[row]);
+        const float m = fp16_to_fp32_lookup(x[ibl].d[row + 4]);
+        for (int ib = 0; ib < QK_K / 32; ++ib) {
+            const int is = 4 * ib + row;
+            const float dl = d * (float)((x[ibl].scales_l[is] & 0xf) |
+                            (((x[ibl].scales_h[is % 16] >> (4 * (is / 16))) & 0x03) << 4));
+            const float ml = m * (float)((x[ibl].scales_l[is] >> 4) |
+                            (((x[ibl].scales_h[is % 16] >> (4 * (is / 16))) & 0x0c) << 2));
+            float *y = dst + QK_K * ibl + 32 * ib;
+            /* Exactly the inverse of ik_llama's repack_q5_k() loop body:
+             *   qs[64*ib+4*row+i+ 0] = L[i+ 0] | L[i+ 8]<<4
+             *   qs[64*ib+4*row+i+16] = L[i+16] | L[i+24]<<4
+             *   qs[64*ib+4*row+i+32] = L[i+ 4] | L[i+12]<<4
+             *   qs[64*ib+4*row+i+48] = L[i+20] | L[i+28]<<4
+             *   qh[16*ib+4*row+i] = L[i+0],L[i+8],L[i+4],L[i+12],
+             *                       L[i+16],L[i+24],L[i+20],L[i+28] high bits
+             *                       in bit positions 0..7 respectively,
+             * where L[] holds the full 5-bit values 0..31. */
+            for (int i = 0; i < 4; ++i) {
+                const uint8_t hb = x[ibl].qh[16 * ib + 4 * row + i];
+                const uint8_t b0 = x[ibl].qs[64 * ib + 4 * row + i +  0];
+                const uint8_t b1 = x[ibl].qs[64 * ib + 4 * row + i + 16];
+                const uint8_t b2 = x[ibl].qs[64 * ib + 4 * row + i + 32];
+                const uint8_t b3 = x[ibl].qs[64 * ib + 4 * row + i + 48];
+                /* (low nibble, qh bit) pairs, in L[] order 0,8,4,12,16,24,20,28 */
+                const int q0 = (b0 & 0xf) | (((hb >> 0) & 1) << 4);
+                const int q8 = (b0 >> 4)  | (((hb >> 1) & 1) << 4);
+                const int q4 = (b2 & 0xf) | (((hb >> 2) & 1) << 4);
+                const int q12= (b2 >> 4)  | (((hb >> 3) & 1) << 4);
+                const int q16= (b1 & 0xf) | (((hb >> 4) & 1) << 4);
+                const int q24= (b1 >> 4)  | (((hb >> 5) & 1) << 4);
+                const int q20= (b3 & 0xf) | (((hb >> 6) & 1) << 4);
+                const int q28= (b3 >> 4)  | (((hb >> 7) & 1) << 4);
+                y[i +  0] = dl * (float)q0  - ml;
+                y[i +  8] = dl * (float)q8  - ml;
+                y[i +  4] = dl * (float)q4  - ml;
+                y[i + 12] = dl * (float)q12 - ml;
+                y[i + 16] = dl * (float)q16 - ml;
+                y[i + 24] = dl * (float)q24 - ml;
+                y[i + 20] = dl * (float)q20 - ml;
+                y[i + 28] = dl * (float)q28 - ml;
+            }
+        }
+    }
+}
+
+void dequantize_row_q5_k_r4(const void *src, float *dst, int n) {
+    dequantize_row_q5_k_r4_single((const block_q5_k_r4 *)src, dst, n, 0);
+}
+
 /* Scalar vec_dot: Q4_K_R4 weight (row 0) x Q8_K activation.
  * Uses process_min_r4_b32 pattern: -ml * bsums for bias correction.
  * Each subblock (32 values) has ONE scale and ONE min. */
@@ -10455,6 +10561,153 @@ static const uint8_t kmask_iq2xs[8] = { 1, 2, 4, 8, 16, 32, 64, 128 };
 const uint32_t *picolm_iq3xxs_grid(void) { return iq3xxs_grid; }
 const uint8_t  *picolm_iq3xxs_ksigns(void) { return ksigns_iq2xs; }
 const uint8_t  *picolm_iq3xxs_kmask(void) { return kmask_iq2xs; }
+
+/**
+ * IQ3_XXS_R4 (GGML type 218): extract logical row `row` (0..3) of a 4-row
+ * interleaved block group, dequantized to f32.
+ *
+ * Follows ik_llama's dequantize_row_iq3_xxs_r4() exactly. Per 256-value block,
+ * for row k, the row's 32-bit word is  sas32[(ibl * 8) + 4*ib + k]  (ik_llama
+ * indexes it as uint32 ysas[4*ib + k]). In it:
+ *   - bit 0 of each of the 4 bytes is one bit of the 4-bit sub-block scale
+ *   - the remaining 7 bits of each byte are the 8-value sign mask, in a
+ *     SCRAMBLED order that is undone with  aux &= 0xfefefefe; aux ^= aux >> 1
+ *     and then consumed 4 bits (one grid word) at a time.
+ * Grid indices are qs[32*ib + 8*k + i] for i = 0..7, and each index yields 4
+ * consecutive values (not 8 like plain IQ3_XXS).
+ */
+void dequantize_row_iq3_xxs_r4_single(const void *src, float *dst, int n, int row) {
+    const block_iq3_xxs_r4 *g = (const block_iq3_xxs_r4 *)src;
+    const int nb = n / QK_K;
+    for (int i = 0; i < nb; ++i) {
+        /* Reference: ik_llama dequantize_row_iq3_xxs_r4().
+         *   d  = 0.25 * fp16;  dl = d * (2*scale+1)
+         *   scale = low bit of each of the 4 bytes of the row's word
+         *   signs: (aux32 & 0xfefefefe) ^ ((aux32 & 0xfefefefe) >> 1), then
+         *          4 bits consumed per grid index, low nibble first
+         *   values: index qs[32*ib + 8*k + i] yields 4 consecutive values */
+        const float d = 0.25f * fp16_to_fp32_lookup(g[i].d[row]);
+        float *y = dst + (size_t)i * QK_K;
+        for (int ib = 0; ib < QK_K / 32; ++ib) {
+            /* sas is 128 bytes = 32 words per group: [4*ib + row]. Take it
+             * from THIS group (g[i]); indexing a group-0 base pointer with an
+             * extra i*32 walks into the next field and desyncs block >= 1. */
+            uint32_t aux32 = ((const uint32_t *)g[i].sas)[4 * ib + row];
+            uint32_t s32 = aux32 & 0x01010101u;
+            const uint8_t *s8 = (const uint8_t *)&s32;
+            const uint32_t scale = (uint32_t)s8[0] | ((uint32_t)s8[1] << 1)
+                                 | ((uint32_t)s8[2] << 2) | ((uint32_t)s8[3] << 3);
+            const float dl = d * (float)(2 * scale + 1);
+            aux32 &= 0xfefefefeu;
+            aux32 ^= aux32 >> 1;
+            const uint8_t *q3 = g[i].qs + 32 * ib + 8 * row;
+            for (int j = 0; j < 8; ++j) {
+                const int8_t *val = (const int8_t *)&iq3xxs_grid[q3[j]];
+                for (int m = 0; m < 4; ++m)
+                    y[4 * j + m] = dl * (float)val[m] * ((aux32 & (1u << m)) ? -1.0f : 1.0f);
+                aux32 >>= 4;
+            }
+            y += 32;
+        }
+    }
+}
+
+void dequantize_row_iq3_xxs_r4(const void *src, float *dst, int n) {
+    /* Full-group form: 4 rows -> 4 * n floats, row-major by row. */
+    for (int r = 0; r < 4; ++r)
+        dequantize_row_iq3_xxs_r4_single(src, dst + (size_t)r * n, n, r);
+}
+
+/**
+ * IQ4_XS_R8 (GGML type 223): extract logical row `row` (0..7) of an 8-row
+ * interleaved block group, dequantized to f32.
+ *
+ * Inverse of ik_llama's repack_iq4_xs(). For value-index i = 8*ib + k:
+ *   sl = (scales_l[i % 32] >> 4*(i/32)) & 0xf
+ *   sh = (scales_h[i % 16] >> 2*(i/16)) & 3
+ * and row k's nibbles live at qs[128*ib + 4*k + j + {0,32,64,96}].
+ */
+void dequantize_row_iq4_xs_r8_single(const void *src, float *dst, int n, int row) {
+    const block_iq4_xs_r8 *g = (const block_iq4_xs_r8 *)src;
+    const int nb = n / QK_K;
+    for (int i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32_lookup(g[i].d[row]);
+        float *y = dst + (size_t)i * QK_K;
+        for (int ib = 0; ib < QK_K / 32; ++ib) {
+            const int idx = 8 * ib + row;
+            const int sl = (g[i].scales_l[idx % 32] >> (4 * (idx / 32))) & 0xf;
+            const int sh = (g[i].scales_h[idx % 16] >> (2 * (idx / 16))) & 3;
+            const float dl = d * (float)((sl | (sh << 4)) - 32);
+            const uint8_t *qs = g[i].qs + 128 * ib + 4 * row;
+            /* +0 : lo(0..3) | lo(4..7)<<4   -> values 0..7
+             * +32: lo(8..11)| lo(12..15)<<4 -> values 8..15
+             * +64: hi(0..3) | hi(4..7)<<4   -> values 16..23
+             * +96: hi(8..11)| hi(12..15)<<4 -> values 24..31 */
+            for (int j = 0; j < 4; ++j) {
+                const uint8_t b0 = qs[j];
+                y[j]      = dl * (float)kvalues_iq4nl[b0 & 0xf];
+                y[j + 4]  = dl * (float)kvalues_iq4nl[b0 >> 4];
+            }
+            for (int j = 0; j < 4; ++j) {
+                const uint8_t b1 = qs[32 + j];
+                y[j + 8]  = dl * (float)kvalues_iq4nl[b1 & 0xf];
+                y[j + 12] = dl * (float)kvalues_iq4nl[b1 >> 4];
+            }
+            for (int j = 0; j < 4; ++j) {
+                const uint8_t b2 = qs[64 + j];
+                y[j + 16] = dl * (float)kvalues_iq4nl[b2 & 0xf];
+                y[j + 20] = dl * (float)kvalues_iq4nl[b2 >> 4];
+            }
+            for (int j = 0; j < 4; ++j) {
+                const uint8_t b3 = qs[96 + j];
+                y[j + 24] = dl * (float)kvalues_iq4nl[b3 & 0xf];
+                y[j + 28] = dl * (float)kvalues_iq4nl[b3 >> 4];
+            }
+            y += 32;
+        }
+    }
+}
+
+void dequantize_row_iq4_xs_r8(const void *src, float *dst, int n) {
+    for (int r = 0; r < 8; ++r)
+        dequantize_row_iq4_xs_r8_single(src, dst + (size_t)r * n, n, r);
+}
+
+
+/* ================================================================
+ * IQ3_XXS_R4 / IQ4_XS_R8 GEMV: 4 (or 8) weight rows x 1 activation row.
+ *
+ * Implemented as "dequantize the row, then dot against Q8_K" using the
+ * dequantizers above, which are validated against the F16 source. That reuses
+ * one proven decode path instead of duplicating the grid/sign maths a second
+ * time in a hand-unrolled kernel, at the cost of a float staging buffer.
+ * A fused SIMD version is the obvious follow-up once an R4/R8 model is the
+ * default; correctness first.
+ * `out` receives 4 (IQ3_XXS_R4) or 8 (IQ4_XS_R8) floats.
+ * ================================================================ */
+
+/* Defined further down, next to the IQ3_XXS AVX2 helpers. */
+static float r4_f32_q8k_dot(const float *w, const block_q8_K *y);
+
+void vec_dot_iq4_xs_r8_q8_k(const void *vx, const void *vy, int n, float *out, int nrows) {
+    const int nb = n / QK_K;
+    const char *wp = (const char *)vx;
+    const block_q8_K *y = (const block_q8_K *)vy;
+    /* See vec_dot_iq3_xxs_r4_q8_k: byte stride, not pointer arithmetic, and
+     * honour nrows (8 rows here, not 4). */
+    const size_t block_stride = sizeof(block_iq4_xs_r8);
+    const int nr = (nrows > 0 && nrows < 8) ? nrows : 8;
+    float wbuf[QK_K];
+    for (int r = 0; r < nr; ++r) {
+        float acc = 0.0f;
+        for (int i = 0; i < nb; ++i) {
+            dequantize_row_iq4_xs_r8_single((const block_iq4_xs_r8 *)(wp + (size_t)i * block_stride),
+                                             wbuf, QK_K, r);
+            acc += r4_f32_q8k_dot(wbuf, &y[i]);
+        }
+        out[r] = acc;
+    }
+}
 
 /* ================================================================
  * Q2_K_R4 (GGUF type 210): 4-row interleaved Q2_K.
@@ -10632,6 +10885,35 @@ static inline __m256i iq3xxs_grid8(const uint8_t *q) {
                             (int)iq3xxs_grid[q[3]], (int)iq3xxs_grid[q[2]],
                             (int)iq3xxs_grid[q[1]], (int)iq3xxs_grid[q[0]]);
 }
+
+/* Dot of a float row against one Q8_K block (256 values), AVX2.
+ *
+ * NOTE on the two int8->int32 widenings below: each FMA consumes 8 float
+ * weights, so the second one needs activation bytes i+8..i+15. Taking them
+ * with _mm_srli_si128(lo, 8) is REQUIRED -- using the high 128-bit lane
+ * (_mm256_extracti128_si256(qi, 1)) instead reads bytes i+16..i+23, which
+ * both skips 8 activations per 16 and double-counts the first 8. That mistake
+ * was present here and made every R4/R8 GEMV produce garbage while still
+ * looking plausible (the products stay correlated in magnitude). Verified
+ * against a scalar double loop: 0 mismatches after the fix, ~1e2 error before. */
+static float r4_f32_q8k_dot(const float *w, const block_q8_K *y) {
+    const int8_t *q8 = y->qs;
+#if defined(__AVX2__)
+    __m256 acc = _mm256_setzero_ps();
+    for (int i = 0; i < QK_K; i += 16) {
+        const __m128i lo = _mm_loadu_si128((const __m128i *)(q8 + i));
+        const __m256 wl = _mm256_loadu_ps(w + i);
+        const __m256 wh = _mm256_loadu_ps(w + i + 8);
+        acc = _mm256_fmadd_ps(wl, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo)), acc);
+        acc = _mm256_fmadd_ps(wh, _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(lo, 8))), acc);
+    }
+    return iq3xxs_hsum(acc) * y->d;
+#else
+    float s = 0.0f;
+    for (int i = 0; i < QK_K; ++i) s += w[i] * (float)q8[i];
+    return s * y->d;
+#endif
+}
 /* One 32-bit aux32 (4 sign masks) -> __m256i of 32 +-1 int8 values. */
 static inline __m256i iq3xxs_signs(const uint32_t aux32) {
     const int8_t *s = (const int8_t *)iq3xxs_sign_tab;
@@ -10790,6 +11072,71 @@ static float vec_dot_iq3_xxs_q8_k_scalar(const void *vx, const void *vy, int n) 
 }
 
 /* Public GEMV entry point: pick the widest available kernel. */
+#if defined(__AVX2__)
+/* R4 sign mask for ONE 8-value run j: 4 bits -> 4 bytes of +-1.
+ * Mirrors the plain kernel's iq3xxs_signs(), except that the R4 word stores
+ * its 7-bit sign code scrambled, so the caller passes the already-unscrambled
+ * nibble. Replicated to both 128-bit halves so it lines up with the q2 vector,
+ * whose 8 grid words occupy 32 bytes in index order q[0..7]. */
+static inline __m256i iq3xxs_r4_sign_nibble(unsigned nib) {
+    const __m128i m = _mm_setr_epi8(
+        (char)((nib & 1) ? -1 : 1), (char)((nib & 1) ? -1 : 1),
+        (char)((nib & 1) ? -1 : 1), (char)((nib & 1) ? -1 : 1),
+        (char)((nib & 2) ? -1 : 1), (char)((nib & 2) ? -1 : 1),
+        (char)((nib & 2) ? -1 : 1), (char)((nib & 2) ? -1 : 1),
+        (char)((nib & 4) ? -1 : 1), (char)((nib & 4) ? -1 : 1),
+        (char)((nib & 4) ? -1 : 1), (char)((nib & 4) ? -1 : 1),
+        (char)((nib & 8) ? -1 : 1), (char)((nib & 8) ? -1 : 1),
+        (char)((nib & 8) ? -1 : 1), (char)((nib & 8) ? -1 : 1));
+    return _mm256_set_m128i(m, m);
+}
+#endif
+
+/* IQ3_XXS_R4 x Q8_K GEMV: 4 interleaved weight rows x 1 activation row.
+ *
+ * Dequantize each of the 4 rows with dequantize_row_iq3_xxs_r4_single() (which is
+ * bit-exact against the plain IQ3_XXS file) into a stack buffer, then run a
+ * vectorised float dot. One trusted decode path, vectorised arithmetic -- rather
+ * than a second fused integer kernel that has to be re-verified against it.
+ * PICOLM_R4_SELFCHECK=1 validates the result against the generic dequant ref.
+ */
+void vec_dot_iq3_xxs_r4_q8_k(const void *vx, const void *vy, int n, float *out, int nrows) {
+    const char *wp = (const char *)vx;
+    const block_q8_K *y = (const block_q8_K *)vy;
+    const int nb = n / QK_K;
+    /* Interleaved group stride: one block of the group holds ALL rpb rows,
+     * so consecutive blocks sit sizeof(block) apart in memory but only
+     * sizeof(block)/rpb apart per logical row. Advance by the byte stride;
+     * `blocks + i` would step rpb times too far. */
+    const size_t block_stride = sizeof(block_iq3_xxs_r4);
+    const int nr = (nrows > 0 && nrows < 4) ? nrows : 4;
+    float wbuf[QK_K];
+    for (int r = 0; r < nr; ++r) {
+        float acc = 0.0f;
+        for (int i = 0; i < nb; ++i) {
+            dequantize_row_iq3_xxs_r4_single((const block_iq3_xxs_r4 *)(wp + (size_t)i * block_stride),
+                                             wbuf, QK_K, r);
+            acc += r4_f32_q8k_dot(wbuf, &y[i]);
+        }
+        out[r] = acc;
+    }
+#if defined(PICOLM_R4_SELFCHECK_BUILD)
+    {
+        float ref[4];
+        vec_dot_r4_q8_k_dequant_ref(vx, vy, n, ref, nr,
+            (void (*)(const void *, float *, int, int))dequantize_row_iq3_xxs_r4_single,
+            sizeof(block_iq3_xxs_r4));
+        for (int r = 0; r < nr; ++r) {
+            double e = fabs((double)ref[r] - (double)out[r]);
+            double m = fabs((double)ref[r]) > 1e-6 ? fabs((double)ref[r]) : 1.0;
+            if (e > 1e-4 * m)
+                fprintf(stderr, "R4 SELFCHECK FAIL row %d got=%.6f ref=%.6f rel=%.2e\n",
+                        r, (double)out[r], (double)ref[r], e / m);
+        }
+    }
+#endif
+}
+
 float vec_dot_iq3_xxs_q8_k(const void *vx, const void *vy, int n) {
     if (n % QK_K) return vec_dot_iq3_xxs_q8_k_scalar(vx, vy, n);
     iq3xxs_sign_init();

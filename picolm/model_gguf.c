@@ -509,6 +509,8 @@ const char *gguf_type_name(uint32_t type) {
         case 16: return "iq2_xxs";
         case 17: return "iq2_xs";
         case 18: return "iq3_xxs";
+        case 218: return "iq3_xxs_r4";
+        case 223: return "iq4_xs_r8";
         case 210: return "q2_k_r4";
         case 19: return "iq1_s";
         case 20: return "iq4_nl";   /* GGML_TYPE_IQ4_NL (was mislabeled iq4_xxs) */
@@ -988,6 +990,11 @@ int model_dump_tensor(const char *path, const char *spec) {
             case GGUF_TYPE_IQ4_NL: bpr = n / 32 * sizeof(block_iq4_nl); break;
             case GGUF_TYPE_Q2_0: bpr = n / 128 * sizeof(block_q2_0); break;
             case GGUF_TYPE_Q1_0: bpr = n / 128 * sizeof(block_q1_0); break;
+            case GGUF_TYPE_IQ3_XXS:   bpr = n / 256 * sizeof(block_iq3_xxs); break;
+            case GGUF_TYPE_Q5_K_R4:    bpr = n / 256 * sizeof(block_q5_k_r4) / 4; break;
+            /* R4/R8: bpr is the per-row share of one interleaved group. */
+            case GGUF_TYPE_IQ3_XXS_R4: bpr = n / 256 * sizeof(block_iq3_xxs_r4) / 4; break;
+            case GGUF_TYPE_IQ4_XS_R8:  bpr = n / 256 * sizeof(block_iq4_xs_r8) / 8; break;
             default:
                 fprintf(stderr, "ERROR: --dump-tensor: unsupported type %u (%s)\n",
                         t_type, gguf_type_name((gguf_type_t)t_type));
@@ -1014,6 +1021,23 @@ int model_dump_tensor(const char *path, const char *spec) {
             if ((uint64_t)row >= t_ne1) break;
             const uint8_t *rowp = addr + base + t_offset + (uint64_t)row * bpr;
             if (t_type == GGUF_TYPE_F32) memcpy(f, rowp, n * sizeof(float));
+            else if (t_type == GGUF_TYPE_Q5_K_R4) {
+                /* Row-interleaved: the group base is what the dequantizer wants. */
+                const uint8_t *gp = addr + base + t_offset +
+                                    (uint64_t)(row / 4) * bpr * 4;
+                dequantize_row_q5_k_r4_single((const block_q5_k_r4 *)gp, f, (int)n, row % 4);
+            }
+            else if (t_type == GGUF_TYPE_IQ3_XXS_R4) {
+                /* Row-interleaved: the group base is what the dequantizer wants. */
+                const uint8_t *gp = addr + base + t_offset +
+                                    (uint64_t)(row / 4) * bpr * 4;
+                dequantize_row_iq3_xxs_r4_single(gp, f, (int)n, row % 4);
+            }
+            else if (t_type == GGUF_TYPE_IQ4_XS_R8) {
+                const uint8_t *gp = addr + base + t_offset +
+                                    (uint64_t)(row / 8) * bpr * 8;
+                dequantize_row_iq4_xs_r8_single(gp, f, (int)n, row % 8);
+            }
             else dequantize_row(rowp, f, (int)n, (gguf_type_t)t_type);
             printf("DUMP %s[%ld] n=%zu:", tname, row, n);
             long lim = (nelem < (long)n) ? nelem : (long)n;
