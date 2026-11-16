@@ -9173,12 +9173,12 @@ void picolm_gelu_f32(float *x, int size) {
             float32x4_t x2 = vmulq_f32(xv, xv);
             float32x4_t inner = vfmaq_f32(xv, vdupq_n_f32(0.044715f), vmulq_f32(x2, xv));
             inner = vmulq_f32(vdupq_n_f32(0.79788456f), inner);
-            /* exp(2*inner) */
+            /* exp(2*inner) via 2^n split: exp(z) = 2^n * exp(frac), n = round(z/ln2) */
             float32x4_t z = vmulq_f32(two, inner);
             /* clamp so the 2^n exponent field stays positive (n+127 in [1,254]) */
             z = vminq_f32(vmaxq_f32(z, vdupq_n_f32(-87.0f)), vdupq_n_f32(88.0f));
-            float32x4_t nf = vrndnq_f32(z);
-            float32x4_t f = vsubq_f32(z, nf);
+            float32x4_t nf = vrndnq_f32(vmulq_f32(z, vdupq_n_f32(1.0f / 0.6931471805599453f))); /* round(z/ln2) */
+            float32x4_t f = vsubq_f32(z, vmulq_f32(nf, vdupq_n_f32(0.6931471805599453f)));   /* z - n*ln2 */
             float32x4_t q = vdupq_n_f32(1.0f / 120.0f);
             q = vfmaq_f32(vdupq_n_f32(1.0f / 24.0f), q, f);
             q = vfmaq_f32(vdupq_n_f32(1.0f / 6.0f),  q, f);
