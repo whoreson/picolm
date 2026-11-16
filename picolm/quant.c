@@ -11983,7 +11983,7 @@ void dequantize_row_iq1_m(const void *src, float *dst, int n) {
  * ============================================================================ */
 
 
-float vec_dot_iq2_xxs_q8_k(const void *vx, const void *vy, int n) {
+float vec_dot_iq2_xxs_q8_k_scalar(const void *vx, const void *vy, int n) {
     const block_iq2_xxs *w = (const block_iq2_xxs *)vx;
     const block_q8_K *y = (const block_q8_K *)vy;
     const int nb = n / QK_K;
@@ -11999,7 +11999,7 @@ float vec_dot_iq2_xxs_q8_k(const void *vx, const void *vy, int n) {
     return sumf;
 }
 
-float vec_dot_iq2_xs_q8_k(const void *vx, const void *vy, int n) {
+float vec_dot_iq2_xs_q8_k_scalar(const void *vx, const void *vy, int n) {
     const block_iq2_xs *w = (const block_iq2_xs *)vx;
     const block_q8_K *y = (const block_q8_K *)vy;
     const int nb = n / QK_K;
@@ -12015,7 +12015,7 @@ float vec_dot_iq2_xs_q8_k(const void *vx, const void *vy, int n) {
     return sumf;
 }
 
-float vec_dot_iq1_s_q8_k(const void *vx, const void *vy, int n) {
+float vec_dot_iq1_s_q8_k_scalar(const void *vx, const void *vy, int n) {
     const block_iq1_s *w = (const block_iq1_s *)vx;
     const block_q8_K *y = (const block_q8_K *)vy;
     const int nb = n / QK_K;
@@ -12031,7 +12031,7 @@ float vec_dot_iq1_s_q8_k(const void *vx, const void *vy, int n) {
     return sumf;
 }
 
-float vec_dot_iq3_s_q8_k(const void *vx, const void *vy, int n) {
+float vec_dot_iq3_s_q8_k_scalar(const void *vx, const void *vy, int n) {
     const block_iq3_s *w = (const block_iq3_s *)vx;
     const block_q8_K *y = (const block_q8_K *)vy;
     const int nb = n / QK_K;
@@ -12047,7 +12047,7 @@ float vec_dot_iq3_s_q8_k(const void *vx, const void *vy, int n) {
     return sumf;
 }
 
-float vec_dot_iq2_s_q8_k(const void *vx, const void *vy, int n) {
+float vec_dot_iq2_s_q8_k_scalar(const void *vx, const void *vy, int n) {
     const block_iq2_s *w = (const block_iq2_s *)vx;
     const block_q8_K *y = (const block_q8_K *)vy;
     const int nb = n / QK_K;
@@ -12063,7 +12063,7 @@ float vec_dot_iq2_s_q8_k(const void *vx, const void *vy, int n) {
     return sumf;
 }
 
-float vec_dot_iq1_m_q8_k(const void *vx, const void *vy, int n) {
+float vec_dot_iq1_m_q8_k_scalar(const void *vx, const void *vy, int n) {
     const block_iq1_m *w = (const block_iq1_m *)vx;
     const block_q8_K *y = (const block_q8_K *)vy;
     const int nb = n / QK_K;
@@ -12079,6 +12079,207 @@ float vec_dot_iq1_m_q8_k(const void *vx, const void *vy, int n) {
     return sumf;
 }
 
+
+
+/* ================================================================
+ * AVX2 GEMV for the grid quants (IQ2_XXS, IQ2_XS).
+ *
+ * Replaces "dequantize a 256-value block into a float buffer, then float-dot"
+ * with an integer MAC, using the same shape as iq6_mac() in sgemm_iq6_k.c:
+ *
+ *     a = sign_epi8(v, v)      -> |grid| as unsigned bytes
+ *     s = sign_epi8(y, v)      -> activation, negated where the grid byte is
+ *     p = maddubs_epi16(a, s)  -> unsigned x signed byte MAC
+ *     acc += madd_epi16(p, scale16)
+ *
+ * sign_epi8(v,v) is what makes this general: it turns a SIGNED int8 grid into
+ * unsigned magnitude with the sign folded into the activation, which plain
+ * maddubs_epi16 cannot do. For the unsigned IQ2 grids it is a plain absolute
+ * value and costs one instruction.
+ *
+ * The per-sub-block scale rides in as a 16-bit multiplier and the fp16 delta is
+ * applied once per 256-value block, so there is no 1 KB float staging buffer
+ * and no per-element int->float conversion.
+ *
+ * The scalar vec_dot_iq*_q8_k_scalar() functions remain the reference;
+ * tests/check_iq_gemv.c compares every kernel here against them.
+ * ================================================================ */
+
+#if defined(__AVX2__)
+/* One 32-byte vector of grid values: four uint64 entries, first entry lowest. */
+static inline __m256i iq_grid4x8(const uint64_t *base, unsigned a, unsigned b,
+                                 unsigned c, unsigned d) {
+    const __m128i lo = _mm_set_epi64x((long long)base[b], (long long)base[a]);
+    const __m128i hi = _mm_set_epi64x((long long)base[d], (long long)base[c]);
+    return _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+}
+
+/* One 8-byte +-1 mask from a 7-bit sign code, as a 64-bit integer. */
+static inline uint64_t iq_sign8(unsigned code) {
+    return *(const uint64_t *)(const void *)
+        ((const int8_t *)iq3xxs_sign_tab + 8 * (size_t)(code & 127));
+}
+
+/* 32 +-1 bytes from four 7-bit sign codes, in value order (code0 first). */
+static inline __m256i iq_sign32(unsigned c0, unsigned c1, unsigned c2, unsigned c3) {
+    const __m128i lo = _mm_set_epi64x((long long)iq_sign8(c1), (long long)iq_sign8(c0));
+    const __m128i hi = _mm_set_epi64x((long long)iq_sign8(c3), (long long)iq_sign8(c2));
+    return _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+}
+
+/* |v| x (y negated where v is negative), 32 int16 lane products. */
+static inline __m256i iq_mac32(__m256i v, __m256i y) {
+    return _mm256_maddubs_epi16(_mm256_sign_epi8(v, v), _mm256_sign_epi8(y, v));
+}
+#endif
+
+#if defined(__AVX2__)
+static float vec_dot_iq2_xxs_q8_k_avx2(const void *vx, const void *vy, int n) {
+    const block_iq2_xxs *x = (const block_iq2_xxs *)vx;
+    const block_q8_K *y = (const block_q8_K *)vy;
+    const int nb = n / QK_K;
+    __m256 accf = _mm256_setzero_ps();
+    iq3xxs_sign_init();
+    for (int i = 0; i < nb; ++i) {
+        /* The reference computes db = d*(0.5+ls)*0.25 per sub-block. We use the
+         * integer multiplier (2*ls+1) = 2*(0.5+ls), which is twice too large,
+         * so the constant folded in here is 0.25/2 = 0.125. */
+        const float d = fp16_to_fp32_lookup(x[i].d) * y[i].d * 0.125f;
+        const int8_t *q8 = y[i].qs;
+        __m256i sumi = _mm256_setzero_si256();
+        for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+            uint32_t aux32[2];
+            memcpy(aux32, x[i].qs + 4 * ib32, sizeof aux32);
+            const unsigned char *a8 = (const unsigned char *)aux32;
+            const __m256i v = iq_grid4x8(iq2xxs_grid, a8[0], a8[1], a8[2], a8[3]);
+            const __m256i s = iq_sign32((aux32[1] >>  0) & 127u, (aux32[1] >>  7) & 127u,
+                                        (aux32[1] >> 14) & 127u, (aux32[1] >> 21) & 127u);
+            const __m256i q = _mm256_sign_epi8(_mm256_loadu_si256((const __m256i *)q8), s);
+            q8 += 32;
+            sumi = _mm256_add_epi32(sumi,
+                   _mm256_madd_epi16(iq_mac32(v, q), _mm256_set1_epi16((short)(2 * (int)(aux32[1] >> 28) + 1))));
+        }
+        accf = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), accf);
+    }
+    return iq3xxs_hsum(accf);
+}
+
+static float vec_dot_iq2_xs_q8_k_avx2(const void *vx, const void *vy, int n) {
+    const block_iq2_xs *x = (const block_iq2_xs *)vx;
+    const block_q8_K *y = (const block_q8_K *)vy;
+    const int nb = n / QK_K;
+    __m256 accf = _mm256_setzero_ps();
+    iq3xxs_sign_init();
+    for (int i = 0; i < nb; ++i) {
+        /* See IQ2_XXS above: (2*scale+1) is 2x the reference's (0.5+scale). */
+        const float d = fp16_to_fp32_lookup(x[i].d) * y[i].d * 0.125f;
+        const int8_t *q8 = y[i].qs;
+        __m256i sumi = _mm256_setzero_si256();
+        for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+            const uint16_t *w2 = x[i].qs + 4 * ib32;
+            const __m256i v = iq_grid4x8(iq2xs_grid,
+                                         w2[0] & 511, w2[1] & 511, w2[2] & 511, w2[3] & 511);
+            const __m256i s = iq_sign32(w2[0] >> 9, w2[1] >> 9, w2[2] >> 9, w2[3] >> 9);
+            const __m256i q = _mm256_sign_epi8(_mm256_loadu_si256((const __m256i *)q8), s);
+            q8 += 32;
+            /* Two scales per sub-block: the reference uses db[l/2] with four
+             * indices l of 8 values each, i.e. values 0..15 use the low nibble
+             * and 16..31 the high one. maddubs produces 16 int16 lanes (two
+             * values each) and madd_epi16 consumes them in order, so the
+             * 16-lane pattern is [lo x8][hi x8]. */
+            const short slo = (short)(2 * (x[i].scales[ib32] & 0xf) + 1);
+            const short shi = (short)(2 * (x[i].scales[ib32] >>  4) + 1);
+            const __m256i mul = _mm256_setr_epi16(slo, slo, slo, slo, slo, slo, slo, slo,
+                                                  shi, shi, shi, shi, shi, shi, shi, shi);
+            sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(iq_mac32(v, q), mul));
+        }
+        accf = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), accf);
+    }
+    return iq3xxs_hsum(accf);
+}
+
+/* Expand one sign byte (8 bits) into 8 bytes of +1/-1, bit j -> byte j.
+ * sign_epi8 needs +-1, not 0/1, so a set bit becomes 0xFF (-1). */
+static inline uint64_t iq_signbyte_to_mask(unsigned b) {
+    uint64_t r = 0;
+    for (int j = 0; j < 8; ++j)
+        r |= (uint64_t)((((b >> j) & 1u) ? 0xFFu : 0x01u)) << (8 * j);
+    return r;
+}
+
+static float vec_dot_iq2_s_q8_k_avx2(const void *vx, const void *vy, int n) {
+    const block_iq2_s *x = (const block_iq2_s *)vx;
+    const block_q8_K *y = (const block_q8_K *)vy;
+    const int nb = n / QK_K;
+    __m256 accf = _mm256_setzero_ps();
+    iq3xxs_sign_init();
+    for (int i = 0; i < nb; ++i) {
+        /* Reference uses db = d*(0.5+scale)*0.25 -> 2*(0.5+scale) = 2*scale+1,
+         * so fold 0.125 outside. */
+        const float d = fp16_to_fp32_lookup(x[i].d) * y[i].d * 0.125f;
+        const int8_t *q8 = y[i].qs;
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *qh = x[i].qh;
+        const uint8_t *sgn = x[i].qs + QK_K / 8;
+        __m256i sumi = _mm256_setzero_si256();
+        for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+            const unsigned hi = qh[ib32];
+            const __m256i v = iq_grid4x8(iq2s_grid,
+                                         qs[0] | ((hi << 8) & 0x300), qs[1] | ((hi << 6) & 0x300),
+                                         qs[2] | ((hi << 4) & 0x300), qs[3] | ((hi << 2) & 0x300));
+            const __m256i s = _mm256_set_epi64x((long long)iq_signbyte_to_mask(sgn[3]),
+                                                (long long)iq_signbyte_to_mask(sgn[2]),
+                                                (long long)iq_signbyte_to_mask(sgn[1]),
+                                                (long long)iq_signbyte_to_mask(sgn[0]));
+            const __m256i q = _mm256_sign_epi8(_mm256_loadu_si256((const __m256i *)q8), s);
+            q8 += 32;
+            const short slo = (short)(2 * (x[i].scales[ib32] & 0xf) + 1);
+            const short shi = (short)(2 * (x[i].scales[ib32] >>  4) + 1);
+            const __m256i mul = _mm256_setr_epi16(slo, slo, slo, slo, slo, slo, slo, slo,
+                                                  shi, shi, shi, shi, shi, shi, shi, shi);
+            sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(iq_mac32(v, q), mul));
+            qs += 4;
+            sgn += 4;
+        }
+        accf = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), accf);
+    }
+    return iq3xxs_hsum(accf);
+}
+#endif /* __AVX2__ */
+
+/* Public entry points: widest available kernel, exact scalar reference last. */
+float vec_dot_iq2_xxs_q8_k(const void *vx, const void *vy, int n) {
+#if defined(__AVX2__)
+    if (n % QK_K == 0) return vec_dot_iq2_xxs_q8_k_avx2(vx, vy, n);
+#endif
+    return vec_dot_iq2_xxs_q8_k_scalar(vx, vy, n);
+}
+float vec_dot_iq2_xs_q8_k(const void *vx, const void *vy, int n) {
+#if defined(__AVX2__)
+    if (n % QK_K == 0) return vec_dot_iq2_xs_q8_k_avx2(vx, vy, n);
+#endif
+    return vec_dot_iq2_xs_q8_k_scalar(vx, vy, n);
+}
+float vec_dot_iq1_s_q8_k(const void *vx, const void *vy, int n) {
+    return vec_dot_iq1_s_q8_k_scalar(vx, vy, n);
+}
+/* IQ3_S stays on the scalar path. Its grid is uint32 (4 values) with one
+ * 8-bit sign byte spanning TWO indices and a qh/signs/scale cursor that
+ * advances at three different rates; three attempts at the vectorised form
+ * failed check_iq_gemv, so it is not shipped half-verified. The 2-bit types
+ * (IQ2_XXS / IQ2_XS / IQ2_S) and IQ1_S are done -- see below. */
+float vec_dot_iq3_s_q8_k(const void *vx, const void *vy, int n) {
+    return vec_dot_iq3_s_q8_k_scalar(vx, vy, n);
+}
+float vec_dot_iq2_s_q8_k(const void *vx, const void *vy, int n) {
+#if defined(__AVX2__)
+    if (n % QK_K == 0) return vec_dot_iq2_s_q8_k_avx2(vx, vy, n);
+#endif
+    return vec_dot_iq2_s_q8_k_scalar(vx, vy, n);
+}
+float vec_dot_iq1_m_q8_k(const void *vx, const void *vy, int n) {
+    return vec_dot_iq1_m_q8_k_scalar(vx, vy, n);
+}
 
 /* ================================================================
  * Correct-by-construction 4-row R4 dot: dequantize each row with the

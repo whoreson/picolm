@@ -401,7 +401,7 @@ clean:
 	-$(RM) shaders/*.spv
 	-$(RM) test_swa test_swa.exe test_quant test_attn_tiled test_attn_tiled.exe test_attn_diff test_attn_diff.exe
 	-$(RM) tests/test_glm5_ops tests/test_glm5_ops.exe test_glm5_dsa test_glm5_snapshot
-	-$(RM) check_r4_gemv check_iq3xxs_r4
+	-$(RM) check_r4_gemv check_iq3xxs_r4 check_iq_gemv
 
 # --- GLM-5 operator unit tests (standalone, no model file needed) ---
 # Re-derives hc_pre / KDA / conv1d / MoE-router with plain scalar code and
@@ -733,6 +733,12 @@ check_r4_gemv: tests/check_r4_gemv.c quant.c $(SGEMM_SRCS)
 	$(CC) $(TEST_NATIVE_CFLAGS) -I. -o $@ tests/check_r4_gemv.c quant.c $(SGEMM_SRCS) \
 	    -lm -lpthread -fopenmp
 
+# Differential test for the IQ grid-quant GEMV kernels (IQ2_XXS/2_XS/1_S/3_S/2_S):
+# synthetic blocks vs the scalar vec_dot_iq*_q8_k_scalar() oracle. No model file.
+check_iq_gemv: tests/check_iq_gemv.c quant.c $(SGEMM_SRCS)
+	$(CC) $(TEST_NATIVE_CFLAGS) -I. -o $@ tests/check_iq_gemv.c quant.c $(SGEMM_SRCS) \
+	    -lm -lpthread -fopenmp
+
 # Dequantizer round-trip check for the newest row-interleaved formats: builds a
 # synthetic group with ik_llama's repack rule and confirms every logical row
 # matches the plain-format dequantizer.
@@ -1004,6 +1010,10 @@ check-q6-k-r4: test_q6_k_r4
 check-r4-gemv: check_r4_gemv
 	./check_r4_gemv
 
+.PHONY: check-iq-gemv
+check-iq-gemv: check_iq_gemv
+	./check_iq_gemv
+
 .PHONY: check-iq3xxs-r4
 check-iq3xxs-r4: check_iq3xxs_r4
 	./check_iq3xxs_r4
@@ -1022,7 +1032,7 @@ check-rowinterleave: test_rowinterleave
 # roughly double check-all's cost. CI runs it as its own step.
 check-all: check-hreduce check-kvcache-tokwrite check-quant check-q6-k-r4 \
            check-attn-tail \
-           check-rowinterleave check-r8-simd check-r4-gemv check-iq3xxs-r4 \
+           check-rowinterleave check-r8-simd check-r4-gemv check-iq3xxs-r4 check-iq-gemv \
            check-glm5-dsa check-glm5-snapshot check-attn check-attn-decode check-pool
 	@echo ""
 	@echo "=== check-all: all self-contained suites passed ==="

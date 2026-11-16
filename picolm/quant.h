@@ -2033,6 +2033,15 @@ float vec_dot_iq1_s_q8_k(const void *vx, const void *vy, int n);
 float vec_dot_iq3_s_q8_k(const void *vx, const void *vy, int n);
 float vec_dot_iq2_s_q8_k(const void *vx, const void *vy, int n);
 float vec_dot_iq1_m_q8_k(const void *vx, const void *vy, int n);
+/* Scalar reference for each of the above: dequantize-then-dot, transcribed
+ * from ggml-quants.c. Exposed so tests/check_iq_gemv.c can use it as the
+ * oracle for the vectorised kernels. */
+float vec_dot_iq2_xxs_q8_k_scalar(const void *vx, const void *vy, int n);
+float vec_dot_iq2_xs_q8_k_scalar(const void *vx, const void *vy, int n);
+float vec_dot_iq1_s_q8_k_scalar(const void *vx, const void *vy, int n);
+float vec_dot_iq3_s_q8_k_scalar(const void *vx, const void *vy, int n);
+float vec_dot_iq2_s_q8_k_scalar(const void *vx, const void *vy, int n);
+float vec_dot_iq1_m_q8_k_scalar(const void *vx, const void *vy, int n);
 /* IQ3_XXS_R4 / IQ4_XS_R8 (ik_llama GGML types 218 / 223): row-interleaved
  * formats. The _single variants extract one logical row from a group base and
  * write exactly n floats; the group variants write rpb rows of n floats each. */

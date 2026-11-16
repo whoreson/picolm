@@ -66,3 +66,4 @@ picolm/*.bak
 picolm/*.o.tmp
 picolm/check_r4_gemv
 picolm/check_iq3xxs_r4
+check_iq_gemv
