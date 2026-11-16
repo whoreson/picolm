@@ -151,20 +151,42 @@ static void glm5_prof_print(void) {
 
 /* SwiGLU clamp value actually applied.
  *
- * The GGUF carries swiglu_clamp_exp/shexp = 10.0 for every layer, but the ik
- * reference implementation for glm5next never reads those keys, so the oracle
- * runs UNCLAMPED. Match the oracle by default and expose the clamp behind an
- * env var so both behaviours can be A/B'd (see glm53flash.md Q1):
- *   PICOLM_GLM5_CLAMP=1     -> apply the GGUF clamp value
- *   PICOLM_GLM5_NOCLAMP=1   -> force it off (same as default)
+ * The GGUF carries swiglu_clamp_exp/shexp = 10.0 for every layer.  The ik
+ * glm5next graph builder parses those keys but never applies them, so the
+ * oracle runs UNCLAMPED -- which is why this used to default to off.
+ *
+ * Measurement says the clamp is the correct behaviour, though:
+ *   - layer 10 shared expert rms    unclamped 0.211491 / clamped 0.341236
+ *     (ik 0.278092; clamped overshoots but the TOTAL MoE output lands on
+ *      ik: 0.343310 vs ik 0.346686, where unclamped gives 0.214758)
+ *   - 21-token "capital of France" logits vs the ik oracle:
+ *     cosine 0.9437 unclamped -> 0.9571 clamped, rms diff 0.645 -> 0.573.
+ * So the clamp is ON by default now.
+ *
+ *   PICOLM_GLM5_NOCLAMP=1   -> force it off (reproduces the old behaviour)
+ *   PICOLM_GLM5_CLAMP=1     -> force it on (now redundant, kept for scripts)
  */
 static float glm5_clamp_value(const model_config_t *c) {
     static int mode = -1;   /* -1 unknown, 0 off, 1 on */
     if (mode < 0) {
-        mode = getenv("PICOLM_GLM5_CLAMP") ? 1 : 0;
+        mode = getenv("PICOLM_GLM5_NOCLAMP") ? 0 : 1;
+        if (getenv("PICOLM_GLM5_EXPCLAMP")) mode = atoi(getenv("PICOLM_GLM5_EXPCLAMP"));
     }
     if (!mode) return 0.0f;   /* 0 == disabled */
     return c->glm5_clamp_exp;
+}
+
+/* Same, for the shared expert.  The GGUF carries a SEPARATE
+ * swiglu_clamp_shexp array (10.0 for every layer, same value as _exp in
+ * practice, but it is a distinct key and gating the shared expert on the
+ * routed-expert limit would be wrong the moment they differ). */
+static float glm5_clamp_value_shexp(const model_config_t *c) {
+    static int mode = -1;
+    if (mode < 0) {
+        mode = getenv("PICOLM_GLM5_NOCLAMP") ? 0 : 1;
+    }
+    if (!mode) return 0.0f;
+    return c->glm5_clamp_shexp;
 }
 
 static float glm5_rms(const float *v, int n) {
@@ -2364,7 +2386,7 @@ static void glm5_moe_shared_expert(const model_t *m, const layer_weights_t *lw,
 {
     const model_config_t *c = &m->config;
     const int D = c->n_embd;
-    const float clamp_v = glm5_clamp_value(c);
+    const float clamp_v = glm5_clamp_value_shexp(c);
 
     matmul(s->hb_exp, cur, lw->ffn_gate_shexp, D, SFF, lw->type_ffn_gate_shexp);
     matmul(s->hb2_exp, cur, lw->ffn_up_shexp, D, SFF, lw->type_ffn_up_shexp);
@@ -3005,7 +3027,7 @@ static int glm5_moe_ffn_batch_ep(const model_t *m, const glm5_layer_weights_t *g
                 ep_grow((void **)&shd, &c_shd, (size_t)NT * D * sizeof(float))) {
                 matmul_batch(shg, cur_b, NT, lw->ffn_gate_shexp, D, SFF, lw->type_ffn_gate_shexp);
                 matmul_batch(shu, cur_b, NT, lw->ffn_up_shexp,   D, SFF, lw->type_ffn_up_shexp);
-                { ep_swiglu_t sw = { shg, shu, SFF, NT, clamp_v };
+                { ep_swiglu_t sw = { shg, shu, SFF, NT, glm5_clamp_value_shexp(c) };
                   tensor_parallel_for_dyn((NT + 7) / 8, ep_swiglu_task, &sw); }
                 matmul_batch(shd, shg, NT, lw->ffn_down_shexp, SFF, D, lw->type_ffn_down_shexp);
                 { ep_add_t ac = { out_b, shd, D }; tensor_parallel_for_dyn(NT, ep_add_task, &ac); }
