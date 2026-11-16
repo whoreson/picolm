@@ -898,6 +898,13 @@ check-glm5-moe-ep: test_glm5_moe_ep
 	./test_glm5_moe_ep perttoken
 	./test_glm5_moe_ep
 
+test_glm5_pf_par: tests/test_glm5_pf_par.c model_glm5.c model_moe.c model_ssm.c model_kv_cache.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) model.h
+	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O3 -o $@ tests/test_glm5_pf_par.c model_moe.c model_ssm.c model_kv_cache.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
+
+.PHONY: check-glm5-pf-par
+check-glm5-pf-par: test_glm5_pf_par
+	./test_glm5_pf_par
+
 # DSA k-pool selector invariants (causal, bounded, sorted, deduped).
 test_glm5_dsa: tests/test_glm5_dsa.c model_glm5.c model_moe.c model_ssm.c model_kv_cache.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) model.h
 	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O2 -o $@ tests/test_glm5_dsa.c model_glm5.c model_moe.c model_ssm.c model_kv_cache.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++

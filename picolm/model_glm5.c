@@ -3668,6 +3668,137 @@ static void glm5_kda_tail_par(
         matmul(out, head_out, lw->attn_output, DI, c->n_embd, lw->type_attn_output);
 }
 
+/* ---- Prefill: per-token serial loops, run in parallel ----------------------------------------
+ *
+ * The batched prefill batches the weight-bound GEMMs but left several loops per token on the main
+ * thread while the other workers spin: hc_pre (rms over S*D doubles + a tiny threaded matmul)
+ * and hc_post run twice per layer for each of the 512 tokens, and the KDA tail issued one
+ * pool dispatch per token (512 per layer), re-streaming the 4 MB recurrent state through DRAM
+ * for every token.
+ *
+ *  - hc_pre / hc_post: every token is independent. One task per token, with per-token scratch.
+ *    matmul() inside a task runs serially with the same per-row kernel, so the results are
+ *    bit-identical to the serial loop.
+ *  - KDA tail: heads are independent, tokens within a head are sequential. One task per HEAD that
+ *    walks all tokens in order, so a head's 64 KB state stays in L2 for the whole chunk and the
+ *    layer needs one dispatch instead of 512. Per-head arithmetic is unchanged (it is the same
+ *    glm5_kda_head_task), so the results are bit-identical.
+ * PICOLM_GLM5_PF_SERIAL=1 restores the old loops (A/B, bisection).
+ * PICOLM_GLM5_PFPROF=1 prints where a prefill layer's time goes, for KDA and MLA layers. */
+static int glm5_pf_par(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("PICOLM_GLM5_PF_SERIAL") ? 0 : 1;
+    return cached;
+}
+
+enum { PF_HC_ATTN_PRE, PF_ATTN, PF_KDA_PROJ, PF_KDA_TAIL, PF_KDA_OUT, PF_HC_ATTN_POST,
+       PF_HC_FFN_PRE, PF_FFN, PF_HC_FFN_POST, PF_LAYER, PF_N };
+static double g_pf_ms[2][PF_N];      /* [0] KDA / dense-attention layers, [1] MLA layers */
+static long   g_pf_layers[2];
+static int glm5_pfprof_on(void) {
+    static int cached = -1;
+    if (cached < 0) { const char *e = getenv("PICOLM_GLM5_PFPROF"); cached = (e && atoi(e) > 0) ? 1 : 0; }
+    return cached;
+}
+static void glm5_pfprof_print(void) {
+    static const char *nm[PF_N] = { "hc_pre (attn) + norm", "attention block", "  kda projections", "  kda tail (conv+state)",
+        "  kda out projection", "hc_post (attn)", "hc_pre (ffn) + norm", "ffn / moe", "hc_post (ffn)", "LAYER TOTAL" };
+    static const char *kind[2] = { "KDA layers", "MLA layers" };
+    for (int k = 0; k < 2; k++) {
+        if (!g_pf_layers[k]) continue;
+        const double tot = g_pf_ms[k][PF_LAYER] / g_pf_layers[k];
+        fprintf(stderr, "\nPrefill layer breakdown, %s (%ld layers), mean ms per layer:\n", kind[k], g_pf_layers[k]);
+        for (int r = 0; r < PF_N; r++) {
+            if (g_pf_ms[k][r] <= 0.0) continue;
+            const double v = g_pf_ms[k][r] / g_pf_layers[k];
+            fprintf(stderr, "  %-26s %9.2f ms  %5.1f%%\n", nm[r], v, 100.0 * v / tot);
+        }
+    }
+}
+#define PFP_BEGIN(t) double t = glm5_pfprof_on() ? glm5_prof_now() : 0.0
+#define PFP_END(t, kind, r) do { if (t) g_pf_ms[kind][r] += glm5_prof_now() - t; } while (0)
+
+typedef struct {
+    const model_t *m; const glm5_layer_weights_t *gw; int is_attn;
+    float *hc_x_b, *cur_b, *hc_res_b, *post_b, *comb_b, *scr_b; const float *norm_w;
+    int S, D, M; float eps;
+} pf_hcpre_t;
+static void pf_hcpre_task(int t, void *vp) {
+    const pf_hcpre_t *x = (const pf_hcpre_t *)vp;
+    const int S = x->S, D = x->D;
+    float *hc_x_t = x->hc_x_b + (size_t)t * S * D, *cur_t = x->cur_b + (size_t)t * D;
+    float *res_t = x->hc_res_b + (size_t)t * S * D, *post_t = x->post_b + (size_t)t * S;
+    float *comb_t = x->comb_b + (size_t)t * S * S;
+    memcpy(res_t, hc_x_t, (size_t)S * D * sizeof(float));
+    glm5_hc_pre(x->m, x->gw, x->is_attn, hc_x_t, cur_t, post_t, comb_t, x->scr_b + (size_t)t * ((size_t)S * D + x->M));
+    rmsnorm(cur_t, cur_t, x->norm_w, D, x->eps);
+}
+/* 1 if it ran in parallel; 0 if the caller must run the serial loop (diagnostics on, no memory). */
+static int pf_run_hcpre(const model_t *m, const glm5_layer_weights_t *gw, int is_attn, int n_tokens,
+                        float *hc_x_b, float *cur_b, float *hc_res_b, float *post_b, float *comb_b,
+                        const float *norm_w)
+{
+    if (g_hc_tag[0]) return 0;                    /* per-stage diagnostics are per call: stay serial */
+    const model_config_t *c = &m->config;
+    const int S = c->glm5_hc, D = c->n_embd, M = (2 + S) * S;
+    static float *scr; static size_t cap;
+    const size_t need = (size_t)n_tokens * ((size_t)S * D + M) * sizeof(float);
+    if (need > cap) { float *nb = (float *)realloc(scr, need); if (!nb) return 0; scr = nb; cap = need; }
+    pf_hcpre_t x = { m, gw, is_attn, hc_x_b, cur_b, hc_res_b, post_b, comb_b, scr, norm_w, S, D, M, c->rms_norm_eps };
+    tensor_parallel_for_dyn(n_tokens, pf_hcpre_task, &x);
+    return 1;
+}
+
+typedef struct { const model_t *m; float *hc_x_b; const float *res_b, *post_b, *comb_b, *attn_b; int S, D; } pf_hcpost_t;
+static void pf_hcpost_task(int t, void *vp) {
+    const pf_hcpost_t *x = (const pf_hcpost_t *)vp;
+    glm5_hc_post(x->m, x->attn_b + (size_t)t * x->D, x->res_b + (size_t)t * x->S * x->D,
+                 x->post_b + (size_t)t * x->S, x->comb_b + (size_t)t * x->S * x->S,
+                 x->hc_x_b + (size_t)t * x->S * x->D);
+}
+static int pf_run_hcpost(const model_t *m, int n_tokens, float *hc_x_b, const float *res_b,
+                         const float *post_b, const float *comb_b, const float *attn_b)
+{
+    pf_hcpost_t x = { m, hc_x_b, res_b, post_b, comb_b, attn_b, m->config.glm5_hc, m->config.n_embd };
+    tensor_parallel_for_dyn(n_tokens, pf_hcpost_task, &x);
+    return 1;
+}
+
+typedef struct { const glm5_kda_head_ctx_t *ctxs; int n_tokens; } pf_kda_seq_t;
+static void pf_kda_head_seq_task(int h, void *vp) {
+    const pf_kda_seq_t *x = (const pf_kda_seq_t *)vp;
+    for (int t = 0; t < x->n_tokens; t++) glm5_kda_head_task(h, (void *)&x->ctxs[t]);
+}
+/* Same effect as calling glm5_kda_tail_par(..., do_out_proj=0) for t = 0..n_tokens-1 in order. */
+static int glm5_kda_layer_par(const model_t *m, const glm5_layer_weights_t *gw, run_state_t *s,
+                              int layer_idx, int n_tokens,
+                              const float *q_b, const float *k_b, const float *v_b,
+                              const float *z_b, const float *raw_b, const float *beta_b,
+                              float *conv_b, float *g_scr, float *head_b, float *beta_sh)
+{
+    const model_config_t *c = &m->config;
+    const int H = c->glm5_n_kda_heads, KD = c->glm5_kda_dim, DI = H * KD;
+    static glm5_kda_head_ctx_t *ctxs; static size_t cap;
+    if ((size_t)n_tokens > cap) {
+        glm5_kda_head_ctx_t *nb = (glm5_kda_head_ctx_t *)realloc(ctxs, (size_t)n_tokens * sizeof *ctxs);
+        if (!nb) return 0;
+        ctxs = nb; cap = (size_t)n_tokens;
+    }
+    for (int t = 0; t < n_tokens; t++) {
+        glm5_kda_head_ctx_t kc = {
+            c, gw, KD, DI, c->ssm_d_conv, 3 * DI,
+            q_b + (size_t)t * DI, k_b + (size_t)t * DI, v_b + (size_t)t * DI,
+            z_b + (size_t)t * DI, raw_b + (size_t)t * DI, beta_b + (size_t)t * H,
+            s->glm5.kda_conv_state[layer_idx], s->glm5.kda_state[layer_idx],
+            conv_b + (size_t)t * 3 * DI, g_scr, head_b + (size_t)t * DI, beta_sh
+        };
+        ctxs[t] = kc;
+    }
+    pf_kda_seq_t x = { ctxs, n_tokens };
+    tensor_parallel_for_dyn(H, pf_kda_head_seq_task, &x);
+    return 1;
+}
+
 /* Batched GLM-5 prefill. Processes n_tokens (<= GLM5_PREFILL_MAX_TOKENS)
  * starting at start_pos. Batches the weight-bound KDA projections and the
  * attention output projection across tokens; everything else stays per-token.
@@ -3785,10 +3916,14 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
             const glm5_layer_weights_t *gw = &w->glm5[il];
             int mla_ord = c->glm5_layer_mla_ord[il];
             BENCH_LAYER_START();
+            PFP_BEGIN(tLayer);
+            const int pfk = mla_ord >= 0 ? 1 : 0;
             /* ============ Attention block ============ */
 
             /* Phase A: hc_pre(attn) + RMSNorm, per token. Saves hc_res,
              * post, comb per token for the hc_post in phase D. */
+            PFP_BEGIN(tA);
+            if (!(glm5_pf_par() && pf_run_hcpre(m, gw, 1, n_tokens, hc_x_b, cur_b, hc_res_b, post_b, comb_b, s->attn_norm_w[il])))
             for (int t = 0; t < n_tokens; t++) {
                 float *hc_x_t = hc_x_b + (size_t)t*S*D;
                 float *cur_t  = cur_b + (size_t)t*D;
@@ -3799,6 +3934,8 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                 glm5_hc_pre(m, gw, 1, hc_x_t, cur_t, post_t, comb_t, s->glm5.hc_scratch);
                 rmsnorm(cur_t, cur_t, s->attn_norm_w[il], D, c->rms_norm_eps);
             }
+            PFP_END(tA, pfk, PF_HC_ATTN_PRE);
+            PFP_BEGIN(tAt);
 
             if (mla_ord >= 0) {
                 /* MLA: batch the weight-bound projections across the token
@@ -3986,6 +4123,7 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                  * sequential tail per token. The projections read cur_b and
                  * write into per-token planes; the tail reads those planes
                  * and updates the recurrent state in token order. */
+                PFP_BEGIN(tKP);
                 matmul_batch(q_b, cur_b, n_tokens, lw->attn_q, D, DI, lw->type_attn_q);
                 matmul_batch(k_b, cur_b, n_tokens, lw->attn_k, D, DI, lw->type_attn_k);
                 matmul_batch(v_b, cur_b, n_tokens, lw->attn_v, D, DI, lw->type_attn_v);
@@ -3997,10 +4135,14 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                 matmul_batch(fb_b, fa_b, n_tokens, gw->kda_f_b, KD, DI, gw->type_kda_f_b);
                 /* beta: [N][H] */
                 matmul_batch(beta_b, cur_b, n_tokens, gw->kda_beta, D, H, gw->type_kda_beta);
+                PFP_END(tKP, pfk, PF_KDA_PROJ);
 
                 /* Sequential tail: conv -> recurrence -> norm -> gate. The
                  * tail's output projection is deferred so attn_output can be
                  * GEMM'd for all tokens at once below. */
+                PFP_BEGIN(tKT);
+                if (!(glm5_pf_par() && glm5_kda_layer_par(m, gw, s, il, n_tokens, q_b, k_b, v_b, gb_b, fb_b,
+                                                          beta_b, conv_b, g_scr, head_b, beta_sh)))
                 for (int t = 0; t < n_tokens; t++) {
                     glm5_kda_tail_par(m, gw, lw, s, il, start_pos + t,
                                   q_b + (size_t)t*DI,
@@ -4016,12 +4158,18 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                                   attn_b + (size_t)t*D,
                                   0);                       /* defer out proj */
                 }
+                PFP_END(tKT, pfk, PF_KDA_TAIL);
                 /* Batched attention output projection: [N][DI] -> [N][D]. */
+                PFP_BEGIN(tKO);
                 matmul_batch(attn_b, head_b, n_tokens, lw->attn_output, DI, D,
                              lw->type_attn_output);
+                PFP_END(tKO, pfk, PF_KDA_OUT);
             }
+            PFP_END(tAt, pfk, PF_ATTN);
 
             /* Phase D: hc_post(attn) per token */
+            PFP_BEGIN(tD);
+            if (!(glm5_pf_par() && pf_run_hcpost(m, n_tokens, hc_x_b, hc_res_b, post_b, comb_b, attn_b)))
             for (int t = 0; t < n_tokens; t++) {
                 float *hc_x_t = hc_x_b + (size_t)t*S*D;
                 float *res_t  = hc_res_b + (size_t)t*S*D;
@@ -4030,10 +4178,13 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                 float *attn_t = attn_b + (size_t)t*D;
                 glm5_hc_post(m, attn_t, res_t, post_t, comb_t, hc_x_t);
             }
+            PFP_END(tD, pfk, PF_HC_ATTN_POST);
 
             /* ============ FFN block ============ */
 
             /* Phase A': hc_pre(ffn) + RMSNorm per token (reuses post/comb planes) */
+            PFP_BEGIN(tA2);
+            if (!(glm5_pf_par() && pf_run_hcpre(m, gw, 0, n_tokens, hc_x_b, cur_b, hc_res_b, post_b, comb_b, s->post_attn_norm_w[il])))
             for (int t = 0; t < n_tokens; t++) {
                 float *hc_x_t = hc_x_b + (size_t)t*S*D;
                 float *cur_t  = cur_b + (size_t)t*D;
@@ -4044,6 +4195,7 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                 glm5_hc_pre(m, gw, 0, hc_x_t, cur_t, post_t, comb_t, s->glm5.hc_scratch);
                 rmsnorm(cur_t, cur_t, s->post_attn_norm_w[il], D, c->rms_norm_eps);
             }
+            PFP_END(tA2, pfk, PF_HC_FFN_PRE);
 
             /* Phase B': FFN / MoE.
              *
@@ -4056,6 +4208,7 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
             /* NOTE: there is an unexplained long-generation divergence that is
              * NOT caused by this batching -- see the TODO above
              * glm5_moe_ffn_batch(). */
+            PFP_BEGIN(tF);
             if (il < c->n_layer_dense_lead) {
                 for (int t = 0; t < n_tokens; t++)
                     glm5_dense_ffn(m, lw, s, cur_b + (size_t)t*D, attn_b + (size_t)t*D);
@@ -4065,8 +4218,11 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                 for (int t = 0; t < n_tokens; t++)
                     glm5_moe_ffn(m, gw, lw, s, cur_b + (size_t)t*D, attn_b + (size_t)t*D);
             }
+            PFP_END(tF, pfk, PF_FFN);
 
             /* Phase D': hc_post(ffn) per token */
+            PFP_BEGIN(tD2);
+            if (!(glm5_pf_par() && pf_run_hcpost(m, n_tokens, hc_x_b, hc_res_b, post_b, comb_b, attn_b)))
             for (int t = 0; t < n_tokens; t++) {
                 float *hc_x_t = hc_x_b + (size_t)t*S*D;
                 float *res_t  = hc_res_b + (size_t)t*S*D;
@@ -4075,6 +4231,7 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                 float *attn_t = attn_b + (size_t)t*D;
                 glm5_hc_post(m, attn_t, res_t, post_t, comb_t, hc_x_t);
             }
+            PFP_END(tD2, pfk, PF_HC_FFN_POST);
 #ifdef PICOLM_VIZ
             {
                 /* Mean-reduce S streams -> single vector per token, then push batch. */
@@ -4100,6 +4257,7 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                     fprintf(stderr, "GLM5 prefill: stopping after layer %d (PICOLM_STOP_LAYER)\n", il);
                 break;
             }
+            if (tLayer) { g_pf_ms[pfk][PF_LAYER] += glm5_prof_now() - tLayer; g_pf_layers[pfk]++; if (g_pf_layers[0] + g_pf_layers[1] == 1) atexit(glm5_pfprof_print); }
             BENCH_LAYER_END(il, 1);
         }
 
