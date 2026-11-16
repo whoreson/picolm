@@ -10980,6 +10980,15 @@ static float vec_dot_iq3_xxs_q8_k_avx2(const void *vx, const void *vy, int n) {
 #endif /* __AVX2__ */
 
 #if defined(__ARM_NEON)
+/* Build a uint32x4_t from 4 indexed grid lookups. */
+static inline uint32x4_t iq3xxs_grid_vec_neon(const uint8_t *q, int off) {
+    uint32x4_t v = vld1q_dup_u32((const uint32_t *)&iq3xxs_grid[q[off]]);
+    v = vsetq_lane_u32(iq3xxs_grid[q[off+1]], v, 1);
+    v = vsetq_lane_u32(iq3xxs_grid[q[off+2]], v, 2);
+    v = vsetq_lane_u32(iq3xxs_grid[q[off+3]], v, 3);
+    return v;
+}
+
 static float vec_dot_iq3_xxs_q8_k_neon(const void *vx, const void *vy, int n) {
     const block_iq3_xxs *x = (const block_iq3_xxs *)vx;
     const block_q8_K *y = (const block_q8_K *)vy;
@@ -11001,10 +11010,12 @@ static float vec_dot_iq3_xxs_q8_k_neon(const void *vx, const void *vy, int n) {
             memcpy(aux32, gas, 8); gas += 8;
             /* Grid -> u8 values held in an s8 register, then multiply by the
              * +-1 sign mask (vmulq_s8 is exact for these small magnitudes). */
-            const uint32x4_t g0 = vld1q_u32((const uint32_t *)&iq3xxs_grid[q3[ 0]]);
-            const uint32x4_t g1 = vld1q_u32((const uint32_t *)&iq3xxs_grid[q3[ 4]]);
-            const uint32x4_t g2 = vld1q_u32((const uint32_t *)&iq3xxs_grid[q3[ 8]]);
-            const uint32x4_t g3 = vld1q_u32((const uint32_t *)&iq3xxs_grid[q3[12]]);
+            /* 16 grid lookups -> 4 x uint32x4_t, each covering 16 grid values.
+             * s0..s3 each have 16 sign bytes; the grids must match 1:1. */
+            const uint32x4_t g0 = iq3xxs_grid_vec_neon(q3, 0);
+            const uint32x4_t g1 = iq3xxs_grid_vec_neon(q3, 4);
+            const uint32x4_t g2 = iq3xxs_grid_vec_neon(q3, 8);
+            const uint32x4_t g3 = iq3xxs_grid_vec_neon(q3, 12);
             q3 += 16;
             const int8_t *s = (const int8_t *)iq3xxs_sign_tab;
             int8x16_t s0 = vcombine_s8(vld1_s8(s + 8 * (size_t)((aux32[0] >>  0) & 127)),
