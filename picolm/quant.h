@@ -628,7 +628,33 @@ typedef enum {
     GGUF_TYPE_Q2_K  = 10,
     GGUF_TYPE_Q3_K  = 11,
     GGUF_TYPE_Q4_K  = 12,
-    GGUF_TYPE_Q8_K = 29,  /* internal: Q8_K intermediate quantization */
+    /* TODO(type-ids): GGUF_TYPE_Q8_K = 29 is a PicoLM-internal ACTIVATION tag,
+     * not a real on-disk GGUF/GGML tensor type id. It works, and nothing reads
+     * a file and dispatches on it, so it is left alone deliberately -- but it
+     * is wrong in two ways that will bite anyone extending the type table:
+     *
+     *   1. The real id for on-disk Q8_K is GGML_TYPE_Q8_K = 15 (see
+     *      ggml/include/ggml.h in ik_llama.cpp / llama.cpp). 29 is
+     *      GGML_TYPE_IQ1_M. So a GGUF whose tensors are genuinely IQ1_M puts
+     *      29 in tinfos[i].type, which lands on THIS table entry instead of an
+     *      IQ1_M one. Nothing in-tree produces such a file, but the failure
+     *      would be silent (Q8_K-shaped reads of IQ1_M data), not an error.
+     *
+     *   2. Even using 15 here would not be a fix: llama.cpp's block_q8_K is
+     *      596 bytes (float d; float sum; int8 qs[256]; int16 bsums[16]),
+     *      while PicoLM's block_q8_K below is 292 bytes -- it drops `sum`. The
+     *      two layouts are not interchangeable, so PicoLM cannot read real
+     *      Q8_K tensor data until `sum` is added (which shifts every qs/bsums
+     *      offset and touches all Q8_K kernels).
+     *
+     * If that ever needs fixing, the clean form is to move internal tags OUT of
+     * the GGUF id space entirely (e.g. rename to PICOLM_ACT_Q8_K with a value
+     * above 399, the highest id in ik_llama's ggml_type), free 29 for IQ1_M,
+     * and add a static assert that keeps future internal tags above the real
+     * range. Note also the adjacent trap documented on GGUF_TYPE_IQ4_NL_R4
+     * below: `general.file_type` (LLAMA_FTYPE_MOSTLY_*) is a THIRD, unrelated
+     * enum, and it is the usual source of confusion here. */
+    GGUF_TYPE_Q8_K = 29,  /* internal: Q8_K intermediate quantization (see TODO above) */
     GGUF_TYPE_Q6_K       = 14,
     GGUF_TYPE_Q4_0_4_4   = 31,  /* 4-row interleaved Q4_0, blocklen=4 (pre-repacked) */
     GGUF_TYPE_Q4_0_4_8   = 32,  /* 4-row interleaved Q4_0, blocklen=8 (pre-repacked, I8MM target) */
@@ -658,7 +684,15 @@ typedef enum {
     GGUF_TYPE_Q2_0       = 42,  /* 2-bit values + scale, 128 values/block */
     GGUF_TYPE_Q6_0       = 133, /* 6-bit values + FP16 scale, 32 values/block (legacy GGML) */
     GGUF_TYPE_Q4_0_R8    = 202, /* 8-row interleaved Q4_0 (GGUF type 202, llama.cpp ik branch) */
-    GGUF_TYPE_Q8_0_R8    = 203, /* 8-row interleaved Q8_0 (GGUF type 203) */
+    /* TODO(type-ids): 203 is not ik_llama's id for Q8_0_R8 -- ggml.h says
+     * GGML_TYPE_Q8_0_R8 = 208 (203 is unused there). model_gguf.c papers over
+     * this by normalising an incoming 208 to this constant, so current GGUFs
+     * load correctly; the constant itself is simply misnumbered. Changing it
+     * to 208 would be a no-op for every model in use (208 already normalises
+     * to it) but could change behaviour for any file that actually carries 203.
+     * Left as-is: it works today. Do not "fix" this without checking
+     * model_gguf.c's 208 normalisation at the same time. */
+    GGUF_TYPE_Q8_0_R8    = 203, /* 8-row interleaved Q8_0 (TODO: ik says 208) */
     GGUF_TYPE_Q6_K_R4    = 214, /* 4-row interleaved Q6_K (GGUF type 214, llama.cpp ik branch) */
     GGUF_TYPE_Q8_K_R8    = 399, /* 8-row interleaved Q8_K (GGUF type 399, llama.cpp ik branch) */
     GGUF_TYPE_Q4_K_R4    = 212, /* 4-row interleaved Q4_K (GGUF type 212, llama.cpp ik branch) */
@@ -667,6 +701,18 @@ typedef enum {
     GGUF_TYPE_IQ3_XXS    = 18,  /* 3-bit "almost true" quant, 16-bit block scale (ggml type 18) */
     GGUF_TYPE_IQ3_XXS_R4 = 218, /* 4-row interleaved IQ3_XXS (ik_llama GGML type 218) */
     GGUF_TYPE_IQ4_XS_R8  = 223, /* 8-row interleaved IQ4_XS (ik_llama GGML type 223) */
+    /* Remaining standard GGUF IQ grid quants. Ids are GGML_TYPE_* from
+     * ik_llama.cpp / llama.cpp ggml.h, i.e. the 4-byte per-tensor type field --
+     * NOT `general.file_type` (LLAMA_FTYPE_MOSTLY_*), which is a separate enum
+     * and a frequent source of confusion here. Block sizes: 66/74/50/110/82/56. */
+    GGUF_TYPE_IQ2_XXS    = 16,  /* 2-bit grid, 8-bit scales */
+    GGUF_TYPE_IQ2_XS     = 17,  /* 2-bit grid, per-32 scales */
+    GGUF_TYPE_IQ1_S      = 19,  /* 1-bit sign grid + delta */
+    GGUF_TYPE_IQ3_S      = 21,  /* 3-bit grid + signs */
+    GGUF_TYPE_IQ2_S      = 22,  /* 2-bit grid + signs */
+    GGUF_TYPE_IQ1_M      = 29,  /* 1-bit, multi-block scale (see TODO on
+                                 * GGUF_TYPE_Q8_K above: that internal marker
+                                 * currently occupies this id) */
 } gguf_type_t;
 
 /* One past the highest type ID, for table sizing */
@@ -1267,6 +1313,61 @@ typedef struct PICOLM_PACKED_ATTR {
     uint16_t d;
     uint8_t  qs[3 * 256 / 8];  /* 96 bytes: 64 index bytes + 32 scale/sign bytes */
 } block_iq3_xxs;               /* 98 bytes */
+
+/* ---- Block layouts (ggml-common.h, QK_K = 256) ----
+ *
+ * Same packing convention as every other block_* struct in quant.h:
+ * #pragma pack(1) plus PICOLM_PACKED_ATTR, which adds __attribute__((packed))
+ * for LLVM-GCC 4.0.1 (iPhoneOS 1), the one compiler that ignores #pragma pack.
+ * Byte sizes are asserted at the end of this section. */
+#pragma pack(push, 1)
+typedef struct PICOLM_PACKED_ATTR { uint16_t d; uint16_t qs[QK_K/8]; } block_iq2_xxs;
+/* 2 + 64 = 66 bytes */
+
+typedef struct PICOLM_PACKED_ATTR { uint16_t d; uint16_t qs[QK_K/8]; uint8_t scales[QK_K/32]; } block_iq2_xs;
+/* 2 + 64 + 8 = 74 bytes */
+
+typedef struct PICOLM_PACKED_ATTR { uint16_t d; uint8_t qs[QK_K/8]; uint16_t qh[QK_K/32]; } block_iq1_s;
+/* 2 + 32 + 16 = 50 bytes */
+
+#define IQ3S_N_SCALE (QK_K/64)
+typedef struct PICOLM_PACKED_ATTR {
+    uint16_t d;
+    uint8_t qs[QK_K/4];
+    uint8_t qh[QK_K/32];
+    uint8_t signs[QK_K/8];
+    uint8_t scales[IQ3S_N_SCALE];
+} block_iq3_s;
+/* 2 + 64 + 8 + 32 + 4 = 110 bytes */
+
+typedef struct PICOLM_PACKED_ATTR { uint16_t d; uint8_t qs[QK_K/4]; uint8_t qh[QK_K/32]; uint8_t scales[QK_K/32]; } block_iq2_s;
+/* 2 + 64 + 8 + 8 = 82 bytes */
+
+typedef struct PICOLM_PACKED_ATTR {
+    uint8_t qs[QK_K/8];      /* grid index, low 8 bits */
+    uint8_t qh[QK_K/16];     /* grid index, high 3 bits + grid shift bit */
+    uint8_t scales[QK_K/32]; /* 3-bit block scales */
+} block_iq1_m;
+/* 32 + 16 + 8 = 56 bytes */
+#pragma pack(pop)
+
+/* Layout guard: a wrong block size here means every tensor of that type is read
+ * at the wrong stride, silently. C11 gets _Static_assert; older compilers
+ * (DJGPP, gcc 3.3, MSVC pre-C11) get the negative-array-size trick, which every
+ * one of them supports and which costs nothing at run time. */
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+_Static_assert(sizeof(block_iq2_xxs) == 66,  "block_iq2_xxs must be 66 bytes");
+_Static_assert(sizeof(block_iq2_xs)  == 74,  "block_iq2_xs must be 74 bytes");
+_Static_assert(sizeof(block_iq1_s)   == 50,  "block_iq1_s must be 50 bytes");
+_Static_assert(sizeof(block_iq3_s)   == 110, "block_iq3_s must be 110 bytes");
+_Static_assert(sizeof(block_iq2_s)   == 82,  "block_iq2_s must be 82 bytes");
+_Static_assert(sizeof(block_iq1_m)   == 56,  "block_iq1_m must be 56 bytes");
+#else
+typedef char picolm_iq_block_size_check[
+    (sizeof(block_iq2_xxs) == 66 && sizeof(block_iq2_xs) == 74 &&
+     sizeof(block_iq1_s)   == 50 && sizeof(block_iq3_s)  == 110 &&
+     sizeof(block_iq2_s)   == 82 && sizeof(block_iq1_m)  == 56) ? 1 : -1];
+#endif
 
 /* IQ3_XXS_R4 block (ik_llama GGML type 218): 4 IQ3_XXS rows interleaved.
  * Size = 4 * sizeof(block_iq3_xxs) = 392 bytes, i.e. 98 bytes per row of 256.
@@ -1917,6 +2018,21 @@ void dequantize_row_q2_k_r4(const void *src, float *dst, int n);
 float vec_dot_q2_k_r4_q8_k(const void *vx, const void *vy, int n);
 void vec_dot_q2_k_r4_q8_k_batch4(const void *vx, const void *vy, int n, float *out, int nrows);
 void dequantize_row_iq3_xxs(const void *src, float *dst, int n);
+/* Standard GGUF IQ grid quants (quant.c, 256-value blocks). Dequantizers are
+ * the reference implementations; the vec_dot_* are the simple
+ * dequantize-then-dot form (correct, not fast). */
+void dequantize_row_iq2_xxs(const void *src, float *dst, int n);
+void dequantize_row_iq2_xs(const void *src, float *dst, int n);
+void dequantize_row_iq1_s(const void *src, float *dst, int n);
+void dequantize_row_iq3_s(const void *src, float *dst, int n);
+void dequantize_row_iq2_s(const void *src, float *dst, int n);
+void dequantize_row_iq1_m(const void *src, float *dst, int n);
+float vec_dot_iq2_xxs_q8_k(const void *vx, const void *vy, int n);
+float vec_dot_iq2_xs_q8_k(const void *vx, const void *vy, int n);
+float vec_dot_iq1_s_q8_k(const void *vx, const void *vy, int n);
+float vec_dot_iq3_s_q8_k(const void *vx, const void *vy, int n);
+float vec_dot_iq2_s_q8_k(const void *vx, const void *vy, int n);
+float vec_dot_iq1_m_q8_k(const void *vx, const void *vy, int n);
 /* IQ3_XXS_R4 / IQ4_XS_R8 (ik_llama GGML types 218 / 223): row-interleaved
  * formats. The _single variants extract one logical row from a group base and
  * write exactly n floats; the group variants write rpb rows of n floats each. */

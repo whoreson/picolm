@@ -217,6 +217,30 @@ static void gemv_iq3_xxs(const void *w, const void *a, int n, float *out, int nr
     *out = vec_dot_iq3_xxs_q8_k(w, a, n);
 }
 
+/* Standard GGUF IQ grid quants (ids 16/17/19/21/22/29). Dequantise-then-dot
+ * against Q8_K: exact, and slow (no fused MAC, 256-float staging buffer per
+ * block). Correctness reference first; a fused/tiled GEMM is a separate
+ * measurable change. IQ1_M = 29 is currently shadowed by the internal
+ * GGUF_TYPE_Q8_K marker -- see the TODO in quant.h before relying on it. */
+static void gemv_iq2_xxs(const void *w, const void *a, int n, float *out, int nrows) {
+    (void)nrows; *out = vec_dot_iq2_xxs_q8_k(w, a, n);
+}
+static void gemv_iq2_xs(const void *w, const void *a, int n, float *out, int nrows) {
+    (void)nrows; *out = vec_dot_iq2_xs_q8_k(w, a, n);
+}
+static void gemv_iq1_s(const void *w, const void *a, int n, float *out, int nrows) {
+    (void)nrows; *out = vec_dot_iq1_s_q8_k(w, a, n);
+}
+static void gemv_iq3_s(const void *w, const void *a, int n, float *out, int nrows) {
+    (void)nrows; *out = vec_dot_iq3_s_q8_k(w, a, n);
+}
+static void gemv_iq2_s(const void *w, const void *a, int n, float *out, int nrows) {
+    (void)nrows; *out = vec_dot_iq2_s_q8_k(w, a, n);
+}
+/* gemv_iq1_m is intentionally absent: IQ1_M == 29 collides with the internal
+ * GGUF_TYPE_Q8_K marker, so it cannot have a table entry yet. Add it back here
+ * (and in the table) once that marker moves -- see the TODO in quant.h. */
+
 static void gemv_q4_k_r4(const void *w, const void *a, int n, float *out, int nrows) {
     (void)nrows;
     vec_dot_q4_k_r4_q8_k_batch4(w, a, n, out);
@@ -711,10 +735,43 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
         .use_repacked = 0,
         .has_dual_scalar_path = 1,
     },
+    /* Standard GGUF IQ grid quants: dequantise-then-dot GEMV vs Q8_K.
+     * fn_gemm is NULL, so batched matmul takes the row-parallel GEMV path
+     * (correct at any batch, no fast kernel yet). fn_dequant_single is NULL
+     * because the dequantize_row_iq*() entry points take the block size from
+     * the type table (quant_size), not from a per-row helper. */
+    [GGUF_TYPE_IQ2_XXS] = {
+        .act_fmt = ACT_FMT_Q8_K, .rows_per_block = 1, .fn_gemv = gemv_iq2_xxs,
+        .fn_gemm = NULL, .has_qgemm_d = 0, .fn_dequant_single = NULL,
+        .needs_qx = 1, .use_repacked = 0, .has_dual_scalar_path = 0,
+    },
+    [GGUF_TYPE_IQ2_XS] = {
+        .act_fmt = ACT_FMT_Q8_K, .rows_per_block = 1, .fn_gemv = gemv_iq2_xs,
+        .fn_gemm = NULL, .has_qgemm_d = 0, .fn_dequant_single = NULL,
+        .needs_qx = 1, .use_repacked = 0, .has_dual_scalar_path = 0,
+    },
+    [GGUF_TYPE_IQ1_S] = {
+        .act_fmt = ACT_FMT_Q8_K, .rows_per_block = 1, .fn_gemv = gemv_iq1_s,
+        .fn_gemm = NULL, .has_qgemm_d = 0, .fn_dequant_single = NULL,
+        .needs_qx = 1, .use_repacked = 0, .has_dual_scalar_path = 0,
+    },
+    [GGUF_TYPE_IQ3_S] = {
+        .act_fmt = ACT_FMT_Q8_K, .rows_per_block = 1, .fn_gemv = gemv_iq3_s,
+        .fn_gemm = NULL, .has_qgemm_d = 0, .fn_dequant_single = NULL,
+        .needs_qx = 1, .use_repacked = 0, .has_dual_scalar_path = 0,
+    },
+    [GGUF_TYPE_IQ2_S] = {
+        .act_fmt = ACT_FMT_Q8_K, .rows_per_block = 1, .fn_gemv = gemv_iq2_s,
+        .fn_gemm = NULL, .has_qgemm_d = 0, .fn_dequant_single = NULL,
+        .needs_qx = 1, .use_repacked = 0, .has_dual_scalar_path = 0,
+    },
+    /* IQ1_M = 29 collides with the internal GGUF_TYPE_Q8_K marker, which is a
+     * duplicate case label in this table -- see the TODO in quant.h. Left out
+     * until that is resolved so the build stays valid. */
     /* IQ3_XXS_R4 / IQ4_XS_R8: row-interleaved variants of IQ3_XXS / IQ4_XS.
      * GEMV decodes the row and dots against Q8_K (one decode path, verified
-     * against the F16 source). No fused GEMM yet, so fn_gemm is NULL and the
-     * runtime uses the row-parallel GEMV, which is correct at any batch. */
+     * against the F16 source). fn_gemm is the per-column GEMV in
+     * type_dispatch.c (exact, no tiled kernel yet). */
     [GGUF_TYPE_IQ3_XXS_R4] = {
         .act_fmt = ACT_FMT_Q8_K,
         .rows_per_block = 4,
