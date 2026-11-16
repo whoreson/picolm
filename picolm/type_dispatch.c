@@ -39,6 +39,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* sgemm_iq4_xs.c */
+extern int sgemm_iq4_xs_q8k_best(int nrows, int ncols, int k, const void *w, const void *a,
+                                  float *out, size_t bs, int ith, int nth);
+
 /* ---- GEMV wrappers for float-returning vec_dot functions ---- */
 
 /* Q8_0 with FP32 deltas: qx_d is appended after the Q8_0 blocks.
@@ -444,7 +448,7 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
         .act_fmt = ACT_FMT_Q8_K,
         .rows_per_block = 1,
         .fn_gemv = gemv_iq4_xs,
-        .fn_gemm = NULL,
+        .fn_gemm = sgemm_iq4_xs_q8k_best,
         .has_qgemm_d = 0,
         .fn_dequant_single = NULL,
         .needs_qx = 1,
@@ -600,17 +604,21 @@ PICOLM_ALIGNED8 const type_info_t type_info_table[] = {
         .use_repacked = 0,
         .has_dual_scalar_path = 0,
     },
-    /* IQ3_XXS: single-row 3-bit grid quant (ggml type 18). */
+    /* IQ3_XXS: single-row 3-bit grid quant (ggml type 18).
+     * GEMV: SIMD grid kernel (AVX2/AVX/NEON) - q2 = iq3xxs_grid[idx] as u8,
+     *       signs applied to the Q8_K activations, exact integer dot.
+     * GEMM: decode-once R8 into the iq6t int8 scratch (VNNI / AVX2), the same
+     *       engine Q6_K / IQ4_XS / IQ3_K use, else the GEMV per column. */
     [GGUF_TYPE_IQ3_XXS] = {
         .act_fmt = ACT_FMT_Q8_K,
         .rows_per_block = 1,
         .fn_gemv = gemv_iq3_xxs,
-        .fn_gemm = NULL,
+        .fn_gemm = sgemm_iq3_xxs_q8_k_best,
         .has_qgemm_d = 0,
         .fn_dequant_single = NULL,
         .needs_qx = 1,
         .use_repacked = 0,
-        .has_dual_scalar_path = 0,
+        .has_dual_scalar_path = 1,
     },
     [GGUF_TYPE_Q6_K_R4] = {
         .act_fmt = ACT_FMT_Q8_K,

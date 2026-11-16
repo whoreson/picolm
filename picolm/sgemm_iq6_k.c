@@ -457,12 +457,72 @@ static void iq4xs_t_decode_group(const char *wbase, size_t w_row_bytes, int nb) 
     }
 }
 
+/* ---- IQ3_XXS source for the same scratch ----
+ * Layout (see block_iq3_xxs in quant.h): per 256-value super-block, qs[0..63]
+ * are grid indices and qs[64..95] are scales_and_signs. Per 32-value sub-block
+ * ib32: aux32 = sas[4*ib32..+3], and each 8-value run l (0..3) takes two grid
+ * entries (qs[2l], qs[2l+1]) = 8 values, negated where the ksigns mask bit is
+ * set. The sub-block scale is 2*(aux32>>28)+1.
+ *
+ * The scratch wants SIGNED int8 weights, so the sign is applied here (the GEMV
+ * kernel instead flips the activations, which is cheaper for 1 row). Grid values
+ * are 4..62, so the negation cannot overflow int8. One 32-value sub-block is
+ * exactly two 16-value groups with the same scale. */
+static void iq3xxs_t_decode_group(const char *wbase, size_t w_row_bytes, int nb) {
+    const uint32_t *grid = picolm_iq3xxs_grid();
+    const uint8_t  *ksig = picolm_iq3xxs_ksigns();
+    const uint8_t  *kmsk = picolm_iq3xxs_kmask();
+    for (int ib = 0; ib < nb; ++ib) {
+        __m256i wv[8][8];
+        float dd[8];
+        int16_t *scb = iq6t_tl.sc + (size_t)ib * 256;
+        for (int r = 0; r < 8; ++r) {
+            const block_iq3_xxs *x = (const block_iq3_xxs *)(wbase + (size_t)r * w_row_bytes) + ib;
+            const uint8_t *qs  = x->qs;
+            const uint8_t *sas = x->qs + QK_K / 4;
+            dd[r] = 0.25f * iq6_f16(x->d);   /* 0.25 == the 0.5*0.5 in db */
+            for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+                uint32_t aux32;
+                memcpy(&aux32, sas + 4 * ib32, sizeof aux32);
+                /* 32 signed int8 values, natural order. */
+                int8_t v[32];
+                for (int l = 0; l < 4; ++l) {
+                    const uint8_t signs = ksig[(aux32 >> (7 * l)) & 127];
+                    const uint8_t *g1 = (const uint8_t *)&grid[qs[2 * l + 0]];
+                    const uint8_t *g2 = (const uint8_t *)&grid[qs[2 * l + 1]];
+                    for (int j = 0; j < 4; ++j)
+                        v[8 * l + j]     = (int8_t)((signs & kmsk[j])     ? -(int)g1[j] : (int)g1[j]);
+                    for (int j = 0; j < 4; ++j)
+                        v[8 * l + j + 4] = (int8_t)((signs & kmsk[j + 4]) ? -(int)g2[j] : (int)g2[j]);
+                }
+                qs += 8;
+                /* IQ3_XXS sub-block ib32 covers values 32*ib32..32*ib32+31, which is
+                 * exactly one 32-value vector in the tile kernel's layout. */
+                wv[r][ib32] = _mm256_loadu_si256((const __m256i *)v);
+                const int16_t sl = (int16_t)(2 * (int)(aux32 >> 28) + 1);
+                for (int gg = 0; gg < 2; ++gg) {
+                    scb[(2 * ib32 + gg) * 16 + 2 * r]     = sl;
+                    scb[(2 * ib32 + gg) * 16 + 2 * r + 1] = sl;
+                }
+            }
+        }
+        int8_t *wb = iq6t_tl.w + (size_t)ib * 2048;
+        for (int k = 0; k < 8; ++k) {
+            __m256i rr[8], o[8];
+            for (int r = 0; r < 8; ++r) rr[r] = wv[r][k];
+            iq6t_transpose8(rr, o);
+            for (int j = 0; j < 8; ++j) _mm256_storeu_si256((__m256i *)(wb + (size_t)(8 * k + j) * 32), o[j]);
+        }
+        _mm256_storeu_ps(iq6t_tl.d + (size_t)ib * 8, _mm256_loadu_ps(dd));
+    }
+}
+
 /* ---- Q6_K / Q3_K sources for the same scratch ----
  * Both are symmetric (no mins): a signed int8 value per weight and one integer scale per 16 values,
  * i.e. exactly the scratch the IQ6_K kernels consume, so only the decode differs (kinds 2 and 3).
  *   Q6_K : q = ((ql nibble) | (2 high bits << 4)) - 32, scale = int8 scales[g], natural 16-groups.
  *   Q3_K : q = (2 low bits | (hmask bit << 2)) - 4,     scale = 6-bit packed scale - 32. */
-enum { KQ_Q6K = 2, KQ_Q3K = 3, KQ_Q4K = 4, KQ_Q5K = 5, KQ_Q2K = 6, KQ_Q4KR4 = 7, KQ_Q6KR4 = 8, KQ_IQ4K = 9, KQ_IQ4KR4 = 10, KQ_IQ2K = 11, KQ_IQ3K = 12, KQ_IQ2KR4 = 13, KQ_IQ3KR4 = 14 };
+enum { KQ_Q6K = 2, KQ_Q3K = 3, KQ_Q4K = 4, KQ_Q5K = 5, KQ_Q2K = 6, KQ_Q4KR4 = 7, KQ_Q6KR4 = 8, KQ_IQ4K = 9, KQ_IQ4KR4 = 10, KQ_IQ2K = 11, KQ_IQ3K = 12, KQ_IQ2KR4 = 13, KQ_IQ3KR4 = 14, KQ_IQ3XXS = 15 };
 static inline always_inline void kq_load_q6(const block_q6_K *x, __m256i wv[8], int8_t sc[16]) {
     const __m256i m0f = _mm256_set1_epi8(0x0F), m03 = _mm256_set1_epi8(0x03), m32 = _mm256_set1_epi8(32);
     for (int n = 0; n < 2; ++n) {                       /* two 128-value halves */
@@ -570,6 +630,7 @@ static inline size_t kq_block_bytes(int kind) {
     case KQ_IQ3K:  return sizeof(block_iq3_k);
     case KQ_IQ2KR4: return sizeof(block_iq2_k_r4) / 4;
     case KQ_IQ3KR4: return sizeof(block_iq3_k_r4) / 4;
+    case KQ_IQ3XXS: return sizeof(block_iq3_xxs);
     default:      return sizeof(block_q2_K);
     }
 }
@@ -986,7 +1047,8 @@ static int iq6t_drive(int kind, int nrows, int ncols, int k, const void *vx, con
     for (int c0 = 0; c0 < ncols; c0 += IQ6T_PC) {
         const int pc = (ncols - c0 < IQ6T_PC) ? (ncols - c0) : IQ6T_PC;
         for (int g = g_start; g < g_end; ++g) {
-            if (kind == KQ_Q4KR4) kqr4_t_decode_group((const char *)vx + (size_t)g * 8 * w_row_bytes, w_row_bytes, nb);
+            if (kind == KQ_IQ3XXS) iq3xxs_t_decode_group((const char *)vx + (size_t)g * 8 * w_row_bytes, w_row_bytes, nb);
+            else if (kind == KQ_Q4KR4) kqr4_t_decode_group((const char *)vx + (size_t)g * 8 * w_row_bytes, w_row_bytes, nb);
             else if (kind == KQ_IQ4KR4) kqi4r_t_decode_group((const char *)vx + (size_t)g * 8 * w_row_bytes, w_row_bytes, nb);
             else if (kind == KQ_IQ2KR4 || kind == KQ_IQ3KR4) kqik4_t_decode_group(kind, (const char *)vx + (size_t)g * 8 * w_row_bytes, w_row_bytes, nb);
             else if (kind == KQ_Q6KR4) kqr6_t_decode_group((const char *)vx + (size_t)g * 8 * w_row_bytes, w_row_bytes, nb);
@@ -1016,6 +1078,11 @@ int sgemm_iq6_k_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void
 int sgemm_iq4_xs_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void *vy,
                           float *out, size_t bs, int ith, int nth) {
     return iq6t_drive(1, nrows, ncols, k, vx, vy, out, bs, ith, nth);
+}
+/* IQ3_XXS x Q8_K decode-once GEMM (AVX2): k = number of elements per row, rows contiguous. */
+int sgemm_iq3_xxs_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void *vy,
+                           float *out, size_t bs, int ith, int nth) {
+    return iq6t_drive(KQ_IQ3XXS, nrows, ncols, k, vx, vy, out, bs, ith, nth);
 }
 
 /* Q6_K / Q3_K x Q8_K decode-once GEMMs (k = elements per row, rows contiguous). */
@@ -1101,6 +1168,53 @@ static void iq4xs_v_decode_group(const char *wbase, size_t w_row_bytes, int nb) 
                 slb[(2 * k) * 8 + r] = sl; slb[(2 * k + 1) * 8 + r] = sl;
             }
             dd[r] = iq6_f16(x->d);
+        }
+        uint8_t *wb = iq6v_tl.w + (size_t)ib * 2048;
+        for (int k = 0; k < 8; ++k) {
+            __m256i rr[8], o[8];
+            for (int r = 0; r < 8; ++r) rr[r] = wv[r][k];
+            iq6t_transpose8(rr, o);
+            for (int j = 0; j < 8; ++j) _mm256_storeu_si256((__m256i *)(wb + (size_t)(8 * k + j) * 32), o[j]);
+        }
+        _mm256_storeu_ps(iq6v_tl.d + (size_t)ib * 8, _mm256_loadu_ps(dd));
+    }
+}
+
+static void iq3xxs_v_decode_group(const char *wbase, size_t w_row_bytes, int nb) {
+    const __m256i x80 = _mm256_set1_epi8((char)0x80);
+    const uint32_t *grid = picolm_iq3xxs_grid();
+    const uint8_t  *ksig = picolm_iq3xxs_ksigns();
+    const uint8_t  *kmsk = picolm_iq3xxs_kmask();
+    for (int ib = 0; ib < nb; ++ib) {
+        __m256i wv[8][8];
+        float dd[8];
+        int32_t *slb = iq6v_tl.sl + (size_t)ib * 128;
+        for (int r = 0; r < 8; ++r) {
+            const block_iq3_xxs *x = (const block_iq3_xxs *)(wbase + (size_t)r * w_row_bytes) + ib;
+            const uint8_t *qs  = x->qs;
+            const uint8_t *sas = x->qs + QK_K / 4;
+            int32_t sc[16];
+            dd[r] = 0.25f * iq6_f16(x->d);
+            for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+                uint32_t aux32;
+                memcpy(&aux32, sas + 4 * ib32, sizeof aux32);
+                int8_t v[32];
+                for (int l = 0; l < 4; ++l) {
+                    const uint8_t signs = ksig[(aux32 >> (7 * l)) & 127];
+                    const uint8_t *g1 = (const uint8_t *)&grid[qs[2 * l + 0]];
+                    const uint8_t *g2 = (const uint8_t *)&grid[qs[2 * l + 1]];
+                    for (int j = 0; j < 4; ++j)
+                        v[8 * l + j]     = (int8_t)((signs & kmsk[j])     ? -(int)g1[j] : (int)g1[j]);
+                    for (int j = 0; j < 4; ++j)
+                        v[8 * l + j + 4] = (int8_t)((signs & kmsk[j + 4]) ? -(int)g2[j] : (int)g2[j]);
+                }
+                qs += 8;
+                wv[r][ib32] = _mm256_loadu_si256((const __m256i *)v);
+                const int32_t sl = 2 * (int32_t)(aux32 >> 28) + 1;
+                sc[2 * ib32] = sl; sc[2 * ib32 + 1] = sl;
+            }
+            for (int k = 0; k < 8; ++k) wv[r][k] = _mm256_xor_si256(wv[r][k], x80);   /* w + 128 as u8 */
+            for (int g = 0; g < 16; ++g) slb[g * 8 + r] = sc[g];
         }
         uint8_t *wb = iq6v_tl.w + (size_t)ib * 2048;
         for (int k = 0; k < 8; ++k) {
@@ -1301,7 +1415,8 @@ static int iq6v_drive(int kind, int nrows, int ncols, int k, const void *vx, con
         const int pc = (ncols - c0 < IQ6T_PC) ? (ncols - c0) : IQ6T_PC;
         iq6v_stage_seeds((const char *)vy, y_row_bytes, c0, pc, nb);
         for (int g = g_start; g < g_end; ++g) {
-            if (kind == KQ_Q4KR4) kqr4_v_decode_group((const char *)vx + (size_t)g * 8 * w_row_bytes, w_row_bytes, nb);
+            if (kind == KQ_IQ3XXS) iq3xxs_v_decode_group((const char *)vx + (size_t)g * 8 * w_row_bytes, w_row_bytes, nb);
+            else if (kind == KQ_Q4KR4) kqr4_v_decode_group((const char *)vx + (size_t)g * 8 * w_row_bytes, w_row_bytes, nb);
             else if (kind == KQ_IQ4KR4) kqi4r_v_decode_group((const char *)vx + (size_t)g * 8 * w_row_bytes, w_row_bytes, nb);
             else if (kind == KQ_IQ2KR4 || kind == KQ_IQ3KR4) kqik4_v_decode_group(kind, (const char *)vx + (size_t)g * 8 * w_row_bytes, w_row_bytes, nb);
             else if (kind == KQ_Q6KR4) kqr6_v_decode_group((const char *)vx + (size_t)g * 8 * w_row_bytes, w_row_bytes, nb);
@@ -1344,6 +1459,7 @@ int sgemm_iq2_k_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void
 int sgemm_iq3_k_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) { return iq6v_drive(KQ_IQ3K, nrows, ncols, k, vx, vy, out, bs, ith, nth); }
 int sgemm_iq2_k_r4_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) { return iq6v_drive(KQ_IQ2KR4, nrows, ncols, k, vx, vy, out, bs, ith, nth); }
 int sgemm_iq3_k_r4_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) { return iq6v_drive(KQ_IQ3KR4, nrows, ncols, k, vx, vy, out, bs, ith, nth); }
+int sgemm_iq3_xxs_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) { return iq6v_drive(KQ_IQ3XXS, nrows, ncols, k, vx, vy, out, bs, ith, nth); }
 #else
 int sgemm_iq6_k_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy,
                          float *out, size_t bs, int ith, int nth) {
@@ -1368,6 +1484,7 @@ int sgemm_iq2_k_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void
 int sgemm_iq3_k_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) { (void)nrows; (void)ncols; (void)k; (void)vx; (void)vy; (void)out; (void)bs; (void)ith; (void)nth; return 0; }
 int sgemm_iq2_k_r4_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) { (void)nrows; (void)ncols; (void)k; (void)vx; (void)vy; (void)out; (void)bs; (void)ith; (void)nth; return 0; }
 int sgemm_iq3_k_r4_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) { (void)nrows; (void)ncols; (void)k; (void)vx; (void)vy; (void)out; (void)bs; (void)ith; (void)nth; return 0; }
+int sgemm_iq3_xxs_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) { (void)nrows; (void)ncols; (void)k; (void)vx; (void)vy; (void)out; (void)bs; (void)ith; (void)nth; return 0; }
 #endif /* VNNI variant */
 
 #else
@@ -1423,6 +1540,8 @@ int sgemm_iq2_k_r4_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const v
 int sgemm_iq2_k_r4_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) { (void)nrows; (void)ncols; (void)k; (void)vx; (void)vy; (void)out; (void)bs; (void)ith; (void)nth; return 0; }
 int sgemm_iq3_k_r4_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) { (void)nrows; (void)ncols; (void)k; (void)vx; (void)vy; (void)out; (void)bs; (void)ith; (void)nth; return 0; }
 int sgemm_iq3_k_r4_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) { (void)nrows; (void)ncols; (void)k; (void)vx; (void)vy; (void)out; (void)bs; (void)ith; (void)nth; return 0; }
+int sgemm_iq3_xxs_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) { (void)nrows; (void)ncols; (void)k; (void)vx; (void)vy; (void)out; (void)bs; (void)ith; (void)nth; return 0; }
+int sgemm_iq3_xxs_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) { (void)nrows; (void)ncols; (void)k; (void)vx; (void)vy; (void)out; (void)bs; (void)ith; (void)nth; return 0; }
 int sgemm_iq4_xs_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) { (void)nrows; (void)ncols; (void)k; (void)vx; (void)vy; (void)out; (void)bs; (void)ith; (void)nth; return 0; }
 int sgemm_iq4_xs_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) { (void)nrows; (void)ncols; (void)k; (void)vx; (void)vy; (void)out; (void)bs; (void)ith; (void)nth; return 0; }
 
@@ -1494,6 +1613,12 @@ static int kq_best(const char *name, kq_r8_fn r8v, kq_r8_fn r8t, float (*dot)(co
         for (int c = 0; c < ncols; ++c)
             out[(size_t)c * bs + i] = dot((const char *)vx + (size_t)i * nb * wblock, (const char *)vy + (size_t)c * nb * sizeof(block_q8_K), k);
     return 1;
+}
+/* IQ3_XXS table fn_gemm: decode-once R8 (VNNI, then AVX2) for big shapes, else a
+ * per-column dot over this thread's rows (the 1-row GEMV kernel, which is exact). */
+int sgemm_iq3_xxs_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) {
+    return kq_best("sgemm_iq3_xxs_q8_k", sgemm_iq3_xxs_q8_k_r8v, sgemm_iq3_xxs_q8_k_r8t,
+                   vec_dot_iq3_xxs_q8_k, sizeof(block_iq3_xxs), nrows, ncols, k, vx, vy, out, bs, ith, nth);
 }
 int sgemm_q6_k_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) {
     return kq_best("sgemm_q6_k_q8_k", sgemm_q6_k_q8_k_r8v, sgemm_q6_k_q8_k_r8t, vec_dot_q6_K_q8_K, sizeof(block_q6_K), nrows, ncols, k, vx, vy, out, bs, ith, nth);

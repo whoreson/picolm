@@ -35,6 +35,9 @@ static const kt_t KT[] = {
     {"q4_K", GGUF_TYPE_Q4_K, sizeof(block_q4_K), offsetof(block_q4_K, d), offsetof(block_q4_K, dmin), vec_dot_q4_K_q8_K},
     {"q5_K", GGUF_TYPE_Q5_K, sizeof(block_q5_K), offsetof(block_q5_K, d), offsetof(block_q5_K, dm),   vec_dot_q5_K_q8_K},
     {"q6_K", GGUF_TYPE_Q6_K, sizeof(block_q6_K), offsetof(block_q6_K, d), (size_t)-1,                  vec_dot_q6_K_q8_K},
+    /* IQ3_XXS: fn_gemm is checked against vec_dot_iq3_xxs_q8_k_ref (the integer-exact
+     * scalar kernel), which is itself verified against dequantize_row_iq3_xxs below. */
+    {"iq3_xxs", GGUF_TYPE_IQ3_XXS, sizeof(block_iq3_xxs), offsetof(block_iq3_xxs, d), (size_t)-1,      vec_dot_iq3_xxs_q8_k_ref},
 };
 
 static int NTH = 4;
@@ -183,6 +186,53 @@ int main(void) {
         printf("%-5s %s  (worst abs diff over all shapes: %.3g)\n",
                "iq4_nl", bad4 ? "see failures above" : "OK", worst4);
         bad |= bad4;
+    }
+
+    /* ---- IQ3_XXS decode GEMV: vec_dot_iq3_xxs_q8_k vs the dequant reference ----
+     * The SIMD kernel keeps everything integer except the final float scale, so it
+     * must agree with dequantize_row_iq3_xxs + a float dot up to rounding. This also
+     * proves the integer kernel itself is right, independent of any GEMM path. */
+    {
+        const int ks3[] = {256, 512, 4096};
+        double worst3 = 0;
+        int bad3 = 0;
+        for (unsigned c = 0; c < 3; c++) {
+            const int k = ks3[c], nb = k / 256;
+            block_iq3_xxs *W = malloc(sizeof(block_iq3_xxs) * (size_t)nb);
+            for (int i = 0; i < nb; i++) {
+                uint8_t *b = (uint8_t *)&W[i];
+                for (size_t j = 2; j < sizeof(block_iq3_xxs); j++) b[j] = (uint8_t)rnd();
+                /* scales_and_signs live in the last 32 bytes; the high nibble of
+                 * every 4th byte is the 4-bit sub-block scale, which is always
+                 * valid, so no masking is needed there. */
+                W[i].d = fp32_to_fp16(0.001f + (rnd() & 255) * 1e-5f);
+            }
+            block_q8_K *B = malloc(sizeof(block_q8_K) * (size_t)nb);
+            float *tmp = malloc(sizeof(float) * k);
+            for (int i = 0; i < k; i++) tmp[i] = (rnd() & 0xFFFF) / 32768.0f - 1.0f;
+            quantize_row_q8_K(tmp, B, k);
+
+            const float got = vec_dot_iq3_xxs_q8_k(W, B, k);
+
+            /* Independent oracle: dequantize the weights to f32, then dot. */
+            float *wd = malloc(sizeof(float) * k);
+            dequantize_row_iq3_xxs(W, wd, k);
+            double refd = 0.0;
+            for (int ib = 0; ib < nb; ib++) {
+                const float dd = B[ib].d;
+                double blk = 0.0;
+                for (int i = 0; i < 256; i++) blk += (double)wd[ib * 256 + i] * (double)B[ib].qs[i];
+                refd += blk * dd;
+            }
+            const double dd = fabs(refd - (double)got);
+            const double mag = fabs(refd) > 1e-3 ? fabs(refd) : 1.0;
+            if (dd > 1e-4 * mag) { printf("  FAIL iq3_xxs gemv k=%d ref=%.6g got=%.6g\n", k, refd, (double)got); bad3 = 1; }
+            if (dd > worst3) worst3 = dd;
+            free(W); free(B); free(tmp); free(wd);
+        }
+        printf("%-8s %s  (worst abs diff vs dequant reference: %.3g)\n",
+               "iq3_xxs", bad3 ? "see failures above" : "OK", worst3);
+        bad |= bad3;
     }
 
     printf("kq_gemm_check: %d shape/thread combinations, %s\n", cnt, bad ? "FAIL" : "all OK");

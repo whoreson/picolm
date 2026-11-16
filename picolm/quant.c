@@ -10449,6 +10449,13 @@ static const uint8_t ksigns_iq2xs[128] = {
 };
 static const uint8_t kmask_iq2xs[8] = { 1, 2, 4, 8, 16, 32, 64, 128 };
 
+/* Accessors so other translation units (sgemm_iq6_k.c) can share the tables
+ * above without a second copy in the binary or a header every DOS/MSVC build
+ * would have to drag in. */
+const uint32_t *picolm_iq3xxs_grid(void) { return iq3xxs_grid; }
+const uint8_t  *picolm_iq3xxs_ksigns(void) { return ksigns_iq2xs; }
+const uint8_t  *picolm_iq3xxs_kmask(void) { return kmask_iq2xs; }
+
 /* ================================================================
  * Q2_K_R4 (GGUF type 210): 4-row interleaved Q2_K.
  * ================================================================ */
@@ -10574,21 +10581,231 @@ void dequantize_row_iq3_xxs(const void *src, float *dst, int n) {
     }
 }
 
-/* IQ3_XXS x Q8_K via dequant + f32 dot (the grid/sign layout does not admit a
- * cheap integer dot; this type is a small fraction of the tensors). */
-float vec_dot_iq3_xxs_q8_k(const void *vx, const void *vy, int n) {
-    const int nb = n / QK_K;
+/* ================================================================
+ * IQ3_XXS x Q8_K: SIMD vec_dot (decode GEMV)
+ * ================================================================
+ * block_iq3_xxs holds, per 256 values: d (fp16), 64 bytes of grid indices
+ * (qs[0..63]) and 32 bytes scales_and_signs (qs[64..95]). Per 32-value
+ * sub-block ib32:
+ *   aux32 = sas[4*ib32..+3]; db = 0.25 * d * (2*(aux32>>28) + 1)
+ *   for l in 0..3: signs = ksigns_iq2xs[(aux32 >> 7*l) & 127]
+ *                  g1 = iq3xxs_grid[qs[2*l+0]], g2 = iq3xxs_grid[qs[2*l+1]]
+ *                  8 values = four from g1 then four from g2, each negated
+ *                  where the matching `signs` bit is set
+ *
+ * The grid entries are u8 lanes in 0x04..0x3e, i.e. small enough to serve as
+ * the UNSIGNED operand of maddubs (u8 * s8). The sign mask is therefore applied
+ * to the Q8_K ACTIVATIONS (sign_epi8(q8, +-1)) instead of the weights, which
+ * keeps the grid values unsigned and lets the whole block be an exact integer
+ * dot. The per-sub-block scale (2*ls+1) is folded in by the madd_epi16 that
+ * widens the products, and the 0.25*d*(...) factor via the float accumulator.
+ *
+ * Ported from ik_llama.cpp's ggml_vec_dot_iq3_xxs_q8_K (AVX2 + NEON forms).
+ * ================================================================ */
+
+/* +-1 sign mask per value, derived from ksigns_iq2xs: byte j of the mask for
+ * index i is -1 when bit j of ksigns_iq2xs[i] is set. Built once on first use
+ * (no extra 1 KB table, keeps the binary small and the code portable). */
+static int8_t iq3xxs_sign_tab[128][8];
+static int iq3xxs_sign_tab_ready = 0;
+static void iq3xxs_sign_init(void) {
+    if (iq3xxs_sign_tab_ready) return;
+    for (int i = 0; i < 128; ++i)
+        for (int j = 0; j < 8; ++j)
+            iq3xxs_sign_tab[i][j] = (int8_t)((ksigns_iq2xs[i] & kmask_iq2xs[j]) ? -1 : 1);
+    /* Benign race: every writer stores the same bytes. */
+    iq3xxs_sign_tab_ready = 1;
+}
+
+#if defined(__AVX2__)
+/* hsum of 8 floats */
+static inline float iq3xxs_hsum(__m256 v) {
+    __m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 0x55));
+    return _mm_cvtss_f32(s);
+}
+/* Four grid u32 entries -> one __m256i of 32 u8 values. */
+static inline __m256i iq3xxs_grid8(const uint8_t *q) {
+    return _mm256_set_epi32((int)iq3xxs_grid[q[7]], (int)iq3xxs_grid[q[6]],
+                            (int)iq3xxs_grid[q[5]], (int)iq3xxs_grid[q[4]],
+                            (int)iq3xxs_grid[q[3]], (int)iq3xxs_grid[q[2]],
+                            (int)iq3xxs_grid[q[1]], (int)iq3xxs_grid[q[0]]);
+}
+/* One 32-bit aux32 (4 sign masks) -> __m256i of 32 +-1 int8 values. */
+static inline __m256i iq3xxs_signs(const uint32_t aux32) {
+    const int8_t *s = (const int8_t *)iq3xxs_sign_tab;
+    return _mm256_set_epi64x(
+        (long long)(*(const int64_t *)(s + 8 * (size_t)((aux32 >> 21) & 127))),
+        (long long)(*(const int64_t *)(s + 8 * (size_t)((aux32 >> 14) & 127))),
+        (long long)(*(const int64_t *)(s + 8 * (size_t)((aux32 >>  7) & 127))),
+        (long long)(*(const int64_t *)(s + 8 * (size_t)((aux32 >>  0) & 127))));
+}
+#endif /* __AVX2__ */
+
+#if defined(__AVX2__)
+static float vec_dot_iq3_xxs_q8_k_avx2(const void *vx, const void *vy, int n) {
+    const block_iq3_xxs *x = (const block_iq3_xxs *)vx;
     const block_q8_K *y = (const block_q8_K *)vy;
-    float sumf = 0.0f;
-    float wbuf[QK_K];
-    for (int ib = 0; ib < nb; ++ib) {
-        dequantize_row_iq3_xxs((const uint8_t *)vx + (size_t)ib * sizeof(block_iq3_xxs), wbuf, QK_K);
-        const int8_t *q8 = y[ib].qs;
-        float blk = 0.0f;
-        for (int i = 0; i < QK_K; ++i) blk += wbuf[i] * (float)q8[i];
-        sumf += blk * y[ib].d;
+    const int nb = n / QK_K;
+    __m256 accumf = _mm256_setzero_ps();
+
+    for (int i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32_lookup(x[i].d) * y[i].d;
+        const uint8_t *q3 = x[i].qs;                    /* 64 grid indices */
+        const uint8_t *gas = x[i].qs + QK_K / 4;        /* 32 scales_and_signs */
+        const int8_t *q8 = y[i].qs;
+        __m256i sumi1 = _mm256_setzero_si256();
+        __m256i sumi2 = _mm256_setzero_si256();
+
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+            const __m256i q2_1 = iq3xxs_grid8(q3); q3 += 8;
+            const __m256i q2_2 = iq3xxs_grid8(q3); q3 += 8;
+            uint32_t aux32[2];
+            memcpy(aux32, gas, 8); gas += 8;
+            const __m256i q8s_1 = _mm256_sign_epi8(q8_1, iq3xxs_signs(aux32[0]));
+            const __m256i q8s_2 = _mm256_sign_epi8(q8_2, iq3xxs_signs(aux32[1]));
+            const __m256i dot1 = _mm256_maddubs_epi16(q2_1, q8s_1);
+            const __m256i dot2 = _mm256_maddubs_epi16(q2_2, q8s_2);
+            const int ls1 = (int)(aux32[0] >> 28);
+            const int ls2 = (int)(aux32[1] >> 28);
+            /* |sum| <= 2 * 62 * 254 * 16 = 503k, fits int32 comfortably. */
+            sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(dot1, _mm256_set1_epi16((short)(2 * ls1 + 1))));
+            sumi2 = _mm256_add_epi32(sumi2, _mm256_madd_epi16(dot2, _mm256_set1_epi16((short)(2 * ls2 + 1))));
+        }
+        accumf = _mm256_fmadd_ps(_mm256_set1_ps(d),
+                                 _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)), accumf);
     }
-    return sumf;
+    /* db carried 0.25 * (2*ls+1) but the grid part already used 2*ls+1, so
+     * scale by 0.25 here (matches ik_llama's `0.25f * hsum`). */
+    return 0.25f * iq3xxs_hsum(accumf);
+}
+#endif /* __AVX2__ */
+
+#if defined(__ARM_NEON)
+static float vec_dot_iq3_xxs_q8_k_neon(const void *vx, const void *vy, int n) {
+    const block_iq3_xxs *x = (const block_iq3_xxs *)vx;
+    const block_q8_K *y = (const block_q8_K *)vy;
+    const int nb = n / QK_K;
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32_lookup(x[i].d) * y[i].d;
+        const uint8_t *q3 = x[i].qs;
+        const uint8_t *gas = x[i].qs + QK_K / 4;
+        const int8_t *q8 = y[i].qs;
+        float sumf1 = 0.0f, sumf2 = 0.0f;
+
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+            const int8x16_t q8a = vld1q_s8(q8 +  0), q8b = vld1q_s8(q8 + 16);
+            const int8x16_t q8c = vld1q_s8(q8 + 32), q8d = vld1q_s8(q8 + 48);
+            q8 += 64;
+            uint32_t aux32[2];
+            memcpy(aux32, gas, 8); gas += 8;
+            /* Grid -> u8 values held in an s8 register, then multiply by the
+             * +-1 sign mask (vmulq_s8 is exact for these small magnitudes). */
+            const uint32x4_t g0 = vld1q_u32((const uint32_t *)&iq3xxs_grid[q3[ 0]]);
+            const uint32x4_t g1 = vld1q_u32((const uint32_t *)&iq3xxs_grid[q3[ 4]]);
+            const uint32x4_t g2 = vld1q_u32((const uint32_t *)&iq3xxs_grid[q3[ 8]]);
+            const uint32x4_t g3 = vld1q_u32((const uint32_t *)&iq3xxs_grid[q3[12]]);
+            q3 += 16;
+            const int8_t *s = (const int8_t *)iq3xxs_sign_tab;
+            int8x16_t s0 = vcombine_s8(vld1_s8(s + 8 * (size_t)((aux32[0] >>  0) & 127)),
+                                       vld1_s8(s + 8 * (size_t)((aux32[0] >>  7) & 127)));
+            int8x16_t s1 = vcombine_s8(vld1_s8(s + 8 * (size_t)((aux32[0] >> 14) & 127)),
+                                       vld1_s8(s + 8 * (size_t)((aux32[0] >> 21) & 127)));
+            int8x16_t s2 = vcombine_s8(vld1_s8(s + 8 * (size_t)((aux32[1] >>  0) & 127)),
+                                       vld1_s8(s + 8 * (size_t)((aux32[1] >>  7) & 127)));
+            int8x16_t s3 = vcombine_s8(vld1_s8(s + 8 * (size_t)((aux32[1] >> 14) & 127)),
+                                       vld1_s8(s + 8 * (size_t)((aux32[1] >> 21) & 127)));
+            const int8x16_t w0 = vmulq_s8(s0, vreinterpretq_s8_u32(g0));
+            const int8x16_t w1 = vmulq_s8(s1, vreinterpretq_s8_u32(g1));
+            const int8x16_t w2 = vmulq_s8(s2, vreinterpretq_s8_u32(g2));
+            const int8x16_t w3 = vmulq_s8(s3, vreinterpretq_s8_u32(g3));
+#if defined(__ARM_FEATURE_DOTPROD) || defined(__ARM_FEATURE_MATMUL_INT8)
+            int32x4_t p1 = vdotq_s32(vdupq_n_s32(0), w0, q8a);
+            p1 = vdotq_s32(p1, w1, q8b);
+            int32x4_t p2 = vdotq_s32(vdupq_n_s32(0), w2, q8c);
+            p2 = vdotq_s32(p2, w3, q8d);
+            const int32_t r1 = vaddvq_s32(p1), r2 = vaddvq_s32(p2);
+#else
+            /* Portable fallback: widen to int16 pairs and sum manually. */
+            int32_t r1 = 0, r2 = 0;
+            const int8_t *wp[4] = { (const int8_t *)&w0, (const int8_t *)&w1,
+                                    (const int8_t *)&w2, (const int8_t *)&w3 };
+            const int8_t *yp[4] = { (const int8_t *)&q8a, (const int8_t *)&q8b,
+                                    (const int8_t *)&q8c, (const int8_t *)&q8d };
+            for (int t = 0; t < 2; ++t)
+                for (int j = 0; j < 16; ++j) r1 += (int32_t)wp[t][j] * (int32_t)yp[t][j];
+            for (int t = 2; t < 4; ++t)
+                for (int j = 0; j < 16; ++j) r2 += (int32_t)wp[t][j] * (int32_t)yp[t][j];
+#endif
+            sumf1 += (float)r1 * (float)(2 * (int)(aux32[0] >> 28) + 1);
+            sumf2 += (float)r2 * (float)(2 * (int)(aux32[1] >> 28) + 1);
+        }
+        sumf += d * (sumf1 + sumf2);
+    }
+    /* d is 0.25 * fp16_d * y.d, and the grid sums used (2*ls+1): net 0.25. */
+    return 0.25f * sumf;
+}
+#endif /* __ARM_NEON */
+
+/* Portable scalar reference / fallback: exact same integer arithmetic as the
+ * SIMD kernels above, so it doubles as the validation oracle for them. */
+static float vec_dot_iq3_xxs_q8_k_scalar(const void *vx, const void *vy, int n) {
+    const block_iq3_xxs *x = (const block_iq3_xxs *)vx;
+    const block_q8_K *y = (const block_q8_K *)vy;
+    const int nb = n / QK_K;
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32_lookup(x[i].d) * y[i].d;
+        const uint8_t *qs = x[i].qs;
+        const uint8_t *sas = qs + QK_K / 4;
+        const int8_t *q8 = y[i].qs;
+        float blk = 0.0f;
+        for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+            uint32_t aux32;
+            memcpy(&aux32, sas + 4 * ib32, sizeof aux32);
+            int32_t isum = 0;
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t signs = ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
+                const uint8_t *g1 = (const uint8_t *)&iq3xxs_grid[qs[2 * l + 0]];
+                const uint8_t *g2 = (const uint8_t *)&iq3xxs_grid[qs[2 * l + 1]];
+                for (int j = 0; j < 4; ++j)
+                    isum += (int32_t)g1[j] * ((signs & kmask_iq2xs[j]) ? -q8[j] : q8[j]);
+                for (int j = 0; j < 4; ++j)
+                    isum += (int32_t)g2[j] * ((signs & kmask_iq2xs[j + 4]) ? -q8[j + 4] : q8[j + 4]);
+                q8 += 8;
+            }
+            blk += (float)isum * (float)(2 * (int)(aux32 >> 28) + 1);
+            qs += 8;
+        }
+        sumf += d * blk;
+    }
+    /* 0.25 from db = d * 0.5 * (0.5 + ls) = 0.25 * d * (2*ls+1) */
+    return 0.25f * sumf;
+}
+
+/* Public GEMV entry point: pick the widest available kernel. */
+float vec_dot_iq3_xxs_q8_k(const void *vx, const void *vy, int n) {
+    if (n % QK_K) return vec_dot_iq3_xxs_q8_k_scalar(vx, vy, n);
+    iq3xxs_sign_init();
+#if defined(__AVX2__)
+    return vec_dot_iq3_xxs_q8_k_avx2(vx, vy, n);
+#elif defined(__ARM_NEON)
+    return vec_dot_iq3_xxs_q8_k_neon(vx, vy, n);
+#else
+    return vec_dot_iq3_xxs_q8_k_scalar(vx, vy, n);
+#endif
+}
+
+/* Scalars exposed for the kernel checker (tests/kq_gemm_check.c). */
+float vec_dot_iq3_xxs_q8_k_ref(const void *vx, const void *vy, int n) {
+    iq3xxs_sign_init();
+    return vec_dot_iq3_xxs_q8_k_scalar(vx, vy, n);
 }
 
 /* ================================================================

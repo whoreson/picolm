@@ -331,3 +331,11 @@ void vec_dot_iq4_xs_q8_k_neon(const void *vx, const void *wy, int n, float *out)
     *out = sumf;
 }
 #endif /* __ARM_NEON */
+
+/* type_gemm_fn wrapper for IQ4_XS: adapts picolm_sgemm_d_iq4xs (k_blocks)
+ * to the type_gemm_fn signature (k in elements). Used by gemm_table_dual_task. */
+int sgemm_iq4_xs_q8k_best(int nrows, int ncols, int k, const void *w, const void *a,
+                           float *out, size_t bs, int ith, int nth) {
+    if (k % 256 != 0) return 0;
+    return picolm_sgemm_d_iq4xs(nrows, ncols, k / 256, w, k / 256, a, k / 256, out, (int)bs, ith, nth);
+}

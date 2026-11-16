@@ -730,6 +730,13 @@ test_kq_gemm: tests/kq_gemm_check.c quant.c $(SGEMM_SRCS) type_dispatch.c tensor
 	$(CC) $(TEST_NATIVE_CFLAGS) -I. -o $@ tests/kq_gemm_check.c quant.c $(SGEMM_SRCS) \
 	    type_dispatch.c tensor.c tokenizer.c -lm -lpthread -fopenmp
 
+# IQ3_XXS prefill GEMM throughput: decode-once R8 vs the per-column GEMV.
+#   ./bench_iq3xxs_gemm check
+#   ./bench_iq3xxs_gemm [m n k reps threads]       e.g. 5120 512 17408 3 24
+bench_iq3xxs_gemm: bench_iq3xxs_gemm.c quant.c $(SGEMM_SRCS) type_dispatch.c tensor.c
+	$(CC) $(TEST_NATIVE_CFLAGS) -I. -o $@ bench_iq3xxs_gemm.c quant.c $(SGEMM_SRCS) \
+	    type_dispatch.c tensor.c -lm -lpthread -fopenmp
+
 .PHONY: check-kq-gemm
 check-kq-gemm: test_kq_gemm
 	./test_kq_gemm

@@ -1810,6 +1810,11 @@ int sgemm_iq2_k_r4_q8_k_best(int nrows, int ncols, int k, const void *vx, const 
 int sgemm_iq3_k_r4_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
 int sgemm_iq6_k_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy,
                           float *out, size_t bs, int ith, int nth);   /* r8t when worthwhile, else tile kernel; always computes */
+/* IQ3_XXS x Q8_K table fn_gemm: decode-once R8 (VNNI/AVX2) for big shapes, else the
+ * 1-row GEMV over this thread's rows. Always computes its whole share. */
+int sgemm_iq3_xxs_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_iq3_xxs_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+int sgemm_iq3_xxs_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
 /* IQ6_K plain x Q8_K ARM NEON GEMV/GEMM. */
 void vec_dot_iq6_k_q8_k_neon(const void *vx, const void *wy, int n, float *out);
 void vec_dot_iq6_k_q8_k_neon_batch(const void *vx, const void *wy, size_t y_stride,
@@ -1839,6 +1844,13 @@ float vec_dot_q2_k_r4_q8_k(const void *vx, const void *vy, int n);
 void vec_dot_q2_k_r4_q8_k_batch4(const void *vx, const void *vy, int n, float *out, int nrows);
 void dequantize_row_iq3_xxs(const void *src, float *dst, int n);
 float vec_dot_iq3_xxs_q8_k(const void *vx, const void *vy, int n);
+/* Scalar (integer-exact) reference for vec_dot_iq3_xxs_q8_k, used as the
+ * validation oracle by tests/kq_gemm_check.c. */
+float vec_dot_iq3_xxs_q8_k_ref(const void *vx, const void *vy, int n);
+/* IQ3_XXS reference tables (see quant.c), shared by the GEMM decode path. */
+const uint32_t *picolm_iq3xxs_grid(void);    /* 256 x packed 4-byte grids */
+const uint8_t  *picolm_iq3xxs_ksigns(void);  /* 128 sign masks */
+const uint8_t  *picolm_iq3xxs_kmask(void);   /* 8 bit masks */
 
 /* Correct 4-row R4 vecdot built on a verified per-row dequantizer. `block_bytes`
  * is the size of one R4 block (e.g. sizeof(block_iq4_k_r4)). */
