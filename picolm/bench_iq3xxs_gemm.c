@@ -59,6 +59,8 @@ static void task(int idx, void *p) {
                                          (const char *)c->Y + (size_t)col * nb * sizeof(block_q8_K), c->k);
     } else if (c->which == 1) {
         sgemm_iq3_xxs_q8_k_r8t(c->m, c->n, c->k, c->W, c->Y, c->C, (size_t)c->m, idx, c->nth);
+    } else if (c->which == 3) {
+        sgemm_iq3_xxs_q8_k_neon(c->m, c->n, c->k, c->W, c->Y, c->C, (size_t)c->m, idx, c->nth);
     } else {
         sgemm_iq3_xxs_q8_k_r8v(c->m, c->n, c->k, c->W, c->Y, c->C, (size_t)c->m, idx, c->nth);
     }
@@ -154,6 +156,44 @@ int main(int argc, char **argv) {
         g2 = ops / best / 1e9;
         printf("  %-34s: %8.2f GOPS total = %6.2f per thread  (%d thread%s)\n",
                "decode-once R8 VNNI (new)", g2, g2/nth, nth, nth > 1 ? "s" : "");
+    }
+    /* ARM: the NEON tiled GEMM (UNTESTED kernel, see its TRACE line). The
+     * x86-only kernels above return 0 / write nothing useful here, so on ARM
+     * this is the number that matters. */
+    double gn = 0;
+    {
+        float *Cn = calloc((size_t)n*m, 4);
+        int haven = sgemm_iq3_xxs_q8_k_neon(m, n, k, W, Y, Cn, m, 0, 1) != 0;
+        if (haven) {
+            ctx_t cx = {3, m, n, k, nth, W, Y, Cn};
+            double best = 1e9;
+            for (int r = -1; r < reps; r++) {
+                double t = now();
+                if (nth > 1) tensor_parallel_for(nth, task, &cx); else task(0, &cx);
+                t = now() - t;
+                if (r >= 0 && t < best) best = t;
+            }
+            gn = ops / best / 1e9;
+            printf("  %-34s: %8.2f GOPS total = %6.2f per thread  (%d thread%s)\n",
+                   "NEON tiled (new, UNTESTED)", gn, gn/nth, nth, nth > 1 ? "s" : "");
+            /* quality of the NEON kernel against the scalar reference */
+            double mn = 0, rn = 0;
+            size_t wrow = (size_t)(k/256) * sizeof(block_iq3_xxs);
+            for (int col = 0; col < n; col++)
+                for (int i = 0; i < m; i++) {
+                    double ref = vec_dot_iq3_xxs_q8_k_ref((const char *)W + (size_t)i*wrow,
+                                                          (const char *)Y + (size_t)col*(k/256)*sizeof(block_q8_K), k);
+                    double d = fabs(ref - (double)Cn[(size_t)col*m + i]);
+                    if (d > mn) mn = d;
+                    rn += ref*ref;
+                }
+            rn = sqrt(rn/((size_t)n*m) + 1e-30);
+            printf("  NEON vs scalar reference: max|diff|=%.3g rms=%.3g (relative %.2e)\n",
+                   mn, rn, mn/(rn+1e-30));
+        } else {
+            printf("  %-34s: not built for this host\n", "NEON tiled (new, UNTESTED)");
+        }
+        free(Cn);
     }
     /* Quality: new kernels vs the scalar integer-exact reference, and each other. */
     double md = 0, rm = 0;

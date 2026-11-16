@@ -1617,6 +1617,14 @@ static int kq_best(const char *name, kq_r8_fn r8v, kq_r8_fn r8t, float (*dot)(co
 /* IQ3_XXS table fn_gemm: decode-once R8 (VNNI, then AVX2) for big shapes, else a
  * per-column dot over this thread's rows (the 1-row GEMV kernel, which is exact). */
 int sgemm_iq3_xxs_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth) {
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    /* ARM has no decode-once R8 engine (iq6t is x86-only), so go straight to the
+     * NEON tile kernel, which decodes each block once per 16x22 tile. */
+    {
+        int r = sgemm_iq3_xxs_q8_k_neon(nrows, ncols, k, vx, vy, out, bs, ith, nth);
+        if (r) return r;
+    }
+#endif
     return kq_best("sgemm_iq3_xxs_q8_k", sgemm_iq3_xxs_q8_k_r8v, sgemm_iq3_xxs_q8_k_r8t,
                    vec_dot_iq3_xxs_q8_k, sizeof(block_iq3_xxs), nrows, ncols, k, vx, vy, out, bs, ith, nth);
 }
@@ -2012,6 +2020,155 @@ int sgemm_iq6_k_q8_k_neon(int nrows, int ncols, int k,
         out[i + (size_t)j * bs] = result;
     }
     return nrows;
+}
+
+#endif /* PICOLM_NEON */
+
+/* ================================================================
+ * IQ3_XXS x Q8_K NEON GEMM  (UNTESTED - see the TRACE line emitted on
+ * first call; written against the same decoding rules as the verified
+ * AVX2 kernel and the scalar oracle, but never executed on real ARM).
+ *
+ * Shape mirrors the Q2_K/Q6_K NEON tiles in sgemm_k_q8k_neon_fast.c:
+ *   weight row r's 256-value block -> 8 sub-blocks of 32 values
+ *   each sub-block ib32 has ONE scale 2*(aux32>>28)+1 and is exactly two
+ *   16-value groups, so the 16-group index is 2*ib32 and 2*ib32+1.
+ *
+ * Decoding is the same trick the AVX2 GEMV uses: the grid is a 256-entry u32
+ * table of four u8 values (0x04..0x3e), so widen it to int8 and multiply by the
+ * +-1 sign mask. NEON has no u8*s8 dot, which is why the sign goes on the
+ * WEIGHTS here (vmulq_s8) rather than on the activations.
+ *
+ * int8 headroom: |w| <= 62, |q8| <= 127, 16 MACs => |sum| <= 126k, and the
+ * scale is <= 15, so the per-group int32 accumulation cannot overflow.
+ * ================================================================ */
+#if defined(PICOLM_NEON)
+
+#define IQ3XXS_NEON_TILE_M 16
+#define IQ3XXS_NEON_TILE_N 16
+
+/* Decode one 256-value block into 256 signed int8 values (natural order) and
+ * return the 8 sub-block scales in sc[0..7]. Mirrors dequantize_row_iq3_xxs. */
+static void iq3xxs_decode_block_neon(const block_iq3_xxs *x, int8_t w[256], int32_t sc[8]) {
+    const uint32_t *grid = picolm_iq3xxs_grid();
+    const uint8_t  *ksig = picolm_iq3xxs_ksigns();
+    const uint8_t  *kmsk = picolm_iq3xxs_kmask();
+    const uint8_t *qs  = x->qs;
+    const uint8_t *sas = x->qs + QK_K / 4;
+    for (int ib32 = 0; ib32 < 8; ++ib32) {
+        uint32_t aux32;
+        memcpy(&aux32, sas + 4 * ib32, sizeof aux32);
+        int8_t *dst = w + 32 * ib32;
+        for (int l = 0; l < 4; ++l) {
+            const uint8_t signs = ksig[(aux32 >> (7 * l)) & 127];
+            const uint8_t *g1 = (const uint8_t *)&grid[qs[2 * l + 0]];
+            const uint8_t *g2 = (const uint8_t *)&grid[qs[2 * l + 1]];
+            for (int j = 0; j < 4; ++j)
+                dst[8 * l + j]     = (int8_t)((signs & kmsk[j])     ? -(int)g1[j] : (int)g1[j]);
+            for (int j = 0; j < 4; ++j)
+                dst[8 * l + j + 4] = (int8_t)((signs & kmsk[j + 4]) ? -(int)g2[j] : (int)g2[j]);
+        }
+        qs += 8;
+        sc[ib32] = 2 * (int32_t)(aux32 >> 28) + 1;
+    }
+}
+
+/* Dot of 16 int8 weights with 16 int8 activations, both already signed.
+ * Tier precedence matches sgemm_k_q8k_neon_fast.c: DOTPROD (vdotq_s32) is used
+ * whenever it exists, because vmmlaq_s32 duplicates its 2x2 result across lanes
+ * and needs a lane-0+lane-3 fold instead of vaddvq_s32. */
+static inline int32_t iq3xxs_dot16_neon(const int8_t *w, const int8_t *a) {
+#if defined(__ARM_FEATURE_DOTPROD)
+    return vaddvq_s32(vdotq_s32(vdupq_n_s32(0), vld1q_s8(w), vld1q_s8(a)));
+#elif defined(__ARM_FEATURE_MATMUL_INT8) || defined(__ARM_FEATURE_SVE_MATMUL_INT8)
+    const int32x4_t s = vmmlaq_s32(vdupq_n_s32(0), vld1q_s8(w), vld1q_s8(a));
+    /* Only lanes 0 and 3 hold distinct values. */
+    return vgetq_lane_s32(s, 0) + vgetq_lane_s32(s, 3);
+#else
+    /* Plain NEON: 8x8 widening multiply into int16, then pairwise add. */
+    const int8x16_t wv = vld1q_s8(w);
+    const int8x16_t av = vld1q_s8(a);
+    const int16x8_t p0 = vmull_s8(vget_low_s8(wv),  vget_low_s8(av));
+    const int16x8_t p1 = vmull_s8(vget_high_s8(wv), vget_high_s8(av));
+    return vaddvq_s32(vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)));
+#endif
+}
+
+static void iq3xxs_gemm_tile_neon(const block_iq3_xxs *A, int lda,
+                                  const block_q8_K *B, int ldb,
+                                  float *C, int ldc, int k_blocks,
+                                  int ir0, int ir1, int jc0, int jc1) {
+    for (int jc = jc0; jc < jc1; jc += IQ3XXS_NEON_TILE_N) {
+        const int nn = (jc + IQ3XXS_NEON_TILE_N <= jc1) ? IQ3XXS_NEON_TILE_N : (jc1 - jc);
+        for (int ir = ir0; ir < ir1; ir += IQ3XXS_NEON_TILE_M) {
+            const int mm = (ir + IQ3XXS_NEON_TILE_M <= ir1) ? IQ3XXS_NEON_TILE_M : (ir1 - ir);
+            float acc[IQ3XXS_NEON_TILE_M][IQ3XXS_NEON_TILE_N];
+            for (int r = 0; r < mm; ++r)
+                for (int c = 0; c < nn; ++c) acc[r][c] = 0.0f;
+
+            for (int l = 0; l < k_blocks; ++l) {
+                /* Decode each weight row of the tile ONCE, reuse for all columns. */
+                int8_t  w[IQ3XXS_NEON_TILE_M][256];
+                int32_t sc[IQ3XXS_NEON_TILE_M][8];
+                float   dsw[IQ3XXS_NEON_TILE_M];
+                for (int r = 0; r < mm; ++r) {
+                    const block_iq3_xxs *aq = &A[(size_t)lda * (ir + r) + l];
+                    iq3xxs_decode_block_neon(aq, w[r], sc[r]);
+                    /* 0.25 is the folded 0.5*0.5 from db = d*(0.5+ls)*0.5 */
+                    dsw[r] = 0.25f * fp16_to_fp32_lookup(aq->d);
+                }
+                for (int c = 0; c < nn; ++c) {
+                    const block_q8_K *bq = &B[(size_t)ldb * (jc + c) + l];
+                    const float dy = bq->d;
+                    for (int r = 0; r < mm; ++r) {
+                        int32_t isum = 0;
+                        for (int g = 0; g < 8; ++g)
+                            isum += sc[r][g] * (iq3xxs_dot16_neon(w[r] + 32 * g,     bq->qs + 32 * g)
+                                              + iq3xxs_dot16_neon(w[r] + 32 * g + 16, bq->qs + 32 * g + 16));
+                        acc[r][c] += dsw[r] * dy * (float)isum;
+                    }
+                }
+            }
+            for (int r = 0; r < mm; ++r)
+                for (int c = 0; c < nn; ++c)
+                    C[(size_t)ldc * (jc + c) + (ir + r)] = acc[r][c];
+        }
+    }
+}
+
+int sgemm_iq3_xxs_q8_k_neon(int nrows, int ncols, int k, const void *vx, const void *vy,
+                            float *out, size_t bs, int ith, int nth) {
+    if (nrows < 1 || ncols < 1 || k <= 0 || (k % QK_K) != 0 || nth < 1) return 0;
+    {
+        static int traced;
+        if (!traced && getenv("PICOLM_DISPATCH")) {
+            traced = 1;
+#if defined(__ARM_FEATURE_DOTPROD)
+            fprintf(stderr, "TRACE kernel: sgemm_iq3_xxs_q8_k_neon (DOTPROD, UNTESTED - written but never run on ARM)\n");
+#elif defined(__ARM_FEATURE_MATMUL_INT8) || defined(__ARM_FEATURE_SVE_MATMUL_INT8)
+            fprintf(stderr, "TRACE kernel: sgemm_iq3_xxs_q8_k_neon (I8MM, UNTESTED - written but never run on ARM)\n");
+#else
+            fprintf(stderr, "TRACE kernel: sgemm_iq3_xxs_q8_k_neon (plain NEON, UNTESTED - written but never run on ARM)\n");
+#endif
+        }
+    }
+    const int nb = k / QK_K;
+    const int64_t rows_per = ((int64_t)nrows + nth - 1) / nth;
+    const int64_t i0 = (int64_t)ith * rows_per;
+    int64_t i1 = i0 + rows_per; if (i1 > nrows) i1 = nrows;
+    if (i0 >= i1) return (int)(i1 - i0);   /* this thread has no rows; still a valid share */
+    iq3xxs_gemm_tile_neon((const block_iq3_xxs *)vx, nb, (const block_q8_K *)vy, nb,
+                          out, (int)bs, nb, (int)i0, (int)i1, 0, ncols);
+    return (int)(i1 - i0);
+}
+
+#else /* !PICOLM_NEON */
+
+int sgemm_iq3_xxs_q8_k_neon(int nrows, int ncols, int k, const void *vx, const void *vy,
+                            float *out, size_t bs, int ith, int nth) {
+    (void)nrows; (void)ncols; (void)k; (void)vx; (void)vy;
+    (void)out; (void)bs; (void)ith; (void)nth;
+    return 0;
 }
 
 #endif /* PICOLM_NEON */

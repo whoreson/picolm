@@ -235,6 +235,67 @@ int main(void) {
         bad |= bad3;
     }
 
+    /* ---- IQ3_XXS NEON tiled GEMM (ARM only; the symbol is a 0-returning stub
+     * elsewhere, in which case the whole block is skipped). Compares each
+     * element against the scalar integer-exact reference. */
+    {
+        const int ms4[] = {1, 7, 16, 17, 32, 136};
+        const int ns4[] = {1, 15, 16, 17, 33};
+        const int ks4[] = {256, 512, 4096};
+        const int ths4[] = {1, 3, 4};
+        double worst = 0;
+        int bad4 = 0, tested = 0;
+        for (int a = 0; a < 6; a++) for (int b = 0; b < 5; b++) for (int c = 0; c < 3; c++) for (int t = 0; t < 3; t++) {
+            const int m = ms4[a], n = ns4[b], k = ks4[c], nth = ths4[t], nb = k / 256;
+            block_iq3_xxs *W = malloc(sizeof(block_iq3_xxs) * (size_t)m * nb);
+            for (size_t i = 0; i < (size_t)m * nb; i++) {
+                uint8_t *b = (uint8_t *)&W[i];
+                for (size_t j = 2; j < sizeof(block_iq3_xxs); j++) b[j] = (uint8_t)rnd();
+                W[i].d = fp32_to_fp16(0.001f + (rnd() & 255) * 1e-5f);
+            }
+            block_q8_K *Y = malloc(sizeof(block_q8_K) * (size_t)n * nb);
+            float *tmp = malloc(sizeof(float) * k);
+            for (int col = 0; col < n; col++) {
+                for (int i = 0; i < k; i++) tmp[i] = (rnd() & 0xFFFF) / 32768.0f - 1.0f;
+                quantize_row_q8_K(tmp, Y + (size_t)col * nb, k);
+            }
+            float *C = malloc(sizeof(float) * (size_t)n * m);
+            for (size_t i = 0; i < (size_t)n * m; i++) C[i] = 1e30f;   /* poison */
+            int any = 0;
+            for (int th = 0; th < nth; th++)
+                if (sgemm_iq3_xxs_q8_k_neon(m, n, k, W, Y, C, (size_t)m, th, nth)) any = 1;
+            if (!any) { free(W); free(Y); free(tmp); free(C); continue; }
+            tested = 1;
+            double md = 0, rm = 0;
+            int this_bad = 0;
+            const size_t wrow = (size_t)nb * sizeof(block_iq3_xxs);
+            for (int col = 0; col < n; col++)
+                for (int i = 0; i < m; i++) {
+                    double ref = vec_dot_iq3_xxs_q8_k_ref((const char *)W + (size_t)i * wrow,
+                                                          (const char *)Y + (size_t)col * nb * sizeof(block_q8_K), k);
+                    double got = C[(size_t)col * m + i];
+                    double dd = fabs(ref - got);
+                    if (!(dd == dd) || got > 1e29f) this_bad = 1;   /* unwritten / NaN */
+                    if (dd > md) md = dd;
+                    rm += ref * ref;
+                }
+            rm = sqrt(rm / ((double)m * n) + 1e-30);
+            if (md > 1e-3 * rm + 1e-3) this_bad = 1;
+            if (md > worst) worst = md;
+            if (this_bad) {
+                printf("  FAIL neon m=%d n=%d k=%d nth=%d maxdiff=%.3g rms=%.3g\n", m, n, k, nth, md, rm);
+                bad4 = 1;
+            }
+            free(W); free(Y); free(tmp); free(C);
+        }
+        if (tested)
+            printf("%-8s %s  (worst abs diff over all shapes: %.3g)\n",
+                   "neon", bad4 ? "see failures above" : "OK", worst);
+        else
+            printf("%-8s skipped (no NEON GEMM in this build)\n", "neon");
+        bad |= bad4;
+    }
+
     printf("kq_gemm_check: %d shape/thread combinations, %s\n", cnt, bad ? "FAIL" : "all OK");
     return bad;
 }

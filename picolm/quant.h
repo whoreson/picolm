@@ -1815,6 +1815,10 @@ int sgemm_iq6_k_q8_k_best(int nrows, int ncols, int k, const void *vx, const voi
 int sgemm_iq3_xxs_q8_k_best(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
 int sgemm_iq3_xxs_q8_k_r8t(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
 int sgemm_iq3_xxs_q8_k_r8v(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
+/* IQ3_XXS x Q8_K ARM NEON tiled GEMM (I8MM / DOTPROD / plain NEON tiers).
+ * UNTESTED: has not been executed on real ARM hardware yet. Returns 0 when
+ * unsupported so the caller can fall back to the per-column GEMV. */
+int sgemm_iq3_xxs_q8_k_neon(int nrows, int ncols, int k, const void *vx, const void *vy, float *out, size_t bs, int ith, int nth);
 /* IQ6_K plain x Q8_K ARM NEON GEMV/GEMM. */
 void vec_dot_iq6_k_q8_k_neon(const void *vx, const void *wy, int n, float *out);
 void vec_dot_iq6_k_q8_k_neon_batch(const void *vx, const void *wy, size_t y_stride,
