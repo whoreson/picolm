@@ -986,6 +986,7 @@ int model_dump_tensor(const char *path, const char *spec) {
             case GGUF_TYPE_Q4_K: bpr = n / 256 * sizeof(block_q4_K); break;
             case GGUF_TYPE_Q5_K: bpr = n / 256 * sizeof(block_q5_K); break;
             case GGUF_TYPE_Q6_K: bpr = n / 256 * sizeof(block_q6_K); break;
+            case GGUF_TYPE_IQ6_K: bpr = n / 256 * sizeof(block_iq6_k); break;
             case GGUF_TYPE_Q6_0: bpr = n / 32 * sizeof(block_q6_0); break;
             case GGUF_TYPE_IQ4_NL: bpr = n / 32 * sizeof(block_iq4_nl); break;
             case GGUF_TYPE_Q2_0: bpr = n / 128 * sizeof(block_q2_0); break;
