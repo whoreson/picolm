@@ -867,7 +867,16 @@ typedef __m256 adv;
 #define AD_MIN_SPLIT_CHUNK 256      /* min positions per split-KV chunk */
 
 static int ad_use_ref = 0;          /* PICOLM_ATTN_DECODE=ref */
-static int ad_split_on = 1;         /* PICOLM_ATTN_SPLIT=0 disables split-KV */
+/* Split-KV flash decoding splits the position range into S chunks, where S is
+ * derived from tensor_get_n_threads(), then merges the S partial softmax
+ * states in chunk order. Different S => a different summation tree => a
+ * different rounded result, i.e. the decoded logits (and therefore the
+ * sampled tokens at a fixed -s seed) change with -j.
+ *
+ * Reproducibility across thread counts is a hard contract, so this is OFF by
+ * default. PICOLM_ATTN_SPLIT=1 (or PICOLM_ATTN_SPLIT_AGGRESSIVE=1) opts into
+ * the throughput mode, which is explicitly NOT bit-reproducible across -j. */
+static int ad_split_on = 0;         /* PICOLM_ATTN_SPLIT=1 enables split-KV */
 static int ad_min_chunk = AD_MIN_SPLIT_CHUNK;
 static int ad_prefetch = 1;         /* PICOLM_ATTN_PF=0 disables sw prefetch */
 static void ad_env_register(void) PICOLM_CONSTRUCTOR;
@@ -875,6 +884,7 @@ static void ad_env_register(void) {
     const char *e;
     if ((e = getenv("PICOLM_ATTN_DECODE")) && !strcmp(e, "ref")) ad_use_ref = 1;
     if ((e = getenv("PICOLM_ATTN_SPLIT"))) ad_split_on = atoi(e) != 0;
+    if ((e = getenv("PICOLM_ATTN_SPLIT_AGGRESSIVE"))) ad_split_on = atoi(e) != 0;
     if ((e = getenv("PICOLM_ATTN_SPLIT_MIN")) && atoi(e) > 0) ad_min_chunk = atoi(e);
     if ((e = getenv("PICOLM_ATTN_PF"))) ad_prefetch = atoi(e) != 0;
 }
@@ -2508,7 +2518,7 @@ void batch_attention_layer(
      * test_attn_diff_sweep.sh), including unaligned start_pos. */
     static int _layer_call = 0;
     int _layer_idx = _layer_call++;
-    static int _tiled_min_tokens = -1, _tiled_eff = 1;
+    static int _tiled_min_tokens = -1, _tiled_eff = 1, _tiled_aggressive = 0;
     if (_tiled_min_tokens < 0) {
         const char *_mt = getenv("PICOLM_ATTN_TILED_MIN_TOKENS");
         _tiled_min_tokens = _mt ? atoi(_mt) : ATTN_TILED_MIN_TOKENS;
@@ -2516,11 +2526,32 @@ void batch_attention_layer(
         const char *_ef = getenv("PICOLM_ATTN_TILED_EFF");
         _tiled_eff = _ef ? atoi(_ef) : ATTN_TILED_EFF_FACTOR;
         if (_tiled_eff < 1) _tiled_eff = 1;
+        /* Read ONCE, here (this block runs on the first layer only), never in
+         * the hot path below.
+         *
+         * Default: the tiled-vs-grouped decision is a pure function of SHAPE
+         * (token count / KV-head count), never of tensor_get_n_threads().
+         * The two paths are both correct but reduce Q.K and P.V with
+         * different floating-point accumulation orders, so gating on the
+         * thread count made the sampled output depend on -j at a fixed -s
+         * seed (e.g. a 32-token prompt with 5 KV heads flips paths at -j 16,
+         * producing logit deltas up to ~0.64). Reproducibility across thread
+         * counts is a hard contract: same seed -> same output, always.
+         *
+         * PICOLM_ATTN_TILED_AGGRESSIVE=1 restores the old thread-count
+         * heuristic (tiled whenever it would keep the pool busy). That is a
+         * throughput mode and is explicitly NOT bit-reproducible across -j. */
+        const char *_ag = getenv("PICOLM_ATTN_TILED_AGGRESSIVE");
+        _tiled_aggressive = (_ag && _ag[0] && _ag[0] != '0') ? 1 : 0;
     }
     int _n_tiled_tasks = n_kv_heads * ((n_tokens + ATTN_TILE - 1) / ATTN_TILE);
+    /* Shape-only gate by default (thread-count independent -> deterministic for
+     * any -j). _tiled_aggressive opts back into the -j-sensitive heuristic. */
     int _size_ok = n_tokens >= 2 * ATTN_TILE ||
                    (n_tokens >= _tiled_min_tokens &&
-                    (long)_tiled_eff * _n_tiled_tasks >= tensor_get_n_threads());
+                    (_tiled_aggressive
+                         ? (long)_tiled_eff * _n_tiled_tasks >= tensor_get_n_threads()
+                         : (long)_n_tiled_tasks >= 1));
     int _use_tiled = _size_ok && attn_tiled_kv_ok(kv_type_k, kv_type_v);
     if (_use_tiled && !(kv_type_k == KV_CACHE_F16 && kv_type_v == KV_CACHE_F16)) {
         /* Opt-out for quantized caches (unchanged default: tiled). */

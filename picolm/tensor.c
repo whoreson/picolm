@@ -1425,11 +1425,11 @@ static void *pool_worker(void *arg) {
             /* 2. nothing arrived: block on the condvar */
             if (sleep_now) {
                 win_mutex_lock(&pool_mutex);
-                /* Recheck gen AFTER locking mutex but BEFORE incrementing nsleep,
-                 * to prevent lost-wakeup: main may have already bumped pool_gen
-                 * and seen nsleep==0, so it didn't broadcast. */
-                g = POOL_LD(&pool_gen);
-                if (g != last_gen || POOL_LD(&pool_shutdown)) {
+                /* Recheck gen AFTER locking the mutex but BEFORE incrementing
+                 * pool_nsleep, so a wake that lands between the spin loop and the
+                 * lock is not lost: pool_wake() only broadcasts when it observes
+                 * pool_nsleep > 0. */
+                if (POOL_LD(&pool_gen) != last_gen || POOL_LD(&pool_shutdown)) {
                     win_mutex_unlock(&pool_mutex);
                 } else {
                     PICOLM_ATOMIC_ADD_FETCH(&pool_nsleep, 1);
@@ -1438,6 +1438,16 @@ static void *pool_worker(void *arg) {
                     PICOLM_ATOMIC_SUB_FETCH(&pool_nsleep, 1);
                     win_mutex_unlock(&pool_mutex);
                 }
+                /* CRITICAL: re-read the generation AFTER the condvar wait and
+                 * unlock. The `g` from the spin loop / the pre-lock recheck is
+                 * the OLD generation -- it must not be latched into last_gen
+                 * below. Doing so leaves last_gen stale, so the next iteration
+                 * sees the (already consumed) generation as "new", runs a task
+                 * nobody published (stale generic_tasks[tid]/pool_tasks[tid]
+                 * pointing at a dead caller frame -> segfault) and bumps
+                 * pool_done an extra time (pool_wait returns early -> garbage
+                 * output). This was the a9a7c4a regression. */
+                g = POOL_LD(&pool_gen);
             }
         }
         if (POOL_LD(&pool_shutdown)) break;
@@ -1526,6 +1536,7 @@ static void pool_init(int nt) {
     win_cond_init(&pool_cond);
     pool_gen = 0;
     pool_done = 0;
+    pool_done_base = 0;
     pool_shutdown = 0;
 #ifdef PICOLM_SPIN_POOL
     win_cond_init(&pool_done_cond);
@@ -1546,9 +1557,12 @@ static void pool_init(int nt) {
 #ifdef PICOLM_SPIN_POOL
 static void pool_wake(int nt) {
     (void)nt;
-    /* Capture the current monotonic done count as base before publishing new generation.
-     * This eliminates the ABA race: pool_done is never reset, so stragglers from previous
-     * generations don't corrupt the next generation's count. */
+    /* Capture the current monotonic done count as base before publishing the new
+     * generation. pool_done is never reset, so a straggler from an earlier
+     * generation can no longer corrupt the next generation's count (the ABA race
+     * of the old reset-in-pool_wait scheme). The previous generation is always
+     * fully drained here because pool_wait() waits for exactly the nt-1 workers
+     * this pool physically owns, so the snapshot is exact. */
     pool_done_base = PICOLM_ATOMIC_LOAD64_SEQCST(&pool_done);
     if (pg_enabled()) {
         long long t = pool_now_ns();
