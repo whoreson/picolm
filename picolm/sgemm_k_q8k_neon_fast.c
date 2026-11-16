@@ -141,13 +141,16 @@ static inline void q2k_decode_block(const block_q2_K *x, q2k_dec_t *o) {
     const uint8x16_t m4 = vdupq_n_u8(0x0F);
     const uint8x16_t ms = vld1q_u8(x->scales);
     /* Sub-block scales as int16 directly in registers: no byte round-trip, and
-     * the values land in the order g[] uses (low nibbles, chunk-major). */
+     * the values land in the order g[] uses (low nibbles, chunk-major).
+     * Scales are 4-bit SIGNED values (range -8..7). Must sign-extend through
+     * int8 before widening to int16, matching vec_dot_q2_K_q8_K reference. */
     {
-        const uint8x16_t sm = vandq_u8(ms, m4);
-        vst1q_s16(o->sc,     vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(sm))));
-        vst1q_s16(o->sc + 8, vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(sm))));
+        const int8x16_t sm = vreinterpretq_s8_u8(vandq_u8(ms, m4));
+        vst1q_s16(o->sc,     vmovl_s8(vget_low_s8(sm)));
+        vst1q_s16(o->sc + 8, vmovl_s8(vget_high_s8(sm)));
     }
 
+    /* Mins are UNSIGNED (0-15), zero-extension is correct. */
     const uint8x16_t mn = vshrq_n_u8(ms, 4);
     o->mins[0] = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(mn)));
     o->mins[1] = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(mn)));
@@ -213,7 +216,8 @@ static inline int32x4_t q2k_acc_block(const block_q2_K *x, const q2k_dec_t *d,
     return vaddq_s32(a0, a1);
 #else
     /* I8MM / plain NEON: kq_acc cannot apply a per-lane scale for I8MM, so the
-     * dot is folded and scaled here. */
+     * dot is folded and scaled here. Return isum in lane 0, zeros elsewhere,
+     * so that the caller's vaddvq_f32() sums to the correct scalar. */
     int32_t isum = 0;
     int sb = 0;
     for (int chunk = 0; chunk < 2; ++chunk) {
@@ -231,8 +235,8 @@ static inline int32x4_t q2k_acc_block(const block_q2_K *x, const q2k_dec_t *d,
             q8 += 32;
         }
     }
-    if (bias_out) *bias_out = vdupq_n_s32(q2k_bias(d->mins, y));
-    return vdupq_n_s32(isum);
+    if (bias_out) *bias_out = vsetq_lane_s32(q2k_bias(d->mins, y), vdupq_n_s32(0), 0);
+    return vsetq_lane_s32(isum, vdupq_n_s32(0), 0);
 #endif
 }
 
