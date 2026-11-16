@@ -210,6 +210,9 @@ static float glm5_rms(const float *v, int n) {
 /*   PICOLM_STOP_LAYER=<n>       stop the trunk loop after layer n       */
 /* ==================================================================== */
 
+static int glm5_stats_mode(const char **substr);
+static int glm5_stats_wanted(void) { const char *p; return glm5_stats_mode(&p); }
+
 static int glm5_stats_mode(const char **substr) {
     static const char *pat = NULL;
     static int init = 0;
@@ -327,6 +330,7 @@ static int glm5_chk(const char *tag, const float *v, int n, float lo, float hi) 
 /* Tag of the hc_pre call in flight, so the intermediates can be reported with
  * ik-compatible names ("hc_pre-<il>", "hc_pre_mixes-<il>"). Set by the caller. */
 static char g_hc_tag[48];
+static float hc_pre_dbg_pre[8];
 
 static void glm5_hc_pre(const model_t *m, const glm5_layer_weights_t *lw,
                         int is_attn, const float *x /* [S][D] */,
@@ -412,6 +416,7 @@ static void glm5_hc_pre(const model_t *m, const glm5_layer_weights_t *lw,
     }
     for (int i = 0; i < S*S; i++)
         comb[i] = mm[2*S + i] * scale[2] + base[2*S + i];
+    for (int i = 0; i < S && i < 8; i++) hc_pre_dbg_pre[i] = pre[i];
 
     /* 4. Sinkhorn (ggml.c:23086-23110) */
     for (int r = 0; r < S; r++) {
@@ -701,6 +706,13 @@ static void glm5_kda_forward(
      * normalisation loop, which is a strong correctness signal. */
     snprintf(t, sizeof(t), "%s.conv_out", tg);
     glm5_stats(t, conv_out, CONV_DIM);
+    if (getenv("PICOLM_DBG_CONVXY") && atoi(getenv("PICOLM_DBG_CONVXY")) == layer_idx) {
+        const char *dd = getenv("PICOLM_DUMP_DIR");
+        char fn[512];
+        snprintf(fn, sizeof(fn), "%s/conv_output_silu-%d.f32", dd ? dd : "/tmp/picd", layer_idx);
+        FILE *fp = fopen(fn, "wb");
+        if (fp) { fwrite(conv_out, sizeof(float), (size_t)CONV_DIM, fp); fclose(fp); }
+    }
     glm5_chk(t, conv_out, CONV_DIM, -1e4f, 1e4f);
     if (glm5_dbg2_enabled()) {
         /* Section RMS of conv_out: q, k, v thirds. v is NOT L2-normalised so
@@ -2405,7 +2417,7 @@ static void glm5_moe_shared_expert(const model_t *m, const layer_weights_t *lw,
 
 static void glm5_moe_ffn(const model_t *m, const glm5_layer_weights_t *gw,
                          const layer_weights_t *lw, run_state_t *s,
-                         const float *cur, float *out)
+                         const float *cur, float *out, int layer_idx)
 {
     const model_config_t *c = &m->config;
     const int D = c->n_embd;
@@ -2417,6 +2429,12 @@ static void glm5_moe_ffn(const model_t *m, const glm5_layer_weights_t *gw,
 
     char t[96];
     glm5_stats("x.moe.in", cur, D);
+    if (getenv("PICOLM_DBG_MOEIN")) {
+        double ss=0; for (int q=0;q<D;q++) ss+=(double)cur[q]*cur[q];
+        static int once=0;
+        if (once++ < 80) fprintf(stderr, "[moein L%d] cur rms=%.6f first3 %.6f %.6f %.6f\n",
+                layer_idx, (float)sqrt(ss/D), cur[0], cur[1], cur[2]);
+    }
 
     /* Local probs[]: router probabilities before the selection bias. */
     float probs[512];
@@ -2431,6 +2449,35 @@ static void glm5_moe_ffn(const model_t *m, const glm5_layer_weights_t *gw,
 
     /* sigmoid router (p), then + bias for SELECTION only (GLM-5 semantics).
      * Keep the pre-bias sigmoid values around: they are the expert weights. */
+    if (glm5_dbg_enabled()) {
+        float mn=logits[0], mx=logits[0]; double ss=0;
+        for (int i = 0; i < NE; i++) { if (logits[i]<mn) mn=logits[i]; if (logits[i]>mx) mx=logits[i]; ss+=(double)logits[i]*logits[i]; }
+        fprintf(stderr, "[moe logits] rms=%.6f min=%.6f max=%.6f\n", (float)sqrt(ss/NE), mn, mx);
+    }
+    /* Dump the raw router logits so they can be diffed element-wise against
+     * ik's ffn_moe_logits-<il>.f32 -- expert selection on this model is a
+     * near-tie (see notes), so this is the only way to tell "different
+     * summation order" from "wrong tensor". */
+    {
+        static int dump_layer = -2;
+        if (dump_layer == -2) {
+            const char *e = getenv("PICOLM_DBG_MOE_LOGITS");
+            dump_layer = e ? atoi(e) : -1;
+        }
+        if (dump_layer >= 0 && dump_layer == layer_idx) {
+            const char *dir = getenv("PICOLM_DUMP_DIR");
+            char fn[512];
+            static int nw = 0;
+            snprintf(fn, sizeof(fn), "%s/ffn_moe_logits-%d.f32", dir ? dir : "/tmp/picd", dump_layer);
+            FILE *fp = fopen(fn, "wb");
+            if (fp) { fwrite(logits, sizeof(float), (size_t)NE, fp); fclose(fp); }
+            /* Also the router input, so the two can be checked together. */
+            snprintf(fn, sizeof(fn), "%s/ffn_norm-%d.f32", dir ? dir : "/tmp/picd", dump_layer);
+            fp = fopen(fn, "wb");
+            if (fp) { fwrite(cur, sizeof(float), (size_t)D, fp); fclose(fp); }
+            if (nw++ < 2) fprintf(stderr, "[moe dump] wrote layer %d (pass %d)\n", dump_layer, nw);
+        }
+    }
     for (int i = 0; i < NE; i++) logits[i] = 1.0f / (1.0f + expf(-logits[i]));
     for (int i = 0; i < NE; i++) probs[i] = logits[i];
     /* Router probabilities are sigmoids, so provably in (0,1). */
@@ -2458,6 +2505,14 @@ static void glm5_moe_ffn(const model_t *m, const glm5_layer_weights_t *gw,
         for (int k = 0; k < AK; k++) sum += wts[k];
         float inv = 1.0f / sum;  /* no epsilon for GLM */
         float sc2 = inv * c->glm5_moe_scale;
+        if (glm5_dbg_enabled()) {
+            float sn = 0.f; for (int k = 0; k < AK; k++) sn += wts[k]*wts[k];
+            fprintf(stderr, "[moe sel] sel=");
+            for (int k = 0; k < AK; k++) fprintf(stderr, " %d", sel[k]);
+            fprintf(stderr, "  sum=%.6f norm_rms=%.6f scale=%.3f w:", sum, sqrtf(sn/AK), c->glm5_moe_scale);
+            for (int k = 0; k < AK; k++) fprintf(stderr, " %.4f", wts[k]);
+            fprintf(stderr, "\n");
+        }
         for (int k = 0; k < AK; k++) wts[k] *= sc2;
     }
 
@@ -2614,7 +2669,7 @@ static void glm5_moe_ffn(const model_t *m, const glm5_layer_weights_t *gw,
  */
 static void glm5_moe_ffn_batch_ref(const model_t *m, const glm5_layer_weights_t *gw,
                                const layer_weights_t *lw, run_state_t *s,
-                               const float *cur_b, float *out_b, int n_tokens)
+                               const float *cur_b, float *out_b, int n_tokens, int layer_idx)
 {
     const model_config_t *c = &m->config;
     const int D = c->n_embd;
@@ -2646,7 +2701,7 @@ static void glm5_moe_ffn_batch_ref(const model_t *m, const glm5_layer_weights_t 
         /* Fall back to the per-token path rather than producing garbage.
          * glm5_moe_ffn() zeroes `out` itself, so no pre-clearing is needed. */
         for (int t = 0; t < NT; t++)
-            glm5_moe_ffn(m, gw, lw, s, cur_b + (size_t)t*D, out_b + (size_t)t*D);
+            glm5_moe_ffn(m, gw, lw, s, cur_b + (size_t)t*D, out_b + (size_t)t*D, layer_idx);
         return;
     }
 
@@ -2767,8 +2822,19 @@ static void glm5_moe_ffn_batch_ref(const model_t *m, const glm5_layer_weights_t 
     /* Shared expert, still per token (1/8 the flops, 36 ms/layer total). */
     if (lw->ffn_gate_shexp) {
         const int SFF = c->n_ff_shexp;
+        if (getenv("PICOLM_DBG_HCVEC") && atoi(getenv("PICOLM_DBG_HCVEC")) == layer_idx) {
+            for (int q=0;q<D;q++) s->glm5.moe_down[q]=out_b[q];   /* save routed */
+        }
         for (int t = 0; t < NT; t++)
             glm5_moe_shared_expert(m, lw, s, cur_b + (size_t)t*D, out_b + (size_t)t*D, SFF);
+        if (getenv("PICOLM_DBG_HCVEC") && atoi(getenv("PICOLM_DBG_HCVEC")) == layer_idx) {
+            double sr=0, ss2=0;
+            for (int q=0;q<D;q++) { sr+=(double)s->glm5.moe_down[q]*s->glm5.moe_down[q];
+                                    double sh=out_b[q]-s->glm5.moe_down[q]; ss2+=sh*sh; }
+            fprintf(stderr, "[moechk L%d ref] routed=%.6f shared=%.6f total=%.6f\n", layer_idx,
+                    (float)sqrt(sr/D), (float)sqrt(ss2/D),
+                    (float)sqrt((double)((sr+ss2)/D)));
+        }
     }
 
     free(sel_all); free(wts_all); free(probs); free(count); free(cursor);
@@ -2919,7 +2985,7 @@ static int ep_grow(void **p, size_t *cap, size_t bytes) {
 /* Returns 1 if it handled the layer, 0 to fall back to the reference path (nothing was written). */
 static int glm5_moe_ffn_batch_ep(const model_t *m, const glm5_layer_weights_t *gw,
                                  const layer_weights_t *lw, run_state_t *s,
-                                 const float *cur_b, float *out_b, int NT)
+                                 const float *cur_b, float *out_b, int NT, int layer_idx)
 {
     const model_config_t *c = &m->config;
     const int D = c->n_embd, NE = c->n_expert, AK = c->n_expert_used, FF = c->n_ff_exp;
@@ -3018,6 +3084,10 @@ static int glm5_moe_ffn_batch_ep(const model_t *m, const glm5_layer_weights_t *g
 
     /* 7. shared expert */
     EPP_BEGIN(t8);
+    if (getenv("PICOLM_DBG_HCVEC") && atoi(getenv("PICOLM_DBG_HCVEC")) == layer_idx) {
+        double ss=0; for (int q=0;q<D;q++) ss+=(double)out_b[q]*out_b[q];
+        fprintf(stderr, "[moechk L%d] routed-only rms=%.6f\n", layer_idx, (float)sqrt(ss/D));
+    }
     if (lw->ffn_gate_shexp) {
         const int SFF = c->n_ff_shexp;
         if (glm5_shexp_batch_enabled()) {
@@ -3039,6 +3109,15 @@ static int glm5_moe_ffn_batch_ep(const model_t *m, const glm5_layer_weights_t *g
         }
     }
     EPP_END(t8, EPP_SHARED);
+    if (getenv("PICOLM_DBG_HCVEC") && atoi(getenv("PICOLM_DBG_HCVEC")) == layer_idx) {
+        const char *dd = getenv("PICOLM_DUMP_DIR");
+        char fn[512];
+        snprintf(fn, sizeof(fn), "%s/moe_out-%d.f32", dd ? dd : "/tmp/picd", layer_idx);
+        FILE *fp = fopen(fn, "wb");
+        if (fp) { fwrite(out_b, sizeof(float), (size_t)m->config.n_embd, fp); fclose(fp); }
+        double ss=0; for (int q=0;q<m->config.n_embd;q++) ss+=(double)out_b[q]*out_b[q];
+        fprintf(stderr, "[moechk L%d] out_b rms=%.6f (routed+shared)\n", layer_idx, (float)sqrt(ss/m->config.n_embd));
+    }
     EPP_END(t_all, EPP_TOTAL);
     return 1;
 }
@@ -3046,17 +3125,48 @@ static int glm5_moe_ffn_batch_ep(const model_t *m, const glm5_layer_weights_t *g
 /* Dispatcher: the expert-parallel path when enabled and applicable, else the reference. */
 static void glm5_moe_ffn_batch(const model_t *m, const glm5_layer_weights_t *gw,
                                const layer_weights_t *lw, run_state_t *s,
-                               const float *cur_b, float *out_b, int n_tokens)
+                               const float *cur_b, float *out_b, int n_tokens, int layer_idx)
 {
     const int prof = glm5_moe_prof_on();
     if (prof && g_epp_calls == 0) atexit(glm5_moe_prof_print);
-    if (glm5_moe_ep_enabled() && glm5_moe_ffn_batch_ep(m, gw, lw, s, cur_b, out_b, n_tokens)) {
+    if (getenv("PICOLM_DBG_HCVEC") && atoi(getenv("PICOLM_DBG_HCVEC")) == layer_idx) {
+        double ss=0; for (int q=0;q<m->config.n_embd;q++) ss+=(double)cur_b[q]*cur_b[q];
+        fprintf(stderr, "[moechk L%d] moe_in rms=%.6f  ep_enabled=%d\n", layer_idx,
+                (float)sqrt(ss/m->config.n_embd), glm5_moe_ep_enabled());
+    }
+    if (glm5_moe_ep_enabled() && glm5_moe_ffn_batch_ep(m, gw, lw, s, cur_b, out_b, n_tokens, layer_idx)) {
         if (prof) { g_epp_mode = 1; g_epp_calls++; }
+        /* Report the batched MoE output so a prefill can be diffed against
+         * ik's ffn_moe_out-<il> at all; without this the whole FFN was
+         * invisible on the batched path and only the per-token decode path
+         * emitted x.moe.* tags. */
+        if (glm5_stats_wanted()) {
+            char t2[96];
+            snprintf(t2, sizeof(t2), "l%02d.moe.out", layer_idx);
+            glm5_stats(t2, out_b, m->config.n_embd);
+        }
         return;
     }
     const double t0 = prof ? glm5_prof_now() : 0.0;
-    glm5_moe_ffn_batch_ref(m, gw, lw, s, cur_b, out_b, n_tokens);
+    glm5_moe_ffn_batch_ref(m, gw, lw, s, cur_b, out_b, n_tokens, layer_idx);
     if (prof) { g_epp_mode = 0; g_epp_calls++; g_epp_ms[EPP_TOTAL] += glm5_prof_now() - t0; }
+    if (glm5_stats_wanted()) {
+        char t2[96];
+        snprintf(t2, sizeof(t2), "l%02d.moe.out", layer_idx);
+        glm5_stats(t2, out_b, m->config.n_embd);
+    }
+    {
+        const char *e = getenv("PICOLM_DBG_HCVEC");
+        if (e && atoi(e) == layer_idx) {
+            const char *dd = getenv("PICOLM_DUMP_DIR");
+            char fn[512];
+            double ss=0; for (int q=0;q<m->config.n_embd;q++) ss+=(double)out_b[q]*out_b[q];
+            fprintf(stderr, "[moechk L%d ref] out_b rms=%.6f\n", layer_idx, (float)sqrt(ss/m->config.n_embd));
+            snprintf(fn, sizeof(fn), "%s/moe_out-%d.f32", dd ? dd : "/tmp/picd", layer_idx);
+            FILE *fp = fopen(fn, "wb");
+            if (fp) { fwrite(out_b, sizeof(float), (size_t)m->config.n_embd, fp); fclose(fp); }
+        }
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -3181,7 +3291,7 @@ float *model_forward_glm5(model_t *m, int token, int pos)
             /* dense FFN (layers 0..n_dense-1 are dense, rest are MoE) */
             glm5_dense_ffn(m, lw, s, s->glm5.cur, s->glm5.attn_out);
         } else {
-            glm5_moe_ffn(m, gw, lw, s, s->glm5.cur, s->glm5.attn_out);
+            glm5_moe_ffn(m, gw, lw, s, s->glm5.cur, s->glm5.attn_out, il);
         }
         if (_t_ffn) glm5_prof_add(GP_MOE, _t_ffn);
 
@@ -3512,6 +3622,7 @@ typedef struct {
     const float *q, *k, *v, *z, *raw, *beta_raw;
     float *conv_state, *kda_state;
     float *conv_out, *g, *head_out, *beta;
+    int layer_idx;
 } glm5_kda_head_ctx_t;
 
 static void glm5_kda_head_task(int h, void *vp)
@@ -3559,11 +3670,31 @@ static void glm5_kda_head_task(int h, void *vp)
                 float acc = 0.f;
                 for (int t = 0; t < CONV_K; t++)
                     acc += xs[t] * w[t + ch_off*CONV_K];
+                if (h == 0 && part == 0 && i < 12 && getenv("PICOLM_DBG_CONVXY") && atoi(getenv("PICOLM_DBG_CONVXY")) == x->layer_idx) {
+                    fprintf(stderr, "[convxy L%d ch=%d] acc=%.8f xs=[%.6f %.6f %.6f] w=[%.6f %.6f %.6f %.6f]\n",
+                            x->layer_idx, ch_off, acc, xs[0], xs[1], xs[2], xs[3],
+                            w[0+ch_off*CONV_K], w[1+ch_off*CONV_K], w[2+ch_off*CONV_K], w[3+ch_off*CONV_K]);
+                }
                 conv_out[ch] = acc / (1.0f + expf(-acc));
                 for (int t = 0; t < CONV_K - 2; t++)
                     conv_state[t * CONV_DIM + ch] = conv_state[(t+1) * CONV_DIM + ch];
                 conv_state[(CONV_K - 2) * CONV_DIM + ch] = x_new;
+
             }
+        }
+    }
+
+    if (getenv("PICOLM_DBG_CONVXY") && atoi(getenv("PICOLM_DBG_CONVXY")) == x->layer_idx) {
+        const char *dd = getenv("PICOLM_DUMP_DIR");
+        char fn[512];
+        /* one file per head: q[KD], k[KD], v[KD] for that head */
+        snprintf(fn, sizeof(fn), "%s/conv_h%02d_%d.f32", dd ? dd : "/tmp/picd", h, x->layer_idx);
+        FILE *fp = fopen(fn, "wb");
+        if (fp) {
+            fwrite(conv_out + h*KD,    sizeof(float), (size_t)KD, fp);
+            fwrite(conv_out + DI+h*KD, sizeof(float), (size_t)KD, fp);
+            fwrite(conv_out + 2*DI+h*KD, sizeof(float), (size_t)KD, fp);
+            fclose(fp);
         }
     }
 
@@ -3822,12 +3953,34 @@ static int glm5_kda_layer_par(const model_t *m, const glm5_layer_weights_t *gw, 
             q_b + (size_t)t * DI, k_b + (size_t)t * DI, v_b + (size_t)t * DI,
             z_b + (size_t)t * DI, raw_b + (size_t)t * DI, beta_b + (size_t)t * H,
             s->glm5.kda_conv_state[layer_idx], s->glm5.kda_state[layer_idx],
-            conv_b + (size_t)t * 3 * DI, g_scr, head_b + (size_t)t * DI, beta_sh
+            conv_b + (size_t)t * 3 * DI, g_scr, head_b + (size_t)t * DI, beta_sh,
+            layer_idx
         };
         ctxs[t] = kc;
     }
     pf_kda_seq_t x = { ctxs, n_tokens };
     tensor_parallel_for_dyn(H, pf_kda_head_seq_task, &x);
+    {
+        const char *e = getenv("PICOLM_DBG_DUMPSTATE");
+        if (e && atoi(e) == layer_idx) {
+            const char *dd = getenv("PICOLM_DUMP_DIR");
+            char fn[512];
+            snprintf(fn, sizeof(fn), "%s/kda_state-%d.f32", dd ? dd : "/tmp/picd", layer_idx);
+            FILE *fp = fopen(fn, "wb");
+            if (fp) { fwrite(s->glm5.kda_state[layer_idx], sizeof(float),
+                             (size_t)H*KD*KD, fp); fclose(fp); }
+        }
+    }
+    {
+        const char *e = getenv("PICOLM_DBG_CONVXY");
+        if (e && atoi(e) == layer_idx) {
+            const char *dd = getenv("PICOLM_DUMP_DIR");
+            char fn[512];
+            snprintf(fn, sizeof(fn), "%s/conv_output_silu-%d.f32", dd ? dd : "/tmp/picd", layer_idx);
+            FILE *fp = fopen(fn, "wb");
+            if (fp) { fwrite(conv_b, sizeof(float), (size_t)(3 * DI), fp); fclose(fp); }
+        }
+    }
     return 1;
 }
 
@@ -3955,6 +4108,13 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
             /* Phase A: hc_pre(attn) + RMSNorm, per token. Saves hc_res,
              * post, comb per token for the hc_post in phase D. */
             PFP_BEGIN(tA);
+            /* Name the layer for the hc_pre diagnostics BEFORE the parallel
+             * fast path is considered: pf_run_hcpre() bails to the serial loop
+             * whenever g_hc_tag is set, and the serial loop is what emits the
+             * per-token stats. Setting it only inside the serial loop was the
+             * chicken-and-egg that made prefill stats invisible. */
+            if (glm5_stats_wanted() || getenv("PICOLM_DBG_DUMP_LAYER") || getenv("PICOLM_DBG_HCVEC"))
+                snprintf(g_hc_tag, sizeof(g_hc_tag), "%d", il);
             if (!(glm5_pf_par() && pf_run_hcpre(m, gw, 1, n_tokens, hc_x_b, cur_b, hc_res_b, post_b, comb_b, s->attn_norm_w[il])))
             for (int t = 0; t < n_tokens; t++) {
                 float *hc_x_t = hc_x_b + (size_t)t*S*D;
@@ -3963,8 +4123,53 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                 float *post_t = post_b + (size_t)t*S;
                 float *comb_t = comb_b + (size_t)t*S*S;
                 memcpy(res_t, hc_x_t, (size_t)S*D*sizeof(float));
+                if (t == 0 && glm5_stats_wanted()) {
+                    char t2[96];
+                    snprintf(t2, sizeof(t2), "l%02d.x_in", il);
+                    glm5_stats(t2, hc_x_t, S*D);
+                }
+                if (t == 0) {
+                    static int dl = -2;
+                    if (dl == -2) { const char *e = getenv("PICOLM_DBG_DUMP_LAYER"); dl = e ? atoi(e) : -1; }
+                    if (dl == il) {
+                        const char *dd = getenv("PICOLM_DUMP_DIR");
+                        char fn[512];
+                        snprintf(fn, sizeof(fn), "%s/pic_l_in-%d.f32", dd ? dd : "/tmp/picd", il);
+                        FILE *fp = fopen(fn, "wb");
+                        if (fp) { fwrite(hc_x_t, sizeof(float), (size_t)S*D, fp); fclose(fp); }
+                    }
+                }
                 glm5_hc_pre(m, gw, 1, hc_x_t, cur_t, post_t, comb_t, s->glm5.hc_scratch);
+                if (t == 0) {
+                    static int wl = -2;
+                    if (wl == -2) { const char *e = getenv("PICOLM_DBG_HCVEC"); wl = e ? atoi(e) : -1; }
+                    if (wl == il) {
+                        const char *dd = getenv("PICOLM_DUMP_DIR");
+                        char fn[512];
+                        snprintf(fn, sizeof(fn), "%s/attn_out-%d.f32", dd ? dd : "/tmp/picd", il);
+                        FILE *fp = fopen(fn, "wb");
+                        if (fp) { fwrite(hc_x_t, sizeof(float), (size_t)S*D, fp); fclose(fp); }
+                        snprintf(fn, sizeof(fn), "%s/attn_comb-%d.f32", dd ? dd : "/tmp/picd", il);
+                        fp = fopen(fn, "wb");
+                        if (fp) { fwrite(comb_t, sizeof(float), (size_t)S*S, fp); fclose(fp); }
+                        snprintf(fn, sizeof(fn), "%s/attn_post-%d.f32", dd ? dd : "/tmp/picd", il);
+                        fp = fopen(fn, "wb");
+                        if (fp) { fwrite(post_t, sizeof(float), (size_t)S, fp); fclose(fp); }
+                    }
+                    if (wl == il)
+                        fprintf(stderr, "[hcvec L%d attn] pre=[%.6f %.6f %.6f %.6f] post=[%.6f %.6f %.6f %.6f] comb0=[%.6f %.6f %.6f %.6f]\n",
+                                il, hc_pre_dbg_pre[0], hc_pre_dbg_pre[1], hc_pre_dbg_pre[2], hc_pre_dbg_pre[3],
+                                post_t[0], post_t[1], post_t[2], post_t[3],
+                                comb_t[0], comb_t[1], comb_t[2], comb_t[3]);
+                }
                 rmsnorm(cur_t, cur_t, s->attn_norm_w[il], D, c->rms_norm_eps);
+                if (t == 0) {
+                    char t2[96];
+                    snprintf(t2, sizeof(t2), "l%02d.hc_attn_pre", il);
+                    glm5_stats(t2, cur_t, D);
+                    snprintf(t2, sizeof(t2), "l%02d.cur_normed", il);
+                    glm5_stats(t2, cur_t, D);
+                }
             }
             PFP_END(tA, pfk, PF_HC_ATTN_PRE);
             PFP_BEGIN(tAt);
@@ -4193,15 +4398,35 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                 PFP_END(tKT, pfk, PF_KDA_TAIL);
                 /* Batched attention output projection: [N][DI] -> [N][D]. */
                 PFP_BEGIN(tKO);
+                {
+                    const char *e = getenv("PICOLM_DBG_DUMPATTN");
+                    if (e && atoi(e) == il) {
+                        const char *dd = getenv("PICOLM_DUMP_DIR");
+                        char fn[512];
+                        snprintf(fn, sizeof(fn), "%s/attn_gated-%d.f32", dd ? dd : "/tmp/picd", il);
+                        FILE *fp = fopen(fn, "wb");
+                        if (fp) { fwrite(head_b, sizeof(float), (size_t)DI, fp); fclose(fp); }
+                    }
+                }
                 matmul_batch(attn_b, head_b, n_tokens, lw->attn_output, DI, D,
                              lw->type_attn_output);
+                {
+                    const char *e = getenv("PICOLM_DBG_DUMPATTN");
+                    if (e && atoi(e) == il) {
+                        const char *dd = getenv("PICOLM_DUMP_DIR");
+                        char fn[512];
+                        snprintf(fn, sizeof(fn), "%s/attn_out-%d.f32", dd ? dd : "/tmp/picd", il);
+                        FILE *fp = fopen(fn, "wb");
+                        if (fp) { fwrite(attn_b, sizeof(float), (size_t)D, fp); fclose(fp); }
+                    }
+                }
                 PFP_END(tKO, pfk, PF_KDA_OUT);
             }
             PFP_END(tAt, pfk, PF_ATTN);
 
             /* Phase D: hc_post(attn) per token */
             PFP_BEGIN(tD);
-            if (!(glm5_pf_par() && pf_run_hcpost(m, n_tokens, hc_x_b, hc_res_b, post_b, comb_b, attn_b)))
+            if (!(glm5_pf_par() && !getenv("PICOLM_DBG_HCVEC") && pf_run_hcpost(m, n_tokens, hc_x_b, hc_res_b, post_b, comb_b, attn_b)))
             for (int t = 0; t < n_tokens; t++) {
                 float *hc_x_t = hc_x_b + (size_t)t*S*D;
                 float *res_t  = hc_res_b + (size_t)t*S*D;
@@ -4209,6 +4434,17 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                 float *comb_t = comb_b + (size_t)t*S*S;
                 float *attn_t = attn_b + (size_t)t*D;
                 glm5_hc_post(m, attn_t, res_t, post_t, comb_t, hc_x_t);
+                if (t == 0) {
+                    static int wl = -2;
+                    if (wl == -2) { const char *e = getenv("PICOLM_DBG_HCVEC"); wl = e ? atoi(e) : -1; }
+                    if (wl == il) {
+                        const char *dd = getenv("PICOLM_DUMP_DIR");
+                        char fn[512];
+                        snprintf(fn, sizeof(fn), "%s/xmid-%d.f32", dd ? dd : "/tmp/picd", il);
+                        FILE *fp = fopen(fn, "wb");
+                        if (fp) { fwrite(hc_x_t, sizeof(float), (size_t)S*D, fp); fclose(fp); }
+                    }
+                }
             }
             PFP_END(tD, pfk, PF_HC_ATTN_POST);
 
@@ -4224,8 +4460,31 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                 float *post_t = post_b + (size_t)t*S;
                 float *comb_t = comb_b + (size_t)t*S*S;
                 memcpy(res_t, hc_x_t, (size_t)S*D*sizeof(float));
+                if (t == 0 && getenv("PICOLM_DBG_HCVEC") && atoi(getenv("PICOLM_DBG_HCVEC")) == il) {
+                    const char *dd = getenv("PICOLM_DUMP_DIR");
+                    char fn[512];
+                    snprintf(fn, sizeof(fn), "%s/ffnpre_in-%d.f32", dd ? dd : "/tmp/picd", il);
+                    FILE *fp = fopen(fn, "wb");
+                    if (fp) { fwrite(hc_x_t, sizeof(float), (size_t)S*D, fp); fclose(fp); }
+                }
                 glm5_hc_pre(m, gw, 0, hc_x_t, cur_t, post_t, comb_t, s->glm5.hc_scratch);
+                if (t == 0 && getenv("PICOLM_DBG_HCVEC") && atoi(getenv("PICOLM_DBG_HCVEC")) == il) {
+                    const char *dd = getenv("PICOLM_DUMP_DIR");
+                    char fn[512];
+                    snprintf(fn, sizeof(fn), "%s/ffnpre_cur-%d.f32", dd ? dd : "/tmp/picd", il);
+                    FILE *fp = fopen(fn, "wb");
+                    if (fp) { fwrite(cur_t, sizeof(float), (size_t)D, fp); fclose(fp); }
+                }
                 rmsnorm(cur_t, cur_t, s->post_attn_norm_w[il], D, c->rms_norm_eps);
+                if (t == 0 && getenv("PICOLM_DBG_HCVEC") && atoi(getenv("PICOLM_DBG_HCVEC")) == il) {
+                    const char *dd = getenv("PICOLM_DUMP_DIR");
+                    char fn[512];
+                    double ss=0; for(int q=0;q<D;q++) ss+=(double)cur_t[q]*cur_t[q];
+                    fprintf(stderr, "[ffnpre L%d] normed rms=%.6f\n", il, (float)sqrt(ss/D));
+                    snprintf(fn, sizeof(fn), "%s/ffn_norm-%d.f32", dd ? dd : "/tmp/picd", il);
+                    FILE *fp = fopen(fn, "wb");
+                    if (fp) { fwrite(cur_t, sizeof(float), (size_t)D, fp); fclose(fp); }
+                }
             }
             PFP_END(tA2, pfk, PF_HC_FFN_PRE);
 
@@ -4245,22 +4504,48 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                 for (int t = 0; t < n_tokens; t++)
                     glm5_dense_ffn(m, lw, s, cur_b + (size_t)t*D, attn_b + (size_t)t*D);
             } else if (n_tokens > 1 && !getenv("PICOLM_GLM5_MOE_PERTOKEN")) {
-                glm5_moe_ffn_batch(m, gw, lw, s, cur_b, attn_b, n_tokens);
+                glm5_moe_ffn_batch(m, gw, lw, s, cur_b, attn_b, n_tokens, il);
             } else {
                 for (int t = 0; t < n_tokens; t++)
-                    glm5_moe_ffn(m, gw, lw, s, cur_b + (size_t)t*D, attn_b + (size_t)t*D);
+                    glm5_moe_ffn(m, gw, lw, s, cur_b + (size_t)t*D, attn_b + (size_t)t*D, il);
+            }
+            if (getenv("PICOLM_DBG_HCVEC") && atoi(getenv("PICOLM_DBG_HCVEC")) == il) {
+                const char *dd = getenv("PICOLM_DUMP_DIR");
+                char fn[512];
+                double ss=0; for (int q=0;q<D;q++) ss+=(double)attn_b[q]*attn_b[q];
+                fprintf(stderr, "[ffnchk L%d] ffn_out rms=%.6f\n", il, (float)sqrt(ss/D));
+                snprintf(fn, sizeof(fn), "%s/ffn_out-%d.f32", dd ? dd : "/tmp/picd", il);
+                FILE *fp = fopen(fn, "wb");
+                if (fp) { fwrite(attn_b, sizeof(float), (size_t)D, fp); fclose(fp); }
             }
             PFP_END(tF, pfk, PF_FFN);
 
             /* Phase D': hc_post(ffn) per token */
             PFP_BEGIN(tD2);
-            if (!(glm5_pf_par() && pf_run_hcpost(m, n_tokens, hc_x_b, hc_res_b, post_b, comb_b, attn_b)))
+            if (!(glm5_pf_par() && !getenv("PICOLM_DBG_HCVEC") && pf_run_hcpost(m, n_tokens, hc_x_b, hc_res_b, post_b, comb_b, attn_b)))
             for (int t = 0; t < n_tokens; t++) {
                 float *hc_x_t = hc_x_b + (size_t)t*S*D;
                 float *res_t  = hc_res_b + (size_t)t*S*D;
                 float *post_t = post_b + (size_t)t*S;
                 float *comb_t = comb_b + (size_t)t*S*S;
                 float *attn_t = attn_b + (size_t)t*D;
+                if (t == 0) {
+                    static int wl2 = -2;
+                    if (wl2 == -2) { const char *e = getenv("PICOLM_DBG_HCVEC"); wl2 = e ? atoi(e) : -1; }
+                    if (wl2 == il) {
+                        const char *dd = getenv("PICOLM_DUMP_DIR");
+                        char fn[512];
+                        snprintf(fn, sizeof(fn), "%s/ffn_attn-%d.f32", dd ? dd : "/tmp/picd", il);
+                        FILE *fp = fopen(fn, "wb");
+                        if (fp) { fwrite(attn_t, sizeof(float), (size_t)D, fp); fclose(fp); }
+                        snprintf(fn, sizeof(fn), "%s/ffn_comb-%d.f32", dd ? dd : "/tmp/picd", il);
+                        fp = fopen(fn, "wb");
+                        if (fp) { fwrite(comb_t, sizeof(float), (size_t)S*S, fp); fclose(fp); }
+                        snprintf(fn, sizeof(fn), "%s/ffn_post-%d.f32", dd ? dd : "/tmp/picd", il);
+                        fp = fopen(fn, "wb");
+                        if (fp) { fwrite(post_t, sizeof(float), (size_t)S, fp); fclose(fp); }
+                    }
+                }
                 glm5_hc_post(m, attn_t, res_t, post_t, comb_t, hc_x_t);
             }
             PFP_END(tD2, pfk, PF_HC_FFN_POST);
