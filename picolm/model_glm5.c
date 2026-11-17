@@ -3169,6 +3169,34 @@ static void glm5_moe_ffn_batch(const model_t *m, const glm5_layer_weights_t *gw,
     }
 }
 
+/* ---- Batched dense FFN (the first n_layer_dense_lead layers) --------------------------------
+ * glm5_dense_ffn() is a GEMV per token. With FF = n_ffn (12288) that re-reads ~127 MB of weights
+ * for every token: ~50 GB (~0.9 s) per dense layer at 400-500 tokens, which is more than a whole
+ * MoE layer now costs. Batching the tokens reads the weights once. A GEMM sums in a different
+ * order than a GEMV, so the result differs at float rounding (~1e-7 relative, same as the batched
+ * shared expert) -- opt in with PICOLM_GLM5_DENSE_BATCH=1 and check the argmax sequence.
+ * Returns 1 if it ran; 0 means "use the per-token loop". */
+static int glm5_dense_batch_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) { const char *e = getenv("PICOLM_GLM5_DENSE_BATCH"); cached = (e && atoi(e) > 0) ? 1 : 0; }
+    return cached;
+}
+static int glm5_dense_ffn_batch(const model_t *m, const layer_weights_t *lw, const float *cur_b, float *out_b, int NT)
+{
+    const model_config_t *c = &m->config;
+    const int D = c->n_embd, FF = c->n_ffn;
+    if (NT < 2 || FF < 1) return 0;
+    static float *g, *u; static size_t cg, cu;
+    if (!ep_grow((void **)&g, &cg, (size_t)NT * FF * sizeof(float)) ||
+        !ep_grow((void **)&u, &cu, (size_t)NT * FF * sizeof(float))) return 0;
+    matmul_batch(g, cur_b, NT, lw->ffn_gate, D, FF, lw->type_ffn_gate);
+    matmul_batch(u, cur_b, NT, lw->ffn_up,   D, FF, lw->type_ffn_up);
+    { ep_swiglu_t sw = { g, u, FF, NT, glm5_clamp_value(c) };
+      tensor_parallel_for_dyn((NT + 7) / 8, ep_swiglu_task, &sw); }
+    matmul_batch(out_b, g, NT, lw->ffn_down, FF, D, lw->type_ffn_down);
+    return 1;
+}
+
 /* ------------------------------------------------------------------ */
 /* Main forward pass                                                   */
 /* ------------------------------------------------------------------ */
@@ -4501,6 +4529,7 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
              * glm5_moe_ffn_batch(). */
             PFP_BEGIN(tF);
             if (il < c->n_layer_dense_lead) {
+                if (!(glm5_dense_batch_enabled() && glm5_dense_ffn_batch(m, lw, cur_b, attn_b, n_tokens)))
                 for (int t = 0; t < n_tokens; t++)
                     glm5_dense_ffn(m, lw, s, cur_b + (size_t)t*D, attn_b + (size_t)t*D);
             } else if (n_tokens > 1 && !getenv("PICOLM_GLM5_MOE_PERTOKEN")) {
