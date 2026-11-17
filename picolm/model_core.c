@@ -2026,6 +2026,26 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                      * Spark support; the weights are still uploaded so that work
                      * can start from a warm cache. */
                     if (c->is_spark25) { eligible = 0; el_reason = 9; }
+                    /* PICOLM_NGL with a partial layer count is NOT supported by
+                     * the GPU pipeline. n_gpu_layers only limits how many layers
+                     * get uploaded; model_forward_gpu()/_prefill_gpu_ubatch()
+                     * still walk all of c->n_layers and dispatch GPU kernels for
+                     * layers whose gpu_layer_weights_t handles are NULL. On
+                     * Qwen3.6-27B with PICOLM_NGL=1 that produced
+                     *   ERROR: GPU attn_output projection declined at layer 3
+                     * followed by cudaErrorIllegalAddress (700) and a cascade of
+                     * bogus "OOM: gpu_free=0.0 MB" lines.
+                     * There is no hybrid CPU/GPU layer split in the tree (grep
+                     * n_gpu_layers: set in model_core.c, read nowhere), so a
+                     * partial NGL cannot be honoured -- decline the whole GPU
+                     * pipeline and run on the CPU, which is correct and slow
+                     * rather than fast and wrong. A real split is post-rc3 work:
+                     * it needs the forward loop to route layers >= n_gpu_layers
+                     * through the CPU forward and to sync the residual stream
+                     * across the boundary each token. */
+                    if (m->gpu.n_gpu_layers > 0 && m->gpu.n_gpu_layers < c->n_layers) {
+                        eligible = 0; el_reason = 11;
+                    }
                     /* F16 KV cache only -- GPU attention kernels read std430 F16 from KV cache */
                     if (kv_type_k != KV_CACHE_F16 || kv_type_v != KV_CACHE_F16) { eligible = 0; el_reason = 2; }
                     /* SSM models: enable GPU pipeline.
@@ -2281,6 +2301,9 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                         else if (el_reason == 2) reason = "KV cache not F16 (GPU attention requires F16 std430)";
                         else if (el_reason == 9) reason = "Spark-X2.5 not implemented by the GPU decode pipeline "
                                                         "(no head-wise attn gate / per-layer SWA rope dim)";
+                        else if (el_reason == 11) reason = "PICOLM_NGL is a partial layer count and the GPU "
+                                                         "pipeline has no hybrid CPU/GPU layer split "
+                                                         "(unset PICOLM_NGL to use the GPU)";
                         else if (el_reason >= 3) reason = "SSM config incompatible with GPU pipeline";
                         else if (!c->has_ssm) reason = "non-SSM model ineligible";
                         fprintf(stderr, "INFO: GPU KV cache disabled (%s; SSM=%d rope=%d kv_k=%d kv_v=%d)\n",
