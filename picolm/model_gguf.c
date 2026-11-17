@@ -533,10 +533,10 @@ const char *gguf_type_name(uint32_t type) {
         case 37: return "mxfp4";
         case 38: return "q8_4";
         case 39: return "q3_0";
-        case 40: return "q4_3";
-        case 41: return "nvfp4";
-        case 42: return "q1_0";
-        case 43: return "q2_0";
+        case 40: return "nvfp4";  /* GGML_TYPE_NVFP4 (mainline, not in ik branch) */
+        case 41: return "q1_0";  /* GGML_TYPE_Q1_0_G128 (Bonsai) / GGML_TYPE_Q1_0 (mainline) */
+        case 42: return "q2_0";  /* GGML_TYPE_Q2_0 */
+        case 43: return "f8_e4m3";  /* GGML_TYPE_F8_E4M3 (mainline) */
         case 133: return "q6_0";
         /* ik_llama repacked types */
         case 202: return "q4_0_r8";
