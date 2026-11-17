@@ -352,47 +352,52 @@ static const char *stop_matcher_feed(stop_matcher_t *sm, const char *piece,
 
     /* Phase 1: full stop word match in the recent text region.
      * Search from the earliest position where the newly appended piece
-     * could complete a stop word, clamped to 0. */
-    int search_from = sm->text_len - (int)strlen(piece) - sm->max_word_len;
+     * could complete a stop word, clamped to 0. Across all stop words the
+     * EARLIEST match position wins (not the first word in list order). */
+    int piece_len0 = (int)strlen(piece);
+    int search_from = sm->text_len - piece_len0 - sm->max_word_len;
     if (search_from < 0) search_from = 0;
+    int best_idx = -1, best_pos = -1;
     for (int i = 0; i < sm->n_words; i++) {
         const char *sw = sm->words[i];
         int sw_len = (int)strlen(sw);
         for (int pos = search_from; pos <= sm->text_len - sw_len; pos++) {
+            if (best_pos >= 0 && pos >= best_pos) break;
             if (strncmp(sm->text + pos, sw, (size_t)sw_len) == 0) {
-                sm->match_idx = i;
-                sm->match_pos = pos;
-                *action = STOP_FULL;
-                /* Salvage withheld content that precedes the stop word.
-                 * Pending can contain real text when a single piece held
-                 * both text and a stop-word prefix (e.g. piece "abc</val"
-                 * withheld whole, then "ue>" completed the stop word): the
-                 * old code discarded it all, losing "abc" from the output.
-                 * Pending maps to text positions
-                 *   [text_len_before - pending_len, text_len_before)
-                 * (it is always a suffix of the pre-piece text). Everything
-                 * in pending before match_pos precedes the stop word and is
-                 * safe to emit with this final chunk. */
-                int text_len_before = sm->text_len - (int)strlen(piece);
-                int pend_start = text_len_before - sm->pending_len;
-                int keep = sm->pending_len > 0 ? sm->match_pos - pend_start : 0;
-                if (keep > sm->pending_len) keep = sm->pending_len;
-                if (keep < 0) keep = 0;
-                /* Truncate the text at the stop word position. */
-                sm->text[sm->match_pos] = '\0';
-                sm->text_len = sm->match_pos;
-                const char *salvage = "";
-                if (keep > 0) {
-                    sm->send_buf = stop_buf_reserve(sm->send_buf, &sm->send_cap, keep, 0);
-                    memcpy(sm->send_buf, sm->pending, (size_t)keep);
-                    sm->send_buf[keep] = '\0';
-                    salvage = sm->send_buf;
-                }
-                if (sm->pending) sm->pending[0] = '\0';
-                sm->pending_len = 0;
-                return salvage;
+                best_idx = i; best_pos = pos;
+                break;
             }
         }
+    }
+    if (best_idx >= 0) {
+        sm->match_idx = best_idx;
+        sm->match_pos = best_pos;
+        *action = STOP_FULL;
+        /* Everything in [first_unsent, match_pos) precedes the stop word
+         * and has not been sent yet: emit it with this final chunk.
+         * Unsent text = withheld pending (a suffix of the pre-piece text)
+         * plus the current piece. Both were already appended to sm->text,
+         * so the unsent region is simply the tail of text starting at
+         * text_len_before - pending_len. (The old code only salvaged
+         * pending and dropped the current piece's text before the stop
+         * word, e.g. piece "abcEND" lost "abc".) */
+        int text_len_before = sm->text_len - piece_len0;
+        int first_unsent = text_len_before - sm->pending_len;
+        if (first_unsent < 0) first_unsent = 0;
+        int keep = best_pos - first_unsent;
+        const char *salvage = "";
+        if (keep > 0) {
+            sm->send_buf = stop_buf_reserve(sm->send_buf, &sm->send_cap, keep, 0);
+            memcpy(sm->send_buf, sm->text + first_unsent, (size_t)keep);
+            sm->send_buf[keep] = '\0';
+            salvage = sm->send_buf;
+        }
+        /* Truncate the text at the stop word position. */
+        sm->text[best_pos] = '\0';
+        sm->text_len = best_pos;
+        if (sm->pending) sm->pending[0] = '\0';
+        sm->pending_len = 0;
+        return salvage;
     }
 
     /* Phase 2: partial match -- does the text end with a prefix of any stop
@@ -440,6 +445,23 @@ static const char *stop_matcher_feed(stop_matcher_t *sm, const char *piece,
 
     return piece;
 }
+
+/* Take any content still withheld (generation ended by EOS / length limit /
+ * without a full stop match). Returns "" if nothing is pending. The returned
+ * pointer is valid until the next feed/flush. Streaming callers MUST send this
+ * after the loop, otherwise a trailing partial-match tail is silently lost. */
+static const char *stop_matcher_flush(stop_matcher_t *sm) {
+    if (sm->pending_len <= 0) return "";
+    sm->send_buf = stop_buf_reserve(sm->send_buf, &sm->send_cap, sm->pending_len, 0);
+    memcpy(sm->send_buf, sm->pending, (size_t)sm->pending_len);
+    sm->send_buf[sm->pending_len] = '\0';
+    sm->pending[0] = '\0';
+    sm->pending_len = 0;
+    return sm->send_buf;
+}
+
+/* True if no full stop match has been recorded (so withheld text may need flushing). */
+static int stop_action_not_full(const stop_matcher_t *sm) { return sm->match_idx < 0; }
 
 /* Accessor for the matched stop word (valid after STOP_FULL). */
 static const char *stop_matcher_word(const stop_matcher_t *sm) {
@@ -2662,6 +2684,31 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         double t_gen_ms = t_prefill_end > 0 ? t_end - t_prefill_end : 0;
         int prompt_evaluated = n_prompt - start_pos;
 
+        /* Release withheld partial-match tail if no full stop matched. */
+        if (stop_action_not_full(&sm) && client_alive(sock)) {
+            const char *tail = stop_matcher_flush(&sm);
+            if (tail[0]) {
+                cJSON *tc = cJSON_CreateObject();
+                cJSON *tch = cJSON_CreateObject();
+                cJSON *td = cJSON_CreateObject();
+                cJSON_AddStringToObject(td, "content", tail);
+                cJSON_AddItemToObject(tch, "delta", td);
+                cJSON_AddNumberToObject(tch, "index", 0);
+                cJSON_AddStringToObject(tch, "finish_reason", "");
+                if (!is_chat) cJSON_AddStringToObject(tch, "text", tail);
+                cJSON *tcs = cJSON_CreateArray();
+                cJSON_AddItemToArray(tcs, tch);
+                cJSON_AddItemToObject(tc, "choices", tcs);
+                cJSON_AddStringToObject(tc, "id", is_chat ? "chatcmpl-pico" : "cmpl-pico");
+                cJSON_AddStringToObject(tc, "object", is_chat ? "chat.completion.chunk" : "text_completion");
+                cJSON_AddNumberToObject(tc, "created", (double)(time(NULL)));
+                char *tj = cJSON_PrintUnformatted(tc);
+                sse_send(sock, tj, NULL);
+                free(tj);
+                cJSON_Delete(tc);
+            }
+        }
+
         /* Send final chunk with timings */
         cJSON *done_chunk = cJSON_CreateObject();
         cJSON *done_choice = cJSON_CreateObject();
@@ -3256,6 +3303,13 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
                 if (!stopping_word) stopping_word = "";
             }
 
+            /* On EOS without a full stop match, release the withheld tail in
+             * this same (final, stop:true) chunk: clients stop reading after it. */
+            if (!stopped && next == (int)tokenizer->eos_id) {
+                const char *tail = stop_matcher_flush(&sm);
+                if (tail[0]) send_piece = tail;
+            }
+
             /* Build streaming response: {content, tokens, stop} */
             cJSON *resp = cJSON_CreateObject();
             cJSON_AddStringToObject(resp, "content", send_piece);
@@ -3269,22 +3323,21 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             if (stopped || next == (int)tokenizer->eos_id) {
                 if (!stopped) stop_type = "eos";
                 cJSON_AddBoolToObject(resp, "stop", 1);
-                sse_send(sock, cJSON_PrintUnformatted(resp), NULL);
-                free(cJSON_PrintUnformatted(resp));
+                { char *rj = cJSON_PrintUnformatted(resp); sse_send(sock, rj, NULL); free(rj); }
                 cJSON_Delete(resp);
                 gen_count++;
                 break;
             }
 
             cJSON_AddBoolToObject(resp, "stop", 0);
-            if (sse_send(sock, cJSON_PrintUnformatted(resp), NULL) < 0) {
-                free(cJSON_PrintUnformatted(resp));
-                cJSON_Delete(resp);
+            char *rj2 = cJSON_PrintUnformatted(resp);
+            int send_rc = sse_send(sock, rj2, NULL);
+            free(rj2);
+            cJSON_Delete(resp);
+            if (send_rc < 0) {
                 fprintf(stderr, "\n[server] /completion stream: send failed\n");
                 break;
             }
-            free(cJSON_PrintUnformatted(resp));
-            cJSON_Delete(resp);
 
             gen_count++;
 
@@ -3304,6 +3357,21 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         double t_end = get_time_ms();
         double t_prefill_ms = t_prefill_end > 0 ? t_prefill_end - t_start : t_end - t_start;
         double gen_ms = t_prefill_end > 0 ? t_end - t_prefill_end : t_end - t_start;
+
+        /* Generation ended without a full stop match (EOS / n_predict / etc):
+         * release any withheld partial-match tail so it is not lost. */
+        if (stop_action_not_full(&sm) && client_alive(sock)) {
+            const char *tail = stop_matcher_flush(&sm);
+            if (tail[0]) {
+                cJSON *tr = cJSON_CreateObject();
+                cJSON_AddStringToObject(tr, "content", tail);
+                cJSON_AddBoolToObject(tr, "stop", 0);
+                char *tj = cJSON_PrintUnformatted(tr);
+                sse_send(sock, tj, NULL);
+                free(tj);
+                cJSON_Delete(tr);
+            }
+        }
 
         /* Final timing SSE */
         cJSON *final = cJSON_CreateObject();
@@ -3325,8 +3393,9 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         cJSON_AddNumberToObject(timings_c, "predicted_per_second", gen_count > 0 ? gen_count / (gen_ms / 1000.0) : 0);
         cJSON_AddItemToObject(final, "timings", timings_c);
         if (client_alive(sock)) {
-            sse_send(sock, cJSON_PrintUnformatted(final), NULL);
-            free(cJSON_PrintUnformatted(final));
+            char *fj = cJSON_PrintUnformatted(final);
+            sse_send(sock, fj, NULL);
+            free(fj);
             send_chunked(sock, "", 0);
         } else {
             /* Client disconnected during generation, don't try to send final chunk */
