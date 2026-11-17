@@ -1863,9 +1863,14 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
     if (picolm_gpu_tensor_upload(&gl->name, lw->name, lw->type ## _ ## name, (I), (O), device)) uploaded++; \
 } while(0)
 
-                /* Attention Q/K/V/O: only exist for attention layers.
-                 * SSM layers (!is_attn_layer) have attn_qkv fused instead. */
-                if (lw->is_attn_layer || !c->has_ssm) {
+                /* Attention Q/K/V/O: only exist for attention layers, and only
+                 * when the model keeps them separate. SSM layers use a fused
+                 * attn_qkv instead, and so does Spark-X2.5 -- without the
+                 * lw->attn_q guard each Spark layer contributed four failed
+                 * upload attempts (108 tensors across 36 layers), which both
+                 * inflated `attempted` and made the completeness check fire on
+                 * tensors that were never meant to exist. */
+                if (lw->attn_q && (lw->is_attn_layer || !c->has_ssm)) {
                     /* Attention Q: [q_dim, n_embd] for dense, [q_full_dim, n_embd] for SSM attn */
                     attempted++;
                     { int qo = (c->has_ssm && lw->is_attn_layer) ? q_dim * 2 : q_dim;
@@ -1884,11 +1889,31 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                     if (picolm_gpu_tensor_upload(&gl->attn_output,
                             lw->attn_output, lw->type_attn_output, q_dim, c->n_embd, device)) uploaded++;
                 }
-                /* GPT-2/GPTNeoX fused QKV: [3*dim, dim] */
+                /* Fused QKV: GPT-2/GPTNeoX ([3*dim, dim]) and Spark-X2.5
+                 * ([qkv_out, dim], qkv_out = q_dim + 2*kv_dim, which is 6144 for
+                 * the 4B and not 3*dim, so it cannot use the GPT-2 shape).
+                 * Spark was previously excluded from this branch entirely and
+                 * has no attn_q/attn_k/attn_v either, so NONE of its attention
+                 * projections were uploaded -- the GPU decode then multiplied by
+                 * NULL weights. */
                 if ((c->is_gpt2 || c->is_gptneox) && lw->attn_qkv) {
                     attempted++;
                     if (picolm_gpu_tensor_upload(&gl->attn_qkv,
                             lw->attn_qkv, lw->type_attn_qkv, c->n_embd, 3*c->n_embd, device)) uploaded++;
+                } else if (c->is_spark25 && lw->attn_qkv) {
+                    int qkv_out = c->n_heads * c->head_dim + 2 * c->n_kv_heads * c->head_dim;
+                    attempted++;
+                    if (picolm_gpu_tensor_upload(&gl->attn_qkv,
+                            lw->attn_qkv, lw->type_attn_qkv, c->n_embd, qkv_out, device)) uploaded++;
+                    /* Spark's head-wise attention gate [dim, n_heads]. The CPU
+                     * path treats it as required (model_core.c rejects the model
+                     * without it), so a GPU run that ignores it is running a
+                     * different network. */
+                    if (lw->attn_gate) {
+                        attempted++;
+                        if (picolm_gpu_tensor_upload(&gl->attn_gate,
+                                lw->attn_gate, lw->type_attn_gate, c->n_embd, c->n_heads, device)) uploaded++;
+                    }
                 }
                 /* FFN gate/up/down: only upload if weight pointer exists.
                  * SSM layers may or may not have FFN. */
@@ -1980,6 +2005,17 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                      * are both supported now (b67b1df) -- this used to be
                      * a hard veto on anything but 0, stale since that fix. */
                     if (c->rope_type != 0 && c->rope_type != 1 && c->rope_type != -1) { eligible = 0; el_reason = 1; }
+                    /* Spark-X2.5 is NOT supported by the GPU decode pipeline yet.
+                     * model_forward_gpu() (model_ssm.c) implements Qwen-SSM and
+                     * GPT-2/GPTNeoX-style attention; it has no head-wise attention
+                     * gate (lw->attn_gate, which model_core's own load-time check
+                     * treats as mandatory for Spark) and no per-layer SWA RoPE
+                     * dimension. Running it over a Spark model therefore computes
+                     * a different network and emits fluent-looking garbage rather
+                     * than failing. Veto it here until the decode pipeline grows
+                     * Spark support; the weights are still uploaded so that work
+                     * can start from a warm cache. */
+                    if (c->is_spark25) { eligible = 0; el_reason = 9; }
                     /* F16 KV cache only -- GPU attention kernels read std430 F16 from KV cache */
                     if (kv_type_k != KV_CACHE_F16 || kv_type_v != KV_CACHE_F16) { eligible = 0; el_reason = 2; }
                     /* SSM models: enable GPU pipeline.
@@ -2068,19 +2104,42 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                             size_t max_xd = (size_t)c->max_seq_len * (max_q8_dim + 31) / 32 * sizeof(float);
                             picolm_gpu_prealloc_q8(max_xq, max_xd, device);
 
-                            /* Upload norm weights and RoPE tables to device */
+                            /* Upload norm weights and RoPE tables to device.
+                             *
+                             * The SWA table is NOT the same width as the global
+                             * one: a model can give SWA layers their own RoPE
+                             * dimension (Spark-X2.5: rope.dimension_count=64 but
+                             * rope.dimension_count_swa=256), so a position's
+                             * cos/sin run has swa_half = rope_dim_swa/2 entries
+                             * against rope_half for everything else. Uploading the
+                             * SWA table with rope_n (the global size) truncates it
+                             * to a quarter and the per-position stride in the
+                             * consumers then walks off the end of the buffer.
+                             *
+                             * The old gate uploaded this only for Gemma-3n, so on
+                             * Spark both pointers stayed NULL while model_ssm.c
+                             * still indexed them as `NULL + pos*rope_half` -- the
+                             * decode path read whatever lives below address zero.
+                             * Gate on "does this model have SWA tables at all"
+                             * instead, and size each table from its own half. */
                             run_state_t *s = &m->state;
-                            /* RoPE cos/sin: [max_seq_len * rope_half] */
                             {
                                 int rope_dim = (c->rope_dim > 0) ? c->rope_dim : c->head_dim;
                                 int rope_half = rope_dim / 2;
                                 size_t rope_n = (size_t)c->max_seq_len * rope_half;
                                 m->gpu.rope_cos_dev = picolm_gpu_upload_f32(s->rope_cos, rope_n, device);
                                 m->gpu.rope_sin_dev = picolm_gpu_upload_f32(s->rope_sin, rope_n, device);
-                                /* SWA RoPE tables (Gemma-3n: freq_base=10000 for SWA layers) */
-                                if (c->is_gemma3n) {
-                                    m->gpu.rope_cos_swa_dev = picolm_gpu_upload_f32(s->rope_cos_swa, rope_n, device);
-                                    m->gpu.rope_sin_swa_dev = picolm_gpu_upload_f32(s->rope_sin_swa, rope_n, device);
+                                /* SWA RoPE tables: present whenever the model has
+                                 * a per-layer SWA RoPE (own rope_dim and/or its own
+                                 * freq_base), i.e. whenever init_swa_rope_tables()
+                                 * actually built them. */
+                                int swa_rope_wide = (c->rope_dim_swa > 0) ? c->rope_dim_swa : rope_dim;
+                                int swa_half_len = swa_rope_wide / 2;
+                                if (s->rope_cos_swa && s->rope_sin_swa &&
+                                    (c->is_gemma3n || c->is_spark25 || c->n_swa > 0)) {
+                                    size_t rope_n_swa = (size_t)c->max_seq_len * swa_half_len;
+                                    m->gpu.rope_cos_swa_dev = picolm_gpu_upload_f32(s->rope_cos_swa, rope_n_swa, device);
+                                    m->gpu.rope_sin_swa_dev = picolm_gpu_upload_f32(s->rope_sin_swa, rope_n_swa, device);
                                 } else {
                                     m->gpu.rope_cos_swa_dev = NULL;
                                     m->gpu.rope_sin_swa_dev = NULL;
@@ -2210,6 +2269,8 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                         const char *reason = "unknown";
                         if (el_reason == 1) reason = "unsupported rope_type";
                         else if (el_reason == 2) reason = "KV cache not F16 (GPU attention requires F16 std430)";
+                        else if (el_reason == 9) reason = "Spark-X2.5 not implemented by the GPU decode pipeline "
+                                                        "(no head-wise attn gate / per-layer SWA rope dim)";
                         else if (el_reason >= 3) reason = "SSM config incompatible with GPU pipeline";
                         else if (!c->has_ssm) reason = "non-SSM model ineligible";
                         fprintf(stderr, "INFO: GPU KV cache disabled (%s; SSM=%d rope=%d kv_k=%d kv_v=%d)\n",
@@ -2288,11 +2349,19 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                 int ot = m->weights.type_output;
                 if (ot >= 0 && ot < 512) tcounts[ot]++;
                 if (uploaded < attempted) {
-                    /* Partial upload: some tensor types are unsupported on GPU.
-                     * Running with NULL weight pointers would produce garbage,
-                     * so disable GPU fallback. */
+                    /* Partial upload: some tensor is unsupported on GPU, or an
+                     * architecture branch above does not cover it. Running with
+                     * NULL weight pointers produces fluent-looking garbage, not a
+                     * crash, so this MUST stop the GPU path -- and it has to
+                     * clear kv_active too. Only clearing `active` was not enough:
+                     * the CLI gates on model.gpu.kv_active (picolm.c), so it went
+                     * on calling model_forward_gpu() over a third of a model's
+                     * weights and produced gibberish. */
                     m->gpu.active = 0;
-                    fprintf(stderr, "WARN: GPU upload incomplete (%d/%d tensors) -- unsupported quant type, disabling GPU\n", uploaded, attempted);
+                    m->gpu.kv_active = 0;
+                    fprintf(stderr, "WARN: GPU upload incomplete (%d/%d tensors) -- "
+                            "falling back to CPU (GPU would run with NULL weights)\n",
+                            uploaded, attempted);
                 } else {
                     fprintf(stderr, "INFO: GPU weights uploaded (%d/%d tensors)\n", uploaded, attempted);
                 }

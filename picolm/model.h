@@ -204,7 +204,8 @@ typedef struct {
     void *ffn_gate;
     void *ffn_down;
     void *ffn_up;
-    void *attn_qkv;            /* SSM */
+    void *attn_qkv;            /* fused QKV: GPT-2/GPTNeoX and Spark-X2.5 */
+    void *attn_gate;           /* Spark-X2.5: head-wise attention gate */
     void *attn_gate_ssm;       /* SSM */
     void *ssm_out;             /* SSM */
     void *ssm_conv1d;          /* SSM: [d_conv x conv_dim] f32 */

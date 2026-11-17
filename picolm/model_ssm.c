@@ -5396,18 +5396,38 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
             }
 
             /* F. RoPE on Q (in-place): rope(pipe_q, n_heads)
-             * SWA layers (il % swa_period < swa_period-1) use freq_base=10000,
-             * global layers (il % swa_period == swa_period-1) use freq_base=1000000. */
+             * and G. RoPE on K (in-place): rope(pipe_k, n_kv_heads).
+             *
+             * Which table, and how wide a position's entry is, both come from
+             * the layer, not from one model-wide constant:
+             *   - SWA-ness is c->n_swa_layer[l], the documented single source of
+             *     truth (model.h). Re-deriving it from swa_period ignores an
+             *     explicit <arch>.attention.sliding_window_pattern array, which
+             *     is what Spark-X2.5 ships, so those two disagree.
+             *   - The two tables have DIFFERENT per-position widths when the
+             *     model gives SWA layers their own RoPE dimension
+             *     (Spark-X2.5: rope_dim=64, rope_dim_swa=256). Using the global
+             *     rope_half to index the SWA table reads a quarter of the way
+             *     into each entry and then walks off the end of the buffer.
+             * The CPU reference in model_core.c does exactly this too
+             * (rope_half_i / cos_pos_i in model_forward). */
             {
-                int is_swa = (c->swa_period > 0) && ((l % c->swa_period) < (c->swa_period - 1));
-                float *rope_cos_pos = (float *)(is_swa ? gw->rope_cos_swa_dev : gw->rope_cos_dev) + (size_t)pos * rope_half;
-                float *rope_sin_pos = (float *)(is_swa ? gw->rope_sin_swa_dev : gw->rope_sin_dev) + (size_t)pos * rope_half;
+                int is_swa = c->n_swa_layer[l] > 0;
+                int rope_half_i = is_swa
+                    ? (c->rope_dim_swa > 0 ? c->rope_dim_swa : rope_dim) / 2
+                    : rope_half;
+                float *rope_tbl_cos = (float *)(is_swa ? gw->rope_cos_swa_dev : gw->rope_cos_dev);
+                float *rope_tbl_sin = (float *)(is_swa ? gw->rope_sin_swa_dev : gw->rope_sin_dev);
+                /* Refuse rather than index a NULL table: a missing SWA table for
+                 * an SWA layer is a bug in the upload, and silently doing
+                 * NULL+offset is how the original garble happened. */
+                if (!rope_tbl_cos || !rope_tbl_sin) return model_forward(m, token, pos);
+                float *rope_cos_pos = rope_tbl_cos + (size_t)pos * rope_half_i;
+                float *rope_sin_pos = rope_tbl_sin + (size_t)pos * rope_half_i;
                 picolm_gpu_rope_apply(pipe_q, n_heads, head_dim,
-                                       rope_cos_pos, rope_sin_pos, rope_half, c->rope_type, gpu_dev);
-
-                /* G. RoPE on K (in-place): rope(pipe_k, n_kv_heads) */
+                                       rope_cos_pos, rope_sin_pos, rope_half_i, c->rope_type, gpu_dev);
                 picolm_gpu_rope_apply(pipe_k, n_kv_heads, head_dim,
-                                       rope_cos_pos, rope_sin_pos, rope_half, c->rope_type, gpu_dev);
+                                       rope_cos_pos, rope_sin_pos, rope_half_i, c->rope_type, gpu_dev);
             }
 
             /* G. KV cache store: pack F32 -> F16 and write directly into the
@@ -5719,8 +5739,6 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
     model_weights_t *w = &m->weights;
     gpu_layer_weights_t *gl;
 
-    (void)rope_dim;
-
     /* NaN guard macro for debugging */
 #if 1
     #define _PFX_NAN_CHECK(_buf, _label) \
@@ -6018,17 +6036,30 @@ after_qkv:
 
         /* Debug: dump Q AFTER matmul but BEFORE RoPE (layer 0 only) */
 
-        /* RoPE: per-layer SWA/global selection */
+        /* RoPE: per-layer SWA/global selection. Same two rules as the decode
+         * path above: n_swa_layer[l] decides which table, and the two tables
+         * can have different per-position widths (Spark-X2.5 rope_dim_swa). */
         {
-            int is_swa = (c->swa_period > 0) && ((l % c->swa_period) < (c->swa_period - 1));
+            int is_swa = c->n_swa_layer[l] > 0;
+            int rope_half_i = is_swa
+                ? (c->rope_dim_swa > 0 ? c->rope_dim_swa : rope_dim) / 2
+                : rope_half;
             void *rope_cos_tbl = is_swa ? gw->rope_cos_swa_dev : gw->rope_cos_dev;
             void *rope_sin_tbl = is_swa ? gw->rope_sin_swa_dev : gw->rope_sin_dev;
+            if (!rope_cos_tbl || !rope_sin_tbl) {
+                /* Missing SWA table: fail this ubatch so model_forward_prefill_gpu()
+                 * falls back to the CPU prefill, rather than indexing
+                 * NULL + pos*rope_half. */
+                fprintf(stderr, "WARN: GPU prefill: no %s RoPE table for layer %d, "
+                        "falling back to CPU prefill\n", is_swa ? "SWA" : "global", l);
+                return 0;
+            }
             picolm_gpu_rope_apply_batched(bq, n_heads, head_dim,
                 (float *)rope_cos_tbl, (float *)rope_sin_tbl,
-                rope_half, start_pos, n_ubatch, c->rope_type, gpu_dev);
+                rope_half_i, start_pos, n_ubatch, c->rope_type, gpu_dev);
             picolm_gpu_rope_apply_batched(bk, n_kv_heads, head_dim,
                 (float *)rope_cos_tbl, (float *)rope_sin_tbl,
-                rope_half, start_pos, n_ubatch, c->rope_type, gpu_dev);
+                rope_half_i, start_pos, n_ubatch, c->rope_type, gpu_dev);
         }
 
         /* KV cache store */
