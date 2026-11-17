@@ -25,6 +25,8 @@ test_attn_diff
 test_r8_simd
 
 # unit-test binaries built by `make test-*` (keep the .c sources)
+test_batch1_equals_matmul
+test_sgemm_bf16_tail
 tests/test_glm5_ops
 tests/test_glm5_ops.exe
 test_glm5_snapshot
