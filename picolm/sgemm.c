@@ -32,6 +32,30 @@
 #define JSTART(nb,ith,nth) ((nb)*(ith)/(nth))
 #define JEND(nb,ith,nth)   ((nb)*((ith)+1)/(nth))
 
+/* k-loop unroll factor for the F32 / F16 / BF16 GEMMs.
+ *
+ * These kernels have no int8/VNNI path: every weight vector has to be loaded
+ * and converted to fp32 before it can feed an FMA, and with a single KN-wide
+ * step per k iteration the compiler has nothing to overlap that latency with,
+ * so the loop stalls well short of the FMA units. Emitting SGEMM_KU steps per
+ * iteration lets it software-pipeline the loads/converts of step u+1 against
+ * the FMAs of step u. Measured on Xeon Silver 4214 (AVX-512), Spark-X2.6-1.7B
+ * shapes: BF16 26.3 -> 63-84 GFLOP/s single-thread, i.e. up to the core's
+ * measured fp32-FMA peak (63.5 GFLOP/s); F32_f32 19.7 -> 34 GFLOP/s in situ.
+ *
+ * Same instructions, same accumulators, same summation order -- this is
+ * scheduling, not arithmetic -- so each kernel stays bit-identical to the
+ * un-unrolled version. Two rules:
+ *   1. The loop advance MUST equal the number of emitted steps (KN is the step
+ *      width, so advance by KN*SGEMM_KU and emit SGEMM_KU steps). An advance
+ *      larger than the steps emitted silently skips a slice of k and still
+ *      returns plausible numbers -- tests/test_sgemm_bf16_tail.c exists for
+ *      exactly that mistake.
+ *   2. Every kernel keeps a remainder loop stepping by KN, so no k % (KN*KU)
+ *      alignment requirement is introduced; any k the SGEMM gates accept
+ *      (k % KN == 0) stays correct. */
+#define SGEMM_KU 16
+
 /* ============================================================
  * F32 x F32 tiled GEMM
  * ============================================================ */
@@ -53,6 +77,18 @@
 #define F32_LDA(p) _mm512_loadu_ps(p)
 #define F32_LDB(p) _mm512_loadu_ps(p)
 #define F32_MADD(a,b,c) _mm512_fmadd_ps(a,b,c)
+
+/* One KN-wide k step of the tile; expanded SGEMM_KU times per k iteration.
+ * Self-contained per arch block on purpose: F32_V / F32_LDA / F32_MADD are
+ * #undef'd between blocks, so defining it once outside would silently depend
+ * on macro-expansion ordering. See the SGEMM_KU note at the top of the file. */
+#define SGEMM_F32_STEP(Cv, ii, jj, off) do {                                 \
+    F32_V Av[F32_RM];                                                        \
+    for(int c=0;c<(int)F32_RM;c++) Av[c]=F32_LDA(A+lda*(ii+c)+(off));        \
+    for(int r=0;r<(int)F32_RN;r++) { F32_V Bv=F32_LDB(B+ldb*(jj+r)+(off));   \
+        for(int c=0;c<(int)F32_RM;c++) Cv[r][c]=F32_MADD(Av[c],Bv,Cv[r][c]); \
+    }                                                                        \
+} while(0)
 #define F32_HSUM(x) _mm512_reduce_add_ps(x)
 
 static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
@@ -72,7 +108,33 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
                 F32_V Cv[F32_RN][F32_RM];
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=F32_ZERO;
-                for (int64_t l=0;l<k;l+=KN) {
+                /* Unrolled k loop: see the SGEMM_KU note at the top of the file.
+                 * Each step loads and consumes its own A row vectors -- do NOT
+                 * pre-load all SGEMM_KU of them into an array: that spills every
+                 * accumulator to the stack and loses more than the unrolling
+                 * gains (measured: F32 stayed at 19.8 GFLOP/s).
+                 * The loop advance and the number of emitted steps must match,
+                 * and the remainder loop finishes any k % (KN*KU). */
+                int64_t l=0;
+                for (;l+KN*SGEMM_KU<=k;l+=KN*SGEMM_KU) {
+                    SGEMM_F32_STEP(Cv, ii, jj, l+0*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+1*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+2*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+3*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+4*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+5*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+6*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+7*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+8*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+9*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+10*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+11*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+12*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+13*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+14*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+15*KN);
+                }
+                for (;l<k;l+=KN) {
                     F32_V Av[F32_RM];
                     for(int c=0;c<RM;c++) Av[c]=F32_LDA(A+lda*(ii+c)+l);
                     for(int r=0;r<RN;r++) { F32_V Bv=F32_LDB(B+ldb*(jj+r)+l);
@@ -99,6 +161,7 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
 #undef F32_LDA
 #undef F32_LDB
 #undef F32_MADD
+#undef SGEMM_F32_STEP
 #undef F32_HSUM
 
 #elif defined(__AVX__) || defined(__AVX2__)
@@ -116,6 +179,18 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
 #else
 #define F32_MADD(a,b,c) _mm256_add_ps(_mm256_mul_ps(a,b),c)
 #endif
+
+/* One KN-wide k step of the tile; expanded SGEMM_KU times per k iteration.
+ * Self-contained per arch block on purpose: F32_V / F32_LDA / F32_MADD are
+ * #undef'd between blocks, so defining it once outside would silently depend
+ * on macro-expansion ordering. See the SGEMM_KU note at the top of the file. */
+#define SGEMM_F32_STEP(Cv, ii, jj, off) do {                                 \
+    F32_V Av[F32_RM];                                                        \
+    for(int c=0;c<(int)F32_RM;c++) Av[c]=F32_LDA(A+lda*(ii+c)+(off));        \
+    for(int r=0;r<(int)F32_RN;r++) { F32_V Bv=F32_LDB(B+ldb*(jj+r)+(off));   \
+        for(int c=0;c<(int)F32_RM;c++) Cv[r][c]=F32_MADD(Av[c],Bv,Cv[r][c]); \
+    }                                                                        \
+} while(0)
 
 static float f32_hsum(F32_V x) {
     __m128 s=_mm_add_ps(_mm256_castps256_ps128(x),_mm256_extractf128_ps(x,1));
@@ -141,7 +216,33 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
                 F32_V Cv[F32_RN][F32_RM];
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=F32_ZERO;
-                for (int64_t l=0;l<k;l+=KN) {
+                /* Unrolled k loop: see the SGEMM_KU note at the top of the file.
+                 * Each step loads and consumes its own A row vectors -- do NOT
+                 * pre-load all SGEMM_KU of them into an array: that spills every
+                 * accumulator to the stack and loses more than the unrolling
+                 * gains (measured: F32 stayed at 19.8 GFLOP/s).
+                 * The loop advance and the number of emitted steps must match,
+                 * and the remainder loop finishes any k % (KN*KU). */
+                int64_t l=0;
+                for (;l+KN*SGEMM_KU<=k;l+=KN*SGEMM_KU) {
+                    SGEMM_F32_STEP(Cv, ii, jj, l+0*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+1*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+2*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+3*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+4*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+5*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+6*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+7*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+8*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+9*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+10*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+11*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+12*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+13*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+14*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+15*KN);
+                }
+                for (;l<k;l+=KN) {
                     F32_V Av[F32_RM];
                     for(int c=0;c<RM;c++) Av[c]=F32_LDA(A+lda*(ii+c)+l);
                     for(int r=0;r<RN;r++) { F32_V Bv=F32_LDB(B+ldb*(jj+r)+l);
@@ -171,6 +272,7 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
 #undef F32_LDA
 #undef F32_LDB
 #undef F32_MADD
+#undef SGEMM_F32_STEP
 
 #elif defined(__SSE__)
 
@@ -183,6 +285,18 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
 #define F32_LDA(p) _mm_loadu_ps(p)
 #define F32_LDB(p) _mm_loadu_ps(p)
 #define F32_MADD(a,b,c) _mm_add_ps(_mm_mul_ps(a,b),c)
+
+/* One KN-wide k step of the tile; expanded SGEMM_KU times per k iteration.
+ * Self-contained per arch block on purpose: F32_V / F32_LDA / F32_MADD are
+ * #undef'd between blocks, so defining it once outside would silently depend
+ * on macro-expansion ordering. See the SGEMM_KU note at the top of the file. */
+#define SGEMM_F32_STEP(Cv, ii, jj, off) do {                                 \
+    F32_V Av[F32_RM];                                                        \
+    for(int c=0;c<(int)F32_RM;c++) Av[c]=F32_LDA(A+lda*(ii+c)+(off));        \
+    for(int r=0;r<(int)F32_RN;r++) { F32_V Bv=F32_LDB(B+ldb*(jj+r)+(off));   \
+        for(int c=0;c<(int)F32_RM;c++) Cv[r][c]=F32_MADD(Av[c],Bv,Cv[r][c]); \
+    }                                                                        \
+} while(0)
 
 static float f32_hsum(F32_V x) {
     __m128 t=_mm_shuffle_ps(x,x,_MM_SHUFFLE(2,3,0,1));
@@ -208,7 +322,33 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
                 F32_V Cv[F32_RN][F32_RM];
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=F32_ZERO;
-                for (int64_t l=0;l<k;l+=KN) {
+                /* Unrolled k loop: see the SGEMM_KU note at the top of the file.
+                 * Each step loads and consumes its own A row vectors -- do NOT
+                 * pre-load all SGEMM_KU of them into an array: that spills every
+                 * accumulator to the stack and loses more than the unrolling
+                 * gains (measured: F32 stayed at 19.8 GFLOP/s).
+                 * The loop advance and the number of emitted steps must match,
+                 * and the remainder loop finishes any k % (KN*KU). */
+                int64_t l=0;
+                for (;l+KN*SGEMM_KU<=k;l+=KN*SGEMM_KU) {
+                    SGEMM_F32_STEP(Cv, ii, jj, l+0*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+1*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+2*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+3*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+4*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+5*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+6*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+7*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+8*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+9*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+10*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+11*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+12*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+13*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+14*KN);
+                    SGEMM_F32_STEP(Cv, ii, jj, l+15*KN);
+                }
+                for (;l<k;l+=KN) {
                     F32_V Av[F32_RM];
                     for(int c=0;c<RM;c++) Av[c]=F32_LDA(A+lda*(ii+c)+l);
                     for(int r=0;r<RN;r++) { F32_V Bv=F32_LDB(B+ldb*(jj+r)+l);
@@ -235,6 +375,7 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
 #undef F32_LDA
 #undef F32_LDB
 #undef F32_MADD
+#undef SGEMM_F32_STEP
 #undef F32_HSUM
 #undef f32_hsum
 
@@ -268,6 +409,9 @@ static void sgemm_f32_f32(int m, int n, int k, const float *A, int lda,
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
                 F32_V Cv[F32_RN][F32_RM];
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=F32_ZERO;
+                /* NOT unrolled on purpose: the SGEMM_KU unrolling of the x86
+                 * variants was only measured and validated on x86. Leave this
+                 * loop as it is rather than ship an untested rewrite here. */
                 for (int64_t l=0;l<k;l+=KN) {
                     F32_V Av[F32_RM];
                     for(int c=0;c<RM;c++) Av[c]=F32_LDA(A+lda*(ii+c)+l);
@@ -882,7 +1026,24 @@ static void sgemm_f16_f16(int m, int n, int k, const uint16_t *A, int lda,
  *   converts 8 bf16 -> 8 f32 (cvtepu16: 8x16->8x32 zero-extend)
  * AVX2:    _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(...), 16))
  *   converts 8 bf16 -> 8 f32 (pmovzxwd is AVX2)
+ *
+ * k-loop unrolling (SGEMM_KU, AVX-512 path below).
+ *
+ * BF16 has no FMA-usable weight format on the AVX-512 parts PicoLM targets, so
+ * every 16 weights cost a load + cvtepu16 + slli before they can feed an FMA.
+ * With a single 16-wide step per k iteration the compiler has nothing to
+ * overlap that conversion latency with, and the kernel stalls well short of
+ * the FMA units: measured on Spark-X2.6-1.7B (Xeon Silver 4214, RM=4/RN=6,
+ * k=2048) the KN=16 loop reaches 26.3 GFLOP/s, while the same code with four
+ * 16-wide steps per iteration reaches 63-84 GFLOP/s -- i.e. essentially this
+ * core's measured F32-FMA peak (63.5 GFLOP/s). Same instructions, same
+ * accumulators, same order: this is instruction scheduling, not arithmetic, so
+ * the result is bit-identical to the KN=16 loop. The remainder loop keeps any
+ * k % 16 == 0 shape working, so no k % (16*KU) alignment is introduced.
  * ============================================================ */
+
+/* SGEMM_KU (the k unroll factor) is defined next to JSTART/JEND at the top of
+ * this file, because the F32 kernels above use it too. */
 
 #if defined(__AVX512F__)
 static void sgemm_bf16_f32(int m, int n, int k, const uint16_t *A, int lda,
@@ -897,6 +1058,17 @@ static void sgemm_bf16_f32(int m, int n, int k, const uint16_t *A, int lda,
     int64_t BM=SGEMM_PICK_BM(m,RM,nth);
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    /* One 16-wide k step of the RM x RN tile: dequantise the RM A rows, then
+     * FMA every (row, col) pair against the fp32 B column. Accumulates in Cv. */
+#define SGEMM_BF16F32_STEP(Cv, off) do {                                     \
+        __m512 Av[SGEMM_RM];                                                 \
+        for(int c=0;c<RM;c++) {                                              \
+            __m256i raw = _mm256_loadu_si256((__m256i*)(A+lda*(ii+c)+(off))); \
+            Av[c] = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(raw), 16)); \
+        }                                                                    \
+        for(int r=0;r<RN;r++) { __m512 Bv=_mm512_loadu_ps(B+ldb*(jj+r)+(off)); \
+            for(int c=0;c<RM;c++) Cv[r][c]=_mm512_fmadd_ps(Av[c],Bv,Cv[r][c]); } \
+    } while(0)
     for (int64_t j=js;j<je;j++) {
         int64_t iib=(j%yt)*RM*BM, jb=j/yt;
         int64_t jj0=jb*RN, jj2=jj0+RN; if(jj2>n)jj2=n;
@@ -906,15 +1078,26 @@ static void sgemm_bf16_f32(int m, int n, int k, const uint16_t *A, int lda,
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
                 __m512 Cv[SGEMM_RN][SGEMM_RM];
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=_mm512_setzero_ps();
-                for (int64_t l=0;l<k;l+=KN) {
-                    __m512 Av[SGEMM_RM];
-                    for(int c=0;c<RM;c++) {
-                        __m256i raw = _mm256_loadu_si256((__m256i*)(A+lda*(ii+c)+l));
-                        Av[c] = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(raw), 16));
-                    }
-                    for(int r=0;r<RN;r++) { __m512 Bv=_mm512_loadu_ps(B+ldb*(jj+r)+l);
-                        for(int c=0;c<RM;c++) Cv[r][c]=_mm512_fmadd_ps(Av[c],Bv,Cv[r][c]); }
+                int64_t l=0;
+                for (;l+KN*SGEMM_KU<=k;l+=KN*SGEMM_KU) {
+                    SGEMM_BF16F32_STEP(Cv, l);
+                    SGEMM_BF16F32_STEP(Cv, l+KN);
+                    SGEMM_BF16F32_STEP(Cv, l+2*KN);
+                    SGEMM_BF16F32_STEP(Cv, l+3*KN);
+                    SGEMM_BF16F32_STEP(Cv, l+4*KN);
+                    SGEMM_BF16F32_STEP(Cv, l+5*KN);
+                    SGEMM_BF16F32_STEP(Cv, l+6*KN);
+                    SGEMM_BF16F32_STEP(Cv, l+7*KN);
+                    SGEMM_BF16F32_STEP(Cv, l+8*KN);
+                    SGEMM_BF16F32_STEP(Cv, l+9*KN);
+                    SGEMM_BF16F32_STEP(Cv, l+10*KN);
+                    SGEMM_BF16F32_STEP(Cv, l+11*KN);
+                    SGEMM_BF16F32_STEP(Cv, l+12*KN);
+                    SGEMM_BF16F32_STEP(Cv, l+13*KN);
+                    SGEMM_BF16F32_STEP(Cv, l+14*KN);
+                    SGEMM_BF16F32_STEP(Cv, l+15*KN);
                 }
+                for (;l<k;l+=KN) SGEMM_BF16F32_STEP(Cv, l);
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) C[ldc*(jj+r)+(ii+c)]=_mm512_reduce_add_ps(Cv[r][c]);
             }
             for (int64_t jj=jj1;jj<jj2;jj++) {
@@ -930,6 +1113,7 @@ static void sgemm_bf16_f32(int m, int n, int k, const uint16_t *A, int lda,
             }
         }
     }
+#undef SGEMM_BF16F32_STEP
 }
 #undef SGEMM_KN
 #undef SGEMM_RM
@@ -948,6 +1132,19 @@ static void sgemm_bf16_bf16(int m, int n, int k, const uint16_t *A, int lda,
     int64_t BM=SGEMM_PICK_BM(m,RM,nth);
     int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
     int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    /* 16-wide k step; see SGEMM_BF16F32_STEP above and the SGEMM_KU note. */
+#define SGEMM_BF16BF16_STEP(Cv, off) do {                                    \
+        __m512 Av[SGEMM_RM];                                                 \
+        for(int c=0;c<RM;c++) {                                              \
+            __m256i raw = _mm256_loadu_si256((__m256i*)(A+lda*(ii+c)+(off))); \
+            Av[c] = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(raw), 16)); \
+        }                                                                    \
+        for(int r=0;r<RN;r++) {                                              \
+            __m256i rawb = _mm256_loadu_si256((__m256i*)(B+ldb*(jj+r)+(off))); \
+            __m512 Bv = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(rawb), 16)); \
+            for(int c=0;c<RM;c++) Cv[r][c]=_mm512_fmadd_ps(Av[c],Bv,Cv[r][c]); \
+        }                                                                    \
+    } while(0)
     for (int64_t j=js;j<je;j++) {
         int64_t iib=(j%yt)*RM*BM, jb=j/yt;
         int64_t jj0=jb*RN, jj2=jj0+RN; if(jj2>n)jj2=n;
@@ -957,18 +1154,26 @@ static void sgemm_bf16_bf16(int m, int n, int k, const uint16_t *A, int lda,
             for (int64_t jj=jj0;jj<jj1;jj+=RN) {
                 __m512 Cv[SGEMM_RN][SGEMM_RM];
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=_mm512_setzero_ps();
-                for (int64_t l=0;l<k;l+=KN) {
-                    __m512 Av[SGEMM_RM];
-                    for(int c=0;c<RM;c++) {
-                        __m256i raw = _mm256_loadu_si256((__m256i*)(A+lda*(ii+c)+l));
-                        Av[c] = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(raw), 16));
-                    }
-                    for(int r=0;r<RN;r++) {
-                        __m256i raw = _mm256_loadu_si256((__m256i*)(B+ldb*(jj+r)+l));
-                        __m512 Bv = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(raw), 16));
-                        for(int c=0;c<RM;c++) Cv[r][c]=_mm512_fmadd_ps(Av[c],Bv,Cv[r][c]);
-                    }
+                int64_t l=0;
+                for (;l+KN*SGEMM_KU<=k;l+=KN*SGEMM_KU) {
+                    SGEMM_BF16BF16_STEP(Cv, l);
+                    SGEMM_BF16BF16_STEP(Cv, l+KN);
+                    SGEMM_BF16BF16_STEP(Cv, l+2*KN);
+                    SGEMM_BF16BF16_STEP(Cv, l+3*KN);
+                    SGEMM_BF16BF16_STEP(Cv, l+4*KN);
+                    SGEMM_BF16BF16_STEP(Cv, l+5*KN);
+                    SGEMM_BF16BF16_STEP(Cv, l+6*KN);
+                    SGEMM_BF16BF16_STEP(Cv, l+7*KN);
+                    SGEMM_BF16BF16_STEP(Cv, l+8*KN);
+                    SGEMM_BF16BF16_STEP(Cv, l+9*KN);
+                    SGEMM_BF16BF16_STEP(Cv, l+10*KN);
+                    SGEMM_BF16BF16_STEP(Cv, l+11*KN);
+                    SGEMM_BF16BF16_STEP(Cv, l+12*KN);
+                    SGEMM_BF16BF16_STEP(Cv, l+13*KN);
+                    SGEMM_BF16BF16_STEP(Cv, l+14*KN);
+                    SGEMM_BF16BF16_STEP(Cv, l+15*KN);
                 }
+                for (;l<k;l+=KN) SGEMM_BF16BF16_STEP(Cv, l);
                 for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) C[ldc*(jj+r)+(ii+c)]=_mm512_reduce_add_ps(Cv[r][c]);
             }
             for (int64_t jj=jj1;jj<jj2;jj++) {
@@ -986,11 +1191,13 @@ static void sgemm_bf16_bf16(int m, int n, int k, const uint16_t *A, int lda,
             }
         }
     }
+#undef SGEMM_BF16BF16_STEP
 }
 #undef SGEMM_KN
 #undef SGEMM_RM
 #undef SGEMM_RN
 #undef SGEMM_BN
+#undef SGEMM_KU
 
 #elif defined(__AVX__) || defined(__AVX2__)
 #if defined(__FMA__)
