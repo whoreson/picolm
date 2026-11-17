@@ -323,9 +323,27 @@ static inline void f32x4_to_fp16_hw(uint16_t *p, float32x4_t v) {
  * as GCC -mavx2 -mfma -mf16c. Verified: /arch:AVX2 accepts _mm256_fmadd_ps
  * and _mm256_cvtph_ps and produces correct results.
  *
- * Note AVX-512 VNNI is deliberately NOT implied: /arch:AVX512 does not enable
- * VNNI. MSVC defines __AVX512VNNI__ only for /arch:AVX512(later) targets that
- * actually have it, and PICOLM_VNNI stays gated on that.
+ * AVX-512 VNNI is NOT derivable on MSVC and must be passed in from outside.
+ * Earlier notes here claimed "MSVC defines __AVX512VNNI__ only for targets
+ * that actually have it"; that is wrong -- cl.exe 14.44 with /arch:AVX512
+ * defines __AVX512F__ and __AVX512VL__ but NEVER __AVX512VNNI__, even though
+ * it happily emits vpdpbusd (verified by dumping the asm). The consequence was
+ * that PICOLM_VNNI never fired on MSVC, so every VNNI kernel compiled out and
+ * a VNNI-capable CPU silently ran the AVX2 fallbacks:
+ *     sgemm_iq6_k_q8_k_r8t       instead of ..._r8v
+ *     sgemm_q8_0_r8_avx2t_q8_0   instead of ..._vnni_q8_0
+ * tools/msvc_build.bat now passes -D PICOLM_VNNI=1, but only after its CPU
+ * probe reports the VNNI feature bit AND ZMM state is enabled, so no build can
+ * execute vpdpbusd on a Skylake-X or a VM that lacks it. Keep that gating if
+ * this flag is ever set by hand; PICOLM_VNNI is intentionally not part of the
+ * /arch consistency guard below because it is a CPU property, not an /arch one.
+ *
+ * The ~32 VNNI kernels in sgemm_*.c / model_attention.c are guarded by
+ * `#if defined(__AVX512VNNI__)` directly rather than by PICOLM_VNNI (they
+ * predate this note, and gcc/clang do define the macro). So opting in has to
+ * define the MACRO, not just PICOLM_VNNI -- exactly the same shim that is
+ * already here for __FMA__ and __F16C__, which MSVC also enables without
+ * defining. Doing it in one place beats editing every kernel guard.
  * ------------------------------------------------------------------------- */
 #if defined(_MSC_VER) && !defined(__CUDACC__) && !defined(__HIP_DEVICE_COMPILE__)
 #  if defined(__AVX2__) || defined(__AVX512F__)
@@ -335,6 +353,23 @@ static inline void f32x4_to_fp16_hw(uint16_t *p, float32x4_t v) {
 #    ifndef __F16C__
 #      define __F16C__ 1
 #    endif
+#  endif
+#endif
+
+/* AVX-512 VNNI: promoted from the build's opt-in to the compiler macro the
+ * kernels actually test. See the long note above for why MSVC cannot define
+ * this itself and why it must only ever come from tools/msvc_build.bat's CPU
+ * probe (or a deliberate -D on a CPU known to have VNNI).
+ *
+ * AVX512VL is required by most of those kernels and MSVC does define it for
+ * /arch:AVX512, but define it here too so a hand-set -D does not half-compile
+ * the VNNI path. Guarded to x86 MSVC builds only. */
+#if defined(PICOLM_VNNI) && !defined(__CUDACC__) && !defined(__HIP_DEVICE_COMPILE__)
+#  if !defined(__AVX512VNNI__)
+#    define __AVX512VNNI__ 1
+#  endif
+#  if defined(_MSC_VER) && !defined(__AVX512VL__)
+#    define __AVX512VL__ 1
 #  endif
 #endif
 

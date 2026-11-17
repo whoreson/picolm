@@ -194,9 +194,21 @@ if /i "%MSVC_SIMD%"=="native" (
             del /q ".msvc_probe.exe" ".msvc_probe.obj" 2>nul
             rem Pick the highest tier the CPU actually has AND cl.exe accepts.
             set "MSVC_SIMD=sse2"
-            echo !PROBE! | find "avx " >nul && set "MSVC_SIMD=avx"
-            echo !PROBE! | find "avx2 " >nul && set "MSVC_SIMD=avx2"
-            echo !PROBE! | find "avx512f " >nul && set "MSVC_SIMD=avx512"
+            rem Use the real Windows find.exe by absolute path. When this
+            rem script is started from an MSYS2/Cygwin shell -- which `make
+            rem msvc` does, and which the notes support -- PATH holds their
+            rem POSIX `find`, whose arguments are paths, not search strings.
+            rem Every token then "fails to match", the tier silently drops to
+            rem sse2, and the build succeeds with a scalar binary. Same class
+            rem of bug the .msvc_cpu comment warns about; this removes the
+            rem dependency on PATH entirely.
+            set "FIND=!SystemRoot!\System32\find.exe"
+            echo !PROBE! | "!FIND!" "avx " >nul && set "MSVC_SIMD=avx"
+            echo !PROBE! | "!FIND!" "avx2 " >nul && set "MSVC_SIMD=avx2"
+            echo !PROBE! | "!FIND!" "avx512f " >nul && set "MSVC_SIMD=avx512"
+            rem AVX-512 VNNI is reported separately: it needs its own -D because
+            rem MSVC never predefines __AVX512VNNI__, so quant.h cannot derive it.
+            echo !PROBE! | "!FIND!" "vnni " >nul && echo vnni> ".msvc_vnni"
             echo !MSVC_SIMD!> ".msvc_cpu"
             if not defined MSVC_PRINT_TIER echo   cpu:  !MSVC_SIMD!
         )
@@ -217,6 +229,24 @@ if not defined MSVC_ARCH (
     echo ERROR: unknown MSVC_SIMD=%MSVC_SIMD% - use avx512/avx2/avx/sse2
     popd 2>nul & exit /b 1
 )
+
+rem ---- 4b. AVX-512 VNNI ---------------------------------------------------
+rem MSVC defines no __AVX512VNNI__ for /arch:AVX512, so quant.h's PICOLM_VNNI
+rem gate (which needs __AVX512VNNI__ && __AVX512VL__) can never fire under
+rem cl.exe and every VNNI kernel compiles out -- the build silently runs the
+rem AVX2 fallbacks (sgemm_iq6_k_q8_k_r8t instead of r8v,
+rem sgemm_q8_0_r8_avx2t_q8_0 instead of the VNNI variant) on a CPU that has
+rem VNNI. Verified on VS2022 14.44: /arch:AVX512 emits vpdpbusd, and the CPU
+rem probe reports the feature bit; only the macro was missing.
+rem Gated on the probe (not on the /arch: flag) so a Skylake-X or a VM
+rem without ZMM state never executes vpdpbusd.
+set "MSVC_VNNI_DEF="
+if not exist ".msvc_vnni" goto vnni_done
+set /p MSVC_VNNI_TMP=<.msvc_vnni
+if /i not "%MSVC_SIMD%"=="avx512" goto vnni_done
+set "MSVC_VNNI_DEF=/D PICOLM_VNNI=1"
+if not defined MSVC_PRINT_TIER echo   vnni: yes (/D PICOLM_VNNI=1)
+:vnni_done
 
 rem Use a real translation unit for the test. "echo . > f.c" writes a stray
 rem "." line and cl.exe rejects it as a syntax error, which made this check
@@ -269,6 +299,7 @@ rem Keeping the cascade in one place is what stops targets from drifting apart.
 set "MSVC_WD=/wd4996 /wd4244 /wd4267 /wd4101 /wd4102 /wd4090 /wd4018 /wd4477"
 set "MSVC_CF=/nologo /O2 /W3 %MSVC_WD% %MSVC_ARCH% /D _CRT_SECURE_NO_WARNINGS /I. /openmp /MP /c"
 set "MSVC_CF=%MSVC_CF% /D PICOLM_SERVER=1"
+if defined MSVC_VNNI_DEF set "MSVC_CF=!MSVC_CF! !MSVC_VNNI_DEF!"
 
 set "MSVC_CSRCS="
 for %%f in (picolm.c model_core.c model_recurrent_state.c model_attention.c model_moe.c model_gemma3n.c model_glm5.c model_ssm.c model_kv_cache.c model_gguf.c steer.c tensor.c type_dispatch.c quant.c sgemm.c sgemm_q0_neon_fast.c sgemm_q2_k_r4_neon.c sgemm_iq4nl_neon_fast.c sgemm_k_q8k_neon_fast.c sgemm_q2_k_neon.c sgemm_k_q8k_neon.c sgemm_q4_0x8.c sgemm_q4i_0x8.c sgemm_q4_0_r8.c sgemm_q8_0_r8.c sgemm_q8_k_r8.c sgemm_q8_k_r8_neon.c sgemm_iq2_k.c sgemm_iq2_k_r4.c sgemm_iq3_k.c sgemm_iq3_k_r4.c sgemm_iq4_k.c sgemm_iq4_nl_r4.c sgemm_q4_k_r4.c sgemm_q6_k_r4.c sgemm_iq6_k.c sgemm_iq4_xs.c tokenizer.c qwen_tokenize.c sampler.c grammar.c cJSON.c server.c csafetensors.c json.c safetensors.c) do (

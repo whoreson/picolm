@@ -1,0 +1,35 @@
+# Normalise line endings at checkout, not in the repository, so that the same
+# blob works on every platform someone builds PicoLM on.
+#
+# Why this file exists: tools/msvc_build.bat was committed with LF-only line
+# endings. cmd.exe tolerates LF for simple commands, but its label lookup
+# (goto :label / call :label) scans the file as a byte stream and mis-handles
+# LF-only files, so the build died with
+#
+#   The system cannot find the batch label specified - parse_args
+#
+# before compiling anything. Every .bat here relies on goto/call labels, so
+# they must be CRLF on disk regardless of what the repository stores.
+*.bat           text eol=crlf
+*.cmd           text eol=crlf
+*.btm           text eol=crlf
+
+# Shell scripts must stay LF, or the kernel refuses them (bad interpreter) and
+# a CRLF-checked-out ./script.sh fails in a way that looks like a missing
+# interpreter rather than a line-ending problem.
+*.sh            text eol=lf
+configure       text eol=lf
+
+# Sources: let each platform's normal convention apply, so a checkout on
+# Windows gets CRLF in the editor without changing what the compiler sees.
+*.c             text
+*.h             text
+*.md            text
+*.txt           text
+
+# Binary-ish assets: never touch these.
+*.png           binary
+*.jpg           binary
+*.gguf          binary
+*.o             binary
+*.exe           binary

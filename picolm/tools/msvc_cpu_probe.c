@@ -36,6 +36,14 @@ int main(void) {
     int max_leaf;
     int have_avx = 0, have_avx2 = 0, have_avx512f = 0;
     int have_fma = 0, have_f16c = 0;
+    /* AVX-512 VNNI (leaf 7 ECX bit 11). MSVC never predefines __AVX512VNNI__
+     * for /arch:AVX512 -- not even when it emits vpdpbusd, which it does --
+     * so quant.h's PICOLM_VNNI gate can never fire on MSVC unless the build
+     * passes it explicitly. This probe is what makes that safe: it is only
+     * reported when the CPU really has the bit AND the OS has enabled the
+     * AVX-512 vector state, so a Skylake-X or a VM without ZMM state cannot
+     * end up executing vpdpbusd. */
+    int have_vnni = 0;
     int osxsave = 0;
     unsigned long long xcr0 = 0;
 
@@ -54,6 +62,7 @@ int main(void) {
         CPUIDX(info, 7, 0);
         have_avx2    = (info[1] >>  5) & 1; /* EBX bit  5: AVX2  */
         have_avx512f = (info[1] >> 16) & 1; /* EBX bit 16: AVX512F */
+        have_vnni    = (info[2] >> 11) & 1; /* ECX bit 11: AVX512_VNNI */
     }
 
     /* CPUID alone is not sufficient. The OS must also have enabled the vector
@@ -79,10 +88,13 @@ int main(void) {
     if ((xcr0 & 0xE0) != 0xE0) {
         have_avx512f = 0;
     }
+    /* VNNI is part of the AVX-512 family: no ZMM state means no vpdpbusd. */
+    if (!have_avx512f) have_vnni = 0;
 
     if (have_fma)      printf("fma ");
     if (have_f16c)     printf("f16c ");
     if (have_avx512f)  printf("avx512f ");
+    if (have_vnni)     printf("vnni ");
     if (have_avx2)     printf("avx2 ");
     if (have_avx)      printf("avx ");
     printf("\n");
