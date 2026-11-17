@@ -2461,7 +2461,7 @@ void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
      * device-resident from model load. Only the activation needs per-call H2D
      * (~20KB) instead of picolm_gpu_ssm_vecdot()'s ~255KB weight re-upload. */
     int ssm_vecdot_gpu_ready = 0;
-    if (gpu_lw && m->gpu.active) {
+    if (gpu_lw && m->gpu.active && m->gpu.kv_active) {
         size_t vx_bytes = (size_t)dim * sizeof(float);
         size_t vout_bytes = (size_t)n_v_heads * sizeof(float);
         if (ssm_vecdot_dev_scratch_ensure(m->gpu.device, vx_bytes, vout_bytes) &&
@@ -2595,7 +2595,17 @@ void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
 #ifdef PICOLM_GPU
     if (1) {
         int rec_done = 0;
-        if (m->gpu.ssm_state_dev[il]) {
+        /* Only treat the device recurrence state as authoritative when the GPU
+         * pipeline is actually running. model_core.c pre-allocates (and zeroes)
+         * ssm_state_dev[] for models whose KV cache was vetoed -- e.g. a hybrid
+         * Qwen3.6 with -ctk/-ctv q8_0, where GPU attention requires F16 -- so a
+         * bare non-NULL test is NOT the same as "the device copy is live".
+         * Taking this branch on a pre-allocated-but-unused buffer made the GPU
+         * recurrence the sole writer of state that was never in sync with the
+         * host, which produced cudaErrorIllegalAddress (700) and then a cascade
+         * of bogus OOMs. Requiring kv_active makes the CPU path run normally
+         * instead -- the soft fallback. */
+        if (m->gpu.ssm_state_dev[il] && m->gpu.kv_active) {
             /* m->gpu.ssm_state_dev[il] is the ONLY up-to-date copy of this
              * layer's recurrence state once GPU-native decode is running:
              * picolm_gpu_ssm_recurrence_dev() deliberately never D2H's the
@@ -2675,7 +2685,7 @@ void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
         /* Try GPU gated norm if GPU is active.
          * Note: we pass head_map=NULL so the kernel writes in sequential order.
          * The GGUF v-head remap (do_remap) is handled separately in step 19. */
-        if (gpu_lw && m->gpu.active) {
+        if (gpu_lw && m->gpu.active && m->gpu.kv_active) {
             if (picolm_gpu_ssm_gated_norm(final_output, ssm_output, s->xb2,
                                            norm_w, NULL, head_v_dim, n_v_heads, eps,
                                            m->gpu.device)) {
@@ -6196,17 +6206,6 @@ after_qkv:
             memset(_t, 0, sizeof(_t));
             picolm_gpu_memcpy(_t, bxb_last2, 16, -1, gpu_dev);
             fprintf(stderr, "[GPUT L0 attn_out][:4]={%.6f,%.6f,%.6f,%.6f}\n", _t[0],_t[1],_t[2],_t[3]);
-        }
-
-        /* Debug: read bx after last layer */
-        if (l == c->n_layers - 1 && n_ubatch == 1) {
-            picolm_gpu_sync(gpu_dev);
-            float *dbg_bx = alloca(dim * sizeof(float));
-            picolm_gpu_memcpy(dbg_bx, bx, dim * sizeof(float), -1, gpu_dev);
-            { float rms=0; for(int _i=0;_i<dim;_i++) rms+=dbg_bx[_i]*dbg_bx[_i]; rms=sqrtf(rms/dim);
-              fprintf(stderr,"[GPU L%d FINAL bx] rms=%.4f x[:4]={", l, rms);
-              for(int _i=0;_i<4;_i++) fprintf(stderr,"%.6f ",dbg_bx[_i]);
-              fprintf(stderr, "}\n"); fflush(stderr); }
         }
 
         /* FFN LayerNorm/RMSNorm */

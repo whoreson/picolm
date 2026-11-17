@@ -2275,6 +2275,28 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                         else if (!c->has_ssm) reason = "non-SSM model ineligible";
                         fprintf(stderr, "INFO: GPU KV cache disabled (%s; SSM=%d rope=%d kv_k=%d kv_v=%d)\n",
                                 reason, c->has_ssm, c->rope_type, kv_type_k, kv_type_v);
+                        /* SOFT FALLBACK: run this model purely on the CPU.
+                         *
+                         * Without this, m->gpu.active stays 1 while kv_active is
+                         * 0, and the CPU forward path still installs the uploaded
+                         * GPU weight handles (tensor_set_gpu_tensor) and calls
+                         * model_forward_gpu()/ssm_forward() with gpu_lw set. Those
+                         * dispatch GPU kernels against state that was only
+                         * partially staged, which raised cudaErrorIllegalAddress
+                         * (700). That error is sticky: every later CUDA call --
+                         * including wipes and allocations -- also fails, so the
+                         * user sees a cascade of bogus "reserve OOM" messages and
+                         * eventually either garbage output or the FATAL abort in
+                         * ssm_forward(). Reproduced with a hybrid Qwen3.6 and
+                         * -ctk/-ctv q8_0.
+                         *
+                         * Same treatment the incomplete-upload path already
+                         * applies: clear both flags so every GPU dispatch site
+                         * sees a consistent "not using the GPU" state. The
+                         * weight upload itself is left in place, so a future
+                         * non-F16 GPU attention can build on it without a reload. */
+                        m->gpu.active = 0;
+                        m->gpu.kv_active = 0;
                         /* SSM model: upload small SSM F32 weights to device for the GPU kernels
                          * that are already called from ssm_forward().
                          * These are: ssm_a [dt_rank], ssm_dt [dt_rank], ssm_norm [head_v_dim] per layer.
