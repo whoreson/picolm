@@ -54,7 +54,10 @@
  *   2. Every kernel keeps a remainder loop stepping by KN, so no k % (KN*KU)
  *      alignment requirement is introduced; any k the SGEMM gates accept
  *      (k % KN == 0) stays correct. */
-#define SGEMM_KU 16
+#define SGEMM_KU 16   /* deliberately not #undef'd: several mutually exclusive
+                       * arch blocks (AVX-512 / AVX2 / NEON) use it, and only
+                       * one of them is compiled, so a shared definition keeps
+                       * each one self-sufficient. */
 
 /* ============================================================
  * F32 x F32 tiled GEMM
@@ -1197,7 +1200,6 @@ static void sgemm_bf16_bf16(int m, int n, int k, const uint16_t *A, int lda,
 #undef SGEMM_RM
 #undef SGEMM_RN
 #undef SGEMM_BN
-#undef SGEMM_KU
 
 #elif defined(__AVX__) || defined(__AVX2__)
 #if defined(__FMA__)
@@ -1335,6 +1337,203 @@ static void sgemm_bf16_bf16(int m, int n, int k, const uint16_t *A, int lda,
 #undef SGEMM_BN
 #endif /* AVX2 F16C chain */
 #endif /* AVX__ || AVX2__ chain */
+
+/* ARM NEON has no AVX of any tier, so this is a chain of its own rather than a
+ * further #elif arm -- it is an independent target, not a lower tier. */
+#if defined(__ARM_NEON)
+/* ---- BF16 x F32 and BF16 x BF16 for ARM NEON ----
+ *
+ * BF16 is the top half of an fp32, so "dequantising" it is a zero-extend plus a
+ * 16-bit shift -- the same thing the scalar bf16_to_fp32() and the NEON branch
+ * of vec_dot_bf16_f32() do. bf16x8_to_f32x2() below is the pinned-down version of
+ * that for the GEMM, and it has two forms because they differ 2x in op count:
+ *
+ * One form serves all three tiers: vget_low/high_u16 splits the register into
+ * the two order-preserving halves, vmovl_u16 widens 4 u16 -> 4 u32, vshlq_n_u32
+ * shifts them into place. Every intrinsic used is baseline ARM NEON, present on
+ * armv7 and aarch64 alike, so this needs no per-arch branch and no
+ * __ARM_FEATURE_BF16 -- see bf16x8_to_f32x2() for why the cheaper-looking
+ * reinterpret form (aarch64-only) is wrong. It produces exactly the fp32 values
+ * bf16_to_fp32() produces, so the result does not depend on the SIMD tier.
+ *
+ * The k loop is unrolled by SGEMM_KU steps like the x86 kernels: on ARM the
+ * conversion costs 2-3 ops per 8 weights against 4 FMAs, so a single KN-wide
+ * step per iteration leaves nothing to overlap the conversion latency with --
+ * the same stall measured on x86 (see the SGEMM_KU note at the top of the
+ * file). Same accumulators, same order, so the result does not change.
+ */
+
+/* 8 bf16 -> 2 x f32x4: lo = weights 0..3, hi = weights 4..7, i.e. the fp32
+ * values bf16_to_fp32() produces, in order.
+ *
+ * ORDER MATTERS. The tempting aarch64 trick -- reinterpret the 8x u16 vector as
+ * 4x u32, which already has bf16[i] in the top half of u32 lane i, and shift --
+ * deinterleaves the weights to 0,2,4,6 / 1,3,5,7, because lane i packs the pair
+ * (b[2i+1]:b[2i]). That silently multiplies each weight by the WRONG activation
+ * (it is symmetric enough to look plausible: bf16_bf16 still passed its test
+ * because both operands are permuted the same way, while bf16_f32 produced
+ * garbage). Widening the two halves separately keeps the order at the same cost
+ * -- 2 ops per 8 weights -- so there is nothing to gain from the other form. */
+static inline void bf16x8_to_f32x2(const uint16_t *p, float32x4_t *lo, float32x4_t *hi) {
+    uint16x8_t v = vld1q_u16(p);
+    /* bf16 -> fp32 is a zero-extend plus a 16-bit shift: the 16 bits are the top
+     * half (sign, exponent, 7 mantissa bits) of the fp32. */
+    *lo = vreinterpretq_f32_u32(vshlq_n_u32(vmovl_u16(vget_low_u16(v)), 16));
+    *hi = vreinterpretq_f32_u32(vshlq_n_u32(vmovl_u16(vget_high_u16(v)), 16));
+}
+
+static void sgemm_bf16_f32(int m, int n, int k, const uint16_t *A, int lda,
+                            const float *B, int ldb, float *C, int ldc,
+                            int ith, int nth) {
+#define NEONBF16_KN 8
+#define NEONBF16_RM 4
+#define NEONBF16_RN 6
+#define NEONBF16_BN 12
+    /* KN=8 because one unrolled step consumes 8 bf16 weights and produces two
+     * f32x4 accumulations. The gate in picolm_sgemm() requires k % KN == 0. */
+    const int64_t KN=8, RM=4, RN=6, BN=12;
+    (void)BN;
+    int64_t BM=SGEMM_PICK_BM(m,RM,nth);
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
+    int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+    /* One KN-wide k step of the RM x RN tile: convert the RM weight rows, then
+     * FMA every (row, col) pair against the fp32 activations. */
+#define SGEMM_BF16F32_STEP(Cv, off) do {                                     \
+        float32x4_t Alo[RM], Ahi[RM];                                        \
+        for(int c=0;c<RM;c++)                                                \
+            bf16x8_to_f32x2(A+lda*(ii+c)+(off), &Alo[c], &Ahi[c]);           \
+        for(int r=0;r<RN;r++) {                                              \
+            float32x4_t B0=vld1q_f32(B+ldb*(jj+r)+(off));                    \
+            float32x4_t B1=vld1q_f32(B+ldb*(jj+r)+(off)+4);                  \
+            for(int c=0;c<RM;c++) {                                          \
+                Cv[r][c]=vfmaq_f32(Cv[r][c],Alo[c],B0);                      \
+                Cv[r][c]=vfmaq_f32(Cv[r][c],Ahi[c],B1);                      \
+            }                                                                \
+        }                                                                    \
+    } while(0)
+    for (int64_t j=js;j<je;j++) {
+        int64_t iib=(j%yt)*RM*BM, jb=j/yt;
+        int64_t jj0=jb*RN, jj2=jj0+RN; if(jj2>n)jj2=n;
+        int64_t jj1=(jb<jR)?jj2:jj0;
+        for (int64_t bi=0;bi<BM*RM;bi+=RM) {
+            int64_t ii=iib+bi;
+            for (int64_t jj=jj0;jj<jj1;jj+=RN) {
+                float32x4_t Cv[NEONBF16_RN][NEONBF16_RM];
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=vdupq_n_f32(0);
+                int64_t l=0;
+                for (;l+KN*SGEMM_KU<=k;l+=KN*SGEMM_KU) {
+#define SGEMM_BF16F32_KU4(base)                                              \
+                    SGEMM_BF16F32_STEP(Cv, (base)+0*KN);                     \
+                    SGEMM_BF16F32_STEP(Cv, (base)+1*KN);                     \
+                    SGEMM_BF16F32_STEP(Cv, (base)+2*KN);                     \
+                    SGEMM_BF16F32_STEP(Cv, (base)+3*KN)
+                    SGEMM_BF16F32_KU4(l);
+                    SGEMM_BF16F32_KU4(l+4*KN);
+                    SGEMM_BF16F32_KU4(l+8*KN);
+                    SGEMM_BF16F32_KU4(l+12*KN);
+#undef SGEMM_BF16F32_KU4
+                }
+                for (;l<k;l+=KN) SGEMM_BF16F32_STEP(Cv, l);
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++)
+                    C[ldc*(jj+r)+(ii+c)]=vaddvq_f32_compat(Cv[r][c]);
+            }
+            for (int64_t jj=jj1;jj<jj2;jj++) {
+                float32x4_t Cv[NEONBF16_RM];
+                for(int c=0;c<RM;c++) Cv[c]=vdupq_n_f32(0);
+                for (int64_t l=0;l<k;l+=KN)
+                    for(int c=0;c<RM;c++) {
+                        float32x4_t lo, hi;
+                        bf16x8_to_f32x2(A+lda*(ii+c)+l, &lo, &hi);
+                        Cv[c]=vfmaq_f32(Cv[c],lo,vld1q_f32(B+ldb*jj+l));
+                        Cv[c]=vfmaq_f32(Cv[c],hi,vld1q_f32(B+ldb*jj+l+4));
+                    }
+                for(int c=0;c<RM;c++) C[ldc*jj+(ii+c)]=vaddvq_f32_compat(Cv[c]);
+            }
+        }
+    }
+#undef SGEMM_BF16F32_STEP
+}
+#undef NEONBF16_KN
+#undef NEONBF16_RM
+#undef NEONBF16_RN
+#undef NEONBF16_BN
+
+/* ---- BF16 x BF16 (BF16 activations) ----
+ * Not used by tensor.c (activations are F32 there), but kept for parity with
+ * the x86 chain and exercised by tests/test_sgemm_bf16_tail.c. */
+static void sgemm_bf16_bf16(int m, int n, int k, const uint16_t *A, int lda,
+                             const uint16_t *B, int ldb, float *C, int ldc,
+                             int ith, int nth) {
+#define NEONBF16_KN 8
+#define NEONBF16_RM 4
+#define NEONBF16_RN 6
+#define NEONBF16_BN 12
+    const int64_t KN=8, RM=4, RN=6, BN=12;
+    (void)BN;
+    int64_t BM=SGEMM_PICK_BM(m,RM,nth);
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
+    int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+#define SGEMM_BF16BF16_STEP(Cv, off) do {                                    \
+        float32x4_t Alo[RM], Ahi[RM];                                        \
+        for(int c=0;c<RM;c++)                                                \
+            bf16x8_to_f32x2(A+lda*(ii+c)+(off), &Alo[c], &Ahi[c]);           \
+        for(int r=0;r<RN;r++) {                                              \
+            float32x4_t Blo, Bhi;                                            \
+            bf16x8_to_f32x2(B+ldb*(jj+r)+(off), &Blo, &Bhi);                 \
+            for(int c=0;c<RM;c++) {                                          \
+                Cv[r][c]=vfmaq_f32(Cv[r][c],Alo[c],Blo);                     \
+                Cv[r][c]=vfmaq_f32(Cv[r][c],Ahi[c],Bhi);                     \
+            }                                                                \
+        }                                                                    \
+    } while(0)
+    for (int64_t j=js;j<je;j++) {
+        int64_t iib=(j%yt)*RM*BM, jb=j/yt;
+        int64_t jj0=jb*RN, jj2=jj0+RN; if(jj2>n)jj2=n;
+        int64_t jj1=(jb<jR)?jj2:jj0;
+        for (int64_t bi=0;bi<BM*RM;bi+=RM) {
+            int64_t ii=iib+bi;
+            for (int64_t jj=jj0;jj<jj1;jj+=RN) {
+                float32x4_t Cv[NEONBF16_RN][NEONBF16_RM];
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=vdupq_n_f32(0);
+                int64_t l=0;
+                for (;l+KN*SGEMM_KU<=k;l+=KN*SGEMM_KU) {
+#define SGEMM_BF16BF16_KU4(base)                                             \
+                    SGEMM_BF16BF16_STEP(Cv, (base)+0*KN);                    \
+                    SGEMM_BF16BF16_STEP(Cv, (base)+1*KN);                    \
+                    SGEMM_BF16BF16_STEP(Cv, (base)+2*KN);                    \
+                    SGEMM_BF16BF16_STEP(Cv, (base)+3*KN)
+                    SGEMM_BF16BF16_KU4(l);
+                    SGEMM_BF16BF16_KU4(l+4*KN);
+                    SGEMM_BF16BF16_KU4(l+8*KN);
+                    SGEMM_BF16BF16_KU4(l+12*KN);
+#undef SGEMM_BF16BF16_KU4
+                }
+                for (;l<k;l+=KN) SGEMM_BF16BF16_STEP(Cv, l);
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++)
+                    C[ldc*(jj+r)+(ii+c)]=vaddvq_f32_compat(Cv[r][c]);
+            }
+            for (int64_t jj=jj1;jj<jj2;jj++) {
+                float32x4_t Cv[NEONBF16_RM];
+                for(int c=0;c<RM;c++) Cv[c]=vdupq_n_f32(0);
+                for (int64_t l=0;l<k;l+=KN)
+                    for(int c=0;c<RM;c++) {
+                        float32x4_t alo, ahi, blo, bhi;
+                        bf16x8_to_f32x2(A+lda*(ii+c)+l, &alo, &ahi);
+                        bf16x8_to_f32x2(B+ldb*jj+l, &blo, &bhi);
+                        Cv[c]=vfmaq_f32(Cv[c],alo,blo);
+                        Cv[c]=vfmaq_f32(Cv[c],ahi,bhi);
+                    }
+                for(int c=0;c<RM;c++) C[ldc*jj+(ii+c)]=vaddvq_f32_compat(Cv[c]);
+            }
+        }
+    }
+#undef SGEMM_BF16BF16_STEP
+}
+#undef NEONBF16_KN
+#undef NEONBF16_RM
+#undef NEONBF16_RN
+#undef NEONBF16_BN
+#endif /* __ARM_NEON (BF16) */
 
 /* ============================================================
  * Quantized GEMM kernels (Q8_0 x Q8_0, Q4_0 x Q8_0, Q5_0 x Q8_0)
@@ -3072,12 +3271,19 @@ int picolm_sgemm(int m, int n, int k,
 #endif
     }
 
-    /* BF16 weights: A=BF16 (uint16), B=F32 or BF16 */
+    /* BF16 weights: A=BF16 (uint16), B=F32 or BF16.
+     *
+     * k must be a multiple of the kernel's KN (16 on AVX-512, 8 on AVX2 and
+     * NEON): the kernels load whole KN-wide vectors and have no scalar tail for
+     * the weights. m must be a multiple of RM=4 -- the row grid is
+     * yt = m/(RM*BM), which silently drops a partial block otherwise. */
     if (Atype == GGUF_TYPE_BF16) {
         if (Btype == GGUF_TYPE_F32) {
 #if defined(__AVX512F__)
             if (k % 16 == 0 && m % 4 == 0) { sgemm_bf16_f32(m,n,k,(const uint16_t*)A,lda,(const float*)B,ldb,C,ldc,ith,nth); return 1; }
 #elif defined(__AVX2__)
+            if (k % 8 == 0 && m % 4 == 0) { sgemm_bf16_f32(m,n,k,(const uint16_t*)A,lda,(const float*)B,ldb,C,ldc,ith,nth); return 1; }
+#elif defined(__ARM_NEON)
             if (k % 8 == 0 && m % 4 == 0) { sgemm_bf16_f32(m,n,k,(const uint16_t*)A,lda,(const float*)B,ldb,C,ldc,ith,nth); return 1; }
 #endif
         }
@@ -3085,6 +3291,8 @@ int picolm_sgemm(int m, int n, int k,
 #if defined(__AVX512F__)
             if (k % 16 == 0 && m % 4 == 0) { sgemm_bf16_bf16(m,n,k,(const uint16_t*)A,lda,(const uint16_t*)B,ldb,C,ldc,ith,nth); return 1; }
 #elif defined(__AVX2__)
+            if (k % 8 == 0 && m % 4 == 0) { sgemm_bf16_bf16(m,n,k,(const uint16_t*)A,lda,(const uint16_t*)B,ldb,C,ldc,ith,nth); return 1; }
+#elif defined(__ARM_NEON)
             if (k % 8 == 0 && m % 4 == 0) { sgemm_bf16_bf16(m,n,k,(const uint16_t*)A,lda,(const uint16_t*)B,ldb,C,ldc,ith,nth); return 1; }
 #endif
         }
