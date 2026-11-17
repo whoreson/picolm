@@ -968,6 +968,15 @@ static void sgemm_f16_f16(int m, int n, int k, const uint16_t *A, int lda,
     }
 }
 #undef SGEMM_FMA
+/* The NEON block above defined SGEMM_KN/RM/RN/BN and never undefined them, so
+ * the FP16-arithmetic kernel below redefines them and gcc warns
+ *   "SGEMM_KN" redefined ... note: this is the location of the previous definition
+ * (seen on the aarch64 CI runner). Undef the shared names here, matching what
+ * the AVX-512 and AVX2 chains do. */
+#undef SGEMM_KN
+#undef SGEMM_RM
+#undef SGEMM_RN
+#undef SGEMM_BN
 #endif
 #elif defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
 static void sgemm_f16_f16(int m, int n, int k, const uint16_t *A, int lda,
@@ -3333,10 +3342,27 @@ int picolm_sgemm_bf16_panel_build(void *panel, const float *B, int n, int k, int
         const float *src = B + (int64_t)(r * ldb);
         uint16_t *dst = bb + (size_t)r * (size_t)k;
         int64_t i = 0;
-        for (; i + 4 <= k; i += 4)
-            vst1_u16(dst + i, vcvt_bf16_f32(vld1q_f32(src + i)));
+        /* f32 -> bf16, four lanes at a time, WITHOUT relying on the ARM BF16
+         * extension.
+         *
+         * bf16 is just the top 16 bits of an fp32, so the whole conversion is a
+         * shift plus a round-to-nearest-even bias -- the same arithmetic the
+         * scalar tail below does, which is why the two agree exactly.
+         *
+         * Deliberately not vcvt_bf16_f32()/vcvtnq_bf16_f32(): the first returns
+         * bfloat16x4_t, which cannot be passed straight to vst1_u16() (a hard
+         * error on the aarch64 CI runner, gcc 13), and the second only exists
+         * when the compiler enables the BF16 ISA, which -march=native does not
+         * do on every ARM core (e.g. the Pi 4). integer shifts are baseline
+         * NEON on armv7 and aarch64 alike. */
+        for (; i + 4 <= k; i += 4) {
+            uint32x4_t u = vreinterpretq_u32_f32(vld1q_f32(src + i));
+            uint32x4_t lsb = vandq_u32(vshrq_n_u32(u, 16), vdupq_n_u32(1u));
+            uint32x4_t rnd = vaddq_u32(vaddq_u32(u, vdupq_n_u32(0x7fffu)), lsb);
+            vst1_u16(dst + i, vmovn_u32(vshrq_n_u32(rnd, 16)));
+        }
         for (; i < k; i++) {
-            /* Scalar tail: round-to-nearest-even, as vcvt_bf16_f32 does. */
+            /* Scalar tail: round-to-nearest-even, matching the vector body. */
             union { float f; uint32_t u; } v;
             v.f = src[i];
             uint32_t lsb = (v.u >> 16) & 1u;
