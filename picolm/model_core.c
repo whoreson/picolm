@@ -1863,13 +1863,20 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
     if (picolm_gpu_tensor_upload(&gl->name, lw->name, lw->type ## _ ## name, (I), (O), device)) uploaded++; \
 } while(0)
 
-                /* Attention Q/K/V/O: only exist for attention layers, and only
-                 * when the model keeps them separate. SSM layers use a fused
-                 * attn_qkv instead, and so does Spark-X2.5 -- without the
-                 * lw->attn_q guard each Spark layer contributed four failed
-                 * upload attempts (108 tensors across 36 layers), which both
-                 * inflated `attempted` and made the completeness check fire on
-                 * tensors that were never meant to exist. */
+                /* Attention Q/K/V: only exist for attention layers, and only
+                 * when the model keeps them SEPARATE. SSM layers and GPT-2 /
+                 * Spark-X2.5 use a fused attn_qkv instead, so attempting q/k/v
+                 * there just adds guaranteed-failed uploads which inflate
+                 * `attempted` and make the completeness check fire on tensors
+                 * the model never had.
+                 *
+                 * attn_output is NOT part of that group: every attention model
+                 * has it, including the fused-QKV ones. It must stay outside
+                 * this guard -- tying it to lw->attn_q (which GPT-2 does not
+                 * have) left gl->attn_output NULL, so picolm_gpu_matmul_dev()
+                 * returned 0 at its `!t` check, the caller ignored the failure,
+                 * and the layer silently reused the previous buffer contents.
+                 * That is the GPT-2-on-CUDA garbage-output bug. */
                 if (lw->attn_q && (lw->is_attn_layer || !c->has_ssm)) {
                     /* Attention Q: [q_dim, n_embd] for dense, [q_full_dim, n_embd] for SSM attn */
                     attempted++;
@@ -1884,7 +1891,10 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                     attempted++;
                     if (picolm_gpu_tensor_upload(&gl->attn_v,
                             lw->attn_v, lw->type_attn_v, c->n_embd, kv_dim, device)) uploaded++;
-                    /* Attention O: [n_embd, q_dim] */
+                }
+                /* Attention O: [n_embd, q_dim] -- present on every attention
+                 * model, fused-QKV or not. */
+                if (lw->attn_output && (lw->is_attn_layer || !c->has_ssm)) {
                     attempted++;
                     if (picolm_gpu_tensor_upload(&gl->attn_output,
                             lw->attn_output, lw->type_attn_output, q_dim, c->n_embd, device)) uploaded++;

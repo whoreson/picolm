@@ -6186,8 +6186,18 @@ after_qkv:
             fprintf(stderr, "[L0DBG battn_out][:4]={%.6f,%.6f,%.6f,%.6f}\n", _ao[0],_ao[1],_ao[2],_ao[3]);
         }
         /* Output projection */
-        picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_output,
-                               bxb, battn_out, n_ubatch, gpu_dev, xb_stride, attn_out_stride);
+        /* Ignoring this return value hid the GPT-2 bug for a long time: a NULL
+         * attn_output handle made picolm_gpu_matmul_dev() decline, bxb kept the
+         * previous layer stage's contents, and the model produced fluent-looking
+         * garbage instead of an error. Fail loudly instead -- the caller already
+         * treats a non-zero return as "fall back to the CPU". */
+        if (!picolm_gpu_matmul_dev((picolm_gpu_tensor_t *)gl->attn_output,
+                                   bxb, battn_out, n_ubatch, gpu_dev, xb_stride, attn_out_stride)) {
+            fprintf(stderr, "ERROR: GPU attn_output projection declined at layer %d "
+                    "(S=%d I=%d O=%d) -- falling back to CPU\n",
+                    l, n_ubatch, q_dim, dim);
+            return -1;
+        }
         /* GPT-2 attn output bias */
         if (gw->attn_output_bias_dev[l]) {
             for (int bi = 0; bi < n_ubatch; bi++) {
