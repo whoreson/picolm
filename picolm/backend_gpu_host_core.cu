@@ -573,8 +573,14 @@ int picolm_gpu_tensor_upload(void **tensor,
                 case 41: qname = "Q1_0"; break;
                 case 42: qname = "Q2_0"; break;
             }
-            fprintf(stderr, "[GPU] upload: %s (type %d) native, copied to GPU (%zu MB)\n",
-                    qname, qtype, total / (1024*1024));
+            /* Print the real size. Integer MB truncation made a 256-byte F32
+             * vector print as "0 MB", which reads like a bug in the upload. */
+            if (total >= 1024 * 1024 || getenv("PICOLM_UPLOAD_DBG"))
+                fprintf(stderr, "[GPU] upload: %s (type %d) native, copied to GPU (%.2f MB, %zu bytes)\n",
+                        qname, qtype, (double)total / (1024.0 * 1024.0), total);
+            else
+                fprintf(stderr, "[GPU] upload: %s (type %d) native, copied to GPU (%zu bytes)\n",
+                        qname, qtype, total);
             seen_count++;
         }
     }
