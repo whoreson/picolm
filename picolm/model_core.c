@@ -5260,6 +5260,23 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
                 orig, n_tokens, start_pos, m->config.max_seq_len);
     }
 
+    /* A one-token prefill is a decode step.
+     *
+     * The batched prefill paths below are built around amortising one weight
+     * pass over many activation columns, and they are only *validated* against
+     * the per-token forward. For n_tokens == 1 the amortisation is zero and the
+     * batched bookkeeping is pure overhead (on GLM-5: 441 ms per token through
+     * model_forward_prefill() vs 269 ms through model_forward()).
+     *
+     * This is not a corner case: the HTTP server's checkpoint-driven chunking
+     * cuts the prefill at n_prompt - checkpoint_tail_offset to keep a rewind
+     * point one token before the end, so every server request ends with a
+     * 1-token chunk. Routing it to model_forward() also makes the output of
+     * that last token identical to the decode path's, by construction. */
+    if (n_tokens == 1) {
+        return model_forward(m, tokens[0], start_pos);
+    }
+
     /* TODO: Gemma-3n batched prefill not yet implemented -- falls back to per-token forward */
     if (m->config.is_gemma3n) {
         g_is_prefill = 1;

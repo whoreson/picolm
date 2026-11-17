@@ -1315,8 +1315,22 @@ static float *prefill_with_checkpoints(SOCKET sock, model_t *model,
             chunk_size = (remaining < ubatch_size) ? remaining : ubatch_size;
         }
 
-        logits = server_model_prefill(model, tokens + offset, chunk_size, cur_pos,
-                                      client_check ? &interrupt : NULL);
+        {
+            static int chunk_dbg = -1;
+            if (chunk_dbg < 0) chunk_dbg = getenv("PICOLM_PREFILL_CHUNK_DBG") ? 1 : 0;
+            double chunk_t0 = chunk_dbg ? get_time_ms() : 0.0;
+            logits = server_model_prefill(model, tokens + offset, chunk_size, cur_pos,
+                                          client_check ? &interrupt : NULL);
+            /* PICOLM_PREFILL_CHUNK_DBG=1: one line per prefill chunk with its
+             * wall time. Prefill cost is per-chunk, not per-token, so this is
+             * the only way to notice that e.g. a 1-token tail chunk (created
+             * by the checkpoint_tail_offset cut) costs as much as a chunk of
+             * real work. */
+            if (chunk_dbg) {
+                fprintf(stderr, "[prefill chunk] pos=%d n=%d %.1fms\n",
+                        cur_pos, chunk_size, get_time_ms() - chunk_t0);
+            }
+        }
         if (!logits) {
             *out_n_processed = n_processed;
             return NULL;

@@ -3106,6 +3106,38 @@ static void qgemm_d_task(int idx, void *ctxp) {
     }
 }
 
+/* Threaded dispatch of the UNQUANTIZED GEMMs: F32/F16/BF16 weights.
+ *
+ * These all have act_fmt == ACT_FMT_F32 (no activation quantization), and
+ * matmul_batch() used to call picolm_sgemm() once with ith=0, nth=1 -- i.e.
+ * the entire GEMM ran on the calling thread with every pool worker asleep.
+ * Measured on Spark-X2.6-1.7B-bf16 (Xeon Silver, 24 threads): prefill was
+ * 9.5 tok/s and -j1 / -j24 were indistinguishable; the same model quantized
+ * to Q8_0_R8 pre-fills at 447 tok/s. The kernels were never the problem --
+ * sgemm_bf16_f32() is written for ith/nth slicing (JSTART/JEND over the
+ * m-tile x n-tile space) and simply was never asked to use it.
+ *
+ * Same shape as qgemm_d_task: idx is both the work-slice id and the thread id
+ * of the same-named pool dispatch, and picolm_sgemm() returns 0 *before*
+ * touching C when the type/shape has no kernel, so a failed probe leaves the
+ * output buffer clean for the caller's fallback. */
+typedef struct {
+    int m, n, k;
+    const void *A; int lda;
+    const float *B; int ldb;
+    float *C; int ldc;
+    gguf_type_t Atype;
+    int nth;
+    int failed;
+} f32_gemm_ctx_t;
+
+static void f32_gemm_task(int idx, void *ctxp) {
+    f32_gemm_ctx_t *c = (f32_gemm_ctx_t *)ctxp;
+    if (!picolm_sgemm(c->m, c->n, c->k, c->A, c->lda, c->B, c->ldb, c->C, c->ldc,
+                      (int)c->Atype, GGUF_TYPE_F32, idx, c->nth))
+        c->failed = 1;
+}
+
 /* Dual-matrix GEMM task: fuses two same-shape GEMMs (e.g. FFN gate + up)
  * into one tensor_parallel_for dispatch to halve barrier overhead.
  * Thread idx in [0, nth) -> matrix A1/C1, idx in [nth, 2*nth) -> A2/C2. */
@@ -3476,20 +3508,94 @@ void matmul_batch(float *out, const float *x, int n_batch,
         }
     }
 #endif
+    /* Batch of one IS a decode step: hand it to matmul().
+     *
+     * Every kernel below is chosen for amortising one weight pass over several
+     * activation columns; with n_batch==1 there is nothing to amortise and the
+     * decisions invert:
+     *   - the table GEMM is gated on n_batch >= 2 (or an interleaved type), so
+     *     plain types drop into the per-row threaded_worker,
+     *   - the qgemm_d path is gated on n_batch >= 2 as well,
+     *   - the F32 branch above sends it to the *serial* vec_dot loop.
+     * matmul() is the tuned single-token path: fn_gemv per row plus dynamic
+     * chunk stealing, and it is the path the decode loop -- i.e. the reference
+     * implementation every batching change is validated against -- already
+     * uses. Both sides call the same fn_gemv on the same activation layout
+     * (quant_activations_ex with amax deltas, appended after the blocks), so
+     * this is bit-identical: per-row dots do not depend on how the rows are
+     * partitioned across threads.
+     *
+     * This matters in practice: the server's checkpoint-driven prefill chunks
+     * at n_prompt - tail_offset, which leaves a 1-token tail chunk on every
+     * request, and GLM-5's batched prefill issues ~150 matmul_batch calls per
+     * layer. Those used to cost 441 ms/token through threaded_worker instead
+     * of 269 ms through the decode path.
+     * (PICOLM_NO_BATCH1_MATMUL=1 restores the old dispatch for A/B testing.) */
+    if (n_batch == 1) {
+        static int batch1_off = -1;
+        if (batch1_off < 0) batch1_off = getenv("PICOLM_NO_BATCH1_MATMUL") ? 1 : 0;
+        if (!batch1_off) {
+            matmul(out, x, W, n, d, qtype);
+            DISPATCH("batch1->matmul");
+            return;
+        }
+    }
+
     const type_info_t *ti = typeinfo(qtype);
     size_t row_bytes = gguf_type_row_size(qtype, n);
     const char *wptr = (const char *)W;
 
-    /* F32/F16: tiled GEMM */
+    /* F32/F16/BF16: tiled GEMM, threaded across the pool.
+     *
+     * The kernels slice the (m-tile x n-tile) work space by ith/nth, so all
+     * we have to do is hand each worker its own idx. Probing support and
+     * running the work are the same call: picolm_sgemm() returns 0 before
+     * writing anything when the type/shape has no kernel, so `failed` means
+     * "nothing was computed" and the vec_dot fallback below is safe.
+     *
+     * Never dispatch more slices than there are output columns: the kernels
+     * split the column space as xt*ith/nth, so nth > ncols leaves *every*
+     * thread with an empty range instead of just the surplus ones (same trap
+     * gemm_table_task documents for fn_gemm). */
     if (!ti || ti->act_fmt == ACT_FMT_F32) {
-        if (picolm_sgemm(d, n_batch, n, wptr, n, x, n, out, d, qtype, GGUF_TYPE_F32, 0, 1)) {
+        int nth = ntl > 1 ? pool_total_threads(ntl) : 1;
+        if (nth > n_batch) nth = n_batch;
+        if (nth < 1) nth = 1;
+        if (nth > 1) {
+            f32_gemm_ctx_t fctx = {
+                .m = d, .n = n_batch, .k = n,
+                .A = wptr, .lda = n,
+                .B = x, .ldb = n,
+                .C = out, .ldc = d,
+                .Atype = qtype, .nth = nth, .failed = 0,
+            };
+            /* Label the region for PICOLM_THREAD_PROF: one task function serves
+             * every projection, so without this the table lumps FFN and attention
+             * GEMMs of different shapes into one meaningless row. */
+            char lbl[160];
+            snprintf(lbl, sizeof lbl, "gemm %s d=%d n=%d k=%d",
+                     qtype_short_name(qtype), d, n_batch, n);
+            tensor_set_region_label(lbl);
+            tensor_parallel_for(nth, f32_gemm_task, &fctx);
+            tensor_set_region_label(NULL);
+            if (!fctx.failed) {
+                if (prof_active) { double dt = picolm_now()-t0; prof_f32_gemm+=dt; cnt_f32_gemm++;
+                    prof_shape_add(d, n, n_batch, dt); }
+                DISPATCH("SGEMM_F32_threaded");
+                return;
+            }
+            DISPATCH("SGEMM_F32_threaded_failed");
+        } else if (picolm_sgemm(d, n_batch, n, wptr, n, x, n, out, d, qtype, GGUF_TYPE_F32, 0, 1)) {
             if (prof_active) { double dt = picolm_now()-t0; prof_f32_gemm+=dt; cnt_f32_gemm++;
                 prof_shape_add(d, n, n_batch, dt); }
             DISPATCH("SGEMM_F32");
             return;
         }
-        /* Fall back to generic vec_dot (also when nested, to avoid pool corruption) */
-        if (ntl <= 1 || n_batch <= 4 || d < matmul_min_rows) {
+        /* Fall back to generic vec_dot (also when nested, to avoid pool corruption).
+         * n_batch <= 4 used to short-circuit here even for large d, which sent
+         * e.g. a 4096x4096 BF16 projection of 4 tokens through one thread. The
+         * threshold now only applies when d is too small to be worth threading. */
+        if (ntl <= 1 || d < matmul_min_rows) {
             for (int b = 0; b < n_batch; b++)
                 for (int i = 0; i < d; i++)
                     out[b * d + i] = vec_dot(wptr + (size_t)i * row_bytes, x + (size_t)b * n, n, qtype);

@@ -4076,7 +4076,13 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
     static int no_batch = -1;
     if (no_batch < 0) no_batch = getenv("PICOLM_GLM5_NO_BATCH") ? 1 : 0;
     float *pf = s->glm5.prefill_buf;
-    if (no_batch || !pf || n_tokens > s->glm5.prefill_n_tokens) {
+    /* n_tokens == 1: the batched layout buys nothing and the per-token path is
+     * both faster (no S-stream arena traffic, no batched KDA scaffolding) and
+     * the one the batched path is validated against. model_forward_prefill()
+     * already redirects the n_tokens==1 case here; do it again so direct
+     * callers of this function (and a 1-token chunk remainder left by the
+     * GLM5_PREFILL_MAX_TOKENS split above) take the same route. */
+    if (no_batch || n_tokens == 1 || !pf || n_tokens > s->glm5.prefill_n_tokens) {
         /* Per-token fallback via the GLM-5 per-token forward
          * (model_forward_glm5 is in this file, so the standalone
          * test_glm5_dsa probe can link). */

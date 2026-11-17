@@ -913,6 +913,32 @@ test_batch_multi: tests/test_batch_multi.c tensor.c type_dispatch.c quant.c $(SG
 check-batch-multi: test_batch_multi
 	./test_batch_multi
 
+# matmul_batch(n_batch=1) must equal matmul() bit-for-bit. This is the invariant
+# that lets tensor.c route a batch of one to the single-token GEMV path instead
+# of the table-GEMM gates (which all require n_batch >= 2) and the per-row
+# threaded_worker fallback behind them. The server's checkpoint-driven prefill
+# produces a 1-token tail chunk on every request, so this path is hot.
+# Synthetic weights, no model file needed.
+test_batch1_equals_matmul: tests/test_batch1_equals_matmul.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) model.h
+	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O3 -o $@ tests/test_batch1_equals_matmul.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
+
+.PHONY: check-batch1
+check-batch1: test_batch1_equals_matmul
+	./test_batch1_equals_matmul 1
+	./test_batch1_equals_matmul 8
+
+# The BF16 GEMMs unroll their k loop and finish the remainder separately, so a
+# mismatch between the loop advance and the number of emitted steps silently
+# skips a slice of k (and still returns plausible numbers). This checks every
+# k-shape against a double-precision reference. The AVX-512 kernels are the ones
+# that unroll; other builds still run the test via the scalar/tail paths.
+test_sgemm_bf16_tail: tests/test_sgemm_bf16_tail.c quant.c $(SGEMM_SRCS)
+	$(CC) $(TEST_NATIVE_CFLAGS) -I. -o $@ tests/test_sgemm_bf16_tail.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
+
+.PHONY: check-sgemm-bf16
+check-sgemm-bf16: test_sgemm_bf16_tail
+	./test_sgemm_bf16_tail
+
 test_glm5_moe_ep: tests/test_glm5_moe_ep.c model_glm5.c model_moe.c model_ssm.c model_kv_cache.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) model.h
 	$(CC) $(TEST_NATIVE_CFLAGS) -I. -O3 -o $@ tests/test_glm5_moe_ep.c model_moe.c model_ssm.c model_kv_cache.c tensor.c type_dispatch.c quant.c $(SGEMM_SRCS) -lm -lpthread -fopenmp -lstdc++
 
@@ -1040,6 +1066,7 @@ check-rowinterleave: test_rowinterleave
 check-all: check-hreduce check-kvcache-tokwrite check-quant check-q6-k-r4 \
            check-attn-tail \
            check-rowinterleave check-r8-simd check-r4-gemv check-iq3xxs-r4 check-iq-gemv \
+           check-batch1 check-sgemm-bf16 \
            check-glm5-dsa check-glm5-snapshot check-attn check-attn-decode check-pool
 	@echo ""
 	@echo "=== check-all: all self-contained suites passed ==="
