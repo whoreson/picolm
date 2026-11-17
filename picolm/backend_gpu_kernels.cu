@@ -1749,14 +1749,24 @@ picolm_q4_1_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
         }
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 300
         {
-            unsigned mask = 0xF << (gid * 4);
-            sq0 += gpuShflDownSync(mask, sq0, 2);
-            sq1 += gpuShflDownSync(mask, sq1, 2);
-            sq0 += gpuShflDownSync(mask, sq0, 1);
-            sq1 += gpuShflDownSync(mask, sq1, 1);
-            /* Broadcast reduced sums to all threads in the group */
-            sq0 = gpuShflSync(mask, sq0, 0);
-            sq1 = gpuShflSync(mask, sq1, 0);
+            /* Reduce over the 4 lanes of this group (lanes gid*4..gid*4+3)
+             * and broadcast the total to all of them.
+             *
+             * The mask must name the whole warp. All 32 lanes execute these
+             * calls, and __shfl_*_sync requires that every lane in the mask
+             * takes part; a per-group mask (0xF << gid*4) makes lanes holding
+             * DIFFERENT masks join the same collective, which is undefined
+             * behaviour. Grouping is expressed by WIDTH=4 instead: that splits
+             * the warp into 8 independent 4-lane sub-groups and makes both the
+             * down-shuffle and the broadcast group-relative, so srcLane 0 means
+             * "lane 0 of this group" rather than lane 0 of the warp. */
+            const unsigned mask = 0xFFFFFFFFu;
+            sq0 += gpuShflDownSync(mask, sq0, 2, 4);
+            sq1 += gpuShflDownSync(mask, sq1, 2, 4);
+            sq0 += gpuShflDownSync(mask, sq0, 1, 4);
+            sq1 += gpuShflDownSync(mask, sq1, 1, 4);
+            sq0 = gpuShflSync(mask, sq0, 0, 4);
+            sq1 = gpuShflSync(mask, sq1, 0, 4);
         }
 #endif
 
@@ -2100,14 +2110,24 @@ picolm_q5_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
         }
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 300
         {
-            unsigned mask = 0xF << (gid * 4);
-            sq0 += gpuShflDownSync(mask, sq0, 2);
-            sq1 += gpuShflDownSync(mask, sq1, 2);
-            sq0 += gpuShflDownSync(mask, sq0, 1);
-            sq1 += gpuShflDownSync(mask, sq1, 1);
-            /* Broadcast reduced sums to all threads in the group */
-            sq0 = gpuShflSync(mask, sq0, 0);
-            sq1 = gpuShflSync(mask, sq1, 0);
+            /* Reduce over the 4 lanes of this group (lanes gid*4..gid*4+3)
+             * and broadcast the total to all of them.
+             *
+             * The mask must name the whole warp. All 32 lanes execute these
+             * calls, and __shfl_*_sync requires that every lane in the mask
+             * takes part; a per-group mask (0xF << gid*4) makes lanes holding
+             * DIFFERENT masks join the same collective, which is undefined
+             * behaviour. Grouping is expressed by WIDTH=4 instead: that splits
+             * the warp into 8 independent 4-lane sub-groups and makes both the
+             * down-shuffle and the broadcast group-relative, so srcLane 0 means
+             * "lane 0 of this group" rather than lane 0 of the warp. */
+            const unsigned mask = 0xFFFFFFFFu;
+            sq0 += gpuShflDownSync(mask, sq0, 2, 4);
+            sq1 += gpuShflDownSync(mask, sq1, 2, 4);
+            sq0 += gpuShflDownSync(mask, sq0, 1, 4);
+            sq1 += gpuShflDownSync(mask, sq1, 1, 4);
+            sq0 = gpuShflSync(mask, sq0, 0, 4);
+            sq1 = gpuShflSync(mask, sq1, 0, 4);
         }
 #endif
 
@@ -2269,14 +2289,24 @@ picolm_q4_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
         }
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 300
         {
-            unsigned mask = 0xF << (gid * 4);
-            sq0 += gpuShflDownSync(mask, sq0, 2);
-            sq1 += gpuShflDownSync(mask, sq1, 2);
-            sq0 += gpuShflDownSync(mask, sq0, 1);
-            sq1 += gpuShflDownSync(mask, sq1, 1);
-            /* Broadcast reduced sums to all threads in the group */
-            sq0 = gpuShflSync(mask, sq0, 0);
-            sq1 = gpuShflSync(mask, sq1, 0);
+            /* Reduce over the 4 lanes of this group (lanes gid*4..gid*4+3)
+             * and broadcast the total to all of them.
+             *
+             * The mask must name the whole warp. All 32 lanes execute these
+             * calls, and __shfl_*_sync requires that every lane in the mask
+             * takes part; a per-group mask (0xF << gid*4) makes lanes holding
+             * DIFFERENT masks join the same collective, which is undefined
+             * behaviour. Grouping is expressed by WIDTH=4 instead: that splits
+             * the warp into 8 independent 4-lane sub-groups and makes both the
+             * down-shuffle and the broadcast group-relative, so srcLane 0 means
+             * "lane 0 of this group" rather than lane 0 of the warp. */
+            const unsigned mask = 0xFFFFFFFFu;
+            sq0 += gpuShflDownSync(mask, sq0, 2, 4);
+            sq1 += gpuShflDownSync(mask, sq1, 2, 4);
+            sq0 += gpuShflDownSync(mask, sq0, 1, 4);
+            sq1 += gpuShflDownSync(mask, sq1, 1, 4);
+            sq0 = gpuShflSync(mask, sq0, 0, 4);
+            sq1 = gpuShflSync(mask, sq1, 0, 4);
         }
 #endif
 
