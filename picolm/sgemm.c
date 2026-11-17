@@ -1338,6 +1338,14 @@ static void sgemm_bf16_bf16(int m, int n, int k, const uint16_t *A, int lda,
 #endif /* AVX2 F16C chain */
 #endif /* AVX__ || AVX2__ chain */
 
+/* Does this build have ARM BF16 vector arithmetic (vbfmlalbq_f32 etc.)?
+ * Deliberately a PicoLM macro rather than the compiler's: -march flags reach
+ * these kernels through several paths and the panel code below has to test the
+ * same condition the kernel is compiled with. */
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_BF16_VECTOR_ARITHMETIC)
+#  define PICOLM_ARM_BF16_FMA 1
+#endif
+
 /* ARM NEON has no AVX of any tier, so this is a chain of its own rather than a
  * further #elif arm -- it is an independent target, not a lower tier. */
 #if defined(__ARM_NEON)
@@ -1533,7 +1541,100 @@ static void sgemm_bf16_bf16(int m, int n, int k, const uint16_t *A, int lda,
 #undef NEONBF16_RM
 #undef NEONBF16_RN
 #undef NEONBF16_BN
+#ifdef PICOLM_ARM_BF16_FMA
+/* ---- BF16 native-FMA kernel (ARMv8.2-BF16 / vbfmlalbq_f32) ----
+ *
+ * Same tiling as sgemm_bf16_f32 above, but the weights are used as bf16 and the
+ * multiply-accumulate happens in the BF16 units: 8 bf16 MACs per instruction
+ * versus 4 f32 MACs (plus 2 conversion instructions per 8 weights) on the plain
+ * path. The activations come from a pre-converted bf16 panel, which is what
+ * makes this pay off -- see the panel notes in sgemm.h.
+ *
+ * Numerics: vbfmlalbq_f32 accumulates the low 4 products and vbfmlaltq_f32 the
+ * high 4, both into the same fp32 accumulator pair, so the summation order
+ * differs from the convert-to-f32 path (which adds them product by product).
+ * The inputs are exactly representable (bf16 weights are unchanged; the panel
+ * holds f32 values rounded to bf16), so the difference is fp32 rounding order.
+ * matmul_batch only uses this when it has a panel, which means the results are
+ * bf16-rounded activations -- that is a real (if tiny) change in the output, so
+ * it is why the plain kernel remains the default for every other caller.
+ */
+static void sgemm_bf16_panel_bfdot(int m, int n, int k, const uint16_t *A, int lda,
+                                   const uint16_t *Bbf, int ldbbf, float *C, int ldc,
+                                   int ith, int nth) {
+#define NEONBF16_KN 8
+#define NEONBF16_RM 4
+#define NEONBF16_RN 6
+#define NEONBF16_BN 12
+    const int64_t KN=8, RM=4, RN=6, BN=12;
+    (void)BN;
+    int64_t BM=SGEMM_PICK_BM(m,RM,nth);
+    int64_t yt=m/(RM*BM), xt=(n+RN-1)/RN, jR=xt-(xt*RN-n); if(jR<0)jR=0;
+    int64_t nj=yt*xt, js=JSTART(nj,ith,nth), je=JEND(nj,ith,nth);
+#define SGEMM_BFDOT_STEP(Cv, off) do {                                        \
+        bfloat16x8_t Aw[RM];                                                  \
+        for(int c=0;c<RM;c++)                                                 \
+            Aw[c]=vld1q_bf16((const bfloat16_t*)(A+lda*(ii+c)+(off)));        \
+        for(int r=0;r<RN;r++) {                                               \
+            bfloat16x8_t Bb=vld1q_bf16((const bfloat16_t*)(Bbf+ldbbf*(jj+r)+(off))); \
+            for(int c=0;c<RM;c++) {                                           \
+                Cv[r][c]=vbfmlalbq_f32(Cv[r][c],Aw[c],Bb);                    \
+                Cv[r][c]=vbfmlaltq_f32(Cv[r][c],Aw[c],Bb);                    \
+            }                                                                 \
+        }                                                                     \
+    } while(0)
+    for (int64_t j=js;j<je;j++) {
+        int64_t iib=(j%yt)*RM*BM, jb=j/yt;
+        int64_t jj0=jb*RN, jj2=jj0+RN; if(jj2>n)jj2=n;
+        int64_t jj1=(jb<jR)?jj2:jj0;
+        for (int64_t bi=0;bi<BM*RM;bi+=RM) {
+            int64_t ii=iib+bi;
+            for (int64_t jj=jj0;jj<jj1;jj+=RN) {
+                float32x4_t Cv[NEONBF16_RN][NEONBF16_RM];
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++) Cv[r][c]=vdupq_n_f32(0);
+                int64_t l=0;
+                for (;l+KN*SGEMM_KU<=k;l+=KN*SGEMM_KU) {
+#define SGEMM_BFDOT_KU4(base)                                             \
+                    SGEMM_BFDOT_STEP(Cv, (base)+0*KN);                    \
+                    SGEMM_BFDOT_STEP(Cv, (base)+1*KN);                    \
+                    SGEMM_BFDOT_STEP(Cv, (base)+2*KN);                    \
+                    SGEMM_BFDOT_STEP(Cv, (base)+3*KN)
+                    SGEMM_BFDOT_KU4(l);
+                    SGEMM_BFDOT_KU4(l+4*KN);
+                    SGEMM_BFDOT_KU4(l+8*KN);
+                    SGEMM_BFDOT_KU4(l+12*KN);
+#undef SGEMM_BFDOT_KU4
+                }
+                for (;l<k;l+=KN) SGEMM_BFDOT_STEP(Cv, l);
+                for(int r=0;r<RN;r++) for(int c=0;c<RM;c++)
+                    C[ldc*(jj+r)+(ii+c)]=vaddvq_f32_compat(Cv[r][c]);
+            }
+            for (int64_t jj=jj1;jj<jj2;jj++) {
+                float32x4_t Cv[NEONBF16_RM];
+                for(int c=0;c<RM;c++) Cv[c]=vdupq_n_f32(0);
+                for (int64_t l=0;l<k;l+=KN)
+                    for(int c=0;c<RM;c++) {
+                        bfloat16x8_t w=vld1q_bf16((const bfloat16_t*)(A+lda*(ii+c)+l));
+                        bfloat16x8_t bb=vld1q_bf16((const bfloat16_t*)(Bbf+ldbbf*jj+l));
+                        Cv[c]=vbfmlalbq_f32(Cv[c],w,bb);
+                        Cv[c]=vbfmlaltq_f32(Cv[c],w,bb);
+                    }
+                for(int c=0;c<RM;c++) C[ldc*jj+(ii+c)]=vaddvq_f32_compat(Cv[c]);
+            }
+        }
+    }
+#undef SGEMM_BFDOT_STEP
+}
+#undef NEONBF16_KN
+#undef NEONBF16_RM
+#undef NEONBF16_RN
+#undef NEONBF16_BN
+#endif /* PICOLM_ARM_BF16_FMA */
 #endif /* __ARM_NEON (BF16) */
+
+/* Done with the k-unroll factor: every arch chain above has been compiled or
+ * #if'd out, and it is defined unconditionally at the top of the file. */
+#undef SGEMM_KU
 
 /* ============================================================
  * Quantized GEMM kernels (Q8_0 x Q8_0, Q4_0 x Q8_0, Q5_0 x Q8_0)
@@ -3199,6 +3300,74 @@ static void sgemm_q4k_q8k_neon(int m, int n, int k_blocks,
 /* ============================================================
  * Dispatch function
  * ============================================================ */
+
+/* picolm_sgemm_disabled() is defined with the dispatch function below. */
+static int picolm_sgemm_disabled(void);
+
+/* ---- BF16 activation panel (see sgemm.h) ----
+ *
+ * The panel is a densely packed n x k block of bf16 (row stride k elements).
+ * Only built when the build has ARM BF16 vector arithmetic; every function
+ * returns 0 / NULL / no-op otherwise, so callers can wire it in unconditionally.
+ */
+size_t picolm_sgemm_bf16_panel_bytes(int n, int k) {
+#ifdef PICOLM_ARM_BF16_FMA
+    if (n <= 0 || k <= 0) return 0;
+    if (k % 8 != 0) return 0;   /* the bfdot kernel loads 8 weights per step */
+    return (size_t)n * (size_t)k * sizeof(uint16_t);
+#else
+    (void)n; (void)k;
+    return 0;
+#endif
+}
+
+int picolm_sgemm_bf16_panel_build(void *panel, const float *B, int n, int k, int ldb,
+                                  int ith, int nth) {
+#ifdef PICOLM_ARM_BF16_FMA
+    if (!panel || !B || n <= 0 || k <= 0) return 0;
+    uint16_t *bb = (uint16_t *)panel;
+    /* Each thread converts its own row slice, so this composes with
+     * tensor_parallel_for the same way the GEMM does. */
+    int64_t r0 = JSTART(n, ith, nth), r1 = JEND(n, ith, nth);
+    for (int64_t r = r0; r < r1; r++) {
+        const float *src = B + (int64_t)(r * ldb);
+        uint16_t *dst = bb + (size_t)r * (size_t)k;
+        int64_t i = 0;
+        for (; i + 4 <= k; i += 4)
+            vst1_u16(dst + i, vcvt_bf16_f32(vld1q_f32(src + i)));
+        for (; i < k; i++) {
+            /* Scalar tail: round-to-nearest-even, as vcvt_bf16_f32 does. */
+            union { float f; uint32_t u; } v;
+            v.f = src[i];
+            uint32_t lsb = (v.u >> 16) & 1u;
+            dst[i] = (uint16_t)((v.u + 0x7fffu + lsb) >> 16);
+        }
+    }
+    return 1;
+#else
+    (void)panel; (void)B; (void)n; (void)k; (void)ldb; (void)ith; (void)nth;
+    return 0;
+#endif
+}
+
+int picolm_sgemm_bf16_panel(int m, int n, int k,
+                            const void *A, int lda,
+                            const void *panel,
+                            float *C, int ldc,
+                            int ith, int nth) {
+#ifdef PICOLM_ARM_BF16_FMA
+    if (!A || !panel || !C) return 0;
+    if (m < 4 || n < 2 || k < 8 || m % 4 != 0 || k % 8 != 0) return 0;
+    if (picolm_sgemm_disabled()) return 0;
+    sgemm_bf16_panel_bfdot(m, n, k, (const uint16_t *)A, lda,
+                           (const uint16_t *)panel, k, C, ldc, ith, nth);
+    return 1;
+#else
+    (void)m; (void)n; (void)k; (void)A; (void)lda; (void)panel;
+    (void)C; (void)ldc; (void)ith; (void)nth;
+    return 0;
+#endif
+}
 
 static int picolm_sgemm_disabled(void) {
     static int checked = 0, disabled = 0, notified = 0;

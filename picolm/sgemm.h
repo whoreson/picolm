@@ -29,6 +29,51 @@ int picolm_sgemm(int m, int n, int k,
                  int Atype, int Btype,
                  int ith, int nth);
 
+/* ---- BF16 weights: optional pre-converted activation panel -----------------
+ *
+ * Some ARM cores have the BF16 vector-FMA extension (vbfmlalbq_f32 /
+ * vbfmlaltq_f32: 8 bf16 MACs per instruction into fp32 accumulators, and no
+ * weight conversion at all, because the weights are already bf16 in memory).
+ * It is only a win if the *activation* block is converted f32->bf16 ONCE for
+ * the whole GEMM and shared by every thread tile: converting per k-step inside
+ * the kernel costs more than the saved FMAs and measured SLOWER than the plain
+ * f32 path (21.5 vs 28.9 GFLOP/s on Cortex-A7xx), while a shared panel measured
+ * 1.28x faster (35.4 vs 27.7 GFLOP/s).
+ *
+ * A panel is therefore caller-owned scratch, and the three calls below let a
+ * caller opt in. Everything degrades to the ordinary path when the panel is
+ * NULL, when the build/CPU lacks BF16 arithmetic, or when the shape does not
+ * fit the kernel -- so a caller never has to know whether the panel is useful.
+ *
+ * Typical use (see matmul_batch in tensor.c):
+ *   size_t bytes = picolm_sgemm_bf16_panel_bytes(n, k);
+ *   if (bytes && scratch_fits(bytes)) {
+ *       if (picolm_sgemm_bf16_panel_build(panel, B, n, k, ldb, ith, nth))
+ *           use picolm_sgemm_bf16_panel(..., panel, ...);
+ *   }
+ */
+
+/* Bytes of scratch a panel for an n x k activation block needs, or 0 when this
+ * build cannot use a panel (then ignore all of the below). */
+size_t picolm_sgemm_bf16_panel_bytes(int n, int k);
+
+/* Convert n rows of k fp32 activations to bf16 into panel (row stride k
+ * elements, i.e. a densely packed n x k bf16 block). Thread-safe: each thread
+ * converts only the rows it is given, split as rows*ith/nth .. rows*(ith+1)/nth,
+ * so callers drive it with tensor_parallel_for exactly like the GEMM itself.
+ * Returns 1 on success, 0 if this build cannot build a panel. */
+int picolm_sgemm_bf16_panel_build(void *panel, const float *B, int n, int k, int ldb,
+                                  int ith, int nth);
+
+/* BF16-weight x F32-activation GEMM using a pre-built panel instead of B.
+ * Falls back to the plain path (and returns 0 if no kernel applies at all),
+ * so callers may use this unconditionally when they have a panel. */
+int picolm_sgemm_bf16_panel(int m, int n, int k,
+                            const void *A, int lda,
+                            const void *panel,
+                            float *C, int ldc,
+                            int ith, int nth);
+
 /* Quantized GEMM with pre-converted activation deltas.
  * B_d is float32 delta array, ldb_d stride in floats per activation row. */
 int picolm_sgemm_d(int m, int n, int k_blocks,

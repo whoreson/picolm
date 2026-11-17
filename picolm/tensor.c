@@ -2933,6 +2933,58 @@ static void mm_id_down_expert_task(int idx, void *ctxp) {
 #endif
 }
 
+/* Threaded dispatch of the UNQUANTIZED GEMMs: F32/F16/BF16 weights.
+ *
+ * These all have act_fmt == ACT_FMT_F32 (no activation quantization), and
+ * matmul_batch() used to call picolm_sgemm() once with ith=0, nth=1 -- i.e.
+ * the entire GEMM ran on the calling thread with every pool worker asleep.
+ * Measured on Spark-X2.6-1.7B-bf16 (Xeon Silver, 24 threads): prefill was
+ * 9.5 tok/s and -j1 / -j24 were indistinguishable; the same model quantized
+ * to Q8_0_R8 pre-fills at 447 tok/s. The kernels were never the problem --
+ * sgemm_bf16_f32() is written for ith/nth slicing (JSTART/JEND over the
+ * m-tile x n-tile space) and simply was never asked to use it.
+ *
+ * Same shape as qgemm_d_task: idx is both the work-slice id and the thread id
+ * of the same-named pool dispatch, and picolm_sgemm() returns 0 *before*
+ * touching C when the type/shape has no kernel, so a failed probe leaves the
+ * output buffer clean for the caller's fallback. */
+typedef struct {
+    int m, n, k;
+    const void *A; int lda;
+    const float *B; int ldb;
+    float *C; int ldc;
+    gguf_type_t Atype;
+    int nth;
+    int failed;
+    /* Optional pre-converted BF16 activation panel (see sgemm.h). When set and
+     * the build has ARM BF16 FMA, every tile is computed by the bfdot kernel
+     * instead of load-convert-FMA-f32; when the panel call declines, the task
+     * falls back to the ordinary path transparently. */
+    const void *panel;
+} f32_gemm_ctx_t;
+
+static void f32_gemm_task(int idx, void *ctxp) {
+    f32_gemm_ctx_t *c = (f32_gemm_ctx_t *)ctxp;
+    if (c->panel && picolm_sgemm_bf16_panel(c->m, c->n, c->k, c->A, c->lda,
+                                            c->panel, c->C, c->ldc, idx, c->nth))
+        return;
+    if (!picolm_sgemm(c->m, c->n, c->k, c->A, c->lda, c->B, c->ldb, c->C, c->ldc,
+                      (int)c->Atype, GGUF_TYPE_F32, idx, c->nth))
+        c->failed = 1;
+}
+
+/* Build the BF16 activation panel (one row slice per thread, like the GEMM). */
+typedef struct {
+    void *panel;
+    const float *B;
+    int n, k, ldb, nth;
+} bf16_panel_ctx_t;
+
+static void bf16_panel_task(int idx, void *ctxp) {
+    bf16_panel_ctx_t *c = (bf16_panel_ctx_t *)ctxp;
+    picolm_sgemm_bf16_panel_build(c->panel, c->B, c->n, c->k, c->ldb, idx, c->nth);
+}
+
 /* GEMM threading context: dispatches picolm_sgemm_d via tensor_parallel_for.
  * Each worker thread gets a distinct idx (its ith), ensuring ALL output tiles
  * are computed. Without this, picolm_sgemm_d(..., ith=0, nth=16) would only
@@ -3106,37 +3158,6 @@ static void qgemm_d_task(int idx, void *ctxp) {
     }
 }
 
-/* Threaded dispatch of the UNQUANTIZED GEMMs: F32/F16/BF16 weights.
- *
- * These all have act_fmt == ACT_FMT_F32 (no activation quantization), and
- * matmul_batch() used to call picolm_sgemm() once with ith=0, nth=1 -- i.e.
- * the entire GEMM ran on the calling thread with every pool worker asleep.
- * Measured on Spark-X2.6-1.7B-bf16 (Xeon Silver, 24 threads): prefill was
- * 9.5 tok/s and -j1 / -j24 were indistinguishable; the same model quantized
- * to Q8_0_R8 pre-fills at 447 tok/s. The kernels were never the problem --
- * sgemm_bf16_f32() is written for ith/nth slicing (JSTART/JEND over the
- * m-tile x n-tile space) and simply was never asked to use it.
- *
- * Same shape as qgemm_d_task: idx is both the work-slice id and the thread id
- * of the same-named pool dispatch, and picolm_sgemm() returns 0 *before*
- * touching C when the type/shape has no kernel, so a failed probe leaves the
- * output buffer clean for the caller's fallback. */
-typedef struct {
-    int m, n, k;
-    const void *A; int lda;
-    const float *B; int ldb;
-    float *C; int ldc;
-    gguf_type_t Atype;
-    int nth;
-    int failed;
-} f32_gemm_ctx_t;
-
-static void f32_gemm_task(int idx, void *ctxp) {
-    f32_gemm_ctx_t *c = (f32_gemm_ctx_t *)ctxp;
-    if (!picolm_sgemm(c->m, c->n, c->k, c->A, c->lda, c->B, c->ldb, c->C, c->ldc,
-                      (int)c->Atype, GGUF_TYPE_F32, idx, c->nth))
-        c->failed = 1;
-}
 
 /* Dual-matrix GEMM task: fuses two same-shape GEMMs (e.g. FFN gate + up)
  * into one tensor_parallel_for dispatch to halve barrier overhead.
@@ -3562,19 +3583,47 @@ void matmul_batch(float *out, const float *x, int n_batch,
         if (nth > n_batch) nth = n_batch;
         if (nth < 1) nth = 1;
         if (nth > 1) {
+            /* BF16 weights on a core with ARM BF16 FMA: converting the whole
+             * activation block to bf16 once and sharing it across all thread
+             * tiles is 1.28x faster than convert-then-f32-FMA, but converting
+             * per k-step inside the kernel is SLOWER than not doing it at all
+             * (see the panel notes in sgemm.h). The panel is cached scratch, so
+             * steady-state prefill does no allocation.
+             * Panel == NULL whenever the build/CPU/shape cannot use it, in which
+             * case f32_gemm_task falls straight through to the plain path. */
+            void *panel = NULL;
+            static int panel_off = -1;
+            if (panel_off < 0) panel_off = getenv("PICOLM_NO_BF16_PANEL") ? 1 : 0;
+            if (qtype == GGUF_TYPE_BF16 && !panel_off) {
+                size_t pbytes = picolm_sgemm_bf16_panel_bytes(n_batch, n);
+                if (pbytes) {
+                    static void *bf16_panel = NULL;
+                    static size_t bf16_panel_size = 0;
+                    if (pbytes > bf16_panel_size) {
+                        void *np = realloc(bf16_panel, pbytes);
+                        if (np) { bf16_panel = np; bf16_panel_size = pbytes; }
+                    }
+                    if (bf16_panel && bf16_panel_size >= pbytes) {
+                        bf16_panel_ctx_t pctx = { bf16_panel, x, n_batch, n, n, nth };
+                        tensor_parallel_for(nth, bf16_panel_task, &pctx);
+                        panel = bf16_panel;
+                    }
+                }
+            }
             f32_gemm_ctx_t fctx = {
                 .m = d, .n = n_batch, .k = n,
                 .A = wptr, .lda = n,
                 .B = x, .ldb = n,
                 .C = out, .ldc = d,
                 .Atype = qtype, .nth = nth, .failed = 0,
+                .panel = panel,
             };
             /* Label the region for PICOLM_THREAD_PROF: one task function serves
              * every projection, so without this the table lumps FFN and attention
              * GEMMs of different shapes into one meaningless row. */
             char lbl[160];
-            snprintf(lbl, sizeof lbl, "gemm %s d=%d n=%d k=%d",
-                     qtype_short_name(qtype), d, n_batch, n);
+            snprintf(lbl, sizeof lbl, "gemm %s%s d=%d n=%d k=%d",
+                     qtype_short_name(qtype), panel ? "+bfdot" : "", d, n_batch, n);
             tensor_set_region_label(lbl);
             tensor_parallel_for(nth, f32_gemm_task, &fctx);
             tensor_set_region_label(NULL);

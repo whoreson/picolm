@@ -171,6 +171,7 @@ ifeq ($(_host_os),Linux)
   _host_sve    := $(shell grep -qwi sve /proc/cpuinfo 2>/dev/null && echo 1)
   _arm_i8mm    := $(shell grep -qwi i8mm /proc/cpuinfo 2>/dev/null && echo 1)
   _arm_bf16    := $(shell grep -qwi bf16 /proc/cpuinfo 2>/dev/null && echo 1)
+  _arm_fp16    := $(shell grep -Eqwi 'fphp|asimdhp' /proc/cpuinfo 2>/dev/null && echo 1)
   _arm_dotprod := $(shell grep -Eqwi 'dotprod|asimddp' /proc/cpuinfo 2>/dev/null && echo 1)
 else
   _host_sve    := native
@@ -178,7 +179,10 @@ endif
 ifeq ($(filter 1,$(_native_sve)),1)
   ifeq ($(_host_sve),)
     _arm_base := $(if $(_arm_i8mm),armv8.6-a,$(if $(_arm_dotprod),armv8.2-a,armv8-a))
-    NATIVE_MARCH := -march=$(_arm_base)$(if $(_arm_dotprod),+dotprod,)$(if $(_arm_i8mm),+i8mm,)$(if $(_arm_bf16),+bf16,)
+    # +fp16 is what makes __ARM_FEATURE_FP16_VECTOR_ARITHMETIC (and therefore the
+    # NEON sgemm_f16_f16 kernel) compile at all. Every ARMv8.2+ core has it, but
+    # it is NOT implied by +bf16/+i8mm, so it has to be listed.
+    NATIVE_MARCH := -march=$(_arm_base)$(if $(_arm_dotprod),+dotprod,)$(if $(_arm_i8mm),+i8mm,)$(if $(_arm_bf16),+bf16,)$(if $(_arm_fp16),+fp16,)
     $(info NOTE: -march=native requested SVE on a CPU without SVE; using $(NATIVE_MARCH))
   else
     NATIVE_MARCH := -march=native
