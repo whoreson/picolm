@@ -1556,8 +1556,6 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
     }
 
     /* FP16/BF16 tiled path for device-resident tensors.
-</source>
-    /* FP16/BF16 tiled path for device-resident tensors.
      * Tiled kernel assumes contiguous x (stride == I); fall through to
      * generic path when x_stride is set and differs from I. */
     if ((t->qtype == GGUF_TYPE_F16 || t->qtype == GGUF_TYPE_BF16) &&
