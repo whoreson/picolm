@@ -5510,13 +5510,29 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
             /* J. Residual add: pipe_x += pipe_xb */
             picolm_gpu_residual_add(pipe_x, pipe_x, pipe_xb, 1, dim, q_pipeline_dim, gpu_dev);
 
-            /* DEBUG: dump first 8 values of pipe_x after each layer for first decode token */
-            if (getenv("PICOLM_DBG_LAYER") && pos == 3 && l < 3) {
-                picolm_gpu_sync(gpu_dev);
-                float dmp[8];
-                picolm_gpu_memcpy(dmp, pipe_x, 32, -1, gpu_dev);
-                fprintf(stderr, "[LNDBG] GPU decode l=%d pos=%d pipe_x[0:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
-                        l, pos, dmp[0],dmp[1],dmp[2],dmp[3],dmp[4],dmp[5],dmp[6],dmp[7]);
+            /* DEBUG: per-layer residual stream after the layer's attention block.
+             * PICOLM_DBG_LAYER=<pos> selects the position (the old code hardcoded
+             * pos==3 && l<3, which is useless for a 1-token prompt); setting it
+             * to "1" keeps the old behaviour. PICOLM_DBG_LAYER_N=<n> limits how
+             * many layers are dumped (default 3).
+             * The CPU path dumps the same thing under the same env in
+             * model_forward(), so the two can be diffed layer by layer -- that is
+             * the only way to find the FIRST layer where the GPU diverges. */
+            {
+                static int dbg_pos = -2, dbg_n = -2;
+                if (dbg_pos == -2) {
+                    const char *e = getenv("PICOLM_DBG_LAYER");
+                    dbg_pos = e ? (e[0] == '1' && e[1] == 0 ? 3 : atoi(e)) : -1;
+                    const char *en = getenv("PICOLM_DBG_LAYER_N");
+                    dbg_n = en ? atoi(en) : 3;
+                }
+                if (dbg_pos >= 0 && pos == dbg_pos && l < dbg_n) {
+                    picolm_gpu_sync(gpu_dev);
+                    float dmp[8];
+                    picolm_gpu_memcpy(dmp, pipe_x, 32, -1, gpu_dev);
+                    fprintf(stderr, "[LNDBG] GPUdec l=%d pos=%d x={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                            l, pos, dmp[0],dmp[1],dmp[2],dmp[3],dmp[4],dmp[5],dmp[6],dmp[7]);
+                }
             }
 
         } else {
@@ -6254,6 +6270,27 @@ after_qkv:
         }
         /* FFN residual */
         picolm_gpu_residual_add(bx, bx, bxb, n_ubatch, dim, xb_stride, gpu_dev);
+        /* Same per-layer residual dump as the CPU path, so the two logs can be
+         * diffed to find the FIRST layer where GPU prefill diverges. */
+        {
+            static int pdbg_pos = -2, pdbg_n = -2;
+            if (pdbg_pos == -2) {
+                const char *e = getenv("PICOLM_DBG_LAYER");
+                pdbg_pos = e ? (e[0] == '1' && e[1] == 0 ? -1 : atoi(e)) : -1;
+                const char *en = getenv("PICOLM_DBG_LAYER_N");
+                pdbg_n = en ? atoi(en) : 3;
+            }
+            if (pdbg_pos >= 0 && l < pdbg_n) {
+                int bi = pdbg_pos - start_pos;
+                if (bi >= 0 && bi < n_ubatch) {
+                    float dmp[8];
+                    picolm_gpu_sync(gpu_dev);
+                    picolm_gpu_memcpy(dmp, bx + (size_t)bi*xb_stride, 32, -1, gpu_dev);
+                    fprintf(stderr, "[LNDBG] GPU l=%d pos=%d x={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                            l, pdbg_pos, dmp[0],dmp[1],dmp[2],dmp[3],dmp[4],dmp[5],dmp[6],dmp[7]);
+                }
+            }
+        }
         if (l == 0 && getenv("PICOLM_DBG")) {
             float _t[4]; picolm_gpu_sync(gpu_dev);
             void *bx_last3 = (void*)((uintptr_t)bx + (size_t)(n_ubatch-1) * (size_t)xb_stride * sizeof(float));

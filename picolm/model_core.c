@@ -3207,7 +3207,21 @@ static float *model_forward_prefill_gptneox(model_t *m, const int *tokens, int n
 static float *model_forward_spark25(model_t *m, int token, int pos);
 static float *model_forward_prefill_spark25(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt);
 
+/* PICOLM_DBG_LAYER=<pos> / PICOLM_DBG_LAYER_N=<n>: dump the per-layer residual
+ * stream for CPU and GPU in the SAME format, so the first layer where the two
+ * diverge can be found by diffing the two logs. A bare "1" keeps the old
+ * behaviour (pos<=4, first 3 layers). */
+static int cpu_layer_dbg_pos = -2, cpu_layer_dbg_n = -2;
+static void cpu_layer_dbg_init(void) {
+    if (cpu_layer_dbg_pos != -2) return;
+    const char *e = getenv("PICOLM_DBG_LAYER");
+    cpu_layer_dbg_pos = e ? (e[0] == '1' && e[1] == 0 ? -1 : atoi(e)) : -1;
+    const char *en = getenv("PICOLM_DBG_LAYER_N");
+    cpu_layer_dbg_n = en ? atoi(en) : 3;
+}
+
 float *model_forward(model_t *m, int token, int pos) {
+    cpu_layer_dbg_init();
     /* Bounds check: pos must be within KV cache allocation */
     if (pos >= m->config.max_seq_len) {
         fprintf(stderr, "WARN: model_forward pos=%d >= max_seq_len=%d, returning last logits\n",
@@ -3399,6 +3413,15 @@ float *model_forward(model_t *m, int token, int pos) {
             layernorm(s->xb, s->x, s->attn_norm_w[l], s->attn_norm_b[l], dim, c->rms_norm_eps);
         } else {
             rmsnorm(s->xb, s->x, s->attn_norm_w[l], dim, c->rms_norm_eps);
+            /* Mirror of the GPU's "[GPUT L0 bx_pre_ln]/[bxb_post_ln]" dump under
+             * the same PICOLM_DBG switch, so the first divergent stage inside a
+             * layer can be identified (embedding vs norm vs qkv vs ...). */
+            if (getenv("PICOLM_DBG") && l == 0) {
+                fprintf(stderr, "[CPUT L0 bx_pre_ln][:4]={%.6f,%.6f,%.6f,%.6f}\n",
+                        s->x[0],s->x[1],s->x[2],s->x[3]);
+                fprintf(stderr, "[CPUT L0 bxb_post_ln][:4]={%.6f,%.6f,%.6f,%.6f}\n",
+                        s->xb[0],s->xb[1],s->xb[2],s->xb[3]);
+            }
         }
         /* Save normalized input for parallel residual FFN */
         if (c->use_parallel_residual) {
@@ -3412,6 +3435,9 @@ float *model_forward(model_t *m, int token, int pos) {
 #endif
         int this_q_dim = (c->has_ssm && lw->is_attn_layer) ? q_full_dim : q_dim;
         matmul(s->q, s->xb, lw->attn_q, dim, this_q_dim, lw->type_attn_q);
+        if (getenv("PICOLM_DBG") && l == 0)
+            fprintf(stderr, "[CPUT L0 Q_t3_h0][:4]={%.6f,%.6f,%.6f,%.6f}\n",
+                    s->q[0],s->q[1],s->q[2],s->q[3]);
         tensor_set_repacked(NULL);
         /* DEBUG: dump Q projection for layer 0 */
         if (getenv("PICOLM_DBG_LAYER") && l == 0) {
@@ -3825,8 +3851,8 @@ float *model_forward(model_t *m, int token, int pos) {
 ffn_done:
         steer_hook(l, s->x, 1, dim, pos);
         /* DEBUG: dump post-layer residual for first few layers */
-        if (getenv("PICOLM_DBG_LAYER") && pos <= 4 && l < 3) {
-            fprintf(stderr, "[LNDBG] LLM decode l=%d pos=%d s->x[0:8]={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+        if (cpu_layer_dbg_pos >= 0 && pos == cpu_layer_dbg_pos && l < cpu_layer_dbg_n) {
+            fprintf(stderr, "[LNDBG] CPU l=%d pos=%d x={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
                     l, pos, s->x[0],s->x[1],s->x[2],s->x[3],s->x[4],s->x[5],s->x[6],s->x[7]);
         }
 #ifdef PICOLM_VIZ
