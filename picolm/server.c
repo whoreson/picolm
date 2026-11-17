@@ -1048,7 +1048,10 @@ static void cache_adjust_stepback(model_t *model, int n_prompt, int *start_pos) 
             checkpoint_restore_log(target, actual, 0, 1);
         } else {
             *start_pos = 0;
-            model_ssm_state_reset(model);
+            /* model_ssm_state_reset() is a silent no-op unless config.has_ssm,
+             * which GLM-5 never sets; model_recurrent_state_reset() covers both
+             * the Qwen SSM and the GLM-5 KDA families. Same for every reset below. */
+            model_recurrent_state_reset(model);
 #ifdef PICOLM_GPU
             if (model->gpu.kv_active) { model_ssm_state_reset_gpu(model); picolm_gpu_kv_cache_clear(model->gpu.device); }
 #endif
@@ -1128,6 +1131,11 @@ static float *server_model_prefill(model_t *model, const int *tokens,
             run_state_t *s = &model->state;
             int gpu_dev = gw->device;
 
+            /* TODO(GLM-5 GPU): untested. This block, the has_ssm test just below
+             * and model_ssm_state_reset_gpu() only know the Qwen SSM layout. If
+             * GLM-5 KDA/MLA state ever lives on the device it must be synced and
+             * reset here too, otherwise the CPU-side fixes in this series do not
+             * reach it. */
             /* 1. Sync SSM persistent state (conv + recurrence) from host -> device */
             if (c->has_ssm) {
                 int conv_dim = 2 * c->ssm_d_state * c->ssm_n_group + c->ssm_d_inner;
@@ -2487,7 +2495,13 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
 
     /* SSM checkpoint restore: if we have SSM layers and cache_start > 0,
      * try to find and restore a checkpoint at or before cache_start. */
-    if (model->config.has_ssm && cache_start > 0) {
+    /* NOTE: gate on model_has_recurrent_state(), NOT config.has_ssm.
+     * GLM-5 (KDA) deliberately reports has_ssm=0, so the old test skipped
+     * this whole block for it: the MLA latent cache was rewound to
+     * cache_start but the KDA state kept the tokens it had already
+     * consumed past that point (old tail + previous generation), and the
+     * re-prefill ran on top of that contaminated state. */
+    if (model_has_recurrent_state(model) && cache_start > 0) {
         int actual = 0;
         if (checkpoint_restore(cache_start, &actual) == 0) {
             /* Restored SSM state to checkpoint at position 'actual'.
@@ -2501,7 +2515,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         } else {
             /* No suitable checkpoint found. Must reprocess everything from scratch. */
             start_pos = 0;
-            model_ssm_state_reset(model);
+            model_recurrent_state_reset(model);
 #ifdef PICOLM_GPU
             if (model->gpu.kv_active) { model_ssm_state_reset_gpu(model); picolm_gpu_kv_cache_clear(model->gpu.device); }
 #endif
@@ -2519,7 +2533,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         srv.kv_pos = 0;
         /* Clear checkpoints and reset SSM state on full reprocess */
         checkpoint_clear();
-        model_ssm_state_reset(model);
+        model_recurrent_state_reset(model);
 #ifdef PICOLM_GPU
         if (model->gpu.kv_active) { model_ssm_state_reset_gpu(model); picolm_gpu_kv_cache_clear(model->gpu.device); }
 #endif
@@ -2670,8 +2684,15 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             gen_count++;
 
             /* Generation checkpoint: every checkpoint_interval_gen tokens */
+            /* GEN_CKPT_POS: a checkpoint's n_tokens must equal the number of
+             * tokens the recurrent state has CONSUMED. At this point the sampled
+             * token 'next' has not been forwarded yet (that happens right below),
+             * so only the prompt plus gen_count-1 generated tokens are in the
+             * state. Labelling it n_prompt+gen_count made a later restore resume
+             * one token too late and silently skip a token. Same at the 3 other
+             * gen-checkpoint sites. */
             if (srv.max_checkpoints > 0 && model_has_recurrent_state(model) && gen_count % srv.checkpoint_interval_gen == 0) {
-                checkpoint_save(n_prompt + gen_count);
+                checkpoint_save(n_prompt + gen_count - 1); /* see GEN_CKPT_POS note */
             }
 
             if (stopped || next == (int)tokenizer->eos_id) break;
@@ -2846,7 +2867,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
 
                 /* Generation checkpoint */
                 if (srv.max_checkpoints > 0 && model_has_recurrent_state(model) && gen_count % srv.checkpoint_interval_gen == 0) {
-                    checkpoint_save(n_prompt + gen_count);
+                    checkpoint_save(n_prompt + gen_count - 1); /* see GEN_CKPT_POS note */
                 }
 
                 /* Check stop words (full match only, no withholding) */
@@ -3123,7 +3144,13 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
     fprintf(stderr, "[server] %.1fms: KV cache match %d/%d tokens (%d new)\n", get_time_ms() - t0, start_pos, n_prompt, n_prompt - start_pos);
 
     /* SSM checkpoint restore */
-    if (model->config.has_ssm && cache_start > 0) {
+    /* NOTE: gate on model_has_recurrent_state(), NOT config.has_ssm.
+     * GLM-5 (KDA) deliberately reports has_ssm=0, so the old test skipped
+     * this whole block for it: the MLA latent cache was rewound to
+     * cache_start but the KDA state kept the tokens it had already
+     * consumed past that point (old tail + previous generation), and the
+     * re-prefill ran on top of that contaminated state. */
+    if (model_has_recurrent_state(model) && cache_start > 0) {
         int actual = 0;
         if (checkpoint_restore(cache_start, &actual) == 0) {
             start_pos = actual;
@@ -3133,7 +3160,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             checkpoint_restore_log(cache_start, actual, cache_start, 1);
         } else {
             start_pos = 0;
-            model_ssm_state_reset(model);
+            model_recurrent_state_reset(model);
 #ifdef PICOLM_GPU
             if (model->gpu.kv_active) { model_ssm_state_reset_gpu(model); picolm_gpu_kv_cache_clear(model->gpu.device); }
 #endif
@@ -3151,7 +3178,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         srv.kv_pos = 0;
         /* Clear checkpoints and reset SSM state on full reprocess */
         checkpoint_clear();
-        model_ssm_state_reset(model);
+        model_recurrent_state_reset(model);
 #ifdef PICOLM_GPU
         if (model->gpu.kv_active) { model_ssm_state_reset_gpu(model); picolm_gpu_kv_cache_clear(model->gpu.device); }
 #endif
@@ -3343,7 +3370,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
 
             /* Generation checkpoint */
             if (srv.max_checkpoints > 0 && model_has_recurrent_state(model) && gen_count % srv.checkpoint_interval_gen == 0) {
-                checkpoint_save(n_prompt + gen_count);
+                checkpoint_save(n_prompt + gen_count - 1); /* see GEN_CKPT_POS note */
             }
 
             if (!ignore_eos && next == (int)tokenizer->eos_id) {
@@ -3505,7 +3532,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
 
             /* Generation checkpoint */
             if (srv.max_checkpoints > 0 && model_has_recurrent_state(model) && gen_count % srv.checkpoint_interval_gen == 0) {
-                checkpoint_save(n_prompt + gen_count);
+                checkpoint_save(n_prompt + gen_count - 1); /* see GEN_CKPT_POS note */
             }
 
             /* Check stop words (full match, no withholding) */

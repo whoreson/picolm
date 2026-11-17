@@ -709,7 +709,7 @@ static void benchmark_thread_scaling(const char *model_path, const char *prompt,
 
         /* warm the weights (and the pool) so the timing is not a page-fault measurement */
         model_forward_prefill(&model, toks, n, 0, NULL);
-        model_ssm_state_reset(&model);
+        model_recurrent_state_reset(&model);
         if (model.state.kv_block) memset(model.state.kv_block, 0, model.state.kv_size);
         tensor_thread_profile_reset();   /* profile only the timed run */
 
@@ -2420,7 +2420,7 @@ int main(int argc, char **argv) {
             double t_iter_start = get_time_ms();
 
             /* Reset model state for fresh iteration */
-            model_ssm_state_reset(&model);
+            model_recurrent_state_reset(&model);
 #ifdef PICOLM_GPU
             if (model.gpu.kv_active) {
                 model_ssm_state_reset_gpu(&model);

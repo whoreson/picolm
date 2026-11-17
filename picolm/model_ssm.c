@@ -5170,6 +5170,9 @@ void model_ssm_state_reset(model_t *m) {
 }
 
 #ifdef PICOLM_GPU
+/* NOTE: Qwen SSM only. Returns early for GLM-5 (has_ssm==0), so GLM-5 KDA
+ * device state, if any, is NOT reset here. The GLM-5 GPU path has never been
+ * tested; see the TODO(GLM-5 GPU) in server.c before relying on it. */
 void model_ssm_state_reset_gpu(model_t *m) {
     const model_config_t *c = &m->config;
     if (!c->has_ssm || !m->gpu.kv_active) return;
