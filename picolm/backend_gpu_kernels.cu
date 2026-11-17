@@ -1637,17 +1637,28 @@ picolm_q4_0_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 #endif
 
-        /* Epilogue: single scale per block (shared across all output columns) */
+        /* Epilogue. Q4_0 has one scale per (output row, block) -- there are no
+         * per-sub-block scales -- but the row that matters is the OUTPUT COLUMN
+         * this lane accumulates, not gid.
+         *
+         * The m16n8k32 accumulator layout (see the store loop below and the
+         * working picolm_q8_q8_matmul_imma) puts sum[0]/sum[2] in output column
+         * tile_o + tid*2 and sum[1]/sum[3] in tile_o + tid*2 + 1. Looking the
+         * scale up at tile_o + gid means every thread applies a different
+         * column's weight scale. */
         float dx0 = xd[(size_t)(tile_s + gid) * n_blocks + kb];
         float dx1 = xd[(size_t)(tile_s + gid + 8) * n_blocks + kb];
-        int wc = tile_o + gid;
-        const uint8_t *wb = w + (size_t)wc * row_bytes + (size_t)kb * GPU_BLOCK_Q4_0_SIZE;
-        float wd = gpu_fp16_to_fp32(wb[0] | ((uint16_t)wb[1] << 8));
+        const uint8_t *wb0 = w + (size_t)(tile_o + tid * 2) * row_bytes
+                             + (size_t)kb * GPU_BLOCK_Q4_0_SIZE;
+        const uint8_t *wb1 = w + (size_t)(tile_o + tid * 2 + 1) * row_bytes
+                             + (size_t)kb * GPU_BLOCK_Q4_0_SIZE;
+        float wd0 = gpu_fp16_to_fp32(wb0[0] | ((uint16_t)wb0[1] << 8));
+        float wd1 = gpu_fp16_to_fp32(wb1[0] | ((uint16_t)wb1[1] << 8));
 
-        sum[0] += wd * dx0 * (float)d0;
-        sum[1] += wd * dx0 * (float)d1;
-        sum[2] += wd * dx1 * (float)d2;
-        sum[3] += wd * dx1 * (float)d3;
+        sum[0] += (float)d0 * dx0 * wd0;
+        sum[1] += (float)d1 * dx0 * wd1;
+        sum[2] += (float)d2 * dx1 * wd0;
+        sum[3] += (float)d3 * dx1 * wd1;
     }
     for (int f = 0; f < 4; f++) {
         int row = (f < 2) ? gid : gid + 8;
