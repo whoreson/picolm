@@ -35,26 +35,6 @@ static int picolm_gpu_no_imma(void) {
     return cached;
 }
 
-/* Warn about known-broken K-quant IMMA kernels (Q2/Q3/Q4/Q5_K).
- * Prints once per process. Only triggers when IMMA is not disabled. */
-static void picolm_kquant_imma_warning(int qtype) {
-    static int warned = 0;
-    if (warned) return;
-    warned = 1;
-    const char *qname = "Q?_K";
-    switch (qtype) {
-        case GGUF_TYPE_Q2_K: qname = "Q2_K"; break;
-        case GGUF_TYPE_Q3_K: qname = "Q3_K"; break;
-        case GGUF_TYPE_Q4_K: qname = "Q4_K"; break;
-        case GGUF_TYPE_Q5_K: qname = "Q5_K"; break;
-    }
-    fprintf(stderr,
-        "\n[GPU] WARNING: %s IMMA matmul kernel is known broken (garbage output).\n"
-        "[GPU]         Set PICOLM_NO_IMMA=1 to disable all IMMA and use scalar fallback.\n"
-        "[GPU]         The scalar path is slower but produces correct results.\n\n",
-        qname);
-}
-
 gpu_device_ctx_t g_gpu_ctx[PICOLM_GPU_MAX_DEVICES];
 int g_nctx;
 
@@ -808,7 +788,7 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
                 ctx->y, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, O);
         } else
 #endif
-        if (ctx->has_imma && !picolm_gpu_no_imma() && S >= 16 && O >= 8) {
+        if (ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8) {
             gpu_dispatch_print("matmul_imma_host");
             dim3 grid((unsigned)((O + 7) / 8), (unsigned)((S + 15) / 16));
             picolm_q8_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(
@@ -832,7 +812,7 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
     }
 
     /* Q4_0 x Q8_0 IMMA path (host) */
-    if (t->qtype == GGUF_TYPE_Q4_0 && ctx->has_imma && !picolm_gpu_no_imma() && S >= 16 && O >= 8) {
+    if (t->qtype == GGUF_TYPE_Q4_0 && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8) {
         int n_blocks = I / 32;
         if (n_blocks < 1 || I % 32 != 0) return 0;
         if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
@@ -865,7 +845,7 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
     }
 
     /* Q4_1 x Q8_0 IMMA path (host) */
-    if (t->qtype == GGUF_TYPE_Q4_1 && ctx->has_imma && !picolm_gpu_no_imma() && S >= 16 && O >= 8) {
+    if (t->qtype == GGUF_TYPE_Q4_1 && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8) {
         int n_blocks = I / 32;
         if (n_blocks < 1 || I % 32 != 0) return 0;
         if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
@@ -927,7 +907,7 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
     }
 
     /* Q2_0 x Q8_0 IMMA path (host) */
-    if (t->qtype == GGUF_TYPE_Q2_0 && ctx->has_imma && !picolm_gpu_no_imma() && S >= 16 && O >= 8) {
+    if (t->qtype == GGUF_TYPE_Q2_0 && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8) {
         int n_blocks = I / 32;
         if (n_blocks < 1 || I % 32 != 0) return 0;
         if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
@@ -961,7 +941,7 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
     }
 
     /* Q1_0 x Q8_0 IMMA path (host) */
-    if (t->qtype == GGUF_TYPE_Q1_0 && ctx->has_imma && !picolm_gpu_no_imma() && S >= 16 && O >= 8) {
+    if (t->qtype == GGUF_TYPE_Q1_0 && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8) {
         int n_blocks = I / 32;
         if (n_blocks < 1 || I % 32 != 0) return 0;
         if (!gpu_ok(gpuMemcpy(ctx->x, x, xb, gpuMemcpyHostToDevice), "input upload")) return 0;
@@ -1032,8 +1012,7 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
     }
 
     /* Q2_K x Q8_0 IMMA path: quantize activations to Q8_0, native Q2_K weights. */
-    if (t->qtype == GGUF_TYPE_Q2_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 16 && O >= 8 && I % 256 == 0) {
-        picolm_kquant_imma_warning(GGUF_TYPE_Q2_K);
+    if (t->qtype == GGUF_TYPE_Q2_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8 && I % 256 == 0) {
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
 
@@ -1068,8 +1047,7 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
     }
 
     /* Q3_K x Q8_0 IMMA path: quantize activations to Q8_0, native Q3_K weights. */
-    if (t->qtype == GGUF_TYPE_Q3_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 16 && O >= 8 && I % 256 == 0) {
-        picolm_kquant_imma_warning(GGUF_TYPE_Q3_K);
+    if (t->qtype == GGUF_TYPE_Q3_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8 && I % 256 == 0) {
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
 
@@ -1104,8 +1082,7 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
     }
 
     /* Q5_K x Q8_0 IMMA path: quantize activations to Q8_0, native Q5_K weights. */
-    if (t->qtype == GGUF_TYPE_Q5_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 16 && O >= 8 && I % 256 == 0) {
-        picolm_kquant_imma_warning(GGUF_TYPE_Q5_K);
+    if (t->qtype == GGUF_TYPE_Q5_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8 && I % 256 == 0) {
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
 
@@ -1140,8 +1117,7 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
     }
 
     /* Q4_K x Q8_0 IMMA host path: ENABLED (device-side disabled). */
-    if (t->qtype == GGUF_TYPE_Q4_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 16 && O >= 8 && I % 256 == 0) {
-        picolm_kquant_imma_warning(GGUF_TYPE_Q4_K);
+    if (t->qtype == GGUF_TYPE_Q4_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8 && I % 256 == 0) {
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
 
@@ -1292,7 +1268,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
                 y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
         } else
 #endif
-        if (ctx->has_imma && !picolm_gpu_no_imma() && S >= 16 && O >= 8) {
+        if (ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8) {
             gpu_dispatch_print("matmul_imma_dev");
             dim3 grid((unsigned)((O + 7) / 8), (unsigned)((S + 15) / 16));
             picolm_q8_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(
@@ -1313,7 +1289,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
     }
 
     /* Q4_0 x Q8_0 IMMA path (device) */
-    if (t->qtype == GGUF_TYPE_Q4_0 && ctx->has_imma && !picolm_gpu_no_imma() && S >= 16 && O >= 8) {
+    if (t->qtype == GGUF_TYPE_Q4_0 && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8) {
         int n_blocks = I / 32;
         if (n_blocks < 1 || I % 32 != 0) return 0;
         int S_padded = (S + 15) & ~15;
@@ -1341,7 +1317,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
     }
 
     /* Q4_1 x Q8_0 IMMA path (device) */
-    if (t->qtype == GGUF_TYPE_Q4_1 && ctx->has_imma && !picolm_gpu_no_imma() && S >= 16 && O >= 8) {
+    if (t->qtype == GGUF_TYPE_Q4_1 && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8) {
         int n_blocks = I / 32;
         if (n_blocks < 1 || I % 32 != 0) return 0;
         int S_padded = (S + 15) & ~15;
@@ -1381,7 +1357,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
     }
 
     /* Q2_0 x Q8_0 IMMA path (device) */
-    if (t->qtype == GGUF_TYPE_Q2_0 && ctx->has_imma && !picolm_gpu_no_imma() && S >= 16 && O >= 8) {
+    if (t->qtype == GGUF_TYPE_Q2_0 && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8) {
         int n_blocks = I / 32;
         if (n_blocks < 1 || I % 32 != 0) return 0;
         int S_padded = (S + 15) & ~15;
@@ -1409,7 +1385,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
     }
 
     /* Q1_0 x Q8_0 IMMA path (device) */
-    if (t->qtype == GGUF_TYPE_Q1_0 && ctx->has_imma && !picolm_gpu_no_imma() && S >= 16 && O >= 8) {
+    if (t->qtype == GGUF_TYPE_Q1_0 && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8) {
         int n_blocks = I / 32;
         if (n_blocks < 1 || I % 32 != 0) return 0;
         int S_padded = (S + 15) & ~15;
@@ -1437,8 +1413,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
     }
 
     /* Q2_K x Q8_0 IMMA path (device) */
-    if (t->qtype == GGUF_TYPE_Q2_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 16 && O >= 8 && I % 256 == 0) {
-        picolm_kquant_imma_warning(GGUF_TYPE_Q2_K);
+    if (t->qtype == GGUF_TYPE_Q2_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8 && I % 256 == 0) {
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
         int S_padded = (S + 15) & ~15;
@@ -1466,8 +1441,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
     }
 
     /* Q3_K x Q8_0 IMMA path (device) */
-    if (t->qtype == GGUF_TYPE_Q3_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 16 && O >= 8 && I % 256 == 0) {
-        picolm_kquant_imma_warning(GGUF_TYPE_Q3_K);
+    if (t->qtype == GGUF_TYPE_Q3_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8 && I % 256 == 0) {
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
         int S_padded = (S + 15) & ~15;
@@ -1525,8 +1499,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
     }
 
     /* Q5_K x Q8_0 IMMA path (device) -- ENABLED */
-    if (t->qtype == GGUF_TYPE_Q5_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 16 && O >= 8 && I % 256 == 0) {
-        picolm_kquant_imma_warning(GGUF_TYPE_Q5_K);
+    if (t->qtype == GGUF_TYPE_Q5_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8 && I % 256 == 0) {
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
         int S_padded = (S + 15) & ~15;
@@ -1554,8 +1527,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
     }
 
     /* Q4_K x Q8_0 IMMA path (device) -- ENABLED */
-    if (t->qtype == GGUF_TYPE_Q4_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 16 && O >= 8 && I % 256 == 0) {
-        picolm_kquant_imma_warning(GGUF_TYPE_Q4_K);
+    if (t->qtype == GGUF_TYPE_Q4_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8 && I % 256 == 0) {
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
         int S_padded = (S + 15) & ~15;
@@ -1766,7 +1738,7 @@ static int imma_dev_q8(picolm_gpu_tensor_t *t, float *y_dev,
             y_dev, xq, xd, t->weights, S, I, O, (int)t->row_bytes, ys);
     } else
 #endif
-    if (ctx->has_imma && !picolm_gpu_no_imma() && S >= 16 && O >= 8) {
+    if (ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8) {
         gpu_dispatch_print("matmul_imma_dev");
         dim3 grid((unsigned)((O + 7) / 8), (unsigned)((S + 15) / 16));
         picolm_q8_q8_matmul_imma<<<grid, 32, 0, ctx->stream>>>(
