@@ -867,20 +867,38 @@ typedef __m256 adv;
 #define AD_MIN_SPLIT_CHUNK 256      /* min positions per split-KV chunk */
 
 static int ad_use_ref = 0;          /* PICOLM_ATTN_DECODE=ref */
+
 /* Split-KV flash decoding splits the position range into S chunks, where S is
  * derived from tensor_get_n_threads(), then merges the S partial softmax
  * states in chunk order. Different S => a different summation tree => a
- * different rounded result, i.e. the decoded logits (and therefore the
- * sampled tokens at a fixed -s seed) change with -j.
+ * different rounded result, i.e. the decoded logits (and therefore the sampled
+ * tokens at a fixed -s seed) change with -j.
  *
- * Reproducibility across thread counts is a hard contract, so this is OFF by
- * default. PICOLM_ATTN_SPLIT=1 (or PICOLM_ATTN_SPLIT_AGGRESSIVE=1) opts into
- * the throughput mode, which is explicitly NOT bit-reproducible across -j. */
-static int ad_split_on = 0;         /* PICOLM_ATTN_SPLIT=1 enables split-KV */
+ * This used to be the default, was turned OFF in 40ee065 because of that
+ * -j sensitivity ("reproducibility across thread counts is a hard contract"),
+ * and is ON again by default: decode attention throughput matters more than
+ * bit-reproducibility across thread counts. The trade-off is real and
+ * deliberate, so if you are bisecting, comparing against another engine, or
+ * chasing a token-level difference, pin the thread count (-j) -- or set
+ * PICOLM_ATTN_SPLIT=0 to get the single-chunk path back. */
+static int ad_split_on = 1;         /* PICOLM_ATTN_SPLIT=0 disables split-KV */
 static int ad_min_chunk = AD_MIN_SPLIT_CHUNK;
 static int ad_prefetch = 1;         /* PICOLM_ATTN_PF=0 disables sw prefetch */
-static void ad_env_register(void) PICOLM_CONSTRUCTOR;
+
+/* env vars are read ONCE, lazily, on first use.
+ *
+ * This used to be a PICOLM_CONSTRUCTOR (__attribute__((constructor))) reading
+ * getenv() before main(). That attribute is a GCC extension which quant.h
+ * compiles out on MSVC and on old GCC (< 4: Mac OS X Tiger, OSF/1), so on
+ * those targets the function was defined but never called -- the env vars were
+ * silently ignored and every setting kept its compiled-in default. Harmless
+ * while split-KV was opt-in (the flag just did nothing), but a default that
+ * silently does not apply on half the supported platforms is not acceptable,
+ * so resolve on first use like every other PICOLM_* getter in the tree. */
+static int ad_env_done = 0;
 static void ad_env_register(void) {
+    if (ad_env_done) return;
+    ad_env_done = 1;
     const char *e;
     if ((e = getenv("PICOLM_ATTN_DECODE")) && !strcmp(e, "ref")) ad_use_ref = 1;
     if ((e = getenv("PICOLM_ATTN_SPLIT"))) ad_split_on = atoi(e) != 0;
@@ -1162,7 +1180,13 @@ static void ad_chunk(const attn_group_ctx_t *ctx, int kv_h, int t0, int t1,
 #undef AD_CASE
 }
 
+static void ad_env_register(void);
+
+/* Entry point for every decision that depends on the AD_* env vars, so they are
+ * resolved exactly once, before first use (they used to be read by a
+ * PICOLM_CONSTRUCTOR, which MSVC and old GCC compile out). */
 static inline int ad_supported(const attn_group_ctx_t *ctx) {
+    ad_env_register();
     return !ad_use_ref && ctx->head_dim % AD_W == 0 && ctx->head_dim <= 256 &&
            ctx->kv_mul >= 1 && ctx->kv_mul <= 8;
 }
@@ -2594,7 +2618,14 @@ void batch_attention_layer(
                     kv_type_k, kv_type_v, kv_row_size_k, kv_row_size_v,
                     kv_head_stride_k, kv_head_stride_v, attn_scale, n_swa, _use_tiled,
                     attn_qk_label(_use_tiled, kv_type_k, head_dim),
-                    pv_label && !strcmp(pv_label, "i16") ? "i16" : "f32");
+                    /* Must mirror the selection in batch_attention_tiled(): i16
+                     * is the default, any other PICOLM_ATTN_PV value means f32. */
+#if defined(PICOLM_AVX512) && defined(__AVX512VNNI__)
+                    (!(pv_label && strcmp(pv_label, "i16") != 0) && ATTN_TILE <= 128) ? "i16" : "f32"
+#else
+                    "f32"
+#endif
+                    );
         }
     }
     if (_use_tiled) {
@@ -3663,10 +3694,23 @@ static void batch_attention_tiled(
         const char *o = getenv("PICOLM_ATTN_SKIP_ORDER");
         bctx.skip_order = (o && atoi(o) == 0) ? 0 : 1;
     }
-    {   /* int16 PV (opt-in, PICOLM_ATTN_PV=i16, needs AVX-512 VNNI) */
+    {   /* int16 PV (default where AVX-512 VNNI exists) */
         const char *pvm = getenv("PICOLM_ATTN_PV");
 #if defined(PICOLM_AVX512) && defined(__AVX512VNNI__)
-        bctx.pv_i16 = (pvm && !strcmp(pvm, "i16")) ? 1 : 0;
+        /* Default on. PICOLM_ATTN_PV=f32 (or any value other than "i16") keeps
+         * the fp32 FMA PV kernel; PICOLM_ATTN_PV=i16 is still accepted so old
+         * scripts keep working.
+         *
+         * Overflow bound, from the kernel header: 64 j * 8191 * 2047 = 1.07e9
+         * < 2^31, valid for ts <= 128. ATTN_TILE is 64 and a tail tile is never
+         * larger, so it holds for every tile the tiled path can produce -- the
+         * check below makes that explicit rather than assumed, and falls back
+         * to fp32 if a future tile size breaks the precondition. */
+        int want = !(pvm && strcmp(pvm, "i16") != 0);   /* on unless set to something else */
+        bctx.pv_i16 = want && (ATTN_TILE <= 128);
+        if (want && ATTN_TILE > 128)
+            fprintf(stderr, "WARN: int16 PV disabled: ATTN_TILE=%d exceeds the "
+                            "int32 accumulator bound (ts <= 128)\n", ATTN_TILE);
 #else
         (void)pvm;
 #endif

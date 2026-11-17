@@ -1144,9 +1144,12 @@ static void mla_attn_task(int idx, void *vp) {
 #define PFA_MAXR  (PFA_HG * PFA_BQ)
 #define PFA_MAXKVL 512
 
+/* Default ON. PICOLM_GLM5_PFA=0 disables it and gets the older GEMV-shaped
+ * mla_attn_task path back (useful as an A/B reference: PFA is not bit-identical
+ * to it, see the note above). */
 static int glm5_pfa_enabled(void) {
     static int cached = -1;
-    if (cached < 0) { const char *e = getenv("PICOLM_GLM5_PFA"); cached = (e && atoi(e) > 0) ? 1 : 0; }
+    if (cached < 0) { const char *e = getenv("PICOLM_GLM5_PFA"); cached = !(e && atoi(e) == 0); }
     return cached;
 }
 
@@ -1719,15 +1722,15 @@ static void glm5_mla_head_block_task(int blk, void *vp) {
  *   merge task h: M = max_c m_c; out = sum_c exp(m_c-M) part_c / sum_c exp(m_c-M) l_c
  *
  * NOT bit-identical to the head-block path (softmax is summed per chunk, and the
- * p < 1e-10 skip is gone); accurate to float rounding. Off by default:
- * PICOLM_GLM5_MLA_SPLITKV=1 enables it for n_kv >= 512, =N for n_kv >= N. */
+ * p < 1e-10 skip is gone); accurate to float rounding. ON by default for
+ * n_kv >= 512; PICOLM_GLM5_MLA_SPLITKV=0 disables it, =N changes the threshold. */
 #define GLM5_SKV_MAX_CHUNKS 64
 
 static int glm5_mla_splitkv_min(void) {
     static int cached = -2;
     if (cached == -2) {
         const char *e = getenv("PICOLM_GLM5_MLA_SPLITKV");
-        int v = e ? atoi(e) : 0;
+        int v = e ? atoi(e) : 1;          /* unset => enabled, threshold 512 */
         cached = v <= 0 ? 0 : (v == 1 ? 512 : v);
     }
     return cached;
@@ -2862,9 +2865,13 @@ static void glm5_moe_ffn_batch_ref(const model_t *m, const glm5_layer_weights_t 
  * a GEMM instead of 512 GEMVs reads its weights once instead of once per token (~10 GB/layer at
  * 512 tokens) but sums in a different order; PICOLM_GLM5_SHEXP_BATCH=0 keeps it per token.
  * PICOLM_GLM5_MOE_PROF=1 prints per-phase times for both this path and the reference. */
+/* Default ON. The expert-parallel batched MoE prefill is bit-identical to the
+ * reference for the routed part (see the long note above) and falls back to the
+ * reference if it cannot run, so it is safe as a default.
+ * PICOLM_GLM5_MOE_EP=0 forces the reference path. */
 static int glm5_moe_ep_enabled(void) {
     static int cached = -1;
-    if (cached < 0) { const char *e = getenv("PICOLM_GLM5_MOE_EP"); cached = (e && atoi(e) > 0) ? 1 : 0; }
+    if (cached < 0) { const char *e = getenv("PICOLM_GLM5_MOE_EP"); cached = !(e && atoi(e) == 0); }
     return cached;
 }
 static int glm5_shexp_batch_enabled(void) {
@@ -3174,11 +3181,15 @@ static void glm5_moe_ffn_batch(const model_t *m, const glm5_layer_weights_t *gw,
  * for every token: ~50 GB (~0.9 s) per dense layer at 400-500 tokens, which is more than a whole
  * MoE layer now costs. Batching the tokens reads the weights once. A GEMM sums in a different
  * order than a GEMV, so the result differs at float rounding (~1e-7 relative, same as the batched
- * shared expert) -- opt in with PICOLM_GLM5_DENSE_BATCH=1 and check the argmax sequence.
- * Returns 1 if it ran; 0 means "use the per-token loop". */
+ * shared expert).
+ *
+ * ON by default; PICOLM_GLM5_DENSE_BATCH=0 forces the per-token loop (the GEMV-exact reference,
+ * useful when diffing an argmax sequence against another engine).
+ * Returns 1 if it ran; 0 means "use the per-token loop" (also what it returns for NT < 2, so
+ * single-token decode is unaffected either way). */
 static int glm5_dense_batch_enabled(void) {
     static int cached = -1;
-    if (cached < 0) { const char *e = getenv("PICOLM_GLM5_DENSE_BATCH"); cached = (e && atoi(e) > 0) ? 1 : 0; }
+    if (cached < 0) { const char *e = getenv("PICOLM_GLM5_DENSE_BATCH"); cached = !(e && atoi(e) == 0); }
     return cached;
 }
 static int glm5_dense_ffn_batch(const model_t *m, const layer_weights_t *lw, const float *cur_b, float *out_b, int NT)
