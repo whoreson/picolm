@@ -1609,23 +1609,40 @@ picolm_q4_0_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
         {
             int wc = tile_o + gid;
             const uint8_t *qs = w + (size_t)wc * row_bytes +
-                                (size_t)kb * GPU_BLOCK_Q4_0_SIZE + 2;
-            uint32_t raw0, raw1;
-            memcpy(&raw0, qs + tid * 2, 2);
-            memcpy(&raw1, qs + 16 + tid * 2, 2);
+                                (size_t)kb * GPU_BLOCK_Q4_0_SIZE + 2;   /* 16 bytes */
+            /* m16n8k32 B fragment: this lane's b0 holds K[tid*4 .. tid*4+3]
+             * and b1 holds K[16+tid*4 .. 16+tid*4+3].
+             *
+             * GGUF Q4_0 packs those 32 values into only SIXTEEN bytes, with
+             * BOTH nibbles of a byte belonging to the SAME 16-byte window
+             * (dequantize_row_q4_0): qs[j] & 0xF -> element j, and
+             * qs[j] >> 4 -> element j+16. K[0..15] are the low nibbles of
+             * qs[0..15] and K[16..31] the high nibbles of the SAME bytes.
+             *
+             * So b0 and b1 are both built from the four bytes
+             * qs[tid*4 .. tid*4+3]: low nibbles for b0, high nibbles for b1.
+             * (The previous code took them from 2 different byte ranges and
+             * read the high-nibble register starting at qs+16, i.e. past the
+             * end of the 16-byte array, into the next block's scale.) */
+            uint32_t raw;
+            memcpy(&raw, qs + tid * 4, 4);
 
-            /* b0: low nibbles of 2 bytes -> 4 elements 0..3 */
-            uint32_t lo = (raw0 & 0x0F) | (((raw0 >> 4) & 0x0F) << 8)
-                        | ((raw0 >> 12) & 0x0F) << 16 | ((raw0 >> 20) & 0x0F) << 24;
-            /* b1: high nibbles of 2 bytes -> 4 elements 16..19 */
-            uint32_t hi = (raw1 >> 4) & 0x0F;
-            hi |= (((raw1 >> 8) & 0x0F) << 8);
-            hi |= (((raw1 >> 12) & 0x0F) << 16);
-            hi |= ((raw1 >> 20) & 0x0F) << 24;
+            uint32_t lo = raw & 0x0F0F0F0F;                    /* -> K[tid*4 ..] */
+            uint32_t hi = (raw >> 4) & 0x0F0F0F0F;              /* -> K[16+tid*4 ..] */
 
-            /* Subtract 8 from each byte for signed interpretation */
-            { uint32_t v = lo; b0 = ((v & 0xFF) - 8) | (((v >> 8) & 0xFF) - 8) << 8 | (((v >> 16) & 0xFF) - 8) << 16 | ((v >> 24) - 8) << 24; }
-            { uint32_t v = hi; b1 = ((v & 0xFF) - 8) | (((v >> 8) & 0xFF) - 8) << 8 | (((v >> 16) & 0xFF) - 8) << 16 | ((v >> 24) - 8) << 24; }
+            /* Q4_0 stores 0..15 meaning -8..7: subtract 8 from every byte.
+             * Mask to 0xFF after the subtraction, otherwise a zero nibble
+             * (0 - 8) borrows into the neighbouring byte. */
+            { uint32_t v = lo;
+              b0 = (int)((((v      ) & 0xFF) - 8) & 0xFF)
+                 | (int)(((((v >>  8) & 0xFF) - 8) & 0xFF) <<  8)
+                 | (int)(((((v >> 16) & 0xFF) - 8) & 0xFF) << 16)
+                 | (int)(((((v >> 24) & 0xFF) - 8) & 0xFF) << 24); }
+            { uint32_t v = hi;
+              b1 = (int)((((v      ) & 0xFF) - 8) & 0xFF)
+                 | (int)(((((v >>  8) & 0xFF) - 8) & 0xFF) <<  8)
+                 | (int)(((((v >> 16) & 0xFF) - 8) & 0xFF) << 16)
+                 | (int)(((((v >> 24) & 0xFF) - 8) & 0xFF) << 24); }
         }
 
         int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
@@ -1721,21 +1738,20 @@ picolm_q4_1_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
         {
             int wc = tile_o + gid;
             const uint8_t *qs = w + (size_t)wc * row_bytes +
-                                (size_t)kb * GPU_BLOCK_Q4_1_SIZE + 4;
-            uint32_t raw0, raw1;
-            memcpy(&raw0, qs + tid * 2, 2);
-            memcpy(&raw1, qs + 16 + tid * 2, 2);
+                                (size_t)kb * GPU_BLOCK_Q4_1_SIZE + 4;  /* 16 bytes */
+            /* Same layout and same fix as Q4_0: 32 values in SIXTEEN bytes,
+             * qs[j] & 0xF -> element j, qs[j] >> 4 -> element j+16
+             * (dequantize_row_q4_1). This lane's b0 holds K[tid*4 .. tid*4+3]
+             * and b1 holds K[16+tid*4 ..], so both come from the same four
+             * bytes qs[tid*4 .. tid*4+3]. */
+            uint32_t raw;
+            memcpy(&raw, qs + tid * 4, 4);
 
-            uint32_t lo = (raw0 & 0x0F) | (((raw0 >> 4) & 0x0F) << 8)
-                        | ((raw0 >> 12) & 0x0F) << 16 | ((raw0 >> 20) & 0x0F) << 24;
-            uint32_t hi = (raw1 >> 4) & 0x0F;
-            hi |= (((raw1 >> 8) & 0x0F) << 8);
-            hi |= (((raw1 >> 12) & 0x0F) << 16);
-            hi |= ((raw1 >> 20) & 0x0F) << 24;
-
-            b0 = lo;
-            b1 = hi;
-            /* No subtract: nibbles 0..15 already have correct sign bit */
+            b0 = (int)(raw & 0x0F0F0F0F);            /* K[tid*4 ..]    */
+            b1 = (int)((raw >> 4) & 0x0F0F0F0F);     /* K[16+tid*4 ..] */
+            /* No bias needed: Q4_1 nibbles are unsigned 0..15 (top bit clear,
+             * so the s8 IMMA sign-extension keeps them positive) and the min
+             * term `m` is applied in the epilogue. */
         }
 
         int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
@@ -1781,21 +1797,28 @@ picolm_q4_1_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
         }
 #endif
 
+        /* Epilogue: y = d*IMMA + m*sum(q8), applied per OUTPUT COLUMN.
+         *
+         * sum[0]/sum[2] belong to output column tile_o + tid*2 and
+         * sum[1]/sum[3] to tile_o + tid*2 + 1 (the accumulator layout; see the
+         * store loop). The old code looked the scales up at tile_o + gid, and
+         * applied the m*sum(q8) min term to only two of the four accumulators,
+         * and only on tid==0. */
         float dx0 = xd[(size_t)(tile_s + gid) * n_blocks + kb];
         float dx1 = xd[(size_t)(tile_s + gid + 8) * n_blocks + kb];
-        int wc = tile_o + gid;
-        const uint8_t *wb = w + (size_t)wc * row_bytes + (size_t)kb * GPU_BLOCK_Q4_1_SIZE;
-        float wd = gpu_fp16_to_fp32(wb[0] | ((uint16_t)wb[1] << 8));
-        float wm = gpu_fp16_to_fp32(wb[2] | ((uint16_t)wb[3] << 8));
+        const uint8_t *wb0 = w + (size_t)(tile_o + tid * 2) * row_bytes
+                             + (size_t)kb * GPU_BLOCK_Q4_1_SIZE;
+        const uint8_t *wb1 = w + (size_t)(tile_o + tid * 2 + 1) * row_bytes
+                             + (size_t)kb * GPU_BLOCK_Q4_1_SIZE;
+        float wd0 = gpu_fp16_to_fp32(wb0[0] | ((uint16_t)wb0[1] << 8));
+        float wm0 = gpu_fp16_to_fp32(wb0[2] | ((uint16_t)wb0[3] << 8));
+        float wd1 = gpu_fp16_to_fp32(wb1[0] | ((uint16_t)wb1[1] << 8));
+        float wm1 = gpu_fp16_to_fp32(wb1[2] | ((uint16_t)wb1[3] << 8));
 
-        if (tid == 0) {
-            sum[0] += wm * dx0 * (float)sq0;
-            sum[2] += wm * dx1 * (float)sq1;
-        }
-        sum[0] += wd * dx0 * (float)d0;
-        sum[1] += wd * dx0 * (float)d1;
-        sum[2] += wd * dx1 * (float)d2;
-        sum[3] += wd * dx1 * (float)d3;
+        sum[0] += wd0 * dx0 * (float)d0 + wm0 * dx0 * (float)sq0;
+        sum[1] += wd1 * dx0 * (float)d1 + wm1 * dx0 * (float)sq0;
+        sum[2] += wd0 * dx1 * (float)d2 + wm0 * dx1 * (float)sq1;
+        sum[3] += wd1 * dx1 * (float)d3 + wm1 * dx1 * (float)sq1;
     }
     for (int f = 0; f < 4; f++) {
         int row = (f < 2) ? gid : gid + 8;
@@ -2697,20 +2720,23 @@ picolm_q2_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd,
         }
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 300
         {
-            unsigned mask = 0xF << (gid * 4);
-            sq0a += gpuShflDownSync(mask, sq0a, 2);
-            sq0b += gpuShflDownSync(mask, sq0b, 2);
-            sq1a += gpuShflDownSync(mask, sq1a, 2);
-            sq1b += gpuShflDownSync(mask, sq1b, 2);
-            sq0a += gpuShflDownSync(mask, sq0a, 1);
-            sq0b += gpuShflDownSync(mask, sq0b, 1);
-            sq1a += gpuShflDownSync(mask, sq1a, 1);
-            sq1b += gpuShflDownSync(mask, sq1b, 1);
-            /* Broadcast reduced sums to all threads in the group */
-            sq0a = gpuShflSync(mask, sq0a, 0);
-            sq0b = gpuShflSync(mask, sq0b, 0);
-            sq1a = gpuShflSync(mask, sq1a, 0);
-            sq1b = gpuShflSync(mask, sq1b, 0);
+            /* Same fix as the other K-quant kernels: the mask must name the
+             * whole warp (all 32 lanes execute this collective), and the 4-lane
+             * grouping is expressed by WIDTH=4 so srcLane 0 means "lane 0 of
+             * this group" rather than warp lane 0. */
+            const unsigned mask = 0xFFFFFFFFu;
+            sq0a += gpuShflDownSync(mask, sq0a, 2, 4);
+            sq0b += gpuShflDownSync(mask, sq0b, 2, 4);
+            sq1a += gpuShflDownSync(mask, sq1a, 2, 4);
+            sq1b += gpuShflDownSync(mask, sq1b, 2, 4);
+            sq0a += gpuShflDownSync(mask, sq0a, 1, 4);
+            sq0b += gpuShflDownSync(mask, sq0b, 1, 4);
+            sq1a += gpuShflDownSync(mask, sq1a, 1, 4);
+            sq1b += gpuShflDownSync(mask, sq1b, 1, 4);
+            sq0a = gpuShflSync(mask, sq0a, 0, 4);
+            sq0b = gpuShflSync(mask, sq0b, 0, 4);
+            sq1a = gpuShflSync(mask, sq1a, 0, 4);
+            sq1b = gpuShflSync(mask, sq1b, 0, 4);
         }
 #endif
 
