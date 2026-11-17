@@ -2482,7 +2482,23 @@ float *model_forward_glm5(model_t *m, int token, int pos);
 float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt);
 
 /* ---- GPT-2 forward pass (specialized) ---- */
+/* PICOLM_DBG_LAYER=<pos> / PICOLM_DBG_LAYER_N=<n>: dump the per-layer residual
+ * stream for CPU and GPU in the SAME format, so the first layer where the two
+ * diverge can be found by diffing the two logs. A bare "1" keeps the old
+ * behaviour (pos<=4, first 3 layers). */
+static int cpu_layer_dbg_pos = -2, cpu_layer_dbg_n = -2;
+static void cpu_layer_dbg_init(void) {
+    if (cpu_layer_dbg_pos != -2) return;
+    const char *e = getenv("PICOLM_DBG_LAYER");
+    cpu_layer_dbg_pos = e ? (e[0] == '1' && e[1] == 0 ? -1 : atoi(e)) : -1;
+    const char *en = getenv("PICOLM_DBG_LAYER_N");
+    cpu_layer_dbg_n = en ? atoi(en) : 3;
+}
+
 static float *model_forward_gpt2(model_t *m, int token, int pos) {
+    /* model_forward_prefill() can call this directly (n_tokens == 1), so the
+     * PICOLM_DBG_LAYER state set up in model_forward() may not have run. */
+    cpu_layer_dbg_init();
     model_config_t *c = &m->config;
     model_weights_t *w = &m->weights;
     run_state_t *s = &m->state;
@@ -2722,6 +2738,15 @@ static float *model_forward_gpt2(model_t *m, int token, int pos) {
                     l, s->xb[0],s->xb[1],s->xb[2],s->xb[3],s->xb[4],s->xb[5],s->xb[6],s->xb[7]);
         }
         vec_add(s->x, s->xb, dim);
+
+        /* Per-layer residual dump in the same [LNDBG] CPU l=N pos=P x={...}
+         * format as the generic path and the GPU, so GPT-2 prefill can be
+         * diffed layer by layer against its GPU counterpart. */
+        if (cpu_layer_dbg_pos >= 0 && pos == cpu_layer_dbg_pos && l < cpu_layer_dbg_n) {
+            fprintf(stderr, "[LNDBG] CPU l=%d pos=%d x={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                    l, pos, s->x[0],s->x[1],s->x[2],s->x[3],s->x[4],s->x[5],s->x[6],s->x[7]);
+        }
+
 #ifdef PICOLM_VIZ
         viz_push_row(l, pos, s->x, dim);
 #endif
@@ -2963,6 +2988,13 @@ static float *model_forward_gptneox(model_t *m, int token, int pos) {
         /* Parallel residual: x += attn_out + ffn_out */
         for (int i = 0; i < dim; i++) {
             s->x[i] = s->x[i] + s->xb2[i] + s->xb[i];
+        }
+
+        /* Same per-layer residual dump the generic path emits, so the GPT-2
+         * (and Spark) forward can be diffed layer by layer against the GPU. */
+        if (cpu_layer_dbg_pos >= 0 && pos == cpu_layer_dbg_pos && l < cpu_layer_dbg_n) {
+            fprintf(stderr, "[LNDBG] CPU l=%d pos=%d x={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                    l, pos, s->x[0],s->x[1],s->x[2],s->x[3],s->x[4],s->x[5],s->x[6],s->x[7]);
         }
 
 #ifdef PICOLM_VIZ
@@ -3228,19 +3260,6 @@ static float *model_forward_gptneox(model_t *m, int token, int pos);
 static float *model_forward_prefill_gptneox(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt);
 static float *model_forward_spark25(model_t *m, int token, int pos);
 static float *model_forward_prefill_spark25(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt);
-
-/* PICOLM_DBG_LAYER=<pos> / PICOLM_DBG_LAYER_N=<n>: dump the per-layer residual
- * stream for CPU and GPU in the SAME format, so the first layer where the two
- * diverge can be found by diffing the two logs. A bare "1" keeps the old
- * behaviour (pos<=4, first 3 layers). */
-static int cpu_layer_dbg_pos = -2, cpu_layer_dbg_n = -2;
-static void cpu_layer_dbg_init(void) {
-    if (cpu_layer_dbg_pos != -2) return;
-    const char *e = getenv("PICOLM_DBG_LAYER");
-    cpu_layer_dbg_pos = e ? (e[0] == '1' && e[1] == 0 ? -1 : atoi(e)) : -1;
-    const char *en = getenv("PICOLM_DBG_LAYER_N");
-    cpu_layer_dbg_n = en ? atoi(en) : 3;
-}
 
 float *model_forward(model_t *m, int token, int pos) {
     cpu_layer_dbg_init();
@@ -5084,6 +5103,17 @@ static float *model_forward_prefill_gptneox(model_t *m, const int *tokens, int n
             float *ffn = xb_batch + bi * dim;
             for (int i = 0; i < dim; i++) {
                 x[i] = x[i] + attn[i] + ffn[i];
+            }
+        }
+
+        /* Per-layer residual dump, same format as the generic path and the GPU,
+         * so the batched GPT-2/Spark prefill can be diffed layer by layer. */
+        if (cpu_layer_dbg_pos >= 0 && l < cpu_layer_dbg_n) {
+            int bi = cpu_layer_dbg_pos - start_pos;
+            if (bi >= 0 && bi < n_tokens) {
+                const float *x = x_batch + bi * dim;
+                fprintf(stderr, "[LNDBG] CPU l=%d pos=%d x={%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f}\n",
+                        l, cpu_layer_dbg_pos, x[0],x[1],x[2],x[3],x[4],x[5],x[6],x[7]);
             }
         }
 
