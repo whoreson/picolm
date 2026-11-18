@@ -1806,7 +1806,13 @@ static void handle_slots_post(SOCKET sock, const char *body) {
         }
 #endif
         double t0 = get_time_ms();
-        int rc = kvcache_save(&srv.model, full_path, srv.kv_pos, srv.last_prompt_tokens);
+        /* srv.kv_pos counts VALID KV rows; srv.last_prompt_tokens only holds
+         * srv.last_prompt_len entries. They are kept equal by the generation
+         * epilogues (see KV_WRITTEN), but kvcache_save() reads n_pos token IDs
+         * unconditionally, so clamp here rather than ever read past the array. */
+        int save_pos = srv.kv_pos;
+        if (save_pos > srv.last_prompt_len) save_pos = srv.last_prompt_len;
+        int rc = kvcache_save(&srv.model, full_path, save_pos, srv.last_prompt_tokens);
         double t_ms = get_time_ms() - t0;
 
         if (rc != 0) {
@@ -1862,8 +1868,8 @@ static void handle_slots_post(SOCKET sock, const char *body) {
         cJSON *root = cJSON_CreateObject();
         cJSON_AddNumberToObject(root, "id_slot", 0);
         cJSON_AddStringToObject(root, "filename", filename);
-        cJSON_AddNumberToObject(root, "n_saved", srv.kv_pos);
-        cJSON_AddNumberToObject(root, "n_written", srv.kv_pos);
+        cJSON_AddNumberToObject(root, "n_saved", save_pos);
+        cJSON_AddNumberToObject(root, "n_written", save_pos);
         cJSON *timings = cJSON_CreateObject();
         cJSON_AddNumberToObject(timings, "save_ms", t_ms);
         cJSON_AddItemToObject(root, "timings", timings);
@@ -2619,6 +2625,21 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
 
         /* ---- Generation phase ---- */
         int gen_count = 0;
+        /* KV_WRITTEN: number of generated tokens actually EVALUATED this
+         * request, i.e. the number of KV rows written past the prompt. The
+         * last sampled token is only forwarded at the BOTTOM of the loop body,
+         * so every `break` (stop word, EOS, client gone) leaves it unforwarded:
+         * the cache then ends at n_prompt + gen_written - 1, NOT at
+         * n_prompt + gen_count. Reporting the larger number made the next
+         * request believe a KV row was valid that never existed; because the
+         * prompt-cache prefix match includes the client's echoed stop string
+         * (e.g. "</tool_call>"), cache_start could land exactly on that phantom
+         * row, the re-prefill started after it, and every later token attended
+         * over a stale/zero column -- fluent but wrong output, most visibly a
+         * mangled tool call. Same bookkeeping as the GEN_CKPT_POS fix: a cache
+         * position must never claim more tokens than the state consumed.
+         * Model-independent: it never depended on recurrent state. */
+        int gen_written = 0;
         stop_matcher_reset(&sm);
 
         if (n_prefill <= 0) {
@@ -2712,6 +2733,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
             if (stopped || next == (int)tokenizer->eos_id) break;
             token = next;
             logits = server_model_forward(model, token, pos);
+            gen_written++;                      /* see KV_WRITTEN above */
         }
 
         double t_end = get_time_ms();
@@ -2785,8 +2807,11 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         }
         cJSON_Delete(done_chunk);
 
-        /* Save prompt + generated tokens for next request */
-        int total_ctx = n_prompt + total_generation_tokens;
+        /* Save prompt + generated tokens for next request.
+         * Only the tokens the forward pass actually consumed (see KV_WRITTEN):
+         * `total_generation_tokens` counts what was SENT, which is one higher
+         * whenever generation ended on a stop word or EOS. */
+        int total_ctx = n_prompt + gen_written;
         if (total_ctx > srv.max_last_prompt) {
             srv.max_last_prompt = total_ctx * 2;
             srv.last_prompt_tokens = (int *)realloc(srv.last_prompt_tokens, (size_t)srv.max_last_prompt * sizeof(int));
@@ -2809,12 +2834,17 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         double t_start_ns = get_time_ms();
         double t_prefill_end_ns = 0;
         int gen_count_ns = 0;
+        /* See KV_WRITTEN in the streaming path: generated tokens actually
+         * evaluated, across all choices (the cache holds the last choice's
+         * state, and this file already stores the last choice's token list). */
+        int gen_written_ns = 0;
 
         for (int c = 0; c < n_choices; c++) {
             sampler_t sampler;
             sampler_init(&sampler, temperature, top_p, top_k, 0.05f, seed + (uint64_t)c);
 
             int gen_count = 0;
+            int gen_written_cs = 0;             /* see KV_WRITTEN (per choice) */
             stop_matcher_reset(&sm);
             const char *finish_reason = "length";
 
@@ -2900,8 +2930,14 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
                 token = next;
                 gen_count_ns++;
                 logits_ns = server_model_forward(model, token, pos);
+                gen_written_cs++;               /* see KV_WRITTEN */
             }
             total_generation_tokens += gen_count;
+            /* The KV cache holds the LAST choice's state, and ptokens[] above is
+             * overwritten per choice, so the cache length must come from this
+             * choice alone -- not from a sum over choices (which is what
+             * total_generation_tokens is). */
+            gen_written_ns = gen_written_cs;
 
             cJSON *choice = cJSON_CreateObject();
             cJSON_AddNumberToObject(choice, "index", c);
@@ -2956,8 +2992,10 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         free(json);
         cJSON_Delete(root);
 
-        /* Save prompt + generated tokens for next request */
-        int total_ctx_ns = n_prompt + total_generation_tokens;
+        /* Save prompt + generated tokens for next request.
+         * gen_written_ns, not total_generation_tokens: the last sampled token
+         * was never forwarded when generation ended on a stop word/EOS. */
+        int total_ctx_ns = n_prompt + gen_written_ns;
         if (total_ctx_ns > srv.max_last_prompt) {
             srv.max_last_prompt = total_ctx_ns * 2;
             srv.last_prompt_tokens = (int *)realloc(srv.last_prompt_tokens, (size_t)srv.max_last_prompt * sizeof(int));
@@ -3314,6 +3352,11 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         }
 
         int gen_count = 0;
+        /* See KV_WRITTEN in handle_completion(): generated tokens actually
+         * evaluated. gen_count is not it -- the stop/EOS paths increment it and
+         * break WITHOUT forwarding the sampled token, so the KV cache ends one
+         * row earlier than gen_count claims. */
+        int gen_written = 0;
         token = ptokens[n_prompt - 1];
         for (int pos = n_prompt; pos < n_prompt + n_predict && logits; pos++) {
             if (!client_alive(sock)) {
@@ -3393,6 +3436,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             }
             token = next;
             logits = server_model_forward(model, token, pos);
+            gen_written++;                      /* see KV_WRITTEN */
         }
 
         double t_end = get_time_ms();
@@ -3421,7 +3465,9 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         cJSON_AddStringToObject(final, "stop_type", stop_type);
         cJSON_AddStringToObject(final, "stopping_word", stopping_word);
         cJSON_AddNumberToObject(final, "tokens_evaluated", n_prompt);
-        cJSON_AddNumberToObject(final, "tokens_cached", n_prompt + gen_count);
+        /* tokens_cached = what the KV cache actually holds (see KV_WRITTEN);
+         * gen_count includes the never-forwarded last sample. */
+        cJSON_AddNumberToObject(final, "tokens_cached", n_prompt + gen_written);
         cJSON *timings_c = cJSON_CreateObject();
         cJSON_AddNumberToObject(timings_c, "cache_n", start_pos);
         cJSON_AddNumberToObject(timings_c, "prompt_n", n_prompt - start_pos);
@@ -3443,14 +3489,18 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         }
         cJSON_Delete(final);
 
-        /* Save prompt + generated tokens for next request */
-        int total_ctx_c = n_prompt + gen_count;
+        /* Save prompt + generated tokens for next request.
+         * gen_written, not gen_count: only the forwarded tokens have KV rows
+         * (see KV_WRITTEN), and a cached position must never claim a token the
+         * model never evaluated -- that is what let the prompt-cache prefix
+         * match land on a stale row and corrupt the next request. */
+        int total_ctx_c = n_prompt + gen_written;
         if (total_ctx_c > srv.max_last_prompt) {
             srv.max_last_prompt = total_ctx_c * 2;
             srv.last_prompt_tokens = (int *)realloc(srv.last_prompt_tokens, (size_t)srv.max_last_prompt * sizeof(int));
         }
         memcpy(srv.last_prompt_tokens, ptokens, (size_t)n_prompt * sizeof(int));
-        memcpy(srv.last_prompt_tokens + n_prompt, gen_tok_buf, (size_t)gen_count * sizeof(int));
+        memcpy(srv.last_prompt_tokens + n_prompt, gen_tok_buf, (size_t)gen_written * sizeof(int));
         srv.last_prompt_len = total_ctx_c;
         srv.kv_pos = total_ctx_c;
         free(gen_tok_buf);
@@ -3469,6 +3519,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         }
         int token = ptokens[gen_start_ns];
         int gen_count = 0;
+        int gen_written_cn = 0;                 /* see KV_WRITTEN */
         const char *stop_type = "none";
         const char *stopping_word = "";
         stop_matcher_reset(&sm);
@@ -3569,6 +3620,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
             if (gen_count >= n_predict) { stop_type = "limit"; break; }
             token = next;
             logits_ns2 = server_model_forward(model, token, pos);
+            gen_written_cn++;                   /* see KV_WRITTEN */
             if (getenv("PICOLM_LOGITS_DUMP"))
                 dump_top_logits("LOGITS", logits_ns2, model->config.vocab_size, pos, 5);
         }
@@ -3591,7 +3643,7 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         cJSON_AddStringToObject(resp, "stop_type", stop_type);
         cJSON_AddStringToObject(resp, "stopping_word", stopping_word);
         cJSON_AddNumberToObject(resp, "tokens_evaluated", n_prompt);
-        cJSON_AddNumberToObject(resp, "tokens_cached", n_prompt + gen_count);
+        cJSON_AddNumberToObject(resp, "tokens_cached", n_prompt + gen_written_cn);
         cJSON_AddNumberToObject(resp, "tokens_predicted", gen_count);
 
         if (model_name) cJSON_AddStringToObject(resp, "model", model_name);
@@ -3619,14 +3671,17 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
 
         srv.kv_pos = n_prompt;
 
-        /* Save prompt + generated tokens for next request */
-        int total_ctx_cn = n_prompt + gen_count;
+        /* Save prompt + generated tokens for next request.
+         * gen_written_cn, not gen_count: the last sampled token was never
+         * forwarded when generation ended on a stop word / EOS / limit, so the
+         * cache holds one row fewer than gen_count tokens (see KV_WRITTEN). */
+        int total_ctx_cn = n_prompt + gen_written_cn;
         if (total_ctx_cn > srv.max_last_prompt) {
             srv.max_last_prompt = total_ctx_cn * 2;
             srv.last_prompt_tokens = (int *)realloc(srv.last_prompt_tokens, (size_t)srv.max_last_prompt * sizeof(int));
         }
         memcpy(srv.last_prompt_tokens, ptokens, (size_t)n_prompt * sizeof(int));
-        memcpy(srv.last_prompt_tokens + n_prompt, gen_token_ids, (size_t)gen_count * sizeof(int));
+        memcpy(srv.last_prompt_tokens + n_prompt, gen_token_ids, (size_t)gen_written_cn * sizeof(int));
         srv.last_prompt_len = total_ctx_cn;
         srv.kv_pos = total_ctx_cn;
 
