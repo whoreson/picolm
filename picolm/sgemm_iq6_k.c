@@ -416,7 +416,7 @@ static void iq6t_decode_group(const char *wbase, size_t w_row_bytes, int nb, con
  * with ONE 6-bit scale (ls-32) per sub-block. That is two identical 16-value groups in the IQ6_K
  * scratch (int8 weights as R8 vectors, per-16-group scales, 8 fp32 row scales), so only the
  * decode differs and both compute kernels below are reused unchanged. */
-static inline always_inline void iq4xs_load_wv(const block_iq4_xs *x, __m256i wv[8]) {
+static inline PICOLM_ALWAYS_INLINE void iq4xs_load_wv(const block_iq4_xs *x, __m256i wv[8]) {
     const __m256i lut = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)kvalues_iq4nl));
     const __m128i m15 = _mm_set1_epi8(15);
     for (int k = 0; k < 8; ++k) {
@@ -523,7 +523,7 @@ static void iq3xxs_t_decode_group(const char *wbase, size_t w_row_bytes, int nb)
  *   Q6_K : q = ((ql nibble) | (2 high bits << 4)) - 32, scale = int8 scales[g], natural 16-groups.
  *   Q3_K : q = (2 low bits | (hmask bit << 2)) - 4,     scale = 6-bit packed scale - 32. */
 enum { KQ_Q6K = 2, KQ_Q3K = 3, KQ_Q4K = 4, KQ_Q5K = 5, KQ_Q2K = 6, KQ_Q4KR4 = 7, KQ_Q6KR4 = 8, KQ_IQ4K = 9, KQ_IQ4KR4 = 10, KQ_IQ2K = 11, KQ_IQ3K = 12, KQ_IQ2KR4 = 13, KQ_IQ3KR4 = 14, KQ_IQ3XXS = 15 };
-static inline always_inline void kq_load_q6(const block_q6_K *x, __m256i wv[8], int8_t sc[16]) {
+static inline PICOLM_ALWAYS_INLINE void kq_load_q6(const block_q6_K *x, __m256i wv[8], int8_t sc[16]) {
     const __m256i m0f = _mm256_set1_epi8(0x0F), m03 = _mm256_set1_epi8(0x03), m32 = _mm256_set1_epi8(32);
     for (int n = 0; n < 2; ++n) {                       /* two 128-value halves */
         const __m256i l0 = _mm256_loadu_si256((const __m256i *)(x->ql + 64 * n));
@@ -538,7 +538,7 @@ static inline always_inline void kq_load_q6(const block_q6_K *x, __m256i wv[8], 
     }
     for (int g = 0; g < 16; ++g) sc[g] = x->scales[g];
 }
-static inline always_inline void kq_load_q3(const block_q3_K *x, __m256i wv[8], int8_t sc[16]) {
+static inline PICOLM_ALWAYS_INLINE void kq_load_q3(const block_q3_K *x, __m256i wv[8], int8_t sc[16]) {
     const __m256i m03 = _mm256_set1_epi8(0x03), one = _mm256_set1_epi8(1), four = _mm256_set1_epi8(4);
     const __m256i hm = _mm256_loadu_si256((const __m256i *)x->hmask);
     for (int n = 0; n < 2; ++n) {
@@ -564,7 +564,7 @@ static inline always_inline void kq_load_q3(const block_q3_K *x, __m256i wv[8], 
  * through a 16-entry int8 table chosen per half by one `extra` bit (iq4k_values: two tables of 16),
  * with an independent signed scale per half ((6 bits) - 32), i.e. natural 16-groups 2k and 2k+1.
  * VPSHUFB is lane-local, so ONE shuffle with [tableA | tableB] decodes both halves. No mins. */
-static inline always_inline void kq_load_iq4k(const block_iq4_k *x, __m256i wv[8], int8_t sc[16]) {
+static inline PICOLM_ALWAYS_INLINE void kq_load_iq4k(const block_iq4_k *x, __m256i wv[8], int8_t sc[16]) {
     const __m256i m0f = _mm256_set1_epi8(0x0F);
     const unsigned extra = x->extra;
     for (int k = 0; k < 8; ++k) {
@@ -586,7 +586,7 @@ static inline always_inline void kq_load_iq4k(const block_iq4_k *x, __m256i wv[8
  * by an `extra` bit (iq2nl_values: 2 x 4 entries, iq3nl_values: 2 x 8) and has its own signed scale:
  *   IQ2_K: (nibble) - 8        IQ3_K: (2*nibble + 1) * (sign bit ? -1 : 1).   No mins.
  * One lane-local VPSHUFB with [tableA | tableB] decodes both halves. */
-static inline always_inline void kq_load_iq2k(const block_iq2_k *x, __m256i wv[8], int8_t sc[16]) {
+static inline PICOLM_ALWAYS_INLINE void kq_load_iq2k(const block_iq2_k *x, __m256i wv[8], int8_t sc[16]) {
     const __m256i m03 = _mm256_set1_epi8(0x03);
     const unsigned extra = x->extra;
     for (int k = 0; k < 8; ++k) {
@@ -597,7 +597,7 @@ static inline always_inline void kq_load_iq2k(const block_iq2_k *x, __m256i wv[8
         sc[2 * k] = (int8_t)((x->scales[k] & 0xf) - 8); sc[2 * k + 1] = (int8_t)((x->scales[k] >> 4) - 8);
     }
 }
-static inline always_inline void kq_load_iq3k(const block_iq3_k *x, __m256i wv[8], int8_t sc[16]) {
+static inline PICOLM_ALWAYS_INLINE void kq_load_iq3k(const block_iq3_k *x, __m256i wv[8], int8_t sc[16]) {
     const __m256i m03 = _mm256_set1_epi8(0x03), one = _mm256_set1_epi8(1);
     const __m256i qh = _mm256_loadu_si256((const __m256i *)x->qh);
     const unsigned extra = x->extra, sh = x->scales_h;
@@ -652,7 +652,7 @@ static inline void kq_k4_meta(const uint8_t *scales, int8_t sc[16], uint8_t mn[1
         sc[2 * s] = sc[2 * s + 1] = (int8_t)a; mn[2 * s] = mn[2 * s + 1] = (uint8_t)b;
     }
 }
-static inline always_inline void kq_load_q4(const block_q4_K *x, __m256i wv[8], int8_t sc[16], uint8_t mn[16]) {
+static inline PICOLM_ALWAYS_INLINE void kq_load_q4(const block_q4_K *x, __m256i wv[8], int8_t sc[16], uint8_t mn[16]) {
     const __m256i m0f = _mm256_set1_epi8(0x0F);
     for (int i = 0; i < 4; ++i) {
         const __m256i v = _mm256_loadu_si256((const __m256i *)(x->qs + 32 * i));
@@ -661,7 +661,7 @@ static inline always_inline void kq_load_q4(const block_q4_K *x, __m256i wv[8], 
     }
     kq_k4_meta(x->scales, sc, mn);
 }
-static inline always_inline void kq_load_q5(const block_q5_K *x, __m256i wv[8], int8_t sc[16], uint8_t mn[16]) {
+static inline PICOLM_ALWAYS_INLINE void kq_load_q5(const block_q5_K *x, __m256i wv[8], int8_t sc[16], uint8_t mn[16]) {
     const __m256i m0f = _mm256_set1_epi8(0x0F), one = _mm256_set1_epi8(1);
     const __m256i qh = _mm256_loadu_si256((const __m256i *)x->qh);
     for (int i = 0; i < 4; ++i) {
@@ -674,7 +674,7 @@ static inline always_inline void kq_load_q5(const block_q5_K *x, __m256i wv[8], 
     }
     kq_k4_meta(x->scales, sc, mn);
 }
-static inline always_inline void kq_load_q2(const block_q2_K *x, __m256i wv[8], int8_t sc[16], uint8_t mn[16]) {
+static inline PICOLM_ALWAYS_INLINE void kq_load_q2(const block_q2_K *x, __m256i wv[8], int8_t sc[16], uint8_t mn[16]) {
     const __m256i m03 = _mm256_set1_epi8(0x03);
     for (int n = 0; n < 2; ++n) {
         const __m256i q = _mm256_loadu_si256((const __m256i *)(x->qs + 32 * n));
@@ -699,7 +699,7 @@ static inline void kqm_store(int ib, int r, const uint8_t mn[16], float dmin) {
     kqm_tl.dm[(size_t)ib * 8 + r] = dmin;
 }
 /* One row of a min-type block: fills wv, sc, and the min scratch; returns d. */
-static inline always_inline float kq_load_min_row(int kind, const char *xr, int ib, int r, __m256i wv[8], int8_t sc[16]) {
+static inline PICOLM_ALWAYS_INLINE float kq_load_min_row(int kind, const char *xr, int ib, int r, __m256i wv[8], int8_t sc[16]) {
     uint8_t mn[16]; float d, dmin;
     if (kind == KQ_Q4K)      { const block_q4_K *x = (const block_q4_K *)xr + ib; kq_load_q4(x, wv, sc, mn); d = iq6_f16(x->d); dmin = iq6_f16(x->dmin); }
     else if (kind == KQ_Q5K) { const block_q5_K *x = (const block_q5_K *)xr + ib; kq_load_q5(x, wv, sc, mn); d = iq6_f16(x->d); dmin = iq6_f16(x->dm); }
@@ -749,7 +749,7 @@ static inline void kqr4_scale_min(const block_q4_k_r4 *x, int ib, int row, int *
     *mn = (int)((l >> 4) | ((h & 0x0c) << 2));
 }
 /* Writes the 8 R8 vectors (o[j]) of sub-block k for rows a (0-3) | b (4-7) of super-block ib. */
-static inline always_inline void kqr4_vecs(const block_q4_k_r4 *a, const block_q4_k_r4 *b, int k, __m256i o[8]) {
+static inline PICOLM_ALWAYS_INLINE void kqr4_vecs(const block_q4_k_r4 *a, const block_q4_k_r4 *b, int k, __m256i o[8]) {
     const __m256i m0f = _mm256_set1_epi8(0x0F);
     __m256i w[4];
     for (int kk = 0; kk < 4; ++kk)
@@ -800,7 +800,7 @@ static void kqr4_t_decode_group(const char *wbase, size_t w_row_bytes, int nb) {
  *   j4: lo(ql1) | qh1<<4    j5: lo(ql3) | qh1       j6: hi(ql1) | qh1<<2    j7: hi(ql3) | qh1>>2
  * (value index = 4*j + i); scales: s[8*ib + row] covers positions 0..15, s[8*ib + row + 4] positions
  * 16..31, i.e. natural 16-groups 2*ib and 2*ib+1.  No mins. */
-static inline always_inline void kqr6_vecs(const block_q6_K_R4 *a, const block_q6_K_R4 *b, int ib, __m256i o[8]) {
+static inline PICOLM_ALWAYS_INLINE void kqr6_vecs(const block_q6_K_R4 *a, const block_q6_K_R4 *b, int ib, __m256i o[8]) {
     const __m256i m0f = _mm256_set1_epi8(0x0F), m30 = _mm256_set1_epi8(0x30), m32 = _mm256_set1_epi8(32);
     __m256i ql[4], qh[2];
     for (int kk = 0; kk < 4; ++kk)
@@ -855,7 +855,7 @@ static void kqr6_t_decode_group(const char *wbase, size_t w_row_bytes, int nb) {
  * group), values2 = extra[row+4] bit ib (second group), so a lane (4 rows) can mix tables: shuffle
  * with both tables and blend per row.  Scales: is = 8*ib + row (first group), +4 (second group),
  * see dequantize_row_iq4_k_r4_single. d[row] per row, no mins. */
-static inline always_inline void kqi4r_vecs(const block_iq4_k_r4 *a, const block_iq4_k_r4 *b, int ib, __m256i o[8]) {
+static inline PICOLM_ALWAYS_INLINE void kqi4r_vecs(const block_iq4_k_r4 *a, const block_iq4_k_r4 *b, int ib, __m256i o[8]) {
     const __m256i m0f = _mm256_set1_epi8(0x0F);
     const __m128i t0 = _mm_loadu_si128((const __m128i *)iq4k_values), t1 = _mm_loadu_si128((const __m128i *)(iq4k_values + 16));
     const __m256i T0 = _mm256_broadcastsi128_si256(t0), T1 = _mm256_broadcastsi128_si256(t1);
@@ -917,7 +917,7 @@ static void kqi4r_t_decode_group(const char *wbase, size_t w_row_bytes, int nb) 
  * qh + 16*ib (same slice shape, bit j of each byte).  Tables are per ROW (extra[row] bit ib first half,
  * extra[row+4] second half): shuffle with both tables and blend per row.  Scales: is = 8*ib + row (+4 for
  * the second half) as in the references.  d[row] per row, no mins. */
-static inline always_inline void kqik4_vecs(int kind, const void *va, const void *vb, int ib, __m256i o[8]) {
+static inline PICOLM_ALWAYS_INLINE void kqik4_vecs(int kind, const void *va, const void *vb, int ib, __m256i o[8]) {
     const int is3 = (kind == KQ_IQ3KR4);
     const uint8_t *qa = is3 ? ((const block_iq3_k_r4 *)va)->qs : ((const block_iq2_k_r4 *)va)->qs;
     const uint8_t *qb = is3 ? ((const block_iq3_k_r4 *)vb)->qs : ((const block_iq2_k_r4 *)vb)->qs;
@@ -982,7 +982,7 @@ static void kqik4_t_decode_group(int kind, const char *wbase, size_t w_row_bytes
     }
 }
 
-static inline always_inline
+static inline PICOLM_ALWAYS_INLINE
 void iq6t_tile(int nb, const char *y0, size_t y_row_bytes, float *out, size_t bs, const int NC, const int HASMIN) {
     __m256 facc[IQ6T_NCMAX];
 SGEMM_UNROLL8
@@ -1340,7 +1340,7 @@ static void iq6v_stage_seeds(const char *vy, size_t y_row_bytes, int c0, int pc,
     }
 }
 
-static inline always_inline
+static inline PICOLM_ALWAYS_INLINE
 void iq6v_tile(int nb, const char *y0, size_t y_row_bytes, const int32_t *cr0, float *out, size_t bs, const int NC, const int HASMIN) {
     __m256 facc[IQ6V_NC];
 SGEMM_UNROLL8

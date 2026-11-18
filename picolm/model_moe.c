@@ -17,7 +17,11 @@ static inline void *picolm_aligned_alloc(size_t align, size_t size) {
     /* DOS: no aligned alloc, use standard malloc. 64-byte alignment is advisory. */
     return malloc(size);
 #elif defined(__APPLE__) && (defined(__GNUC__) && __GNUC__ < 4)
-    /* Old Mac OS X (Tiger): no posix_memalign, use valloc (page-aligned) */
+     /* Apple: no posix_memalign in libSystem before 10.4.8, and not in
+      * iPhoneOS 1.x either (GCC 4.0.1 arm-apple-darwin). valloc is in every
+      * Darwin libSystem, returns page-aligned memory (>= 64B), free()-able.
+      * It's in OS/X 10.6+ I think though. I need an iPhoneOS-specific define
+        here. TODO */
     return valloc((size) + (align) - 1);
 #else
     void *ptr = NULL;

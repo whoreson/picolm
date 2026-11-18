@@ -68,12 +68,12 @@
 #define __thread __declspec(thread)
 #endif
 #endif
-/* always_inline: GCC __attribute__((always_inline)) vs MSVC __forceinline. */
-#ifndef always_inline
+/* PICOLM_ALWAYS_INLINE: GCC __attribute__((always_inline)) vs MSVC __forceinline. */
+#ifndef PICOLM_ALWAYS_INLINE
 #if defined(_MSC_VER)
-#define always_inline __forceinline
+#define PICOLM_ALWAYS_INLINE __forceinline
 #else
-#define always_inline __attribute__((always_inline))
+#define PICOLM_ALWAYS_INLINE __attribute__((always_inline))
 #endif
 #endif
 

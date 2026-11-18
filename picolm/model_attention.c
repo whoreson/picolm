@@ -1049,7 +1049,7 @@ static inline void ad_prefetch_row_l2(const uint8_t *p, size_t bytes) {
  * m_out[g] (log2-domain running max), l_out[g] (sum of weights relative to m),
  * acc_out[g*hd + d]. KVM / FAST are compile-time constants at the specialized
  * call sites (FAST = both caches F16, no dequant scratch needed). */
-static inline always_inline
+static inline PICOLM_ALWAYS_INLINE
 void ad_chunk_impl(const attn_group_ctx_t *ctx, int kv_h, int t0, int t1,
                    float *m_out, float *l_out, float *acc_out,
                    const int KVM, const int FAST) {
@@ -1676,7 +1676,7 @@ static void attn_process_tile(attn_tile_task_t *t, float *tmp_f32);
 #endif
 /* Needed by both the AVX-512 and the AVX2 slice-major PV kernels. */
 #if !defined(ATTN_ALWAYS_INLINE)
-#define ATTN_ALWAYS_INLINE inline always_inline   /* project macro, see quant.h */
+#define ATTN_ALWAYS_INLINE inline PICOLM_ALWAYS_INLINE   /* project macro, see quant.h */
 #endif
 
 #if defined(PICOLM_AVX512)
