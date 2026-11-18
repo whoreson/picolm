@@ -19,55 +19,95 @@ https://github.com/whoreson/thelastjinja
 
 ## What's New
 
-<table><tr><td><b>v1.0-rc2</b> ("Yura Kana")</td><td align="right"><img src="yura_kana.jpg" width="80" alt="Yura Kana"></td></tr></table>
+<table><tr><td><b>v1.0-rc3</b> ("Yura Kana")</td><td align="right"><img src="yura_kana.jpg" width="80" alt="Yura Kana"></td></tr></table>
 
-- RoPE scaling: linear, YaRN, and LongRoPE methods. Pre-computed cos/sin tables modified per GGUF rope.scaling metadata (freq_scale, ext_factor, attn_factor, beta_fast/slow), enabling extended context beyond model defaults
-- Sliding window attention (SWA), model-independent with unit tests
-- Tokenizer rewritten: O(n^2) -> O(n log n) SPM via priority queue + hash table, UTF-8 fallback always splits on failed lookup
-- IQ4_NL (GGUF type 20) full support: LUT-based non-linear 4-bit quantization with AVX512 VPERMD, AVX2 VPSHUFB, NEON vqtbl1q_u8 dequant, I8MM/AVX2/NEON int8 MAC matmul, Lloyd-Max 4-bit quantize
-- Quantized tiled GEMM engine (C port of llama.cpp's TinyBLAS Q0): Q8_0/Q4_0/Q5_0 x Q8_0, AVX2 sign-trick+maddubs/dpbusd, AVX-512 VNNI, NEON I8MM/SDOT, dispatched from tensor.c matmul_batch at n_batch>=32
-- NEON tiled GEMM for ARM Pi 4 (Cortex-A72, basic NEON only)
-- AVX2/AVX1/SSSE3 SIMD paths for Q4_K tiled GEMM kernel
-- NEON acceleration expanded: Q4_K, Q5_K, Q6_K, Q3_K, Q2_0, Q1_0 vec_dot and sgemm paths
-- I8MM (ARM64) vec_dot for Q4_0, Q8_0, Q4_K using vmmlaq_s32; DotProd gemv for Q4_0_4_4/Q4_0_4_8 (1.3x vs Q4_0 on DGX Spark)
-- Q4_0_4_4 (GGUF type 31, 4-row interleaved) and Q4_0_4_8 (type 32) full support with DotProd gemv and I8MM gemm
-- Q6_0 (GGUF type 133) quantization support
-- Q5_1 fast path via vec_dot_q5_1_q8_0 (NEON int8 MAC)
-- Q4_K tiled GEMM kernel (AVX2, 1x4 tiles)
-- BF16 GEMM kernels (bf16_f32 + bf16_bf16)
-- Vulkan compute backend (preliminary, barely tested): push descriptors replacing descriptor rings, fused QKV/GU shaders with auto GCN1 detection, F16 KV-cache attention for prefill, batched RoPE, scoped barriers, KAVERI (PS4) compatibility
-- GPT-2 GPU fully working on CUDA/HIP/Vulkan: fused QKV split, LayerNorm, GELU, activation quantization, KV cache fixes
-- IQ4_NL GPU support: converted to Q8_0 at upload time for HIP compatibility
-- Server: /slots/0 path for llama.cpp compatibility, return_progress for prefill progress, consolidated stop-word matching into stop_matcher_t, SIGPIPE guard, double-free fixes
-- MSYS2 CUDA: hunger-msys-direct Makefile target for SSH builds with nvcc+cl.exe
-- OSF/1 Tru64 UNIX (DEC Alpha) compilation support
-- iPhoneOS 1 (ARMv6, LLVM-GCC 4.0.1) build and runtime support
-- Big-endian BE swap: IQ4_NL support added, warning for unsupported tensor types
-- Cross-platform packed struct macros (__PICO_PACKED) for MSVC/LLVM-GCC compatibility
-- PICOLM_SGEMM=0 env var to disable tiled GEMM
-- GPU: PICOLM_NO_IMMA flag to disable IMMA kernels, PICOLM_F32KV env var to guard F32KV attention
-- CUDA/HIP: Q6_K native IMMA fully working (qh byte extraction, offset, high-nibble masking all fixed)
-- CUDA/HIP: Q4_K IMMA dispatched but BROKEN for S>=16 (use PICOLM_NO_IMMA=1)
-- Gemma-3n: KV cache reuse fixed for non-KV layers, SWA RoPE tables wired into layer loop
-- gaussian_topk std: reverted to ddof=1 matching llama.cpp
-- Server default --checkpoint-max to 3 in --server mode, --slot-save-path to .
-- --benchmark-ctx honors thread count and truncates prompt
-- Fix: stale .o files causing 0-token prompt, log warning on oversized prompt rejection in server
-- Fix: HIP decode broken since GPU merge for O<256 or head_dim<16
-- Fix: Q5_0 GEMM on AVX2/AVX-512 (wrong qh bit position + missing offset)
-- Fix: Q4_0_8_8 LUT byte order + disabled broken GEMM with vec_dot fallback
-- Fix: GPU tensor upload for SSM models (Qwen3.6)
-- Fix: Vulkan RMSNorm push constant bug on RADV, descriptor set aliasing, quantize shader shared memory race
-- Fix: PICOLM_NGL partial GPU offload correctness on Windows WDDM
-- Fix: GPT-2 GPU prefill segfault, fused QKV split, LayerNorm Vulkan support
-- Fix: Vulkan KAVERI multi-ubatch prefill corruption workaround, D2H/H2D hang
-- Fix: Vulkan fused QKV/GU shader local_size_x and Q8 block stride bugs
-- Fix: Vulkan KV cache D2H sync, coherent GPU inference, fence checks, ring wraparound
-- Fix: Vulkan KV cache flush via backend-agnostic picolm_gpu_kv_flush_to_cpu()
-- Fix: Vulkan activation quantization rounding matches CPU/CUDA/HIP
-- Fix: Vulkan gracefully rejects unsupported quantization types on GPU
-- Remove dead matmul_dual_batch path and orphaned tensor_prof.c
-- Don't dump full help on unknown option
+PicoLM on standard attention models (llama 2 & Co., Mistral Nemo,
+Fimbulvetr, you know, models with soul and of consequence) is <a
+href="https://gabucino.hu/bench/v1.0-rc3/miqu-q4/">now faster on
+CPU than ik_llama, on prefill, decode, and deep context attention itself</a> (!).
+If you see another engine faster than this, let me know.
+
+Mainline llama.cpp's sluggish tempo doesn't even apply, I usually don't even
+measure it because it's just dismal and makes me feel vicarious
+embarrassment. C++ bloatware developers are left in the dirt. (Qwen and
+GLM still lags behind in prefill, but is world#1 in CPU decode.)
+
+In 2 months of continuous development since rc2, I worked only on CPU
+improvements (who can afford a GPU?..), although a last-minute CUDA fix by
+DeepSeek (xie-xie) now finally enabled all other IMMA kernels besides Q8 and
+Q6. But don't expect that much, the bit GPU enhancements will be done after
+rc3.
+
+Most of the development effort and time went into fast IQ* quantization
+implementations and kernels. Some of the cope 1-bit and 2-bit tiers are only
+barebones, don't embarrass yourself with those.
+
+Recommended quantization levels for the best performance: Q8_0_R8, IQ6_K;
+IQ4_NL and other mid-tier quants when needed.
+
+PicoLM server is now feature-complete and bug-free even for agentic use.
+The gigabytes of bugware string-parsing logic necessary for a
+chat-completion endpoint will never be implemented in the server because it
+simply does not belong here, a "thelastjinja" Python proxy was created which
+supplements PicoLM and enables agentic work with any model: Qwen, GLM,
+Spark. Development is performed by/on PicoLM itself.
+
+New model architectures
+- GLM-5 / GLM-5.3-Flash (glm5next): full CPU forward pass with mHC hyper-connections (Sinkhorn), KDA linear attention, absorbed NoPE-MLA and MoE (sigmoid+bias router, ungated shared expert). QWEN_PRETOK_GLM4 digit-grouping pretokenizer, GLM chat template.
+- Spark-X2.5 (spark2_5): fused QKV, dual RoPE tables, head-wise sigmoid gate, GeGLU FFN, SWA; tokenizer matches llama.cpp byte-for-byte.
+- GPTNeoX (Krake v2) and StableLM (Clio v1 Legacy): NovelAI's released models, somewhat falling into my purview. LayerNorm+bias, parallel residual, partial RoPE, GELU FFN.
+- Qwen3.5/3.6: RoPE actually is NEOX-style half-split, not pairwise (IMROPE and NEOX produce the same rotation) -- a correctness fix for every Qwen3.5/3.6 release before this one.
+- Generic recurrent-state checkpointing: --cache save/reload now covers MLA/KDA state, not only Qwen SSM.
+
+GLM-5 performance (prefill and decode)
+- Batched MoE dispatch (24 -> 2), expert-sorted batched prefill.
+- Head-parallel KDA core and tail (150 -> 81 ms/token).
+- Flash-style blocked MLA prefill (3.8x); MLA decode 19x faster at deep context; F16 shadow of the MLA latent cache (84 -> 52 ms at 7k context).
+- Split-KV decode attention, MLA split-KV, int16 PV (vpdpwssd), batched dense-FFN prefill: all default-on now, each with an opt-out environment variable.
+
+Quantization: i-quants and row-interleaved R4/R8 family
+- New formats: IQ4_XS (type 23), IQ6_K (141), IQ4_K (139), IQ4_K_R4 (339), IQ3_K_R4 (338), Q4_K_R4 (212), IQ4_NL_R4 (220), Q6_K_R4, Q2_K_R4, Q8_K_R8, Q4_0_R8, IQ2_K, IQ3_K, IQ2_XXS/2_XS/1_S/3_S/2_S (standard GGUF IQ grid quants).
+- sgemm split into per-type source files; "decode-once" R8 GEMM engine (AVX-512 VNNI + AVX2 + NEON): weight rows decoded once per column panel instead of per activation column, removing the LUT-decode bottleneck from long-context prefill.
+- Row-aware addressing helpers (gguf_type_row_ptr etc.) after R4/R8 vec_dot silently read the wrong logical row for 3/4 (or 7/8) of all rows.
+- IQ2_K/IQ3_K AVX2 decode-once rewrite; IQ2_XXS/XS/S AVX2 GEMV (8-35x); IQ6_K VNNI rewrite (1.5x); BF16 tiled GEMM for ARM NEON (there was none) + ARM bfdot activation panel.
+
+Attention and SSM speed
+- Tiled prefill attention: log2-domain softmax, lazy online-softmax rescale, AVX2/NEON vector exp2, tile/row-block skip, GQA-grouped task (4x fewer KV reads), quantized KV caches (q8_0/q4_0/tq3/tq4).
+- SSM conv1d parallelized over channels (589 -> 324 ms), gated-norm parallelized over (token, v-head) (228 -> 15 ms, 14.7x), rolling conv1d history instead of per-token state shift.
+- Vectorised GELU/SiLU: fixed a 3.5x scalar-activation bottleneck.
+- AVX-512 RoPE cos/sin shuffle constant fix (wrong patterns).
+
+Thread pool
+- Spin-then-sleep barrier: 75x fewer context switches.
+- Dynamic chunk claiming in matmul, nested-dispatch prevention, per-thread quant scratch, PICOLM_PIN thread affinity with cgroup-aware spin budget, narrow decode matmuls threaded (min_rows 256 -> 16), batched activation quantization once per matmul instead of once per work item.
+
+GPU (CUDA, fixes only, HIP untested in this release but should work)
+- Full IMMA kernel audit: Q4_0, Q4_1, Q2_K fixed; all 10 quant types now agree with the CPU bit-for-bit; every quant may use IMMA at decode (S=1).
+- GPU/backend audit: Vulkan ignored rope_type; Metal and CUDA SSM assumed head_v_dim == d_state. GPT-2 CUDA garbage fixed (unuploaded attn_output handle). PICOLM_NGL partial offload now declines the pipeline instead of crashing; soft fallback to CPU when the GPU KV cache is declined (non-F16 cache).
+- Per-layer CPU/GPU residual dumps under one switch (PICOLM_DBG_LAYER).
+
+Server and CLI
+- --steer L:N:DOSE neuron steering via ffn_down columns.
+- --benchmark-live: per-layer timing during ordinary generation (works with --cache and real prompts, unlike --benchmark).
+- --prefill-ubatch N: chunked CLI prefill with KV/SSM state preserved.
+- --cache saves the full conversation including SSM checkpoints; GPU sync after --cache load.
+- Server: growable heap recv buffer (was fixed 64 KB), stop-word text salvage (withheld tail flushed on EOS/length limit), GLM-5 checkpoint gating and off-by-one gen checkpoint fixes.
+
+Platforms and build
+- GitHub Actions CI: Linux x86 matrix + prefill smoke tests with cross-build output comparison (which I conveniently ignore ATM), Linux tests, macOS ARM64, Ubuntu ARM64 (NEON), Windows MinGW, Windows MSVC + MSVC SIMD-tier parity jobs.
+- MSVC: full build (make msvc / msvc-gpu with SIMD autodetect), C11 atomics/pthread shim, PICOLM_VIZ enabled.
+- WiiLinux PPC paired-singles intrinsics + big-endian GGUF corruption fix; Mac OS X Tiger (GCC 3.3) build; Termux aligned_alloc/pthread fixes; SVE mis-detection guard for clang -march=native on ARMv9.
+- make help; 'all' is the default goal again.
+
+Testing and tooling
+- stories260K-stuffed.gguf (12 distinct tensor types, ~290 KB). ik_llama blatantly hangs on its own formats in this one, PicoLM runs it even in MS-DOS, cope
+- stories260K-r4.gguf (7 interleaved types): every architecture in CI runs a test against real interleaved/quant-diverse models, plus a SIMD-vs-scalar differential check.
+- Dummy-oracle model generator + end-to-end differential check (logit tolerance comparison against the reference).
+- check-all + sanitizer targets; row-interleaved layout regression; test_quant orphaned suites revived.
+- --list-tensors buffer sizing fix (silent truncation).
+
+Visualization
+- Reworked the theme: position-indexed activation grid, per-request reset with relative column indexing, rewind detection after ring wrap, bucket-specific scale calibration, auto-rederive when activations drift.
 
 ## What all this is
 
@@ -86,7 +126,7 @@ In low-memory environments, to avoid weights needlessly being rotated round-robi
 
 Per-layer activation heatmap, viewable over the built-in VNC server, with no speed loss. Looks cool. Also can enable/disable/reorder layers with the pointer, though the Basilisk probably won't be very approving of this. Think about the future, Eckhardt! More visualizations planned, even console ANSI.
 
-## Who devs this
+## Who develops this
 
 This was someone's Claude vibeslop originally, but I started to tinker with it and it grew. Now it's Qwen vibeslop. I'm Gabucino, member of the original MPlayer team from 25 years ago (which was very closely related to ffmpeg).
 
@@ -136,6 +176,56 @@ This was someone's Claude vibeslop originally, but I started to tinker with it a
 ```
 
 ## Past Releases
+
+<table><tr><td><b>v1.0-rc2</b> ("Yura Kana")</td><td align="right"><img src="yura_kana.jpg" width="80" alt="Yura Kana"></td></tr></table>
+
+- RoPE scaling: linear, YaRN, and LongRoPE methods. Pre-computed cos/sin tables modified per GGUF rope.scaling metadata (freq_scale, ext_factor, attn_factor, beta_fast/slow), enabling extended context beyond model defaults
+- Sliding window attention (SWA), model-independent with unit tests
+- Tokenizer rewritten: O(n^2) -> O(n log n) SPM via priority queue + hash table, UTF-8 fallback always splits on failed lookup
+- IQ4_NL (GGUF type 20) full support: LUT-based non-linear 4-bit quantization with AVX512 VPERMD, AVX2 VPSHUFB, NEON vqtbl1q_u8 dequant, I8MM/AVX2/NEON int8 MAC matmul, Lloyd-Max 4-bit quantize
+- Quantized tiled GEMM engine (C port of llama.cpp's TinyBLAS Q0): Q8_0/Q4_0/Q5_0 x Q8_0, AVX2 sign-trick+maddubs/dpbusd, AVX-512 VNNI, NEON I8MM/SDOT, dispatched from tensor.c matmul_batch at n_batch>=32
+- NEON tiled GEMM for ARM Pi 4 (Cortex-A72, basic NEON only)
+- AVX2/AVX1/SSSE3 SIMD paths for Q4_K tiled GEMM kernel
+- NEON acceleration expanded: Q4_K, Q5_K, Q6_K, Q3_K, Q2_0, Q1_0 vec_dot and sgemm paths
+- I8MM (ARM64) vec_dot for Q4_0, Q8_0, Q4_K using vmmlaq_s32; DotProd gemv for Q4_0_4_4/Q4_0_4_8 (1.3x vs Q4_0 on DGX Spark)
+- Q4_0_4_4 (GGUF type 31, 4-row interleaved) and Q4_0_4_8 (type 32) full support with DotProd gemv and I8MM gemm
+- Q6_0 (GGUF type 133) quantization support
+- Q5_1 fast path via vec_dot_q5_1_q8_0 (NEON int8 MAC)
+- Q4_K tiled GEMM kernel (AVX2, 1x4 tiles)
+- BF16 GEMM kernels (bf16_f32 + bf16_bf16)
+- Vulkan compute backend (preliminary, barely tested): push descriptors replacing descriptor rings, fused QKV/GU shaders with auto GCN1 detection, F16 KV-cache attention for prefill, batched RoPE, scoped barriers, KAVERI (PS4) compatibility
+- GPT-2 GPU fully working on CUDA/HIP/Vulkan: fused QKV split, LayerNorm, GELU, activation quantization, KV cache fixes
+- IQ4_NL GPU support: converted to Q8_0 at upload time for HIP compatibility
+- Server: /slots/0 path for llama.cpp compatibility, return_progress for prefill progress, consolidated stop-word matching into stop_matcher_t, SIGPIPE guard, double-free fixes
+- MSYS2 CUDA: hunger-msys-direct Makefile target for SSH builds with nvcc+cl.exe
+- OSF/1 Tru64 UNIX (DEC Alpha) compilation support
+- iPhoneOS 1 (ARMv6, LLVM-GCC 4.0.1) build and runtime support
+- Big-endian BE swap: IQ4_NL support added, warning for unsupported tensor types
+- Cross-platform packed struct macros (__PICO_PACKED) for MSVC/LLVM-GCC compatibility
+- PICOLM_SGEMM=0 env var to disable tiled GEMM
+- GPU: PICOLM_NO_IMMA flag to disable IMMA kernels, PICOLM_F32KV env var to guard F32KV attention
+- CUDA/HIP: Q6_K native IMMA fully working (qh byte extraction, offset, high-nibble masking all fixed)
+- CUDA/HIP: Q4_K IMMA dispatched but BROKEN for S>=16 (use PICOLM_NO_IMMA=1)
+- Gemma-3n: KV cache reuse fixed for non-KV layers, SWA RoPE tables wired into layer loop
+- gaussian_topk std: reverted to ddof=1 matching llama.cpp
+- Server default --checkpoint-max to 3 in --server mode, --slot-save-path to .
+- --benchmark-ctx honors thread count and truncates prompt
+- Fix: stale .o files causing 0-token prompt, log warning on oversized prompt rejection in server
+- Fix: HIP decode broken since GPU merge for O<256 or head_dim<16
+- Fix: Q5_0 GEMM on AVX2/AVX-512 (wrong qh bit position + missing offset)
+- Fix: Q4_0_8_8 LUT byte order + disabled broken GEMM with vec_dot fallback
+- Fix: GPU tensor upload for SSM models (Qwen3.6)
+- Fix: Vulkan RMSNorm push constant bug on RADV, descriptor set aliasing, quantize shader shared memory race
+- Fix: PICOLM_NGL partial GPU offload correctness on Windows WDDM
+- Fix: GPT-2 GPU prefill segfault, fused QKV split, LayerNorm Vulkan support
+- Fix: Vulkan KAVERI multi-ubatch prefill corruption workaround, D2H/H2D hang
+- Fix: Vulkan fused QKV/GU shader local_size_x and Q8 block stride bugs
+- Fix: Vulkan KV cache D2H sync, coherent GPU inference, fence checks, ring wraparound
+- Fix: Vulkan KV cache flush via backend-agnostic picolm_gpu_kv_flush_to_cpu()
+- Fix: Vulkan activation quantization rounding matches CPU/CUDA/HIP
+- Fix: Vulkan gracefully rejects unsupported quantization types on GPU
+- Remove dead matmul_dual_batch path and orphaned tensor_prof.c
+- Don't dump full help on unknown option
 
 ### v1.0-rc1 ("Yura Kana")
 
