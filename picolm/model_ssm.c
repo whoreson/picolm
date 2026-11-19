@@ -5836,6 +5836,7 @@ decode_done:
  * n_ubatch is the number of tokens in this ubatch.
  * Returns 0 on success, -1 on failure. */
 static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
+    const int *tokens_for_tail,
     int gpu_dev, int dim, int n_ffn, int n_heads, int n_kv_heads, int head_dim,
     int seq_len, int rope_dim, int rope_half,
     int q_dim, int kv_dim, int q_full_dim, int xb_stride,
@@ -6451,8 +6452,48 @@ after_qkv:
         }
     }
     double _gpu_per_layer = _gpu_layer_total / (double)c->n_layers;
-    for (int _bl = 0; _bl < c->n_layers; _bl++) {
+    for (int _bl = 0; _bl < n_gpu_layers; _bl++) {
         _gpu_bench_emit(_bl, 1, _gpu_per_layer, 0, 0);
+    }
+
+    /* HYBRID SPLIT: run layers [n_gpu_layers, n_layers) on the CPU for this
+     * ubatch, writing their KV into the HOST cache. Without this the CPU
+     * tail's KV rows are never written during prefill and decode then reads
+     * uninitialised rows -- which is exactly how a partial PICOLM_NGL failed
+     * before: correct-looking first token, then garbage.
+     *
+     * Two transfers per ubatch, both of the residual stream only:
+     *   D2H  bx[n_ubatch][xb_stride] -> xb_host[n_ubatch][dim]
+     *   ... CPU runs the tail, returns per-token residuals ...
+     *   H2D  tail_out[n_ubatch][dim] -> bx[n_ubatch][xb_stride]
+     * The second one matters: model_forward_prefill_gpu()'s own epilogue
+     * later D2H's bx[last token], normalises and projects, so the tail's
+     * output must land back in bx or that epilogue would run on the GPU-range
+     * residual and discard this work. */
+    if (n_gpu_layers < c->n_layers) {
+        picolm_gpu_sync(gpu_dev);
+        float *xb_host = (float *)malloc((size_t)n_ubatch * dim * sizeof(float));
+        float *tail_out = (float *)malloc((size_t)n_ubatch * dim * sizeof(float));
+        if (!xb_host || !tail_out) {
+            free(xb_host); free(tail_out);
+            fprintf(stderr, "ERROR: hybrid split: prefill handoff allocation failed\n");
+            return -1;
+        }
+        for (int _t = 0; _t < n_ubatch; _t++) {
+            picolm_gpu_memcpy(xb_host + (size_t)_t * dim,
+                              bx + (size_t)_t * xb_stride,
+                              (size_t)dim * sizeof(float), -1, gpu_dev);
+        }
+        model_forward_prefill_range(m, tokens_for_tail, n_ubatch, start_pos, interrupt,
+                                    n_gpu_layers, c->n_layers - c->n_mtp_layers,
+                                    0, 0, xb_host, dim, tail_out);
+        for (int _t = 0; _t < n_ubatch; _t++) {
+            picolm_gpu_memcpy(bx + (size_t)_t * xb_stride,
+                              tail_out + (size_t)_t * dim,
+                              (size_t)dim * sizeof(float), 1, gpu_dev);
+        }
+        free(tail_out);
+        free(xb_host);
     }
 
     return 0;
@@ -6585,7 +6626,7 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
                     dim * sizeof(float), 1, gpu_dev);
             }
             /* Process this ubatch through all layers */
-            int ubatch_rc = _prefill_gpu_ubatch(m, s, gw, gpu_dev,
+            int ubatch_rc = _prefill_gpu_ubatch(m, s, gw, tokens + offset, gpu_dev,
                 dim, n_ffn, n_heads, n_kv_heads, head_dim,
                 seq_len, rope_dim, rope_half,
                 q_dim, kv_dim, q_full_dim, xb_stride,
@@ -6632,14 +6673,24 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
      * Required on all GPU backends: GPU prefill writes to GPU KV cache only,
      * but CPU decode (model_forward_gpt2) reads from CPU KV cache. */
     if (gw->kv_active && !getenv("PICOLM_NO_GPU_FLUSH")) {
-        int n_attn_ord = 0;
-        for (int _ll = 0; _ll < c->n_layers; _ll++) {
-            if (w->layers[_ll].is_attn_layer) n_attn_ord++;
+        /* Flush only the layers the DEVICE holds. The device cache is sized
+         * gpu_kv_layers and indexed from 0, so flushing "all attention layers"
+         * reads past its end AND overwrites the host rows owned by the CPU half
+         * of the hybrid split -- which silently destroyed the CPU tail's KV and
+         * made every partial PICOLM_NGL produce garbage after a correct first
+         * token. */
+        int n_attn_ord = gw->gpu_kv_layers > 0 ? gw->gpu_kv_layers : 0;
+        if (n_attn_ord == 0) {
+            for (int _ll = 0; _ll < c->n_layers; _ll++) {
+                if (w->layers[_ll].is_attn_layer) n_attn_ord++;
+            }
         }
-        picolm_gpu_kv_flush_to_cpu(s->key_cache, s->val_cache,
-                                        n_attn_ord, c->max_seq_len, n_tokens,
-                                        s->kv_row_size_k, s->kv_row_size_v,
-                                        gpu_dev);
+        if (n_attn_ord > 0) {
+            picolm_gpu_kv_flush_to_cpu(s->key_cache, s->val_cache,
+                                            n_attn_ord, c->max_seq_len, n_tokens,
+                                            s->kv_row_size_k, s->kv_row_size_v,
+                                            gpu_dev);
+        }
     }
 
     tensor_set_gpu_tensor((picolm_gpu_tensor_t *)gw->output, gpu_dev);

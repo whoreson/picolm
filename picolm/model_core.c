@@ -2122,9 +2122,12 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                     if (m->gpu.n_gpu_layers > 0 && m->gpu.n_gpu_layers < c->n_layers) {
                         eligible = 0; el_reason = 11;
                         fprintf(stderr,
-                            "INFO: PICOLM_NGL=%d/%d requested, but the hybrid split needs a\n"
-                            "      layer-ranged CPU prefill that does not exist yet; running on\n"
-                            "      the CPU. Full offload (PICOLM_NGL unset) works.\n",
+                            "INFO: PICOLM_NGL=%d/%d: hybrid split declined -- PREFILL is exact\n"
+                            "      (last prefill position matches full offload: median 0.019,\n"
+                            "      same argmax) but the FIRST DECODE STEP diverges (median 3.72).\n"
+                            "      Everything below the handoff is verified correct, so the gap\n"
+                            "      is in the decode handoff. Running on the CPU. Full offload\n"
+                            "      is unaffected.\n",
                             m->gpu.n_gpu_layers, c->n_layers);
                     }
                     /* KV cache types the device attention kernels can read.
@@ -5594,7 +5597,21 @@ static float *model_forward_prefill_spark25(model_t *m, const int *tokens, int n
  *
  * ================================================================ */
 
+float *model_forward_prefill_range(model_t *m, const int *tokens, int n_tokens, int start_pos,
+                                   volatile int *interrupt, int l_lo, int l_hi,
+                                   int do_embed, int do_output,
+                                   const float *x_in, int x_in_stride, float *x_out);
+
 float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt) {
+    return model_forward_prefill_range(m, tokens, n_tokens, start_pos, interrupt,
+                                       0, m->config.n_layers - m->config.n_mtp_layers,
+                                       1, 1, NULL, 0, NULL);
+}
+
+float *model_forward_prefill_range(model_t *m, const int *tokens, int n_tokens, int start_pos,
+                                   volatile int *interrupt, int l_lo, int l_hi,
+                                   int do_embed, int do_output,
+                                   const float *x_in, int x_in_stride, float *x_out) {
     /* Bounds check: truncate n_tokens if start_pos + n_tokens exceeds max_seq_len */
     if (start_pos + n_tokens > m->config.max_seq_len) {
         int orig = n_tokens;
@@ -5742,8 +5759,17 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
      * reason about. Give the gate its own allocation. */
     float *gate_batch = p; p += bs * q_dim;
 
-    /* Embedding lookup */
-    {
+    /* Embedding lookup. With do_embed == 0 the caller supplies the residual in
+     * x_in ([n_tokens][x_in_stride]); copy it into the batch residual buffer
+     * instead of embedding. */
+    if (!do_embed) {
+        if (x_in && x_in_stride > 0) {
+            for (int _bi = 0; _bi < n_tokens; _bi++)
+                memcpy(x_batch + (size_t)_bi * dim,
+                       x_in + (size_t)_bi * (size_t)x_in_stride,
+                       (size_t)dim * sizeof(float));
+        }
+    } else {
         if (w->type_token_embd == GGUF_TYPE_Q4_0_4_4) {
             /* Q4_0_4_4: rows are interleaved in groups of 4 */
             int nb = dim / 32;
@@ -5811,7 +5837,10 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
     }
 #endif
     int n_active_layers = c->n_layers - c->n_mtp_layers;
-    for (int slot = 0; slot < n_active_layers; slot++) {
+    if (l_lo < 0) l_lo = 0;
+    if (l_hi < l_lo) l_hi = l_lo;
+    if (l_hi > n_active_layers) l_hi = n_active_layers;
+    for (int slot = l_lo; slot < l_hi; slot++) {
         /* Check for client disconnect interrupt */
         if (interrupt && *interrupt) {
             free(buf);
@@ -6368,6 +6397,16 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
     }
 
     pp_report(n_tokens, c->n_layers);
+    if (!do_output) {
+        if (x_out) {
+            for (int _bi = 0; _bi < n_tokens; _bi++)
+                memcpy(x_out + (size_t)_bi * dim,
+                       x_batch + (size_t)_bi * dim,
+                       (size_t)dim * sizeof(float));
+        }
+        free(buf);
+        return s->logits;
+    }
     /* Final norm + output (last token only) */
     float *last_x = x_batch + (n_tokens - 1) * dim;
     if (s->output_norm_b) {

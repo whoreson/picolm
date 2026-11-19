@@ -909,6 +909,16 @@ float *model_forward(model_t *m, int token, int pos);
  * rows a full run would. model_forward() is the full-model wrapper. */
 float *model_forward_range(model_t *m, int token, int pos, int l_lo, int l_hi,
                            int do_embed, int do_output);
+
+/* Batched-prefill equivalent of model_forward_range. Runs layers [l_lo, l_hi)
+ * for n_tokens; do_embed==0 takes the residual from x_in ([n_tokens][stride])
+ * and do_output==0 returns the per-token residuals in x_out instead of logits.
+ * Needed by the GPU hybrid split so the CPU can finish a prefill the GPU
+ * started. */
+float *model_forward_prefill_range(model_t *m, const int *tokens, int n_tokens, int start_pos,
+                                   volatile int *interrupt, int l_lo, int l_hi,
+                                   int do_embed, int do_output,
+                                   const float *x_in, int x_in_stride, float *x_out);
 float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt);
 
 /* GPU-pipelined forward pass (Phase 2).
