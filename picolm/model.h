@@ -895,6 +895,14 @@ size_t layer_weight_size(model_t *m, int l);
 int allocate_run_state(model_t *m, kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v,
                        int k_cache_hadamard, int v_cache_hadamard, int n_threads);
 float *model_forward(model_t *m, int token, int pos);
+
+/* Run only layers [l_lo, l_hi), optionally skipping the embedding lookup and
+ * the final norm + output projection. Used by the GPU hybrid (PICOLM_NGL) path
+ * to run the tail of the model on the CPU with the residual already in s->x.
+ * The host KV ordinal is derived from l_lo, so a partial range writes the same
+ * rows a full run would. model_forward() is the full-model wrapper. */
+float *model_forward_range(model_t *m, int token, int pos, int l_lo, int l_hi,
+                           int do_embed, int do_output);
 float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt);
 
 /* GPU-pipelined forward pass (Phase 2).

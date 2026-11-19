@@ -3402,7 +3402,12 @@ static float *model_forward_prefill_gptneox(model_t *m, const int *tokens, int n
 static float *model_forward_spark25(model_t *m, int token, int pos);
 static float *model_forward_prefill_spark25(model_t *m, const int *tokens, int n_tokens, int start_pos, volatile int *interrupt);
 
-float *model_forward(model_t *m, int token, int pos) {
+/* Run layers [l_lo, l_hi) only, optionally skipping the embedding lookup and
+ * the final norm+projection. This is the entry point the GPU hybrid path uses
+ * to hand the tail of the model to the CPU with the residual already in s->x.
+ * model_forward() is the full-model wrapper around it. */
+float *model_forward_range(model_t *m, int token, int pos, int l_lo, int l_hi,
+                           int do_embed, int do_output) {
     cpu_layer_dbg_init();
     /* Bounds check: pos must be within KV cache allocation */
     if (pos >= m->config.max_seq_len) {
@@ -3456,8 +3461,9 @@ float *model_forward(model_t *m, int token, int pos) {
     const float *cos_pos = s->rope_cos + (size_t)pos * half_dim;
     const float *sin_pos = s->rope_sin + (size_t)pos * half_dim;
 
-    /* 1. Embedding lookup */
-    {
+    /* 1. Embedding lookup. Skipped when the caller already has a residual in
+     * s->x (the GPU hybrid path hands it over that way). */
+    if (do_embed) {
         size_t row_bytes = gguf_type_row_size(w->type_token_embd, dim);
         if (w->type_token_embd == GGUF_TYPE_Q4_0_8_8) {
             int nb = dim / 32;
@@ -3547,8 +3553,22 @@ float *model_forward(model_t *m, int token, int pos) {
      * to produce N candidate tokens, then verify with a fast forward
      * pass. For now, skip them entirely. */
     int n_active_layers = c->n_layers - c->n_mtp_layers;
+    /* Ordinal base: the host KV cache is indexed by an ordinal that counts
+     * attention layers from the START OF THE MODEL, not from l_lo. When the GPU
+     * hybrid path runs only the tail, the CPU must resume at the ordinal the
+     * GPU range ended on, or the two would write over each other's rows. */
     int attn_ordinal = 0;
-    for (int slot = 0; slot < n_active_layers; slot++) {
+    if (l_lo > 0) {
+        for (int _l = 0; _l < l_lo && _l < c->n_layers; _l++) {
+            if (w->layers[_l].is_attn_layer) attn_ordinal++;
+        }
+    }
+    /* Bounds delivered by the caller (see model_forward_range). Clamped here
+     * so the full-model wrapper and the hybrid path cannot disagree. */
+    if (l_lo < 0) l_lo = 0;
+    if (l_hi < l_lo) l_hi = l_lo;
+    if (l_hi > n_active_layers) l_hi = n_active_layers;
+    for (int slot = l_lo; slot < l_hi; slot++) {
 #ifdef PICOLM_VIZ
         int l = viz_layer_permute(slot);
 #else
@@ -4043,7 +4063,10 @@ ffn_done:
         BENCH_LAYER_END(l, 0);
     }
 
-    /* 3. Final RMSNorm */
+    /* 3+4. Final RMSNorm then output projection. Both skipped when running a
+     * partial layer range: the residual goes back to the caller unnormalised
+     * and unprojected. */
+    if (do_output) {
     if (s->output_norm_b) {
         layernorm(s->x, s->x, s->output_norm_w, s->output_norm_b, dim, c->rms_norm_eps);
     } else {
@@ -4079,8 +4102,15 @@ ffn_done:
         for (int j = 0; j < 10; j++) fprintf(stderr, "%d(%f) ", top_idx[j], top_val[j]);
         fprintf(stderr, "\n");
     }
+    }   /* end if (do_output) */
 
     return s->logits;
+}
+
+/* Full-model forward: every layer, embedding in, logits out. */
+float *model_forward(model_t *m, int token, int pos) {
+    return model_forward_range(m, token, pos, 0,
+                               m->config.n_layers - m->config.n_mtp_layers, 1, 1);
 }
 
 void model_free(model_t *m) {

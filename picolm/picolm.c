@@ -2848,6 +2848,50 @@ int main(int argc, char **argv) {
         if (grammar_is_complete(&grammar)) break;
 
         token = next;
+        /* PICOLM_SPLITTEST=<k>: run the layer range [0,k) then [k,N) via
+         * model_forward_range() and compare the logits with a normal full
+         * model_forward() run. Validates the hybrid split plumbing without
+         * needing any GPU. */
+        {
+            static int splittest = -2;
+            if (splittest == -2) {
+                const char *ev = getenv("PICOLM_SPLITTEST");
+                splittest = ev ? atoi(ev) : -1;
+            }
+            if (splittest > 0 && splittest < model.config.n_layers && total_gen == 1) {
+                int k = splittest;
+                extern float *model_forward_range(model_t *, int, int, int, int, int, int);
+                /* Recurrent state (SSM layers) is MUTATED by every forward pass,
+                 * so the three runs below must each start from the same state or
+                 * the comparison is meaningless: on Qwen3.6-27B the diff was a
+                 * constant 5.26 regardless of k, which is the signature of the
+                 * test, not the split, being wrong. Snapshot and restore. */
+                size_t rs_sz = model_recurrent_state_size(&model);
+                uint8_t *rs = rs_sz ? (uint8_t *)malloc(rs_sz) : NULL;
+                if (rs) model_recurrent_state_save(&model, rs, rs_sz);
+                float *full = model_forward(&model, token, pos + 1);
+                float ref[8] = {0};
+                int nref = model.config.vocab_size < 8 ? model.config.vocab_size : 8;
+                for (int i = 0; i < nref; i++) ref[i] = full[i];
+                if (rs) model_recurrent_state_restore(&model, rs, rs_sz);
+                /* head */
+                model_forward_range(&model, token, pos + 1, 0, k, 1, 0);
+                /* tail: residual already in s->x */
+                float *split = model_forward_range(&model, token, pos + 1, k,
+                                                   model.config.n_layers - model.config.n_mtp_layers, 0, 1);
+                int bad = 0;
+                double mx = 0;
+                for (int i = 0; i < nref; i++) {
+                    double d = split[i] - ref[i];
+                    if (d < 0) d = -d;
+                    if (d > mx) mx = d;
+                    if (d > 1e-5) bad++;
+                }
+                fprintf(stderr, "[SPLITTEST] k=%d/%d  max|diff| over first %d logits = %.6g  %s\n",
+                        k, model.config.n_layers, nref, mx, bad ? "MISMATCH" : "OK");
+                free(rs);
+            }
+        }
 #ifdef PICOLM_GPU
         static int dbg_pipeline_active = 0, dbg_pipeline_init = 0;
         if (!dbg_pipeline_init++) {
