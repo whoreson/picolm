@@ -90,6 +90,7 @@ __global__ void picolm_quantize_q8_K(float *d_out, int8_t *qs_out, int16_t *bsum
  * quant.c. xbsums is y[i].bsums for super-block i. */
 __global__ void picolm_q5_K_gemv(float *y, const int8_t *xq, const float *xd, const int16_t *xbsums, const void *weights, int I, int O, int row_bytes, int y_stride);
 __global__ void picolm_q4_K_gemv(float *y, const int8_t *xq, const float *xd, const int16_t *xbsums, const void *weights, int I, int O, int row_bytes, int y_stride);
+__global__ void picolm_q3_K_gemv(float *y, const int8_t *xq, const float *xd, const int16_t *xbsums, const void *weights, int I, int O, int row_bytes, int y_stride);
 __global__ void picolm_q6_K_gemv(float *y, const int8_t *xq, const float *xd, const int16_t *xbsums, const void *weights, int I, int O, int row_bytes, int y_stride);
 
 /* Number of sequence positions per tile in the tiled Q8_0 matmul.

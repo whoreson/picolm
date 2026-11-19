@@ -199,6 +199,18 @@ static const char *tmpl_chatml_prefix =
     "A chat between a curious user and an assistant.\n"
     "<|im_end|>\n"
     "<|im_start|>user\n";
+/* ChatML is shared by Qwen and SmolLM2, but they need different suffixes.
+ *
+ * Qwen (3.5/3.6) has a reasoning mode and understands <think>: opening and
+ * immediately closing it asks for a direct answer. Removing it makes Qwen
+ * emit a literal "<think>" and stop, so it stays for Qwen.
+ *
+ * SmolLM2 has no such mode. The same suffix sends it into a degenerate loop
+ * -- "controvers mischie controvers ..." with top logits climbing past 25 --
+ * at EVERY quantisation level including Q8_0, so it is the prompt and not a
+ * numeric problem. SmolLM2 therefore gets the suffix without the block.
+ *
+ * (GLM-5 and Spark keep their own </think> for the same reason as Qwen.) */
 static const char *tmpl_chatml_suffix =
     "<|im_end|>\n"
     "<|im_start|>assistant\n"
@@ -206,6 +218,11 @@ static const char *tmpl_chatml_suffix =
     "\n"
     "</think>\n"
     "\n";
+
+/* Same, for models without a reasoning mode (SmolLM2-Instruct). */
+static const char *tmpl_chatml_suffix_nothink =
+    "<|im_end|>\n"
+    "<|im_start|>assistant\n";
 
 static const char *tmpl_tekken_prefix = "[INST]";
 static const char *tmpl_tekken_suffix = "[/INST]";
@@ -283,9 +300,12 @@ static char *apply_chat_template(const char *model_path, const model_t *model, c
     } else if (strstr(lower, "gemma")) {
         prefix = tmpl_gemma_prefix;
         suffix = tmpl_gemma_suffix;
-    } else if (strstr(lower, "qwen") || (strstr(lower, "smollm") && strstr(lower, "instruct"))) {
+    } else if (strstr(lower, "qwen")) {
         prefix = tmpl_chatml_prefix;
         suffix = tmpl_chatml_suffix;
+    } else if (strstr(lower, "smollm") && strstr(lower, "instruct")) {
+        prefix = tmpl_chatml_prefix;
+        suffix = tmpl_chatml_suffix_nothink;
     } else {
         prefix = tmpl_alpaca_prefix;
         suffix = tmpl_alpaca_suffix;

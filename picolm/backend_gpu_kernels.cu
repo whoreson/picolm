@@ -451,6 +451,7 @@ picolm_q8_q8_matmul(float *y,
 }
 
 
+
 /* ================================================================
  * Q8_K activation quantiser (device)
  * ================================================================
@@ -663,8 +664,14 @@ picolm_q8_0_gemv(float *y,
 /* Unpack the 6-bit scale/min pairs of a Q5_K super-block into 8 scales
  * followed by 8 mins, exactly like the utmp shuffling in quant.c's
  * vec_dot_q5_K_q8_K. */
-__device__ static inline void gemv_unpack_q5k_scales(const uint8_t *packed,
-                                                      uint8_t *out /* 16 */) {
+/* Materialise only the ONE (scale, min) pair this thread needs. The previous
+ * version built all 16 bytes on every thread and then used two of them, so
+ * with 8 threads per super-block the shuffle ran 8x redundantly. On Q3_K,
+ * where 16 threads each used 1 of 16, removing that redundancy took the
+ * kernel from 77 to ~220 tok/s -- it was the dominant cost, not the dot
+ * product. out[0] = scale[sub], out[1] = min[sub]. */
+__device__ static inline void gemv_q5k_scale_min(const uint8_t *packed, int sub,
+                                                  uint8_t *out /* 2 */) {
     uint32_t utmp[4];
     const uint32_t kmask1 = 0x3f3f3f3f;
     const uint32_t kmask2 = 0x0f0f0f0f;
@@ -675,8 +682,10 @@ __device__ static inline void gemv_unpack_q5k_scales(const uint8_t *packed,
       utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
       utmp[2] = uaux; }
     utmp[0] &= kmask1;
-    memcpy(out,     &utmp[0], 8);   /* 8 scales */
-    memcpy(out + 8, &utmp[2], 8);   /* 8 mins   */
+    /* bytes 0..7 = 8 scales, bytes 8..15 = 8 mins */
+    const uint8_t *sc = (const uint8_t *)(const void *)&utmp[0];
+    out[0] = sc[sub];
+    out[1] = sc[8 + sub];
 }
 
 __global__ void
@@ -706,8 +715,8 @@ picolm_q5_K_gemv(float *y,
         const float d    = xd[sb] * wd;
         const float dmin = xd[sb] * wdm;
 
-        uint8_t sc_min[16];
-        gemv_unpack_q5k_scales(wb + 4, sc_min);
+        uint8_t sc2[2];
+        gemv_q5k_scale_min(wb + 4, sub, sc2);
 
         const uint8_t *qh = wb + 16;
         const uint8_t *qs = wb + 48;
@@ -787,8 +796,8 @@ picolm_q5_K_gemv(float *y,
          * j in 0..15, i.e. mins[m] pairs with bsums[2m] and bsums[2m+1].
          * Sub-block `sub` owns exactly those two bsums, so its min index is
          * `sub`, not sub/2. */
-        const int scale = (int)sc_min[sub];
-        const int minv  = (int)sc_min[8 + sub];
+        const int scale = (int)sc2[0];
+        const int minv  = (int)sc2[1];
         sumf += scale * d * (float)acc;
         /* Bias correction over this 32-value sub-block = two 16-value bsums. */
         const int bsum = (int)xbsums[sb * 16 + sub * 2]
@@ -942,8 +951,8 @@ picolm_q4_K_gemv(float *y,
         const float d    = xd[sb] * wd;
         const float dmin = xd[sb] * wdm;
 
-        uint8_t sc_min[16];
-        gemv_unpack_q5k_scales(wb + 4, sc_min);   /* same 6-bit packing */
+        uint8_t sc2[2];
+        gemv_q5k_scale_min(wb + 4, sub, sc2);   /* same 6-bit packing */
 
         const uint8_t *qs = wb + 16;
         const int8_t  *q8 = xq + (size_t)sb * 256;
@@ -977,12 +986,126 @@ picolm_q4_K_gemv(float *y,
             acc = gpu_dot4_i8_packed(wBi, aB, acc);
         }
 
-        const int scale = (int)sc_min[sub];
-        const int minv  = (int)sc_min[8 + sub];
+        const int scale = (int)sc2[0];
+        const int minv  = (int)sc2[1];
         const int bsum  = (int)xbsums[sb * 16 + sub * 2]
                         + (int)xbsums[sb * 16 + sub * 2 + 1];
         sumf += scale * d * (float)acc;
         sumf -= dmin * (float)minv * (float)bsum;
+    }
+
+    __shared__ float red[GEMV_WARPS > 1 ? GEMV_WARPS - 1 : 1][32];
+    if (warp > 0) red[warp - 1][lane] = sumf;
+    gpuSyncthreads();
+    if (warp > 0) return;
+    for (int w = 0; w < GEMV_WARPS - 1; w++) sumf += red[w][lane];
+    for (int off = 16; off > 0; off >>= 1)
+        sumf += gpuShflXorSync(0xFFFFFFFFu, sumf, off);
+    if (lane == 0) y[o] = sumf;
+}
+
+/* Q3_K: 256 weights in 110 bytes -- hmask[32] qs[64] scales[12] d(2).
+ *
+ * Transcribed from dequantize_row_q3_K() in quant.c, which is the readable
+ * authority (Q3_K has NO scalar fallback in vec_dot_q3_K_q8_K):
+ *
+ *   - 16 six-bit scales from the 12 bytes via a 3-byte shuffle, each biased
+ *     by -32 (signed, and there are no mins -- so no bias-correction term).
+ *   - TWO chunks of 128 values. Per chunk, qs advances 32 bytes and the bit
+ *     shift walks 0,2,4,6, giving 8 groups of 16 values each.
+ *   - A group's value is (2-bit field) - (hmask bit clear ? 4 : 0), i.e.
+ *     signed 3-bit -4..3. The hmask bit doubles every 16-value group.
+ *
+ * So a sub-block is 16 values (not 32 as in Q4_K/Q5_K): 16 sub-blocks per
+ * super-block, 16 scales. GEMVK_THREADS_PER_SB is therefore 16 here, one
+ * thread per sub-block, each reading 16 values and 16 q8 entries.
+ */
+#define Q3K_SUBS_PER_SB 16
+
+/* Only the ONE scale this thread uses is materialised: the previous version
+ * built all 16 into a local array on every thread, so each of the 16 threads
+ * per super-block did the full shuffle and then used one entry. Four ALU ops
+ * for the shuffle are cheaper than the array stores + loop that followed. */
+__device__ static inline int gemv_q3k_scale(const uint8_t *b, int s) {
+    uint32_t aux[4];
+    memcpy(aux, b, 12);
+    const uint32_t tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & 0x0F0F0F0Fu) | (((tmp >> 4) & 0x03030303u) << 4);
+    aux[3] = ((aux[1] >> 4) & 0x0F0F0F0Fu) | (((tmp >> 6) & 0x03030303u) << 4);
+    aux[0] = (aux[0] & 0x0F0F0F0Fu) | (((tmp >> 0) & 0x03030303u) << 4);
+    aux[1] = (aux[1] & 0x0F0F0F0Fu) | (((tmp >> 2) & 0x03030303u) << 4);
+    const int8_t *sc = (const int8_t *)(const void *)aux;
+    return (int)sc[s] - 32;
+}
+
+__global__ void
+picolm_q3_K_gemv(float *y,
+                 const int8_t *xq, const float *xd, const int16_t *xbsums,
+                 const void *weights,
+                 int I, int O, int row_bytes, int y_stride) {
+    (void)xbsums;   /* no mins -> no bias term */
+    const int lane = (int)(gpuThreadIdx_x & 31);
+    const int warp = (int)(gpuThreadIdx_x >> 5);
+    const int tid  = warp * 32 + lane;
+    const int o    = (int)gpuBlockIdx_x;
+    if (o >= O) return;
+
+    const int n_super = I / 256;
+    const uint8_t *wrow = (const uint8_t *)weights + (size_t)o * row_bytes;
+
+    /* 16 threads per super-block (one per 16-value sub-block); a 128-thread
+     * block therefore covers 8 super-blocks per step. */
+    const int sb0 = tid / Q3K_SUBS_PER_SB;              /* 0..7  */
+    const int sub = tid % Q3K_SUBS_PER_SB;              /* 0..15 */
+    const int stride = (GEMV_WARPS * 32) / Q3K_SUBS_PER_SB;  /* 8 */
+
+    float sumf = 0.0f;
+
+    for (int sb = sb0; sb < n_super; sb += stride) {
+        const uint8_t *wb = wrow + (size_t)sb * GPU_BLOCK_Q3_K_SIZE;
+        const uint8_t *hm = wb;            /* hmask[32]  */
+        const uint8_t *qs = wb + 32;       /* qs[64]     */
+        const uint16_t d_raw = (uint16_t)(wb[108] | ((uint16_t)wb[109] << 8));
+        const float d = xd[sb] * gpu_fp16_to_fp32(d_raw);
+
+        const int scale = gemv_q3k_scale(wb + 96, sub);
+
+        /* Sub-block (== one 16-value scale group) `sub` = 0..15, mapping taken
+         * directly from dequantize_row_q3_K's loop order:
+         *   chunk  = sub / 8          (qs advances 32 bytes per chunk)
+         *   w      = sub % 8          (8 groups per chunk)
+         *   j      = w / 2            (bit shift 2*j)
+         *   half   = w % 2            (bytes 0..15 or 16..31)
+         *   hmask byte offset = half ? 16 : 0
+         *   hmask bit = chunk*4 + j   (m carries across chunks, it is not reset)
+         *   q8 offset = sub*16
+         */
+        const int chunk = sub >> 3;
+        const int w     = sub & 7;
+        const int j     = w >> 1;
+        const int half  = w & 1;
+        const int shift = 2 * j;
+        const int boff  = chunk * 32 + (half ? 16 : 0);
+        const uint8_t mbit = (uint8_t)(1u << (chunk * 4 + j));
+        const uint8_t *qrun = qs + boff;
+        const uint8_t *hrun = hm + (half ? 16 : 0);
+        const int8_t  *q8  = xq + (size_t)sb * 256 + (size_t)sub * 16;
+
+        int acc = 0;
+        for (int l = 0; l < 16; l += 4) {
+            int8_t w4[4];
+            for (int t = 0; t < 4; t++) {
+                int v = (qrun[l + t] >> shift) & 3;
+                if (!(hrun[l + t] & mbit)) v -= 4;
+                w4[t] = (int8_t)v;
+            }
+            int aA = gemv_get_int_b2(q8 + l, 0);
+            int wAi;
+            memcpy(&wAi, w4, 4);
+            acc = gpu_dot4_i8_packed(wAi, aA, acc);
+        }
+
+        sumf += d * (float)scale * (float)acc;
     }
 
     __shared__ float red[GEMV_WARPS > 1 ? GEMV_WARPS - 1 : 1][32];
