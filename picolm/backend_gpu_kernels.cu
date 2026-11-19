@@ -859,28 +859,35 @@ picolm_q6_K_gemv(float *y,
         const int j0 = chunk * 8 + 2 * which;      /* first of the pair */
         const int j1 = j0 + 1;
         int acc0 = 0, acc1 = 0;
-        for (int l = 0; l < 32; l++) {
-            /* NOTE: the byte index is `l`, NOT `l & 15`. The reference has two
-             * separate 16-iteration loops that both index ql_c[l] / qh_c[l] --
-             * the second one runs l=16..31, so it reads bytes 16..31. Folding
-             * the halves into one loop and masking l to 0..15 re-read the
-             * first half of every sub-block: plausible magnitudes, wrong
-             * values, and only in the upper half of each 32-value group. */
-            const int bi = l;
-            int q;
-            switch (which) {
-                case 0: q = (ql_c[bi]      & 0xF) | (((qh_c[bi] >> 0) & 3) << 4);
-                        if (l < 16) acc0 += q * q8_c[l];
-                        else        acc1 += q * q8_c[l];          break;
-                case 1: q = (ql_c[bi + 32] & 0xF) | (((qh_c[bi] >> 2) & 3) << 4);
-                        if (l < 16) acc0 += q * q8_c[l + 32];
-                        else        acc1 += q * q8_c[l + 32];     break;
-                case 2: q = (ql_c[bi]      >> 4)  | (((qh_c[bi] >> 4) & 3) << 4);
-                        if (l < 16) acc0 += q * q8_c[l + 64];
-                        else        acc1 += q * q8_c[l + 64];     break;
-                default:q = (ql_c[bi + 32] >> 4)  | (((qh_c[bi] >> 6) & 3) << 4);
-                        if (l < 16) acc0 += q * q8_c[l + 96];
-                        else        acc1 += q * q8_c[l + 96];     break;
+        /* Everything that depends only on `which` is hoisted out, so each of
+         * the four cases becomes a straight-line 16-iteration loop with no
+         * branch and no switch -- same shape as the reference, which has two
+         * separate 16-iteration loops rather than one 32-iteration loop with a
+         * predicate. The previous version switched on `which` and tested
+         * `l < 16` on EVERY iteration; measured 448 GB/s against Q8_0's 839.
+         *
+         * NOTE: the byte index is `l`, not `l & 15`, and the q8 index runs the
+         * full l=0..31 for both halves. Folding the halves with a mask
+         * re-reads the first 16 bytes of every sub-block. */
+        {
+            const int  ql_off  = (which & 1) ? 32 : 0;   /* q1/q3 vs q2/q4 */
+            const int  ql_sh   = (which & 2) ? 4 : 0;    /* high vs low nibble */
+            const int  qh_sh   = which * 2;              /* 0,2,4,6 */
+            const int  q8_off  = which * 32;             /* 0,32,64,96 */
+            const uint8_t *qlp = ql_c + ql_off;
+            const int8_t  *q8p = q8_c + q8_off;
+
+            /* l=0..15 -> acc0, l=16..31 -> acc1, both indexing qlp[l] and
+             * qh_c[l] with the FULL l (see the note above). */
+            for (int l = 0; l < 16; l++) {
+                const int q = ((qlp[l] >> ql_sh) & 0xF)
+                            | (((qh_c[l] >> qh_sh) & 3) << 4);
+                acc0 += q * q8p[l];
+            }
+            for (int l = 16; l < 32; l++) {
+                const int q = ((qlp[l] >> ql_sh) & 0xF)
+                            | (((qh_c[l] >> qh_sh) & 3) << 4);
+                acc1 += q * q8p[l];
             }
         }
 
