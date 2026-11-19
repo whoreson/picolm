@@ -139,10 +139,23 @@ static void pp_report(int n_tokens, int n_layers) {
     memset(pp_acc, 0, sizeof pp_acc);
 }
 
+/* Tokens per batched-prefill compute chunk. See model.h for why this is
+ * shared between the allocator and the forward pass. Cached because it is
+ * read from an allocation path and from a per-prefill-call path. */
+int picolm_prefill_ubatch(void) {
+    static int cached = 0;
+    if (cached > 0) return cached;
+    const char *ev = getenv("PICOLM_UBATCH");
+    int n = ev ? atoi(ev) : 0;
+    if (n <= 0) n = PICOLM_PREFILL_UBATCH_DEFAULT;
+    cached = n;
+    return cached;
+}
+
 /* Forward declarations from backend_gpu.cu (avoids nvcc extern "C" overload
  * confusion when backend_gpu.h is included from the .cu compilation unit). */
 extern int picolm_gpu_pipeline_batch_alloc(int dim, int q_dim, int kv_dim, int ffn_hidden,
-                                            int xb_stride, int max_seq_len, int device);
+                                            int xb_stride, int max_ubatch, int device);
 extern int picolm_gpu_prealloc_q8(size_t max_xq_bytes, size_t max_xd_bytes, int device);
 extern int picolm_gpu_ssm_head_permute_batch_dev(float *dst, const float *src,
                                                   const int *head_map,
@@ -594,6 +607,13 @@ static size_t kv_row_size_gqa(kv_cache_type_t kv_type, int n_elements) {
         case KV_CACHE_TQ4:  return ((size_t)(n_elements / TQ4_BLOCK_SIZE)) * sizeof(block_tq4);
     }
     return 0;
+}
+
+/* True when a KV cache type has a device attention/dequant path. Mirrors
+ * kv_block_bytes() in backend_gpu_dequant.cuh and picolm_gpu_kv_set_type().
+ * TQ3/TQ4 have no GPU reader and must not take the GPU attention path. */
+static int kv_type_gpu_capable(kv_cache_type_t t) {
+    return t == KV_CACHE_F16 || t == KV_CACHE_Q8_0 || t == KV_CACHE_Q4_0;
 }
 
 /* kv_head_stride: byte offset between consecutive heads within a GQA row
@@ -2046,8 +2066,20 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                     if (m->gpu.n_gpu_layers > 0 && m->gpu.n_gpu_layers < c->n_layers) {
                         eligible = 0; el_reason = 11;
                     }
-                    /* F16 KV cache only -- GPU attention kernels read std430 F16 from KV cache */
-                    if (kv_type_k != KV_CACHE_F16 || kv_type_v != KV_CACHE_F16) { eligible = 0; el_reason = 2; }
+                    /* KV cache types the device attention kernels can read.
+                     * F16, Q8_0 and Q4_0 have device dequant paths (kv_block_bytes()
+                     * in backend_gpu_dequant.cuh); TQ3/TQ4 do not and stay CPU-only.
+                     * Quantized KV additionally requires head_dim to be a multiple of
+                     * 32 because a block must not straddle a KV head. */
+                    if (kv_type_k != KV_CACHE_F16 || kv_type_v != KV_CACHE_F16) {
+                        int kk = (kv_type_k == KV_CACHE_Q8_0 || kv_type_k == KV_CACHE_Q4_0);
+                        int vv = (kv_type_v == KV_CACHE_Q8_0 || kv_type_v == KV_CACHE_Q4_0);
+                        int quant_ok = 1;
+                        if (kv_type_k != KV_CACHE_F16 && !kk) quant_ok = 0;
+                        if (kv_type_v != KV_CACHE_F16 && !vv) quant_ok = 0;
+                        if (quant_ok && c->head_dim % 32 != 0) quant_ok = 0;
+                        if (!quant_ok) { eligible = 0; el_reason = 2; }
+                    }
                     /* SSM models: enable GPU pipeline.
                      * Q+gate de-interleave race condition is fixed.
                      * Recurrence kernel matches NEON order. */
@@ -2068,13 +2100,34 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                         }
                         if (kv_layers == 0) kv_layers = c->n_layers;
 
-                        size_t kv_head_stride = c->n_kv_heads * c->head_dim * sizeof(uint16_t);
-                        /* Per-layer: max_seq_len * n_kv_heads * head_dim * sizeof(uint16_t) */
-                        size_t layer_bytes = (size_t)c->max_seq_len * kv_head_stride;
-                        size_t total_k = (size_t)kv_layers * layer_bytes;
-                        size_t total_v = (size_t)kv_layers * layer_bytes;
+                        /* Per-layer: max_seq_len * kv_row_size_*, where kv_row_size
+                         * already encodes the storage type (F16 = 2 bytes/element,
+                         * Q8_0 = 34/32, Q4_0 = 18/32). Using the run state's row
+                         * sizes keeps the device cache exactly the same size as the
+                         * CPU cache of the same type, which is what makes it
+                         * byte-interchangeable for picolm_gpu_kv_flush_to_cpu. */
+                        run_state_t *rs = &m->state;
+                        size_t layer_bytes_k = (size_t)c->max_seq_len * rs->kv_row_size_k;
+                        size_t layer_bytes_v = (size_t)c->max_seq_len * rs->kv_row_size_v;
+                        size_t total_k = (size_t)kv_layers * layer_bytes_k;
+                        size_t total_v = (size_t)kv_layers * layer_bytes_v;
 
                         if (picolm_gpu_kv_alloc(total_k, total_v, device)) {
+                            /* Tell the cache how its rows are laid out. If the
+                             * backend has no dequant path for these types it
+                             * refuses, and we decline the GPU KV path below
+                             * rather than run kernels over bytes they cannot
+                             * decode. */
+                            if (!picolm_gpu_kv_set_type((int)rs->kv_type_k, (int)rs->kv_type_v,
+                                                        rs->kv_head_stride_k, rs->kv_head_stride_v,
+                                                        device)) {
+                                fprintf(stderr, "INFO: GPU KV cache type not supported on this backend "
+                                                "(kv_k=%d kv_v=%d); staying on the CPU KV cache\n",
+                                        (int)rs->kv_type_k, (int)rs->kv_type_v);
+                                eligible = 0; el_reason = 2;
+                            }
+                        }
+                        if (eligible) {
                             m->gpu.kv_k_dev = picolm_gpu_kv_k_dev(device);
                             m->gpu.kv_v_dev = picolm_gpu_kv_v_dev(device);
                             m->gpu.kv_k_cap = total_k;
@@ -2103,13 +2156,23 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                                 fprintf(stderr, "WARN: GPU pipeline buffer alloc failed\n");
                             }
                             /* Prefill batch buffers - xb_stride must accommodate both
-                             * q_pipeline_dim (attention QKV) and ssm_conv_dim (SSM QKV) */
+                             * q_pipeline_dim (attention QKV) and ssm_conv_dim (SSM QKV).
+                             *
+                             * Sized by the UBATCH size, NOT max_seq_len: the GPU prefill
+                             * loop chunks every prompt into picolm_prefill_ubatch() tokens
+                             * and never touches more than that per launch. Allocating for
+                             * max_seq_len over-reserved ~221 KB of VRAM per context token
+                             * on a 27B (n_ffn=17408) -- 5.4 GB at 24k ctx -- which
+                             * exhausted a 24 GB card long before the KV cache did. This
+                             * is a pure allocation fix; no kernel or indexing changes. */
                             int ssm_conv_dim = 2 * c->ssm_d_state * c->ssm_n_group + c->ssm_d_inner;
                             int xb_stride = q_pipeline_dim;
                             if (ssm_conv_dim > xb_stride) xb_stride = ssm_conv_dim;
                             if (c->n_embd > xb_stride) xb_stride = c->n_embd;
+                            int gpu_max_ubatch = picolm_prefill_ubatch();
+                            if (gpu_max_ubatch > c->max_seq_len) gpu_max_ubatch = c->max_seq_len;
                             if (!picolm_gpu_pipeline_batch_alloc(c->n_embd, q_pipeline_dim, kv_dim,
-                                                                 c->n_ffn, xb_stride, c->max_seq_len, device)) {
+                                                                 c->n_ffn, xb_stride, gpu_max_ubatch, device)) {
                                 fprintf(stderr, "WARN: GPU prefill batch buffer alloc failed\n");
                             }
 
@@ -2126,12 +2189,15 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                              * to avoid runtime reallocation races between GPU work
                              * and host-side cudaFree/cudaMalloc in reserve/reserve_i8.
                              * Max input dim = max(q_pipeline_dim, ssm_conv_dim, n_ffn).
-                             * Max batch = c->max_seq_len. */
+                             * Max batch = the UBATCH size, not max_seq_len -- these are
+                             * activation panels for one prefill launch, and they were
+                             * costing ~480 MB at 24k ctx on a 27B (17408-wide rows) for
+                             * no reason. Same argument as the pipe_*_b buffers above. */
                             int max_q8_dim = q_pipeline_dim;
                             if (ssm_conv_dim > max_q8_dim) max_q8_dim = ssm_conv_dim;
                             if (c->n_ffn > max_q8_dim) max_q8_dim = c->n_ffn;
-                            size_t max_xq = (size_t)c->max_seq_len * max_q8_dim;
-                            size_t max_xd = (size_t)c->max_seq_len * (max_q8_dim + 31) / 32 * sizeof(float);
+                            size_t max_xq = (size_t)gpu_max_ubatch * max_q8_dim;
+                            size_t max_xd = (size_t)gpu_max_ubatch * (max_q8_dim + 31) / 32 * sizeof(float);
                             picolm_gpu_prealloc_q8(max_xq, max_xd, device);
 
                             /* Upload norm weights and RoPE tables to device.
@@ -3764,7 +3830,7 @@ float *model_forward(model_t *m, int token, int pos) {
 
 #ifdef PICOLM_GPU
         /* Phase 1: GPU attention decode path */
-        if (gpu_ok && m->gpu.kv_active && s->kv_type_k == KV_CACHE_F16 && s->kv_type_v == KV_CACHE_F16) {
+        if (gpu_ok && m->gpu.kv_active && kv_type_gpu_capable(s->kv_type_k) && kv_type_gpu_capable(s->kv_type_v)) {
             /* Clear GPU tensor before calling attention (no weight tensors involved) */
             tensor_set_gpu_tensor(NULL, 0);
             if (picolm_gpu_attention_decode(s->xb, s->q,
@@ -3786,7 +3852,7 @@ float *model_forward(model_t *m, int token, int pos) {
         /* PICOLM_DBG_ATTN: compare GPU vs CPU attention output */
         {
             const char *dbg_attn = getenv("PICOLM_DBG_ATTN");
-            if (dbg_attn && atoi(dbg_attn) && gpu_ok && m->gpu.kv_active && s->kv_type_k == KV_CACHE_F16) {
+            if (dbg_attn && atoi(dbg_attn) && gpu_ok && m->gpu.kv_active && kv_type_gpu_capable(s->kv_type_k)) {
                 size_t xb_cpu_sz = (size_t)n_heads * 256 * sizeof(float);
                 float *xb_cpu = (float *)malloc(xb_cpu_sz);
                 memcpy(xb_cpu, s->xb, n_heads * head_dim * sizeof(float));
@@ -5926,7 +5992,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
              * per K/V per chunk, replacing n_tokens*n_kv_heads launches. */
             #ifdef PICOLM_GPU
             if (gpu_ok && m->gpu.kv_active &&
-                s->kv_type_k == KV_CACHE_F16 && s->kv_type_v == KV_CACHE_F16) {
+                kv_type_gpu_capable(s->kv_type_k) && kv_type_gpu_capable(s->kv_type_v)) {
                 picolm_gpu_kv_store_rows(1, this_attn_ord, start_pos, n_tokens,
                                          kcl + (size_t)start_pos * s->kv_row_size_k,
                                          s->kv_row_size_k, n_kv_heads, head_dim,
@@ -5981,7 +6047,7 @@ float *model_forward_prefill(model_t *m, const int *tokens, int n_tokens, int st
 #endif
             #ifdef PICOLM_GPU
             /* Phase 1: GPU attention prefill path */
-            if (gpu_ok && m->gpu.kv_active && s->kv_type_k == KV_CACHE_F16 && s->kv_type_v == KV_CACHE_F16 &&
+            if (gpu_ok && m->gpu.kv_active && kv_type_gpu_capable(s->kv_type_k) && kv_type_gpu_capable(s->kv_type_v) &&
                 s->kv_head_stride_k == s->kv_head_stride_v) {
                 if (picolm_gpu_attention_prefill(xb_batch, q_batch,
                                                   this_attn_ord, start_pos, n_tokens,

@@ -102,6 +102,15 @@ __device__ inline float gpuShflDownSync(unsigned mask, float var, int lane_delta
 __device__ inline double gpuShflDownSync(unsigned mask, double var, int lane_delta, int width = 0) {
     (void)mask; return __shfl_down(var, lane_delta, width);
 }
+/* XOR butterfly shuffle: every lane ends with the reduction of the whole
+ * group, which __shfl_down does not give (it leaves partial sums in lanes
+ * other than 0). Used by the quantized KV store reduction. */
+__device__ inline float gpuShflXorSync(unsigned mask, float var, int lane_mask, int width = 0) {
+    (void)mask; return __shfl_xor(var, lane_mask, width);
+}
+__device__ inline int gpuShflXorSync(unsigned mask, int var, int lane_mask, int width = 0) {
+    (void)mask; return __shfl_xor(var, lane_mask, width);
+}
 #define gpuDeviceSynchronize hipDeviceSynchronize
 typedef hipDeviceProp_t gpuDeviceProp_t;
 typedef hipError_t gpuError_t;
@@ -196,6 +205,7 @@ typedef hipEvent_t gpuEvent_t;
  * CUDA path: __shfl_down_sync exists natively with the 4-arg signature. */
 #ifndef __HIP_PLATFORM_AMD__
 #define gpuShflDownSync __shfl_down_sync
+#define gpuShflXorSync __shfl_xor_sync
 #endif
 #define gpuLaunchBlockPerMultiprocessor cudaDevAttrMaxThreadsPerMultiProcessor
 #define gpuDevice cudaDevice

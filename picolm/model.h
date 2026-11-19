@@ -443,6 +443,27 @@ typedef struct {
 
 #define GLM5_PREFILL_MAX_TOKENS 512
 
+/* Tokens per batched-prefill compute chunk ("ubatch" in llama.cpp terms).
+ *
+ * This is the SINGLE source of truth for the chunk size, and it matters for
+ * more than performance: every GPU prefill scratch buffer that is indexed by
+ * token is sized from it. Sizing those buffers from max_seq_len instead (as
+ * picolm_gpu_pipeline_batch_alloc used to) costs ~221 KB of VRAM PER CONTEXT
+ * TOKEN on a 27B-class model -- 5.4 GB at 24k ctx -- which is why a 20.5 GB
+ * model could not exceed ~8k context on a 24 GB card no matter how small the
+ * KV cache was.
+ *
+ * 512 is the sweet spot: good IMMA occupancy, a Q8_0 activation panel
+ * (512*4096 = 2 MB) that still fits in L2, and prompts shorter than this fit
+ * in one chunk with zero overhead. PICOLM_UBATCH overrides it; read it through
+ * picolm_prefill_ubatch() so the allocator and the forward pass can never
+ * disagree. */
+#define PICOLM_PREFILL_UBATCH_DEFAULT 512
+
+/* Resolved ubatch size: PICOLM_UBATCH if set and > 0, else the default.
+ * Never returns 0. */
+int picolm_prefill_ubatch(void);
+
 typedef struct {
     const void *nextn_eh_proj;   /* [n_embd, 2*n_embd] */
     gguf_type_t type_nextn_eh_proj;

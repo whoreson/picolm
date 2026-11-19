@@ -2826,8 +2826,8 @@ picolm_gpu_attention_decode_kernel(
         int pos,
         int n_heads, int n_kv_heads, int head_dim, int max_seq_len,
         size_t kv_pos_stride_bytes,
-        size_t kv_head_stride_bytes,
-        int n_swa)
+        size_t kv_head_stride_bytes, size_t kv_head_stride_v_bytes,
+        int n_swa, int kv_type)
 {
     int kv_h = (int)gpuBlockIdx_x;
     if (kv_h >= n_kv_heads) return;
@@ -2837,7 +2837,7 @@ picolm_gpu_attention_decode_kernel(
     int tid = gpuThreadIdx_x;
     int n_threads = gpuBlockDim_x;
 
-    size_t layer_base = (size_t)layer_ordinal * max_seq_len * n_kv_heads * head_dim;
+    size_t layer_base = (size_t)layer_ordinal * max_seq_len * kv_pos_stride_bytes;
 
     /* Shared memory: K + V (u16), reduce area (256 float), then the
      * accumulator [kv_mul][head_dim] float, then max_score[kv_mul] and
@@ -2869,12 +2869,12 @@ picolm_gpu_attention_decode_kernel(
     if (t_start < 0) t_start = 0;
 
     for (int t = t_start; t <= pos; t++) {
-        size_t k_off = layer_base + (size_t)t * kv_pos_stride_bytes / 2 + kv_h * kv_head_stride_bytes / 2;
-        size_t v_off = k_off;
-        for (int d = tid; d < head_dim; d += n_threads) {
-            k_sh[d] = kv_k[k_off + d];
-            v_sh[d] = kv_v[v_off + d];
-        }
+        /* Byte offsets, so the same arithmetic works for F16 and for the
+         * block-quantized formats (whose per-head stride is not 2*head_dim). */
+        size_t row_off = layer_base + (size_t)t * kv_pos_stride_bytes + (size_t)kv_h * kv_head_stride_bytes;
+        size_t v_off = row_off - (size_t)kv_h * kv_head_stride_bytes + (size_t)kv_h * kv_head_stride_v_bytes;
+        kv_row_load_f16((const uint8_t *)kv_k, row_off, kv_type, head_dim, tid, n_threads, k_sh);
+        kv_row_load_f16((const uint8_t *)kv_v, v_off, kv_type, head_dim, tid, n_threads, v_sh);
         gpuSyncthreads();
 
         for (int g = 0; g < kv_mul; g++) {
@@ -2950,8 +2950,8 @@ picolm_gpu_attention_decode_split_kernel(
         const uint16_t *kv_k, const uint16_t *kv_v,
         int layer_ordinal, int pos,
         int n_heads, int n_kv_heads, int head_dim, int max_seq_len,
-        size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes,
-        int n_splits, int chunk_size, int n_swa)
+        size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, size_t kv_head_stride_v_bytes,
+        int n_splits, int chunk_size, int n_swa, int kv_type)
 {
     int kv_h = (int)gpuBlockIdx_x;
     int split = (int)gpuBlockIdx_y;
@@ -2995,15 +2995,14 @@ picolm_gpu_attention_decode_split_kernel(
     gpuSyncthreads();
 
     if (t0 < t1) {
-        size_t layer_base = (size_t)layer_ordinal * max_seq_len * n_kv_heads * head_dim;
+        size_t layer_base = (size_t)layer_ordinal * max_seq_len * kv_pos_stride_bytes;
         float attn_scale = 1.0f / sqrtf((float)head_dim);
 
         for (int t = t0; t < t1; t++) {
-            size_t k_off = layer_base + (size_t)t * kv_pos_stride_bytes / 2 + kv_h * kv_head_stride_bytes / 2;
-            for (int d = tid; d < head_dim; d += n_threads) {
-                k_sh[d] = kv_k[k_off + d];
-                v_sh[d] = kv_v[k_off + d];
-            }
+            size_t row_off = layer_base + (size_t)t * kv_pos_stride_bytes + (size_t)kv_h * kv_head_stride_bytes;
+            size_t v_off = row_off - (size_t)kv_h * kv_head_stride_bytes + (size_t)kv_h * kv_head_stride_v_bytes;
+            kv_row_load_f16((const uint8_t *)kv_k, row_off, kv_type, head_dim, tid, n_threads, k_sh);
+            kv_row_load_f16((const uint8_t *)kv_v, v_off, kv_type, head_dim, tid, n_threads, v_sh);
             gpuSyncthreads();
 
             for (int g = 0; g < kv_mul; g++) {
@@ -3281,8 +3280,8 @@ picolm_gpu_attention_prefill_kernel(
         int start_pos, int n_tokens,
         int n_heads, int n_kv_heads, int head_dim, int max_seq_len,
         size_t kv_pos_stride_bytes,
-        size_t kv_head_stride_bytes,
-        int tile_q, int n_swa)
+        size_t kv_head_stride_bytes, size_t kv_head_stride_v_bytes,
+        int tile_q, int n_swa, int kv_type)
 {
     int h = (int)gpuBlockIdx_x;       /* query head */
     int tile_q_idx = (int)gpuBlockIdx_y; /* tile of query tokens */
@@ -3292,7 +3291,7 @@ picolm_gpu_attention_prefill_kernel(
     int kv_h = h / (n_heads / n_kv_heads);
     float attn_scale = 1.0f / sqrtf((float)head_dim);
     /* Layer base offset in uint16_t */
-    size_t layer_base = (size_t)layer_ordinal * max_seq_len * n_kv_heads * head_dim;
+    size_t layer_base = (size_t)layer_ordinal * max_seq_len * kv_pos_stride_bytes;
 
     /* Which query tokens does this block handle? */
     int q_start = tile_q_idx * tile_q;
@@ -3343,9 +3342,9 @@ picolm_gpu_attention_prefill_kernel(
         /* Load K and V tile into shared memory */
         for (int d = tid; d < head_dim; d += n_threads) {
             for (int ti = 0; ti < tile_k_size; ti++) {
-                size_t k_off = layer_base + kv_h * kv_head_stride_bytes / 2 + (size_t)(t0 + ti) * kv_pos_stride_bytes / 2 + d;
-                k_tile[ti * head_dim + d] = kv_k[k_off];
-                v_tile[ti * head_dim + d] = kv_v[k_off];
+                size_t row_off = layer_base + (size_t)kv_h * kv_head_stride_bytes + (size_t)(t0 + ti) * kv_pos_stride_bytes + d;
+                k_tile[ti * head_dim + d] = gpu_fp32_to_fp16(kv_row_dequant((const uint8_t *)kv_k, row_off - d, kv_type, d));
+                v_tile[ti * head_dim + d] = gpu_fp32_to_fp16(kv_row_dequant((const uint8_t *)kv_v, row_off - (size_t)kv_h * kv_head_stride_bytes + (size_t)kv_h * kv_head_stride_v_bytes, kv_type, d));
             }
         }
         gpuSyncthreads();
@@ -3500,19 +3499,20 @@ __global__ void
 picolm_gpu_attention_prefill_warpgrp_kernel(
         float *xb_out,        /* [n_tokens][n_heads][head_dim] */
         const float *q_dev,   /* [n_tokens][n_heads][head_dim] */
-        const uint16_t *kv_k, /* [layer][pos][kv_head][head_dim] FP16
-                               * TODO(quant_kv): currently F16-only. For
-                               * quantized KV cache, kv_pos_stride_bytes and
-                               * kv_head_stride_bytes will change, and the
-                               * dequant step in the scoring loop must handle
-                               * per-block Q8_0/Q4_0/TQ3/TQ4 formats. */
-        const uint16_t *kv_v, /* [layer][pos][kv_head][head_dim] FP16 */
+        const uint16_t *kv_k, /* [layer][pos][kv_head] rows; the per-head
+                               * stride is kv_head_stride_bytes and the
+                               * storage format is kv_type (0 = F16,
+                               * 1 = Q8_0, 2 = Q4_0). Read through
+                               * kv_row_load_f16()/kv_row_dequant() so all
+                               * three formats work. */
+        const uint16_t *kv_v, /* same layout/format as kv_k, but with its
+                               * own per-head stride (kv_head_stride_v_bytes) */
         int layer_ordinal,
         int start_pos, int n_tokens,
         int n_heads, int n_kv_heads, int head_dim, int max_seq_len,
         size_t kv_pos_stride_bytes,
-        size_t kv_head_stride_bytes,
-        int tile_q, int n_swa)
+        size_t kv_head_stride_bytes, size_t kv_head_stride_v_bytes,
+        int tile_q, int n_swa, int kv_type)
 {
     const int GRP = ATTN_WARPGRP_SIZE;
     int h = (int)gpuBlockIdx_x;
@@ -3525,7 +3525,7 @@ picolm_gpu_attention_prefill_warpgrp_kernel(
 
     int kv_h = h / (n_heads / n_kv_heads);
     float attn_scale = 1.0f / sqrtf((float)head_dim);
-    size_t layer_base = (size_t)layer_ordinal * max_seq_len * n_kv_heads * head_dim;
+    size_t layer_base = (size_t)layer_ordinal * max_seq_len * kv_pos_stride_bytes;
 
     int q_start = tile_q_idx * tile_q;
     int q_end = min(q_start + tile_q, n_tokens);
@@ -3575,11 +3575,15 @@ picolm_gpu_attention_prefill_warpgrp_kernel(
          * which is what uint4 (8-element) alignment needs. Device
          * allocations are at minimum 256B-aligned, so the base pointer
          * itself is never the constraint. */
-        if ((head_dim & 7) == 0) {
+        if (kv_type == 0 && (head_dim & 7) == 0) {   /* F16-only fast path */
             int vec_elems = head_dim >> 3;
             for (int ti = 0; ti < tile_k_size; ti++) {
-                size_t base_off = layer_base + kv_h * kv_head_stride_bytes / 2
-                    + (size_t)(t0 + ti) * kv_pos_stride_bytes / 2;
+                /* layer_base is a BYTE offset; halve it back to uint16
+                 * elements for this pointer-arithmetic fast path (the old
+                 * code had layer_base already in elements, so this is the
+                 * same address it computed before). */
+                size_t base_off = layer_base / 2 + (size_t)kv_h * (kv_head_stride_bytes / 2)
+                    + (size_t)(t0 + ti) * (kv_pos_stride_bytes / 2);
                 const uint4 *k_src = (const uint4 *)(kv_k + base_off);
                 const uint4 *v_src = (const uint4 *)(kv_v + base_off);
                 uint4 *k_dst = (uint4 *)(k_tile + ti * head_dim);
@@ -3592,10 +3596,11 @@ picolm_gpu_attention_prefill_warpgrp_kernel(
         } else {
             for (int d = tid; d < head_dim; d += n_threads) {
                 for (int ti = 0; ti < tile_k_size; ti++) {
-                    size_t k_off = layer_base + kv_h * kv_head_stride_bytes / 2
-                        + (size_t)(t0 + ti) * kv_pos_stride_bytes / 2 + d;
-                    k_tile[ti * head_dim + d] = kv_k[k_off];
-                    v_tile[ti * head_dim + d] = kv_v[k_off];
+                    size_t head_off = layer_base + (size_t)kv_h * kv_head_stride_bytes
+                        + (size_t)(t0 + ti) * kv_pos_stride_bytes;
+                    k_tile[ti * head_dim + d] = gpu_fp32_to_fp16(kv_row_dequant((const uint8_t *)kv_k, head_off, kv_type, d));
+                    size_t v_head_off = head_off - (size_t)kv_h * kv_head_stride_bytes + (size_t)kv_h * kv_head_stride_v_bytes;
+                    v_tile[ti * head_dim + d] = gpu_fp32_to_fp16(kv_row_dequant((const uint8_t *)kv_v, v_head_off, kv_type, d));
                 }
             }
         }
@@ -3724,8 +3729,8 @@ picolm_gpu_attention_prefill_warpgrp_dot2_kernel(
         int start_pos, int n_tokens,
         int n_heads, int n_kv_heads, int head_dim, int max_seq_len,
         size_t kv_pos_stride_bytes,
-        size_t kv_head_stride_bytes,
-        int tile_q, int n_swa)
+        size_t kv_head_stride_bytes, size_t kv_head_stride_v_bytes,
+        int tile_q, int n_swa, int kv_type)
 {
     const int GRP = ATTN_WARPGRP_SIZE;
     int h = (int)gpuBlockIdx_x;
@@ -3738,7 +3743,7 @@ picolm_gpu_attention_prefill_warpgrp_dot2_kernel(
 
     int kv_h = h / (n_heads / n_kv_heads);
     float attn_scale = 1.0f / sqrtf((float)head_dim);
-    size_t layer_base = (size_t)layer_ordinal * max_seq_len * n_kv_heads * head_dim;
+    size_t layer_base = (size_t)layer_ordinal * max_seq_len * kv_pos_stride_bytes;
 
     int q_start = tile_q_idx * tile_q;
     int q_end = min(q_start + tile_q, n_tokens);
@@ -3782,11 +3787,15 @@ picolm_gpu_attention_prefill_warpgrp_dot2_kernel(
         int t_end = min(t0 + ATTN_TILE_K, block_kv_limit);
         int tile_k_size = t_end - t0;
 
-        if ((head_dim & 7) == 0) {
+        if (kv_type == 0 && (head_dim & 7) == 0) {   /* F16-only fast path */
             int vec_elems = head_dim >> 3;
             for (int ti = 0; ti < tile_k_size; ti++) {
-                size_t base_off = layer_base + kv_h * kv_head_stride_bytes / 2
-                    + (size_t)(t0 + ti) * kv_pos_stride_bytes / 2;
+                /* layer_base is a BYTE offset; halve it back to uint16
+                 * elements for this pointer-arithmetic fast path (the old
+                 * code had layer_base already in elements, so this is the
+                 * same address it computed before). */
+                size_t base_off = layer_base / 2 + (size_t)kv_h * (kv_head_stride_bytes / 2)
+                    + (size_t)(t0 + ti) * (kv_pos_stride_bytes / 2);
                 const uint4 *k_src = (const uint4 *)(kv_k + base_off);
                 const uint4 *v_src = (const uint4 *)(kv_v + base_off);
                 uint4 *k_dst = (uint4 *)(k_tile + ti * head_dim);
@@ -3799,10 +3808,11 @@ picolm_gpu_attention_prefill_warpgrp_dot2_kernel(
         } else {
             for (int d = tid; d < head_dim; d += n_threads) {
                 for (int ti = 0; ti < tile_k_size; ti++) {
-                    size_t k_off = layer_base + kv_h * kv_head_stride_bytes / 2
-                        + (size_t)(t0 + ti) * kv_pos_stride_bytes / 2 + d;
-                    k_tile[ti * head_dim + d] = kv_k[k_off];
-                    v_tile[ti * head_dim + d] = kv_v[k_off];
+                    size_t head_off = layer_base + (size_t)kv_h * kv_head_stride_bytes
+                        + (size_t)(t0 + ti) * kv_pos_stride_bytes;
+                    k_tile[ti * head_dim + d] = gpu_fp32_to_fp16(kv_row_dequant((const uint8_t *)kv_k, head_off, kv_type, d));
+                    size_t v_head_off = head_off - (size_t)kv_h * kv_head_stride_bytes + (size_t)kv_h * kv_head_stride_v_bytes;
+                    v_tile[ti * head_dim + d] = gpu_fp32_to_fp16(kv_row_dequant((const uint8_t *)kv_v, v_head_off, kv_type, d));
                 }
             }
         }
@@ -4371,7 +4381,7 @@ picolm_gpu_attention_prefill_fa2_kernel(
     const uint16_t *kv_k, const uint16_t *kv_v,
     int layer_ordinal, int start_pos, int n_tokens,
     int n_heads, int n_kv_heads, int head_dim, int max_seq_len,
-    size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, int n_swa)
+    size_t kv_pos_stride_bytes, size_t kv_head_stride_bytes, size_t kv_head_stride_v_bytes, int n_swa, int kv_type)
 {
     int q_h = gpuBlockIdx_x;        /* query head 0..n_heads-1 */
     int q_tile_idx = gpuBlockIdx_y;
@@ -4382,7 +4392,7 @@ picolm_gpu_attention_prefill_fa2_kernel(
     int kv_h = q_h / kv_mul;
 
     float attn_scale = 1.0f / sqrtf((float)head_dim);
-    size_t layer_base = (size_t)layer_ordinal * max_seq_len * n_kv_heads * head_dim;
+    size_t layer_base = (size_t)layer_ordinal * max_seq_len * kv_pos_stride_bytes;
     int n_total_kv = start_pos + n_tokens;
     int n_k16 = head_dim / 16;
     int row_stride32 = head_dim / 2;
@@ -4432,10 +4442,10 @@ picolm_gpu_attention_prefill_fa2_kernel(
             for (int d = t; d < tk_size * head_dim; d += 128) {
                 int ti = d / head_dim;
                 int dim = d % head_dim;
-                size_t kv_off = layer_base + kv_h * kv_head_stride_bytes / 2
-                    + (size_t)(t0 + ti) * kv_pos_stride_bytes / 2 + dim;
-                k_tile_sh[ti * head_dim + dim] = kv_k[kv_off];
-                v_tile_sh[ti * head_dim + dim] = kv_v[kv_off];
+                size_t head_off = layer_base + (size_t)kv_h * kv_head_stride_bytes
+                    + (size_t)(t0 + ti) * kv_pos_stride_bytes;
+                k_tile_sh[ti * head_dim + dim] = gpu_fp32_to_fp16(kv_row_dequant((const uint8_t *)kv_k, head_off, kv_type, dim));
+                v_tile_sh[ti * head_dim + dim] = gpu_fp32_to_fp16(kv_row_dequant((const uint8_t *)kv_v, head_off - (size_t)kv_h * kv_head_stride_bytes + (size_t)kv_h * kv_head_stride_v_bytes, kv_type, dim));
             }
         }
         gpuSyncthreads();

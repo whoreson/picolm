@@ -369,6 +369,90 @@ __device__ static inline float dequant_iq4_nl(const void *blk, int i) {
     return (float)val * d;
 }
 
+/* ---- quantized KV cache row loading ----
+ *
+ * The GPU KV cache can be stored in the same formats the CPU uses, in which
+ * case it is byte-identical to the CPU cache (same quantize_row_*, same block
+ * layout, same row stride, same per-head stride). See picolm_gpu_kv_quant_store_kernel
+ * for the writer and kv_row_load_f16() below for the reader.
+ *
+ * A cache position is [n_kv_heads][head_stride] bytes. Head h's blocks start
+ * at h * kv_head_stride and cover kv_head_stride / block_bytes blocks of
+ * block_elems values each. Every attention kernel wants the row as FP16 in
+ * shared memory, so the reader dequantizes straight into that tile -- the
+ * kernels themselves never see the storage format.
+ *
+ * Values are pure C (no PTX), so this is HIP- and any-backend-safe.
+ */
+
+/* Bytes per 32-value block for a KV cache storage format. Keep in sync with
+ * kv_head_stride() in model_core.c and with picolm_gpu_kv_store/load callers.
+ * Returns 0 for formats with no GPU dequant path.
+ *
+ * The numeric values are kv_cache_type_t (model.h), passed down as a plain
+ * int because model.h is not visible in device translation units:
+ *   0 = KV_CACHE_F16, 1 = KV_CACHE_Q8_0, 2 = KV_CACHE_Q4_0,
+ *   3 = KV_CACHE_TQ3, 4 = KV_CACHE_TQ4. */
+__device__ static inline int kv_block_bytes(int kv_type) {
+    switch (kv_type) {
+        case 0:  return 2;    /* KV_CACHE_F16: 32 values * 2 bytes */
+        case 1:  return 34;   /* KV_CACHE_Q8_0: block_q8_0 */
+        case 2:  return 18;   /* KV_CACHE_Q4_0: block_q4_0 */
+        default: return 0;    /* TQ3/TQ4 and anything else: CPU only */
+    }
+}
+
+/* Dequantize one value out of a KV cache row whose base byte offset is
+ * `row_bytes_off`. `i` is the element index within the head (0..head_dim-1). */
+__device__ static inline float kv_row_dequant(const uint8_t *kv_base,
+                                              size_t row_bytes_off, int kv_type, int i) {
+    switch (kv_type) {
+        case 0: { /* F16 */
+            const uint16_t *p = (const uint16_t *)(kv_base + row_bytes_off);
+            return gpu_fp16_to_fp32(p[i]);
+        }
+        case 1: { /* Q8_0 */
+            const uint8_t *b = kv_base + row_bytes_off + (size_t)(i >> 5) * kv_block_bytes(1);
+            return dequant_q8_0(b, i & 31);
+        }
+        case 2: { /* Q4_0 */
+            const uint8_t *b = kv_base + row_bytes_off + (size_t)(i >> 5) * kv_block_bytes(2);
+            return dequant_q4_0(b, i & 31);
+        }
+        default:
+            return 0.0f;
+    }
+}
+
+/* Load one KV head row for one position into the FP16 shared tile every
+ * attention kernel already uses.
+ *
+ *   kv_base       cache base pointer (g_kv_k_dev / g_kv_v_dev)
+ *   row_bytes_off byte offset of [layer][pos][head] within that buffer
+ *   kv_type       KV_CACHE_* storage format
+ *   head_dim      values to load (F16 path must be a multiple of 32 for
+ *                 quantized types; the host gate guarantees that)
+ *   tid, n_threads  the kernel's thread id / block size, for the strided copy
+ *   dst16         shared-memory FP16 tile, receiving head_dim values
+ *
+ * For F16 this is exactly the old `dst[d] = kv_k[k_off + d]` loop, so the F16
+ * path is unchanged bit for bit. */
+__device__ static inline void kv_row_load_f16(const uint8_t *kv_base,
+                                              size_t row_bytes_off, int kv_type,
+                                              int head_dim, int tid, int n_threads,
+                                              uint16_t *dst16) {
+    if (kv_type == 0) { /* F16: straight copy, fastest path */
+        const uint16_t *src = (const uint16_t *)(kv_base + row_bytes_off);
+        for (int d = tid; d < head_dim; d += n_threads)
+            dst16[d] = src[d];
+        return;
+    }
+    /* Quantized: dequantize into the tile. The kernels consume the tile as
+     * FP16, so round exactly the way the F16 cache would have stored it. */
+    for (int d = tid; d < head_dim; d += n_threads)
+        dst16[d] = gpu_fp32_to_fp16(kv_row_dequant(kv_base, row_bytes_off, kv_type, d));
+}
+
 /* ---- quant_matmul kernel ----
  *
  * Simple, correct GEMV kernel for all quant formats.

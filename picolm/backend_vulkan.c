@@ -2373,7 +2373,7 @@ int picolm_gpu_pipeline_batch_alloc(int dim, int q_dim, int kv_dim,
     size_t kvb = bsz * kv_dim * sizeof(float);
     size_t fb = bsz * ffn_hidden * sizeof(float);
     size_t total = 2*xb + 2*qb + 2*kvb + 2*fb;
-    fprintf(stderr, "[VK] pipeline_batch_alloc: seq=%d stride=%d total=%zu MB\n",
+    fprintf(stderr, "[VK] pipeline_batch_alloc: ubatch=%d stride=%d total=%zu MB\n",
             max_seq_len, xb_stride, total/(1024*1024));
     int ok = 1;
     #define APB(name, sz) do { if (!alloc_device_local((sz), &G.pipe_##name##_b, &G.pipe_##name##_b_m)) ok = 0; } while(0)

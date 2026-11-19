@@ -30,6 +30,34 @@ static uint16_t *g_kv_v_dev[PICOLM_GPU_MAX_DEVICES];
 static size_t g_kv_k_cap[PICOLM_GPU_MAX_DEVICES];
 static size_t g_kv_v_cap[PICOLM_GPU_MAX_DEVICES];
 static float *g_verify_buf_dev[PICOLM_GPU_MAX_DEVICES];
+
+/* How the device KV cache rows are laid out. Default F16 (0) so that a caller
+ * which never calls picolm_gpu_kv_set_type() gets exactly the historical
+ * behaviour. g_kv_types_set[dev] is 0 until set_type() runs, which is what
+ * lets the store path tell "defaulted to F16" from "explicitly F16". */
+static int g_kv_type_k[PICOLM_GPU_MAX_DEVICES] = {0};
+static int g_kv_type_v[PICOLM_GPU_MAX_DEVICES] = {0};
+static size_t g_kv_head_stride_k[PICOLM_GPU_MAX_DEVICES] = {0};
+static size_t g_kv_head_stride_v[PICOLM_GPU_MAX_DEVICES] = {0};
+static int g_kv_types_set[PICOLM_GPU_MAX_DEVICES] = {0};
+
+extern "C" int
+picolm_gpu_kv_set_type(int kv_type_k, int kv_type_v,
+                        size_t kv_head_stride_k, size_t kv_head_stride_v,
+                        int device) {
+    if (device < 0 || device >= PICOLM_GPU_MAX_DEVICES) return 0;
+    /* Only F16, Q8_0 and Q4_0 have a device dequant path (kv_block_bytes() in
+     * backend_gpu_dequant.cuh). TQ3/TQ4 stay CPU-only: refuse rather than let
+     * the attention kernels read a format they cannot decode. */
+    if (kv_type_k < 0 || kv_type_k > 2) return 0;
+    if (kv_type_v < 0 || kv_type_v > 2) return 0;
+    g_kv_type_k[device] = kv_type_k;
+    g_kv_type_v[device] = kv_type_v;
+    g_kv_head_stride_k[device] = kv_head_stride_k;
+    g_kv_head_stride_v[device] = kv_head_stride_v;
+    g_kv_types_set[device] = 1;
+    return 1;
+}
 extern "C" int
 picolm_gpu_kv_alloc(size_t kv_k_bytes, size_t kv_v_bytes, int device) {
     gpu_device_ctx_t *ctx = find_ctx(device);
@@ -140,19 +168,22 @@ picolm_gpu_ssm_pipeline_alloc(int conv_dim, int ssm_d_inner, int n_v_heads, int 
     return 1;
 }
 
-/* Allocate prefill batch buffers: [max_seq_len][max_stride] for S>1 pipeline
+/* Allocate prefill batch buffers: [max_ubatch][max_stride] for S>1 pipeline
  * xb_stride = max(q_dim, conv_dim, dim) to accommodate all uses:
  * - attention: RMSNorm output + QKV projections (q_dim stride)
  * - SSM prefill: attn_qkv output (conv_dim = 2*d_state*n_k + ssm_d_inner)
- * - residual add: dim stride */
+ * - residual add: dim stride
+ *
+ * max_ubatch is the largest number of tokens a single prefill launch will
+ * process (picolm_prefill_ubatch()), NOT the context length. See model.h. */
 extern "C" int
 picolm_gpu_pipeline_batch_alloc(int dim, int q_dim, int kv_dim, int ffn_hidden,
-                                 int xb_stride, int max_seq_len, int device) {
+                                 int xb_stride, int max_ubatch, int device) {
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
     if (ctx->pipe_b_ready) return 1;
 
-    size_t bsz = (size_t)max_seq_len;
+    size_t bsz = (size_t)max_ubatch;
     size_t qb = bsz * q_dim * sizeof(float);
     size_t xb = bsz * xb_stride * sizeof(float);
     size_t kvb = bsz * kv_dim * sizeof(float);
@@ -364,32 +395,106 @@ picolm_gpu_kv_pack_store_kernel(uint16_t *dst_row, const float *src, int n) {
     }
 }
 
+/* ---- Quantized KV store ----
+ *
+ * Writes the SAME bytes the CPU's quantize_row_q8_0 / quantize_row_q4_0 produce
+ * for the same inputs, so a GPU-quantized KV cache and a CPU-quantized one are
+ * interchangeable (and picolm_gpu_kv_flush_to_cpu is a plain memcpy).
+ *
+ * Layout per position: [n_kv_heads][head_dim] values, quantized in place as one
+ * contiguous run of blocks -- exactly what quantize_row_*(k_pos, kp, kv_dim)
+ * does on the CPU, because a block never straddles a head when head_dim is a
+ * multiple of 32 (the host gate guarantees this when it enables quantized KV).
+ *
+ * One warp per 32-value group: the warp is the natural scope for the absmax
+ * reduction, so it goes through the gpuShflXorSync shim (defined for CUDA and
+ * HIP alike) and the kernel needs no shared memory and no block-wide barrier.
+ *
+ * kv_type: 1 = Q8_0, 2 = Q4_0.
+ */
+__global__ void
+picolm_gpu_kv_quant_store_kernel(uint8_t *dst_row, const float *src,
+                                  int n_values, int kv_type) {
+    /* Assign exactly one 32-value block to each warp. No shared memory and no
+     * block-wide barriers: the absmax is exchanged with an XOR butterfly over
+     * the warp, and there is no way for a partial warp to reach a barrier the
+     * rest of the block does not (an earlier version early-returned
+     * out-of-range groups before a gpuSyncthreads(), which is undefined
+     * behaviour and corrupted the Q4_0 store). */
+    int tid = (int)gpuThreadIdx_x;
+    int lane = tid % 32;
+    int warp_in_block = tid / 32;
+    int warps_per_block = (int)gpuBlockDim_x / 32;
+    int blk = (int)gpuBlockIdx_x * warps_per_block + warp_in_block;
+    int nblk = n_values / 32;
+    if (blk >= nblk) return;
+
+    float x = src[(size_t)blk * 32 + lane];
+
+    /* Butterfly absmax across the 32 lanes of this warp. Every lane ends with
+     * the same value, so no lane needs to read another lane's scratch. */
+    float amax = fabsf(x);
+    for (int off = 16; off > 0; off >>= 1) {
+        float o = gpuShflXorSync(0xFFFFFFFFu, amax, off);
+        if (o > amax) amax = o;
+    }
+
+    if (kv_type == 1) { /* Q8_0: 34 bytes = fp16 d + 32 int8 */
+        uint8_t *b = dst_row + (size_t)blk * 34;
+        float d = amax / 127.0f;
+        float id = (amax != 0.0f) ? 127.0f / amax : 0.0f;
+        int q = (int)nearbyintf(x * id);
+        if (q > 127) q = 127;
+        if (q < -128) q = -128;
+        if (lane == 0) {
+            uint16_t dh = gpu_fp32_to_fp16(d);
+            b[0] = (uint8_t)(dh & 0xFF);
+            b[1] = (uint8_t)(dh >> 8);
+        }
+        b[2 + lane] = (uint8_t)(int8_t)q;
+    } else { /* Q4_0: 18 bytes = fp16 d + 16 packed nibbles */
+        uint8_t *b = dst_row + (size_t)blk * 18;
+        float d = amax / 8.0f;
+        float id = (amax != 0.0f) ? 8.0f / amax : 0.0f;
+        /* quantize_row_q4_0: v = (uint8_t)(x*id + 8.5f), clamped to 15. */
+        int v = (int)(x * id + 8.5f);
+        if (v > 15) v = 15;
+        if (v < 0) v = 0;
+        if (lane == 0) {
+            uint16_t dh = gpu_fp32_to_fp16(d);
+            b[0] = (uint8_t)(dh & 0xFF);
+            b[1] = (uint8_t)(dh >> 8);
+        }
+        /* Lanes 0..15 own byte lane (low nibble = element lane), lanes
+         * 16..31 own the high nibble of byte lane-16 (= element lane).
+         * Each byte is written entirely by its low-nibble lane, which
+         * reads the partner's value with a shuffle instead of racing on a
+         * read-modify-write. */
+        int hi_v = (int)gpuShflXorSync(0xFFFFFFFFu, (float)v, 16); /* lane<16 gets lane+16 */
+        if (lane < 16)
+            b[2 + lane] = (uint8_t)((v & 0x0F) | (((int)hi_v & 0x0F) << 4));
+    }
+}
+
 /* Device-native KV store: src_dev is pipe_k/pipe_v (F32, already on
  * device, kv_dim = n_kv_heads*head_dim elements). No transfer, no sync --
  * same ctx->stream ordering argument as the other _dev primitives.
  * Caller must call this (K then V) before picolm_gpu_attention_decode_dev
- * for the same (layer_ordinal, pos), same as picolm_gpu_kv_store_rows. */
+ * for the same (layer_ordinal, pos), same as picolm_gpu_kv_store_rows.
+ *
+ * Delegates to the batched strided implementation with n_positions=1 so the
+ * decode path and the prefill path CANNOT disagree about the row stride or
+ * the storage format. They used to: this function wrote F16 at
+ * kv_dim*sizeof(uint16_t) per row unconditionally, so with a Q8_0/Q4_0 cache
+ * every decode step scribbled 2 bytes/element into a cache sized for 34/18
+ * bytes per 32 values, corrupting every subsequent read. */
 extern "C" int
 picolm_gpu_kv_store_dev(int is_k, int layer_ordinal, int pos,
                          const float *src_dev, int n_kv_heads, int head_dim,
                          int max_seq_len, int device) {
-    gpu_device_ctx_t *ctx = find_ctx(device);
-    if (!ctx || !select_ctx(ctx)) return 0;
-    if (!g_kv_k_dev[device] || !g_kv_v_dev[device]) return 0;
-
-    int kv_dim = n_kv_heads * head_dim;
-    size_t row_bytes = (size_t)kv_dim * sizeof(uint16_t);
-    uint16_t *dst_base = is_k ? g_kv_k_dev[device] : g_kv_v_dev[device];
-    uint16_t *dst_row = dst_base
-        + ((size_t)layer_ordinal * max_seq_len * row_bytes
-           + (size_t)pos * row_bytes) / sizeof(uint16_t);
-
-    int n_threads = min(kv_dim, 256);
-    int n_blocks = (kv_dim + n_threads - 1) / n_threads;
-    picolm_gpu_kv_pack_store_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
-        dst_row, src_dev, kv_dim);
-    if (!gpu_ok(gpuGetLastError(), "kv pack+store (dev)")) return 0;
-    return 1;
+    return picolm_gpu_kv_store_dev_batched_strided(is_k, layer_ordinal, pos, 1,
+                                                   src_dev, n_kv_heads, head_dim,
+                                                   max_seq_len, device, 0);
 }
 
 /* Batched variant: src_dev is [S][kv_dim] contiguous F32, positions
@@ -414,21 +519,51 @@ picolm_gpu_kv_store_dev_batched_strided(int is_k, int layer_ordinal, int start_p
     if (!g_kv_k_dev[device] || !g_kv_v_dev[device]) return 0;
 
     int kv_dim = n_kv_heads * head_dim;
-    size_t row_bytes = (size_t)kv_dim * sizeof(uint16_t);
-    uint16_t *dst_base = is_k ? g_kv_k_dev[device] : g_kv_v_dev[device];
-    uint16_t *dst_row = dst_base
-        + ((size_t)layer_ordinal * max_seq_len * row_bytes
-           + (size_t)start_pos * row_bytes) / sizeof(uint16_t);
+    int kv_type = is_k ? g_kv_type_k[device] : g_kv_type_v[device];
+    /* Row size in bytes depends on the storage format: F16 is 2 bytes per
+     * element, Q8_0 ~1.06, Q4_0 ~0.56. The CPU row size (kv_row_size_*) is
+     * exactly this, and the device cache was allocated from it. */
+    size_t row_bytes;
+    if (g_kv_types_set[device] && kv_type != 0) {
+        int block_bytes = (kv_type == 1) ? 34 : 18;
+        row_bytes = (size_t)(kv_dim / 32) * block_bytes;
+    } else {
+        row_bytes = (size_t)kv_dim * sizeof(uint16_t);
+    }
 
+    uint8_t *dst_base = (uint8_t *)(is_k ? g_kv_k_dev[device] : g_kv_v_dev[device]);
+    uint8_t *dst_row = dst_base + (size_t)layer_ordinal * max_seq_len * row_bytes
+                                 + (size_t)start_pos * row_bytes;
+
+    if (kv_type != 0) {
+        /* Quantized: the kernel works on 32-value groups and needs one thread
+         * per value, so run one position at a time and give each launch
+         * (kv_dim/32) groups of 32 lanes. src_stride is 0 when the source rows
+         * are already packed at kv_dim. */
+        if ((kv_dim % 32) != 0) return 0;   /* host gate should prevent this */
+        int n_threads = 128;                 /* 4 warps = 4 blocks per launch */
+        int groups = kv_dim / 32;
+        int n_blocks = (groups + 3) / 4;
+        for (int t = 0; t < n_positions; t++) {
+            const float *src_pos = src_dev + (size_t)t * (src_stride > 0 ? src_stride : kv_dim);
+            uint8_t *dst_pos = dst_row + (size_t)t * row_bytes;
+            picolm_gpu_kv_quant_store_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
+                dst_pos, src_pos, kv_dim, kv_type);
+        }
+        if (!gpu_ok(gpuGetLastError(), "kv quant store batched (dev)")) return 0;
+        return 1;
+    }
+
+    uint16_t *dst_row16 = (uint16_t *)dst_row;
     int total = n_positions * kv_dim;
     int n_threads = 256;
     int n_blocks = min((total + n_threads - 1) / n_threads, 4096);
     if (src_stride > 0 && src_stride != kv_dim) {
         picolm_gpu_kv_pack_store_strided_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
-            dst_row, src_dev, kv_dim, n_positions, src_stride);
+            dst_row16, src_dev, kv_dim, n_positions, src_stride);
     } else {
         picolm_gpu_kv_pack_store_kernel<<<n_blocks, n_threads, 0, ctx->stream>>>(
-            dst_row, src_dev, total);
+            dst_row16, src_dev, total);
     }
     if (!gpu_ok(gpuGetLastError(), "kv pack+store batched (dev)")) return 0;
     return 1;
@@ -441,9 +576,17 @@ picolm_gpu_kv_debug_dump(int is_k, int layer_ordinal, int pos,
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!ctx || !select_ctx(ctx)) return 0;
     if (!g_kv_k_dev[device]) return 0;
+    /* Only meaningful for an F16 cache: the element-indexed layout below is
+     * the F16 one. A quantized cache has no uint16 element addressing. */
+    if (g_kv_types_set[device] && (g_kv_type_k[device] != 0 || g_kv_type_v[device] != 0))
+        return 0;
     uint16_t *src_base = is_k ? g_kv_k_dev[device] : g_kv_v_dev[device];
-    int kv_dim = n_kv_heads * head_dim;
-    uint16_t *src_row = src_base + (size_t)layer_ordinal * max_seq_len * kv_dim + (size_t)pos * kv_dim;
+    /* Was `* kv_dim`, which is only the row size for F16 with head_dim
+     * elements per head -- i.e. it silently assumed the row stride equals the
+     * element count. Use the explicit row stride so this stays correct. */
+    size_t row_stride = (size_t)n_kv_heads * head_dim;
+    uint16_t *src_row = src_base + (size_t)layer_ordinal * max_seq_len * row_stride
+                                  + (size_t)pos * row_stride;
     if (!gpu_ok(gpuMemcpy(dst, src_row, n_elements * sizeof(uint16_t), gpuMemcpyDeviceToHost),
                 "kv_debug_dump D2H"))
         return 0;
@@ -458,14 +601,20 @@ picolm_gpu_kv_store_rows(int is_k, int layer_ordinal, int start_pos, int n_posit
     if (!ctx || !select_ctx(ctx)) return 0;
     if (!g_kv_k_dev[device] || !g_kv_v_dev[device]) return 0;
 
-    /* Sanity: row_bytes must match the F16 GQA row size this cache was
-     * sized for. If a caller passes a quantized row_bytes here, refuse
-     * rather than silently corrupting the cache.
-     * TODO(quant_kv): Remove this check once quantized KV cache is supported.
-     * For quantized KV, row_bytes will be smaller than the F16 row size and
-     * the H2D memcpy will still work correctly (quantized CPU layout is
-     * byte-identical to GPU layout). */
-    size_t expect_row_bytes = (size_t)n_kv_heads * head_dim * sizeof(uint16_t);
+    /* row_bytes must be the row size of the format this cache was allocated
+     * for. F16 is n_kv_heads*head_dim*2; Q8_0/Q4_0 use the block layouts. The
+     * CPU and device layouts are byte-identical for a given type, so a plain
+     * H2D of the CPU row is correct for every supported type. */
+    size_t expect_row_bytes;
+    {
+        int t = is_k ? g_kv_type_k[device] : g_kv_type_v[device];
+        if (g_kv_types_set[device] && t != 0) {
+            size_t hs = is_k ? g_kv_head_stride_k[device] : g_kv_head_stride_v[device];
+            expect_row_bytes = (size_t)n_kv_heads * hs;
+        } else {
+            expect_row_bytes = (size_t)n_kv_heads * head_dim * sizeof(uint16_t);
+        }
+    }
     if (row_bytes != expect_row_bytes) return 0;
 
     uint16_t *dst_base = is_k ? g_kv_k_dev[device] : g_kv_v_dev[device];
@@ -506,6 +655,27 @@ picolm_gpu_kv_upload_layer(int is_k, int layer_ordinal, int n_positions,
     return 1;
 }
 
+/* Resolve the KV cache row/head strides and storage format for one cache
+ * (1 = K, 0 = V). Before picolm_gpu_kv_set_type() runs this is F16 with the
+ * historical implicit strides, so every caller that does not opt in keeps the
+ * exact previous behaviour. After it, the strides are whatever the allocator
+ * used, which is what the GPU cache is actually laid out as. */
+static void kv_strides_for(int device, int is_k, int n_kv_heads, int head_dim,
+                            size_t *pos_stride_out, size_t *head_stride_out, int *kv_type_out) {
+    if (device >= 0 && device < PICOLM_GPU_MAX_DEVICES && g_kv_types_set[device]) {
+        int t = is_k ? g_kv_type_k[device] : g_kv_type_v[device];
+        size_t hs = is_k ? g_kv_head_stride_k[device] : g_kv_head_stride_v[device];
+        if (hs == 0) hs = (size_t)head_dim * sizeof(uint16_t);
+        *kv_type_out = t;
+        *head_stride_out = hs;
+        *pos_stride_out = (size_t)n_kv_heads * hs;
+        return;
+    }
+    *kv_type_out = 0;
+    *head_stride_out = (size_t)head_dim * sizeof(uint16_t);
+    *pos_stride_out = (size_t)n_kv_heads * head_dim * sizeof(uint16_t);
+}
+
 /* Shared dispatch for both picolm_gpu_attention_decode and _dev: chooses
  * single-pass (grid=n_kv_heads, matching the pre-split-K behavior
  * exactly -- no regression risk for short contexts) vs split-K (grid=
@@ -527,8 +697,15 @@ attn_decode_dispatch(float *xb_dev, const float *q_dev,
     if (n_kv_heads <= 0 || n_heads <= 0 || n_heads % n_kv_heads != 0) return 0;
 
     int kv_mul = n_heads / n_kv_heads;
-    size_t kv_pos_stride_bytes = (size_t)n_kv_heads * head_dim * sizeof(uint16_t);
-    size_t kv_head_stride_bytes = head_dim * sizeof(uint16_t);
+    size_t kv_pos_stride_bytes, kv_head_stride_bytes;
+    size_t kv_pos_stride_v_bytes, kv_head_stride_v_bytes;
+    int kv_type = 0, kv_type_v = 0;
+    kv_strides_for(device, 1, n_kv_heads, head_dim,
+                   &kv_pos_stride_bytes, &kv_head_stride_bytes, &kv_type);
+    kv_strides_for(device, 0, n_kv_heads, head_dim,
+                   &kv_pos_stride_v_bytes, &kv_head_stride_v_bytes, &kv_type_v);
+    (void)kv_pos_stride_v_bytes;
+    (void)kv_type_v;   /* K and V share the block format in every kernel below */
 
     int total_kv = pos + 1;
     if (n_swa > 0 && n_swa < total_kv) total_kv = n_swa; /* SWA shrinks the split-K work estimate */
@@ -548,7 +725,7 @@ attn_decode_dispatch(float *xb_dev, const float *q_dev,
         picolm_gpu_attention_decode_kernel<<<grid, 256, (unsigned)shared_bytes, ctx->stream>>>(
             xb_dev, q_dev, g_kv_k_dev[device], g_kv_v_dev[device],
             layer_ordinal, pos, n_heads, n_kv_heads, head_dim, max_seq_len,
-            kv_pos_stride_bytes, kv_head_stride_bytes, n_swa);
+            kv_pos_stride_bytes, kv_head_stride_bytes, kv_head_stride_v_bytes, n_swa, kv_type);
         if (!gpu_ok(gpuGetLastError(), "attn decode kernel")) return 0;
         return 1;
     }
@@ -570,7 +747,7 @@ attn_decode_dispatch(float *xb_dev, const float *q_dev,
         partial_max, partial_sum, partial_acc,
         q_dev, g_kv_k_dev[device], g_kv_v_dev[device],
         layer_ordinal, pos, n_heads, n_kv_heads, head_dim, max_seq_len,
-        kv_pos_stride_bytes, kv_head_stride_bytes, n_splits, chunk_size, n_swa);
+        kv_pos_stride_bytes, kv_head_stride_bytes, kv_head_stride_v_bytes, n_splits, chunk_size, n_swa, kv_type);
     if (!gpu_ok(gpuGetLastError(), "attn decode split kernel")) return 0;
 
     size_t merge_shared = (size_t)kv_mul * 2 * sizeof(float);
@@ -813,8 +990,15 @@ picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
     if (!gpu_ok(gpuMemcpyAsync(ctx->x, q_host, x_bytes, gpuMemcpyHostToDevice, ctx->stream),
                 "attn prefill Q upload")) return 0;
 
-    size_t kv_pos_stride_bytes = (size_t)n_kv_heads * head_dim * sizeof(uint16_t);
-    size_t kv_head_stride_bytes = head_dim * sizeof(uint16_t);
+    size_t kv_pos_stride_bytes, kv_head_stride_bytes;
+    size_t kv_pos_stride_v_bytes, kv_head_stride_v_bytes;
+    int kv_type = 0, kv_type_v = 0;
+    kv_strides_for(device, 1, n_kv_heads, head_dim,
+                   &kv_pos_stride_bytes, &kv_head_stride_bytes, &kv_type);
+    kv_strides_for(device, 0, n_kv_heads, head_dim,
+                   &kv_pos_stride_v_bytes, &kv_head_stride_v_bytes, &kv_type_v);
+    (void)kv_pos_stride_v_bytes;
+    (void)kv_type_v;   /* K and V share the block format in every kernel below */
 
     /* Try FA2 (tensor core) kernel when available (NVIDIA IMMA only) */
     int use_fa2 = ctx->has_imma && n_tokens >= 64 && !getenv("PICOLM_FORCE_SCALAR_ATTN");
@@ -836,7 +1020,7 @@ picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
                 ctx->y, ctx->x,
                 g_kv_k_dev[device], g_kv_v_dev[device],
                 layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim, max_seq_len,
-                kv_pos_stride_bytes, kv_head_stride_bytes, n_swa);
+                kv_pos_stride_bytes, kv_head_stride_bytes, kv_head_stride_v_bytes, n_swa, kv_type);
             if (!gpu_ok(gpuGetLastError(), "attn prefill fa2 (host)")) return 0;
         } else {
             use_fa2 = 0;
@@ -872,7 +1056,7 @@ picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
                     ctx->y, ctx->x,
                     g_kv_k_dev[device], g_kv_v_dev[device],
                     layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim, max_seq_len,
-                    kv_pos_stride_bytes, kv_head_stride_bytes, tile_q, n_swa);
+                    kv_pos_stride_bytes, kv_head_stride_bytes, kv_head_stride_v_bytes, tile_q, n_swa, kv_type);
             } else
 #endif
             {
@@ -882,7 +1066,7 @@ picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
                     ctx->y, ctx->x,
                     g_kv_k_dev[device], g_kv_v_dev[device],
                     layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim, max_seq_len,
-                    kv_pos_stride_bytes, kv_head_stride_bytes, tile_q, n_swa);
+                    kv_pos_stride_bytes, kv_head_stride_bytes, kv_head_stride_v_bytes, tile_q, n_swa, kv_type);
             }
         } else {
             gpu_dispatch_print("attn_prefill_scalar_host");
@@ -899,7 +1083,7 @@ picolm_gpu_attention_prefill(float *xb_out, const float *q_host,
                 ctx->y, ctx->x,
                 g_kv_k_dev[device], g_kv_v_dev[device],
                 layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim, max_seq_len,
-                kv_pos_stride_bytes, kv_head_stride_bytes, tile_q, n_swa);
+                kv_pos_stride_bytes, kv_head_stride_bytes, kv_head_stride_v_bytes, tile_q, n_swa, kv_type);
         }
     }
 
@@ -927,8 +1111,15 @@ picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
     if (head_dim > 256) return 0;
     if (head_dim % 16 != 0) return 0;
 
-    size_t kv_pos_stride_bytes = (size_t)n_kv_heads * head_dim * sizeof(uint16_t);
-    size_t kv_head_stride_bytes = head_dim * sizeof(uint16_t);
+    size_t kv_pos_stride_bytes, kv_head_stride_bytes;
+    size_t kv_pos_stride_v_bytes, kv_head_stride_v_bytes;
+    int kv_type = 0, kv_type_v = 0;
+    kv_strides_for(device, 1, n_kv_heads, head_dim,
+                   &kv_pos_stride_bytes, &kv_head_stride_bytes, &kv_type);
+    kv_strides_for(device, 0, n_kv_heads, head_dim,
+                   &kv_pos_stride_v_bytes, &kv_head_stride_v_bytes, &kv_type_v);
+    (void)kv_pos_stride_v_bytes;
+    (void)kv_type_v;   /* K and V share the block format in every kernel below */
 
     /* Use FA2 (tensor core) kernel only on NVIDIA with IMMA.
      * HIP scalar fallback is too slow (10-15s for 200 tokens). */
@@ -958,7 +1149,7 @@ picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
                 xb_out_dev, q_dev,
                 g_kv_k_dev[device], g_kv_v_dev[device],
                 layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim, max_seq_len,
-                kv_pos_stride_bytes, kv_head_stride_bytes, n_swa);
+                kv_pos_stride_bytes, kv_head_stride_bytes, kv_head_stride_v_bytes, n_swa, kv_type);
             if (!gpu_ok(gpuGetLastError(), "attn prefill fa2 (dev)")) return 0;
             return 1;
         }
@@ -995,7 +1186,7 @@ picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
             xb_out_dev, q_dev,
             g_kv_k_dev[device], g_kv_v_dev[device],
             layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim, max_seq_len,
-            kv_pos_stride_bytes, kv_head_stride_bytes, tile_q, n_swa);
+            kv_pos_stride_bytes, kv_head_stride_bytes, kv_head_stride_v_bytes, tile_q, n_swa, kv_type);
         if (!gpu_ok(gpuGetLastError(), "attn prefill warpgrp (dev)")) return 0;
         return 1;
     }
@@ -1015,7 +1206,7 @@ picolm_gpu_attention_prefill_dev(float *xb_out_dev, const float *q_dev,
         xb_out_dev, q_dev,
         g_kv_k_dev[device], g_kv_v_dev[device],
         layer_ordinal, start_pos, n_tokens, n_heads, n_kv_heads, head_dim, max_seq_len,
-        kv_pos_stride_bytes, kv_head_stride_bytes, tile_q, n_swa);
+        kv_pos_stride_bytes, kv_head_stride_bytes, kv_head_stride_v_bytes, tile_q, n_swa, kv_type);
     if (!gpu_ok(gpuGetLastError(), "attn prefill (dev)")) return 0;
     return 1;
 }

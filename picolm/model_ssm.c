@@ -6435,13 +6435,10 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
          * Our PICOLM_UBATCH maps to n_ubatch: the physical chunk size for IMMA kernels.
          * 512 is the sweet spot: good IMMA occupancy, manageable L2 cache footprint,
          * and the Q8_0 quantized activation (512*4096 = 2MB) fits well in L2.
-         * Smaller prompts fit in one ubatch with zero overhead. */
-        int ubatch_size = 0;
-        {
-            const char *ev = getenv("PICOLM_UBATCH");
-            if (ev) ubatch_size = atoi(ev);
-            if (ubatch_size <= 0) ubatch_size = 512;
-        }
+         * Smaller prompts fit in one ubatch with zero overhead.
+         * picolm_prefill_ubatch() is the SAME value the GPU batch buffers were
+         * allocated with, so a chunk can never exceed its destination buffer. */
+        int ubatch_size = picolm_prefill_ubatch();
 
         /* Dequantize embeddings per-ubatch to avoid huge host allocations
          * for very long prompts. Each ubatch's embeddings fit in a small
@@ -6529,8 +6526,7 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
     /* Flush GPU KV cache to CPU for CPU decode path.
      * Required on all GPU backends: GPU prefill writes to GPU KV cache only,
      * but CPU decode (model_forward_gpt2) reads from CPU KV cache. */
-    if (gw->kv_active && s->kv_type_k == KV_CACHE_F16 && s->kv_type_v == KV_CACHE_F16
-        && !getenv("PICOLM_NO_GPU_FLUSH")) {
+    if (gw->kv_active && !getenv("PICOLM_NO_GPU_FLUSH")) {
         int n_attn_ord = 0;
         for (int _ll = 0; _ll < c->n_layers; _ll++) {
             if (w->layers[_ll].is_attn_layer) n_attn_ord++;

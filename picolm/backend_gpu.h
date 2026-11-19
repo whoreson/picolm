@@ -375,25 +375,46 @@ void *picolm_gpu_upload_int(const int *host, size_t n, int device);
 /* Allocate device KV cache. Called once at model_load.
  * kv_k_bytes / kv_v_bytes are the total bytes needed for each cache,
  * matching the CPU allocation: kv_layers * max_seq_len * n_kv_heads * kv_head_stride.
- * Returns 1 on success, 0 -> caller falls back to CPU KV cache. */
+ * Returns 1 on success, 0 -> caller falls back to CPU KV cache.
+ *
+ * The cache is F16 until picolm_gpu_kv_set_type() says otherwise; that call
+ * only records how rows are laid out, it does not touch the allocation. */
 int picolm_gpu_kv_alloc(size_t kv_k_bytes, size_t kv_v_bytes, int device);
 
-/* Store one or more full GQA rows (F16) into the device KV cache.
+/* Tell the device KV cache how its rows are stored. Call right after a
+ * successful picolm_gpu_kv_alloc(), BEFORE any store. kv_type_k/_v are
+ * kv_cache_type_t values (model.h); kv_head_stride_k/_v is the byte distance
+ * between consecutive KV heads inside a row (kv_head_stride() in model_core.c).
+ *
+ * F16 (0) is the default and is bit-identical to the historical behaviour.
+ * Q8_0 (1) and Q4_0 (2) make the device cache byte-identical to a CPU cache
+ * of the same type: the store path quantizes on device and the attention
+ * kernels dequantize on read. Any other type is refused (returns 0) so the
+ * caller can decline the GPU KV path instead of corrupting it. */
+int picolm_gpu_kv_set_type(int kv_type_k, int kv_type_v,
+                           size_t kv_head_stride_k, size_t kv_head_stride_v,
+                           int device);
+
+/* Store one or more full GQA rows into the device KV cache.
  *
  * Phase 1.5: the CPU-side KV cache (s->key_cache / s->val_cache) already
- * stores each row as [kv_head][head_dim] contiguous FP16 -- byte-identical
- * to the device layout [layer][pos][kv_head][head_dim]. There is therefore
- * no per-head or per-element work to do on the device side at all; this is
- * a single async H2D copy of `n_positions` contiguous rows starting at
- * `start_pos`. This replaces both the old per-head decode kernel launch
- * and the old per-token/per-head prefill loop (which cost O(n_tokens *
- * n_kv_heads) launches and was the source of the prefill regression).
+ * stores each row as [kv_head][head_dim] contiguous values in the cache's
+ * storage format -- byte-identical to the device layout
+ * [layer][pos][kv_head][head_dim]. That holds for F16 and for the block
+ * formats (Q8_0/Q4_0) alike, because both sides run the same quantize_row_*
+ * over the same kv_dim. There is therefore no per-head or per-element work to
+ * do on the device side at all; this is a single async H2D copy of
+ * `n_positions` contiguous rows starting at `start_pos`. This replaces both
+ * the old per-head decode kernel launch and the old per-token/per-head
+ * prefill loop (which cost O(n_tokens * n_kv_heads) launches and was the
+ * source of the prefill regression).
  *
  * host_rows: pointer to `n_positions` contiguous rows, i.e.
  *            s->key_cache/val_cache + this_attn_ordinal*seq_len*row_bytes
  *                                   + start_pos*row_bytes
- * row_bytes: n_kv_heads * head_dim * sizeof(uint16_t) (== kv_row_size_k/v
- *            for KV_CACHE_F16 -- caller must only call this for F16 KV).
+ * row_bytes: n_kv_heads * kv_head_stride for the cache's type
+ *            (== kv_row_size_k/v). F16 is n_kv_heads*head_dim*2; Q8_0 and
+ *            Q4_0 are the corresponding block layouts.
  * Returns 1 on success, 0 -> caller must fall back (row_bytes mismatch,
  * alloc missing, etc). */
 int picolm_gpu_kv_store_rows(int is_k, int layer_ordinal, int start_pos, int n_positions,
