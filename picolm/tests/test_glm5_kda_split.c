@@ -63,23 +63,42 @@ static int run(const int *chunks, int nch, int nth, int H) {
     return bad;
 }
 
-#if defined(PICOLM_AVX512)
+#if defined(PICOLM_AVX512) || defined(PICOLM_AVX2) || defined(PICOLM_AVX)
 /* vector expf vs libm expf: max ULP error and the overflow/underflow limits */
-static int test_expf(void) {
-    float xs[16], ys[16]; double maxulp = 0; int bad = 0; long n = 0;
+static int test_expf(void)
+{
+#if defined(PICOLM_AVX512)
+#define TEST_EXP_FNSIZE 16
+#elif defined(PICOLM_AVX2) || defined(PICOLM_AVX)
+#define TEST_EXP_FNSIZE 8
+#endif
+    float xs[TEST_EXP_FNSIZE], ys[TEST_EXP_FNSIZE];
+    double maxulp = 0; int bad = 0; long n = 0;
     for (int it = 0; it < 400000; it++) {
-        for (int i = 0; i < 16; i++) xs[i] = ((float)(rnd() % 2000001) / 10000.0f) - 100.0f;     /* [-100, 100] */
+        for (int i = 0; i < TEST_EXP_FNSIZE; i++) xs[i] = ((float)(rnd() % 2000001) / 10000.0f) - 100.0f;
+#if defined(PICOLM_AVX512)
         _mm512_storeu_ps(ys, kda_expf16(_mm512_loadu_ps(xs)));
-        for (int i = 0; i < 16; i++) {
+#elif defined(PICOLM_AVX2) || defined(PICOLM_AVX)
+        _mm256_storeu_ps(ys, kda_expf8(_mm256_loadu_ps(xs)));
+#endif
+        for (int i = 0; i < TEST_EXP_FNSIZE; i++) {
             const float ref = expf(xs[i]);
             if (!isfinite(ref)) { if (!isinf(ys[i])) bad++; continue; }
-            if (ref < 1.2e-38f) continue;                                   /* denormal range: ULP is meaningless */
+            if (ref < 1.2e-38f) continue;
             int32_t a, b; memcpy(&a, &ref, 4); memcpy(&b, &ys[i], 4);
             const double u = fabs((double)a - (double)b); if (u > maxulp) maxulp = u; n++;
         }
     }
-    float lim[16] = { 89.5f, 200.f, 1e30f, -104.5f, -200.f, -1e30f, 0.f, 1.f, -1.f, 88.7f, 88.8f, -87.f, -90.f, 50.f, -50.f, 10.f };
+    float lim[TEST_EXP_FNSIZE] = { 89.5f, 200.f, 1e30f, -104.5f, -200.f, -1e30f, 0.f, 1.f
+#if TEST_EXP_FNSIZE > 8
+        , -1.f, 88.7f, 88.8f, -87.f, -90.f, 50.f, -50.f, 10.f
+#endif
+    };
+#if defined(PICOLM_AVX512)
     _mm512_storeu_ps(ys, kda_expf16(_mm512_loadu_ps(lim)));
+#elif defined(PICOLM_AVX2) || defined(PICOLM_AVX)
+    _mm256_storeu_ps(ys, kda_expf8(_mm256_loadu_ps(lim)));
+#endif
     if (!(isinf(ys[0]) && isinf(ys[1]) && isinf(ys[2]))) { bad++; puts("   overflow limit wrong"); }
     if (!(ys[3] == 0.f && ys[4] == 0.f && ys[5] == 0.f)) { bad++; puts("   underflow limit wrong"); }
     if (ys[6] != 1.0f) { bad++; puts("   exp(0) != 1"); }
@@ -144,7 +163,7 @@ int main(void) {
         f += run(c4, 3, nth, 64); f += run(c5, 3, nth, 64);
     }
     f += run(c4, 3, 8, 6);   /* H not a multiple of 4: single-head tasks */
-#if defined(PICOLM_AVX512)
+#if defined(PICOLM_AVX512) || defined(PICOLM_AVX2) || defined(PICOLM_AVX)
     f += test_expf();
     f += run_vexp(c2, 3, 1, 64); f += run_vexp(c4, 3, 1, 64); f += run_vexp(c5, 3, 8, 64); f += run_vexp(c4, 3, 8, 6);
 #endif

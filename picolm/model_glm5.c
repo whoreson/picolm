@@ -4056,7 +4056,7 @@ static int glm5_kda_layer_par(const model_t *m, const glm5_layer_weights_t *gw, 
  * when the debug dumps are on; PICOLM_GLM5_KDA_SPLIT=0 forces the fallback. */
 static int glm5_kda_vexp_enabled(void) {
     static int cached = -1;
-#if defined(PICOLM_AVX512)
+#if defined(PICOLM_AVX512) || defined(PICOLM_AVX2) || defined(PICOLM_AVX)
     if (cached < 0) { const char *e = getenv("PICOLM_GLM5_KDA_VEXP"); cached = (e && atoi(e) > 0) ? 1 : 0; }
 #else
     cached = 0;
@@ -4170,12 +4170,124 @@ static void kda_split_pre_head_v(const kda_split_t *x, int t, int h)
         x->score_p[(size_t)t * H + h] = attn_score * scale;
     }
 }
+#elif defined(PICOLM_AVX2) || defined(PICOLM_AVX)
+/* 8-lane AVX2/AVX variant of the vector pre-pass.
+ * expf: same Cephes polynomial, 8-wide. scalef implemented manually (cvttps_epi32 + exponent bit
+ * construction) since AVX2 lacks _mm256_scalef_ps. Gather loads are scalar (AVX2 has no gather)
+ * but the expf vectorization still dominates the savings. */
+static inline __m256 kda_expf8(__m256 x)
+{
+    x = _mm256_min_ps(_mm256_max_ps(x, _mm256_set1_ps(-104.0f)), _mm256_set1_ps(89.0f));
+    const __m256 log2e = _mm256_set1_ps(1.44269504088896341f);
+    const __m256 c1 = _mm256_set1_ps(0.693359375f), c2 = _mm256_set1_ps(-2.12194440e-4f);
+    const __m256 fx = _mm256_round_ps(_mm256_mul_ps(x, log2e), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    __m256 r = _mm256_fnmadd_ps(fx, c1, x);
+    r = _mm256_fnmadd_ps(fx, c2, r);
+    __m256 y = _mm256_set1_ps(1.9875691500E-4f);
+    y = _mm256_fmadd_ps(y, r, _mm256_set1_ps(1.3981999507E-3f));
+    y = _mm256_fmadd_ps(y, r, _mm256_set1_ps(8.3334519073E-3f));
+    y = _mm256_fmadd_ps(y, r, _mm256_set1_ps(4.1665795894E-2f));
+    y = _mm256_fmadd_ps(y, r, _mm256_set1_ps(1.6666665459E-1f));
+    y = _mm256_fmadd_ps(y, r, _mm256_set1_ps(5.0000001201E-1f));
+    const __m256 r2 = _mm256_mul_ps(r, r);
+    y = _mm256_fmadd_ps(y, r2, _mm256_add_ps(r, _mm256_set1_ps(1.0f)));
+    /* Manual scalef: y * 2^(int) via exponent bit construction.
+     * Float exponent field = fx + 127 (bias). Clamp to [-149, 127] first.
+     * Below -126 the result is subnormal; set to 0 to match libm expf underflow.
+     * Above 127 would overflow; set to +inf to match libm expf overflow.
+     * fx == 128 is valid for expf(88-89): double y first, then scale by 2^127. */
+    __m256i vfx_raw = _mm256_cvttps_epi32(fx);
+    /* Handle fx=128: double y and use exponent 127 instead */
+    __m256i mask128 = _mm256_cmpeq_epi32(vfx_raw, _mm256_set1_epi32(128));
+    y = _mm256_blendv_ps(y, _mm256_add_ps(y, y), _mm256_castsi256_ps(mask128));
+    __m256i vfx = _mm256_max_epi32(_mm256_min_epi32(vfx_raw, _mm256_set1_epi32(127)), _mm256_set1_epi32(-149));
+    __m256i vexp = _mm256_slli_epi32(_mm256_add_epi32(vfx, _mm256_set1_epi32(127)), 23);
+    __m256 vtwo = _mm256_castsi256_ps(vexp);
+    __m256 res = _mm256_mul_ps(y, vtwo);
+    /* Select: +inf where fx > 128, 0 where fx < -126, computed result otherwise */
+    __m256 vzero = _mm256_setzero_ps();
+    __m256 vinf  = _mm256_castsi256_ps(_mm256_set1_epi32(0x7f800000));
+    __m256i mask_under = _mm256_cmpgt_epi32(_mm256_set1_epi32(-126), vfx_raw); /* fx <= -126 */
+    __m256i mask_over  = _mm256_cmpgt_epi32(vfx_raw, _mm256_set1_epi32(128));  /* fx > 128  */
+    res = _mm256_blendv_ps(res, vzero, _mm256_castsi256_ps(mask_under));
+    res = _mm256_blendv_ps(res, vinf,  _mm256_castsi256_ps(mask_over));
+    return res;
+}
+
+static void kda_split_pre_head_v2(const kda_split_t *x, int t, int h)
+{
+    const model_config_t *c = x->c;
+    const glm5_layer_weights_t *gw = x->gw;
+    const int KD = x->KD, DI = x->DI, CK = x->CK, CD = x->CD, H = x->H;
+    float *conv_out = x->conv_b + (size_t)t * 3 * DI;
+    const float *raw = x->raw_b + (size_t)t * DI, *z = x->z_b + (size_t)t * DI;
+    const __m256 one = _mm256_set1_ps(1.0f);
+
+    x->beta_p[(size_t)t * H + h] = 1.0f / (1.0f + expf(-x->beta_b[(size_t)t * H + h]));
+    {
+        const float *dt_bias = (const float *)gw->kda_dt_bias;
+        const __m256 a_val = _mm256_set1_ps(((const float *)gw->kda_a)[h]);
+        const __m256 lb = _mm256_set1_ps(c->glm5_kda_lower_bound), cap = _mm256_set1_ps(50.0f);
+        const __m256 zero = _mm256_setzero_ps();
+        for (int ch = 0; ch < KD; ch += 8) {
+            const int idx = h * KD + ch;
+            const __m256 e = kda_expf8(_mm256_mul_ps(a_val, _mm256_add_ps(_mm256_loadu_ps(raw + idx), _mm256_loadu_ps(dt_bias + idx))));
+            const __m256 g = _mm256_mul_ps(lb, _mm256_div_ps(one, _mm256_add_ps(one, e)));
+            _mm256_storeu_ps(x->decay_p + (size_t)t * DI + idx, kda_expf8(_mm256_min_ps(g, cap)));
+            _mm256_storeu_ps(x->gate_p + (size_t)t * DI + idx,
+                             _mm256_div_ps(one, _mm256_add_ps(one, kda_expf8(_mm256_sub_ps(zero, _mm256_loadu_ps(z + idx))))));
+        }
+    }
+    {
+        const float *wq = (const float *)gw->kda_conv_q, *wk = (const float *)gw->kda_conv_k, *wv = (const float *)gw->kda_conv_v;
+        const __m256 zero = _mm256_setzero_ps();
+        for (int part = 0; part < 3; part++) {
+            const float *src = (part == 0) ? x->q_b : (part == 1) ? x->k_b : x->v_b;
+            const float *w   = (part == 0) ? wq     : (part == 1) ? wk     : wv;
+            for (int i = 0; i < KD; i += 8) {
+                const int ch_off = h * KD + i, ch = part * DI + ch_off;
+                __m256 acc = zero;
+                for (int tap = 0; tap < CK; tap++) {
+                    __m256 xs;
+                    if (tap == CK - 1) xs = _mm256_loadu_ps(src + (size_t)t * DI + ch_off);
+                    else {
+                        const int tt = t - (CK - 1) + tap;
+                        xs = tt >= 0 ? _mm256_loadu_ps(src + (size_t)tt * DI + ch_off)
+                                     : _mm256_loadu_ps(x->old_state + (size_t)(tt + CK - 1) * CD + ch);
+                    }
+                    /* Scalar gather for 8 strided weights (AVX2 has no gather) */
+                    const __m256 wv8 = _mm256_set_ps(
+                        w[(ch_off+7) * CK + tap], w[(ch_off+6) * CK + tap],
+                        w[(ch_off+5) * CK + tap], w[(ch_off+4) * CK + tap],
+                        w[(ch_off+3) * CK + tap], w[(ch_off+2) * CK + tap],
+                        w[(ch_off+1) * CK + tap], w[ch_off * CK + tap]);
+                    acc = _mm256_add_ps(acc, _mm256_mul_ps(xs, wv8));
+                }
+                const __m256 den = _mm256_add_ps(one, kda_expf8(_mm256_sub_ps(zero, acc)));
+                _mm256_storeu_ps(conv_out + ch, _mm256_div_ps(acc, den));
+            }
+        }
+    }
+    {
+        float *qh = conv_out + h * KD, *kh = conv_out + DI + h * KD;
+        float sq = 0.f, sk = 0.f;
+        for (int ch = 0; ch < KD; ch++) { sq += qh[ch] * qh[ch]; sk += kh[ch] * kh[ch]; }
+        const float inv_q = 1.0f / fmaxf(sqrtf(sq), 1e-5f), inv_k = 1.0f / fmaxf(sqrtf(sk), 1e-5f);
+        for (int ch = 0; ch < KD; ch++) { qh[ch] *= inv_q; kh[ch] *= inv_k; }
+        const float scale = 1.0f / sqrtf((float)KD);
+        float attn_score = 0.f;
+        for (int i = 0; i < KD; i++) attn_score += kh[i] * qh[i];
+        x->score_p[(size_t)t * H + h] = attn_score * scale;
+    }
+}
 #endif
 
 static void kda_split_pre_head(const kda_split_t *x, int t, int h)
 {
 #if defined(PICOLM_AVX512)
     if (x->vexp) { kda_split_pre_head_v(x, t, h); return; }
+#elif defined(PICOLM_AVX2) || defined(PICOLM_AVX)
+    if (x->vexp) { kda_split_pre_head_v2(x, t, h); return; }
 #endif
     const model_config_t *c = x->c;
     const glm5_layer_weights_t *gw = x->gw;
@@ -4350,7 +4462,11 @@ static int glm5_kda_layer_split_ex(const model_t *m, const glm5_layer_weights_t 
     kda_split_t x;
     x.c = c; x.gw = gw; x.KD = KD; x.H = H; x.DI = DI; x.CK = CK; x.CD = 3 * DI; x.NT = n_tokens;
     x.HB = (H % 4 == 0) ? 4 : 1;
+#if defined(PICOLM_AVX512)
     x.vexp = vexp_req && (KD % 16 == 0);
+#else
+    x.vexp = vexp_req && (KD % 8 == 0);
+#endif
     x.q_b = q_b; x.k_b = k_b; x.v_b = v_b; x.z_b = z_b; x.raw_b = raw_b; x.beta_b = beta_b;
     x.old_state = conv_state; x.conv_b = conv_b; x.head_b = head_b; x.kda_state = s->glm5.kda_state[layer_idx];
     x.decay_p = buf; x.gate_p = buf + (size_t)n_tokens * DI;
