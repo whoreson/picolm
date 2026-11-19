@@ -736,23 +736,49 @@ picolm_q5_K_gemv(float *y,
          * multiplies by a signed q8, so subtract 16 from every weight value
          * and add back 16*sum(q8) afterwards -- that keeps the arithmetic in
          * int8 range and is exactly what the +16*bias term below cancels. */
+        /* Activation (q8) is read 8 bytes at a time via gemv_get_int_b2, the
+         * SAME load the Q8_0 GEMV uses. Reading it as four separate byte
+         * accesses measured 30% of this kernel's runtime: an ablation that
+         * dropped the q8 read entirely took 0.0907 -> 0.0636 ms/call, landing
+         * on Q8_0's 0.0564, while dropping the qh unpack saved only 7%. The
+         * traffic is identical between the two kernels (same I, S=1), so it is
+         * the 4-byte strided access pattern, not the volume. */
         int acc = 0;
-        for (int l = 0; l < 32; l += 4) {
-            int8_t w4[4], a4[4];
-            int sum_a = 0;
-            for (int t = 0; t < 4; t++) {
-                const uint8_t packed = qs[group * 32 + l + t];
-                int v = half ? (packed >> 4) : (packed & 0xF);
-                if (qh[l + t] & bitmask) v |= 0x10;
-                w4[t] = (int8_t)(v - 16);       /* now -16..15, fits int8 */
-                a4[t] = q8[sub * 32 + l + t];
-                sum_a += (int)a4[t];
-            }
-            int wi, ai;
-            memcpy(&wi, w4, 4);
-            memcpy(&ai, a4, 4);
-            acc = gpu_dot4_i8_packed(wi, ai, acc);
-            acc += 16 * sum_a;                  /* undo the -16 shift */
+        for (int l = 0; l < 32; l += 8) {
+            /* 8 weight values: bytes l..l+7 of this group's window. */
+            const uint8_t p0 = qs[group * 32 + l + 0], p1 = qs[group * 32 + l + 1];
+            const uint8_t p2 = qs[group * 32 + l + 2], p3 = qs[group * 32 + l + 3];
+            const uint8_t p4 = qs[group * 32 + l + 4], p5 = qs[group * 32 + l + 5];
+            const uint8_t p6 = qs[group * 32 + l + 6], p7 = qs[group * 32 + l + 7];
+            const uint8_t h0 = qh[l+0], h1 = qh[l+1], h2 = qh[l+2], h3 = qh[l+3];
+            const uint8_t h4 = qh[l+4], h5 = qh[l+5], h6 = qh[l+6], h7 = qh[l+7];
+
+            /* Two 4-value groups, packed into ints for DP4A/SDOT. */
+            int8_t wA[4], wB[4];
+            wA[0] = (int8_t)(((half ? (p0 >> 4) : (p0 & 0xF)) | ((h0 & bitmask) ? 0x10 : 0)) - 16);
+            wA[1] = (int8_t)(((half ? (p1 >> 4) : (p1 & 0xF)) | ((h1 & bitmask) ? 0x10 : 0)) - 16);
+            wA[2] = (int8_t)(((half ? (p2 >> 4) : (p2 & 0xF)) | ((h2 & bitmask) ? 0x10 : 0)) - 16);
+            wA[3] = (int8_t)(((half ? (p3 >> 4) : (p3 & 0xF)) | ((h3 & bitmask) ? 0x10 : 0)) - 16);
+            wB[0] = (int8_t)(((half ? (p4 >> 4) : (p4 & 0xF)) | ((h4 & bitmask) ? 0x10 : 0)) - 16);
+            wB[1] = (int8_t)(((half ? (p5 >> 4) : (p5 & 0xF)) | ((h5 & bitmask) ? 0x10 : 0)) - 16);
+            wB[2] = (int8_t)(((half ? (p6 >> 4) : (p6 & 0xF)) | ((h6 & bitmask) ? 0x10 : 0)) - 16);
+            wB[3] = (int8_t)(((half ? (p7 >> 4) : (p7 & 0xF)) | ((h7 & bitmask) ? 0x10 : 0)) - 16);
+
+            const int8_t *qa = q8 + (size_t)sub * 32 + l;
+            /* Two 32-bit activation loads (bytes l..l+3 and l+4..l+7). */
+            const int aA = gemv_get_int_b2(qa, 0);
+            const int aB = gemv_get_int_b2(qa, 1);
+
+            const int8_t *aAp = (const int8_t *)&aA;
+            const int8_t *aBp = (const int8_t *)&aB;
+            int sumA = (int)aAp[0]+(int)aAp[1]+(int)aAp[2]+(int)aAp[3];
+            int sumB = (int)aBp[0]+(int)aBp[1]+(int)aBp[2]+(int)aBp[3];
+
+            int wAi, wBi;
+            memcpy(&wAi, wA, 4); memcpy(&wBi, wB, 4);
+            acc = gpu_dot4_i8_packed(wAi, aA, acc);
+            acc = gpu_dot4_i8_packed(wBi, aB, acc);
+            acc += 16 * (sumA + sumB);          /* undo the -16 shift */
         }
 
         /* scales[is++] runs sequentially with j (0..7) == our `sub`.
