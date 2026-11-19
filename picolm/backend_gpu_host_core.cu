@@ -367,6 +367,7 @@ static int gguf_block_size(gguf_type_t qtype) {
      * kernel; picolm_gpu_tensor_upload repacks it to Q8_0 on the way in (see
      * the Q8_0_R8 branch there), so it runs the ordinary Q8_0 kernels. */
     case 203: return 34;
+    case 141: return GPU_BLOCK_IQ6_K_SIZE; /* IQ6_K: 212 bytes per 256 values */
     default: return 0;
     }
 }
@@ -398,7 +399,7 @@ int picolm_gpu_tensor_upload(void **tensor,
     } else if (qtype == 1 || qtype == 30) {
         row_bytes = (size_t)I * sizeof(uint16_t);
         vals_per_block = 1;
-    } else if (qtype == 10 || qtype == 11 || qtype == 12 || qtype == 13 || qtype == 14) {
+    } else if (qtype == 10 || qtype == 11 || qtype == 12 || qtype == 13 || qtype == 14 || qtype == 141) {
         vals_per_block = 256;
         row_bytes = (size_t)((I + vals_per_block - 1) / vals_per_block) * bs;
     } else if (qtype == 41 || qtype == 42) {
@@ -490,8 +491,9 @@ int picolm_gpu_tensor_upload(void **tensor,
     /* Native K-quant upload path. All K-quant types (Q2_K through Q6_K)
      * use native IMMA fast path when eligible. Fall back to scalar
      * dequant when IMMA cannot fire (small S/O, non-256-aligned I). */
-    if ((qtype == 10 || qtype == 11 || qtype == 12 || qtype == 13 || qtype == 14) && (I % 256) == 0 && O >= 8) {
-        size_t blk_size = (qtype == 14) ? GPU_BLOCK_Q6_K_SIZE :
+    if ((qtype == 10 || qtype == 11 || qtype == 12 || qtype == 13 || qtype == 14 || qtype == 141) && (I % 256) == 0 && O >= 8) {
+        size_t blk_size = (qtype == 141) ? GPU_BLOCK_IQ6_K_SIZE :
+                          (qtype == 14) ? GPU_BLOCK_Q6_K_SIZE :
                           (qtype == 13) ? GPU_BLOCK_Q5_K_SIZE :
                           (qtype == 12) ? GPU_BLOCK_Q4_K_SIZE :
                           (qtype == 11) ? GPU_BLOCK_Q3_K_SIZE :
@@ -1387,9 +1389,14 @@ kquant_gemv_dev(gpu_device_ctx_t *ctx, picolm_gpu_tensor_t *t, float *y_dev,
         ctx->q8_xd, ctx->q8_xq, ctx->q8_k_bsums, x_dev, I, 1);
     if (!gpu_ok(gpuGetLastError(), "q8_K quantize (dev)")) return 0;
     dim3 grid((unsigned)O);
-    int _ps = picolm_gpu_prof_slot(which == 2 ? "gemv_q2_K" : which == 3 ? "gemv_q3_K" : which == 4 ? "gemv_q4_K" : which == 5 ? "gemv_q5_K" : "gemv_q6_K");
+    int _ps = picolm_gpu_prof_slot(which == 141 ? "gemv_iq6_K" : which == 2 ? "gemv_q2_K" : which == 3 ? "gemv_q3_K" : which == 4 ? "gemv_q4_K" : which == 5 ? "gemv_q5_K" : "gemv_q6_K");
     picolm_gpu_prof_begin(0);
-    if (which == 2) {
+    if (which == 141) {
+        gpu_dispatch_print("matmul_iq6_gemv_dev");
+        picolm_iq6_K_gemv<<<grid, 32 * GEMV_WARPS, 0, ctx->stream>>>(
+            y_dev, ctx->q8_xq, ctx->q8_xd, ctx->q8_k_bsums, t->weights,
+            I, O, (int)t->row_bytes, ys);
+    } else if (which == 2) {
         gpu_dispatch_print("matmul_q2_gemv_dev");
         picolm_q2_K_gemv<<<grid, 32 * GEMV_WARPS, 0, ctx->stream>>>(
             y_dev, ctx->q8_xq, ctx->q8_xd, ctx->q8_k_bsums, t->weights,
@@ -1650,6 +1657,17 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
     }
 
     /* Q2_K x Q8_0 IMMA path (device) */
+    /* IQ6_K: decode GEMV against Q8_K (mirrors the CPU, whose IQ6_K vec_dot
+     * also consumes Q8_K). Guarded on (I % 256) == 0 like the other K-quants.
+     * The generic picolm_quant_matmul fallback below has no IQ6_K dequant case,
+     * so without this an IQ6_K tensor simply declines (returns 0) and the
+     * caller falls back to the CPU. */
+    if (t->qtype == GGUF_TYPE_IQ6_K && S >= 1 && O >= 8 && I % 256 == 0) {
+        if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 141))
+            return 1;
+        return 0;
+    }
+
     if (t->qtype == GGUF_TYPE_Q2_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8 && I % 256 == 0) {
         if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 2))
             return 1;
@@ -1889,6 +1907,16 @@ int picolm_gpu_matmul_logits(picolm_gpu_tensor_t *t, float *logits_dev,
             1, I, O, (int)t->row_bytes, O);
         if (!gpu_ok(gpuGetLastError(), "logits matmul")) return 0;
         return 1;
+    }
+
+    /* IQ6_K lm_head. Needed because the caller's fallback path installs this
+     * tensor as a GPU handle and then calls the CPU matmul(), which routes
+     * straight back to picolm_quant_matmul -- whose switch has no IQ6_K case
+     * and therefore ZEROES the logits, poisoning every later token. Reusing
+     * kquant_gemv_dev (Q8_K quantise + IQ6_K GEMV) avoids that entirely. */
+    if (t->qtype == GGUF_TYPE_IQ6_K && (I % 256) == 0 && O >= 8) {
+        if (kquant_gemv_dev(ctx, t, logits_dev, x_dev, I, O, O, 0, 141)) return 1;
+        return 0;
     }
     return 0; /* unsupported type */
 }

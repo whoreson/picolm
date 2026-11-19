@@ -92,6 +92,7 @@ __global__ void picolm_q5_K_gemv(float *y, const int8_t *xq, const float *xd, co
 __global__ void picolm_q4_K_gemv(float *y, const int8_t *xq, const float *xd, const int16_t *xbsums, const void *weights, int I, int O, int row_bytes, int y_stride);
 __global__ void picolm_q3_K_gemv(float *y, const int8_t *xq, const float *xd, const int16_t *xbsums, const void *weights, int I, int O, int row_bytes, int y_stride);
 __global__ void picolm_q2_K_gemv(float *y, const int8_t *xq, const float *xd, const int16_t *xbsums, const void *weights, int I, int O, int row_bytes, int y_stride);
+__global__ void picolm_iq6_K_gemv(float *y, const int8_t *xq, const float *xd, const int16_t *xbsums, const void *weights, int I, int O, int row_bytes, int y_stride);
 __global__ void picolm_q6_K_gemv(float *y, const int8_t *xq, const float *xd, const int16_t *xbsums, const void *weights, int I, int O, int row_bytes, int y_stride);
 
 /* Number of sequence positions per tile in the tiled Q8_0 matmul.

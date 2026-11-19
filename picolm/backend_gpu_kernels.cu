@@ -1198,6 +1198,120 @@ picolm_q2_K_gemv(float *y,
 }
 
 
+/* ================================================================
+ * IQ6_K GEMV (decode, S=1) against Q8_K activations
+ * ================================================================
+ *
+ * 212-byte block: d(2) extra(2) scales[16] qs[128] qh[64] = 256 values,
+ * organized as FOUR 64-value sub-blocks. Within a sub-block, four groups of
+ * 16 values each carry their own signed scale (scales[4*ib64 + g]) and their
+ * own LUT-select bit ((extra >> g) & 1, with extra >>= 4 per sub-block).
+ *
+ * The 6-bit code is NOT a linear quantisation: it indexes a 64-entry
+ * non-linear table, value = iq6nl_lut[q] - 128 + mn. Transcribed from
+ * dequantize_row_iq6_k() and the scalar branch of vec_dot_iq6_k_q8_k() in
+ * quant.c, which agree.
+ *
+ * LUT handling: the table is 64 bytes and lives in __constant__ memory (the
+ * natural place on CUDA; HIP maps it to the same read-only path). The values
+ * are -127..121, which fits int8, so the dot still runs through
+ * gpu_dot4_i8_packed once the LUT result has been materialised.
+ */
+/* __device__, not __constant__: the tree uses no __constant__ at all today and
+ * adding one is a new CUDA/HIP surface for a 64-byte table. A __device__ array
+ * is handled identically by nvcc and hipcc, and the kernel is bandwidth-bound
+ * on the weights anyway, so the caching difference does not matter. */
+__device__ const uint8_t g_iq6nl_lut[64] = {
+     1,   7,  13,  19,  24,  30,  35,  40,  44,  49,  54,  58,  62,  66,  70,  74,
+    77,  81,  84,  88,  91,  94,  97, 100, 103, 106, 109, 112, 115, 117, 120, 123,
+   126, 128, 131, 134, 137, 140, 142, 145, 148, 151, 155, 158, 161, 164, 168, 172,
+   175, 179, 183, 187, 191, 196, 200, 205, 210, 215, 220, 226, 231, 237, 243, 249,
+};
+
+#define IQ6K_VALS_PER_SB  64
+/* one thread per 16-value group: 4 groups per 64-value sub-block, so 16
+ * threads cover a whole super-block (4 sub-blocks x 4 groups) */
+#define IQ6K_GROUPS_PER_SUPER 16
+
+__global__ void
+picolm_iq6_K_gemv(float *y,
+                  const int8_t *xq, const float *xd, const int16_t *xbsums,
+                  const void *weights,
+                  int I, int O, int row_bytes, int y_stride) {
+    (void)xbsums;   /* no mins term: the bias lives in the LUT value */
+    const int lane = (int)(gpuThreadIdx_x & 31);
+    const int warp = (int)(gpuThreadIdx_x >> 5);
+    const int tid  = warp * 32 + lane;
+    const int o    = (int)gpuBlockIdx_x;
+    if (o >= O) return;
+
+    const int n_super = I / 256;
+    const uint8_t *wrow = (const uint8_t *)weights + (size_t)o * row_bytes;
+
+    const int sb0    = tid / IQ6K_GROUPS_PER_SUPER;                  /* 0..7 */
+    const int grp_id = tid % IQ6K_GROUPS_PER_SUPER;                  /* 0..15 */
+    const int stride = (GEMV_WARPS * 32) / IQ6K_GROUPS_PER_SUPER;    /* 8 */
+
+    float sumf = 0.0f;
+
+    for (int sb = sb0; sb < n_super; sb += stride) {
+        const uint8_t *wb = wrow + (size_t)sb * GPU_BLOCK_IQ6_K_SIZE;
+        const uint16_t d_raw = (uint16_t)(wb[0] | ((uint16_t)wb[1] << 8));
+        const uint16_t extra = (uint16_t)(wb[2] | ((uint16_t)wb[3] << 8));
+        const int8_t  *sl = (const int8_t *)(wb + 4);
+        const uint8_t *qs = wb + 20;
+        const uint8_t *qh = wb + 148;
+        const float d = xd[sb] * gpu_fp16_to_fp32(d_raw);
+
+        /* grp_id -> sub-block ib64 (0..3) and group g (0..3) */
+        const int ib64 = grp_id >> 2;
+        const int g    = grp_id & 3;
+
+        /* Pointer walk, matching the reference exactly:
+         *   qs += 32 per sub-block, qh += 32 every second sub-block,
+         *   shift += 4 per sub-block and wraps 8 -> 0,
+         *   extra >>= 4 per sub-block. */
+        const uint8_t *qs_c = qs + ib64 * 32;
+        const uint8_t *qh_c = qh + (ib64 >> 1) * 32;
+        const int shift = (ib64 & 1) * 4;
+        const int mn = (extra >> (4 * ib64 + g)) & 1;
+        const int scale = (int)sl[4 * ib64 + g];
+
+        /* q8 for this 16-value group sits at grp_id*16 within the super-block */
+        const int8_t *q8 = xq + (size_t)sb * 256 + (size_t)grp_id * 16;
+
+        int acc = 0;
+        for (int l = 0; l < 16; l += 4) {
+            int8_t w4[4];
+            for (int t = 0; t < 4; t++) {
+                const int j = l + t;
+                int q;
+                if (g == 0)      q = (qs_c[j]      & 0x0F) | (((qh_c[j] >> shift) & 0x03) << 4);
+                else if (g == 1) q = (qs_c[j + 16] & 0x0F) | (((qh_c[j + 16] >> shift) & 0x03) << 4);
+                else if (g == 2) q = (qs_c[j]      >> 4)   | (((qh_c[j] >> shift) & 0x0C) << 2);
+                else             q = (qs_c[j + 16] >> 4)   | (((qh_c[j + 16] >> shift) & 0x0C) << 2);
+                w4[t] = (int8_t)((int)g_iq6nl_lut[q] - 128 + mn);
+            }
+            int aA = gemv_get_int_b2(q8 + l, 0);
+            int wAi;
+            memcpy(&wAi, w4, 4);
+            acc = gpu_dot4_i8_packed(wAi, aA, acc);
+        }
+
+        sumf += d * (float)scale * (float)acc;
+    }
+
+    __shared__ float red[GEMV_WARPS > 1 ? GEMV_WARPS - 1 : 1][32];
+    if (warp > 0) red[warp - 1][lane] = sumf;
+    gpuSyncthreads();
+    if (warp > 0) return;
+    for (int w2 = 0; w2 < GEMV_WARPS - 1; w2++) sumf += red[w2][lane];
+    for (int off = 16; off > 0; off >>= 1)
+        sumf += gpuShflXorSync(0xFFFFFFFFu, sumf, off);
+    if (lane == 0) y[o] = sumf;
+}
+
+
 /* lines 351-426 from backend_gpu_kernels.cuh */
 __global__ void
 picolm_q8_q8_matmul_tiled(float *y,
