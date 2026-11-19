@@ -362,6 +362,11 @@ static int gguf_block_size(gguf_type_t qtype) {
     case 41: return 18;   /* Q1_0: 18 bytes per 128 values */
     case 42: return 34;   /* Q2_0: 34 bytes per 128 values */
     case 133: return 26;  /* Q6_0: 26 bytes per 32 values (F16 d + 8 qh + 16 qs) */
+    /* Q8_0_R8 is 8 rows interleaved into 272 bytes, i.e. 34 bytes per row per
+     * 32 values -- the same per-row density as Q8_0. It has no native GPU
+     * kernel; picolm_gpu_tensor_upload repacks it to Q8_0 on the way in (see
+     * the Q8_0_R8 branch there), so it runs the ordinary Q8_0 kernels. */
+    case 203: return 34;
     default: return 0;
     }
 }
@@ -403,6 +408,78 @@ int picolm_gpu_tensor_upload(void **tensor,
         vals_per_block = 32;
         row_bytes = (size_t)((I + vals_per_block - 1) / vals_per_block) * bs;
     }
+    /* Q8_0_R8 -> Q8_0 repack on upload.
+     *
+     * block_q8_0_r8 is 272 bytes: uint16 d[8] then int8 qs[256] holding 8 rows
+     * of 32 values interleaved. The GPU has no _R8 kernel and does not need
+     * one: the CPU keeps using the interleaved form (its AVX2/VNNI GEMV wants
+     * it), while the GPU gets plain Q8_0 and runs the existing kernels, so a
+     * mixed model like IQ6_K + Q8_0_R8 gets the CPU fast path AND full GPU
+     * coverage instead of the whole pipeline being vetoed as "unsupported".
+     *
+     * The conversion is a pure permutation -- no arithmetic, and d is already
+     * FP16 exactly as block_q8_0 stores it. Per row r, the 32 int8 values are
+     *   qs[m]      = b->qs[32*l + 4*r + i]        m = 4*l + i,      l<4, i<4
+     *   qs[m + 16] = b->qs[32*l + 4*r + i + 128]  (same l, i)
+     * which is what dequantize_row_q8_0_r8_single() reads. */
+    if (qtype == 203) {
+        if ((I % 32) != 0) return 0;
+        const int nb = I / 32;                    /* _R8 blocks per row */
+        size_t out_row_bytes = (size_t)nb * 34;   /* block_q8_0 row */
+        size_t out_total = out_row_bytes * (size_t)O;
+        uint8_t *packed = (uint8_t *)malloc(out_total);
+        if (!packed) return 0;
+        const uint8_t *src = (const uint8_t *)weights;
+        /* one physical _R8 group covers 8 logical rows */
+        for (int og = 0; og < (O + 7) / 8; og++) {
+            for (int r = 0; r < 8; r++) {
+                const int row = og * 8 + r;
+                if (row >= O) break;
+                for (int ib = 0; ib < nb; ib++) {
+                    const uint8_t *b = src + ((size_t)og * nb + ib) * 272;
+                    uint8_t *o = packed + (size_t)row * out_row_bytes + (size_t)ib * 34;
+                    uint16_t d = (uint16_t)(b[2*r] | ((uint16_t)b[2*r + 1] << 8));
+                    o[0] = (uint8_t)(d & 0xFF);
+                    o[1] = (uint8_t)(d >> 8);
+                    const uint8_t *q = b + 16;
+                    for (int l = 0; l < 4; l++) {
+                        for (int i = 0; i < 4; i++) {
+                            o[2 + 4*l + i]      = (uint8_t)q[32*l + 4*r + i];
+                            o[2 + 4*l + i + 16] = (uint8_t)q[32*l + 4*r + i + 128];
+                        }
+                    }
+                }
+            }
+        }
+        picolm_gpu_tensor_t *tr = (picolm_gpu_tensor_t *)calloc(1, sizeof(*tr));
+        if (!tr) { free(packed); return 0; }
+        tr->qtype = (gguf_type_t)8;              /* now ordinary Q8_0 */
+        tr->I = I; tr->O = O; tr->device = device;
+        tr->row_bytes = out_row_bytes;
+        tr->block_size = 34;
+        if (!gpu_ok(gpuMalloc(&tr->weights, out_total), "tensor allocation (q8_0_r8 repack)") ||
+            !gpu_ok(gpuMemcpy(tr->weights, packed, out_total, gpuMemcpyHostToDevice),
+                    "tensor upload (q8_0_r8 repack)")) {
+            free(packed); gpuFree(tr->weights); free(tr); return 0;
+        }
+        free(packed);
+        tr->zero_copy = 0;
+        tr->tracked = 1;
+        ctx->tensor_count++;
+        ctx->tensor_bytes += out_total;
+        {
+            static int r8_print = 1;
+            if (r8_print) {
+                r8_print = 0;
+                fprintf(stderr, "[GPU] upload: Q8_0_R8 (type 203) repacked to Q8_0 "
+                                "(%d rows x %d blocks, %zu MB) -- CPU keeps the _R8 form\n",
+                        O, nb, out_total / (1024*1024));
+            }
+        }
+        *tp = tr;
+        return 1;
+    }
+
     size_t total = row_bytes * (size_t)O;
 
     picolm_gpu_tensor_t *t = (picolm_gpu_tensor_t *)calloc(1, sizeof(*t));
