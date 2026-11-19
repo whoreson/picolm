@@ -199,7 +199,7 @@ simd_defines_for = $(strip \
     $(if $(filter 1,$(call _have_avx2,$(1))),\
       -DPICOLM_AVX2 -DPICOLM_AVX -DPICOLM_SSSE3 -DPICOLM_SSE3 -DPICOLM_SSE2 -DPICOLM_FMA,\
       $(if $(filter 1,$(call _have_avx,$(1))),\
-        -DPICOLM_AVX -DPICOLM_SSSE3 -DPICOLM_SSE3 -DPICOLM_SSE2,\
+        -DPICOLM_AVX -DPICOLM_SSSE3 -DPICOLM_SSE3 -DPICOLM_SSE2 $(if $(filter 1,$(call _have_fma,$(1))),-DPICOLM_FMA,),\
         $(if $(filter 1,$(call _have_sse3,$(1))),\
           -DPICOLM_SSE3 -DPICOLM_SSE2,\
           $(if $(filter 1,$(call _have_sse2,$(1))),\
@@ -219,7 +219,7 @@ simd_flags_for = $(strip \
     $(if $(filter 1,$(call _have_avx2,$(1))),\
       -mavx2 -mfma $(call f16c_flag,$(1)) -mbmi2,\
       $(if $(filter 1,$(call _have_avx,$(1))),\
-        -mavx $(call f16c_flag,$(1)),\
+        -mavx $(if $(filter 1,$(call _have_fma,$(1))),-mfma,) $(call f16c_flag,$(1)),\
         $(if $(filter 1,$(call _have_sse3,$(1))),\
           -mssse3 -mpopcnt,\
           )))))
@@ -272,7 +272,7 @@ sse3:
 
 # --- x86-64 with AVX (Sandy Bridge and newer Intel; Bulldozer and newer AMD) ---
 avx:
-	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -mavx -mf16c -mpopcnt -DPICOLM_AVX -DPICOLM_SSE2 -DPICOLM_SSE3 -DPICOLM_SSSE3"
+	$(MAKE) $(TARGET) CFLAGS="$(CFLAGS) -mavx -mf16c -mpopcnt $(if $(filter 1,$(call _have_fma,$(NATIVE_MARCH))),-mfma -DPICOLM_FMA,) -DPICOLM_AVX -DPICOLM_SSE2 -DPICOLM_SSE3 -DPICOLM_SSSE3"
 
 # --- x86-64 with AVX2 (Haswell and newer Intel; Excavator and newer AMD) ---
 avx2:

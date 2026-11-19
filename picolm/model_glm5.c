@@ -4073,7 +4073,7 @@ static int glm5_kda_layer_par(const model_t *m, const glm5_layer_weights_t *gw, 
  * when the debug dumps are on; PICOLM_GLM5_KDA_SPLIT=0 forces the fallback. */
 static int glm5_kda_vexp_enabled(void) {
     static int cached = -1;
-#if defined(PICOLM_AVX512) || defined(PICOLM_AVX2) || defined(PICOLM_AVX)
+#if defined(PICOLM_AVX512) || defined(PICOLM_AVX2)
     if (cached < 0) { const char *e = getenv("PICOLM_GLM5_KDA_VEXP"); cached = (e && atoi(e) > 0) ? 1 : 0; }
 #else
     cached = 0;
@@ -4187,8 +4187,8 @@ static void kda_split_pre_head_v(const kda_split_t *x, int t, int h)
         x->score_p[(size_t)t * H + h] = attn_score * scale;
     }
 }
-#elif defined(PICOLM_AVX2) || defined(PICOLM_AVX)
-/* 8-lane AVX2/AVX variant of the vector pre-pass.
+#elif defined(PICOLM_AVX2)
+/* 8-lane AVX2 variant of the vector pre-pass.
  * expf: same Cephes polynomial, 8-wide. scalef implemented manually (cvttps_epi32 + exponent bit
  * construction) since AVX2 lacks _mm256_scalef_ps. Gather loads are scalar (AVX2 has no gather)
  * but the expf vectorization still dominates the savings. */
@@ -4303,7 +4303,7 @@ static void kda_split_pre_head(const kda_split_t *x, int t, int h)
 {
 #if defined(PICOLM_AVX512)
     if (x->vexp) { kda_split_pre_head_v(x, t, h); return; }
-#elif defined(PICOLM_AVX2) || defined(PICOLM_AVX)
+#elif defined(PICOLM_AVX2)
     if (x->vexp) { kda_split_pre_head_v2(x, t, h); return; }
 #endif
     const model_config_t *c = x->c;
@@ -4481,8 +4481,11 @@ static int glm5_kda_layer_split_ex(const model_t *m, const glm5_layer_weights_t 
     x.HB = (H % 4 == 0) ? 4 : 1;
 #if defined(PICOLM_AVX512)
     x.vexp = vexp_req && (KD % 16 == 0);
-#else
+#elif defined(PICOLM_AVX2)
     x.vexp = vexp_req && (KD % 8 == 0);
+#else
+    (void)vexp_req;
+    x.vexp = 0;
 #endif
     x.q_b = q_b; x.k_b = k_b; x.v_b = v_b; x.z_b = z_b; x.raw_b = raw_b; x.beta_b = beta_b;
     x.old_state = conv_state; x.conv_b = conv_b; x.head_b = head_b; x.kda_state = s->glm5.kda_state[layer_idx];
