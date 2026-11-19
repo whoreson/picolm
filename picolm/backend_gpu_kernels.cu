@@ -451,6 +451,91 @@ picolm_q8_q8_matmul(float *y,
 }
 
 /* ================================================================
+ * Q8_K activation quantiser (device)
+ * ================================================================
+ *
+ * The CPU uses Q8_K (256-value super-blocks) as the activation format for
+ * every K-quant weight (gguf_type_act_fmt() in quant.h), because the K-quant
+ * vec_dot_*_q8_K kernels are written for per-sub-block scales. The GPU had
+ * only a Q8_0 quantiser, so K-quant weights were multiplied by 32-value-block
+ * activations instead -- the documented CPU/GPU drift measured in
+ * cuda-first-survey.txt (fp32 `d` vs fp16 `d`, not a corruption). This
+ * kernel removes that difference at the source.
+ *
+ * Byte-for-byte identical to quantize_row_q8_K() in quant.c:
+ *   d      = amax / 127                     (stored as float, NOT fp16)
+ *   qs[j]  = round_to_nearest(x[j] * 127/amax)
+ *   bsums[k] = sum(qs[k*16 .. k*16+15])
+ * and the all-zero super-block (amax == 0) gets d=0, qs=0, bsums=0 so no
+ * inf/NaN can appear downstream.
+ *
+ * Layout per block: 292 bytes = float d + int8 qs[256] + int16 bsums[16].
+ * One CUDA block per super-block; 256 threads, one value each, absmax via a
+ * shared-memory tree reduce. Output buffers therefore need
+ * (I/256)*292 bytes per row, not (I/32)*34.
+ */
+/* GPU_BLOCK_Q8_K_SIZE is defined in backend_gpu_kernels.cuh. */
+__global__ void
+picolm_quantize_q8_K(float *d_out, int8_t *qs_out, int16_t *bsums_out,
+                      const float *x, int I, int S) {
+    int s = (int)gpuBlockIdx_y;          /* row */
+    int sb = (int)gpuBlockIdx_x;         /* super-block within row */
+    int tid = (int)gpuThreadIdx_x;       /* 0..255 */
+    int n_super = I / 256;
+    if (sb >= n_super || s >= S) return;
+
+    const float *xb = x + (size_t)s * I + (size_t)sb * 256;
+    float v = xb[tid];
+
+    __shared__ float amax_sh[256];
+    amax_sh[tid] = fabsf(v);
+    gpuSyncthreads();
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            float a = amax_sh[tid], b = amax_sh[tid + stride];
+            if (b > a) amax_sh[tid] = b;
+        }
+        gpuSyncthreads();
+    }
+    float amax = amax_sh[0];
+
+    size_t base = (size_t)s * n_super + sb;
+    float  *d_out_b    = d_out    + base;
+    int8_t *qs_out_b   = qs_out   + base * 256;
+    int16_t *bsums_b   = bsums_out + base * 16;
+
+    if (amax == 0.0f) {
+        /* Match the CPU's explicit zero-fill: avoids 0/0 -> NaN below. */
+        qs_out_b[tid] = 0;
+        if (tid < 16) bsums_b[tid] = 0;
+        if (tid == 0) *d_out_b = 0.0f;
+        return;
+    }
+
+    /* CPU: id = 127/amax; d = 1/id. Kept in that order so the float `d` is
+     * bit-identical, not merely close. */
+    float id = 127.0f / amax;
+    if (tid == 0) *d_out_b = 1.0f / id;
+
+    /* CPU scalar path: (int)(x*id + (x>=0 ? 0.5f : -0.5f)) -- a truncating
+     * bias, which is round-half-away-from-zero. rintf() is round-half-even,
+     * so it would differ on exact .5 boundaries; use the same trick. */
+    int q = (int)(v * id + (v >= 0.0f ? 0.5f : -0.5f));
+    if (q > 127) q = 127;
+    if (q < -128) q = -128;
+    qs_out_b[tid] = (int8_t)q;
+
+    /* bsums: one per group of 16 values. Threads 0..15 each own a group and
+     * can read the qs values they just wrote (same block, after a barrier). */
+    gpuSyncthreads();
+    if (tid < 16) {
+        int acc = 0;
+        for (int j = 0; j < 16; j++) acc += (int)qs_out_b[tid * 16 + j];
+        bsums_b[tid] = (int16_t)acc;
+    }
+}
+
+/* ================================================================
  * Quantised GEMV -- the decode (S=1) fast path
  * ================================================================
  *
@@ -551,6 +636,222 @@ picolm_q8_0_gemv(float *y,
 
     if (lane == 0) y[o] = sumf;
 }
+
+/* ================================================================
+ * K-quant GEMV (decode, S=1) against Q8_K activations
+ * ================================================================
+ *
+ * Same warp-per-row shape as picolm_q8_0_gemv, but for weights whose natural
+ * activation format is Q8_K (gguf_type_act_fmt(): every K-quant weight). Using
+ * Q8_0 activations against K-quant weights was the documented CPU/GPU drift;
+ * these kernels make the GPU consume the same activation format as the CPU.
+ *
+ * Both bodies are direct transcriptions of the SCALAR reference paths in
+ * quant.c (vec_dot_q5_K_q8_K / vec_dot_q6_K_q8_K, "Scalar fallback" sections),
+ * because those are the unambiguous specification -- the AVX2 paths are
+ * vectorised restatements of the same arithmetic. Keeping the structure
+ * identical means a future SIMD version can be diffed against these.
+ *
+ * Work split: one 256-value super-block is covered by
+ * GEMVK_THREADS_PER_SB (8) threads, each taking 32 values, so a warp covers
+ * 4 super-blocks per step and consecutive lanes read consecutive bytes.
+ */
+#define GEMVK_THREADS_PER_SB  8
+#define GEMVK_BLOCKS_PER_ITER (GEMV_WARPS * 32 / GEMVK_THREADS_PER_SB)  /* 16 */
+
+/* Unpack the 6-bit scale/min pairs of a Q5_K super-block into 8 scales
+ * followed by 8 mins, exactly like the utmp shuffling in quant.c's
+ * vec_dot_q5_K_q8_K. */
+__device__ static inline void gemv_unpack_q5k_scales(const uint8_t *packed,
+                                                      uint8_t *out /* 16 */) {
+    uint32_t utmp[4];
+    const uint32_t kmask1 = 0x3f3f3f3f;
+    const uint32_t kmask2 = 0x0f0f0f0f;
+    const uint32_t kmask3 = 0x03030303;
+    memcpy(utmp, packed, 12);
+    utmp[3] = ((utmp[2] >> 4) & kmask2) | (((utmp[1] >> 6) & kmask3) << 4);
+    { const uint32_t uaux = utmp[1] & kmask1;
+      utmp[1] = (utmp[2] & kmask2) | (((utmp[0] >> 6) & kmask3) << 4);
+      utmp[2] = uaux; }
+    utmp[0] &= kmask1;
+    memcpy(out,     &utmp[0], 8);   /* 8 scales */
+    memcpy(out + 8, &utmp[2], 8);   /* 8 mins   */
+}
+
+__global__ void
+picolm_q5_K_gemv(float *y,
+                 const int8_t *xq, const float *xd, const int16_t *xbsums,
+                 const void *weights,
+                 int I, int O, int row_bytes, int y_stride) {
+    const int lane = (int)(gpuThreadIdx_x & 31);
+    const int warp = (int)(gpuThreadIdx_x >> 5);
+    const int tid  = warp * 32 + lane;
+    const int o    = (int)gpuBlockIdx_x;
+    if (o >= O) return;
+    int ys = y_stride > 0 ? y_stride : O;
+
+    const int n_super = I / 256;
+    const uint8_t *wrow = (const uint8_t *)weights + (size_t)o * row_bytes;
+
+    const int sb0 = tid / GEMVK_THREADS_PER_SB;   /* first super-block */
+    const int sub = tid % GEMVK_THREADS_PER_SB;   /* which 32 of the 256 */
+
+    float sumf = 0.0f;
+
+    for (int sb = sb0; sb < n_super; sb += GEMVK_BLOCKS_PER_ITER) {
+        const uint8_t *wb = wrow + (size_t)sb * GPU_BLOCK_Q5_K_SIZE;
+        const float wd   = gpu_fp16_to_fp32((uint16_t)(wb[0] | ((uint16_t)wb[1] << 8)));
+        const float wdm  = gpu_fp16_to_fp32((uint16_t)(wb[2] | ((uint16_t)wb[3] << 8)));
+        const float d    = xd[sb] * wd;
+        const float dmin = xd[sb] * wdm;
+
+        uint8_t sc_min[16];
+        gemv_unpack_q5k_scales(wb + 4, sc_min);
+
+        const uint8_t *qh = wb + 16;
+        const uint8_t *qs = wb + 48;
+        const int8_t  *q8 = xq + (size_t)sb * 256;
+
+        const int group = sub >> 1;     /* 0..3: selects a 32-byte qs window */
+        const int half  = sub & 1;      /* 0/1: low or high nibble           */
+        /* The reference walks `m` as 1,2,4,...,128 -- one bit per 32-value
+         * group, in order. So the 5th bit for sub-block `sub` is simply
+         * bit `sub`, NOT (half ? 2 : 1) << (2*group) (which collides across
+         * groups and left group 3 reading bit 8..15 of "qh[l]" -- qh is only
+         * 8 bytes logically but the array is 32, so it silently read garbage).
+         * This was the Q5_K bug. */
+        const uint8_t bitmask = (uint8_t)(1u << sub);
+
+        int acc = 0;
+        for (int l = 0; l < 32; l++) {
+            const uint8_t packed = qs[group * 32 + l];
+            int v = half ? (packed >> 4) : (packed & 0xF);
+            if (qh[l] & bitmask) v |= 0x10;
+            acc += v * (int)q8[sub * 32 + l];
+        }
+
+        /* scales[is++] runs sequentially with j (0..7) == our `sub`.
+         * The reference bias loop is  sumi += bsums[j] * mins[j/2]  for
+         * j in 0..15, i.e. mins[m] pairs with bsums[2m] and bsums[2m+1].
+         * Sub-block `sub` owns exactly those two bsums, so its min index is
+         * `sub`, not sub/2. */
+        const int scale = (int)sc_min[sub];
+        const int minv  = (int)sc_min[8 + sub];
+        sumf += scale * d * (float)acc;
+        /* Bias correction over this 32-value sub-block = two 16-value bsums. */
+        const int bsum = (int)xbsums[sb * 16 + sub * 2]
+                       + (int)xbsums[sb * 16 + sub * 2 + 1];
+        sumf -= dmin * (float)minv * (float)bsum;
+    }
+
+    __shared__ float red[GEMV_WARPS > 1 ? GEMV_WARPS - 1 : 1][32];
+    if (warp > 0) red[warp - 1][lane] = sumf;
+    gpuSyncthreads();
+    if (warp > 0) return;
+    for (int w = 0; w < GEMV_WARPS - 1; w++) sumf += red[w][lane];
+    for (int off = 16; off > 0; off >>= 1)
+        sumf += gpuShflXorSync(0xFFFFFFFFu, sumf, off);
+    if (lane == 0) y[o] = sumf;
+}
+
+/* Q6_K: same shape. Transcribed from the "Scalar fallback" in
+ * vec_dot_q6_K_q8_K. Layout: ql[128], qh[64], scales[16] (int8), d (fp16). */
+__global__ void
+picolm_q6_K_gemv(float *y,
+                 const int8_t *xq, const float *xd, const int16_t *xbsums,
+                 const void *weights,
+                 int I, int O, int row_bytes, int y_stride) {
+    const int lane = (int)(gpuThreadIdx_x & 31);
+    const int warp = (int)(gpuThreadIdx_x >> 5);
+    const int tid  = warp * 32 + lane;
+    const int o    = (int)gpuBlockIdx_x;
+    if (o >= O) return;
+    int ys = y_stride > 0 ? y_stride : O;
+
+    const int n_super = I / 256;
+    const uint8_t *wrow = (const uint8_t *)weights + (size_t)o * row_bytes;
+
+    const int sb0 = tid / GEMVK_THREADS_PER_SB;
+    const int sub = tid % GEMVK_THREADS_PER_SB;
+
+    float sumf = 0.0f;
+
+    for (int sb = sb0; sb < n_super; sb += GEMVK_BLOCKS_PER_ITER) {
+        const uint8_t *wb = wrow + (size_t)sb * GPU_BLOCK_Q6_K_SIZE;
+        const uint8_t *ql = wb;
+        const uint8_t *qh = wb + 128;
+        const int8_t  *sc = (const int8_t *)(wb + 192);
+        const uint16_t d_raw = (uint16_t)(wb[208] | ((uint16_t)wb[209] << 8));
+        const float d = xd[sb] * gpu_fp16_to_fp32(d_raw);
+
+        const int8_t *q8 = xq + (size_t)sb * 256;
+
+        /* A 128-value chunk holds 4 interleaved sub-blocks. Per the reference
+         * (quant.c vec_dot_q6_K_q8_K scalar path), sub-block `which` sums
+         * q8_c[q8off + 0..15] for l=0..15 and q8_c[q8off + 16..31] for
+         * l=16..31 -- i.e. the two halves of the 32 q8 values are taken from
+         * the SAME ql/qh byte range but different l, so l must run the full
+         * 0..31 here while the byte index wraps at 16. Getting this wrong
+         * silently mis-associates half of every sub-block. */
+        const int chunk = sub >> 2;          /* 0 or 1 */
+        const int which = sub & 3;           /* 0..3 -> q1..q4 */
+        const uint8_t *ql_c = ql + chunk * 64;
+        const uint8_t *qh_c = qh + chunk * 32;
+        const int8_t  *q8_c = q8 + chunk * 128;
+
+        /* IMPORTANT: a 32-value sub-block spans TWO reference entries.
+         * sums[is+2*which] accumulates l=0..15 and sums[is+2*which+1]
+         * accumulates l=16..31, each with its OWN scale sc[is+2*which] and
+         * sc[is+2*which+1] (and its own bsums entry). Treating the 32 values
+         * as one block with a single scale was the bug: it produced plausible
+         * magnitudes but a wrong answer for 8 of every 16 scale slots. */
+        const int j0 = chunk * 8 + 2 * which;      /* first of the pair */
+        const int j1 = j0 + 1;
+        int acc0 = 0, acc1 = 0;
+        for (int l = 0; l < 32; l++) {
+            /* NOTE: the byte index is `l`, NOT `l & 15`. The reference has two
+             * separate 16-iteration loops that both index ql_c[l] / qh_c[l] --
+             * the second one runs l=16..31, so it reads bytes 16..31. Folding
+             * the halves into one loop and masking l to 0..15 re-read the
+             * first half of every sub-block: plausible magnitudes, wrong
+             * values, and only in the upper half of each 32-value group. */
+            const int bi = l;
+            int q;
+            switch (which) {
+                case 0: q = (ql_c[bi]      & 0xF) | (((qh_c[bi] >> 0) & 3) << 4);
+                        if (l < 16) acc0 += q * q8_c[l];
+                        else        acc1 += q * q8_c[l];          break;
+                case 1: q = (ql_c[bi + 32] & 0xF) | (((qh_c[bi] >> 2) & 3) << 4);
+                        if (l < 16) acc0 += q * q8_c[l + 32];
+                        else        acc1 += q * q8_c[l + 32];     break;
+                case 2: q = (ql_c[bi]      >> 4)  | (((qh_c[bi] >> 4) & 3) << 4);
+                        if (l < 16) acc0 += q * q8_c[l + 64];
+                        else        acc1 += q * q8_c[l + 64];     break;
+                default:q = (ql_c[bi + 32] >> 4)  | (((qh_c[bi] >> 6) & 3) << 4);
+                        if (l < 16) acc0 += q * q8_c[l + 96];
+                        else        acc1 += q * q8_c[l + 96];     break;
+            }
+        }
+
+        /* Reference: block_sum += sc[j]*sums[j] - 32*bsums[j]*sc[j] */
+        const int s0 = (int)sc[j0], s1 = (int)sc[j1];
+        const int b0 = (int)xbsums[sb * 16 + j0];
+        const int b1 = (int)xbsums[sb * 16 + j1];
+        acc0 = acc0 * s0 - 32 * b0 * s0;
+        acc1 = acc1 * s1 - 32 * b1 * s1;
+        sumf += d * (float)(acc0 + acc1);
+    }
+
+    __shared__ float red[GEMV_WARPS > 1 ? GEMV_WARPS - 1 : 1][32];
+    if (warp > 0) red[warp - 1][lane] = sumf;
+    gpuSyncthreads();
+    if (warp > 0) return;
+    for (int w = 0; w < GEMV_WARPS - 1; w++) sumf += red[w][lane];
+    for (int off = 16; off > 0; off >>= 1)
+        sumf += gpuShflXorSync(0xFFFFFFFFu, sumf, off);
+    if (lane == 0) y[o] = sumf;
+}
+
 
 /* lines 351-426 from backend_gpu_kernels.cuh */
 __global__ void

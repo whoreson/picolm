@@ -1280,6 +1280,51 @@ int picolm_gpu_matmul(picolm_gpu_tensor_t *t, float *y, const float *x, int S, i
  * x_dev/y_dev must NOT alias ctx->x/ctx->y/ctx->q8_xq/ctx->q8_xd (those
  * are still used internally here as Q8_0 quantize scratch) -- pass
  * dedicated pipeline buffers. */
+/* Q8_K activation scratch + one GEMV launch, shared by the Q5_K and Q6_K
+ * decode paths. Returns 1 on success, 0 to let the caller fall back to the
+ * IMMA tile paths (which still use Q8_0 activations). */
+static int
+kquant_gemv_dev(gpu_device_ctx_t *ctx, picolm_gpu_tensor_t *t, float *y_dev,
+                const float *x_dev, int I, int O, int ys, int x_stride,
+                int which /* 5 or 6 */) {
+    const int n_super = I / 256;
+    if (n_super < 1 || I % 256 != 0) return 0;
+    if (x_stride > 0 && x_stride != I) return 0;   /* GEMV assumes packed x */
+
+    size_t qs_bytes    = (size_t)n_super * 256;
+    size_t d_bytes     = (size_t)n_super * sizeof(float);
+    size_t bsums_bytes = (size_t)n_super * 16 * sizeof(int16_t);
+    if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, qs_bytes) ||
+        !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, d_bytes)) return 0;
+    if (ctx->q8_k_bsums_cap < bsums_bytes) {
+        if (ctx->q8_k_bsums) gpuFree(ctx->q8_k_bsums);
+        if (!gpu_ok(gpuMalloc(&ctx->q8_k_bsums, bsums_bytes), "q8_k bsums alloc")) {
+            ctx->q8_k_bsums = NULL; ctx->q8_k_bsums_cap = 0; return 0;
+        }
+        ctx->q8_k_bsums_cap = bsums_bytes;
+    }
+
+    /* Quantize the activation row to Q8_K exactly as the CPU does. */
+    dim3 q_grid((unsigned)n_super, 1);
+    picolm_quantize_q8_K<<<q_grid, 256, 0, ctx->stream>>>(
+        ctx->q8_xd, ctx->q8_xq, ctx->q8_k_bsums, x_dev, I, 1);
+    if (!gpu_ok(gpuGetLastError(), "q8_K quantize (dev)")) return 0;
+
+    dim3 grid((unsigned)O);
+    if (which == 5) {
+        gpu_dispatch_print("matmul_q5_gemv_dev");
+        picolm_q5_K_gemv<<<grid, 32 * GEMV_WARPS, 0, ctx->stream>>>(
+            y_dev, ctx->q8_xq, ctx->q8_xd, ctx->q8_k_bsums, t->weights,
+            I, O, (int)t->row_bytes, ys);
+    } else {
+        gpu_dispatch_print("matmul_q6_gemv_dev");
+        picolm_q6_K_gemv<<<grid, 32 * GEMV_WARPS, 0, ctx->stream>>>(
+            y_dev, ctx->q8_xq, ctx->q8_xd, ctx->q8_k_bsums, t->weights,
+            I, O, (int)t->row_bytes, ys);
+    }
+    return gpu_ok(gpuGetLastError(), "kquant gemv (dev)");
+}
+
 extern "C" int
 picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
                        int S, int device, int y_stride, int x_stride) {
@@ -1569,6 +1614,9 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
     /* Q6_K x Q8_0 IMMA path (device): quantize activations to Q8_0, native Q6_K weights.
      * Uses picolm_q6_q8_matmul_imma (m16n8k32 tensor cores, 2 IMMA per K-step). */
     if (t->qtype == GGUF_TYPE_Q6_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8 && I % 256 == 0) {
+        /* Decode fast path: Q6_K GEMV against Q8_K activations. */
+        if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 6))
+            return 1;
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
         int S_padded = (S + 15) & ~15;
@@ -1598,6 +1646,10 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
 
     /* Q5_K x Q8_0 IMMA path (device) -- ENABLED */
     if (t->qtype == GGUF_TYPE_Q5_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8 && I % 256 == 0) {
+        /* Decode fast path: Q5_K GEMV against Q8_K activations, matching the
+         * CPU's activation format for K-quant weights. */
+        if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 5))
+            return 1;
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
         int S_padded = (S + 15) & ~15;

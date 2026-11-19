@@ -79,6 +79,18 @@ __global__ void picolm_q8_q8_matmul(float *y, const int8_t *xq, const float *xd,
 #define GEMV_BLOCKS_PER_ITER (GEMV_VDR * GEMV_WARPS * 32 / GEMV_QI)  /* 32 */
 __global__ void picolm_q8_0_gemv(float *y, const int8_t *xq, const float *xd, const void *weights, int I, int O, int row_bytes, int y_stride);
 
+/* Q8_K activation quantiser: one block per 256-value super-block.
+ * d_out/qs_out/bsums_out are arrays of (I/256)*S entries with strides
+ * 1, 256 and 16 respectively. Byte-identical to quantize_row_q8_K(). */
+#define GPU_BLOCK_Q8_K_SIZE 292
+__global__ void picolm_quantize_q8_K(float *d_out, int8_t *qs_out, int16_t *bsums_out, const float *x, int I, int S);
+
+/* K-quant GEMV against Q8_K activations (decode, S=1). Same warp-per-row
+ * shape as picolm_q8_0_gemv; transcriptions of the scalar reference paths in
+ * quant.c. xbsums is y[i].bsums for super-block i. */
+__global__ void picolm_q5_K_gemv(float *y, const int8_t *xq, const float *xd, const int16_t *xbsums, const void *weights, int I, int O, int row_bytes, int y_stride);
+__global__ void picolm_q6_K_gemv(float *y, const int8_t *xq, const float *xd, const int16_t *xbsums, const void *weights, int I, int O, int row_bytes, int y_stride);
+
 /* Number of sequence positions per tile in the tiled Q8_0 matmul.
  * Shared memory usage (row_bytes, up to ~15KB for a 14336-wide FFN row)
  * doesn't depend on this constant -- positions are handled in an inner

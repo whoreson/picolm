@@ -5696,18 +5696,10 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
 #endif
     }
 
-    /* Close the layer loop's work and attribute it: one sync is enough, since
-     * everything is ordered on ctx->stream. Note batch_end is deliberately NOT
-     * called here -- the pre-existing one below (after the final norm) is the
-     * matching call for the batch_begin() above, and issuing two ends would be
-     * a real error on backends where batching is not a no-op (Vulkan). */
-    picolm_gpu_sync(gpu_dev);
-    {
-        double _total = ssm_now_ms() - _gpu_layer_t0;
-        double _per_layer = (c->n_layers > 0) ? _total / (double)c->n_layers : 0.0;
-        for (int _bl = 0; _bl < c->n_layers; _bl++)
-            _gpu_bench_emit(_bl, 0, _per_layer, 0, 0);
-    }
+    /* NOTE: no sync here. The layer loop's work is attributed below, at the
+     * D2H that already has to wait for it -- inserting a gpuDeviceSynchronize
+     * at this point split the pipeline in two and cost ~9% of decode speed
+     * while measuring nothing extra. */
 
     /* 3. Output projection on GPU: pipe_logits = output_weights @ pipe_x
      * Keep the matmul on device to avoid the D2H+H2D round-trip of the
@@ -5753,6 +5745,15 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
         matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
         tensor_set_repacked(NULL);
         tensor_set_gpu_tensor(NULL, 0);
+    }
+
+    /* Attribute the layer loop now that its work has certainly completed
+     * (both branches above forced a D2H, so no extra sync is needed). */
+    {
+        double _total = ssm_now_ms() - _gpu_layer_t0;
+        double _per_layer = (c->n_layers > 0) ? _total / (double)c->n_layers : 0.0;
+        for (int _bl = 0; _bl < c->n_layers; _bl++)
+            _gpu_bench_emit(_bl, 0, _per_layer, 0, 0);
     }
 
     if (getenv("PICOLM_DBG_LOGITS")) {

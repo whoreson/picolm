@@ -383,6 +383,10 @@ typedef struct {
     size_t host_x_cap, host_y_cap;
     int8_t *q8_xq; float *q8_xd;
     size_t q8_xq_cap, q8_xd_cap;
+    /* Q8_K activation scratch: q8_xq holds qs[(S)*(I/256)][256], q8_xd holds
+     * d[(S)*(I/256)], and this holds bsums[(S)*(I/256)][16]. Separate from the
+     * Q8_0 scratch above because the block sizes differ (256 vs 32 values). */
+    int16_t *q8_k_bsums; size_t q8_k_bsums_cap;
     gpuStream_t stream;
     size_t tensor_count, tensor_bytes;
     float *pipe_x, *pipe_xb, *pipe_q, *pipe_k, *pipe_v,
