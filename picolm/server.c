@@ -2369,6 +2369,42 @@ static char *chat_to_prompt(cJSON *messages, const char *system_template) {
     return prompt;
 }
 
+/* Debug: print KV cache mismatch context around the first differing token */
+static void kv_cache_mismatch_debug(const int *ptokens, int cache_start, int min_len, tokenizer_t *tokenizer) {
+    fprintf(stderr, "[server] KV CACHE MISMATCH at token %d: ", cache_start);
+    int wstart = cache_start > 4 ? cache_start - 4 : 0;
+    int wend = cache_start + 8;
+    if (wend > cache_start + 4) wend = cache_start + 4;
+    if (wend > min_len) wend = min_len;
+    fprintf(stderr, "OLD:");
+    for (int i = wstart; i < wend; i++) {
+        fprintf(stderr, " %d", srv.last_prompt_tokens[i]);
+    }
+    fprintf(stderr, "\n[server]");
+    for (int i = wstart; i < wend; i++) {
+        fprintf(stderr, " NEW: %d", ptokens[i]);
+    }
+    fprintf(stderr, "[server] KV cache: last_prompt_len=%d, n_prompt=%d\n", srv.last_prompt_len, min_len < srv.last_prompt_len ? min_len : srv.last_prompt_len);
+    if (srv.use_qwen_tok) {
+        fprintf(stderr, "\n[server] KV CACHE MISMATCH decoded context (tokens %d..%d):\n", wstart, wend);
+        char obuf[256], nbuf[256];
+        for (int i = wstart; i < wend; i++) {
+            qwen_tokenize_decode(&srv.qwen_enc, srv.last_prompt_tokens[i], obuf, sizeof(obuf));
+            qwen_tokenize_decode(&srv.qwen_enc, ptokens[i], nbuf, sizeof(nbuf));
+            fprintf(stderr, "[server]   pos %4d: old_tok=%6d \"%s\"  new_tok=%6d \"%s\"\n",
+                    i, srv.last_prompt_tokens[i], obuf, ptokens[i], nbuf);
+        }
+    } else {
+        fprintf(stderr, "\n[server] KV CACHE MISMATCH decoded context (tokens %d..%d):\n", wstart, wend);
+        for (int i = wstart; i < wend; i++) {
+            const char *old_txt = tokenizer_decode(tokenizer, i > 0 ? srv.last_prompt_tokens[i-1] : -1, srv.last_prompt_tokens[i]);
+            const char *new_txt = tokenizer_decode(tokenizer, i > 0 ? ptokens[i-1] : -1, ptokens[i]);
+            fprintf(stderr, "[server]   pos %4d: old_tok=%6d \"%s\"  new_tok=%6d \"%s\"\n",
+                    i, srv.last_prompt_tokens[i], old_txt, ptokens[i], new_txt);
+        }
+    }
+}
+
 /* ---- Endpoint: POST /v1/completions and /v1/chat/completions ---- */
 
 static void handle_completion(SOCKET sock, const char *request_body, int is_chat) {
@@ -2504,14 +2540,19 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
 
     /* Prompt caching: find shared prefix with last request */
     int cache_start = 0;
+    int min_len = n_prompt < srv.last_prompt_len ? n_prompt : srv.last_prompt_len;
     if (srv.last_prompt_tokens) {
-        int min_len = n_prompt < srv.last_prompt_len ? n_prompt : srv.last_prompt_len;
         for (cache_start = 0; cache_start < min_len; cache_start++) {
             if (ptokens[cache_start] != srv.last_prompt_tokens[cache_start]) break;
         }
     }
     int start_pos = cache_start;
     fprintf(stderr, "[server] %.1fms: KV cache match %d/%d tokens (%d new)\n", get_time_ms() - t0, start_pos, n_prompt, n_prompt - start_pos);
+
+    /* DEBUG: when there's a mismatch, show context around the first differing token */
+    if (cache_start < min_len) {
+        kv_cache_mismatch_debug(ptokens, cache_start, min_len, tokenizer);
+    }
 
     /* SSM checkpoint restore: if we have SSM layers and cache_start > 0,
      * try to find and restore a checkpoint at or before cache_start. */
@@ -3182,8 +3223,8 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
 
     /* Prompt caching: find shared prefix */
     int cache_start = 0;
+    int min_len = n_prompt < srv.last_prompt_len ? n_prompt : srv.last_prompt_len;
     if (srv.last_prompt_tokens) {
-        int min_len = n_prompt < srv.last_prompt_len ? n_prompt : srv.last_prompt_len;
         for (cache_start = 0; cache_start < min_len; cache_start++) {
             if (ptokens[cache_start] != srv.last_prompt_tokens[cache_start]) break;
         }
@@ -3194,6 +3235,11 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
      * at least one token is re-evaluated, preventing a duplicate KV entry. */
     int start_pos = cache_start;
     fprintf(stderr, "[server] %.1fms: KV cache match %d/%d tokens (%d new)\n", get_time_ms() - t0, start_pos, n_prompt, n_prompt - start_pos);
+
+    /* DEBUG: when there's a mismatch, show context around the first differing token */
+    if (cache_start < min_len) {
+        kv_cache_mismatch_debug(ptokens, cache_start, min_len, tokenizer);
+    }
 
     /* SSM checkpoint restore */
     /* NOTE: gate on model_has_recurrent_state(), NOT config.has_ssm.
