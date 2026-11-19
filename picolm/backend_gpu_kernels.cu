@@ -450,6 +450,81 @@ picolm_q8_q8_matmul(float *y,
         y[(size_t)s * ys + o] = (float)partial[0];
 }
 
+/* ================================================================
+ * Quantised GEMV -- the decode (S=1) fast path
+ * ================================================================
+ *
+ * Why this exists: at S=1 the IMMA path still launches a 16-row tensor-core
+ * tile, so 15 of 16 rows do useless work on zero padding and one 32-thread
+ * block serves just 8 output columns. Measured on a 27B/Q5_K at 8.5 tok/s, a
+ * decode token streams ~5.6 GB of FFN weights in ~1.06 s = ~48 GB/s of a
+ * 4090's ~1000 GB/s: it is kernel-bound, not bandwidth-bound. GEMV cannot use
+ * tensor cores well by construction (a 16x8x32 mma for 1 useful row IS the
+ * bug), so the right shape here is: stream each weight row exactly once,
+ * coalesced, and reduce.
+ *
+ * Layout: GEMV_WARPS_PER_BLOCK warps per block, one warp per WEIGHT ROW.
+ *   block b, warp w  -> row o = b * GEMV_WARPS_PER_BLOCK + w
+ *   lane l walks the row's 32-value blocks with stride 32 across the warp.
+ * Each lane accumulates an int32 per block-step, and the per-block
+ * contribution is scaled by wd * xd in _double_ exactly like
+ * picolm_q8_q8_matmul, so this kernel is numerically comparable to it (and
+ * checkable bit-for-bit against it with the scalar fallback).
+ *
+ * Weights are read through gpu_dot4_i8(), i.e. DP4A on NVIDIA sm_61+ and
+ * SDOT on gfx906+, with a scalar fallback so this always compiles and always
+ * gives the same answer. See the gpu_dot4_i8 notes in backend_gpu_common.cuh
+ * for why that is a source-level shim and not a performance guarantee.
+ */
+__global__ void
+picolm_q8_0_gemv(float *y,
+                 const int8_t *xq, const float *xd,
+                 const void *weights,
+                 int I, int O, int row_bytes, int y_stride) {
+    const int lane = (int)(gpuThreadIdx_x & 31);
+    const int warp = (int)(gpuThreadIdx_x >> 5);
+    const int o = (int)gpuBlockIdx_x * GEMV_WARPS_PER_BLOCK + warp;
+    if (o >= O) return;
+    int ys = y_stride > 0 ? y_stride : O;
+
+    const int n_blocks = I / 32;
+    const uint8_t *wrow = (const uint8_t *)weights + (size_t)o * row_bytes;
+
+    /* Each lane owns blocks lane, lane+32, ... -- consecutive lanes touch
+     * consecutive 34-byte blocks, which is the coalescing that makes this
+     * bandwidth-efficient. */
+    double sum = 0.0;
+    for (int bi = lane; bi < n_blocks; bi += 32) {
+        const uint8_t *b = wrow + (size_t)bi * GPU_BLOCK_Q8_0_SIZE;
+        uint16_t wd_raw = (uint16_t)(b[0] | ((uint16_t)b[1] << 8));
+        float wd = gpu_fp16_to_fp32(wd_raw);
+        float xdv = xd[bi];
+
+        const int8_t *wq = (const int8_t *)(b + 2);
+        const int8_t *xqp = xq + (size_t)bi * 32;
+
+        int acc = 0;
+        for (int j = 0; j < 32; j += 4)
+            acc = gpu_dot4_i8(wq + j, xqp + j, acc);
+
+        sum += (double)acc * (double)wd * (double)xdv;
+    }
+
+    /* Warp reduction in shared memory. Deliberately NOT a __shfl butterfly:
+     * gpuShflXorSync only has float/int overloads (and adding a double one
+     * per vendor is not worth it), and narrowing the partials to float would
+     * make this kernel disagree with picolm_q8_q8_matmul, which accumulates
+     * in double. One row per warp, so the shared array is tiny. */
+    __shared__ double red[GEMV_WARPS_PER_BLOCK][32];
+    red[warp][lane] = sum;
+    gpuSyncthreads();
+    for (int off = 16; off > 0; off >>= 1) {
+        if (lane < off) red[warp][lane] += red[warp][lane + off];
+        gpuSyncthreads();
+    }
+    if (lane == 0) y[o] = (float)red[warp][0];
+}
+
 /* lines 351-426 from backend_gpu_kernels.cuh */
 __global__ void
 picolm_q8_q8_matmul_tiled(float *y,

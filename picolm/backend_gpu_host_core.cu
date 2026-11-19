@@ -1254,6 +1254,28 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
                 ctx->q8_xq, ctx->q8_xd, x_dev, I, S);
         }
         if (!gpu_ok(gpuGetLastError(), "q8 quantize (dev)")) return 0;
+
+        /* Decode fast path: a real GEMV, one warp per weight row.
+         *
+         * Taken only at S==1. Everything below shapes a tensor-core tile, and
+         * at S=1 that means 16 rows of mma for 1 useful row (94% waste) with
+         * one 32-thread block per 8 output columns. GEMV streams each weight
+         * row exactly once and does no padding work.
+         *
+         * PICOLM_NO_GEMV=1 forces the IMMA path back on, for A/B measurement
+         * and for bisecting any numerical difference to a single kernel.
+         * (PICOLM_NO_DP4A=1 separately forces the scalar int8 dot inside the
+         * GEMV, so the two switches isolate the kernel shape from the ISA.) */
+        if (S == 1 && O >= 1 && !getenv("PICOLM_NO_GEMV")) {
+            gpu_dispatch_print("matmul_q8_gemv_dev");
+            int warps = GEMV_WARPS_PER_BLOCK;
+            dim3 grid((unsigned)((O + warps - 1) / warps));
+            picolm_q8_0_gemv<<<grid, 32 * warps, 0, ctx->stream>>>(
+                y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, I, O, (int)t->row_bytes, ys);
+            if (gpu_ok(gpuGetLastError(), "q8 gemv (dev)")) return 1;
+            /* fall through to the tile paths if the GEMV launch failed */
+        }
+
         /* Phase 6 abandoned: Q8_0 34-byte blocks cause misaligned access. */
         #ifndef __HIP__
         /* Phase 8: shared-memory staged IMMA (32x16 tiles, 64 threads). */

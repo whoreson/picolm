@@ -60,6 +60,14 @@ __global__ void picolm_quantize_weights_to_q8_0(
 
 __global__ void picolm_q8_q8_matmul(float *y, const int8_t *xq, const float *xd, const void *weights, int S, int I, int O, int row_bytes, int y_stride);
 
+/* Quantised GEMV for the decode path (S=1): one warp per output row, weights
+ * streamed once. See the kernel comment in backend_gpu_kernels.cu for why the
+ * tensor-core path is the wrong shape at S=1 and why this is bandwidth-bound
+ * rather than compute-bound. Implemented for Q8_0 blocks; the q4_0/q4_1/q2_0/
+ * iq4_nl paths reuse the same row/warp layout with their own dequant-dot. */
+#define GEMV_WARPS_PER_BLOCK 4
+__global__ void picolm_q8_0_gemv(float *y, const int8_t *xq, const float *xd, const void *weights, int I, int O, int row_bytes, int y_stride);
+
 /* Number of sequence positions per tile in the tiled Q8_0 matmul.
  * Shared memory usage (row_bytes, up to ~15KB for a 14336-wide FFN row)
  * doesn't depend on this constant -- positions are handled in an inner

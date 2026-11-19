@@ -437,4 +437,76 @@ PICOLM_UNUSED extern int reserve_pinned(float **ptr, size_t *cap, size_t bytes);
 extern int reserve_i8(int8_t **ptr, size_t *cap, size_t bytes);
 extern int ssm_batch_scratch_ensure(void **buf, size_t *cap, size_t need);
 
+/* ================================================================
+ * gpu_dot4_i8: 4-way int8 dot-accumulate (DP4A on NVIDIA, SDOT on AMD)
+ * ================================================================
+ *
+ * Used by the quantised GEMV kernels (decode, S=1). At S=1 a tensor-core
+ * mma tile is 16 rows for 1 useful row, so tensor cores are the wrong tool
+ * and the right one is stream-the-weights-once with packed byte dot products.
+ * This is that instruction, behind one name for both vendors.
+ *
+ * Why a shim rather than calling __dp4a directly: this tree also compiles for
+ * DJGPP/BE targets (which never reach GPU code) and for HIP, and __dp4a is
+ * NVIDIA-only -- AMD has no such intrinsic. Naming it once means a kernel is
+ * written a single time and still gets the fast instruction on both GPUs this
+ * project actually tests on (RTX 4090 = DP4A, MI50/gfx906 = SDOT), with a
+ * correct scalar fallback everywhere else.
+ */
+/* Portable 4-byte int8 dot-accumulate. The scalar branch produces IDENTICAL
+ * results to the hardware instruction (int32 sum of four sign-extended byte
+ * products), which is what lets the GEMV be validated bit-for-bit against the
+ * existing picolm_q8_q8_matmul reference kernel. */
+__device__ static inline int gpu_dp4a_fallback(const int8_t *a, const int8_t *b, int acc) {
+    return acc + (int)a[0] * (int)b[0]
+               + (int)a[1] * (int)b[1]
+               + (int)a[2] * (int)b[2]
+               + (int)a[3] * (int)b[3];
+}
+
+/* gpu_dot4_i8: the interface the GEMV kernels call.
+ *
+ * The arch decision lives INSIDE this function rather than in a GPU_DP4A_*
+ * macro. Reason: nvcc compiles every .cu twice (host pass then device pass)
+ * and __CUDA_ARCH__ is only defined in the latter, so a macro that claims
+ * "available" during the host pass references a __device__ function that does
+ * not exist in that pass -- which is exactly how this failed to build the
+ * first time. Keeping the #if inside a __device__ function body means the
+ * host pass never has to resolve it.
+ *
+ * AMD note: __builtin_amdgcn_sdot4 is a compiler builtin, not inline asm for
+ * a raw AMDGPU mnemonic. That matters -- hand-written asm for gfx-specific
+ * instructions is what breaks when hipcc targets an unexpected arch. gfx906
+ * (MI50) has SDOT natively; architectures without it take the scalar path.
+ *
+ * NVIDIA note (measured, see picolm_q8_q8_matmul): __dp4a requires sm_61 and
+ * is CORRECT on every newer part, but ptxas lowers it to scalar IMAD on
+ * GB10/sm_121. So this is the right source formulation, not a guarantee of
+ * 4x. PICOLM_NO_DP4A forces the scalar path for A/B measurement. */
+__device__ static inline int gpu_dot4_i8(const int8_t *a, const int8_t *b, int acc) {
+#if defined(PICOLM_NO_DP4A)
+    return gpu_dp4a_fallback(a, b, acc);
+#elif defined(__HIP_PLATFORM_AMD__)
+#if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || \
+    defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || \
+    defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || \
+    defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
+    defined(__gfx1103__) || defined(__gfx1200__) || defined(__gfx1201__)
+    int ai, bi;
+    memcpy(&ai, a, 4);
+    memcpy(&bi, b, 4);
+    return __builtin_amdgcn_sdot4(ai, bi, acc, false);
+#else
+    return gpu_dp4a_fallback(a, b, acc);
+#endif
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
+    int ai, bi;
+    memcpy(&ai, a, 4);
+    memcpy(&bi, b, 4);
+    return __dp4a(ai, bi, acc);
+#else
+    return gpu_dp4a_fallback(a, b, acc);
+#endif
+}
+
 #endif /* BACKEND_GPU_COMMON_CUH */
