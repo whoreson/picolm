@@ -450,6 +450,7 @@ picolm_q8_q8_matmul(float *y,
         y[(size_t)s * ys + o] = (float)partial[0];
 }
 
+
 /* ================================================================
  * Q8_K activation quantiser (device)
  * ================================================================
@@ -898,6 +899,90 @@ picolm_q6_K_gemv(float *y,
         acc0 = acc0 * s0 - 32 * b0 * s0;
         acc1 = acc1 * s1 - 32 * b1 * s1;
         sumf += d * (float)(acc0 + acc1);
+    }
+
+    __shared__ float red[GEMV_WARPS > 1 ? GEMV_WARPS - 1 : 1][32];
+    if (warp > 0) red[warp - 1][lane] = sumf;
+    gpuSyncthreads();
+    if (warp > 0) return;
+    for (int w = 0; w < GEMV_WARPS - 1; w++) sumf += red[w][lane];
+    for (int off = 16; off > 0; off >>= 1)
+        sumf += gpuShflXorSync(0xFFFFFFFFu, sumf, off);
+    if (lane == 0) y[o] = sumf;
+}
+
+/* Q4_K: 256 weights in 144 bytes -- d(2) dmin(2) scales[12] qs[128].
+ * Same shape as Q5_K minus the qh array: for j=0..3 the bytes qs[j*32..j*32+31]
+ * hold sub-block j*2 in their low nibbles and j*2+1 in their high nibbles.
+ * Scales/mins use the same 6-bit utmp packing as Q5_K. */
+__global__ void
+picolm_q4_K_gemv(float *y,
+                 const int8_t *xq, const float *xd, const int16_t *xbsums,
+                 const void *weights,
+                 int I, int O, int row_bytes, int y_stride) {
+    const int lane = (int)(gpuThreadIdx_x & 31);
+    const int warp = (int)(gpuThreadIdx_x >> 5);
+    const int tid  = warp * 32 + lane;
+    const int o    = (int)gpuBlockIdx_x;
+    if (o >= O) return;
+    int ys = y_stride > 0 ? y_stride : O;
+
+    const int n_super = I / 256;
+    const uint8_t *wrow = (const uint8_t *)weights + (size_t)o * row_bytes;
+
+    const int sb0 = tid / GEMVK_THREADS_PER_SB;
+    const int sub = tid % GEMVK_THREADS_PER_SB;
+
+    float sumf = 0.0f;
+
+    for (int sb = sb0; sb < n_super; sb += GEMVK_BLOCKS_PER_ITER) {
+        const uint8_t *wb = wrow + (size_t)sb * GPU_BLOCK_Q4_K_SIZE;
+        const float wd   = gpu_fp16_to_fp32((uint16_t)(wb[0] | ((uint16_t)wb[1] << 8)));
+        const float wdm  = gpu_fp16_to_fp32((uint16_t)(wb[2] | ((uint16_t)wb[3] << 8)));
+        const float d    = xd[sb] * wd;
+        const float dmin = xd[sb] * wdm;
+
+        uint8_t sc_min[16];
+        gemv_unpack_q5k_scales(wb + 4, sc_min);   /* same 6-bit packing */
+
+        const uint8_t *qs = wb + 16;
+        const int8_t  *q8 = xq + (size_t)sb * 256;
+
+        const int group = sub >> 1;
+        const int half  = sub & 1;
+        const uint8_t *qsg = qs + group * 32;
+
+        /* 4-bit values 0..15 fit signed int8 directly (no bias needed, unlike
+         * Q5_K's 5-bit). Activations read 4 bytes at a time via
+         * gemv_get_int_b2-style packing -- reading them as separate bytes was
+         * what cost Q5_K 30% before that fix. */
+        int acc = 0;
+        for (int l = 0; l < 32; l += 8) {
+            int8_t wA[4], wB[4];
+            wA[0] = (int8_t)(half ? (qsg[l+0] >> 4) : (qsg[l+0] & 0xF));
+            wA[1] = (int8_t)(half ? (qsg[l+1] >> 4) : (qsg[l+1] & 0xF));
+            wA[2] = (int8_t)(half ? (qsg[l+2] >> 4) : (qsg[l+2] & 0xF));
+            wA[3] = (int8_t)(half ? (qsg[l+3] >> 4) : (qsg[l+3] & 0xF));
+            wB[0] = (int8_t)(half ? (qsg[l+4] >> 4) : (qsg[l+4] & 0xF));
+            wB[1] = (int8_t)(half ? (qsg[l+5] >> 4) : (qsg[l+5] & 0xF));
+            wB[2] = (int8_t)(half ? (qsg[l+6] >> 4) : (qsg[l+6] & 0xF));
+            wB[3] = (int8_t)(half ? (qsg[l+7] >> 4) : (qsg[l+7] & 0xF));
+
+            const int8_t *qa = q8 + (size_t)sub * 32 + l;
+            const int aA = gemv_get_int_b2(qa, 0);
+            const int aB = gemv_get_int_b2(qa, 1);
+            int wAi, wBi;
+            memcpy(&wAi, wA, 4); memcpy(&wBi, wB, 4);
+            acc = gpu_dot4_i8_packed(wAi, aA, acc);
+            acc = gpu_dot4_i8_packed(wBi, aB, acc);
+        }
+
+        const int scale = (int)sc_min[sub];
+        const int minv  = (int)sc_min[8 + sub];
+        const int bsum  = (int)xbsums[sb * 16 + sub * 2]
+                        + (int)xbsums[sb * 16 + sub * 2 + 1];
+        sumf += scale * d * (float)acc;
+        sumf -= dmin * (float)minv * (float)bsum;
     }
 
     __shared__ float red[GEMV_WARPS > 1 ? GEMV_WARPS - 1 : 1][32];
