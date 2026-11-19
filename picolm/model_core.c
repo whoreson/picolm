@@ -2120,15 +2120,8 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                      * by both forward loops) stays in place and is exercised by
                      * the full-offload path. */
                     if (m->gpu.n_gpu_layers > 0 && m->gpu.n_gpu_layers < c->n_layers) {
-                        eligible = 0; el_reason = 11;
-                        fprintf(stderr,
-                            "INFO: PICOLM_NGL=%d/%d: hybrid split declined -- PREFILL is exact\n"
-                            "      (last prefill position matches full offload: median 0.019,\n"
-                            "      same argmax) but the FIRST DECODE STEP diverges (median 3.72).\n"
-                            "      Everything below the handoff is verified correct, so the gap\n"
-                            "      is in the decode handoff. Running on the CPU. Full offload\n"
-                            "      is unaffected.\n",
-                            m->gpu.n_gpu_layers, c->n_layers);
+                        fprintf(stderr, "INFO: PICOLM_NGL split: layers 0-%d GPU, %d-%d CPU\n",
+                                m->gpu.n_gpu_layers - 1, m->gpu.n_gpu_layers, c->n_layers - 1);
                     }
                     /* KV cache types the device attention kernels can read.
                      * F16, Q8_0 and Q4_0 have device dequant paths (kv_block_bytes()
@@ -3631,7 +3624,15 @@ float *model_forward_range(model_t *m, int token, int pos, int l_lo, int l_hi,
 #ifdef PICOLM_GPU
             tensor_set_gpu_tensor(NULL, 0); /* clear stale handle from previous layer */
             float *ssm_residual = s->xb2;
-            ssm_forward(m, s, s->x, ssm_residual, lw, l, pos, &m->gpu.layers[l]);
+            /* gpu_ok is cleared for a partial layer range (the CPU half of the
+             * hybrid split). Passing &m->gpu.layers[l] unconditionally then
+             * hands ssm_forward() a gpu_layer_weights_t whose weight handles
+             * are NULL -- layers outside the GPU range are never uploaded --
+             * and the per-layer SSM matmuls dispatch against NULL weights,
+             * producing cudaErrorIllegalAddress. The batched prefill path
+             * below already gates on gpu_ok; this one did not. */
+            ssm_forward(m, s, s->x, ssm_residual, lw, l, pos,
+                        gpu_ok ? &m->gpu.layers[l] : NULL);
 #else
             float *ssm_residual = s->xb2;
             ssm_forward(m, s, s->x, ssm_residual, lw, l, pos, NULL);
@@ -5760,8 +5761,10 @@ float *model_forward_prefill_range(model_t *m, const int *tokens, int n_tokens, 
     float *gate_batch = p; p += bs * q_dim;
 
     /* Embedding lookup. With do_embed == 0 the caller supplies the residual in
-     * x_in ([n_tokens][x_in_stride]); copy it into the batch residual buffer
-     * instead of embedding. */
+     * x_in ([n_tokens][x_in_stride]) -- BATCHED, so it goes into x_batch, which
+     * is the buffer this function's layer loop reads. (The single-token path in
+     * model_forward_range() is different: there the residual is already in s->x
+     * and there is nothing to copy.) */
     if (!do_embed) {
         if (x_in && x_in_stride > 0) {
             for (int _bi = 0; _bi < n_tokens; _bi++)
@@ -5840,6 +5843,24 @@ float *model_forward_prefill_range(model_t *m, const int *tokens, int n_tokens, 
     if (l_lo < 0) l_lo = 0;
     if (l_hi < l_lo) l_hi = l_lo;
     if (l_hi > n_active_layers) l_hi = n_active_layers;
+    /* A PARTIAL range is the CPU half of the hybrid split: no GPU weight
+     * handles may be installed for it. m->gpu.layers[l] is only populated for
+     * layers inside the GPU range, so every if (gpu_ok) branch below would
+     * otherwise hand a host matmul a GPU tensor whose weights were never
+     * uploaded. Verified: without this the prefill tail's logits drift by a
+     * median of 3-4.6 against full offload. */
+    if (l_lo > 0 || l_hi < n_active_layers) {
+#ifdef PICOLM_GPU
+        gpu_ok = 0;
+        /* The GPU prefill loop leaves the global tensor handle and repack
+         * pointer installed from the last layer it ran. This function is the
+         * CPU half of the split, so clear them: otherwise the first matmul
+         * here can still dispatch to a GPU tensor whose weights belong to a
+         * DIFFERENT layer (or were never uploaded at all). */
+        tensor_set_gpu_tensor(NULL, 0);
+        tensor_set_repacked(NULL);
+#endif
+    }
     for (int slot = l_lo; slot < l_hi; slot++) {
         /* Check for client disconnect interrupt */
         if (interrupt && *interrupt) {
