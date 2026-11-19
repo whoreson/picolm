@@ -79,3 +79,4 @@ test_batch_multi
 test_glm5_moe_ep
 test_glm5_pf_par
 test_glm5_dense_batch
+test_glm5_kda_split

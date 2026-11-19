@@ -3893,7 +3893,8 @@ static int glm5_pf_par(void) {
     return cached;
 }
 
-enum { PF_HC_ATTN_PRE, PF_ATTN, PF_KDA_PROJ, PF_KDA_TAIL, PF_KDA_OUT, PF_HC_ATTN_POST,
+enum { PF_HC_ATTN_PRE, PF_ATTN, PF_KDA_PROJ, PF_KDA_TAIL, PF_KDA_OUT,
+       PF_MLA_PROJ, PF_MLA_KB, PF_MLA_CORE, PF_MLA_VB, PF_MLA_OUT, PF_HC_ATTN_POST,
        PF_HC_FFN_PRE, PF_FFN, PF_HC_FFN_POST, PF_LAYER, PF_N };
 static double g_pf_ms[2][PF_N];      /* [0] KDA / dense-attention layers, [1] MLA layers */
 static long   g_pf_layers[2];
@@ -3902,9 +3903,23 @@ static int glm5_pfprof_on(void) {
     if (cached < 0) { const char *e = getenv("PICOLM_GLM5_PFPROF"); cached = (e && atoi(e) > 0) ? 1 : 0; }
     return cached;
 }
+static void glm5_pfprof_layer_line(int il, int kind) {
+    const double *v = g_pf_ms[kind];
+    double acc = v[PF_HC_ATTN_PRE] + v[PF_ATTN] + v[PF_KDA_PROJ] + v[PF_KDA_TAIL] + v[PF_KDA_OUT]
+               + v[PF_MLA_PROJ] + v[PF_MLA_KB] + v[PF_MLA_CORE] + v[PF_MLA_VB] + v[PF_MLA_OUT]
+               + v[PF_HC_ATTN_POST] + v[PF_HC_FFN_PRE] + v[PF_FFN] + v[PF_HC_FFN_POST];
+    fprintf(stderr, "PFPROF layer %2d %s %7.1f ms | hc_pre %6.1f  attn %7.1f", il, kind ? "MLA" : "KDA", v[PF_LAYER],
+            v[PF_HC_ATTN_PRE], v[PF_ATTN]);
+    if (!kind) fprintf(stderr, " (proj %6.1f tail %6.1f out %6.1f)", v[PF_KDA_PROJ], v[PF_KDA_TAIL], v[PF_KDA_OUT]);
+    else fprintf(stderr, " (proj %6.1f kb %6.1f core %6.1f vb %6.1f out %6.1f)", v[PF_MLA_PROJ], v[PF_MLA_KB], v[PF_MLA_CORE], v[PF_MLA_VB], v[PF_MLA_OUT]);
+    fprintf(stderr, "  hc_post %5.1f | hc_pre2 %6.1f  ffn %7.1f  hc_post2 %5.1f | unaccounted %6.1f\n",
+            v[PF_HC_ATTN_POST], v[PF_HC_FFN_PRE], v[PF_FFN], v[PF_HC_FFN_POST], v[PF_LAYER] - acc);
+    fflush(stderr);
+}
 static void glm5_pfprof_print(void) {
     static const char *nm[PF_N] = { "hc_pre (attn) + norm", "attention block", "  kda projections", "  kda tail (conv+state)",
-        "  kda out projection", "hc_post (attn)", "hc_pre (ffn) + norm", "ffn / moe", "hc_post (ffn)", "LAYER TOTAL" };
+        "  kda out projection", "  mla q/kv projections", "  mla k_b absorb (64 heads)", "  mla attention core",
+        "  mla v_b (64 heads)", "  mla out projection", "hc_post (attn)", "hc_pre (ffn) + norm", "ffn / moe", "hc_post (ffn)", "LAYER TOTAL" };
     static const char *kind[2] = { "KDA layers", "MLA layers" };
     for (int k = 0; k < 2; k++) {
         if (!g_pf_layers[k]) continue;
@@ -4021,6 +4036,352 @@ static int glm5_kda_layer_par(const model_t *m, const glm5_layer_weights_t *gw, 
         }
     }
     return 1;
+}
+
+/* ---- KDA tail with the state-independent work split out (prefill) ---------------------------
+ *
+ * glm5_kda_head_task() does, per head and token, ~770 expf calls and a pile of scalar loops
+ * (g, decay, the conv1d + SiLU over 3*KD channels, the q/k L2 norms, the output gate) -- and then
+ * the recurrent state update, which is the only part that depends on the previous token. Measured
+ * on the Xeon: 33 ms per KDA layer at 193 tokens, ~55 us per head-token, almost all of it that
+ * state-independent math running as the sequential part.
+ *
+ * None of it needs the state: the conv1d reads the last CONV_K-1 INPUTS (not outputs), so token t
+ * only needs tokens t-3..t of the batch (or the carried conv state for t < 3). So:
+ *   phase P  (parallel over token x head): conv+SiLU, q/k norms, g -> decay, attn score, beta, gate
+ *   phase C  (tiny):                       roll the carried conv state forward by n_tokens
+ *   phase R  (parallel over heads):        per head, tokens in order: state update, RMSNorm, gate
+ * Every value is computed with the same expressions as before, only on different threads, so the
+ * result is bit-identical to glm5_kda_layer_par (tests/test_glm5_kda_split.c). Falls back to it
+ * when the debug dumps are on; PICOLM_GLM5_KDA_SPLIT=0 forces the fallback. */
+static int glm5_kda_vexp_enabled(void) {
+    static int cached = -1;
+#if defined(PICOLM_AVX512)
+    if (cached < 0) { const char *e = getenv("PICOLM_GLM5_KDA_VEXP"); cached = (e && atoi(e) > 0) ? 1 : 0; }
+#else
+    cached = 0;
+#endif
+    return cached;
+}
+static int glm5_kda_split_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("PICOLM_GLM5_KDA_SPLIT");
+        cached = !(e && atoi(e) == 0) && !getenv("PICOLM_DBG_CONVXY") && !getenv("PICOLM_DBG_DUMPSTATE");
+    }
+    return cached;
+}
+
+typedef struct {
+    const model_config_t *c; const glm5_layer_weights_t *gw;
+    int KD, H, DI, CK, CD, NT, HB, vexp;          /* vexp: AVX-512 pre-pass (not bit-identical) */
+    const float *q_b, *k_b, *v_b, *z_b, *raw_b, *beta_b;
+    const float *old_state;                       /* conv state before this chunk (read-only in phase P) */
+    float *conv_b, *head_b, *decay_p, *gate_p, *score_p, *beta_p, *kda_state;
+} kda_split_t;
+
+#if defined(PICOLM_AVX512)
+/* expf for 16 lanes: Cephes range reduction + degree-6 polynomial, scaled with vscalefps so that
+ * overflow -> +inf and underflow -> 0 like libm. Max error ~2 ULP against glibc's expf, i.e. NOT
+ * bit-identical; that is why the vector pre-pass is opt-in (PICOLM_GLM5_KDA_VEXP=1). */
+static inline __m512 kda_expf16(__m512 x)
+{
+    /* expf(89) overflows to +inf and expf(-104) underflows to 0 in float, so clamping first keeps the
+     * range reduction sane for huge |x| without changing those limits. */
+    x = _mm512_min_ps(_mm512_max_ps(x, _mm512_set1_ps(-104.0f)), _mm512_set1_ps(89.0f));
+    const __m512 log2e = _mm512_set1_ps(1.44269504088896341f);
+    const __m512 c1 = _mm512_set1_ps(0.693359375f), c2 = _mm512_set1_ps(-2.12194440e-4f);
+    const __m512 fx = _mm512_roundscale_ps(_mm512_mul_ps(x, log2e), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    __m512 r = _mm512_fnmadd_ps(fx, c1, x);
+    r = _mm512_fnmadd_ps(fx, c2, r);
+    __m512 y = _mm512_set1_ps(1.9875691500E-4f);
+    y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(1.3981999507E-3f));
+    y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(8.3334519073E-3f));
+    y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(4.1665795894E-2f));
+    y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(1.6666665459E-1f));
+    y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(5.0000001201E-1f));
+    const __m512 r2 = _mm512_mul_ps(r, r);
+    y = _mm512_fmadd_ps(y, r2, _mm512_add_ps(r, _mm512_set1_ps(1.0f)));
+    return _mm512_scalef_ps(y, fx);
+}
+
+/* Same arithmetic order as the scalar pre-pass; only expf differs, and the q/k L2 norms and the
+ * attention-score dot keep their sequential scalar summation order. */
+static void kda_split_pre_head_v(const kda_split_t *x, int t, int h)
+{
+    const model_config_t *c = x->c;
+    const glm5_layer_weights_t *gw = x->gw;
+    const int KD = x->KD, DI = x->DI, CK = x->CK, CD = x->CD, H = x->H;
+    float *conv_out = x->conv_b + (size_t)t * 3 * DI;
+    const float *raw = x->raw_b + (size_t)t * DI, *z = x->z_b + (size_t)t * DI;
+    const __m512 one = _mm512_set1_ps(1.0f);
+
+    x->beta_p[(size_t)t * H + h] = 1.0f / (1.0f + expf(-x->beta_b[(size_t)t * H + h]));
+    {
+        const float *dt_bias = (const float *)gw->kda_dt_bias;
+        const __m512 a_val = _mm512_set1_ps(((const float *)gw->kda_a)[h]);
+        const __m512 lb = _mm512_set1_ps(c->glm5_kda_lower_bound), cap = _mm512_set1_ps(50.0f);
+        const __m512 zero = _mm512_setzero_ps();
+        for (int ch = 0; ch < KD; ch += 16) {
+            const int idx = h * KD + ch;
+            const __m512 e = kda_expf16(_mm512_mul_ps(a_val, _mm512_add_ps(_mm512_loadu_ps(raw + idx), _mm512_loadu_ps(dt_bias + idx))));
+            const __m512 g = _mm512_mul_ps(lb, _mm512_div_ps(one, _mm512_add_ps(one, e)));
+            _mm512_storeu_ps(x->decay_p + (size_t)t * DI + idx, kda_expf16(_mm512_min_ps(g, cap)));
+            _mm512_storeu_ps(x->gate_p + (size_t)t * DI + idx,
+                             _mm512_div_ps(one, _mm512_add_ps(one, kda_expf16(_mm512_sub_ps(zero, _mm512_loadu_ps(z + idx))))));
+        }
+    }
+    {
+        const float *wq = (const float *)gw->kda_conv_q, *wk = (const float *)gw->kda_conv_k, *wv = (const float *)gw->kda_conv_v;
+        const __m512i lane = _mm512_mullo_epi32(_mm512_set_epi32(15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0), _mm512_set1_epi32(CK));
+        const __m512 zero = _mm512_setzero_ps();
+        for (int part = 0; part < 3; part++) {
+            const float *src = (part == 0) ? x->q_b : (part == 1) ? x->k_b : x->v_b;
+            const float *w   = (part == 0) ? wq     : (part == 1) ? wk     : wv;
+            for (int i = 0; i < KD; i += 16) {
+                const int ch_off = h * KD + i, ch = part * DI + ch_off;
+                __m512 acc = zero;
+                for (int tap = 0; tap < CK; tap++) {
+                    __m512 xs;
+                    if (tap == CK - 1) xs = _mm512_loadu_ps(src + (size_t)t * DI + ch_off);
+                    else {
+                        const int tt = t - (CK - 1) + tap;
+                        xs = tt >= 0 ? _mm512_loadu_ps(src + (size_t)tt * DI + ch_off)
+                                     : _mm512_loadu_ps(x->old_state + (size_t)(tt + CK - 1) * CD + ch);
+                    }
+                    const __m512 wv16 = _mm512_i32gather_ps(_mm512_add_epi32(lane, _mm512_set1_epi32(tap)),
+                                                            w + (size_t)ch_off * CK, 4);
+                    acc = _mm512_add_ps(acc, _mm512_mul_ps(xs, wv16));
+                }
+                const __m512 den = _mm512_add_ps(one, kda_expf16(_mm512_sub_ps(zero, acc)));
+                _mm512_storeu_ps(conv_out + ch, _mm512_div_ps(acc, den));
+            }
+        }
+    }
+    {
+        float *qh = conv_out + h * KD, *kh = conv_out + DI + h * KD;
+        float sq = 0.f, sk = 0.f;
+        for (int ch = 0; ch < KD; ch++) { sq += qh[ch] * qh[ch]; sk += kh[ch] * kh[ch]; }
+        const float inv_q = 1.0f / fmaxf(sqrtf(sq), 1e-5f), inv_k = 1.0f / fmaxf(sqrtf(sk), 1e-5f);
+        for (int ch = 0; ch < KD; ch++) { qh[ch] *= inv_q; kh[ch] *= inv_k; }
+        const float scale = 1.0f / sqrtf((float)KD);
+        float attn_score = 0.f;
+        for (int i = 0; i < KD; i++) attn_score += kh[i] * qh[i];
+        x->score_p[(size_t)t * H + h] = attn_score * scale;
+    }
+}
+#endif
+
+static void kda_split_pre_head(const kda_split_t *x, int t, int h)
+{
+#if defined(PICOLM_AVX512)
+    if (x->vexp) { kda_split_pre_head_v(x, t, h); return; }
+#endif
+    const model_config_t *c = x->c;
+    const glm5_layer_weights_t *gw = x->gw;
+    const int KD = x->KD, DI = x->DI, CK = x->CK, CD = x->CD, H = x->H;
+    float *conv_out = x->conv_b + (size_t)t * 3 * DI;
+    const float *raw = x->raw_b + (size_t)t * DI, *z = x->z_b + (size_t)t * DI;
+
+    x->beta_p[(size_t)t * H + h] = 1.0f / (1.0f + expf(-x->beta_b[(size_t)t * H + h]));
+
+    {   /* g, then decay = exp(min(g, 50)) */
+        const float *dt_bias = (const float *)gw->kda_dt_bias;
+        const float a_val = ((const float *)gw->kda_a)[h];
+        for (int ch = 0; ch < KD; ch++) {
+            const int idx = h * KD + ch;
+            const float gv = c->glm5_kda_lower_bound *
+                             (1.0f / (1.0f + expf(a_val * (raw[idx] + dt_bias[idx]))));
+            x->decay_p[(size_t)t * DI + idx] = expf(fminf(gv, 50.0f));
+        }
+    }
+    for (int ch = 0; ch < KD; ch++) {            /* output gate sigmoid(z) */
+        const int idx = h * KD + ch;
+        x->gate_p[(size_t)t * DI + idx] = 1.0f / (1.0f + expf(-z[idx]));
+    }
+    {   /* causal depthwise conv1d + SiLU; history = the previous inputs of this batch, or the carried state */
+        const float *wq = (const float *)gw->kda_conv_q, *wk = (const float *)gw->kda_conv_k, *wv = (const float *)gw->kda_conv_v;
+        for (int part = 0; part < 3; part++) {
+            const float *src = (part == 0) ? x->q_b : (part == 1) ? x->k_b : x->v_b;
+            const float *w   = (part == 0) ? wq     : (part == 1) ? wk     : wv;
+            for (int i = 0; i < KD; i++) {
+                const int ch_off = h * KD + i, ch = part * DI + ch_off;
+                float xs[GLM5_KD_MAX];
+                for (int tap = 0; tap < CK - 1; tap++) {
+                    const int tt = t - (CK - 1) + tap;
+                    xs[tap] = tt >= 0 ? src[(size_t)tt * DI + ch_off]
+                                      : x->old_state[(size_t)(tt + CK - 1) * CD + ch];
+                }
+                xs[CK - 1] = src[(size_t)t * DI + ch_off];
+                float acc = 0.f;
+                for (int tap = 0; tap < CK; tap++) acc += xs[tap] * w[tap + ch_off * CK];
+                conv_out[ch] = acc / (1.0f + expf(-acc));
+            }
+        }
+    }
+    {   /* per-head L2 norm of q and k */
+        float *qh = conv_out + h * KD, *kh = conv_out + DI + h * KD;
+        float sq = 0.f, sk = 0.f;
+        for (int ch = 0; ch < KD; ch++) { sq += qh[ch] * qh[ch]; sk += kh[ch] * kh[ch]; }
+        const float inv_q = 1.0f / fmaxf(sqrtf(sq), 1e-5f), inv_k = 1.0f / fmaxf(sqrtf(sk), 1e-5f);
+        for (int ch = 0; ch < KD; ch++) { qh[ch] *= inv_q; kh[ch] *= inv_k; }
+        const float scale = 1.0f / sqrtf((float)KD);
+        float attn_score = 0.f;
+        for (int i = 0; i < KD; i++) attn_score += kh[i] * qh[i];
+        x->score_p[(size_t)t * H + h] = attn_score * scale;
+    }
+}
+static void kda_split_pre_task(int idx, void *vp) {
+    const kda_split_t *x = (const kda_split_t *)vp;
+    const int per = x->H / x->HB;
+    const int t = idx / per, hb = idx % per;
+    for (int k = 0; k < x->HB; k++) kda_split_pre_head(x, t, hb * x->HB + k);
+}
+
+/* The sequential part: recurrent state update (verbatim from glm5_kda_head_task), then the per-head
+ * RMSNorm and the precomputed gate. */
+static void kda_rec_head(const float *qh, const float *kh, const float *vh, const float *decay,
+                         float attn_score, float beta_h, float scale, float *Sh, float *head_out_h,
+                         const float *gate, const float *norm_w, float eps, int KD)
+{
+    float v_new[GLM5_KD_MAX];
+        {
+            float *vp = v_new;
+            float *ov = head_out_h;
+            memset(vp, 0, (size_t)KD * sizeof(float));
+            memset(ov, 0, (size_t)KD * sizeof(float));
+            for (int col = 0; col < KD; col++) {
+                const float *Scol = Sh + (size_t)col*KD;
+                const float kd_ = kh[col] * decay[col];
+                const float qd_ = qh[col] * decay[col];
+                for (int row = 0; row < KD; row++) {
+                    float st = Scol[row];
+                    vp[row] += st * kd_;
+                    ov[row] += st * qd_;
+                }
+            }
+            for (int row = 0; row < KD; row++) {
+                float vn = beta_h * (vh[row] - vp[row]);
+                v_new[row] = vn;
+                ov[row] = ov[row] * scale + vn * attn_score;
+            }
+        }
+        for (int col = 0; col < KD; col++) {
+            float k_col = kh[col];
+            float dec = decay[col];
+            float *Sc = Sh + (size_t)col*KD;
+            int row = 0;
+#if defined(PICOLM_AVX512)
+            {
+                const __m512 vdec = _mm512_set1_ps(dec);
+                const __m512 vk   = _mm512_set1_ps(k_col);
+                const __m512 vlo  = _mm512_set1_ps(-1e6f);
+                const __m512 vhi  = _mm512_set1_ps(1e6f);
+                for (; row + 15 < KD; row += 16) {
+                    __m512 st = _mm512_loadu_ps(Sc + row);
+                    __m512 vn = _mm512_loadu_ps(v_new + row);
+                    st = _mm512_add_ps(_mm512_mul_ps(vdec, st), _mm512_mul_ps(vn, vk));
+                    st = _mm512_min_ps(_mm512_max_ps(st, vlo), vhi);
+                    _mm512_storeu_ps(Sc + row, st);
+                }
+            }
+#elif defined(PICOLM_AVX2) || defined(PICOLM_AVX)
+            {
+                const __m256 vk = _mm256_set1_ps(k_col);
+                const __m256 vdec = _mm256_set1_ps(dec);
+                const __m256 vlo  = _mm256_set1_ps(-1e6f);
+                const __m256 vhi  = _mm256_set1_ps(1e6f);
+                for (; row + 7 < KD; row += 8) {
+                    __m256 st = _mm256_loadu_ps(Sc + row);
+                    __m256 vn = _mm256_loadu_ps(v_new + row);
+                    st = _mm256_add_ps(_mm256_mul_ps(vdec, st), _mm256_mul_ps(vn, vk));
+                    st = _mm256_min_ps(_mm256_max_ps(st, vlo), vhi);
+                    _mm256_storeu_ps(Sc + row, st);
+                }
+            }
+#endif
+            for (; row < KD; row++) {
+                float st = Sc[row];
+                st = dec * st + v_new[row] * k_col;
+                Sc[row] = fminf(fmaxf(st, -1e6f), 1e6f);
+            }
+        }
+    {
+        float *oh = head_out_h;
+        float ss = 0.f;
+        for (int ch = 0; ch < KD; ch++) ss += oh[ch] * oh[ch];
+        const float inv = 1.0f / sqrtf(ss / KD + eps);
+        for (int ch = 0; ch < KD; ch++) oh[ch] *= inv * norm_w[ch];
+        for (int ch = 0; ch < KD; ch++) oh[ch] *= gate[ch];
+    }
+}
+static void kda_split_rec_task(int h, void *vp) {
+    const kda_split_t *x = (const kda_split_t *)vp;
+    const int KD = x->KD, DI = x->DI, H = x->H;
+    const float scale = 1.0f / sqrtf((float)KD);
+    const float *norm_w = (const float *)x->gw->kda_norm;
+    float *Sh = x->kda_state + (size_t)h * KD * KD;
+    for (int t = 0; t < x->NT; t++) {
+        const float *co = x->conv_b + (size_t)t * 3 * DI;
+        kda_rec_head(co + h * KD, co + DI + h * KD, co + 2 * DI + h * KD,
+                     x->decay_p + (size_t)t * DI + h * KD,
+                     x->score_p[(size_t)t * H + h], x->beta_p[(size_t)t * H + h], scale, Sh,
+                     x->head_b + (size_t)t * DI + h * KD, x->gate_p + (size_t)t * DI + h * KD,
+                     norm_w, x->c->rms_norm_eps, KD);
+    }
+}
+
+/* Same contract and bit-identical results as glm5_kda_layer_par(). */
+static int glm5_kda_layer_split_ex(const model_t *m, const glm5_layer_weights_t *gw, run_state_t *s,
+                                   int layer_idx, int n_tokens,
+                                   const float *q_b, const float *k_b, const float *v_b,
+                                   const float *z_b, const float *raw_b, const float *beta_b,
+                                   float *conv_b, float *g_scr, float *head_b, float *beta_sh, int vexp_req)
+{
+    const model_config_t *c = &m->config;
+    const int H = c->glm5_n_kda_heads, KD = c->glm5_kda_dim, DI = H * KD, CK = c->ssm_d_conv;
+    static float *buf; static size_t cap;                      /* cap in bytes (ep_grow) */
+    const size_t need = ((size_t)n_tokens * DI * 2 + (size_t)n_tokens * H * 2);
+    if (!glm5_kda_split_enabled() || KD > GLM5_KD_MAX || CK < 2 || n_tokens < 1 || H < 1 ||
+        !ep_grow((void **)&buf, &cap, need * sizeof(float)))
+        return glm5_kda_layer_par(m, gw, s, layer_idx, n_tokens, q_b, k_b, v_b, z_b, raw_b, beta_b,
+                                  conv_b, g_scr, head_b, beta_sh);
+    float *conv_state = s->glm5.kda_conv_state[layer_idx];
+    kda_split_t x;
+    x.c = c; x.gw = gw; x.KD = KD; x.H = H; x.DI = DI; x.CK = CK; x.CD = 3 * DI; x.NT = n_tokens;
+    x.HB = (H % 4 == 0) ? 4 : 1;
+    x.vexp = vexp_req && (KD % 16 == 0);
+    x.q_b = q_b; x.k_b = k_b; x.v_b = v_b; x.z_b = z_b; x.raw_b = raw_b; x.beta_b = beta_b;
+    x.old_state = conv_state; x.conv_b = conv_b; x.head_b = head_b; x.kda_state = s->glm5.kda_state[layer_idx];
+    x.decay_p = buf; x.gate_p = buf + (size_t)n_tokens * DI;
+    x.score_p = buf + (size_t)n_tokens * DI * 2; x.beta_p = x.score_p + (size_t)n_tokens * H;
+
+    tensor_parallel_for_dyn(n_tokens * (H / x.HB), kda_split_pre_task, &x);       /* phase P */
+
+    {   /* phase C: carried conv state := the last CK-1 inputs of the stream (in place, ascending) */
+        const int CD = x.CD, NT = n_tokens;
+        for (int ch = 0; ch < CD; ch++) {
+            const int part = ch / DI, ch_off = ch % DI;
+            const float *src = (part == 0) ? q_b : (part == 1) ? k_b : v_b;
+            for (int tap = 0; tap < CK - 1; tap++) {
+                const int tt = NT - (CK - 1) + tap;
+                conv_state[(size_t)tap * CD + ch] = tt >= 0 ? src[(size_t)tt * DI + ch_off]
+                                                            : conv_state[(size_t)(tap + NT) * CD + ch];
+            }
+        }
+    }
+    tensor_parallel_for_dyn(H, kda_split_rec_task, &x);                           /* phase R */
+    return 1;
+}
+
+static int glm5_kda_layer_split(const model_t *m, const glm5_layer_weights_t *gw, run_state_t *s,
+                                int layer_idx, int n_tokens,
+                                const float *q_b, const float *k_b, const float *v_b,
+                                const float *z_b, const float *raw_b, const float *beta_b,
+                                float *conv_b, float *g_scr, float *head_b, float *beta_sh)
+{
+    return glm5_kda_layer_split_ex(m, gw, s, layer_idx, n_tokens, q_b, k_b, v_b, z_b, raw_b, beta_b,
+                                   conv_b, g_scr, head_b, beta_sh, glm5_kda_vexp_enabled());
 }
 
 /* Batched GLM-5 prefill. Processes n_tokens (<= GLM5_PREFILL_MAX_TOKENS)
@@ -4248,6 +4609,7 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                      * must be its own allocation: putting it in kda_scratch ran
                      * past the end of that buffer (8*DI + NH*KVL = 98304 vs the
                      * 82112 it owns) and into the KDA state. */
+                    PFP_BEGIN(tMP);
                     glm5_mla_project_batch(m, gw, cur_b, n_tokens,
                                            qr_plane, q_plane, kv_plane);
 
@@ -4263,6 +4625,7 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                                              start_pos, n_tokens);
                     }
 
+                    PFP_END(tMP, pfk, PF_MLA_PROJ);
                     /* qabs for the whole batch: qabs[t][h] = Wk_b[h] @ q_t[h].
                      * Not a persistent arena plane -- see the qabs note above;
                      * it is consumed immediately by the attention below. */
@@ -4291,6 +4654,7 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                              * and we need [t][h] interleaving -- so the token
                              * loop stays outside and the activation rows for one
                              * head are gathered contiguously first. */
+                            PFP_BEGIN(tMK);
                             for (int h = 0; h < NH; h++) {
                                 static float *qh_buf = NULL, *qh_dst = NULL;
                                 static size_t qh_n = 0;
@@ -4317,6 +4681,8 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                                            (size_t)KVL * sizeof(float));
                             }
 
+                            PFP_END(tMK, pfk, PF_MLA_KB);
+
                             /* Attention over the latent cache, all tokens at
                              * once. Only for the dense case: a DSA selection is
                              * per token, so it keeps the per-token core. */
@@ -4334,9 +4700,12 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                                     ctx_b = malloc(need * sizeof(float));
                                     ctx_b_n = ctx_b ? need : 0;
                                 }
-                                if (ctx_b)
+                                if (ctx_b) {
+                                    PFP_BEGIN(tMC);
                                     glm5_mla_attn_batch(c, s, mla_ord, qabs_b, ctx_b,
                                                         n_tokens, start_pos);
+                                    PFP_END(tMC, pfk, PF_MLA_CORE);
+                                }
                             }
                             if (dense && ctx_b) {
                                 /* o[h] = Wv_b[h] @ ctx[h] per token */
@@ -4345,6 +4714,7 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                                  * head is read once per layer not once per
                                  * token. Gather ctx rows for the head, GEMM,
                                  * scatter back to [t][h]. */
+                                PFP_BEGIN(tMV);
                                 const uint8_t *vb = (const uint8_t *)gw->mla_v_b;
                                 size_t v_row_sz = gguf_type_row_size(gw->type_mla_v_b, KVL);
                                 size_t v_head_sz = (size_t)MHD * v_row_sz;
@@ -4371,6 +4741,7 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                                                vh_dst + (size_t)t*MHD,
                                                (size_t)MHD * sizeof(float));
                                 }
+                                PFP_END(tMV, pfk, PF_MLA_VB);
                             } else {
                                 /* DSA / allocation failure: per-token core. */
                                 for (int t = 0; t < n_tokens && (!interrupt || !*interrupt); t++) {
@@ -4397,8 +4768,10 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                         }
                     }
                     /* Batched attention output projection: [N][NH*MHD] -> [N][D]. */
+                    PFP_BEGIN(tMO);
                     matmul_batch(attn_b, o_plane, n_tokens, lw->attn_output,
                                  QD, D, lw->type_attn_output);
+                    PFP_END(tMO, pfk, PF_MLA_OUT);
                 }
             } else {
                 /* KDA: batch the weight-bound projections, then run the
@@ -4423,7 +4796,7 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                  * tail's output projection is deferred so attn_output can be
                  * GEMM'd for all tokens at once below. */
                 PFP_BEGIN(tKT);
-                if (!(glm5_pf_par() && glm5_kda_layer_par(m, gw, s, il, n_tokens, q_b, k_b, v_b, gb_b, fb_b,
+                if (!(glm5_pf_par() && glm5_kda_layer_split(m, gw, s, il, n_tokens, q_b, k_b, v_b, gb_b, fb_b,
                                                           beta_b, conv_b, g_scr, head_b, beta_sh)))
                 for (int t = 0; t < n_tokens; t++) {
                     glm5_kda_tail_par(m, gw, lw, s, il, start_pos + t,
@@ -4620,7 +4993,7 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                     fprintf(stderr, "GLM5 prefill: stopping after layer %d (PICOLM_STOP_LAYER)\n", il);
                 break;
             }
-            if (tLayer) { g_pf_ms[pfk][PF_LAYER] += glm5_prof_now() - tLayer; g_pf_layers[pfk]++; if (g_pf_layers[0] + g_pf_layers[1] == 1) atexit(glm5_pfprof_print); }
+            if (tLayer) { g_pf_ms[pfk][PF_LAYER] += glm5_prof_now() - tLayer; g_pf_layers[pfk]++; glm5_pfprof_layer_line(il, pfk); if (g_pf_layers[0] + g_pf_layers[1] == 1) atexit(glm5_pfprof_print); }
             BENCH_LAYER_END(il, 1);
         }
 
