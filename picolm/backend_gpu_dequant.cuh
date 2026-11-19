@@ -3,6 +3,17 @@
 
 #include "backend_gpu_common.cuh"
 
+/* IQ6_K non-linear LUT: the same 64 bytes as iq6nl_lut in quant.c.
+ * Defined here as `static` so every TU that includes this header gets its own
+ * copy -- no cross-TU device-symbol linkage, which nvcc and hipcc handle
+ * differently (and which the rest of this tree avoids entirely). */
+__device__ static const uint8_t iq6nl_lut_dev[64] = {
+     1,   7,  13,  19,  24,  30,  35,  40,  44,  49,  54,  58,  62,  66,  70,  74,
+    77,  81,  84,  88,  91,  94,  97, 100, 103, 106, 109, 112, 115, 117, 120, 123,
+   126, 128, 131, 134, 137, 140, 142, 145, 148, 151, 155, 158, 161, 164, 168, 172,
+   175, 179, 183, 187, 191, 196, 200, 205, 210, 215, 220, 226, 231, 237, 243, 249,
+};
+
 __device__ static inline float dequant_q4_0(const void *blk, int i) {
     const uint8_t *b = (const uint8_t *)blk;
     uint16_t d_raw = b[0] | ((uint16_t)b[1] << 8);
@@ -337,6 +348,38 @@ __device__ static inline float dequant_q5_K(const void *blk, int i) {
     int high_bit = (qh[l] & u) ? 16 : 0;
 
     return d * (float)sc * (float)(nibble + high_bit) - dm * (float)mn;
+}
+
+/* IQ6_K dequant: 256 values in 212 bytes. Non-linear: the 6-bit code indexes
+ * a 64-entry table. Ported from dequantize_row_iq6_k() in quant.c.
+ *
+ * Layout: d(2) extra(2) scales[16] qs[128] qh[64]. Four 64-value sub-blocks;
+ * within one, four groups of 16 each with their own signed scale and their own
+ * LUT-select bit. i is the element index within the block (0..255). */
+__device__ static inline float dequant_iq6_K(const void *blk, int i) {
+    const uint8_t *b = (const uint8_t *)blk;
+    const float d = gpu_fp16_to_fp32((uint16_t)(b[0] | ((uint16_t)b[1] << 8)));
+    const uint16_t extra = (uint16_t)(b[2] | ((uint16_t)b[3] << 8));
+    const int8_t  *sl = (const int8_t *)(b + 4);
+    const uint8_t *qs = b + 20;
+    const uint8_t *qh = b + 148;
+
+    const int ib64 = i >> 6;             /* 64-value sub-block 0..3 */
+    const int rem  = i & 63;             /* position inside it       */
+    const int g    = rem >> 4;           /* 16-value group 0..3      */
+    const int j    = rem & 15;           /* index inside the group   */
+    const int shift = (ib64 & 1) * 4;
+    const uint8_t *qs_c = qs + ib64 * 32;
+    const uint8_t *qh_c = qh + (ib64 >> 1) * 32;
+
+    int q;
+    if (g == 0)      q = (qs_c[j]      & 0x0F) | (((qh_c[j] >> shift) & 0x03) << 4);
+    else if (g == 1) q = (qs_c[j + 16] & 0x0F) | (((qh_c[j + 16] >> shift) & 0x03) << 4);
+    else if (g == 2) q = (qs_c[j]      >> 4)   | (((qh_c[j] >> shift) & 0x0C) << 2);
+    else             q = (qs_c[j + 16] >> 4)   | (((qh_c[j + 16] >> shift) & 0x0C) << 2);
+
+    const int mn = (extra >> (4 * ib64 + g)) & 1;
+    return d * (float)sl[4 * ib64 + g] * (float)((int)iq6nl_lut_dev[q] - 128 + mn);
 }
 
 /* IQ4_NL dequant: 32 values in 18 bytes, same layout as Q4_0.

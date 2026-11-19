@@ -21,6 +21,7 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
         case GGUF_TYPE_Q4_K: bytes_per_block = GPU_BLOCK_Q4_K_SIZE; break;  /* 144 */
         case 13:             bytes_per_block = GPU_BLOCK_Q5_K_SIZE; break;  /* Q5_K: 176 */
         case 14:             bytes_per_block = GPU_BLOCK_Q6_K_SIZE; break;  /* Q6_K: 210 */
+        case 141:            bytes_per_block = GPU_BLOCK_IQ6_K_SIZE; break; /* IQ6_K: 212 */
         case 41:             bytes_per_block = 18; break;      /* Q1_0 */
         case 42:             bytes_per_block = 34; break;      /* Q2_0 */
         case GGUF_TYPE_IQ4_NL: bytes_per_block = GPU_BLOCK_Q4_0_SIZE; break;  /* IQ4_NL: 18 */
@@ -164,6 +165,23 @@ picolm_quant_matmul(float *y, const float *x, const void *weights,
                 for (int j = 0; j < 256; j++) {
                     int i = bi * 256 + j;
                     sum += x[rs*s+i] * dequant_q5_K(blk, j);
+                }
+            }
+        }
+        break;
+
+    case 141: /* GGUF_TYPE_IQ6_K -- non-linear 6-bit, 212 bytes per 256 values.
+               * This case is what makes IQ6_K work at S>1: the decode GEMV only
+               * covers S==1, and without a per-element dequant here prefill and
+               * every S>1 matmul fell into the `default:` branch below, which
+               * ZEROES the output and poisons the whole run. */
+        {
+            int n_blocks = I / 256;
+            for (int bi = gpuThreadIdx_x; bi < n_blocks; bi += gpuBlockDim_x) {
+                const void *blk = wrow + (size_t)bi * bytes_per_block;
+                for (int j = 0; j < 256; j++) {
+                    int i = bi * 256 + j;
+                    sum += x[rs*s+i] * dequant_iq6_K(blk, j);
                 }
             }
         }
@@ -1221,13 +1239,7 @@ picolm_q2_K_gemv(float *y,
  * adding one is a new CUDA/HIP surface for a 64-byte table. A __device__ array
  * is handled identically by nvcc and hipcc, and the kernel is bandwidth-bound
  * on the weights anyway, so the caching difference does not matter. */
-__device__ const uint8_t g_iq6nl_lut[64] = {
-     1,   7,  13,  19,  24,  30,  35,  40,  44,  49,  54,  58,  62,  66,  70,  74,
-    77,  81,  84,  88,  91,  94,  97, 100, 103, 106, 109, 112, 115, 117, 120, 123,
-   126, 128, 131, 134, 137, 140, 142, 145, 148, 151, 155, 158, 161, 164, 168, 172,
-   175, 179, 183, 187, 191, 196, 200, 205, 210, 215, 220, 226, 231, 237, 243, 249,
-};
-
+/* LUT comes from backend_gpu_dequant.cuh (iq6nl_lut_dev). */
 #define IQ6K_VALS_PER_SB  64
 /* one thread per 16-value group: 4 groups per 64-value sub-block, so 16
  * threads cover a whole super-block (4 sub-blocks x 4 groups) */
@@ -1280,17 +1292,27 @@ picolm_iq6_K_gemv(float *y,
         /* q8 for this 16-value group sits at grp_id*16 within the super-block */
         const int8_t *q8 = xq + (size_t)sb * 256 + (size_t)grp_id * 16;
 
+        /* Hoist everything that depends only on g out of the loop: the previous
+         * version ran a 4-way `if (g == ...)` chain on every one of the 16
+         * elements, which measured 376 GB/s against the ~800 the other K-quant
+         * GEMVs reach. Only two things vary with g -- the qs byte offset
+         * (0 or 16), the nibble selector, and the qh bit field -- so the loop
+         * below is straight-line with no branch. */
+        const int   qs_off = (g & 1) ? 16 : 0;      /* q2/q4 read +16      */
+        const int   nib_sh = (g & 2) ? 4 : 0;       /* q3/q4 high nibble   */
+        const int   hi_msk = (g & 2) ? 0x0C : 0x03; /* qh bits 2-3 or 0-1  */
+        const int   hi_sh  = (g & 2) ? 2 : 4;       /* shift into bits 4-5 */
+        const uint8_t *qs_g = qs_c + qs_off;
+        const uint8_t *qh_g = qh_c + qs_off;
+
         int acc = 0;
         for (int l = 0; l < 16; l += 4) {
             int8_t w4[4];
             for (int t = 0; t < 4; t++) {
                 const int j = l + t;
-                int q;
-                if (g == 0)      q = (qs_c[j]      & 0x0F) | (((qh_c[j] >> shift) & 0x03) << 4);
-                else if (g == 1) q = (qs_c[j + 16] & 0x0F) | (((qh_c[j + 16] >> shift) & 0x03) << 4);
-                else if (g == 2) q = (qs_c[j]      >> 4)   | (((qh_c[j] >> shift) & 0x0C) << 2);
-                else             q = (qs_c[j + 16] >> 4)   | (((qh_c[j + 16] >> shift) & 0x0C) << 2);
-                w4[t] = (int8_t)((int)g_iq6nl_lut[q] - 128 + mn);
+                const int q = ((qs_g[j] >> nib_sh) & 0x0F)
+                            | (((qh_g[j] >> shift) & hi_msk) << hi_sh);
+                w4[t] = (int8_t)((int)iq6nl_lut_dev[q] - 128 + mn);
             }
             int aA = gemv_get_int_b2(q8 + l, 0);
             int wAi;

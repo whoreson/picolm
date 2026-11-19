@@ -58,6 +58,7 @@
 #include <stdlib.h>  /* alloca() in <stdlib.h> on FreeBSD */
 #endif
 
+#include "type_dispatch.h"   /* type_info_table: not GPU-specific, needed by model_load */
 #ifdef PICOLM_GPU
 #include "backend_gpu.h"
 #ifdef PICOLM_CUDA
@@ -1822,18 +1823,19 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
 
     if (allocate_run_state(m, kv_type_k, kv_type_v, k_cache_hadamard, v_cache_hadamard, n_threads) != 0) return -1;
 
-    /* ---- SSM alpha/beta must be a type the GEMM path can consume ----
+    /* ---- SSM alpha/beta must be a type matmul_batch can actually run ----
      * ssm_alpha / ssm_beta feed a recurrence whose error compounds over every
-     * later token, so they are the wrong tensors to quantise aggressively, and
-     * ssm_alphabeta_gemm() funnels them through matmul_batch(), which only has
-     * kernels for a subset of types. When it declines, the fallback is one
-     * scalar dot per (token, head) -- on a 27B that was 11879 ms of a 19.9 s
-     * prefill -- and the run then usually dies further down with a confusing
-     * "GPU SSM recurrence failed" instead of naming the real problem.
+     * later token, so they are the wrong tensors to quantise aggressively; and
+     * when matmul_batch has no kernel for their type, ssm_alphabeta_gemm()
+     * declines and the fallback is one scalar dot per (token, head) -- on a 27B
+     * that measured 11879 ms of a 19.9 s prefill -- before the run usually
+     * dies further down with an unrelated "GPU SSM recurrence failed".
      *
-     * F32 and Q8_0 are both legitimate (Qwen3.5-9B ships Q8_0 ssm_alpha and
-     * works), so this only rejects types matmul_batch cannot handle. It is a
-     * load-time guard so the diagnosis arrives before minutes of prefill. */
+     * The accepted set is "does type_info_table have an entry for this type",
+     * i.e. exactly the predicate matmul_batch itself uses, rather than a
+     * hardcoded list. That matters: F32, BF16 AND Q8_0 are all legitimate here
+     * (Qwen3.6-27B ships bf16 ssm_alpha/beta, Qwen3.5-9B ships Q8_0, both
+     * work), and each hand-written list I tried wrongly rejected one. */
     {
     model_config_t *cfg = &m->config;
     if (cfg->has_ssm) {
@@ -1842,28 +1844,25 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
         const char *bad_name = NULL;
         for (int l = 0; l < cfg->n_layers; l++) {
             layer_weights_t *lw = &m->weights.layers[l];
-            gguf_type_t ta = lw->ssm_alpha ? lw->type_ssm_alpha : GGUF_TYPE_F32;
-            gguf_type_t tb = lw->ssm_beta  ? lw->type_ssm_beta  : GGUF_TYPE_F32;
-            int ok_a = (ta == GGUF_TYPE_F32 || ta == GGUF_TYPE_Q8_0 || ta == GGUF_TYPE_Q4_0);
-            int ok_b = (tb == GGUF_TYPE_F32 || tb == GGUF_TYPE_Q8_0 || tb == GGUF_TYPE_Q4_0);
-            if (lw->ssm_alpha && !ok_a) { bad_layer = l; bad_type = ta; bad_name = "ssm_alpha"; break; }
-            if (lw->ssm_beta  && !ok_b) { bad_layer = l; bad_type = tb; bad_name = "ssm_beta";  break; }
+            if (lw->ssm_alpha && !typeinfo(lw->type_ssm_alpha)) {
+                bad_layer = l; bad_type = lw->type_ssm_alpha; bad_name = "ssm_alpha"; break;
+            }
+            if (lw->ssm_beta && !typeinfo(lw->type_ssm_beta)) {
+                bad_layer = l; bad_type = lw->type_ssm_beta; bad_name = "ssm_beta"; break;
+            }
         }
         if (bad_layer >= 0) {
             fprintf(stderr,
-                "ERROR: blk.%d.%s is %s (type %d), which matmul_batch has no kernel for.\n"
-                "  ssm_alpha / ssm_beta drive a recurrence whose error compounds across every\n"
-                "  later token, so they must stay at F32 (preferred) or Q8_0 at most.\n"
-                "  Falling through would silently use a ~100x slower scalar path and then\n"
-                "  usually abort with an unrelated SSM error, so the model is refused here.\n"
-                "  Re-create the GGUF with, e.g.\n"
+                "ERROR: blk.%d.%s has type %d (%s), which PicoLM has no matmul kernel\n"
+                "  for at all. ssm_alpha / ssm_beta drive a recurrence whose error compounds\n"
+                "  across every later token, so they must stay high precision: F32, BF16 and\n"
+                "  Q8_0 are all supported. Re-create the GGUF with, e.g.\n"
                 "    llama-quantize --custom-q '.*ssm_(alpha|beta).*=f32' ...\n",
-                bad_layer, bad_name, gguf_type_name(bad_type), (int)bad_type);
+                bad_layer, bad_name, (int)bad_type, gguf_type_name(bad_type));
             return -1;
         }
     }
     }
-
 
     /* Repack Q4_0 tensors to Q4_0x8 for AVX2 SIMD optimization.
      * Only repack tensors where nrows % 8 == 0 and ncols % 32 == 0. */

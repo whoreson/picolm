@@ -1663,9 +1663,13 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
      * so without this an IQ6_K tensor simply declines (returns 0) and the
      * caller falls back to the CPU. */
     if (t->qtype == GGUF_TYPE_IQ6_K && S >= 1 && O >= 8 && I % 256 == 0) {
+        /* S==1 -> the purpose-built GEMV. Anything else falls through to the
+         * generic picolm_quant_matmul below, which now has a case 141
+         * per-element dequant. (An earlier version returned 0 here, which
+         * looked safe but silently disabled IQ6_K for ALL of prefill: the
+         * dequant case could never be reached.) */
         if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 141))
             return 1;
-        return 0;
     }
 
     if (t->qtype == GGUF_TYPE_Q2_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8 && I % 256 == 0) {
