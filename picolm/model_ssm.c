@@ -2608,7 +2608,13 @@ void ssm_forward(model_t *m, run_state_t *s, float *x, float *residual,
          * host, which produced cudaErrorIllegalAddress (700) and then a cascade
          * of bogus OOMs. Requiring kv_active makes the CPU path run normally
          * instead -- the soft fallback. */
-        if (m->gpu.ssm_state_dev[il] && m->gpu.kv_active) {
+        /* PICOLM_NGL hybrid split: a device SSM state buffer may exist (it is
+         * pre-allocated for every SSM layer) while THIS layer was moved to the
+         * CPU. Running the device recurrence then makes VRAM the sole writer of
+         * state the host also owns, which is the corruption the comment below
+         * describes. The layer must be inside the GPU range as well. */
+        if (m->gpu.ssm_state_dev[il] && m->gpu.kv_active &&
+            (m->gpu.n_gpu_layers <= 0 || il < m->gpu.n_gpu_layers)) {
             /* m->gpu.ssm_state_dev[il] is the ONLY up-to-date copy of this
              * layer's recurrence state once GPU-native decode is running:
              * picolm_gpu_ssm_recurrence_dev() deliberately never D2H's the
@@ -5325,8 +5331,12 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
      * per-layer figure meaningful (it is the average layer cost). */
     double _gpu_layer_t0 = ssm_now_ms();
 
-    /* 2. Per-layer pipeline */
-    for (int l = 0; l < c->n_layers; l++) {
+    /* 2. Per-layer pipeline. Only layers [0, n_gpu_layers) run here; the tail
+     * is handed to the CPU after the loop (PICOLM_NGL hybrid split). With full
+     * offload n_gpu_layers == c->n_layers and this is unchanged. */
+    int n_gpu_layers = gw->n_gpu_layers;
+    if (n_gpu_layers <= 0 || n_gpu_layers > c->n_layers) n_gpu_layers = c->n_layers;
+    for (int l = 0; l < n_gpu_layers; l++) {
         if (l > 0 && (l % batch_flush_interval) == 0) {
             picolm_gpu_batch_end(gpu_dev);
             picolm_gpu_batch_begin(gpu_dev);
@@ -5701,6 +5711,25 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
      * at this point split the pipeline in two and cost ~9% of decode speed
      * while measuring nothing extra. */
 
+    /* 2b. HYBRID SPLIT: hand the residual to the CPU for layers
+     * [n_gpu_layers, n_layers). One D2H of `dim` floats (20 KB at 5120) and a
+     * single model_forward_range() call that skips the embedding (the residual
+     * is already in s->x) and returns the residual unnormalised. The CPU run
+     * derives its own KV ordinal from the layer index, so the two backends
+     * never share a row.
+     *
+     * This is the ONLY transfer in the split: each backend keeps the KV of the
+     * layers it runs, the way llama.cpp shards the cache per layer onto that
+     * layer's buffer. */
+    if (n_gpu_layers < c->n_layers) {
+        picolm_gpu_memcpy(s->x, pipe_x, (size_t)dim * sizeof(float), -1, gpu_dev);
+        model_forward_range(m, token, pos, n_gpu_layers,
+                            c->n_layers - c->n_mtp_layers, 0, 0);
+        /* Residual is in s->x; the tail's final norm + projection are the
+         * caller's job, so jump straight to them. */
+        goto hybrid_tail_output;
+    }
+
     /* 3. Output projection on GPU: pipe_logits = output_weights @ pipe_x
      * Keep the matmul on device to avoid the D2H+H2D round-trip of the
      * hidden state. Only the final logits (vocab_size floats) need to
@@ -5756,6 +5785,22 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
             _gpu_bench_emit(_bl, 0, _per_layer, 0, 0);
     }
 
+    goto decode_done;
+
+hybrid_tail_output:
+    /* CPU tail: final norm + output projection on the host, using the same
+     * code model_forward() uses so the two paths cannot diverge. */
+    if (s->output_norm_b) {
+        layernorm(s->x, s->x, s->output_norm_w, s->output_norm_b, dim, c->rms_norm_eps);
+    } else {
+        rmsnorm(s->x, s->x, s->output_norm_w, dim, c->rms_norm_eps);
+    }
+    tensor_set_repacked(m->repack_used[1] ? m->repack_buffers[1] : NULL);
+    tensor_set_gpu_tensor(NULL, 0);   /* host output projection */
+    matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
+    tensor_set_repacked(NULL);
+
+decode_done:
     if (getenv("PICOLM_DBG_LOGITS")) {
         int top_idx[20] = {0};
         float top_val[20] = {0};
@@ -5823,7 +5868,11 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
     // Without push descriptors (WDDM), flush every 8 layers to balance TDR risk vs overhead
     int batch_flush_interval = picolm_gpu_has_push_descriptors() ? c->n_layers : 8;
     picolm_gpu_batch_begin(gpu_dev);
-    for (int l = 0; l < c->n_layers; l++) {
+    /* GPU range only (PICOLM_NGL hybrid split); the tail runs on the CPU
+     * inside model_forward_prefill_gpu's caller. Full offload => unchanged. */
+    int n_gpu_layers = gw->n_gpu_layers;
+    if (n_gpu_layers <= 0 || n_gpu_layers > c->n_layers) n_gpu_layers = c->n_layers;
+    for (int l = 0; l < n_gpu_layers; l++) {
         if (l > 0 && (l % batch_flush_interval) == 0) {
             picolm_gpu_batch_end(gpu_dev);
             picolm_gpu_batch_begin(gpu_dev);

@@ -253,6 +253,12 @@ typedef struct {
     void *ssm_head_map_dev;               /* device copy of forward head_map: natural->GGUF [n_v_heads] */
     void *ssm_head_invmap_dev;            /* device copy of inverse head_map: GGUF->natural [n_v_heads] */
     int n_gpu_layers;                     /* -ngl: layers 0..n-1 on GPU, rest on CPU (0=-1=all) */
+    /* Number of ATTENTION layers inside the GPU range [0, n_gpu_layers). The
+     * device KV cache is sized for this many and indexed by an ordinal that
+     * counts attention layers within that range, so the GPU and the CPU never
+     * address the same row. Equals the model-wide attention count when
+     * n_gpu_layers covers everything. */
+    int gpu_kv_layers;
 } gpu_weights_t;
 #endif /* PICOLM_GPU */
 

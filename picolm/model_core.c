@@ -2105,8 +2105,27 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                      * it needs the forward loop to route layers >= n_gpu_layers
                      * through the CPU forward and to sync the residual stream
                      * across the boundary each token. */
+                    /* PICOLM_NGL hybrid split: the DECODE side is implemented
+                     * (GPU runs [0, n_gpu_layers), then model_forward_range()
+                     * takes the tail with the residual handed over by one D2H),
+                     * but the PREFILL side is not: model_forward_prefill() has
+                     * no layer-range entry point, so with ngl < n_layers the
+                     * CPU tail's KV never gets written during prefill and decode
+                     * then reads rows that were never filled. Observed as wrong
+                     * output at PICOLM_NGL=12 on SmolLM2 (garbage, no crash).
+                     *
+                     * Refuse the split until prefill can be ranged too, rather
+                     * than run half a pipeline. The groundwork (device KV sized
+                     * to the GPU range, n_gpu_layers honoured by the upload and
+                     * by both forward loops) stays in place and is exercised by
+                     * the full-offload path. */
                     if (m->gpu.n_gpu_layers > 0 && m->gpu.n_gpu_layers < c->n_layers) {
                         eligible = 0; el_reason = 11;
+                        fprintf(stderr,
+                            "INFO: PICOLM_NGL=%d/%d requested, but the hybrid split needs a\n"
+                            "      layer-ranged CPU prefill that does not exist yet; running on\n"
+                            "      the CPU. Full offload (PICOLM_NGL unset) works.\n",
+                            m->gpu.n_gpu_layers, c->n_layers);
                     }
                     /* KV cache types the device attention kernels can read.
                      * F16, Q8_0 and Q4_0 have device dequant paths (kv_block_bytes()
@@ -2137,10 +2156,21 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                     if (eligible) {
                         /* Compute KV cache sizes matching CPU allocation */
                         int kv_layers = 0;
+                        /* Only attention layers in the GPU range get a device KV
+                         * entry (PICOLM_NGL hybrid). n_gpu_layers was resolved
+                         * above; when it covers the whole model this counts every
+                         * attention layer, i.e. exactly the old behaviour. */
+                        int gpu_kv_layers = 0;
                         for (int l = 0; l < c->n_layers; l++) {
-                            if (m->weights.layers[l].is_attn_layer) kv_layers++;
+                            if (!m->weights.layers[l].is_attn_layer) continue;
+                            if (l < m->gpu.n_gpu_layers) gpu_kv_layers++;
+                            kv_layers++;
                         }
-                        if (kv_layers == 0) kv_layers = c->n_layers;
+                        if (kv_layers == 0) { kv_layers = c->n_layers; gpu_kv_layers = c->n_layers; }
+                        /* The device cache is indexed by an ordinal that counts
+                         * attention layers WITHIN the GPU range, so it starts at
+                         * 0 rather than at the model-wide count. */
+                        m->gpu.gpu_kv_layers = gpu_kv_layers;
 
                         /* Per-layer: max_seq_len * kv_row_size_*, where kv_row_size
                          * already encodes the storage type (F16 = 2 bytes/element,
@@ -2151,8 +2181,8 @@ int model_load(model_t *m, const char *path, int max_seq_len, kv_cache_type_t kv
                         run_state_t *rs = &m->state;
                         size_t layer_bytes_k = (size_t)c->max_seq_len * rs->kv_row_size_k;
                         size_t layer_bytes_v = (size_t)c->max_seq_len * rs->kv_row_size_v;
-                        size_t total_k = (size_t)kv_layers * layer_bytes_k;
-                        size_t total_v = (size_t)kv_layers * layer_bytes_v;
+                        size_t total_k = (size_t)gpu_kv_layers * layer_bytes_k;
+                        size_t total_v = (size_t)gpu_kv_layers * layer_bytes_v;
 
                         if (picolm_gpu_kv_alloc(total_k, total_v, device)) {
                             /* Tell the cache how its rows are laid out. If the
