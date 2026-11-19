@@ -572,6 +572,14 @@ static void viz_span_end(int layer, int last_pos) {
     atomic_fetch_add_explicit(&viz_ring.gen, 1u, memory_order_release);
 }
 
+/* Cheap predicate so a caller that would have to do real work to produce the
+ * row (e.g. a D2H copy out of GPU memory) can skip it entirely when nobody is
+ * watching. The push_* functions already no-op when inactive, but they need
+ * the data pointer to exist first. */
+int viz_active(void) {
+    return atomic_load_explicit(&viz_ring.active, memory_order_relaxed) ? 1 : 0;
+}
+
 void viz_push_row(int layer, int pos, const float *data, int n_embd) {
     if (!atomic_load_explicit(&viz_ring.active, memory_order_relaxed)) return;
     if (layer < 0 || layer >= VIZ_MAX_LAYERS || pos < 0 || !data) return;

@@ -63,6 +63,12 @@ int  viz_init(int width, int height, int port);
  * Cheap no-op unless viz_init() succeeded.                            */
 void viz_push_row(int layer, int pos, const float *data, int n_embd);
 
+/* 1 when the visualization ring is live (viz_init() succeeded and nobody has
+ * torn it down). Use this to avoid gathering data that would then be thrown
+ * away -- notably a device-to-host copy of the residual stream on the GPU
+ * path. Returns 0 when PicoLM was built without PICOLM_VIZ. */
+int  viz_active(void);
+
 /* Push a whole prefill batch: `x_batch` is [n_tokens][n_embd] row-major,
  * row i = absolute position start_pos+i, the residual after `layer`.
  * Prefill advances the whole batch one layer at a time, so call this once

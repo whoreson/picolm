@@ -2,6 +2,9 @@
 #include "tensor.h"
 #include "quant.h"
 #include "model_internal.h"
+#ifdef PICOLM_VIZ
+#include "viz.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #ifdef PICOLM_GPU
@@ -5314,6 +5317,14 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
 
     int this_attn_ordinal = 0;
 
+    /* Timing for --benchmark. Same reasoning as the prefill path: every layer
+     * enqueues work on one stream and nothing completes until the single
+     * end-of-pass sync, so a per-layer wall clock would measure launch cost,
+     * not execution. Measure the whole layer loop and split it evenly -- that
+     * is what the prefill path already does, and it keeps the reported
+     * per-layer figure meaningful (it is the average layer cost). */
+    double _gpu_layer_t0 = ssm_now_ms();
+
     /* 2. Per-layer pipeline */
     for (int l = 0; l < c->n_layers; l++) {
         if (l > 0 && (l % batch_flush_interval) == 0) {
@@ -5672,6 +5683,30 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
             /* P. Residual add: pipe_x += pipe_xb */
             picolm_gpu_residual_add(pipe_x, pipe_x, pipe_xb, 1, dim, q_pipeline_dim, gpu_dev);
         } /* end if (!did_cpu_ssm) */
+
+#ifdef PICOLM_VIZ
+        /* Residual stream after this layer, for the VNC visualization.
+         * pipe_x lives in VRAM, so this is a D2H of one row -- hence the
+         * viz_active() guard: when nobody is attached we spend nothing. */
+        if (viz_active()) {
+            float *viz_row = picolm_gpu_staging_host(gpu_dev, (size_t)dim * sizeof(float));
+            if (viz_row && picolm_gpu_memcpy(viz_row, pipe_x, (size_t)dim * sizeof(float), -1, gpu_dev))
+                viz_push_row(l, pos, viz_row, dim);
+        }
+#endif
+    }
+
+    /* Close the layer loop's work and attribute it: one sync is enough, since
+     * everything is ordered on ctx->stream. Note batch_end is deliberately NOT
+     * called here -- the pre-existing one below (after the final norm) is the
+     * matching call for the batch_begin() above, and issuing two ends would be
+     * a real error on backends where batching is not a no-op (Vulkan). */
+    picolm_gpu_sync(gpu_dev);
+    {
+        double _total = ssm_now_ms() - _gpu_layer_t0;
+        double _per_layer = (c->n_layers > 0) ? _total / (double)c->n_layers : 0.0;
+        for (int _bl = 0; _bl < c->n_layers; _bl++)
+            _gpu_bench_emit(_bl, 0, _per_layer, 0, 0);
     }
 
     /* 3. Output projection on GPU: pipe_logits = output_weights @ pipe_x
@@ -6319,6 +6354,26 @@ after_qkv:
             picolm_gpu_memcpy(tmp,bx+(size_t)(n_ubatch-1)*xb_stride,32,-1,gpu_dev);
             fprintf(stderr,"[GPU PFX l=%d] bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n",l,tmp[0],tmp[1],tmp[2],tmp[3]);
         }
+
+#ifdef PICOLM_VIZ
+        /* Residual stream after this layer for the whole ubatch, for the VNC
+         * visualization. bx is [n_ubatch][xb_stride] in VRAM, so this gathers
+         * each row into a tightly packed [n_tokens][n_embd] host buffer --
+         * only when somebody is actually watching. */
+        if (viz_active()) {
+            size_t row_bytes = (size_t)dim * sizeof(float);
+            float *viz_buf = (float *)malloc((size_t)n_ubatch * row_bytes);
+            if (viz_buf) {
+                for (int _vi = 0; _vi < n_ubatch; _vi++) {
+                    picolm_gpu_memcpy(viz_buf + (size_t)_vi * dim,
+                                      bx + (size_t)_vi * xb_stride,
+                                      row_bytes, -1, gpu_dev);
+                }
+                viz_push_batch(l, start_pos, viz_buf, n_ubatch, dim);
+                free(viz_buf);
+            }
+        }
+#endif
     }
     { char _ts_label[64]; snprintf(_ts_label, 64, "ALL_LAYERS_DONE"); picolm_gpu_ts_write(_ts_label); }
 
