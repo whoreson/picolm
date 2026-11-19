@@ -375,7 +375,7 @@ compat/snprintf_osf1_supplement.o: compat/snprintf_osf1_supplement.c compat/osf1
 # SSE3 intrinsics are broken in GCC 4.2's <emmintrin.h>; SSSE3+SSE4.1 work
 # via individual headers. __thread not supported.
 mac106:
-	$(MAKE) $(TARGET) CFLAGS="-O2 -g -std=c99 -D_GNU_SOURCE -Wall -msse4.1 -mssse3 -msse2 -DPICOLM_SSE3 -DPICOLM_SSE2" LDFLAGS="-lm -lpthread -fopenmp"
+	$(MAKE) $(TARGET) CFLAGS="-O2 -g -std=c99 -D_GNU_SOURCE -Wall -msse4.1 -mssse3 -msse2 -DPICOLM_SSE2" LDFLAGS="-lm -lpthread -fopenmp"
 
 # --- Debug build ---
 debug:

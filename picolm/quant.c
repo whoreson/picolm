@@ -2837,6 +2837,41 @@ static inline __m256i get_scale_shuffle_q2k(int shift) {
 }
 #endif
 
+/* GCC 4.2.1 (Mac OS X 10.6) ICEs when _mm_maddubs_epi16 and _mm_cvtepi32_ps
+ * appear in the same function. Split the SSE4.1 conversion into a separate
+ * inline to avoid the compiler bug. */
+#if defined(PICOLM_SSSE3) && defined(__SSE4_1__) && \
+    defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ <= 2
+static PICOLM_NOINLINE __m128 ssse3_cvtepi32_ps(__m128i a) {
+    return _mm_cvtepi32_ps(a);
+}
+static PICOLM_NOINLINE __m128 ssse3_cvtepi32_ps_add(__m128i a, __m128i b) {
+    return _mm_add_ps(_mm_cvtepi32_ps(a), _mm_cvtepi32_ps(b));
+}
+/* Q1_0 SSSE3 block: expand 32 sign bits into sign masks, maddubs with Q8_0,
+ * reduce to int32 sum. Returned as int32x4 to avoid _mm_cvtepi32_ps in the
+ * caller (which would ICE with _mm_maddubs_epi16 in the same function). */
+static PICOLM_NOINLINE __m128i ssse3_q1_block(const uint32_t *qs32, int qs_off,
+        const int8_t *qy_base, const __m128i byte_shuf,
+        const __m128i bit_masks, const __m128i zero,
+        const __m128i ones_8, const __m128i ones_16) {
+    __m128i qs16 = _mm_cvtsi32_si128((int)qs32[qs_off / 4]);
+    __m128i rep_lo = _mm_shufflelo_epi16(qs16, 0);
+    __m128i sm0 = _mm_cmpeq_epi8(
+        _mm_and_si128(_mm_shuffle_epi8(rep_lo, byte_shuf), bit_masks), zero);
+    __m128i rep_hi = _mm_shufflelo_epi16(qs16, 0x11);
+    __m128i sm1 = _mm_cmpeq_epi8(
+        _mm_and_si128(_mm_shuffle_epi8(rep_hi, byte_shuf), bit_masks), zero);
+    __m128i qy0 = _mm_loadu_si128((const __m128i *)qy_base);
+    __m128i qy1 = _mm_loadu_si128((const __m128i *)(qy_base + 16));
+    __m128i sy0 = _mm_sub_epi8(_mm_xor_si128(qy0, sm0), sm0);
+    __m128i sy1 = _mm_sub_epi8(_mm_xor_si128(qy1, sm1), sm1);
+    __m128i sum_0 = _mm_madd_epi16(_mm_maddubs_epi16(ones_8, sy0), ones_16);
+    __m128i sum_1 = _mm_madd_epi16(_mm_maddubs_epi16(ones_8, sy1), ones_16);
+    return _mm_add_epi32(sum_0, sum_1);
+}
+#endif
+
 /* vec_dot_q4_K_q8_K: int8 MAC for Q4_K weights * Q8_K input
  * Adapted from llama.cpp's ggml_vec_dot_q4_K_q8_K (AVX2, AVX1, NEON, scalar)
  * The key optimization: nibble extraction to int8, int8 MAC with
@@ -2958,7 +2993,11 @@ float vec_dot_q4_K_q8_K(const void *src_q4, const void *src_q8, int n) {
         const __m128i q8sums_1 = _mm_loadu_si128((const __m128i*)&y[i].bsums[8]);
         const __m128i q8s = _mm_hadd_epi16(q8sums_0, q8sums_1);
         const __m128i prod = _mm_madd_epi16(mins128, q8s);
+#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ <= 2
+        acc_m = _mm_add_ps(_mm_mul_ps(_mm_set1_ps(dmin), ssse3_cvtepi32_ps(prod)), acc_m);
+#else
         acc_m = _mm_add_ps(_mm_mul_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(prod)), acc_m);
+#endif
 
         __m128i sumi_0 = _mm_setzero_si128();
         __m128i sumi_1 = _mm_setzero_si128();
@@ -3042,7 +3081,11 @@ float vec_dot_q4_K_q8_K(const void *src_q4, const void *src_q8, int n) {
         const __m128i q8sums_1 = _mm_loadu_si128((const __m128i*)&y[i].bsums[8]);
         const __m128i q8s = _mm_hadd_epi16(q8sums_0, q8sums_1);
         const __m128i prod = _mm_madd_epi16(mins128, q8s);
+#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ <= 2
+        acc_m = _mm_add_ps(_mm_mul_ps(_mm_set1_ps(dmin), ssse3_cvtepi32_ps(prod)), acc_m);
+#else
         acc_m = _mm_add_ps(_mm_mul_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(prod)), acc_m);
+#endif
 
         __m128i sumi_0 = _mm_setzero_si128();
         __m128i sumi_1 = _mm_setzero_si128();
@@ -3081,7 +3124,11 @@ float vec_dot_q4_K_q8_K(const void *src_q4, const void *src_q8, int n) {
         }
 
         const __m128 vd = _mm_set1_ps(d);
+#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ <= 2
+        __m128 sf = ssse3_cvtepi32_ps_add(sumi_0, sumi_1);
+#else
         __m128 sf = _mm_add_ps(_mm_cvtepi32_ps(sumi_0), _mm_cvtepi32_ps(sumi_1));
+#endif
         acc = _mm_add_ps(acc, _mm_mul_ps(vd, sf));
     }
 
@@ -6617,10 +6664,13 @@ float vec_dot_q1_0_q8_0(const void *vx, const void *wy, int n) {
         sumf = hsum_avx(acc);
         return sumf;
     }
-#elif defined(PICOLM_SSE3)
+#elif defined(PICOLM_SSSE3)
     /* SSSE3 path: 128-bit bit expansion + 128-bit maddubs (SSE4.1).
      * Uses 4 independent __m128 accumulators for the 4 Q8_0 sub-blocks.
-     * Ported from llama.cpp. */
+     * Ported from llama.cpp.
+     * GCC 4.2.1 ICEs when _mm_maddubs_epi16 and _mm_cvtepi32_ps are in the
+     * same function, so we use helper functions that isolate the SSE4.1
+     * conversion in a separate compilation unit scope. */
     {
         float sumf;
         const __m128i ones_8  = _mm_set1_epi8(1);
@@ -6640,7 +6690,23 @@ float vec_dot_q1_0_q8_0(const void *vx, const void *wy, int n) {
             __m128 d0 = _mm_set1_ps(fp16_to_fp32_lookup(x[ib].d));
             const uint32_t *qs32 = (const uint32_t *)x[ib].qs;
             const block_q8_0 *yp = &y[ib * 4];
-
+#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ <= 2
+            /* GCC 4.2.1: use helper to avoid ICE with maddubs+cvtepi32_ps */
+            {
+                __m128i s0 = ssse3_q1_block(qs32, 0, yp[0].qs, byte_shuf, bit_masks, zero, ones_8, ones_16);
+                __m128i s1 = ssse3_q1_block(qs32, 4, yp[1].qs, byte_shuf, bit_masks, zero, ones_8, ones_16);
+                __m128i s2 = ssse3_q1_block(qs32, 8, yp[2].qs, byte_shuf, bit_masks, zero, ones_8, ones_16);
+                __m128i s3 = ssse3_q1_block(qs32, 12, yp[3].qs, byte_shuf, bit_masks, zero, ones_8, ones_16);
+                __m128 q0 = ssse3_cvtepi32_ps(s0);
+                __m128 q1 = ssse3_cvtepi32_ps(s1);
+                __m128 q2 = ssse3_cvtepi32_ps(s2);
+                __m128 q3 = ssse3_cvtepi32_ps(s3);
+                acc_0 = _mm_add_ps(acc_0, _mm_mul_ps(_mm_mul_ps(d0, _mm_set1_ps(fp16_to_fp32_lookup(yp[0].d))), q0));
+                acc_1 = _mm_add_ps(acc_1, _mm_mul_ps(_mm_mul_ps(d0, _mm_set1_ps(fp16_to_fp32_lookup(yp[1].d))), q1));
+                acc_2 = _mm_add_ps(acc_2, _mm_mul_ps(_mm_mul_ps(d0, _mm_set1_ps(fp16_to_fp32_lookup(yp[2].d))), q2));
+                acc_3 = _mm_add_ps(acc_3, _mm_mul_ps(_mm_mul_ps(d0, _mm_set1_ps(fp16_to_fp32_lookup(yp[3].d))), q3));
+            }
+#else
 #define Q1_SSSE3_BLOCK(QS_OFF, Y_IDX, ACC) \
             { \
                 __m128i qs16 = _mm_cvtsi32_si128((int)qs32[QS_OFF / 4]); \
@@ -6667,6 +6733,7 @@ float vec_dot_q1_0_q8_0(const void *vx, const void *wy, int n) {
             Q1_SSSE3_BLOCK(8, 2, acc_2)
             Q1_SSSE3_BLOCK(12, 3, acc_3)
 #undef Q1_SSSE3_BLOCK
+#endif
         }
         sumf = hsum_sse(_mm_add_ps(_mm_add_ps(acc_0, acc_1), _mm_add_ps(acc_2, acc_3)));
         return sumf;

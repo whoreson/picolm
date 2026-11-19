@@ -32,7 +32,18 @@
 #include <stdint.h>
 #include <assert.h>
 #if defined(__x86_64__) || defined(__i386__)
-#include <immintrin.h>
+#  if __GNUC__ >= 4 && __GNUC_MINOR__ >= 7
+#    include <immintrin.h>
+#  else
+#    include <xmmintrin.h>
+#    include <emmintrin.h>
+#    ifdef __SSSE3__
+#      include <tmmintrin.h>
+#    endif
+#    ifdef __SSE4_1__
+#      include <smmintrin.h>
+#    endif
+#  endif
 #endif
 #include "quant.h"
 #if defined(__AVX2__)

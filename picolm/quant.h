@@ -76,6 +76,15 @@
 #define PICOLM_ALWAYS_INLINE __attribute__((always_inline))
 #endif
 #endif
+/* PICOLM_NOINLINE: GCC __attribute__((noinline)) vs MSVC __declspec(noinline).
+ * Used as a compiler workaround (e.g. GCC 4.2.1 ICE on SSSE3+SSE4.1 combo). */
+#ifndef PICOLM_NOINLINE
+#if defined(_MSC_VER)
+#define PICOLM_NOINLINE __declspec(noinline)
+#else
+#define PICOLM_NOINLINE __attribute__((noinline))
+#endif
+#endif
 
 /* Atomic compatibility: GCC builtins vs MSVC Interlocked.
  * GCC 4.7+ has __atomic_fetch_add/__atomic_store_n natively.
@@ -2309,7 +2318,7 @@ __m256 picolm_exp256_ps(__m256 x);
  * overhead is noise; correctness on the target compiler wins.
  *
  * If you add another paired-singles asm kernel, mark it the same way. */
-#define PICOLM_PS_NOINLINE __attribute__((noinline))
+#define PICOLM_PS_NOINLINE PICOLM_NOINLINE
 
 void ps_init_gqr(void);
 PICOLM_PS_NOINLINE void ps_q8_row_dot(const int8_t *x, const int8_t *w, int n, float *out);

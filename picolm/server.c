@@ -65,9 +65,10 @@ typedef long long off_t;
 #include <signal.h>
 /* Very old macOS 10.4 SDK (GCC 4.0.x, no _DARWIN_C_SOURCE) didn't declare
  * signal() with -std=c99. Newer SDKs and iOS SDKs declare it properly.
- * Only provide our own declaration when _DARWIN_C_SOURCE is NOT defined. */
-#if defined(__APPLE__) && defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ <= 2 && !defined(_DARWIN_C_SOURCE)
-extern int signal(int signum, void (*handler)(int));
+ * Only provide our own declaration when _DARWIN_C_SOURCE is NOT defined
+ * AND the system header hasn't already declared it. */
+#if defined(__APPLE__) && defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ <= 2 && !defined(_DARWIN_C_SOURCE) && !defined(_SIGNAL_H_)
+extern void (*signal(int signum, void (*handler)(int)))(int);
 #endif
 #include <fcntl.h>
 #include <poll.h>
