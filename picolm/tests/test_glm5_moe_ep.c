@@ -51,9 +51,9 @@ static int run(int NT, int AK, int nth, int with_shexp, int exact) {
     memset(oA, 0xAB, (size_t)NT * D * 4); memset(oB, 0xCD, (size_t)NT * D * 4);
 
     double t0 = get_time_ms();
-    glm5_moe_ffn_batch_ref(m, &gw, &lw, s, cur, oA, NT);
+    glm5_moe_ffn_batch_ref(m, &gw, &lw, s, cur, oA, NT, 0);
     double t1 = get_time_ms();
-    int ran = glm5_moe_ffn_batch_ep(m, &gw, &lw, s, cur, oB, NT);
+    int ran = glm5_moe_ffn_batch_ep(m, &gw, &lw, s, cur, oB, NT, 0);
     double t2 = get_time_ms();
 
     int bad = !ran, nonfinite = 0; double dmax = 0, amax = 0;

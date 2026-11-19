@@ -89,6 +89,9 @@ static int test_hc(int NT, int nth, int is_attn) {
         glm5_hc_pre(m, &gw, is_attn, hc_x_t, cur_t, post_t, comb_t, s->glm5.hc_scratch);
         rmsnorm(cur_t, cur_t, nw, D, c->rms_norm_eps);
     }
+    /* decode sets g_hc_tag for every layer and never clears it: with diagnostics off the parallel path
+     * must still run (a stale tag used to force the serial loop in every server prefill) */
+    snprintf(g_hc_tag, sizeof g_hc_tag, "7");
     int ran = pf_run_hcpre(m, &gw, is_attn, NT, hxB, curB, resB, poB, coB, nw);
     int bad = !ran || memcmp(curA, curB, (size_t)NT*D*4) || memcmp(resA, resB, (size_t)NT*S*D*4) ||
               memcmp(poA, poB, (size_t)NT*S*4) || memcmp(coA, coB, (size_t)NT*S*S*4);

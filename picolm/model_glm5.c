@@ -3898,23 +3898,28 @@ enum { PF_HC_ATTN_PRE, PF_ATTN, PF_KDA_PROJ, PF_KDA_TAIL, PF_KDA_OUT,
        PF_HC_FFN_PRE, PF_FFN, PF_HC_FFN_POST, PF_LAYER, PF_N };
 static double g_pf_ms[2][PF_N];      /* [0] KDA / dense-attention layers, [1] MLA layers */
 static long   g_pf_layers[2];
-static int glm5_pfprof_on(void) {
+/* PICOLM_GLM5_PFPROF=1: summary at the end of every prefill call; =2: also one line per layer,
+ * printed (and flushed) as soon as the layer finishes. Neither depends on atexit() handlers. */
+static int glm5_pfprof_mode(void) {
     static int cached = -1;
-    if (cached < 0) { const char *e = getenv("PICOLM_GLM5_PFPROF"); cached = (e && atoi(e) > 0) ? 1 : 0; }
+    if (cached < 0) { const char *e = getenv("PICOLM_GLM5_PFPROF"); cached = e ? atoi(e) : 0; if (cached < 0) cached = 0; }
     return cached;
 }
+static int glm5_pfprof_on(void) { return glm5_pfprof_mode() > 0; }
+static double g_pf_cur[PF_N];       /* this layer's regions */
 static void glm5_pfprof_layer_line(int il, int kind) {
-    const double *v = g_pf_ms[kind];
-    double acc = v[PF_HC_ATTN_PRE] + v[PF_ATTN] + v[PF_KDA_PROJ] + v[PF_KDA_TAIL] + v[PF_KDA_OUT]
-               + v[PF_MLA_PROJ] + v[PF_MLA_KB] + v[PF_MLA_CORE] + v[PF_MLA_VB] + v[PF_MLA_OUT]
-               + v[PF_HC_ATTN_POST] + v[PF_HC_FFN_PRE] + v[PF_FFN] + v[PF_HC_FFN_POST];
-    fprintf(stderr, "PFPROF layer %2d %s %7.1f ms | hc_pre %6.1f  attn %7.1f", il, kind ? "MLA" : "KDA", v[PF_LAYER],
-            v[PF_HC_ATTN_PRE], v[PF_ATTN]);
-    if (!kind) fprintf(stderr, " (proj %6.1f tail %6.1f out %6.1f)", v[PF_KDA_PROJ], v[PF_KDA_TAIL], v[PF_KDA_OUT]);
-    else fprintf(stderr, " (proj %6.1f kb %6.1f core %6.1f vb %6.1f out %6.1f)", v[PF_MLA_PROJ], v[PF_MLA_KB], v[PF_MLA_CORE], v[PF_MLA_VB], v[PF_MLA_OUT]);
-    fprintf(stderr, "  hc_post %5.1f | hc_pre2 %6.1f  ffn %7.1f  hc_post2 %5.1f | unaccounted %6.1f\n",
-            v[PF_HC_ATTN_POST], v[PF_HC_FFN_PRE], v[PF_FFN], v[PF_HC_FFN_POST], v[PF_LAYER] - acc);
-    fflush(stderr);
+    if (glm5_pfprof_mode() >= 2) {
+        const double *v = g_pf_cur;
+        const double acc = v[PF_HC_ATTN_PRE] + v[PF_ATTN] + v[PF_HC_ATTN_POST] + v[PF_HC_FFN_PRE] + v[PF_FFN] + v[PF_HC_FFN_POST];
+        fprintf(stderr, "PFPROF layer %2d %s %7.1f ms | hc_pre %6.1f  attn %7.1f", il, kind ? "MLA" : "KDA", v[PF_LAYER],
+                v[PF_HC_ATTN_PRE], v[PF_ATTN]);
+        if (!kind) fprintf(stderr, " (proj %6.1f tail %6.1f out %6.1f)", v[PF_KDA_PROJ], v[PF_KDA_TAIL], v[PF_KDA_OUT]);
+        else fprintf(stderr, " (proj %6.1f kb %6.1f core %6.1f vb %6.1f out %6.1f)", v[PF_MLA_PROJ], v[PF_MLA_KB], v[PF_MLA_CORE], v[PF_MLA_VB], v[PF_MLA_OUT]);
+        fprintf(stderr, "  hc_post %5.1f | hc_pre2 %6.1f  ffn %7.1f  hc_post2 %5.1f | unaccounted %6.1f\n",
+                v[PF_HC_ATTN_POST], v[PF_HC_FFN_PRE], v[PF_FFN], v[PF_HC_FFN_POST], v[PF_LAYER] - acc);
+        fflush(stderr);
+    }
+    memset(g_pf_cur, 0, sizeof g_pf_cur);
 }
 static void glm5_pfprof_print(void) {
     static const char *nm[PF_N] = { "hc_pre (attn) + norm", "attention block", "  kda projections", "  kda tail (conv+state)",
@@ -3931,9 +3936,10 @@ static void glm5_pfprof_print(void) {
             fprintf(stderr, "  %-26s %9.2f ms  %5.1f%%\n", nm[r], v, 100.0 * v / tot);
         }
     }
+    memset(g_pf_ms, 0, sizeof g_pf_ms); memset(g_pf_layers, 0, sizeof g_pf_layers);
 }
 #define PFP_BEGIN(t) double t = glm5_pfprof_on() ? glm5_prof_now() : 0.0
-#define PFP_END(t, kind, r) do { if (t) g_pf_ms[kind][r] += glm5_prof_now() - t; } while (0)
+#define PFP_END(t, kind, r) do { if (t) { const double _d = glm5_prof_now() - (t); g_pf_ms[kind][r] += _d; g_pf_cur[r] += _d; } } while (0)
 
 typedef struct {
     const model_t *m; const glm5_layer_weights_t *gw; int is_attn;
@@ -3950,12 +3956,23 @@ static void pf_hcpre_task(int t, void *vp) {
     glm5_hc_pre(x->m, x->gw, x->is_attn, hc_x_t, cur_t, post_t, comb_t, x->scr_b + (size_t)t * ((size_t)S * D + x->M));
     rmsnorm(cur_t, cur_t, x->norm_w, D, x->eps);
 }
+/* The per-stage hc diagnostics (stats, layer dumps) are emitted per call, so they need the serial
+ * loop. Decide that from the environment, NOT from g_hc_tag: decode sets the tag for every layer
+ * and never clears it, so after the first generation (i.e. in any server, whose first request is
+ * a decode) the tag is stale, and gating on it forced every later prefill onto the serial hc_pre
+ * loop: ~20 ms per layer instead of ~2 at 128 tokens, 27% of the whole prefill. */
+static int glm5_hc_diag_wanted(void) {
+    static int cached = -1;
+    if (cached < 0)
+        cached = (glm5_stats_wanted() || getenv("PICOLM_DBG_DUMP_LAYER") || getenv("PICOLM_DBG_HCVEC")) ? 1 : 0;
+    return cached;
+}
 /* 1 if it ran in parallel; 0 if the caller must run the serial loop (diagnostics on, no memory). */
 static int pf_run_hcpre(const model_t *m, const glm5_layer_weights_t *gw, int is_attn, int n_tokens,
                         float *hc_x_b, float *cur_b, float *hc_res_b, float *post_b, float *comb_b,
                         const float *norm_w)
 {
-    if (g_hc_tag[0]) return 0;                    /* per-stage diagnostics are per call: stay serial */
+    if (glm5_hc_diag_wanted()) return 0;          /* per-stage diagnostics are per call: stay serial */
     const model_config_t *c = &m->config;
     const int S = c->glm5_hc, D = c->n_embd, M = (2 + S) * S;
     static float *scr; static size_t cap;
@@ -4637,6 +4654,8 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
              * chicken-and-egg that made prefill stats invisible. */
             if (glm5_stats_wanted() || getenv("PICOLM_DBG_DUMP_LAYER") || getenv("PICOLM_DBG_HCVEC"))
                 snprintf(g_hc_tag, sizeof(g_hc_tag), "%d", il);
+            else
+                g_hc_tag[0] = '\0';   /* decode leaves its tag set: do not let it force the serial path */
             if (!(glm5_pf_par() && pf_run_hcpre(m, gw, 1, n_tokens, hc_x_b, cur_b, hc_res_b, post_b, comb_b, s->attn_norm_w[il])))
             for (int t = 0; t < n_tokens; t++) {
                 float *hc_x_t = hc_x_b + (size_t)t*S*D;
@@ -5109,9 +5128,11 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                     fprintf(stderr, "GLM5 prefill: stopping after layer %d (PICOLM_STOP_LAYER)\n", il);
                 break;
             }
-            if (tLayer) { g_pf_ms[pfk][PF_LAYER] += glm5_prof_now() - tLayer; g_pf_layers[pfk]++; glm5_pfprof_layer_line(il, pfk); if (g_pf_layers[0] + g_pf_layers[1] == 1) atexit(glm5_pfprof_print); }
+            if (tLayer) { const double dl = glm5_prof_now() - tLayer; g_pf_ms[pfk][PF_LAYER] += dl; g_pf_cur[PF_LAYER] = dl; g_pf_layers[pfk]++; glm5_pfprof_layer_line(il, pfk); }
             BENCH_LAYER_END(il, 1);
         }
+
+        if (glm5_pfprof_on()) glm5_pfprof_print();
 
         /* ---- Final: mean over S streams -> RMSNorm -> output head ---- */
         {
