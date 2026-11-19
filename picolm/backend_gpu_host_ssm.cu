@@ -16,6 +16,7 @@ picolm_gpu_ssm_recurrence(float *state,
     if (d_state > 256) return 0;
 
     if (!gpu_ok(gpuSetDevice(device), "ssm device")) return 0;
+    g_gpu_selected_device = device;
     gpu_device_ctx_t *ctx = NULL;
     for (int i = 0; i < g_nctx; i++) {
         if (g_gpu_ctx[i].device == device) { ctx = &g_gpu_ctx[i]; break; }
@@ -148,6 +149,7 @@ picolm_gpu_ssm_recurrence_dev(void *ssm_state_dev,  /* in/out, device [n_v_heads
     if (!ssm_state_dev) return 0;
 
     if (!gpu_ok(gpuSetDevice(device), "ssm device")) return 0;
+    g_gpu_selected_device = device;
     gpu_device_ctx_t *ctx = NULL;
     for (int i = 0; i < g_nctx; i++) {
         if (g_gpu_ctx[i].device == device) { ctx = &g_gpu_ctx[i]; break; }
@@ -739,6 +741,7 @@ picolm_gpu_ssm_gated_norm(float *final_output,  /* out, host [head_v_dim * n_v_h
                            int device) {
     if (head_v_dim < 1 || n_v_heads < 1) return 0;
     if (!gpu_ok(gpuSetDevice(device), "ssm gn")) return 0;
+    g_gpu_selected_device = device;
     gpu_device_ctx_t *ctx = NULL;
     for (int i = 0; i < g_nctx; i++) {
         if (g_gpu_ctx[i].device == device) { ctx = &g_gpu_ctx[i]; break; }
@@ -939,6 +942,7 @@ picolm_gpu_ssm_vecdot(float *out_host,
     if (dim > PICOLM_SSM_VECDOT_MAX_DIM) return 0;
 
     if (!gpu_ok(gpuSetDevice(device), "ssm vecdot device")) return 0;
+    g_gpu_selected_device = device;
     gpu_device_ctx_t *ctx = NULL;
     for (int i = 0; i < g_nctx; i++) {
         if (g_gpu_ctx[i].device == device) { ctx = &g_gpu_ctx[i]; break; }

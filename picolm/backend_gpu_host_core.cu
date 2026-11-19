@@ -1,6 +1,12 @@
 // backend_gpu_host_core.cu - GPU initialization, memory, tensor, matmul, expert MLP
 #include "backend_gpu_kernels.cuh"
 
+/* PICOLM_GPU_PROF hooks (implemented in backend_gpu_host_misc.cu). */
+extern "C" int  picolm_gpu_prof_slot(const char *name);
+extern "C" void picolm_gpu_prof_begin(int device);
+extern "C" void picolm_gpu_prof_end(int slot);
+
+
 /* Win32 API forward declarations for CUDA_DEVICE_MAX_CONNECTIONS env var
  * management on Windows. Avoids pulling in <windows.h> (min/max/byte macro
  * pollution) into a .cu file compiled by nvcc with CUDA/C++ headers.
@@ -20,11 +26,21 @@ __global__ void picolm_q8_q8_matmul_imma_smw16(float *, const int8_t *, const fl
                                                 const void *, int, int, int, int, int);
 
 static void gpu_dispatch_print(const char *name) {
+    /* Called on EVERY kernel launch (~350 per decode token). Once all 64 slots
+     * are used there is provably nothing left to print, so bail immediately
+     * instead of running 64 strcmp()s per launch. This is not a micro
+     * optimisation: at 350 launches/token the scan alone was measurable next
+     * to the launch cost. */
     static char seen[64][64] = {0};
-    for (int i = 0; i < 64; i++) {
-        if (seen[i][0] == '\0') { snprintf(seen[i], 64, "%s", name); fprintf(stderr, "[GPU] kernel: %s\n", name); return; }
+    static int  filled = 0;
+    static int  full = 0;
+    if (full) return;
+    for (int i = 0; i < filled; i++) {
         if (strcmp(seen[i], name) == 0) return;
     }
+    snprintf(seen[filled], 64, "%s", name);
+    fprintf(stderr, "[GPU] kernel: %s\n", name);
+    if (++filled == 64) full = 1;
 }
 
 /* Cached PICOLM_NO_IMMA check. getenv() is O(n) in env list and not
@@ -35,8 +51,46 @@ static int picolm_gpu_no_imma(void) {
     return cached;
 }
 
+/* Same argument for the other per-launch switches. These are read on EVERY
+ * matmul dispatch -- ~350 launches per decode token -- and MSVC's getenv()
+ * walks the whole environment block with strcmp each time. Measured on the
+ * 4090: ~71 us of host CPU per launch, of which these getenv() calls were the
+ * dominant non-CUDA cost (a launch should be ~3-5 us). Cached once, exactly
+ * like PICOLM_NO_IMMA above.
+ *
+ * None of these are expected to change at runtime; an env var that could be
+ * toggled mid-process would be a different design. */
+static int picolm_gpu_env_flag(const char *name) {
+    return getenv(name) ? 1 : 0;
+}
+static int picolm_gpu_no_gemv(void) {
+    static int cached = -1;
+    if (cached < 0) cached = picolm_gpu_env_flag("PICOLM_NO_GEMV");
+    return cached;
+}
+static int picolm_gpu_no_sm_imma(void) {
+    static int cached = -1;
+    if (cached < 0) cached = picolm_gpu_env_flag("PICOLM_NO_SM_IMMA");
+    return cached;
+}
+static int picolm_gpu_force_f32(void) {
+    static int cached = -1;
+    if (cached < 0) cached = picolm_gpu_env_flag("PICOLM_FORCE_F32_MATMUL");
+    return cached;
+}
+static int picolm_gpu_no_fused_qkv(void) {
+    static int cached = -1;
+    if (cached < 0) cached = picolm_gpu_env_flag("PICOLM_NO_FUSED_QKV");
+    return cached;
+}
+
 gpu_device_ctx_t g_gpu_ctx[PICOLM_GPU_MAX_DEVICES];
 int g_nctx;
+
+/* Last device passed to gpuSetDevice() through select_ctx(). See the comment
+ * on select_ctx() in backend_gpu_common.cuh for why this is cached. Any code
+ * that calls gpuSetDevice() directly must reset this to -1. */
+int g_gpu_selected_device = -1;
 
 /* Mutex protecting g_gpu_ctx scratch buffer resize (reserve/reserve_pinned). */
 #ifdef _WIN32
@@ -232,6 +286,8 @@ int picolm_gpu_init(const int *devices, int count) {
 
 extern "C"
 void picolm_gpu_shutdown(void) {
+    /* Resolve and print PICOLM_GPU_PROF totals before tearing anything down. */
+    { extern void picolm_gpu_prof_report(void); picolm_gpu_prof_report(); }
     /* Free KV cache allocations */
     picolm_gpu_kv_free();
     /* Free pipeline buffers */
@@ -1235,7 +1291,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
     int I = t->I, O = t->O;
     int ys = y_stride > 0 ? y_stride : O;
 
-    if (t->qtype == GGUF_TYPE_Q8_0 && !getenv("PICOLM_FORCE_F32_MATMUL")) {
+    if (t->qtype == GGUF_TYPE_Q8_0 && !picolm_gpu_force_f32()) {
         int n_blocks = I / 32;
         if (n_blocks < 1 || I % 32 != 0) return 0;
         int S_padded = (S + 15) & ~15;
@@ -1243,8 +1299,17 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
         size_t xd_bytes = (size_t)S_padded * n_blocks * sizeof(float);
         if (!reserve_i8(&ctx->q8_xq, &ctx->q8_xq_cap, xq_bytes) ||
             !reserve(&ctx->q8_xd, &ctx->q8_xd_cap, xd_bytes)) return 0;
-        gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
-        gpuMemsetAsync(ctx->q8_xd, 0, xd_bytes, ctx->stream);
+        /* The zero-fill only exists for the IMMA tile tail: those kernels read
+         * S_padded rows and would otherwise pick up stale data from a previous,
+         * larger S. The GEMV (S==1) reads exactly I values and touches no
+         * padding, so it does not need it -- and at ~350 launches per decode
+         * token, two extra driver calls per launch is real CPU time on the
+         * critical path. Decided once, used by both this and the dispatch. */
+        const int gemv_path = (S == 1 && O >= 1 && !picolm_gpu_no_gemv());
+        if (!gemv_path) {
+            gpuMemsetAsync(ctx->q8_xq, 0, xq_bytes, ctx->stream);
+            gpuMemsetAsync(ctx->q8_xd, 0, xd_bytes, ctx->stream);
+        }
     dim3 q_grid((unsigned)n_blocks, (unsigned)S);
         if (x_stride > 0) {
             picolm_quantize_q8_0_strided<<<q_grid, 32, 32 * sizeof(float), ctx->stream>>>(
@@ -1266,14 +1331,17 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
          * and for bisecting any numerical difference to a single kernel.
          * (PICOLM_NO_DP4A=1 separately forces the scalar int8 dot inside the
          * GEMV, so the two switches isolate the kernel shape from the ISA.) */
-        if (S == 1 && O >= 1 && !getenv("PICOLM_NO_GEMV")) {
+        if (gemv_path) {
             gpu_dispatch_print("matmul_q8_gemv_dev");
             /* One output row per block; all GEMV_WARPS warps of the block
              * cooperate on it (see the kernel comment for why cooperating on
              * one row beats assigning one row per warp). */
             dim3 grid((unsigned)O);
+            int _ps = picolm_gpu_prof_slot("gemv_q8_0");
+            picolm_gpu_prof_begin(device);
             picolm_q8_0_gemv<<<grid, 32 * GEMV_WARPS, 0, ctx->stream>>>(
                 y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, I, O, (int)t->row_bytes, ys);
+            picolm_gpu_prof_end(_ps);
             if (gpu_ok(gpuGetLastError(), "q8 gemv (dev)")) return 1;
             /* fall through to the tile paths if the GEMV launch failed */
         }
@@ -1281,7 +1349,7 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
         /* Phase 6 abandoned: Q8_0 34-byte blocks cause misaligned access. */
         #ifndef __HIP__
         /* Phase 8: shared-memory staged IMMA (32x16 tiles, 64 threads). */
-        if (!getenv("PICOLM_NO_SM_IMMA") && ctx->has_imma && !picolm_gpu_no_imma() && S >= 32 && O >= 16) {
+        if (!picolm_gpu_no_sm_imma() && ctx->has_imma && !picolm_gpu_no_imma() && S >= 32 && O >= 16) {
             gpu_dispatch_print("matmul_imma_smw16_dev");
             dim3 grid((unsigned)((O + 15) / 16), (unsigned)((S + 31) / 32));
             int smem = 16 * GPU_BLOCK_Q8_0_SIZE;
@@ -1748,7 +1816,7 @@ static int imma_dev_q8(picolm_gpu_tensor_t *t, float *y_dev,
     /* Phase 6 abandoned: Q8_0 34-byte blocks cause misaligned access. */
 #ifndef __HIP__
     /* Phase 8: try shared-memory staged IMMA W16 (32x16 tiles, 64 threads). */
-    if (!getenv("PICOLM_NO_SM_IMMA") && ctx->has_imma && !picolm_gpu_no_imma() && S >= 32 && O >= 16) {
+    if (!picolm_gpu_no_sm_imma() && ctx->has_imma && !picolm_gpu_no_imma() && S >= 32 && O >= 16) {
         gpu_dispatch_print("matmul_imma_smw16_dev");
         dim3 grid((unsigned)((O + 15) / 16), (unsigned)((S + 31) / 32));
         int smem = 16 * GPU_BLOCK_Q8_0_SIZE; /* ~544 bytes */
@@ -1795,7 +1863,7 @@ int picolm_gpu_matmul_dev_qkv(picolm_gpu_tensor_t *tq, picolm_gpu_tensor_t *tk, 
     if (tq->I != tk->I || tq->I != tv->I) return 0;
     if (tq->qtype != GGUF_TYPE_Q8_0 || tk->qtype != GGUF_TYPE_Q8_0 || tv->qtype != GGUF_TYPE_Q8_0)
         return 0;
-    if (getenv("PICOLM_FORCE_F32_MATMUL")) return 0;
+    if (picolm_gpu_force_f32()) return 0;
 
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!select_ctx(ctx)) return 0;
@@ -1831,7 +1899,7 @@ int picolm_gpu_matmul_dev_qkv(picolm_gpu_tensor_t *tq, picolm_gpu_tensor_t *tk, 
      * Only on CUDA sm_80+ where IMMA is available. Falls back to 3x separate IMMA. */
 #ifdef PICOLM_CUDA
     if (ctx->has_imma && !picolm_gpu_no_imma() && S >= 16 && tq->O >= 8 && tk->O >= 8 && tv->O >= 8 &&
-        !getenv("PICOLM_NO_FUSED_QKV")) {
+        !picolm_gpu_no_fused_qkv()) {
         int max_o = tq->O;
         if (tk->O > max_o) max_o = tk->O;
         if (tv->O > max_o) max_o = tv->O;
@@ -1880,7 +1948,7 @@ int picolm_gpu_rmsnorm_matmul_dev_qkv(picolm_gpu_tensor_t *tq, picolm_gpu_tensor
     if (tq->I != tk->I || tq->I != tv->I) return 0;
     if (tq->qtype != GGUF_TYPE_Q8_0 || tk->qtype != GGUF_TYPE_Q8_0 || tv->qtype != GGUF_TYPE_Q8_0)
         return 0;
-    if (getenv("PICOLM_FORCE_F32_MATMUL")) return 0;
+    if (picolm_gpu_force_f32()) return 0;
 
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!select_ctx(ctx)) return 0;
@@ -1913,7 +1981,7 @@ int picolm_gpu_rmsnorm_matmul_dev_qkv(picolm_gpu_tensor_t *tq, picolm_gpu_tensor
 
 #ifdef PICOLM_CUDA
     if (ctx->has_imma && !picolm_gpu_no_imma() && S >= 16 && tq->O >= 8 && tk->O >= 8 && tv->O >= 8 &&
-        !getenv("PICOLM_NO_FUSED_QKV")) {
+        !picolm_gpu_no_fused_qkv()) {
         int max_o = tq->O;
         if (tk->O > max_o) max_o = tk->O;
         if (tv->O > max_o) max_o = tv->O;
@@ -1955,7 +2023,7 @@ int picolm_gpu_matmul_dev_gu(picolm_gpu_tensor_t *tg, picolm_gpu_tensor_t *tu,
     if (tg->I < 512 || tu->I < 512) return 0;
     if (tg->I != tu->I) return 0;
     if (tg->qtype != GGUF_TYPE_Q8_0 || tu->qtype != GGUF_TYPE_Q8_0) return 0;
-    if (getenv("PICOLM_FORCE_F32_MATMUL")) return 0;
+    if (picolm_gpu_force_f32()) return 0;
 
     gpu_device_ctx_t *ctx = find_ctx(device);
     if (!select_ctx(ctx)) return 0;

@@ -82,6 +82,7 @@
 #define gpuEventDestroy hipEventDestroy
 #define gpuEventRecord hipEventRecord
 #define gpuEventSynchronize hipEventSynchronize
+#define gpuEventElapsedTime hipEventElapsedTime
 #define gpuGetLastError hipGetLastError
 #define gpuLaunchBlockPerMultiprocessor hipDeviceAttributeMaxThreadsPerMultiProcessor
 #define gpuSyncthreads __syncthreads
@@ -179,6 +180,7 @@ typedef hipEvent_t gpuEvent_t;
 #define gpuEventDestroy cudaEventDestroy
 #define gpuEventRecord cudaEventRecord
 #define gpuEventSynchronize cudaEventSynchronize
+#define gpuEventElapsedTime cudaEventElapsedTime
 #define gpuGetLastError cudaGetLastError
 #define gpuSyncthreads __syncthreads
 #define gpuThreadIdx_x threadIdx.x
@@ -415,9 +417,22 @@ static inline gpu_device_ctx_t *find_ctx(int device) {
     return NULL;
 }
 
+/* Bind the device and make its stream current.
+ *
+ * gpuSetDevice() is a driver call that takes an internal lock (~5-10 us on
+ * Windows). It is called from every matmul dispatch -- ~350 times per decode
+ * token -- where it is almost always a no-op because the device has not
+ * changed since the previous call. Track the last device we selected and skip
+ * the call when it is already current; that removes one of the four driver
+ * round-trips that were making each launch cost ~49 us of host CPU. */
+extern int g_gpu_selected_device;   /* defined in backend_gpu_host_core.cu */
+
 static inline int select_ctx(gpu_device_ctx_t *ctx) {
     if (!ctx) return 0;
-    return gpuSetDevice(ctx->device) == gpuSuccess;
+    if (ctx->device == g_gpu_selected_device) return 1;
+    if (gpuSetDevice(ctx->device) != gpuSuccess) return 0;
+    g_gpu_selected_device = ctx->device;
+    return 1;
 }
 
 /* ---- Mutex for device context scratch buffer resize ---- */

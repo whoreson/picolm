@@ -1,6 +1,11 @@
 // backend_gpu_host_misc.cu - KV cache, pipeline, attention, rmsnorm, rope, residual, misc
 #include "backend_gpu_kernels.cuh"
 
+/* PICOLM_GPU_PROF hooks, defined at the bottom of this file. */
+extern "C" int  picolm_gpu_prof_slot(const char *name);
+extern "C" void picolm_gpu_prof_begin(int device);
+extern "C" void picolm_gpu_prof_end(int slot);
+
 extern "C" {
 __global__ void picolm_gpu_kv_pack_store_kernel(uint16_t *dst_row, const float *src, int n);
 }
@@ -721,11 +726,14 @@ attn_decode_dispatch(float *xb_dev, const float *q_dev,
 
     if (n_splits <= 1) {
         gpu_dispatch_print("attn_decode");
+        int _ps = picolm_gpu_prof_slot("attn_decode");
+        picolm_gpu_prof_begin(device);
         dim3 grid((unsigned)n_kv_heads, 1, 1);
         picolm_gpu_attention_decode_kernel<<<grid, 256, (unsigned)shared_bytes, ctx->stream>>>(
             xb_dev, q_dev, g_kv_k_dev[device], g_kv_v_dev[device],
             layer_ordinal, pos, n_heads, n_kv_heads, head_dim, max_seq_len,
             kv_pos_stride_bytes, kv_head_stride_bytes, kv_head_stride_v_bytes, n_swa, kv_type);
+        picolm_gpu_prof_end(_ps);
         if (!gpu_ok(gpuGetLastError(), "attn decode kernel")) return 0;
         return 1;
     }
@@ -2432,4 +2440,114 @@ int picolm_gpu_ssm_chunked_recurrence_dev(const float *conv_dev, const float *al
     }
     return ok;
 #endif
+}
+
+/* ================================================================
+ * PICOLM_GPU_PROF: per-kernel-class timing for the GPU pipeline
+ * ================================================================
+ *
+ * Everything in the _dev pipeline runs on ctx->stream with no internal sync,
+ * so a pair of CUDA events around each launch class and reading the deltas at
+ * the single end-of-pass sync gives correct attribution with NO extra
+ * synchronisation on the hot path (a per-launch gpuEventSynchronize would
+ * serialise the pipeline and measure something else entirely).
+ *
+ * Usage: PICOLM_GPU_PROF=1 PICOLM_GPU=1 ./picolm.exe ... ; the report is
+ * printed at exit. Costs two event records per launch when enabled, nothing
+ * when not.
+ */
+#define PROF_MAX_SLOTS 16
+#define PROF_MAX_EVENTS 65536
+
+typedef struct {
+    const char *name;
+    int    slot_of_event_start;   /* index into the start-event ring */
+    double total_ms;
+    long   calls;
+} prof_slot_t;
+
+static prof_slot_t g_prof[PROF_MAX_SLOTS];
+static int   g_prof_n = 0;
+static int   g_prof_on = -1;
+static gpuEvent_t g_prof_ev[PROF_MAX_EVENTS];
+static int   g_prof_ev_n = 0;
+static int   g_prof_slot_log[PROF_MAX_EVENTS];   /* slot for event pair i */
+static int   g_prof_depth = 0;
+static gpuStream_t g_prof_stream = (gpuStream_t)0;
+
+static void gpu_event_rec_stop(void) {
+    gpuEventRecord(g_prof_ev[g_prof_ev_n], g_prof_stream);
+}
+
+static int prof_enabled(void) {
+    if (g_prof_on < 0) {
+        g_prof_on = getenv("PICOLM_GPU_PROF") ? 1 : 0;
+        if (g_prof_on) {
+            for (int i = 0; i < PROF_MAX_EVENTS; i++) gpuEventCreate(&g_prof_ev[i]);
+        }
+    }
+    return g_prof_on;
+}
+
+extern "C" int picolm_gpu_prof_slot(const char *name) {
+    if (!prof_enabled()) return -1;
+    for (int i = 0; i < g_prof_n; i++)
+        if (g_prof[i].name == name) return i;   /* interned string literals */
+    if (g_prof_n >= PROF_MAX_SLOTS) return -1;
+    g_prof[g_prof_n].name = name;
+    g_prof[g_prof_n].total_ms = 0.0;
+    g_prof[g_prof_n].calls = 0;
+    return g_prof_n++;
+}
+
+/* Record a start event. Nested regions are not supported; the GPU pipeline is
+ * a flat sequence of launches, so a simple depth counter is enough to keep
+ * begin/end paired. */
+extern "C" void picolm_gpu_prof_begin(int device) {
+    if (!prof_enabled()) return;
+    if (g_prof_ev_n + 1 >= PROF_MAX_EVENTS) return;
+    /* MUST record on ctx->stream, not the null stream: every kernel in this
+     * backend is enqueued on ctx->stream, and an event on the null stream is
+     * not ordered against them -- it would time nothing. */
+    gpu_device_ctx_t *c = find_ctx(device);
+    gpuStream_t st = (c && c->stream) ? c->stream : (gpuStream_t)0;
+    g_prof_stream = st;
+    gpuEventRecord(g_prof_ev[g_prof_ev_n], st);
+    g_prof_depth = g_prof_ev_n;
+    g_prof_ev_n++;
+}
+
+extern "C" void picolm_gpu_prof_end(int slot) {
+    if (slot < 0 || !prof_enabled()) return;
+    if (g_prof_ev_n >= PROF_MAX_EVENTS) return;
+    gpu_event_rec_stop();
+    g_prof_slot_log[g_prof_ev_n] = slot;
+    g_prof_ev_n++;
+    (void)g_prof_depth;
+}
+
+/* Called once at exit, after the final sync, to resolve the deltas. */
+extern "C" void picolm_gpu_prof_report(void) {
+    if (!g_prof_on || g_prof_n == 0) return;
+    gpuDeviceSynchronize();
+    int i = 0;
+    while (i + 1 < g_prof_ev_n) {
+        float ms = 0.0f;
+        gpuEventElapsedTime(&ms, g_prof_ev[i], g_prof_ev[i + 1]);
+        int slot = g_prof_slot_log[i + 1];
+        if (slot >= 0 && slot < g_prof_n) {
+            g_prof[slot].total_ms += (double)ms;
+            g_prof[slot].calls++;
+        }
+        i += 2;
+    }
+    double grand = 0.0;
+    for (int k = 0; k < g_prof_n; k++) grand += g_prof[k].total_ms;
+    fprintf(stderr, "\n[GPROF] per-kernel-class totals (%.1f ms measured)\n", grand);
+    for (int k = 0; k < g_prof_n; k++) {
+        double pct = grand > 0 ? 100.0 * g_prof[k].total_ms / grand : 0.0;
+        fprintf(stderr, "[GPROF] %-24s %9.1f ms  %5.1f%%  n=%-7ld %.4f ms/call\n",
+                g_prof[k].name, g_prof[k].total_ms, pct, g_prof[k].calls,
+                g_prof[k].calls ? g_prof[k].total_ms / g_prof[k].calls : 0.0);
+    }
 }
