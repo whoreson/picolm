@@ -1119,6 +1119,85 @@ picolm_q3_K_gemv(float *y,
 }
 
 
+/* Q2_K: 256 weights in 84 bytes -- scales[16] qs[64] d(2) dmin(2).
+ *
+ * Layout is Q3_K's minus the hmask: 16 sub-blocks of 16 values, two chunks of
+ * 128, qs advancing 32 bytes per chunk with the bit shift walking 0,2,4,6.
+ * Values are UNSIGNED 2-bit (0..3) and scales[16] holds one 4-bit scale and
+ * one 4-bit min per sub-block (low nibble = scale, high nibble = min), so
+ * unlike Q4_K/Q5_K there is no 6-bit unpacking, and since a sub-block here is
+ * exactly 16 values it maps 1:1 onto one Q8_K bsums entry -- no pairing.
+ *
+ * Transcribed from dequantize_row_q2_K() in quant.c. */
+__global__ void
+picolm_q2_K_gemv(float *y,
+                 const int8_t *xq, const float *xd, const int16_t *xbsums,
+                 const void *weights,
+                 int I, int O, int row_bytes, int y_stride) {
+    const int lane = (int)(gpuThreadIdx_x & 31);
+    const int warp = (int)(gpuThreadIdx_x >> 5);
+    const int tid  = warp * 32 + lane;
+    const int o    = (int)gpuBlockIdx_x;
+    if (o >= O) return;
+
+    const int n_super = I / 256;
+    const uint8_t *wrow = (const uint8_t *)weights + (size_t)o * row_bytes;
+
+    const int sb0 = tid / Q3K_SUBS_PER_SB;                  /* 16 subs/sb */
+    const int sub = tid % Q3K_SUBS_PER_SB;
+    const int stride = (GEMV_WARPS * 32) / Q3K_SUBS_PER_SB; /* 8 */
+
+    float sumf = 0.0f;
+
+    for (int sb = sb0; sb < n_super; sb += stride) {
+        const uint8_t *wb = wrow + (size_t)sb * GPU_BLOCK_Q2_K_SIZE;
+        const uint16_t d_raw    = (uint16_t)(wb[80] | ((uint16_t)wb[81] << 8));
+        const uint16_t dmin_raw = (uint16_t)(wb[82] | ((uint16_t)wb[83] << 8));
+        const float d    = xd[sb] * gpu_fp16_to_fp32(d_raw);
+        const float dmin = xd[sb] * gpu_fp16_to_fp32(dmin_raw);
+
+        /* Only the one 4-bit scale/min pair this thread uses. */
+        const uint8_t sc = wb[sub];
+        const int scale = (int)(sc & 0xF);
+        const int minv  = (int)(sc >> 4);
+
+        const int chunk = sub >> 3;
+        const int w     = sub & 7;
+        const int j     = w >> 1;
+        const int half  = w & 1;
+        const int shift = 2 * j;
+        /* block_q2_K: scales[16] qs[64] d(2) dmin(2) -- qs starts at byte 16.
+         * (Q3_K's is at 32 because hmask[32] comes first; copying that offset
+         * here read scale/d bytes as quants and produced garbage.) */
+        const uint8_t *qrun = wb + 16 + chunk * 32 + (half ? 16 : 0);
+        const int8_t  *q8   = xq + (size_t)sb * 256 + (size_t)sub * 16;
+
+        int acc = 0;
+        for (int l = 0; l < 16; l += 4) {
+            int8_t w4[4];
+            for (int t = 0; t < 4; t++)
+                w4[t] = (int8_t)((qrun[l + t] >> shift) & 3);   /* 0..3 */
+            int aA = gemv_get_int_b2(q8 + l, 0);
+            int wAi;
+            memcpy(&wAi, w4, 4);
+            acc = gpu_dot4_i8_packed(wAi, aA, acc);
+        }
+
+        sumf += scale * d * (float)acc;
+        sumf -= dmin * (float)minv * (float)xbsums[sb * 16 + sub];
+    }
+
+    __shared__ float red[GEMV_WARPS > 1 ? GEMV_WARPS - 1 : 1][32];
+    if (warp > 0) red[warp - 1][lane] = sumf;
+    gpuSyncthreads();
+    if (warp > 0) return;
+    for (int w2 = 0; w2 < GEMV_WARPS - 1; w2++) sumf += red[w2][lane];
+    for (int off = 16; off > 0; off >>= 1)
+        sumf += gpuShflXorSync(0xFFFFFFFFu, sumf, off);
+    if (lane == 0) y[o] = sumf;
+}
+
+
 /* lines 351-426 from backend_gpu_kernels.cuh */
 __global__ void
 picolm_q8_q8_matmul_tiled(float *y,

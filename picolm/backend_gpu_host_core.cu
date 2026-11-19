@@ -1310,9 +1310,14 @@ kquant_gemv_dev(gpu_device_ctx_t *ctx, picolm_gpu_tensor_t *t, float *y_dev,
         ctx->q8_xd, ctx->q8_xq, ctx->q8_k_bsums, x_dev, I, 1);
     if (!gpu_ok(gpuGetLastError(), "q8_K quantize (dev)")) return 0;
     dim3 grid((unsigned)O);
-    int _ps = picolm_gpu_prof_slot(which == 3 ? "gemv_q3_K" : which == 4 ? "gemv_q4_K" : which == 5 ? "gemv_q5_K" : "gemv_q6_K");
+    int _ps = picolm_gpu_prof_slot(which == 2 ? "gemv_q2_K" : which == 3 ? "gemv_q3_K" : which == 4 ? "gemv_q4_K" : which == 5 ? "gemv_q5_K" : "gemv_q6_K");
     picolm_gpu_prof_begin(0);
-    if (which == 3) {
+    if (which == 2) {
+        gpu_dispatch_print("matmul_q2_gemv_dev");
+        picolm_q2_K_gemv<<<grid, 32 * GEMV_WARPS, 0, ctx->stream>>>(
+            y_dev, ctx->q8_xq, ctx->q8_xd, ctx->q8_k_bsums, t->weights,
+            I, O, (int)t->row_bytes, ys);
+    } else if (which == 3) {
         gpu_dispatch_print("matmul_q3_gemv_dev");
         picolm_q3_K_gemv<<<grid, 32 * GEMV_WARPS, 0, ctx->stream>>>(
             y_dev, ctx->q8_xq, ctx->q8_xd, ctx->q8_k_bsums, t->weights,
@@ -1569,6 +1574,8 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
 
     /* Q2_K x Q8_0 IMMA path (device) */
     if (t->qtype == GGUF_TYPE_Q2_K && ctx->has_imma && !picolm_gpu_no_imma() && S >= 1 && O >= 8 && I % 256 == 0) {
+        if (S == 1 && !picolm_gpu_no_gemv() && kquant_gemv_dev(ctx, t, y_dev, x_dev, I, O, ys, x_stride, 2))
+            return 1;
         int n_blocks = I / 32;
         if (n_blocks < 1) return 0;
         int S_padded = (S + 15) & ~15;
