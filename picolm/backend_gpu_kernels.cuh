@@ -65,7 +65,18 @@ __global__ void picolm_q8_q8_matmul(float *y, const int8_t *xq, const float *xd,
  * tensor-core path is the wrong shape at S=1 and why this is bandwidth-bound
  * rather than compute-bound. Implemented for Q8_0 blocks; the q4_0/q4_1/q2_0/
  * iq4_nl paths reuse the same row/warp layout with their own dequant-dot. */
-#define GEMV_WARPS_PER_BLOCK 4
+/* GEMV launch shape. 4 warps (128 threads) cooperate on ONE output row;
+ * each thread handles GEMV_VDR ints (8 bytes) of a block, so
+ * GEMV_THREADS_PER_BLK threads cover a block and one iteration issues
+ * GEMV_BLOCKS_PER_ITER independent block loads. Mirrors llama.cpp's
+ * k_mul_mat_vec_q, which is what gets close to peak bandwidth.
+ * Defined here (not in the .cu) because the host dispatch sizes the grid
+ * from them. */
+#define GEMV_WARPS            4
+#define GEMV_QI               8              /* ints per 32-value block */
+#define GEMV_VDR              2              /* ints per thread per block */
+#define GEMV_THREADS_PER_BLK (GEMV_QI / GEMV_VDR)   /* 4 threads, one block */
+#define GEMV_BLOCKS_PER_ITER (GEMV_VDR * GEMV_WARPS * 32 / GEMV_QI)  /* 32 */
 __global__ void picolm_q8_0_gemv(float *y, const int8_t *xq, const float *xd, const void *weights, int I, int O, int row_bytes, int y_stride);
 
 /* Number of sequence positions per tile in the tiled Q8_0 matmul.

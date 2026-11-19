@@ -509,4 +509,44 @@ __device__ static inline int gpu_dot4_i8(const int8_t *a, const int8_t *b, int a
 #endif
 }
 
+/* Same instruction, but on values the caller has ALREADY loaded as packed
+ * ints. That is the shape DP4A/SDOT actually take, and it is what the GEMV
+ * inner loop wants: the quants arrive as two 16-bit reads combined into one
+ * int, so re-splitting them into a byte pointer just to have the intrinsic
+ * re-pack them would be wasted work (and an extra register round-trip). */
+__device__ static inline int gpu_dot4_i8_packed(int a, int b, int acc) {
+#if defined(PICOLM_NO_DP4A)
+    const int8_t *a8 = (const int8_t *)&a;
+    const int8_t *b8 = (const int8_t *)&b;
+    return acc + (int)a8[0] * (int)b8[0]
+               + (int)a8[1] * (int)b8[1]
+               + (int)a8[2] * (int)b8[2]
+               + (int)a8[3] * (int)b8[3];
+#elif defined(__HIP_PLATFORM_AMD__)
+#if defined(__gfx906__) || defined(__gfx908__) || defined(__gfx90a__) || \
+    defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__) || \
+    defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || \
+    defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
+    defined(__gfx1103__) || defined(__gfx1200__) || defined(__gfx1201__)
+    return __builtin_amdgcn_sdot4(a, b, acc, false);
+#else
+    const int8_t *a8 = (const int8_t *)&a;
+    const int8_t *b8 = (const int8_t *)&b;
+    return acc + (int)a8[0] * (int)b8[0]
+               + (int)a8[1] * (int)b8[1]
+               + (int)a8[2] * (int)b8[2]
+               + (int)a8[3] * (int)b8[3];
+#endif
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
+    return __dp4a(a, b, acc);
+#else
+    const int8_t *a8 = (const int8_t *)&a;
+    const int8_t *b8 = (const int8_t *)&b;
+    return acc + (int)a8[0] * (int)b8[0]
+               + (int)a8[1] * (int)b8[1]
+               + (int)a8[2] * (int)b8[2]
+               + (int)a8[3] * (int)b8[3];
+#endif
+}
+
 #endif /* BACKEND_GPU_COMMON_CUH */

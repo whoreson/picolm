@@ -456,26 +456,42 @@ picolm_q8_q8_matmul(float *y,
  *
  * Why this exists: at S=1 the IMMA path still launches a 16-row tensor-core
  * tile, so 15 of 16 rows do useless work on zero padding and one 32-thread
- * block serves just 8 output columns. Measured on a 27B/Q5_K at 8.5 tok/s, a
- * decode token streams ~5.6 GB of FFN weights in ~1.06 s = ~48 GB/s of a
- * 4090's ~1000 GB/s: it is kernel-bound, not bandwidth-bound. GEMV cannot use
- * tensor cores well by construction (a 16x8x32 mma for 1 useful row IS the
- * bug), so the right shape here is: stream each weight row exactly once,
- * coalesced, and reduce.
+ * block serves just 8 output columns. Tensor cores are the wrong tool for
+ * GEMV by construction (a 16x8x32 mma for 1 useful row IS the bug). The right
+ * shape is: stream each weight row exactly once, coalesced, and reduce.
  *
- * Layout: GEMV_WARPS_PER_BLOCK warps per block, one warp per WEIGHT ROW.
- *   block b, warp w  -> row o = b * GEMV_WARPS_PER_BLOCK + w
- *   lane l walks the row's 32-value blocks with stride 32 across the warp.
- * Each lane accumulates an int32 per block-step, and the per-block
- * contribution is scaled by wd * xd in _double_ exactly like
- * picolm_q8_q8_matmul, so this kernel is numerically comparable to it (and
- * checkable bit-for-bit against it with the scalar fallback).
+ * SHAPE (taken from llama.cpp's k_mul_mat_vec_q, which saturates the memory
+ * bus where our first attempt did not -- 761 GB/s vs 319 GB/s measured on a
+ * 4090 with Fimbulvetr-11B-Q8_0):
  *
- * Weights are read through gpu_dot4_i8(), i.e. DP4A on NVIDIA sm_61+ and
- * SDOT on gfx906+, with a scalar fallback so this always compiles and always
- * gives the same answer. See the gpu_dot4_i8 notes in backend_gpu_common.cuh
- * for why that is a source-level shim and not a performance guarantee.
+ *   - ALL GEMV_WARPS warps of the block cooperate on ONE output row.
+ *   - Each thread handles GEMV_VDR ints (8 bytes) of a block per step, so
+ *     GEMV_QI/GEMV_VDR threads cover one block together.
+ *   - Consecutive blocks are handed to consecutive thread groups, so one
+ *     iteration issues GEMV_BLOCKS_PER_ITER independent block loads: that is
+ *     the memory-level parallelism the first version lacked (it walked one
+ *     block at a time per lane with a serial 8-step inner loop).
+ *   - Per-block the raw int32 dot is accumulated and only scaled at the END
+ *     by d8_0*d8_1, instead of a double multiply per block.
+ *
+ * Block layout is GGUF Q8_0: uint16 d + int8 qs[32] = 34 bytes, 4-byte
+ * aligned in the qs array only (hence the b2-style 2x16-bit reads below --
+ * reading an int directly from &qs[k] would be a misaligned 32-bit load).
+ *
+ * Weights are read through gpu_dot4_i8(): DP4A on NVIDIA sm_61+, SDOT on
+ * gfx906+, scalar fallback that is bit-identical. Note the earlier measurement
+ * that DP4A vs scalar changed nothing (28.9 vs 28.5 tok/s) -- this kernel is
+ * bandwidth-bound, so the load pattern is what matters, not the ISA.
  */
+/* 32-bit read of two 16-bit halves. The qs arrays are 2-byte aligned but not
+ * necessarily 4-byte aligned, so this is the portable form of an int load. */
+__device__ static inline int gemv_get_int_b2(const int8_t *qs, int i32) {
+    const uint16_t *x16 = (const uint16_t *)qs;
+    int x32  = (int)(x16[2 * i32 + 0] << 0);
+    x32     |= (int)(x16[2 * i32 + 1] << 16);
+    return x32;
+}
+
 __global__ void
 picolm_q8_0_gemv(float *y,
                  const int8_t *xq, const float *xd,
@@ -483,46 +499,57 @@ picolm_q8_0_gemv(float *y,
                  int I, int O, int row_bytes, int y_stride) {
     const int lane = (int)(gpuThreadIdx_x & 31);
     const int warp = (int)(gpuThreadIdx_x >> 5);
-    const int o = (int)gpuBlockIdx_x * GEMV_WARPS_PER_BLOCK + warp;
+    const int tid  = warp * 32 + lane;          /* 0 .. 32*GEMV_WARPS-1 */
+    const int o    = (int)gpuBlockIdx_x;        /* one row per block */
     if (o >= O) return;
     int ys = y_stride > 0 ? y_stride : O;
 
     const int n_blocks = I / 32;
     const uint8_t *wrow = (const uint8_t *)weights + (size_t)o * row_bytes;
 
-    /* Each lane owns blocks lane, lane+32, ... -- consecutive lanes touch
-     * consecutive 34-byte blocks, which is the coalescing that makes this
-     * bandwidth-efficient. */
-    double sum = 0.0;
-    for (int bi = lane; bi < n_blocks; bi += 32) {
-        const uint8_t *b = wrow + (size_t)bi * GPU_BLOCK_Q8_0_SIZE;
-        uint16_t wd_raw = (uint16_t)(b[0] | ((uint16_t)b[1] << 8));
-        float wd = gpu_fp16_to_fp32(wd_raw);
-        float xdv = xd[bi];
+    /* Which block this thread starts on, and which int pair within it. */
+    const int kbx0 = tid / GEMV_THREADS_PER_BLK;
+    const int kqs  = GEMV_VDR * (tid % GEMV_THREADS_PER_BLK);
+
+    /* Raw int8 dot products, scaled at the very end. float is enough here:
+     * llama.cpp uses float for the same accumulator and this matches its
+     * numerics, which is the reference we are trying to close the gap to. */
+    float sumf = 0.0f;
+
+    for (int kbx = kbx0; kbx < n_blocks; kbx += GEMV_BLOCKS_PER_ITER) {
+        const uint8_t *b = wrow + (size_t)kbx * GPU_BLOCK_Q8_0_SIZE;
+        const uint16_t wd_raw = (uint16_t)(b[0] | ((uint16_t)b[1] << 8));
+        const float wd = gpu_fp16_to_fp32(wd_raw);
+        const float xdv = xd[kbx];
 
         const int8_t *wq = (const int8_t *)(b + 2);
-        const int8_t *xqp = xq + (size_t)bi * 32;
+        const int8_t *xqp = xq + (size_t)kbx * 32;
 
+        /* GEMV_VDR ints of this block, i.e. 8 bytes, contiguous and aligned
+         * to the thread's group offset. */
         int acc = 0;
-        for (int j = 0; j < 32; j += 4)
-            acc = gpu_dot4_i8(wq + j, xqp + j, acc);
+        for (int i = 0; i < GEMV_VDR; i++)
+            acc = gpu_dot4_i8_packed(gemv_get_int_b2(wq, kqs + i),
+                                     gemv_get_int_b2(xqp, kqs + i), acc);
 
-        sum += (double)acc * (double)wd * (double)xdv;
+        sumf += wd * xdv * (float)acc;
     }
 
-    /* Warp reduction in shared memory. Deliberately NOT a __shfl butterfly:
-     * gpuShflXorSync only has float/int overloads (and adding a double one
-     * per vendor is not worth it), and narrowing the partials to float would
-     * make this kernel disagree with picolm_q8_q8_matmul, which accumulates
-     * in double. One row per warp, so the shared array is tiny. */
-    __shared__ double red[GEMV_WARPS_PER_BLOCK][32];
-    red[warp][lane] = sum;
+    /* Cross-warp reduction. Every warp holds a partial over its own blocks;
+     * warps 1..N-1 stash theirs in shared memory and warp 0 finishes. */
+    __shared__ float red[GEMV_WARPS > 1 ? GEMV_WARPS - 1 : 1][32];
+    if (warp > 0) red[warp - 1][lane] = sumf;
     gpuSyncthreads();
-    for (int off = 16; off > 0; off >>= 1) {
-        if (lane < off) red[warp][lane] += red[warp][lane + off];
-        gpuSyncthreads();
-    }
-    if (lane == 0) y[o] = (float)red[warp][0];
+    if (warp > 0) return;
+
+    for (int w = 0; w < GEMV_WARPS - 1; w++)
+        sumf += red[w][lane];
+
+    /* Warp butterfly: every lane ends with the block total. */
+    for (int off = 16; off > 0; off >>= 1)
+        sumf += gpuShflXorSync(0xFFFFFFFFu, sumf, off);
+
+    if (lane == 0) y[o] = sumf;
 }
 
 /* lines 351-426 from backend_gpu_kernels.cuh */

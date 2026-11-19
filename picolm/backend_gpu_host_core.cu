@@ -1268,9 +1268,11 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
          * GEMV, so the two switches isolate the kernel shape from the ISA.) */
         if (S == 1 && O >= 1 && !getenv("PICOLM_NO_GEMV")) {
             gpu_dispatch_print("matmul_q8_gemv_dev");
-            int warps = GEMV_WARPS_PER_BLOCK;
-            dim3 grid((unsigned)((O + warps - 1) / warps));
-            picolm_q8_0_gemv<<<grid, 32 * warps, 0, ctx->stream>>>(
+            /* One output row per block; all GEMV_WARPS warps of the block
+             * cooperate on it (see the kernel comment for why cooperating on
+             * one row beats assigning one row per warp). */
+            dim3 grid((unsigned)O);
+            picolm_q8_0_gemv<<<grid, 32 * GEMV_WARPS, 0, ctx->stream>>>(
                 y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, I, O, (int)t->row_bytes, ys);
             if (gpu_ok(gpuGetLastError(), "q8 gemv (dev)")) return 1;
             /* fall through to the tile paths if the GEMV launch failed */
