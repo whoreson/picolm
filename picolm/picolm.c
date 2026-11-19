@@ -2816,8 +2816,15 @@ int main(int argc, char **argv) {
             cli_checkpoint_save(&model, checkpoint_max, start_pos + n_prompt + total_gen);
         }
 
-        /* Stop on EOS or grammar completion */
-        if (next == (int)tokenizer.eos_id) break;
+        /* Stop on EOS or grammar completion.
+         * PICOLM_IGNORE_EOS=1 keeps going past EOS, which the HTTP server
+         * already allows per request (`ignore_eos`). Useful for benchmarking:
+         * a short prompt on a chat-tuned model otherwise stops after a few
+         * dozen tokens, which is far too few to characterise decode latency.
+         * Like the server, grammar completion still stops generation. */
+        static int ignore_eos = -1;
+        if (ignore_eos < 0) ignore_eos = getenv("PICOLM_IGNORE_EOS") ? 1 : 0;
+        if (!ignore_eos && next == (int)tokenizer.eos_id) break;
         if (grammar_is_complete(&grammar)) break;
 
         token = next;
@@ -2831,7 +2838,16 @@ int main(int argc, char **argv) {
             }
         }
         if (model.gpu.kv_active && gpu_path == 1) {
+            /* PICOLM_TOKPROF: per-token wall latency, to characterise
+             * straggling (uneven decode timing). Prints one line per token so
+             * the distribution can be inspected directly rather than inferred
+             * from an average. */
+            static int tokprof = -1;
+            if (tokprof < 0) tokprof = getenv("PICOLM_TOKPROF") ? 1 : 0;
+            double _tk0 = tokprof ? get_time_ms() : 0.0;
             logits = model_forward_gpu(&model, token, pos + 1);
+            if (tokprof)
+                fprintf(stderr, "[TOK] %6.2f ms\n", get_time_ms() - _tk0);
             if (!logits) logits = model_forward(&model, token, pos + 1);
             /* PICOLM_DBG_PIPELINE: compare GPU pipeline vs CPU at first token only
              * (running CPU path for all tokens corrupts the KV cache shared with GPU) */

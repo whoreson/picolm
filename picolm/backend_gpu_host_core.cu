@@ -1311,6 +1311,8 @@ kquant_gemv_dev(gpu_device_ctx_t *ctx, picolm_gpu_tensor_t *t, float *y_dev,
     if (!gpu_ok(gpuGetLastError(), "q8_K quantize (dev)")) return 0;
 
     dim3 grid((unsigned)O);
+    int _ps = picolm_gpu_prof_slot(which == 5 ? "gemv_q5_K" : "gemv_q6_K");
+    picolm_gpu_prof_begin(0);
     if (which == 5) {
         gpu_dispatch_print("matmul_q5_gemv_dev");
         picolm_q5_K_gemv<<<grid, 32 * GEMV_WARPS, 0, ctx->stream>>>(
@@ -1322,6 +1324,7 @@ kquant_gemv_dev(gpu_device_ctx_t *ctx, picolm_gpu_tensor_t *t, float *y_dev,
             y_dev, ctx->q8_xq, ctx->q8_xd, ctx->q8_k_bsums, t->weights,
             I, O, (int)t->row_bytes, ys);
     }
+    picolm_gpu_prof_end(_ps);
     return gpu_ok(gpuGetLastError(), "kquant gemv (dev)");
 }
 
