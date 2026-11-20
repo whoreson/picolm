@@ -467,7 +467,14 @@ typedef struct {
 #define PICOLM_PREFILL_UBATCH_DEFAULT 512
 
 /* Resolved ubatch size: PICOLM_UBATCH if set and > 0, else the default.
- * Never returns 0. */
+ * Never returns 0.
+ *
+ * This is the GPU prefill's INTERNAL chunk size (the granularity at which the
+ * residual stream advances, hence the rate at which viz is fed). It is NOT the
+ * server's progress-report cadence: with SSM checkpointing enabled the server
+ * cuts at --checkpoint-every-nt instead, so a progress packet can cover several
+ * ubatches. Cosmetic divergence only; both report real token counts. See the
+ * long comment in server.c's prefill_with_checkpoints(). */
 int picolm_prefill_ubatch(void);
 
 typedef struct {

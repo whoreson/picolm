@@ -6447,7 +6447,18 @@ after_qkv:
         /* Residual stream after this layer for the whole ubatch, for the VNC
          * visualization. bx is [n_ubatch][xb_stride] in VRAM, so this gathers
          * each row into a tightly packed [n_tokens][n_embd] host buffer --
-         * only when somebody is actually watching. */
+         * only when somebody is actually watching.
+         *
+         * This is the INNER (ubatch, picolm_prefill_ubatch() = 512 default)
+         * grid. The server's prompt_progress packet is emitted on its OUTER
+         * chunk boundaries (see prefill_with_checkpoints), which are
+         * --checkpoint-every-nt when SSM checkpointing is on. So with, say,
+         * checkpoint-every-nt 1024, viz advances TWICE per progress packet.
+         * Cosmetic only -- both report real positions -- and inherently
+         * unaligned while checkpointing, because the outer cut has to land on
+         * checkpoint boundaries. Use --checkpoint-every-nt 512 to match them.
+         * The one sync + n_ubatch D2Hs below already happen per layer per
+         * ubatch; do not add a second copy path to emit more progress. */
         if (viz_active()) {
             size_t row_bytes = (size_t)dim * sizeof(float);
             float *viz_buf = (float *)malloc((size_t)n_ubatch * row_bytes);

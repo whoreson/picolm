@@ -1241,7 +1241,30 @@ static float *prefill_with_checkpoints(SOCKET sock, model_t *model,
      * - return_progress enabled: chunk at ~512 tokens (matches GPU ubatch)
      * - otherwise: single batched call */
     int do_chunking = 0;
-    int ubatch_size = 512; /* matches GPU prefill ubatch */
+    /* COSMETIC ONLY: used on the return_progress path, where this value does
+     * match the GPU's internal ubatch (picolm_prefill_ubatch(), 512 default).
+     * It does NOT apply on the SSM-checkpointing path below -- that cuts at
+     * checkpoint_interval boundaries instead -- so do not read this as "the
+     * chunk size".
+     *
+     * KNOWN COSMETIC MISMATCH (see also picolm_prefill_ubatch() in model.h and
+     * the viz push in model_ssm.c): the progress packet is emitted once per
+     * OUTER chunk (this function), while viz is fed once per INNER GPU ubatch
+     * (512). With checkpointing enabled the outer chunk is
+     * --checkpoint-every-nt (1024 in a typical run), so viz advances twice per
+     * progress packet. On CPU the two always agree, because
+     * model_forward_prefill() is called once per outer chunk and has no
+     * internal ubatch loop (picolm.c: "no ubatch split here").
+     *
+     * This is a reporting cadence difference, never a wrong number: both
+     * counters report correct token positions, a progress packet always names
+     * an outer-chunk boundary (a valid token count), and viz only ever shows
+     * real activations. Do NOT "fix" it by D2H-ing the residual here just to
+     * emit more packets: a viz sync+D2H per layer per ubatch already happens
+     * inside the GPU prefill, and a second copy path would double it for a
+     * cosmetic gain. To make them tick together, pass
+     * --checkpoint-every-nt 512 (or PICOLM_UBATCH=<checkpoint interval>). */
+    int ubatch_size = 512;
 
     if (model_has_recurrent_state(model) && srv.max_checkpoints > 0) {
         do_chunking = 1;
@@ -1289,7 +1312,12 @@ static float *prefill_with_checkpoints(SOCKET sock, model_t *model,
         int chunk_size;
 
         if (model_has_recurrent_state(model) && srv.max_checkpoints > 0) {
-            /* SSM checkpoint-driven chunking */
+            /* SSM checkpoint-driven chunking.
+             * NOTE: this OVERRIDES ubatch_size (512) from the block above, so on
+             * a checkpointing server the progress cadence is
+             * --checkpoint-every-nt, not 512. viz keeps ticking on the GPU's
+             * internal 512 ubatches, so the two only look synchronised when
+             * interval == ubatch. Cosmetic only -- see the long comment above. */
             int mod = cur_pos % srv.checkpoint_interval;
             int interval_dist = (mod == 0) ? srv.checkpoint_interval : (srv.checkpoint_interval - mod);
             int tail_dist = tail_pos - cur_pos;
