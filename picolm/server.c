@@ -616,11 +616,7 @@ typedef struct {
     int *ptokens;            /* encoded prompt tokens */
     int n_prompt;
     int max_tokens;
-    float temperature;
-    float top_p;
-    int top_k;
-    float repeat_penalty;
-    int repeat_last_n;
+    sampling_params_t sparams;   /* the same struct the sampler consumes */
     int seed;
     int do_stream;
     int ignore_eos;
@@ -1596,20 +1592,24 @@ static void handle_props(SOCKET sock) {
 
     cJSON *dgs = cJSON_CreateObject();
     cJSON *params = cJSON_CreateObject();
+    /* /props and /slots report the sampler's REAL defaults (sampler.h) instead
+     * of llama.cpp's example numbers: the old literals promised min_p and
+     * repeat_penalty settings the sampler never received. */
+    sampling_params_t sp = sampling_params_default();
 
     cJSON_AddNumberToObject(params, "seed", 4294967295);
-    cJSON_AddNumberToObject(params, "temperature", 1.0);
+    cJSON_AddNumberToObject(params, "temperature", (double)sp.temperature);
     cJSON_AddNumberToObject(params, "dynatemp_range", 0.0);
     cJSON_AddNumberToObject(params, "dynatemp_exponent", 1.0);
-    cJSON_AddNumberToObject(params, "top_k", 40);
-    cJSON_AddNumberToObject(params, "top_p", 0.95);
-    cJSON_AddNumberToObject(params, "min_p", 0.05);
+    cJSON_AddNumberToObject(params, "top_k", sp.top_k);
+    cJSON_AddNumberToObject(params, "top_p", (double)sp.top_p);
+    cJSON_AddNumberToObject(params, "min_p", (double)sp.min_p);
     cJSON_AddNumberToObject(params, "top_n_sigma", -1.0);
     cJSON_AddNumberToObject(params, "xtc_probability", 0.0);
     cJSON_AddNumberToObject(params, "xtc_threshold", 0.1);
     cJSON_AddNumberToObject(params, "typical_p", 1.0);
-    cJSON_AddNumberToObject(params, "repeat_last_n", 64);
-    cJSON_AddNumberToObject(params, "repeat_penalty", 1.1);
+    cJSON_AddNumberToObject(params, "repeat_last_n", sp.repeat_last_n);
+    cJSON_AddNumberToObject(params, "repeat_penalty", (double)sp.repeat_penalty);
     cJSON_AddNumberToObject(params, "presence_penalty", 0.0);
     cJSON_AddNumberToObject(params, "frequency_penalty", 0.0);
     cJSON_AddNumberToObject(params, "dry_multiplier", 0.0);
@@ -2244,22 +2244,23 @@ static void handle_slots(SOCKET sock) {
     cJSON_AddBoolToObject(slot, "speculative", 0);
     cJSON_AddBoolToObject(slot, "is_processing", srv.is_processing != 0);
 
-    /* Generation params - defaults for PicoLM */
+    /* Generation params - report what the sampler actually uses. */
     cJSON *params = cJSON_CreateObject();
+    sampling_params_t sp = sampling_params_default();
     cJSON_AddNumberToObject(params, "n_predict", -1);
     cJSON_AddNumberToObject(params, "seed", 4294967295);
-    cJSON_AddNumberToObject(params, "temperature", 0.8);
+    cJSON_AddNumberToObject(params, "temperature", (double)sp.temperature);
     cJSON_AddNumberToObject(params, "dynatemp_range", 0.0);
     cJSON_AddNumberToObject(params, "dynatemp_exponent", 1.0);
-    cJSON_AddNumberToObject(params, "top_k", 40);
-    cJSON_AddNumberToObject(params, "top_p", 0.95);
-    cJSON_AddNumberToObject(params, "min_p", 0.05);
+    cJSON_AddNumberToObject(params, "top_k", sp.top_k);
+    cJSON_AddNumberToObject(params, "top_p", (double)sp.top_p);
+    cJSON_AddNumberToObject(params, "min_p", (double)sp.min_p);
     cJSON_AddNumberToObject(params, "top_n_sigma", -1.0);
     cJSON_AddNumberToObject(params, "xtc_probability", 0.0);
     cJSON_AddNumberToObject(params, "xtc_threshold", 0.1);
     cJSON_AddNumberToObject(params, "typical_p", 1.0);
-    cJSON_AddNumberToObject(params, "repeat_last_n", 64);
-    cJSON_AddNumberToObject(params, "repeat_penalty", 1.1);
+    cJSON_AddNumberToObject(params, "repeat_last_n", sp.repeat_last_n);
+    cJSON_AddNumberToObject(params, "repeat_penalty", (double)sp.repeat_penalty);
     cJSON_AddNumberToObject(params, "presence_penalty", 0.0);
     cJSON_AddNumberToObject(params, "frequency_penalty", 0.0);
     cJSON_AddNumberToObject(params, "dry_multiplier", 0.0);
@@ -2536,9 +2537,10 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
     char *chat_prompt = NULL;
     char *raw_prompt_copy = NULL;
     int max_tokens = 256;
-    float temperature = 0.8f;
-    float top_p = 0.9f;
-    int top_k = 40;
+    /* One struct for every sampling parameter (sampler.h). Loose locals are
+     * what let min_p be unsettable while /props advertised it, and let this
+     * handler and /v1/completions disagree on the top_p default. */
+    sampling_params_t sparams = SAMPLING_DEFAULTS;
     uint64_t seed = 42;
     int n_choices = 1;
     int do_stream = 0;
@@ -2584,9 +2586,13 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
     if ((item = cJSON_GetObjectItem(req, "max_tokens"))) max_tokens = (int)cJSON_GetNumberValue(item);
     int prompt_only = (max_tokens == 0);
     if (max_tokens <= 0 && !prompt_only) max_tokens = 256;
-    if ((item = cJSON_GetObjectItem(req, "temperature"))) temperature = (float)cJSON_GetNumberValue(item);
-    if ((item = cJSON_GetObjectItem(req, "top_p"))) top_p = (float)cJSON_GetNumberValue(item);
-    if ((item = cJSON_GetObjectItem(req, "top_k"))) top_k = (int)cJSON_GetNumberValue(item);
+    if ((item = cJSON_GetObjectItem(req, "temperature"))) sparams.temperature = (float)cJSON_GetNumberValue(item);
+    if ((item = cJSON_GetObjectItem(req, "top_p"))) sparams.top_p = (float)cJSON_GetNumberValue(item);
+    if ((item = cJSON_GetObjectItem(req, "top_k"))) sparams.top_k = (int)cJSON_GetNumberValue(item);
+    if ((item = cJSON_GetObjectItem(req, "min_p"))) sparams.min_p = (float)cJSON_GetNumberValue(item);
+    if ((item = cJSON_GetObjectItem(req, "repeat_penalty"))) sparams.repeat_penalty = (float)cJSON_GetNumberValue(item);
+    if ((item = cJSON_GetObjectItem(req, "repeat_last_n"))) sparams.repeat_last_n = (int)cJSON_GetNumberValue(item);
+    sampling_params_check(&sparams);
     if ((item = cJSON_GetObjectItem(req, "seed"))) seed = (uint64_t)cJSON_GetNumberValue(item);
     if ((item = cJSON_GetObjectItem(req, "stream")) && cJSON_IsTrue(item)) do_stream = 1;
     if ((item = cJSON_GetObjectItem(req, "timings_per_token")) && cJSON_IsTrue(item)) timings_per_token = 1;
@@ -2736,7 +2742,8 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         send(sock, hdr, strlen(hdr), 0);
 
         sampler_t sampler;
-        sampler_init(&sampler, temperature, top_p, top_k, 0.05f, seed);
+        sampler_init(&sampler, &sparams, seed);
+        sampler_set_history(&sampler, ptokens, n_prompt);
 
         double t_start = get_time_ms();
 
@@ -2993,7 +3000,8 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
 
         for (int c = 0; c < n_choices; c++) {
             sampler_t sampler;
-            sampler_init(&sampler, temperature, top_p, top_k, 0.05f, seed + (uint64_t)c);
+            sampler_init(&sampler, &sparams, seed + (uint64_t)c);
+            sampler_set_history(&sampler, ptokens, n_prompt);
 
             int gen_count = 0;
             int gen_written_cs = 0;             /* see KV_WRITTEN (per choice) */
@@ -3228,11 +3236,9 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
 
     /* Parameters (llama.cpp naming) */
     int n_predict = -1; /* -1 = unlimited (use max_seq_len) */
-    float temperature = 0.8f;
-    float top_p = 0.95f;
-    int top_k = 40;
-    float repeat_penalty = 1.1f;
-    int repeat_last_n = 64;
+    /* Same struct, same defaults as /completion and the CLI. This handler used
+     * to default top_p to 0.95 while /completion used 0.90. */
+    sampling_params_t sparams = SAMPLING_DEFAULTS;
     int seed = -1; /* -1 = random */
     int do_stream = 0;
     int return_tokens = 0;
@@ -3250,15 +3256,18 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
     if ((item = cJSON_GetObjectItem(req, "max_tokens")) && n_predict < 0)
         n_predict = (int)cJSON_GetNumberValue(item);
     if ((item = cJSON_GetObjectItem(req, "temperature")))
-        temperature = (float)cJSON_GetNumberValue(item);
+        sparams.temperature = (float)cJSON_GetNumberValue(item);
     if ((item = cJSON_GetObjectItem(req, "top_p")))
-        top_p = (float)cJSON_GetNumberValue(item);
+        sparams.top_p = (float)cJSON_GetNumberValue(item);
     if ((item = cJSON_GetObjectItem(req, "top_k")))
-        top_k = (int)cJSON_GetNumberValue(item);
+        sparams.top_k = (int)cJSON_GetNumberValue(item);
+    if ((item = cJSON_GetObjectItem(req, "min_p")))
+        sparams.min_p = (float)cJSON_GetNumberValue(item);
     if ((item = cJSON_GetObjectItem(req, "repeat_penalty")))
-        repeat_penalty = (float)cJSON_GetNumberValue(item);
+        sparams.repeat_penalty = (float)cJSON_GetNumberValue(item);
     if ((item = cJSON_GetObjectItem(req, "repeat_last_n")))
-        repeat_last_n = (int)cJSON_GetNumberValue(item);
+        sparams.repeat_last_n = (int)cJSON_GetNumberValue(item);
+    sampling_params_check(&sparams);
     if ((item = cJSON_GetObjectItem(req, "seed"))) {
         seed = (int)cJSON_GetNumberValue(item);
     }
@@ -3414,16 +3423,18 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
     if (seed < 0) seed = (int)((unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)&seed);
 
     sampler_t sampler;
-    sampler_init(&sampler, temperature, top_p, top_k, 0.05f, (uint64_t)seed);
+    sampler_init(&sampler, &sparams, (uint64_t)seed);
+    sampler_set_history(&sampler, ptokens, n_prompt);
 
     /* Build generation_settings JSON */
     cJSON *gen_settings = cJSON_CreateObject();
     cJSON_AddNumberToObject(gen_settings, "n_predict", n_predict);
-    cJSON_AddNumberToObject(gen_settings, "temperature", (double)temperature);
-    cJSON_AddNumberToObject(gen_settings, "top_p", (double)top_p);
-    cJSON_AddNumberToObject(gen_settings, "top_k", top_k);
-    cJSON_AddNumberToObject(gen_settings, "repeat_penalty", (double)repeat_penalty);
-    cJSON_AddNumberToObject(gen_settings, "repeat_last_n", repeat_last_n);
+    cJSON_AddNumberToObject(gen_settings, "temperature", (double)sparams.temperature);
+    cJSON_AddNumberToObject(gen_settings, "top_p", (double)sparams.top_p);
+    cJSON_AddNumberToObject(gen_settings, "top_k", sparams.top_k);
+    cJSON_AddNumberToObject(gen_settings, "min_p", (double)sparams.min_p);
+    cJSON_AddNumberToObject(gen_settings, "repeat_penalty", (double)sparams.repeat_penalty);
+    cJSON_AddNumberToObject(gen_settings, "repeat_last_n", sparams.repeat_last_n);
     cJSON_AddNumberToObject(gen_settings, "seed", seed);
 
     double t_start = get_time_ms();

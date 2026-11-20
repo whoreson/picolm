@@ -671,10 +671,10 @@ static void bench_summary(const bench_ctx_t *bc, int iteration, double wall_sec)
  * not linger; PICOLM_BENCH_THREADS_CHILD marks the child to avoid an endless loop.
  */
 static void benchmark_thread_scaling(const char *model_path, const char *prompt,
-        int ctx_size_limit, float temperature, int top_k, int max_tokens,
+        int ctx_size_limit, const sampling_params_t *sparams, int max_tokens,
         uint64_t seed, int num_threads, int do_prefault, const char *list,
         int argc, char *argv[]) {
-    (void)temperature; (void)top_k; (void)seed;
+    (void)sparams; (void)seed;
 
     /* Child mode: this process runs exactly one thread count and reports. */
     const char *child = getenv("PICOLM_BENCH_THREADS_CHILD");
@@ -832,7 +832,7 @@ static void benchmark_thread_scaling(const char *model_path, const char *prompt,
  * - We output CSV: ctx_size,prefill_tok/s,gen_tok/s
  */
 static void benchmark_context_scaling(const char *model_path, const char *base_prompt,
-        int ctx_size_limit, float temperature, int top_k, int max_tokens,
+        int ctx_size_limit, const sampling_params_t *sparams, int max_tokens,
         uint64_t seed, int num_threads, int do_prefault,
         kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v, int prompt_flag_f) {
 
@@ -914,7 +914,11 @@ static void benchmark_context_scaling(const char *model_path, const char *base_p
 
     /* Init sampler */
     sampler_t sampler;
-    sampler_init(&sampler, temperature, 0.95f, top_k, 0.05f, seed);
+    /* Was sampler_init(&sampler, temperature, 0.95f, top_k, 0.05f, seed):
+     * a literal top_p AND min_p here meant --top-p / --min-p were silently
+     * ignored by the benchmark, so it measured a different sampler than the
+     * CLI's own generation loop. */
+    sampler_init(&sampler, sparams, seed);
 
     /* Truncate base prompt if it exceeds context size */
     if (n_base > ctx) {
@@ -1435,9 +1439,10 @@ int main(int argc, char **argv) {
     const char *prompt = NULL;
     int prompt_flag_f = 0;     /* -pf: apply chat template */
     int    max_tokens = 256;
-    float  temperature = 0.8f;
-    float  top_p = 0.9f;
-    int    top_k = 40;
+    /* Sampling parameters live in ONE struct shared with the server and the
+     * benchmarks (sampler.h). Loose locals are what let min_p be hardcoded at
+     * the call sites while being advertised as settable. */
+    sampling_params_t sparams = SAMPLING_DEFAULTS;
     uint64_t seed = 42;
     int    context_override = 0;
     int    num_threads = 0; /* 0 = auto-detect from physical cores */
@@ -1530,11 +1535,17 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
             max_tokens = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
-            temperature = (float)atof(argv[++i]);
+            sparams.temperature = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "--top-p") == 0 && i + 1 < argc) {
-            top_p = (float)atof(argv[++i]);
+            sparams.top_p = (float)atof(argv[++i]);
         } else if (strcmp(argv[i], "-k") == 0 && i + 1 < argc) {
-            top_k = atoi(argv[++i]);
+            sparams.top_k = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--min-p") == 0 && i + 1 < argc) {
+            sparams.min_p = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--repeat-penalty") == 0 && i + 1 < argc) {
+            sparams.repeat_penalty = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--repeat-last-n") == 0 && i + 1 < argc) {
+            sparams.repeat_last_n = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
             seed = (uint64_t)atoll(argv[++i]);
         } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
@@ -1753,7 +1764,7 @@ int main(int argc, char **argv) {
     /* --benchmark-threads: thread-scaling sweep for one prefill */
     if (bench_threads_list) {
         if (!model_path) { fprintf(stderr, "No model file specified\n"); usage(argv[0]); return 1; }
-        benchmark_thread_scaling(model_path, prompt, context_override, temperature, top_k,
+        benchmark_thread_scaling(model_path, prompt, context_override, &sparams,
                                  max_tokens, seed, num_threads, do_prefault, bench_threads_list,
                                  argc, argv);
         return 0;
@@ -1765,7 +1776,7 @@ int main(int argc, char **argv) {
         if (!model_path) { fprintf(stderr, "No model file specified\n"); usage(argv[0]); return 1; }
         benchmark_context_scaling(model_path, prompt ? prompt :
             "You are standing in a dungeon. The darkness surrounds you, making it impossible to see more than a few feet in front of you. The air is thick with the stench of rot and decay. A faint luminescent glow emanates from your right hand. You notice a heavy iron door to your left, covered in strange runes that seem to pulse with an otherworldly energy.",
-            context_override, temperature, top_k, max_tokens, seed, num_threads, do_prefault,
+            context_override, &sparams, max_tokens, seed, num_threads, do_prefault,
             kv_type_k, kv_type_v, prompt_flag_f);
         return 0;
     }
@@ -1791,7 +1802,7 @@ int main(int argc, char **argv) {
         const char *child_j = getenv("PICOLM_BENCH_THREADS_CHILD");
         if (child_j && *child_j) {
             if (!model_path) { fprintf(stderr, "No model file specified\n"); return 1; }
-            benchmark_thread_scaling(model_path, prompt, context_override, temperature, top_k,
+            benchmark_thread_scaling(model_path, prompt, context_override, &sparams,
                                      max_tokens, seed, num_threads, do_prefault, "",
                                      argc, argv);
             return 0;
@@ -2090,7 +2101,7 @@ int main(int argc, char **argv) {
 
     /* Init sampler */
     sampler_t sampler;
-    sampler_init(&sampler, temperature, top_p, top_k, 0.05f, seed);
+    sampler_init(&sampler, &sparams, seed);
 
     /* Buffer for generated text (printed at the end for easy grepping) */
     char *gen_buf = malloc(max_tokens * 16); /* avg 16 bytes per token */
@@ -2367,8 +2378,11 @@ int main(int argc, char **argv) {
         }
     }
 
-    fprintf(stderr, "Prompt: %d tokens, generating up to %d (temp=%.2f, top_p=%.2f, threads=%d)\n",
-            n_prompt, max_tokens, (double)temperature, (double)top_p, num_threads);
+    fprintf(stderr, "Prompt: %d tokens, generating up to %d (temp=%.2f, top_p=%.2f, top_k=%d, "
+                    "min_p=%.2f, repeat_penalty=%.2f/%d, threads=%d)\n",
+            n_prompt, max_tokens, (double)sparams.temperature, (double)sparams.top_p,
+            sparams.top_k, (double)sparams.min_p, (double)sparams.repeat_penalty,
+            sparams.repeat_last_n, num_threads);
 
     /* ---- --benchmark-live ----
      * Install a per-layer timing callback for the ORDINARY generation path, so
@@ -2810,6 +2824,11 @@ int main(int argc, char **argv) {
 
     int token = 0;
     int next = 0;
+
+    /* Repetition-penalty history: the sampler appends every generated token
+     * itself, so seed it with the prompt here (llama.cpp penalises against
+     * prompt + generated history, not just what this process produced). */
+    sampler_set_history(&sampler, prompt_tokens, n_prompt);
 
     for (; pos < total_steps; pos++) {
         /* Generation: apply grammar constraints, then sample */

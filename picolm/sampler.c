@@ -47,24 +47,142 @@ static int cmp_prob_desc(const void *a, const void *b) {
 #define SAMPLER_SELECT_MAX_K 8192
 #endif
 
-void sampler_init(sampler_t *s, float temperature, float top_p, int top_k,
-                  float min_p, uint64_t seed) {
-    s->temperature = temperature;
-    s->top_p       = top_p;
-    s->top_k       = top_k;
-    s->min_p       = min_p;
-    s->rng_state   = seed ? seed : 42;
+void sampler_init(sampler_t *s, const sampling_params_t *p, uint64_t seed) {
+    s->params        = p ? *p : sampling_params_default();
+    s->rng_state     = seed ? seed : 42;
+    s->history       = NULL;
+    s->n_history     = 0;
+    s->history_head  = 0;
+}
+
+void sampler_free(sampler_t *s) {
+    if (!s) return;
+    free(s->history);
+    s->history = NULL;
+    s->n_history = 0;
+    s->history_head = 0;
+}
+
+void sampler_init_simple(sampler_t *s, float temperature, float top_p, int top_k,
+                         float min_p, uint64_t seed) {
+    sampling_params_t p = sampling_params_default();
+    p.temperature = temperature;
+    p.top_p       = top_p;
+    p.top_k       = top_k;
+    p.min_p       = min_p;
+    /* repeat_penalty/repeat_last_n keep their defaults (disabled), which is
+     * what this signature always implied. */
+    sampler_init(s, &p, seed);
+}
+
+void sampler_init_legacy(sampler_t *s, float temperature, float top_p, int top_k,
+                         float min_p, uint64_t seed) {
+    sampler_init_simple(s, temperature, top_p, top_k, min_p, seed);
+}
+
+void sampler_set_history(sampler_t *s, const int *tokens, int n_tokens) {
+    s->n_history    = 0;
+    s->history_head = 0;
+    if (!tokens || n_tokens <= 0) return;
+    if (!s->history) {
+        s->history = (int *)malloc((size_t)SAMPLER_HISTORY_CAP * sizeof(int));
+        if (!s->history) return;
+    }
+    if (n_tokens > SAMPLER_HISTORY_CAP) {
+        tokens   += n_tokens - SAMPLER_HISTORY_CAP;   /* keep the tail */
+        n_tokens  = SAMPLER_HISTORY_CAP;
+    }
+    memcpy(s->history, tokens, (size_t)n_tokens * sizeof(int));
+    s->n_history    = n_tokens;
+    s->history_head = n_tokens % SAMPLER_HISTORY_CAP;
+}
+
+/* Append a generated token to the history ring. */
+static void history_push(sampler_t *s, int tok) {
+    if (!s->history) {
+        s->history = (int *)malloc((size_t)SAMPLER_HISTORY_CAP * sizeof(int));
+        if (!s->history) return;
+    }
+    s->history[s->history_head] = tok;
+    s->history_head = (s->history_head + 1) % SAMPLER_HISTORY_CAP;
+    if (s->n_history < SAMPLER_HISTORY_CAP) s->n_history++;
+}
+
+sampling_params_t sampling_params_default(void) {
+    sampling_params_t p = SAMPLING_DEFAULTS;
+    return p;
+}
+
+int sampling_params_check(sampling_params_t *p) {
+    if (!p) return -1;
+    if (!isfinite(p->temperature) || p->temperature < 0.0f) p->temperature = PICOLM_DEF_TEMPERATURE;
+    if (!isfinite(p->top_p) || p->top_p <= 0.0f)          p->top_p       = PICOLM_DEF_TOP_P;
+    if (p->top_p > 1.0f)                                  p->top_p       = 1.0f;
+    if (p->top_k < 0)                                     p->top_k       = 0;   /* 0 = disabled */
+    if (!isfinite(p->min_p) || p->min_p < 0.0f)           p->min_p       = 0.0f;
+    if (p->min_p > 1.0f)                                  p->min_p       = 1.0f;
+    if (!isfinite(p->repeat_penalty) || p->repeat_penalty < 0.0f)
+        p->repeat_penalty = PICOLM_DEF_REPEAT_PENALTY;
+    if (p->repeat_last_n < 0)                             p->repeat_last_n = 0;
+    return 0;
+}
+
+/* Repetition penalty on RAW LOGITS, in llama.cpp's order and sign convention.
+ * Runs BEFORE softmax so it composes with top_k/top_p/min_p exactly as users
+ * expect from llama.cpp (and as the response's generation_settings claims).
+ *
+ * The academic version divides unconditionally; that makes tokens with
+ * NEGATIVE logits MORE likely, so llama.cpp multiplies instead -- same fix
+ * here. Frequency/presence terms are not exposed yet, but `count` is already
+ * accumulated for both, so adding them is a two-line change. */
+static void apply_repeat_penalty(sampler_t *s, float *logits, int vocab_size) {
+    const sampling_params_t *p = &s->params;
+    if (p->repeat_last_n <= 0 || s->n_history <= 0 || !s->history) return;
+    if (p->repeat_penalty == 1.0f) return;        /* disabled */
+
+    int n = p->repeat_last_n;
+    if (n > s->n_history) n = s->n_history;
+    if (n > SAMPLER_HISTORY_CAP) n = SAMPLER_HISTORY_CAP;
+
+    /* Walk the newest n entries of the ring, oldest first. Each DISTINCT token
+     * is penalised once (llama.cpp multiplies/divides by penalty_repeat and
+     * keeps a per-token count only for the freq/presence terms, which are not
+     * exposed yet). A small stack buffer of already-seen tokens avoids a
+     * vocab-sized map; repeat_last_n is small (64 by default). */
+    for (int i = 0; i < n; i++) {
+        int idx   = (s->history_head - n + i + SAMPLER_HISTORY_CAP * 2) % SAMPLER_HISTORY_CAP;
+        int tok   = s->history[idx];
+        if (tok < 0 || tok >= vocab_size) continue;
+
+        /* Already handled this token earlier in the window? */
+        int seen = 0;
+        for (int j = 0; j < i; j++) {
+            int jdx = (s->history_head - n + j + SAMPLER_HISTORY_CAP * 2) % SAMPLER_HISTORY_CAP;
+            if (s->history[jdx] == tok) { seen = 1; break; }
+        }
+        if (seen) continue;
+
+        float *l = &logits[tok];
+        if (*l <= 0.0f) *l *= p->repeat_penalty;
+        else            *l /= p->repeat_penalty;
+    }
 }
 
 /* llama.cpp order: penalties;dry;top_n_sigma;top_k;typ_p;top_p;min_p;xtc;temperature
-   PicoLM implements: top_k -> top_p -> min_p -> temperature -> sample */
+   PicoLM implements: penalties -> top_k -> top_p -> min_p -> temperature -> sample */
 int sampler_sample(sampler_t *s, float *logits, int vocab_size) {
+    const sampling_params_t *p = &s->params;
+
+    /* 0. Repetition penalty, on raw logits, before anything else. */
+    apply_repeat_penalty(s, logits, vocab_size);
+
     /* Greedy (temperature 0) */
-    if (s->temperature <= 0.0f) {
+    if (p->temperature <= 0.0f) {
         int best = 0;
         for (int i = 1; i < vocab_size; i++) {
             if (logits[i] > logits[best]) best = i;
         }
+        history_push(s, best);
         return best;
     }
 
@@ -99,7 +217,7 @@ int sampler_sample(sampler_t *s, float *logits, int vocab_size) {
      * top_p; otherwise the full sort below runs (correct, and cheap to detect).
      * Real LM logits are peaked enough that the cap holds in practice, but the
      * check makes that a measurement rather than an assumption. */
-    int want_k = (s->top_k > 0 && s->top_k < vocab_size) ? s->top_k : SAMPLER_TOPK_UNBOUNDED;
+    int want_k = (p->top_k > 0 && p->top_k < vocab_size) ? p->top_k : SAMPLER_TOPK_UNBOUNDED;
     if (want_k > vocab_size) want_k = vocab_size;
     /* The selection below keeps a sorted k-element list, so it must stay cheap:
      * with k near vocab_size the memmove inside the k-array dominates. Above
@@ -137,10 +255,10 @@ int sampler_sample(sampler_t *s, float *logits, int vocab_size) {
         /* If top-k is disabled, top_p is applied over the FULL vocabulary, so
          * a cap is only safe when the retained entries cover it. Verify, and
          * fall back to the full sort otherwise (flat/untrained logits). */
-        if (s->top_k <= 0 && k_limit < vocab_size) {
+        if (p->top_k <= 0 && k_limit < vocab_size) {
             double kept = 0.0;
             for (int i = 0; i < k_limit; i++) kept += (double)sorted[i].prob;
-            if (kept + 1e-6 < (double)s->top_p) use_partial = 0;
+            if (kept + 1e-6 < (double)p->top_p) use_partial = 0;
         }
         if (!use_partial) { free(sorted); sorted = NULL; }
     }
@@ -165,12 +283,12 @@ int sampler_sample(sampler_t *s, float *logits, int vocab_size) {
     for (int i = 0; i < k_limit; i++) {
         cum += sorted[i].prob;
         cutoff = i + 1;
-        if (cum >= s->top_p) break;
+        if (cum >= p->top_p) break;
     }
 
     /* 5. Apply min_p: remove tokens with prob < min_p * max_prob */
-    if (s->min_p > 0.0f && cutoff > 1) {
-        float min_threshold = s->min_p * sorted[0].prob;
+    if (p->min_p > 0.0f && cutoff > 1) {
+        float min_threshold = p->min_p * sorted[0].prob;
         int new_cutoff = 0;
         for (int i = 0; i < cutoff; i++) {
             if (sorted[i].prob >= min_threshold) {
@@ -182,7 +300,7 @@ int sampler_sample(sampler_t *s, float *logits, int vocab_size) {
     }
 
     /* 6. Apply temperature: scale to p^(1/T), renormalize */
-    float inv_temp = 1.0f / s->temperature;
+    float inv_temp = 1.0f / p->temperature;
     float sum_scaled = 0.0f;
     for (int i = 0; i < cutoff; i++) {
         sorted[i].prob = powf(sorted[i].prob, inv_temp);
@@ -208,5 +326,6 @@ int sampler_sample(sampler_t *s, float *logits, int vocab_size) {
     }
 
     free(sorted);
+    history_push(s, result);
     return result;
 }
