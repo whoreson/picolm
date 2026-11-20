@@ -2442,6 +2442,42 @@ static char *chat_to_prompt(cJSON *messages, const char *system_template, int is
     return prompt;
 }
 
+/* Prompt caching: find the shared prefix between `ptokens` (this request) and
+ * the KV cache contents of the previous request (`srv.last_prompt_tokens`).
+ *
+ * Returns the number of leading tokens already in the cache, i.e. the position
+ * the new prefill must start at. 0 means "process the whole prompt".
+ *
+ * `cache_prompt`: llama.cpp semantics -- when false the request must NOT be
+ * matched against the cache, so the whole prompt is evaluated again (useful to
+ * measure real prefill cost, or to avoid inheriting a poisoned cache). The KV
+ * cache is still written and kept afterwards either way, exactly as llama.cpp
+ * does: this only controls whether an existing entry is REUSED for this
+ * request, not whether the result is stored.
+ *
+ * On the caller side, a return of 0 is enough: the prefill path with
+ * start_pos == 0 overwrites the cache rows from position 0, and the
+ * last_prompt_tokens bookkeeping below the call site is unaffected. */
+static int kv_cache_match(const int *ptokens, int n_prompt, int cache_prompt) {
+    if (!cache_prompt) {
+        fprintf(stderr, "[server] cache_prompt=false: ignoring the %d cached tokens, "
+                        "re-evaluating the whole prompt\n", srv.last_prompt_len);
+        return 0;
+    }
+    int cache_start = 0;
+    int min_len = n_prompt < srv.last_prompt_len ? n_prompt : srv.last_prompt_len;
+    if (srv.last_prompt_tokens && min_len > 0) {
+        for (cache_start = 0; cache_start < min_len; cache_start++) {
+            if (ptokens[cache_start] != srv.last_prompt_tokens[cache_start]) break;
+        }
+    }
+    /* A cache hit that covers the ENTIRE prompt cannot produce logits for the
+     * next token without a stepback, and callers handle that separately (see
+     * cache_adjust_stepback). Leaving the value here keeps behaviour identical
+     * to the six hand-written copies this replaced. */
+    return cache_start;
+}
+
 /* Debug: print KV cache mismatch context around the first differing token */
 static void kv_cache_mismatch_debug(const int *ptokens, int cache_start, int min_len, tokenizer_t *tokenizer) {
     fprintf(stderr, "[server] KV CACHE MISMATCH at token %d: ", cache_start);
@@ -2507,6 +2543,10 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
     int n_choices = 1;
     int do_stream = 0;
     int timings_per_token = 0;
+    /* cache_prompt: llama.cpp semantics, default true. false = do NOT reuse the
+     * existing KV cache for this request (re-evaluate the prompt from position
+     * 0) while still writing the resulting cache. */
+    int cache_prompt = 1;
     char *model_name = NULL;
 
     if (is_chat) {
@@ -2553,6 +2593,8 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
     if ((item = cJSON_GetObjectItem(req, "n"))) n_choices = (int)cJSON_GetNumberValue(item);
     if (n_choices < 1) n_choices = 1;
     if (n_choices > 4) n_choices = 4;
+    if ((item = cJSON_GetObjectItem(req, "cache_prompt")) && cJSON_IsBool(item))
+        cache_prompt = cJSON_IsTrue(item) ? 1 : 0;
     /* Parse stop words - MUST copy before cJSON_Delete.
      * Accept both array ["stop1","stop2"] and single string "stop". */
     stop_matcher_t sm;
@@ -2611,14 +2653,10 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         max_tokens = model->config.max_seq_len - n_prompt;
     }
 
-    /* Prompt caching: find shared prefix with last request */
-    int cache_start = 0;
+    /* Prompt caching: find shared prefix with last request (honours
+     * cache_prompt; see kv_cache_match). */
+    int cache_start = kv_cache_match(ptokens, n_prompt, cache_prompt);
     int min_len = n_prompt < srv.last_prompt_len ? n_prompt : srv.last_prompt_len;
-    if (srv.last_prompt_tokens) {
-        for (cache_start = 0; cache_start < min_len; cache_start++) {
-            if (ptokens[cache_start] != srv.last_prompt_tokens[cache_start]) break;
-        }
-    }
     int start_pos = cache_start;
     fprintf(stderr, "[server] %.1fms: KV cache match %d/%d tokens (%d new)\n", get_time_ms() - t0, start_pos, n_prompt, n_prompt - start_pos);
 
@@ -3199,6 +3237,10 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
     int do_stream = 0;
     int return_tokens = 0;
     int ignore_eos = 0;
+    /* cache_prompt: llama.cpp semantics, default true. false = do NOT try to
+     * reuse the existing KV cache for this request (re-evaluate the prompt from
+     * position 0) while still writing the resulting cache. */
+    int cache_prompt = 1;
     char *model_name = NULL;
 
     cJSON *item;
@@ -3226,6 +3268,8 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         return_tokens = 1;
     if ((item = cJSON_GetObjectItem(req, "ignore_eos")) && cJSON_IsTrue(item))
         ignore_eos = 1;
+    if ((item = cJSON_GetObjectItem(req, "cache_prompt")) && cJSON_IsBool(item))
+        cache_prompt = cJSON_IsTrue(item) ? 1 : 0;
     if ((item = cJSON_GetObjectItem(req, "model")) && cJSON_IsString(item))
         model_name = strdup(item->valuestring);
 
@@ -3294,14 +3338,9 @@ static void handle_llama_completion(SOCKET sock, const char *request_body) {
         return;
     }
 
-    /* Prompt caching: find shared prefix */
-    int cache_start = 0;
+    /* Prompt caching: find shared prefix (honours cache_prompt). */
+    int cache_start = kv_cache_match(ptokens, n_prompt, cache_prompt);
     int min_len = n_prompt < srv.last_prompt_len ? n_prompt : srv.last_prompt_len;
-    if (srv.last_prompt_tokens) {
-        for (cache_start = 0; cache_start < min_len; cache_start++) {
-            if (ptokens[cache_start] != srv.last_prompt_tokens[cache_start]) break;
-        }
-    }
     /* Use shared prefix from KV cache. Stale KV data at positions beyond
      * the prompt is harmless during generation (it gets overwritten).
      * When the prompt is fully cached, we step back 1 token below so that
