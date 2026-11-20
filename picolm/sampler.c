@@ -34,6 +34,19 @@ static int cmp_prob_desc(const void *a, const void *b) {
 
 /* ---- Public API ---- */
 
+/* Cap on how many entries a top-k DISABLED sample (top_k <= 0, i.e. llama.cpp's
+ * "top-k off") selects. Verified against the retained probability mass below,
+ * so this bounds the per-token cost without changing what gets sampled. */
+#ifndef SAMPLER_TOPK_UNBOUNDED
+#define SAMPLER_TOPK_UNBOUNDED 1024
+#endif
+
+/* Above this k the sorted-insertion selection loses to a plain qsort (the
+ * in-place memmove grows with k), so fall back to the sort. */
+#ifndef SAMPLER_SELECT_MAX_K
+#define SAMPLER_SELECT_MAX_K 8192
+#endif
+
 void sampler_init(sampler_t *s, float temperature, float top_p, int top_k,
                   float min_p, uint64_t seed) {
     s->temperature = temperature;
@@ -72,37 +85,74 @@ int sampler_sample(sampler_t *s, float *logits, int vocab_size) {
      * indirection per comparison, no cache-hostile full sort. With the default
      * top_k = 40 that is 40 linear scans instead of a sort. Order among equal
      * probabilities can differ from qsort's, so outputs are only identical for
-     * distinct probabilities; logits after softmax are effectively never tied. */
-    int k_limit = vocab_size;
-    int use_partial = s->top_k > 0 && s->top_k < vocab_size;
-    if (use_partial) k_limit = s->top_k;
+     * distinct probabilities; logits after softmax are effectively never tied.
+     *
+     * top_k <= 0 means "top-k DISABLED" (llama.cpp semantics -- and exactly
+     * what a client sending `"top_k":0` asks for; llama.cpp's own default
+     * request body does that). Keeping a CAP for that case is a large win:
+     * the full sort costs ~35 ms/token on the 27B's 248,320-token vocabulary,
+     * which was 42% of the token time and dropped the HTTP server from 19.7 to
+     * 11.9 tok/s with the GPU 40% idle -- the server looked ~35% slower than
+     * the CLI simply because the CLI's default top_k = 40 takes the cheap path.
+     *
+     * SAMPLER_TOPK_UNBOUNDED is only used when the retained mass still covers
+     * top_p; otherwise the full sort below runs (correct, and cheap to detect).
+     * Real LM logits are peaked enough that the cap holds in practice, but the
+     * check makes that a measurement rather than an assumption. */
+    int want_k = (s->top_k > 0 && s->top_k < vocab_size) ? s->top_k : SAMPLER_TOPK_UNBOUNDED;
+    if (want_k > vocab_size) want_k = vocab_size;
+    /* The selection below keeps a sorted k-element list, so it must stay cheap:
+     * with k near vocab_size the memmove inside the k-array dominates. Above
+     * this bound the plain qsort is both faster and exactly equivalent. */
+    int use_partial = want_k <= SAMPLER_SELECT_MAX_K;
 
+    int k_limit = use_partial ? want_k : vocab_size;
     prob_index_t *sorted = (prob_index_t *)malloc((size_t)k_limit * sizeof(prob_index_t));
     if (!sorted) return 0;
     if (use_partial) {
-        /* Partial selection: O(vocab * k_limit) -- cheap when k_limit << vocab_size.
-         * When k_limit >= vocab_size this would be O(vocab^2), catastrophically
-         * slower than qsort's O(vocab * log vocab). Guard against it above. */
-        float *work = (float *)malloc((size_t)vocab_size * sizeof(float));
-        uint8_t *taken = (uint8_t *)calloc((size_t)vocab_size, 1);
-        if (!work || !taken) { free(work); free(taken); free(sorted); return 0; }
-        memcpy(work, logits, (size_t)vocab_size * sizeof(float));
-        for (int i = 0; i < k_limit; i++) {
-            int best = -1; float bv = -INFINITY;
-            for (int j = 0; j < vocab_size; j++) {
-                if (!taken[j] && work[j] > bv) { bv = work[j]; best = j; }
+        /* Single linear pass over the vocabulary, keeping the best `want_k` in
+         * descending order: for each entry that beats the current k-th largest,
+         * binary-search its slot and memmove once. O(vocab) in the common case,
+         * O(vocab*log k) worst. NOT k repeated full scans of the vocabulary:
+         * that is O(vocab*k) = 250M+ ops at k=1024 and measured 397 ms/token. */
+        int n = 0;
+        float vmin = -INFINITY;         /* sorted[n-1].prob once n == want_k */
+        for (int j = 0; j < vocab_size; j++) {
+            float v = logits[j];
+            if (n == want_k && v <= vmin) continue;
+            int lo = 0, hi = n;
+            while (lo < hi) {
+                int mid = (lo + hi) >> 1;
+                if (sorted[mid].prob >= v) lo = mid + 1; else hi = mid;
             }
-            if (best < 0) { k_limit = i; break; }
-            taken[best] = 1;
-            sorted[i].prob = bv;
-            sorted[i].index = best;
+            if (n < want_k) n++;
+            if (lo < n - 1)
+                memmove(&sorted[lo + 1], &sorted[lo], (size_t)(n - 1 - lo) * sizeof(prob_index_t));
+            sorted[lo].prob  = v;
+            sorted[lo].index = j;
+            if (n == want_k) vmin = sorted[n - 1].prob;
         }
-        free(work); free(taken);
-    } else {
-        /* Full sort: O(vocab * log vocab), always fast enough. */
+        k_limit = n;
+
+        /* If top-k is disabled, top_p is applied over the FULL vocabulary, so
+         * a cap is only safe when the retained entries cover it. Verify, and
+         * fall back to the full sort otherwise (flat/untrained logits). */
+        if (s->top_k <= 0 && k_limit < vocab_size) {
+            double kept = 0.0;
+            for (int i = 0; i < k_limit; i++) kept += (double)sorted[i].prob;
+            if (kept + 1e-6 < (double)s->top_p) use_partial = 0;
+        }
+        if (!use_partial) { free(sorted); sorted = NULL; }
+    }
+    if (!use_partial) {
+        k_limit = vocab_size;
+        sorted = (prob_index_t *)malloc((size_t)k_limit * sizeof(prob_index_t));
+        if (!sorted) return 0;
+        /* Full sort: O(vocab * log vocab). */
         for (int i = 0; i < vocab_size; i++) {
             sorted[i].prob  = logits[i];
             sorted[i].index = i;
+
         }
         qsort(sorted, (size_t)vocab_size, sizeof(prob_index_t), cmp_prob_desc);
     }
