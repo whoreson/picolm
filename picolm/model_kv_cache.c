@@ -43,6 +43,8 @@ typedef long long off_t;
  * ================================================================ */
 
 /* Flush buffered write to file descriptor. Returns 0 on success, -1 on error. */
+static int _kv_errno;   /* errno of the last failure inside kvcache_save */
+
 static int _kv_flush(int fd, uint8_t *buf, size_t *buf_off) {
     if (*buf_off == 0) return 0;
     ssize_t w;
@@ -52,6 +54,13 @@ static int _kv_flush(int fd, uint8_t *buf, size_t *buf_off) {
     w = write(fd, buf, *buf_off);
 #endif
     if (w != (ssize_t)*buf_off) {
+        /* Report WHY. A silent -1 from here is what made "/slots?action=save"
+         * return a bare "Failed to save slot" with a 0-byte file on disk and
+         * no clue which of open/write/close failed or with what errno. */
+        int e = errno;
+        _kv_errno = e;
+        fprintf(stderr, "kvcache_save: write failed (%zd of %zu bytes, errno=%d: %s)\n",
+                w, *buf_off, e, strerror(e));
 #ifdef _WIN32
         _close(fd);
 #else
@@ -123,7 +132,9 @@ static void _kv_close(int fd) {
 #endif
 }
 
-int kvcache_save(const model_t *m, const char *path, int n_pos, const int *tokens) {
+int kvcache_save_ex(const model_t *m, const char *path, int n_pos, const int *tokens,
+                    int *out_errno) {
+    _kv_errno = 0;
     const model_config_t *c = &m->config;
     const run_state_t *s = &m->state;
 
@@ -135,7 +146,11 @@ int kvcache_save(const model_t *m, const char *path, int n_pos, const int *token
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 #endif
     if (fd < 0) {
-        fprintf(stderr, "kvcache_save: cannot open %s\n", path);
+        int e = errno;
+        _kv_errno = e;
+        fprintf(stderr, "kvcache_save: cannot open %s (errno=%d: %s)\n",
+                path, e, strerror(e));
+        if (out_errno) *out_errno = e;
         return -1;
     }
 
@@ -304,10 +319,16 @@ int kvcache_save(const model_t *m, const char *path, int n_pos, const int *token
         free(glm5_buf);
     }
 
-    if (_kv_flush(fd, buf, &buf_off)) return -1;
+    if (_kv_flush(fd, buf, &buf_off)) { if (out_errno) *out_errno = _kv_errno; return -1; }
     _kv_close(fd);
     fprintf(stderr, "\nKV cache saved: %d positions to %s\n", n_pos, path);
+    if (out_errno) *out_errno = 0;
     return 0;
+}
+
+/* Backwards-compatible entry point: same behaviour, errno discarded. */
+int kvcache_save(const model_t *m, const char *path, int n_pos, const int *tokens) {
+    return kvcache_save_ex(m, path, n_pos, tokens, NULL);
 }
 
 int kvcache_load(model_t *m, const char *path, int **tokens_out) {

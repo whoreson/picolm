@@ -937,8 +937,12 @@ void model_free(model_t *m);
 
 /* Save KV cache state for positions [0, n_pos) to a file.
  * tokens: pointer to token array (optional, NULL if not saving tokens).
- * Returns 0 on success. */
+ * Returns 0 on success. On failure returns -1 and, when out_errno is not NULL,
+ * stores the errno of the failing open()/_write() call so callers can report
+ * the real cause (ENOSPC, EACCES, ...) instead of a bare "failed". */
 int kvcache_save(const model_t *m, const char *path, int n_pos, const int *tokens);
+int kvcache_save_ex(const model_t *m, const char *path, int n_pos, const int *tokens,
+                    int *out_errno);
 
 /* Load KV cache state from a file. Returns the number of positions
  * loaded (0 on failure). *tokens_out is set to a malloc'd token array

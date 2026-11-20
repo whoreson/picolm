@@ -1813,12 +1813,32 @@ static void handle_slots_post(SOCKET sock, const char *body) {
          * unconditionally, so clamp here rather than ever read past the array. */
         int save_pos = srv.kv_pos;
         if (save_pos > srv.last_prompt_len) save_pos = srv.last_prompt_len;
-        int rc = kvcache_save(&srv.model, full_path, save_pos, srv.last_prompt_tokens);
+        int save_errno = 0;
+        int rc = kvcache_save_ex(&srv.model, full_path, save_pos,
+                                 srv.last_prompt_tokens, &save_errno);
         double t_ms = get_time_ms() - t0;
 
         if (rc != 0) {
-            http_send(sock, 500, "application/json",
-                "{\"error\":{\"message\":\"Failed to save slot\"}}");
+            /* Say WHY. A bare "Failed to save slot" over a 0-byte file is what
+             * made a full disk look like a PicoLM/Windows path bug. */
+            char msg[2048 + 256];   /* must hold full_path (2048) + text */
+            if (save_errno)
+                snprintf(msg, sizeof(msg),
+                    "Failed to save slot: %s (errno=%d, path=%s)",
+                    strerror(save_errno), save_errno, full_path);
+            else
+                snprintf(msg, sizeof(msg),
+                    "Failed to save slot: nothing to save (no KV positions) or bad path (%s)",
+                    full_path);
+            cJSON *eo = cJSON_CreateObject();
+            cJSON *em = cJSON_CreateObject();
+            cJSON_AddStringToObject(em, "message", msg);
+            if (save_errno) cJSON_AddNumberToObject(em, "errno", save_errno);
+            cJSON_AddItemToObject(eo, "error", em);
+            char *js = cJSON_PrintUnformatted(eo);
+            http_send(sock, 500, "application/json", js ? js : "{\"error\":\"save failed\"}");
+            free(js);
+            cJSON_Delete(eo);
             return;
         }
 
@@ -1835,23 +1855,30 @@ static void handle_slots_post(SOCKET sock, const char *body) {
                 /* Checkpoint header: 2 uint32_t = [CHECKPOINT_MAGIC, count] */
                 uint32_t cp_magic = 0x43505350; /* "CSPS" backwards */
                 uint32_t cp_count = (uint32_t)n_cps;
+                /* Every write is checked. These used to ignore their return
+                 * values, so a slot file that ran out of space at this point
+                 * was reported as fully saved while being truncated: the
+                 * reader then loaded a half-written checkpoint set. */
+                int cp_ok = 1;
 #ifdef _WIN32
-                _write(fd, (char *)&cp_magic, sizeof(cp_magic));
-                _write(fd, (char *)&cp_count, sizeof(cp_count));
+                if (_write(fd, (char *)&cp_magic, sizeof(cp_magic)) != (int)sizeof(cp_magic) ||
+                    _write(fd, (char *)&cp_count, sizeof(cp_count)) != (int)sizeof(cp_count)) cp_ok = 0;
 #else
-                write(fd, &cp_magic, sizeof(cp_magic));
-                write(fd, &cp_count, sizeof(cp_count));
+                if (write(fd, &cp_magic, sizeof(cp_magic)) != (ssize_t)sizeof(cp_magic) ||
+                    write(fd, &cp_count, sizeof(cp_count)) != (ssize_t)sizeof(cp_count)) cp_ok = 0;
 #endif
                 /* Write each checkpoint: [n_tokens (uint32_t), data (bytes)] */
                 picolm_checkpoint_t *cp = srv.checkpoints;
-                while (cp) {
+                while (cp && cp_ok) {
                     uint32_t cp_n = (uint32_t)cp->n_tokens;
 #ifdef _WIN32
-                    _write(fd, (char *)&cp_n, sizeof(cp_n));
-                    _write(fd, (char *)cp->data, (unsigned)srv.checkpoint_snapshot_size);
+                    if (_write(fd, (char *)&cp_n, sizeof(cp_n)) != (int)sizeof(cp_n)) cp_ok = 0;
+                    if (cp_ok && _write(fd, (char *)cp->data, (unsigned)srv.checkpoint_snapshot_size)
+                                 != (int)srv.checkpoint_snapshot_size) cp_ok = 0;
 #else
-                    write(fd, &cp_n, sizeof(cp_n));
-                    write(fd, cp->data, srv.checkpoint_snapshot_size);
+                    if (write(fd, &cp_n, sizeof(cp_n)) != (ssize_t)sizeof(cp_n)) cp_ok = 0;
+                    if (cp_ok && write(fd, cp->data, srv.checkpoint_snapshot_size)
+                                 != (ssize_t)srv.checkpoint_snapshot_size) cp_ok = 0;
 #endif
                     cp = cp->next;
                 }
@@ -1860,6 +1887,30 @@ static void handle_slots_post(SOCKET sock, const char *body) {
 #else
                 close(fd);
 #endif
+                if (!cp_ok) {
+                    int e = errno;
+                    fprintf(stderr, "\n[server] WARNING: checkpoint append to %s failed "
+                                    "(errno=%d: %s); the slot file is incomplete\n",
+                            full_path, e, strerror(e));
+                    {   /* Report it instead of claiming success. */
+                        char msg[2048 + 256];
+                        snprintf(msg, sizeof(msg),
+                            "Slot written but %d SSM checkpoints could not be appended: %s "
+                            "(errno=%d, path=%s). The file is incomplete; restore will only "
+                            "work up to the checkpoint data.",
+                            n_cps, strerror(e), e, full_path);
+                        cJSON *eo = cJSON_CreateObject();
+                        cJSON *em = cJSON_CreateObject();
+                        cJSON_AddStringToObject(em, "message", msg);
+                        cJSON_AddNumberToObject(em, "errno", e);
+                        cJSON_AddItemToObject(eo, "error", em);
+                        char *js = cJSON_PrintUnformatted(eo);
+                        http_send(sock, 500, "application/json", js ? js : "{\"error\":\"append failed\"}");
+                        free(js);
+                        cJSON_Delete(eo);
+                        return;
+                    }
+                }
                 fprintf(stderr, "\n[server] Saved %d SSM checkpoints (%.1f MB total)\n",
                         n_cps, (double)n_cps * (double)srv.checkpoint_snapshot_size / (1024*1024));
             }
