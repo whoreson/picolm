@@ -3562,9 +3562,16 @@ float *model_forward_glm5(model_t *m, int token, int pos)
         }
         float ss = 0.f;
         for (int i = 0; i < D; i++) ss += s->glm5.cur[i] * s->glm5.cur[i];
+        if (glm5_stats_wanted()) {
+            glm5_stats("head_in", s->glm5.cur, D);
+            double mu = 0.0;
+            for (int i = 0; i < D; i++) mu += s->glm5.cur[i];
+            fprintf(stderr, "GLM5 STAT head_in_mean n=1 mean=%.9f\n", mu / D);
+        }
         float inv = 1.0f / sqrtf(ss / D + c->rms_norm_eps);
         const float *nw = s->output_norm_w;   /* predequantized output_norm */
         for (int i = 0; i < D; i++) s->glm5.cur[i] *= inv * nw[i];
+        if (glm5_stats_wanted()) glm5_stats("head_normed", s->glm5.cur, D);
         double _t_head = glm5_prof_mode() ? glm5_prof_now() : 0.0;
         matmul(s->logits, s->glm5.cur, w->output, D, c->vocab_size, w->type_output);
         if (_t_head) glm5_prof_add(GP_HEAD, _t_head);
@@ -4148,6 +4155,15 @@ static int glm5_hc_diag_wanted(void) {
     static int cached = -1;
     if (cached < 0)
         cached = (glm5_stats_wanted() || getenv("PICOLM_DBG_DUMP_LAYER") || getenv("PICOLM_DBG_HCVEC")) ? 1 : 0;
+    return cached;
+}
+
+/* Which token of the prefill batch the PICOLM_DBG_DUMP_LAYER / PICOLM_DBG_HCVEC dumps describe.
+ * The ik oracle's l_out-<N> tensor holds the last token of its batch, so a prefill-vs-oracle
+ * element-wise diff has to select the matching token. Default 0 (the historical behaviour). */
+static int glm5_dump_tok(void) {
+    static int cached = -2;
+    if (cached == -2) { const char *e = getenv("PICOLM_DBG_DUMP_TOK"); cached = e ? atoi(e) : 0; }
     return cached;
 }
 /* 1 if it ran in parallel; 0 if the caller must run the serial loop (diagnostics on, no memory). */
@@ -4832,7 +4848,10 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                     snprintf(t2, sizeof(t2), "l%02d.x_in", il);
                     glm5_stats(t2, hc_x_t, S*D);
                 }
-                if (t == 0) {
+                /* PICOLM_DBG_DUMP_TOK selects which token of the prefill batch is dumped (default 0).
+                 * The ik oracle's l_out-<N> holds the LAST token of its batch, so diffing a prefill
+                 * against QORACLE_DUMP needs this to point at the same token. */
+                if (t == glm5_dump_tok()) {
                     static int dl = -2;
                     if (dl == -2) { const char *e = getenv("PICOLM_DBG_DUMP_LAYER"); dl = e ? atoi(e) : -1; }
                     if (dl == il) {
@@ -4844,7 +4863,7 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                     }
                 }
                 glm5_hc_pre(m, gw, 1, hc_x_t, cur_t, post_t, comb_t, s->glm5.hc_scratch);
-                if (t == 0) {
+                if (t == glm5_dump_tok()) {
                     static int wl = -2;
                     if (wl == -2) { const char *e = getenv("PICOLM_DBG_HCVEC"); wl = e ? atoi(e) : -1; }
                     if (wl == il) {
@@ -5150,7 +5169,7 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                 float *comb_t = comb_b + (size_t)t*S*S;
                 float *attn_t = attn_b + (size_t)t*D;
                 glm5_hc_post(m, attn_t, res_t, post_t, comb_t, hc_x_t);
-                if (t == 0) {
+                if (t == glm5_dump_tok()) {
                     static int wl = -2;
                     if (wl == -2) { const char *e = getenv("PICOLM_DBG_HCVEC"); wl = e ? atoi(e) : -1; }
                     if (wl == il) {
@@ -5246,7 +5265,7 @@ float *model_forward_prefill_glm5(model_t *m, const int *tokens, int n_tokens,
                 float *post_t = post_b + (size_t)t*S;
                 float *comb_t = comb_b + (size_t)t*S*S;
                 float *attn_t = attn_b + (size_t)t*D;
-                if (t == 0) {
+                if (t == glm5_dump_tok()) {
                     static int wl2 = -2;
                     if (wl2 == -2) { const char *e = getenv("PICOLM_DBG_HCVEC"); wl2 = e ? atoi(e) : -1; }
                     if (wl2 == il) {
