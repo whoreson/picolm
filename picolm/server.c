@@ -2304,10 +2304,82 @@ static void handle_slots(SOCKET sock) {
 
 /* ---- Build prompt from chat messages or raw text ---- */
 
+/* Qwen3 chatml role tags. Hex-escaped so the raw token bytes never appear
+ * verbatim in this source (they are the model's im-start / im-end tags). */
+static const char *QW_IM_START = "\x3C\x7C\x69\x6D\x5F\x73\x74\x61\x72\x74\x7C\x3E";
+static const char *QW_IM_END   = "\x3C\x7C\x69\x6D\x5F\x65\x6E\x64\x7C\x3E";
+static const char *QW_THINK_O  = "\x3C\x74\x68\x69\x6E\x6B\x3E";    /* think-open  */
+static const char *QW_THINK_C  = "\x3C\x2F\x74\x68\x69\x6E\x6B\x3E"; /* think-close */
+
+/* Build a Qwen chatml prompt from chat messages. Matches the CLI's -pf
+ * template, which is verified correct for Qwen instruct models: a system
+ * block, one block per message (content directly followed by the closing
+ * tag), then an assistant generation prompt with a CLOSED think block to
+ * request a direct answer. */
+static char *qwen_chatml_build(cJSON *messages, const char *system_template) {
+    int n = cJSON_GetArraySize(messages);
+
+    /* first pass: total length + first system content + last role */
+    const char *sys_content = NULL;
+    const char *last_role = NULL;
+    size_t total = 0;
+    for (int i = 0; i < n; i++) {
+        cJSON *msg = cJSON_GetArrayItem(messages, i);
+        cJSON *role = cJSON_GetObjectItem(msg, "role");
+        cJSON *content = cJSON_GetObjectItem(msg, "content");
+        if (!role || !content) continue;
+        const char *rs = cJSON_GetStringValue(role);
+        const char *cs = cJSON_GetStringValue(content);
+        if (!rs || !cs) continue;
+        if (strcmp(rs, "system") == 0 && !sys_content) sys_content = cs;
+        last_role = rs;
+        total += strlen(rs) + strlen(cs) + 16;
+    }
+    if (!sys_content) sys_content = "A chat between a curious user and an assistant.";
+
+    char *buf = (char *)malloc(total + strlen(sys_content) + 256 + 1);
+    if (!buf) return NULL;
+    buf[0] = '\0';
+
+    /* system block: {tag}system\n{sys}\n{tag}\n */
+    strcat(buf, QW_IM_START); strcat(buf, "system\n");
+    strcat(buf, sys_content); strcat(buf, "\n");
+    strcat(buf, QW_IM_END); strcat(buf, "\n");
+
+    /* each non-system message: {tag}{role}\n{content}{tag}\n */
+    for (int i = 0; i < n; i++) {
+        cJSON *msg = cJSON_GetArrayItem(messages, i);
+        cJSON *role = cJSON_GetObjectItem(msg, "role");
+        cJSON *content = cJSON_GetObjectItem(msg, "content");
+        if (!role || !content) continue;
+        const char *rs = cJSON_GetStringValue(role);
+        const char *cs = cJSON_GetStringValue(content);
+        if (!rs || !cs) continue;
+        if (strcmp(rs, "system") == 0) continue;
+        strcat(buf, QW_IM_START); strcat(buf, rs); strcat(buf, "\n");
+        strcat(buf, cs);
+        strcat(buf, QW_IM_END); strcat(buf, "\n");
+    }
+
+    /* generation prompt (skip if the client already ended on an assistant
+     * turn): open assistant + a CLOSED think block => direct answer */
+    if (!(last_role && strcmp(last_role, "assistant") == 0)) {
+        strcat(buf, QW_IM_START); strcat(buf, "assistant\n");
+        strcat(buf, QW_THINK_O); strcat(buf, "\n");
+        strcat(buf, "\n");
+        strcat(buf, QW_THINK_C); strcat(buf, "\n");
+        strcat(buf, "\n");
+    }
+    return buf;
+}
+
 /* Convert chat messages to a prompt string.
- * Simple template: each message becomes "### {role}\n{text}\n\n".
+ * Qwen models get the chatml template (verified correct for instruct Qwen);
+ * other models get the simple "### {role}\n{text}\n\n" template.
  * Returns a malloc'd string. */
-static char *chat_to_prompt(cJSON *messages, const char *system_template) {
+static char *chat_to_prompt(cJSON *messages, const char *system_template, int is_qwen) {
+    if (is_qwen)
+        return qwen_chatml_build(messages, system_template);
     size_t total_len = 0;
     int n_msgs = cJSON_GetArraySize(messages);
 
@@ -2448,7 +2520,7 @@ static void handle_completion(SOCKET sock, const char *request_body, int is_chat
         cJSON *sti = cJSON_GetObjectItem(req, "system_template");
         if (sti) sys_template = cJSON_GetStringValue(sti);
 
-        chat_prompt = chat_to_prompt(messages, sys_template);
+        chat_prompt = chat_to_prompt(messages, sys_template, model->config.is_qwen);
         fprintf(stderr, "[server] %.1fms: chat template built (%d chars)\n", get_time_ms() - t0, (int)strlen(chat_prompt));
         if (!chat_prompt) {
             http_send(sock, 400, "application/json", "{\"error\":{\"message\":\"Failed to build prompt\"}}");
