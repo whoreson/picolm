@@ -5697,9 +5697,22 @@ float *model_forward_gpu(model_t *m, int token, int pos) {
 #ifdef PICOLM_VIZ
         /* Residual stream after this layer, for the VNC visualization.
          * pipe_x lives in VRAM, so this is a D2H of one row -- hence the
-         * viz_active() guard: when nobody is attached we spend nothing. */
+         * viz_active() guard: when nobody is attached we spend nothing.
+         *
+         * picolm_gpu_sync() is REQUIRED, not just belt-and-braces: the layer
+         * kernels run on ctx->stream, which is created with gpuStreamNonBlocking,
+         * while picolm_gpu_memcpy(dir<0) uses the synchronous gpuMemcpy on the
+         * DEFAULT stream. Those two have no ordering relationship at all, so
+         * without the sync the copy raced the kernels and read partially
+         * written / previous-layer residuals -- the "funky" GPU-only display.
+         * The cost is one device sync per layer per ubatch, paid whenever
+         * --viz is active (viz_active() tracks viz_init(), not viewer count,
+         * so that a client attaching later still sees the recent history).
+         * A prefill with --viz is therefore slower than one without; if that
+         * ever matters, add a viewer-count check to viz_active(). */
         if (viz_active()) {
             float *viz_row = picolm_gpu_staging_host(gpu_dev, (size_t)dim * sizeof(float));
+            picolm_gpu_sync(gpu_dev);
             if (viz_row && picolm_gpu_memcpy(viz_row, pipe_x, (size_t)dim * sizeof(float), -1, gpu_dev))
                 viz_push_row(l, pos, viz_row, dim);
         }
@@ -5931,6 +5944,30 @@ static int _prefill_gpu_ubatch(model_t *m, run_state_t *s, gpu_weights_t *gw,
                 picolm_gpu_sync(gpu_dev);
                 float lt8[8];picolm_gpu_memcpy(lt8,bx+(size_t)(n_ubatch-1)*xb_stride,32,-1,gpu_dev);
                 fprintf(stderr,"[DBG GPU l=%d] bx_last[:4]={%.6f,%.6f,%.6f,%.6f}\n",l,lt8[0],lt8[1],lt8[2],lt8[3]);}
+            /* SSM layers have NO FFN block below, so they return here. The VNC
+             * visualization push is at the bottom of this loop, past this
+             * `continue`, which is why an SSM hybrid model (Qwen3.5/3.6: 48 SSM
+             * + 16 attention layers) used to show ONLY every 4th layer during
+             * GPU prefill -- the CPU prefill path pushes before its own
+             * SSM `continue` (model_core.c, has_ssm branch), so the two
+             * backends disagreed. Push here as well, then continue. */
+#ifdef PICOLM_VIZ
+            if (viz_active()) {
+                size_t row_bytes = (size_t)dim * sizeof(float);
+                float *viz_buf = (float *)malloc((size_t)n_ubatch * row_bytes);
+                if (viz_buf) {
+                    /* See the decode-path push for why the sync is required. */
+                    picolm_gpu_sync(gpu_dev);
+                    for (int _vi = 0; _vi < n_ubatch; _vi++) {
+                        picolm_gpu_memcpy(viz_buf + (size_t)_vi * dim,
+                                          bx + (size_t)_vi * xb_stride,
+                                          row_bytes, -1, gpu_dev);
+                    }
+                    viz_push_batch(l, start_pos, viz_buf, n_ubatch, dim);
+                    free(viz_buf);
+                }
+            }
+#endif
             continue;
         }
 
@@ -6415,6 +6452,11 @@ after_qkv:
             size_t row_bytes = (size_t)dim * sizeof(float);
             float *viz_buf = (float *)malloc((size_t)n_ubatch * row_bytes);
             if (viz_buf) {
+                /* See the decode-path push: the D2H is on the default stream
+                 * and the layer kernels are on a non-blocking ctx->stream, so
+                 * one sync before the whole gather is what makes these rows
+                 * the ones this layer produced. */
+                picolm_gpu_sync(gpu_dev);
                 for (int _vi = 0; _vi < n_ubatch; _vi++) {
                     picolm_gpu_memcpy(viz_buf + (size_t)_vi * dim,
                                       bx + (size_t)_vi * xb_stride,
@@ -6545,6 +6587,13 @@ float *model_forward_prefill_gpu(model_t *m, const int *tokens, int n_tokens, in
     if (dim > xb_stride) xb_stride = dim;
     int ssm_conv_dim = c->ssm_d_inner + 2 * c->ssm_d_state * c->ssm_n_group;
     if (ssm_conv_dim > xb_stride) xb_stride = ssm_conv_dim;
+
+    /* An empty prefill has no hidden state to read back: the epilogue would
+     * compute `bx + (last_ubatch_size - 1) * xb_stride` with last_ubatch_size
+     * == 0, i.e. a D2H from ONE STRIDE BEFORE the buffer. CUDA rejects that
+     * with cudaErrorInvalidValue ("invalid argument"), which then surfaces on
+     * every subsequent call too. Refuse it here instead. */
+    if (n_tokens <= 0) return NULL;
 
     /* Verify pipeline and batch buffers are ready */
     if (!m->gpu.active) return model_forward_prefill(m, tokens, n_tokens, start_pos, interrupt);

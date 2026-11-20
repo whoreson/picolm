@@ -833,7 +833,8 @@ static void benchmark_thread_scaling(const char *model_path, const char *prompt,
  */
 static void benchmark_context_scaling(const char *model_path, const char *base_prompt,
         int ctx_size_limit, float temperature, int top_k, int max_tokens,
-        uint64_t seed, int num_threads, int do_prefault) {
+        uint64_t seed, int num_threads, int do_prefault,
+        kv_cache_type_t kv_type_k, kv_cache_type_t kv_type_v, int prompt_flag_f) {
 
     fprintf(stderr, "Loading model '%s'...\n", model_path);
 
@@ -847,7 +848,7 @@ static void benchmark_context_scaling(const char *model_path, const char *base_p
 
     model_t model;
     if (model_load(&model, model_path, ctx_size_limit,
-            KV_CACHE_F16, KV_CACHE_F16, 0, 0, num_threads) != 0) {
+            kv_type_k, kv_type_v, 0, 0, num_threads) != 0) {
         fprintf(stderr, "ERROR: failed to load model '%s' (see error above)\n", model_path);
         exit(1);
     }
@@ -873,20 +874,43 @@ static void benchmark_context_scaling(const char *model_path, const char *base_p
         tokenizer_load(&tokenizer, &model);
     }
 
-    /* Tokenize base prompt */
+    /* Tokenize base prompt. `-pf` must be honoured HERE too: this function
+     * has its own model_load() and returns before the main path reaches its
+     * apply_chat_template() call, so a benchmark run with -pf would otherwise
+     * measure the raw, untemplated prompt. */
+    if (prompt_flag_f) {
+        char *templated = apply_chat_template(model_path, &model, base_prompt);
+        if (templated) {
+            fprintf(stderr, "Applied chat template\n");
+            base_prompt = templated;
+        } else {
+            fprintf(stderr, "WARN: failed to apply chat template, using raw prompt\n");
+        }
+    }
+
     int *base_tokens = NULL;
     int n_base = 0;
     if (use_qwen_tok) {
-        n_base = qwen_tokenize_encode(&qwen_enc, base_prompt, NULL, 0);
-        if (n_base < 0) n_base = -n_base;
-        base_tokens = malloc(n_base * sizeof(int));
-        qwen_tokenize_encode(&qwen_enc, base_prompt, base_tokens, n_base + 1);
+        /* qwen_tokenize_encode() returns the number of tokens WRITTEN, so it
+         * cannot be probed with cap 0 -- that returns 0, not the length, and a
+         * 0-token "base prompt" made every prefill in this benchmark a no-op
+         * (0.0 prefill tok/s). Encode straight into a generously sized buffer. */
+        int cap = (int)strlen(base_prompt) + 16;
+        base_tokens = malloc((size_t)(cap + 1) * sizeof(int));
+        n_base = qwen_tokenize_encode(&qwen_enc, base_prompt, base_tokens, cap);
+        if (n_base < 0) n_base = 0;
     } else {
         base_tokens = malloc(1024 * sizeof(int));
         n_base = tokenizer_encode(&tokenizer, base_prompt, base_tokens, 1024, model.tok_add_bos);
+        if (n_base < 0) n_base = 0;
     }
 
     fprintf(stderr, "Base prompt: %d tokens\n", n_base);
+
+    if (n_base < 1) {
+        fprintf(stderr, "ERROR: base prompt tokenized to 0 tokens, nothing to benchmark\n");
+        exit(1);
+    }
 
     /* Init sampler */
     sampler_t sampler;
@@ -919,8 +943,26 @@ static void benchmark_context_scaling(const char *model_path, const char *base_p
      *
      * The KV cache accumulates: start_pos tracks the cached position. */
     srand48(seed);
-    const int chunk_size = max_tokens;  /* tokens to generate per step */
+    int chunk_size = max_tokens;  /* tokens to generate per step */
     int start_pos = 0;  /* current KV cache position */
+
+    /* The loop needs at least ONE step to fit, i.e. n_base + chunk_size <= ctx.
+     * Otherwise a long -p / -pf prompt under a small -c prints nothing but the
+     * CSV header, which reads as "the benchmark is broken". Shrink what we can
+     * and say so. */
+    if (n_base + chunk_size > ctx) {
+        int new_chunk = ctx - n_base;
+        if (new_chunk >= 1) {
+            fprintf(stderr, "Capping -n from %d to %d so one benchmark step fits in -c %d\n",
+                    chunk_size, new_chunk, ctx);
+            chunk_size = new_chunk;
+        } else {
+            fprintf(stderr, "ERROR: base prompt (%d tokens) leaves no room for a step in -c %d.\n",
+                    n_base, ctx);
+            fprintf(stderr, "       Raise -c above %d, or shorten the prompt.\n", n_base + 1);
+            exit(1);
+        }
+    }
 
     while (start_pos + n_base + chunk_size <= ctx) {
         /* Build the new prompt segment: just the base prompt */
@@ -938,8 +980,9 @@ static void benchmark_context_scaling(const char *model_path, const char *base_p
 
         float *logits = NULL;
 #ifdef PICOLM_GPU
-        fprintf(stderr, "[PICOLM] prefill path: PICOLM_GPU=%s kv_active=%d\n",
-                getenv("PICOLM_GPU") ? getenv("PICOLM_GPU") : "(null)", model.gpu.kv_active);
+        if (getenv("PICOLM_BENCH_DBG"))
+            fprintf(stderr, "[PICOLM] prefill path: PICOLM_GPU=%s kv_active=%d\n",
+                    getenv("PICOLM_GPU") ? getenv("PICOLM_GPU") : "(null)", model.gpu.kv_active);
         if (getenv("PICOLM_GPU") && model.gpu.kv_active) {
             /* KV cache comparison: run both CPU and GPU prefills, compare */
             if (getenv("PICOLM_KV_COMPARE")) {
@@ -1722,7 +1765,8 @@ int main(int argc, char **argv) {
         if (!model_path) { fprintf(stderr, "No model file specified\n"); usage(argv[0]); return 1; }
         benchmark_context_scaling(model_path, prompt ? prompt :
             "You are standing in a dungeon. The darkness surrounds you, making it impossible to see more than a few feet in front of you. The air is thick with the stench of rot and decay. A faint luminescent glow emanates from your right hand. You notice a heavy iron door to your left, covered in strange runes that seem to pulse with an otherworldly energy.",
-            context_override, temperature, top_k, max_tokens, seed, num_threads, do_prefault);
+            context_override, temperature, top_k, max_tokens, seed, num_threads, do_prefault,
+            kv_type_k, kv_type_v, prompt_flag_f);
         return 0;
     }
 

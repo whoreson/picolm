@@ -503,6 +503,47 @@ static void viz_cell_write(viz_cell_t *c, int pos, const float *data, int n_embd
     atomic_store_explicit(&c->seq, q + 2, memory_order_release);
 }
 
+/* PICOLM_VIZ_TRACE=1: print one line per pushed (layer,pos) with the layer's
+ * bucketed RMS. This is the way to tell "the numbers are wrong" apart from
+ * "the numbers are right but the picture is drawn wrong", and to diff the CPU
+ * and GPU producers of the SAME model -- text output cannot do either.
+ * PICOLM_VIZ_TRACE=<n> only traces absolute positions >= n.
+ * PICOLM_VIZ_TRACE_RAW=1 adds the largest |element| and its dimension, which
+ * is what identifies an outlier band that stretches the colour scale. */
+static void viz_trace_write(int layer, int pos, const float *buckets, int n_buckets) {
+    static int limit = -2;
+    if (limit == -2) {
+        const char *e = getenv("PICOLM_VIZ_TRACE");
+        limit = e ? atoi(e) : -1;
+        if (e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y') && e[1] == '\0') limit = 0;
+    }
+    if (limit < 0 || pos < limit) return;
+    double sq = 0.0;
+    for (int i = 0; i < n_buckets; i++) sq += (double)buckets[i] * (double)buckets[i];
+    fprintf(stderr, "[VIZ] l=%d pos=%d rms=%.6f b0..3={%.4f,%.4f,%.4f,%.4f}\n",
+            layer, pos, sqrt(sq / n_buckets),
+            buckets[0], buckets[1], buckets[2], buckets[3]);
+}
+
+/* Raw-entry variant: needs the activation vector, not the buckets. Reports the
+ * largest |element| and where it is, plus a NaN scan. An activation outlier is
+ * what silently flattens the whole heatmap (the colour scale is min/max based),
+ * so this separates "the picture is wrong" from "the data has a spike". */
+static void viz_trace_raw(int layer, int pos, const float *data, int n_embd) {
+    static int on = -2;
+    if (on == -2) on = getenv("PICOLM_VIZ_TRACE_RAW") ? 1 : 0;
+    if (!on || !data || n_embd < 1) return;
+    int amax = 0, nan_at = -1;
+    float vmax = 0.0f;
+    for (int i = 0; i < n_embd; i++) {
+        float a = data[i] < 0 ? -data[i] : data[i];
+        if (data[i] != data[i]) { if (nan_at < 0) nan_at = i; continue; }
+        if (a > vmax) { vmax = a; amax = i; }
+    }
+    fprintf(stderr, "[VIZRAW] l=%d pos=%d max|x|=%.6f at dim=%d%s\n",
+            layer, pos, vmax, amax, nan_at >= 0 ? " (has NaN)" : "");
+}
+
 /* Consistent snapshot of one cell. Returns 1 and fills out/pos on success. */
 static int viz_cell_read(const viz_cell_t *c, int *pos, float *out) {
     for (int tries = 0; tries < 8; tries++) {
@@ -586,6 +627,8 @@ void viz_push_row(int layer, int pos, const float *data, int n_embd) {
     int col = viz_rel(pos);
     viz_span_begin(layer, col);
     viz_cell_write(&viz_ring.cells[col % VIZ_TOKEN_RING][layer], col, data, n_embd);
+    viz_trace_write(layer, pos, viz_ring.cells[col % VIZ_TOKEN_RING][layer].buckets, VIZ_N_BUCKETS);
+    viz_trace_raw(layer, pos, data, n_embd);
     viz_span_end(layer, col);
     viz_dump_maybe(col);
 }
@@ -600,9 +643,12 @@ void viz_push_batch(int layer, int start_pos, const float *x_batch, int n_tokens
     int c0 = viz_rel(start_pos);
     viz_span_begin(layer, c0);                       /* logical start, not the first stored row */
     int first = n_tokens > VIZ_TOKEN_RING ? n_tokens - VIZ_TOKEN_RING : 0;
-    for (int i = first; i < n_tokens; i++)
-        viz_cell_write(&viz_ring.cells[(c0 + i) % VIZ_TOKEN_RING][layer], c0 + i,
-                       x_batch + (size_t)i * (size_t)n_embd, n_embd);
+    for (int i = first; i < n_tokens; i++) {
+        viz_cell_t *cell = &viz_ring.cells[(c0 + i) % VIZ_TOKEN_RING][layer];
+        viz_cell_write(cell, c0 + i, x_batch + (size_t)i * (size_t)n_embd, n_embd);
+        viz_trace_write(layer, start_pos + i, cell->buckets, VIZ_N_BUCKETS);
+        viz_trace_raw(layer, start_pos + i, x_batch + (size_t)i * (size_t)n_embd, n_embd);
+    }
     viz_span_end(layer, c0 + n_tokens - 1);
     viz_dump_maybe(c0 + n_tokens - 1);
 }
@@ -936,7 +982,22 @@ static void viz_render_heatmap(void) {
     int layer_h = heatmap_h / n_layers; if (layer_h < 1) layer_h = 1;
 
     int avail = fb_w - 4 - 20;                 /* leave room for the color bar */
-    int col_w = avail / VIZ_TOKEN_RING; if (col_w < 1) col_w = 1;
+    /* Column width is derived from the positions that can actually be on
+     * screen, NOT from VIZ_TOKEN_RING. Sizing it as avail/VIZ_TOKEN_RING (128)
+     * made every column 6 px wide and reserved 768 of the 776 available pixels
+     * even when the run had 9 positions: the whole heatmap collapsed into a
+     * narrow strip at the far left and the rest of the window stayed black,
+     * which reads exactly like "the display is corrupted". A short context now
+     * fills the window; once the history is long enough to fill it, col_w falls
+     * back to the natural ring width and the view scrolls one column at a time.
+     * Only the X axis is affected; viz_y_to_slot() maps Y and is unchanged. */
+    int head_pre = atomic_load_explicit(&viz_ring.head, memory_order_acquire);
+    int nat_col_w = avail / VIZ_TOKEN_RING; if (nat_col_w < 1) nat_col_w = 1;
+    int col_w = nat_col_w;
+    if (head_pre >= 0 && head_pre + 1 < VIZ_TOKEN_RING) {
+        int fit = avail / (head_pre + 1);      /* widen to fill the window */
+        if (fit > col_w) col_w = fit;
+    }
     int W = avail / col_w; if (W > VIZ_TOKEN_RING) W = VIZ_TOKEN_RING; if (W < 1) W = 1;
 
     int head = atomic_load_explicit(&viz_ring.head, memory_order_acquire);
