@@ -35,37 +35,46 @@ static int run_case(int NH, int KVL, int n_tokens, int start_pos, int do_ref, in
     s->glm5.mla_kv = calloc((size_t)MAXSEQ * KVL, sizeof(float));
     for (size_t i = 0; i < (size_t)MAXSEQ * KVL; i++) s->glm5.mla_kv[i] = rnd();
     const size_t QN = (size_t)n_tokens * NH * KVL;
-    float *q = malloc(QN * 4), *oA = malloc(QN * 4), *oB = malloc(QN * 4);
+    float *q = malloc(QN * 4), *oA = malloc(QN * 4), *oB = malloc(QN * 4), *oC = malloc(QN * 4);
     for (size_t i = 0; i < QN; i++) q[i] = rnd() * 3.f;
-    memset(oA, 0xAB, QN*4); memset(oB, 0xCD, QN*4);
+    memset(oA, 0xAB, QN*4); memset(oB, 0xCD, QN*4); memset(oC, 0xEF, QN*4);
     tensor_set_threads(nth); tensor_threadpool_init(nth);
     double t0 = get_time_ms();
     glm5_mla_attn_batch(c, s, 0, q, oA, n_tokens, start_pos);            /* existing path */
     double t1 = get_time_ms();
-    int ran = glm5_mla_attn_pfa(c, s, 0, q, oB, n_tokens, start_pos);    /* new path */
+    int ran = glm5_mla_attn_pfa_ex(c, s, 0, q, oB, n_tokens, start_pos, 0);   /* blocked kernel, scalar softmax */
     double t2 = get_time_ms();
+    int ranv = glm5_mla_attn_pfa_ex(c, s, 0, q, oC, n_tokens, start_pos, 1);  /* + vector softmax / tree-reduced scores */
+    double t3 = get_time_ms();
+    double dv = 0, eC = 0;
+    for (size_t i = 0; i < QN; i++) { double d = fabs((double)oB[i] - oC[i]); if (d > dv) dv = d; }
     double dmax = 0, amax = 0, eA = 0, eB = 0;
     for (size_t i = 0; i < QN; i++) { double d = fabs((double)oA[i] - oB[i]); if (d > dmax) dmax = d;
         if (fabs(oA[i]) > amax) amax = fabs(oA[i]); }
-    int bad = !ran || !(dmax < 2e-4 * (amax + 1e-6)) || !isfinite(dmax);
+    int bad = !ran || !ranv || !(dmax < 2e-4 * (amax + 1e-6)) || !isfinite(dmax) || !(dv < 2e-5 * (amax + 1e-6));
     if (do_ref) {
         double *r = malloc(QN * sizeof(double));
         ref_attn(q, s->glm5.mla_kv, r, NH, KVL, n_tokens, start_pos, 1.0f / sqrtf(16.f));
         for (size_t i = 0; i < QN; i++) { double a = fabs(oA[i] - r[i]), b = fabs(oB[i] - r[i]);
             if (a > eA) eA = a;
-            if (b > eB) eB = b; }
-        if (eB > 4 * eA + 1e-5) bad = 1;      /* new must be about as accurate as old */
+            if (b > eB) eB = b;
+            const double cc = fabs(oC[i] - r[i]); if (cc > eC) eC = cc; }
+        if (eB > 4 * eA + 1e-5 || eC > 4 * eA + 1e-5) bad = 1;      /* new must be about as accurate as old */
         free(r);
     }
     printf("NH=%-2d KVL=%d tok=%-3d start=%-5d  old-vs-new max|d|=%.2e (|o|max %.2f)", NH, KVL, n_tokens, start_pos, dmax, amax);
-    if (do_ref) printf("  err vs double: old %.2e new %.2e", eA, eB);
-    if (timing) printf("  | old %.0f ms  new %.0f ms (%.1fx)", t1-t0, t2-t1, (t1-t0)/(t2-t1));
+    printf("  vec-vs-scalar %.1e", dv / (amax + 1e-30));
+    if (do_ref) printf("  err vs double: old %.2e new %.2e vec %.2e", eA, eB, eC);
+    if (timing) printf("  | old %.0f ms  blocked %.0f ms  blocked+vec %.0f ms (%.2fx over blocked)", t1-t0, t2-t1, t3-t2, (t2-t1)/(t3-t2));
     printf("  %s\n", bad ? "FAIL" : "ok");
-    free(q); free(oA); free(oB); free(s->glm5.mla_kv); free(m);
+    free(q); free(oA); free(oB); free(oC); free(s->glm5.mla_kv); free(m);
     return bad;
 }
 
 int main(void) {
+    /* PFA is on by default, so glm5_mla_attn_batch() would run the very kernel under test. Switch it off
+     * (before its first call: the flag is cached) so that path is the independent per-token core. */
+    setenv("PICOLM_GLM5_PFA", "0", 1);
     int f = 0;
     f += run_case(16, 512,  1,    0, 1, 4, 0);   /* single token, single key */
     f += run_case(16, 512,  8,    0, 1, 4, 0);   /* pure diagonal block */
@@ -73,6 +82,7 @@ int main(void) {
     f += run_case(16, 512, 37, 1000, 1, 4, 0);   /* ragged token tail, many key blocks */
     f += run_case( 8, 512, 64,  129, 1, 8, 0);
     f += run_case(64, 512, 16, 3000, 0, 1, 1);   /* real head count, single thread timing */
+    f += run_case(64, 512, 16, 6000, 0, 1, 1);   /* deeper: the softmax/score overhead share matters more */
     puts(f ? "FAIL" : "PASS");
     return f != 0;
 }

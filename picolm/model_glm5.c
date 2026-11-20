@@ -1115,6 +1115,32 @@ static void mla_attn_task(int idx, void *vp) {
     }
 }
 
+#if defined(PICOLM_AVX512)
+/* expf for 16 lanes: Cephes range reduction + degree-6 polynomial, scaled with vscalefps so that
+ * overflow -> +inf and underflow -> 0 like libm. Max error ~2 ULP against glibc's expf, i.e. NOT
+ * bit-identical; that is why the vector pre-pass is opt-in (PICOLM_GLM5_KDA_VEXP=1). */
+static inline __m512 kda_expf16(__m512 x)
+{
+    /* expf(89) overflows to +inf and expf(-104) underflows to 0 in float, so clamping first keeps the
+     * range reduction sane for huge |x| without changing those limits. */
+    x = _mm512_min_ps(_mm512_max_ps(x, _mm512_set1_ps(-104.0f)), _mm512_set1_ps(89.0f));
+    const __m512 log2e = _mm512_set1_ps(1.44269504088896341f);
+    const __m512 c1 = _mm512_set1_ps(0.693359375f), c2 = _mm512_set1_ps(-2.12194440e-4f);
+    const __m512 fx = _mm512_roundscale_ps(_mm512_mul_ps(x, log2e), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    __m512 r = _mm512_fnmadd_ps(fx, c1, x);
+    r = _mm512_fnmadd_ps(fx, c2, r);
+    __m512 y = _mm512_set1_ps(1.9875691500E-4f);
+    y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(1.3981999507E-3f));
+    y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(8.3334519073E-3f));
+    y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(4.1665795894E-2f));
+    y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(1.6666665459E-1f));
+    y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(5.0000001201E-1f));
+    const __m512 r2 = _mm512_mul_ps(r, r);
+    y = _mm512_fmadd_ps(y, r2, _mm512_add_ps(r, _mm512_set1_ps(1.0f)));
+    return _mm512_scalef_ps(y, fx);
+}
+#endif
+
 /* ---- Blocked flash-style prefill attention (absorbed MLA, dense) ------------
  *
  * mla_attn_task() above is GEMV-shaped: for every (head, token) it streams the
@@ -1153,15 +1179,51 @@ static int glm5_pfa_enabled(void) {
     return cached;
 }
 
+/* PICOLM_GLM5_PFA_VEXP=1: score tiles reduce with a shuffle tree instead of 16 reduce_add calls, and
+ * the softmax uses a vector max, a vector expf (<= 1 ULP vs libm) and a vector sum. Not bit-identical
+ * to the scalar path (summation order, expf rounding); AVX-512 only. */
+static int glm5_pfa_vexp_enabled(void) {
+    static int cached = -1;
+#if defined(PICOLM_AVX512)
+    if (cached < 0) { const char *e = getenv("PICOLM_GLM5_PFA_VEXP"); cached = (e && atoi(e) > 0) ? 1 : 0; }
+#else
+    cached = 0;
+#endif
+    return cached;
+}
+
 typedef struct {
     const float *qabs, *cache; float *ctx;
-    int n_tokens, start_pos, NH, KVL, nTB, perm;
+    int n_tokens, start_pos, NH, KVL, nTB, perm, vx;   /* vx: AVX-512 vector softmax + tree-reduced scores */
     float scale;
 } glm5_pfa_t;
 
+#if defined(PICOLM_AVX512)
+/* Lane k of the result = horizontal sum of a[k]. 24 unpack/add + 12 shuffle/add + 16 cross-lane
+ * instructions instead of 16 x ~9 for _mm512_reduce_add_ps. */
+static inline __m512 glm5_pfa_hsum16(const __m512 a[16])
+{
+    __m512 t[8], u[4];
+    for (int i = 0; i < 8; i++)
+        t[i] = _mm512_add_ps(_mm512_unpacklo_ps(a[2*i], a[2*i+1]), _mm512_unpackhi_ps(a[2*i], a[2*i+1]));
+    for (int i = 0; i < 4; i++)
+        u[i] = _mm512_add_ps(_mm512_shuffle_ps(t[2*i], t[2*i+1], 0x44), _mm512_shuffle_ps(t[2*i], t[2*i+1], 0xEE));
+    __m128 v[4];
+    for (int i = 0; i < 4; i++) {
+        const __m256 hi = _mm256_castpd_ps(_mm512_extractf64x4_pd(_mm512_castps_pd(u[i]), 1));
+        const __m256 h  = _mm256_add_ps(_mm512_castps512_ps256(u[i]), hi);
+        v[i] = _mm_add_ps(_mm256_castps256_ps128(h), _mm256_extractf128_ps(h, 1));
+    }
+    __m512 r = _mm512_castps128_ps512(v[0]);
+    r = _mm512_insertf32x4(r, v[1], 1);
+    r = _mm512_insertf32x4(r, v[2], 2);
+    return _mm512_insertf32x4(r, v[3], 3);
+}
+#endif
+
 /* S[r][j] = scale * dot(q[r], kb[j]) for r<R, j<nk. kb rows are KVL floats apart. */
 static void glm5_pfa_scores(const float *const *qp, int R, const float *kb, int nk,
-                            int KVL, float scale, float *S)
+                            int KVL, float scale, float *S, int vx)
 {
     int r = 0;
 #if defined(PICOLM_AVX512)
@@ -1190,6 +1252,15 @@ static void glm5_pfa_scores(const float *const *qp, int R, const float *kb, int 
                     a30 = _mm512_fmadd_ps(v0, w3, a30); a31 = _mm512_fmadd_ps(v1, w3, a31);
                     a32 = _mm512_fmadd_ps(v2, w3, a32); a33 = _mm512_fmadd_ps(v3, w3, a33);
                 }
+                if (vx) {
+                    const __m512 acc[16] = { a00, a01, a02, a03, a10, a11, a12, a13, a20, a21, a22, a23, a30, a31, a32, a33 };
+                    const __m512 sum = _mm512_mul_ps(glm5_pfa_hsum16(acc), _mm512_set1_ps(scale));
+                    _mm_storeu_ps(S + (size_t)(r + 0) * PFA_BK + j, _mm512_extractf32x4_ps(sum, 0));
+                    _mm_storeu_ps(S + (size_t)(r + 1) * PFA_BK + j, _mm512_extractf32x4_ps(sum, 1));
+                    _mm_storeu_ps(S + (size_t)(r + 2) * PFA_BK + j, _mm512_extractf32x4_ps(sum, 2));
+                    _mm_storeu_ps(S + (size_t)(r + 3) * PFA_BK + j, _mm512_extractf32x4_ps(sum, 3));
+                    continue;
+                }
                 float *s0 = S + (size_t)(r + 0) * PFA_BK + j, *s1 = S + (size_t)(r + 1) * PFA_BK + j;
                 float *s2 = S + (size_t)(r + 2) * PFA_BK + j, *s3 = S + (size_t)(r + 3) * PFA_BK + j;
                 s0[0] = _mm512_reduce_add_ps(a00) * scale; s0[1] = _mm512_reduce_add_ps(a01) * scale;
@@ -1200,6 +1271,49 @@ static void glm5_pfa_scores(const float *const *qp, int R, const float *kb, int 
                 s2[2] = _mm512_reduce_add_ps(a22) * scale; s2[3] = _mm512_reduce_add_ps(a23) * scale;
                 s3[0] = _mm512_reduce_add_ps(a30) * scale; s3[1] = _mm512_reduce_add_ps(a31) * scale;
                 s3[2] = _mm512_reduce_add_ps(a32) * scale; s3[3] = _mm512_reduce_add_ps(a33) * scale;
+            }
+            for (; j < nk; j++)
+                for (int i = 0; i < 4; i++)
+                    S[(size_t)(r + i) * PFA_BK + j] =
+                        vec_dot_f32_f32(kb + (size_t)j * KVL, qp[r + i], KVL) * scale;
+        }
+    }
+#elif defined(PICOLM_AVX2)
+    if ((KVL & 7) == 0) {
+        for (; r + 3 < R; r += 4) {
+            int j = 0;
+            for (; j + 3 < nk; j += 4) {
+                __m256 a00 = _mm256_setzero_ps(), a01 = a00, a02 = a00, a03 = a00,
+                       a10 = a00, a11 = a00, a12 = a00, a13 = a00,
+                       a20 = a00, a21 = a00, a22 = a00, a23 = a00,
+                       a30 = a00, a31 = a00, a32 = a00, a33 = a00;
+                const float *k0 = kb + (size_t)(j + 0) * KVL, *k1 = kb + (size_t)(j + 1) * KVL,
+                            *k2 = kb + (size_t)(j + 2) * KVL, *k3 = kb + (size_t)(j + 3) * KVL;
+                const float *q0 = qp[r], *q1 = qp[r + 1], *q2 = qp[r + 2], *q3 = qp[r + 3];
+                for (int d = 0; d < KVL; d += 8) {
+                    const __m256 v0 = _mm256_loadu_ps(k0 + d), v1 = _mm256_loadu_ps(k1 + d),
+                                 v2 = _mm256_loadu_ps(k2 + d), v3 = _mm256_loadu_ps(k3 + d);
+                    const __m256 w0 = _mm256_loadu_ps(q0 + d), w1 = _mm256_loadu_ps(q1 + d),
+                                 w2 = _mm256_loadu_ps(q2 + d), w3 = _mm256_loadu_ps(q3 + d);
+                    a00 = _mm256_fmadd_ps(v0, w0, a00); a01 = _mm256_fmadd_ps(v1, w0, a01);
+                    a02 = _mm256_fmadd_ps(v2, w0, a02); a03 = _mm256_fmadd_ps(v3, w0, a03);
+                    a10 = _mm256_fmadd_ps(v0, w1, a10); a11 = _mm256_fmadd_ps(v1, w1, a11);
+                    a12 = _mm256_fmadd_ps(v2, w1, a12); a13 = _mm256_fmadd_ps(v3, w1, a13);
+                    a20 = _mm256_fmadd_ps(v0, w2, a20); a21 = _mm256_fmadd_ps(v1, w2, a21);
+                    a22 = _mm256_fmadd_ps(v2, w2, a22); a23 = _mm256_fmadd_ps(v3, w2, a23);
+                    a30 = _mm256_fmadd_ps(v0, w3, a30); a31 = _mm256_fmadd_ps(v1, w3, a31);
+                    a32 = _mm256_fmadd_ps(v2, w3, a32); a33 = _mm256_fmadd_ps(v3, w3, a33);
+                }
+                float *s0 = S + (size_t)(r + 0) * PFA_BK + j, *s1 = S + (size_t)(r + 1) * PFA_BK + j;
+                float *s2 = S + (size_t)(r + 2) * PFA_BK + j, *s3 = S + (size_t)(r + 3) * PFA_BK + j;
+                s0[0] = hsum_avx(a00) * scale; s0[1] = hsum_avx(a01) * scale;
+                s0[2] = hsum_avx(a02) * scale; s0[3] = hsum_avx(a03) * scale;
+                s1[0] = hsum_avx(a10) * scale; s1[1] = hsum_avx(a11) * scale;
+                s1[2] = hsum_avx(a12) * scale; s1[3] = hsum_avx(a13) * scale;
+                s2[0] = hsum_avx(a20) * scale; s2[1] = hsum_avx(a21) * scale;
+                s2[2] = hsum_avx(a22) * scale; s2[3] = hsum_avx(a23) * scale;
+                s3[0] = hsum_avx(a30) * scale; s3[1] = hsum_avx(a31) * scale;
+                s3[2] = hsum_avx(a32) * scale; s3[3] = hsum_avx(a33) * scale;
             }
             for (; j < nk; j++)
                 for (int i = 0; i < 4; i++)
@@ -1248,6 +1362,37 @@ static void glm5_pfa_pv(float *O, int R, const float *P, int nk, const float *kb
             }
         }
     }
+#elif defined(PICOLM_AVX2)
+    if ((KVL & 31) == 0) {
+        for (; r + 3 < R; r += 4) {
+            for (int c0 = 0; c0 < KVL; c0 += 32) {
+                __m256 a[4][4];
+                #pragma GCC unroll 4
+                for (int i = 0; i < 4; i++) {
+                    #pragma GCC unroll 4
+                    for (int u = 0; u < 4; u++) a[i][u] = _mm256_loadu_ps(O + (size_t)(r + i) * KVL + c0 + 8 * u);
+                }
+                for (int j = 0; j < nk; j++) {
+                    const float *kr = kb + (size_t)j * KVL + c0;
+                    const __m256 v0 = _mm256_loadu_ps(kr), v1 = _mm256_loadu_ps(kr + 8),
+                                 v2 = _mm256_loadu_ps(kr + 16), v3 = _mm256_loadu_ps(kr + 24);
+                    #pragma GCC unroll 4
+                    for (int i = 0; i < 4; i++) {
+                        const __m256 pb = _mm256_set1_ps(P[(size_t)(r + i) * PFA_BK + j]);
+                        a[i][0] = _mm256_fmadd_ps(pb, v0, a[i][0]);
+                        a[i][1] = _mm256_fmadd_ps(pb, v1, a[i][1]);
+                        a[i][2] = _mm256_fmadd_ps(pb, v2, a[i][2]);
+                        a[i][3] = _mm256_fmadd_ps(pb, v3, a[i][3]);
+                    }
+                }
+                #pragma GCC unroll 4
+                for (int i = 0; i < 4; i++) {
+                    #pragma GCC unroll 4
+                    for (int u = 0; u < 4; u++) _mm256_storeu_ps(O + (size_t)(r + i) * KVL + c0 + 8 * u, a[i][u]);
+                }
+            }
+        }
+    }
 #endif
     for (; r < R; r++) {
         float *o = O + (size_t)r * KVL;
@@ -1288,12 +1433,44 @@ static void glm5_pfa_task(int idx, void *vp)
     for (int kb = 0; kb < nkeys; kb += PFA_BK) {
         const int nk = (nkeys - kb < PFA_BK) ? nkeys - kb : PFA_BK;
         const float *kblk = x->cache + (size_t)kb * KVL;
-        glm5_pfa_scores(qp, R, kblk, nk, KVL, x->scale, S);
+        glm5_pfa_scores(qp, R, kblk, nk, KVL, x->scale, S, x->vx);
 
         for (int r = 0; r < R; r++) {
             float *sr = S + (size_t)r * PFA_BK;
             const int vis = lim[r] - kb + 1;       /* visible keys in this block */
             int nv = vis < 0 ? 0 : (vis > nk ? nk : vis);
+#if defined(PICOLM_AVX512)
+            if (x->vx) {
+                if (nv == 0) { for (int j = 0; j < nk; j++) sr[j] = 0.f; continue; }
+                __m512 vmx = _mm512_set1_ps(-INFINITY);
+                for (int j = 0; j < nv; j += 16) {
+                    const int rem = nv - j;
+                    const __mmask16 mk = rem >= 16 ? (__mmask16)0xFFFF : (__mmask16)((1u << rem) - 1u);
+                    vmx = _mm512_mask_max_ps(vmx, mk, vmx, _mm512_loadu_ps(sr + j));
+                }
+                const float bm = _mm512_reduce_max_ps(vmx);
+                const float mn = bm > m[r] ? bm : m[r];
+                const float alpha = expf(m[r] - mn);
+                const __m512 vmn = _mm512_set1_ps(mn);
+                __m512 vsum = _mm512_setzero_ps();
+                for (int j = 0; j < nv; j += 16) {
+                    const int rem = nv - j;
+                    const __mmask16 mk = rem >= 16 ? (__mmask16)0xFFFF : (__mmask16)((1u << rem) - 1u);
+                    const __m512 e = _mm512_maskz_mov_ps(mk, kda_expf16(_mm512_sub_ps(_mm512_loadu_ps(sr + j), vmn)));
+                    _mm512_storeu_ps(sr + j, e);              /* lanes >= nv are stored as 0 */
+                    vsum = _mm512_add_ps(vsum, e);
+                }
+                const float sum = _mm512_reduce_add_ps(vsum);
+                for (int j = (nv + 15) & ~15; j < nk; j++) sr[j] = 0.f;
+                l[r] = l[r] * alpha + sum;
+                if (alpha != 1.0f) {
+                    float *o = O + (size_t)r * KVL;
+                    for (int d = 0; d < KVL; d++) o[d] *= alpha;
+                }
+                m[r] = mn;
+                continue;
+            }
+#endif
             for (int j = nv; j < nk; j++) sr[j] = -INFINITY;
             float bm = -INFINITY;
             for (int j = 0; j < nv; j++) if (sr[j] > bm) bm = sr[j];
@@ -1324,13 +1501,13 @@ static void glm5_pfa_task(int idx, void *vp)
 }
 
 /* Returns 1 if it ran (caller falls back to the per-(head,token) core otherwise). */
-static int glm5_mla_attn_pfa(const model_config_t *c, run_state_t *s, int mla_ord,
-                             const float *qabs_b, float *ctx_b, int n_tokens, int start_pos)
+static int glm5_mla_attn_pfa_ex(const model_config_t *c, run_state_t *s, int mla_ord,
+                                const float *qabs_b, float *ctx_b, int n_tokens, int start_pos, int vexp_req)
 {
     const int NH = c->n_heads, KVL = c->glm5_kv_lora;
     if (KVL > PFA_MAXKVL || KVL < 16 || n_tokens < 1) return 0;
     glm5_pfa_t x;
-    x.qabs = qabs_b; x.ctx = ctx_b; x.n_tokens = n_tokens; x.start_pos = start_pos;
+    x.qabs = qabs_b; x.ctx = ctx_b; x.n_tokens = n_tokens; x.start_pos = start_pos; x.vx = vexp_req;
     x.NH = NH; x.KVL = KVL; x.scale = 1.0f / sqrtf((float)c->glm5_mla_head_dim);
     x.cache = s->glm5.mla_kv + (size_t)mla_ord * c->max_seq_len * KVL;
     x.nTB = (n_tokens + PFA_BQ - 1) / PFA_BQ;
@@ -1345,6 +1522,12 @@ static int glm5_mla_attn_pfa(const model_config_t *c, run_state_t *s, int mla_or
     const int nHG = (NH + PFA_HG - 1) / PFA_HG;
     tensor_parallel_for(nHG * x.nTB, glm5_pfa_task, &x);
     return 1;
+}
+
+static int glm5_mla_attn_pfa(const model_config_t *c, run_state_t *s, int mla_ord,
+                             const float *qabs_b, float *ctx_b, int n_tokens, int start_pos)
+{
+    return glm5_mla_attn_pfa_ex(c, s, mla_ord, qabs_b, ctx_b, n_tokens, start_pos, glm5_pfa_vexp_enabled());
 }
 
 static void glm5_mla_attn_batch(
@@ -4098,29 +4281,6 @@ typedef struct {
 } kda_split_t;
 
 #if defined(PICOLM_AVX512)
-/* expf for 16 lanes: Cephes range reduction + degree-6 polynomial, scaled with vscalefps so that
- * overflow -> +inf and underflow -> 0 like libm. Max error ~2 ULP against glibc's expf, i.e. NOT
- * bit-identical; that is why the vector pre-pass is opt-in (PICOLM_GLM5_KDA_VEXP=1). */
-static inline __m512 kda_expf16(__m512 x)
-{
-    /* expf(89) overflows to +inf and expf(-104) underflows to 0 in float, so clamping first keeps the
-     * range reduction sane for huge |x| without changing those limits. */
-    x = _mm512_min_ps(_mm512_max_ps(x, _mm512_set1_ps(-104.0f)), _mm512_set1_ps(89.0f));
-    const __m512 log2e = _mm512_set1_ps(1.44269504088896341f);
-    const __m512 c1 = _mm512_set1_ps(0.693359375f), c2 = _mm512_set1_ps(-2.12194440e-4f);
-    const __m512 fx = _mm512_roundscale_ps(_mm512_mul_ps(x, log2e), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-    __m512 r = _mm512_fnmadd_ps(fx, c1, x);
-    r = _mm512_fnmadd_ps(fx, c2, r);
-    __m512 y = _mm512_set1_ps(1.9875691500E-4f);
-    y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(1.3981999507E-3f));
-    y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(8.3334519073E-3f));
-    y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(4.1665795894E-2f));
-    y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(1.6666665459E-1f));
-    y = _mm512_fmadd_ps(y, r, _mm512_set1_ps(5.0000001201E-1f));
-    const __m512 r2 = _mm512_mul_ps(r, r);
-    y = _mm512_fmadd_ps(y, r2, _mm512_add_ps(r, _mm512_set1_ps(1.0f)));
-    return _mm512_scalef_ps(y, fx);
-}
 
 /* Same arithmetic order as the scalar pre-pass; only expf differs, and the q/k L2 norms and the
  * attention-score dot keep their sequential scalar summation order. */
