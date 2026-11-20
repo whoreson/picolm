@@ -1542,13 +1542,30 @@ static void glm5_mla_attn_batch(
     const float *cache = s->glm5.mla_kv + (size_t)mla_ord * c->max_seq_len * KVL;
 
     /* One scores row per task: the pool runs tasks in parallel and each needs
-     * its own [max_seq] scratch. Aim for ~4x as many tasks as threads so a slow
-     * one does not stall the barrier. */
-    int nth = 24;
-    int n_chunk = (n_tokens > 0) ? (n_tokens * 4 + nth - 1) / nth : 1;
-    if (n_chunk < 1) n_chunk = 1;
-    const int n_chunks = (n_tokens + n_chunk - 1) / n_chunk;
-    const int n_tasks = NH * n_chunks;
+     * its own [max_seq] scratch, so n_tasks is ALSO the scratch size
+     * (n_tasks * max_seq_len floats). It therefore has to be derived from the
+     * machine, not guessed: a hardcoded 24 gave 384 tasks on a 1-core build
+     * (run inline, one after another) and too few tasks on a 48-core one, and
+     * it allocated ~150 MB of scratch at -c 100000 where ~26 MB is enough.
+     *
+     * n_threads is already clamped to MAX_THREADS by tensor_set_threads() and
+     * the pool is created once from it (pool_init), so tensor_get_n_threads()
+     * is the value to size against.
+     *
+     * Task count: there are NH heads and the batch is split into n_chunks token
+     * ranges, giving NH*n_chunks tasks. NH alone already fills a many-core box,
+     * so only add a chunk when the thread count exceeds NH. n_tasks therefore
+     * stays at ~max(NH, n_threads), which both keeps the scratch bounded and
+     * gives every worker something to do. */
+    int nth = tensor_get_n_threads();
+    if (nth < 1) nth = 1;
+    const int target = (nth > NH) ? nth : NH;   /* tasks we would like */
+    int n_chunks = (target + NH - 1) / NH;
+    if (n_chunks < 1) n_chunks = 1;
+    if (n_tokens > 0 && n_chunks > n_tokens) n_chunks = n_tokens;
+    const int n_chunk = (n_tokens > 0) ? (n_tokens + n_chunks - 1) / n_chunks : 1;
+    int n_tasks = NH * n_chunks;
+    if (n_tasks < 1) n_tasks = 1;
 
     static float *scores_pool = NULL;
     static size_t scores_pool_n = 0;

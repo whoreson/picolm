@@ -14,18 +14,26 @@ from gguf import GGUFWriter
 p = argparse.ArgumentParser()
 p.add_argument('-o', '--output', default='glm5_tiny.gguf')
 p.add_argument('--seed', type=int, default=42)
+p.add_argument('--n-head', type=int, default=4, help='MLA q heads / KDA heads (real GLM-5.3: 64)')
+p.add_argument('--kv-lora', type=int, default=128, help='MLA latent width KVL (real GLM-5.3: 512)')
+p.add_argument('--mla-hd', type=int, default=64, help='MLA head dim (real GLM-5.3: 192)')
+p.add_argument('--n-embd', type=int, default=256, help='embedding length (real GLM-5.3: 4096)')
+p.add_argument('--layers', type=int, default=9, help='block_count (real GLM-5.3: 45)')
+p.add_argument('--vocab', type=int, default=257, help='vocab size')
+p.add_argument('--n-ff-dense', type=int, default=0, help='dense FFN width (0 = 2*n_embd)')
+p.add_argument('--n-ff-exp', type=int, default=0, help='expert FFN width (0 = n_embd)')
 args = p.parse_args()
 rng = np.random.default_rng(args.seed)
 
 # ---- dimensions ----
-N_EMBD      = 256
-N_HEAD      = 4          # MLA q heads
+N_EMBD      = args.n_embd
+N_HEAD      = args.n_head   # MLA q heads
 KDA_DIM     = 128        # kda.head_dim
 N_KDA_HEADS = N_HEAD     # ik derives ssm_dt_rank = n_head, d_inner = kda_dim*N_HEAD
 D_INNER     = N_KDA_HEADS * KDA_DIM   # 512 = n_head * kda_dim
 Q_LORA      = 64
-KV_LORA     = 128
-MLA_HD      = 64
+KV_LORA     = args.kv_lora
+MLA_HD      = args.mla_hd
 IDX_NH      = 4
 IDX_DIM     = 32
 IDX_TOPK    = 8
@@ -35,11 +43,11 @@ SINKHORN    = 20
 HC_EPS      = 1e-6
 N_EXP       = 16
 N_EXP_USED  = 4
-N_FF_EXP    = 256
-N_FF_DENSE  = 512
-N_LAYERS    = 9          # 8 trunk + 1 NextN
+N_FF_EXP    = args.n_ff_exp or N_EMBD
+N_FF_DENSE  = args.n_ff_dense or 2*N_EMBD
+N_LAYERS    = args.layers
 N_DENSE_LEAD= 3
-VOCAB       = 257   # 256 raw byte tokens + 1 </s>
+VOCAB       = args.vocab
 CONV_K      = 4
 LOWER_BOUND = -5.0
 
@@ -163,7 +171,11 @@ for il in range(N_LAYERS):
         T(p_+'attn_kv_a_norm.weight', ones(KV_LORA))
         T(p_+'attn_k_b.weight', rq(MLA_HD, KV_LORA, N_HEAD))
         T(p_+'attn_v_b.weight', rq(KV_LORA, MLA_HD, N_HEAD))
-        T(p_+'attn_output.weight', rq(N_EMBD, N_HEAD*MLA_HD))
+        # attn_output: [n_head*mla_hd, n_embd] = rq(input, output). Written with
+        # the arguments swapped until --n-head was added: at the default 4*64 ==
+        # 256 == N_EMBD the transpose is a no-op, so it only shows up once the
+        # head count is varied.
+        T(p_+'attn_output.weight', rq(N_HEAD*MLA_HD, N_EMBD))
         T(p_+'indexer.k_norm.weight', ones(IDX_DIM))
         T(p_+'indexer.k_norm.bias', zeros(IDX_DIM))
         T(p_+'indexer.proj.weight', rq(N_EMBD, IDX_NH))
@@ -204,8 +216,12 @@ for il in range(N_LAYERS):
         T(p_+'ffn_gate_exps.weight', rq(N_EMBD, N_FF_EXP, N_EXP))
         T(p_+'ffn_up_exps.weight', rq(N_EMBD, N_FF_EXP, N_EXP))
         T(p_+'ffn_down_exps.weight', rq(N_FF_EXP, N_EMBD, N_EXP))
-        T(p_+'ffn_gate_shexp.weight', rq(N_FF_EXP, N_EMBD))
-        T(p_+'ffn_up_shexp.weight', rq(N_FF_EXP, N_EMBD))
+        # shexp gate/up: [n_embd, n_ff_exp] = rq(input, output); down is the reverse.
+        # gate/up were written as rq(N_FF_EXP, N_EMBD), which is the same shape
+        # only while N_EMBD == N_FF_EXP (256 == 256 by default), so the swap was
+        # invisible until --n-embd was added.
+        T(p_+'ffn_gate_shexp.weight', rq(N_EMBD, N_FF_EXP))
+        T(p_+'ffn_up_shexp.weight', rq(N_EMBD, N_FF_EXP))
         T(p_+'ffn_down_shexp.weight', rq(N_FF_EXP, N_EMBD))
 
 w.write_header_to_file()
