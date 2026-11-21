@@ -2021,6 +2021,94 @@ picolm_gpu_matmul_dev(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
     return rc;
 }
 
+/* --gpu-q8diff: compare the GPU activation quantiser against the CPU's.
+ *
+ * Decides whether the next large piece of work is a correctness fix or only a
+ * performance change. See the comment on the CLI side for the reasoning.
+ * Returns 0 when the int8 payloads are identical.
+ */
+extern "C" int picolm_gpu_q8_quant_diff(int I);
+extern "C" int picolm_gpu_q8_quant_diff(int I) {
+    if (I <= 0 || (I % 32) != 0) { fprintf(stderr, "I must be a positive multiple of 32\n"); return 1; }
+    int nb = I / 32;
+
+    float *x = (float *)malloc((size_t)I * sizeof(float));
+    int8_t *cpu_row = (int8_t *)malloc((size_t)nb * 34);
+    if (!x || !cpu_row) { fprintf(stderr, "OOM\n"); return 1; }
+
+    /* Deterministic pseudo-random activations with a realistic dynamic range;
+     * a block whose values are all equal cannot distinguish rounding. */
+    unsigned st = 1234u;
+    for (int i = 0; i < I; i++) {
+        st = st * 1664525u + 1013904223u;
+        x[i] = ((float)((st >> 8) & 0xFFFF) / 32768.0f - 1.0f) * 8.0f;
+    }
+
+    /* CPU reference: same function the CPU matmul path uses. */
+    extern void quantize_row_q8_0(const float *x, void *y, int k);
+    quantize_row_q8_0(x, cpu_row, I);
+
+    { int dev0 = 0;
+      if (!picolm_gpu_init(&dev0, 1)) { fprintf(stderr, "GPU init failed\n"); free(x); free(cpu_row); return 1; } }
+    gpu_device_ctx_t *ctx = find_ctx(0);
+    if (!ctx || !select_ctx(ctx)) { fprintf(stderr, "no ctx\n"); return 1; }
+
+    int8_t *d_qs = NULL; float *d_d = NULL, *d_x = NULL;
+    size_t qs_bytes = (size_t)nb * 32, d_bytes = (size_t)nb * sizeof(float);
+    if (!gpu_ok(gpuMalloc((void **)&d_qs, qs_bytes), "q8diff qs") ||
+        !gpu_ok(gpuMalloc((void **)&d_d, d_bytes), "q8diff d") ||
+        !gpu_ok(gpuMalloc((void **)&d_x, (size_t)I * sizeof(float)), "q8diff x")) {
+        fprintf(stderr, "gpuMalloc failed\n"); return 1;
+    }
+    gpuMemcpy(d_x, x, (size_t)I * sizeof(float), gpuMemcpyHostToDevice);
+    /* One block of 32 threads per 32-value block, exactly as the real dispatch
+     * does (q_grid = (n_blocks, S)). */
+    dim3 grid((unsigned)nb, 1);
+    picolm_quantize_q8_0<<<grid, 32, 32 * sizeof(float), ctx->stream>>>(d_qs, d_d, d_x, I, 1);
+    if (!gpu_ok(gpuGetLastError(), "q8diff kernel")) return 1;
+    gpuDeviceSynchronize();
+
+    int8_t *gpu_qs = (int8_t *)malloc(qs_bytes);
+    float *gpu_d = (float *)malloc(d_bytes);
+    if (!gpu_qs || !gpu_d) { fprintf(stderr, "OOM\n"); return 1; }
+    gpuMemcpy(gpu_qs, d_qs, qs_bytes, gpuMemcpyDeviceToHost);
+    gpuMemcpy(gpu_d, d_d, d_bytes, gpuMemcpyDeviceToHost);
+
+    int qs_bad = 0, d_bad = 0, max_qd = 0;
+    double max_dd = 0.0, sum_abs_dd = 0.0;
+    for (int b = 0; b < nb; b++) {
+        const uint8_t *blk = (const uint8_t *)cpu_row + (size_t)b * 34;
+        uint16_t d16 = (uint16_t)(blk[0] | ((uint16_t)blk[1] << 8));
+        float cd = gpu_fp16_to_fp32((int)d16);
+        double dd = (double)cd - (double)gpu_d[b];
+        if (dd < 0) dd = -dd;
+        sum_abs_dd += dd;
+        if (cd != gpu_d[b]) { d_bad++; if (dd > max_dd) max_dd = dd; }
+        for (int j = 0; j < 32; j++) {
+            int cq = (int8_t)blk[2 + j];
+            int gq = (int)gpu_qs[b * 32 + j];
+            if (cq != gq) {
+                qs_bad++;
+                int q = cq - gq; if (q < 0) q = -q;
+                if (q > max_qd) max_qd = q;
+            }
+        }
+    }
+
+    fprintf(stderr, "\n[Q8DIFF] I=%d  blocks=%d\n", I, nb);
+    fprintf(stderr, "  int8 payload : %d / %d differ   (max |dq| = %d)\n", qs_bad, nb * 32, max_qd);
+    fprintf(stderr, "  d scale      : %d / %d blocks differ (max |dd| = %.9g, mean %.3g)\n",
+            d_bad, nb, max_dd, nb ? sum_abs_dd / (double)nb : 0.0);
+    fprintf(stderr, "  VERDICT: %s\n",
+            (qs_bad == 0 && d_bad == 0)
+              ? "GPU and CPU Q8_0 agree EXACTLY -- the Q8_0 quantiser is not the long-context divergence"
+              : "they DIFFER -- the quantiser is a genuine divergence source");
+
+    free(x); free(cpu_row); free(gpu_qs); free(gpu_d);
+    gpuFree(d_qs); gpuFree(d_d); gpuFree(d_x);
+    return (qs_bad == 0 && d_bad == 0) ? 0 : 2;
+}
+
 /* picolm_gpu_matmul_logits: output projection (lm_head) on GPU.
  * Specialized for S=1 (single token), Q8_0 weights.
  * Takes input from device, writes logits to device.

@@ -301,7 +301,25 @@ picolm_quantize_q8_0(int8_t *qs_out, float *d_out,
 
     qs_out[(size_t)s * (size_t)n_blocks * 32 + (size_t)block * 32 + tid] = (int8_t)q;
     if (tid == 0)
-        d_out[(size_t)s * (size_t)n_blocks + block] = d;
+        /* ROUND d TO FP16, because that is what it is.
+         *
+         * `d` is the block_q8_0 scale, and in the GGUF format that field is
+         * an fp16. The CPU's quantize_row_q8_0 therefore stores
+         * fp32_to_fp16(maxS/127.0f), while this kernel was storing the full
+         * fp32 value into its separate float buffer. Measured with
+         * --gpu-q8diff: the int8 payloads agree EXACTLY (0/5120 differ) but
+         * 159/160 blocks had a different d, mean |dd| 9.5e-6.
+         *
+         * That is not extra precision, it is a DIFFERENT FUNCTION: every one
+         * of the 32 values in the block is scaled by a slightly different
+         * number, in every matmul of every layer. Tiny per token, but it
+         * accumulates over the residual stream, and at 9848 tokens of context
+         * GPU and CPU prefill disagree by max|logit diff| 11.4 with different
+         * argmaxes. Applying the same fp16 rounding makes the two paths
+         * compute the same thing at the source instead of drifting apart.
+         */
+        d_out[(size_t)s * (size_t)n_blocks + block] =
+            gpu_fp16_to_fp32((int)gpu_fp32_to_fp16(d));
 }
 
 /* Quantize F32/BF16 weight rows to Q8_0 block format.
