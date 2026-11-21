@@ -1863,6 +1863,21 @@ matmul_dev_impl(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
          * PICOLM_NO_MT_Q5K=1 restores the single-tile kernel for A/B. */
         static int no_mt_q5k = -1;
         if (no_mt_q5k < 0) no_mt_q5k = getenv("PICOLM_NO_MT_Q5K") ? 1 : 0;
+        /* Multi-warp kernel first: 8 warps per block instead of 1. The
+         * single-warp multi-tile kernel measured 4% of bandwidth and 3.4% of
+         * int8 peak simultaneously, i.e. occupancy-bound, which a 32-thread
+         * block cannot fix. PICOLM_NO_W8_Q5K=1 falls back to it. */
+        static int no_w8_q5k = -1;
+        if (no_w8_q5k < 0) no_w8_q5k = getenv("PICOLM_NO_W8_Q5K") ? 1 : 0;
+        if (!no_w8_q5k && !no_mt_q5k && S > 16) {
+            gpu_dispatch_print("matmul_q5_imma_w8_dev");
+            unsigned gy = (unsigned)((S + 16 * Q5K_TILES_S - 1) / (16 * Q5K_TILES_S));
+            unsigned gx = (unsigned)((O + 8 * Q5KW_WARPS - 1) / (8 * Q5KW_WARPS));
+            int smt = Q5KW_WARPS * 32 * Q5K_TILES_S * 4 * (int)sizeof(float);
+            picolm_q5_k_q8_matmul_imma_w8<<<dim3(gx, gy), 32 * Q5KW_WARPS, smt, ctx->stream>>>(
+                y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
+            if (gpu_ok(gpuGetLastError(), "q5 matmul w8 (dev)")) return 1;
+        }
         if (!no_mt_q5k && S > 16) {
             gpu_dispatch_print("matmul_q5_imma_mt_dev");
             /* Cap the tile count so short chunks stay wide: with a fixed 32

@@ -18,6 +18,15 @@ __global__ void picolm_q5_k_q8_matmul_imma(float *y, const int8_t *xq, const flo
  * ((O+7)/8, ceil(S / (16*Q5K_TILES_S))). */
 #define Q5K_TILES_S 16
 __global__ void picolm_q5_k_q8_matmul_imma_mt(float *y, const int8_t *xq, const float *xd, const void *weights, int S, int I, int O, int row_bytes, int y_stride);
+
+/* Multi-warp x multi-tile Q5_K IMMA. Block = Q5KW_WARPS warps; each warp owns
+ * its own 8 output columns, all warps share the row-tiles and walk K together.
+ * Grid is (ceil(O/(8*Q5KW_WARPS)), ceil(S/(16*Q5K_TILES_S))), 32*Q5KW_WARPS
+ * threads/block. Exists because the 32-thread blocks cap an SM at 1/64 of its
+ * thread slots, which is why the multi-tile kernel measured 4% of bandwidth
+ * AND 3.4% of compute at the same time. */
+#define Q5KW_WARPS 8
+__global__ void picolm_q5_k_q8_matmul_imma_w8(float *y, const int8_t *xq, const float *xd, const void *weights, int S, int I, int O, int row_bytes, int y_stride);
 __global__ void picolm_q4_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd, const void *weights, int S, int I, int O, int row_bytes, int y_stride);
 __global__ void picolm_q3_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd, const void *weights, int S, int I, int O, int row_bytes, int y_stride);
 __global__ void picolm_q2_k_q8_matmul_imma(float *y, const int8_t *xq, const float *xd, const void *weights, int S, int I, int O, int row_bytes, int y_stride);

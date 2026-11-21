@@ -3282,6 +3282,203 @@ picolm_q6_k_q8_matmul_imma_mt(float *y, const int8_t *xq, const float *xd,
     }
 }
 
+/* Q5_K x Q8_0 IMMA kernel, MULTI-WARP x MULTI-TILE.
+ *
+ * WHY: measured on the 27B at S=423, the multi-tile kernel above runs at
+ * 4% of memory bandwidth AND 3.4% of int8 tensor-core peak. When neither
+ * roofline is close, the kernel is occupancy/latency bound, and the arithmetic
+ * says exactly why: the block is 32 threads, so an SM can never host more than
+ * 32 useful threads per block x (blocks/SM). A first-generation warp-per-tile
+ * GEMM needs many warps per SM to hide the load latency of the weight stream,
+ * and one warp per block cannot provide them.
+ *
+ * WHAT THIS DOES: keeps every piece of per-tile arithmetic identical to the
+ * multi-tile kernel (same m16n8k32 mma, same Q5_K nibble/high-bit decode, same
+ * min-correction, same fp32 epilogue) and only changes how work is grouped:
+ *
+ *   block = Q5KW_WARPS warps, 32 threads each
+ *   warp  w handles output columns tile_o + w*8 .. +7   (its own 8-col tile)
+ *   all warps share the same Q5K_TILES_S row-tiles and walk K together
+ *
+ * So each block now produces Q5KW_WARPS*8 output columns x Q5K_TILES_S*16 rows
+ * instead of 8 x that. Occupancy per SM rises by Q5KW_WARPS, and the row-tile
+ * reuse across K (the multi-tile win) is unchanged because each warp still
+ * reuses its own weight fragment across its Q5K_TILES_S tiles.
+ *
+ * The weight fragment cannot be shared ACROSS warps (each warp owns different
+ * output columns, so it needs different weight bytes), which is why this is a
+ * grouping change and not a shared-memory B-fragment change.
+ */
+#define Q5KW_WARPS 8
+
+__global__ void
+picolm_q5_k_q8_matmul_imma_w8(float *y, const int8_t *xq, const float *xd,
+                               const void *weights, int S, int I, int O,
+                               int row_bytes, int y_stride) {
+    const int warp = (int)(gpuThreadIdx_x >> 5);        /* which 8-col tile */
+    const int lane = (int)(gpuThreadIdx_x & 31);
+    int gid = lane / 4;
+    int tid = lane % 4;
+
+    int tile_o = (int)gpuBlockIdx_x * (8 * Q5KW_WARPS) + warp * 8;
+    int tile_s0 = (int)gpuBlockIdx_y * (16 * Q5K_TILES_S);
+    int ys = y_stride > 0 ? y_stride : O;
+    int n_blocks = I / 32;
+    const uint8_t *w = (const uint8_t *)weights;
+
+    int n_tiles = (S - tile_s0 + 15) >> 4;
+    if (n_tiles > Q5K_TILES_S) n_tiles = Q5K_TILES_S;
+    if (n_tiles <= 0) return;
+
+    /* Accumulators: one 4-float group per (thread, tile). Indexed by the
+     * block-wide thread id so warps never collide. Shared memory rather than a
+     * register array for the reason recorded on the multi-tile kernel: as
+     * registers the array spills from 8 tiles up and the spill changes the
+     * RESULT, not just the speed. */
+    extern __shared__ float sum_sh[];
+    {
+        int total = Q5KW_WARPS * 32 * Q5K_TILES_S * 4;
+        for (int i = (int)gpuThreadIdx_x; i < total; i += (int)gpuBlockDim_x)
+            sum_sh[i] = 0.0f;
+    }
+    gpuSyncthreads();
+    float *mysum = sum_sh + ((size_t)warp * 32 + lane) * 4;
+
+    for (int kb = 0; kb < n_blocks; kb++) {
+        int q5_block = kb / 8;
+        int g = kb % 8;
+
+        int wc = tile_o + gid;
+        size_t wrow_base = (size_t)wc * row_bytes + q5_block * GPU_BLOCK_Q5_K_SIZE;
+        const uint8_t *wb = w + wrow_base;
+
+        int b0, b1;
+        {
+            int group = g >> 1;
+            int sub = g & 1;
+            const uint8_t *qs_base = wb + 48 + group * 32;
+            const uint8_t *qh_base = wb + 16;
+            int bit_shift = 2 * group + sub;
+            uint32_t b0_val = 0, b1_val = 0;
+            for (int e = 0; e < 4; e++) {
+                int l = tid * 4 + e;
+                uint8_t qs_byte = qs_base[l];
+                uint8_t nibble = sub ? (qs_byte >> 4) : (qs_byte & 0xF);
+                uint8_t high = ((qh_base[l] >> bit_shift) & 1) ? 16 : 0;
+                b0_val |= (uint32_t)(nibble + high) << (e * 8);
+
+                int l1 = 16 + tid * 4 + e;
+                uint8_t qs1 = qs_base[l1];
+                uint8_t nib1 = sub ? (qs1 >> 4) : (qs1 & 0xF);
+                uint8_t hi1 = ((qh_base[l1] >> bit_shift) & 1) ? 16 : 0;
+                b1_val |= (uint32_t)(nib1 + hi1) << (e * 8);
+            }
+            b0 = (int)b0_val;
+            b1 = (int)b1_val;
+        }
+
+        float wds0, wdmn0, wds1, wdmn1;
+        {
+            size_t wb0_off = (size_t)(tile_o + tid * 2) * row_bytes + q5_block * GPU_BLOCK_Q5_K_SIZE;
+            const uint8_t *wb0 = w + wb0_off;
+            float wd0 = gpu_fp16_to_fp32((uint16_t)(wb0[0] | (wb0[1] << 8)));
+            float wdm0 = gpu_fp16_to_fp32((uint16_t)(wb0[2] | (wb0[3] << 8)));
+            uint8_t sc0, mn0;
+            { const uint8_t *s0 = wb0 + 4;
+              if (g < 4) { sc0 = s0[g] & 63; mn0 = s0[g + 4] & 63; }
+              else { sc0 = (uint8_t)((s0[g + 4] & 0xF) | ((s0[g - 4] >> 6) << 4));
+                      mn0 = (uint8_t)((s0[g + 4] >> 4) | ((s0[g] >> 6) << 4)); } }
+            wds0 = wd0 * (float)sc0;
+            wdmn0 = wdm0 * (float)mn0;
+
+            size_t wb1_off = (size_t)(tile_o + tid * 2 + 1) * row_bytes + q5_block * GPU_BLOCK_Q5_K_SIZE;
+            const uint8_t *wb1 = w + wb1_off;
+            float wd1 = gpu_fp16_to_fp32((uint16_t)(wb1[0] | (wb1[1] << 8)));
+            float wdm1 = gpu_fp16_to_fp32((uint16_t)(wb1[2] | (wb1[3] << 8)));
+            uint8_t sc1, mn1;
+            { const uint8_t *s1 = wb1 + 4;
+              if (g < 4) { sc1 = s1[g] & 63; mn1 = s1[g + 4] & 63; }
+              else { sc1 = (uint8_t)((s1[g + 4] & 0xF) | ((s1[g - 4] >> 6) << 4));
+                      mn1 = (uint8_t)((s1[g + 4] >> 4) | ((s1[g] >> 6) << 4)); } }
+            wds1 = wd1 * (float)sc1;
+            wdmn1 = wdm1 * (float)mn1;
+        }
+
+        for (int t = 0; t < n_tiles; t++) {
+            int tile_s = tile_s0 + t * 16;
+
+            int a0, a1, a2, a3;
+            {
+                int c0 = tid * 4;
+                int c2 = c0 + 16;
+                int row0 = tile_s + gid;
+                int row1 = tile_s + gid + 8;
+                if (row0 >= S) row0 = S - 1;
+                if (row1 >= S) row1 = S - 1;
+                int src0 = row0 * I + kb * 32 + c0;
+                int src1 = row1 * I + kb * 32 + c0;
+                int src2 = row0 * I + kb * 32 + c2;
+                int src3 = row1 * I + kb * 32 + c2;
+                int32_t *p;
+                p = (int32_t *)(const int8_t *)(&xq[src0]); a0 = p[0];
+                p = (int32_t *)(const int8_t *)(&xq[src1]); a1 = p[0];
+                p = (int32_t *)(const int8_t *)(&xq[src2]); a2 = p[0];
+                p = (int32_t *)(const int8_t *)(&xq[src3]); a3 = p[0];
+            }
+
+            int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__)
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                : "+r"(d0), "+r"(d1), "+r"(d2), "+r"(d3)
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
+
+            int sq0 = 0, sq1 = 0;
+            {
+                int8_t *av;
+                av = (int8_t *)&a0; sq0 += av[0] + av[1] + av[2] + av[3];
+                av = (int8_t *)&a2; sq0 += av[0] + av[1] + av[2] + av[3];
+                av = (int8_t *)&a1; sq1 += av[0] + av[1] + av[2] + av[3];
+                av = (int8_t *)&a3; sq1 += av[0] + av[1] + av[2] + av[3];
+            }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 300
+            {
+                const unsigned mask = 0xFFFFFFFFu;
+                sq0 += gpuShflDownSync(mask, sq0, 2, 4);
+                sq1 += gpuShflDownSync(mask, sq1, 2, 4);
+                sq0 += gpuShflDownSync(mask, sq0, 1, 4);
+                sq1 += gpuShflDownSync(mask, sq1, 1, 4);
+                sq0 = gpuShflSync(mask, sq0, 0, 4);
+                sq1 = gpuShflSync(mask, sq1, 0, 4);
+            }
+#endif
+
+            const int row_a = tile_s + gid;
+            const int row_b = tile_s + gid + 8;
+            float dx0 = (row_a < S) ? xd[(size_t)row_a * n_blocks + kb] : 0.0f;
+            float dx1 = (row_b < S) ? xd[(size_t)row_b * n_blocks + kb] : 0.0f;
+
+            { float *S4 = mysum + (size_t)t * 32 * 4;
+              S4[0] += wds0 * dx0 * (float)d0 - wdmn0 * dx0 * (float)sq0;
+              S4[2] += wds0 * dx1 * (float)d2 - wdmn0 * dx1 * (float)sq1;
+              S4[1] += wds1 * dx0 * (float)d1 - wdmn1 * dx0 * (float)sq0;
+              S4[3] += wds1 * dx1 * (float)d3 - wdmn1 * dx1 * (float)sq1; }
+        }
+    }
+
+    for (int t = 0; t < n_tiles; t++) {
+        int tile_s = tile_s0 + t * 16;
+        for (int f = 0; f < 4; f++) {
+            int row = tile_s + ((f < 2) ? gid : gid + 8);
+            int col = tile_o + tid * 2 + (f % 2);
+            if (row < S && col < O)
+                y[(size_t)row * ys + (size_t)col] = mysum[(size_t)t * 32 * 4 + f];
+        }
+    }
+}
+
 /* Q5_K x Q8_0 IMMA kernel, MULTI-TILE (TILES_S row-tiles of 16 per block).
  *
  * Why this exists: the single-tile kernel above (picolm_q5_k_q8_matmul_imma)
