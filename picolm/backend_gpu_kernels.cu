@@ -3867,6 +3867,251 @@ picolm_q5_k_q8_matmul_imma_w8(float *y, const int8_t *xq, const float *xd,
     }
 }
 
+/* Q5_K x Q8_0 IMMA kernel, SUPERBLOCK-UNROLLED inner loop.
+ *
+ * WHY: after moving the accumulators to registers the q5_K kernel ran at
+ * 28 TFLOP/s = 4% of the card's int8 peak, with the weight stream, the A
+ * gather, the min-correction and the scale decode all measuring as nearly free
+ * alongside it. What is left is the shape of the inner loop: per k-block it
+ * issues ONE mma and then ~15 dependent scalar operations around it, and it
+ * does that 8 times per Q5_K super-block, so the tensor core alternates with
+ * scalar work instead of running in bursts.
+ *
+ * This kernel keeps the per-output arithmetic identical but restructures the
+ * k loop: for one super-block (the 8 sub-blocks g = 0..7) it decodes all eight
+ * weight fragments, issues the eight mma back to back into eight INDEPENDENT
+ * accumulator sets, and only then runs the eight epilogues. Independent
+ * accumulators mean no dependency chain between the mma, so the scheduler can
+ * put real work behind each one.
+ *
+ * Registers: acc[8][4] = 32 floats + d[8][4] = 32 ints + fragments ~ 90-110,
+ * comfortably inside the 255 budget at 256 threads/block.
+ *
+ * The Q5_K block (256 values, 176 bytes) holds exactly 8 sub-blocks of 32
+ * values, which is why g unrolls to 8 with no remainder.
+ */
+__global__ void
+picolm_q5_k_q8_matmul_imma_sb(float *y, const int8_t *xq, const float *xd,
+                               const void *weights, int S, int I, int O,
+                               int row_bytes, int y_stride) {
+    const int warp = (int)(gpuThreadIdx_x >> 5);
+    const int lane = (int)(gpuThreadIdx_x & 31);
+    int gid = lane / 4;
+    int tid = lane % 4;
+
+    int tile_o = (int)gpuBlockIdx_x * (8 * Q5KW_WARPS) + warp * 8;
+    int tile_s0 = (int)gpuBlockIdx_y * (16 * Q5K_TILES_S);
+    int ys = y_stride > 0 ? y_stride : O;
+    int n_blocks = I / 32;
+    int n_super  = n_blocks / 8;               /* Q5_K super-blocks */
+    const uint8_t *w = (const uint8_t *)weights;
+
+    int n_tiles = (S - tile_s0 + 15) >> 4;
+    if (n_tiles > Q5K_TILES_S) n_tiles = Q5K_TILES_S;
+    if (n_tiles <= 0) return;
+
+    float acc[Q5K_TILES_S][4];
+    for (int t = 0; t < Q5K_TILES_S; t++)
+        acc[t][0] = acc[t][1] = acc[t][2] = acc[t][3] = 0.0f;
+
+    int wc = tile_o + gid;
+
+    for (int sb = 0; sb < n_super; sb++) {
+        size_t base = (size_t)wc * row_bytes + (size_t)sb * GPU_BLOCK_Q5_K_SIZE;
+        const uint8_t *wb = w + base;
+
+        /* ---- decode all 8 sub-block weight fragments first ---- */
+        int bb0[8], bb1[8];
+#pragma unroll
+        for (int g = 0; g < 8; g++) {
+            int group = g >> 1;
+            int sub = g & 1;
+            const uint8_t *qs_base = wb + 48 + group * 32;
+            const uint8_t *qh_base = wb + 16;
+            int bit_shift = 2 * group + sub;
+            uint32_t b0_val = 0, b1_val = 0;
+            for (int e = 0; e < 4; e++) {
+                int l = tid * 4 + e;
+                uint8_t qs_byte = qs_base[l];
+                uint8_t nibble = sub ? (qs_byte >> 4) : (qs_byte & 0xF);
+                uint8_t high = ((qh_base[l] >> bit_shift) & 1) ? 16 : 0;
+                b0_val |= (uint32_t)(nibble + high) << (e * 8);
+
+                int l1 = 16 + tid * 4 + e;
+                uint8_t qs1 = qs_base[l1];
+                uint8_t nib1 = sub ? (qs1 >> 4) : (qs1 & 0xF);
+                uint8_t hi1 = ((qh_base[l1] >> bit_shift) & 1) ? 16 : 0;
+                b1_val |= (uint32_t)(nib1 + hi1) << (e * 8);
+            }
+            bb0[g] = (int)b0_val;
+            bb1[g] = (int)b1_val;
+        }
+
+        /* ---- per-output-column scales for all 8 sub-blocks ---- */
+        float s0a[8], s0m[8], s1a[8], s1m[8];
+        {
+            size_t o0 = (size_t)(tile_o + tid * 2) * row_bytes + (size_t)sb * GPU_BLOCK_Q5_K_SIZE;
+            const uint8_t *wb0 = w + o0;
+            float wd0  = gpu_fp16_to_fp32((uint16_t)(wb0[0] | (wb0[1] << 8)));
+            float wdm0 = gpu_fp16_to_fp32((uint16_t)(wb0[2] | (wb0[3] << 8)));
+            size_t o1 = (size_t)(tile_o + tid * 2 + 1) * row_bytes + (size_t)sb * GPU_BLOCK_Q5_K_SIZE;
+            const uint8_t *wb1 = w + o1;
+            float wd1  = gpu_fp16_to_fp32((uint16_t)(wb1[0] | (wb1[1] << 8)));
+            float wdm1 = gpu_fp16_to_fp32((uint16_t)(wb1[2] | (wb1[3] << 8)));
+            const uint8_t *p0 = wb0 + 4;
+            const uint8_t *p1 = wb1 + 4;
+#pragma unroll
+            for (int g = 0; g < 8; g++) {
+                uint8_t sc0, mn0, sc1, mn1;
+                if (g < 4) {
+                    sc0 = p0[g] & 63; mn0 = p0[g + 4] & 63;
+                    sc1 = p1[g] & 63; mn1 = p1[g + 4] & 63;
+                } else {
+                    sc0 = (uint8_t)((p0[g + 4] & 0xF) | ((p0[g - 4] >> 6) << 4));
+                    mn0 = (uint8_t)((p0[g + 4] >> 4) | ((p0[g] >> 6) << 4));
+                    sc1 = (uint8_t)((p1[g + 4] & 0xF) | ((p1[g - 4] >> 6) << 4));
+                    mn1 = (uint8_t)((p1[g + 4] >> 4) | ((p1[g] >> 6) << 4));
+                }
+                s0a[g] = wd0 * (float)sc0;  s0m[g] = wdm0 * (float)mn0;
+                s1a[g] = wd1 * (float)sc1;  s1m[g] = wdm1 * (float)mn1;
+            }
+        }
+
+        for (int t = 0; t < n_tiles; t++) {
+            int tile_s = tile_s0 + t * 16;
+            int kb0 = sb * 8;
+
+            /* ---- broadcast this tile's xd values across the warp ----
+             * Every lane needs xd[tile_s + gid + {0,8}][kb] for each of the 8
+             * sub-blocks, and gid is just lane/4, so the whole 16-row tile only
+             * needs 16 distinct floats per kb -- but the loads as written were
+             * one per lane, strided nb*4 = 640 bytes apart, i.e. 8 cache lines
+             * per 32 useful bytes, repeated for every tile and k-block.
+             * Dropping them entirely measured 491 -> 344 ms, so they were 30%
+             * of the kernel.
+             *
+             * Now lanes 0..15 each load ONE value (contiguous within a kb
+             * column: they are tile_s+0..15, stride nb, so still strided, but
+             * 16 loads per kb instead of 8 per kb per lane) and the result is
+             * broadcast with shuffles. That is 16 global loads per (tile, kb)
+             * for the whole warp instead of 64. */
+            /* Load this lane's xd values for all 8 sub-blocks of the
+             * super-block, straight into registers.
+             *
+             * The original code loaded xd[row][kb] inside the tile loop and
+             * the epilogue, so every lane issued 2 loads per (tile, k-block)
+             * at addresses nb*4 = 640 bytes apart -- 8 cache lines per 32
+             * useful bytes. Removing them entirely measured 491 -> 344 ms.
+             *
+             * Here each lane loads the 8 k-blocks of its own two rows
+             * (gid and gid+8) as one run of 8 CONSECUTIVE floats from each
+             * row, i.e. xd[row*nb + kb0 .. +7]: 2 contiguous 32-byte reads per
+             * lane instead of 16 scattered 4-byte ones, and no shuffles. */
+            float xdb[8][2];
+            {
+                int ra = tile_s + gid;
+                int rb = tile_s + gid + 8;
+                if (ra < S) {
+                    const float *pa = xd + (size_t)ra * n_blocks + kb0;
+                    for (int q = 0; q < 8; q++) xdb[q][0] = pa[q];
+                } else {
+                    for (int q = 0; q < 8; q++) xdb[q][0] = 0.0f;
+                }
+                if (rb < S) {
+                    const float *pb = xd + (size_t)rb * n_blocks + kb0;
+                    for (int q = 0; q < 8; q++) xdb[q][1] = pb[q];
+                } else {
+                    for (int q = 0; q < 8; q++) xdb[q][1] = 0.0f;
+                }
+            }
+
+            /* ---- 8 back-to-back mma with independent accumulators ---- */
+            int d0[8], d1[8], d2[8], d3[8];
+            int q0[8], q1[8];
+#pragma unroll
+            for (int g = 0; g < 8; g++) { d0[g] = d1[g] = d2[g] = d3[g] = 0; q0[g] = q1[g] = 0; }
+
+#pragma unroll
+            for (int g = 0; g < 8; g++) {
+                int kb = kb0 + g;
+                int a0, a1, a2, a3;
+                {
+                    int c0 = tid * 4;
+                    int c2 = c0 + 16;
+                    int row0 = tile_s + gid;
+                    int row1 = tile_s + gid + 8;
+                    if (row0 >= S) row0 = S - 1;
+                    if (row1 >= S) row1 = S - 1;
+                    int32_t *p;
+                    p = (int32_t *)(const int8_t *)(&xq[row0 * I + kb * 32 + c0]); a0 = p[0];
+                    p = (int32_t *)(const int8_t *)(&xq[row1 * I + kb * 32 + c0]); a1 = p[0];
+                    p = (int32_t *)(const int8_t *)(&xq[row0 * I + kb * 32 + c2]); a2 = p[0];
+                    p = (int32_t *)(const int8_t *)(&xq[row1 * I + kb * 32 + c2]); a3 = p[0];
+                }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIP__)
+                asm volatile(
+                    "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                    : "+r"(d0[g]), "+r"(d1[g]), "+r"(d2[g]), "+r"(d3[g])
+                    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(bb0[g]), "r"(bb1[g]));
+#endif
+                {
+                    int s0v = 0, s1v = 0;
+                    int8_t *av;
+                    av = (int8_t *)&a0; s0v += av[0] + av[1] + av[2] + av[3];
+                    av = (int8_t *)&a2; s0v += av[0] + av[1] + av[2] + av[3];
+                    av = (int8_t *)&a1; s1v += av[0] + av[1] + av[2] + av[3];
+                    av = (int8_t *)&a3; s1v += av[0] + av[1] + av[2] + av[3];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 300
+                    const unsigned mask = 0xFFFFFFFFu;
+                    s0v += gpuShflDownSync(mask, s0v, 2, 4);
+                    s1v += gpuShflDownSync(mask, s1v, 2, 4);
+                    s0v += gpuShflDownSync(mask, s0v, 1, 4);
+                    s1v += gpuShflDownSync(mask, s1v, 1, 4);
+                    s0v = gpuShflSync(mask, s0v, 0, 4);
+                    s1v = gpuShflSync(mask, s1v, 0, 4);
+#endif
+                    q0[g] = s0v; q1[g] = s1v;
+                }
+            }
+
+            /* ---- epilogue: same arithmetic and order as the non-unrolled
+             * kernel, per sub-block, accumulating into this tile's registers ---- */
+            const int row_a = tile_s + gid;
+            const int row_b = tile_s + gid + 8;
+#pragma unroll
+            for (int g = 0; g < 8; g++) {
+                int kb = kb0 + g;
+#ifdef PICOLM_ABL_NO_XD
+                float dx0 = 1.0f, dx1 = 1.0f;   /* ABLATION: drop the epilogue loads */
+#else
+                /* gid-indexed values come from the per-tile broadcast above.
+                 * NOTE this is only valid because kb == kb0 in this loop: the
+                 * sb kernel groups the 8 sub-blocks of one Q5_K super-block,
+                 * and xd is indexed by kb, so values loaded for kb0 do NOT
+                 * serve kb0+1..7. Keep the real load for those. */
+                float dx0 = xdb[g][0];
+                float dx1 = xdb[g][1];
+#endif
+                acc[t][0] += s0a[g] * dx0 * (float)d0[g] - s0m[g] * dx0 * (float)q0[g];
+                acc[t][2] += s0a[g] * dx1 * (float)d2[g] - s0m[g] * dx1 * (float)q1[g];
+                acc[t][1] += s1a[g] * dx0 * (float)d1[g] - s1m[g] * dx0 * (float)q0[g];
+                acc[t][3] += s1a[g] * dx1 * (float)d3[g] - s1m[g] * dx1 * (float)q1[g];
+            }
+        }
+    }
+
+    for (int t = 0; t < n_tiles; t++) {
+        int tile_s = tile_s0 + t * 16;
+        for (int f = 0; f < 4; f++) {
+            int row = tile_s + ((f < 2) ? gid : gid + 8);
+            int col = tile_o + tid * 2 + (f % 2);
+            if (row < S && col < O)
+                y[(size_t)row * ys + (size_t)col] = acc[t][f];
+        }
+    }
+}
+
 /* Q5_K x Q8_0 IMMA kernel, MULTI-TILE (TILES_S row-tiles of 16 per block).
  *
  * Why this exists: the single-tile kernel above (picolm_q5_k_q8_matmul_imma)

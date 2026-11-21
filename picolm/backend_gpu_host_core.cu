@@ -1870,10 +1870,26 @@ matmul_dev_impl(picolm_gpu_tensor_t *t, float *y_dev, const float *x_dev,
         static int no_w8_q5k = -1;
         if (no_w8_q5k < 0) no_w8_q5k = getenv("PICOLM_NO_W8_Q5K") ? 1 : 0;
         if (!no_w8_q5k && !no_mt_q5k && S > 16) {
-            gpu_dispatch_print("matmul_q5_imma_w8_dev");
             unsigned gy = (unsigned)((S + 16 * Q5K_TILES_S - 1) / (16 * Q5K_TILES_S));
             unsigned gx = (unsigned)((O + 8 * Q5KW_WARPS - 1) / (8 * Q5KW_WARPS));
             int smt = 0;   /* register accumulators now; no dynamic shared memory */
+
+            /* Superblock-unrolled inner loop: 8 back-to-back mma into
+             * independent accumulators, then 8 epilogues, instead of
+             * one mma alternating with scalar work.
+             * PICOLM_NO_SB_Q5K=1 selects the plain w8 kernel for A/B. */
+            static int no_sb_q5k = -1;
+            if (no_sb_q5k < 0) no_sb_q5k = getenv("PICOLM_NO_SB_Q5K") ? 1 : 0;
+            if (!no_sb_q5k && (I % 256) == 0) {
+                gpu_dispatch_print("matmul_q5_imma_sb_dev");
+                picolm_q5_k_q8_matmul_imma_sb<<<dim3(gx, gy), 32 * Q5KW_WARPS, 0, ctx->stream>>>(
+                    y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
+                gpuError_t sbe = gpuGetLastError();
+                if (sbe == gpuSuccess) return 1;
+                fprintf(stderr, "ERROR: q5 sb kernel LAUNCH FAILED (%d)\n", (int)sbe);
+                gpuGetLastError();
+            }
+            gpu_dispatch_print("matmul_q5_imma_w8_dev");
             picolm_q5_k_q8_matmul_imma_w8<<<dim3(gx, gy), 32 * Q5KW_WARPS, smt, ctx->stream>>>(
                 y_dev, ctx->q8_xq, ctx->q8_xd, t->weights, S, I, O, (int)t->row_bytes, ys);
             if (gpu_ok(gpuGetLastError(), "q5 matmul w8 (dev)")) return 1;
