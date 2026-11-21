@@ -68,6 +68,29 @@ static int run_case(int NH, int KVL, int n, int nchunks, int do_ref, int nth, in
     return bad;
 }
 
+/* Blocked chunk task (sb>0) vs the original whole-chunk kernel (sb=0) on a deep context, single
+ * thread, few chunks so every chunk overflows the L2 -- the regime that made decode slope triple past
+ * ~24k context on a 24-thread Cascade Lake. Same math up to summation order: must agree to ~1e-5. */
+static int run_deep(int NH, int KVL, int n, int nchunks, int sb) {
+    uint16_t *c16 = malloc((size_t)n * KVL * 2);
+    for (size_t i = 0; i < (size_t)n * KVL; i++) c16[i] = fp32_to_fp16(rnd());
+    const size_t QN = (size_t)NH * KVL;
+    float *q = malloc(QN * 4), *oA = malloc(QN * 4), *oB = malloc(QN * 4);
+    for (size_t i = 0; i < QN; i++) q[i] = rnd() * 3.f;
+    tensor_set_threads(1); tensor_threadpool_init(1);
+    double t0 = get_time_ms();
+    int r1 = glm5_mla_splitkv_ex(c16, q, oA, NH, KVL, n, 0.25f, nchunks, 0);
+    double t1 = get_time_ms();
+    int r2 = glm5_mla_splitkv_ex(c16, q, oB, NH, KVL, n, 0.25f, nchunks, sb);
+    double t2 = get_time_ms();
+    double d = 0, a = 0; for (size_t i = 0; i < QN; i++) { d = fmax(d, fabs((double)oA[i] - oB[i])); a = fmax(a, fabs(oA[i])); }
+    int bad = !r1 || !r2 || !isfinite(d) || !(d < 2e-5 * (a + 1e-6));
+    printf("deep NH=%d n_kv=%-6d chunks=%d sb=%-3d  max rel diff %.1e  whole-chunk %.1f ms  blocked %.1f ms  (%.2fx)  %s\n",
+           NH, n, nchunks, sb, d / (a + 1e-30), t1 - t0, t2 - t1, (t1 - t0) / (t2 - t1), bad ? "FAIL" : "ok");
+    free(c16); free(q); free(oA); free(oB);
+    return bad;
+}
+
 int main(void) {
     fp16_table_init();   /* fp16_to_fp32_lookup() is all zeros until this runs */
     int f = 0;
@@ -80,6 +103,11 @@ int main(void) {
     f += run_case(64, 512, 2047,  1, 1, 2, 0);   /* one chunk == plain two-pass softmax */
     f += run_case(64, 512, 7111, 24, 0, 1, 1);   /* real shape, single-thread timing */
     f += run_case(64, 512, 7111, 24, 0, 1, 1);
+    /* sub-block edge cases against the original kernel: len < sb, len == sb, len % sb != 0, tiny sb */
+    f += run_deep(64, 512, 100, 1, 256); f += run_deep(64, 512, 256, 1, 256); f += run_deep(64, 512, 1000, 1, 256);
+    f += run_deep(64, 512, 1000, 1, 16);  f += run_deep(64, 512, 3001, 3, 128); f += run_deep(13, 512, 700, 2, 256);
+    /* deep: chunks of 12 MB (and 3 MB) overflow the L2 */
+    f += run_deep(64, 512, 24000, 2, 256); f += run_deep(64, 512, 24000, 2, 128); f += run_deep(64, 512, 24000, 8, 256);
     puts(f ? "FAIL" : "PASS");
     return f != 0;
 }

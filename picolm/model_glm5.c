@@ -1944,12 +1944,192 @@ typedef struct {
     float *pm, *pl;   /* [nchunks][NH]      */
     float *sc;        /* [nchunks][NH][cmax] */
     int NH, KVL, n_kv, nchunks, cmax;
+    int sb;           /* key sub-block per pass (0 = whole chunk per pass, the original kernel) */
     float scale;
 } glm5_skv_t;
+
+/* ---- L2-blocked chunk task ------------------------------------------------------------------
+ *
+ * The original chunk task sweeps the WHOLE chunk (ctx/nthreads rows of 1 KB) once per 4-head quad
+ * in the score pass (16 sweeps) and once per head pair x column tile in the PV pass (128 sweeps),
+ * and its score buffer is NH x len floats. That is fine while a thread's chunk fits its L2
+ * (1 MB on Cascade Lake: ~24k context with 24 threads) and ruinous after: every sweep re-reads the
+ * chunk from L3/DRAM, ~200 MB per thread per layer at 100k. Measured on the Xeon, the marginal decode
+ * cost per context token tripled (2 -> 6 us) exactly there, while ik stays at ~1.3 us.
+ *
+ * Here a thread processes its key range in sub-blocks of `sb` keys (default 256 = 256 KB of F16 rows
+ * + 64 KB of scores + 128 KB of q + 128 KB of accumulators): scores -> online softmax (running max m,
+ * sum l, accumulators rescaled) -> PV, all on an L2-resident sub-block, so each key row is fetched
+ * from memory once. The merge across chunks is unchanged (part, m, l keep their meaning).
+ * Tiles: scores 8 heads x 2 keys, PV 8 heads x 32 columns -- 16 accumulators each, but only 2
+ * F16->F32 conversions per 16 FMAs (the 4x4 / 2x8 tiles needed 4 and 8).
+ * PICOLM_GLM5_SKV_SB=<n> sets the sub-block (16..512); 0 selects the original kernel. */
+#define GLM5_SKV_SB_MAX 512
+static int glm5_skv_sb(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("PICOLM_GLM5_SKV_SB");
+        int v = e ? atoi(e) : 256;
+        if (v <= 0) v = 0; else { if (v < 16) v = 16; if (v > GLM5_SKV_SB_MAX) v = GLM5_SKV_SB_MAX; v &= ~15; }
+        cached = v;
+    }
+    return cached;
+}
+
+/* S[h*SB + j] = scale * dot(q_h, row_j) for h < NH, j < nk */
+static void glm5_skv_scores_blk(const float *q, int NH, const uint16_t *rows, int nk, int KVL,
+                                float scale, float *S, int SB)
+{
+    int h = 0;
+#if defined(PICOLM_AVX512)
+    if ((KVL & 15) == 0) {
+        for (; h + 7 < NH; h += 8) {
+            const float *qh = q + (size_t)h * KVL;
+            int p = 0;
+            for (; p + 1 < nk; p += 2) {
+                __m512 a0[8], a1[8];
+                #pragma GCC unroll 8
+                for (int hh = 0; hh < 8; hh++) { a0[hh] = _mm512_setzero_ps(); a1[hh] = a0[hh]; }
+                const uint16_t *r0 = rows + (size_t)p * KVL, *r1 = r0 + KVL;
+                for (int d = 0; d < KVL; d += 16) {
+                    const __m512 k0 = glm5_f16x16_to_ps(r0 + d), k1 = glm5_f16x16_to_ps(r1 + d);
+                    #pragma GCC unroll 8
+                    for (int hh = 0; hh < 8; hh++) {
+                        const __m512 w = _mm512_loadu_ps(qh + (size_t)hh * KVL + d);
+                        a0[hh] = _mm512_fmadd_ps(k0, w, a0[hh]);
+                        a1[hh] = _mm512_fmadd_ps(k1, w, a1[hh]);
+                    }
+                }
+                __m512 acc[16];
+                #pragma GCC unroll 8
+                for (int hh = 0; hh < 8; hh++) { acc[2 * hh] = a0[hh]; acc[2 * hh + 1] = a1[hh]; }
+                float tmp[16];
+                _mm512_storeu_ps(tmp, _mm512_mul_ps(glm5_pfa_hsum16(acc), _mm512_set1_ps(scale)));
+                for (int hh = 0; hh < 8; hh++) {
+                    S[(size_t)(h + hh) * SB + p]     = tmp[2 * hh];
+                    S[(size_t)(h + hh) * SB + p + 1] = tmp[2 * hh + 1];
+                }
+            }
+            for (; p < nk; p++)
+                for (int hh = 0; hh < 8; hh++)
+                    S[(size_t)(h + hh) * SB + p] =
+                        glm5_mla_dot_f16(rows + (size_t)p * KVL, qh + (size_t)hh * KVL, KVL) * scale;
+        }
+    }
+#endif
+    for (; h < NH; h++)
+        for (int p = 0; p < nk; p++)
+            S[(size_t)h * SB + p] = glm5_mla_dot_f16(rows + (size_t)p * KVL, q + (size_t)h * KVL, KVL) * scale;
+}
+
+/* part[h][:] += sum_j S[h*SB + j] * row_j[:] */
+static void glm5_skv_pv_blk(float *part, int NH, const float *S, int nk, const uint16_t *rows,
+                            int KVL, int SB)
+{
+    int h = 0;
+#if defined(PICOLM_AVX512)
+    if ((KVL & 31) == 0) {
+        for (; h + 7 < NH; h += 8) {
+            for (int c0 = 0; c0 < KVL; c0 += 32) {
+                __m512 a0[8], a1[8];
+                #pragma GCC unroll 8
+                for (int hh = 0; hh < 8; hh++) {
+                    a0[hh] = _mm512_loadu_ps(part + (size_t)(h + hh) * KVL + c0);
+                    a1[hh] = _mm512_loadu_ps(part + (size_t)(h + hh) * KVL + c0 + 16);
+                }
+                for (int p = 0; p < nk; p++) {
+                    const uint16_t *row = rows + (size_t)p * KVL + c0;
+                    const __m512 r0 = glm5_f16x16_to_ps(row), r1 = glm5_f16x16_to_ps(row + 16);
+                    #pragma GCC unroll 8
+                    for (int hh = 0; hh < 8; hh++) {
+                        const __m512 pw = _mm512_set1_ps(S[(size_t)(h + hh) * SB + p]);
+                        a0[hh] = _mm512_fmadd_ps(pw, r0, a0[hh]);
+                        a1[hh] = _mm512_fmadd_ps(pw, r1, a1[hh]);
+                    }
+                }
+                #pragma GCC unroll 8
+                for (int hh = 0; hh < 8; hh++) {
+                    _mm512_storeu_ps(part + (size_t)(h + hh) * KVL + c0, a0[hh]);
+                    _mm512_storeu_ps(part + (size_t)(h + hh) * KVL + c0 + 16, a1[hh]);
+                }
+            }
+        }
+    }
+#endif
+    for (; h < NH; h++)
+        for (int p = 0; p < nk; p++)
+            glm5_mla_accum_f16(part + (size_t)h * KVL, rows + (size_t)p * KVL, S[(size_t)h * SB + p], KVL);
+}
+
+static void glm5_skv_chunk_task_blk(int c, const glm5_skv_t *x)
+{
+    const int NH = x->NH, KVL = x->KVL, SB = x->sb;
+    const int p0 = (int)((long long)x->n_kv * c / x->nchunks);
+    const int p1 = (int)((long long)x->n_kv * (c + 1) / x->nchunks);
+    const int len = p1 - p0;
+    float *part = x->part + (size_t)c * NH * KVL;
+    float *pm = x->pm + (size_t)c * NH, *pl = x->pl + (size_t)c * NH;
+    const uint16_t *base = x->cache16 + (size_t)p0 * KVL;
+
+    memset(part, 0, (size_t)NH * KVL * sizeof(float));
+    if (len <= 0) { for (int h = 0; h < NH; h++) pm[h] = -INFINITY, pl[h] = 0.f; return; }
+
+    float S[64 * GLM5_SKV_SB_MAX];
+    float m[64], l[64];
+    for (int h = 0; h < NH; h++) { m[h] = -INFINITY; l[h] = 0.f; }
+
+    for (int kb = 0; kb < len; kb += SB) {
+        const int nk = (len - kb < SB) ? len - kb : SB;
+        const uint16_t *rows = base + (size_t)kb * KVL;
+        glm5_skv_scores_blk(x->qabs, NH, rows, nk, KVL, x->scale, S, SB);
+        for (int h = 0; h < NH; h++) {
+            float *sr = S + (size_t)h * SB;
+            float sum;
+            float mn;
+#if defined(PICOLM_AVX512)
+            __m512 vmx = _mm512_set1_ps(-INFINITY);
+            for (int j = 0; j < nk; j += 16) {
+                const int rem = nk - j;
+                const __mmask16 mk = rem >= 16 ? (__mmask16)0xFFFF : (__mmask16)((1u << rem) - 1u);
+                vmx = _mm512_mask_max_ps(vmx, mk, vmx, _mm512_loadu_ps(sr + j));
+            }
+            { const float bm = _mm512_reduce_max_ps(vmx); mn = bm > m[h] ? bm : m[h]; }
+            {
+                const __m512 vmn = _mm512_set1_ps(mn);
+                __m512 vsum = _mm512_setzero_ps();
+                for (int j = 0; j < nk; j += 16) {
+                    const int rem = nk - j;
+                    const __mmask16 mk = rem >= 16 ? (__mmask16)0xFFFF : (__mmask16)((1u << rem) - 1u);
+                    const __m512 e = _mm512_maskz_mov_ps(mk, kda_expf16(_mm512_sub_ps(_mm512_loadu_ps(sr + j), vmn)));
+                    _mm512_storeu_ps(sr + j, e);
+                    vsum = _mm512_add_ps(vsum, e);
+                }
+                sum = _mm512_reduce_add_ps(vsum);
+            }
+#else
+            float bm = -INFINITY;
+            for (int j = 0; j < nk; j++) if (sr[j] > bm) bm = sr[j];
+            mn = bm > m[h] ? bm : m[h];
+            sum = 0.f;
+            for (int j = 0; j < nk; j++) { const float e = expf(sr[j] - mn); sr[j] = e; sum += e; }
+#endif
+            const float alpha = (m[h] == -INFINITY) ? 0.0f : expf(m[h] - mn);
+            l[h] = l[h] * alpha + sum;
+            if (alpha != 1.0f) {
+                float *o = part + (size_t)h * KVL;
+                for (int d = 0; d < KVL; d++) o[d] *= alpha;
+            }
+            m[h] = mn;
+        }
+        glm5_skv_pv_blk(part, NH, S, nk, rows, KVL, SB);
+    }
+    for (int h = 0; h < NH; h++) { pm[h] = m[h]; pl[h] = l[h]; }
+}
 
 static void glm5_skv_chunk_task(int c, void *vp)
 {
     const glm5_skv_t *x = (const glm5_skv_t *)vp;
+    if (x->sb > 0) { glm5_skv_chunk_task_blk(c, x); return; }
     const int NH = x->NH, KVL = x->KVL, cmax = x->cmax;
     const int p0 = (int)((long long)x->n_kv * c / x->nchunks);
     const int p1 = (int)((long long)x->n_kv * (c + 1) / x->nchunks);
@@ -2107,16 +2287,17 @@ static void glm5_skv_merge_task(int h, void *vp)
 }
 
 /* Returns 1 if it ran. nchunks is clamped to [1, min(64, n_kv)]. */
-static int glm5_mla_splitkv(const uint16_t *cache16, const float *qabs, float *ctx,
-                            int NH, int KVL, int n_kv, float scale, int nchunks)
+static int glm5_mla_splitkv_ex(const uint16_t *cache16, const float *qabs, float *ctx,
+                               int NH, int KVL, int n_kv, float scale, int nchunks, int sb)
 {
     if (!cache16 || n_kv < 1 || NH < 1) return 0;
+    if (NH > 64) sb = 0;                    /* the blocked task keeps its per-head state on the stack */
     if (nchunks > GLM5_SKV_MAX_CHUNKS) nchunks = GLM5_SKV_MAX_CHUNKS;
     if (nchunks > n_kv) nchunks = n_kv;
     if (nchunks < 1) nchunks = 1;
     const int cmax = (n_kv + nchunks - 1) / nchunks;
     const size_t n_part = (size_t)nchunks * NH * KVL, n_ml = (size_t)nchunks * NH,
-                 n_sc = (size_t)nchunks * NH * cmax;
+                 n_sc = sb > 0 ? 0 : (size_t)nchunks * NH * cmax;     /* blocked task keeps scores on its stack */
     static float *buf = NULL; static size_t cap = 0;
     const size_t need = n_part + 2 * n_ml + n_sc;
     if (need > cap) {
@@ -2127,10 +2308,16 @@ static int glm5_mla_splitkv(const uint16_t *cache16, const float *qabs, float *c
     glm5_skv_t x;
     x.cache16 = cache16; x.qabs = qabs; x.ctx = ctx;
     x.part = buf; x.pm = buf + n_part; x.pl = x.pm + n_ml; x.sc = x.pl + n_ml;
-    x.NH = NH; x.KVL = KVL; x.n_kv = n_kv; x.nchunks = nchunks; x.cmax = cmax; x.scale = scale;
+    x.NH = NH; x.KVL = KVL; x.n_kv = n_kv; x.nchunks = nchunks; x.cmax = cmax; x.scale = scale; x.sb = sb;
     tensor_parallel_for(nchunks, glm5_skv_chunk_task, &x);
     tensor_parallel_for(NH, glm5_skv_merge_task, &x);
     return 1;
+}
+
+static int glm5_mla_splitkv(const uint16_t *cache16, const float *qabs, float *ctx,
+                            int NH, int KVL, int n_kv, float scale, int nchunks)
+{
+    return glm5_mla_splitkv_ex(cache16, qabs, ctx, NH, KVL, n_kv, scale, nchunks, glm5_skv_sb());
 }
 
 static void glm5_mla_forward(
