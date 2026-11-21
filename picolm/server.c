@@ -2054,7 +2054,7 @@ static void handle_slots_post(SOCKET sock, const char *body) {
                  * snapshot taken from the middle of the state blob.  Read the
                  * full 14 words and derive sizeof(header) from the version.
                  */
-                uint32_t header[14];
+                uint32_t header[15];
                 memset(header, 0, sizeof(header));
 #ifdef _WIN32
                 ssize_t hdr_read = (ssize_t)_read(fd, (char *)header, 13 * sizeof(uint32_t));
@@ -2063,7 +2063,8 @@ static void handle_slots_post(SOCKET sock, const char *body) {
 #endif
                 if (hdr_read == (ssize_t)(13 * sizeof(uint32_t)) &&
                     (header[0] & 0xF) >= 5) {
-                    /* v5 has a 14th word: the GLM-5 state blob size. */
+                    /* v5 has a 14th word: the GLM-5 state blob size (uint32_t,
+                     * may be truncated). v6 has a 15th word: high 32 bits. */
 #ifdef _WIN32
                     ssize_t extra = (ssize_t)_read(fd, (char *)&header[13], sizeof(uint32_t));
 #else
@@ -2071,14 +2072,26 @@ static void handle_slots_post(SOCKET sock, const char *body) {
 #endif
                     if (extra == (ssize_t)sizeof(uint32_t)) {
                         hdr_read = 14 * sizeof(uint32_t);
+                        uint32_t ver = header[0] & 0xF;
+                        if (ver >= 6) {
+#ifdef _WIN32
+                            ssize_t extra2 = (ssize_t)_read(fd, (char *)&header[14], sizeof(uint32_t));
+#else
+                            ssize_t extra2 = read(fd, &header[14], sizeof(uint32_t));
+#endif
+                            if (extra2 == (ssize_t)sizeof(uint32_t)) {
+                                hdr_read = 15 * sizeof(uint32_t);
+                            }
+                        }
                     } else {
                         header[13] = 0;
                     }
                 }
                 if (hdr_read >= (ssize_t)(13 * sizeof(uint32_t))) {
                     uint32_t ver = header[0] & 0xF;
-                    /* Number of header words actually present on disk. */
-                    off_t hdr_bytes = (off_t)((ver >= 5 ? 14 : 13) * sizeof(uint32_t));
+                    /* Number of header words actually present on disk.
+                     * v4: 13, v5: 14, v6: 15 */
+                    off_t hdr_bytes = (off_t)((ver >= 6 ? 15 : (ver >= 5 ? 14 : 13)) * sizeof(uint32_t));
                     int file_n_pos = (int)header[1];
                     int file_layers = (int)header[2];
                     int file_n_kv_heads = (int)header[3];
@@ -2139,14 +2152,29 @@ static void handle_slots_post(SOCKET sock, const char *body) {
                             kv_end += (off_t)ssm_sz;
                         }
                     }
-                    /* GLM-5 state blob (v5): MLA latent caches + KDA states.
+                    /* GLM-5 state blob (v5/v6): MLA latent caches + KDA states.
                      * kvcache_save() streams this after the SSM state and
                      * before the checkpoint section, so it MUST be included
                      * here or every checkpoint lookup seeks into the middle of
                      * the blob.  GLM-5 reports has_ssm=0, so the SSM branch
-                     * above does not cover it. */
+                     * above does not cover it.
+                     * v5 stores a truncated uint32_t; v6 stores lo+hi. */
                     if (ver >= 5) {
-                        uint32_t glm5_sz = header[13];
+                        size_t glm5_sz;
+                        if (ver >= 6) {
+                            glm5_sz = (size_t)header[13] | ((size_t)header[14] << 32);
+                        } else {
+                            /* v5: the stored value may be truncated. Compute
+                             * the expected size from n_pos and use it if the
+                             * file value looks truncated (smaller than expected). */
+                            glm5_sz = (size_t)header[13];
+                            if (srv.model.config.is_glm5) {
+                                size_t expect = model_glm5_snapshot_size(&srv.model, file_n_pos);
+                                if (glm5_sz < expect && expect > 0) {
+                                    glm5_sz = expect;
+                                }
+                            }
+                        }
                         if (glm5_sz > 0) {
                             kv_end += (off_t)glm5_sz;
                         }
