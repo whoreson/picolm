@@ -203,13 +203,27 @@ static int gguf_format_array_full(char *buf, int buflen, reader_t *r) {
     uint32_t arr_type = read_u32(r);
     uint64_t arr_len  = read_u64(r);
     int written = snprintf(buf, (size_t)buflen, "[");
-    for (uint64_t i = 0; i < arr_len && written < buflen - 8; i++) {
+    uint64_t shown = 0;
+    for (uint64_t i = 0; i < arr_len; i++) {
         char valbuf[64];
-        gguf_format_value(valbuf, (int)sizeof(valbuf), r, arr_type);
-        written += snprintf(buf + written, (size_t)(buflen - written), "%s%s",
-                            i > 0 ? ", " : "", valbuf);
+        /* Stop FORMATTING once the buffer is full, but keep READING: the
+         * caller's reader must stay positioned after the whole array,
+         * otherwise the next metadata key is parsed from mid-array data
+         * and the walk eventually runs off the end of the mmap (SIGBUS). */
+        if (written < buflen - 8) {
+            gguf_format_value(valbuf, (int)sizeof(valbuf), r, arr_type);
+            shown++;
+            written += snprintf(buf + written, (size_t)(buflen - written), "%s%s",
+                                i > 0 ? ", " : "", valbuf);
+        } else {
+            skip_meta_value(r, arr_type, NULL);
+        }
     }
-    written += snprintf(buf + written, (size_t)(buflen - written), "]");
+    /* Ellipsis marker when the array was truncated for display */
+    if (shown < arr_len)
+        written += snprintf(buf + written, (size_t)(buflen - written), ", ...; %" PRIu64 " more]", arr_len - shown);
+    else
+        written += snprintf(buf + written, (size_t)(buflen - written), "]");
     return written;
 }
 

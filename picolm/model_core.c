@@ -5917,6 +5917,37 @@ float *model_forward_prefill_range(model_t *m, const int *tokens, int n_tokens, 
         }
 #endif
 
+        /* SenseNova-Loop mHC blocks (kinds 1/4/2): the route/merge chain is
+         * sequential per token but each token is independent, so run the
+         * decode layer body per token over the batch. Kind-0 (plain) layers
+         * fall through to the fully batched path below. The mHC stream
+         * state (streams_active) is a property of the layer-kind sequence,
+         * identical for every token, so it is tracked once per layer.
+         * Scratch: sensenova_layer() works in s->x/s->xb/s->xb2/s->hb/s->hb2,
+         * none of which are live across layer iterations of this loop. */
+        if (c->is_sensenova_loop && c->mhc_layer_kinds[l] != 0) {
+            /* kind 1 seeds both streams from the residual; kind 2 merges
+             * them back into x and resets. Interior (4) carries them.
+             * streams_active ON ENTRY to layer l: the loop segments are
+             * contiguous ([first_enter .. start2+shift)), so the state is
+             * "inside" for every l past the first enter, up to the last
+             * exit. kind-1 layers reseed regardless, kind-2 clears after
+             * the merge, so this one value is exact for all cases. */
+            int streams_active =
+                (l > c->mhc_loop_first && l < c->mhc_loop_start2 + c->mhc_loop_shift);
+            for (bi = 0; bi < n_tokens; bi++) {
+                memcpy(s->x, x_batch + (size_t)bi * dim, dim * sizeof(float));
+                sensenova_layer(m, s, l, start_pos + bi, &streams_active);
+                memcpy(x_batch + (size_t)bi * dim, s->x, dim * sizeof(float));
+            }
+            steer_hook(l, x_batch, n_tokens, dim, start_pos);
+#ifdef PICOLM_VIZ
+            viz_push_batch(l, start_pos, x_batch, n_tokens, dim);
+#endif
+            BENCH_LAYER_END(l, 1);
+            continue;
+        }
+
         if (c->has_ssm && !lw->is_attn_layer) {
             if (m->ssm_batched_prefill) {
                 /* Batched SSM layer prefill (--ssm-batched) */
